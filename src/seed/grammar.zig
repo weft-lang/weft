@@ -85,6 +85,8 @@ pub const ast_record_lit = "RecordLit";
 pub const ast_list_lit = "ListLit";
 pub const ast_field_access = "FieldAccess";
 pub const ast_propagate = "Propagate";
+pub const ast_record_update = "RecordUpdate";
+pub const ast_string_interp = "StringInterp";
 
 // Declaration tags
 pub const ast_fn_decl = "FnDecl";
@@ -100,12 +102,15 @@ pub const ast_pat_bind = "PatBind";
 pub const ast_pat_literal = "PatLiteral";
 pub const ast_pat_constructor = "PatConstructor";
 pub const ast_pat_record = "PatRecord";
+pub const ast_pat_type_narrow = "PatTypeNarrow";
 
 // Type expression tags
 pub const ast_type_named = "TypeNamed";
 pub const ast_type_app = "TypeApp";
 pub const ast_type_union = "TypeUnion";
 pub const ast_type_fn = "TypeFn";
+pub const ast_type_intersection = "TypeIntersection";
+pub const ast_type_complement = "TypeComplement";
 pub const ast_type_nullable = "TypeNullable";
 
 // Module tag
@@ -476,26 +481,30 @@ fn genLexString(g: *Gen) !FuncId {
     const pos = try g.addParam();
 
     // entry: skip opening quote, scan for closing quote
+    // Track has_interp (whether we've seen {) to decide StringLit vs StringInterp
     _ = g.beginBlock();
     const one = try g.constInt(1);
     const start = try g.add(pos, one); // past opening "
     const len = try g.stringLength(source);
+    const init_interp = try g.constBool(false);
     const loop_blk = g.reserveBlock();
-    try g.jump(loop_blk, &.{start});
+    try g.jump(loop_blk, &.{ start, init_interp });
 
     // loop: find closing quote (handle escape)
     g.beginReservedBlock(loop_blk);
     const cur = try g.addBlockParam();
+    const has_interp = try g.addBlockParam();
     const in_bounds = try g.lt(cur, len);
     const check_blk = g.reserveBlock();
     const error_blk = g.reserveBlock();
     try g.branch(in_bounds, check_blk, error_blk);
 
-    // check: is it quote or backslash?
+    // check: is it quote, backslash, or {?
     g.beginReservedBlock(check_blk);
     const byte = try g.stringByteAt(source, cur);
     const quote = try g.constInt(34); // '"'
     const backslash = try g.constInt(92); // '\'
+    const lbrace = try g.constInt(123); // '{'
     const is_quote = try g.eq(byte, quote);
     const found_blk = g.reserveBlock();
     const check_esc_blk = g.reserveBlock();
@@ -505,24 +514,49 @@ fn genLexString(g: *Gen) !FuncId {
     g.beginReservedBlock(check_esc_blk);
     const is_esc = try g.eq(byte, backslash);
     const skip_blk = g.reserveBlock();
+    const check_brace_blk = g.reserveBlock();
+    try g.branch(is_esc, skip_blk, check_brace_blk);
+
+    // check for { (interpolation marker)
+    g.beginReservedBlock(check_brace_blk);
+    const is_brace = try g.eq(byte, lbrace);
+    const mark_interp_blk = g.reserveBlock();
     const advance_blk = g.reserveBlock();
-    try g.branch(is_esc, skip_blk, advance_blk);
+    try g.branch(is_brace, mark_interp_blk, advance_blk);
+
+    g.beginReservedBlock(mark_interp_blk);
+    const true_val = try g.constBool(true);
+    const next_interp = try g.add(cur, one);
+    try g.jump(loop_blk, &.{ next_interp, true_val });
 
     // skip: advance by 2 (backslash + escaped char)
     g.beginReservedBlock(skip_blk);
     const two = try g.constInt(2);
     const next_skip = try g.add(cur, two);
-    try g.jump(loop_blk, &.{next_skip});
+    try g.jump(loop_blk, &.{ next_skip, has_interp });
 
     // advance: normal char, advance by 1
     g.beginReservedBlock(advance_blk);
     const next = try g.add(cur, one);
-    try g.jump(loop_blk, &.{next});
+    try g.jump(loop_blk, &.{ next, has_interp });
 
-    // found: extract string content, return
+    // found: extract string content, choose tag based on has_interp
     g.beginReservedBlock(found_blk);
     const content = try g.stringSlice(source, start, cur);
     const end_pos = try g.add(cur, one); // past closing quote
+    const interp_blk = g.reserveBlock();
+    const plain_blk = g.reserveBlock();
+    try g.branch(has_interp, interp_blk, plain_blk);
+
+    g.beginReservedBlock(interp_blk);
+    const interp_tok = try g.tag("StringInterp", content);
+    const interp_rec = try g.record(&.{
+        .{ .name = "token", .value = interp_tok },
+        .{ .name = "end", .value = end_pos },
+    });
+    try g.ret(interp_rec);
+
+    g.beginReservedBlock(plain_blk);
     const tok = try g.tag(tok_string_lit, content);
     const rec = try g.record(&.{
         .{ .name = "token", .value = tok },
@@ -1159,8 +1193,35 @@ fn genParsePattern(g: *Gen, pf: ParserFuncs) !void {
     const wc_res = try emitResult(g, wc_node, next_pos);
     try g.ret(wc_res);
 
-    // bind
+    // bind: check for : (type narrow)
     g.beginReservedBlock(bind_blk);
+    const bind_next_tok = try emitGetToken(g, tokens, next_pos);
+    const bind_is_punct = try g.tagTest(bind_next_tok, "Punct");
+    const bind_check_colon_blk = g.reserveBlock();
+    const bind_simple_blk = g.reserveBlock();
+    try g.branch(bind_is_punct, bind_check_colon_blk, bind_simple_blk);
+
+    g.beginReservedBlock(bind_check_colon_blk);
+    const bind_punct = try g.tagPayload(bind_next_tok, "Punct");
+    const bind_colon = try g.constString(":");
+    const bind_is_colon = try g.eq(bind_punct, bind_colon);
+    const type_narrow_blk = g.reserveBlock();
+    try g.branch(bind_is_colon, type_narrow_blk, bind_simple_blk);
+
+    g.beginReservedBlock(type_narrow_blk);
+    const tn_type_start = try emitAdvance(g, next_pos); // skip :
+    const tn_type_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, tn_type_start });
+    const tn_type_node = try g.recordField(tn_type_result, "node");
+    const tn_type_end = try g.recordField(tn_type_result, "pos");
+    const tn_rec = try g.record(&.{
+        .{ .name = "name", .value = ident_name },
+        .{ .name = "type_expr", .value = tn_type_node },
+    });
+    const tn_node = try g.tag(ast_pat_type_narrow, tn_rec);
+    const tn_res = try emitResult(g, tn_node, tn_type_end);
+    try g.ret(tn_res);
+
+    g.beginReservedBlock(bind_simple_blk);
     const bind_node = try g.tag(ast_pat_bind, ident_name);
     const bind_res = try emitResult(g, bind_node, next_pos);
     try g.ret(bind_res);
@@ -1290,8 +1351,128 @@ fn genParsePattern(g: *Gen, pf: ParserFuncs) !void {
     const bool_res = try emitResult(g, bool_pat, next_pos);
     try g.ret(bool_res);
 
-    // default: treat as wildcard
+    // Check for { (record pattern)
     g.beginReservedBlock(default_pat_blk);
+    const pr_is_delim = try g.tagTest(tok, "Delim");
+    const pr_check_blk = g.reserveBlock();
+    const pr_fallback_blk = g.reserveBlock();
+    try g.branch(pr_is_delim, pr_check_blk, pr_fallback_blk);
+
+    g.beginReservedBlock(pr_check_blk);
+    const pr_delim_val = try g.tagPayload(tok, "Delim");
+    const pr_lbrace = try g.constString("{");
+    const pr_is_lb = try g.eq(pr_delim_val, pr_lbrace);
+    const pr_rec_blk = g.reserveBlock();
+    try g.branch(pr_is_lb, pr_rec_blk, pr_fallback_blk);
+
+    // Record pattern: { field1, field2 } or { field1: pat, field2: pat }
+    g.beginReservedBlock(pr_rec_blk);
+    const pr_empty = try g.listInit(&.{});
+    const pr_loop_blk = g.reserveBlock();
+    try g.jump(pr_loop_blk, &.{ next_pos, pr_empty });
+
+    g.beginReservedBlock(pr_loop_blk);
+    const pr_pos = try g.addBlockParam();
+    const pr_fields = try g.addBlockParam();
+    const pr_tok = try emitGetToken(g, tokens, pr_pos);
+    const pr_tok_is_delim = try g.tagTest(pr_tok, "Delim");
+    const pr_check_rb_blk = g.reserveBlock();
+    const pr_parse_blk = g.reserveBlock();
+    try g.branch(pr_tok_is_delim, pr_check_rb_blk, pr_parse_blk);
+
+    g.beginReservedBlock(pr_check_rb_blk);
+    const pr_tok_delim = try g.tagPayload(pr_tok, "Delim");
+    const pr_rbrace = try g.constString("}");
+    const pr_is_rb = try g.eq(pr_tok_delim, pr_rbrace);
+    const pr_done_blk = g.reserveBlock();
+    try g.branch(pr_is_rb, pr_done_blk, pr_parse_blk);
+
+    // Parse one field: name or name: pattern
+    g.beginReservedBlock(pr_parse_blk);
+    const pr_fname = try g.tagPayload(pr_tok, "Ident");
+    const pr_fnext = try emitAdvance(g, pr_pos);
+    const pr_ftok = try emitGetToken(g, tokens, pr_fnext);
+    const pr_f_is_punct = try g.tagTest(pr_ftok, "Punct");
+    const pr_fcheck_blk = g.reserveBlock();
+    const pr_fshort_blk = g.reserveBlock();
+    try g.branch(pr_f_is_punct, pr_fcheck_blk, pr_fshort_blk);
+
+    g.beginReservedBlock(pr_fcheck_blk);
+    const pr_f_punct = try g.tagPayload(pr_ftok, "Punct");
+    const pr_f_colon = try g.constString(":");
+    const pr_f_is_colon = try g.eq(pr_f_punct, pr_f_colon);
+    const pr_f_typed_blk = g.reserveBlock();
+    const pr_f_comma_blk = g.reserveBlock();
+    try g.branch(pr_f_is_colon, pr_f_typed_blk, pr_f_comma_blk);
+
+    // field: pattern
+    g.beginReservedBlock(pr_f_typed_blk);
+    const pr_f_pat_start = try emitAdvance(g, pr_fnext); // skip :
+    const pr_f_pat_result = try g.callDirect(pf.parse_pattern, &.{ tokens, pr_f_pat_start });
+    const pr_f_pat_node = try g.recordField(pr_f_pat_result, "node");
+    const pr_f_pat_end = try g.recordField(pr_f_pat_result, "pos");
+    const pr_f_rec = try g.record(&.{
+        .{ .name = "name", .value = pr_fname },
+        .{ .name = "pattern", .value = pr_f_pat_node },
+    });
+    const pr_fields_t = try g.listAppend(pr_fields, pr_f_rec);
+    // Check for comma
+    const prt_tok = try emitGetToken(g, tokens, pr_f_pat_end);
+    const prt_is_punct = try g.tagTest(prt_tok, "Punct");
+    const prt_check_blk = g.reserveBlock();
+    const prt_no_blk = g.reserveBlock();
+    try g.branch(prt_is_punct, prt_check_blk, prt_no_blk);
+
+    g.beginReservedBlock(prt_check_blk);
+    const prt_val = try g.tagPayload(prt_tok, "Punct");
+    const prt_comma = try g.constString(",");
+    const prt_is_comma = try g.eq(prt_val, prt_comma);
+    const prt_skip_blk = g.reserveBlock();
+    try g.branch(prt_is_comma, prt_skip_blk, prt_no_blk);
+
+    g.beginReservedBlock(prt_skip_blk);
+    const prt_after = try emitAdvance(g, pr_f_pat_end);
+    try g.jump(pr_loop_blk, &.{ prt_after, pr_fields_t });
+
+    g.beginReservedBlock(prt_no_blk);
+    try g.jump(pr_loop_blk, &.{ pr_f_pat_end, pr_fields_t });
+
+    // Shorthand: just field name (implicit bind)
+    g.beginReservedBlock(pr_fshort_blk);
+    const pr_f_bind = try g.tag(ast_pat_bind, pr_fname);
+    const pr_f_short_rec = try g.record(&.{
+        .{ .name = "name", .value = pr_fname },
+        .{ .name = "pattern", .value = pr_f_bind },
+    });
+    const pr_fields_s = try g.listAppend(pr_fields, pr_f_short_rec);
+    try g.jump(pr_loop_blk, &.{ pr_fnext, pr_fields_s });
+
+    // Check comma shorthand
+    g.beginReservedBlock(pr_f_comma_blk);
+    const pr_fc_comma = try g.constString(",");
+    const pr_fc_is_comma = try g.eq(pr_f_punct, pr_fc_comma);
+    const pr_fc_skip_blk = g.reserveBlock();
+    try g.branch(pr_fc_is_comma, pr_fc_skip_blk, pr_fshort_blk);
+
+    g.beginReservedBlock(pr_fc_skip_blk);
+    const pr_fc_bind = try g.tag(ast_pat_bind, pr_fname);
+    const pr_fc_rec = try g.record(&.{
+        .{ .name = "name", .value = pr_fname },
+        .{ .name = "pattern", .value = pr_fc_bind },
+    });
+    const pr_fields_c = try g.listAppend(pr_fields, pr_fc_rec);
+    const pr_fc_after = try emitAdvance(g, pr_fnext);
+    try g.jump(pr_loop_blk, &.{ pr_fc_after, pr_fields_c });
+
+    // Done: record pattern
+    g.beginReservedBlock(pr_done_blk);
+    const pr_after_rb = try emitAdvance(g, pr_pos);
+    const pr_node = try g.tag(ast_pat_record, pr_fields);
+    const pr_res = try emitResult(g, pr_node, pr_after_rb);
+    try g.ret(pr_res);
+
+    // fallback: treat as wildcard
+    g.beginReservedBlock(pr_fallback_blk);
     const def_node = try g.tag(ast_pat_wildcard, null);
     const def_res = try emitResult(g, def_node, pos);
     try g.ret(def_res);
@@ -1306,12 +1487,37 @@ fn genParseTypeExpr(g: *Gen, pf: ParserFuncs) !void {
     const tokens = try g.addParam();
     const pos = try g.addParam();
 
-    // entry: peek at token — expect an UpperIdent or Ident for type name
+    // entry: peek at token — dispatch to primary type parser
     _ = g.beginBlock();
     const tok = try emitGetToken(g, tokens, pos);
     const next_pos = try emitAdvance(g, pos);
 
+    // All primary type paths converge to check_suffix_blk(node, pos)
+    const check_suffix_blk = g.reserveBlock();
+
+    // Check for ~ prefix (complement)
+    const is_op0 = try g.tagTest(tok, "Op");
+    const check_tilde_blk = g.reserveBlock();
+    const check_upper_blk = g.reserveBlock();
+    try g.branch(is_op0, check_tilde_blk, check_upper_blk);
+
+    g.beginReservedBlock(check_tilde_blk);
+    const op0_val = try g.tagPayload(tok, "Op");
+    const tilde_str = try g.constString("~");
+    const is_tilde = try g.eq(op0_val, tilde_str);
+    const tilde_blk = g.reserveBlock();
+    try g.branch(is_tilde, tilde_blk, check_upper_blk);
+
+    g.beginReservedBlock(tilde_blk);
+    const comp_inner_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, next_pos });
+    const comp_inner = try g.recordField(comp_inner_result, "node");
+    const comp_end = try g.recordField(comp_inner_result, "pos");
+    const comp_node = try g.tag(ast_type_complement, comp_inner);
+    const comp_res = try emitResult(g, comp_node, comp_end);
+    try g.ret(comp_res);
+
     // Check for UpperIdent (most type names)
+    g.beginReservedBlock(check_upper_blk);
     const is_upper = try g.tagTest(tok, "UpperIdent");
     const upper_blk = g.reserveBlock();
     const check_ident_blk = g.reserveBlock();
@@ -1385,7 +1591,7 @@ fn genParseTypeExpr(g: *Gen, pf: ParserFuncs) !void {
     g.beginReservedBlock(tc_no_comma_blk);
     try g.jump(targs_loop_blk, &.{ targ_next, t_list2 });
 
-    // done: TypeApp node
+    // done: TypeApp node -> check suffix
     g.beginReservedBlock(t_done_blk);
     const after_gt = try emitAdvance(g, t_pos); // skip >
     const app_rec = try g.record(&.{
@@ -1393,49 +1599,193 @@ fn genParseTypeExpr(g: *Gen, pf: ParserFuncs) !void {
         .{ .name = "args", .value = t_list },
     });
     const app_node = try g.tag(ast_type_app, app_rec);
-    const app_res = try emitResult(g, app_node, after_gt);
-    try g.ret(app_res);
+    try g.jump(check_suffix_blk, &.{ app_node, after_gt });
 
-    // simple_type: just a named type
+    // simple_type: just a named type -> check suffix
     g.beginReservedBlock(simple_type_blk);
-    // Check for ? suffix (nullable)
-    const sq_tok = try emitGetToken(g, tokens, next_pos);
-    const sq_is_op = try g.tagTest(sq_tok, "Op");
-    const sq_check_blk = g.reserveBlock();
-    const plain_type_blk = g.reserveBlock();
-    try g.branch(sq_is_op, sq_check_blk, plain_type_blk);
-
-    g.beginReservedBlock(sq_check_blk);
-    const sq_op_val = try g.tagPayload(sq_tok, "Op");
-    const q_str = try g.constString("?");
-    const is_q = try g.eq(sq_op_val, q_str);
-    const nullable_blk = g.reserveBlock();
-    try g.branch(is_q, nullable_blk, plain_type_blk);
-
-    g.beginReservedBlock(nullable_blk);
-    const inner = try g.tag(ast_type_named, type_name);
-    const nullable_node = try g.tag(ast_type_nullable, inner);
-    const nq_pos = try emitAdvance(g, next_pos);
-    const nullable_res = try emitResult(g, nullable_node, nq_pos);
-    try g.ret(nullable_res);
-
-    g.beginReservedBlock(plain_type_blk);
     const named_node = try g.tag(ast_type_named, type_name);
-    const named_res = try emitResult(g, named_node, next_pos);
-    try g.ret(named_res);
+    try g.jump(check_suffix_blk, &.{ named_node, next_pos });
 
     // check_ident: lowercase type names (type params like 'a', or builtins)
     g.beginReservedBlock(check_ident_blk);
     const is_ident = try g.tagTest(tok, "Ident");
     const ident_type_blk = g.reserveBlock();
-    const fallback_blk = g.reserveBlock();
-    try g.branch(is_ident, ident_type_blk, fallback_blk);
+    const check_delim_blk = g.reserveBlock();
+    try g.branch(is_ident, ident_type_blk, check_delim_blk);
 
     g.beginReservedBlock(ident_type_blk);
     const id_name = try g.tagPayload(tok, "Ident");
     const id_node = try g.tag(ast_type_named, id_name);
-    const id_res = try emitResult(g, id_node, next_pos);
-    try g.ret(id_res);
+    try g.jump(check_suffix_blk, &.{ id_node, next_pos });
+
+    // Check for ( — function type or grouped type
+    g.beginReservedBlock(check_delim_blk);
+    const is_delim = try g.tagTest(tok, "Delim");
+    const check_lparen_blk = g.reserveBlock();
+    const fallback_blk = g.reserveBlock();
+    try g.branch(is_delim, check_lparen_blk, fallback_blk);
+
+    g.beginReservedBlock(check_lparen_blk);
+    const delim_val = try g.tagPayload(tok, "Delim");
+    const lparen_str = try g.constString("(");
+    const is_lparen = try g.eq(delim_val, lparen_str);
+    const fn_type_blk = g.reserveBlock();
+    try g.branch(is_lparen, fn_type_blk, fallback_blk);
+
+    // ( — parse param types, check for ) -> RetType (function type)
+    g.beginReservedBlock(fn_type_blk);
+    const ft_params_empty = try g.listInit(&.{});
+    const ft_loop_blk = g.reserveBlock();
+    try g.jump(ft_loop_blk, &.{ next_pos, ft_params_empty });
+
+    g.beginReservedBlock(ft_loop_blk);
+    const ft_pos = try g.addBlockParam();
+    const ft_list = try g.addBlockParam();
+    const ft_tok = try emitGetToken(g, tokens, ft_pos);
+    const ft_is_delim = try g.tagTest(ft_tok, "Delim");
+    const ft_check_rp_blk = g.reserveBlock();
+    const ft_parse_blk = g.reserveBlock();
+    try g.branch(ft_is_delim, ft_check_rp_blk, ft_parse_blk);
+
+    g.beginReservedBlock(ft_check_rp_blk);
+    const ft_delim = try g.tagPayload(ft_tok, "Delim");
+    const ft_rparen = try g.constString(")");
+    const ft_is_rp = try g.eq(ft_delim, ft_rparen);
+    const ft_done_blk = g.reserveBlock();
+    try g.branch(ft_is_rp, ft_done_blk, ft_parse_blk);
+
+    g.beginReservedBlock(ft_parse_blk);
+    const ft_param_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, ft_pos });
+    const ft_param_node = try g.recordField(ft_param_result, "node");
+    const ft_param_next = try g.recordField(ft_param_result, "pos");
+    const ft_list2 = try g.listAppend(ft_list, ft_param_node);
+    // Check for comma
+    const ftc_tok = try emitGetToken(g, tokens, ft_param_next);
+    const ftc_is_punct = try g.tagTest(ftc_tok, "Punct");
+    const ftc_check_blk = g.reserveBlock();
+    const ftc_no_blk = g.reserveBlock();
+    try g.branch(ftc_is_punct, ftc_check_blk, ftc_no_blk);
+
+    g.beginReservedBlock(ftc_check_blk);
+    const ftc_val = try g.tagPayload(ftc_tok, "Punct");
+    const ftc_comma = try g.constString(",");
+    const ftc_is_comma = try g.eq(ftc_val, ftc_comma);
+    const ftc_skip_blk = g.reserveBlock();
+    try g.branch(ftc_is_comma, ftc_skip_blk, ftc_no_blk);
+
+    g.beginReservedBlock(ftc_skip_blk);
+    const ftc_after = try emitAdvance(g, ft_param_next);
+    try g.jump(ft_loop_blk, &.{ ftc_after, ft_list2 });
+
+    g.beginReservedBlock(ftc_no_blk);
+    try g.jump(ft_loop_blk, &.{ ft_param_next, ft_list2 });
+
+    // After ): check for -> (fn type) or -[ (effect fn type)
+    g.beginReservedBlock(ft_done_blk);
+    const ft_after_rp = try emitAdvance(g, ft_pos); // skip )
+    const ft_arrow_tok = try emitGetToken(g, tokens, ft_after_rp);
+    const ft_arrow_is_op = try g.tagTest(ft_arrow_tok, "Op");
+    const ft_check_arrow_blk = g.reserveBlock();
+    const ft_not_fn_blk = g.reserveBlock();
+    try g.branch(ft_arrow_is_op, ft_check_arrow_blk, ft_not_fn_blk);
+
+    g.beginReservedBlock(ft_check_arrow_blk);
+    const ft_arrow_val = try g.tagPayload(ft_arrow_tok, "Op");
+    const ft_arrow_str = try g.constString("->");
+    const ft_is_arrow = try g.eq(ft_arrow_val, ft_arrow_str);
+    const ft_plain_arrow_blk = g.reserveBlock();
+    const ft_check_eff_blk = g.reserveBlock();
+    try g.branch(ft_is_arrow, ft_plain_arrow_blk, ft_check_eff_blk);
+
+    // (A, B) -> C
+    g.beginReservedBlock(ft_plain_arrow_blk);
+    const ft_nil_effects = try g.listInit(&.{});
+    const ft_ret_start = try emitAdvance(g, ft_after_rp); // skip ->
+    const ft_ret_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, ft_ret_start });
+    const ft_ret_node = try g.recordField(ft_ret_result, "node");
+    const ft_ret_end = try g.recordField(ft_ret_result, "pos");
+    const ft_rec = try g.record(&.{
+        .{ .name = "params", .value = ft_list },
+        .{ .name = "effects", .value = ft_nil_effects },
+        .{ .name = "ret", .value = ft_ret_node },
+    });
+    const ft_node = try g.tag(ast_type_fn, ft_rec);
+    const ft_res = try emitResult(g, ft_node, ft_ret_end);
+    try g.ret(ft_res);
+
+    // Check for -[ (effect fn type)
+    g.beginReservedBlock(ft_check_eff_blk);
+    const ft_eff_str = try g.constString("-[");
+    const ft_is_eff = try g.eq(ft_arrow_val, ft_eff_str);
+    const ft_eff_blk = g.reserveBlock();
+    try g.branch(ft_is_eff, ft_eff_blk, ft_not_fn_blk);
+
+    // (A, B) -[E]> C
+    g.beginReservedBlock(ft_eff_blk);
+    const fte_start = try emitAdvance(g, ft_after_rp); // skip -[
+    const fte_empty = try g.listInit(&.{});
+    const fte_loop_blk = g.reserveBlock();
+    try g.jump(fte_loop_blk, &.{ fte_start, fte_empty });
+
+    g.beginReservedBlock(fte_loop_blk);
+    const fte_pos = try g.addBlockParam();
+    const fte_list = try g.addBlockParam();
+    const fte_tok = try emitGetToken(g, tokens, fte_pos);
+    const fte_is_op = try g.tagTest(fte_tok, "Op");
+    const fte_check_close_blk = g.reserveBlock();
+    const fte_parse_blk = g.reserveBlock();
+    try g.branch(fte_is_op, fte_check_close_blk, fte_parse_blk);
+
+    g.beginReservedBlock(fte_check_close_blk);
+    const fte_op_val = try g.tagPayload(fte_tok, "Op");
+    const fte_close = try g.constString("]>");
+    const fte_is_close = try g.eq(fte_op_val, fte_close);
+    const fte_done_blk = g.reserveBlock();
+    try g.branch(fte_is_close, fte_done_blk, fte_parse_blk);
+
+    g.beginReservedBlock(fte_parse_blk);
+    const fte_name = try g.tagPayload(fte_tok, "UpperIdent");
+    const fte_list2 = try g.listAppend(fte_list, fte_name);
+    const fte_next = try emitAdvance(g, fte_pos);
+    const ftec_tok = try emitGetToken(g, tokens, fte_next);
+    const ftec_is_punct = try g.tagTest(ftec_tok, "Punct");
+    const ftec_check_blk = g.reserveBlock();
+    const ftec_no_blk = g.reserveBlock();
+    try g.branch(ftec_is_punct, ftec_check_blk, ftec_no_blk);
+
+    g.beginReservedBlock(ftec_check_blk);
+    const ftec_val = try g.tagPayload(ftec_tok, "Punct");
+    const ftec_comma = try g.constString(",");
+    const ftec_is_comma = try g.eq(ftec_val, ftec_comma);
+    const ftec_skip_blk = g.reserveBlock();
+    try g.branch(ftec_is_comma, ftec_skip_blk, ftec_no_blk);
+
+    g.beginReservedBlock(ftec_skip_blk);
+    const ftec_after = try emitAdvance(g, fte_next);
+    try g.jump(fte_loop_blk, &.{ ftec_after, fte_list2 });
+
+    g.beginReservedBlock(ftec_no_blk);
+    try g.jump(fte_loop_blk, &.{ fte_next, fte_list2 });
+
+    g.beginReservedBlock(fte_done_blk);
+    const fte_after_close = try emitAdvance(g, fte_pos); // skip ]>
+    const fte_ret_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, fte_after_close });
+    const fte_ret_node = try g.recordField(fte_ret_result, "node");
+    const fte_ret_end = try g.recordField(fte_ret_result, "pos");
+    const fte_rec = try g.record(&.{
+        .{ .name = "params", .value = ft_list },
+        .{ .name = "effects", .value = fte_list },
+        .{ .name = "ret", .value = fte_ret_node },
+    });
+    const fte_node = try g.tag(ast_type_fn, fte_rec);
+    const fte_res = try emitResult(g, fte_node, fte_ret_end);
+    try g.ret(fte_res);
+
+    // Not a fn type — if single param, treat as grouped type
+    g.beginReservedBlock(ft_not_fn_blk);
+    // Just use the first (and only) param type as a grouped type
+    const ft_first = try g.listHead(ft_list);
+    try g.jump(check_suffix_blk, &.{ ft_first, ft_after_rp });
 
     // fallback: return a placeholder
     g.beginReservedBlock(fallback_blk);
@@ -1443,6 +1793,78 @@ fn genParseTypeExpr(g: *Gen, pf: ParserFuncs) !void {
     const fb_node = try g.tag(ast_type_named, fb_name);
     const fb_res = try emitResult(g, fb_node, pos);
     try g.ret(fb_res);
+
+    // ── check_suffix: after parsing a primary type, check for ?, |, & ──
+    g.beginReservedBlock(check_suffix_blk);
+    const sf_node = try g.addBlockParam();
+    const sf_pos = try g.addBlockParam();
+    const sf_tok = try emitGetToken(g, tokens, sf_pos);
+    const sf_is_op = try g.tagTest(sf_tok, "Op");
+    const sf_check_op_blk = g.reserveBlock();
+    const sf_done_blk = g.reserveBlock();
+    try g.branch(sf_is_op, sf_check_op_blk, sf_done_blk);
+
+    g.beginReservedBlock(sf_check_op_blk);
+    const sf_op_val = try g.tagPayload(sf_tok, "Op");
+
+    // Check for ? (nullable)
+    const sf_q_str = try g.constString("?");
+    const sf_is_q = try g.eq(sf_op_val, sf_q_str);
+    const sf_nullable_blk = g.reserveBlock();
+    const sf_check_pipe_blk = g.reserveBlock();
+    try g.branch(sf_is_q, sf_nullable_blk, sf_check_pipe_blk);
+
+    g.beginReservedBlock(sf_nullable_blk);
+    const sf_nullable = try g.tag(ast_type_nullable, sf_node);
+    const sf_nq_pos = try emitAdvance(g, sf_pos);
+    // After nullable, check for more suffixes
+    try g.jump(check_suffix_blk, &.{ sf_nullable, sf_nq_pos });
+
+    // Check for | (union)
+    g.beginReservedBlock(sf_check_pipe_blk);
+    const sf_pipe_str = try g.constString("|");
+    const sf_is_pipe = try g.eq(sf_op_val, sf_pipe_str);
+    const sf_union_blk = g.reserveBlock();
+    const sf_check_amp_blk = g.reserveBlock();
+    try g.branch(sf_is_pipe, sf_union_blk, sf_check_amp_blk);
+
+    g.beginReservedBlock(sf_union_blk);
+    const sf_u_next = try emitAdvance(g, sf_pos); // skip |
+    const sf_u_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, sf_u_next });
+    const sf_u_rhs = try g.recordField(sf_u_result, "node");
+    const sf_u_end = try g.recordField(sf_u_result, "pos");
+    const sf_u_rec = try g.record(&.{
+        .{ .name = "lhs", .value = sf_node },
+        .{ .name = "rhs", .value = sf_u_rhs },
+    });
+    const sf_u_node = try g.tag(ast_type_union, sf_u_rec);
+    const sf_u_res = try emitResult(g, sf_u_node, sf_u_end);
+    try g.ret(sf_u_res);
+
+    // Check for & (intersection)
+    g.beginReservedBlock(sf_check_amp_blk);
+    const sf_amp_str = try g.constString("&");
+    const sf_is_amp = try g.eq(sf_op_val, sf_amp_str);
+    const sf_inter_blk = g.reserveBlock();
+    try g.branch(sf_is_amp, sf_inter_blk, sf_done_blk);
+
+    g.beginReservedBlock(sf_inter_blk);
+    const sf_i_next = try emitAdvance(g, sf_pos); // skip &
+    const sf_i_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, sf_i_next });
+    const sf_i_rhs = try g.recordField(sf_i_result, "node");
+    const sf_i_end = try g.recordField(sf_i_result, "pos");
+    const sf_i_rec = try g.record(&.{
+        .{ .name = "lhs", .value = sf_node },
+        .{ .name = "rhs", .value = sf_i_rhs },
+    });
+    const sf_i_node = try g.tag(ast_type_intersection, sf_i_rec);
+    const sf_i_res = try emitResult(g, sf_i_node, sf_i_end);
+    try g.ret(sf_i_res);
+
+    // No suffix: return as-is
+    g.beginReservedBlock(sf_done_blk);
+    const sf_res = try emitResult(g, sf_node, sf_pos);
+    try g.ret(sf_res);
 
     try g.endReservedFunc(pf.parse_type_expr);
 }
@@ -1498,8 +1920,21 @@ fn genParsePrimary(g: *Gen, pf: ParserFuncs) !void {
     const str_res = try emitResult(g, str_node, next_pos);
     try g.ret(str_res);
 
-    // BoolLit
+    // StringInterp — string with interpolation markers
     g.beginReservedBlock(c3);
+    const is_interp = try g.tagTest(tok, "StringInterp");
+    const interp_blk = g.reserveBlock();
+    const c3b = g.reserveBlock();
+    try g.branch(is_interp, interp_blk, c3b);
+
+    g.beginReservedBlock(interp_blk);
+    const interp_val = try g.tagPayload(tok, "StringInterp");
+    const interp_node = try g.tag(ast_string_interp, interp_val);
+    const interp_res = try emitResult(g, interp_node, next_pos);
+    try g.ret(interp_res);
+
+    // BoolLit
+    g.beginReservedBlock(c3b);
     const is_bool = try g.tagTest(tok, "BoolLit");
     const bool_blk = g.reserveBlock();
     const c4 = g.reserveBlock();
@@ -1671,15 +2106,185 @@ fn genParsePrimary(g: *Gen, pf: ParserFuncs) !void {
     const group_res = try emitResult(g, group_node, after_rp);
     try g.ret(group_res);
 
-    // { — block
+    // { — block, record literal, or record update
     g.beginReservedBlock(check_lbrace_blk);
     const lbrace_str = try g.constString("{");
     const is_lb = try g.eq(delim_val, lbrace_str);
-    const block_blk = g.reserveBlock();
+    const brace_blk = g.reserveBlock();
     const check_lbracket_blk = g.reserveBlock();
-    try g.branch(is_lb, block_blk, check_lbracket_blk);
+    try g.branch(is_lb, brace_blk, check_lbracket_blk);
 
-    g.beginReservedBlock(block_blk);
+    // Disambiguate: { Ident : → record literal, { expr | → record update, else → block
+    g.beginReservedBlock(brace_blk);
+    const br_tok1 = try emitGetToken(g, tokens, next_pos);
+    const br_is_ident = try g.tagTest(br_tok1, "Ident");
+    const br_check_rec_blk = g.reserveBlock();
+    const br_block_blk = g.reserveBlock();
+    try g.branch(br_is_ident, br_check_rec_blk, br_block_blk);
+
+    g.beginReservedBlock(br_check_rec_blk);
+    const br_pos2 = try emitAdvance(g, next_pos);
+    const br_tok2 = try emitGetToken(g, tokens, br_pos2);
+    // Check if token after ident is : (record) or | (record update)
+    const br_is_punct = try g.tagTest(br_tok2, "Punct");
+    const br_check_colon_blk = g.reserveBlock();
+    const br_check_pipe_blk = g.reserveBlock();
+    try g.branch(br_is_punct, br_check_colon_blk, br_check_pipe_blk);
+
+    g.beginReservedBlock(br_check_colon_blk);
+    const br_punct_val = try g.tagPayload(br_tok2, "Punct");
+    const br_colon = try g.constString(":");
+    const br_is_colon = try g.eq(br_punct_val, br_colon);
+    const rec_lit_blk = g.reserveBlock();
+    try g.branch(br_is_colon, rec_lit_blk, br_check_pipe_blk);
+
+    // Check for | (record update: { base | field: val })
+    g.beginReservedBlock(br_check_pipe_blk);
+    const br_is_op = try g.tagTest(br_tok2, "Op");
+    const br_check_pipe2_blk = g.reserveBlock();
+    try g.branch(br_is_op, br_check_pipe2_blk, br_block_blk);
+
+    g.beginReservedBlock(br_check_pipe2_blk);
+    const br_op_val = try g.tagPayload(br_tok2, "Op");
+    const br_pipe = try g.constString("|");
+    const br_is_pipe_op = try g.eq(br_op_val, br_pipe);
+    const rec_update_blk = g.reserveBlock();
+    try g.branch(br_is_pipe_op, rec_update_blk, br_block_blk);
+
+    // Record literal: { name: expr, name: expr }
+    g.beginReservedBlock(rec_lit_blk);
+    const rl_empty = try g.listInit(&.{});
+    const rl_loop_blk = g.reserveBlock();
+    try g.jump(rl_loop_blk, &.{ next_pos, rl_empty });
+
+    g.beginReservedBlock(rl_loop_blk);
+    const rl_pos = try g.addBlockParam();
+    const rl_fields = try g.addBlockParam();
+    const rl_tok = try emitGetToken(g, tokens, rl_pos);
+    // Check for }
+    const rl_is_delim = try g.tagTest(rl_tok, "Delim");
+    const rl_check_rb_blk = g.reserveBlock();
+    const rl_parse_blk = g.reserveBlock();
+    try g.branch(rl_is_delim, rl_check_rb_blk, rl_parse_blk);
+
+    g.beginReservedBlock(rl_check_rb_blk);
+    const rl_delim = try g.tagPayload(rl_tok, "Delim");
+    const rl_rbrace = try g.constString("}");
+    const rl_is_rb = try g.eq(rl_delim, rl_rbrace);
+    const rl_done_blk = g.reserveBlock();
+    try g.branch(rl_is_rb, rl_done_blk, rl_parse_blk);
+
+    // Parse one field: name: expr
+    g.beginReservedBlock(rl_parse_blk);
+    const rl_fname = try g.tagPayload(rl_tok, "Ident");
+    const rl_after_name = try emitAdvance(g, rl_pos);
+    const rl_after_colon = try emitAdvance(g, rl_after_name); // skip :
+    const rl_zero = try g.constInt(0);
+    const rl_val_result = try g.callDirect(pf.parse_expr, &.{ tokens, rl_after_colon, rl_zero });
+    const rl_val_node = try g.recordField(rl_val_result, "node");
+    const rl_val_end = try g.recordField(rl_val_result, "pos");
+    const rl_field = try g.record(&.{
+        .{ .name = "name", .value = rl_fname },
+        .{ .name = "value", .value = rl_val_node },
+    });
+    const rl_fields2 = try g.listAppend(rl_fields, rl_field);
+    // Check for comma
+    const rlc_tok = try emitGetToken(g, tokens, rl_val_end);
+    const rlc_is_punct = try g.tagTest(rlc_tok, "Punct");
+    const rlc_check_blk = g.reserveBlock();
+    const rlc_no_blk = g.reserveBlock();
+    try g.branch(rlc_is_punct, rlc_check_blk, rlc_no_blk);
+
+    g.beginReservedBlock(rlc_check_blk);
+    const rlc_val = try g.tagPayload(rlc_tok, "Punct");
+    const rlc_comma = try g.constString(",");
+    const rlc_is_comma = try g.eq(rlc_val, rlc_comma);
+    const rlc_skip_blk = g.reserveBlock();
+    try g.branch(rlc_is_comma, rlc_skip_blk, rlc_no_blk);
+
+    g.beginReservedBlock(rlc_skip_blk);
+    const rlc_after = try emitAdvance(g, rl_val_end);
+    try g.jump(rl_loop_blk, &.{ rlc_after, rl_fields2 });
+
+    g.beginReservedBlock(rlc_no_blk);
+    try g.jump(rl_loop_blk, &.{ rl_val_end, rl_fields2 });
+
+    g.beginReservedBlock(rl_done_blk);
+    const rl_after_rb = try emitAdvance(g, rl_pos);
+    const rl_node = try g.tag(ast_record_lit, rl_fields);
+    const rl_res = try emitResult(g, rl_node, rl_after_rb);
+    try g.ret(rl_res);
+
+    // Record update: { base | field: val, field: val }
+    g.beginReservedBlock(rec_update_blk);
+    const ru_base_name = try g.tagPayload(br_tok1, "Ident");
+    const ru_base = try g.tag(ast_ident, ru_base_name);
+    const ru_after_pipe = try emitAdvance(g, br_pos2); // skip |
+    const ru_empty = try g.listInit(&.{});
+    const ru_loop_blk = g.reserveBlock();
+    try g.jump(ru_loop_blk, &.{ ru_after_pipe, ru_empty });
+
+    g.beginReservedBlock(ru_loop_blk);
+    const ru_pos = try g.addBlockParam();
+    const ru_fields = try g.addBlockParam();
+    const ru_tok = try emitGetToken(g, tokens, ru_pos);
+    const ru_is_delim = try g.tagTest(ru_tok, "Delim");
+    const ru_check_rb_blk = g.reserveBlock();
+    const ru_parse_blk = g.reserveBlock();
+    try g.branch(ru_is_delim, ru_check_rb_blk, ru_parse_blk);
+
+    g.beginReservedBlock(ru_check_rb_blk);
+    const ru_delim = try g.tagPayload(ru_tok, "Delim");
+    const ru_rbrace = try g.constString("}");
+    const ru_is_rb = try g.eq(ru_delim, ru_rbrace);
+    const ru_done_blk = g.reserveBlock();
+    try g.branch(ru_is_rb, ru_done_blk, ru_parse_blk);
+
+    g.beginReservedBlock(ru_parse_blk);
+    const ru_fname = try g.tagPayload(ru_tok, "Ident");
+    const ru_after_name = try emitAdvance(g, ru_pos);
+    const ru_after_colon = try emitAdvance(g, ru_after_name); // skip :
+    const ru_zero = try g.constInt(0);
+    const ru_val_result = try g.callDirect(pf.parse_expr, &.{ tokens, ru_after_colon, ru_zero });
+    const ru_val_node = try g.recordField(ru_val_result, "node");
+    const ru_val_end = try g.recordField(ru_val_result, "pos");
+    const ru_field = try g.record(&.{
+        .{ .name = "name", .value = ru_fname },
+        .{ .name = "value", .value = ru_val_node },
+    });
+    const ru_fields2 = try g.listAppend(ru_fields, ru_field);
+    const ruc_tok = try emitGetToken(g, tokens, ru_val_end);
+    const ruc_is_punct = try g.tagTest(ruc_tok, "Punct");
+    const ruc_check_blk = g.reserveBlock();
+    const ruc_no_blk = g.reserveBlock();
+    try g.branch(ruc_is_punct, ruc_check_blk, ruc_no_blk);
+
+    g.beginReservedBlock(ruc_check_blk);
+    const ruc_val = try g.tagPayload(ruc_tok, "Punct");
+    const ruc_comma = try g.constString(",");
+    const ruc_is_comma = try g.eq(ruc_val, ruc_comma);
+    const ruc_skip_blk = g.reserveBlock();
+    try g.branch(ruc_is_comma, ruc_skip_blk, ruc_no_blk);
+
+    g.beginReservedBlock(ruc_skip_blk);
+    const ruc_after = try emitAdvance(g, ru_val_end);
+    try g.jump(ru_loop_blk, &.{ ruc_after, ru_fields2 });
+
+    g.beginReservedBlock(ruc_no_blk);
+    try g.jump(ru_loop_blk, &.{ ru_val_end, ru_fields2 });
+
+    g.beginReservedBlock(ru_done_blk);
+    const ru_after_rb = try emitAdvance(g, ru_pos);
+    const ru_rec = try g.record(&.{
+        .{ .name = "base", .value = ru_base },
+        .{ .name = "fields", .value = ru_fields },
+    });
+    const ru_node = try g.tag(ast_record_update, ru_rec);
+    const ru_res = try emitResult(g, ru_node, ru_after_rb);
+    try g.ret(ru_res);
+
+    // Fall through to block parsing
+    g.beginReservedBlock(br_block_blk);
     const block_result = try g.callDirect(pf.parse_block, &.{ tokens, next_pos });
     try g.ret(block_result);
 
@@ -2559,9 +3164,90 @@ fn genParseFnDecl(g: *Gen, pf: ParserFuncs) !void {
     const arrow_str = try g.constString("->");
     const is_arrow = try g.eq(rt_op, arrow_str);
     const has_ret_blk = g.reserveBlock();
-    try g.branch(is_arrow, has_ret_blk, no_ret_type_blk);
+    const check_effect_arrow_blk = g.reserveBlock();
+    try g.branch(is_arrow, has_ret_blk, check_effect_arrow_blk);
 
+    // Check for -[ (effect arrow)
+    g.beginReservedBlock(check_effect_arrow_blk);
+    const eff_arrow_str = try g.constString("-[");
+    const is_eff_arrow = try g.eq(rt_op, eff_arrow_str);
+    const eff_arrow_blk = g.reserveBlock();
+    try g.branch(is_eff_arrow, eff_arrow_blk, no_ret_type_blk);
+
+    // Effect arrow: -[Effect1, Effect2]> RetType
+    g.beginReservedBlock(eff_arrow_blk);
+    const ea_start = try emitAdvance(g, after_rp); // skip -[
+    const ea_empty = try g.listInit(&.{});
+    const ea_loop_blk = g.reserveBlock();
+    try g.jump(ea_loop_blk, &.{ ea_start, ea_empty });
+
+    g.beginReservedBlock(ea_loop_blk);
+    const ea_pos = try g.addBlockParam();
+    const ea_list = try g.addBlockParam();
+    const ea_tok = try emitGetToken(g, tokens, ea_pos);
+    // Check for ]>
+    const ea_is_op = try g.tagTest(ea_tok, "Op");
+    const ea_check_close_blk = g.reserveBlock();
+    const ea_parse_blk = g.reserveBlock();
+    try g.branch(ea_is_op, ea_check_close_blk, ea_parse_blk);
+
+    g.beginReservedBlock(ea_check_close_blk);
+    const ea_op_val = try g.tagPayload(ea_tok, "Op");
+    const ea_close = try g.constString("]>");
+    const ea_is_close = try g.eq(ea_op_val, ea_close);
+    const ea_done_blk = g.reserveBlock();
+    try g.branch(ea_is_close, ea_done_blk, ea_parse_blk);
+
+    // Parse one effect name
+    g.beginReservedBlock(ea_parse_blk);
+    const ea_name = try g.tagPayload(ea_tok, "UpperIdent");
+    const ea_list2 = try g.listAppend(ea_list, ea_name);
+    const ea_next = try emitAdvance(g, ea_pos);
+    // Check for comma
+    const eac_tok = try emitGetToken(g, tokens, ea_next);
+    const eac_is_punct = try g.tagTest(eac_tok, "Punct");
+    const eac_check_blk = g.reserveBlock();
+    const eac_no_blk = g.reserveBlock();
+    try g.branch(eac_is_punct, eac_check_blk, eac_no_blk);
+
+    g.beginReservedBlock(eac_check_blk);
+    const eac_val = try g.tagPayload(eac_tok, "Punct");
+    const eac_comma = try g.constString(",");
+    const eac_is_comma = try g.eq(eac_val, eac_comma);
+    const eac_skip_blk = g.reserveBlock();
+    try g.branch(eac_is_comma, eac_skip_blk, eac_no_blk);
+
+    g.beginReservedBlock(eac_skip_blk);
+    const eac_after = try emitAdvance(g, ea_next);
+    try g.jump(ea_loop_blk, &.{ eac_after, ea_list2 });
+
+    g.beginReservedBlock(eac_no_blk);
+    try g.jump(ea_loop_blk, &.{ ea_next, ea_list2 });
+
+    // After ]>: parse return type, then body
+    g.beginReservedBlock(ea_done_blk);
+    const ea_after_close = try emitAdvance(g, ea_pos); // skip ]>
+    const ea_ret_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, ea_after_close });
+    const ea_ret_node = try g.recordField(ea_ret_result, "node");
+    const ea_ret_end = try g.recordField(ea_ret_result, "pos");
+    const ea_body_start = try emitAdvance(g, ea_ret_end); // skip {
+    const ea_body_result = try g.callDirect(pf.parse_block, &.{ tokens, ea_body_start });
+    const ea_body_node = try g.recordField(ea_body_result, "node");
+    const ea_body_end = try g.recordField(ea_body_result, "pos");
+    const ea_fn_rec = try g.record(&.{
+        .{ .name = "name", .value = fn_name },
+        .{ .name = "params", .value = p_params },
+        .{ .name = "effects", .value = ea_list },
+        .{ .name = "return_type", .value = ea_ret_node },
+        .{ .name = "body", .value = ea_body_node },
+    });
+    const ea_fn_node = try g.tag(ast_fn_decl, ea_fn_rec);
+    const ea_fn_res = try emitResult(g, ea_fn_node, ea_body_end);
+    try g.ret(ea_fn_res);
+
+    // Simple -> return type (no effects)
     g.beginReservedBlock(has_ret_blk);
+    const nil_effects = try g.listInit(&.{});
     const ret_type_start = try emitAdvance(g, after_rp); // skip ->
     const ret_type_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, ret_type_start });
     const ret_type_node = try g.recordField(ret_type_result, "node");
@@ -2574,6 +3260,7 @@ fn genParseFnDecl(g: *Gen, pf: ParserFuncs) !void {
     const fn_rec = try g.record(&.{
         .{ .name = "name", .value = fn_name },
         .{ .name = "params", .value = p_params },
+        .{ .name = "effects", .value = nil_effects },
         .{ .name = "return_type", .value = ret_type_node },
         .{ .name = "body", .value = body_node },
     });
@@ -2583,6 +3270,7 @@ fn genParseFnDecl(g: *Gen, pf: ParserFuncs) !void {
 
     // No return type: parse body directly
     g.beginReservedBlock(no_ret_type_blk);
+    const nb_nil_effects = try g.listInit(&.{});
     const nb_start = try emitAdvance(g, after_rp); // skip {
     const nb_result = try g.callDirect(pf.parse_block, &.{ tokens, nb_start });
     const nb_node = try g.recordField(nb_result, "node");
@@ -2591,6 +3279,7 @@ fn genParseFnDecl(g: *Gen, pf: ParserFuncs) !void {
     const fn_rec2 = try g.record(&.{
         .{ .name = "name", .value = fn_name },
         .{ .name = "params", .value = p_params },
+        .{ .name = "effects", .value = nb_nil_effects },
         .{ .name = "return_type", .value = nil_ret },
         .{ .name = "body", .value = nb_node },
     });
@@ -2615,16 +3304,122 @@ fn genParseTypeDecl(g: *Gen, pf: ParserFuncs) !void {
     const type_name = try g.tagPayload(name_tok, "UpperIdent");
     const after_name = try emitAdvance(g, pos);
 
+    // Check for <T, U> type params
+    const tp_tok = try emitGetToken(g, tokens, after_name);
+    const tp_is_op = try g.tagTest(tp_tok, "Op");
+    const tp_check_lt_blk = g.reserveBlock();
+    const tp_no_params_blk = g.reserveBlock();
+    try g.branch(tp_is_op, tp_check_lt_blk, tp_no_params_blk);
+
+    g.beginReservedBlock(tp_check_lt_blk);
+    const tp_op = try g.tagPayload(tp_tok, "Op");
+    const tp_lt = try g.constString("<");
+    const tp_is_lt = try g.eq(tp_op, tp_lt);
+    const tp_parse_blk = g.reserveBlock();
+    try g.branch(tp_is_lt, tp_parse_blk, tp_no_params_blk);
+
+    // Parse type params until >
+    g.beginReservedBlock(tp_parse_blk);
+    const tp_start = try emitAdvance(g, after_name); // skip <
+    const tp_empty = try g.listInit(&.{});
+    const tp_loop_blk = g.reserveBlock();
+    try g.jump(tp_loop_blk, &.{ tp_start, tp_empty });
+
+    g.beginReservedBlock(tp_loop_blk);
+    const tp_pos = try g.addBlockParam();
+    const tp_list = try g.addBlockParam();
+    const tp_cur = try emitGetToken(g, tokens, tp_pos);
+    const tp_cur_is_op = try g.tagTest(tp_cur, "Op");
+    const tp_check_gt_blk = g.reserveBlock();
+    const tp_parse_one_blk = g.reserveBlock();
+    try g.branch(tp_cur_is_op, tp_check_gt_blk, tp_parse_one_blk);
+
+    g.beginReservedBlock(tp_check_gt_blk);
+    const tp_cur_op = try g.tagPayload(tp_cur, "Op");
+    const tp_gt = try g.constString(">");
+    const tp_is_gt = try g.eq(tp_cur_op, tp_gt);
+    const tp_done_blk = g.reserveBlock();
+    try g.branch(tp_is_gt, tp_done_blk, tp_parse_one_blk);
+
+    g.beginReservedBlock(tp_parse_one_blk);
+    // Type params can be UpperIdent (T, K, V) or Ident (a, b)
+    const tp_is_upper = try g.tagTest(tp_cur, "UpperIdent");
+    const tp_upper_blk = g.reserveBlock();
+    const tp_lower_blk = g.reserveBlock();
+    try g.branch(tp_is_upper, tp_upper_blk, tp_lower_blk);
+
+    g.beginReservedBlock(tp_upper_blk);
+    const tp_name_u = try g.tagPayload(tp_cur, "UpperIdent");
+    const tp_list2_u = try g.listAppend(tp_list, tp_name_u);
+    const tp_next_u = try emitAdvance(g, tp_pos);
+    // Check for comma (same logic for both paths - converge below)
+    const tpu_tok = try emitGetToken(g, tokens, tp_next_u);
+    const tpu_is_punct = try g.tagTest(tpu_tok, "Punct");
+    const tpu_check_blk = g.reserveBlock();
+    const tpu_no_blk = g.reserveBlock();
+    try g.branch(tpu_is_punct, tpu_check_blk, tpu_no_blk);
+
+    g.beginReservedBlock(tpu_check_blk);
+    const tpu_val = try g.tagPayload(tpu_tok, "Punct");
+    const tpu_comma = try g.constString(",");
+    const tpu_is_comma = try g.eq(tpu_val, tpu_comma);
+    const tpu_skip_blk = g.reserveBlock();
+    try g.branch(tpu_is_comma, tpu_skip_blk, tpu_no_blk);
+
+    g.beginReservedBlock(tpu_skip_blk);
+    const tpu_after = try emitAdvance(g, tp_next_u);
+    try g.jump(tp_loop_blk, &.{ tpu_after, tp_list2_u });
+
+    g.beginReservedBlock(tpu_no_blk);
+    try g.jump(tp_loop_blk, &.{ tp_next_u, tp_list2_u });
+
+    g.beginReservedBlock(tp_lower_blk);
+    const tp_name = try g.tagPayload(tp_cur, "Ident");
+    const tp_list2 = try g.listAppend(tp_list, tp_name);
+    const tp_next = try emitAdvance(g, tp_pos);
+    // Check for comma
+    const tpc_tok = try emitGetToken(g, tokens, tp_next);
+    const tpc_is_punct = try g.tagTest(tpc_tok, "Punct");
+    const tpc_check_blk = g.reserveBlock();
+    const tpc_no_blk = g.reserveBlock();
+    try g.branch(tpc_is_punct, tpc_check_blk, tpc_no_blk);
+
+    g.beginReservedBlock(tpc_check_blk);
+    const tpc_val = try g.tagPayload(tpc_tok, "Punct");
+    const tpc_comma = try g.constString(",");
+    const tpc_is_comma = try g.eq(tpc_val, tpc_comma);
+    const tpc_skip_blk = g.reserveBlock();
+    try g.branch(tpc_is_comma, tpc_skip_blk, tpc_no_blk);
+
+    g.beginReservedBlock(tpc_skip_blk);
+    const tpc_after = try emitAdvance(g, tp_next);
+    try g.jump(tp_loop_blk, &.{ tpc_after, tp_list2 });
+
+    g.beginReservedBlock(tpc_no_blk);
+    try g.jump(tp_loop_blk, &.{ tp_next, tp_list2 });
+
+    // Done: after >
+    g.beginReservedBlock(tp_done_blk);
+    const tp_after_gt = try emitAdvance(g, tp_pos); // skip >
+    // Skip {
+    const tp_variants_start = try emitAdvance(g, tp_after_gt);
+    const tp_variants_empty = try g.listInit(&.{});
+    const variants_loop_blk = g.reserveBlock();
+    try g.jump(variants_loop_blk, &.{ tp_variants_start, tp_variants_empty, tp_list });
+
+    // No type params path
+    g.beginReservedBlock(tp_no_params_blk);
+    const np_nil_tparams = try g.listInit(&.{});
     // Skip {
     const variants_start = try emitAdvance(g, after_name);
     const variants_empty = try g.listInit(&.{});
-    const variants_loop_blk = g.reserveBlock();
-    try g.jump(variants_loop_blk, &.{ variants_start, variants_empty });
+    try g.jump(variants_loop_blk, &.{ variants_start, variants_empty, np_nil_tparams });
 
     // Loop: parse variants until }
     g.beginReservedBlock(variants_loop_blk);
     const v_pos = try g.addBlockParam();
     const v_variants = try g.addBlockParam();
+    const v_type_params = try g.addBlockParam();
     const v_tok = try emitGetToken(g, tokens, v_pos);
     const comma = try g.constString(",");
 
@@ -2692,10 +3487,10 @@ fn genParseTypeDecl(g: *Gen, pf: ParserFuncs) !void {
 
     g.beginReservedBlock(vac_skip_blk);
     const vac_after = try emitAdvance(g, va_after_rp);
-    try g.jump(variants_loop_blk, &.{ vac_after, va_variants });
+    try g.jump(variants_loop_blk, &.{ vac_after, va_variants, v_type_params });
 
     g.beginReservedBlock(vac_no_blk);
-    try g.jump(variants_loop_blk, &.{ va_after_rp, va_variants });
+    try g.jump(variants_loop_blk, &.{ va_after_rp, va_variants, v_type_params });
 
     // variant without args
     g.beginReservedBlock(vn_no_args_blk);
@@ -2720,10 +3515,10 @@ fn genParseTypeDecl(g: *Gen, pf: ParserFuncs) !void {
 
     g.beginReservedBlock(vnc_skip_blk);
     const vnc_after = try emitAdvance(g, v_next);
-    try g.jump(variants_loop_blk, &.{ vnc_after, vn_variants });
+    try g.jump(variants_loop_blk, &.{ vnc_after, vn_variants, v_type_params });
 
     g.beginReservedBlock(vnc_no_blk);
-    try g.jump(variants_loop_blk, &.{ v_next, vn_variants });
+    try g.jump(variants_loop_blk, &.{ v_next, vn_variants, v_type_params });
 
     // Record field: name: Type
     g.beginReservedBlock(field_blk);
@@ -2754,16 +3549,17 @@ fn genParseTypeDecl(g: *Gen, pf: ParserFuncs) !void {
 
     g.beginReservedBlock(fc_skip_blk);
     const fc_after = try emitAdvance(g, f_type_end);
-    try g.jump(variants_loop_blk, &.{ fc_after, f_variants });
+    try g.jump(variants_loop_blk, &.{ fc_after, f_variants, v_type_params });
 
     g.beginReservedBlock(fc_no_blk);
-    try g.jump(variants_loop_blk, &.{ f_type_end, f_variants });
+    try g.jump(variants_loop_blk, &.{ f_type_end, f_variants, v_type_params });
 
     // done
     g.beginReservedBlock(v_done_blk);
     const after_rb = try emitAdvance(g, v_pos);
     const type_rec = try g.record(&.{
         .{ .name = "name", .value = type_name },
+        .{ .name = "type_params", .value = v_type_params },
         .{ .name = "variants", .value = v_variants },
     });
     const type_node = try g.tag(ast_type_decl, type_rec);
@@ -4932,4 +5728,278 @@ test "grammar: parse mixed declarations" {
     try std.testing.expectEqualStrings("TraitDecl", ctx.tagName(decls[1]));
     try std.testing.expectEqualStrings("EffectDecl", ctx.tagName(decls[2]));
     try std.testing.expectEqualStrings("FnDecl", ctx.tagName(decls[3]));
+}
+
+// ── TypeDecl type params ──────────────────────────────────────────────
+
+test "grammar: type decl with type params" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("type Option<T> { Some(T), None }");
+    try std.testing.expectEqualStrings("TypeDecl", ctx.tagName(decl));
+    try std.testing.expectEqualStrings("Option", ctx.field(decl, "name").?.string);
+    const tparams = ctx.field(decl, "type_params").?.list;
+    try std.testing.expectEqual(@as(usize, 1), tparams.items.len);
+    try std.testing.expectEqualStrings("T", tparams.items[0].string);
+}
+
+test "grammar: type decl with multiple type params" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("type Either<L, R> { Left(L), Right(R) }");
+    try std.testing.expectEqualStrings("TypeDecl", ctx.tagName(decl));
+    const tparams = ctx.field(decl, "type_params").?.list;
+    try std.testing.expectEqual(@as(usize, 2), tparams.items.len);
+    try std.testing.expectEqualStrings("L", tparams.items[0].string);
+    try std.testing.expectEqualStrings("R", tparams.items[1].string);
+}
+
+test "grammar: type decl without type params has empty list" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("type Bool { True, False }");
+    const tparams = ctx.field(decl, "type_params").?.list;
+    try std.testing.expectEqual(@as(usize, 0), tparams.items.len);
+}
+
+// ── FnDecl effect arrows ─────────────────────────────────────────────
+
+test "grammar: fn decl with effect arrow" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn read() -[IO]> String { nil }");
+    try std.testing.expectEqualStrings("FnDecl", ctx.tagName(decl));
+    try std.testing.expectEqualStrings("read", ctx.field(decl, "name").?.string);
+    const effects = ctx.field(decl, "effects").?.list;
+    try std.testing.expectEqual(@as(usize, 1), effects.items.len);
+    try std.testing.expectEqualStrings("IO", effects.items[0].string);
+    const ret = ctx.field(decl, "return_type").?;
+    try std.testing.expectEqualStrings("TypeNamed", ctx.tagName(ret));
+}
+
+test "grammar: fn decl with multiple effects" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn run() -[IO, State]> Int { 0 }");
+    const effects = ctx.field(decl, "effects").?.list;
+    try std.testing.expectEqual(@as(usize, 2), effects.items.len);
+    try std.testing.expectEqualStrings("IO", effects.items[0].string);
+    try std.testing.expectEqualStrings("State", effects.items[1].string);
+}
+
+test "grammar: fn decl without effects has empty list" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn add(a: Int, b: Int) -> Int { a }");
+    const effects = ctx.field(decl, "effects").?.list;
+    try std.testing.expectEqual(@as(usize, 0), effects.items.len);
+}
+
+test "grammar: fn decl no return type has empty effects" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn main() { 42 }");
+    const effects = ctx.field(decl, "effects").?.list;
+    try std.testing.expectEqual(@as(usize, 0), effects.items.len);
+    try std.testing.expect(ctx.field(decl, "return_type").? == .nil);
+}
+
+// ── StringInterp ──────────────────────────────────────────────────────
+
+test "grammar: lex string with interpolation" {
+    var backing = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer backing.deinit();
+    const a = backing.allocator();
+    var pool = InternPool.init(a);
+    const module, const funcs = try buildModule(a, &pool);
+    var interp = Interpreter.init(a, module, &pool);
+    defer interp.deinit();
+    try builtins_mod.registerAll(&interp);
+
+    const result = try interp.execFunc(funcs.lex, &.{.{ .string = "\"hello {name}\"" }});
+    const list = result.list;
+    const tok_name = try pool.intern(a, "token");
+    const tag0 = getField(list.items[0].record, tok_name).?.tagged;
+    try std.testing.expectEqualStrings("StringInterp", pool.get(tag0.tag));
+}
+
+test "grammar: lex plain string stays StringLit" {
+    var backing = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer backing.deinit();
+    const a = backing.allocator();
+    var pool = InternPool.init(a);
+    const module, const funcs = try buildModule(a, &pool);
+    var interp = Interpreter.init(a, module, &pool);
+    defer interp.deinit();
+    try builtins_mod.registerAll(&interp);
+
+    const result = try interp.execFunc(funcs.lex, &.{.{ .string = "\"hello world\"" }});
+    const list = result.list;
+    const tok_name = try pool.intern(a, "token");
+    const tag0 = getField(list.items[0].record, tok_name).?.tagged;
+    try std.testing.expectEqualStrings("StringLit", pool.get(tag0.tag));
+}
+
+test "grammar: parse string interpolation expr" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn f() { \"hello {name}\" }");
+    try std.testing.expectEqualStrings("FnDecl", ctx.tagName(decl));
+    const body = ctx.field(decl, "body").?;
+    try std.testing.expectEqualStrings("StringInterp", ctx.tagName(body));
+}
+
+// ── RecordLit ─────────────────────────────────────────────────────────
+
+test "grammar: parse record literal" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn f() { {x: 1, y: 2} }");
+    const body = ctx.field(decl, "body").?;
+    try std.testing.expectEqualStrings("RecordLit", ctx.tagName(body));
+    const fields = body.tagged.payload.?.list;
+    try std.testing.expectEqual(@as(usize, 2), fields.items.len);
+}
+
+test "grammar: parse single-field record literal" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn f() { {name: \"chris\"} }");
+    const body = ctx.field(decl, "body").?;
+    try std.testing.expectEqualStrings("RecordLit", ctx.tagName(body));
+}
+
+// ── RecordUpdate ──────────────────────────────────────────────────────
+
+test "grammar: parse record update" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn f() { {p | x: 1} }");
+    const body = ctx.field(decl, "body").?;
+    try std.testing.expectEqualStrings("RecordUpdate", ctx.tagName(body));
+    const base = ctx.field(body, "base").?;
+    try std.testing.expectEqualStrings("Ident", ctx.tagName(base));
+    const fields = ctx.field(body, "fields").?.list;
+    try std.testing.expectEqual(@as(usize, 1), fields.items.len);
+}
+
+test "grammar: parse record update multiple fields" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn f() { {p | x: 1, y: 2} }");
+    const body = ctx.field(decl, "body").?;
+    try std.testing.expectEqualStrings("RecordUpdate", ctx.tagName(body));
+    const fields = ctx.field(body, "fields").?.list;
+    try std.testing.expectEqual(@as(usize, 2), fields.items.len);
+}
+
+// ── TypeExpr: union, intersection, complement, fn type ────────────────
+
+test "grammar: type union" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn f(x: Int | String) { x }");
+    const params = ctx.field(decl, "params").?.list;
+    const param_type = getFieldByName(ctx.alloc(), &ctx.pool, params.items[0].record, "type").?;
+    try std.testing.expectEqualStrings("TypeUnion", ctx.tagName(param_type));
+}
+
+test "grammar: type intersection" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn f(x: Readable & Writable) { x }");
+    const params = ctx.field(decl, "params").?.list;
+    const param_type = getFieldByName(ctx.alloc(), &ctx.pool, params.items[0].record, "type").?;
+    try std.testing.expectEqualStrings("TypeIntersection", ctx.tagName(param_type));
+}
+
+test "grammar: type complement" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn f(x: ~Nil) { x }");
+    const params = ctx.field(decl, "params").?.list;
+    const param_type = getFieldByName(ctx.alloc(), &ctx.pool, params.items[0].record, "type").?;
+    try std.testing.expectEqualStrings("TypeComplement", ctx.tagName(param_type));
+}
+
+test "grammar: nullable type via suffix" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn f(x: Int?) { x }");
+    const params = ctx.field(decl, "params").?.list;
+    const param_type = getFieldByName(ctx.alloc(), &ctx.pool, params.items[0].record, "type").?;
+    try std.testing.expectEqualStrings("TypeNullable", ctx.tagName(param_type));
+}
+
+test "grammar: function type in annotation" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn apply(f: (Int) -> Int, x: Int) -> Int { f(x) }");
+    const params = ctx.field(decl, "params").?.list;
+    const param_type = getFieldByName(ctx.alloc(), &ctx.pool, params.items[0].record, "type").?;
+    try std.testing.expectEqualStrings("TypeFn", ctx.tagName(param_type));
+    const fn_params = ctx.field(param_type, "params").?.list;
+    try std.testing.expectEqual(@as(usize, 1), fn_params.items.len);
+    const fn_ret = ctx.field(param_type, "ret").?;
+    try std.testing.expectEqualStrings("TypeNamed", ctx.tagName(fn_ret));
+}
+
+test "grammar: function type with effects" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn apply(f: (Int) -[IO]> Int) { f(0) }");
+    const params = ctx.field(decl, "params").?.list;
+    const param_type = getFieldByName(ctx.alloc(), &ctx.pool, params.items[0].record, "type").?;
+    try std.testing.expectEqualStrings("TypeFn", ctx.tagName(param_type));
+    const effects = ctx.field(param_type, "effects").?.list;
+    try std.testing.expectEqual(@as(usize, 1), effects.items.len);
+    try std.testing.expectEqualStrings("IO", effects.items[0].string);
+}
+
+// ── Pattern: type narrow, record pattern ──────────────────────────────
+
+test "grammar: pattern type narrow in match" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn f(x: Int) { match x { n: Int -> n } }");
+    const body = ctx.field(decl, "body").?;
+    try std.testing.expectEqualStrings("Match", ctx.tagName(body));
+    const arms = ctx.field(body, "arms").?.list;
+    const pat = getFieldByName(ctx.alloc(), &ctx.pool, arms.items[0].record, "pattern").?;
+    try std.testing.expectEqualStrings("PatTypeNarrow", ctx.tagName(pat));
+    try std.testing.expectEqualStrings("n", ctx.field(pat, "name").?.string);
+    const te = ctx.field(pat, "type_expr").?;
+    try std.testing.expectEqualStrings("TypeNamed", ctx.tagName(te));
+}
+
+test "grammar: record pattern in match" {
+    var ctx: ParseTestCtx = undefined;
+    ctx.initInPlace();
+    defer ctx.deinit();
+    const decl = try ctx.parseOne("fn f(p: Int) { match p { {x, y} -> x } }");
+    const body = ctx.field(decl, "body").?;
+    const arms = ctx.field(body, "arms").?.list;
+    const pat = getFieldByName(ctx.alloc(), &ctx.pool, arms.items[0].record, "pattern").?;
+    try std.testing.expectEqualStrings("PatRecord", ctx.tagName(pat));
+    const fields = pat.tagged.payload.?.list;
+    try std.testing.expectEqual(@as(usize, 2), fields.items.len);
 }

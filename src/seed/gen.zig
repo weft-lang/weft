@@ -148,6 +148,11 @@ pub const Gen = struct {
         return self.callBuiltin("list_nth", &.{ list, idx });
     }
 
+    pub fn listHead(self: *Gen, list: ValueId) !ValueId {
+        const zero = try self.constInt(0);
+        return self.callBuiltin("list_nth", &.{ list, zero });
+    }
+
     pub fn ioPrint(self: *Gen, msg: ValueId) !ValueId {
         return self.callBuiltin("io_print", &.{msg});
     }
