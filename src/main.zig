@@ -6,6 +6,7 @@ comptime {
     _ = @import("intern.zig");
     _ = @import("span.zig");
     _ = @import("diag.zig");
+    _ = @import("types.zig");
     _ = @import("ir.zig");
 }
 

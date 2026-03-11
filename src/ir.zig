@@ -3,6 +3,8 @@ const Allocator = std.mem.Allocator;
 const intern_mod = @import("intern.zig");
 const InternedString = intern_mod.InternedString;
 const InternPool = intern_mod.InternPool;
+const types_mod = @import("types.zig");
+pub const Type = types_mod.Type;
 
 // ── ID types ────────────────────────────────────────────────────────────
 
@@ -138,15 +140,9 @@ pub const Block = struct {
     terminator: Terminator,
 };
 
-// ── Effect sets ─────────────────────────────────────────────────────────
+// ── Effect sets (canonical definition in types.zig) ─────────────────────
 
-pub const EffectSet = struct {
-    effects: []const InternedString,
-    /// Open effect variable for polymorphism (null = closed/pure).
-    tail_var: ?u32,
-
-    pub const pure: EffectSet = .{ .effects = &.{}, .tail_var = null };
-};
+pub const EffectSet = types_mod.EffectSet;
 
 // ── Handler definitions ─────────────────────────────────────────────────
 
@@ -176,7 +172,7 @@ pub const Func = struct {
     name: InternedString,
     params: []const ValueId,
     /// Type reference — opaque until brief 0b lands.
-    return_type: ?*const anyopaque,
+    return_type: ?*const Type,
     effect_set: EffectSet,
     blocks: []const Block,
     entry: BlockId,
