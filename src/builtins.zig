@@ -167,6 +167,41 @@ fn string_contains(args: []const Value, _: *anyopaque) InterpreterError!Value {
     return .{ .bool_val = std.mem.indexOf(u8, haystack, needle) != null };
 }
 
+fn string_byte_at(args: []const Value, _: *anyopaque) InterpreterError!Value {
+    if (args.len < 2) return error.ArityMismatch;
+    const s = try expectString(args[0]);
+    const idx_i = try expectInt(args[1]);
+    if (idx_i < 0 or @as(usize, @intCast(idx_i)) >= s.len) return .{ .int = -1 };
+    return .{ .int = @intCast(s[@intCast(idx_i)]) };
+}
+
+fn string_starts_with(args: []const Value, _: *anyopaque) InterpreterError!Value {
+    if (args.len < 2) return error.ArityMismatch;
+    const s = try expectString(args[0]);
+    const prefix = try expectString(args[1]);
+    return .{ .bool_val = std.mem.startsWith(u8, s, prefix) };
+}
+
+fn string_from_int_char(args: []const Value, ctx: *anyopaque) InterpreterError!Value {
+    if (args.len < 1) return error.ArityMismatch;
+    const self = getInterp(ctx);
+    const code = try expectInt(args[0]);
+    if (code < 0 or code > 255) return error.TypeError;
+    const result = self.arena.alloc(u8, 1) catch return error.OutOfMemory;
+    result[0] = @intCast(@as(u8, @truncate(@as(u64, @bitCast(code)))));
+    return .{ .string = result };
+}
+
+fn string_index_of(args: []const Value, _: *anyopaque) InterpreterError!Value {
+    if (args.len < 2) return error.ArityMismatch;
+    const haystack = try expectString(args[0]);
+    const needle = try expectString(args[1]);
+    if (std.mem.indexOf(u8, haystack, needle)) |idx| {
+        return .{ .int = @intCast(idx) };
+    }
+    return .{ .int = -1 };
+}
+
 // ── List operations ────────────────────────────────────────────────────
 
 fn list_length(args: []const Value, _: *anyopaque) InterpreterError!Value {
@@ -209,6 +244,19 @@ fn list_slice(args: []const Value, ctx: *anyopaque) InterpreterError!Value {
     if (start > l.items.len or end > l.items.len or start > end) return error.IndexOutOfBounds;
     const new_items = self.arena.alloc(Value, end - start) catch return error.OutOfMemory;
     @memcpy(new_items, l.items[start..end]);
+    const new_list = self.arena.create(ListValue) catch return error.OutOfMemory;
+    new_list.* = .{ .items = new_items };
+    return .{ .list = new_list };
+}
+
+fn list_concat(args: []const Value, ctx: *anyopaque) InterpreterError!Value {
+    if (args.len < 2) return error.ArityMismatch;
+    const self = getInterp(ctx);
+    const a = try expectList(args[0]);
+    const b = try expectList(args[1]);
+    const new_items = self.arena.alloc(Value, a.items.len + b.items.len) catch return error.OutOfMemory;
+    @memcpy(new_items[0..a.items.len], a.items);
+    @memcpy(new_items[a.items.len..], b.items);
     const new_list = self.arena.create(ListValue) catch return error.OutOfMemory;
     new_list.* = .{ .items = new_items };
     return .{ .list = new_list };
@@ -361,11 +409,16 @@ pub fn registerAll(self: *Interpreter) InterpreterError!void {
         .{ "string_to_int", string_to_int },
         .{ "string_from_int", string_from_int },
         .{ "string_contains", string_contains },
+        .{ "string_byte_at", string_byte_at },
+        .{ "string_starts_with", string_starts_with },
+        .{ "string_from_int_char", string_from_int_char },
+        .{ "string_index_of", string_index_of },
         // List
         .{ "list_length", list_length },
         .{ "list_append", list_append },
         .{ "list_nth", list_nth },
         .{ "list_slice", list_slice },
+        .{ "list_concat", list_concat },
         // Map
         .{ "map_new", map_new },
         .{ "map_get", map_get },
@@ -748,6 +801,83 @@ test "builtin: bytes_append_u64_le" {
 }
 
 // ── IO tests (limited — avoid actual file IO in tests) ────────────────
+
+test "builtin: string_byte_at" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    _ = h.setup();
+    const result = try h.runBuiltin("string_byte_at", &.{ .{ .string = "ABC" }, .{ .int = 0 } });
+    try std.testing.expectEqual(@as(i64, 65), result.int); // 'A' = 65
+}
+
+test "builtin: string_byte_at out of bounds" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    _ = h.setup();
+    const result = try h.runBuiltin("string_byte_at", &.{ .{ .string = "hi" }, .{ .int = 5 } });
+    try std.testing.expectEqual(@as(i64, -1), result.int);
+}
+
+test "builtin: string_starts_with" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    _ = h.setup();
+    const r1 = try h.runBuiltin("string_starts_with", &.{ .{ .string = "hello world" }, .{ .string = "hello" } });
+    try std.testing.expect(r1.bool_val == true);
+    const r2 = try h.runBuiltin("string_starts_with", &.{ .{ .string = "hello" }, .{ .string = "world" } });
+    try std.testing.expect(r2.bool_val == false);
+}
+
+test "builtin: string_from_int_char" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    _ = h.setup();
+    const result = try h.runBuiltin("string_from_int_char", &.{.{ .int = 65 }});
+    try std.testing.expectEqualStrings("A", result.string);
+}
+
+test "builtin: string_index_of" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    _ = h.setup();
+    const r1 = try h.runBuiltin("string_index_of", &.{ .{ .string = "hello world" }, .{ .string = "world" } });
+    try std.testing.expectEqual(@as(i64, 6), r1.int);
+    const r2 = try h.runBuiltin("string_index_of", &.{ .{ .string = "hello" }, .{ .string = "xyz" } });
+    try std.testing.expectEqual(@as(i64, -1), r2.int);
+}
+
+test "builtin: list_concat" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const alloc, const pool, var b = h.setup();
+
+    const n_len = try pool.intern(alloc, "list_concat");
+    const n_list_len = try pool.intern(alloc, "list_length");
+
+    b.beginFunc(try pool.intern(alloc, "test_main"));
+    _ = b.beginBlock();
+
+    const a = try b.addInst(.{ .list_init = .{ .elements = &.{} } });
+    const v1 = try b.addInst(.{ .const_int = 1 });
+    const a1 = try b.addInst(.{ .call_builtin = .{ .name = try pool.intern(alloc, "list_append"), .args = &.{ a, v1 } } });
+
+    const c = try b.addInst(.{ .list_init = .{ .elements = &.{} } });
+    const v2 = try b.addInst(.{ .const_int = 2 });
+    const c1 = try b.addInst(.{ .call_builtin = .{ .name = try pool.intern(alloc, "list_append"), .args = &.{ c, v2 } } });
+
+    const merged = try b.addInst(.{ .call_builtin = .{ .name = n_len, .args = &.{ a1, c1 } } });
+    const len = try b.addInst(.{ .call_builtin = .{ .name = n_list_len, .args = &.{merged} } });
+    try b.endBlock(.{ .ret = len });
+    const fid = try b.endFunc();
+    const module = try b.build(fid);
+
+    var interpreter = Interpreter.init(alloc, module, pool);
+    defer interpreter.deinit();
+    try registerAll(&interpreter);
+
+    const result = try interpreter.execFunc(fid, &.{});
+    try std.testing.expectEqual(@as(i64, 2), result.int);
+}
 
 test "builtin: io_print (smoke test)" {
     var h = TestHarness.init();
