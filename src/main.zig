@@ -8,6 +8,8 @@ comptime {
     _ = @import("diag.zig");
     _ = @import("types.zig");
     _ = @import("ir.zig");
+    _ = @import("interp.zig");
+    _ = @import("builtins.zig");
 }
 
 pub fn main() !void {
