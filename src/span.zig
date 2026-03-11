@@ -188,3 +188,26 @@ test "source_map: file name" {
     try std.testing.expectEqualStrings("main.rz", sm.getFileName(fid));
     try std.testing.expectEqualStrings("fn main() {}", sm.getSource(fid));
 }
+
+test "source_map: multiple files" {
+    const gpa = std.testing.allocator;
+    var sm: SourceMap = .empty;
+    defer sm.deinit(gpa);
+
+    const fid0 = try sm.addFile(gpa, "a.rz", "let a = 1\nlet b = 2");
+    const fid1 = try sm.addFile(gpa, "b.rz", "let c = 3");
+
+    try std.testing.expect(fid0 != fid1);
+    try std.testing.expectEqualStrings("a.rz", sm.getFileName(fid0));
+    try std.testing.expectEqualStrings("b.rz", sm.getFileName(fid1));
+
+    // line/col in first file, second line
+    const lc = sm.offsetToLineCol(fid0, 10);
+    try std.testing.expectEqual(@as(u32, 1), lc.line);
+    try std.testing.expectEqual(@as(u32, 0), lc.col);
+
+    // line/col in second file
+    const lc2 = sm.offsetToLineCol(fid1, 4);
+    try std.testing.expectEqual(@as(u32, 0), lc2.line);
+    try std.testing.expectEqual(@as(u32, 4), lc2.col);
+}

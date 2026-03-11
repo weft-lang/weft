@@ -1017,3 +1017,264 @@ test "ir: every const variant" {
     gpa.free(module.funcs[0].blocks);
     gpa.free(module.funcs[0].handle_defs);
 }
+
+test "ir: all instruction variants serialize round-trip" {
+    const gpa = std.testing.allocator;
+    var arena = @import("arena.zig").Arena.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var pool = InternPool.init(gpa);
+    defer pool.deinit(gpa);
+
+    const name = try pool.intern(gpa, "all_variants");
+    const field_a = try pool.intern(gpa, "a");
+    const tag_x = try pool.intern(gpa, "X");
+    const effect_io = try pool.intern(gpa, "IO");
+    const op_print = try pool.intern(gpa, "print");
+    const builtin_len = try pool.intern(gpa, "len");
+
+    var b = Builder.init(alloc);
+
+    // A second function to reference with call_direct/closure.
+    b.beginFunc(try pool.intern(gpa, "helper"));
+    _ = b.beginBlock();
+    const helper_ret = try b.addInst(.{ .const_int = 0 });
+    try b.endBlock(.{ .ret = helper_ret });
+    const helper_fid = try b.endFunc();
+
+    // Main function with every instruction variant.
+    b.beginFunc(name);
+    _ = b.beginBlock();
+
+    const v_int = try b.addInst(.{ .const_int = -999 });
+    const v_float = try b.addInst(.{ .const_float = 2.718 });
+    const v_str = try b.addInst(.{ .const_string = field_a });
+    const v_bool = try b.addInst(.{ .const_bool = true });
+    const v_nil = try b.addInst(.const_nil);
+    const v_bin = try b.addInst(.{ .binary = .{ .op = .add, .lhs = v_int, .rhs = v_int } });
+    const v_un = try b.addInst(.{ .unary = .{ .op = .neg, .operand = v_int } });
+    const v_rec = try b.addInst(.{ .record_init = .{ .fields = &.{.{ .name = field_a, .value = v_int }} } });
+    _ = try b.addInst(.{ .record_field = .{ .record = v_rec, .field = field_a } });
+    _ = try b.addInst(.{ .record_update = .{ .base = v_rec, .updates = &.{.{ .name = field_a, .value = v_float }} } });
+    const v_tag = try b.addInst(.{ .tag_init = .{ .tag = tag_x, .payload = v_int } });
+    _ = try b.addInst(.{ .tag_test = .{ .value = v_tag, .tag = tag_x } });
+    _ = try b.addInst(.{ .tag_payload = .{ .value = v_tag, .tag = tag_x } });
+    const v_lst = try b.addInst(.{ .list_init = .{ .elements = &.{ v_int, v_float } } });
+    _ = try b.addInst(.{ .call = .{ .callee = v_nil, .args = &.{v_int} } });
+    _ = try b.addInst(.{ .call_direct = .{ .func = helper_fid, .args = &.{v_int} } });
+    _ = try b.addInst(.{ .call_builtin = .{ .name = builtin_len, .args = &.{v_lst} } });
+    _ = try b.addInst(.{ .closure = .{ .func = helper_fid, .captures = &.{v_int} } });
+    _ = try b.addInst(.{ .perform = .{ .effect = effect_io, .op = op_print, .args = &.{v_str} } });
+    _ = try b.addInst(.{ .retain = v_rec });
+    _ = try b.addInst(.{ .release = v_rec });
+    _ = try b.addInst(.{ .copy = v_int });
+    _ = v_bin;
+    _ = v_un;
+    _ = v_bool;
+
+    try b.endBlock(.{ .ret = v_nil });
+    const fid = try b.endFunc();
+    const module = try b.build(fid);
+
+    try std.testing.expectEqual(@as(usize, 22), module.funcs[1].blocks[0].insts.len);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try serialize(module, &pool, buf.writer(gpa));
+
+    // Use a backing arena so pool2 + deserialized data share one allocator
+    var backing2 = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer backing2.deinit();
+    const alloc2 = backing2.allocator();
+
+    var pool2 = InternPool.init(alloc2);
+
+    var stream = std.io.fixedBufferStream(buf.items);
+    const module2 = try deserialize(stream.reader(), alloc2, &pool2);
+
+    try std.testing.expectEqual(module.funcs.len, module2.funcs.len);
+    try std.testing.expectEqual(@as(usize, 22), module2.funcs[1].blocks[0].insts.len);
+
+    const insts = module2.funcs[1].blocks[0].insts;
+    try std.testing.expectEqual(@as(i64, -999), insts[0].op.const_int);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.718), insts[1].op.const_float, 0.001);
+    try std.testing.expect(insts[3].op.const_bool);
+    try std.testing.expect(insts[4].op == .const_nil);
+    try std.testing.expectEqual(BinaryOp.add, insts[5].op.binary.op);
+    try std.testing.expectEqual(UnaryOp.neg, insts[6].op.unary.op);
+    try std.testing.expectEqual(@as(usize, 1), insts[7].op.record_init.fields.len);
+    try std.testing.expectEqual(@as(usize, 2), insts[13].op.list_init.elements.len);
+    try std.testing.expect(insts[18].op == .perform);
+    try std.testing.expect(insts[19].op == .retain);
+    try std.testing.expect(insts[20].op == .release);
+    try std.testing.expect(insts[21].op == .copy);
+}
+
+test "ir: all terminator variants serialize round-trip" {
+    const gpa = std.testing.allocator;
+    var arena = @import("arena.zig").Arena.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var pool = InternPool.init(gpa);
+    defer pool.deinit(gpa);
+
+    const tag_a = try pool.intern(gpa, "A");
+    const tag_b = try pool.intern(gpa, "B");
+
+    var b = Builder.init(alloc);
+    b.beginFunc(try pool.intern(gpa, "terminators"));
+
+    _ = b.beginBlock();
+    const cond = try b.addInst(.{ .const_bool = true });
+    try b.endBlock(.{ .branch = .{ .cond = cond, .then_block = @enumFromInt(1), .else_block = @enumFromInt(2) } });
+
+    _ = b.beginBlock();
+    const rv = try b.addInst(.{ .const_int = 1 });
+    try b.endBlock(.{ .ret = rv });
+
+    _ = b.beginBlock();
+    try b.endBlock(.{ .jump = .{ .target = @enumFromInt(1), .args = &.{} } });
+
+    _ = b.beginBlock();
+    const sv = try b.addInst(.{ .const_int = 0 });
+    try b.endBlock(.{ .switch_tag = .{
+        .value = sv,
+        .cases = &.{ .{ .tag = tag_a, .target = @enumFromInt(1) }, .{ .tag = tag_b, .target = @enumFromInt(2) } },
+        .default = @enumFromInt(1),
+    } });
+
+    _ = b.beginBlock();
+    try b.endBlock(.unreachable_term);
+
+    _ = b.beginBlock();
+    try b.endBlock(.{ .ret = null });
+
+    const fid = try b.endFunc();
+    const module = try b.build(fid);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try serialize(module, &pool, buf.writer(gpa));
+
+    var backing2 = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer backing2.deinit();
+    const alloc2 = backing2.allocator();
+
+    var pool2 = InternPool.init(alloc2);
+
+    var stream = std.io.fixedBufferStream(buf.items);
+    const module2 = try deserialize(stream.reader(), alloc2, &pool2);
+
+    try std.testing.expectEqual(@as(usize, 6), module2.funcs[0].blocks.len);
+    try std.testing.expect(module2.funcs[0].blocks[0].terminator == .branch);
+    try std.testing.expect(module2.funcs[0].blocks[1].terminator.ret != null);
+    try std.testing.expect(module2.funcs[0].blocks[2].terminator == .jump);
+    try std.testing.expect(module2.funcs[0].blocks[3].terminator == .switch_tag);
+    try std.testing.expectEqual(@as(usize, 2), module2.funcs[0].blocks[3].terminator.switch_tag.cases.len);
+    try std.testing.expect(module2.funcs[0].blocks[3].terminator.switch_tag.default != null);
+    try std.testing.expect(module2.funcs[0].blocks[4].terminator == .unreachable_term);
+    try std.testing.expect(module2.funcs[0].blocks[5].terminator.ret == null);
+}
+
+test "ir: truncated input" {
+    const gpa = std.testing.allocator;
+    var pool = InternPool.init(gpa);
+    defer pool.deinit(gpa);
+
+    const truncated = "RHIZ" ++ "\x01\x00\x00\x00";
+    var stream = std.io.fixedBufferStream(truncated);
+    const result = deserialize(stream.reader(), gpa, &pool);
+    try std.testing.expectError(error.InvalidData, result);
+}
+
+test "ir: empty module round-trip" {
+    const gpa = std.testing.allocator;
+    var pool = InternPool.init(gpa);
+    defer pool.deinit(gpa);
+
+    var b = Builder.init(gpa);
+    defer b.deinit();
+    const module = try b.build(null);
+    defer gpa.free(module.funcs);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try serialize(module, &pool, buf.writer(gpa));
+
+    var pool2 = InternPool.init(gpa);
+    defer pool2.deinit(gpa);
+    var stream = std.io.fixedBufferStream(buf.items);
+    const module2 = try deserialize(stream.reader(), gpa, &pool2);
+    defer gpa.free(module2.funcs);
+
+    try std.testing.expectEqual(@as(usize, 0), module2.funcs.len);
+    try std.testing.expect(module2.entry == null);
+}
+
+test "ir: handle_def serialize round-trip" {
+    const gpa = std.testing.allocator;
+    var arena = @import("arena.zig").Arena.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var pool = InternPool.init(gpa);
+    defer pool.deinit(gpa);
+
+    const effect_state = try pool.intern(gpa, "State");
+    const op_get = try pool.intern(gpa, "get");
+
+    var b = Builder.init(alloc);
+    b.beginFunc(try pool.intern(gpa, "with_handler"));
+
+    _ = b.beginBlock();
+    const hv = try b.addInst(.{ .const_int = 42 });
+    try b.endBlock(.{ .ret = hv });
+
+    _ = b.beginBlock();
+    const resume_val = try b.addInst(.{ .const_int = 0 });
+    try b.endBlock(.{ .ret = resume_val });
+
+    _ = b.beginBlock();
+    const ret_val = try b.addInst(.{ .const_int = 1 });
+    try b.endBlock(.{ .ret = ret_val });
+
+    const resume_param = b.freshValue();
+    const clause_param = b.freshValue();
+    const ret_param = b.freshValue();
+    try b.func_handle_defs.append(alloc, .{
+        .body_block = @enumFromInt(0),
+        .effect = effect_state,
+        .clauses = &.{.{
+            .op = op_get,
+            .params = &.{clause_param},
+            .resume_param = resume_param,
+            .body = @enumFromInt(1),
+        }},
+        .return_clause = .{ .param = ret_param, .body = @enumFromInt(2) },
+    });
+
+    const fid = try b.endFunc();
+    const module = try b.build(fid);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try serialize(module, &pool, buf.writer(gpa));
+
+    var backing2 = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer backing2.deinit();
+    const alloc2 = backing2.allocator();
+
+    var pool2 = InternPool.init(alloc2);
+
+    var stream = std.io.fixedBufferStream(buf.items);
+    const module2 = try deserialize(stream.reader(), alloc2, &pool2);
+
+    try std.testing.expectEqual(@as(usize, 1), module2.funcs[0].handle_defs.len);
+    const hd = module2.funcs[0].handle_defs[0];
+    try std.testing.expectEqual(@as(usize, 1), hd.clauses.len);
+    try std.testing.expect(hd.return_clause != null);
+    try std.testing.expectEqualStrings("State", pool2.get(hd.effect));
+    try std.testing.expectEqualStrings("get", pool2.get(hd.clauses[0].op));
+}

@@ -224,8 +224,68 @@ test "diag: render" {
     defer buf.deinit(gpa);
     try d.render(&sm, buf.writer(gpa));
 
-    // Just verify it doesn't crash and produces output.
-    try std.testing.expect(buf.items.len > 0);
+    const output = buf.items;
+    // Strip ANSI codes for content verification
+    // Verify structural elements are present
+    try std.testing.expect(std.mem.indexOf(u8, output, "error[E001]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "type mismatch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "test.rz:1:9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "let x = true + 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "^^^^^^^^") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "help") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "cannot add Bool and Int") != null);
+}
+
+test "diag: render with label" {
+    const gpa = std.testing.allocator;
+    var sm: SourceMap = .empty;
+    defer sm.deinit(gpa);
+
+    const src = "let x = foo(bar)";
+    const fid = try sm.addFile(gpa, "test.rz", src);
+
+    const primary_span = Span{ .file = fid, .start = 8, .end = 16 };
+    const label_span = Span{ .file = fid, .start = 12, .end = 15 };
+    const d = try Diagnostic.err("E003", "argument error")
+        .at(primary_span)
+        .withLabel(gpa, label_span, "this has type String");
+    defer gpa.free(d.labels);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try d.render(&sm, buf.writer(gpa));
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "error[E003]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "argument error") != null);
+    // Primary span renders first, then label
+    try std.testing.expect(std.mem.indexOf(u8, output, "this has type String") != null);
+}
+
+test "diag: render all severities" {
+    const gpa = std.testing.allocator;
+    var sm: SourceMap = .empty;
+    defer sm.deinit(gpa);
+
+    const src = "let x = 1";
+    const fid = try sm.addFile(gpa, "test.rz", src);
+    const span = Span{ .file = fid, .start = 4, .end = 5 };
+
+    var list: DiagnosticList = .empty;
+    defer list.deinit(gpa);
+
+    try list.emit(gpa, Diagnostic.err("E001", "error msg").at(span));
+    try list.emit(gpa, Diagnostic.warn("W001", "warn msg").at(span));
+    try list.emit(gpa, Diagnostic.note("N001", "note msg").at(span));
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try list.renderAll(&sm, buf.writer(gpa));
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "error[E001]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "warning[W001]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "note[N001]") != null);
 }
 
 test "diag: list hasErrors" {
