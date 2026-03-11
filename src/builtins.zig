@@ -375,6 +375,37 @@ fn bytes_append_u64_le(args: []const Value, ctx: *anyopaque) InterpreterError!Va
     return .{ .bytes = new_b };
 }
 
+fn bytes_set_u32_le(args: []const Value, ctx: *anyopaque) InterpreterError!Value {
+    if (args.len < 3) return error.ArityMismatch;
+    const self = getInterp(ctx);
+    const b = try expectBytes(args[0]);
+    const offset_i = try expectInt(args[1]);
+    const val = try expectInt(args[2]);
+
+    if (offset_i < 0) return error.IndexOutOfBounds;
+    const offset: usize = @intCast(offset_i);
+    if (offset + 4 > b.data.items.len) return error.IndexOutOfBounds;
+
+    // Create new BytesValue (immutable semantics)
+    const new_b = self.arena.create(BytesValue) catch return error.OutOfMemory;
+    new_b.* = .{ .data = .empty };
+    new_b.data.appendSlice(self.gpa, b.data.items) catch return error.OutOfMemory;
+    const le_bytes = std.mem.toBytes(@as(u32, @truncate(@as(u64, @bitCast(val)))));
+    @memcpy(new_b.data.items[offset .. offset + 4], &le_bytes);
+    return .{ .bytes = new_b };
+}
+
+fn string_to_bytes(args: []const Value, ctx: *anyopaque) InterpreterError!Value {
+    if (args.len < 1) return error.ArityMismatch;
+    const self = getInterp(ctx);
+    const s = try expectString(args[0]);
+
+    const new_b = self.arena.create(BytesValue) catch return error.OutOfMemory;
+    new_b.* = .{ .data = .empty };
+    new_b.data.appendSlice(self.gpa, s) catch return error.OutOfMemory;
+    return .{ .bytes = new_b };
+}
+
 fn bytes_length(args: []const Value, _: *anyopaque) InterpreterError!Value {
     if (args.len < 1) return error.ArityMismatch;
     const b = try expectBytes(args[0]);
@@ -430,8 +461,10 @@ pub fn registerAll(self: *Interpreter) InterpreterError!void {
         .{ "bytes_append_u8", bytes_append_u8 },
         .{ "bytes_append_u32_le", bytes_append_u32_le },
         .{ "bytes_append_u64_le", bytes_append_u64_le },
+        .{ "bytes_set_u32_le", bytes_set_u32_le },
         .{ "bytes_length", bytes_length },
         .{ "bytes_write_file", bytes_write_file },
+        .{ "string_to_bytes", string_to_bytes },
     };
 
     inline for (entries) |e| {
@@ -877,6 +910,120 @@ test "builtin: list_concat" {
 
     const result = try interpreter.execFunc(fid, &.{});
     try std.testing.expectEqual(@as(i64, 2), result.int);
+}
+
+test "builtin: bytes_set_u32_le" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const alloc, const pool, var b = h.setup();
+
+    const n_new = try pool.intern(alloc, "bytes_new");
+    const n_u32 = try pool.intern(alloc, "bytes_append_u32_le");
+    const n_set = try pool.intern(alloc, "bytes_set_u32_le");
+    const n_len = try pool.intern(alloc, "bytes_length");
+
+    b.beginFunc(try pool.intern(alloc, "test_main"));
+    _ = b.beginBlock();
+
+    // Create bytes with one u32 (0x01020304), then overwrite it with 0xDEADBEEF
+    const b0 = try b.addInst(.{ .call_builtin = .{ .name = n_new, .args = &.{} } });
+    const val1 = try b.addInst(.{ .const_int = 0x01020304 });
+    const b1 = try b.addInst(.{ .call_builtin = .{ .name = n_u32, .args = &.{ b0, val1 } } });
+    const zero = try b.addInst(.{ .const_int = 0 });
+    const val2 = try b.addInst(.{ .const_int = @as(i64, @bitCast(@as(u64, 0xDEADBEEF))) });
+    const b2 = try b.addInst(.{ .call_builtin = .{ .name = n_set, .args = &.{ b1, zero, val2 } } });
+    const len = try b.addInst(.{ .call_builtin = .{ .name = n_len, .args = &.{b2} } });
+    try b.endBlock(.{ .ret = len });
+    const fid = try b.endFunc();
+    const module = try b.build(fid);
+
+    var interpreter = Interpreter.init(alloc, module, pool);
+    defer interpreter.deinit();
+    try registerAll(&interpreter);
+
+    const result = try interpreter.execFunc(fid, &.{});
+    // Length should still be 4 (overwrite, not append)
+    try std.testing.expectEqual(@as(i64, 4), result.int);
+}
+
+test "builtin: bytes_set_u32_le out of bounds" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const alloc, const pool, var b = h.setup();
+
+    const n_new = try pool.intern(alloc, "bytes_new");
+    const n_set = try pool.intern(alloc, "bytes_set_u32_le");
+
+    b.beginFunc(try pool.intern(alloc, "test_main"));
+    _ = b.beginBlock();
+
+    // Empty bytes — set at offset 0 should fail
+    const b0 = try b.addInst(.{ .call_builtin = .{ .name = n_new, .args = &.{} } });
+    const zero = try b.addInst(.{ .const_int = 0 });
+    const val = try b.addInst(.{ .const_int = 42 });
+    const result_id = try b.addInst(.{ .call_builtin = .{ .name = n_set, .args = &.{ b0, zero, val } } });
+    try b.endBlock(.{ .ret = result_id });
+    const fid = try b.endFunc();
+    const module = try b.build(fid);
+
+    var interpreter = Interpreter.init(alloc, module, pool);
+    defer interpreter.deinit();
+    try registerAll(&interpreter);
+
+    const result = interpreter.execFunc(fid, &.{});
+    try std.testing.expectError(error.IndexOutOfBounds, result);
+}
+
+test "builtin: string_to_bytes" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const alloc, const pool, var b = h.setup();
+
+    const n_stb = try pool.intern(alloc, "string_to_bytes");
+    const n_len = try pool.intern(alloc, "bytes_length");
+
+    b.beginFunc(try pool.intern(alloc, "test_main"));
+    _ = b.beginBlock();
+
+    const s = try b.addInst(.{ .const_string = try pool.intern(alloc, "hello") });
+    const bv = try b.addInst(.{ .call_builtin = .{ .name = n_stb, .args = &.{s} } });
+    const len = try b.addInst(.{ .call_builtin = .{ .name = n_len, .args = &.{bv} } });
+    try b.endBlock(.{ .ret = len });
+    const fid = try b.endFunc();
+    const module = try b.build(fid);
+
+    var interpreter = Interpreter.init(alloc, module, pool);
+    defer interpreter.deinit();
+    try registerAll(&interpreter);
+
+    const result = try interpreter.execFunc(fid, &.{});
+    try std.testing.expectEqual(@as(i64, 5), result.int);
+}
+
+test "builtin: string_to_bytes empty" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const alloc, const pool, var b = h.setup();
+
+    const n_stb = try pool.intern(alloc, "string_to_bytes");
+    const n_len = try pool.intern(alloc, "bytes_length");
+
+    b.beginFunc(try pool.intern(alloc, "test_main"));
+    _ = b.beginBlock();
+
+    const s = try b.addInst(.{ .const_string = try pool.intern(alloc, "") });
+    const bv = try b.addInst(.{ .call_builtin = .{ .name = n_stb, .args = &.{s} } });
+    const len = try b.addInst(.{ .call_builtin = .{ .name = n_len, .args = &.{bv} } });
+    try b.endBlock(.{ .ret = len });
+    const fid = try b.endFunc();
+    const module = try b.build(fid);
+
+    var interpreter = Interpreter.init(alloc, module, pool);
+    defer interpreter.deinit();
+    try registerAll(&interpreter);
+
+    const result = try interpreter.execFunc(fid, &.{});
+    try std.testing.expectEqual(@as(i64, 0), result.int);
 }
 
 test "builtin: io_print (smoke test)" {

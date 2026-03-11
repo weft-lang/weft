@@ -6,3 +6,4 @@
 
 pub const grammar = @import("seed/grammar.zig");
 pub const gen = @import("seed/gen.zig");
+pub const typeck = @import("seed/typeck.zig");

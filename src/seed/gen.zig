@@ -157,6 +157,31 @@ pub const Gen = struct {
         return self.callBuiltin("io_print", &.{msg});
     }
 
+    // Map builtins
+    pub fn mapNew(self: *Gen) !ValueId {
+        return self.callBuiltin("map_new", &.{});
+    }
+
+    pub fn mapGet(self: *Gen, m: ValueId, key: ValueId) !ValueId {
+        return self.callBuiltin("map_get", &.{ m, key });
+    }
+
+    pub fn mapSet(self: *Gen, m: ValueId, key: ValueId, val: ValueId) !ValueId {
+        return self.callBuiltin("map_set", &.{ m, key, val });
+    }
+
+    pub fn mapHas(self: *Gen, m: ValueId, key: ValueId) !ValueId {
+        return self.callBuiltin("map_has", &.{ m, key });
+    }
+
+    pub fn mapKeys(self: *Gen, m: ValueId) !ValueId {
+        return self.callBuiltin("map_keys", &.{m});
+    }
+
+    pub fn listConcat(self: *Gen, a: ValueId, b_val: ValueId) !ValueId {
+        return self.callBuiltin("list_concat", &.{ a, b_val });
+    }
+
     // ── Data construction ──────────────────────────────────────────────
 
     pub fn tag(self: *Gen, name: []const u8, payload: ?ValueId) !ValueId {

@@ -383,6 +383,11 @@ pub const Interpreter = struct {
             };
         }
 
+        // Cross-type equality: different types are never equal.
+        // This handles tagged vs nil, record vs nil, list vs nil, etc.
+        if (op == .eq) return .{ .bool_val = false };
+        if (op == .ne) return .{ .bool_val = true };
+
         return error.TypeError;
     }
 
