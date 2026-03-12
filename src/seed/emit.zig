@@ -2187,8 +2187,219 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             }
         }
 
-        // Default fallthrough: return bytes unchanged
+        // Not list_init: check IrTagInit
         g.beginReservedBlock(blk_not_list_init);
+        const is_tag_init = try g.tagTest(inst, ir_tag_init);
+        const blk_tag_init = g.reserveBlock();
+        const blk_not_tag_init = g.reserveBlock();
+        try g.branch(is_tag_init, blk_tag_init, blk_not_tag_init);
+
+        // IrTagInit: {dst, tag, payload} -> bump alloc 16 bytes, store [tag_hash, payload]
+        g.beginReservedBlock(blk_tag_init);
+        {
+            const ti_payload = try g.tagPayload(inst, ir_tag_init);
+            const ti_dst = try g.recordField(ti_payload, "dst");
+            const ti_tag = try g.recordField(ti_payload, "tag");
+            const ti_pl_val = try g.recordField(ti_payload, "payload");
+
+            const ti_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, ti_dst });
+            const ti_reg_raw = try g.recordField(ti_alloc, "reg");
+            const ti_ctx = try g.recordField(ti_alloc, "ctx");
+
+            // Spill merge for dst: use x27 if spilled
+            const c100_ti = try g.constInt(100);
+            const ti_spilled = try g.ge(ti_reg_raw, c100_ti);
+            const blk_ti_sp = g.reserveBlock();
+            const blk_ti_ph = g.reserveBlock();
+            const blk_ti_mg = g.reserveBlock();
+            try g.branch(ti_spilled, blk_ti_sp, blk_ti_ph);
+            g.beginReservedBlock(blk_ti_sp);
+            const c27_ti = try g.constInt(27);
+            try g.jump(blk_ti_mg, &.{c27_ti});
+            g.beginReservedBlock(blk_ti_ph);
+            try g.jump(blk_ti_mg, &.{ti_reg_raw});
+            g.beginReservedBlock(blk_ti_mg);
+            const ti_reg = try g.addBlockParam();
+
+            // Bump alloc 16 bytes: [tag_hash at +0, payload at +8]
+            const c16_ti = try g.constInt(16);
+            var ti_bytes = try g.callDirect(f_emit_bump_alloc, &.{ bytes, ti_reg, c16_ti });
+
+            // Compute tag hash and store at [ti_reg, #0]
+            const ti_hash = try g.callBuiltin("string_hash", &.{ti_tag});
+            const c17_ti = try g.constInt(17); // use x17 as temp
+            ti_bytes = try g.callDirect(f_mov_imm64, &.{ ti_bytes, c17_ti, ti_hash });
+            const c0_ti = try g.constInt(0);
+            const ti_str_hash = try g.callDirect(f_encode_str, &.{ c17_ti, ti_reg, c0_ti });
+            ti_bytes = try g.callDirect(f_append_inst, &.{ ti_bytes, ti_str_hash });
+
+            // Store payload at [ti_reg, #8] (if payload != -1)
+            const ti_neg1 = try g.constInt(-1);
+            const ti_has_payload = try g.binary(.ne, ti_pl_val, ti_neg1);
+            const blk_ti_has_pl = g.reserveBlock();
+            const blk_ti_no_pl = g.reserveBlock();
+            const blk_ti_done = g.reserveBlock();
+            try g.branch(ti_has_payload, blk_ti_has_pl, blk_ti_no_pl);
+
+            g.beginReservedBlock(blk_ti_has_pl);
+            {
+                const ti_pl_reg_raw = try g.callDirect(f_get_reg, &.{ ti_ctx, ti_pl_val });
+                // Load from spill if needed
+                const c17_ti2 = try g.constInt(17);
+                const ti_pl_load = try g.callDirect(f_load_spill, &.{ ti_bytes, ti_pl_reg_raw, c17_ti2 });
+                const ti_b_pl = try g.recordField(ti_pl_load, "bytes");
+                const ti_pl_reg = try g.recordField(ti_pl_load, "reg");
+                const c8_ti = try g.constInt(8);
+                const ti_str_pl = try g.callDirect(f_encode_str, &.{ ti_pl_reg, ti_reg, c8_ti });
+                const ti_b_pl2 = try g.callDirect(f_append_inst, &.{ ti_b_pl, ti_str_pl });
+                try g.jump(blk_ti_done, &.{ti_b_pl2});
+            }
+
+            g.beginReservedBlock(blk_ti_no_pl);
+            {
+                // No payload — store 0 at [ti_reg, #8]
+                const c17_ti3 = try g.constInt(17);
+                const ti_b_np = try g.callDirect(f_mov_imm64, &.{ ti_bytes, c17_ti3, c0_ti });
+                const c8_ti2 = try g.constInt(8);
+                const ti_str_np = try g.callDirect(f_encode_str, &.{ c17_ti3, ti_reg, c8_ti2 });
+                const ti_b_np2 = try g.callDirect(f_append_inst, &.{ ti_b_np, ti_str_np });
+                try g.jump(blk_ti_done, &.{ti_b_np2});
+            }
+
+            g.beginReservedBlock(blk_ti_done);
+            const ti_bytes_final = try g.addBlockParam();
+            // Store to spill slot if needed
+            const ti_b_spill = try g.callDirect(f_store_spill, &.{ ti_bytes_final, ti_reg_raw, ti_reg });
+            const ti_result = try g.record(&.{
+                .{ .name = "bytes", .value = ti_b_spill },
+                .{ .name = "ctx", .value = ti_ctx },
+            });
+            try g.ret(ti_result);
+        }
+
+        // Not tag_init: check IrTagTest
+        g.beginReservedBlock(blk_not_tag_init);
+        const is_tag_test = try g.tagTest(inst, ir_tag_test);
+        const blk_tag_test = g.reserveBlock();
+        const blk_not_tag_test = g.reserveBlock();
+        try g.branch(is_tag_test, blk_tag_test, blk_not_tag_test);
+
+        // IrTagTest: {dst, value, tag} -> load tag_hash from [value, #0], compare with expected
+        g.beginReservedBlock(blk_tag_test);
+        {
+            const tt_payload = try g.tagPayload(inst, ir_tag_test);
+            const tt_dst = try g.recordField(tt_payload, "dst");
+            const tt_value = try g.recordField(tt_payload, "value");
+            const tt_tag = try g.recordField(tt_payload, "tag");
+
+            const tt_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, tt_dst });
+            const tt_dst_reg_raw = try g.recordField(tt_alloc, "reg");
+            const tt_ctx = try g.recordField(tt_alloc, "ctx");
+
+            // Spill merge for dst: use x27 if spilled
+            const c100_tt = try g.constInt(100);
+            const tt_spilled = try g.ge(tt_dst_reg_raw, c100_tt);
+            const blk_tt_sp = g.reserveBlock();
+            const blk_tt_ph = g.reserveBlock();
+            const blk_tt_mg = g.reserveBlock();
+            try g.branch(tt_spilled, blk_tt_sp, blk_tt_ph);
+            g.beginReservedBlock(blk_tt_sp);
+            const c27_tt = try g.constInt(27);
+            try g.jump(blk_tt_mg, &.{c27_tt});
+            g.beginReservedBlock(blk_tt_ph);
+            try g.jump(blk_tt_mg, &.{tt_dst_reg_raw});
+            g.beginReservedBlock(blk_tt_mg);
+            const tt_dst_reg = try g.addBlockParam();
+
+            // Get the value register (the tagged value pointer)
+            const tt_val_reg_raw = try g.callDirect(f_get_reg, &.{ tt_ctx, tt_value });
+            const c17_tt = try g.constInt(17);
+            const tt_val_load = try g.callDirect(f_load_spill, &.{ bytes, tt_val_reg_raw, c17_tt });
+            var tt_bytes = try g.recordField(tt_val_load, "bytes");
+            const tt_val_reg = try g.recordField(tt_val_load, "reg");
+
+            // LDR x17, [value_reg, #0] — load the stored tag hash
+            const c0_tt = try g.constInt(0);
+            const tt_ldr = try g.callDirect(f_encode_ldr, &.{ c17_tt, tt_val_reg, c0_tt });
+            tt_bytes = try g.callDirect(f_append_inst, &.{ tt_bytes, tt_ldr });
+
+            // Compute expected tag hash and load into dst_reg
+            const tt_hash = try g.callBuiltin("string_hash", &.{tt_tag});
+            tt_bytes = try g.callDirect(f_mov_imm64, &.{ tt_bytes, tt_dst_reg, tt_hash });
+
+            // CMP x17, dst_reg
+            const tt_cmp = try g.callDirect(f_encode_cmp_reg, &.{ c17_tt, tt_dst_reg });
+            tt_bytes = try g.callDirect(f_append_inst, &.{ tt_bytes, tt_cmp });
+
+            // CSET dst_reg, EQ (cond=0)
+            const tt_cset = try g.callDirect(f_encode_cset, &.{ tt_dst_reg, c0_tt });
+            tt_bytes = try g.callDirect(f_append_inst, &.{ tt_bytes, tt_cset });
+
+            // Store to spill slot if needed
+            tt_bytes = try g.callDirect(f_store_spill, &.{ tt_bytes, tt_dst_reg_raw, tt_dst_reg });
+            const tt_result = try g.record(&.{
+                .{ .name = "bytes", .value = tt_bytes },
+                .{ .name = "ctx", .value = tt_ctx },
+            });
+            try g.ret(tt_result);
+        }
+
+        // Not tag_test: check IrTagPayload
+        g.beginReservedBlock(blk_not_tag_test);
+        const is_tag_payload = try g.tagTest(inst, ir_tag_payload);
+        const blk_tag_payload = g.reserveBlock();
+        const blk_not_tag_payload = g.reserveBlock();
+        try g.branch(is_tag_payload, blk_tag_payload, blk_not_tag_payload);
+
+        // IrTagPayload: {dst, value, tag} -> LDR dst, [value, #8]
+        g.beginReservedBlock(blk_tag_payload);
+        {
+            const tp_payload = try g.tagPayload(inst, ir_tag_payload);
+            const tp_dst = try g.recordField(tp_payload, "dst");
+            const tp_value = try g.recordField(tp_payload, "value");
+
+            const tp_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, tp_dst });
+            const tp_dst_reg_raw = try g.recordField(tp_alloc, "reg");
+            const tp_ctx = try g.recordField(tp_alloc, "ctx");
+
+            // Spill merge for dst: use x27 if spilled
+            const c100_tp = try g.constInt(100);
+            const tp_spilled = try g.ge(tp_dst_reg_raw, c100_tp);
+            const blk_tp_sp = g.reserveBlock();
+            const blk_tp_ph = g.reserveBlock();
+            const blk_tp_mg = g.reserveBlock();
+            try g.branch(tp_spilled, blk_tp_sp, blk_tp_ph);
+            g.beginReservedBlock(blk_tp_sp);
+            const c27_tp = try g.constInt(27);
+            try g.jump(blk_tp_mg, &.{c27_tp});
+            g.beginReservedBlock(blk_tp_ph);
+            try g.jump(blk_tp_mg, &.{tp_dst_reg_raw});
+            g.beginReservedBlock(blk_tp_mg);
+            const tp_dst_reg = try g.addBlockParam();
+
+            // Get the value register
+            const tp_val_reg_raw = try g.callDirect(f_get_reg, &.{ tp_ctx, tp_value });
+            const c17_tp = try g.constInt(17);
+            const tp_val_load = try g.callDirect(f_load_spill, &.{ bytes, tp_val_reg_raw, c17_tp });
+            var tp_bytes = try g.recordField(tp_val_load, "bytes");
+            const tp_val_reg = try g.recordField(tp_val_load, "reg");
+
+            // LDR dst_reg, [value_reg, #8] — load payload from offset 8
+            const c8_tp = try g.constInt(8);
+            const tp_ldr = try g.callDirect(f_encode_ldr, &.{ tp_dst_reg, tp_val_reg, c8_tp });
+            tp_bytes = try g.callDirect(f_append_inst, &.{ tp_bytes, tp_ldr });
+
+            // Store to spill slot if needed
+            tp_bytes = try g.callDirect(f_store_spill, &.{ tp_bytes, tp_dst_reg_raw, tp_dst_reg });
+            const tp_result = try g.record(&.{
+                .{ .name = "bytes", .value = tp_bytes },
+                .{ .name = "ctx", .value = tp_ctx },
+            });
+            try g.ret(tp_result);
+        }
+
+        // Default fallthrough: return bytes unchanged
+        g.beginReservedBlock(blk_not_tag_payload);
         const ft_result = try g.record(&.{
             .{ .name = "bytes", .value = bytes },
             .{ .name = "ctx", .value = ctx },

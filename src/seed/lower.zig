@@ -595,6 +595,49 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const payload = try g.tagPayload(expr, typeck.tast_field_access);
             const base = try g.recordField(payload, "expr");
             const field = try g.recordField(payload, "field");
+
+            // Check if base is TIdent with name NOT in scope → variant constructor
+            const base_is_ident = try g.tagTest(base, typeck.tast_ident);
+            const fa_check_ident_blk = g.reserveBlock();
+            const fa_regular_blk = g.reserveBlock();
+            try g.branch(base_is_ident, fa_check_ident_blk, fa_regular_blk);
+
+            g.beginReservedBlock(fa_check_ident_blk);
+            {
+                const base_pl = try g.tagPayload(base, typeck.tast_ident);
+                const base_name = try g.recordField(base_pl, "name");
+                const in_scope = try g.mapHas(scope, base_name);
+                const fa_scope_blk = g.reserveBlock();
+                const fa_variant_blk = g.reserveBlock();
+                try g.branch(in_scope, fa_scope_blk, fa_variant_blk);
+
+                // In scope → regular field access
+                g.beginReservedBlock(fa_scope_blk);
+                try g.jump(fa_regular_blk, &.{});
+
+                // Not in scope → variant constructor (no payload)
+                g.beginReservedBlock(fa_variant_blk);
+                {
+                    const fv_v = try g.callDirect(f_fresh_val, &.{state});
+                    const dst_v = try g.recordField(fv_v, "id");
+                    const st_v = try g.recordField(fv_v, "state");
+                    const neg1_v = try g.constInt(-1);
+                    const inst_v = try g.record(&.{
+                        .{ .name = "dst", .value = dst_v },
+                        .{ .name = "tag", .value = field },
+                        .{ .name = "payload", .value = neg1_v },
+                    });
+                    const tag_inst = try g.tag(ir_tag_init, inst_v);
+                    const st_v2 = try g.callDirect(f_emit_inst, &.{ tag_inst, st_v });
+                    try g.ret(try g.record(&.{
+                        .{ .name = "value", .value = dst_v },
+                        .{ .name = "state", .value = st_v2 },
+                    }));
+                }
+            }
+
+            // Regular field access
+            g.beginReservedBlock(fa_regular_blk);
             const base_r = try g.callDirect(f_lower_expr, &.{ base, scope, state });
             const base_val = try g.recordField(base_r, "value");
             const st1 = try g.recordField(base_r, "state");
@@ -1186,8 +1229,143 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             }));
         }
 
-        // Generic callee — lower it as expression, use value ID
+        // Check if callee is TFieldAccess (variant constructor pattern: Type.Variant(args))
         g.beginReservedBlock(generic_callee_blk);
+        const callee_is_field = try g.tagTest(callee, typeck.tast_field_access);
+        const field_callee_blk = g.reserveBlock();
+        const indirect_callee_blk = g.reserveBlock();
+        try g.branch(callee_is_field, field_callee_blk, indirect_callee_blk);
+
+        // Callee is TFieldAccess — check if base is TIdent (variant constructor)
+        g.beginReservedBlock(field_callee_blk);
+        {
+            const fa_pl = try g.tagPayload(callee, typeck.tast_field_access);
+            const fa_base = try g.recordField(fa_pl, "expr");
+            const fa_field = try g.recordField(fa_pl, "field");
+
+            // Check if base is a TIdent (Type name)
+            const base_is_ident = try g.tagTest(fa_base, typeck.tast_ident);
+            const variant_ctor_blk = g.reserveBlock();
+            const field_indirect_blk = g.reserveBlock();
+            try g.branch(base_is_ident, variant_ctor_blk, field_indirect_blk);
+
+            // Variant constructor: Type.Variant(payload) → IrTagInit
+            g.beginReservedBlock(variant_ctor_blk);
+            {
+                // Lower args (payload values)
+                const vc_args_len = try g.listLength(args);
+                const vc_zero = try g.constInt(0);
+                const vc_empty = try g.listInit(&.{});
+                const vc_loop = g.reserveBlock();
+                try g.jump(vc_loop, &.{ vc_zero, vc_empty, state });
+
+                g.beginReservedBlock(vc_loop);
+                const vc_idx = try g.addBlockParam();
+                const vc_vals = try g.addBlockParam();
+                const vc_st = try g.addBlockParam();
+                const vc_done = try g.ge(vc_idx, vc_args_len);
+                const vc_body = g.reserveBlock();
+                const vc_exit = g.reserveBlock();
+                try g.branch(vc_done, vc_exit, vc_body);
+
+                g.beginReservedBlock(vc_body);
+                const vc_arg = try g.listNth(args, vc_idx);
+                const vc_arg_r = try g.callDirect(f_lower_expr, &.{ vc_arg, scope, vc_st });
+                const vc_arg_val = try g.recordField(vc_arg_r, "value");
+                const vc_arg_st = try g.recordField(vc_arg_r, "state");
+                const vc_new_vals = try g.listAppend(vc_vals, vc_arg_val);
+                const vc_one = try g.constInt(1);
+                const vc_next = try g.add(vc_idx, vc_one);
+                try g.jump(vc_loop, &.{ vc_next, vc_new_vals, vc_arg_st });
+
+                g.beginReservedBlock(vc_exit);
+                // Emit IrTagInit with tag = field name, payload = first arg (or nil)
+                const fv_vc = try g.callDirect(f_fresh_val, &.{vc_st});
+                const vc_dst = try g.recordField(fv_vc, "id");
+                const vc_st_final = try g.recordField(fv_vc, "state");
+                // Get payload: if args exist, use first; else use -1 as sentinel for no payload
+                const vc_has_args = try g.binary(.gt, vc_args_len, vc_zero);
+                const vc_payload_blk = g.reserveBlock();
+                const vc_no_payload_blk = g.reserveBlock();
+                const vc_merge_blk = g.reserveBlock();
+                try g.branch(vc_has_args, vc_payload_blk, vc_no_payload_blk);
+
+                g.beginReservedBlock(vc_payload_blk);
+                const vc_first_val = try g.listNth(vc_vals, vc_zero);
+                try g.jump(vc_merge_blk, &.{vc_first_val});
+
+                g.beginReservedBlock(vc_no_payload_blk);
+                const vc_neg1 = try g.constInt(-1);
+                try g.jump(vc_merge_blk, &.{vc_neg1});
+
+                g.beginReservedBlock(vc_merge_blk);
+                const vc_payload = try g.addBlockParam();
+                const vc_inst_rec = try g.record(&.{
+                    .{ .name = "dst", .value = vc_dst },
+                    .{ .name = "tag", .value = fa_field },
+                    .{ .name = "payload", .value = vc_payload },
+                });
+                const vc_inst = try g.tag(ir_tag_init, vc_inst_rec);
+                const vc_st2 = try g.callDirect(f_emit_inst, &.{ vc_inst, vc_st_final });
+                try g.ret(try g.record(&.{
+                    .{ .name = "value", .value = vc_dst },
+                    .{ .name = "state", .value = vc_st2 },
+                }));
+            }
+
+            // Field access but base is not TIdent — fall through to indirect call
+            g.beginReservedBlock(field_indirect_blk);
+            {
+                const callee_r2 = try g.callDirect(f_lower_expr, &.{ callee, scope, state });
+                const callee_val2 = try g.recordField(callee_r2, "value");
+                const st_fi = try g.recordField(callee_r2, "state");
+                const args_len_fi = try g.listLength(args);
+                const zero_fi = try g.constInt(0);
+                const empty_fi = try g.listInit(&.{});
+                const loop_fi = g.reserveBlock();
+                try g.jump(loop_fi, &.{ zero_fi, empty_fi, st_fi });
+
+                g.beginReservedBlock(loop_fi);
+                const fi_idx = try g.addBlockParam();
+                const fi_vals = try g.addBlockParam();
+                const fi_st = try g.addBlockParam();
+                const fi_done = try g.ge(fi_idx, args_len_fi);
+                const fi_body = g.reserveBlock();
+                const fi_exit = g.reserveBlock();
+                try g.branch(fi_done, fi_exit, fi_body);
+
+                g.beginReservedBlock(fi_body);
+                const fi_arg = try g.listNth(args, fi_idx);
+                const fi_arg_r = try g.callDirect(f_lower_expr, &.{ fi_arg, scope, fi_st });
+                const fi_arg_val = try g.recordField(fi_arg_r, "value");
+                const fi_arg_st = try g.recordField(fi_arg_r, "state");
+                const fi_new_vals = try g.listAppend(fi_vals, fi_arg_val);
+                const fi_one = try g.constInt(1);
+                const fi_next = try g.add(fi_idx, fi_one);
+                try g.jump(loop_fi, &.{ fi_next, fi_new_vals, fi_arg_st });
+
+                g.beginReservedBlock(fi_exit);
+                const fv_fi = try g.callDirect(f_fresh_val, &.{fi_st});
+                const dst_fi = try g.recordField(fv_fi, "id");
+                const st_fi2 = try g.recordField(fv_fi, "state");
+                const empty_name_fi = try g.constString("");
+                const inst_fi = try g.record(&.{
+                    .{ .name = "dst", .value = dst_fi },
+                    .{ .name = "callee", .value = empty_name_fi },
+                    .{ .name = "callee_val", .value = callee_val2 },
+                    .{ .name = "args", .value = fi_vals },
+                });
+                const inst_fi_tag = try g.tag(ir_call, inst_fi);
+                const st_fi3 = try g.callDirect(f_emit_inst, &.{ inst_fi_tag, st_fi2 });
+                try g.ret(try g.record(&.{
+                    .{ .name = "value", .value = dst_fi },
+                    .{ .name = "state", .value = st_fi3 },
+                }));
+            }
+        }
+
+        // Generic callee — lower it as expression, use value ID
+        g.beginReservedBlock(indirect_callee_blk);
         {
             const callee_r = try g.callDirect(f_lower_expr, &.{ callee, scope, state });
             const callee_val = try g.recordField(callee_r, "value");

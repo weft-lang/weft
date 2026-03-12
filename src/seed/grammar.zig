@@ -1233,11 +1233,43 @@ fn genParsePattern(g: *Gen, pf: ParserFuncs) !void {
     const check_lit_blk = g.reserveBlock();
     try g.branch(is_upper, upper_blk, check_lit_blk);
 
-    // upper: constructor pattern — ConstructorName or ConstructorName(args)
+    // upper: constructor pattern — ConstructorName, Type.Variant, or with (args)
     g.beginReservedBlock(upper_blk);
-    const ctor_name = try g.tagPayload(tok, "UpperIdent");
+    const first_upper = try g.tagPayload(tok, "UpperIdent");
+    // Check for . after upper ident (qualified: Type.Variant)
+    const tok_after_upper = try emitGetToken(g, tokens, next_pos);
+    const is_dot = try g.tagTest(tok_after_upper, "Punct");
+    const check_dot_blk = g.reserveBlock();
+    const no_dot_blk = g.reserveBlock();
+    try g.branch(is_dot, check_dot_blk, no_dot_blk);
+
+    g.beginReservedBlock(check_dot_blk);
+    const dot_val = try g.tagPayload(tok_after_upper, "Punct");
+    const dot_str = try g.constString(".");
+    const is_actual_dot = try g.eq(dot_val, dot_str);
+    const qualified_blk = g.reserveBlock();
+    try g.branch(is_actual_dot, qualified_blk, no_dot_blk);
+
+    // Qualified: Type.Variant — skip dot, read the variant name
+    g.beginReservedBlock(qualified_blk);
+    const pos_after_dot = try emitAdvance(g, next_pos);
+    const tok_variant = try emitGetToken(g, tokens, pos_after_dot);
+    const variant_name = try g.tagPayload(tok_variant, "UpperIdent");
+    const pos_after_variant = try emitAdvance(g, pos_after_dot);
+    const ctor_merge_blk = g.reserveBlock();
+    try g.jump(ctor_merge_blk, &.{ variant_name, pos_after_variant });
+
+    // Not qualified: just ConstructorName
+    g.beginReservedBlock(no_dot_blk);
+    try g.jump(ctor_merge_blk, &.{ first_upper, next_pos });
+
+    // Merge: ctor_name is the variant name, ctor_pos is position after name
+    g.beginReservedBlock(ctor_merge_blk);
+    const ctor_name = try g.addBlockParam();
+    const ctor_pos = try g.addBlockParam();
+
     // Check for ( after constructor name
-    const tok2 = try emitGetToken(g, tokens, next_pos);
+    const tok2 = try emitGetToken(g, tokens, ctor_pos);
     const is_delim = try g.tagTest(tok2, "Delim");
     const check_lparen_blk = g.reserveBlock();
     const ctor_no_args_blk = g.reserveBlock();
@@ -1252,7 +1284,7 @@ fn genParsePattern(g: *Gen, pf: ParserFuncs) !void {
 
     // ctor with args: parse comma-separated patterns until )
     g.beginReservedBlock(ctor_args_blk);
-    const args_start = try emitAdvance(g, next_pos); // skip (
+    const args_start = try emitAdvance(g, ctor_pos); // skip (
     // Parse pattern args in a loop
     const args_empty = try g.listInit(&.{});
     const args_loop_blk = g.reserveBlock();
@@ -1320,7 +1352,7 @@ fn genParsePattern(g: *Gen, pf: ParserFuncs) !void {
         .{ .name = "args", .value = try g.listInit(&.{}) },
     });
     const ctor0_node = try g.tag(ast_pat_constructor, ctor0_rec);
-    const ctor0_res = try emitResult(g, ctor0_node, next_pos);
+    const ctor0_res = try emitResult(g, ctor0_node, ctor_pos);
     try g.ret(ctor0_res);
 
     // check_lit: literal patterns (int, string, bool, nil)
@@ -2510,7 +2542,23 @@ fn genParseExpr(g: *Gen, pf: ParserFuncs) !void {
     g.beginReservedBlock(dot_blk);
     const dot_next = try emitAdvance(g, cur_pos); // skip .
     const field_tok = try emitGetToken(g, tokens, dot_next);
-    const field_name = try g.tagPayload(field_tok, "Ident");
+    // Field name can be Ident (record.field) or UpperIdent (Type.Variant)
+    const field_is_ident = try g.tagTest(field_tok, "Ident");
+    const field_ident_blk = g.reserveBlock();
+    const field_upper_blk = g.reserveBlock();
+    const field_merge_blk = g.reserveBlock();
+    try g.branch(field_is_ident, field_ident_blk, field_upper_blk);
+
+    g.beginReservedBlock(field_ident_blk);
+    const field_name_lower = try g.tagPayload(field_tok, "Ident");
+    try g.jump(field_merge_blk, &.{field_name_lower});
+
+    g.beginReservedBlock(field_upper_blk);
+    const field_name_upper = try g.tagPayload(field_tok, "UpperIdent");
+    try g.jump(field_merge_blk, &.{field_name_upper});
+
+    g.beginReservedBlock(field_merge_blk);
+    const field_name = try g.addBlockParam();
     const field_after = try emitAdvance(g, dot_next);
     const field_rec = try g.record(&.{
         .{ .name = "expr", .value = cur_node },

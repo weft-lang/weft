@@ -223,6 +223,19 @@ fn string_index_of(args: []const Value, _: *anyopaque) InterpreterError!Value {
     return .{ .int = -1 };
 }
 
+fn string_hash(args: []const Value, _: *anyopaque) InterpreterError!Value {
+    if (args.len < 1) return error.ArityMismatch;
+    const s = try expectString(args[0]);
+    // FNV-1a 64-bit hash, truncated to positive i64
+    var h: u64 = 14695981039346656037;
+    for (s) |byte| {
+        h ^= byte;
+        h *%= 1099511628211;
+    }
+    // Ensure positive by masking off sign bit
+    return .{ .int = @bitCast(h & 0x7FFFFFFFFFFFFFFF) };
+}
+
 // ── List operations ────────────────────────────────────────────────────
 
 fn list_length(args: []const Value, _: *anyopaque) InterpreterError!Value {
@@ -608,6 +621,7 @@ pub fn registerAll(self: *Interpreter) InterpreterError!void {
         .{ "string_starts_with", string_starts_with },
         .{ "string_from_int_char", string_from_int_char },
         .{ "string_index_of", string_index_of },
+        .{ "string_hash", string_hash },
         // List
         .{ "list_length", list_length },
         .{ "list_append", list_append },
