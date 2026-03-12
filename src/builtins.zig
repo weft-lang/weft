@@ -59,6 +59,27 @@ fn io_print(args: []const Value, _: *anyopaque) InterpreterError!Value {
     return .nil;
 }
 
+fn debug_type(args: []const Value, _: *anyopaque) InterpreterError!Value {
+    if (args.len < 1) return error.ArityMismatch;
+    const type_name: []const u8 = switch (args[0]) {
+        .int => "int",
+        .float => "float",
+        .bool_val => "bool",
+        .string => "string",
+        .list => "list",
+        .record => "record",
+        .tagged => "tagged",
+        .nil => "nil",
+        .closure => "closure",
+        .continuation => "continuation",
+        .builtin_fn => "builtin_fn",
+        .map => "map",
+        .bytes => "bytes",
+    };
+    _ = std.posix.write(std.posix.STDOUT_FILENO, type_name) catch {};
+    return .nil;
+}
+
 fn io_read_file(args: []const Value, ctx: *anyopaque) InterpreterError!Value {
     if (args.len < 1) return error.ArityMismatch;
     const self = getInterp(ctx);
@@ -406,10 +427,152 @@ fn string_to_bytes(args: []const Value, ctx: *anyopaque) InterpreterError!Value 
     return .{ .bytes = new_b };
 }
 
+fn bytes_append_bytes(args: []const Value, ctx: *anyopaque) InterpreterError!Value {
+    if (args.len < 2) return error.ArityMismatch;
+    const self = getInterp(ctx);
+    const dst = try expectBytes(args[0]);
+    const src = try expectBytes(args[1]);
+
+    const new_b = self.arena.create(BytesValue) catch return error.OutOfMemory;
+    new_b.* = .{ .data = .{} };
+    new_b.data.appendSlice(self.gpa, dst.data.items) catch return error.OutOfMemory;
+    new_b.data.appendSlice(self.gpa, src.data.items) catch return error.OutOfMemory;
+    return .{ .bytes = new_b };
+}
+
 fn bytes_length(args: []const Value, _: *anyopaque) InterpreterError!Value {
     if (args.len < 1) return error.ArityMismatch;
     const b = try expectBytes(args[0]);
     return .{ .int = @intCast(b.data.items.len) };
+}
+
+/// Ad-hoc code sign a Mach-O binary for macOS arm64.
+/// Takes the unsigned Mach-O bytes (which must already have LC_CODE_SIGNATURE
+/// load command with correct dataoff/datasize) and appends the code signature.
+fn bytes_macho_codesign(args: []const Value, ctx: *anyopaque) InterpreterError!Value {
+    if (args.len < 1) return error.ArityMismatch;
+    const self = getInterp(ctx);
+    const b = try expectBytes(args[0]);
+
+    const result = self.arena.create(BytesValue) catch return error.OutOfMemory;
+    result.* = .{ .data = .{} };
+
+    // Copy existing bytes
+    result.data.appendSlice(self.gpa, b.data.items) catch return error.OutOfMemory;
+
+    // Find LC_CODE_SIGNATURE in load commands to get dataoff and datasize
+    const bytes = result.data.items;
+    if (bytes.len < 32) return error.TypeError; // Too small for Mach-O header
+
+    const ncmds = std.mem.readInt(u32, bytes[16..20], .little);
+    var cmd_offset: usize = 32; // After Mach-O header
+
+    var cs_dataoff: u32 = 0;
+    var cs_datasize: u32 = 0;
+    var found_cs = false;
+    var text_fileoff: u64 = 0;
+    var text_filesize: u64 = 0;
+
+    for (0..ncmds) |_| {
+        if (cmd_offset + 8 > bytes.len) break;
+        const cmd = std.mem.readInt(u32, bytes[cmd_offset..][0..4], .little);
+        const cmdsize = std.mem.readInt(u32, bytes[cmd_offset + 4..][0..4], .little);
+
+        if (cmd == 0x1D) { // LC_CODE_SIGNATURE
+            cs_dataoff = std.mem.readInt(u32, bytes[cmd_offset + 8..][0..4], .little);
+            cs_datasize = std.mem.readInt(u32, bytes[cmd_offset + 12..][0..4], .little);
+            found_cs = true;
+        } else if (cmd == 0x19) { // LC_SEGMENT_64
+            // Check segment name for __TEXT
+            if (cmd_offset + 24 <= bytes.len) {
+                const seg_name = bytes[cmd_offset + 8 .. cmd_offset + 24];
+                if (std.mem.startsWith(u8, seg_name, "__TEXT")) {
+                    text_fileoff = std.mem.readInt(u64, bytes[cmd_offset + 40..][0..8], .little);
+                    text_filesize = std.mem.readInt(u64, bytes[cmd_offset + 48..][0..8], .little);
+                }
+            }
+        }
+        cmd_offset += cmdsize;
+    }
+
+    if (!found_cs or cs_dataoff == 0) return error.TypeError;
+
+    // Pad to cs_dataoff if needed
+    while (result.data.items.len < cs_dataoff) {
+        result.data.append(self.gpa, 0) catch return error.OutOfMemory;
+    }
+
+    const code_limit = cs_dataoff;
+    const page_size: u32 = 4096;
+    const n_code_slots = (code_limit + page_size - 1) / page_size;
+    const hash_size: u8 = 32;
+    const ident_len: u32 = 1; // empty string "\0"
+    const cdir_header_size: u32 = 88;
+    const cdir_size = cdir_header_size + ident_len + n_code_slots * hash_size;
+    const blob_count: u32 = 1;
+    const superblob_size = 12 + blob_count * 8 + cdir_size;
+
+    // Verify our computed size matches expected
+    if (superblob_size != cs_datasize) {
+        // Size mismatch — the IR computed a different size than we did.
+        // This shouldn't happen if the formula is consistent.
+        // Patch the LC_CODE_SIGNATURE datasize to match our computation.
+        std.mem.writeInt(u32, result.data.items[cmd_offset - 4 ..][0..4], superblob_size, .little);
+    }
+
+    // Write SuperBlob header (big-endian)
+    const writer = result.data.writer(self.gpa);
+    writer.writeInt(u32, 0xFADE0CC0, .big) catch return error.OutOfMemory; // magic
+    writer.writeInt(u32, superblob_size, .big) catch return error.OutOfMemory; // length
+    writer.writeInt(u32, blob_count, .big) catch return error.OutOfMemory; // count
+
+    // BlobIndex[0]: CodeDirectory
+    writer.writeInt(u32, 0x00000000, .big) catch return error.OutOfMemory; // type = CSSLOT_CODEDIRECTORY
+    writer.writeInt(u32, 12 + blob_count * 8, .big) catch return error.OutOfMemory; // offset from SuperBlob start
+
+    // CodeDirectory header (88 bytes, big-endian)
+    const hash_offset = cdir_header_size + ident_len;
+    const ident_offset = cdir_header_size;
+
+    writer.writeInt(u32, 0xFADE0C02, .big) catch return error.OutOfMemory; // magic
+    writer.writeInt(u32, cdir_size, .big) catch return error.OutOfMemory; // length
+    writer.writeInt(u32, 0x00020400, .big) catch return error.OutOfMemory; // version
+    writer.writeInt(u32, 0x00020002, .big) catch return error.OutOfMemory; // flags: CS_ADHOC | CS_LINKER_SIGNED
+    writer.writeInt(u32, hash_offset, .big) catch return error.OutOfMemory; // hashOffset
+    writer.writeInt(u32, ident_offset, .big) catch return error.OutOfMemory; // identOffset
+    writer.writeInt(u32, 0, .big) catch return error.OutOfMemory; // nSpecialSlots
+    writer.writeInt(u32, n_code_slots, .big) catch return error.OutOfMemory; // nCodeSlots
+    writer.writeInt(u32, code_limit, .big) catch return error.OutOfMemory; // codeLimit
+    writer.writeByte(hash_size) catch return error.OutOfMemory; // hashSize
+    writer.writeByte(2) catch return error.OutOfMemory; // hashType = CS_HASHTYPE_SHA256
+    writer.writeByte(0) catch return error.OutOfMemory; // platform
+    writer.writeByte(12) catch return error.OutOfMemory; // pageSize = log2(4096)
+    writer.writeInt(u32, 0, .big) catch return error.OutOfMemory; // spare2
+    writer.writeInt(u32, 0, .big) catch return error.OutOfMemory; // scatterOffset
+    writer.writeInt(u32, 0, .big) catch return error.OutOfMemory; // teamOffset
+    writer.writeInt(u32, 0, .big) catch return error.OutOfMemory; // spare3
+    writer.writeInt(u64, 0, .big) catch return error.OutOfMemory; // codeLimit64
+    writer.writeInt(u64, text_fileoff, .big) catch return error.OutOfMemory; // execSegBase
+    writer.writeInt(u64, text_filesize, .big) catch return error.OutOfMemory; // execSegLimit
+    writer.writeInt(u64, 0x1, .big) catch return error.OutOfMemory; // execSegFlags = CS_EXECSEG_MAIN_BINARY
+
+    // Identity: empty null-terminated string
+    writer.writeByte(0) catch return error.OutOfMemory;
+
+    // Code slot hashes: SHA-256 of each 4096-byte page
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const file_bytes = result.data.items;
+    var page_idx: u32 = 0;
+    while (page_idx < n_code_slots) : (page_idx += 1) {
+        const start = page_idx * page_size;
+        const end = @min(start + page_size, code_limit);
+        const page_data = file_bytes[start..end];
+        var hash: [32]u8 = undefined;
+        Sha256.hash(page_data, &hash, .{});
+        writer.writeAll(&hash) catch return error.OutOfMemory;
+    }
+
+    return .{ .bytes = result };
 }
 
 fn bytes_write_file(args: []const Value, _: *anyopaque) InterpreterError!Value {
@@ -429,6 +592,7 @@ pub fn registerAll(self: *Interpreter) InterpreterError!void {
     const entries = .{
         // IO
         .{ "io_print", io_print },
+        .{ "debug_type", debug_type },
         .{ "io_read_file", io_read_file },
         .{ "io_write_file", io_write_file },
         .{ "io_exit", io_exit },
@@ -462,8 +626,10 @@ pub fn registerAll(self: *Interpreter) InterpreterError!void {
         .{ "bytes_append_u32_le", bytes_append_u32_le },
         .{ "bytes_append_u64_le", bytes_append_u64_le },
         .{ "bytes_set_u32_le", bytes_set_u32_le },
+        .{ "bytes_append_bytes", bytes_append_bytes },
         .{ "bytes_length", bytes_length },
         .{ "bytes_write_file", bytes_write_file },
+        .{ "bytes_macho_codesign", bytes_macho_codesign },
         .{ "string_to_bytes", string_to_bytes },
     };
 

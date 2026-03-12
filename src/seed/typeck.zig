@@ -1592,12 +1592,51 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
         g.beginReservedBlock(rec_lit_blk);
         {
-            const rec_type = try g.tag(ty_any, null);
-            const texpr = try g.tag(tast_record_lit, expr);
-            try g.ret(try g.record(&.{
-                .{ .name = "expr", .value = texpr },
-                .{ .name = "type", .value = rec_type },
-            }));
+            // Type-check each field value
+            const ast_fields = try g.tagPayload(expr, grammar.ast_record_lit);
+            const num_fields_r = try g.listLength(ast_fields);
+            const zero_r = try g.constInt(0);
+            const typed_fields = try g.listInit(&.{});
+            const rl_loop = g.reserveBlock();
+            try g.jump(rl_loop, &.{ zero_r, typed_fields });
+
+            g.beginReservedBlock(rl_loop);
+            const rl_i = try g.addBlockParam();
+            const rl_tfs = try g.addBlockParam();
+            const rl_done = try g.ge(rl_i, num_fields_r);
+            const rl_body = g.reserveBlock();
+            const rl_exit = g.reserveBlock();
+            try g.branch(rl_done, rl_exit, rl_body);
+
+            g.beginReservedBlock(rl_body);
+            {
+                const ast_field = try g.listNth(ast_fields, rl_i);
+                const f_name = try g.recordField(ast_field, "name");
+                const f_val = try g.recordField(ast_field, "value");
+                // Type-check field value
+                const f_result = try g.callDirect(f_infer, &.{ f_val, ctx });
+                const f_typed = try g.recordField(f_result, "expr");
+                const typed_field = try g.record(&.{
+                    .{ .name = "name", .value = f_name },
+                    .{ .name = "value", .value = f_typed },
+                });
+                const rl_tfs2 = try g.listAppend(rl_tfs, typed_field);
+                const one_r = try g.constInt(1);
+                const next_r = try g.add(rl_i, one_r);
+                try g.jump(rl_loop, &.{ next_r, rl_tfs2 });
+            }
+
+            g.beginReservedBlock(rl_exit);
+            {
+                const rec_type = try g.tag(ty_any, null);
+                // Wrap typed fields as TRecordLit(RecordLit([{name, value: typed}]))
+                const typed_rec = try g.tag(grammar.ast_record_lit, rl_tfs);
+                const texpr = try g.tag(tast_record_lit, typed_rec);
+                try g.ret(try g.record(&.{
+                    .{ .name = "expr", .value = texpr },
+                    .{ .name = "type", .value = rec_type },
+                }));
+            }
         }
 
         // Unary

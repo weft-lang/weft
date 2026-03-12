@@ -7,3 +7,5 @@
 pub const grammar = @import("seed/grammar.zig");
 pub const gen = @import("seed/gen.zig");
 pub const typeck = @import("seed/typeck.zig");
+pub const lower = @import("seed/lower.zig");
+pub const emit = @import("seed/emit.zig");

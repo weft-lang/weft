@@ -250,7 +250,7 @@ pub const Interpreter = struct {
             .unary => |v| try execUnary(v.op, resolve(frame, v.operand)),
 
             .record_init => |v| try self.execRecordInit(v.fields, frame),
-            .record_field => |v| try execRecordField(resolve(frame, v.record), v.field),
+            .record_field => |v| try self.execRecordField(resolve(frame, v.record), v.field),
             .record_update => |v| try self.execRecordUpdate(resolve(frame, v.base), v.updates, frame),
 
             .tag_init => |v| try self.execTagInit(v.tag, if (v.payload) |p| resolve(frame, p) else null),
@@ -423,7 +423,7 @@ pub const Interpreter = struct {
         return .{ .record = rec };
     }
 
-    fn execRecordField(record_val: Value, field: InternedString) InterpreterError!Value {
+    fn execRecordField(_: *const Interpreter, record_val: Value, field: InternedString) InterpreterError!Value {
         const rec = switch (record_val) {
             .record => |r| r,
             else => return error.TypeError,
