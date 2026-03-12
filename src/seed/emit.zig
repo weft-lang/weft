@@ -724,44 +724,99 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
     try g.endReservedFunc(f_emit_exit);
 
     // ── ec_emit_prologue(frame_size) -> Bytes ────────────────────────
-    // STP x29, x30, [sp, #-frame_size]!
-    // ADD x29, sp, #0  (MOV x29, sp)
+    // Save callee-saved registers: x19-x26 + x29/x30
+    // 5 STP pre-index pairs, then ADD x29, sp, #0
     try g.beginReservedFunc("ec_emit_prologue");
     {
         _ = g.beginBlock();
         const frame_size = try g.addParam();
+        _ = frame_size;
         const bytes = try g.callBuiltin("bytes_new", &.{});
+        const c31 = try g.constInt(31); // sp
+        const neg16 = try g.constInt(-16);
+        const c0 = try g.constInt(0);
+
+        // STP x19, x20, [sp, #-16]!
+        const c19 = try g.constInt(19);
+        const c20 = try g.constInt(20);
+        const stp1 = try g.callDirect(f_encode_stp_pre, &.{ c19, c20, c31, neg16 });
+        const b1 = try g.callDirect(f_append_inst, &.{ bytes, stp1 });
+
+        // STP x21, x22, [sp, #-16]!
+        const c21 = try g.constInt(21);
+        const c22 = try g.constInt(22);
+        const stp2 = try g.callDirect(f_encode_stp_pre, &.{ c21, c22, c31, neg16 });
+        const b2 = try g.callDirect(f_append_inst, &.{ b1, stp2 });
+
+        // STP x23, x24, [sp, #-16]!
+        const c23 = try g.constInt(23);
+        const c24 = try g.constInt(24);
+        const stp3 = try g.callDirect(f_encode_stp_pre, &.{ c23, c24, c31, neg16 });
+        const b3 = try g.callDirect(f_append_inst, &.{ b2, stp3 });
+
+        // STP x25, x26, [sp, #-16]!
+        const c25 = try g.constInt(25);
+        const c26 = try g.constInt(26);
+        const stp4 = try g.callDirect(f_encode_stp_pre, &.{ c25, c26, c31, neg16 });
+        const b4 = try g.callDirect(f_append_inst, &.{ b3, stp4 });
+
+        // STP x29, x30, [sp, #-16]!
         const c29 = try g.constInt(29);
         const c30 = try g.constInt(30);
-        const c31 = try g.constInt(31); // sp
-        // STP with negative offset: we negate frame_size
-        const c0 = try g.constInt(0);
-        const neg_frame = try g.sub(c0, frame_size);
-        const stp = try g.callDirect(f_encode_stp_pre, &.{ c29, c30, c31, neg_frame });
-        const b1 = try g.callDirect(f_append_inst, &.{ bytes, stp });
-        // ADD x29, sp, #0
+        const stp5 = try g.callDirect(f_encode_stp_pre, &.{ c29, c30, c31, neg16 });
+        const b5 = try g.callDirect(f_append_inst, &.{ b4, stp5 });
+
+        // ADD x29, sp, #0  (frame pointer)
         const mov_fp = try g.callDirect(f_encode_add_imm, &.{ c29, c31, c0 });
-        const b2 = try g.callDirect(f_append_inst, &.{ b1, mov_fp });
-        try g.ret(b2);
+        const b6 = try g.callDirect(f_append_inst, &.{ b5, mov_fp });
+        try g.ret(b6);
     }
     try g.endReservedFunc(f_emit_prologue);
 
     // ── ec_emit_epilogue(frame_size) -> Bytes ────────────────────────
-    // LDP x29, x30, [sp], #frame_size
-    // RET
+    // Restore callee-saved registers in reverse order, then RET
     try g.beginReservedFunc("ec_emit_epilogue");
     {
         _ = g.beginBlock();
         const frame_size = try g.addParam();
+        _ = frame_size;
         const bytes = try g.callBuiltin("bytes_new", &.{});
+        const c31 = try g.constInt(31); // sp
+        const c16 = try g.constInt(16);
+
+        // LDP x29, x30, [sp], #16
         const c29 = try g.constInt(29);
         const c30 = try g.constInt(30);
-        const c31 = try g.constInt(31); // sp
-        const ldp = try g.callDirect(f_encode_ldp_post, &.{ c29, c30, c31, frame_size });
-        const b1 = try g.callDirect(f_append_inst, &.{ bytes, ldp });
+        const ldp1 = try g.callDirect(f_encode_ldp_post, &.{ c29, c30, c31, c16 });
+        const b1 = try g.callDirect(f_append_inst, &.{ bytes, ldp1 });
+
+        // LDP x25, x26, [sp], #16
+        const c25 = try g.constInt(25);
+        const c26 = try g.constInt(26);
+        const ldp2 = try g.callDirect(f_encode_ldp_post, &.{ c25, c26, c31, c16 });
+        const b2 = try g.callDirect(f_append_inst, &.{ b1, ldp2 });
+
+        // LDP x23, x24, [sp], #16
+        const c23 = try g.constInt(23);
+        const c24 = try g.constInt(24);
+        const ldp3 = try g.callDirect(f_encode_ldp_post, &.{ c23, c24, c31, c16 });
+        const b3 = try g.callDirect(f_append_inst, &.{ b2, ldp3 });
+
+        // LDP x21, x22, [sp], #16
+        const c21 = try g.constInt(21);
+        const c22 = try g.constInt(22);
+        const ldp4 = try g.callDirect(f_encode_ldp_post, &.{ c21, c22, c31, c16 });
+        const b4 = try g.callDirect(f_append_inst, &.{ b3, ldp4 });
+
+        // LDP x19, x20, [sp], #16
+        const c19 = try g.constInt(19);
+        const c20 = try g.constInt(20);
+        const ldp5 = try g.callDirect(f_encode_ldp_post, &.{ c19, c20, c31, c16 });
+        const b5 = try g.callDirect(f_append_inst, &.{ b4, ldp5 });
+
         const ret_inst = try g.callDirect(f_encode_ret_inst, &.{});
-        const b2 = try g.callDirect(f_append_inst, &.{ b1, ret_inst });
-        try g.ret(b2);
+        const b6 = try g.callDirect(f_append_inst, &.{ b5, ret_inst });
+        try g.ret(b6);
     }
     try g.endReservedFunc(f_emit_epilogue);
 
@@ -796,24 +851,26 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         // New allocation
         g.beginReservedBlock(blk_new);
         // Map next_reg counter to actual register number
-        // 0-7 -> x8-x15, 8-17 -> x19-x28
+        // Prefer callee-saved first so values survive across calls:
+        // 0-7 -> x19-x26 (callee-saved), 8-15 -> x8-x15 (temps)
         const c8_val = try g.constInt(8);
-        const is_callee_saved = try g.ge(next_reg, c8_val);
-        const blk_callee = g.reserveBlock();
+        const is_temp = try g.ge(next_reg, c8_val);
         const blk_temp = g.reserveBlock();
-        try g.branch(is_callee_saved, blk_callee, blk_temp);
-
-        g.beginReservedBlock(blk_temp);
-        // reg = next_reg + 8
-        const reg_temp = try g.add(next_reg, c8_val);
-        const blk_assign = g.reserveBlock();
-        try g.jump(blk_assign, &.{reg_temp});
+        const blk_callee = g.reserveBlock();
+        try g.branch(is_temp, blk_temp, blk_callee);
 
         g.beginReservedBlock(blk_callee);
-        // reg = next_reg - 8 + 19 = next_reg + 11
-        const c11 = try g.constInt(11);
-        const reg_callee = try g.add(next_reg, c11);
+        // reg = next_reg + 19
+        const c19_val = try g.constInt(19);
+        const reg_callee = try g.add(next_reg, c19_val);
+        const blk_assign = g.reserveBlock();
         try g.jump(blk_assign, &.{reg_callee});
+
+        g.beginReservedBlock(blk_temp);
+        // reg = next_reg - 8 + 8 = next_reg
+        // counter 8 -> x8, 9 -> x9, etc.
+        const reg_temp = try g.add(next_reg, try g.constInt(0));
+        try g.jump(blk_assign, &.{reg_temp});
 
         g.beginReservedBlock(blk_assign);
         const actual_reg = try g.addBlockParam();
@@ -1683,20 +1740,10 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
         g.beginReservedBlock(param_done_blk);
         const func_reg_map = try g.addBlockParam();
-        // next_reg starts after params (they occupy x0..n-1, but our alloc starts at x8)
-        // Actually alloc_reg maps counter to actual regs: counter 0->x8, etc. So next_reg=0 is correct.
-        // The params are pre-bound by value ID in reg_map, bypassing the counter.
-        // Emit prologue: STP x29, x30, [sp, #-16]! ; ADD x29, sp, #0
+        // Emit prologue: save all callee-saved registers
         const c16 = try g.constInt(16);
-        const c29 = try g.constInt(29);
-        const c30 = try g.constInt(30);
-        const c31 = try g.constInt(31);
-        const neg16 = try g.constInt(-16);
-        const stp_inst = try g.callDirect(f_encode_stp_pre, &.{ c29, c30, c31, neg16 });
-        const code1 = try g.callDirect(f_append_inst, &.{ code, stp_inst });
-        // ADD x29, sp, #0
-        const mov_fp = try g.callDirect(f_encode_add_imm, &.{ c29, c31, c0 });
-        const code2 = try g.callDirect(f_append_inst, &.{ code1, mov_fp });
+        const pro_bytes = try g.callDirect(f_emit_prologue, &.{c16});
+        const code2 = try g.callBuiltin("bytes_append_bytes", &.{ code, pro_bytes });
 
         const blocks = try g.recordField(func, "blocks");
         const num_blocks = try g.listLength(blocks);
@@ -1822,14 +1869,10 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const next_b_idx = try g.add(b_idx, c1);
         try g.jump(loop_blk, &.{ next_b_idx, new_code, new_ctx });
 
-        // Done: emit epilogue
+        // Done: emit epilogue (restore all callee-saved registers + RET)
         g.beginReservedBlock(blk_done);
-        // LDP x29, x30, [sp], #16
-        const ldp_inst = try g.callDirect(f_encode_ldp_post, &.{ c29, c30, c31, c16 });
-        const code_epi1 = try g.callDirect(f_append_inst, &.{ cur_code, ldp_inst });
-        // RET
-        const ret_inst = try g.callDirect(f_encode_ret_inst, &.{});
-        const code_epi2 = try g.callDirect(f_append_inst, &.{ code_epi1, ret_inst });
+        const epi_bytes = try g.callDirect(f_emit_epilogue, &.{c16});
+        const code_epi2 = try g.callBuiltin("bytes_append_bytes", &.{ cur_code, epi_bytes });
 
         const func_result = try g.record(&.{
             .{ .name = "code", .value = code_epi2 },
@@ -2963,8 +3006,8 @@ test "emit: alloc_reg maps first value to x8" {
     defer interp.deinit();
 
     const val = try interp.execFunc(fid, &.{});
-    // First allocation: next_reg=0, reg = 0+8 = x8
-    try std.testing.expectEqual(@as(i64, 8), val.int);
+    // First allocation: next_reg=0, reg = 0+19 = x19 (callee-saved first)
+    try std.testing.expectEqual(@as(i64, 19), val.int);
 }
 
 test "emit: alloc_reg returns same reg for same value_id" {
@@ -3018,8 +3061,8 @@ test "emit: alloc_reg returns same reg for same value_id" {
     try std.testing.expect(val.bool_val == true);
 }
 
-test "emit: alloc_reg callee-saved starts at x19" {
-    // After allocating 8 temp registers (x8-x15), the 9th goes to x19
+test "emit: alloc_reg temps start at x8 after callee-saved" {
+    // After allocating 8 callee-saved registers (x19-x26), the 9th goes to x8
     var backing = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer backing.deinit();
     const alloc = backing.allocator();
@@ -3062,8 +3105,8 @@ test "emit: alloc_reg callee-saved starts at x19" {
     defer interp.deinit();
 
     const val = try interp.execFunc(fid, &.{});
-    // next_reg=8 >= 8, so callee-saved: reg = 8 + 11 = 19 (x19)
-    try std.testing.expectEqual(@as(i64, 19), val.int);
+    // next_reg=8 >= 8, so temp: reg = 8 + 0 = 8 (x8)
+    try std.testing.expectEqual(@as(i64, 8), val.int);
 }
 
 // ── Code generation semantic tests ─────────────────────────────────────
@@ -3417,7 +3460,7 @@ test "emit: emit_inst binary == produces 8 bytes (CMP+CSET)" {
 
 // ── Prologue/Epilogue semantic tests ───────────────────────────────────
 
-test "emit: prologue produces 8 bytes (STP + MOV fp)" {
+test "emit: prologue produces 24 bytes (5 STP + MOV fp)" {
     var backing = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer backing.deinit();
     const alloc = backing.allocator();
@@ -3442,11 +3485,11 @@ test "emit: prologue produces 8 bytes (STP + MOV fp)" {
     defer interp.deinit();
 
     const val = try interp.execFunc(fid, &.{});
-    // STP (4 bytes) + ADD (4 bytes) = 8 bytes
-    try std.testing.expectEqual(@as(i64, 8), val.int);
+    // 5 STP (20 bytes) + ADD (4 bytes) = 24 bytes
+    try std.testing.expectEqual(@as(i64, 24), val.int);
 }
 
-test "emit: epilogue produces 8 bytes (LDP + RET)" {
+test "emit: epilogue produces 24 bytes (5 LDP + RET)" {
     var backing = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer backing.deinit();
     const alloc = backing.allocator();
@@ -3471,8 +3514,8 @@ test "emit: epilogue produces 8 bytes (LDP + RET)" {
     defer interp.deinit();
 
     const val = try interp.execFunc(fid, &.{});
-    // LDP (4 bytes) + RET (4 bytes) = 8 bytes
-    try std.testing.expectEqual(@as(i64, 8), val.int);
+    // 5 LDP (20 bytes) + RET (4 bytes) = 24 bytes
+    try std.testing.expectEqual(@as(i64, 24), val.int);
 }
 
 // ── Encoding cross-check: AND/ORR ──────────────────────────────────────
