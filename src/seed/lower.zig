@@ -47,6 +47,8 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
     const f_lower_call = try g.reserveFunc("lc_lower_call");
     const f_lower_let = try g.reserveFunc("lc_lower_let");
     const f_lower_block = try g.reserveFunc("lc_lower_block");
+    const f_lower_match = try g.reserveFunc("lc_lower_match");
+    const f_lower_match_arms = try g.reserveFunc("lc_lower_match_arms");
     const f_lower_fn_decl = try g.reserveFunc("lc_lower_fn_decl");
     const f_lower_module = try g.reserveFunc("lc_lower_module");
 
@@ -788,7 +790,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             }));
         }
 
-        // ── TMatch (simplified) ──
+        // ── TMatch ──
         g.beginReservedBlock(check_match);
         const is_match = try g.tagTest(expr, typeck.tast_match);
         const match_blk = g.reserveBlock();
@@ -797,11 +799,8 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
         g.beginReservedBlock(match_blk);
         {
-            // For bootstrap: lower scrutinee, return its value
-            const payload = try g.tagPayload(expr, typeck.tast_match);
-            const scrutinee = try g.recordField(payload, "expr");
-            const scrut_r = try g.callDirect(f_lower_expr, &.{ scrutinee, scope, state });
-            try g.ret(scrut_r);
+            const result = try g.callDirect(f_lower_match, &.{ expr, scope, state });
+            try g.ret(result);
         }
 
         // ── Default: unhandled node, emit const nil ──
@@ -1174,6 +1173,594 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         }));
     }
     try g.endReservedFunc(f_lower_block);
+
+    // ── Generate: lc_lower_match(expr, scope, state) -> {value, state} ──
+    // Lowers a match expression as an if-else chain.
+    try g.beginReservedFunc("lc_lower_match");
+    {
+        const expr = try g.addParam();
+        const scope = try g.addParam();
+        const state = try g.addParam();
+        _ = g.beginBlock();
+
+        const payload = try g.tagPayload(expr, typeck.tast_match);
+        const scrutinee = try g.recordField(payload, "expr");
+        const cases = try g.recordField(payload, "cases");
+
+        // Lower scrutinee
+        const scrut_r = try g.callDirect(f_lower_expr, &.{ scrutinee, scope, state });
+        const scrut_val = try g.recordField(scrut_r, "value");
+        const st1 = try g.recordField(scrut_r, "state");
+
+        // Allocate merge block ID
+        const merge_nb = try g.callDirect(f_alloc_block_id, &.{st1});
+        const merge_id = try g.recordField(merge_nb, "id");
+        const st2 = try g.recordField(merge_nb, "state");
+
+        // Process arms recursively
+        const zero = try g.constInt(0);
+        const arms_len = try g.listLength(cases);
+        const arms_r = try g.callDirect(f_lower_match_arms, &.{ cases, zero, arms_len, scrut_val, scope, merge_id, st2 });
+        const st3 = try g.recordField(arms_r, "state");
+
+        // Set up merge block: allocate phi value
+        const fv_merge = try g.callDirect(f_fresh_val, &.{st3});
+        const merge_val = try g.recordField(fv_merge, "id");
+        const st4 = try g.recordField(fv_merge, "state");
+
+        // Set block_id to merge_id
+        const nv4 = try g.recordField(st4, "next_val");
+        const nb4 = try g.recordField(st4, "next_block");
+        const blks4 = try g.recordField(st4, "blocks");
+        const fns4 = try g.recordField(st4, "functions");
+        const insts4 = try g.recordField(st4, "insts");
+        const st_merge = try g.record(&.{
+            .{ .name = "next_val", .value = nv4 },
+            .{ .name = "insts", .value = insts4 },
+            .{ .name = "blocks", .value = blks4 },
+            .{ .name = "block_id", .value = merge_id },
+            .{ .name = "next_block", .value = nb4 },
+            .{ .name = "functions", .value = fns4 },
+        });
+
+        try g.ret(try g.record(&.{
+            .{ .name = "value", .value = merge_val },
+            .{ .name = "state", .value = st_merge },
+        }));
+    }
+    try g.endReservedFunc(f_lower_match);
+
+    // ── Generate: lc_lower_match_arms(cases, idx, len, scrut_val, scope, merge_id, state) -> {state} ──
+    // Recursively processes match arms as an if-else chain.
+    // Each arm: test pattern → branch to body (jumps to merge) or next arm.
+    try g.beginReservedFunc("lc_lower_match_arms");
+    {
+        const cases = try g.addParam();
+        const idx = try g.addParam();
+        const len = try g.addParam();
+        const scrut_val = try g.addParam();
+        const scope = try g.addParam();
+        const merge_id = try g.addParam();
+        const state = try g.addParam();
+        _ = g.beginBlock();
+
+        // Base case: idx >= len → emit unreachable (const nil, jump to merge)
+        const done = try g.ge(idx, len);
+        const base_blk = g.reserveBlock();
+        const arm_blk = g.reserveBlock();
+        try g.branch(done, base_blk, arm_blk);
+
+        g.beginReservedBlock(base_blk);
+        {
+            // Emit a nil value and jump to merge (unreachable in well-typed programs)
+            const fv = try g.callDirect(f_fresh_val, &.{state});
+            const nil_dst = try g.recordField(fv, "id");
+            const st1 = try g.recordField(fv, "state");
+            const nil_inst = try g.record(&.{
+                .{ .name = "dst", .value = nil_dst },
+            });
+            const nil_tag = try g.tag(ir_const_nil, nil_inst);
+            const st2 = try g.callDirect(f_emit_inst, &.{ nil_tag, st1 });
+            const nil_args = try g.listInit(&.{nil_dst});
+            const nil_jmp = try g.record(&.{
+                .{ .name = "target", .value = merge_id },
+                .{ .name = "args", .value = nil_args },
+            });
+            const nil_term = try g.tag(ir_jump, nil_jmp);
+            const st3 = try g.callDirect(f_end_block, &.{ nil_term, st2 });
+            try g.ret(try g.record(&.{
+                .{ .name = "state", .value = st3 },
+            }));
+        }
+
+        g.beginReservedBlock(arm_blk);
+        {
+            const arm = try g.listNth(cases, idx);
+            const pattern = try g.recordField(arm, "pattern");
+            const body = try g.recordField(arm, "body");
+
+            // ── Check pattern type ──
+            // TPatWildcard: always matches
+            const is_wildcard = try g.tagTest(pattern, "TPatWildcard");
+            const wildcard_arm_blk = g.reserveBlock();
+            const check_bind = g.reserveBlock();
+            try g.branch(is_wildcard, wildcard_arm_blk, check_bind);
+
+            // Wildcard: lower body directly, jump to merge
+            g.beginReservedBlock(wildcard_arm_blk);
+            {
+                const body_r = try g.callDirect(f_lower_expr, &.{ body, scope, state });
+                const body_val = try g.recordField(body_r, "value");
+                const st1 = try g.recordField(body_r, "state");
+                const wc_args = try g.listInit(&.{body_val});
+                const wc_jmp = try g.record(&.{
+                    .{ .name = "target", .value = merge_id },
+                    .{ .name = "args", .value = wc_args },
+                });
+                const wc_term = try g.tag(ir_jump, wc_jmp);
+                const st2 = try g.callDirect(f_end_block, &.{ wc_term, st1 });
+                try g.ret(try g.record(&.{
+                    .{ .name = "state", .value = st2 },
+                }));
+            }
+
+            // TPatBind: always matches, bind scrutinee to name
+            g.beginReservedBlock(check_bind);
+            const is_bind = try g.tagTest(pattern, "TPatBind");
+            const bind_arm_blk = g.reserveBlock();
+            const check_literal = g.reserveBlock();
+            try g.branch(is_bind, bind_arm_blk, check_literal);
+
+            g.beginReservedBlock(bind_arm_blk);
+            {
+                const tpat_pl = try g.tagPayload(pattern, "TPatBind");
+                const pat_name = try g.recordField(tpat_pl, "name");
+                const new_scope = try g.mapSet(scope, pat_name, scrut_val);
+                const body_r = try g.callDirect(f_lower_expr, &.{ body, new_scope, state });
+                const body_val = try g.recordField(body_r, "value");
+                const st1 = try g.recordField(body_r, "state");
+                const bind_args = try g.listInit(&.{body_val});
+                const bind_jmp = try g.record(&.{
+                    .{ .name = "target", .value = merge_id },
+                    .{ .name = "args", .value = bind_args },
+                });
+                const bind_term = try g.tag(ir_jump, bind_jmp);
+                const st2 = try g.callDirect(f_end_block, &.{ bind_term, st1 });
+                try g.ret(try g.record(&.{
+                    .{ .name = "state", .value = st2 },
+                }));
+            }
+
+            // TPatLiteral: compare scrutinee == literal, branch
+            g.beginReservedBlock(check_literal);
+            const is_literal = try g.tagTest(pattern, "TPatLiteral");
+            const literal_arm_blk = g.reserveBlock();
+            const check_ctor = g.reserveBlock();
+            try g.branch(is_literal, literal_arm_blk, check_ctor);
+
+            g.beginReservedBlock(literal_arm_blk);
+            {
+                // TPatLiteral payload is the literal AST node (IntLit(n) or BoolLit(b))
+                const lit_pl = try g.tagPayload(pattern, "TPatLiteral");
+
+                // Lower the literal to get its value
+                // The literal is an AST node — we need to extract the int value
+                const is_int = try g.tagTest(lit_pl, "IntLit");
+                const int_lit_blk = g.reserveBlock();
+                const bool_lit_blk = g.reserveBlock();
+                try g.branch(is_int, int_lit_blk, bool_lit_blk);
+
+                g.beginReservedBlock(int_lit_blk);
+                {
+                    const int_val = try g.tagPayload(lit_pl, "IntLit");
+
+                    // Emit IrConstInt for the literal value
+                    const fv = try g.callDirect(f_fresh_val, &.{state});
+                    const lit_dst = try g.recordField(fv, "id");
+                    const st1 = try g.recordField(fv, "state");
+                    const lit_inst = try g.record(&.{
+                        .{ .name = "dst", .value = lit_dst },
+                        .{ .name = "value", .value = int_val },
+                    });
+                    const lit_tag = try g.tag(ir_const_int, lit_inst);
+                    const st2 = try g.callDirect(f_emit_inst, &.{ lit_tag, st1 });
+
+                    // Emit IrBinary eq: cmp_dst = (scrut_val == lit_dst)
+                    const fv2 = try g.callDirect(f_fresh_val, &.{st2});
+                    const cmp_dst = try g.recordField(fv2, "id");
+                    const st3 = try g.recordField(fv2, "state");
+                    const eq_str = try g.constString("==");
+                    const cmp_inst = try g.record(&.{
+                        .{ .name = "dst", .value = cmp_dst },
+                        .{ .name = "op", .value = eq_str },
+                        .{ .name = "lhs", .value = scrut_val },
+                        .{ .name = "rhs", .value = lit_dst },
+                    });
+                    const cmp_tag = try g.tag(ir_binary, cmp_inst);
+                    const st4 = try g.callDirect(f_emit_inst, &.{ cmp_tag, st3 });
+
+                    // Allocate body and next-arm block IDs
+                    const body_nb = try g.callDirect(f_alloc_block_id, &.{st4});
+                    const body_id = try g.recordField(body_nb, "id");
+                    const st5 = try g.recordField(body_nb, "state");
+                    const next_nb = try g.callDirect(f_alloc_block_id, &.{st5});
+                    const next_id = try g.recordField(next_nb, "id");
+                    const st6 = try g.recordField(next_nb, "state");
+
+                    // End current block with branch
+                    const br_rec = try g.record(&.{
+                        .{ .name = "cond", .value = cmp_dst },
+                        .{ .name = "then_blk", .value = body_id },
+                        .{ .name = "else_blk", .value = next_id },
+                    });
+                    const br_term = try g.tag(ir_branch, br_rec);
+                    const st7 = try g.callDirect(f_end_block, &.{ br_term, st6 });
+
+                    // Lower body in body_id block
+                    const nv7 = try g.recordField(st7, "next_val");
+                    const nb7 = try g.recordField(st7, "next_block");
+                    const blks7 = try g.recordField(st7, "blocks");
+                    const fns7 = try g.recordField(st7, "functions");
+                    const empty7 = try g.listInit(&.{});
+                    const st_body = try g.record(&.{
+                        .{ .name = "next_val", .value = nv7 },
+                        .{ .name = "insts", .value = empty7 },
+                        .{ .name = "blocks", .value = blks7 },
+                        .{ .name = "block_id", .value = body_id },
+                        .{ .name = "next_block", .value = nb7 },
+                        .{ .name = "functions", .value = fns7 },
+                    });
+                    const body_r = try g.callDirect(f_lower_expr, &.{ body, scope, st_body });
+                    const body_val = try g.recordField(body_r, "value");
+                    const st8 = try g.recordField(body_r, "state");
+
+                    // End body block: jump to merge
+                    const body_args = try g.listInit(&.{body_val});
+                    const body_jmp = try g.record(&.{
+                        .{ .name = "target", .value = merge_id },
+                        .{ .name = "args", .value = body_args },
+                    });
+                    const body_term = try g.tag(ir_jump, body_jmp);
+                    const st9 = try g.callDirect(f_end_block, &.{ body_term, st8 });
+
+                    // Continue with next arms in next_id block
+                    const nv9 = try g.recordField(st9, "next_val");
+                    const nb9 = try g.recordField(st9, "next_block");
+                    const blks9 = try g.recordField(st9, "blocks");
+                    const fns9 = try g.recordField(st9, "functions");
+                    const empty9 = try g.listInit(&.{});
+                    const st_next = try g.record(&.{
+                        .{ .name = "next_val", .value = nv9 },
+                        .{ .name = "insts", .value = empty9 },
+                        .{ .name = "blocks", .value = blks9 },
+                        .{ .name = "block_id", .value = next_id },
+                        .{ .name = "next_block", .value = nb9 },
+                        .{ .name = "functions", .value = fns9 },
+                    });
+                    const one = try g.constInt(1);
+                    const next_idx = try g.add(idx, one);
+                    const rest_r = try g.callDirect(f_lower_match_arms, &.{ cases, next_idx, len, scrut_val, scope, merge_id, st_next });
+                    try g.ret(rest_r);
+                }
+
+                g.beginReservedBlock(bool_lit_blk);
+                {
+                    // Bool literal pattern: extract bool, compare
+                    const bool_str = try g.tagPayload(lit_pl, "BoolLit");
+                    const true_str = try g.constString("true");
+                    const is_true = try g.eq(bool_str, true_str);
+                    const one_val = try g.constInt(1);
+                    const zero_val = try g.constInt(0);
+                    const bool_blk_true = g.reserveBlock();
+                    const bool_blk_false = g.reserveBlock();
+                    try g.branch(is_true, bool_blk_true, bool_blk_false);
+
+                    g.beginReservedBlock(bool_blk_true);
+                    const bool_merge = g.reserveBlock();
+                    try g.jump(bool_merge, &.{one_val});
+
+                    g.beginReservedBlock(bool_blk_false);
+                    try g.jump(bool_merge, &.{zero_val});
+
+                    g.beginReservedBlock(bool_merge);
+                    const bool_val = try g.addBlockParam();
+
+                    // Emit IrConstInt for the bool value
+                    const fv = try g.callDirect(f_fresh_val, &.{state});
+                    const lit_dst = try g.recordField(fv, "id");
+                    const st1 = try g.recordField(fv, "state");
+                    const lit_inst = try g.record(&.{
+                        .{ .name = "dst", .value = lit_dst },
+                        .{ .name = "value", .value = bool_val },
+                    });
+                    const lit_tag = try g.tag(ir_const_int, lit_inst);
+                    const st2 = try g.callDirect(f_emit_inst, &.{ lit_tag, st1 });
+
+                    // Compare scrutinee == literal
+                    const fv2 = try g.callDirect(f_fresh_val, &.{st2});
+                    const cmp_dst = try g.recordField(fv2, "id");
+                    const st3 = try g.recordField(fv2, "state");
+                    const eq_str = try g.constString("==");
+                    const cmp_inst = try g.record(&.{
+                        .{ .name = "dst", .value = cmp_dst },
+                        .{ .name = "op", .value = eq_str },
+                        .{ .name = "lhs", .value = scrut_val },
+                        .{ .name = "rhs", .value = lit_dst },
+                    });
+                    const cmp_tag = try g.tag(ir_binary, cmp_inst);
+                    const st4 = try g.callDirect(f_emit_inst, &.{ cmp_tag, st3 });
+
+                    // Same branch/body/next pattern as int lit
+                    const body_nb = try g.callDirect(f_alloc_block_id, &.{st4});
+                    const body_id = try g.recordField(body_nb, "id");
+                    const st5 = try g.recordField(body_nb, "state");
+                    const next_nb = try g.callDirect(f_alloc_block_id, &.{st5});
+                    const next_id = try g.recordField(next_nb, "id");
+                    const st6 = try g.recordField(next_nb, "state");
+
+                    const br_rec = try g.record(&.{
+                        .{ .name = "cond", .value = cmp_dst },
+                        .{ .name = "then_blk", .value = body_id },
+                        .{ .name = "else_blk", .value = next_id },
+                    });
+                    const br_term = try g.tag(ir_branch, br_rec);
+                    const st7 = try g.callDirect(f_end_block, &.{ br_term, st6 });
+
+                    const nv7 = try g.recordField(st7, "next_val");
+                    const nb7 = try g.recordField(st7, "next_block");
+                    const blks7 = try g.recordField(st7, "blocks");
+                    const fns7 = try g.recordField(st7, "functions");
+                    const empty7 = try g.listInit(&.{});
+                    const st_body = try g.record(&.{
+                        .{ .name = "next_val", .value = nv7 },
+                        .{ .name = "insts", .value = empty7 },
+                        .{ .name = "blocks", .value = blks7 },
+                        .{ .name = "block_id", .value = body_id },
+                        .{ .name = "next_block", .value = nb7 },
+                        .{ .name = "functions", .value = fns7 },
+                    });
+                    const body_r = try g.callDirect(f_lower_expr, &.{ body, scope, st_body });
+                    const body_val2 = try g.recordField(body_r, "value");
+                    const st8 = try g.recordField(body_r, "state");
+
+                    const body_args = try g.listInit(&.{body_val2});
+                    const body_jmp = try g.record(&.{
+                        .{ .name = "target", .value = merge_id },
+                        .{ .name = "args", .value = body_args },
+                    });
+                    const body_term = try g.tag(ir_jump, body_jmp);
+                    const st9 = try g.callDirect(f_end_block, &.{ body_term, st8 });
+
+                    const nv9 = try g.recordField(st9, "next_val");
+                    const nb9 = try g.recordField(st9, "next_block");
+                    const blks9 = try g.recordField(st9, "blocks");
+                    const fns9 = try g.recordField(st9, "functions");
+                    const empty9 = try g.listInit(&.{});
+                    const st_next = try g.record(&.{
+                        .{ .name = "next_val", .value = nv9 },
+                        .{ .name = "insts", .value = empty9 },
+                        .{ .name = "blocks", .value = blks9 },
+                        .{ .name = "block_id", .value = next_id },
+                        .{ .name = "next_block", .value = nb9 },
+                        .{ .name = "functions", .value = fns9 },
+                    });
+                    const one = try g.constInt(1);
+                    const next_idx = try g.add(idx, one);
+                    const rest_r = try g.callDirect(f_lower_match_arms, &.{ cases, next_idx, len, scrut_val, scope, merge_id, st_next });
+                    try g.ret(rest_r);
+                }
+            }
+
+            // TPatConstructor: tag test + optional payload binding
+            g.beginReservedBlock(check_ctor);
+            const is_ctor = try g.tagTest(pattern, "TPatConstructor");
+            const ctor_arm_blk = g.reserveBlock();
+            const default_pat_blk = g.reserveBlock();
+            try g.branch(is_ctor, ctor_arm_blk, default_pat_blk);
+
+            g.beginReservedBlock(ctor_arm_blk);
+            {
+                const ctor_pl = try g.tagPayload(pattern, "TPatConstructor");
+                const ctor_name = try g.recordField(ctor_pl, "name");
+                const ctor_args = try g.recordField(ctor_pl, "args");
+
+                // Emit IrTagTest: cmp_dst = tag_test(scrut_val, ctor_name)
+                const fv = try g.callDirect(f_fresh_val, &.{state});
+                const cmp_dst = try g.recordField(fv, "id");
+                const st1 = try g.recordField(fv, "state");
+                const tt_inst = try g.record(&.{
+                    .{ .name = "dst", .value = cmp_dst },
+                    .{ .name = "value", .value = scrut_val },
+                    .{ .name = "tag", .value = ctor_name },
+                });
+                const tt_tag = try g.tag(ir_tag_test, tt_inst);
+                const st2 = try g.callDirect(f_emit_inst, &.{ tt_tag, st1 });
+
+                // Allocate body and next-arm block IDs
+                const body_nb = try g.callDirect(f_alloc_block_id, &.{st2});
+                const body_id = try g.recordField(body_nb, "id");
+                const st3 = try g.recordField(body_nb, "state");
+                const next_nb = try g.callDirect(f_alloc_block_id, &.{st3});
+                const next_id = try g.recordField(next_nb, "id");
+                const st4 = try g.recordField(next_nb, "state");
+
+                // Branch on tag test
+                const br_rec = try g.record(&.{
+                    .{ .name = "cond", .value = cmp_dst },
+                    .{ .name = "then_blk", .value = body_id },
+                    .{ .name = "else_blk", .value = next_id },
+                });
+                const br_term = try g.tag(ir_branch, br_rec);
+                const st5 = try g.callDirect(f_end_block, &.{ br_term, st4 });
+
+                // Body block: extract payload if args exist, bind to scope
+                const nv5 = try g.recordField(st5, "next_val");
+                const nb5 = try g.recordField(st5, "next_block");
+                const blks5 = try g.recordField(st5, "blocks");
+                const fns5 = try g.recordField(st5, "functions");
+                const empty5 = try g.listInit(&.{});
+                const st_body = try g.record(&.{
+                    .{ .name = "next_val", .value = nv5 },
+                    .{ .name = "insts", .value = empty5 },
+                    .{ .name = "blocks", .value = blks5 },
+                    .{ .name = "block_id", .value = body_id },
+                    .{ .name = "next_block", .value = nb5 },
+                    .{ .name = "functions", .value = fns5 },
+                });
+
+                // Check if ctor has args (for payload binding)
+                const args_len = try g.listLength(ctor_args);
+                const zero_c = try g.constInt(0);
+                const has_args = try g.binary(.gt, args_len, zero_c);
+                const ctor_with_args_blk = g.reserveBlock();
+                const ctor_no_args_blk = g.reserveBlock();
+                try g.branch(has_args, ctor_with_args_blk, ctor_no_args_blk);
+
+                // Ctor with args: extract payload, bind first arg name
+                g.beginReservedBlock(ctor_with_args_blk);
+                {
+                    // Emit IrTagPayload to extract the inner value
+                    const fv2 = try g.callDirect(f_fresh_val, &.{st_body});
+                    const payload_dst = try g.recordField(fv2, "id");
+                    const st6 = try g.recordField(fv2, "state");
+                    const tp_inst = try g.record(&.{
+                        .{ .name = "dst", .value = payload_dst },
+                        .{ .name = "value", .value = scrut_val },
+                        .{ .name = "tag", .value = ctor_name },
+                    });
+                    const tp_tag = try g.tag(ir_tag_payload, tp_inst);
+                    const st7 = try g.callDirect(f_emit_inst, &.{ tp_tag, st6 });
+
+                    // First arg should be a pattern — if it's TPatBind, bind payload to name
+                    const first_arg = try g.listNth(ctor_args, zero_c);
+                    const arg_is_bind = try g.tagTest(first_arg, "PatBind");
+                    const arg_bind_blk = g.reserveBlock();
+                    const arg_nobind_blk = g.reserveBlock();
+                    try g.branch(arg_is_bind, arg_bind_blk, arg_nobind_blk);
+
+                    g.beginReservedBlock(arg_bind_blk);
+                    {
+                        const arg_name = try g.tagPayload(first_arg, "PatBind");
+                        const new_scope = try g.mapSet(scope, arg_name, payload_dst);
+                        const body_r = try g.callDirect(f_lower_expr, &.{ body, new_scope, st7 });
+                        const body_val = try g.recordField(body_r, "value");
+                        const st8 = try g.recordField(body_r, "state");
+                        const b_args = try g.listInit(&.{body_val});
+                        const b_jmp = try g.record(&.{
+                            .{ .name = "target", .value = merge_id },
+                            .{ .name = "args", .value = b_args },
+                        });
+                        const b_term = try g.tag(ir_jump, b_jmp);
+                        const st9 = try g.callDirect(f_end_block, &.{ b_term, st8 });
+
+                        // Continue with remaining arms
+                        const nv9 = try g.recordField(st9, "next_val");
+                        const nb9 = try g.recordField(st9, "next_block");
+                        const blks9 = try g.recordField(st9, "blocks");
+                        const fns9 = try g.recordField(st9, "functions");
+                        const empty9 = try g.listInit(&.{});
+                        const st_next = try g.record(&.{
+                            .{ .name = "next_val", .value = nv9 },
+                            .{ .name = "insts", .value = empty9 },
+                            .{ .name = "blocks", .value = blks9 },
+                            .{ .name = "block_id", .value = next_id },
+                            .{ .name = "next_block", .value = nb9 },
+                            .{ .name = "functions", .value = fns9 },
+                        });
+                        const one = try g.constInt(1);
+                        const next_idx = try g.add(idx, one);
+                        const rest_r = try g.callDirect(f_lower_match_arms, &.{ cases, next_idx, len, scrut_val, scope, merge_id, st_next });
+                        try g.ret(rest_r);
+                    }
+
+                    // Non-bind arg: just lower body without binding
+                    g.beginReservedBlock(arg_nobind_blk);
+                    {
+                        const body_r = try g.callDirect(f_lower_expr, &.{ body, scope, st7 });
+                        const body_val = try g.recordField(body_r, "value");
+                        const st8 = try g.recordField(body_r, "state");
+                        const b_args = try g.listInit(&.{body_val});
+                        const b_jmp = try g.record(&.{
+                            .{ .name = "target", .value = merge_id },
+                            .{ .name = "args", .value = b_args },
+                        });
+                        const b_term = try g.tag(ir_jump, b_jmp);
+                        const st9 = try g.callDirect(f_end_block, &.{ b_term, st8 });
+
+                        const nv9 = try g.recordField(st9, "next_val");
+                        const nb9 = try g.recordField(st9, "next_block");
+                        const blks9 = try g.recordField(st9, "blocks");
+                        const fns9 = try g.recordField(st9, "functions");
+                        const empty9 = try g.listInit(&.{});
+                        const st_next = try g.record(&.{
+                            .{ .name = "next_val", .value = nv9 },
+                            .{ .name = "insts", .value = empty9 },
+                            .{ .name = "blocks", .value = blks9 },
+                            .{ .name = "block_id", .value = next_id },
+                            .{ .name = "next_block", .value = nb9 },
+                            .{ .name = "functions", .value = fns9 },
+                        });
+                        const one = try g.constInt(1);
+                        const next_idx = try g.add(idx, one);
+                        const rest_r = try g.callDirect(f_lower_match_arms, &.{ cases, next_idx, len, scrut_val, scope, merge_id, st_next });
+                        try g.ret(rest_r);
+                    }
+                }
+
+                // Ctor without args: just test tag, lower body
+                g.beginReservedBlock(ctor_no_args_blk);
+                {
+                    const body_r = try g.callDirect(f_lower_expr, &.{ body, scope, st_body });
+                    const body_val = try g.recordField(body_r, "value");
+                    const st6 = try g.recordField(body_r, "state");
+                    const b_args = try g.listInit(&.{body_val});
+                    const b_jmp = try g.record(&.{
+                        .{ .name = "target", .value = merge_id },
+                        .{ .name = "args", .value = b_args },
+                    });
+                    const b_term = try g.tag(ir_jump, b_jmp);
+                    const st7 = try g.callDirect(f_end_block, &.{ b_term, st6 });
+
+                    const nv7 = try g.recordField(st7, "next_val");
+                    const nb7 = try g.recordField(st7, "next_block");
+                    const blks7 = try g.recordField(st7, "blocks");
+                    const fns7 = try g.recordField(st7, "functions");
+                    const empty7 = try g.listInit(&.{});
+                    const st_next = try g.record(&.{
+                        .{ .name = "next_val", .value = nv7 },
+                        .{ .name = "insts", .value = empty7 },
+                        .{ .name = "blocks", .value = blks7 },
+                        .{ .name = "block_id", .value = next_id },
+                        .{ .name = "next_block", .value = nb7 },
+                        .{ .name = "functions", .value = fns7 },
+                    });
+                    const one = try g.constInt(1);
+                    const next_idx = try g.add(idx, one);
+                    const rest_r = try g.callDirect(f_lower_match_arms, &.{ cases, next_idx, len, scrut_val, scope, merge_id, st_next });
+                    try g.ret(rest_r);
+                }
+            }
+
+            // Default pattern: treat as wildcard
+            g.beginReservedBlock(default_pat_blk);
+            {
+                const body_r = try g.callDirect(f_lower_expr, &.{ body, scope, state });
+                const body_val = try g.recordField(body_r, "value");
+                const st1 = try g.recordField(body_r, "state");
+                const d_args = try g.listInit(&.{body_val});
+                const d_jmp = try g.record(&.{
+                    .{ .name = "target", .value = merge_id },
+                    .{ .name = "args", .value = d_args },
+                });
+                const d_term = try g.tag(ir_jump, d_jmp);
+                const st2 = try g.callDirect(f_end_block, &.{ d_term, st1 });
+                try g.ret(try g.record(&.{
+                    .{ .name = "state", .value = st2 },
+                }));
+            }
+        }
+    }
+    try g.endReservedFunc(f_lower_match_arms);
 
     // ── Generate: lc_lower_fn_decl(decl, state) -> state ────────────
     try g.beginReservedFunc("lc_lower_fn_decl");

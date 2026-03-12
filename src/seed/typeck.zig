@@ -1405,12 +1405,50 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const scrut_result = try g.callDirect(f_infer, &.{ scrutinee, ctx });
             const scrut_typed = try g.recordField(scrut_result, "expr");
             const scrut_type = try g.recordField(scrut_result, "type");
+
+            // Type-check each arm: check pattern, infer body
+            const cases_len = try g.listLength(cases);
+            const m_zero = try g.constInt(0);
+            const m_empty = try g.listInit(&.{});
+            const m_loop = g.reserveBlock();
+            try g.jump(m_loop, &.{ m_zero, m_empty });
+
+            g.beginReservedBlock(m_loop);
+            const m_idx = try g.addBlockParam();
+            const m_typed_arms = try g.addBlockParam();
+            const m_done = try g.ge(m_idx, cases_len);
+            const m_body_blk = g.reserveBlock();
+            const m_exit_blk = g.reserveBlock();
+            try g.branch(m_done, m_exit_blk, m_body_blk);
+
+            g.beginReservedBlock(m_body_blk);
+            {
+                const arm = try g.listNth(cases, m_idx);
+                const arm_pat = try g.recordField(arm, "pattern");
+                const arm_body = try g.recordField(arm, "body");
+                // Check pattern against scrutinee type
+                const pat_result = try g.callDirect(f_check_pattern, &.{ arm_pat, scrut_type, ctx });
+                const typed_pat = try g.recordField(pat_result, "typed_pat");
+                const arm_ctx = try g.recordField(pat_result, "ctx");
+                // Infer body with extended context
+                const body_result = try g.callDirect(f_infer, &.{ arm_body, arm_ctx });
+                const body_typed = try g.recordField(body_result, "expr");
+                const typed_arm = try g.record(&.{
+                    .{ .name = "pattern", .value = typed_pat },
+                    .{ .name = "body", .value = body_typed },
+                });
+                const m_arms2 = try g.listAppend(m_typed_arms, typed_arm);
+                const m_one = try g.constInt(1);
+                const m_next = try g.add(m_idx, m_one);
+                try g.jump(m_loop, &.{ m_next, m_arms2 });
+            }
+
+            g.beginReservedBlock(m_exit_blk);
             // For bootstrap: return TyAny as match result type
-            // (proper union of all arm types requires more complex logic)
             const match_type = try g.tag(ty_any, null);
             const typed = try g.record(&.{
                 .{ .name = "expr", .value = scrut_typed },
-                .{ .name = "cases", .value = cases },
+                .{ .name = "cases", .value = m_typed_arms },
                 .{ .name = "scrutinee_type", .value = scrut_type },
                 .{ .name = "type", .value = match_type },
             });
