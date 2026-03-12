@@ -11,7 +11,7 @@ const Gen = @import("gen.zig").Gen;
 const grammar = @import("grammar.zig");
 
 /// Seed type checker: generates IR that, when run on the interpreter,
-/// type-checks a Rhiz AST (from the grammar) and produces a typed AST.
+/// type-checks a Weft AST (from the grammar) and produces a typed AST.
 ///
 /// Types are represented as tagged IR values (mirroring types.zig but
 /// as interpreter values). Type environments are maps. Subtyping is

@@ -45,7 +45,7 @@ pub fn main() !void {
     defer std.process.argsFree(alloc, args);
 
     if (args.len < 2) {
-        write("rhiz kernel v0.0.1\nUsage: rhiz <parse|check|compile> <file.rz>\n");
+        write("weft kernel v0.0.1\nUsage: weft <parse|check|compile> <file.weft>\n");
         return;
     }
 
@@ -66,7 +66,7 @@ pub fn main() !void {
             writeErr("Error: compile requires a file argument\n");
             std.process.exit(1);
         }
-        // Default output: input with .rz replaced by empty, or "a.out"
+        // Default output: input with .weft replaced by empty, or "a.out"
         const output = if (args.len >= 5 and std.mem.eql(u8, args[3], "-o"))
             args[4]
         else

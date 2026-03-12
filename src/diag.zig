@@ -213,7 +213,7 @@ test "diag: render" {
     defer sm.deinit(gpa);
 
     const src = "let x = true + 1";
-    const fid = try sm.addFile(gpa, "test.rz", src);
+    const fid = try sm.addFile(gpa, "test.weft", src);
 
     const span = Span{ .file = fid, .start = 8, .end = 16 };
     const d = Diagnostic.err("E001", "type mismatch")
@@ -229,7 +229,7 @@ test "diag: render" {
     // Verify structural elements are present
     try std.testing.expect(std.mem.indexOf(u8, output, "error[E001]") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "type mismatch") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "test.rz:1:9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "test.weft:1:9") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "let x = true + 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "^^^^^^^^") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "help") != null);
@@ -242,7 +242,7 @@ test "diag: render with label" {
     defer sm.deinit(gpa);
 
     const src = "let x = foo(bar)";
-    const fid = try sm.addFile(gpa, "test.rz", src);
+    const fid = try sm.addFile(gpa, "test.weft", src);
 
     const primary_span = Span{ .file = fid, .start = 8, .end = 16 };
     const label_span = Span{ .file = fid, .start = 12, .end = 15 };
@@ -268,7 +268,7 @@ test "diag: render all severities" {
     defer sm.deinit(gpa);
 
     const src = "let x = 1";
-    const fid = try sm.addFile(gpa, "test.rz", src);
+    const fid = try sm.addFile(gpa, "test.weft", src);
     const span = Span{ .file = fid, .start = 4, .end = 5 };
 
     var list: DiagnosticList = .empty;

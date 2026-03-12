@@ -156,7 +156,7 @@ test "source_map: line/col" {
     defer sm.deinit(gpa);
 
     const src = "hello\nworld\nfoo";
-    const fid = try sm.addFile(gpa, "test.rz", src);
+    const fid = try sm.addFile(gpa, "test.weft", src);
 
     // 'h' at 0,0
     const lc0 = sm.offsetToLineCol(fid, 0);
@@ -184,8 +184,8 @@ test "source_map: file name" {
     var sm: SourceMap = .empty;
     defer sm.deinit(gpa);
 
-    const fid = try sm.addFile(gpa, "main.rz", "fn main() {}");
-    try std.testing.expectEqualStrings("main.rz", sm.getFileName(fid));
+    const fid = try sm.addFile(gpa, "main.weft", "fn main() {}");
+    try std.testing.expectEqualStrings("main.weft", sm.getFileName(fid));
     try std.testing.expectEqualStrings("fn main() {}", sm.getSource(fid));
 }
 
@@ -194,12 +194,12 @@ test "source_map: multiple files" {
     var sm: SourceMap = .empty;
     defer sm.deinit(gpa);
 
-    const fid0 = try sm.addFile(gpa, "a.rz", "let a = 1\nlet b = 2");
-    const fid1 = try sm.addFile(gpa, "b.rz", "let c = 3");
+    const fid0 = try sm.addFile(gpa, "a.weft", "let a = 1\nlet b = 2");
+    const fid1 = try sm.addFile(gpa, "b.weft", "let c = 3");
 
     try std.testing.expect(fid0 != fid1);
-    try std.testing.expectEqualStrings("a.rz", sm.getFileName(fid0));
-    try std.testing.expectEqualStrings("b.rz", sm.getFileName(fid1));
+    try std.testing.expectEqualStrings("a.weft", sm.getFileName(fid0));
+    try std.testing.expectEqualStrings("b.weft", sm.getFileName(fid1));
 
     // line/col in first file, second line
     const lc = sm.offsetToLineCol(fid0, 10);

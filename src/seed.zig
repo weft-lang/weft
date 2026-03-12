@@ -1,7 +1,7 @@
-// Seed modules — IR generators that teach the kernel how to parse and compile .rz files.
+// Seed modules — IR generators that teach the kernel how to parse and compile .weft files.
 //
 // The seed is a self-contained compiler written as IR that runs on the kernel's
-// interpreter. It bootstraps the language: once Rhiz can compile itself, the seed
+// interpreter. It bootstraps the language: once Weft can compile itself, the seed
 // is no longer needed.
 
 pub const grammar = @import("seed/grammar.zig");

@@ -315,7 +315,7 @@ pub const Builder = struct {
 
 // ── Serialization ───────────────────────────────────────────────────────
 
-pub const MAGIC = [4]u8{ 'R', 'H', 'I', 'Z' };
+pub const MAGIC = [4]u8{ 'W', 'E', 'F', 'T' };
 pub const FORMAT_VERSION: u32 = 1;
 
 pub fn serialize(module: Module, pool: *const InternPool, writer: anytype) !void {
@@ -975,7 +975,7 @@ test "ir: unsupported version" {
     var pool = InternPool.init(gpa);
     defer pool.deinit(gpa);
 
-    const bad_data = "RHIZ" ++ "\xff\x00\x00\x00";
+    const bad_data = "WEFT" ++ "\xff\x00\x00\x00";
     var stream = std.io.fixedBufferStream(bad_data);
     const result = deserialize(stream.reader(), gpa, &pool);
     try std.testing.expectError(error.UnsupportedVersion, result);
@@ -1183,7 +1183,7 @@ test "ir: truncated input" {
     var pool = InternPool.init(gpa);
     defer pool.deinit(gpa);
 
-    const truncated = "RHIZ" ++ "\x01\x00\x00\x00";
+    const truncated = "WEFT" ++ "\x01\x00\x00\x00";
     var stream = std.io.fixedBufferStream(truncated);
     const result = deserialize(stream.reader(), gpa, &pool);
     try std.testing.expectError(error.InvalidData, result);
