@@ -57,6 +57,9 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
     const f_encode_str = try g.reserveFunc("ec_encode_str");
     const f_encode_and_reg = try g.reserveFunc("ec_encode_and_reg");
     const f_encode_orr_reg = try g.reserveFunc("ec_encode_orr_reg");
+    const f_encode_blr = try g.reserveFunc("ec_encode_blr");
+    const f_encode_adr = try g.reserveFunc("ec_encode_adr");
+    const f_encode_msub = try g.reserveFunc("ec_encode_msub");
 
     const f_mov_imm64 = try g.reserveFunc("ec_mov_imm64");
     const f_emit_heap_init = try g.reserveFunc("ec_emit_heap_init");
@@ -66,6 +69,8 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
     const f_emit_epilogue = try g.reserveFunc("ec_emit_epilogue");
     const f_alloc_reg = try g.reserveFunc("ec_alloc_reg");
     const f_get_reg = try g.reserveFunc("ec_get_reg");
+    const f_load_spill = try g.reserveFunc("ec_load_spill");
+    const f_store_spill = try g.reserveFunc("ec_store_spill");
     const f_emit_inst = try g.reserveFunc("ec_emit_inst");
     const f_emit_term = try g.reserveFunc("ec_emit_term");
     const f_emit_block = try g.reserveFunc("ec_emit_block");
@@ -497,6 +502,71 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
     }
     try g.endReservedFunc(f_encode_orr_reg);
 
+    // ── ec_encode_blr(rn) -> Int ─────────────────────────────────────
+    // BLR Xn: 0xD63F0000 | (Rn << 5)
+    try g.beginReservedFunc("ec_encode_blr");
+    {
+        _ = g.beginBlock();
+        const rn = try g.addParam();
+        const base = try g.constInt(0xD63F0000);
+        const c5 = try g.constInt(5);
+        const rn_shifted = try g.binary(.shl, rn, c5);
+        const r1 = try g.binary(.bit_or, base, rn_shifted);
+        try g.ret(r1);
+    }
+    try g.endReservedFunc(f_encode_blr);
+
+    // ── ec_encode_adr(rd, imm21) -> Int ──────────────────────────────
+    // ADR Xd, #imm: PC-relative address within ±1MB
+    // Encoding: 0x10000000 | (immlo << 29) | (immhi << 5) | Rd
+    // immlo = imm & 3, immhi = (imm >> 2) & 0x7FFFF
+    try g.beginReservedFunc("ec_encode_adr");
+    {
+        _ = g.beginBlock();
+        const rd = try g.addParam();
+        const imm = try g.addParam();
+        const base = try g.constInt(0x10000000);
+        const c3 = try g.constInt(3);
+        const immlo = try g.binary(.bit_and, imm, c3);
+        const c29 = try g.constInt(29);
+        const immlo_shifted = try g.binary(.shl, immlo, c29);
+        const c2 = try g.constInt(2);
+        const imm_shr2 = try g.binary(.shr, imm, c2);
+        const c0x7ffff = try g.constInt(0x7FFFF);
+        const immhi = try g.binary(.bit_and, imm_shr2, c0x7ffff);
+        const c5 = try g.constInt(5);
+        const immhi_shifted = try g.binary(.shl, immhi, c5);
+        const r1 = try g.binary(.bit_or, base, immlo_shifted);
+        const r2 = try g.binary(.bit_or, r1, immhi_shifted);
+        const r3 = try g.binary(.bit_or, r2, rd);
+        try g.ret(r3);
+    }
+    try g.endReservedFunc(f_encode_adr);
+
+    // ── ec_encode_msub(rd, rn, rm, ra) -> Int ────────────────────────
+    // MSUB Xd, Xn, Xm, Xa: 0x9B008000 | (Rm << 16) | (Ra << 10) | (Rn << 5) | Rd
+    try g.beginReservedFunc("ec_encode_msub");
+    {
+        _ = g.beginBlock();
+        const rd = try g.addParam();
+        const rn = try g.addParam();
+        const rm = try g.addParam();
+        const ra = try g.addParam();
+        const base = try g.constInt(0x9B008000);
+        const c16 = try g.constInt(16);
+        const c10 = try g.constInt(10);
+        const c5 = try g.constInt(5);
+        const rm_shifted = try g.binary(.shl, rm, c16);
+        const ra_shifted = try g.binary(.shl, ra, c10);
+        const rn_shifted = try g.binary(.shl, rn, c5);
+        const r1 = try g.binary(.bit_or, base, rm_shifted);
+        const r2 = try g.binary(.bit_or, r1, ra_shifted);
+        const r3 = try g.binary(.bit_or, r2, rn_shifted);
+        const r4 = try g.binary(.bit_or, r3, rd);
+        try g.ret(r4);
+    }
+    try g.endReservedFunc(f_encode_msub);
+
     // ── ec_append_inst(bytes, inst_word) -> Bytes ────────────────────
     // Append a 32-bit instruction word to bytes buffer as little-endian.
     try g.beginReservedFunc("ec_append_inst");
@@ -724,8 +794,8 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
     try g.endReservedFunc(f_emit_exit);
 
     // ── ec_emit_prologue(frame_size) -> Bytes ────────────────────────
-    // Save callee-saved registers: x19-x26 + x29/x30
-    // 5 STP pre-index pairs, then ADD x29, sp, #0
+    // Save all usable registers: x8-x15 (overflow temps), x19-x26 (callee-saved), x29/x30
+    // 9 STP pre-index pairs, then ADD x29, sp, #0
     try g.beginReservedFunc("ec_emit_prologue");
     {
         _ = g.beginBlock();
@@ -736,45 +806,76 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const neg16 = try g.constInt(-16);
         const c0 = try g.constInt(0);
 
+        // Save overflow temp registers so they survive recursive calls
+        // STP x8, x9, [sp, #-16]!
+        const c8 = try g.constInt(8);
+        const c9 = try g.constInt(9);
+        const stp_t1 = try g.callDirect(f_encode_stp_pre, &.{ c8, c9, c31, neg16 });
+        var b = try g.callDirect(f_append_inst, &.{ bytes, stp_t1 });
+
+        // STP x10, x11, [sp, #-16]!
+        const c10 = try g.constInt(10);
+        const c11 = try g.constInt(11);
+        const stp_t2 = try g.callDirect(f_encode_stp_pre, &.{ c10, c11, c31, neg16 });
+        b = try g.callDirect(f_append_inst, &.{ b, stp_t2 });
+
+        // STP x12, x13, [sp, #-16]!
+        const c12 = try g.constInt(12);
+        const c13 = try g.constInt(13);
+        const stp_t3 = try g.callDirect(f_encode_stp_pre, &.{ c12, c13, c31, neg16 });
+        b = try g.callDirect(f_append_inst, &.{ b, stp_t3 });
+
+        // STP x14, x15, [sp, #-16]!
+        const c14 = try g.constInt(14);
+        const c15 = try g.constInt(15);
+        const stp_t4 = try g.callDirect(f_encode_stp_pre, &.{ c14, c15, c31, neg16 });
+        b = try g.callDirect(f_append_inst, &.{ b, stp_t4 });
+
+        // Standard callee-saved registers
         // STP x19, x20, [sp, #-16]!
         const c19 = try g.constInt(19);
         const c20 = try g.constInt(20);
         const stp1 = try g.callDirect(f_encode_stp_pre, &.{ c19, c20, c31, neg16 });
-        const b1 = try g.callDirect(f_append_inst, &.{ bytes, stp1 });
+        b = try g.callDirect(f_append_inst, &.{ b, stp1 });
 
         // STP x21, x22, [sp, #-16]!
         const c21 = try g.constInt(21);
         const c22 = try g.constInt(22);
         const stp2 = try g.callDirect(f_encode_stp_pre, &.{ c21, c22, c31, neg16 });
-        const b2 = try g.callDirect(f_append_inst, &.{ b1, stp2 });
+        b = try g.callDirect(f_append_inst, &.{ b, stp2 });
 
         // STP x23, x24, [sp, #-16]!
         const c23 = try g.constInt(23);
         const c24 = try g.constInt(24);
         const stp3 = try g.callDirect(f_encode_stp_pre, &.{ c23, c24, c31, neg16 });
-        const b3 = try g.callDirect(f_append_inst, &.{ b2, stp3 });
+        b = try g.callDirect(f_append_inst, &.{ b, stp3 });
 
         // STP x25, x26, [sp, #-16]!
         const c25 = try g.constInt(25);
         const c26 = try g.constInt(26);
         const stp4 = try g.callDirect(f_encode_stp_pre, &.{ c25, c26, c31, neg16 });
-        const b4 = try g.callDirect(f_append_inst, &.{ b3, stp4 });
+        b = try g.callDirect(f_append_inst, &.{ b, stp4 });
 
         // STP x29, x30, [sp, #-16]!
         const c29 = try g.constInt(29);
         const c30 = try g.constInt(30);
         const stp5 = try g.callDirect(f_encode_stp_pre, &.{ c29, c30, c31, neg16 });
-        const b5 = try g.callDirect(f_append_inst, &.{ b4, stp5 });
+        b = try g.callDirect(f_append_inst, &.{ b, stp5 });
 
         // ADD x29, sp, #0  (frame pointer)
         const mov_fp = try g.callDirect(f_encode_add_imm, &.{ c29, c31, c0 });
-        const b6 = try g.callDirect(f_append_inst, &.{ b5, mov_fp });
-        try g.ret(b6);
+        b = try g.callDirect(f_append_inst, &.{ b, mov_fp });
+
+        // SUB sp, sp, #256  (32 spill slots × 8 bytes, 16-byte aligned)
+        const spill_size = try g.constInt(256);
+        const sub_sp = try g.callDirect(f_encode_sub_imm, &.{ c31, c31, spill_size });
+        b = try g.callDirect(f_append_inst, &.{ b, sub_sp });
+        try g.ret(b);
     }
     try g.endReservedFunc(f_emit_prologue);
 
     // ── ec_emit_epilogue(frame_size) -> Bytes ────────────────────────
-    // Restore callee-saved registers in reverse order, then RET
+    // Restore all registers in reverse order, then RET
     try g.beginReservedFunc("ec_emit_epilogue");
     {
         _ = g.beginBlock();
@@ -784,39 +885,71 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const c31 = try g.constInt(31); // sp
         const c16 = try g.constInt(16);
 
+        // ADD sp, sp, #256  (undo spill area)
+        const c0 = try g.constInt(0);
+        _ = c0;
+        const spill_size = try g.constInt(256);
+        const add_sp = try g.callDirect(f_encode_add_imm, &.{ c31, c31, spill_size });
+        var b = try g.callDirect(f_append_inst, &.{ bytes, add_sp });
+
         // LDP x29, x30, [sp], #16
         const c29 = try g.constInt(29);
         const c30 = try g.constInt(30);
         const ldp1 = try g.callDirect(f_encode_ldp_post, &.{ c29, c30, c31, c16 });
-        const b1 = try g.callDirect(f_append_inst, &.{ bytes, ldp1 });
+        b = try g.callDirect(f_append_inst, &.{ b, ldp1 });
 
         // LDP x25, x26, [sp], #16
         const c25 = try g.constInt(25);
         const c26 = try g.constInt(26);
         const ldp2 = try g.callDirect(f_encode_ldp_post, &.{ c25, c26, c31, c16 });
-        const b2 = try g.callDirect(f_append_inst, &.{ b1, ldp2 });
+        b = try g.callDirect(f_append_inst, &.{ b, ldp2 });
 
         // LDP x23, x24, [sp], #16
         const c23 = try g.constInt(23);
         const c24 = try g.constInt(24);
         const ldp3 = try g.callDirect(f_encode_ldp_post, &.{ c23, c24, c31, c16 });
-        const b3 = try g.callDirect(f_append_inst, &.{ b2, ldp3 });
+        b = try g.callDirect(f_append_inst, &.{ b, ldp3 });
 
         // LDP x21, x22, [sp], #16
         const c21 = try g.constInt(21);
         const c22 = try g.constInt(22);
         const ldp4 = try g.callDirect(f_encode_ldp_post, &.{ c21, c22, c31, c16 });
-        const b4 = try g.callDirect(f_append_inst, &.{ b3, ldp4 });
+        b = try g.callDirect(f_append_inst, &.{ b, ldp4 });
 
         // LDP x19, x20, [sp], #16
         const c19 = try g.constInt(19);
         const c20 = try g.constInt(20);
         const ldp5 = try g.callDirect(f_encode_ldp_post, &.{ c19, c20, c31, c16 });
-        const b5 = try g.callDirect(f_append_inst, &.{ b4, ldp5 });
+        b = try g.callDirect(f_append_inst, &.{ b, ldp5 });
+
+        // Restore overflow temp registers
+        // LDP x14, x15, [sp], #16
+        const c14 = try g.constInt(14);
+        const c15 = try g.constInt(15);
+        const ldp_t4 = try g.callDirect(f_encode_ldp_post, &.{ c14, c15, c31, c16 });
+        b = try g.callDirect(f_append_inst, &.{ b, ldp_t4 });
+
+        // LDP x12, x13, [sp], #16
+        const c12 = try g.constInt(12);
+        const c13 = try g.constInt(13);
+        const ldp_t3 = try g.callDirect(f_encode_ldp_post, &.{ c12, c13, c31, c16 });
+        b = try g.callDirect(f_append_inst, &.{ b, ldp_t3 });
+
+        // LDP x10, x11, [sp], #16
+        const c10 = try g.constInt(10);
+        const c11 = try g.constInt(11);
+        const ldp_t2 = try g.callDirect(f_encode_ldp_post, &.{ c10, c11, c31, c16 });
+        b = try g.callDirect(f_append_inst, &.{ b, ldp_t2 });
+
+        // LDP x8, x9, [sp], #16
+        const c8 = try g.constInt(8);
+        const c9 = try g.constInt(9);
+        const ldp_t1 = try g.callDirect(f_encode_ldp_post, &.{ c8, c9, c31, c16 });
+        b = try g.callDirect(f_append_inst, &.{ b, ldp_t1 });
 
         const ret_inst = try g.callDirect(f_encode_ret_inst, &.{});
-        const b6 = try g.callDirect(f_append_inst, &.{ b5, ret_inst });
-        try g.ret(b6);
+        b = try g.callDirect(f_append_inst, &.{ b, ret_inst });
+        try g.ret(b);
     }
     try g.endReservedFunc(f_emit_epilogue);
 
@@ -867,10 +1000,25 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         try g.jump(blk_assign, &.{reg_callee});
 
         g.beginReservedBlock(blk_temp);
+        // Check if we've exhausted physical registers (next_reg >= 16)
+        const c16_val = try g.constInt(16);
+        const is_spill = try g.ge(next_reg, c16_val);
+        const blk_spill = g.reserveBlock();
+        const blk_phys_temp = g.reserveBlock();
+        try g.branch(is_spill, blk_spill, blk_phys_temp);
+
+        g.beginReservedBlock(blk_phys_temp);
         // reg = next_reg - 8 + 8 = next_reg
         // counter 8 -> x8, 9 -> x9, etc.
         const reg_temp = try g.add(next_reg, try g.constInt(0));
         try g.jump(blk_assign, &.{reg_temp});
+
+        // Spill to stack: use x9 as temp, actual "register" stored as 100+slot_index
+        // We'll STR/LDR with [sp, #(slot_index * 8)] in the spill area
+        g.beginReservedBlock(blk_spill);
+        const c100 = try g.constInt(100);
+        const spill_slot = try g.add(c100, next_reg); // 100+16=116, 100+17=117, etc.
+        try g.jump(blk_assign, &.{spill_slot});
 
         g.beginReservedBlock(blk_assign);
         const actual_reg = try g.addBlockParam();
@@ -921,6 +1069,73 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
     }
     try g.endReservedFunc(f_get_reg);
 
+    // ── ec_load_spill(bytes, reg, temp) -> {bytes, actual_reg} ────────
+    // If reg >= 100, emit LDR temp, [sp, #(reg - 116) * 8] and return temp.
+    // Otherwise return reg as-is (no load needed).
+    try g.beginReservedFunc("ec_load_spill");
+    {
+        _ = g.beginBlock();
+        const load_bytes = try g.addParam();
+        const load_reg = try g.addParam();
+        const load_temp = try g.addParam();
+        const c100_l = try g.constInt(100);
+        const is_spilled = try g.ge(load_reg, c100_l);
+        const blk_spilled = g.reserveBlock();
+        const blk_physical = g.reserveBlock();
+        try g.branch(is_spilled, blk_spilled, blk_physical);
+
+        g.beginReservedBlock(blk_physical);
+        try g.ret(try g.record(&.{
+            .{ .name = "bytes", .value = load_bytes },
+            .{ .name = "reg", .value = load_reg },
+        }));
+
+        g.beginReservedBlock(blk_spilled);
+        // offset = (reg - 116) * 8
+        const c116_l = try g.constInt(116);
+        const slot_idx = try g.sub(load_reg, c116_l);
+        const c8_l = try g.constInt(8);
+        const offset = try g.binary(.mul, slot_idx, c8_l);
+        const c31_l = try g.constInt(31); // sp
+        const ldr_enc = try g.callDirect(f_encode_ldr, &.{ load_temp, c31_l, offset });
+        const new_bytes = try g.callDirect(f_append_inst, &.{ load_bytes, ldr_enc });
+        try g.ret(try g.record(&.{
+            .{ .name = "bytes", .value = new_bytes },
+            .{ .name = "reg", .value = load_temp },
+        }));
+    }
+    try g.endReservedFunc(f_load_spill);
+
+    // ── ec_store_spill(bytes, reg, src_reg) -> bytes ─────────────────
+    // If reg >= 100 (spilled), emit STR src_reg, [sp, #(reg - 116) * 8].
+    // Otherwise return bytes unchanged (value is already in its physical register).
+    try g.beginReservedFunc("ec_store_spill");
+    {
+        _ = g.beginBlock();
+        const st_bytes = try g.addParam();
+        const st_reg = try g.addParam();
+        const st_src = try g.addParam();
+        const c100_s = try g.constInt(100);
+        const is_spilled_s = try g.ge(st_reg, c100_s);
+        const blk_spilled_s = g.reserveBlock();
+        const blk_physical_s = g.reserveBlock();
+        try g.branch(is_spilled_s, blk_spilled_s, blk_physical_s);
+
+        g.beginReservedBlock(blk_physical_s);
+        try g.ret(st_bytes);
+
+        g.beginReservedBlock(blk_spilled_s);
+        const c116_s = try g.constInt(116);
+        const slot_s = try g.sub(st_reg, c116_s);
+        const c8_s = try g.constInt(8);
+        const offset_s = try g.binary(.mul, slot_s, c8_s);
+        const c31_s = try g.constInt(31); // sp
+        const str_enc = try g.callDirect(f_encode_str, &.{ st_src, c31_s, offset_s });
+        const new_bytes_s = try g.callDirect(f_append_inst, &.{ st_bytes, str_enc });
+        try g.ret(new_bytes_s);
+    }
+    try g.endReservedFunc(f_store_spill);
+
     // ── ec_emit_inst(inst, bytes, ctx) -> {bytes, ctx} ───────────────
     // Emit machine code for a single IR instruction.
     try g.beginReservedFunc("ec_emit_inst");
@@ -944,12 +1159,31 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const ci_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, ci_dst });
         const ci_reg = try g.recordField(ci_alloc, "reg");
         const ci_ctx = try g.recordField(ci_alloc, "ctx");
-        const ci_bytes = try g.callDirect(f_mov_imm64, &.{ bytes, ci_reg, ci_value });
-        const ci_result = try g.record(&.{
-            .{ .name = "bytes", .value = ci_bytes },
-            .{ .name = "ctx", .value = ci_ctx },
-        });
-        try g.ret(ci_result);
+        // If dst is spilled, load into x27, then store to stack
+        const ci_c100 = try g.constInt(100);
+        const ci_spilled = try g.ge(ci_reg, ci_c100);
+        const blk_ci_spill = g.reserveBlock();
+        const blk_ci_phys = g.reserveBlock();
+        try g.branch(ci_spilled, blk_ci_spill, blk_ci_phys);
+
+        g.beginReservedBlock(blk_ci_phys);
+        {
+            const ci_bytes = try g.callDirect(f_mov_imm64, &.{ bytes, ci_reg, ci_value });
+            try g.ret(try g.record(&.{
+                .{ .name = "bytes", .value = ci_bytes },
+                .{ .name = "ctx", .value = ci_ctx },
+            }));
+        }
+        g.beginReservedBlock(blk_ci_spill);
+        {
+            const ci_tmp = try g.constInt(27); // x27 as spill temp
+            const ci_bytes = try g.callDirect(f_mov_imm64, &.{ bytes, ci_tmp, ci_value });
+            const ci_bytes2 = try g.callDirect(f_store_spill, &.{ ci_bytes, ci_reg, ci_tmp });
+            try g.ret(try g.record(&.{
+                .{ .name = "bytes", .value = ci_bytes2 },
+                .{ .name = "ctx", .value = ci_ctx },
+            }));
+        }
 
         // Not const_int: check binary
         g.beginReservedBlock(blk_not_const_int);
@@ -967,13 +1201,40 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const bin_rhs = try g.recordField(bin_payload, "rhs");
 
         const bin_alloc_dst = try g.callDirect(f_alloc_reg, &.{ ctx, bin_dst });
-        const bin_rd = try g.recordField(bin_alloc_dst, "reg");
+        const bin_rd_raw = try g.recordField(bin_alloc_dst, "reg");
         const bin_ctx1 = try g.recordField(bin_alloc_dst, "ctx");
 
-        const bin_rn = try g.callDirect(f_get_reg, &.{ bin_ctx1, bin_lhs });
-        const bin_rm = try g.callDirect(f_get_reg, &.{ bin_ctx1, bin_rhs });
+        const bin_rn_raw = try g.callDirect(f_get_reg, &.{ bin_ctx1, bin_lhs });
+        const bin_rm_raw = try g.callDirect(f_get_reg, &.{ bin_ctx1, bin_rhs });
 
-        // Dispatch on op string
+        // Load spilled operands into temp registers (x27 for lhs, x17 for rhs)
+        const c27_b = try g.constInt(27);
+        const c17_b = try g.constInt(17);
+        const lhs_load = try g.callDirect(f_load_spill, &.{ bytes, bin_rn_raw, c27_b });
+        const bytes_l1 = try g.recordField(lhs_load, "bytes");
+        const bin_rn = try g.recordField(lhs_load, "reg");
+        const rhs_load = try g.callDirect(f_load_spill, &.{ bytes_l1, bin_rm_raw, c17_b });
+        const bytes_l2 = try g.recordField(rhs_load, "bytes");
+        const bin_rm = try g.recordField(rhs_load, "reg");
+
+        // If dst is spilled, compute into x27, then store to stack later
+        const c100_b = try g.constInt(100);
+        const dst_is_spilled = try g.ge(bin_rd_raw, c100_b);
+        const blk_dst_spill = g.reserveBlock();
+        const blk_dst_phys = g.reserveBlock();
+        const blk_dst_merge = g.reserveBlock();
+        try g.branch(dst_is_spilled, blk_dst_spill, blk_dst_phys);
+        g.beginReservedBlock(blk_dst_spill);
+        try g.jump(blk_dst_merge, &.{c27_b}); // use x27 as compute target
+        g.beginReservedBlock(blk_dst_phys);
+        try g.jump(blk_dst_merge, &.{bin_rd_raw});
+        g.beginReservedBlock(blk_dst_merge);
+        const bin_rd = try g.addBlockParam();
+        // Reserve merge block for store-spill after binary op
+        const bin_store_merge = g.reserveBlock();
+
+        // Dispatch on op string — all branches use bytes_l2 (post spill-load)
+        // and jump to bin_store_merge instead of returning directly
         const op_add = try g.constString("+");
         const is_add = try g.eq(bin_op, op_add);
         const blk_add = g.reserveBlock();
@@ -981,13 +1242,11 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         try g.branch(is_add, blk_add, blk_not_add);
 
         g.beginReservedBlock(blk_add);
-        const add_enc = try g.callDirect(f_encode_add_reg, &.{ bin_rd, bin_rn, bin_rm });
-        const add_bytes = try g.callDirect(f_append_inst, &.{ bytes, add_enc });
-        const add_result = try g.record(&.{
-            .{ .name = "bytes", .value = add_bytes },
-            .{ .name = "ctx", .value = bin_ctx1 },
-        });
-        try g.ret(add_result);
+        {
+            const add_enc = try g.callDirect(f_encode_add_reg, &.{ bin_rd, bin_rn, bin_rm });
+            const add_bytes = try g.callDirect(f_append_inst, &.{ bytes_l2, add_enc });
+            try g.jump(bin_store_merge, &.{add_bytes});
+        }
 
         g.beginReservedBlock(blk_not_add);
         const op_sub = try g.constString("-");
@@ -997,13 +1256,11 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         try g.branch(is_sub, blk_sub, blk_not_sub);
 
         g.beginReservedBlock(blk_sub);
-        const sub_enc = try g.callDirect(f_encode_sub_reg, &.{ bin_rd, bin_rn, bin_rm });
-        const sub_bytes = try g.callDirect(f_append_inst, &.{ bytes, sub_enc });
-        const sub_result = try g.record(&.{
-            .{ .name = "bytes", .value = sub_bytes },
-            .{ .name = "ctx", .value = bin_ctx1 },
-        });
-        try g.ret(sub_result);
+        {
+            const sub_enc = try g.callDirect(f_encode_sub_reg, &.{ bin_rd, bin_rn, bin_rm });
+            const sub_bytes = try g.callDirect(f_append_inst, &.{ bytes_l2, sub_enc });
+            try g.jump(bin_store_merge, &.{sub_bytes});
+        }
 
         g.beginReservedBlock(blk_not_sub);
         const op_mul = try g.constString("*");
@@ -1013,13 +1270,11 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         try g.branch(is_mul, blk_mul, blk_not_mul);
 
         g.beginReservedBlock(blk_mul);
-        const mul_enc = try g.callDirect(f_encode_mul, &.{ bin_rd, bin_rn, bin_rm });
-        const mul_bytes = try g.callDirect(f_append_inst, &.{ bytes, mul_enc });
-        const mul_result = try g.record(&.{
-            .{ .name = "bytes", .value = mul_bytes },
-            .{ .name = "ctx", .value = bin_ctx1 },
-        });
-        try g.ret(mul_result);
+        {
+            const mul_enc = try g.callDirect(f_encode_mul, &.{ bin_rd, bin_rn, bin_rm });
+            const mul_bytes = try g.callDirect(f_append_inst, &.{ bytes_l2, mul_enc });
+            try g.jump(bin_store_merge, &.{mul_bytes});
+        }
 
         g.beginReservedBlock(blk_not_mul);
         const op_div = try g.constString("/");
@@ -1029,13 +1284,11 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         try g.branch(is_div, blk_div, blk_not_div);
 
         g.beginReservedBlock(blk_div);
-        const div_enc = try g.callDirect(f_encode_sdiv, &.{ bin_rd, bin_rn, bin_rm });
-        const div_bytes = try g.callDirect(f_append_inst, &.{ bytes, div_enc });
-        const div_result = try g.record(&.{
-            .{ .name = "bytes", .value = div_bytes },
-            .{ .name = "ctx", .value = bin_ctx1 },
-        });
-        try g.ret(div_result);
+        {
+            const div_enc = try g.callDirect(f_encode_sdiv, &.{ bin_rd, bin_rn, bin_rm });
+            const div_bytes = try g.callDirect(f_append_inst, &.{ bytes_l2, div_enc });
+            try g.jump(bin_store_merge, &.{div_bytes});
+        }
 
         // == comparison
         g.beginReservedBlock(blk_not_div);
@@ -1046,17 +1299,14 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         try g.branch(is_eq_op, blk_eq, blk_not_eq);
 
         g.beginReservedBlock(blk_eq);
-        // CMP Xn, Xm; CSET Xd, EQ (cond=0)
-        const cmp_eq = try g.callDirect(f_encode_cmp_reg, &.{ bin_rn, bin_rm });
-        const b_eq1 = try g.callDirect(f_append_inst, &.{ bytes, cmp_eq });
-        const cond_eq = try g.constInt(0); // EQ
-        const cset_eq = try g.callDirect(f_encode_cset, &.{ bin_rd, cond_eq });
-        const b_eq2 = try g.callDirect(f_append_inst, &.{ b_eq1, cset_eq });
-        const eq_result = try g.record(&.{
-            .{ .name = "bytes", .value = b_eq2 },
-            .{ .name = "ctx", .value = bin_ctx1 },
-        });
-        try g.ret(eq_result);
+        {
+            const cmp_eq = try g.callDirect(f_encode_cmp_reg, &.{ bin_rn, bin_rm });
+            const b_eq1 = try g.callDirect(f_append_inst, &.{ bytes_l2, cmp_eq });
+            const cond_eq = try g.constInt(0); // EQ
+            const cset_eq = try g.callDirect(f_encode_cset, &.{ bin_rd, cond_eq });
+            const b_eq2 = try g.callDirect(f_append_inst, &.{ b_eq1, cset_eq });
+            try g.jump(bin_store_merge, &.{b_eq2});
+        }
 
         // < comparison
         g.beginReservedBlock(blk_not_eq);
@@ -1067,24 +1317,148 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         try g.branch(is_lt_op, blk_lt, blk_not_lt);
 
         g.beginReservedBlock(blk_lt);
-        const cmp_lt = try g.callDirect(f_encode_cmp_reg, &.{ bin_rn, bin_rm });
-        const b_lt1 = try g.callDirect(f_append_inst, &.{ bytes, cmp_lt });
-        const cond_lt = try g.constInt(11); // LT
-        const cset_lt = try g.callDirect(f_encode_cset, &.{ bin_rd, cond_lt });
-        const b_lt2 = try g.callDirect(f_append_inst, &.{ b_lt1, cset_lt });
-        const lt_result = try g.record(&.{
-            .{ .name = "bytes", .value = b_lt2 },
-            .{ .name = "ctx", .value = bin_ctx1 },
-        });
-        try g.ret(lt_result);
+        {
+            const cmp_lt = try g.callDirect(f_encode_cmp_reg, &.{ bin_rn, bin_rm });
+            const b_lt1 = try g.callDirect(f_append_inst, &.{ bytes_l2, cmp_lt });
+            const cond_lt = try g.constInt(11); // LT
+            const cset_lt = try g.callDirect(f_encode_cset, &.{ bin_rd, cond_lt });
+            const b_lt2 = try g.callDirect(f_append_inst, &.{ b_lt1, cset_lt });
+            try g.jump(bin_store_merge, &.{b_lt2});
+        }
+
+        // > comparison
+        g.beginReservedBlock(blk_not_lt);
+        const op_gt = try g.constString(">");
+        const is_gt_op = try g.eq(bin_op, op_gt);
+        const blk_gt = g.reserveBlock();
+        const blk_not_gt = g.reserveBlock();
+        try g.branch(is_gt_op, blk_gt, blk_not_gt);
+
+        g.beginReservedBlock(blk_gt);
+        {
+            const cmp_gt = try g.callDirect(f_encode_cmp_reg, &.{ bin_rn, bin_rm });
+            const b_gt1 = try g.callDirect(f_append_inst, &.{ bytes_l2, cmp_gt });
+            const cond_gt = try g.constInt(12); // GT
+            const cset_gt = try g.callDirect(f_encode_cset, &.{ bin_rd, cond_gt });
+            const b_gt2 = try g.callDirect(f_append_inst, &.{ b_gt1, cset_gt });
+            try g.jump(bin_store_merge, &.{b_gt2});
+        }
+
+        // <= comparison
+        g.beginReservedBlock(blk_not_gt);
+        const op_le = try g.constString("<=");
+        const is_le_op = try g.eq(bin_op, op_le);
+        const blk_le = g.reserveBlock();
+        const blk_not_le = g.reserveBlock();
+        try g.branch(is_le_op, blk_le, blk_not_le);
+
+        g.beginReservedBlock(blk_le);
+        {
+            const cmp_le = try g.callDirect(f_encode_cmp_reg, &.{ bin_rn, bin_rm });
+            const b_le1 = try g.callDirect(f_append_inst, &.{ bytes_l2, cmp_le });
+            const cond_le = try g.constInt(13); // LE
+            const cset_le = try g.callDirect(f_encode_cset, &.{ bin_rd, cond_le });
+            const b_le2 = try g.callDirect(f_append_inst, &.{ b_le1, cset_le });
+            try g.jump(bin_store_merge, &.{b_le2});
+        }
+
+        // >= comparison
+        g.beginReservedBlock(blk_not_le);
+        const op_ge = try g.constString(">=");
+        const is_ge_op = try g.eq(bin_op, op_ge);
+        const blk_ge_op = g.reserveBlock();
+        const blk_not_ge_op = g.reserveBlock();
+        try g.branch(is_ge_op, blk_ge_op, blk_not_ge_op);
+
+        g.beginReservedBlock(blk_ge_op);
+        {
+            const cmp_ge = try g.callDirect(f_encode_cmp_reg, &.{ bin_rn, bin_rm });
+            const b_ge1 = try g.callDirect(f_append_inst, &.{ bytes_l2, cmp_ge });
+            const cond_ge = try g.constInt(10); // GE
+            const cset_ge = try g.callDirect(f_encode_cset, &.{ bin_rd, cond_ge });
+            const b_ge2 = try g.callDirect(f_append_inst, &.{ b_ge1, cset_ge });
+            try g.jump(bin_store_merge, &.{b_ge2});
+        }
+
+        // != comparison
+        g.beginReservedBlock(blk_not_ge_op);
+        const op_ne = try g.constString("!=");
+        const is_ne_op = try g.eq(bin_op, op_ne);
+        const blk_ne_op = g.reserveBlock();
+        const blk_not_ne_op = g.reserveBlock();
+        try g.branch(is_ne_op, blk_ne_op, blk_not_ne_op);
+
+        g.beginReservedBlock(blk_ne_op);
+        {
+            const cmp_ne = try g.callDirect(f_encode_cmp_reg, &.{ bin_rn, bin_rm });
+            const b_ne1 = try g.callDirect(f_append_inst, &.{ bytes_l2, cmp_ne });
+            const cond_ne = try g.constInt(1); // NE
+            const cset_ne = try g.callDirect(f_encode_cset, &.{ bin_rd, cond_ne });
+            const b_ne2 = try g.callDirect(f_append_inst, &.{ b_ne1, cset_ne });
+            try g.jump(bin_store_merge, &.{b_ne2});
+        }
+
+        // % modulo: SDIV Xdst, Xlhs, Xrhs; MSUB Xdst, Xdst, Xrhs, Xlhs
+        g.beginReservedBlock(blk_not_ne_op);
+        const op_mod = try g.constString("%");
+        const is_mod_op = try g.eq(bin_op, op_mod);
+        const blk_mod = g.reserveBlock();
+        const blk_not_mod = g.reserveBlock();
+        try g.branch(is_mod_op, blk_mod, blk_not_mod);
+
+        g.beginReservedBlock(blk_mod);
+        {
+            const sdiv_enc = try g.callDirect(f_encode_sdiv, &.{ bin_rd, bin_rn, bin_rm });
+            const b_mod1 = try g.callDirect(f_append_inst, &.{ bytes_l2, sdiv_enc });
+            const msub_enc = try g.callDirect(f_encode_msub, &.{ bin_rd, bin_rd, bin_rm, bin_rn });
+            const b_mod2 = try g.callDirect(f_append_inst, &.{ b_mod1, msub_enc });
+            try g.jump(bin_store_merge, &.{b_mod2});
+        }
+
+        // "and" logical: AND Xd, Xn, Xm
+        g.beginReservedBlock(blk_not_mod);
+        const op_and = try g.constString("and");
+        const is_and_op = try g.eq(bin_op, op_and);
+        const blk_and = g.reserveBlock();
+        const blk_not_and = g.reserveBlock();
+        try g.branch(is_and_op, blk_and, blk_not_and);
+
+        g.beginReservedBlock(blk_and);
+        {
+            const and_enc = try g.callDirect(f_encode_and_reg, &.{ bin_rd, bin_rn, bin_rm });
+            const b_and = try g.callDirect(f_append_inst, &.{ bytes_l2, and_enc });
+            try g.jump(bin_store_merge, &.{b_and});
+        }
+
+        // "or" logical: ORR Xd, Xn, Xm
+        g.beginReservedBlock(blk_not_and);
+        const op_or = try g.constString("or");
+        const is_or_op = try g.eq(bin_op, op_or);
+        const blk_or = g.reserveBlock();
+        const blk_not_or = g.reserveBlock();
+        try g.branch(is_or_op, blk_or, blk_not_or);
+
+        g.beginReservedBlock(blk_or);
+        {
+            const orr_enc = try g.callDirect(f_encode_orr_reg, &.{ bin_rd, bin_rn, bin_rm });
+            const b_or = try g.callDirect(f_append_inst, &.{ bytes_l2, orr_enc });
+            try g.jump(bin_store_merge, &.{b_or});
+        }
 
         // Default: treat unknown op as NOP (return unchanged)
-        g.beginReservedBlock(blk_not_lt);
-        const default_bin_result = try g.record(&.{
-            .{ .name = "bytes", .value = bytes },
+        g.beginReservedBlock(blk_not_or);
+        try g.jump(bin_store_merge, &.{bytes_l2});
+
+        // ── Binary op merge: store result to spill slot if dst is spilled ──
+        g.beginReservedBlock(bin_store_merge);
+        const bin_op_bytes = try g.addBlockParam();
+        // If bin_rd_raw >= 100, the result was computed into x27 (bin_rd); store to stack
+        const bin_final_bytes = try g.callDirect(f_store_spill, &.{ bin_op_bytes, bin_rd_raw, bin_rd });
+        const bin_final_result = try g.record(&.{
+            .{ .name = "bytes", .value = bin_final_bytes },
             .{ .name = "ctx", .value = bin_ctx1 },
         });
-        try g.ret(default_bin_result);
+        try g.ret(bin_final_result);
 
         // Not binary: check const_bool
         g.beginReservedBlock(blk_not_binary);
@@ -1178,7 +1552,12 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             {
                 // Get the register for this arg value
                 const arg_val_id = try g.listNth(call_args, ai);
-                const arg_reg = try g.callDirect(f_get_reg, &.{ ac, arg_val_id });
+                const arg_reg_raw = try g.callDirect(f_get_reg, &.{ ac, arg_val_id });
+                // Load from spill slot if needed (use x27 as temp)
+                const c27_ca = try g.constInt(27);
+                const arg_load = try g.callDirect(f_load_spill, &.{ ab, arg_reg_raw, c27_ca });
+                const ab_loaded = try g.recordField(arg_load, "bytes");
+                const arg_reg = try g.recordField(arg_load, "reg");
                 // Target register is xi (i = ai)
                 // Only emit MOV if arg_reg != ai
                 const need_mov = try g.ne(arg_reg, ai);
@@ -1191,11 +1570,11 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                 // MOV xi, arg_reg: ADD xi, arg_reg, #0
                 const c0_m = try g.constInt(0);
                 const mov_enc = try g.callDirect(f_encode_add_imm, &.{ ai, arg_reg, c0_m });
-                const mb = try g.callDirect(f_append_inst, &.{ ab, mov_enc });
+                const mb = try g.callDirect(f_append_inst, &.{ ab_loaded, mov_enc });
                 try g.jump(after_mov, &.{mb});
 
                 g.beginReservedBlock(skip_mov);
-                try g.jump(after_mov, &.{ab});
+                try g.jump(after_mov, &.{ab_loaded});
 
                 g.beginReservedBlock(after_mov);
                 const ab2 = try g.addBlockParam();
@@ -1204,47 +1583,91 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                 try g.jump(args_loop, &.{ next_ai, ab2, ac });
             }
 
-            // Args done — emit BL
+            // Args done — check if direct or indirect call
             g.beginReservedBlock(args_exit);
             {
-                // Look up callee offset in func_map
                 const call_fmap = try g.recordField(ac, "func_map");
-                const target_off = try g.mapGet(call_fmap, call_callee);
-                // Current position = bytes_length(ab)
-                const cur_off = try g.callBuiltin("bytes_length", &.{ab});
-                // Relative offset (signed): target - current
-                const rel_off = try g.sub(target_off, cur_off);
-                const bl_enc = try g.callDirect(f_encode_bl, &.{rel_off});
-                const bl_bytes = try g.callDirect(f_append_inst, &.{ ab, bl_enc });
+                const has_callee = try g.mapHas(call_fmap, call_callee);
+                const blk_direct_call = g.reserveBlock();
+                const blk_indirect_call = g.reserveBlock();
+                try g.branch(has_callee, blk_direct_call, blk_indirect_call);
 
-                // Allocate register for dst, move x0 to it if needed
-                const call_alloc = try g.callDirect(f_alloc_reg, &.{ ac, call_dst });
+                const blk_call_merge = g.reserveBlock();
+
+                // Direct call: BL to known function
+                g.beginReservedBlock(blk_direct_call);
+                {
+                    const target_off = try g.mapGet(call_fmap, call_callee);
+                    const cur_off = try g.callBuiltin("bytes_length", &.{ab});
+                    const rel_off = try g.sub(target_off, cur_off);
+                    const bl_enc = try g.callDirect(f_encode_bl, &.{rel_off});
+                    const bl_bytes = try g.callDirect(f_append_inst, &.{ ab, bl_enc });
+                    try g.jump(blk_call_merge, &.{ bl_bytes, ac });
+                }
+
+                // Indirect call: BLR Xn — use callee_val (value ID) to get register
+                g.beginReservedBlock(blk_indirect_call);
+                {
+                    const call_callee_val = try g.recordField(call_payload, "callee_val");
+                    const ind_reg = try g.callDirect(f_get_reg, &.{ ac, call_callee_val });
+                    const blr_enc = try g.callDirect(f_encode_blr, &.{ind_reg});
+                    const blr_bytes = try g.callDirect(f_append_inst, &.{ ab, blr_enc });
+                    try g.jump(blk_call_merge, &.{ blr_bytes, ac });
+                }
+
+                // Merge: allocate dst register, move x0 if needed
+                g.beginReservedBlock(blk_call_merge);
+                const call_bytes_m = try g.addBlockParam();
+                const call_ctx_m = try g.addBlockParam();
+
+                const call_alloc = try g.callDirect(f_alloc_reg, &.{ call_ctx_m, call_dst });
                 const dst_reg = try g.recordField(call_alloc, "reg");
                 const call_ctx = try g.recordField(call_alloc, "ctx");
 
                 const c0_r = try g.constInt(0);
-                const dst_is_x0 = try g.eq(dst_reg, c0_r);
-                const blk_need_ret_mov = g.reserveBlock();
-                const blk_skip_ret_mov = g.reserveBlock();
-                const blk_after_ret_mov = g.reserveBlock();
-                try g.branch(dst_is_x0, blk_skip_ret_mov, blk_need_ret_mov);
+                // Check if dst is spilled
+                const c100_cr = try g.constInt(100);
+                const call_dst_spilled = try g.ge(dst_reg, c100_cr);
+                const blk_call_dst_spill = g.reserveBlock();
+                const blk_call_dst_phys = g.reserveBlock();
+                try g.branch(call_dst_spilled, blk_call_dst_spill, blk_call_dst_phys);
 
-                g.beginReservedBlock(blk_need_ret_mov);
-                // MOV dst_reg, x0: ADD dst_reg, x0, #0
-                const ret_mov_enc = try g.callDirect(f_encode_add_imm, &.{ dst_reg, c0_r, c0_r });
-                const ret_mov_bytes = try g.callDirect(f_append_inst, &.{ bl_bytes, ret_mov_enc });
-                try g.jump(blk_after_ret_mov, &.{ret_mov_bytes});
+                // Physical register: MOV dst_reg, x0 (if not already x0)
+                g.beginReservedBlock(blk_call_dst_phys);
+                {
+                    const dst_is_x0 = try g.eq(dst_reg, c0_r);
+                    const blk_need_ret_mov = g.reserveBlock();
+                    const blk_skip_ret_mov = g.reserveBlock();
+                    const blk_after_ret_mov = g.reserveBlock();
+                    try g.branch(dst_is_x0, blk_skip_ret_mov, blk_need_ret_mov);
 
-                g.beginReservedBlock(blk_skip_ret_mov);
-                try g.jump(blk_after_ret_mov, &.{bl_bytes});
+                    g.beginReservedBlock(blk_need_ret_mov);
+                    const ret_mov_enc = try g.callDirect(f_encode_add_imm, &.{ dst_reg, c0_r, c0_r });
+                    const ret_mov_bytes = try g.callDirect(f_append_inst, &.{ call_bytes_m, ret_mov_enc });
+                    try g.jump(blk_after_ret_mov, &.{ret_mov_bytes});
 
-                g.beginReservedBlock(blk_after_ret_mov);
-                const final_bytes = try g.addBlockParam();
-                const call_result = try g.record(&.{
-                    .{ .name = "bytes", .value = final_bytes },
-                    .{ .name = "ctx", .value = call_ctx },
-                });
-                try g.ret(call_result);
+                    g.beginReservedBlock(blk_skip_ret_mov);
+                    try g.jump(blk_after_ret_mov, &.{call_bytes_m});
+
+                    g.beginReservedBlock(blk_after_ret_mov);
+                    const final_bytes_p = try g.addBlockParam();
+                    const call_result_p = try g.record(&.{
+                        .{ .name = "bytes", .value = final_bytes_p },
+                        .{ .name = "ctx", .value = call_ctx },
+                    });
+                    try g.ret(call_result_p);
+                }
+
+                // Spilled register: STR x0, [sp, #offset]
+                g.beginReservedBlock(blk_call_dst_spill);
+                {
+                    const spill_bytes = try g.callDirect(f_store_spill, &.{ call_bytes_m, dst_reg, c0_r });
+                    const call_result_s = try g.record(&.{
+                        .{ .name = "bytes", .value = spill_bytes },
+                        .{ .name = "ctx", .value = call_ctx },
+                    });
+                    try g.ret(call_result_s);
+                }
             }
         }
 
@@ -1266,8 +1689,23 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
             // Allocate register for the record pointer
             const ri_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, ri_dst });
-            const ri_reg = try g.recordField(ri_alloc, "reg");
+            const ri_reg_raw = try g.recordField(ri_alloc, "reg");
             const ri_ctx = try g.recordField(ri_alloc, "ctx");
+
+            // If dst is spilled, use x27 as physical register for bump alloc + STR base
+            const c100_ri = try g.constInt(100);
+            const ri_spilled = try g.ge(ri_reg_raw, c100_ri);
+            const blk_ri_spill = g.reserveBlock();
+            const blk_ri_phys = g.reserveBlock();
+            const blk_ri_merge = g.reserveBlock();
+            try g.branch(ri_spilled, blk_ri_spill, blk_ri_phys);
+            g.beginReservedBlock(blk_ri_spill);
+            const c27_ri = try g.constInt(27);
+            try g.jump(blk_ri_merge, &.{c27_ri});
+            g.beginReservedBlock(blk_ri_phys);
+            try g.jump(blk_ri_merge, &.{ri_reg_raw});
+            g.beginReservedBlock(blk_ri_merge);
+            const ri_reg = try g.addBlockParam();
 
             // Bump alloc: n_fields * 8 bytes
             const c8_ri = try g.constInt(8);
@@ -1292,10 +1730,15 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             {
                 const ri_field = try g.listNth(ri_fields, ri_i);
                 const ri_fval = try g.recordField(ri_field, "value");
-                const ri_fval_reg = try g.callDirect(f_get_reg, &.{ ri_c, ri_fval });
+                const ri_fval_reg_raw = try g.callDirect(f_get_reg, &.{ ri_c, ri_fval });
+
+                // Load field value from spill slot if needed (use x17 as temp for field value)
+                const c17_ri = try g.constInt(17);
+                const ri_fval_load = try g.callDirect(f_load_spill, &.{ ri_b, ri_fval_reg_raw, c17_ri });
+                const ri_b_loaded = try g.recordField(ri_fval_load, "bytes");
+                const ri_fval_reg = try g.recordField(ri_fval_load, "reg");
 
                 // STR ri_fval_reg, [ri_reg, #i*8]
-                // STR Xt, [Xn, #imm12] = 0xF9000000 | (imm12/8 << 10) | (Xn << 5) | Xt
                 const ri_offset = try g.binary(.mul, ri_i, c8_ri);
                 const ri_off_div8 = try g.binary(.div, ri_offset, c8_ri);
                 const str_base = try g.constInt(0xF9000000);
@@ -1306,7 +1749,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                 const str_r1 = try g.binary(.bit_or, str_base, str_off);
                 const str_r2 = try g.binary(.bit_or, str_r1, str_rn);
                 const str_enc = try g.binary(.bit_or, str_r2, ri_fval_reg);
-                const ri_b2 = try g.callDirect(f_append_inst, &.{ ri_b, str_enc });
+                const ri_b2 = try g.callDirect(f_append_inst, &.{ ri_b_loaded, str_enc });
 
                 const one_ri = try g.constInt(1);
                 const ri_next = try g.add(ri_i, one_ri);
@@ -1357,8 +1800,10 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                         .{ .name = "blocks_start", .value = try g.recordField(ri_c, "blocks_start") },
                         .{ .name = "fields_map", .value = new_fm },
                     });
+                    // Store record pointer to spill slot if dst was spilled
+                    const ri_b_final = try g.callDirect(f_store_spill, &.{ ri_b, ri_reg_raw, ri_reg });
                     const ri_result = try g.record(&.{
-                        .{ .name = "bytes", .value = ri_b },
+                        .{ .name = "bytes", .value = ri_b_final },
                         .{ .name = "ctx", .value = ri_ctx_final },
                     });
                     try g.ret(ri_result);
@@ -1373,7 +1818,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const blk_not_field_get = g.reserveBlock();
         try g.branch(is_field_get, blk_field_get, blk_not_field_get);
 
-        // IrFieldGet: {dst, base, field} -> LDR dst, [base, #index*8]
+        // IrFieldGet: {dst, base, field, index} -> LDR dst, [base, #index*8]
         g.beginReservedBlock(blk_field_get);
         {
             const fg_payload = try g.tagPayload(inst, ir_field_get);
@@ -1381,83 +1826,369 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const fg_base = try g.recordField(fg_payload, "base");
             const fg_field = try g.recordField(fg_payload, "field");
 
-            // Look up base value_id in fields_map to get field names list
+            // Check if base is in fields_map
             const fg_base_str = try g.callBuiltin("string_from_int", &.{fg_base});
             const fg_fm = try g.recordField(ctx, "fields_map");
-            const fg_names = try g.mapGet(fg_fm, fg_base_str);
+            const fg_has = try g.mapHas(fg_fm, fg_base_str);
+            const blk_fg_has_map = g.reserveBlock();
+            const blk_fg_no_map = g.reserveBlock();
+            try g.branch(fg_has, blk_fg_has_map, blk_fg_no_map);
 
-            // Find index of fg_field in fg_names
-            const fg_num = try g.listLength(fg_names);
-            const c0_fg = try g.constInt(0);
-            const fg_find = g.reserveBlock();
-            try g.jump(fg_find, &.{c0_fg});
-
-            g.beginReservedBlock(fg_find);
-            const fg_fi = try g.addBlockParam();
-            const fg_fi_done = try g.ge(fg_fi, fg_num);
-            const fg_not_found = g.reserveBlock();
-            const fg_check = g.reserveBlock();
-            try g.branch(fg_fi_done, fg_not_found, fg_check);
-
-            g.beginReservedBlock(fg_check);
+            // Has fields_map entry: find field index by name
+            g.beginReservedBlock(blk_fg_has_map);
             {
-                const fg_name_i = try g.listNth(fg_names, fg_fi);
-                const fg_match = try g.eq(fg_name_i, fg_field);
-                const fg_found = g.reserveBlock();
-                const fg_next_blk = g.reserveBlock();
-                try g.branch(fg_match, fg_found, fg_next_blk);
+                const fg_names = try g.mapGet(fg_fm, fg_base_str);
+                const fg_num = try g.listLength(fg_names);
+                const c0_fg = try g.constInt(0);
+                const fg_find = g.reserveBlock();
+                try g.jump(fg_find, &.{c0_fg});
 
-                g.beginReservedBlock(fg_found);
+                g.beginReservedBlock(fg_find);
+                const fg_fi = try g.addBlockParam();
+                const fg_fi_done = try g.ge(fg_fi, fg_num);
+                const fg_not_found = g.reserveBlock();
+                const fg_check = g.reserveBlock();
+                try g.branch(fg_fi_done, fg_not_found, fg_check);
+
+                g.beginReservedBlock(fg_check);
                 {
-                    // Found: index = fg_fi
-                    const fg_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, fg_dst });
-                    const fg_reg = try g.recordField(fg_alloc, "reg");
-                    const fg_ctx = try g.recordField(fg_alloc, "ctx");
-                    const fg_base_reg = try g.callDirect(f_get_reg, &.{ fg_ctx, fg_base });
+                    const fg_name_i = try g.listNth(fg_names, fg_fi);
+                    const fg_match = try g.eq(fg_name_i, fg_field);
+                    const fg_found = g.reserveBlock();
+                    const fg_next_blk = g.reserveBlock();
+                    try g.branch(fg_match, fg_found, fg_next_blk);
 
-                    // LDR Xt, [Xn, #imm12] = 0xF9400000 | (imm12/8 << 10) | (Xn << 5) | Xt
-                    const c8_fg = try g.constInt(8);
-                    const fg_offset = try g.binary(.mul, fg_fi, c8_fg);
-                    const fg_off_div8 = try g.binary(.div, fg_offset, c8_fg);
-                    const ldr_base = try g.constInt(0xF9400000);
-                    const c10_fg = try g.constInt(10);
-                    const c5_fg = try g.constInt(5);
-                    const ldr_off = try g.binary(.shl, fg_off_div8, c10_fg);
-                    const ldr_rn = try g.binary(.shl, fg_base_reg, c5_fg);
-                    const ldr_r1 = try g.binary(.bit_or, ldr_base, ldr_off);
-                    const ldr_r2 = try g.binary(.bit_or, ldr_r1, ldr_rn);
-                    const ldr_enc = try g.binary(.bit_or, ldr_r2, fg_reg);
-                    const fg_bytes = try g.callDirect(f_append_inst, &.{ bytes, ldr_enc });
+                    g.beginReservedBlock(fg_found);
+                    {
+                        const fg_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, fg_dst });
+                        const fg_reg_raw = try g.recordField(fg_alloc, "reg");
+                        const fg_ctx = try g.recordField(fg_alloc, "ctx");
+                        const fg_base_reg_raw = try g.callDirect(f_get_reg, &.{ fg_ctx, fg_base });
 
-                    // Copy fields_map entry for dst (so chained access works: r.x.y)
-                    const fg_result = try g.record(&.{
-                        .{ .name = "bytes", .value = fg_bytes },
-                        .{ .name = "ctx", .value = fg_ctx },
-                    });
-                    try g.ret(fg_result);
+                        // Load base from spill if needed
+                        const c17_fg = try g.constInt(17);
+                        const fg_base_load = try g.callDirect(f_load_spill, &.{ bytes, fg_base_reg_raw, c17_fg });
+                        const fg_b1 = try g.recordField(fg_base_load, "bytes");
+                        const fg_base_reg = try g.recordField(fg_base_load, "reg");
+
+                        // Use x27 as dst if spilled
+                        const c100_fg = try g.constInt(100);
+                        const fg_dst_spilled = try g.ge(fg_reg_raw, c100_fg);
+                        const blk_fg_sp = g.reserveBlock();
+                        const blk_fg_ph = g.reserveBlock();
+                        const blk_fg_dm = g.reserveBlock();
+                        try g.branch(fg_dst_spilled, blk_fg_sp, blk_fg_ph);
+                        g.beginReservedBlock(blk_fg_sp);
+                        const c27_fg = try g.constInt(27);
+                        try g.jump(blk_fg_dm, &.{c27_fg});
+                        g.beginReservedBlock(blk_fg_ph);
+                        try g.jump(blk_fg_dm, &.{fg_reg_raw});
+                        g.beginReservedBlock(blk_fg_dm);
+                        const fg_reg = try g.addBlockParam();
+
+                        const ldr_base = try g.constInt(0xF9400000);
+                        const c10_fg = try g.constInt(10);
+                        const c5_fg = try g.constInt(5);
+                        const ldr_off = try g.binary(.shl, fg_fi, c10_fg);
+                        const ldr_rn = try g.binary(.shl, fg_base_reg, c5_fg);
+                        const ldr_r1 = try g.binary(.bit_or, ldr_base, ldr_off);
+                        const ldr_r2 = try g.binary(.bit_or, ldr_r1, ldr_rn);
+                        const ldr_enc = try g.binary(.bit_or, ldr_r2, fg_reg);
+                        const fg_bytes = try g.callDirect(f_append_inst, &.{ fg_b1, ldr_enc });
+
+                        // Store dst to spill if needed
+                        const fg_bytes_final = try g.callDirect(f_store_spill, &.{ fg_bytes, fg_reg_raw, fg_reg });
+                        const fg_result = try g.record(&.{
+                            .{ .name = "bytes", .value = fg_bytes_final },
+                            .{ .name = "ctx", .value = fg_ctx },
+                        });
+                        try g.ret(fg_result);
+                    }
+
+                    g.beginReservedBlock(fg_next_blk);
+                    {
+                        const one_fg = try g.constInt(1);
+                        const fg_next = try g.add(fg_fi, one_fg);
+                        try g.jump(fg_find, &.{fg_next});
+                    }
                 }
 
-                g.beginReservedBlock(fg_next_blk);
+                // Field not found in names list: use index 0 as fallback
+                g.beginReservedBlock(fg_not_found);
                 {
-                    const one_fg = try g.constInt(1);
-                    const fg_next = try g.add(fg_fi, one_fg);
-                    try g.jump(fg_find, &.{fg_next});
+                    const fg_alloc2 = try g.callDirect(f_alloc_reg, &.{ ctx, fg_dst });
+                    const fg_reg2_raw = try g.recordField(fg_alloc2, "reg");
+                    const fg_ctx2 = try g.recordField(fg_alloc2, "ctx");
+                    const fg_base_reg2_raw = try g.callDirect(f_get_reg, &.{ fg_ctx2, fg_base });
+
+                    const c17_fb = try g.constInt(17);
+                    const fg_base_load2 = try g.callDirect(f_load_spill, &.{ bytes, fg_base_reg2_raw, c17_fb });
+                    const fg_b2 = try g.recordField(fg_base_load2, "bytes");
+                    const fg_base_reg2 = try g.recordField(fg_base_load2, "reg");
+
+                    const c100_fb = try g.constInt(100);
+                    const fg_dst_sp2 = try g.ge(fg_reg2_raw, c100_fb);
+                    const blk_fg_sp2 = g.reserveBlock();
+                    const blk_fg_ph2 = g.reserveBlock();
+                    const blk_fg_dm2 = g.reserveBlock();
+                    try g.branch(fg_dst_sp2, blk_fg_sp2, blk_fg_ph2);
+                    g.beginReservedBlock(blk_fg_sp2);
+                    const c27_fb = try g.constInt(27);
+                    try g.jump(blk_fg_dm2, &.{c27_fb});
+                    g.beginReservedBlock(blk_fg_ph2);
+                    try g.jump(blk_fg_dm2, &.{fg_reg2_raw});
+                    g.beginReservedBlock(blk_fg_dm2);
+                    const fg_reg2 = try g.addBlockParam();
+
+                    const ldr_base2 = try g.constInt(0xF9400000);
+                    const c10_fb = try g.constInt(10);
+                    const c5_fb = try g.constInt(5);
+                    const ldr_off2 = try g.binary(.shl, try g.constInt(0), c10_fb);
+                    const ldr_rn2 = try g.binary(.shl, fg_base_reg2, c5_fb);
+                    const ldr_r1b = try g.binary(.bit_or, ldr_base2, ldr_off2);
+                    const ldr_r2b = try g.binary(.bit_or, ldr_r1b, ldr_rn2);
+                    const ldr_enc2 = try g.binary(.bit_or, ldr_r2b, fg_reg2);
+                    const fg_bytes2 = try g.callDirect(f_append_inst, &.{ fg_b2, ldr_enc2 });
+                    const fg_bytes2_final = try g.callDirect(f_store_spill, &.{ fg_bytes2, fg_reg2_raw, fg_reg2 });
+                    const fg_result2 = try g.record(&.{
+                        .{ .name = "bytes", .value = fg_bytes2_final },
+                        .{ .name = "ctx", .value = fg_ctx2 },
+                    });
+                    try g.ret(fg_result2);
                 }
             }
 
-            // Field not found: return unchanged (shouldn't happen if lowerer is correct)
-            g.beginReservedBlock(fg_not_found);
+            // No fields_map entry (cross-function): use index 0 as fallback
+            g.beginReservedBlock(blk_fg_no_map);
             {
-                const fg_def = try g.record(&.{
-                    .{ .name = "bytes", .value = bytes },
-                    .{ .name = "ctx", .value = ctx },
+                const fg_alloc3 = try g.callDirect(f_alloc_reg, &.{ ctx, fg_dst });
+                const fg_reg3_raw = try g.recordField(fg_alloc3, "reg");
+                const fg_ctx3 = try g.recordField(fg_alloc3, "ctx");
+                const fg_base_reg3_raw = try g.callDirect(f_get_reg, &.{ fg_ctx3, fg_base });
+
+                const c17_nm = try g.constInt(17);
+                const fg_base_load3 = try g.callDirect(f_load_spill, &.{ bytes, fg_base_reg3_raw, c17_nm });
+                const fg_b3 = try g.recordField(fg_base_load3, "bytes");
+                const fg_base_reg3 = try g.recordField(fg_base_load3, "reg");
+
+                const c100_nm = try g.constInt(100);
+                const fg_dst_sp3 = try g.ge(fg_reg3_raw, c100_nm);
+                const blk_fg_sp3 = g.reserveBlock();
+                const blk_fg_ph3 = g.reserveBlock();
+                const blk_fg_dm3 = g.reserveBlock();
+                try g.branch(fg_dst_sp3, blk_fg_sp3, blk_fg_ph3);
+                g.beginReservedBlock(blk_fg_sp3);
+                const c27_nm = try g.constInt(27);
+                try g.jump(blk_fg_dm3, &.{c27_nm});
+                g.beginReservedBlock(blk_fg_ph3);
+                try g.jump(blk_fg_dm3, &.{fg_reg3_raw});
+                g.beginReservedBlock(blk_fg_dm3);
+                const fg_reg3 = try g.addBlockParam();
+
+                const ldr_base3 = try g.constInt(0xF9400000);
+                const c10_nm = try g.constInt(10);
+                const c5_nm = try g.constInt(5);
+                const ldr_off3 = try g.binary(.shl, try g.constInt(0), c10_nm);
+                const ldr_rn3 = try g.binary(.shl, fg_base_reg3, c5_nm);
+                const ldr_r1c = try g.binary(.bit_or, ldr_base3, ldr_off3);
+                const ldr_r2c = try g.binary(.bit_or, ldr_r1c, ldr_rn3);
+                const ldr_enc3 = try g.binary(.bit_or, ldr_r2c, fg_reg3);
+                const fg_bytes3 = try g.callDirect(f_append_inst, &.{ fg_b3, ldr_enc3 });
+                const fg_bytes3_final = try g.callDirect(f_store_spill, &.{ fg_bytes3, fg_reg3_raw, fg_reg3 });
+                const fg_result3 = try g.record(&.{
+                    .{ .name = "bytes", .value = fg_bytes3_final },
+                    .{ .name = "ctx", .value = fg_ctx3 },
                 });
-                try g.ret(fg_def);
+                try g.ret(fg_result3);
+            }
+        }
+
+        // Not field_get: check IrConstString
+        g.beginReservedBlock(blk_not_field_get);
+        const is_const_string = try g.tagTest(inst, ir_const_string);
+        const blk_const_string = g.reserveBlock();
+        const blk_not_const_string = g.reserveBlock();
+        try g.branch(is_const_string, blk_const_string, blk_not_const_string);
+
+        // IrConstString: {dst, value} -> allocate reg, MOV 0 (stub)
+        g.beginReservedBlock(blk_const_string);
+        {
+            const cs_payload = try g.tagPayload(inst, ir_const_string);
+            const cs_dst = try g.recordField(cs_payload, "dst");
+            const cs_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, cs_dst });
+            const cs_reg = try g.recordField(cs_alloc, "reg");
+            const cs_ctx = try g.recordField(cs_alloc, "ctx");
+            const cs_zero = try g.constInt(0);
+            const cs_bytes = try g.callDirect(f_mov_imm64, &.{ bytes, cs_reg, cs_zero });
+            const cs_result = try g.record(&.{
+                .{ .name = "bytes", .value = cs_bytes },
+                .{ .name = "ctx", .value = cs_ctx },
+            });
+            try g.ret(cs_result);
+        }
+
+        // Not const_string: check IrClosure
+        g.beginReservedBlock(blk_not_const_string);
+        const is_closure = try g.tagTest(inst, ir_closure);
+        const blk_closure = g.reserveBlock();
+        const blk_not_closure = g.reserveBlock();
+        try g.branch(is_closure, blk_closure, blk_not_closure);
+
+        // IrClosure: {dst, func} -> look up func in func_map, load offset into dst
+        g.beginReservedBlock(blk_closure);
+        {
+            const cl_payload = try g.tagPayload(inst, ir_closure);
+            const cl_dst = try g.recordField(cl_payload, "dst");
+            const cl_func = try g.recordField(cl_payload, "func");
+            const cl_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, cl_dst });
+            const cl_reg_raw = try g.recordField(cl_alloc, "reg");
+            const cl_ctx = try g.recordField(cl_alloc, "ctx");
+
+            // If dst is spilled, use x27 as temp register for ADR/MOV
+            const c100_cl = try g.constInt(100);
+            const cl_spilled = try g.ge(cl_reg_raw, c100_cl);
+            const blk_cl_spill = g.reserveBlock();
+            const blk_cl_phys = g.reserveBlock();
+            const blk_cl_reg_merge = g.reserveBlock();
+            try g.branch(cl_spilled, blk_cl_spill, blk_cl_phys);
+            g.beginReservedBlock(blk_cl_spill);
+            const c27_cl = try g.constInt(27);
+            try g.jump(blk_cl_reg_merge, &.{c27_cl});
+            g.beginReservedBlock(blk_cl_phys);
+            try g.jump(blk_cl_reg_merge, &.{cl_reg_raw});
+            g.beginReservedBlock(blk_cl_reg_merge);
+            const cl_reg = try g.addBlockParam();
+
+            const cl_fmap = try g.recordField(cl_ctx, "func_map");
+            const cl_has = try g.mapHas(cl_fmap, cl_func);
+            const blk_cl_found = g.reserveBlock();
+            const blk_cl_notfound = g.reserveBlock();
+            try g.branch(cl_has, blk_cl_found, blk_cl_notfound);
+
+            g.beginReservedBlock(blk_cl_found);
+            {
+                const cl_off = try g.mapGet(cl_fmap, cl_func);
+                const cl_cur_off = try g.callBuiltin("bytes_length", &.{bytes});
+                const cl_rel = try g.sub(cl_off, cl_cur_off);
+                const cl_adr = try g.callDirect(f_encode_adr, &.{ cl_reg, cl_rel });
+                const cl_bytes = try g.callDirect(f_append_inst, &.{ bytes, cl_adr });
+                // Store to spill slot if needed
+                const cl_bytes_final = try g.callDirect(f_store_spill, &.{ cl_bytes, cl_reg_raw, cl_reg });
+                const cl_result = try g.record(&.{
+                    .{ .name = "bytes", .value = cl_bytes_final },
+                    .{ .name = "ctx", .value = cl_ctx },
+                });
+                try g.ret(cl_result);
+            }
+
+            g.beginReservedBlock(blk_cl_notfound);
+            {
+                const cl_zero = try g.constInt(0);
+                const cl_bytes2 = try g.callDirect(f_mov_imm64, &.{ bytes, cl_reg, cl_zero });
+                // Store to spill slot if needed
+                const cl_bytes2_final = try g.callDirect(f_store_spill, &.{ cl_bytes2, cl_reg_raw, cl_reg });
+                const cl_result2 = try g.record(&.{
+                    .{ .name = "bytes", .value = cl_bytes2_final },
+                    .{ .name = "ctx", .value = cl_ctx },
+                });
+                try g.ret(cl_result2);
+            }
+        }
+
+        // Not closure: check IrListInit
+        g.beginReservedBlock(blk_not_closure);
+        const is_list_init = try g.tagTest(inst, ir_list_init);
+        const blk_list_init = g.reserveBlock();
+        const blk_not_list_init = g.reserveBlock();
+        try g.branch(is_list_init, blk_list_init, blk_not_list_init);
+
+        // IrListInit: {dst, elements} -> bump alloc (1+n)*8 bytes, store length + elements
+        g.beginReservedBlock(blk_list_init);
+        {
+            const li_payload = try g.tagPayload(inst, ir_list_init);
+            const li_dst = try g.recordField(li_payload, "dst");
+            const li_elems = try g.recordField(li_payload, "elements");
+            const li_num = try g.listLength(li_elems);
+
+            const li_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, li_dst });
+            const li_reg_raw = try g.recordField(li_alloc, "reg");
+            const li_ctx = try g.recordField(li_alloc, "ctx");
+
+            // If dst is spilled, use x27 as physical register
+            const c100_li = try g.constInt(100);
+            const li_spilled = try g.ge(li_reg_raw, c100_li);
+            const blk_li_sp = g.reserveBlock();
+            const blk_li_ph = g.reserveBlock();
+            const blk_li_mg = g.reserveBlock();
+            try g.branch(li_spilled, blk_li_sp, blk_li_ph);
+            g.beginReservedBlock(blk_li_sp);
+            const c27_li = try g.constInt(27);
+            try g.jump(blk_li_mg, &.{c27_li});
+            g.beginReservedBlock(blk_li_ph);
+            try g.jump(blk_li_mg, &.{li_reg_raw});
+            g.beginReservedBlock(blk_li_mg);
+            const li_reg = try g.addBlockParam();
+
+            // Bump alloc: (1 + n) * 8 bytes (slot 0 = length, slots 1..n = elements)
+            const c1_li = try g.constInt(1);
+            const li_slots = try g.add(li_num, c1_li);
+            const c8_li = try g.constInt(8);
+            const li_size = try g.binary(.mul, li_slots, c8_li);
+            const li_bytes1 = try g.callDirect(f_emit_bump_alloc, &.{ bytes, li_reg, li_size });
+
+            // Store length at offset 0
+            const li_len_reg = try g.constInt(17); // use x17 as temp for length
+            const li_ctx2 = li_ctx;
+            const li_bytes2 = try g.callDirect(f_mov_imm64, &.{ li_bytes1, li_len_reg, li_num });
+            const c0_li = try g.constInt(0);
+            const li_str_len = try g.callDirect(f_encode_str, &.{ li_len_reg, li_reg, c0_li });
+            const li_bytes3 = try g.callDirect(f_append_inst, &.{ li_bytes2, li_str_len });
+
+            // STR each element at [li_reg, #(i+1)*8]
+            const li_elem_loop = g.reserveBlock();
+            try g.jump(li_elem_loop, &.{ c0_li, li_bytes3, li_ctx2 });
+
+            g.beginReservedBlock(li_elem_loop);
+            const li_ei = try g.addBlockParam();
+            const li_eb = try g.addBlockParam();
+            const li_ec = try g.addBlockParam();
+            const li_edone = try g.ge(li_ei, li_num);
+            const li_ebody = g.reserveBlock();
+            const li_eexit = g.reserveBlock();
+            try g.branch(li_edone, li_eexit, li_ebody);
+
+            g.beginReservedBlock(li_ebody);
+            {
+                const li_elem = try g.listNth(li_elems, li_ei);
+                const li_elem_reg_raw = try g.callDirect(f_get_reg, &.{ li_ec, li_elem });
+                // Load element from spill if needed (use x17 as temp)
+                const c17_li = try g.constInt(17);
+                const li_elem_load = try g.callDirect(f_load_spill, &.{ li_eb, li_elem_reg_raw, c17_li });
+                const li_eb_loaded = try g.recordField(li_elem_load, "bytes");
+                const li_elem_reg = try g.recordField(li_elem_load, "reg");
+
+                const c1_ei = try g.constInt(1);
+                const li_slot = try g.add(li_ei, c1_ei);
+                const li_str_elem = try g.callDirect(f_encode_str, &.{ li_elem_reg, li_reg, li_slot });
+                const li_eb2 = try g.callDirect(f_append_inst, &.{ li_eb_loaded, li_str_elem });
+                const li_next_ei = try g.add(li_ei, c1_ei);
+                try g.jump(li_elem_loop, &.{ li_next_ei, li_eb2, li_ec });
+            }
+
+            g.beginReservedBlock(li_eexit);
+            {
+                // Store list pointer to spill slot if needed
+                const li_b_final = try g.callDirect(f_store_spill, &.{ li_eb, li_reg_raw, li_reg });
+                const li_result = try g.record(&.{
+                    .{ .name = "bytes", .value = li_b_final },
+                    .{ .name = "ctx", .value = li_ec },
+                });
+                try g.ret(li_result);
             }
         }
 
         // Default fallthrough: return bytes unchanged
-        g.beginReservedBlock(blk_not_field_get);
+        g.beginReservedBlock(blk_not_list_init);
         const ft_result = try g.record(&.{
             .{ .name = "bytes", .value = bytes },
             .{ .name = "ctx", .value = ctx },
@@ -1485,7 +2216,12 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(blk_ret);
         const ret_payload = try g.tagPayload(term, ir_ret);
         const ret_val_id = try g.recordField(ret_payload, "value");
-        const ret_reg = try g.callDirect(f_get_reg, &.{ ctx, ret_val_id });
+        const ret_reg_raw = try g.callDirect(f_get_reg, &.{ ctx, ret_val_id });
+        // Load from spill slot if needed
+        const c27_ret = try g.constInt(27);
+        const ret_load = try g.callDirect(f_load_spill, &.{ bytes, ret_reg_raw, c27_ret });
+        const ret_bytes_loaded = try g.recordField(ret_load, "bytes");
+        const ret_reg = try g.recordField(ret_load, "reg");
         // MOV x0, Xn: ADD x0, Xn, #0
         const c0_v = try g.constInt(0);
         const is_x0 = try g.eq(ret_reg, c0_v);
@@ -1496,11 +2232,11 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
         g.beginReservedBlock(blk_need_mov);
         const mov_inst = try g.callDirect(f_encode_add_imm, &.{ c0_v, ret_reg, c0_v });
-        const ret_b1 = try g.callDirect(f_append_inst, &.{ bytes, mov_inst });
+        const ret_b1 = try g.callDirect(f_append_inst, &.{ ret_bytes_loaded, mov_inst });
         try g.jump(blk_after_mov, &.{ret_b1});
 
         g.beginReservedBlock(blk_skip_mov);
-        try g.jump(blk_after_mov, &.{bytes});
+        try g.jump(blk_after_mov, &.{ret_bytes_loaded});
 
         g.beginReservedBlock(blk_after_mov);
         const ret_bytes = try g.addBlockParam();
@@ -1542,7 +2278,12 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             g.beginReservedBlock(j_args_body);
             {
                 const j_arg_id = try g.listNth(jmp_args, ji);
-                const j_arg_reg = try g.callDirect(f_get_reg, &.{ jc, j_arg_id });
+                const j_arg_reg_raw = try g.callDirect(f_get_reg, &.{ jc, j_arg_id });
+                // Load from spill if needed
+                const c27_j = try g.constInt(27);
+                const j_load = try g.callDirect(f_load_spill, &.{ jb, j_arg_reg_raw, c27_j });
+                const jb_loaded = try g.recordField(j_load, "bytes");
+                const j_arg_reg = try g.recordField(j_load, "reg");
                 // Move to x0+i (block param register)
                 const j_need_mov = try g.ne(j_arg_reg, ji);
                 const j_do_mov = g.reserveBlock();
@@ -1553,11 +2294,11 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                 g.beginReservedBlock(j_do_mov);
                 const jc0m = try g.constInt(0);
                 const j_mov = try g.callDirect(f_encode_add_imm, &.{ ji, j_arg_reg, jc0m });
-                const j_mb = try g.callDirect(f_append_inst, &.{ jb, j_mov });
+                const j_mb = try g.callDirect(f_append_inst, &.{ jb_loaded, j_mov });
                 try g.jump(j_after_mov, &.{j_mb});
 
                 g.beginReservedBlock(j_skip_mov);
-                try g.jump(j_after_mov, &.{jb});
+                try g.jump(j_after_mov, &.{jb_loaded});
 
                 g.beginReservedBlock(j_after_mov);
                 const jb2 = try g.addBlockParam();
@@ -1605,7 +2346,12 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const br_cond = try g.recordField(br_payload, "cond");
             const br_else = try g.recordField(br_payload, "else_blk");
 
-            const br_cond_reg = try g.callDirect(f_get_reg, &.{ ctx, br_cond });
+            const br_cond_reg_raw = try g.callDirect(f_get_reg, &.{ ctx, br_cond });
+            // Load from spill if needed
+            const c27_br = try g.constInt(27);
+            const br_load = try g.callDirect(f_load_spill, &.{ bytes, br_cond_reg_raw, c27_br });
+            const br_bytes_loaded = try g.recordField(br_load, "bytes");
+            const br_cond_reg = try g.recordField(br_load, "reg");
 
             // Compute offset to else block
             const br_bo = try g.recordField(ctx, "block_offsets");
@@ -1613,7 +2359,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const br_else_str = try g.callBuiltin("string_from_int", &.{br_else});
             const br_else_off = try g.mapGet(br_bo, br_else_str);
             const br_else_abs = try g.add(br_bs, br_else_off);
-            const br_cur_abs = try g.callBuiltin("bytes_length", &.{bytes});
+            const br_cur_abs = try g.callBuiltin("bytes_length", &.{br_bytes_loaded});
             const br_rel = try g.sub(br_else_abs, br_cur_abs);
 
             // CBZ Xt, offset: branch if cond==0 (false) to else
@@ -1706,8 +2452,9 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const new_func_map = try g.mapSet(func_map, func_name, code_len);
 
         // Reset reg_map and next_reg for this function
-        // Pre-populate reg_map with parameter bindings: param i -> register xi (x0-x7)
+        // Pre-populate reg_map with parameter bindings using actual value IDs from the lowerer
         const params = try g.recordField(func, "params");
+        const param_ids = try g.recordField(func, "param_ids");
         const num_params = try g.listLength(params);
         const c0 = try g.constInt(0);
         const init_rm = try g.mapNew();
@@ -1725,9 +2472,12 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
         g.beginReservedBlock(param_body_blk);
         {
-            // Map value_id=pi to register=pi (x0, x1, x2, ...)
-            const pi_str = try g.callBuiltin("string_from_int", &.{pi});
-            const pi_rm2 = try g.mapSet(pi_rm, pi_str, pi);
+            // Map actual value_id (from lowerer) to callee-saved register x(19+pi)
+            const c19_p = try g.constInt(19);
+            const callee_reg = try g.add(pi, c19_p);
+            const actual_vid = try g.listNth(param_ids, pi);
+            const pi_str = try g.callBuiltin("string_from_int", &.{actual_vid});
+            const pi_rm2 = try g.mapSet(pi_rm, pi_str, callee_reg);
             const pi_one = try g.constInt(1);
             const pi_next = try g.add(pi, pi_one);
             try g.jump(param_loop, &.{ pi_next, pi_rm2 });
@@ -1743,7 +2493,35 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         // Emit prologue: save all callee-saved registers
         const c16 = try g.constInt(16);
         const pro_bytes = try g.callDirect(f_emit_prologue, &.{c16});
-        const code2 = try g.callBuiltin("bytes_append_bytes", &.{ code, pro_bytes });
+        const code_after_pro = try g.callBuiltin("bytes_append_bytes", &.{ code, pro_bytes });
+
+        // Move params from x0-x7 (caller-saved) to callee-saved x19+ after prologue
+        const mov_param_loop = g.reserveBlock();
+        try g.jump(mov_param_loop, &.{ c0, code_after_pro });
+
+        g.beginReservedBlock(mov_param_loop);
+        const mpi = try g.addBlockParam();
+        const mp_code = try g.addBlockParam();
+        const mp_done = try g.ge(mpi, num_params);
+        const mp_exit = g.reserveBlock();
+        const mp_body = g.reserveBlock();
+        try g.branch(mp_done, mp_exit, mp_body);
+
+        g.beginReservedBlock(mp_body);
+        {
+            // MOV x(19+i), xi: ADD x(19+i), xi, #0
+            const c19_m = try g.constInt(19);
+            const dst_reg_m = try g.add(mpi, c19_m);
+            const c0_m = try g.constInt(0);
+            const mov_enc = try g.callDirect(f_encode_add_imm, &.{ dst_reg_m, mpi, c0_m });
+            const mp_code2 = try g.callDirect(f_append_inst, &.{ mp_code, mov_enc });
+            const mp_one = try g.constInt(1);
+            const mp_next = try g.add(mpi, mp_one);
+            try g.jump(mov_param_loop, &.{ mp_next, mp_code2 });
+        }
+
+        g.beginReservedBlock(mp_exit);
+        const code2 = try g.copy(mp_code);
 
         const blocks = try g.recordField(func, "blocks");
         const num_blocks = try g.listLength(blocks);
@@ -1780,7 +2558,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const temp_bytes = try g.callBuiltin("bytes_new", &.{});
         const sizing_ctx = try g.record(&.{
             .{ .name = "reg_map", .value = func_reg_map },
-            .{ .name = "next_reg", .value = c0 },
+            .{ .name = "next_reg", .value = num_params },
             .{ .name = "func_map", .value = new_func_map },
             .{ .name = "block_offsets", .value = init_bo },
             .{ .name = "data", .value = try g.recordField(ctx, "data") },
@@ -1838,7 +2616,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const blocks_start = try g.callBuiltin("bytes_length", &.{code2});
         const real_ctx = try g.record(&.{
             .{ .name = "reg_map", .value = func_reg_map },
-            .{ .name = "next_reg", .value = c0 },
+            .{ .name = "next_reg", .value = num_params },
             .{ .name = "func_map", .value = new_func_map },
             .{ .name = "block_offsets", .value = final_bo },
             .{ .name = "data", .value = try g.recordField(ctx, "data") },
@@ -2326,14 +3104,17 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(blk_has_entry);
         // Entry point is 0: start at heap_init, B jumps to main
         const blk_build = g.reserveBlock();
-        try g.jump(blk_build, &.{c0});
+        const has_main_true = try g.constBool(true);
+        try g.jump(blk_build, &.{ c0, has_main_true });
 
         g.beginReservedBlock(blk_no_entry);
-        try g.jump(blk_build, &.{c0});
+        const has_main_false = try g.constBool(false);
+        try g.jump(blk_build, &.{ c0, has_main_false });
 
         // Build Mach-O header (padded to page boundary)
         g.beginReservedBlock(blk_build);
         const entry_offset = try g.addBlockParam();
+        const has_main = try g.addBlockParam();
         const macho_header = try g.callDirect(f_emit_macho, &.{ code_len, entry_offset });
 
         // Second pass: re-emit all functions directly into the macho buffer.
@@ -2364,23 +3145,36 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
         // Emit heap init into macho buffer (before functions)
         const macho_with_heap_raw = try g.callDirect(f_emit_heap_init, &.{macho_header});
-        // Append B instruction to jump to main function
-        // B offset = (main_abs_offset - current_pos) / 4
-        // main_abs_offset = header_size + entry_off_from_pass1
-        // current_pos = bytes_length(macho_with_heap_raw)
-        const header_size = try g.callBuiltin("bytes_length", &.{macho_header});
-        const main_entry_off = try g.mapGet(final_func_map, entry_name);
-        const main_abs = try g.add(header_size, main_entry_off);
-        const cur_pos = try g.callBuiltin("bytes_length", &.{macho_with_heap_raw});
-        const b_rel = try g.sub(main_abs, cur_pos);
-        const c4_b = try g.constInt(4);
-        const b_rel_div4 = try g.binary(.div, b_rel, c4_b);
-        // B imm26: 0x14000000 | (imm26 & 0x03FFFFFF)
-        const b_base = try g.constInt(0x14000000);
-        const b_mask = try g.constInt(0x03FFFFFF);
-        const b_imm = try g.binary(.bit_and, b_rel_div4, b_mask);
-        const b_enc = try g.binary(.bit_or, b_base, b_imm);
-        const macho_with_heap = try g.callDirect(f_append_inst, &.{ macho_with_heap_raw, b_enc });
+
+        // Branch on has_main: if true, emit B main; if false, skip
+        const blk_emit_b_main = g.reserveBlock();
+        const blk_skip_b_main = g.reserveBlock();
+        const blk_after_b_main = g.reserveBlock();
+        try g.branch(has_main, blk_emit_b_main, blk_skip_b_main);
+
+        g.beginReservedBlock(blk_emit_b_main);
+        {
+            // Append B instruction to jump to main function
+            const header_size = try g.callBuiltin("bytes_length", &.{macho_header});
+            const main_entry_off = try g.mapGet(final_func_map, entry_name);
+            const main_abs = try g.add(header_size, main_entry_off);
+            const cur_pos = try g.callBuiltin("bytes_length", &.{macho_with_heap_raw});
+            const b_rel = try g.sub(main_abs, cur_pos);
+            const c4_b = try g.constInt(4);
+            const b_rel_div4 = try g.binary(.div, b_rel, c4_b);
+            const b_base = try g.constInt(0x14000000);
+            const b_mask = try g.constInt(0x03FFFFFF);
+            const b_imm = try g.binary(.bit_and, b_rel_div4, b_mask);
+            const b_enc = try g.binary(.bit_or, b_base, b_imm);
+            const macho_with_b = try g.callDirect(f_append_inst, &.{ macho_with_heap_raw, b_enc });
+            try g.jump(blk_after_b_main, &.{macho_with_b});
+        }
+
+        g.beginReservedBlock(blk_skip_b_main);
+        try g.jump(blk_after_b_main, &.{macho_with_heap_raw});
+
+        g.beginReservedBlock(blk_after_b_main);
+        const macho_with_heap = try g.addBlockParam();
 
         const loop2 = g.reserveBlock();
         try g.jump(loop2, &.{ c0, macho_with_heap, ctx2 });
@@ -2670,7 +3464,7 @@ test "emit: macho header starts with magic" {
     _ = g.beginBlock();
     const code_len = try g.constInt(0);
     const entry_off = try g.constInt(0);
-    const f_macho: FuncId = @enumFromInt(34); // ec_emit_macho
+    const f_macho: FuncId = @enumFromInt(39); // ec_emit_macho
     const macho = try g.callDirect(f_macho, &.{ code_len, entry_off });
     // Check length — should be one page (16384) for the header
     const len = try g.callBuiltin("bytes_length", &.{macho});
@@ -2995,7 +3789,7 @@ test "emit: alloc_reg maps first value to x8" {
         .{ .name = "fields_map", .value = try g.mapNew() },
     });
     const val_id = try g.constInt(0);
-    const f_alloc: FuncId = @enumFromInt(27); // ec_alloc_reg
+    const f_alloc: FuncId = @enumFromInt(30); // ec_alloc_reg
     const result = try g.callDirect(f_alloc, &.{ ctx, val_id });
     const reg = try g.recordField(result, "reg");
     try g.ret(reg);
@@ -3040,7 +3834,7 @@ test "emit: alloc_reg returns same reg for same value_id" {
         .{ .name = "fields_map", .value = try g.mapNew() },
     });
     const val_id = try g.constInt(42);
-    const f_alloc: FuncId = @enumFromInt(27); // ec_alloc_reg
+    const f_alloc: FuncId = @enumFromInt(30); // ec_alloc_reg
     // Allocate once
     const r1 = try g.callDirect(f_alloc, &.{ ctx, val_id });
     const reg1 = try g.recordField(r1, "reg");
@@ -3094,7 +3888,7 @@ test "emit: alloc_reg temps start at x8 after callee-saved" {
         .{ .name = "fields_map", .value = try g.mapNew() },
     });
     const val_id = try g.constInt(99);
-    const f_alloc: FuncId = @enumFromInt(27); // ec_alloc_reg
+    const f_alloc: FuncId = @enumFromInt(30); // ec_alloc_reg
     const result = try g.callDirect(f_alloc, &.{ ctx, val_id });
     const reg = try g.recordField(result, "reg");
     try g.ret(reg);
@@ -3152,7 +3946,7 @@ test "emit: emit_inst const_int produces 4 bytes for small value" {
     });
 
     const bytes = try g.callBuiltin("bytes_new", &.{});
-    const f_emit: FuncId = @enumFromInt(29); // ec_emit_inst
+    const f_emit: FuncId = @enumFromInt(34); // ec_emit_inst
     const result = try g.callDirect(f_emit, &.{ inst, bytes, ctx });
     const result_bytes = try g.recordField(result, "bytes");
     const len = try g.callBuiltin("bytes_length", &.{result_bytes});
@@ -3207,7 +4001,7 @@ test "emit: emit_inst const_int large value produces 8 bytes (MOVZ+MOVK)" {
     });
 
     const bytes = try g.callBuiltin("bytes_new", &.{});
-    const f_emit: FuncId = @enumFromInt(29); // ec_emit_inst
+    const f_emit: FuncId = @enumFromInt(34); // ec_emit_inst
     const result = try g.callDirect(f_emit, &.{ inst, bytes, ctx });
     const result_bytes = try g.recordField(result, "bytes");
     const len = try g.callBuiltin("bytes_length", &.{result_bytes});
@@ -3257,7 +4051,7 @@ test "emit: emit_inst unknown tag falls through returning bytes unchanged" {
     });
 
     const bytes = try g.callBuiltin("bytes_new", &.{});
-    const f_emit: FuncId = @enumFromInt(29); // ec_emit_inst
+    const f_emit: FuncId = @enumFromInt(34); // ec_emit_inst
     const result = try g.callDirect(f_emit, &.{ inst, bytes, ctx });
     const result_bytes = try g.recordField(result, "bytes");
     const len = try g.callBuiltin("bytes_length", &.{result_bytes});
@@ -3320,7 +4114,7 @@ test "emit: emit_inst binary add produces 4 bytes" {
     }));
 
     const bytes = try g.callBuiltin("bytes_new", &.{});
-    const f_emit: FuncId = @enumFromInt(29); // ec_emit_inst
+    const f_emit: FuncId = @enumFromInt(34); // ec_emit_inst
     const result = try g.callDirect(f_emit, &.{ inst, bytes, ctx });
     const result_bytes = try g.recordField(result, "bytes");
     const len = try g.callBuiltin("bytes_length", &.{result_bytes});
@@ -3337,7 +4131,7 @@ test "emit: emit_inst binary add produces 4 bytes" {
 }
 
 test "emit: emit_inst binary unknown op produces 0 bytes" {
-    // IrBinary with unknown op "%" -> fallthrough, 0 bytes
+    // IrBinary with unknown op "^^" -> fallthrough, 0 bytes
     var backing = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer backing.deinit();
     const alloc = backing.allocator();
@@ -3375,13 +4169,13 @@ test "emit: emit_inst binary unknown op produces 0 bytes" {
 
     const inst = try g.tag("IrBinary", try g.record(&.{
         .{ .name = "dst", .value = try g.constInt(3) },
-        .{ .name = "op", .value = try g.constString("%") },
+        .{ .name = "op", .value = try g.constString("^^") },
         .{ .name = "lhs", .value = try g.constInt(1) },
         .{ .name = "rhs", .value = try g.constInt(2) },
     }));
 
     const bytes = try g.callBuiltin("bytes_new", &.{});
-    const f_emit: FuncId = @enumFromInt(29); // ec_emit_inst
+    const f_emit: FuncId = @enumFromInt(34); // ec_emit_inst
     const result = try g.callDirect(f_emit, &.{ inst, bytes, ctx });
     const result_bytes = try g.recordField(result, "bytes");
     const len = try g.callBuiltin("bytes_length", &.{result_bytes});
@@ -3442,7 +4236,7 @@ test "emit: emit_inst binary == produces 8 bytes (CMP+CSET)" {
     }));
 
     const bytes = try g.callBuiltin("bytes_new", &.{});
-    const f_emit: FuncId = @enumFromInt(29); // ec_emit_inst
+    const f_emit: FuncId = @enumFromInt(34); // ec_emit_inst
     const result = try g.callDirect(f_emit, &.{ inst, bytes, ctx });
     const result_bytes = try g.recordField(result, "bytes");
     const len = try g.callBuiltin("bytes_length", &.{result_bytes});
@@ -3460,7 +4254,7 @@ test "emit: emit_inst binary == produces 8 bytes (CMP+CSET)" {
 
 // ── Prologue/Epilogue semantic tests ───────────────────────────────────
 
-test "emit: prologue produces 24 bytes (5 STP + MOV fp)" {
+test "emit: prologue produces 44 bytes (9 STP + MOV fp + SUB sp)" {
     var backing = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer backing.deinit();
     const alloc = backing.allocator();
@@ -3474,7 +4268,7 @@ test "emit: prologue produces 24 bytes (5 STP + MOV fp)" {
     try g.beginFunc("test_main");
     _ = g.beginBlock();
     const frame_size = try g.constInt(16);
-    const f_pro: FuncId = @enumFromInt(25); // ec_emit_prologue
+    const f_pro: FuncId = @enumFromInt(28); // ec_emit_prologue
     const bytes = try g.callDirect(f_pro, &.{frame_size});
     const len = try g.callBuiltin("bytes_length", &.{bytes});
     try g.ret(len);
@@ -3485,11 +4279,11 @@ test "emit: prologue produces 24 bytes (5 STP + MOV fp)" {
     defer interp.deinit();
 
     const val = try interp.execFunc(fid, &.{});
-    // 5 STP (20 bytes) + ADD (4 bytes) = 24 bytes
-    try std.testing.expectEqual(@as(i64, 24), val.int);
+    // 9 STP (36 bytes) + ADD (4 bytes) + SUB sp (4 bytes) = 44 bytes
+    try std.testing.expectEqual(@as(i64, 44), val.int);
 }
 
-test "emit: epilogue produces 24 bytes (5 LDP + RET)" {
+test "emit: epilogue produces 44 bytes (ADD sp + 9 LDP + RET)" {
     var backing = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer backing.deinit();
     const alloc = backing.allocator();
@@ -3503,7 +4297,7 @@ test "emit: epilogue produces 24 bytes (5 LDP + RET)" {
     try g.beginFunc("test_main");
     _ = g.beginBlock();
     const frame_size = try g.constInt(16);
-    const f_epi: FuncId = @enumFromInt(26); // ec_emit_epilogue
+    const f_epi: FuncId = @enumFromInt(29); // ec_emit_epilogue
     const bytes = try g.callDirect(f_epi, &.{frame_size});
     const len = try g.callBuiltin("bytes_length", &.{bytes});
     try g.ret(len);
@@ -3514,8 +4308,8 @@ test "emit: epilogue produces 24 bytes (5 LDP + RET)" {
     defer interp.deinit();
 
     const val = try interp.execFunc(fid, &.{});
-    // 5 LDP (20 bytes) + RET (4 bytes) = 24 bytes
-    try std.testing.expectEqual(@as(i64, 24), val.int);
+    // ADD sp (4 bytes) + 9 LDP (36 bytes) + RET (4 bytes) = 44 bytes
+    try std.testing.expectEqual(@as(i64, 44), val.int);
 }
 
 // ── Encoding cross-check: AND/ORR ──────────────────────────────────────
@@ -3634,7 +4428,7 @@ test "emit: mov_imm64 zero produces 4 bytes" {
     const bytes = try g.callBuiltin("bytes_new", &.{});
     const rd = try g.constInt(0);
     const value = try g.constInt(0);
-    const f_mov: FuncId = @enumFromInt(21); // ec_mov_imm64
+    const f_mov: FuncId = @enumFromInt(24); // ec_mov_imm64
     const result = try g.callDirect(f_mov, &.{ bytes, rd, value });
     const len = try g.callBuiltin("bytes_length", &.{result});
     try g.ret(len);
@@ -3666,7 +4460,7 @@ test "emit: mov_imm64 large value produces 12 bytes (3 chunks)" {
     const bytes = try g.callBuiltin("bytes_new", &.{});
     const rd = try g.constInt(0);
     const value = try g.constInt(0x0001_0002_0003);
-    const f_mov: FuncId = @enumFromInt(21);
+    const f_mov: FuncId = @enumFromInt(24); // ec_mov_imm64
     const result = try g.callDirect(f_mov, &.{ bytes, rd, value });
     const len = try g.callBuiltin("bytes_length", &.{result});
     try g.ret(len);
@@ -3697,10 +4491,10 @@ test "emit: pad_to_page already aligned returns same length" {
     try g.beginFunc("test_main");
     _ = g.beginBlock();
     // Pad something already page-aligned — result should be unchanged
-    const f_macho: FuncId = @enumFromInt(34); // ec_emit_macho returns page-aligned buffer
+    const f_macho: FuncId = @enumFromInt(39); // ec_emit_macho returns page-aligned buffer
     const c0 = try g.constInt(0);
     const header = try g.callDirect(f_macho, &.{ c0, c0 });
-    const f_pad: FuncId = @enumFromInt(36); // ec_pad_to_page
+    const f_pad: FuncId = @enumFromInt(41); // ec_pad_to_page
     const padded = try g.callDirect(f_pad, &.{header});
     const len = try g.callBuiltin("bytes_length", &.{padded});
     // Header is already page-aligned (16384), padding should not change it
