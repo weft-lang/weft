@@ -3650,8 +3650,61 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             try g.ret(ar_result_s);
         }
 
-        // Default fallthrough: return bytes unchanged
+        // IrRetain / IrRelease: no-ops in bootstrap (bump allocator, no actual RC)
         g.beginReservedBlock(blk_not_arg_receive);
+        const is_retain = try g.tagTest(inst, "IrRetain");
+        const is_release = try g.tagTest(inst, "IrRelease");
+        const is_rc_op = try g.logicOr(is_retain, is_release);
+        const blk_rc_noop = g.reserveBlock();
+        const blk_not_rc = g.reserveBlock();
+        try g.branch(is_rc_op, blk_rc_noop, blk_not_rc);
+
+        g.beginReservedBlock(blk_rc_noop);
+        const rc_noop_result = try g.record(&.{
+            .{ .name = "bytes", .value = bytes },
+            .{ .name = "ctx", .value = ctx },
+        });
+        try g.ret(rc_noop_result);
+
+        // IrStore: variable or pointer write
+        g.beginReservedBlock(blk_not_rc);
+        const is_store = try g.tagTest(inst, "IrStore");
+        const blk_store = g.reserveBlock();
+        const blk_not_store = g.reserveBlock();
+        try g.branch(is_store, blk_store, blk_not_store);
+
+        g.beginReservedBlock(blk_store);
+        {
+            const store_payload = try g.tagPayload(inst, "IrStore");
+            const store_target = try g.recordField(store_payload, "target");
+            const store_value = try g.recordField(store_payload, "value");
+            // Get registers for target and value
+            const tgt_reg_raw = try g.callDirect(f_get_reg, &.{ ctx, store_target });
+            const val_reg_raw = try g.callDirect(f_get_reg, &.{ ctx, store_value });
+            // Load spilled operands into temp registers
+            const c16_st = try g.constInt(16);
+            const c17_st = try g.constInt(17);
+            const tgt_load = try g.callDirect(f_load_spill, &.{ bytes, tgt_reg_raw, c16_st });
+            const bytes_st1 = try g.recordField(tgt_load, "bytes");
+            const tgt_reg = try g.recordField(tgt_load, "reg");
+            const val_load = try g.callDirect(f_load_spill, &.{ bytes_st1, val_reg_raw, c17_st });
+            const bytes_st2 = try g.recordField(val_load, "bytes");
+            const val_reg = try g.recordField(val_load, "reg");
+            // MOV target_reg, value_reg → ADD target_reg, value_reg, #0
+            const c0_st = try g.constInt(0);
+            const st_mov = try g.callDirect(f_encode_add_imm, &.{ tgt_reg, val_reg, c0_st });
+            const st_bytes = try g.callDirect(f_append_inst, &.{ bytes_st2, st_mov });
+            // If target was spilled, store back
+            const st_bytes2 = try g.callDirect(f_store_spill, &.{ st_bytes, tgt_reg_raw, tgt_reg });
+            const st_result = try g.record(&.{
+                .{ .name = "bytes", .value = st_bytes2 },
+                .{ .name = "ctx", .value = ctx },
+            });
+            try g.ret(st_result);
+        }
+
+        // Default fallthrough: return bytes unchanged
+        g.beginReservedBlock(blk_not_store);
         const ft_result = try g.record(&.{
             .{ .name = "bytes", .value = bytes },
             .{ .name = "ctx", .value = ctx },

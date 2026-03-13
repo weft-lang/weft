@@ -75,6 +75,7 @@ pub const tast_record_update = "TRecordUpdate";
 pub const tast_string_interp = "TStringInterp";
 pub const tast_unsafe = "TUnsafe";
 pub const tast_defer = "TDefer";
+pub const tast_assign = "TAssign";
 pub const tast_addr_of = "TAddrOf";
 pub const tast_addr_of_mut = "TAddrOfMut";
 pub const tast_deref = "TDeref";
@@ -2355,8 +2356,36 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             }));
         }
 
-        // Defer: defer expr → TyNil (just type-check the inner expression)
+        // Assign: target = value → TyNil
         g.beginReservedBlock(check_addr_of);
+        const is_assign = try g.tagTest(expr, grammar.ast_assign);
+        const assign_blk = g.reserveBlock();
+        const check_defer2 = g.reserveBlock();
+        try g.branch(is_assign, assign_blk, check_defer2);
+
+        g.beginReservedBlock(assign_blk);
+        {
+            const assign_pl = try g.tagPayload(expr, grammar.ast_assign);
+            const assign_target = try g.recordField(assign_pl, "target");
+            const assign_value = try g.recordField(assign_pl, "value");
+            const target_r = try g.callDirect(f_infer, &.{ assign_target, ctx });
+            const target_typed = try g.recordField(target_r, "expr");
+            const value_r = try g.callDirect(f_infer, &.{ assign_value, ctx });
+            const value_typed = try g.recordField(value_r, "expr");
+            const value_type = try g.recordField(value_r, "type");
+            const assign_rec = try g.record(&.{
+                .{ .name = "target", .value = target_typed },
+                .{ .name = "value", .value = value_typed },
+            });
+            const assign_texpr = try g.tag(tast_assign, assign_rec);
+            try g.ret(try g.record(&.{
+                .{ .name = "expr", .value = assign_texpr },
+                .{ .name = "type", .value = value_type },
+            }));
+        }
+
+        // Defer: defer expr → TyNil (just type-check the inner expression)
+        g.beginReservedBlock(check_defer2);
         const is_defer_expr = try g.tagTest(expr, grammar.ast_defer);
         const defer_expr_blk = g.reserveBlock();
         const check_addr_of2 = g.reserveBlock();

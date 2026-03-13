@@ -91,6 +91,7 @@ pub const ast_addr_of = "AddrOf";
 pub const ast_addr_of_mut = "AddrOfMut";
 pub const ast_deref = "Deref";
 pub const ast_defer = "Defer";
+pub const ast_assign = "Assign";
 
 // Declaration tags
 pub const ast_fn_decl = "FnDecl";
@@ -121,6 +122,8 @@ pub const ast_type_nullable = "TypeNullable";
 pub const ast_type_ptr = "TypePtr";
 pub const ast_type_ptr_mut = "TypePtrMut";
 pub const ast_type_rc = "TypeRc";
+pub const ast_type_array = "TypeArray";
+pub const ast_type_slice = "TypeSlice";
 
 // Module tag
 pub const ast_module = "Module";
@@ -2893,8 +2896,43 @@ fn genParseExpr(g: *Gen, pf: ParserFuncs) !void {
     const kw_binop_node = try g.tag(ast_binop, kw_binop_rec);
     try g.jump(loop_blk, &.{ kw_binop_node, kw_rhs_end });
 
-    // done: return current node
+    // done: check for assignment (x = expr, p.* = expr)
     g.beginReservedBlock(done_blk);
+    // Only check for assignment at top-level (min_bp == 0)
+    const is_top_level = try g.eq(min_bp, zero);
+    const check_assign_blk = g.reserveBlock();
+    const return_blk = g.reserveBlock();
+    try g.branch(is_top_level, check_assign_blk, return_blk);
+
+    g.beginReservedBlock(check_assign_blk);
+    const assign_tok = try emitGetToken(g, tokens, cur_pos);
+    const assign_is_op = try g.tagTest(assign_tok, "Op");
+    const check_eq_blk = g.reserveBlock();
+    try g.branch(assign_is_op, check_eq_blk, return_blk);
+
+    g.beginReservedBlock(check_eq_blk);
+    const assign_op_val = try g.tagPayload(assign_tok, "Op");
+    const eq_str = try g.constString("=");
+    const is_eq = try g.eq(assign_op_val, eq_str);
+    const assign_blk = g.reserveBlock();
+    try g.branch(is_eq, assign_blk, return_blk);
+
+    g.beginReservedBlock(assign_blk);
+    const assign_next = try emitAdvance(g, cur_pos); // skip =
+    const assign_zero = try g.constInt(0);
+    const assign_rhs_result = try g.callDirect(pf.parse_expr, &.{ tokens, assign_next, assign_zero });
+    const assign_rhs = try g.recordField(assign_rhs_result, "node");
+    const assign_end = try g.recordField(assign_rhs_result, "pos");
+    const assign_rec = try g.record(&.{
+        .{ .name = "target", .value = cur_node },
+        .{ .name = "value", .value = assign_rhs },
+    });
+    const assign_node = try g.tag(ast_assign, assign_rec);
+    const assign_res = try emitResult(g, assign_node, assign_end);
+    try g.ret(assign_res);
+
+    // return: no assignment, return current node
+    g.beginReservedBlock(return_blk);
     const done_res = try emitResult(g, cur_node, cur_pos);
     try g.ret(done_res);
 

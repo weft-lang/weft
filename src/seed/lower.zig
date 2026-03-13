@@ -32,6 +32,9 @@ pub const ir_resume = "IrResume";
 pub const ir_arg_receive = "IrArgReceive";
 pub const ir_string_eq = "IrStringEq";
 pub const ir_string_ne = "IrStringNe";
+pub const ir_store = "IrStore";
+pub const ir_retain = "IrRetain";
+pub const ir_release = "IrRelease";
 
 // ── Terminator tag constants ────────────────────────────────────────────
 pub const ir_ret = "IrRet";
@@ -59,6 +62,8 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
     const f_lower_match_arms = try g.reserveFunc("lc_lower_match_arms");
     const f_lower_fn_decl = try g.reserveFunc("lc_lower_fn_decl");
     const f_lower_handle = try g.reserveFunc("lc_lower_handle");
+    const f_collect_defers = try g.reserveFunc("lc_collect_defers");
+    const f_lower_defers = try g.reserveFunc("lc_lower_defers");
     const f_lower_module = try g.reserveFunc("lc_lower_module");
 
     // ── Generate: lc_state_new() -> LowerState ──────────────────────
@@ -696,9 +701,14 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                     });
                     const tag_inst = try g.tag(ir_tag_init, inst_v);
                     const st_v2 = try g.callDirect(f_emit_inst, &.{ tag_inst, st_v });
+                    // Emit retain for heap-allocated tagged value
+                    const retain_v = try g.tag(ir_retain, try g.record(&.{
+                        .{ .name = "value", .value = dst_v },
+                    }));
+                    const st_v3 = try g.callDirect(f_emit_inst, &.{ retain_v, st_v2 });
                     try g.ret(try g.record(&.{
                         .{ .name = "value", .value = dst_v },
-                        .{ .name = "state", .value = st_v2 },
+                        .{ .name = "state", .value = st_v3 },
                     }));
                 }
             }
@@ -780,9 +790,13 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             });
             const inst = try g.tag(ir_list_init, inst_rec);
             const st2 = try g.callDirect(f_emit_inst, &.{ inst, st1 });
+            const retain_l = try g.tag(ir_retain, try g.record(&.{
+                .{ .name = "value", .value = dst },
+            }));
+            const st3 = try g.callDirect(f_emit_inst, &.{ retain_l, st2 });
             try g.ret(try g.record(&.{
                 .{ .name = "value", .value = dst },
-                .{ .name = "state", .value = st2 },
+                .{ .name = "state", .value = st3 },
             }));
         }
 
@@ -846,9 +860,13 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                 });
                 const inst = try g.tag(ir_record_init, inst_rec);
                 const st_done = try g.callDirect(f_emit_inst, &.{ inst, st_final });
+                const retain_r = try g.tag(ir_retain, try g.record(&.{
+                    .{ .name = "value", .value = dst },
+                }));
+                const st_retained = try g.callDirect(f_emit_inst, &.{ retain_r, st_done });
                 try g.ret(try g.record(&.{
                     .{ .name = "value", .value = dst },
-                    .{ .name = "state", .value = st_done },
+                    .{ .name = "state", .value = st_retained },
                 }));
             }
         }
@@ -1278,8 +1296,88 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             try g.ret(unsafe_result);
         }
 
-        // ── TDefer — for bootstrap, lower the deferred expression inline ──
+        // ── TAssign — lower assignment (variable or pointer write) ──
         g.beginReservedBlock(check_addr_of_expr);
+        const is_assign_ex = try g.tagTest(expr, typeck.tast_assign);
+        const assign_ex_blk = g.reserveBlock();
+        const check_defer_ex2 = g.reserveBlock();
+        try g.branch(is_assign_ex, assign_ex_blk, check_defer_ex2);
+
+        g.beginReservedBlock(assign_ex_blk);
+        {
+            const assign_pl = try g.tagPayload(expr, typeck.tast_assign);
+            const assign_target = try g.recordField(assign_pl, "target");
+            const assign_value = try g.recordField(assign_pl, "value");
+            // Lower the value first
+            const val_result = try g.callDirect(f_lower_expr, &.{ assign_value, scope, state });
+            const val_id = try g.recordField(val_result, "value");
+            const st1 = try g.recordField(val_result, "state");
+
+            // Check if target is an identifier (variable reassignment)
+            const target_is_ident = try g.tagTest(assign_target, typeck.tast_ident);
+            const assign_ident_blk = g.reserveBlock();
+            const assign_deref_blk = g.reserveBlock();
+            try g.branch(target_is_ident, assign_ident_blk, assign_deref_blk);
+
+            // Variable assignment: emit store instruction
+            g.beginReservedBlock(assign_ident_blk);
+            const ident_pl = try g.tagPayload(assign_target, typeck.tast_ident);
+            const ident_name = try g.recordField(ident_pl, "name");
+            // Look up the variable's current value ID in scope
+            const has_var = try g.mapHas(scope, ident_name);
+            const found_var_blk = g.reserveBlock();
+            const assign_fallback_blk = g.reserveBlock();
+            try g.branch(has_var, found_var_blk, assign_fallback_blk);
+
+            g.beginReservedBlock(found_var_blk);
+            const target_val_id = try g.mapGet(scope, ident_name);
+            // Emit IrStore{target, value}
+            const fv2 = try g.callDirect(f_fresh_val, &.{st1});
+            const store_dst = try g.recordField(fv2, "id");
+            const st2 = try g.recordField(fv2, "state");
+            const store_inst_rec = try g.record(&.{
+                .{ .name = "dst", .value = store_dst },
+                .{ .name = "target", .value = target_val_id },
+                .{ .name = "value", .value = val_id },
+            });
+            const store_inst = try g.tag(ir_store, store_inst_rec);
+            const st3 = try g.callDirect(f_emit_inst, &.{ store_inst, st2 });
+            try g.ret(try g.record(&.{
+                .{ .name = "value", .value = val_id },
+                .{ .name = "state", .value = st3 },
+            }));
+
+            // Deref assignment: lower the pointer, emit store
+            g.beginReservedBlock(assign_deref_blk);
+            const deref_inner = try g.tagPayload(assign_target, typeck.tast_deref);
+            const ptr_result = try g.callDirect(f_lower_expr, &.{ deref_inner, scope, st1 });
+            const ptr_id = try g.recordField(ptr_result, "value");
+            const st4 = try g.recordField(ptr_result, "state");
+            const fv3 = try g.callDirect(f_fresh_val, &.{st4});
+            const store_dst2 = try g.recordField(fv3, "id");
+            const st5 = try g.recordField(fv3, "state");
+            const store_inst_rec2 = try g.record(&.{
+                .{ .name = "dst", .value = store_dst2 },
+                .{ .name = "target", .value = ptr_id },
+                .{ .name = "value", .value = val_id },
+            });
+            const store_inst2 = try g.tag(ir_store, store_inst_rec2);
+            const st6 = try g.callDirect(f_emit_inst, &.{ store_inst2, st5 });
+            try g.ret(try g.record(&.{
+                .{ .name = "value", .value = val_id },
+                .{ .name = "state", .value = st6 },
+            }));
+
+            // Fallback: just return the value (unknown target type)
+            g.beginReservedBlock(assign_fallback_blk);
+            try g.ret(try g.record(&.{
+                .{ .name = "value", .value = val_id },
+                .{ .name = "state", .value = st1 },
+            }));
+        }
+
+        // ── TDefer — for bootstrap, lower the deferred expression inline ──
+        g.beginReservedBlock(check_defer_ex2);
         const is_defer_ex = try g.tagTest(expr, typeck.tast_defer);
         const defer_ex_blk = g.reserveBlock();
         const check_addr_of_expr2 = g.reserveBlock();
@@ -1287,9 +1385,20 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
         g.beginReservedBlock(defer_ex_blk);
         {
-            const defer_inner = try g.tagPayload(expr, typeck.tast_defer);
-            const defer_result = try g.callDirect(f_lower_expr, &.{ defer_inner, scope, state });
-            try g.ret(defer_result);
+            // Defer is a no-op at the defer site — the deferred expression
+            // is collected and lowered at scope exit (in lc_lower_fn_decl).
+            const fv = try g.callDirect(f_fresh_val, &.{state});
+            const dst = try g.recordField(fv, "id");
+            const st1 = try g.recordField(fv, "state");
+            const nil_inst_rec = try g.record(&.{
+                .{ .name = "dst", .value = dst },
+            });
+            const nil_inst = try g.tag(ir_const_nil, nil_inst_rec);
+            const st2 = try g.callDirect(f_emit_inst, &.{ nil_inst, st1 });
+            try g.ret(try g.record(&.{
+                .{ .name = "value", .value = dst },
+                .{ .name = "state", .value = st2 },
+            }));
         }
 
         // ── TAddrOf — for bootstrap, lower inner expression (value is the "pointer") ──
@@ -1666,9 +1775,13 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                 });
                 const vc_inst = try g.tag(ir_tag_init, vc_inst_rec);
                 const vc_st2 = try g.callDirect(f_emit_inst, &.{ vc_inst, vc_st_final });
+                const vc_retain = try g.tag(ir_retain, try g.record(&.{
+                    .{ .name = "value", .value = vc_dst },
+                }));
+                const vc_st3 = try g.callDirect(f_emit_inst, &.{ vc_retain, vc_st2 });
                 try g.ret(try g.record(&.{
                     .{ .name = "value", .value = vc_dst },
-                    .{ .name = "state", .value = vc_st2 },
+                    .{ .name = "state", .value = vc_st3 },
                 }));
             }
 
@@ -2684,6 +2797,136 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
     }
     try g.endReservedFunc(f_lower_handle);
 
+    // ── Generate: lc_collect_defers(expr) -> List<TypedExpr> ─────────
+    // Walk a typed AST and collect TDefer inner expressions (top-level only).
+    try g.beginReservedFunc("lc_collect_defers");
+    {
+        const expr = try g.addParam();
+        _ = g.beginBlock();
+        const empty = try g.listInit(&.{});
+
+        // If expr is TDefer, return the inner expression in a list
+        const is_defer = try g.tagTest(expr, typeck.tast_defer);
+        const defer_blk = g.reserveBlock();
+        const check_block_blk = g.reserveBlock();
+        try g.branch(is_defer, defer_blk, check_block_blk);
+
+        g.beginReservedBlock(defer_blk);
+        const defer_inner = try g.tagPayload(expr, typeck.tast_defer);
+        const single = try g.listAppend(empty, defer_inner);
+        try g.ret(single);
+
+        // If expr is TBlock, scan its statements for defers
+        g.beginReservedBlock(check_block_blk);
+        const is_block = try g.tagTest(expr, typeck.tast_block);
+        const block_blk = g.reserveBlock();
+        const no_defers_blk = g.reserveBlock();
+        try g.branch(is_block, block_blk, no_defers_blk);
+
+        g.beginReservedBlock(block_blk);
+        {
+            // TBlock payload is a list of typed statements (not a record)
+            const stmts = try g.tagPayload(expr, typeck.tast_block);
+            const stmts_len = try g.listLength(stmts);
+            const zero = try g.constInt(0);
+            const collect_loop = g.reserveBlock();
+            try g.jump(collect_loop, &.{ zero, empty });
+
+            g.beginReservedBlock(collect_loop);
+            const ci = try g.addBlockParam();
+            const acc = try g.addBlockParam();
+            const ci_done = try g.ge(ci, stmts_len);
+            const ci_body = g.reserveBlock();
+            const ci_exit = g.reserveBlock();
+            try g.branch(ci_done, ci_exit, ci_body);
+
+            g.beginReservedBlock(ci_body);
+            const stmt = try g.listNth(stmts, ci);
+            const stmt_defers = try g.callDirect(f_collect_defers, &.{stmt});
+            // Concatenate (append each element)
+            const sd_len = try g.listLength(stmt_defers);
+            const sd_zero = try g.constInt(0);
+            const concat_loop = g.reserveBlock();
+            try g.jump(concat_loop, &.{ sd_zero, acc });
+
+            g.beginReservedBlock(concat_loop);
+            const sdi = try g.addBlockParam();
+            const sd_acc = try g.addBlockParam();
+            const sdi_done = try g.ge(sdi, sd_len);
+            const sdi_body = g.reserveBlock();
+            const sdi_exit = g.reserveBlock();
+            try g.branch(sdi_done, sdi_exit, sdi_body);
+
+            g.beginReservedBlock(sdi_body);
+            const sd_item = try g.listNth(stmt_defers, sdi);
+            const sd_acc2 = try g.listAppend(sd_acc, sd_item);
+            const sd_one = try g.constInt(1);
+            const sd_next = try g.add(sdi, sd_one);
+            try g.jump(concat_loop, &.{ sd_next, sd_acc2 });
+
+            g.beginReservedBlock(sdi_exit);
+            const one = try g.constInt(1);
+            const ci_next = try g.add(ci, one);
+            try g.jump(collect_loop, &.{ ci_next, sd_acc });
+
+            g.beginReservedBlock(ci_exit);
+            try g.ret(acc);
+        }
+
+        // Default: no defers
+        g.beginReservedBlock(no_defers_blk);
+        try g.ret(empty);
+    }
+    try g.endReservedFunc(f_collect_defers);
+
+    // ── Generate: lc_lower_defers(defers, scope, state) -> state ──────
+    // Lower deferred expressions in LIFO order.
+    try g.beginReservedFunc("lc_lower_defers");
+    {
+        const defers = try g.addParam();
+        const scope = try g.addParam();
+        const state = try g.addParam();
+        _ = g.beginBlock();
+
+        const defers_len = try g.listLength(defers);
+        const zero = try g.constInt(0);
+        const is_empty = try g.eq(defers_len, zero);
+        const empty_blk = g.reserveBlock();
+        const loop_blk = g.reserveBlock();
+        try g.branch(is_empty, empty_blk, loop_blk);
+
+        g.beginReservedBlock(empty_blk);
+        try g.ret(state);
+
+        // Iterate in reverse (LIFO): start from len-1, go to 0
+        g.beginReservedBlock(loop_blk);
+        const one = try g.constInt(1);
+        const start_idx = try g.sub(defers_len, one);
+        const rev_loop = g.reserveBlock();
+        try g.jump(rev_loop, &.{ start_idx, state });
+
+        g.beginReservedBlock(rev_loop);
+        const di = try g.addBlockParam();
+        const cur_state = try g.addBlockParam();
+        // Lower the deferred expression
+        const defer_expr = try g.listNth(defers, di);
+        const defer_r = try g.callDirect(f_lower_expr, &.{ defer_expr, scope, cur_state });
+        const next_state = try g.recordField(defer_r, "state");
+        // Check if we're done (di == 0)
+        const di_is_zero = try g.eq(di, zero);
+        const rev_done = g.reserveBlock();
+        const rev_continue = g.reserveBlock();
+        try g.branch(di_is_zero, rev_done, rev_continue);
+
+        g.beginReservedBlock(rev_done);
+        try g.ret(next_state);
+
+        g.beginReservedBlock(rev_continue);
+        const next_di = try g.sub(di, one);
+        try g.jump(rev_loop, &.{ next_di, next_state });
+    }
+    try g.endReservedFunc(f_lower_defers);
+
     // ── Generate: lc_lower_fn_decl(decl, state) -> state ────────────
     try g.beginReservedFunc("lc_lower_fn_decl");
     {
@@ -2742,17 +2985,23 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
         g.beginReservedBlock(p_exit);
         {
+            // Collect deferred expressions from the body AST
+            const fn_defers = try g.callDirect(f_collect_defers, &.{fn_body});
+
             // Lower body
             const body_r = try g.callDirect(f_lower_expr, &.{ fn_body, p_scope, p_state });
             const body_val = try g.recordField(body_r, "value");
             const st_body = try g.recordField(body_r, "state");
+
+            // Lower deferred expressions in LIFO order before return
+            const st_deferred = try g.callDirect(f_lower_defers, &.{ fn_defers, p_scope, st_body });
 
             // End block with return
             const ret_rec = try g.record(&.{
                 .{ .name = "value", .value = body_val },
             });
             const ret_term = try g.tag(ir_ret, ret_rec);
-            const st_ended = try g.callDirect(f_end_block, &.{ ret_term, st_body });
+            const st_ended = try g.callDirect(f_end_block, &.{ ret_term, st_deferred });
 
             // Create function record
             const fn_blocks = try g.recordField(st_ended, "blocks");
