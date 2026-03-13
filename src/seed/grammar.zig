@@ -3667,16 +3667,63 @@ fn genParseTypeDecl(g: *Gen, pf: ParserFuncs) !void {
     const vn_args_blk = g.reserveBlock();
     try g.branch(vn_is_lp, vn_args_blk, vn_no_args_blk);
 
-    // variant with type args
+    // variant with type args — parse comma-separated list of types until )
     g.beginReservedBlock(vn_args_blk);
     const va_start = try emitAdvance(g, v_next); // skip (
-    const va_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, va_start });
-    const va_type = try g.recordField(va_result, "node");
-    const va_end = try g.recordField(va_result, "pos");
-    const va_after_rp = try emitAdvance(g, va_end); // skip )
+    const va_types_empty = try g.listInit(&.{});
+    const va_loop_blk = g.reserveBlock();
+    try g.jump(va_loop_blk, &.{ va_start, va_types_empty });
+
+    g.beginReservedBlock(va_loop_blk);
+    const vl_pos = try g.addBlockParam();
+    const vl_types = try g.addBlockParam();
+    // Check for ) to end the list
+    const vl_tok = try emitGetToken(g, tokens, vl_pos);
+    const vl_is_delim = try g.tagTest(vl_tok, "Delim");
+    const vl_check_rp_blk = g.reserveBlock();
+    const vl_parse_blk = g.reserveBlock();
+    try g.branch(vl_is_delim, vl_check_rp_blk, vl_parse_blk);
+
+    g.beginReservedBlock(vl_check_rp_blk);
+    const vl_delim = try g.tagPayload(vl_tok, "Delim");
+    const vl_rparen = try g.constString(")");
+    const vl_is_rp = try g.eq(vl_delim, vl_rparen);
+    const vl_done_blk = g.reserveBlock();
+    try g.branch(vl_is_rp, vl_done_blk, vl_parse_blk);
+
+    // Parse a type expression and append to list
+    g.beginReservedBlock(vl_parse_blk);
+    const vl_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, vl_pos });
+    const vl_type = try g.recordField(vl_result, "node");
+    const vl_next = try g.recordField(vl_result, "pos");
+    const vl_types2 = try g.listAppend(vl_types, vl_type);
+    // Check for comma
+    const vlc_tok = try emitGetToken(g, tokens, vl_next);
+    const vlc_is_punct = try g.tagTest(vlc_tok, "Punct");
+    const vlc_check_blk = g.reserveBlock();
+    const vlc_no_blk = g.reserveBlock();
+    try g.branch(vlc_is_punct, vlc_check_blk, vlc_no_blk);
+
+    g.beginReservedBlock(vlc_check_blk);
+    const vlc_val = try g.tagPayload(vlc_tok, "Punct");
+    const vlc_comma = try g.constString(",");
+    const vlc_is_c = try g.eq(vlc_val, vlc_comma);
+    const vlc_skip_blk = g.reserveBlock();
+    try g.branch(vlc_is_c, vlc_skip_blk, vlc_no_blk);
+
+    g.beginReservedBlock(vlc_skip_blk);
+    const vlc_after = try emitAdvance(g, vl_next);
+    try g.jump(va_loop_blk, &.{ vlc_after, vl_types2 });
+
+    g.beginReservedBlock(vlc_no_blk);
+    try g.jump(va_loop_blk, &.{ vl_next, vl_types2 });
+
+    // Done: all type args parsed, skip )
+    g.beginReservedBlock(vl_done_blk);
+    const va_after_rp = try emitAdvance(g, vl_pos); // skip )
     const va_rec = try g.record(&.{
         .{ .name = "name", .value = vname },
-        .{ .name = "payload_type", .value = va_type },
+        .{ .name = "payload_type", .value = vl_types },
     });
     const va_variants = try g.listAppend(v_variants, va_rec);
     // Skip optional comma
