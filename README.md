@@ -29,7 +29,7 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 - **Set-theoretic types** -- types are sets. Union (`i64 | str`), intersection (`Display & Eq`), complement (`~nil`). Subtyping is set inclusion. Pattern matching narrows by set difference. One algebra for everything.
 - **Algebraic effects** -- every side effect is declared in the function's type. Pure functions are proven pure by the compiler. Effects subsume error handling, async, iterators, and concurrency under one mechanism.
-- **Explicit memory** -- no GC, no hidden allocations. `rc T` for opt-in deterministic reference counting. `defer` for cleanup. Allocation is an effect -- handlers choose the strategy (arena, system allocator, etc.).
+- **Managed by default, manual when needed** -- heap values use deterministic reference counting automatically. No annotation, no GC. When you need control, raw pointers and explicit allocators are available within the language via the `Alloc` and `Unsafe` effects.
 - **Memory-safe by default** -- code without the `Unsafe` effect cannot perform pointer arithmetic or type-punning. `Unsafe` propagates through the type system, making trust boundaries visible and auditable. No borrow checker -- safety comes from the effect system instead.
 - **Immutable by default** -- `let` is immutable. `mut` is opt-in. The compiler exploits immutability for reordering, caching, and parallelism.
 
@@ -103,24 +103,30 @@ fn describe(val: i64 | str | nil) -> str {
 -- After matching str, remaining type is (i64 | str | nil) & ~str = i64 | nil
 ```
 
-### Memory is explicit, safety is typed
+### Memory: managed by default, the floor drops out
 
 ```weft
--- Safe: rc values, stack values, defer
-let config: rc Config = rc Config.default()
-let alias = config  -- rc increment, not a copy
+-- Application code: RC is automatic, just write code
+fn parse(source: str) -> Ast {
+  let tokens = List.new()   -- heap-allocated, RC-managed
+  Ast { decls: List.new() }
+}
 
--- Safe: pointer dereference
-let x: i64 = 42
-let p: *i64 = &x
-let val = p.*       -- safe read
+-- Performance-critical: explicit allocation strategy
+fn parse_fast(source: str) -[Alloc]> Ast {
+  let tokens = List.new()   -- allocated from arena
+  Ast { decls: List.new() }
+}
 
--- Unsafe: pointer arithmetic (requires Unsafe effect)
+-- Systems code: raw pointers, manual memory
 fn write_at[T](buf: *mut T, index: usize, val: T) -[Unsafe]> nil {
   let ptr = Unsafe.raw_offset(buf, index)
   ptr.* = val
 }
 ```
+
+The effect signature tells you which level you're at. `-> T` is managed.
+`-[Alloc]>` controls allocation strategy. `-[Unsafe]>` is raw.
 
 ## Architecture
 
