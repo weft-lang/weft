@@ -1259,6 +1259,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                 .{ .name = "lhs", .value = lhs_typed },
                 .{ .name = "rhs", .value = rhs_typed },
                 .{ .name = "type", .value = result_type },
+                .{ .name = "lhs_type", .value = lhs_type },
             });
             const texpr = try g.tag(tast_binop, typed);
             try g.ret(try g.record(&.{

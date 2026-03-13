@@ -27,6 +27,9 @@ pub const ir_handle_pop = "IrHandlePop";
 pub const ir_perform = "IrPerform";
 pub const ir_resume = "IrResume";
 pub const ir_arg_receive = "IrArgReceive";
+pub const ir_string_eq = "IrStringEq";
+pub const ir_string_ne = "IrStringNe";
+pub const ir_record_update = "IrRecordUpdate";
 
 pub const ir_ret = "IrRet";
 pub const ir_jump = "IrJump";
@@ -1480,8 +1483,273 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         });
         try g.ret(bin_final_result);
 
-        // Not binary: check const_bool
+        // Not binary: check string_eq
         g.beginReservedBlock(blk_not_binary);
+        const is_str_eq = try g.tagTest(inst, ir_string_eq);
+        const blk_str_eq = g.reserveBlock();
+        const blk_not_str_eq = g.reserveBlock();
+        try g.branch(is_str_eq, blk_str_eq, blk_not_str_eq);
+
+        // ── IrStringEq: inline string comparison ──
+        // Emits ~23 aarch64 instructions: compare lengths, then compare data word-by-word
+        g.beginReservedBlock(blk_str_eq);
+        {
+            const se_payload = try g.tagPayload(inst, ir_string_eq);
+            const se_dst = try g.recordField(se_payload, "dst");
+            const se_lhs = try g.recordField(se_payload, "lhs");
+            const se_rhs = try g.recordField(se_payload, "rhs");
+
+            // Alloc reg for dst
+            const se_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, se_dst });
+            const se_rd_raw = try g.recordField(se_alloc, "reg");
+            const se_ctx = try g.recordField(se_alloc, "ctx");
+
+            // Get regs for lhs, rhs
+            const se_rn_raw = try g.callDirect(f_get_reg, &.{ se_ctx, se_lhs });
+            const se_rm_raw = try g.callDirect(f_get_reg, &.{ se_ctx, se_rhs });
+
+            // Load spilled operands into x16 (lhs) and x17 (rhs)
+            const c16_se = try g.constInt(16);
+            const c17_se = try g.constInt(17);
+            const se_lhs_load = try g.callDirect(f_load_spill, &.{ bytes, se_rn_raw, c16_se });
+            const se_b1 = try g.recordField(se_lhs_load, "bytes");
+            const se_rn = try g.recordField(se_lhs_load, "reg");
+            const se_rhs_load = try g.callDirect(f_load_spill, &.{ se_b1, se_rm_raw, c17_se });
+            const se_b2 = try g.recordField(se_rhs_load, "bytes");
+            const se_rm = try g.recordField(se_rhs_load, "reg");
+
+            // Determine dst register (use x6 as temp if spilled)
+            const c100_se = try g.constInt(100);
+            const se_dst_spilled = try g.ge(se_rd_raw, c100_se);
+            const se_spill_blk = g.reserveBlock();
+            const se_phys_blk = g.reserveBlock();
+            const se_merge_blk = g.reserveBlock();
+            try g.branch(se_dst_spilled, se_spill_blk, se_phys_blk);
+            g.beginReservedBlock(se_spill_blk);
+            const c6_se = try g.constInt(6);
+            try g.jump(se_merge_blk, &.{c6_se});
+            g.beginReservedBlock(se_phys_blk);
+            try g.jump(se_merge_blk, &.{se_rd_raw});
+            g.beginReservedBlock(se_merge_blk);
+            const se_rd = try g.addBlockParam();
+
+            // Register constants (also used as immediates where value matches)
+            const c0 = try g.constInt(0);
+            const c1_se = try g.constInt(1);
+            const c2_se = try g.constInt(2);
+            const c3_se = try g.constInt(3);
+            const c4_se = try g.constInt(4);
+            const c5_se = try g.constInt(5);
+            const c31 = try g.constInt(31); // XZR
+            const c7_se = try g.constInt(7);
+            const c8_se = try g.constInt(8);
+
+            // Instr 0: LDR x0, [Rn, #8]  — lhs.len
+            const se_i0 = try g.callDirect(f_encode_ldr, &.{ c0, se_rn, c8_se });
+            const se_b3 = try g.callDirect(f_append_inst, &.{ se_b2, se_i0 });
+            // Instr 1: LDR x1, [Rm, #8]  — rhs.len
+            const se_i1 = try g.callDirect(f_encode_ldr, &.{ c1_se, se_rm, c8_se });
+            const se_b4 = try g.callDirect(f_append_inst, &.{ se_b3, se_i1 });
+            // Instr 2: CMP x0, x1
+            const se_i2 = try g.callDirect(f_encode_cmp_reg, &.{ c0, c1_se });
+            const se_b5 = try g.callDirect(f_append_inst, &.{ se_b4, se_i2 });
+            // Instr 3: B.NE +76  → not_equal (instr 22, offset=(22-3)*4=76)
+            const c76 = try g.constInt(76);
+            const se_i3 = try g.callDirect(f_encode_b_cond, &.{ c76, c1_se }); // NE=1
+            const se_b6 = try g.callDirect(f_append_inst, &.{ se_b5, se_i3 });
+            // Instr 4: LDR x2, [Rn, #0]  — lhs.ptr
+            const se_i4 = try g.callDirect(f_encode_ldr, &.{ c2_se, se_rn, c0 });
+            const se_b7 = try g.callDirect(f_append_inst, &.{ se_b6, se_i4 });
+            // Instr 5: LDR x3, [Rm, #0]  — rhs.ptr
+            const se_i5 = try g.callDirect(f_encode_ldr, &.{ c3_se, se_rm, c0 });
+            const se_b8 = try g.callDirect(f_append_inst, &.{ se_b7, se_i5 });
+            // Instr 6: ADD x0, x0, #7
+            const se_i6 = try g.callDirect(f_encode_add_imm, &.{ c0, c0, c7_se });
+            const se_b9 = try g.callDirect(f_append_inst, &.{ se_b8, se_i6 });
+            // Instr 7: MOVZ x1, #8
+            const se_i7 = try g.callDirect(f_encode_movz, &.{ c1_se, c8_se, c0 });
+            const se_b10 = try g.callDirect(f_append_inst, &.{ se_b9, se_i7 });
+            // Instr 8: SDIV x0, x0, x1  — num_words = (len+7)/8
+            const se_i8 = try g.callDirect(f_encode_sdiv, &.{ c0, c0, c1_se });
+            const se_b11 = try g.callDirect(f_append_inst, &.{ se_b10, se_i8 });
+            // Instr 9: CMP x0, XZR  — check if 0 words
+            const se_i9 = try g.callDirect(f_encode_cmp_reg, &.{ c0, c31 });
+            const se_b12 = try g.callDirect(f_append_inst, &.{ se_b11, se_i9 });
+            // Instr 10: B.EQ +40  → equal (instr 20, offset=(20-10)*4=40)
+            const c40 = try g.constInt(40);
+            const se_i10 = try g.callDirect(f_encode_b_cond, &.{ c40, c0 }); // EQ=0
+            const se_b13 = try g.callDirect(f_append_inst, &.{ se_b12, se_i10 });
+            // Instr 11: LDR x4, [x2, #0]  — load lhs word (loop start)
+            const se_i11 = try g.callDirect(f_encode_ldr, &.{ c4_se, c2_se, c0 });
+            const se_b14 = try g.callDirect(f_append_inst, &.{ se_b13, se_i11 });
+            // Instr 12: LDR x5, [x3, #0]  — load rhs word
+            const se_i12 = try g.callDirect(f_encode_ldr, &.{ c5_se, c3_se, c0 });
+            const se_b15 = try g.callDirect(f_append_inst, &.{ se_b14, se_i12 });
+            // Instr 13: CMP x4, x5
+            const se_i13 = try g.callDirect(f_encode_cmp_reg, &.{ c4_se, c5_se });
+            const se_b16 = try g.callDirect(f_append_inst, &.{ se_b15, se_i13 });
+            // Instr 14: B.NE +32  → not_equal (instr 22, offset=(22-14)*4=32)
+            const c32_se = try g.constInt(32);
+            const se_i14 = try g.callDirect(f_encode_b_cond, &.{ c32_se, c1_se }); // NE=1
+            const se_b17 = try g.callDirect(f_append_inst, &.{ se_b16, se_i14 });
+            // Instr 15: ADD x2, x2, #8  — advance lhs ptr
+            const se_i15 = try g.callDirect(f_encode_add_imm, &.{ c2_se, c2_se, c8_se });
+            const se_b18 = try g.callDirect(f_append_inst, &.{ se_b17, se_i15 });
+            // Instr 16: ADD x3, x3, #8  — advance rhs ptr
+            const se_i16 = try g.callDirect(f_encode_add_imm, &.{ c3_se, c3_se, c8_se });
+            const se_b19 = try g.callDirect(f_append_inst, &.{ se_b18, se_i16 });
+            // Instr 17: SUB x0, x0, #1  — decrement word count
+            const se_i17 = try g.callDirect(f_encode_sub_imm, &.{ c0, c0, c1_se });
+            const se_b20 = try g.callDirect(f_append_inst, &.{ se_b19, se_i17 });
+            // Instr 18: CMP x0, XZR  — check if done
+            const se_i18 = try g.callDirect(f_encode_cmp_reg, &.{ c0, c31 });
+            const se_b21 = try g.callDirect(f_append_inst, &.{ se_b20, se_i18 });
+            // Instr 19: B.NE -32  → loop (instr 11, offset=(11-19)*4=-32)
+            // Negative offset: -32 as signed will be masked to 19-bit two's complement
+            const cn32 = try g.constInt(-32);
+            const se_i19 = try g.callDirect(f_encode_b_cond, &.{ cn32, c1_se }); // NE=1
+            const se_b22 = try g.callDirect(f_append_inst, &.{ se_b21, se_i19 });
+            // Instr 20: MOVZ Rd, #1  — equal
+            const se_i20 = try g.callDirect(f_encode_movz, &.{ se_rd, c1_se, c0 });
+            const se_b23 = try g.callDirect(f_append_inst, &.{ se_b22, se_i20 });
+            // Instr 21: B +8  → done (instr 23, offset=(23-21)*4=8)
+            const se_i21 = try g.callDirect(f_encode_b, &.{c8_se});
+            const se_b24 = try g.callDirect(f_append_inst, &.{ se_b23, se_i21 });
+            // Instr 22: MOVZ Rd, #0  — not_equal
+            const se_i22 = try g.callDirect(f_encode_movz, &.{ se_rd, c0, c0 });
+            const se_b25 = try g.callDirect(f_append_inst, &.{ se_b24, se_i22 });
+            // Instr 23 is the done point (next instruction after)
+
+            // Store result to spill slot if dst is spilled
+            const se_final = try g.callDirect(f_store_spill, &.{ se_b25, se_rd_raw, se_rd });
+            const se_result = try g.record(&.{
+                .{ .name = "bytes", .value = se_final },
+                .{ .name = "ctx", .value = se_ctx },
+            });
+            try g.ret(se_result);
+        }
+
+        // Not string_eq: check string_ne
+        g.beginReservedBlock(blk_not_str_eq);
+        const is_str_ne = try g.tagTest(inst, ir_string_ne);
+        const blk_str_ne = g.reserveBlock();
+        const blk_not_str_ne = g.reserveBlock();
+        try g.branch(is_str_ne, blk_str_ne, blk_not_str_ne);
+
+        // ── IrStringNe: same as IrStringEq but with result inverted ──
+        g.beginReservedBlock(blk_str_ne);
+        {
+            const sn_payload = try g.tagPayload(inst, ir_string_ne);
+            const sn_dst = try g.recordField(sn_payload, "dst");
+            const sn_lhs = try g.recordField(sn_payload, "lhs");
+            const sn_rhs = try g.recordField(sn_payload, "rhs");
+
+            const sn_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, sn_dst });
+            const sn_rd_raw = try g.recordField(sn_alloc, "reg");
+            const sn_ctx = try g.recordField(sn_alloc, "ctx");
+
+            const sn_rn_raw = try g.callDirect(f_get_reg, &.{ sn_ctx, sn_lhs });
+            const sn_rm_raw = try g.callDirect(f_get_reg, &.{ sn_ctx, sn_rhs });
+
+            const c16_sn = try g.constInt(16);
+            const c17_sn = try g.constInt(17);
+            const sn_lhs_load = try g.callDirect(f_load_spill, &.{ bytes, sn_rn_raw, c16_sn });
+            const sn_b1 = try g.recordField(sn_lhs_load, "bytes");
+            const sn_rn = try g.recordField(sn_lhs_load, "reg");
+            const sn_rhs_load = try g.callDirect(f_load_spill, &.{ sn_b1, sn_rm_raw, c17_sn });
+            const sn_b2 = try g.recordField(sn_rhs_load, "bytes");
+            const sn_rm = try g.recordField(sn_rhs_load, "reg");
+
+            const c100_sn = try g.constInt(100);
+            const sn_dst_spilled = try g.ge(sn_rd_raw, c100_sn);
+            const sn_spill_blk = g.reserveBlock();
+            const sn_phys_blk = g.reserveBlock();
+            const sn_merge_blk = g.reserveBlock();
+            try g.branch(sn_dst_spilled, sn_spill_blk, sn_phys_blk);
+            g.beginReservedBlock(sn_spill_blk);
+            const c6_sn = try g.constInt(6);
+            try g.jump(sn_merge_blk, &.{c6_sn});
+            g.beginReservedBlock(sn_phys_blk);
+            try g.jump(sn_merge_blk, &.{sn_rd_raw});
+            g.beginReservedBlock(sn_merge_blk);
+            const sn_rd = try g.addBlockParam();
+
+            // Same comparison as IrStringEq but swap equal/not_equal results
+            const sn_c0 = try g.constInt(0);
+            const sn_c1 = try g.constInt(1);
+            const sn_c2 = try g.constInt(2);
+            const sn_c3 = try g.constInt(3);
+            const sn_c4 = try g.constInt(4);
+            const sn_c5 = try g.constInt(5);
+            const sn_c31 = try g.constInt(31);
+            const sn_c7 = try g.constInt(7);
+            const sn_c8 = try g.constInt(8);
+
+            const sn_i0 = try g.callDirect(f_encode_ldr, &.{ sn_c0, sn_rn, sn_c8 });
+            const sn_b3 = try g.callDirect(f_append_inst, &.{ sn_b2, sn_i0 });
+            const sn_i1 = try g.callDirect(f_encode_ldr, &.{ sn_c1, sn_rm, sn_c8 });
+            const sn_b4 = try g.callDirect(f_append_inst, &.{ sn_b3, sn_i1 });
+            const sn_i2 = try g.callDirect(f_encode_cmp_reg, &.{ sn_c0, sn_c1 });
+            const sn_b5 = try g.callDirect(f_append_inst, &.{ sn_b4, sn_i2 });
+            // B.NE → not_equal → result=1 (strings ARE not-equal)
+            const sn_c76 = try g.constInt(76);
+            const sn_i3 = try g.callDirect(f_encode_b_cond, &.{ sn_c76, sn_c1 });
+            const sn_b6 = try g.callDirect(f_append_inst, &.{ sn_b5, sn_i3 });
+            const sn_i4 = try g.callDirect(f_encode_ldr, &.{ sn_c2, sn_rn, sn_c0 });
+            const sn_b7 = try g.callDirect(f_append_inst, &.{ sn_b6, sn_i4 });
+            const sn_i5 = try g.callDirect(f_encode_ldr, &.{ sn_c3, sn_rm, sn_c0 });
+            const sn_b8 = try g.callDirect(f_append_inst, &.{ sn_b7, sn_i5 });
+            const sn_i6 = try g.callDirect(f_encode_add_imm, &.{ sn_c0, sn_c0, sn_c7 });
+            const sn_b9 = try g.callDirect(f_append_inst, &.{ sn_b8, sn_i6 });
+            const sn_i7 = try g.callDirect(f_encode_movz, &.{ sn_c1, sn_c8, sn_c0 });
+            const sn_b10 = try g.callDirect(f_append_inst, &.{ sn_b9, sn_i7 });
+            const sn_i8 = try g.callDirect(f_encode_sdiv, &.{ sn_c0, sn_c0, sn_c1 });
+            const sn_b11 = try g.callDirect(f_append_inst, &.{ sn_b10, sn_i8 });
+            const sn_i9 = try g.callDirect(f_encode_cmp_reg, &.{ sn_c0, sn_c31 });
+            const sn_b12 = try g.callDirect(f_append_inst, &.{ sn_b11, sn_i9 });
+            // B.EQ → equal → result=0 (strings are equal, so NOT not-equal)
+            const sn_c40 = try g.constInt(40);
+            const sn_i10 = try g.callDirect(f_encode_b_cond, &.{ sn_c40, sn_c0 });
+            const sn_b13 = try g.callDirect(f_append_inst, &.{ sn_b12, sn_i10 });
+            const sn_i11 = try g.callDirect(f_encode_ldr, &.{ sn_c4, sn_c2, sn_c0 });
+            const sn_b14 = try g.callDirect(f_append_inst, &.{ sn_b13, sn_i11 });
+            const sn_i12 = try g.callDirect(f_encode_ldr, &.{ sn_c5, sn_c3, sn_c0 });
+            const sn_b15 = try g.callDirect(f_append_inst, &.{ sn_b14, sn_i12 });
+            const sn_i13 = try g.callDirect(f_encode_cmp_reg, &.{ sn_c4, sn_c5 });
+            const sn_b16 = try g.callDirect(f_append_inst, &.{ sn_b15, sn_i13 });
+            const sn_c32 = try g.constInt(32);
+            const sn_i14 = try g.callDirect(f_encode_b_cond, &.{ sn_c32, sn_c1 });
+            const sn_b17 = try g.callDirect(f_append_inst, &.{ sn_b16, sn_i14 });
+            const sn_i15 = try g.callDirect(f_encode_add_imm, &.{ sn_c2, sn_c2, sn_c8 });
+            const sn_b18 = try g.callDirect(f_append_inst, &.{ sn_b17, sn_i15 });
+            const sn_i16 = try g.callDirect(f_encode_add_imm, &.{ sn_c3, sn_c3, sn_c8 });
+            const sn_b19 = try g.callDirect(f_append_inst, &.{ sn_b18, sn_i16 });
+            const sn_i17 = try g.callDirect(f_encode_sub_imm, &.{ sn_c0, sn_c0, sn_c1 });
+            const sn_b20 = try g.callDirect(f_append_inst, &.{ sn_b19, sn_i17 });
+            const sn_i18 = try g.callDirect(f_encode_cmp_reg, &.{ sn_c0, sn_c31 });
+            const sn_b21 = try g.callDirect(f_append_inst, &.{ sn_b20, sn_i18 });
+            const sn_cn32 = try g.constInt(-32);
+            const sn_i19 = try g.callDirect(f_encode_b_cond, &.{ sn_cn32, sn_c1 });
+            const sn_b22 = try g.callDirect(f_append_inst, &.{ sn_b21, sn_i19 });
+            // equal → result=0 (for !=, equal strings means false)
+            const sn_i20 = try g.callDirect(f_encode_movz, &.{ sn_rd, sn_c0, sn_c0 });
+            const sn_b23 = try g.callDirect(f_append_inst, &.{ sn_b22, sn_i20 });
+            const sn_i21 = try g.callDirect(f_encode_b, &.{sn_c8});
+            const sn_b24 = try g.callDirect(f_append_inst, &.{ sn_b23, sn_i21 });
+            // not_equal → result=1 (for !=, different strings means true)
+            const sn_i22 = try g.callDirect(f_encode_movz, &.{ sn_rd, sn_c1, sn_c0 });
+            const sn_b25 = try g.callDirect(f_append_inst, &.{ sn_b24, sn_i22 });
+
+            const sn_final = try g.callDirect(f_store_spill, &.{ sn_b25, sn_rd_raw, sn_rd });
+            const sn_result = try g.record(&.{
+                .{ .name = "bytes", .value = sn_final },
+                .{ .name = "ctx", .value = sn_ctx },
+            });
+            try g.ret(sn_result);
+        }
+
+        // Not string_ne: check const_bool
+        g.beginReservedBlock(blk_not_str_ne);
         const is_const_bool = try g.tagTest(inst, ir_const_bool);
         const blk_const_bool = g.reserveBlock();
         const blk_not_const_bool = g.reserveBlock();
@@ -3535,7 +3803,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const cbz_off_shifted = try g.binary(.shl, cbz_off_masked, cbz_c5);
             const cbz_r1 = try g.binary(.bit_or, cbz_base, cbz_off_shifted);
             const cbz_enc = try g.binary(.bit_or, cbz_r1, br_cond_reg);
-            const br_bytes = try g.callDirect(f_append_inst, &.{ bytes, cbz_enc });
+            const br_bytes = try g.callDirect(f_append_inst, &.{ br_bytes_loaded, cbz_enc });
             // Then block is next (fall-through), no need for extra B
             const br_result = try g.record(&.{
                 .{ .name = "bytes", .value = br_bytes },

@@ -30,6 +30,8 @@ pub const ir_handle_setup = "IrHandleSetup";
 pub const ir_handle_pop = "IrHandlePop";
 pub const ir_resume = "IrResume";
 pub const ir_arg_receive = "IrArgReceive";
+pub const ir_string_eq = "IrStringEq";
+pub const ir_string_ne = "IrStringNe";
 
 // ── Terminator tag constants ────────────────────────────────────────────
 pub const ir_ret = "IrRet";
@@ -414,6 +416,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const op = try g.recordField(payload, "op");
             const lhs = try g.recordField(payload, "lhs");
             const rhs = try g.recordField(payload, "rhs");
+            const lhs_type = try g.recordField(payload, "lhs_type");
             // Lower lhs
             const lhs_r = try g.callDirect(f_lower_expr, &.{ lhs, scope, state });
             const lhs_val = try g.recordField(lhs_r, "value");
@@ -422,22 +425,76 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const rhs_r = try g.callDirect(f_lower_expr, &.{ rhs, scope, st1 });
             const rhs_val = try g.recordField(rhs_r, "value");
             const st2 = try g.recordField(rhs_r, "state");
-            // Emit IrBinary
-            const fv = try g.callDirect(f_fresh_val, &.{st2});
-            const dst = try g.recordField(fv, "id");
-            const st3 = try g.recordField(fv, "state");
-            const inst_rec = try g.record(&.{
-                .{ .name = "dst", .value = dst },
-                .{ .name = "op", .value = op },
-                .{ .name = "lhs", .value = lhs_val },
-                .{ .name = "rhs", .value = rhs_val },
-            });
-            const inst = try g.tag(ir_binary, inst_rec);
-            const st4 = try g.callDirect(f_emit_inst, &.{ inst, st3 });
-            try g.ret(try g.record(&.{
-                .{ .name = "value", .value = dst },
-                .{ .name = "state", .value = st4 },
-            }));
+            // Check if this is string equality/inequality
+            const is_str_type = try g.tagTest(lhs_type, typeck.ty_string);
+            const op_eq_str = try g.constString("==");
+            const op_ne_str = try g.constString("!=");
+            const is_eq_op = try g.eq(op, op_eq_str);
+            const is_ne_op = try g.eq(op, op_ne_str);
+            const is_eq_or_ne = try g.logicOr(is_eq_op, is_ne_op);
+            const is_str_cmp = try g.logicAnd(is_str_type, is_eq_or_ne);
+            const str_cmp_blk = g.reserveBlock();
+            const int_binop_blk = g.reserveBlock();
+            try g.branch(is_str_cmp, str_cmp_blk, int_binop_blk);
+
+            // String equality/inequality path
+            g.beginReservedBlock(str_cmp_blk);
+            {
+                const fv = try g.callDirect(f_fresh_val, &.{st2});
+                const dst = try g.recordField(fv, "id");
+                const st3 = try g.recordField(fv, "state");
+                // Choose IrStringEq or IrStringNe based on op
+                const str_eq_tag_blk = g.reserveBlock();
+                const str_ne_tag_blk = g.reserveBlock();
+                const str_emit_blk = g.reserveBlock();
+                try g.branch(is_eq_op, str_eq_tag_blk, str_ne_tag_blk);
+
+                g.beginReservedBlock(str_eq_tag_blk);
+                const eq_inst_rec = try g.record(&.{
+                    .{ .name = "dst", .value = dst },
+                    .{ .name = "lhs", .value = lhs_val },
+                    .{ .name = "rhs", .value = rhs_val },
+                });
+                const eq_inst = try g.tag(ir_string_eq, eq_inst_rec);
+                try g.jump(str_emit_blk, &.{eq_inst});
+
+                g.beginReservedBlock(str_ne_tag_blk);
+                const ne_inst_rec = try g.record(&.{
+                    .{ .name = "dst", .value = dst },
+                    .{ .name = "lhs", .value = lhs_val },
+                    .{ .name = "rhs", .value = rhs_val },
+                });
+                const ne_inst = try g.tag(ir_string_ne, ne_inst_rec);
+                try g.jump(str_emit_blk, &.{ne_inst});
+
+                g.beginReservedBlock(str_emit_blk);
+                const str_inst = try g.addBlockParam();
+                const st4 = try g.callDirect(f_emit_inst, &.{ str_inst, st3 });
+                try g.ret(try g.record(&.{
+                    .{ .name = "value", .value = dst },
+                    .{ .name = "state", .value = st4 },
+                }));
+            }
+
+            // Regular binary op path
+            g.beginReservedBlock(int_binop_blk);
+            {
+                const fv = try g.callDirect(f_fresh_val, &.{st2});
+                const dst = try g.recordField(fv, "id");
+                const st3 = try g.recordField(fv, "state");
+                const inst_rec = try g.record(&.{
+                    .{ .name = "dst", .value = dst },
+                    .{ .name = "op", .value = op },
+                    .{ .name = "lhs", .value = lhs_val },
+                    .{ .name = "rhs", .value = rhs_val },
+                });
+                const inst = try g.tag(ir_binary, inst_rec);
+                const st4 = try g.callDirect(f_emit_inst, &.{ inst, st3 });
+                try g.ret(try g.record(&.{
+                    .{ .name = "value", .value = dst },
+                    .{ .name = "state", .value = st4 },
+                }));
+            }
         }
 
         // ── TCall ──
@@ -2923,6 +2980,7 @@ test "lower: lower BinOp produces IrBinary" {
         .{ .name = "lhs", .value = lhs },
         .{ .name = "rhs", .value = rhs },
         .{ .name = "type", .value = ty_int_val },
+        .{ .name = "lhs_type", .value = ty_int_val },
     });
     const binop = try g.tag(typeck.tast_binop, binop_payload);
 
@@ -3117,6 +3175,7 @@ test "lower: BinOp last instruction is IrBinary with correct op" {
         .{ .name = "lhs", .value = lhs },
         .{ .name = "rhs", .value = rhs },
         .{ .name = "type", .value = ty_int_val },
+        .{ .name = "lhs_type", .value = ty_int_val },
     });
     const binop = try g.tag(typeck.tast_binop, binop_payload);
     const result = try g.callDirect(f_lower_expr, &.{ binop, scope, state });
