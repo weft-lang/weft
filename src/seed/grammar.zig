@@ -34,7 +34,7 @@ pub const keywords = [_][]const u8{
     "pub",    "unsafe", "extern", "for",
     "test",   "return", "true",   "false",
     "nil",    "opaque", "implements",
-    "and",    "or",
+    "and",    "or",    "mut",    "defer",
 };
 
 // ── Multi-char operators (checked before single-char) ──────────────────
@@ -87,6 +87,10 @@ pub const ast_field_access = "FieldAccess";
 pub const ast_propagate = "Propagate";
 pub const ast_record_update = "RecordUpdate";
 pub const ast_string_interp = "StringInterp";
+pub const ast_addr_of = "AddrOf";
+pub const ast_addr_of_mut = "AddrOfMut";
+pub const ast_deref = "Deref";
+pub const ast_defer = "Defer";
 
 // Declaration tags
 pub const ast_fn_decl = "FnDecl";
@@ -114,6 +118,9 @@ pub const ast_type_fn = "TypeFn";
 pub const ast_type_intersection = "TypeIntersection";
 pub const ast_type_complement = "TypeComplement";
 pub const ast_type_nullable = "TypeNullable";
+pub const ast_type_ptr = "TypePtr";
+pub const ast_type_ptr_mut = "TypePtrMut";
+pub const ast_type_rc = "TypeRc";
 
 // Module tag
 pub const ast_module = "Module";
@@ -676,7 +683,7 @@ fn genLexIdentOrKeyword(g: *Gen, is_ident_char_fn: FuncId, _: FuncId) !FuncId {
         "else",   "let",    "handle", "resume",
         "pub",    "unsafe", "extern", "for",
         "test",   "return", "opaque", "implements",
-        "and",    "or",
+        "and",    "or",    "mut",    "defer",
     };
 
     var prev_else_blk = kw_chain_blk;
@@ -1556,7 +1563,49 @@ fn genParseTypeExpr(g: *Gen, pf: ParserFuncs) !void {
     const tilde_str = try g.constString("~");
     const is_tilde = try g.eq(op0_val, tilde_str);
     const tilde_blk = g.reserveBlock();
-    try g.branch(is_tilde, tilde_blk, check_upper_blk);
+    const check_star_blk = g.reserveBlock();
+    try g.branch(is_tilde, tilde_blk, check_star_blk);
+
+    // Check for * prefix (pointer type: *T or *mut T)
+    g.beginReservedBlock(check_star_blk);
+    const star_str = try g.constString("*");
+    const is_star = try g.eq(op0_val, star_str);
+    const star_blk = g.reserveBlock();
+    try g.branch(is_star, star_blk, check_upper_blk);
+
+    // star: check if next token is keyword "mut" → *mut T, else *T
+    g.beginReservedBlock(star_blk);
+    const star_tok = try emitGetToken(g, tokens, next_pos);
+    const star_is_kw = try g.tagTest(star_tok, "Keyword");
+    const star_check_mut_blk = g.reserveBlock();
+    const star_immut_blk = g.reserveBlock();
+    try g.branch(star_is_kw, star_check_mut_blk, star_immut_blk);
+
+    g.beginReservedBlock(star_check_mut_blk);
+    const star_kw_val = try g.tagPayload(star_tok, "Keyword");
+    const mut_str = try g.constString("mut");
+    const is_mut = try g.eq(star_kw_val, mut_str);
+    const star_mut_blk = g.reserveBlock();
+    try g.branch(is_mut, star_mut_blk, star_immut_blk);
+
+    // *mut T
+    g.beginReservedBlock(star_mut_blk);
+    const after_mut = try emitAdvance(g, next_pos); // skip "mut"
+    const mut_inner_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, after_mut });
+    const mut_inner_node = try g.recordField(mut_inner_result, "node");
+    const mut_inner_end = try g.recordField(mut_inner_result, "pos");
+    const ptr_mut_node = try g.tag(ast_type_ptr_mut, mut_inner_node);
+    const ptr_mut_res = try emitResult(g, ptr_mut_node, mut_inner_end);
+    try g.ret(ptr_mut_res);
+
+    // *T (immutable pointer)
+    g.beginReservedBlock(star_immut_blk);
+    const ptr_inner_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, next_pos });
+    const ptr_inner_node = try g.recordField(ptr_inner_result, "node");
+    const ptr_inner_end = try g.recordField(ptr_inner_result, "pos");
+    const ptr_node = try g.tag(ast_type_ptr, ptr_inner_node);
+    const ptr_res = try emitResult(g, ptr_node, ptr_inner_end);
+    try g.ret(ptr_res);
 
     g.beginReservedBlock(tilde_blk);
     const comp_inner_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, next_pos });
@@ -1665,6 +1714,24 @@ fn genParseTypeExpr(g: *Gen, pf: ParserFuncs) !void {
 
     g.beginReservedBlock(ident_type_blk);
     const id_name = try g.tagPayload(tok, "Ident");
+    // Check for "rc" — reference-counted pointer type: rc T
+    const rc_str = try g.constString("rc");
+    const is_rc = try g.eq(id_name, rc_str);
+    const rc_type_blk = g.reserveBlock();
+    const plain_ident_type_blk = g.reserveBlock();
+    try g.branch(is_rc, rc_type_blk, plain_ident_type_blk);
+
+    // rc T: parse inner type
+    g.beginReservedBlock(rc_type_blk);
+    const rc_inner_result = try g.callDirect(pf.parse_type_expr, &.{ tokens, next_pos });
+    const rc_inner_node = try g.recordField(rc_inner_result, "node");
+    const rc_inner_end = try g.recordField(rc_inner_result, "pos");
+    const rc_node = try g.tag(ast_type_rc, rc_inner_node);
+    const rc_res = try emitResult(g, rc_node, rc_inner_end);
+    try g.ret(rc_res);
+
+    // plain lowercase type name
+    g.beginReservedBlock(plain_ident_type_blk);
     const id_node = try g.tag(ast_type_named, id_name);
     try g.jump(check_suffix_blk, &.{ id_node, next_pos });
 
@@ -2185,8 +2252,27 @@ fn genParsePrimary(g: *Gen, pf: ParserFuncs) !void {
         try g.ret(unsafe_res);
     }
 
-    // unknown keyword — treat as ident
+    // defer expr
     g.beginReservedBlock(kw6);
+    const defer_str = try g.constString("defer");
+    const is_defer = try g.eq(kw_val, defer_str);
+    const defer_blk = g.reserveBlock();
+    const kw7 = g.reserveBlock();
+    try g.branch(is_defer, defer_blk, kw7);
+
+    g.beginReservedBlock(defer_blk);
+    {
+        const defer_zero = try g.constInt(0);
+        const defer_body_r = try g.callDirect(pf.parse_expr, &.{ tokens, next_pos, defer_zero });
+        const defer_body = try g.recordField(defer_body_r, "node");
+        const defer_end = try g.recordField(defer_body_r, "pos");
+        const defer_node = try g.tag(ast_defer, defer_body);
+        const defer_res = try emitResult(g, defer_node, defer_end);
+        try g.ret(defer_res);
+    }
+
+    // unknown keyword — treat as ident
+    g.beginReservedBlock(kw7);
     const kw_ident = try g.tag(ast_ident, kw_val);
     const kw_res = try emitResult(g, kw_ident, next_pos);
     try g.ret(kw_res);
@@ -2479,7 +2565,8 @@ fn genParsePrimary(g: *Gen, pf: ParserFuncs) !void {
     const is_not = try g.eq(op_val, not_str);
     const is_unary = try g.logicOr(is_neg, is_not);
     const do_unary_blk = g.reserveBlock();
-    try g.branch(is_unary, do_unary_blk, fallback2_blk);
+    const check_addr_of_blk = g.reserveBlock();
+    try g.branch(is_unary, do_unary_blk, check_addr_of_blk);
 
     g.beginReservedBlock(do_unary_blk);
     const u_bp = try g.constInt(17); // unary prefix binding power
@@ -2493,6 +2580,49 @@ fn genParsePrimary(g: *Gen, pf: ParserFuncs) !void {
     const u_node = try g.tag(ast_unary, u_rec);
     const u_res = try emitResult(g, u_node, u_end);
     try g.ret(u_res);
+
+    // &expr or &mut expr — address-of
+    g.beginReservedBlock(check_addr_of_blk);
+    const amp_str = try g.constString("&");
+    const is_amp = try g.eq(op_val, amp_str);
+    const addr_of_blk = g.reserveBlock();
+    try g.branch(is_amp, addr_of_blk, fallback2_blk);
+
+    g.beginReservedBlock(addr_of_blk);
+    // Check if next token is keyword "mut" → &mut expr
+    const amp_tok = try emitGetToken(g, tokens, next_pos);
+    const amp_is_kw = try g.tagTest(amp_tok, "Keyword");
+    const check_amp_mut_blk = g.reserveBlock();
+    const addr_immut_blk = g.reserveBlock();
+    try g.branch(amp_is_kw, check_amp_mut_blk, addr_immut_blk);
+
+    g.beginReservedBlock(check_amp_mut_blk);
+    const amp_kw_val = try g.tagPayload(amp_tok, "Keyword");
+    const amp_mut_str = try g.constString("mut");
+    const amp_is_mut = try g.eq(amp_kw_val, amp_mut_str);
+    const addr_mut_blk = g.reserveBlock();
+    try g.branch(amp_is_mut, addr_mut_blk, addr_immut_blk);
+
+    // &mut expr
+    g.beginReservedBlock(addr_mut_blk);
+    const after_amp_mut = try emitAdvance(g, next_pos); // skip "mut"
+    const amp_bp = try g.constInt(17); // same binding power as unary prefix
+    const mut_result = try g.callDirect(pf.parse_expr, &.{ tokens, after_amp_mut, amp_bp });
+    const mut_operand = try g.recordField(mut_result, "node");
+    const mut_end = try g.recordField(mut_result, "pos");
+    const addr_mut_node = try g.tag(ast_addr_of_mut, mut_operand);
+    const addr_mut_res = try emitResult(g, addr_mut_node, mut_end);
+    try g.ret(addr_mut_res);
+
+    // &expr
+    g.beginReservedBlock(addr_immut_blk);
+    const amp_bp2 = try g.constInt(17);
+    const immut_result = try g.callDirect(pf.parse_expr, &.{ tokens, next_pos, amp_bp2 });
+    const immut_operand = try g.recordField(immut_result, "node");
+    const immut_end = try g.recordField(immut_result, "pos");
+    const addr_of_node = try g.tag(ast_addr_of, immut_operand);
+    const addr_of_res = try emitResult(g, addr_of_node, immut_end);
+    try g.ret(addr_of_res);
 
     // fallback: return nil placeholder
     g.beginReservedBlock(fallback_blk);
@@ -2622,7 +2752,27 @@ fn genParseExpr(g: *Gen, pf: ParserFuncs) !void {
     g.beginReservedBlock(dot_blk);
     const dot_next = try emitAdvance(g, cur_pos); // skip .
     const field_tok = try emitGetToken(g, tokens, dot_next);
+
+    // Check for .* (pointer dereference)
+    const deref_is_op = try g.tagTest(field_tok, "Op");
+    const check_deref_star_blk = g.reserveBlock();
+    const check_field_blk = g.reserveBlock();
+    try g.branch(deref_is_op, check_deref_star_blk, check_field_blk);
+
+    g.beginReservedBlock(check_deref_star_blk);
+    const deref_op_val = try g.tagPayload(field_tok, "Op");
+    const deref_star_str = try g.constString("*");
+    const is_deref_star = try g.eq(deref_op_val, deref_star_str);
+    const deref_blk = g.reserveBlock();
+    try g.branch(is_deref_star, deref_blk, check_field_blk);
+
+    g.beginReservedBlock(deref_blk);
+    const deref_after = try emitAdvance(g, dot_next); // skip *
+    const deref_node = try g.tag(ast_deref, cur_node);
+    try g.jump(loop_blk, &.{ deref_node, deref_after });
+
     // Field name can be Ident (record.field) or UpperIdent (Type.Variant)
+    g.beginReservedBlock(check_field_blk);
     const field_is_ident = try g.tagTest(field_tok, "Ident");
     const field_ident_blk = g.reserveBlock();
     const field_upper_blk = g.reserveBlock();
@@ -3047,8 +3197,39 @@ fn genParseLet(g: *Gen, pf: ParserFuncs) !void {
     const pos = try g.addParam();
 
     _ = g.beginBlock();
+
+    // Check for "mut" keyword after "let"
+    const mut_tok = try emitGetToken(g, tokens, pos);
+    const mut_is_kw = try g.tagTest(mut_tok, "Keyword");
+    const check_mut_blk = g.reserveBlock();
+    const not_mut_blk = g.reserveBlock();
+    try g.branch(mut_is_kw, check_mut_blk, not_mut_blk);
+
+    g.beginReservedBlock(check_mut_blk);
+    const mut_kw_val = try g.tagPayload(mut_tok, "Keyword");
+    const mut_str = try g.constString("mut");
+    const is_mut = try g.eq(mut_kw_val, mut_str);
+    const mut_blk = g.reserveBlock();
+    try g.branch(is_mut, mut_blk, not_mut_blk);
+
+    // let mut: skip "mut" and set mutable flag
+    const merge_blk = g.reserveBlock();
+
+    g.beginReservedBlock(mut_blk);
+    const after_mut = try emitAdvance(g, pos);
+    const mut_true = try g.constBool(true);
+    try g.jump(merge_blk, &.{ after_mut, mut_true });
+
+    g.beginReservedBlock(not_mut_blk);
+    const mut_false = try g.constBool(false);
+    try g.jump(merge_blk, &.{ pos, mut_false });
+
+    g.beginReservedBlock(merge_blk);
+    const pat_start = try g.addBlockParam();
+    const is_mutable = try g.addBlockParam();
+
     // Parse pattern
-    const pat_result = try g.callDirect(pf.parse_pattern, &.{ tokens, pos });
+    const pat_result = try g.callDirect(pf.parse_pattern, &.{ tokens, pat_start });
     const pat_node = try g.recordField(pat_result, "node");
     const pat_pos = try g.recordField(pat_result, "pos");
 
@@ -3064,6 +3245,7 @@ fn genParseLet(g: *Gen, pf: ParserFuncs) !void {
     const let_rec = try g.record(&.{
         .{ .name = "pattern", .value = pat_node },
         .{ .name = "value", .value = val_node },
+        .{ .name = "mutable", .value = is_mutable },
     });
     const let_node = try g.tag(ast_let, let_rec);
     const let_res = try emitResult(g, let_node, val_end);

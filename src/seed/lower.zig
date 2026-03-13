@@ -1268,14 +1268,70 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(check_unsafe_expr);
         const is_unsafe_expr = try g.tagTest(expr, typeck.tast_unsafe);
         const unsafe_expr_blk = g.reserveBlock();
-        const default_blk = g.reserveBlock();
-        try g.branch(is_unsafe_expr, unsafe_expr_blk, default_blk);
+        const check_addr_of_expr = g.reserveBlock();
+        try g.branch(is_unsafe_expr, unsafe_expr_blk, check_addr_of_expr);
 
         g.beginReservedBlock(unsafe_expr_blk);
         {
             const unsafe_inner = try g.tagPayload(expr, typeck.tast_unsafe);
             const unsafe_result = try g.callDirect(f_lower_expr, &.{ unsafe_inner, scope, state });
             try g.ret(unsafe_result);
+        }
+
+        // ── TDefer — for bootstrap, lower the deferred expression inline ──
+        g.beginReservedBlock(check_addr_of_expr);
+        const is_defer_ex = try g.tagTest(expr, typeck.tast_defer);
+        const defer_ex_blk = g.reserveBlock();
+        const check_addr_of_expr2 = g.reserveBlock();
+        try g.branch(is_defer_ex, defer_ex_blk, check_addr_of_expr2);
+
+        g.beginReservedBlock(defer_ex_blk);
+        {
+            const defer_inner = try g.tagPayload(expr, typeck.tast_defer);
+            const defer_result = try g.callDirect(f_lower_expr, &.{ defer_inner, scope, state });
+            try g.ret(defer_result);
+        }
+
+        // ── TAddrOf — for bootstrap, lower inner expression (value is the "pointer") ──
+        g.beginReservedBlock(check_addr_of_expr2);
+        const is_addr_of_expr = try g.tagTest(expr, typeck.tast_addr_of);
+        const addr_of_expr_blk = g.reserveBlock();
+        const check_addr_of_mut_expr = g.reserveBlock();
+        try g.branch(is_addr_of_expr, addr_of_expr_blk, check_addr_of_mut_expr);
+
+        g.beginReservedBlock(addr_of_expr_blk);
+        {
+            const ao_inner = try g.tagPayload(expr, typeck.tast_addr_of);
+            const ao_result = try g.callDirect(f_lower_expr, &.{ ao_inner, scope, state });
+            try g.ret(ao_result);
+        }
+
+        // ── TAddrOfMut — same as TAddrOf for bootstrap ──
+        g.beginReservedBlock(check_addr_of_mut_expr);
+        const is_aom_expr = try g.tagTest(expr, typeck.tast_addr_of_mut);
+        const aom_expr_blk = g.reserveBlock();
+        const check_deref_expr = g.reserveBlock();
+        try g.branch(is_aom_expr, aom_expr_blk, check_deref_expr);
+
+        g.beginReservedBlock(aom_expr_blk);
+        {
+            const aom_inner = try g.tagPayload(expr, typeck.tast_addr_of_mut);
+            const aom_result = try g.callDirect(f_lower_expr, &.{ aom_inner, scope, state });
+            try g.ret(aom_result);
+        }
+
+        // ── TDeref — for bootstrap, lower inner expression (transparent) ──
+        g.beginReservedBlock(check_deref_expr);
+        const is_deref_expr = try g.tagTest(expr, typeck.tast_deref);
+        const deref_expr_blk = g.reserveBlock();
+        const default_blk = g.reserveBlock();
+        try g.branch(is_deref_expr, deref_expr_blk, default_blk);
+
+        g.beginReservedBlock(deref_expr_blk);
+        {
+            const d_inner = try g.tagPayload(expr, typeck.tast_deref);
+            const d_result = try g.callDirect(f_lower_expr, &.{ d_inner, scope, state });
+            try g.ret(d_result);
         }
 
         // ── Default: unhandled node, emit const nil ──

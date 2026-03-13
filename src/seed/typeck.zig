@@ -36,6 +36,19 @@ pub const ty_tagged_union = "TyTaggedUnion";
 pub const ty_function = "TyFunction";
 pub const ty_type_var = "TyTypeVar";
 pub const ty_app = "TyApp";
+pub const ty_int8 = "TyInt8";
+pub const ty_int16 = "TyInt16";
+pub const ty_int32 = "TyInt32";
+pub const ty_uint8 = "TyUInt8";
+pub const ty_uint16 = "TyUInt16";
+pub const ty_uint32 = "TyUInt32";
+pub const ty_uint64 = "TyUInt64";
+pub const ty_float32 = "TyFloat32";
+pub const ty_usize = "TyUsize";
+pub const ty_isize = "TyIsize";
+pub const ty_ptr = "TyPtr";
+pub const ty_ptr_mut = "TyPtrMut";
+pub const ty_rc = "TyRc";
 
 // ── Typed AST tag constants ─────────────────────────────────────────────
 pub const tast_int_lit = "TIntLit";
@@ -61,6 +74,10 @@ pub const tast_field_access = "TFieldAccess";
 pub const tast_record_update = "TRecordUpdate";
 pub const tast_string_interp = "TStringInterp";
 pub const tast_unsafe = "TUnsafe";
+pub const tast_defer = "TDefer";
+pub const tast_addr_of = "TAddrOf";
+pub const tast_addr_of_mut = "TAddrOfMut";
+pub const tast_deref = "TDeref";
 pub const tast_extern_fn = "TExternFn";
 pub const tast_fn_decl = "TFnDecl";
 pub const tast_module = "TModule";
@@ -112,6 +129,16 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const is_nil = try g.eq(param, try g.constString(ty_nil));
         const is_never = try g.eq(param, try g.constString(ty_never));
         const is_any = try g.eq(param, try g.constString(ty_any));
+        const is_int8 = try g.eq(param, try g.constString(ty_int8));
+        const is_int16 = try g.eq(param, try g.constString(ty_int16));
+        const is_int32 = try g.eq(param, try g.constString(ty_int32));
+        const is_uint8 = try g.eq(param, try g.constString(ty_uint8));
+        const is_uint16 = try g.eq(param, try g.constString(ty_uint16));
+        const is_uint32 = try g.eq(param, try g.constString(ty_uint32));
+        const is_uint64 = try g.eq(param, try g.constString(ty_uint64));
+        const is_float32 = try g.eq(param, try g.constString(ty_float32));
+        const is_usize = try g.eq(param, try g.constString(ty_usize));
+        const is_isize = try g.eq(param, try g.constString(ty_isize));
 
         const r1 = try g.logicOr(is_int, is_float);
         const r2 = try g.logicOr(r1, is_string);
@@ -119,7 +146,17 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const r4 = try g.logicOr(r3, is_nil);
         const r5 = try g.logicOr(r4, is_never);
         const r6 = try g.logicOr(r5, is_any);
-        try g.ret(r6);
+        const r7 = try g.logicOr(r6, is_int8);
+        const r8 = try g.logicOr(r7, is_int16);
+        const r9 = try g.logicOr(r8, is_int32);
+        const r10 = try g.logicOr(r9, is_uint8);
+        const r11 = try g.logicOr(r10, is_uint16);
+        const r12 = try g.logicOr(r11, is_uint32);
+        const r13 = try g.logicOr(r12, is_uint64);
+        const r14 = try g.logicOr(r13, is_float32);
+        const r15 = try g.logicOr(r14, is_usize);
+        const r16 = try g.logicOr(r15, is_isize);
+        try g.ret(r16);
     }
     try g.endReservedFunc(f_is_primitive);
 
@@ -161,13 +198,63 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const b_is_any = try g.tagTest(b, ty_any);
         const both_any = try g.logicAnd(a_is_any, b_is_any);
 
+        const a_is_int8 = try g.tagTest(a, ty_int8);
+        const b_is_int8 = try g.tagTest(b, ty_int8);
+        const both_int8 = try g.logicAnd(a_is_int8, b_is_int8);
+
+        const a_is_int16 = try g.tagTest(a, ty_int16);
+        const b_is_int16 = try g.tagTest(b, ty_int16);
+        const both_int16 = try g.logicAnd(a_is_int16, b_is_int16);
+
+        const a_is_int32 = try g.tagTest(a, ty_int32);
+        const b_is_int32 = try g.tagTest(b, ty_int32);
+        const both_int32 = try g.logicAnd(a_is_int32, b_is_int32);
+
+        const a_is_uint8 = try g.tagTest(a, ty_uint8);
+        const b_is_uint8 = try g.tagTest(b, ty_uint8);
+        const both_uint8 = try g.logicAnd(a_is_uint8, b_is_uint8);
+
+        const a_is_uint16 = try g.tagTest(a, ty_uint16);
+        const b_is_uint16 = try g.tagTest(b, ty_uint16);
+        const both_uint16 = try g.logicAnd(a_is_uint16, b_is_uint16);
+
+        const a_is_uint32 = try g.tagTest(a, ty_uint32);
+        const b_is_uint32 = try g.tagTest(b, ty_uint32);
+        const both_uint32 = try g.logicAnd(a_is_uint32, b_is_uint32);
+
+        const a_is_uint64 = try g.tagTest(a, ty_uint64);
+        const b_is_uint64 = try g.tagTest(b, ty_uint64);
+        const both_uint64 = try g.logicAnd(a_is_uint64, b_is_uint64);
+
+        const a_is_float32 = try g.tagTest(a, ty_float32);
+        const b_is_float32 = try g.tagTest(b, ty_float32);
+        const both_float32 = try g.logicAnd(a_is_float32, b_is_float32);
+
+        const a_is_usize = try g.tagTest(a, ty_usize);
+        const b_is_usize = try g.tagTest(b, ty_usize);
+        const both_usize = try g.logicAnd(a_is_usize, b_is_usize);
+
+        const a_is_isize = try g.tagTest(a, ty_isize);
+        const b_is_isize = try g.tagTest(b, ty_isize);
+        const both_isize = try g.logicAnd(a_is_isize, b_is_isize);
+
         const r1 = try g.logicOr(both_int, both_float);
         const r2 = try g.logicOr(r1, both_str);
         const r3 = try g.logicOr(r2, both_bool);
         const r4 = try g.logicOr(r3, both_nil);
         const r5 = try g.logicOr(r4, both_never);
         const r6 = try g.logicOr(r5, both_any);
-        try g.ret(r6);
+        const r7 = try g.logicOr(r6, both_int8);
+        const r8 = try g.logicOr(r7, both_int16);
+        const r9 = try g.logicOr(r8, both_int32);
+        const r10 = try g.logicOr(r9, both_uint8);
+        const r11 = try g.logicOr(r10, both_uint16);
+        const r12 = try g.logicOr(r11, both_uint32);
+        const r13 = try g.logicOr(r12, both_uint64);
+        const r14 = try g.logicOr(r13, both_float32);
+        const r15 = try g.logicOr(r14, both_usize);
+        const r16 = try g.logicOr(r15, both_isize);
+        try g.ret(r16);
     }
     try g.endReservedFunc(f_primitives_equal);
 
@@ -311,8 +398,66 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const rec_names_eq = try g.eq(a_rec_name, b_rec_name);
         try g.ret(rec_names_eq);
 
-        // Default: not a subtype
+        // 9. Pointer subtyping: rc T <: *T, *mut T <: *T, covariance
         g.beginReservedBlock(fallthrough);
+
+        // rc T <: *T — reference-counted usable as immutable pointer
+        const a_is_rc = try g.tagTest(a, ty_rc);
+        const b_is_ptr = try g.tagTest(b, ty_ptr);
+        const rc_to_ptr = try g.logicAnd(a_is_rc, b_is_ptr);
+        const check_rc_ptr = g.reserveBlock();
+        const check_mut_ptr = g.reserveBlock();
+        try g.branch(rc_to_ptr, check_rc_ptr, check_mut_ptr);
+
+        g.beginReservedBlock(check_rc_ptr);
+        const rc_inner = try g.tagPayload(a, ty_rc);
+        const ptr_inner_b = try g.tagPayload(b, ty_ptr);
+        const rc_ptr_sub = try g.callDirect(f_is_subtype, &.{ rc_inner, ptr_inner_b });
+        try g.ret(rc_ptr_sub);
+
+        // *mut T <: *T — mutable pointer coerces to immutable
+        g.beginReservedBlock(check_mut_ptr);
+        const a_is_ptr_mut = try g.tagTest(a, ty_ptr_mut);
+        const mut_to_ptr = try g.logicAnd(a_is_ptr_mut, b_is_ptr);
+        const check_mut_ptr_body = g.reserveBlock();
+        const check_ptr_cov = g.reserveBlock();
+        try g.branch(mut_to_ptr, check_mut_ptr_body, check_ptr_cov);
+
+        g.beginReservedBlock(check_mut_ptr_body);
+        const mut_inner = try g.tagPayload(a, ty_ptr_mut);
+        const ptr_inner_b2 = try g.tagPayload(b, ty_ptr);
+        const mut_ptr_sub = try g.callDirect(f_is_subtype, &.{ mut_inner, ptr_inner_b2 });
+        try g.ret(mut_ptr_sub);
+
+        // *T <: *U when T <: U (covariance), and rc T <: rc U
+        g.beginReservedBlock(check_ptr_cov);
+        const a_is_ptr = try g.tagTest(a, ty_ptr);
+        const both_ptr = try g.logicAnd(a_is_ptr, b_is_ptr);
+        const check_ptr_cov_body = g.reserveBlock();
+        const check_rc_cov = g.reserveBlock();
+        try g.branch(both_ptr, check_ptr_cov_body, check_rc_cov);
+
+        g.beginReservedBlock(check_ptr_cov_body);
+        const ptr_a_inner = try g.tagPayload(a, ty_ptr);
+        const ptr_b_inner = try g.tagPayload(b, ty_ptr);
+        const ptr_cov_sub = try g.callDirect(f_is_subtype, &.{ ptr_a_inner, ptr_b_inner });
+        try g.ret(ptr_cov_sub);
+
+        g.beginReservedBlock(check_rc_cov);
+        const b_is_rc = try g.tagTest(b, ty_rc);
+        const both_rc = try g.logicAnd(a_is_rc, b_is_rc);
+        const check_rc_cov_body = g.reserveBlock();
+        const ptr_fallthrough = g.reserveBlock();
+        try g.branch(both_rc, check_rc_cov_body, ptr_fallthrough);
+
+        g.beginReservedBlock(check_rc_cov_body);
+        const rc_a_inner = try g.tagPayload(a, ty_rc);
+        const rc_b_inner = try g.tagPayload(b, ty_rc);
+        const rc_cov_sub = try g.callDirect(f_is_subtype, &.{ rc_a_inner, rc_b_inner });
+        try g.ret(rc_cov_sub);
+
+        // Default: not a subtype
+        g.beginReservedBlock(ptr_fallthrough);
         try g.ret(try g.constBool(false));
     }
     try g.endReservedFunc(f_is_subtype);
@@ -428,8 +573,8 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(check_fn_type);
         const is_fn_type = try g.tagTest(type_expr, grammar.ast_type_fn);
         const fn_type_blk = g.reserveBlock();
-        const type_default = g.reserveBlock();
-        try g.branch(is_fn_type, fn_type_blk, type_default);
+        const check_ptr = g.reserveBlock();
+        try g.branch(is_fn_type, fn_type_blk, check_ptr);
 
         g.beginReservedBlock(fn_type_blk);
         const fn_pl = try g.tagPayload(type_expr, grammar.ast_type_fn);
@@ -444,6 +589,42 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             .{ .name = "ret", .value = fn_ret_type },
         });
         try g.ret(try g.tag(ty_function, fn_rec));
+
+        // TypePtr -> *T
+        g.beginReservedBlock(check_ptr);
+        const is_ptr = try g.tagTest(type_expr, grammar.ast_type_ptr);
+        const ptr_blk = g.reserveBlock();
+        const check_ptr_mut = g.reserveBlock();
+        try g.branch(is_ptr, ptr_blk, check_ptr_mut);
+
+        g.beginReservedBlock(ptr_blk);
+        const ptr_inner_ast = try g.tagPayload(type_expr, grammar.ast_type_ptr);
+        const ptr_inner_type = try g.callDirect(f_type_from_ast, &.{ ptr_inner_ast, ctx });
+        try g.ret(try g.tag(ty_ptr, ptr_inner_type));
+
+        // TypePtrMut -> *mut T
+        g.beginReservedBlock(check_ptr_mut);
+        const is_ptr_mut = try g.tagTest(type_expr, grammar.ast_type_ptr_mut);
+        const ptr_mut_blk = g.reserveBlock();
+        const check_rc = g.reserveBlock();
+        try g.branch(is_ptr_mut, ptr_mut_blk, check_rc);
+
+        g.beginReservedBlock(ptr_mut_blk);
+        const pm_inner_ast = try g.tagPayload(type_expr, grammar.ast_type_ptr_mut);
+        const pm_inner_type = try g.callDirect(f_type_from_ast, &.{ pm_inner_ast, ctx });
+        try g.ret(try g.tag(ty_ptr_mut, pm_inner_type));
+
+        // TypeRc -> rc T
+        g.beginReservedBlock(check_rc);
+        const is_rc_type = try g.tagTest(type_expr, grammar.ast_type_rc);
+        const rc_blk = g.reserveBlock();
+        const type_default = g.reserveBlock();
+        try g.branch(is_rc_type, rc_blk, type_default);
+
+        g.beginReservedBlock(rc_blk);
+        const rc_inner_ast = try g.tagPayload(type_expr, grammar.ast_type_rc);
+        const rc_inner_type = try g.callDirect(f_type_from_ast, &.{ rc_inner_ast, ctx });
+        try g.ret(try g.tag(ty_rc, rc_inner_type));
 
         // Default: return TyAny (unknown type expression)
         g.beginReservedBlock(type_default);
@@ -516,11 +697,159 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(check_any);
         const is_any = try g.eq(name, try g.constString("Any"));
         const ret_any = g.reserveBlock();
-        const check_ctx = g.reserveBlock();
-        try g.branch(is_any, ret_any, check_ctx);
+        const check_i64 = g.reserveBlock();
+        try g.branch(is_any, ret_any, check_i64);
 
         g.beginReservedBlock(ret_any);
         try g.ret(try g.tag(ty_any, null));
+
+        // ── Lowercase primitive aliases (kernel.md §1) ──────────────
+        // i64 → TyInt, f64 → TyFloat, str → TyString, bool → TyBool
+        // i8/i16/i32, u8/u16/u32/u64, f32, usize, isize
+
+        g.beginReservedBlock(check_i64);
+        const is_i64 = try g.eq(name, try g.constString("i64"));
+        const ret_i64 = g.reserveBlock();
+        const check_f64 = g.reserveBlock();
+        try g.branch(is_i64, ret_i64, check_f64);
+
+        g.beginReservedBlock(ret_i64);
+        try g.ret(try g.tag(ty_int, null));
+
+        g.beginReservedBlock(check_f64);
+        const is_f64 = try g.eq(name, try g.constString("f64"));
+        const ret_f64 = g.reserveBlock();
+        const check_str_lc = g.reserveBlock();
+        try g.branch(is_f64, ret_f64, check_str_lc);
+
+        g.beginReservedBlock(ret_f64);
+        try g.ret(try g.tag(ty_float, null));
+
+        g.beginReservedBlock(check_str_lc);
+        const is_str_lc = try g.eq(name, try g.constString("str"));
+        const ret_str_lc = g.reserveBlock();
+        const check_bool_lc = g.reserveBlock();
+        try g.branch(is_str_lc, ret_str_lc, check_bool_lc);
+
+        g.beginReservedBlock(ret_str_lc);
+        try g.ret(try g.tag(ty_string, null));
+
+        g.beginReservedBlock(check_bool_lc);
+        const is_bool_lc = try g.eq(name, try g.constString("bool"));
+        const ret_bool_lc = g.reserveBlock();
+        const check_nil_lc = g.reserveBlock();
+        try g.branch(is_bool_lc, ret_bool_lc, check_nil_lc);
+
+        g.beginReservedBlock(ret_bool_lc);
+        try g.ret(try g.tag(ty_bool, null));
+
+        g.beginReservedBlock(check_nil_lc);
+        const is_nil_lc = try g.eq(name, try g.constString("nil"));
+        const ret_nil_lc = g.reserveBlock();
+        const check_never_lc = g.reserveBlock();
+        try g.branch(is_nil_lc, ret_nil_lc, check_never_lc);
+
+        g.beginReservedBlock(ret_nil_lc);
+        try g.ret(try g.tag(ty_nil, null));
+
+        g.beginReservedBlock(check_never_lc);
+        const is_never_lc = try g.eq(name, try g.constString("never"));
+        const ret_never_lc = g.reserveBlock();
+        const check_i8 = g.reserveBlock();
+        try g.branch(is_never_lc, ret_never_lc, check_i8);
+
+        g.beginReservedBlock(ret_never_lc);
+        try g.ret(try g.tag(ty_never, null));
+
+        g.beginReservedBlock(check_i8);
+        const is_i8 = try g.eq(name, try g.constString("i8"));
+        const ret_i8 = g.reserveBlock();
+        const check_i16 = g.reserveBlock();
+        try g.branch(is_i8, ret_i8, check_i16);
+
+        g.beginReservedBlock(ret_i8);
+        try g.ret(try g.tag(ty_int8, null));
+
+        g.beginReservedBlock(check_i16);
+        const is_i16 = try g.eq(name, try g.constString("i16"));
+        const ret_i16 = g.reserveBlock();
+        const check_i32 = g.reserveBlock();
+        try g.branch(is_i16, ret_i16, check_i32);
+
+        g.beginReservedBlock(ret_i16);
+        try g.ret(try g.tag(ty_int16, null));
+
+        g.beginReservedBlock(check_i32);
+        const is_i32 = try g.eq(name, try g.constString("i32"));
+        const ret_i32 = g.reserveBlock();
+        const check_u8 = g.reserveBlock();
+        try g.branch(is_i32, ret_i32, check_u8);
+
+        g.beginReservedBlock(ret_i32);
+        try g.ret(try g.tag(ty_int32, null));
+
+        g.beginReservedBlock(check_u8);
+        const is_u8 = try g.eq(name, try g.constString("u8"));
+        const ret_u8 = g.reserveBlock();
+        const check_u16 = g.reserveBlock();
+        try g.branch(is_u8, ret_u8, check_u16);
+
+        g.beginReservedBlock(ret_u8);
+        try g.ret(try g.tag(ty_uint8, null));
+
+        g.beginReservedBlock(check_u16);
+        const is_u16 = try g.eq(name, try g.constString("u16"));
+        const ret_u16 = g.reserveBlock();
+        const check_u32 = g.reserveBlock();
+        try g.branch(is_u16, ret_u16, check_u32);
+
+        g.beginReservedBlock(ret_u16);
+        try g.ret(try g.tag(ty_uint16, null));
+
+        g.beginReservedBlock(check_u32);
+        const is_u32 = try g.eq(name, try g.constString("u32"));
+        const ret_u32 = g.reserveBlock();
+        const check_u64 = g.reserveBlock();
+        try g.branch(is_u32, ret_u32, check_u64);
+
+        g.beginReservedBlock(ret_u32);
+        try g.ret(try g.tag(ty_uint32, null));
+
+        g.beginReservedBlock(check_u64);
+        const is_u64 = try g.eq(name, try g.constString("u64"));
+        const ret_u64 = g.reserveBlock();
+        const check_f32 = g.reserveBlock();
+        try g.branch(is_u64, ret_u64, check_f32);
+
+        g.beginReservedBlock(ret_u64);
+        try g.ret(try g.tag(ty_uint64, null));
+
+        g.beginReservedBlock(check_f32);
+        const is_f32 = try g.eq(name, try g.constString("f32"));
+        const ret_f32 = g.reserveBlock();
+        const check_usize = g.reserveBlock();
+        try g.branch(is_f32, ret_f32, check_usize);
+
+        g.beginReservedBlock(ret_f32);
+        try g.ret(try g.tag(ty_float32, null));
+
+        g.beginReservedBlock(check_usize);
+        const is_usize = try g.eq(name, try g.constString("usize"));
+        const ret_usize = g.reserveBlock();
+        const check_isize = g.reserveBlock();
+        try g.branch(is_usize, ret_usize, check_isize);
+
+        g.beginReservedBlock(ret_usize);
+        try g.ret(try g.tag(ty_usize, null));
+
+        g.beginReservedBlock(check_isize);
+        const is_isize = try g.eq(name, try g.constString("isize"));
+        const ret_isize = g.reserveBlock();
+        const check_ctx = g.reserveBlock();
+        try g.branch(is_isize, ret_isize, check_ctx);
+
+        g.beginReservedBlock(ret_isize);
+        try g.ret(try g.tag(ty_isize, null));
 
         // Check context type environment
         g.beginReservedBlock(check_ctx);
@@ -2010,8 +2339,8 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(check_unsafe);
         const is_unsafe = try g.tagTest(expr, grammar.ast_unsafe);
         const unsafe_blk = g.reserveBlock();
-        const default_expr = g.reserveBlock();
-        try g.branch(is_unsafe, unsafe_blk, default_expr);
+        const check_addr_of = g.reserveBlock();
+        try g.branch(is_unsafe, unsafe_blk, check_addr_of);
 
         g.beginReservedBlock(unsafe_blk);
         {
@@ -2023,6 +2352,134 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             try g.ret(try g.record(&.{
                 .{ .name = "expr", .value = unsafe_texpr },
                 .{ .name = "type", .value = unsafe_type },
+            }));
+        }
+
+        // Defer: defer expr → TyNil (just type-check the inner expression)
+        g.beginReservedBlock(check_addr_of);
+        const is_defer_expr = try g.tagTest(expr, grammar.ast_defer);
+        const defer_expr_blk = g.reserveBlock();
+        const check_addr_of2 = g.reserveBlock();
+        try g.branch(is_defer_expr, defer_expr_blk, check_addr_of2);
+
+        g.beginReservedBlock(defer_expr_blk);
+        {
+            const defer_inner = try g.tagPayload(expr, grammar.ast_defer);
+            const defer_r = try g.callDirect(f_infer, &.{ defer_inner, ctx });
+            const defer_typed = try g.recordField(defer_r, "expr");
+            const defer_nil = try g.tag(ty_nil, null);
+            const defer_texpr = try g.tag(tast_defer, defer_typed);
+            try g.ret(try g.record(&.{
+                .{ .name = "expr", .value = defer_texpr },
+                .{ .name = "type", .value = defer_nil },
+            }));
+        }
+
+        // AddrOf: &expr → TyPtr(T) where T is the type of expr
+        g.beginReservedBlock(check_addr_of2);
+        const is_addr_of = try g.tagTest(expr, grammar.ast_addr_of);
+        const addr_of_blk = g.reserveBlock();
+        const check_addr_of_mut = g.reserveBlock();
+        try g.branch(is_addr_of, addr_of_blk, check_addr_of_mut);
+
+        g.beginReservedBlock(addr_of_blk);
+        {
+            const ao_inner = try g.tagPayload(expr, grammar.ast_addr_of);
+            const ao_r = try g.callDirect(f_infer, &.{ ao_inner, ctx });
+            const ao_typed = try g.recordField(ao_r, "expr");
+            const ao_type = try g.recordField(ao_r, "type");
+            const ptr_type = try g.tag(ty_ptr, ao_type);
+            const ao_texpr = try g.tag(tast_addr_of, ao_typed);
+            try g.ret(try g.record(&.{
+                .{ .name = "expr", .value = ao_texpr },
+                .{ .name = "type", .value = ptr_type },
+            }));
+        }
+
+        // AddrOfMut: &mut expr → TyPtrMut(T)
+        g.beginReservedBlock(check_addr_of_mut);
+        const is_addr_of_mut = try g.tagTest(expr, grammar.ast_addr_of_mut);
+        const addr_of_mut_blk = g.reserveBlock();
+        const check_deref = g.reserveBlock();
+        try g.branch(is_addr_of_mut, addr_of_mut_blk, check_deref);
+
+        g.beginReservedBlock(addr_of_mut_blk);
+        {
+            const aom_inner = try g.tagPayload(expr, grammar.ast_addr_of_mut);
+            const aom_r = try g.callDirect(f_infer, &.{ aom_inner, ctx });
+            const aom_typed = try g.recordField(aom_r, "expr");
+            const aom_type = try g.recordField(aom_r, "type");
+            const ptr_mut_type = try g.tag(ty_ptr_mut, aom_type);
+            const aom_texpr = try g.tag(tast_addr_of_mut, aom_typed);
+            try g.ret(try g.record(&.{
+                .{ .name = "expr", .value = aom_texpr },
+                .{ .name = "type", .value = ptr_mut_type },
+            }));
+        }
+
+        // Deref: expr.* → T where expr is TyPtr(T), TyPtrMut(T), or TyRc(T)
+        g.beginReservedBlock(check_deref);
+        const is_deref = try g.tagTest(expr, grammar.ast_deref);
+        const deref_blk = g.reserveBlock();
+        const default_expr = g.reserveBlock();
+        try g.branch(is_deref, deref_blk, default_expr);
+
+        g.beginReservedBlock(deref_blk);
+        {
+            const d_inner = try g.tagPayload(expr, grammar.ast_deref);
+            const d_r = try g.callDirect(f_infer, &.{ d_inner, ctx });
+            const d_typed = try g.recordField(d_r, "expr");
+            const d_type = try g.recordField(d_r, "type");
+            // Extract inner type from pointer wrapper
+            // Check TyPtr, TyPtrMut, TyRc — extract payload
+            const d_is_ptr = try g.tagTest(d_type, ty_ptr);
+            const d_ptr_blk = g.reserveBlock();
+            const d_check_mut = g.reserveBlock();
+            try g.branch(d_is_ptr, d_ptr_blk, d_check_mut);
+
+            g.beginReservedBlock(d_ptr_blk);
+            const d_ptr_inner = try g.tagPayload(d_type, ty_ptr);
+            const d_ptr_texpr = try g.tag(tast_deref, d_typed);
+            try g.ret(try g.record(&.{
+                .{ .name = "expr", .value = d_ptr_texpr },
+                .{ .name = "type", .value = d_ptr_inner },
+            }));
+
+            g.beginReservedBlock(d_check_mut);
+            const d_is_ptr_mut = try g.tagTest(d_type, ty_ptr_mut);
+            const d_mut_blk = g.reserveBlock();
+            const d_check_rc = g.reserveBlock();
+            try g.branch(d_is_ptr_mut, d_mut_blk, d_check_rc);
+
+            g.beginReservedBlock(d_mut_blk);
+            const d_mut_inner = try g.tagPayload(d_type, ty_ptr_mut);
+            const d_mut_texpr = try g.tag(tast_deref, d_typed);
+            try g.ret(try g.record(&.{
+                .{ .name = "expr", .value = d_mut_texpr },
+                .{ .name = "type", .value = d_mut_inner },
+            }));
+
+            g.beginReservedBlock(d_check_rc);
+            const d_is_rc = try g.tagTest(d_type, ty_rc);
+            const d_rc_blk = g.reserveBlock();
+            const d_deref_any = g.reserveBlock();
+            try g.branch(d_is_rc, d_rc_blk, d_deref_any);
+
+            g.beginReservedBlock(d_rc_blk);
+            const d_rc_inner = try g.tagPayload(d_type, ty_rc);
+            const d_rc_texpr = try g.tag(tast_deref, d_typed);
+            try g.ret(try g.record(&.{
+                .{ .name = "expr", .value = d_rc_texpr },
+                .{ .name = "type", .value = d_rc_inner },
+            }));
+
+            // Deref on non-pointer type: return TyAny (permissive bootstrap)
+            g.beginReservedBlock(d_deref_any);
+            const d_any_type = try g.tag(ty_any, null);
+            const d_any_texpr = try g.tag(tast_deref, d_typed);
+            try g.ret(try g.record(&.{
+                .{ .name = "expr", .value = d_any_texpr },
+                .{ .name = "type", .value = d_any_type },
             }));
         }
 
