@@ -33,6 +33,7 @@ pub const ir_arg_receive = "IrArgReceive";
 pub const ir_string_eq = "IrStringEq";
 pub const ir_string_ne = "IrStringNe";
 pub const ir_store = "IrStore";
+pub const ir_ptr_store = "IrPtrStore";
 pub const ir_retain = "IrRetain";
 pub const ir_release = "IrRelease";
 
@@ -1358,10 +1359,10 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const st5 = try g.recordField(fv3, "state");
             const store_inst_rec2 = try g.record(&.{
                 .{ .name = "dst", .value = store_dst2 },
-                .{ .name = "target", .value = ptr_id },
+                .{ .name = "ptr", .value = ptr_id },
                 .{ .name = "value", .value = val_id },
             });
-            const store_inst2 = try g.tag(ir_store, store_inst_rec2);
+            const store_inst2 = try g.tag(ir_ptr_store, store_inst_rec2);
             const st6 = try g.callDirect(f_emit_inst, &.{ store_inst2, st5 });
             try g.ret(try g.record(&.{
                 .{ .name = "value", .value = val_id },

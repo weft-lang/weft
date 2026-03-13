@@ -3703,8 +3703,40 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             try g.ret(st_result);
         }
 
-        // Default fallthrough: return bytes unchanged
+        // IrPtrStore: store value through pointer — STR value_reg, [ptr_reg, #0]
         g.beginReservedBlock(blk_not_store);
+        const is_ptr_store = try g.tagTest(inst, "IrPtrStore");
+        const blk_ptr_store = g.reserveBlock();
+        const blk_not_ptr_store = g.reserveBlock();
+        try g.branch(is_ptr_store, blk_ptr_store, blk_not_ptr_store);
+
+        g.beginReservedBlock(blk_ptr_store);
+        {
+            const ps_payload = try g.tagPayload(inst, "IrPtrStore");
+            const ps_ptr = try g.recordField(ps_payload, "ptr");
+            const ps_value = try g.recordField(ps_payload, "value");
+            const ps_ptr_raw = try g.callDirect(f_get_reg, &.{ ctx, ps_ptr });
+            const ps_val_raw = try g.callDirect(f_get_reg, &.{ ctx, ps_value });
+            const c16_ps = try g.constInt(16);
+            const c17_ps = try g.constInt(17);
+            const ps_ptr_load = try g.callDirect(f_load_spill, &.{ bytes, ps_ptr_raw, c16_ps });
+            const ps_bytes1 = try g.recordField(ps_ptr_load, "bytes");
+            const ps_ptr_reg = try g.recordField(ps_ptr_load, "reg");
+            const ps_val_load = try g.callDirect(f_load_spill, &.{ ps_bytes1, ps_val_raw, c17_ps });
+            const ps_bytes2 = try g.recordField(ps_val_load, "bytes");
+            const ps_val_reg = try g.recordField(ps_val_load, "reg");
+            // STR value_reg, [ptr_reg, #0]
+            const ps_str_inst = try g.callDirect(f_encode_str, &.{ ps_val_reg, ps_ptr_reg, try g.constInt(0) });
+            const ps_bytes3 = try g.callDirect(f_append_inst, &.{ ps_bytes2, ps_str_inst });
+            const ps_result = try g.record(&.{
+                .{ .name = "bytes", .value = ps_bytes3 },
+                .{ .name = "ctx", .value = ctx },
+            });
+            try g.ret(ps_result);
+        }
+
+        // Default fallthrough: return bytes unchanged
+        g.beginReservedBlock(blk_not_ptr_store);
         const ft_result = try g.record(&.{
             .{ .name = "bytes", .value = bytes },
             .{ .name = "ctx", .value = ctx },
