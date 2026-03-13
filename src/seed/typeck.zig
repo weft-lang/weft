@@ -49,6 +49,8 @@ pub const ty_isize = "TyIsize";
 pub const ty_ptr = "TyPtr";
 pub const ty_ptr_mut = "TyPtrMut";
 pub const ty_rc = "TyRc";
+pub const ty_array = "TyArray";
+pub const ty_slice = "TySlice";
 
 // ── Typed AST tag constants ─────────────────────────────────────────────
 pub const tast_int_lit = "TIntLit";
@@ -371,16 +373,40 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const check_record = g.reserveBlock();
         try g.branch(both_fn, check_fn_body, check_record);
 
-        // For functions: (A1, A2) -> R1 <: (B1, B2) -> R2
-        // iff B1 <: A1 and B2 <: A2 (contravariant) and R1 <: R2 (covariant)
-        // Simplified: just check return type covariance for bootstrap
+        // For functions: (A1, A2) -[E1]> R1 <: (B1, B2) -[E2]> R2
+        // iff R1 <: R2 (covariant return) and E1 ⊆ E2 (effect subset)
+        // A pure function (no effects) is subtype of any effectful function.
         g.beginReservedBlock(check_fn_body);
         const a_fn_pl = try g.tagPayload(a, ty_function);
         const b_fn_pl = try g.tagPayload(b, ty_function);
         const a_ret = try g.recordField(a_fn_pl, "ret");
         const b_ret = try g.recordField(b_fn_pl, "ret");
         const ret_sub = try g.callDirect(f_is_subtype, &.{ a_ret, b_ret });
-        try g.ret(ret_sub);
+        // If return types aren't subtypes, fail immediately
+        const fn_ret_ok = g.reserveBlock();
+        const fn_ret_fail = g.reserveBlock();
+        try g.branch(ret_sub, fn_ret_ok, fn_ret_fail);
+
+        g.beginReservedBlock(fn_ret_fail);
+        try g.ret(try g.constBool(false));
+
+        // Check effect set: a's effects must be subset of b's effects
+        g.beginReservedBlock(fn_ret_ok);
+        const a_effects = try g.recordField(a_fn_pl, "effects");
+        _ = try g.recordField(b_fn_pl, "effects"); // b_effects — used in full subset check
+        // If a_effects is nil (pure), it's always a subtype
+        const a_eff_is_nil = try g.tagTest(a_effects, "Nil");
+        const fn_eff_ok = g.reserveBlock();
+        const fn_check_eff = g.reserveBlock();
+        try g.branch(a_eff_is_nil, fn_eff_ok, fn_check_eff);
+
+        g.beginReservedBlock(fn_eff_ok);
+        try g.ret(try g.constBool(true));
+
+        // a has effects — for bootstrap, be permissive (accept)
+        // Full subset check would iterate a's effects and verify each is in b
+        g.beginReservedBlock(fn_check_eff);
+        try g.ret(try g.constBool(true));
 
         // 8. Record subtyping: structural — a has all fields of b with subtypes
         g.beginReservedBlock(check_record);
@@ -619,13 +645,43 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(check_rc);
         const is_rc_type = try g.tagTest(type_expr, grammar.ast_type_rc);
         const rc_blk = g.reserveBlock();
-        const type_default = g.reserveBlock();
-        try g.branch(is_rc_type, rc_blk, type_default);
+        const check_array = g.reserveBlock();
+        try g.branch(is_rc_type, rc_blk, check_array);
 
         g.beginReservedBlock(rc_blk);
         const rc_inner_ast = try g.tagPayload(type_expr, grammar.ast_type_rc);
         const rc_inner_type = try g.callDirect(f_type_from_ast, &.{ rc_inner_ast, ctx });
         try g.ret(try g.tag(ty_rc, rc_inner_type));
+
+        // TypeArray -> [T; N]
+        g.beginReservedBlock(check_array);
+        const is_array_type = try g.tagTest(type_expr, grammar.ast_type_array);
+        const array_blk = g.reserveBlock();
+        const check_slice = g.reserveBlock();
+        try g.branch(is_array_type, array_blk, check_slice);
+
+        g.beginReservedBlock(array_blk);
+        const arr_pl = try g.tagPayload(type_expr, grammar.ast_type_array);
+        const arr_elem_ast = try g.recordField(arr_pl, "elem");
+        const arr_size = try g.recordField(arr_pl, "size");
+        const arr_elem_type = try g.callDirect(f_type_from_ast, &.{ arr_elem_ast, ctx });
+        const arr_type_rec = try g.record(&.{
+            .{ .name = "elem", .value = arr_elem_type },
+            .{ .name = "size", .value = arr_size },
+        });
+        try g.ret(try g.tag(ty_array, arr_type_rec));
+
+        // TypeSlice -> [T]
+        g.beginReservedBlock(check_slice);
+        const is_slice_type = try g.tagTest(type_expr, grammar.ast_type_slice);
+        const slice_blk = g.reserveBlock();
+        const type_default = g.reserveBlock();
+        try g.branch(is_slice_type, slice_blk, type_default);
+
+        g.beginReservedBlock(slice_blk);
+        const slice_elem_ast = try g.tagPayload(type_expr, grammar.ast_type_slice);
+        const slice_elem_type = try g.callDirect(f_type_from_ast, &.{ slice_elem_ast, ctx });
+        try g.ret(try g.tag(ty_slice, slice_elem_type));
 
         // Default: return TyAny (unknown type expression)
         g.beginReservedBlock(type_default);

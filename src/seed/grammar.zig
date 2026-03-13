@@ -1791,7 +1791,64 @@ fn genParseTypeExpr(g: *Gen, pf: ParserFuncs) !void {
     const lparen_str = try g.constString("(");
     const is_lparen = try g.eq(delim_val, lparen_str);
     const bare_paren_blk = g.reserveBlock();
-    try g.branch(is_lparen, bare_paren_blk, fallback_blk);
+    const check_lbracket_blk = g.reserveBlock();
+    try g.branch(is_lparen, bare_paren_blk, check_lbracket_blk);
+
+    // [ — array or slice type: [T; N] or [T]
+    g.beginReservedBlock(check_lbracket_blk);
+    const lbracket_str = try g.constString("[");
+    const is_lbracket = try g.eq(delim_val, lbracket_str);
+    const array_type_blk = g.reserveBlock();
+    try g.branch(is_lbracket, array_type_blk, fallback_blk);
+
+    g.beginReservedBlock(array_type_blk);
+    {
+        // Parse inner type
+        const arr_elem_r = try g.callDirect(pf.parse_type_expr, &.{ tokens, next_pos });
+        const arr_elem = try g.recordField(arr_elem_r, "node");
+        const arr_after_elem = try g.recordField(arr_elem_r, "pos");
+        // Check for ; (array) or ] (slice)
+        const arr_tok = try emitGetToken(g, tokens, arr_after_elem);
+        const arr_is_punct = try g.tagTest(arr_tok, "Punct");
+        const arr_check_semi_blk = g.reserveBlock();
+        const arr_check_close_blk = g.reserveBlock();
+        try g.branch(arr_is_punct, arr_check_semi_blk, arr_check_close_blk);
+
+        g.beginReservedBlock(arr_check_semi_blk);
+        const arr_punct_val = try g.tagPayload(arr_tok, "Punct");
+        const semi_str = try g.constString(";");
+        const is_semi = try g.eq(arr_punct_val, semi_str);
+        const arr_size_blk = g.reserveBlock();
+        try g.branch(is_semi, arr_size_blk, arr_check_close_blk);
+
+        // [T; N] — fixed-size array
+        g.beginReservedBlock(arr_size_blk);
+        const arr_after_semi = try emitAdvance(g, arr_after_elem); // skip ;
+        const arr_size_tok = try emitGetToken(g, tokens, arr_after_semi);
+        const arr_size_text = try g.tagPayload(arr_size_tok, "IntLit");
+        const arr_size_val = try g.stringToInt(arr_size_text);
+        const arr_after_size = try emitAdvance(g, arr_after_semi); // skip size
+        const arr_after_close = try emitAdvance(g, arr_after_size); // skip ]
+        const arr_rec = try g.record(&.{
+            .{ .name = "elem", .value = arr_elem },
+            .{ .name = "size", .value = arr_size_val },
+        });
+        const arr_node = try g.tag(ast_type_array, arr_rec);
+        const arr_res = try emitResult(g, arr_node, arr_after_close);
+        try g.ret(arr_res);
+
+        // [T] — slice type
+        g.beginReservedBlock(arr_check_close_blk);
+        const arr_close_is_delim = try g.tagTest(arr_tok, "Delim");
+        const arr_do_slice_blk = g.reserveBlock();
+        try g.branch(arr_close_is_delim, arr_do_slice_blk, fallback_blk);
+
+        g.beginReservedBlock(arr_do_slice_blk);
+        const arr_after_rbracket = try emitAdvance(g, arr_after_elem); // skip ]
+        const slice_node = try g.tag(ast_type_slice, arr_elem);
+        const slice_res = try emitResult(g, slice_node, arr_after_rbracket);
+        try g.ret(slice_res);
+    }
 
     // Bare ( — function type without fn keyword: advance past ( and enter fn_type loop
     g.beginReservedBlock(bare_paren_blk);
