@@ -93,13 +93,18 @@ pub const FunctionType = struct {
     effects: EffectSet,
 };
 
+pub const ArrayType = struct {
+    elem: *const Type,
+    size: u64,
+};
+
 pub const AppType = struct {
     constructor: InternedString,
     args: []const *const Type,
 };
 
 pub const Type = union(enum) {
-    // Primitives (14, matching kernel.md §1)
+    // Primitives (16, matching kernel.md §1)
     int,
     int8,
     int16,
@@ -114,23 +119,33 @@ pub const Type = union(enum) {
     string,
     nil,
     never,
+    usize_type,
+    isize_type,
 
     // Set-theoretic operations
     union_type: BinaryPayload,
     intersection: BinaryPayload,
     complement: *const Type,
 
+    // Pointer / memory types
+    ptr: *const Type,
+    ptr_mut: *const Type,
+    rc: *const Type,
+
+    // Collection types
+    array: ArrayType,
+    slice: *const Type,
+
     // Compound types
     record: RecordType,
     anon_record: AnonRecordType,
     tagged: TaggedType,
     function: FunctionType,
-    unique: *const Type,
     type_var: TypeVarId,
     app: AppType,
 
     /// Returns a tag for fast disjointness checking.
-    /// Scalar primitives (0-13) with different tags are always disjoint.
+    /// Types with different non-null tags are always disjoint.
     /// Set operations and type vars return null.
     pub fn primitiveTag(self: *const Type) ?u8 {
         return switch (self.*) {
@@ -148,12 +163,18 @@ pub const Type = union(enum) {
             .string => 11,
             .nil => 12,
             .never => 13,
-            .record => 14,
-            .anon_record => 15,
-            .tagged => 16,
-            .function => 17,
-            .unique => 18,
-            .app => 19,
+            .usize_type => 14,
+            .isize_type => 15,
+            .record => 16,
+            .anon_record => 17,
+            .tagged => 18,
+            .function => 19,
+            .ptr => 20,
+            .ptr_mut => 21,
+            .rc => 22,
+            .array => 23,
+            .slice => 24,
+            .app => 25,
             .union_type, .intersection, .complement, .type_var => null,
         };
     }
@@ -170,12 +191,16 @@ pub fn typeEqual(a: *const Type, b: *const Type) bool {
 
     return switch (a.*) {
         // Payload-less primitives: discriminant match is sufficient.
-        .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float, .float32, .bool_type, .string, .nil, .never => true,
+        .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float, .float32, .bool_type, .string, .nil, .never, .usize_type, .isize_type => true,
 
         .union_type => |au| typeEqual(au.left, b.union_type.left) and typeEqual(au.right, b.union_type.right),
         .intersection => |ai| typeEqual(ai.left, b.intersection.left) and typeEqual(ai.right, b.intersection.right),
         .complement => |ac| typeEqual(ac, b.complement),
-        .unique => |au| typeEqual(au, b.unique),
+        .ptr => |ap| typeEqual(ap, b.ptr),
+        .ptr_mut => |ap| typeEqual(ap, b.ptr_mut),
+        .rc => |ar| typeEqual(ar, b.rc),
+        .slice => |as_| typeEqual(as_, b.slice),
+        .array => |aa| aa.size == b.array.size and typeEqual(aa.elem, b.array.elem),
         .type_var => |av| av == b.type_var,
         .function => |af| blk: {
             const bf = b.function;
@@ -331,6 +356,12 @@ pub const TypeContext = struct {
     pub fn makeNever(self: *TypeContext) !*const Type {
         return self.put(.never);
     }
+    pub fn makeUsize(self: *TypeContext) !*const Type {
+        return self.put(.usize_type);
+    }
+    pub fn makeIsize(self: *TypeContext) !*const Type {
+        return self.put(.isize_type);
+    }
 
     // ── Set operations ──────────────────────────────────────────────
 
@@ -346,6 +377,24 @@ pub const TypeContext = struct {
         return self.put(.{ .complement = inner });
     }
 
+    // ── Pointer / memory types ──────────────────────────────────────
+
+    pub fn makePtr(self: *TypeContext, inner: *const Type) !*const Type {
+        return self.put(.{ .ptr = inner });
+    }
+    pub fn makePtrMut(self: *TypeContext, inner: *const Type) !*const Type {
+        return self.put(.{ .ptr_mut = inner });
+    }
+    pub fn makeRc(self: *TypeContext, inner: *const Type) !*const Type {
+        return self.put(.{ .rc = inner });
+    }
+    pub fn makeArray(self: *TypeContext, elem: *const Type, size: u64) !*const Type {
+        return self.put(.{ .array = .{ .elem = elem, .size = size } });
+    }
+    pub fn makeSlice(self: *TypeContext, elem: *const Type) !*const Type {
+        return self.put(.{ .slice = elem });
+    }
+
     // ── Compound types ──────────────────────────────────────────────
 
     pub fn makeFunction(self: *TypeContext, params: []const *const Type, return_type: *const Type, effects: EffectSet) !*const Type {
@@ -357,10 +406,6 @@ pub const TypeContext = struct {
                 .tail_var = effects.tail_var,
             },
         } });
-    }
-
-    pub fn makeUnique(self: *TypeContext, inner: *const Type) !*const Type {
-        return self.put(.{ .unique = inner });
     }
 
     pub fn makeRecord(self: *TypeContext, name: InternedString, fields: []const Field) !*const Type {
@@ -516,16 +561,15 @@ fn clauseIsUnsatisfiable(clause: DnfClause) bool {
         }
     }
 
-    // 3. Two distinct scalar primitives in positive (Int & Bool = empty).
-    var seen_scalar_tag: ?u8 = null;
+    // 3. Two distinct concrete types in positive position are disjoint.
+    // Any two types with different non-null primitive tags cannot overlap.
+    var seen_tag: ?u8 = null;
     for (clause.positive) |p| {
         if (p.primitiveTag()) |tag| {
-            if (tag <= 13) { // scalar primitive range
-                if (seen_scalar_tag) |prev| {
-                    if (prev != tag) return true;
-                } else {
-                    seen_scalar_tag = tag;
-                }
+            if (seen_tag) |prev| {
+                if (prev != tag) return true;
+            } else {
+                seen_tag = tag;
             }
         }
     }
@@ -548,11 +592,18 @@ pub fn isSubtype(a: *const Type, b: *const Type, ctx: *TypeContext, gpa: Allocat
     // Fast: structural equality.
     if (typeEqual(a, b)) return true;
 
-    // Unique<T> <: U if T <: U.
-    if (a.* == .unique) {
+    // rc T <: *T (reference-counted pointer usable as immutable pointer)
+    if (a.* == .rc and b.* == .ptr) {
         var tmp = TypeContext.init(gpa);
         defer tmp.deinit();
-        return isSubtype(a.unique, b, &tmp, gpa);
+        return isSubtype(a.rc, b.ptr, &tmp, gpa);
+    }
+
+    // *mut T <: *T (mutable pointer coerces to immutable)
+    if (a.* == .ptr_mut and b.* == .ptr) {
+        var tmp = TypeContext.init(gpa);
+        defer tmp.deinit();
+        return isSubtype(a.ptr_mut, b.ptr, &tmp, gpa);
     }
 
     // Function structural subtyping: contravariant params, covariant return, effect subset.
@@ -648,7 +699,8 @@ test "types: all primitives constructible" {
         try ctx.makeInt32(),   try ctx.makeUInt8(),   try ctx.makeUInt16(),
         try ctx.makeUInt32(),  try ctx.makeUInt64(),  try ctx.makeFloat(),
         try ctx.makeFloat32(), try ctx.makeBool(),    try ctx.makeString(),
-        try ctx.makeNil(),     try ctx.makeNever(),
+        try ctx.makeNil(),     try ctx.makeNever(),   try ctx.makeUsize(),
+        try ctx.makeIsize(),
     };
     inline for (primitives, 0..) |p, i| {
         try std.testing.expectEqual(@as(?u8, @intCast(i)), p.primitiveTag());
@@ -798,7 +850,7 @@ test "types: all pairs of scalar primitives are disjoint" {
         &TypeContext.makeInt32,   &TypeContext.makeUInt8,   &TypeContext.makeUInt16,
         &TypeContext.makeUInt32,  &TypeContext.makeUInt64,  &TypeContext.makeFloat,
         &TypeContext.makeFloat32, &TypeContext.makeBool,    &TypeContext.makeString,
-        &TypeContext.makeNil,
+        &TypeContext.makeNil,     &TypeContext.makeUsize,   &TypeContext.makeIsize,
     };
 
     var types: [makers.len]*const Type = undefined;
@@ -869,31 +921,6 @@ test "types: Never <: T" {
     try std.testing.expect(try isSubtype(never, int_t, &ctx, gpa));
     try std.testing.expect(try isSubtype(never, str_t, &ctx, gpa));
     try std.testing.expect(try isSubtype(never, u, &ctx, gpa));
-}
-
-test "types: Unique<T> <: T" {
-    const gpa = std.testing.allocator;
-    var ctx = TypeContext.init(gpa);
-    defer ctx.deinit();
-
-    const int_t = try ctx.makeInt();
-    const unique_int = try ctx.makeUnique(int_t);
-
-    try std.testing.expect(try isSubtype(unique_int, int_t, &ctx, gpa));
-    try std.testing.expect(!try isSubtype(int_t, unique_int, &ctx, gpa));
-}
-
-test "types: nested Unique" {
-    const gpa = std.testing.allocator;
-    var ctx = TypeContext.init(gpa);
-    defer ctx.deinit();
-
-    const int_t = try ctx.makeInt();
-    const uniq1 = try ctx.makeUnique(int_t);
-    const uniq2 = try ctx.makeUnique(uniq1);
-
-    // Unique<Unique<Int>> <: Int
-    try std.testing.expect(try isSubtype(uniq2, int_t, &ctx, gpa));
 }
 
 test "types: function pure <: effectful" {
@@ -1109,4 +1136,119 @@ test "types: type variable" {
     const t = try ctx.makeTypeVar(tv);
     try std.testing.expect(t.* == .type_var);
     try std.testing.expect(t.primitiveTag() == null);
+}
+
+test "types: pointer type construction" {
+    const gpa = std.testing.allocator;
+    var ctx = TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    const i32_t = try ctx.makeInt32();
+    const ptr_t = try ctx.makePtr(i32_t);
+    const ptr_mut_t = try ctx.makePtrMut(i32_t);
+    const rc_t = try ctx.makeRc(i32_t);
+
+    try std.testing.expect(ptr_t.* == .ptr);
+    try std.testing.expect(ptr_mut_t.* == .ptr_mut);
+    try std.testing.expect(rc_t.* == .rc);
+}
+
+test "types: array and slice construction" {
+    const gpa = std.testing.allocator;
+    var ctx = TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    const u8_t = try ctx.makeUInt8();
+    const arr_t = try ctx.makeArray(u8_t, 256);
+    const slice_t = try ctx.makeSlice(u8_t);
+
+    try std.testing.expect(arr_t.* == .array);
+    try std.testing.expectEqual(@as(u64, 256), arr_t.array.size);
+    try std.testing.expect(slice_t.* == .slice);
+}
+
+test "types: rc T <: *T" {
+    const gpa = std.testing.allocator;
+    var ctx = TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    const i32_t = try ctx.makeInt32();
+    const rc_t = try ctx.makeRc(i32_t);
+    const ptr_t = try ctx.makePtr(i32_t);
+
+    // rc i32 <: *i32
+    try std.testing.expect(try isSubtype(rc_t, ptr_t, &ctx, gpa));
+    // *i32 NOT <: rc i32
+    try std.testing.expect(!try isSubtype(ptr_t, rc_t, &ctx, gpa));
+}
+
+test "types: *mut T <: *T" {
+    const gpa = std.testing.allocator;
+    var ctx = TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    const i32_t = try ctx.makeInt32();
+    const ptr_mut_t = try ctx.makePtrMut(i32_t);
+    const ptr_t = try ctx.makePtr(i32_t);
+
+    // *mut i32 <: *i32
+    try std.testing.expect(try isSubtype(ptr_mut_t, ptr_t, &ctx, gpa));
+    // *i32 NOT <: *mut i32
+    try std.testing.expect(!try isSubtype(ptr_t, ptr_mut_t, &ctx, gpa));
+}
+
+test "types: pointer type equality" {
+    const gpa = std.testing.allocator;
+    var ctx = TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    const i32_t = try ctx.makeInt32();
+    const i64_t = try ctx.makeInt();
+
+    const ptr_a = try ctx.makePtr(i32_t);
+    const ptr_b = try ctx.makePtr(i32_t);
+    const ptr_c = try ctx.makePtr(i64_t);
+
+    try std.testing.expect(typeEqual(ptr_a, ptr_b));
+    try std.testing.expect(!typeEqual(ptr_a, ptr_c));
+}
+
+test "types: rc T not subtype of *mut T" {
+    const gpa = std.testing.allocator;
+    var ctx = TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    const i32_t = try ctx.makeInt32();
+    const rc_t = try ctx.makeRc(i32_t);
+    const ptr_mut_t = try ctx.makePtrMut(i32_t);
+
+    // rc i32 NOT <: *mut i32 (rc gives shared immutable access, not mutable)
+    try std.testing.expect(!try isSubtype(rc_t, ptr_mut_t, &ctx, gpa));
+}
+
+test "types: array type equality" {
+    const gpa = std.testing.allocator;
+    var ctx = TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    const u8_t = try ctx.makeUInt8();
+    const arr_a = try ctx.makeArray(u8_t, 64);
+    const arr_b = try ctx.makeArray(u8_t, 64);
+    const arr_c = try ctx.makeArray(u8_t, 128);
+
+    try std.testing.expect(typeEqual(arr_a, arr_b));
+    try std.testing.expect(!typeEqual(arr_a, arr_c));
+}
+
+test "types: pointer types are disjoint from primitives" {
+    const gpa = std.testing.allocator;
+    var ctx = TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    const i32_t = try ctx.makeInt32();
+    const ptr_t = try ctx.makePtr(i32_t);
+
+    // *i32 & i32 should be empty (pointer and primitive are disjoint)
+    const inter = try ctx.makeIntersection(ptr_t, i32_t);
+    try std.testing.expect(try isEmpty(inter, &ctx, gpa));
 }
