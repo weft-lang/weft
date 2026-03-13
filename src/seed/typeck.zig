@@ -54,11 +54,14 @@ pub const tast_let = "TLet";
 pub const tast_block = "TBlock";
 pub const tast_lambda = "TLambda";
 pub const tast_handle = "THandle";
+pub const tast_perform = "TPerform";
 pub const tast_record_lit = "TRecordLit";
 pub const tast_list_lit = "TListLit";
 pub const tast_field_access = "TFieldAccess";
 pub const tast_record_update = "TRecordUpdate";
 pub const tast_string_interp = "TStringInterp";
+pub const tast_unsafe = "TUnsafe";
+pub const tast_extern_fn = "TExternFn";
 pub const tast_fn_decl = "TFnDecl";
 pub const tast_module = "TModule";
 
@@ -1276,46 +1279,116 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const call_pl = try g.tagPayload(expr, grammar.ast_call);
             const callee = try g.recordField(call_pl, "callee");
             const args = try g.recordField(call_pl, "args");
-            const callee_result = try g.callDirect(f_infer, &.{ callee, ctx });
-            const callee_typed = try g.recordField(callee_result, "expr");
-            const callee_type = try g.recordField(callee_result, "type");
-            const result_type = try g.callDirect(f_infer_call, &.{ callee_type, args, ctx });
 
-            // Infer types of arguments
-            const args_len = try g.listLength(args);
-            const zero = try g.constInt(0);
-            const empty_list = try g.listInit(&.{});
-            const args_loop = g.reserveBlock();
-            try g.jump(args_loop, &.{ zero, empty_list });
+            // Check if this is an effect perform: callee is FieldAccess(Ident(effect_name), op)
+            const is_fa = try g.tagTest(callee, grammar.ast_field_access);
+            const perform_check_blk = g.reserveBlock();
+            const normal_call_blk = g.reserveBlock();
+            try g.branch(is_fa, perform_check_blk, normal_call_blk);
 
-            g.beginReservedBlock(args_loop);
-            const args_idx = try g.addBlockParam();
-            const typed_args = try g.addBlockParam();
-            const args_done = try g.ge(args_idx, args_len);
-            const args_body = g.reserveBlock();
-            const args_exit = g.reserveBlock();
-            try g.branch(args_done, args_exit, args_body);
+            g.beginReservedBlock(perform_check_blk);
+            {
+                const fa_pl = try g.tagPayload(callee, grammar.ast_field_access);
+                const fa_base = try g.recordField(fa_pl, "expr");
+                const fa_field = try g.recordField(fa_pl, "field");
+                const base_is_ident = try g.tagTest(fa_base, grammar.ast_ident);
+                const check_effect_blk = g.reserveBlock();
+                try g.branch(base_is_ident, check_effect_blk, normal_call_blk);
 
-            g.beginReservedBlock(args_body);
-            const arg = try g.listNth(args, args_idx);
-            const arg_result = try g.callDirect(f_infer, &.{ arg, ctx });
-            const arg_typed = try g.recordField(arg_result, "expr");
-            const new_typed_args = try g.listAppend(typed_args, arg_typed);
-            const one_a = try g.constInt(1);
-            const next_a = try g.add(args_idx, one_a);
-            try g.jump(args_loop, &.{ next_a, new_typed_args });
+                g.beginReservedBlock(check_effect_blk);
+                {
+                    const base_name = try g.tagPayload(fa_base, grammar.ast_ident);
+                    const effects_map = try g.recordField(ctx, "effects");
+                    const is_effect = try g.mapHas(effects_map, base_name);
+                    const perform_blk = g.reserveBlock();
+                    try g.branch(is_effect, perform_blk, normal_call_blk);
 
-            g.beginReservedBlock(args_exit);
-            const call_typed = try g.record(&.{
-                .{ .name = "callee", .value = callee_typed },
-                .{ .name = "args", .value = typed_args },
-                .{ .name = "type", .value = result_type },
-            });
-            const texpr = try g.tag(tast_call, call_typed);
-            try g.ret(try g.record(&.{
-                .{ .name = "expr", .value = texpr },
-                .{ .name = "type", .value = result_type },
-            }));
+                    g.beginReservedBlock(perform_blk);
+                    {
+                        // This is an effect perform. Infer arg types, produce TPerform.
+                        const p_args_len = try g.listLength(args);
+                        const p_zero = try g.constInt(0);
+                        const p_empty = try g.listInit(&.{});
+                        const p_loop = g.reserveBlock();
+                        try g.jump(p_loop, &.{ p_zero, p_empty });
+
+                        g.beginReservedBlock(p_loop);
+                        const p_idx = try g.addBlockParam();
+                        const p_typed = try g.addBlockParam();
+                        const p_done = try g.ge(p_idx, p_args_len);
+                        const p_body = g.reserveBlock();
+                        const p_exit = g.reserveBlock();
+                        try g.branch(p_done, p_exit, p_body);
+
+                        g.beginReservedBlock(p_body);
+                        const p_arg = try g.listNth(args, p_idx);
+                        const p_arg_r = try g.callDirect(f_infer, &.{ p_arg, ctx });
+                        const p_arg_t = try g.recordField(p_arg_r, "expr");
+                        const p_new = try g.listAppend(p_typed, p_arg_t);
+                        const p_one = try g.constInt(1);
+                        const p_next = try g.add(p_idx, p_one);
+                        try g.jump(p_loop, &.{ p_next, p_new });
+
+                        g.beginReservedBlock(p_exit);
+                        const perform_type = try g.tag(ty_any, null);
+                        const perform_rec = try g.record(&.{
+                            .{ .name = "effect", .value = base_name },
+                            .{ .name = "op", .value = fa_field },
+                            .{ .name = "args", .value = p_typed },
+                        });
+                        const perform_texpr = try g.tag(tast_perform, perform_rec);
+                        try g.ret(try g.record(&.{
+                            .{ .name = "expr", .value = perform_texpr },
+                            .{ .name = "type", .value = perform_type },
+                        }));
+                    }
+                }
+            }
+
+            // Normal call path
+            g.beginReservedBlock(normal_call_blk);
+            {
+                const callee_result = try g.callDirect(f_infer, &.{ callee, ctx });
+                const callee_typed = try g.recordField(callee_result, "expr");
+                const callee_type = try g.recordField(callee_result, "type");
+                const result_type = try g.callDirect(f_infer_call, &.{ callee_type, args, ctx });
+
+                // Infer types of arguments
+                const args_len = try g.listLength(args);
+                const zero = try g.constInt(0);
+                const empty_list = try g.listInit(&.{});
+                const args_loop = g.reserveBlock();
+                try g.jump(args_loop, &.{ zero, empty_list });
+
+                g.beginReservedBlock(args_loop);
+                const args_idx = try g.addBlockParam();
+                const typed_args = try g.addBlockParam();
+                const args_done = try g.ge(args_idx, args_len);
+                const args_body = g.reserveBlock();
+                const args_exit = g.reserveBlock();
+                try g.branch(args_done, args_exit, args_body);
+
+                g.beginReservedBlock(args_body);
+                const arg = try g.listNth(args, args_idx);
+                const arg_result = try g.callDirect(f_infer, &.{ arg, ctx });
+                const arg_typed = try g.recordField(arg_result, "expr");
+                const new_typed_args = try g.listAppend(typed_args, arg_typed);
+                const one_a = try g.constInt(1);
+                const next_a = try g.add(args_idx, one_a);
+                try g.jump(args_loop, &.{ next_a, new_typed_args });
+
+                g.beginReservedBlock(args_exit);
+                const call_typed = try g.record(&.{
+                    .{ .name = "callee", .value = callee_typed },
+                    .{ .name = "args", .value = typed_args },
+                    .{ .name = "type", .value = result_type },
+                });
+                const texpr = try g.tag(tast_call, call_typed);
+                try g.ret(try g.record(&.{
+                    .{ .name = "expr", .value = texpr },
+                    .{ .name = "type", .value = result_type },
+                }));
+            }
         }
 
         // If
@@ -1677,8 +1750,71 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             }
         }
 
-        // Unary
+        // RecordUpdate
         g.beginReservedBlock(check_unary);
+        const is_rec_upd = try g.tagTest(expr, grammar.ast_record_update);
+        const rec_upd_blk = g.reserveBlock();
+        const check_unary_real = g.reserveBlock();
+        try g.branch(is_rec_upd, rec_upd_blk, check_unary_real);
+
+        g.beginReservedBlock(rec_upd_blk);
+        {
+            // RecordUpdate { base: Expr, fields: [{name, value}] }
+            const ru_pl = try g.tagPayload(expr, grammar.ast_record_update);
+            const ru_base = try g.recordField(ru_pl, "base");
+            const ru_fields = try g.recordField(ru_pl, "fields");
+            // Type-check base expression
+            const ru_base_result = try g.callDirect(f_infer, &.{ ru_base, ctx });
+            const ru_base_typed = try g.recordField(ru_base_result, "expr");
+            // Type-check each update field value
+            const ru_num = try g.listLength(ru_fields);
+            const ru_zero = try g.constInt(0);
+            const ru_typed_fields = try g.listInit(&.{});
+            const ru_loop = g.reserveBlock();
+            try g.jump(ru_loop, &.{ ru_zero, ru_typed_fields });
+
+            g.beginReservedBlock(ru_loop);
+            const ru_i = try g.addBlockParam();
+            const ru_tfs = try g.addBlockParam();
+            const ru_done = try g.ge(ru_i, ru_num);
+            const ru_body = g.reserveBlock();
+            const ru_exit = g.reserveBlock();
+            try g.branch(ru_done, ru_exit, ru_body);
+
+            g.beginReservedBlock(ru_body);
+            {
+                const ru_f = try g.listNth(ru_fields, ru_i);
+                const ru_fn = try g.recordField(ru_f, "name");
+                const ru_fv = try g.recordField(ru_f, "value");
+                const ru_fr = try g.callDirect(f_infer, &.{ ru_fv, ctx });
+                const ru_ft = try g.recordField(ru_fr, "expr");
+                const ru_tf = try g.record(&.{
+                    .{ .name = "name", .value = ru_fn },
+                    .{ .name = "value", .value = ru_ft },
+                });
+                const ru_tfs2 = try g.listAppend(ru_tfs, ru_tf);
+                const ru_one = try g.constInt(1);
+                const ru_next = try g.add(ru_i, ru_one);
+                try g.jump(ru_loop, &.{ ru_next, ru_tfs2 });
+            }
+
+            g.beginReservedBlock(ru_exit);
+            {
+                const ru_type = try g.tag(ty_any, null);
+                const ru_typed_rec = try g.record(&.{
+                    .{ .name = "base", .value = ru_base_typed },
+                    .{ .name = "fields", .value = ru_tfs },
+                });
+                const ru_texpr = try g.tag(tast_record_update, ru_typed_rec);
+                try g.ret(try g.record(&.{
+                    .{ .name = "expr", .value = ru_texpr },
+                    .{ .name = "type", .value = ru_type },
+                }));
+            }
+        }
+
+        // Unary
+        g.beginReservedBlock(check_unary_real);
         const is_unary = try g.tagTest(expr, grammar.ast_unary);
         const unary_blk = g.reserveBlock();
         const check_pipe = g.reserveBlock();
@@ -1708,8 +1844,8 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(check_pipe);
         const is_pipe = try g.tagTest(expr, grammar.ast_pipe);
         const pipe_blk = g.reserveBlock();
-        const default_expr = g.reserveBlock();
-        try g.branch(is_pipe, pipe_blk, default_expr);
+        const check_handle = g.reserveBlock();
+        try g.branch(is_pipe, pipe_blk, check_handle);
 
         g.beginReservedBlock(pipe_blk);
         {
@@ -1732,6 +1868,111 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             try g.ret(try g.record(&.{
                 .{ .name = "expr", .value = texpr },
                 .{ .name = "type", .value = pipe_result_type },
+            }));
+        }
+
+        // Handle expression
+        g.beginReservedBlock(check_handle);
+        const is_handle = try g.tagTest(expr, grammar.ast_handle);
+        const handle_blk = g.reserveBlock();
+        const check_unsafe = g.reserveBlock();
+        try g.branch(is_handle, handle_blk, check_unsafe);
+
+        g.beginReservedBlock(handle_blk);
+        {
+            const handle_pl = try g.tagPayload(expr, grammar.ast_handle);
+            const handle_body = try g.recordField(handle_pl, "body");
+            const handle_clauses = try g.recordField(handle_pl, "clauses");
+
+            // Infer body type
+            const body_result = try g.callDirect(f_infer, &.{ handle_body, ctx });
+            const body_typed = try g.recordField(body_result, "expr");
+            const body_type = try g.recordField(body_result, "type");
+
+            // Extract effect name from first clause's pattern qualifier
+            const first_clause = try g.listNth(handle_clauses, try g.constInt(0));
+            const first_pat = try g.recordField(first_clause, "pattern");
+            const first_pat_pl = try g.tagPayload(first_pat, grammar.ast_pat_constructor);
+            const effect_name = try g.recordField(first_pat_pl, "qualifier");
+
+            // Type each handler clause: pattern + body (with resume in scope)
+            const hc_len = try g.listLength(handle_clauses);
+            const hc_zero = try g.constInt(0);
+            const hc_empty = try g.listInit(&.{});
+            const hc_loop = g.reserveBlock();
+            try g.jump(hc_loop, &.{ hc_zero, hc_empty });
+
+            g.beginReservedBlock(hc_loop);
+            const hc_idx = try g.addBlockParam();
+            const hc_typed_list = try g.addBlockParam();
+            const hc_done = try g.ge(hc_idx, hc_len);
+            const hc_body_blk = g.reserveBlock();
+            const hc_exit = g.reserveBlock();
+            try g.branch(hc_done, hc_exit, hc_body_blk);
+
+            g.beginReservedBlock(hc_body_blk);
+            {
+                const clause = try g.listNth(handle_clauses, hc_idx);
+                const clause_pat = try g.recordField(clause, "pattern");
+                const clause_body = try g.recordField(clause, "body");
+
+                // Check pattern to bind params
+                const pat_result = try g.callDirect(f_check_pattern, &.{ clause_pat, body_type, ctx });
+                const pat_ctx = try g.recordField(pat_result, "ctx");
+                const pat_typed = try g.recordField(pat_result, "typed_pat");
+
+                // Bind "resume" as a function in the clause body's context
+                const resume_name = try g.constString("resume");
+                const resume_type = try g.tag(ty_any, null);
+                const clause_ctx = try g.callDirect(f_ctx_bind_value, &.{ pat_ctx, resume_name, resume_type });
+
+                // Infer clause body
+                const clause_result = try g.callDirect(f_infer, &.{ clause_body, clause_ctx });
+                const clause_typed = try g.recordField(clause_result, "expr");
+
+                const typed_clause = try g.record(&.{
+                    .{ .name = "pattern", .value = pat_typed },
+                    .{ .name = "body", .value = clause_typed },
+                });
+                const new_list = try g.listAppend(hc_typed_list, typed_clause);
+                const hc_one = try g.constInt(1);
+                const hc_next = try g.add(hc_idx, hc_one);
+                try g.jump(hc_loop, &.{ hc_next, new_list });
+            }
+
+            g.beginReservedBlock(hc_exit);
+            {
+                const handle_typed = try g.record(&.{
+                    .{ .name = "body", .value = body_typed },
+                    .{ .name = "effect", .value = effect_name },
+                    .{ .name = "clauses", .value = hc_typed_list },
+                    .{ .name = "type", .value = body_type },
+                });
+                const handle_texpr = try g.tag(tast_handle, handle_typed);
+                try g.ret(try g.record(&.{
+                    .{ .name = "expr", .value = handle_texpr },
+                    .{ .name = "type", .value = body_type },
+                }));
+            }
+        }
+
+        // Unsafe expression — transparent, just infer the inner expression
+        g.beginReservedBlock(check_unsafe);
+        const is_unsafe = try g.tagTest(expr, grammar.ast_unsafe);
+        const unsafe_blk = g.reserveBlock();
+        const default_expr = g.reserveBlock();
+        try g.branch(is_unsafe, unsafe_blk, default_expr);
+
+        g.beginReservedBlock(unsafe_blk);
+        {
+            const unsafe_body = try g.tagPayload(expr, grammar.ast_unsafe);
+            const unsafe_r = try g.callDirect(f_infer, &.{ unsafe_body, ctx });
+            const unsafe_typed = try g.recordField(unsafe_r, "expr");
+            const unsafe_type = try g.recordField(unsafe_r, "type");
+            const unsafe_texpr = try g.tag(tast_unsafe, unsafe_typed);
+            try g.ret(try g.record(&.{
+                .{ .name = "expr", .value = unsafe_texpr },
+                .{ .name = "type", .value = unsafe_type },
             }));
         }
 
@@ -1826,7 +2067,78 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
         // Get declarations list from module
         const module_pl = try g.tagPayload(module, grammar.ast_module);
-        const decls = module_pl; // Module payload is the decls list
+        const raw_decls = module_pl; // Module payload is the decls list
+
+        // Pre-process: flatten impl methods into top-level declarations
+        const raw_len = try g.listLength(raw_decls);
+        const flat_zero = try g.constInt(0);
+        const flat_empty = try g.listInit(&.{});
+        const flat_loop = g.reserveBlock();
+        try g.jump(flat_loop, &.{ flat_zero, flat_empty });
+
+        g.beginReservedBlock(flat_loop);
+        const flat_i = try g.addBlockParam();
+        const flat_decls = try g.addBlockParam();
+        const flat_done = try g.ge(flat_i, raw_len);
+        const flat_body = g.reserveBlock();
+        const flat_exit = g.reserveBlock();
+        try g.branch(flat_done, flat_exit, flat_body);
+
+        g.beginReservedBlock(flat_body);
+        {
+            const flat_d = try g.listNth(raw_decls, flat_i);
+            const flat_is_impl = try g.tagTest(flat_d, grammar.ast_impl_decl);
+            const flat_impl_blk = g.reserveBlock();
+            const flat_skip = g.reserveBlock();
+            try g.branch(flat_is_impl, flat_impl_blk, flat_skip);
+
+            // ImplDecl: extract methods and append as top-level FnDecls
+            g.beginReservedBlock(flat_impl_blk);
+            {
+                const impl_pl = try g.tagPayload(flat_d, grammar.ast_impl_decl);
+                const impl_methods = try g.recordField(impl_pl, "methods");
+                const im_len = try g.listLength(impl_methods);
+                const im_zero = try g.constInt(0);
+                const im_loop = g.reserveBlock();
+                try g.jump(im_loop, &.{ im_zero, flat_decls });
+
+                g.beginReservedBlock(im_loop);
+                const im_i = try g.addBlockParam();
+                const im_decls = try g.addBlockParam();
+                const im_done = try g.ge(im_i, im_len);
+                const im_body = g.reserveBlock();
+                const im_exit = g.reserveBlock();
+                try g.branch(im_done, im_exit, im_body);
+
+                g.beginReservedBlock(im_body);
+                {
+                    const im_method = try g.listNth(impl_methods, im_i);
+                    const im_decls2 = try g.listAppend(im_decls, im_method);
+                    const im_one = try g.constInt(1);
+                    const im_next = try g.add(im_i, im_one);
+                    try g.jump(im_loop, &.{ im_next, im_decls2 });
+                }
+
+                g.beginReservedBlock(im_exit);
+                {
+                    const flat_one = try g.constInt(1);
+                    const flat_next = try g.add(flat_i, flat_one);
+                    try g.jump(flat_loop, &.{ flat_next, im_decls });
+                }
+            }
+
+            // Not impl — keep in list
+            g.beginReservedBlock(flat_skip);
+            {
+                const flat_decls2 = try g.listAppend(flat_decls, flat_d);
+                const flat_one2 = try g.constInt(1);
+                const flat_next2 = try g.add(flat_i, flat_one2);
+                try g.jump(flat_loop, &.{ flat_next2, flat_decls2 });
+            }
+        }
+
+        g.beginReservedBlock(flat_exit);
+        const decls = flat_decls;
 
         // First pass: collect all declarations
         const empty_ctx = try g.callDirect(f_ctx_new, &.{});

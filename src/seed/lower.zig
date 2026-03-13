@@ -20,10 +20,16 @@ pub const ir_call = "IrCall";
 pub const ir_tag_init = "IrTagInit";
 pub const ir_record_init = "IrRecordInit";
 pub const ir_field_get = "IrFieldGet";
+pub const ir_record_update = "IrRecordUpdate";
 pub const ir_tag_test = "IrTagTest";
 pub const ir_tag_payload = "IrTagPayload";
 pub const ir_list_init = "IrListInit";
 pub const ir_closure = "IrClosure";
+pub const ir_perform = "IrPerform";
+pub const ir_handle_setup = "IrHandleSetup";
+pub const ir_handle_pop = "IrHandlePop";
+pub const ir_resume = "IrResume";
+pub const ir_arg_receive = "IrArgReceive";
 
 // ── Terminator tag constants ────────────────────────────────────────────
 pub const ir_ret = "IrRet";
@@ -50,6 +56,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
     const f_lower_match = try g.reserveFunc("lc_lower_match");
     const f_lower_match_arms = try g.reserveFunc("lc_lower_match_arms");
     const f_lower_fn_decl = try g.reserveFunc("lc_lower_fn_decl");
+    const f_lower_handle = try g.reserveFunc("lc_lower_handle");
     const f_lower_module = try g.reserveFunc("lc_lower_module");
 
     // ── Generate: lc_state_new() -> LowerState ──────────────────────
@@ -754,8 +761,80 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             }
         }
 
-        // ── TUnary ──
+        // ── TRecordUpdate ──
         g.beginReservedBlock(check_unary);
+        const is_rec_upd = try g.tagTest(expr, typeck.tast_record_update);
+        const rec_upd_blk = g.reserveBlock();
+        const check_unary_real = g.reserveBlock();
+        try g.branch(is_rec_upd, rec_upd_blk, check_unary_real);
+
+        g.beginReservedBlock(rec_upd_blk);
+        {
+            // TRecordUpdate { base: typed_expr, fields: [{name, value: typed_expr}] }
+            const ru_pl = try g.tagPayload(expr, typeck.tast_record_update);
+            const ru_base_expr = try g.recordField(ru_pl, "base");
+            const ru_upd_fields = try g.recordField(ru_pl, "fields");
+
+            // Lower base expression
+            const ru_base_r = try g.callDirect(f_lower_expr, &.{ ru_base_expr, scope, state });
+            const ru_base_val = try g.recordField(ru_base_r, "value");
+            const ru_st1 = try g.recordField(ru_base_r, "state");
+
+            // Lower each update field value
+            const ru_n = try g.listLength(ru_upd_fields);
+            const ru_zero = try g.constInt(0);
+            const ru_ir_fields = try g.listInit(&.{});
+            const ru_loop = g.reserveBlock();
+            try g.jump(ru_loop, &.{ ru_zero, ru_st1, ru_ir_fields });
+
+            g.beginReservedBlock(ru_loop);
+            const ru_i = try g.addBlockParam();
+            const ru_st = try g.addBlockParam();
+            const ru_ifs = try g.addBlockParam();
+            const ru_done = try g.ge(ru_i, ru_n);
+            const ru_body_blk = g.reserveBlock();
+            const ru_exit_blk = g.reserveBlock();
+            try g.branch(ru_done, ru_exit_blk, ru_body_blk);
+
+            g.beginReservedBlock(ru_body_blk);
+            {
+                const ru_f = try g.listNth(ru_upd_fields, ru_i);
+                const ru_fn = try g.recordField(ru_f, "name");
+                const ru_fv = try g.recordField(ru_f, "value");
+                const ru_fr = try g.callDirect(f_lower_expr, &.{ ru_fv, scope, ru_st });
+                const ru_fvid = try g.recordField(ru_fr, "value");
+                const ru_st2 = try g.recordField(ru_fr, "state");
+                const ru_if = try g.record(&.{
+                    .{ .name = "name", .value = ru_fn },
+                    .{ .name = "value", .value = ru_fvid },
+                });
+                const ru_ifs2 = try g.listAppend(ru_ifs, ru_if);
+                const ru_one = try g.constInt(1);
+                const ru_next = try g.add(ru_i, ru_one);
+                try g.jump(ru_loop, &.{ ru_next, ru_st2, ru_ifs2 });
+            }
+
+            g.beginReservedBlock(ru_exit_blk);
+            {
+                const ru_fv = try g.callDirect(f_fresh_val, &.{ru_st});
+                const ru_dst = try g.recordField(ru_fv, "id");
+                const ru_st_final = try g.recordField(ru_fv, "state");
+                const ru_inst_rec = try g.record(&.{
+                    .{ .name = "dst", .value = ru_dst },
+                    .{ .name = "base", .value = ru_base_val },
+                    .{ .name = "updates", .value = ru_ifs },
+                });
+                const ru_inst = try g.tag(ir_record_update, ru_inst_rec);
+                const ru_st_done = try g.callDirect(f_emit_inst, &.{ ru_inst, ru_st_final });
+                try g.ret(try g.record(&.{
+                    .{ .name = "value", .value = ru_dst },
+                    .{ .name = "state", .value = ru_st_done },
+                }));
+            }
+        }
+
+        // ── TUnary ──
+        g.beginReservedBlock(check_unary_real);
         const is_unary = try g.tagTest(expr, typeck.tast_unary);
         const unary_blk = g.reserveBlock();
         const check_pipe = g.reserveBlock();
@@ -1009,13 +1088,102 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(check_match);
         const is_match = try g.tagTest(expr, typeck.tast_match);
         const match_blk = g.reserveBlock();
-        const default_blk = g.reserveBlock();
-        try g.branch(is_match, match_blk, default_blk);
+        const check_perform = g.reserveBlock();
+        try g.branch(is_match, match_blk, check_perform);
 
         g.beginReservedBlock(match_blk);
         {
             const result = try g.callDirect(f_lower_match, &.{ expr, scope, state });
             try g.ret(result);
+        }
+
+        // ── TPerform ──
+        g.beginReservedBlock(check_perform);
+        const is_perform = try g.tagTest(expr, typeck.tast_perform);
+        const perform_blk = g.reserveBlock();
+        const check_handle_expr = g.reserveBlock();
+        try g.branch(is_perform, perform_blk, check_handle_expr);
+
+        g.beginReservedBlock(perform_blk);
+        {
+            const perf_pl = try g.tagPayload(expr, typeck.tast_perform);
+            const perf_effect = try g.recordField(perf_pl, "effect");
+            const perf_op = try g.recordField(perf_pl, "op");
+            const perf_args = try g.recordField(perf_pl, "args");
+
+            // Lower each argument
+            const pa_len = try g.listLength(perf_args);
+            const pa_zero = try g.constInt(0);
+            const pa_empty = try g.listInit(&.{});
+            const pa_loop = g.reserveBlock();
+            try g.jump(pa_loop, &.{ pa_zero, pa_empty, state });
+
+            g.beginReservedBlock(pa_loop);
+            const pa_idx = try g.addBlockParam();
+            const pa_vals = try g.addBlockParam();
+            const pa_st = try g.addBlockParam();
+            const pa_done = try g.ge(pa_idx, pa_len);
+            const pa_body_blk = g.reserveBlock();
+            const pa_exit = g.reserveBlock();
+            try g.branch(pa_done, pa_exit, pa_body_blk);
+
+            g.beginReservedBlock(pa_body_blk);
+            {
+                const pa_arg = try g.listNth(perf_args, pa_idx);
+                const pa_r = try g.callDirect(f_lower_expr, &.{ pa_arg, scope, pa_st });
+                const pa_val = try g.recordField(pa_r, "value");
+                const pa_st2 = try g.recordField(pa_r, "state");
+                const pa_new = try g.listAppend(pa_vals, pa_val);
+                const pa_one = try g.constInt(1);
+                const pa_next = try g.add(pa_idx, pa_one);
+                try g.jump(pa_loop, &.{ pa_next, pa_new, pa_st2 });
+            }
+
+            g.beginReservedBlock(pa_exit);
+            {
+                const fv = try g.callDirect(f_fresh_val, &.{pa_st});
+                const dst = try g.recordField(fv, "id");
+                const st1 = try g.recordField(fv, "state");
+                const inst_rec = try g.record(&.{
+                    .{ .name = "dst", .value = dst },
+                    .{ .name = "effect", .value = perf_effect },
+                    .{ .name = "op", .value = perf_op },
+                    .{ .name = "args", .value = pa_vals },
+                });
+                const inst = try g.tag(ir_perform, inst_rec);
+                const st2 = try g.callDirect(f_emit_inst, &.{ inst, st1 });
+                try g.ret(try g.record(&.{
+                    .{ .name = "value", .value = dst },
+                    .{ .name = "state", .value = st2 },
+                }));
+            }
+        }
+
+        // ── THandle ──
+        g.beginReservedBlock(check_handle_expr);
+        const is_handle_expr = try g.tagTest(expr, typeck.tast_handle);
+        const handle_expr_blk = g.reserveBlock();
+        const check_unsafe_expr = g.reserveBlock();
+        try g.branch(is_handle_expr, handle_expr_blk, check_unsafe_expr);
+
+        g.beginReservedBlock(handle_expr_blk);
+        {
+            const result = try g.callDirect(f_lower_handle, &.{ expr, scope, state });
+            try g.ret(result);
+        }
+
+        // ── TUnsafe — transparent, just lower the inner expression ──
+        g.beginReservedBlock(check_unsafe_expr);
+        const is_unsafe_expr = try g.tagTest(expr, typeck.tast_unsafe);
+        const unsafe_expr_blk = g.reserveBlock();
+        const default_blk = g.reserveBlock();
+        try g.branch(is_unsafe_expr, unsafe_expr_blk, default_blk);
+
+        g.beginReservedBlock(unsafe_expr_blk);
+        {
+            const unsafe_inner = try g.tagPayload(expr, typeck.tast_unsafe);
+            const unsafe_result = try g.callDirect(f_lower_expr, &.{ unsafe_inner, scope, state });
+            try g.ret(unsafe_result);
         }
 
         // ── Default: unhandled node, emit const nil ──
@@ -1140,7 +1308,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const blks10 = try g.recordField(st10, "blocks");
         const fns10 = try g.recordField(st10, "functions");
         const insts10 = try g.recordField(st10, "insts");
-        const st_merge = try g.record(&.{
+        const st_merge_pre = try g.record(&.{
             .{ .name = "next_val", .value = nv10 },
             .{ .name = "insts", .value = insts10 },
             .{ .name = "blocks", .value = blks10 },
@@ -1148,6 +1316,15 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             .{ .name = "next_block", .value = nb10 },
             .{ .name = "functions", .value = fns10 },
         });
+
+        // Emit IrArgReceive to save block param (x0) to a callee-saved register
+        const c0_ifm = try g.constInt(0);
+        const if_ar_inst = try g.record(&.{
+            .{ .name = "dst", .value = merge_val },
+            .{ .name = "index", .value = c0_ifm },
+        });
+        const if_ar_tag = try g.tag(ir_arg_receive, if_ar_inst);
+        const st_merge = try g.callDirect(f_emit_inst, &.{ if_ar_tag, st_merge_pre });
 
         try g.ret(try g.record(&.{
             .{ .name = "value", .value = merge_val },
@@ -1212,21 +1389,55 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             try g.jump(args_loop, &.{ next_a, new_vals, arg_st });
 
             g.beginReservedBlock(a_exit);
-            const fv = try g.callDirect(f_fresh_val, &.{a_state});
-            const dst = try g.recordField(fv, "id");
-            const st_call = try g.recordField(fv, "state");
-            const inst_rec = try g.record(&.{
-                .{ .name = "dst", .value = dst },
-                .{ .name = "callee", .value = callee_name },
-                .{ .name = "callee_val", .value = callee_vid },
-                .{ .name = "args", .value = a_vals },
-            });
-            const inst = try g.tag(ir_call, inst_rec);
-            const st_final = try g.callDirect(f_emit_inst, &.{ inst, st_call });
-            try g.ret(try g.record(&.{
-                .{ .name = "value", .value = dst },
-                .{ .name = "state", .value = st_final },
-            }));
+            {
+                // Check if this is a resume call
+                const resume_name = try g.constString("resume");
+                const is_resume = try g.eq(callee_name, resume_name);
+                const resume_call_blk = g.reserveBlock();
+                const normal_call_blk = g.reserveBlock();
+                try g.branch(is_resume, resume_call_blk, normal_call_blk);
+
+                // Resume call: emit IrResume instead of IrCall
+                g.beginReservedBlock(resume_call_blk);
+                {
+                    const fv = try g.callDirect(f_fresh_val, &.{a_state});
+                    const dst = try g.recordField(fv, "id");
+                    const st_call = try g.recordField(fv, "state");
+                    // resume(val) — callee_vid is the continuation, first arg is the value
+                    const resume_arg = try g.listNth(a_vals, try g.constInt(0));
+                    const inst_rec = try g.record(&.{
+                        .{ .name = "dst", .value = dst },
+                        .{ .name = "continuation", .value = callee_vid },
+                        .{ .name = "value", .value = resume_arg },
+                    });
+                    const inst = try g.tag(ir_resume, inst_rec);
+                    const st_final = try g.callDirect(f_emit_inst, &.{ inst, st_call });
+                    try g.ret(try g.record(&.{
+                        .{ .name = "value", .value = dst },
+                        .{ .name = "state", .value = st_final },
+                    }));
+                }
+
+                // Normal call
+                g.beginReservedBlock(normal_call_blk);
+                {
+                    const fv = try g.callDirect(f_fresh_val, &.{a_state});
+                    const dst = try g.recordField(fv, "id");
+                    const st_call = try g.recordField(fv, "state");
+                    const inst_rec = try g.record(&.{
+                        .{ .name = "dst", .value = dst },
+                        .{ .name = "callee", .value = callee_name },
+                        .{ .name = "callee_val", .value = callee_vid },
+                        .{ .name = "args", .value = a_vals },
+                    });
+                    const inst = try g.tag(ir_call, inst_rec);
+                    const st_final = try g.callDirect(f_emit_inst, &.{ inst, st_call });
+                    try g.ret(try g.record(&.{
+                        .{ .name = "value", .value = dst },
+                        .{ .name = "state", .value = st_final },
+                    }));
+                }
+            }
         }
 
         // Check if callee is TFieldAccess (variant constructor pattern: Type.Variant(args))
@@ -1573,7 +1784,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const blks4 = try g.recordField(st4, "blocks");
         const fns4 = try g.recordField(st4, "functions");
         const insts4 = try g.recordField(st4, "insts");
-        const st_merge = try g.record(&.{
+        const st_merge_pre = try g.record(&.{
             .{ .name = "next_val", .value = nv4 },
             .{ .name = "insts", .value = insts4 },
             .{ .name = "blocks", .value = blks4 },
@@ -1581,6 +1792,15 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             .{ .name = "next_block", .value = nb4 },
             .{ .name = "functions", .value = fns4 },
         });
+
+        // Emit IrArgReceive to save block param (x0) to a callee-saved register
+        const c0_mm = try g.constInt(0);
+        const mm_ar_inst = try g.record(&.{
+            .{ .name = "dst", .value = merge_val },
+            .{ .name = "index", .value = c0_mm },
+        });
+        const mm_ar_tag = try g.tag(ir_arg_receive, mm_ar_inst);
+        const st_merge = try g.callDirect(f_emit_inst, &.{ mm_ar_tag, st_merge_pre });
 
         try g.ret(try g.record(&.{
             .{ .name = "value", .value = merge_val },
@@ -2120,6 +2340,201 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         }
     }
     try g.endReservedFunc(f_lower_match_arms);
+
+    // ── Generate: lc_lower_handle(expr, scope, state) -> {value, state} ──
+    // Lowers a handle expression using blocks:
+    //   1. Current block: emit IrHandleSetup, lower body, emit IrHandlePop, jump to merge
+    //   2. Handler clause block: lower clause body (with resume bound), jump to merge
+    //   3. Merge block: phi result
+    try g.beginReservedFunc("lc_lower_handle");
+    {
+        const expr = try g.addParam();
+        const scope = try g.addParam();
+        const state = try g.addParam();
+        _ = g.beginBlock();
+
+        const handle_pl = try g.tagPayload(expr, typeck.tast_handle);
+        const handle_body = try g.recordField(handle_pl, "body");
+        const handle_effect = try g.recordField(handle_pl, "effect");
+        const handle_clauses = try g.recordField(handle_pl, "clauses");
+
+        // Allocate block IDs: clause_block, merge_block
+        const clause_nb = try g.callDirect(f_alloc_block_id, &.{state});
+        const clause_blk_id = try g.recordField(clause_nb, "id");
+        const st1 = try g.recordField(clause_nb, "state");
+        const merge_nb = try g.callDirect(f_alloc_block_id, &.{st1});
+        const merge_blk_id = try g.recordField(merge_nb, "id");
+        const st2 = try g.recordField(merge_nb, "state");
+
+        // Emit IrHandleSetup in current block: installs handler, clause_blk_id is handler addr
+        const fv_setup = try g.callDirect(f_fresh_val, &.{st2});
+        const setup_dst = try g.recordField(fv_setup, "id");
+        const st3 = try g.recordField(fv_setup, "state");
+        const setup_inst = try g.record(&.{
+            .{ .name = "dst", .value = setup_dst },
+            .{ .name = "effect", .value = handle_effect },
+            .{ .name = "clause_block", .value = clause_blk_id },
+        });
+        const setup_tag = try g.tag(ir_handle_setup, setup_inst);
+        const st4 = try g.callDirect(f_emit_inst, &.{ setup_tag, st3 });
+
+        // Lower body expression (inline in current block)
+        const body_r = try g.callDirect(f_lower_expr, &.{ handle_body, scope, st4 });
+        const body_val = try g.recordField(body_r, "value");
+        const st5 = try g.recordField(body_r, "state");
+
+        // Emit IrHandlePop: restore x27 to prev handler
+        const pop_inst = try g.record(&.{
+            .{ .name = "dst", .value = setup_dst }, // reuse, not meaningful
+        });
+        const pop_tag = try g.tag(ir_handle_pop, pop_inst);
+        const st6 = try g.callDirect(f_emit_inst, &.{ pop_tag, st5 });
+
+        // End current block: jump to merge with body result
+        const body_args = try g.listInit(&.{body_val});
+        const body_jmp = try g.record(&.{
+            .{ .name = "target", .value = merge_blk_id },
+            .{ .name = "args", .value = body_args },
+        });
+        const body_term = try g.tag(ir_jump, body_jmp);
+        const st7 = try g.callDirect(f_end_block, &.{ body_term, st6 });
+
+        // === Handler clause block ===
+        // Set block_id to clause_blk_id
+        const nv7 = try g.recordField(st7, "next_val");
+        const nb7 = try g.recordField(st7, "next_block");
+        const blks7 = try g.recordField(st7, "blocks");
+        const fns7 = try g.recordField(st7, "functions");
+        const empty7 = try g.listInit(&.{});
+        const st_clause = try g.record(&.{
+            .{ .name = "next_val", .value = nv7 },
+            .{ .name = "insts", .value = empty7 },
+            .{ .name = "blocks", .value = blks7 },
+            .{ .name = "block_id", .value = clause_blk_id },
+            .{ .name = "next_block", .value = nb7 },
+            .{ .name = "functions", .value = fns7 },
+        });
+
+        // For bootstrap: handle first clause only
+        // Extract clause pattern and body
+        const first_clause = try g.listNth(handle_clauses, try g.constInt(0));
+        const clause_pat = try g.recordField(first_clause, "pattern");
+        const clause_body = try g.recordField(first_clause, "body");
+
+        // Extract op name from TPatConstructor pattern
+        const pat_pl = try g.tagPayload(clause_pat, "TPatConstructor");
+        const op_args = try g.recordField(pat_pl, "args");
+
+        // The handler clause receives: x0 = continuation ptr
+        // Bind "resume" to the continuation via IrArgReceive {dst, index: 0}
+        const resume_fv = try g.callDirect(f_fresh_val, &.{st_clause});
+        const resume_val = try g.recordField(resume_fv, "id");
+        const st8_pre = try g.recordField(resume_fv, "state");
+        const c0_ar = try g.constInt(0);
+        const ar_resume_inst = try g.record(&.{
+            .{ .name = "dst", .value = resume_val },
+            .{ .name = "index", .value = c0_ar },
+        });
+        const ar_resume_tag = try g.tag(ir_arg_receive, ar_resume_inst);
+        const st8 = try g.callDirect(f_emit_inst, &.{ ar_resume_tag, st8_pre });
+        const resume_str = try g.constString("resume");
+        const clause_scope_val = try g.mapSet(scope, resume_str, resume_val);
+
+        // Check if there are operation params to bind
+        const op_args_len = try g.listLength(op_args);
+        const has_op_args = try g.binary(.gt, op_args_len, try g.constInt(0));
+        const bind_op_blk = g.reserveBlock();
+        const no_op_blk = g.reserveBlock();
+        const op_merge = g.reserveBlock();
+        try g.branch(has_op_args, bind_op_blk, no_op_blk);
+
+        g.beginReservedBlock(bind_op_blk);
+        {
+            const first_arg = try g.listNth(op_args, try g.constInt(0));
+            const is_bind = try g.tagTest(first_arg, "PatBind");
+            const op_bind_blk = g.reserveBlock();
+            const op_skip_blk = g.reserveBlock();
+            try g.branch(is_bind, op_bind_blk, op_skip_blk);
+
+            g.beginReservedBlock(op_bind_blk);
+            {
+                const arg_name = try g.tagPayload(first_arg, "PatBind");
+                // Operation param comes in x1 — emit IrArgReceive to copy to a register
+                const param_fv = try g.callDirect(f_fresh_val, &.{st8});
+                const param_val = try g.recordField(param_fv, "id");
+                const st9 = try g.recordField(param_fv, "state");
+                // Emit IrArgReceive {dst, index: 1} — x1 holds the first op arg
+                const c1_ar = try g.constInt(1);
+                const ar_inst = try g.record(&.{
+                    .{ .name = "dst", .value = param_val },
+                    .{ .name = "index", .value = c1_ar },
+                });
+                const ar_tag = try g.tag(ir_arg_receive, ar_inst);
+                const st9b = try g.callDirect(f_emit_inst, &.{ ar_tag, st9 });
+                const scope_p = try g.mapSet(clause_scope_val, arg_name, param_val);
+                try g.jump(op_merge, &.{ scope_p, st9b });
+            }
+
+            g.beginReservedBlock(op_skip_blk);
+            try g.jump(op_merge, &.{ clause_scope_val, st8 });
+        }
+
+        g.beginReservedBlock(no_op_blk);
+        try g.jump(op_merge, &.{ clause_scope_val, st8 });
+
+        g.beginReservedBlock(op_merge);
+        const final_scope = try g.addBlockParam();
+        const st10 = try g.addBlockParam();
+
+        // Lower handler clause body
+        const clause_r = try g.callDirect(f_lower_expr, &.{ clause_body, final_scope, st10 });
+        const clause_val = try g.recordField(clause_r, "value");
+        const st11 = try g.recordField(clause_r, "state");
+
+        // End clause block: jump to merge with clause result
+        const clause_args = try g.listInit(&.{clause_val});
+        const clause_jmp = try g.record(&.{
+            .{ .name = "target", .value = merge_blk_id },
+            .{ .name = "args", .value = clause_args },
+        });
+        const clause_term = try g.tag(ir_jump, clause_jmp);
+        const st12 = try g.callDirect(f_end_block, &.{ clause_term, st11 });
+
+        // === Merge block ===
+        const fv_merge = try g.callDirect(f_fresh_val, &.{st12});
+        const merge_val = try g.recordField(fv_merge, "id");
+        const st13 = try g.recordField(fv_merge, "state");
+
+        // Set block_id to merge_blk_id
+        const nv13 = try g.recordField(st13, "next_val");
+        const nb13 = try g.recordField(st13, "next_block");
+        const blks13 = try g.recordField(st13, "blocks");
+        const fns13 = try g.recordField(st13, "functions");
+        const insts13 = try g.recordField(st13, "insts");
+        const st_merge_pre = try g.record(&.{
+            .{ .name = "next_val", .value = nv13 },
+            .{ .name = "insts", .value = insts13 },
+            .{ .name = "blocks", .value = blks13 },
+            .{ .name = "block_id", .value = merge_blk_id },
+            .{ .name = "next_block", .value = nb13 },
+            .{ .name = "functions", .value = fns13 },
+        });
+
+        // Emit IrArgReceive to save block param (x0) to a callee-saved register
+        const c0_hm = try g.constInt(0);
+        const hm_ar_inst = try g.record(&.{
+            .{ .name = "dst", .value = merge_val },
+            .{ .name = "index", .value = c0_hm },
+        });
+        const hm_ar_tag = try g.tag(ir_arg_receive, hm_ar_inst);
+        const st_merge = try g.callDirect(f_emit_inst, &.{ hm_ar_tag, st_merge_pre });
+
+        try g.ret(try g.record(&.{
+            .{ .name = "value", .value = merge_val },
+            .{ .name = "state", .value = st_merge },
+        }));
+    }
+    try g.endReservedFunc(f_lower_handle);
 
     // ── Generate: lc_lower_fn_decl(decl, state) -> state ────────────
     try g.beginReservedFunc("lc_lower_fn_decl");

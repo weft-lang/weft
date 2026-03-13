@@ -95,6 +95,8 @@ pub const ast_trait_decl = "TraitDecl";
 pub const ast_impl_decl = "ImplDecl";
 pub const ast_effect_decl = "EffectDecl";
 pub const ast_use_decl = "UseDecl";
+pub const ast_extern_fn = "ExternFn";
+pub const ast_unsafe = "Unsafe";
 
 // Pattern tags
 pub const ast_pat_wildcard = "PatWildcard";
@@ -1250,23 +1252,37 @@ fn genParsePattern(g: *Gen, pf: ParserFuncs) !void {
     const qualified_blk = g.reserveBlock();
     try g.branch(is_actual_dot, qualified_blk, no_dot_blk);
 
-    // Qualified: Type.Variant — skip dot, read the variant name
+    // Qualified: Type.Variant or Effect.operation — skip dot, read the name
     g.beginReservedBlock(qualified_blk);
     const pos_after_dot = try emitAdvance(g, next_pos);
     const tok_variant = try emitGetToken(g, tokens, pos_after_dot);
-    const variant_name = try g.tagPayload(tok_variant, "UpperIdent");
-    const pos_after_variant = try emitAdvance(g, pos_after_dot);
+    // Handle both UpperIdent (type variants) and Ident (effect operations)
+    const qv_is_upper = try g.tagTest(tok_variant, "UpperIdent");
+    const qv_upper_blk = g.reserveBlock();
+    const qv_lower_blk = g.reserveBlock();
     const ctor_merge_blk = g.reserveBlock();
-    try g.jump(ctor_merge_blk, &.{ variant_name, pos_after_variant });
+    try g.branch(qv_is_upper, qv_upper_blk, qv_lower_blk);
 
-    // Not qualified: just ConstructorName
+    g.beginReservedBlock(qv_upper_blk);
+    const qv_upper_name = try g.tagPayload(tok_variant, "UpperIdent");
+    const qv_upper_pos = try emitAdvance(g, pos_after_dot);
+    try g.jump(ctor_merge_blk, &.{ qv_upper_name, qv_upper_pos, first_upper });
+
+    g.beginReservedBlock(qv_lower_blk);
+    const qv_lower_name = try g.tagPayload(tok_variant, "Ident");
+    const qv_lower_pos = try emitAdvance(g, pos_after_dot);
+    try g.jump(ctor_merge_blk, &.{ qv_lower_name, qv_lower_pos, first_upper });
+
+    // Not qualified: just ConstructorName (no qualifier)
     g.beginReservedBlock(no_dot_blk);
-    try g.jump(ctor_merge_blk, &.{ first_upper, next_pos });
+    const null_qualifier = try g.constNil();
+    try g.jump(ctor_merge_blk, &.{ first_upper, next_pos, null_qualifier });
 
-    // Merge: ctor_name is the variant name, ctor_pos is position after name
+    // Merge: ctor_name is the variant name, ctor_pos is position after name, ctor_qualifier is Type/Effect name or nil
     g.beginReservedBlock(ctor_merge_blk);
     const ctor_name = try g.addBlockParam();
     const ctor_pos = try g.addBlockParam();
+    const ctor_qualifier = try g.addBlockParam();
 
     // Check for ( after constructor name
     const tok2 = try emitGetToken(g, tokens, ctor_pos);
@@ -1340,6 +1356,7 @@ fn genParsePattern(g: *Gen, pf: ParserFuncs) !void {
     const ctor_rec = try g.record(&.{
         .{ .name = "name", .value = ctor_name },
         .{ .name = "args", .value = a_list },
+        .{ .name = "qualifier", .value = ctor_qualifier },
     });
     const ctor_node = try g.tag(ast_pat_constructor, ctor_rec);
     const ctor_res = try emitResult(g, ctor_node, after_rparen);
@@ -1350,6 +1367,7 @@ fn genParsePattern(g: *Gen, pf: ParserFuncs) !void {
     const ctor0_rec = try g.record(&.{
         .{ .name = "name", .value = ctor_name },
         .{ .name = "args", .value = try g.listInit(&.{}) },
+        .{ .name = "qualifier", .value = ctor_qualifier },
     });
     const ctor0_node = try g.tag(ast_pat_constructor, ctor0_rec);
     const ctor0_res = try emitResult(g, ctor0_node, ctor_pos);
@@ -1650,27 +1668,69 @@ fn genParseTypeExpr(g: *Gen, pf: ParserFuncs) !void {
     const id_node = try g.tag(ast_type_named, id_name);
     try g.jump(check_suffix_blk, &.{ id_node, next_pos });
 
-    // Check for ( — function type or grouped type
+    // Check for Keyword "fn" — function type like fn(Int) -> Int
     g.beginReservedBlock(check_delim_blk);
+    const is_kw = try g.tagTest(tok, "Keyword");
+    const check_fn_kw_blk = g.reserveBlock();
+    const check_delim2_blk = g.reserveBlock();
+    try g.branch(is_kw, check_fn_kw_blk, check_delim2_blk);
+
+    g.beginReservedBlock(check_fn_kw_blk);
+    const kw_val = try g.tagPayload(tok, "Keyword");
+    const fn_str = try g.constString("fn");
+    const is_fn_kw = try g.eq(kw_val, fn_str);
+    const fn_kw_type_blk = g.reserveBlock();
+    try g.branch(is_fn_kw, fn_kw_type_blk, check_delim2_blk);
+
+    // fn(...) -> T: advance past "fn", then parse the ( as a fn type
+    g.beginReservedBlock(fn_kw_type_blk);
+    // next_pos already points past "fn", now expect (
+    const fn_kw_tok = try emitGetToken(g, tokens, next_pos);
+    const fn_kw_is_delim = try g.tagTest(fn_kw_tok, "Delim");
+    const fn_kw_check_lp = g.reserveBlock();
+    const fn_kw_fallback = g.reserveBlock();
+    try g.branch(fn_kw_is_delim, fn_kw_check_lp, fn_kw_fallback);
+
+    g.beginReservedBlock(fn_kw_check_lp);
+    const fn_kw_delim = try g.tagPayload(fn_kw_tok, "Delim");
+    const fn_kw_lp_str = try g.constString("(");
+    const fn_kw_is_lp = try g.eq(fn_kw_delim, fn_kw_lp_str);
+    const fn_kw_start_blk = g.reserveBlock();
+    try g.branch(fn_kw_is_lp, fn_kw_start_blk, fn_kw_fallback);
+
+    // Start parsing fn type params from position after "fn("
+    g.beginReservedBlock(fn_kw_start_blk);
+    const fn_kw_after_lp = try emitAdvance(g, next_pos); // skip (
+    const fn_kw_empty = try g.listInit(&.{});
+    const fn_type_blk = g.reserveBlock();
+    try g.jump(fn_type_blk, &.{ fn_kw_after_lp, fn_kw_empty });
+
+    // fn keyword fallback
+    g.beginReservedBlock(fn_kw_fallback);
+    const fallback_blk = g.reserveBlock();
+    try g.jump(fallback_blk, &.{});
+
+    // Check for ( — function type or grouped type (without fn keyword)
+    g.beginReservedBlock(check_delim2_blk);
     const is_delim = try g.tagTest(tok, "Delim");
     const check_lparen_blk = g.reserveBlock();
-    const fallback_blk = g.reserveBlock();
     try g.branch(is_delim, check_lparen_blk, fallback_blk);
 
     g.beginReservedBlock(check_lparen_blk);
     const delim_val = try g.tagPayload(tok, "Delim");
     const lparen_str = try g.constString("(");
     const is_lparen = try g.eq(delim_val, lparen_str);
-    const fn_type_blk = g.reserveBlock();
-    try g.branch(is_lparen, fn_type_blk, fallback_blk);
+    const bare_paren_blk = g.reserveBlock();
+    try g.branch(is_lparen, bare_paren_blk, fallback_blk);
 
-    // ( — parse param types, check for ) -> RetType (function type)
+    // Bare ( — function type without fn keyword: advance past ( and enter fn_type loop
+    g.beginReservedBlock(bare_paren_blk);
+    const bare_empty = try g.listInit(&.{});
+    try g.jump(fn_type_blk, &.{ next_pos, bare_empty });
+
+    // fn_type_blk: parse param types, check for ) -> RetType
+    // Receives (pos_after_lparen, param_list)
     g.beginReservedBlock(fn_type_blk);
-    const ft_params_empty = try g.listInit(&.{});
-    const ft_loop_blk = g.reserveBlock();
-    try g.jump(ft_loop_blk, &.{ next_pos, ft_params_empty });
-
-    g.beginReservedBlock(ft_loop_blk);
     const ft_pos = try g.addBlockParam();
     const ft_list = try g.addBlockParam();
     const ft_tok = try emitGetToken(g, tokens, ft_pos);
@@ -1707,10 +1767,10 @@ fn genParseTypeExpr(g: *Gen, pf: ParserFuncs) !void {
 
     g.beginReservedBlock(ftc_skip_blk);
     const ftc_after = try emitAdvance(g, ft_param_next);
-    try g.jump(ft_loop_blk, &.{ ftc_after, ft_list2 });
+    try g.jump(fn_type_blk, &.{ ftc_after, ft_list2 });
 
     g.beginReservedBlock(ftc_no_blk);
-    try g.jump(ft_loop_blk, &.{ ft_param_next, ft_list2 });
+    try g.jump(fn_type_blk, &.{ ft_param_next, ft_list2 });
 
     // After ): check for -> (fn type) or -[ (effect fn type)
     g.beginReservedBlock(ft_done_blk);
@@ -2105,8 +2165,28 @@ fn genParsePrimary(g: *Gen, pf: ParserFuncs) !void {
     const handle_result = try g.callDirect(pf.parse_handle, &.{ tokens, next_pos });
     try g.ret(handle_result);
 
-    // unknown keyword — treat as ident
+    // unsafe { expr } — transparent wrapper
     g.beginReservedBlock(kw5);
+    const unsafe_str = try g.constString("unsafe");
+    const is_unsafe = try g.eq(kw_val, unsafe_str);
+    const unsafe_blk = g.reserveBlock();
+    const kw6 = g.reserveBlock();
+    try g.branch(is_unsafe, unsafe_blk, kw6);
+
+    g.beginReservedBlock(unsafe_blk);
+    {
+        // Parse the block expression after "unsafe"
+        const zero_prec = try g.constInt(0);
+        const unsafe_body_r = try g.callDirect(pf.parse_expr, &.{ tokens, next_pos, zero_prec });
+        const unsafe_body = try g.recordField(unsafe_body_r, "node");
+        const unsafe_end = try g.recordField(unsafe_body_r, "pos");
+        const unsafe_node = try g.tag(ast_unsafe, unsafe_body);
+        const unsafe_res = try emitResult(g, unsafe_node, unsafe_end);
+        try g.ret(unsafe_res);
+    }
+
+    // unknown keyword — treat as ident
+    g.beginReservedBlock(kw6);
     const kw_ident = try g.tag(ast_ident, kw_val);
     const kw_res = try emitResult(g, kw_ident, next_pos);
     try g.ret(kw_res);
@@ -3096,8 +3176,84 @@ fn genParseFnDecl(g: *Gen, pf: ParserFuncs) !void {
     const fn_name = try g.tagPayload(name_tok, "Ident");
     const after_name = try emitAdvance(g, pos);
 
+    // Check for generic type params: <T, U, ...>
+    const gp_tok = try emitGetToken(g, tokens, after_name);
+    const gp_is_op = try g.tagTest(gp_tok, "Op");
+    const gp_check_lt = g.reserveBlock();
+    const gp_no_generics = g.reserveBlock();
+    try g.branch(gp_is_op, gp_check_lt, gp_no_generics);
+
+    g.beginReservedBlock(gp_check_lt);
+    const gp_op = try g.tagPayload(gp_tok, "Op");
+    const gp_lt = try g.constString("<");
+    const gp_is_lt = try g.eq(gp_op, gp_lt);
+    const gp_has_generics = g.reserveBlock();
+    try g.branch(gp_is_lt, gp_has_generics, gp_no_generics);
+
+    // Parse type params: <T, U, ...> until >
+    g.beginReservedBlock(gp_has_generics);
+    const gp_start = try emitAdvance(g, after_name); // skip <
+    const gp_empty = try g.listInit(&.{});
+    const gp_loop = g.reserveBlock();
+    try g.jump(gp_loop, &.{ gp_start, gp_empty });
+
+    g.beginReservedBlock(gp_loop);
+    const gp_pos = try g.addBlockParam();
+    const gp_list = try g.addBlockParam();
+    const gp_cur = try emitGetToken(g, tokens, gp_pos);
+    // Check for >
+    const gp_cur_is_op = try g.tagTest(gp_cur, "Op");
+    const gp_check_gt = g.reserveBlock();
+    const gp_parse = g.reserveBlock();
+    try g.branch(gp_cur_is_op, gp_check_gt, gp_parse);
+
+    g.beginReservedBlock(gp_check_gt);
+    const gp_cur_op = try g.tagPayload(gp_cur, "Op");
+    const gp_gt = try g.constString(">");
+    const gp_is_gt = try g.eq(gp_cur_op, gp_gt);
+    const gp_done = g.reserveBlock();
+    try g.branch(gp_is_gt, gp_done, gp_parse);
+
+    g.beginReservedBlock(gp_parse);
+    const gp_name = try g.tagPayload(gp_cur, "UpperIdent");
+    const gp_list2 = try g.listAppend(gp_list, gp_name);
+    const gp_next = try emitAdvance(g, gp_pos);
+    // Skip comma if present
+    const gp_comma_tok = try emitGetToken(g, tokens, gp_next);
+    const gp_comma_is_p = try g.tagTest(gp_comma_tok, "Punct");
+    const gp_check_comma = g.reserveBlock();
+    const gp_no_comma = g.reserveBlock();
+    try g.branch(gp_comma_is_p, gp_check_comma, gp_no_comma);
+
+    g.beginReservedBlock(gp_check_comma);
+    const gp_comma_val = try g.tagPayload(gp_comma_tok, "Punct");
+    const gp_comma_str = try g.constString(",");
+    const gp_is_comma = try g.eq(gp_comma_val, gp_comma_str);
+    const gp_skip_comma = g.reserveBlock();
+    try g.branch(gp_is_comma, gp_skip_comma, gp_no_comma);
+
+    g.beginReservedBlock(gp_skip_comma);
+    const gp_after_comma = try emitAdvance(g, gp_next);
+    try g.jump(gp_loop, &.{ gp_after_comma, gp_list2 });
+
+    g.beginReservedBlock(gp_no_comma);
+    try g.jump(gp_loop, &.{ gp_next, gp_list2 });
+
+    g.beginReservedBlock(gp_done);
+    const gp_after_gt = try emitAdvance(g, gp_pos); // skip >
+    const gp_merge = g.reserveBlock();
+    try g.jump(gp_merge, &.{ gp_after_gt, gp_list });
+
+    g.beginReservedBlock(gp_no_generics);
+    const gp_no_list = try g.listInit(&.{});
+    try g.jump(gp_merge, &.{ after_name, gp_no_list });
+
+    g.beginReservedBlock(gp_merge);
+    const after_generics = try g.addBlockParam();
+    const fn_type_params = try g.addBlockParam();
+
     // Skip (
-    const params_start = try emitAdvance(g, after_name);
+    const params_start = try emitAdvance(g, after_generics);
 
     // Parse parameters until )
     const params_empty = try g.listInit(&.{});
@@ -3284,6 +3440,7 @@ fn genParseFnDecl(g: *Gen, pf: ParserFuncs) !void {
     const ea_body_end = try g.recordField(ea_body_result, "pos");
     const ea_fn_rec = try g.record(&.{
         .{ .name = "name", .value = fn_name },
+        .{ .name = "type_params", .value = fn_type_params },
         .{ .name = "params", .value = p_params },
         .{ .name = "effects", .value = ea_list },
         .{ .name = "return_type", .value = ea_ret_node },
@@ -3307,6 +3464,7 @@ fn genParseFnDecl(g: *Gen, pf: ParserFuncs) !void {
     const body_end = try g.recordField(body_result, "pos");
     const fn_rec = try g.record(&.{
         .{ .name = "name", .value = fn_name },
+        .{ .name = "type_params", .value = fn_type_params },
         .{ .name = "params", .value = p_params },
         .{ .name = "effects", .value = nil_effects },
         .{ .name = "return_type", .value = ret_type_node },
@@ -3326,6 +3484,7 @@ fn genParseFnDecl(g: *Gen, pf: ParserFuncs) !void {
     const nil_ret = try g.constNil();
     const fn_rec2 = try g.record(&.{
         .{ .name = "name", .value = fn_name },
+        .{ .name = "type_params", .value = fn_type_params },
         .{ .name = "params", .value = p_params },
         .{ .name = "effects", .value = nb_nil_effects },
         .{ .name = "return_type", .value = nil_ret },
@@ -4283,7 +4442,42 @@ fn genParseDecl(g: *Gen, pf: ParserFuncs) !void {
     // Must be a keyword
     const kw_val = try g.tagPayload(tok, "Keyword");
 
+    // pub — skip modifier, recurse into parse_decl
+    const pub_str = try g.constString("pub");
+    const is_pub = try g.eq(kw_val, pub_str);
+    const pub_blk = g.reserveBlock();
+    const cp = g.reserveBlock();
+    try g.branch(is_pub, pub_blk, cp);
+
+    g.beginReservedBlock(pub_blk);
+    const pub_result = try g.callDirect(pf.parse_decl, &.{ tokens, next_pos });
+    try g.ret(pub_result);
+
+    // extern fn — parse fn signature without body
+    g.beginReservedBlock(cp);
+    const extern_str = try g.constString("extern");
+    const is_extern = try g.eq(kw_val, extern_str);
+    const extern_blk = g.reserveBlock();
+    const ce = g.reserveBlock();
+    try g.branch(is_extern, extern_blk, ce);
+
+    g.beginReservedBlock(extern_blk);
+    {
+        // Skip "extern", expect "fn" next — delegate to parse_fn_decl
+        // For bootstrap, extern fns have placeholder bodies
+        const ext_skip_fn = try emitAdvance(g, next_pos); // skip "fn"
+        const ext_result = try g.callDirect(pf.parse_fn_decl, &.{ tokens, ext_skip_fn });
+        // Unwrap the FnDecl and re-wrap as ExternFn
+        const ext_node = try g.recordField(ext_result, "node");
+        const ext_pos_final = try g.recordField(ext_result, "pos");
+        const ext_inner = try g.tagPayload(ext_node, ast_fn_decl);
+        const ext_wrapped = try g.tag(ast_extern_fn, ext_inner);
+        const ext_res = try emitResult(g, ext_wrapped, ext_pos_final);
+        try g.ret(ext_res);
+    }
+
     // fn
+    g.beginReservedBlock(ce);
     const fn_str = try g.constString("fn");
     const is_fn = try g.eq(kw_val, fn_str);
     const fn_blk = g.reserveBlock();
@@ -4351,11 +4545,48 @@ fn genParseDecl(g: *Gen, pf: ParserFuncs) !void {
     try g.branch(is_use, use_blk, c6);
 
     g.beginReservedBlock(use_blk);
-    const use_tok = try emitGetToken(g, tokens, next_pos);
-    const use_path = try g.tagPayload(use_tok, "Ident");
-    const use_end = try emitAdvance(g, next_pos);
-    const use_node = try g.tag(ast_use_decl, use_path);
-    const use_res = try emitResult(g, use_node, use_end);
+    // Parse use path: ident ( "/" ident )*
+    const use_first_tok = try emitGetToken(g, tokens, next_pos);
+    const use_first_seg = try g.tagPayload(use_first_tok, "Ident");
+    const use_pos1 = try emitAdvance(g, next_pos);
+
+    // Loop to consume slash-separated segments
+    const use_path_loop = g.reserveBlock();
+    try g.jump(use_path_loop, &.{ use_first_seg, use_pos1 });
+
+    g.beginReservedBlock(use_path_loop);
+    const use_accum = try g.addBlockParam();
+    const use_cur_pos = try g.addBlockParam();
+    // Check if next token is Op("/")
+    const use_slash_tok = try emitGetToken(g, tokens, use_cur_pos);
+    const use_is_op = try g.tagTest(use_slash_tok, "Op");
+    const use_check_slash = g.reserveBlock();
+    const use_path_done = g.reserveBlock();
+    try g.branch(use_is_op, use_check_slash, use_path_done);
+
+    g.beginReservedBlock(use_check_slash);
+    {
+        const use_op_val = try g.tagPayload(use_slash_tok, "Op");
+        const use_slash_str = try g.constString("/");
+        const use_is_slash = try g.eq(use_op_val, use_slash_str);
+        const use_consume_seg = g.reserveBlock();
+        try g.branch(use_is_slash, use_consume_seg, use_path_done);
+
+        g.beginReservedBlock(use_consume_seg);
+        // Consume "/" and next ident
+        const use_pos_after_slash = try emitAdvance(g, use_cur_pos);
+        const use_seg_tok = try emitGetToken(g, tokens, use_pos_after_slash);
+        const use_seg_name = try g.tagPayload(use_seg_tok, "Ident");
+        const use_pos_after_seg = try emitAdvance(g, use_pos_after_slash);
+        // Concatenate: accum + "/" + segment
+        const use_accum_slash = try g.callBuiltin("string_concat", &.{ use_accum, use_slash_str });
+        const use_new_accum = try g.callBuiltin("string_concat", &.{ use_accum_slash, use_seg_name });
+        try g.jump(use_path_loop, &.{ use_new_accum, use_pos_after_seg });
+    }
+
+    g.beginReservedBlock(use_path_done);
+    const use_node = try g.tag(ast_use_decl, use_accum);
+    const use_res = try emitResult(g, use_node, use_cur_pos);
     try g.ret(use_res);
 
     // fallback: parse as expression

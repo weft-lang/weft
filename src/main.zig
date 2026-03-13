@@ -256,8 +256,81 @@ fn runCompile(alloc: std.mem.Allocator, path: []const u8, output: []const u8) vo
     const msg1 = g.constString("parse ok\n") catch unreachable;
     _ = g.callBuiltin("io_print", &.{msg1}) catch unreachable;
 
+    // Resolve `use` declarations: read imported files, parse them, merge decls
+    const main_decls = g.tagPayload(ast_node, "Module") catch unreachable;
+    const main_decls_len = g.listLength(main_decls) catch unreachable;
+    const use_zero = g.constInt(0) catch unreachable;
+    const use_loop = g.reserveBlock();
+    const merged_empty = g.listInit(&.{}) catch unreachable;
+    g.jump(use_loop, &.{ use_zero, merged_empty }) catch unreachable;
+
+    g.beginReservedBlock(use_loop);
+    const use_i = g.addBlockParam() catch unreachable;
+    const use_merged = g.addBlockParam() catch unreachable;
+    const use_done = g.ge(use_i, main_decls_len) catch unreachable;
+    const use_body_blk = g.reserveBlock();
+    const use_exit_blk = g.reserveBlock();
+    g.branch(use_done, use_exit_blk, use_body_blk) catch unreachable;
+
+    g.beginReservedBlock(use_body_blk);
+    const use_decl = g.listNth(main_decls, use_i) catch unreachable;
+    const use_is_use = g.tagTest(use_decl, "UseDecl") catch unreachable;
+    const use_import_blk = g.reserveBlock();
+    const use_keep_blk = g.reserveBlock();
+    g.branch(use_is_use, use_import_blk, use_keep_blk) catch unreachable;
+
+    // UseDecl: read file, parse, extract decls, append to merged
+    g.beginReservedBlock(use_import_blk);
+    {
+        const use_path = g.tagPayload(use_decl, "UseDecl") catch unreachable;
+        const weft_ext = g.constString(".weft") catch unreachable;
+        const use_file_path = g.callBuiltin("string_concat", &.{ use_path, weft_ext }) catch unreachable;
+        const use_source = g.callBuiltin("io_read_file", &.{use_file_path}) catch unreachable;
+        const use_parsed = g.callDirect(gram_funcs.parse, &.{use_source}) catch unreachable;
+        const use_ast = g.recordField(use_parsed, "node") catch unreachable;
+        const use_mod_decls = g.tagPayload(use_ast, "Module") catch unreachable;
+        // Append all imported decls to merged list
+        const use_imp_len = g.listLength(use_mod_decls) catch unreachable;
+        const use_imp_zero = g.constInt(0) catch unreachable;
+        const use_imp_loop = g.reserveBlock();
+        g.jump(use_imp_loop, &.{ use_imp_zero, use_merged }) catch unreachable;
+
+        g.beginReservedBlock(use_imp_loop);
+        const imp_j = g.addBlockParam() catch unreachable;
+        const imp_merged = g.addBlockParam() catch unreachable;
+        const imp_done = g.ge(imp_j, use_imp_len) catch unreachable;
+        const imp_body = g.reserveBlock();
+        const imp_exit = g.reserveBlock();
+        g.branch(imp_done, imp_exit, imp_body) catch unreachable;
+
+        g.beginReservedBlock(imp_body);
+        const imp_d = g.listNth(use_mod_decls, imp_j) catch unreachable;
+        const imp_merged2 = g.listAppend(imp_merged, imp_d) catch unreachable;
+        const imp_one = g.constInt(1) catch unreachable;
+        const imp_next = g.add(imp_j, imp_one) catch unreachable;
+        g.jump(use_imp_loop, &.{ imp_next, imp_merged2 }) catch unreachable;
+
+        g.beginReservedBlock(imp_exit);
+        const use_one = g.constInt(1) catch unreachable;
+        const use_next = g.add(use_i, use_one) catch unreachable;
+        g.jump(use_loop, &.{ use_next, imp_merged }) catch unreachable;
+    }
+
+    // Non-use decl: keep in merged list
+    g.beginReservedBlock(use_keep_blk);
+    {
+        const use_merged2 = g.listAppend(use_merged, use_decl) catch unreachable;
+        const use_one2 = g.constInt(1) catch unreachable;
+        const use_next2 = g.add(use_i, use_one2) catch unreachable;
+        g.jump(use_loop, &.{ use_next2, use_merged2 }) catch unreachable;
+    }
+
+    // Rebuild module with merged decls
+    g.beginReservedBlock(use_exit_blk);
+    const merged_module = g.tag("Module", use_merged) catch unreachable;
+
     // Type check
-    const typed_mod = g.callDirect(f_check_module, &.{ast_node}) catch unreachable;
+    const typed_mod = g.callDirect(f_check_module, &.{merged_module}) catch unreachable;
     const msg2 = g.constString("check ok\n") catch unreachable;
     _ = g.callBuiltin("io_print", &.{msg2}) catch unreachable;
 
