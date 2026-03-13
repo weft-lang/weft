@@ -2306,6 +2306,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const fg_dst = try g.recordField(fg_payload, "dst");
             const fg_base = try g.recordField(fg_payload, "base");
             const fg_field = try g.recordField(fg_payload, "field");
+            const fg_index = try g.recordField(fg_payload, "index");
 
             // Check if base is in fields_map
             const fg_base_str = try g.callBuiltin("string_from_int", &.{fg_base});
@@ -2394,9 +2395,24 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                     }
                 }
 
-                // Field not found in names list: use index 0 as fallback
+                // Field not found in names list: use index from payload, fallback to 0
                 g.beginReservedBlock(fg_not_found);
                 {
+                    // Use fg_index from payload if >= 0, else default to 0
+                    const neg_one_fb = try g.constInt(-1);
+                    const has_idx_fb = try g.binary(.ne, fg_index, neg_one_fb);
+                    const blk_use_idx_fb = g.reserveBlock();
+                    const blk_use_zero_fb = g.reserveBlock();
+                    const blk_idx_merge_fb = g.reserveBlock();
+                    try g.branch(has_idx_fb, blk_use_idx_fb, blk_use_zero_fb);
+                    g.beginReservedBlock(blk_use_idx_fb);
+                    try g.jump(blk_idx_merge_fb, &.{fg_index});
+                    g.beginReservedBlock(blk_use_zero_fb);
+                    const c0_idx_fb = try g.constInt(0);
+                    try g.jump(blk_idx_merge_fb, &.{c0_idx_fb});
+                    g.beginReservedBlock(blk_idx_merge_fb);
+                    const resolved_idx_fb = try g.addBlockParam();
+
                     const fg_alloc2 = try g.callDirect(f_alloc_reg, &.{ ctx, fg_dst });
                     const fg_reg2_raw = try g.recordField(fg_alloc2, "reg");
                     const fg_ctx2 = try g.recordField(fg_alloc2, "ctx");
@@ -2421,10 +2437,11 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                     g.beginReservedBlock(blk_fg_dm2);
                     const fg_reg2 = try g.addBlockParam();
 
+                    // LDR dst, [base, #resolved_idx*8] — use resolved_idx for offset
                     const ldr_base2 = try g.constInt(0xF9400000);
                     const c10_fb = try g.constInt(10);
                     const c5_fb = try g.constInt(5);
-                    const ldr_off2 = try g.binary(.shl, try g.constInt(0), c10_fb);
+                    const ldr_off2 = try g.binary(.shl, resolved_idx_fb, c10_fb);
                     const ldr_rn2 = try g.binary(.shl, fg_base_reg2, c5_fb);
                     const ldr_r1b = try g.binary(.bit_or, ldr_base2, ldr_off2);
                     const ldr_r2b = try g.binary(.bit_or, ldr_r1b, ldr_rn2);
@@ -2439,9 +2456,24 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                 }
             }
 
-            // No fields_map entry (cross-function): use index 0 as fallback
+            // No fields_map entry (cross-function): use index from payload, fallback to 0
             g.beginReservedBlock(blk_fg_no_map);
             {
+                // Use fg_index from payload if >= 0, else default to 0
+                const neg_one_c = try g.constInt(-1);
+                const has_idx = try g.binary(.ne, fg_index, neg_one_c);
+                const blk_use_idx = g.reserveBlock();
+                const blk_use_zero = g.reserveBlock();
+                const blk_idx_merge = g.reserveBlock();
+                try g.branch(has_idx, blk_use_idx, blk_use_zero);
+                g.beginReservedBlock(blk_use_idx);
+                try g.jump(blk_idx_merge, &.{fg_index});
+                g.beginReservedBlock(blk_use_zero);
+                const c0_idx = try g.constInt(0);
+                try g.jump(blk_idx_merge, &.{c0_idx});
+                g.beginReservedBlock(blk_idx_merge);
+                const resolved_idx = try g.addBlockParam();
+
                 const fg_alloc3 = try g.callDirect(f_alloc_reg, &.{ ctx, fg_dst });
                 const fg_reg3_raw = try g.recordField(fg_alloc3, "reg");
                 const fg_ctx3 = try g.recordField(fg_alloc3, "ctx");
@@ -2466,10 +2498,11 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                 g.beginReservedBlock(blk_fg_dm3);
                 const fg_reg3 = try g.addBlockParam();
 
+                // LDR dst, [base, #resolved_idx*8] — use resolved_idx for offset
                 const ldr_base3 = try g.constInt(0xF9400000);
                 const c10_nm = try g.constInt(10);
                 const c5_nm = try g.constInt(5);
-                const ldr_off3 = try g.binary(.shl, try g.constInt(0), c10_nm);
+                const ldr_off3 = try g.binary(.shl, resolved_idx, c10_nm);
                 const ldr_rn3 = try g.binary(.shl, fg_base_reg3, c5_nm);
                 const ldr_r1c = try g.binary(.bit_or, ldr_base3, ldr_off3);
                 const ldr_r2c = try g.binary(.bit_or, ldr_r1c, ldr_rn3);

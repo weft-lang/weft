@@ -417,6 +417,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const lhs = try g.recordField(payload, "lhs");
             const rhs = try g.recordField(payload, "rhs");
             const lhs_type = try g.recordField(payload, "lhs_type");
+            const rhs_type = try g.recordField(payload, "rhs_type");
             // Lower lhs
             const lhs_r = try g.callDirect(f_lower_expr, &.{ lhs, scope, state });
             const lhs_val = try g.recordField(lhs_r, "value");
@@ -425,8 +426,10 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const rhs_r = try g.callDirect(f_lower_expr, &.{ rhs, scope, st1 });
             const rhs_val = try g.recordField(rhs_r, "value");
             const st2 = try g.recordField(rhs_r, "state");
-            // Check if this is string equality/inequality
-            const is_str_type = try g.tagTest(lhs_type, typeck.ty_string);
+            // Check if this is string equality/inequality (either operand typed as string)
+            const is_lhs_str = try g.tagTest(lhs_type, typeck.ty_string);
+            const is_rhs_str = try g.tagTest(rhs_type, typeck.ty_string);
+            const is_str_type = try g.logicOr(is_lhs_str, is_rhs_str);
             const op_eq_str = try g.constString("==");
             const op_ne_str = try g.constString("!=");
             const is_eq_op = try g.eq(op, op_eq_str);
@@ -708,13 +711,45 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const fv = try g.callDirect(f_fresh_val, &.{st1});
             const dst = try g.recordField(fv, "id");
             const st2 = try g.recordField(fv, "state");
-            // index = -1 means "unknown, use fields_map"
-            const neg_one = try g.constInt(-1);
+
+            // Compute field index from base_type when possible
+            // For strings: "ptr" → 0, "len" → 1
+            const base_type = try g.recordField(payload, "base_type");
+            const is_str_base = try g.tagTest(base_type, typeck.ty_string);
+            const fa_idx_str_blk = g.reserveBlock();
+            const fa_idx_default_blk = g.reserveBlock();
+            const fa_idx_merge_blk = g.reserveBlock();
+            try g.branch(is_str_base, fa_idx_str_blk, fa_idx_default_blk);
+
+            g.beginReservedBlock(fa_idx_str_blk);
+            {
+                const len_str = try g.constString("len");
+                const is_len = try g.eq(field, len_str);
+                const fa_len_blk = g.reserveBlock();
+                const fa_ptr_blk = g.reserveBlock();
+                try g.branch(is_len, fa_len_blk, fa_ptr_blk);
+                g.beginReservedBlock(fa_len_blk);
+                const c1_fa = try g.constInt(1);
+                try g.jump(fa_idx_merge_blk, &.{c1_fa});
+                g.beginReservedBlock(fa_ptr_blk);
+                const c0_fa = try g.constInt(0);
+                try g.jump(fa_idx_merge_blk, &.{c0_fa});
+            }
+
+            g.beginReservedBlock(fa_idx_default_blk);
+            {
+                const neg_one_def = try g.constInt(-1);
+                try g.jump(fa_idx_merge_blk, &.{neg_one_def});
+            }
+
+            g.beginReservedBlock(fa_idx_merge_blk);
+            const field_idx = try g.addBlockParam();
+
             const inst_rec = try g.record(&.{
                 .{ .name = "dst", .value = dst },
                 .{ .name = "base", .value = base_val },
                 .{ .name = "field", .value = field },
-                .{ .name = "index", .value = neg_one },
+                .{ .name = "index", .value = field_idx },
             });
             const inst = try g.tag(ir_field_get, inst_rec);
             const st3 = try g.callDirect(f_emit_inst, &.{ inst, st2 });
@@ -2981,6 +3016,7 @@ test "lower: lower BinOp produces IrBinary" {
         .{ .name = "rhs", .value = rhs },
         .{ .name = "type", .value = ty_int_val },
         .{ .name = "lhs_type", .value = ty_int_val },
+        .{ .name = "rhs_type", .value = ty_int_val },
     });
     const binop = try g.tag(typeck.tast_binop, binop_payload);
 
@@ -3176,6 +3212,7 @@ test "lower: BinOp last instruction is IrBinary with correct op" {
         .{ .name = "rhs", .value = rhs },
         .{ .name = "type", .value = ty_int_val },
         .{ .name = "lhs_type", .value = ty_int_val },
+        .{ .name = "rhs_type", .value = ty_int_val },
     });
     const binop = try g.tag(typeck.tast_binop, binop_payload);
     const result = try g.callDirect(f_lower_expr, &.{ binop, scope, state });

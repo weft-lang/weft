@@ -1081,13 +1081,59 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         try g.branch(is_ctor, ctor_blk, default_blk);
 
         g.beginReservedBlock(ctor_blk);
-        const ctor_pl = try g.tagPayload(pat, grammar.ast_pat_constructor);
-        const ctor_typed = try g.tag("TPatConstructor", ctor_pl);
-        const ctor_result = try g.record(&.{
-            .{ .name = "ctx", .value = ctx },
-            .{ .name = "typed_pat", .value = ctor_typed },
-        });
-        try g.ret(ctor_result);
+        {
+            const ctor_pl = try g.tagPayload(pat, grammar.ast_pat_constructor);
+            const ctor_args = try g.recordField(ctor_pl, "args");
+            const ctor_nargs = try g.listLength(ctor_args);
+            const c0_cp = try g.constInt(0);
+            const has_args_cp = try g.binary(.gt, ctor_nargs, c0_cp);
+            const ctor_recurse_blk = g.reserveBlock();
+            const ctor_done_blk = g.reserveBlock();
+            try g.branch(has_args_cp, ctor_recurse_blk, ctor_done_blk);
+
+            // Recurse into sub-patterns (bind variables with TyAny for now)
+            g.beginReservedBlock(ctor_recurse_blk);
+            {
+                // Loop over args, recursively check each with TyAny
+                const cp_loop = g.reserveBlock();
+                try g.jump(cp_loop, &.{ c0_cp, ctx });
+                g.beginReservedBlock(cp_loop);
+                const cp_i = try g.addBlockParam();
+                const cp_ctx = try g.addBlockParam();
+                const cp_done = try g.ge(cp_i, ctor_nargs);
+                const cp_body = g.reserveBlock();
+                const cp_exit = g.reserveBlock();
+                try g.branch(cp_done, cp_exit, cp_body);
+
+                g.beginReservedBlock(cp_body);
+                {
+                    const sub_pat = try g.listNth(ctor_args, cp_i);
+                    const sub_ty = try g.tag(ty_any, null);
+                    const sub_result = try g.callDirect(f_check_pattern, &.{ sub_pat, sub_ty, cp_ctx });
+                    const new_ctx = try g.recordField(sub_result, "ctx");
+                    const c1_cp = try g.constInt(1);
+                    const next_i = try g.add(cp_i, c1_cp);
+                    try g.jump(cp_loop, &.{ next_i, new_ctx });
+                }
+
+                g.beginReservedBlock(cp_exit);
+                const ctor_typed_r = try g.tag("TPatConstructor", ctor_pl);
+                const ctor_result_r = try g.record(&.{
+                    .{ .name = "ctx", .value = cp_ctx },
+                    .{ .name = "typed_pat", .value = ctor_typed_r },
+                });
+                try g.ret(ctor_result_r);
+            }
+
+            // No args — return unchanged ctx
+            g.beginReservedBlock(ctor_done_blk);
+            const ctor_typed = try g.tag("TPatConstructor", ctor_pl);
+            const ctor_result = try g.record(&.{
+                .{ .name = "ctx", .value = ctx },
+                .{ .name = "typed_pat", .value = ctor_typed },
+            });
+            try g.ret(ctor_result);
+        }
 
         // Default — pass through
         g.beginReservedBlock(default_blk);
@@ -1260,6 +1306,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                 .{ .name = "rhs", .value = rhs_typed },
                 .{ .name = "type", .value = result_type },
                 .{ .name = "lhs_type", .value = lhs_type },
+                .{ .name = "rhs_type", .value = rhs_type },
             });
             const texpr = try g.tag(tast_binop, typed);
             try g.ret(try g.record(&.{
@@ -1665,11 +1712,13 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const fa_field = try g.recordField(fa_pl, "field");
             const fa_result = try g.callDirect(f_infer, &.{ fa_expr, ctx });
             const fa_typed = try g.recordField(fa_result, "expr");
+            const fa_base_type = try g.recordField(fa_result, "type");
             const fa_type = try g.tag(ty_any, null); // TODO: lookup field type
             const typed = try g.record(&.{
                 .{ .name = "expr", .value = fa_typed },
                 .{ .name = "field", .value = fa_field },
                 .{ .name = "type", .value = fa_type },
+                .{ .name = "base_type", .value = fa_base_type },
             });
             const texpr = try g.tag(tast_field_access, typed);
             try g.ret(try g.record(&.{
