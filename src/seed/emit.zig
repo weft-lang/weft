@@ -5130,19 +5130,9 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
         g.beginReservedBlock(blk_emit_b_main);
         {
-            // Append B instruction to jump to main function
-            const header_size = try g.callBuiltin("bytes_length", &.{macho_header});
-            const main_entry_off = try g.mapGet(final_func_map, entry_name);
-            const main_abs = try g.add(header_size, main_entry_off);
-            const cur_pos = try g.callBuiltin("bytes_length", &.{macho_with_heap_raw});
-            const b_rel = try g.sub(main_abs, cur_pos);
-            const c4_b = try g.constInt(4);
-            const b_rel_div4 = try g.binary(.div, b_rel, c4_b);
-            const b_base = try g.constInt(0x14000000);
-            const b_mask = try g.constInt(0x03FFFFFF);
-            const b_imm = try g.binary(.bit_and, b_rel_div4, b_mask);
-            const b_enc = try g.binary(.bit_or, b_base, b_imm);
-            const macho_with_b = try g.callDirect(f_append_inst, &.{ macho_with_heap_raw, b_enc });
+            // Append placeholder B instruction (will be patched after pass 2)
+            const b_placeholder = try g.constInt(0x14000001); // B +4 (NOP-like)
+            const macho_with_b = try g.callDirect(f_append_inst, &.{ macho_with_heap_raw, b_placeholder });
             try g.jump(blk_after_b_main, &.{macho_with_b});
         }
 
@@ -5174,10 +5164,41 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const next_f_idx2 = try g.add(f_idx2, c1b);
         try g.jump(loop2, &.{ next_f_idx2, new_macho, new_ctx2 });
 
-        // Append exit sequence to final binary
+        // Patch B main instruction using pass 2's func_map (correct absolute offsets)
         g.beginReservedBlock(blk_done2);
+        const pass2_func_map = try g.recordField(cur_ctx2, "func_map");
+        const has_main2 = try g.mapHas(pass2_func_map, entry_name);
+        const blk_patch = g.reserveBlock();
+        const blk_skip_patch = g.reserveBlock();
+        const blk_no_patch = g.reserveBlock();
+        try g.branch(has_main2, blk_patch, blk_skip_patch);
+
+        g.beginReservedBlock(blk_skip_patch);
+        try g.jump(blk_no_patch, &.{cur_macho});
+
+        g.beginReservedBlock(blk_patch);
+        {
+            const main_off2 = try g.mapGet(pass2_func_map, entry_name);
+            // B is the last instruction in macho_with_heap (header + heap_init + B_placeholder)
+            const c4_p = try g.constInt(4);
+            const b_pos_actual = try g.sub(try g.callBuiltin("bytes_length", &.{macho_with_heap}), c4_p);
+            const b_rel2 = try g.sub(main_off2, b_pos_actual);
+            const b_rel_div4 = try g.binary(.div, b_rel2, c4_p);
+            const b_base = try g.constInt(0x14000000);
+            const b_mask = try g.constInt(0x03FFFFFF);
+            const b_imm = try g.binary(.bit_and, b_rel_div4, b_mask);
+            const b_enc = try g.binary(.bit_or, b_base, b_imm);
+            // Patch: write the B instruction at b_pos_actual in cur_macho
+            const patched_macho = try g.callBuiltin("bytes_set_u32_le", &.{ cur_macho, b_pos_actual, b_enc });
+            try g.jump(blk_no_patch, &.{patched_macho});
+        }
+
+        g.beginReservedBlock(blk_no_patch);
+        const patched_or_orig = try g.addBlockParam();
+
+        // Append exit sequence to final binary
         const exit_reg2 = try g.constInt(0);
-        const final_macho = try g.callDirect(f_emit_exit, &.{ cur_macho, exit_reg2 });
+        const final_macho = try g.callDirect(f_emit_exit, &.{ patched_or_orig, exit_reg2 });
 
         // Pad code to page boundary (code_limit alignment)
         const padded = try g.callDirect(f_pad_to_page, &.{final_macho});
