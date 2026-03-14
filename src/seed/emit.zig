@@ -3673,12 +3673,14 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(blk_store);
         {
             const store_payload = try g.tagPayload(inst, "IrStore");
+            const store_dst = try g.recordField(store_payload, "dst");
             const store_target = try g.recordField(store_payload, "target");
             const store_value = try g.recordField(store_payload, "value");
-            // Get registers for target and value
-            const tgt_reg_raw = try g.callDirect(f_get_reg, &.{ ctx, store_target });
-            const val_reg_raw = try g.callDirect(f_get_reg, &.{ ctx, store_value });
-            // Load spilled operands into temp registers
+            // Allocate dst to keep counter in sync
+            const store_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, store_dst });
+            const store_ctx = try g.recordField(store_alloc, "ctx");
+            const tgt_reg_raw = try g.callDirect(f_get_reg, &.{ store_ctx, store_target });
+            const val_reg_raw = try g.callDirect(f_get_reg, &.{ store_ctx, store_value });
             const c16_st = try g.constInt(16);
             const c17_st = try g.constInt(17);
             const tgt_load = try g.callDirect(f_load_spill, &.{ bytes, tgt_reg_raw, c16_st });
@@ -3687,15 +3689,13 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const val_load = try g.callDirect(f_load_spill, &.{ bytes_st1, val_reg_raw, c17_st });
             const bytes_st2 = try g.recordField(val_load, "bytes");
             const val_reg = try g.recordField(val_load, "reg");
-            // MOV target_reg, value_reg → ADD target_reg, value_reg, #0
             const c0_st = try g.constInt(0);
             const st_mov = try g.callDirect(f_encode_add_imm, &.{ tgt_reg, val_reg, c0_st });
             const st_bytes = try g.callDirect(f_append_inst, &.{ bytes_st2, st_mov });
-            // If target was spilled, store back
             const st_bytes2 = try g.callDirect(f_store_spill, &.{ st_bytes, tgt_reg_raw, tgt_reg });
             const st_result = try g.record(&.{
                 .{ .name = "bytes", .value = st_bytes2 },
-                .{ .name = "ctx", .value = ctx },
+                .{ .name = "ctx", .value = store_ctx },
             });
             try g.ret(st_result);
         }
@@ -3710,10 +3710,14 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(blk_ptr_store);
         {
             const ps_payload = try g.tagPayload(inst, "IrPtrStore");
+            const ps_dst = try g.recordField(ps_payload, "dst");
             const ps_ptr = try g.recordField(ps_payload, "ptr");
             const ps_value = try g.recordField(ps_payload, "value");
-            const ps_ptr_raw = try g.callDirect(f_get_reg, &.{ ctx, ps_ptr });
-            const ps_val_raw = try g.callDirect(f_get_reg, &.{ ctx, ps_value });
+            // Allocate dst to keep counter in sync
+            const ps_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, ps_dst });
+            const ps_ctx = try g.recordField(ps_alloc, "ctx");
+            const ps_ptr_raw = try g.callDirect(f_get_reg, &.{ ps_ctx, ps_ptr });
+            const ps_val_raw = try g.callDirect(f_get_reg, &.{ ps_ctx, ps_value });
             const c16_ps = try g.constInt(16);
             const c17_ps = try g.constInt(17);
             const ps_ptr_load = try g.callDirect(f_load_spill, &.{ bytes, ps_ptr_raw, c16_ps });
@@ -3722,12 +3726,11 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const ps_val_load = try g.callDirect(f_load_spill, &.{ ps_bytes1, ps_val_raw, c17_ps });
             const ps_bytes2 = try g.recordField(ps_val_load, "bytes");
             const ps_val_reg = try g.recordField(ps_val_load, "reg");
-            // STR value_reg, [ptr_reg, #0]
             const ps_str_inst = try g.callDirect(f_encode_str, &.{ ps_val_reg, ps_ptr_reg, try g.constInt(0) });
             const ps_bytes3 = try g.callDirect(f_append_inst, &.{ ps_bytes2, ps_str_inst });
             const ps_result = try g.record(&.{
                 .{ .name = "bytes", .value = ps_bytes3 },
-                .{ .name = "ctx", .value = ctx },
+                .{ .name = "ctx", .value = ps_ctx },
             });
             try g.ret(ps_result);
         }
@@ -3857,11 +3860,15 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(blk_ms8);
         {
             const ms_payload = try g.tagPayload(inst, "IrMemStore8");
+            const ms_dst = try g.recordField(ms_payload, "dst");
             const ms_args = try g.recordField(ms_payload, "args");
             const ms_addr_id = try g.listNth(ms_args, try g.constInt(0));
             const ms_val_id = try g.listNth(ms_args, try g.constInt(1));
-            const ms_addr_raw = try g.callDirect(f_get_reg, &.{ ctx, ms_addr_id });
-            const ms_val_raw = try g.callDirect(f_get_reg, &.{ ctx, ms_val_id });
+            // Allocate dst to keep counter in sync
+            const ms_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, ms_dst });
+            const ms_ctx = try g.recordField(ms_alloc, "ctx");
+            const ms_addr_raw = try g.callDirect(f_get_reg, &.{ ms_ctx, ms_addr_id });
+            const ms_val_raw = try g.callDirect(f_get_reg, &.{ ms_ctx, ms_val_id });
             const c16_ms = try g.constInt(16);
             const c17_ms = try g.constInt(17);
             const ms_addr_load = try g.callDirect(f_load_spill, &.{ bytes, ms_addr_raw, c16_ms });
@@ -3870,14 +3877,13 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const ms_val_load = try g.callDirect(f_load_spill, &.{ ms_bytes1, ms_val_raw, c17_ms });
             const ms_bytes2 = try g.recordField(ms_val_load, "bytes");
             const ms_val_reg = try g.recordField(ms_val_load, "reg");
-            // STRB Wt, [Xn] = 0x39000000 | (Rn << 5) | Rt
             const ms_base = try g.constInt(0x39000000);
             const c5_ms = try g.constInt(5);
             const ms_rn_shifted = try g.binary(.shl, ms_addr_reg, c5_ms);
             const ms_enc1 = try g.binary(.bit_or, ms_base, ms_rn_shifted);
             const ms_enc2 = try g.binary(.bit_or, ms_enc1, ms_val_reg);
             const ms_bytes3 = try g.callDirect(f_append_inst, &.{ ms_bytes2, ms_enc2 });
-            try g.ret(try g.record(&.{ .{ .name = "bytes", .value = ms_bytes3 }, .{ .name = "ctx", .value = ctx } }));
+            try g.ret(try g.record(&.{ .{ .name = "bytes", .value = ms_bytes3 }, .{ .name = "ctx", .value = ms_ctx } }));
         }
 
         // IrMemLoad8: LDRB dst, [addr] — __mem_load8(addr)
@@ -3922,11 +3928,15 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(blk_ms64);
         {
             const ms64_payload = try g.tagPayload(inst, "IrMemStore64");
+            const ms64_dst = try g.recordField(ms64_payload, "dst");
             const ms64_args = try g.recordField(ms64_payload, "args");
             const ms64_addr_id = try g.listNth(ms64_args, try g.constInt(0));
             const ms64_val_id = try g.listNth(ms64_args, try g.constInt(1));
-            const ms64_addr_raw = try g.callDirect(f_get_reg, &.{ ctx, ms64_addr_id });
-            const ms64_val_raw = try g.callDirect(f_get_reg, &.{ ctx, ms64_val_id });
+            // Allocate dst register to keep counter in sync with lowerer
+            const ms64_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, ms64_dst });
+            const ms64_ctx = try g.recordField(ms64_alloc, "ctx");
+            const ms64_addr_raw = try g.callDirect(f_get_reg, &.{ ms64_ctx, ms64_addr_id });
+            const ms64_val_raw = try g.callDirect(f_get_reg, &.{ ms64_ctx, ms64_val_id });
             const c16_ms64 = try g.constInt(16);
             const c17_ms64 = try g.constInt(17);
             const ms64_al = try g.callDirect(f_load_spill, &.{ bytes, ms64_addr_raw, c16_ms64 });
@@ -3935,11 +3945,10 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const ms64_vl = try g.callDirect(f_load_spill, &.{ ms64_b1, ms64_val_raw, c17_ms64 });
             const ms64_b2 = try g.recordField(ms64_vl, "bytes");
             const ms64_vr = try g.recordField(ms64_vl, "reg");
-            // STR Xt, [Xn] = already have f_encode_str
             const c0_ms64 = try g.constInt(0);
             const ms64_enc = try g.callDirect(f_encode_str, &.{ ms64_vr, ms64_ar, c0_ms64 });
             const ms64_b3 = try g.callDirect(f_append_inst, &.{ ms64_b2, ms64_enc });
-            try g.ret(try g.record(&.{ .{ .name = "bytes", .value = ms64_b3 }, .{ .name = "ctx", .value = ctx } }));
+            try g.ret(try g.record(&.{ .{ .name = "bytes", .value = ms64_b3 }, .{ .name = "ctx", .value = ms64_ctx } }));
         }
 
         // IrMemLoad64: LDR dst, [addr] — __mem_load64(addr)
