@@ -3828,19 +3828,41 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const sp_value = try g.recordField(sp_payload, "value");
             // Allocate dst register
             const sp_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, sp_dst });
-            const sp_dst_reg = try g.recordField(sp_alloc, "reg");
+            const sp_dst_reg_raw = try g.recordField(sp_alloc, "reg");
             const sp_ctx = try g.recordField(sp_alloc, "ctx");
-            // Get the descriptor register (string value = pointer to {data_ptr, len})
+            // Get the descriptor register
             const sp_val_raw = try g.callDirect(f_get_reg, &.{ sp_ctx, sp_value });
             const c16_sp = try g.constInt(16);
+            const c17_sp = try g.constInt(17);
+            // Load descriptor into x16 (if spilled)
             const sp_load = try g.callDirect(f_load_spill, &.{ bytes, sp_val_raw, c16_sp });
             const sp_bytes = try g.recordField(sp_load, "bytes");
             const sp_val_reg = try g.recordField(sp_load, "reg");
-            // LDR dst, [descriptor, #0] — load the data pointer from the descriptor
+            // Use x17 as dst temp (in case dst is spilled)
             const c0_sp = try g.constInt(0);
-            const sp_ldr = try g.callDirect(f_encode_ldr, &.{ sp_dst_reg, sp_val_reg, c0_sp });
+            const sp_ldr = try g.callDirect(f_encode_ldr, &.{ c17_sp, sp_val_reg, c0_sp });
             const sp_bytes2 = try g.callDirect(f_append_inst, &.{ sp_bytes, sp_ldr });
-            const sp_bytes3 = try g.callDirect(f_store_spill, &.{ sp_bytes2, sp_dst_reg, sp_dst_reg });
+            // Store x17 to dst (spill or physical)
+            const c100_sp = try g.constInt(100);
+            const sp_is_spilled = try g.ge(sp_dst_reg_raw, c100_sp);
+            const sp_spill_blk = g.reserveBlock();
+            const sp_phys_blk = g.reserveBlock();
+            const sp_merge_blk = g.reserveBlock();
+            try g.branch(sp_is_spilled, sp_spill_blk, sp_phys_blk);
+
+            g.beginReservedBlock(sp_phys_blk);
+            // MOV dst_reg, x17
+            const sp_mov = try g.callDirect(f_encode_add_imm, &.{ sp_dst_reg_raw, c17_sp, c0_sp });
+            const sp_bytes_p = try g.callDirect(f_append_inst, &.{ sp_bytes2, sp_mov });
+            try g.jump(sp_merge_blk, &.{sp_bytes_p});
+
+            g.beginReservedBlock(sp_spill_blk);
+            // STR x17, [sp, #offset]
+            const sp_bytes_s = try g.callDirect(f_store_spill, &.{ sp_bytes2, sp_dst_reg_raw, c17_sp });
+            try g.jump(sp_merge_blk, &.{sp_bytes_s});
+
+            g.beginReservedBlock(sp_merge_blk);
+            const sp_bytes3 = try g.addBlockParam();
             const sp_result = try g.record(&.{
                 .{ .name = "bytes", .value = sp_bytes3 },
                 .{ .name = "ctx", .value = sp_ctx },
@@ -3898,21 +3920,41 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const ml_args = try g.recordField(ml_payload, "args");
             const ml_addr_id = try g.listNth(ml_args, try g.constInt(0));
             const ml_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, ml_dst });
-            const ml_dst_reg = try g.recordField(ml_alloc, "reg");
+            const ml_dst_reg_raw = try g.recordField(ml_alloc, "reg");
             const ml_ctx = try g.recordField(ml_alloc, "ctx");
             const ml_addr_raw = try g.callDirect(f_get_reg, &.{ ml_ctx, ml_addr_id });
             const c16_ml = try g.constInt(16);
+            const c17_ml = try g.constInt(17);
             const ml_load = try g.callDirect(f_load_spill, &.{ bytes, ml_addr_raw, c16_ml });
             const ml_bytes1 = try g.recordField(ml_load, "bytes");
             const ml_addr_reg = try g.recordField(ml_load, "reg");
-            // LDRB Wt, [Xn] = 0x39400000 | (Rn << 5) | Rt
+            // LDRB x17, [addr_reg] — always use x17 as temp dst
             const ml_base = try g.constInt(0x39400000);
             const c5_ml = try g.constInt(5);
             const ml_rn_shifted = try g.binary(.shl, ml_addr_reg, c5_ml);
             const ml_enc1 = try g.binary(.bit_or, ml_base, ml_rn_shifted);
-            const ml_enc2 = try g.binary(.bit_or, ml_enc1, ml_dst_reg);
+            const ml_enc2 = try g.binary(.bit_or, ml_enc1, c17_ml);
             const ml_bytes2 = try g.callDirect(f_append_inst, &.{ ml_bytes1, ml_enc2 });
-            const ml_bytes3 = try g.callDirect(f_store_spill, &.{ ml_bytes2, ml_dst_reg, ml_dst_reg });
+            // Store x17 to dst (physical or spill)
+            const c100_ml = try g.constInt(100);
+            const ml_spilled = try g.ge(ml_dst_reg_raw, c100_ml);
+            const ml_sp_blk = g.reserveBlock();
+            const ml_ph_blk = g.reserveBlock();
+            const ml_mg_blk = g.reserveBlock();
+            try g.branch(ml_spilled, ml_sp_blk, ml_ph_blk);
+
+            g.beginReservedBlock(ml_ph_blk);
+            const c0_ml = try g.constInt(0);
+            const ml_mov = try g.callDirect(f_encode_add_imm, &.{ ml_dst_reg_raw, c17_ml, c0_ml });
+            const ml_bp = try g.callDirect(f_append_inst, &.{ ml_bytes2, ml_mov });
+            try g.jump(ml_mg_blk, &.{ml_bp});
+
+            g.beginReservedBlock(ml_sp_blk);
+            const ml_bs = try g.callDirect(f_store_spill, &.{ ml_bytes2, ml_dst_reg_raw, c17_ml });
+            try g.jump(ml_mg_blk, &.{ml_bs});
+
+            g.beginReservedBlock(ml_mg_blk);
+            const ml_bytes3 = try g.addBlockParam();
             try g.ret(try g.record(&.{ .{ .name = "bytes", .value = ml_bytes3 }, .{ .name = "ctx", .value = ml_ctx } }));
         }
 
@@ -3963,17 +4005,37 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const ml64_args = try g.recordField(ml64_payload, "args");
             const ml64_addr_id = try g.listNth(ml64_args, try g.constInt(0));
             const ml64_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, ml64_dst });
-            const ml64_dst_reg = try g.recordField(ml64_alloc, "reg");
+            const ml64_dst_reg_raw = try g.recordField(ml64_alloc, "reg");
             const ml64_ctx = try g.recordField(ml64_alloc, "ctx");
             const ml64_addr_raw = try g.callDirect(f_get_reg, &.{ ml64_ctx, ml64_addr_id });
             const c16_ml64 = try g.constInt(16);
+            const c17_ml64 = try g.constInt(17);
             const ml64_load = try g.callDirect(f_load_spill, &.{ bytes, ml64_addr_raw, c16_ml64 });
             const ml64_b1 = try g.recordField(ml64_load, "bytes");
             const ml64_ar = try g.recordField(ml64_load, "reg");
+            // LDR x17, [addr_reg, #0] — always use x17 as temp dst
             const c0_ml64 = try g.constInt(0);
-            const ml64_enc = try g.callDirect(f_encode_ldr, &.{ ml64_dst_reg, ml64_ar, c0_ml64 });
+            const ml64_enc = try g.callDirect(f_encode_ldr, &.{ c17_ml64, ml64_ar, c0_ml64 });
             const ml64_b2 = try g.callDirect(f_append_inst, &.{ ml64_b1, ml64_enc });
-            const ml64_b3 = try g.callDirect(f_store_spill, &.{ ml64_b2, ml64_dst_reg, ml64_dst_reg });
+            // Move x17 to dst (physical or spill)
+            const c100_ml64 = try g.constInt(100);
+            const ml64_spilled = try g.ge(ml64_dst_reg_raw, c100_ml64);
+            const ml64_sp = g.reserveBlock();
+            const ml64_ph = g.reserveBlock();
+            const ml64_mg = g.reserveBlock();
+            try g.branch(ml64_spilled, ml64_sp, ml64_ph);
+
+            g.beginReservedBlock(ml64_ph);
+            const ml64_mov = try g.callDirect(f_encode_add_imm, &.{ ml64_dst_reg_raw, c17_ml64, c0_ml64 });
+            const ml64_bp = try g.callDirect(f_append_inst, &.{ ml64_b2, ml64_mov });
+            try g.jump(ml64_mg, &.{ml64_bp});
+
+            g.beginReservedBlock(ml64_sp);
+            const ml64_bs = try g.callDirect(f_store_spill, &.{ ml64_b2, ml64_dst_reg_raw, c17_ml64 });
+            try g.jump(ml64_mg, &.{ml64_bs});
+
+            g.beginReservedBlock(ml64_mg);
+            const ml64_b3 = try g.addBlockParam();
             try g.ret(try g.record(&.{ .{ .name = "bytes", .value = ml64_b3 }, .{ .name = "ctx", .value = ml64_ctx } }));
         }
 
@@ -3991,22 +4053,41 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const ba_args = try g.recordField(ba_payload, "args");
             const ba_size_id = try g.listNth(ba_args, try g.constInt(0));
             const ba_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, ba_dst });
-            const ba_dst_reg = try g.recordField(ba_alloc, "reg");
+            const ba_dst_reg_raw = try g.recordField(ba_alloc, "reg");
             const ba_ctx = try g.recordField(ba_alloc, "ctx");
             const ba_size_raw = try g.callDirect(f_get_reg, &.{ ba_ctx, ba_size_id });
             const c16_ba = try g.constInt(16);
+            const c17_ba = try g.constInt(17);
             const ba_load = try g.callDirect(f_load_spill, &.{ bytes, ba_size_raw, c16_ba });
             const ba_b1 = try g.recordField(ba_load, "bytes");
             const ba_size_reg = try g.recordField(ba_load, "reg");
-            // MOV dst, x28 → ADD dst, x28, #0
+            // MOV x17, x28 → ADD x17, x28, #0 (use x17 as temp dst)
             const c28_ba = try g.constInt(28);
             const c0_ba = try g.constInt(0);
-            const ba_mov = try g.callDirect(f_encode_add_imm, &.{ ba_dst_reg, c28_ba, c0_ba });
+            const ba_mov = try g.callDirect(f_encode_add_imm, &.{ c17_ba, c28_ba, c0_ba });
             const ba_b2 = try g.callDirect(f_append_inst, &.{ ba_b1, ba_mov });
             // ADD x28, x28, size_reg
             const ba_add = try g.callDirect(f_encode_add_reg, &.{ c28_ba, c28_ba, ba_size_reg });
             const ba_b3 = try g.callDirect(f_append_inst, &.{ ba_b2, ba_add });
-            const ba_b4 = try g.callDirect(f_store_spill, &.{ ba_b3, ba_dst_reg, ba_dst_reg });
+            // Move x17 to dst (physical or spill)
+            const c100_ba = try g.constInt(100);
+            const ba_spilled = try g.ge(ba_dst_reg_raw, c100_ba);
+            const ba_sp = g.reserveBlock();
+            const ba_ph = g.reserveBlock();
+            const ba_mg = g.reserveBlock();
+            try g.branch(ba_spilled, ba_sp, ba_ph);
+
+            g.beginReservedBlock(ba_ph);
+            const ba_movd = try g.callDirect(f_encode_add_imm, &.{ ba_dst_reg_raw, c17_ba, c0_ba });
+            const ba_bp = try g.callDirect(f_append_inst, &.{ ba_b3, ba_movd });
+            try g.jump(ba_mg, &.{ba_bp});
+
+            g.beginReservedBlock(ba_sp);
+            const ba_bs = try g.callDirect(f_store_spill, &.{ ba_b3, ba_dst_reg_raw, c17_ba });
+            try g.jump(ba_mg, &.{ba_bs});
+
+            g.beginReservedBlock(ba_mg);
+            const ba_b4 = try g.addBlockParam();
             try g.ret(try g.record(&.{ .{ .name = "bytes", .value = ba_b4 }, .{ .name = "ctx", .value = ba_ctx } }));
         }
 
@@ -4023,18 +4104,38 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const sl_dst = try g.recordField(sl_payload, "dst");
             const sl_value = try g.recordField(sl_payload, "value");
             const sl_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, sl_dst });
-            const sl_dst_reg = try g.recordField(sl_alloc, "reg");
+            const sl_dst_reg_raw = try g.recordField(sl_alloc, "reg");
             const sl_ctx = try g.recordField(sl_alloc, "ctx");
             const sl_val_raw = try g.callDirect(f_get_reg, &.{ sl_ctx, sl_value });
             const c16_sl = try g.constInt(16);
+            const c17_sl = try g.constInt(17);
             const sl_load = try g.callDirect(f_load_spill, &.{ bytes, sl_val_raw, c16_sl });
             const sl_bytes = try g.recordField(sl_load, "bytes");
             const sl_val_reg = try g.recordField(sl_load, "reg");
-            // LDR dst, [descriptor, #8] — load length field
+            // LDR x17, [descriptor, #8] — use x17 as temp dst
             const c8_sl = try g.constInt(8);
-            const sl_ldr = try g.callDirect(f_encode_ldr, &.{ sl_dst_reg, sl_val_reg, c8_sl });
+            const sl_ldr = try g.callDirect(f_encode_ldr, &.{ c17_sl, sl_val_reg, c8_sl });
             const sl_bytes2 = try g.callDirect(f_append_inst, &.{ sl_bytes, sl_ldr });
-            const sl_bytes3 = try g.callDirect(f_store_spill, &.{ sl_bytes2, sl_dst_reg, sl_dst_reg });
+            // Move x17 to dst (physical or spill)
+            const c100_sl = try g.constInt(100);
+            const c0_sl = try g.constInt(0);
+            const sl_spilled = try g.ge(sl_dst_reg_raw, c100_sl);
+            const sl_sp = g.reserveBlock();
+            const sl_ph = g.reserveBlock();
+            const sl_mg = g.reserveBlock();
+            try g.branch(sl_spilled, sl_sp, sl_ph);
+
+            g.beginReservedBlock(sl_ph);
+            const sl_mov = try g.callDirect(f_encode_add_imm, &.{ sl_dst_reg_raw, c17_sl, c0_sl });
+            const sl_bp = try g.callDirect(f_append_inst, &.{ sl_bytes2, sl_mov });
+            try g.jump(sl_mg, &.{sl_bp});
+
+            g.beginReservedBlock(sl_sp);
+            const sl_bs = try g.callDirect(f_store_spill, &.{ sl_bytes2, sl_dst_reg_raw, c17_sl });
+            try g.jump(sl_mg, &.{sl_bs});
+
+            g.beginReservedBlock(sl_mg);
+            const sl_bytes3 = try g.addBlockParam();
             const sl_result = try g.record(&.{
                 .{ .name = "bytes", .value = sl_bytes3 },
                 .{ .name = "ctx", .value = sl_ctx },
