@@ -34,6 +34,8 @@ pub const ir_string_eq = "IrStringEq";
 pub const ir_string_ne = "IrStringNe";
 pub const ir_store = "IrStore";
 pub const ir_ptr_store = "IrPtrStore";
+pub const ir_syscall = "IrSyscall";
+pub const ir_str_ptr = "IrStrPtr";
 pub const ir_retain = "IrRetain";
 pub const ir_release = "IrRelease";
 
@@ -1676,8 +1678,60 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                     }));
                 }
 
-                // Normal call
+                // __syscall intrinsic
                 g.beginReservedBlock(normal_call_blk);
+                const syscall_name = try g.constString("__syscall");
+                const is_syscall = try g.eq(callee_name, syscall_name);
+                const syscall_call_blk = g.reserveBlock();
+                const check_str_ptr_blk = g.reserveBlock();
+                try g.branch(is_syscall, syscall_call_blk, check_str_ptr_blk);
+
+                g.beginReservedBlock(syscall_call_blk);
+                {
+                    const fv = try g.callDirect(f_fresh_val, &.{a_state});
+                    const dst = try g.recordField(fv, "id");
+                    const st_call = try g.recordField(fv, "state");
+                    const inst_rec = try g.record(&.{
+                        .{ .name = "dst", .value = dst },
+                        .{ .name = "args", .value = a_vals },
+                    });
+                    const inst = try g.tag(ir_syscall, inst_rec);
+                    const st_final = try g.callDirect(f_emit_inst, &.{ inst, st_call });
+                    try g.ret(try g.record(&.{
+                        .{ .name = "value", .value = dst },
+                        .{ .name = "state", .value = st_final },
+                    }));
+                }
+
+                // __str_ptr intrinsic
+                g.beginReservedBlock(check_str_ptr_blk);
+                const str_ptr_name = try g.constString("__str_ptr");
+                const is_str_ptr = try g.eq(callee_name, str_ptr_name);
+                const str_ptr_call_blk = g.reserveBlock();
+                const actual_normal_call_blk = g.reserveBlock();
+                try g.branch(is_str_ptr, str_ptr_call_blk, actual_normal_call_blk);
+
+                g.beginReservedBlock(str_ptr_call_blk);
+                {
+                    // __str_ptr(s) → the string's address (pass-through, strings are already pointers)
+                    const fv = try g.callDirect(f_fresh_val, &.{a_state});
+                    const dst = try g.recordField(fv, "id");
+                    const st_call = try g.recordField(fv, "state");
+                    const str_arg = try g.listNth(a_vals, try g.constInt(0));
+                    const inst_rec = try g.record(&.{
+                        .{ .name = "dst", .value = dst },
+                        .{ .name = "value", .value = str_arg },
+                    });
+                    const inst = try g.tag(ir_str_ptr, inst_rec);
+                    const st_final = try g.callDirect(f_emit_inst, &.{ inst, st_call });
+                    try g.ret(try g.record(&.{
+                        .{ .name = "value", .value = dst },
+                        .{ .name = "state", .value = st_final },
+                    }));
+                }
+
+                // Normal call
+                g.beginReservedBlock(actual_normal_call_blk);
                 {
                     const fv = try g.callDirect(f_fresh_val, &.{a_state});
                     const dst = try g.recordField(fv, "id");
