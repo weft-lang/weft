@@ -36,6 +36,7 @@ pub const ir_store = "IrStore";
 pub const ir_ptr_store = "IrPtrStore";
 pub const ir_syscall = "IrSyscall";
 pub const ir_str_ptr = "IrStrPtr";
+pub const ir_str_len = "IrStrLen";
 pub const ir_retain = "IrRetain";
 pub const ir_release = "IrRelease";
 
@@ -1730,8 +1731,34 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                     }));
                 }
 
-                // Normal call
+                // __str_len intrinsic
                 g.beginReservedBlock(actual_normal_call_blk);
+                const str_len_name = try g.constString("__str_len");
+                const is_str_len = try g.eq(callee_name, str_len_name);
+                const str_len_call_blk = g.reserveBlock();
+                const real_normal_call_blk = g.reserveBlock();
+                try g.branch(is_str_len, str_len_call_blk, real_normal_call_blk);
+
+                g.beginReservedBlock(str_len_call_blk);
+                {
+                    const fv = try g.callDirect(f_fresh_val, &.{a_state});
+                    const dst = try g.recordField(fv, "id");
+                    const st_call = try g.recordField(fv, "state");
+                    const str_arg = try g.listNth(a_vals, try g.constInt(0));
+                    const inst_rec = try g.record(&.{
+                        .{ .name = "dst", .value = dst },
+                        .{ .name = "value", .value = str_arg },
+                    });
+                    const inst = try g.tag(ir_str_len, inst_rec);
+                    const st_final = try g.callDirect(f_emit_inst, &.{ inst, st_call });
+                    try g.ret(try g.record(&.{
+                        .{ .name = "value", .value = dst },
+                        .{ .name = "state", .value = st_final },
+                    }));
+                }
+
+                // Normal call
+                g.beginReservedBlock(real_normal_call_blk);
                 {
                     const fv = try g.callDirect(f_fresh_val, &.{a_state});
                     const dst = try g.recordField(fv, "id");

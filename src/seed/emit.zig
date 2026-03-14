@@ -3850,8 +3850,40 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             try g.ret(sp_result);
         }
 
-        // Default fallthrough: return bytes unchanged
+        // IrStrLen: load string length from descriptor[8]
         g.beginReservedBlock(blk_default);
+        const is_str_len = try g.tagTest(inst, "IrStrLen");
+        const blk_str_len = g.reserveBlock();
+        const blk_real_default = g.reserveBlock();
+        try g.branch(is_str_len, blk_str_len, blk_real_default);
+
+        g.beginReservedBlock(blk_str_len);
+        {
+            const sl_payload = try g.tagPayload(inst, "IrStrLen");
+            const sl_dst = try g.recordField(sl_payload, "dst");
+            const sl_value = try g.recordField(sl_payload, "value");
+            const sl_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, sl_dst });
+            const sl_dst_reg = try g.recordField(sl_alloc, "reg");
+            const sl_ctx = try g.recordField(sl_alloc, "ctx");
+            const sl_val_raw = try g.callDirect(f_get_reg, &.{ sl_ctx, sl_value });
+            const c16_sl = try g.constInt(16);
+            const sl_load = try g.callDirect(f_load_spill, &.{ bytes, sl_val_raw, c16_sl });
+            const sl_bytes = try g.recordField(sl_load, "bytes");
+            const sl_val_reg = try g.recordField(sl_load, "reg");
+            // LDR dst, [descriptor, #8] — load length field
+            const c8_sl = try g.constInt(8);
+            const sl_ldr = try g.callDirect(f_encode_ldr, &.{ sl_dst_reg, sl_val_reg, c8_sl });
+            const sl_bytes2 = try g.callDirect(f_append_inst, &.{ sl_bytes, sl_ldr });
+            const sl_bytes3 = try g.callDirect(f_store_spill, &.{ sl_bytes2, sl_dst_reg, sl_dst_reg });
+            const sl_result = try g.record(&.{
+                .{ .name = "bytes", .value = sl_bytes3 },
+                .{ .name = "ctx", .value = sl_ctx },
+            });
+            try g.ret(sl_result);
+        }
+
+        // Default fallthrough: return bytes unchanged
+        g.beginReservedBlock(blk_real_default);
         const ft_result = try g.record(&.{
             .{ .name = "bytes", .value = bytes },
             .{ .name = "ctx", .value = ctx },
