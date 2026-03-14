@@ -3799,16 +3799,37 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             const svc_inst = try g.constInt(0xD4001001); // SVC #0x80
             const sc_bytes_svc = try g.callDirect(f_append_inst, &.{ sc_ab, svc_inst });
 
-            // Move result from x0 to dst register
+            // Move result from x0 to dst register (use x17 as temp for spill safety)
             const sc_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, sc_dst });
             const sc_dst_reg = try g.recordField(sc_alloc, "reg");
             const sc_ctx2 = try g.recordField(sc_alloc, "ctx");
-            const sc_mov_result = try g.callDirect(f_encode_add_imm, &.{ sc_dst_reg, c0_sc, c0_sc });
-            const sc_bytes_final = try g.callDirect(f_append_inst, &.{ sc_bytes_svc, sc_mov_result });
-            // If dst is spilled, store it
-            const sc_bytes_spill = try g.callDirect(f_store_spill, &.{ sc_bytes_final, sc_dst_reg, sc_dst_reg });
+            const c0_result = try g.constInt(0);
+            const c0_imm = try g.constInt(0);
+            const c17_result = try g.constInt(17);
+            // MOV x17, x0: ADD x17, x0, #0
+            const sc_mov_to_tmp = try g.callDirect(f_encode_add_imm, &.{ c17_result, c0_result, c0_imm });
+            const sc_bytes_tmp = try g.callDirect(f_append_inst, &.{ sc_bytes_svc, sc_mov_to_tmp });
+            // Move x17 to dst (physical or spill)
+            const c100_sc2 = try g.constInt(100);
+            const sc_dst_spilled = try g.ge(sc_dst_reg, c100_sc2);
+            const sc_dst_sp = g.reserveBlock();
+            const sc_dst_ph = g.reserveBlock();
+            const sc_dst_mg = g.reserveBlock();
+            try g.branch(sc_dst_spilled, sc_dst_sp, sc_dst_ph);
+
+            g.beginReservedBlock(sc_dst_ph);
+            const sc_mov_phys = try g.callDirect(f_encode_add_imm, &.{ sc_dst_reg, c17_result, c0_imm });
+            const sc_bp = try g.callDirect(f_append_inst, &.{ sc_bytes_tmp, sc_mov_phys });
+            try g.jump(sc_dst_mg, &.{sc_bp});
+
+            g.beginReservedBlock(sc_dst_sp);
+            const sc_bs = try g.callDirect(f_store_spill, &.{ sc_bytes_tmp, sc_dst_reg, c17_result });
+            try g.jump(sc_dst_mg, &.{sc_bs});
+
+            g.beginReservedBlock(sc_dst_mg);
+            const sc_bytes_final = try g.addBlockParam();
             const sc_result = try g.record(&.{
-                .{ .name = "bytes", .value = sc_bytes_spill },
+                .{ .name = "bytes", .value = sc_bytes_final },
                 .{ .name = "ctx", .value = sc_ctx2 },
             });
             try g.ret(sc_result);
