@@ -763,10 +763,17 @@ pub const Interpreter = struct {
             },
             .jump => |j| {
                 const target_block = &frame.func.blocks[j.target.index()];
-                // Bind block params
+                // Resolve ALL args before binding ANY params (phi-node semantics).
+                // This prevents aliasing bugs where a jump arg references a ValueId
+                // that was already overwritten by an earlier block param binding.
+                var resolved_args: [16]Value = undefined;
+                const n_args = @min(j.args.len, target_block.params.len);
+                for (0..n_args) |i| {
+                    resolved_args[i] = resolve(frame, j.args[i]);
+                }
                 for (target_block.params, 0..) |param, i| {
-                    if (i < j.args.len) {
-                        bind(frame, param, resolve(frame, j.args[i]));
+                    if (i < n_args) {
+                        bind(frame, param, resolved_args[i]);
                     }
                 }
                 frame.block_idx = j.target.index();

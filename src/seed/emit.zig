@@ -1867,14 +1867,29 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                 const blk_call_merge = g.reserveBlock();
 
                 // Direct call: BL to known function
+                // If function is already emitted (backward ref), emit BL directly.
+                // If not (forward ref), emit BL placeholder and record for patching.
                 g.beginReservedBlock(blk_direct_call);
                 {
+                    const has_target = try g.mapHas(call_fmap, call_callee);
+                    const blk_bl_known = g.reserveBlock();
+                    const blk_bl_fwd = g.reserveBlock();
+                    try g.branch(has_target, blk_bl_known, blk_bl_fwd);
+
+                    // Known target: emit BL with correct offset
+                    g.beginReservedBlock(blk_bl_known);
                     const target_off = try g.mapGet(call_fmap, call_callee);
-                    const cur_off = try g.callBuiltin("bytes_length", &.{ab});
-                    const rel_off = try g.sub(target_off, cur_off);
+                    const cur_off_k = try g.callBuiltin("bytes_length", &.{ab});
+                    const rel_off = try g.sub(target_off, cur_off_k);
                     const bl_enc = try g.callDirect(f_encode_bl, &.{rel_off});
-                    const bl_bytes = try g.callDirect(f_append_inst, &.{ ab, bl_enc });
-                    try g.jump(blk_call_merge, &.{ bl_bytes, ac });
+                    const bl_bytes_k = try g.callDirect(f_append_inst, &.{ ab, bl_enc });
+                    try g.jump(blk_call_merge, &.{ bl_bytes_k, ac });
+
+                    // Forward reference: emit placeholder BL +0
+                    g.beginReservedBlock(blk_bl_fwd);
+                    const bl_placeholder_fwd = try g.constInt(0x94000000); // BL +0 (self)
+                    const bl_bytes_f = try g.callDirect(f_append_inst, &.{ ab, bl_placeholder_fwd });
+                    try g.jump(blk_call_merge, &.{ bl_bytes_f, ac });
                 }
 
                 // Indirect call: BLR Xn — use callee_val (value ID) to get register
@@ -5100,7 +5115,10 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         // but pass 2 appends to macho_header, so we need to add header_size.
         // ec_emit_func will overwrite entries with pass 2 offsets anyway,
         // but for forward references we need pass 1's map + header offset.
-        const pass1_func_map = try g.recordField(cur_ctx, "func_map");
+        // Single-pass: start with empty func_map. As each function is emitted,
+        // its offset is recorded. Forward BL references emit BL +0 placeholders.
+        // After all functions, we patch them using a second scan.
+        const pass1_func_map = try g.mapNew();
         const reg_map2 = try g.mapNew();
         const block_offsets2 = try g.mapNew();
         const data2 = try g.callBuiltin("bytes_new", &.{});
