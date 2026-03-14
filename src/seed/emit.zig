@@ -1004,40 +1004,27 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         });
         try g.ret(result_existing);
 
-        // New allocation
+        // New allocation: callee-saved only, then spill.
+        // Skip x8-x15 entirely — they get clobbered by function calls.
         g.beginReservedBlock(blk_new);
-        // Map next_reg counter to actual register number
-        // 0-7 -> x19-x26 (callee-saved), 8-15 -> x8-x15 (temps), 16+ -> spill
         const c8_val = try g.constInt(8);
-        const is_temp = try g.ge(next_reg, c8_val);
-        const blk_temp = g.reserveBlock();
+        const is_spill = try g.ge(next_reg, c8_val);
         const blk_callee = g.reserveBlock();
-        try g.branch(is_temp, blk_temp, blk_callee);
+        const blk_spill = g.reserveBlock();
+        try g.branch(is_spill, blk_spill, blk_callee);
 
         g.beginReservedBlock(blk_callee);
-        // reg = next_reg + 19
+        // counter 0-7 -> x19-x26
         const c19_val = try g.constInt(19);
         const reg_callee = try g.add(next_reg, c19_val);
         const blk_assign = g.reserveBlock();
         try g.jump(blk_assign, &.{reg_callee});
 
-        g.beginReservedBlock(blk_temp);
-        // Check if we've exhausted physical registers (next_reg >= 16)
-        const c16_val = try g.constInt(16);
-        const is_spill = try g.ge(next_reg, c16_val);
-        const blk_spill = g.reserveBlock();
-        const blk_phys_temp = g.reserveBlock();
-        try g.branch(is_spill, blk_spill, blk_phys_temp);
-
-        g.beginReservedBlock(blk_phys_temp);
-        // counter 8 -> x8, 9 -> x9, etc.
-        const reg_temp = try g.add(next_reg, try g.constInt(0));
-        try g.jump(blk_assign, &.{reg_temp});
-
-        // Spill to stack
+        // Spill to stack: counter 8 -> reg 116, 9 -> 117, etc.
+        // load_spill/store_spill use (reg - 116) * 8 for offset
         g.beginReservedBlock(blk_spill);
-        const c100 = try g.constInt(100);
-        const spill_slot = try g.add(c100, next_reg); // 100+16=116, etc.
+        const c108 = try g.constInt(108);
+        const spill_slot = try g.add(c108, next_reg); // 108+8=116, 108+9=117, etc.
         try g.jump(blk_assign, &.{spill_slot});
 
         g.beginReservedBlock(blk_assign);
@@ -3084,8 +3071,12 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(blk_handle_setup);
         {
             const hs_payload = try g.tagPayload(inst, ir_handle_setup);
+            const hs_dst = try g.recordField(hs_payload, "dst");
             const hs_effect = try g.recordField(hs_payload, "effect");
             const hs_clause_blk = try g.recordField(hs_payload, "clause_block");
+            // Allocate dst to keep counter in sync
+            const hs_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, hs_dst });
+            const hs_ctx = try g.recordField(hs_alloc, "ctx");
 
             // Bump alloc 48 bytes: x17 = frame ptr
             const c17_hs = try g.constInt(17);
@@ -3108,8 +3099,8 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
             // Compute handler clause address via ADR and store at [x17, #16]
             // offset = (blocks_start + block_offsets[clause_block]) - current_offset
-            const hs_bo = try g.recordField(ctx, "block_offsets");
-            const hs_bs = try g.recordField(ctx, "blocks_start");
+            const hs_bo = try g.recordField(hs_ctx, "block_offsets");
+            const hs_bs = try g.recordField(hs_ctx, "blocks_start");
             const hs_clause_str = try g.callBuiltin("string_from_int", &.{hs_clause_blk});
             const hs_clause_off = try g.mapGet(hs_bo, hs_clause_str);
             const hs_clause_abs = try g.add(hs_bs, hs_clause_off);
@@ -3146,7 +3137,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
             const hs_result = try g.record(&.{
                 .{ .name = "bytes", .value = hs_bytes },
-                .{ .name = "ctx", .value = ctx },
+                .{ .name = "ctx", .value = hs_ctx },
             });
             try g.ret(hs_result);
         }
@@ -3161,6 +3152,10 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         // IrHandlePop: {dst} -> LDR x27, [x27, #8] (restore prev handler)
         g.beginReservedBlock(blk_handle_pop);
         {
+            const hp_payload = try g.tagPayload(inst, ir_handle_pop);
+            const hp_dst = try g.recordField(hp_payload, "dst");
+            const hp_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, hp_dst });
+            const hp_ctx = try g.recordField(hp_alloc, "ctx");
             const c27_hp = try g.constInt(27);
             const c8_hp = try g.constInt(8);
             const hp_ldr = try g.callDirect(f_encode_ldr, &.{ c27_hp, c27_hp, c8_hp });
@@ -3168,7 +3163,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
             const hp_result = try g.record(&.{
                 .{ .name = "bytes", .value = hp_bytes },
-                .{ .name = "ctx", .value = ctx },
+                .{ .name = "ctx", .value = hp_ctx },
             });
             try g.ret(hp_result);
         }
@@ -3437,16 +3432,19 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         g.beginReservedBlock(blk_resume);
         {
             const rs_payload = try g.tagPayload(inst, ir_resume);
+            const rs_dst = try g.recordField(rs_payload, "dst");
             const rs_continuation = try g.recordField(rs_payload, "continuation");
             const rs_value = try g.recordField(rs_payload, "value");
+
+            // Allocate dst to keep counter in sync
+            const rs_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, rs_dst });
+            const rs_ctx = try g.recordField(rs_alloc, "ctx");
 
             const c0_rs = try g.constInt(0);
             const c16_rs = try g.constInt(16);
             const c17_rs = try g.constInt(17);
 
-            // Step 1: Get continuation register and MOV x17, cont_reg
-            // Must handle spilled continuation: load from stack into x16 first, then MOV x17, x16
-            const rs_cont_reg_raw = try g.callDirect(f_get_reg, &.{ ctx, rs_continuation });
+            const rs_cont_reg_raw = try g.callDirect(f_get_reg, &.{ rs_ctx, rs_continuation });
             const rs_cont_load = try g.callDirect(f_load_spill, &.{ bytes, rs_cont_reg_raw, c16_rs });
             var rs_bytes = try g.recordField(rs_cont_load, "bytes");
             const rs_cont_reg = try g.recordField(rs_cont_load, "reg");
@@ -3480,7 +3478,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             rs_bytes = try g.callDirect(f_append_inst, &.{ rs_bytes, rs_str_consumed });
 
             // Step 4: Get value register (x16 is now free for spill loading)
-            const rs_val_reg_raw = try g.callDirect(f_get_reg, &.{ ctx, rs_value });
+            const rs_val_reg_raw = try g.callDirect(f_get_reg, &.{ rs_ctx, rs_value });
             const rs_val_load = try g.callDirect(f_load_spill, &.{ rs_bytes, rs_val_reg_raw, c16_rs });
             rs_bytes = try g.recordField(rs_val_load, "bytes");
             const rs_val_reg = try g.recordField(rs_val_load, "reg");
@@ -3592,7 +3590,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
 
             const rs_result = try g.record(&.{
                 .{ .name = "bytes", .value = rs_b },
-                .{ .name = "ctx", .value = ctx },
+                .{ .name = "ctx", .value = rs_ctx },
             });
             try g.ret(rs_result);
         }
@@ -5764,8 +5762,9 @@ test "emit: alloc_reg temps start at x8 after callee-saved" {
     defer interp.deinit();
 
     const val = try interp.execFunc(fid, &.{});
-    // next_reg=8 >= 8, so temp: reg = 8 + 0 = 8 (x8)
-    try std.testing.expectEqual(@as(i64, 8), val.int);
+    // next_reg=8 >= 8, so spill: reg = 108 + 8 = 116 (spill slot 0)
+    // With callee-saved-only allocator, x8-x15 are skipped entirely
+    try std.testing.expectEqual(@as(i64, 116), val.int);
 }
 
 // ── Code generation semantic tests ─────────────────────────────────────
