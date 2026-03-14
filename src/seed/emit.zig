@@ -5080,9 +5080,8 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         // ec_emit_func will overwrite entries with pass 2 offsets anyway,
         // but for forward references we need pass 1's map + header offset.
         const pass1_func_map = try g.recordField(cur_ctx, "func_map");
-        // ec_emit_func overwrites entries during pass 2 with correct absolute offsets.
-        // Since functions are emitted in order and callees are typically defined before callers,
-        // pass 2's own entries (which have correct absolute offsets) will be used for BL.
+        // Note: pass 1 offsets are code-relative. For forward references,
+        // callee functions must be defined BEFORE callers in the source.
         const reg_map2 = try g.mapNew();
         const block_offsets2 = try g.mapNew();
         const data2 = try g.callBuiltin("bytes_new", &.{});
