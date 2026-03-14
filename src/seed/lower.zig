@@ -37,6 +37,11 @@ pub const ir_ptr_store = "IrPtrStore";
 pub const ir_syscall = "IrSyscall";
 pub const ir_str_ptr = "IrStrPtr";
 pub const ir_str_len = "IrStrLen";
+pub const ir_mem_store8 = "IrMemStore8";
+pub const ir_mem_load8 = "IrMemLoad8";
+pub const ir_mem_store64 = "IrMemStore64";
+pub const ir_mem_load64 = "IrMemLoad64";
+pub const ir_bump_alloc = "IrBumpAlloc";
 pub const ir_retain = "IrRetain";
 pub const ir_release = "IrRelease";
 
@@ -1757,8 +1762,86 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                     }));
                 }
 
-                // Normal call
+                // __mem_store8, __mem_load8, __mem_store64, __mem_load64, __bump_alloc
                 g.beginReservedBlock(real_normal_call_blk);
+
+                // Check all memory intrinsics
+                const ms8_name = try g.constString("__mem_store8");
+                const ml8_name = try g.constString("__mem_load8");
+                const ms64_name = try g.constString("__mem_store64");
+                const ml64_name = try g.constString("__mem_load64");
+                const ba_name = try g.constString("__bump_alloc");
+                const is_ms8 = try g.eq(callee_name, ms8_name);
+                const is_ml8 = try g.eq(callee_name, ml8_name);
+                const is_ms64 = try g.eq(callee_name, ms64_name);
+                const is_ml64 = try g.eq(callee_name, ml64_name);
+                const is_ba = try g.eq(callee_name, ba_name);
+                const is_mem_op = try g.logicOr(is_ms8, is_ml8);
+                const is_mem_op2 = try g.logicOr(is_mem_op, is_ms64);
+                const is_mem_op3 = try g.logicOr(is_mem_op2, is_ml64);
+                const is_mem_op4 = try g.logicOr(is_mem_op3, is_ba);
+                const mem_op_blk = g.reserveBlock();
+                const final_normal_call_blk = g.reserveBlock();
+                try g.branch(is_mem_op4, mem_op_blk, final_normal_call_blk);
+
+                g.beginReservedBlock(mem_op_blk);
+                {
+                    const fv = try g.callDirect(f_fresh_val, &.{a_state});
+                    const dst = try g.recordField(fv, "id");
+                    const st_call = try g.recordField(fv, "state");
+                    const inst_rec = try g.record(&.{
+                        .{ .name = "dst", .value = dst },
+                        .{ .name = "args", .value = a_vals },
+                    });
+                    // Dispatch to the right IR tag based on which intrinsic matched
+                    const ms8_blk = g.reserveBlock();
+                    const not_ms8_blk = g.reserveBlock();
+                    try g.branch(is_ms8, ms8_blk, not_ms8_blk);
+
+                    g.beginReservedBlock(ms8_blk);
+                    const ms8_inst = try g.tag(ir_mem_store8, inst_rec);
+                    const ms8_st = try g.callDirect(f_emit_inst, &.{ ms8_inst, st_call });
+                    try g.ret(try g.record(&.{ .{ .name = "value", .value = dst }, .{ .name = "state", .value = ms8_st } }));
+
+                    g.beginReservedBlock(not_ms8_blk);
+                    const ml8_blk = g.reserveBlock();
+                    const not_ml8_blk = g.reserveBlock();
+                    try g.branch(is_ml8, ml8_blk, not_ml8_blk);
+
+                    g.beginReservedBlock(ml8_blk);
+                    const ml8_inst = try g.tag(ir_mem_load8, inst_rec);
+                    const ml8_st = try g.callDirect(f_emit_inst, &.{ ml8_inst, st_call });
+                    try g.ret(try g.record(&.{ .{ .name = "value", .value = dst }, .{ .name = "state", .value = ml8_st } }));
+
+                    g.beginReservedBlock(not_ml8_blk);
+                    const ms64_blk = g.reserveBlock();
+                    const not_ms64_blk = g.reserveBlock();
+                    try g.branch(is_ms64, ms64_blk, not_ms64_blk);
+
+                    g.beginReservedBlock(ms64_blk);
+                    const ms64_inst = try g.tag(ir_mem_store64, inst_rec);
+                    const ms64_st = try g.callDirect(f_emit_inst, &.{ ms64_inst, st_call });
+                    try g.ret(try g.record(&.{ .{ .name = "value", .value = dst }, .{ .name = "state", .value = ms64_st } }));
+
+                    g.beginReservedBlock(not_ms64_blk);
+                    const ml64_blk = g.reserveBlock();
+                    const not_ml64_blk = g.reserveBlock();
+                    try g.branch(is_ml64, ml64_blk, not_ml64_blk);
+
+                    g.beginReservedBlock(ml64_blk);
+                    const ml64_inst = try g.tag(ir_mem_load64, inst_rec);
+                    const ml64_st = try g.callDirect(f_emit_inst, &.{ ml64_inst, st_call });
+                    try g.ret(try g.record(&.{ .{ .name = "value", .value = dst }, .{ .name = "state", .value = ml64_st } }));
+
+                    g.beginReservedBlock(not_ml64_blk);
+                    // Must be __bump_alloc
+                    const ba_inst = try g.tag(ir_bump_alloc, inst_rec);
+                    const ba_st = try g.callDirect(f_emit_inst, &.{ ba_inst, st_call });
+                    try g.ret(try g.record(&.{ .{ .name = "value", .value = dst }, .{ .name = "state", .value = ba_st } }));
+                }
+
+                // Normal call
+                g.beginReservedBlock(final_normal_call_blk);
                 {
                     const fv = try g.callDirect(f_fresh_val, &.{a_state});
                     const dst = try g.recordField(fv, "id");

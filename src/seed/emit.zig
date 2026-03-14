@@ -3850,8 +3850,164 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
             try g.ret(sp_result);
         }
 
-        // IrStrLen: load string length from descriptor[8]
+        // IrMemStore8: STRB value, [addr] — __mem_store8(addr, val)
         g.beginReservedBlock(blk_default);
+        const is_ms8 = try g.tagTest(inst, "IrMemStore8");
+        const blk_ms8 = g.reserveBlock();
+        const blk_not_ms8 = g.reserveBlock();
+        try g.branch(is_ms8, blk_ms8, blk_not_ms8);
+
+        g.beginReservedBlock(blk_ms8);
+        {
+            const ms_payload = try g.tagPayload(inst, "IrMemStore8");
+            const ms_args = try g.recordField(ms_payload, "args");
+            const ms_addr_id = try g.listNth(ms_args, try g.constInt(0));
+            const ms_val_id = try g.listNth(ms_args, try g.constInt(1));
+            const ms_addr_raw = try g.callDirect(f_get_reg, &.{ ctx, ms_addr_id });
+            const ms_val_raw = try g.callDirect(f_get_reg, &.{ ctx, ms_val_id });
+            const c16_ms = try g.constInt(16);
+            const c17_ms = try g.constInt(17);
+            const ms_addr_load = try g.callDirect(f_load_spill, &.{ bytes, ms_addr_raw, c16_ms });
+            const ms_bytes1 = try g.recordField(ms_addr_load, "bytes");
+            const ms_addr_reg = try g.recordField(ms_addr_load, "reg");
+            const ms_val_load = try g.callDirect(f_load_spill, &.{ ms_bytes1, ms_val_raw, c17_ms });
+            const ms_bytes2 = try g.recordField(ms_val_load, "bytes");
+            const ms_val_reg = try g.recordField(ms_val_load, "reg");
+            // STRB Wt, [Xn] = 0x39000000 | (Rn << 5) | Rt
+            const ms_base = try g.constInt(0x39000000);
+            const c5_ms = try g.constInt(5);
+            const ms_rn_shifted = try g.binary(.shl, ms_addr_reg, c5_ms);
+            const ms_enc1 = try g.binary(.bit_or, ms_base, ms_rn_shifted);
+            const ms_enc2 = try g.binary(.bit_or, ms_enc1, ms_val_reg);
+            const ms_bytes3 = try g.callDirect(f_append_inst, &.{ ms_bytes2, ms_enc2 });
+            try g.ret(try g.record(&.{ .{ .name = "bytes", .value = ms_bytes3 }, .{ .name = "ctx", .value = ctx } }));
+        }
+
+        // IrMemLoad8: LDRB dst, [addr] — __mem_load8(addr)
+        g.beginReservedBlock(blk_not_ms8);
+        const is_ml8 = try g.tagTest(inst, "IrMemLoad8");
+        const blk_ml8 = g.reserveBlock();
+        const blk_not_ml8 = g.reserveBlock();
+        try g.branch(is_ml8, blk_ml8, blk_not_ml8);
+
+        g.beginReservedBlock(blk_ml8);
+        {
+            const ml_payload = try g.tagPayload(inst, "IrMemLoad8");
+            const ml_dst = try g.recordField(ml_payload, "dst");
+            const ml_args = try g.recordField(ml_payload, "args");
+            const ml_addr_id = try g.listNth(ml_args, try g.constInt(0));
+            const ml_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, ml_dst });
+            const ml_dst_reg = try g.recordField(ml_alloc, "reg");
+            const ml_ctx = try g.recordField(ml_alloc, "ctx");
+            const ml_addr_raw = try g.callDirect(f_get_reg, &.{ ml_ctx, ml_addr_id });
+            const c16_ml = try g.constInt(16);
+            const ml_load = try g.callDirect(f_load_spill, &.{ bytes, ml_addr_raw, c16_ml });
+            const ml_bytes1 = try g.recordField(ml_load, "bytes");
+            const ml_addr_reg = try g.recordField(ml_load, "reg");
+            // LDRB Wt, [Xn] = 0x39400000 | (Rn << 5) | Rt
+            const ml_base = try g.constInt(0x39400000);
+            const c5_ml = try g.constInt(5);
+            const ml_rn_shifted = try g.binary(.shl, ml_addr_reg, c5_ml);
+            const ml_enc1 = try g.binary(.bit_or, ml_base, ml_rn_shifted);
+            const ml_enc2 = try g.binary(.bit_or, ml_enc1, ml_dst_reg);
+            const ml_bytes2 = try g.callDirect(f_append_inst, &.{ ml_bytes1, ml_enc2 });
+            const ml_bytes3 = try g.callDirect(f_store_spill, &.{ ml_bytes2, ml_dst_reg, ml_dst_reg });
+            try g.ret(try g.record(&.{ .{ .name = "bytes", .value = ml_bytes3 }, .{ .name = "ctx", .value = ml_ctx } }));
+        }
+
+        // IrMemStore64: STR value, [addr] — __mem_store64(addr, val)
+        g.beginReservedBlock(blk_not_ml8);
+        const is_ms64 = try g.tagTest(inst, "IrMemStore64");
+        const blk_ms64 = g.reserveBlock();
+        const blk_not_ms64 = g.reserveBlock();
+        try g.branch(is_ms64, blk_ms64, blk_not_ms64);
+
+        g.beginReservedBlock(blk_ms64);
+        {
+            const ms64_payload = try g.tagPayload(inst, "IrMemStore64");
+            const ms64_args = try g.recordField(ms64_payload, "args");
+            const ms64_addr_id = try g.listNth(ms64_args, try g.constInt(0));
+            const ms64_val_id = try g.listNth(ms64_args, try g.constInt(1));
+            const ms64_addr_raw = try g.callDirect(f_get_reg, &.{ ctx, ms64_addr_id });
+            const ms64_val_raw = try g.callDirect(f_get_reg, &.{ ctx, ms64_val_id });
+            const c16_ms64 = try g.constInt(16);
+            const c17_ms64 = try g.constInt(17);
+            const ms64_al = try g.callDirect(f_load_spill, &.{ bytes, ms64_addr_raw, c16_ms64 });
+            const ms64_b1 = try g.recordField(ms64_al, "bytes");
+            const ms64_ar = try g.recordField(ms64_al, "reg");
+            const ms64_vl = try g.callDirect(f_load_spill, &.{ ms64_b1, ms64_val_raw, c17_ms64 });
+            const ms64_b2 = try g.recordField(ms64_vl, "bytes");
+            const ms64_vr = try g.recordField(ms64_vl, "reg");
+            // STR Xt, [Xn] = already have f_encode_str
+            const c0_ms64 = try g.constInt(0);
+            const ms64_enc = try g.callDirect(f_encode_str, &.{ ms64_vr, ms64_ar, c0_ms64 });
+            const ms64_b3 = try g.callDirect(f_append_inst, &.{ ms64_b2, ms64_enc });
+            try g.ret(try g.record(&.{ .{ .name = "bytes", .value = ms64_b3 }, .{ .name = "ctx", .value = ctx } }));
+        }
+
+        // IrMemLoad64: LDR dst, [addr] — __mem_load64(addr)
+        g.beginReservedBlock(blk_not_ms64);
+        const is_ml64 = try g.tagTest(inst, "IrMemLoad64");
+        const blk_ml64 = g.reserveBlock();
+        const blk_not_ml64 = g.reserveBlock();
+        try g.branch(is_ml64, blk_ml64, blk_not_ml64);
+
+        g.beginReservedBlock(blk_ml64);
+        {
+            const ml64_payload = try g.tagPayload(inst, "IrMemLoad64");
+            const ml64_dst = try g.recordField(ml64_payload, "dst");
+            const ml64_args = try g.recordField(ml64_payload, "args");
+            const ml64_addr_id = try g.listNth(ml64_args, try g.constInt(0));
+            const ml64_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, ml64_dst });
+            const ml64_dst_reg = try g.recordField(ml64_alloc, "reg");
+            const ml64_ctx = try g.recordField(ml64_alloc, "ctx");
+            const ml64_addr_raw = try g.callDirect(f_get_reg, &.{ ml64_ctx, ml64_addr_id });
+            const c16_ml64 = try g.constInt(16);
+            const ml64_load = try g.callDirect(f_load_spill, &.{ bytes, ml64_addr_raw, c16_ml64 });
+            const ml64_b1 = try g.recordField(ml64_load, "bytes");
+            const ml64_ar = try g.recordField(ml64_load, "reg");
+            const c0_ml64 = try g.constInt(0);
+            const ml64_enc = try g.callDirect(f_encode_ldr, &.{ ml64_dst_reg, ml64_ar, c0_ml64 });
+            const ml64_b2 = try g.callDirect(f_append_inst, &.{ ml64_b1, ml64_enc });
+            const ml64_b3 = try g.callDirect(f_store_spill, &.{ ml64_b2, ml64_dst_reg, ml64_dst_reg });
+            try g.ret(try g.record(&.{ .{ .name = "bytes", .value = ml64_b3 }, .{ .name = "ctx", .value = ml64_ctx } }));
+        }
+
+        // IrBumpAlloc: MOV dst, x28; ADD x28, x28, size — __bump_alloc(size)
+        g.beginReservedBlock(blk_not_ml64);
+        const is_ba = try g.tagTest(inst, "IrBumpAlloc");
+        const blk_ba = g.reserveBlock();
+        const blk_not_ba = g.reserveBlock();
+        try g.branch(is_ba, blk_ba, blk_not_ba);
+
+        g.beginReservedBlock(blk_ba);
+        {
+            const ba_payload = try g.tagPayload(inst, "IrBumpAlloc");
+            const ba_dst = try g.recordField(ba_payload, "dst");
+            const ba_args = try g.recordField(ba_payload, "args");
+            const ba_size_id = try g.listNth(ba_args, try g.constInt(0));
+            const ba_alloc = try g.callDirect(f_alloc_reg, &.{ ctx, ba_dst });
+            const ba_dst_reg = try g.recordField(ba_alloc, "reg");
+            const ba_ctx = try g.recordField(ba_alloc, "ctx");
+            const ba_size_raw = try g.callDirect(f_get_reg, &.{ ba_ctx, ba_size_id });
+            const c16_ba = try g.constInt(16);
+            const ba_load = try g.callDirect(f_load_spill, &.{ bytes, ba_size_raw, c16_ba });
+            const ba_b1 = try g.recordField(ba_load, "bytes");
+            const ba_size_reg = try g.recordField(ba_load, "reg");
+            // MOV dst, x28 → ADD dst, x28, #0
+            const c28_ba = try g.constInt(28);
+            const c0_ba = try g.constInt(0);
+            const ba_mov = try g.callDirect(f_encode_add_imm, &.{ ba_dst_reg, c28_ba, c0_ba });
+            const ba_b2 = try g.callDirect(f_append_inst, &.{ ba_b1, ba_mov });
+            // ADD x28, x28, size_reg
+            const ba_add = try g.callDirect(f_encode_add_reg, &.{ c28_ba, c28_ba, ba_size_reg });
+            const ba_b3 = try g.callDirect(f_append_inst, &.{ ba_b2, ba_add });
+            const ba_b4 = try g.callDirect(f_store_spill, &.{ ba_b3, ba_dst_reg, ba_dst_reg });
+            try g.ret(try g.record(&.{ .{ .name = "bytes", .value = ba_b4 }, .{ .name = "ctx", .value = ba_ctx } }));
+        }
+
+        // IrStrLen: load string length from descriptor[8]
+        g.beginReservedBlock(blk_not_ba);
         const is_str_len = try g.tagTest(inst, "IrStrLen");
         const blk_str_len = g.reserveBlock();
         const blk_real_default = g.reserveBlock();
