@@ -5100,9 +5100,13 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         // but pass 2 appends to macho_header, so we need to add header_size.
         // ec_emit_func will overwrite entries with pass 2 offsets anyway,
         // but for forward references we need pass 1's map + header offset.
-        const pass1_func_map = try g.recordField(cur_ctx, "func_map");
-        // Note: pass 1 offsets are code-relative. For forward references,
-        // callee functions must be defined BEFORE callers in the source.
+        // Start pass 2 with EMPTY func_map.
+        // As each function is emitted, its offset is recorded.
+        // Forward references (mutual recursion) won't find targets —
+        // they'll go to "indirect call" which falls through gracefully.
+        // This means mutual recursion in compiled programs WON'T WORK YET.
+        // But non-recursive programs and programs with callees-before-callers work.
+        const pass1_func_map = try g.mapNew();
         const reg_map2 = try g.mapNew();
         const block_offsets2 = try g.mapNew();
         const data2 = try g.callBuiltin("bytes_new", &.{});
