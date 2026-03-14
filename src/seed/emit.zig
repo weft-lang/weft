@@ -889,8 +889,8 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const mov_fp = try g.callDirect(f_encode_add_imm, &.{ c29, c31, c0 });
         b = try g.callDirect(f_append_inst, &.{ b, mov_fp });
 
-        // SUB sp, sp, #256  (32 spill slots × 8 bytes, 16-byte aligned)
-        const spill_size = try g.constInt(256);
+        // SUB sp, sp, #2048  (256 spill slots × 8 bytes, 16-byte aligned)
+        const spill_size = try g.constInt(1024);
         const sub_sp = try g.callDirect(f_encode_sub_imm, &.{ c31, c31, spill_size });
         b = try g.callDirect(f_append_inst, &.{ b, sub_sp });
         try g.ret(b);
@@ -908,10 +908,10 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         const c31 = try g.constInt(31); // sp
         const c16 = try g.constInt(16);
 
-        // ADD sp, sp, #256  (undo spill area)
+        // ADD sp, sp, #2048  (undo spill area)
         const c0 = try g.constInt(0);
         _ = c0;
-        const spill_size = try g.constInt(256);
+        const spill_size = try g.constInt(1024);
         const add_sp = try g.callDirect(f_encode_add_imm, &.{ c31, c31, spill_size });
         var b = try g.callDirect(f_append_inst, &.{ bytes, add_sp });
 
@@ -1007,8 +1007,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         // New allocation
         g.beginReservedBlock(blk_new);
         // Map next_reg counter to actual register number
-        // Prefer callee-saved first so values survive across calls:
-        // 0-7 -> x19-x26 (callee-saved), 8-15 -> x8-x15 (temps)
+        // 0-7 -> x19-x26 (callee-saved), 8-15 -> x8-x15 (temps), 16+ -> spill
         const c8_val = try g.constInt(8);
         const is_temp = try g.ge(next_reg, c8_val);
         const blk_temp = g.reserveBlock();
@@ -1031,16 +1030,14 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         try g.branch(is_spill, blk_spill, blk_phys_temp);
 
         g.beginReservedBlock(blk_phys_temp);
-        // reg = next_reg - 8 + 8 = next_reg
         // counter 8 -> x8, 9 -> x9, etc.
         const reg_temp = try g.add(next_reg, try g.constInt(0));
         try g.jump(blk_assign, &.{reg_temp});
 
-        // Spill to stack: use x9 as temp, actual "register" stored as 100+slot_index
-        // We'll STR/LDR with [sp, #(slot_index * 8)] in the spill area
+        // Spill to stack
         g.beginReservedBlock(blk_spill);
         const c100 = try g.constInt(100);
-        const spill_slot = try g.add(c100, next_reg); // 100+16=116, 100+17=117, etc.
+        const spill_slot = try g.add(c100, next_reg); // 100+16=116, etc.
         try g.jump(blk_assign, &.{spill_slot});
 
         g.beginReservedBlock(blk_assign);
