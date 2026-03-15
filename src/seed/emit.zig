@@ -5186,8 +5186,8 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
         // but pass 2 appends to macho_header, so we need to add header_size.
         // ec_emit_func will overwrite entries with pass 2 offsets anyway,
         // but for forward references we need pass 1's map + header offset.
-        // Pass 1 func_map for has_callee (identify function names).
-        // p2_func_map for BL offset computation (starts empty, filled in pass 2).
+        // Use pass 1 func_map for has_callee checks.
+        // p2_func_map (starts empty) for BL offset computation.
         const pass1_func_map = try g.recordField(cur_ctx, "func_map");
         const reg_map2 = try g.mapNew();
         const block_offsets2 = try g.mapNew();
