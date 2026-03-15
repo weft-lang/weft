@@ -856,8 +856,52 @@ fn emit_epilogue3(code: i64) -> i64 {
   bu32(code, encode_ret())
 }
 
--- Map register counter to physical register (callee-saved only)
-fn reg_phys(counter: i64) -> i64 { counter + 19 }
+-- Map register counter to register identifier
+-- 0-7 → x19-x26 (physical, returned as 19-26)
+-- 8+ → spill slot (returned as negative: -(slot+1))
+fn reg_id(counter: i64) -> i64 {
+  if counter < 8 { counter + 19 }
+  else { 0 - (counter - 7) }
+}
+
+-- For backward compatibility
+fn reg_phys(counter: i64) -> i64 {
+  if counter < 8 { counter + 19 } else { 17 }
+}
+
+-- Emit: move value from reg_phys(counter) to a usable register
+-- If counter < 8, the value is already in a physical register.
+-- If counter >= 8, emit LDR from spill slot into x16 (temp).
+fn emit_load_reg(code: i64, counter: i64) -> i64 {
+  -- Returns the physical register containing the value
+  if counter < 8 { counter + 19 }
+  else {
+    -- LDR x16, [sp, #((counter-8)*8)]
+    -- 0xF9400000 = 4181721088
+    let slot = (counter - 8) * 8
+    bu32(code, 4181721088 + slot / 8 * 1024 + 31 * 32 + 16)
+    16
+  }
+}
+
+fn emit_load_rhs(code: i64, counter: i64) -> i64 {
+  -- Same as emit_load_reg but uses x17 instead of x16
+  if counter < 8 { counter + 19 }
+  else {
+    let slot = (counter - 8) * 8
+    bu32(code, 4181721088 + slot / 8 * 1024 + 31 * 32 + 17)
+    17
+  }
+}
+
+fn emit_store_reg(code: i64, counter: i64, phys_reg: i64) -> i64 {
+  if counter >= 8 {
+    -- STR phys_reg, [sp, #((counter-8)*8)]
+    -- 0xF9000000 = 4177526784
+    let slot = (counter - 8) * 8
+    bu32(code, 4177526784 + slot / 8 * 1024 + 31 * 32 + phys_reg)
+  } else { 0 }
+}
 
 -- Load 64-bit immediate into register
 fn emit_mov_imm(code: i64, rd: i64, val: i64) -> i64 {
@@ -882,8 +926,13 @@ fn cg_expr(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64
 
 fn cg_int(node: i64, code: i64, ctr: i64) -> i64 {
   let val = node_f1(node)
-  let rd = reg_phys(ctr)
-  emit_mov_imm(code, rd, val)
+  if ctr < 8 {
+    emit_mov_imm(code, ctr + 19, val)
+  } else {
+    -- Spill: MOV x17, val then STR to stack
+    emit_mov_imm(code, 17, val)
+    emit_store_reg(code, ctr, 17)
+  }
   ctr + 1
 }
 
@@ -891,9 +940,20 @@ fn cg_ident(node: i64, code: i64, scope: i64, src: i64, ctr: i64) -> i64 {
   let ns = node_f1(node)
   let nl = node_f2(node)
   let reg = scope_lookup(scope, src, ns, nl)
-  -- MOV new_reg, found_reg
-  let rd = reg_phys(ctr)
-  bu32(code, encode_add_imm(rd, reg, 0))
+  -- Load source value into a physical register
+  let src_phys = if reg < 0 {
+    -- Spill slot: LDR x16, [sp, #(slot*8)]
+    let slot = 0 - reg - 1
+    bu32(code, 4181721088 + slot * 1024 + 31 * 32 + 16)
+    16
+  } else { reg }
+  -- Store to destination
+  if ctr < 8 {
+    bu32(code, encode_add_imm(ctr + 19, src_phys, 0))
+  } else {
+    bu32(code, encode_add_imm(17, src_phys, 0))
+    emit_store_reg(code, ctr, 17)
+  }
   ctr + 1
 }
 
@@ -902,11 +962,18 @@ fn cg_binop(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i6
   let lhs = node_f2(node)
   let rhs = node_f3(node)
   let c1 = cg_expr(lhs, code, scope, src, ctr, fm)
-  let lhs_reg = reg_phys(c1 - 1)
   let c2 = cg_expr(rhs, code, scope, src, c1, fm)
-  let rhs_reg = reg_phys(c2 - 1)
-  let rd = reg_phys(c2)
-  cg_binop_emit(code, op, rd, lhs_reg, rhs_reg)
+  -- Load LHS into x16, RHS into x17 (use different temps for spilled values)
+  let lhs_phys = emit_load_reg(code, c1 - 1)
+  let rhs_phys = emit_load_rhs(code, c2 - 1)
+  -- Compute into x17
+  cg_binop_emit(code, op, 17, lhs_phys, rhs_phys)
+  -- Store result
+  if c2 < 8 {
+    bu32(code, encode_add_imm(c2 + 19, 17, 0))
+  } else {
+    emit_store_reg(code, c2, 17)
+  }
   c2 + 1
 }
 
@@ -945,9 +1012,10 @@ fn cg_call_args(args: i64, nargs: i64, code: i64, scope: i64, src: i64, ctr: i64
   else {
     let arg = nlist_get(args, i)
     let c = cg_expr(arg, code, scope, src, ctr, fm)
-    let arg_reg = reg_phys(c - 1)
-    -- MOV xi, arg_reg
-    bu32(code, encode_add_imm(i, arg_reg, 0))
+    -- Load arg into physical register (may need spill load)
+    let arg_phys = emit_load_reg(code, c - 1)
+    -- MOV xi, arg_phys
+    bu32(code, encode_add_imm(i, arg_phys, 0))
     cg_call_args(args, nargs, code, scope, src, c, fm, i + 1)
   }
 }
@@ -958,9 +1026,12 @@ fn cg_call_emit(code: i64, src: i64, ns: i64, nl: i64, fm: i64, ctr: i64) -> i64
   let cur = buf_len(code)
   let rel = target - cur
   bu32(code, encode_bl(rel))
-  -- Move result from x0 to callee-saved register
-  let rd = reg_phys(ctr)
-  bu32(code, encode_add_imm(rd, 0, 0))
+  -- Move result from x0 to register or spill
+  if ctr < 8 {
+    bu32(code, encode_add_imm(ctr + 19, 0, 0))
+  } else {
+    emit_store_reg(code, ctr, 0)
+  }
   ctr + 1
 }
 
@@ -970,29 +1041,39 @@ fn cg_if(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
   let else_n = node_f3(node)
   -- Emit condition
   let c1 = cg_expr(cond, code, scope, src, ctr, fm)
-  let cond_reg = reg_phys(c1 - 1)
+  let cond_phys = emit_load_reg(code, c1 - 1)
   -- CBZ cond_reg, else_branch (patch later)
   let cbz_pos = buf_len(code)
   bu32(code, 0)
   -- Emit then branch
   let c2 = cg_expr(then_n, code, scope, src, c1, fm)
-  let then_reg = reg_phys(c2 - 1)
-  let rd = reg_phys(c2)
-  bu32(code, encode_add_imm(rd, then_reg, 0))
+  -- Move then result to rd (c2 slot)
+  let then_phys = emit_load_reg(code, c2 - 1)
+  if c2 < 8 {
+    bu32(code, encode_add_imm(c2 + 19, then_phys, 0))
+  } else {
+    bu32(code, encode_add_imm(17, then_phys, 0))
+    emit_store_reg(code, c2, 17)
+  }
   -- B over else (patch later)
   let b_pos = buf_len(code)
   bu32(code, 0)
   -- Else branch
   let else_start = buf_len(code)
   let c3 = cg_expr(else_n, code, scope, src, c2 + 1, fm)
-  let else_reg = reg_phys(c3 - 1)
-  bu32(code, encode_add_imm(rd, else_reg, 0))
+  let else_phys = emit_load_reg(code, c3 - 1)
+  if c2 < 8 {
+    bu32(code, encode_add_imm(c2 + 19, else_phys, 0))
+  } else {
+    bu32(code, encode_add_imm(17, else_phys, 0))
+    emit_store_reg(code, c2, 17)
+  }
   let after_else = buf_len(code)
   -- Patch CBZ: jump to else_start
-  cg_patch_cbz(code, cbz_pos, cond_reg, else_start)
+  cg_patch_cbz(code, cbz_pos, cond_phys, else_start)
   -- Patch B: jump to after_else
   cg_patch_b(code, b_pos, after_else)
-  c3 + 1
+  c2 + 1
 }
 
 fn cg_patch_cbz(code: i64, pos: i64, reg: i64, target: i64) -> i64 {
@@ -1027,9 +1108,9 @@ fn cg_let(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 
   let body = node_f4(node)
   -- Emit value
   let c1 = cg_expr(val, code, scope, src, ctr, fm)
-  let val_reg = reg_phys(c1 - 1)
-  -- Add to scope and compile body
-  let new_scope = scope_push(scope, ns, nl, val_reg)
+  -- Store register ID for scope (physical reg or negative spill indicator)
+  let val_rid = reg_id(c1 - 1)
+  let new_scope = scope_push(scope, ns, nl, val_rid)
   cg_expr(body, code, new_scope, src, c1, fm)
 }
 
@@ -1048,9 +1129,9 @@ fn cg_fn(fn_node: i64, code: i64, fm: i64, src: i64) -> i64 {
   let scope = cg_fn_params(params, nparams, src, scope_new(), 0, code)
   -- Emit body
   let ctr = cg_expr(body, code, scope, src, nparams, fm)
-  let result_reg = reg_phys(ctr - 1)
-  -- MOV x0, result
-  bu32(code, encode_add_imm(0, result_reg, 0))
+  -- Move result to x0
+  let result_phys = emit_load_reg(code, ctr - 1)
+  bu32(code, encode_add_imm(0, result_phys, 0))
   -- Emit epilogue
   emit_epilogue(code)
   0
