@@ -310,7 +310,6 @@ fn map_get(args: []const Value, _: *anyopaque) InterpreterError!Value {
     const m = try expectMap(args[0]);
     const key = try expectString(args[1]);
     if (m.entries.get(key)) |v| return v;
-    // Debug: this should not happen if mapHas was checked first
     return .nil;
 }
 

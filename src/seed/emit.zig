@@ -1873,14 +1873,18 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                 {
                     const blk_bl_known = g.reserveBlock();
                     const blk_bl_fwd = g.reserveBlock();
-                    // Check if function has been emitted in pass 2
+                    // Re-extract callee name fresh (workaround for value corruption)
+                    const call_callee2 = try g.recordField(
+                        try g.tagPayload(inst, ir_call),
+                        "callee",
+                    );
                     const p2_fm = try g.recordField(ac, "p2_func_map");
-                    const in_p2 = try g.mapHas(p2_fm, call_callee);
+                    const in_p2 = try g.mapHas(p2_fm, call_callee2);
                     try g.branch(in_p2, blk_bl_known, blk_bl_fwd);
 
                     // Known target: emit BL with correct offset
                     g.beginReservedBlock(blk_bl_known);
-                    const target_off = try g.mapGet(p2_fm, call_callee);
+                    const target_off = try g.mapGet(p2_fm, call_callee2);
                     const cur_off_k = try g.callBuiltin("bytes_length", &.{ab});
                     const rel_off = try g.sub(target_off, cur_off_k);
                     const bl_enc = try g.callDirect(f_encode_bl, &.{rel_off});
@@ -1892,10 +1896,14 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                     const cur_off_f = try g.callBuiltin("bytes_length", &.{ab});
                     const bl_placeholder_fwd = try g.constInt(0x94000000); // BL +0
                     const bl_bytes_f = try g.callDirect(f_append_inst, &.{ ab, bl_placeholder_fwd });
-                    // Record patch in bl_patches
+                    // Record patch in bl_patches (re-extract callee name fresh)
+                    const call_callee3 = try g.recordField(
+                        try g.tagPayload(inst, ir_call),
+                        "callee",
+                    );
                     const pr = try g.record(&.{
                         .{ .name = "pos", .value = cur_off_f },
-                        .{ .name = "name", .value = call_callee },
+                        .{ .name = "name", .value = call_callee3 },
                     });
                     const old_p = try g.recordField(ac, "bl_patches");
                     const new_p = try g.listAppend(old_p, pr);
@@ -1909,7 +1917,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                         .{ .name = "blocks_start", .value = try g.recordField(ac, "blocks_start") },
                         .{ .name = "fields_map", .value = try g.recordField(ac, "fields_map") },
                         .{ .name = "bl_patches", .value = new_p },
-                        .{ .name = "p2_func_map", .value = try g.mapNew() },
+                        .{ .name = "p2_func_map", .value = try g.recordField(ac, "p2_func_map") },
                     });
                     try g.jump(blk_call_merge, &.{ bl_bytes_f, ac2 });
                 }
@@ -1947,7 +1955,7 @@ pub fn generate(alloc: Allocator, builder: *ir.Builder, pool: *InternPool) !Func
                         .{ .name = "blocks_start", .value = try g.recordField(ac, "blocks_start") },
                         .{ .name = "fields_map", .value = try g.recordField(ac, "fields_map") },
                         .{ .name = "bl_patches", .value = fwd_new_p },
-                        .{ .name = "p2_func_map", .value = try g.mapNew() },
+                        .{ .name = "p2_func_map", .value = try g.recordField(ac, "p2_func_map") },
                     });
                     try g.jump(blk_call_merge, &.{ fwd_bytes, fwd_ac });
 

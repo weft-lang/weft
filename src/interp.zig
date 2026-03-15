@@ -423,7 +423,8 @@ pub const Interpreter = struct {
         return .{ .record = rec };
     }
 
-    fn execRecordField(_: *const Interpreter, record_val: Value, field: InternedString) InterpreterError!Value {
+    fn execRecordField(self: *const Interpreter, record_val: Value, field: InternedString) InterpreterError!Value {
+        _ = self;
         const rec = switch (record_val) {
             .record => |r| r,
             else => return error.TypeError,
