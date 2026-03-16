@@ -1,4 +1,4 @@
-# Weft
+# -[weft]>
 
 A compiled systems language with set-theoretic types, algebraic effects, and explicit memory management.
 
@@ -35,24 +35,25 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 ## Status
 
-Weft is in bootstrap. The Zig kernel (Layer 0) interprets a seed compiler that emits native aarch64 Mach-O binaries. The goal is self-hosting: a Weft compiler written in Weft, compiled by the seed, that then compiles itself.
+Weft has achieved self-hosting. The compiler, written in Weft, compiles itself to native aarch64 Mach-O binaries.
 
 ```
-Layer 0: Zig IR kernel          -- done
-Seed grammar: parser as IR      -- done
-Seed compiler: typeck + codegen -- in progress
-Layer 1: Weft-in-Weft           -- next
-Layer 2: self-hosted, Zig shed  -- the finish line
+Layer 0: Zig IR kernel             -- done
+Seed:    parser + compiler as IR   -- done
+Layer 1: Weft-in-Weft              -- done (self-hosting achieved)
+Layer 2: self-hosted, Zig shed     -- next
 ```
+
+The bootstrap path: a Zig IR interpreter runs a seed compiler (the Weft grammar and codegen expressed as IR). The seed compiles `compiler/main.weft` -- a Weft compiler written in Weft -- which then compiles itself. The output is a native aarch64 Mach-O binary with no runtime dependencies beyond OS syscalls.
 
 ## Quick Start
 
 **Prerequisites:** Zig 0.15.2, just
 
 ```bash
-just build              # build the weft binary
-just test               # run all tests
-just run FILE=test/hello.weft   # interpret a .weft file
+just build                          # build the weft binary
+just test                           # run all tests
+just run FILE=test/hello.weft       # interpret a .weft file
 weft compile test/exit42.weft -o /tmp/exit42 && /tmp/exit42  # compile to native
 ```
 
@@ -141,4 +142,6 @@ The compiler is a Weft program. IR is a Weft type. Passes are effect-annotated f
 
 ## License
 
-TBD
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.
+
+Copyright 2026 Amplified AI, Inc.
