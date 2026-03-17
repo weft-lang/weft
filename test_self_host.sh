@@ -372,6 +372,80 @@ run_test2 "bshr_zero" "42" 'fn main() -> i64 { 42 bshr 0 }'
 run_test2 "bshr_div2" "21" 'fn main() -> i64 { 42 bshr 1 }'
 run_test2 "bit_prec" "42" 'fn main() -> i64 { 40 bor 2 band 255 }'
 run_test2 "bit_shift_add" "64" 'fn main() -> i64 { 1 bshl 5 + 1 }'
+# ═══════════════════════════════════════════════════════════════
+# 21. FUNCTION HOISTING — definition order doesn't matter
+# ═══════════════════════════════════════════════════════════════
+# Forward reference: main before helper
+run_test2 "hoist_forward" "42" 'fn main() -> i64 { helper() } fn helper() -> i64 { 42 }'
+# Any definition order
+run_test2 "hoist_any_order" "42" 'fn main() -> i64 { a() + b() + c() } fn c() -> i64 { 10 } fn a() -> i64 { 20 } fn b() -> i64 { 12 }'
+# Mutual recursion (even/odd)
+run_test2 "hoist_mutual_t" "1" 'fn is_even(n: i64) -> i64 { if n == 0 { 1 } else { is_odd(n - 1) } } fn is_odd(n: i64) -> i64 { if n == 0 { 0 } else { is_even(n - 1) } } fn main() -> i64 { is_even(10) }'
+run_test2 "hoist_mutual_f" "0" 'fn is_even(n: i64) -> i64 { if n == 0 { 1 } else { is_odd(n - 1) } } fn is_odd(n: i64) -> i64 { if n == 0 { 0 } else { is_even(n - 1) } } fn main() -> i64 { is_even(7) }'
+# Forward chain: main→a→b→c, all forward
+run_test2 "hoist_chain" "42" 'fn main() -> i64 { a(20) } fn a(x: i64) -> i64 { b(x + 1) } fn b(x: i64) -> i64 { c(x * 2) } fn c(x: i64) -> i64 { x }'
+# Main first/last (both should work)
+run_test2 "hoist_main_first" "42" 'fn main() -> i64 { 42 }'
+run_test2 "hoist_main_last" "42" 'fn a() -> i64 { 1 } fn b() -> i64 { 2 } fn c() -> i64 { 3 } fn main() -> i64 { 42 }'
+# Forward recursive call (main calls fib, fib defined after)
+run_test2 "hoist_recursive" "55" 'fn main() -> i64 { fib(10) } fn fib(n: i64) -> i64 { if n <= 1 { n } else { fib(n - 1) + fib(n - 2) } }'
+# Forward ref with multi-arg function
+run_test2 "hoist_multi_arg" "42" 'fn main() -> i64 { compute(10, 20, 12) } fn compute(a: i64, b: i64, c: i64) -> i64 { a + b + c }'
+# Forward ref where callee uses records
+run_test2 "hoist_record" "42" 'fn main() -> i64 { get_sum() } type P { x: i64, y: i64 } fn get_sum() -> i64 { let p = P { x: 30, y: 12 } p.x + p.y }'
+# Forward ref where callee uses match
+run_test2 "hoist_match" "42" 'fn main() -> i64 { classify(5) } fn classify(n: i64) -> i64 { match n { 5 -> 42 _ -> 0 } }'
+# Forward ref where callee uses match guard
+run_test2 "hoist_guard" "42" 'fn main() -> i64 { check(5) } fn check(n: i64) -> i64 { match n { x if x > 3 -> 42 _ -> 0 } }'
+# Forward ref where callee uses while
+run_test2 "hoist_while" "42" 'fn main() -> i64 { count_to(42) } fn count_to(n: i64) -> i64 { let mut i = 0 while i < n { i = i + 1 } i }'
+# Forward ref where callee uses variants
+run_test2 "hoist_variant" "42" 'fn main() -> i64 { extract(make()) } type T { V(i64) } fn make() -> i64 { V(42) } fn extract(x: i64) -> i64 { match x { V(n) -> n } }'
+# Many functions, random order, all calling each other
+run_test2 "hoist_many" "42" 'fn main() -> i64 { f1() + f2() + f3() + f4() + f5() + f6() } fn f6() -> i64 { 7 } fn f4() -> i64 { 5 } fn f2() -> i64 { 3 } fn f5() -> i64 { 6 } fn f1() -> i64 { 2 } fn f3() -> i64 { 19 }'
+# ═══════════════════════════════════════════════════════════════
+# 22. FILE IMPORTS — use "path.weft"
+# ═══════════════════════════════════════════════════════════════
+pushd tests > /dev/null
+run_use() {
+  local name="$1" expected="$2" input="$3"
+  echo "$input" | /tmp/weft2 > /tmp/t2 && codesign -s - /tmp/t2 2>/dev/null && chmod +x /tmp/t2
+  local got=$(/tmp/t2 2>/dev/null; echo $?)
+  if [ "$got" = "$expected" ]; then
+    PASS2=$((PASS2+1))
+  else
+    echo "  ✗ $name = $got (expected $expected)"
+    FAIL2=$((FAIL2+1))
+  fi
+}
+# Basic import: single function
+run_use "use_basic" "42" 'use "use_lib.weft" fn main() -> i64 { add(20, 22) }'
+# Import with multiple functions used
+run_use "use_multi_fn" "42" 'use "use_lib.weft" fn main() -> i64 { add(20, mul(2, 11)) }'
+# Nested imports (mid imports base)
+run_use "use_nested" "42" 'use "use_mid.weft" fn main() -> i64 { double_base() }'
+# Import with type declarations (records)
+run_use "use_types" "42" 'use "use_types.weft" fn main() -> i64 { let p = make_point(30, 12) point_sum(p) }'
+# Imported fn + local fn with hoisting
+run_use "use_hoist" "42" 'use "use_lib.weft" fn main() -> i64 { add(20, local_val()) } fn local_val() -> i64 { 22 }'
+# Import with variants and match
+run_use "use_variants" "42" 'use "use_variants.weft" fn main() -> i64 { unwrap_or(make_some(42), 0) }'
+# Note: can't pass 0 as a variant — no null-safe tag check yet
+# run_use "use_variant_default" "99" 'use "use_variants.weft" fn main() -> i64 { unwrap_or(0, 99) }'
+# Import with intrinsics (__bump_alloc, __mem_store64, etc.)
+run_use "use_intrinsics" "42" 'use "use_intrinsics.weft" fn main() -> i64 { let p = alloc_pair(30, 12) pair_first(p) + pair_second(p) }'
+# Import with while loops
+run_use "use_while" "55" 'use "use_while.weft" fn main() -> i64 { sum_to(10) }'
+run_use "use_while_mod" "4" 'use "use_while.weft" fn main() -> i64 { count_matches(12, 3) }'
+# Import with match guards
+run_use "use_guards" "14" 'use "use_guards.weft" fn main() -> i64 { classify(0) + classify(5) + classify(50) + classify(200) + abs(-5) + abs(3) }'
+# Multiple use statements in one file
+run_use "use_multi_files" "42" 'use "use_multi_a.weft" use "use_multi_b.weft" fn main() -> i64 { val_a() + val_b() + 12 }'
+# Local fn calling imported fn
+run_use "use_local_calls_import" "42" 'use "use_lib.weft" fn double_add(a: i64, b: i64) -> i64 { mul(add(a, b), 2) } fn main() -> i64 { double_add(10, 11) }'
+# Imported fn expression as argument
+run_use "use_expr_arg" "42" 'use "use_lib.weft" fn main() -> i64 { add(mul(3, 7), mul(3, 7)) }'
+popd > /dev/null
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
