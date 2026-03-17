@@ -463,6 +463,42 @@ run_use "ty_transitivity" "0" 'use "../compiler/lib.weft" use "../compiler/types
 run_use "ty_union_commut" "0" 'use "../compiler/lib.weft" use "../compiler/types.weft" fn main() -> i64 { let ab = ty_union(ty_i64(), ty_str()) let ba = ty_union(ty_str(), ty_i64()) let mut ok = true if not is_subtype(ab, ba) { ok = false } else { ok = ok } if not is_subtype(ba, ab) { ok = false } else { ok = ok } if ok { 0 } else { 1 } }'
 run_use "ty_de_morgan" "0" 'use "../compiler/lib.weft" use "../compiler/types.weft" fn main() -> i64 { let i = ty_i64() let s = ty_str() let not_u = ty_compl(ty_union(i, s)) let inter_n = ty_inter(ty_compl(i), ty_compl(s)) let mut ok = true if not is_subtype(not_u, inter_n) { ok = false } else { ok = ok } if not is_subtype(inter_n, not_u) { ok = false } else { ok = ok } if is_subtype(i, not_u) { ok = false } else { ok = ok } if not is_subtype(ty_bool(), not_u) { ok = false } else { ok = ok } if ok { 0 } else { 1 } }'
 popd > /dev/null
+# ═══════════════════════════════════════════════════════════════
+# 24. TYPE ANNOTATION PARSING
+# ═══════════════════════════════════════════════════════════════
+# Primitive type annotations (existing syntax, now parsed)
+run_test2 "typarse_i64" "42" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { f(42) }'
+run_test2 "typarse_str" "5" 'fn f(s: str) -> i64 { __str_len(s) } fn main() -> i64 { f("hello") }'
+run_test2 "typarse_bool" "42" 'fn f(b: bool) -> i64 { if b { 42 } else { 0 } } fn main() -> i64 { f(true) }'
+run_test2 "typarse_nil" "42" 'fn f(x: nil) -> i64 { 42 } fn main() -> i64 { f(0) }'
+# Multi-param with types
+run_test2 "typarse_multi" "42" 'fn f(a: i64, b: i64, c: i64) -> i64 { a + b + c } fn main() -> i64 { f(10, 20, 12) }'
+# No type annotation (backwards compat)
+run_test2 "typarse_notype" "42" 'fn f(x) -> i64 { 42 } fn main() -> i64 { f(0) }'
+# Return type only
+run_test2 "typarse_retonly" "42" 'fn f() -> i64 { 42 } fn main() -> i64 { f() }'
+# No return type
+run_test2 "typarse_noret" "42" 'fn f(x: i64) { x } fn main() -> i64 { f(42) }'
+# Union type annotation
+run_test2 "typarse_union" "42" 'fn f(x: i64 | str) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# Nullable type annotation
+run_test2 "typarse_nullable" "42" 'fn f(x: i64?) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# Complement type annotation
+run_test2 "typarse_compl" "42" 'fn f(x: ~nil) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# Parenthesized type
+run_test2 "typarse_parens" "42" 'fn f(x: (i64)) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# Intersection type
+run_test2 "typarse_inter" "42" 'fn f(x: i64 & any) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# Nested union
+run_test2 "typarse_nested_union" "42" 'fn f(x: i64 | str | bool) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# Type annotation with function call
+run_test2 "typarse_call" "120" 'fn fact(n: i64) -> i64 { if n <= 1 { 1 } else { n * fact(n - 1) } } fn main() -> i64 { fact(5) }'
+# Multiple typed functions
+run_test2 "typarse_multi_fn" "42" 'fn add(a: i64, b: i64) -> i64 { a + b } fn mul(a: i64, b: i64) -> i64 { a * b } fn main() -> i64 { add(mul(3, 7), mul(3, 7)) }'
+# Type annotations with records
+run_test2 "typarse_record" "42" 'type P { x: i64, y: i64 } fn sum(p: i64) -> i64 { p.x + p.y } fn main() -> i64 { let p = P { x: 30, y: 12 } sum(p) }'
+# Type annotations with variants and match
+run_test2 "typarse_variant" "42" 'type T { A(i64), B(i64) } fn extract(v: i64) -> i64 { match v { A(n) -> n B(n) -> n } } fn main() -> i64 { extract(A(42)) }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
