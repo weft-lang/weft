@@ -517,10 +517,11 @@ run_test2 "esc_no_esc" "5" 'fn main() -> i64 { let s = "hello" __str_len(s) }'
 run_test2 "esc_multi" "5" 'fn main() -> i64 { let s = "a\nb\tc" __str_len(s) }'
 run_test2 "esc_null" "3" 'fn main() -> i64 { let s = "a\0b" __str_len(s) }'
 # ═══════════════════════════════════════════════════════════════
-# 26. TYPE CHECKER (standalone)
+# 26. TYPE CHECKER
 # ═══════════════════════════════════════════════════════════════
 pushd tests > /dev/null
-run_use "typeck_synth" "0" "$(cat test_typeck.weft)"
+# Full type checker test suite: literals, all binop types, tenv, ftypes, error detection, let propagation
+run_use "typeck_all" "0" "$(cat test_typeck.weft)"
 popd > /dev/null
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
