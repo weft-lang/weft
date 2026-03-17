@@ -446,6 +446,12 @@ run_use "use_local_calls_import" "42" 'use "use_lib.weft" fn double_add(a: i64, 
 # Imported fn expression as argument
 run_use "use_expr_arg" "42" 'use "use_lib.weft" fn main() -> i64 { add(mul(3, 7), mul(3, 7)) }'
 popd > /dev/null
+# ═══════════════════════════════════════════════════════════════
+# 23. SET-THEORETIC TYPE SYSTEM
+# ═══════════════════════════════════════════════════════════════
+pushd tests > /dev/null
+run_use "types" "42" "$(cat test_types.weft)"
+popd > /dev/null
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
