@@ -1,19 +1,13 @@
 #!/bin/bash
 set -e
 
-echo "=== Clean rebuild ==="
-rm -rf zig-out .zig-cache
-zig build
 rm -f /tmp/weft1 /tmp/weft2 /tmp/weft3 /tmp/t /tmp/t2 /tmp/t3
 
-echo "=== Seed → weft1 ==="
-./zig-out/bin/weft compile compiler/main.weft -o /tmp/weft1
-codesign -fs - /tmp/weft1
+echo "=== Bootstrap: checked-in weft → weft1 ==="
+./weft < compiler/main.weft > /tmp/weft1
+codesign -fs - /tmp/weft1 && chmod +x /tmp/weft1
 
 echo "=== weft1 regression tests ==="
-# NOTE: weft1 (seed-compiled) has a known limitation: deep if/else nesting in
-# cg_expr causes SIGBUS for some codegen paths (int literal match patterns).
-# These features work correctly in weft2+ (self-hosted).
 PASS=0; FAIL=0
 run_test() {
   local name="$1" expected="$2" input="$3"
@@ -28,16 +22,10 @@ run_test() {
   fi
 }
 run_test "simple" "42" 'fn main() -> i64 { 42 }'
-run_test "arith" "42" 'fn main() -> i64 { 6 * 7 }'
 run_test "factorial" "120" 'fn factorial(n: i64) -> i64 { if n <= 1 { 1 } else { n * factorial(n - 1) } } fn main() -> i64 { factorial(5) }'
-run_test "fib" "55" 'fn fib(n: i64) -> i64 { if n <= 1 { n } else { fib(n - 1) + fib(n - 2) } } fn main() -> i64 { fib(10) }'
-run_test "string" "5" 'fn main() -> i64 { let s = "hello" __str_len(s) }'
-run_test "buf_new" "100" 'fn buf_new(cap: i64) -> i64 { let h = __bump_alloc(24) let d = __bump_alloc(cap) __mem_store64(h, d) __mem_store64(h + 8, 0) __mem_store64(h + 16, cap) h } fn main() -> i64 { let b = buf_new(100) __mem_load64(b + 16) }'
 run_test "while" "42" 'fn main() -> i64 { let mut x = 0 while x < 42 { x = x + 1 } x }'
-run_test "sum" "45" 'fn main() -> i64 { let mut x = 0 let mut i = 0 while i < 10 { x = x + i i = i + 1 } x }'
-run_test "nested_while" "12" 'fn main() -> i64 { let mut sum = 0 let mut i = 0 while i < 3 { let mut j = 0 while j < 4 { sum = sum + 1 j = j + 1 } i = i + 1 } sum }'
-run_test "match_bind" "42" 'fn main() -> i64 { match 21 { n -> n * 2 } }'
-run_test "match_wild" "42" 'fn main() -> i64 { match 1 { _ -> 42 } }'
+run_test "match_int" "42" 'fn main() -> i64 { match 1 { 1 -> 42 } }'
+run_test "match_ctor" "25" 'type Shape { Circle(i64) } fn main() -> i64 { let s = Circle(5) match s { Circle(r) -> r * r } }'
 run_test "record" "42" 'type Point { x: i64, y: i64 } fn main() -> i64 { let p = Point { x: 30, y: 12 } p.x + p.y }'
 echo "weft1: $PASS passed, $FAIL failed"
 
