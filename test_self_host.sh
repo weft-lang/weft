@@ -11,6 +11,9 @@ echo "=== Seed → weft1 ==="
 codesign -fs - /tmp/weft1
 
 echo "=== weft1 regression tests ==="
+# NOTE: weft1 (seed-compiled) has a known limitation: deep if/else nesting in
+# cg_expr causes SIGBUS for some codegen paths (int literal match patterns).
+# These features work correctly in weft2+ (self-hosted).
 PASS=0; FAIL=0
 run_test() {
   local name="$1" expected="$2" input="$3"
@@ -25,6 +28,7 @@ run_test() {
   fi
 }
 run_test "simple" "42" 'fn main() -> i64 { 42 }'
+run_test "arith" "42" 'fn main() -> i64 { 6 * 7 }'
 run_test "factorial" "120" 'fn factorial(n: i64) -> i64 { if n <= 1 { 1 } else { n * factorial(n - 1) } } fn main() -> i64 { factorial(5) }'
 run_test "fib" "55" 'fn fib(n: i64) -> i64 { if n <= 1 { n } else { fib(n - 1) + fib(n - 2) } } fn main() -> i64 { fib(10) }'
 run_test "string" "5" 'fn main() -> i64 { let s = "hello" __str_len(s) }'
@@ -32,39 +36,320 @@ run_test "buf_new" "100" 'fn buf_new(cap: i64) -> i64 { let h = __bump_alloc(24)
 run_test "while" "42" 'fn main() -> i64 { let mut x = 0 while x < 42 { x = x + 1 } x }'
 run_test "sum" "45" 'fn main() -> i64 { let mut x = 0 let mut i = 0 while i < 10 { x = x + i i = i + 1 } x }'
 run_test "nested_while" "12" 'fn main() -> i64 { let mut sum = 0 let mut i = 0 while i < 3 { let mut j = 0 while j < 4 { sum = sum + 1 j = j + 1 } i = i + 1 } sum }'
+run_test "match_bind" "42" 'fn main() -> i64 { match 21 { n -> n * 2 } }'
+run_test "match_wild" "42" 'fn main() -> i64 { match 1 { _ -> 42 } }'
+run_test "record" "42" 'type Point { x: i64, y: i64 } fn main() -> i64 { let p = Point { x: 30, y: 12 } p.x + p.y }'
 echo "weft1: $PASS passed, $FAIL failed"
 
+echo ""
 echo "=== weft1 → weft2 ==="
 /tmp/weft1 < compiler/main.weft > /tmp/weft2
 codesign -fs - /tmp/weft2 && chmod +x /tmp/weft2
 
-echo "=== weft2 tests ==="
+echo "=== weft2 comprehensive tests ==="
 PASS2=0; FAIL2=0
 run_test2() {
   local name="$1" expected="$2" input="$3"
   echo "$input" | /tmp/weft2 > /tmp/t2 && codesign -s - /tmp/t2 2>/dev/null && chmod +x /tmp/t2
   local got=$(/tmp/t2 2>/dev/null; echo $?)
   if [ "$got" = "$expected" ]; then
-    echo "  ✓ $name = $got"
     PASS2=$((PASS2+1))
   else
     echo "  ✗ $name = $got (expected $expected)"
     FAIL2=$((FAIL2+1))
   fi
 }
-run_test2 "simple" "42" 'fn main() -> i64 { 42 }'
-run_test2 "factorial" "120" 'fn factorial(n: i64) -> i64 { if n <= 1 { 1 } else { n * factorial(n - 1) } } fn main() -> i64 { factorial(5) }'
+# ═══════════════════════════════════════════════════════════════
+# 1. INTEGER LITERALS
+# ═══════════════════════════════════════════════════════════════
+run_test2 "int_zero" "0" 'fn main() -> i64 { 0 }'
+run_test2 "int_one" "1" 'fn main() -> i64 { 1 }'
+run_test2 "int_42" "42" 'fn main() -> i64 { 42 }'
+run_test2 "int_255" "255" 'fn main() -> i64 { 255 }'
+run_test2 "int_256" "0" 'fn main() -> i64 { 256 }'
+run_test2 "int_257" "1" 'fn main() -> i64 { 257 }'
+run_test2 "int_65535" "255" 'fn main() -> i64 { 65535 }'
+run_test2 "int_65536" "0" 'fn main() -> i64 { 65536 }'
+run_test2 "int_128" "128" 'fn main() -> i64 { 128 }'
+run_test2 "int_200" "200" 'fn main() -> i64 { 200 }'
+# ═══════════════════════════════════════════════════════════════
+# 2. ARITHMETIC — all ops, precedence, associativity
+# ═══════════════════════════════════════════════════════════════
+run_test2 "add" "3" 'fn main() -> i64 { 1 + 2 }'
+run_test2 "add_zero" "5" 'fn main() -> i64 { 5 + 0 }'
+run_test2 "add_zero_lhs" "5" 'fn main() -> i64 { 0 + 5 }'
+run_test2 "add_chain" "10" 'fn main() -> i64 { 1 + 2 + 3 + 4 }'
+run_test2 "sub" "3" 'fn main() -> i64 { 5 - 2 }'
+run_test2 "sub_zero" "5" 'fn main() -> i64 { 5 - 0 }'
+run_test2 "sub_self" "0" 'fn main() -> i64 { 42 - 42 }'
+run_test2 "sub_negative" "252" 'fn main() -> i64 { 3 - 7 }'
+run_test2 "sub_chain" "2" 'fn main() -> i64 { 10 - 3 - 5 }'
+run_test2 "mul" "42" 'fn main() -> i64 { 6 * 7 }'
+run_test2 "mul_zero" "0" 'fn main() -> i64 { 42 * 0 }'
+run_test2 "mul_one" "42" 'fn main() -> i64 { 42 * 1 }'
+run_test2 "mul_chain" "24" 'fn main() -> i64 { 2 * 3 * 4 }'
+run_test2 "mul_large" "16" 'fn main() -> i64 { 100 * 100 }'
+run_test2 "div_trunc" "3" 'fn main() -> i64 { 7 / 2 }'
+run_test2 "div_exact" "5" 'fn main() -> i64 { 10 / 2 }'
+run_test2 "div_one" "42" 'fn main() -> i64 { 42 / 1 }'
+run_test2 "div_self" "1" 'fn main() -> i64 { 42 / 42 }'
+run_test2 "div_large" "100" 'fn main() -> i64 { 200 / 2 }'
+run_test2 "div_trunc2" "2" 'fn main() -> i64 { 11 / 4 }'
+run_test2 "prec_add_mul" "14" 'fn main() -> i64 { 2 + 3 * 4 }'
+run_test2 "prec_mul_add" "14" 'fn main() -> i64 { 3 * 4 + 2 }'
+run_test2 "prec_sub_mul" "2" 'fn main() -> i64 { 14 - 3 * 4 }'
+run_test2 "prec_div_add" "5" 'fn main() -> i64 { 6 / 2 + 2 }'
+run_test2 "prec_complex" "9" 'fn main() -> i64 { 1 + 2 * 3 + 4 / 2 }'
+run_test2 "assoc_sub" "2" 'fn main() -> i64 { 10 - 5 - 3 }'
+run_test2 "assoc_div" "5" 'fn main() -> i64 { 100 / 2 / 10 }'
+run_test2 "parens_add_mul" "20" 'fn main() -> i64 { (2 + 3) * 4 }'
+run_test2 "parens_sub_div" "2" 'fn main() -> i64 { (10 - 4) / 3 }'
+# ═══════════════════════════════════════════════════════════════
+# 3. COMPARISONS — all 6 ops, true/false, boundary
+# ═══════════════════════════════════════════════════════════════
+run_test2 "eq_true" "1" 'fn main() -> i64 { if 5 == 5 { 1 } else { 0 } }'
+run_test2 "eq_false" "0" 'fn main() -> i64 { if 5 == 6 { 1 } else { 0 } }'
+run_test2 "eq_zero" "1" 'fn main() -> i64 { if 0 == 0 { 1 } else { 0 } }'
+run_test2 "ne_true" "1" 'fn main() -> i64 { if 5 != 6 { 1 } else { 0 } }'
+run_test2 "ne_false" "0" 'fn main() -> i64 { if 5 != 5 { 1 } else { 0 } }'
+run_test2 "ne_zero" "0" 'fn main() -> i64 { if 0 != 0 { 1 } else { 0 } }'
+run_test2 "lt_true" "1" 'fn main() -> i64 { if 3 < 5 { 1 } else { 0 } }'
+run_test2 "lt_false" "0" 'fn main() -> i64 { if 5 < 3 { 1 } else { 0 } }'
+run_test2 "lt_eq" "0" 'fn main() -> i64 { if 5 < 5 { 1 } else { 0 } }'
+run_test2 "lt_01" "1" 'fn main() -> i64 { if 0 < 1 { 1 } else { 0 } }'
+run_test2 "lt_10" "0" 'fn main() -> i64 { if 1 < 0 { 1 } else { 0 } }'
+run_test2 "gt_true" "1" 'fn main() -> i64 { if 5 > 3 { 1 } else { 0 } }'
+run_test2 "gt_false" "0" 'fn main() -> i64 { if 3 > 5 { 1 } else { 0 } }'
+run_test2 "gt_eq" "0" 'fn main() -> i64 { if 5 > 5 { 1 } else { 0 } }'
+run_test2 "gt_10" "1" 'fn main() -> i64 { if 1 > 0 { 1 } else { 0 } }'
+run_test2 "gt_01" "0" 'fn main() -> i64 { if 0 > 1 { 1 } else { 0 } }'
+run_test2 "le_lt" "1" 'fn main() -> i64 { if 3 <= 5 { 1 } else { 0 } }'
+run_test2 "le_eq" "1" 'fn main() -> i64 { if 5 <= 5 { 1 } else { 0 } }'
+run_test2 "le_false" "0" 'fn main() -> i64 { if 6 <= 5 { 1 } else { 0 } }'
+run_test2 "ge_gt" "1" 'fn main() -> i64 { if 5 >= 3 { 1 } else { 0 } }'
+run_test2 "ge_eq" "1" 'fn main() -> i64 { if 5 >= 5 { 1 } else { 0 } }'
+run_test2 "ge_false" "0" 'fn main() -> i64 { if 3 >= 5 { 1 } else { 0 } }'
+run_test2 "cmp_as_val" "2" 'fn main() -> i64 { let a = if 3 < 5 { 1 } else { 0 } let b = if 5 > 3 { 1 } else { 0 } a + b }'
+# ═══════════════════════════════════════════════════════════════
+# 4. IF/ELSE — branches, nesting, as expression
+# ═══════════════════════════════════════════════════════════════
+run_test2 "if_true" "1" 'fn main() -> i64 { if 1 == 1 { 1 } else { 2 } }'
+run_test2 "if_false" "2" 'fn main() -> i64 { if 1 == 2 { 1 } else { 2 } }'
+run_test2 "if_nested_tt" "1" 'fn main() -> i64 { if 1 == 1 { if 2 == 2 { 1 } else { 2 } } else { 3 } }'
+run_test2 "if_nested_tf" "2" 'fn main() -> i64 { if 1 == 1 { if 2 == 3 { 1 } else { 2 } } else { 3 } }'
+run_test2 "if_nested_ft" "3" 'fn main() -> i64 { if 1 == 2 { if 2 == 2 { 1 } else { 2 } } else { 3 } }'
+run_test2 "if_deep4" "4" 'fn main() -> i64 { if 1 == 1 { if 2 == 2 { if 3 == 3 { if 4 == 4 { 4 } else { 0 } } else { 0 } } else { 0 } } else { 0 } }'
+run_test2 "if_deep4_fail" "99" 'fn main() -> i64 { if 1 == 2 { if 2 == 2 { if 3 == 3 { if 4 == 4 { 4 } else { 0 } } else { 0 } } else { 0 } } else { 99 } }'
+run_test2 "if_expr_let" "10" 'fn main() -> i64 { let x = if 3 > 2 { 5 } else { 1 } x * 2 }'
+run_test2 "if_expr_arith" "50" 'fn main() -> i64 { (if 1 == 1 { 5 } else { 0 }) * 10 }'
+run_test2 "if_complex_cond" "42" 'fn main() -> i64 { let a = 10 let b = 20 if a + b == 30 { 42 } else { 0 } }'
+run_test2 "if_chain" "3" 'fn main() -> i64 { if 0 == 1 { 1 } else { if 0 == 2 { 2 } else { 3 } } }'
+# ═══════════════════════════════════════════════════════════════
+# 5. LET BINDINGS
+# ═══════════════════════════════════════════════════════════════
+run_test2 "let_simple" "42" 'fn main() -> i64 { let x = 42 x }'
+run_test2 "let_arith" "10" 'fn main() -> i64 { let x = 3 let y = 7 x + y }'
+run_test2 "let_shadow" "2" 'fn main() -> i64 { let x = 1 let x = 2 x }'
+run_test2 "let_multi" "15" 'fn main() -> i64 { let a = 1 let b = 2 let c = 3 let d = 4 let e = 5 a + b + c + d + e }'
+run_test2 "let_fn_result" "120" 'fn fact(n: i64) -> i64 { if n <= 1 { 1 } else { n * fact(n - 1) } } fn main() -> i64 { let r = fact(5) r }'
+run_test2 "let_chain" "42" 'fn main() -> i64 { let a = 2 let b = a * 3 let c = b * 7 c }'
+# ═══════════════════════════════════════════════════════════════
+# 6. LET MUT + ASSIGNMENT
+# ═══════════════════════════════════════════════════════════════
+run_test2 "mut_basic" "10" 'fn main() -> i64 { let mut x = 5 x = 10 x }'
+run_test2 "mut_multi" "3" 'fn main() -> i64 { let mut x = 0 x = 1 x = 2 x = 3 x }'
+run_test2 "mut_arith" "42" 'fn main() -> i64 { let mut x = 20 x = x + 22 x }'
+run_test2 "mut_while" "100" 'fn main() -> i64 { let mut x = 0 while x < 100 { x = x + 1 } x }'
+run_test2 "mut_complex" "30" 'fn main() -> i64 { let mut x = 0 let a = 10 let b = 20 x = a + b x }'
+run_test2 "mut_swap" "30" 'fn main() -> i64 { let mut x = 10 let mut y = 20 let tmp = x x = y y = tmp x + y }'
+# ═══════════════════════════════════════════════════════════════
+# 7. WHILE LOOPS — basic, edge, nested, patterns
+# ═══════════════════════════════════════════════════════════════
 run_test2 "while" "42" 'fn main() -> i64 { let mut x = 0 while x < 42 { x = x + 1 } x }'
+run_test2 "while_never" "0" 'fn main() -> i64 { let mut x = 0 while x > 0 { x = x - 1 } x }'
+run_test2 "while_one" "1" 'fn main() -> i64 { let mut x = 0 while x < 1 { x = x + 1 } x }'
+run_test2 "while_sum" "45" 'fn main() -> i64 { let mut x = 0 let mut i = 0 while i < 10 { x = x + i i = i + 1 } x }'
+run_test2 "while_nested" "12" 'fn main() -> i64 { let mut sum = 0 let mut i = 0 while i < 3 { let mut j = 0 while j < 4 { sum = sum + 1 j = j + 1 } i = i + 1 } sum }'
+run_test2 "while_pow2" "128" 'fn main() -> i64 { let mut x = 1 let mut i = 0 while i < 7 { x = x * 2 i = i + 1 } x }'
+run_test2 "while_countdown" "0" 'fn main() -> i64 { let mut n = 100 while n > 0 { n = n - 1 } n }'
+run_test2 "while_factorial" "120" 'fn main() -> i64 { let mut p = 1 let mut i = 1 while i <= 5 { p = p * i i = i + 1 } p }'
+run_test2 "while_nested3" "27" 'fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 3 { let mut j = 0 while j < 3 { let mut k = 0 while k < 3 { s = s + 1 k = k + 1 } j = j + 1 } i = i + 1 } s }'
+run_test2 "while_div" "3" 'fn main() -> i64 { let mut x = 24 while x > 5 { x = x / 2 } x }'
+run_test2 "while_250" "250" 'fn main() -> i64 { let mut x = 0 while x < 250 { x = x + 1 } x }'
+# ═══════════════════════════════════════════════════════════════
+# 8. FUNCTIONS — arity 0-7, recursive, composition
+# ═══════════════════════════════════════════════════════════════
+run_test2 "fn_zero" "42" 'fn f() -> i64 { 42 } fn main() -> i64 { f() }'
+run_test2 "fn_one" "10" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { f(10) }'
+run_test2 "fn_two" "30" 'fn f(a: i64, b: i64) -> i64 { a + b } fn main() -> i64 { f(10, 20) }'
+run_test2 "fn_three" "60" 'fn f(a: i64, b: i64, c: i64) -> i64 { a + b + c } fn main() -> i64 { f(10, 20, 30) }'
+run_test2 "fn_four" "100" 'fn f(a: i64, b: i64, c: i64, d: i64) -> i64 { a + b + c + d } fn main() -> i64 { f(10, 20, 30, 40) }'
+run_test2 "fn_five" "150" 'fn f(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 { a + b + c + d + e } fn main() -> i64 { f(10, 20, 30, 40, 50) }'
+run_test2 "fn_six" "210" 'fn f(a: i64, b: i64, c: i64, d: i64, e: i64, g: i64) -> i64 { a + b + c + d + e + g } fn main() -> i64 { f(10, 20, 30, 40, 50, 60) }'
+run_test2 "fn_seven" "28" 'fn f(a: i64, b: i64, c: i64, d: i64, e: i64, g: i64, h: i64) -> i64 { a + b + c + d + e + g + h } fn main() -> i64 { f(1, 2, 3, 4, 5, 6, 7) }'
+run_test2 "factorial" "120" 'fn factorial(n: i64) -> i64 { if n <= 1 { 1 } else { n * factorial(n - 1) } } fn main() -> i64 { factorial(5) }'
+run_test2 "fib" "55" 'fn fib(n: i64) -> i64 { if n <= 1 { n } else { fib(n - 1) + fib(n - 2) } } fn main() -> i64 { fib(10) }'
+run_test2 "fn_recursive_sum" "55" 'fn sum(n: i64) -> i64 { if n <= 0 { 0 } else { n + sum(n - 1) } } fn main() -> i64 { sum(10) }'
+run_test2 "fn_nested_call" "42" 'fn double(x: i64) -> i64 { x * 2 } fn add1(x: i64) -> i64 { x + 1 } fn main() -> i64 { double(add1(20)) }'
+run_test2 "fn_multi_calls" "14" 'fn f(x: i64) -> i64 { x + 1 } fn main() -> i64 { f(1) + f(2) + f(3) + f(4) }'
+run_test2 "fn_arg_order" "3" 'fn sub(a: i64, b: i64) -> i64 { a - b } fn main() -> i64 { sub(5, 2) }'
+run_test2 "fn_chain" "42" 'fn c(x: i64) -> i64 { x + 2 } fn b(x: i64) -> i64 { c(x * 2) } fn a(x: i64) -> i64 { b(x + 3) } fn main() -> i64 { a(17) }'
+run_test2 "fn_compose" "42" 'fn id(x: i64) -> i64 { x } fn main() -> i64 { id(id(id(id(id(42))))) }'
+run_test2 "fn_deep_recursion" "200" 'fn f(n: i64) -> i64 { if n <= 0 { 0 } else { 1 + f(n - 1) } } fn main() -> i64 { f(200) }'
+# ═══════════════════════════════════════════════════════════════
+# 9. STRINGS
+# ═══════════════════════════════════════════════════════════════
+run_test2 "str_hello" "5" 'fn main() -> i64 { let s = "hello" __str_len(s) }'
+run_test2 "str_empty" "0" 'fn main() -> i64 { let s = "" __str_len(s) }'
+run_test2 "str_one" "1" 'fn main() -> i64 { let s = "x" __str_len(s) }'
+run_test2 "str_long" "26" 'fn main() -> i64 { let s = "abcdefghijklmnopqrstuvwxyz" __str_len(s) }'
+run_test2 "str_fn_arg" "5" 'fn slen(s: str) -> i64 { __str_len(s) } fn main() -> i64 { slen("hello") }'
+run_test2 "str_spaces" "3" 'fn main() -> i64 { let s = "   " __str_len(s) }'
+run_test2 "str_digits" "10" 'fn main() -> i64 { let s = "0123456789" __str_len(s) }'
+# ═══════════════════════════════════════════════════════════════
+# 10. RECORDS — field count, access order, in functions
+# ═══════════════════════════════════════════════════════════════
+run_test2 "record_1f" "42" 'type Wrap { val: i64 } fn main() -> i64 { let w = Wrap { val: 42 } w.val }'
+run_test2 "record_2f" "42" 'type Point { x: i64, y: i64 } fn main() -> i64 { let p = Point { x: 30, y: 12 } p.x + p.y }'
+run_test2 "record_3f" "60" 'type R { a: i64, b: i64, c: i64 } fn main() -> i64 { let r = R { a: 10, b: 20, c: 30 } r.a + r.b + r.c }'
+run_test2 "record_4f" "100" 'type Q { a: i64, b: i64, c: i64, d: i64 } fn main() -> i64 { let q = Q { a: 10, b: 20, c: 30, d: 40 } q.a + q.b + q.c + q.d }'
+run_test2 "record_first" "10" 'type R { a: i64, b: i64, c: i64 } fn main() -> i64 { let r = R { a: 10, b: 20, c: 30 } r.a }'
+run_test2 "record_mid" "20" 'type R { a: i64, b: i64, c: i64 } fn main() -> i64 { let r = R { a: 10, b: 20, c: 30 } r.b }'
+run_test2 "record_last" "30" 'type R { a: i64, b: i64, c: i64 } fn main() -> i64 { let r = R { a: 10, b: 20, c: 30 } r.c }'
+run_test2 "record_fn_arg" "42" 'type Pair { a: i64, b: i64 } fn sum(p: i64) -> i64 { p.a + p.b } fn main() -> i64 { let p = Pair { a: 30, b: 12 } sum(p) }'
+run_test2 "record_fn_area" "200" 'type R { w: i64, h: i64 } fn area(r: i64) -> i64 { r.w * r.h } fn main() -> i64 { let r = R { w: 10, h: 20 } area(r) }'
+run_test2 "record_arith" "42" 'type P { x: i64, y: i64 } fn main() -> i64 { let p = P { x: 6, y: 7 } p.x * p.y }'
+run_test2 "record_let_field" "42" 'type P { x: i64, y: i64 } fn main() -> i64 { let p = P { x: 6, y: 7 } let v = p.x * p.y v }'
+run_test2 "record_two_types" "42" 'type A { x: i64 } type B { y: i64 } fn main() -> i64 { let a = A { x: 30 } let b = B { y: 12 } a.x + b.y }'
+run_test2 "fn_returns_record" "42" 'type P { x: i64, y: i64 } fn mk(a: i64, b: i64) -> i64 { P { x: a, y: b } } fn main() -> i64 { let p = mk(30, 12) p.x + p.y }'
+run_test2 "record_getters" "42" 'type P { x: i64, y: i64 } fn getx(p: i64) -> i64 { p.x } fn gety(p: i64) -> i64 { p.y } fn main() -> i64 { let p = P { x: 30, y: 12 } getx(p) + gety(p) }'
+# ═══════════════════════════════════════════════════════════════
+# 11. VARIANTS — single/multi, names, dispatch, no-payload
+# ═══════════════════════════════════════════════════════════════
+run_test2 "variant_A" "42" 'type T { A(i64) } fn main() -> i64 { let x = A(42) match x { A(v) -> v } }'
+run_test2 "variant_long" "42" 'type T { LongName(i64) } fn main() -> i64 { let v = LongName(42) match v { LongName(n) -> n } }'
+run_test2 "variant_dispatch_A" "42" 'type T { A(i64), B(i64) } fn main() -> i64 { let x = A(42) match x { A(v) -> v B(v) -> v + 100 } }'
+run_test2 "variant_dispatch_B" "42" 'type T { A(i64), B(i64) } fn main() -> i64 { let x = B(42) match x { A(v) -> v + 100 B(v) -> v } }'
+run_test2 "variant_3way_X" "1" 'type T { X(i64), Y(i64), Z(i64) } fn main() -> i64 { let v = X(1) match v { X(n) -> n Y(n) -> n + 100 Z(n) -> n + 200 } }'
+run_test2 "variant_3way_Y" "2" 'type T { X(i64), Y(i64), Z(i64) } fn main() -> i64 { let v = Y(2) match v { X(n) -> n + 100 Y(n) -> n Z(n) -> n + 200 } }'
+run_test2 "variant_3way_Z" "3" 'type T { X(i64), Y(i64), Z(i64) } fn main() -> i64 { let v = Z(3) match v { X(n) -> n + 100 Y(n) -> n + 200 Z(n) -> n } }'
+run_test2 "variant_fn_arg" "42" 'type T { V(i64) } fn extract(t: i64) -> i64 { match t { V(n) -> n } } fn main() -> i64 { extract(V(42)) }'
+run_test2 "variant_arith_body" "84" 'type T { A(i64), B(i64) } fn main() -> i64 { let x = A(42) match x { A(v) -> v * 2 B(v) -> v } }'
+run_test2 "variant_ctor_expr" "42" 'type T { A(i64) } fn main() -> i64 { let x = A(6 * 7) match x { A(v) -> v } }'
+run_test2 "variant_sq" "25" 'type Shape { Circle(i64) } fn main() -> i64 { let s = Circle(5) match s { Circle(r) -> r * r } }'
+# No-payload variant construction (None()) not yet supported — needs zero-arg ctor handling
+# run_test2 "variant_no_payload" "99" 'type T { None, Some(i64) } fn main() -> i64 { let x = None() match x { None -> 99 Some(v) -> v } }'
+run_test2 "variant_some" "42" 'type T { None, Some(i64) } fn main() -> i64 { let x = Some(42) match x { None -> 0 Some(v) -> v } }'
+# ═══════════════════════════════════════════════════════════════
+# 12. MATCH — all pattern types, arm positions, complex bodies
+# ═══════════════════════════════════════════════════════════════
+run_test2 "match_bind" "42" 'fn main() -> i64 { match 21 { n -> n * 2 } }'
+run_test2 "match_bind_only" "42" 'fn main() -> i64 { match 42 { x -> x } }'
+run_test2 "match_wild" "42" 'fn main() -> i64 { match 1 { _ -> 42 } }'
+run_test2 "match_int" "42" 'fn main() -> i64 { match 1 { 1 -> 42 } }'
+run_test2 "match_zero" "0" 'fn main() -> i64 { match 0 { 0 -> 0 _ -> 1 } }'
+run_test2 "match_first" "10" 'fn main() -> i64 { match 1 { 1 -> 10 2 -> 20 3 -> 30 } }'
+run_test2 "match_middle" "20" 'fn main() -> i64 { match 2 { 1 -> 10 2 -> 20 3 -> 30 } }'
+run_test2 "match_last" "30" 'fn main() -> i64 { match 3 { 1 -> 10 2 -> 20 3 -> 30 } }'
+run_test2 "match_fallthrough" "42" 'fn main() -> i64 { match 5 { 1 -> 10 2 -> 20 _ -> 42 } }'
+run_test2 "match_large" "42" 'fn main() -> i64 { match 1000000 { 999999 -> 0 1000000 -> 42 _ -> 1 } }'
+run_test2 "match_5arms" "5" 'fn main() -> i64 { match 5 { 1 -> 1 2 -> 2 3 -> 3 4 -> 4 _ -> 5 } }'
+run_test2 "match_7arms" "7" 'fn main() -> i64 { match 7 { 1 -> 1 2 -> 2 3 -> 3 4 -> 4 5 -> 5 6 -> 6 _ -> 7 } }'
+run_test2 "match_expr" "42" 'fn main() -> i64 { match 3 + 4 { 7 -> 42 _ -> 0 } }'
+run_test2 "match_scr_call" "42" 'fn f(x: i64) -> i64 { x * 2 } fn main() -> i64 { match f(21) { 42 -> 42 _ -> 0 } }'
+run_test2 "match_nested" "42" 'fn main() -> i64 { match 1 { 1 -> match 2 { 2 -> 42 _ -> 0 } _ -> 0 } }'
+run_test2 "match_deep_nest" "99" 'fn main() -> i64 { match 1 { 1 -> match 2 { 2 -> match 3 { 3 -> 99 _ -> 0 } _ -> 0 } _ -> 0 } }'
+run_test2 "match_fn" "42" 'fn classify(n: i64) -> i64 { match n { 0 -> 0 1 -> 42 _ -> 99 } } fn main() -> i64 { classify(1) }'
+run_test2 "match_let" "50" 'fn main() -> i64 { let x = match 2 { 1 -> 10 2 -> 25 _ -> 0 } x * 2 }'
+run_test2 "match_shadow" "10" 'fn main() -> i64 { let x = 5 match 10 { x -> x } }'
+run_test2 "match_wild_arith" "6" 'fn test(n: i64) -> i64 { match n { 0 -> 100 _ -> n + 1 } } fn main() -> i64 { test(5) }'
+run_test2 "match_bind_arith" "6" 'fn main() -> i64 { match 5 { 0 -> 100 x -> x + 1 } }'
+run_test2 "match_body_while" "10" 'fn main() -> i64 { match 1 { 1 -> { let mut s = 0 let mut i = 0 while i < 10 { s = s + 1 i = i + 1 } s } _ -> 0 } }'
+run_test2 "match_body_call" "120" 'fn fact(n: i64) -> i64 { if n <= 1 { 1 } else { n * fact(n - 1) } } fn main() -> i64 { match 5 { n -> fact(n) } }'
+run_test2 "recursive_match" "120" 'fn fact(n: i64) -> i64 { match n { 0 -> 1 1 -> 1 _ -> n * fact(n - 1) } } fn main() -> i64 { fact(5) }'
+run_test2 "gcd_match" "6" 'fn gcd(a: i64, b: i64) -> i64 { match b { 0 -> a _ -> gcd(b, a - a / b * b) } } fn main() -> i64 { gcd(48, 18) }'
+run_test2 "ctor_wildcard" "99" 'type T { A(i64), B(i64) } fn main() -> i64 { let x = B(0) match x { A(v) -> v _ -> 99 } }'
+run_test2 "ctor_wild_hit" "42" 'type T { A(i64), B(i64) } fn main() -> i64 { let x = A(42) match x { A(v) -> v _ -> 0 } }'
+run_test2 "match_no_hit" "42" 'fn main() -> i64 { match 99 { 1 -> 1 2 -> 2 3 -> 3 _ -> 42 } }'
+# ═══════════════════════════════════════════════════════════════
+# 13. INTERACTIONS — feature combinations
+# ═══════════════════════════════════════════════════════════════
+run_test2 "while_match" "10" 'fn main() -> i64 { let mut sum = 0 let mut i = 0 while i < 5 { let v = match i { 0 -> 1 1 -> 2 2 -> 3 _ -> 2 } sum = sum + v i = i + 1 } sum }'
+run_test2 "match_while" "42" 'fn main() -> i64 { match 1 { 1 -> { let mut x = 0 while x < 42 { x = x + 1 } x } _ -> 0 } }'
+run_test2 "match_in_loop" "15" 'fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 6 { let v = match i { 0 -> 0 1 -> 1 2 -> 2 3 -> 3 4 -> 4 _ -> 5 } s = s + v i = i + 1 } s }'
+run_test2 "multi_type" "42" 'type A { x: i64 } type B { y: i64, z: i64 } fn main() -> i64 { let a = A { x: 30 } let b = B { y: 10, z: 2 } a.x + b.y + b.z }'
+run_test2 "variant_in_match" "42" 'type T { A(i64) } fn main() -> i64 { let x = match 1 { 1 -> A(42) _ -> A(0) } match x { A(v) -> v } }'
+run_test2 "record_field_match" "42" 'type P { x: i64, y: i64 } fn main() -> i64 { let p = P { x: 42, y: 0 } match p.x { 42 -> 42 _ -> 0 } }'
+run_test2 "variant_in_match2" "7" 'type T { A(i64), B(i64) } fn main() -> i64 { let v = match 1 { 1 -> A(7) _ -> B(0) } match v { A(n) -> n B(n) -> n } }'
+run_test2 "recursive_variant" "6" 'type T { A(i64), B(i64) } fn process(n: i64) -> i64 { if n <= 0 { 0 } else { let v = A(n) let x = match v { A(k) -> k B(k) -> 0 } x + process(n - 1) } } fn main() -> i64 { process(3) }'
+run_test2 "while_record" "27" 'type P { x: i64, y: i64 } fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 3 { let p = P { x: i * 3, y: i * 3 + 3 } s = s + p.x + p.y i = i + 1 } s }'
+run_test2 "deep_nesting" "39" 'fn main() -> i64 { match 1 { 1 -> { let mut s = 0 let mut i = 0 while i < 7 { if i > 2 { s = s + i * 2 } else { s = s + i } i = i + 1 } s } _ -> 0 } }'
+run_test2 "let_while_fn" "55" 'fn sq(n: i64) -> i64 { n * n } fn main() -> i64 { let mut s = 0 let mut i = 1 while i <= 5 { s = s + sq(i) i = i + 1 } s }'
+run_test2 "while_variant_dispatch" "10" 'type T { Even(i64), Odd(i64) } fn classify(n: i64) -> i64 { if n - n / 2 * 2 == 0 { Even(n) } else { Odd(n) } } fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 5 { let v = classify(i) let x = match v { Even(n) -> n Odd(n) -> n } s = s + x i = i + 1 } s }'
+run_test2 "variant_record_body" "42" 'type V { A(i64), B(i64) } type R { x: i64, y: i64 } fn main() -> i64 { let v = A(42) let r = R { x: match v { A(n) -> n B(n) -> 0 }, y: 0 } r.x }'
+run_test2 "cmp_while_match" "42" 'fn main() -> i64 { let mut x = 0 let mut i = 0 while i < 42 { x = match i { 0 -> 1 _ -> x + 1 } i = i + 1 } x }'
+# ═══════════════════════════════════════════════════════════════
+# 14. ADVERSARIAL / PATHOLOGICAL
+# ═══════════════════════════════════════════════════════════════
+run_test2 "many_lets_8" "36" 'fn main() -> i64 { let a = 1 let b = 2 let c = 3 let d = 4 let e = 5 let f = 6 let g = 7 let h = 8 a + b + c + d + e + f + g + h }'
+run_test2 "many_lets_10" "55" 'fn main() -> i64 { let a = 1 let b = 2 let c = 3 let d = 4 let e = 5 let f = 6 let g = 7 let h = 8 let i = 9 let j = 10 a + b + c + d + e + f + g + h + i + j }'
+run_test2 "fn_arg_stress" "150" 'fn f(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 { a * 1 + b * 2 + c * 3 + d * 4 + e * 5 } fn main() -> i64 { f(10, 10, 10, 10, 10) }'
+run_test2 "while_sq_accum" "30" 'fn main() -> i64 { let mut s = 0 let mut i = 1 while i <= 4 { s = s + i * i i = i + 1 } s }'
+# ═══════════════════════════════════════════════════════════════
+# 15. PROPERTY TESTS
+# ═══════════════════════════════════════════════════════════════
+run_test2 "prop_add_sub" "42" 'fn main() -> i64 { let x = 42 x + 10 - 10 }'
+run_test2 "prop_distrib" "1" 'fn main() -> i64 { let a = 3 let b = 4 let c = 5 let lhs = a * (b + c) let rhs = a * b + a * c if lhs == rhs { 1 } else { 0 } }'
+run_test2 "prop_div_mul" "42" 'fn main() -> i64 { let x = 42 x / 1 * 1 }'
+run_test2 "prop_lt_asym" "1" 'fn main() -> i64 { let a = 3 let b = 5 let ab = if a < b { 1 } else { 0 } let ba = if b < a { 1 } else { 0 } if ab == 1 { if ba == 0 { 1 } else { 0 } } else { 0 } }'
+run_test2 "prop_eq_reflex" "1" 'fn main() -> i64 { let x = 42 if x == x { 1 } else { 0 } }'
+run_test2 "prop_fact_eq" "1" 'fn fact_if(n: i64) -> i64 { if n <= 1 { 1 } else { n * fact_if(n - 1) } } fn fact_match(n: i64) -> i64 { match n { 0 -> 1 1 -> 1 _ -> n * fact_match(n - 1) } } fn main() -> i64 { if fact_if(7) == fact_match(7) { 1 } else { 0 } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
+echo ""
 echo "=== weft2 → weft3 (bootstrap gate) ==="
 /tmp/weft2 < compiler/main.weft > /tmp/weft3
 codesign -fs - /tmp/weft3 && chmod +x /tmp/weft3
-echo 'fn main() -> i64 { 42 }' | /tmp/weft3 > /tmp/t3 && codesign -s - /tmp/t3 && chmod +x /tmp/t3
-got=$(/tmp/t3 2>/dev/null; echo $?)
-echo "weft3 simple: $got (expected 42)"
+
+echo "=== weft3 spot checks ==="
+PASS3=0; FAIL3=0
+run_test3() {
+  local name="$1" expected="$2" input="$3"
+  echo "$input" | /tmp/weft3 > /tmp/t3 && codesign -s - /tmp/t3 2>/dev/null && chmod +x /tmp/t3
+  local got=$(/tmp/t3 2>/dev/null; echo $?)
+  if [ "$got" = "$expected" ]; then
+    PASS3=$((PASS3+1))
+  else
+    echo "  ✗ $name = $got (expected $expected)"
+    FAIL3=$((FAIL3+1))
+  fi
+}
+run_test3 "simple" "42" 'fn main() -> i64 { 42 }'
+run_test3 "factorial" "120" 'fn factorial(n: i64) -> i64 { if n <= 1 { 1 } else { n * factorial(n - 1) } } fn main() -> i64 { factorial(5) }'
+run_test3 "match_int" "42" 'fn main() -> i64 { match 1 { 1 -> 42 } }'
+run_test3 "match_ctor" "25" 'type Shape { Circle(i64) } fn main() -> i64 { let s = Circle(5) match s { Circle(r) -> r * r } }'
+run_test3 "variant_dispatch" "42" 'type T { A(i64), B(i64) } fn main() -> i64 { let x = B(42) match x { A(v) -> v + 100 B(v) -> v } }'
+run_test3 "record" "42" 'type Point { x: i64, y: i64 } fn main() -> i64 { let p = Point { x: 30, y: 12 } p.x + p.y }'
+run_test3 "recursive_match" "120" 'fn fact(n: i64) -> i64 { match n { 0 -> 1 1 -> 1 _ -> n * fact(n - 1) } } fn main() -> i64 { fact(5) }'
+run_test3 "gcd" "6" 'fn gcd(a: i64, b: i64) -> i64 { match b { 0 -> a _ -> gcd(b, a - a / b * b) } } fn main() -> i64 { gcd(48, 18) }'
+echo "weft3: $PASS3 passed, $FAIL3 failed"
+
+echo ""
+echo "=== Byte-identical gate ==="
+cp /tmp/weft2 /tmp/weft2_cmp && codesign --remove-signature /tmp/weft2_cmp 2>/dev/null
+cp /tmp/weft3 /tmp/weft3_cmp && codesign --remove-signature /tmp/weft3_cmp 2>/dev/null
+if diff <(xxd /tmp/weft2_cmp) <(xxd /tmp/weft3_cmp) > /dev/null; then
+  echo "  ✓ weft2 == weft3 (byte-identical after stripping signature)"
+else
+  echo "  ✗ weft2 != weft3"
+fi
 
 echo ""
 echo "=== Summary ==="
 echo "weft1: $PASS/$((PASS+FAIL))"
 echo "weft2: $PASS2/$((PASS2+FAIL2))"
+echo "weft3: $PASS3/$((PASS3+FAIL3))"
+TOTAL=$((PASS+PASS2+PASS3))
+TOTAL_FAIL=$((FAIL+FAIL2+FAIL3))
+echo "Total: $TOTAL passed, $TOTAL_FAIL failed"
+if [ $TOTAL_FAIL -gt 0 ]; then exit 1; fi
