@@ -336,6 +336,23 @@ run_test2 "and_or" "1" 'fn main() -> i64 { if false and true or true { 1 } else 
 run_test2 "or_and" "1" 'fn main() -> i64 { if true or false and false { 1 } else { 0 } }'
 run_test2 "not_and" "1" 'fn main() -> i64 { if not false and true { 1 } else { 0 } }'
 # ═══════════════════════════════════════════════════════════════
+# 20. MATCH GUARDS
+# ═══════════════════════════════════════════════════════════════
+run_test2 "guard_pass" "42" 'fn main() -> i64 { match 5 { n if n > 3 -> 42 _ -> 0 } }'
+run_test2 "guard_fail" "42" 'fn main() -> i64 { match 2 { n if n > 3 -> 0 _ -> 42 } }'
+run_test2 "guard_multi" "42" 'fn main() -> i64 { match 10 { n if n > 100 -> 0 n if n > 5 -> 42 _ -> 99 } }'
+run_test2 "guard_int_pass" "42" 'fn main() -> i64 { match 1 { 1 if true -> 42 _ -> 0 } }'
+run_test2 "guard_int_fail" "42" 'fn main() -> i64 { match 1 { 1 if false -> 0 _ -> 42 } }'
+run_test2 "guard_wild" "42" 'fn main() -> i64 { match 5 { _ if false -> 0 _ -> 42 } }'
+run_test2 "guard_abs" "8" 'fn abs(n: i64) -> i64 { match n { x if x < 0 -> 0 - x x -> x } } fn main() -> i64 { abs(-5) + abs(3) }'
+run_test2 "guard_ctor_pass" "42" 'type T { A(i64), B(i64) } fn main() -> i64 { let v = A(10) match v { A(n) if n > 5 -> 42 A(n) -> n _ -> 0 } }'
+run_test2 "guard_ctor_fail" "3" 'type T { A(i64), B(i64) } fn main() -> i64 { let v = A(3) match v { A(n) if n > 5 -> 0 A(n) -> n _ -> 99 } }'
+run_test2 "guard_chain" "8" 'fn classify(n: i64) -> i64 { match n { x if x < 0 -> 0 - 1 x if x == 0 -> 0 x if x < 10 -> 1 x if x < 100 -> 2 _ -> 3 } } fn main() -> i64 { classify(0) + classify(5) + classify(50) + classify(200) + classify(-1) + classify(7) + classify(99) }'
+run_test2 "guard_not" "42" 'fn main() -> i64 { match 5 { n if not (n > 10) -> 42 _ -> 0 } }'
+run_test2 "guard_and" "42" 'fn main() -> i64 { match 5 { n if n > 0 and n < 10 -> 42 _ -> 0 } }'
+run_test2 "guard_or" "42" 'fn main() -> i64 { match 5 { n if n == 3 or n == 5 -> 42 _ -> 0 } }'
+run_test2 "guard_complex" "42" 'fn main() -> i64 { match 15 { n if n % 3 == 0 and n % 5 == 0 -> 42 _ -> 0 } }'
+# ═══════════════════════════════════════════════════════════════
 # 19. BITWISE OPERATORS
 # ═══════════════════════════════════════════════════════════════
 run_test2 "band_basic" "15" 'fn main() -> i64 { 255 band 15 }'
