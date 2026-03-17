@@ -505,6 +505,23 @@ run_test2 "typarse_complex" "42" 'fn f(x: (i64 | str) & ~nil) -> i64 { 42 } fn m
 run_test2 "typarse_ret_paren" "42" 'fn f() -> (i64 | str) { 42 } fn main() -> i64 { f() }'
 run_test2 "typarse_paren_inter" "42" 'fn f(x: (i64 & any)) -> i64 { 42 } fn main() -> i64 { f(1) }'
 run_test2 "typarse_full_complex" "42" 'fn f(x: (i64 | str) & ~nil) -> (i64 | str) { 42 } fn main() -> i64 { f(1) }'
+# ═══════════════════════════════════════════════════════════════
+# 25. STRING ESCAPE SEQUENCES
+# ═══════════════════════════════════════════════════════════════
+run_test2 "esc_newline" "11" 'fn main() -> i64 { let s = "hello\nworld" __str_len(s) }'
+run_test2 "esc_tab" "3" 'fn main() -> i64 { let s = "a\tb" __str_len(s) }'
+run_test2 "esc_just_n" "1" 'fn main() -> i64 { let s = "\n" __str_len(s) }'
+run_test2 "esc_just_t" "1" 'fn main() -> i64 { let s = "\t" __str_len(s) }'
+run_test2 "esc_empty" "0" 'fn main() -> i64 { let s = "" __str_len(s) }'
+run_test2 "esc_no_esc" "5" 'fn main() -> i64 { let s = "hello" __str_len(s) }'
+run_test2 "esc_multi" "5" 'fn main() -> i64 { let s = "a\nb\tc" __str_len(s) }'
+run_test2 "esc_null" "3" 'fn main() -> i64 { let s = "a\0b" __str_len(s) }'
+# ═══════════════════════════════════════════════════════════════
+# 26. TYPE CHECKER (standalone)
+# ═══════════════════════════════════════════════════════════════
+pushd tests > /dev/null
+run_use "typeck_synth" "0" "$(cat test_typeck.weft)"
+popd > /dev/null
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""

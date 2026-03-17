@@ -1,0 +1,331 @@
+-- compiler/typeck.weft — Bidirectional type checker
+--
+-- Synthesizes types bottom-up for expressions:
+--   IntLit → i64, StringLit → str, true/false → bool
+--   BinOp(+,-,*,/,%) → i64 (both operands must be i64)
+--   BinOp(==,!=,<,>,<=,>=) → bool
+--   BinOp(and,or) → bool
+--   not expr → bool
+--   if/else → unify branches
+--   function call → return type of function
+--
+-- Reports type errors to stderr and continues.
+-- Does NOT block compilation — errors are informational for now.
+
+-- Dependencies: lib.weft, types.weft (loaded by caller)
+
+-- Type environment: maps variable names to types
+-- Linked list of {name_start, name_len, type, src, next}
+fn tenv_new() -> i64 { 0 }
+
+fn tenv_bind(env: i64, src: i64, ns: i64, nl: i64, ty: i64) -> i64 {
+  let e = __bump_alloc(40)
+  __mem_store64(e, ns)
+  __mem_store64(e + 8, nl)
+  __mem_store64(e + 16, ty)
+  __mem_store64(e + 24, src)
+  __mem_store64(e + 32, env)
+  e
+}
+
+fn tenv_lookup(env: i64, src: i64, ns: i64, nl: i64) -> i64 {
+  if env == 0 { 0 }
+  else {
+    let e_ns = __mem_load64(env)
+    let e_nl = __mem_load64(env + 8)
+    let e_src = __mem_load64(env + 24)
+    if e_nl == nl {
+      if src_eq_at(src, ns, e_src + e_ns, 0, nl) == 1 {
+        __mem_load64(env + 16)
+      } else { tenv_lookup(__mem_load64(env + 32), src, ns, nl) }
+    } else { tenv_lookup(__mem_load64(env + 32), src, ns, nl) }
+  }
+}
+
+-- Function type table: maps function names to {param_types, ret_type}
+-- For now, a simple list. Built during pass 1 of type checking.
+fn ftypes_new() -> i64 { nlist_new() }
+
+fn ftypes_add(ft: i64, src: i64, ns: i64, nl: i64, ret_ty: i64) -> i64 {
+  let e = __bump_alloc(40)
+  __mem_store64(e, ns)
+  __mem_store64(e + 8, nl)
+  __mem_store64(e + 16, ret_ty)
+  __mem_store64(e + 24, src)
+  __mem_store64(e + 32, 0)
+  nlist_add(ft, e)
+}
+
+fn ftypes_lookup(ft: i64, src: i64, ns: i64, nl: i64) -> i64 {
+  let mut i = 0
+  let mut result = 0
+  while i < nlist_len(ft) {
+    let e = nlist_get(ft, i)
+    let e_nl = __mem_load64(e + 8)
+    if e_nl == nl {
+      let e_src = __mem_load64(e + 24)
+      if src_eq_at(src, ns, e_src + __mem_load64(e), 0, nl) == 1 {
+        result = __mem_load64(e + 16)
+        i = nlist_len(ft)
+      } else { i = i + 1 }
+    } else { i = i + 1 }
+  }
+  result
+}
+
+-- ══════════════════════════════════════════════════════════════
+-- Type synthesis: infer the type of an expression
+-- ══════════════════════════════════════════════════════════════
+-- Returns a type pointer (ty_i64(), ty_str(), etc.) or 0 for unknown
+
+fn synth(node: i64, env: i64, ft: i64, src: i64) -> i64 {
+  let tag = node_tag(node)
+  match tag {
+    -- IntLit → i64
+    1 -> ty_i64()
+    -- Ident → lookup in environment
+    2 -> synth_ident(node, env, src)
+    -- BinOp → depends on operator
+    3 -> synth_binop(node, env, ft, src)
+    -- Call → return type of function
+    4 -> synth_call(node, env, ft, src)
+    -- If/else → unify branches
+    5 -> synth_if(node, env, ft, src)
+    -- Let → type of body
+    6 -> synth_let(node, env, ft, src)
+    -- Block → type of last expression
+    7 -> synth_block(node, env, ft, src)
+    -- StringLit → str
+    9 -> ty_str()
+    -- While → nil (loops don't produce values)
+    10 -> ty_nil()
+    -- LetMut → type of body
+    11 -> synth_let_mut(node, env, ft, src)
+    -- Assign → nil
+    12 -> ty_nil()
+    -- FieldAccess → i64 (no field types yet)
+    13 -> ty_i64()
+    -- RecordInit → i64 (pointer to record)
+    14 -> ty_i64()
+    -- Match → type of first arm body (simplified)
+    15 -> synth_match(node, env, ft, src)
+    -- Not → bool
+    22 -> ty_bool()
+    -- Unknown
+    _ -> ty_any()
+  }
+}
+
+fn synth_ident(node: i64, env: i64, src: i64) -> i64 {
+  let ns = node_f1(node)
+  let nl = node_f2(node)
+  let ty = tenv_lookup(env, src, ns, nl)
+  if ty == 0 { ty_any() } else { ty }
+}
+
+fn synth_binop(node: i64, env: i64, ft: i64, src: i64) -> i64 {
+  let op = node_f1(node)
+  -- Arithmetic: +,-,*,/,% → i64
+  if op <= 4 { ty_i64() }
+  else { if op == 11 { ty_i64() }
+  -- Comparison: ==,!=,<,>,<=,>= → bool
+  else { if op <= 10 { ty_bool() }
+  -- Logical: and=12, or=13 → bool
+  else { if op <= 13 { ty_bool() }
+  -- Bitwise: band=14..bshr=18 → i64
+  else { ty_i64() } } } }
+}
+
+fn synth_call(node: i64, env: i64, ft: i64, src: i64) -> i64 {
+  let ns = node_f1(node)
+  let nl = node_f2(node)
+  -- Look up return type in function type table
+  let ret = ftypes_lookup(ft, src, ns, nl)
+  if ret == 0 { ty_any() } else { ret }
+}
+
+fn synth_if(node: i64, env: i64, ft: i64, src: i64) -> i64 {
+  let then_ty = synth(node_f2(node), env, ft, src)
+  let else_node = node_f3(node)
+  if else_node == 0 { ty_nil() }
+  else {
+    let else_ty = synth(else_node, env, ft, src)
+    -- If both branches have the same type, use it
+    if ty_eq(then_ty, else_ty) { then_ty }
+    else { ty_union(then_ty, else_ty) }
+  }
+}
+
+fn synth_let(node: i64, env: i64, ft: i64, src: i64) -> i64 {
+  let ns = node_f1(node)
+  let nl = node_f2(node)
+  let val = node_f3(node)
+  let body = node_f4(node)
+  let val_ty = synth(val, env, ft, src)
+  let new_env = tenv_bind(env, src, ns, nl, val_ty)
+  synth(body, new_env, ft, src)
+}
+
+fn synth_let_mut(node: i64, env: i64, ft: i64, src: i64) -> i64 {
+  let ns = node_f1(node)
+  let nl = node_f2(node)
+  let val = node_f3(node)
+  let body = node_f4(node)
+  let val_ty = synth(val, env, ft, src)
+  let new_env = tenv_bind(env, src, ns, nl, val_ty)
+  synth(body, new_env, ft, src)
+}
+
+fn synth_block(node: i64, env: i64, ft: i64, src: i64) -> i64 {
+  -- Block has first and rest; type is type of rest (last expr)
+  let rest = node_f2(node)
+  if rest == 0 { synth(node_f1(node), env, ft, src) }
+  else { synth(rest, env, ft, src) }
+}
+
+fn synth_match(node: i64, env: i64, ft: i64, src: i64) -> i64 {
+  -- Simplified: return type of first arm body
+  let arms = node_f2(node)
+  let n_arms = node_f3(node)
+  if n_arms > 0 {
+    let arm = nlist_get(arms, 0)
+    let body = node_f2(arm)
+    synth(body, env, ft, src)
+  } else { ty_nil() }
+}
+
+-- ══════════════════════════════════════════════════════════════
+-- Type checking: verify type constraints
+-- ══════════════════════════════════════════════════════════════
+
+-- Check a binary operation's operand types
+fn check_binop(node: i64, env: i64, ft: i64, src: i64) -> i64 {
+  let op = node_f1(node)
+  let lhs = node_f2(node)
+  let rhs = node_f3(node)
+  let lhs_ty = synth(lhs, env, ft, src)
+  let rhs_ty = synth(rhs, env, ft, src)
+  -- Arithmetic ops require i64
+  if op <= 4 {
+    check_arith_operand(lhs_ty, rhs_ty, src)
+  } else { if op == 11 {
+    check_arith_operand(lhs_ty, rhs_ty, src)
+  } else { 0 } }
+}
+
+fn check_arith_operand(lhs_ty: i64, rhs_ty: i64, src: i64) -> i64 {
+  let mut errors = 0
+  if not is_subtype(lhs_ty, ty_i64()) {
+    eprint("type error: arithmetic operand is not i64\n")
+    errors = errors + 1
+  } else { errors = errors }
+  if not is_subtype(rhs_ty, ty_i64()) {
+    eprint("type error: arithmetic operand is not i64\n")
+    errors = errors + 1
+  } else { errors = errors }
+  errors
+}
+
+-- Check all expressions in a function body
+fn check_expr(node: i64, env: i64, ft: i64, src: i64) -> i64 {
+  let tag = node_tag(node)
+  let mut errors = 0
+  match tag {
+    3 -> {
+      -- BinOp: check operand types
+      errors = errors + check_binop(node, env, ft, src)
+      -- Recursively check sub-expressions
+      errors = errors + check_expr(node_f2(node), env, ft, src)
+      errors = errors + check_expr(node_f3(node), env, ft, src)
+      errors
+    }
+    5 -> {
+      -- If: check condition is bool-like, check branches
+      errors = errors + check_expr(node_f2(node), env, ft, src)
+      let else_node = node_f3(node)
+      if else_node != 0 { errors = errors + check_expr(else_node, env, ft, src) } else { errors = errors }
+      errors
+    }
+    6 -> {
+      -- Let: check value, then check body with extended env
+      let val = node_f3(node)
+      let body = node_f4(node)
+      errors = errors + check_expr(val, env, ft, src)
+      let val_ty = synth(val, env, ft, src)
+      let new_env = tenv_bind(env, src, node_f1(node), node_f2(node), val_ty)
+      errors = errors + check_expr(body, new_env, ft, src)
+      errors
+    }
+    11 -> {
+      -- LetMut: same as let
+      let val = node_f3(node)
+      let body = node_f4(node)
+      errors = errors + check_expr(val, env, ft, src)
+      let val_ty = synth(val, env, ft, src)
+      let new_env = tenv_bind(env, src, node_f1(node), node_f2(node), val_ty)
+      errors = errors + check_expr(body, new_env, ft, src)
+      errors
+    }
+    7 -> {
+      -- Block: check first, then rest
+      errors = errors + check_expr(node_f1(node), env, ft, src)
+      let rest = node_f2(node)
+      if rest != 0 { errors = errors + check_expr(rest, env, ft, src) } else { errors = errors }
+      errors
+    }
+    4 -> {
+      -- Call: check arguments recursively
+      let args = node_f3(node)
+      let nargs = node_f4(node)
+      let mut i = 0
+      while i < nargs {
+        errors = errors + check_expr(nlist_get(args, i), env, ft, src)
+        i = i + 1
+      }
+      errors
+    }
+    _ -> errors
+  }
+}
+
+-- Check a single function
+fn check_fn(fn_node: i64, ft: i64, src: i64) -> i64 {
+  let params = node_f3(fn_node)
+  let body = node_f4(fn_node)
+  let nparams = nlist_len(params)
+  -- Build environment from params (all i64 for now)
+  let mut env = tenv_new()
+  let mut i = 0
+  while i < nparams {
+    let p = nlist_get(params, i)
+    env = tenv_bind(env, src, node_f1(p), node_f2(p), ty_i64())
+    i = i + 1
+  }
+  check_expr(body, env, ft, src)
+}
+
+-- Check all functions in a module
+fn check_module(fns: i64) -> i64 {
+  let n = nlist_len(fns)
+  let ft = ftypes_new()
+  -- Pass 1: register all function return types (default i64)
+  let mut i = 0
+  while i < n {
+    let pair = nlist_get(fns, i)
+    let fn_node = node_f1(pair)
+    let fn_src = node_f2(pair)
+    ftypes_add(ft, fn_src, node_f1(fn_node), node_f2(fn_node), ty_i64())
+    i = i + 1
+  }
+  -- Pass 2: check all function bodies
+  let mut j = 0
+  let mut total_errors = 0
+  while j < n {
+    let pair = nlist_get(fns, j)
+    let fn_node = node_f1(pair)
+    let fn_src = node_f2(pair)
+    total_errors = total_errors + check_fn(fn_node, ft, fn_src)
+    j = j + 1
+  }
+  total_errors
+}
