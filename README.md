@@ -35,26 +35,32 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 ## Status
 
-Weft has achieved self-hosting. The compiler, written in Weft, compiles itself to native aarch64 Mach-O binaries.
+**Self-hosted, Zig shed.** The compiler compiles itself to native aarch64 Mach-O. The Zig bootstrap has been removed. `./weft` is a checked-in binary that serves as the trust anchor.
 
 ```
-Layer 0: Zig IR kernel             -- done
-Seed:    parser + compiler as IR   -- done
-Layer 1: Weft-in-Weft              -- done (self-hosting achieved)
-Layer 2: self-hosted, Zig shed     -- next
+Seed (Zig, archived in git history) → Layer 1 → Layer 2 (byte-identical)
 ```
 
-The bootstrap path: a Zig IR interpreter runs a seed compiler (the Weft grammar and codegen expressed as IR). The seed compiles `compiler/main.weft` -- a Weft compiler written in Weft -- which then compiles itself. The output is a native aarch64 Mach-O binary with no runtime dependencies beyond OS syscalls.
+277 tests. Byte-identical reproducible builds.
 
 ## Quick Start
 
-**Prerequisites:** Zig 0.15.2, just
+**Prerequisites:** macOS Apple Silicon (aarch64)
 
 ```bash
-just build                          # build the weft binary
-just test                           # run all tests
-just run FILE=test/hello.weft       # interpret a .weft file
-weft compile test/exit42.weft -o /tmp/exit42 && /tmp/exit42  # compile to native
+# Compile a program
+echo 'fn main() -> i64 { 42 }' | ./weft > program
+codesign -s - program && chmod +x program
+./program  # exits 42
+
+# Verify self-hosting
+./weft < compiler/main.weft > /tmp/weft1
+codesign -fs - /tmp/weft1 && chmod +x /tmp/weft1
+/tmp/weft1 < compiler/main.weft > /tmp/weft2
+# weft1 == weft2 (byte-identical after stripping code signatures)
+
+# Run the test suite
+bash test_self_host.sh
 ```
 
 ## The Ideas
