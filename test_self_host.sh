@@ -499,6 +499,12 @@ run_test2 "typarse_multi_fn" "42" 'fn add(a: i64, b: i64) -> i64 { a + b } fn mu
 run_test2 "typarse_record" "42" 'type P { x: i64, y: i64 } fn sum(p: i64) -> i64 { p.x + p.y } fn main() -> i64 { let p = P { x: 30, y: 12 } sum(p) }'
 # Type annotations with variants and match
 run_test2 "typarse_variant" "42" 'type T { A(i64), B(i64) } fn extract(v: i64) -> i64 { match v { A(n) -> n B(n) -> n } } fn main() -> i64 { extract(A(42)) }'
+# Parenthesized type annotations (was buggy — parse_type heap allocation issue)
+run_test2 "typarse_paren_union" "42" 'fn f(x: (i64 | str)) -> i64 { 42 } fn main() -> i64 { f(1) }'
+run_test2 "typarse_complex" "42" 'fn f(x: (i64 | str) & ~nil) -> i64 { 42 } fn main() -> i64 { f(1) }'
+run_test2 "typarse_ret_paren" "42" 'fn f() -> (i64 | str) { 42 } fn main() -> i64 { f() }'
+run_test2 "typarse_paren_inter" "42" 'fn f(x: (i64 & any)) -> i64 { 42 } fn main() -> i64 { f(1) }'
+run_test2 "typarse_full_complex" "42" 'fn f(x: (i64 | str) & ~nil) -> (i64 | str) { 42 } fn main() -> i64 { f(1) }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
