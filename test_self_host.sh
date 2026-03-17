@@ -292,6 +292,69 @@ run_test2 "prop_div_mul" "42" 'fn main() -> i64 { let x = 42 x / 1 * 1 }'
 run_test2 "prop_lt_asym" "1" 'fn main() -> i64 { let a = 3 let b = 5 let ab = if a < b { 1 } else { 0 } let ba = if b < a { 1 } else { 0 } if ab == 1 { if ba == 0 { 1 } else { 0 } } else { 0 } }'
 run_test2 "prop_eq_reflex" "1" 'fn main() -> i64 { let x = 42 if x == x { 1 } else { 0 } }'
 run_test2 "prop_fact_eq" "1" 'fn fact_if(n: i64) -> i64 { if n <= 1 { 1 } else { n * fact_if(n - 1) } } fn fact_match(n: i64) -> i64 { match n { 0 -> 1 1 -> 1 _ -> n * fact_match(n - 1) } } fn main() -> i64 { if fact_if(7) == fact_match(7) { 1 } else { 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 16. UNARY MINUS
+# ═══════════════════════════════════════════════════════════════
+run_test2 "neg_simple" "42" 'fn main() -> i64 { let x = -5 x + 47 }'
+run_test2 "neg_compare" "42" 'fn main() -> i64 { if -1 < 0 { 42 } else { 0 } }'
+run_test2 "neg_double" "10" 'fn main() -> i64 { let x = -10 0 - x }'
+run_test2 "neg_in_expr" "42" 'fn main() -> i64 { 50 + -8 }'
+run_test2 "neg_prec" "42" 'fn main() -> i64 { -2 * -21 }'
+# ═══════════════════════════════════════════════════════════════
+# 17. MODULO
+# ═══════════════════════════════════════════════════════════════
+run_test2 "mod_basic" "1" 'fn main() -> i64 { 10 % 3 }'
+run_test2 "mod_exact" "0" 'fn main() -> i64 { 10 % 5 }'
+run_test2 "mod_one" "0" 'fn main() -> i64 { 42 % 1 }'
+run_test2 "mod_same" "0" 'fn main() -> i64 { 7 % 7 }'
+run_test2 "mod_small" "3" 'fn main() -> i64 { 3 % 5 }'
+run_test2 "mod_7_2" "1" 'fn main() -> i64 { 7 % 2 }'
+run_test2 "mod_even" "0" 'fn main() -> i64 { 100 % 2 }'
+run_test2 "mod_odd" "1" 'fn main() -> i64 { 101 % 2 }'
+run_test2 "mod_prec" "3" 'fn main() -> i64 { 2 + 10 % 3 }'
+run_test2 "mod_gcd" "6" 'fn gcd(a: i64, b: i64) -> i64 { match b { 0 -> a _ -> gcd(b, a % b) } } fn main() -> i64 { gcd(48, 18) }'
+# ═══════════════════════════════════════════════════════════════
+# 18. BOOLEAN LITERALS AND LOGICAL OPERATORS
+# ═══════════════════════════════════════════════════════════════
+run_test2 "true_val" "1" 'fn main() -> i64 { if true { 1 } else { 0 } }'
+run_test2 "false_val" "0" 'fn main() -> i64 { if false { 1 } else { 0 } }'
+run_test2 "not_true" "0" 'fn main() -> i64 { if not true { 1 } else { 0 } }'
+run_test2 "not_false" "1" 'fn main() -> i64 { if not false { 1 } else { 0 } }'
+run_test2 "not_not" "1" 'fn main() -> i64 { if not not true { 1 } else { 0 } }'
+run_test2 "not_cmp" "1" 'fn main() -> i64 { if not (3 > 5) { 1 } else { 0 } }'
+run_test2 "and_tt" "1" 'fn main() -> i64 { if true and true { 1 } else { 0 } }'
+run_test2 "and_tf" "0" 'fn main() -> i64 { if true and false { 1 } else { 0 } }'
+run_test2 "and_ft" "0" 'fn main() -> i64 { if false and true { 1 } else { 0 } }'
+run_test2 "and_ff" "0" 'fn main() -> i64 { if false and false { 1 } else { 0 } }'
+run_test2 "or_tt" "1" 'fn main() -> i64 { if true or true { 1 } else { 0 } }'
+run_test2 "or_tf" "1" 'fn main() -> i64 { if true or false { 1 } else { 0 } }'
+run_test2 "or_ft" "1" 'fn main() -> i64 { if false or true { 1 } else { 0 } }'
+run_test2 "or_ff" "0" 'fn main() -> i64 { if false or false { 1 } else { 0 } }'
+run_test2 "and_prec" "1" 'fn main() -> i64 { if 3 > 2 and 5 > 4 { 1 } else { 0 } }'
+run_test2 "or_prec" "1" 'fn main() -> i64 { if 3 > 5 or 5 > 4 { 1 } else { 0 } }'
+run_test2 "and_or" "1" 'fn main() -> i64 { if false and true or true { 1 } else { 0 } }'
+run_test2 "or_and" "1" 'fn main() -> i64 { if true or false and false { 1 } else { 0 } }'
+run_test2 "not_and" "1" 'fn main() -> i64 { if not false and true { 1 } else { 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 19. BITWISE OPERATORS
+# ═══════════════════════════════════════════════════════════════
+run_test2 "band_basic" "15" 'fn main() -> i64 { 255 band 15 }'
+run_test2 "band_zero" "0" 'fn main() -> i64 { 42 band 0 }'
+run_test2 "band_self" "42" 'fn main() -> i64 { 42 band 42 }'
+run_test2 "bor_basic" "255" 'fn main() -> i64 { 170 bor 85 }'
+run_test2 "bor_zero" "42" 'fn main() -> i64 { 42 bor 0 }'
+run_test2 "bor_self" "42" 'fn main() -> i64 { 42 bor 42 }'
+run_test2 "bxor_basic" "42" 'fn main() -> i64 { 255 bxor 213 }'
+run_test2 "bxor_self" "0" 'fn main() -> i64 { 42 bxor 42 }'
+run_test2 "bxor_zero" "42" 'fn main() -> i64 { 42 bxor 0 }'
+run_test2 "bshl_basic" "32" 'fn main() -> i64 { 1 bshl 5 }'
+run_test2 "bshl_zero" "42" 'fn main() -> i64 { 42 bshl 0 }'
+run_test2 "bshl_mul2" "84" 'fn main() -> i64 { 42 bshl 1 }'
+run_test2 "bshr_basic" "32" 'fn main() -> i64 { 128 bshr 2 }'
+run_test2 "bshr_zero" "42" 'fn main() -> i64 { 42 bshr 0 }'
+run_test2 "bshr_div2" "21" 'fn main() -> i64 { 42 bshr 1 }'
+run_test2 "bit_prec" "42" 'fn main() -> i64 { 40 bor 2 band 255 }'
+run_test2 "bit_shift_add" "64" 'fn main() -> i64 { 1 bshl 5 + 1 }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
