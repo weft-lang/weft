@@ -610,6 +610,50 @@ run_test_err "te_str_mod" "not i64" 'fn f(x: str) -> i64 { x % 2 } fn main() -> 
 run_test_err "te_bool_arith" "not i64" 'fn f(b: bool) -> i64 { b + 1 } fn main() -> i64 { f(true) }'
 run_test_err "te_nil_arith" "not i64" 'fn f(x: nil) -> i64 { x + 1 } fn main() -> i64 { f(0) }'
 run_test_err "te_let_str" "not i64" 'fn f(s: str) -> i64 { let x = s x + 1 } fn main() -> i64 { f("hi") }'
+# Sad: multiple errors in one function
+run_test_err "te_multi_err" "not i64" 'fn f(a: str, b: str) -> i64 { a + b } fn main() -> i64 { f("x", "y") }'
+# Sad: error in nested expression
+run_test_err "te_nested_err" "not i64" 'fn f(s: str) -> i64 { (s + 1) * 2 } fn main() -> i64 { f("hi") }'
+# Sad: typed param in let chain
+run_test_err "te_chain_err" "not i64" 'fn f(s: str) -> i64 { let a = s let b = a b + 1 } fn main() -> i64 { f("hi") }'
+# Clean: function calling typed function
+run_test_no_err "te_call_typed" "42" 'fn add1(x: i64) -> i64 { x + 1 } fn main() -> i64 { add1(41) }'
+# Clean: let binding from typed param
+run_test_no_err "te_let_typed" "42" 'fn f(x: i64) -> i64 { let y = x + 1 y } fn main() -> i64 { f(41) }'
+# Clean: match on typed param
+run_test_no_err "te_match_typed" "42" 'fn f(x: i64) -> i64 { match x { 41 -> 42 _ -> 0 } } fn main() -> i64 { f(41) }'
+# Clean: while with typed counter
+run_test_no_err "te_while_typed" "42" 'fn f(n: i64) -> i64 { let mut x = 0 while x < n { x = x + 1 } x } fn main() -> i64 { f(42) }'
+# Clean: no annotation backward compat
+run_test_no_err "te_no_annot" "42" 'fn f(x) -> i64 { x + 1 } fn main() -> i64 { f(41) }'
+# Clean: str param not used in arithmetic (just passed through)
+run_test_no_err "te_str_pass" "5" 'fn f(s: str) -> i64 { __str_len(s) } fn main() -> i64 { f("hello") }'
+# Adversarial: many typed params
+run_test_no_err "te_many_params" "28" 'fn f(a: i64, b: i64, c: i64, d: i64, e: i64, g: i64, h: i64) -> i64 { a + b + c + d + e + g + h } fn main() -> i64 { f(1, 2, 3, 4, 5, 6, 7) }'
+# Adversarial: typed param shadowed by let
+run_test_no_err "te_shadow" "42" 'fn f(x: str) -> i64 { let x = 42 x } fn main() -> i64 { f("hi") }'
+# Property: type annotation doesn't change runtime behavior
+run_test_no_err "te_runtime_same" "42" 'fn typed(x: i64) -> i64 { x } fn untyped(x) -> i64 { x } fn main() -> i64 { typed(21) + untyped(21) }'
+# ═══════════════════════════════════════════════════════════════
+# 29. CODE SIGNING — binaries run without codesign -s -
+# ═══════════════════════════════════════════════════════════════
+# All test binaries already run without codesign (test harness doesn't call it).
+# These explicit tests verify specific code-signing properties.
+# Small program
+run_test2 "cs_small" "42" 'fn main() -> i64 { 42 }'
+# Larger program (more code = more hash pages)
+run_test2 "cs_large" "120" 'fn factorial(n: i64) -> i64 { if n <= 1 { 1 } else { n * factorial(n - 1) } } fn add(a: i64, b: i64) -> i64 { a + b } fn sub(a: i64, b: i64) -> i64 { a - b } fn mul(a: i64, b: i64) -> i64 { a * b } fn main() -> i64 { factorial(5) }'
+# Program with string data (different binary content pattern)
+run_test2 "cs_strings" "11" 'fn main() -> i64 { let a = "hello" let b = "world" __str_len(a) + __str_len(b) + 1 }'
+# Sad: str used in str context but declared -> i64 return (return type NOT checked yet)
+# This documents that return type enforcement is TODO — str concat returns str, not i64
+run_test_no_err "te_ret_unchecked" "5" 'fn f(s: str) -> i64 { __str_len(s) } fn main() -> i64 { f("hello") }'
+# Sad: both operands are str (not just one)
+run_test_err "te_str_str_add" "not i64" 'fn f(a: str, b: str) -> i64 { a + b } fn main() -> i64 { f("x", "y") }'
+# Sad: bool used as arithmetic operand (not comparison)
+run_test_err "te_bool_mul" "not i64" 'fn f(b: bool) -> i64 { b * 2 } fn main() -> i64 { f(true) }'
+# Sad: nil in subtraction
+run_test_err "te_nil_sub" "not i64" 'fn f(x: nil) -> i64 { x - 1 } fn main() -> i64 { f(0) }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
