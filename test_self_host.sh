@@ -505,6 +505,17 @@ run_test2 "typarse_complex" "42" 'fn f(x: (i64 | str) & ~nil) -> i64 { 42 } fn m
 run_test2 "typarse_ret_paren" "42" 'fn f() -> (i64 | str) { 42 } fn main() -> i64 { f() }'
 run_test2 "typarse_paren_inter" "42" 'fn f(x: (i64 & any)) -> i64 { 42 } fn main() -> i64 { f(1) }'
 run_test2 "typarse_full_complex" "42" 'fn f(x: (i64 | str) & ~nil) -> (i64 | str) { 42 } fn main() -> i64 { f(1) }'
+# Type names: never, any
+run_test2 "typarse_never" "42" 'fn f(x: never) -> i64 { 42 } fn main() -> i64 { f(0) }'
+run_test2 "typarse_any" "42" 'fn f(x: any) -> i64 { 42 } fn main() -> i64 { f(0) }'
+# Mixed param types
+run_test2 "typarse_mixed" "42" 'fn f(a: i64, b: str, c: bool) -> i64 { a } fn main() -> i64 { f(42, "hi", true) }'
+# Deeply nested parens
+run_test2 "typarse_deep_parens" "42" 'fn f(x: (((i64)))) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# Multiple union members
+run_test2 "typarse_tri_union" "42" 'fn f(x: i64 | str | bool) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# Nullable return
+run_test2 "typarse_nullable_ret" "42" 'fn f() -> i64? { 42 } fn main() -> i64 { f() }'
 # ═══════════════════════════════════════════════════════════════
 # 25. STRING ESCAPE SEQUENCES
 # ═══════════════════════════════════════════════════════════════
@@ -516,6 +527,11 @@ run_test2 "esc_empty" "0" 'fn main() -> i64 { let s = "" __str_len(s) }'
 run_test2 "esc_no_esc" "5" 'fn main() -> i64 { let s = "hello" __str_len(s) }'
 run_test2 "esc_multi" "5" 'fn main() -> i64 { let s = "a\nb\tc" __str_len(s) }'
 run_test2 "esc_null" "3" 'fn main() -> i64 { let s = "a\0b" __str_len(s) }'
+run_test2 "esc_consecutive" "3" 'fn main() -> i64 { let s = "\n\n\n" __str_len(s) }'
+run_test2 "esc_all_types" "5" 'fn main() -> i64 { let s = "\n\t\0\n\t" __str_len(s) }'
+run_test2 "esc_unknown" "1" 'fn main() -> i64 { let s = "\q" __str_len(s) }'
+run_test2 "esc_nested_parens" "42" 'fn main() -> i64 { let s = "he\nllo" if __str_len(s) == 6 { 42 } else { 0 } }'
+run_test2 "esc_in_fn_arg" "1" 'fn slen(s: str) -> i64 { __str_len(s) } fn main() -> i64 { slen("\n") }'
 # ═══════════════════════════════════════════════════════════════
 # 26. TYPE CHECKER (standalone unit tests)
 # ═══════════════════════════════════════════════════════════════
@@ -563,6 +579,17 @@ run_test_err "tc_str_minus" "not i64" 'fn main() -> i64 { "hello" - 1 }'
 run_test_err "tc_str_mul" "not i64" 'fn main() -> i64 { "a" * "b" }'
 run_test_err "tc_let_str_add" "not i64" 'fn main() -> i64 { let x = "hello" x + 1 }'
 run_test_err "tc_str_mod" "not i64" 'fn main() -> i64 { "a" % 2 }'
+run_test_err "tc_str_div" "not i64" 'fn main() -> i64 { "a" / 2 }'
+run_test_err "tc_nested_err" "not i64" 'fn main() -> i64 { (42 + "a") + 1 }'
+run_test_err "tc_let_chain" "not i64" 'fn main() -> i64 { let x = "hi" let y = x + 1 y }'
+# Clean: deeply nested arithmetic
+run_test_no_err "tc_deep_arith" "42" 'fn main() -> i64 { 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 6 }'
+# Clean: match with all int arms
+run_test_no_err "tc_match_clean" "42" 'fn main() -> i64 { match 2 { 1 -> 10 2 -> 42 _ -> 0 } }'
+# Clean: while with mutation
+run_test_no_err "tc_while_mut" "42" 'fn main() -> i64 { let mut x = 0 while x < 42 { x = x + 1 } x }'
+# Clean: function calls chain
+run_test_no_err "tc_fn_chain" "42" 'fn a(x: i64) -> i64 { x + 1 } fn b(x: i64) -> i64 { a(x) * 2 } fn main() -> i64 { b(20) }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
