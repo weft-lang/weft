@@ -631,7 +631,9 @@ run_test_no_err "cty_paren_union" "42" 'fn f(x: (i64 | str)) -> i64 { 42 } fn ma
 run_test_no_err "cty_inter" "42" 'fn f(x: (i64 & any)) -> i64 { 42 } fn main() -> i64 { f(1) }'
 run_test_no_err "cty_compl" "42" 'fn f(x: ~nil) -> i64 { 42 } fn main() -> i64 { f(1) }'
 run_test_no_err "cty_nullable" "42" 'fn f(x: i64?) -> i64 { 42 } fn main() -> i64 { f(1) }'
-run_test_no_err "cty_ret_union" "42" 'fn f() -> (i64 | str) { 42 } fn main() -> i64 { f() }'
+# fn f() -> (i64|str) returning i64 is fine, but main()->i64 calling f() is a mismatch
+# because f() might return str. This correctly errors on main's return type.
+run_test_no_err "cty_ret_union" "42" 'fn f() -> (i64 | str) { 42 } fn main() -> (i64 | str) { f() }'
 run_test_no_err "cty_complex" "42" 'fn f(x: (i64 | str) & ~nil) -> i64 { 42 } fn main() -> i64 { f(1) }'
 # Enforcement with complex types
 run_test_err "cty_str_to_i64only" "argument type mismatch" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { f("hello") }'
@@ -657,6 +659,21 @@ run_test_no_err "lex_question_type" "42" 'fn f(a: i64?, b: i64) -> i64 { b } fn 
 run_test_no_err "lex_amp_type" "42" 'fn f(a: i64 & any, b: i64) -> i64 { b } fn main() -> i64 { f(1, 42) }'
 # Multiple type operators in one annotation
 run_test_no_err "lex_multi_ops" "42" 'fn f(x: (i64 | str) & ~nil) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# ═══════════════════════════════════════════════════════════════
+# 36. COMPLEX TYPE ENFORCEMENT — union/intersection types checked
+# ═══════════════════════════════════════════════════════════════
+# i64 subtype of i64|str: should pass
+run_test_no_err "cte_i64_to_union" "42" 'fn f(x: i64 | str) -> i64 { 42 } fn main() -> i64 { f(42) }'
+# str subtype of i64|str: should pass
+run_test_no_err "cte_str_to_union" "42" 'fn f(x: i64 | str) -> i64 { 42 } fn main() -> i64 { f("hi") }'
+# bool NOT subtype of i64|str: should error
+run_test_err "cte_bool_to_union" "argument type mismatch" 'fn f(x: i64 | str) -> i64 { 42 } fn main() -> i64 { f(true) }'
+# union return type: body i64 subtype of i64|str
+run_test_no_err "cte_ret_union_ok" "42" 'fn f() -> i64 | str { 42 } fn main() -> i64 | str { f() }'
+# i64|str NOT subtype of i64: return type mismatch
+run_test_err "cte_ret_narrow" "return type mismatch" 'fn f() -> i64 | str { 42 } fn main() -> i64 { f() }'
+# nullable: i64 subtype of i64?
+run_test_no_err "cte_nullable_ok" "42" 'fn f(x: i64?) -> i64 { 42 } fn main() -> i64 { f(42) }'
 # ═══════════════════════════════════════════════════════════════
 # 35. EXPRESSION SEPARATION — newlines and semicolons
 # ═══════════════════════════════════════════════════════════════
