@@ -657,6 +657,80 @@ run_test_no_err "lex_question_type" "42" 'fn f(a: i64?, b: i64) -> i64 { b } fn 
 run_test_no_err "lex_amp_type" "42" 'fn f(a: i64 & any, b: i64) -> i64 { b } fn main() -> i64 { f(1, 42) }'
 # Multiple type operators in one annotation
 run_test_no_err "lex_multi_ops" "42" 'fn f(x: (i64 | str) & ~nil) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# ═══════════════════════════════════════════════════════════════
+# 35. EXPRESSION SEPARATION — newlines and semicolons
+# ═══════════════════════════════════════════════════════════════
+# Semicolons as explicit separator
+run_test2 "sep_semi" "42" 'fn main() -> i64 { let x = 20; let y = 22; x + y }'
+# Multiple semicolons
+run_test2 "sep_multi_semi" "42" 'fn main() -> i64 { let x = 42;; x }'
+# Newlines as separator (multiline function body)
+run_test2 "sep_newline_let" "42" 'fn main() -> i64 {
+  let x = 20
+  let y = 22
+  x + y
+}'
+# Newline continuation after operator
+run_test2 "sep_continue_op" "42" 'fn main() -> i64 {
+  20 +
+  22
+}'
+# Newline continuation after comma
+run_test2 "sep_continue_comma" "42" 'fn add(a: i64, b: i64) -> i64 { a + b }
+fn main() -> i64 {
+  add(20,
+    22)
+}'
+# If/else across newlines
+run_test2 "sep_if_else" "42" 'fn main() -> i64 {
+  if true {
+    42
+  } else {
+    0
+  }
+}'
+# Match across newlines
+run_test2 "sep_match_nl" "42" 'fn main() -> i64 {
+  match 2 {
+    1 -> 10
+    2 -> 42
+    _ -> 0
+  }
+}'
+# While across newlines
+run_test2 "sep_while_nl" "42" 'fn main() -> i64 {
+  let mut x = 0
+  while x < 42 {
+    x = x + 1
+  }
+  x
+}'
+# Multiple functions with newlines
+run_test2 "sep_multi_fn" "42" 'fn a() -> i64 {
+  21
+}
+fn b() -> i64 {
+  21
+}
+fn main() -> i64 {
+  a() + b()
+}'
+# Nested blocks with newlines
+run_test2 "sep_nested_block" "42" 'fn main() -> i64 {
+  let x = {
+    let a = 20
+    let b = 22
+    a + b
+  }
+  x
+}'
+# Match with guards across newlines
+run_test2 "sep_guard_nl" "42" 'fn main() -> i64 {
+  match 5 {
+    n if n > 3 -> 42
+    _ -> 0
+  }
+}'
 run_test_err "te_let_str" "not i64" 'fn f(s: str) -> i64 { let x = s x + 1 } fn main() -> i64 { f("hi") }'
 # Sad: multiple errors in one function
 run_test_err "te_multi_err" "not i64" 'fn f(a: str, b: str) -> i64 { a + b } fn main() -> i64 { f("x", "y") }'
