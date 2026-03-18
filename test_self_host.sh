@@ -591,6 +591,25 @@ run_test_no_err "tc_match_clean" "42" 'fn main() -> i64 { match 2 { 1 -> 10 2 ->
 run_test_no_err "tc_while_mut" "42" 'fn main() -> i64 { let mut x = 0 while x < 42 { x = x + 1 } x }'
 # Clean: function calls chain
 run_test_no_err "tc_fn_chain" "42" 'fn a(x: i64) -> i64 { x + 1 } fn b(x: i64) -> i64 { a(x) * 2 } fn main() -> i64 { b(20) }'
+# ═══════════════════════════════════════════════════════════════
+# 28. TYPE ENFORCEMENT — annotations enforce type checking
+# ═══════════════════════════════════════════════════════════════
+# Clean: correctly typed params
+run_test_no_err "te_i64_arith" "42" 'fn f(x: i64) -> i64 { x + 1 } fn main() -> i64 { f(41) }'
+run_test_no_err "te_str_len" "5" 'fn f(s: str) -> i64 { __str_len(s) } fn main() -> i64 { f("hello") }'
+run_test_no_err "te_bool_if" "42" 'fn f(b: bool) -> i64 { if b { 42 } else { 0 } } fn main() -> i64 { f(true) }'
+run_test_no_err "te_multi_typed" "42" 'fn f(a: i64, b: i64) -> i64 { a + b } fn main() -> i64 { f(20, 22) }'
+run_test_no_err "te_mixed" "42" 'fn f(n: i64, s: str) -> i64 { n + __str_len(s) } fn main() -> i64 { f(37, "hello") }'
+run_test_no_err "te_untyped" "42" 'fn f(x) -> i64 { 42 } fn main() -> i64 { f(0) }'
+# Errors: typed params used incorrectly (all 5 arithmetic ops)
+run_test_err "te_str_plus" "not i64" 'fn f(x: str) -> i64 { x + 1 } fn main() -> i64 { f("hi") }'
+run_test_err "te_str_minus" "not i64" 'fn f(x: str) -> i64 { x - 1 } fn main() -> i64 { f("hi") }'
+run_test_err "te_str_mul" "not i64" 'fn f(x: str) -> i64 { x * 2 } fn main() -> i64 { f("hi") }'
+run_test_err "te_str_div" "not i64" 'fn f(x: str) -> i64 { x / 2 } fn main() -> i64 { f("hi") }'
+run_test_err "te_str_mod" "not i64" 'fn f(x: str) -> i64 { x % 2 } fn main() -> i64 { f("hi") }'
+run_test_err "te_bool_arith" "not i64" 'fn f(b: bool) -> i64 { b + 1 } fn main() -> i64 { f(true) }'
+run_test_err "te_nil_arith" "not i64" 'fn f(x: nil) -> i64 { x + 1 } fn main() -> i64 { f(0) }'
+run_test_err "te_let_str" "not i64" 'fn f(s: str) -> i64 { let x = s x + 1 } fn main() -> i64 { f("hi") }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
