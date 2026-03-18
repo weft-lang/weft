@@ -47,6 +47,20 @@ run_test2() {
     FAIL2=$((FAIL2+1))
   fi
 }
+# Test that a program crashes (non-zero exit, used for trap tests)
+run_test_crash() {
+  local name="$1" input="$2"
+  echo "$input" | /tmp/weft2 > /tmp/t_crash && chmod +x /tmp/t_crash
+  # Run in subshell with set +e to prevent set -e from killing script on signal
+  local got
+  got=$( (set +e; /tmp/t_crash >/dev/null 2>/dev/null; echo $?) 2>/dev/null )
+  if [ "$got" != "0" ]; then
+    PASS2=$((PASS2+1))
+  else
+    echo "  ✗ $name: expected crash but got exit 0"
+    FAIL2=$((FAIL2+1))
+  fi
+}
 # ═══════════════════════════════════════════════════════════════
 # 1. INTEGER LITERALS
 # ═══════════════════════════════════════════════════════════════
@@ -764,7 +778,7 @@ run_test_no_err "te_match_typed" "42" 'fn f(x: i64) -> i64 { match x { 41 -> 42 
 # Clean: while with typed counter
 run_test_no_err "te_while_typed" "42" 'fn f(n: i64) -> i64 { let mut x = 0 while x < n { x = x + 1 } x } fn main() -> i64 { f(42) }'
 # Clean: no annotation backward compat
-run_test_no_err "te_no_annot" "42" 'fn f(x) -> i64 { x + 1 } fn main() -> i64 { f(41) }'
+run_test_err "te_no_annot" "not i64" 'fn f(x) -> i64 { x + 1 } fn main() -> i64 { f(41) }'
 # Clean: str param not used in arithmetic (just passed through)
 run_test_no_err "te_str_pass" "5" 'fn f(s: str) -> i64 { __str_len(s) } fn main() -> i64 { f("hello") }'
 # Adversarial: many typed params
@@ -772,7 +786,7 @@ run_test_no_err "te_many_params" "28" 'fn f(a: i64, b: i64, c: i64, d: i64, e: i
 # Adversarial: typed param shadowed by let
 run_test_no_err "te_shadow" "42" 'fn f(x: str) -> i64 { let x = 42 x } fn main() -> i64 { f("hi") }'
 # Property: type annotation doesn't change runtime behavior
-run_test_no_err "te_runtime_same" "42" 'fn typed(x: i64) -> i64 { x } fn untyped(x) -> i64 { x } fn main() -> i64 { typed(21) + untyped(21) }'
+run_test_err "te_runtime_same" "return type" 'fn typed(x: i64) -> i64 { x } fn untyped(x) -> i64 { x } fn main() -> i64 { typed(21) + untyped(21) }'
 # ═══════════════════════════════════════════════════════════════
 # 29. CODE SIGNING — binaries run without codesign -s -
 # ═══════════════════════════════════════════════════════════════
@@ -831,6 +845,138 @@ run_test_err "te_str_str_add" "not i64" 'fn f(a: str, b: str) -> i64 { a + b } f
 run_test_err "te_bool_mul" "not i64" 'fn f(b: bool) -> i64 { b * 2 } fn main() -> i64 { f(true) }'
 # Sad: nil in subtraction
 run_test_err "te_nil_sub" "not i64" 'fn f(x: nil) -> i64 { x - 1 } fn main() -> i64 { f(0) }'
+# ═══════════════════════════════════════════════════════════════
+# 28. TECH DEBT FIX 1 — undefined variable detection
+# ═══════════════════════════════════════════════════════════════
+# Happy path: defined variables still work in all contexts
+run_test_no_err "td_undef_let_ok" "42" 'fn main() -> i64 { let x = 42 x }'
+run_test_no_err "td_undef_mut_ok" "10" 'fn main() -> i64 { let mut x = 5 x = 10 x }'
+run_test_no_err "td_undef_param_ok" "42" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { f(42) }'
+run_test_no_err "td_undef_nested_ok" "42" 'fn main() -> i64 { let x = 20 let y = 22 x + y }'
+run_test_no_err "td_undef_shadow_ok" "42" 'fn main() -> i64 { let x = 1 let x = 42 x }'
+run_test_no_err "td_undef_match_ok" "42" 'fn main() -> i64 { match 42 { x -> x } }'
+run_test_no_err "td_undef_mut_while" "10" 'fn main() -> i64 { let mut i = 0 while i < 10 { i = i + 1 } i }'
+# Sad path: assigning to undefined variable produces error
+run_test_err "td_undef_assign" "undefined" 'fn main() -> i64 { let mut x = 5 y = 10 x }'
+# Sad path: reading undefined variable produces error
+run_test_err "td_undef_read" "undefined" 'fn main() -> i64 { y }'
+# Sad path: undefined in expression context
+run_test_err "td_undef_in_expr" "undefined" 'fn main() -> i64 { 1 + z }'
+# Sad path: undefined in function call arg
+run_test_err "td_undef_in_call" "undefined" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { f(w) }'
+# Sad path: undefined in if condition
+run_test_err "td_undef_in_cond" "undefined" 'fn main() -> i64 { if q == 1 { 1 } else { 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 29. TECH DEBT FIX 2 — record field order by declaration
+# ═══════════════════════════════════════════════════════════════
+# Happy: fields in declaration order (regression — must still work)
+run_test2 "td_forder_decl" "42" 'type P { x: i64, y: i64 } fn main() -> i64 { let p = P { x: 30, y: 12 } p.x + p.y }'
+# Happy: 1 field (trivially correct)
+run_test2 "td_forder_1f" "42" 'type W { v: i64 } fn main() -> i64 { let w = W { v: 42 } w.v }'
+# Core test: 2 fields reversed — access first declared field
+run_test2 "td_forder_rev2_x" "30" 'type P { x: i64, y: i64 } fn main() -> i64 { let p = P { y: 12, x: 30 } p.x }'
+# Core test: 2 fields reversed — access second declared field
+run_test2 "td_forder_rev2_y" "12" 'type P { x: i64, y: i64 } fn main() -> i64 { let p = P { y: 12, x: 30 } p.y }'
+# Core test: 2 fields reversed — sum (both correct)
+run_test2 "td_forder_rev2_sum" "42" 'type P { x: i64, y: i64 } fn main() -> i64 { let p = P { y: 12, x: 30 } p.x + p.y }'
+# 3 fields fully reversed — access each individually
+run_test2 "td_forder_rev3_a" "10" 'type R { a: i64, b: i64, c: i64 } fn main() -> i64 { let r = R { c: 30, b: 20, a: 10 } r.a }'
+run_test2 "td_forder_rev3_b" "20" 'type R { a: i64, b: i64, c: i64 } fn main() -> i64 { let r = R { c: 30, b: 20, a: 10 } r.b }'
+run_test2 "td_forder_rev3_c" "30" 'type R { a: i64, b: i64, c: i64 } fn main() -> i64 { let r = R { c: 30, b: 20, a: 10 } r.c }'
+# 3 fields scrambled (not just reversed) — c,a,b order
+run_test2 "td_forder_scramble" "60" 'type R { a: i64, b: i64, c: i64 } fn main() -> i64 { let r = R { c: 30, a: 10, b: 20 } r.a + r.b + r.c }'
+# 4 fields reversed — each field individually
+run_test2 "td_forder_4f_a" "10" 'type Q { a: i64, b: i64, c: i64, d: i64 } fn main() -> i64 { let q = Q { d: 40, c: 30, b: 20, a: 10 } q.a }'
+run_test2 "td_forder_4f_d" "40" 'type Q { a: i64, b: i64, c: i64, d: i64 } fn main() -> i64 { let q = Q { d: 40, c: 30, b: 20, a: 10 } q.d }'
+# Reordered record passed to function
+run_test2 "td_forder_fn" "42" 'type P { x: i64, y: i64 } fn getx(p: i64) -> i64 { p.x } fn main() -> i64 { let p = P { y: 12, x: 42 } getx(p) }'
+run_test2 "td_forder_fn_y" "12" 'type P { x: i64, y: i64 } fn gety(p: i64) -> i64 { p.y } fn main() -> i64 { let p = P { y: 12, x: 42 } gety(p) }'
+# Reordered record in if/else
+run_test2 "td_forder_if" "42" 'type P { x: i64, y: i64 } fn main() -> i64 { let p = if true { P { y: 12, x: 42 } } else { P { x: 0, y: 0 } } p.x }'
+# Multiple reordered records of different types
+run_test2 "td_forder_multi_type" "32" 'type A { x: i64, y: i64 } type B { m: i64, n: i64 } fn main() -> i64 { let a = A { y: 2, x: 10 } let b = B { n: 22, m: 10 } a.x + b.n }'
+# Property: field sum invariant — same sum regardless of construction order
+run_test2 "td_forder_prop_sum" "60" 'type R { a: i64, b: i64, c: i64 } fn main() -> i64 { let r = R { c: 30, a: 10, b: 20 } r.a + r.b + r.c }'
+# Adversarial: reordered record with computed field values
+run_test2 "td_forder_computed" "42" 'type P { x: i64, y: i64 } fn main() -> i64 { let p = P { y: 2 * 3, x: 6 * 7 } p.x }'
+# Wicked: reorder + field access in match
+run_test2 "td_forder_match" "42" 'type P { x: i64, y: i64 } fn main() -> i64 { let p = P { y: 12, x: 42 } match 1 { _ -> p.x } }'
+# ═══════════════════════════════════════════════════════════════
+# 30. TECH DEBT FIX 3 — param count limit (>8 = error)
+# ═══════════════════════════════════════════════════════════════
+# Happy: 1-8 params all work (regressions)
+run_test_no_err "td_params_1" "42" 'fn f(a: i64) -> i64 { a } fn main() -> i64 { f(42) }'
+run_test_no_err "td_params_4" "100" 'fn f(a: i64, b: i64, c: i64, d: i64) -> i64 { a + b + c + d } fn main() -> i64 { f(10, 20, 30, 40) }'
+run_test_no_err "td_params_7" "28" 'fn f(a: i64, b: i64, c: i64, d: i64, e: i64, g: i64, h: i64) -> i64 { a + b + c + d + e + g + h } fn main() -> i64 { f(1, 2, 3, 4, 5, 6, 7) }'
+run_test_no_err "td_params_8" "36" 'fn f(a: i64, b: i64, c: i64, d: i64, e: i64, g: i64, h: i64, i: i64) -> i64 { a + b + c + d + e + g + h + i } fn main() -> i64 { f(1, 2, 3, 4, 5, 6, 7, 8) }'
+# Sad: 9 params should produce error
+run_test_err "td_params_9" "more than 8" 'fn f(a: i64, b: i64, c: i64, d: i64, e: i64, g: i64, h: i64, i: i64, j: i64) -> i64 { a } fn main() -> i64 { f(1,2,3,4,5,6,7,8,9) }'
+# Sad: 10 params should also error
+run_test_err "td_params_10" "more than 8" 'fn f(a: i64, b: i64, c: i64, d: i64, e: i64, g: i64, h: i64, i: i64, j: i64, k: i64) -> i64 { a } fn main() -> i64 { f(1,2,3,4,5,6,7,8,9,10) }'
+# ═══════════════════════════════════════════════════════════════
+# 31. TECH DEBT FIX 4 — non-exhaustive match trap
+# ═══════════════════════════════════════════════════════════════
+# Happy: exhaustive matches still work
+run_test2 "td_match_wild" "42" 'fn main() -> i64 { match 5 { _ -> 42 } }'
+run_test2 "td_match_bind" "42" 'fn main() -> i64 { match 42 { x -> x } }'
+run_test2 "td_match_int_wild" "42" 'fn main() -> i64 { match 5 { 1 -> 1 _ -> 42 } }'
+run_test2 "td_match_ctor_wild" "42" 'type T { A(i64), B(i64) } fn main() -> i64 { match A(42) { A(v) -> v B(v) -> v } }'
+run_test2 "td_match_all_ints" "42" 'fn main() -> i64 { match 2 { 1 -> 10 2 -> 42 _ -> 99 } }'
+# Sad: non-exhaustive int match — scrutinee doesn't match any arm
+run_test_crash "td_match_nonexh_int" 'fn main() -> i64 { match 99 { 1 -> 42 } }'
+# Sad: non-exhaustive with multiple int arms
+run_test_crash "td_match_nonexh_multi" 'fn main() -> i64 { match 5 { 1 -> 10 2 -> 20 3 -> 30 } }'
+# Sad: non-exhaustive constructor match
+run_test_crash "td_match_nonexh_ctor" 'type T { A(i64), B(i64) } fn main() -> i64 { let x = B(42) match x { A(v) -> v } }'
+# Happy: exhaustive via wildcard (must not trap)
+run_test2 "td_match_exh_wild" "42" 'fn main() -> i64 { match 99 { 1 -> 10 _ -> 42 } }'
+# Happy: exhaustive via binding (must not trap)
+run_test2 "td_match_exh_bind" "42" 'fn main() -> i64 { match 42 { 1 -> 10 n -> n } }'
+# Happy: single wildcard arm (trivially exhaustive)
+run_test2 "td_match_exh_single" "42" 'fn main() -> i64 { match 99 { _ -> 42 } }'
+# ═══════════════════════════════════════════════════════════════
+# 32. TECH DEBT ROUND 2 — crash prevention
+# ═══════════════════════════════════════════════════════════════
+# Bounds: token buffer overflow (>32K tokens should error, not corrupt)
+# We can't easily generate 32K tokens in a one-liner, so test buffer bounds
+# indirectly via large programs that still fit.
+# Happy: programs near limits still work
+run_test2 "td_buf_many_lets" "100" 'fn main() -> i64 { let a0 = 0 let a1 = 1 let a2 = 2 let a3 = 3 let a4 = 4 let a5 = 5 let a6 = 6 let a7 = 7 let a8 = 8 let a9 = 9 let b0 = 10 let b1 = 11 let b2 = 12 let b3 = 13 let b4 = 14 let b5 = 15 let b6 = 16 let b7 = 17 let b8 = 18 let b9 = 19 a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8 + b9 - 90 }'
+# Bounds: type table with multiple types
+run_test2 "td_buf_multi_types" "42" 'type A { x: i64 } type B { y: i64 } type C { z: i64 } fn main() -> i64 { let a = A { x: 10 } let b = B { y: 12 } let c = C { z: 20 } a.x + b.y + c.z }'
+# Bounds: nlist with many function args
+run_test2 "td_buf_many_args" "28" 'fn f(a: i64, b: i64, c: i64, d: i64, e: i64, g: i64, h: i64) -> i64 { a + b + c + d + e + g + h } fn main() -> i64 { f(1, 2, 3, 4, 5, 6, 7) }'
+# Bounds: deeply nested if/else
+run_test2 "td_buf_nested_if" "42" 'fn main() -> i64 { if 1 == 1 { if 2 == 2 { if 3 == 3 { if 4 == 4 { if 5 == 5 { 42 } else { 0 } } else { 0 } } else { 0 } } else { 0 } } else { 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 33. TECH DEBT ROUND 3 — type defaults (any instead of i64)
+# ═══════════════════════════════════════════════════════════════
+# Happy: annotated params still type-check correctly
+run_test_no_err "td_tdef_annotated" "42" 'fn f(x: i64) -> i64 { x + 1 } fn main() -> i64 { f(41) }'
+run_test_no_err "td_tdef_str_ann" "5" 'fn f(s: str) -> i64 { __str_len(s) } fn main() -> i64 { f("hello") }'
+run_test_no_err "td_tdef_multi_ann" "42" 'fn f(a: i64, b: i64) -> i64 { a + b } fn main() -> i64 { f(20, 22) }'
+# Happy: annotated return type still works
+run_test_no_err "td_tdef_ret_ann" "42" 'fn f() -> i64 { 42 } fn main() -> i64 { f() }'
+# Happy: no annotation still compiles (backwards compat — any type allows anything)
+run_test2 "td_tdef_noann_ok" "42" 'fn f(x) { x } fn main() -> i64 { f(42) }'
+run_test2 "td_tdef_noret_ok" "42" 'fn f(x: i64) { x } fn main() -> i64 { f(42) }'
+# Sad: unannotated param used in arithmetic should now warn (any is not subtype of i64)
+run_test_err "td_tdef_noann_arith" "not i64" 'fn f(x) -> i64 { x + 1 } fn main() -> i64 { f(41) }'
+# Sad: unannotated param in comparison with i64
+run_test_err "td_tdef_noann_cmp" "not i64" 'fn f(x) -> i64 { x * 2 } fn main() -> i64 { f(21) }'
+# ═══════════════════════════════════════════════════════════════
+# 34. TECH DEBT ROUND 4 — } continuation token fix
+# ═══════════════════════════════════════════════════════════════
+# Happy: } else still works (same line)
+run_test2 "td_cont_else_same" "1" 'fn main() -> i64 { if true { 1 } else { 0 } }'
+# Happy: } else works (different line — this is the critical case)
+run_test2 "td_cont_else_nl" "1" "$(printf 'fn main() -> i64 {\n  if true { 1 }\n  else { 0 }\n}')"
+# Happy: } followed by function on next line
+run_test2 "td_cont_fn_nl" "42" "$(printf 'fn f() -> i64 { 42 }\nfn main() -> i64 { f() }')"
+# Happy: nested if/else across lines
+run_test2 "td_cont_nested_else" "3" "$(printf 'fn main() -> i64 {\n  if false { 1 }\n  else {\n    if false { 2 }\n    else { 3 }\n  }\n}')"
+# Happy: match with arms on separate lines
+run_test2 "td_cont_match" "42" "$(printf 'fn main() -> i64 {\n  match 2 {\n    1 -> 10\n    2 -> 42\n    _ -> 0\n  }\n}')"
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
