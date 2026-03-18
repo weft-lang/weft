@@ -623,6 +623,40 @@ run_test_err "te_true_arith" "not i64" 'fn main() -> i64 { true + 1 }'
 run_test_err "te_false_arith" "not i64" 'fn main() -> i64 { false * 2 }'
 # Comparison result used in arithmetic should error (bool not i64)
 run_test_err "te_cmp_arith" "not i64" 'fn main() -> i64 { (3 > 2) + 1 }'
+# ═══════════════════════════════════════════════════════════════
+# 33. COMPLEX TYPE ANNOTATIONS — (i64 | str), ~nil, etc.
+# ═══════════════════════════════════════════════════════════════
+# These require parse_type to work in param/return positions
+run_test_no_err "cty_paren_union" "42" 'fn f(x: (i64 | str)) -> i64 { 42 } fn main() -> i64 { f(1) }'
+run_test_no_err "cty_inter" "42" 'fn f(x: (i64 & any)) -> i64 { 42 } fn main() -> i64 { f(1) }'
+run_test_no_err "cty_compl" "42" 'fn f(x: ~nil) -> i64 { 42 } fn main() -> i64 { f(1) }'
+run_test_no_err "cty_nullable" "42" 'fn f(x: i64?) -> i64 { 42 } fn main() -> i64 { f(1) }'
+run_test_no_err "cty_ret_union" "42" 'fn f() -> (i64 | str) { 42 } fn main() -> i64 { f() }'
+run_test_no_err "cty_complex" "42" 'fn f(x: (i64 | str) & ~nil) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# Enforcement with complex types
+run_test_err "cty_str_to_i64only" "argument type mismatch" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { f("hello") }'
+# Verify ~ is lexed: ~nil should be a valid annotation (not just skipping ~)
+run_test_no_err "cty_tilde_nil" "42" 'fn f(x: ~nil) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# Verify | is lexed: union types should not create extra params
+run_test_no_err "cty_union_one_param" "42" 'fn f(x: i64 | str) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# Verify & is lexed
+run_test_no_err "cty_amp_inter" "42" 'fn f(x: i64 & any) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# Verify ? is lexed
+run_test_no_err "cty_question_nullable" "42" 'fn f(x: i64?) -> i64 { 42 } fn main() -> i64 { f(1) }'
+# ═══════════════════════════════════════════════════════════════
+# 34. LEXER TOKEN TESTS — verify special chars are tokenized
+# ═══════════════════════════════════════════════════════════════
+# These test that |, &, ~, ? don't silently corrupt parsing
+# | in type shouldn't create extra params
+run_test_no_err "lex_pipe_type" "42" 'fn f(a: i64 | str, b: i64) -> i64 { b } fn main() -> i64 { f(1, 42) }'
+# ~ in type shouldn't be skipped
+run_test_no_err "lex_tilde_type" "42" 'fn f(a: ~nil, b: i64) -> i64 { b } fn main() -> i64 { f(1, 42) }'
+# ? in type shouldn't be skipped
+run_test_no_err "lex_question_type" "42" 'fn f(a: i64?, b: i64) -> i64 { b } fn main() -> i64 { f(1, 42) }'
+# & in type shouldn't be skipped
+run_test_no_err "lex_amp_type" "42" 'fn f(a: i64 & any, b: i64) -> i64 { b } fn main() -> i64 { f(1, 42) }'
+# Multiple type operators in one annotation
+run_test_no_err "lex_multi_ops" "42" 'fn f(x: (i64 | str) & ~nil) -> i64 { 42 } fn main() -> i64 { f(1) }'
 run_test_err "te_let_str" "not i64" 'fn f(s: str) -> i64 { let x = s x + 1 } fn main() -> i64 { f("hi") }'
 # Sad: multiple errors in one function
 run_test_err "te_multi_err" "not i64" 'fn f(a: str, b: str) -> i64 { a + b } fn main() -> i64 { f("x", "y") }'
