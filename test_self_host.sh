@@ -517,12 +517,52 @@ run_test2 "esc_no_esc" "5" 'fn main() -> i64 { let s = "hello" __str_len(s) }'
 run_test2 "esc_multi" "5" 'fn main() -> i64 { let s = "a\nb\tc" __str_len(s) }'
 run_test2 "esc_null" "3" 'fn main() -> i64 { let s = "a\0b" __str_len(s) }'
 # ═══════════════════════════════════════════════════════════════
-# 26. TYPE CHECKER
+# 26. TYPE CHECKER (standalone unit tests)
 # ═══════════════════════════════════════════════════════════════
 pushd tests > /dev/null
-# Full type checker test suite: literals, all binop types, tenv, ftypes, error detection, let propagation
 run_use "typeck_all" "0" "$(cat test_typeck.weft)"
 popd > /dev/null
+# ═══════════════════════════════════════════════════════════════
+# 27. TYPE CHECKER INTEGRATION — error detection in compiled programs
+# ═══════════════════════════════════════════════════════════════
+# Programs that should compile cleanly (no type errors on stderr)
+run_test_no_err() {
+  local name="$1" expected="$2" input="$3"
+  local errs=$(echo "$input" | /tmp/weft2 2>&1 >/tmp/t2)
+  codesign -fs - /tmp/t2 2>/dev/null && chmod +x /tmp/t2
+  local got=$(/tmp/t2 2>/dev/null; echo $?)
+  if [ "$got" = "$expected" ] && [ -z "$errs" ]; then
+    PASS2=$((PASS2+1))
+  else
+    echo "  ✗ $name = $got (expected $expected), errors: $errs"
+    FAIL2=$((FAIL2+1))
+  fi
+}
+# Programs that SHOULD produce type errors on stderr
+run_test_err() {
+  local name="$1" pattern="$2" input="$3"
+  local errs=$(echo "$input" | /tmp/weft2 2>&1 >/tmp/t2)
+  if echo "$errs" | grep -q "$pattern"; then
+    PASS2=$((PASS2+1))
+  else
+    echo "  ✗ $name: expected error '$pattern', got: $errs"
+    FAIL2=$((FAIL2+1))
+  fi
+}
+# Clean programs — no type errors
+run_test_no_err "tc_int_arith" "42" 'fn main() -> i64 { 3 + 4 * 5 + 19 }'
+run_test_no_err "tc_let_int" "42" 'fn main() -> i64 { let x = 20 x + 22 }'
+run_test_no_err "tc_fn_call" "42" 'fn f(a: i64, b: i64) -> i64 { a + b } fn main() -> i64 { f(20, 22) }'
+run_test_no_err "tc_if" "42" 'fn main() -> i64 { if true { 42 } else { 0 } }'
+run_test_no_err "tc_while" "42" 'fn main() -> i64 { let mut x = 0 while x < 42 { x = x + 1 } x }'
+run_test_no_err "tc_match" "42" 'fn main() -> i64 { match 1 { 1 -> 42 _ -> 0 } }'
+run_test_no_err "tc_str" "5" 'fn main() -> i64 { let s = "hello" __str_len(s) }'
+# Type errors — should report
+run_test_err "tc_int_plus_str" "not i64" 'fn main() -> i64 { 42 + "hello" }'
+run_test_err "tc_str_minus" "not i64" 'fn main() -> i64 { "hello" - 1 }'
+run_test_err "tc_str_mul" "not i64" 'fn main() -> i64 { "a" * "b" }'
+run_test_err "tc_let_str_add" "not i64" 'fn main() -> i64 { let x = "hello" x + 1 }'
+run_test_err "tc_str_mod" "not i64" 'fn main() -> i64 { "a" % 2 }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
