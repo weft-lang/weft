@@ -597,9 +597,9 @@ run_test_no_err "tc_fn_chain" "42" 'fn a(x: i64) -> i64 { x + 1 } fn b(x: i64) -
 # Clean: correctly typed params
 run_test_no_err "te_i64_arith" "42" 'fn f(x: i64) -> i64 { x + 1 } fn main() -> i64 { f(41) }'
 run_test_no_err "te_str_len" "5" 'fn f(s: str) -> i64 { __str_len(s) } fn main() -> i64 { f("hello") }'
-# NOTE: true/false are lexed as IntLit, so their type is i64, not bool.
-# Passing true to a bool param triggers mismatch. Known gap.
-run_test_no_err "te_bool_if" "42" 'fn f(b: i64) -> i64 { if b > 0 { 42 } else { 0 } } fn main() -> i64 { f(1) }'
+# bool params: true/false should have type bool, passing to bool param should work
+run_test_no_err "te_bool_if" "42" 'fn f(b: bool) -> i64 { if b { 42 } else { 0 } } fn main() -> i64 { f(true) }'
+run_test_no_err "te_bool_false" "0" 'fn f(b: bool) -> i64 { if b { 1 } else { 0 } } fn main() -> i64 { f(false) }'
 run_test_no_err "te_multi_typed" "42" 'fn f(a: i64, b: i64) -> i64 { a + b } fn main() -> i64 { f(20, 22) }'
 run_test_no_err "te_mixed" "42" 'fn f(n: i64, s: str) -> i64 { n + __str_len(s) } fn main() -> i64 { f(37, "hello") }'
 run_test_no_err "te_untyped" "42" 'fn f(x) -> i64 { 42 } fn main() -> i64 { f(0) }'
@@ -611,6 +611,18 @@ run_test_err "te_str_div" "not i64" 'fn f(x: str) -> i64 { x / 2 } fn main() -> 
 run_test_err "te_str_mod" "not i64" 'fn f(x: str) -> i64 { x % 2 } fn main() -> i64 { f("hi") }'
 run_test_err "te_bool_arith" "not i64" 'fn f(b: bool) -> i64 { b + 1 } fn main() -> i64 { f(true) }'
 run_test_err "te_nil_arith" "not i64" 'fn f(x: nil) -> i64 { x + 1 } fn main() -> i64 { f(0) }'
+# Bool synthesis: comparisons return bool, passing to bool param should work
+run_test_no_err "te_cmp_bool" "42" 'fn check(b: bool) -> i64 { if b { 42 } else { 0 } } fn main() -> i64 { check(3 > 2) }'
+# Bool synthesis: logical ops return bool
+run_test_no_err "te_logic_bool" "42" 'fn check(b: bool) -> i64 { if b { 42 } else { 0 } } fn main() -> i64 { check(true and true) }'
+# Bool synthesis: not returns bool
+run_test_no_err "te_not_bool" "42" 'fn check(b: bool) -> i64 { if b { 42 } else { 0 } } fn main() -> i64 { check(not false) }'
+# true used in arithmetic should error (bool is not i64)
+run_test_err "te_true_arith" "not i64" 'fn main() -> i64 { true + 1 }'
+# false used in arithmetic should error
+run_test_err "te_false_arith" "not i64" 'fn main() -> i64 { false * 2 }'
+# Comparison result used in arithmetic should error (bool not i64)
+run_test_err "te_cmp_arith" "not i64" 'fn main() -> i64 { (3 > 2) + 1 }'
 run_test_err "te_let_str" "not i64" 'fn f(s: str) -> i64 { let x = s x + 1 } fn main() -> i64 { f("hi") }'
 # Sad: multiple errors in one function
 run_test_err "te_multi_err" "not i64" 'fn f(a: str, b: str) -> i64 { a + b } fn main() -> i64 { f("x", "y") }'
@@ -668,8 +680,10 @@ run_test_no_err "ca_untyped_ok" "42" 'fn f(x) -> i64 { 42 } fn main() -> i64 { f
 # Error: argument type doesn't match parameter type
 run_test_err "ca_str_to_i64" "argument type mismatch" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { f("hello") }'
 run_test_err "ca_i64_to_str" "argument type mismatch" 'fn f(s: str) -> i64 { __str_len(s) } fn main() -> i64 { f(42) }'
-# NOTE: true is IntLit(1) so type is i64, passes i64 param check
-run_test_no_err "ca_bool_to_i64" "1" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { f(true) }'
+# bool argument to i64 param: true is bool, i64 expected — should error
+run_test_err "ca_bool_to_i64" "argument type mismatch" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { f(true) }'
+# bool argument to bool param: should work
+run_test_no_err "ca_bool_to_bool" "42" 'fn f(b: bool) -> i64 { if b { 42 } else { 0 } } fn main() -> i64 { f(true) }'
 run_test_err "ca_multi_mismatch" "argument type mismatch" 'fn f(a: i64, b: str) -> i64 { a } fn main() -> i64 { f(1, 2) }'
 # Adversarial: chain of calls with type mismatch
 run_test_err "ca_chain_err" "argument type mismatch" 'fn g(x: i64) -> i64 { x } fn f(s: str) -> i64 { g(s) } fn main() -> i64 { f("hi") }'
