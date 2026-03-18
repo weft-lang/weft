@@ -5,13 +5,13 @@ rm -f /tmp/weft1 /tmp/weft2 /tmp/weft3 /tmp/t /tmp/t2 /tmp/t3
 
 echo "=== Bootstrap: checked-in weft → weft1 ==="
 ./weft < compiler/main.weft > /tmp/weft1
-codesign -fs - /tmp/weft1 && chmod +x /tmp/weft1
+chmod +x /tmp/weft1
 
 echo "=== weft1 regression tests ==="
 PASS=0; FAIL=0
 run_test() {
   local name="$1" expected="$2" input="$3"
-  echo "$input" | /tmp/weft1 > /tmp/t && codesign -s - /tmp/t 2>/dev/null && chmod +x /tmp/t
+  echo "$input" | /tmp/weft1 > /tmp/t && chmod +x /tmp/t
   local got=$(/tmp/t 2>/dev/null; echo $?)
   if [ "$got" = "$expected" ]; then
     echo "  ✓ $name = $got"
@@ -32,13 +32,13 @@ echo "weft1: $PASS passed, $FAIL failed"
 echo ""
 echo "=== weft1 → weft2 ==="
 /tmp/weft1 < compiler/main.weft > /tmp/weft2
-codesign -fs - /tmp/weft2 && chmod +x /tmp/weft2
+chmod +x /tmp/weft2
 
 echo "=== weft2 comprehensive tests ==="
 PASS2=0; FAIL2=0
 run_test2() {
   local name="$1" expected="$2" input="$3"
-  echo "$input" | /tmp/weft2 > /tmp/t2 && codesign -s - /tmp/t2 2>/dev/null && chmod +x /tmp/t2
+  echo "$input" | /tmp/weft2 > /tmp/t2 && chmod +x /tmp/t2
   local got=$(/tmp/t2 2>/dev/null; echo $?)
   if [ "$got" = "$expected" ]; then
     PASS2=$((PASS2+1))
@@ -409,7 +409,7 @@ run_test2 "hoist_many" "42" 'fn main() -> i64 { f1() + f2() + f3() + f4() + f5()
 pushd tests > /dev/null
 run_use() {
   local name="$1" expected="$2" input="$3"
-  echo "$input" | /tmp/weft2 > /tmp/t2 && codesign -s - /tmp/t2 2>/dev/null && chmod +x /tmp/t2
+  echo "$input" | /tmp/weft2 > /tmp/t2 && chmod +x /tmp/t2
   local got=$(/tmp/t2 2>/dev/null; echo $?)
   if [ "$got" = "$expected" ]; then
     PASS2=$((PASS2+1))
@@ -546,7 +546,7 @@ popd > /dev/null
 run_test_no_err() {
   local name="$1" expected="$2" input="$3"
   local errs=$(echo "$input" | /tmp/weft2 2>&1 >/tmp/t2)
-  codesign -fs - /tmp/t2 2>/dev/null && chmod +x /tmp/t2
+  chmod +x /tmp/t2
   local got=$(/tmp/t2 2>/dev/null; echo $?)
   if [ "$got" = "$expected" ] && [ -z "$errs" ]; then
     PASS2=$((PASS2+1))
@@ -596,13 +596,13 @@ echo "weft2: $PASS2 passed, $FAIL2 failed"
 echo ""
 echo "=== weft2 → weft3 (bootstrap gate) ==="
 /tmp/weft2 < compiler/main.weft > /tmp/weft3
-codesign -fs - /tmp/weft3 && chmod +x /tmp/weft3
+chmod +x /tmp/weft3
 
 echo "=== weft3 spot checks ==="
 PASS3=0; FAIL3=0
 run_test3() {
   local name="$1" expected="$2" input="$3"
-  echo "$input" | /tmp/weft3 > /tmp/t3 && codesign -s - /tmp/t3 2>/dev/null && chmod +x /tmp/t3
+  echo "$input" | /tmp/weft3 > /tmp/t3 && chmod +x /tmp/t3
   local got=$(/tmp/t3 2>/dev/null; echo $?)
   if [ "$got" = "$expected" ]; then
     PASS3=$((PASS3+1))
@@ -623,8 +623,8 @@ echo "weft3: $PASS3 passed, $FAIL3 failed"
 
 echo ""
 echo "=== Byte-identical gate ==="
-cp /tmp/weft2 /tmp/weft2_cmp && codesign --remove-signature /tmp/weft2_cmp 2>/dev/null
-cp /tmp/weft3 /tmp/weft3_cmp && codesign --remove-signature /tmp/weft3_cmp 2>/dev/null
+cp /tmp/weft2 /tmp/weft2_cmp
+cp /tmp/weft3 /tmp/weft3_cmp
 if diff <(xxd /tmp/weft2_cmp) <(xxd /tmp/weft3_cmp) > /dev/null; then
   echo "  ✓ weft2 == weft3 (byte-identical after stripping signature)"
 else
