@@ -537,6 +537,7 @@ run_test2 "esc_in_fn_arg" "1" 'fn slen(s: str) -> i64 { __str_len(s) } fn main()
 # ═══════════════════════════════════════════════════════════════
 pushd tests > /dev/null
 run_use "typeck_all" "0" "$(cat test_typeck.weft)"
+run_use "sha256_nist" "0" "$(cat test_sha256.weft)"
 popd > /dev/null
 # ═══════════════════════════════════════════════════════════════
 # 27. TYPE CHECKER INTEGRATION — error detection in compiled programs
