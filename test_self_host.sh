@@ -1227,6 +1227,43 @@ run_test2 "eff_h_in_while" "10" 'effect Counter { fn inc() -> i64 fn read() -> i
 run_test2 "eff_h_adv_minimal" "1" 'effect E { fn f() -> i64 } fn main() -> i64 { handle E.f() { E.f() -> resume(1) } }'
 # --- Adversarial: handler clause with no captures ---
 run_test2 "eff_h_adv_no_cap" "77" 'effect E { fn f() -> i64 } fn main() -> i64 { handle E.f() { E.f() -> resume(77) } }'
+# ═══════════════════════════════════════════════════════════════
+# 42. GENERICS — type parameters on function declarations
+# ═══════════════════════════════════════════════════════════════
+# --- Happy: generic function declaration parses (type params ignored by codegen) ---
+run_test2 "gen_decl_one" "42" 'fn id<T>(x: i64) -> i64 { x } fn main() -> i64 { id(42) }'
+run_test2 "gen_decl_two" "42" 'fn pair<A, B>(a: i64, b: i64) -> i64 { a + b } fn main() -> i64 { pair(20, 22) }'
+run_test2 "gen_decl_three" "42" 'fn f<X, Y, Z>(x: i64) -> i64 { x } fn main() -> i64 { f(42) }'
+# --- Happy: generic fn with type annotations using type params ---
+run_test2 "gen_typed_param" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { id(42) }'
+run_test2 "gen_typed_multi" "42" 'fn fst<A, B>(a: A, b: B) -> A { a } fn main() -> i64 { fst(42, 99) }'
+# --- Happy: non-generic functions still work ---
+run_test2 "gen_compat" "42" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { f(42) }'
+# --- Happy: generic + non-generic in same module ---
+run_test2 "gen_mixed" "42" 'fn id<T>(x: T) -> T { x } fn add(a: i64, b: i64) -> i64 { a + b } fn main() -> i64 { add(id(20), id(22)) }'
+# --- Happy: generic fn calling another generic fn ---
+run_test2 "gen_chain" "42" 'fn id<T>(x: T) -> T { x } fn wrap<U>(y: U) -> U { id(y) } fn main() -> i64 { wrap(42) }'
+# --- Happy: generic with effect annotation ---
+run_test2 "gen_eff" "42" 'fn id<T>(x: T) -[IO]> T { x } fn main() -> i64 { id(42) }'
+# --- Adversarial: single-char type param names ---
+run_test2 "gen_adv_chars" "42" 'fn f<T>(x: T) -> T { x } fn g<A>(x: A) -> A { x } fn main() -> i64 { f(20) + g(22) }'
+# --- Adversarial: type param name same as builtin type ---
+run_test2 "gen_adv_shadow" "42" 'fn f<i64>(x: i64) -> i64 { x } fn main() -> i64 { f(42) }'
+# --- Happy: explicit type args at call site ---
+run_test2 "gen_call_one" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { id<i64>(42) }'
+run_test2 "gen_call_two" "42" 'fn fst<A, B>(a: A, b: B) -> A { a } fn main() -> i64 { fst<i64, i64>(42, 99) }'
+run_test2 "gen_call_expr" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { id<i64>(20) + id<i64>(22) }'
+# --- Happy: generic call with closure arg ---
+run_test2 "gen_call_lam" "42" 'fn apply<T, U>(f: i64, x: T) -> U { f(x) } fn main() -> i64 { apply<i64, i64>(x => x + 1, 41) }'
+# --- Happy: non-generic fn called with type args (ignored) ---
+run_test2 "gen_call_mono" "42" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { f<i64>(42) }'
+# --- Happy: comparison still works (< disambiguation) ---
+run_test2 "gen_cmp_ok" "42" 'fn main() -> i64 { if 1 < 2 { 42 } else { 0 } }'
+run_test2 "gen_cmp_chain" "42" 'fn main() -> i64 { let x = 10 if x < 100 { 42 } else { 0 } }'
+# --- Sad: type var used in arithmetic (checker catches type mismatch) ---
+run_test_err "gen_sad_arith" "arithmetic operand is not i64" 'fn f<T>(x: T) -> T { x + 1 } fn main() -> i64 { f(42) }'
+# --- Sad: type var in return position mismatches i64 ---
+run_test_err "gen_sad_ret" "return type mismatch" 'fn f<T>(x: T) -> i64 { x } fn main() -> i64 { f(42) }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
