@@ -868,6 +868,9 @@ fn cg_expr_high(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -
     26 -> cg_break(node, code, ctr, fm)
     27 -> cg_continue(node, code, ctr, fm)
     29 -> cg_lambda(node, code, scope, src, ctr, fm)
+    32 -> cg_perform(node, code, scope, src, ctr, fm)
+    33 -> cg_handle(node, code, scope, src, ctr, fm)
+    35 -> cg_resume(node, code, scope, src, ctr, fm)
     _ -> cg_int(node_new(1, 0, 0, 0, 0), code, ctr)
   }
 }
@@ -963,7 +966,10 @@ fn find_free_vars(node: i64, ls: i64, src: i64, fv: i64) -> i64 {
       else { if tag == 15 { nlist_add(work, node_f1(n)) find_free_vars_match(node_f2(n), node_f3(n), ls, src, fv) }
       else { if tag == 22 { nlist_add(work, node_f1(n)) }
       else { if tag == 25 { nlist_add(work, node_f1(n)) }
-      else { 0 } } } } } } } } } } } }
+      else { if tag == 32 { find_free_vars_list(node_f3(n), node_f4(n), ls, src, fv) }
+      else { if tag == 33 { nlist_add(work, node_f1(n)) }
+      else { if tag == 35 { nlist_add(work, node_f1(n)) }
+      else { 0 } } } } } } } } } } } } } } }
     }
   }
   0
@@ -1099,6 +1105,302 @@ fn cg_lambda(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i
     emit_store_reg(code, ctr, 16)
   }
   ctr + 1
+}
+
+-- ======================================================================
+-- Effect handler codegen (Tier 2: tail-resumptive)
+-- Per brief: resume in tail position = return from closure.
+-- Handler clauses compiled as closures. State mutation via heap cells.
+-- ======================================================================
+
+-- Resume: evaluate value and return it (Tier 2 only — tail-resumptive)
+fn cg_resume(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
+  let val = node_f1(node)
+  let c1 = cg_expr(val, code, scope, src, ctr, fm)
+  let result_phys = emit_load_reg(code, c1 - 1)
+  bu32(code, encode_add_imm(0, result_phys, 0))
+  emit_epilogue(code)
+  ctr + 1
+}
+
+-- Compile a handler clause body as a closure function
+-- Returns info pointer: [clause_start(8), free_vars_ptr(8), nfree(8)]
+fn cg_hclause_body(clause: i64, code: i64, scope: i64, src: i64, fm: i64) -> i64 {
+  let params = node_f3(clause)
+  let cbody = node_f4(clause)
+  let nparams = nlist_len(params)
+  -- Free variable analysis (clause params form the lambda scope)
+  let mut lambda_scope = scope_new()
+  let mut pi = 0
+  while pi < nparams {
+    let p = nlist_get(params, pi)
+    lambda_scope = scope_push(lambda_scope, node_f1(p), node_f2(p), pi + 1)
+    pi = pi + 1
+  }
+  let free_vars = nlist_new()
+  find_free_vars(cbody, lambda_scope, src, free_vars)
+  let nfree = nlist_len(free_vars)
+  -- B to skip over clause body
+  let skip_pos = buf_len(code)
+  bu32(code, 0)
+  let clause_start = buf_len(code)
+  emit_prologue(code)
+  -- Load captures from x0 (env_ptr)
+  let mut body_scope = scope_new()
+  let mut bi = 0
+  let mut body_ctr = nparams
+  while bi < nfree {
+    let fv = nlist_get(free_vars, bi)
+    if body_ctr < 8 {
+      bu32(code, cg_ldr(body_ctr + 19, 0, bi * 8))
+    } else {
+      bu32(code, cg_ldr(17, 0, bi * 8))
+      emit_store_reg(code, body_ctr, 17)
+    }
+    body_scope = scope_push(body_scope, node_f1(fv), node_f2(fv), reg_id(body_ctr))
+    body_ctr = body_ctr + 1
+    bi = bi + 1
+  }
+  -- Load params from x1..xN (operation arguments)
+  let mut param_i = 0
+  while param_i < nparams {
+    let p = nlist_get(params, param_i)
+    let s_reg = param_i + 1
+    if param_i < 7 {
+      let dst = reg_phys(body_ctr)
+      bu32(code, encode_add_imm(dst, s_reg, 0))
+      body_scope = scope_push(body_scope, node_f1(p), node_f2(p), dst)
+    } else {
+      emit_store_reg(code, body_ctr, s_reg)
+      body_scope = scope_push(body_scope, node_f1(p), node_f2(p), reg_id(body_ctr))
+    }
+    body_ctr = body_ctr + 1
+    param_i = param_i + 1
+  }
+  -- Compile clause body (resume compiles as return)
+  let br = cg_expr(cbody, code, body_scope, src, body_ctr, fm)
+  let rp = emit_load_reg(code, br - 1)
+  bu32(code, encode_add_imm(0, rp, 0))
+  emit_epilogue(code)
+  cg_patch_b(code, skip_pos, buf_len(code))
+  -- Return info struct
+  let info = __bump_alloc(24)
+  __mem_store64(info, clause_start)
+  __mem_store64(info + 8, free_vars)
+  __mem_store64(info + 16, nfree)
+  info
+}
+
+-- Build closure env for a handler clause, store env_ptr in ops array
+fn cg_hclause_env(code: i64, scope: i64, src: i64, ops_ctr: i64, ci: i64, fvs: i64, nfree: i64) -> i64 {
+  let env_size = nfree * 8
+  emit_mov_imm(code, 0, env_size)
+  bu32(code, encode_add_imm(17, 28, 0))
+  bu32(code, encode_add_reg(28, 28, 0))
+  -- Store captures into env
+  let mut ei = 0
+  while ei < nfree {
+    let fv = nlist_get(fvs, ei)
+    let enc_reg = scope_lookup(scope, src, node_f1(fv), node_f2(fv))
+    let ep = if enc_reg < 0 {
+      let slot = 0 - enc_reg - 1
+      bu32(code, cg_ldr(9, 31, slot * 8))
+      9
+    } else { enc_reg }
+    bu32(code, cg_str(ep, 17, ei * 8))
+    ei = ei + 1
+  }
+  -- Store env_ptr at ops[ci].env_ptr
+  let ops_phys = emit_load_reg(code, ops_ctr)
+  bu32(code, cg_str(17, ops_phys, ci * 24 + 16))
+  0
+}
+
+-- Fill ops array entries for all handler clauses
+fn cg_hfill_ops(clauses: i64, n: i64, infos: i64, code: i64, scope: i64, src: i64, ops_ctr: i64) -> i64 {
+  let mut ci = 0
+  while ci < n {
+    let clause = nlist_get(clauses, ci)
+    let op_hash = node_f2(clause)
+    let info = __mem_load64(infos + ci * 8)
+    let cs = __mem_load64(info)
+    let fvs = __mem_load64(info + 8)
+    let nfree = __mem_load64(info + 16)
+    -- Store op_hash at ops[ci].op_hash
+    let ops_phys = emit_load_reg(code, ops_ctr)
+    emit_mov_imm(code, 17, op_hash)
+    bu32(code, cg_str(17, ops_phys, ci * 24))
+    -- Store fn_ptr via ADR at ops[ci].fn_ptr
+    let adr_pos = buf_len(code)
+    bu32(code, encode_adr(17, cs - adr_pos))
+    let ops_p2 = emit_load_reg(code, ops_ctr)
+    bu32(code, cg_str(17, ops_p2, ci * 24 + 8))
+    -- Build env and store env_ptr
+    if nfree > 0 {
+      cg_hclause_env(code, scope, src, ops_ctr, ci, fvs, nfree)
+    } else {
+      emit_mov_imm(code, 17, 0)
+      let ops_p3 = emit_load_reg(code, ops_ctr)
+      bu32(code, cg_str(17, ops_p3, ci * 24 + 16))
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+-- Build handler frame [eff_hash, num_ops, ops_ptr, prev] and push onto x27
+fn cg_hbuild_frame(code: i64, eff_hash: i64, nclauses: i64, ops_ctr: i64) -> i64 {
+  -- Allocate 32-byte frame from bump allocator
+  bu32(code, encode_add_imm(16, 28, 0))
+  bu32(code, encode_add_imm(28, 28, 32))
+  -- Save frame_ptr to x15 (x16 may be clobbered by emit_load_reg)
+  bu32(code, encode_add_imm(15, 16, 0))
+  -- Store eff_hash
+  emit_mov_imm(code, 17, eff_hash)
+  bu32(code, cg_str(17, 15, 0))
+  -- Store num_ops
+  emit_mov_imm(code, 17, nclauses)
+  bu32(code, cg_str(17, 15, 8))
+  -- Store ops_ptr (emit_load_reg may use x16, so we use x15 as frame base)
+  let ops_phys = emit_load_reg(code, ops_ctr)
+  bu32(code, cg_str(ops_phys, 15, 16))
+  -- Store prev = x27
+  bu32(code, cg_str(27, 15, 24))
+  -- Push: x27 = frame_ptr
+  bu32(code, encode_add_imm(27, 15, 0))
+  0
+}
+
+-- Handle expression: compile clauses as closures, build frame, run body, pop
+fn cg_handle(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
+  let body = node_f1(node)
+  let clauses = node_f2(node)
+  let nclauses = node_f3(node)
+  let eff_hash = node_f1(nlist_get(clauses, 0))
+  -- Phase 1: Compile all clause bodies as closures
+  let clause_infos = __bump_alloc(nclauses * 8)
+  let mut ci = 0
+  while ci < nclauses {
+    let info = cg_hclause_body(nlist_get(clauses, ci), code, scope, src, fm)
+    __mem_store64(clause_infos + ci * 8, info)
+    ci = ci + 1
+  }
+  -- Phase 2: Build ops array at runtime
+  bu32(code, encode_add_imm(16, 28, 0))
+  bu32(code, encode_add_imm(28, 28, nclauses * 24))
+  if ctr < 8 {
+    bu32(code, encode_add_imm(ctr + 19, 16, 0))
+  } else { emit_store_reg(code, ctr, 16) }
+  let ops_ctr = ctr
+  cg_hfill_ops(clauses, nclauses, clause_infos, code, scope, src, ops_ctr)
+  -- Phase 3: Build and push handler frame
+  cg_hbuild_frame(code, eff_hash, nclauses, ops_ctr)
+  -- Save x27 (= frame_ptr) for later pop
+  let frame_ctr = ops_ctr + 1
+  if frame_ctr < 8 {
+    bu32(code, encode_add_imm(frame_ctr + 19, 27, 0))
+  } else { emit_store_reg(code, frame_ctr, 27) }
+  -- Phase 4: Compile body (handler is now active)
+  let br = cg_expr(body, code, scope, src, frame_ctr + 1, fm)
+  -- Phase 5: Pop handler — restore x27 from frame.prev
+  let fp = emit_load_reg(code, frame_ctr)
+  bu32(code, cg_ldr(27, fp, 24))
+  -- Move body result to ctr
+  let bp = emit_load_reg(code, br - 1)
+  if ctr < 8 {
+    bu32(code, encode_add_imm(ctr + 19, bp, 0))
+  } else {
+    bu32(code, encode_add_imm(17, bp, 0))
+    emit_store_reg(code, ctr, 17)
+  }
+  ctr + 1
+}
+
+-- Emit inline handler lookup code (uses x8-x14 as temps)
+-- On exit: x13 = matching ops entry ptr (fn_ptr at +8, env_ptr at +16)
+fn cg_perform_lookup(code: i64, eff_hash: i64, op_hash: i64) -> i64 {
+  -- MOV x8, x27 (frame = handler stack top)
+  bu32(code, encode_add_imm(8, 27, 0))
+  emit_mov_imm(code, 10, eff_hash)
+  emit_mov_imm(code, 11, op_hash)
+  -- loop_start:
+  let loop_start = buf_len(code)
+  let cbz_pos = buf_len(code)
+  bu32(code, 0)
+  -- LDR x9, [x8, 0] (frame.eff_hash)
+  bu32(code, cg_ldr(9, 8, 0))
+  bu32(code, encode_cmp(9, 10))
+  let bne_pos = buf_len(code)
+  bu32(code, 0)
+  -- Effect matches: search ops
+  bu32(code, cg_ldr(12, 8, 8))
+  bu32(code, cg_ldr(13, 8, 16))
+  bu32(code, encode_movz(14, 0, 0))
+  let op_loop = buf_len(code)
+  bu32(code, encode_cmp(14, 12))
+  let bge_pos = buf_len(code)
+  bu32(code, 0)
+  bu32(code, cg_ldr(9, 13, 0))
+  bu32(code, encode_cmp(9, 11))
+  let beq_pos = buf_len(code)
+  bu32(code, 0)
+  bu32(code, encode_add_imm(13, 13, 24))
+  bu32(code, encode_add_imm(14, 14, 1))
+  bu32(code, encode_b(op_loop - buf_len(code)))
+  -- next_frame:
+  let next_frame = buf_len(code)
+  bu32(code, cg_ldr(8, 8, 24))
+  bu32(code, encode_b(loop_start - buf_len(code)))
+  -- trap: (no handler found)
+  let trap = buf_len(code)
+  bu32(code, encode_brk(2))
+  -- found:
+  let found = buf_len(code)
+  -- Patch all branches
+  cg_patch_cbz(code, cbz_pos, 8, trap)
+  cg_patch_b_cond(code, bne_pos, 1, next_frame)
+  cg_patch_b_cond(code, bge_pos, 10, next_frame)
+  cg_patch_b_cond(code, beq_pos, 0, found)
+  0
+}
+
+-- Perform: look up handler, call clause closure
+fn cg_perform(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
+  let lhs = node_f1(node)
+  let op_hash = node_f2(node)
+  let args = node_f3(node)
+  let nargs = node_f4(node)
+  -- Compute eff_hash from lhs identifier
+  let eff_hash = str_hash(src, node_f1(lhs), node_f2(lhs))
+  -- Evaluate args into callee-saved registers
+  let arg_results = __bump_alloc(nargs * 8 + 8)
+  let mut i = 0
+  let mut c = ctr
+  while i < nargs {
+    c = cg_expr(nlist_get(args, i), code, scope, src, c, fm)
+    __mem_store64(arg_results + i * 8, c - 1)
+    i = i + 1
+  }
+  -- Inline handler lookup (x8-x14 as temps, x13 = ops entry on exit)
+  cg_perform_lookup(code, eff_hash, op_hash)
+  -- Load fn_ptr and env_ptr from ops entry
+  bu32(code, cg_ldr(9, 13, 8))
+  bu32(code, cg_ldr(0, 13, 16))
+  -- Set up args: x1..xN from callee-saved registers
+  let mut j = 0
+  while j < nargs {
+    let actr = __mem_load64(arg_results + j * 8)
+    let ap = emit_load_reg(code, actr)
+    bu32(code, encode_add_imm(j + 1, ap, 0))
+    j = j + 1
+  }
+  -- Call clause closure
+  bu32(code, encode_blr(9))
+  -- Result in x0
+  if c < 8 {
+    bu32(code, encode_add_imm(c + 19, 0, 0))
+  } else { emit_store_reg(code, c, 0) }
+  c + 1
 }
 
 fn cg_not(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
@@ -1549,6 +1851,18 @@ fn cg_patch_breaks(code: i64, patches: i64, target: i64) -> i64 {
     cg_patch_b(code, nlist_get(patches, i), target)
     i = i + 1
   }
+  0
+}
+
+-- Patch a conditional branch (B.cond) at pos to target
+fn cg_patch_b_cond(code: i64, pos: i64, cond: i64, target: i64) -> i64 {
+  let off = target - pos
+  let enc = encode_b_cond(off, cond)
+  let d = buf_ptr(code)
+  __mem_store8(d + pos, enc - enc / 256 * 256)
+  __mem_store8(d + pos + 1, enc / 256 - enc / 65536 * 256)
+  __mem_store8(d + pos + 2, enc / 65536 - enc / 16777216 * 256)
+  __mem_store8(d + pos + 3, enc / 16777216 - enc / 4294967296 * 256)
   0
 }
 

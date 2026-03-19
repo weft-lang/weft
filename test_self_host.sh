@@ -1196,6 +1196,37 @@ run_test2 "mlam_typed" "42" 'fn main() -> i64 { let f = (x: i64, y: i64) => x + 
 run_test2 "mlam_zero_block" "42" 'fn main() -> i64 { let f = () => { let x = 40 x + 2 } f() }'
 # --- Multi-param with control flow ---
 run_test2 "mlam_control" "42" 'fn main() -> i64 { let f = (x, y) => if x > y { x } else { y } f(42, 10) }'
+# ═══════════════════════════════════════════════════════════════
+# 41. EFFECT HANDLERS — comprehensive (Tier 2: tail-resumptive)
+# ═══════════════════════════════════════════════════════════════
+# --- Happy: basic State.get ---
+run_test2 "eff_h_get" "42" 'effect State { fn get() -> i64 } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 42) handle State.get() { State.get() -> resume(__mem_load64(c)) } }'
+# --- Happy: State.put then get ---
+run_test2 "eff_h_put_get" "99" 'effect State { fn get() -> i64 fn put(v: i64) -> i64 } fn do_it() -> i64 { State.put(99) State.get() } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 0) handle do_it() { State.get() -> resume(__mem_load64(c)) State.put(v) -> { __mem_store64(c, v) resume(0) } } }'
+# --- Happy: multiple performs accumulate ---
+run_test2 "eff_h_multi" "115" 'effect State { fn get() -> i64 fn put(v: i64) -> i64 } fn go() -> i64 { let a = State.get() State.put(a + 10) let b = State.get() State.put(b + 5) State.get() } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 100) handle go() { State.get() -> resume(__mem_load64(c)) State.put(v) -> { __mem_store64(c, v) resume(0) } } }'
+# --- Happy: handler captures enclosing variable ---
+run_test2 "eff_h_capture" "142" 'effect State { fn get() -> i64 } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 0) let offset = 100 handle { State.get() + 42 } { State.get() -> resume(__mem_load64(c) + offset) } }'
+# --- Happy: complex body with block ---
+run_test2 "eff_h_complex" "11" 'effect State { fn get() -> i64 fn put(v: i64) -> i64 } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 5) handle { let x = State.get() State.put(x * 2) State.get() + 1 } { State.get() -> resume(__mem_load64(c)) State.put(v) -> { __mem_store64(c, v) resume(0) } } }'
+# --- Happy: different effect name (Counter) ---
+run_test2 "eff_h_counter" "3" 'effect Counter { fn inc() -> i64 fn read() -> i64 } fn go() -> i64 { Counter.inc() Counter.inc() Counter.inc() Counter.read() } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 0) handle go() { Counter.inc() -> { let v = __mem_load64(c) __mem_store64(c, v + 1) resume(0) } Counter.read() -> resume(__mem_load64(c)) } }'
+# --- Happy: body performs no effects ---
+run_test2 "eff_h_no_perf" "42" 'effect State { fn get() -> i64 } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 0) handle 42 { State.get() -> resume(__mem_load64(c)) } }'
+# --- Happy: single zero-arg operation ---
+run_test2 "eff_h_zero_arg" "7" 'effect Ask { fn ask() -> i64 } fn main() -> i64 { handle Ask.ask() { Ask.ask() -> resume(7) } }'
+# --- Happy: operation with multiple args ---
+run_test2 "eff_h_multi_arg" "30" 'effect Math { fn add(a: i64, b: i64) -> i64 } fn main() -> i64 { handle Math.add(10, 20) { Math.add(a, b) -> resume(a + b) } }'
+# --- Property: handler result flows through ---
+run_test2 "eff_h_result" "10" 'effect State { fn get() -> i64 } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 10) let r = handle State.get() { State.get() -> resume(__mem_load64(c)) } r }'
+# --- Property: perform in if branch ---
+run_test2 "eff_h_in_if" "42" 'effect State { fn get() -> i64 } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 42) handle { if true { State.get() } else { 0 } } { State.get() -> resume(__mem_load64(c)) } }'
+# --- Property: perform in while loop ---
+run_test2 "eff_h_in_while" "10" 'effect Counter { fn inc() -> i64 fn read() -> i64 } fn go() -> i64 { let mut i = 0 while i < 10 { Counter.inc() i = i + 1 } Counter.read() } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 0) handle go() { Counter.inc() -> { __mem_store64(c, __mem_load64(c) + 1) resume(0) } Counter.read() -> resume(__mem_load64(c)) } }'
+# --- Adversarial: perform is the entire body (minimal) ---
+run_test2 "eff_h_adv_minimal" "1" 'effect E { fn f() -> i64 } fn main() -> i64 { handle E.f() { E.f() -> resume(1) } }'
+# --- Adversarial: handler clause with no captures ---
+run_test2 "eff_h_adv_no_cap" "77" 'effect E { fn f() -> i64 } fn main() -> i64 { handle E.f() { E.f() -> resume(77) } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
