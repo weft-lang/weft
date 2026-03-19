@@ -1003,66 +1003,138 @@ run_test2 "td_recovery_runs2" "42" 'fn broken fn main() -> i64 { 42 }'
 # Valid programs still work correctly
 run_test_no_err "td_recovery_valid" "42" 'fn main() -> i64 { 42 }'
 # ═══════════════════════════════════════════════════════════════
-# 37. RETURN STATEMENT
+# 37. RETURN STATEMENT — comprehensive
 # ═══════════════════════════════════════════════════════════════
-# Happy: return as last expression (identity)
+# --- Happy path ---
 run_test2 "ret_basic" "42" 'fn f() -> i64 { return 42 } fn main() -> i64 { f() }'
-# Happy: early return in if branch
-run_test2 "ret_early" "99" 'fn f(x: i64) -> i64 { if x > 10 { return 99 } x + 1 } fn main() -> i64 { f(20) }'
-# Happy: no early return taken
-run_test2 "ret_no_early" "6" 'fn f(x: i64) -> i64 { if x > 10 { return 99 } x + 1 } fn main() -> i64 { f(5) }'
-# Happy: return in nested if
-run_test2 "ret_nested" "1" 'fn classify(n: i64) -> i64 { if n < 0 { return 0 } if n == 0 { return 1 } 2 } fn main() -> i64 { classify(0) }'
-# Happy: return from recursive function
-run_test2 "ret_recursive" "120" 'fn fact(n: i64) -> i64 { if n <= 1 { return 1 } n * fact(n - 1) } fn main() -> i64 { fact(5) }'
-# Happy: return 0 explicitly
 run_test2 "ret_zero" "0" 'fn f() -> i64 { return 0 } fn main() -> i64 { f() }'
-# Happy: return in while loop
-run_test2 "ret_in_loop" "42" 'fn find(target: i64) -> i64 { let mut i = 0 while i < 100 { if i == target { return i } i = i + 1 } 0 - 1 } fn main() -> i64 { find(42) }'
+run_test2 "ret_1" "1" 'fn f() -> i64 { return 1 } fn main() -> i64 { f() }'
+run_test2 "ret_255" "255" 'fn f() -> i64 { return 255 } fn main() -> i64 { f() }'
+# --- Early return: if branch taken vs not taken ---
+run_test2 "ret_early_taken" "99" 'fn f(x: i64) -> i64 { if x > 10 { return 99 } x + 1 } fn main() -> i64 { f(20) }'
+run_test2 "ret_early_not" "6" 'fn f(x: i64) -> i64 { if x > 10 { return 99 } x + 1 } fn main() -> i64 { f(5) }'
+# --- Multiple return points ---
+run_test2 "ret_multi_first" "0" 'fn classify(n: i64) -> i64 { if n < 0 { return 0 } if n == 0 { return 1 } 2 } fn main() -> i64 { classify(0 - 5) }'
+run_test2 "ret_multi_second" "1" 'fn classify(n: i64) -> i64 { if n < 0 { return 0 } if n == 0 { return 1 } 2 } fn main() -> i64 { classify(0) }'
+run_test2 "ret_multi_fallthru" "2" 'fn classify(n: i64) -> i64 { if n < 0 { return 0 } if n == 0 { return 1 } 2 } fn main() -> i64 { classify(5) }'
+# --- Return in recursive function ---
+run_test2 "ret_recursive" "120" 'fn fact(n: i64) -> i64 { if n <= 1 { return 1 } n * fact(n - 1) } fn main() -> i64 { fact(5) }'
+run_test2 "ret_recursive_base" "1" 'fn fact(n: i64) -> i64 { if n <= 1 { return 1 } n * fact(n - 1) } fn main() -> i64 { fact(1) }'
+# --- Return inside while loop ---
+run_test2 "ret_in_loop" "42" 'fn find(t: i64) -> i64 { let mut i = 0 while i < 100 { if i == t { return i } i = i + 1 } 0 - 1 } fn main() -> i64 { find(42) }'
+run_test2 "ret_in_loop_miss" "255" 'fn find(t: i64) -> i64 { let mut i = 0 while i < 100 { if i == t { return i } i = i + 1 } 0 - 1 } fn main() -> i64 { find(200) }'
+# --- Return inside match arm ---
+run_test2 "ret_in_match" "42" 'fn f(x: i64) -> i64 { match x { 1 -> { return 42 } _ -> 0 } } fn main() -> i64 { f(1) }'
+run_test2 "ret_in_match_fall" "0" 'fn f(x: i64) -> i64 { match x { 1 -> { return 42 } _ -> 0 } } fn main() -> i64 { f(2) }'
+# --- Return inside match inside while ---
+run_test2 "ret_match_in_loop" "42" 'fn f() -> i64 { let mut i = 0 while i < 100 { match i { 42 -> { return i } _ -> { i = i + 1 } } } 0 } fn main() -> i64 { f() }'
+# --- Return with expression (not just literal) ---
+run_test2 "ret_expr" "42" 'fn f(a: i64, b: i64) -> i64 { return a * b } fn main() -> i64 { f(6, 7) }'
+run_test2 "ret_call" "42" 'fn g() -> i64 { 42 } fn f() -> i64 { return g() } fn main() -> i64 { f() }'
+# --- Return from deep nesting ---
+run_test2 "ret_deep" "42" 'fn f(x: i64) -> i64 { if x > 0 { if x > 10 { if x > 20 { return 42 } else { return 0 } } else { return 1 } } else { return 2 } } fn main() -> i64 { f(30) }'
+# --- Dead code after return (must not affect result) ---
+run_test2 "ret_dead_code" "42" 'fn f() -> i64 { return 42 let x = 99 x } fn main() -> i64 { f() }'
+# --- Property: return preserves value across call depth ---
+run_test2 "ret_prop_depth" "42" 'fn a() -> i64 { return b() } fn b() -> i64 { return c() } fn c() -> i64 { return 42 } fn main() -> i64 { a() }'
 # ═══════════════════════════════════════════════════════════════
-# 38. BREAK AND CONTINUE
+# 38. BREAK AND CONTINUE — comprehensive
 # ═══════════════════════════════════════════════════════════════
-# Happy: break exits loop
+# --- Break: basic ---
 run_test2 "brk_basic" "42" 'fn main() -> i64 { let mut i = 0 while i < 100 { if i == 42 { break } i = i + 1 } i }'
-# Happy: break on first iteration
 run_test2 "brk_first" "0" 'fn main() -> i64 { let mut i = 0 while i < 10 { break i = i + 1 } i }'
-# Happy: break in nested if
+run_test2 "brk_last" "100" 'fn main() -> i64 { let mut i = 0 while i < 100 { i = i + 1 if i == 100 { break } } i }'
+# --- Break: in nested if ---
 run_test2 "brk_nested_if" "5" 'fn main() -> i64 { let mut i = 0 while i < 100 { i = i + 1 if i > 3 { if i == 5 { break } } else { 0 } } i }'
-# Happy: continue skips iteration
+# --- Break: in match arm ---
+run_test2 "brk_in_match" "42" 'fn main() -> i64 { let mut i = 0 while i < 100 { match i { 42 -> break _ -> { i = i + 1 } } } i }'
+# --- Break: inner loop only (outer continues) ---
+run_test2 "brk_inner_only" "10" 'fn main() -> i64 { let mut total = 0 let mut i = 0 while i < 5 { let mut j = 0 while j < 10 { if j == 2 { break } j = j + 1 total = total + 1 } i = i + 1 } total }'
+# --- Break: outer loop unaffected by inner break ---
+run_test2 "brk_outer_intact" "5" 'fn main() -> i64 { let mut i = 0 while i < 5 { let mut j = 0 while j < 10 { break } i = i + 1 } i }'
+# --- Break: multiple breaks in same loop (different conditions) ---
+run_test2 "brk_multi_cond" "3" 'fn main() -> i64 { let mut i = 0 while i < 100 { if i == 3 { break } if i == 50 { break } i = i + 1 } i }'
+# --- Continue: basic ---
 run_test2 "cont_basic" "9" 'fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 10 { i = i + 1 if i == 5 { continue } s = s + 1 } s }'
-# Happy: continue on all iterations (infinite loop guard)
+# --- Continue: skip multiple values ---
+run_test2 "cont_skip_multi" "7" 'fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 10 { i = i + 1 if i == 3 { continue } if i == 5 { continue } if i == 7 { continue } s = s + 1 } s }'
+# --- Continue: skip even numbers (sum odd only) ---
 run_test2 "cont_sum_even" "30" 'fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 10 { i = i + 1 if i - i / 2 * 2 != 0 { continue } s = s + i } s }'
-# Happy: break from inner loop only
-run_test2 "brk_inner" "10" 'fn main() -> i64 { let mut total = 0 let mut i = 0 while i < 5 { let mut j = 0 while j < 10 { if j == 2 { break } j = j + 1 total = total + 1 } i = i + 1 } total }'
-# Happy: continue in inner loop
+# --- Continue: inner loop only ---
 run_test2 "cont_inner" "45" 'fn main() -> i64 { let mut total = 0 let mut i = 0 while i < 5 { let mut j = 0 while j < 10 { j = j + 1 if j == 3 { continue } total = total + 1 } i = i + 1 } total }'
-# Happy: break + continue in same loop
+# --- Continue: all iterations skipped (loop still terminates) ---
+run_test2 "cont_all_skip" "0" 'fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 5 { i = i + 1 continue s = s + 1 } s }'
+# --- Break + continue in same loop ---
 run_test2 "brk_cont_combo" "8" 'fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 20 { i = i + 1 if i == 10 { break } if i == 5 { continue } s = s + 1 } s }'
-# Sad: break outside loop (error)
+# --- Break + continue: continue then break same iteration ---
+run_test2 "cont_then_brk" "42" 'fn main() -> i64 { let mut i = 0 while i < 100 { i = i + 1 if i < 42 { continue } break } i }'
+# --- Nested break: inner break, outer continue ---
+run_test2 "brk_inner_cont_outer" "8" 'fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 5 { i = i + 1 if i == 3 { continue } let mut j = 0 while j < 10 { if j == 2 { break } j = j + 1 s = s + 1 } } s }'
+# --- Deeply nested: break inside if inside match inside while ---
+run_test2 "brk_deep_nest" "42" 'fn main() -> i64 { let mut i = 0 while i < 100 { match 1 { 1 -> { if i == 42 { break } else { 0 } } _ -> { 0 } } i = i + 1 } i }'
+# --- Break in function called from loop (break is local to innermost while) ---
+run_test2 "brk_in_fn_loop" "10" 'fn inner() -> i64 { let mut j = 0 while j < 10 { if j == 5 { break } j = j + 1 } j } fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 2 { s = s + inner() i = i + 1 } s }'
+# --- Sad: break outside loop ---
 run_test_err "brk_outside" "break outside" 'fn main() -> i64 { break 42 }'
-# Sad: continue outside loop (error)
+# --- Sad: continue outside loop ---
 run_test_err "cont_outside" "continue outside" 'fn main() -> i64 { continue 42 }'
+# --- Sad: break in function body (not in loop) ---
+run_test_err "brk_in_fn" "break outside" 'fn f() -> i64 { break } fn main() -> i64 { let mut i = 0 while i < 1 { f() i = i + 1 } i }'
+# --- Property: break preserves mut state ---
+run_test2 "brk_prop_mut" "42" 'fn main() -> i64 { let mut x = 0 let mut i = 0 while i < 100 { x = i i = i + 1 if i > 42 { break } } x }'
+# --- Property: continue doesn't skip loop counter update (when before it) ---
+run_test2 "cont_prop_terminates" "10" 'fn main() -> i64 { let mut i = 0 while i < 10 { i = i + 1 if true { continue } } i }'
 # ═══════════════════════════════════════════════════════════════
-# 39. EFFECT TYPE ANNOTATIONS
+# 39. EFFECT TYPE ANNOTATIONS — comprehensive
 # ═══════════════════════════════════════════════════════════════
-# Happy: plain function (no effect annotation)
+# --- Happy: basic effect annotation parsing ---
 run_test2 "eff_plain" "42" 'fn main() -> i64 { 42 }'
-# Happy: effect-annotated function compiles
 run_test2 "eff_io" "42" 'fn f() -[IO]> i64 { 42 } fn main() -> i64 { f() }'
-# Happy: multiple effects
 run_test2 "eff_multi" "42" 'fn f() -[IO, Log]> i64 { 42 } fn main() -> i64 { f() }'
-# Happy: effectful calling same effects
+run_test2 "eff_three" "42" 'fn f() -[IO, Log, Net]> i64 { 42 } fn main() -> i64 { f() }'
+run_test2 "eff_pure_arrow" "42" 'fn f() -> i64 { 42 } fn main() -> i64 { f() }'
+# --- Happy: effect subtyping (caller has >= callee effects) ---
 run_test_no_err "eff_same" "42" 'fn g() -[IO]> i64 { 42 } fn f() -[IO]> i64 { g() } fn main() { f() }'
-# Happy: effectful calling subset (more effects available)
 run_test_no_err "eff_superset" "42" 'fn g() -[IO]> i64 { 42 } fn f() -[IO, Log]> i64 { g() } fn main() { f() }'
-# Happy: pure calling pure
+run_test_no_err "eff_superset3" "42" 'fn g() -[IO]> i64 { 42 } fn f() -[IO, Log, Net]> i64 { g() } fn main() { f() }'
 run_test_no_err "eff_pure_pure" "42" 'fn g() -> i64 { 42 } fn f() -> i64 { g() } fn main() { f() }'
-# Sad: explicitly pure function calling effectful
-run_test_err "eff_pure_call_eff" "effect not available" 'fn g() -[IO]> i64 { 42 } fn f() -> i64 { g() } fn main() { f() }'
-# Sad: effectful calling function with MORE effects than available
-run_test_err "eff_missing" "effect not available" 'fn g() -[IO, Log]> i64 { 42 } fn f() -[IO]> i64 { g() } fn main() { f() }'
-# Happy: unannotated functions skip effect checking (backward compat)
+# --- Happy: multiple calls with different effects (all within caller's set) ---
+run_test_no_err "eff_multi_call" "42" 'fn a() -[IO]> i64 { 21 } fn b() -[Log]> i64 { 21 } fn f() -[IO, Log]> i64 { a() + b() } fn main() { f() }'
+# --- Happy: unannotated (backward compat, no effect checking) ---
 run_test2 "eff_unann_ok" "42" 'fn g() -[IO]> i64 { 42 } fn main() -> i64 { g() }'
+run_test2 "eff_unann_chain" "42" 'fn h() -[IO]> i64 { 42 } fn g() -> i64 { h() } fn main() -> i64 { g() }'
+# --- Happy: chain of effectful functions ---
+run_test_no_err "eff_chain" "42" 'fn c() -[IO]> i64 { 42 } fn b() -[IO]> i64 { c() } fn a() -[IO]> i64 { b() } fn main() { a() }'
+# --- Happy: effectful function in different positions ---
+run_test_no_err "eff_in_if" "42" 'fn g() -[IO]> i64 { 42 } fn f() -[IO]> i64 { if true { g() } else { 0 } } fn main() { f() }'
+run_test_no_err "eff_in_let" "42" 'fn g() -[IO]> i64 { 42 } fn f() -[IO]> i64 { let x = g() x } fn main() { f() }'
+run_test_no_err "eff_in_while" "42" 'fn g() -[IO]> i64 { 42 } fn f() -[IO]> i64 { let mut x = 0 while x == 0 { x = g() } x } fn main() { f() }'
+run_test_no_err "eff_in_match" "42" 'fn g() -[IO]> i64 { 42 } fn f() -[IO]> i64 { match 1 { _ -> g() } } fn main() { f() }'
+# --- Sad: pure calling effectful ---
+run_test_err "eff_pure_call_eff" "effect not available" 'fn g() -[IO]> i64 { 42 } fn f() -> i64 { g() } fn main() { f() }'
+# --- Sad: effectful calling function with MORE effects ---
+run_test_err "eff_missing_one" "effect not available" 'fn g() -[IO, Log]> i64 { 42 } fn f() -[IO]> i64 { g() } fn main() { f() }'
+run_test_err "eff_missing_all" "effect not available" 'fn g() -[IO]> i64 { 42 } fn f() -[Log]> i64 { g() } fn main() { f() }'
+# --- Sad: pure calling multi-effect ---
+run_test_err "eff_pure_call_multi" "effect not available" 'fn g() -[IO, Log]> i64 { 42 } fn f() -> i64 { g() } fn main() { f() }'
+# --- Sad: empty effect set calling single effect ---
+run_test_err "eff_empty_call_eff" "effect not available" 'fn g() -[IO]> i64 { 42 } fn f() -[]> i64 { g() } fn main() { f() }'
+# --- Property: effect subset is reflexive (A ⊆ A) ---
+run_test_no_err "eff_prop_reflex" "42" 'fn g() -[IO]> i64 { 42 } fn f() -[IO]> i64 { g() } fn main() { f() }'
+run_test_no_err "eff_prop_reflex2" "42" 'fn g() -[IO, Log]> i64 { 42 } fn f() -[IO, Log]> i64 { g() } fn main() { f() }'
+# --- Property: pure is subtype of everything ---
+run_test_no_err "eff_prop_pure_sub" "42" 'fn g() -> i64 { 42 } fn f() -[IO]> i64 { g() } fn main() { f() }'
+run_test_no_err "eff_prop_pure_sub2" "42" 'fn g() -> i64 { 42 } fn f() -[IO, Log, Net]> i64 { g() } fn main() { f() }'
+# --- Adversarial: same effect name repeated in annotation ---
+run_test2 "eff_adv_dup" "42" 'fn f() -[IO, IO]> i64 { 42 } fn main() -> i64 { f() }'
+# --- Adversarial: effect with params (future-proof — currently just names) ---
+run_test2 "eff_adv_long_name" "42" 'fn f() -[VeryLongEffectNameThatIsUnusuallyLong]> i64 { 42 } fn main() -> i64 { f() }'
+# --- Wicked: transitive purity through unannotated intermediary ---
+# g is effectful, h is unannotated (calls g without checking), f is pure (calls h)
+# h is unannotated so no checking happens there — the effect "leaks" through
+run_test2 "eff_wicked_leak" "42" 'fn g() -[IO]> i64 { 42 } fn h() -> i64 { g() } fn f() -> i64 { h() } fn main() -> i64 { f() }'
+# --- Wicked: recursive effectful function ---
+run_test_no_err "eff_wicked_recursive" "120" 'fn fact(n: i64) -[IO]> i64 { if n <= 1 { return 1 } n * fact(n - 1) } fn main() { fact(5) }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
