@@ -1135,6 +1135,47 @@ run_test2 "eff_adv_long_name" "42" 'fn f() -[VeryLongEffectNameThatIsUnusuallyLo
 run_test2 "eff_wicked_leak" "42" 'fn g() -[IO]> i64 { 42 } fn h() -> i64 { g() } fn f() -> i64 { h() } fn main() -> i64 { f() }'
 # --- Wicked: recursive effectful function ---
 run_test_no_err "eff_wicked_recursive" "120" 'fn fact(n: i64) -[IO]> i64 { if n <= 1 { return 1 } n * fact(n - 1) } fn main() { fact(5) }'
+# ═══════════════════════════════════════════════════════════════
+# 40. CLOSURES / LAMBDAS — comprehensive
+# ═══════════════════════════════════════════════════════════════
+# --- Happy path: basic lambda ---
+run_test2 "lam_const" "42" 'fn main() -> i64 { let f = x => 42 f(0) }'
+run_test2 "lam_identity" "42" 'fn main() -> i64 { let f = x => x f(42) }'
+run_test2 "lam_add1" "42" 'fn main() -> i64 { let f = x => x + 1 f(41) }'
+run_test2 "lam_arith" "42" 'fn main() -> i64 { let f = x => x * 2 + 2 f(20) }'
+run_test2 "lam_zero" "0" 'fn main() -> i64 { let f = x => 0 f(99) }'
+run_test2 "lam_255" "255" 'fn main() -> i64 { let f = x => 255 f(0) }'
+# --- Happy: closure captures ---
+run_test2 "lam_cap_one" "42" 'fn main() -> i64 { let a = 10 let f = x => x + a f(32) }'
+run_test2 "lam_cap_two" "42" 'fn main() -> i64 { let a = 10 let b = 20 let f = x => x + a + b f(12) }'
+run_test2 "lam_cap_three" "42" 'fn main() -> i64 { let a = 1 let b = 2 let c = 3 let f = x => x + a + b + c f(36) }'
+run_test2 "lam_cap_nested" "42" 'fn main() -> i64 { let a = 10 let b = 20 let f = x => { let r = x + a r + b } f(12) }'
+# --- Happy: passing closures as arguments ---
+run_test2 "lam_pass" "42" 'fn apply(f: i64, x: i64) -> i64 { f(x) } fn main() -> i64 { let g = x => x * 2 apply(g, 21) }'
+run_test2 "lam_pass_cap" "42" 'fn apply(f: i64, x: i64) -> i64 { f(x) } fn main() -> i64 { let off = 10 let g = x => x + off apply(g, 32) }'
+run_test2 "lam_pass_inline" "42" 'fn apply(f: i64, x: i64) -> i64 { f(x) } fn main() -> i64 { apply(x => x + 1, 41) }'
+# --- Happy: multiple calls to same closure ---
+run_test2 "lam_multi_call" "43" 'fn main() -> i64 { let f = x => x + 1 f(20) + f(21) }'
+# --- Happy: closure in if/else ---
+run_test2 "lam_in_if" "42" 'fn main() -> i64 { let f = if true { x => 42 } else { x => 0 } f(0) }'
+# --- Happy: closure in let chain ---
+run_test2 "lam_let_chain" "42" 'fn main() -> i64 { let a = 10 let f = x => x + a let b = f(12) let g = y => y + b g(20) }'
+# --- Happy: control flow inside lambda ---
+run_test2 "lam_if_body" "42" 'fn main() -> i64 { let f = x => if x > 10 { 42 } else { 0 } f(20) }'
+run_test2 "lam_while_body" "42" 'fn main() -> i64 { let f = n => { let mut i = 0 while i < n { i = i + 1 } i } f(42) }'
+run_test2 "lam_return" "42" 'fn main() -> i64 { let f = x => { if x > 10 { return 42 } x } f(20) }'
+run_test2 "lam_break" "42" 'fn main() -> i64 { let f = x => { let mut i = 0 while i < 100 { if i == x { break } i = i + 1 } i } f(42) }'
+# --- Happy: closure capturing closure ---
+run_test2 "lam_cap_lam" "42" 'fn apply(f: i64, x: i64) -> i64 { f(x) } fn main() -> i64 { let add = a => b => a + b let add10 = apply(add, 10) apply(add10, 32) }'
+# --- Sad paths ---
+# (none for closures in bootstrap — no type checking of lambda params yet)
+# --- Adversarial ---
+run_test2 "lam_adv_many_caps" "42" 'fn main() -> i64 { let a = 1 let b = 2 let c = 3 let d = 4 let e = 5 let g = 6 let h = 7 let i = 8 let f = x => x + a + b + c + d + e + g + h + i f(6) }'
+run_test2 "lam_adv_deep" "42" 'fn a3(f: i64, x: i64) -> i64 { f(x) } fn a2(f: i64, x: i64) -> i64 { a3(f, x) } fn a1(f: i64, x: i64) -> i64 { a2(f, x) } fn main() -> i64 { a1(x => x + 1, 41) }'
+# --- Property: capture preserves value ---
+run_test2 "lam_prop_value" "42" 'fn main() -> i64 { let mut x = 42 let f = y => x x = 99 f(0) }'
+# --- Property: multiple calls return same result ---
+run_test2 "lam_prop_consistent" "1" 'fn main() -> i64 { let f = x => x + 1 if f(5) == f(5) { 1 } else { 0 } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""

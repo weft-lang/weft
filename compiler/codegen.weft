@@ -867,6 +867,7 @@ fn cg_expr_high(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -
     25 -> cg_return(node, code, scope, src, ctr, fm)
     26 -> cg_break(node, code, ctr, fm)
     27 -> cg_continue(node, code, ctr, fm)
+    29 -> cg_lambda(node, code, scope, src, ctr, fm)
     _ -> cg_int(node_new(1, 0, 0, 0, 0), code, ctr)
   }
 }
@@ -913,6 +914,191 @@ fn cg_continue(node: i64, code: i64, ctr: i64, fm: i64) -> i64 {
     eprint("error: continue outside of loop\n")
   }
   cg_int(node_new(1, 0, 0, 0, 0), code, ctr)
+}
+
+-- ======================================================================
+-- Free variable analysis for closures
+-- ======================================================================
+-- Walk AST, find Ident nodes not bound in lambda_scope, add to free_vars list.
+-- lambda_scope contains only the lambda's own params (not enclosing scope).
+-- Check if ident is a free var (not in lambda scope, not already in free_vars)
+fn ffv_check_ident(node: i64, ls: i64, src: i64, fv: i64) -> i64 {
+  let ns = node_f1(node)
+  let nl = node_f2(node)
+  let reg = scope_lookup(ls, src, ns, nl)
+  if reg == 0 - 999 {
+    let mut found = false
+    let mut i = 0
+    while i < nlist_len(fv) {
+      let e = nlist_get(fv, i)
+      if node_f2(e) == nl {
+        if src_eq_at(src, ns, src + node_f1(e), 0, nl) == 1 { found = true i = nlist_len(fv) }
+        else { i = i + 1 }
+      } else { i = i + 1 }
+    }
+    if not found { nlist_add(fv, node_new(2, ns, nl, 0, 0)) } else { 0 }
+  } else { 0 }
+}
+
+-- Walk AST using a worklist (iterative, avoids stack overflow)
+fn find_free_vars(node: i64, ls: i64, src: i64, fv: i64) -> i64 {
+  let work = nlist_new()
+  nlist_add(work, node)
+  let mut wi = 0
+  while wi < nlist_len(work) {
+    let n = nlist_get(work, wi)
+    wi = wi + 1
+    if n == 0 { 0 }
+    else {
+      let tag = node_tag(n)
+      if tag == 2 { ffv_check_ident(n, ls, src, fv) }
+      else { if tag == 3 { nlist_add(work, node_f2(n)) nlist_add(work, node_f3(n)) }
+      else { if tag == 4 { find_free_vars_list(node_f3(n), node_f4(n), ls, src, fv) }
+      else { if tag == 5 { nlist_add(work, node_f1(n)) nlist_add(work, node_f2(n)) if node_f3(n) != 0 { nlist_add(work, node_f3(n)) } else { 0 } }
+      else { if tag == 6 { nlist_add(work, node_f3(n)) nlist_add(work, node_f4(n)) }
+      else { if tag == 7 { nlist_add(work, node_f1(n)) if node_f2(n) != 0 { nlist_add(work, node_f2(n)) } else { 0 } }
+      else { if tag == 10 { nlist_add(work, node_f1(n)) nlist_add(work, node_f2(n)) }
+      else { if tag == 11 { nlist_add(work, node_f3(n)) nlist_add(work, node_f4(n)) }
+      else { if tag == 12 { nlist_add(work, node_f3(n)) }
+      else { if tag == 15 { nlist_add(work, node_f1(n)) find_free_vars_match(node_f2(n), node_f3(n), ls, src, fv) }
+      else { if tag == 22 { nlist_add(work, node_f1(n)) }
+      else { if tag == 25 { nlist_add(work, node_f1(n)) }
+      else { 0 } } } } } } } } } } } }
+    }
+  }
+  0
+}
+
+fn find_free_vars_list(args: i64, n: i64, scope: i64, src: i64, fv: i64) -> i64 {
+  let mut i = 0
+  while i < n { find_free_vars(nlist_get(args, i), scope, src, fv) i = i + 1 }
+  0
+}
+
+fn find_free_vars_match(arms: i64, n: i64, scope: i64, src: i64, fv: i64) -> i64 {
+  let mut i = 0
+  while i < n {
+    let arm = nlist_get(arms, i)
+    find_free_vars(node_f2(arm), scope, src, fv)
+    i = i + 1
+  }
+  0
+}
+
+-- ======================================================================
+-- Lambda codegen
+-- ======================================================================
+fn cg_lambda(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
+  let params = node_f1(node)
+  let body = node_f2(node)
+  let nparams = node_f3(node)
+  -- Build lambda scope with just the params (for free var analysis)
+  let mut lambda_scope = scope_new()
+  let mut pi = 0
+  while pi < nparams {
+    let p = nlist_get(params, pi)
+    lambda_scope = scope_push(lambda_scope, node_f1(p), node_f2(p), pi + 1)
+    pi = pi + 1
+  }
+  -- Find free variables
+  let free_vars = nlist_new()
+  find_free_vars(body, lambda_scope, src, free_vars)
+  let nfree = nlist_len(free_vars)
+  -- Emit B to skip over lambda body
+  let skip_pos = buf_len(code)
+  bu32(code, 0)
+  -- Compile lambda body as anonymous function
+  let lambda_start = buf_len(code)
+  emit_prologue(code)
+  -- Set up scope: load captures from env_ptr (x0), params from x1..xN
+  let mut body_scope = scope_new()
+  -- Load captures from env (x0)
+  let mut ci = 0
+  let mut body_ctr = nparams
+  while ci < nfree {
+    let fv = nlist_get(free_vars, ci)
+    -- LDR capture from [x0 + ci*8] into a register
+    let cap_reg = body_ctr + 19
+    if body_ctr < 8 {
+      bu32(code, cg_ldr(cap_reg, 0, ci * 8))
+    } else {
+      bu32(code, cg_ldr(17, 0, ci * 8))
+      emit_store_reg(code, body_ctr, 17)
+    }
+    body_scope = scope_push(body_scope, node_f1(fv), node_f2(fv), reg_id(body_ctr))
+    body_ctr = body_ctr + 1
+    ci = ci + 1
+  }
+  -- Set up explicit params from x1..xN (shifted by 1 for env_ptr in x0)
+  let mut param_i = 0
+  while param_i < nparams {
+    let p = nlist_get(params, param_i)
+    let src_reg = param_i + 1
+    if param_i < 7 {
+      let dst_reg = reg_phys(body_ctr)
+      bu32(code, encode_add_imm(dst_reg, src_reg, 0))
+      body_scope = scope_push(body_scope, node_f1(p), node_f2(p), dst_reg)
+    } else {
+      emit_store_reg(code, body_ctr, src_reg)
+      body_scope = scope_push(body_scope, node_f1(p), node_f2(p), reg_id(body_ctr))
+    }
+    body_ctr = body_ctr + 1
+    param_i = param_i + 1
+  }
+  -- Compile body
+  let body_result = cg_expr(body, code, body_scope, src, body_ctr, fm)
+  let result_phys = emit_load_reg(code, body_result - 1)
+  bu32(code, encode_add_imm(0, result_phys, 0))
+  emit_epilogue(code)
+  -- Patch B skip
+  let after_lambda = buf_len(code)
+  cg_patch_b(code, skip_pos, after_lambda)
+  -- Now at the closure creation site:
+  -- 1. Compute fn_ptr via ADR (PC-relative, ASLR-safe)
+  let adr_pos = buf_len(code)
+  let adr_off = lambda_start - adr_pos
+  bu32(code, encode_adr(17, adr_off))
+  -- 2. Allocate closure pair: [fn_ptr, env_ptr]
+  emit_mov_imm(code, 0, 16)
+  bu32(code, encode_add_imm(16, 28, 0))
+  bu32(code, encode_add_reg(28, 28, 0))
+  -- x16 = closure pointer. Store fn_ptr at [x16, 0]
+  bu32(code, cg_str(17, 16, 0))
+  -- 3. Build environment (if captures)
+  if nfree > 0 {
+    let env_size = nfree * 8
+    emit_mov_imm(code, 0, env_size)
+    bu32(code, encode_add_imm(17, 28, 0))
+    bu32(code, encode_add_reg(28, 28, 0))
+    -- x17 = env pointer. Store captures.
+    let mut ei = 0
+    while ei < nfree {
+      let fv = nlist_get(free_vars, ei)
+      -- Load captured value from ENCLOSING scope
+      let enc_reg = scope_lookup(scope, src, node_f1(fv), node_f2(fv))
+      let enc_phys = if enc_reg < 0 {
+        let slot = 0 - enc_reg - 1
+        bu32(code, cg_ldr(9, 31, slot * 8))
+        9
+      } else { enc_reg }
+      -- Store into env at offset ei*8
+      bu32(code, cg_str(enc_phys, 17, ei * 8))
+      ei = ei + 1
+    }
+    -- Store env_ptr at [closure, 8]
+    bu32(code, cg_str(17, 16, 8))
+  } else {
+    -- No captures: store 0 as env_ptr
+    emit_mov_imm(code, 17, 0)
+    bu32(code, cg_str(17, 16, 8))
+  }
+  -- Move closure pointer to result register
+  if ctr < 8 {
+    bu32(code, encode_add_imm(ctr + 19, 16, 0))
+  } else {
+    emit_store_reg(code, ctr, 16)
+  }
+  ctr + 1
 }
 
 fn cg_not(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
@@ -1192,17 +1378,55 @@ fn cg_call(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64
   let tt = fmap_get_tt(fm)
   let tag_hash = if tt > 0 { ttable_find_variant(tt, src, ns, nl) } else { 0 - 1 }
   if tag_hash >= 0 {
-    -- Variant constructor: allocate 16 bytes, store [tag_hash, payload]
     cg_variant_init(code, scope, src, ctr, fm, tag_hash, args, nargs)
   } else {
-    -- Normal call
-    let c = cg_call_args(args, nargs, code, scope, src, ctr, fm, 0)
-    if is_intrinsic(src, ns, nl) == 1 {
-      cg_intrinsic(code, src, ns, nl, c)
+    -- Check: is this a closure variable? (scope has it, fmap doesn't)
+    let var_reg = scope_lookup(scope, src, ns, nl)
+    let fn_off = fmap_lookup(fm, src, ns, nl)
+    if var_reg != 0 - 999 {
+      if fn_off == 0 {
+        -- Variable in scope, not in fmap → closure call
+        cg_call_closure(node, code, scope, src, ctr, fm, var_reg)
+      } else {
+        -- Both in scope and fmap (e.g., function param shadowing) → direct call
+        let c = cg_call_args(args, nargs, code, scope, src, ctr, fm, 0)
+        if is_intrinsic(src, ns, nl) == 1 { cg_intrinsic(code, src, ns, nl, c) }
+        else { cg_call_emit(code, src, ns, nl, fm, c) }
+      }
     } else {
-      cg_call_emit(code, src, ns, nl, fm, c)
+      -- Not in scope → direct function call (or forward ref)
+      let c = cg_call_args(args, nargs, code, scope, src, ctr, fm, 0)
+      if is_intrinsic(src, ns, nl) == 1 { cg_intrinsic(code, src, ns, nl, c) }
+      else { cg_call_emit(code, src, ns, nl, fm, c) }
     }
   }
+}
+
+-- Indirect call through closure variable
+fn cg_call_closure(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64, closure_reg: i64) -> i64 {
+  let args = node_f3(node)
+  let nargs = node_f4(node)
+  -- Evaluate args FIRST, starting at ctr+1 to avoid clobbering the closure register
+  let c = cg_call_args(args, nargs, code, scope, src, ctr + 1, fm, 1)
+  -- THEN load closure pointer and extract fn_ptr/env_ptr
+  let closure_phys = if closure_reg < 0 {
+    let slot = 0 - closure_reg - 1
+    bu32(code, cg_ldr(16, 31, slot * 8))
+    16
+  } else { closure_reg }
+  -- Extract fn_ptr: LDR x9, [closure, 0]
+  bu32(code, cg_ldr(9, closure_phys, 0))
+  -- Extract env_ptr → x0
+  bu32(code, cg_ldr(0, closure_phys, 8))
+  -- BLR x9 (indirect call through fn_ptr)
+  bu32(code, encode_blr(9))
+  -- Move result from x0 to destination
+  if c < 8 {
+    bu32(code, encode_add_imm(c + 19, 0, 0))
+  } else {
+    emit_store_reg(code, c, 0)
+  }
+  c + 1
 }
 
 -- Two-phase call arg evaluation:
@@ -1210,8 +1434,8 @@ fn cg_call(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64
 -- Phase 2: move each arg from its register to x0..xN (no BL = no clobber)
 fn cg_call_args(args: i64, nargs: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64, start: i64) -> i64 {
   let results = __bump_alloc(nargs * 8 + 8)
-  -- Phase 1: evaluate args
-  let mut i = start
+  -- Phase 1: evaluate ALL args (always from index 0)
+  let mut i = 0
   let mut c = ctr
   while i < nargs {
     let arg = nlist_get(args, i)
@@ -1219,12 +1443,12 @@ fn cg_call_args(args: i64, nargs: i64, code: i64, scope: i64, src: i64, ctr: i64
     __mem_store64(results + i * 8, c - 1)
     i = i + 1
   }
-  -- Phase 2: move results to x0..xN
-  let mut j = start
+  -- Phase 2: move results to x(start)..x(start+N-1)
+  let mut j = 0
   while j < nargs {
     let result_ctr = __mem_load64(results + j * 8)
     let arg_phys = emit_load_reg(code, result_ctr)
-    bu32(code, encode_add_imm(j, arg_phys, 0))
+    bu32(code, encode_add_imm(j + start, arg_phys, 0))
     j = j + 1
   }
   c
