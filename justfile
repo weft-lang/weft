@@ -36,9 +36,8 @@ bootstrap:
     codesign --remove-signature /tmp/weft_b3 2>/dev/null || true
     if diff <(xxd /tmp/weft_b2) <(xxd /tmp/weft_b3) > /dev/null; then
         echo "✓ weft2 == weft3 (byte-identical)"
-        cp /tmp/weft_b2 ./weft
+        mv /tmp/weft_b2 ./weft
         chmod +x ./weft
-        codesign -s - ./weft 2>/dev/null || true
         echo "✓ Updated ./weft"
     else
         echo "✗ Gate FAILED: weft2 != weft3"
