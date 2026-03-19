@@ -1002,6 +1002,46 @@ run_test2 "td_recovery_runs" "42" 'fn bad( fn main() -> i64 { 42 }'
 run_test2 "td_recovery_runs2" "42" 'fn broken fn main() -> i64 { 42 }'
 # Valid programs still work correctly
 run_test_no_err "td_recovery_valid" "42" 'fn main() -> i64 { 42 }'
+# ═══════════════════════════════════════════════════════════════
+# 37. RETURN STATEMENT
+# ═══════════════════════════════════════════════════════════════
+# Happy: return as last expression (identity)
+run_test2 "ret_basic" "42" 'fn f() -> i64 { return 42 } fn main() -> i64 { f() }'
+# Happy: early return in if branch
+run_test2 "ret_early" "99" 'fn f(x: i64) -> i64 { if x > 10 { return 99 } x + 1 } fn main() -> i64 { f(20) }'
+# Happy: no early return taken
+run_test2 "ret_no_early" "6" 'fn f(x: i64) -> i64 { if x > 10 { return 99 } x + 1 } fn main() -> i64 { f(5) }'
+# Happy: return in nested if
+run_test2 "ret_nested" "1" 'fn classify(n: i64) -> i64 { if n < 0 { return 0 } if n == 0 { return 1 } 2 } fn main() -> i64 { classify(0) }'
+# Happy: return from recursive function
+run_test2 "ret_recursive" "120" 'fn fact(n: i64) -> i64 { if n <= 1 { return 1 } n * fact(n - 1) } fn main() -> i64 { fact(5) }'
+# Happy: return 0 explicitly
+run_test2 "ret_zero" "0" 'fn f() -> i64 { return 0 } fn main() -> i64 { f() }'
+# Happy: return in while loop
+run_test2 "ret_in_loop" "42" 'fn find(target: i64) -> i64 { let mut i = 0 while i < 100 { if i == target { return i } i = i + 1 } 0 - 1 } fn main() -> i64 { find(42) }'
+# ═══════════════════════════════════════════════════════════════
+# 38. BREAK AND CONTINUE
+# ═══════════════════════════════════════════════════════════════
+# Happy: break exits loop
+run_test2 "brk_basic" "42" 'fn main() -> i64 { let mut i = 0 while i < 100 { if i == 42 { break } i = i + 1 } i }'
+# Happy: break on first iteration
+run_test2 "brk_first" "0" 'fn main() -> i64 { let mut i = 0 while i < 10 { break i = i + 1 } i }'
+# Happy: break in nested if
+run_test2 "brk_nested_if" "5" 'fn main() -> i64 { let mut i = 0 while i < 100 { i = i + 1 if i > 3 { if i == 5 { break } } else { 0 } } i }'
+# Happy: continue skips iteration
+run_test2 "cont_basic" "9" 'fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 10 { i = i + 1 if i == 5 { continue } s = s + 1 } s }'
+# Happy: continue on all iterations (infinite loop guard)
+run_test2 "cont_sum_even" "30" 'fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 10 { i = i + 1 if i - i / 2 * 2 != 0 { continue } s = s + i } s }'
+# Happy: break from inner loop only
+run_test2 "brk_inner" "10" 'fn main() -> i64 { let mut total = 0 let mut i = 0 while i < 5 { let mut j = 0 while j < 10 { if j == 2 { break } j = j + 1 total = total + 1 } i = i + 1 } total }'
+# Happy: continue in inner loop
+run_test2 "cont_inner" "45" 'fn main() -> i64 { let mut total = 0 let mut i = 0 while i < 5 { let mut j = 0 while j < 10 { j = j + 1 if j == 3 { continue } total = total + 1 } i = i + 1 } total }'
+# Happy: break + continue in same loop
+run_test2 "brk_cont_combo" "8" 'fn main() -> i64 { let mut s = 0 let mut i = 0 while i < 20 { i = i + 1 if i == 10 { break } if i == 5 { continue } s = s + 1 } s }'
+# Sad: break outside loop (error)
+run_test_err "brk_outside" "break outside" 'fn main() -> i64 { break 42 }'
+# Sad: continue outside loop (error)
+run_test_err "cont_outside" "continue outside" 'fn main() -> i64 { continue 42 }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
