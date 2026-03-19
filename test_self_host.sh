@@ -977,6 +977,31 @@ run_test2 "td_cont_fn_nl" "42" "$(printf 'fn f() -> i64 { 42 }\nfn main() -> i64
 run_test2 "td_cont_nested_else" "3" "$(printf 'fn main() -> i64 {\n  if false { 1 }\n  else {\n    if false { 2 }\n    else { 3 }\n  }\n}')"
 # Happy: match with arms on separate lines
 run_test2 "td_cont_match" "42" "$(printf 'fn main() -> i64 {\n  match 2 {\n    1 -> 10\n    2 -> 42\n    _ -> 0\n  }\n}')"
+# ═══════════════════════════════════════════════════════════════
+# 35. SOURCE SPANS ON ERROR MESSAGES
+# ═══════════════════════════════════════════════════════════════
+# Undefined variable errors include line:col
+run_test_err "td_span_undef" "line 1, col" 'fn main() -> i64 { y }'
+# Type errors include line:col
+run_test_err "td_span_arith" "line 1, col" 'fn f(s: str) -> i64 { s + 1 } fn main() -> i64 { f("x") }'
+# Return type mismatch includes line:col
+run_test_err "td_span_ret" "line 1, col" 'fn f() -> i64 { "hello" } fn main() -> i64 { f() }'
+# Arg type mismatch includes line:col
+run_test_err "td_span_arg" "line 1, col" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { f("hi") }'
+# Multi-line: span reports correct line number
+run_test_err "td_span_line2" "line 2" "$(printf 'fn main() -> i64 {\n  y\n}')"
+# ═══════════════════════════════════════════════════════════════
+# 36. PARSER ERROR RECOVERY
+# ═══════════════════════════════════════════════════════════════
+# Recovery: malformed fn with ( but no matching ) — syncs to next fn
+run_test_err "td_recovery_bad_paren" "expected" 'fn bad( fn main() -> i64 { 42 }'
+# Recovery: fn without ( — syncs to next fn
+run_test_err "td_recovery_no_paren" "expected" 'fn broken fn main() -> i64 { 42 }'
+# Recovery: program after bad fn produces correct output
+run_test2 "td_recovery_runs" "42" 'fn bad( fn main() -> i64 { 42 }'
+run_test2 "td_recovery_runs2" "42" 'fn broken fn main() -> i64 { 42 }'
+# Valid programs still work correctly
+run_test_no_err "td_recovery_valid" "42" 'fn main() -> i64 { 42 }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
