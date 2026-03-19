@@ -1042,6 +1042,27 @@ run_test2 "brk_cont_combo" "8" 'fn main() -> i64 { let mut s = 0 let mut i = 0 w
 run_test_err "brk_outside" "break outside" 'fn main() -> i64 { break 42 }'
 # Sad: continue outside loop (error)
 run_test_err "cont_outside" "continue outside" 'fn main() -> i64 { continue 42 }'
+# ═══════════════════════════════════════════════════════════════
+# 39. EFFECT TYPE ANNOTATIONS
+# ═══════════════════════════════════════════════════════════════
+# Happy: plain function (no effect annotation)
+run_test2 "eff_plain" "42" 'fn main() -> i64 { 42 }'
+# Happy: effect-annotated function compiles
+run_test2 "eff_io" "42" 'fn f() -[IO]> i64 { 42 } fn main() -> i64 { f() }'
+# Happy: multiple effects
+run_test2 "eff_multi" "42" 'fn f() -[IO, Log]> i64 { 42 } fn main() -> i64 { f() }'
+# Happy: effectful calling same effects
+run_test_no_err "eff_same" "42" 'fn g() -[IO]> i64 { 42 } fn f() -[IO]> i64 { g() } fn main() { f() }'
+# Happy: effectful calling subset (more effects available)
+run_test_no_err "eff_superset" "42" 'fn g() -[IO]> i64 { 42 } fn f() -[IO, Log]> i64 { g() } fn main() { f() }'
+# Happy: pure calling pure
+run_test_no_err "eff_pure_pure" "42" 'fn g() -> i64 { 42 } fn f() -> i64 { g() } fn main() { f() }'
+# Sad: explicitly pure function calling effectful
+run_test_err "eff_pure_call_eff" "effect not available" 'fn g() -[IO]> i64 { 42 } fn f() -> i64 { g() } fn main() { f() }'
+# Sad: effectful calling function with MORE effects than available
+run_test_err "eff_missing" "effect not available" 'fn g() -[IO, Log]> i64 { 42 } fn f() -[IO]> i64 { g() } fn main() { f() }'
+# Happy: unannotated functions skip effect checking (backward compat)
+run_test2 "eff_unann_ok" "42" 'fn g() -[IO]> i64 { 42 } fn main() -> i64 { g() }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
