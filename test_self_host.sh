@@ -1176,6 +1176,26 @@ run_test2 "lam_adv_deep" "42" 'fn a3(f: i64, x: i64) -> i64 { f(x) } fn a2(f: i6
 run_test2 "lam_prop_value" "42" 'fn main() -> i64 { let mut x = 42 let f = y => x x = 99 f(0) }'
 # --- Property: multiple calls return same result ---
 run_test2 "lam_prop_consistent" "1" 'fn main() -> i64 { let f = x => x + 1 if f(5) == f(5) { 1 } else { 0 } }'
+# --- Multi-param lambdas ---
+run_test2 "mlam_two" "42" 'fn main() -> i64 { let f = (x, y) => x + y f(20, 22) }'
+run_test2 "mlam_three" "42" 'fn main() -> i64 { let f = (a, b, c) => a + b + c f(10, 20, 12) }'
+run_test2 "mlam_zero" "42" 'fn main() -> i64 { let f = () => 42 f() }'
+run_test2 "mlam_four" "100" 'fn main() -> i64 { let f = (a, b, c, d) => a + b + c + d f(10, 20, 30, 40) }'
+# --- Multi-param with captures ---
+run_test2 "mlam_cap" "42" 'fn main() -> i64 { let off = 2 let f = (x, y) => x + y + off f(20, 20) }'
+# --- Multi-param passed as argument ---
+run_test2 "mlam_pass" "42" 'fn apply2(f: i64, a: i64, b: i64) -> i64 { f(a, b) } fn main() -> i64 { apply2((x, y) => x + y, 20, 22) }'
+# --- Grouped expression still works (regression) ---
+run_test2 "mlam_group" "42" 'fn main() -> i64 { (40 + 2) }'
+run_test2 "mlam_group_nested" "42" 'fn main() -> i64 { ((21 * 2)) }'
+# --- Disambiguation: (x) is grouped expr, not 1-param lambda (no =>) ---
+run_test2 "mlam_disambig" "42" 'fn main() -> i64 { let x = 42 (x) }'
+# --- Typed multi-param lambda ---
+run_test2 "mlam_typed" "42" 'fn main() -> i64 { let f = (x: i64, y: i64) => x + y f(20, 22) }'
+# --- Zero-param lambda with block body ---
+run_test2 "mlam_zero_block" "42" 'fn main() -> i64 { let f = () => { let x = 40 x + 2 } f() }'
+# --- Multi-param with control flow ---
+run_test2 "mlam_control" "42" 'fn main() -> i64 { let f = (x, y) => if x > y { x } else { y } f(42, 10) }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
