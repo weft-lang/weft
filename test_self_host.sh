@@ -1260,6 +1260,57 @@ run_test2 "gen_call_mono" "42" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { f<i
 # --- Happy: comparison still works (< disambiguation) ---
 run_test2 "gen_cmp_ok" "42" 'fn main() -> i64 { if 1 < 2 { 42 } else { 0 } }'
 run_test2 "gen_cmp_chain" "42" 'fn main() -> i64 { let x = 10 if x < 100 { 42 } else { 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 43. FUNCTION TYPE ANNOTATIONS — comprehensive
+# ═══════════════════════════════════════════════════════════════
+# --- Happy: basic function type params ---
+run_test2 "fntype_basic" "42" 'fn apply(f: (i64) -> i64, x: i64) -> i64 { f(x) } fn main() -> i64 { apply(x => x + 1, 41) }'
+run_test2 "fntype_multi" "42" 'fn ap2(f: (i64, i64) -> i64, a: i64, b: i64) -> i64 { f(a, b) } fn main() -> i64 { ap2((x, y) => x + y, 20, 22) }'
+run_test2 "fntype_empty" "42" 'fn call(f: () -> i64) -> i64 { f() } fn main() -> i64 { call(() => 42) }'
+# --- Happy: effectful function type ---
+run_test2 "fntype_effect" "42" 'fn apply(f: (i64) -[IO]> i64, x: i64) -> i64 { f(x) } fn main() -> i64 { apply(x => x + 1, 41) }'
+# --- Happy: generic with function type param ---
+run_test2 "fntype_generic" "42" 'fn apply<T, U>(f: (T) -> U, x: T) -> U { f(x) } fn main() -> i64 { apply(x => x + 1, 41) }'
+run_test2 "fntype_gen_typed" "42" 'fn apply<T, U>(f: (T) -> U, x: T) -> U { f(x) } fn main() -> i64 { apply<i64, i64>(x => x + 1, 41) }'
+# --- Happy: grouped type (single type in parens) still works ---
+run_test2 "fntype_grouped" "42" 'fn f(x: (i64)) -> i64 { x } fn main() -> i64 { f(42) }'
+# --- Variant: function type in return position ---
+run_test2 "fntype_ret_pos" "42" 'fn make_adder(n: i64) -> (i64) -> i64 { x => x + n } fn main() -> i64 { let f = make_adder(1) f(41) }'
+# --- Variant: nested function types ---
+run_test2 "fntype_nested" "41" 'fn apply(f: (i64) -> i64, x: i64) -> i64 { f(x) } fn compose(f: (i64) -> i64, g: (i64) -> i64, x: i64) -> i64 { f(g(x)) } fn main() -> i64 { compose(x => x + 1, x => x * 2, 20) }'
+# --- Variant: higher-order (fn taking fn returning fn) ---
+run_test2 "fntype_higher" "42" 'fn twice(f: (i64) -> i64, x: i64) -> i64 { f(f(x)) } fn main() -> i64 { twice(x => x + 1, 40) }'
+# --- Variant: four params in function type ---
+run_test2 "fntype_four" "100" 'fn ap4(f: (i64, i64, i64, i64) -> i64, a: i64, b: i64, c: i64, d: i64) -> i64 { f(a, b, c, d) } fn main() -> i64 { ap4((a, b, c, d) => a + b + c + d, 10, 20, 30, 40) }'
+# --- Sad: function type mismatch (param type not i64) ---
+run_test_err "fntype_sad_param" "argument type mismatch" 'fn f(g: (str) -> i64) -> i64 { g(42) } fn main() -> i64 { f(x => x) }'
+# --- Sad: function type return mismatch ---
+run_test_err "fntype_sad_ret" "return type mismatch" 'fn f(g: (i64) -> str) -> str { g(42) } fn main() -> i64 { 42 }'
+# --- Adversarial: deeply nested function type ---
+run_test2 "fntype_adv_deep" "42" 'fn ap(f: ((i64) -> i64) -> i64, g: (i64) -> i64) -> i64 { f(g) } fn main() -> i64 { ap(f => f(41), x => x + 1) }'
+# --- Adversarial: function type with union return ---
+run_test2 "fntype_adv_union" "42" 'fn f(g: (i64) -> i64 | nil) -> i64 { g(42) } fn main() -> i64 { f(x => x) }'
+# ═══════════════════════════════════════════════════════════════
+# 44. LET TYPE ANNOTATIONS — comprehensive
+# ═══════════════════════════════════════════════════════════════
+# --- Happy: basic let with type ---
+run_test2 "let_type_basic" "42" 'fn main() -> i64 { let x: i64 = 42 x }'
+run_test2 "let_type_str" "3" 'fn main() -> i64 { let s: str = "abc" __str_len(s) }'
+# --- Happy: let mut with type ---
+run_test2 "let_type_mut" "42" 'fn main() -> i64 { let mut x: i64 = 0 x = 42 x }'
+# --- Happy: let with complex type (union) ---
+run_test2 "let_type_union" "42" 'fn main() -> i64 { let x: i64 | str = 42 x }'
+# --- Happy: let with function type ---
+run_test2 "let_type_fn" "42" 'fn main() -> i64 { let f: (i64) -> i64 = x => x + 1 f(41) }'
+# --- Happy: let type doesn't break existing code ---
+run_test2 "let_type_compat" "42" 'fn main() -> i64 { let x = 42 x }'
+# --- Sad: let type annotation mismatch ---
+run_test_err "let_type_sad_str" "value does not match let type annotation" 'fn f(x: str) -> str { let y: i64 = x y } fn main() -> i64 { 42 }'
+run_test_err "let_type_sad_int" "value does not match let type annotation" 'fn main() -> i64 { let x: str = 42 0 }'
+# --- Adversarial: let with nullable type ---
+run_test2 "let_type_adv_null" "42" 'fn main() -> i64 { let x: i64? = 42 x }'
+# --- Adversarial: let with parenthesized type ---
+run_test2 "let_type_adv_paren" "42" 'fn main() -> i64 { let x: (i64) = 42 x }'
 # --- Sad: type var used in arithmetic (checker catches type mismatch) ---
 run_test_err "gen_sad_arith" "arithmetic operand is not i64" 'fn f<T>(x: T) -> T { x + 1 } fn main() -> i64 { f(42) }'
 # --- Sad: type var in return position mismatches i64 ---
