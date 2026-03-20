@@ -1311,10 +1311,18 @@ run_test_err "let_type_sad_int" "value does not match let type annotation" 'fn m
 run_test2 "let_type_adv_null" "42" 'fn main() -> i64 { let x: i64? = 42 x }'
 # --- Adversarial: let with parenthesized type ---
 run_test2 "let_type_adv_paren" "42" 'fn main() -> i64 { let x: (i64) = 42 x }'
+# --- Happy: type checker synthesizes correct return type after substitution ---
+run_test_no_err "gen_tc_ret" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { let r: i64 = id<i64>(42) r }'
 # --- Sad: type var used in arithmetic (checker catches type mismatch) ---
 run_test_err "gen_sad_arith" "arithmetic operand is not i64" 'fn f<T>(x: T) -> T { x + 1 } fn main() -> i64 { f(42) }'
 # --- Sad: type var in return position mismatches i64 ---
 run_test_err "gen_sad_ret" "return type mismatch" 'fn f<T>(x: T) -> i64 { x } fn main() -> i64 { f(42) }'
+# --- Sad: wrong number of type arguments ---
+run_test_err "gen_sad_targ_count" "wrong number of type arguments" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { id<i64, str>(42) }'
+# --- Sad: arg type mismatch after substitution (T=str but pass i64) ---
+run_test_err "gen_sad_arg_subst" "argument type mismatch" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { id<str>(42) }'
+# --- Sad: return type mismatch after substitution (T=str but fn returns i64) ---
+run_test_err "gen_sad_ret_subst" "return type mismatch" 'fn id<T>(x: T) -> T { x } fn f() -> i64 { id<str>("hi") }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
