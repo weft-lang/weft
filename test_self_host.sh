@@ -1454,6 +1454,52 @@ run_test2 "gtype_adv_mixed" "42" 'type Box<T> { Box(T) } type Plain { Val(i64) }
 # ── Property ──
 run_test2 "gtype_prop_roundtrip" "42" 'type Box<T> { Box(T) } fn main() -> i64 { let x = 42 match Box(x) { Box(y) -> y } }'
 run_test2 "gtype_prop_some" "42" 'type Option<T> { Some(T), None } fn main() -> i64 { match Some(42) { Some(v) -> v None -> 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 47. REGRESSION: bare constructors, no-payload variants, record disambig
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Bare no-payload constructors in expression position ──
+run_test2 "bare_none_expr" "0" 'type O<T> { Some(T), None } fn main() -> i64 { match None { Some(v) -> v None -> 0 } }'
+run_test2 "bare_nil_expr" "99" 'type L<T> { Nil, Cons(T) } fn main() -> i64 { match Nil { Cons(v) -> v Nil -> 99 } }'
+run_test2 "bare_multi_ctor" "2" 'type Color { Red, Green, Blue } fn main() -> i64 { match Green { Red -> 1 Green -> 2 Blue -> 3 } }'
+run_test2 "bare_first_arm" "1" 'type Color { Red, Green, Blue } fn main() -> i64 { match Red { Red -> 1 Green -> 2 Blue -> 3 } }'
+run_test2 "bare_last_arm" "3" 'type Color { Red, Green, Blue } fn main() -> i64 { match Blue { Red -> 1 Green -> 2 Blue -> 3 } }'
+# Bare constructor passed as argument
+run_test2 "bare_as_arg" "1" 'type O<T> { Some(T), None } fn is_none(x: i64) -> i64 { match x { None -> 1 _ -> 0 } } fn main() -> i64 { is_none(None) }'
+# Bare constructor in if branch
+run_test2 "bare_in_if" "99" 'type O<T> { Some(T), None } fn main() -> i64 { let x = if true { None } else { Some(1) } match x { Some(v) -> v None -> 99 } }'
+# Bare constructor in let binding
+run_test2 "bare_in_let" "99" 'type O<T> { Some(T), None } fn main() -> i64 { let x = None match x { Some(v) -> v None -> 99 } }'
+# Bare constructor returned from function
+run_test2 "bare_from_fn" "99" 'type O<T> { Some(T), None } fn make_none() -> i64 { None } fn main() -> i64 { match make_none() { Some(v) -> v None -> 99 } }'
+#
+# ── No-payload variant sentinel (emit_mov_imm -1 bug) ──
+# Multiple no-payload variants in same type
+run_test2 "nopay_multi" "42" 'type T { A, B, C(i64) } fn main() -> i64 { match C(42) { A -> 0 B -> 0 C(v) -> v } }'
+# No-payload then payload in sequence
+run_test2 "nopay_sequence" "42" 'type O<T> { Some(T), None } fn main() -> i64 { let a = None let b = Some(42) match a { Some(v) -> 0 None -> match b { Some(v) -> v None -> 0 } } }'
+# No-payload in a loop
+run_test2 "nopay_loop" "5" 'type O<T> { Some(T), None } fn main() -> i64 { let mut count = 0 let mut i = 0 while i < 10 { let x = if i < 5 { None } else { Some(1) } match x { Some(v) -> { count = count + v } None -> { 0 } } i = i + 1 } count }'
+#
+# ── Record literal disambiguation (UpperCase { peek for : ) ──
+# match with bare uppercase scrutinee + arms block
+run_test2 "disambig_match" "42" 'type X { A, B } fn main() -> i64 { match A { A -> 42 B -> 0 } }'
+# Record literal still works alongside
+run_test2 "disambig_record" "42" 'type Point { x: i64, y: i64 } fn main() -> i64 { let p = Point { x: 20, y: 22 } p.x + p.y }'
+# Match with uppercase scrutinee that IS a variable (not a constructor)
+run_test2 "disambig_var" "42" 'fn main() -> i64 { let X = 42 match X { 42 -> 42 _ -> 0 } }'
+# Record + variant in same program (disambiguation works for both)
+run_test2 "disambig_both" "42" 'type Pt { x: i64, y: i64 } type Op<T> { Some(T), None } fn main() -> i64 { let p = Pt { x: 20, y: 22 } match None { Some(v) -> 0 None -> p.x + p.y } }'
+# Nested match with bare constructors
+run_test2 "disambig_nested" "3" 'type O<T> { Some(T), None } fn main() -> i64 { match Some(1) { Some(v) -> match None { Some(w) -> 0 None -> v + 2 } None -> 0 } }'
+#
+# ── Constructor type checking (payload type + tparams) ──
+# Sad: generic constructor arg mismatch detected
+run_test_err "ctor_tc_mismatch" "argument type mismatch" 'type Box<T> { Box(T) } fn main() -> i64 { Box<str>(42) 0 }'
+# Sad: Either<str, i64> Left with wrong arg type
+run_test_err "ctor_tc_either" "argument type mismatch" 'type Either<A, B> { Left(A), Right(B) } fn main() -> i64 { Left<str>("hi") Right<i64>(42) Left<i64>("bad") 0 }'
+# Happy: correct generic constructor doesn't error
+run_test_no_err "ctor_tc_ok" "42" 'type Box<T> { Box(T) } fn main() -> i64 { match Box<i64>(42) { Box(x) -> x } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
