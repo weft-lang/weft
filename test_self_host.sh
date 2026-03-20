@@ -1539,6 +1539,56 @@ run_test_no_err "discharge_adv_loop" "42" 'effect A { fn f() -> i64 } fn go() -[
 run_test_no_err "discharge_prop_chain" "42" 'effect A { fn f() -> i64 } effect B { fn g() -> i64 } fn go() -[A, B]> i64 { 42 } fn main() -> i64 { handle { handle go() { B.g() -> resume(0) } } { A.f() -> resume(0) } }'
 # Discharge same effect twice (nested handles for same effect)
 run_test_no_err "discharge_prop_double" "42" 'effect A { fn f() -> i64 } fn inner() -[A]> i64 { 42 } fn outer() -[A]> i64 { handle inner() { A.f() -> resume(0) } } fn main() -> i64 { handle outer() { A.f() -> resume(0) } }'
+# ═══════════════════════════════════════════════════════════════
+# 49. TRAITS AND IMPL BLOCKS — Phases 1-2
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: trait declaration parsed ──
+run_test2 "trait_decl_parsed" "42" 'trait Display { fn display(self: i64) -> i64 } fn main() -> i64 { 42 }'
+# ── Happy: inherent impl on record type ──
+run_test2 "impl_inherent_record" "42" 'type Point { x: i64, y: i64 } impl Point { fn sum(self: i64) -> i64 { let s = self __mem_load64(s) + __mem_load64(s + 8) } } fn main() -> i64 { let p = Point { x: 30, y: 12 } p.sum() }'
+# ── Happy: inherent impl on primitive (i64) ──
+run_test2 "impl_prim_i64" "42" 'impl i64 { fn answer(self: i64) -> i64 { 42 } } fn main() -> i64 { let x: i64 = 5 x.answer() }'
+# ── Happy: trait impl for primitive ──
+run_test2 "trait_impl_prim" "42" 'trait Greet { fn greet(self: i64) -> i64 } impl Greet for i64 { fn greet(self: i64) -> i64 { 42 } } fn main() -> i64 { let x: i64 = 5 x.greet() }'
+# ── Happy: trait impl for user-defined type ──
+run_test2 "trait_impl_record" "42" 'trait Val { fn val(self: i64) -> i64 } type Box { v: i64 } impl Val for Box { fn val(self: i64) -> i64 { __mem_load64(self) } } fn main() -> i64 { let b = Box { v: 42 } b.val() }'
+# ── Happy: self as value — method uses self ──
+run_test2 "self_value_use" "10" 'impl i64 { fn double(self: i64) -> i64 { self + self } } fn main() -> i64 { let x: i64 = 5 x.double() }'
+# ── Happy: method with additional args ──
+run_test2 "method_extra_args" "42" 'type Box { v: i64 } impl Box { fn add(self: i64, n: i64) -> i64 { __mem_load64(self) + n } } fn main() -> i64 { let b = Box { v: 20 } b.add(22) }'
+# ── Happy: multiple methods in one impl ──
+run_test2 "impl_multi_methods" "42" 'type Pair { a: i64, b: i64 } impl Pair { fn first(self: i64) -> i64 { __mem_load64(self) } fn second(self: i64) -> i64 { __mem_load64(self + 8) } fn sum(self: i64) -> i64 { __mem_load64(self) + __mem_load64(self + 8) } } fn main() -> i64 { let p = Pair { a: 20, b: 22 } p.sum() }'
+# ── Happy: multiple impl blocks with same method name on different types ──
+run_test2 "impl_type_dispatch" "42" 'type Foo { x: i64 } type Bar { y: i64 } impl Foo { fn val(self: i64) -> i64 { __mem_load64(self) } } impl Bar { fn val(self: i64) -> i64 { __mem_load64(self) + 10 } } fn main() -> i64 { let f = Foo { x: 20 } let b = Bar { y: 12 } f.val() + b.val() }'
+# ── Happy: method call chaining ──
+run_test2 "method_chain" "42" 'type W { v: i64 } impl W { fn get(self: i64) -> i64 { __mem_load64(self) } } impl i64 { fn double(self: i64) -> i64 { self + self } fn plus(self: i64, n: i64) -> i64 { self + n } } fn main() -> i64 { let w = W { v: 20 } w.get().double().plus(2) }'
+# ── Happy: method inside conditional ──
+run_test2 "method_in_if" "42" 'type N { v: i64 } impl N { fn val(self: i64) -> i64 { __mem_load64(self) } fn big(self: i64) -> i64 { if __mem_load64(self) > 10 { 1 } else { 0 } } } fn main() -> i64 { let n = N { v: 42 } if n.big() == 1 { n.val() } else { 0 } }'
+# ── Happy: method call inside recursive function ──
+run_test2 "method_recursive" "42" 'impl i64 { fn inc(self: i64) -> i64 { self + 1 } } fn go(x: i64, t: i64) -> i64 { if x >= t { x } else { go(x.inc(), t) } } fn main() -> i64 { go(0, 42) }'
+# ── Happy: method in while loop ──
+run_test2 "method_in_loop" "42" 'impl i64 { fn inc(self: i64) -> i64 { self + 1 } } fn main() -> i64 { let mut x: i64 = 0 while x < 42 { x = x.inc() } x }'
+# ── Happy: effect perform still works alongside impls ──
+run_test2 "effect_with_impl" "42" 'effect C { fn inc() -> i64 } fn u() -> i64 { C.inc() } fn main() -> i64 { handle u() { C.inc() -> resume(42) } }'
+# ── Happy: effect perform and method call in same function ──
+run_test2 "effect_and_method" "42" 'effect C { fn inc() -> i64 } impl i64 { fn pt(self: i64) -> i64 { self + 10 } } fn u() -> i64 { let b = C.inc() b.pt() } fn main() -> i64 { handle u() { C.inc() -> resume(32) } }'
+# ── Happy: method on variant type ──
+run_test2 "method_variant" "42" 'type Shape { Circle(i64) } impl Shape { fn radius(self: i64) -> i64 { __mem_load64(self + 8) } } fn main() -> i64 { let c = Circle(42) c.radius() }'
+# ── Happy: impl for str type ──
+run_test2 "impl_str" "42" 'impl str { fn len42(self: i64) -> i64 { 42 } } fn main() -> i64 { let s = "hello" s.len42() }'
+# ── Happy: method call result used in let binding ──
+run_test2 "method_let_bind" "42" 'impl i64 { fn triple(self: i64) -> i64 { self * 3 } } fn main() -> i64 { let x: i64 = 14 let y = x.triple() y }'
+# ── Happy: method call as function argument ──
+run_test2 "method_as_arg" "42" 'impl i64 { fn dbl(self: i64) -> i64 { self + self } } fn add(a: i64, b: i64) -> i64 { a + b } fn main() -> i64 { let x: i64 = 20 let y: i64 = 11 add(x, y.dbl()) }'
+# ── Happy: method call in match scrutinee ──
+run_test2 "method_in_match" "42" 'impl i64 { fn get(self: i64) -> i64 { self } } fn main() -> i64 { let x: i64 = 42 match x.get() { 42 -> 42 _ -> 0 } }'
+# ── Happy: impl method calling another function ──
+run_test2 "method_calls_fn" "42" 'fn helper(n: i64) -> i64 { n * 2 } impl i64 { fn dbl(self: i64) -> i64 { helper(self) } } fn main() -> i64 { let x: i64 = 21 x.dbl() }'
+# ── Happy: impl method calling another method ──
+run_test2 "method_calls_method" "42" 'impl i64 { fn inc(self: i64) -> i64 { self + 1 } fn inc2(self: i64) -> i64 { self.inc().inc() } } fn main() -> i64 { let x: i64 = 40 x.inc2() }'
+# ── Disambiguation: variable named like a type ──
+run_test2 "disambig_var_type" "42" 'type Foo { x: i64 } impl Foo { fn val(self: i64) -> i64 { __mem_load64(self) } } fn main() -> i64 { let Foo = Foo { x: 42 } Foo.val() }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
