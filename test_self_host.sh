@@ -1500,6 +1500,45 @@ run_test_err "ctor_tc_mismatch" "argument type mismatch" 'type Box<T> { Box(T) }
 run_test_err "ctor_tc_either" "argument type mismatch" 'type Either<A, B> { Left(A), Right(B) } fn main() -> i64 { Left<str>("hi") Right<i64>(42) Left<i64>("bad") 0 }'
 # Happy: correct generic constructor doesn't error
 run_test_no_err "ctor_tc_ok" "42" 'type Box<T> { Box(T) } fn main() -> i64 { match Box<i64>(42) { Box(x) -> x } }'
+# ═══════════════════════════════════════════════════════════════
+# 48. HANDLER DISCHARGE TYPING — comprehensive (effect Phase 3)
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: handle discharges effect — body can use it ──
+# Pure function handles State — no effect error
+run_test_no_err "discharge_basic" "42" 'effect State { fn get() -> i64 } fn go() -[State]> i64 { 42 } fn main() -> i64 { handle go() { State.get() -> resume(0) } }'
+# Pure function handles IO
+run_test_no_err "discharge_io" "42" 'effect MyIO { fn print() -> i64 } fn go() -[MyIO]> i64 { 42 } fn main() -> i64 { handle go() { MyIO.print() -> resume(0) } }'
+# Effectful function handles a DIFFERENT effect
+run_test_no_err "discharge_diff" "42" 'effect A { fn f() -> i64 } effect B { fn g() -> i64 } fn go() -[A]> i64 { 42 } fn main() -[B]> i64 { handle go() { A.f() -> resume(0) } }'
+#
+# ── Sad: effect NOT discharged — should error ──
+# Pure function calls effectful without handle
+run_test_err "discharge_sad_no_handle" "effect not available" 'effect State { fn get() -> i64 } fn go() -[State]> i64 { 42 } fn f() -> i64 { go() } fn main() -> i64 { 42 }'
+# Handle discharges one effect but body has two — second still errors
+run_test_err "discharge_sad_partial" "effect not available" 'effect A { fn f() -> i64 } effect B { fn g() -> i64 } fn go() -[A, B]> i64 { 42 } fn f() -> i64 { handle go() { A.f() -> resume(0) } } fn main() -> i64 { 42 }'
+# Pure function tries to perform effect without handle
+run_test_err "discharge_sad_perform" "effect not available" 'effect State { fn get() -> i64 } fn go() -[State]> i64 { 42 } fn bad() -> i64 { go() } fn main() -> i64 { bad() }'
+#
+# ── Variants: different effect configurations ──
+# Multiple operations in one handler
+run_test_no_err "discharge_multi_op" "42" 'effect State { fn get() -> i64 fn put(v: i64) -> i64 } fn go() -[State]> i64 { 42 } fn main() -> i64 { handle go() { State.get() -> resume(0) State.put(v) -> resume(0) } }'
+# Handle in effectful function — discharges one, keeps the other
+run_test_no_err "discharge_keep" "42" 'effect A { fn f() -> i64 } effect B { fn g() -> i64 } fn go() -[A]> i64 { 42 } fn f() -[B]> i64 { handle go() { A.f() -> resume(0) } } fn main() -[B]> i64 { f() }'
+#
+# ── Adversarial ──
+# Nested handles discharge different effects
+run_test_no_err "discharge_adv_nested" "42" 'effect A { fn f() -> i64 } effect B { fn g() -> i64 } fn go() -[A, B]> i64 { 42 } fn main() -> i64 { handle { handle go() { A.f() -> resume(0) } } { B.g() -> resume(0) } }'
+# Handle wrapping a non-effectful body (no-op but valid)
+run_test_no_err "discharge_adv_noop" "42" 'effect A { fn f() -> i64 } fn main() -> i64 { handle 42 { A.f() -> resume(0) } }'
+# Handle inside a loop
+run_test_no_err "discharge_adv_loop" "42" 'effect A { fn f() -> i64 } fn go() -[A]> i64 { 42 } fn main() -> i64 { let mut r = 0 let mut i = 0 while i < 1 { r = handle go() { A.f() -> resume(42) } i = i + 1 } r }'
+#
+# ── Property: discharge is set-minus ──
+# A function with [A, B] — handle A leaves [B] — handle B leaves [] → pure
+run_test_no_err "discharge_prop_chain" "42" 'effect A { fn f() -> i64 } effect B { fn g() -> i64 } fn go() -[A, B]> i64 { 42 } fn main() -> i64 { handle { handle go() { B.g() -> resume(0) } } { A.f() -> resume(0) } }'
+# Discharge same effect twice (nested handles for same effect)
+run_test_no_err "discharge_prop_double" "42" 'effect A { fn f() -> i64 } fn inner() -[A]> i64 { 42 } fn outer() -[A]> i64 { handle inner() { A.f() -> resume(0) } } fn main() -> i64 { handle outer() { A.f() -> resume(0) } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
