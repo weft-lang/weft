@@ -1323,6 +1323,99 @@ run_test_err "gen_sad_targ_count" "wrong number of type arguments" 'fn id<T>(x: 
 run_test_err "gen_sad_arg_subst" "argument type mismatch" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { id<str>(42) }'
 # --- Sad: return type mismatch after substitution (T=str but fn returns i64) ---
 run_test_err "gen_sad_ret_subst" "return type mismatch" 'fn id<T>(x: T) -> T { x } fn f() -> i64 { id<str>("hi") }'
+# ═══════════════════════════════════════════════════════════════
+# 45. COMPREHENSIVE QUALITY PASS — pathological, wicked, property
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Effect handlers: pathological ──
+# Nested handlers (inner handler shadows outer)
+run_test2 "eff_path_nested" "10" 'effect A { fn get() -> i64 } effect B { fn get() -> i64 } fn go() -> i64 { B.get() } fn main() -> i64 { let ca = __bump_alloc(8) __mem_store64(ca, 99) let cb = __bump_alloc(8) __mem_store64(cb, 10) handle { handle go() { B.get() -> resume(__mem_load64(cb)) } } { A.get() -> resume(__mem_load64(ca)) } }'
+# Handler correctly popped: inner handler doesn't leak
+run_test2 "eff_path_pop" "42" 'effect S { fn get() -> i64 } fn inner() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 99) handle S.get() { S.get() -> resume(__mem_load64(c)) } } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 42) handle { inner() S.get() } { S.get() -> resume(__mem_load64(c)) } }'
+# Many operations in one handler (3 ops)
+run_test2 "eff_path_many_ops" "6" 'effect M { fn a() -> i64 fn b() -> i64 fn c() -> i64 } fn go() -> i64 { M.a() + M.b() + M.c() } fn main() -> i64 { handle go() { M.a() -> resume(1) M.b() -> resume(2) M.c() -> resume(3) } }'
+# Handler in a loop (handler push/pop repeatedly)
+run_test2 "eff_path_loop" "45" 'effect S { fn get() -> i64 } fn main() -> i64 { let mut sum = 0 let mut i = 0 while i < 10 { let c = __bump_alloc(8) __mem_store64(c, i) sum = sum + handle S.get() { S.get() -> resume(__mem_load64(c)) } i = i + 1 } sum }'
+#
+# ── Effect handlers: wicked ──
+# Perform inside a lambda inside a handle
+run_test2 "eff_wicked_lam" "42" 'effect S { fn get() -> i64 } fn apply(f: (i64) -> i64, x: i64) -> i64 { f(x) } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 42) handle { let f = x => S.get() + x apply(f, 0) } { S.get() -> resume(__mem_load64(c)) } }'
+# Perform result used in a match
+run_test2 "eff_wicked_match" "1" 'effect S { fn get() -> i64 } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 42) handle { match S.get() { 42 -> 1 _ -> 0 } } { S.get() -> resume(__mem_load64(c)) } }'
+# Handler clause captures a mutable cell and mutates it across multiple performs
+run_test2 "eff_wicked_accum" "55" 'effect S { fn add(v: i64) -> i64 fn total() -> i64 } fn go() -> i64 { let mut i = 1 while i <= 10 { S.add(i) i = i + 1 } S.total() } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 0) handle go() { S.add(v) -> { __mem_store64(c, __mem_load64(c) + v) resume(0) } S.total() -> resume(__mem_load64(c)) } }'
+#
+# ── Effect handlers: property ──
+# Handler result IS the body result when no effects performed
+run_test2 "eff_prop_passthru" "99" 'effect E { fn f() -> i64 } fn main() -> i64 { handle 99 { E.f() -> resume(0) } }'
+# Sequential performs return correct values
+run_test2 "eff_prop_seq" "15" 'effect S { fn get() -> i64 fn put(v: i64) -> i64 } fn go() -> i64 { let a = S.get() S.put(a + 5) S.get() } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 10) handle go() { S.get() -> resume(__mem_load64(c)) S.put(v) -> { __mem_store64(c, v) resume(0) } } }'
+#
+# ── Generics: pathological ──
+# Many type params (5)
+run_test2 "gen_path_five" "15" 'fn sum5<A, B, C, D, E>(a: A, b: B, c: C, d: D, e: E) -> i64 { a + b + c + d + e } fn main() -> i64 { sum5<i64, i64, i64, i64, i64>(1, 2, 3, 4, 5) }'
+# Generic fn calling itself recursively
+run_test2 "gen_path_recur" "120" 'fn fact<T>(n: T) -> T { if n <= 1 { 1 } else { n * fact<T>(n - 1) } } fn main() -> i64 { fact<i64>(5) }'
+# Chain of generic calls with different type args (all i64 in bootstrap)
+run_test2 "gen_path_chain" "42" 'fn id<T>(x: T) -> T { x } fn wrap<U>(x: U) -> U { id<U>(x) } fn outer<V>(x: V) -> V { wrap<V>(x) } fn main() -> i64 { outer<i64>(42) }'
+#
+# ── Generics: wicked ──
+# Generic + effects combined
+run_test2 "gen_wicked_eff" "42" 'effect S { fn get() -> i64 } fn id<T>(x: T) -> T { x } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 42) handle id<i64>(S.get()) { S.get() -> resume(__mem_load64(c)) } }'
+# Generic call in if condition
+run_test2 "gen_wicked_if" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { if id<i64>(1) == 1 { 42 } else { 0 } }'
+# Generic call in while condition
+run_test2 "gen_wicked_while" "10" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { let mut i = 0 while id<i64>(i) < 10 { i = i + 1 } i }'
+# Generic call as match scrutinee
+run_test2 "gen_wicked_match" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { match id<i64>(1) { 1 -> 42 _ -> 0 } }'
+# Type arg is the return type, not the param type
+run_test2 "gen_wicked_ret" "42" 'fn make<T>(x: i64) -> T { x } fn main() -> i64 { make<i64>(42) }'
+#
+# ── Generics: property ──
+# id is the identity: id<T>(x) == x for various types
+run_test2 "gen_prop_id_int" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { id<i64>(42) }'
+run_test2 "gen_prop_id_zero" "0" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { id<i64>(0) }'
+run_test2 "gen_prop_id_neg" "201" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { id<i64>(201) }'
+# Substitution preserves concrete types: T=i64 means param is i64
+run_test_no_err "gen_prop_subst" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { let r: i64 = id<i64>(42) r }'
+#
+# ── Function types: pathological ──
+# Nested function type: fn taking fn returning fn
+run_test2 "fntype_path_nest" "43" 'fn ap(f: ((i64) -> i64) -> i64, g: (i64) -> i64) -> i64 { f(g) } fn main() -> i64 { ap(f => f(42), x => x + 1) }'
+# Function type with 0 params and 4 params
+run_test2 "fntype_path_0_4" "142" 'fn c0(f: () -> i64) -> i64 { f() } fn c4(f: (i64, i64, i64, i64) -> i64) -> i64 { f(10, 20, 30, 40) } fn main() -> i64 { c0(() => 42) + c4((a, b, c, d) => a + b + c + d) }'
+#
+# ── Function types: wicked ──
+# Function type inside union type annotation
+run_test2 "fntype_wicked_union" "42" 'fn f(g: (i64) -> i64 | nil, x: i64) -> i64 { g(x) } fn main() -> i64 { f(x => x, 42) }'
+# Function type with generic type variable params
+run_test2 "fntype_wicked_gen" "42" 'fn map<T, U>(f: (T) -> U, x: T) -> U { f(x) } fn main() -> i64 { map<i64, i64>(x => x + 1, 41) }'
+# Returning a function type value
+run_test2 "fntype_wicked_ret" "42" 'fn make(n: i64) -> (i64) -> i64 { x => x + n } fn main() -> i64 { let f: (i64) -> i64 = make(2) f(40) }'
+#
+# ── Let types: wicked ──
+# Let type annotation with function call value
+run_test2 "let_wicked_call" "42" 'fn f() -> i64 { 42 } fn main() -> i64 { let x: i64 = f() x }'
+# Let type annotation used for variable type in subsequent check
+run_test_no_err "let_wicked_flow" "42" 'fn f(x: i64) -> i64 { x } fn main() -> i64 { let x: i64 = 42 f(x) }'
+# Let mut type annotation, then reassign
+run_test2 "let_wicked_mut_reassign" "99" 'fn main() -> i64 { let mut x: i64 = 42 x = 99 x }'
+#
+# ── Let type vars in generic functions (tctx gap fix) ──
+# Happy: let with type var annotation works inside generic fn
+run_test2 "let_gen_tvar" "42" 'fn id<T>(x: T) -> T { let y: T = x y } fn main() -> i64 { id<i64>(42) }'
+# Happy: multiple type vars in let annotations
+run_test2 "let_gen_multi" "42" 'fn fst<A, B>(a: A, b: B) -> A { let x: A = a let y: B = b x } fn main() -> i64 { fst<i64, i64>(42, 99) }'
+# Happy: let with type var in control flow inside generic fn
+run_test2 "let_gen_if" "42" 'fn f<T>(x: T, b: i64) -> T { let y: T = if b == 1 { x } else { x } y } fn main() -> i64 { f<i64>(42, 1) }'
+# Sad: let annotation T but value is clearly wrong type (checker catches)
+run_test_err "let_gen_sad_mismatch" "value does not match let type annotation" 'fn f<T>(x: T) -> T { let y: i64 = x y } fn main() -> i64 { f<str>("hi") }'
+# Sad: let annotation i64 but var is T (T is not subtype of i64)
+run_test_err "let_gen_sad_tvar_not_i64" "value does not match let type annotation" 'fn f<T>(x: T) -> i64 { let y: i64 = x y } fn main() -> i64 { f(42) }'
+# Property: tctx restored — non-generic fn after generic fn still works
+run_test2 "let_gen_prop_restore" "42" 'fn id<T>(x: T) -> T { let y: T = x y } fn plain(x: i64) -> i64 { let y: i64 = x y } fn main() -> i64 { plain(id<i64>(42)) }'
+# Adversarial: let type var in lambda inside generic fn
+run_test2 "let_gen_adv_lam" "42" 'fn f<T>(x: T) -> T { let g = (y: T) => y g(x) } fn main() -> i64 { f<i64>(42) }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
