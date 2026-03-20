@@ -1416,6 +1416,44 @@ run_test_err "let_gen_sad_tvar_not_i64" "value does not match let type annotatio
 run_test2 "let_gen_prop_restore" "42" 'fn id<T>(x: T) -> T { let y: T = x y } fn plain(x: i64) -> i64 { let y: i64 = x y } fn main() -> i64 { plain(id<i64>(42)) }'
 # Adversarial: let type var in lambda inside generic fn
 run_test2 "let_gen_adv_lam" "42" 'fn f<T>(x: T) -> T { let g = (y: T) => y g(x) } fn main() -> i64 { f<i64>(42) }'
+# ═══════════════════════════════════════════════════════════════
+# 46. GENERIC TYPE DECLARATIONS — comprehensive (Phase 4)
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: basic generic variant ──
+run_test2 "gtype_box" "42" 'type Box<T> { Box(T) } fn main() -> i64 { let b = Box(42) match b { Box(x) -> x } }'
+run_test2 "gtype_option" "42" 'type Option<T> { Some(T), None } fn main() -> i64 { match Some(42) { Some(v) -> v None -> 0 } }'
+run_test2 "gtype_either" "42" 'type Either<A, B> { Left(A), Right(B) } fn main() -> i64 { let e = Left(42) match e { Left(v) -> v Right(v) -> v } }'
+# ── Happy: generic record ──
+run_test2 "gtype_pair" "42" 'type Pair<A, B> { fst: A, snd: B } fn main() -> i64 { let p = Pair { fst: 20, snd: 22 } p.fst + p.snd }'
+# ── Happy: constructor with explicit type args ──
+run_test2 "gtype_ctor_typed" "42" 'type Box<T> { Box(T) } fn main() -> i64 { match Box<i64>(42) { Box(x) -> x } }'
+# ── Happy: type args in annotation position ──
+run_test2 "gtype_ann" "42" 'type Box<T> { Box(T) } fn unbox(b: Box<i64>) -> i64 { match b { Box(x) -> x } } fn main() -> i64 { unbox(Box(42)) }'
+# ── Happy: generic fn + generic type together ──
+run_test2 "gtype_with_gen_fn" "42" 'type Box<T> { Box(T) } fn unbox<T>(b: Box<T>) -> T { match b { Box(x) -> x } } fn main() -> i64 { unbox<i64>(Box(42)) }'
+# ── Happy: None variant (no payload) ──
+run_test2 "gtype_none" "0" 'type Option<T> { Some(T), None } fn main() -> i64 { match None { Some(v) -> v None -> 0 } }'
+# ── Happy: nested generic type usage ──
+run_test2 "gtype_nested" "42" 'type Box<T> { Box(T) } fn main() -> i64 { let b = Box(Box(42)) match b { Box(inner) -> match inner { Box(x) -> x } } }'
+#
+# ── Sad: type checker catches errors ──
+run_test_err "gtype_sad_ctor" "argument type mismatch" 'type Box<T> { Box(T) } fn f() -> i64 { let b: Box<str> = Box<str>(42) 0 } fn main() -> i64 { 42 }'
+#
+# ── Variants: all pattern forms with generic types ──
+run_test2 "gtype_var_wildcard" "1" 'type Box<T> { Box(T) } fn main() -> i64 { match Box(42) { _ -> 1 } }'
+run_test2 "gtype_var_binding" "42" 'type Box<T> { Box(T) } fn main() -> i64 { match Box(42) { b -> match b { Box(x) -> x } } }'
+run_test2 "gtype_var_multi_arm" "2" 'type Option<T> { Some(T), None } fn main() -> i64 { match None { Some(v) -> 1 None -> 2 } }'
+#
+# ── Adversarial ──
+run_test2 "gtype_adv_recur" "3" 'type List<T> { Nil, Cons(T) } fn main() -> i64 { let a = Cons(1) let b = Cons(2) match a { Cons(v) -> v + match b { Cons(w) -> w Nil -> 0 } Nil -> 0 } }'
+run_test2 "gtype_adv_many" "42" 'type Triple<A, B, C> { fst: A, snd: B, thd: C } fn main() -> i64 { let t = Triple { fst: 10, snd: 20, thd: 12 } t.fst + t.snd + t.thd }'
+run_test2 "gtype_adv_eff" "42" 'type Box<T> { Box(T) } effect S { fn get() -> i64 } fn main() -> i64 { let c = __bump_alloc(8) __mem_store64(c, 42) handle { let b = Box(S.get()) match b { Box(x) -> x } } { S.get() -> resume(__mem_load64(c)) } }'
+run_test2 "gtype_adv_mixed" "42" 'type Box<T> { Box(T) } type Plain { Val(i64) } fn main() -> i64 { let b = Box(20) let p = Val(22) match b { Box(x) -> x + match p { Val(y) -> y } } }'
+#
+# ── Property ──
+run_test2 "gtype_prop_roundtrip" "42" 'type Box<T> { Box(T) } fn main() -> i64 { let x = 42 match Box(x) { Box(y) -> y } }'
+run_test2 "gtype_prop_some" "42" 'type Option<T> { Some(T), None } fn main() -> i64 { match Some(42) { Some(v) -> v None -> 0 } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
