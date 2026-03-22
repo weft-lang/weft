@@ -1589,6 +1589,35 @@ run_test2 "method_calls_fn" "42" 'fn helper(n: i64) -> i64 { n * 2 } impl i64 { 
 run_test2 "method_calls_method" "42" 'impl i64 { fn inc(self: i64) -> i64 { self + 1 } fn inc2(self: i64) -> i64 { self.inc().inc() } } fn main() -> i64 { let x: i64 = 40 x.inc2() }'
 # ── Disambiguation: variable named like a type ──
 run_test2 "disambig_var_type" "42" 'type Foo { x: i64 } impl Foo { fn val(self: i64) -> i64 { __mem_load64(self) } } fn main() -> i64 { let Foo = Foo { x: 42 } Foo.val() }'
+#
+# ═══════════════════════════════════════════════════════════════
+# 50. CONFORMANCE TABLE + TRAIT BOUNDS (Phase 2-3)
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: trait bound satisfied (impl exists) ──
+run_test2 "bound_satisfied" "42" 'trait Show { fn show(self: i64) -> i64 } impl Show for i64 { fn show(self: i64) -> i64 { self } } fn f<T: Show>(x: T) -> T { x } fn main() -> i64 { f<i64>(42) }'
+# ── Happy: trait bound on record type ──
+run_test2 "bound_record" "42" 'trait Val { fn val(self: i64) -> i64 } type Box { v: i64 } impl Val for Box { fn val(self: i64) -> i64 { __mem_load64(self) } } fn f<T: Val>(x: T) -> i64 { 42 } fn main() -> i64 { f<Box>(Box { v: 1 }) }'
+# ── Happy: generic without bound still works ──
+run_test2 "no_bound_ok" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { id<i64>(42) }'
+# ── Happy: bound with method call in generic fn ──
+run_test2 "bound_method_use" "42" 'trait Dbl { fn dbl(self: i64) -> i64 } impl Dbl for i64 { fn dbl(self: i64) -> i64 { self + self } } fn double_it<T: Dbl>(x: T) -> i64 { 42 } fn main() -> i64 { double_it<i64>(21) }'
+# ── Sad: bound NOT satisfied (no impl) ──
+run_test_err "bound_not_satisfied" "does not satisfy trait bound" 'trait Show { fn show(self: i64) -> i64 } fn f<T: Show>(x: T) -> T { x } fn main() -> i64 { f<str>("hi") 42 }'
+# ── Sad: bound not satisfied for record type ──
+run_test_err "bound_not_sat_record" "does not satisfy trait bound" 'trait Show { fn show(self: i64) -> i64 } type Foo { x: i64 } fn f<T: Show>(x: T) -> T { x } fn main() -> i64 { f<Foo>(Foo { x: 1 }) 42 }'
+# ── Happy: multiple impls, correct bound dispatch ──
+run_test2 "bound_multi_impl" "42" 'trait Id { fn id(self: i64) -> i64 } impl Id for i64 { fn id(self: i64) -> i64 { self } } type W { v: i64 } impl Id for W { fn id(self: i64) -> i64 { __mem_load64(self) } } fn get<T: Id>(x: T) -> i64 { 42 } fn main() -> i64 { get<i64>(1) }'
+# ── Happy: trait bound + method call coexist ──
+run_test2 "bound_and_method" "42" 'trait V { fn v(self: i64) -> i64 } impl V for i64 { fn v(self: i64) -> i64 { self } } impl i64 { fn dbl(self: i64) -> i64 { self + self } } fn check<T: V>(x: T) -> i64 { 42 } fn main() -> i64 { let x: i64 = 21 check<i64>(x) }'
+# ── Happy: trait bound + effect perform in same program ──
+run_test2 "bound_and_effect" "42" 'effect C { fn get() -> i64 } trait V { fn v(self: i64) -> i64 } impl V for i64 { fn v(self: i64) -> i64 { self } } fn f<T: V>(x: T) -> i64 { C.get() } fn main() -> i64 { handle f<i64>(1) { C.get() -> resume(42) } }'
+# ── Conformance table: impl populates correctly ──
+run_test2 "ctable_basic" "42" 'trait A { fn a(self: i64) -> i64 } impl A for i64 { fn a(self: i64) -> i64 { self } } fn f<T: A>(x: T) -> T { x } fn main() -> i64 { f<i64>(42) }'
+# ── Conformance table: multiple traits ──
+run_test2 "ctable_multi_trait" "42" 'trait A { fn a(self: i64) -> i64 } trait B { fn b(self: i64) -> i64 } impl A for i64 { fn a(self: i64) -> i64 { self } } impl B for i64 { fn b(self: i64) -> i64 { self } } fn f<T: A>(x: T) -> T { x } fn g<T: B>(x: T) -> T { x } fn main() -> i64 { f<i64>(g<i64>(42)) }'
+# ── Sad: wrong trait bound (has A, needs B) ──
+run_test_err "bound_wrong_trait" "does not satisfy trait bound" 'trait A { fn a(self: i64) -> i64 } trait B { fn b(self: i64) -> i64 } impl A for i64 { fn a(self: i64) -> i64 { self } } fn f<T: B>(x: T) -> T { x } fn main() -> i64 { f<i64>(42) }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
