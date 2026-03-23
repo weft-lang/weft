@@ -1,0 +1,292 @@
+-- stdlib/map.weft — Persistent hash map using CHAMP trie
+--
+-- CHAMP = Compressed Hash-Array Mapped Prefix-tree
+-- State of the art for persistent/immutable hash maps.
+-- Used by Clojure, Scala, Rust's `im` crate.
+--
+-- Each node has:
+--   [data_map(8), node_map(8), content_ptr(8), content_len(8)] = 32 bytes
+--
+-- data_map: 32-bit bitmap — which hash slots have inline key-value pairs
+-- node_map: 32-bit bitmap — which hash slots have sub-nodes
+-- content: array of entries — data pairs (key, val) first, then sub-node pointers
+--
+-- At each trie level, 5 bits of the hash select a slot (32-wide branching).
+-- Structural sharing: insert/remove create new path, share unchanged subtrees.
+
+use "stdlib/hash.weft"
+use "stdlib/eq.weft"
+
+-- ══════════════════════════════════════════════════════════════
+-- Node layout
+-- ══════════════════════════════════════════════════════════════
+
+fn champ_node_new(data_map: i64, node_map: i64, content: i64, content_len: i64) -> i64 {
+  let node = __bump_alloc(32)
+  __mem_store64(node, data_map)
+  __mem_store64(node + 8, node_map)
+  __mem_store64(node + 16, content)
+  __mem_store64(node + 24, content_len)
+  node
+}
+
+fn champ_data_map(node: i64) -> i64 { __mem_load64(node) }
+fn champ_node_map(node: i64) -> i64 { __mem_load64(node + 8) }
+fn champ_content(node: i64) -> i64 { __mem_load64(node + 16) }
+fn champ_content_len(node: i64) -> i64 { __mem_load64(node + 24) }
+
+fn champ_empty_node() -> i64 {
+  let content = __bump_alloc(8)
+  champ_node_new(0, 0, content, 0)
+}
+
+-- Number of data entries (key-value pairs) in this node
+fn champ_data_count(node: i64) -> i64 {
+  popcount(champ_data_map(node))
+}
+
+-- Number of sub-node entries in this node
+fn champ_node_count(node: i64) -> i64 {
+  popcount(champ_node_map(node))
+}
+
+-- Get data key at index i (data entries are stored as [key, val] pairs)
+fn champ_data_key(node: i64, idx: i64) -> i64 {
+  __mem_load64(champ_content(node) + idx * 16)
+}
+
+-- Get data value at index i
+fn champ_data_val(node: i64, idx: i64) -> i64 {
+  __mem_load64(champ_content(node) + idx * 16 + 8)
+}
+
+-- Get sub-node at index i (sub-nodes stored after all data entries)
+fn champ_sub_node(node: i64, idx: i64) -> i64 {
+  let data_count = champ_data_count(node)
+  __mem_load64(champ_content(node) + data_count * 16 + idx * 8)
+}
+
+-- ══════════════════════════════════════════════════════════════
+-- Lookup
+-- ══════════════════════════════════════════════════════════════
+
+-- Extract 5 bits of hash at the given depth (0 = bits 0-4, 1 = bits 5-9, etc.)
+fn hash_fragment(hash: i64, depth: i64) -> i64 {
+  (hash bshr (depth * 5)) band 31
+}
+
+-- Convert a hash fragment to a bit position in the bitmap
+fn frag_to_bit(frag: i64) -> i64 {
+  1 bshl frag
+}
+
+-- Look up a key in a CHAMP node. Returns the value, or 0 if not found.
+-- sentinel = value to return if key is absent (caller provides)
+fn champ_get(node: i64, key: i64, key_hash: i64, depth: i64, sentinel: i64) -> i64 {
+  let frag = hash_fragment(key_hash, depth)
+  let bit = frag_to_bit(frag)
+  let dm = champ_data_map(node)
+  let nm = champ_node_map(node)
+  if (dm band bit) != 0 {
+    -- Data entry at this position: compare keys
+    let idx = compressed_index(dm, bit)
+    let stored_key = champ_data_key(node, idx)
+    if stored_key == key {
+      champ_data_val(node, idx)
+    } else { sentinel }
+  } else {
+    if (nm band bit) != 0 {
+      -- Sub-node at this position: recurse
+      let idx = compressed_index(nm, bit)
+      let sub = champ_sub_node(node, idx)
+      champ_get(sub, key, key_hash, depth + 1, sentinel)
+    } else {
+      -- Empty slot: key not found
+      sentinel
+    }
+  }
+}
+
+-- ══════════════════════════════════════════════════════════════
+-- Insert (persistent — returns new node, shares structure)
+-- ══════════════════════════════════════════════════════════════
+
+-- Copy an array, inserting a new element at position idx.
+-- src_ptr: source array base, src_count: number of elements (8 bytes each)
+-- Returns new array pointer.
+fn array_insert_at(src_ptr: i64, src_count: i64, idx: i64, elem_size: i64, new_elems: i64, new_count: i64) -> i64 {
+  let total = src_count + new_count
+  let new_arr = __bump_alloc(total * elem_size)
+  -- Copy elements before idx
+  for i in 0..idx {
+    for b in 0..elem_size {
+      __mem_store8(new_arr + i * elem_size + b, __mem_load8(src_ptr + i * elem_size + b))
+    }
+  }
+  -- Insert new elements
+  for i in 0..new_count {
+    for b in 0..elem_size {
+      __mem_store8(new_arr + (idx + i) * elem_size + b, __mem_load8(new_elems + i * elem_size + b))
+    }
+  }
+  -- Copy elements after idx
+  for i in idx..src_count {
+    for b in 0..elem_size {
+      __mem_store8(new_arr + (i + new_count) * elem_size + b, __mem_load8(src_ptr + i * elem_size + b))
+    }
+  }
+  new_arr
+}
+
+-- Insert or update a key-value pair. Returns a new node (persistent).
+fn champ_put(node: i64, key: i64, val: i64, key_hash: i64, depth: i64) -> i64 {
+  let frag = hash_fragment(key_hash, depth)
+  let bit = frag_to_bit(frag)
+  let dm = champ_data_map(node)
+  let nm = champ_node_map(node)
+  if (dm band bit) != 0 {
+    -- Data entry exists at this position
+    let idx = compressed_index(dm, bit)
+    let stored_key = champ_data_key(node, idx)
+    if stored_key == key {
+      -- Same key: update value (create new node with updated content)
+      let dc = champ_data_count(node)
+      let nc = champ_node_count(node)
+      let total_size = dc * 16 + nc * 8
+      let new_content = __bump_alloc(total_size)
+      -- Copy all content
+      for i in 0..total_size {
+        __mem_store8(new_content + i, __mem_load8(champ_content(node) + i))
+      }
+      -- Overwrite the value at idx
+      __mem_store64(new_content + idx * 16 + 8, val)
+      champ_node_new(dm, nm, new_content, champ_content_len(node))
+    } else {
+      -- Different key at same position: push both down to sub-node
+      let stored_val = champ_data_val(node, idx)
+      let stored_hash = stored_key.hash()
+      -- Create sub-node containing both entries
+      let sub = champ_put(champ_put(champ_empty_node(), stored_key, stored_val, stored_hash, depth + 1), key, val, key_hash, depth + 1)
+      -- Remove data entry, add sub-node
+      champ_migrate_to_node(node, dm, nm, bit, idx, sub)
+    }
+  } else {
+    if (nm band bit) != 0 {
+      -- Sub-node exists: recurse into it
+      let idx = compressed_index(nm, bit)
+      let sub = champ_sub_node(node, idx)
+      let new_sub = champ_put(sub, key, val, key_hash, depth + 1)
+      -- Replace sub-node pointer
+      champ_replace_sub_node(node, dm, nm, idx, new_sub)
+    } else {
+      -- Empty slot: insert data entry
+      let idx = compressed_index(dm, bit)
+      champ_insert_data(node, dm bor bit, nm, idx, key, val)
+    }
+  }
+}
+
+-- Insert a new data entry at position idx in the content array
+fn champ_insert_data(node: i64, new_dm: i64, nm: i64, idx: i64, key: i64, val: i64) -> i64 {
+  let dc = champ_data_count(node)
+  let nc = champ_node_count(node)
+  let old_content = champ_content(node)
+  let new_total = (dc + 1) * 16 + nc * 8
+  let new_content = __bump_alloc(new_total)
+  -- Copy data entries before idx
+  for i in 0..idx {
+    __mem_store64(new_content + i * 16, __mem_load64(old_content + i * 16))
+    __mem_store64(new_content + i * 16 + 8, __mem_load64(old_content + i * 16 + 8))
+  }
+  -- Insert new entry
+  __mem_store64(new_content + idx * 16, key)
+  __mem_store64(new_content + idx * 16 + 8, val)
+  -- Copy data entries after idx
+  for i in idx..dc {
+    __mem_store64(new_content + (i + 1) * 16, __mem_load64(old_content + i * 16))
+    __mem_store64(new_content + (i + 1) * 16 + 8, __mem_load64(old_content + i * 16 + 8))
+  }
+  -- Copy sub-node pointers
+  for i in 0..nc {
+    __mem_store64(new_content + (dc + 1) * 16 + i * 8, __mem_load64(old_content + dc * 16 + i * 8))
+  }
+  champ_node_new(new_dm, nm, new_content, new_total)
+}
+
+-- Migrate a data entry to a sub-node (collision handling)
+fn champ_migrate_to_node(node: i64, dm: i64, nm: i64, bit: i64, data_idx: i64, sub: i64) -> i64 {
+  let dc = champ_data_count(node)
+  let nc = champ_node_count(node)
+  let old_content = champ_content(node)
+  let new_dm = dm bxor bit
+  let new_nm = nm bor bit
+  let node_idx = compressed_index(new_nm, bit)
+  let new_dc = dc - 1
+  let new_nc = nc + 1
+  let new_total = new_dc * 16 + new_nc * 8
+  let new_content = __bump_alloc(new_total)
+  -- Copy data entries, skipping data_idx
+  let mut di = 0
+  for i in 0..dc {
+    if i != data_idx {
+      __mem_store64(new_content + di * 16, __mem_load64(old_content + i * 16))
+      __mem_store64(new_content + di * 16 + 8, __mem_load64(old_content + i * 16 + 8))
+      di = di + 1
+    } else { 0 }
+  }
+  -- Copy existing sub-nodes, inserting new sub at node_idx
+  let mut ni = 0
+  for i in 0..new_nc {
+    if i == node_idx {
+      __mem_store64(new_content + new_dc * 16 + i * 8, sub)
+    } else {
+      __mem_store64(new_content + new_dc * 16 + i * 8, __mem_load64(old_content + dc * 16 + ni * 8))
+      ni = ni + 1
+    }
+  }
+  champ_node_new(new_dm, new_nm, new_content, new_total)
+}
+
+-- Replace a sub-node pointer at index
+fn champ_replace_sub_node(node: i64, dm: i64, nm: i64, idx: i64, new_sub: i64) -> i64 {
+  let dc = champ_data_count(node)
+  let nc = champ_node_count(node)
+  let old_content = champ_content(node)
+  let total = dc * 16 + nc * 8
+  let new_content = __bump_alloc(total)
+  -- Copy everything
+  for i in 0..total {
+    __mem_store8(new_content + i, __mem_load8(old_content + i))
+  }
+  -- Replace sub-node pointer
+  __mem_store64(new_content + dc * 16 + idx * 8, new_sub)
+  champ_node_new(dm, nm, new_content, total)
+}
+
+-- ══════════════════════════════════════════════════════════════
+-- Map API — user-facing wrapper
+-- ══════════════════════════════════════════════════════════════
+
+-- Create an empty map
+fn map_new() -> i64 {
+  champ_empty_node()
+}
+
+-- Get a value by key. Returns sentinel if not found.
+fn map_get(m: i64, key: i64, sentinel: i64) -> i64 {
+  let h = key.hash()
+  champ_get(m, key, h, 0, sentinel)
+}
+
+-- Insert or update a key-value pair. Returns a new map (persistent).
+fn map_put(m: i64, key: i64, val: i64) -> i64 {
+  let h = key.hash()
+  champ_put(m, key, val, h, 0)
+}
+
+-- Check if a key exists
+fn map_contains(m: i64, key: i64) -> i64 {
+  let sentinel = 0 - 9999999
+  let result = map_get(m, key, sentinel)
+  if result == sentinel { false } else { true }
+}

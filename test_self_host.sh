@@ -2026,6 +2026,51 @@ run_test2 "int_to_str_all_digits" "1" 'use "stdlib/string.weft" fn main() -> i64
 #
 # ── Property: concat + len ──
 run_test2 "str_concat_len_additive" "42" 'use "stdlib/string.weft" fn main() -> i64 { let a = "hello world hello world h" let b = "ello world hello w" if str_len(str_concat(a, b)) == str_len(a) + str_len(b) { 42 } else { 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 61. HASH + CHAMP MAP — comprehensive
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Hash trait ──
+run_test2 "hash_i64_deterministic" "1" 'use "stdlib/hash.weft" fn main() -> i64 { let a: i64 = 42 let b: i64 = 42 if a.hash() == b.hash() { 1 } else { 0 } }'
+run_test2 "hash_i64_diff" "0" 'use "stdlib/hash.weft" fn main() -> i64 { let a: i64 = 1 let b: i64 = 2 if a.hash() == b.hash() { 1 } else { 0 } }'
+run_test2 "hash_i64_positive" "1" 'use "stdlib/hash.weft" fn main() -> i64 { let x: i64 = 42 if x.hash() > 0 { 1 } else { 0 } }'
+run_test2 "hash_zero" "1" 'use "stdlib/hash.weft" fn main() -> i64 { let x: i64 = 0 if x.hash() >= 0 { 1 } else { 0 } }'
+# ── Popcount ──
+run_test2 "popcount_0" "0" 'use "stdlib/hash.weft" fn main() -> i64 { popcount(0) }'
+run_test2 "popcount_1" "1" 'use "stdlib/hash.weft" fn main() -> i64 { popcount(1) }'
+run_test2 "popcount_255" "8" 'use "stdlib/hash.weft" fn main() -> i64 { popcount(255) }'
+run_test2 "popcount_powers" "1" 'use "stdlib/hash.weft" fn main() -> i64 { popcount(1 bshl 15) }'
+run_test2 "popcount_all32" "32" 'use "stdlib/hash.weft" fn main() -> i64 { popcount(4294967295) }'
+#
+# ── Map: happy paths ──
+run_test2 "map_empty_get" "0" 'use "stdlib/map.weft" fn main() -> i64 { map_get(map_new(), 1, 0) }'
+run_test2 "map_put_get" "42" 'use "stdlib/map.weft" fn main() -> i64 { map_get(map_put(map_new(), 1, 42), 1, 0) }'
+run_test2 "map_two_entries" "42" 'use "stdlib/map.weft" fn main() -> i64 { let m = map_put(map_put(map_new(), 1, 20), 2, 22) map_get(m, 1, 0) + map_get(m, 2, 0) }'
+run_test2 "map_update_key" "42" 'use "stdlib/map.weft" fn main() -> i64 { let m = map_put(map_put(map_new(), 1, 10), 1, 42) map_get(m, 1, 0) }'
+run_test2 "map_contains_yes" "1" 'use "stdlib/map.weft" fn main() -> i64 { map_contains(map_put(map_new(), 42, 1), 42) }'
+run_test2 "map_contains_no" "0" 'use "stdlib/map.weft" fn main() -> i64 { map_contains(map_new(), 42) }'
+#
+# ── Map: sad paths ──
+run_test2 "map_get_missing" "0" 'use "stdlib/map.weft" fn main() -> i64 { map_get(map_put(map_new(), 1, 42), 99, 0) }'
+run_test2 "map_get_sentinel" "255" 'use "stdlib/map.weft" fn main() -> i64 { map_get(map_new(), 1, 255) }'
+#
+# ── Map: many entries (forces trie depth) ──
+run_test2 "map_20_entries" "20" 'use "stdlib/map.weft" fn main() -> i64 { let mut m = map_new() for i in 0..20 { m = map_put(m, i, i * 2) } map_get(m, 10, 0) }'
+run_test2 "map_50_entries" "98" 'use "stdlib/map.weft" fn main() -> i64 { let mut m = map_new() for i in 0..50 { m = map_put(m, i, i * 2) } map_get(m, 49, 0) }'
+run_test2 "map_all_present" "42" 'use "stdlib/map.weft" fn main() -> i64 { let mut m = map_new() for i in 0..42 { m = map_put(m, i, 1) } let mut count: i64 = 0 for i in 0..42 { if map_contains(m, i) == 1 { count = count + 1 } else { 0 } } count }'
+#
+# ── Map: persistence (structural sharing) ──
+run_test2 "map_persist_old" "42" 'use "stdlib/map.weft" fn main() -> i64 { let m1 = map_put(map_new(), 1, 10) let m2 = map_put(m1, 2, 20) map_get(m1, 2, 42) }'
+run_test2 "map_persist_new" "20" 'use "stdlib/map.weft" fn main() -> i64 { let m1 = map_put(map_new(), 1, 10) let m2 = map_put(m1, 2, 20) map_get(m2, 2, 0) }'
+run_test2 "map_persist_both" "42" 'use "stdlib/map.weft" fn main() -> i64 { let m1 = map_put(map_new(), 1, 42) let m2 = map_put(m1, 1, 99) if map_get(m1, 1, 0) == 42 { if map_get(m2, 1, 0) == 99 { 42 } else { 0 } } else { 0 } }'
+#
+# ── Map: adversarial ──
+run_test2 "map_key_zero" "42" 'use "stdlib/map.weft" fn main() -> i64 { map_get(map_put(map_new(), 0, 42), 0, 0) }'
+run_test2 "map_val_zero" "0" 'use "stdlib/map.weft" fn main() -> i64 { map_get(map_put(map_new(), 1, 0), 1, 99) }'
+run_test2 "map_large_keys" "42" 'use "stdlib/map.weft" fn main() -> i64 { let m = map_put(map_put(map_new(), 1000000, 20), 9999999, 22) map_get(m, 1000000, 0) + map_get(m, 9999999, 0) }'
+#
+# ── Map: property tests ──
+run_test2 "map_put_get_id" "42" 'use "stdlib/map.weft" fn main() -> i64 { let mut ok: i64 = 1 let mut m = map_new() for i in 0..42 { m = map_put(m, i, i) } for i in 0..42 { if map_get(m, i, 0 - 1) != i { ok = 0 } else { 0 } } if ok == 1 { 42 } else { 0 } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
