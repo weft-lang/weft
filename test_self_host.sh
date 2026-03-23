@@ -2071,6 +2071,30 @@ run_test2 "map_large_keys" "42" 'use "stdlib/map.weft" fn main() -> i64 { let m 
 #
 # ── Map: property tests ──
 run_test2 "map_put_get_id" "42" 'use "stdlib/map.weft" fn main() -> i64 { let mut ok: i64 = 1 let mut m = map_new() for i in 0..42 { m = map_put(m, i, i) } for i in 0..42 { if map_get(m, i, 0 - 1) != i { ok = 0 } else { 0 } } if ok == 1 { 42 } else { 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 62. SET — comprehensive
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy paths ──
+run_test2 "set_empty" "0" 'use "stdlib/set.weft" fn main() -> i64 { set_contains(set_new(), 1) }'
+run_test2 "set_add_contains" "1" 'use "stdlib/set.weft" fn main() -> i64 { set_contains(set_add(set_new(), 42), 42) }'
+run_test2 "set_two_elems" "42" 'use "stdlib/set.weft" fn main() -> i64 { let s = set_add(set_add(set_new(), 1), 2) if set_contains(s, 1) == 1 { if set_contains(s, 2) == 1 { 42 } else { 0 } } else { 0 } }'
+run_test2 "set_not_present" "0" 'use "stdlib/set.weft" fn main() -> i64 { set_contains(set_add(set_new(), 1), 99) }'
+# ── Sad paths ──
+run_test2 "set_empty_count" "0" 'use "stdlib/set.weft" fn main() -> i64 { set_count_in_range(set_new(), 0, 10) }'
+# ── Deduplication ──
+run_test2 "set_dedup" "1" 'use "stdlib/set.weft" fn main() -> i64 { let s = set_add(set_add(set_new(), 5), 5) set_count_in_range(s, 0, 10) }'
+run_test2 "set_dedup_many" "10" 'use "stdlib/set.weft" fn main() -> i64 { let mut s = set_new() for i in 0..10 { s = set_add(s, i) s = set_add(s, i) } set_count_in_range(s, 0, 20) }'
+# ── Many elements ──
+run_test2 "set_20_elems" "20" 'use "stdlib/set.weft" fn main() -> i64 { let mut s = set_new() for i in 0..20 { s = set_add(s, i) } set_count_in_range(s, 0, 30) }'
+run_test2 "set_from_list" "42" 'use "stdlib/set.weft" use "stdlib/list.weft" fn main() -> i64 { set_count_in_range(set_from_list(list_range(0, 42)), 0, 50) }'
+# ── Persistence ──
+run_test2 "set_persist" "42" 'use "stdlib/set.weft" fn main() -> i64 { let s1 = set_add(set_new(), 1) let s2 = set_add(s1, 2) if set_contains(s1, 2) == 0 { 42 } else { 0 } }'
+# ── Adversarial ──
+run_test2 "set_zero_elem" "1" 'use "stdlib/set.weft" fn main() -> i64 { set_contains(set_add(set_new(), 0), 0) }'
+run_test2 "set_large_elem" "1" 'use "stdlib/set.weft" fn main() -> i64 { set_contains(set_add(set_new(), 9999999), 9999999) }'
+# ── Property: all elements present after bulk insert ──
+run_test2 "set_all_present" "42" 'use "stdlib/set.weft" fn main() -> i64 { let mut s = set_new() for i in 0..42 { s = set_add(s, i) } let mut ok: i64 = 1 for i in 0..42 { if set_contains(s, i) == 0 { ok = 0 } else { 0 } } if ok == 1 { 42 } else { 0 } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
