@@ -1,4 +1,5 @@
 import Weft.CoreEffectMachine
+import Weft.CoreSubtype
 
 namespace Weft.CoreEffects
 
@@ -94,6 +95,24 @@ def check : (expr : Expr) -> Option (CheckedTy expr)
             typed := HasType.handleBool effect value body ty bodyEffects hBody
           }
       | none => none
+
+def inferType (expr : Expr) : Option Weft.Ty :=
+  match check expr with
+  | some checked => some checked.ty
+  | none => none
+
+def inferEffects (expr : Expr) : Option Weft.EffectSet :=
+  match check expr with
+  | some checked => some checked.effects
+  | none => none
+
+def checkAgainst (expr : Expr) (expected : Weft.Ty) : Bool :=
+  match inferType expr, Weft.CoreSetTy.ofTy expected with
+  | some inferred, some expectedCore =>
+      match Weft.CoreSetTy.ofTy inferred with
+      | some inferredCore => inferredCore.subtypeb expectedCore
+      | none => false
+  | _, _ => false
 
 inductive IRExpr : Type where
   | const : RuntimeVal -> IRExpr

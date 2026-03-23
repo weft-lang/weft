@@ -57,6 +57,13 @@ The first cut lands three things:
 12. `Weft/CoreEffectPipeline.lean` + `Weft/Properties/CoreEffectPipelineCorrectness.lean`
     A staged handled-effect pipeline, parameterized by the effect oracle and
     proved with the same whole-compiler composition theorem as the pure core.
+13. `Weft/Properties/CoreEffectTypecheckCorrectness.lean`,
+    `Weft/Properties/CoreEffectSemanticSoundness.lean`,
+    `Weft/Properties/CoreEffectSubtypeChecking.lean`
+    The handled-effect checker now supports inferred type/effect recovery plus
+    subtype-aware expected-type checking, and we can prove that empty-effect
+    accepted programs compile to trace-free executions whose results inhabit the
+    requested type.
 
 ## Near-Term Expansion
 
