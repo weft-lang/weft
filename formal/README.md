@@ -64,6 +64,9 @@ The first cut lands three things:
     subtype-aware expected-type checking, and we can prove that empty-effect
     accepted programs compile to trace-free executions whose results inhabit the
     requested type.
+14. `Weft/Properties/CoreEffectPipelineSemanticSoundness.lean`
+    The staged handled-effect pipeline now carries that same guarantee all the
+    way from surface syntax to emitted code.
 
 ## Near-Term Expansion
 
