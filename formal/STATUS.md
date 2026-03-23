@@ -59,7 +59,7 @@ That estimate is based on:
   of only pointwise boolean checks. This is the bridge from the tiny finite
   model toward the full Weft type algebra.
 
-- current uncommitted whole-`Ty` DNF work
+- `d9205ad` `formal: normalize whole ty boolean structure`
   This extends normalization beyond the finite core. The theorem gain is not
   yet a full subtyping decision procedure, but we now normalize the real `Ty`
   boolean surface (`|`, `&`, `~`) over opaque rich atoms, prove semantic
