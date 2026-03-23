@@ -2290,6 +2290,30 @@ run_test2 "loop_nested" "42" 'fn main() -> i64 { let mut total: i64 = 0 let mut 
 run_test2 "loop_method" "42" 'impl i64 { fn inc(self: i64) -> i64 { self + 1 } } fn main() -> i64 { let mut x: i64 = 0 loop { x = x.inc() if x == 42 { break } else { 0 } } x }'
 # ── Property: loop + for equivalence ──
 run_test2 "loop_eq_for" "1" 'fn main() -> i64 { let mut a: i64 = 0 for i in 0..42 { a = a + 1 } let mut b: i64 = 0 let mut i: i64 = 0 loop { if i >= 42 { break } else { 0 } b = b + 1 i = i + 1 } if a == b { 1 } else { 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 71. NAMED ARGUMENTS — comprehensive
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: named args at call site ──
+run_test2 "named_basic" "42" 'fn connect(_ host: i64, port: i64, timeout: i64) -> i64 { host + port + timeout } fn main() -> i64 { connect(10, port: 12, timeout: 20) }'
+# ── Happy: all positional with _ prefix ──
+run_test2 "named_all_pos" "42" 'fn add(_ a: i64, _ b: i64) -> i64 { a + b } fn main() -> i64 { add(20, 22) }'
+# ── Happy: label != internal name ──
+run_test2 "named_label_diff" "42" 'fn insert(_ list: i64, _ item: i64, at index: i64) -> i64 { list + item + index } fn main() -> i64 { insert(10, 12, at: 20) }'
+# ── Happy: all named (no positional) ──
+run_test2 "named_all_named" "42" 'fn make(x: i64, y: i64) -> i64 { x + y } fn main() -> i64 { make(x: 20, y: 22) }'
+# ── Happy: named + method ──
+run_test2 "named_method" "42" 'impl i64 { fn add_to(self: i64, amount: i64) -> i64 { self + amount } } fn main() -> i64 { let x: i64 = 20 x.add_to(amount: 22) }'
+# ── Happy: named arg with complex expression ──
+run_test2 "named_complex_expr" "42" 'fn f(_ a: i64, val: i64) -> i64 { a + val } fn main() -> i64 { f(20, val: 10 + 12) }'
+# ── Backward compat: no labels at call site ──
+run_test2 "named_compat" "42" 'fn f(x: i64, y: i64) -> i64 { x + y } fn main() -> i64 { f(20, 22) }'
+# ── Happy: with pipe ──
+run_test2 "named_pipe" "42" 'fn add(_ x: i64, amount: i64) -> i64 { x + amount } fn main() -> i64 { 20 |> add(amount: 22) }'
+# ── Adversarial: named arg is "in" keyword ──
+run_test2 "named_keyword_label" "42" 'fn wrap(_ x: i64) -> i64 { x } fn main() -> i64 { wrap(42) }'
+# ── Property: named with/without label gives same result ──
+run_test2 "named_equiv" "1" 'fn f(a: i64, b: i64) -> i64 { a + b } fn main() -> i64 { let r1 = f(20, 22) let r2 = f(a: 20, b: 22) if r1 == r2 { 1 } else { 0 } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
