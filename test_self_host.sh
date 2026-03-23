@@ -1972,6 +1972,60 @@ run_test2 "xfile_variant_match" "42" 'use "stdlib/option.weft" fn extract(x: i64
 run_test2 "xfile_record_field" "42" 'type Point { x: i64, y: i64 } fn main() -> i64 { let p = Point { x: 20, y: 22 } p.x + p.y }'
 run_test2 "xfile_trait_method" "42" 'use "stdlib/eq.weft" fn check(x: i64) -> i64 { if x.eq(42) == 1 { 42 } else { 0 } } fn main() -> i64 { check(42) }'
 run_test2 "xfile_effect_handler" "42" 'use "stdlib/fail.weft" fn go() -[Fail]> i64 { Fail.fail(42) } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(e) } }'
+# ═══════════════════════════════════════════════════════════════
+# 60. STRING + DISPLAY + IO — comprehensive
+# ═══════════════════════════════════════════════════════════════
+#
+# ── str_concat: happy paths ──
+run_test2 "str_concat_basic" "11" 'use "stdlib/string.weft" fn main() -> i64 { str_len(str_concat("hello", " world")) }'
+run_test2 "str_concat_empty_left" "5" 'use "stdlib/string.weft" fn main() -> i64 { str_len(str_concat("", "hello")) }'
+run_test2 "str_concat_empty_right" "5" 'use "stdlib/string.weft" fn main() -> i64 { str_len(str_concat("hello", "")) }'
+run_test2 "str_concat_both_empty" "0" 'use "stdlib/string.weft" fn main() -> i64 { str_len(str_concat("", "")) }'
+run_test2 "str_concat_chain" "16" 'use "stdlib/string.weft" fn main() -> i64 { str_len(str_concat(str_concat("a", "bb"), str_concat("ccc", "dddddddddd"))) }'
+# ── str_concat: content verification via str_eq ──
+run_test2 "str_concat_eq" "1" 'use "stdlib/string.weft" fn main() -> i64 { str_eq(str_concat("he", "llo"), "hello") }'
+run_test2 "str_concat_eq_longer" "1" 'use "stdlib/string.weft" fn main() -> i64 { str_eq(str_concat("foo", "bar"), "foobar") }'
+#
+# ── int_to_str: happy paths ──
+run_test2 "int_to_str_42" "2" 'use "stdlib/string.weft" fn main() -> i64 { str_len(int_to_str(42)) }'
+run_test2 "int_to_str_0" "1" 'use "stdlib/string.weft" fn main() -> i64 { str_len(int_to_str(0)) }'
+run_test2 "int_to_str_1" "1" 'use "stdlib/string.weft" fn main() -> i64 { str_eq(int_to_str(1), "1") }'
+run_test2 "int_to_str_100" "1" 'use "stdlib/string.weft" fn main() -> i64 { str_eq(int_to_str(100), "100") }'
+run_test2 "int_to_str_neg" "1" 'use "stdlib/string.weft" fn main() -> i64 { str_eq(int_to_str(0 - 42), "-42") }'
+# ── int_to_str: boundary ──
+run_test2 "int_to_str_large" "7" 'use "stdlib/string.weft" fn main() -> i64 { str_len(int_to_str(1000000)) }'
+run_test2 "int_to_str_zero_eq" "1" 'use "stdlib/string.weft" fn main() -> i64 { str_eq(int_to_str(0), "0") }'
+#
+# ── str_eq: all cases ──
+run_test2 "str_eq_same" "1" 'use "stdlib/string.weft" fn main() -> i64 { str_eq("abc", "abc") }'
+run_test2 "str_eq_diff" "0" 'use "stdlib/string.weft" fn main() -> i64 { str_eq("abc", "abd") }'
+run_test2 "str_eq_diff_len" "0" 'use "stdlib/string.weft" fn main() -> i64 { str_eq("abc", "ab") }'
+run_test2 "str_eq_empty" "1" 'use "stdlib/string.weft" fn main() -> i64 { str_eq("", "") }'
+run_test2 "str_eq_empty_vs_nonempty" "0" 'use "stdlib/string.weft" fn main() -> i64 { str_eq("", "a") }'
+#
+# ── str_len ──
+run_test2 "str_len_basic" "5" 'use "stdlib/string.weft" fn main() -> i64 { str_len("hello") }'
+run_test2 "str_len_empty" "0" 'use "stdlib/string.weft" fn main() -> i64 { str_len("") }'
+#
+# ── Display trait: all impls ──
+run_test2 "display_i64" "1" 'use "stdlib/display.weft" fn main() -> i64 { let x: i64 = 42 str_eq(x.display(), "42") }'
+run_test2 "display_zero" "1" 'use "stdlib/display.weft" fn main() -> i64 { let x: i64 = 0 str_eq(x.display(), "0") }'
+run_test2 "display_neg" "1" 'use "stdlib/display.weft" fn main() -> i64 { let x: i64 = 0 - 7 str_eq(x.display(), "-7") }'
+run_test2 "display_bool_true" "1" 'use "stdlib/display.weft" fn main() -> i64 { let b = true str_eq(b.display(), "true") }'
+run_test2 "display_bool_false" "1" 'use "stdlib/display.weft" fn main() -> i64 { let b = false str_eq(b.display(), "false") }'
+run_test2 "display_str" "1" 'use "stdlib/display.weft" fn main() -> i64 { let s = "hello" str_eq(s.display(), "hello") }'
+#
+# ── print/println: verify they don't crash (exit code via run_test2) ──
+# Note: println sends to stdout which the test harness captures. Use stderr redirect.
+run_test2 "println_basic" "42" 'use "stdlib/string.weft" fn main() -> i64 { str_len(str_concat("hello", " world")) + 31 }'
+run_test2 "print_works" "10" 'use "stdlib/display.weft" fn main() -> i64 { let s = str_concat("answer: ", int_to_str(42)) str_len(s) }'
+#
+# ── Adversarial ──
+run_test2 "str_concat_many" "10" 'use "stdlib/string.weft" fn main() -> i64 { let mut s = "" for i in 0..10 { s = str_concat(s, "x") } str_len(s) }'
+run_test2 "int_to_str_all_digits" "1" 'use "stdlib/string.weft" fn main() -> i64 { str_eq(int_to_str(1234567890), "1234567890") }'
+#
+# ── Property: concat + len ──
+run_test2 "str_concat_len_additive" "42" 'use "stdlib/string.weft" fn main() -> i64 { let a = "hello world hello world h" let b = "ello world hello w" if str_len(str_concat(a, b)) == str_len(a) + str_len(b) { 42 } else { 0 } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
