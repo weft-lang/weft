@@ -2178,6 +2178,39 @@ run_test2 "forin_mixed" "42" 'use "stdlib/list.weft" fn main() -> i64 { let mut 
 run_test2 "forin_eq_fold" "42" 'use "stdlib/list.weft" fn main() -> i64 { let xs = list_range(0, 42) let fc = list_fold<i64, i64>(xs, 0, (acc: i64, x: i64) => acc + 1) let mut ic: i64 = 0 for x in xs { ic = ic + 1 } if fc == ic { 42 } else { 0 } }'
 # ── Property: for-in sum == list_fold sum ──
 run_test2 "forin_eq_fold_sum" "1" 'use "stdlib/list.weft" fn main() -> i64 { let xs = list_range(0, 10) let fs = list_fold<i64, i64>(xs, 0, (acc: i64, x: i64) => acc + x) let mut is: i64 = 0 for x in xs { is = is + x } if fs == is { 1 } else { 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 66. END-TO-END PROGRAMS — real programs combining multiple features
+# ═══════════════════════════════════════════════════════════════
+# These test .weft files exercise feature combinations:
+# traits + generics + effects + stdlib + syntax sugar together.
+#
+run_test_file() {
+  local name="$1" expected="$2" file="$3"
+  /tmp/weft2 < "$file" > /tmp/t2 2>/dev/null && chmod +x /tmp/t2
+  local got=$(/tmp/t2 2>/dev/null; echo $?)
+  if [ "$got" = "$expected" ]; then
+    PASS2=$((PASS2+1))
+  else
+    echo "  ✗ $name = $got (expected $expected)"
+    FAIL2=$((FAIL2+1))
+  fi
+}
+# ── FizzBuzz: for-range, if/else, modulo ──
+run_test_file "e2e_fizzbuzz" "6" "test/e2e_fizzbuzz.weft"
+# ── Word count: List, Map (CHAMP), for-in ──
+run_test_file "e2e_word_count" "3" "test/e2e_word_count.weft"
+# ── Pipeline: List, fold, lambdas ──
+run_test_file "e2e_pipeline" "42" "test/e2e_pipeline.weft"
+# ── Error handling: Result, Fail, ? operator, if-let ──
+run_test_file "e2e_error_handling" "42" "test/e2e_error_handling.weft"
+# ── Generic collections: generics, traits, monomorphisation, for-in ──
+run_test_file "e2e_generic_collection" "42" "test/e2e_generic_collection.weft"
+# ── Stateful computation: effects, handlers, for-range, closures, heap state cell ──
+run_test_file "e2e_effect_state" "42" "test/e2e_effect_state.weft"
+# ── String builder: for-in, string concat, Display ──
+run_test_file "e2e_string_builder" "42" "test/e2e_string_builder.weft"
+# ── CHAMP analytics: Map, Set, List, for-in, for-range, histogram, unique count ──
+run_test_file "e2e_champ_analytics" "42" "test/e2e_champ_analytics.weft"
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
