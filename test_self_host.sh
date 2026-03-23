@@ -2123,6 +2123,33 @@ run_test2 "try_in_iflet" "42" 'use "stdlib/result.weft" use "stdlib/fail.weft" u
 run_test2 "try_in_loop" "42" 'use "stdlib/result.weft" use "stdlib/fail.weft" fn check(i: i64) -> i64 { if i < 100 { Ok<i64>(1) } else { Err<i64>(i) } } fn go() -[Fail]> i64 { let mut sum: i64 = 0 for i in 0..42 { sum = sum + check(i)? } sum } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(0) } }'
 # ── Property: ? on Ok is identity ──
 run_test2 "try_ok_identity" "42" 'use "stdlib/result.weft" use "stdlib/fail.weft" fn go() -[Fail]> i64 { let x: i64 = 42 let r = Ok<i64>(x) let v = r? v } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(0) } }'
+# ═══════════════════════════════════════════════════════════════
+# 64. STRING INTERPOLATION — comprehensive
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: basic interpolation ──
+run_test2 "interp_basic" "11" 'use "stdlib/string.weft" fn main() -> i64 { let name = "world" str_len("hello {name}") }'
+run_test2 "interp_content" "1" 'use "stdlib/string.weft" fn main() -> i64 { let name = "world" str_eq("hello {name}", "hello world") }'
+# ── Happy: multiple interpolations ──
+run_test2 "interp_multi" "1" 'use "stdlib/string.weft" fn main() -> i64 { let a = "hello" let b = "world" str_eq("{a} {b}", "hello world") }'
+# ── Happy: interpolation with int_to_str ──
+run_test2 "interp_int" "1" 'use "stdlib/display.weft" fn main() -> i64 { let x = int_to_str(42) str_eq("val: {x}", "val: 42") }'
+# ── Happy: interpolation at start ──
+run_test2 "interp_start" "1" 'use "stdlib/string.weft" fn main() -> i64 { let x = "hello" str_eq("{x} world", "hello world") }'
+# ── Happy: interpolation at end ──
+run_test2 "interp_end" "1" 'use "stdlib/string.weft" fn main() -> i64 { let x = "world" str_eq("hello {x}", "hello world") }'
+# ── Happy: plain string unchanged ──
+run_test2 "interp_plain" "11" 'use "stdlib/string.weft" fn main() -> i64 { str_len("hello world") }'
+# ── Sad: no interpolation on non-ident { ──
+run_test2 "interp_no_false_pos" "42" 'fn main() -> i64 { 42 }'
+# ── Variant: empty string with interpolation ──
+run_test2 "interp_just_var" "5" 'use "stdlib/string.weft" fn main() -> i64 { let x = "hello" str_len("{x}") }'
+# ── Variant: adjacent interpolations ──
+run_test2 "interp_adjacent" "1" 'use "stdlib/string.weft" fn main() -> i64 { let a = "ab" let b = "cd" str_eq("{a}{b}", "abcd") }'
+# ── Adversarial: interpolation + concat ──
+run_test2 "interp_with_concat" "1" 'use "stdlib/string.weft" fn main() -> i64 { let name = "world" let greeting = "hello {name}" str_eq(str_concat(greeting, "!"), "hello world!") }'
+# ── Property: interpolation is equivalent to str_concat ──
+run_test2 "interp_eq_concat" "1" 'use "stdlib/string.weft" fn main() -> i64 { let x = "world" str_eq("hello {x}", str_concat("hello ", x)) }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
