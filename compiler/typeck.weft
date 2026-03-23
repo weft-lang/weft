@@ -182,6 +182,74 @@ fn ctable_conforms(ct: i64, type_hash: i64, trait_hash: i64) -> i64 {
 
 -- Build conformance table from impl blocks in the ttable
 -- Scans for kind=4 entries (impl blocks) and registers conformances
+-- Look up a trait declaration in the ttable by name hash.
+-- Returns the methods list (nlist of tag-39 nodes), or 0 if not found.
+fn lookup_trait_methods(tt: i64, src: i64, trait_hash: i64) -> i64 {
+  if tt == 0 { 0 }
+  else {
+    let n = __mem_load64(tt + 8)
+    let d = __mem_load64(tt)
+    let mut i = 0
+    let mut result = 0
+    while i < n {
+      let kind = __mem_load64(d + i * 48 + 16)
+      if kind == 3 {
+        let t_ns = __mem_load64(d + i * 48)
+        let t_nl = __mem_load64(d + i * 48 + 8)
+        let t_hash = effect_name_hash(src, t_ns, t_nl)
+        if t_hash == trait_hash {
+          result = __mem_load64(d + i * 48 + 32)
+          i = n
+        } else { i = i + 1 }
+      } else { i = i + 1 }
+    }
+    result
+  }
+}
+
+-- Verify that an impl block's methods match the trait declaration.
+-- Returns number of errors found.
+fn verify_impl_methods(impl_methods: i64, trait_methods: i64, src: i64, type_ns: i64, trait_hash: i64) -> i64 {
+  if trait_methods == 0 { 0 }
+  else {
+    let mut errors = 0
+    -- Check each trait method is present in the impl
+    let ntrait = nlist_len(trait_methods)
+    let nimpl = nlist_len(impl_methods)
+    let mut ti = 0
+    while ti < ntrait {
+      let tm = nlist_get(trait_methods, ti)
+      let tm_ns = node_f1(tm)
+      let tm_nl = node_f2(tm)
+      let tm_hash = effect_name_hash(src, tm_ns, tm_nl)
+      -- Search impl methods for this name
+      let mut found = false
+      let mut ii = 0
+      while ii < nimpl {
+        let im = nlist_get(impl_methods, ii)
+        -- impl methods are FnDecl (tag 23) wrappers
+        let im_inner = if node_tag(im) == 23 { node_f1(im) } else { im }
+        let im_ns = node_f1(im_inner)
+        let im_nl = node_f2(im_inner)
+        let im_hash = effect_name_hash(src, im_ns, im_nl)
+        if im_hash == tm_hash {
+          found = true
+          ii = nimpl
+        } else { ii = ii + 1 }
+      }
+      if not found {
+        eprint_span(src, type_ns)
+        eprint("type error: impl missing required method '")
+        sys_write(2, src + tm_ns, tm_nl)
+        eprint("'\n")
+        errors = errors + 1
+      } else { errors = errors }
+      ti = ti + 1
+    }
+    errors
+  }
+}
+
 fn build_ctable(tt: i64, src: i64) -> i64 {
   let ct = ctable_new()
   if tt == 0 { ct }
@@ -199,8 +267,16 @@ fn build_ctable(tt: i64, src: i64) -> i64 {
         let methods = __mem_load64(d + i * 48 + 32)
         let type_hash = type_name_hash(src, type_ns, type_nl)
         if trait_hash != 0 {
-          -- Trait impl: register (type_hash, trait_hash)
-          ctable_add(ct, type_hash, trait_hash, methods)
+          -- Trait impl: check coherence (no duplicate impls)
+          if ctable_conforms(ct, type_hash, trait_hash) == 1 {
+            eprint_span(src, type_ns)
+            eprint("type error: conflicting implementations of trait for type\n")
+          } else {
+            -- Verify methods match trait declaration, then register
+            let trait_methods = lookup_trait_methods(tt, src, trait_hash)
+            verify_impl_methods(methods, trait_methods, src, type_ns, trait_hash)
+            ctable_add(ct, type_hash, trait_hash, methods)
+          }
         } else { 0 }
       } else { 0 }
       i = i + 1
@@ -223,17 +299,24 @@ fn check_trait_bounds(tparams: i64, type_args: i64, src: i64, call_ns: i64, tt: 
   let mut i = 0
   while i < n {
     let tp = nlist_get(tparams, i)
-    let bound = node_f4(tp)
-    if bound != 0 {
+    let bounds = node_f4(tp)
+    if bounds != 0 {
+      -- bounds is an nlist of trait hashes
       if i < nlist_len(type_args) {
         let type_arg = nlist_get(type_args, i)
         let concrete_hash = type_hash_of(type_arg)
-        -- Query the conformance oracle via effect
-        if Conformance.conforms(concrete_hash, bound) == 0 {
-          eprint_span(src, call_ns)
-          eprint("type error: type does not satisfy trait bound\n")
-          errors = errors + 1
-        } else { errors = errors }
+        -- Check each bound in the list
+        let nbounds = nlist_len(bounds)
+        let mut bi = 0
+        while bi < nbounds {
+          let trait_hash = nlist_get(bounds, bi)
+          if Conformance.conforms(concrete_hash, trait_hash) == 0 {
+            eprint_span(src, call_ns)
+            eprint("type error: type does not satisfy trait bound\n")
+            errors = errors + 1
+          } else { errors = errors }
+          bi = bi + 1
+        }
       } else { errors = errors }
     } else { errors = errors }
     i = i + 1
@@ -527,7 +610,23 @@ fn synth_method_call(node: i64, recv_ty: i64, env: i64, ft: i64, src: i64, tt: i
     -- Primitive type: negative ID matching type_name_hash convention
     let pid = ty_f1(recv_ty)
     0 - pid - 1
-  } else { 0 } }
+  } else { if ty_tag(recv_ty) == 12 {
+    -- TypeVar: look up bound from current function's tparams
+    -- The bound's trait hash becomes the type_hash for method resolution
+    let var_id = ty_f1(recv_ty)
+    let tparams = ttable_get_tparams(tt)
+    if tparams != 0 {
+      if var_id < nlist_len(tparams) {
+        let tp = nlist_get(tparams, var_id)
+        let bounds = node_f4(tp)
+        -- Use the first bound's trait hash as the type_hash
+        -- (method resolution on a bounded type var resolves to the trait)
+        if bounds != 0 {
+          if nlist_len(bounds) > 0 { nlist_get(bounds, 0) } else { 0 }
+        } else { 0 }
+      } else { 0 }
+    } else { 0 }
+  } else { 0 } } }
   -- Mutate the node: change tag to 41, store type_hash in a recoverable place
   -- Tag 41 = MethodCall: f1=receiver, f2=method_hash, f3=args, f4=type_hash
   -- We reuse f4 (was nargs) — store nargs in the args list length instead
@@ -901,6 +1000,10 @@ fn check_fn(fn_node: i64, ft: i64, src: i64, tt: i64) -> i64 {
     env = tenv_bind(env, src, node_f1(p), node_f2(p), ty)
     i = i + 1
   }
+  -- Store current function's tparams for generic method resolution
+  let tparams = fn_tparams(fn_node)
+  let saved_tparams = ttable_get_tparams(tt)
+  ttable_set_tparams(tt, tparams)
   let caller_eff = fn_effects(fn_node)
   let mut errors = check_expr(body, env, ft, src, caller_eff, tt)
   -- Check return type: body type must be subtype of declared return type
@@ -911,6 +1014,8 @@ fn check_fn(fn_node: i64, ft: i64, src: i64, tt: i64) -> i64 {
     eprint("type error: return type mismatch\n")
     errors = errors + 1
   } else { errors = errors }
+  -- Restore previous function's tparams
+  ttable_set_tparams(tt, saved_tparams)
   errors
 }
 
