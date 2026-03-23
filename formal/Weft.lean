@@ -1,8 +1,10 @@
 import Weft.Compiler
+import Weft.CoreMachine
 import Weft.Effects
 import Weft.SafetyCore
 import Weft.Syntax
 import Weft.Types
+import Weft.Properties.CoreCompilerCorrectness
 import Weft.Properties.CompilerCorrectness
 import Weft.Properties.EffectDiscipline
 import Weft.Properties.TypeSafetyCore

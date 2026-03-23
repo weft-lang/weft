@@ -25,6 +25,9 @@ The first cut lands three things:
 3. `Weft/Compiler.lean` + `Weft/Properties/CompilerCorrectness.lean`
    A generic end-to-end stage-composition theorem over full observable I/O
    behaviors, including the bootstrap-parity shape we need for self-hosting.
+4. `Weft/CoreMachine.lean` + `Weft/Properties/CoreCompilerCorrectness.lean`
+   A concrete verified compiler for the proved safety core, giving a real
+   source-to-machine preservation theorem rather than only abstract stage laws.
 
 ## Near-Term Expansion
 
