@@ -7,6 +7,7 @@ import Weft.CorePipeline
 import Weft.CoreMachine
 import Weft.CoreSubtype
 import Weft.Effects
+import Weft.KernelModel
 import Weft.SafetyCore
 import Weft.Syntax
 import Weft.TyDNF
@@ -28,6 +29,7 @@ import Weft.Properties.CoreTypecheckCorrectness
 import Weft.Properties.CompilerCorrectness
 import Weft.Properties.CoreDNFSoundness
 import Weft.Properties.EffectDiscipline
+import Weft.Properties.KernelModelSoundness
 import Weft.Properties.TyDNFSoundness
 import Weft.Properties.TyTheorySoundness
 import Weft.Properties.TypeSafetyCore

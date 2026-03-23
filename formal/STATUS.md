@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **45%** of the way to the complete theorem.
+Roughly **47%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -31,7 +31,7 @@ That estimate is based on:
 | Pure core source-to-machine correctness | 85% | Concrete compiler, staged pipeline, and typed-result preservation are proved. |
 | Handled-effect core correctness | 80% | Trace-preserving compilation, staged effectful compiler theorem, and machine-level effect/result conformance are proved. |
 | Result-carrying semantic observations | 70% | Successful staged compilations now preserve and reflect trace/result behaviors. |
-| Set-theoretic normalization/subtyping | 52% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, and theory-aware unsatisfiability now implies semantic subtyping under sound kernel valuations. Full executable oracle-backed semantic subtyping is still missing. |
+| Set-theoretic normalization/subtyping | 56% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, theory-aware unsatisfiability implies semantic subtyping under sound valuations, and the kernel theory now has a concrete tag-level semantic model. Full executable oracle-backed semantic subtyping is still missing. |
 | Runtime semantics (`IO`, `Alloc`, `Unsafe`) | 10% | Only abstract observable behavior scaffolding exists so far. |
 | Continuations / handler operational model | 10% | Tail-resumptive handled-effect core exists, but full continuation semantics is not yet formalized. |
 | Native backend / object emission bridge | 10% | Machine model exists for core targets, but not a real aarch64/Mach-O semantic bridge. |
@@ -41,12 +41,28 @@ That estimate is based on:
 
 Current frontier:
 
+- kernel tag semantic model
+  The atom theory is no longer justified only by abstract “sound valuations.”
+  We now have a concrete tag-level interpretation for primitive values,
+  functions, records, nominals, and pointer flavors, plus proofs that the
+  kernel theory is sound for those tags. Concretely: `rc` and `mptr` values now
+  inhabit `ptr` semantics in an actual model, which is a real step from
+  theorem-shape subtyping toward theorem-shape runtime semantics.
+
 - theory-aware atomized subtype rules
   The whole-`Ty` DNF layer is no longer purely structural. We now have an
   explicit semantic theory of atom implication/disjointness and a proof bridge
   from normalized unsatisfiability to semantic subtyping under sound
   valuations. Concretely, this is the first whole-`Ty` step where kernel facts
   like `rc T <: ptr T` live in the theorem story rather than only in prose.
+
+- `a61a4eb` `formal: add theory-aware atomized subtype rules`
+  The atomized whole-`Ty` DNF layer now supports explicit implication and
+  disjointness assumptions with proofs that normalized unsatisfiability implies
+  semantic subtyping under any valuation respecting those assumptions.
+  Concretely: the formal development can now express kernel facts like
+  `rc T <: ptr T` at the whole-`Ty` semantic level instead of only inside the
+  tiny finite core.
 
 - `0e9dee2` `formal: prove staged effect compiler equivalence`
   Successful staged handled-effect compilations are no longer only forward

@@ -91,11 +91,18 @@ The first cut lands three things:
     normalized unsatisfiability implies semantic subtyping under sound
     valuations, and instantiate that bridge with concrete kernel facts such as
     `rc T <: ptr T`, `mptr T <: ptr T`, and `bool & int` being empty.
+18. `Weft/KernelModel.lean` + `Weft/Properties/KernelModelSoundness.lean`
+    A concrete tag-level semantic model for the kernel atom theory. The new
+    model gives explicit sound valuations for primitive tags, functions,
+    records, nominals, and pointer flavors, then reuses the theory-aware
+    subtyping theorems to show that concrete `rc` and `mptr` runtime tags
+    inhabit `ptr` semantics and that `bool & int` is empty on every kernel tag.
 
 ## Near-Term Expansion
 
 - scale DNF normalization from the finite core to the real semantic subtype algebra
 - add executable/oracle-backed unsatisfiability checks over the whole-`Ty` atom theory
+- grow the kernel tag model into fuller runtime observations for `IO`, allocation, and unsafe boundaries
 - effect handler operational semantics and discharge proofs
 - one-shot continuation linearity
 - unsafe boundary and allocation confinement theorems
