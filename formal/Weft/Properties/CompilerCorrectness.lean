@@ -3,16 +3,18 @@ import Weft.Compiler
 namespace Weft
 
 theorem semantics_eq_refl
+    {Obs : Type}
     {α : Type}
-    (sem : Semantics α)
+    (sem : Semantics α Obs)
     (artifact : α) :
     SemanticEq sem artifact artifact := by
   intro input behavior
   constructor <;> intro h <;> exact h
 
 theorem semantics_eq_symm
+    {Obs : Type}
     {α : Type}
-    (sem : Semantics α)
+    (sem : Semantics α Obs)
     {lhs rhs : α}
     (hEq : SemanticEq sem lhs rhs) :
     SemanticEq sem rhs lhs := by
@@ -20,8 +22,9 @@ theorem semantics_eq_symm
   exact Iff.symm (hEq input behavior)
 
 theorem semantics_eq_trans
+    {Obs : Type}
     {α : Type}
-    (sem : Semantics α)
+    (sem : Semantics α Obs)
     {lhs mid rhs : α}
     (h₁ : SemanticEq sem lhs mid)
     (h₂ : SemanticEq sem mid rhs) :
@@ -34,10 +37,11 @@ theorem semantics_eq_trans
     exact (h₁ input behavior).2 ((h₂ input behavior).2 h)
 
 theorem preserves_comp
+    {Obs : Type}
     {α β γ : Type}
-    {sourceSem : Semantics α}
-    {midSem : Semantics β}
-    {targetSem : Semantics γ}
+    {sourceSem : Semantics α Obs}
+    {midSem : Semantics β Obs}
+    {targetSem : Semantics γ Obs}
     {s₁ : Stage α β}
     {s₂ : Stage β γ}
     (h₁ : SemanticsPreserving sourceSem midSem s₁)
@@ -52,12 +56,13 @@ theorem preserves_comp
       exact h₂ mid artifact input behavior hCompile (h₁ source mid input behavior hStage₁ hSource)
 
 theorem whole_compiler_theorem
+    {Obs : Type}
     (pipeline : CompilerPipeline)
-    (sourceSem : Semantics pipeline.Source)
-    (parsedSem : Semantics pipeline.Parsed)
-    (typedSem : Semantics pipeline.Typed)
-    (irSem : Semantics pipeline.IR)
-    (nativeSem : Semantics pipeline.Native)
+    (sourceSem : Semantics pipeline.Source Obs)
+    (parsedSem : Semantics pipeline.Parsed Obs)
+    (typedSem : Semantics pipeline.Typed Obs)
+    (irSem : Semantics pipeline.IR Obs)
+    (nativeSem : Semantics pipeline.Native Obs)
     (hParse : SemanticsPreserving sourceSem parsedSem pipeline.parse)
     (hTypecheck : SemanticsPreserving parsedSem typedSem pipeline.typecheck)
     (hLower : SemanticsPreserving typedSem irSem pipeline.lower)
@@ -72,8 +77,9 @@ theorem whole_compiler_theorem
   · exact hEmit
 
 theorem bootstrap_semantics_stable
+    {Obs : Type}
     {α : Type}
-    (sem : Semantics α)
+    (sem : Semantics α Obs)
     {compiler₁ compiler₂ compiler₃ : α}
     (h₁₂ : SemanticEq sem compiler₁ compiler₂)
     (h₂₃ : SemanticEq sem compiler₂ compiler₃) :

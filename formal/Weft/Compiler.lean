@@ -16,7 +16,7 @@ structure Behavior : Type where
   deriving Repr, DecidableEq
 
 abbrev Input : Type := List UInt8
-abbrev Semantics (α : Type) : Type := α -> Input -> Behavior -> Prop
+abbrev Semantics (α : Type) (β : Type := Behavior) : Type := α -> Input -> β -> Prop
 
 structure Stage (α β : Type) where
   compile : α -> Except String β
@@ -32,16 +32,17 @@ def comp {α β γ : Type} (s₂ : Stage β γ) (s₁ : Stage α β) : Stage α 
 end Stage
 
 def SemanticsPreserving
-    {α β : Type}
-    (sourceSem : Semantics α)
-    (targetSem : Semantics β)
-    (stage : Stage α β) : Prop :=
+    {Obs : Type}
+    {α γ : Type}
+    (sourceSem : Semantics α Obs)
+    (targetSem : Semantics γ Obs)
+    (stage : Stage α γ) : Prop :=
   ∀ source artifact input behavior,
     stage.compile source = .ok artifact ->
     sourceSem source input behavior ->
     targetSem artifact input behavior
 
-def SemanticEq {α : Type} (sem : Semantics α) (lhs rhs : α) : Prop :=
+def SemanticEq {Obs : Type} {α : Type} (sem : Semantics α Obs) (lhs rhs : α) : Prop :=
   ∀ input behavior, sem lhs input behavior ↔ sem rhs input behavior
 
 structure CompilerPipeline where

@@ -54,6 +54,9 @@ The first cut lands three things:
 11. `Weft/CoreEffectMachine.lean` + `Weft/Properties/CoreEffectCompilerCorrectness.lean`
     A concrete effectful compiler target for handled effects, with exact
     preservation of both result values and effect traces through compilation.
+12. `Weft/CoreEffectPipeline.lean` + `Weft/Properties/CoreEffectPipelineCorrectness.lean`
+    A staged handled-effect pipeline, parameterized by the effect oracle and
+    proved with the same whole-compiler composition theorem as the pure core.
 
 ## Near-Term Expansion
 
