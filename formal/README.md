@@ -40,6 +40,10 @@ The first cut lands three things:
    A handled-effect core with explicit capability typing and proofs that
    evaluation traces stay within the declared effect set and that handling
    actually confines the handled effect.
+8. `Weft/CoreSubtype.lean` + `Weft/Properties/CoreSubtypeSoundness.lean`
+   A finite semantic core for union/intersection/complement, with decision
+   procedures for emptiness and subtyping plus proofs that subtyping is exactly
+   emptiness of `A & ~B` on the finite model.
 
 ## Near-Term Expansion
 

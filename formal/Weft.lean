@@ -2,6 +2,7 @@ import Weft.Compiler
 import Weft.CoreEffects
 import Weft.CorePipeline
 import Weft.CoreMachine
+import Weft.CoreSubtype
 import Weft.Effects
 import Weft.SafetyCore
 import Weft.Syntax
@@ -10,6 +11,7 @@ import Weft.Properties.CoreCompilerCorrectness
 import Weft.Properties.CoreEffectSoundness
 import Weft.Properties.CorePipelineCorrectness
 import Weft.Properties.CoreSemanticSoundness
+import Weft.Properties.CoreSubtypeSoundness
 import Weft.Properties.CompilerCorrectness
 import Weft.Properties.EffectDiscipline
 import Weft.Properties.TypeSafetyCore
