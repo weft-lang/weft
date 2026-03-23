@@ -2229,6 +2229,27 @@ run_test2 "hinline_nested" "42" 'effect A { fn a() -> i64 } effect B { fn b() ->
 run_test2 "hinline_poly" "42" 'effect IO { fn print() -> i64 } fn apply<T, E>(f: () -[E]> T) -[E]> T { f() } fn do_io() -[IO]> i64 { IO.print() } fn main() -> i64 { handle apply<i64, IO>(do_io) { IO.print() -> resume(42) } }'
 # ── Property: inlined produces same result as non-inlined ──
 run_test2 "hinline_equiv" "42" 'effect E { fn v() -> i64 } fn inner() -[E]> i64 { E.v() } fn main() -> i64 { let r1 = handle inner() { E.v() -> resume(42) } let r2 = handle inner() { E.v() -> resume(42) } if r1 == r2 { 42 } else { 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 68. MAP ITERATION — map_fold, map_keys, map_values, map_size
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy paths ──
+run_test2 "map_size_empty" "0" 'use "stdlib/map.weft" fn main() -> i64 { map_size(map_new()) }'
+run_test2 "map_size_one" "1" 'use "stdlib/map.weft" fn main() -> i64 { map_size(map_put(map_new(), 1, 42)) }'
+run_test2 "map_size_42" "42" 'use "stdlib/map.weft" fn main() -> i64 { let mut m = map_new() for i in 0..42 { m = map_put(m, i, i) } map_size(m) }'
+run_test2 "map_fold_sum" "42" 'use "stdlib/map.weft" fn main() -> i64 { let m = map_put(map_put(map_put(map_new(), 1, 10), 2, 12), 3, 20) map_fold(m, 0, (a: i64, k: i64, v: i64) => a + v) }'
+run_test2 "map_fold_keys" "42" 'use "stdlib/map.weft" fn main() -> i64 { let m = map_put(map_put(map_new(), 20, 1), 22, 1) map_fold(m, 0, (a: i64, k: i64, v: i64) => a + k) }'
+run_test2 "map_keys_sum" "30" 'use "stdlib/map.weft" use "stdlib/list.weft" fn main() -> i64 { let m = map_put(map_put(map_new(), 10, 1), 20, 2) let mut s: i64 = 0 for k in map_keys(m) { s = s + k } s }'
+run_test2 "map_values_sum" "42" 'use "stdlib/map.weft" use "stdlib/list.weft" fn main() -> i64 { let m = map_put(map_put(map_new(), 1, 20), 2, 22) let mut s: i64 = 0 for v in map_values(m) { s = s + v } s }'
+# ── Sad paths ──
+run_test2 "map_fold_empty" "42" 'use "stdlib/map.weft" fn main() -> i64 { map_fold(map_new(), 42, (a: i64, k: i64, v: i64) => 0) }'
+run_test2 "map_keys_empty" "42" 'use "stdlib/map.weft" use "stdlib/list.weft" fn main() -> i64 { match map_keys(map_new()) { Nil -> 42 Cons(x, r) -> 0 } }'
+# ── Property: size == fold count ──
+run_test2 "map_size_eq_fold" "42" 'use "stdlib/map.weft" fn main() -> i64 { let mut m = map_new() for i in 0..42 { m = map_put(m, i, i) } let sz = map_size(m) let fc = map_fold(m, 0, (a: i64, k: i64, v: i64) => a + 1) if sz == fc { 42 } else { 0 } }'
+# ── Property: fold sum of values == sum of map_values list ──
+run_test2 "map_fold_eq_values" "1" 'use "stdlib/map.weft" use "stdlib/list.weft" fn main() -> i64 { let m = map_put(map_put(map_put(map_new(), 1, 10), 2, 20), 3, 12) let fs = map_fold(m, 0, (a: i64, k: i64, v: i64) => a + v) let mut vs: i64 = 0 for v in map_values(m) { vs = vs + v } if fs == vs { 1 } else { 0 } }'
+# ── Adversarial: iterate large map ──
+run_test2 "map_fold_50" "50" 'use "stdlib/map.weft" fn main() -> i64 { let mut m = map_new() for i in 0..50 { m = map_put(m, i, 1) } map_fold(m, 0, (a: i64, k: i64, v: i64) => a + v) }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
