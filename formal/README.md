@@ -56,7 +56,9 @@ The first cut lands three things:
     preservation of both result values and effect traces through compilation.
 12. `Weft/CoreEffectPipeline.lean` + `Weft/Properties/CoreEffectPipelineCorrectness.lean`
     A staged handled-effect pipeline, parameterized by the effect oracle and
-    proved with the same whole-compiler composition theorem as the pure core.
+    proved with the same whole-compiler composition theorem as the pure core,
+    now strengthened with reverse compilation lemmas so successful staged
+    compilations satisfy a source/machine semantics `iff`.
 13. `Weft/Properties/CoreEffectTypecheckCorrectness.lean`,
     `Weft/Properties/CoreEffectSemanticSoundness.lean`,
     `Weft/Properties/CoreEffectSubtypeChecking.lean`
@@ -66,7 +68,8 @@ The first cut lands three things:
     compile to trace-free executions whose results inhabit the requested type.
 14. `Weft/Properties/CoreEffectPipelineSemanticSoundness.lean`
     The staged handled-effect pipeline now carries those type and effect-trace
-    guarantees all the way from surface syntax to emitted code.
+    guarantees all the way from surface syntax to emitted code, including direct
+    machine-execution theorems for accepted compiled programs.
 
 ## Near-Term Expansion
 

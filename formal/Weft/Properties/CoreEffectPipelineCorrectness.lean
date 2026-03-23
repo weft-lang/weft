@@ -93,6 +93,11 @@ theorem lower_stage_preserves
   rcases hChecked with ⟨value, trace, hEval, hBehavior⟩
   exact ⟨value, trace, lower_eval_preserves hEval, hBehavior⟩
 
+@[simp] theorem lower_toExpr
+    (expr : Expr) :
+    (lower expr).toExpr = expr := by
+  induction expr <;> simp [lower, IRExpr.toExpr, *]
+
 theorem irEval_to_source
     {oracle : Oracle}
     {ir : IRExpr}
@@ -167,6 +172,12 @@ theorem emit_correct
   simpa [emitClosed] using
     emit_correct_aux oracle ir value trace .halt [] [value] [] hEval (Exec.halt oracle [value])
 
+theorem emitClosed_eq_compileClosed
+    (expr : Expr) :
+    emitClosed (lower expr) = compileClosed expr := by
+  simpa [emitClosed, compileClosed, lower_toExpr] using
+    emitIR_eq_compile_toExpr (lower expr) .halt
+
 theorem emit_stage_preserves
     (oracle : Oracle) :
     Weft.SemanticsPreserving (irSem oracle) (machineSem oracle) emitStage := by
@@ -192,5 +203,48 @@ theorem staged_whole_compiler_theorem
       (typecheck_stage_preserves oracle)
       (lower_stage_preserves oracle)
       (emit_stage_preserves oracle))
+
+theorem staged_compile_eq_emitClosed
+    {surface : SurfaceExpr}
+    {code : Code}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code) :
+    code = emitClosed (lower (parseSurface surface)) := by
+  unfold Weft.CompilerPipeline.compile Weft.Stage.comp stagedCompilerPipeline at hCompile
+  cases hCheck : check (parseSurface surface) with
+  | none =>
+      simp [parseStage, typecheckStage, lowerStage, emitStage, hCheck] at hCompile
+  | some checked =>
+      simp [parseStage, typecheckStage, lowerStage, emitStage, hCheck] at hCompile
+      exact hCompile.symm
+
+theorem staged_compile_complete
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {code : Code}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hExec : Exec oracle code [] [value] trace) :
+    Eval oracle (parseSurface surface) value trace := by
+  have hCode : code = emitClosed (lower (parseSurface surface)) :=
+    staged_compile_eq_emitClosed hCompile
+  subst code
+  rw [emitClosed_eq_compileClosed] at hExec
+  exact compile_complete oracle (parseSurface surface) value trace hExec
+
+theorem staged_semantics_iff
+    (oracle : Oracle)
+    {surface : SurfaceExpr}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : EffectBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code) :
+    surfaceSem oracle surface input behavior ↔ machineSem oracle code input behavior := by
+  constructor
+  · intro hSurface
+    exact staged_whole_compiler_theorem oracle surface code input behavior hCompile hSurface
+  · intro hMachine
+    rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+    exact ⟨value, trace, staged_compile_complete hCompile hExec, hBehavior⟩
 
 end Weft.CoreEffects
