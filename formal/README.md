@@ -51,6 +51,9 @@ The first cut lands three things:
     A subtype-aware checking layer over inferred core types, with proofs that a
     successful expected-type check is both complete for the representable core
     fragment and semantically respected by evaluation results.
+11. `Weft/CoreEffectMachine.lean` + `Weft/Properties/CoreEffectCompilerCorrectness.lean`
+    A concrete effectful compiler target for handled effects, with exact
+    preservation of both result values and effect traces through compilation.
 
 ## Near-Term Expansion
 
