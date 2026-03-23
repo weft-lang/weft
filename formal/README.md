@@ -36,6 +36,10 @@ The first cut lands three things:
    A genuinely staged core compiler theorem: surface syntax -> parsed core ->
    checked core -> lowered IR -> machine code, with preservation proved at each
    stage and composed through the generic pipeline theorem.
+7. `Weft/CoreEffects.lean` + `Weft/Properties/CoreEffectSoundness.lean`
+   A handled-effect core with explicit capability typing and proofs that
+   evaluation traces stay within the declared effect set and that handling
+   actually confines the handled effect.
 
 ## Near-Term Expansion
 
