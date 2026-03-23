@@ -2270,6 +2270,26 @@ run_test2 "optchain_second_field" "42" 'use "stdlib/maybe.weft" type P { x: i64,
 run_test2 "optchain_in_expr" "42" 'use "stdlib/maybe.weft" type R { val: i64 } fn add(a: i64, b: i64) -[Maybe]> i64 { a?.val + b?.val } fn main() -> i64 { handle add(R { val: 20 }, R { val: 22 }) { Maybe.none() -> resume(0) } }'
 # ── Property: ?. on non-nil is identity for field access ──
 run_test2 "optchain_eq_field" "1" 'use "stdlib/maybe.weft" type R { val: i64 } fn main() -> i64 { let r = R { val: 42 } let direct = r.val let chained = handle { r?.val } { Maybe.none() -> resume(0) } if direct == chained { 1 } else { 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 70. LOOP EXPRESSION — comprehensive
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: basic loop with break ──
+run_test2 "loop_basic" "42" 'fn main() -> i64 { let mut x: i64 = 0 loop { x = x + 1 if x == 42 { break } else { 0 } } x }'
+# ── Happy: loop as expression with break(value) ──
+run_test2 "loop_expr" "42" 'fn main() -> i64 { loop { break(42) } }'
+# ── Happy: loop with counter ──
+run_test2 "loop_counter" "100" 'fn main() -> i64 { let mut n: i64 = 0 loop { if n >= 100 { break } else { n = n + 1 } } n }'
+# ── Happy: loop with continue ──
+run_test2 "loop_continue" "42" 'fn main() -> i64 { let mut x: i64 = 0 let mut skipped: i64 = 0 loop { x = x + 1 if x > 42 { break } else { 0 } if x == 10 { skipped = skipped + 1 continue } else { 0 } } x - 1 }'
+# ── Boundary: immediate break ──
+run_test2 "loop_immediate" "42" 'fn main() -> i64 { let mut r: i64 = 42 loop { break } r }'
+# ── Adversarial: nested loops ──
+run_test2 "loop_nested" "42" 'fn main() -> i64 { let mut total: i64 = 0 let mut i: i64 = 0 loop { if i >= 6 { break } else { 0 } let mut j: i64 = 0 loop { if j >= 7 { break } else { 0 } total = total + 1 j = j + 1 } i = i + 1 } total }'
+# ── Adversarial: loop + method call ──
+run_test2 "loop_method" "42" 'impl i64 { fn inc(self: i64) -> i64 { self + 1 } } fn main() -> i64 { let mut x: i64 = 0 loop { x = x.inc() if x == 42 { break } else { 0 } } x }'
+# ── Property: loop + for equivalence ──
+run_test2 "loop_eq_for" "1" 'fn main() -> i64 { let mut a: i64 = 0 for i in 0..42 { a = a + 1 } let mut b: i64 = 0 let mut i: i64 = 0 loop { if i >= 42 { break } else { 0 } b = b + 1 i = i + 1 } if a == b { 1 } else { 0 } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
