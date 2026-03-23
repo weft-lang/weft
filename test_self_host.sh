@@ -2211,6 +2211,24 @@ run_test_file "e2e_effect_state" "42" "test/e2e_effect_state.weft"
 run_test_file "e2e_string_builder" "42" "test/e2e_string_builder.weft"
 # ── CHAMP analytics: Map, Set, List, for-in, for-range, histogram, unique count ──
 run_test_file "e2e_champ_analytics" "42" "test/e2e_champ_analytics.weft"
+# ═══════════════════════════════════════════════════════════════
+# 67. HANDLER INLINING — Stage 2 optimiser 2a
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: simple inline (no captures) ──
+run_test2 "hinline_basic" "42" 'effect E { fn get() -> i64 } fn go() -> i64 { handle E.get() { E.get() -> resume(42) } } fn main() -> i64 { go() }'
+# ── Happy: inline with arg ──
+run_test2 "hinline_arg" "42" 'effect E { fn add(x: i64) -> i64 } fn go() -> i64 { handle E.add(42) { E.add(x) -> resume(x) } } fn main() -> i64 { go() }'
+# ── Happy: inline in loop ──
+run_test2 "hinline_loop" "42" 'effect C { fn inc() -> i64 } fn go() -> i64 { let mut s: i64 = 0 handle { for i in 0..42 { s = s + C.inc() } s } { C.inc() -> resume(1) } } fn main() -> i64 { go() }'
+# ── Happy: captures fall back to runtime (still works) ──
+run_test2 "hinline_capture" "42" 'effect E { fn get() -> i64 } fn go() -> i64 { let val = 42 handle E.get() { E.get() -> resume(val) } } fn main() -> i64 { go() }'
+# ── Happy: nested handlers (inner inlined, outer runtime) ──
+run_test2 "hinline_nested" "42" 'effect A { fn a() -> i64 } effect B { fn b() -> i64 } fn go() -> i64 { handle { handle { A.a() + B.b() } { B.b() -> resume(22) } } { A.a() -> resume(20) } } fn main() -> i64 { go() }'
+# ── Adversarial: inline + effect-poly function ──
+run_test2 "hinline_poly" "42" 'effect IO { fn print() -> i64 } fn apply<T, E>(f: () -[E]> T) -[E]> T { f() } fn do_io() -[IO]> i64 { IO.print() } fn main() -> i64 { handle apply<i64, IO>(do_io) { IO.print() -> resume(42) } }'
+# ── Property: inlined produces same result as non-inlined ──
+run_test2 "hinline_equiv" "42" 'effect E { fn v() -> i64 } fn inner() -[E]> i64 { E.v() } fn main() -> i64 { let r1 = handle inner() { E.v() -> resume(42) } let r2 = handle inner() { E.v() -> resume(42) } if r1 == r2 { 42 } else { 0 } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""

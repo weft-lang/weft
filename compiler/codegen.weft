@@ -200,7 +200,7 @@ fn str_hash(src: i64, start: i64, len: i64) -> i64 {
 -- ======================================================================
 
 fn fmap_new() -> i64 {
-  let h = __bump_alloc(96)
+  let h = __bump_alloc(120)
   let d = __bump_alloc(64000)
   __mem_store64(h, d)
   __mem_store64(h + 8, 0)
@@ -221,6 +221,11 @@ fn fmap_new() -> i64 {
   __mem_store64(h + 80, mono_tmap_new())
   -- Specialisation cache: (spec_hash → code_offset) (offset 88)
   __mem_store64(h + 88, mono_cache_new())
+  -- Handler inlining context (offset 96): current handler info for static dispatch
+  -- [eff_hash(8), clause_infos_ptr(8), nclauses(8)] = 24 bytes at h+96..h+120
+  __mem_store64(h + 96, 0)
+  __mem_store64(h + 104, 0)
+  __mem_store64(h + 112, 0)
   h
 }
 fn fmap_set_tt(fm: i64, tt: i64) -> i64 { __mem_store64(fm + 48, tt) 0 }
@@ -1536,8 +1541,21 @@ fn cg_handle(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i
   if frame_ctr < 8 {
     bu32(code, encode_add_imm(frame_ctr + 19, 27, 0))
   } else { emit_store_reg(code, frame_ctr, 27) }
-  -- Phase 4: Compile body (handler is now active)
+  -- Phase 4: Set handler inlining context for body compilation
+  -- Save previous handler context
+  let prev_eff = __mem_load64(fm + 96)
+  let prev_infos = __mem_load64(fm + 104)
+  let prev_nc = __mem_load64(fm + 112)
+  -- Install current handler for inlining
+  __mem_store64(fm + 96, eff_hash)
+  __mem_store64(fm + 104, clause_infos)
+  __mem_store64(fm + 112, nclauses)
+  -- Compile body (handler is now active, performs can be inlined)
   let br = cg_expr(body, code, scope, src, frame_ctr + 1, fm)
+  -- Restore previous handler context
+  __mem_store64(fm + 96, prev_eff)
+  __mem_store64(fm + 104, prev_infos)
+  __mem_store64(fm + 112, prev_nc)
   -- Phase 5: Pop handler — restore x27 from frame.prev
   let fp = emit_load_reg(code, frame_ctr)
   bu32(code, cg_ldr(27, fp, 24))
@@ -1615,24 +1633,53 @@ fn cg_perform(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> 
     c = cg_expr(nlist_get(args, i), code, scope, src, c, fm)
     __mem_store64(arg_results + i * 8, c - 1)
   }
-  -- Inline handler lookup (x8-x14 as temps, x13 = ops entry on exit)
-  cg_perform_lookup(code, eff_hash, op_hash)
-  -- Load fn_ptr and env_ptr from ops entry
-  bu32(code, cg_ldr(9, 13, 8))
-  bu32(code, cg_ldr(0, 13, 16))
-  -- Set up args: x1..xN from callee-saved registers
-  for j in 0..nargs {
-    let actr = __mem_load64(arg_results + j * 8)
-    let ap = emit_load_reg(code, actr)
-    bu32(code, encode_add_imm(j + 1, ap, 0))
+  -- Check for handler inlining: is the current handler for this effect?
+  -- Only inline if the clause has no captures (nfree == 0).
+  -- Clauses with captures need the runtime env ptr from the ops array.
+  let inline_eff = __mem_load64(fm + 96)
+  let can_inline = if inline_eff == eff_hash {
+    let infos = __mem_load64(fm + 104)
+    let info = __mem_load64(infos)
+    let nfree = __mem_load64(info + 16)
+    if nfree == 0 { 1 } else { 0 }
+  } else { 0 }
+  if can_inline == 1 {
+    -- INLINED PATH: handler is statically known, no captures.
+    -- Direct BL to clause function with x0 = 0 (no env).
+    let infos = __mem_load64(fm + 104)
+    let info = __mem_load64(infos)
+    let clause_start = __mem_load64(info)
+    -- Set up args: x1..xN
+    for j in 0..nargs {
+      let actr = __mem_load64(arg_results + j * 8)
+      let ap = emit_load_reg(code, actr)
+      bu32(code, encode_add_imm(j + 1, ap, 0))
+    }
+    -- x0 = 0 (no env)
+    emit_mov_imm(code, 0, 0)
+    let cur = buf_len(code)
+    bu32(code, encode_bl(clause_start - cur))
+    -- Result in x0
+    if c < 8 {
+      bu32(code, encode_add_imm(c + 19, 0, 0))
+    } else { emit_store_reg(code, c, 0) }
+    c + 1
+  } else {
+    -- RUNTIME PATH: full handler dispatch via x27 stack
+    cg_perform_lookup(code, eff_hash, op_hash)
+    bu32(code, cg_ldr(9, 13, 8))
+    bu32(code, cg_ldr(0, 13, 16))
+    for j in 0..nargs {
+      let actr = __mem_load64(arg_results + j * 8)
+      let ap = emit_load_reg(code, actr)
+      bu32(code, encode_add_imm(j + 1, ap, 0))
+    }
+    bu32(code, encode_blr(9))
+    if c < 8 {
+      bu32(code, encode_add_imm(c + 19, 0, 0))
+    } else { emit_store_reg(code, c, 0) }
+    c + 1
   }
-  -- Call clause closure
-  bu32(code, encode_blr(9))
-  -- Result in x0
-  if c < 8 {
-    bu32(code, encode_add_imm(c + 19, 0, 0))
-  } else { emit_store_reg(code, c, 0) }
-  c + 1
 }
 
 -- Dot-call: disambiguate between effect perform and method call
