@@ -1829,6 +1829,32 @@ run_test2 "multi_payload_4" "42" 'type Q { Q(i64, i64, i64, i64) } fn main() -> 
 run_test2 "gen_type_method" "42" 'type Box<T> { Box(T) } impl Box { fn get(self: i64) -> i64 { __mem_load64(self + 8) } } fn main() -> i64 { let b = Box<i64>(42) b.get() }'
 # ── Adversarial: generic variant + trait bound ──
 run_test2 "gen_variant_bound" "42" 'trait V { fn v(self: i64) -> i64 } impl V for i64 { fn v(self: i64) -> i64 { self } } type Box<T> { Box(T) } fn extract<T: V>(b: i64) -> i64 { match b { Box(x) -> 42 } } fn main() -> i64 { extract<i64>(Box<i64>(5)) }'
+# ═══════════════════════════════════════════════════════════════
+# 57. FUNCTION VALUES + INDIRECT CALLS + EFFECT POLYMORPHISM
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: function reference as value ──
+run_test2 "fn_value_pass" "42" 'fn f() -> i64 { 42 } fn apply(g: i64) -> i64 { 42 } fn main() -> i64 { apply(f) }'
+# ── Happy: call through function parameter ──
+run_test2 "fn_indirect_call" "42" 'fn pure_fn() -> i64 { 42 } fn apply<T>(f: () -> T) -> T { f() } fn main() -> i64 { apply<i64>(pure_fn) }'
+# ── Happy: call with arguments through param ──
+run_test2 "fn_indirect_arg" "42" 'fn add(a: i64, b: i64) -> i64 { a + b } fn apply2<T>(f: (i64, i64) -> T, a: i64, b: i64) -> T { f(a, b) } fn main() -> i64 { apply2<i64>(add, 20, 22) }'
+# ── Happy: lambda as callback ──
+run_test2 "lambda_callback" "42" 'fn apply<T>(f: (i64) -> T, x: i64) -> T { f(x) } fn main() -> i64 { apply<i64>(n => n + n, 21) }'
+# ── Happy: effect-polymorphic function ──
+run_test2 "effect_poly_basic" "42" 'effect IO { fn print() -> i64 } fn apply<T, E>(f: () -[E]> T) -[E]> T { f() } fn do_io() -[IO]> i64 { IO.print() } fn main() -> i64 { handle apply<i64, IO>(do_io) { IO.print() -> resume(42) } }'
+# ── Happy: effect-polymorphic with pure callback ──
+run_test2 "effect_poly_pure" "42" 'fn apply<T, E>(f: () -[E]> T) -[E]> T { f() } fn pure_fn() -> i64 { 42 } fn main() -> i64 { apply<i64, i64>(pure_fn) }'
+# ── Happy: effect variable in annotation accepted ──
+run_test2 "effect_var_decl" "42" 'fn apply<T, E>(f: () -[E]> T) -[E]> T { 42 } fn main() -> i64 { 42 }'
+# ── Happy: concrete + effect variable (open set) ──
+run_test_no_err "effect_open_set" "42" 'effect IO { fn p() -> i64 } fn wrap<E>(f: () -[IO, E]> i64) -[IO, E]> i64 { 42 } fn main() -> i64 { 42 }'
+# ── Variant: higher-order function with method ──
+run_test2 "fn_value_method" "42" 'impl i64 { fn dbl(self: i64) -> i64 { self + self } } fn apply<T>(f: (i64) -> T, x: i64) -> T { f(x) } fn main() -> i64 { let x: i64 = 21 apply<i64>(n => n.dbl(), x) }'
+# ── Adversarial: nested indirect calls ──
+run_test2 "fn_nested_indirect" "42" 'fn id(x: i64) -> i64 { x } fn apply<T>(f: (i64) -> T, x: i64) -> T { f(x) } fn main() -> i64 { apply<i64>(id, apply<i64>(id, 42)) }'
+# ── Adversarial: fn value + pipe ──
+run_test2 "fn_value_pipe" "42" 'fn double(x: i64) -> i64 { x * 2 } fn main() -> i64 { 21 |> double() }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
