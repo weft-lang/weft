@@ -125,4 +125,31 @@ theorem compiled_pure_result_respects_expected_type
     checkAgainst_semantic_soundness hCheck hEval
   exact ⟨hCompiledPure.1, hCompiledPure.2, hExpectedSound⟩
 
+theorem compiled_result_respects_effects_and_expected_type
+    {oracle : Oracle}
+    {expr : Expr}
+    {expected : Weft.Ty}
+    {effects : Weft.EffectSet}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hCheck : checkAgainst expr expected = true)
+    (hEffects : inferEffects expr = some effects)
+    (hEval : Eval oracle expr value trace) :
+    Exec oracle (compileClosed expr) [] [value] trace ∧
+      (∀ effect : Weft.EffectName, effect ∈ trace -> effect ∈ effects.elems) ∧
+      ∃ expectedCore : Weft.CoreSetTy,
+        Weft.CoreSetTy.ofTy expected = some expectedCore ∧
+        expectedCore.denotes value.toCoreAtom := by
+  rcases inferEffects_sound hEffects with ⟨ty, hTy⟩
+  have hCompiled :
+      Exec oracle (compileClosed expr) [] [value] trace ∧
+        ∀ effect : Weft.EffectName, effect ∈ trace -> effect ∈ effects.elems :=
+    compiled_trace_subset_of_typed_effects hTy hEval
+  have hExpectedSound :
+      ∃ expectedCore : Weft.CoreSetTy,
+        Weft.CoreSetTy.ofTy expected = some expectedCore ∧
+        expectedCore.denotes value.toCoreAtom :=
+    checkAgainst_semantic_soundness hCheck hEval
+  exact ⟨hCompiled.1, hCompiled.2, hExpectedSound⟩
+
 end Weft.CoreEffects

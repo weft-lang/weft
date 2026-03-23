@@ -61,12 +61,12 @@ The first cut lands three things:
     `Weft/Properties/CoreEffectSemanticSoundness.lean`,
     `Weft/Properties/CoreEffectSubtypeChecking.lean`
     The handled-effect checker now supports inferred type/effect recovery plus
-    subtype-aware expected-type checking, and we can prove that empty-effect
-    accepted programs compile to trace-free executions whose results inhabit the
-    requested type.
+    subtype-aware expected-type checking, and we can prove both that accepted
+    programs only emit inferred effects and that empty-effect accepted programs
+    compile to trace-free executions whose results inhabit the requested type.
 14. `Weft/Properties/CoreEffectPipelineSemanticSoundness.lean`
-    The staged handled-effect pipeline now carries that same guarantee all the
-    way from surface syntax to emitted code.
+    The staged handled-effect pipeline now carries those type and effect-trace
+    guarantees all the way from surface syntax to emitted code.
 
 ## Near-Term Expansion
 
