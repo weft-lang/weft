@@ -1855,6 +1855,34 @@ run_test2 "fn_value_method" "42" 'impl i64 { fn dbl(self: i64) -> i64 { self + s
 run_test2 "fn_nested_indirect" "42" 'fn id(x: i64) -> i64 { x } fn apply<T>(f: (i64) -> T, x: i64) -> T { f(x) } fn main() -> i64 { apply<i64>(id, apply<i64>(id, 42)) }'
 # ── Adversarial: fn value + pipe ──
 run_test2 "fn_value_pipe" "42" 'fn double(x: i64) -> i64 { x * 2 } fn main() -> i64 { 21 |> double() }'
+# ═══════════════════════════════════════════════════════════════
+# 58. MONOMORPHISATION — comprehensive
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: basic specialisation ──
+run_test2 "mono_basic" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { id<i64>(42) }'
+# ── Happy: two different type args ──
+run_test2 "mono_two_types" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { let a = id<i64>(42) let b = id<str>("hi") a }'
+# ── Happy: same specialisation cached ──
+run_test2 "mono_cached" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { let a = id<i64>(20) let b = id<i64>(22) a + b }'
+# ── Happy: recursive generic ──
+run_test2 "mono_recursive" "120" 'fn fact<T>(n: T) -> T { if n <= 1 { 1 } else { n * fact<T>(n - 1) } } fn main() -> i64 { fact<i64>(5) }'
+# ── Happy: effect polymorphism ──
+run_test2 "mono_effect_poly" "42" 'effect IO { fn print() -> i64 } fn apply<T, E>(f: () -[E]> T) -[E]> T { f() } fn do_io() -[IO]> i64 { IO.print() } fn main() -> i64 { handle apply<i64, IO>(do_io) { IO.print() -> resume(42) } }'
+# ── Happy: trait method in generic body ──
+run_test2 "mono_trait_method" "42" 'trait Show { fn show(self: i64) -> i64 } impl Show for i64 { fn show(self: i64) -> i64 { self } } fn display<T: Show>(x: T) -> i64 { x.show() } fn main() -> i64 { display<i64>(42) }'
+# ── Happy: generic function calling generic function (transitive) ──
+run_test2 "mono_transitive" "42" 'fn id<T>(x: T) -> T { x } fn wrap<T>(x: T) -> T { id<T>(x) } fn main() -> i64 { wrap<i64>(42) }'
+# ── Happy: generic with for loop in body ──
+run_test2 "mono_with_loop" "42" 'fn sum_to<T>(n: T) -> T { let mut s: i64 = 0 for i in 0..n { s = s + 1 } s } fn main() -> i64 { sum_to<i64>(42) }'
+# ── Backward compat: generic called without type args ──
+run_test2 "mono_no_targs" "42" 'fn id<T>(x: i64) -> i64 { x } fn main() -> i64 { id(42) }'
+# ── Backward compat: variant constructor with type args ──
+run_test2 "mono_variant_ctor" "42" 'type Box<T> { Box(T) } fn main() -> i64 { match Box<i64>(42) { Box(x) -> x } }'
+# ── Adversarial: many specialisations of same function ──
+run_test2 "mono_many_specs" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { let a = id<i64>(10) let b = id<str>("x") let c = id<bool>(true) let d = id<i64>(32) a + d }'
+# ── Adversarial: specialised body with method + for loop ──
+run_test2 "mono_complex_body" "42" 'impl i64 { fn inc(self: i64) -> i64 { self + 1 } } fn count<T>(n: T) -> i64 { let mut s: i64 = 0 for i in 0..n { s = s.inc() } s } fn main() -> i64 { count<i64>(42) }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""

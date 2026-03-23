@@ -190,7 +190,7 @@ fn str_hash(src: i64, start: i64, len: i64) -> i64 {
 -- ======================================================================
 
 fn fmap_new() -> i64 {
-  let h = __bump_alloc(80)
+  let h = __bump_alloc(96)
   let d = __bump_alloc(64000)
   __mem_store64(h, d)
   __mem_store64(h + 8, 0)
@@ -207,6 +207,10 @@ fn fmap_new() -> i64 {
   __mem_store64(h + 64, 0)
   -- Method map pointer
   __mem_store64(h + 72, mmap_new())
+  -- Template map: generic function ASTs for monomorphisation (offset 80)
+  __mem_store64(h + 80, mono_tmap_new())
+  -- Specialisation cache: (spec_hash → code_offset) (offset 88)
+  __mem_store64(h + 88, mono_cache_new())
   h
 }
 fn fmap_set_tt(fm: i64, tt: i64) -> i64 { __mem_store64(fm + 48, tt) 0 }
@@ -393,6 +397,97 @@ fn is_effect_ident(node: i64, src: i64, tt: i64) -> i64 {
       if kind == 2 { true } else { false }
     }
   }
+}
+
+-- ======================================================================
+-- Monomorphisation: template map + specialisation cache
+-- ======================================================================
+
+-- Template map: stores generic function ASTs for on-demand specialisation
+-- Entry: [name_hash(8), fn_wrap_ptr(8), src_ptr(8)] = 24 bytes
+fn mono_tmap_new() -> i64 {
+  let h = __bump_alloc(24)
+  let d = __bump_alloc(12000)
+  __mem_store64(h, d)
+  __mem_store64(h + 8, 0)
+  __mem_store64(h + 16, 500)
+  h
+}
+
+fn mono_tmap_add(tm: i64, name_hash: i64, fn_wrap: i64, src: i64) -> i64 {
+  let d = __mem_load64(tm)
+  let n = __mem_load64(tm + 8)
+  let cap = __mem_load64(tm + 16)
+  if n >= cap { tm }
+  else {
+    __mem_store64(d + n * 24, name_hash)
+    __mem_store64(d + n * 24 + 8, fn_wrap)
+    __mem_store64(d + n * 24 + 16, src)
+    __mem_store64(tm + 8, n + 1)
+    tm
+  }
+}
+
+fn mono_tmap_lookup(tm: i64, name_hash: i64) -> i64 {
+  let d = __mem_load64(tm)
+  let n = __mem_load64(tm + 8)
+  let mut i = 0
+  let mut result = 0
+  while i < n {
+    if __mem_load64(d + i * 24) == name_hash {
+      result = d + i * 24
+      i = n
+    } else { i = i + 1 }
+  }
+  result
+}
+
+-- Specialisation cache: deduplicates identical generic instantiations
+-- Entry: [spec_hash(8), code_offset(8)] = 16 bytes
+fn mono_cache_new() -> i64 {
+  let h = __bump_alloc(24)
+  let d = __bump_alloc(8000)
+  __mem_store64(h, d)
+  __mem_store64(h + 8, 0)
+  __mem_store64(h + 16, 500)
+  h
+}
+
+fn mono_cache_lookup(mc: i64, spec_hash: i64) -> i64 {
+  let d = __mem_load64(mc)
+  let n = __mem_load64(mc + 8)
+  let mut i = 0
+  let mut result = 0
+  while i < n {
+    if __mem_load64(d + i * 16) == spec_hash {
+      result = __mem_load64(d + i * 16 + 8)
+      i = n
+    } else { i = i + 1 }
+  }
+  result
+}
+
+fn mono_cache_add(mc: i64, spec_hash: i64, off: i64) -> i64 {
+  let d = __mem_load64(mc)
+  let n = __mem_load64(mc + 8)
+  let cap = __mem_load64(mc + 16)
+  if n >= cap { mc }
+  else {
+    __mem_store64(d + n * 16, spec_hash)
+    __mem_store64(d + n * 16 + 8, off)
+    __mem_store64(mc + 8, n + 1)
+    mc
+  }
+}
+
+-- Compute specialisation hash: combine function name hash with type arg values
+fn mono_spec_hash(name_hash: i64, type_args: i64) -> i64 {
+  let mut h = name_hash
+  let n = nlist_len(type_args)
+  for i in 0..n {
+    h = h * 31 + nlist_get(type_args, i)
+  }
+  h
 }
 
 -- ======================================================================
@@ -1015,7 +1110,7 @@ fn cg_expr_high(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -
     33 -> cg_handle(node, code, scope, src, ctr, fm)
     41 -> cg_method_call_typed(node, code, scope, src, ctr, fm)
     35 -> cg_resume(node, code, scope, src, ctr, fm)
-    36 -> cg_call(node_f2(node), code, scope, src, ctr, fm)
+    36 -> cg_generic_call(node, code, scope, src, ctr, fm)
     37 -> cg_expr(node_f1(node), code, scope, src, ctr, fm)
     _ -> cg_int(node_new(1, 0, 0, 0, 0), code, ctr)
   }
@@ -1977,6 +2072,83 @@ fn cg_variant_init(code: i64, scope: i64, src: i64, ctr: i64, fm: i64, tag_hash:
 }
 
 -- ======================================================================
+-- Monomorphisation: compile specialised versions of generic functions
+-- ======================================================================
+
+-- GenericCall: tag 36 = (type_args_list, inner_call_node, num_type_args, 0)
+-- Specialise the generic function for the given type args, then call it.
+fn cg_generic_call(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
+  let type_args = node_f1(node)
+  let call_node = node_f2(node)
+  let ns = node_f1(call_node)
+  let nl = node_f2(call_node)
+  let args = node_f3(call_node)
+  let nargs = node_f4(call_node)
+  -- Compute the specialisation key
+  let name_hash = str_hash(src, ns, nl)
+  let spec_hash = mono_spec_hash(name_hash, type_args)
+  -- Check specialisation cache
+  let mc = __mem_load64(fm + 88)
+  let cached = mono_cache_lookup(mc, spec_hash)
+  if cached > 0 {
+    -- Already specialised: emit call to cached function
+    let c = cg_call_args(args, nargs, code, scope, src, ctr, fm, 0)
+    let cur = buf_len(code)
+    bu32(code, encode_bl(cached - cur))
+    if c < 8 { bu32(code, encode_add_imm(c + 19, 0, 0)) }
+    else { emit_store_reg(code, c, 0) }
+    c + 1
+  } else {
+    -- Look up the generic template
+    let tm = __mem_load64(fm + 80)
+    let tmpl_entry = mono_tmap_lookup(tm, name_hash)
+    if tmpl_entry == 0 {
+      -- Not a generic function template: fall back to regular call
+      -- (This handles non-generic functions called with explicit type args)
+      cg_call(call_node, code, scope, src, ctr, fm)
+    } else {
+      -- Specialise: compile the template body as a new function
+      let tmpl_wrap = __mem_load64(tmpl_entry + 8)
+      let tmpl_src = __mem_load64(tmpl_entry + 16)
+      let tmpl_inner = unwrap_fn(tmpl_wrap)
+      -- Jump over the specialised body (so caller flow continues after)
+      let b_over_pos = buf_len(code)
+      bu32(code, 0)
+      -- Compile the specialised function body
+      let fn_off = buf_len(code)
+      -- Cache BEFORE compiling so recursive calls find this specialisation
+      mono_cache_add(mc, spec_hash, fn_off)
+      emit_prologue(code)
+      let params = node_f3(tmpl_inner)
+      let body = node_f4(tmpl_inner)
+      let nparams = nlist_len(params)
+      if nparams > 8 {
+        eprint("error: specialised function has more than 8 parameters\n")
+      } else { 0 }
+      let fn_scope = cg_fn_params(params, nparams, tmpl_src, scope_new(), code)
+      let body_ctr = cg_expr(body, code, fn_scope, tmpl_src, nparams, fm)
+      let result_phys = emit_load_reg(code, body_ctr - 1)
+      bu32(code, encode_add_imm(0, result_phys, 0))
+      emit_epilogue(code)
+      -- Patch the jump-over to skip the specialised body
+      let b_enc = encode_b(buf_len(code) - b_over_pos)
+      let bd = buf_ptr(code)
+      __mem_store8(bd + b_over_pos, b_enc - b_enc / 256 * 256)
+      __mem_store8(bd + b_over_pos + 1, b_enc / 256 - b_enc / 65536 * 256)
+      __mem_store8(bd + b_over_pos + 2, b_enc / 65536 - b_enc / 16777216 * 256)
+      __mem_store8(bd + b_over_pos + 3, b_enc / 16777216 - b_enc / 4294967296 * 256)
+      -- Emit call args + BL to the specialised function
+      let c = cg_call_args(args, nargs, code, scope, src, ctr, fm, 0)
+      let cur = buf_len(code)
+      bu32(code, encode_bl(fn_off - cur))
+      if c < 8 { bu32(code, encode_add_imm(c + 19, 0, 0)) }
+      else { emit_store_reg(code, c, 0) }
+      c + 1
+    }
+  }
+}
+
+-- ======================================================================
 -- Call, if, let, fn, module
 -- ======================================================================
 
@@ -2241,24 +2413,37 @@ fn unwrap_fn(fn_wrap: i64) -> i64 {
 fn cg_module(fns: i64, code: i64, fm: i64) -> i64 {
   let n = nlist_len(fns)
   let mm = __mem_load64(fm + 72)
-  -- Pass 1: register all function names (hoisting)
+  let tm = __mem_load64(fm + 80)
+  -- Pass 1: register all function names (hoisting) + generic templates
   for i in 0..n {
     let pair = nlist_get(fns, i)
-    let fn_node = unwrap_fn(node_f1(pair))
+    let fn_wrap = node_f1(pair)
+    let fn_node = unwrap_fn(fn_wrap)
     let fn_src = node_f2(pair)
     fmap_add(fm, fn_src, node_f1(fn_node), node_f2(fn_node), 0)
-    -- If this is an impl method (type_hash != 0), also register in method map
+    -- If this is an impl method (type_hash != 0), register in method map
     let type_hash = node_f3(pair)
     if type_hash != 0 {
       let method_hash = str_hash(fn_src, node_f1(fn_node), node_f2(fn_node))
       mmap_add(mm, type_hash, method_hash, 0)
     } else { 0 }
+    -- If generic (has tparams), register as template for monomorphisation
+    let tparams = fn_tparams(fn_wrap)
+    if tparams != 0 {
+      let name_hash = str_hash(fn_src, node_f1(fn_node), node_f2(fn_node))
+      mono_tmap_add(tm, name_hash, fn_wrap, fn_src)
+    } else { 0 }
   }
-  -- Pass 2: compile all function bodies
+  -- Pass 2: compile NON-GENERIC function bodies
+  -- Generic functions are compiled on demand via monomorphisation
   for j in 0..n {
     let pair = nlist_get(fns, j)
-    let fn_node = unwrap_fn(node_f1(pair))
+    let fn_wrap = node_f1(pair)
+    let fn_node = unwrap_fn(fn_wrap)
     let fn_src = node_f2(pair)
+    let tparams = fn_tparams(fn_wrap)
+    -- Compile all functions (including generics — generics get a default
+    -- non-specialised version for calls without explicit type args)
     cg_fn(fn_node, code, fm, fn_src)
     -- If impl method, update method map with compiled offset
     let type_hash = node_f3(pair)
