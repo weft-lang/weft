@@ -32,6 +32,10 @@ The first cut lands three things:
    The compiled result still inhabits the source type for the safety-core
    fragment, so the formal story now has both semantic preservation and typed
    result preservation.
+6. `Weft/CorePipeline.lean` + `Weft/Properties/CorePipelineCorrectness.lean`
+   A genuinely staged core compiler theorem: surface syntax -> parsed core ->
+   checked core -> lowered IR -> machine code, with preservation proved at each
+   stage and composed through the generic pipeline theorem.
 
 ## Near-Term Expansion
 

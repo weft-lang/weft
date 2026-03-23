@@ -1,10 +1,12 @@
 import Weft.Compiler
+import Weft.CorePipeline
 import Weft.CoreMachine
 import Weft.Effects
 import Weft.SafetyCore
 import Weft.Syntax
 import Weft.Types
 import Weft.Properties.CoreCompilerCorrectness
+import Weft.Properties.CorePipelineCorrectness
 import Weft.Properties.CoreSemanticSoundness
 import Weft.Properties.CompilerCorrectness
 import Weft.Properties.EffectDiscipline
