@@ -44,6 +44,9 @@ The first cut lands three things:
    A finite semantic core for union/intersection/complement, with decision
    procedures for emptiness and subtyping plus proofs that subtyping is exactly
    emptiness of `A & ~B` on the finite model.
+9. `Weft/Properties/CoreTypecheckCorrectness.lean`
+   The staged core checker now has a proved specification: inferred types are
+   sound, complete for the safety core, and unique.
 
 ## Near-Term Expansion
 

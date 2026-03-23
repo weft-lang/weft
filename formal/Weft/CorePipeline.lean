@@ -52,6 +52,11 @@ def check : (expr : Expr) -> Option (CheckedTy expr)
           some { ty := Weft.Ty.nil, typed := HasType.ifThenElse cond thenBranch elseBranch Weft.Ty.nil hCond hThen hElse }
       | _, _, _ => none
 
+def inferType (expr : Expr) : Option Weft.Ty :=
+  match check expr with
+  | some checked => some checked.ty
+  | none => none
+
 inductive IRExpr : Type where
   | const : RuntimeVal -> IRExpr
   | add : IRExpr -> IRExpr -> IRExpr
