@@ -708,11 +708,13 @@ fn cg_match_ctor_arm(arms: i64, n_arms: i64, code: i64, scope: i64, src: i64, ct
   cg_match_ctor_test(code, scrutinee_ctr, expected_hash)
   let cbz_pos = buf_len(code)
   bu32(code, 0)
-  -- Bind payload (if present)
-  let body_scope = if b_nl > 0 {
+  -- Bind payload(s) (if present: b_nl > 0 for single, b_nl < 0 for multi)
+  let body_scope = if b_nl != 0 {
     cg_match_ctor_bind_only(code, scope, ctr, scrutinee_ctr, b_ns, b_nl)
   } else { scope }
-  let body_ctr = if b_nl > 0 { ctr + 1 } else { ctr }
+  let body_ctr = if b_nl != 0 {
+    if b_nl < 0 { ctr + (0 - b_nl) } else { ctr + 1 }
+  } else { ctr }
   -- Guard check (if present)
   let guard_cbz = if guard > 0 {
     let cg = cg_expr(guard, code, body_scope, src, body_ctr, fm)
@@ -737,15 +739,38 @@ fn cg_match_ctor_arm(arms: i64, n_arms: i64, code: i64, scope: i64, src: i64, ct
 
 -- Bind constructor payload to scope without evaluating body
 fn cg_match_ctor_bind_only(code: i64, scope: i64, ctr: i64, scrutinee_ctr: i64, b_ns: i64, b_nl: i64) -> i64 {
-  let scr2 = emit_load_reg(code, scrutinee_ctr)
-  -- LDR x17, [scrutinee, #8] (payload)
-  bu32(code, cg_ldr(17, scr2, 8))
-  if ctr < 8 {
-    bu32(code, encode_add_imm(ctr + 19, 17, 0))
+  if b_nl < 0 {
+    -- Multi-binding: b_ns is a bindings list, b_nl is negative count
+    let bindings = b_ns
+    let nb = 0 - b_nl
+    let mut s = scope
+    let mut c = ctr
+    for i in 0..nb {
+      let b = nlist_get(bindings, i)
+      if node_tag(b) == 18 {
+        let scr2 = emit_load_reg(code, scrutinee_ctr)
+        bu32(code, cg_ldr(17, scr2, 8 + i * 8))
+        if c < 8 {
+          bu32(code, encode_add_imm(c + 19, 17, 0))
+        } else {
+          emit_store_reg(code, c, 17)
+        }
+        s = scope_push(s, node_f1(b), node_f2(b), reg_id(c))
+        c = c + 1
+      } else { c = c }
+    }
+    s
   } else {
-    emit_store_reg(code, ctr, 17)
+    -- Single binding (backward compat)
+    let scr2 = emit_load_reg(code, scrutinee_ctr)
+    bu32(code, cg_ldr(17, scr2, 8))
+    if ctr < 8 {
+      bu32(code, encode_add_imm(ctr + 19, 17, 0))
+    } else {
+      emit_store_reg(code, ctr, 17)
+    }
+    scope_push(scope, b_ns, b_nl, reg_id(ctr))
   }
-  scope_push(scope, b_ns, b_nl, reg_id(ctr))
 }
 
 -- Emit: LDR tag from scrutinee, compare with expected, CSET result to x17
@@ -777,18 +802,23 @@ fn cg_match_ctor_body(code: i64, scope: i64, src: i64, ctr: i64, fm: i64, scruti
 fn cg_match_ctor_bind(code: i64, scope: i64, src: i64, ctr: i64, fm: i64, scrutinee_ctr: i64, b_packed: i64, body: i64) -> i64 {
   let b_ns = b_packed / 256
   let b_nl = b_packed - b_ns * 256
-  let scr2 = emit_load_reg(code, scrutinee_ctr)
-  -- LDR x17, [scrutinee, #8] (payload)
-  bu32(code, cg_ldr(17, scr2, 8))
-  if ctr < 8 {
-    let pe = encode_add_imm(ctr + 19, 17, 0)
-    bu32(code, pe)
+  if b_nl > 128 {
+    -- Multi-binding encoded: b_nl > 128 means b_ns is list ptr, actual count = 256 - b_nl
+    -- This path is unused in current code (cg_match_ctor_body doesn't handle multi)
+    -- Fall back to first binding for now
+    let scr2 = emit_load_reg(code, scrutinee_ctr)
+    bu32(code, cg_ldr(17, scr2, 8))
+    if ctr < 8 { bu32(code, encode_add_imm(ctr + 19, 17, 0)) }
+    else { emit_store_reg(code, ctr, 17) }
+    cg_expr(body, code, scope_push(scope, b_ns, b_nl, reg_id(ctr)), src, ctr + 1, fm)
   } else {
-    emit_store_reg(code, ctr, 17)
+    let scr2 = emit_load_reg(code, scrutinee_ctr)
+    bu32(code, cg_ldr(17, scr2, 8))
+    if ctr < 8 { bu32(code, encode_add_imm(ctr + 19, 17, 0)) }
+    else { emit_store_reg(code, ctr, 17) }
+    let new_scope = scope_push(scope, b_ns, b_nl, reg_id(ctr))
+    cg_expr(body, code, new_scope, src, ctr + 1, fm)
   }
-  let payload_rid = reg_id(ctr)
-  let new_scope = scope_push(scope, b_ns, b_nl, payload_rid)
-  cg_expr(body, code, new_scope, src, ctr + 1, fm)
 }
 
 -- Store match arm result at ctr
@@ -1852,32 +1882,31 @@ fn cg_intrinsic(code: i64, src: i64, ns: i64, nl: i64, ctr: i64) -> i64 {
 
 -- Variant constructor: allocate 16 bytes [tag_hash, payload]
 fn cg_variant_init(code: i64, scope: i64, src: i64, ctr: i64, fm: i64, tag_hash: i64, args: i64, nargs: i64) -> i64 {
-  -- Allocate 16 bytes: MOV x0, #16; MOV x17, x28; ADD x28, x28, x0
-  emit_mov_imm(code, 0, 16)
-  let e1 = encode_add_imm(17, 28, 0)
-  bu32(code, e1)
-  let e2 = encode_add_reg(28, 28, 0)
-  bu32(code, e2)
+  -- Allocate 8 + nargs*8 bytes (tag_hash slot + payload slots, min 16)
+  let alloc_size = 8 + nargs * 8
+  let min_size = if alloc_size < 16 { 16 } else { alloc_size }
+  emit_mov_imm(code, 0, min_size)
+  bu32(code, encode_add_imm(17, 28, 0))
+  bu32(code, encode_add_reg(28, 28, 0))
   -- Store tag hash at [x17, #0]
   emit_mov_imm(code, 16, tag_hash)
-  -- STR x16, [x17, #0]: 4177526784 + 17*32 + 16
   bu32(code, cg_str(16, 17, 0))
-  -- Store to ctr register (variant pointer)
+  -- Store variant pointer to ctr register
   if ctr < 8 {
-    let e3 = encode_add_imm(ctr + 19, 17, 0)
-    bu32(code, e3)
+    bu32(code, encode_add_imm(ctr + 19, 17, 0))
   } else {
     emit_store_reg(code, ctr, 17)
   }
-  -- If has payload, evaluate and store at [variant+8]
+  -- Store each payload at [variant + 8 + i*8]
   if nargs > 0 {
-    let arg = nlist_get(args, 0)
-    let c = cg_expr(arg, code, scope, src, ctr + 1, fm)
-    -- Load variant base
-    let base_phys = emit_load_reg(code, ctr)
-    let val_phys = emit_load_rhs(code, c - 1)
-    -- STR val, [base, #8]: 4177526784 + 1*1024 + base*32 + val
-    bu32(code, cg_str(val_phys, base_phys, 8))
+    let mut c = ctr + 1
+    for i in 0..nargs {
+      let arg = nlist_get(args, i)
+      c = cg_expr(arg, code, scope, src, c, fm)
+      let base_phys = emit_load_reg(code, ctr)
+      let val_phys = emit_load_rhs(code, c - 1)
+      bu32(code, cg_str(val_phys, base_phys, 8 + i * 8))
+    }
     ctr + 1
   } else {
     -- No payload: store 0 sentinel at [variant+8]
