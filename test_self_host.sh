@@ -2150,6 +2150,34 @@ run_test2 "interp_adjacent" "1" 'use "stdlib/string.weft" fn main() -> i64 { let
 run_test2 "interp_with_concat" "1" 'use "stdlib/string.weft" fn main() -> i64 { let name = "world" let greeting = "hello {name}" str_eq(str_concat(greeting, "!"), "hello world!") }'
 # ── Property: interpolation is equivalent to str_concat ──
 run_test2 "interp_eq_concat" "1" 'use "stdlib/string.weft" fn main() -> i64 { let x = "world" str_eq("hello {x}", str_concat("hello ", x)) }'
+# ═══════════════════════════════════════════════════════════════
+# 65. FOR-IN ITERATION — comprehensive
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: iterate over list counting elements ──
+run_test2 "forin_count" "42" 'use "stdlib/list.weft" fn main() -> i64 { let mut s: i64 = 0 for x in list_range(0, 42) { s = s + 1 } s }'
+# ── Happy: iterate over list summing values ──
+run_test2 "forin_sum" "10" 'use "stdlib/list.weft" fn main() -> i64 { let mut s: i64 = 0 for x in list_range(0, 5) { s = s + x } s }'
+# ── Happy: iterate with method call in body ──
+run_test2 "forin_method" "42" 'use "stdlib/list.weft" impl i64 { fn inc(self: i64) -> i64 { self + 1 } } fn main() -> i64 { let mut s: i64 = 0 for x in list_range(0, 42) { s = s.inc() } s }'
+# ── Happy: iterate over manually built list ──
+run_test2 "forin_manual" "42" 'use "stdlib/list.weft" fn main() -> i64 { let xs = Cons<i64>(20, Cons<i64>(22, Nil)) let mut s: i64 = 0 for x in xs { s = s + x } s }'
+# ── Happy: range-for still works ──
+run_test2 "forin_range_compat" "42" 'fn main() -> i64 { let mut s: i64 = 0 for i in 0..42 { s = s + 1 } s }'
+# ── Sad/boundary: empty list ──
+run_test2 "forin_empty" "42" 'use "stdlib/list.weft" fn main() -> i64 { let mut s: i64 = 42 for x in Nil { s = 0 } s }'
+# ── Boundary: single element ──
+run_test2 "forin_single" "42" 'use "stdlib/list.weft" fn main() -> i64 { let xs = Cons<i64>(42, Nil) let mut s: i64 = 0 for x in xs { s = x } s }'
+# ── Adversarial: 100 elements ──
+run_test2 "forin_100" "100" 'use "stdlib/list.weft" fn main() -> i64 { let mut s: i64 = 0 for x in list_range(0, 100) { s = s + 1 } s }'
+# ── Adversarial: nested for-in ──
+run_test2 "forin_nested" "6" 'use "stdlib/list.weft" fn main() -> i64 { let xs = list_range(0, 3) let mut s: i64 = 0 for x in xs { for y in list_range(0, 2) { s = s + 1 } } s }'
+# ── Adversarial: for-in + for-range in same function ──
+run_test2 "forin_mixed" "42" 'use "stdlib/list.weft" fn main() -> i64 { let mut a: i64 = 0 for i in 0..21 { a = a + 1 } let mut b: i64 = 0 for x in list_range(0, 21) { b = b + 1 } a + b }'
+# ── Property: for-in count == list_fold count ──
+run_test2 "forin_eq_fold" "42" 'use "stdlib/list.weft" fn main() -> i64 { let xs = list_range(0, 42) let fc = list_fold<i64, i64>(xs, 0, (acc: i64, x: i64) => acc + 1) let mut ic: i64 = 0 for x in xs { ic = ic + 1 } if fc == ic { 42 } else { 0 } }'
+# ── Property: for-in sum == list_fold sum ──
+run_test2 "forin_eq_fold_sum" "1" 'use "stdlib/list.weft" fn main() -> i64 { let xs = list_range(0, 10) let fs = list_fold<i64, i64>(xs, 0, (acc: i64, x: i64) => acc + x) let mut is: i64 = 0 for x in xs { is = is + x } if fs == is { 1 } else { 0 } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
