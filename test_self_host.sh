@@ -1618,6 +1618,41 @@ run_test2 "ctable_basic" "42" 'trait A { fn a(self: i64) -> i64 } impl A for i64
 run_test2 "ctable_multi_trait" "42" 'trait A { fn a(self: i64) -> i64 } trait B { fn b(self: i64) -> i64 } impl A for i64 { fn a(self: i64) -> i64 { self } } impl B for i64 { fn b(self: i64) -> i64 { self } } fn f<T: A>(x: T) -> T { x } fn g<T: B>(x: T) -> T { x } fn main() -> i64 { f<i64>(g<i64>(42)) }'
 # ── Sad: wrong trait bound (has A, needs B) ──
 run_test_err "bound_wrong_trait" "does not satisfy trait bound" 'trait A { fn a(self: i64) -> i64 } trait B { fn b(self: i64) -> i64 } impl A for i64 { fn a(self: i64) -> i64 { self } } fn f<T: B>(x: T) -> T { x } fn main() -> i64 { f<i64>(42) }'
+#
+# ═══════════════════════════════════════════════════════════════
+# 51. TRAITS — comprehensive coverage (brief testing requirements)
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Verification: missing method in impl ──
+run_test_err "impl_missing_method" "missing required method" 'trait AB { fn a(self: i64) -> i64 fn b(self: i64) -> i64 } impl AB for i64 { fn a(self: i64) -> i64 { self } } fn main() -> i64 { 42 }'
+# ── Verification: coherence violation (double impl) ──
+run_test_err "coherence_double" "conflicting implementations" 'trait T { fn f(self: i64) -> i64 } impl T for i64 { fn f(self: i64) -> i64 { 1 } } impl T for i64 { fn f(self: i64) -> i64 { 2 } } fn main() -> i64 { 42 }'
+# ── Happy: where clause ──
+run_test2 "where_clause" "42" 'trait S { fn s(self: i64) -> i64 } impl S for i64 { fn s(self: i64) -> i64 { self } } fn f<T>(x: T) -> T where T: S { x } fn main() -> i64 { f<i64>(42) }'
+# ── Happy: where clause with multiple params ──
+run_test2 "where_multi_param" "42" 'trait A { fn a(self: i64) -> i64 } trait B { fn b(self: i64) -> i64 } impl A for i64 { fn a(self: i64) -> i64 { self } } impl B for i64 { fn b(self: i64) -> i64 { self } } fn f<X, Y>(x: X, y: Y) -> i64 where X: A, Y: B { 42 } fn main() -> i64 { f<i64, i64>(1, 2) }'
+# ── Sad: where clause bound not satisfied ──
+run_test_err "where_not_satisfied" "does not satisfy trait bound" 'trait S { fn s(self: i64) -> i64 } fn f<T>(x: T) -> T where T: S { x } fn main() -> i64 { f<str>("hi") 42 }'
+# ── Happy: multiple bounds with & ──
+run_test2 "multi_bound_and" "42" 'trait A { fn a(self: i64) -> i64 } trait B { fn b(self: i64) -> i64 } impl A for i64 { fn a(self: i64) -> i64 { self } } impl B for i64 { fn b(self: i64) -> i64 { self } } fn f<T: A & B>(x: T) -> T { x } fn main() -> i64 { f<i64>(42) }'
+# ── Sad: multiple bounds, one missing ──
+run_test_err "multi_bound_partial" "does not satisfy trait bound" 'trait A { fn a(self: i64) -> i64 } trait B { fn b(self: i64) -> i64 } impl A for i64 { fn a(self: i64) -> i64 { self } } fn f<T: A & B>(x: T) -> T { x } fn main() -> i64 { f<i64>(42) }'
+# ── Happy: generic method resolution (x.show() where T: Show) ──
+run_test2 "generic_method" "42" 'trait Show { fn show(self: i64) -> i64 } impl Show for i64 { fn show(self: i64) -> i64 { self } } fn display<T: Show>(x: T) -> i64 { x.show() } fn main() -> i64 { display<i64>(42) }'
+# ── Happy: trait method with effects ──
+run_test2 "trait_method_effect" "42" 'effect Log { fn log() -> i64 } trait Logged { fn logged(self: i64) -[Log]> i64 } impl Logged for i64 { fn logged(self: i64) -[Log]> i64 { self } } fn main() -> i64 { 42 }'
+# ── Happy: associated type declaration + binding parsed ──
+run_test2 "assoc_type_parse" "42" 'trait Iter { type Item fn next(self: i64) -> i64 } impl Iter for i64 { type Item = i64 fn next(self: i64) -> i64 { self + 1 } } fn main() -> i64 { let x: i64 = 41 x.next() }'
+# ── Happy: impl<T> type params parsed ──
+run_test2 "impl_tparams" "42" 'trait V { fn v(self: i64) -> i64 } type Box { x: i64 } impl<T: V> V for Box { fn v(self: i64) -> i64 { __mem_load64(self) } } fn main() -> i64 { let b = Box { x: 42 } b.v() }'
+# ── Happy: two different traits same type ──
+run_test2 "two_traits_one_type" "42" 'trait A { fn a(self: i64) -> i64 } trait B { fn b(self: i64) -> i64 } impl A for i64 { fn a(self: i64) -> i64 { 20 } } impl B for i64 { fn b(self: i64) -> i64 { 22 } } fn main() -> i64 { let x: i64 = 1 x.a() + x.b() }'
+# ── Happy: same trait different types ──
+run_test2 "same_trait_diff_types" "42" 'trait V { fn v(self: i64) -> i64 } type F { x: i64 } impl V for i64 { fn v(self: i64) -> i64 { self } } impl V for F { fn v(self: i64) -> i64 { __mem_load64(self) } } fn main() -> i64 { let f = F { x: 42 } f.v() }'
+# ── Happy: method in match arm ──
+run_test2 "method_in_match_arm" "42" 'impl i64 { fn dbl(self: i64) -> i64 { self + self } } fn main() -> i64 { match 21 { x -> x.dbl() } }'
+# ── Happy: method call result in binop ──
+run_test2 "method_in_binop" "42" 'impl i64 { fn half(self: i64) -> i64 { self / 2 } } fn main() -> i64 { let x: i64 = 80 x.half() + 2 }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
