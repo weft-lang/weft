@@ -47,6 +47,10 @@ The first cut lands three things:
 9. `Weft/Properties/CoreTypecheckCorrectness.lean`
    The staged core checker now has a proved specification: inferred types are
    sound, complete for the safety core, and unique.
+10. `Weft/Properties/CoreSubtypeChecking.lean`
+    A subtype-aware checking layer over inferred core types, with proofs that a
+    successful expected-type check is both complete for the representable core
+    fragment and semantically respected by evaluation results.
 
 ## Near-Term Expansion
 

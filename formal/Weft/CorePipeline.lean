@@ -1,4 +1,5 @@
 import Weft.CoreMachine
+import Weft.CoreSubtype
 
 namespace Weft.SafetyCore
 
@@ -56,6 +57,14 @@ def inferType (expr : Expr) : Option Weft.Ty :=
   match check expr with
   | some checked => some checked.ty
   | none => none
+
+def checkAgainst (expr : Expr) (expected : Weft.Ty) : Bool :=
+  match inferType expr, Weft.CoreSetTy.ofTy expected with
+  | some inferred, some expectedCore =>
+      match Weft.CoreSetTy.ofTy inferred with
+      | some inferredCore => inferredCore.subtypeb expectedCore
+      | none => false
+  | _, _ => false
 
 inductive IRExpr : Type where
   | const : RuntimeVal -> IRExpr

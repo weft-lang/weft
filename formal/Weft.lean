@@ -11,6 +11,7 @@ import Weft.Properties.CoreCompilerCorrectness
 import Weft.Properties.CoreEffectSoundness
 import Weft.Properties.CorePipelineCorrectness
 import Weft.Properties.CoreSemanticSoundness
+import Weft.Properties.CoreSubtypeChecking
 import Weft.Properties.CoreSubtypeSoundness
 import Weft.Properties.CoreTypecheckCorrectness
 import Weft.Properties.CompilerCorrectness
