@@ -2314,6 +2314,27 @@ run_test2 "named_pipe" "42" 'fn add(_ x: i64, amount: i64) -> i64 { x + amount }
 run_test2 "named_keyword_label" "42" 'fn wrap(_ x: i64) -> i64 { x } fn main() -> i64 { wrap(42) }'
 # ── Property: named with/without label gives same result ──
 run_test2 "named_equiv" "1" 'fn f(a: i64, b: i64) -> i64 { a + b } fn main() -> i64 { let r1 = f(20, 22) let r2 = f(a: 20, b: 22) if r1 == r2 { 1 } else { 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 72. ALGORITHM GALLERY — examples as benchmarks + integration tests
+# ═══════════════════════════════════════════════════════════════
+run_test_example() {
+  local name="$1" file="$2"
+  /tmp/weft2 < "$file" > /tmp/t2 2>/dev/null && chmod +x /tmp/t2
+  local got=$(/tmp/t2 >/dev/null 2>/dev/null; echo $?)
+  if [ "$got" = "0" ]; then
+    PASS2=$((PASS2+1))
+  else
+    echo "  ✗ $name (exit $got)"
+    FAIL2=$((FAIL2+1))
+  fi
+}
+run_test_example "ex_fibonacci" "examples/fibonacci.weft"
+run_test_example "ex_sieve" "examples/sieve.weft"
+run_test_example "ex_quicksort" "examples/quicksort.weft"
+run_test_example "ex_state_machine" "examples/state_machine.weft"
+run_test_example "ex_map_benchmark" "examples/map_benchmark.weft"
+run_test_example "ex_error_pipeline" "examples/error_pipeline.weft"
+run_test_example "ex_generic_pipeline" "examples/generic_pipeline.weft"
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
