@@ -1883,6 +1883,39 @@ run_test2 "mono_variant_ctor" "42" 'type Box<T> { Box(T) } fn main() -> i64 { ma
 run_test2 "mono_many_specs" "42" 'fn id<T>(x: T) -> T { x } fn main() -> i64 { let a = id<i64>(10) let b = id<str>("x") let c = id<bool>(true) let d = id<i64>(32) a + d }'
 # ── Adversarial: specialised body with method + for loop ──
 run_test2 "mono_complex_body" "42" 'impl i64 { fn inc(self: i64) -> i64 { self + 1 } } fn count<T>(n: T) -> i64 { let mut s: i64 = 0 for i in 0..n { s = s.inc() } s } fn main() -> i64 { count<i64>(42) }'
+# ═══════════════════════════════════════════════════════════════
+# 59. STDLIB — Eq, Option, Result, List, Fail, Maybe
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Eq ──
+run_test2 "stdlib_eq_true" "1" 'use "stdlib/eq.weft" fn main() -> i64 { let x: i64 = 42 x.eq(42) }'
+run_test2 "stdlib_eq_false" "0" 'use "stdlib/eq.weft" fn main() -> i64 { let x: i64 = 42 x.eq(99) }'
+# ── Option ──
+run_test2 "stdlib_opt_some" "42" 'use "stdlib/option.weft" fn main() -> i64 { let x = Some<i64>(42) x.unwrap_or(0) }'
+run_test2 "stdlib_opt_none" "42" 'use "stdlib/option.weft" fn main() -> i64 { let x = None x.unwrap_or(42) }'
+run_test2 "stdlib_opt_is_some" "1" 'use "stdlib/option.weft" fn main() -> i64 { Some<i64>(1).is_some() }'
+run_test2 "stdlib_opt_is_none" "1" 'use "stdlib/option.weft" fn main() -> i64 { let x = None x.is_none() }'
+# ── Result ──
+run_test2 "stdlib_res_ok" "42" 'use "stdlib/result.weft" fn main() -> i64 { let r = Ok<i64>(42) r.unwrap_or(0) }'
+run_test2 "stdlib_res_err" "42" 'use "stdlib/result.weft" fn main() -> i64 { let r = Err<i64>(99) r.unwrap_or(42) }'
+run_test2 "stdlib_res_is_ok" "1" 'use "stdlib/result.weft" fn main() -> i64 { let r = Ok<i64>(1) r.is_ok() }'
+run_test2 "stdlib_res_is_err" "1" 'use "stdlib/result.weft" fn main() -> i64 { let r = Err<i64>(1) r.is_err() }'
+# ── List ──
+run_test2 "stdlib_list_range" "42" 'use "stdlib/list.weft" fn main() -> i64 { let xs = list_range(0, 42) list_fold<i64, i64>(xs, 0, (acc: i64, x: i64) => acc + 1) }'
+run_test2 "stdlib_list_head" "10" 'use "stdlib/list.weft" fn main() -> i64 { list_range(10, 20).head() }'
+run_test2 "stdlib_list_tail" "11" 'use "stdlib/list.weft" fn main() -> i64 { list_range(10, 20).tail().head() }'
+run_test2 "stdlib_list_prepend" "42" 'use "stdlib/list.weft" fn main() -> i64 { let xs = Nil xs.prepend(42).head() }'
+run_test2 "stdlib_list_fold_sum" "10" 'use "stdlib/list.weft" fn main() -> i64 { list_fold<i64, i64>(list_range(0, 5), 0, (acc: i64, x: i64) => acc + x) }'
+run_test2 "stdlib_list_map" "42" 'use "stdlib/list.weft" fn main() -> i64 { let xs = list_range(3, 4) let ys = list_map<i64, i64>(xs, (x: i64) => x * 14) ys.head() }'
+run_test2 "stdlib_list_filter" "42" 'use "stdlib/list.weft" fn main() -> i64 { let xs = list_range(0, 100) let evens = list_filter<i64>(xs, (x: i64) => if x == 42 { 1 } else { 0 }) evens.head() }'
+# ── Fail effect ──
+run_test2 "stdlib_fail_happy" "42" 'use "stdlib/fail.weft" fn risky(x: i64) -[Fail]> i64 { if x > 0 { x } else { Fail.fail(0 - 1) } } fn main() -> i64 { handle risky(42) { Fail.fail(e) -> resume(0) } }'
+run_test2 "stdlib_fail_sad" "42" 'use "stdlib/fail.weft" fn risky(x: i64) -[Fail]> i64 { if x > 0 { x } else { Fail.fail(0 - 1) } } fn main() -> i64 { handle risky(0 - 5) { Fail.fail(e) -> resume(42) } }'
+# ── Maybe effect ──
+run_test2 "stdlib_maybe_present" "42" 'use "stdlib/maybe.weft" fn get(x: i64) -[Maybe]> i64 { if x > 0 { x } else { Maybe.none() } } fn main() -> i64 { handle get(42) { Maybe.none() -> resume(0) } }'
+run_test2 "stdlib_maybe_absent" "42" 'use "stdlib/maybe.weft" fn get(x: i64) -[Maybe]> i64 { if x > 0 { x } else { Maybe.none() } } fn main() -> i64 { handle get(0 - 1) { Maybe.none() -> resume(42) } }'
+# ── Cross-file: multiple stdlib modules together ──
+run_test2 "stdlib_combined" "42" 'use "stdlib/eq.weft" use "stdlib/option.weft" fn main() -> i64 { let x = Some<i64>(42) if x.is_some() == 1 { x.unwrap_or(0) } else { 0 } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
