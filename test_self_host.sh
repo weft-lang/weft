@@ -1653,6 +1653,73 @@ run_test2 "same_trait_diff_types" "42" 'trait V { fn v(self: i64) -> i64 } type 
 run_test2 "method_in_match_arm" "42" 'impl i64 { fn dbl(self: i64) -> i64 { self + self } } fn main() -> i64 { match 21 { x -> x.dbl() } }'
 # ── Happy: method call result in binop ──
 run_test2 "method_in_binop" "42" 'impl i64 { fn half(self: i64) -> i64 { self / 2 } } fn main() -> i64 { let x: i64 = 80 x.half() + 2 }'
+#
+# ═══════════════════════════════════════════════════════════════
+# 52. TRAITS — exhaustive sad paths + adversarial + pathological
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Sad: unresolved method (type has no such method) ──
+run_test_err "method_unresolved" "method not found" 'impl i64 { fn foo(self: i64) -> i64 { self } } fn main() -> i64 { let x: i64 = 5 x.bar() }'
+# ── Sad: method on type with no impl at all ──
+run_test_err "method_no_impl" "method not found" 'type Empty { x: i64 } fn main() -> i64 { let e = Empty { x: 1 } e.foo() }'
+# ── Sad: missing multiple methods in impl ──
+run_test_err "impl_missing_two" "missing required method" 'trait ABC { fn a(self: i64) -> i64 fn b(self: i64) -> i64 fn c(self: i64) -> i64 } impl ABC for i64 { fn a(self: i64) -> i64 { self } } fn main() -> i64 { 42 }'
+# ── Sad: bound not satisfied for bool type ──
+run_test_err "bound_not_sat_bool" "does not satisfy trait bound" 'trait S { fn s(self: i64) -> i64 } fn f<T: S>(x: T) -> T { x } fn main() -> i64 { f<bool>(true) 42 }'
+# ── Sad: three bounds, third not satisfied ──
+run_test_err "bound_triple_partial" "does not satisfy trait bound" 'trait A { fn a(self: i64) -> i64 } trait B { fn b(self: i64) -> i64 } trait C { fn c(self: i64) -> i64 } impl A for i64 { fn a(self: i64) -> i64 { self } } impl B for i64 { fn b(self: i64) -> i64 { self } } fn f<T: A & B & C>(x: T) -> T { x } fn main() -> i64 { f<i64>(42) }'
+#
+# ── Variant: impl with fewer effects than trait (valid — more restricted) ──
+run_test2 "impl_fewer_effects" "42" 'effect IO { fn print() -> i64 } trait Logged { fn log(self: i64) -[IO]> i64 } impl Logged for i64 { fn log(self: i64) -> i64 { self } } fn main() -> i64 { 42 }'
+# ── Variant: self with str type ──
+run_test2 "self_str_method" "42" 'impl str { fn code(self: i64) -> i64 { 42 } } fn main() -> i64 { let s = "hello" s.code() }'
+# ── Variant: self with bool type ──
+run_test2 "self_bool_method" "42" 'impl bool { fn to_int(self: i64) -> i64 { if self == 1 { 42 } else { 0 } } } fn main() -> i64 { let b = true b.to_int() }'
+# ── Variant: multiple impls on same type (inherent) with different methods ──
+run_test2 "multi_inherent_impl" "42" 'type V { x: i64 } impl V { fn get_x(self: i64) -> i64 { __mem_load64(self) } } impl V { fn dbl_x(self: i64) -> i64 { __mem_load64(self) * 2 } } fn main() -> i64 { let v = V { x: 21 } v.dbl_x() }'
+# ── Variant: method taking multiple additional args ──
+run_test2 "method_three_args" "42" 'impl i64 { fn add3(self: i64, a: i64, b: i64, c: i64) -> i64 { self + a + b + c } } fn main() -> i64 { let x: i64 = 10 x.add3(10, 11, 11) }'
+# ── Variant: method returning 0 (edge case) ──
+run_test2 "method_returns_zero" "0" 'impl i64 { fn zero(self: i64) -> i64 { 0 } } fn main() -> i64 { let x: i64 = 99 x.zero() }'
+# ── Variant: method on deeply nested record field access ──
+run_test2 "method_after_field" "42" 'type Outer { inner: i64 } type Inner { val: i64 } impl Inner { fn get(self: i64) -> i64 { __mem_load64(self) } } fn main() -> i64 { let i = Inner { val: 42 } i.get() }'
+#
+# ── Adversarial: method name collision between inherent and trait impl ──
+# Both inherent and trait define "f" — inherent should win (or both register)
+run_test2 "method_collision" "42" 'trait T { fn f(self: i64) -> i64 } impl T for i64 { fn f(self: i64) -> i64 { 0 } } impl i64 { fn f(self: i64) -> i64 { 42 } } fn main() -> i64 { let x: i64 = 1 x.f() }'
+# ── Adversarial: trait with zero methods (empty trait / marker) ──
+run_test2 "empty_trait" "42" 'trait Marker { } impl Marker for i64 { } fn f<T: Marker>(x: T) -> T { x } fn main() -> i64 { f<i64>(42) }'
+# ── Adversarial: impl with self not first param name but still first positionally ──
+run_test2 "self_positional" "42" 'impl i64 { fn id(self: i64) -> i64 { self } } fn main() -> i64 { let x: i64 = 42 x.id() }'
+# ── Adversarial: chained method calls 5 deep ──
+run_test2 "chain_5_deep" "42" 'impl i64 { fn inc(self: i64) -> i64 { self + 1 } } fn main() -> i64 { let x: i64 = 37 x.inc().inc().inc().inc().inc() }'
+# ── Adversarial: method called in both branches of if ──
+run_test2 "method_both_branches" "42" 'impl i64 { fn dbl(self: i64) -> i64 { self + self } } fn main() -> i64 { let x: i64 = 21 let r = if true { x.dbl() } else { x.dbl() } r }'
+# ── Adversarial: many traits on one type ──
+run_test2 "many_traits" "42" 'trait A { fn a(self: i64) -> i64 } trait B { fn b(self: i64) -> i64 } trait C { fn c(self: i64) -> i64 } trait D { fn d(self: i64) -> i64 } impl A for i64 { fn a(self: i64) -> i64 { 10 } } impl B for i64 { fn b(self: i64) -> i64 { 11 } } impl C for i64 { fn c(self: i64) -> i64 { 12 } } impl D for i64 { fn d(self: i64) -> i64 { 9 } } fn main() -> i64 { let x: i64 = 0 x.a() + x.b() + x.c() + x.d() }'
+# ── Adversarial: trait with many methods ──
+run_test2 "trait_many_methods" "42" 'trait Big { fn a(self: i64) -> i64 fn b(self: i64) -> i64 fn c(self: i64) -> i64 fn d(self: i64) -> i64 } impl Big for i64 { fn a(self: i64) -> i64 { 10 } fn b(self: i64) -> i64 { 11 } fn c(self: i64) -> i64 { 12 } fn d(self: i64) -> i64 { 9 } } fn main() -> i64 { let x: i64 = 0 x.a() + x.b() + x.c() + x.d() }'
+#
+# ── Pathological: method in tight loop (100 iterations) ──
+run_test2 "method_tight_loop" "100" 'impl i64 { fn inc(self: i64) -> i64 { self + 1 } } fn main() -> i64 { let mut x: i64 = 0 while x < 100 { x = x.inc() } x }'
+# ── Pathological: deeply nested method chaining (10 deep) ──
+run_test2 "chain_10_deep" "10" 'impl i64 { fn inc(self: i64) -> i64 { self + 1 } } fn main() -> i64 { let x: i64 = 0 x.inc().inc().inc().inc().inc().inc().inc().inc().inc().inc() }'
+# ── Pathological: method + recursion (factorial via method) ──
+run_test2 "method_factorial" "120" 'impl i64 { fn dec(self: i64) -> i64 { self - 1 } } fn fact(n: i64) -> i64 { if n <= 1 { 1 } else { n * fact(n.dec()) } } fn main() -> i64 { fact(5) }'
+# ── Pathological: many impl blocks in one program ──
+run_test2 "many_impls" "42" 'type A { x: i64 } type B { x: i64 } type C { x: i64 } type D { x: i64 } type E { x: i64 } impl A { fn v(self: i64) -> i64 { __mem_load64(self) } } impl B { fn v(self: i64) -> i64 { __mem_load64(self) } } impl C { fn v(self: i64) -> i64 { __mem_load64(self) } } impl D { fn v(self: i64) -> i64 { __mem_load64(self) } } impl E { fn v(self: i64) -> i64 { __mem_load64(self) } } fn main() -> i64 { let a = A { x: 8 } let b = B { x: 9 } let c = C { x: 8 } let d = D { x: 8 } let e = E { x: 9 } a.v() + b.v() + c.v() + d.v() + e.v() }'
+# ── Pathological: trait bound on every param ──
+run_test2 "all_params_bounded" "42" 'trait V { fn v(self: i64) -> i64 } impl V for i64 { fn v(self: i64) -> i64 { self } } fn f<A: V, B: V, C: V>(a: A, b: B, c: C) -> i64 { 42 } fn main() -> i64 { f<i64, i64, i64>(1, 2, 3) }'
+# ── Pathological: where clause with & bounds on multiple params ──
+run_test2 "where_complex" "42" 'trait A { fn a(self: i64) -> i64 } trait B { fn b(self: i64) -> i64 } impl A for i64 { fn a(self: i64) -> i64 { self } } impl B for i64 { fn b(self: i64) -> i64 { self } } fn f<X, Y>(x: X, y: Y) -> i64 where X: A & B, Y: A { 42 } fn main() -> i64 { f<i64, i64>(1, 2) }'
+# ── Boundary: trait with single-char name ──
+run_test2 "trait_single_char" "42" 'trait T { fn t(self: i64) -> i64 } impl T for i64 { fn t(self: i64) -> i64 { self } } fn main() -> i64 { let x: i64 = 42 x.t() }'
+# ── Boundary: method with single-char name ──
+run_test2 "method_single_char" "42" 'impl i64 { fn x(self: i64) -> i64 { self } } fn main() -> i64 { let v: i64 = 42 v.x() }'
+# ── Boundary: long trait name (tests hash stability) ──
+run_test2 "trait_long_name" "42" 'trait VeryLongTraitNameForTesting { fn check(self: i64) -> i64 } impl VeryLongTraitNameForTesting for i64 { fn check(self: i64) -> i64 { self } } fn f<T: VeryLongTraitNameForTesting>(x: T) -> T { x } fn main() -> i64 { f<i64>(42) }'
+# ── Boundary: method returning negative via exit code wraparound ──
+run_test2 "method_return_max" "255" 'impl i64 { fn max_exit(self: i64) -> i64 { 255 } } fn main() -> i64 { let x: i64 = 0 x.max_exit() }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
