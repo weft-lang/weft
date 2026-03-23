@@ -2095,6 +2095,34 @@ run_test2 "set_zero_elem" "1" 'use "stdlib/set.weft" fn main() -> i64 { set_cont
 run_test2 "set_large_elem" "1" 'use "stdlib/set.weft" fn main() -> i64 { set_contains(set_add(set_new(), 9999999), 9999999) }'
 # ── Property: all elements present after bulk insert ──
 run_test2 "set_all_present" "42" 'use "stdlib/set.weft" fn main() -> i64 { let mut s = set_new() for i in 0..42 { s = set_add(s, i) } let mut ok: i64 = 1 for i in 0..42 { if set_contains(s, i) == 0 { ok = 0 } else { 0 } } if ok == 1 { 42 } else { 0 } }'
+# ═══════════════════════════════════════════════════════════════
+# 63. ? OPERATOR — comprehensive
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: ? on Ok extracts value ──
+run_test2 "try_ok" "42" 'use "stdlib/result.weft" use "stdlib/fail.weft" fn go() -[Fail]> i64 { Ok<i64>(42)? } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(0) } }'
+# ── Happy: ? on Err performs Fail ──
+run_test2 "try_err" "42" 'use "stdlib/result.weft" use "stdlib/fail.weft" fn go() -[Fail]> i64 { Err<i64>(42)? } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(e) } }'
+# ── Happy: ? chain (both Ok) ──
+run_test2 "try_chain_ok" "42" 'use "stdlib/result.weft" use "stdlib/fail.weft" fn go() -[Fail]> i64 { let a = Ok<i64>(20)? let b = Ok<i64>(22)? a + b } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(0) } }'
+# ── Happy: ? with function returning Result ──
+run_test2 "try_fn_result" "42" 'use "stdlib/result.weft" use "stdlib/fail.weft" fn parse(x: i64) -> i64 { if x > 0 { Ok<i64>(x) } else { Err<i64>(0 - 1) } } fn go() -[Fail]> i64 { parse(42)? } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(0) } }'
+# ── Sad: ? on Err propagates error value ──
+run_test2 "try_err_value" "99" 'use "stdlib/result.weft" use "stdlib/fail.weft" fn go() -[Fail]> i64 { Err<i64>(99)? } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(e) } }'
+# ── Sad: ? chain where first fails ──
+run_test2 "try_chain_first_fail" "42" 'use "stdlib/result.weft" use "stdlib/fail.weft" fn go() -[Fail]> i64 { let a = Err<i64>(42)? let b = Ok<i64>(0)? a + b } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(e) } }'
+# ── Variant: ? on Ok(0) (zero value) ──
+run_test2 "try_ok_zero" "0" 'use "stdlib/result.weft" use "stdlib/fail.weft" fn go() -[Fail]> i64 { Ok<i64>(0)? } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(99) } }'
+# ── Variant: ? in expression position ──
+run_test2 "try_in_expr" "42" 'use "stdlib/result.weft" use "stdlib/fail.weft" fn go() -[Fail]> i64 { Ok<i64>(21)? + Ok<i64>(21)? } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(0) } }'
+# ── Variant: ? after method call ──
+run_test2 "try_after_method" "42" 'use "stdlib/result.weft" use "stdlib/fail.weft" impl i64 { fn to_result(self: i64) -> i64 { Ok<i64>(self) } } fn go() -[Fail]> i64 { let x: i64 = 42 x.to_result()? } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(0) } }'
+# ── Adversarial: nested ? in if-let ──
+run_test2 "try_in_iflet" "42" 'use "stdlib/result.weft" use "stdlib/fail.weft" use "stdlib/option.weft" fn go() -[Fail]> i64 { let v = Ok<i64>(42)? if let Some(x) = Some<i64>(v) { x } else { 0 } } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(0) } }'
+# ── Adversarial: ? in for loop body ──
+run_test2 "try_in_loop" "42" 'use "stdlib/result.weft" use "stdlib/fail.weft" fn check(i: i64) -> i64 { if i < 100 { Ok<i64>(1) } else { Err<i64>(i) } } fn go() -[Fail]> i64 { let mut sum: i64 = 0 for i in 0..42 { sum = sum + check(i)? } sum } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(0) } }'
+# ── Property: ? on Ok is identity ──
+run_test2 "try_ok_identity" "42" 'use "stdlib/result.weft" use "stdlib/fail.weft" fn go() -[Fail]> i64 { let x: i64 = 42 let r = Ok<i64>(x) let v = r? v } fn main() -> i64 { handle go() { Fail.fail(e) -> resume(0) } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
