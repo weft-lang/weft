@@ -64,6 +64,14 @@ Current frontier:
   `rc T <: ptr T` at the whole-`Ty` semantic level instead of only inside the
   tiny finite core.
 
+- `dff034b` `formal: add kernel tag semantic model`
+  The kernel atom theory now has an explicit runtime-flavored model instead of
+  only abstract admissible valuations. We formalize concrete tags for
+  primitives, functions, records, nominals, and pointer flavors, prove the
+  kernel theory is sound for those tags, and derive runtime-facing corollaries
+  showing that concrete `rc` and `mptr` tags satisfy `ptr` semantics while
+  `bool & int` stays empty on every kernel tag.
+
 - `0e9dee2` `formal: prove staged effect compiler equivalence`
   Successful staged handled-effect compilations are no longer only forward
   preserving. We can also recover source evaluations from compiled executions.
