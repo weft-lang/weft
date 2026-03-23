@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **43%** of the way to the complete theorem.
+Roughly **45%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -31,13 +31,22 @@ That estimate is based on:
 | Pure core source-to-machine correctness | 85% | Concrete compiler, staged pipeline, and typed-result preservation are proved. |
 | Handled-effect core correctness | 80% | Trace-preserving compilation, staged effectful compiler theorem, and machine-level effect/result conformance are proved. |
 | Result-carrying semantic observations | 70% | Successful staged compilations now preserve and reflect trace/result behaviors. |
-| Set-theoretic normalization/subtyping | 45% | Finite core DNF/subtype theorem is proved, and whole-`Ty` boolean structure now normalizes to an atomized DNF semantics. Full oracle-aware semantic subtyping is still missing. |
+| Set-theoretic normalization/subtyping | 52% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, and theory-aware unsatisfiability now implies semantic subtyping under sound kernel valuations. Full executable oracle-backed semantic subtyping is still missing. |
 | Runtime semantics (`IO`, `Alloc`, `Unsafe`) | 10% | Only abstract observable behavior scaffolding exists so far. |
 | Continuations / handler operational model | 10% | Tail-resumptive handled-effect core exists, but full continuation semantics is not yet formalized. |
 | Native backend / object emission bridge | 10% | Machine model exists for core targets, but not a real aarch64/Mach-O semantic bridge. |
 | Self-hosted whole-compiler theorem | 5% | The theorem shape exists, but it is not yet connected to the real compiler/runtime stack. |
 
 ## What Each Checkpoint Means
+
+Current frontier:
+
+- theory-aware atomized subtype rules
+  The whole-`Ty` DNF layer is no longer purely structural. We now have an
+  explicit semantic theory of atom implication/disjointness and a proof bridge
+  from normalized unsatisfiability to semantic subtyping under sound
+  valuations. Concretely, this is the first whole-`Ty` step where kernel facts
+  like `rc T <: ptr T` live in the theorem story rather than only in prose.
 
 - `0e9dee2` `formal: prove staged effect compiler equivalence`
   Successful staged handled-effect compilations are no longer only forward

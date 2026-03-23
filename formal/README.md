@@ -85,10 +85,17 @@ The first cut lands three things:
     normalize structurally. We now have semantic normalization soundness and
     idempotence for whole-`Ty` boolean structure, even before the final
     oracle-aware emptiness decision procedure exists.
+17. `Weft/TyTheory.lean` + `Weft/Properties/TyTheorySoundness.lean`
+    A theory-aware semantic layer over atomized whole-`Ty` DNF. We can now
+    state kernel assumptions like atom implication and disjointness, prove that
+    normalized unsatisfiability implies semantic subtyping under sound
+    valuations, and instantiate that bridge with concrete kernel facts such as
+    `rc T <: ptr T`, `mptr T <: ptr T`, and `bool & int` being empty.
 
 ## Near-Term Expansion
 
 - scale DNF normalization from the finite core to the real semantic subtype algebra
+- add executable/oracle-backed unsatisfiability checks over the whole-`Ty` atom theory
 - effect handler operational semantics and discharge proofs
 - one-shot continuation linearity
 - unsafe boundary and allocation confinement theorems
