@@ -5,6 +5,7 @@ import Weft.SafetyCore
 import Weft.Syntax
 import Weft.Types
 import Weft.Properties.CoreCompilerCorrectness
+import Weft.Properties.CoreSemanticSoundness
 import Weft.Properties.CompilerCorrectness
 import Weft.Properties.EffectDiscipline
 import Weft.Properties.TypeSafetyCore

@@ -28,6 +28,10 @@ The first cut lands three things:
 4. `Weft/CoreMachine.lean` + `Weft/Properties/CoreCompilerCorrectness.lean`
    A concrete verified compiler for the proved safety core, giving a real
    source-to-machine preservation theorem rather than only abstract stage laws.
+5. `Weft/Properties/CoreSemanticSoundness.lean`
+   The compiled result still inhabits the source type for the safety-core
+   fragment, so the formal story now has both semantic preservation and typed
+   result preservation.
 
 ## Near-Term Expansion
 
