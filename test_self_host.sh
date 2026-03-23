@@ -2250,6 +2250,26 @@ run_test2 "map_size_eq_fold" "42" 'use "stdlib/map.weft" fn main() -> i64 { let 
 run_test2 "map_fold_eq_values" "1" 'use "stdlib/map.weft" use "stdlib/list.weft" fn main() -> i64 { let m = map_put(map_put(map_put(map_new(), 1, 10), 2, 20), 3, 12) let fs = map_fold(m, 0, (a: i64, k: i64, v: i64) => a + v) let mut vs: i64 = 0 for v in map_values(m) { vs = vs + v } if fs == vs { 1 } else { 0 } }'
 # ── Adversarial: iterate large map ──
 run_test2 "map_fold_50" "50" 'use "stdlib/map.weft" fn main() -> i64 { let mut m = map_new() for i in 0..50 { m = map_put(m, i, 1) } map_fold(m, 0, (a: i64, k: i64, v: i64) => a + v) }'
+# ═══════════════════════════════════════════════════════════════
+# 69. ?. OPTIONAL CHAINING — comprehensive
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: ?. on non-nil record ──
+run_test2 "optchain_field" "42" 'use "stdlib/maybe.weft" type R { val: i64 } fn get(r: i64) -[Maybe]> i64 { r?.val } fn main() -> i64 { handle get(R { val: 42 }) { Maybe.none() -> resume(0) } }'
+# ── Happy: ?. triggers Maybe.none() on nil ──
+run_test2 "optchain_nil" "42" 'use "stdlib/maybe.weft" type R { val: i64 } fn get(r: i64) -[Maybe]> i64 { r?.val } fn main() -> i64 { handle get(0) { Maybe.none() -> resume(42) } }'
+# ── Happy: chained ?. (both non-nil) ──
+run_test2 "optchain_chain" "42" 'use "stdlib/maybe.weft" type A { b: i64 } type B { val: i64 } fn deep(a: i64) -[Maybe]> i64 { let b = a?.b b?.val } fn main() -> i64 { let inner = B { val: 42 } let outer = A { b: inner } handle deep(outer) { Maybe.none() -> resume(0) } }'
+# ── Sad: single ?. on nil ──
+run_test2 "optchain_single_nil" "42" 'use "stdlib/maybe.weft" type R { val: i64 } fn get(r: i64) -[Maybe]> i64 { r?.val } fn main() -> i64 { handle get(0) { Maybe.none() -> resume(42) } }'
+# ── Variant: ?. on first field ──
+run_test2 "optchain_first_field" "42" 'use "stdlib/maybe.weft" type P { x: i64, y: i64 } fn get_x(p: i64) -[Maybe]> i64 { p?.x } fn main() -> i64 { let p = P { x: 42, y: 0 } handle get_x(p) { Maybe.none() -> resume(0) } }'
+# ── Variant: ?. on second field ──
+run_test2 "optchain_second_field" "42" 'use "stdlib/maybe.weft" type P { x: i64, y: i64 } fn get_y(p: i64) -[Maybe]> i64 { p?.y } fn main() -> i64 { handle get_y(P { x: 0, y: 42 }) { Maybe.none() -> resume(0) } }'
+# ── Adversarial: ?. in expression position ──
+run_test2 "optchain_in_expr" "42" 'use "stdlib/maybe.weft" type R { val: i64 } fn add(a: i64, b: i64) -[Maybe]> i64 { a?.val + b?.val } fn main() -> i64 { handle add(R { val: 20 }, R { val: 22 }) { Maybe.none() -> resume(0) } }'
+# ── Property: ?. on non-nil is identity for field access ──
+run_test2 "optchain_eq_field" "1" 'use "stdlib/maybe.weft" type R { val: i64 } fn main() -> i64 { let r = R { val: 42 } let direct = r.val let chained = handle { r?.val } { Maybe.none() -> resume(0) } if direct == chained { 1 } else { 0 } }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
