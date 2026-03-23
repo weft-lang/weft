@@ -3,6 +3,8 @@
 Lean 4 formalization for the actual Weft language/kernel and its compiler
 pipeline.
 
+For rough theorem-progress tracking and checkpoint meaning, see `STATUS.md`.
+
 The point of this directory is not to prove facts about a cute surrogate
 calculus and stop there. The target is the real architecture described in
 `internal/docs/kernel.md` and `internal/briefs/design/compiler-as-data.md`:
@@ -77,6 +79,12 @@ The first cut lands three things:
     signed-constraint cubes, structural complement/distribution, normalization
     soundness, round-trip/idempotence semantics, and a DNF emptiness restatement
     of `A <: B` via normalization of `A & ~B`.
+16. `Weft/TyDNF.lean` + `Weft/Properties/TyDNFSoundness.lean`
+    An atomized DNF normalization layer for the full `Ty` surface: richer
+    constructors are carried as opaque atoms, while union/intersection/complement
+    normalize structurally. We now have semantic normalization soundness and
+    idempotence for whole-`Ty` boolean structure, even before the final
+    oracle-aware emptiness decision procedure exists.
 
 ## Near-Term Expansion
 

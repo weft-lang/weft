@@ -9,6 +9,7 @@ import Weft.CoreSubtype
 import Weft.Effects
 import Weft.SafetyCore
 import Weft.Syntax
+import Weft.TyDNF
 import Weft.Types
 import Weft.Properties.CoreCompilerCorrectness
 import Weft.Properties.CoreEffectCompilerCorrectness
@@ -26,4 +27,5 @@ import Weft.Properties.CoreTypecheckCorrectness
 import Weft.Properties.CompilerCorrectness
 import Weft.Properties.CoreDNFSoundness
 import Weft.Properties.EffectDiscipline
+import Weft.Properties.TyDNFSoundness
 import Weft.Properties.TypeSafetyCore
