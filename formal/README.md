@@ -72,10 +72,15 @@ The first cut lands three things:
     guarantees all the way from surface syntax to emitted code, including direct
     machine-execution theorems for accepted compiled programs and behavior-level
     trace/result conformance for compiled machine semantics.
+15. `Weft/CoreDNF.lean` + `Weft/Properties/CoreDNFSoundness.lean`
+    A real DNF normalization layer for the finite core subtype algebra, with
+    signed-constraint cubes, structural complement/distribution, normalization
+    soundness, round-trip/idempotence semantics, and a DNF emptiness restatement
+    of `A <: B` via normalization of `A & ~B`.
 
 ## Near-Term Expansion
 
-- real semantic subtyping / DNF normalization
+- scale DNF normalization from the finite core to the real semantic subtype algebra
 - effect handler operational semantics and discharge proofs
 - one-shot continuation linearity
 - unsafe boundary and allocation confinement theorems

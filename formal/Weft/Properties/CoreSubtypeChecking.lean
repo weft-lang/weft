@@ -1,4 +1,5 @@
 import Weft.Properties.CoreSemanticSoundness
+import Weft.Properties.CoreDNFSoundness
 import Weft.Properties.CoreSubtypeSoundness
 import Weft.Properties.CoreTypecheckCorrectness
 
@@ -94,5 +95,31 @@ theorem checkAgainst_complete
     (hAdmits : AdmitsExpectedTy expr expected) :
     checkAgainst expr expected = true :=
   (checkAgainst_iff_admitsExpectedTy).2 hAdmits
+
+theorem checkAgainst_iff_normalizeDNF_empty_diff
+    {expr : Expr}
+    {expected : Weft.Ty} :
+    checkAgainst expr expected = true ↔
+      ∃ inferred inferredCore expectedCore,
+        inferType expr = some inferred ∧
+        Weft.CoreSetTy.ofTy inferred = some inferredCore ∧
+        Weft.CoreSetTy.ofTy expected = some expectedCore ∧
+        (Weft.CoreSetTy.normalizeDNF
+          (Weft.CoreSetTy.inter inferredCore (Weft.CoreSetTy.compl expectedCore))).emptyb = true := by
+  unfold checkAgainst
+  cases hInfer : inferType expr with
+  | none =>
+      simp
+  | some inferred =>
+      cases hExpected : Weft.CoreSetTy.ofTy expected with
+      | none =>
+          simp
+      | some expectedCore =>
+          cases hInferred : Weft.CoreSetTy.ofTy inferred with
+          | none =>
+              simp [hInferred]
+          | some inferredCore =>
+              simp [hInferred]
+              exact Weft.CoreSetTy.subtypeb_eq_normalizeDNF_empty_diff inferredCore expectedCore
 
 end Weft.SafetyCore

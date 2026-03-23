@@ -1,4 +1,5 @@
 import Weft.Compiler
+import Weft.CoreDNF
 import Weft.CoreEffects
 import Weft.CoreEffectMachine
 import Weft.CoreEffectPipeline
@@ -23,5 +24,6 @@ import Weft.Properties.CoreSubtypeChecking
 import Weft.Properties.CoreSubtypeSoundness
 import Weft.Properties.CoreTypecheckCorrectness
 import Weft.Properties.CompilerCorrectness
+import Weft.Properties.CoreDNFSoundness
 import Weft.Properties.EffectDiscipline
 import Weft.Properties.TypeSafetyCore

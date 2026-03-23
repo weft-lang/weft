@@ -1,5 +1,6 @@
 import Weft.Properties.CoreEffectSemanticSoundness
 import Weft.Properties.CoreEffectTypecheckCorrectness
+import Weft.Properties.CoreDNFSoundness
 import Weft.Properties.CoreSubtypeChecking
 import Weft.Properties.CoreSubtypeSoundness
 
@@ -151,5 +152,31 @@ theorem compiled_result_respects_effects_and_expected_type
         expectedCore.denotes value.toCoreAtom :=
     checkAgainst_semantic_soundness hCheck hEval
   exact ⟨hCompiled.1, hCompiled.2, hExpectedSound⟩
+
+theorem checkAgainst_iff_normalizeDNF_empty_diff
+    {expr : Expr}
+    {expected : Weft.Ty} :
+    checkAgainst expr expected = true ↔
+      ∃ inferred inferredCore expectedCore,
+        inferType expr = some inferred ∧
+        Weft.CoreSetTy.ofTy inferred = some inferredCore ∧
+        Weft.CoreSetTy.ofTy expected = some expectedCore ∧
+        (Weft.CoreSetTy.normalizeDNF
+          (Weft.CoreSetTy.inter inferredCore (Weft.CoreSetTy.compl expectedCore))).emptyb = true := by
+  unfold checkAgainst
+  cases hInfer : inferType expr with
+  | none =>
+      simp
+  | some inferred =>
+      cases hExpected : Weft.CoreSetTy.ofTy expected with
+      | none =>
+          simp
+      | some expectedCore =>
+          cases hInferred : Weft.CoreSetTy.ofTy inferred with
+          | none =>
+              simp [hInferred]
+          | some inferredCore =>
+              simp [hInferred]
+              exact Weft.CoreSetTy.subtypeb_eq_normalizeDNF_empty_diff inferredCore expectedCore
 
 end Weft.CoreEffects
