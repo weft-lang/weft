@@ -47,3 +47,7 @@ bootstrap:
 # Run the full self-hosting test suite
 selfhost:
     bash test_self_host.sh
+
+# Run benchmarks and record results
+bench:
+    bash bench.sh
