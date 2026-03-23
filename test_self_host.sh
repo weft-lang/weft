@@ -1796,6 +1796,39 @@ run_test2 "iflet_nested" "42" 'type Opt { Some(i64), None } fn main() -> i64 { l
 run_test2 "iflet_wildcard" "42" 'fn main() -> i64 { let x = 42 if let _ = x { 42 } else { 0 } }'
 # ── Adversarial: if let vs regular if ──
 run_test2 "iflet_vs_if" "42" 'type Opt { Some(i64), None } fn main() -> i64 { let x = Some(21) let a = if let Some(v) = x { v } else { 0 } let b = if a > 0 { 21 } else { 0 } a + b }'
+# ═══════════════════════════════════════════════════════════════
+# 56. GENERICS PHASE 4 — generic types + multi-payload variants
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: generic Box<T> ──
+run_test2 "gen_box" "42" 'type Box<T> { Box(T) } fn main() -> i64 { match Box<i64>(42) { Box(x) -> x } }'
+# ── Happy: generic Option<T> ──
+run_test2 "gen_option_some" "42" 'type Opt<T> { Some(T), None } fn main() -> i64 { match Some<i64>(42) { Some(v) -> v None -> 0 } }'
+run_test2 "gen_option_none" "42" 'type Opt<T> { Some(T), None } fn main() -> i64 { match None { Some(v) -> 0 None -> 42 } }'
+# ── Happy: generic function on generic type ──
+run_test2 "gen_unwrap" "42" 'type Opt<T> { Some(T), None } fn unwrap<T>(opt: i64, def: T) -> T { match opt { Some(v) -> v None -> def } } fn main() -> i64 { unwrap<i64>(Some<i64>(42), 0) }'
+# ── Happy: multi-payload constructor ──
+run_test2 "multi_payload_2" "42" 'type P { A(i64, i64) } fn main() -> i64 { match A(20, 22) { A(x, y) -> x + y } }'
+# ── Happy: multi-payload with bare variant ──
+run_test2 "multi_payload_bare" "42" 'type L { N, C(i64, i64) } fn main() -> i64 { match C(42, 10) { C(x, y) -> x N -> 0 } }'
+# ── Happy: second payload accessed ──
+run_test2 "multi_payload_second" "42" 'type P { P(i64, i64) } fn main() -> i64 { match P(10, 42) { P(x, y) -> y } }'
+# ── Happy: three payloads ──
+run_test2 "multi_payload_3" "42" 'type T { T(i64, i64, i64) } fn main() -> i64 { match T(10, 12, 20) { T(a, b, c) -> a + b + c } }'
+# ── Happy: generic list Cons/Nil ──
+run_test2 "gen_list_cons" "42" 'type List<T> { Nil, Cons(T, i64) } fn main() -> i64 { match Cons<i64>(42, 0) { Cons(x, rest) -> x Nil -> 0 } }'
+# ── Happy: wildcard in multi-payload ──
+run_test2 "multi_payload_wild" "42" 'type P { P(i64, i64) } fn main() -> i64 { match P(42, 99) { P(x, _) -> x } }'
+# ── Happy: nested match on generic ──
+run_test2 "gen_nested_match" "42" 'type Opt<T> { Some(T), None } fn main() -> i64 { let x = Some<i64>(21) let y = Some<i64>(21) let a = match x { Some(v) -> v None -> 0 } let b = match y { Some(v) -> v None -> 0 } a + b }'
+# ── Variant: multi-payload in if-let ──
+run_test2 "multi_payload_iflet" "42" 'type P { P(i64, i64), Q } fn main() -> i64 { let v = P(20, 22) if let P(x, y) = v { x + y } else { 0 } }'
+# ── Adversarial: many payloads (4) ──
+run_test2 "multi_payload_4" "42" 'type Q { Q(i64, i64, i64, i64) } fn main() -> i64 { match Q(10, 11, 12, 9) { Q(a, b, c, d) -> a + b + c + d } }'
+# ── Adversarial: generic type used as method receiver ──
+run_test2 "gen_type_method" "42" 'type Box<T> { Box(T) } impl Box { fn get(self: i64) -> i64 { __mem_load64(self + 8) } } fn main() -> i64 { let b = Box<i64>(42) b.get() }'
+# ── Adversarial: generic variant + trait bound ──
+run_test2 "gen_variant_bound" "42" 'trait V { fn v(self: i64) -> i64 } impl V for i64 { fn v(self: i64) -> i64 { self } } type Box<T> { Box(T) } fn extract<T: V>(b: i64) -> i64 { match b { Box(x) -> 42 } } fn main() -> i64 { extract<i64>(Box<i64>(5)) }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
