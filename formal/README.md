@@ -69,7 +69,8 @@ The first cut lands three things:
 14. `Weft/Properties/CoreEffectPipelineSemanticSoundness.lean`
     The staged handled-effect pipeline now carries those type and effect-trace
     guarantees all the way from surface syntax to emitted code, including direct
-    machine-execution theorems for accepted compiled programs.
+    machine-execution theorems for accepted compiled programs and behavior-level
+    trace conformance for compiled machine semantics.
 
 ## Near-Term Expansion
 

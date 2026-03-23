@@ -128,4 +128,39 @@ theorem staged_machine_result_respects_effects_and_expected_type
     compiled_result_respects_effects_and_expected_type hCheck hEffects hEval
   exact ⟨hCore.2.1, hCore.2.2⟩
 
+theorem staged_machine_behavior_respects_inferred_effects
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {effects : Weft.EffectSet}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : EffectBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hEffects : inferEffects (parseSurface surface) = some effects)
+    (hMachine : machineSem oracle code input behavior) :
+    ∀ effect : Weft.EffectName, effect ∈ behavior.trace -> effect ∈ effects.elems := by
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  have hEval : Eval oracle (parseSurface surface) value trace :=
+    staged_compile_complete hCompile hExec
+  rcases inferEffects_sound hEffects with ⟨ty, hTy⟩
+  cases hBehavior
+  exact trace_subset_of_typed_effects hTy hEval
+
+theorem staged_machine_behavior_trace_free_when_pure
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : EffectBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hPure : inferEffects (parseSurface surface) = some Weft.EffectSet.empty)
+    (hMachine : machineSem oracle code input behavior) :
+    ∀ effect : Weft.EffectName, effect ∉ behavior.trace := by
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  have hEval : Eval oracle (parseSurface surface) value trace :=
+    staged_compile_complete hCompile hExec
+  rcases inferEffects_sound hPure with ⟨ty, hTy⟩
+  cases hBehavior
+  exact empty_effects_have_empty_trace hTy hEval
+
 end Weft.CoreEffects
