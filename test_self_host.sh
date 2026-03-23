@@ -1720,6 +1720,82 @@ run_test2 "method_single_char" "42" 'impl i64 { fn x(self: i64) -> i64 { self } 
 run_test2 "trait_long_name" "42" 'trait VeryLongTraitNameForTesting { fn check(self: i64) -> i64 } impl VeryLongTraitNameForTesting for i64 { fn check(self: i64) -> i64 { self } } fn f<T: VeryLongTraitNameForTesting>(x: T) -> T { x } fn main() -> i64 { f<i64>(42) }'
 # ── Boundary: method returning negative via exit code wraparound ──
 run_test2 "method_return_max" "255" 'impl i64 { fn max_exit(self: i64) -> i64 { 255 } } fn main() -> i64 { let x: i64 = 0 x.max_exit() }'
+# ═══════════════════════════════════════════════════════════════
+# 53. PIPES |> — comprehensive
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: basic pipe into unary function ──
+run_test2 "pipe_unary" "42" 'fn double(x: i64) -> i64 { x * 2 } fn main() -> i64 { 21 |> double() }'
+# ── Happy: pipe into function with extra args ──
+run_test2 "pipe_extra_args" "42" 'fn add(x: i64, n: i64) -> i64 { x + n } fn main() -> i64 { 20 |> add(22) }'
+# ── Happy: chained pipes ──
+run_test2 "pipe_chain" "42" 'fn inc(x: i64) -> i64 { x + 1 } fn double(x: i64) -> i64 { x * 2 } fn main() -> i64 { 20 |> inc() |> double() }'
+# ── Happy: pipe into bare function name (no parens) ──
+run_test2 "pipe_bare_fn" "42" 'fn double(x: i64) -> i64 { x * 2 } fn main() -> i64 { 21 |> double }'
+# ── Happy: pipe from complex expression ──
+run_test2 "pipe_from_expr" "42" 'fn double(x: i64) -> i64 { x * 2 } fn main() -> i64 { let x = 10 + 11 x |> double() }'
+# ── Happy: pipe + method coexist ──
+run_test2 "pipe_and_method" "42" 'impl i64 { fn inc(self: i64) -> i64 { self + 1 } } fn double(x: i64) -> i64 { x * 2 } fn main() -> i64 { let x: i64 = 20 x.inc() |> double() }'
+# ── Happy: pipe into function with 3 args ──
+run_test2 "pipe_three_args" "42" 'fn add3(a: i64, b: i64, c: i64) -> i64 { a + b + c } fn main() -> i64 { 10 |> add3(12, 20) }'
+# ── Happy: pipe result used in let ──
+run_test2 "pipe_in_let" "42" 'fn double(x: i64) -> i64 { x * 2 } fn main() -> i64 { let r = 21 |> double() r }'
+# ── Adversarial: 5-deep pipe chain ──
+run_test2 "pipe_5_deep" "42" 'fn inc(x: i64) -> i64 { x + 1 } fn main() -> i64 { 37 |> inc() |> inc() |> inc() |> inc() |> inc() }'
+# ── Adversarial: pipe with 0 ──
+run_test2 "pipe_zero" "0" 'fn id(x: i64) -> i64 { x } fn main() -> i64 { 0 |> id() }'
+# ── Adversarial: pipe precedence vs arithmetic ──
+run_test2 "pipe_prec" "42" 'fn id(x: i64) -> i64 { x } fn main() -> i64 { 40 + 2 |> id() }'
+#
+# ═══════════════════════════════════════════════════════════════
+# 54. FOR LOOPS — comprehensive
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: basic for range ──
+run_test2 "for_basic" "42" 'fn main() -> i64 { let mut s: i64 = 0 for i in 0..42 { s = s + 1 } s }'
+# ── Happy: for with accumulation ──
+run_test2 "for_sum" "10" 'fn main() -> i64 { let mut s: i64 = 0 for i in 0..5 { s = s + i } s }'
+# ── Happy: for with non-zero start ──
+run_test2 "for_nonzero_start" "42" 'fn main() -> i64 { let mut s: i64 = 0 for i in 10..14 { s = s + 1 } s + 38 }'
+# ── Happy: for with variable end ──
+run_test2 "for_var_end" "42" 'fn main() -> i64 { let n = 42 let mut s: i64 = 0 for i in 0..n { s = s + 1 } s }'
+# ── Happy: nested for loops ──
+run_test2 "for_nested" "42" 'fn main() -> i64 { let mut s: i64 = 0 for i in 0..6 { for j in 0..7 { s = s + 1 } } s }'
+# ── Happy: for loop body uses index ──
+run_test2 "for_use_index" "42" 'fn main() -> i64 { let mut last: i64 = 0 for i in 0..43 { last = i } last }'
+# ── Happy: for loop + method call ──
+run_test2 "for_method" "42" 'impl i64 { fn inc(self: i64) -> i64 { self + 1 } } fn main() -> i64 { let mut s: i64 = 0 for i in 0..42 { s = s.inc() } s }'
+# ── Boundary: for 0..0 (zero iterations) ──
+run_test2 "for_zero_iter" "0" 'fn main() -> i64 { let mut s: i64 = 0 for i in 0..0 { s = 99 } s }'
+# ── Boundary: for 0..1 (one iteration) ──
+run_test2 "for_one_iter" "42" 'fn main() -> i64 { let mut s: i64 = 0 for i in 0..1 { s = 42 } s }'
+# ── Adversarial: 100 iterations ──
+run_test2 "for_100" "100" 'fn main() -> i64 { let mut s: i64 = 0 for i in 0..100 { s = s + 1 } s }'
+# ── Adversarial: for in expression position ──
+run_test2 "for_expr_pos" "42" 'fn main() -> i64 { let mut s: i64 = 0 for i in 0..42 { s = s + 1 } s }'
+#
+# ═══════════════════════════════════════════════════════════════
+# 55. IF LET — comprehensive
+# ═══════════════════════════════════════════════════════════════
+#
+# ── Happy: if let with constructor match ──
+run_test2 "iflet_ctor" "42" 'type Opt { Some(i64), None } fn main() -> i64 { let x = Some(42) if let Some(v) = x { v } else { 0 } }'
+# ── Happy: if let with else branch ──
+run_test2 "iflet_else" "42" 'type Opt { Some(i64), None } fn main() -> i64 { let x = None if let Some(v) = x { v } else { 42 } }'
+# ── Happy: if let with int literal pattern ──
+run_test2 "iflet_int" "42" 'fn main() -> i64 { let x = 42 if let 42 = x { 42 } else { 0 } }'
+# ── Happy: if let with binding pattern ──
+run_test2 "iflet_bind" "42" 'fn main() -> i64 { let x = 42 if let v = x { v } else { 0 } }'
+# ── Happy: if let without else (nil default) ──
+run_test2 "iflet_no_else" "42" 'type Opt { Some(i64), None } fn main() -> i64 { let x = Some(42) let mut r: i64 = 0 if let Some(v) = x { r = v } r }'
+# ── Happy: if let in function body ──
+run_test2 "iflet_in_fn" "42" 'type Opt { Some(i64), None } fn extract(x: i64) -> i64 { if let Some(v) = x { v } else { 0 } } fn main() -> i64 { extract(Some(42)) }'
+# ── Happy: nested if let ──
+run_test2 "iflet_nested" "42" 'type Opt { Some(i64), None } fn main() -> i64 { let x = Some(42) if let Some(v) = x { if let 42 = v { 42 } else { 0 } } else { 0 } }'
+# ── Variant: if let with wildcard ──
+run_test2 "iflet_wildcard" "42" 'fn main() -> i64 { let x = 42 if let _ = x { 42 } else { 0 } }'
+# ── Adversarial: if let vs regular if ──
+run_test2 "iflet_vs_if" "42" 'type Opt { Some(i64), None } fn main() -> i64 { let x = Some(21) let a = if let Some(v) = x { v } else { 0 } let b = if a > 0 { 21 } else { 0 } a + b }'
 echo "weft2: $PASS2 passed, $FAIL2 failed"
 
 echo ""
