@@ -34,6 +34,35 @@ def machineSem (oracle : Oracle) : Weft.Semantics Code EffectBehavior :=
     ∃ value trace, Exec oracle code [] [value] trace ∧
       behavior = { trace := trace, exitCode := exitCode value }
 
+structure ResultBehavior : Type where
+  result : RuntimeVal
+  trace : List Weft.EffectName
+  exitCode : Int
+  deriving Repr, DecidableEq
+
+def sourceResultSem (oracle : Oracle) : Weft.Semantics Expr ResultBehavior :=
+  fun expr _input behavior =>
+    ∃ value trace, Eval oracle expr value trace ∧
+      behavior = { result := value, trace := trace, exitCode := exitCode value }
+
+def surfaceResultSem (oracle : Oracle) : Weft.Semantics SurfaceExpr ResultBehavior :=
+  fun surface input behavior =>
+    sourceResultSem oracle (parseSurface surface) input behavior
+
+def checkedResultSem (oracle : Oracle) : Weft.Semantics CheckedExpr ResultBehavior :=
+  fun checked input behavior =>
+    sourceResultSem oracle checked.expr input behavior
+
+def irResultSem (oracle : Oracle) : Weft.Semantics IRExpr ResultBehavior :=
+  fun ir _input behavior =>
+    ∃ value trace, IREval oracle ir value trace ∧
+      behavior = { result := value, trace := trace, exitCode := exitCode value }
+
+def machineResultSem (oracle : Oracle) : Weft.Semantics Code ResultBehavior :=
+  fun code _input behavior =>
+    ∃ value trace, Exec oracle code [] [value] trace ∧
+      behavior = { result := value, trace := trace, exitCode := exitCode value }
+
 theorem parse_stage_preserves
     (oracle : Oracle) :
     Weft.SemanticsPreserving (surfaceSem oracle) (sourceSem oracle) parseStage := by
@@ -42,9 +71,29 @@ theorem parse_stage_preserves
   subst artifact
   exact hSurface
 
+theorem parse_stage_preserves_result
+    (oracle : Oracle) :
+    Weft.SemanticsPreserving (surfaceResultSem oracle) (sourceResultSem oracle) parseStage := by
+  intro surface artifact input behavior hCompile hSurface
+  simp [parseStage] at hCompile
+  subst artifact
+  exact hSurface
+
 theorem typecheck_stage_preserves
     (oracle : Oracle) :
     Weft.SemanticsPreserving (sourceSem oracle) (checkedSem oracle) typecheckStage := by
+  intro expr artifact input behavior hCompile hSource
+  cases hCheck : check expr with
+  | none =>
+      simp [typecheckStage, hCheck] at hCompile
+  | some checked =>
+      simp [typecheckStage, hCheck] at hCompile
+      cases hCompile
+      exact hSource
+
+theorem typecheck_stage_preserves_result
+    (oracle : Oracle) :
+    Weft.SemanticsPreserving (sourceResultSem oracle) (checkedResultSem oracle) typecheckStage := by
   intro expr artifact input behavior hCompile hSource
   cases hCheck : check expr with
   | none =>
@@ -87,6 +136,15 @@ theorem lower_eval_preserves
 theorem lower_stage_preserves
     (oracle : Oracle) :
     Weft.SemanticsPreserving (checkedSem oracle) (irSem oracle) lowerStage := by
+  intro checked artifact input behavior hCompile hChecked
+  simp [lowerStage] at hCompile
+  subst artifact
+  rcases hChecked with ⟨value, trace, hEval, hBehavior⟩
+  exact ⟨value, trace, lower_eval_preserves hEval, hBehavior⟩
+
+theorem lower_stage_preserves_result
+    (oracle : Oracle) :
+    Weft.SemanticsPreserving (checkedResultSem oracle) (irResultSem oracle) lowerStage := by
   intro checked artifact input behavior hCompile hChecked
   simp [lowerStage] at hCompile
   subst artifact
@@ -187,6 +245,15 @@ theorem emit_stage_preserves
   rcases hIr with ⟨value, trace, hEval, hBehavior⟩
   exact ⟨value, trace, emit_correct oracle ir value trace hEval, hBehavior⟩
 
+theorem emit_stage_preserves_result
+    (oracle : Oracle) :
+    Weft.SemanticsPreserving (irResultSem oracle) (machineResultSem oracle) emitStage := by
+  intro ir artifact input behavior hCompile hIr
+  simp [emitStage, emitClosed] at hCompile
+  subst artifact
+  rcases hIr with ⟨value, trace, hEval, hBehavior⟩
+  exact ⟨value, trace, emit_correct oracle ir value trace hEval, hBehavior⟩
+
 theorem staged_whole_compiler_theorem
     (oracle : Oracle) :
     Weft.SemanticsPreserving (surfaceSem oracle) (machineSem oracle)
@@ -203,6 +270,23 @@ theorem staged_whole_compiler_theorem
       (typecheck_stage_preserves oracle)
       (lower_stage_preserves oracle)
       (emit_stage_preserves oracle))
+
+theorem staged_whole_result_compiler_theorem
+    (oracle : Oracle) :
+    Weft.SemanticsPreserving (surfaceResultSem oracle) (machineResultSem oracle)
+      (Weft.CompilerPipeline.compile stagedCompilerPipeline) := by
+  simpa using
+    (Weft.whole_compiler_theorem
+      stagedCompilerPipeline
+      (surfaceResultSem oracle)
+      (sourceResultSem oracle)
+      (checkedResultSem oracle)
+      (irResultSem oracle)
+      (machineResultSem oracle)
+      (parse_stage_preserves_result oracle)
+      (typecheck_stage_preserves_result oracle)
+      (lower_stage_preserves_result oracle)
+      (emit_stage_preserves_result oracle))
 
 theorem staged_compile_eq_emitClosed
     {surface : SurfaceExpr}
@@ -243,6 +327,21 @@ theorem staged_semantics_iff
   constructor
   · intro hSurface
     exact staged_whole_compiler_theorem oracle surface code input behavior hCompile hSurface
+  · intro hMachine
+    rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+    exact ⟨value, trace, staged_compile_complete hCompile hExec, hBehavior⟩
+
+theorem staged_result_semantics_iff
+    (oracle : Oracle)
+    {surface : SurfaceExpr}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : ResultBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code) :
+    surfaceResultSem oracle surface input behavior ↔ machineResultSem oracle code input behavior := by
+  constructor
+  · intro hSurface
+    exact staged_whole_result_compiler_theorem oracle surface code input behavior hCompile hSurface
   · intro hMachine
     rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
     exact ⟨value, trace, staged_compile_complete hCompile hExec, hBehavior⟩

@@ -58,7 +58,8 @@ The first cut lands three things:
     A staged handled-effect pipeline, parameterized by the effect oracle and
     proved with the same whole-compiler composition theorem as the pure core,
     now strengthened with reverse compilation lemmas so successful staged
-    compilations satisfy a source/machine semantics `iff`.
+    compilations satisfy source/machine semantics `iff`s for both trace-only and
+    result-carrying observations.
 13. `Weft/Properties/CoreEffectTypecheckCorrectness.lean`,
     `Weft/Properties/CoreEffectSemanticSoundness.lean`,
     `Weft/Properties/CoreEffectSubtypeChecking.lean`
@@ -70,7 +71,7 @@ The first cut lands three things:
     The staged handled-effect pipeline now carries those type and effect-trace
     guarantees all the way from surface syntax to emitted code, including direct
     machine-execution theorems for accepted compiled programs and behavior-level
-    trace conformance for compiled machine semantics.
+    trace/result conformance for compiled machine semantics.
 
 ## Near-Term Expansion
 
