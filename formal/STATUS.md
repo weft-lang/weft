@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **60%** of the way to the complete theorem.
+Roughly **62%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -26,6 +26,8 @@ That estimate is based on:
   representable fragment
 - the whole-`Ty` kernel subtype layer is now structurally computable rather
   than only theorem-facing
+- bootstrap-parity reasoning is now instantiated for emitted handled-effect
+  machine artifacts over explicit observed `IOEvent` behaviors
 - DNF/subtyping work moving beyond the tiny finite core
 - but the real runtime, unsafe/alloc boundaries, continuation semantics, and
   native object-format bridge still being mostly unproved
@@ -37,16 +39,26 @@ That estimate is based on:
 | Compiler composition backbone | 90% | Generic stage-composition theorem and bootstrap-stability shape are in place. |
 | Pure core source-to-machine correctness | 85% | Concrete compiler, staged pipeline, and typed-result preservation are proved. |
 | Handled-effect core correctness | 80% | Trace-preserving compilation, staged effectful compiler theorem, and machine-level effect/result conformance are proved. |
-| Result-carrying semantic observations | 88% | Successful staged compilations now preserve and reflect trace/result behaviors, representable expected types can be restated at the whole-`Ty` kernel-tag semantic level, the handled-effect fragment has explicit query/reply observation theorems in the generic `IOEvent` space, and staged/compiled expected-type theorems now work through an executable whole-`Ty` kernel subtype layer rather than only the finite `CoreSetTy` bridge. |
+| Result-carrying semantic observations | 89% | Successful staged compilations now preserve and reflect trace/result behaviors, representable expected types can be restated at the whole-`Ty` kernel-tag semantic level, the handled-effect fragment has explicit query/reply observation theorems in the generic `IOEvent` space, staged/compiled expected-type theorems now work through an executable whole-`Ty` kernel subtype layer rather than only the finite `CoreSetTy` bridge, and semantic equivalence of surface compiler generations can be transferred to semantic equivalence of their emitted machine artifacts. |
 | Set-theoretic normalization/subtyping | 69% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, theory-aware unsatisfiability implies semantic subtyping under sound valuations, the kernel theory has a concrete tag-level semantic model with explicit pointer-flavor separation facts such as `rc T & mptr U` being empty, and there is now a structurally computable whole-`Ty` kernel subtype checker over normalized obligations. Full semantic subtyping for richer constructors is still missing. |
 | Runtime semantics (`IO`, `Alloc`, `Unsafe`) | 23% | We now have a concrete tag-level semantic model for runtime values plus explicit observable query/reply event semantics for the handled-effect fragment, and we can already rule out impossible runtime tag overlaps like `rc`/`mptr` collisions. Full `IO`/allocation/unsafe runtime behaviors are still missing. |
 | Continuations / handler operational model | 10% | Tail-resumptive handled-effect core exists, but full continuation semantics is not yet formalized. |
 | Native backend / object emission bridge | 10% | Machine model exists for core targets, but not a real aarch64/Mach-O semantic bridge. |
-| Self-hosted whole-compiler theorem | 7% | The theorem shape exists and its handled-effect fragment now speaks in generic observable `IOEvent` behaviors, but it is not yet connected to the real compiler/runtime stack. |
+| Self-hosted whole-compiler theorem | 10% | The theorem shape exists, its handled-effect fragment now speaks in generic observable `IOEvent` behaviors, and bootstrap-style semantic parity has been instantiated for emitted artifacts of the staged handled-effect pipeline. It is still not connected to the real compiler/runtime stack. |
 
 ## What Each Checkpoint Means
 
 Current frontier:
+
+- bootstrap parity for observed emitted artifacts
+  The generic bootstrap theorem is no longer only a library lemma sitting above
+  the real formal pipeline. We now specialize it to the staged handled-effect
+  compiler and use the staged source/machine `iff` theorems to transfer
+  semantic equivalence of surface compiler generations into semantic
+  equivalence of their emitted machine artifacts, for both trace-only and
+  result-carrying `IOEvent` observations. Concretely: the self-hosted theorem
+  story now reaches actual emitted artifacts in the current formal fragment,
+  not just abstract compiler values.
 
 - executable whole-`Ty` kernel subtype checking for compiled/staged expected-type theorems
   The formal development no longer has to route every expected-type theorem
@@ -169,6 +181,14 @@ Current frontier:
   the staged whole-`Ty` expected-type theorems now sit on top of an executable
   kernel checker rather than a theorem-only placeholder.
 
+- observed bootstrap artifact parity
+  The staged handled-effect fragment now has explicit lemmas transferring
+  semantic equivalence of surface programs through compilation into semantic
+  equivalence of emitted code under the observed `IOEvent` semantics. Chaining
+  those lemmas with the generic bootstrap transitivity theorem yields the first
+  concrete “compiler generation parity implies emitted artifact parity” story
+  in the current formal development.
+
 - `0e9dee2` `formal: prove staged effect compiler equivalence`
   Successful staged handled-effect compilations are no longer only forward
   preserving. We can also recover source evaluations from compiled executions.
@@ -208,7 +228,8 @@ Current frontier:
 3. Extend the new computable whole-`Ty` kernel subtype checker so it reasons
    about richer semantic obligations, then push the staged compiler theorem
    outward from effect-query observations to real observable runtime events:
-   `IO`, allocation, unsafe boundaries, object emission, and bootstrap parity.
+   `IO`, allocation, unsafe boundaries, object emission, and full bootstrap
+   parity against the self-hosted compiler artifacts.
 
 ## Missing For The Full Theorem
 

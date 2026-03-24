@@ -16,6 +16,7 @@ import Weft.TyTheory
 import Weft.Types
 import Weft.Properties.CoreCompilerCorrectness
 import Weft.Properties.CoreEffectCompilerCorrectness
+import Weft.Properties.CoreEffectBootstrap
 import Weft.Properties.CoreEffectIOObservations
 import Weft.Properties.CoreEffectSemanticSoundness
 import Weft.Properties.CoreEffectSoundness

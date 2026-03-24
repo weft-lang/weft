@@ -120,6 +120,12 @@ The first cut lands three things:
     drives semantic soundness theorems showing compiled and staged executions
     respect requested whole-`Ty` kernel semantics beyond the old finite
     `CoreSetTy` fragment.
+22. `Weft/Properties/CoreEffectBootstrap.lean`
+    A bootstrap-parity bridge specialized to the staged handled-effect
+    pipeline. It transfers semantic equivalence of surface compiler generations
+    through staged compilation into semantic equivalence of their emitted
+    machine artifacts, for both trace-only and result-carrying observable
+    `IOEvent` behaviors.
 
 ## Near-Term Expansion
 
