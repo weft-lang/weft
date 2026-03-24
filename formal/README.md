@@ -103,13 +103,20 @@ The first cut lands three things:
     handled-effect expected-type theorems from `value.toCoreAtom` denotations to
     concrete whole-`Ty` semantic judgments over runtime tags, including staged
     machine/result behavior theorems.
+20. `Weft/Properties/CoreEffectIOObservations.lean`
+    The handled-effect compiler theorem now also lives over explicit generic
+    `IOEvent.effectQuery` observations rather than only internal effect-name
+    traces. We can state staged source/machine equivalence for those observed
+    query/reply behaviors, prove pure accepted programs have empty observable
+    traces, and show every observed event is exactly an oracle-mediated effect
+    query already justified by the inferred effect set, while keeping typed
+    results at the whole-`Ty` kernel-tag level.
 
 ## Near-Term Expansion
 
 - scale DNF normalization from the finite core to the real semantic subtype algebra
 - add executable/oracle-backed unsatisfiability checks over the whole-`Ty` atom theory
-- grow the kernel tag model into fuller runtime observations for `IO`, allocation, and unsafe boundaries
-- replace effect-name traces with richer observable event semantics
+- grow the handled-effect observation layer into fuller runtime observations for `IO`, allocation, and unsafe boundaries
 - effect handler operational semantics and discharge proofs
 - one-shot continuation linearity
 - unsafe boundary and allocation confinement theorems

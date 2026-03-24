@@ -12,13 +12,15 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **49%** of the way to the complete theorem.
+Roughly **53%** of the way to the complete theorem.
 
 That estimate is based on:
 
 - the staged compiler theorem backbone being in place
 - concrete source-to-machine theorems existing for pure and handled-effect cores
 - result/effect semantic soundness already reaching emitted code
+- handled-effect observations now lifted into explicit generic `IOEvent`
+  query/reply behaviors rather than only raw effect-name traces
 - DNF/subtyping work moving beyond the tiny finite core
 - but the real runtime, unsafe/alloc boundaries, continuation semantics, and
   native object-format bridge still being mostly unproved
@@ -30,16 +32,25 @@ That estimate is based on:
 | Compiler composition backbone | 90% | Generic stage-composition theorem and bootstrap-stability shape are in place. |
 | Pure core source-to-machine correctness | 85% | Concrete compiler, staged pipeline, and typed-result preservation are proved. |
 | Handled-effect core correctness | 80% | Trace-preserving compilation, staged effectful compiler theorem, and machine-level effect/result conformance are proved. |
-| Result-carrying semantic observations | 76% | Successful staged compilations now preserve and reflect trace/result behaviors, and representable expected types can be restated at the whole-`Ty` kernel-tag semantic level rather than only in the finite core model. |
+| Result-carrying semantic observations | 83% | Successful staged compilations now preserve and reflect trace/result behaviors, representable expected types can be restated at the whole-`Ty` kernel-tag semantic level, and the handled-effect fragment now has explicit query/reply observation theorems in the generic `IOEvent` space. |
 | Set-theoretic normalization/subtyping | 56% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, theory-aware unsatisfiability implies semantic subtyping under sound valuations, and the kernel theory now has a concrete tag-level semantic model. Full executable oracle-backed semantic subtyping is still missing. |
-| Runtime semantics (`IO`, `Alloc`, `Unsafe`) | 14% | We now have a concrete tag-level semantic model for runtime values, but full event/I/O/allocation semantics are still missing. |
+| Runtime semantics (`IO`, `Alloc`, `Unsafe`) | 22% | We now have a concrete tag-level semantic model for runtime values plus explicit observable query/reply event semantics for the handled-effect fragment, but full `IO`/allocation/unsafe runtime behaviors are still missing. |
 | Continuations / handler operational model | 10% | Tail-resumptive handled-effect core exists, but full continuation semantics is not yet formalized. |
 | Native backend / object emission bridge | 10% | Machine model exists for core targets, but not a real aarch64/Mach-O semantic bridge. |
-| Self-hosted whole-compiler theorem | 5% | The theorem shape exists, but it is not yet connected to the real compiler/runtime stack. |
+| Self-hosted whole-compiler theorem | 7% | The theorem shape exists and its handled-effect fragment now speaks in generic observable `IOEvent` behaviors, but it is not yet connected to the real compiler/runtime stack. |
 
 ## What Each Checkpoint Means
 
 Current frontier:
+
+- generic `IOEvent` query/reply observations for compiled handled effects
+  The handled-effect theorem no longer has to speak only in internal
+  `List EffectName` traces. We now interpret compiled and staged executions as
+  generic observable `IOEvent` behaviors carrying explicit effect-query replies,
+  prove source/machine equivalence at that level, and show every observed event
+  is already justified by the inferred effect set. Concretely: the theorem now
+  talks in a runtime-observation language much closer to the eventual full
+  `IO`/allocation/unsafe semantics instead of an internal bookkeeping list.
 
 - whole-`Ty` tagged result semantics for compiled executions
   The staged handled-effect pipeline no longer stops at finite-core denotation
@@ -89,6 +100,22 @@ Current frontier:
   inhabit the requested whole-`Ty` runtime-tag semantics, not just the tiny
   core denotation domain.
 
+- `071f0f5` `formal: observe handled effects as io events`
+  The handled-effect fragment now exposes its behavior through explicit generic
+  `IOEvent.effectQuery` observations rather than only raw effect-name traces.
+  We prove staged source/machine equivalence for those observations and carry
+  typed-result theorems through the result-carrying observed behaviors.
+  Concretely: the compiler theorem can now talk about observed query/reply
+  runtime behavior, not only about an internal list of effect names.
+
+- `38f567a` `formal: constrain observed io behaviors`
+  Observable handled-effect `IOEvent` traces are now proved precise rather than
+  merely present: every event in the compiled/staged observed trace is exactly
+  an oracle-mediated effect query whose effect lies in the inferred effect set,
+  and pure accepted programs have empty observed traces. Concretely: the new
+  runtime-observation layer is already semantically disciplined, not just a new
+  notation for the old traces.
+
 - `0e9dee2` `formal: prove staged effect compiler equivalence`
   Successful staged handled-effect compilations are no longer only forward
   preserving. We can also recover source evaluations from compiled executions.
@@ -125,8 +152,9 @@ Current frontier:
 2. Replace opaque atoms with real semantic relations where the kernel requires
    them: pointer variance, record openness, nominal/trait/conformance, effect
    sets, and eventually continuation-sensitive handler semantics.
-3. Push the staged compiler theorem outward to real observable runtime events:
-   `IO`, allocation, unsafe boundaries, object emission, and bootstrap parity.
+3. Push the staged compiler theorem outward from effect-query observations to
+   real observable runtime events: `IO`, allocation, unsafe boundaries, object
+   emission, and bootstrap parity.
 
 ## Missing For The Full Theorem
 
