@@ -89,6 +89,10 @@ theorem soundValuation (tag : KernelTag) :
     change KernelTheory.Disjoint lhs rhs at hDisjoint
     cases lhs <;> cases rhs <;> cases tag <;>
       simp [KernelTheory.Disjoint, valuation, TyAtom.denotesTag] at hDisjoint hPair
+    case mptr.rc.ptr kind inner =>
+      cases kind <;> simp at hDisjoint hPair
+    case rc.mptr.ptr kind inner =>
+      cases kind <;> simp at hDisjoint hPair
 
 theorem exists_soundValuation :
     ∃ ν : TyAtom -> Prop, KernelTheory.theory.SoundValuation ν := by

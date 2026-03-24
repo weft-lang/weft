@@ -33,6 +33,19 @@ theorem kernel_rc_ptr_runtime
     Ty.denotesTag (.ptr .rc inner) (Ty.ptr inner) := by
   simp [Ty.denotesTag, Ty.denotesUnder, KernelTag.valuation, TyAtom.denotesTag]
 
+theorem kernel_rc_mptr_empty_tag
+    (tag : KernelTag)
+    (rcInner mptrInner : Ty) :
+    ¬ Ty.denotesTag tag (Ty.inter (Ty.rc rcInner) (Ty.mptr mptrInner)) := by
+  intro hDen
+  have hNorm :
+      TyDNF.denotes (KernelTag.valuation tag)
+        (Ty.normalizeTyDNF (Ty.inter (Ty.rc rcInner) (Ty.mptr mptrInner))) :=
+    (Ty.normalizeTyDNF_spec (KernelTag.valuation tag)
+      (Ty.inter (Ty.rc rcInner) (Ty.mptr mptrInner))).2 hDen
+  exact TyDNF.unsat_sound (KernelTag.soundValuation tag)
+    (kernel_rc_mptr_inter_unsat rcInner mptrInner) hNorm
+
 theorem kernel_rc_runtime
     (inner : Ty) :
     Ty.denotesTag (.ptr .rc inner) (Ty.rc inner) := by

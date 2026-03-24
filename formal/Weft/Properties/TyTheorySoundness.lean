@@ -87,6 +87,18 @@ theorem kernel_mptr_ptr_diff_unsat
   change inner = inner
   rfl
 
+theorem kernel_rc_mptr_inter_unsat
+    (rcInner mptrInner : Ty) :
+    (Ty.normalizeTyDNF (Ty.inter (Ty.rc rcInner) (Ty.mptr mptrInner))).Unsat KernelTheory.theory := by
+  intro clause hMem
+  have hClause : clause = { pos := [TyAtom.rc rcInner, TyAtom.mptr mptrInner], neg := [] } := by
+    simpa [Ty.normalizeTyDNF, TyDNF.inter, TyDNF.interWith, TyDNF.ofAtom,
+      TyClause.ofPos, TyClause.merge] using hMem
+  subst clause
+  refine Or.inl ⟨TyAtom.rc rcInner, by simp, TyAtom.mptr mptrInner, by simp, ?_⟩
+  change True
+  trivial
+
 theorem kernel_rc_subtype_ptr
     (inner : Ty) :
     (Ty.rc inner).SubtypeIn KernelTheory.theory (Ty.ptr inner) := by

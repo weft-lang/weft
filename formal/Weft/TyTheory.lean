@@ -51,6 +51,8 @@ def Disjoint : TyAtom -> TyAtom -> Prop
   | .nil, .bool => True
   | .int, .nil => True
   | .nil, .int => True
+  | .rc _, .mptr _ => True
+  | .mptr _, .rc _ => True
   | _, _ => False
 
 def theory : TyTheory where

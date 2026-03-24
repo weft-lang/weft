@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **53%** of the way to the complete theorem.
+Roughly **54%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -33,8 +33,8 @@ That estimate is based on:
 | Pure core source-to-machine correctness | 85% | Concrete compiler, staged pipeline, and typed-result preservation are proved. |
 | Handled-effect core correctness | 80% | Trace-preserving compilation, staged effectful compiler theorem, and machine-level effect/result conformance are proved. |
 | Result-carrying semantic observations | 83% | Successful staged compilations now preserve and reflect trace/result behaviors, representable expected types can be restated at the whole-`Ty` kernel-tag semantic level, and the handled-effect fragment now has explicit query/reply observation theorems in the generic `IOEvent` space. |
-| Set-theoretic normalization/subtyping | 56% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, theory-aware unsatisfiability implies semantic subtyping under sound valuations, and the kernel theory now has a concrete tag-level semantic model. Full executable oracle-backed semantic subtyping is still missing. |
-| Runtime semantics (`IO`, `Alloc`, `Unsafe`) | 22% | We now have a concrete tag-level semantic model for runtime values plus explicit observable query/reply event semantics for the handled-effect fragment, but full `IO`/allocation/unsafe runtime behaviors are still missing. |
+| Set-theoretic normalization/subtyping | 58% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, theory-aware unsatisfiability implies semantic subtyping under sound valuations, and the kernel theory now has a concrete tag-level semantic model with explicit pointer-flavor separation facts such as `rc T & mptr U` being empty. Full executable oracle-backed semantic subtyping is still missing. |
+| Runtime semantics (`IO`, `Alloc`, `Unsafe`) | 23% | We now have a concrete tag-level semantic model for runtime values plus explicit observable query/reply event semantics for the handled-effect fragment, and we can already rule out impossible runtime tag overlaps like `rc`/`mptr` collisions. Full `IO`/allocation/unsafe runtime behaviors are still missing. |
 | Continuations / handler operational model | 10% | Tail-resumptive handled-effect core exists, but full continuation semantics is not yet formalized. |
 | Native backend / object emission bridge | 10% | Machine model exists for core targets, but not a real aarch64/Mach-O semantic bridge. |
 | Self-hosted whole-compiler theorem | 7% | The theorem shape exists and its handled-effect fragment now speaks in generic observable `IOEvent` behaviors, but it is not yet connected to the real compiler/runtime stack. |
@@ -42,6 +42,13 @@ That estimate is based on:
 ## What Each Checkpoint Means
 
 Current frontier:
+
+- pointer-flavor separation in the kernel tag model
+  The kernel theory now distinguishes `rc` and `mptr` values semantically, not
+  just by constructor names in the syntax. We prove their intersection is empty
+  in the theory-aware DNF layer and in the concrete kernel-tag model.
+  Concretely: the formal runtime story can now rule out a class of impossible
+  aliasing/tag-collision cases instead of leaving them as unstated intuition.
 
 - generic `IOEvent` query/reply observations for compiled handled effects
   The handled-effect theorem no longer has to speak only in internal
@@ -115,6 +122,13 @@ Current frontier:
   and pure accepted programs have empty observed traces. Concretely: the new
   runtime-observation layer is already semantically disciplined, not just a new
   notation for the old traces.
+
+- `formal: separate pointer tag flavors`
+  The kernel theory and concrete tag model now explicitly rule out overlap
+  between `rc` and `mptr` pointer flavors. We prove `rc T & mptr U` is
+  unsatisfiable in the theory-aware DNF layer and empty at every concrete
+  kernel tag. Concretely: pointer-kind separation is now a proved semantic
+  invariant rather than an informal expectation.
 
 - `0e9dee2` `formal: prove staged effect compiler equivalence`
   Successful staged handled-effect compilations are no longer only forward
