@@ -50,6 +50,19 @@ def observeIOTrace (oracle : Oracle) : List Weft.EffectName -> List Weft.IOEvent
         · right
           exact ih.mpr ⟨hInTail, hResp⟩
 
+@[simp] theorem mem_observeIOTrace_iff
+    {oracle : Oracle}
+    {trace : List Weft.EffectName}
+    {event : Weft.IOEvent} :
+    event ∈ observeIOTrace oracle trace ↔
+      ∃ effect : Weft.EffectName,
+        effect ∈ trace ∧ event = Weft.IOEvent.effectQuery effect (oracle effect) := by
+  induction trace with
+  | nil =>
+      cases event <;> simp [observeIOTrace]
+  | cons head tail ih =>
+      cases event <;> simp [observeIOTrace, ih]
+
 theorem trace_eq_nil_of_forall_not_mem
     {trace : List Weft.EffectName}
     (hNone : ∀ effect : Weft.EffectName, effect ∉ trace) :
