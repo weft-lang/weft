@@ -80,6 +80,15 @@ Current frontier:
   showing that concrete `rc` and `mptr` tags satisfy `ptr` semantics while
   `bool & int` stays empty on every kernel tag.
 
+- `57b289d` `formal: lift staged results to kernel tag semantics`
+  The staged handled-effect theorem now reaches beyond the finite `CoreSetTy`
+  checker model. We prove that every representable expected type can be
+  interpreted equivalently in the whole-`Ty` kernel-tag semantics, then lift
+  the compiled/staged expected-type theorems through that bridge. Concretely:
+  successful compiled executions can now be stated as producing results that
+  inhabit the requested whole-`Ty` runtime-tag semantics, not just the tiny
+  core denotation domain.
+
 - `0e9dee2` `formal: prove staged effect compiler equivalence`
   Successful staged handled-effect compilations are no longer only forward
   preserving. We can also recover source evaluations from compiled executions.
