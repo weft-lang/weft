@@ -1,3 +1,5 @@
+import Weft.Effects
+
 namespace Weft
 
 inductive IOEvent : Type where
@@ -6,6 +8,7 @@ inductive IOEvent : Type where
   | stderrChunk : List UInt8 -> IOEvent
   | openFile : String -> IOEvent
   | writeFile : String -> List UInt8 -> IOEvent
+  | effectQuery : EffectName -> Bool -> IOEvent
   | alloc : Nat -> IOEvent
   | free : Nat -> IOEvent
   deriving Repr, DecidableEq

@@ -1,3 +1,4 @@
+import Weft.Compiler
 import Weft.CoreMachine
 import Weft.Effects
 
@@ -6,6 +7,59 @@ namespace Weft.CoreEffects
 open Weft.SafetyCore
 
 abbrev Oracle : Type := Weft.EffectName -> Bool
+
+def observeIOTrace (oracle : Oracle) : List Weft.EffectName -> List Weft.IOEvent
+  | [] => []
+  | effect :: trace => .effectQuery effect (oracle effect) :: observeIOTrace oracle trace
+
+@[simp] theorem observeIOTrace_append
+    (oracle : Oracle)
+    (lhs rhs : List Weft.EffectName) :
+    observeIOTrace oracle (lhs ++ rhs) = observeIOTrace oracle lhs ++ observeIOTrace oracle rhs := by
+  induction lhs with
+  | nil =>
+      simp [observeIOTrace]
+  | cons head tail ih =>
+      simp [observeIOTrace, ih]
+
+@[simp] theorem observeIOTrace_query_mem_iff
+    {oracle : Oracle}
+    {trace : List Weft.EffectName}
+    {effect : Weft.EffectName}
+    {response : Bool} :
+    Weft.IOEvent.effectQuery effect response ∈ observeIOTrace oracle trace ↔
+      effect ∈ trace ∧ response = oracle effect := by
+  induction trace with
+  | nil =>
+      simp [observeIOTrace]
+  | cons head tail ih =>
+      constructor
+      · intro hMem
+        simp [observeIOTrace] at hMem
+        rcases hMem with hHead | hTail
+        · rcases hHead with ⟨rfl, hResp⟩
+          exact ⟨List.mem_cons.mpr (Or.inl rfl), by simpa using hResp⟩
+        · rcases ih.mp hTail with ⟨hInTail, hResp⟩
+          exact ⟨List.mem_cons.mpr (Or.inr hInTail), hResp⟩
+      · intro hObserved
+        rcases hObserved with ⟨hInTrace, hResp⟩
+        simp [observeIOTrace]
+        rcases List.mem_cons.mp hInTrace with rfl | hInTail
+        · left
+          simp [hResp]
+        · right
+          exact ih.mpr ⟨hInTail, hResp⟩
+
+theorem trace_eq_nil_of_forall_not_mem
+    {trace : List Weft.EffectName}
+    (hNone : ∀ effect : Weft.EffectName, effect ∉ trace) :
+    trace = [] := by
+  cases trace with
+  | nil =>
+      rfl
+  | cons head tail =>
+      exfalso
+      exact hNone head (List.mem_cons.mpr (Or.inl rfl))
 
 inductive Expr : Type where
   | bool : Bool -> Expr
