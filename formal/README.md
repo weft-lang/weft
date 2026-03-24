@@ -111,11 +111,18 @@ The first cut lands three things:
     traces, and show every observed event is exactly an oracle-mediated effect
     query already justified by the inferred effect set, while keeping typed
     results at the whole-`Ty` kernel-tag level.
+21. `Weft/KernelSubtype.lean`
+    A whole-`Ty` kernel-theory decision layer for normalized subtype
+    obligations, exposed as `kernelSubtypeb`. The current implementation is
+    theorem-facing rather than extracted-computable, but it is already enough to
+    drive new semantic soundness theorems showing compiled and staged executions
+    respect requested whole-`Ty` kernel semantics beyond the old finite
+    `CoreSetTy` fragment.
 
 ## Near-Term Expansion
 
 - scale DNF normalization from the finite core to the real semantic subtype algebra
-- add executable/oracle-backed unsatisfiability checks over the whole-`Ty` atom theory
+- replace the current theorem-facing kernel subtype decision layer with a fully computable/extracted whole-`Ty` checker
 - grow the handled-effect observation layer into fuller runtime observations for `IO`, allocation, and unsafe boundaries
 - effect handler operational semantics and discharge proofs
 - one-shot continuation linearity

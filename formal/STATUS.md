@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **54%** of the way to the complete theorem.
+Roughly **58%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -21,6 +21,9 @@ That estimate is based on:
 - result/effect semantic soundness already reaching emitted code
 - handled-effect observations now lifted into explicit generic `IOEvent`
   query/reply behaviors rather than only raw effect-name traces
+- whole-`Ty` kernel subtype obligations can now feed expected-type theorems for
+  compiled and staged executions rather than stopping at the `CoreSetTy`
+  representable fragment
 - DNF/subtyping work moving beyond the tiny finite core
 - but the real runtime, unsafe/alloc boundaries, continuation semantics, and
   native object-format bridge still being mostly unproved
@@ -32,8 +35,8 @@ That estimate is based on:
 | Compiler composition backbone | 90% | Generic stage-composition theorem and bootstrap-stability shape are in place. |
 | Pure core source-to-machine correctness | 85% | Concrete compiler, staged pipeline, and typed-result preservation are proved. |
 | Handled-effect core correctness | 80% | Trace-preserving compilation, staged effectful compiler theorem, and machine-level effect/result conformance are proved. |
-| Result-carrying semantic observations | 83% | Successful staged compilations now preserve and reflect trace/result behaviors, representable expected types can be restated at the whole-`Ty` kernel-tag semantic level, and the handled-effect fragment now has explicit query/reply observation theorems in the generic `IOEvent` space. |
-| Set-theoretic normalization/subtyping | 58% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, theory-aware unsatisfiability implies semantic subtyping under sound valuations, and the kernel theory now has a concrete tag-level semantic model with explicit pointer-flavor separation facts such as `rc T & mptr U` being empty. Full executable oracle-backed semantic subtyping is still missing. |
+| Result-carrying semantic observations | 87% | Successful staged compilations now preserve and reflect trace/result behaviors, representable expected types can be restated at the whole-`Ty` kernel-tag semantic level, the handled-effect fragment has explicit query/reply observation theorems in the generic `IOEvent` space, and staged/compiled expected-type theorems now also work through the whole-`Ty` kernel subtype layer rather than only the finite `CoreSetTy` bridge. |
+| Set-theoretic normalization/subtyping | 64% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, theory-aware unsatisfiability implies semantic subtyping under sound valuations, the kernel theory has a concrete tag-level semantic model with explicit pointer-flavor separation facts such as `rc T & mptr U` being empty, and there is now a theorem-facing whole-`Ty` kernel subtype decision layer. A fully computable/extracted whole-`Ty` checker is still missing. |
 | Runtime semantics (`IO`, `Alloc`, `Unsafe`) | 23% | We now have a concrete tag-level semantic model for runtime values plus explicit observable query/reply event semantics for the handled-effect fragment, and we can already rule out impossible runtime tag overlaps like `rc`/`mptr` collisions. Full `IO`/allocation/unsafe runtime behaviors are still missing. |
 | Continuations / handler operational model | 10% | Tail-resumptive handled-effect core exists, but full continuation semantics is not yet formalized. |
 | Native backend / object emission bridge | 10% | Machine model exists for core targets, but not a real aarch64/Mach-O semantic bridge. |
@@ -42,6 +45,16 @@ That estimate is based on:
 ## What Each Checkpoint Means
 
 Current frontier:
+
+- whole-`Ty` kernel subtype checking for compiled/staged expected-type theorems
+  The formal development no longer has to route every expected-type theorem
+  through the finite `CoreSetTy.ofTy` bridge. We now have a kernel-theory
+  boolean decision layer over normalized whole-`Ty` subtype obligations, and we
+  use it to prove that compiled and staged executions respect requested
+  whole-`Ty` kernel semantics even when the target type lies outside the old
+  tiny boolean fragment. Concretely: the compiler theorem’s expected-type side
+  has started moving from the surrogate finite checker model into the actual
+  whole-`Ty` kernel theory.
 
 - pointer-flavor separation in the kernel tag model
   The kernel theory now distinguishes `rc` and `mptr` values semantically, not
@@ -130,6 +143,14 @@ Current frontier:
   kernel tag. Concretely: pointer-kind separation is now a proved semantic
   invariant rather than an informal expectation.
 
+- `43bd73a` `formal: decide whole-ty kernel subtype`
+  We now expose a kernel-theory boolean decision layer for normalized whole-`Ty`
+  subtype obligations and use it to state compiled/staged expected-type
+  theorems beyond the finite `CoreSetTy` fragment. Concretely: accepted staged
+  handled-effect executions can now be shown to inhabit requested whole-`Ty`
+  kernel semantics through the kernel subtype theory itself, not only through a
+  bridge from the tiny representable core.
+
 - `0e9dee2` `formal: prove staged effect compiler equivalence`
   Successful staged handled-effect compilations are no longer only forward
   preserving. We can also recover source evaluations from compiled executions.
@@ -166,9 +187,10 @@ Current frontier:
 2. Replace opaque atoms with real semantic relations where the kernel requires
    them: pointer variance, record openness, nominal/trait/conformance, effect
    sets, and eventually continuation-sensitive handler semantics.
-3. Push the staged compiler theorem outward from effect-query observations to
-   real observable runtime events: `IO`, allocation, unsafe boundaries, object
-   emission, and bootstrap parity.
+3. Replace the current theorem-facing whole-`Ty` kernel subtype decision layer
+   with a fully computable one, then push the staged compiler theorem outward
+   from effect-query observations to real observable runtime events: `IO`,
+   allocation, unsafe boundaries, object emission, and bootstrap parity.
 
 ## Missing For The Full Theorem
 
