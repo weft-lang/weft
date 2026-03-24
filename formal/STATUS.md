@@ -151,6 +151,13 @@ Current frontier:
   kernel semantics through the kernel subtype theory itself, not only through a
   bridge from the tiny representable core.
 
+- `4ace9fe` `formal: certify kernel subtype witnesses`
+  The new whole-`Ty` kernel subtype layer now certifies concrete kernel facts
+  directly: `rc T <: ptr T`, `mptr T <: ptr T`, and emptiness of `rc T & mptr U`
+  all evaluate to `true` in the decision layer. Concretely: the new checker is
+  no longer only theorem-shaped plumbing; it already recognizes the core kernel
+  pointer facts we need it to recognize.
+
 - `0e9dee2` `formal: prove staged effect compiler equivalence`
   Successful staged handled-effect compilations are no longer only forward
   preserving. We can also recover source evaluations from compiled executions.
