@@ -123,7 +123,7 @@ Current frontier:
   runtime-observation layer is already semantically disciplined, not just a new
   notation for the old traces.
 
-- `formal: separate pointer tag flavors`
+- `46d6aab` `formal: separate pointer tag flavors`
   The kernel theory and concrete tag model now explicitly rule out overlap
   between `rc` and `mptr` pointer flavors. We prove `rc T & mptr U` is
   unsatisfiable in the theory-aware DNF layer and empty at every concrete
