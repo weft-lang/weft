@@ -60,6 +60,14 @@ Current frontier:
   story now reaches actual emitted artifacts in the current formal fragment,
   not just abstract compiler values.
 
+- observation-shape exclusion for the handled-effect fragment
+  The current `IOEvent` layer now proves not only that observed events are
+  effect queries justified by inferred capabilities, but also that no other
+  runtime-event constructors can appear at all in traces produced by this
+  fragment. Concretely: the formal observation language is now honest about the
+  current fragment’s limits while we work toward real `IO`/allocation/unsafe
+  events.
+
 - executable whole-`Ty` kernel subtype checking for compiled/staged expected-type theorems
   The formal development no longer has to route every expected-type theorem
   through the finite `CoreSetTy.ofTy` bridge. We now have a kernel-theory

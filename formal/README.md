@@ -109,8 +109,11 @@ The first cut lands three things:
     traces. We can state staged source/machine equivalence for those observed
     query/reply behaviors, prove pure accepted programs have empty observable
     traces, and show every observed event is exactly an oracle-mediated effect
-    query already justified by the inferred effect set, while keeping typed
-    results at the whole-`Ty` kernel-tag level.
+    query already justified by the inferred effect set. The current handled
+    fragment also now proves a negative observation result: emitted artifacts in
+    this fragment cannot produce fake `stdin`/`stdout`/`alloc`/`file` events;
+    their observable traces are entirely effect queries. Typed results remain
+    tracked at the whole-`Ty` kernel-tag level.
 21. `Weft/KernelSubtype.lean`
     A whole-`Ty` kernel-theory decision layer for normalized subtype
     obligations, exposed as `kernelSubtypeb`. It is now a genuinely computable

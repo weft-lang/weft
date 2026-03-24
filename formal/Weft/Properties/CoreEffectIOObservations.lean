@@ -103,6 +103,64 @@ theorem staged_io_result_semantics_iff
     rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
     exact ⟨value, trace, staged_compile_complete hCompile hExec, hBehavior⟩
 
+theorem machine_io_behavior_events_are_effect_queries
+    {oracle : Oracle}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : Weft.Behavior}
+    (hMachine : machineIOSem oracle code input behavior) :
+    ∀ event, event ∈ behavior.trace ->
+      ∃ effect : Weft.EffectName,
+        event = Weft.IOEvent.effectQuery effect (oracle effect) := by
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  cases hBehavior
+  intro event hMem
+  rcases mem_observeIOTrace_iff.mp hMem with ⟨effect, _hInTrace, hEvent⟩
+  exact ⟨effect, hEvent⟩
+
+theorem machine_io_result_behavior_events_are_effect_queries
+    {oracle : Oracle}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : IOResultBehavior}
+    (hMachine : machineIOResultSem oracle code input behavior) :
+    ∀ event, event ∈ behavior.trace ->
+      ∃ effect : Weft.EffectName,
+        event = Weft.IOEvent.effectQuery effect (oracle effect) := by
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  cases hBehavior
+  intro event hMem
+  rcases mem_observeIOTrace_iff.mp hMem with ⟨effect, _hInTrace, hEvent⟩
+  exact ⟨effect, hEvent⟩
+
+theorem staged_io_behavior_has_no_non_effect_events
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : Weft.Behavior}
+    (_hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hMachine : machineIOSem oracle code input behavior) :
+    ∀ event, event ∈ behavior.trace ->
+      ∃ effect : Weft.EffectName,
+        event = Weft.IOEvent.effectQuery effect (oracle effect) := by
+  intro event hMem
+  exact machine_io_behavior_events_are_effect_queries hMachine event hMem
+
+theorem staged_io_result_behavior_has_no_non_effect_events
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : IOResultBehavior}
+    (_hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hMachine : machineIOResultSem oracle code input behavior) :
+    ∀ event, event ∈ behavior.trace ->
+      ∃ effect : Weft.EffectName,
+        event = Weft.IOEvent.effectQuery effect (oracle effect) := by
+  intro event hMem
+  exact machine_io_result_behavior_events_are_effect_queries hMachine event hMem
+
 theorem staged_io_behavior_respects_inferred_effects
     {oracle : Oracle}
     {surface : SurfaceExpr}
