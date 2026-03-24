@@ -2315,7 +2315,57 @@ run_test2 "named_keyword_label" "42" 'fn wrap(_ x: i64) -> i64 { x } fn main() -
 # ── Property: named with/without label gives same result ──
 run_test2 "named_equiv" "1" 'fn f(a: i64, b: i64) -> i64 { a + b } fn main() -> i64 { let r1 = f(20, 22) let r2 = f(a: 20, b: 22) if r1 == r2 { 1 } else { 0 } }'
 # ═══════════════════════════════════════════════════════════════
-# 73. BUG FIXES — regression tests for root-cause fixes
+# 73. ARGV — command-line argument passing
+# ═══════════════════════════════════════════════════════════════
+
+# ── argc is passed correctly ──
+run_test2 "argv_argc_zero" "1" 'fn main(argc: i64, argv: i64) -> i64 { argc }'
+# (argc=1 because the program name counts)
+
+# ── main without argc/argv still works (backward compat) ──
+run_test2 "argv_compat" "42" 'fn main() -> i64 { 42 }'
+
+# ── argv[0] is accessible (program name exists) ──
+run_test2 "argv_access" "1" 'fn main(argc: i64, argv: i64) -> i64 { let arg0 = __mem_load64(argv) if __mem_load8(arg0) != 0 { 1 } else { 0 } }'
+
+# ── Subcommand dispatch: weft fmt ──
+FMT_OUT=$(echo 'fn add(x: i64, y: i64) -> i64 {x+y} fn main() -> i64 {add(1,2)}' | /tmp/weft2 fmt 2>&1)
+if echo "$FMT_OUT" | grep -q "fn add" && echo "$FMT_OUT" | grep -q "fn main"; then
+  PASS2=$((PASS2+1))
+else
+  echo "  ✗ subcmd_fmt"
+  FAIL2=$((FAIL2+1))
+fi
+
+# ── Subcommand dispatch: weft check ──
+CHECK_OUT=$(echo 'fn main() -> i64 { 42 }' | /tmp/weft2 check 2>&1)
+if echo "$CHECK_OUT" | grep -q "functions"; then
+  PASS2=$((PASS2+1))
+else
+  echo "  ✗ subcmd_check"
+  FAIL2=$((FAIL2+1))
+fi
+
+# ── Subcommand dispatch: weft ast ──
+AST_OUT=$(echo 'fn main() -> i64 { 42 }' | /tmp/weft2 ast 2>&1)
+if echo "$AST_OUT" | grep -q "IntLit"; then
+  PASS2=$((PASS2+1))
+else
+  echo "  ✗ subcmd_ast"
+  FAIL2=$((FAIL2+1))
+fi
+
+# ── Default (no subcommand): still compiles ──
+echo 'fn main() -> i64 { 42 }' | /tmp/weft2 > /tmp/t_default 2>/dev/null
+if [ -s /tmp/t_default ]; then
+  PASS2=$((PASS2+1))
+else
+  echo "  ✗ subcmd_default_compile"
+  FAIL2=$((FAIL2+1))
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# 74. BUG FIXES — regression tests for root-cause fixes
 # ═══════════════════════════════════════════════════════════════
 
 # ── Bug 1: effect declarations in use'd files ──
