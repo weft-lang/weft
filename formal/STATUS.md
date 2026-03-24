@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **47%** of the way to the complete theorem.
+Roughly **49%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -30,9 +30,9 @@ That estimate is based on:
 | Compiler composition backbone | 90% | Generic stage-composition theorem and bootstrap-stability shape are in place. |
 | Pure core source-to-machine correctness | 85% | Concrete compiler, staged pipeline, and typed-result preservation are proved. |
 | Handled-effect core correctness | 80% | Trace-preserving compilation, staged effectful compiler theorem, and machine-level effect/result conformance are proved. |
-| Result-carrying semantic observations | 70% | Successful staged compilations now preserve and reflect trace/result behaviors. |
+| Result-carrying semantic observations | 76% | Successful staged compilations now preserve and reflect trace/result behaviors, and representable expected types can be restated at the whole-`Ty` kernel-tag semantic level rather than only in the finite core model. |
 | Set-theoretic normalization/subtyping | 56% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, theory-aware unsatisfiability implies semantic subtyping under sound valuations, and the kernel theory now has a concrete tag-level semantic model. Full executable oracle-backed semantic subtyping is still missing. |
-| Runtime semantics (`IO`, `Alloc`, `Unsafe`) | 10% | Only abstract observable behavior scaffolding exists so far. |
+| Runtime semantics (`IO`, `Alloc`, `Unsafe`) | 14% | We now have a concrete tag-level semantic model for runtime values, but full event/I/O/allocation semantics are still missing. |
 | Continuations / handler operational model | 10% | Tail-resumptive handled-effect core exists, but full continuation semantics is not yet formalized. |
 | Native backend / object emission bridge | 10% | Machine model exists for core targets, but not a real aarch64/Mach-O semantic bridge. |
 | Self-hosted whole-compiler theorem | 5% | The theorem shape exists, but it is not yet connected to the real compiler/runtime stack. |
@@ -40,6 +40,14 @@ That estimate is based on:
 ## What Each Checkpoint Means
 
 Current frontier:
+
+- whole-`Ty` tagged result semantics for compiled executions
+  The staged handled-effect pipeline no longer stops at finite-core denotation
+  facts like `expectedCore.denotes value.toCoreAtom`. We now bridge those facts
+  into whole-`Ty` kernel-tag semantics for every type the current checker can
+  represent. Concretely: accepted compiled programs can be stated as producing
+  results that inhabit the requested whole-`Ty` semantics in the runtime tag
+  model, not merely a tiny auxiliary core domain.
 
 - kernel tag semantic model
   The atom theory is no longer justified only by abstract “sound valuations.”

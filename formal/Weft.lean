@@ -21,6 +21,7 @@ import Weft.Properties.CoreEffectSubtypeChecking
 import Weft.Properties.CoreEffectTypecheckCorrectness
 import Weft.Properties.CoreEffectPipelineCorrectness
 import Weft.Properties.CoreEffectPipelineSemanticSoundness
+import Weft.Properties.CoreKernelModelBridge
 import Weft.Properties.CorePipelineCorrectness
 import Weft.Properties.CoreSemanticSoundness
 import Weft.Properties.CoreSubtypeChecking

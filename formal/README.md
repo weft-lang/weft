@@ -97,12 +97,19 @@ The first cut lands three things:
     records, nominals, and pointer flavors, then reuses the theory-aware
     subtyping theorems to show that concrete `rc` and `mptr` runtime tags
     inhabit `ptr` semantics and that `bool & int` is empty on every kernel tag.
+19. `Weft/Properties/CoreKernelModelBridge.lean`
+    A bridge from the finite `CoreSetTy` checker model to whole-`Ty` kernel-tag
+    semantics for all representable boolean/set-theoretic types. This lifts the
+    handled-effect expected-type theorems from `value.toCoreAtom` denotations to
+    concrete whole-`Ty` semantic judgments over runtime tags, including staged
+    machine/result behavior theorems.
 
 ## Near-Term Expansion
 
 - scale DNF normalization from the finite core to the real semantic subtype algebra
 - add executable/oracle-backed unsatisfiability checks over the whole-`Ty` atom theory
 - grow the kernel tag model into fuller runtime observations for `IO`, allocation, and unsafe boundaries
+- replace effect-name traces with richer observable event semantics
 - effect handler operational semantics and discharge proofs
 - one-shot continuation linearity
 - unsafe boundary and allocation confinement theorems
