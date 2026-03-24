@@ -44,6 +44,11 @@ def Implies : TyAtom -> TyAtom -> Prop
   | .mptr inner, .ptr inner' => inner = inner'
   | lhs, rhs => lhs = rhs
 
+def impliesb : TyAtom -> TyAtom -> Bool
+  | .rc inner, .ptr inner' => Ty.eqb inner inner'
+  | .mptr inner, .ptr inner' => Ty.eqb inner inner'
+  | lhs, rhs => TyAtom.eqb lhs rhs
+
 def Disjoint : TyAtom -> TyAtom -> Prop
   | .bool, .int => True
   | .int, .bool => True
@@ -54,6 +59,28 @@ def Disjoint : TyAtom -> TyAtom -> Prop
   | .rc _, .mptr _ => True
   | .mptr _, .rc _ => True
   | _, _ => False
+
+def disjointb : TyAtom -> TyAtom -> Bool
+  | .bool, .int => true
+  | .int, .bool => true
+  | .bool, .nil => true
+  | .nil, .bool => true
+  | .int, .nil => true
+  | .nil, .int => true
+  | .rc _, .mptr _ => true
+  | .mptr _, .rc _ => true
+  | _, _ => false
+
+theorem impliesb_spec
+    (lhs rhs : TyAtom) :
+    impliesb lhs rhs = true ↔ Implies lhs rhs := by
+  cases lhs <;> cases rhs <;>
+    simp [impliesb, Implies, Ty.eqb_spec, TyAtom.eqb_spec]
+
+theorem disjointb_spec
+    (lhs rhs : TyAtom) :
+    disjointb lhs rhs = true ↔ Disjoint lhs rhs := by
+  cases lhs <;> cases rhs <;> simp [disjointb, Disjoint]
 
 def theory : TyTheory where
   Implies := Implies

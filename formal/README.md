@@ -113,16 +113,18 @@ The first cut lands three things:
     results at the whole-`Ty` kernel-tag level.
 21. `Weft/KernelSubtype.lean`
     A whole-`Ty` kernel-theory decision layer for normalized subtype
-    obligations, exposed as `kernelSubtypeb`. The current implementation is
-    theorem-facing rather than extracted-computable, but it is already enough to
-    drive new semantic soundness theorems showing compiled and staged executions
+    obligations, exposed as `kernelSubtypeb`. It is now a genuinely computable
+    structural checker rather than a classical `decide` wrapper: `Ty`,
+    `TyAtom`, and normalized kernel obligations compare via explicit boolean
+    equality/unsatisfiability procedures, and that executable layer already
+    drives semantic soundness theorems showing compiled and staged executions
     respect requested whole-`Ty` kernel semantics beyond the old finite
     `CoreSetTy` fragment.
 
 ## Near-Term Expansion
 
 - scale DNF normalization from the finite core to the real semantic subtype algebra
-- replace the current theorem-facing kernel subtype decision layer with a fully computable/extracted whole-`Ty` checker
+- extend the new computable whole-`Ty` kernel checker across richer semantic obligations such as record openness, nominal/trait/conformance, and effect-set structure
 - grow the handled-effect observation layer into fuller runtime observations for `IO`, allocation, and unsafe boundaries
 - effect handler operational semantics and discharge proofs
 - one-shot continuation linearity

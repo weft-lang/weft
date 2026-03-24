@@ -27,6 +27,26 @@ def toTy : TyAtom -> Ty
   | .rc inner => .rc inner
   | .nominal name args => .nominal name args
 
+def eqb : TyAtom -> TyAtom -> Bool
+  | .bool, .bool => true
+  | .int, .int => true
+  | .nil, .nil => true
+  | .fn arg₁ eff₁ ret₁, .fn arg₂ eff₂ ret₂ =>
+      Ty.eqb arg₁ arg₂ && decide (eff₁ = eff₂) && Ty.eqb ret₁ ret₂
+  | .record fields₁, .record fields₂ => Ty.fieldsEqb fields₁ fields₂
+  | .ptr inner₁, .ptr inner₂ => Ty.eqb inner₁ inner₂
+  | .mptr inner₁, .mptr inner₂ => Ty.eqb inner₁ inner₂
+  | .rc inner₁, .rc inner₂ => Ty.eqb inner₁ inner₂
+  | .nominal name₁ args₁, .nominal name₂ args₂ =>
+      decide (name₁ = name₂) && Ty.listEqb args₁ args₂
+  | _, _ => false
+
+theorem eqb_spec
+    (lhs rhs : TyAtom) :
+    eqb lhs rhs = true ↔ lhs = rhs := by
+  cases lhs <;> cases rhs <;>
+    simp [eqb, Ty.eqb_spec, Ty.fieldsEqb_spec, Ty.listEqb_spec, and_assoc]
+
 end TyAtom
 
 structure TyClause : Type where

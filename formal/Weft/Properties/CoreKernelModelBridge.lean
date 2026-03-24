@@ -104,7 +104,7 @@ theorem runtimeValHasType_denotesTag
     simp [RuntimeVal.toKernelTag, Weft.Ty.denotesTag, Weft.Ty.denotesUnder,
       Weft.KernelTag.valuation, Weft.TyAtom.denotesTag]
 
-noncomputable def kernelCheckAgainst (expr : Expr) (expected : Weft.Ty) : Bool :=
+def kernelCheckAgainst (expr : Expr) (expected : Weft.Ty) : Bool :=
   match inferType expr with
   | some inferred => inferred.kernelSubtypeb expected
   | none => false
@@ -149,7 +149,7 @@ theorem checkAgainst_semantic_soundness_tag
   rcases checkAgainst_semantic_soundness hCheck hEval with ⟨expectedCore, hCore, hDen⟩
   exact (ofTy_denotes_iff_denotesTag hCore).1 hDen
 
-noncomputable def kernelCheckAgainst (expr : Expr) (expected : Weft.Ty) : Bool :=
+def kernelCheckAgainst (expr : Expr) (expected : Weft.Ty) : Bool :=
   match inferType expr with
   | some inferred => inferred.kernelSubtypeb expected
   | none => false
