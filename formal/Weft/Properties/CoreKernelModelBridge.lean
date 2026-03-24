@@ -1,4 +1,5 @@
 import Weft.KernelModel
+import Weft.KernelSubtype
 import Weft.Properties.CoreEffectSubtypeChecking
 
 namespace Weft.SafetyCore
@@ -94,6 +95,42 @@ theorem checkAgainst_semantic_soundness_tag
   rcases checkAgainst_semantic_soundness hCheck hEval with ⟨expectedCore, hCore, hDen⟩
   exact (ofTy_denotes_iff_denotesTag hCore).1 hDen
 
+theorem runtimeValHasType_denotesTag
+    {value : RuntimeVal}
+    {ty : Weft.Ty}
+    (hTy : RuntimeValHasType value ty) :
+    Weft.Ty.denotesTag value.toKernelTag ty := by
+  cases hTy <;>
+    simp [RuntimeVal.toKernelTag, Weft.Ty.denotesTag, Weft.Ty.denotesUnder,
+      Weft.KernelTag.valuation, Weft.TyAtom.denotesTag]
+
+noncomputable def kernelCheckAgainst (expr : Expr) (expected : Weft.Ty) : Bool :=
+  match inferType expr with
+  | some inferred => inferred.kernelSubtypeb expected
+  | none => false
+
+theorem kernelCheckAgainst_semantic_soundness_tag
+    {expr : Expr}
+    {expected : Weft.Ty}
+    {value : RuntimeVal}
+    (hCheck : kernelCheckAgainst expr expected = true)
+    (hEval : Eval expr value) :
+    Weft.Ty.denotesTag value.toKernelTag expected := by
+  unfold kernelCheckAgainst at hCheck
+  cases hInfer : inferType expr with
+  | none =>
+      simp [hInfer] at hCheck
+  | some inferred =>
+      simp [hInfer] at hCheck
+      have hSubtype : inferred.SubtypeIn Weft.KernelTheory.theory expected :=
+        Weft.Ty.kernelSubtypeb_sound hCheck
+      have hTy : HasType expr inferred :=
+        inferType_sound hInfer
+      have hValTy : RuntimeValHasType value inferred :=
+        eval_preserves_type hTy hEval
+      exact hSubtype _ (Weft.KernelTag.soundValuation value.toKernelTag)
+        (runtimeValHasType_denotesTag hValTy)
+
 end Weft.SafetyCore
 
 namespace Weft.CoreEffects
@@ -111,6 +148,34 @@ theorem checkAgainst_semantic_soundness_tag
     Weft.Ty.denotesTag value.toKernelTag expected := by
   rcases checkAgainst_semantic_soundness hCheck hEval with ⟨expectedCore, hCore, hDen⟩
   exact (ofTy_denotes_iff_denotesTag hCore).1 hDen
+
+noncomputable def kernelCheckAgainst (expr : Expr) (expected : Weft.Ty) : Bool :=
+  match inferType expr with
+  | some inferred => inferred.kernelSubtypeb expected
+  | none => false
+
+theorem kernelCheckAgainst_semantic_soundness_tag
+    {oracle : Oracle}
+    {expr : Expr}
+    {expected : Weft.Ty}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hCheck : kernelCheckAgainst expr expected = true)
+    (hEval : Eval oracle expr value trace) :
+    Weft.Ty.denotesTag value.toKernelTag expected := by
+  unfold kernelCheckAgainst at hCheck
+  cases hInfer : inferType expr with
+  | none =>
+      simp [hInfer] at hCheck
+  | some inferred =>
+      simp [hInfer] at hCheck
+      have hSubtype : inferred.SubtypeIn Weft.KernelTheory.theory expected :=
+        Weft.Ty.kernelSubtypeb_sound hCheck
+      rcases inferType_sound hInfer with ⟨effects, hTy⟩
+      have hValTy : RuntimeValHasType value inferred :=
+        eval_preserves_type hTy hEval
+      exact hSubtype _ (Weft.KernelTag.soundValuation value.toKernelTag)
+        (runtimeValHasType_denotesTag hValTy)
 
 theorem compiled_pure_result_respects_expected_type_tag
     {oracle : Oracle}
@@ -144,5 +209,45 @@ theorem compiled_result_respects_effects_and_expected_type_tag
   rcases compiled_result_respects_effects_and_expected_type hCheck hEffects hEval with
     ⟨hExec, hTrace, expectedCore, hCore, hDen⟩
   exact ⟨hExec, hTrace, (ofTy_denotes_iff_denotesTag hCore).1 hDen⟩
+
+theorem compiled_pure_result_respects_kernel_expected_type_tag
+    {oracle : Oracle}
+    {expr : Expr}
+    {expected : Weft.Ty}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hCheck : kernelCheckAgainst expr expected = true)
+    (hPure : inferEffects expr = some Weft.EffectSet.empty)
+    (hEval : Eval oracle expr value trace) :
+    Exec oracle (compileClosed expr) [] [value] trace ∧
+      (∀ effect : Weft.EffectName, effect ∉ trace) ∧
+      Weft.Ty.denotesTag value.toKernelTag expected := by
+  have hExec : Exec oracle (compileClosed expr) [] [value] trace :=
+    compile_correct oracle expr value trace hEval
+  have hTraceFree : ∀ effect : Weft.EffectName, effect ∉ trace := by
+    rcases inferEffects_sound hPure with ⟨ty, hTy⟩
+    exact empty_effects_have_empty_trace hTy hEval
+  exact ⟨hExec, hTraceFree, kernelCheckAgainst_semantic_soundness_tag hCheck hEval⟩
+
+theorem compiled_result_respects_effects_and_kernel_expected_type_tag
+    {oracle : Oracle}
+    {expr : Expr}
+    {expected : Weft.Ty}
+    {effects : Weft.EffectSet}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hCheck : kernelCheckAgainst expr expected = true)
+    (hEffects : inferEffects expr = some effects)
+    (hEval : Eval oracle expr value trace) :
+    Exec oracle (compileClosed expr) [] [value] trace ∧
+      (∀ effect : Weft.EffectName, effect ∈ trace -> effect ∈ effects.elems) ∧
+      Weft.Ty.denotesTag value.toKernelTag expected := by
+  have hExec : Exec oracle (compileClosed expr) [] [value] trace :=
+    compile_correct oracle expr value trace hEval
+  have hTrace :
+      ∀ effect : Weft.EffectName, effect ∈ trace -> effect ∈ effects.elems := by
+    rcases inferEffects_sound hEffects with ⟨ty, hTy⟩
+    exact trace_subset_of_typed_effects hTy hEval
+  exact ⟨hExec, hTrace, kernelCheckAgainst_semantic_soundness_tag hCheck hEval⟩
 
 end Weft.CoreEffects

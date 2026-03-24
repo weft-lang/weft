@@ -8,6 +8,7 @@ import Weft.CoreMachine
 import Weft.CoreSubtype
 import Weft.Effects
 import Weft.KernelModel
+import Weft.KernelSubtype
 import Weft.SafetyCore
 import Weft.Syntax
 import Weft.TyDNF
