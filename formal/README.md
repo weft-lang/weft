@@ -128,7 +128,10 @@ The first cut lands three things:
     pipeline. It transfers semantic equivalence of surface compiler generations
     through staged compilation into semantic equivalence of their emitted
     machine artifacts, for both trace-only and result-carrying observable
-    `IOEvent` behaviors.
+    `IOEvent` behaviors. It also lifts the current typed/effect-disciplined
+    contracts through that bridge, so later emitted artifacts inherit the pure
+    trace-free and effect-bounded kernel-typed guarantees proved for earlier
+    semantically equivalent compiler generations.
 
 ## Near-Term Expansion
 
