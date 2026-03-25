@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **67%** of the way to the complete theorem.
+Roughly **69%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -32,6 +32,11 @@ That estimate is based on:
 - the concrete kernel tag model now also captures semantic function variance
   and `ptr`/`rc` covariance, even where the executable checker still only knows
   flatter kernel facts
+- staged/compiler theorems can now weaken accepted kernel expected types along
+  semantic subtyping, so model-only variance facts already pay off at the
+  theorem surface
+- bootstrap artifact theorems now preserve those weakened kernel expected-type
+  contracts too, so semantic subtype facts survive cross-generation parity
 - bootstrap-parity reasoning is now instantiated for emitted handled-effect
   machine artifacts over explicit observed `IOEvent` behaviors
 - bootstrap-parity reasoning now also reaches the raw handled-effect machine
@@ -105,6 +110,24 @@ Current frontier:
   while `mptr` remains invariant. Concretely: full semantic support has moved
   closer to the kernel docs even where the executable checker has not yet been
   taught the same richer recursive obligations.
+
+- semantic expected-type weakening at the compiler-theorem surface
+  The staged/compiler theorems no longer require every useful expected-type
+  relation to be directly decided by the executable checker. Once an accepted
+  program is proved to inhabit some kernel expected type `A`, we can now
+  weaken that postcondition along any semantic subtype proof `A <: B` and
+  recover the same machine/result guarantees for `B`. Concretely: richer model
+  facts like function variance and pointer covariance now influence the
+  end-to-end theorem surface immediately, even before the executable checker is
+  upgraded to derive them itself.
+
+- semantic expected-type weakening through bootstrap parity
+  The cross-generation bootstrap layer now preserves those weakened kernel
+  expected-type postconditions as well. Concretely: if an earlier compiler
+  generation is proved to produce results inhabiting `A`, and `A <: B` holds
+  semantically in the kernel theory, later semantically equivalent emitted
+  artifacts inherit the `B`-typed contract too. This lets the richer semantic
+  model affect not just local staged theorems but the bootstrap story itself.
 
 - raw machine bootstrap parity for handled effects
   The staged handled-effect bootstrap layer no longer speaks only in the

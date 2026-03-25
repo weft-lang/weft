@@ -104,6 +104,14 @@ theorem runtimeValHasType_denotesTag
     simp [RuntimeVal.toKernelTag, Weft.Ty.denotesTag, Weft.Ty.denotesUnder,
       Weft.KernelTag.valuation, Weft.TyAtom.denotesTag]
 
+theorem denotesTag_of_subtype
+    {value : RuntimeVal}
+    {lhs rhs : Weft.Ty}
+    (hDen : Weft.Ty.denotesTag value.toKernelTag lhs)
+    (hSubtype : lhs.SubtypeIn Weft.KernelTheory.theory rhs) :
+    Weft.Ty.denotesTag value.toKernelTag rhs := by
+  exact hSubtype _ (Weft.KernelTag.soundValuation value.toKernelTag) hDen
+
 def kernelCheckAgainst (expr : Expr) (expected : Weft.Ty) : Bool :=
   match inferType expr with
   | some inferred => inferred.kernelSubtypeb expected
@@ -249,5 +257,40 @@ theorem compiled_result_respects_effects_and_kernel_expected_type_tag
     rcases inferEffects_sound hEffects with ⟨ty, hTy⟩
     exact trace_subset_of_typed_effects hTy hEval
   exact ⟨hExec, hTrace, kernelCheckAgainst_semantic_soundness_tag hCheck hEval⟩
+
+theorem compiled_pure_result_respects_weakened_kernel_expected_type_tag
+    {oracle : Oracle}
+    {expr : Expr}
+    {expected widened : Weft.Ty}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hCheck : kernelCheckAgainst expr expected = true)
+    (hSubtype : expected.SubtypeIn Weft.KernelTheory.theory widened)
+    (hPure : inferEffects expr = some Weft.EffectSet.empty)
+    (hEval : Eval oracle expr value trace) :
+    Exec oracle (compileClosed expr) [] [value] trace ∧
+      (∀ effect : Weft.EffectName, effect ∉ trace) ∧
+      Weft.Ty.denotesTag value.toKernelTag widened := by
+  rcases compiled_pure_result_respects_kernel_expected_type_tag hCheck hPure hEval with
+    ⟨hExec, hTrace, hTyped⟩
+  exact ⟨hExec, hTrace, denotesTag_of_subtype hTyped hSubtype⟩
+
+theorem compiled_result_respects_effects_and_weakened_kernel_expected_type_tag
+    {oracle : Oracle}
+    {expr : Expr}
+    {expected widened : Weft.Ty}
+    {effects : Weft.EffectSet}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hCheck : kernelCheckAgainst expr expected = true)
+    (hSubtype : expected.SubtypeIn Weft.KernelTheory.theory widened)
+    (hEffects : inferEffects expr = some effects)
+    (hEval : Eval oracle expr value trace) :
+    Exec oracle (compileClosed expr) [] [value] trace ∧
+      (∀ effect : Weft.EffectName, effect ∈ trace -> effect ∈ effects.elems) ∧
+      Weft.Ty.denotesTag value.toKernelTag widened := by
+  rcases compiled_result_respects_effects_and_kernel_expected_type_tag hCheck hEffects hEval with
+    ⟨hExec, hTrace, hTyped⟩
+  exact ⟨hExec, hTrace, denotesTag_of_subtype hTyped hSubtype⟩
 
 end Weft.CoreEffects
