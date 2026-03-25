@@ -99,10 +99,10 @@ Current frontier:
   external `IOEvent` observation language. We now also transfer semantic
   equivalence of surface compiler generations directly into semantic
   equivalence of emitted artifacts under the underlying raw machine trace and
-  result semantics, and we carry the corresponding inferred-effect and
-  kernel-typed result contracts through that layer. Concretely: the bootstrap
-  theorem story now reaches both the observed interface and the lower-level
-  machine semantics that generate it.
+  result semantics, and we carry the corresponding inferred-effect, pure
+  trace-free, and kernel-typed result contracts through that layer.
+  Concretely: the bootstrap theorem story now reaches both the observed
+  interface and the lower-level machine semantics that generate it.
 
 - executable whole-`Ty` kernel subtype checking for compiled/staged expected-type theorems
   The formal development no longer has to route every expected-type theorem
