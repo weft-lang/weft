@@ -72,6 +72,14 @@ inductive IRExpr : Type where
   | ite : IRExpr -> IRExpr -> IRExpr -> IRExpr
   deriving Repr, DecidableEq
 
+def IRExpr.toExpr : IRExpr -> Expr
+  | .const (.bool b) => .bool b
+  | .const (.int n) => .int n
+  | .const .nil => .nil
+  | .add lhs rhs => .add lhs.toExpr rhs.toExpr
+  | .ite cond thenBranch elseBranch =>
+      .ifThenElse cond.toExpr thenBranch.toExpr elseBranch.toExpr
+
 inductive IREval : IRExpr -> RuntimeVal -> Prop where
   | const (value : RuntimeVal) :
       IREval (.const value) value

@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **72%** of the way to the complete theorem.
+Roughly **73%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -39,6 +39,9 @@ That estimate is based on:
   contracts too, so semantic subtype facts survive cross-generation parity
 - the generic compiler theorem layer now supports semantic reflection and
   whole-pipeline `iff`s, not only one-way preservation
+- the pure safety-core compiler and the staged pure core pipeline now
+  instantiate that generic reflection/equivalence layer too, not only the
+  handled-effect side
 - emitted-artifact semantic-equivalence transfer is now factored through a
   reusable generic compilation lemma instead of being reproved separately at
   each raw/observed behavior layer
@@ -58,7 +61,7 @@ That estimate is based on:
 | Area | Rough Status | What is done |
 |------|--------------|--------------|
 | Compiler composition backbone | 93% | Generic stage-composition, stage-reflection, whole-pipeline semantics `iff`, and bootstrap-stability shape are in place. |
-| Pure core source-to-machine correctness | 85% | Concrete compiler, staged pipeline, and typed-result preservation are proved. |
+| Pure core source-to-machine correctness | 88% | Concrete compiler, staged pipeline, typed-result preservation, and generic source/machine semantics `iff` theorems are proved. |
 | Handled-effect core correctness | 80% | Trace-preserving compilation, staged effectful compiler theorem, and machine-level effect/result conformance are proved. |
 | Result-carrying semantic observations | 90% | Successful staged compilations now preserve and reflect trace/result behaviors, representable expected types can be restated at the whole-`Ty` kernel-tag semantic level, the handled-effect fragment has explicit query/reply observation theorems in the generic `IOEvent` space, staged/compiled expected-type theorems now work through an executable whole-`Ty` kernel subtype layer rather than only the finite `CoreSetTy` bridge, and semantic equivalence of surface compiler generations can be transferred to emitted machine artifacts together with the current pure/effect-bounded typed-result contracts. |
 | Set-theoretic normalization/subtyping | 69% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, theory-aware unsatisfiability implies semantic subtyping under sound valuations, the kernel theory has a concrete tag-level semantic model with explicit pointer-flavor separation facts such as `rc T & mptr U` being empty, and there is now a structurally computable whole-`Ty` kernel subtype checker over normalized obligations. Full semantic subtyping for richer constructors is still missing. |
@@ -78,6 +81,13 @@ Current frontier:
   `iff` theorems. Concretely: “compiled artifact behaves like source” is now a
   first-class generic theorem shape in the library, not only a pattern we keep
   reproving manually inside the current handled-effect pipeline.
+
+- pure-core instantiation of the generic equivalence layer
+  The safety-core compiler and staged pure pipeline now instantiate that same
+  generic reflection/equivalence framework. Concretely: the formal backbone is
+  no longer asymmetric between the pure fragment and the handled-effect
+  fragment; both now support reusable source/machine `iff` reasoning through
+  the shared compiler library.
 
 - generic compiled-artifact equivalence transfer
   The bootstrap/equivalence story no longer needs one custom proof per
