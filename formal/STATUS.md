@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **73%** of the way to the complete theorem.
+Roughly **74%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -42,6 +42,9 @@ That estimate is based on:
 - the pure safety-core compiler and the staged pure core pipeline now
   instantiate that generic reflection/equivalence layer too, not only the
   handled-effect side
+- the compiler library now also packages the three-generation bootstrap
+  artifact-stability theorem generically, not only the two-generation
+  source-to-artifact equivalence transfer
 - emitted-artifact semantic-equivalence transfer is now factored through a
   reusable generic compilation lemma instead of being reproved separately at
   each raw/observed behavior layer
@@ -60,7 +63,7 @@ That estimate is based on:
 
 | Area | Rough Status | What is done |
 |------|--------------|--------------|
-| Compiler composition backbone | 93% | Generic stage-composition, stage-reflection, whole-pipeline semantics `iff`, and bootstrap-stability shape are in place. |
+| Compiler composition backbone | 95% | Generic stage-composition, stage-reflection, whole-pipeline semantics `iff`, direct source-to-artifact equivalence transfer, and compiled bootstrap-stability theorems are in place. |
 | Pure core source-to-machine correctness | 88% | Concrete compiler, staged pipeline, typed-result preservation, and generic source/machine semantics `iff` theorems are proved. |
 | Handled-effect core correctness | 80% | Trace-preserving compilation, staged effectful compiler theorem, and machine-level effect/result conformance are proved. |
 | Result-carrying semantic observations | 90% | Successful staged compilations now preserve and reflect trace/result behaviors, representable expected types can be restated at the whole-`Ty` kernel-tag semantic level, the handled-effect fragment has explicit query/reply observation theorems in the generic `IOEvent` space, staged/compiled expected-type theorems now work through an executable whole-`Ty` kernel subtype layer rather than only the finite `CoreSetTy` bridge, and semantic equivalence of surface compiler generations can be transferred to emitted machine artifacts together with the current pure/effect-bounded typed-result contracts. |
@@ -88,6 +91,15 @@ Current frontier:
   no longer asymmetric between the pure fragment and the handled-effect
   fragment; both now support reusable source/machine `iff` reasoning through
   the shared compiler library.
+
+- generic compiled bootstrap stability
+  The shared compiler library now contains the three-generation version of the
+  artifact-parity theorem too: if `compiler₁ ~ compiler₂` and
+  `compiler₂ ~ compiler₃` at the source semantics, then compiled artifacts from
+  generations 1 and 3 are equivalent at the target semantics whenever the
+  stage or whole pipeline supports preservation plus reflection. Concretely:
+  bootstrap artifact parity is now a reusable compiler-theorem combinator, not
+  just a handled-effect-specific proof pattern.
 
 - generic compiled-artifact equivalence transfer
   The bootstrap/equivalence story no longer needs one custom proof per

@@ -80,10 +80,11 @@ theorem staged_bootstrap_machine_io_semantics_stable
     (hCompile₃ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₃ = .ok code₃)
     (h₁₂ : Weft.SemanticEq (surfaceIOSem oracle) compiler₁ compiler₂)
     (h₂₃ : Weft.SemanticEq (surfaceIOSem oracle) compiler₂ compiler₃) :
-    Weft.SemanticEq (machineIOSem oracle) code₁ code₃ := by
-  have hSurface : Weft.SemanticEq (surfaceIOSem oracle) compiler₁ compiler₃ :=
-    staged_bootstrap_surface_io_semantics_stable oracle h₁₂ h₂₃
-  exact machine_io_semanticEq_of_surfaceEq oracle hCompile₁ hCompile₃ hSurface
+    Weft.SemanticEq (machineIOSem oracle) code₁ code₃ :=
+  Weft.compiled_bootstrap_semantics_stable
+    (staged_whole_io_compiler_theorem oracle)
+    (staged_whole_io_compiler_reflection_theorem oracle)
+    hCompile₁ _hCompile₂ hCompile₃ h₁₂ h₂₃
 
 theorem staged_bootstrap_surface_semantics_stable
     (oracle : Oracle)
@@ -110,10 +111,11 @@ theorem staged_bootstrap_machine_io_result_semantics_stable
     (hCompile₃ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₃ = .ok code₃)
     (h₁₂ : Weft.SemanticEq (surfaceIOResultSem oracle) compiler₁ compiler₂)
     (h₂₃ : Weft.SemanticEq (surfaceIOResultSem oracle) compiler₂ compiler₃) :
-    Weft.SemanticEq (machineIOResultSem oracle) code₁ code₃ := by
-  have hSurface : Weft.SemanticEq (surfaceIOResultSem oracle) compiler₁ compiler₃ :=
-    staged_bootstrap_surface_io_result_semantics_stable oracle h₁₂ h₂₃
-  exact machine_io_result_semanticEq_of_surfaceEq oracle hCompile₁ hCompile₃ hSurface
+    Weft.SemanticEq (machineIOResultSem oracle) code₁ code₃ :=
+  Weft.compiled_bootstrap_semantics_stable
+    (staged_whole_io_result_compiler_theorem oracle)
+    (staged_whole_io_result_compiler_reflection_theorem oracle)
+    hCompile₁ _hCompile₂ hCompile₃ h₁₂ h₂₃
 
 theorem staged_bootstrap_machine_semantics_stable
     (oracle : Oracle)
@@ -124,10 +126,11 @@ theorem staged_bootstrap_machine_semantics_stable
     (hCompile₃ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₃ = .ok code₃)
     (h₁₂ : Weft.SemanticEq (surfaceSem oracle) compiler₁ compiler₂)
     (h₂₃ : Weft.SemanticEq (surfaceSem oracle) compiler₂ compiler₃) :
-    Weft.SemanticEq (machineSem oracle) code₁ code₃ := by
-  have hSurface : Weft.SemanticEq (surfaceSem oracle) compiler₁ compiler₃ :=
-    staged_bootstrap_surface_semantics_stable oracle h₁₂ h₂₃
-  exact machine_semanticEq_of_surfaceEq oracle hCompile₁ hCompile₃ hSurface
+    Weft.SemanticEq (machineSem oracle) code₁ code₃ :=
+  Weft.compiled_bootstrap_semantics_stable
+    (staged_whole_compiler_theorem oracle)
+    (staged_whole_compiler_reflection_theorem oracle)
+    hCompile₁ _hCompile₂ hCompile₃ h₁₂ h₂₃
 
 theorem staged_bootstrap_machine_result_semantics_stable
     (oracle : Oracle)
@@ -138,10 +141,11 @@ theorem staged_bootstrap_machine_result_semantics_stable
     (hCompile₃ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₃ = .ok code₃)
     (h₁₂ : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₂)
     (h₂₃ : Weft.SemanticEq (surfaceResultSem oracle) compiler₂ compiler₃) :
-    Weft.SemanticEq (machineResultSem oracle) code₁ code₃ := by
-  have hSurface : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₃ :=
-    staged_bootstrap_surface_result_semantics_stable oracle h₁₂ h₂₃
-  exact machine_result_semanticEq_of_surfaceEq oracle hCompile₁ hCompile₃ hSurface
+    Weft.SemanticEq (machineResultSem oracle) code₁ code₃ :=
+  Weft.compiled_bootstrap_semantics_stable
+    (staged_whole_result_compiler_theorem oracle)
+    (staged_whole_result_compiler_reflection_theorem oracle)
+    hCompile₁ _hCompile₂ hCompile₃ h₁₂ h₂₃
 
 theorem machine_io_result_behavior_only_reports_inferred_effects_and_kernel_expected_type_tag_of_surfaceEq
     (oracle : Oracle)

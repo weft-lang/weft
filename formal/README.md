@@ -169,6 +169,16 @@ The first cut lands three things:
     been rewritten against a reusable generic “compile equivalent sources to
     equivalent artifacts” lemma instead of repeating the source/machine
     shuttling proof at each observation layer.
+26. `Weft/Properties/CompilerCorrectness.lean`,
+    `Weft/Properties/CoreEffectBootstrap.lean`
+    The shared compiler library now also contains the three-generation
+    bootstrap version of that artifact-equivalence transfer: if successive
+    compiler generations are semantically equivalent at the source level, then
+    their compiled artifacts are semantically equivalent at the target level
+    for any stage or whole pipeline with preservation plus reflection. The
+    handled-effect bootstrap file now instantiates that generic theorem for raw
+    machine, observed `IOEvent`, and result-carrying artifact behaviors instead
+    of reproving the same bootstrap stitching separately in each case.
 
 ## Near-Term Expansion
 

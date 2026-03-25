@@ -165,6 +165,27 @@ theorem compiled_semanticEq_of_sourceEq
       (hEq input behavior).2 hSource₂
     exact (stage_semantics_iff hPreserve hReflect hCompile₁).1 hSource₁
 
+theorem compiled_bootstrap_semantics_stable
+    {Obs : Type}
+    {α γ : Type}
+    {sourceSem : Semantics α Obs}
+    {targetSem : Semantics γ Obs}
+    {stage : Stage α γ}
+    (hPreserve : SemanticsPreserving sourceSem targetSem stage)
+    (hReflect : SemanticsReflecting sourceSem targetSem stage)
+    {source₁ source₂ source₃ : α}
+    {artifact₁ artifact₂ artifact₃ : γ}
+    (hCompile₁ : stage.compile source₁ = .ok artifact₁)
+    (_hCompile₂ : stage.compile source₂ = .ok artifact₂)
+    (hCompile₃ : stage.compile source₃ = .ok artifact₃)
+    (h₁₂ : SemanticEq sourceSem source₁ source₂)
+    (h₂₃ : SemanticEq sourceSem source₂ source₃) :
+    SemanticEq targetSem artifact₁ artifact₃ := by
+  have hSource : SemanticEq sourceSem source₁ source₃ :=
+    semantics_eq_trans sourceSem h₁₂ h₂₃
+  exact compiled_semanticEq_of_sourceEq
+    hPreserve hReflect hCompile₁ hCompile₃ hSource
+
 theorem whole_compiler_semantics_iff
     {Obs : Type}
     (pipeline : CompilerPipeline)
