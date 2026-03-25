@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **65%** of the way to the complete theorem.
+Roughly **66%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -31,6 +31,8 @@ That estimate is based on:
   whole-`Ty` checker rather than remaining exact-equality atoms
 - bootstrap-parity reasoning is now instantiated for emitted handled-effect
   machine artifacts over explicit observed `IOEvent` behaviors
+- bootstrap-parity reasoning now also reaches the raw handled-effect machine
+  trace/result semantics underneath the `IOEvent` observation layer
 - those emitted-artifact bootstrap lemmas now carry both trace-only and
   result-carrying purity/effect-boundedness contracts rather than only
   extensional behavior equality
@@ -91,6 +93,16 @@ Current frontier:
   whole-`Ty` semantic/checker story now matches one of the kernel’s core
   effect-subtyping commitments rather than leaving function effects outside the
   executable subtype layer.
+
+- raw machine bootstrap parity for handled effects
+  The staged handled-effect bootstrap layer no longer speaks only in the
+  external `IOEvent` observation language. We now also transfer semantic
+  equivalence of surface compiler generations directly into semantic
+  equivalence of emitted artifacts under the underlying raw machine trace and
+  result semantics, and we carry the corresponding inferred-effect and
+  kernel-typed result contracts through that layer. Concretely: the bootstrap
+  theorem story now reaches both the observed interface and the lower-level
+  machine semantics that generate it.
 
 - executable whole-`Ty` kernel subtype checking for compiled/staged expected-type theorems
   The formal development no longer has to route every expected-type theorem

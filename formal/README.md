@@ -139,6 +139,14 @@ The first cut lands three things:
     and prove the kernel rule that pure functions are subtypes of effectful
     ones, and more generally that smaller effect sets subtype larger ones for
     fixed function argument/result types.
+24. `Weft/Properties/CoreEffectBootstrap.lean`
+    The bootstrap specialization for the staged handled-effect pipeline now
+    reaches both layers of the current machine story: not only the external
+    `IOEvent` observation semantics, but also the underlying raw machine
+    trace/result semantics. It transfers semantic equivalence of surface
+    compiler generations into semantic equivalence of emitted artifacts at that
+    lower layer too, and carries inferred-effect and kernel-typed result
+    contracts through the raw-machine bootstrap theorems.
 
 ## Near-Term Expansion
 
