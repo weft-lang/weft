@@ -100,9 +100,10 @@ Current frontier:
   equivalence of surface compiler generations directly into semantic
   equivalence of emitted artifacts under the underlying raw machine trace and
   result semantics, and we carry the corresponding inferred-effect, pure
-  trace-free, and kernel-typed result contracts through that layer.
-  Concretely: the bootstrap theorem story now reaches both the observed
-  interface and the lower-level machine semantics that generate it.
+  trace-free, representable-core typed, and kernel-typed result contracts
+  through that layer. Concretely: the bootstrap theorem story now reaches both
+  the observed interface and the lower-level machine semantics that generate
+  it, without dropping the older core-typing contract surface.
 
 - executable whole-`Ty` kernel subtype checking for compiled/staged expected-type theorems
   The formal development no longer has to route every expected-type theorem

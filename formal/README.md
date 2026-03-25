@@ -145,8 +145,9 @@ The first cut lands three things:
     `IOEvent` observation semantics, but also the underlying raw machine
     trace/result semantics. It transfers semantic equivalence of surface
     compiler generations into semantic equivalence of emitted artifacts at that
-    lower layer too, and carries inferred-effect and kernel-typed result
-    contracts through the raw-machine bootstrap theorems.
+    lower layer too, and carries inferred-effect plus both representable-core
+    and kernel-typed result contracts through the raw-machine bootstrap
+    theorems.
 
 ## Near-Term Expansion
 
