@@ -179,6 +179,15 @@ The first cut lands three things:
     handled-effect bootstrap file now instantiates that generic theorem for raw
     machine, observed `IOEvent`, and result-carrying artifact behaviors instead
     of reproving the same bootstrap stitching separately in each case.
+27. `Weft/Properties/CoreKernelModelBridge.lean`,
+    `Weft/Properties/CoreEffectPipelineSemanticSoundness.lean`,
+    `Weft/Properties/CoreEffectBootstrap.lean`
+    Executable whole-`Ty` kernel subtype witnesses now feed directly into the
+    theorem surface. In addition to weakening expected-type postconditions by
+    semantic subtype proofs or full tag-implication lemmas, we can now weaken
+    them using plain boolean facts `A.kernelSubtypeb B = true`, and that route
+    is wired through compiled executions, staged machine/result behaviors, and
+    cross-generation bootstrap artifact contracts.
 
 ## Near-Term Expansion
 

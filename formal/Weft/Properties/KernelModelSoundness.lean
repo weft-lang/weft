@@ -1,4 +1,5 @@
 import Weft.KernelModel
+import Weft.KernelSubtype
 import Weft.Properties.TyTheorySoundness
 
 namespace Weft
@@ -18,6 +19,12 @@ theorem kernel_subtypeIn_implies_tag_subtype
     ∀ tag : KernelTag, Ty.denotesTag tag lhs -> Ty.denotesTag tag rhs := by
   intro tag hDen
   exact hSubtype _ (KernelTag.soundValuation tag) hDen
+
+theorem kernel_subtypeb_implies_tag_subtype
+    {lhs rhs : Ty}
+    (hSubtype : lhs.kernelSubtypeb rhs = true) :
+    ∀ tag : KernelTag, Ty.denotesTag tag lhs -> Ty.denotesTag tag rhs := by
+  exact kernel_subtypeIn_implies_tag_subtype (Ty.kernelSubtypeb_sound hSubtype)
 
 theorem kernel_rc_ptr_tag
     (tag : KernelTag)
