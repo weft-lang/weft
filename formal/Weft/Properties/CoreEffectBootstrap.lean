@@ -136,6 +136,40 @@ theorem machine_io_result_behavior_trace_free_and_kernel_typed_when_pure_of_surf
   exact staged_io_result_behavior_trace_free_and_kernel_typed_when_pure_tag
     hCompile₁ hCheck₁ hPure₁ hMachine₁
 
+theorem machine_io_behavior_has_no_non_effect_events_of_surfaceEq
+    (oracle : Oracle)
+    {surface₁ surface₂ : SurfaceExpr}
+    {code₁ code₂ : Code}
+    {input : Weft.Input}
+    {behavior : Weft.Behavior}
+    (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface₁ = .ok code₁)
+    (hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface₂ = .ok code₂)
+    (hEq : Weft.SemanticEq (surfaceIOSem oracle) surface₁ surface₂)
+    (hMachine₂ : machineIOSem oracle code₂ input behavior) :
+    ∀ event, event ∈ behavior.trace ->
+      ∃ effect : Weft.EffectName,
+        event = Weft.IOEvent.effectQuery effect (oracle effect) := by
+  have hMachine₁ : machineIOSem oracle code₁ input behavior :=
+    (machine_io_semanticEq_of_surfaceEq oracle hCompile₁ hCompile₂ hEq input behavior).2 hMachine₂
+  exact staged_io_behavior_has_no_non_effect_events hCompile₁ hMachine₁
+
+theorem machine_io_result_behavior_has_no_non_effect_events_of_surfaceEq
+    (oracle : Oracle)
+    {surface₁ surface₂ : SurfaceExpr}
+    {code₁ code₂ : Code}
+    {input : Weft.Input}
+    {behavior : IOResultBehavior}
+    (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface₁ = .ok code₁)
+    (hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface₂ = .ok code₂)
+    (hEq : Weft.SemanticEq (surfaceIOResultSem oracle) surface₁ surface₂)
+    (hMachine₂ : machineIOResultSem oracle code₂ input behavior) :
+    ∀ event, event ∈ behavior.trace ->
+      ∃ effect : Weft.EffectName,
+        event = Weft.IOEvent.effectQuery effect (oracle effect) := by
+  have hMachine₁ : machineIOResultSem oracle code₁ input behavior :=
+    (machine_io_result_semanticEq_of_surfaceEq oracle hCompile₁ hCompile₂ hEq input behavior).2 hMachine₂
+  exact staged_io_result_behavior_has_no_non_effect_events hCompile₁ hMachine₁
+
 theorem staged_bootstrap_machine_io_result_behavior_only_reports_inferred_effects_and_kernel_expected_type_tag
     (oracle : Oracle)
     {compiler₁ compiler₂ compiler₃ : SurfaceExpr}
@@ -160,6 +194,46 @@ theorem staged_bootstrap_machine_io_result_behavior_only_reports_inferred_effect
     staged_bootstrap_surface_io_result_semantics_stable oracle h₁₂ h₂₃
   exact machine_io_result_behavior_only_reports_inferred_effects_and_kernel_expected_type_tag_of_surfaceEq
     oracle hCompile₁ hCompile₃ hSurface hCheck₁ hEffects₁ hMachine₃
+
+theorem staged_bootstrap_machine_io_behavior_has_no_non_effect_events
+    (oracle : Oracle)
+    {compiler₁ compiler₂ compiler₃ : SurfaceExpr}
+    {code₁ code₂ code₃ : Code}
+    {input : Weft.Input}
+    {behavior : Weft.Behavior}
+    (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₁ = .ok code₁)
+    (_hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₂ = .ok code₂)
+    (hCompile₃ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₃ = .ok code₃)
+    (h₁₂ : Weft.SemanticEq (surfaceIOSem oracle) compiler₁ compiler₂)
+    (h₂₃ : Weft.SemanticEq (surfaceIOSem oracle) compiler₂ compiler₃)
+    (hMachine₃ : machineIOSem oracle code₃ input behavior) :
+    ∀ event, event ∈ behavior.trace ->
+      ∃ effect : Weft.EffectName,
+        event = Weft.IOEvent.effectQuery effect (oracle effect) := by
+  have hSurface : Weft.SemanticEq (surfaceIOSem oracle) compiler₁ compiler₃ :=
+    staged_bootstrap_surface_io_semantics_stable oracle h₁₂ h₂₃
+  exact machine_io_behavior_has_no_non_effect_events_of_surfaceEq
+    oracle hCompile₁ hCompile₃ hSurface hMachine₃
+
+theorem staged_bootstrap_machine_io_result_behavior_has_no_non_effect_events
+    (oracle : Oracle)
+    {compiler₁ compiler₂ compiler₃ : SurfaceExpr}
+    {code₁ code₂ code₃ : Code}
+    {input : Weft.Input}
+    {behavior : IOResultBehavior}
+    (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₁ = .ok code₁)
+    (_hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₂ = .ok code₂)
+    (hCompile₃ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₃ = .ok code₃)
+    (h₁₂ : Weft.SemanticEq (surfaceIOResultSem oracle) compiler₁ compiler₂)
+    (h₂₃ : Weft.SemanticEq (surfaceIOResultSem oracle) compiler₂ compiler₃)
+    (hMachine₃ : machineIOResultSem oracle code₃ input behavior) :
+    ∀ event, event ∈ behavior.trace ->
+      ∃ effect : Weft.EffectName,
+        event = Weft.IOEvent.effectQuery effect (oracle effect) := by
+  have hSurface : Weft.SemanticEq (surfaceIOResultSem oracle) compiler₁ compiler₃ :=
+    staged_bootstrap_surface_io_result_semantics_stable oracle h₁₂ h₂₃
+  exact machine_io_result_behavior_has_no_non_effect_events_of_surfaceEq
+    oracle hCompile₁ hCompile₃ hSurface hMachine₃
 
 theorem staged_bootstrap_machine_io_result_behavior_trace_free_and_kernel_typed_when_pure
     (oracle : Oracle)
