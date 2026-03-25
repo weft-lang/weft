@@ -151,9 +151,10 @@ The first cut lands three things:
     compiler generations into semantic equivalence of emitted artifacts at that
     lower layer too, and carries inferred-effect plus both representable-core
     and kernel-typed result contracts through the raw-machine bootstrap
-    theorems. Those bootstrap contracts can now also be weakened along
-    semantic kernel subtyping, so model-level variance facts already flow
-    through cross-generation emitted-artifact parity.
+    theorems. Those bootstrap contracts can now also be weakened along both
+    theory-level kernel subtyping and concrete kernel-tag implication, so
+    model-level variance facts already flow through cross-generation
+    emitted-artifact parity.
 
 ## Near-Term Expansion
 

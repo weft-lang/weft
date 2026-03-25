@@ -12,6 +12,13 @@ theorem kernel_bool_int_empty_tag
     (Ty.normalizeTyDNF_spec (KernelTag.valuation tag) (Ty.inter Ty.bool Ty.int)).2 hDen
   exact TyDNF.unsat_sound (KernelTag.soundValuation tag) kernel_bool_int_inter_unsat hNorm
 
+theorem kernel_subtypeIn_implies_tag_subtype
+    {lhs rhs : Ty}
+    (hSubtype : lhs.SubtypeIn KernelTheory.theory rhs) :
+    ∀ tag : KernelTag, Ty.denotesTag tag lhs -> Ty.denotesTag tag rhs := by
+  intro tag hDen
+  exact hSubtype _ (KernelTag.soundValuation tag) hDen
+
 theorem kernel_rc_ptr_tag
     (tag : KernelTag)
     (inner : Ty) :
