@@ -24,7 +24,7 @@ def denotesTag : TyAtom -> KernelTag -> Prop
   | .bool, .bool => True
   | .int, .int => True
   | .nil, .nil => True
-  | .fn arg eff ret, .fn arg' eff' ret' => arg = arg' ∧ eff = eff' ∧ ret = ret'
+  | .fn arg eff ret, .fn arg' eff' ret' => arg = arg' ∧ EffectSet.subset eff' eff ∧ ret = ret'
   | .record fields, .record fields' => fields = fields'
   | .ptr inner, .ptr _ inner' => inner = inner'
   | .mptr inner, .ptr .mut inner' => inner = inner'
@@ -62,7 +62,10 @@ theorem soundValuation (tag : KernelTag) :
       exact hVal
     case fn.fn =>
       rcases hImplies with ⟨hArg, hEff, hRet⟩
-      simpa [valuation, TyAtom.denotesTag, hArg, hEff, hRet] using hVal
+      cases tag <;> simp [valuation, TyAtom.denotesTag] at hVal ⊢
+      case fn argTag effTag retTag =>
+        rcases hVal with ⟨hArgVal, hEffVal, hRetVal⟩
+        exact ⟨hArg.symm.trans hArgVal, EffectSet.subset_trans hEffVal hEff, hRet.symm.trans hRetVal⟩
     case record.record =>
       simpa [valuation, TyAtom.denotesTag, hImplies] using hVal
     case ptr.ptr =>

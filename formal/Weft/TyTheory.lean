@@ -40,11 +40,15 @@ end Ty
 namespace KernelTheory
 
 def Implies : TyAtom -> TyAtom -> Prop
+  | .fn arg eff ret, .fn arg' eff' ret' =>
+      arg = arg' ∧ EffectSet.subset eff eff' ∧ ret = ret'
   | .rc inner, .ptr inner' => inner = inner'
   | .mptr inner, .ptr inner' => inner = inner'
   | lhs, rhs => lhs = rhs
 
 def impliesb : TyAtom -> TyAtom -> Bool
+  | .fn arg eff ret, .fn arg' eff' ret' =>
+      Ty.eqb arg arg' && EffectSet.subsetb eff eff' && Ty.eqb ret ret'
   | .rc inner, .ptr inner' => Ty.eqb inner inner'
   | .mptr inner, .ptr inner' => Ty.eqb inner inner'
   | lhs, rhs => TyAtom.eqb lhs rhs
@@ -75,7 +79,7 @@ theorem impliesb_spec
     (lhs rhs : TyAtom) :
     impliesb lhs rhs = true ↔ Implies lhs rhs := by
   cases lhs <;> cases rhs <;>
-    simp [impliesb, Implies, Ty.eqb_spec, TyAtom.eqb_spec]
+    simp [impliesb, Implies, Ty.eqb_spec, TyAtom.eqb_spec, EffectSet.subsetb_spec, and_assoc]
 
 theorem disjointb_spec
     (lhs rhs : TyAtom) :
@@ -87,7 +91,7 @@ def theory : TyTheory where
   Disjoint := Disjoint
   implies_refl := by
     intro atom
-    simp [Implies]
+    cases atom <;> simp [Implies, EffectSet.subset_refl]
 
 end KernelTheory
 

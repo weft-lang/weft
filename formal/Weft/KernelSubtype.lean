@@ -149,6 +149,21 @@ theorem kernelSubtypeb_rc_ptr
   exact (kernelSubtypeb_spec (Ty.rc inner) (Ty.ptr inner)).2
     (kernel_rc_ptr_diff_unsat inner)
 
+theorem kernelSubtypeb_fn_effect_subset
+    (arg ret : Ty)
+    (eff eff' : EffectSet)
+    (hSubset : EffectSet.subset eff eff') :
+    (Ty.fn arg eff ret).kernelSubtypeb (Ty.fn arg eff' ret) = true := by
+  exact (kernelSubtypeb_spec (Ty.fn arg eff ret) (Ty.fn arg eff' ret)).2
+    (kernel_fn_effect_subset_diff_unsat arg ret eff eff' hSubset)
+
+theorem kernelSubtypeb_pure_fn_effectful
+    (arg ret : Ty)
+    (effects : EffectSet) :
+    (Ty.fn arg Weft.EffectSet.empty ret).kernelSubtypeb (Ty.fn arg effects ret) = true := by
+  exact kernelSubtypeb_fn_effect_subset arg ret Weft.EffectSet.empty effects
+    (Weft.EffectSet.subset_empty effects)
+
 theorem kernelSubtypeb_mptr_ptr
     (inner : Ty) :
     (Ty.mptr inner).kernelSubtypeb (Ty.ptr inner) = true := by

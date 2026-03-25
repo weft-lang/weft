@@ -31,6 +31,14 @@ def handle (available handled : EffectSet) : EffectSet :=
 def subset (lhs rhs : EffectSet) : Prop :=
   ∀ effect : EffectName, effect ∈ lhs.elems -> effect ∈ rhs.elems
 
+def subsetbList (lhs : List EffectName) (rhs : EffectSet) : Bool :=
+  match lhs with
+  | [] => true
+  | effect :: rest => decide (effect ∈ rhs.elems) && subsetbList rest rhs
+
+def subsetb (lhs rhs : EffectSet) : Bool :=
+  subsetbList lhs.elems rhs
+
 def disjoint (lhs rhs : EffectSet) : Prop :=
   ∀ effect : EffectName, effect ∈ lhs.elems -> effect ∉ rhs.elems
 
@@ -46,6 +54,35 @@ theorem subset_trans {a b c : EffectSet} :
 theorem subset_empty (s : EffectSet) : subset empty s := by
   intro effect hMem
   cases hMem
+
+theorem subsetbList_spec
+    (lhs : List EffectName)
+    (rhs : EffectSet) :
+    subsetbList lhs rhs = true ↔
+      ∀ effect : EffectName, effect ∈ lhs -> effect ∈ rhs.elems := by
+  induction lhs with
+  | nil =>
+      simp [subsetbList]
+  | cons effect rest ih =>
+      constructor
+      · intro h target hMem
+        simp [subsetbList, Bool.and_eq_true] at h
+        rcases List.mem_cons.mp hMem with rfl | hMemRest
+        · simpa using h.1
+        · exact (ih.1 h.2) target hMemRest
+      · intro h
+        have hHead : decide (effect ∈ rhs.elems) = true :=
+          decide_eq_true (h effect (List.mem_cons.mpr (Or.inl rfl)))
+        have hTail : subsetbList rest rhs = true :=
+          (ih.2 (fun target hMem => h target (List.mem_cons.mpr (Or.inr hMem))))
+        simpa [subsetbList, Bool.and_eq_true] using And.intro hHead hTail
+
+theorem subsetb_spec
+    (lhs rhs : EffectSet) :
+    subsetb lhs rhs = true ↔ subset lhs rhs := by
+  cases lhs with
+  | mk elems =>
+      simpa [subsetb, subset] using subsetbList_spec elems rhs
 
 theorem subset_union_left (lhs rhs : EffectSet) : subset lhs (union lhs rhs) := by
   intro effect hMem

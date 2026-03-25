@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **64%** of the way to the complete theorem.
+Roughly **65%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -26,6 +26,9 @@ That estimate is based on:
   representable fragment
 - the whole-`Ty` kernel subtype layer is now structurally computable rather
   than only theorem-facing
+- function types in the kernel theory/model now respect effect-set subtyping,
+  so pure functions and effect-bounded functions participate in the executable
+  whole-`Ty` checker rather than remaining exact-equality atoms
 - bootstrap-parity reasoning is now instantiated for emitted handled-effect
   machine artifacts over explicit observed `IOEvent` behaviors
 - those emitted-artifact bootstrap lemmas now carry both trace-only and
@@ -79,6 +82,15 @@ Current frontier:
   fragment. Concretely: the formal observation language is now honest about the
   current fragment’s limits while we work toward real `IO`/allocation/unsafe
   events.
+
+- function-effect subtyping in the kernel model/checker
+  The kernel theory and concrete tag model now recognize effect-set subtyping
+  for function atoms instead of treating them as exact-equality leaves. We now
+  prove and compute facts like `(A) -> B <: (A) -[E]> B` and, more generally,
+  `fn A -[E1]> B <: fn A -[E2]> B` whenever `E1 ⊆ E2`. Concretely: the
+  whole-`Ty` semantic/checker story now matches one of the kernel’s core
+  effect-subtyping commitments rather than leaving function effects outside the
+  executable subtype layer.
 
 - executable whole-`Ty` kernel subtype checking for compiled/staged expected-type theorems
   The formal development no longer has to route every expected-type theorem

@@ -74,6 +74,21 @@ theorem kernel_rc_ptr_diff_unsat
   change inner = inner
   rfl
 
+theorem kernel_fn_effect_subset_diff_unsat
+    (arg ret : Ty)
+    (eff eff' : EffectSet)
+    (hSubset : EffectSet.subset eff eff') :
+    (Ty.normalizeTyDNF (Ty.inter (Ty.fn arg eff ret) (Ty.compl (Ty.fn arg eff' ret)))).Unsat
+      KernelTheory.theory := by
+  intro clause hMem
+  have hClause : clause = { pos := [TyAtom.fn arg eff ret], neg := [TyAtom.fn arg eff' ret] } := by
+    simpa [Ty.normalizeTyDNF, TyDNF.inter, TyDNF.interWith, TyDNF.ofAtom, TyDNF.compl,
+      TyDNF.complClause, TyDNF.top, TyClause.ofPos, TyClause.ofNeg, TyClause.merge,
+      TyClause.top] using hMem
+  subst clause
+  refine Or.inr ⟨TyAtom.fn arg eff ret, by simp, TyAtom.fn arg eff' ret, by simp, ?_⟩
+  exact ⟨rfl, hSubset, rfl⟩
+
 theorem kernel_mptr_ptr_diff_unsat
     (inner : Ty) :
     (Ty.normalizeTyDNF (Ty.inter (Ty.mptr inner) (Ty.compl (Ty.ptr inner)))).Unsat KernelTheory.theory := by
@@ -103,6 +118,13 @@ theorem kernel_rc_subtype_ptr
     (inner : Ty) :
     (Ty.rc inner).SubtypeIn KernelTheory.theory (Ty.ptr inner) := by
   exact Ty.unsat_normalize_implies_subtypeIn (kernel_rc_ptr_diff_unsat inner)
+
+theorem kernel_fn_effect_subset_subtype
+    (arg ret : Ty)
+    (eff eff' : EffectSet)
+    (hSubset : EffectSet.subset eff eff') :
+    (Ty.fn arg eff ret).SubtypeIn KernelTheory.theory (Ty.fn arg eff' ret) := by
+  exact Ty.unsat_normalize_implies_subtypeIn (kernel_fn_effect_subset_diff_unsat arg ret eff eff' hSubset)
 
 theorem kernel_mptr_subtype_ptr
     (inner : Ty) :

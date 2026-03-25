@@ -132,6 +132,13 @@ The first cut lands three things:
     contracts through that bridge, so later emitted artifacts inherit the pure
     trace-free and effect-bounded kernel-typed guarantees proved for earlier
     semantically equivalent compiler generations.
+23. `Weft/TyTheory.lean`, `Weft/KernelModel.lean`, `Weft/KernelSubtype.lean`
+    The executable whole-`Ty` kernel checker and the concrete kernel-tag model
+    now recognize function-effect subtyping instead of treating function atoms
+    as exact-equality leaves. The current formal surface can already compute
+    and prove the kernel rule that pure functions are subtypes of effectful
+    ones, and more generally that smaller effect sets subtype larger ones for
+    fixed function argument/result types.
 
 ## Near-Term Expansion
 
