@@ -24,11 +24,14 @@ def denotesTag : TyAtom -> KernelTag -> Prop
   | .bool, .bool => True
   | .int, .int => True
   | .nil, .nil => True
-  | .fn arg eff ret, .fn arg' eff' ret' => arg = arg' ∧ EffectSet.subset eff' eff ∧ ret = ret'
+  | .fn arg eff ret, .fn arg' eff' ret' =>
+      arg.SubtypeIn KernelTheory.theory arg' ∧
+        EffectSet.subset eff' eff ∧
+        ret'.SubtypeIn KernelTheory.theory ret
   | .record fields, .record fields' => fields = fields'
-  | .ptr inner, .ptr _ inner' => inner = inner'
+  | .ptr inner, .ptr _ inner' => inner'.SubtypeIn KernelTheory.theory inner
   | .mptr inner, .ptr .mut inner' => inner = inner'
-  | .rc inner, .ptr .rc inner' => inner = inner'
+  | .rc inner, .ptr .rc inner' => inner'.SubtypeIn KernelTheory.theory inner
   | .nominal name args, .nominal name' args' => name = name' ∧ args = args'
   | _, _ => False
 
@@ -65,7 +68,9 @@ theorem soundValuation (tag : KernelTag) :
       cases tag <;> simp [valuation, TyAtom.denotesTag] at hVal ⊢
       case fn argTag effTag retTag =>
         rcases hVal with ⟨hArgVal, hEffVal, hRetVal⟩
-        exact ⟨hArg.symm.trans hArgVal, EffectSet.subset_trans hEffVal hEff, hRet.symm.trans hRetVal⟩
+        cases hArg
+        cases hRet
+        exact ⟨hArgVal, EffectSet.subset_trans hEffVal hEff, hRetVal⟩
     case record.record =>
       simpa [valuation, TyAtom.denotesTag, hImplies] using hVal
     case ptr.ptr =>
@@ -73,14 +78,21 @@ theorem soundValuation (tag : KernelTag) :
     case mptr.ptr =>
       cases tag <;> simp [valuation, TyAtom.denotesTag] at hVal ⊢
       case ptr kind inner =>
-        cases kind <;> simp [hImplies] at hVal ⊢ <;> try exact hVal
+        cases kind <;> simp at hVal ⊢
+        ·
+          cases hImplies
+          cases hVal
+          simpa using (Ty.subtypeIn_refl KernelTheory.theory _)
     case mptr.mptr =>
       cases hImplies
       exact hVal
     case rc.ptr =>
       cases tag <;> simp [valuation, TyAtom.denotesTag] at hVal ⊢
       case ptr kind inner =>
-        cases kind <;> simp [hImplies] at hVal ⊢ <;> try exact hVal
+        cases kind <;> simp at hVal ⊢
+        ·
+          cases hImplies
+          exact hVal
     case rc.rc =>
       cases hImplies
       exact hVal

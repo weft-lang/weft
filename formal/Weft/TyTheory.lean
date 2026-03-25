@@ -35,6 +35,22 @@ namespace Ty
 def SubtypeIn (theory : TyTheory) (lhs rhs : Ty) : Prop :=
   ∀ ν : TyAtom -> Prop, theory.SoundValuation ν -> lhs.denotesUnder ν -> rhs.denotesUnder ν
 
+theorem subtypeIn_refl
+    (theory : TyTheory)
+    (ty : Ty) :
+    ty.SubtypeIn theory ty := by
+  intro ν hSound hTy
+  exact hTy
+
+theorem subtypeIn_trans
+    {theory : TyTheory}
+    {lhs mid rhs : Ty}
+    (hLeft : lhs.SubtypeIn theory mid)
+    (hRight : mid.SubtypeIn theory rhs) :
+    lhs.SubtypeIn theory rhs := by
+  intro ν hSound hLhs
+  exact hRight ν hSound (hLeft ν hSound hLhs)
+
 end Ty
 
 namespace KernelTheory

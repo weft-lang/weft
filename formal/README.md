@@ -139,6 +139,10 @@ The first cut lands three things:
     and prove the kernel rule that pure functions are subtypes of effectful
     ones, and more generally that smaller effect sets subtype larger ones for
     fixed function argument/result types.
+    The concrete kernel-tag semantics has also moved a step further than the
+    checker: function tags are now interpreted with semantic argument/result
+    variance, and `ptr`/`rc` tags are interpreted covariantly in their payload
+    types while `mptr` remains invariant.
 24. `Weft/Properties/CoreEffectBootstrap.lean`
     The bootstrap specialization for the staged handled-effect pipeline now
     reaches both layers of the current machine story: not only the external

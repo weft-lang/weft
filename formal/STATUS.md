@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **66%** of the way to the complete theorem.
+Roughly **67%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -29,6 +29,9 @@ That estimate is based on:
 - function types in the kernel theory/model now respect effect-set subtyping,
   so pure functions and effect-bounded functions participate in the executable
   whole-`Ty` checker rather than remaining exact-equality atoms
+- the concrete kernel tag model now also captures semantic function variance
+  and `ptr`/`rc` covariance, even where the executable checker still only knows
+  flatter kernel facts
 - bootstrap-parity reasoning is now instantiated for emitted handled-effect
   machine artifacts over explicit observed `IOEvent` behaviors
 - bootstrap-parity reasoning now also reaches the raw handled-effect machine
@@ -93,6 +96,15 @@ Current frontier:
   whole-`Ty` semantic/checker story now matches one of the kernel’s core
   effect-subtyping commitments rather than leaving function effects outside the
   executable subtype layer.
+
+- semantic variance in the concrete kernel tag model
+  The concrete runtime-tag semantics no longer treats every function and
+  pointer payload as an exact-syntax leaf. Function tags are now interpreted
+  with contravariant arguments, covariant results, and effect-set widening;
+  `ptr` and `rc` tags are interpreted covariantly in their payload types,
+  while `mptr` remains invariant. Concretely: full semantic support has moved
+  closer to the kernel docs even where the executable checker has not yet been
+  taught the same richer recursive obligations.
 
 - raw machine bootstrap parity for handled effects
   The staged handled-effect bootstrap layer no longer speaks only in the

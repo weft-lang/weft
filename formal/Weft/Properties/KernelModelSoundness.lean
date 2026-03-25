@@ -20,6 +20,30 @@ theorem kernel_rc_ptr_tag
   intro hRc
   exact kernel_rc_subtype_ptr inner (KernelTag.valuation tag) (KernelTag.soundValuation tag) hRc
 
+theorem kernel_ptr_covariant_tag
+    (tag : KernelTag)
+    (inner₁ inner₂ : Ty)
+    (hSubtype : inner₁.SubtypeIn KernelTheory.theory inner₂) :
+    Ty.denotesTag tag (Ty.ptr inner₁) ->
+      Ty.denotesTag tag (Ty.ptr inner₂) := by
+  intro hPtr
+  cases tag <;> simp [Ty.denotesTag, Ty.denotesUnder, KernelTag.valuation, TyAtom.denotesTag] at hPtr ⊢
+  case ptr kind innerTag =>
+    exact Ty.subtypeIn_trans hPtr hSubtype
+
+theorem kernel_rc_covariant_tag
+    (tag : KernelTag)
+    (inner₁ inner₂ : Ty)
+    (hSubtype : inner₁.SubtypeIn KernelTheory.theory inner₂) :
+    Ty.denotesTag tag (Ty.rc inner₁) ->
+      Ty.denotesTag tag (Ty.rc inner₂) := by
+  intro hRc
+  cases tag <;> simp [Ty.denotesTag, Ty.denotesUnder, KernelTag.valuation, TyAtom.denotesTag] at hRc ⊢
+  case ptr kind innerTag =>
+    cases kind <;> simp at hRc ⊢
+    case rc =>
+      exact Ty.subtypeIn_trans hRc hSubtype
+
 theorem kernel_fn_effect_subset_tag
     (tag : KernelTag)
     (arg ret : Ty)
@@ -30,6 +54,21 @@ theorem kernel_fn_effect_subset_tag
   intro hFn
   exact kernel_fn_effect_subset_subtype arg ret eff eff' hSubset
     (KernelTag.valuation tag) (KernelTag.soundValuation tag) hFn
+
+theorem kernel_fn_subtype_tag
+    (tag : KernelTag)
+    (arg₁ ret₁ arg₂ ret₂ : Ty)
+    (eff₁ eff₂ : EffectSet)
+    (hArg : arg₂.SubtypeIn KernelTheory.theory arg₁)
+    (hEff : EffectSet.subset eff₁ eff₂)
+    (hRet : ret₁.SubtypeIn KernelTheory.theory ret₂) :
+    Ty.denotesTag tag (Ty.fn arg₁ eff₁ ret₁) ->
+      Ty.denotesTag tag (Ty.fn arg₂ eff₂ ret₂) := by
+  intro hFn
+  cases tag <;> simp [Ty.denotesTag, Ty.denotesUnder, KernelTag.valuation, TyAtom.denotesTag] at hFn ⊢
+  case fn argTag effTag retTag =>
+    rcases hFn with ⟨hArgTag, hEffTag, hRetTag⟩
+    exact ⟨Ty.subtypeIn_trans hArg hArgTag, EffectSet.subset_trans hEffTag hEff, Ty.subtypeIn_trans hRetTag hRet⟩
 
 theorem kernel_mptr_ptr_tag
     (tag : KernelTag)
@@ -42,7 +81,7 @@ theorem kernel_mptr_ptr_tag
 theorem kernel_rc_ptr_runtime
     (inner : Ty) :
     Ty.denotesTag (.ptr .rc inner) (Ty.ptr inner) := by
-  simp [Ty.denotesTag, Ty.denotesUnder, KernelTag.valuation, TyAtom.denotesTag]
+  simp [Ty.denotesTag, Ty.denotesUnder, KernelTag.valuation, TyAtom.denotesTag, Ty.subtypeIn_refl]
 
 theorem kernel_pure_fn_tag
     (tag : KernelTag)
@@ -51,8 +90,11 @@ theorem kernel_pure_fn_tag
     Ty.denotesTag tag (Ty.fn arg Weft.EffectSet.empty ret) ->
       Ty.denotesTag tag (Ty.fn arg effects ret) := by
   intro hFn
-  exact kernel_fn_effect_subset_tag tag arg ret Weft.EffectSet.empty effects
-    (Weft.EffectSet.subset_empty effects) hFn
+  exact kernel_fn_subtype_tag tag arg ret arg ret Weft.EffectSet.empty effects
+    (Ty.subtypeIn_refl KernelTheory.theory arg)
+    (Weft.EffectSet.subset_empty effects)
+    (Ty.subtypeIn_refl KernelTheory.theory ret)
+    hFn
 
 theorem kernel_rc_mptr_empty_tag
     (tag : KernelTag)
@@ -70,19 +112,19 @@ theorem kernel_rc_mptr_empty_tag
 theorem kernel_rc_runtime
     (inner : Ty) :
     Ty.denotesTag (.ptr .rc inner) (Ty.rc inner) := by
-  simp [Ty.denotesTag, Ty.denotesUnder, KernelTag.valuation, TyAtom.denotesTag]
+  simp [Ty.denotesTag, Ty.denotesUnder, KernelTag.valuation, TyAtom.denotesTag, Ty.subtypeIn_refl]
 
 theorem kernel_pure_fn_runtime
     (arg ret : Ty)
     (effects : EffectSet) :
     Ty.denotesTag (.fn arg Weft.EffectSet.empty ret) (Ty.fn arg effects ret) := by
   simp [Ty.denotesTag, Ty.denotesUnder, KernelTag.valuation, TyAtom.denotesTag,
-    Weft.EffectSet.subset_empty]
+    Weft.EffectSet.subset_empty, Ty.subtypeIn_refl]
 
 theorem kernel_mptr_ptr_runtime
     (inner : Ty) :
     Ty.denotesTag (.ptr .mut inner) (Ty.ptr inner) := by
-  simp [Ty.denotesTag, Ty.denotesUnder, KernelTag.valuation, TyAtom.denotesTag]
+  simp [Ty.denotesTag, Ty.denotesUnder, KernelTag.valuation, TyAtom.denotesTag, Ty.subtypeIn_refl]
 
 theorem kernel_mptr_runtime
     (inner : Ty) :
