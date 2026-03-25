@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **63%** of the way to the complete theorem.
+Roughly **64%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -28,8 +28,9 @@ That estimate is based on:
   than only theorem-facing
 - bootstrap-parity reasoning is now instantiated for emitted handled-effect
   machine artifacts over explicit observed `IOEvent` behaviors
-- those emitted-artifact bootstrap lemmas now carry the current typed pure and
-  effect-bounded result contracts, not only extensional behavior equality
+- those emitted-artifact bootstrap lemmas now carry both trace-only and
+  result-carrying purity/effect-boundedness contracts rather than only
+  extensional behavior equality
 - DNF/subtyping work moving beyond the tiny finite core
 - but the real runtime, unsafe/alloc boundaries, continuation semantics, and
   native object-format bridge still being mostly unproved
@@ -63,13 +64,13 @@ Current frontier:
   not just abstract compiler values.
 
 - contract-preserving bootstrap transfer
-  The new emitted-artifact bootstrap layer now carries the fragment’s existing
-  semantic contracts as well: pure trace-freedom, effect-bounded observations,
-  and whole-`Ty` kernel-typed results can be transferred from an earlier
-  compiler generation to a later semantically equivalent emitted artifact.
-  Concretely: bootstrap parity in the current fragment is no longer only about
-  extensional behavior sets; it now preserves the current semantic guarantees
-  we care about.
+  The emitted-artifact bootstrap layer now carries the fragment’s existing
+  semantic contracts in both forms: trace-only purity/effect-boundedness for
+  plain observed behaviors, and purity/effect-boundedness plus whole-`Ty`
+  kernel-typed results for result-carrying behaviors. Concretely: bootstrap
+  parity in the current fragment is no longer only about extensional behavior
+  sets; it preserves the semantic contracts we actually want to keep stable
+  across compiler generations.
 
 - observation-shape exclusion for the handled-effect fragment
   The current `IOEvent` layer now proves not only that observed events are
