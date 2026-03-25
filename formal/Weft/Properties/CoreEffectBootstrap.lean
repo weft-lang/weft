@@ -10,21 +10,11 @@ theorem machine_io_semanticEq_of_surfaceEq
     (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface₁ = .ok code₁)
     (hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface₂ = .ok code₂)
     (hEq : Weft.SemanticEq (surfaceIOSem oracle) surface₁ surface₂) :
-    Weft.SemanticEq (machineIOSem oracle) code₁ code₂ := by
-  intro input behavior
-  constructor
-  · intro hMachine
-    have hSurface₁ : surfaceIOSem oracle surface₁ input behavior :=
-      (staged_io_semantics_iff oracle hCompile₁).2 hMachine
-    have hSurface₂ : surfaceIOSem oracle surface₂ input behavior :=
-      (hEq input behavior).1 hSurface₁
-    exact (staged_io_semantics_iff oracle hCompile₂).1 hSurface₂
-  · intro hMachine
-    have hSurface₂ : surfaceIOSem oracle surface₂ input behavior :=
-      (staged_io_semantics_iff oracle hCompile₂).2 hMachine
-    have hSurface₁ : surfaceIOSem oracle surface₁ input behavior :=
-      (hEq input behavior).2 hSurface₂
-    exact (staged_io_semantics_iff oracle hCompile₁).1 hSurface₁
+    Weft.SemanticEq (machineIOSem oracle) code₁ code₂ :=
+  Weft.compiled_semanticEq_of_sourceEq
+    (staged_whole_io_compiler_theorem oracle)
+    (staged_whole_io_compiler_reflection_theorem oracle)
+    hCompile₁ hCompile₂ hEq
 
 theorem machine_io_result_semanticEq_of_surfaceEq
     (oracle : Oracle)
@@ -33,21 +23,11 @@ theorem machine_io_result_semanticEq_of_surfaceEq
     (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface₁ = .ok code₁)
     (hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface₂ = .ok code₂)
     (hEq : Weft.SemanticEq (surfaceIOResultSem oracle) surface₁ surface₂) :
-    Weft.SemanticEq (machineIOResultSem oracle) code₁ code₂ := by
-  intro input behavior
-  constructor
-  · intro hMachine
-    have hSurface₁ : surfaceIOResultSem oracle surface₁ input behavior :=
-      (staged_io_result_semantics_iff oracle hCompile₁).2 hMachine
-    have hSurface₂ : surfaceIOResultSem oracle surface₂ input behavior :=
-      (hEq input behavior).1 hSurface₁
-    exact (staged_io_result_semantics_iff oracle hCompile₂).1 hSurface₂
-  · intro hMachine
-    have hSurface₂ : surfaceIOResultSem oracle surface₂ input behavior :=
-      (staged_io_result_semantics_iff oracle hCompile₂).2 hMachine
-    have hSurface₁ : surfaceIOResultSem oracle surface₁ input behavior :=
-      (hEq input behavior).2 hSurface₂
-    exact (staged_io_result_semantics_iff oracle hCompile₁).1 hSurface₁
+    Weft.SemanticEq (machineIOResultSem oracle) code₁ code₂ :=
+  Weft.compiled_semanticEq_of_sourceEq
+    (staged_whole_io_result_compiler_theorem oracle)
+    (staged_whole_io_result_compiler_reflection_theorem oracle)
+    hCompile₁ hCompile₂ hEq
 
 theorem machine_semanticEq_of_surfaceEq
     (oracle : Oracle)
@@ -56,21 +36,11 @@ theorem machine_semanticEq_of_surfaceEq
     (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface₁ = .ok code₁)
     (hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface₂ = .ok code₂)
     (hEq : Weft.SemanticEq (surfaceSem oracle) surface₁ surface₂) :
-    Weft.SemanticEq (machineSem oracle) code₁ code₂ := by
-  intro input behavior
-  constructor
-  · intro hMachine
-    have hSurface₁ : surfaceSem oracle surface₁ input behavior :=
-      (staged_semantics_iff oracle hCompile₁).2 hMachine
-    have hSurface₂ : surfaceSem oracle surface₂ input behavior :=
-      (hEq input behavior).1 hSurface₁
-    exact (staged_semantics_iff oracle hCompile₂).1 hSurface₂
-  · intro hMachine
-    have hSurface₂ : surfaceSem oracle surface₂ input behavior :=
-      (staged_semantics_iff oracle hCompile₂).2 hMachine
-    have hSurface₁ : surfaceSem oracle surface₁ input behavior :=
-      (hEq input behavior).2 hSurface₂
-    exact (staged_semantics_iff oracle hCompile₁).1 hSurface₁
+    Weft.SemanticEq (machineSem oracle) code₁ code₂ :=
+  Weft.compiled_semanticEq_of_sourceEq
+    (staged_whole_compiler_theorem oracle)
+    (staged_whole_compiler_reflection_theorem oracle)
+    hCompile₁ hCompile₂ hEq
 
 theorem machine_result_semanticEq_of_surfaceEq
     (oracle : Oracle)
@@ -79,21 +49,11 @@ theorem machine_result_semanticEq_of_surfaceEq
     (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface₁ = .ok code₁)
     (hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface₂ = .ok code₂)
     (hEq : Weft.SemanticEq (surfaceResultSem oracle) surface₁ surface₂) :
-    Weft.SemanticEq (machineResultSem oracle) code₁ code₂ := by
-  intro input behavior
-  constructor
-  · intro hMachine
-    have hSurface₁ : surfaceResultSem oracle surface₁ input behavior :=
-      (staged_result_semantics_iff oracle hCompile₁).2 hMachine
-    have hSurface₂ : surfaceResultSem oracle surface₂ input behavior :=
-      (hEq input behavior).1 hSurface₁
-    exact (staged_result_semantics_iff oracle hCompile₂).1 hSurface₂
-  · intro hMachine
-    have hSurface₂ : surfaceResultSem oracle surface₂ input behavior :=
-      (staged_result_semantics_iff oracle hCompile₂).2 hMachine
-    have hSurface₁ : surfaceResultSem oracle surface₁ input behavior :=
-      (hEq input behavior).2 hSurface₂
-    exact (staged_result_semantics_iff oracle hCompile₁).1 hSurface₁
+    Weft.SemanticEq (machineResultSem oracle) code₁ code₂ :=
+  Weft.compiled_semanticEq_of_sourceEq
+    (staged_whole_result_compiler_theorem oracle)
+    (staged_whole_result_compiler_reflection_theorem oracle)
+    hCompile₁ hCompile₂ hEq
 
 theorem staged_bootstrap_surface_io_semantics_stable
     (oracle : Oracle)

@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **70%** of the way to the complete theorem.
+Roughly **72%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -37,6 +37,11 @@ That estimate is based on:
   model-only variance facts already pay off at the theorem surface
 - bootstrap artifact theorems now preserve those weakened kernel expected-type
   contracts too, so semantic subtype facts survive cross-generation parity
+- the generic compiler theorem layer now supports semantic reflection and
+  whole-pipeline `iff`s, not only one-way preservation
+- emitted-artifact semantic-equivalence transfer is now factored through a
+  reusable generic compilation lemma instead of being reproved separately at
+  each raw/observed behavior layer
 - bootstrap-parity reasoning is now instantiated for emitted handled-effect
   machine artifacts over explicit observed `IOEvent` behaviors
 - bootstrap-parity reasoning now also reaches the raw handled-effect machine
@@ -52,7 +57,7 @@ That estimate is based on:
 
 | Area | Rough Status | What is done |
 |------|--------------|--------------|
-| Compiler composition backbone | 90% | Generic stage-composition theorem and bootstrap-stability shape are in place. |
+| Compiler composition backbone | 93% | Generic stage-composition, stage-reflection, whole-pipeline semantics `iff`, and bootstrap-stability shape are in place. |
 | Pure core source-to-machine correctness | 85% | Concrete compiler, staged pipeline, and typed-result preservation are proved. |
 | Handled-effect core correctness | 80% | Trace-preserving compilation, staged effectful compiler theorem, and machine-level effect/result conformance are proved. |
 | Result-carrying semantic observations | 90% | Successful staged compilations now preserve and reflect trace/result behaviors, representable expected types can be restated at the whole-`Ty` kernel-tag semantic level, the handled-effect fragment has explicit query/reply observation theorems in the generic `IOEvent` space, staged/compiled expected-type theorems now work through an executable whole-`Ty` kernel subtype layer rather than only the finite `CoreSetTy` bridge, and semantic equivalence of surface compiler generations can be transferred to emitted machine artifacts together with the current pure/effect-bounded typed-result contracts. |
@@ -60,11 +65,28 @@ That estimate is based on:
 | Runtime semantics (`IO`, `Alloc`, `Unsafe`) | 23% | We now have a concrete tag-level semantic model for runtime values plus explicit observable query/reply event semantics for the handled-effect fragment, and we can already rule out impossible runtime tag overlaps like `rc`/`mptr` collisions. Full `IO`/allocation/unsafe runtime behaviors are still missing. |
 | Continuations / handler operational model | 10% | Tail-resumptive handled-effect core exists, but full continuation semantics is not yet formalized. |
 | Native backend / object emission bridge | 10% | Machine model exists for core targets, but not a real aarch64/Mach-O semantic bridge. |
-| Self-hosted whole-compiler theorem | 12% | The theorem shape exists, its handled-effect fragment now speaks in generic observable `IOEvent` behaviors, bootstrap-style semantic parity has been instantiated for emitted artifacts of the staged handled-effect pipeline, and the current typed pure/effect-bounded contracts can be transferred across those emitted-artifact parity lemmas. It is still not connected to the real compiler/runtime stack. |
+| Self-hosted whole-compiler theorem | 16% | The theorem shape exists, its handled-effect fragment now speaks in generic observable `IOEvent` behaviors, raw and observed staged pipelines now instantiate reusable whole-pipeline semantics `iff` theorems rather than ad hoc reversals, bootstrap-style semantic parity has been instantiated for emitted artifacts of the staged handled-effect pipeline through a generic compilation-equivalence transfer lemma, and the current typed pure/effect-bounded contracts can be transferred across those emitted-artifact parity lemmas. It is still not connected to the real compiler/runtime stack. |
 
 ## What Each Checkpoint Means
 
 Current frontier:
+
+- generic stage reflection and whole-pipeline semantics equivalence
+  The shared compiler framework no longer stops at one-way
+  `SemanticsPreserving` theorems. It now tracks semantic reflection, composes
+  that reflection across stages, and derives reusable whole-pipeline semantics
+  `iff` theorems. Concretely: “compiled artifact behaves like source” is now a
+  first-class generic theorem shape in the library, not only a pattern we keep
+  reproving manually inside the current handled-effect pipeline.
+
+- generic compiled-artifact equivalence transfer
+  The bootstrap/equivalence story no longer needs one custom proof per
+  behavior layer showing that semantically equivalent sources compile to
+  semantically equivalent artifacts. We now have a reusable generic lemma that
+  transfers source semantic equivalence through any stage or whole pipeline
+  with preservation plus reflection. Concretely: raw machine, observed
+  `IOEvent`, and result-carrying artifact parity now share one compiler-theorem
+  spine instead of four near-duplicates.
 
 - bootstrap parity for observed emitted artifacts
   The generic bootstrap theorem is no longer only a library lemma sitting above

@@ -155,6 +155,17 @@ The first cut lands three things:
     theory-level kernel subtyping and concrete kernel-tag implication, so
     model-level variance facts already flow through cross-generation
     emitted-artifact parity.
+25. `Weft/Compiler.lean`, `Weft/Properties/CompilerCorrectness.lean`,
+    `Weft/Properties/CoreEffectPipelineCorrectness.lean`,
+    `Weft/Properties/CoreEffectIOObservations.lean`,
+    `Weft/Properties/CoreEffectBootstrap.lean`
+    The generic compiler framework now tracks semantic reflection as well as
+    preservation, so we can compose not only whole-compiler preservation but
+    whole-pipeline semantics `iff`s. The staged handled-effect pipeline and its
+    observed `IOEvent` layer now instantiate that generic two-way theorem, and
+    bootstrap artifact-parity transfer has been rewritten against a reusable
+    generic “compile equivalent sources to equivalent artifacts” lemma instead
+    of repeating the source/machine shuttling proof at each observation layer.
 
 ## Near-Term Expansion
 

@@ -79,6 +79,22 @@ theorem parse_stage_preserves_result
   subst artifact
   exact hSurface
 
+theorem parse_stage_reflects
+    (oracle : Oracle) :
+    Weft.SemanticsReflecting (surfaceSem oracle) (sourceSem oracle) parseStage := by
+  intro surface artifact input behavior hCompile hSource
+  simp [parseStage] at hCompile
+  subst artifact
+  exact hSource
+
+theorem parse_stage_reflects_result
+    (oracle : Oracle) :
+    Weft.SemanticsReflecting (surfaceResultSem oracle) (sourceResultSem oracle) parseStage := by
+  intro surface artifact input behavior hCompile hSource
+  simp [parseStage] at hCompile
+  subst artifact
+  exact hSource
+
 theorem typecheck_stage_preserves
     (oracle : Oracle) :
     Weft.SemanticsPreserving (sourceSem oracle) (checkedSem oracle) typecheckStage := by
@@ -102,6 +118,30 @@ theorem typecheck_stage_preserves_result
       simp [typecheckStage, hCheck] at hCompile
       cases hCompile
       exact hSource
+
+theorem typecheck_stage_reflects
+    (oracle : Oracle) :
+    Weft.SemanticsReflecting (sourceSem oracle) (checkedSem oracle) typecheckStage := by
+  intro expr artifact input behavior hCompile hChecked
+  cases hCheck : check expr with
+  | none =>
+      simp [typecheckStage, hCheck] at hCompile
+  | some checked =>
+      simp [typecheckStage, hCheck] at hCompile
+      cases hCompile
+      exact hChecked
+
+theorem typecheck_stage_reflects_result
+    (oracle : Oracle) :
+    Weft.SemanticsReflecting (sourceResultSem oracle) (checkedResultSem oracle) typecheckStage := by
+  intro expr artifact input behavior hCompile hChecked
+  cases hCheck : check expr with
+  | none =>
+      simp [typecheckStage, hCheck] at hCompile
+  | some checked =>
+      simp [typecheckStage, hCheck] at hCompile
+      cases hCompile
+      exact hChecked
 
 theorem lower_eval_preserves
     {oracle : Oracle}
@@ -187,6 +227,60 @@ theorem irEval_to_source
       simpa [IRExpr.toExpr] using
         Eval.handleBool oracle effect value body.toExpr result trace ihBody
 
+theorem lower_stage_reflects
+    (oracle : Oracle) :
+    Weft.SemanticsReflecting (checkedSem oracle) (irSem oracle) lowerStage := by
+  intro checked artifact input behavior hCompile hIr
+  simp [lowerStage] at hCompile
+  subst artifact
+  rcases hIr with ⟨value, trace, hEval, hBehavior⟩
+  exact ⟨value, trace, by
+    simpa [lower_toExpr] using (irEval_to_source hEval : Eval oracle (lower checked.expr).toExpr value trace), hBehavior⟩
+
+theorem lower_stage_reflects_result
+    (oracle : Oracle) :
+    Weft.SemanticsReflecting (checkedResultSem oracle) (irResultSem oracle) lowerStage := by
+  intro checked artifact input behavior hCompile hIr
+  simp [lowerStage] at hCompile
+  subst artifact
+  rcases hIr with ⟨value, trace, hEval, hBehavior⟩
+  exact ⟨value, trace, by
+    simpa [lower_toExpr] using (irEval_to_source hEval : Eval oracle (lower checked.expr).toExpr value trace), hBehavior⟩
+
+theorem sourceEval_to_irEval
+    {oracle : Oracle}
+    {ir : IRExpr}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hEval : Eval oracle ir.toExpr value trace) :
+    IREval oracle ir value trace := by
+  induction ir generalizing oracle value trace with
+  | const runtime =>
+      cases runtime <;> cases hEval <;> simpa [IRExpr.toExpr] using IREval.const oracle _
+  | add lhs rhs ihL ihR =>
+      cases hEval with
+      | add oracle lhsExpr rhsExpr lhsVal rhsVal traceL traceR hL hR =>
+          simpa [IRExpr.toExpr] using
+            IREval.add oracle lhs rhs lhsVal rhsVal traceL traceR (ihL hL) (ihR hR)
+  | ite cond thenBranch elseBranch ihCond ihThen ihElse =>
+      cases hEval with
+      | ifTrue oracle condExpr thenExpr elseExpr value traceCond traceThen hCond hThen =>
+          simpa [IRExpr.toExpr] using
+            IREval.ifTrue oracle cond thenBranch elseBranch value traceCond traceThen
+              (ihCond hCond) (ihThen hThen)
+      | ifFalse oracle condExpr thenExpr elseExpr value traceCond traceElse hCond hElse =>
+          simpa [IRExpr.toExpr] using
+            IREval.ifFalse oracle cond thenBranch elseBranch value traceCond traceElse
+              (ihCond hCond) (ihElse hElse)
+  | performBool effect =>
+      cases hEval
+      simpa [IRExpr.toExpr] using IREval.performBool oracle effect
+  | handleBool effect handled body ihBody =>
+      cases hEval with
+      | handleBool oracle _ _ _ _ trace hBody =>
+          simpa [IRExpr.toExpr] using
+            IREval.handleBool oracle effect handled body value trace (ihBody hBody)
+
 theorem emitIR_eq_compile_toExpr
     (ir : IRExpr)
     (k : Code) :
@@ -254,6 +348,36 @@ theorem emit_stage_preserves_result
   rcases hIr with ⟨value, trace, hEval, hBehavior⟩
   exact ⟨value, trace, emit_correct oracle ir value trace hEval, hBehavior⟩
 
+theorem emit_stage_reflects
+    (oracle : Oracle) :
+    Weft.SemanticsReflecting (irSem oracle) (machineSem oracle) emitStage := by
+  intro ir artifact input behavior hCompile hMachine
+  simp [emitStage, emitClosed] at hCompile
+  subst artifact
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  have hExecCompile : Exec oracle (compileClosed ir.toExpr) [] [value] trace := by
+    simpa [compileClosed] using
+      (show Exec oracle (compile ir.toExpr .halt) [] [value] trace from by
+        simpa [emitIR_eq_compile_toExpr] using hExec)
+  have hSource : Eval oracle ir.toExpr value trace :=
+    compile_complete oracle ir.toExpr value trace hExecCompile
+  exact ⟨value, trace, sourceEval_to_irEval hSource, hBehavior⟩
+
+theorem emit_stage_reflects_result
+    (oracle : Oracle) :
+    Weft.SemanticsReflecting (irResultSem oracle) (machineResultSem oracle) emitStage := by
+  intro ir artifact input behavior hCompile hMachine
+  simp [emitStage, emitClosed] at hCompile
+  subst artifact
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  have hExecCompile : Exec oracle (compileClosed ir.toExpr) [] [value] trace := by
+    simpa [compileClosed] using
+      (show Exec oracle (compile ir.toExpr .halt) [] [value] trace from by
+        simpa [emitIR_eq_compile_toExpr] using hExec)
+  have hSource : Eval oracle ir.toExpr value trace :=
+    compile_complete oracle ir.toExpr value trace hExecCompile
+  exact ⟨value, trace, sourceEval_to_irEval hSource, hBehavior⟩
+
 theorem staged_whole_compiler_theorem
     (oracle : Oracle) :
     Weft.SemanticsPreserving (surfaceSem oracle) (machineSem oracle)
@@ -287,6 +411,40 @@ theorem staged_whole_result_compiler_theorem
       (typecheck_stage_preserves_result oracle)
       (lower_stage_preserves_result oracle)
       (emit_stage_preserves_result oracle))
+
+theorem staged_whole_compiler_reflection_theorem
+    (oracle : Oracle) :
+    Weft.SemanticsReflecting (surfaceSem oracle) (machineSem oracle)
+      (Weft.CompilerPipeline.compile stagedCompilerPipeline) := by
+  simpa using
+    (Weft.whole_compiler_reflection_theorem
+      stagedCompilerPipeline
+      (surfaceSem oracle)
+      (sourceSem oracle)
+      (checkedSem oracle)
+      (irSem oracle)
+      (machineSem oracle)
+      (parse_stage_reflects oracle)
+      (typecheck_stage_reflects oracle)
+      (lower_stage_reflects oracle)
+      (emit_stage_reflects oracle))
+
+theorem staged_whole_result_compiler_reflection_theorem
+    (oracle : Oracle) :
+    Weft.SemanticsReflecting (surfaceResultSem oracle) (machineResultSem oracle)
+      (Weft.CompilerPipeline.compile stagedCompilerPipeline) := by
+  simpa using
+    (Weft.whole_compiler_reflection_theorem
+      stagedCompilerPipeline
+      (surfaceResultSem oracle)
+      (sourceResultSem oracle)
+      (checkedResultSem oracle)
+      (irResultSem oracle)
+      (machineResultSem oracle)
+      (parse_stage_reflects_result oracle)
+      (typecheck_stage_reflects_result oracle)
+      (lower_stage_reflects_result oracle)
+      (emit_stage_reflects_result oracle))
 
 theorem staged_compile_eq_emitClosed
     {surface : SurfaceExpr}
@@ -324,12 +482,22 @@ theorem staged_semantics_iff
     {behavior : EffectBehavior}
     (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code) :
     surfaceSem oracle surface input behavior ↔ machineSem oracle code input behavior := by
-  constructor
-  · intro hSurface
-    exact staged_whole_compiler_theorem oracle surface code input behavior hCompile hSurface
-  · intro hMachine
-    rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
-    exact ⟨value, trace, staged_compile_complete hCompile hExec, hBehavior⟩
+  exact Weft.whole_compiler_semantics_iff
+    stagedCompilerPipeline
+    (surfaceSem oracle)
+    (sourceSem oracle)
+    (checkedSem oracle)
+    (irSem oracle)
+    (machineSem oracle)
+    (parse_stage_preserves oracle)
+    (typecheck_stage_preserves oracle)
+    (lower_stage_preserves oracle)
+    (emit_stage_preserves oracle)
+    (parse_stage_reflects oracle)
+    (typecheck_stage_reflects oracle)
+    (lower_stage_reflects oracle)
+    (emit_stage_reflects oracle)
+    hCompile
 
 theorem staged_result_semantics_iff
     (oracle : Oracle)
@@ -339,11 +507,21 @@ theorem staged_result_semantics_iff
     {behavior : ResultBehavior}
     (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code) :
     surfaceResultSem oracle surface input behavior ↔ machineResultSem oracle code input behavior := by
-  constructor
-  · intro hSurface
-    exact staged_whole_result_compiler_theorem oracle surface code input behavior hCompile hSurface
-  · intro hMachine
-    rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
-    exact ⟨value, trace, staged_compile_complete hCompile hExec, hBehavior⟩
+  exact Weft.whole_compiler_semantics_iff
+    stagedCompilerPipeline
+    (surfaceResultSem oracle)
+    (sourceResultSem oracle)
+    (checkedResultSem oracle)
+    (irResultSem oracle)
+    (machineResultSem oracle)
+    (parse_stage_preserves_result oracle)
+    (typecheck_stage_preserves_result oracle)
+    (lower_stage_preserves_result oracle)
+    (emit_stage_preserves_result oracle)
+    (parse_stage_reflects_result oracle)
+    (typecheck_stage_reflects_result oracle)
+    (lower_stage_reflects_result oracle)
+    (emit_stage_reflects_result oracle)
+    hCompile
 
 end Weft.CoreEffects

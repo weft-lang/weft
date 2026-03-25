@@ -72,6 +72,22 @@ theorem staged_whole_io_result_compiler_theorem
   rcases hSurface with ⟨value, trace, hEval, hBehavior⟩
   exact ⟨value, trace, staged_compile_correct hCompile hEval, hBehavior⟩
 
+theorem staged_whole_io_compiler_reflection_theorem
+    (oracle : Oracle) :
+    Weft.SemanticsReflecting (surfaceIOSem oracle) (machineIOSem oracle)
+      (Weft.CompilerPipeline.compile stagedCompilerPipeline) := by
+  intro surface code input behavior hCompile hMachine
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  exact ⟨value, trace, staged_compile_complete hCompile hExec, hBehavior⟩
+
+theorem staged_whole_io_result_compiler_reflection_theorem
+    (oracle : Oracle) :
+    Weft.SemanticsReflecting (surfaceIOResultSem oracle) (machineIOResultSem oracle)
+      (Weft.CompilerPipeline.compile stagedCompilerPipeline) := by
+  intro surface code input behavior hCompile hMachine
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  exact ⟨value, trace, staged_compile_complete hCompile hExec, hBehavior⟩
+
 theorem staged_io_semantics_iff
     (oracle : Oracle)
     {surface : SurfaceExpr}
@@ -80,12 +96,10 @@ theorem staged_io_semantics_iff
     {behavior : Weft.Behavior}
     (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code) :
     surfaceIOSem oracle surface input behavior ↔ machineIOSem oracle code input behavior := by
-  constructor
-  · intro hSurface
-    exact staged_whole_io_compiler_theorem oracle surface code input behavior hCompile hSurface
-  · intro hMachine
-    rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
-    exact ⟨value, trace, staged_compile_complete hCompile hExec, hBehavior⟩
+  exact Weft.stage_semantics_iff
+    (staged_whole_io_compiler_theorem oracle)
+    (staged_whole_io_compiler_reflection_theorem oracle)
+    hCompile
 
 theorem staged_io_result_semantics_iff
     (oracle : Oracle)
@@ -96,12 +110,10 @@ theorem staged_io_result_semantics_iff
     (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code) :
     surfaceIOResultSem oracle surface input behavior ↔
       machineIOResultSem oracle code input behavior := by
-  constructor
-  · intro hSurface
-    exact staged_whole_io_result_compiler_theorem oracle surface code input behavior hCompile hSurface
-  · intro hMachine
-    rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
-    exact ⟨value, trace, staged_compile_complete hCompile hExec, hBehavior⟩
+  exact Weft.stage_semantics_iff
+    (staged_whole_io_result_compiler_theorem oracle)
+    (staged_whole_io_result_compiler_reflection_theorem oracle)
+    hCompile
 
 theorem machine_io_behavior_events_are_effect_queries
     {oracle : Oracle}

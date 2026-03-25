@@ -45,6 +45,17 @@ def SemanticsPreserving
     sourceSem source input behavior ->
     targetSem artifact input behavior
 
+def SemanticsReflecting
+    {Obs : Type}
+    {α γ : Type}
+    (sourceSem : Semantics α Obs)
+    (targetSem : Semantics γ Obs)
+    (stage : Stage α γ) : Prop :=
+  ∀ source artifact input behavior,
+    stage.compile source = .ok artifact ->
+    targetSem artifact input behavior ->
+    sourceSem source input behavior
+
 def SemanticEq {Obs : Type} {α : Type} (sem : Semantics α Obs) (lhs rhs : α) : Prop :=
   ∀ input behavior, sem lhs input behavior ↔ sem rhs input behavior
 
