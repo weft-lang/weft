@@ -11,8 +11,10 @@ echo "=== weft1 regression tests ==="
 PASS=0; FAIL=0
 run_test() {
   local name="$1" expected="$2" input="$3"
-  echo "$input" | /tmp/weft1 > /tmp/t && chmod +x /tmp/t
-  local got=$(/tmp/t 2>/dev/null; echo $?)
+  local tmpbin=$(mktemp /tmp/weft_test_XXXXXX)
+  echo "$input" | /tmp/weft1 > "$tmpbin" 2>/dev/null && chmod +x "$tmpbin"
+  local got=$("$tmpbin" 2>/dev/null; echo $?)
+  rm -f "$tmpbin"
   if [ "$got" = "$expected" ]; then
     echo "  ✓ $name = $got"
     PASS=$((PASS+1))
@@ -38,8 +40,10 @@ echo "=== weft2 comprehensive tests ==="
 PASS2=0; FAIL2=0
 run_test2() {
   local name="$1" expected="$2" input="$3"
-  echo "$input" | /tmp/weft2 > /tmp/t2 && chmod +x /tmp/t2
-  local got=$(/tmp/t2 2>/dev/null; echo $?)
+  local tmpbin=$(mktemp /tmp/weft_test_XXXXXX)
+  echo "$input" | timeout 10 /tmp/weft2 > "$tmpbin" 2>/dev/null && chmod +x "$tmpbin"
+  local got=$(timeout 5 "$tmpbin" 2>/dev/null; echo $?)
+  rm -f "$tmpbin"
   if [ "$got" = "$expected" ]; then
     PASS2=$((PASS2+1))
   else
@@ -50,10 +54,11 @@ run_test2() {
 # Test that a program crashes (non-zero exit, used for trap tests)
 run_test_crash() {
   local name="$1" input="$2"
-  echo "$input" | /tmp/weft2 > /tmp/t_crash && chmod +x /tmp/t_crash
-  # Run in subshell with set +e to prevent set -e from killing script on signal
+  local tmpbin=$(mktemp /tmp/weft_test_XXXXXX)
+  echo "$input" | /tmp/weft2 > "$tmpbin" 2>/dev/null && chmod +x "$tmpbin"
   local got
-  got=$( (set +e; /tmp/t_crash >/dev/null 2>/dev/null; echo $?) 2>/dev/null )
+  got=$( (set +e; "$tmpbin" >/dev/null 2>/dev/null; echo $?) 2>/dev/null )
+  rm -f "$tmpbin"
   if [ "$got" != "0" ]; then
     PASS2=$((PASS2+1))
   else
