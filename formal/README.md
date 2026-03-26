@@ -208,6 +208,14 @@ The first cut lands three things:
     results. Concretely: the recursive-kernel checker/model bridge now reaches
     the current end-to-end observation language, not only the underlying raw
     machine result semantics.
+30. `Weft/Properties/CoreEffectBootstrap.lean`
+    The same observable result contracts now survive bootstrap parity too.
+    Cross-generation semantic equivalence of surface compilers now preserves
+    checked pointer covariance, `rc` covariance, and function
+    argument/effect/result variance directly at the observed `IOEvent` result
+    layer. Concretely: these richer checked contracts are now stable not only
+    for one compiled artifact, but across the current self-hosted bootstrap
+    theorem path.
 
 ## Near-Term Expansion
 
