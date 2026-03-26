@@ -185,6 +185,149 @@ fn emit_macho(code: i64, main_off: i64) -> i64 {
   emit_macho2(code, main_off, cs, ts, so)
 }
 
+-- Emit Mach-O with real LINKEDIT data (GOT, bind info, symbol table)
+-- ngot = number of GOT entries to emit
+fn emit_macho_linked(code: i64, main_off: i64, fm: i64) -> i64 {
+  let cs = buf_len(code)
+  let ts = page_round(16384 + cs)
+  let so = ts + 16384
+  let ngot_patches = __mem_load64(fm + 128)
+  -- If no GOT entries, fall back to simple emission
+  if ngot_patches == 0 { emit_macho2(code, main_off, cs, ts, so) }
+  else {
+    -- Always emit all 3 GOT slots (posix_spawn=0, waitpid=1, exit=2)
+    let ngot = 3
+    -- LINKEDIT layout: bind(40) + indirect(ngot*4 padded to 8) + symtab(ngot*16) + strtab(padded)
+    let bind_size = 39
+    let bind_padded = 40
+    let indirect_size = ngot * 4
+    let indirect_padded = (indirect_size + 7) / 8 * 8
+    let symtab_size = ngot * 16
+    -- String table: \0 + "_posix_spawn\0" + "_waitpid\0" + "_exit\0" = 1+13+9+6 = 29
+    let strtab_size = 32
+    let linkedit_pre = bind_padded + indirect_padded + symtab_size + strtab_size
+    let codesig_off = so + linkedit_pre
+    let nh = (codesig_off + 4095) / 4096
+    let ss = 20 + 93 + nh * 32
+    let ll = page_round(linkedit_pre + ss)
+    let o = buf_new(so + ll + 4096)
+    -- Header: 11 load commands, updated sizeofcmds
+    bu32(o, 4277009103) bu32(o, 16777228) bu32(o, 0) bu32(o, 2)
+    bu32(o, 11) bu32(o, 728) bu32(o, 2097285) bu32(o, 0)
+    -- Segments
+    emit_pz(o) emit_text_seg(o, ts) emit_text_sec(o, cs)
+    emit_data_seg(o, ts) emit_got_sec(o, ts, ngot)
+    emit_linkedit_signed(o, ts, so, ll)
+    -- Load commands with real offsets
+    emit_main_lc(o, main_off)
+    emit_symtab_real(o, so + bind_padded + indirect_padded, ngot, so + bind_padded + indirect_padded + symtab_size, strtab_size)
+    emit_dylinker(o) emit_dylib(o)
+    emit_dyld_info_real(o, so, bind_size)
+    emit_dysymtab(o, so + bind_padded, ngot)
+    emit_codesig_lc(o, codesig_off, ss)
+    -- Pad to page boundary then copy code section
+    bpad(o, 16384)
+    bscopy(o, buf_ptr(code), cs, 0)
+    bpad(o, ts)
+    -- GOT entries (zero-filled — dyld binds at load time)
+    bpad(o, so)
+    -- LINKEDIT data
+    emit_bind_data(o)
+    bpad(o, so + bind_padded)
+    emit_indirect_data(o, ngot)
+    bpad(o, so + bind_padded + indirect_padded)
+    emit_nlist_data(o, ngot)
+    emit_strtab_data(o)
+    bpad(o, codesig_off)
+    -- Code signature
+    emit_codesig(o, codesig_off, 16384, ts - 16384)
+    bpad(o, so + ll)
+    o
+  }
+}
+
+-- __got section header (replaces __const)
+fn emit_got_sec(o: i64, ts: i64, ngot: i64) -> i64 {
+  bstr(o, "__got") bfill(o, 11)
+  bstr(o, "__DATA") bfill(o, 10)
+  bu64(o, 4294967296 + ts) bu64(o, ngot * 8)
+  bu32(o, ts) bu32(o, 3)
+  bu32(o, 0) bu32(o, 0)
+  bu32(o, 6)
+  bu32(o, 0) bu32(o, 0) bu32(o, 0)
+}
+
+-- LC_SYMTAB with real offsets
+fn emit_symtab_real(o: i64, symoff: i64, nsyms: i64, stroff: i64, strsize: i64) -> i64 {
+  bu32(o, 2) bu32(o, 24) bu32(o, symoff) bu32(o, nsyms) bu32(o, stroff) bu32(o, strsize)
+}
+
+-- LC_DYLD_INFO_ONLY with bind offsets
+fn emit_dyld_info_real(o: i64, bind_off: i64, bind_size: i64) -> i64 {
+  bu32(o, 2147483682) bu32(o, 48)
+  bu32(o, 0) bu32(o, 0)
+  bu32(o, bind_off) bu32(o, bind_size)
+  bu32(o, 0) bu32(o, 0)
+  bu32(o, 0) bu32(o, 0)
+  bu32(o, 0) bu32(o, 0)
+}
+
+-- LC_DYSYMTAB
+fn emit_dysymtab(o: i64, indirect_off: i64, ngot: i64) -> i64 {
+  bu32(o, 11) bu32(o, 80)
+  bu32(o, 0) bu32(o, 0)
+  bu32(o, 0) bu32(o, 0)
+  bu32(o, 0) bu32(o, ngot)
+  bu32(o, 0) bu32(o, 0)
+  bu32(o, 0) bu32(o, 0)
+  bu32(o, 0) bu32(o, 0)
+  bu32(o, indirect_off) bu32(o, ngot)
+  bu32(o, 0) bu32(o, 0)
+  bu32(o, 0) bu32(o, 0)
+}
+
+-- Non-lazy bind info for 3 symbols
+fn emit_bind_data(o: i64) -> i64 {
+  -- SET_DYLIB_ORDINAL_IMM(1)
+  bu8(o, 17)
+  -- SET_TYPE_IMM(POINTER=1)
+  bu8(o, 81)
+  -- SET_SEGMENT_AND_OFFSET_ULEB(seg=2, offset=0)
+  bu8(o, 114) bu8(o, 0)
+  -- Symbol 0: _posix_spawn
+  bu8(o, 64) bstr(o, "_posix_spawn") bu8(o, 0) bu8(o, 144)
+  -- Symbol 1: _waitpid (DO_BIND advances by pointer size, so next slot auto)
+  bu8(o, 64) bstr(o, "_waitpid") bu8(o, 0) bu8(o, 144)
+  -- Symbol 2: _exit
+  bu8(o, 64) bstr(o, "_exit") bu8(o, 0) bu8(o, 144)
+  -- Done
+  bu8(o, 0)
+  0
+}
+
+-- Indirect symbol table (ngot entries)
+fn emit_indirect_data(o: i64, ngot: i64) -> i64 {
+  for i in 0..ngot { bu32(o, i) }
+  0
+}
+
+-- nlist_64 entries (each 16 bytes)
+fn emit_nlist_data(o: i64, ngot: i64) -> i64 {
+  -- _posix_spawn (strx=1, n_type=0x01, n_sect=0, n_desc=0x0100, n_value=0)
+  bu32(o, 1) bu8(o, 1) bu8(o, 0) bu8(o, 0) bu8(o, 1) bu64(o, 0)
+  -- _waitpid (strx=14)
+  bu32(o, 14) bu8(o, 1) bu8(o, 0) bu8(o, 0) bu8(o, 1) bu64(o, 0)
+  -- _exit (strx=23)
+  bu32(o, 23) bu8(o, 1) bu8(o, 0) bu8(o, 0) bu8(o, 1) bu64(o, 0)
+  0
+}
+
+-- String table
+fn emit_strtab_data(o: i64) -> i64 {
+  bu8(o, 0) bstr(o, "_posix_spawn") bu8(o, 0) bstr(o, "_waitpid") bu8(o, 0) bstr(o, "_exit") bu8(o, 0)
+  0
+}
+
 fn emit_macho2(code: i64, main_off: i64, cs: i64, ts: i64, so: i64) -> i64 {
   let nh = (so + 4095) / 4096
   let ss = 20 + 93 + nh * 32

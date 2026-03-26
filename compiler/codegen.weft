@@ -202,7 +202,7 @@ fn str_hash(src: i64, start: i64, len: i64) -> i64 {
 -- ======================================================================
 
 fn fmap_new() -> i64 {
-  let h = __bump_alloc(120)
+  let h = __bump_alloc(144)
   let d = __bump_alloc(64000)
   __mem_store64(h, d)
   __mem_store64(h + 8, 0)
@@ -228,6 +228,11 @@ fn fmap_new() -> i64 {
   __mem_store64(h + 96, 0)
   __mem_store64(h + 104, 0)
   __mem_store64(h + 112, 0)
+  -- GOT patch list (offset 120): [code_position(8), got_index(8)] pairs
+  let gp = __bump_alloc(1024)
+  __mem_store64(h + 120, gp)
+  __mem_store64(h + 128, 0)
+  __mem_store64(h + 136, 64)
   h
 }
 fn fmap_set_tt(fm: i64, tt: i64) -> i64 { __mem_store64(fm + 48, tt) 0 }
@@ -2580,16 +2585,19 @@ fn cg_call(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64
         -- Variable in scope, not in fmap → closure call
         cg_call_closure(node, code, scope, src, ctr, fm, var_reg)
       } else {
-        -- Both in scope and fmap (e.g., function param shadowing) → direct call
+        -- Both in scope and fmap → direct call (GOT check first)
         cg_call_args(args, nargs, code, scope, src, ctr, fm, 0)
-        if is_intrinsic(src, ns, nl) == 1 { cg_intrinsic(code, src, ns, nl, ctr) }
-        else { cg_call_emit(code, src, ns, nl, fm, ctr) }
+        if got_index(src, ns, nl) >= 0 { cg_call_emit(code, src, ns, nl, fm, ctr) }
+        else { if is_intrinsic(src, ns, nl) == 1 { cg_intrinsic(code, src, ns, nl, ctr) }
+        else { cg_call_emit(code, src, ns, nl, fm, ctr) } }
       }
     } else {
-      -- Not in scope → direct function call (or forward ref)
+      -- Not in scope → direct function call, GOT call, or intrinsic
       cg_call_args(args, nargs, code, scope, src, ctr, fm, 0)
-      if is_intrinsic(src, ns, nl) == 1 { cg_intrinsic(code, src, ns, nl, ctr) }
-      else { cg_call_emit(code, src, ns, nl, fm, ctr) }
+      -- Check GOT first (before intrinsic, since __got_* starts with __)
+      if got_index(src, ns, nl) >= 0 { cg_call_emit(code, src, ns, nl, fm, ctr) }
+      else { if is_intrinsic(src, ns, nl) == 1 { cg_intrinsic(code, src, ns, nl, ctr) }
+      else { cg_call_emit(code, src, ns, nl, fm, ctr) } }
     }
   }
 }
@@ -2642,17 +2650,64 @@ fn cg_call_args(args: i64, nargs: i64, code: i64, scope: i64, src: i64, ctr: i64
   c
 }
 
+-- Check if a function name is a GOT import (__got_posix_spawn, etc.)
+-- Returns GOT index (0+) or -1 if not a GOT call.
+fn got_index(src: i64, ns: i64, nl: i64) -> i64 {
+  if nl > 6 {
+    if src_eq_at(src, ns, __str_ptr("__got_"), 0, 6) == 1 {
+      -- Matches __got_ prefix. Check which symbol:
+      let rest_ns = ns + 6
+      let rest_nl = nl - 6
+      if src_eq(src, rest_ns, rest_nl, "posix_spawn") == 1 { 0 }
+      else { if src_eq(src, rest_ns, rest_nl, "waitpid") == 1 { 1 }
+      else { if src_eq(src, rest_ns, rest_nl, "exit") == 1 { 2 }
+      else { 0 - 1 } } }
+    } else { 0 - 1 }
+  } else { 0 - 1 }
+}
+
+-- Record a GOT ADRP instruction that needs patching once ts is known
+fn fmap_add_got_patch(fm: i64, code_pos: i64, gi: i64) -> i64 {
+  let gp = __mem_load64(fm + 120)
+  let gn = __mem_load64(fm + 128)
+  let gcap = __mem_load64(fm + 136)
+  if gn >= gcap {
+    let new_cap = gcap * 2
+    let new_gp = __bump_alloc(new_cap * 16)
+    mem_copy(new_gp, gp, gn * 16)
+    __mem_store64(fm + 120, new_gp)
+    __mem_store64(fm + 136, new_cap)
+    0
+  } else { 0 }
+  let gpd = __mem_load64(fm + 120)
+  __mem_store64(gpd + gn * 16, code_pos)
+  __mem_store64(gpd + gn * 16 + 8, gi)
+  __mem_store64(fm + 128, gn + 1)
+  0
+}
+
 fn cg_call_emit(code: i64, src: i64, ns: i64, nl: i64, fm: i64, ctr: i64) -> i64 {
-  -- BL to function (may be forward reference)
-  let target = fmap_lookup(fm, src, ns, nl)
-  let cur = buf_len(code)
-  if target == 0 {
-    fmap_add_patch(fm, cur, src, ns, nl)
-    bu32(code, encode_bl(0))
+  -- Check for GOT call (__got_posix_spawn, etc.)
+  let gi = got_index(src, ns, nl)
+  if gi >= 0 {
+    -- GOT call: ADRP x16, <GOT page> (placeholder); LDR x16, [x16, #offset]; BLR x16
+    let adrp_pos = buf_len(code)
+    bu32(code, 0)
+    fmap_add_got_patch(fm, adrp_pos, gi)
+    bu32(code, encode_ldr(16, 16, gi * 8))
+    bu32(code, encode_blr(16))
   } else {
-    bu32(code, encode_bl(target - cur))
+    -- Regular BL to function (may be forward reference)
+    let target = fmap_lookup(fm, src, ns, nl)
+    let cur = buf_len(code)
+    if target == 0 {
+      fmap_add_patch(fm, cur, src, ns, nl)
+      bu32(code, encode_bl(0))
+    } else {
+      bu32(code, encode_bl(target - cur))
+    }
   }
-  -- Move result from x0 to the ORIGINAL ctr (args are dead after BL)
+  -- Move result from x0 to the ORIGINAL ctr (args are dead after call)
   if ctr < 8 {
     bu32(code, encode_add_imm(ctr + 19, 0, 0))
   } else {
