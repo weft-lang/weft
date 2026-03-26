@@ -386,4 +386,202 @@ theorem staged_io_result_behavior_trace_free_and_kernel_typed_when_pure_tag
   cases hBehavior
   exact ⟨by simp [hTraceNil, observeIOTrace], hConforms.2⟩
 
+theorem staged_io_result_behavior_only_reports_inferred_effects_and_ptr_covariant_kernel_expected_type_tag
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {inner₁ inner₂ : Weft.Ty}
+    {effects : Weft.EffectSet}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : IOResultBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hCheck : kernelCheckAgainst (parseSurface surface) (Weft.Ty.ptr inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hEffects : inferEffects (parseSurface surface) = some effects)
+    (hMachine : machineIOResultSem oracle code input behavior) :
+    (∀ event, event ∈ behavior.trace ->
+      ∃ effect : Weft.EffectName,
+        effect ∈ effects.elems ∧ event = Weft.IOEvent.effectQuery effect (oracle effect)) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.ptr inner₂) := by
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  have hEval : Eval oracle (parseSurface surface) value trace :=
+    staged_compile_complete hCompile hExec
+  rcases inferEffects_sound hEffects with ⟨ty, hTy⟩
+  have hTyped : Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.ptr inner₂) :=
+    (staged_machine_result_respects_effects_and_tag_weakened_kernel_expected_type_tag
+      hCompile hCheck
+      (Weft.SafetyCore.tag_subtype_of_ptr_covariant_kernelSubtypeb hSubtype)
+      hEffects hExec).2
+  cases hBehavior
+  constructor
+  · intro event hMem
+    have hObserved :
+        ∃ effect : Weft.EffectName,
+          effect ∈ trace ∧ event = Weft.IOEvent.effectQuery effect (oracle effect) :=
+      mem_observeIOTrace_iff.mp hMem
+    rcases hObserved with ⟨effect, hInTrace, rfl⟩
+    exact ⟨effect, trace_subset_of_typed_effects hTy hEval effect hInTrace, rfl⟩
+  · exact hTyped
+
+theorem staged_io_result_behavior_trace_free_and_ptr_covariant_kernel_typed_when_pure_tag
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {inner₁ inner₂ : Weft.Ty}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : IOResultBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hCheck : kernelCheckAgainst (parseSurface surface) (Weft.Ty.ptr inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hPure : inferEffects (parseSurface surface) = some Weft.EffectSet.empty)
+    (hMachine : machineIOResultSem oracle code input behavior) :
+    behavior.trace = [] ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.ptr inner₂) := by
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  have hConforms :
+      (∀ effect : Weft.EffectName, effect ∉ trace) ∧
+        Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.ptr inner₂) :=
+    staged_machine_pure_result_respects_tag_weakened_kernel_expected_type_tag
+      hCompile hCheck
+      (Weft.SafetyCore.tag_subtype_of_ptr_covariant_kernelSubtypeb hSubtype)
+      hPure hExec
+  have hTraceNil : trace = [] :=
+    trace_eq_nil_of_forall_not_mem hConforms.1
+  cases hBehavior
+  exact ⟨by simp [hTraceNil, observeIOTrace], hConforms.2⟩
+
+theorem staged_io_result_behavior_only_reports_inferred_effects_and_rc_covariant_kernel_expected_type_tag
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {inner₁ inner₂ : Weft.Ty}
+    {effects : Weft.EffectSet}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : IOResultBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hCheck : kernelCheckAgainst (parseSurface surface) (Weft.Ty.rc inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hEffects : inferEffects (parseSurface surface) = some effects)
+    (hMachine : machineIOResultSem oracle code input behavior) :
+    (∀ event, event ∈ behavior.trace ->
+      ∃ effect : Weft.EffectName,
+        effect ∈ effects.elems ∧ event = Weft.IOEvent.effectQuery effect (oracle effect)) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.rc inner₂) := by
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  have hEval : Eval oracle (parseSurface surface) value trace :=
+    staged_compile_complete hCompile hExec
+  rcases inferEffects_sound hEffects with ⟨ty, hTy⟩
+  have hTyped : Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.rc inner₂) :=
+    (staged_machine_result_respects_effects_and_tag_weakened_kernel_expected_type_tag
+      hCompile hCheck
+      (Weft.SafetyCore.tag_subtype_of_rc_covariant_kernelSubtypeb hSubtype)
+      hEffects hExec).2
+  cases hBehavior
+  constructor
+  · intro event hMem
+    have hObserved :
+        ∃ effect : Weft.EffectName,
+          effect ∈ trace ∧ event = Weft.IOEvent.effectQuery effect (oracle effect) :=
+      mem_observeIOTrace_iff.mp hMem
+    rcases hObserved with ⟨effect, hInTrace, rfl⟩
+    exact ⟨effect, trace_subset_of_typed_effects hTy hEval effect hInTrace, rfl⟩
+  · exact hTyped
+
+theorem staged_io_result_behavior_trace_free_and_rc_covariant_kernel_typed_when_pure_tag
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {inner₁ inner₂ : Weft.Ty}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : IOResultBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hCheck : kernelCheckAgainst (parseSurface surface) (Weft.Ty.rc inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hPure : inferEffects (parseSurface surface) = some Weft.EffectSet.empty)
+    (hMachine : machineIOResultSem oracle code input behavior) :
+    behavior.trace = [] ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.rc inner₂) := by
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  have hConforms :
+      (∀ effect : Weft.EffectName, effect ∉ trace) ∧
+        Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.rc inner₂) :=
+    staged_machine_pure_result_respects_tag_weakened_kernel_expected_type_tag
+      hCompile hCheck
+      (Weft.SafetyCore.tag_subtype_of_rc_covariant_kernelSubtypeb hSubtype)
+      hPure hExec
+  have hTraceNil : trace = [] :=
+    trace_eq_nil_of_forall_not_mem hConforms.1
+  cases hBehavior
+  exact ⟨by simp [hTraceNil, observeIOTrace], hConforms.2⟩
+
+theorem staged_io_result_behavior_only_reports_inferred_effects_and_fn_subtype_kernel_expected_type_tag
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {arg₁ ret₁ arg₂ ret₂ : Weft.Ty}
+    {eff₁ eff₂ : Weft.EffectSet}
+    {effects : Weft.EffectSet}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : IOResultBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hCheck : kernelCheckAgainst (parseSurface surface) (Weft.Ty.fn arg₁ eff₁ ret₁) = true)
+    (hArg : arg₂.kernelSubtypeb arg₁ = true)
+    (hEff : Weft.EffectSet.subsetb eff₁ eff₂ = true)
+    (hRet : ret₁.kernelSubtypeb ret₂ = true)
+    (hEffects : inferEffects (parseSurface surface) = some effects)
+    (hMachine : machineIOResultSem oracle code input behavior) :
+    (∀ event, event ∈ behavior.trace ->
+      ∃ effect : Weft.EffectName,
+        effect ∈ effects.elems ∧ event = Weft.IOEvent.effectQuery effect (oracle effect)) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.fn arg₂ eff₂ ret₂) := by
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  have hEval : Eval oracle (parseSurface surface) value trace :=
+    staged_compile_complete hCompile hExec
+  rcases inferEffects_sound hEffects with ⟨ty, hTy⟩
+  have hTyped : Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.fn arg₂ eff₂ ret₂) :=
+    (staged_machine_result_respects_effects_and_tag_weakened_kernel_expected_type_tag
+      hCompile hCheck
+      (Weft.SafetyCore.tag_subtype_of_fn_subtype_kernelSubtypeb hArg hEff hRet)
+      hEffects hExec).2
+  cases hBehavior
+  constructor
+  · intro event hMem
+    have hObserved :
+        ∃ effect : Weft.EffectName,
+          effect ∈ trace ∧ event = Weft.IOEvent.effectQuery effect (oracle effect) :=
+      mem_observeIOTrace_iff.mp hMem
+    rcases hObserved with ⟨effect, hInTrace, rfl⟩
+    exact ⟨effect, trace_subset_of_typed_effects hTy hEval effect hInTrace, rfl⟩
+  · exact hTyped
+
+theorem staged_io_result_behavior_trace_free_and_fn_subtype_kernel_typed_when_pure_tag
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {arg₁ ret₁ arg₂ ret₂ : Weft.Ty}
+    {eff₁ eff₂ : Weft.EffectSet}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : IOResultBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hCheck : kernelCheckAgainst (parseSurface surface) (Weft.Ty.fn arg₁ eff₁ ret₁) = true)
+    (hArg : arg₂.kernelSubtypeb arg₁ = true)
+    (hEff : Weft.EffectSet.subsetb eff₁ eff₂ = true)
+    (hRet : ret₁.kernelSubtypeb ret₂ = true)
+    (hPure : inferEffects (parseSurface surface) = some Weft.EffectSet.empty)
+    (hMachine : machineIOResultSem oracle code input behavior) :
+    behavior.trace = [] ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.fn arg₂ eff₂ ret₂) := by
+  rcases hMachine with ⟨value, trace, hExec, hBehavior⟩
+  have hConforms :
+      (∀ effect : Weft.EffectName, effect ∉ trace) ∧
+        Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.fn arg₂ eff₂ ret₂) :=
+    staged_machine_pure_result_respects_tag_weakened_kernel_expected_type_tag
+      hCompile hCheck
+      (Weft.SafetyCore.tag_subtype_of_fn_subtype_kernelSubtypeb hArg hEff hRet)
+      hPure hExec
+  have hTraceNil : trace = [] :=
+    trace_eq_nil_of_forall_not_mem hConforms.1
+  cases hBehavior
+  exact ⟨by simp [hTraceNil, observeIOTrace], hConforms.2⟩
+
 end Weft.CoreEffects

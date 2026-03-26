@@ -200,6 +200,14 @@ The first cut lands three things:
     bootstrap result theorems. Concretely: recursive kernel-variance facts now
     have a checked theorem path into the end-to-end compiler story even before
     the executable checker learns every richer outer rule natively.
+29. `Weft/Properties/CoreEffectIOObservations.lean`
+    Those witness-driven variance facts now reach the observable result layer
+    too. The staged `IOEvent` result theorems can now express checked pointer
+    covariance, `rc` covariance, and function argument/effect/result variance
+    directly over observed query/reply traces plus whole-`Ty` kernel-tagged
+    results. Concretely: the recursive-kernel checker/model bridge now reaches
+    the current end-to-end observation language, not only the underlying raw
+    machine result semantics.
 
 ## Near-Term Expansion
 

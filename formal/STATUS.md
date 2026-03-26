@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **76%** of the way to the complete theorem.
+Roughly **77%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -50,6 +50,8 @@ That estimate is based on:
 - executable inner-type/effect witnesses now also drive theorem-surface
   specializations for pointer covariance, `rc` covariance, and function
   argument/effect/result variance at the whole-`Ty` kernel-tag level
+- those witness-driven variance specializations now reach the observed
+  `IOEvent` result layer too, not only raw machine/result semantics
 - emitted-artifact semantic-equivalence transfer is now factored through a
   reusable generic compilation lemma instead of being reproved separately at
   each raw/observed behavior layer
@@ -71,7 +73,7 @@ That estimate is based on:
 | Compiler composition backbone | 95% | Generic stage-composition, stage-reflection, whole-pipeline semantics `iff`, direct source-to-artifact equivalence transfer, and compiled bootstrap-stability theorems are in place. |
 | Pure core source-to-machine correctness | 88% | Concrete compiler, staged pipeline, typed-result preservation, and generic source/machine semantics `iff` theorems are proved. |
 | Handled-effect core correctness | 80% | Trace-preserving compilation, staged effectful compiler theorem, and machine-level effect/result conformance are proved. |
-| Result-carrying semantic observations | 93% | Successful staged compilations now preserve and reflect trace/result behaviors, representable expected types can be restated at the whole-`Ty` kernel-tag semantic level, the handled-effect fragment has explicit query/reply observation theorems in the generic `IOEvent` space, staged/compiled expected-type theorems now work through an executable whole-`Ty` kernel subtype layer rather than only the finite `CoreSetTy` bridge, executable `kernelSubtypeb` witnesses can directly weaken staged/bootstrap expected-type contracts, those executable witnesses now also specialize pointer/`rc`/function variance theorems at the staged/bootstrap surface, and semantic equivalence of surface compiler generations can be transferred to emitted machine artifacts together with the current pure/effect-bounded typed-result contracts. |
+| Result-carrying semantic observations | 94% | Successful staged compilations now preserve and reflect trace/result behaviors, representable expected types can be restated at the whole-`Ty` kernel-tag semantic level, the handled-effect fragment has explicit query/reply observation theorems in the generic `IOEvent` space, staged/compiled expected-type theorems now work through an executable whole-`Ty` kernel subtype layer rather than only the finite `CoreSetTy` bridge, executable `kernelSubtypeb` witnesses can directly weaken staged/bootstrap expected-type contracts, those executable witnesses now also specialize pointer/`rc`/function variance theorems at the staged/bootstrap surface, those variance specializations now reach the observed `IOEvent` result layer too, and semantic equivalence of surface compiler generations can be transferred to emitted machine artifacts together with the current pure/effect-bounded typed-result contracts. |
 | Set-theoretic normalization/subtyping | 70% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, theory-aware unsatisfiability implies semantic subtyping under sound valuations, the kernel theory has a concrete tag-level semantic model with explicit pointer-flavor separation facts such as `rc T & mptr U` being empty, there is now a structurally computable whole-`Ty` kernel subtype checker over normalized obligations, and executable inner witnesses can already drive some recursive semantic variance facts at the theorem surface. Full semantic subtyping for richer constructors is still missing. |
 | Runtime semantics (`IO`, `Alloc`, `Unsafe`) | 23% | We now have a concrete tag-level semantic model for runtime values plus explicit observable query/reply event semantics for the handled-effect fragment, and we can already rule out impossible runtime tag overlaps like `rc`/`mptr` collisions. Full `IO`/allocation/unsafe runtime behaviors are still missing. |
 | Continuations / handler operational model | 10% | Tail-resumptive handled-effect core exists, but full continuation semantics is not yet formalized. |
@@ -124,6 +126,15 @@ Current frontier:
   behaviors. Concretely: part of the remaining checker/model gap for recursive
   kernel structure now has a checked path into the end-to-end theorem, even
   before the executable checker derives every outer recursive rule by itself.
+
+- witness-driven semantic variance at the observed `IOEvent` layer
+  The recursive-kernel variance bridge no longer stops underneath the
+  observation language. Checked pointer covariance, `rc` covariance, and
+  function argument/effect/result variance now appear directly on staged
+  `IOEvent` result theorems that talk about observed query/reply traces and
+  whole-`Ty` kernel-tagged outputs. Concretely: the current end-to-end
+  observation layer now exposes the same richer checked result contracts as
+  the lower raw machine semantics.
 
 - generic compiled-artifact equivalence transfer
   The bootstrap/equivalence story no longer needs one custom proof per
