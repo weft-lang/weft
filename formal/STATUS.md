@@ -12,7 +12,7 @@ about what is still missing, not to pretend the remaining work is linear.
 
 ## Overall Progress
 
-Roughly **75%** of the way to the complete theorem.
+Roughly **76%** of the way to the complete theorem.
 
 That estimate is based on:
 
@@ -47,6 +47,9 @@ That estimate is based on:
   source-to-artifact equivalence transfer
 - executable `kernelSubtypeb` witnesses now directly weaken staged and
   bootstrap expected-type contracts, not only Prop-level subtype proofs
+- executable inner-type/effect witnesses now also drive theorem-surface
+  specializations for pointer covariance, `rc` covariance, and function
+  argument/effect/result variance at the whole-`Ty` kernel-tag level
 - emitted-artifact semantic-equivalence transfer is now factored through a
   reusable generic compilation lemma instead of being reproved separately at
   each raw/observed behavior layer
@@ -68,8 +71,8 @@ That estimate is based on:
 | Compiler composition backbone | 95% | Generic stage-composition, stage-reflection, whole-pipeline semantics `iff`, direct source-to-artifact equivalence transfer, and compiled bootstrap-stability theorems are in place. |
 | Pure core source-to-machine correctness | 88% | Concrete compiler, staged pipeline, typed-result preservation, and generic source/machine semantics `iff` theorems are proved. |
 | Handled-effect core correctness | 80% | Trace-preserving compilation, staged effectful compiler theorem, and machine-level effect/result conformance are proved. |
-| Result-carrying semantic observations | 92% | Successful staged compilations now preserve and reflect trace/result behaviors, representable expected types can be restated at the whole-`Ty` kernel-tag semantic level, the handled-effect fragment has explicit query/reply observation theorems in the generic `IOEvent` space, staged/compiled expected-type theorems now work through an executable whole-`Ty` kernel subtype layer rather than only the finite `CoreSetTy` bridge, executable `kernelSubtypeb` witnesses can directly weaken staged/bootstrap expected-type contracts, and semantic equivalence of surface compiler generations can be transferred to emitted machine artifacts together with the current pure/effect-bounded typed-result contracts. |
-| Set-theoretic normalization/subtyping | 69% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, theory-aware unsatisfiability implies semantic subtyping under sound valuations, the kernel theory has a concrete tag-level semantic model with explicit pointer-flavor separation facts such as `rc T & mptr U` being empty, and there is now a structurally computable whole-`Ty` kernel subtype checker over normalized obligations. Full semantic subtyping for richer constructors is still missing. |
+| Result-carrying semantic observations | 93% | Successful staged compilations now preserve and reflect trace/result behaviors, representable expected types can be restated at the whole-`Ty` kernel-tag semantic level, the handled-effect fragment has explicit query/reply observation theorems in the generic `IOEvent` space, staged/compiled expected-type theorems now work through an executable whole-`Ty` kernel subtype layer rather than only the finite `CoreSetTy` bridge, executable `kernelSubtypeb` witnesses can directly weaken staged/bootstrap expected-type contracts, those executable witnesses now also specialize pointer/`rc`/function variance theorems at the staged/bootstrap surface, and semantic equivalence of surface compiler generations can be transferred to emitted machine artifacts together with the current pure/effect-bounded typed-result contracts. |
+| Set-theoretic normalization/subtyping | 70% | Finite core DNF/subtype theorem is proved, whole-`Ty` boolean structure normalizes to an atomized DNF semantics, theory-aware unsatisfiability implies semantic subtyping under sound valuations, the kernel theory has a concrete tag-level semantic model with explicit pointer-flavor separation facts such as `rc T & mptr U` being empty, there is now a structurally computable whole-`Ty` kernel subtype checker over normalized obligations, and executable inner witnesses can already drive some recursive semantic variance facts at the theorem surface. Full semantic subtyping for richer constructors is still missing. |
 | Runtime semantics (`IO`, `Alloc`, `Unsafe`) | 23% | We now have a concrete tag-level semantic model for runtime values plus explicit observable query/reply event semantics for the handled-effect fragment, and we can already rule out impossible runtime tag overlaps like `rc`/`mptr` collisions. Full `IO`/allocation/unsafe runtime behaviors are still missing. |
 | Continuations / handler operational model | 10% | Tail-resumptive handled-effect core exists, but full continuation semantics is not yet formalized. |
 | Native backend / object emission bridge | 10% | Machine model exists for core targets, but not a real aarch64/Mach-O semantic bridge. |
@@ -111,6 +114,16 @@ Current frontier:
   feeds compiled, staged, and bootstrap result theorems. Concretely: more of
   the end-to-end theorem surface is now driven by the actual executable kernel
   checker rather than only by semantic proof wrappers around it.
+
+- witness-driven semantic variance at theorem surface
+  The executable kernel-checker route no longer stops at flat whole-type
+  weakening theorems. Boolean witnesses for inner subtype and effect inclusion
+  now specialize theorem-surface rules for pointer covariance, `rc`
+  covariance, and function argument/effect/result variance, and those facts
+  are exposed directly for staged and bootstrap handled-effect result
+  behaviors. Concretely: part of the remaining checker/model gap for recursive
+  kernel structure now has a checked path into the end-to-end theorem, even
+  before the executable checker derives every outer recursive rule by itself.
 
 - generic compiled-artifact equivalence transfer
   The bootstrap/equivalence story no longer needs one custom proof per

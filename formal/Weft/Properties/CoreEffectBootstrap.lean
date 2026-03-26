@@ -844,6 +844,159 @@ theorem staged_bootstrap_machine_result_trace_free_and_kernelSubtypeb_weakened_t
   exact machine_result_trace_free_and_kernelSubtypeb_weakened_typed_when_pure_of_surfaceEq
     oracle hCompile₁ hCompile₃ hSurface hCheck₁ hSubtype hPure₁ hMachine₃
 
+theorem staged_bootstrap_machine_result_respects_effects_and_ptr_covariant_kernel_expected_type_tag
+    (oracle : Oracle)
+    {compiler₁ compiler₂ compiler₃ : SurfaceExpr}
+    {code₁ code₂ code₃ : Code}
+    {inner₁ inner₂ : Weft.Ty}
+    {effects : Weft.EffectSet}
+    {input : Weft.Input}
+    {behavior : ResultBehavior}
+    (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₁ = .ok code₁)
+    (_hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₂ = .ok code₂)
+    (hCompile₃ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₃ = .ok code₃)
+    (h₁₂ : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₂)
+    (h₂₃ : Weft.SemanticEq (surfaceResultSem oracle) compiler₂ compiler₃)
+    (hCheck₁ : kernelCheckAgainst (parseSurface compiler₁) (Weft.Ty.ptr inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hEffects₁ : inferEffects (parseSurface compiler₁) = some effects)
+    (hMachine₃ : machineResultSem oracle code₃ input behavior) :
+    (∀ effect : Weft.EffectName, effect ∈ behavior.trace -> effect ∈ effects.elems) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.ptr inner₂) := by
+  have hSurface : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₃ :=
+    staged_bootstrap_surface_result_semantics_stable oracle h₁₂ h₂₃
+  exact machine_result_respects_effects_and_tag_weakened_kernel_expected_type_tag_of_surfaceEq
+    oracle hCompile₁ hCompile₃ hSurface hCheck₁
+    (Weft.SafetyCore.tag_subtype_of_ptr_covariant_kernelSubtypeb hSubtype) hEffects₁ hMachine₃
+
+theorem staged_bootstrap_machine_result_trace_free_and_ptr_covariant_kernel_typed_when_pure
+    (oracle : Oracle)
+    {compiler₁ compiler₂ compiler₃ : SurfaceExpr}
+    {code₁ code₂ code₃ : Code}
+    {inner₁ inner₂ : Weft.Ty}
+    {input : Weft.Input}
+    {behavior : ResultBehavior}
+    (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₁ = .ok code₁)
+    (_hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₂ = .ok code₂)
+    (hCompile₃ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₃ = .ok code₃)
+    (h₁₂ : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₂)
+    (h₂₃ : Weft.SemanticEq (surfaceResultSem oracle) compiler₂ compiler₃)
+    (hCheck₁ : kernelCheckAgainst (parseSurface compiler₁) (Weft.Ty.ptr inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hPure₁ : inferEffects (parseSurface compiler₁) = some Weft.EffectSet.empty)
+    (hMachine₃ : machineResultSem oracle code₃ input behavior) :
+    (∀ effect : Weft.EffectName, effect ∉ behavior.trace) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.ptr inner₂) := by
+  have hSurface : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₃ :=
+    staged_bootstrap_surface_result_semantics_stable oracle h₁₂ h₂₃
+  exact machine_result_trace_free_and_tag_weakened_kernel_typed_when_pure_of_surfaceEq
+    oracle hCompile₁ hCompile₃ hSurface hCheck₁
+    (Weft.SafetyCore.tag_subtype_of_ptr_covariant_kernelSubtypeb hSubtype) hPure₁ hMachine₃
+
+theorem staged_bootstrap_machine_result_respects_effects_and_rc_covariant_kernel_expected_type_tag
+    (oracle : Oracle)
+    {compiler₁ compiler₂ compiler₃ : SurfaceExpr}
+    {code₁ code₂ code₃ : Code}
+    {inner₁ inner₂ : Weft.Ty}
+    {effects : Weft.EffectSet}
+    {input : Weft.Input}
+    {behavior : ResultBehavior}
+    (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₁ = .ok code₁)
+    (_hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₂ = .ok code₂)
+    (hCompile₃ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₃ = .ok code₃)
+    (h₁₂ : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₂)
+    (h₂₃ : Weft.SemanticEq (surfaceResultSem oracle) compiler₂ compiler₃)
+    (hCheck₁ : kernelCheckAgainst (parseSurface compiler₁) (Weft.Ty.rc inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hEffects₁ : inferEffects (parseSurface compiler₁) = some effects)
+    (hMachine₃ : machineResultSem oracle code₃ input behavior) :
+    (∀ effect : Weft.EffectName, effect ∈ behavior.trace -> effect ∈ effects.elems) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.rc inner₂) := by
+  have hSurface : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₃ :=
+    staged_bootstrap_surface_result_semantics_stable oracle h₁₂ h₂₃
+  exact machine_result_respects_effects_and_tag_weakened_kernel_expected_type_tag_of_surfaceEq
+    oracle hCompile₁ hCompile₃ hSurface hCheck₁
+    (Weft.SafetyCore.tag_subtype_of_rc_covariant_kernelSubtypeb hSubtype) hEffects₁ hMachine₃
+
+theorem staged_bootstrap_machine_result_trace_free_and_rc_covariant_kernel_typed_when_pure
+    (oracle : Oracle)
+    {compiler₁ compiler₂ compiler₃ : SurfaceExpr}
+    {code₁ code₂ code₃ : Code}
+    {inner₁ inner₂ : Weft.Ty}
+    {input : Weft.Input}
+    {behavior : ResultBehavior}
+    (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₁ = .ok code₁)
+    (_hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₂ = .ok code₂)
+    (hCompile₃ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₃ = .ok code₃)
+    (h₁₂ : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₂)
+    (h₂₃ : Weft.SemanticEq (surfaceResultSem oracle) compiler₂ compiler₃)
+    (hCheck₁ : kernelCheckAgainst (parseSurface compiler₁) (Weft.Ty.rc inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hPure₁ : inferEffects (parseSurface compiler₁) = some Weft.EffectSet.empty)
+    (hMachine₃ : machineResultSem oracle code₃ input behavior) :
+    (∀ effect : Weft.EffectName, effect ∉ behavior.trace) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.rc inner₂) := by
+  have hSurface : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₃ :=
+    staged_bootstrap_surface_result_semantics_stable oracle h₁₂ h₂₃
+  exact machine_result_trace_free_and_tag_weakened_kernel_typed_when_pure_of_surfaceEq
+    oracle hCompile₁ hCompile₃ hSurface hCheck₁
+    (Weft.SafetyCore.tag_subtype_of_rc_covariant_kernelSubtypeb hSubtype) hPure₁ hMachine₃
+
+theorem staged_bootstrap_machine_result_respects_effects_and_fn_subtype_kernel_expected_type_tag
+    (oracle : Oracle)
+    {compiler₁ compiler₂ compiler₃ : SurfaceExpr}
+    {code₁ code₂ code₃ : Code}
+    {arg₁ ret₁ arg₂ ret₂ : Weft.Ty}
+    {eff₁ eff₂ : Weft.EffectSet}
+    {effects : Weft.EffectSet}
+    {input : Weft.Input}
+    {behavior : ResultBehavior}
+    (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₁ = .ok code₁)
+    (_hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₂ = .ok code₂)
+    (hCompile₃ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₃ = .ok code₃)
+    (h₁₂ : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₂)
+    (h₂₃ : Weft.SemanticEq (surfaceResultSem oracle) compiler₂ compiler₃)
+    (hCheck₁ : kernelCheckAgainst (parseSurface compiler₁) (Weft.Ty.fn arg₁ eff₁ ret₁) = true)
+    (hArg : arg₂.kernelSubtypeb arg₁ = true)
+    (hEff : Weft.EffectSet.subsetb eff₁ eff₂ = true)
+    (hRet : ret₁.kernelSubtypeb ret₂ = true)
+    (hEffects₁ : inferEffects (parseSurface compiler₁) = some effects)
+    (hMachine₃ : machineResultSem oracle code₃ input behavior) :
+    (∀ effect : Weft.EffectName, effect ∈ behavior.trace -> effect ∈ effects.elems) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.fn arg₂ eff₂ ret₂) := by
+  have hSurface : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₃ :=
+    staged_bootstrap_surface_result_semantics_stable oracle h₁₂ h₂₃
+  exact machine_result_respects_effects_and_tag_weakened_kernel_expected_type_tag_of_surfaceEq
+    oracle hCompile₁ hCompile₃ hSurface hCheck₁
+    (Weft.SafetyCore.tag_subtype_of_fn_subtype_kernelSubtypeb hArg hEff hRet) hEffects₁ hMachine₃
+
+theorem staged_bootstrap_machine_result_trace_free_and_fn_subtype_kernel_typed_when_pure
+    (oracle : Oracle)
+    {compiler₁ compiler₂ compiler₃ : SurfaceExpr}
+    {code₁ code₂ code₃ : Code}
+    {arg₁ ret₁ arg₂ ret₂ : Weft.Ty}
+    {eff₁ eff₂ : Weft.EffectSet}
+    {input : Weft.Input}
+    {behavior : ResultBehavior}
+    (hCompile₁ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₁ = .ok code₁)
+    (_hCompile₂ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₂ = .ok code₂)
+    (hCompile₃ : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile compiler₃ = .ok code₃)
+    (h₁₂ : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₂)
+    (h₂₃ : Weft.SemanticEq (surfaceResultSem oracle) compiler₂ compiler₃)
+    (hCheck₁ : kernelCheckAgainst (parseSurface compiler₁) (Weft.Ty.fn arg₁ eff₁ ret₁) = true)
+    (hArg : arg₂.kernelSubtypeb arg₁ = true)
+    (hEff : Weft.EffectSet.subsetb eff₁ eff₂ = true)
+    (hRet : ret₁.kernelSubtypeb ret₂ = true)
+    (hPure₁ : inferEffects (parseSurface compiler₁) = some Weft.EffectSet.empty)
+    (hMachine₃ : machineResultSem oracle code₃ input behavior) :
+    (∀ effect : Weft.EffectName, effect ∉ behavior.trace) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.fn arg₂ eff₂ ret₂) := by
+  have hSurface : Weft.SemanticEq (surfaceResultSem oracle) compiler₁ compiler₃ :=
+    staged_bootstrap_surface_result_semantics_stable oracle h₁₂ h₂₃
+  exact machine_result_trace_free_and_tag_weakened_kernel_typed_when_pure_of_surfaceEq
+    oracle hCompile₁ hCompile₃ hSurface hCheck₁
+    (Weft.SafetyCore.tag_subtype_of_fn_subtype_kernelSubtypeb hArg hEff hRet) hPure₁ hMachine₃
+
 theorem staged_bootstrap_machine_result_trace_free_and_typed_when_pure
     (oracle : Oracle)
     {compiler₁ compiler₂ compiler₃ : SurfaceExpr}

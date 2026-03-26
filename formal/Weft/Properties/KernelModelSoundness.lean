@@ -45,6 +45,14 @@ theorem kernel_ptr_covariant_tag
   case ptr kind innerTag =>
     exact Ty.subtypeIn_trans hPtr hSubtype
 
+theorem kernel_ptr_covariant_tag_of_subtypeb
+    (tag : KernelTag)
+    (inner₁ inner₂ : Ty)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true) :
+    Ty.denotesTag tag (Ty.ptr inner₁) ->
+      Ty.denotesTag tag (Ty.ptr inner₂) := by
+  exact kernel_ptr_covariant_tag tag inner₁ inner₂ (Ty.kernelSubtypeb_sound hSubtype)
+
 theorem kernel_rc_covariant_tag
     (tag : KernelTag)
     (inner₁ inner₂ : Ty)
@@ -57,6 +65,14 @@ theorem kernel_rc_covariant_tag
     cases kind <;> simp at hRc ⊢
     case rc =>
       exact Ty.subtypeIn_trans hRc hSubtype
+
+theorem kernel_rc_covariant_tag_of_subtypeb
+    (tag : KernelTag)
+    (inner₁ inner₂ : Ty)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true) :
+    Ty.denotesTag tag (Ty.rc inner₁) ->
+      Ty.denotesTag tag (Ty.rc inner₂) := by
+  exact kernel_rc_covariant_tag tag inner₁ inner₂ (Ty.kernelSubtypeb_sound hSubtype)
 
 theorem kernel_fn_effect_subset_tag
     (tag : KernelTag)
@@ -83,6 +99,20 @@ theorem kernel_fn_subtype_tag
   case fn argTag effTag retTag =>
     rcases hFn with ⟨hArgTag, hEffTag, hRetTag⟩
     exact ⟨Ty.subtypeIn_trans hArg hArgTag, EffectSet.subset_trans hEffTag hEff, Ty.subtypeIn_trans hRetTag hRet⟩
+
+theorem kernel_fn_subtype_tag_of_subtypeb
+    (tag : KernelTag)
+    (arg₁ ret₁ arg₂ ret₂ : Ty)
+    (eff₁ eff₂ : EffectSet)
+    (hArg : arg₂.kernelSubtypeb arg₁ = true)
+    (hEff : EffectSet.subsetb eff₁ eff₂ = true)
+    (hRet : ret₁.kernelSubtypeb ret₂ = true) :
+    Ty.denotesTag tag (Ty.fn arg₁ eff₁ ret₁) ->
+      Ty.denotesTag tag (Ty.fn arg₂ eff₂ ret₂) := by
+  exact kernel_fn_subtype_tag tag arg₁ ret₁ arg₂ ret₂ eff₁ eff₂
+    (Ty.kernelSubtypeb_sound hArg)
+    ((EffectSet.subsetb_spec eff₁ eff₂).1 hEff)
+    (Ty.kernelSubtypeb_sound hRet)
 
 theorem kernel_mptr_ptr_tag
     (tag : KernelTag)

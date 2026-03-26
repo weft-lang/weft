@@ -679,4 +679,115 @@ theorem staged_result_behavior_trace_free_and_kernelSubtypeb_weakened_typed_when
   cases hBehavior
   exact hConforms
 
+theorem staged_result_behavior_respects_effects_and_ptr_covariant_kernel_expected_type_tag
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {inner₁ inner₂ : Weft.Ty}
+    {effects : Weft.EffectSet}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : ResultBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hCheck : kernelCheckAgainst (parseSurface surface) (Weft.Ty.ptr inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hEffects : inferEffects (parseSurface surface) = some effects)
+    (hMachine : machineResultSem oracle code input behavior) :
+    (∀ effect : Weft.EffectName, effect ∈ behavior.trace -> effect ∈ effects.elems) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.ptr inner₂) := by
+  exact staged_result_behavior_respects_effects_and_tag_weakened_kernel_expected_type_tag
+    hCompile hCheck (tag_subtype_of_ptr_covariant_kernelSubtypeb hSubtype) hEffects hMachine
+
+theorem staged_result_behavior_trace_free_and_ptr_covariant_kernel_typed_when_pure_tag
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {inner₁ inner₂ : Weft.Ty}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : ResultBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hCheck : kernelCheckAgainst (parseSurface surface) (Weft.Ty.ptr inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hPure : inferEffects (parseSurface surface) = some Weft.EffectSet.empty)
+    (hMachine : machineResultSem oracle code input behavior) :
+    (∀ effect : Weft.EffectName, effect ∉ behavior.trace) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.ptr inner₂) := by
+  exact staged_result_behavior_trace_free_and_tag_weakened_kernel_typed_when_pure_tag
+    hCompile hCheck (tag_subtype_of_ptr_covariant_kernelSubtypeb hSubtype) hPure hMachine
+
+theorem staged_result_behavior_respects_effects_and_rc_covariant_kernel_expected_type_tag
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {inner₁ inner₂ : Weft.Ty}
+    {effects : Weft.EffectSet}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : ResultBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hCheck : kernelCheckAgainst (parseSurface surface) (Weft.Ty.rc inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hEffects : inferEffects (parseSurface surface) = some effects)
+    (hMachine : machineResultSem oracle code input behavior) :
+    (∀ effect : Weft.EffectName, effect ∈ behavior.trace -> effect ∈ effects.elems) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.rc inner₂) := by
+  exact staged_result_behavior_respects_effects_and_tag_weakened_kernel_expected_type_tag
+    hCompile hCheck (tag_subtype_of_rc_covariant_kernelSubtypeb hSubtype) hEffects hMachine
+
+theorem staged_result_behavior_trace_free_and_rc_covariant_kernel_typed_when_pure_tag
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {inner₁ inner₂ : Weft.Ty}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : ResultBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hCheck : kernelCheckAgainst (parseSurface surface) (Weft.Ty.rc inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hPure : inferEffects (parseSurface surface) = some Weft.EffectSet.empty)
+    (hMachine : machineResultSem oracle code input behavior) :
+    (∀ effect : Weft.EffectName, effect ∉ behavior.trace) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.rc inner₂) := by
+  exact staged_result_behavior_trace_free_and_tag_weakened_kernel_typed_when_pure_tag
+    hCompile hCheck (tag_subtype_of_rc_covariant_kernelSubtypeb hSubtype) hPure hMachine
+
+theorem staged_result_behavior_respects_effects_and_fn_subtype_kernel_expected_type_tag
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {arg₁ ret₁ arg₂ ret₂ : Weft.Ty}
+    {eff₁ eff₂ : Weft.EffectSet}
+    {effects : Weft.EffectSet}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : ResultBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hCheck : kernelCheckAgainst (parseSurface surface) (Weft.Ty.fn arg₁ eff₁ ret₁) = true)
+    (hArg : arg₂.kernelSubtypeb arg₁ = true)
+    (hEff : Weft.EffectSet.subsetb eff₁ eff₂ = true)
+    (hRet : ret₁.kernelSubtypeb ret₂ = true)
+    (hEffects : inferEffects (parseSurface surface) = some effects)
+    (hMachine : machineResultSem oracle code input behavior) :
+    (∀ effect : Weft.EffectName, effect ∈ behavior.trace -> effect ∈ effects.elems) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.fn arg₂ eff₂ ret₂) := by
+  exact staged_result_behavior_respects_effects_and_tag_weakened_kernel_expected_type_tag
+    hCompile hCheck (tag_subtype_of_fn_subtype_kernelSubtypeb hArg hEff hRet) hEffects hMachine
+
+theorem staged_result_behavior_trace_free_and_fn_subtype_kernel_typed_when_pure_tag
+    {oracle : Oracle}
+    {surface : SurfaceExpr}
+    {arg₁ ret₁ arg₂ ret₂ : Weft.Ty}
+    {eff₁ eff₂ : Weft.EffectSet}
+    {code : Code}
+    {input : Weft.Input}
+    {behavior : ResultBehavior}
+    (hCompile : (Weft.CompilerPipeline.compile stagedCompilerPipeline).compile surface = .ok code)
+    (hCheck : kernelCheckAgainst (parseSurface surface) (Weft.Ty.fn arg₁ eff₁ ret₁) = true)
+    (hArg : arg₂.kernelSubtypeb arg₁ = true)
+    (hEff : Weft.EffectSet.subsetb eff₁ eff₂ = true)
+    (hRet : ret₁.kernelSubtypeb ret₂ = true)
+    (hPure : inferEffects (parseSurface surface) = some Weft.EffectSet.empty)
+    (hMachine : machineResultSem oracle code input behavior) :
+    (∀ effect : Weft.EffectName, effect ∉ behavior.trace) ∧
+      Weft.Ty.denotesTag behavior.result.toKernelTag (Weft.Ty.fn arg₂ eff₂ ret₂) := by
+  exact staged_result_behavior_trace_free_and_tag_weakened_kernel_typed_when_pure_tag
+    hCompile hCheck (tag_subtype_of_fn_subtype_kernelSubtypeb hArg hEff hRet) hPure hMachine
+
 end Weft.CoreEffects

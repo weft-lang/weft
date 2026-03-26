@@ -188,6 +188,18 @@ The first cut lands three things:
     them using plain boolean facts `A.kernelSubtypeb B = true`, and that route
     is wired through compiled executions, staged machine/result behaviors, and
     cross-generation bootstrap artifact contracts.
+28. `Weft/Properties/KernelModelSoundness.lean`,
+    `Weft/Properties/CoreKernelModelBridge.lean`,
+    `Weft/Properties/CoreEffectPipelineSemanticSoundness.lean`,
+    `Weft/Properties/CoreEffectBootstrap.lean`
+    The executable witness route now reaches semantic variance facts too, not
+    only flat subtype obligations. Boolean inner-type/effect witnesses can now
+    drive pointer covariance, `rc` covariance, and function
+    argument/effect/result variance at the whole-`Ty` kernel-tag level, and
+    those specializations are exposed directly on compiled, staged, and
+    bootstrap result theorems. Concretely: recursive kernel-variance facts now
+    have a checked theorem path into the end-to-end compiler story even before
+    the executable checker learns every richer outer rule natively.
 
 ## Near-Term Expansion
 

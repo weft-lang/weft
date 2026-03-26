@@ -1,5 +1,6 @@
 import Weft.KernelModel
 import Weft.KernelSubtype
+import Weft.Properties.KernelModelSoundness
 import Weft.Properties.CoreEffectSubtypeChecking
 
 namespace Weft.SafetyCore
@@ -127,6 +128,64 @@ theorem denotesTag_of_kernelSubtypeb
     (hSubtype : lhs.kernelSubtypeb rhs = true) :
     Weft.Ty.denotesTag value.toKernelTag rhs := by
   exact denotesTag_of_subtype hDen (Weft.Ty.kernelSubtypeb_sound hSubtype)
+
+theorem tag_subtype_of_ptr_covariant_kernelSubtypeb
+    {inner₁ inner₂ : Weft.Ty}
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true) :
+    ∀ tag : Weft.KernelTag,
+      Weft.Ty.denotesTag tag (Weft.Ty.ptr inner₁) ->
+      Weft.Ty.denotesTag tag (Weft.Ty.ptr inner₂) := by
+  intro tag hDen
+  exact Weft.kernel_ptr_covariant_tag_of_subtypeb tag inner₁ inner₂ hSubtype hDen
+
+theorem tag_subtype_of_rc_covariant_kernelSubtypeb
+    {inner₁ inner₂ : Weft.Ty}
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true) :
+    ∀ tag : Weft.KernelTag,
+      Weft.Ty.denotesTag tag (Weft.Ty.rc inner₁) ->
+      Weft.Ty.denotesTag tag (Weft.Ty.rc inner₂) := by
+  intro tag hDen
+  exact Weft.kernel_rc_covariant_tag_of_subtypeb tag inner₁ inner₂ hSubtype hDen
+
+theorem tag_subtype_of_fn_subtype_kernelSubtypeb
+    {arg₁ ret₁ arg₂ ret₂ : Weft.Ty}
+    {eff₁ eff₂ : Weft.EffectSet}
+    (hArg : arg₂.kernelSubtypeb arg₁ = true)
+    (hEff : Weft.EffectSet.subsetb eff₁ eff₂ = true)
+    (hRet : ret₁.kernelSubtypeb ret₂ = true) :
+    ∀ tag : Weft.KernelTag,
+      Weft.Ty.denotesTag tag (Weft.Ty.fn arg₁ eff₁ ret₁) ->
+      Weft.Ty.denotesTag tag (Weft.Ty.fn arg₂ eff₂ ret₂) := by
+  intro tag hDen
+  exact Weft.kernel_fn_subtype_tag_of_subtypeb
+    tag arg₁ ret₁ arg₂ ret₂ eff₁ eff₂ hArg hEff hRet hDen
+
+theorem denotesTag_of_ptr_covariant_kernelSubtypeb
+    {value : RuntimeVal}
+    {inner₁ inner₂ : Weft.Ty}
+    (hDen : Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.ptr inner₁))
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true) :
+    Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.ptr inner₂) := by
+  exact tag_subtype_of_ptr_covariant_kernelSubtypeb hSubtype value.toKernelTag hDen
+
+theorem denotesTag_of_rc_covariant_kernelSubtypeb
+    {value : RuntimeVal}
+    {inner₁ inner₂ : Weft.Ty}
+    (hDen : Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.rc inner₁))
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true) :
+    Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.rc inner₂) := by
+  exact tag_subtype_of_rc_covariant_kernelSubtypeb hSubtype value.toKernelTag hDen
+
+theorem denotesTag_of_fn_subtype_kernelSubtypeb
+    {value : RuntimeVal}
+    {arg₁ ret₁ arg₂ ret₂ : Weft.Ty}
+    {eff₁ eff₂ : Weft.EffectSet}
+    (hDen : Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.fn arg₁ eff₁ ret₁))
+    (hArg : arg₂.kernelSubtypeb arg₁ = true)
+    (hEff : Weft.EffectSet.subsetb eff₁ eff₂ = true)
+    (hRet : ret₁.kernelSubtypeb ret₂ = true) :
+    Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.fn arg₂ eff₂ ret₂) := by
+  exact tag_subtype_of_fn_subtype_kernelSubtypeb hArg hEff hRet value.toKernelTag hDen
 
 def kernelCheckAgainst (expr : Expr) (expected : Weft.Ty) : Bool :=
   match inferType expr with
@@ -378,5 +437,110 @@ theorem compiled_result_respects_effects_and_tag_weakened_kernel_expected_type_t
   rcases compiled_result_respects_effects_and_kernel_expected_type_tag hCheck hEffects hEval with
     ⟨hExec, hTrace, hTyped⟩
   exact ⟨hExec, hTrace, denotesTag_of_tag_subtype hTyped hSubtype⟩
+
+theorem compiled_pure_result_respects_ptr_covariant_kernel_expected_type_tag
+    {oracle : Oracle}
+    {expr : Expr}
+    {inner₁ inner₂ : Weft.Ty}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hCheck : kernelCheckAgainst expr (Weft.Ty.ptr inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hPure : inferEffects expr = some Weft.EffectSet.empty)
+    (hEval : Eval oracle expr value trace) :
+    Exec oracle (compileClosed expr) [] [value] trace ∧
+      (∀ effect : Weft.EffectName, effect ∉ trace) ∧
+      Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.ptr inner₂) := by
+  exact compiled_pure_result_respects_tag_weakened_kernel_expected_type_tag
+    hCheck (tag_subtype_of_ptr_covariant_kernelSubtypeb hSubtype) hPure hEval
+
+theorem compiled_result_respects_effects_and_ptr_covariant_kernel_expected_type_tag
+    {oracle : Oracle}
+    {expr : Expr}
+    {inner₁ inner₂ : Weft.Ty}
+    {effects : Weft.EffectSet}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hCheck : kernelCheckAgainst expr (Weft.Ty.ptr inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hEffects : inferEffects expr = some effects)
+    (hEval : Eval oracle expr value trace) :
+    Exec oracle (compileClosed expr) [] [value] trace ∧
+      (∀ effect : Weft.EffectName, effect ∈ trace -> effect ∈ effects.elems) ∧
+      Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.ptr inner₂) := by
+  exact compiled_result_respects_effects_and_tag_weakened_kernel_expected_type_tag
+    hCheck (tag_subtype_of_ptr_covariant_kernelSubtypeb hSubtype) hEffects hEval
+
+theorem compiled_pure_result_respects_rc_covariant_kernel_expected_type_tag
+    {oracle : Oracle}
+    {expr : Expr}
+    {inner₁ inner₂ : Weft.Ty}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hCheck : kernelCheckAgainst expr (Weft.Ty.rc inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hPure : inferEffects expr = some Weft.EffectSet.empty)
+    (hEval : Eval oracle expr value trace) :
+    Exec oracle (compileClosed expr) [] [value] trace ∧
+      (∀ effect : Weft.EffectName, effect ∉ trace) ∧
+      Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.rc inner₂) := by
+  exact compiled_pure_result_respects_tag_weakened_kernel_expected_type_tag
+    hCheck (tag_subtype_of_rc_covariant_kernelSubtypeb hSubtype) hPure hEval
+
+theorem compiled_result_respects_effects_and_rc_covariant_kernel_expected_type_tag
+    {oracle : Oracle}
+    {expr : Expr}
+    {inner₁ inner₂ : Weft.Ty}
+    {effects : Weft.EffectSet}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hCheck : kernelCheckAgainst expr (Weft.Ty.rc inner₁) = true)
+    (hSubtype : inner₁.kernelSubtypeb inner₂ = true)
+    (hEffects : inferEffects expr = some effects)
+    (hEval : Eval oracle expr value trace) :
+    Exec oracle (compileClosed expr) [] [value] trace ∧
+      (∀ effect : Weft.EffectName, effect ∈ trace -> effect ∈ effects.elems) ∧
+      Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.rc inner₂) := by
+  exact compiled_result_respects_effects_and_tag_weakened_kernel_expected_type_tag
+    hCheck (tag_subtype_of_rc_covariant_kernelSubtypeb hSubtype) hEffects hEval
+
+theorem compiled_pure_result_respects_fn_subtype_kernel_expected_type_tag
+    {oracle : Oracle}
+    {expr : Expr}
+    {arg₁ ret₁ arg₂ ret₂ : Weft.Ty}
+    {eff₁ eff₂ : Weft.EffectSet}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hCheck : kernelCheckAgainst expr (Weft.Ty.fn arg₁ eff₁ ret₁) = true)
+    (hArg : arg₂.kernelSubtypeb arg₁ = true)
+    (hEff : Weft.EffectSet.subsetb eff₁ eff₂ = true)
+    (hRet : ret₁.kernelSubtypeb ret₂ = true)
+    (hPure : inferEffects expr = some Weft.EffectSet.empty)
+    (hEval : Eval oracle expr value trace) :
+    Exec oracle (compileClosed expr) [] [value] trace ∧
+      (∀ effect : Weft.EffectName, effect ∉ trace) ∧
+      Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.fn arg₂ eff₂ ret₂) := by
+  exact compiled_pure_result_respects_tag_weakened_kernel_expected_type_tag
+    hCheck (tag_subtype_of_fn_subtype_kernelSubtypeb hArg hEff hRet) hPure hEval
+
+theorem compiled_result_respects_effects_and_fn_subtype_kernel_expected_type_tag
+    {oracle : Oracle}
+    {expr : Expr}
+    {arg₁ ret₁ arg₂ ret₂ : Weft.Ty}
+    {eff₁ eff₂ : Weft.EffectSet}
+    {effects : Weft.EffectSet}
+    {value : RuntimeVal}
+    {trace : List Weft.EffectName}
+    (hCheck : kernelCheckAgainst expr (Weft.Ty.fn arg₁ eff₁ ret₁) = true)
+    (hArg : arg₂.kernelSubtypeb arg₁ = true)
+    (hEff : Weft.EffectSet.subsetb eff₁ eff₂ = true)
+    (hRet : ret₁.kernelSubtypeb ret₂ = true)
+    (hEffects : inferEffects expr = some effects)
+    (hEval : Eval oracle expr value trace) :
+    Exec oracle (compileClosed expr) [] [value] trace ∧
+      (∀ effect : Weft.EffectName, effect ∈ trace -> effect ∈ effects.elems) ∧
+      Weft.Ty.denotesTag value.toKernelTag (Weft.Ty.fn arg₂ eff₂ ret₂) := by
+  exact compiled_result_respects_effects_and_tag_weakened_kernel_expected_type_tag
+    hCheck (tag_subtype_of_fn_subtype_kernelSubtypeb hArg hEff hRet) hEffects hEval
 
 end Weft.CoreEffects
