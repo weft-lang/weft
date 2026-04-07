@@ -1,0 +1,165 @@
+-- compiler/object.weft -- Emit Mach-O relocatable object file (.o)
+--
+-- Produces a .o file that the system linker (ld) turns into an executable.
+-- This replaces the direct executable emission in macho.weft for linked
+-- binaries. External function calls become BL 0 + ARM64_RELOC_BRANCH26.
+-- The linker handles GOT, stubs, code signing, and segment layout.
+
+use "compiler/lib.weft"
+
+-- Emit a complete .o file from code buffer + relocation list + symbol info
+-- code: buf with machine code
+-- relocs: list of {code_offset, symbol_index} pairs (for BL relocations)
+-- syms: list of {name_ns, name_nl, code_offset, is_defined} symbol entries
+-- src: source buffer (for symbol name bytes)
+fn emit_object(code: i64, relocs: i64, syms: i64, src: i64) -> i64 {
+  let code_size = buf_len(code)
+  let nrelocs = nlist_len(relocs)
+  let nsyms = nlist_len(syms)
+
+  -- Compute offsets
+  let hdr_size = 32
+  let seg_cmd_size = 72 + 80
+  let bv_cmd_size = 24
+  let symtab_cmd_size = 24
+  let dysymtab_cmd_size = 80
+  let cmds_size = seg_cmd_size + bv_cmd_size + symtab_cmd_size + dysymtab_cmd_size
+  let code_off = hdr_size + cmds_size
+  let reloc_off = code_off + code_size
+  let sym_off = reloc_off + nrelocs * 8
+  let str_off = sym_off + nsyms * 16
+
+  -- Build string table and compute strsize
+  let strtab = buf_new(512)
+  bu8(strtab, 0)
+  let str_indices = __bump_alloc(nsyms * 8)
+  for i in 0..nsyms {
+    let sym = nlist_get(syms, i)
+    let ns = node_f1(sym)
+    let nl = node_f2(sym)
+    __mem_store64(str_indices + i * 8, buf_len(strtab))
+    bu8(strtab, 95)
+    bscopy(strtab, src + ns, nl, 0)
+    bu8(strtab, 0)
+  }
+  let strsize = buf_len(strtab)
+
+  -- Count defined vs undefined symbols
+  let mut nextdef = 0
+  let mut nundef = 0
+  for i in 0..nsyms {
+    let sym = nlist_get(syms, i)
+    if node_f4(sym) == 1 { nextdef = nextdef + 1 } else { nundef = nundef + 1 }
+  }
+
+  let total_size = str_off + strsize
+  let o = buf_new(total_size + 256)
+
+  -- Mach-O header (32 bytes)
+  bu32(o, 4277009103)    -- magic: 0xFEEDFACF
+  bu32(o, 16777228)      -- cputype: ARM64
+  bu32(o, 0)             -- cpusubtype: ALL
+  bu32(o, 1)             -- filetype: MH_OBJECT
+  bu32(o, 4)             -- ncmds
+  bu32(o, cmds_size)     -- sizeofcmds
+  bu32(o, 8192)          -- flags: MH_SUBSECTIONS_VIA_SYMBOLS
+  bu32(o, 0)             -- reserved
+
+  -- LC_SEGMENT_64 (72 + 80 = 152 bytes)
+  bu32(o, 25)            -- cmd: LC_SEGMENT_64
+  bu32(o, seg_cmd_size)  -- cmdsize
+  bfill(o, 16)           -- segname: empty
+  bu64(o, 0)             -- vmaddr
+  bu64(o, code_size)     -- vmsize
+  bu64(o, code_off)      -- fileoff
+  bu64(o, code_size)     -- filesize
+  bu32(o, 7)             -- maxprot: rwx
+  bu32(o, 7)             -- initprot: rwx
+  bu32(o, 1)             -- nsects: 1
+  bu32(o, 0)             -- flags
+
+  -- section_64: __text (80 bytes)
+  bstr(o, "__text") bfill(o, 10)
+  bstr(o, "__TEXT") bfill(o, 10)
+  bu64(o, 0)             -- addr
+  bu64(o, code_size)     -- size
+  bu32(o, code_off)      -- offset
+  bu32(o, 2)             -- align: 2^2 = 4
+  bu32(o, reloc_off)     -- reloff
+  bu32(o, nrelocs)       -- nreloc
+  bu32(o, 2147484672)    -- flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+  bu32(o, 0) bu32(o, 0) bu32(o, 0)
+
+  -- LC_BUILD_VERSION (24 bytes)
+  bu32(o, 50)            -- cmd: LC_BUILD_VERSION
+  bu32(o, 24)            -- cmdsize
+  bu32(o, 1)             -- platform: PLATFORM_MACOS
+  bu32(o, 917504)        -- minos: 14.0.0 = 0x0E0000
+  bu32(o, 983040)        -- sdk: 15.0.0 = 0x0F0000
+  bu32(o, 0)             -- ntools
+
+  -- LC_SYMTAB (24 bytes)
+  bu32(o, 2)             -- cmd: LC_SYMTAB
+  bu32(o, 24)            -- cmdsize
+  bu32(o, sym_off)       -- symoff
+  bu32(o, nsyms)         -- nsyms
+  bu32(o, str_off)       -- stroff
+  bu32(o, strsize)       -- strsize
+
+  -- LC_DYSYMTAB (80 bytes)
+  bu32(o, 11)            -- cmd: LC_DYSYMTAB
+  bu32(o, 80)            -- cmdsize
+  bu32(o, 0)             -- ilocalsym
+  bu32(o, 0)             -- nlocalsym
+  bu32(o, 0)             -- iextdefsym
+  bu32(o, nextdef)       -- nextdefsym
+  bu32(o, nextdef)       -- iundefsym
+  bu32(o, nundef)        -- nundefsym
+  bfill(o, 48)           -- remaining fields: all zero
+
+  -- Code section
+  bscopy(o, buf_ptr(code), code_size, 0)
+
+  -- Relocation entries (8 bytes each)
+  for i in 0..nrelocs {
+    let rel = nlist_get(relocs, i)
+    let r_address = node_f1(rel)
+    let r_symidx = node_f2(rel)
+    bu32(o, r_address)
+    -- ARM64_RELOC_BRANCH26 (type=2), extern=1, length=2, pcrel=1
+    -- word = symidx | (1 << 24) | (2 << 25) | (1 << 27) | (2 << 28)
+    -- = symidx | 0x1000000 | 0x4000000 | 0x8000000 | 0x20000000
+    -- = symidx | 0x2D000000
+    bu32(o, r_symidx + 754974720)
+  }
+
+  -- Symbol table (nlist_64, 16 bytes each)
+  -- Defined symbols first, then undefined
+  for i in 0..nsyms {
+    let sym = nlist_get(syms, i)
+    if node_f4(sym) == 1 {
+      let strx = __mem_load64(str_indices + i * 8)
+      bu32(o, strx)
+      bu8(o, 15)           -- n_type: N_SECT | N_EXT = 0x0F
+      bu8(o, 1)            -- n_sect: 1 (__text)
+      bu8(o, 0) bu8(o, 0)  -- n_desc: 0
+      bu64(o, node_f3(sym)) -- n_value: code offset
+    } else { 0 }
+  }
+  for i in 0..nsyms {
+    let sym = nlist_get(syms, i)
+    if node_f4(sym) != 1 {
+      let strx = __mem_load64(str_indices + i * 8)
+      bu32(o, strx)
+      bu8(o, 1)            -- n_type: N_UNDF | N_EXT = 0x01
+      bu8(o, 0)            -- n_sect: NO_SECT
+      bu8(o, 0) bu8(o, 0)  -- n_desc: 0
+      bu64(o, 0)            -- n_value: 0
+    } else { 0 }
+  }
+
+  -- String table
+  bscopy(o, buf_ptr(strtab), strsize, 0)
+
+  o
+}
