@@ -43,6 +43,8 @@ check_rejects "method_call_arity_too_many" "test/negative/method_call_arity_too_
 check_rejects "method_call_arg_mismatch" "test/negative/method_call_arg_mismatch.weft" "type error: argument type mismatch"
 check_rejects "method_call_trait_arg_mismatch" "test/negative/method_call_trait_arg_mismatch.weft" "type error: argument type mismatch"
 check_rejects "method_call_effect_unavailable" "test/negative/method_call_effect_unavailable.weft" "type error: effect not available in caller"
+check_rejects "method_call_unknown" "test/negative/method_call_unknown.weft" "type error: unknown method"
+check_rejects "method_call_trait_unknown" "test/negative/method_call_trait_unknown.weft" "type error: unknown method"
 check_rejects "let_bound_lambda_effect_mismatch" "test/negative/let_bound_lambda_effect_mismatch.weft" "type error: argument type mismatch"
 check_rejects "let_bound_lambda_effect_unavailable" "test/negative/let_bound_lambda_effect_unavailable.weft" "type error: effect not available in caller"
 check_rejects "let_bound_lambda_return_mismatch" "test/negative/let_bound_lambda_return_mismatch.weft" "type error: argument type mismatch"
