@@ -7,6 +7,8 @@ WEFT=${WEFT:-./weft}
 PASS=0
 FAIL=0
 ERRORS=""
+RUNTIME_FILES=0
+RUNTIME_TESTS=0
 
 echo "=== Weft Test Suite ==="
 echo ""
@@ -14,6 +16,9 @@ echo ""
 for f in $(grep -l 'test "' test/*.weft 2>/dev/null); do
   name=$(basename "$f" .weft)
   tmpbin=$(mktemp /tmp/weft_test_XXXXXX)
+  file_tests=$(grep -c 'test "' "$f")
+  RUNTIME_FILES=$((RUNTIME_FILES+1))
+  RUNTIME_TESTS=$((RUNTIME_TESTS+file_tests))
 
   # Compile test file
   if ! timeout 30 "$WEFT" test < "$f" > "$tmpbin" 2>/dev/null; then
@@ -112,7 +117,8 @@ fi
 
 echo ""
 echo "=== Summary ==="
-echo "$PASS passed, $FAIL failed"
+echo "$PASS suite groups passed, $FAIL failed"
+echo "Runtime tests: $RUNTIME_FILES files, $RUNTIME_TESTS test blocks"
 if [ -n "$ERRORS" ]; then
   echo ""
   echo "Failures:"

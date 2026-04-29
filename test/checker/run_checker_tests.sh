@@ -45,6 +45,8 @@ check_accepts "handler_clause_coverage" "test/checker/handler_clause_coverage.we
 check_accepts "generic_type_declarations" "test/checker/generic_type_declarations.weft"
 check_accepts "compiler_self_check" "compiler/main.weft"
 
+echo ""
+echo "Checker summary: $PASS passed, $FAIL failed"
 if [ $FAIL -gt 0 ]; then
   echo ""
   echo "Checker test failures:"
