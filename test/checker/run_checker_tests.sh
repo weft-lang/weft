@@ -35,6 +35,7 @@ check_accepts "function_value_effect_call" "test/checker/function_value_effect_c
 check_accepts "let_bound_lambdas" "test/checker/let_bound_lambdas.weft"
 check_accepts "name_resolution" "test/checker/name_resolution.weft"
 check_accepts "field_access" "test/checker/field_access.weft"
+check_accepts "record_init" "test/checker/record_init.weft"
 check_accepts "arity_happy_paths" "test/checker/arity_happy_paths.weft"
 check_accepts "handler_clause_typing" "test/checker/handler_clause_typing.weft"
 check_accepts "handler_clause_coverage" "test/checker/handler_clause_coverage.weft"
