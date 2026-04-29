@@ -53,6 +53,10 @@ check_rejects "handler_clause_resume_type_mismatch" "test/negative/handler_claus
 check_rejects "handler_clause_duplicate" "test/negative/handler_clause_duplicate.weft" "type error: duplicate handler clause"
 check_rejects "handler_clause_missing_direct" "test/negative/handler_clause_missing_direct.weft" "type error: missing handler clause"
 check_rejects "handler_clause_missing_branch" "test/negative/handler_clause_missing_branch.weft" "type error: missing handler clause"
+check_rejects "generic_type_payload_mismatch" "test/negative/generic_type_payload_mismatch.weft" "type error: argument type mismatch"
+check_rejects "generic_type_return_mismatch" "test/negative/generic_type_return_mismatch.weft" "type error: value does not match let type annotation"
+check_rejects "generic_type_constructor_arity" "test/negative/generic_type_constructor_arity.weft" "type error: arity mismatch"
+check_rejects "generic_type_arg_count" "test/negative/generic_type_arg_count.weft" "type error: wrong number of type arguments"
 
 echo ""
 echo "=== Negative Summary ==="
