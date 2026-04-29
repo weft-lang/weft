@@ -57,6 +57,7 @@ check_rejects "generic_type_payload_mismatch" "test/negative/generic_type_payloa
 check_rejects "generic_type_return_mismatch" "test/negative/generic_type_return_mismatch.weft" "type error: value does not match let type annotation"
 check_rejects "generic_type_constructor_arity" "test/negative/generic_type_constructor_arity.weft" "type error: arity mismatch"
 check_rejects "generic_type_arg_count" "test/negative/generic_type_arg_count.weft" "type error: wrong number of type arguments"
+check_rejects "generic_type_pattern_payload_mismatch" "test/negative/generic_type_pattern_payload_mismatch.weft" "type error: return type mismatch"
 
 echo ""
 echo "=== Negative Summary ==="
