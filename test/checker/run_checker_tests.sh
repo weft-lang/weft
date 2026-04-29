@@ -26,6 +26,7 @@ check_accepts() {
 check_accepts "method_return_let" "test/checker/method_return_let.weft"
 check_accepts "handled_effect_perform" "test/checker/handled_effect_perform.weft"
 check_accepts "handled_try_effect" "test/checker/handled_try_effect.weft"
+check_accepts "imported_effect_perform_args" "test/checker/imported_effect_perform_args.weft"
 check_accepts "compiler_self_check" "compiler/main.weft"
 
 if [ $FAIL -gt 0 ]; then
