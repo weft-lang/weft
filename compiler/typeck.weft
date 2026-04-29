@@ -130,6 +130,28 @@ fn ftypes_lookup_tparams(ft: i64, src: i64, ns: i64, nl: i64) -> i64 {
   result
 }
 
+fn param_type_list(params: i64) -> i64 {
+  let result = nlist_new()
+  let n = nlist_len(params)
+  for i in 0..n {
+    let p = nlist_get(params, i)
+    let ty = node_f3(p)
+    if ty != 0 { nlist_add(result, ty) }
+    else { nlist_add(result, ty_any()) }
+  }
+  result
+}
+
+fn ftypes_lookup_fn_type(ft: i64, src: i64, ns: i64, nl: i64) -> i64 {
+  let ret = ftypes_lookup(ft, src, ns, nl)
+  if ret == 0 { 0 }
+  else {
+    let params = ftypes_lookup_params(ft, src, ns, nl)
+    let effects = ftypes_lookup_effects(ft, src, ns, nl)
+    ty_fn(param_type_list(params), ret, effects)
+  }
+}
+
 -- ══════════════════════════════════════════════════════════════
 -- Conformance table: maps (type_hash, trait_hash) → method list
 -- Entry: [type_hash(8), trait_hash(8), methods_ptr(8)] = 24 bytes
@@ -347,8 +369,8 @@ fn synth(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
   match tag {
     -- IntLit → i64
     1 -> ty_i64()
-    -- Ident → lookup in environment
-    2 -> synth_ident(node, env, src)
+    -- Ident → lookup in environment or function table
+    2 -> synth_ident(node, env, ft, src)
     -- BinOp → depends on operator
     3 -> synth_binop(node, env, ft, src, tt)
     -- Call → return type of function
@@ -367,8 +389,8 @@ fn synth(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
     11 -> synth_let_mut(node, env, ft, src, tt)
     -- Assign → nil
     12 -> ty_nil()
-    -- FieldAccess → i64 (no field types yet)
-    13 -> ty_i64()
+    -- FieldAccess → i64 (and annotate record offset when type is known)
+    13 -> synth_field_access(node, env, ft, src, tt)
     -- RecordInit → Named(type_hash, i64) — nominal record type
     14 -> ty_named(effect_name_hash(src, node_f1(node), node_f2(node)), ty_i64())
     -- Match → type of first arm body (simplified)
@@ -390,11 +412,26 @@ fn synth(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
   }
 }
 
-fn synth_ident(node: i64, env: i64, src: i64) -> i64 {
+fn synth_ident(node: i64, env: i64, ft: i64, src: i64) -> i64 {
   let ns = node_f1(node)
   let nl = node_f2(node)
   let ty = tenv_lookup(env, src, ns, nl)
-  if ty == 0 { ty_any() } else { ty }
+  if ty == 0 {
+    let fn_ty = ftypes_lookup_fn_type(ft, src, ns, nl)
+    if fn_ty == 0 { ty_any() } else { fn_ty }
+  } else { ty }
+}
+
+fn synth_field_access(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
+  let base = node_f1(node)
+  let field_ns = node_f2(node)
+  let field_nl = node_f3(node)
+  let base_ty = synth(base, env, ft, src, tt)
+  if ty_tag(base_ty) == 9 {
+    let idx = ttable_find_field_by_type_hash(tt, ty_f1(base_ty), src, field_ns, field_nl)
+    if idx >= 0 { __mem_store64(node + 32, idx + 1) } else { 0 }
+  } else { 0 }
+  ty_i64()
 }
 
 fn synth_binop(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
@@ -919,6 +956,38 @@ fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) 
       }
       errors
     }
+    32 -> {
+      -- Perform/dot-call: resolve method calls (synth mutates tag 32 → 41)
+      -- and recurse into args so nested method calls also get resolved
+      synth_dot_call(node, env, ft, src, tt)
+      let new_tag = node_tag(node)
+      if new_tag == 41 {
+        -- Resolved as method call: recurse into method args (f3 in tag 41)
+        let ma = node_f3(node)
+        let mn = nlist_len(ma)
+        for mai in 0..mn {
+          errors = errors + check_expr(nlist_get(ma, mai), env, ft, src, caller_eff, tt)
+        }
+        errors
+      } else {
+        -- Effect perform: recurse into perform args (f4 in tag 32)
+        let pa = node_f4(node)
+        let pn = nlist_len(pa)
+        for pai in 0..pn {
+          errors = errors + check_expr(nlist_get(pa, pai), env, ft, src, caller_eff, tt)
+        }
+        errors
+      }
+    }
+    41 -> {
+      -- Already-resolved method call: recurse into args
+      let ma = node_f3(node)
+      let mn = nlist_len(ma)
+      for mai in 0..mn {
+        errors = errors + check_expr(nlist_get(ma, mai), env, ft, src, caller_eff, tt)
+      }
+      errors
+    }
     _ -> errors
   }
 }
@@ -996,10 +1065,12 @@ fn check_fn(fn_node: i64, ft: i64, src: i64, tt: i64) -> i64 {
   let saved_tparams = ttable_get_tparams(tt)
   ttable_set_tparams(tt, tparams)
   let caller_eff = fn_effects(fn_node)
-  let mut errors = check_expr(body, env, ft, src, caller_eff, tt)
-  -- Check return type: body type must be subtype of declared return type
+  -- synth first to convert tag-32 dot-calls to tag-41 method calls
   let ret_ty = fn_ret_type(fn_node)
   let body_ty = synth(body, env, ft, src, tt)
+  -- check_expr recurses deeper and resolves remaining tag-32 nodes
+  let mut errors = check_expr(body, env, ft, src, caller_eff, tt)
+  -- Check return type: body type must be subtype of declared return type
   if not is_subtype(body_ty, ret_ty) {
     eprint_span(src, node_f1(inner))
     eprint("type error: return type mismatch\n")

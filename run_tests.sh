@@ -63,6 +63,26 @@ fi
 rm -f "$tmpw1" "$tmpw2" "$tmpw3"
 
 echo ""
+echo "=== Linked Tests ==="
+if bash test/linked/run_linked_tests.sh; then
+  PASS=$((PASS+1))
+else
+  echo "  ✗ linked tests failed"
+  FAIL=$((FAIL+1))
+  ERRORS="$ERRORS\n  linked tests failed"
+fi
+
+echo ""
+echo "=== Negative Tests ==="
+if bash test/negative/run_negative_tests.sh; then
+  PASS=$((PASS+1))
+else
+  echo "  ✗ negative tests failed"
+  FAIL=$((FAIL+1))
+  ERRORS="$ERRORS\n  negative tests failed"
+fi
+
+echo ""
 echo "=== Summary ==="
 echo "$PASS passed, $FAIL failed"
 if [ -n "$ERRORS" ]; then
