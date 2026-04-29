@@ -48,10 +48,30 @@ echo "=== Bootstrap Gate ==="
 tmpw1=$(mktemp /tmp/weft_test_XXXXXX)
 tmpw2=$(mktemp /tmp/weft_test_XXXXXX)
 tmpw3=$(mktemp /tmp/weft_test_XXXXXX)
-"$WEFT" < compiler/main.weft > "$tmpw1" 2>/dev/null && chmod +x "$tmpw1"
-"$tmpw1" < compiler/main.weft > "$tmpw2" 2>/dev/null && chmod +x "$tmpw2"
-"$tmpw2" < compiler/main.weft > "$tmpw3" 2>/dev/null && chmod +x "$tmpw3"
-if diff <(xxd "$tmpw2") <(xxd "$tmpw3") > /dev/null 2>&1; then
+bootstrap_ok=1
+if "$WEFT" < compiler/main.weft > "$tmpw1" 2>/dev/null; then
+  chmod +x "$tmpw1"
+else
+  bootstrap_ok=0
+  echo "  ✗ bootstrap stage 1 failed"
+fi
+if [ $bootstrap_ok -eq 1 ]; then
+  if "$tmpw1" < compiler/main.weft > "$tmpw2" 2>/dev/null; then
+    chmod +x "$tmpw2"
+  else
+    bootstrap_ok=0
+    echo "  ✗ bootstrap stage 2 failed"
+  fi
+fi
+if [ $bootstrap_ok -eq 1 ]; then
+  if "$tmpw2" < compiler/main.weft > "$tmpw3" 2>/dev/null; then
+    chmod +x "$tmpw3"
+  else
+    bootstrap_ok=0
+    echo "  ✗ bootstrap stage 3 failed"
+  fi
+fi
+if [ $bootstrap_ok -eq 1 ] && diff <(xxd "$tmpw2") <(xxd "$tmpw3") > /dev/null 2>&1; then
   echo "  ✓ weft2 == weft3 (byte-identical)"
   PASS=$((PASS+1))
 else
