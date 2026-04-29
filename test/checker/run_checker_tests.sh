@@ -33,6 +33,7 @@ check_accepts "contextual_effect_op_lambda" "test/checker/contextual_effect_op_l
 check_accepts "function_value_pure_call" "test/checker/function_value_pure_call.weft"
 check_accepts "function_value_effect_call" "test/checker/function_value_effect_call.weft"
 check_accepts "arity_happy_paths" "test/checker/arity_happy_paths.weft"
+check_accepts "handler_clause_typing" "test/checker/handler_clause_typing.weft"
 check_accepts "compiler_self_check" "compiler/main.weft"
 
 if [ $FAIL -gt 0 ]; then

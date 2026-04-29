@@ -44,6 +44,12 @@ check_rejects "generic_call_arity_mismatch" "test/negative/generic_call_arity_mi
 check_rejects "function_value_arity_mismatch" "test/negative/function_value_arity_mismatch.weft" "type error: arity mismatch"
 check_rejects "effect_perform_arity_too_few" "test/negative/effect_perform_arity_too_few.weft" "type error: arity mismatch"
 check_rejects "effect_perform_arity_too_many" "test/negative/effect_perform_arity_too_many.weft" "type error: arity mismatch"
+check_rejects "handler_clause_unknown_op" "test/negative/handler_clause_unknown_op.weft" "type error: unknown effect operation"
+check_rejects "handler_clause_effect_mismatch" "test/negative/handler_clause_effect_mismatch.weft" "type error: handler clause effect mismatch"
+check_rejects "handler_clause_arity_too_few" "test/negative/handler_clause_arity_too_few.weft" "type error: arity mismatch"
+check_rejects "handler_clause_arity_too_many" "test/negative/handler_clause_arity_too_many.weft" "type error: arity mismatch"
+check_rejects "handler_clause_param_type_mismatch" "test/negative/handler_clause_param_type_mismatch.weft" "type error: argument type mismatch"
+check_rejects "handler_clause_resume_type_mismatch" "test/negative/handler_clause_resume_type_mismatch.weft" "type error: resume type mismatch"
 
 echo ""
 echo "=== Negative Summary ==="
