@@ -44,6 +44,7 @@ check_rejects "let_bound_lambda_return_mismatch" "test/negative/let_bound_lambda
 check_rejects "unknown_identifier" "test/negative/unknown_identifier.weft" "type error: unknown identifier"
 check_rejects "unknown_function" "test/negative/unknown_function.weft" "type error: unknown function"
 check_rejects "call_non_function" "test/negative/call_non_function.weft" "type error: called value is not a function"
+check_rejects "no_payload_variant_not_function" "test/negative/no_payload_variant_not_function.weft" "type error: called value is not a function"
 check_rejects "unknown_record_field" "test/negative/unknown_record_field.weft" "type error: unknown field"
 check_rejects "field_access_non_record" "test/negative/field_access_non_record.weft" "type error: field access on non-record"
 check_rejects "record_init_unknown_type" "test/negative/record_init_unknown_type.weft" "type error: unknown record type"
