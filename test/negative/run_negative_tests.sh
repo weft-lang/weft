@@ -97,6 +97,7 @@ check_rejects "assignment_immutable_let" "test/negative/assignment_immutable_let
 check_rejects "assignment_immutable_typed_let" "test/negative/assignment_immutable_typed_let.weft" "type error: cannot assign to immutable binding"
 check_rejects "assignment_param_immutable" "test/negative/assignment_param_immutable.weft" "type error: cannot assign to immutable binding"
 check_rejects "assignment_pattern_binding_immutable" "test/negative/assignment_pattern_binding_immutable.weft" "type error: cannot assign to immutable binding"
+check_rejects "assignment_for_range_index" "test/negative/assignment_for_range_index.weft" "type error: cannot assign to immutable binding"
 check_rejects "lambda_capture_mut_binding" "test/negative/lambda_capture_mut_binding.weft" "type error: cannot capture mut binding"
 check_rejects "lambda_capture_mut_assignment" "test/negative/lambda_capture_mut_assignment.weft" "type error: cannot capture mut binding"
 check_rejects "return_branch_type_mismatch" "test/negative/return_branch_type_mismatch.weft" "type error: return type mismatch"
