@@ -32,8 +32,6 @@ bootstrap:
     /tmp/weft_b2 < compiler/main.weft > /tmp/weft_b3
     chmod +x /tmp/weft_b3
     echo "=== Gate check ==="
-    codesign --remove-signature /tmp/weft_b2 2>/dev/null || true
-    codesign --remove-signature /tmp/weft_b3 2>/dev/null || true
     if diff <(xxd /tmp/weft_b2) <(xxd /tmp/weft_b3) > /dev/null; then
         echo "✓ weft2 == weft3 (byte-identical)"
         mv /tmp/weft_b2 ./weft

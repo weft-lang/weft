@@ -51,8 +51,6 @@ tmpw3=$(mktemp /tmp/weft_test_XXXXXX)
 "$WEFT" < compiler/main.weft > "$tmpw1" 2>/dev/null && chmod +x "$tmpw1"
 "$tmpw1" < compiler/main.weft > "$tmpw2" 2>/dev/null && chmod +x "$tmpw2"
 "$tmpw2" < compiler/main.weft > "$tmpw3" 2>/dev/null && chmod +x "$tmpw3"
-codesign --remove-signature "$tmpw2" 2>/dev/null || true
-codesign --remove-signature "$tmpw3" 2>/dev/null || true
 if diff <(xxd "$tmpw2") <(xxd "$tmpw3") > /dev/null 2>&1; then
   echo "  ✓ weft2 == weft3 (byte-identical)"
   PASS=$((PASS+1))
@@ -70,6 +68,16 @@ else
   echo "  ✗ linked tests failed"
   FAIL=$((FAIL+1))
   ERRORS="$ERRORS\n  linked tests failed"
+fi
+
+echo ""
+echo "=== Checker Tests ==="
+if bash test/checker/run_checker_tests.sh; then
+  PASS=$((PASS+1))
+else
+  echo "  ✗ checker tests failed"
+  FAIL=$((FAIL+1))
+  ERRORS="$ERRORS\n  checker tests failed"
 fi
 
 echo ""
