@@ -50,6 +50,9 @@ check_rejects "handler_clause_arity_too_few" "test/negative/handler_clause_arity
 check_rejects "handler_clause_arity_too_many" "test/negative/handler_clause_arity_too_many.weft" "type error: arity mismatch"
 check_rejects "handler_clause_param_type_mismatch" "test/negative/handler_clause_param_type_mismatch.weft" "type error: argument type mismatch"
 check_rejects "handler_clause_resume_type_mismatch" "test/negative/handler_clause_resume_type_mismatch.weft" "type error: resume type mismatch"
+check_rejects "handler_clause_duplicate" "test/negative/handler_clause_duplicate.weft" "type error: duplicate handler clause"
+check_rejects "handler_clause_missing_direct" "test/negative/handler_clause_missing_direct.weft" "type error: missing handler clause"
+check_rejects "handler_clause_missing_branch" "test/negative/handler_clause_missing_branch.weft" "type error: missing handler clause"
 
 echo ""
 echo "=== Negative Summary ==="
