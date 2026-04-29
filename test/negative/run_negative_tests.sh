@@ -51,6 +51,8 @@ check_rejects "record_init_unknown_field" "test/negative/record_init_unknown_fie
 check_rejects "record_init_missing_field" "test/negative/record_init_missing_field.weft" "type error: missing record field"
 check_rejects "record_init_duplicate_field" "test/negative/record_init_duplicate_field.weft" "type error: duplicate record field"
 check_rejects "record_init_variant_type" "test/negative/record_init_variant_type.weft" "type error: not a record type"
+check_rejects "record_init_field_type_mismatch" "test/negative/record_init_field_type_mismatch.weft" "type error: record field type mismatch"
+check_rejects "record_field_access_type_mismatch" "test/negative/record_field_access_type_mismatch.weft" "type error: return type mismatch"
 check_rejects "call_arity_too_few" "test/negative/call_arity_too_few.weft" "type error: arity mismatch"
 check_rejects "call_arity_too_many" "test/negative/call_arity_too_many.weft" "type error: arity mismatch"
 check_rejects "generic_call_arity_mismatch" "test/negative/generic_call_arity_mismatch.weft" "type error: arity mismatch"
