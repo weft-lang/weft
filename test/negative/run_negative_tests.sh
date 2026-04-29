@@ -74,6 +74,7 @@ check_rejects "return_str_i64_mismatch" "test/negative/return_str_i64_mismatch.w
 check_rejects "unhandled_effect_in_return" "test/negative/unhandled_effect_in_return.weft" "type error: effect not available in caller"
 check_rejects "unhandled_effect_in_break" "test/negative/unhandled_effect_in_break.weft" "type error: effect not available in caller"
 check_rejects "contextual_lambda_return_stmt_mismatch" "test/negative/contextual_lambda_return_stmt_mismatch.weft" "type error: return type mismatch"
+check_rejects "let_bound_lambda_return_stmt_mismatch" "test/negative/let_bound_lambda_return_stmt_mismatch.weft" "type error: return type mismatch"
 check_rejects "call_arity_too_few" "test/negative/call_arity_too_few.weft" "type error: arity mismatch"
 check_rejects "call_arity_too_many" "test/negative/call_arity_too_many.weft" "type error: arity mismatch"
 check_rejects "generic_call_arity_mismatch" "test/negative/generic_call_arity_mismatch.weft" "type error: arity mismatch"
