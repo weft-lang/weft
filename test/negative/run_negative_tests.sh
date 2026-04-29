@@ -54,6 +54,8 @@ check_rejects "trait_assoc_missing" "test/negative/trait_assoc_missing.weft" "ty
 check_rejects "trait_assoc_duplicate" "test/negative/trait_assoc_duplicate.weft" "type error: duplicate associated type binding"
 check_rejects "trait_assoc_extra" "test/negative/trait_assoc_extra.weft" "type error: impl associated type is not declared by trait"
 check_rejects "let_bound_lambda_effect_mismatch" "test/negative/let_bound_lambda_effect_mismatch.weft" "type error: argument type mismatch"
+check_rejects "let_bound_lambda_record_effect_mismatch" "test/negative/let_bound_lambda_record_effect_mismatch.weft" "type error: argument type mismatch"
+check_rejects "let_bound_lambda_method_effect_mismatch" "test/negative/let_bound_lambda_method_effect_mismatch.weft" "type error: argument type mismatch"
 check_rejects "let_bound_lambda_effect_unavailable" "test/negative/let_bound_lambda_effect_unavailable.weft" "type error: effect not available in caller"
 check_rejects "let_bound_lambda_return_mismatch" "test/negative/let_bound_lambda_return_mismatch.weft" "type error: argument type mismatch"
 check_rejects "unknown_identifier" "test/negative/unknown_identifier.weft" "type error: unknown identifier"
