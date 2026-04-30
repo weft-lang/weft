@@ -106,6 +106,16 @@ else
 fi
 
 echo ""
+echo "=== Tool Boundary Tests ==="
+if bash test/tools/run_tool_tests.sh; then
+  PASS=$((PASS+1))
+else
+  echo "  ✗ tool boundary tests failed"
+  FAIL=$((FAIL+1))
+  ERRORS="$ERRORS\n  tool boundary tests failed"
+fi
+
+echo ""
 echo "=== Negative Tests ==="
 if bash test/negative/run_negative_tests.sh; then
   PASS=$((PASS+1))
