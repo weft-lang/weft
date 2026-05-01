@@ -32,6 +32,7 @@ check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" "type e
 check_rejects "unhandled_effect_perform" "test/negative/unhandled_effect_perform.weft" "type error: effect not available in caller"
 check_rejects "unhandled_effect_in_while" "test/negative/unhandled_effect_in_while.weft" "type error: effect not available in caller"
 check_rejects "unhandled_try_effect" "test/negative/unhandled_try_effect.weft" "type error: effect not available in caller"
+check_rejects "unhandled_optional_chain_effect" "test/negative/unhandled_optional_chain_effect.weft" "type error: effect not available in caller"
 check_rejects "effect_perform_arg_mismatch" "test/negative/effect_perform_arg_mismatch.weft" "type error: argument type mismatch"
 check_rejects "effectful_lambda_to_pure_fn" "test/negative/effectful_lambda_to_pure_fn.weft" "type error: effect not available in caller"
 check_rejects "effectful_lambda_to_pure_effect_op" "test/negative/effectful_lambda_to_pure_effect_op.weft" "type error: effect not available in caller"
