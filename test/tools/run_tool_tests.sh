@@ -60,4 +60,13 @@ printf 'use "%s"\nfn main() -> i64 { sentinel() }\n' "$tmp_import" > "$tmp_src"
 large_import_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_reads_large_import" "$large_import_out" "check: 2 functions, 0 errors"
 
-echo "Tool boundary summary: 8 passed, 0 failed"
+: > "$tmp_src"
+for ((i = 0; i < 1800; i++)); do
+  printf 'test "t%d" { Test.assert_eq(1, 1) }\n' "$i" >> "$tmp_src"
+done
+"$WEFT" test < "$tmp_src" > "$tmp_bin" 2>/dev/null
+chmod +x "$tmp_bin"
+"$tmp_bin"
+echo "  ok test_builds_large_harness"
+
+echo "Tool boundary summary: 9 passed, 0 failed"
