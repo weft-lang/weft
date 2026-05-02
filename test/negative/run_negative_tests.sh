@@ -35,6 +35,7 @@ check_rejects "unsafe_raw_syscall_requires_effect" "test/negative/unsafe_raw_sys
 check_rejects "unsafe_got_requires_effect" "test/negative/unsafe_got_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_wrapper_must_discharge" "test/negative/unsafe_wrapper_must_discharge.weft" "type error: effect not available in caller"
 check_rejects "unsafe_lambda_to_pure_fn" "test/negative/unsafe_lambda_to_pure_fn.weft" "type error: effect not available in caller"
+check_rejects "non_unsafe_handler_raw_call" "test/negative/non_unsafe_handler_raw_call.weft" "type error: effect not available in caller"
 check_rejects "unhandled_effect_in_while" "test/negative/unhandled_effect_in_while.weft" "type error: effect not available in caller"
 check_rejects "unhandled_effect_in_defer" "test/negative/unhandled_effect_in_defer.weft" "type error: effect not available in caller"
 check_rejects "unhandled_try_effect" "test/negative/unhandled_try_effect.weft" "type error: effect not available in caller"
