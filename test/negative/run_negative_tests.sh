@@ -30,6 +30,7 @@ check_rejects() {
 
 check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" "type error: argument type mismatch"
 check_rejects "unhandled_effect_perform" "test/negative/unhandled_effect_perform.weft" "type error: effect not available in caller"
+check_rejects "unhandled_alloc_effect" "test/negative/unhandled_alloc_effect.weft" "type error: effect not available in caller"
 check_rejects "unhandled_effect_in_while" "test/negative/unhandled_effect_in_while.weft" "type error: effect not available in caller"
 check_rejects "unhandled_try_effect" "test/negative/unhandled_try_effect.weft" "type error: effect not available in caller"
 check_rejects "unhandled_optional_chain_effect" "test/negative/unhandled_optional_chain_effect.weft" "type error: effect not available in caller"
