@@ -314,7 +314,7 @@ fn str_hash(src: i64, start: i64, len: i64) -> i64 {
 -- ======================================================================
 
 fn fmap_new() -> i64 {
-  let h = alloc_bump(144)
+  let h = alloc_bump(160)
   let d = alloc_bump(64000)
   __mem_store64(h, d)
   __mem_store64(h + 8, 0)
@@ -345,6 +345,9 @@ fn fmap_new() -> i64 {
   __mem_store64(h + 120, gp)
   __mem_store64(h + 128, 0)
   __mem_store64(h + 136, 64)
+  -- Active lexical defer cleanup stack and current loop cleanup boundary.
+  __mem_store64(h + 144, nlist_new())
+  __mem_store64(h + 152, 0)
   h
 }
 fn fmap_set_tt(fm: i64, tt: i64) -> i64 { __mem_store64(fm + 48, tt) 0 }
@@ -771,11 +774,13 @@ fn cg_while(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i6
   -- Save outer loop context
   let old_loop_start = __mem_load64(fm + 56)
   let old_break_patches = __mem_load64(fm + 64)
+  let old_loop_cleanup_depth = __mem_load64(fm + 152)
   -- Set up this loop's context
   let loop_start = buf_len(code)
   let break_patches = nlist_new()
   __mem_store64(fm + 56, loop_start)
   __mem_store64(fm + 64, break_patches)
+  __mem_store64(fm + 152, cg_cleanup_count(fm))
   let c1 = cg_expr(cond, code, scope, src, ctr, fm)
   let cond_phys = emit_load_reg(code, c1 - 1)
   -- CBZ cond, after_loop (placeholder)
@@ -793,6 +798,7 @@ fn cg_while(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i6
   -- Restore outer loop context
   __mem_store64(fm + 56, old_loop_start)
   __mem_store64(fm + 64, old_break_patches)
+  __mem_store64(fm + 152, old_loop_cleanup_depth)
   -- Result is 0 (nil)
   cg_int(node_new(1, 0, 0, 0, 0), code, ctr)
 }
@@ -1222,13 +1228,53 @@ fn cg_block(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i6
   cg_expr(rest, code, scope, src, ctr, fm)
 }
 
+fn cg_cleanup_stack(fm: i64) -> i64 {
+  __mem_load64(fm + 144)
+}
+
+fn cg_cleanup_count(fm: i64) -> i64 {
+  nlist_len(cg_cleanup_stack(fm))
+}
+
+fn cg_cleanup_push(fm: i64, cleanup: i64, scope: i64) -> i64 {
+  let stack = cg_cleanup_stack(fm)
+  nlist_add(stack, node_new(0, cleanup, scope, 0, 0))
+  nlist_len(stack)
+}
+
+fn cg_cleanup_restore(fm: i64, depth: i64) -> i64 {
+  let stack = cg_cleanup_stack(fm)
+  __mem_store64(stack + 8, depth)
+  0
+}
+
+fn cg_emit_cleanups_to_depth(code: i64, src: i64, ctr: i64, fm: i64, depth: i64) -> i64 {
+  let stack = cg_cleanup_stack(fm)
+  let old_len = nlist_len(stack)
+  let mut remaining = old_len - depth
+  let mut c = ctr
+  while remaining > 0 {
+    let i = depth + remaining - 1
+    let entry = nlist_get(stack, i)
+    __mem_store64(stack + 8, i)
+    c = cg_expr(node_f1(entry), code, node_f2(entry), src, c, fm)
+    __mem_store64(stack + 8, old_len)
+    remaining = remaining - 1
+  }
+  __mem_store64(stack + 8, old_len)
+  c
+}
+
 fn cg_defer(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
   let cleanup = node_f1(node)
   let body = node_f2(node)
+  let depth = cg_cleanup_count(fm)
+  cg_cleanup_push(fm, cleanup, scope)
   let br = cg_expr(body, code, scope, src, ctr, fm)
   let save_ctr = br
   cg_match_store_result(code, save_ctr, br)
-  cg_expr(cleanup, code, scope, src, save_ctr + 1, fm)
+  cg_emit_cleanups_to_depth(code, src, save_ctr + 1, fm, depth)
+  cg_cleanup_restore(fm, depth)
   cg_match_store_result(code, ctr, save_ctr + 1)
   ctr + 1
 }
@@ -1262,7 +1308,7 @@ fn cg_expr_high(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -
     24 -> cg_int(node_new(1, node_f1(node), 0, 0, 0), code, ctr)
     25 -> cg_return(node, code, scope, src, ctr, fm)
     26 -> cg_break(node, code, scope, src, ctr, fm)
-    27 -> cg_continue(node, code, ctr, fm)
+    27 -> cg_continue(node, code, scope, src, ctr, fm)
     29 -> cg_lambda(node, code, scope, src, ctr, fm)
     32 -> cg_dot_call(node, code, scope, src, ctr, fm)
     33 -> cg_handle(node, code, scope, src, ctr, fm)
@@ -1295,7 +1341,10 @@ fn cg_expr(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64
 fn cg_return(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
   let val = node_f1(node)
   let c1 = cg_expr(val, code, scope, src, ctr, fm)
-  let result_phys = emit_load_reg(code, c1 - 1)
+  let save_ctr = c1
+  cg_match_store_result(code, save_ctr, c1)
+  cg_emit_cleanups_to_depth(code, src, save_ctr + 1, fm, 0)
+  let result_phys = emit_load_reg(code, save_ctr)
   bu32(code, encode_add_imm(0, result_phys, 0))
   emit_epilogue(code)
   ctr + 1
@@ -1305,10 +1354,12 @@ fn cg_return(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i
 fn cg_break(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
   -- Check for break(expr) — tag 26, f1 = value node or 0
   let val_node = node_f1(node)
-  if val_node != 0 {
+  let cleanup_ctr = if val_node != 0 {
     -- break(expr): evaluate expr, store in the loop's result register (ctr - 1)
     -- The loop allocated ctr for its result. break(expr) writes to it.
-    let c = cg_expr(val_node, code, scope, src, ctr, fm)
+    cg_expr(val_node, code, scope, src, ctr, fm)
+  } else { ctr }
+  if val_node != 0 {
     -- Move result to the ENCLOSING loop's ctr position
     -- The loop's ctr is ctr - 1 (since loop body runs at ctr)
     -- Actually, the loop increments ctr by 1 at the end. The break value
@@ -1316,6 +1367,7 @@ fn cg_break(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i6
     -- For now, just evaluate and let the break jump leave the value in place.
     0
   } else { 0 }
+  cg_emit_cleanups_to_depth(code, src, cleanup_ctr, fm, __mem_load64(fm + 152))
   let patches = __mem_load64(fm + 64)
   if patches > 0 {
     nlist_add(patches, buf_len(code))
@@ -1327,9 +1379,10 @@ fn cg_break(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i6
 }
 
 -- continue: emit B back to loop_start
-fn cg_continue(node: i64, code: i64, ctr: i64, fm: i64) -> i64 {
+fn cg_continue(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
   let loop_start = __mem_load64(fm + 56)
   if loop_start > 0 {
+    cg_emit_cleanups_to_depth(code, src, ctr, fm, __mem_load64(fm + 152))
     let cur = buf_len(code)
     bu32(code, encode_b(loop_start - cur))
   } else {
@@ -2539,11 +2592,13 @@ fn cg_loop(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64
   -- Save outer loop context
   let old_loop_start = __mem_load64(fm + 56)
   let old_break_patches = __mem_load64(fm + 64)
+  let old_loop_cleanup_depth = __mem_load64(fm + 152)
   -- Set up this loop's context
   let loop_start = buf_len(code)
   let break_patches = nlist_new()
   __mem_store64(fm + 56, loop_start)
   __mem_store64(fm + 64, break_patches)
+  __mem_store64(fm + 152, cg_cleanup_count(fm))
   -- Compile body (runs repeatedly)
   cg_expr(body, code, scope, src, ctr, fm)
   -- B loop_start (unconditional back-edge)
@@ -2554,6 +2609,7 @@ fn cg_loop(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64
   -- Restore outer loop context
   __mem_store64(fm + 56, old_loop_start)
   __mem_store64(fm + 64, old_break_patches)
+  __mem_store64(fm + 152, old_loop_cleanup_depth)
   -- Result is in ctr (set by break(expr) in cg_break)
   ctr + 1
 }
