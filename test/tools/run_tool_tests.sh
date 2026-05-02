@@ -41,6 +41,11 @@ assert_contains "ast_parse_only_literal" "$ast_out" "IntLit(42)"
 check_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_parse_and_typecheck" "$check_out" "check: 1 functions, 0 errors"
 
+printf 'fn broken() -> i64 { 1\nfn after() -> i64 { 2 }\n' > "$tmp_src"
+parse_recovery_out=$("$WEFT" ast < "$tmp_src" 2>&1)
+assert_contains "ast_reports_parse_recovery" "$parse_recovery_out" "error: expected '}' before declaration"
+assert_contains "ast_recovers_after_parse_error" "$parse_recovery_out" "--- AST: 2 functions ---"
+
 printf 'fn main() -> i64 { missing }\n' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_reports_diagnostics" "$diag_out" "type error: unknown identifier"
@@ -69,4 +74,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 9 passed, 0 failed"
+echo "Tool boundary summary: 11 passed, 0 failed"
