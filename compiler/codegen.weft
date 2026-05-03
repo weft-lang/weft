@@ -451,8 +451,8 @@ fn fmap_new() -> i64 {
   __mem_store64(h + 80, mono_tmap_new())
   -- Specialisation cache: (spec_hash → code_offset) (offset 88)
   __mem_store64(h + 88, mono_cache_new())
-  -- Handler inlining context (offset 96): current handler info for static dispatch
-  -- [eff_hash(8), clause_infos_ptr(8), nclauses(8)] = 24 bytes at h+96..h+120
+  -- Handler inlining context stack (offset 96): compile-time handler scopes.
+  -- Context layout: [eff_hash, clauses, clause_infos, nclauses, ops_ctr, prev].
   __mem_store64(h + 96, 0)
   __mem_store64(h + 104, 0)
   __mem_store64(h + 112, 0)
@@ -522,6 +522,94 @@ fn fmap_lookup_qualified(fm: i64, src: i64, ns: i64, nl: i64, owner_hash: i64) -
 }
 fn fmap_lookup(fm: i64, src: i64, ns: i64, nl: i64) -> i64 {
   fmap_lookup_qualified(fm, src, ns, nl, 0)
+}
+
+fn cg_handler_inline_ctx_size() -> i64 { 48 }
+fn cg_handler_inline_ctx_eff_offset() -> i64 { 0 }
+fn cg_handler_inline_ctx_clauses_offset() -> i64 { 8 }
+fn cg_handler_inline_ctx_infos_offset() -> i64 { 16 }
+fn cg_handler_inline_ctx_nclauses_offset() -> i64 { 24 }
+fn cg_handler_inline_ctx_ops_ctr_offset() -> i64 { 32 }
+fn cg_handler_inline_ctx_prev_offset() -> i64 { 40 }
+
+fn cg_handler_inline_match_size() -> i64 { 32 }
+fn cg_handler_inline_match_info_offset() -> i64 { 0 }
+fn cg_handler_inline_match_index_offset() -> i64 { 8 }
+fn cg_handler_inline_match_ops_ctr_offset() -> i64 { 16 }
+fn cg_handler_inline_match_nfree_offset() -> i64 { 24 }
+
+fn fmap_handler_inline_top(fm: i64) -> i64 { __mem_load64(fm + 96) }
+fn fmap_set_handler_inline_top(fm: i64, top: i64) -> i64 { __mem_store64(fm + 96, top) 0 }
+
+fn cg_handler_inline_push(fm: i64, eff_hash: i64, clauses: i64, clause_infos: i64, nclauses: i64, ops_ctr: i64) -> i64 {
+  let ctx = alloc_bump(cg_handler_inline_ctx_size())
+  __mem_store64(ctx + cg_handler_inline_ctx_eff_offset(), eff_hash)
+  __mem_store64(ctx + cg_handler_inline_ctx_clauses_offset(), clauses)
+  __mem_store64(ctx + cg_handler_inline_ctx_infos_offset(), clause_infos)
+  __mem_store64(ctx + cg_handler_inline_ctx_nclauses_offset(), nclauses)
+  __mem_store64(ctx + cg_handler_inline_ctx_ops_ctr_offset(), ops_ctr)
+  __mem_store64(ctx + cg_handler_inline_ctx_prev_offset(), fmap_handler_inline_top(fm))
+  fmap_set_handler_inline_top(fm, ctx)
+  ctx
+}
+
+fn cg_handler_inline_pop(fm: i64) -> i64 {
+  let ctx = fmap_handler_inline_top(fm)
+  if ctx == 0 { 0 }
+  else {
+    fmap_set_handler_inline_top(fm, __mem_load64(ctx + cg_handler_inline_ctx_prev_offset()))
+    0
+  }
+}
+
+fn cg_handler_inline_clause_op_hash(clause: i64, src: i64) -> i64 {
+  let clause_names = node_f1(clause)
+  str_hash(src, node_f3(clause_names), node_f4(clause_names))
+}
+
+fn cg_handler_inline_make_match(info: i64, index: i64, ops_ctr: i64) -> i64 {
+  let result = alloc_bump(cg_handler_inline_match_size())
+  __mem_store64(result + cg_handler_inline_match_info_offset(), info)
+  __mem_store64(result + cg_handler_inline_match_index_offset(), index)
+  __mem_store64(result + cg_handler_inline_match_ops_ctr_offset(), ops_ctr)
+  __mem_store64(result + cg_handler_inline_match_nfree_offset(), __mem_load64(info + 16))
+  result
+}
+
+fn cg_handler_inline_find_clause(ctx: i64, src: i64, op_hash: i64) -> i64 {
+  let clauses = __mem_load64(ctx + cg_handler_inline_ctx_clauses_offset())
+  let infos = __mem_load64(ctx + cg_handler_inline_ctx_infos_offset())
+  let nclauses = __mem_load64(ctx + cg_handler_inline_ctx_nclauses_offset())
+  let ops_ctr = __mem_load64(ctx + cg_handler_inline_ctx_ops_ctr_offset())
+  let mut i = 0
+  let mut result = 0
+  while i < nclauses {
+    let clause = nlist_get(clauses, i)
+    if cg_handler_inline_clause_op_hash(clause, src) == op_hash {
+      result = cg_handler_inline_make_match(__mem_load64(infos + i * 8), i, ops_ctr)
+      i = nclauses
+    } else { i = i + 1 }
+  }
+  result
+}
+
+fn cg_handler_inline_find(fm: i64, src: i64, eff_hash: i64, op_hash: i64) -> i64 {
+  let mut ctx = fmap_handler_inline_top(fm)
+  let mut result = 0
+  while ctx != 0 {
+    if __mem_load64(ctx + cg_handler_inline_ctx_eff_offset()) == eff_hash {
+      let found = cg_handler_inline_find_clause(ctx, src, op_hash)
+      if found == 0 {
+        ctx = __mem_load64(ctx + cg_handler_inline_ctx_prev_offset())
+      } else {
+        result = found
+        ctx = 0
+      }
+    } else {
+      ctx = __mem_load64(ctx + cg_handler_inline_ctx_prev_offset())
+    }
+  }
+  result
 }
 
 -- Check if a name exists in fmap (regardless of offset value)
@@ -2491,21 +2579,11 @@ fn cg_handle(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i
   if frame_ctr < 8 {
     bu32(code, encode_add_imm(frame_ctr + 19, 27, 0))
   } else { emit_store_reg(code, frame_ctr, 27) }
-  -- Phase 4: Set handler inlining context for body compilation
-  -- Save previous handler context
-  let prev_eff = __mem_load64(fm + 96)
-  let prev_infos = __mem_load64(fm + 104)
-  let prev_nc = __mem_load64(fm + 112)
-  -- Install current handler for inlining
-  __mem_store64(fm + 96, eff_hash)
-  __mem_store64(fm + 104, clause_infos)
-  __mem_store64(fm + 112, nclauses)
+  -- Phase 4: Push handler inlining context for body compilation.
+  cg_handler_inline_push(fm, eff_hash, clauses, clause_infos, nclauses, ops_ctr)
   -- Compile body (handler is now active, performs can be inlined)
   let br = cg_expr(body, code, scope, src, frame_ctr + 1, fm)
-  -- Restore previous handler context
-  __mem_store64(fm + 96, prev_eff)
-  __mem_store64(fm + 104, prev_infos)
-  __mem_store64(fm + 112, prev_nc)
+  cg_handler_inline_pop(fm)
   -- Phase 5: Pop handler — restore x27 from frame.prev
   let fp = emit_load_reg(code, frame_ctr)
   bu32(code, cg_ldr(27, fp, handler_frame_prev_offset()))
@@ -2557,21 +2635,11 @@ fn cg_perform(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> 
     c = cg_expr(nlist_get(args, i), code, scope, src, c, fm)
     __mem_store64(arg_results + i * 8, c - 1)
   }
-  -- Check for handler inlining: is the current handler for this effect?
-  -- Only inline if the clause has no captures (nfree == 0).
-  -- Clauses with captures need the runtime env ptr from the ops array.
-  let inline_eff = __mem_load64(fm + 96)
-  let can_inline = if inline_eff == eff_hash {
-    let infos = __mem_load64(fm + 104)
-    let info = __mem_load64(infos)
-    let nfree = __mem_load64(info + 16)
-    if nfree == 0 { 1 } else { 0 }
-  } else { 0 }
-  if can_inline == 1 {
-    -- INLINED PATH: handler is statically known, no captures.
-    -- Direct BL to clause function with x0 = 0 (no env).
-    let infos = __mem_load64(fm + 104)
-    let info = __mem_load64(infos)
+  let inline_match = cg_handler_inline_find(fm, src, eff_hash, op_hash)
+  if inline_match != 0 {
+    -- INLINED PATH: handler is statically known. Captured clauses reuse the
+    -- env pointer already stored in the handler ops array.
+    let info = __mem_load64(inline_match + cg_handler_inline_match_info_offset())
     let clause_start = __mem_load64(info)
     -- Set up args: x1..xN
     for j in 0..nargs {
@@ -2579,8 +2647,15 @@ fn cg_perform(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> 
       let ap = emit_load_reg(code, actr)
       bu32(code, encode_add_imm(j + 1, ap, 0))
     }
-    -- x0 = 0 (no env)
-    emit_mov_imm(code, 0, 0)
+    let nfree = __mem_load64(inline_match + cg_handler_inline_match_nfree_offset())
+    if nfree == 0 {
+      emit_mov_imm(code, 0, 0)
+    } else {
+      let op_index = __mem_load64(inline_match + cg_handler_inline_match_index_offset())
+      let ops_ctr = __mem_load64(inline_match + cg_handler_inline_match_ops_ctr_offset())
+      let ops_phys = emit_load_reg(code, ops_ctr)
+      bu32(code, cg_ldr(0, ops_phys, op_index * handler_ops_entry_size() + handler_ops_env_ptr_offset()))
+    }
     let cur = buf_len(code)
     bu32(code, encode_bl(clause_start - cur))
     -- Result in x0
