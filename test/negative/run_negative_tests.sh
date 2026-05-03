@@ -42,6 +42,7 @@ check_rejects "unsafe_raw_offset_wrapper_requires_effect" "test/negative/unsafe_
 check_rejects "unsafe_transmute_wrapper_requires_effect" "test/negative/unsafe_transmute_wrapper_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_int_to_ptr_wrapper_requires_effect" "test/negative/unsafe_int_to_ptr_wrapper_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_runtime_state_wrapper_requires_effect" "test/negative/unsafe_runtime_state_wrapper_requires_effect.weft" "type error: effect not available in caller"
+check_rejects "unsafe_process_run_command_requires_effect" "test/negative/unsafe_process_run_command_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_lambda_to_pure_fn" "test/negative/unsafe_lambda_to_pure_fn.weft" "type error: effect not available in caller"
 check_rejects "non_unsafe_handler_raw_call" "test/negative/non_unsafe_handler_raw_call.weft" "type error: effect not available in caller"
 check_rejects "unhandled_effect_in_while" "test/negative/unhandled_effect_in_while.weft" "type error: effect not available in caller"
