@@ -28,6 +28,7 @@ check_accepts "handled_effect_perform" "test/checker/handled_effect_perform.weft
 check_accepts "handled_try_effect" "test/checker/handled_try_effect.weft"
 check_accepts "imported_effect_perform_args" "test/checker/imported_effect_perform_args.weft"
 check_accepts "unsafe_boundary" "test/checker/unsafe_boundary.weft"
+check_accepts "runtime_syscall_unsafe_wrapper" "runtime/syscall.weft"
 check_accepts "contextual_lambda_pure" "test/checker/contextual_lambda_pure.weft"
 check_accepts "contextual_lambda_effectful" "test/checker/contextual_lambda_effectful.weft"
 check_accepts "contextual_effect_op_lambda" "test/checker/contextual_effect_op_lambda.weft"
