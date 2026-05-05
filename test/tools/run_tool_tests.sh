@@ -6,7 +6,8 @@ WEFT=${WEFT:-./weft}
 tmp_src=$(mktemp /tmp/weft_tool_src_XXXXXX)
 tmp_import=$(mktemp /tmp/weft_tool_import_XXXXXX)
 tmp_bin=$(mktemp /tmp/weft_tool_bin_XXXXXX)
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin"' EXIT
+tmp_err=$(mktemp /tmp/weft_tool_err_XXXXXX)
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err"' EXIT
 
 assert_contains() {
   local name="$1"
@@ -18,6 +19,19 @@ assert_contains() {
     echo "  fail $name"
     echo "    expected to contain: $needle"
     exit 1
+  fi
+}
+
+assert_not_contains_file() {
+  local name="$1"
+  local file="$2"
+  local needle="$3"
+  if grep -q "$needle" "$file"; then
+    echo "  fail $name"
+    echo "    unexpected stderr: $needle"
+    exit 1
+  else
+    echo "  ok $name"
   fi
 }
 
@@ -65,6 +79,13 @@ printf 'use "%s"\nfn main() -> i64 { sentinel() }\n' "$tmp_import" > "$tmp_src"
 large_import_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_reads_large_import" "$large_import_out" "check: 2 functions, 0 errors"
 
+printf 'test "plain" { Test.assert_eq(1, 1) }\n' > "$tmp_src"
+"$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+assert_not_contains_file "test_harness_binds_runtime_without_missing_symbols" "$tmp_err" "required runtime function unavailable"
+chmod +x "$tmp_bin"
+"$tmp_bin"
+echo "  ok test_harness_binds_runtime_after_synthesis"
+
 : > "$tmp_src"
 for ((i = 0; i < 1800; i++)); do
   printf 'test "t%d" { Test.assert_eq(1, 1) }\n' "$i" >> "$tmp_src"
@@ -74,4 +95,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 11 passed, 0 failed"
+echo "Tool boundary summary: 13 passed, 0 failed"
