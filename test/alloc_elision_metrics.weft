@@ -1,0 +1,133 @@
+-- test/alloc_elision_metrics.weft -- native evidence for scoped allocation elision
+
+use "compiler/codegen.weft"
+use "compiler/typeck.weft"
+use "compiler/macho.weft"
+use "compiler/object.weft"
+use "compiler/ir.weft"
+use "compiler/grammar.weft"
+use "compiler/pipeline.weft"
+use "runtime/alloc.weft"
+
+fn alloc_metric_u32_at(p: i64) -> i64 {
+  __mem_load8(p) +
+  __mem_load8(p + 1) * 256 +
+  __mem_load8(p + 2) * 65536 +
+  __mem_load8(p + 3) * 16777216
+}
+
+fn alloc_metric_next_offset(fm: i64, off: i64, fallback: i64) -> i64 {
+  let n = __mem_load64(fm + 8)
+  let d = __mem_load64(fm)
+  let mut i = 0
+  let mut result = fallback
+  while i < n {
+    let entry_off = __mem_load64(d + i * 40 + 16)
+    if entry_off > off and entry_off < result {
+      result = entry_off
+    } else { 0 }
+    i = i + 1
+  }
+  result
+}
+
+fn alloc_metric_count_bl_to_target(code: i64, start: i64, end: i64, target: i64) -> i64 {
+  let p = buf_ptr(code)
+  let mut i = start
+  let mut count = 0
+  while i + 4 <= end {
+    if alloc_metric_u32_at(p + i) == encode_bl(target - i) {
+      count = count + 1
+    } else { 0 }
+    i = i + 4
+  }
+  count
+}
+
+fn alloc_metric_native(src: str) -> NativeModule {
+  let typed = pipeline_check_source(__str_ptr(src), __str_len(src))
+  let ir = pipeline_lower_ir(typed)
+  let optimised = pipeline_optimise_typed_ir(typed, ir)
+  pipeline_lower_native_module(typed, optimised)
+}
+
+fn alloc_metric_call_sites(src: str, fn_name: str, target_name: str) -> i64 {
+  let native = alloc_metric_native(src)
+  let code = pipeline_native_code(native)
+  let fm = pipeline_native_fmap(native)
+  let off = fmap_lookup(fm, __str_ptr(fn_name), 0, __str_len(fn_name))
+  let end = alloc_metric_next_offset(fm, off, buf_len(code))
+  let target = fmap_lookup(fm, __str_ptr(target_name), 0, __str_len(target_name))
+  alloc_metric_count_bl_to_target(code, off, end, target)
+}
+
+fn alloc_metric_elisions(src: str) -> i64 {
+  pipeline_native_alloc_elision_count(alloc_metric_native(src))
+}
+
+fn alloc_elision_temp_value() -> i64 {
+  let p = alloc_bump(8)
+  __mem_store64(p, 42)
+  __mem_load64(p)
+}
+
+fn alloc_elision_temp_branch(flag: bool) -> i64 {
+  let p = alloc_bump(8)
+  __mem_store64(p, 43)
+  if flag { __mem_load64(p) } else { 0 }
+}
+
+test "alloc_elision_local_temp_removes_alloc_bump_call" {
+  let src = "use \"runtime/alloc.weft\" fn main() -> i64 { let p = alloc_bump(8) __mem_store64(p, 42) __mem_load64(p) }"
+  Test.assert_eq(alloc_metric_elisions(src), 1)
+  Test.assert_eq(alloc_metric_call_sites(src, "main", "alloc_bump"), 0)
+}
+
+test "alloc_elision_local_temp_control_flow_matrix" {
+  let in_if = "use \"runtime/alloc.weft\" fn main() -> i64 { let p = alloc_bump(8) __mem_store64(p, 43) if true { __mem_load64(p) } else { 0 } }"
+  Test.assert_eq(alloc_metric_elisions(in_if), 1)
+  Test.assert_eq(alloc_metric_call_sites(in_if, "main", "alloc_bump"), 0)
+
+  let in_match = "use \"runtime/alloc.weft\" fn main() -> i64 { let p = alloc_bump(8) __mem_store64(p, 44) match 1 { 1 -> __mem_load64(p) _ -> 0 } }"
+  Test.assert_eq(alloc_metric_elisions(in_match), 1)
+  Test.assert_eq(alloc_metric_call_sites(in_match, "main", "alloc_bump"), 0)
+}
+
+test "alloc_elision_rejects_returned_allocation" {
+  let src = "use \"runtime/alloc.weft\" fn main() -> i64 { let p = alloc_bump(8) p }"
+  Test.assert_eq(alloc_metric_elisions(src), 0)
+  Test.assert_eq(alloc_metric_call_sites(src, "main", "alloc_bump"), 1)
+}
+
+test "alloc_elision_rejects_stored_allocation" {
+  let src = "use \"runtime/alloc.weft\" fn main() -> i64 { let slot = alloc_bump(8) let p = alloc_bump(8) __mem_store64(slot, p) 0 }"
+  Test.assert_eq(alloc_metric_elisions(src), 0)
+  Test.assert_eq(alloc_metric_call_sites(src, "main", "alloc_bump"), 2)
+}
+
+test "alloc_elision_rejects_captured_allocation" {
+  let src = "use \"runtime/alloc.weft\" fn main() -> i64 { let p = alloc_bump(8) let f = () => p f() }"
+  Test.assert_eq(alloc_metric_elisions(src), 0)
+  Test.assert_eq(alloc_metric_call_sites(src, "main", "alloc_bump"), 1)
+}
+
+test "alloc_elision_rejects_defer_boundary" {
+  let src = "use \"runtime/alloc.weft\" fn main() -> i64 { let p = alloc_bump(8) defer __mem_store64(p, 1) 0 }"
+  Test.assert_eq(alloc_metric_elisions(src), 0)
+  Test.assert_eq(alloc_metric_call_sites(src, "main", "alloc_bump"), 1)
+}
+
+test "alloc_elision_rejects_nested_candidate_to_avoid_stack_slot_overlap" {
+  let src = "use \"runtime/alloc.weft\" fn main() -> i64 { let p = alloc_bump(8) __mem_store64(p, 1) let q = alloc_bump(8) __mem_store64(q, 2) __mem_load64(p) + __mem_load64(q) }"
+  Test.assert_eq(alloc_metric_elisions(src), 1)
+  Test.assert_eq(alloc_metric_call_sites(src, "main", "alloc_bump"), 1)
+}
+
+test "alloc_elision_e2e_preserves_temp_value" {
+  Test.assert_eq(alloc_elision_temp_value(), 42)
+}
+
+test "alloc_elision_e2e_preserves_branch_value" {
+  Test.assert_eq(alloc_elision_temp_branch(true), 43)
+  Test.assert_eq(alloc_elision_temp_branch(false), 0)
+}
