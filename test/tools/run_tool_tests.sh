@@ -64,6 +64,10 @@ printf 'fn main() -> i64 { missing }\n' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_reports_diagnostics" "$diag_out" "type error: unknown identifier"
 
+printf 'fn main() -> i64 { let mut i = 0 let mut stop = 0 while i < 5 && stop == 0 { i = i + 1 } i }\n' > "$tmp_src"
+amp_diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
+assert_contains "check_rejects_symbolic_and" "$amp_diag_out" "error: expected '}'"
+
 write_large_padding "$tmp_src"
 printf 'fn main() -> i64 { 0 }\n' >> "$tmp_src"
 large_check_out=$("$WEFT" check < "$tmp_src" 2>&1)
@@ -95,4 +99,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 13 passed, 0 failed"
+echo "Tool boundary summary: 14 passed, 0 failed"
