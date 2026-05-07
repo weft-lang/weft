@@ -40,6 +40,7 @@ check_rejects "unsafe_runtime_state_requires_effect" "test/negative/unsafe_runti
 check_rejects "unsafe_set_runtime_state_requires_effect" "test/negative/unsafe_set_runtime_state_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_set_handler_stack_requires_effect" "test/negative/unsafe_set_handler_stack_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_raw_call_i64_requires_effect" "test/negative/unsafe_raw_call_i64_requires_effect.weft" "type error: effect not available in caller"
+check_rejects "unsafe_call_closure_i64_requires_effect" "test/negative/unsafe_call_closure_i64_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_got_requires_effect" "test/negative/unsafe_got_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_imported_got_requires_effect" "test/negative/unsafe_imported_got_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unknown_got_symbol" "test/negative/unknown_got_symbol.weft" "type error: unknown GOT symbol"
