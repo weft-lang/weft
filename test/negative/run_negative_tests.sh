@@ -36,6 +36,7 @@ check_rejects "unsafe_raw_offset_requires_effect" "test/negative/unsafe_raw_offs
 check_rejects "unsafe_transmute_requires_effect" "test/negative/unsafe_transmute_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_int_to_ptr_requires_effect" "test/negative/unsafe_int_to_ptr_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_runtime_state_requires_effect" "test/negative/unsafe_runtime_state_requires_effect.weft" "type error: effect not available in caller"
+check_rejects "unsafe_raw_call_i64_requires_effect" "test/negative/unsafe_raw_call_i64_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_got_requires_effect" "test/negative/unsafe_got_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_imported_got_requires_effect" "test/negative/unsafe_imported_got_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unknown_got_symbol" "test/negative/unknown_got_symbol.weft" "type error: unknown GOT symbol"
