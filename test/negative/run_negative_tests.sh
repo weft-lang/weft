@@ -153,6 +153,7 @@ check_rejects "generic_call_non_generic_constructor" "test/negative/generic_call
 check_rejects "function_value_arity_mismatch" "test/negative/function_value_arity_mismatch.weft" "type error: arity mismatch"
 check_rejects "effect_perform_arity_too_few" "test/negative/effect_perform_arity_too_few.weft" "type error: arity mismatch"
 check_rejects "effect_perform_arity_too_many" "test/negative/effect_perform_arity_too_many.weft" "type error: arity mismatch"
+check_rejects "deferred_with_k_non_deferred" "test/negative/deferred_with_k_non_deferred.weft" "type error: handler continuation requires deferred effect operation"
 check_rejects "handler_clause_unknown_op" "test/negative/handler_clause_unknown_op.weft" "type error: unknown effect operation"
 check_rejects "handler_clause_effect_mismatch" "test/negative/handler_clause_effect_mismatch.weft" "type error: handler clause effect mismatch"
 check_rejects "handler_clause_arity_too_few" "test/negative/handler_clause_arity_too_few.weft" "type error: arity mismatch"
