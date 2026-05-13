@@ -161,7 +161,7 @@ check_rejects "deferred_k_capture_lambda" "test/negative/deferred_k_capture_lamb
 check_rejects "deferred_k_escape_value" "test/negative/deferred_k_escape_value.weft" "type error: continuation cannot escape"
 check_rejects "deferred_k_multiple_use" "test/negative/deferred_k_multiple_use.weft" "type error: continuation used more than once"
 check_rejects "deferred_k_non_tail" "test/negative/deferred_k_non_tail.weft" "type error: continuation call must be tail position"
-check_rejects "deferred_k_repeated_non_tail" "test/negative/deferred_k_conditional_non_tail.weft" "type error: continuation call must be tail position"
+check_rejects "deferred_k_loop_non_tail" "test/negative/deferred_k_conditional_non_tail.weft" "type error: continuation call must be tail position"
 check_rejects "deferred_k_arity" "test/negative/deferred_k_arity.weft" "type error: arity mismatch"
 check_rejects "deferred_k_direct_resume" "test/negative/deferred_k_direct_resume.weft" "type error: use continuation binding instead of resume"
 check_rejects "handler_clause_unknown_op" "test/negative/handler_clause_unknown_op.weft" "type error: unknown effect operation"
