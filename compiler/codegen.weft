@@ -442,7 +442,7 @@ fn cg_ftypes_lookup_fn_type(ft: i64, src: i64, ns: i64, nl: i64) -> i64 {
 -- ======================================================================
 
 fn fmap_new() -> i64 {
-  let h = alloc_bump(248)
+  let h = alloc_bump(264)
   let d = alloc_bump(80000)
   __mem_store64(h, d)
   __mem_store64(h + 8, 0)
@@ -497,6 +497,9 @@ fn fmap_new() -> i64 {
   __mem_store64(h + 232, 0)
   -- Spawn emission metadata: scoped Par helper calls lowered directly.
   __mem_store64(h + 240, 0)
+  -- Active deferred-fiber lowering context and rewrite count.
+  __mem_store64(h + 248, 0)
+  __mem_store64(h + 256, 0)
   h
 }
 fn fmap_set_tt(fm: i64, tt: i64) -> i64 { __mem_store64(fm + 48, tt) 0 }
@@ -514,6 +517,10 @@ fn fmap_fusion_count(fm: i64) -> i64 { __mem_load64(fm + 224) }
 fn fmap_inc_fusion_count(fm: i64) -> i64 { __mem_store64(fm + 224, __mem_load64(fm + 224) + 1) 0 }
 fn fmap_par_lowering_count(fm: i64) -> i64 { __mem_load64(fm + 240) }
 fn fmap_inc_par_lowering_count(fm: i64) -> i64 { __mem_store64(fm + 240, __mem_load64(fm + 240) + 1) 0 }
+fn fmap_fiber_lowering_top(fm: i64) -> i64 { __mem_load64(fm + 248) }
+fn fmap_set_fiber_lowering_top(fm: i64, top: i64) -> i64 { __mem_store64(fm + 248, top) 0 }
+fn fmap_fiber_lowering_count(fm: i64) -> i64 { __mem_load64(fm + 256) }
+fn fmap_inc_fiber_lowering_count(fm: i64) -> i64 { __mem_store64(fm + 256, __mem_load64(fm + 256) + 1) 0 }
 fn fmap_scoped_alloc_top(fm: i64) -> i64 { __mem_load64(fm + 208) }
 fn fmap_set_scoped_alloc_top(fm: i64, top: i64) -> i64 { __mem_store64(fm + 208, top) 0 }
 fn fmap_par_lowering_top(fm: i64) -> i64 { __mem_load64(fm + 232) }
@@ -715,6 +722,37 @@ fn cg_par_lowering_mode(fm: i64) -> i64 {
 fn cg_par_lowering_pool_ctr(fm: i64) -> i64 {
   let ctx = fmap_par_lowering_top(fm)
   if ctx == 0 { 0 - 1 } else { __mem_load64(ctx + cg_par_lowering_ctx_pool_ctr_offset()) }
+}
+
+fn cg_fiber_lowering_ctx_eff_hash_offset() -> i64 { 0 }
+fn cg_fiber_lowering_ctx_op_hash_offset() -> i64 { 8 }
+fn cg_fiber_lowering_ctx_prev_offset() -> i64 { 16 }
+
+fn cg_fiber_lowering_push(fm: i64, eff_hash: i64, op_hash: i64) -> i64 {
+  let ctx = alloc_bump(24)
+  __mem_store64(ctx + cg_fiber_lowering_ctx_eff_hash_offset(), eff_hash)
+  __mem_store64(ctx + cg_fiber_lowering_ctx_op_hash_offset(), op_hash)
+  __mem_store64(ctx + cg_fiber_lowering_ctx_prev_offset(), fmap_fiber_lowering_top(fm))
+  fmap_set_fiber_lowering_top(fm, ctx)
+}
+
+fn cg_fiber_lowering_pop(fm: i64) -> i64 {
+  let ctx = fmap_fiber_lowering_top(fm)
+  if ctx == 0 { 0 }
+  else {
+    fmap_set_fiber_lowering_top(fm, __mem_load64(ctx + cg_fiber_lowering_ctx_prev_offset()))
+    0
+  }
+}
+
+fn cg_fiber_lowering_matches(fm: i64, eff_hash: i64, op_hash: i64) -> i64 {
+  let ctx = fmap_fiber_lowering_top(fm)
+  if ctx == 0 { 0 }
+  else {
+    if __mem_load64(ctx + cg_fiber_lowering_ctx_eff_hash_offset()) == eff_hash {
+      if __mem_load64(ctx + cg_fiber_lowering_ctx_op_hash_offset()) == op_hash { 1 } else { 0 }
+    } else { 0 }
+  }
 }
 
 -- Check if a name exists in fmap (regardless of offset value)
@@ -1146,6 +1184,15 @@ fn emit_load_reg_id(code: i64, rid: i64, temp: i64) -> i64 {
     bu32(code, cg_ldr(temp, 31, slot * 8))
     temp
   } else { rid }
+}
+
+fn emit_load_counter_to(code: i64, counter: i64, temp: i64) -> i64 {
+  if counter < 8 { counter + 19 }
+  else {
+    let slot = (counter - 8) * 8
+    bu32(code, cg_ldr(temp, 31, slot))
+    temp
+  }
 }
 
 fn emit_load_rhs(code: i64, counter: i64) -> i64 {
@@ -4227,6 +4274,91 @@ fn cg_split_info_supported(body: i64, info: i64) -> i64 {
   }
 }
 
+fn cg_fiber_count_max(left: i64, right: i64) -> i64 {
+  if left > right { left } else { right }
+}
+
+fn cg_fiber_count_list(list: i64, n: i64, clause: i64, src: i64) -> i64 {
+  let mut count = 0
+  for i in 0..n {
+    count = count + cg_fiber_perform_count(nlist_get(list, i), clause, src)
+  }
+  count
+}
+
+fn cg_fiber_perform_count(node: i64, clause: i64, src: i64) -> i64 {
+  if node == 0 { 0 }
+  else {
+    match node_tag(node) {
+      3 -> cg_fiber_perform_count(node_f2(node), clause, src) + cg_fiber_perform_count(node_f3(node), clause, src)
+      4 -> cg_fiber_count_list(node_f3(node), node_f4(node), clause, src)
+      5 -> {
+        let cond_count = cg_fiber_perform_count(node_f1(node), clause, src)
+        let then_count = cg_fiber_perform_count(node_f2(node), clause, src)
+        let else_count = cg_fiber_perform_count(node_f3(node), clause, src)
+        cond_count + cg_fiber_count_max(then_count, else_count)
+      }
+      6 -> cg_fiber_perform_count(node_f3(node), clause, src) + cg_fiber_perform_count(node_f4(node), clause, src)
+      7 -> cg_fiber_perform_count(node_f1(node), clause, src) + cg_fiber_perform_count(node_f2(node), clause, src)
+      10 -> 2
+      11 -> cg_fiber_perform_count(node_f3(node), clause, src) + cg_fiber_perform_count(node_f4(node), clause, src)
+      12 -> cg_fiber_perform_count(node_f3(node), clause, src)
+      13 -> cg_fiber_perform_count(node_f1(node), clause, src)
+      14 -> {
+        let fields = node_f3(node)
+        let nfields = node_f4(node)
+        let mut count = 0
+        for ri in 0..nfields {
+          count = count + cg_fiber_perform_count(node_f3(nlist_get(fields, ri)), clause, src)
+        }
+        count
+      }
+      15 -> {
+        let arms = node_f2(node)
+        let n = node_f3(node)
+        let mut arm_max = 0
+        for i in 0..n {
+          let arm = nlist_get(arms, i)
+          let guard = node_f3(arm)
+          let guard_count = if guard != 0 { cg_fiber_perform_count(guard, clause, src) } else { 0 }
+          let arm_count = guard_count + cg_fiber_perform_count(node_f2(arm), clause, src)
+          arm_max = cg_fiber_count_max(arm_max, arm_count)
+        }
+        cg_fiber_perform_count(node_f1(node), clause, src) + arm_max
+      }
+      22 -> cg_fiber_perform_count(node_f1(node), clause, src)
+      25 -> cg_fiber_perform_count(node_f1(node), clause, src)
+      26 -> cg_fiber_perform_count(node_f1(node), clause, src)
+      32 -> if cg_clause_matches_perform_node(clause, node, src) == 1 { 1 }
+        else { cg_fiber_count_list(node_f4(node), nlist_len(node_f4(node)), clause, src) }
+      33 -> 2
+      35 -> cg_fiber_perform_count(node_f1(node), clause, src)
+      36 -> {
+        let call_node = node_f2(node)
+        cg_fiber_count_list(node_f3(call_node), node_f4(call_node), clause, src)
+      }
+      37 -> cg_fiber_perform_count(node_f1(node), clause, src)
+      41 -> cg_fiber_perform_count(node_f1(node), clause, src) + cg_fiber_count_list(node_f3(node), nlist_len(node_f3(node)), clause, src)
+      45 -> cg_fiber_perform_count(node_f1(node), clause, src)
+      46 -> cg_fiber_perform_count(node_f1(node), clause, src) + cg_fiber_perform_count(node_f2(node), clause, src)
+      47 -> 2
+      48 -> cg_fiber_perform_count(node_f1(node), clause, src)
+      49 -> 2
+      52 -> cg_fiber_perform_count(node_f1(node), clause, src) + cg_fiber_perform_count(node_f2(node), clause, src)
+      _ -> 0
+    }
+  }
+}
+
+fn cg_handle_deferred_fiber_supported(body: i64, clauses: i64, nclauses: i64, src: i64) -> i64 {
+  if nclauses != 1 { 0 }
+  else {
+    let clause = nlist_get(clauses, 0)
+    if node_f4(clause) == 0 { 0 }
+    else { if cg_fiber_perform_count(body, clause, src) == 1 { 1 } else { 0 } }
+  }
+}
+
 fn cg_find_split_target_for_clauses(node: i64, clauses: i64, nclauses: i64, src: i64) -> i64 {
   if node == 0 { 0 }
   else {
@@ -4531,8 +4663,8 @@ fn cg_emit_split_k_closure(ctx: i64, code: i64, scope: i64, src: i64, ctr: i64, 
   } else {
     emit_store_reg(code, env_ctr, 17)
   }
-  let env_phys0 = emit_load_reg(code, env_ctr)
-  let token_phys = emit_load_reg(code, token_ctr)
+  let env_phys0 = emit_load_counter_to(code, env_ctr, 9)
+  let token_phys = emit_load_counter_to(code, token_ctr, 16)
   bu32(code, cg_str(token_phys, env_phys0, 0))
   for ei in 0..nfree {
     let fv2 = nlist_get(free_vars, ei)
@@ -4545,8 +4677,8 @@ fn cg_emit_split_k_closure(ctx: i64, code: i64, scope: i64, src: i64, ctr: i64, 
     let env_phys = emit_load_reg(code, env_ctr)
     bu32(code, cg_str(ep, env_phys, 8 + ei * 8))
   }
-  let closure_phys2 = emit_load_reg(code, ctr)
-  let env_phys2 = emit_load_reg(code, env_ctr)
+  let closure_phys2 = emit_load_counter_to(code, ctr, 9)
+  let env_phys2 = emit_load_counter_to(code, env_ctr, 16)
   bu32(code, cg_str(env_phys2, closure_phys2, 8))
   if call_node != 0 {
     cg_target_restore(call_node, old_call_tag, old_call_f1, old_call_f2, old_call_f3, old_call_f4)
@@ -4635,6 +4767,217 @@ fn cg_handle_deferred_split(node: i64, split_info: i64, target_index: i64, code:
   ctr + 1
 }
 
+fn cg_fiber_body_info(body: i64, code: i64, scope: i64, src: i64, fm: i64, eff_hash: i64, op_hash: i64) -> i64 {
+  let free_vars = nlist_new()
+  find_free_vars(body, scope_new(), scope, src, free_vars)
+  let nfree = nlist_len(free_vars)
+  let skip_pos = buf_len(code)
+  bu32(code, 0)
+  let body_start = buf_len(code)
+  emit_prologue(code)
+  let old_ret_ty = fmap_get_current_ret_ty(fm)
+  let old_cleanup_stack = cg_cleanup_stack(fm)
+  let old_loop_cleanup_depth = __mem_load64(fm + 152)
+  let old_par_lowering_top = fmap_par_lowering_top(fm)
+  __mem_store64(fm + 144, nlist_new())
+  __mem_store64(fm + 152, 0)
+  fmap_set_par_lowering_top(fm, 0)
+  cg_fiber_lowering_push(fm, eff_hash, op_hash)
+  let mut body_scope = scope_new()
+  let mut body_ctr = 0
+  for ci in 0..nfree {
+    let fv = nlist_get(free_vars, ci)
+    if body_ctr < 8 {
+      bu32(code, cg_ldr(body_ctr + 19, 0, ci * 8))
+    } else {
+      bu32(code, cg_ldr(17, 0, ci * 8))
+      emit_store_reg(code, body_ctr, 17)
+    }
+    let cap_ty = scope_lookup_type(scope, src, node_f1(fv), node_f2(fv))
+    body_scope = scope_push_typed(body_scope, node_f1(fv), node_f2(fv), reg_id(body_ctr), cap_ty)
+    body_ctr = body_ctr + 1
+  }
+  let body_ret_ty = cg_expr_type(body, body_scope, src, fm)
+  fmap_set_current_ret_ty(fm, body_ret_ty)
+  let br = cg_expr(body, code, body_scope, src, body_ctr, fm)
+  let result_phys = emit_load_reg(code, br - 1)
+  bu32(code, encode_add_imm(0, result_phys, 0))
+  emit_epilogue(code)
+  cg_fiber_lowering_pop(fm)
+  fmap_set_current_ret_ty(fm, old_ret_ty)
+  __mem_store64(fm + 144, old_cleanup_stack)
+  __mem_store64(fm + 152, old_loop_cleanup_depth)
+  fmap_set_par_lowering_top(fm, old_par_lowering_top)
+  cg_patch_b(code, skip_pos, buf_len(code))
+  let info = alloc_bump(24)
+  __mem_store64(info, body_start)
+  __mem_store64(info + 8, free_vars)
+  __mem_store64(info + 16, nfree)
+  info
+}
+
+fn cg_fiber_body_env(code: i64, scope: i64, src: i64, info: i64, ctr: i64) -> i64 {
+  let free_vars = __mem_load64(info + 8)
+  let nfree = __mem_load64(info + 16)
+  if nfree == 0 {
+    emit_mov_imm(code, 17, 0)
+    if ctr < 8 { bu32(code, encode_add_imm(ctr + 19, 17, 0)) }
+    else { emit_store_reg(code, ctr, 17) }
+  } else {
+    cg_bump_alloc_imm(code, 17, nfree * 8)
+    if ctr < 8 { bu32(code, encode_add_imm(ctr + 19, 17, 0)) }
+    else { emit_store_reg(code, ctr, 17) }
+    for ei in 0..nfree {
+      let fv = nlist_get(free_vars, ei)
+      let enc_reg = scope_lookup(scope, src, node_f1(fv), node_f2(fv))
+      let ep = if enc_reg < 0 {
+        let slot = 0 - enc_reg - 1
+        bu32(code, cg_ldr(9, 31, slot * 8))
+        9
+      } else { enc_reg }
+      let env_phys = emit_load_reg(code, ctr)
+      bu32(code, cg_str(ep, env_phys, ei * 8))
+    }
+  }
+  ctr + 1
+}
+
+fn cg_emit_fiber_k_closure(code: i64, fm: i64, prompt_ctr: i64, token_ctr: i64, ctr: i64) -> i64 {
+  let skip_pos = buf_len(code)
+  bu32(code, 0)
+  let thunk_start = buf_len(code)
+  emit_prologue(code)
+  bu32(code, encode_add_imm(19, 1, 0))
+  bu32(code, encode_add_imm(20, 0, 0))
+  bu32(code, cg_ldr(0, 20, 8))
+  cg_emit_call_lit(code, fm, "continuation_resume_managed")
+  let cbz_pos = buf_len(code)
+  bu32(code, 0)
+  let jump_ok_pos = buf_len(code)
+  bu32(code, 0)
+  let trap = buf_len(code)
+  bu32(code, encode_brk(4))
+  let ok = buf_len(code)
+  cg_patch_cbz(code, cbz_pos, 0, trap)
+  cg_patch_b(code, jump_ok_pos, ok)
+  bu32(code, cg_ldr(0, 20, 0))
+  bu32(code, encode_add_imm(1, 19, 0))
+  cg_emit_call_lit(code, fm, "fiber_resume")
+  bu32(code, encode_add_imm(19, 0, 0))
+  cg_emit_call_lit(code, fm, "fiber_is_done")
+  let done_cbz = buf_len(code)
+  bu32(code, 0)
+  let done_jump = buf_len(code)
+  bu32(code, 0)
+  let done_trap = buf_len(code)
+  bu32(code, encode_brk(5))
+  let done_ok = buf_len(code)
+  cg_patch_cbz(code, done_cbz, 0, done_trap)
+  cg_patch_b(code, done_jump, done_ok)
+  bu32(code, encode_add_imm(0, 19, 0))
+  emit_epilogue(code)
+  cg_patch_b(code, skip_pos, buf_len(code))
+  cg_bump_alloc_imm(code, 17, 16)
+  if ctr < 8 { bu32(code, encode_add_imm(ctr + 19, 17, 0)) }
+  else { emit_store_reg(code, ctr, 17) }
+  let closure_phys1 = emit_load_reg(code, ctr)
+  let adr_pos = buf_len(code)
+  bu32(code, encode_adr(17, thunk_start - adr_pos))
+  bu32(code, cg_str(17, closure_phys1, 0))
+  cg_bump_alloc_imm(code, 17, 16)
+  let env_ctr = ctr + 1
+  if env_ctr < 8 { bu32(code, encode_add_imm(env_ctr + 19, 17, 0)) }
+  else { emit_store_reg(code, env_ctr, 17) }
+  let env_phys0 = emit_load_counter_to(code, env_ctr, 9)
+  let prompt_phys = emit_load_counter_to(code, prompt_ctr, 16)
+  bu32(code, cg_str(prompt_phys, env_phys0, 0))
+  let token_phys = emit_load_counter_to(code, token_ctr, 16)
+  let env_phys1 = emit_load_counter_to(code, env_ctr, 9)
+  bu32(code, cg_str(token_phys, env_phys1, 8))
+  let closure_phys2 = emit_load_counter_to(code, ctr, 9)
+  let env_phys2 = emit_load_counter_to(code, env_ctr, 16)
+  bu32(code, cg_str(env_phys2, closure_phys2, 8))
+  ctr + 1
+}
+
+fn cg_handle_deferred_fiber(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
+  let body = node_f1(node)
+  let clauses = node_f2(node)
+  let nclauses = node_f3(node)
+  let clause = nlist_get(clauses, 0)
+  let first_names = node_f1(clause)
+  let eff_hash = str_hash(src, node_f1(first_names), node_f2(first_names))
+  let op_hash = str_hash(src, node_f3(first_names), node_f4(first_names))
+  let clause_infos = alloc_bump(nclauses * 8)
+  let info = cg_hclause_body_split(clause, code, scope, src, fm)
+  __mem_store64(clause_infos, info)
+  cg_bump_alloc_imm(code, 16, nclauses * handler_ops_entry_size())
+  if ctr < 8 { bu32(code, encode_add_imm(ctr + 19, 16, 0)) }
+  else { emit_store_reg(code, ctr, 16) }
+  let ops_ctr = ctr
+  cg_hfill_ops(clauses, nclauses, clause_infos, code, scope, src, ops_ctr)
+  let body_info = cg_fiber_body_info(body, code, scope, src, fm, eff_hash, op_hash)
+  let mut c = ops_ctr + 1
+  c = cg_fiber_body_env(code, scope, src, body_info, c)
+  let env_ctr = c - 1
+  emit_mov_imm_safe(code, 0, 65536)
+  cg_emit_call_lit(code, fm, "fiber_segment_new")
+  cg_hclause_store_x0(code, c)
+  let segment_ctr = c
+  let segment_phys = emit_load_reg(code, segment_ctr)
+  bu32(code, encode_add_imm(0, segment_phys, 0))
+  cg_emit_call_lit(code, fm, "fiber_prompt_new")
+  cg_hclause_store_x0(code, c + 1)
+  let prompt_ctr = c + 1
+  let prompt_phys = emit_load_reg(code, prompt_ctr)
+  bu32(code, encode_add_imm(0, prompt_phys, 0))
+  let adr_pos = buf_len(code)
+  bu32(code, encode_adr(1, __mem_load64(body_info) - adr_pos))
+  let env_phys = emit_load_reg(code, env_ctr)
+  bu32(code, encode_add_imm(2, env_phys, 0))
+  cg_emit_call_lit(code, fm, "fiber_trampoline")
+  cg_hclause_store_x0(code, c + 2)
+  let result_ctr = c + 2
+  cg_emit_call_lit(code, fm, "fiber_is_done")
+  let done_ctr = c + 3
+  cg_hclause_store_x0(code, done_ctr)
+  let done_phys = emit_load_reg(code, done_ctr)
+  let suspend_pos = buf_len(code)
+  bu32(code, 0)
+  let result_phys = emit_load_reg(code, result_ctr)
+  if ctr < 8 { bu32(code, encode_add_imm(ctr + 19, result_phys, 0)) }
+  else { bu32(code, encode_add_imm(17, result_phys, 0)) emit_store_reg(code, ctr, 17) }
+  let after_pos = buf_len(code)
+  bu32(code, 0)
+  let suspended = buf_len(code)
+  cg_patch_cbz(code, suspend_pos, done_phys, suspended)
+  cg_emit_call_lit(code, fm, "continuation_new_noop")
+  cg_hclause_store_x0(code, c + 4)
+  let token_ctr = c + 4
+  let closure_ctr = c + 5
+  cg_emit_fiber_k_closure(code, fm, prompt_ctr, token_ctr, closure_ctr)
+  let packet_phys = emit_load_reg(code, result_ctr)
+  let nparams = nlist_len(node_f2(clause))
+  for ai in 0..nparams {
+    bu32(code, cg_ldr(ai + 1, packet_phys, 8 + ai * 8))
+  }
+  let closure_phys = emit_load_reg(code, closure_ctr)
+  bu32(code, encode_add_imm(nparams + 1, closure_phys, 0))
+  let ops_phys = emit_load_reg(code, ops_ctr)
+  bu32(code, cg_ldr(0, ops_phys, handler_ops_env_ptr_offset()))
+  let clause_start = __mem_load64(info)
+  let cur = buf_len(code)
+  bu32(code, encode_bl(clause_start - cur))
+  cg_hclause_store_x0(code, ctr)
+  let token_phys2 = emit_load_reg(code, token_ctr)
+  bu32(code, encode_add_imm(0, token_phys2, 0))
+  cg_emit_call_lit(code, fm, "continuation_drop_managed")
+  let after = buf_len(code)
+  cg_patch_b(code, after_pos, after)
+  fmap_inc_fiber_lowering_count(fm)
+  ctr + 1
+}
+
 -- Handle expression: compile clauses as closures, build frame, run body, pop
 fn cg_handle(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
   let body = node_f1(node)
@@ -4643,6 +4986,8 @@ fn cg_handle(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i
   let split_info = if cg_clauses_have_continuation(clauses, nclauses) == 1 { cg_find_split_info_for_clauses(body, clauses, nclauses, src, fm) } else { 0 }
   if split_info != 0 and cg_split_info_supported(body, split_info) == 1 {
     cg_handle_deferred_split(node, split_info, cg_split_clause_index_for_target(clauses, nclauses, cg_split_info_target(split_info), src), code, scope, src, ctr, fm)
+  } else { if cg_handle_deferred_fiber_supported(body, clauses, nclauses, src) == 1 {
+    cg_handle_deferred_fiber(node, code, scope, src, ctr, fm)
   } else {
   -- Extract eff_hash from the first clause's name_info
   let first_names = node_f1(nlist_get(clauses, 0))
@@ -4684,7 +5029,7 @@ fn cg_handle(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i
     emit_store_reg(code, ctr, 17)
   }
   ctr + 1
-  }
+  } }
 }
 
 -- Emit runtime handler lookup.
@@ -4812,6 +5157,36 @@ fn cg_store_x0_result(code: i64, ctr: i64) -> i64 {
   ctr + 1
 }
 
+fn cg_perform_fiber_suspend(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
+  let args = node_f4(node)
+  let nargs = nlist_len(args)
+  let arg_results = alloc_bump(nargs * 8 + 8)
+  let mut c = ctr
+  for i in 0..nargs {
+    c = cg_expr(nlist_get(args, i), code, scope, src, c, fm)
+    __mem_store64(arg_results + i * 8, c - 1)
+  }
+  cg_bump_alloc_imm(code, 17, 8 + nargs * 8)
+  let packet_ctr = c
+  if packet_ctr < 8 {
+    bu32(code, encode_add_imm(packet_ctr + 19, 17, 0))
+  } else {
+    emit_store_reg(code, packet_ctr, 17)
+  }
+  let packet_phys0 = emit_load_reg(code, packet_ctr)
+  emit_mov_imm_safe(code, 16, nargs)
+  bu32(code, cg_str(16, packet_phys0, 0))
+  for pi in 0..nargs {
+    let packet_phys = emit_load_reg(code, packet_ctr)
+    let arg_phys = emit_load_reg(code, __mem_load64(arg_results + pi * 8))
+    bu32(code, cg_str(arg_phys, packet_phys, 8 + pi * 8))
+  }
+  let packet_phys2 = emit_load_reg(code, packet_ctr)
+  bu32(code, encode_add_imm(0, packet_phys2, 0))
+  cg_emit_call_lit(code, fm, "fiber_suspend")
+  cg_store_x0_result(code, packet_ctr + 1)
+}
+
 fn cg_perform_is_direct_par(node: i64, src: i64, fm: i64) -> i64 {
   if cg_par_lowering_mode(fm) == 0 { 0 } else { cg_par_perform_is_direct(node, src) }
 }
@@ -4884,7 +5259,9 @@ fn cg_perform(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> 
   let nargs = nlist_len(args)
   -- Compute eff_hash from lhs identifier
   let eff_hash = str_hash(src, node_f1(lhs), node_f2(lhs))
-  if cg_perform_is_scoped_alloc(node, src, fm) == 1 {
+  if cg_fiber_lowering_matches(fm, eff_hash, op_hash) == 1 {
+    cg_perform_fiber_suspend(node, code, scope, src, ctr, fm)
+  } else { if cg_perform_is_scoped_alloc(node, src, fm) == 1 {
     cg_perform_scoped_alloc(node, code, scope, src, ctr, fm)
   } else { if cg_perform_is_direct_par(node, src, fm) == 1 {
     cg_perform_direct_par(node, code, scope, src, ctr, fm)
@@ -4941,7 +5318,7 @@ fn cg_perform(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> 
       bu32(code, encode_add_imm(c + 19, 0, 0))
     } else { emit_store_reg(code, c, 0) }
     c + 1
-  } } }
+  } } } }
 }
 
 -- Dot-call: disambiguate between effect perform and method call
