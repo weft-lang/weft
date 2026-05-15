@@ -22,6 +22,20 @@ assert_contains() {
   fi
 }
 
+assert_equals() {
+  local name="$1"
+  local actual="$2"
+  local expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    echo "  ok $name"
+  else
+    echo "  fail $name"
+    echo "    expected: $expected"
+    echo "    actual: $actual"
+    exit 1
+  fi
+}
+
 assert_not_contains_file() {
   local name="$1"
   local file="$2"
@@ -103,10 +117,12 @@ printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>&1)
 assert_contains "fmt_parse_only" "$fmt_out" "fn main() -> i64 { 42 }"
+assert_equals "fmt_snapshot_exact" "$fmt_out" "fn main() -> i64 { 42 }"
 
 ast_out=$("$WEFT" ast < "$tmp_src" 2>&1)
 assert_contains "ast_parse_only_header" "$ast_out" "--- AST: 1 functions ---"
 assert_contains "ast_parse_only_literal" "$ast_out" "IntLit(42)"
+assert_equals "ast_snapshot_exact" "$ast_out" $'--- AST: 1 functions ---\n\nfn main:\n  IntLit(42)'
 
 check_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_parse_and_typecheck" "$check_out" "check: 1 functions, 0 errors"
@@ -119,6 +135,7 @@ assert_contains "ast_recovers_after_parse_error" "$parse_recovery_out" "--- AST:
 printf 'fn main() -> i64 { missing }\n' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_reports_diagnostics" "$diag_out" "type error: unknown identifier"
+assert_equals "diagnostic_snapshot_exact" "$diag_out" $'line 1, col 20: type error: unknown identifier\ncheck: 1 functions, 0 errors'
 
 printf 'fn main() -> i64 { let mut i = 0 let mut stop = 0 while i < 5 && stop == 0 { i = i + 1 } i }\n' > "$tmp_src"
 amp_diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
@@ -182,4 +199,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 35 passed, 0 failed"
+echo "Tool boundary summary: 38 passed, 0 failed"
