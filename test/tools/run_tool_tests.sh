@@ -57,6 +57,30 @@ assert_test_exit_code() {
   fi
 }
 
+assert_test_failure_contains() {
+  local name="$1"
+  local source="$2"
+  local expected="$3"
+  local needle="$4"
+  local exit_code
+  local err
+  printf '%s\n' "$source" > "$tmp_src"
+  "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+  chmod +x "$tmp_bin"
+  set +e
+  "$tmp_bin" >/dev/null 2>"$tmp_err"
+  exit_code=$?
+  set -e
+  err=$(<"$tmp_err")
+  if [ "$exit_code" -ne "$expected" ]; then
+    echo "  fail $name"
+    echo "    expected exit code: $expected"
+    echo "    actual exit code: $exit_code"
+    exit 1
+  fi
+  assert_contains "$name" "$err" "$needle"
+}
+
 assert_test_compile_rejects() {
   local name="$1"
   local source="$2"
@@ -130,10 +154,14 @@ chmod +x "$tmp_bin"
 echo "  ok test_assertion_helpers_pass"
 
 assert_test_exit_code "test_assert_eq_failure_returns_one" 'test "fail_eq" { Test.assert_eq(1, 2) }' 1
+assert_test_exit_code "test_assert_eq_and_ne_two_clause_harness_runs" 'test "eq_ne" { Test.assert_eq(0, 0) Test.assert_ne(1, 2) }' 0
 assert_test_exit_code "test_assert_ne_failure_returns_one" 'test "fail_ne" { Test.assert_ne(2, 2) }' 1
 assert_test_exit_code "test_assert_bool_failures_return_two" $'test "fail_true" { Test.assert_true(1 == 2) }\ntest "fail_false" { Test.assert_false(1 == 1) }' 2
 assert_test_exit_code "test_assert_comparison_failure_returns_one" 'test "fail_cmp" { Test.assert_lt(2, 1) }' 1
+assert_test_failure_contains "test_assertion_failure_reports_diagnostic" 'test "fail_eq_diag" { Test.assert_eq(1, 2) }' 1 "test assertion failed: assert_eq"
+assert_test_failure_contains "test_snapshot_mismatch_reports_diagnostic" 'test "fail_snapshot" { Test.assert_snapshot("actual", "expected") }' 1 "test assertion failed: snapshot"
 assert_test_compile_rejects "test_assert_true_rejects_i64" 'test "bad_bool" { Test.assert_true(1) }' "type error: argument type mismatch"
+assert_test_compile_rejects "test_assert_str_eq_rejects_i64" 'test "bad_str" { Test.assert_str_eq(1, "one") }' "type error: argument type mismatch"
 
 : > "$tmp_src"
 for ((i = 0; i < 1800; i++)); do
@@ -144,4 +172,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 21 passed, 0 failed"
+echo "Tool boundary summary: 25 passed, 0 failed"
