@@ -35,6 +35,38 @@ assert_not_contains_file() {
   fi
 }
 
+assert_test_exit_code() {
+  local name="$1"
+  local source="$2"
+  local expected="$3"
+  local exit_code
+  printf '%s\n' "$source" > "$tmp_src"
+  "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+  chmod +x "$tmp_bin"
+  set +e
+  "$tmp_bin" >/dev/null 2>&1
+  exit_code=$?
+  set -e
+  if [ "$exit_code" -eq "$expected" ]; then
+    echo "  ok $name"
+  else
+    echo "  fail $name"
+    echo "    expected exit code: $expected"
+    echo "    actual exit code: $exit_code"
+    exit 1
+  fi
+}
+
+assert_test_compile_rejects() {
+  local name="$1"
+  local source="$2"
+  local pattern="$3"
+  local out
+  printf '%s\n' "$source" > "$tmp_src"
+  out=$("$WEFT" test < "$tmp_src" 2>&1 >/dev/null || true)
+  assert_contains "$name" "$out" "$pattern"
+}
+
 write_large_padding() {
   local file="$1"
   : > "$file"
@@ -90,6 +122,19 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_harness_binds_runtime_after_synthesis"
 
+printf 'test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) }\n' > "$tmp_src"
+"$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+assert_not_contains_file "test_harness_supports_assertion_helpers" "$tmp_err" "unknown effect operation"
+chmod +x "$tmp_bin"
+"$tmp_bin"
+echo "  ok test_assertion_helpers_pass"
+
+assert_test_exit_code "test_assert_eq_failure_returns_one" 'test "fail_eq" { Test.assert_eq(1, 2) }' 1
+assert_test_exit_code "test_assert_ne_failure_returns_one" 'test "fail_ne" { Test.assert_ne(2, 2) }' 1
+assert_test_exit_code "test_assert_bool_failures_return_two" $'test "fail_true" { Test.assert_true(1 == 2) }\ntest "fail_false" { Test.assert_false(1 == 1) }' 2
+assert_test_exit_code "test_assert_comparison_failure_returns_one" 'test "fail_cmp" { Test.assert_lt(2, 1) }' 1
+assert_test_compile_rejects "test_assert_true_rejects_i64" 'test "bad_bool" { Test.assert_true(1) }' "type error: argument type mismatch"
+
 : > "$tmp_src"
 for ((i = 0; i < 1800; i++)); do
   printf 'test "t%d" { Test.assert_eq(1, 1) }\n' "$i" >> "$tmp_src"
@@ -99,4 +144,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 14 passed, 0 failed"
+echo "Tool boundary summary: 21 passed, 0 failed"
