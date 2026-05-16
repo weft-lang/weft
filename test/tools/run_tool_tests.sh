@@ -329,6 +329,18 @@ assert_equals "mcp_diagnostics_resume_outside_handler_snapshot" "$mcp_out" '{"js
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"effect State { fn get() -> i64 } fn bad() -> i64 { handle State.get() { State.get() -> { let f = x => resume(x) f(1) } } }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_resume_capture_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: cannot capture resume","span":109,"line":1,"col":110}]}}'
 
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"effect Async { @deferred fn get() -> i64 } fn apply_saved(f: (i64) -> i64) -> i64 { f(1) } fn bad() -> i64 { handle Async.get() { Async.get() with k -> { let f = x => k(x) apply_saved(f) } } }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_continuation_escape_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":2,"check_errors":1,"items":[{"severity":"error","message":"type error: continuation cannot escape","span":184,"line":1,"col":185}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"effect Async { @deferred fn get() -> i64 } fn bad() -> i64 { handle Async.get() { Async.get() with k -> { k(1) k(2) } } }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_continuation_multiple_use_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: continuation used more than once","span":99,"line":1,"col":100}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"effect DeferredK { @deferred fn step(value: rc i64) -> rc i64 } fn go(value: rc i64) -[DeferredK]> rc i64 { DeferredK.step(value) } fn main(p: rc i64) -> rc i64 { handle go(p) { DeferredK.step(value) with k -> { let resumed = k(value) resumed } } }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_continuation_non_tail_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":2,"check_errors":1,"items":[{"severity":"error","message":"type error: continuation call must be tail position","span":205,"line":1,"col":206}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"effect Async { @deferred fn get() -> i64 } fn bad() -> (i64) -> i64 { handle Async.get() { Async.get() with k -> x => k(x) } }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_continuation_closure_local_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":3,"functions":1,"check_errors":3,"items":[{"severity":"error","message":"type error: continuation-capturing closure must stay local","span":108,"line":1,"col":109},{"severity":"error","message":"type error: resume type mismatch","span":97,"line":1,"col":98},{"severity":"error","message":"type error: return type mismatch","span":46,"line":1,"col":47}]}}'
+
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad(n: i64) -> i64 { let x = match n { 0 -> 42 _ -> \"oops\" } 0 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_match_arm_type_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: match arm type mismatch","span":-1,"line":-1,"col":-1}]}}'
 
@@ -499,4 +511,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 137 passed, 0 failed"
+echo "Tool boundary summary: 141 passed, 0 failed"
