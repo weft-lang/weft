@@ -86,6 +86,7 @@ check_rejects "trait_impl_effect_mismatch" "test/negative/trait_impl_effect_mism
 check_rejects "trait_assoc_missing" "test/negative/trait_assoc_missing.weft" "type error: impl missing required associated type"
 check_rejects "trait_assoc_duplicate" "test/negative/trait_assoc_duplicate.weft" "type error: duplicate associated type binding"
 check_rejects "trait_assoc_extra" "test/negative/trait_assoc_extra.weft" "type error: impl associated type is not declared by trait"
+check_rejects "trait_impl_conflict" "test/negative/trait_impl_conflict.weft" "type error: conflicting implementations of trait for type"
 check_rejects "let_bound_lambda_effect_mismatch" "test/negative/let_bound_lambda_effect_mismatch.weft" "type error: argument type mismatch"
 check_rejects "let_bound_lambda_record_effect_mismatch" "test/negative/let_bound_lambda_record_effect_mismatch.weft" "type error: argument type mismatch"
 check_rejects "let_bound_lambda_method_effect_mismatch" "test/negative/let_bound_lambda_method_effect_mismatch.weft" "type error: argument type mismatch"
