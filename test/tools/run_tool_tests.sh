@@ -284,6 +284,36 @@ assert_equals "mcp_diagnostics_resume_outside_handler_snapshot" "$mcp_out" '{"js
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"effect State { fn get() -> i64 } fn bad() -> i64 { handle State.get() { State.get() -> { let f = x => resume(x) f(1) } } }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_resume_capture_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: cannot capture resume","span":109,"line":1,"col":110}]}}'
 
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad(n: i64) -> i64 { let x = match n { 0 -> 42 _ -> \"oops\" } 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_match_arm_type_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: match arm type mismatch","span":-1,"line":-1,"col":-1}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad(n: i64) -> i64 { match n { 1 -> 2 } }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_match_int_exhaustive_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: non-exhaustive match","span":30,"line":1,"col":31}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"type Choice { Left(i64), Right(i64) } fn bad(x: Choice) -> i64 { match x { Left(v) -> v } }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_match_ctor_exhaustive_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: non-exhaustive match","span":71,"line":1,"col":72}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"type Choice { Left(i64), Right(i64) } fn bad(x: Choice) -> i64 { match x { Left(v) -> v Left(v) -> v + 1 Right(v) -> v } }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_match_duplicate_ctor_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: duplicate match constructor arm","span":88,"line":1,"col":89}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad(s: str) -> i64 { match s { 0 -> 1 _ -> 0 } }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_pattern_literal_scrutinee_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: literal pattern does not match scrutinee","span":0,"line":1,"col":1}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"type KnownPattern { KnownVariant(i64) } fn bad(k: KnownPattern) -> i64 { match k { MissingVariant(x) -> x _ -> 0 } }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_pattern_unknown_ctor_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: unknown constructor pattern","span":83,"line":1,"col":84}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"type BoxPattern { BoxedPattern(i64) } fn bad(n: i64) -> i64 { match n { BoxedPattern(v) -> v _ -> 0 } }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_pattern_ctor_on_i64_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: constructor pattern does not match scrutinee","span":72,"line":1,"col":73}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"type ShapePatternBad { BadCircle(i64) } type ColorPatternBad { BadRed(i64) } fn bad(c: ColorPatternBad) -> i64 { match c { BadCircle(r) -> r _ -> 0 } }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_pattern_wrong_ctor_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: constructor pattern does not match scrutinee","span":123,"line":1,"col":124}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"type PayloadPattern { PayloadOne(i64) } fn bad(p: PayloadPattern) -> i64 { match p { PayloadOne -> 1 } }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_pattern_ctor_arity_few_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: constructor pattern arity mismatch","span":85,"line":1,"col":86}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"type PayloadPatternMany { PayloadSingle(i64) } fn bad(p: PayloadPatternMany) -> i64 { match p { PayloadSingle(x, y) -> x + y } }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_pattern_ctor_arity_many_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: constructor pattern arity mismatch","span":96,"line":1,"col":97}]}}'
+
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"parse_summary","arguments":{"source":"fn main() -> str { \"Ω\" }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_unicode_source_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"parse_summary","ok":true,"functions":1,"first_body_tag":9}}'
 
@@ -376,4 +406,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 96 passed, 0 failed"
+echo "Tool boundary summary: 106 passed, 0 failed"
