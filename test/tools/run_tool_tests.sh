@@ -203,8 +203,17 @@ assert_equals "mcp_grammar_check_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select nope from users"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_check_unknown_column_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":true,"grammar":"mini_sql","root_tag":701,"columns":1,"star":0,"table":"users","where":0,"check_errors":1}}'
 
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select memo from invoices where memo = '\''paid'\''","host_source":"type invoices { total: i64, memo: str }\nfn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_check_host_source_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":true,"grammar":"mini_sql","root_tag":701,"columns":1,"star":0,"table":"invoices","where":1,"check_errors":0}}'
+
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select nope from users"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_diagnostics_type_error_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":1,"check_errors":1,"items":[{"severity":"error","message":"mini_sql type error: unknown column","span":7,"line":1,"col":8}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select nope from invoices","host_source":"type invoices { total: i64, memo: str }\nfn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_diagnostics_host_unknown_column_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":1,"check_errors":1,"items":[{"severity":"error","message":"mini_sql type error: unknown column","span":7,"line":1,"col":8}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select total from invoices where total = '\''bad'\''","host_source":"type invoices { total: i64, memo: str }\nfn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_diagnostics_host_predicate_mismatch_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":1,"check_errors":1,"items":[{"severity":"error","message":"mini_sql type error: predicate type mismatch","span":42,"line":1,"col":43}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select id users"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_diagnostics_parse_error_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":2,"check_errors":0,"items":[{"severity":"error","message":"mini_sql parse error: expected FROM","span":10,"line":1,"col":11},{"severity":"error","message":"mini_sql parse error: expected table name","span":15,"line":1,"col":16}]}}'
@@ -664,4 +673,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 178 passed, 0 failed"
+echo "Tool boundary summary: 181 passed, 0 failed"
