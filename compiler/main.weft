@@ -45,12 +45,13 @@ fn main(argc: i64, argv: i64) -> i64 {
     else { if cstr_eq(cmd, "ast") == 1 { run_ast() }
     else { if cstr_eq(cmd, "test") == 1 { run_test() }
     else { if cstr_eq(cmd, "mcp") == 1 { run_mcp() }
+    else { if cstr_eq(cmd, "lsp") == 1 { run_lsp() }
     else {
       let input = read_stdin_all()
       let src = __mem_load64(input)
       let n = __mem_load64(input + 8)
       compile(src, n)
-    } } } } }
+    } } } } } }
   } else {
     let input = read_stdin_all()
     let src = __mem_load64(input)
@@ -1426,6 +1427,661 @@ fn run_mcp() -> i64 {
     } else {
       mcp_emit_error(0, 0 - 32601, "unknown method")
     } } } }
+  }
+  0
+}
+
+-- ======================================================================
+-- Tool: lsp — stateless-ish stdio language server
+-- ======================================================================
+
+fn lsp_buf_append_i(b: i64, n: i64) -> i64 {
+  if n < 0 {
+    bstr(b, "-")
+    lsp_buf_append_i(b, 0 - n)
+  } else {
+    if n < 10 {
+      bu8(b, 48 + n)
+    } else {
+      lsp_buf_append_i(b, n / 10)
+      bu8(b, 48 + n - n / 10 * 10)
+    }
+  }
+  buf_len(b)
+}
+
+fn lsp_buf_append_json_bytes(b: i64, ptr: i64, n: i64) -> i64 {
+  bstr(b, "\"")
+  let mut i = 0
+  while i < n {
+    let ch = __mem_load8(ptr + i)
+    if ch == 34 {
+      bstr(b, "\\\"")
+    } else { if ch == 92 {
+      bstr(b, "\\\\")
+    } else { if ch == 10 {
+      bstr(b, "\\n")
+    } else { if ch == 13 {
+      bstr(b, "\\r")
+    } else { if ch == 9 {
+      bstr(b, "\\t")
+    } else {
+      if ch >= 32 { bu8(b, ch) } else { 0 }
+    } } } } }
+    i = i + 1
+  }
+  bstr(b, "\"")
+  buf_len(b)
+}
+
+fn lsp_write_body(body: i64) -> i64 {
+  mcp_write("Content-Length: ")
+  mcp_write_i(buf_len(body))
+  let sep = alloc_bump(4)
+  __mem_store8(sep, 13)
+  __mem_store8(sep + 1, 10)
+  __mem_store8(sep + 2, 13)
+  __mem_store8(sep + 3, 10)
+  sys_write(1, sep, 4)
+  sys_write(1, buf_ptr(body), buf_len(body))
+}
+
+fn lsp_state_new() -> i64 {
+  let st = alloc_bump(40)
+  __mem_store64(st, 0)
+  __mem_store64(st + 8, 0)
+  __mem_store64(st + 16, 0)
+  __mem_store64(st + 24, 0)
+  __mem_store64(st + 32, 0)
+  st
+}
+
+fn lsp_state_uri_ptr(st: i64) -> i64 { __mem_load64(st) }
+fn lsp_state_uri_len(st: i64) -> i64 { __mem_load64(st + 8) }
+fn lsp_state_src_ptr(st: i64) -> i64 { __mem_load64(st + 16) }
+fn lsp_state_src_len(st: i64) -> i64 { __mem_load64(st + 24) }
+fn lsp_state_version(st: i64) -> i64 { __mem_load64(st + 32) }
+
+fn lsp_state_set_doc(st: i64, uri_ptr: i64, uri_n: i64, src: i64, n: i64, version: i64) -> i64 {
+  __mem_store64(st, uri_ptr)
+  __mem_store64(st + 8, uri_n)
+  __mem_store64(st + 16, src)
+  __mem_store64(st + 24, n)
+  __mem_store64(st + 32, version)
+  0
+}
+
+fn lsp_state_uri_matches(st: i64, uri_ptr: i64, uri_n: i64) -> i64 {
+  let cur_ptr = lsp_state_uri_ptr(st)
+  let cur_n = lsp_state_uri_len(st)
+  if cur_ptr == 0 { 0 }
+  else { if uri_ptr == 0 { 1 }
+  else { mcp_name_bytes_eq(cur_ptr, cur_n, uri_ptr, uri_n) } }
+}
+
+fn lsp_json_int_at(src: i64, n: i64, pos: i64, default: i64) -> i64 {
+  if pos < 0 or pos >= n { default }
+  else {
+    let mut p = pos
+    let mut sign = 1
+    if __mem_load8(src + p) == 45 { sign = 0 - 1 p = p + 1 } else { 0 }
+    let mut value = 0
+    let mut seen = 0
+    while p < n and is_digit(__mem_load8(src + p)) == 1 {
+      value = value * 10 + __mem_load8(src + p) - 48
+      seen = 1
+      p = p + 1
+    }
+    if seen == 1 { value * sign } else { default }
+  }
+}
+
+fn lsp_json_first_array_object_start(src: i64, n: i64, value_start: i64) -> i64 {
+  if value_start < 0 or value_start >= n { 0 - 1 }
+  else { if __mem_load8(src + value_start) != 91 { 0 - 1 }
+  else {
+    let p = mcp_skip_json_ws(src, n, value_start + 1)
+    if p < n and __mem_load8(src + p) == 123 { p } else { 0 - 1 }
+  } }
+}
+
+fn lsp_extract_params_object(req: i64, n: i64, root: i64) -> i64 {
+  mcp_json_object_field_start(req, n, root, "params")
+}
+
+fn lsp_extract_text_document_object(req: i64, n: i64, root: i64) -> i64 {
+  let params = lsp_extract_params_object(req, n, root)
+  mcp_json_object_field_start(req, n, params, "textDocument")
+}
+
+fn lsp_extract_text_document_string(req: i64, n: i64, root: i64, key: str) -> i64 {
+  let doc = lsp_extract_text_document_object(req, n, root)
+  let value = mcp_json_field_value_start(req, n, doc, key)
+  mcp_decode_json_string_pair(req, n, value)
+}
+
+fn lsp_extract_text_document_version(req: i64, n: i64, root: i64, default: i64) -> i64 {
+  let doc = lsp_extract_text_document_object(req, n, root)
+  let value = mcp_json_field_value_start(req, n, doc, "version")
+  lsp_json_int_at(req, n, value, default)
+}
+
+fn lsp_extract_position_line(req: i64, n: i64, root: i64) -> i64 {
+  let params = lsp_extract_params_object(req, n, root)
+  let pos = mcp_json_object_field_start(req, n, params, "position")
+  lsp_json_int_at(req, n, mcp_json_field_value_start(req, n, pos, "line"), 0)
+}
+
+fn lsp_extract_position_character(req: i64, n: i64, root: i64) -> i64 {
+  let params = lsp_extract_params_object(req, n, root)
+  let pos = mcp_json_object_field_start(req, n, params, "position")
+  lsp_json_int_at(req, n, mcp_json_field_value_start(req, n, pos, "character"), 0)
+}
+
+fn lsp_extract_change_text(req: i64, n: i64, root: i64) -> i64 {
+  let params = lsp_extract_params_object(req, n, root)
+  let changes = mcp_json_field_value_start(req, n, params, "contentChanges")
+  let first = lsp_json_first_array_object_start(req, n, changes)
+  let value = mcp_json_field_value_start(req, n, first, "text")
+  mcp_decode_json_string_pair(req, n, value)
+}
+
+fn lsp_append_id_or_null(b: i64, req: i64, n: i64, root: i64) -> i64 {
+  let id_start = mcp_json_field_value_start(req, n, root, "id")
+  if id_start < 0 {
+    bstr(b, "null")
+  } else {
+    let parsed = mcp_json_parse_value(req, n, id_start)
+    if mcp_json_result_ok(parsed) == 0 { bstr(b, "null") }
+    else { bscopy(b, req + id_start, mcp_json_result_pos(parsed) - id_start, 0) }
+  }
+  buf_len(b)
+}
+
+fn lsp_response_start(b: i64, req: i64, n: i64, root: i64) -> i64 {
+  bstr(b, "{\"jsonrpc\":\"2.0\",\"id\":")
+  lsp_append_id_or_null(b, req, n, root)
+  bstr(b, ",\"result\":")
+  buf_len(b)
+}
+
+fn lsp_emit_error_response(req: i64, n: i64, root: i64, code: i64, message: str) -> i64 {
+  let body = buf_new(512)
+  bstr(body, "{\"jsonrpc\":\"2.0\",\"id\":")
+  if root < 0 { bstr(body, "null") } else { lsp_append_id_or_null(body, req, n, root) }
+  bstr(body, ",\"error\":{\"code\":")
+  lsp_buf_append_i(body, code)
+  bstr(body, ",\"message\":")
+  lsp_buf_append_json_bytes(body, __str_ptr(message), __str_len(message))
+  bstr(body, "}}")
+  lsp_write_body(body)
+}
+
+fn lsp_span_line0(src: i64, span: i64) -> i64 {
+  if span < 0 { 0 }
+  else {
+    let mut i = 0
+    let mut line = 0
+    while i < span {
+      if __mem_load8(src + i) == 10 { line = line + 1 } else { 0 }
+      i = i + 1
+    }
+    line
+  }
+}
+
+fn lsp_span_col0(src: i64, span: i64) -> i64 {
+  if span < 0 { 0 }
+  else {
+    let mut i = 0
+    let mut col = 0
+    while i < span {
+      if __mem_load8(src + i) == 10 { col = 0 } else { col = col + 1 }
+      i = i + 1
+    }
+    col
+  }
+}
+
+fn lsp_offset_for_line_col(src: i64, n: i64, line: i64, ch: i64) -> i64 {
+  let mut i = 0
+  let mut cur_line = 0
+  let mut cur_ch = 0
+  let mut done = 0
+  while i < n and done == 0 {
+    if cur_line == line and cur_ch == ch { done = 1 }
+    else {
+      let c = __mem_load8(src + i)
+      i = i + 1
+      if c == 10 { cur_line = cur_line + 1 cur_ch = 0 }
+      else { cur_ch = cur_ch + 1 }
+    }
+  }
+  i
+}
+
+fn lsp_buf_append_range(b: i64, src: i64, start: i64, end_pos: i64) -> i64 {
+  let s = if start < 0 { 0 } else { start }
+  let e = if end_pos <= s { s + 1 } else { end_pos }
+  bstr(b, "{\"start\":{\"line\":")
+  lsp_buf_append_i(b, lsp_span_line0(src, s))
+  bstr(b, ",\"character\":")
+  lsp_buf_append_i(b, lsp_span_col0(src, s))
+  bstr(b, "},\"end\":{\"line\":")
+  lsp_buf_append_i(b, lsp_span_line0(src, e))
+  bstr(b, ",\"character\":")
+  lsp_buf_append_i(b, lsp_span_col0(src, e))
+  bstr(b, "}}")
+  buf_len(b)
+}
+
+fn lsp_collect_diagnostics(src: i64, n: i64) -> i64 {
+  let tt = ttable_new()
+  let grammar = weft_grammar()
+  let diags = nlist_new()
+  let fns = handle grammar.parse(src, n, tt) {
+    Diagnose.error(msg, span) -> { nlist_add(diags, mcp_diag_entry(1, msg, span)) resume(0) }
+    Diagnose.warn(msg, span) -> { nlist_add(diags, mcp_diag_entry(2, msg, span)) resume(0) }
+    Diagnose.note(msg, span) -> { nlist_add(diags, mcp_diag_entry(3, msg, span)) resume(0) }
+  }
+  handle grammar.check(fns, src, tt) {
+    Diagnose.error(msg, span) -> { nlist_add(diags, mcp_diag_entry(1, msg, span)) resume(0) }
+    Diagnose.warn(msg, span) -> { nlist_add(diags, mcp_diag_entry(2, msg, span)) resume(0) }
+    Diagnose.note(msg, span) -> { nlist_add(diags, mcp_diag_entry(3, msg, span)) resume(0) }
+  }
+  diags
+}
+
+fn lsp_buf_append_diag_item(b: i64, src: i64, entry: i64) -> i64 {
+  let msg_ptr = __mem_load64(entry + 8)
+  let msg_len = __mem_load64(entry + 16)
+  let span = __mem_load64(entry + 24)
+  bstr(b, "{\"range\":")
+  lsp_buf_append_range(b, src, span, span + 1)
+  bstr(b, ",\"severity\":1,\"source\":\"weft\",\"message\":")
+  lsp_buf_append_json_bytes(b, msg_ptr, msg_len)
+  bstr(b, "}")
+  buf_len(b)
+}
+
+fn lsp_emit_publish_diagnostics(st: i64) -> i64 {
+  let body = buf_new(4096)
+  let src = lsp_state_src_ptr(st)
+  let n = lsp_state_src_len(st)
+  let diags = if src == 0 { nlist_new() } else { lsp_collect_diagnostics(src, n) }
+  bstr(body, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":")
+  if lsp_state_uri_ptr(st) == 0 { lsp_buf_append_json_bytes(body, __str_ptr(""), 0) }
+  else { lsp_buf_append_json_bytes(body, lsp_state_uri_ptr(st), lsp_state_uri_len(st)) }
+  bstr(body, ",\"diagnostics\":[")
+  for i in 0..nlist_len(diags) {
+    if i > 0 { bstr(body, ",") } else { 0 }
+    lsp_buf_append_diag_item(body, src, nlist_get(diags, i))
+  }
+  bstr(body, "]}}")
+  lsp_write_body(body)
+}
+
+fn lsp_emit_initialize(req: i64, n: i64, root: i64) -> i64 {
+  let body = buf_new(1024)
+  lsp_response_start(body, req, n, root)
+  bstr(body, "{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"codeActionProvider\":true}}}")
+  lsp_write_body(body)
+}
+
+fn lsp_is_ident_char_at(src: i64, n: i64, pos: i64) -> i64 {
+  if pos < 0 or pos >= n { 0 } else { is_alnum(__mem_load8(src + pos)) }
+}
+
+fn lsp_identifier_bounds(src: i64, n: i64, offset: i64) -> i64 {
+  let pair = alloc_bump(16)
+  let mut pos = offset
+  if pos >= n { pos = n - 1 } else { 0 }
+  if lsp_is_ident_char_at(src, n, pos) == 0 and pos > 0 and lsp_is_ident_char_at(src, n, pos - 1) == 1 {
+    pos = pos - 1
+  } else { 0 }
+  if lsp_is_ident_char_at(src, n, pos) == 0 {
+    __mem_store64(pair, 0)
+    __mem_store64(pair + 8, 0)
+  } else {
+    let mut s = pos
+    let mut e = pos + 1
+    while s > 0 and lsp_is_ident_char_at(src, n, s - 1) == 1 { s = s - 1 }
+    while e < n and lsp_is_ident_char_at(src, n, e) == 1 { e = e + 1 }
+    if is_alpha(__mem_load8(src + s)) == 0 {
+      __mem_store64(pair, 0)
+      __mem_store64(pair + 8, 0)
+    } else {
+      __mem_store64(pair, s)
+      __mem_store64(pair + 8, e - s)
+    }
+  }
+  pair
+}
+
+fn lsp_fn_pair_name_start(pair: i64) -> i64 {
+  let fn_wrap = node_f1(pair)
+  let inner = pipeline_fn_inner(fn_wrap)
+  node_f1(inner)
+}
+
+fn lsp_fn_pair_name_len(pair: i64) -> i64 {
+  let fn_wrap = node_f1(pair)
+  let inner = pipeline_fn_inner(fn_wrap)
+  node_f2(inner)
+}
+
+fn lsp_find_let_binding_before(src: i64, n: i64, name_ptr: i64, name_n: i64, limit: i64) -> i64 {
+  let mut i = 0
+  let mut result = 0 - 1
+  while i + 3 < limit and result < 0 {
+    if src_eq(src, i, 3, "let") == 1 and (i == 0 or lsp_is_ident_char_at(src, n, i - 1) == 0) and lsp_is_ident_char_at(src, n, i + 3) == 0 {
+      let mut p = i + 3
+      while p < limit and is_ws(__mem_load8(src + p)) == 1 { p = p + 1 }
+      if p + 3 < limit and src_eq(src, p, 3, "mut") == 1 and lsp_is_ident_char_at(src, n, p + 3) == 0 {
+        p = p + 3
+        while p < limit and is_ws(__mem_load8(src + p)) == 1 { p = p + 1 }
+      } else { 0 }
+      let mut e = p
+      while e < limit and lsp_is_ident_char_at(src, n, e) == 1 { e = e + 1 }
+      if e > p and mcp_name_bytes_eq(name_ptr, name_n, src + p, e - p) == 1 {
+        result = p
+      } else { 0 }
+      i = e + 1
+    } else {
+      i = i + 1
+    }
+  }
+  result
+}
+
+fn lsp_buf_append_type_entry_kind_text(b: i64, kind: i64) -> i64 {
+  match kind {
+    0 -> bstr(b, "record")
+    1 -> bstr(b, "variant")
+    2 -> bstr(b, "effect")
+    3 -> bstr(b, "trait")
+    4 -> bstr(b, "impl")
+    _ -> bstr(b, "unknown")
+  }
+  buf_len(b)
+}
+
+fn lsp_emit_hover_null(req: i64, n: i64, root: i64) -> i64 {
+  let body = buf_new(256)
+  lsp_response_start(body, req, n, root)
+  bstr(body, "null}")
+  lsp_write_body(body)
+}
+
+fn lsp_emit_hover_value(req: i64, n: i64, root: i64, value: i64) -> i64 {
+  let body = buf_new(512)
+  lsp_response_start(body, req, n, root)
+  bstr(body, "{\"contents\":{\"kind\":\"plaintext\",\"value\":")
+  lsp_buf_append_json_bytes(body, buf_ptr(value), buf_len(value))
+  bstr(body, "}}}")
+  lsp_write_body(body)
+}
+
+fn lsp_emit_hover(req: i64, n: i64, root: i64, st: i64) -> i64 {
+  let uri_pair = lsp_extract_text_document_string(req, n, root, "uri")
+  let uri_ptr = __mem_load64(uri_pair)
+  let uri_n = __mem_load64(uri_pair + 8)
+  let src = lsp_state_src_ptr(st)
+  let src_n = lsp_state_src_len(st)
+  if src == 0 or lsp_state_uri_matches(st, uri_ptr, uri_n) == 0 {
+    lsp_emit_hover_null(req, n, root)
+  } else {
+    let off = lsp_offset_for_line_col(src, src_n, lsp_extract_position_line(req, n, root), lsp_extract_position_character(req, n, root))
+    let bounds = lsp_identifier_bounds(src, src_n, off)
+    let name_start = __mem_load64(bounds)
+    let name_n = __mem_load64(bounds + 8)
+    if name_n == 0 {
+      lsp_emit_hover_null(req, n, root)
+    } else {
+      let typed = mcp_check_source_quiet(src, src_n)
+      let name_ptr = src + name_start
+      let fn_pair = mcp_lookup_fn_pair(pipeline_typed_fns(typed), name_ptr, name_n)
+      if fn_pair != 0 {
+        let fn_wrap = node_f1(fn_pair)
+        let inner = pipeline_fn_inner(fn_wrap)
+        let params = node_f3(inner)
+        let ret = fn_ret_type(fn_wrap)
+        let eff = fn_effects(fn_wrap)
+        let value = buf_new(256)
+        bstr(value, "function ")
+        bscopy(value, name_ptr, name_n, 0)
+        bstr(value, ": params=")
+        lsp_buf_append_i(value, if params == 0 { 0 } else { nlist_len(params) })
+        bstr(value, " return_type_tag=")
+        lsp_buf_append_i(value, mcp_type_tag_or(ret, 0 - 1))
+        bstr(value, " effects=")
+        lsp_buf_append_i(value, effect_sig_effect_count_or(eff, 0))
+        lsp_emit_hover_value(req, n, root, value)
+      } else {
+        let entry = mcp_lookup_type_entry_raw(pipeline_typed_type_entries(typed), name_ptr, name_n, 0 - 1)
+        if entry != 0 {
+          let type_entry = type_entry_from_ptr(entry)
+          let value = buf_new(256)
+          bstr(value, "type ")
+          bscopy(value, name_ptr, name_n, 0)
+          bstr(value, ": ")
+          lsp_buf_append_type_entry_kind_text(value, type_entry_kind_or(type_entry, 0 - 1))
+          bstr(value, " items=")
+          lsp_buf_append_i(value, type_entry_item_count_or(type_entry, 0))
+          lsp_emit_hover_value(req, n, root, value)
+        } else {
+          let let_pos = lsp_find_let_binding_before(src, src_n, name_ptr, name_n, name_start)
+          if let_pos >= 0 {
+            let value = buf_new(128)
+            bstr(value, "local ")
+            bscopy(value, name_ptr, name_n, 0)
+            lsp_emit_hover_value(req, n, root, value)
+          } else {
+            lsp_emit_hover_null(req, n, root)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn lsp_emit_definition_location(req: i64, n: i64, root: i64, st: i64, def_start: i64, def_len: i64) -> i64 {
+  let body = buf_new(512)
+  lsp_response_start(body, req, n, root)
+  bstr(body, "{\"uri\":")
+  lsp_buf_append_json_bytes(body, lsp_state_uri_ptr(st), lsp_state_uri_len(st))
+  bstr(body, ",\"range\":")
+  lsp_buf_append_range(body, lsp_state_src_ptr(st), def_start, def_start + def_len)
+  bstr(body, "}}")
+  lsp_write_body(body)
+}
+
+fn lsp_emit_definition_null(req: i64, n: i64, root: i64) -> i64 {
+  let body = buf_new(256)
+  lsp_response_start(body, req, n, root)
+  bstr(body, "null}")
+  lsp_write_body(body)
+}
+
+fn lsp_emit_definition(req: i64, n: i64, root: i64, st: i64) -> i64 {
+  let uri_pair = lsp_extract_text_document_string(req, n, root, "uri")
+  let uri_ptr = __mem_load64(uri_pair)
+  let uri_n = __mem_load64(uri_pair + 8)
+  let src = lsp_state_src_ptr(st)
+  let src_n = lsp_state_src_len(st)
+  if src == 0 or lsp_state_uri_matches(st, uri_ptr, uri_n) == 0 {
+    lsp_emit_definition_null(req, n, root)
+  } else {
+    let off = lsp_offset_for_line_col(src, src_n, lsp_extract_position_line(req, n, root), lsp_extract_position_character(req, n, root))
+    let bounds = lsp_identifier_bounds(src, src_n, off)
+    let name_start = __mem_load64(bounds)
+    let name_n = __mem_load64(bounds + 8)
+    if name_n == 0 {
+      lsp_emit_definition_null(req, n, root)
+    } else {
+      let typed = mcp_check_source_quiet(src, src_n)
+      let name_ptr = src + name_start
+      let fn_pair = mcp_lookup_fn_pair(pipeline_typed_fns(typed), name_ptr, name_n)
+      if fn_pair != 0 {
+        if node_f2(fn_pair) == src {
+          lsp_emit_definition_location(req, n, root, st, lsp_fn_pair_name_start(fn_pair), lsp_fn_pair_name_len(fn_pair))
+        } else {
+          lsp_emit_definition_null(req, n, root)
+        }
+      } else {
+        let entry = mcp_lookup_type_entry_raw(pipeline_typed_type_entries(typed), name_ptr, name_n, 0 - 1)
+        if entry != 0 {
+          if __mem_load64(entry + 48) == src {
+            lsp_emit_definition_location(req, n, root, st, __mem_load64(entry), __mem_load64(entry + 8))
+          } else {
+            lsp_emit_definition_null(req, n, root)
+          }
+        } else {
+          let let_pos = lsp_find_let_binding_before(src, src_n, name_ptr, name_n, name_start)
+          if let_pos >= 0 { lsp_emit_definition_location(req, n, root, st, let_pos, name_n) }
+          else { lsp_emit_definition_null(req, n, root) }
+        }
+      }
+    }
+  }
+}
+
+fn lsp_emit_completion(req: i64, n: i64, root: i64) -> i64 {
+  let body = buf_new(512)
+  lsp_response_start(body, req, n, root)
+  bstr(body, "{\"isIncomplete\":false,\"items\":[{\"label\":\"handle\",\"kind\":14},{\"label\":\"perform\",\"kind\":14},{\"label\":\"par_map\",\"kind\":3}]}}")
+  lsp_write_body(body)
+}
+
+fn lsp_emit_code_action(req: i64, n: i64, root: i64) -> i64 {
+  let body = buf_new(512)
+  lsp_response_start(body, req, n, root)
+  bstr(body, "[{\"title\":\"Consider par_map for pure map callbacks\",\"kind\":\"refactor.rewrite\"}]}")
+  lsp_write_body(body)
+}
+
+fn lsp_handle_open(req: i64, n: i64, root: i64, st: i64) -> i64 {
+  let uri_pair = lsp_extract_text_document_string(req, n, root, "uri")
+  let text_pair = lsp_extract_text_document_string(req, n, root, "text")
+  let version = lsp_extract_text_document_version(req, n, root, 1)
+  lsp_state_set_doc(st, __mem_load64(uri_pair), __mem_load64(uri_pair + 8), __mem_load64(text_pair), __mem_load64(text_pair + 8), version)
+  lsp_emit_publish_diagnostics(st)
+}
+
+fn lsp_handle_change(req: i64, n: i64, root: i64, st: i64) -> i64 {
+  let uri_pair = lsp_extract_text_document_string(req, n, root, "uri")
+  let uri_ptr = __mem_load64(uri_pair)
+  let uri_n = __mem_load64(uri_pair + 8)
+  if lsp_state_uri_matches(st, uri_ptr, uri_n) == 0 {
+    lsp_emit_publish_diagnostics(st)
+  } else {
+    let version = lsp_extract_text_document_version(req, n, root, lsp_state_version(st) + 1)
+    if version < lsp_state_version(st) {
+      lsp_emit_publish_diagnostics(st)
+    } else {
+      let text_pair = lsp_extract_change_text(req, n, root)
+      lsp_state_set_doc(st, uri_ptr, uri_n, __mem_load64(text_pair), __mem_load64(text_pair + 8), version)
+      lsp_emit_publish_diagnostics(st)
+    }
+  }
+}
+
+fn lsp_process_body(req: i64, n: i64, st: i64) -> i64 {
+  let root = mcp_json_root_object_start(req, n)
+  if root < 0 {
+    lsp_emit_error_response(req, n, root, 0 - 32700, "invalid json-rpc")
+  } else {
+    let jsonrpc = mcp_json_field_value_start(req, n, root, "jsonrpc")
+    let method = mcp_json_field_value_start(req, n, root, "method")
+    if mcp_json_string_value_eq(req, n, jsonrpc, "2.0") == 0 or method < 0 {
+      lsp_emit_error_response(req, n, root, 0 - 32600, "invalid request")
+    } else { if mcp_json_string_value_eq(req, n, method, "initialize") == 1 {
+      lsp_emit_initialize(req, n, root)
+    } else { if mcp_json_string_value_eq(req, n, method, "textDocument/didOpen") == 1 {
+      lsp_handle_open(req, n, root, st)
+    } else { if mcp_json_string_value_eq(req, n, method, "textDocument/didChange") == 1 {
+      lsp_handle_change(req, n, root, st)
+    } else { if mcp_json_string_value_eq(req, n, method, "textDocument/hover") == 1 {
+      lsp_emit_hover(req, n, root, st)
+    } else { if mcp_json_string_value_eq(req, n, method, "textDocument/definition") == 1 {
+      lsp_emit_definition(req, n, root, st)
+    } else { if mcp_json_string_value_eq(req, n, method, "textDocument/completion") == 1 {
+      lsp_emit_completion(req, n, root)
+    } else { if mcp_json_string_value_eq(req, n, method, "textDocument/codeAction") == 1 {
+      lsp_emit_code_action(req, n, root)
+    } else {
+      lsp_emit_error_response(req, n, root, 0 - 32601, "unknown method")
+    } } } } } } } }
+  }
+}
+
+fn lsp_match_content_length(src: i64, pos: i64) -> i64 {
+  src_eq(src, pos, 15, "Content-Length:")
+}
+
+fn lsp_header_end(src: i64, n: i64, pos: i64) -> i64 {
+  let mut i = pos
+  let mut result = 0 - 1
+  while i + 3 < n and result < 0 {
+    if __mem_load8(src + i) == 13 and __mem_load8(src + i + 1) == 10 and __mem_load8(src + i + 2) == 13 and __mem_load8(src + i + 3) == 10 {
+      result = i
+    } else {
+      i = i + 1
+    }
+  }
+  result
+}
+
+fn lsp_content_length(src: i64, n: i64, pos: i64, header_end: i64) -> i64 {
+  let mut i = pos
+  let mut result = 0 - 1
+  while i + 15 <= header_end and result < 0 {
+    if lsp_match_content_length(src, i) == 1 {
+      let mut p = i + 15
+      while p < header_end and is_ws(__mem_load8(src + p)) == 1 { p = p + 1 }
+      result = lsp_json_int_at(src, n, p, 0 - 1)
+    } else {
+      i = i + 1
+    }
+  }
+  result
+}
+
+fn run_lsp() -> i64 {
+  let input = read_stdin_all()
+  let src = __mem_load64(input)
+  let n = __mem_load64(input + 8)
+  let st = lsp_state_new()
+  let mut pos = mcp_skip_json_ws(src, n, 0)
+  let mut done = 0
+  while pos < n and done == 0 {
+    if __mem_load8(src + pos) == 123 {
+      let parsed = mcp_json_parse_value(src, n, pos)
+      if mcp_json_result_ok(parsed) == 0 {
+        lsp_emit_error_response(src + pos, n - pos, 0 - 1, 0 - 32700, "invalid json-rpc")
+        done = 1
+      } else {
+        let end = mcp_json_result_pos(parsed)
+        lsp_process_body(src + pos, end - pos, st)
+        pos = mcp_skip_json_ws(src, n, end)
+      }
+    } else {
+      let header_end = lsp_header_end(src, n, pos)
+      if header_end < 0 {
+        lsp_emit_error_response(src + pos, n - pos, 0 - 1, 0 - 32700, "invalid json-rpc")
+        done = 1
+      } else {
+        let len = lsp_content_length(src, n, pos, header_end)
+        let body_start = header_end + 4
+        if len < 0 or body_start + len > n {
+          lsp_emit_error_response(src + pos, n - pos, 0 - 1, 0 - 32700, "invalid json-rpc")
+          done = 1
+        } else {
+          lsp_process_body(src + body_start, len, st)
+          pos = mcp_skip_json_ws(src, n, body_start + len)
+        }
+      }
+    }
   }
   0
 }

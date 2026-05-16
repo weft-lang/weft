@@ -36,6 +36,19 @@ assert_equals() {
   fi
 }
 
+assert_not_contains() {
+  local name="$1"
+  local haystack="$2"
+  local needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  fail $name"
+    echo "    unexpected content: $needle"
+    exit 1
+  else
+    echo "  ok $name"
+  fi
+}
+
 assert_not_contains_file() {
   local name="$1"
   local file="$2"
@@ -47,6 +60,14 @@ assert_not_contains_file() {
   else
     echo "  ok $name"
   fi
+}
+
+lsp_frame() {
+  local body="$1"
+  local len
+  len=$(printf '%s' "$body" | LC_ALL=C wc -c)
+  len=${len//[[:space:]]/}
+  printf 'Content-Length: %s\r\n\r\n%s' "$len" "$body"
 }
 
 assert_test_exit_code() {
@@ -472,6 +493,94 @@ assert_equals "mcp_type_lookup_invalid_source_json_only_snapshot" "$mcp_out" '{"
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"effect_lookup","arguments":{"source":"effect Log { fn hit() -> i64 } fn main() -> i64 { missing }","name":"Log"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_effect_lookup_invalid_source_json_only_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"effect_lookup","ok":true,"name":"Log","found":true,"kind":"effect","ops":1,"first_op":"hit","first_op_params":0,"first_op_return_type_tag":2,"first_op_return_type_prim":0,"first_op_deferred":0}}'
 
+lsp_init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+lsp_out=$(lsp_frame "$lsp_init" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_initialize_framed_header" "$lsp_out" "Content-Length:"
+assert_contains "lsp_initialize_capabilities" "$lsp_out" '"hoverProvider":true'
+assert_contains "lsp_initialize_definition_capability" "$lsp_out" '"definitionProvider":true'
+assert_contains "lsp_initialize_completion_hook" "$lsp_out" '"completionProvider"'
+assert_contains "lsp_initialize_code_action_hook" "$lsp_out" '"codeActionProvider":true'
+
+lsp_open_clean='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///clean.weft","version":1,"text":"fn main() -> i64 { 0 }"}}}'
+lsp_out=$(lsp_frame "$lsp_open_clean" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_open_clean_publish_diagnostics" "$lsp_out" '"method":"textDocument/publishDiagnostics"'
+assert_contains "lsp_open_clean_empty_diagnostics" "$lsp_out" '"diagnostics":[]'
+
+lsp_open_parse='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///parse.weft","version":1,"text":"fn broken -> i64 { 0 }"}}}'
+lsp_out=$(lsp_frame "$lsp_open_parse" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_open_parse_error_diagnostic" "$lsp_out" "error: expected"
+assert_contains "lsp_open_parse_error_range" "$lsp_out" '"range":{"start":{"line":0,"character":3}'
+
+lsp_open_type='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///type.weft","version":1,"text":"fn main() -> i64 { missing }"}}}'
+lsp_out=$(lsp_frame "$lsp_open_type" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_open_type_error_diagnostic" "$lsp_out" "type error: unknown identifier"
+assert_contains "lsp_open_type_error_range" "$lsp_out" '"character":19'
+
+lsp_open_unicode='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///unicode.weft","version":1,"text":"fn main() -> i64 { let s = \"Ω\" missing }"}}}'
+lsp_out=$(lsp_frame "$lsp_open_unicode" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_unicode_source_diagnostic" "$lsp_out" "type error: unknown identifier"
+assert_contains "lsp_unicode_source_range" "$lsp_out" '"line":0'
+
+large_lsp_source=""
+for ((i = 0; i < 40; i++)); do
+  large_lsp_source+="fn broken$i -> i64 { $i } "
+done
+lsp_large_open="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///large.weft\",\"version\":1,\"text\":\"$large_lsp_source\"}}}"
+lsp_out=$(lsp_frame "$lsp_large_open" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_large_diagnostics_response" "$lsp_out" '"diagnostics":[{"range"'
+assert_contains "lsp_large_diagnostics_late_range" "$lsp_out" '"character":997'
+
+lsp_open_hover='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///hover.weft","version":1,"text":"fn add(x: i64) -> i64 { x } fn main() -> i64 { add(1) }"}}}'
+lsp_hover='{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///hover.weft"},"position":{"line":0,"character":3}}}'
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_hover")" "$(lsp_frame "$lsp_hover")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_hover_function" "$lsp_out" '"value":"function add: params=1 return_type_tag=2 effects=0"'
+
+lsp_definition='{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///hover.weft"},"position":{"line":0,"character":47}}}'
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_hover")" "$(lsp_frame "$lsp_definition")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_definition_function" "$lsp_out" '"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":6}}'
+
+lsp_open_local='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///local.weft","version":1,"text":"fn main() -> i64 { let value = 41 value + 1 }"}}}'
+lsp_local_hover='{"jsonrpc":"2.0","id":4,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///local.weft"},"position":{"line":0,"character":34}}}'
+lsp_local_definition='{"jsonrpc":"2.0","id":5,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///local.weft"},"position":{"line":0,"character":34}}}'
+lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_open_local")" "$(lsp_frame "$lsp_local_hover")" "$(lsp_frame "$lsp_local_definition")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_hover_local" "$lsp_out" '"value":"local value"'
+assert_contains "lsp_definition_local" "$lsp_out" '"range":{"start":{"line":0,"character":23},"end":{"line":0,"character":28}}'
+
+lsp_unknown_hover='{"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///missing.weft"},"position":{"line":0,"character":0}}}'
+lsp_out=$(lsp_frame "$lsp_unknown_hover" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_unknown_file_hover_null" "$lsp_out" '"result":null'
+
+lsp_unknown_definition='{"jsonrpc":"2.0","id":66,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///missing.weft"},"position":{"line":0,"character":0}}}'
+lsp_out=$(lsp_frame "$lsp_unknown_definition" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_unknown_file_definition_null" "$lsp_out" '"result":null'
+
+lsp_change_bad='{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///rapid.weft","version":2},"contentChanges":[{"text":"fn main() -> i64 { missing }"}]}}'
+lsp_change_good='{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///rapid.weft","version":3},"contentChanges":[{"text":"fn main() -> i64 { 1 }"}]}}'
+lsp_open_rapid='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///rapid.weft","version":1,"text":"fn main() -> i64 { 0 }"}}}'
+lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_open_rapid")" "$(lsp_frame "$lsp_change_bad")" "$(lsp_frame "$lsp_change_good")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_rapid_edit_bad_diagnostic" "$lsp_out" "type error: unknown identifier"
+assert_contains "lsp_rapid_edit_final_clean" "$lsp_out" '"uri":"file:///rapid.weft","diagnostics":[]'
+
+lsp_stale_change='{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///stale.weft","version":1},"contentChanges":[{"text":"fn main() -> i64 { missing }"}]}}'
+lsp_open_stale='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///stale.weft","version":2,"text":"fn main() -> i64 { 0 }"}}}'
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_stale")" "$(lsp_frame "$lsp_stale_change")" | "$WEFT" lsp 2>&1)
+assert_not_contains "lsp_stale_update_ignored" "$lsp_out" "type error: unknown identifier"
+
+lsp_completion='{"jsonrpc":"2.0","id":7,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///hover.weft"},"position":{"line":0,"character":1}}}'
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_hover")" "$(lsp_frame "$lsp_completion")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_completion_hook_items" "$lsp_out" '"label":"par_map"'
+
+lsp_code_action='{"jsonrpc":"2.0","id":8,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///hover.weft"},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"context":{"diagnostics":[]}}}'
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_hover")" "$(lsp_frame "$lsp_code_action")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_code_action_hook" "$lsp_out" "Consider par_map"
+
+lsp_out=$(printf '%s' 'not-json' | "$WEFT" lsp 2>&1)
+assert_contains "lsp_malformed_json_rpc_error" "$lsp_out" '"code":-32700'
+
+lsp_unknown='{"jsonrpc":"2.0","id":9,"method":"workspace/unknown","params":{}}'
+lsp_out=$(lsp_frame "$lsp_unknown" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_unknown_method_error" "$lsp_out" '"code":-32601'
+
 printf 'fn main() -> i64 { let mut i = 0 let mut stop = 0 while i < 5 && stop == 0 { i = i + 1 } i }\n' > "$tmp_src"
 amp_diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_rejects_symbolic_and" "$amp_diag_out" "error: expected '}'"
@@ -534,4 +643,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 147 passed, 0 failed"
+echo "Tool boundary summary: 171 passed, 0 failed"
