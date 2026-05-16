@@ -290,6 +290,21 @@ assert_equals "mcp_diagnostics_trait_bound_snapshot" "$mcp_out" '{"jsonrpc":"2.0
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"trait DupTrait { fn val(self: i64) -> i64 } type DupBox { v: i64 } impl DupTrait for DupBox { fn val(self: i64) -> i64 { 1 } } impl DupTrait for DupBox { fn val(self: i64) -> i64 { 2 } } fn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_trait_impl_conflict_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":3,"check_errors":1,"items":[{"severity":"error","message":"type error: conflicting implementations of trait for type","span":145,"line":1,"col":146}]}}'
 
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn id<T>(x: T) -> T { x } fn bad() -> i64 { let y = id<i64, str>(1) 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_generic_type_arg_count_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":2,"check_errors":1,"items":[{"severity":"error","message":"type error: wrong number of type arguments","span":52,"line":1,"col":53}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad() -> i64 { for x in 42 { 0 } 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_for_iter_non_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: for iterator requires a Cons/Nil list","span":22,"line":1,"col":23}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad() -[Unsafe]> i64 { __got_nope() }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_unknown_got_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: unknown GOT symbol","span":26,"line":1,"col":27}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"type NoMeth { v: i64 } fn bad(x: NoMeth) -> i64 { x.missing() }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_unknown_method_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: unknown method","span":50,"line":1,"col":51}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad() -> i64 { let mut x = 1 let f = () => x f() }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_mut_capture_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: cannot capture mut binding","span":46,"line":1,"col":47}]}}'
+
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"effect State { fn get() -> i64 } fn bad() -> i64 { handle State.get() { State.put() -> resume(0) } }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_handler_unknown_op_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":2,"functions":1,"check_errors":2,"items":[{"severity":"error","message":"type error: missing handler clause","span":64,"line":1,"col":65},{"severity":"error","message":"type error: unknown effect operation","span":78,"line":1,"col":79}]}}'
 
@@ -484,4 +499,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 132 passed, 0 failed"
+echo "Tool boundary summary: 137 passed, 0 failed"
