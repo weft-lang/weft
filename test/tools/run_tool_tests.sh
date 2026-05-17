@@ -777,7 +777,7 @@ large_import_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_reads_large_import" "$large_import_out" "check: 2 functions, 0 errors"
 
 mkdir -p "$tmp_pkg_dir/deps/math"
-printf 'package app\ndep math deps/math\n' > "$tmp_pkg_dir/weft.pkg"
+printf '{"package":"app","dependencies":{"math":"deps/math"}}\n' > "$tmp_pkg_dir/weft.pkg"
 printf 'fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
 printf 'use "math/lib.weft"\nfn main() -> i64 { if add(40, 2) == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_dir/app.weft"
 (cd "$tmp_pkg_dir" && "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
@@ -810,12 +810,12 @@ mkdir -p "$tmp_pkg_cli_dir/deps/math"
 pkg_init_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg init cli_app 2>&1)
 assert_contains "pkg_init_writes_manifest" "$pkg_init_out" "pkg: wrote weft.pkg"
 pkg_manifest=$(< "$tmp_pkg_cli_dir/weft.pkg")
-assert_contains "pkg_init_manifest_package" "$pkg_manifest" "package cli_app"
+assert_contains "pkg_init_manifest_package" "$pkg_manifest" '"package":"cli_app"'
 
 pkg_add_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg add math deps/math 2>&1)
 assert_contains "pkg_add_records_dependency" "$pkg_add_out" "pkg: added dependency"
 pkg_manifest=$(< "$tmp_pkg_cli_dir/weft.pkg")
-assert_contains "pkg_add_manifest_dep" "$pkg_manifest" "dep math deps/math"
+assert_contains "pkg_add_manifest_dep" "$pkg_manifest" '"math":"deps/math"'
 printf 'fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp_pkg_cli_dir/deps/math/lib.weft"
 printf 'use "math/lib.weft"\nfn main() -> i64 { if add(40, 2) == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_cli_dir/app.weft"
 (cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" < app.weft > app 2>"$tmp_err")

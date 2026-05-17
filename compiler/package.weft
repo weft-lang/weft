@@ -1,6 +1,9 @@
 -- compiler/package.weft -- local package manifest parsing and import roots
 --
--- MVP manifest format:
+-- Manifest format:
+--   {"package":"app_name","dependencies":{"package_name":"relative/path"}}
+--
+-- The legacy line-oriented format remains readable for compatibility:
 --   package app_name
 --   dep package_name relative/path
 --
@@ -12,6 +15,7 @@ use "runtime/alloc.weft"
 use "runtime/buffer.weft"
 use "runtime/memory.weft"
 use "runtime/syscall.weft"
+use "stdlib/json.weft"
 
 fn pkg_manifest_package_start(m: i64) -> i64 { __mem_load64(m) }
 fn pkg_manifest_package_len(m: i64) -> i64 { __mem_load64(m + 8) }
@@ -92,6 +96,13 @@ fn pkg_bytes_eq(src: i64, start: i64, len: i64, s: str) -> i64 {
 fn pkg_bytes_eq_at(a_ptr: i64, a_start: i64, a_len: i64, b_ptr: i64, b_start: i64, b_len: i64) -> i64 {
   if a_len != b_len { 0 }
   else { src_eq_at(a_ptr, a_start, b_ptr + b_start, 0, a_len) }
+}
+
+fn pkg_str_view(ptr: i64, len: i64) -> str {
+  let desc = alloc_words(2)
+  __mem_store64(desc, ptr)
+  __mem_store64(desc + 8, len)
+  desc
 }
 
 fn pkg_name_is_valid(src: i64, start: i64, len: i64) -> i64 {
@@ -276,16 +287,90 @@ fn pkg_manifest_parse_line(m: i64, src: i64, n: i64, p: i64) -> i64 {
 }
 
 fn pkg_manifest_parse(src: i64, n: i64) -> i64 {
-  let m = pkg_manifest_new()
-  let mut p = 0
-  while p < n {
-    p = pkg_manifest_parse_line(m, src, n, p)
+  let start = json_skip_ws(src, n, 0)
+  if start < n and __mem_load8(src + start) == 123 {
+    pkg_manifest_parse_json(src, n)
+  } else {
+    let m = pkg_manifest_new()
+    let mut p = 0
+    while p < n {
+      p = pkg_manifest_parse_line(m, src, n, p)
+    }
+    m
   }
-  m
 }
 
 fn pkg_manifest_parse_str(src: str) -> i64 {
   pkg_manifest_parse(__str_ptr(src), __str_len(src))
+}
+
+fn pkg_manifest_parse_json(src: i64, n: i64) -> i64 {
+  let m = pkg_manifest_new()
+  let parsed = json_parse(pkg_str_view(src, n))
+  if json_result_ok(parsed) == 0 {
+    pkg_manifest_add_error(m)
+    m
+  } else {
+    pkg_manifest_fill_from_json(m, json_result_value(parsed))
+  }
+}
+
+fn pkg_manifest_json_key_is_allowed(key: str) -> i64 {
+  if str_eq(key, "package") == 1 { 1 }
+  else { if str_eq(key, "dependencies") == 1 { 1 } else { 0 } }
+}
+
+fn pkg_manifest_validate_json_keys(m: i64, root: Json) -> i64 {
+  let entries = json_object_entries(root)
+  for i in 0..vector_len(entries) {
+    let entry = vector_get<JsonEntry>(entries, i, json_entry("", json_null()))
+    if pkg_manifest_json_key_is_allowed(json_entry_key(entry)) == 0 {
+      pkg_manifest_add_error(m)
+    } else { 0 }
+  }
+  m
+}
+
+fn pkg_manifest_fill_from_json(m: i64, root: Json) -> i64 {
+  if json_kind(root) != 5 {
+    pkg_manifest_add_error(m)
+    m
+  } else {
+    pkg_manifest_validate_json_keys(m, root)
+    let package_opt = json_object_get(root, "package")
+    if json_option_is_some(package_opt) == 1 {
+      let package_value = json_option_value_or(package_opt, json_null())
+      if json_kind(package_value) != 3 {
+        pkg_manifest_add_error(m)
+      } else {
+        let name = json_string_value(package_value, "")
+        pkg_manifest_set_package(m, __str_ptr(name), 0, __str_len(name))
+      }
+    } else { 0 }
+
+    let deps_opt = json_object_get(root, "dependencies")
+    if json_option_is_some(deps_opt) == 1 {
+      let deps_value = json_option_value_or(deps_opt, json_null())
+      if json_kind(deps_value) != 5 {
+        pkg_manifest_add_error(m)
+      } else {
+        let deps = json_object_entries(deps_value)
+        for i in 0..vector_len(deps) {
+          let dep_entry = vector_get<JsonEntry>(deps, i, json_entry("", json_null()))
+          let dep_name = json_entry_key(dep_entry)
+          let dep_value = json_entry_value(dep_entry)
+          if json_kind(dep_value) != 3 {
+            pkg_manifest_add_error(m)
+          } else {
+            let dep_path = json_string_value(dep_value, "")
+            let added = pkg_manifest_add_dep_from_parts(m, __str_ptr(dep_name), __str_len(dep_name), __str_ptr(dep_path), __str_len(dep_path))
+            if added != 0 { pkg_manifest_add_error(m) } else { 0 }
+          }
+        }
+      }
+    } else { 0 }
+    m
+  }
 }
 
 fn pkg_manifest_file_path() -> i64 {
@@ -416,22 +501,27 @@ fn pkg_write_file(path: i64, data_ptr: i64, data_len: i64) -> i64 {
 }
 
 fn pkg_manifest_render_into(b: i64, m: i64) -> i64 {
+  bstr(b, json_stringify(pkg_manifest_to_json(m)))
+  bu8(b, 10)
+  buf_len(b)
+}
+
+fn pkg_manifest_to_json(m: i64) -> Json {
+  let root = vector_new<JsonEntry>()
   if pkg_manifest_package_len(m) > 0 {
-    bstr(b, "package ")
-    bscopy(b, pkg_manifest_package_start(m), pkg_manifest_package_len(m), 0)
-    bu8(b, 10)
+    vector_push<JsonEntry>(root, json_entry("package", json_string(pkg_str_view(pkg_manifest_package_start(m), pkg_manifest_package_len(m)))))
   } else { 0 }
+  let dep_entries = vector_new<JsonEntry>()
   let deps = pkg_manifest_deps(m)
   for i in 0..nlist_len(deps) {
     let dep = nlist_get(deps, i)
     let dep_src = pkg_dep_src(dep)
-    bstr(b, "dep ")
-    bscopy(b, dep_src + pkg_dep_name_start(dep), pkg_dep_name_len(dep), 0)
-    bu8(b, 32)
-    bscopy(b, dep_src + pkg_dep_path_start(dep), pkg_dep_path_len(dep), 0)
-    bu8(b, 10)
+    let name = pkg_str_view(dep_src + pkg_dep_name_start(dep), pkg_dep_name_len(dep))
+    let path = pkg_str_view(dep_src + pkg_dep_path_start(dep), pkg_dep_path_len(dep))
+    vector_push<JsonEntry>(dep_entries, json_entry(name, json_string(path)))
   }
-  buf_len(b)
+  vector_push<JsonEntry>(root, json_entry("dependencies", json_object(dep_entries)))
+  json_object(root)
 }
 
 fn pkg_manifest_rendered_eq(m: i64, expected: str) -> i64 {
@@ -458,10 +548,10 @@ fn pkg_cli_init(name_ptr: i64, name_len: i64) -> i64 {
       pkg_stderr("pkg: weft.pkg already exists\n")
       1
     } else {
-      let b = buf_new(name_len + 16)
-      bstr(b, "package ")
-      bscopy(b, name_ptr, name_len, 0)
-      bu8(b, 10)
+      let manifest = pkg_manifest_new()
+      pkg_manifest_set_package(manifest, name_ptr, 0, name_len)
+      let b = buf_new(name_len + 48)
+      pkg_manifest_render_into(b, manifest)
       if pkg_write_file(pkg_manifest_file_path(), buf_ptr(b), buf_len(b)) == 0 {
         pkg_stdout("pkg: wrote weft.pkg\n")
         0
