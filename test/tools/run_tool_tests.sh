@@ -12,8 +12,10 @@ tmp_import=$(mktemp /tmp/weft_tool_import_XXXXXX)
 tmp_bin=$(mktemp /tmp/weft_tool_bin_XXXXXX)
 tmp_err=$(mktemp /tmp/weft_tool_err_XXXXXX)
 tmp_pkg_dir=$(mktemp -d /tmp/weft_tool_pkg_XXXXXX)
+tmp_pkg_cli_dir=$(mktemp -d /tmp/weft_tool_pkg_cli_XXXXXX)
+tmp_pkg_missing_dir=$(mktemp -d /tmp/weft_tool_pkg_missing_XXXXXX)
 tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err"; rm -rf "$tmp_pkg_dir" "$tmp_outside_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir"' EXIT
 
 assert_contains() {
   local name="$1"
@@ -795,6 +797,51 @@ printf 'use "math/lib.weft"\nfn main() -> i64 { add(1, 2) }\n' > "$tmp_pkg_dir/a
 unsupported_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1)
 assert_contains "package_rejects_unsupported_version_token" "$unsupported_out" "type error: unknown function"
 
+mkdir -p "$tmp_pkg_cli_dir/deps/math"
+pkg_init_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg init cli_app 2>&1)
+assert_contains "pkg_init_writes_manifest" "$pkg_init_out" "pkg: wrote weft.pkg"
+pkg_manifest=$(< "$tmp_pkg_cli_dir/weft.pkg")
+assert_contains "pkg_init_manifest_package" "$pkg_manifest" "package cli_app"
+
+pkg_add_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg add math deps/math 2>&1)
+assert_contains "pkg_add_records_dependency" "$pkg_add_out" "pkg: added dependency"
+pkg_manifest=$(< "$tmp_pkg_cli_dir/weft.pkg")
+assert_contains "pkg_add_manifest_dep" "$pkg_manifest" "dep math deps/math"
+printf 'fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp_pkg_cli_dir/deps/math/lib.weft"
+printf 'use "math/lib.weft"\nfn main() -> i64 { if add(40, 2) == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_cli_dir/app.weft"
+(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
+chmod +x "$tmp_pkg_cli_dir/app"
+"$tmp_pkg_cli_dir/app"
+echo "  ok pkg_add_dependency_compiles"
+
+if duplicate_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg add math deps/other 2>&1); then
+  echo "  fail pkg_add_rejects_duplicate"
+  exit 1
+else
+  assert_contains "pkg_add_rejects_duplicate" "$duplicate_out" "pkg: invalid or duplicate dependency"
+fi
+
+if traversal_add_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg add evil ../outside 2>&1); then
+  echo "  fail pkg_add_rejects_traversal_path"
+  exit 1
+else
+  assert_contains "pkg_add_rejects_traversal_path" "$traversal_add_out" "pkg: invalid or duplicate dependency"
+fi
+
+if missing_add_out=$(cd "$tmp_pkg_missing_dir" && "$WEFT_ABS" pkg add math deps/math 2>&1); then
+  echo "  fail pkg_add_requires_manifest"
+  exit 1
+else
+  assert_contains "pkg_add_requires_manifest" "$missing_add_out" "pkg: missing weft.pkg"
+fi
+
+if bad_init_out=$(cd "$tmp_pkg_missing_dir" && "$WEFT_ABS" pkg init bad.name 2>&1); then
+  echo "  fail pkg_init_rejects_invalid_name"
+  exit 1
+else
+  assert_contains "pkg_init_rejects_invalid_name" "$bad_init_out" "pkg: invalid package name"
+fi
+
 printf 'test "plain" { Test.assert_eq(1, 1) }\n' > "$tmp_src"
 "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_binds_runtime_without_missing_symbols" "$tmp_err" "required runtime function unavailable"
@@ -838,4 +885,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 230 passed, 0 failed"
+echo "Tool boundary summary: 240 passed, 0 failed"
