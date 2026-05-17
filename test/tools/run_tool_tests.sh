@@ -3,11 +3,17 @@
 set -e
 
 WEFT=${WEFT:-./weft}
+case "$WEFT" in
+  /*) WEFT_ABS="$WEFT" ;;
+  *) WEFT_ABS="$(pwd)/$WEFT" ;;
+esac
 tmp_src=$(mktemp /tmp/weft_tool_src_XXXXXX)
 tmp_import=$(mktemp /tmp/weft_tool_import_XXXXXX)
 tmp_bin=$(mktemp /tmp/weft_tool_bin_XXXXXX)
 tmp_err=$(mktemp /tmp/weft_tool_err_XXXXXX)
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err"' EXIT
+tmp_pkg_dir=$(mktemp -d /tmp/weft_tool_pkg_XXXXXX)
+tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err"; rm -rf "$tmp_pkg_dir" "$tmp_outside_dir"' EXIT
 
 assert_contains() {
   local name="$1"
@@ -768,6 +774,27 @@ printf 'use "%s"\nfn main() -> i64 { sentinel() }\n' "$tmp_import" > "$tmp_src"
 large_import_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_reads_large_import" "$large_import_out" "check: 2 functions, 0 errors"
 
+mkdir -p "$tmp_pkg_dir/deps/math"
+printf 'package app\ndep math deps/math\n' > "$tmp_pkg_dir/weft.pkg"
+printf 'fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
+printf 'use "math/lib.weft"\nfn main() -> i64 { if add(40, 2) == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_dir/app.weft"
+(cd "$tmp_pkg_dir" && "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
+chmod +x "$tmp_pkg_dir/app"
+"$tmp_pkg_dir/app"
+echo "  ok package_local_dep_import_compiles"
+
+outside_name=$(basename "$tmp_outside_dir")
+printf 'fn hidden() -> i64 { 0 }\n' > "$tmp_outside_dir/lib.weft"
+printf 'package app\ndep evil ../%s\n' "$outside_name" > "$tmp_pkg_dir/weft.pkg"
+printf 'use "evil/lib.weft"\nfn main() -> i64 { hidden() }\n' > "$tmp_pkg_dir/app.weft"
+traversal_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1)
+assert_contains "package_rejects_traversal_dep_path" "$traversal_out" "type error: unknown function"
+
+printf 'package app\ndep math deps/math 1.0.0\n' > "$tmp_pkg_dir/weft.pkg"
+printf 'use "math/lib.weft"\nfn main() -> i64 { add(1, 2) }\n' > "$tmp_pkg_dir/app.weft"
+unsupported_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1)
+assert_contains "package_rejects_unsupported_version_token" "$unsupported_out" "type error: unknown function"
+
 printf 'test "plain" { Test.assert_eq(1, 1) }\n' > "$tmp_src"
 "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_binds_runtime_without_missing_symbols" "$tmp_err" "required runtime function unavailable"
@@ -811,4 +838,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 227 passed, 0 failed"
+echo "Tool boundary summary: 230 passed, 0 failed"
