@@ -233,6 +233,9 @@ assert_equals "mcp_grammar_check_host_order_alias_snapshot" "$mcp_out" '{"jsonrp
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select paid, sum(total) total_due from invoices group by paid having total_due > 100 order by total_due desc","host_source":"type invoices { total: i64, memo: str, paid: bool }\nfn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_check_host_having_alias_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":true,"grammar":"mini_sql","root_tag":701,"columns":2,"star":0,"table":"invoices","where":0,"check_errors":0}}'
 
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select i.paid, sum(i.total) as total_due from invoices i group by i.paid having total_due > 100 order by i.paid","host_source":"type invoices { total: i64, memo: str, paid: bool }\nfn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_check_host_qualified_ref_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":true,"grammar":"mini_sql","root_tag":701,"columns":2,"star":0,"table":"invoices","where":0,"check_errors":0}}'
+
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select nope from users"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_diagnostics_type_error_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":1,"check_errors":1,"items":[{"severity":"error","message":"mini_sql type error: unknown column","span":7,"line":1,"col":8}]}}'
 
@@ -307,6 +310,15 @@ assert_equals "mcp_grammar_diagnostics_ambiguous_alias_snapshot" "$mcp_out" '{"j
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select total as memo from invoices order by memo + 1","host_source":"type invoices { total: i64, memo: str, paid: bool }\nfn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_diagnostics_alias_column_shadow_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":1,"check_errors":1,"items":[{"severity":"error","message":"mini_sql type error: arithmetic expression requires i64","span":44,"line":1,"col":45}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select o.memo from invoices as i","host_source":"type invoices { total: i64, memo: str, paid: bool }\nfn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_diagnostics_qualified_unknown_alias_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":1,"check_errors":1,"items":[{"severity":"error","message":"mini_sql type error: unknown table qualifier","span":7,"line":1,"col":8}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select i. from invoices i","host_source":"type invoices { total: i64, memo: str, paid: bool }\nfn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_diagnostics_qualified_missing_field_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":1,"check_errors":0,"items":[{"severity":"error","message":"mini_sql parse error: expected field after '\''.'\''","span":10,"line":1,"col":11}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select i.memo + 1 from invoices i","host_source":"type invoices { total: i64, memo: str, paid: bool }\nfn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_diagnostics_qualified_type_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":1,"check_errors":1,"items":[{"severity":"error","message":"mini_sql type error: arithmetic expression requires i64","span":7,"line":1,"col":8}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select id users"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_diagnostics_parse_error_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":2,"check_errors":0,"items":[{"severity":"error","message":"mini_sql parse error: expected FROM","span":15,"line":1,"col":16},{"severity":"error","message":"mini_sql parse error: expected table name","span":15,"line":1,"col":16}]}}'
@@ -775,4 +787,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 215 passed, 0 failed"
+echo "Tool boundary summary: 219 passed, 0 failed"
