@@ -785,6 +785,15 @@ chmod +x "$tmp_pkg_dir/app"
 "$tmp_pkg_dir/app"
 echo "  ok package_local_dep_import_compiles"
 
+mkdir -p "$tmp_pkg_dir/.weft/cache/math"
+printf 'fn cached_value() -> i64 { 1 }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
+printf 'fn cached_value() -> i64 { 42 }\n' > "$tmp_pkg_dir/.weft/cache/math/lib.weft"
+printf 'use "math/lib.weft"\nfn main() -> i64 { if cached_value() == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_dir/app.weft"
+(cd "$tmp_pkg_dir" && "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
+chmod +x "$tmp_pkg_dir/app"
+"$tmp_pkg_dir/app"
+echo "  ok package_cache_hit_prefers_cached_file"
+
 outside_name=$(basename "$tmp_outside_dir")
 printf 'fn hidden() -> i64 { 0 }\n' > "$tmp_outside_dir/lib.weft"
 printf 'package app\ndep evil ../%s\n' "$outside_name" > "$tmp_pkg_dir/weft.pkg"
@@ -885,4 +894,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 240 passed, 0 failed"
+echo "Tool boundary summary: 241 passed, 0 failed"
