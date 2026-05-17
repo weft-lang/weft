@@ -239,6 +239,12 @@ assert_equals "mcp_grammar_check_host_qualified_ref_snapshot" "$mcp_out" '{"json
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select u.name, o.total from users u join orders o on u.id = o.user_id","host_source":"type users { id: i64, name: str, active: bool }\ntype orders { id: i64, user_id: i64, total: i64 }\nfn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_check_host_join_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":true,"grammar":"mini_sql","root_tag":701,"columns":2,"star":0,"table":"users","where":0,"check_errors":0}}'
 
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select distinct name from users order by name"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_check_distinct_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":true,"grammar":"mini_sql","root_tag":701,"columns":1,"star":0,"distinct":1,"table":"users","where":0,"check_errors":0}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select distinct u.name, o.total from users u join orders o on u.id = o.user_id","host_source":"type users { id: i64, name: str, active: bool }\ntype orders { id: i64, user_id: i64, total: i64 }\nfn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_check_host_distinct_join_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":true,"grammar":"mini_sql","root_tag":701,"columns":2,"star":0,"distinct":1,"table":"users","where":0,"check_errors":0}}'
+
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select nope from users"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_diagnostics_type_error_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":1,"check_errors":1,"items":[{"severity":"error","message":"mini_sql type error: unknown column","span":7,"line":1,"col":8}]}}'
 
@@ -331,6 +337,12 @@ assert_equals "mcp_grammar_diagnostics_join_predicate_mismatch_snapshot" "$mcp_o
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select u.name from users u join orders o"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_diagnostics_join_missing_on_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":1,"check_errors":0,"items":[{"severity":"error","message":"mini_sql parse error: expected ON","span":40,"line":1,"col":41}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select distinct id from users join orders on users.id = orders.user_id"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_diagnostics_distinct_ambiguous_column_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":1,"check_errors":1,"items":[{"severity":"error","message":"mini_sql type error: ambiguous column","span":16,"line":1,"col":17}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select id as distinct from users"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_diagnostics_distinct_alias_parse_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":2,"check_errors":0,"items":[{"severity":"error","message":"mini_sql parse error: expected alias after AS","span":13,"line":1,"col":14},{"severity":"error","message":"mini_sql parse error: expected FROM","span":13,"line":1,"col":14}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"mini_sql","source":"select id users"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_diagnostics_parse_error_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_diagnostics","ok":true,"grammar":"mini_sql","phase":"parse+check","diagnostics":2,"check_errors":0,"items":[{"severity":"error","message":"mini_sql parse error: expected FROM","span":15,"line":1,"col":16},{"severity":"error","message":"mini_sql parse error: expected table name","span":15,"line":1,"col":16}]}}'
@@ -799,4 +811,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 223 passed, 0 failed"
+echo "Tool boundary summary: 227 passed, 0 failed"
