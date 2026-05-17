@@ -41,6 +41,7 @@ echo "  time: ${TEST_MS}ms  files: ${TEST_FILES}  tests: ${TEST_TOTAL}"
 echo ""
 echo "Examples:"
 EXAMPLES=""
+EXAMPLE_FAIL=0
 for f in examples/*.weft; do
   name=$(basename $f .weft)
 
@@ -57,6 +58,7 @@ for f in examples/*.weft; do
 
   if [ "$COMP_STATUS" -ne 0 ] || [ "$DIAG_SIZE" -ne 0 ] || [ "$EX_SIZE" -eq 0 ]; then
     echo "  ${name}: compile ${COMP_MS}ms, compile failed, size ${EX_SIZE}b"
+    EXAMPLE_FAIL=$((EXAMPLE_FAIL+1))
 
     if [ -n "$EXAMPLES" ]; then EXAMPLES="${EXAMPLES}, "; fi
     EXAMPLES="${EXAMPLES}\"${name}\": {\"compile_ms\": ${COMP_MS}, \"run_ms\": 0, \"size\": ${EX_SIZE}, \"ok\": false}"
@@ -80,6 +82,7 @@ for f in examples/*.weft; do
     echo "  ${name}: compile ${COMP_MS}ms, run ${RUN_MS}ms, size ${EX_SIZE}b"
   else
     echo "  ${name}: compile ${COMP_MS}ms, run ${RUN_MS}ms failed (${RUN_STATUS}), size ${EX_SIZE}b"
+    EXAMPLE_FAIL=$((EXAMPLE_FAIL+1))
   fi
 
   if [ -n "$EXAMPLES" ]; then EXAMPLES="${EXAMPLES}, "; fi
@@ -104,6 +107,8 @@ echo ""
 echo "Summary:"
 echo "  Self-compile:  ${SELF_MS}ms (${SELF_SIZE} bytes)"
 echo "  Test suite:    ${TEST_MS}ms (${TEST_TOTAL} tests)"
+echo "  Examples:      ${EXAMPLE_FAIL} failed"
 echo "  SHA: ${SHA}"
 
 rm -f /tmp/bench_weft /tmp/bench_weft2 /tmp/bench_test_out
+if [ "$EXAMPLE_FAIL" -gt 0 ]; then exit 1; fi
