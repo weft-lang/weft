@@ -78,6 +78,8 @@ check_rejects "effectful_lambda_to_pure_fn" "test/negative/effectful_lambda_to_p
 check_rejects "fusion_effectful_map_callback" "test/negative/fusion_effectful_map_callback.weft" "type error: effect not available in caller"
 check_rejects "fusion_effectful_filter_callback" "test/negative/fusion_effectful_filter_callback.weft" "type error: effect not available in caller"
 check_rejects "fusion_alloc_effect_callback" "test/negative/fusion_alloc_effect_callback.weft" "type error: argument type mismatch"
+check_rejects "iter_fold_effectful_callback" "test/negative/iter_fold_effectful_callback.weft" "type error: effect not available in caller"
+check_rejects "iter_map_collect_effectful_callback" "test/negative/iter_map_collect_effectful_callback.weft" "type error: effect not available in caller"
 check_rejects "effectful_lambda_to_pure_effect_op" "test/negative/effectful_lambda_to_pure_effect_op.weft" "type error: effect not available in caller"
 check_rejects "function_value_effect_unavailable" "test/negative/function_value_effect_unavailable.weft" "type error: effect not available in caller"
 check_rejects "function_value_arg_mismatch" "test/negative/function_value_arg_mismatch.weft" "type error: argument type mismatch"
