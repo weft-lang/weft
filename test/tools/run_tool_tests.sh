@@ -761,6 +761,12 @@ printf 'fn main() -> i64 { let mut i = 0 let mut stop = 0 while i < 5 && stop ==
 amp_diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_rejects_symbolic_and" "$amp_diag_out" "error: expected '}'"
 
+printf 'test "plain" { Test.assert_eq(1, 1) }\n' > "$tmp_src"
+test_check_out=$("$WEFT" check < "$tmp_src" 2>&1)
+assert_contains "check_accepts_test_blocks" "$test_check_out" "0 errors"
+test_ast_out=$("$WEFT" ast < "$tmp_src" 2>&1)
+assert_contains "ast_accepts_test_blocks" "$test_ast_out" "test plain:"
+
 write_large_padding "$tmp_src"
 printf 'fn main() -> i64 { 0 }\n' >> "$tmp_src"
 large_check_out=$("$WEFT" check < "$tmp_src" 2>&1)
@@ -889,9 +895,11 @@ assert_test_compile_rejects "test_fixture_rejects_wrong_return_body" 'test "bad_
 for ((i = 0; i < 1800; i++)); do
   printf 'test "t%d" { Test.assert_eq(1, 1) }\n' "$i" >> "$tmp_src"
 done
+large_test_check_out=$("$WEFT" check < "$tmp_src" 2>&1)
+assert_contains "check_reads_large_test_harness" "$large_test_check_out" "0 errors"
 "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>/dev/null
 chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 241 passed, 0 failed"
+echo "Tool boundary summary: 244 passed, 0 failed"
