@@ -142,6 +142,16 @@ write_large_padding() {
   done
 }
 
+write_huge_padding() {
+  local file="$1"
+  : > "$file"
+  printf -- '-- ' >> "$file"
+  for ((i = 0; i < 15000; i++)); do
+    printf -- 'padding padding padding padding padding padding padding padding padding padding ' >> "$file"
+  done
+  printf '\n' >> "$file"
+}
+
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>&1)
@@ -782,6 +792,15 @@ printf 'use "%s"\nfn main() -> i64 { sentinel() }\n' "$tmp_import" > "$tmp_src"
 large_import_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_reads_large_import" "$large_import_out" "check: 2 functions, 0 errors"
 
+write_huge_padding "$tmp_src"
+printf 'fn main() -> i64 { 0 }\n' >> "$tmp_src"
+huge_check_out=$("$WEFT" check < "$tmp_src" 2>&1)
+assert_contains "check_reads_huge_stdin_offsets" "$huge_check_out" "check: 1 functions, 0 errors"
+"$WEFT" < "$tmp_src" > "$tmp_bin" 2>/dev/null
+chmod +x "$tmp_bin"
+"$tmp_bin"
+echo "  ok compile_reads_huge_stdin_offsets"
+
 mkdir -p "$tmp_pkg_dir/deps/math"
 printf '{"package":"app","dependencies":{"math":"deps/math"}}\n' > "$tmp_pkg_dir/weft.pkg"
 printf 'fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
@@ -902,4 +921,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 244 passed, 0 failed"
+echo "Tool boundary summary: 246 passed, 0 failed"
