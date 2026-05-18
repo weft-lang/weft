@@ -1,32 +1,54 @@
 -- stdlib/iter.weft -- pull iterators over generic generators
 
 use "runtime/alloc.weft"
+use "runtime/rc.weft"
 use "stdlib/generator.weft"
 use "stdlib/option.weft"
 use "stdlib/vector.weft"
 
 type Iterator<T> {
-  Iterator(i64)
+  Iterator(i64, () -> i64)
 }
 
 fn iter_kind_generator() -> i64 { 1 }
 fn iter_kind_range_i64() -> i64 { 2 }
-fn iter_state_size() -> i64 { 24 }
+fn iter_state_size() -> i64 { 32 }
 fn iter_state_kind_offset() -> i64 { 0 }
 fn iter_state_first_offset() -> i64 { 8 }
 fn iter_state_second_offset() -> i64 { 16 }
+fn iter_state_closed_offset() -> i64 { 24 }
+
+fn iter_noop_drop() -> i64 { 0 }
+
+fn iter_keep_generator_producer(producer: () -[GeneratorYield]> i64) -> i64 { 0 }
+
+fn iter_make<T>(state: i64, dropper: () -> i64) -> Iterator<T> {
+  closure_default_retain(dropper)
+  Iterator<T>(state, dropper)
+}
 
 fn iter_from_generator<T>(g: Generator<T, i64>) -> Iterator<T> {
+  iter_from_generator_with_dropper<T>(g, iter_noop_drop)
+}
+
+fn iter_from_generator_with_dropper<T>(g: Generator<T, i64>, dropper: () -> i64) -> Iterator<T> {
   let state = alloc_bump(iter_state_size())
   __mem_store64(state + iter_state_kind_offset(), iter_kind_generator())
   __mem_store64(state + iter_state_first_offset(), g)
   __mem_store64(state + iter_state_second_offset(), 0)
-  Iterator<T>(state)
+  __mem_store64(state + iter_state_closed_offset(), 0)
+  iter_make<T>(state, dropper)
 }
 
 fn iter_state<T>(it: Iterator<T>) -> i64 {
   match it {
-    Iterator(state) -> state
+    Iterator(state, dropper) -> state
+  }
+}
+
+fn iter_dropper<T>(it: Iterator<T>) -> () -> i64 {
+  match it {
+    Iterator(state, dropper) -> dropper
   }
 }
 
@@ -35,23 +57,47 @@ fn iter_range(start: i64, end: i64) -> Iterator<i64> {
   __mem_store64(state + iter_state_kind_offset(), iter_kind_range_i64())
   __mem_store64(state + iter_state_first_offset(), start)
   __mem_store64(state + iter_state_second_offset(), end)
-  Iterator<i64>(state)
+  __mem_store64(state + iter_state_closed_offset(), 0)
+  iter_make<i64>(state, iter_noop_drop)
+}
+
+fn iter_close<T>(it: Iterator<T>) -> i64 {
+  let state = iter_state<T>(it)
+  if state == 0 { 0 } else {
+    if __mem_load64(state + iter_state_closed_offset()) == 1 {
+      0
+    } else {
+      __mem_store64(state + iter_state_closed_offset(), 1)
+      let dropper = iter_dropper<T>(it)
+      let dropped = dropper()
+      closure_default_release(dropper)
+      dropped
+    }
+  }
 }
 
 fn iter_next<T>(it: Iterator<T>) -> Option<T> {
   let state = iter_state<T>(it)
   let kind = if state == 0 { 0 } else { __mem_load64(state + iter_state_kind_offset()) }
   if kind == iter_kind_generator() {
-    let next = generator_next<T, i64>(__mem_load64(state + iter_state_first_offset()))
-    match next {
-      GeneratorNextDone -> None
-      GeneratorNextValue(value) -> Some<T>(value)
+    if __mem_load64(state + iter_state_closed_offset()) == 1 {
+      None
+    } else {
+      let next = generator_next<T, i64>(__mem_load64(state + iter_state_first_offset()))
+      match next {
+        GeneratorNextDone -> {
+          iter_close<T>(it)
+          None
+        }
+        GeneratorNextValue(value) -> Some<T>(value)
+      }
     }
   } else {
     if kind == iter_kind_range_i64() {
       let current = __mem_load64(state + iter_state_first_offset())
       let end = __mem_load64(state + iter_state_second_offset())
       if current >= end {
+        iter_close<T>(it)
         None
       } else {
         __mem_store64(state + iter_state_first_offset(), current + 1)
@@ -66,16 +112,100 @@ fn iter_next<T>(it: Iterator<T>) -> Option<T> {
 fn iter_drop<T>(it: Iterator<T>) -> i64 {
   let state = iter_state<T>(it)
   let kind = if state == 0 { 0 } else { __mem_load64(state + iter_state_kind_offset()) }
-  if kind == iter_kind_generator() {
-    generator_drop<T, i64>(__mem_load64(state + iter_state_first_offset()))
+  if state == 0 {
+    0
   } else {
-    if kind == iter_kind_range_i64() {
-      __mem_store64(state + iter_state_first_offset(), __mem_load64(state + iter_state_second_offset()))
+    if __mem_load64(state + iter_state_closed_offset()) == 1 {
       0
     } else {
-      0
+      if kind == iter_kind_generator() {
+        let dropped = generator_drop<T, i64>(__mem_load64(state + iter_state_first_offset()))
+        iter_close<T>(it)
+        dropped
+      } else {
+        if kind == iter_kind_range_i64() {
+          __mem_store64(state + iter_state_first_offset(), __mem_load64(state + iter_state_second_offset()))
+          iter_close<T>(it)
+        } else {
+          iter_close<T>(it)
+        }
+      }
     }
   }
+}
+
+fn iter_map<T, U>(it: Iterator<T>, f: (T) -> U) -> Iterator<U> {
+  let producer = () => {
+    let mut done = 0
+    while done == 0 {
+      let next = iter_next<T>(it)
+      match next {
+        Some(value) -> {
+          generator_yield<U>(f(value))
+        }
+        None -> {
+          done = 1
+        }
+      }
+    }
+    0
+  }
+  let dropper = () => {
+    iter_keep_generator_producer(producer)
+    iter_drop<T>(it)
+  }
+  iter_from_generator_with_dropper<U>(generator_new<U, i64>(producer), dropper)
+}
+
+fn iter_filter<T>(it: Iterator<T>, pred: (T) -> i64) -> Iterator<T> {
+  let producer = () => {
+    let mut done = 0
+    while done == 0 {
+      let next = iter_next<T>(it)
+      match next {
+        Some(value) -> {
+          if pred(value) == 1 {
+            generator_yield<T>(value)
+          } else { 0 }
+        }
+        None -> {
+          done = 1
+        }
+      }
+    }
+    0
+  }
+  let dropper = () => {
+    iter_keep_generator_producer(producer)
+    iter_drop<T>(it)
+  }
+  iter_from_generator_with_dropper<T>(generator_new<T, i64>(producer), dropper)
+}
+
+fn iter_take<T>(it: Iterator<T>, limit: i64) -> Iterator<T> {
+  let producer = () => {
+    let mut remaining = limit
+    let mut done = if limit <= 0 { 1 } else { 0 }
+    while done == 0 {
+      let next = iter_next<T>(it)
+      match next {
+        Some(value) -> {
+          generator_yield<T>(value)
+          remaining = remaining - 1
+          if remaining <= 0 { done = 1 } else { 0 }
+        }
+        None -> {
+          done = 1
+        }
+      }
+    }
+    0
+  }
+  let dropper = () => {
+    iter_keep_generator_producer(producer)
+    iter_drop<T>(it)
+  }
+  iter_from_generator_with_dropper<T>(generator_new<T, i64>(producer), dropper)
 }
 
 fn iter_fold<T, A>(it: Iterator<T>, init: A, f: (A, T) -> A) -> A {
