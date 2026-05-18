@@ -182,6 +182,8 @@ check_rejects "deferred_k_generic_identity" "test/negative/deferred_k_generic_id
 check_rejects "deferred_k_returned_alias_non_tail" "test/negative/deferred_k_returned_alias_non_tail.weft" "type error: continuation call must be tail position"
 check_rejects "deferred_k_returned_alias_record_store" "test/negative/deferred_k_returned_alias_record_store.weft" "type error: continuation cannot escape"
 check_rejects "deferred_k_returned_alias_multiple_use" "test/negative/deferred_k_returned_alias_multiple_use.weft" "type error: continuation used more than once"
+check_rejects "stored_continuation_store_twice" "test/negative/stored_continuation_store_twice.weft" "type error: continuation used more than once"
+check_rejects "stored_continuation_use_after_store" "test/negative/stored_continuation_use_after_store.weft" "type error: continuation used more than once"
 check_rejects "handler_clause_unknown_op" "test/negative/handler_clause_unknown_op.weft" "type error: unknown effect operation"
 check_rejects "handler_clause_effect_mismatch" "test/negative/handler_clause_effect_mismatch.weft" "type error: handler clause effect mismatch"
 check_rejects "handler_clause_arity_too_few" "test/negative/handler_clause_arity_too_few.weft" "type error: arity mismatch"
