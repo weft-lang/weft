@@ -38,9 +38,10 @@ for f in test/linked/*.weft; do
 
   chmod +x "$tmpbin"
 
-  # Run and check exit code (0 = pass)
+  # Run and check exit code (0 = pass). Fresh linked binaries can spend more
+  # than 10s in cold macOS ad-hoc signature verification on first launch.
   exit_code=0
-  timeout 10 "$tmpbin" >/dev/null 2>/dev/null || exit_code=$?
+  timeout 30 "$tmpbin" >/dev/null 2>/dev/null || exit_code=$?
 
   if [ $exit_code -eq 0 ]; then
     echo "  ✓ $name"
