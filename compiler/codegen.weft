@@ -3754,6 +3754,8 @@ fn cg_lambda(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i
   let free_vars = nlist_new()
   find_free_vars(body, lambda_scope, scope, src, free_vars)
   let nfree = nlist_len(free_vars)
+  let lambda_evidence_info = cg_effect_evidence_info_for_lambda(node, fm, src)
+  let lambda_evidence_slots = if lambda_evidence_info == 0 { 0 } else { 1 }
   -- Emit B to skip over lambda body
   let skip_pos = buf_len(code)
   bu32(code, 0)
@@ -3764,9 +3766,15 @@ fn cg_lambda(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i
   let old_cleanup_stack = cg_cleanup_stack(fm)
   let old_loop_cleanup_depth = __mem_load64(fm + 152)
   let old_par_lowering_top = fmap_par_lowering_top(fm)
+  let old_handler_inline_top = fmap_handler_inline_top(fm)
+  let old_evidence_top = fmap_effect_evidence_top(fm)
+  let old_callback_top = fmap_effect_callback_top(fm)
   __mem_store64(fm + 144, nlist_new())
   __mem_store64(fm + 152, 0)
   fmap_set_par_lowering_top(fm, 0)
+  fmap_set_handler_inline_top(fm, 0)
+  fmap_set_effect_evidence_top(fm, 0)
+  fmap_set_effect_callback_top(fm, 0)
   -- Set up scope: load captures from env_ptr (x0), params from x1..xN
   let mut body_scope = scope_new()
   -- Load captures from env (x0)
@@ -3786,6 +3794,17 @@ fn cg_lambda(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i
     body_scope = scope_push_typed(body_scope, node_f1(fv), node_f2(fv), reg_id(body_ctr), cap_ty)
     body_ctr = body_ctr + 1
   }
+  if lambda_evidence_info != 0 {
+    let evidence_off = 8 + nfree * 16
+    if body_ctr < 8 {
+      bu32(code, cg_ldr(body_ctr + 19, 0, evidence_off))
+    } else {
+      bu32(code, cg_ldr(17, 0, evidence_off))
+      emit_store_reg(code, body_ctr, 17)
+    }
+    cg_effect_evidence_push(fm, node_f1(lambda_evidence_info), node_f2(lambda_evidence_info), body_ctr)
+    body_ctr = body_ctr + 1
+  } else { 0 }
   -- Set up explicit params from x1..xN (shifted by 1 for env_ptr in x0)
   for param_i in 0..nparams {
     let p = nlist_get(params, param_i)
@@ -3823,6 +3842,9 @@ fn cg_lambda(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i
   __mem_store64(fm + 144, old_cleanup_stack)
   __mem_store64(fm + 152, old_loop_cleanup_depth)
   fmap_set_par_lowering_top(fm, old_par_lowering_top)
+  fmap_set_handler_inline_top(fm, old_handler_inline_top)
+  fmap_set_effect_evidence_top(fm, old_evidence_top)
+  fmap_set_effect_callback_top(fm, old_callback_top)
   -- Patch B skip
   let after_lambda = buf_len(code)
   cg_patch_b(code, skip_pos, after_lambda)
@@ -3844,8 +3866,9 @@ fn cg_lambda(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i
   bu32(code, encode_adr(17, adr_off))
   bu32(code, cg_str(17, closure_phys1, 0))
   -- 3. Build managed environment (if captures)
-  if nfree > 0 {
-    let env_size = 8 + nfree * 16
+  let env_slots = nfree + lambda_evidence_slots
+  if env_slots > 0 {
+    let env_size = 8 + env_slots * 16
     emit_mov_imm(code, 0, env_size)
     emit_mov_imm(code, 1, 8)
     cg_emit_call_lit(code, fm, "rc_default_alloc")
@@ -3856,7 +3879,7 @@ fn cg_lambda(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i
       emit_store_reg(code, env_ctr, 0)
     }
     let env_phys0 = emit_load_reg(code, env_ctr)
-    emit_mov_imm(code, 9, nfree)
+    emit_mov_imm(code, 9, env_slots)
     bu32(code, cg_str(9, env_phys0, 0))
     -- Store captures plus a per-slot rc marker for env destruction.
     for ei in 0..nfree {
@@ -3891,6 +3914,16 @@ fn cg_lambda(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i
         }
       }
     }
+    if lambda_evidence_info != 0 {
+      let evidence_val_off = 8 + nfree * 16
+      let evidence_flag_off = 16 + nfree * 16
+      cg_emit_active_evidence_entry_value(code, fm, src, node_f1(lambda_evidence_info), node_f2(lambda_evidence_info), 9)
+      let env_phys_evidence = emit_load_reg(code, env_ctr)
+      bu32(code, cg_str(9, env_phys_evidence, evidence_val_off))
+      let env_phys_evidence_flag = emit_load_reg(code, env_ctr)
+      emit_mov_imm(code, 9, 0)
+      bu32(code, cg_str(9, env_phys_evidence_flag, evidence_flag_off))
+    } else { 0 }
     -- Store env_ptr at [closure, 8]
     let closure_phys2 = if closure_rid < 0 {
       let slot2 = 0 - closure_rid - 1
@@ -7624,6 +7657,18 @@ fn cg_evidence_bindings_from_params(params: i64) -> i64 {
   bindings
 }
 
+fn cg_evidence_bindings_push_params(bindings: i64, params: i64) -> i64 {
+  let mut result = bindings
+  let mut i = 0
+  let n = if params == 0 { 0 } else { nlist_len(params) }
+  while i < n {
+    let p = nlist_get(params, i)
+    result = cg_evidence_bindings_push(result, node_f1(p), node_f2(p))
+    i = i + 1
+  }
+  result
+}
+
 fn cg_evidence_bindings_contains(bindings: i64, src: i64, ns: i64, nl: i64) -> i64 {
   let mut b = bindings
   let mut found = 0
@@ -7865,7 +7910,7 @@ fn cg_evidence_scan_expr_scoped(node: i64, src: i64, fm: i64, s: i64, bindings: 
       22 -> cg_evidence_scan_expr_scoped(node_f1(node), src, fm, s, bindings, stack, callbacks)
       25 -> cg_evidence_scan_expr_scoped(node_f1(node), src, fm, s, bindings, stack, callbacks)
       26 -> cg_evidence_scan_expr_scoped(node_f1(node), src, fm, s, bindings, stack, callbacks)
-      29 -> cg_evidence_scan_state_reject(s)
+      29 -> cg_evidence_scan_expr_scoped(node_f2(node), src, fm, s, cg_evidence_bindings_push_params(bindings, node_f1(node)), stack, callbacks)
       32 -> cg_evidence_scan_perform_scoped(node, src, fm, s, bindings, stack, callbacks)
       33 -> cg_evidence_scan_state_reject(s)
       35 -> cg_evidence_scan_expr_scoped(node_f1(node), src, fm, s, bindings, stack, callbacks)
@@ -7885,6 +7930,29 @@ fn cg_evidence_scan_expr_scoped(node: i64, src: i64, fm: i64, s: i64, bindings: 
 
 fn cg_evidence_scan_expr(node: i64, src: i64, fm: i64, s: i64) -> i64 {
   cg_evidence_scan_expr_scoped(node, src, fm, s, 0, 0, 0)
+}
+
+fn cg_effect_evidence_info_for_lambda(node: i64, fm: i64, src: i64) -> i64 {
+  if node == 0 { 0 }
+  else { if node_tag(node) != 29 { 0 }
+  else {
+    let params = node_f1(node)
+    let body = node_f2(node)
+    let nparams = node_f3(node)
+    if nparams > 7 { 0 }
+    else {
+      let s = cg_evidence_scan_state_new()
+      let bindings = cg_evidence_bindings_from_params(params)
+      cg_evidence_scan_expr_scoped(body, src, fm, s, bindings, 0, fmap_effect_callback_top(fm))
+      if __mem_load64(s) == 1 and __mem_load64(s + 8) == 1 {
+        let eff_hash = __mem_load64(s + 16)
+        let op_hash = __mem_load64(s + 24)
+        if cg_effect_evidence_find(fm, eff_hash, op_hash) >= 0 or cg_handler_inline_find(fm, src, eff_hash, op_hash) != 0 {
+          node_new(0, eff_hash, op_hash, 0, 0)
+        } else { 0 }
+      } else { 0 }
+    }
+  } }
 }
 
 fn cg_effect_evidence_info_for_direct_call(node: i64, fm: i64, src: i64, entry: i64) -> i64 {
@@ -7964,6 +8032,27 @@ fn cg_emit_effect_evidence_fn_spec(code: i64, fm: i64, entry: i64, info: i64) ->
       fmap_set_effect_callback_top(fm, old_callback_top)
       cg_patch_b(code, b_over_pos, buf_len(code))
       fn_off
+    }
+  }
+}
+
+fn cg_emit_active_evidence_entry_value(code: i64, fm: i64, src: i64, eff_hash: i64, op_hash: i64, dest: i64) -> i64 {
+  let active_evidence_ctr = cg_effect_evidence_find(fm, eff_hash, op_hash)
+  if active_evidence_ctr >= 0 {
+    let evidence_phys = emit_load_reg(code, active_evidence_ctr)
+    bu32(code, encode_add_imm(dest, evidence_phys, 0))
+    1
+  } else {
+    let inline_match = cg_handler_inline_find(fm, src, eff_hash, op_hash)
+    if inline_match == 0 {
+      emit_mov_imm_safe(code, dest, 0)
+      0
+    } else {
+      let op_index = __mem_load64(inline_match + cg_handler_inline_match_index_offset())
+      let ops_ctr = __mem_load64(inline_match + cg_handler_inline_match_ops_ctr_offset())
+      let ops_phys = emit_load_reg(code, ops_ctr)
+      bu32(code, encode_add_imm(dest, ops_phys, op_index * handler_ops_entry_size()))
+      1
     }
   }
 }
