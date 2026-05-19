@@ -146,7 +146,7 @@ require_cmd rustc
 
 mkdir -p "$(dirname "$OUT")"
 
-CASES="sieve vector_sort graph_reach"
+CASES="sieve vector_sort graph_reach mandelbrot"
 RESULTS=""
 FAIL=0
 

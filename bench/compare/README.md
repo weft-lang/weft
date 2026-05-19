@@ -19,11 +19,14 @@ BENCH_COMPARE_RECORD=0 bash bench_compare.sh
 WEFT=/tmp/weft-under-test bash bench_compare.sh
 ```
 
-The first workload set is intentionally integer-only:
+The workload set covers integer-heavy and float-heavy kernels:
 
 - `sieve`: raw word-memory loops and stores
 - `vector_sort`: vector-backed insertion sort plus binary search
 - `graph_reach`: adjacency-matrix reachability with vector queues
+- `mandelbrot`: `f64` escape-count loops with explicit `i64` to `f64`
+  conversion
 
-Float-heavy published benchmarks such as `n-body` and `spectral-norm` should
-wait until Weft's `f64` implementation is shipped.
+Further float-heavy published benchmarks such as `n-body` and `spectral-norm`
+need the next numeric-stdlib slices, especially checked float conversion and
+transcendental/runtime math surfaces.
