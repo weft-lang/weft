@@ -574,7 +574,7 @@ fn cg_ftypes_lookup_fn_type(ft: i64, src: i64, ns: i64, nl: i64) -> i64 {
 -- ======================================================================
 
 fn fmap_new() -> i64 {
-  let h = alloc_bump(824)
+  let h = alloc_bump(832)
   let d = alloc_bump(80000)
   __mem_store64(h, d)
   __mem_store64(h + 8, 0)
@@ -736,6 +736,8 @@ fn fmap_new() -> i64 {
   __mem_store64(h + 800, 0)
   __mem_store64(h + 808, 0)
   __mem_store64(h + 816, 0)
+  -- Mutable i64 loop-carried values held in registers across loop iterations.
+  __mem_store64(h + 824, 0)
   h
 }
 fn fmap_set_tt(fm: i64, tt: i64) -> i64 { __mem_store64(fm + 48, tt) 0 }
@@ -771,6 +773,8 @@ fn fmap_rc_reuse_lowering_count(fm: i64) -> i64 { __mem_load64(fm + 808) }
 fn fmap_inc_rc_reuse_lowering_count(fm: i64) -> i64 { __mem_store64(fm + 808, __mem_load64(fm + 808) + 1) 0 }
 fn fmap_closure_reuse_lowering_count(fm: i64) -> i64 { __mem_load64(fm + 816) }
 fn fmap_inc_closure_reuse_lowering_count(fm: i64) -> i64 { __mem_store64(fm + 816, __mem_load64(fm + 816) + 1) 0 }
+fn fmap_loop_accumulator_register_count(fm: i64) -> i64 { __mem_load64(fm + 824) }
+fn fmap_inc_loop_accumulator_register_count(fm: i64) -> i64 { __mem_store64(fm + 824, __mem_load64(fm + 824) + 1) 0 }
 fn fmap_alloc_elision_count(fm: i64) -> i64 { __mem_load64(fm + 200) }
 fn fmap_inc_alloc_elision_count(fm: i64) -> i64 { __mem_store64(fm + 200, __mem_load64(fm + 200) + 1) 0 }
 fn fmap_fusion_count(fm: i64) -> i64 { __mem_load64(fm + 224) }
@@ -2599,9 +2603,14 @@ fn cg_while(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i6
   let old_vector_bounds_top = fmap_vector_bounds_top(fm)
   let old_vector_data_top = fmap_vector_data_top(fm)
   let old_vector_push_proof_top = fmap_vector_push_proof_top(fm)
-  let hoist_candidates = cg_vector_data_loop_candidates(cond, body, scope, src, fm)
-  let loop_ctr = cg_vector_data_emit_loop_hoists(hoist_candidates, code, scope, src, ctr, fm)
-  let push_proofs = cg_vector_push_loop_proofs(cond, body, scope, src, fm)
+  let accum_candidates = cg_loop_accum_candidates(body, scope, src)
+  let accum_plan = cg_loop_accum_plan(accum_candidates, scope, fm)
+  cg_loop_accum_emit_loads(accum_plan, code, fm)
+  let loop_scope = if accum_plan == 0 { scope } else { cg_loop_accum_plan_scope(accum_plan) }
+  let loop_base_ctr = cg_counter_after_scope(loop_scope, ctr)
+  let hoist_candidates = cg_vector_data_loop_candidates(cond, body, loop_scope, src, fm)
+  let loop_ctr = cg_vector_data_emit_loop_hoists(hoist_candidates, code, loop_scope, src, loop_base_ctr, fm)
+  let push_proofs = cg_vector_push_loop_proofs(cond, body, loop_scope, src, fm)
   cg_vector_push_activate_loop_proofs(fm, push_proofs)
   -- Set up this loop's context
   let loop_start = buf_len(code)
@@ -2610,12 +2619,12 @@ fn cg_while(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i6
   __mem_store64(fm + 64, break_patches)
   __mem_store64(fm + 152, cg_cleanup_count(fm))
   fmap_set_loop_result_ctr(fm, ctr)
-  let direct_branch = cg_direct_branch_false(cond, code, scope, src, loop_ctr, fm)
+  let direct_branch = cg_direct_branch_false(cond, code, loop_scope, src, loop_ctr, fm)
   let mut cond_phys = 0
   let mut branch_pos = 0
   let mut body_ctr = loop_ctr
   if direct_branch == 0 {
-    let c1 = cg_expr(cond, code, scope, src, loop_ctr, fm)
+    let c1 = cg_expr(cond, code, loop_scope, src, loop_ctr, fm)
     cond_phys = emit_load_reg(code, c1 - 1)
     branch_pos = buf_len(code)
     bu32(code, 0)
@@ -2625,8 +2634,8 @@ fn cg_while(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i6
     body_ctr = node_f2(direct_branch)
   }
   -- body (result discarded)
-  cg_vector_bound_push_from_cond(fm, cond, body, scope, src)
-  let c2 = cg_expr(body, code, scope, src, body_ctr, fm)
+  cg_vector_bound_push_from_cond(fm, cond, body, loop_scope, src)
+  let c2 = cg_expr(body, code, loop_scope, src, body_ctr, fm)
   fmap_set_vector_bounds_top(fm, old_vector_bounds_top)
   fmap_set_vector_data_top(fm, old_vector_data_top)
   fmap_set_vector_push_proof_top(fm, old_vector_push_proof_top)
@@ -2634,13 +2643,14 @@ fn cg_while(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i6
   let b_pos = buf_len(code)
   bu32(code, encode_b(loop_start - b_pos))
   -- Patch CBZ and all break targets
-  let after_loop = buf_len(code)
+  let store_start = buf_len(code)
   if direct_branch == 0 {
-    cg_patch_cbz(code, branch_pos, cond_phys, after_loop)
+    cg_patch_cbz(code, branch_pos, cond_phys, store_start)
   } else {
-    cg_patch_branch_cond_list(code, branch_pos, after_loop)
+    cg_patch_branch_cond_list(code, branch_pos, store_start)
   }
-  cg_patch_breaks(code, break_patches, after_loop)
+  cg_patch_breaks(code, break_patches, store_start)
+  cg_loop_accum_emit_stores(accum_plan, code)
   -- Restore outer loop context
   __mem_store64(fm + 56, old_loop_start)
   __mem_store64(fm + 64, old_break_patches)
@@ -2808,6 +2818,237 @@ fn cg_expr_has_break(node: i64) -> i64 {
   }
 }
 
+fn cg_loop_accum_entry_new(ns: i64, nl: i64, rid: i64, ty: i64) -> i64 {
+  let e = alloc_bump(40)
+  __mem_store64(e, ns)
+  __mem_store64(e + 8, nl)
+  __mem_store64(e + 16, rid)
+  __mem_store64(e + 24, ty)
+  __mem_store64(e + 32, 0)
+  e
+}
+
+fn cg_loop_accum_entry_ns(e: i64) -> i64 { __mem_load64(e) }
+fn cg_loop_accum_entry_nl(e: i64) -> i64 { __mem_load64(e + 8) }
+fn cg_loop_accum_entry_rid(e: i64) -> i64 { __mem_load64(e + 16) }
+fn cg_loop_accum_entry_ty(e: i64) -> i64 { __mem_load64(e + 24) }
+fn cg_loop_accum_entry_phys(e: i64) -> i64 { __mem_load64(e + 32) }
+fn cg_loop_accum_entry_set_phys(e: i64, phys: i64) -> i64 { __mem_store64(e + 32, phys) 0 }
+
+fn cg_loop_accum_find(entries: i64, src: i64, ns: i64, nl: i64) -> i64 {
+  let mut i = 0
+  let mut found = 0
+  while i < nlist_len(entries) {
+    let e = nlist_get(entries, i)
+    if cg_span_eq(src, cg_loop_accum_entry_ns(e), cg_loop_accum_entry_nl(e), src, ns, nl) == 1 {
+      found = e
+      i = nlist_len(entries)
+    } else { i = i + 1 }
+  }
+  found
+}
+
+fn cg_loop_accum_assignment_candidate(assign: i64, scope: i64, src: i64) -> i64 {
+  if assign == 0 { 0 }
+  else { if node_tag(assign) != 12 { 0 }
+  else {
+    let ns = node_f1(assign)
+    let nl = node_f2(assign)
+    let rid = scope_lookup(scope, src, ns, nl)
+    let ty = scope_lookup_type(scope, src, ns, nl)
+    if rid >= 0 { 0 }
+    else { if rid == 0 - 999 { 0 }
+    else { if ty == 0 { 0 }
+    else { if ty_eq(ty, ty_i64()) != 1 { 0 }
+    else { if cg_while_update_value_matches(node_f3(assign), src, ns, nl) != 1 { 0 }
+    else { cg_loop_accum_entry_new(ns, nl, rid, ty) } } } } }
+  } }
+}
+
+fn cg_loop_accum_collect_args(args: i64, n: i64, scope: i64, src: i64, entries: i64) -> i64 {
+  for i in 0..n {
+    cg_loop_accum_collect(nlist_get(args, i), scope, src, entries)
+  }
+  0
+}
+
+fn cg_loop_accum_collect(node: i64, scope: i64, src: i64, entries: i64) -> i64 {
+  if node == 0 { 0 }
+  else {
+    let tag = node_tag(node)
+    match tag {
+      3 -> { cg_loop_accum_collect(node_f2(node), scope, src, entries) cg_loop_accum_collect(node_f3(node), scope, src, entries) }
+      4 -> cg_loop_accum_collect_args(node_f3(node), node_f4(node), scope, src, entries)
+      5 -> { cg_loop_accum_collect(node_f1(node), scope, src, entries) cg_loop_accum_collect(node_f2(node), scope, src, entries) cg_loop_accum_collect(node_f3(node), scope, src, entries) }
+      6 -> {
+        cg_loop_accum_collect(node_f3(node), scope, src, entries)
+        let inner_scope = scope_push(scope, node_f1(node), node_f2(node), 0)
+        cg_loop_accum_collect(node_f4(node), inner_scope, src, entries)
+      }
+      7 -> { cg_loop_accum_collect(node_f1(node), scope, src, entries) cg_loop_accum_collect(node_f2(node), scope, src, entries) }
+      10 -> { cg_loop_accum_collect(node_f1(node), scope, src, entries) cg_loop_accum_collect(node_f2(node), scope, src, entries) }
+      11 -> {
+        cg_loop_accum_collect(node_f3(node), scope, src, entries)
+        let inner_scope = scope_push(scope, node_f1(node), node_f2(node), 0)
+        cg_loop_accum_collect(node_f4(node), inner_scope, src, entries)
+      }
+      12 -> {
+        cg_loop_accum_collect(node_f3(node), scope, src, entries)
+        let candidate = cg_loop_accum_assignment_candidate(node, scope, src)
+        if candidate == 0 { 0 }
+        else {
+          if cg_loop_accum_find(entries, src, node_f1(node), node_f2(node)) == 0 {
+            nlist_add(entries, candidate)
+          } else { 0 }
+        }
+      }
+      22 -> cg_loop_accum_collect(node_f1(node), scope, src, entries)
+      25 -> cg_loop_accum_collect(node_f1(node), scope, src, entries)
+      26 -> cg_loop_accum_collect(node_f1(node), scope, src, entries)
+      35 -> cg_loop_accum_collect(node_f1(node), scope, src, entries)
+      36 -> {
+        let inner = node_f2(node)
+        cg_loop_accum_collect_args(node_f3(inner), node_f4(inner), scope, src, entries)
+      }
+      37 -> cg_loop_accum_collect(node_f1(node), scope, src, entries)
+      41 -> { cg_loop_accum_collect(node_f1(node), scope, src, entries) cg_loop_accum_collect_args(node_f3(node), nlist_len(node_f3(node)), scope, src, entries) }
+      45 -> cg_loop_accum_collect(node_f1(node), scope, src, entries)
+      46 -> { cg_loop_accum_collect(node_f1(node), scope, src, entries) cg_loop_accum_collect(node_f2(node), scope, src, entries) }
+      47 -> {
+        cg_loop_accum_collect(node_f3(node), scope, src, entries)
+        let inner_scope = scope_push(scope, node_f1(node), node_f2(node), 0)
+        cg_loop_accum_collect(node_f4(node), inner_scope, src, entries)
+      }
+      48 -> cg_loop_accum_collect(node_f1(node), scope, src, entries)
+      49 -> cg_loop_accum_collect(node_f1(node), scope, src, entries)
+      52 -> { cg_loop_accum_collect(node_f1(node), scope, src, entries) cg_loop_accum_collect(node_f2(node), scope, src, entries) }
+      _ -> 0
+    }
+  }
+}
+
+fn cg_loop_accum_safe_args(args: i64, n: i64, src: i64, ns: i64, nl: i64) -> i64 {
+  let mut i = 0
+  let mut ok = 1
+  while i < n and ok == 1 {
+    ok = cg_loop_accum_var_safe(nlist_get(args, i), src, ns, nl)
+    i = i + 1
+  }
+  ok
+}
+
+fn cg_loop_accum_var_safe(node: i64, src: i64, ns: i64, nl: i64) -> i64 {
+  if node == 0 { 1 }
+  else {
+    let tag = node_tag(node)
+    match tag {
+      1 -> 1
+      2 -> 1
+      3 -> if cg_loop_accum_var_safe(node_f2(node), src, ns, nl) != 1 { 0 } else { cg_loop_accum_var_safe(node_f3(node), src, ns, nl) }
+      4 -> cg_loop_accum_safe_args(node_f3(node), node_f4(node), src, ns, nl)
+      5 -> if cg_loop_accum_var_safe(node_f1(node), src, ns, nl) != 1 { 0 } else { if cg_loop_accum_var_safe(node_f2(node), src, ns, nl) != 1 { 0 } else { cg_loop_accum_var_safe(node_f3(node), src, ns, nl) } }
+      6 -> if cg_span_eq(src, node_f1(node), node_f2(node), src, ns, nl) == 1 { 0 } else { if cg_loop_accum_var_safe(node_f3(node), src, ns, nl) != 1 { 0 } else { cg_loop_accum_var_safe(node_f4(node), src, ns, nl) } }
+      7 -> if cg_loop_accum_var_safe(node_f1(node), src, ns, nl) != 1 { 0 } else { cg_loop_accum_var_safe(node_f2(node), src, ns, nl) }
+      10 -> if cg_loop_accum_var_safe(node_f1(node), src, ns, nl) != 1 { 0 } else { cg_loop_accum_var_safe(node_f2(node), src, ns, nl) }
+      11 -> if cg_span_eq(src, node_f1(node), node_f2(node), src, ns, nl) == 1 { 0 } else { if cg_loop_accum_var_safe(node_f3(node), src, ns, nl) != 1 { 0 } else { cg_loop_accum_var_safe(node_f4(node), src, ns, nl) } }
+      12 -> {
+        if cg_span_eq(src, node_f1(node), node_f2(node), src, ns, nl) == 1 {
+          cg_while_update_value_matches(node_f3(node), src, ns, nl)
+        } else { cg_loop_accum_var_safe(node_f3(node), src, ns, nl) }
+      }
+      22 -> cg_loop_accum_var_safe(node_f1(node), src, ns, nl)
+      24 -> 1
+      25 -> cg_loop_accum_var_safe(node_f1(node), src, ns, nl)
+      26 -> cg_loop_accum_var_safe(node_f1(node), src, ns, nl)
+      35 -> cg_loop_accum_var_safe(node_f1(node), src, ns, nl)
+      36 -> {
+        let inner = node_f2(node)
+        cg_loop_accum_safe_args(node_f3(inner), node_f4(inner), src, ns, nl)
+      }
+      37 -> cg_loop_accum_var_safe(node_f1(node), src, ns, nl)
+      41 -> if cg_loop_accum_var_safe(node_f1(node), src, ns, nl) != 1 { 0 } else { cg_loop_accum_safe_args(node_f3(node), nlist_len(node_f3(node)), src, ns, nl) }
+      45 -> cg_loop_accum_var_safe(node_f1(node), src, ns, nl)
+      46 -> if cg_loop_accum_var_safe(node_f1(node), src, ns, nl) != 1 { 0 } else { cg_loop_accum_var_safe(node_f2(node), src, ns, nl) }
+      47 -> if cg_span_eq(src, node_f1(node), node_f2(node), src, ns, nl) == 1 { 0 } else { if cg_loop_accum_var_safe(node_f3(node), src, ns, nl) != 1 { 0 } else { cg_loop_accum_var_safe(node_f4(node), src, ns, nl) } }
+      48 -> cg_loop_accum_var_safe(node_f1(node), src, ns, nl)
+      49 -> cg_loop_accum_var_safe(node_f1(node), src, ns, nl)
+      52 -> if cg_loop_accum_var_safe(node_f1(node), src, ns, nl) != 1 { 0 } else { cg_loop_accum_var_safe(node_f2(node), src, ns, nl) }
+      54 -> 1
+      _ -> 0
+    }
+  }
+}
+
+fn cg_loop_accum_filter(candidates: i64, body: i64, src: i64) -> i64 {
+  let result = nlist_new()
+  for i in 0..nlist_len(candidates) {
+    let e = nlist_get(candidates, i)
+    if cg_loop_accum_var_safe(body, src, cg_loop_accum_entry_ns(e), cg_loop_accum_entry_nl(e)) == 1 {
+      nlist_add(result, e)
+    } else { 0 }
+  }
+  result
+}
+
+fn cg_loop_accum_candidates(body: i64, scope: i64, src: i64) -> i64 {
+  let candidates = nlist_new()
+  cg_loop_accum_collect(body, scope, src, candidates)
+  cg_loop_accum_filter(candidates, body, src)
+}
+
+fn cg_loop_accum_plan(candidates: i64, scope: i64, fm: i64) -> i64 {
+  let planned = nlist_new()
+  let mut plan_scope = scope
+  let mut ok = 1
+  let mut i = 0
+  while i < nlist_len(candidates) and ok == 1 {
+    let e = nlist_get(candidates, i)
+    let phys = cg_scope_first_free_loop_accum_phys(plan_scope)
+    if phys == 0 {
+      ok = 0
+    } else {
+      let p = cg_loop_accum_entry_new(cg_loop_accum_entry_ns(e), cg_loop_accum_entry_nl(e), cg_loop_accum_entry_rid(e), cg_loop_accum_entry_ty(e))
+      cg_loop_accum_entry_set_phys(p, phys)
+      nlist_add(planned, p)
+      plan_scope = scope_push_typed(plan_scope, cg_loop_accum_entry_ns(p), cg_loop_accum_entry_nl(p), phys, cg_loop_accum_entry_ty(p))
+      i = i + 1
+    }
+  }
+  if ok == 1 and nlist_len(planned) > 0 {
+    node_new(0, planned, plan_scope, 0, 0)
+  } else { 0 }
+}
+
+fn cg_loop_accum_plan_entries(plan: i64) -> i64 { node_f1(plan) }
+fn cg_loop_accum_plan_scope(plan: i64) -> i64 { node_f2(plan) }
+
+fn cg_loop_accum_emit_loads(plan: i64, code: i64, fm: i64) -> i64 {
+  if plan == 0 { 0 }
+  else {
+    let entries = cg_loop_accum_plan_entries(plan)
+    for i in 0..nlist_len(entries) {
+      let e = nlist_get(entries, i)
+      let rid = cg_loop_accum_entry_rid(e)
+      let slot = 0 - rid - 1
+      bu32(code, cg_ldr(cg_loop_accum_entry_phys(e), 31, slot * 8))
+      fmap_inc_loop_accumulator_register_count(fm)
+    }
+    0
+  }
+}
+
+fn cg_loop_accum_emit_stores(plan: i64, code: i64) -> i64 {
+  if plan == 0 { 0 }
+  else {
+    let entries = cg_loop_accum_plan_entries(plan)
+    for i in 0..nlist_len(entries) {
+      let e = nlist_get(entries, i)
+      cg_store_regid_from_phys(code, cg_loop_accum_entry_rid(e), cg_loop_accum_entry_phys(e))
+    }
+    0
+  }
+}
+
 fn cg_store_regid_from_phys(code: i64, rid: i64, phys: i64) -> i64 {
   if rid < 0 {
     let slot = 0 - rid - 1
@@ -2850,10 +3091,14 @@ fn cg_while_try_induction_register(node: i64, code: i64, scope: i64, src: i64, c
         let old_vector_bounds_top = fmap_vector_bounds_top(fm)
         let old_vector_data_top = fmap_vector_data_top(fm)
         let old_vector_push_proof_top = fmap_vector_push_proof_top(fm)
-        let body_base_ctr = cg_counter_after_scope(loop_scope, ctr)
-        let hoist_candidates = cg_vector_data_loop_candidates(cond, user_body, loop_scope, src, fm)
-        let loop_ctr = cg_vector_data_emit_loop_hoists(hoist_candidates, code, loop_scope, src, body_base_ctr, fm)
-        let push_proofs = cg_vector_push_loop_proofs(cond, user_body, loop_scope, src, fm)
+        let accum_candidates = cg_loop_accum_candidates(user_body, loop_scope, src)
+        let accum_plan = cg_loop_accum_plan(accum_candidates, loop_scope, fm)
+        cg_loop_accum_emit_loads(accum_plan, code, fm)
+        let accum_scope = if accum_plan == 0 { loop_scope } else { cg_loop_accum_plan_scope(accum_plan) }
+        let body_base_ctr = cg_counter_after_scope(accum_scope, ctr)
+        let hoist_candidates = cg_vector_data_loop_candidates(cond, user_body, accum_scope, src, fm)
+        let loop_ctr = cg_vector_data_emit_loop_hoists(hoist_candidates, code, accum_scope, src, body_base_ctr, fm)
+        let push_proofs = cg_vector_push_loop_proofs(cond, user_body, accum_scope, src, fm)
         cg_vector_push_activate_loop_proofs(fm, push_proofs)
         let loop_start = buf_len(code)
         let break_patches = nlist_new()
@@ -2861,12 +3106,12 @@ fn cg_while_try_induction_register(node: i64, code: i64, scope: i64, src: i64, c
         __mem_store64(fm + 64, break_patches)
         __mem_store64(fm + 152, cg_cleanup_count(fm))
         fmap_set_loop_result_ctr(fm, 0 - 1)
-        let direct_branch = cg_direct_branch_false(cond, code, loop_scope, src, loop_ctr, fm)
+        let direct_branch = cg_direct_branch_false(cond, code, accum_scope, src, loop_ctr, fm)
         let mut cond_phys = 0
         let mut branch_pos = 0
         let mut body_ctr = loop_ctr
         if direct_branch == 0 {
-          let c1 = cg_expr(cond, code, loop_scope, src, loop_ctr, fm)
+          let c1 = cg_expr(cond, code, accum_scope, src, loop_ctr, fm)
           cond_phys = emit_load_reg(code, c1 - 1)
           branch_pos = buf_len(code)
           bu32(code, 0)
@@ -2875,15 +3120,15 @@ fn cg_while_try_induction_register(node: i64, code: i64, scope: i64, src: i64, c
           branch_pos = node_f1(direct_branch)
           body_ctr = node_f2(direct_branch)
         }
-        cg_vector_bound_push_from_cond(fm, cond, user_body, loop_scope, src)
-        cg_expr(user_body, code, loop_scope, src, body_ctr, fm)
+        cg_vector_bound_push_from_cond(fm, cond, user_body, accum_scope, src)
+        cg_expr(user_body, code, accum_scope, src, body_ctr, fm)
         fmap_set_vector_bounds_top(fm, old_vector_bounds_top)
         fmap_set_vector_data_top(fm, old_vector_data_top)
         fmap_set_vector_push_proof_top(fm, old_vector_push_proof_top)
         if cg_assignment_preserves_existing_nonnegative(fm, update_assign, src) != 1 {
           fmap_set_nonnegative_top(fm, 0)
         } else { 0 }
-        let c_update = cg_expr(node_f3(update_assign), code, loop_scope, src, loop_ctr, fm)
+        let c_update = cg_expr(node_f3(update_assign), code, accum_scope, src, loop_ctr, fm)
         let update_phys = emit_load_reg(code, c_update - 1)
         bu32(code, encode_add_imm(idx_phys, update_phys, 0))
         let b_pos = buf_len(code)
@@ -2895,6 +3140,7 @@ fn cg_while_try_induction_register(node: i64, code: i64, scope: i64, src: i64, c
           cg_patch_branch_cond_list(code, branch_pos, store_start)
         }
         cg_patch_breaks(code, break_patches, store_start)
+        cg_loop_accum_emit_stores(accum_plan, code)
         cg_store_regid_from_phys(code, var_rid, idx_phys)
         __mem_store64(fm + 56, old_loop_start)
         __mem_store64(fm + 64, old_break_patches)
@@ -2958,6 +3204,18 @@ fn cg_scope_first_free_phys_between(scope: i64, phys: i64, min_phys: i64) -> i64
 
 fn cg_scope_first_free_pinned_phys(scope: i64) -> i64 {
   cg_scope_first_free_phys_between(scope, cg_pinned_phys_max(), cg_pinned_phys_min())
+}
+
+fn cg_scope_first_free_phys_between_low(scope: i64, phys: i64, max_phys: i64) -> i64 {
+  if phys > max_phys { 0 }
+  else {
+    if cg_scope_uses_phys(scope, phys) == 0 { phys }
+    else { cg_scope_first_free_phys_between_low(scope, phys + 1, max_phys) }
+  }
+}
+
+fn cg_scope_first_free_loop_accum_phys(scope: i64) -> i64 {
+  cg_scope_first_free_phys_between_low(scope, cg_counter_phys_min(), cg_counter_phys_max())
 }
 
 fn cg_vreg_reason_natural() -> i64 { 0 }
@@ -3108,10 +3366,14 @@ fn cg_let_mut_try_for_range_loop(node: i64, code: i64, scope: i64, src: i64, ctr
           let old_vector_push_proof_top = fmap_vector_push_proof_top(fm)
           let old_nonnegative_top = fmap_nonnegative_top(fm)
           if cg_expr_is_nonnegative_i64_literal(start) == 1 { cg_nonnegative_push(fm, src, ns, nl) } else { 0 }
-          let hoist_candidates = cg_vector_data_loop_candidates(cond, loop_body, loop_scope, src, fm)
-          let body_base_ctr = cg_counter_after_scope(loop_scope, ctr)
-          let loop_ctr = cg_vector_data_emit_loop_hoists(hoist_candidates, code, loop_scope, src, body_base_ctr, fm)
-          let push_proofs = cg_vector_push_loop_proofs(cond, loop_body, loop_scope, src, fm)
+          let accum_candidates = cg_loop_accum_candidates(user_body, loop_scope, src)
+          let accum_plan = cg_loop_accum_plan(accum_candidates, loop_scope, fm)
+          cg_loop_accum_emit_loads(accum_plan, code, fm)
+          let accum_scope = if accum_plan == 0 { loop_scope } else { cg_loop_accum_plan_scope(accum_plan) }
+          let hoist_candidates = cg_vector_data_loop_candidates(cond, loop_body, accum_scope, src, fm)
+          let body_base_ctr = cg_counter_after_scope(accum_scope, ctr)
+          let loop_ctr = cg_vector_data_emit_loop_hoists(hoist_candidates, code, accum_scope, src, body_base_ctr, fm)
+          let push_proofs = cg_vector_push_loop_proofs(cond, loop_body, accum_scope, src, fm)
           cg_vector_push_activate_loop_proofs(fm, push_proofs)
           let loop_start = buf_len(code)
           let break_patches = nlist_new()
@@ -3119,13 +3381,13 @@ fn cg_let_mut_try_for_range_loop(node: i64, code: i64, scope: i64, src: i64, ctr
           __mem_store64(fm + 64, break_patches)
           __mem_store64(fm + 152, cg_cleanup_count(fm))
           fmap_set_loop_result_ctr(fm, ctr)
-          let c_end = cg_expr(end, code, loop_scope, src, loop_ctr, fm)
+          let c_end = cg_expr(end, code, accum_scope, src, loop_ctr, fm)
           let end_phys = emit_load_reg(code, c_end - 1)
           bu32(code, encode_cmp(idx_phys, end_phys))
           let branch_pos = buf_len(code)
           bu32(code, 0)
-          cg_vector_bound_push_from_cond(fm, cond, loop_body, loop_scope, src)
-          let body_scope = scope_push_typed(loop_scope, ns, nl, idx_rid, binding_ty)
+          cg_vector_bound_push_from_cond(fm, cond, loop_body, accum_scope, src)
+          let body_scope = scope_push_typed(accum_scope, ns, nl, idx_rid, binding_ty)
           cg_expr(user_body, code, body_scope, src, loop_ctr, fm)
           fmap_set_vector_bounds_top(fm, old_vector_bounds_top)
           fmap_set_vector_data_top(fm, old_vector_data_top)
@@ -3136,6 +3398,7 @@ fn cg_let_mut_try_for_range_loop(node: i64, code: i64, scope: i64, src: i64, ctr
           let after_loop = buf_len(code)
           cg_patch_b_cond(code, branch_pos, cg_direct_branch_false_cond_for_op(7), after_loop)
           cg_patch_breaks(code, break_patches, after_loop)
+          cg_loop_accum_emit_stores(accum_plan, code)
           __mem_store64(fm + 56, old_loop_start)
           __mem_store64(fm + 64, old_break_patches)
           __mem_store64(fm + 152, old_loop_cleanup_depth)
