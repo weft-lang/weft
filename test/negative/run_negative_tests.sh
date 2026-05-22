@@ -149,6 +149,8 @@ check_rejects "f64_bitwise" "test/negative/f64_bitwise.weft" "type error: bitwis
 check_rejects "f64_modulo" "test/negative/f64_modulo.weft" "type error: arithmetic operand is not i64"
 check_rejects "num_i64_to_f64_arg_mismatch" "test/negative/num_i64_to_f64_arg_mismatch.weft" "type error: argument type mismatch"
 check_rejects "intrinsic_i64_to_f64_arg_mismatch" "test/negative/intrinsic_i64_to_f64_arg_mismatch.weft" "type error: argument type mismatch"
+check_rejects "num_f64_to_i64_exact_arg_mismatch" "test/negative/num_f64_to_i64_exact_arg_mismatch.weft" "type error: argument type mismatch"
+check_rejects "intrinsic_f64_to_i64_arg_mismatch" "test/negative/intrinsic_f64_to_i64_arg_mismatch.weft" "type error: argument type mismatch"
 check_rejects "unhandled_effect_in_if_condition" "test/negative/unhandled_effect_in_if_condition.weft" "type error: effect not available in caller"
 check_rejects "unhandled_effect_in_match_guard" "test/negative/unhandled_effect_in_match_guard.weft" "type error: effect not available in caller"
 check_rejects "assignment_unknown_target" "test/negative/assignment_unknown_target.weft" "type error: unknown identifier"
