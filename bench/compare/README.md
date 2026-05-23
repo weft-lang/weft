@@ -31,8 +31,3 @@ The workload set covers integer-heavy and float-heavy kernels:
 Further float-heavy published benchmarks such as `spectral-norm` need the
 next numeric-stdlib slices, especially broader math surfaces and typed float
 storage/array ergonomics.
-
-Note: `nbody` uses constants rounded to the current decimal-literal lowering
-envelope. The full benchmark-game literals exposed that long fractional
-decimal lowering needs a real decimal-to-binary path instead of the current
-integer numerator/denominator approximation.
