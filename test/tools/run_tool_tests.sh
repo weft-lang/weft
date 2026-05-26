@@ -158,13 +158,30 @@ fmt_out=$("$WEFT" fmt < "$tmp_src" 2>&1)
 assert_contains "fmt_parse_only" "$fmt_out" "fn main() -> i64 { 42 }"
 assert_equals "fmt_snapshot_exact" "$fmt_out" "fn main() -> i64 { 42 }"
 
+fmt_path_out=$("$WEFT" fmt "$tmp_src" 2>&1)
+assert_equals "fmt_path_snapshot_exact" "$fmt_path_out" "fn main() -> i64 { 42 }"
+
 ast_out=$("$WEFT" ast < "$tmp_src" 2>&1)
 assert_contains "ast_parse_only_header" "$ast_out" "--- AST: 1 functions ---"
 assert_contains "ast_parse_only_literal" "$ast_out" "IntLit(42)"
 assert_equals "ast_snapshot_exact" "$ast_out" $'--- AST: 1 functions ---\n\nfn main:\n  IntLit(42)'
 
+ast_path_out=$("$WEFT" ast "$tmp_src" 2>&1)
+assert_equals "ast_path_snapshot_exact" "$ast_path_out" $'--- AST: 1 functions ---\n\nfn main:\n  IntLit(42)'
+
 check_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_parse_and_typecheck" "$check_out" "check: 1 functions, 0 errors"
+
+check_path_out=$("$WEFT" check "$tmp_src" 2>&1)
+assert_contains "check_path_parse_and_typecheck" "$check_path_out" "check: 1 functions, 0 errors"
+
+"$WEFT" compile "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+chmod +x "$tmp_bin"
+set +e
+"$tmp_bin" >/dev/null 2>&1
+compile_path_exit=$?
+set -e
+assert_equals "compile_path_binary_exit" "$compile_path_exit" "42"
 
 printf 'fn broken() -> i64 { 1\nfn after() -> i64 { 2 }\n' > "$tmp_src"
 parse_recovery_out=$("$WEFT" ast < "$tmp_src" 2>&1)

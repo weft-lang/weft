@@ -54,14 +54,14 @@ tmpw1=$(mktemp /tmp/weft_test_XXXXXX)
 tmpw2=$(mktemp /tmp/weft_test_XXXXXX)
 tmpw3=$(mktemp /tmp/weft_test_XXXXXX)
 bootstrap_ok=1
-if "$WEFT" < compiler/main.weft > "$tmpw1" 2>/dev/null; then
+if "$WEFT" compile compiler/main.weft > "$tmpw1" 2>/dev/null; then
   chmod +x "$tmpw1"
 else
   bootstrap_ok=0
   echo "  ✗ bootstrap stage 1 failed"
 fi
 if [ $bootstrap_ok -eq 1 ]; then
-  if "$tmpw1" < compiler/main.weft > "$tmpw2" 2>/dev/null; then
+  if "$tmpw1" compile compiler/main.weft > "$tmpw2" 2>/dev/null; then
     chmod +x "$tmpw2"
   else
     bootstrap_ok=0
@@ -69,7 +69,7 @@ if [ $bootstrap_ok -eq 1 ]; then
   fi
 fi
 if [ $bootstrap_ok -eq 1 ]; then
-  if "$tmpw2" < compiler/main.weft > "$tmpw3" 2>/dev/null; then
+  if "$tmpw2" compile compiler/main.weft > "$tmpw3" 2>/dev/null; then
     chmod +x "$tmpw3"
   else
     bootstrap_ok=0

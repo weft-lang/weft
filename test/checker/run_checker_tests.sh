@@ -11,7 +11,7 @@ check_accepts() {
   local name="$1"
   local file="$2"
   local out
-  out=$(timeout 30 "$WEFT" check < "$file" 2>&1 >/dev/null || true)
+  out=$(timeout 30 "$WEFT" check "$file" 2>&1 >/dev/null || true)
   if echo "$out" | grep -q "type error:"; then
     echo "  FAIL $name (unexpected type error)"
     echo "$out" | sed 's/^/    /'

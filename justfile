@@ -23,13 +23,13 @@ bootstrap:
     set -e
     echo "=== Bootstrap chain ==="
     echo "Stage 1: ./weft → weft1"
-    ./weft < compiler/main.weft > /tmp/weft_b1
+    ./weft compile compiler/main.weft > /tmp/weft_b1
     chmod +x /tmp/weft_b1
     echo "Stage 2: weft1 → weft2"
-    /tmp/weft_b1 < compiler/main.weft > /tmp/weft_b2
+    /tmp/weft_b1 compile compiler/main.weft > /tmp/weft_b2
     chmod +x /tmp/weft_b2
     echo "Stage 3: weft2 → weft3"
-    /tmp/weft_b2 < compiler/main.weft > /tmp/weft_b3
+    /tmp/weft_b2 compile compiler/main.weft > /tmp/weft_b3
     chmod +x /tmp/weft_b3
     echo "=== Gate check ==="
     if diff <(xxd /tmp/weft_b2) <(xxd /tmp/weft_b3) > /dev/null; then

@@ -17,7 +17,7 @@ check_rejects() {
   local pattern="$3"
   local out
 
-  out=$(timeout 30 "$WEFT" check < "$file" 2>&1 >/dev/null || true)
+  out=$(timeout 30 "$WEFT" check "$file" 2>&1 >/dev/null || true)
   if echo "$out" | grep -q "$pattern"; then
     echo "  ✓ $name"
     PASS=$((PASS+1))
