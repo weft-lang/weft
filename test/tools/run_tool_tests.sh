@@ -907,6 +907,17 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_assertion_helpers_pass"
 
+printf 'test "path" { Test.assert_eq(21 + 21, 42) }\n' > "$tmp_src"
+"$WEFT" test "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+assert_not_contains_file "test_path_compiles_strict_source" "$tmp_err" "type error:"
+chmod +x "$tmp_bin"
+"$tmp_bin"
+echo "  ok test_path_binary_runs"
+
+printf 'test "raw" { let p = __bump_alloc(8) Test.assert_eq(p, p) }\n' > "$tmp_src"
+test_path_raw_out=$("$WEFT" test "$tmp_src" > "$tmp_bin" 2>"$tmp_err" || true; cat "$tmp_err")
+assert_contains "test_path_rejects_root_raw_memory" "$test_path_raw_out" "type error: raw allocation is sealed to trusted runtime/platform code"
+
 assert_test_exit_code "test_assert_eq_failure_returns_one" 'test "fail_eq" { Test.assert_eq(1, 2) }' 1
 assert_test_exit_code "test_assert_eq_and_ne_two_clause_harness_runs" 'test "eq_ne" { Test.assert_eq(0, 0) Test.assert_ne(1, 2) }' 0
 assert_test_exit_code "test_assert_ne_failure_returns_one" 'test "fail_ne" { Test.assert_ne(2, 2) }' 1
@@ -938,4 +949,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 246 passed, 0 failed"
+echo "Tool boundary summary: 248 passed, 0 failed"
