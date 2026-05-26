@@ -21,7 +21,20 @@ for f in $(grep -l 'test "' test/*.weft 2>/dev/null); do
   RUNTIME_TESTS=$((RUNTIME_TESTS+file_tests))
 
   # Compile test file
-  if ! timeout 30 "$WEFT" test < "$f" > "$tmpbin" 2>/dev/null; then
+  if [ "$name" = "unsafe_boundary" ]; then
+    compile_cmd=(timeout 30 "$WEFT" test "$f")
+  else
+    compile_cmd=(timeout 30 "$WEFT" test)
+  fi
+  if [ "$name" = "unsafe_boundary" ]; then
+    if ! "${compile_cmd[@]}" > "$tmpbin" 2>/dev/null; then
+      echo "  ✗ $name (compilation failed)"
+      FAIL=$((FAIL+1))
+      ERRORS="$ERRORS\n  $name: compilation failed"
+      rm -f "$tmpbin"
+      continue
+    fi
+  elif ! "${compile_cmd[@]}" < "$f" > "$tmpbin" 2>/dev/null; then
     echo "  ✗ $name (compilation failed)"
     FAIL=$((FAIL+1))
     ERRORS="$ERRORS\n  $name: compilation failed"
