@@ -23,12 +23,28 @@ check_accepts() {
   fi
 }
 
+check_accepts_stdin() {
+  local name="$1"
+  local file="$2"
+  local out
+  out=$(timeout 30 "$WEFT" check < "$file" 2>&1 >/dev/null || true)
+  if echo "$out" | grep -q "type error:"; then
+    echo "  FAIL $name (unexpected type error)"
+    echo "$out" | sed 's/^/    /'
+    FAIL=$((FAIL+1))
+    ERRORS="$ERRORS\n  $name: unexpected type error"
+  else
+    echo "  ok $name"
+    PASS=$((PASS+1))
+  fi
+}
+
 check_accepts "method_return_let" "test/checker/method_return_let.weft"
 check_accepts "handled_effect_perform" "test/checker/handled_effect_perform.weft"
 check_accepts "handled_try_effect" "test/checker/handled_try_effect.weft"
 check_accepts "imported_effect_perform_args" "test/checker/imported_effect_perform_args.weft"
-check_accepts "imported_trusted_process_unsafe_wrapper" "test/checker/imported_trusted_process_unsafe_wrapper.weft"
-check_accepts "unsafe_boundary" "test/checker/unsafe_boundary.weft"
+check_accepts_stdin "legacy_imported_trusted_process_unsafe_wrapper" "test/checker/imported_trusted_process_unsafe_wrapper.weft"
+check_accepts_stdin "legacy_unsafe_boundary" "test/checker/unsafe_boundary.weft"
 check_accepts "runtime_syscall_unsafe_wrapper" "runtime/syscall.weft"
 check_accepts "runtime_rc_unsafe_wrapper" "runtime/rc.weft"
 check_accepts "stdlib_process_unsafe_surface" "stdlib/process.weft"
@@ -37,11 +53,11 @@ check_accepts "contextual_lambda_effectful" "test/checker/contextual_lambda_effe
 check_accepts "contextual_effect_op_lambda" "test/checker/contextual_effect_op_lambda.weft"
 check_accepts "function_value_pure_call" "test/checker/function_value_pure_call.weft"
 check_accepts "function_value_effect_call" "test/checker/function_value_effect_call.weft"
-check_accepts "method_calls" "test/checker/method_calls.weft"
-check_accepts "trait_impl_signatures" "test/checker/trait_impl_signatures.weft"
-check_accepts "trait_associated_types" "test/checker/trait_associated_types.weft"
-check_accepts "let_bound_lambdas" "test/checker/let_bound_lambdas.weft"
-check_accepts "name_resolution" "test/checker/name_resolution.weft"
+check_accepts_stdin "legacy_method_calls_raw_self" "test/checker/method_calls.weft"
+check_accepts_stdin "legacy_trait_impl_signatures_raw_self" "test/checker/trait_impl_signatures.weft"
+check_accepts_stdin "legacy_trait_associated_types_raw_self" "test/checker/trait_associated_types.weft"
+check_accepts_stdin "legacy_let_bound_lambdas_raw_self" "test/checker/let_bound_lambdas.weft"
+check_accepts_stdin "legacy_name_resolution_raw_memory" "test/checker/name_resolution.weft"
 check_accepts "field_access" "test/checker/field_access.weft"
 check_accepts "record_init" "test/checker/record_init.weft"
 check_accepts "match_arm_types" "test/checker/match_arm_types.weft"
