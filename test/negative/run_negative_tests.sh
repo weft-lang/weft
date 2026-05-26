@@ -63,6 +63,8 @@ check_rejects "unsafe_imported_mem_store_requires_trusted" "test/negative/unsafe
 check_rejects "unsafe_imported_got_with_effect_requires_trusted" "test/negative/unsafe_imported_got_with_effect_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "unsafe_imported_mem_with_effect_requires_trusted" "test/negative/unsafe_imported_mem_with_effect_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "unsafe_imported_mem_store_with_effect_requires_trusted" "test/negative/unsafe_imported_mem_store_with_effect_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
+check_rejects "imported_bump_alloc_requires_trusted" "test/negative/imported_bump_alloc_requires_trusted.weft" "type error: raw allocation is sealed to trusted runtime/platform code"
+check_rejects "imported_alloc_bump_with_effect_requires_trusted" "test/negative/imported_alloc_bump_with_effect_requires_trusted.weft" "type error: raw allocation is sealed to trusted runtime/platform code"
 check_rejects "unsafe_imported_handler_requires_trusted" "test/negative/unsafe_imported_handler_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "unsafe_imported_perform_requires_trusted" "test/negative/unsafe_imported_perform_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "unknown_got_symbol" "test/negative/unknown_got_symbol.weft" "type error: unknown GOT symbol"
