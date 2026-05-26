@@ -795,6 +795,46 @@ fn cg_layout_storage_align(tt: i64, ty: i64) -> i64 {
   }
 }
 
+fn cg_layout_vector_record_mode() -> i64 { 7 }
+
+fn cg_layout_vector_plain_record_field_eligible(tt: i64, ty: i64) -> i64 {
+  if ty == 0 { 0 }
+  else { if cg_ty_is_managed(ty) == 1 { 0 }
+  else {
+    let tag = ty_tag(ty)
+    match tag {
+      2 -> if cg_layout_prim_size(ty_f1(ty)) > 0 { 1 } else { 0 }
+      15 -> 1
+      _ -> 0
+    }
+  } }
+}
+
+fn cg_layout_vector_record_inline_eligible(tt: i64, ty: i64) -> i64 {
+  let entry = cg_layout_record_entry(tt, ty)
+  if entry == 0 { 0 }
+  else {
+    let size = cg_layout_record_inline_size(tt, ty)
+    if size <= 0 { 0 }
+    else {
+      let nfields = __mem_load64(entry + 24)
+      let mut ok = 1
+      for i in 0..nfields {
+        if cg_layout_vector_plain_record_field_eligible(tt, cg_layout_field_type_at(entry, ty, i)) != 1 {
+          ok = 0
+        } else { 0 }
+      }
+      ok
+    }
+  }
+}
+
+fn cg_layout_vector_element_size(tt: i64, ty: i64) -> i64 {
+  if cg_layout_vector_record_inline_eligible(tt, ty) == 1 {
+    cg_layout_record_inline_size(tt, ty)
+  } else { cg_layout_storage_size(tt, ty) }
+}
+
 fn cg_layout_field_offset(tt: i64, record_ty: i64, field_index: i64) -> i64 {
   let entry = cg_layout_record_entry(tt, record_ty)
   if entry == 0 { cg_layout_unknown() }
@@ -850,8 +890,9 @@ fn cg_layout_rc_block_size(tt: i64, ty: i64) -> i64 {
   if payload < 0 { cg_layout_unknown() } else { cg_layout_rc_header_size() + payload }
 }
 
-fn cg_layout_vector_element_mode(ty: i64) -> i64 {
+fn cg_layout_vector_element_mode(tt: i64, ty: i64) -> i64 {
   if ty == 0 { 0 }
+  else { if cg_layout_vector_record_inline_eligible(tt, ty) == 1 { cg_layout_vector_record_mode() }
   else { if ty_tag(ty) != 2 { 0 }
   else {
     let prim = ty_f1(ty)
@@ -861,7 +902,7 @@ fn cg_layout_vector_element_mode(ty: i64) -> i64 {
     else { if prim == PRIM_I16() { 4 }
     else { if prim == PRIM_U32() or prim == PRIM_F32() { 5 }
     else { if prim == PRIM_I32() { 6 } else { 0 } } } } } }
-  } }
+  } } }
 }
 
 -- Simple string hash for variant tags (compile-time)
@@ -5336,14 +5377,18 @@ fn cg_ptr_assign(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) 
 }
 
 -- Block: evaluate first for side effects, then evaluate and return rest
--- Record construction: allocate num_fields * 8 bytes, store each field value
+-- Record construction: plain value records use their concrete payload layout;
+-- other records keep the legacy one-word-per-field payload.
 fn cg_record_init(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
   let type_ns = node_f1(node)
   let type_nl = node_f2(node)
   let fields = node_f3(node)
   let nfields = node_f4(node)
-  -- Allocate nfields * 8 bytes using __bump_alloc inline
-  let size = nfields * 8
+  let tt = fmap_get_tt(fm)
+  let record_ty = ty_named(type_name_hash(src, type_ns, type_nl), ty_i64())
+  let inline_record = cg_layout_vector_record_inline_eligible(tt, record_ty)
+  let inline_size = if inline_record == 1 { cg_layout_record_inline_size(tt, record_ty) } else { 0 - 1 }
+  let size = if inline_size > 0 { inline_size } else { nfields * 8 }
   emit_mov_imm(code, 0, size)
   cg_bump_alloc_reg(code, 17, 0)
   -- Result (record ptr) in x17. Store to ctr register.
@@ -5355,7 +5400,7 @@ fn cg_record_init(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64)
   }
   -- Store each field value. Pack base_ctr and i: base*256+i
   -- Fields use temporary registers but the RECORD POINTER is the result
-  let record_info = node_new(0, ctr, type_ns, type_nl, 0)
+  let record_info = node_new(0, ctr, record_ty, inline_record, 0)
   cg_record_fields(fields, nfields, code, scope, src, ctr + 1, fm, record_info)
   -- Return ctr+1: the record pointer is at counter ctr, result is ctr+1
   ctr + 1
@@ -5364,41 +5409,137 @@ fn cg_record_init(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64)
 fn cg_record_fields(fields: i64, nfields: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64, info: i64) -> i64 {
   let tt = fmap_get_tt(fm)
   let base_ctr = node_f1(info)
-  let type_ns = node_f2(info)
-  let type_nl = node_f3(info)
+  let record_ty = node_f2(info)
+  let inline_record = node_f3(info)
+  let type_hash = ty_f1(record_ty)
   let mut c = ctr
   for i in 0..nfields {
     let field_pair = nlist_get(fields, i)
     let f_ns = node_f1(field_pair)
     let f_nl = node_f2(field_pair)
     let val_node = node_f3(field_pair)
-    c = cg_expr(val_node, code, scope, src, c, fm)
+    -- Look up field index from type table (not positional)
+    let field_idx = ttable_find_field_by_type_hash(tt, type_hash, src, f_ns, f_nl)
+    let idx = if field_idx >= 0 { field_idx } else { i }
+    let fty = cg_layout_field_type_at(cg_layout_record_entry(tt, record_ty), record_ty, idx)
+    c = if fty != 0 { cg_expr_as_type(val_node, fty, code, scope, src, c, fm) } else { cg_expr(val_node, code, scope, src, c, fm) }
     let base_phys = emit_load_reg(code, base_ctr)
     let val_phys = emit_load_rhs(code, c - 1)
-    -- Look up field index from type table (not positional)
-    let field_idx = ttable_find_field_in_type(tt, src, type_ns, type_nl, f_ns, f_nl, i)
-    let off = field_idx * 8
-    let str_enc = cg_str(val_phys, base_phys, off)
-    bu32(code, str_enc)
+    if inline_record == 1 {
+      let off = cg_layout_field_offset(tt, record_ty, idx)
+      let size = cg_layout_field_size(tt, record_ty, idx)
+      cg_emit_store_sized_to_addr(code, base_phys, off, val_phys, size)
+    } else {
+      let off = idx * 8
+      let str_enc = cg_str(val_phys, base_phys, off)
+      bu32(code, str_enc)
+    }
   }
   c
 }
 
--- Field access: load from record + field_index * 8
+fn cg_generic_call_record_vector_get_ty(node: i64, scope: i64, src: i64, fm: i64) -> i64 {
+  if node == 0 { 0 }
+  else { if node_tag(node) != 36 { 0 }
+  else { if cg_generic_call_name_is(node, src, "vector_get") != 1 { 0 }
+  else {
+    let call_node = node_f2(node)
+    if node_f4(call_node) != 3 { 0 }
+    else { if scope_lookup(scope, src, node_f1(call_node), node_f2(call_node)) != 0 - 999 { 0 }
+    else {
+      let type_args = cg_type_args_in_current_context(fm, node_f1(node))
+      if type_args == 0 or nlist_len(type_args) != 1 { 0 }
+      else {
+        let ty = nlist_get(type_args, 0)
+        if cg_layout_vector_record_inline_eligible(fmap_get_tt(fm), ty) == 1 { ty } else { 0 }
+      }
+    } }
+  } } }
+}
+
+fn cg_field_access_try_vector_record_get(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
+  let base = node_f1(node)
+  let record_ty = cg_generic_call_record_vector_get_ty(base, scope, src, fm)
+  if record_ty == 0 { 0 - 1 }
+  else {
+    let field_ns = node_f2(node)
+    let field_nl = node_f3(node)
+    let tt = fmap_get_tt(fm)
+    let idx = if node_f4(node) > 0 { node_f4(node) - 1 }
+    else { ttable_find_field_by_type_hash(tt, ty_f1(record_ty), src, field_ns, field_nl) }
+    if idx < 0 { 0 - 1 }
+    else {
+      let call_node = node_f2(base)
+      let args = node_f3(call_node)
+      let vec_arg = nlist_get(args, 0)
+      let index_arg = nlist_get(args, 1)
+      let default_arg = nlist_get(args, 2)
+      let field_ty = cg_layout_field_type_at(cg_layout_record_entry(tt, record_ty), record_ty, idx)
+      let field_off = cg_layout_field_offset(tt, record_ty, idx)
+      let field_size = cg_layout_field_size(tt, record_ty, idx)
+      let field_mode = cg_layout_vector_element_mode(tt, field_ty)
+      let elem_size = cg_layout_record_inline_size(tt, record_ty)
+      let c_vec = cg_expr(vec_arg, code, scope, src, ctr, fm)
+      let c_index = cg_expr(index_arg, code, scope, src, c_vec, fm)
+      let c_default = cg_expr_as_type(default_arg, record_ty, code, scope, src, c_index, fm)
+      emit_move_counter_to(code, c_default - 1, 12)
+      cg_emit_load_sized_from_addr(code, 17, 12, field_off, field_size, field_mode)
+      emit_move_counter_to(code, c_vec - 1, 14)
+      emit_move_counter_to(code, c_index - 1, 15)
+      let bound_mode = cg_vector_bound_mode_for_access(fm, scope, src, vec_arg, index_arg)
+      let patches = if bound_mode == 2 {
+        fmap_inc_vector_bounds_elision_count(fm)
+        fmap_inc_vector_full_bounds_elision_count(fm)
+        nlist_new()
+      } else { if bound_mode > 0 {
+        fmap_inc_vector_bounds_elision_count(fm)
+        cg_emit_vector_index_valid_upper_proven(code, 14, 15)
+      } else { cg_emit_vector_index_valid(code, 14, 15) } }
+      cg_emit_vector_data_base(code, fm, src, vec_arg, 14, 16)
+      emit_mov_imm_safe(code, 12, elem_size)
+      bu32(code, encode_mul(13, 15, 12))
+      bu32(code, encode_add_reg(16, 16, 13))
+      cg_emit_load_sized_from_addr(code, 17, 16, field_off, field_size, field_mode)
+      let done = buf_len(code)
+      cg_patch_vector_index_valid(code, patches, 14, 13, done)
+      emit_store_counter_from_phys(code, ctr, 17)
+      fmap_inc_vector_lowering_count(fm)
+      fmap_inc_vector_scaled_addr_count(fm)
+      ctr + 1
+    }
+  }
+}
+
+-- Field access: layout-aware for plain value records, legacy word slots otherwise.
 fn cg_field_access(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64) -> i64 {
+  let record_vector_get = cg_field_access_try_vector_record_get(node, code, scope, src, ctr, fm)
+  if record_vector_get >= 0 { record_vector_get } else {
   let base = node_f1(node)
   let field_ns = node_f2(node)
   let field_nl = node_f3(node)
+  let tt = fmap_get_tt(fm)
+  let base_ty = cg_expr_type(base, scope, src, fm)
+  let inline_record = cg_layout_vector_record_inline_eligible(tt, base_ty)
   -- Evaluate base expression
   let c1 = cg_expr(base, code, scope, src, ctr, fm)
   let base_phys = emit_load_reg(code, c1 - 1)
   -- Look up field index from type table
-  let tt = fmap_get_tt(fm)
-  let idx = if node_f4(node) > 0 { node_f4(node) - 1 } else { ttable_find_any_field(tt, src, field_ns, field_nl) }
-  -- LDR x17, [base + idx * 8]
-  let off = idx * 8
-  let ldr_enc = cg_ldr(17, base_phys, off)
-  bu32(code, ldr_enc)
+  let idx = if node_f4(node) > 0 { node_f4(node) - 1 } else {
+    if base_ty != 0 and ty_tag(base_ty) == 9 {
+      let found = ttable_find_field_by_type_hash(tt, ty_f1(base_ty), src, field_ns, field_nl)
+      if found >= 0 { found } else { ttable_find_any_field(tt, src, field_ns, field_nl) }
+    } else { ttable_find_any_field(tt, src, field_ns, field_nl) }
+  }
+  if inline_record == 1 {
+    let off = cg_layout_field_offset(tt, base_ty, idx)
+    let size = cg_layout_field_size(tt, base_ty, idx)
+    let fty = cg_layout_field_type_at(cg_layout_record_entry(tt, base_ty), base_ty, idx)
+    cg_emit_load_sized_from_addr(code, 17, base_phys, off, size, cg_layout_vector_element_mode(tt, fty))
+  } else {
+    let off = idx * 8
+    let ldr_enc = cg_ldr(17, base_phys, off)
+    bu32(code, ldr_enc)
+  }
   if c1 < 8 {
     let e_fa = encode_add_imm(c1 + 19, 17, 0)
     bu32(code, e_fa)
@@ -5406,6 +5547,7 @@ fn cg_field_access(node: i64, code: i64, scope: i64, src: i64, ctr: i64, fm: i64
     emit_store_reg(code, c1, 17)
   }
   c1 + 1
+  }
 }
 
 -- ======================================================================
@@ -6579,9 +6721,15 @@ fn cg_generic_subst_ret(tmpl_wrap: i64, type_args: i64) -> i64 {
 }
 
 fn cg_generic_call_expr_type(node: i64, fm: i64, src: i64) -> i64 {
-  if cg_generic_call_is_f64(node, src, "vector_get", 3, 1) == 1 { ty_f64() }
-  else { if cg_generic_call_is_f64(node, src, "vector_set", 3, 1) == 1 { ty_i64() }
-  else { 0 } }
+  if cg_generic_call_name_is(node, src, "vector_get") == 1 {
+    let call_node = node_f2(node)
+    if node_f4(call_node) == 3 and nlist_len(node_f1(node)) == 1 {
+      let type_args = cg_type_args_in_current_context(fm, node_f1(node))
+      if type_args == 0 { 0 } else { nlist_get(type_args, 0) }
+    } else { 0 }
+  } else { if cg_generic_call_name_is(node, src, "vector_set") == 1 { ty_i64() }
+  else { if cg_generic_call_name_is(node, src, "vector_push") == 1 { ty_i64() }
+  else { 0 } } }
 }
 
 fn cg_merge_expr_type(a: i64, b: i64) -> i64 {
@@ -6807,6 +6955,18 @@ fn cg_expr_type(node: i64, scope: i64, src: i64, fm: i64) -> i64 {
         let new_scope = scope_push_typed(scope, node_f1(node), node_f2(node), 0, val_ty)
         cg_expr_type(node_f4(node), new_scope, src, fm)
       }
+      13 -> {
+        let base_ty = cg_expr_type(node_f1(node), scope, src, fm)
+        let tt = fmap_get_tt(fm)
+        let idx = if node_f4(node) > 0 { node_f4(node) - 1 }
+        else { if base_ty != 0 and ty_tag(base_ty) == 9 {
+          ttable_find_field_by_type_hash(tt, ty_f1(base_ty), src, node_f2(node), node_f3(node))
+        } else { 0 - 1 } }
+        let entry = cg_layout_record_entry(tt, base_ty)
+        let fty = cg_layout_field_type_at(entry, base_ty, idx)
+        if fty != 0 { fty } else { ty_i64() }
+      }
+      14 -> ty_named(type_name_hash(src, node_f1(node), node_f2(node)), ty_i64())
       15 -> cg_match_body_type(node_f2(node), node_f3(node), scope, src, fm)
       24 -> ty_bool()
       25 -> cg_expr_type(node_f1(node), scope, src, fm)
@@ -13439,8 +13599,75 @@ fn cg_i_sized_store_byte(code: i64, off: i64, shift: i64) -> i64 {
   }
 }
 
+fn cg_emit_mem_copy_regs(code: i64, dst_reg: i64, src_reg: i64, size_reg: i64) -> i64 {
+  emit_mov_imm_safe(code, 11, 0)
+  let loop_start = buf_len(code)
+  bu32(code, encode_cmp(11, size_reg))
+  let done_pos = buf_len(code)
+  bu32(code, 0)
+  bu32(code, encode_add_reg(13, src_reg, 11))
+  bu32(code, cg_ldrb(12, 13, 0))
+  bu32(code, encode_add_reg(14, dst_reg, 11))
+  bu32(code, cg_strb(12, 14, 0))
+  bu32(code, encode_add_imm(11, 11, 1))
+  let back_pos = buf_len(code)
+  bu32(code, 0)
+  cg_patch_b(code, back_pos, loop_start)
+  let done = buf_len(code)
+  cg_patch_b_cond(code, done_pos, 10, done)
+}
+
+fn cg_emit_load_sized_from_addr(code: i64, dst_reg: i64, base_reg: i64, off: i64, size: i64, mode: i64) -> i64 {
+  if size == 8 {
+    bu32(code, cg_ldr(dst_reg, base_reg, off))
+  } else {
+    emit_mov_imm_safe(code, dst_reg, 0)
+    for i in 0..size {
+      bu32(code, cg_ldrb(12, base_reg, off + i))
+      let shift = i * 8
+      if shift == 0 { bu32(code, encode_orr_reg(dst_reg, dst_reg, 12)) }
+      else {
+        emit_mov_imm_safe(code, 13, shift)
+        bu32(code, encode_lsl_reg(12, 12, 13))
+        bu32(code, encode_orr_reg(dst_reg, dst_reg, 12))
+      }
+    }
+    if mode == 2 { bu32(code, encode_sxtb(dst_reg, dst_reg)) }
+    else { if mode == 4 { bu32(code, encode_sxth(dst_reg, dst_reg)) }
+    else { if mode == 6 { bu32(code, encode_sxtw(dst_reg, dst_reg)) } else { 0 } } }
+  }
+}
+
+fn cg_emit_store_sized_to_addr(code: i64, base_reg: i64, off: i64, value_reg: i64, size: i64) -> i64 {
+  if size == 8 {
+    bu32(code, cg_str(value_reg, base_reg, off))
+  } else {
+    for i in 0..size {
+      let shift = i * 8
+      if shift == 0 { bu32(code, cg_strb(value_reg, base_reg, off + i)) }
+      else {
+        bu32(code, encode_add_imm(12, value_reg, 0))
+        emit_mov_imm_safe(code, 13, shift)
+        bu32(code, encode_lsr_reg(12, 12, 13))
+        bu32(code, cg_strb(12, base_reg, off + i))
+      }
+    }
+  }
+}
+
 fn cg_i_mem_load_sized(code: i64, ctr: i64) -> i64 {
   -- x0=addr, x1=size, x2=mode. Mode 2/4/6 sign-extends i8/i16/i32.
+  emit_mov_imm_safe(code, 13, cg_layout_vector_record_mode())
+  bu32(code, encode_cmp(2, 13))
+  let not_record_pos = buf_len(code)
+  bu32(code, 0)
+  cg_bump_alloc_reg(code, 17, 1)
+  cg_emit_mem_copy_regs(code, 17, 0, 1)
+  let done_from_record = buf_len(code)
+  bu32(code, 0)
+
+  let scalar_start = buf_len(code)
+  cg_patch_b_cond(code, not_record_pos, 1, scalar_start)
   emit_mov_imm_safe(code, 17, 0)
   emit_mov_imm_safe(code, 13, 0)
   bu32(code, encode_cmp(1, 13))
@@ -13516,11 +13743,22 @@ fn cg_i_mem_load_sized(code: i64, ctr: i64) -> i64 {
   cg_patch_b(code, done_from_2, done)
   cg_patch_b(code, done_from_2_unsigned, done)
   cg_patch_b_cond(code, load1_unsigned_pos, 1, done)
+  cg_patch_b(code, done_from_record, done)
   cg_i_result(code, ctr)
 }
 
 fn cg_i_mem_store_sized(code: i64, ctr: i64) -> i64 {
   -- x0=addr, x1=size, x2=mode, x3=value. Mode is kept for symmetry with load.
+  emit_mov_imm_safe(code, 13, cg_layout_vector_record_mode())
+  bu32(code, encode_cmp(2, 13))
+  let not_record_pos = buf_len(code)
+  bu32(code, 0)
+  cg_emit_mem_copy_regs(code, 0, 3, 1)
+  let done_from_record = buf_len(code)
+  bu32(code, 0)
+
+  let scalar_start = buf_len(code)
+  cg_patch_b_cond(code, not_record_pos, 1, scalar_start)
   emit_mov_imm_safe(code, 13, 0)
   bu32(code, encode_cmp(1, 13))
   let size_zero_pos = buf_len(code)
@@ -13567,6 +13805,7 @@ fn cg_i_mem_store_sized(code: i64, ctr: i64) -> i64 {
   cg_patch_b(code, done_from_8, done)
   cg_patch_b(code, done_from_4, done)
   cg_patch_b(code, done_from_2, done)
+  cg_patch_b(code, done_from_record, done)
   bu32(code, encode_add_imm(17, 3, 0))
   cg_i_result(code, ctr)
 }
@@ -14366,9 +14605,10 @@ fn cg_generic_call_is_vector_layout_const(node: i64, scope: i64, src: i64, name:
 fn cg_generic_call_vector_layout_const_value(node: i64, fm: i64, mode: i64) -> i64 {
   let type_args = cg_type_args_in_current_context(fm, node_f1(node))
   let ty = if type_args == 0 { 0 } else { if nlist_len(type_args) == 0 { 0 } else { nlist_get(type_args, 0) } }
-  if mode == 1 { cg_layout_vector_element_mode(ty) }
+  let tt = fmap_get_tt(fm)
+  if mode == 1 { cg_layout_vector_element_mode(tt, ty) }
   else {
-    let size = cg_layout_storage_size(fmap_get_tt(fm), ty)
+    let size = cg_layout_vector_element_size(tt, ty)
     if size < 0 { 8 } else { size }
   }
 }
