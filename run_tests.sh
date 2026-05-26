@@ -22,7 +22,7 @@ for f in $(grep -l 'test "' test/*.weft 2>/dev/null); do
 
   # Compile test file
   case "$name" in
-    unsafe_boundary|ptr_basic|types_ptr|runtime_alloc|defer_order) strict_test=1 ;;
+    unsafe_boundary|ptr_basic|types_ptr|runtime_alloc|defer_order|method_calls) strict_test=1 ;;
     *) strict_test=0 ;;
   esac
   if [ "$strict_test" -eq 1 ]; then
