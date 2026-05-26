@@ -60,6 +60,8 @@ check_rejects "unsafe_got_requires_effect" "test/negative/unsafe_got_requires_ef
 check_rejects "unsafe_imported_got_requires_effect" "test/negative/unsafe_imported_got_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_imported_mem_requires_effect" "test/negative/unsafe_imported_mem_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_imported_mem_store_requires_effect" "test/negative/unsafe_imported_mem_store_requires_effect.weft" "type error: effect not available in caller"
+check_rejects "unsafe_imported_handler_requires_trusted" "test/negative/unsafe_imported_handler_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
+check_rejects "unsafe_imported_perform_requires_trusted" "test/negative/unsafe_imported_perform_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "unknown_got_symbol" "test/negative/unknown_got_symbol.weft" "type error: unknown GOT symbol"
 check_rejects "unknown_imported_got_symbol" "test/negative/unknown_imported_got_symbol.weft" "type error: unknown GOT symbol"
 check_rejects "unsafe_wrapper_must_discharge" "test/negative/unsafe_wrapper_must_discharge.weft" "type error: effect not available in caller"
