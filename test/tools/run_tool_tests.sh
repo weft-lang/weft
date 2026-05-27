@@ -16,8 +16,9 @@ tmp_pkg_cli_dir=$(mktemp -d /tmp/weft_tool_pkg_cli_XXXXXX)
 tmp_pkg_missing_dir=$(mktemp -d /tmp/weft_tool_pkg_missing_XXXXXX)
 tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
+tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_compiler_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir"' EXIT
 
 assert_contains() {
   local name="$1"
@@ -939,6 +940,15 @@ compiler_probe_import_out=$("$WEFT" check "$tmp_src" 2>&1 || true)
 assert_contains "compiler_unlisted_import_rejects_raw_memory" "$compiler_probe_import_out" "type error: Unsafe is sealed to trusted runtime/platform code"
 rm -f "$tmp_compiler_probe"
 
+printf 'fn leaked() -> i64 { __mem_load64(0) }\n' > "$tmp_runtime_probe"
+runtime_probe_root_out=$("$WEFT" check "$tmp_runtime_probe" 2>&1 || true)
+assert_contains "runtime_unlisted_root_rejects_raw_memory" "$runtime_probe_root_out" "type error: Unsafe is sealed to trusted runtime/platform code"
+
+printf 'use "%s"\nfn main() -> i64 { leaked() }\n' "$tmp_runtime_probe" > "$tmp_src"
+runtime_probe_import_out=$("$WEFT" check "$tmp_src" 2>&1 || true)
+assert_contains "runtime_unlisted_import_rejects_raw_memory" "$runtime_probe_import_out" "type error: Unsafe is sealed to trusted runtime/platform code"
+rm -f "$tmp_runtime_probe"
+
 printf 'fn leaked() -> i64 { __mem_load64(0) }\n' > "$tmp_stdlib_probe"
 stdlib_probe_root_out=$("$WEFT" check "$tmp_stdlib_probe" 2>&1 || true)
 assert_contains "stdlib_unlisted_root_rejects_raw_memory" "$stdlib_probe_root_out" "type error: Unsafe is sealed to trusted runtime/platform code"
@@ -979,4 +989,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 255 passed, 0 failed"
+echo "Tool boundary summary: 257 passed, 0 failed"
