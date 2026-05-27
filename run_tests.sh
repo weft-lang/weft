@@ -22,25 +22,11 @@ for f in $(grep -l 'test "' test/*.weft 2>/dev/null); do
   RUNTIME_FILES=$((RUNTIME_FILES+1))
   RUNTIME_TESTS=$((RUNTIME_TESTS+file_tests))
 
-  # Compile test file
-  case "$name" in
-    unsafe_boundary|ptr_basic|types_ptr|runtime_alloc|defer_order|method_calls|runtime_rc_implicit) strict_test=1 ;;
-    *) strict_test=0 ;;
-  esac
-  if [ "$strict_test" -eq 1 ]; then
-    compile_cmd=(timeout "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT" test "$f")
-  else
-    compile_cmd=(timeout "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT" test)
-  fi
-  if [ "$strict_test" -eq 1 ]; then
-    if ! "${compile_cmd[@]}" > "$tmpbin" 2>/dev/null; then
-      echo "  ✗ $name (compilation failed)"
-      FAIL=$((FAIL+1))
-      ERRORS="$ERRORS\n  $name: compilation failed"
-      rm -f "$tmpbin"
-      continue
-    fi
-  elif ! "${compile_cmd[@]}" < "$f" > "$tmpbin" 2>/dev/null; then
+  # Compile test file through strict path-mode. Legacy `weft test < file`
+  # remains a CLI compatibility path, but the project suite should not depend
+  # on root raw-memory openings.
+  compile_cmd=(timeout "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT" test "$f")
+  if ! "${compile_cmd[@]}" > "$tmpbin" 2>/dev/null; then
     echo "  ✗ $name (compilation failed)"
     FAIL=$((FAIL+1))
     ERRORS="$ERRORS\n  $name: compilation failed"
