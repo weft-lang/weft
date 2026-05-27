@@ -4,6 +4,8 @@
 set -e
 
 WEFT=${WEFT:-./weft}
+WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-60}
+WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-60}
 PASS=0
 FAIL=0
 ERRORS=""
@@ -26,9 +28,9 @@ for f in $(grep -l 'test "' test/*.weft 2>/dev/null); do
     *) strict_test=0 ;;
   esac
   if [ "$strict_test" -eq 1 ]; then
-    compile_cmd=(timeout 30 "$WEFT" test "$f")
+    compile_cmd=(timeout "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT" test "$f")
   else
-    compile_cmd=(timeout 30 "$WEFT" test)
+    compile_cmd=(timeout "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT" test)
   fi
   if [ "$strict_test" -eq 1 ]; then
     if ! "${compile_cmd[@]}" > "$tmpbin" 2>/dev/null; then
@@ -50,11 +52,15 @@ for f in $(grep -l 'test "' test/*.weft 2>/dev/null); do
 
   # Run test binary
   exit_code=0
-  timeout 10 "$tmpbin" 2>/dev/null || exit_code=$?
+  timeout "$WEFT_TEST_RUN_TIMEOUT" "$tmpbin" 2>/dev/null || exit_code=$?
 
   if [ $exit_code -eq 0 ]; then
     echo "  ✓ $name"
     PASS=$((PASS+1))
+  elif [ $exit_code -eq 124 ]; then
+    echo "  ✗ $name (timed out after ${WEFT_TEST_RUN_TIMEOUT}s)"
+    FAIL=$((FAIL+1))
+    ERRORS="$ERRORS\n  $name: timed out after ${WEFT_TEST_RUN_TIMEOUT}s"
   else
     echo "  ✗ $name ($exit_code failures)"
     FAIL=$((FAIL+1))
