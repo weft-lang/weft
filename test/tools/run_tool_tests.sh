@@ -15,7 +15,8 @@ tmp_pkg_dir=$(mktemp -d /tmp/weft_tool_pkg_XXXXXX)
 tmp_pkg_cli_dir=$(mktemp -d /tmp/weft_tool_pkg_cli_XXXXXX)
 tmp_pkg_missing_dir=$(mktemp -d /tmp/weft_tool_pkg_missing_XXXXXX)
 tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir"' EXIT
+tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir"' EXIT
 
 assert_contains() {
   local name="$1"
@@ -928,6 +929,15 @@ assert_contains "test_path_rejects_root_raw_memory" "$test_path_raw_out" "type e
 test_stdin_raw_out=$("$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err" || true; cat "$tmp_err")
 assert_contains "test_stdin_rejects_root_raw_memory" "$test_stdin_raw_out" "type error: raw allocation is sealed to trusted runtime/platform code"
 
+printf 'fn leaked() -> i64 { __mem_load64(0) }\n' > "$tmp_stdlib_probe"
+stdlib_probe_root_out=$("$WEFT" check "$tmp_stdlib_probe" 2>&1 || true)
+assert_contains "stdlib_unlisted_root_rejects_raw_memory" "$stdlib_probe_root_out" "type error: Unsafe is sealed to trusted runtime/platform code"
+
+printf 'use "%s"\nfn main() -> i64 { leaked() }\n' "$tmp_stdlib_probe" > "$tmp_src"
+stdlib_probe_import_out=$("$WEFT" check "$tmp_src" 2>&1 || true)
+assert_contains "stdlib_unlisted_import_rejects_raw_memory" "$stdlib_probe_import_out" "type error: Unsafe is sealed to trusted runtime/platform code"
+rm -f "$tmp_stdlib_probe"
+
 assert_test_exit_code "test_assert_eq_failure_returns_one" 'test "fail_eq" { Test.assert_eq(1, 2) }' 1
 assert_test_exit_code "test_assert_eq_and_ne_two_clause_harness_runs" 'test "eq_ne" { Test.assert_eq(0, 0) Test.assert_ne(1, 2) }' 0
 assert_test_exit_code "test_assert_ne_failure_returns_one" 'test "fail_ne" { Test.assert_ne(2, 2) }' 1
@@ -959,4 +969,4 @@ chmod +x "$tmp_bin"
 "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 251 passed, 0 failed"
+echo "Tool boundary summary: 253 passed, 0 failed"
