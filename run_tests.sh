@@ -22,9 +22,8 @@ for f in $(grep -l 'test "' test/*.weft 2>/dev/null); do
   RUNTIME_FILES=$((RUNTIME_FILES+1))
   RUNTIME_TESTS=$((RUNTIME_TESTS+file_tests))
 
-  # Compile test file through strict path-mode. Legacy `weft test < file`
-  # remains a CLI compatibility path, but the project suite should not depend
-  # on root raw-memory openings.
+  # Compile test file through strict path-mode; stdin test compilation is strict
+  # too, but path-mode keeps source identity explicit in the project suite.
   compile_cmd=(timeout "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT" test "$f")
   if ! "${compile_cmd[@]}" > "$tmpbin" 2>/dev/null; then
     echo "  ✗ $name (compilation failed)"
