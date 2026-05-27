@@ -251,6 +251,7 @@ check_rejects "ownership_cycle_vector_continuation" "test/negative/ownership_cyc
 check_rejects "weak_ref_unmanaged" "test/negative/weak_ref_unmanaged.weft" "type error: weak_ref requires managed value"
 check_rejects "weak_load_nonweak" "test/negative/weak_load_nonweak.weft" "type error: weak_load requires weak managed reference"
 check_rejects "weak_ref_arity" "test/negative/weak_ref_arity.weft" "type error: arity mismatch"
+check_rejects "weak_load_nullable_required" "test/negative/weak_load_nullable_required.weft" "type error: value does not match let type annotation"
 check_rejects "lambda_capture_mut_binding" "test/negative/lambda_capture_mut_binding.weft" "type error: cannot capture mut binding"
 check_rejects "lambda_capture_mut_assignment" "test/negative/lambda_capture_mut_assignment.weft" "type error: cannot capture mut binding"
 check_rejects "return_branch_type_mismatch" "test/negative/return_branch_type_mismatch.weft" "type error: return type mismatch"
