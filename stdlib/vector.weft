@@ -234,15 +234,20 @@ fn vector_contains_i64(vec: i64, needle: i64) -> i64 {
 -- Managed persistent vector scaffold
 --
 -- The mutable Vector above stays the hot local-mutation representation. This
--- surface is for immutable shared data: one managed root box points at a raw
--- immutable header whose chunk table and chunks are path-copied on update.
+-- surface is for immutable shared data: one managed root box points at an
+-- immutable vector header. Completed chunks live in a 32-way tree; the current
+-- partial chunk lives in a tail. Updates path-copy the touched tree branch or
+-- tail while older roots keep their view.
 fn persistent_vector_chunk_size() -> i64 { 32 }
-fn persistent_vector_header_size() -> i64 { 40 }
+fn persistent_vector_header_size() -> i64 { 56 }
+fn persistent_vector_node_size() -> i64 { 256 }
 fn persistent_vector_len_offset() -> i64 { 0 }
 fn persistent_vector_element_size_offset() -> i64 { 8 }
 fn persistent_vector_element_mode_offset() -> i64 { 16 }
-fn persistent_vector_chunk_count_offset() -> i64 { 24 }
-fn persistent_vector_chunks_offset() -> i64 { 32 }
+fn persistent_vector_tree_count_offset() -> i64 { 24 }
+fn persistent_vector_tree_depth_offset() -> i64 { 32 }
+fn persistent_vector_tree_root_offset() -> i64 { 40 }
+fn persistent_vector_tail_offset() -> i64 { 48 }
 
 fn persistent_vector_box(root: i64) -> rc i64 {
   let box: rc i64 = rc_default_alloc(8, 8)
@@ -250,18 +255,20 @@ fn persistent_vector_box(root: i64) -> rc i64 {
   box
 }
 
-fn persistent_vector_make_root(len: i64, elem_size: i64, elem_mode: i64, chunk_count: i64, chunks: i64) -> i64 {
+fn persistent_vector_make_root(len: i64, elem_size: i64, elem_mode: i64, tree_count: i64, tree_depth: i64, tree_root: i64, tail: i64) -> i64 {
   let root = alloc_bump(persistent_vector_header_size())
   __mem_store64(root + persistent_vector_len_offset(), len)
   __mem_store64(root + persistent_vector_element_size_offset(), elem_size)
   __mem_store64(root + persistent_vector_element_mode_offset(), elem_mode)
-  __mem_store64(root + persistent_vector_chunk_count_offset(), chunk_count)
-  __mem_store64(root + persistent_vector_chunks_offset(), chunks)
+  __mem_store64(root + persistent_vector_tree_count_offset(), tree_count)
+  __mem_store64(root + persistent_vector_tree_depth_offset(), tree_depth)
+  __mem_store64(root + persistent_vector_tree_root_offset(), tree_root)
+  __mem_store64(root + persistent_vector_tail_offset(), tail)
   root
 }
 
 fn persistent_vector_new<T>() -> rc i64 {
-  persistent_vector_box(persistent_vector_make_root(0, vector_element_size_of<T>(), vector_element_mode_of<T>(), 0, 0))
+  persistent_vector_box(persistent_vector_make_root(0, vector_element_size_of<T>(), vector_element_mode_of<T>(), 0, 1, 0, 0))
 }
 
 fn persistent_vector_root(vec: i64) -> i64 {
@@ -275,11 +282,97 @@ fn persistent_vector_len(vec: i64) -> i64 {
 
 fn persistent_vector_chunk_count(vec: i64) -> i64 {
   let root = persistent_vector_root(vec)
-  if root == 0 { 0 } else { __mem_load64(root + persistent_vector_chunk_count_offset()) }
+  if root == 0 {
+    0
+  } else {
+    let len = __mem_load64(root + persistent_vector_len_offset())
+    if len == 0 { 0 } else { (len + persistent_vector_chunk_size() - 1) / persistent_vector_chunk_size() }
+  }
+}
+
+fn persistent_vector_tree_depth(vec: i64) -> i64 {
+  let root = persistent_vector_root(vec)
+  if root == 0 { 0 } else { __mem_load64(root + persistent_vector_tree_depth_offset()) }
 }
 
 fn persistent_vector_in_bounds(vec: i64, index: i64) -> i64 {
   if index < 0 { 0 } else { if index >= persistent_vector_len(vec) { 0 } else { 1 } }
+}
+
+fn persistent_vector_pow32(exp: i64) -> i64 {
+  let mut result = 1
+  let mut i = 0
+  while i < exp {
+    result = result * persistent_vector_chunk_size()
+    i = i + 1
+  }
+  result
+}
+
+fn persistent_vector_slot(chunk_index: i64, depth: i64) -> i64 {
+  let div = persistent_vector_pow32(depth - 1)
+  let value = chunk_index / div
+  value - value / persistent_vector_chunk_size() * persistent_vector_chunk_size()
+}
+
+fn persistent_vector_tail_count_for_len(len: i64, tree_count: i64) -> i64 {
+  len - tree_count * persistent_vector_chunk_size()
+}
+
+fn persistent_vector_copy_node(node: i64) -> i64 {
+  let next = alloc_bump(persistent_vector_node_size())
+  if node != 0 {
+    mem_copy(next, node, persistent_vector_node_size())
+  } else {
+    for i in 0..persistent_vector_chunk_size() {
+      __mem_store64(next + i * 8, 0)
+    }
+  }
+  next
+}
+
+fn persistent_vector_copy_chunk(chunk: i64, elem_size: i64) -> i64 {
+  let next = alloc_bump(persistent_vector_chunk_size() * elem_size)
+  if chunk != 0 { mem_copy(next, chunk, persistent_vector_chunk_size() * elem_size) } else { 0 }
+  next
+}
+
+fn persistent_vector_tree_chunk(node: i64, depth: i64, chunk_index: i64) -> i64 {
+  if node == 0 { 0 }
+  else {
+    let slot = persistent_vector_slot(chunk_index, depth)
+    let child = __mem_load64(node + slot * 8)
+    if depth <= 1 { child } else { persistent_vector_tree_chunk(child, depth - 1, chunk_index) }
+  }
+}
+
+fn persistent_vector_tree_assoc_chunk(node: i64, depth: i64, chunk_index: i64, chunk: i64) -> i64 {
+  let next = persistent_vector_copy_node(node)
+  let slot = persistent_vector_slot(chunk_index, depth)
+  if depth <= 1 {
+    __mem_store64(next + slot * 8, chunk)
+  } else {
+    let old_child = if node == 0 { 0 } else { __mem_load64(node + slot * 8) }
+    let new_child = persistent_vector_tree_assoc_chunk(old_child, depth - 1, chunk_index, chunk)
+    __mem_store64(next + slot * 8, new_child)
+  }
+  next
+}
+
+fn persistent_vector_tree_set<T>(node: i64, depth: i64, chunk_index: i64, slot_in_chunk: i64, elem_size: i64, elem_mode: i64, value: T) -> i64 {
+  let next = persistent_vector_copy_node(node)
+  let slot = persistent_vector_slot(chunk_index, depth)
+  if depth <= 1 {
+    let old_chunk = if node == 0 { 0 } else { __mem_load64(node + slot * 8) }
+    let new_chunk = persistent_vector_copy_chunk(old_chunk, elem_size)
+    vector_store_value<T>(new_chunk + slot_in_chunk * elem_size, elem_size, elem_mode, value)
+    __mem_store64(next + slot * 8, new_chunk)
+  } else {
+    let old_child = if node == 0 { 0 } else { __mem_load64(node + slot * 8) }
+    let new_child = persistent_vector_tree_set<T>(old_child, depth - 1, chunk_index, slot_in_chunk, elem_size, elem_mode, value)
+    __mem_store64(next + slot * 8, new_child)
+  }
+  next
 }
 
 fn persistent_vector_get<T>(vec: i64, index: i64, default: T) -> T {
@@ -289,11 +382,19 @@ fn persistent_vector_get<T>(vec: i64, index: i64, default: T) -> T {
   } else {
     let elem_size = __mem_load64(root + persistent_vector_element_size_offset())
     let elem_mode = __mem_load64(root + persistent_vector_element_mode_offset())
-    let chunks = __mem_load64(root + persistent_vector_chunks_offset())
+    let tree_count = __mem_load64(root + persistent_vector_tree_count_offset())
+    let tree_depth = __mem_load64(root + persistent_vector_tree_depth_offset())
+    let tree_root = __mem_load64(root + persistent_vector_tree_root_offset())
+    let tail = __mem_load64(root + persistent_vector_tail_offset())
+    let tail_start = tree_count * persistent_vector_chunk_size()
     let chunk_index = index / persistent_vector_chunk_size()
     let slot = index - chunk_index * persistent_vector_chunk_size()
-    let chunk = __mem_load64(chunks + chunk_index * 8)
-    vector_load_value<T>(chunk + slot * elem_size, elem_size, elem_mode, default)
+    if index >= tail_start {
+      vector_load_value<T>(tail + (index - tail_start) * elem_size, elem_size, elem_mode, default)
+    } else {
+      let chunk = persistent_vector_tree_chunk(tree_root, tree_depth, chunk_index)
+      vector_load_value<T>(chunk + slot * elem_size, elem_size, elem_mode, default)
+    }
   }
 }
 
@@ -302,22 +403,28 @@ fn persistent_vector_push<T>(vec: i64, value: T) -> rc i64 {
   let len = if root == 0 { 0 } else { __mem_load64(root + persistent_vector_len_offset()) }
   let elem_size = if root == 0 { vector_element_size_of<T>() } else { __mem_load64(root + persistent_vector_element_size_offset()) }
   let elem_mode = if root == 0 { vector_element_mode_of<T>() } else { __mem_load64(root + persistent_vector_element_mode_offset()) }
-  let old_chunk_count = if root == 0 { 0 } else { __mem_load64(root + persistent_vector_chunk_count_offset()) }
-  let old_chunks = if root == 0 { 0 } else { __mem_load64(root + persistent_vector_chunks_offset()) }
-  let slot = len - len / persistent_vector_chunk_size() * persistent_vector_chunk_size()
-  let new_chunk_count = if slot == 0 { old_chunk_count + 1 } else { old_chunk_count }
-  let new_chunks = if new_chunk_count <= 0 { 0 } else { alloc_bump(new_chunk_count * 8) }
-  if old_chunk_count > 0 and old_chunks != 0 and new_chunks != 0 {
-    mem_copy(new_chunks, old_chunks, old_chunk_count * 8)
-  } else { 0 }
-  let chunk = alloc_bump(persistent_vector_chunk_size() * elem_size)
-  if slot != 0 and old_chunks != 0 {
-    let old_chunk = __mem_load64(old_chunks + (old_chunk_count - 1) * 8)
-    mem_copy(chunk, old_chunk, persistent_vector_chunk_size() * elem_size)
-  } else { 0 }
-  vector_store_value<T>(chunk + slot * elem_size, elem_size, elem_mode, value)
-  __mem_store64(new_chunks + (new_chunk_count - 1) * 8, chunk)
-  persistent_vector_box(persistent_vector_make_root(len + 1, elem_size, elem_mode, new_chunk_count, new_chunks))
+  let tree_count = if root == 0 { 0 } else { __mem_load64(root + persistent_vector_tree_count_offset()) }
+  let tree_depth = if root == 0 { 1 } else { __mem_load64(root + persistent_vector_tree_depth_offset()) }
+  let tree_root = if root == 0 { 0 } else { __mem_load64(root + persistent_vector_tree_root_offset()) }
+  let tail = if root == 0 { 0 } else { __mem_load64(root + persistent_vector_tail_offset()) }
+  let tail_count = persistent_vector_tail_count_for_len(len, tree_count)
+  if tail_count < persistent_vector_chunk_size() {
+    let new_tail = persistent_vector_copy_chunk(tail, elem_size)
+    vector_store_value<T>(new_tail + tail_count * elem_size, elem_size, elem_mode, value)
+    persistent_vector_box(persistent_vector_make_root(len + 1, elem_size, elem_mode, tree_count, tree_depth, tree_root, new_tail))
+  } else {
+    let needs_grow = if tree_count >= persistent_vector_pow32(tree_depth) { 1 } else { 0 }
+    let next_depth = if needs_grow == 1 { tree_depth + 1 } else { tree_depth }
+    let base_tree = if needs_grow == 1 {
+      let node = persistent_vector_copy_node(0)
+      if tree_root != 0 { __mem_store64(node, tree_root) } else { 0 }
+      node
+    } else { tree_root }
+    let next_tree = persistent_vector_tree_assoc_chunk(base_tree, next_depth, tree_count, tail)
+    let new_tail = persistent_vector_copy_chunk(0, elem_size)
+    vector_store_value<T>(new_tail, elem_size, elem_mode, value)
+    persistent_vector_box(persistent_vector_make_root(len + 1, elem_size, elem_mode, tree_count + 1, next_depth, next_tree, new_tail))
+  }
 }
 
 fn persistent_vector_set<T>(vec: i64, index: i64, value: T) -> rc i64 {
@@ -328,18 +435,21 @@ fn persistent_vector_set<T>(vec: i64, index: i64, value: T) -> rc i64 {
     let len = __mem_load64(root + persistent_vector_len_offset())
     let elem_size = __mem_load64(root + persistent_vector_element_size_offset())
     let elem_mode = __mem_load64(root + persistent_vector_element_mode_offset())
-    let chunk_count = __mem_load64(root + persistent_vector_chunk_count_offset())
-    let old_chunks = __mem_load64(root + persistent_vector_chunks_offset())
-    let new_chunks = alloc_bump(chunk_count * 8)
-    mem_copy(new_chunks, old_chunks, chunk_count * 8)
+    let tree_count = __mem_load64(root + persistent_vector_tree_count_offset())
+    let tree_depth = __mem_load64(root + persistent_vector_tree_depth_offset())
+    let tree_root = __mem_load64(root + persistent_vector_tree_root_offset())
+    let tail = __mem_load64(root + persistent_vector_tail_offset())
+    let tail_start = tree_count * persistent_vector_chunk_size()
     let chunk_index = index / persistent_vector_chunk_size()
     let slot = index - chunk_index * persistent_vector_chunk_size()
-    let old_chunk = __mem_load64(old_chunks + chunk_index * 8)
-    let new_chunk = alloc_bump(persistent_vector_chunk_size() * elem_size)
-    mem_copy(new_chunk, old_chunk, persistent_vector_chunk_size() * elem_size)
-    vector_store_value<T>(new_chunk + slot * elem_size, elem_size, elem_mode, value)
-    __mem_store64(new_chunks + chunk_index * 8, new_chunk)
-    persistent_vector_box(persistent_vector_make_root(len, elem_size, elem_mode, chunk_count, new_chunks))
+    if index >= tail_start {
+      let new_tail = persistent_vector_copy_chunk(tail, elem_size)
+      vector_store_value<T>(new_tail + (index - tail_start) * elem_size, elem_size, elem_mode, value)
+      persistent_vector_box(persistent_vector_make_root(len, elem_size, elem_mode, tree_count, tree_depth, tree_root, new_tail))
+    } else {
+      let next_tree = persistent_vector_tree_set<T>(tree_root, tree_depth, chunk_index, slot, elem_size, elem_mode, value)
+      persistent_vector_box(persistent_vector_make_root(len, elem_size, elem_mode, tree_count, tree_depth, next_tree, tail))
+    }
   }
 }
 
