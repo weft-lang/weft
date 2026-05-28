@@ -260,6 +260,7 @@ check_rejects "region_scoped_handler_body_result" "test/negative/region_scoped_h
 check_rejects "region_scoped_handler_resume_region" "test/negative/region_scoped_handler_resume_region.weft" "type error: region value cannot escape scoped arena"
 check_rejects "region_scoped_store_to_outer_slot" "test/negative/region_scoped_store_to_outer_slot.weft" "type error: region value cannot escape scoped arena"
 check_rejects "region_scoped_store_sized_to_outer_slot" "test/negative/region_scoped_store_sized_to_outer_slot.weft" "type error: region value cannot escape scoped arena"
+check_rejects "region_scoped_value_return_alloc" "test/negative/region_scoped_value_return_alloc.weft" "type error: region value cannot escape scoped arena"
 check_rejects "region_scoped_promote_size_region" "test/negative/region_scoped_promote_size_region.weft" "type error: region value cannot escape scoped arena"
 check_rejects "region_scoped_promote_align_region" "test/negative/region_scoped_promote_align_region.weft" "type error: region value cannot escape scoped arena"
 check_rejects "lambda_capture_mut_binding" "test/negative/lambda_capture_mut_binding.weft" "type error: cannot capture mut binding"
