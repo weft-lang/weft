@@ -5,18 +5,31 @@ use "runtime/effects.weft"
 use "runtime/memory.weft"
 use "stdlib/unsafe.weft"
 
-fn rc_header_size() -> i64 { 32 }
+fn rc_header_size() -> i64 { 40 }
 fn rc_count_offset() -> i64 { 0 }
 fn rc_payload_size_offset() -> i64 { 8 }
 fn rc_weak_count_offset() -> i64 { 16 }
 fn rc_promoted_offset() -> i64 { 24 }
+fn rc_atomic_lock_offset() -> i64 { 32 }
 fn rc_default_heap_offset() -> i64 { 8 }
-fn rc_default_heap_capacity() -> i64 { 1048576 }
+fn rc_default_heap_capacity() -> i64 { 16777216 }
 
 fn rc_runtime_state_ptr() -> i64 {
   handle unsafe_runtime_state() {
     Unsafe.runtime_state() -> resume(__runtime_state())
   }
+}
+
+fn rc_atomic_lock_cell(payload: i64) -> i64 {
+  rc_header_from_payload(payload) + rc_atomic_lock_offset()
+}
+
+fn rc_atomic_lock(payload: i64) -> i64 {
+  __atomic_lock64(rc_atomic_lock_cell(payload))
+}
+
+fn rc_atomic_unlock(payload: i64) -> i64 {
+  __atomic_unlock64(rc_atomic_lock_cell(payload))
 }
 
 fn rc_header_from_payload(payload: i64) -> i64 {
@@ -39,21 +52,33 @@ fn rc_weak_count(payload: i64) -> i64 {
   __mem_load64(rc_header_from_payload(payload) + rc_weak_count_offset())
 }
 
+fn rc_is_promoted_raw(payload: i64) -> i64 {
+  __mem_load64(rc_header_from_payload(payload) + rc_promoted_offset())
+}
+
 fn rc_is_promoted(payload: i64) -> i64 {
   if payload == 0 { 0 }
-  else { __mem_load64(rc_header_from_payload(payload) + rc_promoted_offset()) }
+  else {
+    rc_atomic_lock(payload)
+    let result = rc_is_promoted_raw(payload)
+    rc_atomic_unlock(payload)
+    result
+  }
 }
 
 fn rc_mark_promoted(payload: i64) -> i64 {
   if payload == 0 { 0 }
   else {
     let header = rc_header_from_payload(payload)
-    if __mem_load64(header + rc_promoted_offset()) != 0 {
+    rc_atomic_lock(payload)
+    let result = if rc_is_promoted_raw(payload) != 0 {
       1
     } else {
       __mem_store64(header + rc_promoted_offset(), 1)
       1
     }
+    rc_atomic_unlock(payload)
+    result
   }
 }
 
@@ -73,6 +98,17 @@ fn rc_free_if_unreferenced(heap: i64, header: i64) -> i64 {
   } else { 0 }
 }
 
+fn rc_finalize_zero_count_payload(heap: i64, payload: i64) -> i64 {
+  let header = rc_header_from_payload(payload)
+  let weak = __mem_load64(header + rc_weak_count_offset())
+  if weak <= 0 {
+    rc_free_if_unreferenced(heap, header)
+  } else {
+    mem_zero(payload, __mem_load64(header + rc_payload_size_offset()))
+    0
+  }
+}
+
 fn rc_alloc(heap: i64, payload_size: i64, align: i64) -> i64 {
   if heap == 0 { 0 }
   else { if payload_size < 0 { 0 }
@@ -84,6 +120,7 @@ fn rc_alloc(heap: i64, payload_size: i64, align: i64) -> i64 {
       __mem_store64(block + rc_payload_size_offset(), payload_size)
       __mem_store64(block + rc_weak_count_offset(), 0)
       __mem_store64(block + rc_promoted_offset(), 0)
+      __mem_store64(block + rc_atomic_lock_offset(), 0)
       let payload = rc_payload_from_header(block)
       mem_zero(payload, payload_size)
       payload
@@ -175,6 +212,41 @@ fn rc_weak_load(payload: i64) -> i64 {
   }
 }
 
+fn rc_atomic_retain(payload: i64) -> i64 {
+  rc_atomic_lock(payload)
+  let result = rc_retain(payload)
+  rc_atomic_unlock(payload)
+  result
+}
+
+fn rc_atomic_release(heap: i64, payload: i64) -> i64 {
+  rc_atomic_lock(payload)
+  let result = rc_release(heap, payload)
+  rc_atomic_unlock(payload)
+  result
+}
+
+fn rc_atomic_weak_retain(payload: i64) -> i64 {
+  rc_atomic_lock(payload)
+  let result = rc_weak_retain(payload)
+  rc_atomic_unlock(payload)
+  result
+}
+
+fn rc_atomic_weak_release(heap: i64, payload: i64) -> i64 {
+  rc_atomic_lock(payload)
+  let result = rc_weak_release(heap, payload)
+  rc_atomic_unlock(payload)
+  result
+}
+
+fn rc_atomic_weak_load(payload: i64) -> i64 {
+  rc_atomic_lock(payload)
+  let result = rc_weak_load(payload)
+  rc_atomic_unlock(payload)
+  result
+}
+
 fn rc_default_heap_cell() -> i64 {
   rc_runtime_state_ptr() + rc_default_heap_offset()
 }
@@ -203,23 +275,88 @@ fn region_promote_rc(src: i64, payload_size: i64, align: i64) -> rc i64 {
 }
 
 fn rc_default_retain(payload: i64) -> i64 {
-  rc_retain(payload)
+  if payload == 0 { 0 - 1 }
+  else {
+    rc_atomic_lock(payload)
+    let promoted = rc_is_promoted_raw(payload)
+    let result = if promoted != 0 { rc_retain(payload) } else { 0 - 2 }
+    rc_atomic_unlock(payload)
+    if promoted != 0 { result } else { rc_retain(payload) }
+  }
+}
+
+fn rc_default_release_promoted(payload: i64) -> i64 {
+  if payload == 0 { 0 - 1 }
+  else {
+    let header = rc_header_from_payload(payload)
+    rc_atomic_lock(payload)
+    let count = __mem_load64(header + rc_count_offset())
+    if count <= 0 {
+      rc_atomic_unlock(payload)
+      0 - 1
+    } else { if count == 1 {
+      __mem_store64(header + rc_count_offset(), 0)
+      let weak = __mem_load64(header + rc_weak_count_offset())
+      if weak <= 0 {
+        rc_atomic_unlock(payload)
+        rc_free_if_unreferenced(rc_default_heap(), header)
+      } else {
+        mem_zero(payload, __mem_load64(header + rc_payload_size_offset()))
+        rc_atomic_unlock(payload)
+        0
+      }
+    } else {
+      let next = count - 1
+      __mem_store64(header + rc_count_offset(), next)
+      rc_atomic_unlock(payload)
+      next
+    } }
+  }
 }
 
 fn rc_default_release(payload: i64) -> i64 {
-  rc_release(rc_default_heap(), payload)
+  if payload == 0 { 0 - 1 }
+  else {
+    rc_atomic_lock(payload)
+    let promoted = rc_is_promoted_raw(payload)
+    rc_atomic_unlock(payload)
+    if promoted != 0 { rc_default_release_promoted(payload) }
+    else { rc_release(rc_default_heap(), payload) }
+  }
 }
 
 fn rc_default_weak_retain(payload: i64) -> i64 {
-  rc_weak_retain(payload)
+  if payload == 0 { 0 - 1 }
+  else {
+    rc_atomic_lock(payload)
+    let promoted = rc_is_promoted_raw(payload)
+    let result = if promoted != 0 { rc_weak_retain(payload) } else { 0 - 2 }
+    rc_atomic_unlock(payload)
+    if promoted != 0 { result } else { rc_weak_retain(payload) }
+  }
 }
 
 fn rc_default_weak_release(payload: i64) -> i64 {
-  rc_weak_release(rc_default_heap(), payload)
+  if payload == 0 { 0 - 1 }
+  else {
+    let heap = rc_default_heap()
+    rc_atomic_lock(payload)
+    let promoted = rc_is_promoted_raw(payload)
+    let result = if promoted != 0 { rc_weak_release(heap, payload) } else { 0 - 2 }
+    rc_atomic_unlock(payload)
+    if promoted != 0 { result } else { rc_weak_release(heap, payload) }
+  }
 }
 
 fn rc_default_weak_load(payload: i64) -> i64 {
-  rc_weak_load(payload)
+  if payload == 0 { 0 }
+  else {
+    rc_atomic_lock(payload)
+    let promoted = rc_is_promoted_raw(payload)
+    let result = if promoted != 0 { rc_weak_load(payload) } else { 0 }
+    rc_atomic_unlock(payload)
+    if promoted != 0 { result } else { rc_weak_load(payload) }
+  }
 }
 
 fn rc_default_promote(payload: i64) -> i64 {
@@ -344,8 +481,37 @@ fn closure_default_release_env(env: i64) -> i64 {
   }
 }
 
+fn closure_default_release_promoted(closure: i64) -> i64 {
+  if closure == 0 { 0 - 1 }
+  else {
+    let heap = rc_default_heap()
+    let header = rc_header_from_payload(closure)
+    rc_atomic_lock(closure)
+    let count = __mem_load64(header + rc_count_offset())
+    if count <= 0 {
+      rc_atomic_unlock(closure)
+      0 - 1
+    } else { if count == 1 {
+      let env = __mem_load64(closure + 8)
+      __mem_store64(header + rc_count_offset(), 0)
+      rc_atomic_unlock(closure)
+      if env != 0 { closure_default_release_env(env) } else { 0 }
+      rc_atomic_lock(closure)
+      let result = rc_finalize_zero_count_payload(heap, closure)
+      rc_atomic_unlock(closure)
+      result
+    } else {
+      let next = count - 1
+      __mem_store64(header + rc_count_offset(), next)
+      rc_atomic_unlock(closure)
+      next
+    } }
+  }
+}
+
 fn closure_default_release(closure: i64) -> i64 {
   if closure == 0 { 0 - 1 }
+  else { if rc_is_promoted(closure) != 0 { closure_default_release_promoted(closure) }
   else {
     let count = rc_count(closure)
     if count == 1 {
@@ -353,7 +519,7 @@ fn closure_default_release(closure: i64) -> i64 {
       if env != 0 { closure_default_release_env(env) } else { 0 }
     } else { 0 }
     rc_default_release(closure)
-  }
+  } }
 }
 
 fn continuation_cleanup_segment_value(segment: i64, slot: i64) -> i64 {

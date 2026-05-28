@@ -60,6 +60,7 @@ check_rejects "unsafe_got_requires_effect" "test/negative/unsafe_got_requires_ef
 check_rejects "root_raw_syscall_with_effect_requires_trusted" "test/negative/root_raw_syscall_with_effect_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "root_mem_with_effect_requires_trusted" "test/negative/root_mem_with_effect_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "root_alloc_with_effect_requires_trusted" "test/negative/root_alloc_with_effect_requires_trusted.weft" "type error: raw allocation is sealed to trusted runtime/platform code"
+check_rejects "root_atomic_lock_with_effect_requires_trusted" "test/negative/root_atomic_lock_with_effect_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "root_pointer_with_effect_requires_trusted" "test/negative/root_pointer_with_effect_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "root_unsafe_handler_requires_trusted" "test/negative/root_unsafe_handler_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "root_unsafe_perform_requires_trusted" "test/negative/root_unsafe_perform_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
