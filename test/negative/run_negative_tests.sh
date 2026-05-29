@@ -31,6 +31,7 @@ check_rejects() {
 check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" "type error: argument type mismatch"
 check_rejects "par_map_scoped_effectful" "test/negative/par_map_scoped_effectful.weft" "type error: argument type mismatch"
 check_rejects "par_pool_submit_effectful" "test/negative/par_pool_submit_effectful.weft" "type error: argument type mismatch"
+check_rejects "par_prepared_submit_public" "test/negative/par_prepared_submit_public.weft" "type error: prepared Par submission is compiler-internal"
 check_rejects "generator_new_non_literal_producer" "test/negative/generator_new_non_literal_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_new_nonzero_arg_producer" "test/negative/generator_new_nonzero_arg_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_new_function_with_arg" "test/negative/generator_new_function_with_arg.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
