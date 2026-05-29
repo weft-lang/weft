@@ -255,6 +255,8 @@ check_rejects "unique_par_spawn_use_after_move" "test/negative/unique_par_spawn_
 check_rejects "owned_param_used_twice" "test/negative/owned_param_used_twice.weft" "type error: owned value used more than once"
 check_rejects "owned_let_used_twice" "test/negative/owned_let_used_twice.weft" "type error: owned value used more than once"
 check_rejects "owned_closure_capture" "test/negative/owned_closure_capture.weft" "type error: owned value cannot be captured by closure"
+check_rejects "owned_drop_effect_unavailable" "test/negative/owned_drop_effect_unavailable.weft" "type error: owned Drop effect not available in caller"
+check_rejects "owned_file_drop_effect_unavailable" "test/negative/owned_file_drop_effect_unavailable.weft" "type error: owned Drop effect not available in caller"
 check_rejects "ownership_cycle_vector_self" "test/negative/ownership_cycle_vector_self.weft" "type error: strong ownership cycle requires weak or id edge"
 check_rejects "ownership_cycle_vector_mutual" "test/negative/ownership_cycle_vector_mutual.weft" "type error: strong ownership cycle requires weak or id edge"
 check_rejects "ownership_cycle_vector_generic_box" "test/negative/ownership_cycle_vector_generic_box.weft" "type error: strong ownership cycle requires weak or id edge"
