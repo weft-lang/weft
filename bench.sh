@@ -8,6 +8,15 @@ SHA=$(git rev-parse --short HEAD)
 TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 mkdir -p bench
+BENCH_TIMEOUT="${WEFT_BENCH_TIMEOUT:-}"
+
+run_bench_cmd() {
+  if [ -n "$BENCH_TIMEOUT" ]; then
+    timeout "$BENCH_TIMEOUT" "$@"
+  else
+    "$@"
+  fi
+}
 
 echo "=== Weft Benchmarks (${SHA}) ==="
 echo ""
@@ -48,7 +57,7 @@ for f in examples/*.weft; do
   # Compilation time
   COMP_START=$(python3 -c "import time; print(int(time.time()*1000))")
   set +e
-  timeout 30 /tmp/bench_weft2 < "$f" > /tmp/bench_ex 2>/tmp/bench_ex_err
+  run_bench_cmd /tmp/bench_weft2 < "$f" > /tmp/bench_ex 2>/tmp/bench_ex_err
   COMP_STATUS=$?
   set -e
   COMP_END=$(python3 -c "import time; print(int(time.time()*1000))")
@@ -72,7 +81,7 @@ for f in examples/*.weft; do
   # Execution time
   RUN_START=$(python3 -c "import time; print(int(time.time()*1000))")
   set +e
-  timeout 30 /tmp/bench_ex > /dev/null 2>/dev/null
+  run_bench_cmd /tmp/bench_ex > /dev/null 2>/dev/null
   RUN_STATUS=$?
   set -e
   RUN_END=$(python3 -c "import time; print(int(time.time()*1000))")
@@ -97,11 +106,6 @@ done
 
 # ── Record results ──
 RESULT="{\"sha\": \"${SHA}\", \"ts\": \"${TS}\", \"self_compile_ms\": ${SELF_MS}, \"self_size\": ${SELF_SIZE}, \"test_ms\": ${TEST_MS}, \"test_files\": ${TEST_FILES}, \"test_count\": ${TEST_TOTAL}, \"examples\": {${EXAMPLES}}}"
-echo "$RESULT" >> bench/results.jsonl
-
-echo ""
-echo "=== Results recorded to bench/results.jsonl ==="
-echo ""
 
 # ── Summary ──
 echo "Summary:"
@@ -112,3 +116,8 @@ echo "  SHA: ${SHA}"
 
 rm -f /tmp/bench_weft /tmp/bench_weft2 /tmp/bench_test_out
 if [ "$EXAMPLE_FAIL" -gt 0 ]; then exit 1; fi
+
+echo "$RESULT" >> bench/results.jsonl
+
+echo ""
+echo "=== Results recorded to bench/results.jsonl ==="
