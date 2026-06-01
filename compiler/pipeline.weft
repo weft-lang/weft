@@ -5920,6 +5920,79 @@ fn pipeline_ir_native_hclause_lambda_scope_params(params: ParamList, index: i64,
   }
 }
 
+fn pipeline_ir_native_hclause_lambda_scope(params: ParamList, continuation: HandlerClauseContinuation) -> i64 {
+  let param_scope = pipeline_ir_native_hclause_lambda_scope_params(params, 0, scope_new())
+  match continuation {
+    HandlerClauseContinuation(ns, nl) -> scope_push(param_scope, ns, nl, cg_continuation_reg())
+    _ -> param_scope
+  }
+}
+
+fn pipeline_ir_native_hclause_params_type_scope(params: ParamList, index: i64, base_scope: i64) -> i64 {
+  match params {
+    ParamListNil -> base_scope
+    ParamListCons(param, rest) -> {
+      match param {
+        Param(ns, nl, ty, label) -> {
+          let next_scope = scope_push_typed(base_scope, ns, nl, reg_id(index), type_expr_to_node(ty))
+          pipeline_ir_native_hclause_params_type_scope(rest, index + 1, next_scope)
+        }
+        UnknownParam(tag) -> pipeline_ir_native_hclause_params_type_scope(rest, index + 1, base_scope)
+      }
+    }
+  }
+}
+
+fn pipeline_ir_native_emit_hclause_continuation(code: i64, fm: i64, body_scope: i64, outer_scope: i64, src: i64, free_vars: i64, body_ctr: i64, continuation: HandlerClauseContinuation) -> i64 {
+  match continuation {
+    HandlerClauseContinuation(ns, nl) -> {
+      let nfree = nlist_len(free_vars)
+      let desc_count = cg_hclause_managed_free_count(free_vars, nfree, outer_scope, src, fm)
+      if desc_count > 0 {
+        cg_emit_hclause_continuation_segment(code, fm, body_scope, outer_scope, src, free_vars, body_ctr, body_ctr + 1)
+        let desc_phys = emit_load_reg(code, body_ctr)
+        bu32(code, encode_add_imm(0, desc_phys, 0))
+        cg_emit_call_lit(code, fm, "continuation_new_with_cleanup_desc")
+        cg_hclause_store_x0(code, body_ctr)
+        let token_phys = emit_load_reg(code, body_ctr)
+        bu32(code, encode_add_imm(0, token_phys, 0))
+        let segment_phys = emit_load_reg(code, body_ctr + 1)
+        bu32(code, encode_add_imm(1, segment_phys, 0))
+        emit_mov_imm(code, 2, 0)
+        emit_mov_imm(code, 3, 0)
+        cg_emit_call_lit(code, fm, "continuation_set_segment")
+        body_ctr + 2
+      } else {
+        cg_emit_call_lit(code, fm, "continuation_new_noop")
+        cg_hclause_store_x0(code, body_ctr)
+        body_ctr + 1
+      }
+    }
+    _ -> body_ctr
+  }
+}
+
+fn pipeline_ir_native_hclause_scope_with_continuation(body_scope: i64, continuation: HandlerClauseContinuation, body_ctr: i64) -> i64 {
+  match continuation {
+    HandlerClauseContinuation(ns, nl) -> scope_push_typed(body_scope, ns, nl, cg_continuation_reg(), reg_id(body_ctr))
+    _ -> body_scope
+  }
+}
+
+fn pipeline_ir_native_drop_hclause_continuation(code: i64, fm: i64, body_scope: i64, src: i64, continuation: HandlerClauseContinuation) -> i64 {
+  match continuation {
+    HandlerClauseContinuation(ns, nl) -> {
+      let token_rid = scope_lookup_type(body_scope, src, ns, nl)
+      if token_rid != 0 {
+        let token_phys = emit_load_reg_id(code, token_rid, 16)
+        bu32(code, encode_add_imm(0, token_phys, 0))
+        cg_emit_call_lit(code, fm, "continuation_drop_managed")
+      } else { 0 }
+    }
+    _ -> 0
+  }
+}
+
 fn pipeline_typed_ffv_bind_pattern_list(patterns: PatternList, scope: i64, src: i64) -> i64 {
   match patterns {
     PatternListNil -> scope
@@ -6135,12 +6208,53 @@ fn pipeline_ir_native_emit_hclause_body_ir(clause: HandlerClause, code: i64, sco
   }
 }
 
+fn pipeline_ir_native_emit_hclause_body_cg(clause: HandlerClause, code: i64, scope: i64, src: i64, fm: i64) -> i64 {
+  match clause {
+    HandlerClause(name_info, params, cbody_expr, continuation) -> {
+      let cbody = expr_to_node(cbody_expr)
+      let nparams = param_list_len(params)
+      let lambda_scope = pipeline_ir_native_hclause_lambda_scope(params, continuation)
+      let free_vars = nlist_new()
+      pipeline_typed_find_free_vars_expr(cbody_expr, lambda_scope, scope, src, free_vars)
+      let nfree = nlist_len(free_vars)
+      let skip_pos = buf_len(code)
+      bu32(code, 0)
+      let clause_start = buf_len(code)
+      let type_scope = pipeline_ir_native_hclause_params_type_scope(
+        params,
+        0,
+        cg_free_vars_type_scope(free_vars, nfree, scope, src, scope_new())
+      )
+      let old_preserve_fp = cg_enter_function_fp_preserve(fm, cbody, type_scope, src)
+      emit_prologue_current(code, fm)
+      pipeline_ir_native_emit_hclause_loads(code, nparams, free_vars, nfree)
+      let base_scope = pipeline_ir_native_hclause_scope(params, nparams, free_vars, nfree, scope, src)
+      let base_ctr = nparams + nfree + nparams
+      let body_ctr = pipeline_ir_native_emit_hclause_continuation(code, fm, base_scope, scope, src, free_vars, base_ctr, continuation)
+      let body_scope = pipeline_ir_native_hclause_scope_with_continuation(base_scope, continuation, base_ctr)
+      let br = cg_expr(cbody, code, body_scope, src, body_ctr, fm)
+      pipeline_ir_native_drop_hclause_continuation(code, fm, body_scope, src, continuation)
+      let rp = emit_load_reg(code, br - 1)
+      bu32(code, encode_add_imm(0, rp, 0))
+      emit_epilogue_current(code, fm)
+      cg_restore_function_fp_preserve(fm, old_preserve_fp)
+      cg_patch_b(code, skip_pos, buf_len(code))
+      let info = alloc_bump(24)
+      __mem_store64(info, clause_start)
+      __mem_store64(info + 8, free_vars)
+      __mem_store64(info + 16, nfree)
+      info
+    }
+    UnknownHandlerClause(tag) -> 0
+  }
+}
+
 fn pipeline_ir_native_emit_hclause_body(clause: HandlerClause, code: i64, scope: i64, src: i64, fm: i64, active_handlers: PipelineNativeHandlerCtx) -> i64 {
   let opt = pipeline_ir_native_emit_hclause_body_ir(clause, code, scope, src, fm, active_handlers)
   if opt != 0 {
     opt
   } else {
-    cg_hclause_body(handler_clause_to_node(clause), code, scope, src, fm)
+    pipeline_ir_native_emit_hclause_body_cg(clause, code, scope, src, fm)
   }
 }
 
