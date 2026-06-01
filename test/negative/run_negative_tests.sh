@@ -347,6 +347,7 @@ check_rejects "handler_clause_arity_too_few" "test/negative/handler_clause_arity
 check_rejects "handler_clause_arity_too_many" "test/negative/handler_clause_arity_too_many.weft" "type error: arity mismatch"
 check_rejects "handler_clause_param_type_mismatch" "test/negative/handler_clause_param_type_mismatch.weft" "type error: argument type mismatch"
 check_rejects "handler_clause_resume_type_mismatch" "test/negative/handler_clause_resume_type_mismatch.weft" "type error: resume type mismatch"
+check_rejects "handler_clause_return_type_mismatch" "test/negative/handler_clause_return_type_mismatch.weft" "type error: return type mismatch"
 check_rejects "handler_clause_resume_capture_lambda" "test/negative/handler_clause_resume_capture_lambda.weft" "type error: cannot capture resume"
 check_rejects "handler_clause_resume_capture_nested_lambda" "test/negative/handler_clause_resume_capture_nested_lambda.weft" "type error: cannot capture resume"
 check_rejects "handler_clause_duplicate" "test/negative/handler_clause_duplicate.weft" "type error: duplicate handler clause"
