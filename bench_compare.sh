@@ -47,15 +47,15 @@ time_command() {
 mean_ms() {
   local csv="$1"
   python3 -c 'import sys
-vals=[int(x) for x in sys.argv[1].split(",") if x]
-print(sum(vals)//len(vals) if vals else -1)' "$csv"
+vals=[float(x) for x in sys.argv[1].split(",") if x]
+print(f"{sum(vals)/len(vals):.3f}" if vals else "-1")' "$csv"
 }
 
 min_ms() {
   local csv="$1"
   python3 -c 'import sys
-vals=[int(x) for x in sys.argv[1].split(",") if x]
-print(min(vals) if vals else -1)' "$csv"
+vals=[float(x) for x in sys.argv[1].split(",") if x]
+print(f"{min(vals):.3f}" if vals else "-1")' "$csv"
 }
 
 json_escape() {
@@ -87,21 +87,35 @@ build_rust() {
 run_binary_many() {
   local bin="$1"
   local runs="$2"
-  local durations=""
-  local i=0
-  while [ "$i" -lt "$WARMUPS" ]; do
-    time_command "$bin" >/dev/null || return 1
-    i=$((i + 1))
-  done
-  i=0
-  while [ "$i" -lt "$runs" ]; do
-    local elapsed
-    elapsed=$(time_command "$bin") || return 1
-    if [ -n "$durations" ]; then durations="${durations},"; fi
-    durations="${durations}${elapsed}"
-    i=$((i + 1))
-  done
-  echo "$durations"
+  python3 - "$bin" "$WARMUPS" "$runs" <<'PY'
+import subprocess
+import sys
+import time
+
+bin_path = sys.argv[1]
+warmups = int(sys.argv[2])
+runs = int(sys.argv[3])
+
+def run_once():
+    start = time.perf_counter_ns()
+    result = subprocess.run([bin_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elapsed_ms = (time.perf_counter_ns() - start) / 1_000_000.0
+    return (result.returncode, elapsed_ms)
+
+for _ in range(warmups):
+    status, _ = run_once()
+    if status != 0:
+        raise SystemExit(status)
+
+durations = []
+for _ in range(runs):
+    status, elapsed = run_once()
+    if status != 0:
+        raise SystemExit(status)
+    durations.append(elapsed)
+
+print(",".join(f"{v:.3f}" for v in durations))
+PY
 }
 
 measure_variant() {
