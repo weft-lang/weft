@@ -65,7 +65,7 @@ json_escape() {
 build_weft() {
   local case="$1"
   local out="$2"
-  if ! "$WEFT" < "bench/compare/weft/${case}.weft" > "$out" 2>/dev/null; then
+  if ! "$WEFT" compile "bench/compare/weft/${case}.weft" > "$out" 2>/dev/null; then
     return 1
   fi
   chmod +x "$out"

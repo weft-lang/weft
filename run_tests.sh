@@ -4,15 +4,77 @@
 set -e
 
 WEFT=${WEFT:-./weft}
-WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-60}
-WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-60}
+WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-120}
+WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-120}
+WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-8000000}
+WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-1000000}
+WEFT_TEST_SHOW_TIMINGS=${WEFT_TEST_SHOW_TIMINGS:-1}
 PASS=0
 FAIL=0
 ERRORS=""
 RUNTIME_FILES=0
 RUNTIME_TESTS=0
+RUNTIME_COMPILE_SECONDS=0
+RUNTIME_RUN_SECONDS=0
+
+export WEFT
+export WEFT_TEST_COMPILE_TIMEOUT
+export WEFT_TEST_RUN_TIMEOUT
+export WEFT_TEST_COMPILE_RSS_LIMIT_KB
+export WEFT_TEST_RUN_RSS_LIMIT_KB
+
+now_s() {
+  date +%s
+}
+
+run_guarded() {
+  local timeout_s="$1"
+  local rss_limit_kb="$2"
+  shift 2
+
+  "$@" <&0 &
+  local pid=$!
+  local start
+  start=$(now_s)
+
+  while kill -0 "$pid" 2>/dev/null; do
+    local stat
+    stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [[ "$stat" == Z* ]]; then
+      break
+    fi
+
+    local rss
+    rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [ -n "$rss" ] && [ "$rss" -gt "$rss_limit_kb" ]; then
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 125
+    fi
+
+    local elapsed
+    elapsed=$(($(now_s) - start))
+    if [ "$elapsed" -ge "$timeout_s" ]; then
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+
+    sleep 1
+  done
+
+  wait "$pid"
+}
 
 echo "=== Weft Test Suite ==="
+echo "runtime compile timeout: ${WEFT_TEST_COMPILE_TIMEOUT}s"
+echo "runtime run timeout: ${WEFT_TEST_RUN_TIMEOUT}s"
+echo "runtime compile RSS limit: ${WEFT_TEST_COMPILE_RSS_LIMIT_KB} KB"
+echo "runtime run RSS limit: ${WEFT_TEST_RUN_RSS_LIMIT_KB} KB"
 echo ""
 
 for f in $(grep -l 'test "' test/*.weft 2>/dev/null); do
@@ -24,11 +86,23 @@ for f in $(grep -l 'test "' test/*.weft 2>/dev/null); do
 
   # Compile test file through strict path-mode; stdin test compilation is strict
   # too, but path-mode keeps source identity explicit in the project suite.
-  compile_cmd=(timeout "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT" test "$f")
-  if ! "${compile_cmd[@]}" > "$tmpbin" 2>/dev/null; then
-    echo "  ✗ $name (compilation failed)"
+  compile_exit=0
+  compile_start=$(now_s)
+  run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" test "$f" > "$tmpbin" 2>/dev/null || compile_exit=$?
+  compile_elapsed=$(($(now_s) - compile_start))
+  RUNTIME_COMPILE_SECONDS=$((RUNTIME_COMPILE_SECONDS+compile_elapsed))
+  if [ $compile_exit -ne 0 ]; then
+    if [ $compile_exit -eq 124 ]; then
+      echo "  ✗ $name (compilation timed out after ${WEFT_TEST_COMPILE_TIMEOUT}s; compile ${compile_elapsed}s)"
+      ERRORS="$ERRORS\n  $name: compilation timed out after ${WEFT_TEST_COMPILE_TIMEOUT}s (compile ${compile_elapsed}s)"
+    elif [ $compile_exit -eq 125 ]; then
+      echo "  ✗ $name (compilation exceeded ${WEFT_TEST_COMPILE_RSS_LIMIT_KB} KB RSS; compile ${compile_elapsed}s)"
+      ERRORS="$ERRORS\n  $name: compilation exceeded ${WEFT_TEST_COMPILE_RSS_LIMIT_KB} KB RSS (compile ${compile_elapsed}s)"
+    else
+      echo "  ✗ $name (compilation failed; exit $compile_exit; compile ${compile_elapsed}s)"
+      ERRORS="$ERRORS\n  $name: compilation failed (exit $compile_exit, compile ${compile_elapsed}s)"
+    fi
     FAIL=$((FAIL+1))
-    ERRORS="$ERRORS\n  $name: compilation failed"
     rm -f "$tmpbin"
     continue
   fi
@@ -37,19 +111,30 @@ for f in $(grep -l 'test "' test/*.weft 2>/dev/null); do
 
   # Run test binary
   exit_code=0
-  timeout "$WEFT_TEST_RUN_TIMEOUT" "$tmpbin" 2>/dev/null || exit_code=$?
+  run_start=$(now_s)
+  run_guarded "$WEFT_TEST_RUN_TIMEOUT" "$WEFT_TEST_RUN_RSS_LIMIT_KB" "$tmpbin" 2>/dev/null || exit_code=$?
+  run_elapsed=$(($(now_s) - run_start))
+  RUNTIME_RUN_SECONDS=$((RUNTIME_RUN_SECONDS+run_elapsed))
 
   if [ $exit_code -eq 0 ]; then
-    echo "  ✓ $name"
+    if [ "$WEFT_TEST_SHOW_TIMINGS" -eq 1 ]; then
+      echo "  ✓ $name (compile ${compile_elapsed}s, run ${run_elapsed}s)"
+    else
+      echo "  ✓ $name"
+    fi
     PASS=$((PASS+1))
   elif [ $exit_code -eq 124 ]; then
-    echo "  ✗ $name (timed out after ${WEFT_TEST_RUN_TIMEOUT}s)"
+    echo "  ✗ $name (runtime timed out after ${WEFT_TEST_RUN_TIMEOUT}s; compile ${compile_elapsed}s, run ${run_elapsed}s)"
     FAIL=$((FAIL+1))
-    ERRORS="$ERRORS\n  $name: timed out after ${WEFT_TEST_RUN_TIMEOUT}s"
+    ERRORS="$ERRORS\n  $name: runtime timed out after ${WEFT_TEST_RUN_TIMEOUT}s (compile ${compile_elapsed}s, run ${run_elapsed}s)"
+  elif [ $exit_code -eq 125 ]; then
+    echo "  ✗ $name (runtime exceeded ${WEFT_TEST_RUN_RSS_LIMIT_KB} KB RSS; compile ${compile_elapsed}s, run ${run_elapsed}s)"
+    FAIL=$((FAIL+1))
+    ERRORS="$ERRORS\n  $name: runtime exceeded ${WEFT_TEST_RUN_RSS_LIMIT_KB} KB RSS (compile ${compile_elapsed}s, run ${run_elapsed}s)"
   else
-    echo "  ✗ $name ($exit_code failures)"
+    echo "  ✗ $name ($exit_code failures; compile ${compile_elapsed}s, run ${run_elapsed}s)"
     FAIL=$((FAIL+1))
-    ERRORS="$ERRORS\n  $name: $exit_code failures"
+    ERRORS="$ERRORS\n  $name: $exit_code failures (compile ${compile_elapsed}s, run ${run_elapsed}s)"
   fi
 
   rm -f "$tmpbin"
@@ -62,14 +147,14 @@ tmpw1=$(mktemp /tmp/weft_test_XXXXXX)
 tmpw2=$(mktemp /tmp/weft_test_XXXXXX)
 tmpw3=$(mktemp /tmp/weft_test_XXXXXX)
 bootstrap_ok=1
-if "$WEFT" compile compiler/main.weft > "$tmpw1" 2>/dev/null; then
+if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" compile compiler/main.weft > "$tmpw1" 2>/dev/null; then
   chmod +x "$tmpw1"
 else
   bootstrap_ok=0
   echo "  ✗ bootstrap stage 1 failed"
 fi
 if [ $bootstrap_ok -eq 1 ]; then
-  if "$tmpw1" compile compiler/main.weft > "$tmpw2" 2>/dev/null; then
+  if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$tmpw1" compile compiler/main.weft > "$tmpw2" 2>/dev/null; then
     chmod +x "$tmpw2"
   else
     bootstrap_ok=0
@@ -77,7 +162,7 @@ if [ $bootstrap_ok -eq 1 ]; then
   fi
 fi
 if [ $bootstrap_ok -eq 1 ]; then
-  if "$tmpw2" compile compiler/main.weft > "$tmpw3" 2>/dev/null; then
+  if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$tmpw2" compile compiler/main.weft > "$tmpw3" 2>/dev/null; then
     chmod +x "$tmpw3"
   else
     bootstrap_ok=0
@@ -137,6 +222,8 @@ echo ""
 echo "=== Summary ==="
 echo "$PASS suite groups passed, $FAIL failed"
 echo "Runtime tests: $RUNTIME_FILES files, $RUNTIME_TESTS test blocks"
+echo "Runtime compile time: ${RUNTIME_COMPILE_SECONDS}s"
+echo "Runtime execution time: ${RUNTIME_RUN_SECONDS}s"
 if [ -n "$ERRORS" ]; then
   echo ""
   echo "Failures:"

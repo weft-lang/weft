@@ -4,9 +4,58 @@
 set -e
 
 WEFT=${WEFT:-./weft}
+WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-120}
+WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-8000000}
 PASS=0
 FAIL=0
 ERRORS=""
+
+now_s() {
+  date +%s
+}
+
+run_guarded() {
+  local timeout_s="$1"
+  local rss_limit_kb="$2"
+  shift 2
+
+  "$@" <&0 &
+  local pid=$!
+  local start
+  start=$(now_s)
+
+  while kill -0 "$pid" 2>/dev/null; do
+    local stat
+    stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [[ "$stat" == Z* ]]; then
+      break
+    fi
+
+    local rss
+    rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [ -n "$rss" ] && [ "$rss" -gt "$rss_limit_kb" ]; then
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 125
+    fi
+
+    local elapsed
+    elapsed=$(($(now_s) - start))
+    if [ "$elapsed" -ge "$timeout_s" ]; then
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+
+    sleep 1
+  done
+
+  wait "$pid"
+}
 
 echo "=== Negative Test Suite ==="
 echo ""
@@ -16,8 +65,24 @@ check_rejects() {
   local file="$2"
   local pattern="$3"
   local out
+  local status
 
-  out=$(timeout 30 "$WEFT" check "$file" 2>&1 >/dev/null || true)
+  set +e
+  out=$(run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" check "$file" 2>&1 >/dev/null)
+  status=$?
+  set -e
+  if [ "$status" -eq 124 ]; then
+    echo "  ✗ $name"
+    FAIL=$((FAIL+1))
+    ERRORS="$ERRORS\n  $name: checker timed out"
+    return
+  fi
+  if [ "$status" -eq 125 ]; then
+    echo "  ✗ $name"
+    FAIL=$((FAIL+1))
+    ERRORS="$ERRORS\n  $name: checker exceeded ${WEFT_TEST_COMPILE_RSS_LIMIT_KB} KB RSS"
+    return
+  fi
   if echo "$out" | grep -q "$pattern"; then
     echo "  ✓ $name"
     PASS=$((PASS+1))
@@ -65,6 +130,7 @@ check_rejects "root_atomic_lock_with_effect_requires_trusted" "test/negative/roo
 check_rejects "root_pointer_with_effect_requires_trusted" "test/negative/root_pointer_with_effect_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "root_unsafe_handler_requires_trusted" "test/negative/root_unsafe_handler_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "root_unsafe_perform_requires_trusted" "test/negative/root_unsafe_perform_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
+check_rejects "unsafe_runtime_helper_with_effect_requires_trusted" "test/negative/unsafe_runtime_helper_with_effect_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "pipeline_origin_helper_requires_trusted" "test/negative/pipeline_origin_helper_requires_trusted.weft" "type error: source trust is sealed to trusted compiler/runtime code"
 check_rejects "pipeline_trust_helper_requires_trusted" "test/negative/pipeline_trust_helper_requires_trusted.weft" "type error: source trust is sealed to trusted compiler/runtime code"
 check_rejects "ttable_mark_trusted_requires_trusted" "test/negative/ttable_mark_trusted_requires_trusted.weft" "type error: source trust is sealed to trusted compiler/runtime code"

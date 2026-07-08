@@ -91,24 +91,44 @@ run_bench_cmd() {
   fi
 }
 
+build_weft_source() {
+  local compiler="$1"
+  local source="$2"
+  local out="$3"
+  local err="$4"
+  set +e
+  "$compiler" compile "$source" > "$out" 2>"$err"
+  local status=$?
+  set -e
+  local size diag_size
+  size=$(wc -c < "$out" | tr -d ' ')
+  diag_size=$(wc -c < "$err" | tr -d ' ')
+  if [ "$status" -ne 0 ] || [ "$diag_size" -ne 0 ] || [ "$size" -eq 0 ]; then
+    echo "compile failed for ${source}" >&2
+    if [ "$diag_size" -ne 0 ]; then
+      cat "$err" >&2
+    fi
+    return 1
+  fi
+  chmod +x "$out"
+}
+
 echo "=== Weft Benchmarks (${SHA}) ==="
 echo ""
 echo "Example runs: ${EXAMPLE_RUNS} measured, ${EXAMPLE_WARMUPS} warmup"
 echo ""
 
 # Build the compiler first
-./weft < compiler/main.weft > /tmp/bench_weft 2>/dev/null
-chmod +x /tmp/bench_weft
+build_weft_source ./weft compiler/main.weft /tmp/bench_weft /tmp/bench_weft_err
 
 # ── Self-compilation time ──
 echo "Self-compilation (weft1 → weft2):"
 SELF_START=$(now_ms)
-/tmp/bench_weft < compiler/main.weft > /tmp/bench_weft2 2>/dev/null
+build_weft_source /tmp/bench_weft compiler/main.weft /tmp/bench_weft2 /tmp/bench_weft2_err
 SELF_END=$(now_ms)
 SELF_MS=$((SELF_END - SELF_START))
 SELF_SIZE=$(wc -c < /tmp/bench_weft2 | tr -d ' ')
 echo "  time: ${SELF_MS}ms  size: ${SELF_SIZE} bytes"
-chmod +x /tmp/bench_weft2
 
 # ── Test suite time ──
 echo ""
@@ -131,10 +151,17 @@ for f in examples/*.weft; do
 
   # Compilation time
   COMP_START=$(now_ms)
-  set +e
-  run_bench_cmd /tmp/bench_weft2 < "$f" > /tmp/bench_ex 2>/tmp/bench_ex_err
-  COMP_STATUS=$?
-  set -e
+  if [ -n "$BENCH_TIMEOUT" ]; then
+    set +e
+    timeout "$BENCH_TIMEOUT" /tmp/bench_weft2 compile "$f" > /tmp/bench_ex 2>/tmp/bench_ex_err
+    COMP_STATUS=$?
+    set -e
+  else
+    set +e
+    /tmp/bench_weft2 compile "$f" > /tmp/bench_ex 2>/tmp/bench_ex_err
+    COMP_STATUS=$?
+    set -e
+  fi
   COMP_END=$(now_ms)
   COMP_MS=$((COMP_END - COMP_START))
   EX_SIZE=$(wc -c < /tmp/bench_ex | tr -d ' ')
@@ -186,7 +213,7 @@ echo "  Test suite:    ${TEST_MS}ms (${TEST_TOTAL} tests)"
 echo "  Examples:      ${EXAMPLE_FAIL} failed"
 echo "  SHA: ${SHA}"
 
-rm -f /tmp/bench_weft /tmp/bench_weft2 /tmp/bench_test_out
+rm -f /tmp/bench_weft /tmp/bench_weft_err /tmp/bench_weft2 /tmp/bench_weft2_err /tmp/bench_test_out
 if [ "$EXAMPLE_FAIL" -gt 0 ]; then exit 1; fi
 
 echo "$RESULT" >> bench/results.jsonl

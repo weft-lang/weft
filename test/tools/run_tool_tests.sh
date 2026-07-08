@@ -3,6 +3,10 @@
 set -e
 
 WEFT=${WEFT:-./weft}
+WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-120}
+WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-120}
+WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-8000000}
+WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-1000000}
 case "$WEFT" in
   /*) WEFT_ABS="$WEFT" ;;
   *) WEFT_ABS="$(pwd)/$WEFT" ;;
@@ -19,6 +23,61 @@ tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
 trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir"' EXIT
+
+now_s() {
+  date +%s
+}
+
+run_guarded() {
+  local timeout_s="$1"
+  local rss_limit_kb="$2"
+  shift 2
+
+  "$@" <&0 &
+  local pid=$!
+  local start
+  start=$(now_s)
+
+  while kill -0 "$pid" 2>/dev/null; do
+    local stat
+    stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [[ "$stat" == Z* ]]; then
+      break
+    fi
+
+    local rss
+    rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [ -n "$rss" ] && [ "$rss" -gt "$rss_limit_kb" ]; then
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 125
+    fi
+
+    local elapsed
+    elapsed=$(($(now_s) - start))
+    if [ "$elapsed" -ge "$timeout_s" ]; then
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+
+    sleep 1
+  done
+
+  wait "$pid"
+}
+
+run_weft_compile_guarded() {
+  run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$@"
+}
+
+run_binary_guarded() {
+  run_guarded "$WEFT_TEST_RUN_TIMEOUT" "$WEFT_TEST_RUN_RSS_LIMIT_KB" "$@"
+}
 
 assert_contains() {
   local name="$1"
@@ -87,10 +146,10 @@ assert_test_exit_code() {
   local expected="$3"
   local exit_code
   printf '%s\n' "$source" > "$tmp_src"
-  "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+  run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
   chmod +x "$tmp_bin"
   set +e
-  "$tmp_bin" >/dev/null 2>&1
+  run_binary_guarded "$tmp_bin" >/dev/null 2>&1
   exit_code=$?
   set -e
   if [ "$exit_code" -eq "$expected" ]; then
@@ -111,10 +170,10 @@ assert_test_failure_contains() {
   local exit_code
   local err
   printf '%s\n' "$source" > "$tmp_src"
-  "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+  run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
   chmod +x "$tmp_bin"
   set +e
-  "$tmp_bin" >/dev/null 2>"$tmp_err"
+  run_binary_guarded "$tmp_bin" >/dev/null 2>"$tmp_err"
   exit_code=$?
   set -e
   err=$(<"$tmp_err")
@@ -133,7 +192,7 @@ assert_test_compile_rejects() {
   local pattern="$3"
   local out
   printf '%s\n' "$source" > "$tmp_src"
-  out=$("$WEFT" test < "$tmp_src" 2>&1 >/dev/null || true)
+  out=$(run_weft_compile_guarded "$WEFT" test < "$tmp_src" 2>&1 >/dev/null || true)
   assert_contains "$name" "$out" "$pattern"
 }
 
@@ -178,10 +237,10 @@ assert_contains "check_parse_and_typecheck" "$check_out" "check: 1 functions, 0 
 check_path_out=$("$WEFT" check "$tmp_src" 2>&1)
 assert_contains "check_path_parse_and_typecheck" "$check_path_out" "check: 1 functions, 0 errors"
 
-"$WEFT" compile "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+run_weft_compile_guarded "$WEFT" compile "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 chmod +x "$tmp_bin"
 set +e
-"$tmp_bin" >/dev/null 2>&1
+run_binary_guarded "$tmp_bin" >/dev/null 2>&1
 compile_path_exit=$?
 set -e
 assert_equals "compile_path_binary_exit" "$compile_path_exit" "42"
@@ -192,9 +251,9 @@ assert_contains "ast_reports_parse_recovery" "$parse_recovery_out" "error: expec
 assert_contains "ast_recovers_after_parse_error" "$parse_recovery_out" "--- AST: 2 functions ---"
 
 printf 'fn main() -> i64 { missing }\n' > "$tmp_src"
-diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
+diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
 assert_contains "check_reports_diagnostics" "$diag_out" "type error: unknown identifier"
-assert_equals "diagnostic_snapshot_exact" "$diag_out" $'line 1, col 20: type error: unknown identifier\ncheck: 1 functions, 0 errors'
+assert_equals "diagnostic_snapshot_exact" "$diag_out" $'line 1, col 20: type error: unknown identifier\ncheck: 1 functions, 1 errors'
 
 mcp_out=$(printf '%s' '{ "jsonrpc" : "2.0", "id" : 1, "method" : "tools/list" }' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"parse_summary"},{"name":"check_summary"},{"name":"ir_summary"},{"name":"type_lookup"},{"name":"effect_lookup"},{"name":"diagnostics"},{"name":"grammar_parse"},{"name":"grammar_check"},{"name":"grammar_diagnostics"}]}}'
@@ -210,6 +269,9 @@ assert_equals "mcp_check_summary_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ir_summary","arguments":{"source":"fn main() -> i64 { 42 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_ir_summary_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"ir_summary","ok":true,"functions":1,"blocks":1,"insts":1}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ir_summary","arguments":{"source":"effect E { @deferred fn get() -> i64 } fn f() -> i64 { handle E.get() { E.get() with k -> k(20) } } test \"x\" { Test.assert_eq(f(), 20) }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_ir_summary_test_deferred_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"ir_summary","ok":true,"functions":2,"blocks":3,"insts":4}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"type_lookup","arguments":{"source":"fn add(x: i64, y: i64) -[Log]> i64 { x + y }\neffect Log { fn hit() -> i64 }","name":"add"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_type_lookup_function_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"name":"add","found":true,"kind":"function","params":2,"return_type_tag":2,"return_type_prim":0,"effects":1,"effect_tail":0}}'
@@ -231,6 +293,9 @@ assert_equals "mcp_effect_lookup_missing_snapshot" "$mcp_out" '{"jsonrpc":"2.0",
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -> i64 { 42 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_clean_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":0,"functions":1,"check_errors":0,"items":[]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"test \"x\" { 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_test_block_clean_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":0,"functions":1,"check_errors":0,"items":[]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -[Unsafe]> i64 { __mem_load64(0) }"}}}' | "$WEFT" mcp 2>&1)
 assert_contains "mcp_diagnostics_rejects_root_raw_memory" "$mcp_out" "type error: Unsafe is sealed to trusted runtime/platform code"
@@ -795,7 +860,7 @@ lsp_out=$(lsp_frame "$lsp_unknown" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_unknown_method_error" "$lsp_out" '"code":-32601'
 
 printf 'fn main() -> i64 { let mut i = 0 let mut stop = 0 while i < 5 && stop == 0 { i = i + 1 } i }\n' > "$tmp_src"
-amp_diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
+amp_diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
 assert_contains "check_rejects_symbolic_and" "$amp_diag_out" "error: expected '}'"
 
 printf 'test "plain" { Test.assert_eq(1, 1) }\n' > "$tmp_src"
@@ -808,9 +873,9 @@ write_large_padding "$tmp_src"
 printf 'fn main() -> i64 { 0 }\n' >> "$tmp_src"
 large_check_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_reads_large_stdin" "$large_check_out" "check: 1 functions, 0 errors"
-"$WEFT" < "$tmp_src" > "$tmp_bin" 2>/dev/null
+run_weft_compile_guarded "$WEFT" < "$tmp_src" > "$tmp_bin" 2>/dev/null
 chmod +x "$tmp_bin"
-"$tmp_bin"
+run_binary_guarded "$tmp_bin"
 echo "  ok compile_reads_large_stdin"
 
 write_large_padding "$tmp_import"
@@ -823,39 +888,39 @@ write_huge_padding "$tmp_src"
 printf 'fn main() -> i64 { 0 }\n' >> "$tmp_src"
 huge_check_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_reads_huge_stdin_offsets" "$huge_check_out" "check: 1 functions, 0 errors"
-"$WEFT" < "$tmp_src" > "$tmp_bin" 2>/dev/null
+run_weft_compile_guarded "$WEFT" < "$tmp_src" > "$tmp_bin" 2>/dev/null
 chmod +x "$tmp_bin"
-"$tmp_bin"
+run_binary_guarded "$tmp_bin"
 echo "  ok compile_reads_huge_stdin_offsets"
 
 mkdir -p "$tmp_pkg_dir/deps/math"
 printf '{"package":"app","dependencies":{"math":"deps/math"}}\n' > "$tmp_pkg_dir/weft.pkg"
 printf 'fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
 printf 'use "math/lib.weft"\nfn main() -> i64 { if add(40, 2) == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_dir/app.weft"
-(cd "$tmp_pkg_dir" && "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
+(cd "$tmp_pkg_dir" && run_weft_compile_guarded "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
 chmod +x "$tmp_pkg_dir/app"
-"$tmp_pkg_dir/app"
+run_binary_guarded "$tmp_pkg_dir/app"
 echo "  ok package_local_dep_import_compiles"
 
 mkdir -p "$tmp_pkg_dir/.weft/cache/math"
 printf 'fn cached_value() -> i64 { 1 }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
 printf 'fn cached_value() -> i64 { 42 }\n' > "$tmp_pkg_dir/.weft/cache/math/lib.weft"
 printf 'use "math/lib.weft"\nfn main() -> i64 { if cached_value() == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_dir/app.weft"
-(cd "$tmp_pkg_dir" && "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
+(cd "$tmp_pkg_dir" && run_weft_compile_guarded "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
 chmod +x "$tmp_pkg_dir/app"
-"$tmp_pkg_dir/app"
+run_binary_guarded "$tmp_pkg_dir/app"
 echo "  ok package_cache_hit_prefers_cached_file"
 
 outside_name=$(basename "$tmp_outside_dir")
 printf 'fn hidden() -> i64 { 0 }\n' > "$tmp_outside_dir/lib.weft"
 printf 'package app\ndep evil ../%s\n' "$outside_name" > "$tmp_pkg_dir/weft.pkg"
 printf 'use "evil/lib.weft"\nfn main() -> i64 { hidden() }\n' > "$tmp_pkg_dir/app.weft"
-traversal_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1)
+traversal_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
 assert_contains "package_rejects_traversal_dep_path" "$traversal_out" "type error: unknown function"
 
 printf 'package app\ndep math deps/math 1.0.0\n' > "$tmp_pkg_dir/weft.pkg"
 printf 'use "math/lib.weft"\nfn main() -> i64 { add(1, 2) }\n' > "$tmp_pkg_dir/app.weft"
-unsupported_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1)
+unsupported_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
 assert_contains "package_rejects_unsupported_version_token" "$unsupported_out" "type error: unknown function"
 
 mkdir -p "$tmp_pkg_cli_dir/deps/math"
@@ -870,9 +935,9 @@ pkg_manifest=$(< "$tmp_pkg_cli_dir/weft.pkg")
 assert_contains "pkg_add_manifest_dep" "$pkg_manifest" '"math":"deps/math"'
 printf 'fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp_pkg_cli_dir/deps/math/lib.weft"
 printf 'use "math/lib.weft"\nfn main() -> i64 { if add(40, 2) == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_cli_dir/app.weft"
-(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
+(cd "$tmp_pkg_cli_dir" && run_weft_compile_guarded "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
 chmod +x "$tmp_pkg_cli_dir/app"
-"$tmp_pkg_cli_dir/app"
+run_binary_guarded "$tmp_pkg_cli_dir/app"
 echo "  ok pkg_add_dependency_compiles"
 
 if duplicate_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg add math deps/other 2>&1); then
@@ -904,31 +969,31 @@ else
 fi
 
 printf 'test "plain" { Test.assert_eq(1, 1) }\n' > "$tmp_src"
-"$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_binds_runtime_without_missing_symbols" "$tmp_err" "required runtime function unavailable"
 chmod +x "$tmp_bin"
-"$tmp_bin"
+run_binary_guarded "$tmp_bin"
 echo "  ok test_harness_binds_runtime_after_synthesis"
 
 printf 'test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.forall_i64_range(0, 3, x => x < 3) Test.assert_eq(Test.with_state_i64(4, () => State.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => Fail.fail(5)), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
-"$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_supports_assertion_helpers" "$tmp_err" "unknown effect operation"
 chmod +x "$tmp_bin"
-"$tmp_bin"
+run_binary_guarded "$tmp_bin"
 echo "  ok test_assertion_helpers_pass"
 
 printf 'test "path" { Test.assert_eq(21 + 21, 42) }\n' > "$tmp_src"
-"$WEFT" test "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+run_weft_compile_guarded "$WEFT" test "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_path_compiles_strict_source" "$tmp_err" "type error:"
 chmod +x "$tmp_bin"
-"$tmp_bin"
+run_binary_guarded "$tmp_bin"
 echo "  ok test_path_binary_runs"
 
 printf 'test "raw" { let p = __bump_alloc(8) Test.assert_eq(p, p) }\n' > "$tmp_src"
-test_path_raw_out=$("$WEFT" test "$tmp_src" > "$tmp_bin" 2>"$tmp_err" || true; cat "$tmp_err")
+test_path_raw_out=$(run_weft_compile_guarded "$WEFT" test "$tmp_src" > "$tmp_bin" 2>"$tmp_err" || true; cat "$tmp_err")
 assert_contains "test_path_rejects_root_raw_memory" "$test_path_raw_out" "type error: raw allocation is sealed to trusted runtime/platform code"
 
-test_stdin_raw_out=$("$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err" || true; cat "$tmp_err")
+test_stdin_raw_out=$(run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err" || true; cat "$tmp_err")
 assert_contains "test_stdin_rejects_root_raw_memory" "$test_stdin_raw_out" "type error: raw allocation is sealed to trusted runtime/platform code"
 
 printf 'fn leaked() -> i64 { __mem_load64(0) }\n' > "$tmp_compiler_probe"
@@ -984,9 +1049,9 @@ for ((i = 0; i < 1800; i++)); do
 done
 large_test_check_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_reads_large_test_harness" "$large_test_check_out" "0 errors"
-"$WEFT" test < "$tmp_src" > "$tmp_bin" 2>/dev/null
+run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>/dev/null
 chmod +x "$tmp_bin"
-"$tmp_bin"
+run_binary_guarded "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
 echo "Tool boundary summary: 257 passed, 0 failed"
