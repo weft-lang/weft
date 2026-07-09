@@ -16162,6 +16162,45 @@ fn pipeline_ir_native_pinned_slot_add_candidate(pinned: i64, slot: i64) -> i64 {
   pipeline_ir_native_pinned_slot_add_candidate_kind(pinned, slot, pipeline_ir_native_pinned_slot_kind_generic())
 }
 
+-- Adjacent def-use load forwarding. A mutable cell at the head of the
+-- pinned list records the last spilled value together with the register it
+-- was stored FROM and the code position after the store. A later operand
+-- load may reuse that register only if the code buffer has not grown since
+-- (the register is provably untouched). Only the last-loaded operand path
+-- (load_rhs) consumes forwards, so an earlier operand's forwarded register
+-- cannot be clobbered by a subsequent operand load in the same instruction.
+fn pipeline_ir_native_forward_marker() -> i64 { 0 - 987654321 }
+
+fn pipeline_ir_native_pinned_with_forward(pinned: i64) -> i64 {
+  node_new(0, pipeline_ir_native_forward_marker(), 0 - 1, pinned, 0)
+}
+
+fn pipeline_ir_native_forward_cell(pinned: i64) -> i64 {
+  if pinned != 0 and node_f1(pinned) == pipeline_ir_native_forward_marker() { pinned } else { 0 }
+}
+
+fn pipeline_ir_native_forward_record(pinned: i64, code: i64, value: i64, phys: i64) -> i64 {
+  let cell = pipeline_ir_native_forward_cell(pinned)
+  if cell == 0 { 0 }
+  else {
+    mem_store64_at(cell, 16, value)
+    mem_store64_at(cell, 32, buf_len(code) * 64 + phys)
+    0
+  }
+}
+
+fn pipeline_ir_native_forward_hit(pinned: i64, code: i64, value: i64) -> i64 {
+  let cell = pipeline_ir_native_forward_cell(pinned)
+  if cell == 0 { 0 }
+  else {
+    if node_f2(cell) == value {
+      let packed = node_f4(cell)
+      let pos = packed / 64
+      if pos == buf_len(code) { packed - pos * 64 } else { 0 }
+    } else { 0 }
+  }
+}
+
 fn pipeline_ir_native_load_reg(code: i64, pinned: i64, value: i64) -> i64 {
   let phys = pipeline_ir_native_pinned_slot_lookup(pinned, value)
   if phys != 0 { phys } else { emit_load_reg(code, value) }
@@ -16178,6 +16217,10 @@ fn pipeline_ir_native_store_reg_pinned(code: i64, pinned: i64, dst: i64, phys: i
     bu32(code, encode_add_imm(pinned_phys, phys, 0))
   } else {
     pipeline_ir_native_store_reg(code, dst, phys)
+    -- Only x17-resident results are forwardable: the spill-load and
+    -- multi-instruction op scratch paths clobber x15/x16 but never x17
+    -- before operands are read.
+    if dst >= 8 and phys == 17 { pipeline_ir_native_forward_record(pinned, code, dst, phys) } else { 0 }
   }
 }
 
@@ -16565,8 +16608,13 @@ fn pipeline_ir_native_emit_const(code: i64, dst: i64, value: i64, pinned: i64) -
 }
 
 fn pipeline_ir_native_emit_binary(code: i64, dst: i64, op: IrBinaryOp, lhs: i64, rhs: i64, pinned: i64) -> i64 {
-  let lp = pipeline_ir_native_load_reg(code, pinned, lhs)
-  let rp = pipeline_ir_native_load_rhs(code, pinned, rhs)
+  -- Capture the forward before any operand load emits code. The spill loads
+  -- use x16 for lhs, so a value forwarded in x17 survives the other
+  -- operand's load regardless of which side it feeds.
+  let fwd_l = pipeline_ir_native_forward_hit(pinned, code, lhs)
+  let fwd_r = if fwd_l != 0 { 0 } else { pipeline_ir_native_forward_hit(pinned, code, rhs) }
+  let lp = if fwd_l != 0 { fwd_l } else { pipeline_ir_native_load_reg(code, pinned, lhs) }
+  let rp = if fwd_r != 0 { fwd_r } else { if fwd_l != 0 and rhs == lhs { fwd_l } else { if fwd_l != 0 { pipeline_ir_native_load_reg(code, pinned, rhs) } else { pipeline_ir_native_load_rhs(code, pinned, rhs) } } }
   cg_binop_emit(code, ir_binary_op_tag(op), 17, lp, rp)
   pipeline_ir_native_store_reg_pinned(code, pinned, dst, 17)
 }
@@ -18951,7 +18999,7 @@ fn pipeline_ir_native_emit_lambda(code: i64, dst: i64, params: ParamList, body: 
     } else {
       pipeline_ir_native_lambda_scope(params, free_vars, nfree, scope, src)
     }
-    let lambda_pinned = pipeline_ir_native_pinned_slot_none()
+    let lambda_pinned = pipeline_ir_native_pinned_with_forward(pipeline_ir_native_pinned_slot_none())
     let temp_base = pipeline_ir_function_next_value(next_value, blocks) + 8
     let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, body_scope, src, fm, PipelineNativeHandlerCtxNil, fns, f64_slots, pipeline_ir_native_f64_facts_gpr_values(f64_facts), pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, lambda_pinned, temp_base))
     let labels = pipeline_ir_native_label_map_add(pipeline_ir_native_cfg_state_labels(state), pipeline_ir_native_epilogue_label(), buf_len(code))
@@ -20903,9 +20951,10 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         } else { 0 }
         emit_prologue_current(code, fm)
         pipeline_cg_ir_only_params_from_regs(code, param_count)
-        let pinned = pipeline_ir_native_pinned_slot_for_function(irf)
-        fmap_add_ir_native_pinned_slot_count(fm, pipeline_ir_native_pinned_slot_count(pinned))
-        fmap_add_ir_native_loop_pinned_slot_count(fm, pipeline_ir_native_pinned_slot_kind_count(pinned, pipeline_ir_native_pinned_slot_kind_loop()))
+        let raw_pinned = pipeline_ir_native_pinned_slot_for_function(irf)
+        fmap_add_ir_native_pinned_slot_count(fm, pipeline_ir_native_pinned_slot_count(raw_pinned))
+        fmap_add_ir_native_loop_pinned_slot_count(fm, pipeline_ir_native_pinned_slot_kind_count(raw_pinned, pipeline_ir_native_pinned_slot_kind_loop()))
+        let pinned = pipeline_ir_native_pinned_with_forward(raw_pinned)
         fmap_add_loop_addr_recur_count(fm, pipeline_ir_native_scaled_recur_count_for_blocks(blocks))
         let temp_base = pipeline_ir_function_next_value(param_count, blocks) + 8
         let base_scope = pipeline_ir_native_scope_from_entry_param_binds(blocks, param_count)
