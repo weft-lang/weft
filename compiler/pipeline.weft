@@ -840,6 +840,12 @@ fn pipeline_native_fp_resident_count(native: NativeModule) -> i64 {
   }
 }
 
+fn pipeline_native_bank_swap_count(native: NativeModule) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_ir_native_bank_swap_count(fm)
+  }
+}
+
 -- Residency metrics (2l): pure post-scans over the emitted code buffer.
 -- These measure sp-based memory traffic in the artifact itself rather than
 -- relying on emission-site counters, so every emitter path is covered.
@@ -16535,7 +16541,10 @@ fn pipeline_ir_native_load_reg(code: i64, pinned: i64, value: i64) -> i64 {
   if phys >= 1000 {
     bu32(code, encode_brk(20))
     17
-  } else { if phys != 0 { phys } else { emit_load_reg(code, value) } }
+  } else { if phys < 0 {
+    emit_load_spill_offset(code, 16, (0 - phys - 1) * 8)
+    16
+  } else { if phys != 0 { phys } else { emit_load_reg(code, value) } } }
 }
 
 fn pipeline_ir_native_load_rhs(code: i64, pinned: i64, value: i64) -> i64 {
@@ -16543,13 +16552,18 @@ fn pipeline_ir_native_load_rhs(code: i64, pinned: i64, value: i64) -> i64 {
   if phys >= 1000 {
     bu32(code, encode_brk(20))
     17
-  } else { if phys != 0 { phys } else { emit_load_rhs(code, value) } }
+  } else { if phys < 0 {
+    emit_load_spill_offset(code, 17, (0 - phys - 1) * 8)
+    17
+  } else { if phys != 0 { phys } else { emit_load_rhs(code, value) } } }
 }
 
 fn pipeline_ir_native_store_reg_pinned(code: i64, pinned: i64, dst: i64, phys: i64) -> i64 {
   let pinned_phys = pipeline_ir_native_pinned_slot_lookup(pinned, dst)
   if pinned_phys >= 1000 {
     bu32(code, encode_brk(20))
+  } else { if pinned_phys < 0 {
+    emit_store_spill_offset(code, phys, (0 - pinned_phys - 1) * 8)
   } else { if pinned_phys != 0 {
     bu32(code, encode_add_imm(pinned_phys, phys, 0))
   } else {
@@ -16558,7 +16572,7 @@ fn pipeline_ir_native_store_reg_pinned(code: i64, pinned: i64, dst: i64, phys: i
     -- multi-instruction op scratch paths clobber x15/x16 but never x17
     -- before operands are read.
     if dst >= 8 and phys == 17 { pipeline_ir_native_forward_record(pinned, code, dst, phys) } else { 0 }
-  } }
+  } } }
 }
 
 fn pipeline_ir_native_fp_env_empty() -> PipelineIrNativeFpEnv {
@@ -16953,15 +16967,16 @@ fn pipeline_ir_native_emit_ptr_store(code: i64, dst: i64, ptr: i64, value: i64, 
 fn pipeline_ir_native_result_reg(dst: i64, pinned: i64) -> i64 {
   let pinned_phys = pipeline_ir_native_pinned_slot_lookup(pinned, dst)
   if pinned_phys >= 1000 { 17 }
+  else { if pinned_phys < 0 { 17 }
   else { if pinned_phys != 0 { pinned_phys }
-  else { if dst >= 0 and dst < 8 { dst + 19 } else { 17 } } }
+  else { if dst >= 0 and dst < 8 { dst + 19 } else { 17 } } } }
 }
 
 fn pipeline_ir_native_emit_const(code: i64, dst: i64, value: i64, pinned: i64) -> i64 {
   let rd = pipeline_ir_native_result_reg(dst, pinned)
   emit_mov_imm_safe(code, rd, value)
   if rd == 17 {
-    if dst >= 8 { emit_store_reg(code, dst, 17) } else { 0 }
+    if dst >= 0 { pipeline_ir_native_store_reg_pinned(code, pinned, dst, 17) } else { 0 }
   } else { 0 }
 }
 
@@ -18746,7 +18761,11 @@ fn pipeline_ir_native_emit_intrinsic_call(code: i64, dst: i64, callee_hash: i64,
     cg_patch_b_cond(code, ok_pos, 3, buf_len(code))
     bu32(code, encode_add_imm(17, 0, 0))
     let syscall_pinned_result_phys = pipeline_ir_native_pinned_slot_lookup(pinned, dst)
-    if syscall_pinned_result_phys != 0 {
+    if syscall_pinned_result_phys >= 1000 {
+      bu32(code, encode_brk(20))
+    } else { if syscall_pinned_result_phys < 0 {
+      emit_store_spill_offset(code, 17, (0 - syscall_pinned_result_phys - 1) * 8)
+    } else { if syscall_pinned_result_phys != 0 {
       bu32(code, encode_add_imm(syscall_pinned_result_phys, 17, 0))
     } else {
       if dst < 0 { 0 }
@@ -18755,7 +18774,7 @@ fn pipeline_ir_native_emit_intrinsic_call(code: i64, dst: i64, callee_hash: i64,
       } else {
         emit_store_reg(code, dst, 17)
       } }
-    }
+    } } }
   } else { if kind == 23 {
     pipeline_ir_native_emit_mem_load_sized_result(code)
   } else { if kind == 24 {
@@ -21320,6 +21339,43 @@ fn pipeline_ir_native_resident_inst_call_def(inst: IrInst) -> i64 {
   }
 }
 
+-- Lambda emission materialises its closure and env through direct
+-- (identity-home) register helpers, so functions containing lambdas keep
+-- identity bank homes: the swap permutation bails on them.
+fn pipeline_ir_native_inst_is_lambda(inst: IrInst) -> i64 {
+  match inst {
+    IrLambdaI64(dst, params, body, nparams, captures) -> 1
+    _ -> 0
+  }
+}
+
+fn pipeline_ir_native_blocks_have_lambdas(blocks: IrBlockList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          let mut cur = insts
+          let mut found = 0
+          let mut done = 0
+          while done == 0 {
+            match cur {
+              IrInstNil -> { done = 1 }
+              IrInstCons(inst, tail) -> {
+                if pipeline_ir_native_inst_is_lambda(inst) == 1 {
+                  found = 1
+                  done = 1
+                } else { cur = tail }
+              }
+            }
+          }
+          if found == 1 { 1 } else { pipeline_ir_native_blocks_have_lambdas(rest) }
+        }
+      }
+    }
+  }
+}
+
 fn pipeline_ir_native_blocks_have_handles(blocks: IrBlockList) -> i64 {
   match blocks {
     IrBlockListNil -> 0
@@ -21347,12 +21403,15 @@ fn pipeline_ir_native_blocks_have_handles(blocks: IrBlockList) -> i64 {
   }
 }
 
-fn pipeline_ir_native_resident_mark_slot_like(inst: IrInst, slot_like: i64, next_value: i64) -> i64 {
+fn pipeline_ir_native_resident_mark_slot_like(inst: IrInst, slot_like: i64, addr_taken: i64, next_value: i64) -> i64 {
   match inst {
     IrSlotI64(slot) -> if slot >= 0 and slot < next_value { pipeline_ir_native_resident_dense_set(slot_like, slot, 1) } else { 0 }
     IrLoadI64(dst, slot) -> if slot >= 0 and slot < next_value { pipeline_ir_native_resident_dense_set(slot_like, slot, 1) } else { 0 }
     IrStoreI64(slot, value) -> if slot >= 0 and slot < next_value { pipeline_ir_native_resident_dense_set(slot_like, slot, 1) } else { 0 }
-    IrAddressOfSlotI64(dst, slot) -> if slot >= 0 and slot < next_value { pipeline_ir_native_resident_dense_set(slot_like, slot, 1) } else { 0 }
+    IrAddressOfSlotI64(dst, slot) -> if slot >= 0 and slot < next_value {
+      pipeline_ir_native_resident_dense_set(slot_like, slot, 1)
+      pipeline_ir_native_resident_dense_set(addr_taken, slot, 1)
+    } else { 0 }
     _ -> 0
   }
 }
@@ -21360,10 +21419,11 @@ fn pipeline_ir_native_resident_mark_slot_like(inst: IrInst, slot_like: i64, next
 -- Dense scan arrays, bundled to keep signatures small:
 -- 0 def_pos, 1 def_block, 2 def_simple, 3 last_use, 4 use_local,
 -- 5 use_gpr_ok, 6 use_fp_ok, 7 use_seen, 8 slot_like, 9 fp_def
-fn pipeline_ir_native_resident_record_use(u: i64, gpos: i64, block_id: i64, simple: i64, fp_allowed: i64, next_value: i64, arrays: i64) -> i64 {
+fn pipeline_ir_native_resident_record_use(u: i64, gpos: i64, block_id: i64, simple: i64, fp_allowed: i64, next_value: i64, arrays: i64, w: i64) -> i64 {
   if u >= 0 and u < next_value {
     pipeline_ir_native_resident_dense_set(nlist_get(arrays, 7), u, 1)
     pipeline_ir_native_resident_dense_set(nlist_get(arrays, 3), u, gpos)
+    pipeline_ir_native_resident_dense_set(nlist_get(arrays, 10), u, nlist_get(nlist_get(arrays, 10), u) + w)
     if simple == 0 { pipeline_ir_native_resident_dense_set(nlist_get(arrays, 5), u, 0) } else { 0 }
     if fp_allowed == 0 { pipeline_ir_native_resident_dense_set(nlist_get(arrays, 6), u, 0) } else { 0 }
     if nlist_get(nlist_get(arrays, 0), u) < 0 { pipeline_ir_native_resident_dense_set(nlist_get(arrays, 4), u, 0) }
@@ -21372,12 +21432,12 @@ fn pipeline_ir_native_resident_record_use(u: i64, gpos: i64, block_id: i64, simp
   } else { 0 }
 }
 
-fn pipeline_ir_native_resident_record_use_set(uses: PipelineIrLiveSet, gpos: i64, block_id: i64, simple: i64, fp_allowed: i64, next_value: i64, arrays: i64) -> i64 {
+fn pipeline_ir_native_resident_record_use_set(uses: PipelineIrLiveSet, gpos: i64, block_id: i64, simple: i64, fp_allowed: i64, next_value: i64, arrays: i64, w: i64) -> i64 {
   match uses {
     PipelineIrLiveSetNil -> 0
     PipelineIrLiveSetCons(u, rest) -> {
-      pipeline_ir_native_resident_record_use(u, gpos, block_id, simple, fp_allowed, next_value, arrays)
-      pipeline_ir_native_resident_record_use_set(rest, gpos, block_id, simple, fp_allowed, next_value, arrays)
+      pipeline_ir_native_resident_record_use(u, gpos, block_id, simple, fp_allowed, next_value, arrays, w)
+      pipeline_ir_native_resident_record_use_set(rest, gpos, block_id, simple, fp_allowed, next_value, arrays, w)
     }
     PipelineIrLiveSetBits(array, words, count) -> 0
   }
@@ -21527,7 +21587,9 @@ fn pipeline_ir_native_resident_regions(blocks: IrBlockList) -> i64 {
   let jump_pred = pipeline_ir_native_resident_dense_new(n, 0 - 1)
   pipeline_ir_native_resident_count_preds(blocks, pred_count, jump_pred, max_id)
   let region_of = pipeline_ir_native_resident_dense_new(n, 0 - 1)
+  let layout_pos = pipeline_ir_native_resident_dense_new(n, 0 - 1)
   let mut next_region = 0
+  let mut pos = 0
   let mut cur = blocks
   let mut done = 0
   while done == 0 {
@@ -21536,6 +21598,8 @@ fn pipeline_ir_native_resident_regions(blocks: IrBlockList) -> i64 {
       IrBlockListCons(block, rest) -> {
         match block {
           IrBlock(id, params, insts, term) -> {
+            pipeline_ir_native_resident_dense_set(layout_pos, id, pos)
+            pos = pos + 1
             let jp = nlist_get(jump_pred, id)
             let chained = if nlist_get(pred_count, id) == 1 and jp >= 0 {
               if nlist_get(region_of, jp) >= 0 { 1 } else { 0 }
@@ -21552,7 +21616,57 @@ fn pipeline_ir_native_resident_regions(blocks: IrBlockList) -> i64 {
       }
     }
   }
-  region_of
+  node_new(0, region_of, layout_pos, pos, 0)
+}
+
+-- Loop depth per layout position: a backedge is any terminator target at
+-- or before its source in layout order; a block's depth is the number of
+-- backedge spans covering it. Weights use 4^min(depth, 4).
+fn pipeline_ir_native_resident_depths(blocks: IrBlockList, layout_pos: i64, block_count: i64) -> i64 {
+  let depth_of = pipeline_ir_native_resident_dense_new(block_count, 0)
+  let mut cur = blocks
+  let mut done = 0
+  while done == 0 {
+    match cur {
+      IrBlockListNil -> { done = 1 }
+      IrBlockListCons(block, rest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> {
+            let src_pos = nlist_get(layout_pos, id)
+            let target = match term {
+              IrTermJump(t, args) -> t
+              IrTermBranch(cond, tb, eb) -> {
+                -- Treat the earlier of the two targets as the loop edge.
+                let tp = nlist_get(layout_pos, tb)
+                let ep = nlist_get(layout_pos, eb)
+                if tp >= 0 and tp <= src_pos { tb } else { if ep >= 0 and ep <= src_pos { eb } else { 0 - 1 } }
+              }
+              _ -> 0 - 1
+            }
+            if target >= 0 {
+              let tpos = nlist_get(layout_pos, target)
+              if tpos >= 0 and tpos <= src_pos {
+                let mut p = tpos
+                while p <= src_pos {
+                  pipeline_ir_native_resident_dense_set(depth_of, p, nlist_get(depth_of, p) + 1)
+                  p = p + 1
+                }
+              } else { 0 }
+            } else { 0 }
+            cur = rest
+          }
+        }
+      }
+    }
+  }
+  depth_of
+}
+
+fn pipeline_ir_native_resident_weight_for_depth(depth: i64) -> i64 {
+  if depth <= 0 { 1 }
+  else { if depth == 1 { 4 }
+  else { if depth == 2 { 16 }
+  else { if depth == 3 { 64 } else { 256 } } } }
 }
 
 fn pipeline_ir_native_resident_term_uses(term: IrTerminator) -> PipelineIrLiveSet {
@@ -21571,6 +21685,7 @@ fn pipeline_ir_native_resident_pool_reg(index: i64) -> i64 {
 }
 
 fn pipeline_ir_native_pinned_slot_kind_resident() -> i64 { 2 }
+fn pipeline_ir_native_pinned_slot_kind_swap() -> i64 { 3 }
 
 fn pipeline_ir_native_pinned_has_cs_fp(pinned: i64) -> i64 {
   let mut cur = pinned
@@ -21600,6 +21715,8 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
       nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
       nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
+      nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
+      nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
       let def_pos = nlist_get(arrays, 0)
       let def_block = nlist_get(arrays, 1)
       let def_simple = nlist_get(arrays, 2)
@@ -21610,7 +21727,13 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       let use_seen = nlist_get(arrays, 7)
       let slot_like = nlist_get(arrays, 8)
       let fp_def = nlist_get(arrays, 9)
-      let region_of = pipeline_ir_native_resident_regions(blocks)
+      let weight = nlist_get(arrays, 10)
+      let addr_taken = nlist_get(arrays, 11)
+      let region_bundle = pipeline_ir_native_resident_regions(blocks)
+      let region_of = node_f1(region_bundle)
+      let layout_pos = node_f2(region_bundle)
+      let block_count = node_f3(region_bundle)
+      let depth_of = pipeline_ir_native_resident_depths(blocks, layout_pos, block_count)
       let barrier_at = nlist_new()
       let barrier_fp_at = nlist_new()
       let barrier_fp_cs_at = nlist_new()
@@ -21627,6 +21750,7 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
             match block {
               IrBlock(raw_block_id, params, insts, term) -> {
                 let block_id = nlist_get(region_of, raw_block_id)
+                let block_w = pipeline_ir_native_resident_weight_for_depth(nlist_get(depth_of, nlist_get(layout_pos, raw_block_id)))
                 let mut cur = insts
                 let mut done = 0
                 while done == 0 {
@@ -21653,11 +21777,12 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
                           pipeline_ir_native_resident_dense_set(def_simple, d, def_class)
                           pipeline_ir_native_resident_dense_set(fp_def, d, pipeline_ir_native_resident_inst_fp_def(inst, f64_slots))
                         }
+                        pipeline_ir_native_resident_dense_set(weight, d, nlist_get(weight, d) + block_w)
                       } else { 0 }
-                      pipeline_ir_native_resident_mark_slot_like(inst, slot_like, next_value)
+                      pipeline_ir_native_resident_mark_slot_like(inst, slot_like, addr_taken, next_value)
                       let fp_allowed = pipeline_ir_native_resident_inst_fp_use_allowed(inst, f64_slots)
                       let uses = pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty())
-                      pipeline_ir_native_resident_record_use_set(uses, gpos, block_id, simple, fp_allowed, next_value, arrays)
+                      pipeline_ir_native_resident_record_use_set(uses, gpos, block_id, simple, fp_allowed, next_value, arrays, block_w)
                       gpos = gpos + 1
                       cur = tail
                     }
@@ -21667,7 +21792,7 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
                 nlist_add(barrier_fp_at, barrier_fp_cum)
                 nlist_add(barrier_fp_cs_at, barrier_fp_cs_cum)
                 let term_uses = pipeline_ir_native_resident_term_uses(term)
-                pipeline_ir_native_resident_record_use_set(term_uses, gpos, block_id, 1, 0, next_value, arrays)
+                pipeline_ir_native_resident_record_use_set(term_uses, gpos, block_id, 1, 0, next_value, arrays, block_w)
                 gpos = gpos + 1
                 cur_blocks = rest_blocks
               }
@@ -21748,6 +21873,52 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
         }
         v = v + 1
       }
+      -- Bank permutation: the identity value-to-home assignment is
+      -- arbitrary, so any consistent permutation is equally correct.
+      -- Promote the hottest unpinned spill values into x19-x26 by swapping
+      -- homes with the coldest displaceable bank values (never params —
+      -- entry cleanup descriptors key on identity homes — and never
+      -- f64-pinned or already-pinned values). Fiber functions bail: their
+      -- intrinsic arms write x19-x22 as fixed scratch.
+      let mut swaps = 0
+      if pipeline_ir_native_blocks_use_fiber_intrinsics(blocks) == 1 or pipeline_ir_native_blocks_have_lambdas(blocks) == 1 { 0 }
+      else {
+        let mut round = 0
+        while round < 8 {
+          let mut best_v = 0 - 1
+          let mut best_w = 0
+          let mut i = 8
+          while i < next_value {
+            if nlist_get(weight, i) > best_w and pipeline_ir_native_pinned_slot_lookup(pinned, i) == 0 and nlist_get(addr_taken, i) == 0 and pipeline_ir_native_f64_slot_lookup(f64_slots, i) < 0 {
+              best_v = i
+              best_w = nlist_get(weight, i)
+            } else { 0 }
+            i = i + 1
+          }
+          let mut best_k = 0 - 1
+          let mut best_kw = 0
+          let mut kk = param_count
+          while kk < 8 {
+            if kk < next_value and pipeline_ir_native_pinned_slot_lookup(pinned, kk) == 0 and pipeline_ir_native_f64_slot_lookup(f64_slots, kk) < 0 {
+              if best_k < 0 {
+                best_k = kk
+                best_kw = nlist_get(weight, kk)
+              } else { if nlist_get(weight, kk) < best_kw {
+                best_k = kk
+                best_kw = nlist_get(weight, kk)
+              } else { 0 } }
+            } else { 0 }
+            kk = kk + 1
+          }
+          if best_v >= 0 and best_k >= 0 and best_w > best_kw * 2 + 8 {
+            pinned = pipeline_ir_native_pinned_slot_new(best_v, 19 + best_k, pipeline_ir_native_pinned_slot_kind_swap(), pinned)
+            pinned = pipeline_ir_native_pinned_slot_new(best_k, 0 - (best_v - 8) - 1, pipeline_ir_native_pinned_slot_kind_swap(), pinned)
+            swaps = swaps + 1
+            round = round + 1
+          } else { round = 8 }
+        }
+      }
+      fmap_add_ir_native_bank_swap_count(fm, swaps)
       fmap_add_ir_native_volatile_resident_count(fm, assigned)
       fmap_add_ir_native_fp_resident_count(fm, fp_assigned)
       pinned
@@ -21800,9 +21971,11 @@ fn pipeline_ir_function_src(irf: IrFunction) -> i64 {
   }
 }
 
-fn pipeline_cg_ir_only_params_from_regs(code: i64, param_count: i64) -> i64 {
+fn pipeline_cg_ir_only_params_from_regs(code: i64, param_count: i64, pinned: i64) -> i64 {
+  -- Params arrive in x0..x7; their homes may be reassigned by the bank
+  -- permutation, so the stores go through the pinned-aware path.
   for i in 0..param_count {
-    pipeline_ir_native_store_reg(code, i, i)
+    pipeline_ir_native_store_reg_pinned(code, pinned, i, i)
   }
 }
 
@@ -21953,7 +22126,7 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
           fmap_inc_fp_preserve_function_count(fm)
         } else { 0 }
         emit_prologue_current(code, fm)
-        pipeline_cg_ir_only_params_from_regs(code, param_count)
+        pipeline_cg_ir_only_params_from_regs(code, param_count, resident_pinned)
         fmap_add_loop_addr_recur_count(fm, pipeline_ir_native_scaled_recur_count_for_blocks(blocks))
         let temp_base = pipeline_ir_function_next_value(param_count, blocks) + 8
         let base_scope = pipeline_ir_native_scope_from_entry_param_binds(blocks, param_count)
