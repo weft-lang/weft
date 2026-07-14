@@ -1682,6 +1682,35 @@ fn pipeline_fns_index_insert(tree: i64, hash: i64, pair: i64) -> i64 {
   }
 }
 
+fn pipeline_fns_index_insert_replace(tree: i64, hash: i64, pair: i64) -> i64 {
+  -- Last-wins variant for generic templates, matching the linear scan
+  -- that kept overwriting its result to the end of the list.
+  let leaf = node_new(0, hash, pair, 0, 0)
+  if tree == 0 { leaf }
+  else {
+    let mut cur = tree
+    let mut done = 0
+    while done == 0 {
+      let cur_hash = node_f1(cur)
+      if hash < cur_hash {
+        if node_f3(cur) == 0 {
+          mem_store64_at(cur, 24, leaf)
+          done = 1
+        } else { cur = node_f3(cur) }
+      } else { if hash > cur_hash {
+        if node_f4(cur) == 0 {
+          mem_store64_at(cur, 32, leaf)
+          done = 1
+        } else { cur = node_f4(cur) }
+      } else {
+        mem_store64_at(cur, 16, pair)
+        done = 1
+      } }
+    }
+    tree
+  }
+}
+
 fn pipeline_fns_index_probe(tree: i64, hash: i64) -> i64 {
   let mut cur = tree
   let mut result = 0
@@ -1697,17 +1726,24 @@ fn pipeline_fns_index_probe(tree: i64, hash: i64) -> i64 {
 
 fn pipeline_fns_index_magic() -> i64 { 762342361276 }
 
-fn pipeline_fns_index(fns: i64) -> i64 {
-  -- The cache node may die in a bump rollback while the list header
-  -- survives; rolled-back memory is zeroed (or reused), so validity
-  -- requires the length, the owning list pointer, and a magic to all
-  -- match before the tree is trusted.
+-- One walk builds three trees: function names (first-wins), method pairs
+-- keyed by the (type, method) patch key (first-wins), and generic
+-- templates (last-wins). The cache node may die in a bump rollback while
+-- the list header survives; rolled-back memory is zeroed (or reused), so
+-- validity requires the length, the owning list pointer, and a magic to
+-- all match before the trees are trusted.
+fn pipeline_fns_index_bundle(fns: i64) -> i64 {
   let cached = mem_load64_at(fns, 24)
   let n = nlist_len(fns)
-  if cached != 0 and node_f2(cached) == n and node_f3(cached) == fns and node_f4(cached) == pipeline_fns_index_magic() {
-    node_f1(cached)
-  } else {
-    let mut tree = 0
+  let aux_ok = if cached != 0 {
+    let aux = node_f4(cached)
+    if aux != 0 and node_f1(aux) == n and node_f2(aux) == fns and node_f3(aux) == pipeline_fns_index_magic() { 1 } else { 0 }
+  } else { 0 }
+  if aux_ok == 1 { cached }
+  else {
+    let mut name_tree = 0
+    let mut method_tree = 0
+    let mut template_tree = 0
     let mut i = 0
     while i < n {
       let pair = nlist_get(fns, i)
@@ -1715,13 +1751,25 @@ fn pipeline_fns_index(fns: i64) -> i64 {
       if pipeline_decl_node_is_function(fn_wrap) == 1 {
         let inner = pipeline_fn_inner(fn_wrap)
         let fn_src = node_f2(pair)
-        tree = pipeline_fns_index_insert(tree, str_hash(fn_src, node_f1(inner), node_f2(inner)), pair)
+        let name_hash = str_hash(fn_src, node_f1(inner), node_f2(inner))
+        name_tree = pipeline_fns_index_insert(name_tree, name_hash, pair)
+        if node_f3(pair) != 0 {
+          method_tree = pipeline_fns_index_insert(method_tree, pipeline_ir_method_patch_key(node_f3(pair), name_hash), pair)
+        } else { 0 }
+        if fn_tparams(fn_wrap) != 0 {
+          template_tree = pipeline_fns_index_insert_replace(template_tree, name_hash, pair)
+        } else { 0 }
       } else { 0 }
       i = i + 1
     }
-    mem_store64_at(fns, 24, node_new(0, tree, n, fns, pipeline_fns_index_magic()))
-    tree
+    let bundle = node_new(0, name_tree, method_tree, template_tree, node_new(0, n, fns, pipeline_fns_index_magic(), 0))
+    mem_store64_at(fns, 24, bundle)
+    bundle
   }
+}
+
+fn pipeline_fns_index(fns: i64) -> i64 {
+  node_f1(pipeline_fns_index_bundle(fns))
 }
 
 fn pipeline_fns_lookup_pair_by_hash(fns: i64, target_hash: i64) -> i64 {
@@ -8907,20 +8955,7 @@ fn pipeline_call_borrowable_param_mask(fns: i64, src: i64, ns: i64, nl: i64, par
 fn pipeline_fns_lookup_method_pair(fns: i64, type_hash: i64, method_hash: i64) -> i64 {
   if pipeline_fns_fact_list_valid(fns) == 0 { 0 }
   else {
-    let mut result = 0
-    let n = nlist_len(fns)
-    for i in 0..n {
-      let pair = nlist_get(fns, i)
-      let fn_wrap = node_f1(pair)
-      if result == 0 and node_f3(pair) == type_hash and pipeline_decl_node_is_function(fn_wrap) == 1 {
-        let inner = pipeline_fn_inner(fn_wrap)
-        let fn_src = node_f2(pair)
-        if str_hash(fn_src, node_f1(inner), node_f2(inner)) == method_hash {
-          result = pair
-        } else { 0 }
-      } else { 0 }
-    }
-    result
+    pipeline_fns_index_probe(node_f2(pipeline_fns_index_bundle(fns)), pipeline_ir_method_patch_key(type_hash, method_hash))
   }
 }
 
@@ -12742,28 +12777,11 @@ fn pipeline_match_arms_result_is_any_param_borrow_typed(arms: MatchArmList, para
 }
 
 fn pipeline_fns_lookup_returns_param_borrow_by_hash(fns: i64, target_hash: i64) -> i64 {
-  if pipeline_fns_fact_list_valid(fns) == 0 { 0 }
+  let pair = pipeline_fns_lookup_pair_by_hash(fns, target_hash)
+  if pair == 0 { 0 }
   else {
-    let n = nlist_len(fns)
-    let mut i = 0
-    let mut result = 0
-    while i < n {
-      let pair = nlist_get(fns, i)
-      let fn_src = node_f2(pair)
-      let fn_wrap = node_f1(pair)
-      if pipeline_decl_node_is_function(fn_wrap) == 1 {
-        let inner = pipeline_fn_inner(fn_wrap)
-        if str_hash(fn_src, node_f1(inner), node_f2(inner)) == target_hash {
-          result = pipeline_expr_result_is_any_param_borrow_typed(expr_from_node(node_f4(inner)), node_f3(inner), fn_src)
-          i = n
-        } else {
-          i = i + 1
-        }
-      } else {
-        i = i + 1
-      }
-    }
-    result
+    let inner = pipeline_fn_inner(node_f1(pair))
+    pipeline_expr_result_is_any_param_borrow_typed(expr_from_node(node_f4(inner)), node_f3(inner), node_f2(pair))
   }
 }
 
@@ -15176,23 +15194,7 @@ fn pipeline_ir_function_list_dedup(functions: IrFunctionList) -> IrFunctionList 
 fn pipeline_generic_template_find(fns: i64, user_src: i64, name_hash: i64) -> i64 {
   if pipeline_fns_fact_list_valid(fns) == 0 { 0 }
   else {
-    let mut result = 0
-    let n = nlist_len(fns)
-    for i in 0..n {
-      let pair = nlist_get(fns, i)
-      let fn_src = node_f2(pair)
-      let fn_wrap = node_f1(pair)
-      if pipeline_decl_node_is_function(fn_wrap) == 1 {
-        let inner = pipeline_fn_inner(fn_wrap)
-        let h = str_hash(fn_src, node_f1(inner), node_f2(inner))
-        if h == name_hash {
-          if fn_tparams(fn_wrap) != 0 {
-            result = pair
-          } else { 0 }
-        } else { 0 }
-      } else { 0 }
-    }
-    result
+    pipeline_fns_index_probe(node_f3(pipeline_fns_index_bundle(fns)), name_hash)
   }
 }
 
