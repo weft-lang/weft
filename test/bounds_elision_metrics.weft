@@ -1,0 +1,97 @@
+-- test/bounds_elision_metrics.weft -- fact-driven vector bounds-check
+-- elision: soundness locks and coverage tripwires.
+--
+-- probe_modes encodes the distribution of vector get/set check modes
+-- across the optimised IR of a probe source: one byte per check_mode
+-- value (bits: 1 = non-null proven, 2 = lower bound proven,
+-- 4 = upper bound proven; a set bit means the runtime check is
+-- ELIDED). The stdlib wrapper specialisations contribute one mode-0
+-- op each; call sites are tiny-inlined and carry the tightened modes.
+
+use "compiler/codegen.weft"
+use "compiler/typeck.weft"
+use "compiler/macho.weft"
+use "compiler/object.weft"
+use "compiler/ir.weft"
+use "compiler/grammar.weft"
+use "compiler/pipeline.weft"
+use "runtime/unsafe.weft"
+
+fn bounds_probe_ir(src: str) -> IrModule {
+  let typed = pipeline_check_source_with_origin(__str_ptr(src), __str_len(src), 1, 0)
+  let ir = pipeline_lower_ir(typed)
+  pipeline_optimise_typed_ir(typed, ir)
+}
+
+fn bounds_probe_mode_insts(insts: IrInstList, acc: i64) -> i64 {
+  match insts {
+    IrInstNil -> acc
+    IrInstCons(inst, rest) -> {
+      let next = match inst {
+        IrVectorGetI64(dst, vec, index, fallback, check_mode) -> acc + (1 bshl (check_mode * 8))
+        IrVectorSetI64(dst, vec, index, value, check_mode) -> acc + (1 bshl (check_mode * 8))
+        _ -> acc
+      }
+      bounds_probe_mode_insts(rest, next)
+    }
+  }
+}
+
+fn bounds_probe_mode_blocks(blocks: IrBlockList, acc: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> acc
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> bounds_probe_mode_blocks(rest, bounds_probe_mode_insts(insts, acc))
+      }
+    }
+  }
+}
+
+fn bounds_probe_mode_functions(functions: IrFunctionList, acc: i64) -> i64 {
+  match functions {
+    IrFunctionNil -> acc
+    IrFunctionCons(f, rest) -> {
+      match f {
+        IrFunction(hash, params, blocks, src) -> bounds_probe_mode_functions(rest, bounds_probe_mode_blocks(blocks, acc))
+      }
+    }
+  }
+}
+
+fn bounds_probe_modes(src: str) -> i64 {
+  bounds_probe_mode_functions(pipeline_ir_functions(bounds_probe_ir(src)), 0)
+}
+
+test "bounds_shrinking_call_kills_upper_fact" {
+  -- SOUNDNESS LOCK: vector_clear between the length guard and the get
+  -- shrinks the vector; the upper-bound check must NOT be elided.
+  -- Expected: spec bodies at mode 0, and the guarded get keeps its
+  -- upper check (mode 2: only the lower bound stays proven).
+  let src = "use \"stdlib/vector.weft\" fn f(v: i64, i: i64) -> i64 { if i >= 0 { if i < vector_len(v) { vector_clear(v) vector_get<i64>(v, i, 0) } else { 0 } } else { 0 } } fn main() -> i64 { 0 }"
+  let acc = bounds_probe_modes(src)
+  let mode6 = (acc bshr 48) band 255
+  let mode2 = (acc bshr 16) band 255
+  Test.assert_eq(mode6, 0)
+  Test.assert_eq(mode2, 1)
+}
+
+test "bounds_guarded_get_elides_both_checks" {
+  -- Nonnegative guard plus same-expression length guard proves both
+  -- bounds for the get (mode 6); the wrapper spec keeps mode 0.
+  let src = "use \"stdlib/vector.weft\" fn f(v: i64, i: i64) -> i64 { if i >= 0 { if i < vector_len(v) { vector_get<i64>(v, i, 0) } else { 0 } } else { 0 } } fn main() -> i64 { 0 }"
+  Test.assert_eq(bounds_probe_modes(src), 281474976710657)
+}
+
+test "bounds_while_header_len_elides_upper" {
+  -- while i < vector_len(v): the header compare proves the upper bound
+  -- for the body get (mode 4); lower needs induction (not yet proven).
+  let src = "use \"stdlib/vector.weft\" fn f(v: i64) -> i64 { let mut i = 0 let mut s = 0 while i < vector_len(v) { s = s + vector_get<i64>(v, i, 0) i = i + 1 } s } fn main() -> i64 { 0 }"
+  Test.assert_eq(bounds_probe_modes(src), 4294967297)
+}
+
+test "bounds_nonneg_guard_elides_lower_in_loop" {
+  -- if j >= 0 guard inside a loop proves the lower bound (mode 2).
+  let src = "use \"stdlib/vector.weft\" fn f(v: i64, n: i64) -> i64 { let mut j = n let mut s = 0 let mut moving = 1 while moving == 1 { if j >= 0 { s = s + vector_get<i64>(v, j, 0) j = j - 1 } else { moving = 0 } } s } fn main() -> i64 { 0 }"
+  Test.assert_eq(bounds_probe_modes(src), 65537)
+}
