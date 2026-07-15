@@ -24264,14 +24264,65 @@ fn pipeline_ir_block_predecessor_count(blocks: IrBlockList, target: i64) -> i64 
   }
 }
 
-fn pipeline_ir_block_entry_facts_from_block(block: IrBlock, all_blocks: IrBlockList, rest_facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactList {
+-- Dense predecessor-count fact: one pass over the terminators, O(1)
+-- probes. Built once per fact pass instead of rescanning the whole
+-- block list per query.
+fn pipeline_ir_block_pred_count_bump(pc: i64, target: i64) -> i64 {
+  let limit = mem_load64_at(pc, 0)
+  if target >= 0 and target < limit {
+    mem_store64_at(pc + 8 + target * 8, 0, mem_load64_at(pc + 8 + target * 8, 0) + 1)
+  } else { 0 }
+}
+
+fn pipeline_ir_block_pred_counts_accumulate(pc: i64, blocks: IrBlockList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          match term {
+            IrTermJump(target, args) -> pipeline_ir_block_pred_count_bump(pc, target)
+            IrTermBranch(cond, then_block, else_block) -> {
+              pipeline_ir_block_pred_count_bump(pc, then_block)
+              pipeline_ir_block_pred_count_bump(pc, else_block)
+            }
+            _ -> 0
+          }
+        }
+      }
+      pipeline_ir_block_pred_counts_accumulate(pc, rest)
+    }
+  }
+}
+
+fn pipeline_ir_block_pred_counts(blocks: IrBlockList) -> i64 {
+  let limit = pipeline_ir_max_block_id_list(blocks, 0) + 1
+  let pc = alloc_words(limit + 1)
+  mem_store64_at(pc, 0, limit)
+  let mut i = 0
+  while i < limit {
+    mem_store64_at(pc + 8 + i * 8, 0, 0)
+    i = i + 1
+  }
+  pipeline_ir_block_pred_counts_accumulate(pc, blocks)
+  pc
+}
+
+fn pipeline_ir_block_pred_count_get(pc: i64, target: i64) -> i64 {
+  let limit = mem_load64_at(pc, 0)
+  if target >= 0 and target < limit {
+    mem_load64_at(pc + 8 + target * 8, 0)
+  } else { 0 }
+}
+
+fn pipeline_ir_block_entry_facts_from_block(block: IrBlock, all_blocks: IrBlockList, pred_counts: i64, rest_facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactList {
   match block {
     IrBlock(id, params, insts, term) -> {
       match term {
         IrTermBranch(cond, then_block, else_block) -> {
           if then_block != else_block {
-            let then_single_pred = pipeline_ir_block_predecessor_count(all_blocks, then_block) == 1
-            let else_single_pred = pipeline_ir_block_predecessor_count(all_blocks, else_block) == 1
+            let then_single_pred = pipeline_ir_block_pred_count_get(pred_counts, then_block) == 1
+            let else_single_pred = pipeline_ir_block_pred_count_get(pred_counts, else_block) == 1
             if then_single_pred == 0 and else_single_pred == 0 {
               rest_facts
             } else {
@@ -24377,10 +24428,10 @@ fn pipeline_ir_block_entry_facts_from_block(block: IrBlock, all_blocks: IrBlockL
   }
 }
 
-fn pipeline_ir_block_entry_facts_from_blocks_inner(blocks: IrBlockList, all_blocks: IrBlockList, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactList {
+fn pipeline_ir_block_entry_facts_from_blocks_inner(blocks: IrBlockList, all_blocks: IrBlockList, pred_counts: i64, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactList {
   match blocks {
     IrBlockListNil -> facts
-    IrBlockListCons(block, rest) -> pipeline_ir_block_entry_facts_from_blocks_inner(rest, all_blocks, pipeline_ir_block_entry_facts_from_block(block, all_blocks, facts))
+    IrBlockListCons(block, rest) -> pipeline_ir_block_entry_facts_from_blocks_inner(rest, all_blocks, pred_counts, pipeline_ir_block_entry_facts_from_block(block, all_blocks, pred_counts, facts))
   }
 }
 
@@ -24837,10 +24888,10 @@ fn pipeline_ir_block_entry_facts_join_scalar_params(params: IrValueList, index: 
   }
 }
 
-fn pipeline_ir_block_entry_facts_join_block_params(block: IrBlock, all_blocks: IrBlockList, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactAddResult {
+fn pipeline_ir_block_entry_facts_join_block_params(block: IrBlock, all_blocks: IrBlockList, pred_counts: i64, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactAddResult {
   match block {
     IrBlock(id, params, insts, term) -> {
-      if pipeline_ir_block_predecessor_count(all_blocks, id) > 1 {
+      if pipeline_ir_block_pred_count_get(pred_counts, id) > 1 {
         let ctor_joined = pipeline_ir_block_entry_facts_join_ctor_params(params, 0, id, all_blocks, facts, facts)
         let bool_joined = pipeline_ir_block_entry_facts_join_scalar_params(params, 0, id, all_blocks, facts, pipeline_ir_block_entry_fact_add_result_facts(ctor_joined), pipeline_ir_scalar_fact_kind_bool())
         let zero_joined = pipeline_ir_block_entry_facts_join_scalar_params(params, 0, id, all_blocks, facts, pipeline_ir_block_entry_fact_add_result_facts(bool_joined), pipeline_ir_scalar_fact_kind_zero())
@@ -24855,8 +24906,8 @@ fn pipeline_ir_block_entry_facts_join_block_params(block: IrBlock, all_blocks: I
   }
 }
 
-fn pipeline_ir_block_entry_facts_propagate_target(source_block: i64, insts: IrInstList, target_block: i64, args: IrValueList, all_blocks: IrBlockList, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactAddResult {
-  pipeline_ir_block_entry_facts_propagate_target_known(source_block, insts, target_block, args, all_blocks, facts, pipeline_ir_block_predecessor_count(all_blocks, target_block) == 1)
+fn pipeline_ir_block_entry_facts_propagate_target(source_block: i64, insts: IrInstList, target_block: i64, args: IrValueList, all_blocks: IrBlockList, pred_counts: i64, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactAddResult {
+  pipeline_ir_block_entry_facts_propagate_target_known(source_block, insts, target_block, args, all_blocks, facts, pipeline_ir_block_pred_count_get(pred_counts, target_block) == 1)
 }
 
 fn pipeline_ir_block_entry_facts_propagate_target_known(source_block: i64, insts: IrInstList, target_block: i64, args: IrValueList, all_blocks: IrBlockList, facts: PipelineIrBlockEntryFactList, target_single_pred: i64) -> PipelineIrBlockEntryFactAddResult {
@@ -24905,20 +24956,20 @@ fn pipeline_ir_block_entry_facts_add_vector_upper_branch(source_block: i64, inst
   }
 }
 
-fn pipeline_ir_block_entry_facts_propagate_block(block: IrBlock, all_blocks: IrBlockList, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactAddResult {
+fn pipeline_ir_block_entry_facts_propagate_block(block: IrBlock, all_blocks: IrBlockList, pred_counts: i64, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactAddResult {
   match block {
     IrBlock(id, params, insts, term) -> {
-      let joined = pipeline_ir_block_entry_facts_join_block_params(block, all_blocks, facts)
+      let joined = pipeline_ir_block_entry_facts_join_block_params(block, all_blocks, pred_counts, facts)
       let joined_facts = pipeline_ir_block_entry_fact_add_result_facts(joined)
       match term {
         IrTermJump(target, args) -> {
-          let propagated = pipeline_ir_block_entry_facts_propagate_target(id, insts, target, args, all_blocks, joined_facts)
+          let propagated = pipeline_ir_block_entry_facts_propagate_target(id, insts, target, args, all_blocks, pred_counts, joined_facts)
           let changed = if pipeline_ir_block_entry_fact_add_result_changed(joined) == 1 or pipeline_ir_block_entry_fact_add_result_changed(propagated) == 1 { 1 } else { 0 }
           pipeline_ir_block_entry_fact_add_result(pipeline_ir_block_entry_fact_add_result_facts(propagated), changed)
         }
         IrTermBranch(cond, then_block, else_block) -> {
-          let then_single_pred = pipeline_ir_block_predecessor_count(all_blocks, then_block) == 1
-          let else_single_pred = pipeline_ir_block_predecessor_count(all_blocks, else_block) == 1
+          let then_single_pred = pipeline_ir_block_pred_count_get(pred_counts, then_block) == 1
+          let else_single_pred = pipeline_ir_block_pred_count_get(pred_counts, else_block) == 1
           let branch_facts = pipeline_ir_block_entry_facts_add_vector_upper_branch(id, insts, cond, then_block, else_block, joined_facts, then_single_pred, else_single_pred)
           let then_result = pipeline_ir_block_entry_facts_propagate_target_known(id, insts, then_block, ir_value_list_empty(), all_blocks, pipeline_ir_block_entry_fact_add_result_facts(branch_facts), then_single_pred)
           let else_result = pipeline_ir_block_entry_facts_propagate_target_known(id, insts, else_block, ir_value_list_empty(), all_blocks, pipeline_ir_block_entry_fact_add_result_facts(then_result), else_single_pred)
@@ -24931,28 +24982,28 @@ fn pipeline_ir_block_entry_facts_propagate_block(block: IrBlock, all_blocks: IrB
   }
 }
 
-fn pipeline_ir_block_entry_facts_propagate_once(blocks: IrBlockList, all_blocks: IrBlockList, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactAddResult {
+fn pipeline_ir_block_entry_facts_propagate_once(blocks: IrBlockList, all_blocks: IrBlockList, pred_counts: i64, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactAddResult {
   match blocks {
     IrBlockListNil -> pipeline_ir_block_entry_fact_add_result(facts, 0)
     IrBlockListCons(block, rest) -> {
-      let head = pipeline_ir_block_entry_facts_propagate_block(block, all_blocks, facts)
-      let tail = pipeline_ir_block_entry_facts_propagate_once(rest, all_blocks, pipeline_ir_block_entry_fact_add_result_facts(head))
+      let head = pipeline_ir_block_entry_facts_propagate_block(block, all_blocks, pred_counts, facts)
+      let tail = pipeline_ir_block_entry_facts_propagate_once(rest, all_blocks, pred_counts, pipeline_ir_block_entry_fact_add_result_facts(head))
       let changed = if pipeline_ir_block_entry_fact_add_result_changed(head) == 1 or pipeline_ir_block_entry_fact_add_result_changed(tail) == 1 { 1 } else { 0 }
       pipeline_ir_block_entry_fact_add_result(pipeline_ir_block_entry_fact_add_result_facts(tail), changed)
     }
   }
 }
 
-fn pipeline_ir_block_entry_facts_propagate_fixpoint(blocks: IrBlockList, facts: PipelineIrBlockEntryFactList, remaining: i64) -> PipelineIrBlockEntryFactList {
+fn pipeline_ir_block_entry_facts_propagate_fixpoint(blocks: IrBlockList, pred_counts: i64, facts: PipelineIrBlockEntryFactList, remaining: i64) -> PipelineIrBlockEntryFactList {
   if remaining <= 0 {
     facts
   } else {
-    let step = pipeline_ir_block_entry_facts_propagate_once(blocks, blocks, facts)
+    let step = pipeline_ir_block_entry_facts_propagate_once(blocks, blocks, pred_counts, facts)
     let next = pipeline_ir_block_entry_fact_add_result_facts(step)
     if pipeline_ir_block_entry_fact_add_result_changed(step) == 0 {
       next
     } else {
-      pipeline_ir_block_entry_facts_propagate_fixpoint(blocks, next, remaining - 1)
+      pipeline_ir_block_entry_facts_propagate_fixpoint(blocks, pred_counts, next, remaining - 1)
     }
   }
 }
@@ -25008,10 +25059,11 @@ fn pipeline_ir_block_entry_fact_full_block_limit() -> i64 {
 }
 
 fn pipeline_ir_block_entry_facts_from_blocks(blocks: IrBlockList) -> PipelineIrBlockEntryFactList {
-  let seed = pipeline_ir_block_entry_facts_from_blocks_inner(blocks, blocks, pipeline_ir_block_entry_facts_empty())
+  let pred_counts = pipeline_ir_block_pred_counts(blocks)
+  let seed = pipeline_ir_block_entry_facts_from_blocks_inner(blocks, blocks, pred_counts, pipeline_ir_block_entry_facts_empty())
   let block_count = ir_block_list_len(blocks)
   if block_count <= pipeline_ir_block_entry_fact_full_block_limit() {
-    pipeline_ir_block_entry_facts_propagate_fixpoint(blocks, seed, block_count + 1)
+    pipeline_ir_block_entry_facts_propagate_fixpoint(blocks, pred_counts, seed, block_count + 1)
   } else {
     seed
   }
@@ -27093,7 +27145,12 @@ fn pipeline_ir_block_param_const_env_params(params: IrValueList, index: i64, tar
 
 fn pipeline_ir_block_param_const_env(block: IrBlock, blocks: IrBlockList, consts: PipelineIrConstEnv) -> PipelineIrConstEnv {
   match block {
-    IrBlock(id, params, insts, term) -> pipeline_ir_block_param_const_env_params(params, 0, id, blocks, consts, consts, pipeline_ir_block_list_has_branch_to(blocks, id))
+    IrBlock(id, params, insts, term) -> {
+      match params {
+        IrValueNil -> consts
+        _ -> pipeline_ir_block_param_const_env_params(params, 0, id, blocks, consts, consts, pipeline_ir_block_list_has_branch_to(blocks, id))
+      }
+    }
   }
 }
 
