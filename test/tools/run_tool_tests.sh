@@ -844,6 +844,14 @@ lsp_open_stale='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"text
 lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_stale")" "$(lsp_frame "$lsp_stale_change")" | "$WEFT" lsp 2>&1)
 assert_not_contains "lsp_stale_update_ignored" "$lsp_out" "type error: unknown identifier"
 
+# Slow writer: frames delivered across multiple pipe reads must not be
+# truncated (read_fd_all once treated any short read as EOF).
+lsp_slow_full="$(lsp_frame "$lsp_open_hover")$(lsp_frame "$lsp_definition")"
+lsp_slow_head=${lsp_slow_full:0:40}
+lsp_slow_tail=${lsp_slow_full:40}
+lsp_out=$( { printf '%s' "$lsp_slow_head"; sleep 0.2; printf '%s' "$lsp_slow_tail"; } | "$WEFT" lsp 2>&1)
+assert_contains "lsp_slow_writer_definition" "$lsp_out" '"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":6}}'
+
 lsp_completion='{"jsonrpc":"2.0","id":7,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///hover.weft"},"position":{"line":0,"character":1}}}'
 lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_hover")" "$(lsp_frame "$lsp_completion")" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_completion_hook_items" "$lsp_out" '"label":"par_map"'
