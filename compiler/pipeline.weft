@@ -674,6 +674,12 @@ fn pipeline_native_ir_loop_pinned_slot_count(native: NativeModule) -> i64 {
   }
 }
 
+fn pipeline_native_ir_param_resident_count(native: NativeModule) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_ir_native_param_resident_count(fm)
+  }
+}
+
 fn pipeline_native_residency_audit_violation_count(native: NativeModule) -> i64 {
   match native {
     NativeModule(code, fm, functions) -> fmap_audit_violation_count(fm)
@@ -21697,12 +21703,55 @@ fn pipeline_ir_native_pinned_has_cs_fp(pinned: i64) -> i64 {
 -- range (def gpos, last-use gpos) so the post-emission checker can verify
 -- that no foreign write lands inside the tenant's window. No-op unless
 -- pipeline_cg_ir_only_function armed the audit for this function.
+-- Tuple: (phys, window lo gpos, window hi gpos, legal-writer gpos list).
+-- Instruction tenants have no writer list (their def instruction owns the
+-- only legal write, and the window starts after it); block-param tenants
+-- carry the gpos of every predecessor jump whose edge moves feed them.
 fn pipeline_ir_native_audit_note_range(fm: i64, value: i64, phys: i64, dp: i64, lu: i64) -> i64 {
   let ranges = fmap_audit_ranges(fm)
   if ranges != 0 {
-    nlist_add(ranges, node_new(0, value, phys, dp, lu))
+    nlist_add(ranges, node_new(0, phys, dp, lu, 0))
     0
   } else { 0 }
+}
+
+fn pipeline_ir_native_audit_note_param_range(fm: i64, phys: i64, lo: i64, hi: i64, writers: i64) -> i64 {
+  let ranges = fmap_audit_ranges(fm)
+  if ranges != 0 {
+    nlist_add(ranges, node_new(0, phys, lo, hi, writers))
+    0
+  } else { 0 }
+}
+
+-- Loop rounding for param windows: a layout interval [lo, hi] only
+-- models a live range if it also covers every loop body that executes
+-- between uses. Any terminator at gpos g targeting a block whose entry
+-- gpos lies inside the window re-enters it, so the window must extend to
+-- g; iterate to fixpoint for nested loops. Without this, a value used by
+-- a loop condition ends its window AT the condition and the loop body is
+-- free for a second same-register tenant — the check_handler_clause
+-- miscompile (nbind clobbered by an op-param call result inside the
+-- param-binding loop).
+fn pipeline_ir_native_param_round_hi(edges: i64, block_entry_gpos: i64, block_count: i64, lo: i64, hi0: i64) -> i64 {
+  let mut hi = hi0
+  let mut changed = 1
+  while changed == 1 {
+    changed = 0
+    let n = nlist_len(edges)
+    for i in 0..n {
+      let e = nlist_get(edges, i)
+      let t = node_f1(e)
+      let g = node_f2(e)
+      if t >= 0 and t < block_count {
+        let te = nlist_get(block_entry_gpos, t)
+        if te >= lo and te <= hi and g > hi {
+          hi = g
+          changed = 1
+        } else { 0 }
+      } else { 0 }
+    }
+  }
+  hi
 }
 
 fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, raw_pinned: i64, fm: i64, f64_slots: i64) -> i64 {
@@ -21745,6 +21794,24 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       let layout_pos = node_f2(region_bundle)
       let block_count = node_f3(region_bundle)
       let depth_of = pipeline_ir_native_resident_depths(blocks, layout_pos, block_count)
+      -- Block-param residency (2o step 1): params are defs at block entry;
+      -- their windows extend over every incoming jump edge (a loop header's
+      -- effective window is the whole loop), the barrier check runs over
+      -- the extended window, and selection bypasses use_local. The writer
+      -- gpos lists exist only under the emission audit.
+      let audit_armed = if fmap_audit_ranges(fm) != 0 { 1 } else { 0 }
+      -- Backedges (target-entry gpos, terminator gpos) for loop rounding:
+      -- a layout interval only models a live range if it covers every loop
+      -- body that executes between uses. Block-entry gpos is recorded on
+      -- the fly; backedge targets are resolved after the walk.
+      let entry_gpos_size = pipeline_ir_native_resident_max_block_id(blocks) + 1
+      let block_entry_gpos = pipeline_ir_native_resident_dense_new(entry_gpos_size, 0 - 1)
+      let backedge_terms = nlist_new()
+      let param_entry = pipeline_ir_native_resident_dense_new(next_value, 0 - 1)
+      let param_lo = pipeline_ir_native_resident_dense_new(next_value, 0 - 1)
+      let param_hi = pipeline_ir_native_resident_dense_new(next_value, 0 - 1)
+      let param_writer_count = pipeline_ir_native_resident_dense_new(next_value, 0)
+      let param_writers = pipeline_ir_native_resident_dense_new(next_value, 0)
       let barrier_at = nlist_new()
       let barrier_fp_at = nlist_new()
       let barrier_fp_cs_at = nlist_new()
@@ -21762,6 +21829,23 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
               IrBlock(raw_block_id, params, insts, term) -> {
                 let block_id = nlist_get(region_of, raw_block_id)
                 let block_w = pipeline_ir_native_resident_weight_for_depth(nlist_get(depth_of, nlist_get(layout_pos, raw_block_id)))
+                if raw_block_id >= 0 and raw_block_id < entry_gpos_size { pipeline_ir_native_resident_dense_set(block_entry_gpos, raw_block_id, gpos) } else { 0 }
+                let mut p_cur = params
+                let mut p_done = 0
+                while p_done == 0 {
+                  match p_cur {
+                    IrValueNil -> { p_done = 1 }
+                    IrValueCons(p, p_rest) -> {
+                      if p >= 0 and p < next_value {
+                        pipeline_ir_native_resident_dense_set(param_entry, p, gpos)
+                        if nlist_get(param_lo, p) < 0 { pipeline_ir_native_resident_dense_set(param_lo, p, gpos) } else { 0 }
+                        if nlist_get(param_hi, p) < gpos { pipeline_ir_native_resident_dense_set(param_hi, p, gpos) } else { 0 }
+                        0
+                      } else { 0 }
+                      p_cur = p_rest
+                    }
+                  }
+                }
                 let mut cur = insts
                 let mut done = 0
                 while done == 0 {
@@ -21812,6 +21896,43 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
                 nlist_add(barrier_fp_cs_at, barrier_fp_cs_cum)
                 let term_uses = pipeline_ir_native_resident_term_uses(term)
                 pipeline_ir_native_resident_record_use_set(term_uses, gpos, block_id, 1, 0, next_value, arrays, block_w)
+                match term {
+                  IrTermJump(jt2, ja2) -> { nlist_add(backedge_terms, node_new(0, jt2, gpos, 0, 0)) 0 }
+                  IrTermBranch(bc2, bt2, be2) -> {
+                    nlist_add(backedge_terms, node_new(0, bt2, gpos, 0, 0))
+                    nlist_add(backedge_terms, node_new(0, be2, gpos, 0, 0))
+                    0
+                  }
+                  _ -> 0
+                }
+                match term {
+                  IrTermJump(jump_target, jump_args) -> {
+                    let tparams = pipeline_ir_native_block_params_or(blocks, jump_target, ir_value_list_empty())
+                    let mut tp_cur = tparams
+                    let mut tp_done = 0
+                    while tp_done == 0 {
+                      match tp_cur {
+                        IrValueNil -> { tp_done = 1 }
+                        IrValueCons(tp, tp_rest) -> {
+                          if tp >= 0 and tp < next_value {
+                            if nlist_get(param_lo, tp) < 0 { pipeline_ir_native_resident_dense_set(param_lo, tp, gpos) }
+                            else { if gpos < nlist_get(param_lo, tp) { pipeline_ir_native_resident_dense_set(param_lo, tp, gpos) } else { 0 } }
+                            if nlist_get(param_hi, tp) < gpos { pipeline_ir_native_resident_dense_set(param_hi, tp, gpos) } else { 0 }
+                            pipeline_ir_native_resident_dense_set(param_writer_count, tp, nlist_get(param_writer_count, tp) + 1)
+                            if audit_armed == 1 {
+                              if nlist_get(param_writers, tp) == 0 { pipeline_ir_native_resident_dense_set(param_writers, tp, nlist_new()) } else { 0 }
+                              nlist_add(nlist_get(param_writers, tp), gpos)
+                              0
+                            } else { 0 }
+                          } else { 0 }
+                          tp_cur = tp_rest
+                        }
+                      }
+                    }
+                    0
+                  }
+                  _ -> 0
+                }
                 gpos = gpos + 1
                 cur_blocks = rest_blocks
               }
@@ -21834,14 +21955,26 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       let mut fp_assigned = 0
       -- GPR candidates need v >= 8 (lower ids already live in the value
       -- bank); FP candidates take any defined value — f64 data in a bank
-      -- GPR still pays the fmov round-trip on every use. Params have no
-      -- defining instruction and are excluded by def_pos.
+      -- GPR still pays the fmov round-trip on every use. Function params
+      -- live in the bank (v < 8); block params are selected through the
+      -- param window path below, which bypasses use_local by design.
       let mut v = 0
       while v < next_value {
         let dp = nlist_get(def_pos, v)
         let base_ok = if dp >= 0 and nlist_get(use_local, v) == 1 and nlist_get(use_seen, v) == 1 and nlist_get(slot_like, v) == 0 { 1 } else { 0 }
         let eligible = if v >= 8 and base_ok == 1 and nlist_get(def_simple, v) == 1 and nlist_get(use_gpr_ok, v) == 1 {
           if nlist_get(barrier_at, nlist_get(last_use, v)) == nlist_get(barrier_at, dp) { 1 } else { 0 }
+        } else { 0 }
+        -- Block-param tenancy: window = [earliest writer/entry, latest of
+        -- last use and latest writer], rounded out to enclosing loops,
+        -- barrier-free across the whole span.
+        let param_base_ok = if v >= 8 and dp < 0 and nlist_get(param_entry, v) >= 0 and nlist_get(param_writer_count, v) > 0 and nlist_get(use_seen, v) == 1 and nlist_get(slot_like, v) == 0 and nlist_get(addr_taken, v) == 0 and nlist_get(use_gpr_ok, v) == 1 and nlist_get(fp_def, v) == 0 { 1 } else { 0 }
+        let param_hi_uses = if nlist_get(param_hi, v) > nlist_get(last_use, v) { nlist_get(param_hi, v) } else { nlist_get(last_use, v) }
+        let param_hi_ext = if param_base_ok == 1 {
+          pipeline_ir_native_param_round_hi(backedge_terms, block_entry_gpos, entry_gpos_size, nlist_get(param_lo, v), param_hi_uses)
+        } else { 0 - 1 }
+        let param_eligible = if param_base_ok == 1 {
+          if nlist_get(barrier_at, param_hi_ext) == nlist_get(barrier_at, nlist_get(param_lo, v)) { 1 } else { 0 }
         } else { 0 }
         let fp_eligible = if base_ok == 1 and nlist_get(fp_def, v) == 1 and nlist_get(use_fp_ok, v) == 1 {
           if nlist_get(barrier_fp_at, nlist_get(last_use, v)) == nlist_get(barrier_fp_at, dp) { 1 } else { 0 }
@@ -21896,6 +22029,28 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
           } else { 0 }
           0
         }
+        if param_eligible == 1 {
+          let plo = nlist_get(param_lo, v)
+          if plo > busy0 {
+            pinned = pipeline_ir_native_pinned_slot_new(v, 12, pipeline_ir_native_pinned_slot_kind_resident(), pinned)
+            busy0 = param_hi_ext
+            assigned = assigned + 1
+            fmap_inc_ir_native_param_resident_count(fm)
+            pipeline_ir_native_audit_note_param_range(fm, 12, plo, param_hi_ext, nlist_get(param_writers, v))
+          } else { if plo > busy1 {
+            pinned = pipeline_ir_native_pinned_slot_new(v, 13, pipeline_ir_native_pinned_slot_kind_resident(), pinned)
+            busy1 = param_hi_ext
+            assigned = assigned + 1
+            fmap_inc_ir_native_param_resident_count(fm)
+            pipeline_ir_native_audit_note_param_range(fm, 13, plo, param_hi_ext, nlist_get(param_writers, v))
+          } else { if plo > busy2 {
+            pinned = pipeline_ir_native_pinned_slot_new(v, 14, pipeline_ir_native_pinned_slot_kind_resident(), pinned)
+            busy2 = param_hi_ext
+            assigned = assigned + 1
+            fmap_inc_ir_native_param_resident_count(fm)
+            pipeline_ir_native_audit_note_param_range(fm, 14, plo, param_hi_ext, nlist_get(param_writers, v))
+          } else { 0 } } }
+        } else { 0 }
         v = v + 1
       }
       -- Bank permutation: the identity value-to-home assignment is
@@ -22145,6 +22300,21 @@ fn pipeline_ir_native_audit_nested_end(nested: i64, pos: i64) -> i64 {
   result
 }
 
+-- A byte position sits inside a legal writer's terminator window when some
+-- writer gpos g satisfies offsets[g] <= pos < offsets[g+1]. Edge moves that
+-- feed a block-param tenant live exactly there.
+fn pipeline_ir_native_audit_in_writer_window(writers: i64, offsets: i64, pos: i64) -> i64 {
+  let mut result = 0
+  if writers != 0 {
+    let n = nlist_len(writers)
+    for i in 0..n {
+      let g = nlist_get(writers, i)
+      if pos >= nlist_get(offsets, g) and pos < nlist_get(offsets, g + 1) { result = 1 } else { 0 }
+    }
+  } else { 0 }
+  result
+}
+
 fn pipeline_ir_native_residency_audit_function(code: i64, fm: i64, fn_hash: i64) -> i64 {
   let ranges = fmap_audit_ranges(fm)
   let offsets = fmap_audit_offsets(fm)
@@ -22160,10 +22330,15 @@ fn pipeline_ir_native_residency_audit_function(code: i64, fm: i64, fn_hash: i64)
       let n = nlist_len(ranges)
       for i in 0..n {
         let r = nlist_get(ranges, i)
-        let phys = node_f2(r)
-        let dp = node_f3(r)
-        let lu = node_f4(r)
-        let mut pos = nlist_get(offsets, dp + 1)
+        let phys = node_f1(r)
+        let dp = node_f2(r)
+        let lu = node_f3(r)
+        let writers = node_f4(r)
+        -- Instruction tenants own the only legal write (their def), so the
+        -- window starts after it. Param tenants have no def instruction;
+        -- their window starts at the block entry / earliest writer, and the
+        -- writer terminators' own windows are exempted below.
+        let mut pos = if writers != 0 { nlist_get(offsets, dp) } else { nlist_get(offsets, dp + 1) }
         let end = nlist_get(offsets, lu + 1)
         while pos < end {
           let nested_end = pipeline_ir_native_audit_nested_end(nested, pos)
@@ -22176,13 +22351,17 @@ fn pipeline_ir_native_residency_audit_function(code: i64, fm: i64, fn_hash: i64)
             } else { 0 }
             pos = nested_end
           } else {
-            let word = pipeline_native_code_word(code, pos)
-            let writes = decode_writes_aarch64(word)
-            if pipeline_ir_native_audit_write_violates(writes, phys) == 1 {
-              if phys >= 1008 { fmap_inc_audit_cs_violation_count(fm) } else { fmap_inc_audit_violation_count(fm) }
-              fmap_audit_record_first(fm, fn_hash, pos, word, phys)
-            } else { 0 }
-            pos = pos + 4
+            if pipeline_ir_native_audit_in_writer_window(writers, offsets, pos) == 1 {
+              pos = pos + 4
+            } else {
+              let word = pipeline_native_code_word(code, pos)
+              let writes = decode_writes_aarch64(word)
+              if pipeline_ir_native_audit_write_violates(writes, phys) == 1 {
+                if phys >= 1008 { fmap_inc_audit_cs_violation_count(fm) } else { fmap_inc_audit_violation_count(fm) }
+                fmap_audit_record_first(fm, fn_hash, pos, word, phys)
+              } else { 0 }
+              pos = pos + 4
+            }
           }
         }
         fmap_inc_audit_checked_count(fm)

@@ -130,14 +130,18 @@ fn audit_probe_offsets_5() -> i64 {
   offsets
 }
 
-fn audit_probe_arm(fm: i64, phys: i64, dp: i64, lu: i64) -> i64 {
+fn audit_probe_arm_writers(fm: i64, phys: i64, dp: i64, lu: i64, writers: i64) -> i64 {
   let ranges = nlist_new()
-  nlist_add(ranges, node_new(0, 9, phys, dp, lu))
+  nlist_add(ranges, node_new(0, phys, dp, lu, writers))
   fmap_set_audit_ranges(fm, ranges)
   fmap_set_audit_offsets(fm, audit_probe_offsets_5())
   fmap_set_audit_nested(fm, nlist_new())
   fmap_set_audit_expected_gpos(fm, 4)
   0
+}
+
+fn audit_probe_arm(fm: i64, phys: i64, dp: i64, lu: i64) -> i64 {
+  audit_probe_arm_writers(fm, phys, dp, lu, 0)
 }
 
 test "audit_flags_foreign_write_to_pool_register_in_window" {
@@ -296,6 +300,57 @@ test "audit_numbering_skew_is_counted_not_trusted" {
   Test.assert_eq(fmap_audit_checked_count(fm), 0)
 }
 
+test "audit_param_window_exempts_writer_terminator_writes" {
+  -- A block-param tenant in x12: the predecessor jump's edge move at
+  -- gpos 2 writes x12 legally; the same write outside a writer window
+  -- is a violation.
+  let fm = audit_probe_fm()
+  let code = buf_new(4096)
+  bu32(code, encode_movz(15, 1, 0))       -- gpos 0
+  bu32(code, encode_add_reg(0, 12, 15))   -- gpos 1: tenant use
+  bu32(code, encode_add_imm(12, 15, 0))   -- gpos 2: writer terminator edge move
+  bu32(code, encode_ret())                -- gpos 3
+  let writers = nlist_new()
+  nlist_add(writers, 2)
+  audit_probe_arm_writers(fm, 12, 0, 3, writers)
+  pipeline_ir_native_residency_audit_function(code, fm, 790)
+  Test.assert_eq(fmap_audit_violation_count(fm), 0)
+  Test.assert_eq(fmap_audit_checked_count(fm), 1)
+}
+
+test "audit_param_window_flags_write_outside_writer_windows" {
+  let fm = audit_probe_fm()
+  let code = buf_new(4096)
+  bu32(code, encode_movz(15, 1, 0))       -- gpos 0
+  bu32(code, encode_add_imm(12, 15, 0))   -- gpos 1: foreign write, NOT a writer
+  bu32(code, encode_add_reg(0, 12, 12))   -- gpos 2: tenant use
+  bu32(code, encode_ret())                -- gpos 3: the only legal writer
+  let writers = nlist_new()
+  nlist_add(writers, 3)
+  audit_probe_arm_writers(fm, 12, 0, 3, writers)
+  pipeline_ir_native_residency_audit_function(code, fm, 791)
+  Test.assert_eq(fmap_audit_violation_count(fm), 1)
+  Test.assert_eq(fmap_audit_first_offset(fm), 4)
+  Test.assert_eq(fmap_audit_first_word(fm), encode_add_imm(12, 15, 0))
+}
+
+test "audit_param_window_includes_its_first_gpos" {
+  -- Param windows start AT lo (no def instruction): a foreign write in
+  -- the very first covered instruction is caught.
+  let fm = audit_probe_fm()
+  let code = buf_new(4096)
+  bu32(code, encode_movz(13, 9, 0))       -- gpos 0: foreign write at window start
+  bu32(code, encode_add_reg(0, 13, 13))   -- gpos 1: tenant use
+  bu32(code, encode_add_imm(13, 15, 0))   -- gpos 2: writer terminator
+  bu32(code, encode_ret())                -- gpos 3
+  let writers = nlist_new()
+  nlist_add(writers, 2)
+  audit_probe_arm_writers(fm, 13, 0, 2, writers)
+  pipeline_ir_native_residency_audit_function(code, fm, 792)
+  Test.assert_eq(fmap_audit_violation_count(fm), 1)
+  Test.assert_eq(fmap_audit_first_offset(fm), 0)
+}
+
 test "audit_state_clears_after_each_function" {
   let fm = audit_probe_fm()
   let code = buf_new(4096)
@@ -364,6 +419,42 @@ test "audit_f64_program_clean" {
   audit_assert_clean(native)
 }
 
+test "audit_block_param_tenants_pinned_and_clean" {
+  -- A pure if/else merge feeding pure arithmetic: the merge param's
+  -- window is barrier-free, so it must join the x12-x14 pool (2o step 1),
+  -- and its windows must audit clean.
+  let src = "fn pick(a: i64, b: i64, flag: i64) -> i64 { let c = if flag == 1 { a + b } else { a - b } let d = c + a let e = c + d d + e + c } fn main() -> i64 { pick(1, 2, 1) }"
+  let native = audit_native(src)
+  audit_assert_clean(native)
+  Test.assert_eq(audit_positive(pipeline_native_ir_param_resident_count(native)), 1)
+}
+
+-- Regression lock for the loop-rounding bug (2o step 1): a min-merge
+-- param feeding a loop bound, with a real call in the loop body. Without
+-- loop rounding the param's window ended AT the loop condition, the call
+-- result inside the body took the same pool register, and the second
+-- iteration compared against garbage (the check_handler_clause
+-- miscompile). This test executes the shape in the suite-compiled binary.
+fn audit_helper_tri(x: i64) -> i64 {
+  if x <= 0 { 0 } else { x + audit_helper_tri(x - 1) }
+}
+
+fn audit_loop_bound_shape(nparams: i64, noparams: i64) -> i64 {
+  let nbind = if nparams < noparams { nparams } else { noparams }
+  let mut acc = 0
+  for pi in 0..nbind {
+    acc = acc + audit_helper_tri(pi)
+  }
+  acc * 1000 + nbind
+}
+
+test "audit_loop_bound_merge_param_survives_loop_body" {
+  Test.assert_eq(audit_loop_bound_shape(3, 5), 4003)
+  Test.assert_eq(audit_loop_bound_shape(7, 2), 1002)
+  Test.assert_eq(audit_loop_bound_shape(0, 9), 0)
+  Test.assert_eq(audit_loop_bound_shape(9, 0), 0)
+}
+
 fn audit_path_pair(path: str) -> i64 {
   let pair = alloc_words(2)
   mem_store64_at(pair, 0, __str_ptr(path))
@@ -384,4 +475,5 @@ test "audit_whole_compiler_emission_clean" {
   let native = pipeline_lower_native_module_with_audit(typed, optimised, 1)
   audit_assert_clean(native)
   Test.assert_eq(audit_positive(pipeline_native_residency_audit_checked_count(native) - 100), 1)
+  Test.assert_eq(audit_positive(pipeline_native_ir_param_resident_count(native)), 1)
 }
