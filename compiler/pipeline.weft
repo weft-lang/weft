@@ -28909,6 +28909,261 @@ fn pipeline_optimised_functions_direct_call_inline_sites(opt: PipelineOptimisedF
   }
 }
 
+-- ══════════════════════════════════════════════════════════════
+-- IR verifier (2o step 0): structural validity of a function's IR
+-- after any transform. Checks: every used value is defined somewhere
+-- (function params, block params, instruction destinations — the use
+-- oracle is pipeline_ir_live_set_add_inst_uses, the same enumeration
+-- the optimiser and residency scan rely on); no duplicate SSA
+-- definitions; jump and branch targets exist; jump argument counts
+-- match target parameter counts; terminators present. Returns 0 for
+-- valid IR, else an encoded first error:
+--   kind * 1_000_000_000 + block_id * 1_000_000 + detail
+-- kinds: 1 duplicate definition (detail = value id)
+--        2 use of undefined value (detail = value id)
+--        3 missing terminator (IrTermNone)
+--        4 branch/jump target does not exist (detail = target id)
+--        5 jump arg count mismatch (detail = target id)
+-- Intra-block use-before-def ordering and full dominance are not yet
+-- checked (needs a dominator tree; see the 2o brief).
+-- ══════════════════════════════════════════════════════════════
+
+fn pipeline_ir_verify_error(kind: i64, block_id: i64, detail: i64) -> i64 {
+  kind * 1000000000 + block_id * 1000000 + detail
+}
+
+fn pipeline_ir_verify_mark_def(defined: i64, words: i64, value: i64, block_id: i64) -> i64 {
+  if value < 0 { 0 }
+  else {
+    let word_index = value / 64
+    if word_index >= words { pipeline_ir_verify_error(1, block_id, value) }
+    else {
+      let mask = 1 bshl (value % 64)
+      let word = pipeline_word_array_get(defined, word_index)
+      if (word band mask) != 0 {
+        pipeline_ir_verify_error(1, block_id, value)
+      } else {
+        pipeline_word_array_set(defined, word_index, word bor mask)
+        0
+      }
+    }
+  }
+}
+
+fn pipeline_ir_verify_value_defined(defined: i64, words: i64, value: i64) -> i64 {
+  if value < 0 { 1 }
+  else {
+    let word_index = value / 64
+    if word_index >= words { 0 }
+    else {
+      if (pipeline_word_array_get(defined, word_index) band (1 bshl (value % 64))) != 0 { 1 } else { 0 }
+    }
+  }
+}
+
+fn pipeline_ir_verify_mark_params(params: IrValueList, defined: i64, words: i64, block_id: i64) -> i64 {
+  match params {
+    IrValueNil -> 0
+    IrValueCons(value, rest) -> {
+      let err = pipeline_ir_verify_mark_def(defined, words, value, block_id)
+      if err != 0 { err } else { pipeline_ir_verify_mark_params(rest, defined, words, block_id) }
+    }
+  }
+}
+
+fn pipeline_ir_verify_mark_bit(defined: i64, words: i64, value: i64) -> i64 {
+  if value < 0 { 0 }
+  else {
+    let word_index = value / 64
+    if word_index >= words { 0 }
+    else {
+      pipeline_word_array_set(defined, word_index, pipeline_word_array_get(defined, word_index) bor (1 bshl (value % 64)))
+    }
+  }
+}
+
+fn pipeline_ir_verify_mark_insts(insts: IrInstList, defined: i64, words: i64, block_id: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let dst = pipeline_ir_inst_def_or(inst, 0 - 1)
+      let err = if dst >= 0 { pipeline_ir_verify_mark_def(defined, words, dst, block_id) } else { 0 }
+      -- Slots share the value namespace and the use oracle counts slot
+      -- operands as uses; a declaration or a store establishes the
+      -- slot (repeated stores are not duplicate definitions).
+      match inst {
+        IrSlotI64(slot_id) -> pipeline_ir_verify_mark_bit(defined, words, slot_id)
+        IrStoreI64(slot_id, value) -> pipeline_ir_verify_mark_bit(defined, words, slot_id)
+        _ -> 0
+      }
+      if err != 0 { err } else { pipeline_ir_verify_mark_insts(rest, defined, words, block_id) }
+    }
+  }
+}
+
+fn pipeline_ir_verify_mark_blocks(blocks: IrBlockList, defined: i64, words: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          let perr = pipeline_ir_verify_mark_params(params, defined, words, id)
+          if perr != 0 { perr }
+          else {
+            let ierr = pipeline_ir_verify_mark_insts(insts, defined, words, id)
+            if ierr != 0 { ierr } else { pipeline_ir_verify_mark_blocks(rest, defined, words) }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_verify_uses_chain(uses: PipelineIrLiveSet, defined: i64, words: i64, block_id: i64) -> i64 {
+  match uses {
+    PipelineIrLiveSetNil -> 0
+    PipelineIrLiveSetCons(value, rest) -> {
+      if pipeline_ir_verify_value_defined(defined, words, value) == 0 {
+        pipeline_ir_verify_error(2, block_id, value)
+      } else {
+        pipeline_ir_verify_uses_chain(rest, defined, words, block_id)
+      }
+    }
+    PipelineIrLiveSetBits(array, bwords, count) -> 0
+  }
+}
+
+fn pipeline_ir_verify_insts_uses(insts: IrInstList, defined: i64, words: i64, block_id: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let err = pipeline_ir_verify_uses_chain(pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty()), defined, words, block_id)
+      if err != 0 { err } else { pipeline_ir_verify_insts_uses(rest, defined, words, block_id) }
+    }
+  }
+}
+
+fn pipeline_ir_verify_block_exists(blocks: IrBlockList, target: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          if id == target { 1 } else { pipeline_ir_verify_block_exists(rest, target) }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_verify_term(term: IrTerminator, all_blocks: IrBlockList, defined: i64, words: i64, block_id: i64) -> i64 {
+  match term {
+    IrTermNone -> pipeline_ir_verify_error(3, block_id, 0)
+    IrTermReturn(value) -> {
+      if pipeline_ir_verify_value_defined(defined, words, value) == 0 {
+        pipeline_ir_verify_error(2, block_id, value)
+      } else { 0 }
+    }
+    IrTermJump(target, args) -> {
+      if pipeline_ir_verify_block_exists(all_blocks, target) == 0 {
+        pipeline_ir_verify_error(4, block_id, target)
+      } else {
+        let params = pipeline_ir_block_params_or(all_blocks, target, ir_value_list_empty())
+        if ir_value_list_len(args) != ir_value_list_len(params) {
+          pipeline_ir_verify_error(5, block_id, target)
+        } else {
+          pipeline_ir_verify_args_defined(args, defined, words, block_id)
+        }
+      }
+    }
+    IrTermBranch(cond, then_block, else_block) -> {
+      if pipeline_ir_verify_value_defined(defined, words, cond) == 0 {
+        pipeline_ir_verify_error(2, block_id, cond)
+      } else {
+        if pipeline_ir_verify_block_exists(all_blocks, then_block) == 0 {
+          pipeline_ir_verify_error(4, block_id, then_block)
+        } else {
+          if pipeline_ir_verify_block_exists(all_blocks, else_block) == 0 {
+            pipeline_ir_verify_error(4, block_id, else_block)
+          } else { 0 }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_verify_args_defined(args: IrValueList, defined: i64, words: i64, block_id: i64) -> i64 {
+  match args {
+    IrValueNil -> 0
+    IrValueCons(value, rest) -> {
+      if pipeline_ir_verify_value_defined(defined, words, value) == 0 {
+        pipeline_ir_verify_error(2, block_id, value)
+      } else {
+        pipeline_ir_verify_args_defined(rest, defined, words, block_id)
+      }
+    }
+  }
+}
+
+fn pipeline_ir_verify_blocks(blocks: IrBlockList, all_blocks: IrBlockList, defined: i64, words: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          let uerr = pipeline_ir_verify_insts_uses(insts, defined, words, id)
+          if uerr != 0 { uerr }
+          else {
+            let terr = pipeline_ir_verify_term(term, all_blocks, defined, words, id)
+            if terr != 0 { terr } else { pipeline_ir_verify_blocks(rest, all_blocks, defined, words) }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_verify_function(f: IrFunction) -> i64 {
+  match f {
+    IrFunction(hash, param_count, blocks, src) -> {
+      let next_value = pipeline_ir_function_next_value(param_count, blocks)
+      let words = pipeline_ir_live_set_dense_word_count(next_value + 1)
+      if words <= 0 { 0 }
+      else {
+        let defined = pipeline_word_array_new(words)
+        pipeline_ir_live_set_dense_clear(defined, words, 0)
+        let mut p = 0
+        while p < param_count {
+          pipeline_ir_verify_mark_def(defined, words, p, 0 - 1)
+          p = p + 1
+        }
+        let derr = pipeline_ir_verify_mark_blocks(blocks, defined, words)
+        if derr != 0 { derr }
+        else {
+          pipeline_ir_verify_blocks(blocks, blocks, defined, words)
+        }
+      }
+    }
+  }
+}
+
+-- Verify every function in a list; returns 0 or the first error with
+-- the function's position folded in as err + index * 100_000_000_000.
+fn pipeline_ir_verify_function_list(functions: IrFunctionList, index: i64) -> i64 {
+  match functions {
+    IrFunctionNil -> 0
+    IrFunctionCons(f, rest) -> {
+      let err = pipeline_ir_verify_function(f)
+      if err != 0 { err + index * 100000000000 }
+      else { pipeline_ir_verify_function_list(rest, index + 1) }
+    }
+  }
+}
+
+fn pipeline_ir_verify_module(ir: IrModule) -> i64 {
+  pipeline_ir_verify_function_list(pipeline_ir_functions(ir), 0)
+}
+
 fn pipeline_optimise_ir_function(f: IrFunction, inline_candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList) -> PipelineOptimisedFunctions {
   match f {
     IrFunction(hash, params, blocks, src) -> {
