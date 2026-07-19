@@ -25016,6 +25016,13 @@ fn pipeline_ir_binary_is_add(op: IrBinaryOp) -> i64 {
   }
 }
 
+fn pipeline_ir_binary_is_sub(op: IrBinaryOp) -> i64 {
+  match op {
+    IrSub -> 1
+    _ -> 0
+  }
+}
+
 fn pipeline_ir_value_def_table_record(table: i64, dst: i64, def: i64) -> i64 {
   let limit = mem_load64_at(table, 0)
   if dst >= 0 and dst < limit {
@@ -25037,7 +25044,11 @@ fn pipeline_ir_value_def_table_scan_insts(table: i64, insts: IrInstList, block_i
           } else {
             if pipeline_ir_binary_is_add(op) == 1 {
               pipeline_ir_value_def_table_record(table, dst, node_new(0, 5, 0, lhs, rhs))
-            } else { 0 }
+            } else {
+              if pipeline_ir_binary_is_sub(op) == 1 {
+                pipeline_ir_value_def_table_record(table, dst, node_new(0, 7, 0, lhs, rhs))
+              } else { 0 }
+            }
           }
         }
         IrCallI64(dst, callee_hash, args) -> {
@@ -26471,6 +26482,194 @@ fn pipeline_ir_seed_slot_nonneg_fact_blocks(blocks: IrBlockList, slot: i64, fact
   }
 }
 
+-- ══════════════════════════════════════════════════════════════
+-- Slot upper-bound induction (decrement mirror of the nonneg rule):
+-- slot k always holds a value < len(v) when every store is either
+--   (a) load(m) - c with c a const in [0, 4095], where slot m carries a
+--       vector-slot-upper fact for v AND a nonneg fact at the store's
+--       block (m < len and m >= 0, so m - c < len and cannot wrap), or
+--   (b) the single own-decrement load(k) - c, guarded by a k-lower-bound
+--       comparison in a block that dominates the store and lies on every
+--       cycle through it (so chained decrements cannot underflow-wrap:
+--       each pass re-checks, and an intervening init leaves at least
+--       -c, far above the integer minimum),
+-- k is never address-taken, no store is a raw const (a const cannot be
+-- compared to a runtime length), and every block in the function is
+-- len-stable (lengths never shrink, so the seeded facts stay true).
+-- ══════════════════════════════════════════════════════════════
+
+fn pipeline_ir_chain_slot_bound_below(chain: PipelineIrBlockEntryFactChain, table: i64, slot: i64) -> i64 {
+  match chain {
+    PipelineIrBlockEntryFactNil -> 0
+    PipelineIrBlockEntryCtorFact(fact_block, value_id, ctor_hash, rest) -> pipeline_ir_chain_slot_bound_below(rest, table, slot)
+    PipelineIrBlockEntryNotCtorFact(fact_block, value_id, ctor_hash, rest) -> pipeline_ir_chain_slot_bound_below(rest, table, slot)
+    PipelineIrBlockEntryScalarFact(fact_block, value_id, kind, value, rest) -> {
+      let hit = if kind == pipeline_ir_scalar_fact_kind_bool() and value == 1 {
+        let def = pipeline_ir_value_def_lookup(table, value_id)
+        if def != 0 and node_f1(def) == 3 {
+          -- ge(load, low): code 6, load on lhs; le(low, load): code 5,
+          -- load on rhs. The low side must be a const >= 0.
+          let load_operand = if node_f2(def) == 6 { node_f3(def) } else { if node_f2(def) == 5 { node_f4(def) } else { 0 - 1 } }
+          let low_operand = if node_f2(def) == 6 { node_f4(def) } else { if node_f2(def) == 5 { node_f3(def) } else { 0 - 1 } }
+          if load_operand >= 0 {
+            let load_def = pipeline_ir_value_def_lookup(table, load_operand)
+            let low_def = pipeline_ir_value_def_lookup(table, low_operand)
+            if load_def != 0 and node_f1(load_def) == 6 and node_f2(load_def) == slot and low_def != 0 and node_f1(low_def) == 1 and node_f2(low_def) >= 0 { 1 } else { 0 }
+          } else { 0 }
+        } else { 0 }
+      } else { 0 }
+      if hit == 1 { 1 } else { pipeline_ir_chain_slot_bound_below(rest, table, slot) }
+    }
+    PipelineIrBlockEntrySlotScalarFact(fact_block, slot_id, kind, value, rest) -> pipeline_ir_chain_slot_bound_below(rest, table, slot)
+    PipelineIrBlockEntryVectorLenFact(fact_block, len_value, vec_value, rest) -> pipeline_ir_chain_slot_bound_below(rest, table, slot)
+    PipelineIrBlockEntryVectorUpperFact(fact_block, vec_value, index_value, rest) -> pipeline_ir_chain_slot_bound_below(rest, table, slot)
+    PipelineIrBlockEntryVectorSlotUpperFact(fact_block, vec_value, slot_id, rest) -> pipeline_ir_chain_slot_bound_below(rest, table, slot)
+    PipelineIrBlockEntryVariantOriginFact(fact_block, value_id, ctor_hash, payloads, rest) -> pipeline_ir_chain_slot_bound_below(rest, table, slot)
+  }
+}
+
+fn pipeline_ir_slot_bound_below_dominating(scan_blocks: IrBlockList, all_blocks: IrBlockList, table: i64, facts: PipelineIrBlockEntryFactList, slot: i64, store_block: i64, dom_sets: i64, dom_max: i64, dom_words: i64) -> i64 {
+  match scan_blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          let own = if id == store_block { pipeline_ir_chain_slot_bound_below(pipeline_ir_block_entry_facts_block_chain(facts, id), table, slot) } else { 0 }
+          let hit = if own == 1 { 1 } else {
+            if id != store_block and dom_sets != 0 and id >= 0 and id <= dom_max and store_block >= 0 and store_block <= dom_max {
+              if pipeline_ir_chain_slot_bound_below(pipeline_ir_block_entry_facts_block_chain(facts, id), table, slot) == 1 {
+                if pipeline_ir_dominators_bit_get(dom_sets, dom_words, store_block, id) == 1 {
+                  pipeline_ir_all_cycles_pass(all_blocks, dom_max, store_block, id)
+                } else { 0 }
+              } else { 0 }
+            } else { 0 }
+          }
+          if hit == 1 { 1 } else { pipeline_ir_slot_bound_below_dominating(rest, all_blocks, table, facts, slot, store_block, dom_sets, dom_max, dom_words) }
+        }
+      }
+    }
+  }
+}
+
+-- First vector with a slot-upper fact for this slot at this block, or -1.
+fn pipeline_ir_chain_slot_upper_vec(chain: PipelineIrBlockEntryFactChain, slot: i64) -> i64 {
+  match chain {
+    PipelineIrBlockEntryFactNil -> 0 - 1
+    PipelineIrBlockEntryCtorFact(fact_block, value_id, ctor_hash, rest) -> pipeline_ir_chain_slot_upper_vec(rest, slot)
+    PipelineIrBlockEntryNotCtorFact(fact_block, value_id, ctor_hash, rest) -> pipeline_ir_chain_slot_upper_vec(rest, slot)
+    PipelineIrBlockEntryScalarFact(fact_block, value_id, kind, value, rest) -> pipeline_ir_chain_slot_upper_vec(rest, slot)
+    PipelineIrBlockEntrySlotScalarFact(fact_block, slot_id, kind, value, rest) -> pipeline_ir_chain_slot_upper_vec(rest, slot)
+    PipelineIrBlockEntryVectorLenFact(fact_block, len_value, vec_value, rest) -> pipeline_ir_chain_slot_upper_vec(rest, slot)
+    PipelineIrBlockEntryVectorUpperFact(fact_block, vec_value, index_value, rest) -> pipeline_ir_chain_slot_upper_vec(rest, slot)
+    PipelineIrBlockEntryVectorSlotUpperFact(fact_block, vec_value, fact_slot, rest) -> {
+      if fact_slot == slot { vec_value } else { pipeline_ir_chain_slot_upper_vec(rest, slot) }
+    }
+    PipelineIrBlockEntryVariantOriginFact(fact_block, value_id, ctor_hash, payloads, rest) -> pipeline_ir_chain_slot_upper_vec(rest, slot)
+  }
+}
+
+-- Verdict node(0, ok, vec, saw_init, 0): ok = 0 reject; saw_init needed
+-- because a decrement-only slot never acquires a bound.
+fn pipeline_ir_slot_upper_scan_insts(insts: IrInstList, block_id: i64, table: i64, facts: PipelineIrBlockEntryFactList, slot: i64, state: i64, all_blocks: IrBlockList, dom_sets: i64, dom_max: i64, dom_words: i64) -> i64 {
+  match insts {
+    IrInstNil -> state
+    IrInstCons(inst, rest) -> {
+      if node_f1(state) == 0 { state }
+      else {
+        let next = match inst {
+          IrAddressOfSlotI64(dst, slot_id) -> if slot_id == slot { node_new(0, 0, 0, 0, 0) } else { state }
+          IrStoreI64(slot_id, value) -> {
+            if slot_id == slot {
+              let def = pipeline_ir_value_def_lookup(table, value)
+              if def != 0 and node_f1(def) == 7 {
+                let lhs_def = pipeline_ir_value_def_lookup(table, node_f3(def))
+                let rhs_def = pipeline_ir_value_def_lookup(table, node_f4(def))
+                let c_ok = if rhs_def != 0 and node_f1(rhs_def) == 1 and node_f2(rhs_def) >= 0 and node_f2(rhs_def) <= 4095 { 1 } else { 0 }
+                if c_ok == 1 and lhs_def != 0 and node_f1(lhs_def) == 6 {
+                  let m = node_f2(lhs_def)
+                  if m == slot {
+                    -- own decrement: needs the dominating lower-bound guard
+                    if pipeline_ir_slot_bound_below_dominating(all_blocks, all_blocks, table, facts, slot, block_id, dom_sets, dom_max, dom_words) == 1 {
+                      state
+                    } else { node_new(0, 0, 0, 0, 0) }
+                  } else {
+                    -- init from a bounded, nonnegative slot
+                    let chain = pipeline_ir_block_entry_facts_block_chain(facts, block_id)
+                    let vec = pipeline_ir_chain_slot_upper_vec(chain, m)
+                    let m_nonneg = pipeline_ir_block_entry_slot_scalar_fact_lookup(facts, block_id, m, pipeline_ir_scalar_fact_kind_nonnegative())
+                    let nonneg_ok = if pipeline_ir_const_lookup_valid(m_nonneg) == 1 and pipeline_ir_const_lookup_value(m_nonneg) == 1 { 1 } else { 0 }
+                    if vec >= 0 and nonneg_ok == 1 {
+                      if node_f2(state) < 0 or node_f2(state) == vec {
+                        node_new(0, 1, vec, 1, 0)
+                      } else { node_new(0, 0, 0, 0, 0) }
+                    } else { node_new(0, 0, 0, 0, 0) }
+                  }
+                } else { node_new(0, 0, 0, 0, 0) }
+              } else { node_new(0, 0, 0, 0, 0) }
+            } else { state }
+          }
+          _ -> state
+        }
+        pipeline_ir_slot_upper_scan_insts(rest, block_id, table, facts, slot, next, all_blocks, dom_sets, dom_max, dom_words)
+      }
+    }
+  }
+}
+
+fn pipeline_ir_slot_upper_scan_blocks(blocks: IrBlockList, table: i64, facts: PipelineIrBlockEntryFactList, slot: i64, state: i64, all_blocks: IrBlockList, dom_sets: i64, dom_max: i64, dom_words: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> state
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          pipeline_ir_slot_upper_scan_blocks(rest, table, facts, slot, pipeline_ir_slot_upper_scan_insts(insts, id, table, facts, slot, state, all_blocks, dom_sets, dom_max, dom_words), all_blocks, dom_sets, dom_max, dom_words)
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_seed_slot_upper_fact_blocks(blocks: IrBlockList, vec: i64, slot: i64, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactList {
+  match blocks {
+    IrBlockListNil -> facts
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          pipeline_ir_seed_slot_upper_fact_blocks(rest, vec, slot, pipeline_ir_block_entry_fact_add_result_facts(pipeline_ir_block_entry_facts_add_vector_slot_upper(facts, id, vec, slot)))
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_seed_slot_upper_facts(blocks: IrBlockList, cfg: i64, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactList {
+  if pipeline_ir_blocks_len_facts_stable(blocks) == 0 { facts }
+  else {
+    let table = pipeline_ir_cfg_bundle_def_table(cfg)
+    let slots = nlist_new()
+    pipeline_ir_collect_store_slots(blocks, slots)
+    let n = nlist_len(slots)
+    let max_id = pipeline_ir_native_resident_max_block_id(blocks)
+    let use_dom = if n > 0 and max_id >= 0 and max_id <= 63 and ir_block_list_len(blocks) <= pipeline_ir_block_entry_fact_full_block_limit() { 1 } else { 0 }
+    if use_dom == 0 { facts }
+    else {
+      let dom_sets = pipeline_ir_dominators(blocks, max_id)
+      let dom_words = pipeline_ir_dominators_words(max_id)
+      let mut result = facts
+      let mut i = 0
+      while i < n {
+        let slot = nlist_get(slots, i)
+        let verdict = pipeline_ir_slot_upper_scan_blocks(blocks, table, result, slot, node_new(0, 1, 0 - 1, 0, 0), blocks, dom_sets, max_id, dom_words)
+        if node_f1(verdict) == 1 and node_f3(verdict) == 1 and node_f2(verdict) >= 0 {
+          result = pipeline_ir_seed_slot_upper_fact_blocks(blocks, node_f2(verdict), slot, result)
+        } else { 0 }
+        i = i + 1
+      }
+      result
+    }
+  }
+}
+
 fn pipeline_ir_block_entry_facts_from_blocks(blocks: IrBlockList) -> PipelineIrBlockEntryFactList {
   let pred_counts = pipeline_ir_cfg_fact_bundle(blocks)
   let seed = pipeline_ir_block_entry_facts_from_blocks_inner(blocks, blocks, pred_counts, pipeline_ir_block_entry_facts_empty())
@@ -26481,8 +26680,11 @@ fn pipeline_ir_block_entry_facts_from_blocks(blocks: IrBlockList) -> PipelineIrB
     seed
   }
   -- Slot induction runs against the propagated plane so the increment
-  -- store's block already carries the loop guard's bound fact.
-  pipeline_ir_seed_slot_nonneg_facts(blocks, pred_counts, propagated)
+  -- store's block already carries the loop guard's bound fact; the upper
+  -- induction runs after nonneg because its init leg consumes the seeded
+  -- nonneg facts.
+  let with_nonneg = pipeline_ir_seed_slot_nonneg_facts(blocks, pred_counts, propagated)
+  pipeline_ir_seed_slot_upper_facts(blocks, pred_counts, with_nonneg)
 }
 
 fn pipeline_ir_block_entry_fact_count_blocks(blocks: IrBlockList) -> i64 {
@@ -28342,6 +28544,31 @@ fn pipeline_ir_vector_tightened_check_mode(block_id: i64, block_facts: PipelineI
   }
 }
 
+-- Offset nonnegativity: dst = x + c with 1 <= c <= 4095, x proven
+-- nonnegative, and x bounded above by some vector's length — a real
+-- length is far below the integer maximum, so the sum cannot wrap. The
+-- result is a stable fact about an SSA value; no kill logic applies.
+fn pipeline_ir_binary_offset_nonneg(block_id: i64, block_facts: PipelineIrBlockEntryFactList, env: PipelineIrConstEnv, local_facts: PipelineIrLocalFactEnv, op: IrBinaryOp, lhs: i64, rhs: i64, lc: PipelineIrConstLookup, rc: PipelineIrConstLookup) -> i64 {
+  if ir_binary_op_tag(op) != 1 { 0 }
+  else {
+    let x = if pipeline_ir_const_lookup_valid(rc) == 1 { lhs } else { if pipeline_ir_const_lookup_valid(lc) == 1 { rhs } else { 0 - 1 } }
+    let c = if pipeline_ir_const_lookup_valid(rc) == 1 { pipeline_ir_const_lookup_value(rc) } else { if pipeline_ir_const_lookup_valid(lc) == 1 { pipeline_ir_const_lookup_value(lc) } else { 0 } }
+    if x < 0 or c < 1 or c > 4095 { 0 }
+    else {
+      if pipeline_ir_vector_index_lower_bound_proven(block_id, block_facts, env, local_facts, x) == 0 { 0 }
+      else {
+        if pipeline_ir_block_entry_vector_upper_any_lookup(block_facts, block_id, x) == 1 { 1 }
+        else {
+          let slot = pipeline_ir_vector_index_slot(block_id, local_facts, x)
+          if pipeline_ir_const_lookup_valid(slot) == 1 {
+            pipeline_ir_block_entry_vector_slot_upper_any_lookup(block_facts, block_id, pipeline_ir_const_lookup_value(slot))
+          } else { 0 }
+        }
+      }
+    }
+  }
+}
+
 fn pipeline_optimise_ir_inst(inst: IrInst, block_id: i64, block_facts: PipelineIrBlockEntryFactList, env: PipelineIrConstEnv, aliases: PipelineIrAliasEnv, local_facts: PipelineIrLocalFactEnv, ctx: PipelineIrOptimiseContext, next_value: i64) -> PipelineOptimisedInsts {
   let facts = pipeline_ir_optimise_context_facts(ctx)
   let inline_candidates = pipeline_ir_optimise_context_inline_candidates(ctx)
@@ -28378,7 +28605,12 @@ fn pipeline_optimise_ir_inst(inst: IrInst, block_id: i64, block_facts: PipelineI
           } else {
             let rewrite = pipeline_ir_algebraic_rewrite(dst, op, lhs, rhs, left, right, next_value)
             match rewrite {
-              PipelineIrRewriteUnchanged -> pipeline_optimised_insts(ir_inst_list_prepend(rewritten, ir_inst_list_empty()), env, aliases, local_facts, next_value, 0, 0, 0)
+              PipelineIrRewriteUnchanged -> {
+                let kept_facts = if pipeline_ir_binary_offset_nonneg(block_id, block_facts, env, local_facts, op, lhs, rhs, left, right) == 1 {
+                  pipeline_ir_local_fact_env_bind_nonneg(local_facts, dst)
+                } else { local_facts }
+                pipeline_optimised_insts(ir_inst_list_prepend(rewritten, ir_inst_list_empty()), env, aliases, kept_facts, next_value, 0, 0, 0)
+              }
               _ -> pipeline_optimise_ir_rewrite_result(dst, rewrite, env, aliases, local_facts, next_value)
             }
           }
@@ -28393,7 +28625,12 @@ fn pipeline_optimise_ir_inst(inst: IrInst, block_id: i64, block_facts: PipelineI
         } else {
           let rewrite = pipeline_ir_algebraic_rewrite(dst, op, lhs, rhs, left, right, next_value)
           match rewrite {
-            PipelineIrRewriteUnchanged -> pipeline_optimised_insts(ir_inst_list_prepend(rewritten, ir_inst_list_empty()), env, aliases, local_facts, next_value, 0, 0, 0)
+            PipelineIrRewriteUnchanged -> {
+                let kept_facts = if pipeline_ir_binary_offset_nonneg(block_id, block_facts, env, local_facts, op, lhs, rhs, left, right) == 1 {
+                  pipeline_ir_local_fact_env_bind_nonneg(local_facts, dst)
+                } else { local_facts }
+                pipeline_optimised_insts(ir_inst_list_prepend(rewritten, ir_inst_list_empty()), env, aliases, kept_facts, next_value, 0, 0, 0)
+              }
             _ -> pipeline_optimise_ir_rewrite_result(dst, rewrite, env, aliases, local_facts, next_value)
           }
         }
