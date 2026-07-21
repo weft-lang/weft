@@ -690,7 +690,7 @@ mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"
 assert_equals "mcp_diagnostics_match_guard_bool_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: boolean expression is not bool","span":39,"line":1,"col":40}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad() -> bool { 1 == \"one\" }"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_diagnostics_equality_operand_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: equality operand mismatch","span":-1,"line":-1,"col":-1}]}}'
+assert_equals "mcp_diagnostics_equality_operand_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: equality operand mismatch","span":19,"line":1,"col":20}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad() -> bool { \"a\" < \"b\" }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_comparison_operand_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":2,"functions":1,"check_errors":2,"items":[{"severity":"error","message":"type error: comparison operand is not i64","span":-1,"line":-1,"col":-1},{"severity":"error","message":"type error: comparison operand is not i64","span":-1,"line":-1,"col":-1}]}}'
@@ -699,7 +699,7 @@ mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"
 assert_equals "mcp_diagnostics_bitwise_operand_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: bitwise operand is not i64","span":-1,"line":-1,"col":-1}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad() -> i64 { 1 bshl false }"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_diagnostics_shift_operand_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: bitwise operand is not i64","span":-1,"line":-1,"col":-1}]}}'
+assert_equals "mcp_diagnostics_shift_operand_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: bitwise operand is not i64","span":18,"line":1,"col":19}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad() -> i64 { \"a\" + 1 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_arithmetic_operand_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"items":[{"severity":"error","message":"type error: arithmetic operand is not i64","span":-1,"line":-1,"col":-1}]}}'
@@ -1043,13 +1043,13 @@ assert_test_failure_contains "test_property_empty_range_reports_exhaustion" 'tes
 assert_test_exit_code "test_effect_fixtures_pass" 'test "fixtures" { Test.assert_eq(Test.with_state_i64(2, () => { State.put(State.get() + 1) State.get() }), 3) Test.assert_eq(Test.expect_fail_i64(8, () => Fail.fail(8)), 8) Test.assert_eq(Test.with_io_i64(() => IO.open(0, 7, 0)), 107) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.note("ok", 0)), 3) }' 0
 assert_test_failure_contains "test_fixture_missing_fail_reports_diagnostic" 'test "missing_fail" { Test.expect_fail_i64(1, () => 0) }' 1 "test assertion failed: expect_fail_missing"
 assert_test_failure_contains "test_fixture_wrong_fail_reports_diagnostic" 'test "wrong_fail" { Test.expect_fail_i64(1, () => Fail.fail(2)) }' 1 "test assertion failed: expect_fail_i64"
-assert_test_compile_rejects "test_assert_true_rejects_i64" 'test "bad_bool" { Test.assert_true(1) }' "type error: argument type mismatch"
+assert_test_compile_rejects "test_assert_true_rejects_i64" 'test "bad_bool" { Test.assert_true(2) }' "type error: argument type mismatch"
 assert_test_compile_rejects "test_assert_str_eq_rejects_i64" 'test "bad_str" { Test.assert_str_eq(1, "one") }' "type error: argument type mismatch"
 assert_test_compile_rejects "test_property_rejects_i64_predicate" 'test "bad_property" { Test.forall_i64_range(0, 1, x => x + 1) }' "type error: return type mismatch"
 assert_test_compile_rejects "test_property_rejects_effectful_predicate" $'effect Log { fn hit() -> i64 }\ntest "bad_property_effect" { Test.forall_i64_range(0, 1, x => Log.hit() == x) }' "type error: effect not available in caller"
 assert_test_compile_rejects "test_fixture_rejects_unhandled_state" 'test "bad_state" { State.get() }' "type error: effect not available in caller"
 assert_test_compile_rejects "test_fixture_rejects_wrong_effect_body" 'test "bad_fixture_effect" { Test.with_state_i64(0, () => IO.write(1, 0, 1)) }' "type error: effect not available in caller"
-assert_test_compile_rejects "test_fixture_rejects_wrong_return_body" 'test "bad_fixture_return" { Test.with_io_i64(() => true) }' "type error: return type mismatch"
+assert_test_compile_rejects "test_fixture_rejects_wrong_return_body" 'test "bad_fixture_return" { Test.with_io_i64(() => "nope") }' "type error: return type mismatch"
 
 : > "$tmp_src"
 for ((i = 0; i < 1800; i++)); do
