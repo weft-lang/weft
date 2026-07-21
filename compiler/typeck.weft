@@ -112,7 +112,7 @@ fn tenv_lookup_mutable(env: i64, src: i64, ns: i64, nl: i64) -> i64 {
 fn ftypes_new() -> i64 { nlist_new() }
 
 fn ftypes_add(ft: i64, src: i64, ns: i64, nl: i64, ret_ty: i64, params: i64, effects: i64, tparams: i64) -> i64 {
-  let e = alloc_words(8)
+  let e = alloc_words(10)
   mem_store64_at(e, 0, ns)
   mem_store64_at(e, 8, nl)
   mem_store64_at(e, 16, ret_ty)
@@ -121,7 +121,14 @@ fn ftypes_add(ft: i64, src: i64, ns: i64, nl: i64, ret_ty: i64, params: i64, eff
   mem_store64_at(e, 40, effects)
   mem_store64_at(e, 48, tparams)
   mem_store64_at(e, 56, 0)
+  -- Same-name collision chain (offset 64): distinct declarations sharing a
+  -- name hash link here so lookups can prefer the caller's own source.
+  mem_store64_at(e, 64, 0)
+  -- offset 72: nonzero when this entry is an impl method registered under
+  -- its bare name; such entries never shadow plain functions.
+  mem_store64_at(e, 72, 0)
   nlist_add(ft, e)
+  e
 }
 
 -- Function-type lookups were linear byte-compare scans per call
@@ -152,6 +159,17 @@ fn ftypes_index_insert(tree: i64, hash: i64, entry: i64) -> i64 {
           done = 1
         } else { cur = node_f4(cur) }
       } else {
+        -- Same hash: keep first-wins head, chain the newcomer so lookups
+        -- can prefer an entry declared in the caller's source.
+        let mut chain = node_f2(cur)
+        let mut linked = 0
+        while linked == 0 {
+          if chain == entry { linked = 1 }
+          else { if mem_load64_at(chain, 64) == 0 {
+            mem_store64_at(chain, 64, entry)
+            linked = 1
+          } else { chain = mem_load64_at(chain, 64) } }
+        }
         done = 1
       } }
     }
@@ -189,6 +207,15 @@ fn ftypes_find(ft: i64, src: i64, ns: i64, nl: i64) -> i64 {
     let cur_hash = node_f1(cur)
     if hash == cur_hash {
       result = node_f2(cur)
+      -- On a name collision, a non-method declaration in the caller's own
+      -- source shadows imported ones; otherwise first declaration wins.
+      let mut chain = mem_load64_at(result, 64)
+      while chain != 0 {
+        if mem_load64_at(chain, 24) == src and mem_load64_at(chain, 72) == 0 {
+          result = chain
+          chain = 0
+        } else { chain = mem_load64_at(chain, 64) }
+      }
       cur = 0
     } else { if hash < cur_hash { cur = node_f3(cur) } else { cur = node_f4(cur) } }
   }
@@ -4183,17 +4210,22 @@ fn check_strict_root_unsafe_raw_fns(fns: i64, user_src: i64, tt: i64) -[Diagnose
   } else { 0 }
 }
 
-fn ttable_variant_payload_count(tt: i64, src: i64, ns: i64, nl: i64) -> i64 {
-  if tt == 0 { 0 - 1 }
-  else {
-    let n = mem_load64_at(tt, 8)
-    let d = mem_load64_at(tt, 0)
-    let mut result = 0 - 1
-    let mut ti = 0
-    while ti < n {
-      let kind = mem_load64_at(d, ti * 56 + 16)
-      if kind == 1 {
-        let entry_src = mem_load64_at(d, ti * 56 + 48)
+-- Variant name lookups prefer a declaration in the caller's own source
+-- (local shadows imported), falling back to first declaration in table
+-- order. field selects the per-variant payload count (offset 24) or the
+-- per-type tparams (entry offset 40); mode 0 returns the variant field,
+-- mode 1 the entry field.
+fn ttable_variant_scan(tt: i64, src: i64, ns: i64, nl: i64, same_src_only: i64, mode: i64, missing: i64) -> i64 {
+  let n = mem_load64_at(tt, 8)
+  let d = mem_load64_at(tt, 0)
+  let mut result = missing
+  let mut ti = 0
+  while ti < n {
+    let kind = mem_load64_at(d, ti * 56 + 16)
+    if kind == 1 {
+      let entry_src = mem_load64_at(d, ti * 56 + 48)
+      if same_src_only == 1 and entry_src != src { 0 }
+      else {
         let nvariants = mem_load64_at(d, ti * 56 + 24)
         let variants = mem_load64_at(d, ti * 56 + 32)
         let mut vi = 0
@@ -4202,48 +4234,37 @@ fn ttable_variant_payload_count(tt: i64, src: i64, ns: i64, nl: i64) -> i64 {
           let v_nl = mem_load64_at(variants, vi * 40 + 8)
           if v_nl == nl {
             if src_eq_at(src, ns, entry_src + v_ns, 0, nl) == 1 {
-              result = mem_load64_at(variants, vi * 40 + 24)
+              result = if mode == 0 { mem_load64_at(variants, vi * 40 + 24) }
+                else { mem_load64_at(d, ti * 56 + 40) }
               vi = nvariants
               ti = n
             } else { vi = vi + 1 }
           } else { vi = vi + 1 }
         }
-      } else { 0 }
-      ti = ti + 1
-    }
-    result
+      }
+    } else { 0 }
+    ti = ti + 1
+  }
+  result
+}
+
+fn ttable_variant_payload_count(tt: i64, src: i64, ns: i64, nl: i64) -> i64 {
+  if tt == 0 { 0 - 1 }
+  else {
+    let local = ttable_variant_scan(tt, src, ns, nl, 1, 0, 0 - 1)
+    if local != 0 - 1 { local }
+    else { ttable_variant_scan(tt, src, ns, nl, 0, 0, 0 - 1) }
   }
 }
 
 fn ttable_variant_tparams(tt: i64, src: i64, ns: i64, nl: i64) -> i64 {
   if tt == 0 { 0 }
   else {
-    let n = mem_load64_at(tt, 8)
-    let d = mem_load64_at(tt, 0)
-    let mut result = 0
-    let mut ti = 0
-    while ti < n {
-      let kind = mem_load64_at(d, ti * 56 + 16)
-      if kind == 1 {
-        let entry_src = mem_load64_at(d, ti * 56 + 48)
-        let nvariants = mem_load64_at(d, ti * 56 + 24)
-        let variants = mem_load64_at(d, ti * 56 + 32)
-        let mut vi = 0
-        while vi < nvariants {
-          let v_ns = mem_load64_at(variants, vi * 40)
-          let v_nl = mem_load64_at(variants, vi * 40 + 8)
-          if v_nl == nl {
-            if src_eq_at(src, ns, entry_src + v_ns, 0, nl) == 1 {
-              result = mem_load64_at(d, ti * 56 + 40)
-              vi = nvariants
-              ti = n
-            } else { vi = vi + 1 }
-          } else { vi = vi + 1 }
-        }
-      } else { 0 }
-      ti = ti + 1
-    }
-    result
+    -- Resolve which TYPE owns the variant with local-shadows-imported
+    -- preference; payload-count success implies the same entry wins here.
+    let local = if ttable_variant_scan(tt, src, ns, nl, 1, 0, 0 - 1) != 0 - 1 { 1 } else { 0 }
+    if local == 1 { ttable_variant_scan(tt, src, ns, nl, 1, 1, 0) }
+    else { ttable_variant_scan(tt, src, ns, nl, 0, 1, 0) }
   }
 }
 
@@ -8079,7 +8100,8 @@ fn check_user_fns(fns: i64, user_src: i64, tt: i64) -[Conformance, Diagnose]> i6
     let fn_wrap = node_f1(pair)
     let fn_src = node_f2(pair)
     let inner = fn_inner(fn_wrap)
-    ftypes_add(ft, fn_src, node_f1(inner), node_f2(inner), fn_ret_type(fn_wrap), node_f3(inner), fn_effects(fn_wrap), fn_tparams(fn_wrap))
+    let reg_entry = ftypes_add(ft, fn_src, node_f1(inner), node_f2(inner), fn_ret_type(fn_wrap), node_f3(inner), fn_effects(fn_wrap), fn_tparams(fn_wrap))
+    if node_f3(pair) != 0 { mem_store64_at(reg_entry, 72, 1) } else { 0 }
     ftypes_set_body(ft, fn_src, node_f1(inner), node_f2(inner), node_f4(inner))
   }
   -- Register variant constructors from type table
