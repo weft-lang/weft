@@ -234,7 +234,7 @@ type PipelineIrRowUpperEnv {
 }
 
 type PipelineIrOptimiseContext {
-  PipelineIrOptimiseContext(PipelineIrSemanticFactList, PipelineIrInlineCandidateList, i64)
+  PipelineIrOptimiseContext(PipelineIrSemanticFactList, PipelineIrInlineCandidateList, i64, i64)
 }
 
 type PipelineIrInlineCandidateList {
@@ -21316,6 +21316,15 @@ fn pipeline_ir_native_inst_clobbers_pinned(inst: IrInst) -> i64 {
       if kind == 0 { 1 } else { pipeline_ir_native_intrinsic_clobbers_pinned(kind) }
     }
     IrIndirectCallI64(dst, callee, args) -> 1
+    -- Generic and method calls run ordinary function bodies: the
+    -- pinned-slot bank (x8/x10/x11) is call-clobbered scratch, so they
+    -- disqualify pinning exactly like a direct call. Historically an
+    -- ordinary call was always present alongside them and masked this
+    -- gap; pure-intrinsic wrapper inlining removed the masking call in
+    -- generic-call-only loops and a pinned loop counter reset every
+    -- iteration.
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> 1
+    IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> 1
     IrOwnedDropI64(value, type_hash) -> 1
     IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> 1
     IrPerformI64(dst, effect_hash, op_hash, args) -> 1
@@ -23467,7 +23476,7 @@ fn pipeline_ir_native_frame_size_for_next_value(next_value: i64) -> i64 {
 }
 
 fn pipeline_ir_native_frame_size_for_blocks(param_count: i64, blocks: IrBlockList) -> i64 {
-  let next_value = pipeline_ir_function_next_value(param_count, blocks)
+  let next_value = pipeline_ir_function_next_value(8, blocks)
   let temp_count = pipeline_ir_native_max_block_param_count(blocks, 0)
   let with_jump_temps = if temp_count > 0 { next_value + 8 + temp_count } else { next_value }
   pipeline_ir_native_frame_size_for_next_value(with_jump_temps)
@@ -28693,31 +28702,41 @@ fn pipeline_ir_inline_candidates_from_functions(functions: IrFunctionList, facts
 }
 
 fn pipeline_ir_optimise_context(facts: PipelineIrSemanticFactList, inline_candidates: PipelineIrInlineCandidateList) -> PipelineIrOptimiseContext {
-  PipelineIrOptimiseContext(facts, inline_candidates, 0)
+  PipelineIrOptimiseContext(facts, inline_candidates, 0, 0)
 }
 
 -- pure_callees is the module-level hash tree of pure callee hashes,
 -- built once per optimise pass; calls to these cannot shrink a vector,
 -- so the len-fact stability walks admit them.
 fn pipeline_ir_optimise_context3(facts: PipelineIrSemanticFactList, inline_candidates: PipelineIrInlineCandidateList, pure_callees: i64) -> PipelineIrOptimiseContext {
-  PipelineIrOptimiseContext(facts, inline_candidates, pure_callees)
+  PipelineIrOptimiseContext(facts, inline_candidates, pure_callees, 0)
+}
+
+fn pipeline_ir_optimise_context4(facts: PipelineIrSemanticFactList, inline_candidates: PipelineIrInlineCandidateList, pure_callees: i64, param_count: i64) -> PipelineIrOptimiseContext {
+  PipelineIrOptimiseContext(facts, inline_candidates, pure_callees, param_count)
 }
 
 fn pipeline_ir_optimise_context_facts(ctx: PipelineIrOptimiseContext) -> PipelineIrSemanticFactList {
   match ctx {
-    PipelineIrOptimiseContext(facts, inline_candidates, pure_callees) -> facts
+    PipelineIrOptimiseContext(facts, inline_candidates, pure_callees, param_count) -> facts
   }
 }
 
 fn pipeline_ir_optimise_context_inline_candidates(ctx: PipelineIrOptimiseContext) -> PipelineIrInlineCandidateList {
   match ctx {
-    PipelineIrOptimiseContext(facts, inline_candidates, pure_callees) -> inline_candidates
+    PipelineIrOptimiseContext(facts, inline_candidates, pure_callees, param_count) -> inline_candidates
   }
 }
 
 fn pipeline_ir_optimise_context_pure_callees(ctx: PipelineIrOptimiseContext) -> i64 {
   match ctx {
-    PipelineIrOptimiseContext(facts, inline_candidates, pure_callees) -> pure_callees
+    PipelineIrOptimiseContext(facts, inline_candidates, pure_callees, param_count) -> pure_callees
+  }
+}
+
+fn pipeline_ir_optimise_context_fn_param_count(ctx: PipelineIrOptimiseContext) -> i64 {
+  match ctx {
+    PipelineIrOptimiseContext(facts, inline_candidates, pure_callees, param_count) -> param_count
   }
 }
 
@@ -31220,6 +31239,443 @@ fn pipeline_ir_merge_rebuild(scan: IrBlockList, all_blocks: IrBlockList, consume
   }
 }
 
+
+-- ── loop-invariant code motion ──
+-- Pure instructions (consts, i64/float binaries, unaries) whose
+-- operands are all defined outside a loop hoist to the loop's
+-- preheader: block-local value numbering cannot span a backedge, so a
+-- loop body recomputes row bases and re-materialises fallback consts
+-- on every iteration. A loop is a backedge S --> T with T dominating S;
+-- its body is T, S, and every block that reaches S without passing T;
+-- the preheader is T's unique non-backedge predecessor when it ends in
+-- a plain jump. Hoisted operands must be function params or defined in
+-- a block dominating the preheader (this IR's verifier does not yet
+-- check cross-block dominance, so the gate is explicit). Innermost
+-- loops hoist first; iterating the fold re-hoists through outer levels.
+
+fn pipeline_ir_licm_value_def_blocks(blocks: IrBlockList, next_value: i64) -> i64 {
+  let map = pipeline_ir_native_resident_dense_new(next_value, 0 - 1)
+  let mut cur = blocks
+  let mut walking = 1
+  while walking == 1 {
+    match cur {
+      IrBlockListNil -> { walking = 0 }
+      IrBlockListCons(block, rest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> {
+            let mut pcur = params
+            let mut pdone = 0
+            while pdone == 0 {
+              match pcur {
+                IrValueNil -> { pdone = 1 }
+                IrValueCons(p, prest) -> {
+                  if p >= 0 and p < next_value { pipeline_ir_native_resident_dense_set(map, p, id) } else { 0 }
+                  pcur = prest
+                }
+              }
+            }
+            let mut icur = insts
+            let mut idone = 0
+            while idone == 0 {
+              match icur {
+                IrInstNil -> { idone = 1 }
+                IrInstCons(inst, irest) -> {
+                  let d = pipeline_ir_inst_def_or(inst, 0 - 1)
+                  if d >= 0 and d < next_value { pipeline_ir_native_resident_dense_set(map, d, id) } else { 0 }
+                  icur = irest
+                }
+              }
+            }
+          }
+        }
+        cur = rest
+      }
+    }
+  }
+  map
+}
+
+fn pipeline_ir_licm_inst_pure(inst: IrInst) -> i64 {
+  match inst {
+    IrConstI64(dst, value) -> 1
+    IrNilI64(dst) -> 1
+    IrBinaryI64(dst, op, lhs, rhs) -> 1
+    IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> 1
+    IrUnaryI64(dst, op, value) -> 1
+    _ -> 0
+  }
+}
+
+fn pipeline_ir_licm_operand_ok(v: i64, param_count: i64, def_blocks: i64, next_value: i64, in_loop: i64, dom_sets: i64, dom_max: i64, dom_words: i64, pre: i64) -> i64 {
+  -- Only true function params are entry-defined; the value counter
+  -- starts at nparams, so ids in [nparams, 8) are ordinary body temps
+  -- that may be loop-defined (treating them as invariant miscompiled).
+  if v < param_count { 1 }
+  else { if v < 0 or v >= next_value { 0 }
+  else {
+    let db = nlist_get(def_blocks, v)
+    if db < 0 { 0 }
+    else { if nlist_get(in_loop, db) == 1 { 0 }
+    else {
+      if db == pre { 1 }
+      else { if db >= 0 and db <= dom_max and pre >= 0 and pre <= dom_max {
+        pipeline_ir_native_dominators_bit_get_checked(dom_sets, dom_words, pre, db)
+      } else { 0 } }
+    } }
+  } }
+}
+
+fn pipeline_ir_native_dominators_bit_get_checked(dom_sets: i64, dom_words: i64, block: i64, other: i64) -> i64 {
+  pipeline_ir_dominators_bit_get(dom_sets, dom_words, block, other)
+}
+
+fn pipeline_ir_licm_inst_operands_ok(inst: IrInst, param_count: i64, def_blocks: i64, next_value: i64, in_loop: i64, dom_sets: i64, dom_max: i64, dom_words: i64, pre: i64) -> i64 {
+  match inst {
+    IrConstI64(dst, value) -> 1
+    IrNilI64(dst) -> 1
+    IrBinaryI64(dst, op, lhs, rhs) -> {
+      if pipeline_ir_licm_operand_ok(lhs, param_count, def_blocks, next_value, in_loop, dom_sets, dom_max, dom_words, pre) == 1 {
+        pipeline_ir_licm_operand_ok(rhs, param_count, def_blocks, next_value, in_loop, dom_sets, dom_max, dom_words, pre)
+      } else { 0 }
+    }
+    IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> {
+      if pipeline_ir_licm_operand_ok(lhs, param_count, def_blocks, next_value, in_loop, dom_sets, dom_max, dom_words, pre) == 1 {
+        pipeline_ir_licm_operand_ok(rhs, param_count, def_blocks, next_value, in_loop, dom_sets, dom_max, dom_words, pre)
+      } else { 0 }
+    }
+    IrUnaryI64(dst, op, value) -> pipeline_ir_licm_operand_ok(value, param_count, def_blocks, next_value, in_loop, dom_sets, dom_max, dom_words, pre)
+    _ -> 0
+  }
+}
+
+fn pipeline_ir_licm_hoist_one_loop(blocks: IrBlockList, param_count: i64, s: i64, t: i64, max_id: i64, dom_sets: i64, dom_words: i64) -> IrBlockList {
+  -- loop membership: T, S, and blocks reaching S without passing T
+  let n = max_id + 1
+  let in_loop = pipeline_ir_native_resident_dense_new(n, 0)
+  pipeline_ir_native_resident_dense_set(in_loop, t, 1)
+  pipeline_ir_native_resident_dense_set(in_loop, s, 1)
+  let mut b = 0
+  while b < n {
+    if nlist_get(in_loop, b) == 0 and b != t {
+      if pipeline_ir_dominators_bit_get(dom_sets, dom_words, b, t) == 1 {
+        if b == s or pipeline_ir_block_reaches_avoiding(blocks, max_id, b, s, t) == 1 {
+          pipeline_ir_native_resident_dense_set(in_loop, b, 1)
+        } else { 0 }
+      } else { 0 }
+    } else { 0 }
+    b = b + 1
+  }
+  -- preheader: T's unique non-backedge jump predecessor
+  let mut pre = 0 - 1
+  let mut pre_count = 0
+  let mut pcur = blocks
+  let mut pwalk = 1
+  while pwalk == 1 {
+    match pcur {
+      IrBlockListNil -> { pwalk = 0 }
+      IrBlockListCons(block, rest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> {
+            let hits = pipeline_ir_term_predecessor_count(term, t)
+            if hits > 0 and nlist_get(in_loop, id) == 0 {
+              pre_count = pre_count + hits
+              match term {
+                IrTermJump(target, args) -> { pre = id }
+                _ -> { pre = 0 - 1 }
+              }
+            } else { 0 }
+          }
+        }
+        pcur = rest
+      }
+    }
+  }
+  if pre < 0 or pre_count != 1 { blocks }
+  else {
+    let next_value = pipeline_ir_function_next_value(param_count, blocks)
+    let def_blocks = pipeline_ir_licm_value_def_blocks(blocks, next_value)
+    -- collect hoistable insts from loop blocks, fixpoint so chains
+    -- (const feeding a mul) hoist together; hoisted defs re-mark as
+    -- preheader-resident for later candidates
+    let hoisted = nlist_new()
+    let mut changed = 1
+    while changed == 1 {
+      changed = 0
+      let mut hcur = blocks
+      let mut hwalk = 1
+      while hwalk == 1 {
+        match hcur {
+          IrBlockListNil -> { hwalk = 0 }
+          IrBlockListCons(block, rest) -> {
+            match block {
+              IrBlock(id, params, insts, term) -> {
+                if id >= 0 and id <= max_id and nlist_get(in_loop, id) == 1 {
+                  let mut icur = insts
+                  let mut idone = 0
+                  while idone == 0 {
+                    match icur {
+                      IrInstNil -> { idone = 1 }
+                      IrInstCons(inst, irest) -> {
+                        let d = pipeline_ir_inst_def_or(inst, 0 - 1)
+                        let already = if d >= 0 and d < next_value { if nlist_get(def_blocks, d) == pre { 1 } else { 0 } } else { 1 }
+                        if already == 0 and pipeline_ir_licm_inst_pure(inst) == 1 and pipeline_ir_licm_inst_operands_ok(inst, param_count, def_blocks, next_value, in_loop, dom_sets, max_id, dom_words, pre) == 1 {
+                          nlist_add(hoisted, d)
+                          changed = 0
+                        } else { 0 }
+                        icur = irest
+                      }
+                    }
+                  }
+                } else { 0 }
+              }
+            }
+            hcur = rest
+          }
+        }
+      }
+    }
+    if nlist_len(hoisted) == 0 { blocks }
+    else {
+      pipeline_ir_licm_rebuild(blocks, in_loop, max_id, pre, hoisted)
+    }
+  }
+}
+
+fn pipeline_ir_licm_value_in_list(list: i64, v: i64) -> i64 {
+  pipeline_ir_native_int_list_contains(list, v)
+}
+
+fn pipeline_ir_licm_rebuild(blocks: IrBlockList, in_loop: i64, max_id: i64, pre: i64, hoisted: i64) -> IrBlockList {
+  -- first sweep: pull hoisted insts (in block order, which preserves
+  -- their original dependency order) out of loop blocks
+  let mut collected = ir_inst_list_empty()
+  let mut cur = blocks
+  let mut walking = 1
+  let mut kept_blocks = IrBlockListNil
+  while walking == 1 {
+    match cur {
+      IrBlockListNil -> { walking = 0 }
+      IrBlockListCons(block, rest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> {
+            if id >= 0 and id <= max_id and nlist_get(in_loop, id) == 1 {
+              let mut keep = ir_inst_list_empty()
+              let mut icur = insts
+              let mut idone = 0
+              while idone == 0 {
+                match icur {
+                  IrInstNil -> { idone = 1 }
+                  IrInstCons(inst, irest) -> {
+                    let d = pipeline_ir_inst_def_or(inst, 0 - 1)
+                    if d >= 0 and pipeline_ir_licm_value_in_list(hoisted, d) == 1 {
+                      collected = ir_inst_list_append(collected, ir_inst_list_prepend(inst, ir_inst_list_empty()))
+                    } else {
+                      keep = ir_inst_list_append(keep, ir_inst_list_prepend(inst, ir_inst_list_empty()))
+                    }
+                    icur = irest
+                  }
+                }
+              }
+              kept_blocks = pipeline_ir_licm_blocks_append(kept_blocks, ir_block_new_params(id, params, keep, term))
+            } else {
+              kept_blocks = pipeline_ir_licm_blocks_append(kept_blocks, block)
+            }
+          }
+        }
+        cur = rest
+      }
+    }
+  }
+  -- order the collected insts by dependency: block order is not
+  -- dominance order, so an inst may precede its operand's def in the
+  -- raw sweep. Repeatedly append insts whose hoisted operands are all
+  -- already emitted.
+  let ordered = pipeline_ir_licm_order_collected(collected, hoisted)
+  -- second sweep: append the ordered insts to the preheader
+  let mut final_blocks = IrBlockListNil
+  let mut fcur = kept_blocks
+  let mut fwalk = 1
+  while fwalk == 1 {
+    match fcur {
+      IrBlockListNil -> { fwalk = 0 }
+      IrBlockListCons(block, rest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> {
+            if id == pre {
+              final_blocks = pipeline_ir_licm_blocks_append(final_blocks, ir_block_new_params(id, params, ir_inst_list_append(insts, ordered), term))
+            } else {
+              final_blocks = pipeline_ir_licm_blocks_append(final_blocks, block)
+            }
+          }
+        }
+        fcur = rest
+      }
+    }
+  }
+  final_blocks
+}
+
+fn pipeline_ir_licm_inst_operands_emitted(inst: IrInst, pending: i64) -> i64 {
+  match inst {
+    IrBinaryI64(dst, op, lhs, rhs) -> {
+      if pipeline_ir_native_int_list_contains(pending, lhs) == 1 { 0 }
+      else { if pipeline_ir_native_int_list_contains(pending, rhs) == 1 { 0 } else { 1 } }
+    }
+    IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> {
+      if pipeline_ir_native_int_list_contains(pending, lhs) == 1 { 0 }
+      else { if pipeline_ir_native_int_list_contains(pending, rhs) == 1 { 0 } else { 1 } }
+    }
+    IrUnaryI64(dst, op, value) -> if pipeline_ir_native_int_list_contains(pending, value) == 1 { 0 } else { 1 }
+    _ -> 1
+  }
+}
+
+fn pipeline_ir_licm_order_collected(collected: IrInstList, hoisted: i64) -> IrInstList {
+  let pending = nlist_new()
+  let n = nlist_len(hoisted)
+  let mut i = 0
+  while i < n {
+    nlist_add(pending, nlist_get(hoisted, i))
+    i = i + 1
+  }
+  let mut ordered = ir_inst_list_empty()
+  let mut remaining = collected
+  let mut rounds = 0
+  while nlist_len(pending) > 0 and rounds < n + 2 {
+    let mut next_remaining = ir_inst_list_empty()
+    let mut cur = remaining
+    let mut done = 0
+    while done == 0 {
+      match cur {
+        IrInstNil -> { done = 1 }
+        IrInstCons(inst, rest) -> {
+          if pipeline_ir_licm_inst_operands_emitted(inst, pending) == 1 {
+            ordered = ir_inst_list_append(ordered, ir_inst_list_prepend(inst, ir_inst_list_empty()))
+            let d = pipeline_ir_inst_def_or(inst, 0 - 1)
+            pipeline_ir_licm_pending_remove(pending, d)
+          } else {
+            next_remaining = ir_inst_list_append(next_remaining, ir_inst_list_prepend(inst, ir_inst_list_empty()))
+          }
+          cur = rest
+        }
+      }
+    }
+    remaining = next_remaining
+    rounds = rounds + 1
+  }
+  -- anything left unplaced (should not happen) is appended to keep the
+  -- defs present; the verifier flags ordering if it ever fires
+  ir_inst_list_append(ordered, remaining)
+}
+
+fn pipeline_ir_licm_pending_remove(pending: i64, v: i64) -> i64 {
+  let n = nlist_len(pending)
+  let mut i = 0
+  let mut found = 0 - 1
+  while i < n and found < 0 {
+    if nlist_get(pending, i) == v { found = i } else { i = i + 1 }
+  }
+  if found >= 0 {
+    pipeline_ir_native_resident_dense_set(pending, found, nlist_get(pending, n - 1))
+    nlist_set_len(pending, n - 1)
+  } else { 0 }
+}
+
+fn pipeline_ir_licm_blocks_append(blocks: IrBlockList, block: IrBlock) -> IrBlockList {
+  match blocks {
+    IrBlockListNil -> IrBlockListCons(block, IrBlockListNil)
+    IrBlockListCons(head, rest) -> IrBlockListCons(head, pipeline_ir_licm_blocks_append(rest, block))
+  }
+}
+
+fn pipeline_ir_licm_has_candidate_backedge(blocks: IrBlockList, max_id: i64) -> i64 {
+  -- cheap pre-gate: a jump whose target's entry precedes it in layout
+  -- order is the only shape that can be a backedge; skip the dominator
+  -- computation entirely for straight-line functions.
+  let entry_pos = pipeline_ir_native_resident_dense_new(max_id + 1, 0 - 1)
+  let mut pos = 0
+  let mut cur = blocks
+  let mut walking = 1
+  while walking == 1 {
+    match cur {
+      IrBlockListNil -> { walking = 0 }
+      IrBlockListCons(block, rest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> {
+            if id >= 0 and id <= max_id { pipeline_ir_native_resident_dense_set(entry_pos, id, pos) } else { 0 }
+            pos = pos + 1
+          }
+        }
+        cur = rest
+      }
+    }
+  }
+  let mut found = 0
+  let mut pos2 = 0
+  let mut cur2 = blocks
+  let mut walking2 = 1
+  while walking2 == 1 {
+    match cur2 {
+      IrBlockListNil -> { walking2 = 0 }
+      IrBlockListCons(block, rest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> {
+            match term {
+              IrTermJump(target, args) -> {
+                if target >= 0 and target <= max_id and nlist_get(entry_pos, target) >= 0 and nlist_get(entry_pos, target) <= pos2 { found = 1 } else { 0 }
+              }
+              _ -> 0
+            }
+            pos2 = pos2 + 1
+          }
+        }
+        cur2 = rest
+      }
+    }
+  }
+  found
+}
+
+fn pipeline_ir_hoist_loop_invariants(blocks: IrBlockList, param_count: i64) -> IrBlockList {
+  let max_id = pipeline_ir_native_resident_max_block_id(blocks)
+  if max_id < 0 or max_id > 63 or ir_block_list_len(blocks) > 64 { blocks }
+  else { if pipeline_ir_licm_has_candidate_backedge(blocks, max_id) == 0 { blocks }
+  else {
+    let dom_sets = pipeline_ir_dominators(blocks, max_id)
+    let dom_words = pipeline_ir_dominators_words(max_id)
+    -- find backedges S -> T (T dominates S) and hoist each loop once;
+    -- innermost first is approximated by processing deeper targets
+    -- first (higher entry gpos = later block), and the fold fixpoint
+    -- re-runs the pass for chained levels.
+    let mut result = blocks
+    let mut scan = blocks
+    let mut walking = 1
+    while walking == 1 {
+      match scan {
+        IrBlockListNil -> { walking = 0 }
+        IrBlockListCons(block, rest) -> {
+          match block {
+            IrBlock(id, params, insts, term) -> {
+              match term {
+                IrTermJump(target, args) -> {
+                  if target >= 0 and target <= max_id and id >= 0 and id <= max_id {
+                    if pipeline_ir_dominators_bit_get(dom_sets, dom_words, id, target) == 1 {
+                      result = pipeline_ir_licm_hoist_one_loop(result, param_count, id, target, max_id, dom_sets, dom_words)
+                    } else { 0 }
+                  } else { 0 }
+                }
+                _ -> 0
+              }
+            }
+          }
+          scan = rest
+        }
+      }
+    }
+    result
+  } }
+}
+
 -- Collapse whole chains before the next fold round: one merge level per
 -- call, iterated to a fixpoint here so the fold's own fixpoint does not
 -- spend a full (fact pass + walk) round per chain link.
@@ -31240,7 +31696,8 @@ fn pipeline_ir_cfg_fold_once(blocks: IrBlockList, ctx: PipelineIrOptimiseContext
   let folded_raw = pipeline_optimised_blocks_blocks(folded)
   let threaded_blocks = pipeline_ir_thread_const_arg_jumps(folded_raw, folded_raw)
   let merged_blocks = pipeline_ir_merge_jump_chains(threaded_blocks)
-  let reachable_blocks = pipeline_ir_filter_reachable_blocks(merged_blocks)
+  let hoisted_blocks = pipeline_ir_hoist_loop_invariants(merged_blocks, pipeline_ir_optimise_context_fn_param_count(ctx))
+  let reachable_blocks = pipeline_ir_filter_reachable_blocks(hoisted_blocks)
   pipeline_optimised_blocks(
     reachable_blocks,
     pipeline_optimised_blocks_next_value(folded),
@@ -31691,7 +32148,7 @@ fn pipeline_optimise_ir_function(f: IrFunction, inline_candidates: PipelineIrInl
     IrFunction(hash, params, blocks, src) -> {
       let first_next_value = pipeline_ir_function_next_value(params, blocks)
       let block_count = ir_block_list_len(blocks)
-      let ctx = pipeline_ir_optimise_context3(facts, inline_candidates, pure_callees)
+      let ctx = pipeline_ir_optimise_context4(facts, inline_candidates, pure_callees, params)
       let folded = if block_count == 1 {
         pipeline_optimise_ir_block_list_with_param_consts(blocks, blocks, pipeline_ir_const_env_empty(), ctx, pipeline_ir_block_entry_facts_empty(), first_next_value)
       } else {

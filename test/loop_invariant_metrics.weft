@@ -1,0 +1,154 @@
+-- test/loop_invariant_metrics.weft -- loop-invariant code motion:
+-- runtime semantics locks and structural pins.
+--
+-- LICM hoists pure instructions (consts, binaries, unaries) whose
+-- operands are defined outside a loop to the loop's preheader. Chains
+-- (a const feeding an invariant multiply) complete across fold rounds:
+-- the single-call chain form miscompiled (a hoisted def could vanish
+-- while its use remained) and is locked out by the runtime tests here.
+
+use "stdlib/vector.weft"
+use "stdlib/math.weft"
+use "stdlib/f64_table.weft"
+use "stdlib/num.weft"
+use "compiler/codegen.weft"
+use "compiler/typeck.weft"
+use "compiler/macho.weft"
+use "compiler/object.weft"
+use "compiler/ir.weft"
+use "compiler/grammar.weft"
+use "compiler/pipeline.weft"
+use "runtime/unsafe.weft"
+
+-- ── runtime semantics locks ──
+
+fn licm_nested_int(n: i64, w: i64) -> i64 {
+  let mut s = 0
+  let mut i = 0
+  while i < n {
+    let mut j = 0
+    while j < n {
+      s = s + i * w + j
+      j = j + 1
+    }
+    i = i + 1
+  }
+  s
+}
+
+test "licm_runtime_nested_invariant_mul" {
+  Test.assert_eq(licm_nested_int(10, 7), 3600)
+}
+
+fn licm_table_pairs(t: i64) -> f64 {
+  -- REGRESSION LOCK for the chain-hoist miscompile: the i-row base
+  -- multiply hoists out of the j loop; the buggy single-call chain form
+  -- deleted the hoisted def and the xi get read an undefined index.
+  let mut acc: f64 = 0.0
+  let count = f64_table_row_count(t, 7)
+  for i in 0..count {
+    let mut j = i + 1
+    while j < count {
+      let xi = f64_table_get(t, i, 7, 0, 0.0)
+      let xj = f64_table_get(t, j, 7, 0, 0.0)
+      acc = acc - (xi + xj)
+      j = j + 1
+    }
+  }
+  acc
+}
+
+test "licm_runtime_table_pair_sum" {
+  let t = f64_table_new(7, 3)
+  let mut k = 0
+  while k < 21 {
+    vector_push<f64>(t, num_i64_to_f64(k) * 0.5)
+    k = k + 1
+  }
+  -- rows start at 0.0, 3.5, 7.0; pair sums total 21
+  Test.assert_eq(if licm_table_pairs(t) == 0.0 - 21.0 { 1 } else { 0 }, 1)
+}
+
+fn licm_calls_in_loop(v: i64, n: i64) -> f64 {
+  -- REGRESSION LOCK for the pinned-slot generic-call clobber: j lives
+  -- across generic vector_get spec calls; the slot-pin bank is
+  -- call-clobbered scratch, so generic calls must disqualify pinning.
+  let mut s: f64 = 0.0
+  let mut i = 0
+  while i < n {
+    let mut j = 0
+    while j < n {
+      let a = vector_get<f64>(v, i, 0.0)
+      let b = vector_get<f64>(v, j, 0.0)
+      let d = a - b
+      s = s + math_sqrt_f64(d * d)
+      j = j + 1
+    }
+    i = i + 1
+  }
+  s
+}
+
+test "licm_runtime_generic_calls_keep_loop_counters" {
+  let v = vector_new<f64>()
+  vector_push<f64>(v, 1.0)
+  vector_push<f64>(v, 3.0)
+  vector_push<f64>(v, 6.0)
+  Test.assert_eq(if licm_calls_in_loop(v, 3) == 20.0 { 1 } else { 0 }, 1)
+}
+
+-- ── structural pin: the invariant multiply leaves the inner loop ──
+
+fn licm_probe_ir(src: str) -> IrModule {
+  let typed = pipeline_check_source_with_origin(__str_ptr(src), __str_len(src), 1, 0)
+  let ir = pipeline_lower_ir(typed)
+  pipeline_optimise_typed_ir(typed, ir)
+}
+
+fn licm_count_module_muls(functions: IrFunctionList, want_hash: i64) -> i64 {
+  match functions {
+    IrFunctionNil -> 0
+    IrFunctionCons(f, rest) -> {
+      let here = match f {
+        IrFunction(hash, params, blocks, src) -> if hash == want_hash { licm_count_block_muls(blocks) } else { 0 }
+      }
+      here + licm_count_module_muls(rest, want_hash)
+    }
+  }
+}
+
+fn licm_count_block_muls(blocks: IrBlockList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      let here = match block {
+        IrBlock(id, params, insts, term) -> licm_count_inst_muls(insts)
+      }
+      here + licm_count_block_muls(rest)
+    }
+  }
+}
+
+fn licm_count_inst_muls(insts: IrInstList) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let one = match inst {
+        IrBinaryI64(dst, op, lhs, rhs) -> if ir_binary_op_tag(op) == 3 { 1 } else { 0 }
+        _ -> 0
+      }
+      one + licm_count_inst_muls(rest)
+    }
+  }
+}
+
+test "licm_static_invariant_row_mul_hoists" {
+  -- The i-row multiply is invariant across the j loop and hoists to the
+  -- j preheader (executed per i, not per pair); the j-row multiply
+  -- stays. Pin: at most 2 muls total in the optimised probe module.
+  let src = "use \"stdlib/vector.weft\" use \"stdlib/f64_table.weft\" fn p(t: i64) -> f64 { let mut acc: f64 = 0.0 let count = f64_table_row_count(t, 7) for i in 0..count { let mut j = i + 1 while j < count { acc = acc + f64_table_get(t, i, 7, 0, 0.0) + f64_table_get(t, j, 7, 0, 0.0) j = j + 1 } } acc } fn main() -> i64 { 0 }"
+  let muls = licm_count_module_muls(pipeline_ir_functions(licm_probe_ir(src)), str_hash(__str_ptr("p"), 0, 1))
+  -- the j-row multiply stays in the pair loop; the hoisted i-row
+  -- multiply sits in the j preheader — 2 muls total in p
+  Test.assert_eq(muls, 2)
+}
