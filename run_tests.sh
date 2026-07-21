@@ -10,7 +10,10 @@ WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-8000000}
 # Whole-compiler in-process tripwire tests (ir_verifier_metrics,
 # emission_audit_metrics) legitimately peak at ~1.7 GB arena RSS; the
 # limit guards runaways above that with margin.
-WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-2500000}
+# 4 GB: full-tree checking (every imported body) grew in-process pipeline
+# metric tests' peak RSS from ~2.5 GB to ~3.7 GB. Checker allocation
+# frugality / identifier interning is the queued lever to bring this down.
+WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-4000000}
 WEFT_TEST_SHOW_TIMINGS=${WEFT_TEST_SHOW_TIMINGS:-1}
 PASS=0
 FAIL=0
