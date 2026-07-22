@@ -136,9 +136,13 @@ type PipelineHandlerInlineStats {
   PipelineHandlerInlineStats(i64, i64)
 }
 
+-- Dense value-indexed const map: header = [known_ptr, value_ptr, cap].
+-- SSA ids are unique and the verifier enforces cross-block dominance, so
+-- one monotone in-place map per function round replaces the assoc list
+-- that made every operand lookup O(consts-so-far).
 type PipelineIrConstEnv {
   PipelineIrConstEnvNil,
-  PipelineIrConstEnvCons(i64, i64, i64, PipelineIrConstEnv)
+  PipelineIrConstEnvDense(i64)
 }
 
 type PipelineIrConstLookup {
@@ -147,7 +151,7 @@ type PipelineIrConstLookup {
 
 type PipelineIrAliasEnv {
   PipelineIrAliasEnvNil,
-  PipelineIrAliasEnvCons(i64, i64, PipelineIrAliasEnv)
+  PipelineIrAliasEnvDense(i64)
 }
 
 type PipelineIrRewrite {
@@ -22800,12 +22804,52 @@ fn pipeline_emit_native_binary(native: NativeModule, src: i64) -> BinaryObject {
   pipeline_emit_native_binary_as(pipeline_native_binary_format(native), native, src)
 }
 
+fn pipeline_ir_dense_env_header() -> i64 {
+  let header = alloc_words(3)
+  mem_store64_at(header, 0, 0)
+  mem_store64_at(header, 8, 0)
+  mem_store64_at(header, 16, 0)
+  header
+}
+
+fn pipeline_ir_dense_env_grow(header: i64, need: i64) -> i64 {
+  let cap = mem_load64_at(header, 16)
+  if need < cap { 0 }
+  else {
+    let mut new_cap = if cap == 0 { 256 } else { cap * 2 }
+    while new_cap <= need { new_cap = new_cap * 2 }
+    let new_known = alloc_zeroed(new_cap * 8)
+    let new_value = alloc_words(new_cap)
+    let old_known = mem_load64_at(header, 0)
+    let old_value = mem_load64_at(header, 8)
+    if cap > 0 {
+      mem_copy(new_known, old_known, cap * 8)
+      mem_copy(new_value, old_value, cap * 8)
+    } else { 0 }
+    mem_store64_at(header, 0, new_known)
+    mem_store64_at(header, 8, new_value)
+    mem_store64_at(header, 16, new_cap)
+    0
+  }
+}
+
 fn pipeline_ir_const_env_empty() -> PipelineIrConstEnv {
-  PipelineIrConstEnvNil
+  PipelineIrConstEnvDense(pipeline_ir_dense_env_header())
 }
 
 fn pipeline_ir_const_env_bind(env: PipelineIrConstEnv, value_id: i64, const_value: i64) -> PipelineIrConstEnv {
-  PipelineIrConstEnvCons(value_id, 1, const_value, env)
+  if value_id < 0 { env }
+  else {
+    match env {
+      PipelineIrConstEnvNil -> env
+      PipelineIrConstEnvDense(header) -> {
+        pipeline_ir_dense_env_grow(header, value_id)
+        mem_store64_at(mem_load64_at(header, 0), value_id * 8, 1)
+        mem_store64_at(mem_load64_at(header, 8), value_id * 8, const_value)
+        env
+      }
+    }
+  }
 }
 
 fn pipeline_ir_const_lookup(valid: i64, value: i64) -> PipelineIrConstLookup {
@@ -22827,28 +22871,52 @@ fn pipeline_ir_const_lookup_value(found: PipelineIrConstLookup) -> i64 {
 fn pipeline_ir_const_env_lookup(env: PipelineIrConstEnv, value_id: i64) -> PipelineIrConstLookup {
   match env {
     PipelineIrConstEnvNil -> pipeline_ir_const_lookup(0, 0)
-    PipelineIrConstEnvCons(id, known, value, rest) -> {
-      if id == value_id { pipeline_ir_const_lookup(known, value) }
-      else { pipeline_ir_const_env_lookup(rest, value_id) }
+    PipelineIrConstEnvDense(header) -> {
+      if value_id < 0 or value_id >= mem_load64_at(header, 16) { pipeline_ir_const_lookup(0, 0) }
+      else {
+        if mem_load64_at(mem_load64_at(header, 0), value_id * 8) == 1 {
+          pipeline_ir_const_lookup(1, mem_load64_at(mem_load64_at(header, 8), value_id * 8))
+        } else { pipeline_ir_const_lookup(0, 0) }
+      }
     }
   }
 }
 
 fn pipeline_ir_alias_env_empty() -> PipelineIrAliasEnv {
-  PipelineIrAliasEnvNil
+  PipelineIrAliasEnvDense(pipeline_ir_dense_env_header())
 }
 
 fn pipeline_ir_alias_env_bind(env: PipelineIrAliasEnv, value_id: i64, source_id: i64) -> PipelineIrAliasEnv {
-  if value_id == source_id { env }
-  else { PipelineIrAliasEnvCons(value_id, source_id, env) }
+  if value_id == source_id or value_id < 0 { env }
+  else {
+    match env {
+      PipelineIrAliasEnvNil -> env
+      PipelineIrAliasEnvDense(header) -> {
+        pipeline_ir_dense_env_grow(header, value_id)
+        mem_store64_at(mem_load64_at(header, 0), value_id * 8, 1)
+        mem_store64_at(mem_load64_at(header, 8), value_id * 8, source_id)
+        env
+      }
+    }
+  }
 }
 
+-- Aliases are bound pre-resolved (dst -> canonical), so the chase is a
+-- formality; the hop cap guards any accidental cycle.
 fn pipeline_ir_alias_env_lookup_or(env: PipelineIrAliasEnv, value_id: i64) -> i64 {
   match env {
     PipelineIrAliasEnvNil -> value_id
-    PipelineIrAliasEnvCons(id, source, rest) -> {
-      if id == value_id { pipeline_ir_alias_env_lookup_or(rest, source) }
-      else { pipeline_ir_alias_env_lookup_or(rest, value_id) }
+    PipelineIrAliasEnvDense(header) -> {
+      let known = mem_load64_at(header, 0)
+      let source = mem_load64_at(header, 8)
+      let cap = mem_load64_at(header, 16)
+      let mut cur = value_id
+      let mut hops = 0
+      while hops < 64 and cur >= 0 and cur < cap and mem_load64_at(known, cur * 8) == 1 {
+        cur = mem_load64_at(source, cur * 8)
+        hops = hops + 1
+      }
+      cur
     }
   }
 }
