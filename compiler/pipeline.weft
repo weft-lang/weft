@@ -31286,8 +31286,8 @@ fn pipeline_ir_merge_rebuild(scan: IrBlockList, all_blocks: IrBlockList, consume
 -- its body is T, S, and every block that reaches S without passing T;
 -- the preheader is T's unique non-backedge predecessor when it ends in
 -- a plain jump. Hoisted operands must be function params or defined in
--- a block dominating the preheader (this IR's verifier does not yet
--- check cross-block dominance, so the gate is explicit). Innermost
+-- a block dominating the preheader (the verifier's kind-7 dominance
+-- check now backstops this gate after every transform). Innermost
 -- loops hoist first; iterating the fold re-hoists through outer levels.
 
 fn pipeline_ir_licm_value_def_blocks(blocks: IrBlockList, next_value: i64) -> i64 {
@@ -31852,8 +31852,8 @@ fn pipeline_optimised_functions_direct_call_inline_sites(opt: PipelineOptimisedF
 --        4 branch/jump target does not exist (detail = target id)
 --        5 jump arg count mismatch (detail = target id)
 --        6 intra-block use before def (detail = value id)
--- Full cross-block dominance is not yet checked (needs a dominator
--- tree; see the 2o brief).
+--        7 cross-block use not dominated by its definition (detail =
+--          value id; slots exempt, unreachable blocks unchecked)
 -- ══════════════════════════════════════════════════════════════
 
 fn pipeline_ir_verify_error(kind: i64, block_id: i64, detail: i64) -> i64 {
@@ -32137,6 +32137,260 @@ fn pipeline_ir_verify_block_order(blocks: IrBlockList, next_value: i64) -> i64 {
   err
 }
 
+
+-- Cross-block dominance (kind 7): a value used in block B but defined in
+-- block D != B is only valid when D dominates B. Dominator bitsets are the
+-- standard iterative dataflow — dom[entry] = {entry}, others start full,
+-- edge relaxation dom[S] &= dom[B] | {S} until fixpoint — over dense block
+-- ids with the list head as entry. Slot ids (established by IrSlotI64 /
+-- IrStoreI64) are excluded: slot initialisation is a path property that
+-- mem2reg will retire, not an SSA dominance property. Unreachable blocks
+-- keep full dominator sets and are not flagged here.
+
+fn pipeline_ir_verify_max_block_id(blocks: IrBlockList) -> i64 {
+  let mut max_id = 0
+  let mut cur = blocks
+  let mut done = 0
+  while done == 0 {
+    match cur {
+      IrBlockListNil -> { done = 1 }
+      IrBlockListCons(block, rest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> {
+            if id > max_id { max_id = id } else { 0 }
+            cur = rest
+          }
+        }
+      }
+    }
+  }
+  max_id
+}
+
+fn pipeline_ir_verify_dom_words(doms: i64, nblocks: i64, words: i64, block_id: i64) -> i64 {
+  doms + block_id * words * 8
+}
+
+fn pipeline_ir_verify_dom_has(doms: i64, nblocks: i64, words: i64, block_id: i64, dom_id: i64) -> i64 {
+  let base = pipeline_ir_verify_dom_words(doms, nblocks, words, block_id)
+  if (pipeline_word_array_get(base, dom_id / 64) band (1 bshl (dom_id % 64))) != 0 { 1 } else { 0 }
+}
+
+-- dom[target] &= dom[source] | {target}; returns 1 when target's set shrank.
+fn pipeline_ir_verify_dom_relax_edge(doms: i64, nblocks: i64, words: i64, source: i64, target: i64) -> i64 {
+  let sbase = pipeline_ir_verify_dom_words(doms, nblocks, words, source)
+  let tbase = pipeline_ir_verify_dom_words(doms, nblocks, words, target)
+  let self_word = target / 64
+  let self_mask = 1 bshl (target % 64)
+  let mut w = 0
+  let mut changed = 0
+  while w < words {
+    let incoming = if w == self_word { pipeline_word_array_get(sbase, w) bor self_mask } else { pipeline_word_array_get(sbase, w) }
+    let old = pipeline_word_array_get(tbase, w)
+    let merged = old band incoming
+    if merged != old {
+      pipeline_word_array_set(tbase, w, merged)
+      changed = 1
+    } else { 0 }
+    w = w + 1
+  }
+  changed
+}
+
+fn pipeline_ir_verify_dom_relax_blocks(blocks: IrBlockList, doms: i64, nblocks: i64, words: i64) -> i64 {
+  let mut changed = 0
+  let mut cur = blocks
+  let mut done = 0
+  while done == 0 {
+    match cur {
+      IrBlockListNil -> { done = 1 }
+      IrBlockListCons(block, rest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> {
+            match term {
+              IrTermNone -> 0
+              IrTermReturn(value) -> 0
+              IrTermJump(target, args) -> {
+                changed = changed bor pipeline_ir_verify_dom_relax_edge(doms, nblocks, words, id, target)
+                0
+              }
+              IrTermBranch(cond, then_block, else_block) -> {
+                changed = changed bor pipeline_ir_verify_dom_relax_edge(doms, nblocks, words, id, then_block)
+                changed = changed bor pipeline_ir_verify_dom_relax_edge(doms, nblocks, words, id, else_block)
+                0
+              }
+            }
+            cur = rest
+          }
+        }
+      }
+    }
+  }
+  changed
+}
+
+fn pipeline_ir_verify_compute_doms(blocks: IrBlockList, nblocks: i64, words: i64, entry_id: i64) -> i64 {
+  let doms = pipeline_word_array_new(nblocks * words)
+  -- All sets start full; the entry is then pinned to {entry}.
+  let mut i = 0
+  while i < nblocks * words {
+    pipeline_word_array_set(doms, i, 0 - 1)
+    i = i + 1
+  }
+  let ebase = pipeline_ir_verify_dom_words(doms, nblocks, words, entry_id)
+  let mut w = 0
+  while w < words {
+    pipeline_word_array_set(ebase, w, 0)
+    w = w + 1
+  }
+  pipeline_word_array_set(ebase, entry_id / 64, 1 bshl (entry_id % 64))
+  let mut rounds = 0
+  let mut changed = 1
+  while changed == 1 and rounds <= nblocks + 1 {
+    changed = pipeline_ir_verify_dom_relax_blocks(blocks, doms, nblocks, words)
+    rounds = rounds + 1
+  }
+  doms
+}
+
+-- def_block: dense value id -> defining block id; -1 for function params
+-- (dominate everything), -2 for undefined (kind 2 catches those earlier).
+-- slot_ids marks ids that behave as slots and are exempt from dominance.
+fn pipeline_ir_verify_fill_def_blocks(blocks: IrBlockList, def_block: i64, slot_ids: i64, next_value: i64) -> i64 {
+  let mut cur = blocks
+  let mut done = 0
+  while done == 0 {
+    match cur {
+      IrBlockListNil -> { done = 1 }
+      IrBlockListCons(block, rest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> {
+            let mut p_cur = params
+            let mut p_done = 0
+            while p_done == 0 {
+              match p_cur {
+                IrValueNil -> { p_done = 1 }
+                IrValueCons(pv, p_rest) -> {
+                  if pv >= 0 and pv < next_value { pipeline_ir_native_resident_dense_set(def_block, pv, id) } else { 0 }
+                  p_cur = p_rest
+                }
+              }
+            }
+            let mut i_cur = insts
+            let mut i_done = 0
+            while i_done == 0 {
+              match i_cur {
+                IrInstNil -> { i_done = 1 }
+                IrInstCons(inst, i_rest) -> {
+                  let d = pipeline_ir_inst_def_or(inst, 0 - 1)
+                  if d >= 0 and d < next_value { pipeline_ir_native_resident_dense_set(def_block, d, id) } else { 0 }
+                  match inst {
+                    IrSlotI64(slot_id) -> if slot_id >= 0 and slot_id < next_value { pipeline_ir_native_resident_dense_set(slot_ids, slot_id, 1) } else { 0 }
+                    IrStoreI64(slot_id, value) -> if slot_id >= 0 and slot_id < next_value { pipeline_ir_native_resident_dense_set(slot_ids, slot_id, 1) } else { 0 }
+                    _ -> 0
+                  }
+                  i_cur = i_rest
+                }
+              }
+            }
+            cur = rest
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
+fn pipeline_ir_verify_dominated_use(u: i64, block_id: i64, def_block: i64, slot_ids: i64, doms: i64, nblocks: i64, words: i64, next_value: i64) -> i64 {
+  if u < 0 or u >= next_value { 0 }
+  else { if nlist_get(slot_ids, u) == 1 { 0 }
+  else {
+    let d = nlist_get(def_block, u)
+    if d == 0 - 1 or d == 0 - 2 { 0 }
+    else { if d == block_id { 0 }
+    else { if pipeline_ir_verify_dom_has(doms, nblocks, words, block_id, d) == 1 { 0 }
+    else { pipeline_ir_verify_error(7, block_id, u) } } }
+  } }
+}
+
+fn pipeline_ir_verify_dominated_uses_chain(uses: PipelineIrLiveSet, block_id: i64, def_block: i64, slot_ids: i64, doms: i64, nblocks: i64, words: i64, next_value: i64) -> i64 {
+  match uses {
+    PipelineIrLiveSetNil -> 0
+    PipelineIrLiveSetCons(value, rest) -> {
+      let err = pipeline_ir_verify_dominated_use(value, block_id, def_block, slot_ids, doms, nblocks, words, next_value)
+      if err != 0 { err } else { pipeline_ir_verify_dominated_uses_chain(rest, block_id, def_block, slot_ids, doms, nblocks, words, next_value) }
+    }
+    PipelineIrLiveSetBits(array, bwords, count) -> 0
+  }
+}
+
+fn pipeline_ir_verify_dominated_args(args: IrValueList, block_id: i64, def_block: i64, slot_ids: i64, doms: i64, nblocks: i64, words: i64, next_value: i64) -> i64 {
+  match args {
+    IrValueNil -> 0
+    IrValueCons(value, rest) -> {
+      let err = pipeline_ir_verify_dominated_use(value, block_id, def_block, slot_ids, doms, nblocks, words, next_value)
+      if err != 0 { err } else { pipeline_ir_verify_dominated_args(rest, block_id, def_block, slot_ids, doms, nblocks, words, next_value) }
+    }
+  }
+}
+
+fn pipeline_ir_verify_dominance(blocks: IrBlockList, param_count: i64, next_value: i64) -> i64 {
+  let nblocks = pipeline_ir_verify_max_block_id(blocks) + 1
+  if nblocks <= 1 { 0 }
+  else {
+    let words = (nblocks + 63) / 64
+    let entry_id = match blocks {
+      IrBlockListNil -> 0
+      IrBlockListCons(block, rest) -> match block { IrBlock(id, params, insts, term) -> id }
+    }
+    let doms = pipeline_ir_verify_compute_doms(blocks, nblocks, words, entry_id)
+    let def_block = pipeline_ir_native_resident_dense_new(next_value, 0 - 2)
+    let slot_ids = pipeline_ir_native_resident_dense_new(next_value, 0)
+    let mut p = 0
+    while p < param_count {
+      pipeline_ir_native_resident_dense_set(def_block, p, 0 - 1)
+      p = p + 1
+    }
+    pipeline_ir_verify_fill_def_blocks(blocks, def_block, slot_ids, next_value)
+    let mut err = 0
+    let mut cur = blocks
+    let mut done = 0
+    while done == 0 and err == 0 {
+      match cur {
+        IrBlockListNil -> { done = 1 }
+        IrBlockListCons(block, rest) -> {
+          match block {
+            IrBlock(id, params, insts, term) -> {
+              let mut i_cur = insts
+              let mut i_done = 0
+              while i_done == 0 and err == 0 {
+                match i_cur {
+                  IrInstNil -> { i_done = 1 }
+                  IrInstCons(inst, i_rest) -> {
+                    err = pipeline_ir_verify_dominated_uses_chain(pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty()), id, def_block, slot_ids, doms, nblocks, words, next_value)
+                    i_cur = i_rest
+                  }
+                }
+              }
+              if err == 0 {
+                err = match term {
+                  IrTermNone -> 0
+                  IrTermReturn(value) -> pipeline_ir_verify_dominated_use(value, id, def_block, slot_ids, doms, nblocks, words, next_value)
+                  IrTermJump(target, args) -> pipeline_ir_verify_dominated_args(args, id, def_block, slot_ids, doms, nblocks, words, next_value)
+                  IrTermBranch(cond, then_block, else_block) -> pipeline_ir_verify_dominated_use(cond, id, def_block, slot_ids, doms, nblocks, words, next_value)
+                }
+              } else { 0 }
+              cur = rest
+            }
+          }
+        }
+      }
+    }
+    err
+  }
+}
+
 fn pipeline_ir_verify_function(f: IrFunction) -> i64 {
   match f {
     IrFunction(hash, param_count, blocks, src) -> {
@@ -32156,7 +32410,11 @@ fn pipeline_ir_verify_function(f: IrFunction) -> i64 {
         else {
           let uerr = pipeline_ir_verify_blocks(blocks, blocks, defined, words)
           if uerr != 0 { uerr }
-          else { pipeline_ir_verify_block_order(blocks, next_value) }
+          else {
+            let oerr = pipeline_ir_verify_block_order(blocks, next_value)
+            if oerr != 0 { oerr }
+            else { pipeline_ir_verify_dominance(blocks, param_count, next_value) }
+          }
         }
       }
     }
