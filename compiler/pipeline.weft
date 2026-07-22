@@ -32325,6 +32325,198 @@ fn pipeline_ir_verify_block_order(blocks: IrBlockList, next_value: i64) -> i64 {
 -- keep full dominator sets and are not flagged here.
 
 
+
+-- ══════════════════════════════════════════════════════════════
+-- Live intervals (2l stage 3, second producer). Flattens the per-block
+-- liveness rows into per-value [start, end] positions over a global
+-- instruction numbering in block layout order, and records whether each
+-- interval crosses a call site — the deciding input for callee-saved
+-- versus caller-saved pool assignment in the linear scan.
+--   def at position p        -> start = min(start, p)
+--   use at position p        -> end   = max(end, p)
+--   value in live_in[B]      -> covers block B's start position
+--   value in live_out[B]     -> covers block B's end position
+-- Slot ids (multiple stores) union naturally under min/max.
+-- Handle layout: [start_ptr, end_ptr, has_ptr, call_pos_ptr, call_count,
+-- next_value].
+-- ══════════════════════════════════════════════════════════════
+
+fn pipeline_ir_intervals_touch(iv: i64, value: i64, position: i64) -> i64 {
+  let n = mem_load64_at(iv, 40)
+  if value < 0 or value >= n { 0 }
+  else {
+    let start_base = mem_load64_at(iv, 0)
+    let end_base = mem_load64_at(iv, 8)
+    let has_base = mem_load64_at(iv, 16)
+    if mem_load64_at(has_base, value * 8) == 0 {
+      mem_store64_at(has_base, value * 8, 1)
+      mem_store64_at(start_base, value * 8, position)
+      mem_store64_at(end_base, value * 8, position)
+    } else {
+      if position < mem_load64_at(start_base, value * 8) { mem_store64_at(start_base, value * 8, position) } else { 0 }
+      if position > mem_load64_at(end_base, value * 8) { mem_store64_at(end_base, value * 8, position) } else { 0 }
+    }
+  }
+}
+
+fn pipeline_ir_intervals_has(iv: i64, value: i64) -> bool {
+  let n = mem_load64_at(iv, 40)
+  if value < 0 or value >= n { false }
+  else { mem_load64_at(mem_load64_at(iv, 16), value * 8) == 1 }
+}
+
+fn pipeline_ir_intervals_start_or(iv: i64, value: i64, missing: i64) -> i64 {
+  if pipeline_ir_intervals_has(iv, value) { mem_load64_at(mem_load64_at(iv, 0), value * 8) } else { missing }
+}
+
+fn pipeline_ir_intervals_end_or(iv: i64, value: i64, missing: i64) -> i64 {
+  if pipeline_ir_intervals_has(iv, value) { mem_load64_at(mem_load64_at(iv, 8), value * 8) } else { missing }
+}
+
+-- Does [start, end] contain any recorded call position? Call positions
+-- are appended in walk order, which is ascending, so a linear probe with
+-- early exit stays cheap at realistic call counts.
+fn pipeline_ir_intervals_crosses_call(iv: i64, value: i64) -> bool {
+  if pipeline_ir_intervals_has(iv, value) == 0 { false }
+  else {
+    let start = pipeline_ir_intervals_start_or(iv, value, 0)
+    let end = pipeline_ir_intervals_end_or(iv, value, 0)
+    let calls = mem_load64_at(iv, 24)
+    let count = mem_load64_at(iv, 32)
+    let mut i = 0
+    let mut found = false
+    while i < count {
+      let cp = mem_load64_at(calls, i * 8)
+      if cp > end { i = count }
+      else {
+        if cp > start and cp < end { found = true i = count } else { i = i + 1 }
+      }
+    }
+    found
+  }
+}
+
+fn pipeline_ir_intervals_inst_is_call(inst: IrInst) -> bool {
+  match inst {
+    IrCallI64(dst, callee_hash, args) -> true
+    IrIndirectCallI64(dst, callee, args) -> true
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> true
+    IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> true
+    IrPerformI64(dst, effect_hash, op_hash, args) -> true
+    IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> true
+    IrHandleI64(dst, src, body, clauses, nclauses, captures) -> true
+    IrDeferredHandleI64(dst, src, body, clauses, nclauses, captures, scratch_base) -> true
+    IrResumeI64(dst, value) -> true
+    _ -> false
+  }
+}
+
+fn pipeline_ir_intervals_compute(blocks: IrBlockList, param_count: i64, next_value: i64, lv: i64) -> i64 {
+  let iv = alloc_words(6)
+  mem_store64_at(iv, 0, alloc_words(next_value + 1))
+  mem_store64_at(iv, 8, alloc_words(next_value + 1))
+  mem_store64_at(iv, 16, alloc_zeroed((next_value + 1) * 8))
+  let call_cap = ir_block_list_inst_count(blocks) + 1
+  mem_store64_at(iv, 24, alloc_words(call_cap))
+  mem_store64_at(iv, 32, 0)
+  mem_store64_at(iv, 40, next_value + 1)
+  let mut position = 0
+  let mut cur = blocks
+  let mut done = 0
+  while done == 0 {
+    match cur {
+      IrBlockListNil -> { done = 1 }
+      IrBlockListCons(block, rest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> {
+            let block_start = position
+            -- Everything live into the block covers its start.
+            let mut v = 0
+            while v <= next_value {
+              if pipeline_ir_liveness_live_in_contains(lv, id, v) { pipeline_ir_intervals_touch(iv, v, block_start) } else { 0 }
+              v = v + 1
+            }
+            let mut p_cur = params
+            let mut p_done = 0
+            while p_done == 0 {
+              match p_cur {
+                IrValueNil -> { p_done = 1 }
+                IrValueCons(pv, p_rest) -> {
+                  pipeline_ir_intervals_touch(iv, pv, block_start)
+                  p_cur = p_rest
+                }
+              }
+            }
+            let mut i_cur = insts
+            let mut i_done = 0
+            while i_done == 0 {
+              match i_cur {
+                IrInstNil -> { i_done = 1 }
+                IrInstCons(inst, i_rest) -> {
+                  position = position + 1
+                  let mut uses = pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty())
+                  let mut u_done = 0
+                  while u_done == 0 {
+                    match uses {
+                      PipelineIrLiveSetNil -> { u_done = 1 }
+                      PipelineIrLiveSetCons(u, u_rest) -> {
+                        pipeline_ir_intervals_touch(iv, u, position)
+                        uses = u_rest
+                      }
+                      PipelineIrLiveSetBits(array, bwords, count) -> { u_done = 1 }
+                    }
+                  }
+                  let d = pipeline_ir_inst_def_or(inst, 0 - 1)
+                  if d >= 0 { pipeline_ir_intervals_touch(iv, d, position) } else { 0 }
+                  match inst {
+                    IrSlotI64(slot_id) -> pipeline_ir_intervals_touch(iv, slot_id, position)
+                    _ -> 0
+                  }
+                  if pipeline_ir_intervals_inst_is_call(inst) {
+                    let cc = mem_load64_at(iv, 32)
+                    mem_store64_at(mem_load64_at(iv, 24), cc * 8, position)
+                    mem_store64_at(iv, 32, cc + 1)
+                  } else { 0 }
+                  i_cur = i_rest
+                }
+              }
+            }
+            position = position + 1
+            let block_end = position
+            match term {
+              IrTermNone -> 0
+              IrTermReturn(value) -> pipeline_ir_intervals_touch(iv, value, block_end)
+              IrTermJump(target, args) -> {
+                let mut a_cur = args
+                let mut a_done = 0
+                while a_done == 0 {
+                  match a_cur {
+                    IrValueNil -> { a_done = 1 }
+                    IrValueCons(av, a_rest) -> {
+                      pipeline_ir_intervals_touch(iv, av, block_end)
+                      a_cur = a_rest
+                    }
+                  }
+                }
+                0
+              }
+              IrTermBranch(cond, then_block, else_block) -> pipeline_ir_intervals_touch(iv, cond, block_end)
+            }
+            let mut w = 0
+            while w <= next_value {
+              if pipeline_ir_liveness_live_out_contains(lv, id, w) { pipeline_ir_intervals_touch(iv, w, block_end) } else { 0 }
+              w = w + 1
+            }
+            position = position + 1
+            cur = rest
+          }
+        }
+      }
+    }
+  }
+  iv
+}
+
 -- ══════════════════════════════════════════════════════════════
 -- Per-block liveness facts (2l stage 3 substrate). Standard backward
 -- dataflow to fixpoint over dense bitset rows keyed by block id:
