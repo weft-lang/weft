@@ -205,6 +205,8 @@ check_rejects "unknown_identifier" "test/negative/unknown_identifier.weft" "type
 check_rejects "unknown_function" "test/negative/unknown_function.weft" "type error: unknown function"
 check_rejects "unknown_intrinsic_call" "test/negative/unknown_intrinsic_call.weft" "type error: unknown function"
 check_rejects "unknown_function_in_import" "test/negative/unknown_function_in_import.weft" "type error: unknown function"
+check_rejects "proc_run_requires_effect" "test/negative/proc_run_requires_effect.weft" "type error: effect not available in caller"
+check_rejects "env_arg_requires_effect" "test/negative/env_arg_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "call_non_function" "test/negative/call_non_function.weft" "type error: called value is not a function"
 check_rejects "no_payload_variant_not_function" "test/negative/no_payload_variant_not_function.weft" "type error: called value is not a function"
 check_rejects "unknown_record_field" "test/negative/unknown_record_field.weft" "type error: unknown field"
