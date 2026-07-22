@@ -1,0 +1,198 @@
+-- test/mem2reg_metrics.weft -- slot-to-SSA promotion (2o step 2).
+-- IR-level pins: promotable slots leave the optimised IR; excluded
+-- classes stay. Runtime shapes: every promotion pattern computes the
+-- same result the slot form did.
+
+use "stdlib/vector.weft"
+use "compiler/codegen.weft"
+use "compiler/typeck.weft"
+use "compiler/macho.weft"
+use "compiler/object.weft"
+use "compiler/ir.weft"
+use "compiler/grammar.weft"
+use "compiler/pipeline.weft"
+
+fn m2r_optimised(src: str) -> IrModule {
+  let typed = pipeline_check_source(__str_ptr(src), __str_len(src))
+  let ir = pipeline_lower_ir(typed)
+  pipeline_optimise_typed_ir(typed, ir)
+}
+
+test "mem2reg_call_bearing_loop_promotes_the_accumulator" {
+  -- The target case: mut acc/i in a loop with a call. The slot-pin
+  -- pass bails on call-bearing functions, so promotion owns them:
+  -- no slot instructions survive.
+  let src = "fn bump(x: i64) -> i64 { if x > 100 { x - 1 } else { x + 1 } } fn hot(n: i64) -> i64 { let mut i = 0; let mut acc = 0; while i < n { acc = acc + bump(i); i = i + 1 } acc } fn main() -> i64 { hot(4) }"
+  Test.assert_eq(pipeline_ir_module_slot_inst_count(m2r_optimised(src)), 0)
+}
+
+test "mem2reg_verifier_clean_on_promoted_shapes" {
+  let src = "fn bump(x: i64) -> i64 { if x > 100 { x - 1 } else { x + 1 } } fn hot(n: i64) -> i64 { let mut i = 0; let mut acc = 0; while i < n { let t = bump(acc); if t > 10 { acc = acc + t } else { acc = acc + 1 } i = i + 1 } acc } fn main() -> i64 { hot(4) }"
+  Test.assert_eq(pipeline_ir_verify_module(m2r_optimised(src)), 0)
+}
+
+fn m2r_count_fn_slots(irf: IrFunction) -> i64 {
+  let mut count = 0
+  let mut bcur = pipeline_ir_function_blocks(irf)
+  let mut bdone = 0
+  while bdone == 0 {
+    match bcur {
+      IrBlockListNil -> { bdone = 1 }
+      IrBlockListCons(block, brest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> {
+            let mut icur = insts
+            let mut idone = 0
+            while idone == 0 {
+              match icur {
+                IrInstNil -> { idone = 1 }
+                IrInstCons(inst, itail) -> {
+                  match inst {
+                    IrSlotI64(s) -> { count = count + 1 0 }
+                    _ -> 0
+                  }
+                  icur = itail
+                }
+              }
+            }
+            bcur = brest
+          }
+        }
+      }
+    }
+  }
+  count
+}
+
+test "mem2reg_address_taken_slot_survives" {
+  -- Hand-built non-leaf function (the call disables the slot-pin
+  -- pass): slot 8 is address-taken, slot 9 is clean. Promotion must
+  -- keep 8 and delete 9.
+  let insts = ir_inst_list_prepend(ir_inst_slot_i64(8), ir_inst_list_prepend(ir_inst_store_i64(8, 0), ir_inst_list_prepend(ir_inst_address_of_slot_i64(10, 8), ir_inst_list_prepend(ir_inst_slot_i64(9), ir_inst_list_prepend(ir_inst_store_i64(9, 0), ir_inst_list_prepend(ir_inst_call_i64(14, 999999, ir_value_list_empty()), ir_inst_list_prepend(ir_inst_load_i64(11, 9), ir_inst_list_prepend(ir_inst_load_i64(12, 8), ir_inst_list_prepend(ir_inst_binary_i64(13, ir_binary_op_add(), 11, 12), ir_inst_list_empty())))))))))
+  let blocks = ir_block_list_prepend(ir_block_new_term(0, insts, ir_term_return(13)), ir_block_list_empty())
+  let promoted = pipeline_mem2reg_function(IrFunction(12345, 1, blocks, 0))
+  Test.assert_eq(m2r_count_fn_slots(promoted), 1)
+}
+
+test "mem2reg_leaf_pinned_slots_stay_slots" {
+  -- The same shape without the call is leaf: the slot-pin pass owns
+  -- the clean slot and promotion must leave both alone.
+  let insts = ir_inst_list_prepend(ir_inst_slot_i64(8), ir_inst_list_prepend(ir_inst_store_i64(8, 0), ir_inst_list_prepend(ir_inst_address_of_slot_i64(10, 8), ir_inst_list_prepend(ir_inst_slot_i64(9), ir_inst_list_prepend(ir_inst_store_i64(9, 0), ir_inst_list_prepend(ir_inst_load_i64(11, 9), ir_inst_list_prepend(ir_inst_load_i64(12, 8), ir_inst_list_prepend(ir_inst_binary_i64(13, ir_binary_op_add(), 11, 12), ir_inst_list_empty()))))))))
+  let blocks = ir_block_list_prepend(ir_block_new_term(0, insts, ir_term_return(13)), ir_block_list_empty())
+  let promoted = pipeline_mem2reg_function(IrFunction(12345, 1, blocks, 0))
+  Test.assert_eq(m2r_count_fn_slots(promoted), 2)
+}
+
+fn m2r_bump(x: i64) -> i64 {
+  if x > 100 { x - 1 } else { x + 1 }
+}
+
+test "mem2reg_call_loop_computes_at_runtime" {
+  -- acc over 4 iterations of acc + bump(i): 1+2+3+4 = 10.
+  let mut i = 0
+  let mut acc = 0
+  while i < 4 {
+    acc = acc + m2r_bump(i)
+    i = i + 1
+  }
+  Test.assert_eq(acc, 10)
+}
+
+fn m2r_partial(n: i64) -> i64 {
+  -- The vsort pattern: moving mutated on one path only; identity
+  -- edge args must round-trip correctly.
+  let mut j = n
+  let mut moving = 1
+  let mut steps = 0
+  while moving == 1 {
+    if j > 0 {
+      j = j - 1
+      steps = steps + 1
+    } else {
+      moving = 0
+    }
+  }
+  steps * 10 + moving
+}
+
+test "mem2reg_partially_mutated_variable_computes_at_runtime" {
+  Test.assert_eq(m2r_partial(5), 50)
+  Test.assert_eq(m2r_partial(0), 0)
+}
+
+fn m2r_nested(n: i64) -> i64 {
+  let mut total = 0
+  let mut y = 0
+  while y < n {
+    let mut x = 0
+    while x < n {
+      total = total + m2r_bump(x + y)
+      x = x + 1
+    }
+    y = y + 1
+  }
+  total
+}
+
+test "mem2reg_nested_loops_compute_at_runtime" {
+  -- 3x3 grid of bump(x+y)=x+y+1: sum over x,y in 0..3 of (x+y+1)
+  -- = 9 + 2*(0+1+2)*3 = 27.
+  Test.assert_eq(m2r_nested(3), 27)
+}
+
+fn m2r_loop_invariant(n: i64, k: i64) -> i64 {
+  -- k is live through the loop but never mutated: the trivial-phi
+  -- removal must alias its param away and still read the right value.
+  let mut i = 0
+  let mut acc = 0
+  while i < n {
+    acc = acc + k + m2r_bump(i)
+    i = i + 1
+  }
+  acc
+}
+
+test "mem2reg_loop_invariant_variable_computes_at_runtime" {
+  -- 4 iterations: 4*7 + (1+2+3+4) = 38.
+  Test.assert_eq(m2r_loop_invariant(4, 7), 38)
+}
+
+fn m2r_early_exit(n: i64) -> i64 {
+  let mut i = 0
+  let mut acc = 0
+  let mut go = 1
+  while go == 1 {
+    if i >= n { go = 0 } else {
+      acc = acc + i
+      if acc > 100 { go = 0 } else { 0 }
+      i = i + 1
+    }
+  }
+  acc * 100 + i
+}
+
+test "mem2reg_early_exit_computes_at_runtime" {
+  -- n=5: acc=0+1+2+3+4=10, i=5 -> 1005.
+  Test.assert_eq(m2r_early_exit(5), 1005)
+  -- n=20: acc crosses 100 at i=14 (0..14 sums to 105), exits with i=15.
+  Test.assert_eq(m2r_early_exit(20), 10515)
+}
+
+fn m2r_capture_base(n: i64) -> i64 {
+  -- Lambda-bearing functions bail from promotion entirely; the mut
+  -- loop variables around the capture must still compute correctly.
+  let mut acc = 0
+  let base = n * 2
+  let add_base = (x: i64) => x + base
+  let mut i = 0
+  while i < 3 {
+    acc = acc + add_base(i)
+    i = i + 1
+  }
+  acc
+}
+
+test "mem2reg_lambda_function_bails_and_computes" {
+  -- base=6: (0+6)+(1+6)+(2+6) = 21.
+  Test.assert_eq(m2r_capture_base(3), 21)
+}

@@ -20638,24 +20638,41 @@ fn pipeline_ir_native_patch_all(code: i64, labels: i64, patches: i64) -> i64 {
   0
 }
 
-fn pipeline_ir_native_emit_jump_arg_saves(args: IrValueList, code: i64, pinned: i64, temp_base: i64, index: i64) -> i64 {
+fn pipeline_ir_native_emit_jump_arg_saves(args: IrValueList, params: IrValueList, code: i64, pinned: i64, temp_base: i64, index: i64) -> i64 {
   match args {
     IrValueNil -> 0
     IrValueCons(arg, rest_args) -> {
-      let phys = pipeline_ir_native_load_reg(code, pinned, arg)
-      pipeline_ir_native_store_reg_pinned(code, pinned, temp_base + index, phys)
-      pipeline_ir_native_emit_jump_arg_saves(rest_args, code, pinned, temp_base, index + 1)
+      match params {
+        IrValueNil -> 0
+        IrValueCons(param, rest_params) -> {
+          -- Identity pairs move nothing: no temp needed, no restore.
+          if arg == param { 0 } else {
+            let phys = pipeline_ir_native_load_reg(code, pinned, arg)
+            pipeline_ir_native_store_reg_pinned(code, pinned, temp_base + index, phys)
+            0
+          }
+          pipeline_ir_native_emit_jump_arg_saves(rest_args, rest_params, code, pinned, temp_base, index + 1)
+        }
+      }
     }
   }
 }
 
-fn pipeline_ir_native_emit_jump_arg_restores(params: IrValueList, code: i64, pinned: i64, temp_base: i64, index: i64) -> i64 {
+fn pipeline_ir_native_emit_jump_arg_restores(params: IrValueList, args: IrValueList, code: i64, pinned: i64, temp_base: i64, index: i64) -> i64 {
   match params {
     IrValueNil -> 0
     IrValueCons(param, rest_params) -> {
-      let phys = pipeline_ir_native_load_reg(code, pinned, temp_base + index)
-      pipeline_ir_native_store_reg_pinned(code, pinned, param, phys)
-      pipeline_ir_native_emit_jump_arg_restores(rest_params, code, pinned, temp_base, index + 1)
+      match args {
+        IrValueNil -> 0
+        IrValueCons(arg, rest_args) -> {
+          if arg == param { 0 } else {
+            let phys = pipeline_ir_native_load_reg(code, pinned, temp_base + index)
+            pipeline_ir_native_store_reg_pinned(code, pinned, param, phys)
+            0
+          }
+          pipeline_ir_native_emit_jump_arg_restores(rest_params, rest_args, code, pinned, temp_base, index + 1)
+        }
+      }
     }
   }
 }
@@ -20677,6 +20694,42 @@ fn pipeline_ir_native_jump_args_disjoint(args: IrValueList, params: IrValueList)
   }
 }
 
+-- A param is written on this edge only when its arg differs (identity
+-- pairs move nothing). True when `target` is among the written params.
+fn pipeline_ir_native_jump_written_params_contain(args: IrValueList, params: IrValueList, target: i64) -> i64 {
+  match args {
+    IrValueNil -> 0
+    IrValueCons(arg, rest_args) -> {
+      match params {
+        IrValueNil -> 0
+        IrValueCons(param, rest_params) -> {
+          if param == target and arg != param { 1 }
+          else { pipeline_ir_native_jump_written_params_contain(rest_args, rest_params, target) }
+        }
+      }
+    }
+  }
+}
+
+-- Parallel-move hazard with identity pairs excluded: only a non-identity
+-- arg that reads a param some other non-identity pair writes forces the
+-- shuffle. A loop edge that changes one variable and passes the rest
+-- through untouched is hazard-free even though its args mention params.
+fn pipeline_ir_native_jump_args_hazard(args: IrValueList, params: IrValueList, all_args: IrValueList, all_params: IrValueList) -> i64 {
+  match args {
+    IrValueNil -> 0
+    IrValueCons(arg, rest_args) -> {
+      match params {
+        IrValueNil -> 0
+        IrValueCons(param, rest_params) -> {
+          if arg != param and pipeline_ir_native_jump_written_params_contain(all_args, all_params, arg) == 1 { 1 }
+          else { pipeline_ir_native_jump_args_hazard(rest_args, rest_params, all_args, all_params) }
+        }
+      }
+    }
+  }
+}
+
 fn pipeline_ir_native_emit_jump_arg_direct(args: IrValueList, params: IrValueList, code: i64, pinned: i64) -> i64 {
   match args {
     IrValueNil -> 0
@@ -20684,8 +20737,13 @@ fn pipeline_ir_native_emit_jump_arg_direct(args: IrValueList, params: IrValueLis
       match params {
         IrValueNil -> 0
         IrValueCons(param, rest_params) -> {
-          let phys = pipeline_ir_native_load_reg(code, pinned, arg)
-          pipeline_ir_native_store_reg_pinned(code, pinned, param, phys)
+          -- An identity edge (arg is the param itself: the variable was
+          -- not changed on this path) moves nothing.
+          if arg == param { 0 } else {
+            let phys = pipeline_ir_native_load_reg(code, pinned, arg)
+            pipeline_ir_native_store_reg_pinned(code, pinned, param, phys)
+            0
+          }
           pipeline_ir_native_emit_jump_arg_direct(rest_args, rest_params, code, pinned)
         }
       }
@@ -20694,16 +20752,17 @@ fn pipeline_ir_native_emit_jump_arg_direct(args: IrValueList, params: IrValueLis
 }
 
 fn pipeline_ir_native_emit_jump_arg_moves(args: IrValueList, params: IrValueList, code: i64, pinned: i64, temp_base: i64) -> i64 {
-  -- The shuffle temps exist for parallel-move hazards: an edge whose arg
-  -- values never appear among the params being written has none, so each
-  -- value moves directly (deleting a spill store + reload per arg per
-  -- edge execution). Merge edges carrying one branch result — the
-  -- dominant shape — always qualify.
-  if pipeline_ir_native_jump_args_disjoint(args, params) == 1 {
+  -- The shuffle temps exist for parallel-move hazards: only a
+  -- non-identity arg that reads a param another non-identity pair
+  -- writes needs them. Identity pairs (loop variables passed through
+  -- unchanged) move nothing and are excluded from the hazard analysis,
+  -- so mutating one variable of several on a backedge stays on the
+  -- direct path.
+  if pipeline_ir_native_jump_args_hazard(args, params, args, params) == 0 {
     pipeline_ir_native_emit_jump_arg_direct(args, params, code, pinned)
   } else {
-    pipeline_ir_native_emit_jump_arg_saves(args, code, pinned, temp_base, 0)
-    pipeline_ir_native_emit_jump_arg_restores(params, code, pinned, temp_base, 0)
+    pipeline_ir_native_emit_jump_arg_saves(args, params, code, pinned, temp_base, 0)
+    pipeline_ir_native_emit_jump_arg_restores(params, args, code, pinned, temp_base, 0)
   }
 }
 
@@ -33410,7 +33469,719 @@ fn pipeline_optimise_ir(ir: IrModule) -> IrModule {
   }
 }
 
+-- ======================================================================
+-- Slot-to-SSA promotion (2o step 2): mem2reg over optimised typed IR.
+-- Mutable locals lower to frame slots; every never-address-taken,
+-- non-f64, cleanly-referenced slot whose loads are store-dominated is
+-- rewritten to SSA values, with pruned block params at joins where the
+-- promoted variable is live-in (the liveness fact producer supplies
+-- the pruning). Runs after the per-function optimiser so slot-keyed
+-- fact machinery upstream is undisturbed; the residency pools
+-- downstream then see loop-carried variables as block params instead
+-- of memory traffic. Functions containing lambdas or handlers bail
+-- (captures resolve variables through scope bindings the rewrite
+-- would go stale on); unreachable blocks, oversized CFGs, and any
+-- structural surprise bail per-function, leaving the input untouched.
+-- The IR verifier covers the whole compiler's optimised output in the
+-- suite, so a bad rewrite is a test failure, not a bisection.
+
+fn pipeline_mem2reg_reverse_insts(list: IrInstList, acc: IrInstList) -> IrInstList {
+  match list {
+    IrInstNil -> acc
+    IrInstCons(inst, rest) -> pipeline_mem2reg_reverse_insts(rest, ir_inst_list_prepend(inst, acc))
+  }
+}
+
+fn pipeline_mem2reg_reverse_blocks(list: IrBlockList, acc: IrBlockList) -> IrBlockList {
+  match list {
+    IrBlockListNil -> acc
+    IrBlockListCons(b, rest) -> pipeline_mem2reg_reverse_blocks(rest, ir_block_list_prepend(b, acc))
+  }
+}
+
+fn pipeline_mem2reg_block_for_id(blocks: IrBlockList, want: i64) -> IrBlock {
+  match blocks {
+    IrBlockListNil -> ir_block_new_term(0 - 1, ir_inst_list_empty(), ir_term_return(0))
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          if id == want { block } else { pipeline_mem2reg_block_for_id(rest, want) }
+        }
+      }
+    }
+  }
+}
+
+-- Candidacy scan: declared slots, minus address-taken, minus slots
+-- referenced by anything except the slot family and binds (binds are
+-- rewritten to the reaching value). Store VALUE operands and terminator
+-- uses that name a declared slot disqualify it.
+fn pipeline_mem2reg_scan_uses(uses: PipelineIrLiveSet, declared: i64, disq: i64, next_value: i64) -> i64 {
+  match uses {
+    PipelineIrLiveSetNil -> 0
+    PipelineIrLiveSetCons(u, rest) -> {
+      if u >= 0 and u < next_value {
+        if nlist_get(declared, u) == 1 { pipeline_ir_native_resident_dense_set(disq, u, 1) } else { 0 }
+      } else { 0 }
+      pipeline_mem2reg_scan_uses(rest, declared, disq, next_value)
+    }
+    PipelineIrLiveSetBits(array, words, count) -> 0
+  }
+}
+
+fn pipeline_mem2reg_scan_inst(inst: IrInst, declared: i64, disq: i64, next_value: i64) -> i64 {
+  match inst {
+    IrSlotI64(s) -> {
+      if s >= 0 and s < next_value { pipeline_ir_native_resident_dense_set(declared, s, 1) } else { 0 }
+      0
+    }
+    IrAddressOfSlotI64(d, s) -> {
+      if s >= 0 and s < next_value { pipeline_ir_native_resident_dense_set(disq, s, 1) } else { 0 }
+      0
+    }
+    IrLoadI64(d, s) -> 0
+    IrStoreI64(s, v) -> {
+      if v >= 0 and v < next_value {
+        if nlist_get(declared, v) == 1 { pipeline_ir_native_resident_dense_set(disq, v, 1) } else { 0 }
+      } else { 0 }
+      0
+    }
+    IrBindI64(ns, nl, v, ty) -> 0
+    _ -> pipeline_mem2reg_scan_uses(pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty()), declared, disq, next_value)
+  }
+}
+
+fn pipeline_mem2reg_term_succ0(term: IrTerminator) -> i64 {
+  match term {
+    IrTermJump(t, args) -> t
+    IrTermBranch(c, bt, be) -> bt
+    _ -> 0 - 1
+  }
+}
+
+fn pipeline_mem2reg_term_succ1(term: IrTerminator) -> i64 {
+  match term {
+    IrTermBranch(c, bt, be) -> be
+    _ -> 0 - 1
+  }
+}
+
+-- Iterative post-order DFS over successor arrays; returns 1 when every
+-- existing block is reachable from the entry, 0 to bail. rpo_out is
+-- filled with block ids in reverse post-order.
+fn pipeline_mem2reg_rpo(entry_id: i64, succ0: i64, succ1: i64, exists: i64, nids: i64, rpo_out: i64) -> i64 {
+  let visited = pipeline_ir_native_resident_dense_new(nids, 0)
+  let post = nlist_new()
+  -- Explicit stack of (id, phase): phase 0 = expand, 1 = emit.
+  let stack_id = nlist_new()
+  let stack_phase = nlist_new()
+  nlist_add(stack_id, entry_id)
+  nlist_add(stack_phase, 0)
+  let mut sp = 1
+  while sp > 0 {
+    let id = nlist_get(stack_id, sp - 1)
+    let phase = nlist_get(stack_phase, sp - 1)
+    sp = sp - 1
+    if phase == 1 {
+      nlist_add(post, id)
+    } else {
+      if nlist_get(visited, id) == 1 { 0 } else {
+        pipeline_ir_native_resident_dense_set(visited, id, 1)
+        -- re-push for emission, then children (reverse order so succ0
+        -- expands first; post-order emit order does not matter for
+        -- correctness, only that preds of non-headers precede them in RPO).
+        if sp < nlist_len(stack_id) {
+          pipeline_ir_native_resident_dense_set(stack_id, sp, id)
+          pipeline_ir_native_resident_dense_set(stack_phase, sp, 1)
+        } else {
+          nlist_add(stack_id, id)
+          nlist_add(stack_phase, 1)
+        }
+        sp = sp + 1
+        let s1 = nlist_get(succ1, id)
+        if s1 >= 0 and s1 < nids and nlist_get(visited, s1) == 0 {
+          if sp < nlist_len(stack_id) {
+            pipeline_ir_native_resident_dense_set(stack_id, sp, s1)
+            pipeline_ir_native_resident_dense_set(stack_phase, sp, 0)
+          } else {
+            nlist_add(stack_id, s1)
+            nlist_add(stack_phase, 0)
+          }
+          sp = sp + 1
+          0
+        } else { 0 }
+        let s0 = nlist_get(succ0, id)
+        if s0 >= 0 and s0 < nids and nlist_get(visited, s0) == 0 {
+          if sp < nlist_len(stack_id) {
+            pipeline_ir_native_resident_dense_set(stack_id, sp, s0)
+            pipeline_ir_native_resident_dense_set(stack_phase, sp, 0)
+          } else {
+            nlist_add(stack_id, s0)
+            nlist_add(stack_phase, 0)
+          }
+          sp = sp + 1
+          0
+        } else { 0 }
+      }
+    }
+  }
+  -- Reachability: every existing id must be visited.
+  let mut all = 1
+  let mut ck = 0
+  while ck < nids {
+    if nlist_get(exists, ck) == 1 and nlist_get(visited, ck) == 0 { all = 0 } else { 0 }
+    ck = ck + 1
+  }
+  if all == 1 {
+    -- reverse post into rpo_out
+    let np = nlist_len(post)
+    let mut ri = 0
+    while ri < np {
+      nlist_add(rpo_out, nlist_get(post, np - 1 - ri))
+      ri = ri + 1
+    }
+    1
+  } else { 0 }
+}
+
+-- Simulate one block's inst list over the candidate map m (dense ncand
+-- row), binding load aliases into env. Returns 0 on success, 1 on a
+-- structural surprise (load or bind before any reaching store).
+fn pipeline_mem2reg_sim_insts(insts: IrInstList, cand_index: i64, m: i64, env: PipelineIrAliasEnv, next_value: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let fail = match inst {
+        IrStoreI64(s, v) -> {
+          if s >= 0 and s < next_value {
+            let ci = nlist_get(cand_index, s)
+            if ci >= 0 { pipeline_ir_native_resident_dense_set(m, ci, pipeline_ir_alias_env_lookup_or(env, v)) } else { 0 }
+          } else { 0 }
+          0
+        }
+        IrLoadI64(d, s) -> {
+          if s >= 0 and s < next_value {
+            let ci = nlist_get(cand_index, s)
+            if ci >= 0 {
+              if nlist_get(m, ci) < 0 { 1 }
+              else {
+                pipeline_ir_alias_env_bind(env, d, nlist_get(m, ci))
+                0
+              }
+            } else { 0 }
+          } else { 0 }
+        }
+        _ -> 0
+      }
+      if fail == 1 { 1 } else { pipeline_mem2reg_sim_insts(rest, cand_index, m, env, next_value) }
+    }
+  }
+}
+
+fn pipeline_mem2reg_row_base(plane: i64, id: i64, ncand: i64) -> i64 { id * ncand }
+
+fn pipeline_mem2reg_copy_row(src_plane: i64, src_id: i64, dst: i64, ncand: i64) -> i64 {
+  let mut i = 0
+  while i < ncand {
+    pipeline_ir_native_resident_dense_set(dst, i, nlist_get(src_plane, src_id * ncand + i))
+    i = i + 1
+  }
+  0
+}
+
+fn pipeline_mem2reg_store_row(dst_plane: i64, dst_id: i64, src: i64, ncand: i64) -> i64 {
+  let mut i = 0
+  while i < ncand {
+    pipeline_ir_native_resident_dense_set(dst_plane, dst_id * ncand + i, nlist_get(src, i))
+    i = i + 1
+  }
+  0
+}
+
+-- Entry map for a block: params row when it has params allocated
+-- (multi-pred), the unique pred's exit row when single-pred, all -1
+-- for the entry block.
+fn pipeline_mem2reg_in_map(id: i64, entry_id: i64, pred_count: i64, pred1: i64, param_plane: i64, param_repl: i64, exit_plane: i64, ncand: i64) -> i64 {
+  let m = pipeline_ir_native_resident_dense_new(ncand, 0 - 1)
+  if id == entry_id { 0 }
+  else { if nlist_get(pred_count, id) >= 2 {
+    pipeline_mem2reg_copy_row(param_plane, id, m, ncand)
+    -- Removed trivial phis leave their single incoming value behind.
+    let mut ri = 0
+    while ri < ncand {
+      if nlist_get(m, ri) < 0 and nlist_get(param_repl, id * ncand + ri) >= 0 {
+        pipeline_ir_native_resident_dense_set(m, ri, nlist_get(param_repl, id * ncand + ri))
+      } else { 0 }
+      ri = ri + 1
+    }
+    0
+  } else { if nlist_get(pred_count, id) == 1 {
+    pipeline_mem2reg_copy_row(exit_plane, nlist_get(pred1, id), m, ncand)
+  } else { 0 } } }
+  m
+}
+
+-- Appended jump args for an edge into `target`: the exit-map values of
+-- the source block for every candidate the target has a param for, in
+-- ascending candidate order (matching param append order).
+fn pipeline_mem2reg_edge_args(target: i64, m: i64, param_plane: i64, ncand: i64, args: IrValueList, env: PipelineIrAliasEnv) -> IrValueList {
+  let mut extra = ir_value_list_empty()
+  let mut ci = ncand - 1
+  while ci >= 0 {
+    if nlist_get(param_plane, target * ncand + ci) >= 0 {
+      extra = ir_value_list_prepend(pipeline_ir_alias_env_lookup_or(env, nlist_get(m, ci)), extra)
+    } else { 0 }
+    ci = ci - 1
+  }
+  ir_value_list_append(args, extra)
+}
+
+fn pipeline_mem2reg_target_needs_args(target: i64, param_plane: i64, ncand: i64) -> i64 {
+  let mut ci = 0
+  let mut needs = 0
+  while ci < ncand {
+    if nlist_get(param_plane, target * ncand + ci) >= 0 { needs = 1 ci = ncand } else { ci = ci + 1 }
+  }
+  needs
+}
+
+fn pipeline_mem2reg_function(irf: IrFunction) -> IrFunction {
+  match irf {
+    IrFunction(hash, param_count, blocks, src) -> {
+      if pipeline_ir_native_blocks_have_handles(blocks) == 1 { irf }
+      else { if pipeline_ir_native_blocks_have_lambdas(blocks) == 1 { irf }
+      else {
+        let next_value = pipeline_ir_function_next_value(param_count, blocks)
+        let max_id = pipeline_ir_verify_max_block_id(blocks)
+        if next_value <= 0 or max_id < 0 or max_id > 400 { irf }
+        else {
+          let nids = max_id + 1
+          -- Candidacy scan.
+          let declared = pipeline_ir_native_resident_dense_new(next_value, 0)
+          let disq = pipeline_ir_native_resident_dense_new(next_value, 0)
+          let mut sc_cur = blocks
+          let mut sc_done = 0
+          while sc_done == 0 {
+            match sc_cur {
+              IrBlockListNil -> { sc_done = 1 }
+              IrBlockListCons(block, rest) -> {
+                match block {
+                  IrBlock(id, params, insts, term) -> {
+                    let mut ic = insts
+                    let mut id2 = 0
+                    while id2 == 0 {
+                      match ic {
+                        IrInstNil -> { id2 = 1 }
+                        IrInstCons(inst, itail) -> {
+                          pipeline_mem2reg_scan_inst(inst, declared, disq, next_value)
+                          ic = itail
+                        }
+                      }
+                    }
+                    pipeline_mem2reg_scan_uses(pipeline_ir_native_resident_term_uses(term), declared, disq, next_value)
+                    sc_cur = rest
+                  }
+                }
+              }
+            }
+          }
+          -- Cheap pre-gate: the f64 fixpoint, slot-pin scan, and
+          -- liveness only run when the dense scan left a live candidate.
+          let mut any_cand = 0
+          let mut ac0 = 0
+          while ac0 < next_value {
+            if nlist_get(declared, ac0) == 1 and nlist_get(disq, ac0) == 0 { any_cand = 1 ac0 = next_value } else { ac0 = ac0 + 1 }
+          }
+          if any_cand == 0 { irf }
+          else {
+          -- f64 slots keep their FP-pool path (facts_slots is an nlist).
+          let f64_facts = pipeline_ir_native_f64_facts_for_blocks(blocks)
+          let f64_slot_list = pipeline_ir_native_f64_facts_slots(f64_facts)
+          let nf64 = nlist_len(f64_slot_list)
+          let mut f64_i = 0
+          while f64_i < nf64 {
+            let fslot = nlist_get(f64_slot_list, f64_i)
+            if fslot >= 0 and fslot < next_value { pipeline_ir_native_resident_dense_set(disq, fslot, 1) } else { 0 }
+            f64_i = f64_i + 1
+          }
+          -- Slots the leaf slot-pin pass already serves stay slots: a
+          -- loop-pinned slot lives in x8/x10/x11 full-time with ZERO
+          -- memory traffic — promotion would demote it to a frame-homed
+          -- block param (the sieve +47% inversion). Promotion targets
+          -- the slots that machinery bails on: call-bearing loops.
+          let mut pin_cur = pipeline_ir_native_pinned_slot_for_function(irf)
+          while pin_cur != 0 {
+            if node_f1(pin_cur) != pipeline_ir_native_forward_marker() {
+              let pslot = node_f1(pin_cur)
+              if pslot >= 0 and pslot < next_value { pipeline_ir_native_resident_dense_set(disq, pslot, 1) } else { 0 }
+            } else { 0 }
+            pin_cur = node_f3(pin_cur)
+          }
+          let mut any_cand2 = 0
+          let mut ac = 0
+          while ac < next_value {
+            if nlist_get(declared, ac) == 1 and nlist_get(disq, ac) == 0 { any_cand2 = 1 ac = next_value } else { ac = ac + 1 }
+          }
+          if any_cand2 == 0 { irf }
+          else {
+            -- Entry-live slots (a path loads before any store) bail.
+            let lv = pipeline_ir_liveness_compute(blocks, param_count, next_value)
+            let entry_id = match blocks {
+              IrBlockListCons(b0, r0) -> match b0 { IrBlock(eid, ep, ei, et) -> eid }
+              IrBlockListNil -> 0 - 1
+            }
+            let cand_index = pipeline_ir_native_resident_dense_new(next_value, 0 - 1)
+            let cand_slot = nlist_new()
+            let mut ncand = 0
+            let mut cb = 0
+            while cb < next_value {
+              if nlist_get(declared, cb) == 1 and nlist_get(disq, cb) == 0 {
+                if pipeline_ir_liveness_live_in_contains(lv, entry_id, cb) { 0 } else {
+                  pipeline_ir_native_resident_dense_set(cand_index, cb, ncand)
+                  nlist_add(cand_slot, cb)
+                  ncand = ncand + 1
+                  0
+                }
+              } else { 0 }
+              cb = cb + 1
+            }
+            if ncand == 0 or nids * ncand > 40000 { irf }
+            else {
+              -- CFG arrays.
+              let exists = pipeline_ir_native_resident_dense_new(nids, 0)
+              let pred_count = pipeline_ir_native_resident_dense_new(nids, 0)
+              let pred1 = pipeline_ir_native_resident_dense_new(nids, 0 - 1)
+              let pred_lists = pipeline_ir_native_resident_dense_new(nids, 0)
+              let succ0 = pipeline_ir_native_resident_dense_new(nids, 0 - 1)
+              let succ1 = pipeline_ir_native_resident_dense_new(nids, 0 - 1)
+              let mut cf_cur = blocks
+              let mut cf_done = 0
+              while cf_done == 0 {
+                match cf_cur {
+                  IrBlockListNil -> { cf_done = 1 }
+                  IrBlockListCons(block, rest) -> {
+                    match block {
+                      IrBlock(id, params, insts, term) -> {
+                        pipeline_ir_native_resident_dense_set(exists, id, 1)
+                        let s0 = pipeline_mem2reg_term_succ0(term)
+                        let s1 = pipeline_mem2reg_term_succ1(term)
+                        pipeline_ir_native_resident_dense_set(succ0, id, s0)
+                        pipeline_ir_native_resident_dense_set(succ1, id, s1)
+                        if s0 >= 0 and s0 < nids {
+                          pipeline_ir_native_resident_dense_set(pred_count, s0, nlist_get(pred_count, s0) + 1)
+                          if nlist_get(pred1, s0) < 0 { pipeline_ir_native_resident_dense_set(pred1, s0, id) } else { 0 }
+                          if nlist_get(pred_lists, s0) == 0 { pipeline_ir_native_resident_dense_set(pred_lists, s0, nlist_new()) } else { 0 }
+                          nlist_add(nlist_get(pred_lists, s0), id)
+                          0
+                        } else { 0 }
+                        if s1 >= 0 and s1 < nids {
+                          pipeline_ir_native_resident_dense_set(pred_count, s1, nlist_get(pred_count, s1) + 1)
+                          if nlist_get(pred1, s1) < 0 { pipeline_ir_native_resident_dense_set(pred1, s1, id) } else { 0 }
+                          if nlist_get(pred_lists, s1) == 0 { pipeline_ir_native_resident_dense_set(pred_lists, s1, nlist_new()) } else { 0 }
+                          nlist_add(nlist_get(pred_lists, s1), id)
+                          0
+                        } else { 0 }
+                        cf_cur = rest
+                      }
+                    }
+                  }
+                }
+              }
+              let rpo = nlist_new()
+              if pipeline_mem2reg_rpo(entry_id, succ0, succ1, exists, nids, rpo) == 0 { irf }
+              else {
+                -- Pruned param allocation at multi-pred joins.
+                let param_plane = pipeline_ir_native_resident_dense_new(nids * ncand, 0 - 1)
+                let param_repl = pipeline_ir_native_resident_dense_new(nids * ncand, 0 - 1)
+                let exit_plane = pipeline_ir_native_resident_dense_new(nids * ncand, 0 - 1)
+                let mut fresh = next_value
+                let nrpo = nlist_len(rpo)
+                let mut pa = 0
+                while pa < nrpo {
+                  let pid = nlist_get(rpo, pa)
+                  if nlist_get(pred_count, pid) >= 2 {
+                    let mut pc = 0
+                    while pc < ncand {
+                      if pipeline_ir_liveness_live_in_contains(lv, pid, nlist_get(cand_slot, pc)) {
+                        pipeline_ir_native_resident_dense_set(param_plane, pid * ncand + pc, fresh)
+                        fresh = fresh + 1
+                        0
+                      } else { 0 }
+                      pc = pc + 1
+                    }
+                    0
+                  } else { 0 }
+                  pa = pa + 1
+                }
+                -- Pass A: RPO simulation filling exit rows and the alias env.
+                let env = pipeline_ir_alias_env_empty()
+                let mut sim_fail = 0
+                let mut sa = 0
+                while sa < nrpo and sim_fail == 0 {
+                  let sid = nlist_get(rpo, sa)
+                  let m = pipeline_mem2reg_in_map(sid, entry_id, pred_count, pred1, param_plane, param_repl, exit_plane, ncand)
+                  let sblock = pipeline_mem2reg_block_for_id(blocks, sid)
+                  match sblock {
+                    IrBlock(bid, bparams, binsts, bterm) -> {
+                      sim_fail = pipeline_mem2reg_sim_insts(binsts, cand_index, m, env, next_value)
+                    }
+                  }
+                  pipeline_mem2reg_store_row(exit_plane, sid, m, ncand)
+                  sa = sa + 1
+                }
+                if sim_fail == 1 { irf }
+                else {
+                  -- Trivial-phi removal (Braun): a param whose incoming
+                  -- values resolve to a single distinct value besides
+                  -- itself is redundant — the variable was not changed
+                  -- around that join. Alias it away; removals cascade.
+                  let mut phi_changed = 1
+                  while phi_changed == 1 {
+                    phi_changed = 0
+                    let mut tb = 0
+                    while tb < nrpo {
+                      let tid3 = nlist_get(rpo, tb)
+                      if nlist_get(pred_count, tid3) >= 2 {
+                        let mut tc = 0
+                        while tc < ncand {
+                          let tp = nlist_get(param_plane, tid3 * ncand + tc)
+                          if tp >= 0 {
+                            let plist = nlist_get(pred_lists, tid3)
+                            let npred = if plist != 0 { nlist_len(plist) } else { 0 }
+                            let mut distinct = 0 - 1
+                            let mut multi = 0
+                            let mut pi3 = 0
+                            while pi3 < npred {
+                              let pin = nlist_get(exit_plane, nlist_get(plist, pi3) * ncand + tc)
+                              let inv = if pin >= 0 { pipeline_ir_alias_env_lookup_or(env, pin) } else { 0 - 1 }
+                              if inv < 0 { multi = 1 } else {
+                                if inv != tp {
+                                  if distinct < 0 { distinct = inv }
+                                  else { if inv != distinct { multi = 1 } else { 0 } }
+                                  0
+                                } else { 0 }
+                              }
+                              pi3 = pi3 + 1
+                            }
+                            if multi == 0 and distinct >= 0 {
+                              pipeline_ir_alias_env_bind(env, tp, distinct)
+                              pipeline_ir_native_resident_dense_set(param_plane, tid3 * ncand + tc, 0 - 1)
+                              pipeline_ir_native_resident_dense_set(param_repl, tid3 * ncand + tc, distinct)
+                              phi_changed = 1
+                            } else { 0 }
+                            0
+                          } else { 0 }
+                          tc = tc + 1
+                        }
+                        0
+                      } else { 0 }
+                      tb = tb + 1
+                    }
+                  }
+                  -- Pass B: layout-order rewrite.
+                  let mut tramp_next = nids
+                  let mut out_rev = ir_block_list_empty()
+                  let mut pending_tramps = ir_block_list_empty()
+                  let mut rw_fail = 0
+                  let mut rw_cur = blocks
+                  let mut rw_done = 0
+                  while rw_done == 0 and rw_fail == 0 {
+                    match rw_cur {
+                      IrBlockListNil -> { rw_done = 1 }
+                      IrBlockListCons(block, rest) -> {
+                        match block {
+                          IrBlock(id, params, insts, term) -> {
+                            let m = pipeline_mem2reg_in_map(id, entry_id, pred_count, pred1, param_plane, param_repl, exit_plane, ncand)
+                            -- Append this block's new params in candidate order.
+                            let mut new_params_extra = ir_value_list_empty()
+                            let mut npc = ncand - 1
+                            while npc >= 0 {
+                              if nlist_get(param_plane, id * ncand + npc) >= 0 {
+                                new_params_extra = ir_value_list_prepend(nlist_get(param_plane, id * ncand + npc), new_params_extra)
+                              } else { 0 }
+                              npc = npc - 1
+                            }
+                            let new_params = ir_value_list_append(params, new_params_extra)
+                            -- Rewrite insts, dropping the promoted slot family.
+                            let mut acc_rev = ir_inst_list_empty()
+                            let mut wi = insts
+                            let mut wdone = 0
+                            while wdone == 0 and rw_fail == 0 {
+                              match wi {
+                                IrInstNil -> { wdone = 1 }
+                                IrInstCons(inst, itail) -> {
+                                  match inst {
+                                    IrSlotI64(s) -> {
+                                      if s >= 0 and s < next_value and nlist_get(cand_index, s) >= 0 { 0 }
+                                      else { acc_rev = ir_inst_list_prepend(inst, acc_rev) 0 }
+                                    }
+                                    IrStoreI64(s, v) -> {
+                                      let sci = if s >= 0 and s < next_value { nlist_get(cand_index, s) } else { 0 - 1 }
+                                      if sci >= 0 {
+                                        pipeline_ir_native_resident_dense_set(m, sci, pipeline_ir_alias_env_lookup_or(env, v))
+                                      } else {
+                                        acc_rev = ir_inst_list_prepend(pipeline_ir_rewrite_inst_uses(inst, env), acc_rev)
+                                        0
+                                      }
+                                      0
+                                    }
+                                    IrLoadI64(d, s) -> {
+                                      let lci = if s >= 0 and s < next_value { nlist_get(cand_index, s) } else { 0 - 1 }
+                                      if lci >= 0 { 0 }
+                                      else { acc_rev = ir_inst_list_prepend(pipeline_ir_rewrite_inst_uses(inst, env), acc_rev) 0 }
+                                    }
+                                    IrBindI64(ns, nl, v, ty) -> {
+                                      let bci = if v >= 0 and v < next_value { nlist_get(cand_index, v) } else { 0 - 1 }
+                                      if bci >= 0 {
+                                        if nlist_get(m, bci) < 0 { rw_fail = 1 0 }
+                                        else { acc_rev = ir_inst_list_prepend(ir_inst_bind_typed_i64(ns, nl, pipeline_ir_alias_env_lookup_or(env, nlist_get(m, bci)), ty), acc_rev) 0 }
+                                        0
+                                      } else {
+                                        acc_rev = ir_inst_list_prepend(pipeline_ir_rewrite_inst_uses(inst, env), acc_rev)
+                                        0
+                                      }
+                                    }
+                                    _ -> {
+                                      acc_rev = ir_inst_list_prepend(pipeline_ir_rewrite_inst_uses(inst, env), acc_rev)
+                                      0
+                                    }
+                                  }
+                                  wi = itail
+                                }
+                              }
+                            }
+                            let new_insts = pipeline_mem2reg_reverse_insts(acc_rev, ir_inst_list_empty())
+                            -- Rewrite terminator and thread edge args.
+                            let rterm = pipeline_ir_rewrite_term(term, env)
+                            let final_term = match rterm {
+                              IrTermJump(jt, jargs) -> {
+                                if jt >= 0 and jt < nids and pipeline_mem2reg_target_needs_args(jt, param_plane, ncand) == 1 {
+                                  ir_term_jump_args(jt, pipeline_mem2reg_edge_args(jt, m, param_plane, ncand, jargs, env))
+                                } else { rterm }
+                              }
+                              IrTermBranch(bc, bt, be) -> {
+                                -- Trampolines land immediately after their
+                                -- source block in layout: a trampoline at the
+                                -- list tail would manufacture backward edges
+                                -- that blow up every position-window rounding
+                                -- downstream (the residency pools would see
+                                -- loop-sized windows everywhere).
+                                let nt = if bt >= 0 and bt < nids and pipeline_mem2reg_target_needs_args(bt, param_plane, ncand) == 1 {
+                                  let tid = tramp_next
+                                  tramp_next = tramp_next + 1
+                                  pending_tramps = ir_block_list_prepend(ir_block_new_term(tid, ir_inst_list_empty(), ir_term_jump_args(bt, pipeline_mem2reg_edge_args(bt, m, param_plane, ncand, ir_value_list_empty(), env))), pending_tramps)
+                                  tid
+                                } else { bt }
+                                let ne = if be >= 0 and be < nids and pipeline_mem2reg_target_needs_args(be, param_plane, ncand) == 1 {
+                                  let tid2 = tramp_next
+                                  tramp_next = tramp_next + 1
+                                  pending_tramps = ir_block_list_prepend(ir_block_new_term(tid2, ir_inst_list_empty(), ir_term_jump_args(be, pipeline_mem2reg_edge_args(be, m, param_plane, ncand, ir_value_list_empty(), env))), pending_tramps)
+                                  tid2
+                                } else { be }
+                                ir_term_branch(bc, nt, ne)
+                              }
+                              _ -> rterm
+                            }
+                            out_rev = ir_block_list_prepend(ir_block_new_params(id, new_params, new_insts, final_term), out_rev)
+                            -- Flush this block's trampolines right behind it.
+                            let mut fl = pipeline_mem2reg_reverse_blocks(pending_tramps, ir_block_list_empty())
+                            pending_tramps = ir_block_list_empty()
+                            let mut fl_done = 0
+                            while fl_done == 0 {
+                              match fl {
+                                IrBlockListNil -> { fl_done = 1 }
+                                IrBlockListCons(tb, tb_rest) -> {
+                                  out_rev = ir_block_list_prepend(tb, out_rev)
+                                  fl = tb_rest
+                                }
+                              }
+                            }
+                            rw_cur = rest
+                          }
+                        }
+                      }
+                    }
+                  }
+                  if rw_fail == 1 { irf }
+                  else {
+                    IrFunction(hash, param_count, pipeline_mem2reg_reverse_blocks(out_rev, ir_block_list_empty()), src)
+                  }
+                }
+              }
+            }
+          }
+          }
+        }
+      } }
+    }
+  }
+}
+
+fn pipeline_mem2reg_function_list(functions: IrFunctionList) -> IrFunctionList {
+  match functions {
+    IrFunctionNil -> IrFunctionNil
+    IrFunctionCons(irf, rest) -> IrFunctionCons(pipeline_mem2reg_function(irf), pipeline_mem2reg_function_list(rest))
+    _ -> functions
+  }
+}
+
+-- Test-facing: count residual slot declarations in an optimised module.
+fn pipeline_ir_module_slot_inst_count(ir: IrModule) -> i64 {
+  let mut count = 0
+  let mut fcur = pipeline_ir_functions(ir)
+  let mut fdone = 0
+  while fdone == 0 {
+    match fcur {
+      IrFunctionNil -> { fdone = 1 }
+      IrFunctionCons(irf, rest) -> {
+        let mut bcur = pipeline_ir_function_blocks(irf)
+        let mut bdone = 0
+        while bdone == 0 {
+          match bcur {
+            IrBlockListNil -> { bdone = 1 }
+            IrBlockListCons(block, brest) -> {
+              match block {
+                IrBlock(id, params, insts, term) -> {
+                  let mut icur = insts
+                  let mut idone = 0
+                  while idone == 0 {
+                    match icur {
+                      IrInstNil -> { idone = 1 }
+                      IrInstCons(inst, itail) -> {
+                        match inst {
+                          IrSlotI64(s) -> { count = count + 1 0 }
+                          _ -> 0
+                        }
+                        icur = itail
+                      }
+                    }
+                  }
+                  bcur = brest
+                }
+              }
+            }
+          }
+        }
+        fcur = rest
+      }
+      _ -> { fdone = 1 }
+    }
+  }
+  count
+}
+
+-- promote = 0 stops before slot-to-SSA promotion: the slot-keyed fact
+-- probes in the bounds metrics analyse the IR the fact plane actually
+-- runs on (facts are decided before promotion rewrites the slots away).
+fn pipeline_optimise_typed_ir_pre_promotion(typed: TypedModule, ir: IrModule) -> IrModule {
+  pipeline_optimise_typed_ir_with_promotion(typed, ir, 0)
+}
+
 fn pipeline_optimise_typed_ir(typed: TypedModule, ir: IrModule) -> IrModule {
+  pipeline_optimise_typed_ir_with_promotion(typed, ir, 1)
+}
+
+fn pipeline_optimise_typed_ir_with_promotion(typed: TypedModule, ir: IrModule, promote: i64) -> IrModule {
   match typed {
     TypedModule(fns, src, tt) -> {
       let base_functions = pipeline_ir_functions(ir)
@@ -33432,8 +34203,13 @@ fn pipeline_optimise_typed_ir(typed: TypedModule, ir: IrModule) -> IrModule {
       -- small CFGs, and copy-prop/DCE is what removes the redundant value
       -- moves the naive lowering emits.
       let opt = pipeline_optimise_ir_function_list(functions, functions, semantic_facts, src)
+      let final_functions = if promote == 1 {
+        pipeline_mem2reg_function_list(pipeline_optimised_functions_functions(opt))
+      } else {
+        pipeline_optimised_functions_functions(opt)
+      }
       OptimisedIrModule(
-        pipeline_optimised_functions_functions(opt),
+        final_functions,
         0,
         0,
         0,
