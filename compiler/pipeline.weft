@@ -32324,6 +32324,268 @@ fn pipeline_ir_verify_block_order(blocks: IrBlockList, next_value: i64) -> i64 {
 -- mem2reg will retire, not an SSA dominance property. Unreachable blocks
 -- keep full dominator sets and are not flagged here.
 
+
+-- ══════════════════════════════════════════════════════════════
+-- Per-block liveness facts (2l stage 3 substrate). Standard backward
+-- dataflow to fixpoint over dense bitset rows keyed by block id:
+--   live_in[b]  = use[b] | (live_out[b] & ~def[b])
+--   live_out[b] = union of live_in over successors
+-- use[b] is upward-exposed uses (used before any in-block def); block
+-- params count as defs at block entry; jump arguments are uses in the
+-- SOURCE block and the target's params are defs in the TARGET, which
+-- models the phi transfer exactly. Slot ids share the value namespace,
+-- so slot liveness falls out of the same rows (the coalescer's food).
+-- Handle layout: [use_ptr, def_ptr, in_ptr, out_ptr, words, nblocks].
+-- ══════════════════════════════════════════════════════════════
+
+fn pipeline_ir_liveness_row(base: i64, words: i64, block_id: i64) -> i64 {
+  base + block_id * words * 8
+}
+
+fn pipeline_ir_liveness_words(lv: i64) -> i64 {
+  mem_load64_at(lv, 32)
+}
+
+fn pipeline_ir_liveness_nblocks(lv: i64) -> i64 {
+  mem_load64_at(lv, 40)
+}
+
+fn pipeline_ir_liveness_row_set(base: i64, words: i64, block_id: i64, value: i64) -> i64 {
+  if value < 0 { 0 }
+  else {
+    let row = pipeline_ir_liveness_row(base, words, block_id)
+    pipeline_word_array_set(row, value / 64, pipeline_word_array_get(row, value / 64) bor (1 bshl (value % 64)))
+  }
+}
+
+fn pipeline_ir_liveness_row_contains(base: i64, words: i64, block_id: i64, value: i64) -> bool {
+  if value < 0 { false }
+  else {
+    let row = pipeline_ir_liveness_row(base, words, block_id)
+    let bit = pipeline_word_array_get(row, value / 64) band (1 bshl (value % 64))
+    bit != 0
+  }
+}
+
+fn pipeline_ir_liveness_live_out_contains(lv: i64, block_id: i64, value: i64) -> bool {
+  pipeline_ir_liveness_row_contains(mem_load64_at(lv, 24), pipeline_ir_liveness_words(lv), block_id, value)
+}
+
+fn pipeline_ir_liveness_live_in_contains(lv: i64, block_id: i64, value: i64) -> bool {
+  pipeline_ir_liveness_row_contains(mem_load64_at(lv, 16), pipeline_ir_liveness_words(lv), block_id, value)
+}
+
+fn pipeline_ir_liveness_row_count(base: i64, words: i64, block_id: i64) -> i64 {
+  let row = pipeline_ir_liveness_row(base, words, block_id)
+  let mut total = 0
+  let mut w = 0
+  while w < words {
+    let mut word = pipeline_word_array_get(row, w)
+    while word != 0 {
+      total = total + (word band 1)
+      word = word bshr 1
+    }
+    w = w + 1
+  }
+  total
+}
+
+fn pipeline_ir_liveness_live_out_count(lv: i64, block_id: i64) -> i64 {
+  pipeline_ir_liveness_row_count(mem_load64_at(lv, 24), pipeline_ir_liveness_words(lv), block_id)
+}
+
+fn pipeline_ir_liveness_live_in_count(lv: i64, block_id: i64) -> i64 {
+  pipeline_ir_liveness_row_count(mem_load64_at(lv, 16), pipeline_ir_liveness_words(lv), block_id)
+}
+
+-- Uses of a terminator alone (no successor params — those are defs in
+-- the target block under the phi model).
+fn pipeline_ir_liveness_term_uses(term: IrTerminator, use_base: i64, def_base: i64, words: i64, block_id: i64) -> i64 {
+  match term {
+    IrTermNone -> 0
+    IrTermReturn(value) -> pipeline_ir_liveness_use_if_exposed(use_base, def_base, words, block_id, value)
+    IrTermJump(target, args) -> pipeline_ir_liveness_args_uses(args, use_base, def_base, words, block_id)
+    IrTermBranch(cond, then_block, else_block) -> pipeline_ir_liveness_use_if_exposed(use_base, def_base, words, block_id, cond)
+  }
+}
+
+fn pipeline_ir_liveness_args_uses(args: IrValueList, use_base: i64, def_base: i64, words: i64, block_id: i64) -> i64 {
+  match args {
+    IrValueNil -> 0
+    IrValueCons(value, rest) -> {
+      pipeline_ir_liveness_use_if_exposed(use_base, def_base, words, block_id, value)
+      pipeline_ir_liveness_args_uses(rest, use_base, def_base, words, block_id)
+    }
+  }
+}
+
+-- A use is upward-exposed only when the block has not defined it yet.
+fn pipeline_ir_liveness_use_if_exposed(use_base: i64, def_base: i64, words: i64, block_id: i64, value: i64) -> i64 {
+  if value < 0 { 0 }
+  else {
+    if pipeline_ir_liveness_row_contains(def_base, words, block_id, value) { 0 }
+    else { pipeline_ir_liveness_row_set(use_base, words, block_id, value) }
+  }
+}
+
+fn pipeline_ir_liveness_gen_kill_block(block: IrBlock, use_base: i64, def_base: i64, words: i64) -> i64 {
+  match block {
+    IrBlock(id, params, insts, term) -> {
+      let mut p_cur = params
+      let mut p_done = 0
+      while p_done == 0 {
+        match p_cur {
+          IrValueNil -> { p_done = 1 }
+          IrValueCons(pv, p_rest) -> {
+            pipeline_ir_liveness_row_set(def_base, words, id, pv)
+            p_cur = p_rest
+          }
+        }
+      }
+      let mut cur = insts
+      let mut done = 0
+      while done == 0 {
+        match cur {
+          IrInstNil -> { done = 1 }
+          IrInstCons(inst, rest) -> {
+            let mut uses = pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty())
+            let mut u_done = 0
+            while u_done == 0 {
+              match uses {
+                PipelineIrLiveSetNil -> { u_done = 1 }
+                PipelineIrLiveSetCons(u, u_rest) -> {
+                  pipeline_ir_liveness_use_if_exposed(use_base, def_base, words, id, u)
+                  uses = u_rest
+                }
+                PipelineIrLiveSetBits(array, bwords, count) -> { u_done = 1 }
+              }
+            }
+            let d = pipeline_ir_inst_def_or(inst, 0 - 1)
+            if d >= 0 { pipeline_ir_liveness_row_set(def_base, words, id, d) } else { 0 }
+            -- Slot declarations and stores establish the slot id for
+            -- exposure purposes (repeated stores are fine).
+            match inst {
+              IrSlotI64(slot_id) -> pipeline_ir_liveness_row_set(def_base, words, id, slot_id)
+              _ -> 0
+            }
+            cur = rest
+          }
+        }
+      }
+      pipeline_ir_liveness_term_uses(term, use_base, def_base, words, id)
+    }
+  }
+}
+
+-- live_out[source] |= live_in[target]; returns 1 when source grew.
+fn pipeline_ir_liveness_flow_edge(in_base: i64, out_base: i64, words: i64, source: i64, target: i64) -> i64 {
+  let s_row = pipeline_ir_liveness_row(out_base, words, source)
+  let t_row = pipeline_ir_liveness_row(in_base, words, target)
+  let mut w = 0
+  let mut changed = 0
+  while w < words {
+    let old = pipeline_word_array_get(s_row, w)
+    let merged = old bor pipeline_word_array_get(t_row, w)
+    if merged != old {
+      pipeline_word_array_set(s_row, w, merged)
+      changed = 1
+    } else { 0 }
+    w = w + 1
+  }
+  changed
+}
+
+fn pipeline_ir_liveness_recompute_in(use_base: i64, def_base: i64, in_base: i64, out_base: i64, words: i64, block_id: i64) -> i64 {
+  let u_row = pipeline_ir_liveness_row(use_base, words, block_id)
+  let d_row = pipeline_ir_liveness_row(def_base, words, block_id)
+  let i_row = pipeline_ir_liveness_row(in_base, words, block_id)
+  let o_row = pipeline_ir_liveness_row(out_base, words, block_id)
+  let mut w = 0
+  let mut changed = 0
+  while w < words {
+    let old = pipeline_word_array_get(i_row, w)
+    let next = pipeline_word_array_get(u_row, w) bor (pipeline_word_array_get(o_row, w) band (pipeline_word_array_get(d_row, w) bxor (0 - 1)))
+    if next != old {
+      pipeline_word_array_set(i_row, w, next)
+      changed = 1
+    } else { 0 }
+    w = w + 1
+  }
+  changed
+}
+
+fn pipeline_ir_liveness_flow_block(block: IrBlock, lv: i64) -> i64 {
+  let use_base = mem_load64_at(lv, 0)
+  let def_base = mem_load64_at(lv, 8)
+  let in_base = mem_load64_at(lv, 16)
+  let out_base = mem_load64_at(lv, 24)
+  let words = pipeline_ir_liveness_words(lv)
+  match block {
+    IrBlock(id, params, insts, term) -> {
+      let mut changed = 0
+      match term {
+        IrTermNone -> 0
+        IrTermReturn(value) -> 0
+        IrTermJump(target, args) -> {
+          changed = changed bor pipeline_ir_liveness_flow_edge(in_base, out_base, words, id, target)
+          0
+        }
+        IrTermBranch(cond, then_block, else_block) -> {
+          changed = changed bor pipeline_ir_liveness_flow_edge(in_base, out_base, words, id, then_block)
+          changed = changed bor pipeline_ir_liveness_flow_edge(in_base, out_base, words, id, else_block)
+          0
+        }
+      }
+      changed bor pipeline_ir_liveness_recompute_in(use_base, def_base, in_base, out_base, words, id)
+    }
+  }
+}
+
+fn pipeline_ir_liveness_flow_blocks(blocks: IrBlockList, lv: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      -- Flow the tail first: block layout is roughly topological, so a
+      -- reverse sweep converges the backward problem in few rounds.
+      let tail_changed = pipeline_ir_liveness_flow_blocks(rest, lv)
+      tail_changed bor pipeline_ir_liveness_flow_block(block, lv)
+    }
+  }
+}
+
+fn pipeline_ir_liveness_compute(blocks: IrBlockList, param_count: i64, next_value: i64) -> i64 {
+  let nblocks = pipeline_ir_verify_max_block_id(blocks) + 1
+  let words = (next_value + 64) / 64
+  let plane = nblocks * words
+  let lv = alloc_words(6)
+  mem_store64_at(lv, 0, alloc_zeroed(plane * 8))
+  mem_store64_at(lv, 8, alloc_zeroed(plane * 8))
+  mem_store64_at(lv, 16, alloc_zeroed(plane * 8))
+  mem_store64_at(lv, 24, alloc_zeroed(plane * 8))
+  mem_store64_at(lv, 32, words)
+  mem_store64_at(lv, 40, nblocks)
+  let use_base = mem_load64_at(lv, 0)
+  let def_base = mem_load64_at(lv, 8)
+  let mut cur = blocks
+  let mut done = 0
+  while done == 0 {
+    match cur {
+      IrBlockListNil -> { done = 1 }
+      IrBlockListCons(block, rest) -> {
+        pipeline_ir_liveness_gen_kill_block(block, use_base, def_base, words)
+        cur = rest
+      }
+    }
+  }
+  let mut rounds = 0
+  let mut changed = 1
+  while changed == 1 and rounds <= nblocks + 2 {
+    changed = pipeline_ir_liveness_flow_blocks(blocks, lv)
+    rounds = rounds + 1
+  }
+  lv
+}
+
 fn pipeline_ir_verify_max_block_id(blocks: IrBlockList) -> i64 {
   let mut max_id = 0
   let mut cur = blocks
