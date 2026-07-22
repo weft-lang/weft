@@ -28554,6 +28554,14 @@ fn pipeline_ir_inline_candidate_prepend(hash: i64, f: IrFunction, rest: Pipeline
   }
 }
 
+
+fn pipeline_ir_inline_candidate_functions(candidates: PipelineIrInlineCandidateList, acc: IrFunctionList) -> IrFunctionList {
+  match candidates {
+    PipelineIrInlineCandidateNil -> acc
+    PipelineIrInlineCandidateNode(hash, f, lower, higher) -> pipeline_ir_inline_candidate_functions(lower, pipeline_ir_inline_candidate_functions(higher, ir_function_list_prepend(f, acc)))
+  }
+}
+
 fn pipeline_ir_inline_candidate_lookup(candidates: PipelineIrInlineCandidateList, hash: i64) -> IrFunctionList {
   match candidates {
     PipelineIrInlineCandidateNil -> ir_function_list_empty()
@@ -28672,7 +28680,7 @@ fn pipeline_ir_pure_intrinsic_bridge_inline_eligible(insts: IrInstList) -> i64 {
   if pipeline_ir_pure_intrinsic_inline_inst_count(insts) == 1 { 1 } else { 0 }
 }
 
-fn pipeline_ir_function_tiny_inline_eligible(f: IrFunction, facts: PipelineIrSemanticFactList) -> i64 {
+fn pipeline_ir_function_tiny_inline_eligible(f: IrFunction, facts: PipelineIrSemanticFactList, tiny_pure: i64) -> i64 {
   match f {
     IrFunction(hash, param_count, blocks, src) -> {
       match blocks {
@@ -28683,7 +28691,7 @@ fn pipeline_ir_function_tiny_inline_eligible(f: IrFunction, facts: PipelineIrSem
               let inst_len = ir_inst_list_len(insts)
               -- The clone path does not yet reify callee parameter ownership
               -- cleanups, so managed parameters stay behind the call boundary.
-              if param_len != 0 or inst_len > 9 or pipeline_ir_tiny_inline_inst_list_supported(insts) != 1 or pipeline_ir_semantic_fact_lookup_managed_param_mask(facts, hash) != 0 {
+              if param_len != 0 or inst_len > 9 or pipeline_ir_tiny_inline_inst_list_supported(insts, tiny_pure, hash) != 1 or pipeline_ir_semantic_fact_lookup_managed_param_mask(facts, hash) != 0 {
                 0
               } else {
                 match term {
@@ -28710,22 +28718,20 @@ fn pipeline_ir_function_tiny_inline_eligible(f: IrFunction, facts: PipelineIrSem
   }
 }
 
-fn pipeline_ir_inline_candidates_from_functions(functions: IrFunctionList, facts: PipelineIrSemanticFactList, user_src: i64) -> PipelineIrInlineCandidateList {
+fn pipeline_ir_inline_candidates_walk(functions: IrFunctionList, facts: PipelineIrSemanticFactList, tiny_pure: i64) -> PipelineIrInlineCandidateList {
   match functions {
     IrFunctionNil -> PipelineIrInlineCandidateNil
     IrFunctionCons(f, rest) -> {
-      let tail = pipeline_ir_inline_candidates_from_functions(rest, facts, user_src)
+      let tail = pipeline_ir_inline_candidates_walk(rest, facts, tiny_pure)
       match f {
         IrFunction(hash, param_count, blocks, src) -> {
           -- Candidates come from every module: imported accessor forests
           -- (node_f*/mem helpers in lib.weft) dominate self-compile call
           -- counts, and the hash-ordered candidate tree keeps lookup
-          -- sublinear, retiring the quadratic risk that once scoped this
-          -- to the root source. Imported functions can only qualify
-          -- through the structural bridge shapes (loads/stores through a
-          -- parameter), which are ownership-neutral; the fact-gated pure
-          -- path still requires root-source facts.
-          if pipeline_ir_function_tiny_inline_eligible(f, facts) == 1 {
+          -- sublinear. Bodies may call bridge shapes or other tiny pure
+          -- functions; the iterated passes collapse helper chains
+          -- (u32 -> rotr32 -> bsig0 -> block) bottom-up.
+          if pipeline_ir_function_tiny_inline_eligible(f, facts, tiny_pure) == 1 {
             pipeline_ir_inline_candidate_prepend(hash, f, tail)
           } else {
             tail
@@ -28734,6 +28740,10 @@ fn pipeline_ir_inline_candidates_from_functions(functions: IrFunctionList, facts
       }
     }
   }
+}
+
+fn pipeline_ir_inline_candidates_from_functions(functions: IrFunctionList, facts: PipelineIrSemanticFactList, user_src: i64) -> PipelineIrInlineCandidateList {
+  pipeline_ir_inline_candidates_walk(functions, facts, pipeline_ir_tiny_pure_hash_tree(functions, facts))
 }
 
 fn pipeline_ir_optimise_context(facts: PipelineIrSemanticFactList, inline_candidates: PipelineIrInlineCandidateList) -> PipelineIrOptimiseContext {
@@ -29236,6 +29246,48 @@ fn pipeline_ir_pure_intrinsic_inline_call_hash(callee_hash: i64) -> i64 {
   else { if callee_hash == pipeline_ir_native_intrinsic_f32_sqrt_hash() { 1 } else { 0 } }
 }
 
+
+-- Structurally-tiny pure prepass for candidate closure: a single-block,
+-- small, unmanaged, pure-scalar function is recorded here even when its
+-- body calls other functions. Candidate eligibility may then admit calls
+-- whose targets are in this set — helper CHAINS (u32 -> rotr32 -> bsig0)
+-- become candidates and the iterated optimise passes collapse them
+-- bottom-up one level per pass.
+fn pipeline_ir_tiny_pure_hashes(functions: IrFunctionList, facts: PipelineIrSemanticFactList, holder: i64) -> i64 {
+  match functions {
+    IrFunctionNil -> 0
+    IrFunctionCons(f, rest) -> {
+      match f {
+        IrFunction(hash, param_count, blocks, src) -> {
+          match blocks {
+            IrBlockListCons(block, IrBlockListNil) -> {
+              match block {
+                IrBlock(id, params, insts, term) -> {
+                  if ir_value_list_len(params) == 0 and ir_inst_list_len(insts) <= 9 and pipeline_ir_semantic_fact_lookup_managed_param_mask(facts, hash) == 0 and pipeline_ir_semantic_fact_lookup_pure_scalar_result(facts, hash) == 1 {
+                    match term {
+                      IrTermReturn(return_value) -> pipeline_ir_hash_tree_add_unique(holder, hash)
+                      _ -> 0
+                    }
+                  } else { 0 }
+                }
+              }
+            }
+            _ -> 0
+          }
+        }
+      }
+      pipeline_ir_tiny_pure_hashes(rest, facts, holder)
+    }
+  }
+}
+
+fn pipeline_ir_tiny_pure_hash_tree(functions: IrFunctionList, facts: PipelineIrSemanticFactList) -> i64 {
+  let holder = alloc_words(1)
+  mem_store64_at(holder, 0, 0)
+  pipeline_ir_tiny_pure_hashes(functions, facts, holder)
+  mem_load64_at(holder, 0)
+}
+
 fn pipeline_ir_inlineable_call_hash(callee_hash: i64) -> i64 {
   if pipeline_ir_raw_memory_inline_call_hash(callee_hash) == 1 { 1 }
   else { if pipeline_ir_pure_intrinsic_inline_call_hash(callee_hash) == 1 { 1 }
@@ -29256,7 +29308,7 @@ fn pipeline_ir_inline_clone_call_hash(callee_hash: i64) -> i64 {
   } } } }
 }
 
-fn pipeline_ir_tiny_inline_inst_supported(inst: IrInst) -> i64 {
+fn pipeline_ir_tiny_inline_inst_supported(inst: IrInst, tiny_pure: i64, self_hash: i64) -> i64 {
   match inst {
     IrBindI64(ns, nl, value, ty) -> 1
     IrConstI64(dst, value) -> 1
@@ -29269,7 +29321,15 @@ fn pipeline_ir_tiny_inline_inst_supported(inst: IrInst) -> i64 {
         _ -> 0
       }
     }
-    IrCallI64(dst, callee_hash, args) -> pipeline_ir_inlineable_call_hash(callee_hash)
+    -- A call is clonable when the callee is an allowlisted bridge shape,
+    -- or itself a structurally-tiny pure function (helper chains); the
+    -- iterated passes then collapse one chain level per pass. Self-calls
+    -- stay behind the call boundary (a pure one-block self-call is an
+    -- infinite loop, but the guard keeps clone growth trivially bounded).
+    IrCallI64(dst, callee_hash, args) -> {
+      if pipeline_ir_inlineable_call_hash(callee_hash) == 1 { 1 }
+      else { if callee_hash != self_hash and pipeline_ir_hash_tree_contains(tiny_pure, callee_hash) == 1 { 1 } else { 0 } }
+    }
     IrPtrLoadI64(dst, ptr) -> 1
     IrPtrStoreI64(dst, ptr, value) -> 1
     IrVectorGetI64(dst, vec, index, fallback, check_mode) -> 1
@@ -29278,15 +29338,44 @@ fn pipeline_ir_tiny_inline_inst_supported(inst: IrInst) -> i64 {
   }
 }
 
-fn pipeline_ir_tiny_inline_inst_list_supported(insts: IrInstList) -> i64 {
+fn pipeline_ir_tiny_inline_inst_list_supported(insts: IrInstList, tiny_pure: i64, self_hash: i64) -> i64 {
   match insts {
     IrInstNil -> 1
     IrInstCons(inst, rest) -> {
-      if pipeline_ir_tiny_inline_inst_supported(inst) == 1 {
-        pipeline_ir_tiny_inline_inst_list_supported(rest)
+      if pipeline_ir_tiny_inline_inst_supported(inst, tiny_pure, self_hash) == 1 {
+        pipeline_ir_tiny_inline_inst_list_supported(rest, tiny_pure, self_hash)
       } else {
         0
       }
+    }
+  }
+}
+
+
+-- Clone-time revalidation mirrors eligibility, with candidate membership
+-- as the chain oracle: a call inside a cloned body is fine when its
+-- target is a bridge shape or another candidate — the spliced call is
+-- inlined by a later pass.
+fn pipeline_ir_tiny_inline_clone_call_ok(callee_hash: i64, inline_candidates: PipelineIrInlineCandidateList, self_hash: i64) -> i64 {
+  if pipeline_ir_inlineable_call_hash(callee_hash) == 1 { 1 }
+  else { if callee_hash == self_hash { 0 }
+  else {
+    match pipeline_ir_inline_candidate_lookup(inline_candidates, callee_hash) {
+      IrFunctionNil -> 0
+      IrFunctionCons(cf, crest) -> 1
+    }
+  } }
+}
+
+fn pipeline_ir_tiny_inline_clone_supported(insts: IrInstList, inline_candidates: PipelineIrInlineCandidateList, self_hash: i64) -> i64 {
+  match insts {
+    IrInstNil -> 1
+    IrInstCons(inst, rest) -> {
+      let ok = match inst {
+        IrCallI64(dst, callee_hash, args) -> pipeline_ir_tiny_inline_clone_call_ok(callee_hash, inline_candidates, self_hash)
+        _ -> pipeline_ir_tiny_inline_inst_supported(inst, 0, self_hash)
+      }
+      if ok == 1 { pipeline_ir_tiny_inline_clone_supported(rest, inline_candidates, self_hash) } else { 0 }
     }
   }
 }
@@ -29382,17 +29471,17 @@ fn pipeline_ir_inline_clone_inst(inst: IrInst, inline_env: PipelineIrInlineValue
       }
     }
     IrCallI64(dst, callee_hash, args) -> {
-      if pipeline_ir_inlineable_call_hash(callee_hash) == 1 {
-        let new_dst = pipeline_ir_inline_clone_dst(dst, return_value, desired_result, next_value)
-        let cloned = ir_inst_call_i64(
-          new_dst,
-          pipeline_ir_inline_clone_call_hash(callee_hash),
-          pipeline_ir_rewrite_inline_value_list(args, inline_env)
-        )
-        pipeline_ir_inline_clone_result(1, ir_inst_list_prepend(cloned, ir_inst_list_empty()), pipeline_ir_inline_value_env_bind(inline_env, dst, new_dst), pipeline_ir_inline_clone_next(new_dst, next_value))
-      } else {
-        pipeline_ir_inline_clone_result(0, ir_inst_list_empty(), inline_env, next_value)
-      }
+      -- Bridge-shape callees map to their pseudo-bridge ids; any other
+      -- call (a fellow tiny-pure candidate, admitted by the clone
+      -- support gate) is copied verbatim with remapped arguments and
+      -- collapses on a later inline pass.
+      let new_dst = pipeline_ir_inline_clone_dst(dst, return_value, desired_result, next_value)
+      let cloned = ir_inst_call_i64(
+        new_dst,
+        pipeline_ir_inline_clone_call_hash(callee_hash),
+        pipeline_ir_rewrite_inline_value_list(args, inline_env)
+      )
+      pipeline_ir_inline_clone_result(1, ir_inst_list_prepend(cloned, ir_inst_list_empty()), pipeline_ir_inline_value_env_bind(inline_env, dst, new_dst), pipeline_ir_inline_clone_next(new_dst, next_value))
     }
     IrPtrLoadI64(dst, ptr) -> {
       let new_dst = pipeline_ir_inline_clone_dst(dst, return_value, desired_result, next_value)
@@ -29500,7 +29589,7 @@ fn pipeline_ir_try_inline_direct_call(callee_hash: i64, args: IrValueList, inlin
               IrBlockListCons(block, IrBlockListNil) -> {
                 match block {
                   IrBlock(id, params, insts, term) -> {
-                    if ir_value_list_len(params) != 0 or ir_inst_list_len(insts) > 9 or pipeline_ir_tiny_inline_inst_list_supported(insts) != 1 {
+                    if ir_value_list_len(params) != 0 or ir_inst_list_len(insts) > 9 or pipeline_ir_tiny_inline_clone_supported(insts, inline_candidates, hash) != 1 {
                       pipeline_ir_inline_result(0, ir_inst_list_empty(), 0, next_value)
                     } else {
                       match term {
@@ -32500,12 +32589,29 @@ fn pipeline_optimise_ir_function_list_with_candidates(functions: IrFunctionList,
 }
 
 fn pipeline_optimise_ir_function_list(functions: IrFunctionList, all_functions: IrFunctionList, facts: PipelineIrSemanticFactList, user_src: i64) -> PipelineOptimisedFunctions {
-  -- The first pass exposes new tiny leaves at their callers; rebuild the
-  -- fact-gated candidate set from that result so the second pass closes the
-  -- short helper chain without admitting effectful or multi-block callees.
-  let first_candidates = pipeline_ir_inline_candidates_from_functions(all_functions, facts, user_src)
   let pure_callees = pipeline_ir_pure_callee_tree(facts)
-  let first = pipeline_optimise_ir_function_list_with_candidates(functions, first_candidates, facts, user_src, pure_callees)
+  -- Pre-collapse the candidate BODIES against each other so helper
+  -- chains (u32 -> rotr32 -> bsig0) are flat before the full passes:
+  -- candidates are tiny single-block functions, so iterating over just
+  -- them is cheap, and callers then splice fully-flattened bodies in
+  -- one shot. Sites counted during pre-collapse are scaffolding on
+  -- throwaway copies and are not reported. The cap bounds clone growth
+  -- for any accidental candidate cycle.
+  let mut candidates = pipeline_ir_inline_candidates_from_functions(all_functions, facts, user_src)
+  let mut ci = 0
+  while ci < 4 {
+    let cand_fns = pipeline_ir_inline_candidate_functions(candidates, ir_function_list_empty())
+    let copt = pipeline_optimise_ir_function_list_with_candidates(cand_fns, candidates, facts, user_src, pure_callees)
+    if pipeline_optimised_functions_direct_call_inline_sites(copt) == 0 { ci = 4 }
+    else {
+      candidates = pipeline_ir_inline_candidates_from_functions(pipeline_optimised_functions_functions(copt), facts, user_src)
+      ci = ci + 1
+    }
+  }
+  -- The historic two full passes: the first splices flattened candidate
+  -- bodies into every caller; rebuilding candidates from that result
+  -- lets the second close callers that only became tiny after pass one.
+  let first = pipeline_optimise_ir_function_list_with_candidates(functions, candidates, facts, user_src, pure_callees)
   let first_functions = pipeline_optimised_functions_functions(first)
   let second_candidates = pipeline_ir_inline_candidates_from_functions(first_functions, facts, user_src)
   let second = pipeline_optimise_ir_function_list_with_candidates(first_functions, second_candidates, facts, user_src, pure_callees)
