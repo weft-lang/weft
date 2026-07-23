@@ -27,6 +27,8 @@ The workload set covers integer-heavy and float-heavy kernels:
 - `mandelbrot`: `f64` escape-count loops with explicit `i64` to `f64`
   conversion
 - `nbody`: five-body solar-system update loop with `f64` state and `sqrt`
+- `sorted_lookup`: sorted_map build plus binary-search lookups through an
+  indirect comparator (ordered-collection lookup path; 2q churn canary)
 
 Further float-heavy published benchmarks such as `spectral-norm` need the
 next numeric-stdlib slices, especially broader math surfaces and typed float

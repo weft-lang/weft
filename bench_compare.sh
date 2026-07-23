@@ -162,7 +162,7 @@ require_cmd rustc
 
 mkdir -p "$(dirname "$OUT")"
 
-CASES="sieve vector_sort graph_reach mandelbrot nbody"
+CASES="sieve vector_sort graph_reach mandelbrot nbody sorted_lookup"
 RESULTS=""
 FAIL=0
 
