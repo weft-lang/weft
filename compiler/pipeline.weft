@@ -34310,6 +34310,603 @@ fn pipeline_ir_module_slot_inst_count(ir: IrModule) -> i64 {
   count
 }
 
+-- ══════════════════════════════════════════════════════════════
+-- Loop-param induction + post-promotion check re-tightening (2o).
+--
+-- mem2reg turns loop variables into header block params, but check
+-- modes were decided by the pre-promotion fact pass, whose slot
+-- induction rules have no param analog — value facts cannot cross a
+-- loop backedge (circular meet). These rules port the slot induction
+-- to header params. A block param is IMMUTABLE for the whole
+-- iteration, so a strict bound established in any block that
+-- dominates a backedge's source bounds exactly the value the backedge
+-- arithmetic consumes: the slot rules' cycle conditions are
+-- unnecessary here.
+--
+-- Rules (every incoming jump edge must satisfy a leg; branch edges
+-- into a param-carrying block disqualify it):
+--   L0 (param >= 0): identity | const >= 0 | vector_len result |
+--      value nonneg-provable at the source block | another L0 param |
+--      param + 1 where a strict upper bound on the param holds in a
+--      block dominating the source (wrap-free: p < X <= MAX).
+--   L1 (param >= -1): as L0 with tolerance one: const >= -1, or
+--      q - 1 with q nonneg-provable at the source. L1 seeds no direct
+--      fact; it only feeds the derived-offset rule below.
+--   U(h) (param < len(v) - h): fresh legs establish the bound
+--      (q - c with q < len(v) at the source: h = c; a value already
+--      carrying an upper fact for v: h = 0); carrying legs preserve
+--      any h (identity, or param - c with c >= 0 and the param
+--      nonneg-provable at the source so the subtraction cannot wrap
+--      below). Increment backedges are rejected: re-establishing an
+--      upper bound after an increment is the guard-true machinery's
+--      territory, not a header invariant. Requires whole-function
+--      len-stability (the seeded facts describe current lengths).
+-- Seeding: L0 params seed value nonneg facts and U params seed
+-- vector-upper facts in every block — sound because any block where
+-- the param is consulted is dominated by its header (SSA dominance),
+-- where the invariant holds. Derived offsets: dst = p + c
+-- (c in [1, 4095]) with p in L0 or L1 and p carrying U (the upper
+-- bound makes the sum wrap-free) seeds nonneg(dst) at dst's block,
+-- plus an upper fact when c <= h.
+-- ══════════════════════════════════════════════════════════════
+
+-- Scan a block's entry chain for a true bool fact about param p.
+-- mode 1: strict upper bound (lt(p, x) / gt(x, p)) -> 1.
+-- mode 2: strict upper bound whose bound value is a vector_len result
+--         -> the vector's value id.
+-- mode 3: constant lower bound at zero (ge(p, c>=0) / le(c>=0, p)) -> 1.
+-- Returns -1 when no matching fact exists.
+fn pipeline_ir_chain_param_bool_scan(chain: PipelineIrBlockEntryFactChain, table: i64, p: i64, mode: i64) -> i64 {
+  match chain {
+    PipelineIrBlockEntryFactNil -> 0 - 1
+    PipelineIrBlockEntryCtorFact(fact_block, value_id, ctor_hash, rest) -> pipeline_ir_chain_param_bool_scan(rest, table, p, mode)
+    PipelineIrBlockEntryNotCtorFact(fact_block, value_id, ctor_hash, rest) -> pipeline_ir_chain_param_bool_scan(rest, table, p, mode)
+    PipelineIrBlockEntryScalarFact(fact_block, value_id, kind, value, rest) -> {
+      let hit = if kind == pipeline_ir_scalar_fact_kind_bool() and value == 1 {
+        let def = pipeline_ir_value_def_lookup(table, value_id)
+        if def != 0 and node_f1(def) == 3 {
+          let code = node_f2(def)
+          if mode == 3 {
+            let bounded = if code == 6 { node_f3(def) } else { if code == 5 { node_f4(def) } else { 0 - 1 } }
+            let low = if code == 6 { node_f4(def) } else { if code == 5 { node_f3(def) } else { 0 - 1 } }
+            if bounded == p and low >= 0 {
+              let low_def = pipeline_ir_value_def_lookup(table, low)
+              if low_def != 0 and node_f1(low_def) == 1 and node_f2(low_def) >= 0 { 1 } else { 0 - 1 }
+            } else { 0 - 1 }
+          } else {
+            let bounded = if code == 3 { node_f3(def) } else { if code == 4 { node_f4(def) } else { 0 - 1 } }
+            let bound = if code == 3 { node_f4(def) } else { if code == 4 { node_f3(def) } else { 0 - 1 } }
+            if bounded == p and bound >= 0 {
+              if mode == 1 { 1 } else {
+                let bound_def = pipeline_ir_value_def_lookup(table, bound)
+                if bound_def != 0 and node_f1(bound_def) == 4 { node_f2(bound_def) } else { 0 - 1 }
+              }
+            } else { 0 - 1 }
+          }
+        } else { 0 - 1 }
+      } else { 0 - 1 }
+      if hit >= 0 { hit } else { pipeline_ir_chain_param_bool_scan(rest, table, p, mode) }
+    }
+    PipelineIrBlockEntrySlotScalarFact(fact_block, slot_id, kind, value, rest) -> pipeline_ir_chain_param_bool_scan(rest, table, p, mode)
+    PipelineIrBlockEntryVectorLenFact(fact_block, len_value, vec_value, rest) -> pipeline_ir_chain_param_bool_scan(rest, table, p, mode)
+    PipelineIrBlockEntryVectorUpperFact(fact_block, vec_value, index_value, rest) -> pipeline_ir_chain_param_bool_scan(rest, table, p, mode)
+    PipelineIrBlockEntryVectorSlotUpperFact(fact_block, vec_value, slot_id, rest) -> pipeline_ir_chain_param_bool_scan(rest, table, p, mode)
+    PipelineIrBlockEntryVectorSlotRowUpperFact(fact_block, vec_value, row_width, slot_id, rest) -> pipeline_ir_chain_param_bool_scan(rest, table, p, mode)
+    PipelineIrBlockEntryVectorRowUpperFact(fact_block, vec_value, row_width, slot_id, rest) -> pipeline_ir_chain_param_bool_scan(rest, table, p, mode)
+    PipelineIrBlockEntryVariantOriginFact(fact_block, value_id, ctor_hash, payloads, rest) -> pipeline_ir_chain_param_bool_scan(rest, table, p, mode)
+  }
+}
+
+-- First vector-upper fact about value v in a block's entry chain:
+-- returns the vector's value id, or -1.
+fn pipeline_ir_chain_value_upper_vec(chain: PipelineIrBlockEntryFactChain, v: i64) -> i64 {
+  match chain {
+    PipelineIrBlockEntryFactNil -> 0 - 1
+    PipelineIrBlockEntryCtorFact(fact_block, value_id, ctor_hash, rest) -> pipeline_ir_chain_value_upper_vec(rest, v)
+    PipelineIrBlockEntryNotCtorFact(fact_block, value_id, ctor_hash, rest) -> pipeline_ir_chain_value_upper_vec(rest, v)
+    PipelineIrBlockEntryScalarFact(fact_block, value_id, kind, value, rest) -> pipeline_ir_chain_value_upper_vec(rest, v)
+    PipelineIrBlockEntrySlotScalarFact(fact_block, slot_id, kind, value, rest) -> pipeline_ir_chain_value_upper_vec(rest, v)
+    PipelineIrBlockEntryVectorLenFact(fact_block, len_value, vec_value, rest) -> pipeline_ir_chain_value_upper_vec(rest, v)
+    PipelineIrBlockEntryVectorUpperFact(fact_block, vec_value, index_value, rest) -> {
+      if index_value == v { vec_value } else { pipeline_ir_chain_value_upper_vec(rest, v) }
+    }
+    PipelineIrBlockEntryVectorSlotUpperFact(fact_block, vec_value, slot_id, rest) -> pipeline_ir_chain_value_upper_vec(rest, v)
+    PipelineIrBlockEntryVectorSlotRowUpperFact(fact_block, vec_value, row_width, slot_id, rest) -> pipeline_ir_chain_value_upper_vec(rest, v)
+    PipelineIrBlockEntryVectorRowUpperFact(fact_block, vec_value, row_width, slot_id, rest) -> pipeline_ir_chain_value_upper_vec(rest, v)
+    PipelineIrBlockEntryVariantOriginFact(fact_block, value_id, ctor_hash, payloads, rest) -> pipeline_ir_chain_value_upper_vec(rest, v)
+  }
+}
+
+fn pipeline_ir_param_nlist_contains(l: i64, v: i64) -> i64 {
+  let n = nlist_len(l)
+  let mut i = 0
+  let mut found = 0
+  while i < n {
+    if nlist_get(l, i) == v { found = 1 i = n } else { i = i + 1 }
+  }
+  found
+}
+
+-- Const definition of a value via the def table.
+fn pipeline_ir_param_arg_const(table: i64, v: i64) -> PipelineIrConstLookup {
+  let def = pipeline_ir_value_def_lookup(table, v)
+  if def != 0 and node_f1(def) == 1 { pipeline_ir_const_lookup(1, node_f2(def)) } else { pipeline_ir_const_lookup(0, 0) }
+}
+
+-- A strict upper bound on param p holds in some block that dominates
+-- use_block (including use_block itself). Immutability of p makes
+-- dominance alone sufficient: every path from the param's binding to
+-- use_block passes the check, and the check constrains the same SSA
+-- value the consumer reads.
+fn pipeline_ir_param_bound_above_dominating(blocks: IrBlockList, table: i64, facts: PipelineIrBlockEntryFactList, p: i64, use_block: i64, dom_sets: i64, dom_max: i64, dom_words: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          let hit = if id >= 0 and id <= dom_max and use_block >= 0 and use_block <= dom_max {
+            if pipeline_ir_dominators_bit_get(dom_sets, dom_words, use_block, id) == 1 {
+              if pipeline_ir_chain_param_bool_scan(pipeline_ir_block_entry_facts_block_chain(facts, id), table, p, 1) >= 0 { 1 } else { 0 }
+            } else { 0 }
+          } else { 0 }
+          if hit == 1 { 1 } else { pipeline_ir_param_bound_above_dominating(rest, table, facts, p, use_block, dom_sets, dom_max, dom_words) }
+        }
+      }
+    }
+  }
+}
+
+-- Value provably nonnegative at a source block: nonneg const,
+-- vector_len result, a nonneg/zero fact in the block's entry chain, a
+-- ge/le-const bool fact, or membership in the proven-L0 param set.
+fn pipeline_ir_param_value_nonneg_at(facts: PipelineIrBlockEntryFactList, table: i64, block_id: i64, l0: i64, v: i64) -> i64 {
+  let c = pipeline_ir_param_arg_const(table, v)
+  if pipeline_ir_const_lookup_valid(c) == 1 and pipeline_ir_const_lookup_value(c) >= 0 { 1 }
+  else {
+    let def = pipeline_ir_value_def_lookup(table, v)
+    if def != 0 and node_f1(def) == 4 { 1 }
+    else {
+      if pipeline_ir_param_nlist_contains(l0, v) == 1 { 1 }
+      else {
+        let chain = pipeline_ir_block_entry_facts_block_chain(facts, block_id)
+        let nonneg = pipeline_ir_block_entry_nonnegative_fact_lookup_chain(chain, block_id, v)
+        if pipeline_ir_const_lookup_valid(nonneg) == 1 and pipeline_ir_const_lookup_value(nonneg) == 1 { 1 }
+        else {
+          let zero = pipeline_ir_block_entry_zero_fact_lookup_chain(chain, block_id, v)
+          if pipeline_ir_const_lookup_valid(zero) == 1 and pipeline_ir_const_lookup_value(zero) == 1 { 1 }
+          else { if pipeline_ir_chain_param_bool_scan(chain, table, v, 3) >= 0 { 1 } else { 0 } }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_param_block_is_branch_target(blocks: IrBlockList, id: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(bid, params, insts, term) -> {
+          let hit = match term {
+            IrTermBranch(cond, then_block, else_block) -> if then_block == id or else_block == id { 1 } else { 0 }
+            _ -> 0
+          }
+          if hit == 1 { 1 } else { pipeline_ir_param_block_is_branch_target(rest, id) }
+        }
+      }
+    }
+  }
+}
+
+-- L0 legs over every jump edge into hdr for the param at index k.
+-- Returns the edge count when all legs pass, -1 otherwise.
+fn pipeline_ir_param_l0_edges(blocks: IrBlockList, all_blocks: IrBlockList, table: i64, facts: PipelineIrBlockEntryFactList, hdr: i64, k: i64, p: i64, l0: i64, dom_sets: i64, dom_max: i64, dom_words: i64, count: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> count
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          let verdict = match term {
+            IrTermJump(target, args) -> {
+              if target != hdr { 0 }
+              else {
+                let a = pipeline_ir_value_list_get_or(args, k, 0 - 1)
+                if a < 0 { 0 - 1 }
+                else { if a == p { 1 }
+                else { if pipeline_ir_param_value_nonneg_at(facts, table, id, l0, a) == 1 { 1 }
+                else {
+                  let def = pipeline_ir_value_def_lookup(table, a)
+                  let inc_ok = if def != 0 and node_f1(def) == 5 {
+                    let lc = pipeline_ir_param_arg_const(table, node_f3(def))
+                    let rc = pipeline_ir_param_arg_const(table, node_f4(def))
+                    let self_inc = if node_f3(def) == p and pipeline_ir_const_lookup_valid(rc) == 1 and pipeline_ir_const_lookup_value(rc) == 1 { 1 } else { if node_f4(def) == p and pipeline_ir_const_lookup_valid(lc) == 1 and pipeline_ir_const_lookup_value(lc) == 1 { 1 } else { 0 } }
+                    if self_inc == 1 { pipeline_ir_param_bound_above_dominating(all_blocks, table, facts, p, id, dom_sets, dom_max, dom_words) } else { 0 }
+                  } else { 0 }
+                  if inc_ok == 1 { 1 } else { 0 - 1 }
+                } } }
+              }
+            }
+            _ -> 0
+          }
+          if verdict < 0 { 0 - 1 } else { pipeline_ir_param_l0_edges(rest, all_blocks, table, facts, hdr, k, p, l0, dom_sets, dom_max, dom_words, count + verdict) }
+        }
+      }
+    }
+  }
+}
+
+-- L1 legs (tolerance one). Returns edge count or -1.
+fn pipeline_ir_param_l1_edges(blocks: IrBlockList, table: i64, facts: PipelineIrBlockEntryFactList, hdr: i64, k: i64, p: i64, l0: i64, count: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> count
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          let verdict = match term {
+            IrTermJump(target, args) -> {
+              if target != hdr { 0 }
+              else {
+                let a = pipeline_ir_value_list_get_or(args, k, 0 - 1)
+                if a < 0 { 0 - 1 }
+                else { if a == p { 1 }
+                else {
+                  let c = pipeline_ir_param_arg_const(table, a)
+                  if pipeline_ir_const_lookup_valid(c) == 1 and pipeline_ir_const_lookup_value(c) >= 0 - 1 { 1 }
+                  else { if pipeline_ir_param_value_nonneg_at(facts, table, id, l0, a) == 1 { 1 }
+                  else {
+                    let def = pipeline_ir_value_def_lookup(table, a)
+                    let dec_ok = if def != 0 and node_f1(def) == 7 {
+                      let rc = pipeline_ir_param_arg_const(table, node_f4(def))
+                      if pipeline_ir_const_lookup_valid(rc) == 1 and pipeline_ir_const_lookup_value(rc) == 1 {
+                        pipeline_ir_param_value_nonneg_at(facts, table, id, l0, node_f3(def))
+                      } else { 0 }
+                    } else { 0 }
+                    if dec_ok == 1 { 1 } else { 0 - 1 }
+                  } }
+                } }
+              }
+            }
+            _ -> 0
+          }
+          if verdict < 0 { 0 - 1 } else { pipeline_ir_param_l1_edges(rest, table, facts, hdr, k, p, l0, count + verdict) }
+        }
+      }
+    }
+  }
+}
+
+-- U legs: state travels as node(ok, vec, h_min, fresh_count) with
+-- vec = -1 until a fresh leg fixes it. Fresh legs from different
+-- vectors, increment backedges, or unprovable args poison the param.
+fn pipeline_ir_param_u_edges(blocks: IrBlockList, table: i64, facts: PipelineIrBlockEntryFactList, hdr: i64, k: i64, p: i64, l0: i64, l1: i64, state: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> state
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          if node_f1(state) == 0 { state }
+          else {
+            let next = match term {
+              IrTermJump(target, args) -> {
+                if target != hdr { state }
+                else {
+                  let a = pipeline_ir_value_list_get_or(args, k, 0 - 1)
+                  if a < 0 { node_new(0, 0, 0, 0, 0) }
+                  else { if a == p { state }
+                  else {
+                    let chain = pipeline_ir_block_entry_facts_block_chain(facts, id)
+                    let def = pipeline_ir_value_def_lookup(table, a)
+                    let is_sub = if def != 0 and node_f1(def) == 7 { 1 } else { 0 }
+                    let sub_c = if is_sub == 1 { pipeline_ir_param_arg_const(table, node_f4(def)) } else { pipeline_ir_const_lookup(0, 0) }
+                    let self_dec = if is_sub == 1 and node_f3(def) == p and pipeline_ir_const_lookup_valid(sub_c) == 1 and pipeline_ir_const_lookup_value(sub_c) >= 0 { 1 } else { 0 }
+                    if self_dec == 1 {
+                      let p_low = if pipeline_ir_param_nlist_contains(l1, p) == 1 { 1 } else { pipeline_ir_param_value_nonneg_at(facts, table, id, l0, p) }
+                      if p_low == 1 { state } else { node_new(0, 0, 0, 0, 0) }
+                    } else {
+                      -- Fresh leg: q - c with q bounded at the source,
+                      -- or a value already carrying an upper fact.
+                      let fresh = if is_sub == 1 and pipeline_ir_const_lookup_valid(sub_c) == 1 and pipeline_ir_const_lookup_value(sub_c) >= 1 and pipeline_ir_const_lookup_value(sub_c) <= 4095 {
+                        let q = node_f3(def)
+                        let qv = pipeline_ir_chain_value_upper_vec(chain, q)
+                        let qv2 = if qv >= 0 { qv } else { pipeline_ir_chain_param_bool_scan(chain, table, q, 2) }
+                        if qv2 >= 0 { node_new(0, 1, qv2, pipeline_ir_const_lookup_value(sub_c), 0) } else { node_new(0, 0, 0, 0, 0) }
+                      } else {
+                        let av = pipeline_ir_chain_value_upper_vec(chain, a)
+                        let av2 = if av >= 0 { av } else { pipeline_ir_chain_param_bool_scan(chain, table, a, 2) }
+                        if av2 >= 0 { node_new(0, 1, av2, 0, 0) } else { node_new(0, 0, 0, 0, 0) }
+                      }
+                      if node_f1(fresh) == 0 { node_new(0, 0, 0, 0, 0) }
+                      else {
+                        let vec = node_f2(fresh)
+                        let h = node_f3(fresh)
+                        if node_f2(state) >= 0 and node_f2(state) != vec { node_new(0, 0, 0, 0, 0) }
+                        else {
+                          let new_h = if node_f4(state) == 0 { h } else { if h < node_f3(state) { h } else { node_f3(state) } }
+                          node_new(0, 1, vec, new_h, node_f4(state) + 1)
+                        }
+                      }
+                    }
+                  } }
+                }
+              }
+              _ -> state
+            }
+            pipeline_ir_param_u_edges(rest, table, facts, hdr, k, p, l0, l1, next)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_seed_param_nonneg_blocks(blocks: IrBlockList, p: i64, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactList {
+  match blocks {
+    IrBlockListNil -> facts
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          pipeline_ir_seed_param_nonneg_blocks(rest, p, pipeline_ir_block_entry_fact_add_result_facts(pipeline_ir_block_entry_facts_add_scalar(facts, id, p, pipeline_ir_scalar_fact_kind_nonnegative(), 1)))
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_seed_param_upper_blocks(blocks: IrBlockList, vec: i64, p: i64, facts: PipelineIrBlockEntryFactList) -> PipelineIrBlockEntryFactList {
+  match blocks {
+    IrBlockListNil -> facts
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          pipeline_ir_seed_param_upper_blocks(rest, vec, p, pipeline_ir_block_entry_fact_add_result_facts(pipeline_ir_block_entry_facts_add_vector_upper(facts, id, vec, p)))
+        }
+      }
+    }
+  }
+}
+
+-- Derived offsets: dst = p + c in some block, p in L0 or L1, p
+-- carrying a U entry (the upper bound keeps the sum far below the
+-- integer maximum, so the addition cannot wrap). Seeds nonneg(dst)
+-- at the defining block, plus an upper fact when c <= h.
+fn pipeline_ir_seed_param_offset_insts(insts: IrInstList, block_id: i64, table: i64, l0: i64, l1: i64, u_params: i64, facts: PipelineIrBlockEntryFactList, counter: i64) -> PipelineIrBlockEntryFactList {
+  match insts {
+    IrInstNil -> facts
+    IrInstCons(inst, rest) -> {
+      let next = match inst {
+        IrBinaryI64(dst, op, lhs, rhs) -> {
+          if pipeline_ir_binary_is_add(op) == 1 {
+            let lc = pipeline_ir_param_arg_const(table, lhs)
+            let rc = pipeline_ir_param_arg_const(table, rhs)
+            let x = if pipeline_ir_const_lookup_valid(rc) == 1 { lhs } else { if pipeline_ir_const_lookup_valid(lc) == 1 { rhs } else { 0 - 1 } }
+            let c = if pipeline_ir_const_lookup_valid(rc) == 1 { pipeline_ir_const_lookup_value(rc) } else { if pipeline_ir_const_lookup_valid(lc) == 1 { pipeline_ir_const_lookup_value(lc) } else { 0 } }
+            if x >= 0 and c >= 1 and c <= 4095 {
+              if pipeline_ir_param_nlist_contains(l0, x) == 1 or pipeline_ir_param_nlist_contains(l1, x) == 1 {
+                let n = nlist_len(u_params)
+                let mut i = 0
+                let mut vec = 0 - 1
+                let mut h = 0 - 1
+                while i < n {
+                  let entry = nlist_get(u_params, i)
+                  if node_f1(entry) == x { vec = node_f2(entry) h = node_f3(entry) i = n } else { i = i + 1 }
+                }
+                if vec >= 0 {
+                  mem_store64_at(counter, 0, mem_load64_at(counter, 0) + 1)
+                  let with_nonneg = pipeline_ir_block_entry_fact_add_result_facts(pipeline_ir_block_entry_facts_add_scalar(facts, block_id, dst, pipeline_ir_scalar_fact_kind_nonnegative(), 1))
+                  if c <= h {
+                    pipeline_ir_block_entry_fact_add_result_facts(pipeline_ir_block_entry_facts_add_vector_upper(with_nonneg, block_id, vec, dst))
+                  } else { with_nonneg }
+                } else { facts }
+              } else { facts }
+            } else { facts }
+          } else { facts }
+        }
+        _ -> facts
+      }
+      pipeline_ir_seed_param_offset_insts(rest, block_id, table, l0, l1, u_params, next, counter)
+    }
+  }
+}
+
+fn pipeline_ir_seed_param_offset_blocks(blocks: IrBlockList, table: i64, l0: i64, l1: i64, u_params: i64, facts: PipelineIrBlockEntryFactList, counter: i64) -> PipelineIrBlockEntryFactList {
+  match blocks {
+    IrBlockListNil -> facts
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          pipeline_ir_seed_param_offset_blocks(rest, table, l0, l1, u_params, pipeline_ir_seed_param_offset_insts(insts, id, table, l0, l1, u_params, facts, counter), counter)
+        }
+      }
+    }
+  }
+}
+
+-- Compute L0/L1/U verdicts for every multi-pred header param and seed
+-- the resulting facts. counter receives the number of seeded findings
+-- so the caller can skip the re-tightening walk when nothing changed.
+fn pipeline_ir_seed_param_induction_facts(blocks: IrBlockList, cfg: i64, facts: PipelineIrBlockEntryFactList, max_id: i64, counter: i64) -> PipelineIrBlockEntryFactList {
+  let table = pipeline_ir_cfg_bundle_def_table(cfg)
+  let dom_sets = pipeline_ir_dominators(blocks, max_id)
+  let dom_words = pipeline_ir_dominators_words(max_id)
+  let len_stable = pipeline_ir_cfg_bundle_len_stable(cfg)
+  let l0 = nlist_new()
+  let l1 = nlist_new()
+  let u_params = nlist_new()
+  -- L0 rounds: two passes so a header can consume another header's
+  -- proven params (nested loops initialise inner params from outer).
+  let mut round = 0
+  while round < 2 {
+    let mut cur = blocks
+    let mut done = 0
+    while done == 0 {
+      match cur {
+        IrBlockListNil -> { done = 1 }
+        IrBlockListCons(block, rest) -> {
+          match block {
+            IrBlock(id, params, insts, term) -> {
+              if ir_value_list_len(params) >= 1 and pipeline_ir_cfg_bundle_pred_count(cfg, id) >= 2 and pipeline_ir_param_block_is_branch_target(blocks, id) == 0 {
+                let np = ir_value_list_len(params)
+                let mut k = 0
+                while k < np {
+                  let p = pipeline_ir_value_list_get_or(params, k, 0 - 1)
+                  if p >= 0 and pipeline_ir_param_nlist_contains(l0, p) == 0 {
+                    if pipeline_ir_param_l0_edges(blocks, blocks, table, facts, id, k, p, l0, dom_sets, max_id, dom_words, 0) >= 1 { nlist_add(l0, p) } else { 0 }
+                  } else { 0 }
+                  k = k + 1
+                }
+                0
+              } else { 0 }
+              cur = rest
+            }
+          }
+        }
+      }
+    }
+    round = round + 1
+  }
+  -- L1 + U single passes over the same headers.
+  let mut cur2 = blocks
+  let mut done2 = 0
+  while done2 == 0 {
+    match cur2 {
+      IrBlockListNil -> { done2 = 1 }
+      IrBlockListCons(block, rest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> {
+            if ir_value_list_len(params) >= 1 and pipeline_ir_cfg_bundle_pred_count(cfg, id) >= 2 and pipeline_ir_param_block_is_branch_target(blocks, id) == 0 {
+              let np = ir_value_list_len(params)
+              let mut k = 0
+              while k < np {
+                let p = pipeline_ir_value_list_get_or(params, k, 0 - 1)
+                if p >= 0 {
+                  if pipeline_ir_param_nlist_contains(l0, p) == 0 and pipeline_ir_param_nlist_contains(l1, p) == 0 {
+                    if pipeline_ir_param_l1_edges(blocks, table, facts, id, k, p, l0, 0) >= 1 { nlist_add(l1, p) } else { 0 }
+                  } else { 0 }
+                  if len_stable == 1 {
+                    let ustate = pipeline_ir_param_u_edges(blocks, table, facts, id, k, p, l0, l1, node_new(0, 1, 0 - 1, 0, 0))
+                    if node_f1(ustate) == 1 and node_f4(ustate) >= 1 and node_f2(ustate) >= 0 { nlist_add(u_params, node_new(0, p, node_f2(ustate), node_f3(ustate), 0)) } else { 0 }
+                  } else { 0 }
+                } else { 0 }
+                k = k + 1
+              }
+              0
+            } else { 0 }
+            cur2 = rest
+          }
+        }
+      }
+    }
+  }
+  -- Seeding.
+  let mut result = facts
+  let nl0 = nlist_len(l0)
+  let mut i0 = 0
+  while i0 < nl0 {
+    result = pipeline_ir_seed_param_nonneg_blocks(blocks, nlist_get(l0, i0), result)
+    mem_store64_at(counter, 0, mem_load64_at(counter, 0) + 1)
+    i0 = i0 + 1
+  }
+  let nu = nlist_len(u_params)
+  let mut iu = 0
+  while iu < nu {
+    let entry = nlist_get(u_params, iu)
+    result = pipeline_ir_seed_param_upper_blocks(blocks, node_f2(entry), node_f1(entry), result)
+    mem_store64_at(counter, 0, mem_load64_at(counter, 0) + 1)
+    iu = iu + 1
+  }
+  pipeline_ir_seed_param_offset_blocks(blocks, table, l0, l1, u_params, result, counter)
+}
+
+fn pipeline_ir_blocks_vector_mode_missing(blocks: IrBlockList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          if pipeline_ir_insts_vector_mode_missing(insts) == 1 { 1 } else { pipeline_ir_blocks_vector_mode_missing(rest) }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_insts_vector_mode_missing(insts: IrInstList) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let hit = match inst {
+        IrVectorGetI64(dst, vec, index, fallback, check_mode) -> if (check_mode band 6) != 6 { 1 } else { 0 }
+        IrVectorSetI64(dst, vec, index, value, check_mode) -> if (check_mode band 6) != 6 { 1 } else { 0 }
+        _ -> 0
+      }
+      if hit == 1 { 1 } else { pipeline_ir_insts_vector_mode_missing(rest) }
+    }
+  }
+}
+
+fn pipeline_ir_blocks_have_param_header(blocks: IrBlockList, cfg: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          if ir_value_list_len(params) >= 1 and pipeline_ir_cfg_bundle_pred_count(cfg, id) >= 2 { 1 } else { pipeline_ir_blocks_have_param_header(rest, cfg) }
+        }
+      }
+    }
+  }
+}
+
+-- Post-promotion re-tightening: rebuild the fact plane over promoted
+-- IR, add param-induction facts, and re-run the existing
+-- fact-consuming walk. Check modes only gain bits (the walk's
+-- tightening is bor-monotone); every kill rule the main pass applies
+-- runs here through the same code.
+fn pipeline_mem2reg_retighten_function(irf: IrFunction, facts: PipelineIrSemanticFactList, pure_callees: i64) -> IrFunction {
+  match irf {
+    IrFunction(hash, param_count, blocks, src) -> {
+      if pipeline_ir_blocks_vector_mode_missing(blocks) == 0 { irf }
+      else { if pipeline_ir_native_blocks_have_handles(blocks) == 1 { irf }
+      else { if pipeline_ir_native_blocks_have_lambdas(blocks) == 1 { irf }
+      else {
+        let block_count = ir_block_list_len(blocks)
+        let max_id = pipeline_ir_verify_max_block_id(blocks)
+        if block_count < 2 or max_id < 0 or max_id > 63 or block_count > pipeline_ir_block_entry_fact_effective_block_limit(blocks) { irf }
+        else {
+          let bundle = pipeline_ir_cfg_fact_bundle_with_pure(blocks, pure_callees)
+          if pipeline_ir_blocks_have_param_header(blocks, bundle) == 0 { irf }
+          else {
+            let seed = pipeline_ir_block_entry_facts_from_blocks_inner(blocks, blocks, bundle, pipeline_ir_block_entry_facts_empty())
+            let propagated = pipeline_ir_block_entry_facts_propagate_fixpoint(blocks, bundle, seed, block_count + 1)
+            let with_nonneg = pipeline_ir_seed_slot_nonneg_facts(blocks, bundle, propagated)
+            let with_upper = pipeline_ir_seed_slot_upper_facts(blocks, bundle, with_nonneg)
+            let base = pipeline_ir_flood_slot_row_upper_facts(blocks, bundle, with_upper)
+            let counter = alloc_words(1)
+            mem_store64_at(counter, 0, 0)
+            let enriched = pipeline_ir_seed_param_induction_facts(blocks, bundle, base, max_id, counter)
+            if mem_load64_at(counter, 0) == 0 { irf }
+            else {
+              let consts = pipeline_ir_const_env_from_block_list(blocks, pipeline_ir_const_env_empty())
+              let ctx = pipeline_ir_optimise_context4(facts, PipelineIrInlineCandidateNil, pure_callees, param_count)
+              let next_value = pipeline_ir_function_next_value(param_count, blocks)
+              let walked = pipeline_optimise_ir_block_list_with_param_consts(blocks, blocks, consts, ctx, enriched, next_value)
+              ir_function_new_blocks_src(hash, param_count, pipeline_optimised_blocks_blocks(walked), src)
+            }
+          }
+        }
+      } } }
+    }
+  }
+}
+
+fn pipeline_mem2reg_retighten_function_list(functions: IrFunctionList, facts: PipelineIrSemanticFactList, pure_callees: i64) -> IrFunctionList {
+  match functions {
+    IrFunctionNil -> IrFunctionNil
+    IrFunctionCons(irf, rest) -> IrFunctionCons(pipeline_mem2reg_retighten_function(irf, facts, pure_callees), pipeline_mem2reg_retighten_function_list(rest, facts, pure_callees))
+    _ -> functions
+  }
+}
+
 -- promote = 0 stops before slot-to-SSA promotion: the slot-keyed fact
 -- probes in the bounds metrics analyse the IR the fact plane actually
 -- runs on (facts are decided before promotion rewrites the slots away).
@@ -34344,7 +34941,7 @@ fn pipeline_optimise_typed_ir_with_promotion(typed: TypedModule, ir: IrModule, p
       -- moves the naive lowering emits.
       let opt = pipeline_optimise_ir_function_list(functions, functions, semantic_facts, src)
       let final_functions = if promote == 1 {
-        pipeline_mem2reg_function_list(pipeline_optimised_functions_functions(opt))
+        pipeline_mem2reg_retighten_function_list(pipeline_mem2reg_function_list(pipeline_optimised_functions_functions(opt)), semantic_facts, pipeline_ir_pure_callee_tree(semantic_facts))
       } else {
         pipeline_optimised_functions_functions(opt)
       }
