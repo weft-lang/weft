@@ -35,19 +35,41 @@ fn got_sym_name(gi: i64) -> str {
 }
 fn got_sym_count() -> i64 { 19 }
 
+-- Relocation kinds carried in the reloc node's f3 field.
+fn object_reloc_kind_branch26() -> i64 { 0 }
+fn object_reloc_kind_page21() -> i64 { 1 }
+fn object_reloc_kind_pageoff12() -> i64 { 2 }
+fn object_reloc_kind_addend() -> i64 { 3 }
+
 -- Compile with external linkage: build .o file buffer.
 -- Caller must invoke: ld -o output input.o -lSystem -syslibroot $(xcrun --show-sdk-path) -e _main -arch arm64
 fn compile_object(code: i64, fm: i64, src: i64, ngot: i64) -> i64 {
+  -- Static closure-pair slots (2q slice 1) live in a zerofill
+  -- __DATA,__wstatic section; ADRP/ADD sites relocate against its base
+  -- symbol with an ARM64_RELOC_ADDEND carrying the slot offset.
+  let nslots = object_storage_static_pair_slot_count(fm)
+  let wsize = nslots * 16
+  let code_size = buf_len(code)
+  let wstatic_addr = (code_size + 15) / 16 * 16
   -- Build symbol list: _main (defined, index 0) then externals.
-  -- Symbol order must match relocation indices.
+  -- Symbol order must match relocation indices. Defined symbols are
+  -- emitted first, so a present wstatic base symbol takes final index 1
+  -- and shifts the undefined externals by one.
   let syms = nlist_new()
-  let names = object_storage_alloc_scratch(256)
+  let names = object_storage_alloc_scratch(512)
   -- _main symbol points to offset 0 (our startup code: mmap + call main + ret).
   -- The actual main() function is called via BL from the startup code.
   let mut p = 0
   mem_copy(names + p, __str_ptr("main"), 4)
   nlist_add(syms, node_new(0, names + p - src, 4, 0, 1))
   p = p + 4
+  if nslots > 0 {
+    let wname_len = __str_len("weft_static_pairs")
+    mem_copy(names + p, __str_ptr("weft_static_pairs"), wname_len)
+    -- f4 = 2: defined symbol in section 2 (__wstatic).
+    nlist_add(syms, node_new(0, names + p - src, wname_len, wstatic_addr, 2))
+    p = p + wname_len
+  } else { 0 }
   -- External symbols: indices 1-10 match GOT indices 0-9.
   for gi in 0..got_sym_count() {
     let name = got_sym_name(gi)
@@ -56,6 +78,7 @@ fn compile_object(code: i64, fm: i64, src: i64, ngot: i64) -> i64 {
     nlist_add(syms, node_new(0, names + p - src, nl, 0, 0))
     p = p + nl
   }
+  let extdef_shift = if nslots > 0 { 1 } else { 0 }
 
   -- Build relocation list from GOT patches.
   let relocs = nlist_new()
@@ -63,26 +86,40 @@ fn compile_object(code: i64, fm: i64, src: i64, ngot: i64) -> i64 {
   for i in 0..gn {
     let code_pos = object_storage_got_patch_code_pos(fm, i)
     let gi = object_storage_got_patch_index(fm, i)
-    -- Symbol index = gi + 1 (0=_main, 1=posix_spawn, 2=waitpid, ...).
-    nlist_add(relocs, node_new(0, code_pos, gi + 1, 0, 0))
+    -- Final symbol index = gi + 1 + extdef_shift (defined symbols first).
+    nlist_add(relocs, node_new(0, code_pos, gi + 1 + extdef_shift, object_reloc_kind_branch26(), 0))
+  }
+  -- Static-pair ADRP/ADD sites: ADDEND must directly precede the entry
+  -- it modifies. The wstatic base symbol has final index 1.
+  let spn = object_storage_static_pair_patch_count(fm)
+  for i in 0..spn {
+    let adrp_pos = object_storage_static_pair_patch_code_pos(fm, i)
+    let slot_off = object_storage_static_pair_patch_slot_off(fm, i)
+    nlist_add(relocs, node_new(0, adrp_pos, slot_off, object_reloc_kind_addend(), 0))
+    nlist_add(relocs, node_new(0, adrp_pos, 1, object_reloc_kind_page21(), 0))
+    nlist_add(relocs, node_new(0, adrp_pos + 4, slot_off, object_reloc_kind_addend(), 0))
+    nlist_add(relocs, node_new(0, adrp_pos + 4, 1, object_reloc_kind_pageoff12(), 0))
   }
 
-  emit_object(code, relocs, syms, src)
+  emit_object(code, relocs, syms, src, wstatic_addr, wsize)
 }
 
 -- Emit a complete .o file from code buffer + relocation list + symbol info
 -- code: buf with machine code
--- relocs: list of {code_offset, symbol_index} pairs (for BL relocations)
--- syms: list of {name_ns, name_nl, code_offset, is_defined} symbol entries
+-- relocs: list of {code_offset, symbol_index_or_addend, kind} entries
+-- syms: list of {name_ns, name_nl, value, sect_or_undef} symbol entries
+--       (f4 = 0 undefined, 1 defined in __text, 2 defined in __wstatic)
 -- src: source buffer (for symbol name bytes)
-fn emit_object(code: i64, relocs: i64, syms: i64, src: i64) -> i64 {
+-- wstatic_addr/wsize: zerofill __wstatic section placement (wsize 0 = absent)
+fn emit_object(code: i64, relocs: i64, syms: i64, src: i64, wstatic_addr: i64, wsize: i64) -> i64 {
   let code_size = buf_len(code)
   let nrelocs = nlist_len(relocs)
   let nsyms = nlist_len(syms)
+  let nsects = if wsize > 0 { 2 } else { 1 }
 
   -- Compute offsets
   let hdr_size = 32
-  let seg_cmd_size = 72 + 80
+  let seg_cmd_size = 72 + 80 * nsects
   let bv_cmd_size = 24
   let symtab_cmd_size = 24
   let dysymtab_cmd_size = 80
@@ -112,7 +149,7 @@ fn emit_object(code: i64, relocs: i64, syms: i64, src: i64) -> i64 {
   let mut nundef = 0
   for i in 0..nsyms {
     let sym = nlist_get(syms, i)
-    if node_f4(sym) == 1 { nextdef = nextdef + 1 } else { nundef = nundef + 1 }
+    if node_f4(sym) >= 1 { nextdef = nextdef + 1 } else { nundef = nundef + 1 }
   }
 
   let total_size = str_off + strsize
@@ -128,17 +165,17 @@ fn emit_object(code: i64, relocs: i64, syms: i64, src: i64) -> i64 {
   bu32(o, 8192)          -- flags: MH_SUBSECTIONS_VIA_SYMBOLS
   bu32(o, 0)             -- reserved
 
-  -- LC_SEGMENT_64 (72 + 80 = 152 bytes)
+  -- LC_SEGMENT_64 (72 + 80 * nsects bytes)
   bu32(o, 25)            -- cmd: LC_SEGMENT_64
   bu32(o, seg_cmd_size)  -- cmdsize
   bfill(o, 16)           -- segname: empty
   bu64(o, 0)             -- vmaddr
-  bu64(o, code_size)     -- vmsize
+  if wsize > 0 { bu64(o, wstatic_addr + wsize) } else { bu64(o, code_size) }  -- vmsize
   bu64(o, code_off)      -- fileoff
   bu64(o, code_size)     -- filesize
   bu32(o, 7)             -- maxprot: rwx
   bu32(o, 7)             -- initprot: rwx
-  bu32(o, 1)             -- nsects: 1
+  bu32(o, nsects)        -- nsects
   bu32(o, 0)             -- flags
 
   -- section_64: __text (80 bytes)
@@ -152,6 +189,21 @@ fn emit_object(code: i64, relocs: i64, syms: i64, src: i64) -> i64 {
   bu32(o, nrelocs)       -- nreloc
   bu32(o, 2147484672)    -- flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
   bu32(o, 0) bu32(o, 0) bu32(o, 0)
+
+  -- section_64: __wstatic zerofill (static closure-pair slots)
+  if wsize > 0 {
+    bstr(o, "__wstatic") bfill(o, 7)
+    bstr(o, "__DATA") bfill(o, 10)
+    bu64(o, wstatic_addr)  -- addr
+    bu64(o, wsize)         -- size
+    bu32(o, 0)             -- offset (zerofill: no file content)
+    bu32(o, 4)             -- align: 2^4 = 16
+    bu32(o, 0)             -- reloff
+    bu32(o, 0)             -- nreloc
+    bu32(o, 1)             -- flags: S_ZEROFILL
+    bu32(o, 0) bu32(o, 0) bu32(o, 0)
+    0
+  } else { 0 }
 
   -- LC_BUILD_VERSION (24 bytes)
   bu32(o, 50)            -- cmd: LC_BUILD_VERSION
@@ -188,30 +240,42 @@ fn emit_object(code: i64, relocs: i64, syms: i64, src: i64) -> i64 {
     let rel = nlist_get(relocs, i)
     let r_address = node_f1(rel)
     let r_symidx = node_f2(rel)
+    let r_kind = node_f3(rel)
     bu32(o, r_address)
-    -- ARM64_RELOC_BRANCH26 (type=2), extern=1, length=2, pcrel=1
-    -- word = symidx | (1 << 24) | (2 << 25) | (1 << 27) | (2 << 28)
-    -- = symidx | 0x1000000 | 0x4000000 | 0x8000000 | 0x20000000
-    -- = symidx | 0x2D000000
-    bu32(o, r_symidx + 754974720)
+    -- Second word: symidx/addend | pcrel<<24 | length<<25 | extern<<27 | type<<28
+    if r_kind == object_reloc_kind_branch26() {
+      -- ARM64_RELOC_BRANCH26 (type=2), extern=1, length=2, pcrel=1 = 0x2D000000
+      bu32(o, r_symidx + 754974720)
+    } else { if r_kind == object_reloc_kind_page21() {
+      -- ARM64_RELOC_PAGE21 (type=3), extern=1, length=2, pcrel=1 = 0x3D000000
+      bu32(o, r_symidx + 1023410176)
+    } else { if r_kind == object_reloc_kind_pageoff12() {
+      -- ARM64_RELOC_PAGEOFF12 (type=4), extern=1, length=2, pcrel=0 = 0x4C000000
+      bu32(o, r_symidx + 1275068416)
+    } else {
+      -- ARM64_RELOC_ADDEND (type=10), extern=0, length=2, pcrel=0: value
+      -- in the symbolnum field, applies to the next entry = 0xA4000000
+      bu32(o, r_symidx + 2751463424)
+    } } }
   }
 
   -- Symbol table (nlist_64, 16 bytes each)
-  -- Defined symbols first, then undefined
+  -- Defined symbols first, then undefined. f4 carries the section number
+  -- for defined symbols (1 = __text, 2 = __wstatic).
   for i in 0..nsyms {
     let sym = nlist_get(syms, i)
-    if node_f4(sym) == 1 {
+    if node_f4(sym) >= 1 {
       let strx = object_storage_word_at(str_indices, i)
       bu32(o, strx)
       bu8(o, 15)           -- n_type: N_SECT | N_EXT = 0x0F
-      bu8(o, 1)            -- n_sect: 1 (__text)
+      bu8(o, node_f4(sym)) -- n_sect
       bu8(o, 0) bu8(o, 0)  -- n_desc: 0
-      bu64(o, node_f3(sym)) -- n_value: code offset
+      bu64(o, node_f3(sym)) -- n_value: address in object
     } else { 0 }
   }
   for i in 0..nsyms {
     let sym = nlist_get(syms, i)
-    if node_f4(sym) != 1 {
+    if node_f4(sym) == 0 {
       let strx = object_storage_word_at(str_indices, i)
       bu32(o, strx)
       bu8(o, 1)            -- n_type: N_UNDF | N_EXT = 0x01
