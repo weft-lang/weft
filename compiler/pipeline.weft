@@ -2335,12 +2335,15 @@ fn pipeline_return_expr_type_node_typed(expr: Expr, params: i64, locals: Pipelin
       let local_ty = pipeline_value_env_lookup_type_node(locals, src, ns, nl)
       if local_ty != 0 { local_ty } else { pipeline_param_type_node_by_name(params, src, ns, nl, subst) }
     }
-    Call(ns, nl, args) -> pipeline_fns_lookup_ret_type_node(fns, src, ns, nl, subst)
+    Call(ns, nl, args) -> {
+      let fn_ret = pipeline_fns_lookup_ret_type_node(fns, src, ns, nl, subst)
+      if fn_ret != 0 { fn_ret } else { pipeline_variant_parent_type_node(pipeline_lower_module_tt(module), src, ns, nl) }
+    }
     GenericCall(type_args, inner_call) -> {
       match inner_call {
         Call(ns, nl, args) -> {
           let pair = pipeline_generic_template_find(fns, src, str_hash(src, ns, nl))
-          if pair == 0 { 0 }
+          if pair == 0 { pipeline_variant_parent_type_node(pipeline_lower_module_tt(module), src, ns, nl) }
           else {
             let fn_wrap = node_f1(pair)
             let concrete = pipeline_type_expr_list_subst(type_args, subst)
@@ -2351,9 +2354,29 @@ fn pipeline_return_expr_type_node_typed(expr: Expr, params: i64, locals: Pipelin
         _ -> pipeline_return_expr_type_node_typed(inner_call, params, locals, module)
       }
     }
+    RecordInit(type_ns, type_nl, fields) -> typecheck_resolve_type(pipeline_lower_module_tt(module), src, type_ns, type_nl)
     Block(first, rest) -> pipeline_return_expr_type_node_typed(rest, params, locals, module)
-    Let(ns, nl, value, body) -> pipeline_return_expr_type_node_typed(body, params, locals, module)
-    LetMut(ns, nl, value, body) -> pipeline_return_expr_type_node_typed(body, params, locals, module)
+    -- A body that returns its own binding types as the binding's init:
+    -- transfer retains for match-arm-local bindings depend on this (the
+    -- binding is not in the fn-level locals env at transfer time).
+    Let(ns, nl, value, body) -> {
+      let body_ty = pipeline_return_expr_type_node_typed(body, params, locals, module)
+      if body_ty != 0 { body_ty }
+      else {
+        if pipeline_expr_final_returns_binding_typed(body, src, ns, nl) == 1 {
+          pipeline_return_expr_type_node_typed(value, params, locals, module)
+        } else { 0 }
+      }
+    }
+    LetMut(ns, nl, value, body) -> {
+      let body_ty = pipeline_return_expr_type_node_typed(body, params, locals, module)
+      if body_ty != 0 { body_ty }
+      else {
+        if pipeline_expr_final_returns_binding_typed(body, src, ns, nl) == 1 {
+          pipeline_return_expr_type_node_typed(value, params, locals, module)
+        } else { 0 }
+      }
+    }
     LetTyped(inner, ann_type) -> type_expr_to_node(ann_type)
     Defer(cleanup, body) -> pipeline_return_expr_type_node_typed(body, params, locals, module)
     If(cond, then_expr, else_expr) -> {
@@ -2361,7 +2384,75 @@ fn pipeline_return_expr_type_node_typed(expr: Expr, params: i64, locals: Pipelin
       let else_ty = pipeline_return_expr_type_node_typed(else_expr, params, locals, module)
       if then_ty != 0 and else_ty != 0 and type_hash_of(then_ty) == type_hash_of(else_ty) { then_ty } else { 0 }
     }
+    Match(scrutinee, arms) -> pipeline_match_arms_result_type_node_typed(arms, params, locals, module)
     _ -> pipeline_expr_type_node_typed(expr)
+  }
+}
+
+-- Index of a named binding within a ctor pattern's binding list, or -1.
+fn pipeline_pattern_binding_index(bindings: PatternList, src: i64, ns: i64, nl: i64, index: i64) -> i64 {
+  match bindings {
+    PatternListNil -> 0 - 1
+    PatternListCons(binding, rest) -> {
+      let found = match binding {
+        Binding(bns, bnl) -> pipeline_name_matches(src, ns, nl, bns, bnl)
+        _ -> 0
+      }
+      if found == 1 { index } else { pipeline_pattern_binding_index(rest, src, ns, nl, index + 1) }
+    }
+  }
+}
+
+-- Result type of a match arm. The accessor shape — an arm body that
+-- returns a ctor-pattern payload binding — resolves the Ident against
+-- the ctor's payload types (2q slice 2): the ownership machinery needs
+-- Named payload types to classify accessor returns as managed borrows,
+-- or the transfer retain never fires while callee/caller releases do.
+fn pipeline_match_arm_result_type_node_typed(arm: MatchArm, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
+  match arm {
+    Arm(pattern, body, guard, has_guard) -> {
+      let direct = pipeline_return_expr_type_node_typed(body, params, locals, module)
+      if direct != 0 { direct }
+      else {
+        match pattern {
+          CtorPattern(tag_ns, tag_nl, bindings) -> {
+            match body {
+              Ident(ns, nl) -> {
+                let src = pipeline_lower_module_src(module)
+                let idx = pipeline_pattern_binding_index(bindings, src, ns, nl, 0)
+                if idx < 0 { 0 }
+                else {
+                  let payload_types = pipeline_variant_payload_types(pipeline_lower_module_tt(module), src, tag_ns, tag_nl)
+                  pipeline_expected_arg_type_node(0, payload_types, idx, 0, pipeline_lower_module_subst(module))
+                }
+              }
+              _ -> 0
+            }
+          }
+          _ -> 0
+        }
+      }
+    }
+    UnknownArm(tag) -> 0
+  }
+}
+
+fn pipeline_match_arms_result_type_node_typed(arms: MatchArmList, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
+  match arms {
+    MatchArmListNil -> 0
+    MatchArmListCons(arm, rest) -> {
+      let ty = pipeline_match_arm_result_type_node_typed(arm, params, locals, module)
+      if ty == 0 { 0 }
+      else {
+        match rest {
+          MatchArmListNil -> ty
+          MatchArmListCons(next_arm, next_rest) -> {
+            let rest_ty = pipeline_match_arms_result_type_node_typed(rest, params, locals, module)
+            if rest_ty != 0 and type_hash_of(rest_ty) == type_hash_of(ty) { ty } else { 0 }
+          }
+        }
+      }
+    }
   }
 }
 
@@ -3027,6 +3118,39 @@ fn pipeline_variant_tag_hash(tt: i64, src: i64, ns: i64, nl: i64) -> i64 {
 
 fn pipeline_variant_payload_count(tt: i64, src: i64, ns: i64, nl: i64) -> i64 {
   if tt == 0 { 0 - 1 } else { ttable_variant_payload_count(tt, src, ns, nl) }
+}
+
+-- Parent Named type node for a variant constructor name (2q slice 2).
+-- The fns table misses ctor calls, but let/return ownership machinery
+-- needs the ctor result type to classify the binding as managed.
+fn pipeline_variant_parent_type_node(tt: i64, src: i64, ns: i64, nl: i64) -> i64 {
+  if tt == 0 { 0 }
+  else {
+    let n = mem_load64_at(tt, 8)
+    let d = mem_load64_at(tt, 0)
+    let mut ti = 0
+    let mut result = 0
+    while ti < n and result == 0 {
+      let entry = d + ti * 64
+      let kind = mem_load64_at(entry, 16)
+      if kind == 1 {
+        let entry_src = mem_load64_at(entry, 48)
+        let nvariants = mem_load64_at(entry, 24)
+        let variants = mem_load64_at(entry, 32)
+        let mut vi = 0
+        while vi < nvariants and result == 0 {
+          let v_ns = mem_load64_at(variants, vi * 40)
+          let v_nl = mem_load64_at(variants, vi * 40 + 8)
+          if v_nl == nl and src_eq_at(src, ns, entry_src + v_ns, 0, nl) == 1 {
+            result = ty_named(mem_load64_at(entry, 56), ty_i64())
+          } else { 0 }
+          vi = vi + 1
+        }
+      } else { 0 }
+      ti = ti + 1
+    }
+    result
+  }
 }
 
 fn pipeline_variant_payload_types(tt: i64, src: i64, ns: i64, nl: i64) -> i64 {
@@ -3887,6 +4011,46 @@ fn pipeline_managed_release_inst_list(value: i64, ty: i64, dst: i64) -> IrInstLi
   }
 }
 
+-- Per-arm ownership normalization for control-flow merges (2q slice 2):
+-- when an if/match result mixes borrowed and owned arms, the whole-expr
+-- classifier reports owned, so every consumer (return transfer, let
+-- retain, arg borrow-retain, masked temp release) treats the merged
+-- value as carrying a count. A borrowed arm must retain on its way to
+-- the merge or consumers under-retain (vector_get's default param arm
+-- dangles). All-borrowed merges classify borrowed and need no arm
+-- retains; all-owned arms already carry their count.
+fn pipeline_managed_arm_retain_hash(arm_borrowed: i64, whole_borrowed: i64, ty: i64) -> i64 {
+  if arm_borrowed == 1 and whole_borrowed == 0 and ty != 0 and ty_is_continuation(ty) == 0 {
+    pipeline_managed_retain_hash_for_ty(ty)
+  } else { 0 }
+}
+
+-- Interposes a retain block between a lowered merge arm and its target:
+-- the arm was lowered targeting retain_block; the appended block takes
+-- the arm result as its param, retains it, and forwards to the real
+-- target. No-op when no retain is needed or the arm never reaches its
+-- target (the reserved block id stays unused, which is harmless).
+fn pipeline_managed_arm_retain_append(arm_blocks: PipelineLoweredBlocks, retain_hash: i64, retain_block: i64, target_block: i64) -> PipelineLoweredBlocks {
+  if retain_hash == 0 or pipeline_lowered_blocks_is_valid(arm_blocks) == 0 or pipeline_lowered_blocks_falls_through(arm_blocks) == 0 {
+    arm_blocks
+  } else {
+    let param_value = pipeline_lowered_blocks_next_value(arm_blocks)
+    let retain_insts = ir_inst_list_prepend(
+      ir_inst_call_i64(param_value + 1, retain_hash, ir_value_list_prepend(param_value, ir_value_list_empty())),
+      ir_inst_list_empty()
+    )
+    let forward_args = ir_value_list_prepend(param_value, ir_value_list_empty())
+    let block = ir_block_new_params(retain_block, ir_value_list_prepend(param_value, ir_value_list_empty()), retain_insts, ir_term_jump_args(target_block, forward_args))
+    pipeline_lowered_blocks_control(
+      pipeline_lowered_blocks_next_block(arm_blocks),
+      param_value + 2,
+      ir_block_list_append(pipeline_lowered_blocks_blocks(arm_blocks), ir_block_list_prepend(block, ir_block_list_empty())),
+      1,
+      1
+    )
+  }
+}
+
 fn pipeline_managed_retain_inst_list(value: i64, ty: i64, dst: i64) -> IrInstList {
   let callee = pipeline_managed_retain_hash_for_ty(ty)
   if callee == 0 or value < 0 {
@@ -3970,6 +4134,33 @@ fn pipeline_expr_owned_temp_drop_kind_typed(expr: Expr) -> i64 {
   }
 }
 
+-- Owned managed rvalue temporaries at call-argument position (2q slice
+-- 2): call results are owned — mode-8 vector loads retain — so a
+-- call/method/ctor/record arg carries a count the caller must release
+-- after the call when the callee only borrows the param. Idents, field
+-- loads, and other borrowed shapes stay with their owners.
+fn pipeline_expr_owned_rvalue_temp_typed(expr: Expr) -> i64 {
+  match expr {
+    Call(ns, nl, args) -> 1
+    GenericCall(type_args, inner_call) -> {
+      match inner_call {
+        Call(ns, nl, args) -> 1
+        _ -> pipeline_expr_owned_rvalue_temp_typed(inner_call)
+      }
+    }
+    MethodCall(recv, method_hash, args, type_hash) -> 1
+    RecordInit(type_ns, type_nl, fields) -> 1
+    LetTyped(inner, ann_type) -> pipeline_expr_owned_rvalue_temp_typed(inner)
+    Block(first, rest) -> pipeline_expr_owned_rvalue_temp_typed(rest)
+    _ -> 0
+  }
+}
+
+fn pipeline_expr_node_owned_rvalue_temp_typed(expr: i64) -> i64 {
+  let stripped = pipeline_expr_node_strip_typed(expr)
+  if stripped == 0 { 0 } else { pipeline_expr_owned_rvalue_temp_typed(expr_from_node(stripped)) }
+}
+
 fn pipeline_expr_node_owned_temp_drop_kind_typed(expr: i64) -> i64 {
   let stripped = pipeline_expr_node_strip_typed(expr)
   if stripped == 0 { continuation_cleanup_kind_none() } else { pipeline_expr_owned_temp_drop_kind_typed(expr_from_node(stripped)) }
@@ -4027,50 +4218,62 @@ fn pipeline_managed_owned_temp_release_arg_nodes(args: i64, arg_count: i64, valu
   }
 }
 
--- Caller-side release for owned lambda temporaries passed to BORROWED
--- params (2q slice 1b). Ownership algebra: a lambda arg is an rvalue the
+-- Caller-side release for owned temporaries passed to BORROWED params
+-- (2q slice 1b, generalized in slice 2). Ownership algebra: a lambda or
+-- managed-rvalue arg (call/method/ctor/record result) is a temp the
 -- caller owns with count 1. A callee that owns the param releases it at
 -- return; a borrow-classified param is never released by the callee, so
--- the caller must release after the call or the pair+env leak per
--- execution. Static named-fn pairs flow through the same release and
--- no-op on the magic guard.
+-- the caller must release after the call or the temp leaks per
+-- execution. Static named-fn pairs and immediates flow through the same
+-- release and no-op on the magic guard.
 -- mask_offset mirrors expected_offset in the arg-lowering helpers: the
 -- borrow mask is indexed by callee param position, and method calls
 -- shift args by one for the receiver.
-fn pipeline_managed_lambda_temp_release_args_masked_typed(args: ExprList, values: IrValueList, index: i64, next_value: i64, borrowed_mask: i64, mask_offset: i64) -> PipelineLoweredArgs {
+fn pipeline_managed_temp_release_arg_kind(expr_kind: i64, is_rvalue_temp: i64, expected_params: i64, expected_types: i64, index: i64, mask_offset: i64, expected_subst: i64) -> i64 {
+  if expr_kind != continuation_cleanup_kind_none() { expr_kind }
+  else {
+    if is_rvalue_temp == 1 {
+      cg_managed_drop_kind_for_ty(pipeline_expected_arg_type_node(expected_params, expected_types, index, mask_offset, expected_subst))
+    } else { continuation_cleanup_kind_none() }
+  }
+}
+
+fn pipeline_managed_lambda_temp_release_args_masked_typed(args: ExprList, values: IrValueList, index: i64, next_value: i64, borrowed_mask: i64, mask_offset: i64, expected_params: i64, expected_types: i64, expected_subst: i64) -> PipelineLoweredArgs {
   match args {
     ExprListNil -> pipeline_lowered_args(ir_value_list_empty(), next_value, ir_inst_list_empty(), 1)
     ExprListCons(expr, rest_exprs) -> {
       let expr_kind = pipeline_expr_owned_temp_drop_kind_typed(expr)
+      let drop_kind = pipeline_managed_temp_release_arg_kind(expr_kind, pipeline_expr_owned_rvalue_temp_typed(expr), expected_params, expected_types, index, mask_offset, expected_subst)
       let value = pipeline_ir_value_list_get_or(values, index, 0 - 1)
-      let callee = pipeline_managed_release_hash_for_kind(expr_kind)
-      let release_insts = if expr_kind != continuation_cleanup_kind_none() and callee != 0 and value >= 0 and cg_mask_has(borrowed_mask, index + mask_offset) == 1 {
+      let callee = pipeline_managed_release_hash_for_kind(drop_kind)
+      let release_insts = if drop_kind != continuation_cleanup_kind_none() and callee != 0 and value >= 0 and cg_mask_has(borrowed_mask, index + mask_offset) == 1 {
         ir_inst_list_prepend(ir_inst_call_i64(next_value, callee, ir_value_list_prepend(value, ir_value_list_empty())), ir_inst_list_empty())
       } else {
         ir_inst_list_empty()
       }
       let next_after_release = if ir_inst_list_len(release_insts) > 0 { next_value + 1 } else { next_value }
-      let rest = pipeline_managed_lambda_temp_release_args_masked_typed(rest_exprs, values, index + 1, next_after_release, borrowed_mask, mask_offset)
+      let rest = pipeline_managed_lambda_temp_release_args_masked_typed(rest_exprs, values, index + 1, next_after_release, borrowed_mask, mask_offset, expected_params, expected_types, expected_subst)
       pipeline_lowered_args(ir_value_list_empty(), pipeline_lowered_args_next_value(rest), ir_inst_list_append(release_insts, pipeline_lowered_args_insts(rest)), 1)
     }
   }
 }
 
-fn pipeline_managed_lambda_temp_release_arg_nodes_masked(args: i64, arg_count: i64, values: IrValueList, index: i64, next_value: i64, borrowed_mask: i64, mask_offset: i64) -> PipelineLoweredArgs {
+fn pipeline_managed_lambda_temp_release_arg_nodes_masked(args: i64, arg_count: i64, values: IrValueList, index: i64, next_value: i64, borrowed_mask: i64, mask_offset: i64, expected_params: i64, expected_types: i64, expected_subst: i64) -> PipelineLoweredArgs {
   if index >= arg_count {
     pipeline_lowered_args(ir_value_list_empty(), next_value, ir_inst_list_empty(), 1)
   } else {
     let arg_node = nlist_get(args, index)
     let expr_kind = pipeline_expr_node_owned_temp_drop_kind_typed(arg_node)
+    let drop_kind = pipeline_managed_temp_release_arg_kind(expr_kind, pipeline_expr_node_owned_rvalue_temp_typed(arg_node), expected_params, expected_types, index, mask_offset, expected_subst)
     let value = pipeline_ir_value_list_get_or(values, index, 0 - 1)
-    let callee = pipeline_managed_release_hash_for_kind(expr_kind)
-    let release_insts = if expr_kind != continuation_cleanup_kind_none() and callee != 0 and value >= 0 and cg_mask_has(borrowed_mask, index + mask_offset) == 1 {
+    let callee = pipeline_managed_release_hash_for_kind(drop_kind)
+    let release_insts = if drop_kind != continuation_cleanup_kind_none() and callee != 0 and value >= 0 and cg_mask_has(borrowed_mask, index + mask_offset) == 1 {
       ir_inst_list_prepend(ir_inst_call_i64(next_value, callee, ir_value_list_prepend(value, ir_value_list_empty())), ir_inst_list_empty())
     } else {
       ir_inst_list_empty()
     }
     let next_after_release = if ir_inst_list_len(release_insts) > 0 { next_value + 1 } else { next_value }
-    let rest = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, values, index + 1, next_after_release, borrowed_mask, mask_offset)
+    let rest = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, values, index + 1, next_after_release, borrowed_mask, mask_offset, expected_params, expected_types, expected_subst)
     pipeline_lowered_args(ir_value_list_empty(), pipeline_lowered_args_next_value(rest), ir_inst_list_append(release_insts, pipeline_lowered_args_insts(rest)), 1)
   }
 }
@@ -5048,7 +5251,7 @@ fn pipeline_lower_generic_call_typed_to_target_blocks(type_args: TypeExprList, i
               pipeline_generic_call_inst_typed(call_dst, src, tt, ns, nl, concrete_type_args, pipeline_lowered_call_blocks_values(lowered_args)),
               ir_inst_list_empty()
             )
-            let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 0)
+            let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 0, expected_params, variant_payloads, expected_subst)
             let call_insts = ir_inst_list_append(call_inst, pipeline_lowered_args_insts(cleanup))
             let call_args = ir_value_list_prepend(call_dst, ir_value_list_empty())
             let call = ir_block_new_term(call_block, call_insts, ir_term_jump_args(target_block, call_args))
@@ -5086,7 +5289,7 @@ fn pipeline_lower_method_call_typed_after_receiver(recv_value: i64, recv_blocks:
         ir_inst_method_call_i64(call_dst, type_hash, method_hash, recv_value, pipeline_lowered_call_blocks_values(lowered_args)),
         ir_inst_list_empty()
       )
-      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 1)
+      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 1, method_params, 0, subst)
       let call_insts = ir_inst_list_append(call_inst, pipeline_lowered_args_insts(cleanup))
       let call_args = ir_value_list_prepend(call_dst, ir_value_list_empty())
       let call = ir_block_new_term(call_block, call_insts, ir_term_jump_args(target_block, call_args))
@@ -5124,7 +5327,7 @@ fn pipeline_lower_method_call_typed_after_straight_receiver(recv_value: i64, ent
         ir_inst_method_call_i64(call_dst, type_hash, method_hash, recv_value, pipeline_lowered_call_blocks_values(lowered_args)),
         ir_inst_list_empty()
       )
-      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 1)
+      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 1, method_params, 0, subst)
       let call_args = ir_value_list_prepend(call_dst, ir_value_list_empty())
       let call = ir_block_new_term(call_block, ir_inst_list_append(call_inst, pipeline_lowered_args_insts(cleanup)), ir_term_jump_args(target_block, call_args))
       let blocks = ir_block_list_prepend(entry, ir_block_list_append(pipeline_lowered_call_blocks_blocks(lowered_args), ir_block_list_prepend(call, ir_block_list_empty())))
@@ -5488,9 +5691,15 @@ fn pipeline_lower_let_typed_to_target_blocks_with_float(ns: i64, nl: i64, init_e
         }
         let owned_type_hash = if local_type_node != 0 and effective_type_node != 0 { cg_owned_drop_type_hash(effective_type_node) } else { 0 }
         let owned_drop_wrap = if owned_type_hash != 0 and address_taken == 0 and pipeline_expr_refs_name_typed(body_expr, src, ns, nl) == 0 { 1 } else { 0 }
+        -- Managed bindings release on the fall-through scope exit through
+        -- the same interposed block as owned drops (2q slice 2): the
+        -- sidecar-body path releases inline, but a CFG body jumps to the
+        -- target directly and previously leaked the binding.
+        let rc_release_hash = if owned_drop_wrap == 0 and address_taken == 0 and effective_type_node != 0 and pipeline_expr_final_returns_binding_typed(body_expr, src, ns, nl) == 0 { pipeline_managed_release_hash_for_ty(effective_type_node) } else { 0 }
+        let scope_wrap = if owned_drop_wrap == 1 or rc_release_hash != 0 { 1 } else { 0 }
         let drop_block = body_start
-        let wrapped_body_start = if owned_drop_wrap == 1 { body_start + 1 } else { body_start }
-        let body_target = if owned_drop_wrap == 1 { drop_block } else { target_block }
+        let wrapped_body_start = if scope_wrap == 1 { body_start + 1 } else { body_start }
+        let body_target = if scope_wrap == 1 { drop_block } else { target_block }
         let body_blocks = pipeline_lower_expr_typed_to_target_blocks(body_expr, params, next_locals, module, body_next_value, wrapped_body_start, body_target)
         if pipeline_lowered_blocks_is_valid(body_blocks) == 1 {
           let local_params = ir_value_list_prepend(local_value, ir_value_list_empty())
@@ -5499,10 +5708,15 @@ fn pipeline_lower_let_typed_to_target_blocks_with_float(ns: i64, nl: i64, init_e
           } else { ir_inst_list_empty() }
           let bind_insts = ir_inst_list_prepend(ir_inst_bind_typed_i64(ns, nl, bind_value, effective_type_node), ir_inst_list_empty())
           let local_merge = ir_block_new_params(local_merge_block, local_params, ir_inst_list_append(slot_insts, ir_inst_list_append(retain_insts, bind_insts)), ir_term_jump(wrapped_body_start))
-          if owned_drop_wrap == 1 and pipeline_lowered_blocks_falls_through(body_blocks) == 1 {
+          if scope_wrap == 1 and pipeline_lowered_blocks_falls_through(body_blocks) == 1 {
             let carried = pipeline_lowered_blocks_next_value(body_blocks)
             let drop_params = ir_value_list_prepend(carried, ir_value_list_empty())
-            let drop_insts = ir_inst_list_prepend(ir_inst_owned_drop_i64(bind_value, owned_type_hash), ir_inst_list_empty())
+            let drop_insts = if owned_drop_wrap == 1 {
+              ir_inst_list_prepend(ir_inst_owned_drop_i64(bind_value, owned_type_hash), ir_inst_list_empty())
+            } else {
+              ir_inst_list_prepend(ir_inst_call_i64(carried + 1, rc_release_hash, ir_value_list_prepend(bind_value, ir_value_list_empty())), ir_inst_list_empty())
+            }
+            let after_drop = if owned_drop_wrap == 1 { carried + 1 } else { carried + 2 }
             let drop_node = ir_block_new_params(drop_block, drop_params, drop_insts, ir_term_jump_args(target_block, ir_value_list_prepend(carried, ir_value_list_empty())))
             let blocks = ir_block_list_append(
               pipeline_lowered_blocks_blocks(init_blocks),
@@ -5510,7 +5724,7 @@ fn pipeline_lower_let_typed_to_target_blocks_with_float(ns: i64, nl: i64, init_e
             )
             pipeline_lowered_blocks_control(
               pipeline_lowered_blocks_next_block(body_blocks),
-              carried + 1,
+              after_drop,
               blocks,
               1,
               1
@@ -5572,25 +5786,34 @@ fn pipeline_lower_let_typed_to_target_blocks_with_float(ns: i64, nl: i64, init_e
       if pipeline_expr_needs_lowering_cfg_typed(body_expr, src) == 1 {
         -- Owned bindings drop on the fall-through scope exit. The drop block
         -- is interposed between the body and the real target; return paths
-        -- bypass it, matching defer-owned lowering.
+        -- bypass it, matching defer-owned lowering. Managed bindings
+        -- release through the same interposed block (2q slice 2) — a CFG
+        -- body jumps to the target directly and previously leaked.
         let owned_type_hash = if local_type_node != 0 and effective_type_node != 0 { cg_owned_drop_type_hash(effective_type_node) } else { 0 }
         let owned_drop_wrap = if owned_type_hash != 0 and address_taken == 0 and pipeline_expr_refs_name_typed(body_expr, src, ns, nl) == 0 { 1 } else { 0 }
+        let rc_release_hash = if owned_drop_wrap == 0 and address_taken == 0 and effective_type_node != 0 and pipeline_expr_final_returns_binding_typed(body_expr, src, ns, nl) == 0 { pipeline_managed_release_hash_for_ty(effective_type_node) } else { 0 }
+        let scope_wrap = if owned_drop_wrap == 1 or rc_release_hash != 0 { 1 } else { 0 }
         let drop_block = next_block
-        let body_start = if owned_drop_wrap == 1 { next_block + 1 } else { next_block }
-        let body_target = if owned_drop_wrap == 1 { drop_block } else { target_block }
+        let body_start = if scope_wrap == 1 { next_block + 1 } else { next_block }
+        let body_target = if scope_wrap == 1 { drop_block } else { target_block }
         let body_blocks = pipeline_lower_expr_typed_to_target_blocks(body_expr, params, next_locals, module, body_next, body_start, body_target)
         if pipeline_lowered_blocks_is_valid(body_blocks) == 1 {
           let bind_insts = ir_inst_list_prepend(ir_inst_bind_typed_i64(ns, nl, bind_value, effective_type_node), ir_inst_list_empty())
           let entry = ir_block_new_term(start_block, ir_inst_list_append(ir_lowered_expr_insts(init), ir_inst_list_append(slot_insts, ir_inst_list_append(retain_insts, bind_insts))), ir_term_jump(body_start))
-          if owned_drop_wrap == 1 and pipeline_lowered_blocks_falls_through(body_blocks) == 1 {
+          if scope_wrap == 1 and pipeline_lowered_blocks_falls_through(body_blocks) == 1 {
             let carried = pipeline_lowered_blocks_next_value(body_blocks)
             let drop_params = ir_value_list_prepend(carried, ir_value_list_empty())
-            let drop_insts = ir_inst_list_prepend(ir_inst_owned_drop_i64(bind_value, owned_type_hash), ir_inst_list_empty())
+            let drop_insts = if owned_drop_wrap == 1 {
+              ir_inst_list_prepend(ir_inst_owned_drop_i64(bind_value, owned_type_hash), ir_inst_list_empty())
+            } else {
+              ir_inst_list_prepend(ir_inst_call_i64(carried + 1, rc_release_hash, ir_value_list_prepend(bind_value, ir_value_list_empty())), ir_inst_list_empty())
+            }
+            let after_drop = if owned_drop_wrap == 1 { carried + 1 } else { carried + 2 }
             let drop_node = ir_block_new_params(drop_block, drop_params, drop_insts, ir_term_jump_args(target_block, ir_value_list_prepend(carried, ir_value_list_empty())))
             let blocks = ir_block_list_prepend(entry, ir_block_list_append(pipeline_lowered_blocks_blocks(body_blocks), ir_block_list_prepend(drop_node, ir_block_list_empty())))
             pipeline_lowered_blocks_control(
               pipeline_lowered_blocks_next_block(body_blocks),
-              carried + 1,
+              after_drop,
               blocks,
               1,
               1
@@ -6034,6 +6257,13 @@ fn pipeline_lower_return_typed_to_blocks(value_expr: Expr, params: i64, locals: 
 
 fn pipeline_lower_if_typed_to_target_blocks(cond_expr: Expr, then_expr: Expr, else_expr: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
   let src = pipeline_lower_module_src(module)
+  let fns = pipeline_lower_module_fns(module)
+  let subst = pipeline_lower_module_subst(module)
+  let then_borrowed = pipeline_expr_result_is_borrowed_with_ctx_typed(then_expr, src, fns, subst)
+  let else_borrowed = pipeline_expr_result_is_borrowed_with_ctx_typed(else_expr, src, fns, subst)
+  let whole_borrowed = if then_borrowed == 1 { else_borrowed } else { 0 }
+  let then_retain_hash = pipeline_managed_arm_retain_hash(then_borrowed, whole_borrowed, pipeline_return_expr_type_node_typed(then_expr, params, locals, module))
+  let else_retain_hash = pipeline_managed_arm_retain_hash(else_borrowed, whole_borrowed, pipeline_return_expr_type_node_typed(else_expr, params, locals, module))
   if pipeline_expr_needs_lowering_cfg_typed(cond_expr, src) == 1 {
     let cond_merge_block = pipeline_lower_internal_block_after_target(next_block, target_block)
     let cond_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(cond_expr, params, locals, module, next_value, start_block, cond_merge_block + 1, cond_merge_block)
@@ -6044,12 +6274,18 @@ fn pipeline_lower_if_typed_to_target_blocks(cond_expr: Expr, then_expr: Expr, el
         let cond_value = pipeline_lowered_blocks_next_value(cond_blocks)
         let then_start = pipeline_lower_internal_block_after_target(pipeline_lowered_blocks_next_block(cond_blocks), target_block)
         let else_seed = pipeline_lower_internal_block_after_target(then_start + 1, target_block)
-        let then_inner_next = pipeline_lower_internal_block_after_target(else_seed + 1, target_block)
-        let then_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved_with_float(then_expr, params, locals, module, cond_value + 1, then_start, then_inner_next, target_block, 0)
+        let then_retain_block = if then_retain_hash != 0 { pipeline_lower_internal_block_after_target(else_seed + 1, target_block) } else { 0 }
+        let then_target = if then_retain_hash != 0 { then_retain_block } else { target_block }
+        let then_inner_next = if then_retain_hash != 0 { pipeline_lower_internal_block_after_target(then_retain_block + 1, target_block) } else { pipeline_lower_internal_block_after_target(else_seed + 1, target_block) }
+        let then_blocks_raw = pipeline_lower_expr_typed_to_target_blocks_reserved_with_float(then_expr, params, locals, module, cond_value + 1, then_start, then_inner_next, then_target, 0)
+        let then_blocks = pipeline_managed_arm_retain_append(then_blocks_raw, then_retain_hash, then_retain_block, target_block)
         if pipeline_lowered_blocks_is_valid(then_blocks) == 1 {
           let else_start = pipeline_lower_internal_block_after_target(pipeline_ir_max_i64(pipeline_lowered_blocks_next_block(then_blocks), else_seed), target_block)
-          let else_inner_next = pipeline_lower_internal_block_after_target(else_start + 1, target_block)
-          let else_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved_with_float(else_expr, params, locals, module, pipeline_lowered_blocks_next_value(then_blocks), else_start, else_inner_next, target_block, 0)
+          let else_retain_block = if else_retain_hash != 0 { pipeline_lower_internal_block_after_target(else_start + 1, target_block) } else { 0 }
+          let else_target = if else_retain_hash != 0 { else_retain_block } else { target_block }
+          let else_inner_next = if else_retain_hash != 0 { pipeline_lower_internal_block_after_target(else_retain_block + 1, target_block) } else { pipeline_lower_internal_block_after_target(else_start + 1, target_block) }
+          let else_blocks_raw = pipeline_lower_expr_typed_to_target_blocks_reserved_with_float(else_expr, params, locals, module, pipeline_lowered_blocks_next_value(then_blocks), else_start, else_inner_next, else_target, 0)
+          let else_blocks = pipeline_managed_arm_retain_append(else_blocks_raw, else_retain_hash, else_retain_block, target_block)
           if pipeline_lowered_blocks_is_valid(else_blocks) == 1 {
             let cond_params = ir_value_list_prepend(cond_value, ir_value_list_empty())
             let cond_merge = ir_block_new_params(cond_merge_block, cond_params, ir_inst_list_empty(), ir_term_branch(cond_value, then_start, else_start))
@@ -6075,12 +6311,18 @@ fn pipeline_lower_if_typed_to_target_blocks(cond_expr: Expr, then_expr: Expr, el
     if ir_lowered_expr_is_valid(cond) == 1 {
       let then_start = pipeline_lower_internal_block_after_target(next_block, target_block)
       let else_seed = pipeline_lower_internal_block_after_target(then_start + 1, target_block)
-      let then_inner_next = pipeline_lower_internal_block_after_target(else_seed + 1, target_block)
-      let then_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved_with_float(then_expr, params, locals, module, ir_lowered_expr_next_value(cond), then_start, then_inner_next, target_block, 0)
+      let then_retain_block = if then_retain_hash != 0 { pipeline_lower_internal_block_after_target(else_seed + 1, target_block) } else { 0 }
+      let then_target = if then_retain_hash != 0 { then_retain_block } else { target_block }
+      let then_inner_next = if then_retain_hash != 0 { pipeline_lower_internal_block_after_target(then_retain_block + 1, target_block) } else { pipeline_lower_internal_block_after_target(else_seed + 1, target_block) }
+      let then_blocks_raw = pipeline_lower_expr_typed_to_target_blocks_reserved_with_float(then_expr, params, locals, module, ir_lowered_expr_next_value(cond), then_start, then_inner_next, then_target, 0)
+      let then_blocks = pipeline_managed_arm_retain_append(then_blocks_raw, then_retain_hash, then_retain_block, target_block)
       if pipeline_lowered_blocks_is_valid(then_blocks) == 1 {
         let else_start = pipeline_lower_internal_block_after_target(pipeline_ir_max_i64(pipeline_lowered_blocks_next_block(then_blocks), else_seed), target_block)
-        let else_inner_next = pipeline_lower_internal_block_after_target(else_start + 1, target_block)
-        let else_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved_with_float(else_expr, params, locals, module, pipeline_lowered_blocks_next_value(then_blocks), else_start, else_inner_next, target_block, 0)
+        let else_retain_block = if else_retain_hash != 0 { pipeline_lower_internal_block_after_target(else_start + 1, target_block) } else { 0 }
+        let else_target = if else_retain_hash != 0 { else_retain_block } else { target_block }
+        let else_inner_next = if else_retain_hash != 0 { pipeline_lower_internal_block_after_target(else_retain_block + 1, target_block) } else { pipeline_lower_internal_block_after_target(else_start + 1, target_block) }
+        let else_blocks_raw = pipeline_lower_expr_typed_to_target_blocks_reserved_with_float(else_expr, params, locals, module, pipeline_lowered_blocks_next_value(then_blocks), else_start, else_inner_next, else_target, 0)
+        let else_blocks = pipeline_managed_arm_retain_append(else_blocks_raw, else_retain_hash, else_retain_block, target_block)
         if pipeline_lowered_blocks_is_valid(else_blocks) == 1 {
           let entry = ir_block_new_term(start_block, ir_lowered_expr_insts(cond), ir_term_branch(ir_lowered_expr_value(cond), then_start, else_start))
           let falls_through = if pipeline_lowered_blocks_falls_through(then_blocks) == 1 { 1 } else { pipeline_lowered_blocks_falls_through(else_blocks) }
@@ -7068,9 +7310,13 @@ fn pipeline_lower_loop_let_to_target_blocks(expr: i64, ctx: PipelineLoopCtx, nex
         if pipeline_lowered_loop_blocks_is_valid(body_blocks) == 1 {
           let local_params = ir_value_list_prepend(local_value, ir_value_list_empty())
           let cleanup_dst = pipeline_lowered_loop_blocks_next_value(body_blocks)
-          let cleanup = pipeline_managed_release_inst_list(local_value, effective_type_node, cleanup_dst)
-          let cleaned_body_blocks = pipeline_ir_block_list_append_loop_scope_cleanup(pipeline_lowered_loop_blocks_blocks(body_blocks), cleanup, local_value, normal_block, continue_block, target_block)
-          let next_after_cleanup = if ir_inst_list_len(cleanup) > 0 { cleanup_dst + 1 } else { cleanup_dst }
+          let cleanup_count = if pipeline_managed_release_hash_for_ty(effective_type_node) != 0 {
+            pipeline_ir_block_list_loop_scope_cleanup_count(pipeline_lowered_loop_blocks_blocks(body_blocks), local_value, normal_block, continue_block, target_block)
+          } else { 0 }
+          let cleaned_body_blocks = if cleanup_count > 0 {
+            pipeline_ir_block_list_append_loop_scope_cleanup_indexed(pipeline_lowered_loop_blocks_blocks(body_blocks), local_value, effective_type_node, cleanup_dst, 0, normal_block, continue_block, target_block)
+          } else { pipeline_lowered_loop_blocks_blocks(body_blocks) }
+          let next_after_cleanup = cleanup_dst + cleanup_count
           let local_merge = ir_block_new_params(local_merge_block, local_params, retain_insts, ir_term_jump(body_start))
           let blocks = ir_block_list_append(
             pipeline_lowered_loop_blocks_blocks(init_blocks),
@@ -7120,9 +7366,13 @@ fn pipeline_lower_loop_let_to_target_blocks(expr: i64, ctx: PipelineLoopCtx, nex
       let body_blocks = pipeline_lower_loop_body_to_target_blocks(body_expr, body_ctx, body_next_value, body_start, body_start + 1)
       if pipeline_lowered_loop_blocks_is_valid(body_blocks) == 1 {
         let cleanup_dst = pipeline_lowered_loop_blocks_next_value(body_blocks)
-        let cleanup = pipeline_managed_release_inst_list(bind_value, effective_type_node, cleanup_dst)
-        let cleaned_body_blocks = pipeline_ir_block_list_append_loop_scope_cleanup(pipeline_lowered_loop_blocks_blocks(body_blocks), cleanup, bind_value, normal_block, continue_block, target_block)
-        let next_after_cleanup = if ir_inst_list_len(cleanup) > 0 { cleanup_dst + 1 } else { cleanup_dst }
+        let cleanup_count = if pipeline_managed_release_hash_for_ty(effective_type_node) != 0 {
+          pipeline_ir_block_list_loop_scope_cleanup_count(pipeline_lowered_loop_blocks_blocks(body_blocks), bind_value, normal_block, continue_block, target_block)
+        } else { 0 }
+        let cleaned_body_blocks = if cleanup_count > 0 {
+          pipeline_ir_block_list_append_loop_scope_cleanup_indexed(pipeline_lowered_loop_blocks_blocks(body_blocks), bind_value, effective_type_node, cleanup_dst, 0, normal_block, continue_block, target_block)
+        } else { pipeline_lowered_loop_blocks_blocks(body_blocks) }
+        let next_after_cleanup = cleanup_dst + cleanup_count
         let entry = ir_block_new_term(start_block, ir_inst_list_append(ir_lowered_expr_insts(init), retain_insts), ir_term_jump(body_start))
         let blocks = ir_block_list_prepend(entry, cleaned_body_blocks)
         pipeline_lowered_loop_blocks(
@@ -7190,9 +7440,13 @@ fn pipeline_lower_loop_let_mut_to_target_blocks(expr: i64, ctx: PipelineLoopCtx,
         if pipeline_lowered_loop_blocks_is_valid(body_blocks) == 1 {
           let local_params = ir_value_list_prepend(local_value, ir_value_list_empty())
           let cleanup_dst = pipeline_lowered_loop_blocks_next_value(body_blocks)
-          let cleanup = pipeline_managed_slot_cleanup_inst_list(slot, effective_type_node, cleanup_dst)
-          let cleaned_body_blocks = pipeline_ir_block_list_append_loop_slot_cleanup(pipeline_lowered_loop_blocks_blocks(body_blocks), cleanup, slot, normal_block, continue_block, target_block)
-          let next_after_cleanup = if ir_inst_list_len(cleanup) > 0 { cleanup_dst + 2 } else { cleanup_dst }
+          let cleanup_count = if pipeline_managed_release_hash_for_ty(effective_type_node) != 0 {
+            pipeline_ir_block_list_loop_slot_cleanup_count(pipeline_lowered_loop_blocks_blocks(body_blocks), slot, normal_block, continue_block, target_block)
+          } else { 0 }
+          let cleaned_body_blocks = if cleanup_count > 0 {
+            pipeline_ir_block_list_append_loop_slot_cleanup_indexed(pipeline_lowered_loop_blocks_blocks(body_blocks), slot, effective_type_node, cleanup_dst, 0, normal_block, continue_block, target_block)
+          } else { pipeline_lowered_loop_blocks_blocks(body_blocks) }
+          let next_after_cleanup = cleanup_dst + cleanup_count * 2
           let local_merge = ir_block_new_params(local_merge_block, local_params, ir_inst_list_append(slot_insts, retain_insts), ir_term_jump(body_start))
           let blocks = ir_block_list_append(
             pipeline_lowered_loop_blocks_blocks(init_blocks),
@@ -7246,9 +7500,13 @@ fn pipeline_lower_loop_let_mut_to_target_blocks(expr: i64, ctx: PipelineLoopCtx,
       let body_blocks = pipeline_lower_loop_body_to_target_blocks(body_expr, body_ctx, body_next_value, body_start, body_start + 1)
       if pipeline_lowered_loop_blocks_is_valid(body_blocks) == 1 {
         let cleanup_dst = pipeline_lowered_loop_blocks_next_value(body_blocks)
-        let cleanup = pipeline_managed_slot_cleanup_inst_list(slot, effective_type_node, cleanup_dst)
-        let cleaned_body_blocks = pipeline_ir_block_list_append_loop_slot_cleanup(pipeline_lowered_loop_blocks_blocks(body_blocks), cleanup, slot, normal_block, continue_block, target_block)
-        let next_after_cleanup = if ir_inst_list_len(cleanup) > 0 { cleanup_dst + 2 } else { cleanup_dst }
+        let cleanup_count = if pipeline_managed_release_hash_for_ty(effective_type_node) != 0 {
+          pipeline_ir_block_list_loop_slot_cleanup_count(pipeline_lowered_loop_blocks_blocks(body_blocks), slot, normal_block, continue_block, target_block)
+        } else { 0 }
+        let cleaned_body_blocks = if cleanup_count > 0 {
+          pipeline_ir_block_list_append_loop_slot_cleanup_indexed(pipeline_lowered_loop_blocks_blocks(body_blocks), slot, effective_type_node, cleanup_dst, 0, normal_block, continue_block, target_block)
+        } else { pipeline_lowered_loop_blocks_blocks(body_blocks) }
+        let next_after_cleanup = cleanup_dst + cleanup_count * 2
         let entry_insts = ir_inst_list_append(ir_lowered_expr_insts(init), ir_inst_list_append(slot_insts, retain_insts))
         let entry = ir_block_new_term(start_block, entry_insts, ir_term_jump(body_start))
         let blocks = ir_block_list_prepend(entry, cleaned_body_blocks)
@@ -7533,6 +7791,13 @@ fn pipeline_lower_if_to_target_blocks(expr: i64, params: i64, locals: PipelineVa
     pipeline_lowered_blocks_invalid(start_block, next_value)
   } else {
     let cond_expr = node_f1(expr)
+    let fns = pipeline_lower_module_fns(module)
+    let subst = pipeline_lower_module_subst(module)
+    let then_borrowed = pipeline_expr_node_result_is_borrowed_with_ctx_typed(node_f2(expr), src, fns, subst)
+    let else_borrowed = pipeline_expr_node_result_is_borrowed_with_ctx_typed(else_expr, src, fns, subst)
+    let whole_borrowed = if then_borrowed == 1 { else_borrowed } else { 0 }
+    let then_retain_hash = pipeline_managed_arm_retain_hash(then_borrowed, whole_borrowed, pipeline_return_expr_type_node_from_node(node_f2(expr), params, locals, module))
+    let else_retain_hash = pipeline_managed_arm_retain_hash(else_borrowed, whole_borrowed, pipeline_return_expr_type_node_from_node(else_expr, params, locals, module))
     if pipeline_expr_needs_cfg(cond_expr) == 1 {
       let cond_merge_block = pipeline_lower_internal_block_after_target(next_block, target_block)
       let cond_blocks = pipeline_lower_expr_to_target_blocks_reserved(cond_expr, params, locals, module, next_value, start_block, cond_merge_block + 1, cond_merge_block)
@@ -7543,12 +7808,18 @@ fn pipeline_lower_if_to_target_blocks(expr: i64, params: i64, locals: PipelineVa
           let cond_value = pipeline_lowered_blocks_next_value(cond_blocks)
           let then_start = pipeline_lower_internal_block_after_target(pipeline_lowered_blocks_next_block(cond_blocks), target_block)
           let else_seed = pipeline_lower_internal_block_after_target(then_start + 1, target_block)
-          let then_inner_next = pipeline_lower_internal_block_after_target(else_seed + 1, target_block)
-          let then_blocks = pipeline_lower_expr_to_target_blocks_reserved(node_f2(expr), params, locals, module, cond_value + 1, then_start, then_inner_next, target_block)
+          let then_retain_block = if then_retain_hash != 0 { pipeline_lower_internal_block_after_target(else_seed + 1, target_block) } else { 0 }
+          let then_target = if then_retain_hash != 0 { then_retain_block } else { target_block }
+          let then_inner_next = if then_retain_hash != 0 { pipeline_lower_internal_block_after_target(then_retain_block + 1, target_block) } else { pipeline_lower_internal_block_after_target(else_seed + 1, target_block) }
+          let then_blocks_raw = pipeline_lower_expr_to_target_blocks_reserved(node_f2(expr), params, locals, module, cond_value + 1, then_start, then_inner_next, then_target)
+          let then_blocks = pipeline_managed_arm_retain_append(then_blocks_raw, then_retain_hash, then_retain_block, target_block)
           if pipeline_lowered_blocks_is_valid(then_blocks) == 1 {
             let else_start = pipeline_lower_internal_block_after_target(pipeline_ir_max_i64(pipeline_lowered_blocks_next_block(then_blocks), else_seed), target_block)
-            let else_inner_next = pipeline_lower_internal_block_after_target(else_start + 1, target_block)
-            let else_blocks = pipeline_lower_expr_to_target_blocks_reserved(else_expr, params, locals, module, pipeline_lowered_blocks_next_value(then_blocks), else_start, else_inner_next, target_block)
+            let else_retain_block = if else_retain_hash != 0 { pipeline_lower_internal_block_after_target(else_start + 1, target_block) } else { 0 }
+            let else_target = if else_retain_hash != 0 { else_retain_block } else { target_block }
+            let else_inner_next = if else_retain_hash != 0 { pipeline_lower_internal_block_after_target(else_retain_block + 1, target_block) } else { pipeline_lower_internal_block_after_target(else_start + 1, target_block) }
+            let else_blocks_raw = pipeline_lower_expr_to_target_blocks_reserved(else_expr, params, locals, module, pipeline_lowered_blocks_next_value(then_blocks), else_start, else_inner_next, else_target)
+            let else_blocks = pipeline_managed_arm_retain_append(else_blocks_raw, else_retain_hash, else_retain_block, target_block)
             if pipeline_lowered_blocks_is_valid(else_blocks) == 1 {
               let cond_params = ir_value_list_prepend(cond_value, ir_value_list_empty())
               let cond_merge = ir_block_new_params(cond_merge_block, cond_params, ir_inst_list_empty(), ir_term_branch(cond_value, then_start, else_start))
@@ -7576,12 +7847,18 @@ fn pipeline_lower_if_to_target_blocks(expr: i64, params: i64, locals: PipelineVa
       if ir_lowered_expr_is_valid(cond) == 1 {
         let then_start = pipeline_lower_internal_block_after_target(next_block, target_block)
         let else_seed = pipeline_lower_internal_block_after_target(then_start + 1, target_block)
-        let then_inner_next = pipeline_lower_internal_block_after_target(else_seed + 1, target_block)
-        let then_blocks = pipeline_lower_expr_to_target_blocks_reserved(node_f2(expr), params, locals, module, ir_lowered_expr_next_value(cond), then_start, then_inner_next, target_block)
+        let then_retain_block = if then_retain_hash != 0 { pipeline_lower_internal_block_after_target(else_seed + 1, target_block) } else { 0 }
+        let then_target = if then_retain_hash != 0 { then_retain_block } else { target_block }
+        let then_inner_next = if then_retain_hash != 0 { pipeline_lower_internal_block_after_target(then_retain_block + 1, target_block) } else { pipeline_lower_internal_block_after_target(else_seed + 1, target_block) }
+        let then_blocks_raw = pipeline_lower_expr_to_target_blocks_reserved(node_f2(expr), params, locals, module, ir_lowered_expr_next_value(cond), then_start, then_inner_next, then_target)
+        let then_blocks = pipeline_managed_arm_retain_append(then_blocks_raw, then_retain_hash, then_retain_block, target_block)
         if pipeline_lowered_blocks_is_valid(then_blocks) == 1 {
           let else_start = pipeline_lower_internal_block_after_target(pipeline_ir_max_i64(pipeline_lowered_blocks_next_block(then_blocks), else_seed), target_block)
-          let else_inner_next = pipeline_lower_internal_block_after_target(else_start + 1, target_block)
-          let else_blocks = pipeline_lower_expr_to_target_blocks_reserved(else_expr, params, locals, module, pipeline_lowered_blocks_next_value(then_blocks), else_start, else_inner_next, target_block)
+          let else_retain_block = if else_retain_hash != 0 { pipeline_lower_internal_block_after_target(else_start + 1, target_block) } else { 0 }
+          let else_target = if else_retain_hash != 0 { else_retain_block } else { target_block }
+          let else_inner_next = if else_retain_hash != 0 { pipeline_lower_internal_block_after_target(else_retain_block + 1, target_block) } else { pipeline_lower_internal_block_after_target(else_start + 1, target_block) }
+          let else_blocks_raw = pipeline_lower_expr_to_target_blocks_reserved(else_expr, params, locals, module, pipeline_lowered_blocks_next_value(then_blocks), else_start, else_inner_next, else_target)
+          let else_blocks = pipeline_managed_arm_retain_append(else_blocks_raw, else_retain_hash, else_retain_block, target_block)
           if pipeline_lowered_blocks_is_valid(else_blocks) == 1 {
             let entry = ir_block_new_term(start_block, ir_lowered_expr_insts(cond), ir_term_branch(ir_lowered_expr_value(cond), then_start, else_start))
             let falls_through = if pipeline_lowered_blocks_falls_through(then_blocks) == 1 { 1 } else { pipeline_lowered_blocks_falls_through(else_blocks) }
@@ -8004,7 +8281,7 @@ fn pipeline_lower_call_to_target_blocks(expr: i64, params: i64, locals: Pipeline
         let borrowed_mask = if direct == 1 {
           pipeline_call_borrowable_param_mask(pipeline_lower_module_fns(module), src, node_f1(expr), node_f2(expr), expected_params, pipeline_lower_module_subst(module))
         } else { 0 }
-        let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(node_f3(expr), arg_count, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 0)
+        let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(node_f3(expr), arg_count, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 0, expected_params, 0, pipeline_lower_module_subst(module))
         let call_args = ir_value_list_prepend(call_dst, ir_value_list_empty())
         let call = ir_block_new_term(call_block, ir_inst_list_append(call_inst, pipeline_lowered_args_insts(cleanup)), ir_term_jump_args(target_block, call_args))
         let blocks = ir_block_list_prepend(
@@ -9371,25 +9648,45 @@ fn pipeline_ir_term_leaves_loop_scope(term: IrTerminator, normal_block: i64, con
   }
 }
 
-fn pipeline_ir_block_append_loop_scope_cleanup(block: IrBlock, cleanup: IrInstList, bind_value: i64, normal_block: i64, continue_block: i64, target_block: i64) -> IrBlock {
+-- Loop-scope cleanup patches EVERY exit block, so each patched copy
+-- must mint its own dst value id (2q slice 2: managed aggregates made
+-- the cleanup non-empty, and a shared dst is a multi-block double
+-- definition). Callers pre-count with the _count helper to advance
+-- next_value, then the appender numbers copies base_dst + index in
+-- block-list order.
+fn pipeline_ir_block_loop_scope_cleanup_applies(block: IrBlock, bind_value: i64, normal_block: i64, continue_block: i64, target_block: i64) -> i64 {
   match block {
     IrBlock(id, params, insts, term) -> {
-      if pipeline_ir_term_leaves_loop_scope(term, normal_block, continue_block, target_block) == 1 and pipeline_ir_term_transfers_value(term, bind_value) == 0 {
-        IrBlock(id, params, ir_inst_list_append(insts, cleanup), term)
-      } else {
-        block
-      }
+      if pipeline_ir_term_leaves_loop_scope(term, normal_block, continue_block, target_block) == 1 and pipeline_ir_term_transfers_value(term, bind_value) == 0 { 1 } else { 0 }
     }
   }
 }
 
-fn pipeline_ir_block_list_append_loop_scope_cleanup(blocks: IrBlockList, cleanup: IrInstList, bind_value: i64, normal_block: i64, continue_block: i64, target_block: i64) -> IrBlockList {
+fn pipeline_ir_block_list_loop_scope_cleanup_count(blocks: IrBlockList, bind_value: i64, normal_block: i64, continue_block: i64, target_block: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      pipeline_ir_block_loop_scope_cleanup_applies(block, bind_value, normal_block, continue_block, target_block) +
+      pipeline_ir_block_list_loop_scope_cleanup_count(rest, bind_value, normal_block, continue_block, target_block)
+    }
+  }
+}
+
+fn pipeline_ir_block_list_append_loop_scope_cleanup_indexed(blocks: IrBlockList, bind_value: i64, ty: i64, base_dst: i64, index: i64, normal_block: i64, continue_block: i64, target_block: i64) -> IrBlockList {
   match blocks {
     IrBlockListNil -> IrBlockListNil
-    IrBlockListCons(block, rest) -> IrBlockListCons(
-      pipeline_ir_block_append_loop_scope_cleanup(block, cleanup, bind_value, normal_block, continue_block, target_block),
-      pipeline_ir_block_list_append_loop_scope_cleanup(rest, cleanup, bind_value, normal_block, continue_block, target_block)
-    )
+    IrBlockListCons(block, rest) -> {
+      let applies = pipeline_ir_block_loop_scope_cleanup_applies(block, bind_value, normal_block, continue_block, target_block)
+      let patched = if applies == 1 {
+        match block {
+          IrBlock(id, params, insts, term) -> IrBlock(id, params, ir_inst_list_append(insts, pipeline_managed_release_inst_list(bind_value, ty, base_dst + index)), term)
+        }
+      } else { block }
+      IrBlockListCons(
+        patched,
+        pipeline_ir_block_list_append_loop_scope_cleanup_indexed(rest, bind_value, ty, base_dst, index + applies, normal_block, continue_block, target_block)
+      )
+    }
   }
 }
 
@@ -9402,25 +9699,41 @@ fn pipeline_managed_slot_cleanup_inst_list(slot: i64, ty: i64, load_value: i64) 
   }
 }
 
-fn pipeline_ir_block_append_loop_slot_cleanup(block: IrBlock, cleanup: IrInstList, slot: i64, normal_block: i64, continue_block: i64, target_block: i64) -> IrBlock {
+-- Slot-based twin: each patched copy loads the slot into its own value
+-- id and releases through its own dst (two ids per copy).
+fn pipeline_ir_block_loop_slot_cleanup_applies(block: IrBlock, slot: i64, normal_block: i64, continue_block: i64, target_block: i64) -> i64 {
   match block {
     IrBlock(id, params, insts, term) -> {
-      if pipeline_ir_term_leaves_loop_scope(term, normal_block, continue_block, target_block) == 1 and pipeline_ir_term_transfers_slot_value(term, insts, slot) == 0 {
-        IrBlock(id, params, ir_inst_list_append(insts, cleanup), term)
-      } else {
-        block
-      }
+      if pipeline_ir_term_leaves_loop_scope(term, normal_block, continue_block, target_block) == 1 and pipeline_ir_term_transfers_slot_value(term, insts, slot) == 0 { 1 } else { 0 }
     }
   }
 }
 
-fn pipeline_ir_block_list_append_loop_slot_cleanup(blocks: IrBlockList, cleanup: IrInstList, slot: i64, normal_block: i64, continue_block: i64, target_block: i64) -> IrBlockList {
+fn pipeline_ir_block_list_loop_slot_cleanup_count(blocks: IrBlockList, slot: i64, normal_block: i64, continue_block: i64, target_block: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      pipeline_ir_block_loop_slot_cleanup_applies(block, slot, normal_block, continue_block, target_block) +
+      pipeline_ir_block_list_loop_slot_cleanup_count(rest, slot, normal_block, continue_block, target_block)
+    }
+  }
+}
+
+fn pipeline_ir_block_list_append_loop_slot_cleanup_indexed(blocks: IrBlockList, slot: i64, ty: i64, base_dst: i64, index: i64, normal_block: i64, continue_block: i64, target_block: i64) -> IrBlockList {
   match blocks {
     IrBlockListNil -> IrBlockListNil
-    IrBlockListCons(block, rest) -> IrBlockListCons(
-      pipeline_ir_block_append_loop_slot_cleanup(block, cleanup, slot, normal_block, continue_block, target_block),
-      pipeline_ir_block_list_append_loop_slot_cleanup(rest, cleanup, slot, normal_block, continue_block, target_block)
-    )
+    IrBlockListCons(block, rest) -> {
+      let applies = pipeline_ir_block_loop_slot_cleanup_applies(block, slot, normal_block, continue_block, target_block)
+      let patched = if applies == 1 {
+        match block {
+          IrBlock(id, params, insts, term) -> IrBlock(id, params, ir_inst_list_append(insts, pipeline_managed_slot_cleanup_inst_list(slot, ty, base_dst + index * 2)), term)
+        }
+      } else { block }
+      IrBlockListCons(
+        patched,
+        pipeline_ir_block_list_append_loop_slot_cleanup_indexed(rest, slot, ty, base_dst, index + applies, normal_block, continue_block, target_block)
+      )
+    }
   }
 }
 
@@ -10302,100 +10615,103 @@ fn pipeline_expr_needs_rc_runtime(node: i64, src: i64) -> bool {
   }
 }
 
-fn pipeline_expr_list_needs_rc_runtime_typed(args: ExprList, src: i64) -> bool {
+fn pipeline_expr_list_needs_rc_runtime_typed(args: ExprList, src: i64, tt: i64) -> bool {
   match args {
     ExprListNil -> false
-    ExprListCons(expr, rest) -> pipeline_expr_needs_rc_runtime_typed(expr, src) or pipeline_expr_list_needs_rc_runtime_typed(rest, src)
+    ExprListCons(expr, rest) -> pipeline_expr_needs_rc_runtime_typed(expr, src, tt) or pipeline_expr_list_needs_rc_runtime_typed(rest, src, tt)
   }
 }
 
-fn pipeline_record_fields_need_rc_runtime_typed(fields: RecordFieldList, src: i64) -> bool {
+fn pipeline_record_fields_need_rc_runtime_typed(fields: RecordFieldList, src: i64, tt: i64) -> bool {
   match fields {
     RecordFieldListNil -> false
     RecordFieldListCons(field, rest) -> {
       match field {
-        RecordField(ns, nl, value) -> pipeline_expr_needs_rc_runtime_typed(value, src) or pipeline_record_fields_need_rc_runtime_typed(rest, src)
-        UnknownRecordField(tag) -> pipeline_record_fields_need_rc_runtime_typed(rest, src)
+        RecordField(ns, nl, value) -> pipeline_expr_needs_rc_runtime_typed(value, src, tt) or pipeline_record_fields_need_rc_runtime_typed(rest, src, tt)
+        UnknownRecordField(tag) -> pipeline_record_fields_need_rc_runtime_typed(rest, src, tt)
       }
     }
   }
 }
 
-fn pipeline_match_arms_need_rc_runtime_typed(arms: MatchArmList, src: i64) -> bool {
+fn pipeline_match_arms_need_rc_runtime_typed(arms: MatchArmList, src: i64, tt: i64) -> bool {
   match arms {
     MatchArmListNil -> false
     MatchArmListCons(arm, rest) -> {
       match arm {
         Arm(pattern, body, guard, has_guard) -> {
-          pipeline_expr_needs_rc_runtime_typed(body, src) or
-          (if has_guard == 1 { pipeline_expr_needs_rc_runtime_typed(guard, src) } else { false }) or
-          pipeline_match_arms_need_rc_runtime_typed(rest, src)
+          pipeline_expr_needs_rc_runtime_typed(body, src, tt) or
+          (if has_guard == 1 { pipeline_expr_needs_rc_runtime_typed(guard, src, tt) } else { false }) or
+          pipeline_match_arms_need_rc_runtime_typed(rest, src, tt)
         }
-        UnknownArm(tag) -> pipeline_match_arms_need_rc_runtime_typed(rest, src)
+        UnknownArm(tag) -> pipeline_match_arms_need_rc_runtime_typed(rest, src, tt)
       }
     }
   }
 }
 
-fn pipeline_handle_clauses_need_rc_runtime_typed(clauses: HandlerClauseList, src: i64) -> bool {
+fn pipeline_handle_clauses_need_rc_runtime_typed(clauses: HandlerClauseList, src: i64, tt: i64) -> bool {
   match clauses {
     HandlerClauseListNil -> false
     HandlerClauseListCons(clause, rest) -> {
       match clause {
         HandlerClause(name_info, params, body, continuation) -> {
           pipeline_param_list_needs_rc_runtime_typed(params) or
-          pipeline_expr_needs_rc_runtime_typed(body, src) or
-          pipeline_handle_clauses_need_rc_runtime_typed(rest, src)
+          pipeline_expr_needs_rc_runtime_typed(body, src, tt) or
+          pipeline_handle_clauses_need_rc_runtime_typed(rest, src, tt)
         }
-        UnknownHandlerClause(tag) -> pipeline_handle_clauses_need_rc_runtime_typed(rest, src)
+        UnknownHandlerClause(tag) -> pipeline_handle_clauses_need_rc_runtime_typed(rest, src, tt)
       }
     }
   }
 }
 
-fn pipeline_expr_needs_rc_runtime_typed(expr: Expr, src: i64) -> bool {
+fn pipeline_expr_needs_rc_runtime_typed(expr: Expr, src: i64, tt: i64) -> bool {
   match expr {
-    BinOp(op, lhs, rhs) -> pipeline_expr_needs_rc_runtime_typed(lhs, src) or pipeline_expr_needs_rc_runtime_typed(rhs, src)
-    Call(ns, nl, args) -> pipeline_rc_runtime_name(src, ns, nl) or pipeline_expr_list_needs_rc_runtime_typed(args, src)
-    GenericCall(type_args, inner_call) -> pipeline_type_expr_list_needs_rc_runtime_typed(type_args) or pipeline_expr_needs_rc_runtime_typed(inner_call, src)
-    If(cond, then_expr, else_expr) -> pipeline_expr_needs_rc_runtime_typed(cond, src) or pipeline_expr_needs_rc_runtime_typed(then_expr, src) or pipeline_expr_needs_rc_runtime_typed(else_expr, src)
-    While(cond, body) -> pipeline_expr_needs_rc_runtime_typed(cond, src) or pipeline_expr_needs_rc_runtime_typed(body, src)
-    Loop(body) -> pipeline_expr_needs_rc_runtime_typed(body, src)
-    Break(value) -> pipeline_expr_needs_rc_runtime_typed(value, src)
-    Return(value) -> pipeline_expr_needs_rc_runtime_typed(value, src)
-    Defer(cleanup, body) -> pipeline_expr_needs_rc_runtime_typed(cleanup, src) or pipeline_expr_needs_rc_runtime_typed(body, src)
-    Let(ns, nl, value, body) -> pipeline_expr_needs_rc_runtime_typed(value, src) or pipeline_expr_needs_rc_runtime_typed(body, src)
-    LetMut(ns, nl, value, body) -> pipeline_expr_needs_rc_runtime_typed(value, src) or pipeline_expr_needs_rc_runtime_typed(body, src)
-    Assign(ns, nl, value) -> pipeline_expr_needs_rc_runtime_typed(value, src)
-    AddressOf(mutable, target) -> pipeline_expr_needs_rc_runtime_typed(target, src)
-    Deref(ptr) -> pipeline_expr_needs_rc_runtime_typed(ptr, src)
-    PtrAssign(ptr, value) -> pipeline_expr_needs_rc_runtime_typed(ptr, src) or pipeline_expr_needs_rc_runtime_typed(value, src)
-    Block(first, rest) -> pipeline_expr_needs_rc_runtime_typed(first, src) or pipeline_expr_needs_rc_runtime_typed(rest, src)
-    FieldAccess(base, field_ns, field_nl) -> pipeline_expr_needs_rc_runtime_typed(base, src)
-    RecordInit(type_ns, type_nl, fields) -> pipeline_record_fields_need_rc_runtime_typed(fields, src)
-    Match(scrutinee, arms) -> pipeline_expr_needs_rc_runtime_typed(scrutinee, src) or pipeline_match_arms_need_rc_runtime_typed(arms, src)
-    Not(operand) -> pipeline_expr_needs_rc_runtime_typed(operand, src)
+    BinOp(op, lhs, rhs) -> pipeline_expr_needs_rc_runtime_typed(lhs, src, tt) or pipeline_expr_needs_rc_runtime_typed(rhs, src, tt)
+    -- Payload-carrying variant construction allocates a headered rc
+    -- node (2q slice 2); payload-less ctors are immediates.
+    Call(ns, nl, args) -> pipeline_rc_runtime_name(src, ns, nl) or pipeline_variant_payload_count(tt, src, ns, nl) >= 1 or pipeline_expr_list_needs_rc_runtime_typed(args, src, tt)
+    GenericCall(type_args, inner_call) -> pipeline_type_expr_list_needs_rc_runtime_typed(type_args) or pipeline_expr_needs_rc_runtime_typed(inner_call, src, tt)
+    If(cond, then_expr, else_expr) -> pipeline_expr_needs_rc_runtime_typed(cond, src, tt) or pipeline_expr_needs_rc_runtime_typed(then_expr, src, tt) or pipeline_expr_needs_rc_runtime_typed(else_expr, src, tt)
+    While(cond, body) -> pipeline_expr_needs_rc_runtime_typed(cond, src, tt) or pipeline_expr_needs_rc_runtime_typed(body, src, tt)
+    Loop(body) -> pipeline_expr_needs_rc_runtime_typed(body, src, tt)
+    Break(value) -> pipeline_expr_needs_rc_runtime_typed(value, src, tt)
+    Return(value) -> pipeline_expr_needs_rc_runtime_typed(value, src, tt)
+    Defer(cleanup, body) -> pipeline_expr_needs_rc_runtime_typed(cleanup, src, tt) or pipeline_expr_needs_rc_runtime_typed(body, src, tt)
+    Let(ns, nl, value, body) -> pipeline_expr_needs_rc_runtime_typed(value, src, tt) or pipeline_expr_needs_rc_runtime_typed(body, src, tt)
+    LetMut(ns, nl, value, body) -> pipeline_expr_needs_rc_runtime_typed(value, src, tt) or pipeline_expr_needs_rc_runtime_typed(body, src, tt)
+    Assign(ns, nl, value) -> pipeline_expr_needs_rc_runtime_typed(value, src, tt)
+    AddressOf(mutable, target) -> pipeline_expr_needs_rc_runtime_typed(target, src, tt)
+    Deref(ptr) -> pipeline_expr_needs_rc_runtime_typed(ptr, src, tt)
+    PtrAssign(ptr, value) -> pipeline_expr_needs_rc_runtime_typed(ptr, src, tt) or pipeline_expr_needs_rc_runtime_typed(value, src, tt)
+    Block(first, rest) -> pipeline_expr_needs_rc_runtime_typed(first, src, tt) or pipeline_expr_needs_rc_runtime_typed(rest, src, tt)
+    FieldAccess(base, field_ns, field_nl) -> pipeline_expr_needs_rc_runtime_typed(base, src, tt)
+    -- Record construction allocates a headered rc node (2q slice 2).
+    RecordInit(type_ns, type_nl, fields) -> true
+    Match(scrutinee, arms) -> pipeline_expr_needs_rc_runtime_typed(scrutinee, src, tt) or pipeline_match_arms_need_rc_runtime_typed(arms, src, tt)
+    Not(operand) -> pipeline_expr_needs_rc_runtime_typed(operand, src, tt)
     Lambda(params, body) -> true
-    Perform(lhs, op_ns, op_nl, args) -> pipeline_expr_needs_rc_runtime_typed(lhs, src) or pipeline_expr_list_needs_rc_runtime_typed(args, src)
+    Perform(lhs, op_ns, op_nl, args) -> pipeline_expr_needs_rc_runtime_typed(lhs, src, tt) or pipeline_expr_list_needs_rc_runtime_typed(args, src, tt)
     Handle(body, clauses) -> true
-    Resume(value) -> pipeline_expr_needs_rc_runtime_typed(value, src)
-    MethodCall(recv, method_hash, args, type_hash) -> pipeline_expr_needs_rc_runtime_typed(recv, src) or pipeline_expr_list_needs_rc_runtime_typed(args, src)
-    Try(inner) -> pipeline_expr_needs_rc_runtime_typed(inner, src)
-    InterpConcat(left, right) -> pipeline_expr_needs_rc_runtime_typed(left, src) or pipeline_expr_needs_rc_runtime_typed(right, src)
-    ForIter(var_ns, var_nl, collection, body) -> pipeline_expr_needs_rc_runtime_typed(collection, src) or pipeline_expr_needs_rc_runtime_typed(body, src)
-    OptChain(base, field_ns, field_nl) -> pipeline_expr_needs_rc_runtime_typed(base, src)
-    LetTyped(inner, ann_type) -> pipeline_type_expr_needs_rc_runtime(ann_type) or pipeline_expr_needs_rc_runtime_typed(inner, src)
+    Resume(value) -> pipeline_expr_needs_rc_runtime_typed(value, src, tt)
+    MethodCall(recv, method_hash, args, type_hash) -> pipeline_expr_needs_rc_runtime_typed(recv, src, tt) or pipeline_expr_list_needs_rc_runtime_typed(args, src, tt)
+    Try(inner) -> pipeline_expr_needs_rc_runtime_typed(inner, src, tt)
+    InterpConcat(left, right) -> pipeline_expr_needs_rc_runtime_typed(left, src, tt) or pipeline_expr_needs_rc_runtime_typed(right, src, tt)
+    ForIter(var_ns, var_nl, collection, body) -> pipeline_expr_needs_rc_runtime_typed(collection, src, tt) or pipeline_expr_needs_rc_runtime_typed(body, src, tt)
+    OptChain(base, field_ns, field_nl) -> pipeline_expr_needs_rc_runtime_typed(base, src, tt)
+    LetTyped(inner, ann_type) -> pipeline_type_expr_needs_rc_runtime(ann_type) or pipeline_expr_needs_rc_runtime_typed(inner, src, tt)
     _ -> false
   }
 }
 
-fn pipeline_decl_needs_rc_runtime(decl: Decl, fn_src: i64, fnhashes: i64) -> bool {
+fn pipeline_decl_needs_rc_runtime(decl: Decl, fn_src: i64, fnhashes: i64, tt: i64) -> bool {
   if pipeline_decl_type_surface_needs_rc_runtime(decl) == 1 {
     true
   } else {
     if decl_is_test(decl) == 1 {
       let body = decl_body_expr(decl)
-      pipeline_expr_needs_rc_runtime_typed(body, fn_src)
+      pipeline_expr_needs_rc_runtime_typed(body, fn_src, tt)
     } else {
       if decl_is_function(decl) == 1 {
         let params = decl_params(decl)
@@ -10403,20 +10719,20 @@ fn pipeline_decl_needs_rc_runtime(decl: Decl, fn_src: i64, fnhashes: i64) -> boo
         let locals = pipeline_param_list_add_locals_typed(params, fn_src, nlist_new())
         pipeline_param_list_needs_rc_runtime_typed(params) or
         pipeline_type_expr_needs_rc_runtime(decl_return_type(decl)) or
-        pipeline_expr_needs_rc_runtime_typed(body, fn_src) or
+        pipeline_expr_needs_rc_runtime_typed(body, fn_src, tt) or
         pipeline_expr_uses_function_value_typed(body, fn_src, fnhashes, locals)
       } else { false }
     }
   }
 }
 
-fn pipeline_fns_need_rc_runtime(fns: i64) -> bool {
+fn pipeline_fns_need_rc_runtime(fns: i64, tt: i64) -> bool {
   let mut found = false
   let fnhashes = pipeline_fn_name_hashes(fns)
   let mut i = 0
   while i < nlist_len(fns) {
     let pair = nlist_get(fns, i)
-    if pipeline_decl_needs_rc_runtime(decl_from_node(node_f1(pair)), node_f2(pair), fnhashes) {
+    if pipeline_decl_needs_rc_runtime(decl_from_node(node_f1(pair)), node_f2(pair), fnhashes, tt) {
       found = true
       i = nlist_len(fns)
     } else { i = i + 1 }
@@ -10650,11 +10966,15 @@ fn pipeline_bind_runtime_preludes(fns: i64, src: i64, tt: i64) -> i64 {
 
 fn pipeline_bind_runtime_preludes_inner(fns: i64, src: i64, tt: i64) -[Diagnose]> i64 {
   let had_effects_need = pipeline_fns_need_effects_runtime(fns)
-  let had_rc_need = pipeline_fns_need_rc_runtime(fns)
+  -- Aggregate CONSTRUCTION (variant ctor with payloads, record init)
+  -- allocates default-managed rc payloads (2q slice 2); the walker
+  -- consults the ttable so plain type declarations without construction
+  -- do not drag the rc runtime into parse-only tooling output.
+  let had_rc_need = pipeline_fns_need_rc_runtime(fns, tt)
   if had_effects_need {
     parse_use_file(fns, tt, "runtime/effects.weft")
   } else { 0 }
-  let rc_need = had_rc_need or pipeline_fns_need_rc_runtime(fns)
+  let rc_need = had_rc_need or pipeline_fns_need_rc_runtime(fns, tt)
   if rc_need {
     parse_use_file(fns, tt, "runtime/rc.weft")
   } else { 0 }
@@ -11893,7 +12213,7 @@ fn pipeline_lower_call_expr_typed_sidecar_handler_opt(ns: i64, nl: i64, args_exp
         pipeline_call_inst_resolved(dst, direct, indirect_callee, src, tt, ns, nl, pipeline_lowered_args_values(args)),
         ir_inst_list_empty()
       )
-      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_expr, pipeline_lowered_args_values(args), 0, dst + 1, borrowed_mask, 0)
+      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_expr, pipeline_lowered_args_values(args), 0, dst + 1, borrowed_mask, 0, expected_params, expected_types, subst)
       let insts = ir_inst_list_append(callee_insts, ir_inst_list_append(pipeline_lowered_args_insts(args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup))))
       ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), insts)
     } else {
@@ -12770,6 +13090,12 @@ fn pipeline_expr_refs_name_typed(expr: Expr, src: i64, ns: i64, nl: i64) -> bool
   }
 }
 
+-- Whether ANY final path of the expr can return the binding. Scope
+-- release is skipped when this reports 1 — a borrowed merge that
+-- aliases the binding must not be freed under the consumer (leak on
+-- the other arms is the accepted trade; the mixed borrowed/owned case
+-- is handled by per-arm retains, but an all-borrowed merge carries no
+-- count of its own).
 fn pipeline_expr_final_returns_binding_typed(expr: Expr, src: i64, ns: i64, nl: i64) -> i64 {
   match expr {
     Ident(ens, enl) -> pipeline_name_matches(src, ns, nl, ens, enl)
@@ -12784,12 +13110,25 @@ fn pipeline_expr_final_returns_binding_typed(expr: Expr, src: i64, ns: i64, nl: 
     }
     LetTyped(inner, ann_type) -> pipeline_expr_final_returns_binding_typed(inner, src, ns, nl)
     If(cond, then_expr, else_expr) -> {
-      if pipeline_expr_final_returns_binding_typed(then_expr, src, ns, nl) == 1 {
-        pipeline_expr_final_returns_binding_typed(else_expr, src, ns, nl)
-      } else { 0 }
+      if pipeline_expr_final_returns_binding_typed(then_expr, src, ns, nl) == 1 { 1 }
+      else { pipeline_expr_final_returns_binding_typed(else_expr, src, ns, nl) }
     }
+    Match(scrutinee, arms) -> pipeline_match_arms_final_return_binding_typed(arms, src, ns, nl)
     Defer(cleanup, body) -> pipeline_expr_final_returns_binding_typed(body, src, ns, nl)
     _ -> 0
+  }
+}
+
+fn pipeline_match_arms_final_return_binding_typed(arms: MatchArmList, src: i64, ns: i64, nl: i64) -> i64 {
+  match arms {
+    MatchArmListNil -> 0
+    MatchArmListCons(arm, rest) -> {
+      let found = match arm {
+        Arm(pattern, body, guard, has_guard) -> pipeline_expr_final_returns_binding_typed(body, src, ns, nl)
+        UnknownArm(tag) -> 0
+      }
+      if found == 1 { 1 } else { pipeline_match_arms_final_return_binding_typed(rest, src, ns, nl) }
+    }
   }
 }
 
@@ -13340,7 +13679,7 @@ fn pipeline_lower_generic_call_expr_typed_sidecar_handler_opt(type_args: TypeExp
               pipeline_generic_call_inst_typed(dst, src, tt, ns, nl, concrete_type_args, pipeline_lowered_args_values(args)),
               ir_inst_list_empty()
             )
-            let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_args_values(args), 0, dst + 1, borrowed_mask, 0)
+            let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_args_values(args), 0, dst + 1, borrowed_mask, 0, expected_params, variant_payloads, expected_subst)
             let insts = ir_inst_list_append(pipeline_lowered_args_insts(args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup)))
             ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), insts)
           } else {
@@ -13373,7 +13712,7 @@ fn pipeline_lower_method_call_expr_typed_sidecar_handler_opt(recv_expr: Expr, me
         ir_inst_method_call_i64(dst, type_hash, method_hash, ir_lowered_expr_value(receiver), pipeline_lowered_args_values(args)),
         ir_inst_list_empty()
       )
-      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_args_values(args), 0, dst + 1, borrowed_mask, 1)
+      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_args_values(args), 0, dst + 1, borrowed_mask, 1, method_params, 0, subst)
       let insts = ir_inst_list_append(ir_lowered_expr_insts(receiver), ir_inst_list_append(pipeline_lowered_args_insts(args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup))))
       ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), insts)
     } else {
@@ -14324,7 +14663,7 @@ fn pipeline_lower_inferred_generic_call_node_typed_sidecar_handler_opt(ns: i64, 
             pipeline_generic_call_inst(dst, src, tt, ns, nl, concrete_type_args, pipeline_lowered_args_values(lowered_args)),
             ir_inst_list_empty()
           )
-          let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 0)
+          let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 0, expected_params, 0, expected_subst)
           ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup))))
         } else {
           ir_lowered_expr_invalid(next_value)
@@ -14389,7 +14728,7 @@ fn pipeline_lower_call_node_typed_sidecar_handler_opt(ns: i64, nl: i64, args: i6
         pipeline_call_inst_resolved(dst, direct, indirect_callee, src, tt, ns, nl, pipeline_lowered_args_values(lowered_args)),
         ir_inst_list_empty()
       )
-      let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 0)
+      let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 0, expected_params, expected_types, subst)
       let insts = ir_inst_list_append(callee_insts, ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup))))
       ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), insts)
     } else {
@@ -14437,7 +14776,7 @@ fn pipeline_lower_generic_call_node_typed_sidecar_handler_opt(type_args: i64, in
           pipeline_generic_call_inst(dst, src, tt, ns, nl, concrete_type_args, pipeline_lowered_args_values(lowered_args)),
           ir_inst_list_empty()
         )
-        let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 0)
+        let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 0, expected_params, 0, expected_subst)
         ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup))))
       } else {
         ir_lowered_expr_invalid(next_value)
@@ -14464,7 +14803,7 @@ fn pipeline_lower_method_call_node_typed_sidecar_handler_opt(recv_node: i64, met
         ir_inst_method_call_i64(dst, type_hash, method_hash, ir_lowered_expr_value(receiver), pipeline_lowered_args_values(lowered_args)),
         ir_inst_list_empty()
       )
-      let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 1)
+      let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 1, method_params, 0, subst)
       ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(ir_lowered_expr_insts(receiver), ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup)))))
     } else {
       ir_lowered_expr_invalid(next_value)
@@ -20017,14 +20356,18 @@ fn pipeline_ir_native_emit_variant_payloads(code: i64, base_reg: i64, args: IrVa
   }
 }
 
-fn pipeline_ir_native_emit_variant_init(code: i64, dst: i64, tag_hash: i64, args: IrValueList, pinned: i64) -> i64 {
+-- Ordinary variant nodes are default-managed (2q slice 2): construction
+-- allocates a headered rc payload so release at end-of-lifetime actually
+-- reclaims. Payload value loads happen after the BL — value homes are
+-- call-surviving and forwarding entries invalidate on buffer growth.
+fn pipeline_ir_native_emit_variant_init(code: i64, dst: i64, tag_hash: i64, args: IrValueList, fm: i64, pinned: i64) -> i64 {
   let nargs = ir_value_list_len(args)
   let alloc_size = 8 + nargs * 8
   let min_size = if alloc_size < 16 { 16 } else { alloc_size }
-  cg_bump_alloc_imm(code, 17, min_size)
+  cg_emit_rc_default_alloc_lit(code, fm, continuation_cleanup_kind_rc(), min_size, 8)
+  bu32(code, encode_add_imm(14, 0, 0))
   emit_mov_imm_safe(code, 16, tag_hash)
-  bu32(code, cg_str(16, 17, 0))
-  bu32(code, encode_add_imm(14, 17, 0))
+  bu32(code, cg_str(16, 14, 0))
   pipeline_ir_native_emit_variant_payloads(code, 14, args, 0, pinned)
   pipeline_ir_native_store_reg_pinned(code, pinned, dst, 14)
 }
@@ -20111,11 +20454,12 @@ fn pipeline_ir_native_emit_record_fields(code: i64, base_reg: i64, fields: IrRec
   }
 }
 
+-- Record nodes are default-managed like variants (2q slice 2).
 fn pipeline_ir_native_emit_record_init(code: i64, dst: i64, type_hash: i64, fields: IrRecordFieldList, fm: i64, pinned: i64) -> i64 {
   let size = ir_record_field_list_len(fields) * 8
   let alloc_size = if size < 8 { 8 } else { size }
-  cg_bump_alloc_imm(code, 17, alloc_size)
-  bu32(code, encode_add_imm(14, 17, 0))
+  cg_emit_rc_default_alloc_lit(code, fm, continuation_cleanup_kind_rc(), alloc_size, 8)
+  bu32(code, encode_add_imm(14, 0, 0))
   pipeline_ir_native_emit_record_fields(code, 14, fields, type_hash, 0, fmap_get_tt(fm), pinned)
   pipeline_ir_native_store_reg_pinned(code, pinned, dst, 14)
 }
@@ -20467,7 +20811,7 @@ fn pipeline_ir_native_emit_inst(inst: IrInst, code: i64, src: i64, fm: i64, ctx:
       ctx
     }
     IrVariantInitI64(dst, tag_hash, args) -> {
-      pipeline_ir_native_emit_variant_init(code, dst, tag_hash, args, pinned)
+      pipeline_ir_native_emit_variant_init(code, dst, tag_hash, args, fm, pinned)
       ctx
     }
     IrVariantTagI64(dst, value) -> {
@@ -20579,6 +20923,10 @@ fn pipeline_ir_native_inst_preserves_fp_env(inst: IrInst) -> i64 {
     IrHandlerPopI64(frame) -> 0
     IrLambdaI64(dst, params, body, nparams, captures) -> 0
     IrTryI64(dst, value) -> 0
+    -- Variant/record construction emits a BL to rc_default_alloc
+    -- (2q slice 2): the cached FP env does not survive the call.
+    IrVariantInitI64(dst, tag_hash, args) -> 0
+    IrRecordInitI64(dst, type_hash, fields) -> 0
     _ -> 1
   }
 }
@@ -21531,6 +21879,10 @@ fn pipeline_ir_native_inst_clobbers_pinned(inst: IrInst) -> i64 {
     IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> 1
     IrPerformI64(dst, effect_hash, op_hash, args) -> 1
     IrDeferredHandleI64(dst, handle_src, body_expr, clauses, nclauses, captures, scratch_base) -> 1
+    -- Variant/record construction emits a BL to rc_default_alloc
+    -- (2q slice 2): call-clobbered like any helper call.
+    IrVariantInitI64(dst, tag_hash, args) -> 1
+    IrRecordInitI64(dst, type_hash, fields) -> 1
     _ -> 0
   }
 }
@@ -28167,6 +28519,9 @@ fn pipeline_ir_flood_slot_row_upper_facts(blocks: IrBlockList, cfg: i64, facts: 
   }
 }
 
+
+
+
 fn pipeline_ir_block_entry_facts_from_blocks_with_pure(blocks: IrBlockList, pure_callees: i64) -> PipelineIrBlockEntryFactList {
   let pred_counts = pipeline_ir_cfg_fact_bundle_with_pure(blocks, pure_callees)
   let seed = pipeline_ir_block_entry_facts_from_blocks_inner(blocks, blocks, pred_counts, pipeline_ir_block_entry_facts_empty())
@@ -32302,6 +32657,7 @@ fn pipeline_ir_merge_jump_chains(blocks: IrBlockList) -> IrBlockList {
   cur
 }
 
+
 fn pipeline_ir_cfg_fold_once(blocks: IrBlockList, ctx: PipelineIrOptimiseContext, next_value: i64) -> PipelineOptimisedBlocks {
   let consts = pipeline_ir_const_env_from_block_list(blocks, pipeline_ir_const_env_empty())
   let block_facts = pipeline_ir_block_entry_facts_from_blocks_with_pure(blocks, pipeline_ir_optimise_context_pure_callees(ctx))
@@ -32806,6 +33162,10 @@ fn pipeline_ir_intervals_inst_is_call(inst: IrInst) -> bool {
     IrHandleI64(dst, src, body, clauses, nclauses, captures) -> true
     IrDeferredHandleI64(dst, src, body, clauses, nclauses, captures, scratch_base) -> true
     IrResumeI64(dst, value) -> true
+    -- Variant/record construction emits a BL to rc_default_alloc
+    -- (2q slice 2): a call barrier for volatile residency.
+    IrVariantInitI64(dst, tag_hash, args) -> true
+    IrRecordInitI64(dst, type_hash, fields) -> true
     _ -> false
   }
 }
@@ -32853,13 +33213,24 @@ fn pipeline_ir_intervals_compute(blocks: IrBlockList, param_count: i64, next_val
                 IrInstNil -> { i_done = 1 }
                 IrInstCons(inst, i_rest) -> {
                   position = position + 1
+                  -- Variant/record init reads its payload args AFTER the
+                  -- rc_default_alloc BL (unlike real calls, which stage
+                  -- args before the branch), so an interval ending exactly
+                  -- at the barrier would read a clobbered register. Bump
+                  -- those uses one position so crosses_call sees them
+                  -- spanning the barrier (2q slice 2).
+                  let use_position = match inst {
+                    IrVariantInitI64(vdst, vtag_hash, vargs) -> position + 1
+                    IrRecordInitI64(rdst, rtype_hash, rfields) -> position + 1
+                    _ -> position
+                  }
                   let mut uses = pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty())
                   let mut u_done = 0
                   while u_done == 0 {
                     match uses {
                       PipelineIrLiveSetNil -> { u_done = 1 }
                       PipelineIrLiveSetCons(u, u_rest) -> {
-                        pipeline_ir_intervals_touch(iv, u, position)
+                        pipeline_ir_intervals_touch(iv, u, use_position)
                         uses = u_rest
                       }
                       PipelineIrLiveSetBits(array, bwords, count) -> { u_done = 1 }
