@@ -3432,10 +3432,74 @@ fn pipeline_opt_chain_field_index(expr: i64, src: i64, tt: i64) -> i64 {
   if tt == 0 { 0 - 1 } else { pipeline_type_find_any_field_index(tt, src, node_f2(expr), node_f3(expr)) }
 }
 
+-- Match-on-rvalue scrutinee release (2q slice 2 stage B): an owned
+-- rvalue scrutinee (call/ctor result) is consumed by the match — its
+-- count must drop at the merge or every such match leaks a node.
+-- Releasing the root at the merge is shallow-safe for payload returns
+-- (children keep their own counts), and mixed merges retained borrowed
+-- arms per-arm, so the only unsafe alias is an ALL-BORROWED merge that
+-- can return the scrutinee itself through a binding-pattern arm — skip
+-- there (leak, not corruption).
+fn pipeline_match_arms_have_binding_pattern(arms: MatchArmList) -> i64 {
+  match arms {
+    MatchArmListNil -> 0
+    MatchArmListCons(arm, rest) -> {
+      let found = match arm {
+        Arm(pattern, body, guard, has_guard) -> {
+          match pattern {
+            Binding(ns, nl) -> 1
+            _ -> 0
+          }
+        }
+        UnknownArm(tag) -> 0
+      }
+      if found == 1 { 1 } else { pipeline_match_arms_have_binding_pattern(rest) }
+    }
+  }
+}
+
+fn pipeline_match_scrutinee_release_hash(scrutinee: Expr, arms: MatchArmList, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
+  if pipeline_expr_owned_rvalue_temp_typed(scrutinee) == 0 { 0 }
+  else {
+    let src = pipeline_lower_module_src(module)
+    let fns = pipeline_lower_module_fns(module)
+    let subst = pipeline_lower_module_subst(module)
+    if pipeline_match_arms_result_is_borrowed_with_ctx_typed(arms, src, fns, subst) == 1 and pipeline_match_arms_have_binding_pattern(arms) == 1 { 0 }
+    else {
+      let ty = pipeline_return_expr_type_node_typed(scrutinee, params, locals, module)
+      if ty == 0 { 0 } else { pipeline_managed_release_hash_for_ty(ty) }
+    }
+  }
+}
+
+-- Interposes a release block between the match arms and their merge
+-- target: takes the merged result as its param, releases the scrutinee
+-- temp, forwards the result. Mirrors pipeline_managed_arm_retain_append.
+fn pipeline_managed_scrutinee_release_append(arm_blocks: PipelineLoweredBlocks, release_hash: i64, release_block: i64, target_block: i64, scrutinee_value: i64) -> PipelineLoweredBlocks {
+  if release_hash == 0 or pipeline_lowered_blocks_is_valid(arm_blocks) == 0 or pipeline_lowered_blocks_falls_through(arm_blocks) == 0 {
+    arm_blocks
+  } else {
+    let carried = pipeline_lowered_blocks_next_value(arm_blocks)
+    let release_insts = ir_inst_list_prepend(
+      ir_inst_call_i64(carried + 1, release_hash, ir_value_list_prepend(scrutinee_value, ir_value_list_empty())),
+      ir_inst_list_empty()
+    )
+    let block = ir_block_new_params(release_block, ir_value_list_prepend(carried, ir_value_list_empty()), release_insts, ir_term_jump_args(target_block, ir_value_list_prepend(carried, ir_value_list_empty())))
+    pipeline_lowered_blocks_control(
+      pipeline_lowered_blocks_next_block(arm_blocks),
+      carried + 2,
+      ir_block_list_append(pipeline_lowered_blocks_blocks(arm_blocks), ir_block_list_prepend(block, ir_block_list_empty())),
+      1,
+      1
+    )
+  }
+}
+
 fn pipeline_lower_match_typed_core_to_target_blocks(scrutinee_typed: Expr, arms: MatchArmList, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
   let src = pipeline_lower_module_src(module)
   let tt = pipeline_lower_module_tt(module)
   let n_arms = match_arm_list_len(arms)
+  let scrutinee_release_hash = pipeline_match_scrutinee_release_hash(scrutinee_typed, arms, params, locals, module)
   if n_arms <= 0 {
     pipeline_lowered_blocks_invalid(start_block, next_value)
   } else {
@@ -3447,9 +3511,13 @@ fn pipeline_lower_match_typed_core_to_target_blocks(scrutinee_typed: Expr, arms:
           scrutinee_blocks
         } else {
           let scrutinee_value = pipeline_lowered_blocks_next_value(scrutinee_blocks)
-          let first_arm = pipeline_lower_internal_block_after_target(pipeline_lowered_blocks_next_block(scrutinee_blocks), target_block)
-          let ctx = PipelineMatchCtx(arms, n_arms, scrutinee_value, params, locals, module, target_block)
-          let arm_blocks = pipeline_lower_match_arm_to_blocks(ctx, 0, scrutinee_value + 1, first_arm, first_arm + 1)
+          let release_block = if scrutinee_release_hash != 0 { pipeline_lower_internal_block_after_target(pipeline_lowered_blocks_next_block(scrutinee_blocks), target_block) } else { 0 }
+          let arms_target = if scrutinee_release_hash != 0 { release_block } else { target_block }
+          let first_arm_seed = if scrutinee_release_hash != 0 { release_block + 1 } else { pipeline_lowered_blocks_next_block(scrutinee_blocks) }
+          let first_arm = pipeline_lower_internal_block_after_target(first_arm_seed, target_block)
+          let ctx = PipelineMatchCtx(arms, n_arms, scrutinee_value, params, locals, module, arms_target)
+          let arm_blocks_raw = pipeline_lower_match_arm_to_blocks(ctx, 0, scrutinee_value + 1, first_arm, first_arm + 1)
+          let arm_blocks = pipeline_managed_scrutinee_release_append(arm_blocks_raw, scrutinee_release_hash, release_block, target_block, scrutinee_value)
           if pipeline_lowered_blocks_is_valid(arm_blocks) == 1 {
             let scrutinee_params = ir_value_list_prepend(scrutinee_value, ir_value_list_empty())
             let scrutinee_merge = ir_block_new_params(scrutinee_merge_block, scrutinee_params, ir_inst_list_empty(), ir_term_jump(first_arm))
@@ -3475,9 +3543,13 @@ fn pipeline_lower_match_typed_core_to_target_blocks(scrutinee_typed: Expr, arms:
       let lower_ctx = pipeline_handler_lower_ctx_from_module(params, locals, module)
       let scrutinee = pipeline_lower_expr_typed_sidecar_handler_ctx(scrutinee_typed, next_value, lower_ctx)
       if ir_lowered_expr_is_valid(scrutinee) == 1 {
-        let first_arm = pipeline_lower_internal_block_after_target(next_block, target_block)
-        let ctx = PipelineMatchCtx(arms, n_arms, ir_lowered_expr_value(scrutinee), params, locals, module, target_block)
-        let arm_blocks = pipeline_lower_match_arm_to_blocks(ctx, 0, ir_lowered_expr_next_value(scrutinee), first_arm, first_arm + 1)
+        let release_block = if scrutinee_release_hash != 0 { pipeline_lower_internal_block_after_target(next_block, target_block) } else { 0 }
+        let arms_target = if scrutinee_release_hash != 0 { release_block } else { target_block }
+        let first_arm_seed = if scrutinee_release_hash != 0 { release_block + 1 } else { next_block }
+        let first_arm = pipeline_lower_internal_block_after_target(first_arm_seed, target_block)
+        let ctx = PipelineMatchCtx(arms, n_arms, ir_lowered_expr_value(scrutinee), params, locals, module, arms_target)
+        let arm_blocks_raw = pipeline_lower_match_arm_to_blocks(ctx, 0, ir_lowered_expr_next_value(scrutinee), first_arm, first_arm + 1)
+        let arm_blocks = pipeline_managed_scrutinee_release_append(arm_blocks_raw, scrutinee_release_hash, release_block, target_block, ir_lowered_expr_value(scrutinee))
         if pipeline_lowered_blocks_is_valid(arm_blocks) == 1 {
           let entry = ir_block_new_term(start_block, ir_lowered_expr_insts(scrutinee), ir_term_jump(first_arm))
           let blocks = ir_block_list_prepend(entry, pipeline_lowered_blocks_blocks(arm_blocks))
@@ -6149,6 +6221,17 @@ fn pipeline_lower_expr_typed_to_target_blocks(expr: Expr, params: i64, locals: P
   pipeline_lower_expr_typed_to_target_blocks_reserved(expr, params, locals, module, next_value, start_block, next_block, target_block)
 }
 
+-- Discarded-result release (2q slice 2 stage B): a statement-position
+-- owned rvalue (call/ctor/record result whose value nobody binds) must
+-- drop its count at the discard point or every such statement leaks.
+fn pipeline_discard_release_hash(expr: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
+  if pipeline_expr_owned_rvalue_temp_typed(expr) == 0 { 0 }
+  else {
+    let ty = pipeline_return_expr_type_node_typed(expr, params, locals, module)
+    if ty == 0 { 0 } else { pipeline_managed_release_hash_for_ty(ty) }
+  }
+}
+
 fn pipeline_lower_expr_typed_to_control_target_blocks_reserved(expr: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
   let src = pipeline_lower_module_src(module)
   if pipeline_expr_needs_lowering_cfg_typed(expr, src) == 1 {
@@ -6160,13 +6243,18 @@ fn pipeline_lower_expr_typed_to_control_target_blocks_reserved(expr: Expr, param
         value_blocks
       } else {
         let discard_value = pipeline_lowered_blocks_next_value(value_blocks)
+        let discard_hash = pipeline_discard_release_hash(expr, params, locals, module)
+        let release_insts = if discard_hash != 0 {
+          ir_inst_list_prepend(ir_inst_call_i64(discard_value + 1, discard_hash, ir_value_list_prepend(discard_value, ir_value_list_empty())), ir_inst_list_empty())
+        } else { ir_inst_list_empty() }
+        let after_discard = if discard_hash != 0 { discard_value + 2 } else { discard_value + 1 }
         let discard_params = ir_value_list_prepend(discard_value, ir_value_list_empty())
-        let discard_merge = ir_block_new_params(discard_block, discard_params, ir_inst_list_empty(), ir_term_jump(target_block))
+        let discard_merge = ir_block_new_params(discard_block, discard_params, release_insts, ir_term_jump(target_block))
         let blocks = ir_block_list_append(
           pipeline_lowered_blocks_blocks(value_blocks),
           ir_block_list_prepend(discard_merge, ir_block_list_empty())
         )
-        pipeline_lowered_blocks_control(pipeline_lowered_blocks_next_block(value_blocks), discard_value + 1, blocks, 1, 1)
+        pipeline_lowered_blocks_control(pipeline_lowered_blocks_next_block(value_blocks), after_discard, blocks, 1, 1)
       }
     } else {
       pipeline_lowered_blocks_invalid(start_block, next_value)
@@ -6405,10 +6493,15 @@ fn pipeline_lower_block_typed_to_target_blocks(first_expr: Expr, rest_expr: Expr
       let lower_ctx = pipeline_handler_lower_ctx_from_module(params, locals, module)
       let first = pipeline_lower_expr_typed_sidecar_handler_ctx(first_expr, next_value, lower_ctx)
       if ir_lowered_expr_is_valid(first) == 1 {
+        let discard_hash = pipeline_discard_release_hash(first_expr, params, locals, module)
+        let release_insts = if discard_hash != 0 {
+          ir_inst_list_prepend(ir_inst_call_i64(ir_lowered_expr_next_value(first), discard_hash, ir_value_list_prepend(ir_lowered_expr_value(first), ir_value_list_empty())), ir_inst_list_empty())
+        } else { ir_inst_list_empty() }
+        let rest_next_value = if discard_hash != 0 { ir_lowered_expr_next_value(first) + 1 } else { ir_lowered_expr_next_value(first) }
         let rest_start = pipeline_lower_internal_block_after_target(next_block, target_block)
-        let rest_blocks = pipeline_lower_block_rest_typed_to_target_blocks(rest_expr, params, locals, module, ir_lowered_expr_next_value(first), rest_start, target_block)
+        let rest_blocks = pipeline_lower_block_rest_typed_to_target_blocks(rest_expr, params, locals, module, rest_next_value, rest_start, target_block)
         if pipeline_lowered_blocks_is_valid(rest_blocks) == 1 {
-          let entry = ir_block_new_term(start_block, ir_lowered_expr_insts(first), ir_term_jump(rest_start))
+          let entry = ir_block_new_term(start_block, ir_inst_list_append(ir_lowered_expr_insts(first), release_insts), ir_term_jump(rest_start))
           let blocks = ir_block_list_prepend(entry, pipeline_lowered_blocks_blocks(rest_blocks))
           pipeline_lowered_blocks_control(
             pipeline_lowered_blocks_next_block(rest_blocks),
@@ -6515,6 +6608,15 @@ fn pipeline_lower_straight_expr_to_control_target_blocks(expr: i64, params: i64,
   }
 }
 
+-- Node twin of the typed discard-release classifier.
+fn pipeline_discard_release_hash_node(expr: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
+  if pipeline_expr_node_owned_rvalue_temp_typed(expr) == 0 { 0 }
+  else {
+    let ty = pipeline_return_expr_type_node_from_node(expr, params, locals, module)
+    if ty == 0 { 0 } else { pipeline_managed_release_hash_for_ty(ty) }
+  }
+}
+
 fn pipeline_lower_expr_to_control_target_blocks_reserved(expr: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
   if pipeline_expr_needs_cfg(expr) == 1 {
     let discard_block = pipeline_lower_internal_block_after_target(next_block, target_block)
@@ -6525,13 +6627,18 @@ fn pipeline_lower_expr_to_control_target_blocks_reserved(expr: i64, params: i64,
         value_blocks
       } else {
         let discard_value = pipeline_lowered_blocks_next_value(value_blocks)
+        let discard_hash = pipeline_discard_release_hash_node(expr, params, locals, module)
+        let release_insts = if discard_hash != 0 {
+          ir_inst_list_prepend(ir_inst_call_i64(discard_value + 1, discard_hash, ir_value_list_prepend(discard_value, ir_value_list_empty())), ir_inst_list_empty())
+        } else { ir_inst_list_empty() }
+        let after_discard = if discard_hash != 0 { discard_value + 2 } else { discard_value + 1 }
         let discard_params = ir_value_list_prepend(discard_value, ir_value_list_empty())
-        let discard_merge = ir_block_new_params(discard_block, discard_params, ir_inst_list_empty(), ir_term_jump(target_block))
+        let discard_merge = ir_block_new_params(discard_block, discard_params, release_insts, ir_term_jump(target_block))
         let blocks = ir_block_list_append(
           pipeline_lowered_blocks_blocks(value_blocks),
           ir_block_list_prepend(discard_merge, ir_block_list_empty())
         )
-        pipeline_lowered_blocks_control(pipeline_lowered_blocks_next_block(value_blocks), discard_value + 1, blocks, 1, 1)
+        pipeline_lowered_blocks_control(pipeline_lowered_blocks_next_block(value_blocks), after_discard, blocks, 1, 1)
       }
     } else {
       pipeline_lowered_blocks_invalid(start_block, next_value)
@@ -7608,14 +7715,20 @@ fn pipeline_lower_loop_body_to_target_blocks(expr: i64, ctx: PipelineLoopCtx, ne
         let lower_ctx = pipeline_handler_lower_ctx_from_module(params, locals, module)
         let value = pipeline_lower_expr_node_typed_sidecar_handler_ctx(expr, next_value, lower_ctx)
         if ir_lowered_expr_is_valid(value) == 1 {
-          let term = if pipeline_loop_ctx_normal_value_mode(ctx) == 1 {
+          let value_mode = pipeline_loop_ctx_normal_value_mode(ctx)
+          let discard_hash = if value_mode == 1 { 0 } else { pipeline_discard_release_hash_node(expr, params, locals, module) }
+          let discard_insts = if discard_hash != 0 {
+            ir_inst_list_prepend(ir_inst_call_i64(ir_lowered_expr_next_value(value), discard_hash, ir_value_list_prepend(ir_lowered_expr_value(value), ir_value_list_empty())), ir_inst_list_empty())
+          } else { ir_inst_list_empty() }
+          let after_discard = if discard_hash != 0 { ir_lowered_expr_next_value(value) + 1 } else { ir_lowered_expr_next_value(value) }
+          let term = if value_mode == 1 {
             ir_term_jump_args(normal_block, ir_value_list_prepend(ir_lowered_expr_value(value), ir_value_list_empty()))
           } else {
             ir_term_jump(normal_block)
           }
-          let block = ir_block_new_term(start_block, ir_lowered_expr_insts(value), term)
+          let block = ir_block_new_term(start_block, ir_inst_list_append(ir_lowered_expr_insts(value), discard_insts), term)
           let blocks = ir_block_list_prepend(block, ir_block_list_empty())
-          pipeline_lowered_loop_blocks(next_block, ir_lowered_expr_next_value(value), blocks, 1, 0, 1)
+          pipeline_lowered_loop_blocks(next_block, after_discard, blocks, 1, 0, 1)
         } else {
           pipeline_lowered_loop_blocks_invalid(start_block, next_value)
         }
@@ -12755,17 +12868,22 @@ fn pipeline_lower_block_expr_typed_sidecar_handler_opt(first_expr: Expr, rest_ex
   let subst = pipeline_handler_lower_ctx_subst(lower_ctx)
   let first = pipeline_lower_expr_typed_sidecar_handler_ctx(first_expr, next_value, lower_ctx)
   if ir_lowered_expr_is_valid(first) == 1 {
+    let discard_hash = pipeline_discard_release_hash(first_expr, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
+    let discard_insts = if discard_hash != 0 {
+      ir_inst_list_prepend(ir_inst_call_i64(ir_lowered_expr_next_value(first), discard_hash, ir_value_list_prepend(ir_lowered_expr_value(first), ir_value_list_empty())), ir_inst_list_empty())
+    } else { ir_inst_list_empty() }
+    let after_discard = if discard_hash != 0 { ir_lowered_expr_next_value(first) + 1 } else { ir_lowered_expr_next_value(first) }
     match rest_expr {
       UnknownExpr(tag) -> {
         if tag == 0 {
           first
         } else {
-          let rest = pipeline_lower_expr_typed_sidecar_handler_ctx(rest_expr, ir_lowered_expr_next_value(first), lower_ctx)
+          let rest = pipeline_lower_expr_typed_sidecar_handler_ctx(rest_expr, after_discard, lower_ctx)
           if ir_lowered_expr_is_valid(rest) == 1 {
             ir_lowered_expr(
               ir_lowered_expr_value(rest),
               ir_lowered_expr_next_value(rest),
-              ir_inst_list_append(ir_lowered_expr_insts(first), ir_lowered_expr_insts(rest))
+              ir_inst_list_append(ir_lowered_expr_insts(first), ir_inst_list_append(discard_insts, ir_lowered_expr_insts(rest)))
             )
           } else {
             ir_lowered_expr_invalid(next_value)
@@ -12773,12 +12891,12 @@ fn pipeline_lower_block_expr_typed_sidecar_handler_opt(first_expr: Expr, rest_ex
         }
       }
       _ -> {
-        let rest = pipeline_lower_expr_typed_sidecar_handler_ctx(rest_expr, ir_lowered_expr_next_value(first), lower_ctx)
+        let rest = pipeline_lower_expr_typed_sidecar_handler_ctx(rest_expr, after_discard, lower_ctx)
         if ir_lowered_expr_is_valid(rest) == 1 {
           ir_lowered_expr(
             ir_lowered_expr_value(rest),
             ir_lowered_expr_next_value(rest),
-            ir_inst_list_append(ir_lowered_expr_insts(first), ir_lowered_expr_insts(rest))
+            ir_inst_list_append(ir_lowered_expr_insts(first), ir_inst_list_append(discard_insts, ir_lowered_expr_insts(rest)))
           )
         } else {
           ir_lowered_expr_invalid(next_value)
