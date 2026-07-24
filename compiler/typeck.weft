@@ -4265,35 +4265,99 @@ fn check_strict_root_unsafe_raw_fns(fns: i64, user_src: i64, tt: i64) -[Diagnose
 -- order. field selects the per-variant payload count (offset 24) or the
 -- per-type tparams (entry offset 40); mode 0 returns the variant field,
 -- mode 1 the entry field.
-fn ttable_variant_scan(tt: i64, src: i64, ns: i64, nl: i64, same_src_only: i64, mode: i64, missing: i64) -> i64 {
+-- Variant lookup goes through a name-hash index (open-addressed,
+-- 32-byte entries [name_hash, ti, vi, entry_src]) built lazily and
+-- rebuilt whenever the type-entry count changes. Probe order matches
+-- the old linear scan's first-match order for equal names: entries
+-- insert in table order and lookups walk the same chain. The
+-- local-shadows-imported preference stays in the callers' two-pass
+-- (same_src_only) structure.
+fn ttable_variant_index_build(tt: i64) -> i64 {
   let n = mem_load64_at(tt, 8)
   let d = mem_load64_at(tt, 0)
-  let mut result = missing
+  let mut total = 0
   let mut ti = 0
   while ti < n {
-    let kind = mem_load64_at(d, ti * 64 + 16)
-    if kind == 1 {
+    if mem_load64_at(d, ti * 64 + 16) == 1 { total = total + mem_load64_at(d, ti * 64 + 24) } else { 0 }
+    ti = ti + 1
+  }
+  let mut slots = 512
+  while slots < total * 4 { slots = slots * 2 }
+  let idx = cg_alloc_bytes(16 + slots * 32)
+  mem_store64_at(idx, 0, slots)
+  mem_store64_at(idx + 8, 0, n)
+  ti = 0
+  while ti < n {
+    if mem_load64_at(d, ti * 64 + 16) == 1 {
       let entry_src = mem_load64_at(d, ti * 64 + 48)
-      if same_src_only == 1 and entry_src != src { 0 }
-      else {
-        let nvariants = mem_load64_at(d, ti * 64 + 24)
-        let variants = mem_load64_at(d, ti * 64 + 32)
-        let mut vi = 0
-        while vi < nvariants {
-          let v_ns = mem_load64_at(variants, vi * 40)
-          let v_nl = mem_load64_at(variants, vi * 40 + 8)
-          if v_nl == nl {
-            if src_eq_at(src, ns, entry_src + v_ns, 0, nl) == 1 {
-              result = if mode == 0 { mem_load64_at(variants, vi * 40 + 24) }
-                else { mem_load64_at(d, ti * 64 + 40) }
-              vi = nvariants
-              ti = n
-            } else { vi = vi + 1 }
-          } else { vi = vi + 1 }
-        }
+      let nvariants = mem_load64_at(d, ti * 64 + 24)
+      let variants = mem_load64_at(d, ti * 64 + 32)
+      let mut vi = 0
+      while vi < nvariants {
+        let v_ns = mem_load64_at(variants, vi * 40)
+        let v_nl = mem_load64_at(variants, vi * 40 + 8)
+        let h = str_hash(entry_src, v_ns, v_nl)
+        let mut slot = h band (slots - 1)
+        while mem_load64_at(idx + 16 + slot * 32, 0) != 0 { slot = (slot + 1) band (slots - 1) }
+        mem_store64_at(idx + 16 + slot * 32, 0, h)
+        mem_store64_at(idx + 16 + slot * 32 + 8, 0, ti)
+        mem_store64_at(idx + 16 + slot * 32 + 16, 0, vi)
+        mem_store64_at(idx + 16 + slot * 32 + 24, 0, entry_src)
+        vi = vi + 1
       }
     } else { 0 }
     ti = ti + 1
+  }
+  idx
+}
+
+fn ttable_variant_index(tt: i64) -> i64 {
+  let idx = mem_load64_at(tt + 80, 0)
+  if idx != 0 and mem_load64_at(idx + 8, 0) == mem_load64_at(tt, 8) { idx }
+  else {
+    let fresh = ttable_variant_index_build(tt)
+    mem_store64_at(tt + 80, 0, fresh)
+    fresh
+  }
+}
+
+fn ttable_variant_scan(tt: i64, src: i64, ns: i64, nl: i64, same_src_only: i64, mode: i64, missing: i64) -> i64 {
+  let idx = ttable_variant_index(tt)
+  let slots = mem_load64_at(idx, 0)
+  let d = mem_load64_at(tt, 0)
+  let h = str_hash(src, ns, nl)
+  let mut slot = h band (slots - 1)
+  let mut probes = 0
+  let mut result = missing
+  let mut done = 0
+  while done == 0 and probes < slots {
+    let key = mem_load64_at(idx + 16 + slot * 32, 0)
+    if key == 0 { done = 1 }
+    else {
+      if key == h {
+        let entry_src = mem_load64_at(idx + 16 + slot * 32 + 24, 0)
+        if same_src_only == 0 or entry_src == src {
+          let ti = mem_load64_at(idx + 16 + slot * 32 + 8, 0)
+          let vi = mem_load64_at(idx + 16 + slot * 32 + 16, 0)
+          let variants = mem_load64_at(d, ti * 64 + 32)
+          let v_ns = mem_load64_at(variants, vi * 40)
+          let v_nl = mem_load64_at(variants, vi * 40 + 8)
+          if v_nl == nl and src_eq_at(src, ns, entry_src + v_ns, 0, nl) == 1 {
+            -- mode 0: payload count; 1: owner tparams; 2: variant
+            -- record address; 3: owner entry address.
+            result = if mode == 0 { mem_load64_at(variants, vi * 40 + 24) }
+              else { if mode == 1 { mem_load64_at(d, ti * 64 + 40) }
+              else { if mode == 2 { variants + vi * 40 }
+              else { d + ti * 64 } } }
+            done = 1
+          } else { 0 }
+        } else { 0 }
+      } else { 0 }
+      if done == 0 {
+        slot = (slot + 1) band (slots - 1)
+        probes = probes + 1
+      } else { 0 }
+    }
   }
   result
 }
