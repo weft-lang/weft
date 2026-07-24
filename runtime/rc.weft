@@ -47,8 +47,19 @@ fn rc_count(payload: i64) -> i64 {
   __mem_load64(rc_header_from_payload(payload) + rc_count_offset())
 }
 
+-- The header's size word packs the deep-release field mask into its
+-- high 32 bits (2 bits per payload word: 0 none, 1 rc, 2 closure,
+-- 3 weak; first 16 words). Sizes stay in the low 32 — every reader
+-- must go through rc_size_word_size.
+fn rc_size_word_size(word: i64) -> i64 { word band 4294967295 }
+fn rc_size_word_mask(word: i64) -> i64 { (word bshr 32) band 4294967295 }
+
 fn rc_payload_size(payload: i64) -> i64 {
-  __mem_load64(rc_header_from_payload(payload) + rc_payload_size_offset())
+  rc_size_word_size(__mem_load64(rc_header_from_payload(payload) + rc_payload_size_offset()))
+}
+
+fn rc_field_mask(payload: i64) -> i64 {
+  rc_size_word_mask(__mem_load64(rc_header_from_payload(payload) + rc_payload_size_offset()))
 }
 
 fn rc_weak_count(payload: i64) -> i64 {
@@ -90,7 +101,7 @@ fn rc_block_size(payload: i64) -> i64 {
 }
 
 fn rc_header_block_size(header: i64) -> i64 {
-  rc_header_size() + __mem_load64(header + rc_payload_size_offset())
+  rc_header_size() + rc_size_word_size(__mem_load64(header + rc_payload_size_offset()))
 }
 
 fn rc_free_if_unreferenced(heap: i64, header: i64) -> i64 {
@@ -109,7 +120,7 @@ fn rc_finalize_zero_count_payload(heap: i64, payload: i64) -> i64 {
   if weak <= 0 {
     rc_free_if_unreferenced(heap, header)
   } else {
-    mem_zero(payload, __mem_load64(header + rc_payload_size_offset()))
+    mem_zero(payload, rc_size_word_size(__mem_load64(header + rc_payload_size_offset())))
     0
   }
 }
@@ -161,7 +172,7 @@ fn rc_release(heap: i64, payload: i64) -> i64 {
       if weak <= 0 {
         rc_free_if_unreferenced(heap, header)
       } else {
-        mem_zero(payload, __mem_load64(header + rc_payload_size_offset()))
+        mem_zero(payload, rc_size_word_size(__mem_load64(header + rc_payload_size_offset())))
         0
       }
     } else {
@@ -352,6 +363,78 @@ fn rc_default_retain(payload: i64) -> i64 {
   } }
 }
 
+-- Deep release (2q slice 2 stage B): a dying node drops one count on
+-- each managed payload field per its header mask. The cascade is a
+-- WORKLIST, not recursion — list spines are millions deep. Dying
+-- nodes (count already 0, not yet freed) link the pending list
+-- through their header's promoted word: it is 0 on the non-promoted
+-- path, nobody mutates a zero-count zombie, and any stale release in
+-- the window no-ops on count <= 0. Kernel §10 rejects mutable strong
+-- cycles, so the walk terminates. Closure/weak fields and promoted
+-- children release recursively (bounded shapes).
+fn rc_deep_pending_push(pending: i64, payload: i64) -> i64 {
+  __mem_store64(rc_header_from_payload(payload) + rc_promoted_offset(), pending)
+  payload
+}
+
+fn rc_deep_pending_next(payload: i64) -> i64 {
+  __mem_load64(rc_header_from_payload(payload) + rc_promoted_offset())
+}
+
+fn rc_deep_release_child(child: i64, pending: i64) -> i64 {
+  if rc_default_payload_has_magic(child) != 1 { pending }
+  else {
+    rc_atomic_lock(child)
+    let promoted = rc_is_promoted_raw(child)
+    rc_atomic_unlock(child)
+    if promoted != 0 {
+      rc_default_release_promoted(child)
+      pending
+    } else {
+      let header = rc_header_from_payload(child)
+      let count = __mem_load64(header + rc_count_offset())
+      if count <= 0 { pending }
+      else { if count == 1 {
+        __mem_store64(header + rc_count_offset(), 0)
+        rc_deep_pending_push(pending, child)
+      } else {
+        __mem_store64(header + rc_count_offset(), count - 1)
+        pending
+      } }
+    }
+  }
+}
+
+fn rc_deep_release_walk(first: i64) -> i64 {
+  let mut pending = first
+  while pending != 0 {
+    let node = pending
+    pending = rc_deep_pending_next(node)
+    let header = rc_header_from_payload(node)
+    __mem_store64(header + rc_promoted_offset(), 0)
+    let word = __mem_load64(header + rc_payload_size_offset())
+    let mask = rc_size_word_mask(word)
+    if mask != 0 {
+      let words = rc_size_word_size(word) / 8
+      let limit = if words < 16 { words } else { 16 }
+      let mut i = 0
+      while i < limit {
+        let kind = (mask bshr (i * 2)) band 3
+        if kind == 1 {
+          pending = rc_deep_release_child(__mem_load64(node + i * 8), pending)
+        } else { if kind == 2 {
+          closure_default_release(__mem_load64(node + i * 8))
+        } else { if kind == 3 {
+          rc_default_weak_release(__mem_load64(node + i * 8))
+        } else { 0 } } }
+        i = i + 1
+      }
+    } else { 0 }
+    rc_finalize_zero_count_payload(rc_default_heap(), node)
+  }
+  0
+}
+
 fn rc_default_release_promoted(payload: i64) -> i64 {
   if payload == 0 { 0 - 1 }
   else {
@@ -363,12 +446,18 @@ fn rc_default_release_promoted(payload: i64) -> i64 {
       0 - 1
     } else { if count == 1 {
       __mem_store64(header + rc_count_offset(), 0)
+      -- Fields drop while the node still holds its lock: the locked
+      -- count decision is what makes the walk race-free for promoted
+      -- nodes. Child locks are distinct nodes (no cycles), so the
+      -- nested releases cannot deadlock; non-promoted subtrees cascade
+      -- iteratively inside rc_default_release.
+      rc_deep_release_promoted_fields(payload)
       let weak = __mem_load64(header + rc_weak_count_offset())
       if weak <= 0 {
         rc_atomic_unlock(payload)
         rc_free_if_unreferenced(rc_default_heap(), header)
       } else {
-        mem_zero(payload, __mem_load64(header + rc_payload_size_offset()))
+        mem_zero(payload, rc_size_word_size(__mem_load64(header + rc_payload_size_offset())))
         rc_atomic_unlock(payload)
         0
       }
@@ -381,16 +470,72 @@ fn rc_default_release_promoted(payload: i64) -> i64 {
   }
 }
 
+-- Promoted nodes walk their fields under the caller's lock; only
+-- closure/weak/promoted children recurse — plain rc children cascade
+-- through the worklist by re-entering rc_default_release.
+fn rc_deep_release_promoted_fields(payload: i64) -> i64 {
+  let header = rc_header_from_payload(payload)
+  let word = __mem_load64(header + rc_payload_size_offset())
+  let mask = rc_size_word_mask(word)
+  if mask == 0 { 0 }
+  else {
+    let words = rc_size_word_size(word) / 8
+    let limit = if words < 16 { words } else { 16 }
+    let mut i = 0
+    while i < limit {
+      let kind = (mask bshr (i * 2)) band 3
+      if kind == 1 {
+        rc_default_release(__mem_load64(payload + i * 8))
+      } else { if kind == 2 {
+        closure_default_release(__mem_load64(payload + i * 8))
+      } else { if kind == 3 {
+        rc_default_weak_release(__mem_load64(payload + i * 8))
+      } else { 0 } } }
+      i = i + 1
+    }
+    0
+  }
+}
+
 fn rc_default_release(payload: i64) -> i64 {
-  if payload == 0 { 0 - 1 }
-  else { if rc_default_payload_has_magic(payload) != 1 { 0 - 1 }
+  if rc_default_payload_has_magic(payload) != 1 { 0 - 1 }
   else {
     rc_atomic_lock(payload)
     let promoted = rc_is_promoted_raw(payload)
     rc_atomic_unlock(payload)
     if promoted != 0 { rc_default_release_promoted(payload) }
-    else { rc_release(rc_default_heap(), payload) }
-  } }
+    else {
+      let header = rc_header_from_payload(payload)
+      let count = __mem_load64(header + rc_count_offset())
+      if count <= 0 { 0 - 1 }
+      else { if count == 1 {
+        __mem_store64(header + rc_count_offset(), 0)
+        __mem_store64(header + rc_promoted_offset(), 0)
+        rc_deep_release_walk(payload)
+        0
+      } else {
+        __mem_store64(header + rc_count_offset(), count - 1)
+        count - 1
+      } }
+    }
+  }
+}
+
+fn rc_set_field_mask_word(payload: i64, payload_size: i64, mask: i64) -> i64 {
+  if payload == 0 { 0 }
+  else {
+    __mem_store64(rc_header_from_payload(payload) + rc_payload_size_offset(), payload_size bor (mask bshl 32))
+    0
+  }
+}
+
+fn rc_default_alloc_masked(payload_size: i64, align: i64, mask: i64) -> i64 {
+  let payload = rc_default_alloc(payload_size, align)
+  if mask == 0 { payload }
+  else {
+    rc_set_field_mask_word(payload, payload_size, mask)
+    payload
+  }
 }
 
 fn rc_default_weak_retain(payload: i64) -> i64 {

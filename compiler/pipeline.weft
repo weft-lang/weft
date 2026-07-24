@@ -2474,12 +2474,33 @@ fn pipeline_return_expr_type_node_from_node(expr: i64, params: i64, locals: Pipe
   if stripped == 0 { 0 } else { pipeline_return_expr_type_node_typed(expr_from_node(stripped), params, locals, module) }
 }
 
+-- Binding-init type inference: like the return-expr inference plus a
+-- payload-less-ctor fallback (let mut t = DNil is Ident-shaped). The
+-- fallback is scoped to INIT positions on purpose — resolving ctor
+-- Idents in general expression positions flips if-arm mixedness and
+-- changes emission broadly.
+fn pipeline_init_type_node_typed(init_expr: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
+  let direct = pipeline_return_expr_type_node_typed(init_expr, params, locals, module)
+  if direct != 0 { direct }
+  else {
+    match init_expr {
+      Ident(ns, nl) -> pipeline_variant_parent_type_node(pipeline_lower_module_tt(module), pipeline_lower_module_src(module), ns, nl)
+      _ -> 0
+    }
+  }
+}
+
+fn pipeline_init_type_node_from_node(expr: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
+  let stripped = pipeline_expr_node_strip_typed(expr)
+  if stripped == 0 { 0 } else { pipeline_init_type_node_typed(expr_from_node(stripped), params, locals, module) }
+}
+
 fn pipeline_lower_return_transfer_typed(value_expr: Expr, value: i64, next_value: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> IrLoweredExpr {
   let src = pipeline_lower_module_src(module)
   let fns = pipeline_lower_module_fns(module)
   let subst = pipeline_lower_module_subst(module)
   let ty = pipeline_return_expr_type_node_typed(value_expr, params, locals, module)
-  let retain = if ty != 0 and ty_is_continuation(ty) == 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, fns, subst) == 1 {
+  let retain = if ty != 0 and ty_is_continuation(ty) == 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, fns, subst, pipeline_lower_module_tt(module)) == 1 {
     pipeline_managed_retain_inst_list(value, ty, next_value)
   } else {
     ir_inst_list_empty()
@@ -2499,7 +2520,7 @@ fn pipeline_lower_return_transfer_from_node(value_expr: i64, value: i64, next_va
   let fns = pipeline_lower_module_fns(module)
   let subst = pipeline_lower_module_subst(module)
   let ty = pipeline_return_expr_type_node_from_node(value_expr, params, locals, module)
-  let retain = if ty != 0 and ty_is_continuation(ty) == 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(value_expr, src, fns, subst) == 1 {
+  let retain = if ty != 0 and ty_is_continuation(ty) == 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(value_expr, src, fns, subst, pipeline_lower_module_tt(module)) == 1 {
     pipeline_managed_retain_inst_list(value, ty, next_value)
   } else {
     ir_inst_list_empty()
@@ -3133,6 +3154,19 @@ fn pipeline_variant_payload_count(tt: i64, src: i64, ns: i64, nl: i64) -> i64 {
   if tt == 0 { 0 - 1 } else { ttable_variant_payload_count(tt, src, ns, nl) }
 }
 
+-- Payload-less ctor Idents (DNil) are CONSTRUCTIONS, not borrows: under
+-- call-results-are-owned they allocate an owned node exactly like
+-- DNode(...). Syntactic Ident classification made every consumer
+-- borrow-retain them while nothing owned the base stake, leaking one
+-- node per construction. Variable Idents never name-match a ctor;
+-- payload-ful ctor Idents are static closure pairs and stay borrowed.
+fn pipeline_ident_is_payloadless_ctor(tt: i64, src: i64, ns: i64, nl: i64) -> i64 {
+  if tt == 0 { 0 }
+  else {
+    if pipeline_variant_payload_count(tt, src, ns, nl) == 0 and pipeline_variant_parent_type_node(tt, src, ns, nl) != 0 { 1 } else { 0 }
+  }
+}
+
 -- Parent Named type node for a variant constructor name (2q slice 2).
 -- The fns table misses ctor calls, but let/return ownership machinery
 -- needs the ctor result type to classify the binding as managed.
@@ -3458,13 +3492,43 @@ fn pipeline_match_arms_have_binding_pattern(arms: MatchArmList) -> i64 {
   }
 }
 
+-- Any arm whose result is a borrowed value that would reach the merge
+-- without its own count. Per-arm retains fire only when the whole
+-- match classifies owned AND the arm type resolves, so an arm is
+-- unprotected when it is borrowed and either its type is unresolvable
+-- or (the type is managed and the whole match classifies borrowed).
+-- Under deep release, freeing the scrutinee kills its payloads, so an
+-- unprotected borrowed return would dangle — the release must not
+-- fire (bounded leak instead).
+fn pipeline_match_arms_any_unprotected_borrow(arms: MatchArmList, whole_borrowed: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, src: i64, fns: i64, subst: i64) -> i64 {
+  match arms {
+    MatchArmListNil -> 0
+    MatchArmListCons(arm, rest) -> {
+      let unsafe_arm = match arm {
+        Arm(pattern, body, guard, has_guard) -> {
+          if pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, pipeline_lower_module_tt(module)) == 0 { 0 }
+          else {
+            let ty = pipeline_match_arm_result_type_node_typed(arm, params, locals, module)
+            if ty == 0 { 1 }
+            else { if pipeline_managed_release_hash_for_ty(ty) != 0 and whole_borrowed == 1 { 1 } else { 0 } }
+          }
+        }
+        UnknownArm(tag) -> 1
+      }
+      if unsafe_arm == 1 { 1 } else { pipeline_match_arms_any_unprotected_borrow(rest, whole_borrowed, params, locals, module, src, fns, subst) }
+    }
+  }
+}
+
 fn pipeline_match_scrutinee_release_hash(scrutinee: Expr, arms: MatchArmList, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
-  if pipeline_expr_owned_rvalue_temp_typed(scrutinee) == 0 { 0 }
+  if pipeline_expr_owned_rvalue_temp_typed(scrutinee, pipeline_lower_module_src(module), pipeline_lower_module_tt(module)) == 0 { 0 }
   else {
     let src = pipeline_lower_module_src(module)
     let fns = pipeline_lower_module_fns(module)
     let subst = pipeline_lower_module_subst(module)
-    if pipeline_match_arms_result_is_borrowed_with_ctx_typed(arms, src, fns, subst) == 1 and pipeline_match_arms_have_binding_pattern(arms) == 1 { 0 }
+    let whole_borrowed = pipeline_match_arms_result_is_borrowed_with_ctx_typed(arms, src, fns, subst, pipeline_lower_module_tt(module))
+    let blocked = pipeline_match_arms_any_unprotected_borrow(arms, whole_borrowed, params, locals, module, src, fns, subst)
+    if blocked == 1 { 0 }
     else {
       let ty = pipeline_return_expr_type_node_typed(scrutinee, params, locals, module)
       if ty == 0 { 0 } else { pipeline_managed_release_hash_for_ty(ty) }
@@ -3930,7 +3994,7 @@ fn pipeline_lower_call_arg_blocks_typed_with_borrow_mask(args: ExprList, nargs: 
         } else {
           let arg_value = pipeline_lowered_blocks_next_value(arg_blocks)
           let rest_start = pipeline_lowered_blocks_next_block(arg_blocks)
-          let retain = pipeline_managed_borrow_retain_arg_typed(arg, arg_value, retain_ty, arg_value + 1, src, pipeline_lower_module_fns(module), expected_subst)
+          let retain = pipeline_managed_borrow_retain_arg_typed(arg, arg_value, retain_ty, arg_value + 1, src, pipeline_lower_module_fns(module), expected_subst, pipeline_lower_module_tt(module))
           let next_values = ir_value_list_append(values, ir_value_list_prepend(arg_value, ir_value_list_empty()))
           let rest = pipeline_lower_call_arg_blocks_typed_with_borrow_mask(args, nargs, params, locals, module, call_block, expected_params, expected_types, expected_subst, expected_offset, borrowed_mask, index + 1, pipeline_lowered_args_next_value(retain), rest_start, next_values)
           if pipeline_lowered_call_blocks_is_valid(rest) == 1 {
@@ -3965,7 +4029,7 @@ fn pipeline_lower_call_arg_blocks_typed_with_borrow_mask(args: ExprList, nargs: 
       }
       if ir_lowered_expr_is_valid(lowered) == 1 {
         let rest_start = next_block + 1
-        let retain = pipeline_managed_borrow_retain_arg_typed(arg, ir_lowered_expr_value(lowered), retain_ty, ir_lowered_expr_next_value(lowered), src, pipeline_lower_module_fns(module), expected_subst)
+        let retain = pipeline_managed_borrow_retain_arg_typed(arg, ir_lowered_expr_value(lowered), retain_ty, ir_lowered_expr_next_value(lowered), src, pipeline_lower_module_fns(module), expected_subst, pipeline_lower_module_tt(module))
         let next_values = ir_value_list_append(values, ir_value_list_prepend(ir_lowered_expr_value(lowered), ir_value_list_empty()))
         let rest = pipeline_lower_call_arg_blocks_typed_with_borrow_mask(args, nargs, params, locals, module, call_block, expected_params, expected_types, expected_subst, expected_offset, borrowed_mask, index + 1, pipeline_lowered_args_next_value(retain), rest_start, next_values)
         if pipeline_lowered_call_blocks_is_valid(rest) == 1 {
@@ -4150,8 +4214,8 @@ fn pipeline_managed_retain_inst_list(value: i64, ty: i64, dst: i64) -> IrInstLis
   }
 }
 
-fn pipeline_managed_borrow_retain_arg_typed(expr: Expr, value: i64, expected_ty: i64, next_value: i64, src: i64, fns: i64, subst: i64) -> PipelineLoweredArgs {
-  let insts = if expected_ty != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(expr, src, fns, subst) == 1 {
+fn pipeline_managed_borrow_retain_arg_typed(expr: Expr, value: i64, expected_ty: i64, next_value: i64, src: i64, fns: i64, subst: i64, tt: i64) -> PipelineLoweredArgs {
+  let insts = if expected_ty != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(expr, src, fns, subst, tt) == 1 {
     pipeline_managed_retain_inst_list(value, expected_ty, next_value)
   } else {
     ir_inst_list_empty()
@@ -4160,58 +4224,14 @@ fn pipeline_managed_borrow_retain_arg_typed(expr: Expr, value: i64, expected_ty:
   pipeline_lowered_args(ir_value_list_empty(), next, insts, 1)
 }
 
-fn pipeline_managed_borrow_retain_arg_node(arg_node: i64, value: i64, expected_ty: i64, next_value: i64, src: i64, fns: i64, subst: i64) -> PipelineLoweredArgs {
-  let insts = if expected_ty != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(arg_node, src, fns, subst) == 1 {
+fn pipeline_managed_borrow_retain_arg_node(arg_node: i64, value: i64, expected_ty: i64, next_value: i64, src: i64, fns: i64, subst: i64, tt: i64) -> PipelineLoweredArgs {
+  let insts = if expected_ty != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(arg_node, src, fns, subst, tt) == 1 {
     pipeline_managed_retain_inst_list(value, expected_ty, next_value)
   } else {
     ir_inst_list_empty()
   }
   let next = if ir_inst_list_len(insts) > 0 { next_value + 1 } else { next_value }
   pipeline_lowered_args(ir_value_list_empty(), next, insts, 1)
-}
-
-fn pipeline_managed_borrow_release_args_typed(args: ExprList, values: IrValueList, index: i64, next_value: i64, expected_params: i64, expected_types: i64, expected_subst: i64, expected_offset: i64, src: i64, fns: i64, subst: i64) -> PipelineLoweredArgs {
-  match args {
-    ExprListNil -> pipeline_lowered_args(ir_value_list_empty(), next_value, ir_inst_list_empty(), 1)
-    ExprListCons(expr, rest_exprs) -> {
-      let expected_ty = pipeline_expected_arg_type_node(expected_params, expected_types, index, expected_offset, expected_subst)
-      let value = pipeline_ir_value_list_get_or(values, index, 0 - 1)
-      let release_insts = if expected_ty != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(expr, src, fns, subst) == 1 {
-        pipeline_managed_release_inst_list(value, expected_ty, next_value)
-      } else {
-        ir_inst_list_empty()
-      }
-      let next_after_release = if ir_inst_list_len(release_insts) > 0 { next_value + 1 } else { next_value }
-      let rest = pipeline_managed_borrow_release_args_typed(rest_exprs, values, index + 1, next_after_release, expected_params, expected_types, expected_subst, expected_offset, src, fns, subst)
-      if pipeline_lowered_args_is_valid(rest) == 1 {
-        pipeline_lowered_args(ir_value_list_empty(), pipeline_lowered_args_next_value(rest), ir_inst_list_append(release_insts, pipeline_lowered_args_insts(rest)), 1)
-      } else {
-        pipeline_lowered_args_invalid(next_value)
-      }
-    }
-  }
-}
-
-fn pipeline_managed_borrow_release_arg_nodes(args: i64, arg_count: i64, values: IrValueList, index: i64, next_value: i64, expected_params: i64, expected_types: i64, expected_subst: i64, expected_offset: i64, src: i64, fns: i64, subst: i64) -> PipelineLoweredArgs {
-  if index >= arg_count {
-    pipeline_lowered_args(ir_value_list_empty(), next_value, ir_inst_list_empty(), 1)
-  } else {
-    let expected_ty = pipeline_expected_arg_type_node(expected_params, expected_types, index, expected_offset, expected_subst)
-    let value = pipeline_ir_value_list_get_or(values, index, 0 - 1)
-    let arg_node = nlist_get(args, index)
-    let release_insts = if expected_ty != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(arg_node, src, fns, subst) == 1 {
-      pipeline_managed_release_inst_list(value, expected_ty, next_value)
-    } else {
-      ir_inst_list_empty()
-    }
-    let next_after_release = if ir_inst_list_len(release_insts) > 0 { next_value + 1 } else { next_value }
-    let rest = pipeline_managed_borrow_release_arg_nodes(args, arg_count, values, index + 1, next_after_release, expected_params, expected_types, expected_subst, expected_offset, src, fns, subst)
-    if pipeline_lowered_args_is_valid(rest) == 1 {
-      pipeline_lowered_args(ir_value_list_empty(), pipeline_lowered_args_next_value(rest), ir_inst_list_append(release_insts, pipeline_lowered_args_insts(rest)), 1)
-    } else {
-      pipeline_lowered_args_invalid(next_value)
-    }
-  }
 }
 
 fn pipeline_expr_owned_temp_drop_kind_typed(expr: Expr) -> i64 {
@@ -4228,26 +4248,27 @@ fn pipeline_expr_owned_temp_drop_kind_typed(expr: Expr) -> i64 {
 -- call/method/ctor/record arg carries a count the caller must release
 -- after the call when the callee only borrows the param. Idents, field
 -- loads, and other borrowed shapes stay with their owners.
-fn pipeline_expr_owned_rvalue_temp_typed(expr: Expr) -> i64 {
+fn pipeline_expr_owned_rvalue_temp_typed(expr: Expr, src: i64, tt: i64) -> i64 {
   match expr {
     Call(ns, nl, args) -> 1
     GenericCall(type_args, inner_call) -> {
       match inner_call {
         Call(ns, nl, args) -> 1
-        _ -> pipeline_expr_owned_rvalue_temp_typed(inner_call)
+        _ -> pipeline_expr_owned_rvalue_temp_typed(inner_call, src, tt)
       }
     }
     MethodCall(recv, method_hash, args, type_hash) -> 1
     RecordInit(type_ns, type_nl, fields) -> 1
-    LetTyped(inner, ann_type) -> pipeline_expr_owned_rvalue_temp_typed(inner)
-    Block(first, rest) -> pipeline_expr_owned_rvalue_temp_typed(rest)
+    Ident(ns, nl) -> pipeline_ident_is_payloadless_ctor(tt, src, ns, nl)
+    LetTyped(inner, ann_type) -> pipeline_expr_owned_rvalue_temp_typed(inner, src, tt)
+    Block(first, rest) -> pipeline_expr_owned_rvalue_temp_typed(rest, src, tt)
     _ -> 0
   }
 }
 
-fn pipeline_expr_node_owned_rvalue_temp_typed(expr: i64) -> i64 {
+fn pipeline_expr_node_owned_rvalue_temp_typed(expr: i64, src: i64, tt: i64) -> i64 {
   let stripped = pipeline_expr_node_strip_typed(expr)
-  if stripped == 0 { 0 } else { pipeline_expr_owned_rvalue_temp_typed(expr_from_node(stripped)) }
+  if stripped == 0 { 0 } else { pipeline_expr_owned_rvalue_temp_typed(expr_from_node(stripped), src, tt) }
 }
 
 fn pipeline_expr_node_owned_temp_drop_kind_typed(expr: i64) -> i64 {
@@ -4327,12 +4348,12 @@ fn pipeline_managed_temp_release_arg_kind(expr_kind: i64, is_rvalue_temp: i64, e
   }
 }
 
-fn pipeline_managed_lambda_temp_release_args_masked_typed(args: ExprList, values: IrValueList, index: i64, next_value: i64, borrowed_mask: i64, mask_offset: i64, expected_params: i64, expected_types: i64, expected_subst: i64) -> PipelineLoweredArgs {
+fn pipeline_managed_lambda_temp_release_args_masked_typed(args: ExprList, values: IrValueList, index: i64, next_value: i64, borrowed_mask: i64, mask_offset: i64, expected_params: i64, expected_types: i64, expected_subst: i64, src: i64, tt: i64) -> PipelineLoweredArgs {
   match args {
     ExprListNil -> pipeline_lowered_args(ir_value_list_empty(), next_value, ir_inst_list_empty(), 1)
     ExprListCons(expr, rest_exprs) -> {
       let expr_kind = pipeline_expr_owned_temp_drop_kind_typed(expr)
-      let drop_kind = pipeline_managed_temp_release_arg_kind(expr_kind, pipeline_expr_owned_rvalue_temp_typed(expr), expected_params, expected_types, index, mask_offset, expected_subst)
+      let drop_kind = pipeline_managed_temp_release_arg_kind(expr_kind, pipeline_expr_owned_rvalue_temp_typed(expr, src, tt), expected_params, expected_types, index, mask_offset, expected_subst)
       let value = pipeline_ir_value_list_get_or(values, index, 0 - 1)
       let callee = pipeline_managed_release_hash_for_kind(drop_kind)
       let release_insts = if drop_kind != continuation_cleanup_kind_none() and callee != 0 and value >= 0 and cg_mask_has(borrowed_mask, index + mask_offset) == 1 {
@@ -4341,19 +4362,19 @@ fn pipeline_managed_lambda_temp_release_args_masked_typed(args: ExprList, values
         ir_inst_list_empty()
       }
       let next_after_release = if ir_inst_list_len(release_insts) > 0 { next_value + 1 } else { next_value }
-      let rest = pipeline_managed_lambda_temp_release_args_masked_typed(rest_exprs, values, index + 1, next_after_release, borrowed_mask, mask_offset, expected_params, expected_types, expected_subst)
+      let rest = pipeline_managed_lambda_temp_release_args_masked_typed(rest_exprs, values, index + 1, next_after_release, borrowed_mask, mask_offset, expected_params, expected_types, expected_subst, src, tt)
       pipeline_lowered_args(ir_value_list_empty(), pipeline_lowered_args_next_value(rest), ir_inst_list_append(release_insts, pipeline_lowered_args_insts(rest)), 1)
     }
   }
 }
 
-fn pipeline_managed_lambda_temp_release_arg_nodes_masked(args: i64, arg_count: i64, values: IrValueList, index: i64, next_value: i64, borrowed_mask: i64, mask_offset: i64, expected_params: i64, expected_types: i64, expected_subst: i64) -> PipelineLoweredArgs {
+fn pipeline_managed_lambda_temp_release_arg_nodes_masked(args: i64, arg_count: i64, values: IrValueList, index: i64, next_value: i64, borrowed_mask: i64, mask_offset: i64, expected_params: i64, expected_types: i64, expected_subst: i64, src: i64, tt: i64) -> PipelineLoweredArgs {
   if index >= arg_count {
     pipeline_lowered_args(ir_value_list_empty(), next_value, ir_inst_list_empty(), 1)
   } else {
     let arg_node = nlist_get(args, index)
     let expr_kind = pipeline_expr_node_owned_temp_drop_kind_typed(arg_node)
-    let drop_kind = pipeline_managed_temp_release_arg_kind(expr_kind, pipeline_expr_node_owned_rvalue_temp_typed(arg_node), expected_params, expected_types, index, mask_offset, expected_subst)
+    let drop_kind = pipeline_managed_temp_release_arg_kind(expr_kind, pipeline_expr_node_owned_rvalue_temp_typed(arg_node, src, tt), expected_params, expected_types, index, mask_offset, expected_subst)
     let value = pipeline_ir_value_list_get_or(values, index, 0 - 1)
     let callee = pipeline_managed_release_hash_for_kind(drop_kind)
     let release_insts = if drop_kind != continuation_cleanup_kind_none() and callee != 0 and value >= 0 and cg_mask_has(borrowed_mask, index + mask_offset) == 1 {
@@ -4362,7 +4383,7 @@ fn pipeline_managed_lambda_temp_release_arg_nodes_masked(args: i64, arg_count: i
       ir_inst_list_empty()
     }
     let next_after_release = if ir_inst_list_len(release_insts) > 0 { next_value + 1 } else { next_value }
-    let rest = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, values, index + 1, next_after_release, borrowed_mask, mask_offset, expected_params, expected_types, expected_subst)
+    let rest = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, values, index + 1, next_after_release, borrowed_mask, mask_offset, expected_params, expected_types, expected_subst, src, tt)
     pipeline_lowered_args(ir_value_list_empty(), pipeline_lowered_args_next_value(rest), ir_inst_list_append(release_insts, pipeline_lowered_args_insts(rest)), 1)
   }
 }
@@ -5340,7 +5361,7 @@ fn pipeline_lower_generic_call_typed_to_target_blocks(type_args: TypeExprList, i
               pipeline_generic_call_inst_typed(call_dst, src, tt, ns, nl, concrete_type_args, pipeline_lowered_call_blocks_values(lowered_args)),
               ir_inst_list_empty()
             )
-            let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 0, expected_params, variant_payloads, expected_subst)
+            let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 0, expected_params, variant_payloads, expected_subst, pipeline_lower_module_src(module), pipeline_lower_module_tt(module))
             let call_insts = ir_inst_list_append(call_inst, pipeline_lowered_args_insts(cleanup))
             let call_args = ir_value_list_prepend(call_dst, ir_value_list_empty())
             let call = ir_block_new_term(call_block, call_insts, ir_term_jump_args(target_block, call_args))
@@ -5378,7 +5399,7 @@ fn pipeline_lower_method_call_typed_after_receiver(recv_value: i64, recv_blocks:
         ir_inst_method_call_i64(call_dst, type_hash, method_hash, recv_value, pipeline_lowered_call_blocks_values(lowered_args)),
         ir_inst_list_empty()
       )
-      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 1, method_params, 0, subst)
+      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 1, method_params, 0, subst, pipeline_lower_module_src(module), pipeline_lower_module_tt(module))
       let call_insts = ir_inst_list_append(call_inst, pipeline_lowered_args_insts(cleanup))
       let call_args = ir_value_list_prepend(call_dst, ir_value_list_empty())
       let call = ir_block_new_term(call_block, call_insts, ir_term_jump_args(target_block, call_args))
@@ -5416,7 +5437,7 @@ fn pipeline_lower_method_call_typed_after_straight_receiver(recv_value: i64, ent
         ir_inst_method_call_i64(call_dst, type_hash, method_hash, recv_value, pipeline_lowered_call_blocks_values(lowered_args)),
         ir_inst_list_empty()
       )
-      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 1, method_params, 0, subst)
+      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 1, method_params, 0, subst, pipeline_lower_module_src(module), pipeline_lower_module_tt(module))
       let call_args = ir_value_list_prepend(call_dst, ir_value_list_empty())
       let call = ir_block_new_term(call_block, ir_inst_list_append(call_inst, pipeline_lowered_args_insts(cleanup)), ir_term_jump_args(target_block, call_args))
       let blocks = ir_block_list_prepend(entry, ir_block_list_append(pipeline_lowered_call_blocks_blocks(lowered_args), ir_block_list_prepend(call, ir_block_list_empty())))
@@ -5756,7 +5777,7 @@ fn pipeline_lower_let_typed_to_target_blocks_with_float(ns: i64, nl: i64, init_e
         let inferred_float_prim = pipeline_expr_float_prim_typed_temp(init_expr, params, locals, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module))
         let float_prim = if local_float == PRIM_F32() or local_float == PRIM_F64() { local_float } else { inferred_float_prim }
         let inferred_type_hash = pipeline_expr_type_hash_typed_temp(init_expr, params, locals, src, tt, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module))
-        let inferred_type_node = pipeline_return_expr_type_node_typed(init_expr, params, locals, module)
+        let inferred_type_node = pipeline_init_type_node_typed(init_expr, params, locals, module)
         let effective_type_node = if local_type_node != 0 { ty_subst(local_type_node, pipeline_lower_module_subst(module)) } else { inferred_type_node }
         let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
@@ -5767,7 +5788,7 @@ fn pipeline_lower_let_typed_to_target_blocks_with_float(ns: i64, nl: i64, init_e
         } else {
           pipeline_ir_max_i64(pipeline_lowered_blocks_next_value(init_blocks), local_value + 1)
         }
-        let retain_insts = if address_taken == 1 or pipeline_expr_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) == 0 {
+        let retain_insts = if address_taken == 1 or pipeline_expr_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 0 {
           ir_inst_list_empty()
         } else {
           pipeline_managed_retain_inst_list(bind_value, effective_type_node, retain_start)
@@ -5849,7 +5870,7 @@ fn pipeline_lower_let_typed_to_target_blocks_with_float(ns: i64, nl: i64, init_e
       let inferred_float_prim = pipeline_expr_float_prim_typed_temp(init_expr, params, locals, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module))
       let float_prim = if local_float == PRIM_F32() or local_float == PRIM_F64() { local_float } else { inferred_float_prim }
       let inferred_type_hash = pipeline_expr_type_hash_typed_temp(init_expr, params, locals, src, tt, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module))
-      let inferred_type_node = pipeline_return_expr_type_node_typed(init_expr, params, locals, module)
+      let inferred_type_node = pipeline_init_type_node_typed(init_expr, params, locals, module)
       let effective_type_node = if local_type_node != 0 { ty_subst(local_type_node, pipeline_lower_module_subst(module)) } else { inferred_type_node }
       let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
@@ -5866,7 +5887,7 @@ fn pipeline_lower_let_typed_to_target_blocks_with_float(ns: i64, nl: i64, init_e
       } else { ir_inst_list_empty() }
       let bind_value = if address_taken == 1 { slot } else { ir_lowered_expr_value(init) }
       let retain_start = if address_taken == 1 { slot + 1 } else { ir_lowered_expr_next_value(init) }
-      let retain_insts = if address_taken == 1 or pipeline_expr_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) == 0 {
+      let retain_insts = if address_taken == 1 or pipeline_expr_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 0 {
         ir_inst_list_empty()
       } else {
         pipeline_managed_retain_inst_list(bind_value, effective_type_node, retain_start)
@@ -5979,12 +6000,12 @@ fn pipeline_lower_let_mut_typed_to_target_blocks_with_float(ns: i64, nl: i64, in
         let inferred_float_prim = pipeline_expr_float_prim_typed_temp(init_expr, params, locals, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module))
         let float_prim = if local_float == PRIM_F32() or local_float == PRIM_F64() { local_float } else { inferred_float_prim }
         let inferred_type_hash = pipeline_expr_type_hash_typed_temp(init_expr, params, locals, src, tt, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module))
-        let inferred_type_node = pipeline_return_expr_type_node_typed(init_expr, params, locals, module)
+        let inferred_type_node = pipeline_init_type_node_typed(init_expr, params, locals, module)
         let effective_type_node = if local_type_node != 0 { ty_subst(local_type_node, pipeline_lower_module_subst(module)) } else { inferred_type_node }
         let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_typed(init_expr, inferred_type_hash, params, locals, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) } } }
-        let retain_insts = if effective_type_node != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) == 1 {
+        let retain_insts = if effective_type_node != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
           pipeline_managed_retain_inst_list(local_value, effective_type_node, retain_start)
         } else {
           ir_inst_list_empty()
@@ -6049,12 +6070,12 @@ fn pipeline_lower_let_mut_typed_to_target_blocks_with_float(ns: i64, nl: i64, in
       let inferred_float_prim = pipeline_expr_float_prim_typed_temp(init_expr, params, locals, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module))
       let float_prim = if local_float == PRIM_F32() or local_float == PRIM_F64() { local_float } else { inferred_float_prim }
       let inferred_type_hash = pipeline_expr_type_hash_typed_temp(init_expr, params, locals, src, tt, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module))
-      let inferred_type_node = pipeline_return_expr_type_node_typed(init_expr, params, locals, module)
+      let inferred_type_node = pipeline_init_type_node_typed(init_expr, params, locals, module)
       let effective_type_node = if local_type_node != 0 { ty_subst(local_type_node, pipeline_lower_module_subst(module)) } else { inferred_type_node }
       let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_typed(init_expr, inferred_type_hash, params, locals, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) } } }
-      let retain_insts = if effective_type_node != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) == 1 {
+      let retain_insts = if effective_type_node != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
         pipeline_managed_retain_inst_list(ir_lowered_expr_value(init), effective_type_node, slot + 1)
       } else {
         ir_inst_list_empty()
@@ -6277,7 +6298,7 @@ fn pipeline_lower_expr_typed_to_target_blocks(expr: Expr, params: i64, locals: P
 -- owned rvalue (call/ctor/record result whose value nobody binds) must
 -- drop its count at the discard point or every such statement leaks.
 fn pipeline_discard_release_hash(expr: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
-  if pipeline_expr_owned_rvalue_temp_typed(expr) == 0 { 0 }
+  if pipeline_expr_owned_rvalue_temp_typed(expr, pipeline_lower_module_src(module), pipeline_lower_module_tt(module)) == 0 { 0 }
   else {
     let ty = pipeline_return_expr_type_node_typed(expr, params, locals, module)
     if ty == 0 { 0 } else { pipeline_managed_release_hash_for_ty(ty) }
@@ -6330,7 +6351,7 @@ fn pipeline_lower_assign_typed_to_target_blocks(ns: i64, nl: i64, value_expr: Ex
             value_blocks
           } else {
             let assign_value = pipeline_lowered_blocks_next_value(value_blocks)
-            let retain_insts = if slot_ty != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) == 1 {
+            let retain_insts = if slot_ty != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
               pipeline_managed_retain_inst_list(assign_value, slot_ty, assign_value + 1)
             } else {
               ir_inst_list_empty()
@@ -6416,8 +6437,8 @@ fn pipeline_lower_if_typed_to_target_blocks(cond_expr: Expr, then_expr: Expr, el
   let src = pipeline_lower_module_src(module)
   let fns = pipeline_lower_module_fns(module)
   let subst = pipeline_lower_module_subst(module)
-  let then_borrowed = pipeline_expr_result_is_borrowed_with_ctx_typed(then_expr, src, fns, subst)
-  let else_borrowed = pipeline_expr_result_is_borrowed_with_ctx_typed(else_expr, src, fns, subst)
+  let then_borrowed = pipeline_expr_result_is_borrowed_with_ctx_typed(then_expr, src, fns, subst, pipeline_lower_module_tt(module))
+  let else_borrowed = pipeline_expr_result_is_borrowed_with_ctx_typed(else_expr, src, fns, subst, pipeline_lower_module_tt(module))
   let whole_borrowed = if then_borrowed == 1 { else_borrowed } else { 0 }
   let then_retain_hash = pipeline_managed_arm_retain_hash(then_borrowed, whole_borrowed, pipeline_return_expr_type_node_typed(then_expr, params, locals, module))
   let else_retain_hash = pipeline_managed_arm_retain_hash(else_borrowed, whole_borrowed, pipeline_return_expr_type_node_typed(else_expr, params, locals, module))
@@ -6662,7 +6683,7 @@ fn pipeline_lower_straight_expr_to_control_target_blocks(expr: i64, params: i64,
 
 -- Node twin of the typed discard-release classifier.
 fn pipeline_discard_release_hash_node(expr: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
-  if pipeline_expr_node_owned_rvalue_temp_typed(expr) == 0 { 0 }
+  if pipeline_expr_node_owned_rvalue_temp_typed(expr, pipeline_lower_module_src(module), pipeline_lower_module_tt(module)) == 0 { 0 }
   else {
     let ty = pipeline_return_expr_type_node_from_node(expr, params, locals, module)
     if ty == 0 { 0 } else { pipeline_managed_release_hash_for_ty(ty) }
@@ -7469,13 +7490,13 @@ fn pipeline_lower_loop_let_to_target_blocks(expr: i64, ctx: PipelineLoopCtx, nex
         let inferred_float_prim = pipeline_expr_float_prim_node_temp(init_expr, params, locals, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module))
         let float_prim = if local_float == PRIM_F32() or local_float == PRIM_F64() { local_float } else { inferred_float_prim }
         let inferred_type_hash = pipeline_expr_type_hash_node_temp(init_expr, params, locals, src, tt, pipeline_lower_module_fns(pipeline_loop_ctx_module(ctx)), 0)
-        let inferred_type_node = pipeline_return_expr_type_node_from_node(init_expr, params, locals, module)
+        let inferred_type_node = pipeline_init_type_node_from_node(init_expr, params, locals, module)
         let effective_type_node = if local_type_node != 0 { ty_subst(local_type_node, pipeline_lower_module_subst(module)) } else { inferred_type_node }
         let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_node(init_expr, inferred_type_hash, params, locals, src, tt, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) } } }
         let next_locals = pipeline_value_env_push_float_typed_node(locals, node_f1(expr), node_f2(expr), local_value, float_prim, local_type_hash, effective_type_node)
-        let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) == 1 {
+        let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
           pipeline_managed_retain_inst_list(local_value, effective_type_node, body_next_value)
         } else {
           ir_inst_list_empty()
@@ -7525,13 +7546,13 @@ fn pipeline_lower_loop_let_to_target_blocks(expr: i64, ctx: PipelineLoopCtx, nex
       let inferred_float_prim = pipeline_expr_float_prim_node_temp(init_expr, params, locals, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module))
       let float_prim = if local_float == PRIM_F32() or local_float == PRIM_F64() { local_float } else { inferred_float_prim }
       let inferred_type_hash = pipeline_expr_type_hash_node_temp(init_expr, params, locals, src, tt, pipeline_lower_module_fns(pipeline_loop_ctx_module(ctx)), 0)
-      let inferred_type_node = pipeline_return_expr_type_node_from_node(init_expr, params, locals, module)
+      let inferred_type_node = pipeline_init_type_node_from_node(init_expr, params, locals, module)
       let effective_type_node = if local_type_node != 0 { ty_subst(local_type_node, pipeline_lower_module_subst(module)) } else { inferred_type_node }
       let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_node(init_expr, inferred_type_hash, params, locals, src, tt, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) } } }
       let bind_value = ir_lowered_expr_value(init)
-      let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) == 1 {
+      let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
         pipeline_managed_retain_inst_list(bind_value, effective_type_node, ir_lowered_expr_next_value(init))
       } else {
         ir_inst_list_empty()
@@ -7599,12 +7620,12 @@ fn pipeline_lower_loop_let_mut_to_target_blocks(expr: i64, ctx: PipelineLoopCtx,
         let inferred_float_prim = pipeline_expr_float_prim_node_temp(init_expr, params, locals, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module))
         let float_prim = if local_float == PRIM_F32() or local_float == PRIM_F64() { local_float } else { inferred_float_prim }
         let inferred_type_hash = pipeline_expr_type_hash_node_temp(init_expr, params, locals, src, tt, pipeline_lower_module_fns(pipeline_loop_ctx_module(ctx)), 0)
-        let inferred_type_node = pipeline_return_expr_type_node_from_node(init_expr, params, locals, module)
+        let inferred_type_node = pipeline_init_type_node_from_node(init_expr, params, locals, module)
         let effective_type_node = if local_type_node != 0 { ty_subst(local_type_node, pipeline_lower_module_subst(module)) } else { inferred_type_node }
         let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_node(init_expr, inferred_type_hash, params, locals, src, tt, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) } } }
-        let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) == 1 {
+        let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
           pipeline_managed_retain_inst_list(local_value, effective_type_node, body_next_value)
         } else {
           ir_inst_list_empty()
@@ -7660,12 +7681,12 @@ fn pipeline_lower_loop_let_mut_to_target_blocks(expr: i64, ctx: PipelineLoopCtx,
       let inferred_float_prim = pipeline_expr_float_prim_node_temp(init_expr, params, locals, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module))
       let float_prim = if local_float == PRIM_F32() or local_float == PRIM_F64() { local_float } else { inferred_float_prim }
       let inferred_type_hash = pipeline_expr_type_hash_node_temp(init_expr, params, locals, src, tt, pipeline_lower_module_fns(pipeline_loop_ctx_module(ctx)), 0)
-      let inferred_type_node = pipeline_return_expr_type_node_from_node(init_expr, params, locals, module)
+      let inferred_type_node = pipeline_init_type_node_from_node(init_expr, params, locals, module)
       let effective_type_node = if local_type_node != 0 { ty_subst(local_type_node, pipeline_lower_module_subst(module)) } else { inferred_type_node }
       let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_node(init_expr, inferred_type_hash, params, locals, src, tt, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) } } }
-      let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) == 1 {
+      let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
         pipeline_managed_retain_inst_list(ir_lowered_expr_value(init), effective_type_node, slot + 1)
       } else {
         ir_inst_list_empty()
@@ -7975,8 +7996,8 @@ fn pipeline_lower_if_to_target_blocks(expr: i64, params: i64, locals: PipelineVa
     let cond_expr = node_f1(expr)
     let fns = pipeline_lower_module_fns(module)
     let subst = pipeline_lower_module_subst(module)
-    let then_borrowed = pipeline_expr_node_result_is_borrowed_with_ctx_typed(node_f2(expr), src, fns, subst)
-    let else_borrowed = pipeline_expr_node_result_is_borrowed_with_ctx_typed(else_expr, src, fns, subst)
+    let then_borrowed = pipeline_expr_node_result_is_borrowed_with_ctx_typed(node_f2(expr), src, fns, subst, tt)
+    let else_borrowed = pipeline_expr_node_result_is_borrowed_with_ctx_typed(else_expr, src, fns, subst, tt)
     let whole_borrowed = if then_borrowed == 1 { else_borrowed } else { 0 }
     let then_retain_hash = pipeline_managed_arm_retain_hash(then_borrowed, whole_borrowed, pipeline_return_expr_type_node_from_node(node_f2(expr), params, locals, module))
     let else_retain_hash = pipeline_managed_arm_retain_hash(else_borrowed, whole_borrowed, pipeline_return_expr_type_node_from_node(else_expr, params, locals, module))
@@ -8463,7 +8484,7 @@ fn pipeline_lower_call_to_target_blocks(expr: i64, params: i64, locals: Pipeline
         let borrowed_mask = if direct == 1 {
           pipeline_call_borrowable_param_mask(pipeline_lower_module_fns(module), src, node_f1(expr), node_f2(expr), expected_params, pipeline_lower_module_subst(module))
         } else { 0 }
-        let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(node_f3(expr), arg_count, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 0, expected_params, 0, pipeline_lower_module_subst(module))
+        let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(node_f3(expr), arg_count, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + 1, borrowed_mask, 0, expected_params, 0, pipeline_lower_module_subst(module), pipeline_lower_module_src(module), pipeline_lower_module_tt(module))
         let call_args = ir_value_list_prepend(call_dst, ir_value_list_empty())
         let call = ir_block_new_term(call_block, ir_inst_list_append(call_inst, pipeline_lowered_args_insts(cleanup)), ir_term_jump_args(target_block, call_args))
         let blocks = ir_block_list_prepend(
@@ -9140,7 +9161,7 @@ fn pipeline_lower_let_mut_to_target_blocks(expr: i64, params: i64, locals: Pipel
         let effective_type_node = pipeline_expr_type_node_from_node(init_expr)
         let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let local_type_hash = if inferred_node_type_hash != 0 { inferred_node_type_hash } else { inferred_type_hash }
-        let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) == 1 {
+        let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
           pipeline_managed_retain_inst_list(local_value, effective_type_node, retain_start)
         } else {
           ir_inst_list_empty()
@@ -9206,7 +9227,7 @@ fn pipeline_lower_let_mut_to_target_blocks(expr: i64, params: i64, locals: Pipel
       let effective_type_node = pipeline_expr_type_node_from_node(init_expr)
       let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let local_type_hash = if inferred_node_type_hash != 0 { inferred_node_type_hash } else { inferred_type_hash }
-      let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) == 1 {
+      let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
         pipeline_managed_retain_inst_list(ir_lowered_expr_value(init), effective_type_node, slot + 1)
       } else {
         ir_inst_list_empty()
@@ -11836,7 +11857,7 @@ fn pipeline_lower_typed_handler_opt_args_expected_borrow_mask(args: ExprList, in
         pipeline_lower_expr_typed_sidecar_handler_ctx(expr, next_value, lower_ctx)
       }
       if ir_lowered_expr_is_valid(arg) == 1 {
-        let retain = pipeline_managed_borrow_retain_arg_typed(expr, ir_lowered_expr_value(arg), retain_ty, ir_lowered_expr_next_value(arg), src, pipeline_handler_lower_ctx_fns(lower_ctx), expected_subst)
+        let retain = pipeline_managed_borrow_retain_arg_typed(expr, ir_lowered_expr_value(arg), retain_ty, ir_lowered_expr_next_value(arg), src, pipeline_handler_lower_ctx_fns(lower_ctx), expected_subst, pipeline_handler_lower_ctx_tt(lower_ctx))
         let rest = pipeline_lower_typed_handler_opt_args_expected_borrow_mask(rest_exprs, index + 1, pipeline_lowered_args_next_value(retain), lower_ctx, expected_params, expected_types, expected_subst, borrowed_mask)
         if pipeline_lowered_args_is_valid(rest) == 1 {
           let values = ir_value_list_prepend(ir_lowered_expr_value(arg), pipeline_lowered_args_values(rest))
@@ -11867,7 +11888,7 @@ fn pipeline_lower_typed_method_handler_opt_args_expected(args: ExprList, index: 
         pipeline_lower_expr_typed_sidecar_handler_ctx(expr, next_value, lower_ctx)
       }
       if ir_lowered_expr_is_valid(arg) == 1 {
-        let retain = pipeline_managed_borrow_retain_arg_typed(expr, ir_lowered_expr_value(arg), retain_ty, ir_lowered_expr_next_value(arg), pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_fns(lower_ctx), expected_subst)
+        let retain = pipeline_managed_borrow_retain_arg_typed(expr, ir_lowered_expr_value(arg), retain_ty, ir_lowered_expr_next_value(arg), pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_fns(lower_ctx), expected_subst, pipeline_handler_lower_ctx_tt(lower_ctx))
         let rest = pipeline_lower_typed_method_handler_opt_args_expected(rest_exprs, index + 1, pipeline_lowered_args_next_value(retain), lower_ctx, method_params, expected_subst, borrowed_mask)
         if pipeline_lowered_args_is_valid(rest) == 1 {
           let values = ir_value_list_prepend(ir_lowered_expr_value(arg), pipeline_lowered_args_values(rest))
@@ -12439,7 +12460,7 @@ fn pipeline_lower_call_expr_typed_sidecar_handler_opt(ns: i64, nl: i64, args_exp
         pipeline_call_inst_resolved(dst, direct, indirect_callee, src, tt, ns, nl, pipeline_lowered_args_values(args)),
         ir_inst_list_empty()
       )
-      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_expr, pipeline_lowered_args_values(args), 0, dst + 1, borrowed_mask, 0, expected_params, expected_types, subst)
+      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_expr, pipeline_lowered_args_values(args), 0, dst + 1, borrowed_mask, 0, expected_params, expected_types, subst, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
       let insts = ir_inst_list_append(callee_insts, ir_inst_list_append(pipeline_lowered_args_insts(args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup))))
       ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), insts)
     } else {
@@ -13375,49 +13396,41 @@ fn pipeline_expr_final_returns_non_param_ident_typed(expr: Expr, params: i64, sr
   }
 }
 
-fn pipeline_expr_result_is_borrowed_typed(expr: Expr) -> i64 {
-  pipeline_expr_result_is_borrowed_with_ctx_typed(expr, 0, 0, 0)
-}
-
-fn pipeline_expr_result_is_borrowed_with_ctx_typed(expr: Expr, src: i64, fns: i64, subst: i64) -> i64 {
+fn pipeline_expr_result_is_borrowed_with_ctx_typed(expr: Expr, src: i64, fns: i64, subst: i64, tt: i64) -> i64 {
   match expr {
-    Ident(ns, nl) -> 1
+    Ident(ns, nl) -> if pipeline_ident_is_payloadless_ctor(tt, src, ns, nl) == 1 { 0 } else { 1 }
     FieldAccess(base, field_ns, field_nl) -> 1
     OptChain(base, field_ns, field_nl) -> 1
     Call(ns, nl, args) -> 0
     GenericCall(type_args, inner_call) -> {
       match inner_call {
         Call(ns, nl, args) -> 0
-        _ -> pipeline_expr_result_is_borrowed_with_ctx_typed(inner_call, src, fns, subst)
+        _ -> pipeline_expr_result_is_borrowed_with_ctx_typed(inner_call, src, fns, subst, tt)
       }
     }
-    Block(first, rest) -> pipeline_expr_result_is_borrowed_with_ctx_typed(rest, src, fns, subst)
-    Let(ns, nl, value, body) -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst)
-    LetMut(ns, nl, value, body) -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst)
-    LetTyped(inner, ann_type) -> pipeline_expr_result_is_borrowed_with_ctx_typed(inner, src, fns, subst)
+    Block(first, rest) -> pipeline_expr_result_is_borrowed_with_ctx_typed(rest, src, fns, subst, tt)
+    Let(ns, nl, value, body) -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt)
+    LetMut(ns, nl, value, body) -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt)
+    LetTyped(inner, ann_type) -> pipeline_expr_result_is_borrowed_with_ctx_typed(inner, src, fns, subst, tt)
     If(cond, then_expr, else_expr) -> {
-      if pipeline_expr_result_is_borrowed_with_ctx_typed(then_expr, src, fns, subst) == 1 {
-        pipeline_expr_result_is_borrowed_with_ctx_typed(else_expr, src, fns, subst)
+      if pipeline_expr_result_is_borrowed_with_ctx_typed(then_expr, src, fns, subst, tt) == 1 {
+        pipeline_expr_result_is_borrowed_with_ctx_typed(else_expr, src, fns, subst, tt)
       } else { 0 }
     }
-    Match(scrutinee, arms) -> pipeline_match_arms_result_is_borrowed_with_ctx_typed(arms, src, fns, subst)
-    Defer(cleanup, body) -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst)
+    Match(scrutinee, arms) -> pipeline_match_arms_result_is_borrowed_with_ctx_typed(arms, src, fns, subst, tt)
+    Defer(cleanup, body) -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt)
     _ -> 0
   }
 }
 
-fn pipeline_match_arms_result_is_borrowed_typed(arms: MatchArmList) -> i64 {
-  pipeline_match_arms_result_is_borrowed_with_ctx_typed(arms, 0, 0, 0)
-}
-
-fn pipeline_match_arms_result_is_borrowed_with_ctx_typed(arms: MatchArmList, src: i64, fns: i64, subst: i64) -> i64 {
+fn pipeline_match_arms_result_is_borrowed_with_ctx_typed(arms: MatchArmList, src: i64, fns: i64, subst: i64, tt: i64) -> i64 {
   match arms {
     MatchArmListNil -> 1
     MatchArmListCons(arm, rest) -> {
       match arm {
         Arm(pattern, body, guard, has_guard) -> {
-          if pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst) == 1 {
-            pipeline_match_arms_result_is_borrowed_with_ctx_typed(rest, src, fns, subst)
+          if pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt) == 1 {
+            pipeline_match_arms_result_is_borrowed_with_ctx_typed(rest, src, fns, subst, tt)
           } else { 0 }
         }
         UnknownArm(tag) -> 0
@@ -13426,9 +13439,9 @@ fn pipeline_match_arms_result_is_borrowed_with_ctx_typed(arms: MatchArmList, src
   }
 }
 
-fn pipeline_expr_node_result_is_borrowed_with_ctx_typed(expr: i64, src: i64, fns: i64, subst: i64) -> i64 {
+fn pipeline_expr_node_result_is_borrowed_with_ctx_typed(expr: i64, src: i64, fns: i64, subst: i64, tt: i64) -> i64 {
   let stripped = pipeline_expr_node_strip_typed(expr)
-  if stripped == 0 { 0 } else { pipeline_expr_result_is_borrowed_with_ctx_typed(expr_from_node(stripped), src, fns, subst) }
+  if stripped == 0 { 0 } else { pipeline_expr_result_is_borrowed_with_ctx_typed(expr_from_node(stripped), src, fns, subst, tt) }
 }
 
 fn pipeline_expr_result_is_any_param_borrow_typed(expr: Expr, params: i64, src: i64) -> i64 {
@@ -13666,7 +13679,7 @@ fn pipeline_lower_let_expr_typed_sidecar_handler_opt_with_float_prim(ns: i64, nl
     let inferred_float_prim = pipeline_expr_float_prim_typed_temp(value_expr, params, locals, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst)
     let float_prim = if local_float == PRIM_F32() or local_float == PRIM_F64() { local_float } else { inferred_float_prim }
     let inferred_type_hash = pipeline_expr_type_hash_typed_temp(value_expr, params, locals, src, tt, pipeline_handler_lower_ctx_fns(lower_ctx), subst)
-    let inferred_type_node = pipeline_return_expr_type_node_typed(value_expr, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
+    let inferred_type_node = pipeline_init_type_node_typed(value_expr, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
     let effective_type_node = if local_type_node != 0 { ty_subst(local_type_node, subst) } else { inferred_type_node }
     let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
     let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
@@ -13674,7 +13687,7 @@ fn pipeline_lower_let_expr_typed_sidecar_handler_opt_with_float_prim(ns: i64, nl
     let address_taken = pipeline_expr_address_of_binding(body_expr, src, ns, nl)
     let slot = pipeline_ir_addressable_slot_id(ir_lowered_expr_next_value(value))
     let bind_value_for_retain = if address_taken == 1 { slot } else { ir_lowered_expr_value(value) }
-    let retain_insts = if address_taken == 1 or pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst) == 0 {
+    let retain_insts = if address_taken == 1 or pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 0 {
       ir_inst_list_empty()
     } else {
       pipeline_managed_retain_inst_list(bind_value_for_retain, effective_type_node, ir_lowered_expr_next_value(value))
@@ -13910,7 +13923,7 @@ fn pipeline_lower_generic_call_expr_typed_sidecar_handler_opt(type_args: TypeExp
               pipeline_generic_call_inst_typed(dst, src, tt, ns, nl, concrete_type_args, pipeline_lowered_args_values(args)),
               ir_inst_list_empty()
             )
-            let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_args_values(args), 0, dst + 1, borrowed_mask, 0, expected_params, variant_payloads, expected_subst)
+            let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_args_values(args), 0, dst + 1, borrowed_mask, 0, expected_params, variant_payloads, expected_subst, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
             let insts = ir_inst_list_append(pipeline_lowered_args_insts(args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup)))
             ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), insts)
           } else {
@@ -13943,7 +13956,7 @@ fn pipeline_lower_method_call_expr_typed_sidecar_handler_opt(recv_expr: Expr, me
         ir_inst_method_call_i64(dst, type_hash, method_hash, ir_lowered_expr_value(receiver), pipeline_lowered_args_values(args)),
         ir_inst_list_empty()
       )
-      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_args_values(args), 0, dst + 1, borrowed_mask, 1, method_params, 0, subst)
+      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_args_values(args), 0, dst + 1, borrowed_mask, 1, method_params, 0, subst, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
       let insts = ir_inst_list_append(ir_lowered_expr_insts(receiver), ir_inst_list_append(pipeline_lowered_args_insts(args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup))))
       ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), insts)
     } else {
@@ -14226,12 +14239,12 @@ fn pipeline_lower_let_mut_expr_typed_sidecar_handler_opt_with_float_prim(ns: i64
     let inferred_float_prim = pipeline_expr_float_prim_typed_temp(value_expr, params, locals, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst)
     let float_prim = if local_float == PRIM_F32() or local_float == PRIM_F64() { local_float } else { inferred_float_prim }
     let inferred_type_hash = pipeline_expr_type_hash_typed_temp(value_expr, params, locals, src, tt, pipeline_handler_lower_ctx_fns(lower_ctx), subst)
-    let inferred_type_node = pipeline_return_expr_type_node_typed(value_expr, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
+    let inferred_type_node = pipeline_init_type_node_typed(value_expr, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
     let effective_type_node = if local_type_node != 0 { ty_subst(local_type_node, subst) } else { inferred_type_node }
     let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
     let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
     let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_typed(value_expr, inferred_type_hash, params, locals, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst) } } }
-    let retain_insts = if effective_type_node != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst) == 1 {
+    let retain_insts = if effective_type_node != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 1 {
       pipeline_managed_retain_inst_list(ir_lowered_expr_value(value), effective_type_node, slot + 1)
     } else {
       ir_inst_list_empty()
@@ -14353,7 +14366,7 @@ fn pipeline_lower_assign_expr_typed_sidecar_handler_opt(ns: i64, nl: i64, value_
       pipeline_lower_expr_typed_sidecar_handler_ctx(value_expr, next_value, lower_ctx)
     }
     if ir_lowered_expr_is_valid(value) == 1 {
-      let retain_insts = if slot_ty != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst) == 1 {
+      let retain_insts = if slot_ty != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 1 {
         pipeline_managed_retain_inst_list(ir_lowered_expr_value(value), slot_ty, ir_lowered_expr_next_value(value))
       } else {
         ir_inst_list_empty()
@@ -14567,7 +14580,7 @@ fn pipeline_lower_node_handler_opt_args_expected_offset_borrow_mask(args: i64, a
       pipeline_lower_expr_node_typed_sidecar_handler_ctx(arg_node, next_value, lower_ctx)
     }
     if ir_lowered_expr_is_valid(arg) == 1 {
-      let retain = pipeline_managed_borrow_retain_arg_node(arg_node, ir_lowered_expr_value(arg), retain_ty, ir_lowered_expr_next_value(arg), pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_fns(lower_ctx), expected_subst)
+      let retain = pipeline_managed_borrow_retain_arg_node(arg_node, ir_lowered_expr_value(arg), retain_ty, ir_lowered_expr_next_value(arg), pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_fns(lower_ctx), expected_subst, pipeline_handler_lower_ctx_tt(lower_ctx))
       let rest = pipeline_lower_node_handler_opt_args_expected_offset_borrow_mask(args, arg_count, index + 1, pipeline_lowered_args_next_value(retain), lower_ctx, expected_params, expected_types, expected_subst, expected_offset, borrowed_mask)
       if pipeline_lowered_args_is_valid(rest) == 1 {
         let values = ir_value_list_prepend(ir_lowered_expr_value(arg), pipeline_lowered_args_values(rest))
@@ -14897,7 +14910,7 @@ fn pipeline_lower_inferred_generic_call_node_typed_sidecar_handler_opt(ns: i64, 
             pipeline_generic_call_inst(dst, src, tt, ns, nl, concrete_type_args, pipeline_lowered_args_values(lowered_args)),
             ir_inst_list_empty()
           )
-          let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 0, expected_params, 0, expected_subst)
+          let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 0, expected_params, 0, expected_subst, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
           ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup))))
         } else {
           ir_lowered_expr_invalid(next_value)
@@ -14962,7 +14975,7 @@ fn pipeline_lower_call_node_typed_sidecar_handler_opt(ns: i64, nl: i64, args: i6
         pipeline_call_inst_resolved(dst, direct, indirect_callee, src, tt, ns, nl, pipeline_lowered_args_values(lowered_args)),
         ir_inst_list_empty()
       )
-      let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 0, expected_params, expected_types, subst)
+      let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 0, expected_params, expected_types, subst, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
       let insts = ir_inst_list_append(callee_insts, ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup))))
       ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), insts)
     } else {
@@ -15010,7 +15023,7 @@ fn pipeline_lower_generic_call_node_typed_sidecar_handler_opt(type_args: i64, in
           pipeline_generic_call_inst(dst, src, tt, ns, nl, concrete_type_args, pipeline_lowered_args_values(lowered_args)),
           ir_inst_list_empty()
         )
-        let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 0, expected_params, 0, expected_subst)
+        let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 0, expected_params, 0, expected_subst, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
         ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup))))
       } else {
         ir_lowered_expr_invalid(next_value)
@@ -15037,7 +15050,7 @@ fn pipeline_lower_method_call_node_typed_sidecar_handler_opt(recv_node: i64, met
         ir_inst_method_call_i64(dst, type_hash, method_hash, ir_lowered_expr_value(receiver), pipeline_lowered_args_values(lowered_args)),
         ir_inst_list_empty()
       )
-      let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 1, method_params, 0, subst)
+      let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + 1, borrowed_mask, 1, method_params, 0, subst, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
       ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(ir_lowered_expr_insts(receiver), ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup)))))
     } else {
       ir_lowered_expr_invalid(next_value)
@@ -15175,7 +15188,7 @@ fn pipeline_lower_let_node_typed_sidecar_handler_opt_with_float_prim(ns: i64, nl
     let inferred_float_prim = pipeline_expr_float_prim_node_temp(value_node, params, locals, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst)
     let float_prim = if local_float == PRIM_F32() or local_float == PRIM_F64() { local_float } else { inferred_float_prim }
     let inferred_type_hash = pipeline_expr_type_hash_node_temp(value_node, params, locals, src, tt, pipeline_handler_lower_ctx_fns(lower_ctx), subst)
-    let inferred_type_node = pipeline_return_expr_type_node_from_node(value_node, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
+    let inferred_type_node = pipeline_init_type_node_from_node(value_node, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
     let effective_type_node = if local_type_node != 0 { ty_subst(local_type_node, subst) } else { inferred_type_node }
     let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
     let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
@@ -15183,7 +15196,7 @@ fn pipeline_lower_let_node_typed_sidecar_handler_opt_with_float_prim(ns: i64, nl
     let address_taken = pipeline_expr_node_address_of_binding(body_node, src, ns, nl)
     let slot = pipeline_ir_addressable_slot_id(ir_lowered_expr_next_value(value))
     let bind_value_for_retain = if address_taken == 1 { slot } else { ir_lowered_expr_value(value) }
-    let retain_insts = if address_taken == 1 or pipeline_expr_node_result_is_borrowed_with_ctx_typed(value_node, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst) == 0 {
+    let retain_insts = if address_taken == 1 or pipeline_expr_node_result_is_borrowed_with_ctx_typed(value_node, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 0 {
       ir_inst_list_empty()
     } else {
       pipeline_managed_retain_inst_list(bind_value_for_retain, effective_type_node, ir_lowered_expr_next_value(value))
@@ -15252,12 +15265,12 @@ fn pipeline_lower_let_mut_node_typed_sidecar_handler_opt_with_float_prim(ns: i64
     let inferred_float_prim = pipeline_expr_float_prim_node_temp(value_node, params, locals, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst)
     let float_prim = if local_float == PRIM_F32() or local_float == PRIM_F64() { local_float } else { inferred_float_prim }
     let inferred_type_hash = pipeline_expr_type_hash_node_temp(value_node, params, locals, src, tt, pipeline_handler_lower_ctx_fns(lower_ctx), subst)
-    let inferred_type_node = pipeline_return_expr_type_node_from_node(value_node, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
+    let inferred_type_node = pipeline_init_type_node_from_node(value_node, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
     let effective_type_node = if local_type_node != 0 { ty_subst(local_type_node, subst) } else { inferred_type_node }
     let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
     let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
     let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_node(value_node, inferred_type_hash, params, locals, src, tt, pipeline_handler_lower_ctx_fns(lower_ctx), subst) } } }
-    let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(value_node, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst) == 1 {
+    let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(value_node, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 1 {
       pipeline_managed_retain_inst_list(ir_lowered_expr_value(value), effective_type_node, slot + 1)
     } else {
       ir_inst_list_empty()
@@ -15293,7 +15306,7 @@ fn pipeline_lower_assign_node_typed_sidecar_handler_opt(ns: i64, nl: i64, value_
       pipeline_lower_expr_node_typed_sidecar_handler_ctx(value_node, next_value, lower_ctx)
     }
     if ir_lowered_expr_is_valid(value) == 1 {
-      let retain_insts = if slot_ty != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(value_node, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst) == 1 {
+      let retain_insts = if slot_ty != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(value_node, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 1 {
         pipeline_managed_retain_inst_list(ir_lowered_expr_value(value), slot_ty, ir_lowered_expr_next_value(value))
       } else {
         ir_inst_list_empty()
@@ -20594,11 +20607,79 @@ fn pipeline_ir_native_emit_variant_payloads(code: i64, base_reg: i64, args: IrVa
 -- allocates a headered rc payload so release at end-of-lifetime actually
 -- reclaims. Payload value loads happen after the BL — value homes are
 -- call-surviving and forwarding entries invalidate on buffer growth.
+-- Deep-release field mask for a variant ctor: 2 bits per payload word
+-- (word 0 is the tag), computed from the DECLARED payload types.
+-- Generic variants declare tyvar payloads (kind none) and stay
+-- shallow-released — a bounded leak, never corruption; the inst-level
+-- mask for monomorphized generics is future work.
+fn pipeline_variant_field_mask(tt: i64, tag_hash: i64) -> i64 {
+  if tt == 0 { 0 }
+  else {
+    let n = mem_load64_at(tt, 8)
+    let d = mem_load64_at(tt, 0)
+    let mut ti = 0
+    let mut mask = 0
+    let mut found = 0
+    while ti < n and found == 0 {
+      let entry = d + ti * 64
+      if mem_load64_at(entry, 16) == 1 {
+        let nvariants = mem_load64_at(entry, 24)
+        let variants = mem_load64_at(entry, 32)
+        let mut vi = 0
+        while vi < nvariants and found == 0 {
+          if mem_load64_at(variants + vi * 40 + 16, 0) == tag_hash {
+            found = 1
+            let payload_types = mem_load64_at(variants + vi * 40 + 32, 0)
+            if payload_types != 0 {
+              let np = nlist_len(payload_types)
+              let mut i = 0
+              while i < np {
+                let word = i + 1
+                if word < 16 {
+                  let ty = pipeline_expected_arg_type_node(0, payload_types, i, 0, 0)
+                  mask = mask bor (cg_field_mask_kind(ty) bshl (word * 2))
+                } else { 0 }
+                i = i + 1
+              }
+            } else { 0 }
+          } else { vi = vi + 1 }
+        }
+      } else { 0 }
+      ti = ti + 1
+    }
+    mask
+  }
+}
+
+-- Record twin: word i = ttable field i.
+fn pipeline_record_field_mask(tt: i64, type_hash: i64) -> i64 {
+  if tt == 0 { 0 }
+  else {
+    let entry = ttable_lookup_by_type_hash(tt, type_hash)
+    if entry == 0 { 0 }
+    else {
+      let nfields = mem_load64_at(entry, 24)
+      let fields = mem_load64_at(entry, 32)
+      let mut mask = 0
+      let mut i = 0
+      while i < nfields {
+        if i < 16 {
+          let ty = mem_load64_at(fields + i * 24 + 16, 0)
+          mask = mask bor (cg_field_mask_kind(ty) bshl (i * 2))
+        } else { 0 }
+        i = i + 1
+      }
+      mask
+    }
+  }
+}
+
 fn pipeline_ir_native_emit_variant_init(code: i64, dst: i64, tag_hash: i64, args: IrValueList, fm: i64, pinned: i64) -> i64 {
   let nargs = ir_value_list_len(args)
   let alloc_size = 8 + nargs * 8
   let min_size = if alloc_size < 16 { 16 } else { alloc_size }
-  cg_emit_rc_default_alloc_lit(code, fm, continuation_cleanup_kind_rc(), min_size, 8)
+  let mask = pipeline_variant_field_mask(fmap_get_tt(fm), tag_hash)
+  cg_emit_rc_default_alloc_masked_lit(code, fm, continuation_cleanup_kind_rc(), min_size, 8, mask)
   bu32(code, encode_add_imm(14, 0, 0))
   emit_mov_imm_safe(code, 16, tag_hash)
   bu32(code, cg_str(16, 14, 0))
@@ -20692,7 +20773,8 @@ fn pipeline_ir_native_emit_record_fields(code: i64, base_reg: i64, fields: IrRec
 fn pipeline_ir_native_emit_record_init(code: i64, dst: i64, type_hash: i64, fields: IrRecordFieldList, fm: i64, pinned: i64) -> i64 {
   let size = ir_record_field_list_len(fields) * 8
   let alloc_size = if size < 8 { 8 } else { size }
-  cg_emit_rc_default_alloc_lit(code, fm, continuation_cleanup_kind_rc(), alloc_size, 8)
+  let mask = pipeline_record_field_mask(fmap_get_tt(fm), type_hash)
+  cg_emit_rc_default_alloc_masked_lit(code, fm, continuation_cleanup_kind_rc(), alloc_size, 8, mask)
   bu32(code, encode_add_imm(14, 0, 0))
   pipeline_ir_native_emit_record_fields(code, 14, fields, type_hash, 0, fmap_get_tt(fm), pinned)
   pipeline_ir_native_store_reg_pinned(code, pinned, dst, 14)
