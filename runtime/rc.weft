@@ -451,6 +451,7 @@ fn rc_deep_release_child(child: i64, pending: i64) -> i64 {
 }
 
 fn rc_deep_release_walk(first: i64) -> i64 {
+  let heap = rc_default_heap()
   let mut pending = first
   while pending != 0 {
     let node = pending
@@ -475,7 +476,26 @@ fn rc_deep_release_walk(first: i64) -> i64 {
         i = i + 1
       }
     } else { 0 }
-    rc_finalize_zero_count_payload(rc_default_heap(), node)
+    -- Free the dead node inline: the non-weak bin push is the hot
+    -- case (magic cleared, [next, size] written into the block, LIFO
+    -- push). Weak survivors and oversize blocks take the general
+    -- finalize/free path.
+    let wk = __mem_load64(header + rc_weak_count_offset())
+    if wk <= 0 {
+      let rounded = (rc_header_size() + (word band 4294967295) + 7) / 8 * 8
+      let need = if rounded < heap_min_block_size() { heap_min_block_size() } else { rounded }
+      __mem_store64(header + rc_magic_offset(), 0)
+      if need <= heap_bin_limit() {
+        let cell = heap + 16 + (need / 8) * 8
+        __mem_store64(header, __mem_load64(cell))
+        __mem_store64(header + 8, need)
+        __mem_store64(cell, header)
+      } else {
+        heap_free(heap, header, need)
+      }
+    } else {
+      rc_finalize_zero_count_payload(heap, node)
+    }
   }
   0
 }
@@ -583,12 +603,44 @@ fn rc_set_field_mask_word(payload: i64, payload_size: i64, mask: i64) -> i64 {
 -- stores the tag and every declared field word before the value is
 -- observable, and slack words (size rounding) are mask-kind none —
 -- the deep-release walk and pattern matching never read them.
+--
+-- This is the hottest allocation site in ownership-heavy programs, so
+-- the bin fast path is SELF-CONTAINED: state -> heap -> bin pop ->
+-- header init with the mask packed into the size word, no nested
+-- calls. Bin miss, oversize, first-touch, and odd alignment fall back
+-- to the general path. Param-less const fns fold to literals; the bin
+-- cell arithmetic (heap + 16 + need/8*8) is written out because
+-- param'd helpers do not fold.
 fn rc_default_alloc_masked(payload_size: i64, align: i64, mask: i64) -> i64 {
-  let payload = rc_alloc_core(rc_default_heap(), payload_size, align, 0)
-  if mask == 0 { payload }
-  else {
-    rc_set_field_mask_word(payload, payload_size, mask)
-    payload
+  let st = handle unsafe_runtime_state() {
+    Unsafe.runtime_state() -> resume(__runtime_state())
+  }
+  let heap = __mem_load64(st + rc_default_heap_offset())
+  let rounded = (rc_header_size() + payload_size + 7) / 8 * 8
+  let need = if rounded < heap_min_block_size() { heap_min_block_size() } else { rounded }
+  let binned = if heap != 0 and payload_size >= 0 and align <= 8 and need <= heap_bin_limit() {
+    let cell = heap + 16 + (need / 8) * 8
+    let head = __mem_load64(cell)
+    if head != 0 {
+      __mem_store64(cell, __mem_load64(head))
+      head
+    } else { 0 }
+  } else { 0 }
+  if binned != 0 {
+    __mem_store64(binned + rc_count_offset(), 1)
+    __mem_store64(binned + rc_payload_size_offset(), payload_size bor (mask bshl 32))
+    __mem_store64(binned + rc_weak_count_offset(), 0)
+    __mem_store64(binned + rc_promoted_offset(), 0)
+    __mem_store64(binned + rc_atomic_lock_offset(), 0)
+    __mem_store64(binned + rc_magic_offset(), rc_magic_value())
+    binned + rc_header_size()
+  } else {
+    let payload = rc_alloc_core(rc_default_heap(), payload_size, align, 0)
+    if mask == 0 { payload }
+    else {
+      rc_set_field_mask_word(payload, payload_size, mask)
+      payload
+    }
   }
 }
 
