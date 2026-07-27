@@ -34,11 +34,27 @@ fn alloc_bump_mark() -> i64 {
   __mem_load64(st)
 }
 
+-- Compile-time twin: runtime_state_bump_base_offset in codegen.weft.
+fn alloc_bump_base_offset() -> i64 { 112 }
+
+fn alloc_bump_segment_base() -> i64 {
+  let st = alloc_runtime_state_ptr()
+  __mem_load64(st + alloc_bump_base_offset())
+}
+
 fn alloc_bump_restore_same_segment(mark: i64) -> i64 {
   let st = alloc_runtime_state_ptr()
-  let end = __mem_load64(st + 32)
+  let base = __mem_load64(st + alloc_bump_base_offset())
   let current = __mem_load64(st)
-  if mark > 0 and mark <= end and end - mark <= 536870912 {
+  -- Same-segment proof must be EXACT: segments are disjoint mappings, so
+  -- a mark inside [base, current] can only belong to the live segment.
+  -- The old end-distance heuristic (end - mark <= 512MB) accepted marks
+  -- from a PREVIOUS segment whenever a freshly chained segment happened
+  -- to land within 512MB above them; the restore then zeroed across the
+  -- inter-segment gap and rewound the bump pointer out of the live
+  -- segment, and later bump allocations overwrote live structures (rc
+  -- arena descriptors included). Layout-dependent heap corruption.
+  if mark > 0 and mark >= base and mark <= current {
     -- Fresh bump memory is zero-filled (mmap); allocations may rely on it.
     -- Re-establish the memory-above-the-pointer-is-zero invariant on
     -- rollback so reused regions behave like a fresh process.
@@ -84,14 +100,24 @@ fn alloc_mmap_flags_private_anon() -> i64 { 4098 }
 
 -- Arena header layout:
 -- [base(8), offset(8), capacity(8), mapped_len(8)] = 32 bytes.
+-- The descriptor lives at the HEAD OF ITS OWN MAPPING (data starts 64
+-- bytes in), never in bump memory: arenas are created and grown from
+-- inside bump mark/restore windows (optimiser scratch reclaim, probe
+-- wrappers), and a bump-allocated descriptor created mid-window was
+-- rewound over by the restore while the heap still pointed at it —
+-- later bump allocations then overwrote the live descriptor
+-- (layout-dependent heap corruption). Self-contained descriptors are
+-- immune to any bump rollback by construction.
+fn arena_descriptor_reserve() -> i64 { 64 }
+
 fn arena_new(size: i64) -> i64 {
   let capacity = if size <= 0 { alloc_page_size() } else { size }
-  let mapped_len = alloc_round_up(capacity, alloc_page_size())
+  let mapped_len = alloc_round_up(capacity + arena_descriptor_reserve(), alloc_page_size())
   let base = sys_mmap(0, mapped_len, alloc_mmap_prot_rw(), alloc_mmap_flags_private_anon(), 0 - 1, 0)
   if base <= 0 { 0 }
   else {
-    let arena = alloc_bump(32)
-    __mem_store64(arena, base)
+    let arena = base
+    __mem_store64(arena, base + arena_descriptor_reserve())
     __mem_store64(arena + 8, 0)
     __mem_store64(arena + 16, capacity)
     __mem_store64(arena + 24, mapped_len)
@@ -152,16 +178,14 @@ fn arena_alloc_words(arena: i64, words: i64) -> i64 {
 fn arena_free(arena: i64) -> i64 {
   if arena == 0 { 0 - 1 }
   else {
-    let base = arena_base(arena)
     let mapped_len = arena_mapped_len(arena)
-    if base == 0 { 0 - 1 }
+    if arena_base(arena) == 0 { 0 - 1 }
     else {
-      let result = sys_munmap(base, mapped_len)
-      __mem_store64(arena, 0)
-      __mem_store64(arena + 8, 0)
-      __mem_store64(arena + 16, 0)
-      __mem_store64(arena + 24, 0)
-      result
+      -- The descriptor lives at the head of the mapping: unmapping the
+      -- arena unmaps the descriptor with it. No field zeroing — the
+      -- memory is gone and any later use of this arena pointer faults
+      -- loudly instead of reading stale zeros.
+      sys_munmap(arena, mapped_len)
     }
   }
 }
@@ -194,14 +218,24 @@ fn alloc_is_aligned(ptr: i64, align: i64) -> bool {
   }
 }
 
+-- The heap header is carved from the heap's own arena for the same
+-- rollback-immunity reason as the arena descriptor: heaps can be
+-- created inside bump mark/restore windows. The arena is sized up by
+-- the header so the caller's requested capacity stays fully usable.
 fn heap_new(size: i64) -> i64 {
-  let arena = arena_new(size)
+  -- The header carve is rounded to 16 so user allocations start at the
+  -- same alignment they had when data began at arena offset zero.
+  let header_carve = alloc_round_up(heap_header_size(), 16)
+  let arena = arena_new(size + header_carve)
   if arena == 0 { 0 }
   else {
-    let heap = alloc_bump(heap_header_size())
-    mem_zero(heap, heap_header_size())
-    __mem_store64(heap, arena)
-    heap
+    let heap = arena_alloc(arena, header_carve, 16)
+    if heap == 0 { 0 }
+    else {
+      mem_zero(heap, heap_header_size())
+      __mem_store64(heap, arena)
+      heap
+    }
   }
 }
 
@@ -347,10 +381,8 @@ fn heap_free(heap: i64, ptr: i64, size: i64) -> i64 {
 fn heap_destroy(heap: i64) -> i64 {
   if heap == 0 { 0 - 1 }
   else {
-    let arena = heap_arena(heap)
-    let result = arena_free(arena)
-    mem_zero(heap, heap_header_size())
-    result
+    -- The header lives inside the heap's arena mapping and dies with it.
+    arena_free(heap_arena(heap))
   }
 }
 
