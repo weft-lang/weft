@@ -206,8 +206,10 @@ fn main() -> i64 {
   Test.assert_eq(if mi_caller_calls(src, "hot", "poke") >= 1 { 1 } else { 0 }, 1)
 }
 
-test "multi_inline_rejects_managed_param" {
-  -- A variant-typed parameter carries a managed mask: call must remain.
+test "multi_inline_match_bodied_accessor_stays_call" {
+  -- Match-bodied accessors carry the unmatched-arm trap inst, which is
+  -- deliberately outside the clone whitelist until candidate budgets
+  -- land (admitting it blew probe compile times; see the gate comment).
   let src = "type Wrap {
   Wrap(i64)
 }
@@ -338,4 +340,163 @@ fn mi_total_calls(fns_list: IrFunctionList, target_hash: i64) -> i64 {
       one + mi_total_calls(rest, target_hash)
     }
   }
+}
+
+fn mi_total_generic_calls(fns_list: IrFunctionList, base_hash: i64) -> i64 {
+  match fns_list {
+    IrFunctionNil -> 0
+    IrFunctionCons(f, rest) -> {
+      let one = match f {
+        IrFunction(hash, nparams, blocks, src) -> mi_generic_calls_blocks(blocks, base_hash)
+      }
+      one + mi_total_generic_calls(rest, base_hash)
+    }
+  }
+}
+
+fn mi_generic_calls_blocks(blocks: IrBlockList, base_hash: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      let one = match block {
+        IrBlock(id, params, insts, term) -> mi_generic_calls_insts(insts, base_hash)
+      }
+      one + mi_generic_calls_blocks(rest, base_hash)
+    }
+  }
+}
+
+fn mi_generic_calls_insts(insts: IrInstList, base_hash: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let one = match inst {
+        IrGenericCallI64(dst, callee_hash, type_args, args) -> if callee_hash == base_hash { 1 } else { 0 }
+        _ -> 0
+      }
+      one + mi_generic_calls_insts(rest, base_hash)
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- Stage 2: managed multi-block candidates (spec facts + word-call gate)
+-- ---------------------------------------------------------------------
+
+test "multi_inline_match_bodied_spec_stays_call" {
+  -- Same trap-arm exclusion applies to generic specs.
+  let src = "type Pair2 {
+  Pair2(i64, i64)
+}
+
+fn pair2_first(p: Pair2) -> i64 {
+  match p {
+    Pair2(a, b) -> a
+  }
+}
+
+fn hot(n: i64) -> i64 {
+  let p = Pair2(n, n + 1)
+  let mut acc = 0
+  let mut i = 0
+  while i < n {
+    acc = acc + pair2_first(p)
+    i = i + 1
+  }
+  acc
+}
+
+fn main() -> i64 {
+  hot(5)
+}"
+  Test.assert_eq(if mi_caller_calls(src, "hot", "pair2_first") >= 1 { 1 } else { 0 }, 1)
+}
+
+test "multi_inline_managed_return_still_balanced" {
+  -- Behavioural witness compiled in-process: a managed-returning helper
+  -- chain optimises and the module still verifies.
+  let src = "type Box2 {
+  Box2(i64)
+}
+
+fn box2_make(v: i64) -> Box2 {
+  if v > 0 { Box2(v) } else { Box2(0 - v) }
+}
+
+fn box2_get(b: Box2) -> i64 {
+  match b {
+    Box2(v) -> v
+  }
+}
+
+fn main() -> i64 {
+  let mut acc = 0
+  let mut i = 0
+  while i < 4 {
+    acc = acc + box2_get(box2_make(i - 2))
+    i = i + 1
+  }
+  acc
+}"
+  Test.assert_eq(pipeline_ir_verify_module(mi_optimised(src)), 0)
+}
+
+test "multi_inline_rejects_float_signature" {
+  -- f64 params/returns cross the boundary in FP registers the scalar
+  -- clone path does not model: the word-call gate keeps the call.
+  let src = "fn fmix(a: f64, b: f64) -> i64 {
+  if a < b { 1 } else { 0 }
+}
+
+fn hot(n: i64) -> i64 {
+  let mut acc = 0
+  let mut i = 0
+  while i < n {
+    acc = acc + fmix(1.5, 2.5)
+    i = i + 1
+  }
+  acc
+}
+
+fn main() -> i64 {
+  hot(3)
+}"
+  Test.assert_eq(if mi_caller_calls(src, "hot", "fmix") >= 1 { 1 } else { 0 }, 1)
+}
+
+test "multi_inline_wrapper_becomes_candidate_after_swallowing" {
+  -- 1-block bodies are never candidates directly (see the gate comment),
+  -- but a wrapper that swallows a branchy body in pass one becomes a
+  -- multi-block candidate for the second pass, so its callers collapse
+  -- the whole chain.
+  let src = "fn deep(v: i64) -> i64 {
+  if v == 0 { 0 } else { v * 3 }
+}
+
+fn wrap1(v: i64) -> i64 {
+  deep(v)
+}
+
+fn main() -> i64 {
+  wrap1(4)
+}"
+  Test.assert_eq(mi_caller_calls(src, "main", "wrap1"), 0)
+  Test.assert_eq(mi_caller_calls(src, "wrap1", "deep"), 0)
+}
+
+test "multi_inline_sorted_chain_collapses" {
+  -- The stage-2 motivating chain: the find loop's entry-key reads stop
+  -- being calls (sorted_entry_key spec inlines; the storage accessors
+  -- already collapsed in slice B').
+  let file = read_file(mi_path_pair("bench/compare/weft/sorted_lookup.weft"))
+  let csrc = mem_load64_at(file, 0)
+  let clen = mem_load64_at(file, 8)
+  let typed = pipeline_check_source_with_origin(csrc, clen, 1, 0)
+  let ir = pipeline_lower_ir(typed)
+  let optimised = pipeline_optimise_typed_ir(typed, ir)
+  let functions = pipeline_ir_functions(optimised)
+  Test.assert_eq(pipeline_ir_verify_module(optimised), 0)
+  -- the storage-load chain collapsed (slice B' + stage 2); entry-key
+  -- specs are match-bodied and wait on the trap-arm unlock
+  Test.assert_eq(mi_total_generic_calls(functions, mi_hash("vector_get_in_bounds")), 0)
 }

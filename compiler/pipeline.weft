@@ -24871,6 +24871,18 @@ fn pipeline_ir_semantic_fact_lookup_scalar_result(facts: PipelineIrSemanticFactL
   }
 }
 
+-- Word-call fact: every param and the return travel in word registers
+-- (i64 scalars or managed pointers — return class 1 or 2 — and no
+-- f32/f64 anywhere in the signature). This is the boundary condition
+-- an IR-level splice needs; ownership is embedded in lowered bodies.
+fn pipeline_ir_semantic_fact_lookup_word_call(facts: PipelineIrSemanticFactList, hash: i64) -> i64 {
+  let fact = pipeline_ir_semantic_fact_find(facts, hash)
+  if fact == 0 { 0 } else {
+    let class = cg_semantic_fact_return_class(fact)
+    if (class == 1 or class == 2) and cg_semantic_fact_word_abi(fact) == 1 { 1 } else { 0 }
+  }
+}
+
 fn pipeline_ir_semantic_fact_lookup_managed_param_mask(facts: PipelineIrSemanticFactList, hash: i64) -> i64 {
   let mut cur = facts
   let mut result = 0
@@ -30811,6 +30823,79 @@ fn pipeline_ir_multi_inline_blocks_cap() -> i64 { 10 }
 fn pipeline_ir_multi_inline_insts_cap() -> i64 { 32 }
 fn pipeline_ir_multi_inline_site_cap() -> i64 { 32 }
 
+-- ----------------------------------------------------------------------
+-- Spec facts (2k stage 2): generic specialisations carry no semantic
+-- facts (the fact plane is keyed by declaration name hash), which kept
+-- every spec out of the inline candidate set. This producer walks the
+-- lowered module's generic call sites — the same site-driven discovery
+-- the spec collector uses — and registers a fact under each spec hash,
+-- built from the template's substituted signature and the template's
+-- body effect flags (the body is identical modulo types).
+-- ----------------------------------------------------------------------
+
+fn pipeline_ir_spec_fact_add(spec_hash: i64, pair: i64, targ_nodes: i64, flag_map: i64, facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
+  if pipeline_ir_semantic_fact_find(facts, spec_hash) != 0 { facts }
+  else {
+    let fn_wrap = node_f1(pair)
+    let fn_src = node_f2(pair)
+    let inner = pipeline_fn_inner(fn_wrap)
+    let subst = cg_build_subst(fn_tparams(fn_wrap), targ_nodes)
+    let params = cg_params_subst(node_f3(inner), subst)
+    let ret_ty = cg_generic_subst_ret(fn_wrap, targ_nodes)
+    let eff = effect_sig_from_node(fn_effects(fn_wrap))
+    let declared_alloc = effect_sig_contains_hash(eff, effect_name_hash(__str_ptr("Alloc"), 0, 5))
+    let declared_unsafe = effect_sig_contains_hash(eff, effect_name_hash(__str_ptr("Unsafe"), 0, 6))
+    let template_hash = str_hash(fn_src, node_f1(inner), node_f2(inner))
+    let effect_summary = cg_semantic_effect_summary_new(effect_sig_is_closed_or(eff, 1), effect_sig_count_or(eff, 0), declared_alloc, declared_unsafe)
+    let fact = cg_semantic_fact_new_with_effect_summary(0, effect_summary, params, ret_ty, 0, pipeline_ir_effect_flag_map_lookup(flag_map, template_hash))
+    pipeline_ir_semantic_facts_prepend(spec_hash, fact, facts)
+  }
+}
+
+fn pipeline_ir_spec_facts_insts(insts: IrInstList, templates: i64, flag_map: i64, facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
+  match insts {
+    IrInstNil -> facts
+    IrInstCons(inst, rest) -> {
+      let next = match inst {
+        IrGenericCallI64(dst, callee_hash, type_args, args) -> {
+          let pair = pipeline_generic_template_find(templates, 0, callee_hash)
+          if pair == 0 { facts }
+          else {
+            let nodes = type_expr_list_to_nodes(type_args)
+            pipeline_ir_spec_fact_add(mono_spec_hash(callee_hash, nodes), pair, nodes, flag_map, facts)
+          }
+        }
+        _ -> facts
+      }
+      pipeline_ir_spec_facts_insts(rest, templates, flag_map, next)
+    }
+  }
+}
+
+fn pipeline_ir_spec_facts_blocks(blocks: IrBlockList, templates: i64, flag_map: i64, facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
+  match blocks {
+    IrBlockListNil -> facts
+    IrBlockListCons(block, rest) -> {
+      let next = match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_spec_facts_insts(insts, templates, flag_map, facts)
+      }
+      pipeline_ir_spec_facts_blocks(rest, templates, flag_map, next)
+    }
+  }
+}
+
+fn pipeline_ir_spec_facts_extend(functions: IrFunctionList, templates: i64, flag_map: i64, facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
+  match functions {
+    IrFunctionNil -> facts
+    IrFunctionCons(f, rest) -> {
+      let next = match f {
+        IrFunction(hash, nparams, blocks, src) -> pipeline_ir_spec_facts_blocks(blocks, templates, flag_map, facts)
+      }
+      pipeline_ir_spec_facts_extend(rest, templates, flag_map, next)
+    }
+  }
+}
+
 fn pipeline_ir_multi_inline_inst_supported(inst: IrInst, self_hash: i64) -> i64 {
   match inst {
     IrConstI64(dst, value) -> 1
@@ -30819,9 +30904,27 @@ fn pipeline_ir_multi_inline_inst_supported(inst: IrInst, self_hash: i64) -> i64 
     IrUnaryI64(dst, op, value) -> 1
     IrPtrLoadI64(dst, ptr) -> 1
     IrBindI64(ns, nl, value, ty) -> 1
+    -- Slot cells (mut locals) renumber like any other def; the magic
+    -- borrowed-param-mask marker is dropped at clone time instead (it
+    -- describes the callee's own parameter contract, which dissolves
+    -- when the body is spliced into a host).
+    IrSlotI64(slot) -> 1
+    IrLoadI64(dst, slot) -> 1
+    IrStoreI64(slot, value) -> 1
+    IrVariantTagI64(dst, value) -> 1
+    IrVariantPayloadI64(dst, value, index) -> 1
+    -- The unmatched-arm trap (IrLoweringFailureI64) is deliberately NOT
+    -- admitted: allowing it makes every match-bodied accessor a
+    -- candidate module-wide, and the optimiser cost on the enlarged
+    -- hosts blew in-process probe compiles from seconds to minutes
+    -- (bounds_elision_metrics timed out). Unlock together with a
+    -- hotness/budget gate — recorded in the 2k brief.
     -- A self-call would re-expose a candidate site on every splice and
     -- burn the whole growth budget on one recursive body.
     IrCallI64(dst, callee_hash, args) -> if callee_hash == self_hash { 0 } else { 1 }
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> {
+      if mono_spec_hash(callee_hash, type_expr_list_to_nodes(type_args)) == self_hash { 0 } else { 1 }
+    }
     _ -> 0
   }
 }
@@ -30881,10 +30984,21 @@ fn pipeline_ir_multi_inline_eligible(f: IrFunction, facts: PipelineIrSemanticFac
       -- and reinstates bounds checks in elided kernels, which costs far
       -- more than the call saves.
       if hash == pipeline_ir_vector_len_hash() or hash == pipeline_ir_f64_table_row_count_hash() { 0 }
-      else { if nblocks < 2 or nblocks > pipeline_ir_multi_inline_blocks_cap() { 0 }
+      else { if nblocks < 1 or nblocks > pipeline_ir_multi_inline_blocks_cap() { 0 }
       else { if ir_block_list_inst_count(blocks) > pipeline_ir_multi_inline_insts_cap() { 0 }
-      else { if pipeline_ir_semantic_fact_lookup_scalar_result(facts, hash) != 1 { 0 }
-      else { if pipeline_ir_semantic_fact_lookup_managed_param_mask(facts, hash) != 0 { 0 }
+      -- Managed params and managed returns are admissible: lowered
+      -- bodies embed their whole ownership protocol (transfer retains,
+      -- borrow-masked or owned param releases, return transfers), so a
+      -- verbatim splice preserves balance. What must hold is the word
+      -- ABI — f32/f64 params or returns cross the boundary in FP
+      -- registers the scalar clone path does not model.
+      else { if pipeline_ir_semantic_fact_lookup_word_call(facts, hash) != 1 { 0 }
+      -- Single-block candidates are deliberately excluded: admitting them
+      -- exposed a value-miswiring interaction between dense splice
+      -- fragmentation and the fold (sorted_map put wrote search flags as
+      -- entry keys); the interaction is recorded in the 2k brief and
+      -- must be root-caused before the gate widens.
+      else { if nblocks < 2 { 0 }
       else { if pipeline_ir_multi_inline_entry_params_empty(blocks) == 0 { 0 }
       else { pipeline_ir_multi_inline_blocks_ok(blocks, hash) } } } } } }
     }
@@ -30931,6 +31045,13 @@ fn pipeline_ir_multi_clone_ctx_next_block(ctx: PipelineIrMultiCloneCtx) -> i64 {
   match ctx { PipelineIrMultiCloneCtx(venv, next_value, benv, next_block) -> next_block }
 }
 
+-- The borrowed-param-mask marker is an IrSlotI64 whose id sits at or
+-- below this base; it describes the callee's own parameter contract
+-- and is dropped when the body is spliced into a host.
+fn pipeline_ir_multi_slot_is_marker(slot: i64) -> i64 {
+  if slot <= pipeline_ir_borrowed_param_mask_slot_base() { 1 } else { 0 }
+}
+
 fn pipeline_ir_multi_inline_inst_dst(inst: IrInst) -> i64 {
   match inst {
     IrConstI64(dst, value) -> dst
@@ -30939,6 +31060,11 @@ fn pipeline_ir_multi_inline_inst_dst(inst: IrInst) -> i64 {
     IrUnaryI64(dst, op, value) -> dst
     IrPtrLoadI64(dst, ptr) -> dst
     IrCallI64(dst, callee_hash, args) -> dst
+    IrSlotI64(slot) -> if pipeline_ir_multi_slot_is_marker(slot) == 1 { 0 - 1 } else { slot }
+    IrLoadI64(dst, slot) -> dst
+    IrVariantTagI64(dst, value) -> dst
+    IrVariantPayloadI64(dst, value, index) -> dst
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> dst
     _ -> 0 - 1
   }
 }
@@ -31024,7 +31150,21 @@ fn pipeline_ir_multi_uses_bound_inst(inst: IrInst, venv: PipelineIrInlineValueEn
     IrUnaryI64(dst, op, value) -> if pipeline_ir_inline_value_env_lookup_or(venv, value, 0 - 1) < 0 { 0 } else { 1 }
     IrPtrLoadI64(dst, ptr) -> if pipeline_ir_inline_value_env_lookup_or(venv, ptr, 0 - 1) < 0 { 0 } else { 1 }
     IrBindI64(ns, nl, value, ty) -> 1
+    IrLoweringFailureI64(reason) -> 1
     IrCallI64(dst, callee_hash, args) -> pipeline_ir_multi_uses_bound_values(args, venv)
+    IrSlotI64(slot) -> 1
+    IrLoadI64(dst, slot) -> {
+      if pipeline_ir_multi_slot_is_marker(slot) == 1 { 0 }
+      else { if pipeline_ir_inline_value_env_lookup_or(venv, slot, 0 - 1) < 0 { 0 } else { 1 } }
+    }
+    IrStoreI64(slot, value) -> {
+      if pipeline_ir_multi_slot_is_marker(slot) == 1 { 0 }
+      else { if pipeline_ir_inline_value_env_lookup_or(venv, slot, 0 - 1) < 0 { 0 }
+      else { if pipeline_ir_inline_value_env_lookup_or(venv, value, 0 - 1) < 0 { 0 } else { 1 } } }
+    }
+    IrVariantTagI64(dst, value) -> if pipeline_ir_inline_value_env_lookup_or(venv, value, 0 - 1) < 0 { 0 } else { 1 }
+    IrVariantPayloadI64(dst, value, index) -> if pipeline_ir_inline_value_env_lookup_or(venv, value, 0 - 1) < 0 { 0 } else { 1 }
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> pipeline_ir_multi_uses_bound_values(args, venv)
     _ -> 0
   }
 }
@@ -31086,23 +31226,81 @@ fn pipeline_ir_multi_clone_insts(insts: IrInstList, venv: PipelineIrInlineValueE
         IrUnaryI64(dst, op, value) -> IrInstCons(ir_inst_unary_i64(pipeline_ir_multi_map_value(venv, dst), op, pipeline_ir_multi_map_value(venv, value)), tail)
         IrPtrLoadI64(dst, ptr) -> IrInstCons(ir_inst_ptr_load_i64(pipeline_ir_multi_map_value(venv, dst), pipeline_ir_multi_map_value(venv, ptr)), tail)
         IrBindI64(ns, nl, value, ty) -> tail
+        IrLoweringFailureI64(reason) -> IrInstCons(inst, tail)
         IrCallI64(dst, callee_hash, args) -> IrInstCons(ir_inst_call_i64(pipeline_ir_multi_map_value(venv, dst), callee_hash, pipeline_ir_multi_map_values(args, venv)), tail)
+        IrSlotI64(slot) -> {
+          -- The borrowed-param-mask marker describes the callee's own
+          -- parameter contract; it dissolves with the call boundary.
+          if pipeline_ir_multi_slot_is_marker(slot) == 1 { tail }
+          else { IrInstCons(ir_inst_slot_i64(pipeline_ir_multi_map_value(venv, slot)), tail) }
+        }
+        IrLoadI64(dst, slot) -> IrInstCons(ir_inst_load_i64(pipeline_ir_multi_map_value(venv, dst), pipeline_ir_multi_map_value(venv, slot)), tail)
+        IrStoreI64(slot, value) -> IrInstCons(ir_inst_store_i64(pipeline_ir_multi_map_value(venv, slot), pipeline_ir_multi_map_value(venv, value)), tail)
+        IrVariantTagI64(dst, value) -> IrInstCons(ir_inst_variant_tag_i64(pipeline_ir_multi_map_value(venv, dst), pipeline_ir_multi_map_value(venv, value)), tail)
+        IrVariantPayloadI64(dst, value, index) -> IrInstCons(ir_inst_variant_payload_i64(pipeline_ir_multi_map_value(venv, dst), pipeline_ir_multi_map_value(venv, value), index), tail)
+        IrGenericCallI64(dst, callee_hash, type_args, args) -> IrInstCons(IrGenericCallI64(pipeline_ir_multi_map_value(venv, dst), callee_hash, type_args, pipeline_ir_multi_map_values(args, venv)), tail)
         _ -> tail
       }
     }
   }
 }
 
-fn pipeline_ir_multi_clone_term(term: IrTerminator, venv: PipelineIrInlineValueEnv, benv: PipelineIrInlineValueEnv, cont_block: i64) -> IrTerminator {
+-- return_args = 1 keeps the parameter-passing continuation (needed when
+-- the candidate has several return sites); return_args = 0 emits a bare
+-- jump — the caller has bound the single return value directly onto the
+-- call's dst. A single-predecessor block PARAMETER is the shape the
+-- fold's chain collapse mishandles (use-before-def after merging), so
+-- single-return candidates avoid it entirely.
+fn pipeline_ir_multi_clone_term(term: IrTerminator, venv: PipelineIrInlineValueEnv, benv: PipelineIrInlineValueEnv, cont_block: i64, return_args: i64) -> IrTerminator {
   match term {
-    IrTermReturn(value) -> ir_term_jump_args(cont_block, IrValueCons(pipeline_ir_multi_map_value(venv, value), IrValueNil))
+    IrTermReturn(value) -> {
+      if return_args == 1 {
+        ir_term_jump_args(cont_block, IrValueCons(pipeline_ir_multi_map_value(venv, value), IrValueNil))
+      } else {
+        ir_term_jump(cont_block)
+      }
+    }
     IrTermJump(target, args) -> ir_term_jump_args(pipeline_ir_multi_map_value(benv, target), pipeline_ir_multi_map_values(args, venv))
     IrTermBranch(cond, then_target, else_target) -> ir_term_branch(pipeline_ir_multi_map_value(venv, cond), pipeline_ir_multi_map_value(benv, then_target), pipeline_ir_multi_map_value(benv, else_target))
     IrTermNone -> IrTermNone
   }
 }
 
-fn pipeline_ir_multi_clone_blocks(blocks: IrBlockList, venv: PipelineIrInlineValueEnv, benv: PipelineIrInlineValueEnv, cont_block: i64) -> IrBlockList {
+fn pipeline_ir_multi_return_count(blocks: IrBlockList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      let one = match block {
+        IrBlock(id, params, insts, term) -> {
+          match term {
+            IrTermReturn(value) -> 1
+            _ -> 0
+          }
+        }
+      }
+      one + pipeline_ir_multi_return_count(rest)
+    }
+  }
+}
+
+fn pipeline_ir_multi_single_return_value(blocks: IrBlockList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0 - 1
+    IrBlockListCons(block, rest) -> {
+      let one = match block {
+        IrBlock(id, params, insts, term) -> {
+          match term {
+            IrTermReturn(value) -> value
+            _ -> 0 - 1
+          }
+        }
+      }
+      if one >= 0 { one } else { pipeline_ir_multi_single_return_value(rest) }
+    }
+  }
+}
+
+fn pipeline_ir_multi_clone_blocks(blocks: IrBlockList, venv: PipelineIrInlineValueEnv, benv: PipelineIrInlineValueEnv, cont_block: i64, return_args: i64) -> IrBlockList {
   match blocks {
     IrBlockListNil -> IrBlockListNil
     IrBlockListCons(block, rest) -> {
@@ -31113,9 +31311,9 @@ fn pipeline_ir_multi_clone_blocks(blocks: IrBlockList, venv: PipelineIrInlineVal
               pipeline_ir_multi_map_value(benv, id),
               pipeline_ir_multi_map_values(params, venv),
               pipeline_ir_multi_clone_insts(insts, venv),
-              pipeline_ir_multi_clone_term(term, venv, benv, cont_block)
+              pipeline_ir_multi_clone_term(term, venv, benv, cont_block, return_args)
             ),
-            pipeline_ir_multi_clone_blocks(rest, venv, benv, cont_block)
+            pipeline_ir_multi_clone_blocks(rest, venv, benv, cont_block, return_args)
           )
         }
       }
@@ -31138,6 +31336,19 @@ fn pipeline_ir_multi_split_insts(insts: IrInstList, candidates: PipelineIrInline
             match pipeline_ir_inline_candidate_lookup(candidates, callee_hash) {
               IrFunctionNil -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix))
               IrFunctionCons(cf, crest) -> PipelineIrMultiSplit(1, prefix, dst, callee_hash, args, rest)
+            }
+          } else {
+            pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix))
+          }
+        }
+        -- Generic call sites resolve to their specialisation's hash: the
+        -- collected spec IrFunction is the candidate body.
+        IrGenericCallI64(dst, callee_hash, type_args, args) -> {
+          let spec_hash = mono_spec_hash(callee_hash, type_expr_list_to_nodes(type_args))
+          if spec_hash != self_hash {
+            match pipeline_ir_inline_candidate_lookup(candidates, spec_hash) {
+              IrFunctionNil -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix))
+              IrFunctionCons(cf, crest) -> PipelineIrMultiSplit(1, prefix, dst, spec_hash, args, rest)
             }
           } else {
             pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix))
@@ -31223,14 +31434,54 @@ fn pipeline_ir_multi_splice_block(host: IrBlock, split: PipelineIrMultiSplit, ca
                         PipelineIrMultiPassResult(0, IrBlockListCons(host, IrBlockListNil), next_value, next_block)
                       } else {
                         let head = ir_block_new_params(host_id, host_params, pipeline_ir_inst_list_reverse_onto(rev_prefix, IrInstNil), ir_term_jump(entry_target))
-                        let clones = pipeline_ir_multi_clone_blocks(cblocks, venv, benv, cont_block)
-                        let cont = ir_block_new_params(cont_block, IrValueCons(dst, IrValueNil), suffix, host_term)
-                        PipelineIrMultiPassResult(
-                          1,
-                          IrBlockListCons(head, ir_block_list_append(clones, IrBlockListCons(cont, IrBlockListNil))),
-                          pipeline_ir_multi_clone_ctx_next_value(ctx),
-                          pipeline_ir_multi_clone_ctx_next_block(ctx)
-                        )
+                        let ret_count = pipeline_ir_multi_return_count(cblocks)
+                        let ret_value = pipeline_ir_multi_single_return_value(cblocks)
+                        if ret_count == 1 and ret_value >= cparam_count {
+                          -- Single local return: bind the return value straight
+                          -- onto the call's dst (the shadowing prepend wins over
+                          -- the fresh id from the defs pass) and keep the
+                          -- continuation parameterless.
+                          let bound = pipeline_ir_inline_value_env_bind(venv, ret_value, dst)
+                          let clones = pipeline_ir_multi_clone_blocks(cblocks, bound, benv, cont_block, 0)
+                          let cont = ir_block_new_params(cont_block, IrValueNil, suffix, host_term)
+                          PipelineIrMultiPassResult(
+                            1,
+                            IrBlockListCons(head, ir_block_list_append(clones, IrBlockListCons(cont, IrBlockListNil))),
+                            pipeline_ir_multi_clone_ctx_next_value(ctx),
+                            pipeline_ir_multi_clone_ctx_next_block(ctx)
+                          )
+                        } else { if ret_count == 1 {
+                          -- Single return of a callee parameter: define dst in
+                          -- the continuation as arg + 0 (the algebraic fold
+                          -- collapses the identity add into an alias).
+                          let arg = pipeline_ir_inline_value_env_lookup_or(venv, ret_value, 0 - 1)
+                          if arg < 0 {
+                            PipelineIrMultiPassResult(0, IrBlockListCons(host, IrBlockListNil), next_value, next_block)
+                          } else {
+                            let zero_id = pipeline_ir_multi_clone_ctx_next_value(ctx)
+                            let clones = pipeline_ir_multi_clone_blocks(cblocks, venv, benv, cont_block, 0)
+                            let cont_insts = IrInstCons(
+                              ir_inst_const_i64(zero_id, 0),
+                              IrInstCons(ir_inst_binary_i64(dst, ir_binary_op_from_parser(1), arg, zero_id), suffix)
+                            )
+                            let cont = ir_block_new_params(cont_block, IrValueNil, cont_insts, host_term)
+                            PipelineIrMultiPassResult(
+                              1,
+                              IrBlockListCons(head, ir_block_list_append(clones, IrBlockListCons(cont, IrBlockListNil))),
+                              zero_id + 1,
+                              pipeline_ir_multi_clone_ctx_next_block(ctx)
+                            )
+                          }
+                        } else {
+                          let clones = pipeline_ir_multi_clone_blocks(cblocks, venv, benv, cont_block, 1)
+                          let cont = ir_block_new_params(cont_block, IrValueCons(dst, IrValueNil), suffix, host_term)
+                          PipelineIrMultiPassResult(
+                            1,
+                            IrBlockListCons(head, ir_block_list_append(clones, IrBlockListCons(cont, IrBlockListNil))),
+                            pipeline_ir_multi_clone_ctx_next_value(ctx),
+                            pipeline_ir_multi_clone_ctx_next_block(ctx)
+                          )
+                        } }
                       }
                     }
                   }
@@ -36361,7 +36612,13 @@ fn pipeline_optimise_typed_ir_with_promotion(typed: TypedModule, ir: IrModule, p
       let direct_generic_specs = pipeline_ir_function_list_dedup(raw_generic_specs)
       let generic_specs = pipeline_collect_generic_specs_closure(direct_generic_specs, templates, fns, tt)
       let functions = pipeline_ir_function_list_append(base_functions, generic_specs)
-      let semantic_facts = pipeline_ir_semantic_facts_from_fns(fns, 0)
+      let decl_facts = pipeline_ir_semantic_facts_from_fns(fns, 0)
+      -- Extend the fact plane to generic specialisations (2k stage 2):
+      -- specs are keyed by their mono hash, which the declaration-keyed
+      -- fact walk never produces. Facts are derived from the template's
+      -- substituted signature at every generic call site, which is the
+      -- same site-driven discovery the spec collector itself uses.
+      let semantic_facts = pipeline_ir_spec_facts_extend(functions, templates, pipeline_ir_semantic_facts_effect_flag_map(decl_facts), decl_facts)
       -- Reconnect the per-function IR optimiser (copy propagation, liveness,
       -- block-parameter trimming, DCE) on the typed path. It was bypassed
       -- during the migration for compile-time cost; the block-entry fact
