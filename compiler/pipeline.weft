@@ -24858,6 +24858,19 @@ fn pipeline_ir_semantic_fact_lookup_pure_scalar_result(facts: PipelineIrSemantic
   }
 }
 
+-- Scalar-return fact WITHOUT the purity requirement. The multi-block
+-- splice needs only the ABI shape: trusted raw-memory accessor bodies
+-- are deliberately flagged effectful by the body-flag fixpoint (their
+-- loads must not be CSE'd or reordered as pure), but SPLICING preserves
+-- instruction order and count, so purity is not a soundness input —
+-- the clone whitelist already rejects stores, performs, and handles.
+fn pipeline_ir_semantic_fact_lookup_scalar_result(facts: PipelineIrSemanticFactList, hash: i64) -> i64 {
+  let fact = pipeline_ir_semantic_fact_find(facts, hash)
+  if fact == 0 { 0 } else {
+    if cg_semantic_fact_i64_return(fact) == 1 { 1 } else { 0 }
+  }
+}
+
 fn pipeline_ir_semantic_fact_lookup_managed_param_mask(facts: PipelineIrSemanticFactList, hash: i64) -> i64 {
   let mut cur = facts
   let mut result = 0
@@ -30771,6 +30784,527 @@ fn pipeline_ir_try_inline_direct_call(callee_hash: i64, args: IrValueList, inlin
   }
 }
 
+-- ======================================================================
+-- Multi-block tiny-fn inlining (2k slice B'): splice small pure
+-- unmanaged-param callees whose bodies carry control flow — the
+-- null-guarded storage accessors and comparator shapes the
+-- single-block splice above can never take. Eligibility consumes the
+-- semantic fact list (purity, managed masks); nothing is re-derived
+-- from syntax. The splice runs per host function before the fold, so
+-- copy-prop, CSE, and DCE then chew on the merged body.
+-- ======================================================================
+
+fn pipeline_ir_multi_inline_blocks_cap() -> i64 { 10 }
+fn pipeline_ir_multi_inline_insts_cap() -> i64 { 32 }
+fn pipeline_ir_multi_inline_site_cap() -> i64 { 32 }
+
+fn pipeline_ir_multi_inline_inst_supported(inst: IrInst, self_hash: i64) -> i64 {
+  match inst {
+    IrConstI64(dst, value) -> 1
+    IrNilI64(dst) -> 1
+    IrBinaryI64(dst, op, lhs, rhs) -> ir_binary_op_is_supported(op)
+    IrUnaryI64(dst, op, value) -> 1
+    IrPtrLoadI64(dst, ptr) -> 1
+    IrBindI64(ns, nl, value, ty) -> 1
+    -- A self-call would re-expose a candidate site on every splice and
+    -- burn the whole growth budget on one recursive body.
+    IrCallI64(dst, callee_hash, args) -> if callee_hash == self_hash { 0 } else { 1 }
+    _ -> 0
+  }
+}
+
+fn pipeline_ir_multi_inline_insts_ok(insts: IrInstList, self_hash: i64) -> i64 {
+  match insts {
+    IrInstNil -> 1
+    IrInstCons(inst, rest) -> {
+      if pipeline_ir_multi_inline_inst_supported(inst, self_hash) == 1 { pipeline_ir_multi_inline_insts_ok(rest, self_hash) } else { 0 }
+    }
+  }
+}
+
+fn pipeline_ir_multi_inline_term_ok(term: IrTerminator) -> i64 {
+  match term {
+    IrTermReturn(value) -> 1
+    IrTermJump(target, args) -> 1
+    IrTermBranch(cond, then_target, else_target) -> 1
+    IrTermNone -> 0
+  }
+}
+
+fn pipeline_ir_multi_inline_blocks_ok(blocks: IrBlockList, self_hash: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 1
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          if pipeline_ir_multi_inline_insts_ok(insts, self_hash) == 1 and pipeline_ir_multi_inline_term_ok(term) == 1 {
+            pipeline_ir_multi_inline_blocks_ok(rest, self_hash)
+          } else { 0 }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_multi_inline_entry_params_empty(blocks: IrBlockList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> if ir_value_list_len(params) == 0 { 1 } else { 0 }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_multi_inline_eligible(f: IrFunction, facts: PipelineIrSemanticFactList) -> i64 {
+  match f {
+    IrFunction(hash, param_count, blocks, src) -> {
+      let nblocks = ir_block_list_len(blocks)
+      -- vector_len and f64_table_row_count calls are the bounds
+      -- machinery's len-stability fact carriers (slot induction, row
+      -- upper facts, and the row-count rewrite all key on IrCallI64 to
+      -- these hashes). Dissolving the call destroys the fact producer
+      -- and reinstates bounds checks in elided kernels, which costs far
+      -- more than the call saves.
+      if hash == pipeline_ir_vector_len_hash() or hash == pipeline_ir_f64_table_row_count_hash() { 0 }
+      else { if nblocks < 2 or nblocks > pipeline_ir_multi_inline_blocks_cap() { 0 }
+      else { if ir_block_list_inst_count(blocks) > pipeline_ir_multi_inline_insts_cap() { 0 }
+      else { if pipeline_ir_semantic_fact_lookup_scalar_result(facts, hash) != 1 { 0 }
+      else { if pipeline_ir_semantic_fact_lookup_managed_param_mask(facts, hash) != 0 { 0 }
+      else { if pipeline_ir_multi_inline_entry_params_empty(blocks) == 0 { 0 }
+      else { pipeline_ir_multi_inline_blocks_ok(blocks, hash) } } } } } }
+    }
+  }
+}
+
+fn pipeline_ir_multi_inline_candidates_walk(functions: IrFunctionList, facts: PipelineIrSemanticFactList) -> PipelineIrInlineCandidateList {
+  match functions {
+    IrFunctionNil -> PipelineIrInlineCandidateNil
+    IrFunctionCons(f, rest) -> {
+      let tail = pipeline_ir_multi_inline_candidates_walk(rest, facts)
+      match f {
+        IrFunction(hash, param_count, blocks, src) -> {
+          if pipeline_ir_multi_inline_eligible(f, facts) == 1 {
+            pipeline_ir_inline_candidate_prepend(hash, f, tail)
+          } else {
+            tail
+          }
+        }
+      }
+    }
+  }
+}
+
+-- Clone context: value env (callee id -> host id), next host value id,
+-- block env (callee block id -> host block id), next host block id.
+type PipelineIrMultiCloneCtx {
+  PipelineIrMultiCloneCtx(PipelineIrInlineValueEnv, i64, PipelineIrInlineValueEnv, i64)
+}
+
+fn pipeline_ir_multi_clone_ctx_venv(ctx: PipelineIrMultiCloneCtx) -> PipelineIrInlineValueEnv {
+  match ctx { PipelineIrMultiCloneCtx(venv, next_value, benv, next_block) -> venv }
+}
+
+fn pipeline_ir_multi_clone_ctx_next_value(ctx: PipelineIrMultiCloneCtx) -> i64 {
+  match ctx { PipelineIrMultiCloneCtx(venv, next_value, benv, next_block) -> next_value }
+}
+
+fn pipeline_ir_multi_clone_ctx_benv(ctx: PipelineIrMultiCloneCtx) -> PipelineIrInlineValueEnv {
+  match ctx { PipelineIrMultiCloneCtx(venv, next_value, benv, next_block) -> benv }
+}
+
+fn pipeline_ir_multi_clone_ctx_next_block(ctx: PipelineIrMultiCloneCtx) -> i64 {
+  match ctx { PipelineIrMultiCloneCtx(venv, next_value, benv, next_block) -> next_block }
+}
+
+fn pipeline_ir_multi_inline_inst_dst(inst: IrInst) -> i64 {
+  match inst {
+    IrConstI64(dst, value) -> dst
+    IrNilI64(dst) -> dst
+    IrBinaryI64(dst, op, lhs, rhs) -> dst
+    IrUnaryI64(dst, op, value) -> dst
+    IrPtrLoadI64(dst, ptr) -> dst
+    IrCallI64(dst, callee_hash, args) -> dst
+    _ -> 0 - 1
+  }
+}
+
+fn pipeline_ir_multi_defs_values(values: IrValueList, ctx: PipelineIrMultiCloneCtx) -> PipelineIrMultiCloneCtx {
+  match values {
+    IrValueNil -> ctx
+    IrValueCons(value, rest) -> {
+      let nv = pipeline_ir_multi_clone_ctx_next_value(ctx)
+      let next = PipelineIrMultiCloneCtx(
+        pipeline_ir_inline_value_env_bind(pipeline_ir_multi_clone_ctx_venv(ctx), value, nv),
+        nv + 1,
+        pipeline_ir_multi_clone_ctx_benv(ctx),
+        pipeline_ir_multi_clone_ctx_next_block(ctx)
+      )
+      pipeline_ir_multi_defs_values(rest, next)
+    }
+  }
+}
+
+fn pipeline_ir_multi_defs_insts(insts: IrInstList, ctx: PipelineIrMultiCloneCtx) -> PipelineIrMultiCloneCtx {
+  match insts {
+    IrInstNil -> ctx
+    IrInstCons(inst, rest) -> {
+      let dst = pipeline_ir_multi_inline_inst_dst(inst)
+      let next = if dst < 0 { ctx } else {
+        let nv = pipeline_ir_multi_clone_ctx_next_value(ctx)
+        PipelineIrMultiCloneCtx(
+          pipeline_ir_inline_value_env_bind(pipeline_ir_multi_clone_ctx_venv(ctx), dst, nv),
+          nv + 1,
+          pipeline_ir_multi_clone_ctx_benv(ctx),
+          pipeline_ir_multi_clone_ctx_next_block(ctx)
+        )
+      }
+      pipeline_ir_multi_defs_insts(rest, next)
+    }
+  }
+}
+
+fn pipeline_ir_multi_defs_blocks(blocks: IrBlockList, ctx: PipelineIrMultiCloneCtx) -> PipelineIrMultiCloneCtx {
+  match blocks {
+    IrBlockListNil -> ctx
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          let nb = pipeline_ir_multi_clone_ctx_next_block(ctx)
+          let with_block = PipelineIrMultiCloneCtx(
+            pipeline_ir_multi_clone_ctx_venv(ctx),
+            pipeline_ir_multi_clone_ctx_next_value(ctx),
+            pipeline_ir_inline_value_env_bind(pipeline_ir_multi_clone_ctx_benv(ctx), id, nb),
+            nb + 1
+          )
+          let with_params = pipeline_ir_multi_defs_values(params, with_block)
+          let with_insts = pipeline_ir_multi_defs_insts(insts, with_params)
+          pipeline_ir_multi_defs_blocks(rest, with_insts)
+        }
+      }
+    }
+  }
+}
+
+-- Uses must resolve through the env: callee bodies only reference their
+-- own params (pre-bound to call args) and local defs. An unbound use
+-- means the candidate body was not self-contained; the splice bails.
+fn pipeline_ir_multi_uses_bound_values(values: IrValueList, venv: PipelineIrInlineValueEnv) -> i64 {
+  match values {
+    IrValueNil -> 1
+    IrValueCons(value, rest) -> {
+      if pipeline_ir_inline_value_env_lookup_or(venv, value, 0 - 1) < 0 { 0 }
+      else { pipeline_ir_multi_uses_bound_values(rest, venv) }
+    }
+  }
+}
+
+fn pipeline_ir_multi_uses_bound_inst(inst: IrInst, venv: PipelineIrInlineValueEnv) -> i64 {
+  match inst {
+    IrConstI64(dst, value) -> 1
+    IrNilI64(dst) -> 1
+    IrBinaryI64(dst, op, lhs, rhs) -> {
+      if pipeline_ir_inline_value_env_lookup_or(venv, lhs, 0 - 1) < 0 { 0 }
+      else { if pipeline_ir_inline_value_env_lookup_or(venv, rhs, 0 - 1) < 0 { 0 } else { 1 } }
+    }
+    IrUnaryI64(dst, op, value) -> if pipeline_ir_inline_value_env_lookup_or(venv, value, 0 - 1) < 0 { 0 } else { 1 }
+    IrPtrLoadI64(dst, ptr) -> if pipeline_ir_inline_value_env_lookup_or(venv, ptr, 0 - 1) < 0 { 0 } else { 1 }
+    IrBindI64(ns, nl, value, ty) -> 1
+    IrCallI64(dst, callee_hash, args) -> pipeline_ir_multi_uses_bound_values(args, venv)
+    _ -> 0
+  }
+}
+
+fn pipeline_ir_multi_uses_bound_term(term: IrTerminator, venv: PipelineIrInlineValueEnv) -> i64 {
+  match term {
+    IrTermReturn(value) -> if pipeline_ir_inline_value_env_lookup_or(venv, value, 0 - 1) < 0 { 0 } else { 1 }
+    IrTermJump(target, args) -> pipeline_ir_multi_uses_bound_values(args, venv)
+    IrTermBranch(cond, then_target, else_target) -> if pipeline_ir_inline_value_env_lookup_or(venv, cond, 0 - 1) < 0 { 0 } else { 1 }
+    IrTermNone -> 0
+  }
+}
+
+fn pipeline_ir_multi_uses_bound_blocks(blocks: IrBlockList, venv: PipelineIrInlineValueEnv) -> i64 {
+  match blocks {
+    IrBlockListNil -> 1
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          let mut cur = insts
+          let mut ok = 1
+          while ok == 1 {
+            match cur {
+              IrInstNil -> { ok = 2 }
+              IrInstCons(inst, tail) -> {
+                if pipeline_ir_multi_uses_bound_inst(inst, venv) == 0 { ok = 0 } else { cur = tail }
+              }
+            }
+          }
+          if ok == 0 { 0 }
+          else { if pipeline_ir_multi_uses_bound_term(term, venv) == 0 { 0 }
+          else { pipeline_ir_multi_uses_bound_blocks(rest, venv) } }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_multi_map_value(venv: PipelineIrInlineValueEnv, value: i64) -> i64 {
+  pipeline_ir_inline_value_env_lookup_or(venv, value, value)
+}
+
+fn pipeline_ir_multi_map_values(values: IrValueList, venv: PipelineIrInlineValueEnv) -> IrValueList {
+  match values {
+    IrValueNil -> IrValueNil
+    IrValueCons(value, rest) -> IrValueCons(pipeline_ir_multi_map_value(venv, value), pipeline_ir_multi_map_values(rest, venv))
+  }
+}
+
+fn pipeline_ir_multi_clone_insts(insts: IrInstList, venv: PipelineIrInlineValueEnv) -> IrInstList {
+  match insts {
+    IrInstNil -> IrInstNil
+    IrInstCons(inst, rest) -> {
+      let tail = pipeline_ir_multi_clone_insts(rest, venv)
+      match inst {
+        IrConstI64(dst, value) -> IrInstCons(ir_inst_const_i64(pipeline_ir_multi_map_value(venv, dst), value), tail)
+        IrNilI64(dst) -> IrInstCons(ir_inst_nil_i64(pipeline_ir_multi_map_value(venv, dst)), tail)
+        IrBinaryI64(dst, op, lhs, rhs) -> IrInstCons(ir_inst_binary_i64(pipeline_ir_multi_map_value(venv, dst), op, pipeline_ir_multi_map_value(venv, lhs), pipeline_ir_multi_map_value(venv, rhs)), tail)
+        IrUnaryI64(dst, op, value) -> IrInstCons(ir_inst_unary_i64(pipeline_ir_multi_map_value(venv, dst), op, pipeline_ir_multi_map_value(venv, value)), tail)
+        IrPtrLoadI64(dst, ptr) -> IrInstCons(ir_inst_ptr_load_i64(pipeline_ir_multi_map_value(venv, dst), pipeline_ir_multi_map_value(venv, ptr)), tail)
+        IrBindI64(ns, nl, value, ty) -> tail
+        IrCallI64(dst, callee_hash, args) -> IrInstCons(ir_inst_call_i64(pipeline_ir_multi_map_value(venv, dst), callee_hash, pipeline_ir_multi_map_values(args, venv)), tail)
+        _ -> tail
+      }
+    }
+  }
+}
+
+fn pipeline_ir_multi_clone_term(term: IrTerminator, venv: PipelineIrInlineValueEnv, benv: PipelineIrInlineValueEnv, cont_block: i64) -> IrTerminator {
+  match term {
+    IrTermReturn(value) -> ir_term_jump_args(cont_block, IrValueCons(pipeline_ir_multi_map_value(venv, value), IrValueNil))
+    IrTermJump(target, args) -> ir_term_jump_args(pipeline_ir_multi_map_value(benv, target), pipeline_ir_multi_map_values(args, venv))
+    IrTermBranch(cond, then_target, else_target) -> ir_term_branch(pipeline_ir_multi_map_value(venv, cond), pipeline_ir_multi_map_value(benv, then_target), pipeline_ir_multi_map_value(benv, else_target))
+    IrTermNone -> IrTermNone
+  }
+}
+
+fn pipeline_ir_multi_clone_blocks(blocks: IrBlockList, venv: PipelineIrInlineValueEnv, benv: PipelineIrInlineValueEnv, cont_block: i64) -> IrBlockList {
+  match blocks {
+    IrBlockListNil -> IrBlockListNil
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          IrBlockListCons(
+            ir_block_new_params(
+              pipeline_ir_multi_map_value(benv, id),
+              pipeline_ir_multi_map_values(params, venv),
+              pipeline_ir_multi_clone_insts(insts, venv),
+              pipeline_ir_multi_clone_term(term, venv, benv, cont_block)
+            ),
+            pipeline_ir_multi_clone_blocks(rest, venv, benv, cont_block)
+          )
+        }
+      }
+    }
+  }
+}
+
+-- Split result: found flag, reversed prefix insts, call fields, suffix.
+type PipelineIrMultiSplit {
+  PipelineIrMultiSplit(i64, IrInstList, i64, i64, IrValueList, IrInstList)
+}
+
+fn pipeline_ir_multi_split_insts(insts: IrInstList, candidates: PipelineIrInlineCandidateList, self_hash: i64, prefix: IrInstList) -> PipelineIrMultiSplit {
+  match insts {
+    IrInstNil -> PipelineIrMultiSplit(0, prefix, 0, 0, IrValueNil, IrInstNil)
+    IrInstCons(inst, rest) -> {
+      match inst {
+        IrCallI64(dst, callee_hash, args) -> {
+          if callee_hash != self_hash {
+            match pipeline_ir_inline_candidate_lookup(candidates, callee_hash) {
+              IrFunctionNil -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix))
+              IrFunctionCons(cf, crest) -> PipelineIrMultiSplit(1, prefix, dst, callee_hash, args, rest)
+            }
+          } else {
+            pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix))
+          }
+        }
+        _ -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix))
+      }
+    }
+  }
+}
+
+fn pipeline_ir_multi_split_found(split: PipelineIrMultiSplit) -> i64 {
+  match split { PipelineIrMultiSplit(found, prefix, dst, callee_hash, args, suffix) -> found }
+}
+
+fn pipeline_ir_inst_list_reverse_onto(insts: IrInstList, acc: IrInstList) -> IrInstList {
+  match insts {
+    IrInstNil -> acc
+    IrInstCons(inst, rest) -> pipeline_ir_inst_list_reverse_onto(rest, IrInstCons(inst, acc))
+  }
+}
+
+fn pipeline_ir_block_list_max_id(blocks: IrBlockList, current: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> current
+    IrBlockListCons(block, rest) -> {
+      let one = match block {
+        IrBlock(id, params, insts, term) -> if id > current { id } else { current }
+      }
+      pipeline_ir_block_list_max_id(rest, one)
+    }
+  }
+}
+
+-- Pass state: changed flag, rebuilt blocks, next value id, next block id.
+type PipelineIrMultiPassResult {
+  PipelineIrMultiPassResult(i64, IrBlockList, i64, i64)
+}
+
+fn pipeline_ir_multi_pass_changed(r: PipelineIrMultiPassResult) -> i64 {
+  match r { PipelineIrMultiPassResult(changed, blocks, next_value, next_block) -> changed }
+}
+
+fn pipeline_ir_multi_pass_blocks(r: PipelineIrMultiPassResult) -> IrBlockList {
+  match r { PipelineIrMultiPassResult(changed, blocks, next_value, next_block) -> blocks }
+}
+
+fn pipeline_ir_multi_pass_next_value(r: PipelineIrMultiPassResult) -> i64 {
+  match r { PipelineIrMultiPassResult(changed, blocks, next_value, next_block) -> next_value }
+}
+
+fn pipeline_ir_multi_pass_next_block(r: PipelineIrMultiPassResult) -> i64 {
+  match r { PipelineIrMultiPassResult(changed, blocks, next_value, next_block) -> next_block }
+}
+
+-- Splice one candidate call found in the given host block. Returns the
+-- replacement blocks (host head, callee clones, continuation) or an
+-- unchanged result when the clone is not self-contained.
+fn pipeline_ir_multi_splice_block(host: IrBlock, split: PipelineIrMultiSplit, candidates: PipelineIrInlineCandidateList, next_value: i64, next_block: i64) -> PipelineIrMultiPassResult {
+  match host {
+    IrBlock(host_id, host_params, host_insts, host_term) -> {
+      match split {
+        PipelineIrMultiSplit(found, rev_prefix, dst, callee_hash, args, suffix) -> {
+          match pipeline_ir_inline_candidate_lookup(candidates, callee_hash) {
+            IrFunctionNil -> PipelineIrMultiPassResult(0, IrBlockListCons(host, IrBlockListNil), next_value, next_block)
+            IrFunctionCons(callee, crest) -> {
+              match callee {
+                IrFunction(chash, cparam_count, cblocks, csrc) -> {
+                  if ir_value_list_len(args) != cparam_count {
+                    PipelineIrMultiPassResult(0, IrBlockListCons(host, IrBlockListNil), next_value, next_block)
+                  } else {
+                    let cont_block = next_block
+                    let arg_env = pipeline_ir_inline_arg_env(args, 0, PipelineIrInlineValueEnvNil)
+                    let seeded = PipelineIrMultiCloneCtx(arg_env, next_value, PipelineIrInlineValueEnvNil, next_block + 1)
+                    let ctx = pipeline_ir_multi_defs_blocks(cblocks, seeded)
+                    let venv = pipeline_ir_multi_clone_ctx_venv(ctx)
+                    let benv = pipeline_ir_multi_clone_ctx_benv(ctx)
+                    if pipeline_ir_multi_uses_bound_blocks(cblocks, venv) == 0 {
+                      PipelineIrMultiPassResult(0, IrBlockListCons(host, IrBlockListNil), next_value, next_block)
+                    } else {
+                      let entry_target = pipeline_ir_inline_value_env_lookup_or(benv, ir_block_id(pipeline_ir_block_list_first(cblocks)), 0 - 1)
+                      if entry_target < 0 {
+                        PipelineIrMultiPassResult(0, IrBlockListCons(host, IrBlockListNil), next_value, next_block)
+                      } else {
+                        let head = ir_block_new_params(host_id, host_params, pipeline_ir_inst_list_reverse_onto(rev_prefix, IrInstNil), ir_term_jump(entry_target))
+                        let clones = pipeline_ir_multi_clone_blocks(cblocks, venv, benv, cont_block)
+                        let cont = ir_block_new_params(cont_block, IrValueCons(dst, IrValueNil), suffix, host_term)
+                        PipelineIrMultiPassResult(
+                          1,
+                          IrBlockListCons(head, ir_block_list_append(clones, IrBlockListCons(cont, IrBlockListNil))),
+                          pipeline_ir_multi_clone_ctx_next_value(ctx),
+                          pipeline_ir_multi_clone_ctx_next_block(ctx)
+                        )
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_block_list_first(blocks: IrBlockList) -> IrBlock {
+  match blocks {
+    IrBlockListNil -> ir_block_new(0 - 1, ir_inst_list_empty())
+    IrBlockListCons(block, rest) -> block
+  }
+}
+
+-- One sweep: rewrite the first block containing a candidate call.
+fn pipeline_ir_multi_inline_sweep(blocks: IrBlockList, candidates: PipelineIrInlineCandidateList, self_hash: i64, next_value: i64, next_block: i64) -> PipelineIrMultiPassResult {
+  match blocks {
+    IrBlockListNil -> PipelineIrMultiPassResult(0, IrBlockListNil, next_value, next_block)
+    IrBlockListCons(block, rest) -> {
+      let split = match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_multi_split_insts(insts, candidates, self_hash, IrInstNil)
+      }
+      if pipeline_ir_multi_split_found(split) == 1 {
+        let spliced = pipeline_ir_multi_splice_block(block, split, candidates, next_value, next_block)
+        if pipeline_ir_multi_pass_changed(spliced) == 1 {
+          PipelineIrMultiPassResult(
+            1,
+            ir_block_list_append(pipeline_ir_multi_pass_blocks(spliced), rest),
+            pipeline_ir_multi_pass_next_value(spliced),
+            pipeline_ir_multi_pass_next_block(spliced)
+          )
+        } else {
+          let tail = pipeline_ir_multi_inline_sweep(rest, candidates, self_hash, next_value, next_block)
+          PipelineIrMultiPassResult(
+            pipeline_ir_multi_pass_changed(tail),
+            IrBlockListCons(block, pipeline_ir_multi_pass_blocks(tail)),
+            pipeline_ir_multi_pass_next_value(tail),
+            pipeline_ir_multi_pass_next_block(tail)
+          )
+        }
+      } else {
+        let tail = pipeline_ir_multi_inline_sweep(rest, candidates, self_hash, next_value, next_block)
+        PipelineIrMultiPassResult(
+          pipeline_ir_multi_pass_changed(tail),
+          IrBlockListCons(block, pipeline_ir_multi_pass_blocks(tail)),
+          pipeline_ir_multi_pass_next_value(tail),
+          pipeline_ir_multi_pass_next_block(tail)
+        )
+      }
+    }
+  }
+}
+
+-- Function-level driver: splice until no candidate calls remain or the
+-- site cap bounds growth (mutual-recursion backstop). Returns via the
+-- pass-result shape: changed carries the site count.
+fn pipeline_ir_multi_inline_function_blocks(self_hash: i64, param_count: i64, blocks: IrBlockList, candidates: PipelineIrInlineCandidateList) -> PipelineIrMultiPassResult {
+  match candidates {
+    PipelineIrInlineCandidateNil -> PipelineIrMultiPassResult(0, blocks, pipeline_ir_function_next_value(param_count, blocks), pipeline_ir_block_list_max_id(blocks, 0) + 1)
+    PipelineIrInlineCandidateNode(chash, cf, clower, chigher) -> {
+      let mut current = blocks
+      let mut next_value = pipeline_ir_function_next_value(param_count, blocks)
+      let mut next_block = pipeline_ir_block_list_max_id(blocks, 0) + 1
+      let mut sites = 0
+      let mut go = 1
+      while go == 1 and sites < pipeline_ir_multi_inline_site_cap() {
+        let swept = pipeline_ir_multi_inline_sweep(current, candidates, self_hash, next_value, next_block)
+        if pipeline_ir_multi_pass_changed(swept) == 1 {
+          current = pipeline_ir_multi_pass_blocks(swept)
+          next_value = pipeline_ir_multi_pass_next_value(swept)
+          next_block = pipeline_ir_multi_pass_next_block(swept)
+          sites = sites + 1
+        } else {
+          go = 0
+        }
+      }
+      PipelineIrMultiPassResult(sites, current, next_value, next_block)
+    }
+  }
+}
+
 fn pipeline_ir_inst_preserves_pure_call_cse(inst: IrInst, facts: PipelineIrSemanticFactList) -> i64 {
   match inst {
     IrConstI64(dst, value) -> 1
@@ -34150,10 +34684,13 @@ fn pipeline_ir_verify_module(ir: IrModule) -> i64 {
   pipeline_ir_verify_function_list(pipeline_ir_functions(ir), 0)
 }
 
-fn pipeline_optimise_ir_function(f: IrFunction, inline_candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, pure_callees: i64) -> PipelineOptimisedFunctions {
+fn pipeline_optimise_ir_function(f: IrFunction, inline_candidates: PipelineIrInlineCandidateList, multi_candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, pure_callees: i64) -> PipelineOptimisedFunctions {
   match f {
-    IrFunction(hash, params, blocks, src) -> {
-      let first_next_value = pipeline_ir_function_next_value(params, blocks)
+    IrFunction(hash, params, raw_blocks, src) -> {
+      let multi = pipeline_ir_multi_inline_function_blocks(hash, params, raw_blocks, multi_candidates)
+      let multi_sites = pipeline_ir_multi_pass_changed(multi)
+      let blocks = pipeline_ir_multi_pass_blocks(multi)
+      let first_next_value = pipeline_ir_multi_pass_next_value(multi)
       let block_count = ir_block_list_len(blocks)
       let ctx = pipeline_ir_optimise_context4(facts, inline_candidates, pure_callees, params)
       let folded = if block_count == 1 {
@@ -34183,13 +34720,13 @@ fn pipeline_optimise_ir_function(f: IrFunction, inline_candidates: PipelineIrInl
         pipeline_optimised_blocks_dead_inst_sites(dce),
         pipeline_optimised_blocks_pure_call_dce_sites(dce),
         pipeline_optimised_blocks_block_entry_narrowing_sites(folded),
-        pipeline_optimised_blocks_direct_call_inline_sites(folded)
+        pipeline_optimised_blocks_direct_call_inline_sites(folded) + multi_sites
       )
     }
   }
 }
 
-fn pipeline_optimise_ir_function_list_with_candidates(functions: IrFunctionList, inline_candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, user_src: i64, pure_callees: i64) -> PipelineOptimisedFunctions {
+fn pipeline_optimise_ir_function_list_with_candidates(functions: IrFunctionList, inline_candidates: PipelineIrInlineCandidateList, multi_candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, user_src: i64, pure_callees: i64) -> PipelineOptimisedFunctions {
   match functions {
     IrFunctionNil -> pipeline_optimised_functions(ir_function_list_empty(), 0, 0, 0, 0, 0, 0)
     IrFunctionCons(f, rest) -> {
@@ -34206,18 +34743,14 @@ fn pipeline_optimise_ir_function_list_with_candidates(functions: IrFunctionList,
       -- into source); the CSE nlists live in the local fact env, which
       -- the result type does not carry; facts/candidates/pure_callees
       -- are read-only during the pass and allocated below the mark.
-      -- The one escape channel is rc ARENA GROWTH mid-function: arena_new
-      -- bump-allocates its 32-byte descriptor, and restoring across it
-      -- would zero a descriptor the heap still points at — so restore is
-      -- skipped when the current rc arena changed. Cross-segment
-      -- straddles no-op inside restore_same_segment's own guard.
+      -- Arena and heap descriptors live at the head of their own
+      -- mappings (never in bump memory), so rc heap growth mid-window
+      -- is rollback-immune, and restore_same_segment itself proves
+      -- same-segment membership against the live segment base.
       let osr_mark = alloc_bump_mark()
-      let osr_arena = heap_arena(rc_default_heap())
-      let head = pipeline_optimise_ir_function(f, local_candidates, facts, pure_callees)
-      if heap_arena(rc_default_heap()) == osr_arena {
-        alloc_bump_restore_same_segment(osr_mark)
-      } else { 0 }
-      let tail = pipeline_optimise_ir_function_list_with_candidates(rest, inline_candidates, facts, user_src, pure_callees)
+      let head = pipeline_optimise_ir_function(f, local_candidates, multi_candidates, facts, pure_callees)
+      alloc_bump_restore_same_segment(osr_mark)
+      let tail = pipeline_optimise_ir_function_list_with_candidates(rest, inline_candidates, multi_candidates, facts, user_src, pure_callees)
       pipeline_optimised_functions(
         pipeline_ir_function_list_append(pipeline_optimised_functions_functions(head), pipeline_optimised_functions_functions(tail)),
         pipeline_optimised_functions_const_fold_sites(head) + pipeline_optimised_functions_const_fold_sites(tail),
@@ -34244,7 +34777,7 @@ fn pipeline_optimise_ir_function_list(functions: IrFunctionList, all_functions: 
   let mut ci = 0
   while ci < 4 {
     let cand_fns = pipeline_ir_inline_candidate_functions(candidates, ir_function_list_empty())
-    let copt = pipeline_optimise_ir_function_list_with_candidates(cand_fns, candidates, facts, user_src, pure_callees)
+    let copt = pipeline_optimise_ir_function_list_with_candidates(cand_fns, candidates, PipelineIrInlineCandidateNil, facts, user_src, pure_callees)
     if pipeline_optimised_functions_direct_call_inline_sites(copt) == 0 { ci = 4 }
     else {
       candidates = pipeline_ir_inline_candidates_from_functions(pipeline_optimised_functions_functions(copt), facts, user_src)
@@ -34254,10 +34787,16 @@ fn pipeline_optimise_ir_function_list(functions: IrFunctionList, all_functions: 
   -- The historic two full passes: the first splices flattened candidate
   -- bodies into every caller; rebuilding candidates from that result
   -- lets the second close callers that only became tiny after pass one.
-  let first = pipeline_optimise_ir_function_list_with_candidates(functions, candidates, facts, user_src, pure_callees)
+  -- Multi-block candidates (null-guarded accessors, comparator shapes)
+  -- splice as a pre-pass inside each function's optimisation; the second
+  -- pass rebuild lets wrappers that swallowed a branchy body feed their
+  -- own callers.
+  let multi_candidates = pipeline_ir_multi_inline_candidates_walk(all_functions, facts)
+  let first = pipeline_optimise_ir_function_list_with_candidates(functions, candidates, multi_candidates, facts, user_src, pure_callees)
   let first_functions = pipeline_optimised_functions_functions(first)
   let second_candidates = pipeline_ir_inline_candidates_from_functions(first_functions, facts, user_src)
-  let second = pipeline_optimise_ir_function_list_with_candidates(first_functions, second_candidates, facts, user_src, pure_callees)
+  let second_multi = pipeline_ir_multi_inline_candidates_walk(first_functions, facts)
+  let second = pipeline_optimise_ir_function_list_with_candidates(first_functions, second_candidates, second_multi, facts, user_src, pure_callees)
   pipeline_optimised_functions(
     pipeline_optimised_functions_functions(second),
     pipeline_optimised_functions_const_fold_sites(first) + pipeline_optimised_functions_const_fold_sites(second),

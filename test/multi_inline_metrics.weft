@@ -1,0 +1,341 @@
+-- test/multi_inline_metrics.weft -- multi-block tiny-fn inlining (2k slice B')
+--
+-- The optimiser splices small pure unmanaged-param callees with branchy
+-- bodies (null-guarded accessors, comparators) into callers. These tests
+-- compile source in-process and assert on the optimised IR: inlined calls
+-- are gone, ineligible calls remain, and the spliced CFG stays sound.
+
+use "compiler/codegen.weft"
+use "compiler/typeck.weft"
+use "compiler/macho.weft"
+use "compiler/object.weft"
+use "compiler/ir.weft"
+use "compiler/grammar.weft"
+use "compiler/pipeline.weft"
+
+fn mi_optimised(src_str: str) -> IrModule {
+  let src = __str_ptr(src_str)
+  let n = __str_len(src_str)
+  let typed = pipeline_check_source_with_origin(src, n, 1, 0)
+  let ir = pipeline_lower_ir(typed)
+  pipeline_optimise_typed_ir(typed, ir)
+}
+
+fn mi_count_calls_insts(insts: IrInstList, target_hash: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let one = match inst {
+        IrCallI64(dst, callee_hash, args) -> if callee_hash == target_hash { 1 } else { 0 }
+        _ -> 0
+      }
+      one + mi_count_calls_insts(rest, target_hash)
+    }
+  }
+}
+
+fn mi_count_calls_blocks(blocks: IrBlockList, target_hash: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      let one = match block {
+        IrBlock(id, params, insts, term) -> mi_count_calls_insts(insts, target_hash)
+      }
+      one + mi_count_calls_blocks(rest, target_hash)
+    }
+  }
+}
+
+fn mi_calls_in(fns_list: IrFunctionList, fn_hash: i64, target_hash: i64) -> i64 {
+  match fns_list {
+    IrFunctionNil -> 0 - 100
+    IrFunctionCons(f, rest) -> {
+      match f {
+        IrFunction(hash, nparams, blocks, src) -> {
+          if hash == fn_hash {
+            mi_count_calls_blocks(blocks, target_hash)
+          } else {
+            mi_calls_in(rest, fn_hash, target_hash)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn mi_hash(name: str) -> i64 {
+  str_hash(__str_ptr(name), 0, __str_len(name))
+}
+
+fn mi_caller_calls(src_str: str, caller: str, callee: str) -> i64 {
+  mi_calls_in(pipeline_ir_functions(mi_optimised(src_str)), mi_hash(caller), mi_hash(callee))
+}
+
+-- ---------------------------------------------------------------------
+-- Happy paths
+-- ---------------------------------------------------------------------
+
+test "multi_inline_null_guarded_accessor_disappears" {
+  -- The vector_storage accessor shape: null guard around a raw load.
+  let src = "fn guarded_load(vec: i64) -> i64 {
+  if vec == 0 { 0 } else { vec * 3 + 7 }
+}
+
+fn hot(n: i64) -> i64 {
+  let mut acc = 0
+  let mut i = 0
+  while i < n {
+    acc = acc + guarded_load(i)
+    i = i + 1
+  }
+  acc
+}
+
+fn main() -> i64 {
+  hot(10)
+}"
+  Test.assert_eq(mi_caller_calls(src, "hot", "guarded_load"), 0)
+}
+
+test "multi_inline_comparator_shape_disappears" {
+  -- Nested-if comparator: six blocks, pure scalar.
+  let src = "fn cmp3(a: i64, b: i64) -> i64 {
+  if a < b { 0 - 1 } else { if a > b { 1 } else { 0 } }
+}
+
+fn hot(n: i64) -> i64 {
+  let mut acc = 0
+  let mut i = 0
+  while i < n {
+    acc = acc + cmp3(i, 5)
+    i = i + 1
+  }
+  acc
+}
+
+fn main() -> i64 {
+  hot(10)
+}"
+  Test.assert_eq(mi_caller_calls(src, "hot", "cmp3"), 0)
+}
+
+test "multi_inline_wrapper_chain_collapses" {
+  -- Wrapper -> guarded body: the wrapper swallows the branchy body in
+  -- pass one; callers swallow the wrapper via the rebuilt candidates.
+  let src = "fn guarded(vec: i64) -> i64 {
+  if vec == 0 { 0 } else { vec * 5 }
+}
+
+fn wrapper(vec: i64) -> i64 {
+  guarded(vec)
+}
+
+fn hot(n: i64) -> i64 {
+  let mut acc = 0
+  let mut i = 0
+  while i < n {
+    acc = acc + wrapper(i)
+    i = i + 1
+  }
+  acc
+}
+
+fn main() -> i64 {
+  hot(10)
+}"
+  Test.assert_eq(mi_caller_calls(src, "hot", "wrapper"), 0)
+  Test.assert_eq(mi_caller_calls(src, "hot", "guarded"), 0)
+}
+
+test "multi_inline_multiple_sites_one_block" {
+  let src = "fn pick(a: i64, b: i64) -> i64 {
+  if a > b { a } else { b }
+}
+
+fn hot(x: i64, y: i64, z: i64) -> i64 {
+  pick(x, y) + pick(y, z) + pick(x, z)
+}
+
+fn main() -> i64 {
+  hot(1, 2, 3)
+}"
+  Test.assert_eq(mi_caller_calls(src, "hot", "pick"), 0)
+}
+
+test "multi_inline_sites_counted" {
+  let src = "fn pick(a: i64, b: i64) -> i64 {
+  if a > b { a } else { b }
+}
+
+fn hot(x: i64, y: i64) -> i64 {
+  pick(x, y)
+}
+
+fn main() -> i64 {
+  hot(1, 2)
+}"
+  let optimised = mi_optimised(src)
+  -- multi splices merge into the direct-call inline site counter
+  Test.assert_eq(if pipeline_ir_direct_call_inline_sites(optimised) >= 1 { 1 } else { 0 }, 1)
+}
+
+-- ---------------------------------------------------------------------
+-- Sad paths: every ineligibility reason leaves the call in place
+-- ---------------------------------------------------------------------
+
+test "multi_inline_rejects_raw_store_body" {
+  -- Store-shaped bodies (vector set) are outside the clone whitelist.
+  let src = "use \"stdlib/vector.weft\"
+
+fn poke(v: i64, i: i64) -> i64 {
+  if v == 0 { 0 } else { vector_set<i64>(v, i, i) }
+}
+
+fn hot(n: i64) -> i64 {
+  let mut i = 0
+  while i < n {
+    poke(0, i)
+    i = i + 1
+  }
+  n
+}
+
+fn main() -> i64 {
+  hot(3)
+}"
+  Test.assert_eq(if mi_caller_calls(src, "hot", "poke") >= 1 { 1 } else { 0 }, 1)
+}
+
+test "multi_inline_rejects_managed_param" {
+  -- A variant-typed parameter carries a managed mask: call must remain.
+  let src = "type Wrap {
+  Wrap(i64)
+}
+
+fn unwrap_w(w: Wrap) -> i64 {
+  match w {
+    Wrap(v) -> if v > 0 { v } else { 0 - v }
+  }
+}
+
+fn hot(n: i64) -> i64 {
+  let w = Wrap(n)
+  unwrap_w(w) + unwrap_w(w)
+}
+
+fn main() -> i64 {
+  hot(4)
+}"
+  Test.assert_eq(if mi_caller_calls(src, "hot", "unwrap_w") >= 1 { 1 } else { 0 }, 1)
+}
+
+test "multi_inline_rejects_effectful_callee" {
+  let src = "effect Tick {
+  fn bump() -> i64
+}
+
+fn noisy(a: i64) -> i64 {
+  if a > 0 { Tick.bump() } else { 0 }
+}
+
+fn hot(n: i64) -[Tick]> i64 {
+  noisy(n) + noisy(n + 1)
+}
+
+fn main() -> i64 {
+  handle hot(3) {
+    Tick.bump() -> resume(1)
+  }
+}"
+  Test.assert_eq(if mi_caller_calls(src, "hot", "noisy") >= 1 { 1 } else { 0 }, 1)
+}
+
+test "multi_inline_rejects_oversize_body" {
+  -- Body over the inst cap stays a call.
+  let src = "fn big(a: i64, b: i64) -> i64 {
+  if a == 0 { 0 } else {
+    let c1 = a * 3 + b
+    let c2 = c1 * 5 + a
+    let c3 = c2 * 7 + b
+    let c4 = c3 * 9 + a
+    let c5 = c4 * 11 + b
+    let c6 = c5 * 13 + a
+    let c7 = c6 * 15 + b
+    let c8 = c7 * 17 + a
+    let c9 = c8 * 19 + b
+    let c10 = c9 * 21 + a
+    let c11 = c10 * 23 + b
+    let c12 = c11 * 25 + a
+    let c13 = c12 * 27 + b
+    let c14 = c13 * 29 + a
+    let c15 = c14 * 31 + b
+    let c16 = c15 * 33 + a
+    c16 + c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8 + c9 + c10 + c11 + c12 + c13 + c14 + c15
+  }
+}
+
+fn hot(n: i64) -> i64 {
+  big(n, 3)
+}
+
+fn main() -> i64 {
+  hot(2)
+}"
+  Test.assert_eq(if mi_caller_calls(src, "hot", "big") >= 1 { 1 } else { 0 }, 1)
+}
+
+test "multi_inline_rejects_self_recursive_callee" {
+  let src = "fn rec_sum(n: i64) -> i64 {
+  if n <= 0 { 0 } else { n + rec_sum(n - 1) }
+}
+
+fn hot(n: i64) -> i64 {
+  rec_sum(n) + rec_sum(n + 1)
+}
+
+fn main() -> i64 {
+  hot(3)
+}"
+  Test.assert_eq(if mi_caller_calls(src, "hot", "rec_sum") >= 1 { 1 } else { 0 }, 1)
+}
+
+-- ---------------------------------------------------------------------
+-- Whole-compiler tripwire: the compiler still optimises itself with the
+-- splice active and the accessor forest actually collapses somewhere.
+-- ---------------------------------------------------------------------
+
+fn mi_path_pair(path: str) -> i64 {
+  let pair = alloc_words(2)
+  mem_store64_at(pair, 0, __str_ptr(path))
+  mem_store64_at(pair, 8, __str_len(path))
+  pair
+}
+
+test "multi_inline_bench_find_loop_accessors_collapse" {
+  -- The motivating workload: sorted_lookup's find loop stops calling the
+  -- vector-storage accessor forest.
+  let file = read_file(mi_path_pair("bench/compare/weft/sorted_lookup.weft"))
+  let csrc = mem_load64_at(file, 0)
+  let clen = mem_load64_at(file, 8)
+  let typed = pipeline_check_source_with_origin(csrc, clen, 1, 0)
+  let ir = pipeline_lower_ir(typed)
+  let optimised = pipeline_optimise_typed_ir(typed, ir)
+  let functions = pipeline_ir_functions(optimised)
+  -- vector_len swallowed vector_storage_len; sorted_map_len swallowed both.
+  let total_storage_len_calls = mi_total_calls(functions, mi_hash("vector_storage_len"))
+  Test.assert_eq(total_storage_len_calls, 0)
+  let total_elem_size_calls = mi_total_calls(functions, mi_hash("vector_storage_element_size"))
+  Test.assert_eq(total_elem_size_calls, 0)
+}
+
+fn mi_total_calls(fns_list: IrFunctionList, target_hash: i64) -> i64 {
+  match fns_list {
+    IrFunctionNil -> 0
+    IrFunctionCons(f, rest) -> {
+      let one = match f {
+        IrFunction(hash, nparams, blocks, src) -> mi_count_calls_blocks(blocks, target_hash)
+      }
+      one + mi_total_calls(rest, target_hash)
+    }
+  }
+}
