@@ -30913,12 +30913,11 @@ fn pipeline_ir_multi_inline_inst_supported(inst: IrInst, self_hash: i64) -> i64 
     IrStoreI64(slot, value) -> 1
     IrVariantTagI64(dst, value) -> 1
     IrVariantPayloadI64(dst, value, index) -> 1
-    -- The unmatched-arm trap (IrLoweringFailureI64) is deliberately NOT
-    -- admitted: allowing it makes every match-bodied accessor a
-    -- candidate module-wide, and the optimiser cost on the enlarged
-    -- hosts blew in-process probe compiles from seconds to minutes
-    -- (bounds_elision_metrics timed out). Unlock together with a
-    -- hotness/budget gate — recorded in the 2k brief.
+    -- The unmatched-arm trap: no operands, no result, emits a BRK.
+    -- Admitting it (match-bodied accessors) is affordable only because
+    -- splices are loop-gated; ungated it blew probe compiles from
+    -- seconds past the suite timeout.
+    IrLoweringFailureI64(reason) -> 1
     -- A self-call would re-expose a candidate site on every splice and
     -- burn the whole growth budget on one recursive body.
     IrCallI64(dst, callee_hash, args) -> if callee_hash == self_hash { 0 } else { 1 }
@@ -31383,6 +31382,85 @@ fn pipeline_ir_block_list_max_id(blocks: IrBlockList, current: i64) -> i64 {
   }
 }
 
+-- ----------------------------------------------------------------------
+-- Loop residency for splice gating: a block is loop-resident when it can
+-- reach itself through the CFG. Splicing pays where calls repeat — loop
+-- bodies — while cold straight-line sites keep their (cheap, one-shot)
+-- calls, which is what contains the optimiser cost on enlarged hosts.
+-- Small hosts (at most the candidate block cap) splice everywhere so
+-- wrapper bodies still swallow their branchy callees and become
+-- candidates themselves. Computed once on the raw host; blocks created
+-- by a splice inherit the residency of the site they came from.
+-- ----------------------------------------------------------------------
+
+fn pipeline_ir_multi_loop_cap() -> i64 { 128 }
+
+fn pipeline_ir_multi_succ_push(stack: i64, target: i64, visited: i64, n: i64) -> i64 {
+  if target >= 0 and target < n and nlist_get(visited, target) == 0 {
+    nlist_add(stack, target)
+    pipeline_ir_native_resident_dense_set(visited, target, 1)
+  } else { 0 }
+}
+
+-- Marks every block on a cycle: BFS from each block's successors; the
+-- block is resident when the walk returns to it.
+fn pipeline_ir_multi_loop_resident_env(blocks: IrBlockList) -> PipelineIrInlineValueEnv {
+  let max_id = pipeline_ir_block_list_max_id(blocks, 0 - 1)
+  if max_id < 0 or max_id + 1 > pipeline_ir_multi_loop_cap() { PipelineIrInlineValueEnvNil }
+  else {
+    let n = max_id + 1
+    -- successor table: two slots per block (jump/branch targets)
+    let succ_a = pipeline_ir_native_resident_dense_new(n, 0 - 1)
+    let succ_b = pipeline_ir_native_resident_dense_new(n, 0 - 1)
+    let mut cur = blocks
+    let mut walking = 1
+    while walking == 1 {
+      match cur {
+        IrBlockListNil -> { walking = 0 }
+        IrBlockListCons(block, rest) -> {
+          match block {
+            IrBlock(id, params, insts, term) -> {
+              if id >= 0 and id < n {
+                match term {
+                  IrTermJump(target, args) -> pipeline_ir_native_resident_dense_set(succ_a, id, target)
+                  IrTermBranch(cond, then_block, else_block) -> {
+                    pipeline_ir_native_resident_dense_set(succ_a, id, then_block)
+                    pipeline_ir_native_resident_dense_set(succ_b, id, else_block)
+                  }
+                  _ -> 0
+                }
+              } else { 0 }
+            }
+          }
+          cur = rest
+        }
+      }
+    }
+    let mut env = PipelineIrInlineValueEnvNil
+    let mut s = 0
+    while s < n {
+      -- BFS from s's successors; resident when s is reached again
+      let visited = pipeline_ir_native_resident_dense_new(n, 0)
+      let stack = nlist_new()
+      pipeline_ir_multi_succ_push(stack, nlist_get(succ_a, s), visited, n)
+      pipeline_ir_multi_succ_push(stack, nlist_get(succ_b, s), visited, n)
+      let mut hit = 0
+      while nlist_len(stack) > 0 and hit == 0 {
+        let top = nlist_get(stack, nlist_len(stack) - 1)
+        nlist_set_len(stack, nlist_len(stack) - 1)
+        if top == s { hit = 1 }
+        else {
+          pipeline_ir_multi_succ_push(stack, nlist_get(succ_a, top), visited, n)
+          pipeline_ir_multi_succ_push(stack, nlist_get(succ_b, top), visited, n)
+        }
+      }
+      if hit == 1 { env = pipeline_ir_inline_value_env_bind(env, s, 1) } else { 0 }
+      s = s + 1
+    }
+    env
+  }
+}
+
 -- Pass state: changed flag, rebuilt blocks, next value id, next block id.
 type PipelineIrMultiPassResult {
   PipelineIrMultiPassResult(i64, IrBlockList, i64, i64)
@@ -31503,12 +31581,23 @@ fn pipeline_ir_block_list_first(blocks: IrBlockList) -> IrBlock {
 }
 
 -- One sweep: rewrite the first block containing a candidate call.
-fn pipeline_ir_multi_inline_sweep(blocks: IrBlockList, candidates: PipelineIrInlineCandidateList, self_hash: i64, next_value: i64, next_block: i64) -> PipelineIrMultiPassResult {
+-- gate_all = 1 splices every block (small hosts); otherwise only blocks
+-- present in the residency env split.
+fn pipeline_ir_multi_inline_sweep(blocks: IrBlockList, candidates: PipelineIrInlineCandidateList, self_hash: i64, next_value: i64, next_block: i64, gate_all: i64, resident: PipelineIrInlineValueEnv) -> PipelineIrMultiPassResult {
   match blocks {
     IrBlockListNil -> PipelineIrMultiPassResult(0, IrBlockListNil, next_value, next_block)
     IrBlockListCons(block, rest) -> {
-      let split = match block {
-        IrBlock(id, params, insts, term) -> pipeline_ir_multi_split_insts(insts, candidates, self_hash, IrInstNil)
+      let hot = match block {
+        IrBlock(id, params, insts, term) -> {
+          if gate_all == 1 { 1 } else { pipeline_ir_inline_value_env_lookup_or(resident, id, 0) }
+        }
+      }
+      let split = if hot == 1 {
+        match block {
+          IrBlock(id, params, insts, term) -> pipeline_ir_multi_split_insts(insts, candidates, self_hash, IrInstNil)
+        }
+      } else {
+        PipelineIrMultiSplit(0, IrInstNil, 0, 0, IrValueNil, IrInstNil)
       }
       if pipeline_ir_multi_split_found(split) == 1 {
         let spliced = pipeline_ir_multi_splice_block(block, split, candidates, next_value, next_block)
@@ -31520,7 +31609,7 @@ fn pipeline_ir_multi_inline_sweep(blocks: IrBlockList, candidates: PipelineIrInl
             pipeline_ir_multi_pass_next_block(spliced)
           )
         } else {
-          let tail = pipeline_ir_multi_inline_sweep(rest, candidates, self_hash, next_value, next_block)
+          let tail = pipeline_ir_multi_inline_sweep(rest, candidates, self_hash, next_value, next_block, gate_all, resident)
           PipelineIrMultiPassResult(
             pipeline_ir_multi_pass_changed(tail),
             IrBlockListCons(block, pipeline_ir_multi_pass_blocks(tail)),
@@ -31529,7 +31618,7 @@ fn pipeline_ir_multi_inline_sweep(blocks: IrBlockList, candidates: PipelineIrInl
           )
         }
       } else {
-        let tail = pipeline_ir_multi_inline_sweep(rest, candidates, self_hash, next_value, next_block)
+        let tail = pipeline_ir_multi_inline_sweep(rest, candidates, self_hash, next_value, next_block, gate_all, resident)
         PipelineIrMultiPassResult(
           pipeline_ir_multi_pass_changed(tail),
           IrBlockListCons(block, pipeline_ir_multi_pass_blocks(tail)),
@@ -31548,17 +31637,29 @@ fn pipeline_ir_multi_inline_function_blocks(self_hash: i64, param_count: i64, bl
   match candidates {
     PipelineIrInlineCandidateNil -> PipelineIrMultiPassResult(0, blocks, pipeline_ir_function_next_value(param_count, blocks), pipeline_ir_block_list_max_id(blocks, 0) + 1)
     PipelineIrInlineCandidateNode(chash, cf, clower, chigher) -> {
+      -- Small hosts splice everywhere (cheap, and wrapper bodies must
+      -- still swallow their branchy callees to become candidates);
+      -- larger hosts splice only loop-resident sites. Blocks a splice
+      -- creates inherit the (resident) site's eligibility.
+      let gate_all = if ir_block_list_len(blocks) <= pipeline_ir_multi_inline_blocks_cap() { 1 } else { 0 }
+      let mut resident = if gate_all == 1 { PipelineIrInlineValueEnvNil } else { pipeline_ir_multi_loop_resident_env(blocks) }
       let mut current = blocks
       let mut next_value = pipeline_ir_function_next_value(param_count, blocks)
       let mut next_block = pipeline_ir_block_list_max_id(blocks, 0) + 1
       let mut sites = 0
       let mut go = 1
       while go == 1 and sites < pipeline_ir_multi_inline_site_cap() {
-        let swept = pipeline_ir_multi_inline_sweep(current, candidates, self_hash, next_value, next_block)
+        let swept = pipeline_ir_multi_inline_sweep(current, candidates, self_hash, next_value, next_block, gate_all, resident)
         if pipeline_ir_multi_pass_changed(swept) == 1 {
           current = pipeline_ir_multi_pass_blocks(swept)
           next_value = pipeline_ir_multi_pass_next_value(swept)
-          next_block = pipeline_ir_multi_pass_next_block(swept)
+          let new_next_block = pipeline_ir_multi_pass_next_block(swept)
+          let mut nb = next_block
+          while nb < new_next_block {
+            resident = pipeline_ir_inline_value_env_bind(resident, nb, 1)
+            nb = nb + 1
+          }
+          next_block = new_next_block
           sites = sites + 1
         } else {
           go = 0
