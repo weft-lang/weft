@@ -299,10 +299,17 @@ type PipelineOptimisedFunctions {
 
 type PipelineHandlerInlineCtx {
   PipelineHandlerInlineCtxNil,
-  -- eff_hash, clauses, nclauses, clause_src, rest. clause_src is the source
-  -- buffer the clause nodes point into; op-name hashing and clause-body
-  -- inlining must use it, not the perform site's src.
-  PipelineHandlerInlineCtxCons(i64, HandlerClauseList, i64, i64, PipelineHandlerInlineCtx)
+  -- eff_hash, clauses, nclauses, clause_src, direct, evidence, rest.
+  -- clause_src is the source buffer the clause nodes point into; op-name
+  -- hashing and clause-body inlining must use it, not the perform site's
+  -- src. direct marks entries backed by an emit-time handler context;
+  -- evidence marks entries whose ops table may be captured by a closure.
+  PipelineHandlerInlineCtxCons(i64, HandlerClauseList, i64, i64, i64, i64, PipelineHandlerInlineCtx)
+}
+
+type PipelineLambdaEvidenceSelection {
+  PipelineLambdaEvidenceSelectionNone,
+  PipelineLambdaEvidenceSelectionBound(i64, HandlerClauseList, i64, i64)
 }
 
 type PipelineHandlerInlineMatch {
@@ -1670,10 +1677,10 @@ fn pipeline_lower_module_inline_depth(module: PipelineLowerModule) -> i64 {
   }
 }
 
--- Lambda hoisting permission (2k slice A). Lowering-time contexts allow
--- it; emission-time lowering (legacy lambda bodies, deferred-handle
--- bodies) forbids it, because the module function list is already
--- fixed by then and a hoisted body would have no emitted code.
+-- Lambda registration timing marker (2k slice A). A value of 1 means the
+-- module collector will see carried closure functions; 0 marks lowering
+-- performed during native emission, where closure functions use the late
+-- ordinary-function path instead.
 fn pipeline_lower_module_hoist(module: PipelineLowerModule) -> i64 {
   match module {
     PipelineLowerModule(src, tt, fns, handlers, subst, par_ctx, inline_depth, hoist) -> hoist
@@ -10188,16 +10195,16 @@ fn pipeline_lambda_capture_env_with_params(fn_params: i64, locals: PipelineValue
 }
 
 -- ---------------------------------------------------------------------
--- Lambda hoisting (2k slice A): lower a perform-free lambda body into a
+-- Lambda hoisting (2k slice A): lower every lambda body into a
 -- standalone ordinary IrFunction at lowering time. The closure ABI
 -- (code ptr called with env in x0, args in x1..) is exactly a normal
 -- direct call to fn(env, p1..pn), so the synthetic function needs no
 -- special prologue: env is param 0, lambda params are 1..nparams, and
 -- the entry preamble loads each capture with const/add/ptr-load
 -- triples off env. The body then flows through the optimiser, mem2reg,
--- and residency like every named function. Bodies with direct perform
--- nodes keep the legacy inline-emission path until evidence resolution
--- moves to lowering (phase 2).
+-- and residency like every named function. Direct performs use an
+-- explicit lowering-time evidence fact whose ops-table pointer is loaded
+-- from the closure env.
 -- ---------------------------------------------------------------------
 
 fn pipeline_lambda_hoist_subst_mix(subst: i64) -> i64 {
@@ -10218,8 +10225,22 @@ fn pipeline_lambda_hoist_subst_mix(subst: i64) -> i64 {
 -- identical and the collector dedups). Node pointers are deterministic
 -- within a build (bump allocation), and the hash never reaches the
 -- output bytes — it keys mono_cache entries and branch patches only.
-fn pipeline_lambda_hoist_hash(src: i64, body_node: i64, subst: i64) -> i64 {
-  body_node * 1000003 + pipeline_lambda_hoist_subst_mix(subst) * 31 + 19790507
+fn pipeline_lambda_evidence_hash_mix(evidence: IrLambdaEvidence) -> i64 {
+  match evidence {
+    IrLambdaEvidenceNone -> 0
+    IrLambdaEvidenceBound(eff_hash, op_hashes, value) -> {
+      let mut h = eff_hash
+      let n = nlist_len(op_hashes)
+      for i in 0..n {
+        h = h * 31 + nlist_get(op_hashes, i)
+      }
+      h
+    }
+  }
+}
+
+fn pipeline_lambda_hoist_hash(src: i64, body_node: i64, subst: i64, evidence: IrLambdaEvidence) -> i64 {
+  body_node * 1000003 + pipeline_lambda_hoist_subst_mix(subst) * 31 + pipeline_lambda_evidence_hash_mix(evidence) * 131 + 19790507
 }
 
 fn pipeline_lambda_hoist_locals(params: ParamList, captures: i64, nfree: i64) -> PipelineValueEnv {
@@ -10259,9 +10280,55 @@ fn pipeline_lambda_hoist_preamble(captures: i64, nfree: i64, base: i64) -> IrIns
   insts
 }
 
--- Returns the hoisted-closure inst list, or IrInstNil when the body
--- cannot hoist (lowering failure) and the caller must fall back to the
--- legacy IrLambdaI64 path.
+fn pipeline_handler_inline_ctx_lambda_evidence_selection(handlers: PipelineHandlerInlineCtx, body: Expr, src: i64) -> PipelineLambdaEvidenceSelection {
+  match handlers {
+    PipelineHandlerInlineCtxNil -> PipelineLambdaEvidenceSelectionNone
+    PipelineHandlerInlineCtxCons(eff_hash, clauses, nclauses, clause_src, direct, evidence, rest) -> {
+      if evidence == 1 and nclauses > 0 and pipeline_typed_expr_performs_hash(body, src, eff_hash) == 1 {
+        PipelineLambdaEvidenceSelectionBound(eff_hash, clauses, nclauses, if clause_src != 0 { clause_src } else { src })
+      } else {
+        pipeline_handler_inline_ctx_lambda_evidence_selection(rest, body, src)
+      }
+    }
+  }
+}
+
+fn pipeline_lambda_evidence_from_selection(selection: PipelineLambdaEvidenceSelection, value: i64) -> IrLambdaEvidence {
+  match selection {
+    PipelineLambdaEvidenceSelectionNone -> IrLambdaEvidenceNone
+    PipelineLambdaEvidenceSelectionBound(eff_hash, clauses, nclauses, clause_src) -> {
+      IrLambdaEvidenceBound(eff_hash, pipeline_ir_native_lambda_evidence_op_hashes(clauses, nclauses, clause_src), value)
+    }
+  }
+}
+
+fn pipeline_lambda_evidence_preamble(evidence: IrLambdaEvidence, nfree: i64, base: i64) -> IrInstList {
+  match evidence {
+    IrLambdaEvidenceNone -> ir_inst_list_empty()
+    IrLambdaEvidenceBound(eff_hash, op_hashes, value) -> {
+      let const_id = base
+      let addr_id = base + 1
+      ir_inst_list_prepend(
+        ir_inst_const_i64(const_id, 8 + nfree * 16),
+        ir_inst_list_prepend(
+          ir_inst_binary_i64(addr_id, ir_binary_op_from_parser(1), 0, const_id),
+          ir_inst_list_prepend(ir_inst_ptr_load_i64(value, addr_id), ir_inst_list_empty())
+        )
+      )
+    }
+  }
+}
+
+fn pipeline_lambda_evidence_value_count(evidence: IrLambdaEvidence) -> i64 {
+  match evidence {
+    IrLambdaEvidenceNone -> 0
+    IrLambdaEvidenceBound(eff_hash, op_hashes, value) -> 3
+  }
+}
+
+-- Returns one closure-construction instruction. A failure is represented in
+-- IR and traps through the ordinary lowering-failure path; no AST-bearing
+-- lambda fallback survives phase 2.
 fn pipeline_lower_lambda_hoisted(lambda_params: ParamList, lambda_body: Expr, lambda_captures: i64, lower_ctx: PipelineHandlerLowerCtx, dst: i64) -> IrInstList {
   let src = pipeline_handler_lower_ctx_src(lower_ctx)
   let tt = pipeline_handler_lower_ctx_tt(lower_ctx)
@@ -10271,12 +10338,22 @@ fn pipeline_lower_lambda_hoisted(lambda_params: ParamList, lambda_body: Expr, la
   let nfree = nlist_len(lambda_captures)
   let base = 1 + nparams
   let locals = pipeline_lambda_hoist_locals(lambda_params, lambda_captures, nfree)
-  let module = pipeline_lower_module_with_fns(src, tt, fns)
-  let next_value = base + nfree * 3
+  let selection = pipeline_handler_inline_ctx_lambda_evidence_selection(pipeline_handler_lower_ctx_handlers(lower_ctx), lambda_body, src)
+  let evidence_value = base + nfree * 3 + 2
+  let evidence = pipeline_lambda_evidence_from_selection(selection, evidence_value)
+  -- Direct performs in the synthetic function must remain residual: the
+  -- creation handler is no longer on the runtime stack when an escaping
+  -- closure runs. The evidence-only context exists solely so nested lambdas
+  -- can inherit the captured ops table.
+  let module = pipeline_lower_module_with_handlers(
+    pipeline_lower_module_with_fns_subst_hoist(src, tt, fns, subst, pipeline_lower_module_hoist(pipeline_handler_lower_ctx_module(lower_ctx))),
+    pipeline_handler_inline_ctx_evidence_only(selection)
+  )
+  let next_value = base + nfree * 3 + pipeline_lambda_evidence_value_count(evidence)
   let return_block = 1
   let lowered = pipeline_lower_expr_typed_to_target_blocks_reserved(lambda_body, 0, locals, module, next_value, 0, 2, return_block)
   if pipeline_lowered_blocks_is_valid(lowered) == 0 {
-    ir_inst_list_empty()
+    ir_inst_list_prepend(ir_inst_lowering_failure_i64(13), ir_inst_list_empty())
   } else {
     let param_nodes = param_list_to_nodes(lambda_params)
     let mut lambda_drop_next = pipeline_lowered_blocks_next_value(lowered)
@@ -10292,27 +10369,15 @@ fn pipeline_lower_lambda_hoisted(lambda_params: ParamList, lambda_body: Expr, la
     }
     let lambda_param_drops = pipeline_managed_param_list_release_insts(lambda_params, 0, 1, lambda_drop_next)
     let dropped = pipeline_ir_block_list_append_return_drops(raw_blocks, lambda_param_drops)
-    let preamble = pipeline_lambda_hoist_preamble(lambda_captures, nfree, base)
+    let preamble = ir_inst_list_append(
+      pipeline_lambda_hoist_preamble(lambda_captures, nfree, base),
+      pipeline_lambda_evidence_preamble(evidence, nfree, base + nfree * 3)
+    )
     let blocks = pipeline_ir_block_list_prepend_entry_insts(dropped, 0, preamble)
-    let fn_hash = pipeline_lambda_hoist_hash(src, expr_to_node(lambda_body), subst)
+    let fn_hash = pipeline_lambda_hoist_hash(src, expr_to_node(lambda_body), subst, evidence)
     let f = IrFunction(fn_hash, nparams + 1, blocks, src)
-    ir_inst_list_prepend(ir_inst_closure_i64(dst, f, lambda_captures, 0), ir_inst_list_empty())
+    ir_inst_list_prepend(ir_inst_closure_i64(dst, f, lambda_captures, evidence), ir_inst_list_empty())
   }
-}
-
--- Gate: hoist only when the body carries no direct perform nodes
--- anywhere (nested lambdas included — the walk covers all sub-exprs).
--- Direct performs are the only thing closure evidence reroutes; calls
--- to effectful functions dispatch through the ambient runtime handler
--- stack identically on both paths.
-fn pipeline_lambda_hoist_eligible(lambda_body: Expr, src: i64) -> i64 {
-  let flags = pipeline_ir_node_direct_effect_expr_collect(expr_to_node(lambda_body), src, nlist_new())
-  if flags band 4 == 0 { 1 } else { 0 }
-}
-
-fn pipeline_lambda_hoist_allowed(lambda_body: Expr, lower_ctx: PipelineHandlerLowerCtx) -> i64 {
-  if pipeline_lower_module_hoist(pipeline_handler_lower_ctx_module(lower_ctx)) == 0 { 0 }
-  else { pipeline_lambda_hoist_eligible(lambda_body, pipeline_handler_lower_ctx_src(lower_ctx)) }
 }
 
 fn pipeline_lambda_captures_for(params: ParamList, body: Expr, lower_ctx: PipelineHandlerLowerCtx) -> i64 {
@@ -11453,11 +11518,24 @@ fn pipeline_handler_inline_ctx_empty() -> PipelineHandlerInlineCtx {
 }
 
 fn pipeline_handler_inline_ctx_push_typed_src(ctx: PipelineHandlerInlineCtx, eff_hash: i64, clauses: HandlerClauseList, nclauses: i64, clause_src: i64) -> PipelineHandlerInlineCtx {
-  PipelineHandlerInlineCtxCons(eff_hash, clauses, nclauses, clause_src, ctx)
+  PipelineHandlerInlineCtxCons(eff_hash, clauses, nclauses, clause_src, 1, 1, ctx)
+}
+
+fn pipeline_handler_inline_ctx_push_typed_src_no_evidence(ctx: PipelineHandlerInlineCtx, eff_hash: i64, clauses: HandlerClauseList, nclauses: i64, clause_src: i64) -> PipelineHandlerInlineCtx {
+  PipelineHandlerInlineCtxCons(eff_hash, clauses, nclauses, clause_src, 1, 0, ctx)
+}
+
+fn pipeline_handler_inline_ctx_evidence_only(selection: PipelineLambdaEvidenceSelection) -> PipelineHandlerInlineCtx {
+  match selection {
+    PipelineLambdaEvidenceSelectionNone -> PipelineHandlerInlineCtxNil
+    PipelineLambdaEvidenceSelectionBound(eff_hash, clauses, nclauses, clause_src) -> {
+      PipelineHandlerInlineCtxCons(eff_hash, clauses, nclauses, clause_src, 0, 1, PipelineHandlerInlineCtxNil)
+    }
+  }
 }
 
 fn pipeline_handler_inline_ctx_push_typed(ctx: PipelineHandlerInlineCtx, eff_hash: i64, clauses: HandlerClauseList, nclauses: i64) -> PipelineHandlerInlineCtx {
-  PipelineHandlerInlineCtxCons(eff_hash, clauses, nclauses, 0, ctx)
+  PipelineHandlerInlineCtxCons(eff_hash, clauses, nclauses, 0, 1, 1, ctx)
 }
 
 fn pipeline_handler_inline_ctx_push(ctx: PipelineHandlerInlineCtx, eff_hash: i64, clauses: i64, nclauses: i64) -> PipelineHandlerInlineCtx {
@@ -11558,8 +11636,10 @@ fn pipeline_handler_inline_match_clause_index_or(found: PipelineHandlerInlineMat
 fn pipeline_handler_inline_ctx_find_match_at(ctx: PipelineHandlerInlineCtx, src: i64, eff_hash: i64, op_hash: i64, depth: i64) -> PipelineHandlerInlineMatch {
   match ctx {
     PipelineHandlerInlineCtxNil -> PipelineHandlerInlineNoMatch
-    PipelineHandlerInlineCtxCons(ctx_eff_hash, clauses, nclauses, clause_src, rest) -> {
-      if ctx_eff_hash == eff_hash {
+    PipelineHandlerInlineCtxCons(ctx_eff_hash, clauses, nclauses, clause_src, direct, evidence, rest) -> {
+      if direct == 0 {
+        pipeline_handler_inline_ctx_find_match_at(rest, src, eff_hash, op_hash, depth)
+      } else { if ctx_eff_hash == eff_hash {
         let hash_src = if clause_src != 0 { clause_src } else { src }
         let clause_index = pipeline_handler_clause_list_index_for_op_hash(hash_src, clauses, nclauses, op_hash)
         if clause_index >= 0 {
@@ -11569,7 +11649,7 @@ fn pipeline_handler_inline_ctx_find_match_at(ctx: PipelineHandlerInlineCtx, src:
         }
       } else {
         pipeline_handler_inline_ctx_find_match_at(rest, src, eff_hash, op_hash, depth + 1)
-      }
+      } }
     }
   }
 }
@@ -11585,8 +11665,12 @@ fn pipeline_handler_inline_ctx_find(ctx: PipelineHandlerInlineCtx, src: i64, eff
 fn pipeline_handler_inline_ctx_entry_at(ctx: PipelineHandlerInlineCtx, depth: i64) -> PipelineHandlerInlineCtx {
   match ctx {
     PipelineHandlerInlineCtxNil -> PipelineHandlerInlineCtxNil
-    PipelineHandlerInlineCtxCons(eff_hash, clauses, nclauses, clause_src, rest) -> {
-      if depth <= 0 { ctx } else { pipeline_handler_inline_ctx_entry_at(rest, depth - 1) }
+    PipelineHandlerInlineCtxCons(eff_hash, clauses, nclauses, clause_src, direct, evidence, rest) -> {
+      if direct == 0 {
+        pipeline_handler_inline_ctx_entry_at(rest, depth)
+      } else {
+        if depth <= 0 { ctx } else { pipeline_handler_inline_ctx_entry_at(rest, depth - 1) }
+      }
     }
   }
 }
@@ -11675,7 +11759,7 @@ fn pipeline_handler_inline_try_tail_resume(handlers: PipelineHandlerInlineCtx, f
     let entry = pipeline_handler_inline_ctx_entry_at(handlers, pipeline_handler_inline_match_depth_or(found, 0))
     match entry {
       PipelineHandlerInlineCtxNil -> ir_lowered_expr_invalid(next_value)
-      PipelineHandlerInlineCtxCons(eff_hash, clauses, nclauses, clause_src, outer) -> {
+      PipelineHandlerInlineCtxCons(eff_hash, clauses, nclauses, clause_src, direct, evidence, outer) -> {
         if clause_src == 0 {
           ir_lowered_expr_invalid(next_value)
         } else {
@@ -15752,12 +15836,7 @@ fn pipeline_lower_expr_node_typed_sidecar_handler_raw(expr: i64, next_value: i64
       -- dst + 1. A single-id reservation let later values (e.g.
       -- loop-hoisted constants) share the env's spill slot and be
       -- clobbered by the env store at runtime.
-      let hoisted = if pipeline_lambda_hoist_allowed(lambda_body, lower_ctx) == 1 {
-        pipeline_lower_lambda_hoisted(lambda_params, lambda_body, lambda_captures, lower_ctx, next_value)
-      } else { ir_inst_list_empty() }
-      let lambda_insts = if ir_inst_list_len(hoisted) > 0 { hoisted } else {
-        ir_inst_list_prepend(IrLambdaI64(next_value, lambda_params, lambda_body, node_f3(stripped), lambda_captures), ir_inst_list_empty())
-      }
+      let lambda_insts = pipeline_lower_lambda_hoisted(lambda_params, lambda_body, lambda_captures, lower_ctx, next_value)
       ir_lowered_expr(next_value, next_value + 2, lambda_insts)
     } else { if tag == 32 {
       pipeline_lower_perform_node_typed_sidecar_handler_opt(node_f1(stripped), node_f2(stripped), node_f3(stripped), node_f4(stripped), nlist_len(node_f4(stripped)), next_value, lower_ctx)
@@ -15819,12 +15898,7 @@ fn pipeline_lower_expr_typed_sidecar_handler_ctx(expr: Expr, next_value: i64, lo
       -- next_value + 2: the native emission stores the capture env at
       -- dst + 1 (see the node-path arm for the collision this reserves
       -- against).
-      let hoisted = if pipeline_lambda_hoist_allowed(lambda_body, lower_ctx) == 1 {
-        pipeline_lower_lambda_hoisted(lambda_params, lambda_body, lambda_captures, lower_ctx, next_value)
-      } else { ir_inst_list_empty() }
-      let lambda_insts = if ir_inst_list_len(hoisted) > 0 { hoisted } else {
-        ir_inst_list_prepend(IrLambdaI64(next_value, lambda_params, lambda_body, param_list_len(params), lambda_captures), ir_inst_list_empty())
-      }
+      let lambda_insts = pipeline_lower_lambda_hoisted(lambda_params, lambda_body, lambda_captures, lower_ctx, next_value)
       ir_lowered_expr(next_value, next_value + 2, lambda_insts)
     }
     StringLit(start, len) -> ir_lowered_expr(
@@ -15881,9 +15955,9 @@ fn pipeline_lower_expr_typed_sidecar_handler_opt_with_fns(expr: Expr, params: i6
   pipeline_lower_expr_typed_sidecar_handler_ctx(expr, next_value, pipeline_handler_lower_ctx_with_fns_subst(params, locals, src, tt, ctx, fns, 0))
 }
 
--- Emission-time variant (handler clause bodies): see
--- pipeline_lower_module_hoist — the module list is fixed by emission,
--- so a hoisted closure body would have no code to branch to.
+-- Emission-time variant (handler clause bodies). The timing marker is
+-- propagated into nested lowering; closure bodies use late ordinary-function
+-- emission because the module collector has already run.
 fn pipeline_lower_expr_typed_sidecar_handler_opt_with_fns_no_hoist(expr: Expr, params: i64, locals: PipelineValueEnv, src: i64, tt: i64, next_value: i64, ctx: PipelineHandlerInlineCtx, fns: i64) -> IrLoweredExpr {
   pipeline_lower_expr_typed_sidecar_handler_ctx(expr, next_value, pipeline_handler_lower_ctx_with_fns_subst_hoist(params, locals, src, tt, ctx, fns, 0, 0))
 }
@@ -16301,9 +16375,6 @@ fn pipeline_collect_generic_specs_ir_inst(inst: IrInst, templates: i64, all_fns:
     IrGenericCallI64(dst, callee_hash, type_args, args) -> {
       let pair = pipeline_generic_template_find(templates, 0, callee_hash)
       pipeline_lower_generic_specialisation_handler_optimised(pair, type_expr_list_to_nodes(type_args), tt, pipeline_handler_inline_ctx_empty(), all_fns)
-    }
-    IrLambdaI64(dst, params, body, nparams, captures) -> {
-      pipeline_collect_generic_specs_expr(expr_to_node(body), all_fns, src, tt, pipeline_handler_inline_ctx_empty())
     }
     -- Hoisted lambda: the carried function's blocks hold the generic
     -- call sites the body Expr used to hold.
@@ -17644,7 +17715,6 @@ fn pipeline_ir_native_f64_gpr_pass_inst(inst: IrInst, f64_slots: i64, gpr_values
     IrResumeI64(dst, value) -> pipeline_ir_native_int_list_add_unique(gpr_values, value)
     IrTryI64(dst, value) -> pipeline_ir_native_int_list_add_unique(gpr_values, value)
     IrOptChainI64(dst, base, field_hash, field_index) -> pipeline_ir_native_int_list_add_unique(gpr_values, base)
-    IrLambdaI64(dst, params, body, nparams, captures) -> pipeline_ir_native_mark_lambda_captures(captures, gpr_values)
     IrClosureI64(dst, f, captures, eff) -> pipeline_ir_native_mark_lambda_captures(captures, gpr_values)
     IrFunctionRefI64(dst, callee_hash) -> 0
     IrStoreI64(slot, value) -> {
@@ -18087,7 +18157,11 @@ fn pipeline_ir_native_handler_ctx_to_inline_ctx(ctx: PipelineNativeHandlerCtx, s
         rest_ctx
       } else {
         let eff_hash = pipeline_handler_clause_effect_hash_typed(src, handler_clause_list_nth(clauses, 0))
-        pipeline_handler_inline_ctx_push_typed_src(rest_ctx, eff_hash, clauses, nclauses, src)
+        if frame_ctr >= 0 {
+          pipeline_handler_inline_ctx_push_typed_src(rest_ctx, eff_hash, clauses, nclauses, src)
+        } else {
+          pipeline_handler_inline_ctx_push_typed_src_no_evidence(rest_ctx, eff_hash, clauses, nclauses, src)
+        }
       }
     }
   }
@@ -18221,20 +18295,6 @@ fn pipeline_ir_native_lambda_locals(params: ParamList, free_vars: i64, nfree: i6
   pipeline_ir_native_lambda_locals_params(params, 0, nfree, locals)
 }
 
-fn pipeline_ir_native_lambda_locals_captures(params: ParamList, captures: i64, nfree: i64) -> PipelineValueEnv {
-  let mut locals = pipeline_value_env_empty()
-  let mut bi = 0
-  while bi < nfree {
-    let capture = nlist_get(captures, bi)
-    let type_node = node_f4(capture)
-    let type_hash = if type_node == 0 { 0 } else { type_hash_of(type_node) }
-    let float_prim = pipeline_type_node_prim_id_or(type_node, 0)
-    locals = pipeline_value_env_push_float_typed_node(locals, node_f1(capture), node_f2(capture), bi, float_prim, type_hash, type_node)
-    bi = bi + 1
-  }
-  pipeline_ir_native_lambda_locals_params(params, 0, nfree, locals)
-}
-
 fn pipeline_ir_native_hclause_scope_params(params: ParamList, index: i64, value_base: i64, body_scope: i64) -> i64 {
   match params {
     ParamListNil -> body_scope
@@ -18257,17 +18317,6 @@ fn pipeline_ir_native_lambda_scope(params: ParamList, free_vars: i64, nfree: i64
     let fv = nlist_get(free_vars, bi)
     let cap_ty = scope_lookup_type(enclosing_scope, src, node_f1(fv), node_f2(fv))
     body_scope = scope_push_typed(body_scope, node_f1(fv), node_f2(fv), reg_id(bi), cap_ty)
-    bi = bi + 1
-  }
-  pipeline_ir_native_hclause_scope_params(params, 0, nfree, body_scope)
-}
-
-fn pipeline_ir_native_lambda_scope_captures(params: ParamList, captures: i64, nfree: i64) -> i64 {
-  let mut body_scope = scope_new()
-  let mut bi = 0
-  while bi < nfree {
-    let capture = nlist_get(captures, bi)
-    body_scope = scope_push_typed(body_scope, node_f1(capture), node_f2(capture), reg_id(bi), node_f4(capture))
     bi = bi + 1
   }
   pipeline_ir_native_hclause_scope_params(params, 0, nfree, body_scope)
@@ -19128,10 +19177,10 @@ fn pipeline_ir_native_emit_deferred_body_function(body_expr: Expr, clauses: Hand
   let safe_handlers = pipeline_ir_native_handler_ctx_uncaptured(active_handlers)
   let base_inline = pipeline_ir_native_handler_ctx_to_inline_ctx(safe_handlers, src)
   let eff_hash = pipeline_handler_clause_effect_hash_typed(src, handler_clause_list_nth(clauses, 0))
-  let inline_ctx = pipeline_handler_inline_ctx_push_typed_src(base_inline, eff_hash, clauses, nclauses, src)
-  -- Emission-time lowering (legacy path): hoisting is forbidden here.
-  -- A closure created now would carry a function the module list was
-  -- already built without, so its hash would never resolve to code.
+  let inline_ctx = pipeline_handler_inline_ctx_push_typed_src_no_evidence(base_inline, eff_hash, clauses, nclauses, src)
+  -- The deferred body is lowered during native emission. Its closure
+  -- functions are therefore emitted through the late ordinary-function
+  -- path when their IrClosureI64 sites are reached.
   let module = PipelineLowerModule(src, fmap_get_tt(fm), fns, inline_ctx, 0, PipelineParLowerNone, 0, 0)
   let return_block = 1
   let lowered = pipeline_lower_expr_typed_to_target_blocks_reserved(body_expr, 0, locals, module, next_value, 0, 2, return_block)
@@ -20054,6 +20103,10 @@ fn pipeline_typed_expr_performs_hash(expr: Expr, src: i64, eff_hash: i64) -> i64
     LetMut(ns, nl, value, body) -> if pipeline_typed_expr_performs_hash(value, src, eff_hash) == 1 { 1 } else { pipeline_typed_expr_performs_hash(body, src, eff_hash) }
     Assign(ns, nl, value) -> pipeline_typed_expr_performs_hash(value, src, eff_hash)
     Block(first, rest) -> if pipeline_typed_expr_performs_hash(first, src, eff_hash) == 1 { 1 } else { pipeline_typed_expr_performs_hash(rest, src, eff_hash) }
+    -- A nested closure can escape its enclosing closure. The outer env must
+    -- therefore carry the lexical handler evidence that the inner closure
+    -- will copy into its own env when constructed.
+    Lambda(params, body) -> pipeline_typed_expr_performs_hash(body, src, eff_hash)
     FieldAccess(base, field_ns, field_nl) -> pipeline_typed_expr_performs_hash(base, src, eff_hash)
     Match(scrutinee, arms) -> if pipeline_typed_expr_performs_hash(scrutinee, src, eff_hash) == 1 { 1 } else { pipeline_typed_match_arms_perform_hash(arms, src, eff_hash) }
     Not(operand) -> pipeline_typed_expr_performs_hash(operand, src, eff_hash)
@@ -20080,35 +20133,87 @@ fn pipeline_typed_match_arms_perform_hash(arms: MatchArmList, src: i64, eff_hash
   }
 }
 
--- Innermost active runtime handler whose effect the lambda body performs.
--- Creation-scope evidence for escaping closures: the closure env captures
--- that handler's ops-table pointer, and the lambda's performs of the effect
--- dispatch through it instead of the invocation-time handler stack.
-fn pipeline_ir_native_lambda_evidence_entry(handlers: PipelineNativeHandlerCtx, body: Expr, src: i64) -> PipelineNativeHandlerCtx {
-  match handlers {
-    PipelineNativeHandlerCtxNil -> PipelineNativeHandlerCtxNil
-    PipelineNativeHandlerCtxCons(clauses, infos, nclauses, ops_ctr, frame_ctr, clause_src, rest) -> {
-      if frame_ctr >= 0 and nclauses > 0 {
-        let hash_src = if clause_src != 0 { clause_src } else { src }
-        let eff_hash = pipeline_handler_clause_effect_hash_typed(hash_src, handler_clause_list_nth(clauses, 0))
-        if pipeline_typed_expr_performs_hash(body, src, eff_hash) == 1 {
-          handlers
-        } else {
-          pipeline_ir_native_lambda_evidence_entry(rest, body, src)
-        }
-      } else {
-        pipeline_ir_native_lambda_evidence_entry(rest, body, src)
-      }
-    }
-  }
-}
-
 fn pipeline_ir_native_lambda_evidence_op_hashes(clauses: HandlerClauseList, nclauses: i64, hash_src: i64) -> i64 {
   let hashes = nlist_new()
   for ci in 0..nclauses {
     nlist_add(hashes, pipeline_handler_clause_op_hash_typed(hash_src, handler_clause_list_nth(clauses, ci)))
   }
   hashes
+}
+
+-- Raw registry entry: fn hash, effect hash, ordered op hashes, evidence SSA
+-- value. The registry is derived exclusively from IrClosureI64 lowering
+-- facts before ordinary-function emission.
+fn pipeline_ir_lambda_evidence_fact(fn_hash: i64, eff_hash: i64, op_hashes: i64, value: i64) -> i64 {
+  node_new(0, fn_hash, eff_hash, op_hashes, value)
+}
+
+fn pipeline_ir_lambda_evidence_registry_ensure(fm: i64) -> i64 {
+  let existing = fmap_lambda_evidence_facts(fm)
+  if existing != 0 { existing }
+  else {
+    let facts = nlist_new()
+    fmap_set_lambda_evidence_facts(fm, facts)
+    facts
+  }
+}
+
+fn pipeline_ir_lambda_evidence_registry_lookup(fm: i64, fn_hash: i64) -> i64 {
+  let facts = fmap_lambda_evidence_facts(fm)
+  if facts == 0 { 0 }
+  else {
+    let n = nlist_len(facts)
+    let mut found = 0
+    let mut i = 0
+    while i < n and found == 0 {
+      let fact = nlist_get(facts, i)
+      if node_f1(fact) == fn_hash { found = fact } else { i = i + 1 }
+    }
+    found
+  }
+}
+
+fn pipeline_ir_lambda_evidence_registry_add(fm: i64, fn_hash: i64, evidence: IrLambdaEvidence) -> i64 {
+  match evidence {
+    IrLambdaEvidenceNone -> 0
+    IrLambdaEvidenceBound(eff_hash, op_hashes, value) -> {
+      if pipeline_ir_lambda_evidence_registry_lookup(fm, fn_hash) != 0 { 0 }
+      else {
+        nlist_add(pipeline_ir_lambda_evidence_registry_ensure(fm), pipeline_ir_lambda_evidence_fact(fn_hash, eff_hash, op_hashes, value))
+        0
+      }
+    }
+  }
+}
+
+fn pipeline_ir_native_handler_evidence_ops_value(handlers: PipelineNativeHandlerCtx, eff_hash: i64, src: i64) -> i64 {
+  match handlers {
+    PipelineNativeHandlerCtxNil -> 0 - 1
+    PipelineNativeHandlerCtxCons(clauses, infos, nclauses, ops_ctr, frame_ctr, clause_src, rest) -> {
+      if frame_ctr >= 0 and nclauses > 0 {
+        let hash_src = if clause_src != 0 { clause_src } else { src }
+        let ctx_eff = pipeline_handler_clause_effect_hash_typed(hash_src, handler_clause_list_nth(clauses, 0))
+        if ctx_eff == eff_hash { ops_ctr }
+        else { pipeline_ir_native_handler_evidence_ops_value(rest, eff_hash, src) }
+      } else {
+        pipeline_ir_native_handler_evidence_ops_value(rest, eff_hash, src)
+      }
+    }
+  }
+}
+
+fn pipeline_ir_native_closure_evidence_ops_value(evidence: IrLambdaEvidence, handlers: PipelineNativeHandlerCtx, fm: i64, src: i64) -> i64 {
+  match evidence {
+    IrLambdaEvidenceNone -> 0 - 1
+    IrLambdaEvidenceBound(eff_hash, op_hashes, value) -> {
+      let active = pipeline_ir_native_handler_evidence_ops_value(handlers, eff_hash, src)
+      if active >= 0 { active }
+      else {
+        if fmap_lambda_evidence_eff(fm) == eff_hash { fmap_lambda_evidence_value(fm) }
+        else { 0 - 1 }
+      }
+    }
+  }
 }
 
 fn pipeline_nlist_index_of(list: i64, target: i64) -> i64 {
@@ -20133,27 +20238,6 @@ fn pipeline_ir_native_emit_lambda_env_evidence_store(code: i64, env_ctr: i64, nf
     let ops_phys = pipeline_ir_native_load_reg_temp(code, evidence_ops_ctr, 16)
     let env_phys = pipeline_ir_native_load_reg_temp(code, env_ctr, 17)
     bu32(code, cg_str(ops_phys, env_phys, 8 + nfree * 16))
-  }
-}
-
-fn pipeline_ir_native_emit_lambda_env(code: i64, fm: i64, closure_ctr: i64, free_vars: i64, nfree: i64, scope: i64, src: i64, evidence_ops_ctr: i64, pinned: i64) -> i64 {
-  if nfree <= 0 and evidence_ops_ctr < 0 {
-    let closure_phys = emit_load_reg(code, closure_ctr)
-    emit_mov_imm(code, 17, 0)
-    bu32(code, cg_str(17, closure_phys, 8))
-  } else {
-    let env_size = 8 + nfree * 16 + if evidence_ops_ctr < 0 { 0 } else { 8 }
-    cg_emit_rc_default_alloc_nozero_raw(code, fm, env_size, 8)
-    let env_ctr = closure_ctr + 1
-    pipeline_ir_native_store_reg(code, env_ctr, 0)
-    let env_phys = emit_load_reg(code, env_ctr)
-    emit_mov_imm(code, 9, nfree)
-    bu32(code, cg_str(9, env_phys, 0))
-    pipeline_ir_native_lambda_store_captures(code, fm, env_ctr, free_vars, nfree, scope, src, pinned)
-    pipeline_ir_native_emit_lambda_env_evidence_store(code, env_ctr, nfree, evidence_ops_ctr)
-    let closure_phys2 = pipeline_ir_native_load_reg_temp(code, closure_ctr, 16)
-    let env_phys2 = pipeline_ir_native_load_reg_temp(code, env_ctr, 17)
-    bu32(code, cg_str(env_phys2, closure_phys2, 8))
   }
 }
 
@@ -20257,14 +20341,36 @@ fn pipeline_ir_native_emit_function_ref(code: i64, dst: i64, callee_hash: i64, f
 -- machinery direct calls use (the closure ABI is exactly a direct call
 -- with env first, so no argument shifting is needed — unlike the
 -- named-fn-as-value thunk).
-fn pipeline_ir_native_emit_closure(code: i64, dst: i64, f: IrFunction, captures: i64, eff: i64, fm: i64, ctx: PipelineNativeEmitCtx) -> i64 {
+fn pipeline_ir_native_emit_closure(code: i64, dst: i64, f: IrFunction, captures: i64, evidence: IrLambdaEvidence, fm: i64, ctx: PipelineNativeEmitCtx) -> i64 {
   let pinned = pipeline_ir_native_emit_ctx_pinned(ctx)
+  let handlers = pipeline_ir_native_emit_ctx_handlers(ctx)
+  let fns = pipeline_ir_native_emit_ctx_fns(ctx)
   let nfree = nlist_len(captures)
   fmap_inc_hoisted_closure_emit_count(fm)
   match f {
     IrFunction(fn_hash, fparams, fblocks, fsrc) -> {
+      pipeline_ir_lambda_evidence_registry_add(fm, fn_hash, evidence)
       let skip_pos = buf_len(code)
       bu32(code, 0)
+      -- Functions carried by closures created during handler-clause or
+      -- deferred-body emission were not present when the module list was
+      -- collected. Emit those through the same ordinary-function driver on
+      -- first sight; globally collected closures are already predeclared.
+      if mono_cache_lookup(fmap_mono_cache(fm), fn_hash) == 0 and fmap_contains_hash(fm, fn_hash) == 0 {
+        let outer_ranges = fmap_audit_ranges(fm)
+        let outer_offsets = fmap_audit_offsets(fm)
+        let outer_nested = fmap_audit_nested(fm)
+        fmap_set_audit_ranges(fm, 0)
+        fmap_set_audit_offsets(fm, 0)
+        fmap_set_audit_nested(fm, 0)
+        let nested_start = buf_len(code)
+        pipeline_cg_ir_only_function(f, code, fm, pipeline_ir_semantic_facts_empty(), fns)
+        let nested_end = buf_len(code)
+        fmap_set_audit_ranges(fm, outer_ranges)
+        fmap_set_audit_offsets(fm, outer_offsets)
+        fmap_set_audit_nested(fm, outer_nested)
+        if outer_nested != 0 { nlist_add(outer_nested, node_new(0, nested_start, nested_end, 0, 0)) 0 } else { 0 }
+      } else { 0 }
       let thunk_off = buf_len(code)
       let mono_target = mono_cache_lookup(fmap_mono_cache(fm), fn_hash)
       if mono_target > 1 {
@@ -20288,148 +20394,14 @@ fn pipeline_ir_native_emit_closure(code: i64, dst: i64, f: IrFunction, captures:
       bu32(code, encode_adr(17, thunk_off - adr_pos))
       bu32(code, cg_str(17, closure_phys, 0))
       pipeline_ir_native_spill_pinned_value(code, dst, pinned)
-      pipeline_ir_native_emit_lambda_env_captures(code, fm, dst, captures, nfree, pipeline_ir_native_pinned_slot_none(), 0 - 1)
-    }
-  }
-}
-
-fn pipeline_ir_native_emit_lambda(code: i64, dst: i64, params: ParamList, body: Expr, nparams: i64, captures: i64, src: i64, fm: i64, ctx: PipelineNativeEmitCtx) -> i64 {
-  let scope = pipeline_ir_native_emit_ctx_scope(ctx)
-  let pinned = pipeline_ir_native_emit_ctx_pinned(ctx)
-  let fns = pipeline_ir_native_emit_ctx_fns(ctx)
-  fmap_inc_typed_lambda_emit_count(fm)
-  let explicit_captures = if captures == 0 { 0 } else { 1 }
-  let free_vars = nlist_new()
-  if explicit_captures == 0 {
-    let lambda_scope = pipeline_ir_native_hclause_lambda_scope_params(params, 0, scope_new())
-    pipeline_typed_find_free_vars_expr(body, lambda_scope, scope, src, free_vars)
-  } else { 0 }
-  let nfree = if explicit_captures == 1 { nlist_len(captures) } else { nlist_len(free_vars) }
-  let locals = if explicit_captures == 1 {
-    pipeline_ir_native_lambda_locals_captures(params, captures, nfree)
-  } else {
-    pipeline_ir_native_lambda_locals(params, free_vars, nfree)
-  }
-  let evidence_entry = pipeline_ir_native_lambda_evidence_entry(pipeline_ir_native_emit_ctx_handlers(ctx), body, src)
-  let evidence_found = match evidence_entry {
-    PipelineNativeHandlerCtxNil -> 0
-    PipelineNativeHandlerCtxCons(ev_clauses, ev_infos, ev_nclauses, ev_ops_ctr, ev_frame_ctr, ev_clause_src, ev_rest) -> 1
-  }
-  let evidence_value = nfree + nparams
-  let next_value = nfree + nparams + evidence_found
-  -- Emission-time lowering (legacy lambda path): no hoisting, see
-  -- pipeline_ir_native_emit_deferred_body_function.
-  let module = pipeline_lower_module_with_fns_no_hoist(src, fmap_get_tt(fm), fns)
-  let param_nodes = param_list_to_nodes(params)
-  let return_block = 1
-  let lowered = pipeline_lower_expr_typed_to_target_blocks_reserved(body, 0, locals, module, next_value, 0, 2, return_block)
-  let lowered_valid = pipeline_lowered_blocks_is_valid(lowered)
-  let mut lambda_drop_next = if lowered_valid == 1 {
-    pipeline_lowered_blocks_next_value(lowered)
-  } else { next_value }
-  let raw_blocks = if lowered_valid == 1 {
-    let lowered_falls = pipeline_lowered_blocks_falls_through(lowered)
-    if lowered_falls == 1 {
-      let return_value = pipeline_lowered_blocks_next_value(lowered)
-      let transfer = pipeline_lower_return_transfer_typed(body, return_value, return_value + 1, param_nodes, locals, module)
-      lambda_drop_next = ir_lowered_expr_next_value(transfer)
-      let return_params = ir_value_list_prepend(ir_lowered_expr_value(transfer), ir_value_list_empty())
-      let return_node = ir_block_new_params(return_block, return_params, ir_lowered_expr_insts(transfer), ir_term_return(ir_lowered_expr_value(transfer)))
-      ir_block_list_append(pipeline_lowered_blocks_blocks(lowered), ir_block_list_prepend(return_node, ir_block_list_empty()))
-    } else {
-      pipeline_lowered_blocks_blocks(lowered)
-    }
-  } else {
-    ir_block_list_empty()
-  }
-  let lambda_param_drops = if lowered_valid == 1 {
-    pipeline_managed_param_list_release_insts(params, 0, nfree, lambda_drop_next)
-  } else {
-    ir_inst_list_empty()
-  }
-  let blocks = pipeline_ir_block_list_append_return_drops(raw_blocks, lambda_param_drops)
-  if lowered_valid == 0 {
-    bu32(code, encode_brk(17))
-  } else {
-    if explicit_captures == 1 {
-      pipeline_ir_native_spill_pinned_lambda_capture_values(code, captures, nfree, pinned)
-    } else { 0 }
-    -- Residency audit: the lambda body is a nested function emitted inline;
-    -- its instructions must not join the outer function's offset ledger.
-    -- The nested byte range is recorded below so the checker treats it as a
-    -- call-equivalent clobber region.
-    let audit_outer_offsets = fmap_audit_offsets(fm)
-    fmap_set_audit_offsets(fm, 0)
-    let skip_pos = buf_len(code)
-    bu32(code, 0)
-    let lambda_start = buf_len(code)
-    let old_frame = fmap_current_frame_size(fm)
-    let old_preserve_fp = fmap_current_preserve_fp(fm)
-    let old_gpr_pairs = fmap_current_gpr_pairs(fm)
-    let f64_facts = pipeline_ir_native_f64_facts_for_blocks(blocks)
-    let f64_slots = pipeline_ir_native_f64_pinned_slots_from_facts(blocks, pipeline_ir_native_f64_facts_slots(f64_facts))
-    let f64_slot_count = pipeline_ir_native_f64_slot_count(f64_slots)
-    fmap_set_current_frame_size(fm, pipeline_ir_native_frame_size_for_blocks(next_value, blocks))
-    if f64_slot_count > 0 { fmap_set_current_preserve_fp(fm, 1) } else { 0 }
-    fmap_set_current_gpr_pairs(fm, 4)
-    emit_prologue_current(code, fm)
-    pipeline_ir_native_emit_lambda_loads(code, nparams, nfree)
-    if evidence_found == 1 {
-      let ev_dst = reg_phys(evidence_value)
-      bu32(code, cg_ldr(ev_dst, 0, 8 + nfree * 16))
-      if evidence_value >= 8 { emit_store_reg(code, evidence_value, ev_dst) } else { 0 }
-    } else { 0 }
-    let old_ev_eff = fmap_lambda_evidence_eff(fm)
-    let old_ev_ops = fmap_lambda_evidence_ops(fm)
-    let old_ev_value = fmap_lambda_evidence_value(fm)
-    match evidence_entry {
-      PipelineNativeHandlerCtxNil -> fmap_set_lambda_evidence(fm, 0, 0, 0)
-      PipelineNativeHandlerCtxCons(ev_clauses, ev_infos, ev_nclauses, ev_ops_ctr, ev_frame_ctr, ev_clause_src, ev_rest) -> {
-        let hash_src = if ev_clause_src != 0 { ev_clause_src } else { src }
-        let ev_eff = pipeline_handler_clause_effect_hash_typed(hash_src, handler_clause_list_nth(ev_clauses, 0))
-        fmap_set_lambda_evidence(fm, ev_eff, pipeline_ir_native_lambda_evidence_op_hashes(ev_clauses, ev_nclauses, hash_src), evidence_value)
+      let evidence_ops = pipeline_ir_native_closure_evidence_ops_value(evidence, handlers, fm, fsrc)
+      match evidence {
+        IrLambdaEvidenceNone -> 0
+        IrLambdaEvidenceBound(eff_hash, op_hashes, value) -> {
+          if evidence_ops < 0 { bu32(code, encode_brk(20)) } else { 0 }
+        }
       }
-    }
-    let body_scope = if explicit_captures == 1 {
-      pipeline_ir_native_lambda_scope_captures(params, captures, nfree)
-    } else {
-      pipeline_ir_native_lambda_scope(params, free_vars, nfree, scope, src)
-    }
-    let lambda_pinned = pipeline_ir_native_pinned_with_forward(pipeline_ir_native_pinned_slot_none())
-    let temp_base = pipeline_ir_function_next_value(next_value, blocks) + 8
-    let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, body_scope, src, fm, PipelineNativeHandlerCtxNil, fns, f64_slots, pipeline_ir_native_f64_facts_gpr_values(f64_facts), pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, lambda_pinned, temp_base))
-    let labels = pipeline_ir_native_label_map_add(pipeline_ir_native_cfg_state_labels(state), pipeline_ir_native_epilogue_label(), buf_len(code))
-    pipeline_ir_native_patch_all(code, labels, pipeline_ir_native_cfg_state_patches(state))
-    emit_epilogue_current(code, fm)
-    fmap_set_lambda_evidence(fm, old_ev_eff, old_ev_ops, old_ev_value)
-    fmap_set_current_frame_size(fm, old_frame)
-    fmap_set_current_preserve_fp(fm, old_preserve_fp)
-    fmap_set_current_gpr_pairs(fm, old_gpr_pairs)
-    cg_patch_b(code, skip_pos, buf_len(code))
-    fmap_set_audit_offsets(fm, audit_outer_offsets)
-    if audit_outer_offsets != 0 {
-      let audit_nested = fmap_audit_nested(fm)
-      if audit_nested != 0 {
-        nlist_add(audit_nested, node_new(0, lambda_start, buf_len(code), 0, 0))
-        0
-      } else { 0 }
-    } else { 0 }
-
-    cg_emit_rc_default_alloc_nozero_lit(code, fm, continuation_cleanup_kind_closure(), 16, 8)
-    pipeline_ir_native_store_reg_pinned(code, pinned, dst, 0)
-    let closure_phys = pipeline_ir_native_load_reg(code, pinned, dst)
-    let adr_pos = buf_len(code)
-    bu32(code, encode_adr(17, lambda_start - adr_pos))
-    bu32(code, cg_str(17, closure_phys, 0))
-    pipeline_ir_native_spill_pinned_value(code, dst, pinned)
-    let evidence_ops_ctr = match evidence_entry {
-      PipelineNativeHandlerCtxNil -> 0 - 1
-      PipelineNativeHandlerCtxCons(ev_clauses, ev_infos, ev_nclauses, ev_ops_ctr, ev_frame_ctr, ev_clause_src, ev_rest) -> ev_ops_ctr
-    }
-    if explicit_captures == 1 {
-      pipeline_ir_native_emit_lambda_env_captures(code, fm, dst, captures, nfree, pipeline_ir_native_pinned_slot_none(), evidence_ops_ctr)
-    } else {
-      pipeline_ir_native_emit_lambda_env(code, fm, dst, free_vars, nfree, scope, src, evidence_ops_ctr, pinned)
+      pipeline_ir_native_emit_lambda_env_captures(code, fm, dst, captures, nfree, pipeline_ir_native_pinned_slot_none(), evidence_ops)
     }
   }
 }
@@ -21422,10 +21394,6 @@ fn pipeline_ir_native_emit_inst(inst: IrInst, code: i64, src: i64, fm: i64, ctx:
       pipeline_ir_native_emit_opt_chain(code, dst, base, field_index, fm, pinned)
       ctx
     }
-    IrLambdaI64(dst, params, body, nparams, captures) -> {
-      pipeline_ir_native_emit_lambda(code, dst, params, body, nparams, captures, src, fm, ctx)
-      ctx
-    }
     IrClosureI64(dst, f, captures, eff) -> {
       pipeline_ir_native_emit_closure(code, dst, f, captures, eff, fm, ctx)
       ctx
@@ -21504,7 +21472,6 @@ fn pipeline_ir_native_inst_preserves_fp_env(inst: IrInst) -> i64 {
     IrHandleI64(dst, handle_src, body, clauses, nclauses, captures) -> 0
     IrDeferredHandleI64(dst, handle_src, body_expr, clauses, nclauses, captures, scratch_base) -> 0
     IrHandlerPopI64(frame) -> 0
-    IrLambdaI64(dst, params, body, nparams, captures) -> 0
     IrClosureI64(dst, f, captures, eff) -> 0
     IrTryI64(dst, value) -> 0
     -- Variant/record construction emits a BL to rc_default_alloc
@@ -22629,7 +22596,6 @@ fn pipeline_ir_native_resident_inst_cs_use_safe(inst: IrInst) -> i64 {
 -- identity bank homes: the swap permutation bails on them.
 fn pipeline_ir_native_inst_is_lambda(inst: IrInst) -> i64 {
   match inst {
-    IrLambdaI64(dst, params, body, nparams, captures) -> 1
     IrClosureI64(dst, f, captures, eff) -> 1
     _ -> 0
   }
@@ -22807,7 +22773,6 @@ fn pipeline_ir_native_resident_inst_fp_cs_simple(inst: IrInst) -> i64 {
       IrOwnedDropI64(value, type_hash) -> 1
       IrVariantInitI64(dst, tag_hash, payloads) -> 1
       IrRecordInitI64(dst, type_hash, fields) -> 1
-      IrLambdaI64(dst, params, body, nparams, captures) -> 1
       IrClosureI64(dst, f, captures, eff) -> 1
       IrFunctionRefI64(dst, callee_hash) -> 1
       IrOptChainI64(dst, base, field_hash, field_index) -> 1
@@ -23853,6 +23818,47 @@ fn pipeline_ir_native_residency_audit_function(code: i64, fm: i64, fn_hash: i64)
   0
 }
 
+fn pipeline_ir_lambda_evidence_register_insts(insts: IrInstList, fm: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      match inst {
+        IrClosureI64(dst, f, captures, evidence) -> {
+          pipeline_ir_lambda_evidence_registry_add(fm, pipeline_ir_function_hash(f), evidence)
+        }
+        _ -> 0
+      }
+      pipeline_ir_lambda_evidence_register_insts(rest, fm)
+    }
+  }
+}
+
+fn pipeline_ir_lambda_evidence_register_blocks(blocks: IrBlockList, fm: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_lambda_evidence_register_insts(insts, fm)
+      }
+      pipeline_ir_lambda_evidence_register_blocks(rest, fm)
+    }
+  }
+}
+
+fn pipeline_ir_lambda_evidence_register_functions(functions: IrFunctionList, fm: i64) -> i64 {
+  pipeline_ir_lambda_evidence_registry_ensure(fm)
+  match functions {
+    IrFunctionNil -> 0
+    IrFunctionCons(irf, rest) -> {
+      match irf {
+        IrFunction(hash, params, blocks, src) -> pipeline_ir_lambda_evidence_register_blocks(blocks, fm)
+      }
+      pipeline_ir_lambda_evidence_register_functions(rest, fm)
+    }
+    _ -> 0
+  }
+}
+
 fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: PipelineIrSemanticFactList, fns: i64) -> i64 {
   match irf {
     IrFunction(hash, param_count, blocks, src) -> {
@@ -23866,6 +23872,15 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         let old_frame = fmap_current_frame_size(fm)
         let old_preserve_fp = fmap_current_preserve_fp(fm)
         let old_gpr_pairs = fmap_current_gpr_pairs(fm)
+        let old_ev_eff = fmap_lambda_evidence_eff(fm)
+        let old_ev_ops = fmap_lambda_evidence_ops(fm)
+        let old_ev_value = fmap_lambda_evidence_value(fm)
+        let evidence_fact = pipeline_ir_lambda_evidence_registry_lookup(fm, hash)
+        if evidence_fact == 0 {
+          fmap_set_lambda_evidence(fm, 0, 0, 0)
+        } else {
+          fmap_set_lambda_evidence(fm, node_f2(evidence_fact), node_f3(evidence_fact), node_f4(evidence_fact))
+        }
         let old_cleanup_depth = nlist_len(cg_cleanup_stack(fm))
         cg_cleanup_restore(fm, 0)
         let f64_facts = pipeline_ir_native_f64_facts_for_blocks(blocks)
@@ -23922,6 +23937,7 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         fmap_set_current_frame_size(fm, old_frame)
         fmap_set_current_preserve_fp(fm, old_preserve_fp)
         fmap_set_current_gpr_pairs(fm, old_gpr_pairs)
+        fmap_set_lambda_evidence(fm, old_ev_eff, old_ev_ops, old_ev_value)
         1
       }
     }
@@ -24025,8 +24041,11 @@ fn pipeline_cg_module_with_ir(fns: i64, ir_functions: IrFunctionList, code: i64,
       }
     } else { 0 }
   }
-  let emitted = pipeline_cg_ir_only_functions(ir_functions, code, fm, facts, fns)
-  fmap_set_ir_native_emit_count(fm, emitted)
+  pipeline_ir_lambda_evidence_register_functions(ir_functions, fm)
+  pipeline_cg_ir_only_functions(ir_functions, code, fm, facts, fns)
+  -- Late closure bodies emitted from handler/deferred lowering also use the
+  -- ordinary driver and increment the candidate counter.
+  fmap_set_ir_native_emit_count(fm, fmap_ir_native_candidate_count(fm))
   code
 }
 
@@ -24743,7 +24762,6 @@ fn pipeline_ir_rewrite_inst_uses(inst: IrInst, aliases: PipelineIrAliasEnv) -> I
     IrBinaryI64(dst, op, lhs, rhs) -> IrBinaryI64(dst, op, pipeline_ir_alias_env_lookup_or(aliases, lhs), pipeline_ir_alias_env_lookup_or(aliases, rhs))
     IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> IrFloatBinaryI64(dst, prim, op, pipeline_ir_alias_env_lookup_or(aliases, lhs), pipeline_ir_alias_env_lookup_or(aliases, rhs))
     IrUnaryI64(dst, op, value) -> IrUnaryI64(dst, op, pipeline_ir_alias_env_lookup_or(aliases, value))
-    IrLambdaI64(dst, params, body, nparams, captures) -> inst
     IrClosureI64(dst, f, captures, eff) -> inst
     IrFunctionRefI64(dst, callee_hash) -> inst
     IrAddressOfSlotI64(dst, slot) -> inst
@@ -24827,7 +24845,6 @@ fn pipeline_ir_max_inst_value(inst: IrInst, current: i64) -> i64 {
     IrBinaryI64(dst, op, lhs, rhs) -> pipeline_ir_max_i64(pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst), lhs), rhs)
     IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> pipeline_ir_max_i64(pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst), lhs), rhs)
     IrUnaryI64(dst, op, value) -> pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst), value)
-    IrLambdaI64(dst, params, body, nparams, captures) -> pipeline_ir_max_lambda_captures(captures, pipeline_ir_max_i64(current, dst))
     IrClosureI64(dst, f, captures, eff) -> pipeline_ir_max_lambda_captures(captures, pipeline_ir_max_i64(current, dst))
     IrFunctionRefI64(dst, callee_hash) -> pipeline_ir_max_i64(current, dst)
     IrAddressOfSlotI64(dst, slot) -> pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst), slot)
@@ -32868,7 +32885,6 @@ fn pipeline_ir_inst_def_or(inst: IrInst, default: i64) -> i64 {
     IrBinaryI64(dst, op, lhs, rhs) -> dst
     IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> dst
     IrUnaryI64(dst, op, value) -> dst
-    IrLambdaI64(dst, params, body, nparams, captures) -> dst
     IrClosureI64(dst, f, captures, eff) -> dst
     IrFunctionRefI64(dst, callee_hash) -> dst
     IrAddressOfSlotI64(dst, slot) -> dst
@@ -32938,7 +32954,6 @@ fn pipeline_ir_live_set_add_inst_uses(inst: IrInst, live: PipelineIrLiveSet) -> 
     IrBinaryI64(dst, op, lhs, rhs) -> pipeline_ir_live_set_add(pipeline_ir_live_set_add(live, lhs), rhs)
     IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> pipeline_ir_live_set_add(pipeline_ir_live_set_add(live, lhs), rhs)
     IrUnaryI64(dst, op, value) -> pipeline_ir_live_set_add(live, value)
-    IrLambdaI64(dst, params, body, nparams, captures) -> pipeline_ir_live_set_add_lambda_captures(captures, live)
     IrClosureI64(dst, f, captures, eff) -> pipeline_ir_live_set_add_lambda_captures(captures, live)
     IrFunctionRefI64(dst, callee_hash) -> live
     IrAddressOfSlotI64(dst, slot) -> pipeline_ir_live_set_add(live, slot)

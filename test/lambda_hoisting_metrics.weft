@@ -7,8 +7,8 @@
 -- with the env pointer first), so it flows through the whole pipeline
 -- like any named function. These tests assert on the emitted-module
 -- counters and on observable semantics: captures (scalar and managed),
--- nesting, escaping, arity, generics, and the emission-time contexts
--- that deliberately keep the legacy path.
+-- nesting, escaping, arity, generics, lowering-time handler evidence,
+-- and late ordinary-function emission from handler/deferred bodies.
 
 use "compiler/codegen.weft"
 use "compiler/typeck.weft"
@@ -55,11 +55,27 @@ fn lh_lambda_insts(insts: IrInstList) -> i64 {
   match insts {
     IrInstNil -> 0
     IrInstCons(inst, rest) -> {
+      -- Tag 17 belonged to the deleted AST-bearing IrLambdaI64 variant.
+      let one = if ir_inst_tag(inst) == 17 { 1 } else { 0 }
+      one + lh_lambda_insts(rest)
+    }
+  }
+}
+
+fn lh_bound_evidence_insts(insts: IrInstList) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
       let one = match inst {
-        IrLambdaI64(dst, params, body, nparams, captures) -> 1
+        IrClosureI64(dst, f, captures, evidence) -> {
+          match evidence {
+            IrLambdaEvidenceNone -> 0
+            IrLambdaEvidenceBound(eff_hash, op_hashes, value) -> 1
+          }
+        }
         _ -> 0
       }
-      one + lh_lambda_insts(rest)
+      one + lh_bound_evidence_insts(rest)
     }
   }
 }
@@ -88,6 +104,18 @@ fn lh_lambda_blocks(blocks: IrBlockList) -> i64 {
   }
 }
 
+fn lh_bound_evidence_blocks(blocks: IrBlockList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      let one = match block {
+        IrBlock(id, params, insts, term) -> lh_bound_evidence_insts(insts)
+      }
+      one + lh_bound_evidence_blocks(rest)
+    }
+  }
+}
+
 fn lh_module_closures(fns_list: IrFunctionList) -> i64 {
   match fns_list {
     IrFunctionNil -> 0
@@ -108,6 +136,18 @@ fn lh_module_lambdas(fns_list: IrFunctionList) -> i64 {
         IrFunction(hash, nparams, blocks, src) -> lh_lambda_blocks(blocks)
       }
       one + lh_module_lambdas(rest)
+    }
+  }
+}
+
+fn lh_module_bound_evidence(fns_list: IrFunctionList) -> i64 {
+  match fns_list {
+    IrFunctionNil -> 0
+    IrFunctionCons(f, rest) -> {
+      let one = match f {
+        IrFunction(hash, nparams, blocks, src) -> lh_bound_evidence_blocks(blocks)
+      }
+      one + lh_module_bound_evidence(rest)
     }
   }
 }
@@ -168,34 +208,39 @@ test "lambda_hoist_identical_bodies_share_one_function" {
 }
 
 -- ---------------------------------------------------------------------
--- Emission-time contexts keep the legacy inline path
+-- Evidence and emission-time lowering contexts use ordinary functions
 -- ---------------------------------------------------------------------
 
-test "lambda_hoist_skips_handler_clause_bodies" {
-  -- Handler clause bodies are lowered at EMISSION time, after the module
-  -- function list is fixed, so a hoisted body would have no code to
-  -- branch to. Those sites stay on the legacy inline-emission path.
+test "lambda_hoist_handler_clause_body_uses_late_ordinary_function" {
+  -- Handler clause bodies are still lowered while emitting their enclosing
+  -- handler, so the carried function is emitted on first closure sight.
   let src = "effect LhClause { fn get() -> i64 } fn lh_call(f: (i64) -> i64) -> i64 { f(2) } fn main() -> i64 { handle LhClause.get() { LhClause.get() -> resume({ let base = 40 let f = (x: i64) => x + base lh_call(f) }) } }"
-  Test.assert_eq(lh_at_least(lh_legacy(src), 1), 1)
-  Test.assert_eq(lh_hoisted(src), 0)
+  Test.assert_eq(lh_legacy(src), 0)
+  Test.assert_eq(lh_at_least(lh_hoisted(src), 1), 1)
 }
 
-test "lambda_hoist_skips_perform_carrying_bodies" {
-  -- Phase 1 gate: a body with a direct perform needs evidence routing
-  -- that only the emission-time context resolves today.
+test "lambda_hoist_perform_body_carries_lowering_evidence" {
   let src = "effect LhPerf { fn get() -> i64 } fn lh_apply(f: (i64) -> i64) -[LhPerf]> i64 { f(1) } fn main() -> i64 { handle lh_apply((x: i64) => x + LhPerf.get()) { LhPerf.get() -> resume(41) } }"
-  Test.assert_eq(lh_at_least(lh_legacy(src), 1), 1)
-  Test.assert_eq(lh_hoisted(src), 0)
+  let functions = pipeline_ir_functions(lh_optimised(src))
+  Test.assert_eq(lh_at_least(lh_module_bound_evidence(functions), 1), 1)
+  Test.assert_eq(lh_legacy(src), 0)
+  Test.assert_eq(lh_at_least(lh_hoisted(src), 1), 1)
 }
 
 test "lambda_hoist_perform_free_body_under_a_handler_still_hoists" {
-  -- Being lexically inside a handled region is not a barrier: only a
-  -- DIRECT perform in the lambda body is.
+  -- A perform-free closure needs no evidence even when created under a
+  -- handler, but it still follows the same ordinary-function path.
   let src = "effect LhAmb { fn get() -> i64 } fn lh_apply2(f: (i64) -> i64) -> i64 { f(1) } fn main() -> i64 { handle LhAmb.get() { LhAmb.get() -> resume(41) } + lh_apply2((x: i64) => x + 1) }"
+  Test.assert_eq(lh_at_least(lh_hoisted(src), 1), 1)
+  Test.assert_eq(lh_legacy(src), 0)
+}
+
+test "lambda_hoist_deferred_body_uses_late_ordinary_function" {
+  let src = "effect LhDeferred { @deferred fn get() -> i64 } fn main() -> i64 { handle { let f = (x: i64) => x + 1 f(40) + LhDeferred.get() } { LhDeferred.get() with k -> k(1) } }"
+  Test.assert_eq(lh_legacy(src), 0)
   Test.assert_eq(lh_at_least(lh_hoisted(src), 1), 1)
 }
 
 -- ---------------------------------------------------------------------
 -- Semantics: captures, nesting, escape, arity, generics
 -- ---------------------------------------------------------------------
-
