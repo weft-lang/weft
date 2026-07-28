@@ -20831,11 +20831,16 @@ fn pipeline_ir_native_emit_function_ref(code: i64, dst: i64, callee_hash: i64, f
 
 -- Hoisted-closure construction (2k slice A): the body is a standalone
 -- ordinary function emitted through the normal per-function driver, so
--- this site only builds the [code, env] pair. The code slot points at
--- a 4-byte local thunk `b <fn>` resolved by the same hash-patch
--- machinery direct calls use (the closure ABI is exactly a direct call
--- with env first, so no argument shifting is needed — unlike the
+-- this site only builds the [code, env] pair. An already-emitted target
+-- within ADR's +/-1MB range is addressed directly; forward/distant
+-- targets use a 4-byte local `b <fn>` thunk resolved by the same hash-
+-- patch machinery as direct calls. The closure ABI is exactly a direct
+-- call with env first, so no argument shifting is needed (unlike the
 -- named-fn-as-value thunk).
+fn pipeline_ir_native_adr_offset_fits(offset: i64) -> i64 {
+  if offset >= 0 - 1048576 and offset <= 1048575 { 1 } else { 0 }
+}
+
 fn pipeline_ir_native_emit_closure(code: i64, dst: i64, f: IrFunction, captures: i64, evidence: IrLambdaEvidence, fm: i64, ctx: PipelineNativeEmitCtx) -> i64 {
   let pinned = pipeline_ir_native_emit_ctx_pinned(ctx)
   let handlers = pipeline_ir_native_emit_ctx_handlers(ctx)
@@ -20845,13 +20850,16 @@ fn pipeline_ir_native_emit_closure(code: i64, dst: i64, f: IrFunction, captures:
   match f {
     IrFunction(fn_hash, fparams, fblocks, fsrc) -> {
       pipeline_ir_lambda_evidence_registry_add(fm, fn_hash, evidence)
-      let skip_pos = buf_len(code)
-      bu32(code, 0)
       -- Functions carried by closures created during handler-clause or
       -- deferred-body emission were not present when the module list was
       -- collected. Emit those through the same ordinary-function driver on
       -- first sight; globally collected closures are already predeclared.
+      -- Only the late body needs a branch-over. Forward targets get their
+      -- local thunk beside the eventual ADR below; already-emitted nearby
+      -- targets need neither branch.
       if mono_cache_lookup(fmap_mono_cache(fm), fn_hash) == 0 and fmap_contains_hash(fm, fn_hash) == 0 {
+        let skip_pos = buf_len(code)
+        bu32(code, 0)
         let outer_ranges = fmap_audit_ranges(fm)
         let outer_offsets = fmap_audit_offsets(fm)
         let outer_nested = fmap_audit_nested(fm)
@@ -20865,28 +20873,40 @@ fn pipeline_ir_native_emit_closure(code: i64, dst: i64, f: IrFunction, captures:
         fmap_set_audit_offsets(fm, outer_offsets)
         fmap_set_audit_nested(fm, outer_nested)
         if outer_nested != 0 { nlist_add(outer_nested, node_new(0, nested_start, nested_end, 0, 0)) 0 } else { 0 }
+        cg_patch_b(code, skip_pos, buf_len(code))
       } else { 0 }
-      let thunk_off = buf_len(code)
-      let mono_target = mono_cache_lookup(fmap_mono_cache(fm), fn_hash)
-      if mono_target > 1 {
-        bu32(code, encode_b(mono_target - thunk_off))
-      } else {
-        if mono_target != 0 or fmap_contains_hash(fm, fn_hash) == 1 {
-          fmap_add_branch_patch_by_hash(fm, thunk_off, fn_hash)
-          bu32(code, encode_b(0))
-        } else {
-          bu32(code, encode_brk(19))
-        }
-      }
-      cg_patch_b(code, skip_pos, buf_len(code))
       if nfree > 0 {
         pipeline_ir_native_spill_pinned_lambda_capture_values(code, captures, nfree, pinned)
       } else { 0 }
       cg_emit_rc_default_alloc_nozero_lit(code, fm, continuation_cleanup_kind_closure(), 16, 8)
       pipeline_ir_native_store_reg_pinned(code, pinned, dst, 0)
       let closure_phys = pipeline_ir_native_load_reg(code, pinned, dst)
-      let adr_pos = buf_len(code)
-      bu32(code, encode_adr(17, thunk_off - adr_pos))
+      let mono_target = mono_cache_lookup(fmap_mono_cache(fm), fn_hash)
+      let emitted_target = if mono_target > 1 { mono_target } else { fmap_lookup_by_hash(fm, fn_hash) }
+      let direct_offset = emitted_target - buf_len(code)
+      if emitted_target > 1 and pipeline_ir_native_adr_offset_fits(direct_offset) == 1 {
+        let adr_pos = buf_len(code)
+        bu32(code, encode_adr(17, emitted_target - adr_pos))
+      } else {
+        -- Keep the thunk adjacent to its address materialisation: ADR
+        -- reaches it for every function size, and B reaches the target
+        -- across the whole native module. The leading branch skips the
+        -- thunk without disturbing the live closure pointer register.
+        bu32(code, encode_b(8))
+        let thunk_off = buf_len(code)
+        if emitted_target > 1 {
+          bu32(code, encode_b(emitted_target - thunk_off))
+        } else {
+          if mono_target != 0 or fmap_contains_hash(fm, fn_hash) == 1 {
+            fmap_add_branch_patch_by_hash(fm, thunk_off, fn_hash)
+            bu32(code, encode_b(0))
+          } else {
+            bu32(code, encode_brk(19))
+          }
+        }
+        let adr_pos = buf_len(code)
+        bu32(code, encode_adr(17, thunk_off - adr_pos))
+      }
       bu32(code, cg_str(17, closure_phys, 0))
       pipeline_ir_native_spill_pinned_value(code, dst, pinned)
       let evidence_ops = pipeline_ir_native_closure_evidence_ops_value(evidence, handlers, fm, fsrc)
