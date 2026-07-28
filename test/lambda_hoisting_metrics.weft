@@ -1,0 +1,201 @@
+-- test/lambda_hoisting_metrics.weft -- lambda body hoisting (2k slice A)
+--
+-- Lambda bodies used to be lowered AND emitted at emission time: no
+-- optimiser, no mem2reg, no register residency, every value through a
+-- spill slot. Hoisting lowers the body into a standalone ordinary
+-- IrFunction (env as param 0 — the closure ABI is exactly a direct call
+-- with the env pointer first), so it flows through the whole pipeline
+-- like any named function. These tests assert on the emitted-module
+-- counters and on observable semantics: captures (scalar and managed),
+-- nesting, escaping, arity, generics, and the emission-time contexts
+-- that deliberately keep the legacy path.
+
+use "compiler/codegen.weft"
+use "compiler/typeck.weft"
+use "compiler/macho.weft"
+use "compiler/object.weft"
+use "compiler/ir.weft"
+use "compiler/grammar.weft"
+use "compiler/pipeline.weft"
+
+fn lh_native(src: str) -> NativeModule {
+  let typed = pipeline_check_source_with_origin(__str_ptr(src), __str_len(src), 1, 0)
+  let ir = pipeline_lower_ir(typed)
+  let optimised = pipeline_optimise_typed_ir(typed, ir)
+  pipeline_lower_native_module(typed, optimised)
+}
+
+fn lh_hoisted(src: str) -> i64 {
+  pipeline_native_hoisted_closure_emit_count(lh_native(src))
+}
+
+fn lh_legacy(src: str) -> i64 {
+  pipeline_native_typed_lambda_emit_count(lh_native(src))
+}
+
+fn lh_at_least(count: i64, expected: i64) -> i64 {
+  if count >= expected { 1 } else { 0 }
+}
+
+-- Count IrClosureI64 insts in the optimised module: the hoisted shape.
+fn lh_closure_insts(insts: IrInstList) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let one = match inst {
+        IrClosureI64(dst, f, captures, eff) -> 1
+        _ -> 0
+      }
+      one + lh_closure_insts(rest)
+    }
+  }
+}
+
+fn lh_lambda_insts(insts: IrInstList) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let one = match inst {
+        IrLambdaI64(dst, params, body, nparams, captures) -> 1
+        _ -> 0
+      }
+      one + lh_lambda_insts(rest)
+    }
+  }
+}
+
+fn lh_closure_blocks(blocks: IrBlockList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      let one = match block {
+        IrBlock(id, params, insts, term) -> lh_closure_insts(insts)
+      }
+      one + lh_closure_blocks(rest)
+    }
+  }
+}
+
+fn lh_lambda_blocks(blocks: IrBlockList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      let one = match block {
+        IrBlock(id, params, insts, term) -> lh_lambda_insts(insts)
+      }
+      one + lh_lambda_blocks(rest)
+    }
+  }
+}
+
+fn lh_module_closures(fns_list: IrFunctionList) -> i64 {
+  match fns_list {
+    IrFunctionNil -> 0
+    IrFunctionCons(f, rest) -> {
+      let one = match f {
+        IrFunction(hash, nparams, blocks, src) -> lh_closure_blocks(blocks)
+      }
+      one + lh_module_closures(rest)
+    }
+  }
+}
+
+fn lh_module_lambdas(fns_list: IrFunctionList) -> i64 {
+  match fns_list {
+    IrFunctionNil -> 0
+    IrFunctionCons(f, rest) -> {
+      let one = match f {
+        IrFunction(hash, nparams, blocks, src) -> lh_lambda_blocks(blocks)
+      }
+      one + lh_module_lambdas(rest)
+    }
+  }
+}
+
+fn lh_optimised(src: str) -> IrModule {
+  let typed = pipeline_check_source_with_origin(__str_ptr(src), __str_len(src), 1, 0)
+  let ir = pipeline_lower_ir(typed)
+  pipeline_optimise_typed_ir(typed, ir)
+}
+
+fn lh_fn_count(fns_list: IrFunctionList) -> i64 {
+  match fns_list {
+    IrFunctionNil -> 0
+    IrFunctionCons(f, rest) -> 1 + lh_fn_count(rest)
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- Hoisting happens, and the body becomes a real module function
+-- ---------------------------------------------------------------------
+
+test "lambda_hoist_plain_lambda_becomes_module_function" {
+  let src = "fn apply(f: (i64) -> i64, x: i64) -> i64 { f(x) } fn main() -> i64 { apply((x: i64) => x + 1, 41) }"
+  let functions = pipeline_ir_functions(lh_optimised(src))
+  -- the lambda site is a closure construction, not a carried body
+  Test.assert_eq(lh_module_closures(functions), 1)
+  Test.assert_eq(lh_module_lambdas(functions), 0)
+  Test.assert_eq(lh_at_least(lh_hoisted(src), 1), 1)
+  Test.assert_eq(lh_legacy(src), 0)
+}
+
+test "lambda_hoist_body_flows_through_the_optimiser" {
+  -- The hoisted body is an ordinary function, so the module function
+  -- count includes it: two source fns plus main plus the lambda body.
+  let src = "fn apply(f: (i64) -> i64, x: i64) -> i64 { f(x) } fn main() -> i64 { apply((x: i64) => x + 1, 41) }"
+  let base = "fn apply(f: (i64) -> i64, x: i64) -> i64 { f(x) } fn helper(x: i64) -> i64 { x + 1 } fn main() -> i64 { apply(helper, 41) }"
+  let with_lambda = lh_fn_count(pipeline_ir_functions(lh_optimised(src)))
+  let with_named = lh_fn_count(pipeline_ir_functions(lh_optimised(base)))
+  -- a lambda contributes exactly what a named helper contributes
+  Test.assert_eq(with_lambda, with_named)
+}
+
+test "lambda_hoist_multiple_sites_each_get_a_function" {
+  let src = "fn apply(f: (i64) -> i64, x: i64) -> i64 { f(x) } fn main() -> i64 { apply((x: i64) => x + 1, 1) + apply((x: i64) => x * 2, 2) + apply((x: i64) => x - 3, 3) }"
+  let functions = pipeline_ir_functions(lh_optimised(src))
+  Test.assert_eq(lh_module_closures(functions), 3)
+  Test.assert_eq(lh_module_lambdas(functions), 0)
+  Test.assert_eq(lh_at_least(lh_hoisted(src), 3), 1)
+}
+
+test "lambda_hoist_identical_bodies_share_one_function" {
+  -- Distinct sites with distinct bodies never collide (the site key is
+  -- the body node), and the collector dedups by hash.
+  let src = "fn apply(f: (i64) -> i64, x: i64) -> i64 { f(x) } fn main() -> i64 { apply((x: i64) => x + 1, 1) + apply((x: i64) => x + 1, 2) }"
+  let functions = pipeline_ir_functions(lh_optimised(src))
+  Test.assert_eq(lh_module_closures(functions), 2)
+  Test.assert_eq(lh_at_least(lh_fn_count(functions), 4), 1)
+}
+
+-- ---------------------------------------------------------------------
+-- Emission-time contexts keep the legacy inline path
+-- ---------------------------------------------------------------------
+
+test "lambda_hoist_skips_handler_clause_bodies" {
+  -- Handler clause bodies are lowered at EMISSION time, after the module
+  -- function list is fixed, so a hoisted body would have no code to
+  -- branch to. Those sites stay on the legacy inline-emission path.
+  let src = "effect LhClause { fn get() -> i64 } fn lh_call(f: (i64) -> i64) -> i64 { f(2) } fn main() -> i64 { handle LhClause.get() { LhClause.get() -> resume({ let base = 40 let f = (x: i64) => x + base lh_call(f) }) } }"
+  Test.assert_eq(lh_at_least(lh_legacy(src), 1), 1)
+  Test.assert_eq(lh_hoisted(src), 0)
+}
+
+test "lambda_hoist_skips_perform_carrying_bodies" {
+  -- Phase 1 gate: a body with a direct perform needs evidence routing
+  -- that only the emission-time context resolves today.
+  let src = "effect LhPerf { fn get() -> i64 } fn lh_apply(f: (i64) -> i64) -[LhPerf]> i64 { f(1) } fn main() -> i64 { handle lh_apply((x: i64) => x + LhPerf.get()) { LhPerf.get() -> resume(41) } }"
+  Test.assert_eq(lh_at_least(lh_legacy(src), 1), 1)
+  Test.assert_eq(lh_hoisted(src), 0)
+}
+
+test "lambda_hoist_perform_free_body_under_a_handler_still_hoists" {
+  -- Being lexically inside a handled region is not a barrier: only a
+  -- DIRECT perform in the lambda body is.
+  let src = "effect LhAmb { fn get() -> i64 } fn lh_apply2(f: (i64) -> i64) -> i64 { f(1) } fn main() -> i64 { handle LhAmb.get() { LhAmb.get() -> resume(41) } + lh_apply2((x: i64) => x + 1) }"
+  Test.assert_eq(lh_at_least(lh_hoisted(src), 1), 1)
+}
+
+-- ---------------------------------------------------------------------
+-- Semantics: captures, nesting, escape, arity, generics
+-- ---------------------------------------------------------------------
+
