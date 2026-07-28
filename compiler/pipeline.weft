@@ -20223,6 +20223,17 @@ fn pipeline_ir_native_vector_element_mode_of_hash() -> i64 {
   str_hash(__str_ptr("vector_element_mode_of"), 0, __str_len("vector_element_mode_of"))
 }
 
+-- Generic-call sites the backend lowers as per-spec constants (see
+-- pipeline_ir_native_emit_generic_call): the collected spec's IR body
+-- is a `const 0` placeholder — the real value exists only at emission.
+-- Any pass that resolves a generic call site to its spec BODY (the
+-- multi-inliner's splice site resolution) must treat these sites as
+-- opaque, or it hard-wires the placeholder.
+fn pipeline_ir_native_generic_call_constant_intrinsic(callee_hash: i64, args: IrValueList) -> i64 {
+  if ir_value_list_len(args) != 0 { 0 }
+  else { if callee_hash == pipeline_ir_native_vector_element_size_of_hash() or callee_hash == pipeline_ir_native_vector_element_mode_of_hash() { 1 } else { 0 } }
+}
+
 fn pipeline_ir_native_vector_storage_store_value_hash() -> i64 {
   str_hash(__str_ptr("vector_storage_store_value"), 0, __str_len("vector_storage_store_value"))
 }
@@ -20364,9 +20375,35 @@ fn pipeline_ir_native_emit_vector_storage_load_inline_record(code: i64, dst: i64
   fmap_inc_vector_lowering_count(fm)
 }
 
-fn pipeline_ir_native_vector_storage_inline_record_type(type_args: TypeExprList, fm: i64) -> i64 {
+fn pipeline_ir_vector_storage_inline_record_type_tt(type_args: TypeExprList, tt: i64) -> i64 {
   let ty = pipeline_ir_native_vector_type_arg_node(type_args)
-  if cg_layout_vector_record_inline_eligible(fmap_get_tt(fm), ty) == 1 { 1 } else { 0 }
+  if cg_layout_vector_record_inline_eligible(tt, ty) == 1 { 1 } else { 0 }
+}
+
+fn pipeline_ir_native_vector_storage_inline_record_type(type_args: TypeExprList, fm: i64) -> i64 {
+  pipeline_ir_vector_storage_inline_record_type_tt(type_args, fmap_get_tt(fm))
+}
+
+-- Mirrors pipeline_ir_native_emit_generic_call's dispatch: generic-call
+-- sites the backend does NOT lower as a plain call to the collected
+-- spec body. Constant intrinsics substitute a per-spec value; the
+-- vector store/load family substitutes byte-accurate inline-record
+-- code when the element type is an inline record. Any pass that
+-- resolves a generic call site to its spec body (the multi-inliner's
+-- splice) must leave these sites opaque — the spec body is not the
+-- site's semantics. tt == 0 (the untyped optimise path) is
+-- conservative: the whole family stays opaque.
+fn pipeline_ir_native_generic_call_emission_intercepted(callee_hash: i64, type_args: TypeExprList, args: IrValueList, tt: i64) -> i64 {
+  if pipeline_ir_native_generic_call_constant_intrinsic(callee_hash, args) == 1 { 1 }
+  else {
+    let nargs = ir_value_list_len(args)
+    let store_family = if (callee_hash == pipeline_ir_native_vector_storage_store_value_hash() or callee_hash == pipeline_ir_native_vector_store_value_hash()) and nargs == 4 { 1 } else { 0 }
+    let load_family = if (callee_hash == pipeline_ir_native_vector_storage_load_value_hash() or callee_hash == pipeline_ir_native_vector_load_value_hash()) and nargs == 4 { 1 } else { 0 }
+    let load_ib = if callee_hash == pipeline_ir_native_vector_storage_load_value_in_bounds_hash() and nargs == 3 { 1 } else { 0 }
+    if store_family == 0 and load_family == 0 and load_ib == 0 { 0 }
+    else { if tt == 0 { 1 }
+    else { pipeline_ir_vector_storage_inline_record_type_tt(type_args, tt) } }
+  }
 }
 
 fn pipeline_ir_native_emit_vector_reserve_call(code: i64, vec_reg: i64, needed_reg: i64, type_args: TypeExprList, fm: i64) -> i64 {
@@ -30992,14 +31029,15 @@ fn pipeline_ir_multi_inline_eligible(f: IrFunction, facts: PipelineIrSemanticFac
       -- ABI — f32/f64 params or returns cross the boundary in FP
       -- registers the scalar clone path does not model.
       else { if pipeline_ir_semantic_fact_lookup_word_call(facts, hash) != 1 { 0 }
-      -- Single-block candidates are deliberately excluded: admitting them
-      -- exposed a value-miswiring interaction between dense splice
-      -- fragmentation and the fold (sorted_map put wrote search flags as
-      -- entry keys); the interaction is recorded in the 2k brief and
-      -- must be root-caused before the gate widens.
-      else { if nblocks < 2 { 0 }
+      -- Single-block candidates are admitted. The historic exclusion
+      -- (sorted_map put wrote search flags as entry keys) was not a
+      -- splice-mechanics bug: the miswire was constant-intrinsic
+      -- generic call sites (vector_element_mode_of and friends), whose
+      -- spec bodies are placeholders — those sites are now opaque at
+      -- the split site, see
+      -- pipeline_ir_native_generic_call_constant_intrinsic.
       else { if pipeline_ir_multi_inline_entry_params_empty(blocks) == 0 { 0 }
-      else { pipeline_ir_multi_inline_blocks_ok(blocks, hash) } } } } } }
+      else { pipeline_ir_multi_inline_blocks_ok(blocks, hash) } } } } }
     }
   }
 }
@@ -31325,7 +31363,7 @@ type PipelineIrMultiSplit {
   PipelineIrMultiSplit(i64, IrInstList, i64, i64, IrValueList, IrInstList)
 }
 
-fn pipeline_ir_multi_split_insts(insts: IrInstList, candidates: PipelineIrInlineCandidateList, self_hash: i64, prefix: IrInstList) -> PipelineIrMultiSplit {
+fn pipeline_ir_multi_split_insts(insts: IrInstList, candidates: PipelineIrInlineCandidateList, self_hash: i64, prefix: IrInstList, tt: i64) -> PipelineIrMultiSplit {
   match insts {
     IrInstNil -> PipelineIrMultiSplit(0, prefix, 0, 0, IrValueNil, IrInstNil)
     IrInstCons(inst, rest) -> {
@@ -31333,27 +31371,33 @@ fn pipeline_ir_multi_split_insts(insts: IrInstList, candidates: PipelineIrInline
         IrCallI64(dst, callee_hash, args) -> {
           if callee_hash != self_hash {
             match pipeline_ir_inline_candidate_lookup(candidates, callee_hash) {
-              IrFunctionNil -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix))
+              IrFunctionNil -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix), tt)
               IrFunctionCons(cf, crest) -> PipelineIrMultiSplit(1, prefix, dst, callee_hash, args, rest)
             }
           } else {
-            pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix))
+            pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix), tt)
           }
         }
         -- Generic call sites resolve to their specialisation's hash: the
-        -- collected spec IrFunction is the candidate body.
+        -- collected spec IrFunction is the candidate body. Emission-
+        -- intercepted sites are opaque: the backend substitutes per-spec
+        -- constants (element size/mode) or byte-accurate inline-record
+        -- code — splicing the collected spec body there wires in the
+        -- placeholder/word-generic semantics instead (the 1-block
+        -- miswire: element mode 0 on managed vectors; word loads on
+        -- packed inline records).
         IrGenericCallI64(dst, callee_hash, type_args, args) -> {
           let spec_hash = mono_spec_hash(callee_hash, type_expr_list_to_nodes(type_args))
-          if spec_hash != self_hash {
+          if spec_hash != self_hash and pipeline_ir_native_generic_call_emission_intercepted(callee_hash, type_args, args, tt) == 0 {
             match pipeline_ir_inline_candidate_lookup(candidates, spec_hash) {
-              IrFunctionNil -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix))
+              IrFunctionNil -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix), tt)
               IrFunctionCons(cf, crest) -> PipelineIrMultiSplit(1, prefix, dst, spec_hash, args, rest)
             }
           } else {
-            pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix))
+            pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix), tt)
           }
         }
-        _ -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix))
+        _ -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix), tt)
       }
     }
   }
@@ -31583,7 +31627,7 @@ fn pipeline_ir_block_list_first(blocks: IrBlockList) -> IrBlock {
 -- One sweep: rewrite the first block containing a candidate call.
 -- gate_all = 1 splices every block (small hosts); otherwise only blocks
 -- present in the residency env split.
-fn pipeline_ir_multi_inline_sweep(blocks: IrBlockList, candidates: PipelineIrInlineCandidateList, self_hash: i64, next_value: i64, next_block: i64, gate_all: i64, resident: PipelineIrInlineValueEnv) -> PipelineIrMultiPassResult {
+fn pipeline_ir_multi_inline_sweep(blocks: IrBlockList, candidates: PipelineIrInlineCandidateList, self_hash: i64, next_value: i64, next_block: i64, gate_all: i64, resident: PipelineIrInlineValueEnv, tt: i64) -> PipelineIrMultiPassResult {
   match blocks {
     IrBlockListNil -> PipelineIrMultiPassResult(0, IrBlockListNil, next_value, next_block)
     IrBlockListCons(block, rest) -> {
@@ -31594,7 +31638,7 @@ fn pipeline_ir_multi_inline_sweep(blocks: IrBlockList, candidates: PipelineIrInl
       }
       let split = if hot == 1 {
         match block {
-          IrBlock(id, params, insts, term) -> pipeline_ir_multi_split_insts(insts, candidates, self_hash, IrInstNil)
+          IrBlock(id, params, insts, term) -> pipeline_ir_multi_split_insts(insts, candidates, self_hash, IrInstNil, tt)
         }
       } else {
         PipelineIrMultiSplit(0, IrInstNil, 0, 0, IrValueNil, IrInstNil)
@@ -31609,7 +31653,7 @@ fn pipeline_ir_multi_inline_sweep(blocks: IrBlockList, candidates: PipelineIrInl
             pipeline_ir_multi_pass_next_block(spliced)
           )
         } else {
-          let tail = pipeline_ir_multi_inline_sweep(rest, candidates, self_hash, next_value, next_block, gate_all, resident)
+          let tail = pipeline_ir_multi_inline_sweep(rest, candidates, self_hash, next_value, next_block, gate_all, resident, tt)
           PipelineIrMultiPassResult(
             pipeline_ir_multi_pass_changed(tail),
             IrBlockListCons(block, pipeline_ir_multi_pass_blocks(tail)),
@@ -31618,7 +31662,7 @@ fn pipeline_ir_multi_inline_sweep(blocks: IrBlockList, candidates: PipelineIrInl
           )
         }
       } else {
-        let tail = pipeline_ir_multi_inline_sweep(rest, candidates, self_hash, next_value, next_block, gate_all, resident)
+        let tail = pipeline_ir_multi_inline_sweep(rest, candidates, self_hash, next_value, next_block, gate_all, resident, tt)
         PipelineIrMultiPassResult(
           pipeline_ir_multi_pass_changed(tail),
           IrBlockListCons(block, pipeline_ir_multi_pass_blocks(tail)),
@@ -31633,7 +31677,7 @@ fn pipeline_ir_multi_inline_sweep(blocks: IrBlockList, candidates: PipelineIrInl
 -- Function-level driver: splice until no candidate calls remain or the
 -- site cap bounds growth (mutual-recursion backstop). Returns via the
 -- pass-result shape: changed carries the site count.
-fn pipeline_ir_multi_inline_function_blocks(self_hash: i64, param_count: i64, blocks: IrBlockList, candidates: PipelineIrInlineCandidateList) -> PipelineIrMultiPassResult {
+fn pipeline_ir_multi_inline_function_blocks(self_hash: i64, param_count: i64, blocks: IrBlockList, candidates: PipelineIrInlineCandidateList, tt: i64) -> PipelineIrMultiPassResult {
   match candidates {
     PipelineIrInlineCandidateNil -> PipelineIrMultiPassResult(0, blocks, pipeline_ir_function_next_value(param_count, blocks), pipeline_ir_block_list_max_id(blocks, 0) + 1)
     PipelineIrInlineCandidateNode(chash, cf, clower, chigher) -> {
@@ -31649,7 +31693,7 @@ fn pipeline_ir_multi_inline_function_blocks(self_hash: i64, param_count: i64, bl
       let mut sites = 0
       let mut go = 1
       while go == 1 and sites < pipeline_ir_multi_inline_site_cap() {
-        let swept = pipeline_ir_multi_inline_sweep(current, candidates, self_hash, next_value, next_block, gate_all, resident)
+        let swept = pipeline_ir_multi_inline_sweep(current, candidates, self_hash, next_value, next_block, gate_all, resident, tt)
         if pipeline_ir_multi_pass_changed(swept) == 1 {
           current = pipeline_ir_multi_pass_blocks(swept)
           next_value = pipeline_ir_multi_pass_next_value(swept)
@@ -35049,10 +35093,10 @@ fn pipeline_ir_verify_module(ir: IrModule) -> i64 {
   pipeline_ir_verify_function_list(pipeline_ir_functions(ir), 0)
 }
 
-fn pipeline_optimise_ir_function(f: IrFunction, inline_candidates: PipelineIrInlineCandidateList, multi_candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, pure_callees: i64) -> PipelineOptimisedFunctions {
+fn pipeline_optimise_ir_function(f: IrFunction, inline_candidates: PipelineIrInlineCandidateList, multi_candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, pure_callees: i64, tt: i64) -> PipelineOptimisedFunctions {
   match f {
     IrFunction(hash, params, raw_blocks, src) -> {
-      let multi = pipeline_ir_multi_inline_function_blocks(hash, params, raw_blocks, multi_candidates)
+      let multi = pipeline_ir_multi_inline_function_blocks(hash, params, raw_blocks, multi_candidates, tt)
       let multi_sites = pipeline_ir_multi_pass_changed(multi)
       let blocks = pipeline_ir_multi_pass_blocks(multi)
       let first_next_value = pipeline_ir_multi_pass_next_value(multi)
@@ -35091,7 +35135,7 @@ fn pipeline_optimise_ir_function(f: IrFunction, inline_candidates: PipelineIrInl
   }
 }
 
-fn pipeline_optimise_ir_function_list_with_candidates(functions: IrFunctionList, inline_candidates: PipelineIrInlineCandidateList, multi_candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, user_src: i64, pure_callees: i64) -> PipelineOptimisedFunctions {
+fn pipeline_optimise_ir_function_list_with_candidates(functions: IrFunctionList, inline_candidates: PipelineIrInlineCandidateList, multi_candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, user_src: i64, pure_callees: i64, tt: i64) -> PipelineOptimisedFunctions {
   match functions {
     IrFunctionNil -> pipeline_optimised_functions(ir_function_list_empty(), 0, 0, 0, 0, 0, 0)
     IrFunctionCons(f, rest) -> {
@@ -35113,9 +35157,9 @@ fn pipeline_optimise_ir_function_list_with_candidates(functions: IrFunctionList,
       -- is rollback-immune, and restore_same_segment itself proves
       -- same-segment membership against the live segment base.
       let osr_mark = alloc_bump_mark()
-      let head = pipeline_optimise_ir_function(f, local_candidates, multi_candidates, facts, pure_callees)
+      let head = pipeline_optimise_ir_function(f, local_candidates, multi_candidates, facts, pure_callees, tt)
       alloc_bump_restore_same_segment(osr_mark)
-      let tail = pipeline_optimise_ir_function_list_with_candidates(rest, inline_candidates, multi_candidates, facts, user_src, pure_callees)
+      let tail = pipeline_optimise_ir_function_list_with_candidates(rest, inline_candidates, multi_candidates, facts, user_src, pure_callees, tt)
       pipeline_optimised_functions(
         pipeline_ir_function_list_append(pipeline_optimised_functions_functions(head), pipeline_optimised_functions_functions(tail)),
         pipeline_optimised_functions_const_fold_sites(head) + pipeline_optimised_functions_const_fold_sites(tail),
@@ -35129,7 +35173,7 @@ fn pipeline_optimise_ir_function_list_with_candidates(functions: IrFunctionList,
   }
 }
 
-fn pipeline_optimise_ir_function_list(functions: IrFunctionList, all_functions: IrFunctionList, facts: PipelineIrSemanticFactList, user_src: i64) -> PipelineOptimisedFunctions {
+fn pipeline_optimise_ir_function_list(functions: IrFunctionList, all_functions: IrFunctionList, facts: PipelineIrSemanticFactList, user_src: i64, tt: i64) -> PipelineOptimisedFunctions {
   let pure_callees = pipeline_ir_pure_callee_tree(facts)
   -- Pre-collapse the candidate BODIES against each other so helper
   -- chains (u32 -> rotr32 -> bsig0) are flat before the full passes:
@@ -35142,7 +35186,7 @@ fn pipeline_optimise_ir_function_list(functions: IrFunctionList, all_functions: 
   let mut ci = 0
   while ci < 4 {
     let cand_fns = pipeline_ir_inline_candidate_functions(candidates, ir_function_list_empty())
-    let copt = pipeline_optimise_ir_function_list_with_candidates(cand_fns, candidates, PipelineIrInlineCandidateNil, facts, user_src, pure_callees)
+    let copt = pipeline_optimise_ir_function_list_with_candidates(cand_fns, candidates, PipelineIrInlineCandidateNil, facts, user_src, pure_callees, tt)
     if pipeline_optimised_functions_direct_call_inline_sites(copt) == 0 { ci = 4 }
     else {
       candidates = pipeline_ir_inline_candidates_from_functions(pipeline_optimised_functions_functions(copt), facts, user_src)
@@ -35157,11 +35201,11 @@ fn pipeline_optimise_ir_function_list(functions: IrFunctionList, all_functions: 
   -- pass rebuild lets wrappers that swallowed a branchy body feed their
   -- own callers.
   let multi_candidates = pipeline_ir_multi_inline_candidates_walk(all_functions, facts)
-  let first = pipeline_optimise_ir_function_list_with_candidates(functions, candidates, multi_candidates, facts, user_src, pure_callees)
+  let first = pipeline_optimise_ir_function_list_with_candidates(functions, candidates, multi_candidates, facts, user_src, pure_callees, tt)
   let first_functions = pipeline_optimised_functions_functions(first)
   let second_candidates = pipeline_ir_inline_candidates_from_functions(first_functions, facts, user_src)
   let second_multi = pipeline_ir_multi_inline_candidates_walk(first_functions, facts)
-  let second = pipeline_optimise_ir_function_list_with_candidates(first_functions, second_candidates, second_multi, facts, user_src, pure_callees)
+  let second = pipeline_optimise_ir_function_list_with_candidates(first_functions, second_candidates, second_multi, facts, user_src, pure_callees, tt)
   pipeline_optimised_functions(
     pipeline_optimised_functions_functions(second),
     pipeline_optimised_functions_const_fold_sites(first) + pipeline_optimised_functions_const_fold_sites(second),
@@ -35177,7 +35221,7 @@ fn pipeline_optimise_ir(ir: IrModule) -> IrModule {
   match ir {
     IrModule(functions) -> {
       let facts = pipeline_ir_semantic_facts_empty()
-      let opt = pipeline_optimise_ir_function_list(functions, functions, facts, 0)
+      let opt = pipeline_optimise_ir_function_list(functions, functions, facts, 0, 0)
       OptimisedIrModule(
         pipeline_optimised_functions_functions(opt),
         0,
@@ -36726,7 +36770,7 @@ fn pipeline_optimise_typed_ir_with_promotion(typed: TypedModule, ir: IrModule, p
       -- propagator that caused the cliff is already containment-budgeted to
       -- small CFGs, and copy-prop/DCE is what removes the redundant value
       -- moves the naive lowering emits.
-      let opt = pipeline_optimise_ir_function_list(functions, functions, semantic_facts, src)
+      let opt = pipeline_optimise_ir_function_list(functions, functions, semantic_facts, src, tt)
       let final_functions = if promote == 1 {
         pipeline_mem2reg_retighten_function_list(pipeline_mem2reg_function_list(pipeline_optimised_functions_functions(opt)), semantic_facts, pipeline_ir_pure_callee_tree(semantic_facts))
       } else {
