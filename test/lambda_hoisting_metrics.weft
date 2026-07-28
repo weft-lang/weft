@@ -8,7 +8,7 @@
 -- like any named function. These tests assert on the emitted-module
 -- counters and on observable semantics: captures (scalar and managed),
 -- nesting, escaping, arity, generics, lowering-time handler evidence,
--- and late ordinary-function emission from handler/deferred bodies.
+-- and pre-optimisation lowering from handler/deferred bodies.
 
 use "compiler/codegen.weft"
 use "compiler/typeck.weft"
@@ -44,6 +44,8 @@ fn lh_closure_insts(insts: IrInstList) -> i64 {
     IrInstCons(inst, rest) -> {
       let one = match inst {
         IrClosureI64(dst, f, captures, eff) -> 1
+        IrHandleI64(dst, src, effect_hash, clauses, nclauses, reserved) -> lh_handler_clause_closures(clauses)
+        IrDeferredHandleI64(dst, src, body, clauses, nclauses, effect_hash, scratch_base) -> lh_deferred_body_closures(body) + lh_handler_clause_closures(clauses)
         _ -> 0
       }
       one + lh_closure_insts(rest)
@@ -56,7 +58,11 @@ fn lh_lambda_insts(insts: IrInstList) -> i64 {
     IrInstNil -> 0
     IrInstCons(inst, rest) -> {
       -- Tag 17 belonged to the deleted AST-bearing IrLambdaI64 variant.
-      let one = if ir_inst_tag(inst) == 17 { 1 } else { 0 }
+      let one = match inst {
+        IrHandleI64(dst, src, effect_hash, clauses, nclauses, reserved) -> lh_handler_clause_lambdas(clauses)
+        IrDeferredHandleI64(dst, src, body, clauses, nclauses, effect_hash, scratch_base) -> lh_deferred_body_lambdas(body) + lh_handler_clause_lambdas(clauses)
+        _ -> if ir_inst_tag(inst) == 17 { 1 } else { 0 }
+      }
       one + lh_lambda_insts(rest)
     }
   }
@@ -73,6 +79,8 @@ fn lh_bound_evidence_insts(insts: IrInstList) -> i64 {
             IrLambdaEvidenceBound(eff_hash, op_hashes, value) -> 1
           }
         }
+        IrHandleI64(dst, src, effect_hash, clauses, nclauses, reserved) -> lh_handler_clause_bound_evidence(clauses)
+        IrDeferredHandleI64(dst, src, body, clauses, nclauses, effect_hash, scratch_base) -> lh_deferred_body_bound_evidence(body) + lh_handler_clause_bound_evidence(clauses)
         _ -> 0
       }
       one + lh_bound_evidence_insts(rest)
@@ -116,6 +124,66 @@ fn lh_bound_evidence_blocks(blocks: IrBlockList) -> i64 {
   }
 }
 
+fn lh_handler_clause_closures(clauses: IrHandlerClauseBodyList) -> i64 {
+  match clauses {
+    IrHandlerClauseBodyNil -> 0
+    IrHandlerClauseBodyCons(body, rest) -> {
+      let one = match body {
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, blocks) -> lh_closure_blocks(blocks)
+        IrHandlerClauseBodyInvalid(reason) -> 0
+      }
+      one + lh_handler_clause_closures(rest)
+    }
+  }
+}
+
+fn lh_handler_clause_lambdas(clauses: IrHandlerClauseBodyList) -> i64 {
+  match clauses {
+    IrHandlerClauseBodyNil -> 0
+    IrHandlerClauseBodyCons(body, rest) -> {
+      let one = match body {
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, blocks) -> lh_lambda_blocks(blocks)
+        IrHandlerClauseBodyInvalid(reason) -> 0
+      }
+      one + lh_handler_clause_lambdas(rest)
+    }
+  }
+}
+
+fn lh_handler_clause_bound_evidence(clauses: IrHandlerClauseBodyList) -> i64 {
+  match clauses {
+    IrHandlerClauseBodyNil -> 0
+    IrHandlerClauseBodyCons(body, rest) -> {
+      let one = match body {
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, blocks) -> lh_bound_evidence_blocks(blocks)
+        IrHandlerClauseBodyInvalid(reason) -> 0
+      }
+      one + lh_handler_clause_bound_evidence(rest)
+    }
+  }
+}
+
+fn lh_deferred_body_closures(body: IrDeferredHandlerBody) -> i64 {
+  match body {
+    IrDeferredHandlerBody(captures, ops_value, first_value, blocks) -> lh_closure_blocks(blocks)
+    IrDeferredHandlerBodyInvalid(reason) -> 0
+  }
+}
+
+fn lh_deferred_body_lambdas(body: IrDeferredHandlerBody) -> i64 {
+  match body {
+    IrDeferredHandlerBody(captures, ops_value, first_value, blocks) -> lh_lambda_blocks(blocks)
+    IrDeferredHandlerBodyInvalid(reason) -> 0
+  }
+}
+
+fn lh_deferred_body_bound_evidence(body: IrDeferredHandlerBody) -> i64 {
+  match body {
+    IrDeferredHandlerBody(captures, ops_value, first_value, blocks) -> lh_bound_evidence_blocks(blocks)
+    IrDeferredHandlerBodyInvalid(reason) -> 0
+  }
+}
+
 fn lh_module_closures(fns_list: IrFunctionList) -> i64 {
   match fns_list {
     IrFunctionNil -> 0
@@ -150,6 +218,13 @@ fn lh_module_bound_evidence(fns_list: IrFunctionList) -> i64 {
       one + lh_module_bound_evidence(rest)
     }
   }
+}
+
+fn lh_registered_evidence_count(src: str) -> i64 {
+  let fm = fmap_new()
+  pipeline_ir_lambda_evidence_register_functions(pipeline_ir_functions(lh_optimised(src)), fm)
+  let facts = fmap_lambda_evidence_facts(fm)
+  if facts == 0 { 0 } else { nlist_len(facts) }
 }
 
 fn lh_optimised(src: str) -> IrModule {
@@ -208,19 +283,20 @@ test "lambda_hoist_identical_bodies_share_one_function" {
 }
 
 -- ---------------------------------------------------------------------
--- Evidence and emission-time lowering contexts use ordinary functions
+-- Evidence and handler/deferred lowering contexts use ordinary functions
 -- ---------------------------------------------------------------------
 
-test "lambda_hoist_handler_clause_body_uses_late_ordinary_function" {
-  -- Handler clause bodies are still lowered while emitting their enclosing
-  -- handler, so the carried function is emitted on first closure sight.
-  let src = "effect LhClause { fn get() -> i64 } fn lh_call(f: (i64) -> i64) -> i64 { f(2) } fn main() -> i64 { handle LhClause.get() { LhClause.get() -> resume({ let base = 40 let f = (x: i64) => x + base lh_call(f) }) } }"
+test "lambda_hoist_handler_clause_body_is_visible_before_emission" {
+  -- The clause CFG and its closure site are present in typed IR before
+  -- native emission; the collector promotes the carried function normally.
+  let src = "effect LhClause { fn get() -> i64 } fn main() -> i64 { handle LhClause.get() { LhClause.get() -> { let base = 40; let f = (x: i64) => x + base; f(2) } } }"
+  Test.assert_eq(lh_module_closures(pipeline_ir_functions(lh_optimised(src))), 1)
   Test.assert_eq(lh_legacy(src), 0)
   Test.assert_eq(lh_at_least(lh_hoisted(src), 1), 1)
 }
 
 test "lambda_hoist_perform_body_carries_lowering_evidence" {
-  let src = "effect LhPerf { fn get() -> i64 } fn lh_apply(f: (i64) -> i64) -[LhPerf]> i64 { f(1) } fn main() -> i64 { handle lh_apply((x: i64) => x + LhPerf.get()) { LhPerf.get() -> resume(41) } }"
+  let src = "effect LhPerf { fn get() -> i64 } fn lh_apply(f: (i64) -[LhPerf]> i64) -[LhPerf]> i64 { f(1) } fn main() -> i64 { handle lh_apply((x: i64) => x + LhPerf.get()) { LhPerf.get() -> resume(41) } }"
   let functions = pipeline_ir_functions(lh_optimised(src))
   Test.assert_eq(lh_at_least(lh_module_bound_evidence(functions), 1), 1)
   Test.assert_eq(lh_legacy(src), 0)
@@ -235,10 +311,21 @@ test "lambda_hoist_perform_free_body_under_a_handler_still_hoists" {
   Test.assert_eq(lh_legacy(src), 0)
 }
 
-test "lambda_hoist_deferred_body_uses_late_ordinary_function" {
+test "lambda_hoist_deferred_body_is_visible_before_emission" {
   let src = "effect LhDeferred { @deferred fn get() -> i64 } fn main() -> i64 { handle { let f = (x: i64) => x + 1 f(40) + LhDeferred.get() } { LhDeferred.get() with k -> k(1) } }"
+  Test.assert_eq(lh_module_closures(pipeline_ir_functions(lh_optimised(src))), 1)
   Test.assert_eq(lh_legacy(src), 0)
   Test.assert_eq(lh_at_least(lh_hoisted(src), 1), 1)
+}
+
+test "lambda_evidence_preregistration_descends_handler_clause_cfgs" {
+  let src = "effect LhOuter { fn run() -> i64 } effect LhInner { fn get() -> i64 } fn lh_apply_inner(f: (i64) -[LhInner]> i64) -[LhInner]> i64 { f(1) } fn main() -> i64 { handle LhOuter.run() { LhOuter.run() -> handle lh_apply_inner((x: i64) => x + LhInner.get()) { LhInner.get() -> resume(40) } } }"
+  Test.assert_eq(lh_at_least(lh_registered_evidence_count(src), 1), 1)
+}
+
+test "lambda_evidence_preregistration_descends_deferred_body_cfgs" {
+  let src = "effect LhFiber { @deferred fn get() -> i64 } effect LhFiberInner { fn get() -> i64 } fn lh_apply_fiber_inner(f: (i64) -[LhFiberInner]> i64) -[LhFiberInner]> i64 { f(1) } fn main() -> i64 { handle { let value = handle lh_apply_fiber_inner((x: i64) => x + LhFiberInner.get()) { LhFiberInner.get() -> resume(40) } value + LhFiber.get() } { LhFiber.get() with k -> k(1) } }"
+  Test.assert_eq(lh_at_least(lh_registered_evidence_count(src), 1), 1)
 }
 
 -- ---------------------------------------------------------------------
