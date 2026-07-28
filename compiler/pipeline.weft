@@ -170,6 +170,21 @@ type PipelineGenericSpecClosureState {
   PipelineGenericSpecClosureState(IrFunctionList, IrFunctionList)
 }
 
+-- Post-closure callback-identity specialisation result. requests is a
+-- scratch nlist of [base spec hash, clone hash, recipe] entries retained
+-- long enough to copy the base spec's semantic fact onto each clone.
+type PipelineIrIdentitySpecialisations {
+  PipelineIrIdentitySpecialisations(IrFunctionList, i64)
+}
+
+type PipelineIrIdentityInstRewrite {
+  PipelineIrIdentityInstRewrite(IrInstList, i64)
+}
+
+type PipelineIrIdentityBlockRewrite {
+  PipelineIrIdentityBlockRewrite(IrBlockList, i64)
+}
+
 -- Block-major fact plane: the outer list is a BST keyed by block id,
 -- each node holding that block's fact chain. Lookups descend to the
 -- block then walk its (short) chain instead of the whole plane.
@@ -16526,6 +16541,486 @@ fn pipeline_ir_function_list_find_hash(functions: IrFunctionList, name_hash: i64
     }
   }
   found
+}
+
+-- ======================================================================
+-- Static callback identity specialisation (2k banked devirt)
+--
+-- A named function value is an immutable static closure pair and
+-- IrFunctionRefI64 is its semantic identity producer. Generic
+-- specialisations that receive such a value are cloned per call-site
+-- recipe (parameter index -> named function hash). Inside the clone,
+-- recipe-bound indirect calls become ordinary direct calls. A recipe is
+-- forwarded through nested generic calls, so helper chains specialise
+-- transitively without assuming that every call site in the program has
+-- the same callback.
+--
+-- IrFunctionRefI64 names an env-free direct target. IrClosureI64 names
+-- an ordinary hoisted fn whose per-instance environment is recovered
+-- from the pair and passed explicitly as arg 0. Values produced by
+-- calls, loads, merges, or mutable slots remain dynamic.
+-- ======================================================================
+
+fn pipeline_ir_identity_specialisations_functions(result: PipelineIrIdentitySpecialisations) -> IrFunctionList {
+  match result {
+    PipelineIrIdentitySpecialisations(functions, requests) -> functions
+  }
+}
+
+fn pipeline_ir_identity_specialisations_requests(result: PipelineIrIdentitySpecialisations) -> i64 {
+  match result {
+    PipelineIrIdentitySpecialisations(functions, requests) -> requests
+  }
+}
+
+fn pipeline_ir_identity_value_defs_insts(insts: IrInstList, defs: i64) -> i64 {
+  match insts {
+    IrInstNil -> defs
+    IrInstCons(inst, rest) -> {
+      match inst {
+        -- Descriptor layout: [SSA value, target hash, kind, 0].
+        -- kind 1 is a static named-function pair; kind 2 is a closure
+        -- pair whose environment must be loaded and passed as arg 0.
+        IrFunctionRefI64(dst, callee_hash) -> nlist_add(defs, node_new(0, dst, callee_hash, 1, 0))
+        IrClosureI64(dst, f, captures, evidence) -> nlist_add(defs, node_new(0, dst, pipeline_ir_function_hash(f), 2, 0))
+        _ -> 0
+      }
+      pipeline_ir_identity_value_defs_insts(rest, defs)
+    }
+  }
+}
+
+fn pipeline_ir_identity_value_defs_blocks(blocks: IrBlockList, defs: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> defs
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_identity_value_defs_insts(insts, defs)
+      }
+      pipeline_ir_identity_value_defs_blocks(rest, defs)
+    }
+  }
+}
+
+fn pipeline_ir_identity_value_defs(blocks: IrBlockList) -> i64 {
+  pipeline_ir_identity_value_defs_blocks(blocks, nlist_new())
+}
+
+fn pipeline_ir_identity_has_value_defs_insts(insts: IrInstList) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let hit = match inst {
+        IrFunctionRefI64(dst, callee_hash) -> 1
+        IrClosureI64(dst, f, captures, evidence) -> 1
+        _ -> 0
+      }
+      if hit == 1 { 1 } else { pipeline_ir_identity_has_value_defs_insts(rest) }
+    }
+  }
+}
+
+fn pipeline_ir_identity_has_value_defs_blocks(blocks: IrBlockList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      let hit = match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_identity_has_value_defs_insts(insts)
+      }
+      if hit == 1 { 1 } else { pipeline_ir_identity_has_value_defs_blocks(rest) }
+    }
+  }
+}
+
+fn pipeline_ir_identity_value_def_lookup(defs: i64, value: i64) -> i64 {
+  let mut identity = 0
+  let mut i = 0
+  let n = nlist_len(defs)
+  while i < n and identity == 0 {
+    let entry = nlist_get(defs, i)
+    if node_f1(entry) == value { identity = entry } else { i = i + 1 }
+  }
+  identity
+}
+
+-- Recipe entries are raw scratch nodes [parameter index, callee hash].
+-- They never enter the IR and are reclaimed with the surrounding
+-- compile arena.
+fn pipeline_ir_identity_recipe_lookup(recipe: i64, param_index: i64) -> i64 {
+  let mut identity = 0
+  let mut i = 0
+  let n = nlist_len(recipe)
+  while i < n and identity == 0 {
+    let entry = nlist_get(recipe, i)
+    if node_f1(entry) == param_index { identity = entry } else { i = i + 1 }
+  }
+  identity
+}
+
+fn pipeline_ir_identity_value(value: i64, defs: i64, recipe: i64, param_count: i64) -> i64 {
+  let local = pipeline_ir_identity_value_def_lookup(defs, value)
+  if local != 0 { local }
+  else { if value >= 0 and value < param_count {
+    pipeline_ir_identity_recipe_lookup(recipe, value)
+  } else { 0 } }
+}
+
+fn pipeline_ir_identity_values_contains(values: IrValueList, value: i64) -> i64 {
+  match values {
+    IrValueNil -> 0
+    IrValueCons(head, rest) -> {
+      if head == value { 1 } else { pipeline_ir_identity_values_contains(rest, value) }
+    }
+  }
+}
+
+-- A binding is useful only when the corresponding parameter is called
+-- indirectly here or forwarded into another generic call. This keeps
+-- function values that are merely returned/stored on the canonical
+-- body and avoids emitting no-op clones.
+fn pipeline_ir_identity_param_relevant_insts(insts: IrInstList, param_index: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let hit = match inst {
+        IrIndirectCallI64(dst, callee, args) -> if callee == param_index { 1 } else { 0 }
+        IrGenericCallI64(dst, callee_hash, type_args, args) -> pipeline_ir_identity_values_contains(args, param_index)
+        _ -> 0
+      }
+      if hit == 1 { 1 } else { pipeline_ir_identity_param_relevant_insts(rest, param_index) }
+    }
+  }
+}
+
+fn pipeline_ir_identity_param_relevant_blocks(blocks: IrBlockList, param_index: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      let hit = match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_identity_param_relevant_insts(insts, param_index)
+      }
+      if hit == 1 { 1 } else { pipeline_ir_identity_param_relevant_blocks(rest, param_index) }
+    }
+  }
+}
+
+fn pipeline_ir_identity_recipe_from_args_inner(args: IrValueList, index: i64, defs: i64, caller_recipe: i64, caller_param_count: i64, base_blocks: IrBlockList, result: i64) -> i64 {
+  match args {
+    IrValueNil -> result
+    IrValueCons(value, rest) -> {
+      let identity = pipeline_ir_identity_value(value, defs, caller_recipe, caller_param_count)
+      if identity != 0 and pipeline_ir_identity_param_relevant_blocks(base_blocks, index) == 1 {
+        nlist_add(result, node_new(0, index, node_f2(identity), node_f3(identity), 0))
+      } else { 0 }
+      pipeline_ir_identity_recipe_from_args_inner(rest, index + 1, defs, caller_recipe, caller_param_count, base_blocks, result)
+    }
+  }
+}
+
+fn pipeline_ir_identity_recipe_from_args(args: IrValueList, defs: i64, caller_recipe: i64, caller_param_count: i64, base: IrFunction) -> i64 {
+  match base {
+    IrFunction(hash, param_count, blocks, src) -> {
+      pipeline_ir_identity_recipe_from_args_inner(args, 0, defs, caller_recipe, caller_param_count, blocks, nlist_new())
+    }
+  }
+}
+
+fn pipeline_ir_identity_recipe_equal(left: i64, right: i64) -> i64 {
+  let n = nlist_len(left)
+  if n != nlist_len(right) { 0 }
+  else {
+    let mut same = 1
+    let mut i = 0
+    while i < n and same == 1 {
+      let a = nlist_get(left, i)
+      let b = nlist_get(right, i)
+      if node_f1(a) == node_f1(b) and node_f2(a) == node_f2(b) and node_f3(a) == node_f3(b) {
+        i = i + 1
+      } else {
+        same = 0
+      }
+    }
+    same
+  }
+}
+
+fn pipeline_ir_identity_request_lookup(requests: i64, base_hash: i64, recipe: i64) -> i64 {
+  let mut clone_hash = 0
+  let mut i = 0
+  let n = nlist_len(requests)
+  while i < n and clone_hash == 0 {
+    let entry = nlist_get(requests, i)
+    if node_f1(entry) == base_hash and pipeline_ir_identity_recipe_equal(node_f3(entry), recipe) == 1 {
+      clone_hash = node_f2(entry)
+    } else {
+      i = i + 1
+    }
+  }
+  clone_hash
+}
+
+fn pipeline_ir_identity_function_hash_exists(functions: IrFunctionList, target_hash: i64) -> i64 {
+  match functions {
+    IrFunctionNil -> 0
+    IrFunctionCons(f, rest) -> {
+      match f {
+        IrFunction(hash, params, blocks, src) -> {
+          if hash == target_hash { 1 } else { pipeline_ir_identity_function_hash_exists(rest, target_hash) }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_identity_request_hash_exists(requests: i64, target_hash: i64) -> i64 {
+  let mut found = 0
+  let mut i = 0
+  let n = nlist_len(requests)
+  while i < n and found == 0 {
+    if node_f2(nlist_get(requests, i)) == target_hash { found = 1 } else { i = i + 1 }
+  }
+  found
+}
+
+fn pipeline_ir_identity_recipe_hash(base_hash: i64, recipe: i64) -> i64 {
+  let mut h = base_hash * 1000003 + 32452843
+  let n = nlist_len(recipe)
+  for i in 0..n {
+    let entry = nlist_get(recipe, i)
+    h = h * 31 + node_f1(entry) * 131 + node_f2(entry) + node_f3(entry) * 8191
+  }
+  if h == 0 { 49979687 } else { h }
+}
+
+fn pipeline_ir_identity_request_ensure(requests: i64, all_functions: IrFunctionList, base_hash: i64, recipe: i64) -> i64 {
+  let existing = pipeline_ir_identity_request_lookup(requests, base_hash, recipe)
+  if existing != 0 { existing }
+  else {
+    let mut clone_hash = pipeline_ir_identity_recipe_hash(base_hash, recipe)
+    while pipeline_ir_identity_function_hash_exists(all_functions, clone_hash) == 1 or pipeline_ir_identity_request_hash_exists(requests, clone_hash) == 1 {
+      clone_hash = clone_hash + 104729
+      if clone_hash == 0 { clone_hash = 49979687 } else { 0 }
+    }
+    nlist_add(requests, node_new(0, base_hash, clone_hash, recipe, 0))
+    clone_hash
+  }
+}
+
+fn pipeline_ir_identity_inst_rewrite_insts(result: PipelineIrIdentityInstRewrite) -> IrInstList {
+  match result {
+    PipelineIrIdentityInstRewrite(insts, next_value) -> insts
+  }
+}
+
+fn pipeline_ir_identity_inst_rewrite_next_value(result: PipelineIrIdentityInstRewrite) -> i64 {
+  match result {
+    PipelineIrIdentityInstRewrite(insts, next_value) -> next_value
+  }
+}
+
+fn pipeline_ir_identity_block_rewrite_blocks(result: PipelineIrIdentityBlockRewrite) -> IrBlockList {
+  match result {
+    PipelineIrIdentityBlockRewrite(blocks, next_value) -> blocks
+  }
+}
+
+fn pipeline_ir_identity_block_rewrite_next_value(result: PipelineIrIdentityBlockRewrite) -> i64 {
+  match result {
+    PipelineIrIdentityBlockRewrite(blocks, next_value) -> next_value
+  }
+}
+
+fn pipeline_ir_identity_direct_call_rewrite(dst: i64, callee: i64, args: IrValueList, identity: i64, next_value: i64) -> PipelineIrIdentityInstRewrite {
+  let target = node_f2(identity)
+  let kind = node_f3(identity)
+  if kind == 1 {
+    PipelineIrIdentityInstRewrite(
+      ir_inst_list_prepend(IrCallI64(dst, target, args), ir_inst_list_empty()),
+      next_value
+    )
+  } else {
+    -- A hoisted lambda is an ordinary fn(env, args...). Recover env
+    -- from the closure pair and feed it as direct arg 0. Three fresh
+    -- SSA ids stay above the function's existing value range.
+    let offset = next_value
+    let address = next_value + 1
+    let env = next_value + 2
+    let insts = ir_inst_list_prepend(
+      IrConstI64(offset, 8),
+      ir_inst_list_prepend(
+        IrBinaryI64(address, IrAdd, callee, offset),
+        ir_inst_list_prepend(
+          IrPtrLoadI64(env, address),
+          ir_inst_list_prepend(IrCallI64(dst, target, ir_value_list_prepend(env, args)), ir_inst_list_empty())
+        )
+      )
+    )
+    PipelineIrIdentityInstRewrite(insts, next_value + 3)
+  }
+}
+
+fn pipeline_ir_identity_rewrite_inst(inst: IrInst, defs: i64, recipe: i64, param_count: i64, all_functions: IrFunctionList, requests: i64, next_value: i64) -> PipelineIrIdentityInstRewrite {
+  match inst {
+    IrIndirectCallI64(dst, callee, args) -> {
+      let identity = pipeline_ir_identity_value(callee, defs, recipe, param_count)
+      if identity == 0 {
+        PipelineIrIdentityInstRewrite(ir_inst_list_prepend(inst, ir_inst_list_empty()), next_value)
+      } else {
+        pipeline_ir_identity_direct_call_rewrite(dst, callee, args, identity, next_value)
+      }
+    }
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> {
+      let base_hash = mono_spec_hash(callee_hash, type_expr_list_to_nodes(type_args))
+      match pipeline_ir_function_list_find_hash(all_functions, base_hash) {
+        IrFunctionNil -> PipelineIrIdentityInstRewrite(ir_inst_list_prepend(inst, ir_inst_list_empty()), next_value)
+        IrFunctionCons(base, rest) -> {
+          let call_recipe = pipeline_ir_identity_recipe_from_args(args, defs, recipe, param_count, base)
+          if nlist_len(call_recipe) == 0 {
+            PipelineIrIdentityInstRewrite(ir_inst_list_prepend(inst, ir_inst_list_empty()), next_value)
+          } else {
+            let clone_hash = pipeline_ir_identity_request_ensure(requests, all_functions, base_hash, call_recipe)
+            PipelineIrIdentityInstRewrite(
+              ir_inst_list_prepend(IrCallI64(dst, clone_hash, args), ir_inst_list_empty()),
+              next_value
+            )
+          }
+        }
+      }
+    }
+    _ -> PipelineIrIdentityInstRewrite(ir_inst_list_prepend(inst, ir_inst_list_empty()), next_value)
+  }
+}
+
+fn pipeline_ir_identity_rewrite_insts(insts: IrInstList, defs: i64, recipe: i64, param_count: i64, all_functions: IrFunctionList, requests: i64, next_value: i64) -> PipelineIrIdentityInstRewrite {
+  match insts {
+    IrInstNil -> PipelineIrIdentityInstRewrite(IrInstNil, next_value)
+    IrInstCons(inst, rest) -> {
+      let head = pipeline_ir_identity_rewrite_inst(inst, defs, recipe, param_count, all_functions, requests, next_value)
+      let tail = pipeline_ir_identity_rewrite_insts(
+        rest,
+        defs,
+        recipe,
+        param_count,
+        all_functions,
+        requests,
+        pipeline_ir_identity_inst_rewrite_next_value(head)
+      )
+      PipelineIrIdentityInstRewrite(
+        ir_inst_list_append(pipeline_ir_identity_inst_rewrite_insts(head), pipeline_ir_identity_inst_rewrite_insts(tail)),
+        pipeline_ir_identity_inst_rewrite_next_value(tail)
+      )
+    }
+  }
+}
+
+fn pipeline_ir_identity_rewrite_blocks(blocks: IrBlockList, defs: i64, recipe: i64, param_count: i64, all_functions: IrFunctionList, requests: i64, next_value: i64) -> PipelineIrIdentityBlockRewrite {
+  match blocks {
+    IrBlockListNil -> PipelineIrIdentityBlockRewrite(IrBlockListNil, next_value)
+    IrBlockListCons(block, rest) -> {
+      let rewritten_insts = match block {
+        IrBlock(id, params, insts, term) -> {
+          pipeline_ir_identity_rewrite_insts(insts, defs, recipe, param_count, all_functions, requests, next_value)
+        }
+      }
+      let rewritten_block = match block {
+        IrBlock(id, params, insts, term) -> {
+          IrBlock(id, params, pipeline_ir_identity_inst_rewrite_insts(rewritten_insts), term)
+        }
+      }
+      let rewritten_rest = pipeline_ir_identity_rewrite_blocks(
+        rest,
+        defs,
+        recipe,
+        param_count,
+        all_functions,
+        requests,
+        pipeline_ir_identity_inst_rewrite_next_value(rewritten_insts)
+      )
+      PipelineIrIdentityBlockRewrite(
+        ir_block_list_prepend(rewritten_block, pipeline_ir_identity_block_rewrite_blocks(rewritten_rest)),
+        pipeline_ir_identity_block_rewrite_next_value(rewritten_rest)
+      )
+    }
+  }
+}
+
+fn pipeline_ir_identity_rewrite_function(f: IrFunction, output_hash: i64, recipe: i64, all_functions: IrFunctionList, requests: i64) -> IrFunction {
+  match f {
+    IrFunction(hash, param_count, blocks, src) -> {
+      if nlist_len(recipe) == 0 and pipeline_ir_identity_has_value_defs_blocks(blocks) == 0 {
+        f
+      } else {
+        let defs = pipeline_ir_identity_value_defs(blocks)
+        let rewritten = pipeline_ir_identity_rewrite_blocks(
+          blocks,
+          defs,
+          recipe,
+          param_count,
+          all_functions,
+          requests,
+          pipeline_ir_function_next_value(param_count, blocks)
+        )
+        ir_function_new_blocks_src(output_hash, param_count, pipeline_ir_identity_block_rewrite_blocks(rewritten), src)
+      }
+    }
+  }
+}
+
+fn pipeline_ir_identity_rewrite_originals(functions: IrFunctionList, all_functions: IrFunctionList, requests: i64, empty_recipe: i64) -> IrFunctionList {
+  match functions {
+    IrFunctionNil -> IrFunctionNil
+    IrFunctionCons(f, rest) -> {
+      let hash = pipeline_ir_function_hash(f)
+      ir_function_list_prepend(
+        pipeline_ir_identity_rewrite_function(f, hash, empty_recipe, all_functions, requests),
+        pipeline_ir_identity_rewrite_originals(rest, all_functions, requests, empty_recipe)
+      )
+    }
+  }
+}
+
+fn pipeline_ir_identity_specialise(functions: IrFunctionList) -> PipelineIrIdentitySpecialisations {
+  let requests = nlist_new()
+  let empty_recipe = nlist_new()
+  let rewritten = pipeline_ir_identity_rewrite_originals(functions, functions, requests, empty_recipe)
+  let mut clones = ir_function_list_empty()
+  let mut i = 0
+  -- requests may grow while a clone is rewritten: this is the
+  -- recipe-aware transitive closure over nested generic calls.
+  while i < nlist_len(requests) {
+    let request = nlist_get(requests, i)
+    let base_hash = node_f1(request)
+    let clone_hash = node_f2(request)
+    let recipe = node_f3(request)
+    match pipeline_ir_function_list_find_hash(functions, base_hash) {
+      IrFunctionNil -> 0
+      IrFunctionCons(base, rest) -> {
+        clones = ir_function_list_prepend(
+          pipeline_ir_identity_rewrite_function(base, clone_hash, recipe, functions, requests),
+          clones
+        )
+        0
+      }
+    }
+    i = i + 1
+  }
+  PipelineIrIdentitySpecialisations(
+    pipeline_ir_function_list_append(rewritten, pipeline_ir_function_list_reverse(clones)),
+    requests
+  )
+}
+
+fn pipeline_ir_identity_facts_extend(requests: i64, base_facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
+  let mut facts = base_facts
+  let n = nlist_len(requests)
+  for i in 0..n {
+    let request = nlist_get(requests, i)
+    let fact = pipeline_ir_semantic_fact_find(base_facts, node_f1(request))
+    if fact != 0 {
+      facts = pipeline_ir_semantic_facts_prepend(node_f2(request), fact, facts)
+    } else { 0 }
+  }
+  facts
 }
 
 fn pipeline_ir_native_params_unmanaged(params: i64, nparams: i64) -> i64 {
@@ -37071,14 +37566,21 @@ fn pipeline_optimise_typed_ir_with_promotion(typed: TypedModule, ir: IrModule, p
       )
       let direct_generic_specs = pipeline_ir_function_list_dedup(raw_generic_specs)
       let generic_specs = pipeline_collect_generic_specs_closure(direct_generic_specs, templates, fns, tt)
-      let functions = pipeline_ir_hoisted_lambda_fns_extend(pipeline_ir_function_list_append(base_functions, generic_specs))
+      let canonical_functions = pipeline_ir_hoisted_lambda_fns_extend(pipeline_ir_function_list_append(base_functions, generic_specs))
       let decl_facts = pipeline_ir_semantic_facts_from_fns(fns, 0)
       -- Extend the fact plane to generic specialisations (2k stage 2):
       -- specs are keyed by their mono hash, which the declaration-keyed
       -- fact walk never produces. Facts are derived from the template's
       -- substituted signature at every generic call site, which is the
       -- same site-driven discovery the spec collector itself uses.
-      let semantic_facts = pipeline_ir_spec_facts_extend(functions, templates, pipeline_ir_semantic_facts_effect_flag_map(decl_facts), decl_facts)
+      let spec_facts = pipeline_ir_spec_facts_extend(canonical_functions, templates, pipeline_ir_semantic_facts_effect_flag_map(decl_facts), decl_facts)
+      -- Static named-function pairs are semantic identity producers.
+      -- Clone generic specs per proven callback recipe, then copy the
+      -- canonical spec fact to each clone so all existing consumers
+      -- (purity, ownership masks, tiny inlining) see the same contract.
+      let identities = pipeline_ir_identity_specialise(canonical_functions)
+      let functions = pipeline_ir_identity_specialisations_functions(identities)
+      let semantic_facts = pipeline_ir_identity_facts_extend(pipeline_ir_identity_specialisations_requests(identities), spec_facts)
       -- Reconnect the per-function IR optimiser (copy propagation, liveness,
       -- block-parameter trimming, DCE) on the typed path. It was bypassed
       -- during the migration for compile-time cost; the block-entry fact
