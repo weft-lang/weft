@@ -358,13 +358,19 @@ type PipelineIrNativeFpEnv {
   PipelineIrNativeFpEnvCons(i64, i64, i64, PipelineIrNativeFpEnv)
 }
 
-type PipelineIrNativeVectorDataEnv {
-  PipelineIrNativeVectorDataEnvNil,
-  PipelineIrNativeVectorDataEnvOne(i64, i64)
+type PipelineIrNativeVectorDataFactList {
+  PipelineIrNativeVectorDataFactNil,
+  -- Access result SSA, vector SSA, reload-required bit, rest.
+  PipelineIrNativeVectorDataFactCons(i64, i64, i64, PipelineIrNativeVectorDataFactList)
+}
+
+type PipelineIrNativeVectorDataFacts {
+  -- Allocated physical home (zero until assigned), per-access facts.
+  PipelineIrNativeVectorDataFacts(i64, PipelineIrNativeVectorDataFactList)
 }
 
 type PipelineNativeEmitCtx {
-  PipelineNativeEmitCtx(i64, PipelineNativeHandlerCtx, i64, i64, i64, i64, PipelineIrNativeFpEnv, PipelineIrNativeVectorDataEnv)
+  PipelineNativeEmitCtx(i64, PipelineNativeHandlerCtx, i64, i64, i64, i64, PipelineIrNativeFpEnv, PipelineIrNativeVectorDataFacts)
 }
 
 type PipelineCgExprCtx {
@@ -18130,19 +18136,121 @@ fn pipeline_ir_native_fp_env_drop_fd(env: PipelineIrNativeFpEnv, fd: i64) -> Pip
 
 fn pipeline_ir_native_vector_data_reg() -> i64 { 9 }
 
-fn pipeline_ir_native_vector_data_env_empty() -> PipelineIrNativeVectorDataEnv {
-  PipelineIrNativeVectorDataEnvNil
+fn pipeline_ir_native_vector_data_fact_list_empty() -> PipelineIrNativeVectorDataFactList {
+  PipelineIrNativeVectorDataFactNil
 }
 
-fn pipeline_ir_native_vector_data_env_lookup(env: PipelineIrNativeVectorDataEnv, vec: i64) -> i64 {
-  match env {
-    PipelineIrNativeVectorDataEnvNil -> 0
-    PipelineIrNativeVectorDataEnvOne(env_vec, phys) -> if env_vec == vec { phys } else { 0 }
+fn pipeline_ir_native_vector_data_facts_unassigned(entries: PipelineIrNativeVectorDataFactList) -> PipelineIrNativeVectorDataFacts {
+  PipelineIrNativeVectorDataFacts(0, entries)
+}
+
+fn pipeline_ir_native_vector_data_facts_home(facts: PipelineIrNativeVectorDataFacts) -> i64 {
+  match facts {
+    PipelineIrNativeVectorDataFacts(home, entries) -> home
   }
 }
 
-fn pipeline_ir_native_vector_data_env_one(vec: i64) -> PipelineIrNativeVectorDataEnv {
-  PipelineIrNativeVectorDataEnvOne(vec, pipeline_ir_native_vector_data_reg())
+fn pipeline_ir_native_vector_data_facts_entries(facts: PipelineIrNativeVectorDataFacts) -> PipelineIrNativeVectorDataFactList {
+  match facts {
+    PipelineIrNativeVectorDataFacts(home, entries) -> entries
+  }
+}
+
+fn pipeline_ir_native_vector_data_facts_have_access(facts: PipelineIrNativeVectorDataFacts) -> i64 {
+  match pipeline_ir_native_vector_data_facts_entries(facts) {
+    PipelineIrNativeVectorDataFactNil -> 0
+    PipelineIrNativeVectorDataFactCons(dst, vec, reload, rest) -> 1
+  }
+}
+
+fn pipeline_ir_native_vector_data_facts_assign_home(facts: PipelineIrNativeVectorDataFacts) -> PipelineIrNativeVectorDataFacts {
+  if pipeline_ir_native_vector_data_facts_have_access(facts) == 1 {
+    -- x9 is the first allocator-owned cache-class home. Unlike the scalar
+    -- pool, lane emission never uses it as an operand/result scratch.
+    PipelineIrNativeVectorDataFacts(pipeline_ir_native_vector_data_reg(), pipeline_ir_native_vector_data_facts_entries(facts))
+  } else {
+    facts
+  }
+}
+
+fn pipeline_ir_native_vector_data_fact_reload_for(entries: PipelineIrNativeVectorDataFactList, dst: i64, vec: i64) -> i64 {
+  match entries {
+    PipelineIrNativeVectorDataFactNil -> 0 - 1
+    PipelineIrNativeVectorDataFactCons(fact_dst, fact_vec, reload, rest) -> {
+      if fact_dst == dst {
+        if fact_vec == vec { reload } else { 0 - 1 }
+      } else {
+        pipeline_ir_native_vector_data_fact_reload_for(rest, dst, vec)
+      }
+    }
+  }
+}
+
+-- This is the cache-segment fact producer's clobber contract. Keep the
+-- whitelist synchronized with actual instruction emission: every omitted
+-- instruction begins a new segment, so facts fail closed.
+fn pipeline_ir_native_inst_preserves_vector_data_fact(inst: IrInst) -> i64 {
+  match inst {
+    IrConstI64(dst, value) -> 1
+    IrNilI64(dst) -> 1
+    IrBinaryI64(dst, op, lhs, rhs) -> 1
+    IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> 1
+    IrUnaryI64(dst, op, value) -> 1
+    IrSlotI64(slot) -> 1
+    IrLoadI64(dst, slot) -> 1
+    IrStoreI64(slot, value) -> 1
+    IrVectorGetI64(dst, vec, index, fallback, check_mode) -> 1
+    IrVectorSetI64(dst, vec, index, value, check_mode) -> 1
+    IrBindI64(ns, nl, value, ty) -> 1
+    IrVariantTagI64(dst, value) -> 1
+    IrVariantPayloadI64(dst, value, index) -> 1
+    IrFieldLoadI64(dst, base, field_hash, field_index) -> 1
+    IrResumeI64(dst, value) -> 1
+    _ -> 0
+  }
+}
+
+fn pipeline_ir_native_vector_data_facts_for_insts(insts: IrInstList, cached_vec: i64, entries: PipelineIrNativeVectorDataFactList) -> PipelineIrNativeVectorDataFactList {
+  match insts {
+    IrInstNil -> entries
+    IrInstCons(inst, rest) -> {
+      match inst {
+        IrVectorGetI64(dst, vec, index, fallback, check_mode) -> {
+          let reload = if cached_vec == vec { 0 } else { 1 }
+          pipeline_ir_native_vector_data_facts_for_insts(rest, vec, PipelineIrNativeVectorDataFactCons(dst, vec, reload, entries))
+        }
+        IrVectorSetI64(dst, vec, index, value, check_mode) -> {
+          let reload = if cached_vec == vec { 0 } else { 1 }
+          pipeline_ir_native_vector_data_facts_for_insts(rest, vec, PipelineIrNativeVectorDataFactCons(dst, vec, reload, entries))
+        }
+        _ -> {
+          let next_cached = if pipeline_ir_native_inst_preserves_vector_data_fact(inst) == 1 { cached_vec } else { 0 - 1 }
+          pipeline_ir_native_vector_data_facts_for_insts(rest, next_cached, entries)
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_native_vector_data_facts_for_blocks_from(blocks: IrBlockList, entries: PipelineIrNativeVectorDataFactList) -> PipelineIrNativeVectorDataFactList {
+  match blocks {
+    IrBlockListNil -> entries
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          -- Cache contents are not a CFG fact: each emitted block begins a
+          -- fresh segment exactly as the former emission-time env did.
+          let next = pipeline_ir_native_vector_data_facts_for_insts(insts, 0 - 1, entries)
+          pipeline_ir_native_vector_data_facts_for_blocks_from(rest, next)
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_native_vector_data_facts_for_blocks(blocks: IrBlockList) -> PipelineIrNativeVectorDataFacts {
+  let entries = pipeline_ir_native_vector_data_facts_for_blocks_from(blocks, pipeline_ir_native_vector_data_fact_list_empty())
+  pipeline_ir_native_vector_data_facts_unassigned(entries)
 }
 
 fn pipeline_ir_native_int_list_contains(list: i64, value: i64) -> i64 {
@@ -19492,6 +19600,7 @@ fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBody, code: i64,
       let old_gpr_pairs = fmap_current_gpr_pairs(fm)
       let f64_facts = pipeline_ir_native_f64_facts_for_blocks(blocks)
       let f64_slots = pipeline_ir_native_f64_pinned_slots_from_facts(blocks, pipeline_ir_native_f64_facts_slots(f64_facts))
+      let vector_data_facts = pipeline_ir_native_vector_data_facts_assign_home(pipeline_ir_native_vector_data_facts_for_blocks(blocks))
       let f64_slot_count = pipeline_ir_native_f64_slot_count(f64_slots)
       let body_max_next = pipeline_ir_function_next_value(first_value, blocks)
       let return_save = if has_continuation == 1 { body_max_next + 8 } else { body_max_next }
@@ -19513,7 +19622,7 @@ fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBody, code: i64,
       let safe_handlers = pipeline_ir_native_handler_ctx_uncaptured(active_handlers)
       let pinned = pipeline_ir_native_pinned_slot_none()
       let temp_base = body_max_next + 8
-      let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, scope_new(), src, fm, safe_handlers, fns, f64_slots, pipeline_ir_native_f64_facts_gpr_values(f64_facts), pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
+      let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, scope_new(), src, fm, safe_handlers, fns, f64_slots, pipeline_ir_native_f64_facts_gpr_values(f64_facts), vector_data_facts, pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
       let labels = pipeline_ir_native_label_map_add(pipeline_ir_native_cfg_state_labels(state), pipeline_ir_native_epilogue_label(), buf_len(code))
       pipeline_ir_native_patch_all(code, labels, pipeline_ir_native_cfg_state_patches(state))
       if has_continuation == 1 {
@@ -19638,6 +19747,7 @@ fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredHandlerBody, e
       let old_gpr_pairs = fmap_current_gpr_pairs(fm)
       let f64_facts = pipeline_ir_native_f64_facts_for_blocks(blocks)
       let f64_slots = pipeline_ir_native_f64_pinned_slots_from_facts(blocks, pipeline_ir_native_f64_facts_slots(f64_facts))
+      let vector_data_facts = pipeline_ir_native_vector_data_facts_assign_home(pipeline_ir_native_vector_data_facts_for_blocks(blocks))
       let f64_slot_count = pipeline_ir_native_f64_slot_count(f64_slots)
       fmap_set_current_frame_size(fm, pipeline_ir_native_frame_size_for_blocks(first_value, blocks))
       if f64_slot_count > 0 { fmap_set_current_preserve_fp(fm, 1) } else { 0 }
@@ -19650,7 +19760,7 @@ fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredHandlerBody, e
       let safe_handlers = pipeline_ir_native_handler_ctx_uncaptured(active_handlers)
       let fiber_handlers = PipelineNativeHandlerCtxCons(eff_hash, clause_infos, nclauses, ops_value, 0 - 1, safe_handlers)
       let temp_base = pipeline_ir_function_next_value(first_value, blocks) + 8
-      let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, scope_new(), src, fm, fiber_handlers, fns, f64_slots, pipeline_ir_native_f64_facts_gpr_values(f64_facts), pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
+      let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, scope_new(), src, fm, fiber_handlers, fns, f64_slots, pipeline_ir_native_f64_facts_gpr_values(f64_facts), vector_data_facts, pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
       let labels = pipeline_ir_native_label_map_add(pipeline_ir_native_cfg_state_labels(state), pipeline_ir_native_epilogue_label(), buf_len(code))
       pipeline_ir_native_patch_all(code, labels, pipeline_ir_native_cfg_state_patches(state))
       emit_epilogue_current(code, fm)
@@ -21515,19 +21625,26 @@ fn pipeline_ir_native_record_vector_check_elision(fm: i64, check_mode: i64) -> i
   if lower == 1 and upper == 1 { fmap_inc_vector_full_bounds_elision_count(fm) } else { 0 }
 }
 
-fn pipeline_ir_native_emit_vector_data_for_access(code: i64, vec: i64, vec_phys: i64, env: PipelineIrNativeVectorDataEnv, fm: i64) -> PipelineIrNativeVectorDataEnv {
-  let cached_phys = pipeline_ir_native_vector_data_env_lookup(env, vec)
-  if cached_phys != 0 {
+fn pipeline_ir_native_emit_vector_data_for_access(code: i64, dst: i64, vec: i64, vec_phys: i64, facts: PipelineIrNativeVectorDataFacts, fm: i64) -> i64 {
+  let home = pipeline_ir_native_vector_data_facts_home(facts)
+  let reload = pipeline_ir_native_vector_data_fact_reload_for(pipeline_ir_native_vector_data_facts_entries(facts), dst, vec)
+  if home == 0 or reload < 0 {
+    -- A vector access without its typed fact is a producer/consumer contract
+    -- violation. Trap the emitted path instead of silently reviving a local
+    -- emission-time recognizer.
+    bu32(code, encode_brk(62))
+    home
+  } else { if reload == 0 {
     fmap_inc_vector_data_hoist_use_count(fm)
-    env
+    home
   } else {
-    bu32(code, cg_ldr(pipeline_ir_native_vector_data_reg(), vec_phys, 0))
+    bu32(code, cg_ldr(home, vec_phys, 0))
     fmap_inc_vector_data_hoist_count(fm)
-    pipeline_ir_native_vector_data_env_one(vec)
-  }
+    home
+  } }
 }
 
-fn pipeline_ir_native_emit_vector_get_i64(code: i64, dst: i64, vec: i64, index: i64, fallback: i64, check_mode: i64, fm: i64, pinned: i64, vector_data_env: PipelineIrNativeVectorDataEnv) -> PipelineIrNativeVectorDataEnv {
+fn pipeline_ir_native_emit_vector_get_i64(code: i64, dst: i64, vec: i64, index: i64, fallback: i64, check_mode: i64, fm: i64, pinned: i64, vector_data_facts: PipelineIrNativeVectorDataFacts) -> i64 {
   -- The fallback path is cold: check failures branch to a stub after the
   -- lane load that seeds the destination and rejoins, so the happy path
   -- never stages the fallback. With every check elided the fallback is
@@ -21539,11 +21656,11 @@ fn pipeline_ir_native_emit_vector_get_i64(code: i64, dst: i64, vec: i64, index: 
   let index_phys = pipeline_ir_native_load_reg(code, pinned, index)
   if index_phys == 15 { 0 } else { bu32(code, encode_add_imm(15, index_phys, 0)) }
   let patches = pipeline_ir_native_emit_vector_index_valid_mode(code, 14, 15, check_mode)
-  let next_vector_data_env = pipeline_ir_native_emit_vector_data_for_access(code, vec, 14, vector_data_env, fm)
+  let vector_data_home = pipeline_ir_native_emit_vector_data_for_access(code, dst, vec, 14, vector_data_facts, fm)
   if dst_fd != 0 {
-    bu32(code, encode_ldr_d_reg_lsl3(dst_fd, pipeline_ir_native_vector_data_reg(), 15))
+    bu32(code, encode_ldr_d_reg_lsl3(dst_fd, vector_data_home, 15))
   } else {
-    bu32(code, encode_ldr_reg_lsl3(17, pipeline_ir_native_vector_data_reg(), 15))
+    bu32(code, encode_ldr_reg_lsl3(17, vector_data_home, 15))
   }
   if nlist_len(patches) > 0 {
     let skip_pos = buf_len(code)
@@ -21559,10 +21676,10 @@ fn pipeline_ir_native_emit_vector_get_i64(code: i64, dst: i64, vec: i64, index: 
   fmap_inc_vector_lowering_count(fm)
   fmap_inc_vector_scaled_addr_count(fm)
   pipeline_ir_native_record_vector_check_elision(fm, check_mode)
-  next_vector_data_env
+  0
 }
 
-fn pipeline_ir_native_emit_vector_set_i64(code: i64, dst: i64, vec: i64, index: i64, value: i64, check_mode: i64, fm: i64, pinned: i64, vector_data_env: PipelineIrNativeVectorDataEnv) -> PipelineIrNativeVectorDataEnv {
+fn pipeline_ir_native_emit_vector_set_i64(code: i64, dst: i64, vec: i64, index: i64, value: i64, check_mode: i64, fm: i64, pinned: i64, vector_data_facts: PipelineIrNativeVectorDataFacts) -> i64 {
   let value_fd = pipeline_ir_native_fp_resident_fd(pinned, value)
   if value_fd == 0 {
     let value_phys = pipeline_ir_native_load_reg(code, pinned, value)
@@ -21574,11 +21691,11 @@ fn pipeline_ir_native_emit_vector_set_i64(code: i64, dst: i64, vec: i64, index: 
   if index_phys == 15 { 0 } else { bu32(code, encode_add_imm(15, index_phys, 0)) }
   emit_mov_imm_safe(code, 17, 0)
   let patches = pipeline_ir_native_emit_vector_index_valid_mode(code, 14, 15, check_mode)
-  let next_vector_data_env = pipeline_ir_native_emit_vector_data_for_access(code, vec, 14, vector_data_env, fm)
+  let vector_data_home = pipeline_ir_native_emit_vector_data_for_access(code, dst, vec, 14, vector_data_facts, fm)
   if value_fd != 0 {
-    bu32(code, encode_str_d_reg_lsl3(value_fd, pipeline_ir_native_vector_data_reg(), 15))
+    bu32(code, encode_str_d_reg_lsl3(value_fd, vector_data_home, 15))
   } else {
-    bu32(code, encode_str_reg_lsl3(12, pipeline_ir_native_vector_data_reg(), 15))
+    bu32(code, encode_str_reg_lsl3(12, vector_data_home, 15))
   }
   emit_mov_imm_safe(code, 17, 1)
   let done = buf_len(code)
@@ -21587,7 +21704,7 @@ fn pipeline_ir_native_emit_vector_set_i64(code: i64, dst: i64, vec: i64, index: 
   fmap_inc_vector_lowering_count(fm)
   fmap_inc_vector_scaled_addr_count(fm)
   pipeline_ir_native_record_vector_check_elision(fm, check_mode)
-  next_vector_data_env
+  0
 }
 
 fn pipeline_ir_native_pop_one(code: i64, ctx: PipelineNativeHandlerCtx) -> PipelineNativeHandlerCtx {
@@ -21603,49 +21720,49 @@ fn pipeline_ir_native_pop_one(code: i64, ctx: PipelineNativeHandlerCtx) -> Pipel
 
 fn pipeline_ir_native_emit_ctx_scope(ctx: PipelineNativeEmitCtx) -> i64 {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_env) -> scope
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_facts) -> scope
   }
 }
 
 fn pipeline_ir_native_emit_ctx_handlers(ctx: PipelineNativeEmitCtx) -> PipelineNativeHandlerCtx {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_env) -> handlers
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_facts) -> handlers
   }
 }
 
 fn pipeline_ir_native_emit_ctx_pinned(ctx: PipelineNativeEmitCtx) -> i64 {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_env) -> pinned
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_facts) -> pinned
   }
 }
 
 fn pipeline_ir_native_emit_ctx_f64_slots(ctx: PipelineNativeEmitCtx) -> i64 {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_env) -> f64_slots
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_facts) -> f64_slots
   }
 }
 
 fn pipeline_ir_native_emit_ctx_f64_gpr_values(ctx: PipelineNativeEmitCtx) -> i64 {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_env) -> f64_gpr_values
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_facts) -> f64_gpr_values
   }
 }
 
 fn pipeline_ir_native_emit_ctx_fns(ctx: PipelineNativeEmitCtx) -> i64 {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_env) -> fns
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_facts) -> fns
   }
 }
 
 fn pipeline_ir_native_emit_ctx_fp_env(ctx: PipelineNativeEmitCtx) -> PipelineIrNativeFpEnv {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_env) -> fp_env
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_facts) -> fp_env
   }
 }
 
 fn pipeline_ir_native_emit_ctx_with_fp_env(ctx: PipelineNativeEmitCtx, fp_env: PipelineIrNativeFpEnv) -> PipelineNativeEmitCtx {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, old_fp_env, vector_data_env) -> PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_env)
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, old_fp_env, vector_data_facts) -> PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_facts)
   }
 }
 
@@ -21653,20 +21770,10 @@ fn pipeline_ir_native_emit_ctx_clear_fp(ctx: PipelineNativeEmitCtx) -> PipelineN
   pipeline_ir_native_emit_ctx_with_fp_env(ctx, pipeline_ir_native_fp_env_empty())
 }
 
-fn pipeline_ir_native_emit_ctx_vector_data_env(ctx: PipelineNativeEmitCtx) -> PipelineIrNativeVectorDataEnv {
+fn pipeline_ir_native_emit_ctx_vector_data_facts(ctx: PipelineNativeEmitCtx) -> PipelineIrNativeVectorDataFacts {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_env) -> vector_data_env
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_facts) -> vector_data_facts
   }
-}
-
-fn pipeline_ir_native_emit_ctx_with_vector_data_env(ctx: PipelineNativeEmitCtx, vector_data_env: PipelineIrNativeVectorDataEnv) -> PipelineNativeEmitCtx {
-  match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, old_vector_data_env) -> PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, fp_env, vector_data_env)
-  }
-}
-
-fn pipeline_ir_native_emit_ctx_clear_vector_data(ctx: PipelineNativeEmitCtx) -> PipelineNativeEmitCtx {
-  pipeline_ir_native_emit_ctx_with_vector_data_env(ctx, pipeline_ir_native_vector_data_env_empty())
 }
 
 fn pipeline_ir_native_emit_inst(inst: IrInst, code: i64, src: i64, fm: i64, ctx: PipelineNativeEmitCtx) -> PipelineNativeEmitCtx {
@@ -21738,12 +21845,12 @@ fn pipeline_ir_native_emit_inst(inst: IrInst, code: i64, src: i64, fm: i64, ctx:
       ctx
     }
     IrVectorGetI64(dst, vec, index, fallback, check_mode) -> {
-      let next_vector_data_env = pipeline_ir_native_emit_vector_get_i64(code, dst, vec, index, fallback, check_mode, fm, pinned, pipeline_ir_native_emit_ctx_vector_data_env(ctx))
-      pipeline_ir_native_emit_ctx_with_vector_data_env(ctx, next_vector_data_env)
+      pipeline_ir_native_emit_vector_get_i64(code, dst, vec, index, fallback, check_mode, fm, pinned, pipeline_ir_native_emit_ctx_vector_data_facts(ctx))
+      ctx
     }
     IrVectorSetI64(dst, vec, index, value, check_mode) -> {
-      let next_vector_data_env = pipeline_ir_native_emit_vector_set_i64(code, dst, vec, index, value, check_mode, fm, pinned, pipeline_ir_native_emit_ctx_vector_data_env(ctx))
-      pipeline_ir_native_emit_ctx_with_vector_data_env(ctx, next_vector_data_env)
+      pipeline_ir_native_emit_vector_set_i64(code, dst, vec, index, value, check_mode, fm, pinned, pipeline_ir_native_emit_ctx_vector_data_facts(ctx))
+      ctx
     }
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> {
       pipeline_ir_native_emit_method_call(code, dst, type_hash, method_hash, receiver, args, fm, pinned)
@@ -21814,16 +21921,16 @@ fn pipeline_ir_native_emit_inst(inst: IrInst, code: i64, src: i64, fm: i64, ctx:
       bu32(code, encode_brk(20 + reason))
       ctx
     }
-    IrBindI64(ns, nl, value, ty) -> PipelineNativeEmitCtx(scope_push_typed(scope, ns, nl, reg_id(value), ty), handlers, pinned, pipeline_ir_native_emit_ctx_f64_slots(ctx), pipeline_ir_native_emit_ctx_f64_gpr_values(ctx), fns, pipeline_ir_native_emit_ctx_fp_env(ctx), pipeline_ir_native_emit_ctx_vector_data_env(ctx))
+    IrBindI64(ns, nl, value, ty) -> PipelineNativeEmitCtx(scope_push_typed(scope, ns, nl, reg_id(value), ty), handlers, pinned, pipeline_ir_native_emit_ctx_f64_slots(ctx), pipeline_ir_native_emit_ctx_f64_gpr_values(ctx), fns, pipeline_ir_native_emit_ctx_fp_env(ctx), pipeline_ir_native_emit_ctx_vector_data_facts(ctx))
     IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, reserved) -> {
       let next_handlers = pipeline_ir_native_emit_handle(code, handle_src, fm, effect_hash, clauses, nclauses, ctx)
-      PipelineNativeEmitCtx(scope, next_handlers, pinned, pipeline_ir_native_emit_ctx_f64_slots(ctx), pipeline_ir_native_emit_ctx_f64_gpr_values(ctx), fns, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_vector_data_env_empty())
+      PipelineNativeEmitCtx(scope, next_handlers, pinned, pipeline_ir_native_emit_ctx_f64_slots(ctx), pipeline_ir_native_emit_ctx_f64_gpr_values(ctx), fns, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_emit_ctx_vector_data_facts(ctx))
     }
     IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> {
       pipeline_ir_native_emit_deferred_handle(code, dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base, fm, ctx)
       ctx
     }
-    IrHandlerPopI64(frame) -> PipelineNativeEmitCtx(scope, pipeline_ir_native_pop_one(code, handlers), pinned, pipeline_ir_native_emit_ctx_f64_slots(ctx), pipeline_ir_native_emit_ctx_f64_gpr_values(ctx), fns, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_vector_data_env_empty())
+    IrHandlerPopI64(frame) -> PipelineNativeEmitCtx(scope, pipeline_ir_native_pop_one(code, handlers), pinned, pipeline_ir_native_emit_ctx_f64_slots(ctx), pipeline_ir_native_emit_ctx_f64_gpr_values(ctx), fns, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_emit_ctx_vector_data_facts(ctx))
     IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> {
       pipeline_ir_native_emit_direct(code, dst, handler_depth, clause_index, args, handlers, fm, pinned)
       ctx
@@ -21840,8 +21947,7 @@ fn pipeline_ir_native_emit_inst_list(insts: IrInstList, code: i64, src: i64, fm:
     IrInstNil -> ctx
     IrInstCons(inst, rest) -> {
       let emitted_ctx = pipeline_ir_native_emit_inst(inst, code, src, fm, ctx)
-      let fp_ctx = if pipeline_ir_native_inst_preserves_fp_env(inst) == 1 { emitted_ctx } else { pipeline_ir_native_emit_ctx_clear_fp(emitted_ctx) }
-      let next_ctx = if pipeline_ir_native_inst_preserves_vector_data_env(inst) == 1 { fp_ctx } else { pipeline_ir_native_emit_ctx_clear_vector_data(fp_ctx) }
+      let next_ctx = if pipeline_ir_native_inst_preserves_fp_env(inst) == 1 { emitted_ctx } else { pipeline_ir_native_emit_ctx_clear_fp(emitted_ctx) }
       pipeline_ir_native_emit_inst_list(rest, code, src, fm, next_ctx)
     }
   }
@@ -21867,27 +21973,6 @@ fn pipeline_ir_native_inst_preserves_fp_env(inst: IrInst) -> i64 {
     IrVariantInitI64(dst, tag_hash, args) -> 0
     IrRecordInitI64(dst, type_hash, fields) -> 0
     _ -> 1
-  }
-}
-
-fn pipeline_ir_native_inst_preserves_vector_data_env(inst: IrInst) -> i64 {
-  match inst {
-    IrConstI64(dst, value) -> 1
-    IrNilI64(dst) -> 1
-    IrBinaryI64(dst, op, lhs, rhs) -> 1
-    IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> 1
-    IrUnaryI64(dst, op, value) -> 1
-    IrSlotI64(slot) -> 1
-    IrLoadI64(dst, slot) -> 1
-    IrStoreI64(slot, value) -> 1
-    IrVectorGetI64(dst, vec, index, fallback, check_mode) -> 1
-    IrVectorSetI64(dst, vec, index, value, check_mode) -> 1
-    IrBindI64(ns, nl, value, ty) -> 1
-    IrVariantTagI64(dst, value) -> 1
-    IrVariantPayloadI64(dst, value, index) -> 1
-    IrFieldLoadI64(dst, base, field_hash, field_index) -> 1
-    IrResumeI64(dst, value) -> 1
-    _ -> 0
   }
 }
 
@@ -21943,8 +22028,7 @@ fn pipeline_ir_native_emit_inst_list_for_term(insts: IrInstList, code: i64, src:
         }
         _ -> {
           let emitted_ctx = pipeline_ir_native_emit_inst(inst, code, src, fm, ctx)
-          let fp_ctx = if pipeline_ir_native_inst_preserves_fp_env(inst) == 1 { emitted_ctx } else { pipeline_ir_native_emit_ctx_clear_fp(emitted_ctx) }
-          let next_ctx = if pipeline_ir_native_inst_preserves_vector_data_env(inst) == 1 { fp_ctx } else { pipeline_ir_native_emit_ctx_clear_vector_data(fp_ctx) }
+          let next_ctx = if pipeline_ir_native_inst_preserves_fp_env(inst) == 1 { emitted_ctx } else { pipeline_ir_native_emit_ctx_clear_fp(emitted_ctx) }
           pipeline_ir_native_emit_inst_list_for_term(rest, code, src, fm, next_ctx, branch_cmp_info)
         }
       }
@@ -22212,7 +22296,7 @@ fn pipeline_ir_native_cfg_state_patches(state: i64) -> i64 { node_f2(state) }
 fn pipeline_ir_native_cfg_state_pinned(state: i64) -> i64 { node_f3(state) }
 fn pipeline_ir_native_cfg_state_temp_base(state: i64) -> i64 { node_f4(state) }
 
-fn pipeline_ir_native_emit_blocks(blocks: IrBlockList, all_blocks: IrBlockList, code: i64, scope: i64, src: i64, fm: i64, handlers: PipelineNativeHandlerCtx, fns: i64, f64_slots: i64, f64_gpr_values: i64, state: i64) -> i64 {
+fn pipeline_ir_native_emit_blocks(blocks: IrBlockList, all_blocks: IrBlockList, code: i64, scope: i64, src: i64, fm: i64, handlers: PipelineNativeHandlerCtx, fns: i64, f64_slots: i64, f64_gpr_values: i64, vector_data_facts: PipelineIrNativeVectorDataFacts, state: i64) -> i64 {
   let labels = pipeline_ir_native_cfg_state_labels(state)
   let patches = pipeline_ir_native_cfg_state_patches(state)
   let pinned = pipeline_ir_native_cfg_state_pinned(state)
@@ -22224,7 +22308,7 @@ fn pipeline_ir_native_emit_blocks(blocks: IrBlockList, all_blocks: IrBlockList, 
         IrBlock(id, params, insts, term) -> {
           let next_labels = pipeline_ir_native_label_map_add(labels, id, buf_len(code))
           let branch_cmp_info = pipeline_ir_native_direct_branch_cmp_info_for_term(insts, term)
-          let ctx = pipeline_ir_native_emit_inst_list_for_term(insts, code, src, fm, PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_vector_data_env_empty()), branch_cmp_info)
+          let ctx = pipeline_ir_native_emit_inst_list_for_term(insts, code, src, fm, PipelineNativeEmitCtx(scope, handlers, pinned, f64_slots, f64_gpr_values, fns, pipeline_ir_native_fp_env_empty(), vector_data_facts), branch_cmp_info)
           let next_handlers_ctx = pipeline_ir_native_emit_ctx_handlers(ctx)
           let branch_return = match rest {
             IrBlockListNil -> 0
@@ -22236,7 +22320,7 @@ fn pipeline_ir_native_emit_blocks(blocks: IrBlockList, all_blocks: IrBlockList, 
           let audit_offsets = fmap_audit_offsets(fm)
           if audit_offsets != 0 { nlist_add(audit_offsets, buf_len(code)) 0 } else { 0 }
           let next_patches = pipeline_ir_native_emit_term_cfg(term, all_blocks, code, next_labels, patches, fm, info)
-          pipeline_ir_native_emit_blocks(rest, all_blocks, code, scope, src, fm, next_handlers_ctx, fns, f64_slots, f64_gpr_values, pipeline_ir_native_cfg_state(next_labels, next_patches, pinned, temp_base))
+          pipeline_ir_native_emit_blocks(rest, all_blocks, code, scope, src, fm, next_handlers_ctx, fns, f64_slots, f64_gpr_values, vector_data_facts, pipeline_ir_native_cfg_state(next_labels, next_patches, pinned, temp_base))
         }
       }
     }
@@ -22250,7 +22334,8 @@ fn pipeline_ir_native_emit_block(block: IrBlock, code: i64, scope: i64, src: i64
       let pinned = pipeline_ir_native_pinned_slot_none()
       let f64_facts = pipeline_ir_native_f64_facts_for_blocks(ir_block_list_prepend(block, ir_block_list_empty()))
       let f64_slots = pipeline_ir_native_f64_pinned_slots_from_facts(ir_block_list_prepend(block, ir_block_list_empty()), pipeline_ir_native_f64_facts_slots(f64_facts))
-      let ctx = pipeline_ir_native_emit_inst_list_for_term(insts, code, src, fm, PipelineNativeEmitCtx(scope, PipelineNativeHandlerCtxNil, pinned, f64_slots, pipeline_ir_native_f64_facts_gpr_values(f64_facts), 0, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_vector_data_env_empty()), branch_cmp_info)
+      let vector_data_facts = pipeline_ir_native_vector_data_facts_assign_home(pipeline_ir_native_vector_data_facts_for_blocks(ir_block_list_prepend(block, ir_block_list_empty())))
+      let ctx = pipeline_ir_native_emit_inst_list_for_term(insts, code, src, fm, PipelineNativeEmitCtx(scope, PipelineNativeHandlerCtxNil, pinned, f64_slots, pipeline_ir_native_f64_facts_gpr_values(f64_facts), 0, pipeline_ir_native_fp_env_empty(), vector_data_facts), branch_cmp_info)
       pipeline_ir_native_emit_term_cfg(
         term,
         ir_block_list_prepend(block, ir_block_list_empty()),
@@ -23326,33 +23411,6 @@ fn pipeline_ir_native_resident_pool_reg(index: i64) -> i64 {
   else { if index == 2 { 14 } else { 0 } } }
 }
 
-fn pipeline_ir_native_inst_list_has_vector_data_access(insts: IrInstList) -> i64 {
-  match insts {
-    IrInstNil -> 0
-    IrInstCons(inst, rest) -> {
-      match inst {
-        IrVectorGetI64(dst, vec, index, fallback, check_mode) -> 1
-        IrVectorSetI64(dst, vec, index, value, check_mode) -> 1
-        _ -> pipeline_ir_native_inst_list_has_vector_data_access(rest)
-      }
-    }
-  }
-}
-
-fn pipeline_ir_native_blocks_have_vector_data_access(blocks: IrBlockList) -> i64 {
-  match blocks {
-    IrBlockListNil -> 0
-    IrBlockListCons(block, rest) -> {
-      match block {
-        IrBlock(id, params, insts, term) -> {
-          if pipeline_ir_native_inst_list_has_vector_data_access(insts) == 1 { 1 }
-          else { pipeline_ir_native_blocks_have_vector_data_access(rest) }
-        }
-      }
-    }
-  }
-}
-
 fn pipeline_ir_native_pinned_slot_kind_resident() -> i64 { 2 }
 fn pipeline_ir_native_pinned_slot_kind_swap() -> i64 { 3 }
 
@@ -23497,7 +23555,7 @@ fn pipeline_ir_native_reusable_param_homes(blocks: IrBlockList, param_count: i64
   }
 }
 
-fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, raw_pinned: i64, fm: i64, f64_slots: i64) -> i64 {
+fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, raw_pinned: i64, fm: i64, f64_slots: i64, vector_data_facts: PipelineIrNativeVectorDataFacts) -> i64 {
   if pipeline_ir_native_blocks_have_handles(blocks) == 1 { raw_pinned }
   else {
     -- FP candidates can have any value id, so even bank-only functions
@@ -23696,7 +23754,8 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       -- allocation, mem copies) is a non-simple instruction and
       -- therefore already a window barrier; the audit's per-register
       -- write decoding is pool-agnostic and caught the original
-      -- unconditional grab.
+      -- unconditional grab. An assigned cache fact owns x9; an empty
+      -- fact set leaves it in the scalar pool.
       let mut x8_taken = 0
       let mut x10_taken = 0
       let mut x11_taken = 0
@@ -23714,7 +23773,7 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       nlist_add(pool_regs, 13)
       nlist_add(pool_regs, 14)
       if x8_taken == 0 { nlist_add(pool_regs, 8) } else { 0 }
-      if pipeline_ir_native_blocks_have_vector_data_access(blocks) == 0 { nlist_add(pool_regs, 9) } else { 0 }
+      if pipeline_ir_native_vector_data_facts_home(vector_data_facts) != 9 { nlist_add(pool_regs, 9) } else { 0 }
       if x10_taken == 0 { nlist_add(pool_regs, 10) } else { 0 }
       if x11_taken == 0 { nlist_add(pool_regs, 11) } else { 0 }
       let pool_n = nlist_len(pool_regs)
@@ -24381,6 +24440,7 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         cg_cleanup_restore(fm, 0)
         let f64_facts = pipeline_ir_native_f64_facts_for_blocks(blocks)
         let f64_slots = pipeline_ir_native_f64_pinned_slots_from_facts(blocks, pipeline_ir_native_f64_facts_slots(f64_facts))
+        let vector_data_facts = pipeline_ir_native_vector_data_facts_assign_home(pipeline_ir_native_vector_data_facts_for_blocks(blocks))
         let f64_slot_count = pipeline_ir_native_f64_slot_count(f64_slots)
         fmap_set_current_frame_size(fm, pipeline_ir_native_frame_size_for_blocks(param_count, blocks))
         if f64_slot_count > 0 {
@@ -24395,7 +24455,7 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         fmap_add_ir_native_pinned_slot_count(fm, pipeline_ir_native_pinned_slot_count(raw_pinned))
         fmap_add_ir_native_loop_pinned_slot_count(fm, pipeline_ir_native_pinned_slot_kind_count(raw_pinned, pipeline_ir_native_pinned_slot_kind_loop()))
         if fmap_audit_mode(fm) == 1 { fmap_set_audit_ranges(fm, nlist_new()) } else { 0 }
-        let resident_pinned = pipeline_ir_native_volatile_residents(param_count, blocks, raw_pinned, fm, f64_slots)
+        let resident_pinned = pipeline_ir_native_volatile_residents(param_count, blocks, raw_pinned, fm, f64_slots, vector_data_facts)
         if fmap_audit_mode(fm) == 1 {
           -- Arm the emission offset ledger only when this function has pool
           -- tenants to audit; handler-bearing functions never do.
@@ -24420,7 +24480,7 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         let temp_base = pipeline_ir_function_next_value(param_count, blocks) + 8
         let base_scope = pipeline_ir_native_scope_from_entry_param_binds(blocks, param_count)
         pipeline_ir_native_push_entry_param_cleanup(blocks, param_count, fm)
-        let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, base_scope, src, fm, PipelineNativeHandlerCtxNil, fns, f64_slots, pipeline_ir_native_f64_facts_gpr_values(f64_facts), pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
+        let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, base_scope, src, fm, PipelineNativeHandlerCtxNil, fns, f64_slots, pipeline_ir_native_f64_facts_gpr_values(f64_facts), vector_data_facts, pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
         -- Residency audit: final sentinel entry marks the end of the last
         -- window (windows never reach the epilogue).
         let audit_offsets_done = fmap_audit_offsets(fm)
