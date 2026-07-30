@@ -56,6 +56,34 @@ fn rc_count(payload: i64) -> i64 {
 fn rc_size_word_size(word: i64) -> i64 { word band 4294967295 }
 fn rc_size_word_mask(word: i64) -> i64 { (word bshr 32) band 4294967295 }
 
+-- Payloads shorter than sixteen words leave the mask's high two bits
+-- outside their field range. Runtime-owned containers use those bits
+-- as a finalizer descriptor without widening the common RC header.
+-- The payload-size check keeps a legitimate word-15 aggregate field
+-- from ever being mistaken for a finalizer.
+fn rc_finalizer_none() -> i64 { 0 }
+fn rc_finalizer_buffer() -> i64 { 1 }
+fn rc_finalizer_vector() -> i64 { 2 }
+fn rc_finalizer_shift() -> i64 { 30 }
+fn rc_buffer_payload_size() -> i64 { 24 }
+fn rc_vector_payload_size() -> i64 { 40 }
+
+fn rc_finalizer_mask(kind: i64) -> i64 {
+  kind bshl rc_finalizer_shift()
+}
+
+fn rc_size_word_finalizer(word: i64) -> i64 {
+  let size = rc_size_word_size(word)
+  let kind = rc_size_word_mask(word) bshr rc_finalizer_shift()
+  if size == rc_buffer_payload_size() and kind == rc_finalizer_buffer() {
+    kind
+  } else { if size == rc_vector_payload_size() and kind == rc_finalizer_vector() {
+    kind
+  } else {
+    rc_finalizer_none()
+  } }
+}
+
 fn rc_payload_size(payload: i64) -> i64 {
   rc_size_word_size(__mem_load64(rc_header_from_payload(payload) + rc_payload_size_offset()))
 }
@@ -466,6 +494,36 @@ fn rc_deep_release_child(child: i64, pending: i64) -> i64 {
   }
 }
 
+fn rc_deep_release_custom(payload: i64, word: i64, pending_start: i64, heap: i64) -> i64 {
+  let kind = rc_size_word_finalizer(word)
+  if kind == rc_finalizer_buffer() {
+    let data = __mem_load64(payload)
+    let cap = __mem_load64(payload + 16)
+    if data != 0 and cap > 0 { heap_free(heap, data, cap) } else { 0 }
+    pending_start
+  } else { if kind == rc_finalizer_vector() {
+    let data = __mem_load64(payload)
+    let len = __mem_load64(payload + 8)
+    let cap = __mem_load64(payload + 16)
+    let elem_size = __mem_load64(payload + 24)
+    let elem_mode = __mem_load64(payload + 32)
+    let mut pending = pending_start
+    if data != 0 and elem_size > 0 and elem_mode == 8 {
+      let mut i = 0
+      while i < len {
+        pending = rc_deep_release_child(__mem_load64(data + i * elem_size), pending)
+        i = i + 1
+      }
+    } else { 0 }
+    if data != 0 and cap > 0 and elem_size > 0 {
+      heap_free(heap, data, cap * elem_size)
+    } else { 0 }
+    pending
+  } else {
+    pending_start
+  } }
+}
+
 fn rc_deep_release_walk(first: i64) -> i64 {
   let heap = rc_default_heap()
   let mut pending = first
@@ -476,6 +534,12 @@ fn rc_deep_release_walk(first: i64) -> i64 {
     __mem_store64(header + rc_promoted_offset(), 0)
     let word = __mem_load64(header + rc_payload_size_offset())
     let mask = rc_size_word_mask(word)
+    -- Ordinary aggregates never pay a finalizer call. Only descriptors
+    -- using the high mask pair can be runtime containers (or a real
+    -- word-15 field, rejected by the helper's payload-size check).
+    if mask >= 1073741824 {
+      pending = rc_deep_release_custom(node, word, pending, heap)
+    } else { 0 }
     if mask != 0 {
       let words = rc_size_word_size(word) / 8
       let limit = if words < 16 { words } else { 16 }
@@ -558,8 +622,29 @@ fn rc_deep_release_promoted_fields(payload: i64) -> i64 {
   let header = rc_header_from_payload(payload)
   let word = __mem_load64(header + rc_payload_size_offset())
   let mask = rc_size_word_mask(word)
-  if mask == 0 { 0 }
-  else {
+  let finalizer = if mask >= 1073741824 { rc_size_word_finalizer(word) } else { rc_finalizer_none() }
+  if finalizer == rc_finalizer_buffer() {
+    let data = __mem_load64(payload)
+    let cap = __mem_load64(payload + 16)
+    if data != 0 and cap > 0 { heap_free(rc_default_heap(), data, cap) } else { 0 }
+  } else { if finalizer == rc_finalizer_vector() {
+    let data = __mem_load64(payload)
+    let len = __mem_load64(payload + 8)
+    let cap = __mem_load64(payload + 16)
+    let elem_size = __mem_load64(payload + 24)
+    let elem_mode = __mem_load64(payload + 32)
+    if data != 0 and elem_size > 0 and elem_mode == 8 {
+      let mut j = 0
+      while j < len {
+        rc_default_release(__mem_load64(data + j * elem_size))
+        j = j + 1
+      }
+    } else { 0 }
+    if data != 0 and cap > 0 and elem_size > 0 {
+      heap_free(rc_default_heap(), data, cap * elem_size)
+    } else { 0 }
+  } else { 0 } }
+  if mask == 0 { 0 } else {
     let words = rc_size_word_size(word) / 8
     let limit = if words < 16 { words } else { 16 }
     let mut i = 0
@@ -613,6 +698,12 @@ fn rc_set_field_mask_word(payload: i64, payload_size: i64, mask: i64) -> i64 {
     __mem_store64(rc_header_from_payload(payload) + rc_payload_size_offset(), payload_size bor (mask bshl 32))
     0
   }
+}
+
+fn rc_default_alloc_finalized(payload_size: i64, align: i64, finalizer: i64) -> rc i64 {
+  let payload = rc_default_alloc(payload_size, align)
+  rc_set_field_mask_word(payload, payload_size, rc_finalizer_mask(finalizer))
+  payload
 }
 
 -- Ctor-init allocations (variant/record) skip the zero fill: emission
