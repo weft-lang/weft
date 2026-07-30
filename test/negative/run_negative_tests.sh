@@ -94,6 +94,10 @@ check_rejects() {
 }
 
 check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" "type error: argument type mismatch"
+check_rejects "deep_release_mask_overflow_record" "test/negative/deep_release_mask_overflow_record.weft" "type error: aggregate field may require release beyond 16-word mask"
+check_rejects "deep_release_mask_overflow_variant_closure" "test/negative/deep_release_mask_overflow_variant_closure.weft" "type error: aggregate field may require release beyond 16-word mask"
+check_rejects "deep_release_mask_overflow_weak" "test/negative/deep_release_mask_overflow_weak.weft" "type error: aggregate field may require release beyond 16-word mask"
+check_rejects "deep_release_mask_overflow_generic" "test/negative/deep_release_mask_overflow_generic.weft" "type error: aggregate field may require release beyond 16-word mask"
 check_rejects "par_map_scoped_effectful" "test/negative/par_map_scoped_effectful.weft" "type error: argument type mismatch"
 check_rejects "par_pool_submit_effectful" "test/negative/par_pool_submit_effectful.weft" "type error: argument type mismatch"
 check_rejects "par_prepared_submit_public" "test/negative/par_prepared_submit_public.weft" "type error: prepared Par submission is compiler-internal"
