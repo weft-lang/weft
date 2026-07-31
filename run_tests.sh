@@ -146,6 +146,59 @@ for f in $(grep -l 'test "' test/*.weft 2>/dev/null); do
   rm -f "$tmpbin"
 done
 
+# Main-style legacy programs (no test blocks): compile + run, comparing
+# the exit code against the REQUIRED '-- Expected exit code: N'
+# annotation. A missing annotation is a failure — these files were
+# silently skipped for months because the loop above only iterates
+# files containing test blocks (2u).
+for f in test/*.weft; do
+  grep -q 'test "' "$f" && continue
+  name=$(basename "$f" .weft)
+  RUNTIME_FILES=$((RUNTIME_FILES+1))
+  RUNTIME_TESTS=$((RUNTIME_TESTS+1))
+  expected=$(grep -o 'Expected exit code: [0-9]*' "$f" | head -1 | grep -o '[0-9]*$')
+  if [ -z "$expected" ]; then
+    echo "  ✗ $name (main-style file missing '-- Expected exit code: N' annotation)"
+    FAIL=$((FAIL+1))
+    ERRORS="$ERRORS\n  $name: missing expected-exit annotation"
+    continue
+  fi
+  tmpbin=$(mktemp /tmp/weft_main_XXXXXX)
+  compile_exit=0
+  compile_start=$(now_s)
+  run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" compile "$f" > "$tmpbin" 2>/dev/null || compile_exit=$?
+  compile_elapsed=$(($(now_s) - compile_start))
+  RUNTIME_COMPILE_SECONDS=$((RUNTIME_COMPILE_SECONDS+compile_elapsed))
+  if [ $compile_exit -ne 0 ]; then
+    echo "  ✗ $name (compilation failed; exit $compile_exit; compile ${compile_elapsed}s)"
+    FAIL=$((FAIL+1))
+    ERRORS="$ERRORS\n  $name: compilation failed (exit $compile_exit)"
+    rm -f "$tmpbin"
+    continue
+  fi
+  chmod +x "$tmpbin"
+  # Expected values must stay below 124: run_guarded reserves 124/125
+  # for timeout/RSS kills, and exit codes are mod-256 anyway.
+  exit_code=0
+  run_start=$(now_s)
+  run_guarded "$WEFT_TEST_RUN_TIMEOUT" "$WEFT_TEST_RUN_RSS_LIMIT_KB" "$tmpbin" >/dev/null 2>/dev/null || exit_code=$?
+  run_elapsed=$(($(now_s) - run_start))
+  RUNTIME_RUN_SECONDS=$((RUNTIME_RUN_SECONDS+run_elapsed))
+  if [ "$exit_code" = "$expected" ]; then
+    if [ "$WEFT_TEST_SHOW_TIMINGS" -eq 1 ]; then
+      echo "  ✓ $name (=$expected; compile ${compile_elapsed}s, run ${run_elapsed}s)"
+    else
+      echo "  ✓ $name"
+    fi
+    PASS=$((PASS+1))
+  else
+    echo "  ✗ $name (exit $exit_code, expected $expected)"
+    FAIL=$((FAIL+1))
+    ERRORS="$ERRORS\n  $name: exit $exit_code != expected $expected"
+  fi
+  rm -f "$tmpbin"
+done
+
 echo ""
 echo "=== Bootstrap Gate ==="
 # Quick 3-stage bootstrap check
