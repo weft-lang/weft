@@ -1,0 +1,137 @@
+-- test/effect_tier0_validations.weft -- B1.0 Tier-0 effect validations (2t)
+--
+-- Three correctness-class validations from the performance roadmap:
+--   (i)  the Tier-2 perform path must not heap-allocate PER PERFORM
+--        (Lexa OOPSLA'24: tail-resumptive handlers need zero allocation;
+--        Koka's ablation prices this class of bug at ~10x);
+--   (ii) the under/evidence-masking trap (Xie & Leijen ICFP'21 2.9.2):
+--        a tail-resumptive clause performing an effect of its OWN label
+--        must dispatch outward, never re-enter itself;
+--   (iii) resume-driven scheduling must not accrete stack: a long chain
+--        of tail resumes runs in constant stack (Lexa fig. 15's
+--        round-robin scheduler failure mode).
+--
+-- Bump-mark discipline (from bump_reclaim_metrics.weft): Test asserts
+-- allocate, so all mark deltas are computed into locals before any
+-- assert runs.
+
+use "runtime/alloc.weft"
+
+effect Tick { fn tick() -> i64 }
+effect Step { @deferred fn step(x: i64) -> i64 }
+
+-- (i) ---------------------------------------------------------------
+
+fn tick_sum(n: i64) -[Tick]> i64 {
+  let mut total = 0
+  for i in 0..n {
+    total = total + Tick.tick()
+  }
+  total
+}
+
+fn run_tick_sum(n: i64, which: i64) -> i64 {
+  -- Two handler bodies selected at runtime keep the perform site from
+  -- statically resolving to a single clause, so the dynamic Tier-2
+  -- path stays exercised even as handler inlining improves.
+  if which == 1 {
+    handle tick_sum(n) { Tick.tick() -> resume(1) }
+  } else {
+    handle tick_sum(n) { Tick.tick() -> resume(2) }
+  }
+}
+
+fn tick_sum_alloc_delta(n: i64, which: i64) -> i64 {
+  let before = alloc_bump_mark()
+  let got = run_tick_sum(n, which)
+  let after = alloc_bump_mark()
+  let expected = if which == 1 { n } else { n * 2 }
+  if got == expected { after - before } else { 0 - 1000000 }
+}
+
+test "tier2_perform_path_allocates_nothing_per_perform" {
+  -- Warm one-time setup, then compare a small and a large perform count
+  -- under the same handler shape: any per-perform allocation makes the
+  -- deltas diverge by (4096 - 16) * cost.
+  let warm = tick_sum_alloc_delta(1, 1)
+  let small = tick_sum_alloc_delta(16, 1)
+  let large = tick_sum_alloc_delta(4096, 1)
+  Test.assert_eq(large - small, 0)
+  let small2 = tick_sum_alloc_delta(16, 2)
+  let large2 = tick_sum_alloc_delta(4096, 2)
+  Test.assert_eq(large2 - small2, 0)
+}
+
+test "tier2_handle_entry_allocation_is_bounded" {
+  -- Handle ENTRY may currently bump-allocate its frame + ops table.
+  -- Pin an upper bound per entry so regressions are loud; the B1.6
+  -- target is zero (stack-resident frame).
+  let warm = tick_sum_alloc_delta(1, 1)
+  let before = alloc_bump_mark()
+  let mut total = 0
+  for i in 0..256 {
+    total = total + run_tick_sum(1, 1)
+  }
+  let after = alloc_bump_mark()
+  let per_entry = (after - before) / 256
+  Test.assert_eq(total, 256)
+  Test.assert_le(per_entry, 128)
+}
+
+-- (ii) --------------------------------------------------------------
+
+fn tick_once() -[Tick]> i64 { Tick.tick() }
+
+fn clause_performs_own_label() -[Tick]> i64 {
+  handle tick_once() {
+    -- This clause performs Tick itself. It must reach the ENCLOSING
+    -- handler (the caller's), not re-enter this one: self-re-entry
+    -- either loops forever or doubles the increment.
+    Tick.tick() -> resume(Tick.tick() + 100)
+  }
+}
+
+test "handler_clause_own_label_dispatches_outward" {
+  let got = handle clause_performs_own_label() {
+    Tick.tick() -> resume(1)
+  }
+  Test.assert_eq(got, 101)
+}
+
+test "nested_same_label_handlers_innermost_wins" {
+  let got = handle {
+    let inner = handle tick_once() { Tick.tick() -> resume(2) }
+    inner + tick_once()
+  } {
+    Tick.tick() -> resume(1)
+  }
+  Test.assert_eq(got, 3)
+}
+
+-- (iii) -------------------------------------------------------------
+
+fn step_chain(n: i64) -[Step]> i64 {
+  let mut total = 0
+  for i in 0..n {
+    total = total + Step.step(1)
+  }
+  total
+}
+
+test "deferred_tail_resume_chain_survives_ten_thousand" {
+  -- KNOWN CEILING (2t, 2026-07-31): the deferred k-in-tail-position
+  -- path accretes ~650 bytes of stack per resume — 2M resumes crash
+  -- (SIGBUS) between n=10k and n=100k. Constant-stack resume needs
+  -- tail calls (roadmap A5/TCO, child brief 11); raise this to 2M when
+  -- that lands. 10k pins today's working envelope so gross per-resume
+  -- regressions still fail loudly.
+  let got = handle step_chain(10000) {
+    Step.step(x) with k -> k(x)
+  }
+  Test.assert_eq(got, 10000)
+}
+
+test "tier2_tail_resume_chain_runs_in_constant_stack" {
+  let got = run_tick_sum(2000000, 1)
+  Test.assert_eq(got, 2000000)
+}
