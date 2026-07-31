@@ -2468,6 +2468,8 @@ fn pipeline_return_expr_type_node_typed(expr: Expr, params: i64, locals: Pipelin
     }
     LetTyped(inner, ann_type) -> type_expr_to_node(ann_type)
     Defer(cleanup, body) -> pipeline_return_expr_type_node_typed(body, params, locals, module)
+    Resume(value) -> pipeline_return_expr_type_node_typed(value, params, locals, module)
+    Handle(body, clauses) -> pipeline_return_expr_type_node_typed(body, params, locals, module)
     If(cond, then_expr, else_expr) -> {
       let then_ty = pipeline_return_expr_type_node_typed(then_expr, params, locals, module)
       let else_ty = pipeline_return_expr_type_node_typed(else_expr, params, locals, module)
@@ -2602,24 +2604,33 @@ fn pipeline_init_type_node_from_node(expr: i64, params: i64, locals: PipelineVal
   if stripped == 0 { 0 } else { pipeline_init_type_node_typed(expr_from_node(stripped), params, locals, module) }
 }
 
-fn pipeline_lower_return_transfer_typed(value_expr: Expr, value: i64, next_value: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> IrLoweredExpr {
+fn pipeline_lower_return_transfer_typed_with_ty(value_expr: Expr, value: i64, next_value: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, forced_ty: i64) -> IrLoweredExpr {
   let src = pipeline_lower_module_src(module)
   let fns = pipeline_lower_module_fns(module)
   let subst = pipeline_lower_module_subst(module)
-  let ty = pipeline_return_expr_type_node_typed(value_expr, params, locals, module)
+  let inferred_ty = pipeline_return_expr_type_node_typed(value_expr, params, locals, module)
+  let ty = if forced_ty != 0 { forced_ty } else { inferred_ty }
   let retain = if ty != 0 and ty_is_continuation(ty) == 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, fns, subst, pipeline_lower_module_tt(module)) == 1 {
     pipeline_managed_retain_inst_list(value, ty, next_value)
   } else {
     ir_inst_list_empty()
   }
   let after_retain = if ir_inst_list_len(retain) > 0 { next_value + 1 } else { next_value }
-  let release = if ty != 0 and pipeline_expr_final_returns_non_param_ident_typed(value_expr, params, src) == 1 {
+  -- The local-release half exists only to balance the transfer retain
+  -- above. A let whose final binding already transfers an owned count
+  -- needs neither operation; releasing without a retain returns a
+  -- zero-count payload to the caller.
+  let release = if ir_inst_list_len(retain) > 0 and pipeline_expr_final_returns_non_param_ident_typed(value_expr, params, src) == 1 {
     pipeline_managed_release_inst_list(value, ty, after_retain)
   } else {
     ir_inst_list_empty()
   }
   let after_release = if ir_inst_list_len(release) > 0 { after_retain + 1 } else { after_retain }
   ir_lowered_expr(value, after_release, ir_inst_list_append(retain, release))
+}
+
+fn pipeline_lower_return_transfer_typed(value_expr: Expr, value: i64, next_value: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> IrLoweredExpr {
+  pipeline_lower_return_transfer_typed_with_ty(value_expr, value, next_value, params, locals, module, 0)
 }
 
 fn pipeline_lower_return_transfer_from_node(value_expr: i64, value: i64, next_value: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> IrLoweredExpr {
@@ -2633,7 +2644,7 @@ fn pipeline_lower_return_transfer_from_node(value_expr: i64, value: i64, next_va
     ir_inst_list_empty()
   }
   let after_retain = if ir_inst_list_len(retain) > 0 { next_value + 1 } else { next_value }
-  let release = if ty != 0 and pipeline_expr_node_final_returns_non_param_ident(value_expr, params, src) == 1 {
+  let release = if ir_inst_list_len(retain) > 0 and pipeline_expr_node_final_returns_non_param_ident(value_expr, params, src) == 1 {
     pipeline_managed_release_inst_list(value, ty, after_retain)
   } else {
     ir_inst_list_empty()
@@ -6709,33 +6720,17 @@ fn pipeline_handler_capture_locals(captures: i64, index: i64, value_base: i64, l
   }
 }
 
-fn pipeline_handler_clause_lowering_locals(clause_params: ParamList, nparams: i64, captures: i64) -> PipelineValueEnv {
+fn pipeline_handler_clause_lowering_locals(clause_params: ParamList, expected_params: i64, nparams: i64, captures: i64) -> PipelineValueEnv {
   let with_captures = pipeline_handler_capture_locals(captures, 0, nparams, pipeline_value_env_empty())
-  pipeline_handler_clause_lowering_params(clause_params, 0, nparams + nlist_len(captures), with_captures)
+  pipeline_handler_clause_lowering_params(clause_params, expected_params, 0, nparams + nlist_len(captures), with_captures)
 }
 
 fn pipeline_deferred_body_lowering_locals(captures: i64) -> PipelineValueEnv {
   pipeline_handler_capture_locals(captures, 0, 0, pipeline_value_env_empty())
 }
 
-fn pipeline_handler_clause_return_unmanaged_lowering(clause: HandlerClause, src: i64, tt: i64) -> i64 {
-  match clause {
-    HandlerClause(name_info, params, body, continuation) -> {
-      match name_info {
-        HandlerClauseName(eff_ns, eff_nl, op_ns, op_nl) -> {
-          let ret_ty = cg_effect_op_ret_type(tt, src, eff_ns, eff_nl, op_ns, op_nl)
-          if cg_ty_is_managed(ret_ty) == 1 { 0 } else { 1 }
-        }
-        UnknownHandlerClauseName -> 0
-      }
-    }
-    UnknownHandlerClause(tag) -> 0
-  }
-}
-
 fn pipeline_lower_handler_clause_body_typed(clause: HandlerClause, fn_params: i64, outer_locals: PipelineValueEnv, module: PipelineLowerModule) -> IrHandlerClauseBody {
   let src = pipeline_lower_module_src(module)
-  let tt = pipeline_lower_module_tt(module)
   match clause {
     HandlerClause(name_info, clause_params, body, continuation) -> {
       let nparams = param_list_len(clause_params)
@@ -6746,32 +6741,36 @@ fn pipeline_lower_handler_clause_body_typed(clause: HandlerClause, fn_params: i6
       let nfree = nlist_len(captures)
       let has_continuation = handler_clause_has_continuation(clause)
       let op_hash = pipeline_handler_clause_op_hash_typed(src, clause)
-      if pipeline_handler_clause_params_unmanaged(clause_params) == 0 {
-        IrHandlerClauseBodyInvalid(1)
-      } else { if pipeline_handler_clause_return_unmanaged_lowering(clause, src, tt) == 0 {
-        IrHandlerClauseBodyInvalid(2)
+      let expected_params = match name_info {
+        HandlerClauseName(eff_ns, eff_nl, op_ns, op_nl) -> pipeline_lookup_effect_op_params_nodes(pipeline_lower_module_tt(module), src, eff_ns, eff_nl, op_ns, op_nl)
+        UnknownHandlerClauseName -> 0
+      }
+      let return_ty = match name_info {
+        HandlerClauseName(eff_ns, eff_nl, op_ns, op_nl) -> cg_effect_op_ret_type(pipeline_lower_module_tt(module), src, eff_ns, eff_nl, op_ns, op_nl)
+        UnknownHandlerClauseName -> 0
+      }
+      -- Immediate handler frames borrow captures from the enclosing frame:
+      -- the handler cannot outlive that lexical extent. Clause parameters
+      -- borrow the perform arguments on the same contract; a managed value
+      -- crossing back through resume is normalised by the clause return
+      -- transfer, while deferred handlers still describe exact capture
+      -- cleanup kinds below.
+      let base_next = nparams + nfree + nparams
+      -- Reserve a fixed continuation layout independent of managed
+      -- capture count: token, cleanup segment, closure, closure env.
+      let continuation_closure_value = base_next + 2
+      let first_value = if has_continuation == 1 { base_next + 4 } else { base_next }
+      let base_locals = pipeline_handler_clause_lowering_locals(clause_params, expected_params, nparams, captures)
+      let body_locals = pipeline_handler_clause_locals_with_continuation(base_locals, continuation, continuation_closure_value)
+      let safe_handlers = pipeline_handler_inline_ctx_out_of_line_safe(pipeline_lower_module_handlers(module))
+      let body_module = pipeline_lower_module_with_handlers(module, safe_handlers)
+      let lower_ctx = pipeline_handler_lower_ctx_from_module(0, body_locals, body_module)
+      let lowered = pipeline_lower_expr_typed_hclause_blocks(body, first_value, lower_ctx, return_ty)
+      if pipeline_lowered_blocks_is_valid(lowered) == 0 {
+        IrHandlerClauseBodyInvalid(4)
       } else {
-        -- Immediate handler frames borrow captures from the enclosing frame:
-        -- the handler cannot outlive that lexical extent, so managed values
-        -- need neither a retain nor the deferred-continuation cleanup segment.
-        -- Deferred handlers still describe exact cleanup kinds below.
-        let base_next = nparams + nfree + nparams
-        -- Reserve a fixed continuation layout independent of managed
-        -- capture count: token, cleanup segment, closure, closure env.
-        let continuation_closure_value = base_next + 2
-        let first_value = if has_continuation == 1 { base_next + 4 } else { base_next }
-        let base_locals = pipeline_handler_clause_lowering_locals(clause_params, nparams, captures)
-        let body_locals = pipeline_handler_clause_locals_with_continuation(base_locals, continuation, continuation_closure_value)
-        let safe_handlers = pipeline_handler_inline_ctx_out_of_line_safe(pipeline_lower_module_handlers(module))
-        let body_module = pipeline_lower_module_with_handlers(module, safe_handlers)
-        let lower_ctx = pipeline_handler_lower_ctx_from_module(0, body_locals, body_module)
-        let lowered = pipeline_lower_expr_typed_hclause_blocks(body, first_value, lower_ctx)
-        if pipeline_lowered_blocks_is_valid(lowered) == 0 {
-          IrHandlerClauseBodyInvalid(4)
-        } else {
-          IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, pipeline_lowered_blocks_blocks(lowered))
-        }
-      } }
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, pipeline_lowered_blocks_blocks(lowered))
+      }
     }
     UnknownHandlerClause(tag) -> IrHandlerClauseBodyInvalid(5)
   }
@@ -6822,7 +6821,7 @@ fn pipeline_lower_deferred_handler_body_typed(body: Expr, clauses: HandlerClause
   let body_module = pipeline_lower_module_with_handlers(module, body_handlers)
   let body_locals = pipeline_deferred_body_lowering_locals(captures)
   let lower_ctx = pipeline_handler_lower_ctx_from_module(0, body_locals, body_module)
-  let lowered = pipeline_lower_expr_typed_hclause_blocks(body, first_value, lower_ctx)
+  let lowered = pipeline_lower_expr_typed_hclause_blocks(body, first_value, lower_ctx, 0)
   if pipeline_lowered_blocks_is_valid(lowered) == 0 {
     IrDeferredHandlerBodyInvalid(1)
   } else {
@@ -14138,7 +14137,16 @@ fn pipeline_expr_result_is_borrowed_with_ctx_typed(expr: Expr, src: i64, fns: i6
       }
     }
     Block(first, rest) -> pipeline_expr_result_is_borrowed_with_ctx_typed(rest, src, fns, subst, tt)
-    Let(ns, nl, value, body) -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt)
+    -- An immutable binding of an OWNED init transfers that count when
+    -- the binding itself is the final result (scope lowering skips its
+    -- release). Classifying that case as borrowed made an enclosing
+    -- mixed if/match add another arm-normalisation retain. Keep
+    -- borrowed inits and let-mut conservative: their binding retain or
+    -- later slot contents are not proven here.
+    Let(ns, nl, value, body) -> {
+      if pipeline_expr_final_returns_binding_typed(body, src, ns, nl) == 1 and pipeline_expr_result_is_borrowed_with_ctx_typed(value, src, fns, subst, tt) == 0 { 0 }
+      else { pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt) }
+    }
     LetMut(ns, nl, value, body) -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt)
     LetTyped(inner, ann_type) -> pipeline_expr_result_is_borrowed_with_ctx_typed(inner, src, fns, subst, tt)
     If(cond, then_expr, else_expr) -> {
@@ -14151,6 +14159,8 @@ fn pipeline_expr_result_is_borrowed_with_ctx_typed(expr: Expr, src: i64, fns: i6
       else { pipeline_match_arms_result_is_borrowed_with_ctx_typed(arms, src, fns, subst, tt) }
     }
     Defer(cleanup, body) -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt)
+    Resume(value) -> pipeline_expr_result_is_borrowed_with_ctx_typed(value, src, fns, subst, tt)
+    Handle(body, clauses) -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt)
     _ -> 0
   }
 }
@@ -14192,6 +14202,8 @@ fn pipeline_expr_result_is_any_param_borrow_typed(expr: Expr, params: i64, src: 
     }
     Match(scrutinee, arms) -> pipeline_match_arms_result_is_any_param_borrow_typed(arms, params, src)
     Defer(cleanup, body) -> pipeline_expr_result_is_any_param_borrow_typed(body, params, src)
+    Resume(value) -> pipeline_expr_result_is_any_param_borrow_typed(value, params, src)
+    Handle(body, clauses) -> pipeline_expr_result_is_any_param_borrow_typed(body, params, src)
     _ -> 0
   }
 }
@@ -14923,7 +14935,7 @@ fn pipeline_lower_if_expr_typed_hclause_blocks(cond_expr: Expr, then_expr: Expr,
   }
 }
 
-fn pipeline_lower_expr_typed_hclause_blocks(body_expr: Expr, next_value: i64, lower_ctx: PipelineHandlerLowerCtx) -> PipelineLoweredBlocks {
+fn pipeline_lower_expr_typed_hclause_blocks(body_expr: Expr, next_value: i64, lower_ctx: PipelineHandlerLowerCtx, return_ty: i64) -> PipelineLoweredBlocks {
   let locals = pipeline_handler_lower_ctx_locals(lower_ctx)
   let module = pipeline_handler_lower_ctx_module(lower_ctx)
   let return_block = 1
@@ -14932,12 +14944,21 @@ fn pipeline_lower_expr_typed_hclause_blocks(body_expr: Expr, next_value: i64, lo
     if pipeline_lowered_blocks_falls_through(lowered) == 1 {
       let return_value = pipeline_lowered_blocks_next_value(lowered)
       let return_params = ir_value_list_prepend(return_value, ir_value_list_empty())
-      let return_node = ir_block_new_params(return_block, return_params, ir_inst_list_empty(), ir_term_return(return_value))
+      let transfer = pipeline_lower_return_transfer_typed_with_ty(
+        body_expr,
+        return_value,
+        return_value + 1,
+        pipeline_handler_lower_ctx_params(lower_ctx),
+        locals,
+        module,
+        return_ty
+      )
+      let return_node = ir_block_new_params(return_block, return_params, ir_lowered_expr_insts(transfer), ir_term_return(ir_lowered_expr_value(transfer)))
       let blocks = ir_block_list_append(
         pipeline_lowered_blocks_blocks(lowered),
         ir_block_list_prepend(return_node, ir_block_list_empty())
       )
-      pipeline_lowered_blocks_control(pipeline_lowered_blocks_next_block(lowered), return_value + 1, blocks, 1, 0)
+      pipeline_lowered_blocks_control(pipeline_lowered_blocks_next_block(lowered), ir_lowered_expr_next_value(transfer), blocks, 1, 0)
     } else {
       lowered
     }
@@ -19423,38 +19444,25 @@ fn pipeline_ir_native_move_call_args(code: i64, args: IrValueList, index: i64, p
   }
 }
 
-fn pipeline_handler_clause_param_unmanaged(param: Param) -> i64 {
-  match param {
-    Param(ns, nl, ty, label) -> {
-      if cg_ty_is_managed(type_expr_to_node(ty)) == 1 { 0 } else { 1 }
-    }
-    UnknownParam(tag) -> 0
-  }
-}
-
-fn pipeline_handler_clause_params_unmanaged(params: ParamList) -> i64 {
-  match params {
-    ParamListNil -> 1
-    ParamListCons(param, rest) -> {
-      if pipeline_handler_clause_param_unmanaged(param) == 1 {
-        pipeline_handler_clause_params_unmanaged(rest)
-      } else { 0 }
-    }
-  }
-}
-
-fn pipeline_handler_clause_lowering_params(params: ParamList, index: i64, value_base: i64, locals: PipelineValueEnv) -> PipelineValueEnv {
+fn pipeline_handler_clause_lowering_params(params: ParamList, expected_params: i64, index: i64, value_base: i64, locals: PipelineValueEnv) -> PipelineValueEnv {
   match params {
     ParamListNil -> locals
     ParamListCons(param, rest) -> {
       match param {
         Param(ns, nl, ty, label) -> {
-          let type_node = type_expr_to_node(ty)
+          -- Clause bindings are syntactically aliases, so their parser
+          -- nodes carry no useful annotation. The effect declaration is
+          -- the semantic producer for their lowering type.
+          let declared_type_node = type_expr_to_node(ty)
+          let expected_type_node = if expected_params != 0 and index < nlist_len(expected_params) {
+            node_f3(nlist_get(expected_params, index))
+          } else { 0 }
+          let type_node = if expected_type_node != 0 { expected_type_node } else { declared_type_node }
           let type_hash = if type_node == 0 { 0 } else { type_hash_of(type_node) }
-          let float_prim = type_expr_prim_id_or(ty, 0)
-          pipeline_handler_clause_lowering_params(rest, index + 1, value_base, pipeline_value_env_push_float_typed_node(locals, ns, nl, value_base + index, float_prim, type_hash, type_node))
+          let float_prim = pipeline_type_node_prim_id_or(type_node, 0)
+          pipeline_handler_clause_lowering_params(rest, expected_params, index + 1, value_base, pipeline_value_env_push_float_typed_node(locals, ns, nl, value_base + index, float_prim, type_hash, type_node))
         }
-        UnknownParam(tag) -> pipeline_handler_clause_lowering_params(rest, index + 1, value_base, locals)
+        UnknownParam(tag) -> pipeline_handler_clause_lowering_params(rest, expected_params, index + 1, value_base, locals)
       }
     }
   }
