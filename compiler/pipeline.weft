@@ -12212,6 +12212,84 @@ fn pipeline_clause_inline_expr_closed(expr: Expr, params: ParamList, src: i64, f
   }
 }
 
+fn pipeline_effect_atoms_contains_hash(atoms: EffectAtomList, eff_hash: i64) -> i64 {
+  match atoms {
+    EffectAtomListNil -> 0
+    EffectAtomListCons(hash, rest) -> if hash == eff_hash { 1 } else { pipeline_effect_atoms_contains_hash(rest, eff_hash) }
+  }
+}
+
+-- 1 when the callee provably cannot perform eff_hash: a pure signature,
+-- or a concrete effect set (no tail variable) that does not mention it.
+fn pipeline_fn_effects_exclude_hash(fn_wrap: i64, eff_hash: i64) -> i64 {
+  let sig = effect_sig_from_node(fn_effects(fn_wrap))
+  match sig {
+    MissingEffectSig -> 1
+    EffectSig(effects, tail_var) -> {
+      if tail_var != 0 { 0 }
+      else { if pipeline_effect_atoms_contains_hash(effects, eff_hash) == 1 { 0 } else { 1 } }
+    }
+  }
+}
+
+-- Splicing a clause tail at the perform site is only sound when the tail
+-- cannot perform the handler's OWN label: a spliced perform lowers in the
+-- handle-body context where the handler's own frame is innermost, so a
+-- same-label perform that falls to dynamic dispatch re-enters the very
+-- clause being spliced (the under/evidence-masking trap; observed as a
+-- doubled resume expression). Conservative: any direct same-label
+-- perform, any call whose effect signature may include the label (or has
+-- a tail variable), or any shape we cannot see through, blocks the
+-- splice — the perform then keeps its dynamic lowering, whose clause
+-- call masks the handler's own frame.
+fn pipeline_clause_tail_may_perform_hash(expr: Expr, src: i64, eff_hash: i64, fns: i64) -> i64 {
+  match expr {
+    IntLit(value, start, len) -> 0
+    BoolLit(value) -> 0
+    NilExpr -> 0
+    FloatLit(start, len) -> 0
+    Ident(ns, nl) -> 0
+    Not(operand) -> pipeline_clause_tail_may_perform_hash(operand, src, eff_hash, fns)
+    BinOp(op, lhs, rhs) -> {
+      if pipeline_clause_tail_may_perform_hash(lhs, src, eff_hash, fns) == 1 { 1 }
+      else { pipeline_clause_tail_may_perform_hash(rhs, src, eff_hash, fns) }
+    }
+    Block(first, rest) -> {
+      if pipeline_clause_tail_may_perform_hash(first, src, eff_hash, fns) == 1 { 1 }
+      else { pipeline_clause_tail_may_perform_hash(rest, src, eff_hash, fns) }
+    }
+    LetTyped(inner, ann_type) -> pipeline_clause_tail_may_perform_hash(inner, src, eff_hash, fns)
+    Lambda(lambda_params, lambda_body) -> pipeline_clause_tail_may_perform_hash(lambda_body, src, eff_hash, fns)
+    Perform(lhs, op_ns, op_nl, args) -> {
+      let own = match lhs {
+        Ident(ns, nl) -> if effect_name_hash(src, ns, nl) == eff_hash { 1 } else { 0 }
+        _ -> 1
+      }
+      if own == 1 { 1 } else { pipeline_clause_tail_list_may_perform_hash(args, src, eff_hash, fns) }
+    }
+    Call(ns, nl, args) -> {
+      let callee_hash = str_hash(src, ns, nl)
+      let callee_safe = if pipeline_ir_native_intrinsic_kind(callee_hash) != 0 { 1 }
+        else {
+          let pair = pipeline_fns_lookup_pair_by_hash(fns, callee_hash)
+          if pair == 0 { 0 } else { pipeline_fn_effects_exclude_hash(node_f1(pair), eff_hash) }
+        }
+      if callee_safe == 0 { 1 } else { pipeline_clause_tail_list_may_perform_hash(args, src, eff_hash, fns) }
+    }
+    _ -> 1
+  }
+}
+
+fn pipeline_clause_tail_list_may_perform_hash(exprs: ExprList, src: i64, eff_hash: i64, fns: i64) -> i64 {
+  match exprs {
+    ExprListNil -> 0
+    ExprListCons(expr, rest) -> {
+      if pipeline_clause_tail_may_perform_hash(expr, src, eff_hash, fns) == 1 { 1 }
+      else { pipeline_clause_tail_list_may_perform_hash(rest, src, eff_hash, fns) }
+    }
+  }
+}
+
 fn pipeline_handler_inline_try_tail_resume(handlers: PipelineHandlerInlineCtx, found: PipelineHandlerInlineMatch, arg_values: IrValueList, tt: i64, fns: i64, next_value: i64) -> IrLoweredExpr {
   if pipeline_handler_inline_match_found(found) == 0 {
     ir_lowered_expr_invalid(next_value)
@@ -12232,6 +12310,8 @@ fn pipeline_handler_inline_try_tail_resume(handlers: PipelineHandlerInlineCtx, f
                 HandlerClause(name, clause_params, body, cont) -> {
                   if pipeline_clause_inline_expr_closed(tail, clause_params, clause_src, fns) == 0 {
                     ir_lowered_expr_invalid(next_value)
+                  } else { if pipeline_clause_tail_may_perform_hash(tail, clause_src, eff_hash, fns) == 1 {
+                    ir_lowered_expr_invalid(next_value)
                   } else {
                     let param_nodes = param_list_to_nodes(clause_params)
                     if nlist_len(param_nodes) != ir_value_list_len(arg_values) {
@@ -12241,7 +12321,7 @@ fn pipeline_handler_inline_try_tail_resume(handlers: PipelineHandlerInlineCtx, f
                       let sub_ctx = pipeline_handler_lower_ctx_with_fns_subst(0, clause_env, clause_src, tt, outer, fns, 0)
                       pipeline_lower_expr_typed_sidecar_handler_ctx(tail, next_value, sub_ctx)
                     }
-                  }
+                  } }
                 }
                 UnknownHandlerClause(tag) -> ir_lowered_expr_invalid(next_value)
               }
@@ -20478,8 +20558,21 @@ fn pipeline_ir_native_emit_direct(code: i64, dst: i64, handler_depth: i64, claus
           let ops_phys = pipeline_ir_native_load_reg(code, pinned, ops_ctr)
           bu32(code, cg_ldr(0, ops_phys, clause_index * handler_ops_entry_size() + handler_ops_env_ptr_offset()))
         }
+        -- Mask the handler's own frame during the clause call (same
+        -- contract as pipeline_ir_native_emit_masked_clause_call): a
+        -- dynamic perform inside the clause must not find this frame,
+        -- or a clause performing its own label re-enters itself. The
+        -- statically known frame register gives prev without the
+        -- runtime-state slot.
+        let frame_phys = pipeline_ir_native_load_reg(code, pinned, frame_ctr)
+        bu32(code, cg_ldr(15, frame_phys, handler_frame_prev_offset()))
+        bu32(code, encode_sub_imm(31, 31, 16))
+        bu32(code, encode_str(27, 31, 0))
+        bu32(code, encode_add_imm(27, 15, 0))
         let cur = buf_len(code)
         bu32(code, encode_bl(clause_start - cur))
+        bu32(code, encode_ldr(27, 31, 0))
+        bu32(code, encode_add_imm(31, 31, 16))
         pipeline_ir_native_store_reg_pinned(code, pinned, dst, 0)
       }
     }
@@ -20554,10 +20647,28 @@ fn pipeline_ir_native_emit_perform(code: i64, dst: i64, effect_hash: i64, op_has
   bu32(code, cg_ldr(9, 13, handler_ops_fn_ptr_offset()))
   bu32(code, cg_ldr(0, 13, handler_ops_env_ptr_offset()))
   pipeline_ir_native_move_args(code, args, 0, pinned)
-  bu32(code, encode_blr(9))
+  pipeline_ir_native_emit_masked_clause_call(code)
   pipeline_ir_native_store_reg_pinned(code, pinned, dst, 0)
   cg_patch_b(code, deferred_done_pos, buf_len(code))
   }
+}
+
+-- Call the clause (fn ptr in x9, args staged) with the found handler's
+-- own frame masked out of the dispatch context: handler_find_entry
+-- stashed the found frame's prev in runtime state, and the clause runs
+-- with x27 = that prev so a clause performing an effect of its OWN
+-- label dispatches to the enclosing handler instead of re-entering
+-- itself (unbounded self-recursion otherwise). x27 is saved across the
+-- call on the stack; sp is adjusted only around the BLR, after all arg
+-- staging, so spill-slot offsets are unaffected.
+fn pipeline_ir_native_emit_masked_clause_call(code: i64) -> i64 {
+  bu32(code, cg_ldr(15, 28, runtime_state_dispatch_prev_offset()))
+  bu32(code, encode_sub_imm(31, 31, 16))
+  bu32(code, encode_str(27, 31, 0))
+  bu32(code, encode_add_imm(27, 15, 0))
+  bu32(code, encode_blr(9))
+  bu32(code, encode_ldr(27, 31, 0))
+  bu32(code, encode_add_imm(31, 31, 16))
 }
 
 fn pipeline_ir_native_emit_mem_load_sized_result(code: i64) -> i64 {
@@ -22086,7 +22197,7 @@ fn pipeline_ir_native_emit_try(code: i64, dst: i64, value: i64, fm: i64, pinned:
   bu32(code, cg_ldr(0, 13, 16))
   bu32(code, cg_ldr(17, result_phys, 8))
   bu32(code, encode_add_imm(1, 17, 0))
-  bu32(code, encode_blr(9))
+  pipeline_ir_native_emit_masked_clause_call(code)
   pipeline_ir_native_store_reg_pinned(code, pinned, dst, 0)
   let after = buf_len(code)
   bytes_set_u32(code, bne_pos, encode_b_cond(err_start - bne_pos, 1))
@@ -22106,7 +22217,7 @@ fn pipeline_ir_native_emit_opt_chain(code: i64, dst: i64, base: i64, field_index
   cg_perform_lookup(code, fm, 210682486643, 6385518581)
   bu32(code, cg_ldr(9, 13, 8))
   bu32(code, cg_ldr(0, 13, 16))
-  bu32(code, encode_blr(9))
+  pipeline_ir_native_emit_masked_clause_call(code)
   pipeline_ir_native_store_reg_pinned(code, pinned, dst, 0)
   let after = buf_len(code)
   cg_patch_cbz(code, cbz_pos, base_phys, nil_start)
