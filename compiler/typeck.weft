@@ -1523,6 +1523,54 @@ fn expr_matches_type_contextual(node: i64, node_ty: i64, target_ty: i64, src: i6
 -- ══════════════════════════════════════════════════════════════
 -- Returns a type pointer (ty_i64(), ty_str(), etc.) or 0 for unknown
 
+-- ══════════════════════════════════════════════════════════════
+-- Guard narrowing (2n): `x != nil` and `x == nil` guards refine the
+-- guarded ident's type in positions the short-circuit contract
+-- (kernel.md §5.3.1) proves conditionally executed:
+--   if x != nil { <x: T> } else { ... }
+--   if x == nil { ... } else { <x: T> }
+--   x != nil and <x: T>
+--   x == nil or <x: T>
+-- Only the NON-nil direction is bound (T <: T | nil, so narrowing can
+-- only accept more programs, never reject working code), and only for
+-- immutable bindings (assignment would invalidate the refinement).
+-- ══════════════════════════════════════════════════════════════
+
+-- The guarded ident node when cond is `x <op> nil` / `nil <op> x` with
+-- the wanted comparison op (5 = ==, 6 = !=); 0 otherwise.
+fn guard_nil_ident(cond: i64, want_op: i64) -> i64 {
+  if node_tag(cond) != 3 { 0 }
+  else { if node_f1(cond) != want_op { 0 }
+  else {
+    let lhs = node_f2(cond)
+    let rhs = node_f3(cond)
+    if node_tag(lhs) == 51 and node_tag(rhs) == 2 { rhs }
+    else { if node_tag(rhs) == 51 and node_tag(lhs) == 2 { lhs } else { 0 } }
+  } }
+}
+
+-- Env for the branch where the guard proves the ident non-nil: shadow
+-- the binding with its nil-free type. Unchanged env when the guard
+-- shape does not apply, the binding is mutable, or nil-free narrowing
+-- would not change the type.
+fn tenv_narrow_guard(env: i64, cond: i64, want_op: i64, src: i64) -> i64 {
+  let ident = guard_nil_ident(cond, want_op)
+  if ident == 0 { env }
+  else {
+    let ns = node_f1(ident)
+    let nl = node_f2(ident)
+    if tenv_lookup_mutable(env, src, ns, nl) == 1 { env }
+    else {
+      let ty = tenv_lookup(env, src, ns, nl)
+      if ty == 0 { env }
+      else {
+        let narrowed = ty_narrow_drop_nil(ty)
+        if narrowed == 0 { env } else { tenv_bind(env, src, ns, nl, narrowed) }
+      }
+    }
+  }
+}
+
 fn synth(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
   let tag = node_tag(node)
   match tag {
@@ -2104,11 +2152,13 @@ fn check_for_iter_collection(node: i64, env: i64, ft: i64, src: i64, tt: i64) -[
 }
 
 fn synth_if(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
-  let then_ty = synth(node_f2(node), env, ft, src, tt)
+  -- Branches synth under the guard-narrowed env so
+  -- `if x != nil { x } else { fallback }` reads T, not T | nil.
+  let then_ty = synth(node_f2(node), tenv_narrow_guard(env, node_f1(node), 6, src), ft, src, tt)
   let else_node = node_f3(node)
   if else_node == 0 { ty_nil() }
   else {
-    let else_ty = synth(else_node, env, ft, src, tt)
+    let else_ty = synth(else_node, tenv_narrow_guard(env, node_f1(node), 5, src), ft, src, tt)
     -- If both branches have the same type, use it
     if ty_eq(then_ty, else_ty) { then_ty }
     else { ty_union(then_ty, else_ty) }
@@ -7135,20 +7185,32 @@ fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) 
     3 -> {
       -- BinOp: check operand types
       errors = errors + check_binop(node, env, ft, src, tt)
-      -- Recursively check sub-expressions
+      -- Recursively check sub-expressions. Short-circuit rhs positions
+      -- see the guard-narrowed env: `x != nil and use(x)` checks use(x)
+      -- with x non-nil, `x == nil or use(x)` likewise (§5.3.1 licenses
+      -- this: the rhs only evaluates when the guard passed/failed).
       errors = errors + check_expr(node_f2(node), env, ft, src, caller_eff, tt)
-      errors = errors + check_expr(node_f3(node), env, ft, src, caller_eff, tt)
+      let op = node_f1(node)
+      let rhs_env = if op == 12 { tenv_narrow_guard(env, node_f2(node), 6, src) }
+        else { if op == 13 { tenv_narrow_guard(env, node_f2(node), 5, src) } else { env } }
+      errors = errors + check_expr(node_f3(node), rhs_env, ft, src, caller_eff, tt)
       errors
     }
     5 -> {
-      -- If: check condition is bool-like, check branches
+      -- If: check condition is bool-like, check branches under the
+      -- guard-narrowed env (then sees `x != nil`, else sees the negation
+      -- of `x == nil`).
       let cond = node_f1(node)
       let then_node = node_f2(node)
       errors = errors + check_expr(cond, env, ft, src, caller_eff, tt)
       errors = errors + check_bool_expr(cond, env, ft, src, tt)
-      errors = errors + check_expr(then_node, env, ft, src, caller_eff, tt)
+      let then_env = tenv_narrow_guard(env, cond, 6, src)
+      errors = errors + check_expr(then_node, then_env, ft, src, caller_eff, tt)
       let else_node = node_f3(node)
-      if else_node != 0 { errors = errors + check_expr(else_node, env, ft, src, caller_eff, tt) } else { errors = errors }
+      if else_node != 0 {
+        let else_env = tenv_narrow_guard(env, cond, 5, src)
+        errors = errors + check_expr(else_node, else_env, ft, src, caller_eff, tt)
+      } else { errors = errors }
       errors
     }
     6 -> {
