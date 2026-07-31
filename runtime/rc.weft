@@ -64,9 +64,16 @@ fn rc_size_word_mask(word: i64) -> i64 { (word bshr 32) band 4294967295 }
 fn rc_finalizer_none() -> i64 { 0 }
 fn rc_finalizer_buffer() -> i64 { 1 }
 fn rc_finalizer_vector() -> i64 { 2 }
+fn rc_finalizer_persistent_region() -> i64 { 3 }
 fn rc_finalizer_shift() -> i64 { 30 }
 fn rc_buffer_payload_size() -> i64 { 24 }
 fn rc_vector_payload_size() -> i64 { 40 }
+fn rc_persistent_region_payload_size() -> i64 { 16 }
+fn rc_persistent_region_arena_next_offset() -> i64 { 32 }
+-- One demand-paged 64 KiB reservation covers the measured 100-element
+-- CHAMP lifetime without a growth mmap; physical pages are committed only
+-- as path copies touch them. Larger families still chain doubling segments.
+fn rc_persistent_region_initial_capacity() -> i64 { 65536 }
 
 fn rc_finalizer_mask(kind: i64) -> i64 {
   kind bshl rc_finalizer_shift()
@@ -79,9 +86,11 @@ fn rc_size_word_finalizer(word: i64) -> i64 {
     kind
   } else { if size == rc_vector_payload_size() and kind == rc_finalizer_vector() {
     kind
+  } else { if size == rc_persistent_region_payload_size() and kind == rc_finalizer_persistent_region() {
+    kind
   } else {
     rc_finalizer_none()
-  } }
+  } } }
 }
 
 fn rc_payload_size(payload: i64) -> i64 {
@@ -494,6 +503,22 @@ fn rc_deep_release_child(child: i64, pending: i64) -> i64 {
   }
 }
 
+fn rc_persistent_region_release_pending(payload: i64, pending_start: i64) -> i64 {
+  let mut pending = pending_start
+  let mut cleanup = __mem_load64(payload + 8)
+  while cleanup != 0 {
+    pending = rc_deep_release_child(__mem_load64(cleanup + 8), pending)
+    cleanup = __mem_load64(cleanup)
+  }
+  let mut arena = __mem_load64(payload)
+  while arena != 0 {
+    let next = __mem_load64(arena + rc_persistent_region_arena_next_offset())
+    arena_free(arena)
+    arena = next
+  }
+  pending
+}
+
 fn rc_deep_release_custom(payload: i64, word: i64, pending_start: i64, heap: i64) -> i64 {
   let kind = rc_size_word_finalizer(word)
   if kind == rc_finalizer_buffer() {
@@ -519,9 +544,11 @@ fn rc_deep_release_custom(payload: i64, word: i64, pending_start: i64, heap: i64
       heap_free(heap, data, cap * elem_size)
     } else { 0 }
     pending
+  } else { if kind == rc_finalizer_persistent_region() {
+    rc_persistent_region_release_pending(payload, pending_start)
   } else {
     pending_start
-  } }
+  } } }
 }
 
 fn rc_deep_release_walk(first: i64) -> i64 {
@@ -643,7 +670,20 @@ fn rc_deep_release_promoted_fields(payload: i64) -> i64 {
     if data != 0 and cap > 0 and elem_size > 0 {
       heap_free(rc_default_heap(), data, cap * elem_size)
     } else { 0 }
+  } else { if finalizer == rc_finalizer_persistent_region() {
+    let mut cleanup = __mem_load64(payload + 8)
+    while cleanup != 0 {
+      rc_default_release(__mem_load64(cleanup + 8))
+      cleanup = __mem_load64(cleanup)
+    }
+    let mut arena = __mem_load64(payload)
+    while arena != 0 {
+      let next = __mem_load64(arena + rc_persistent_region_arena_next_offset())
+      arena_free(arena)
+      arena = next
+    }
   } else { 0 } }
+  }
   if mask == 0 { 0 } else {
     let words = rc_size_word_size(word) / 8
     let limit = if words < 16 { words } else { 16 }
@@ -704,6 +744,87 @@ fn rc_default_alloc_finalized(payload_size: i64, align: i64, finalizer: i64) -> 
   let payload = rc_default_alloc(payload_size, align)
   rc_set_field_mask_word(payload, payload_size, rc_finalizer_mask(finalizer))
   payload
+}
+
+fn rc_persistent_region_alloc_unlocked(region: i64, size: i64, align: i64) -> i64 {
+  let arena = __mem_load64(region)
+  let direct = arena_alloc(arena, size, align)
+  if direct != 0 { direct }
+  else {
+    let old_cap = arena_capacity(arena)
+    let need = alloc_round_up(size, align)
+    let next_cap = if old_cap * 2 > need * 2 { old_cap * 2 } else { need * 2 }
+    let grown = arena_new(next_cap)
+    if grown == 0 {
+      sys_write(2, __str_ptr("weft: persistent collection region growth failed\n"), __str_len("weft: persistent collection region growth failed\n"))
+      sys_exit(70)
+      0
+    } else {
+      __mem_store64(grown + rc_persistent_region_arena_next_offset(), arena)
+      __mem_store64(region, grown)
+      arena_alloc(grown, size, align)
+    }
+  }
+}
+
+fn rc_persistent_region_new() -> rc i64 {
+  let arena = arena_new(rc_persistent_region_initial_capacity())
+  if arena == 0 {
+    sys_write(2, __str_ptr("weft: persistent collection region allocation failed\n"), __str_len("weft: persistent collection region allocation failed\n"))
+    sys_exit(70)
+    rc_null_i64()
+  } else {
+    let owner: rc i64 = rc_default_alloc_finalized(rc_persistent_region_payload_size(), 8, rc_finalizer_persistent_region())
+    let raw: i64 = owner
+    __mem_store64(raw, arena)
+    __mem_store64(raw + 8, 0)
+    owner
+  }
+}
+
+fn rc_persistent_region_alloc(region: i64, size: i64, align: i64) -> i64 {
+  if rc_is_promoted_raw(region) != 0 {
+    rc_atomic_lock(region)
+    let result = rc_persistent_region_alloc_unlocked(region, size, align)
+    rc_atomic_unlock(region)
+    result
+  } else {
+    rc_persistent_region_alloc_unlocked(region, size, align)
+  }
+}
+
+-- Records one managed-element stake already retained by a persistent
+-- collection chunk. The ledger lives in the same region and is walked
+-- before the region's arenas are unmapped.
+fn rc_persistent_region_register_retained(region: i64, value: i64) -> i64 {
+  if value == 0 { 0 }
+  else { if rc_default_payload_has_magic(value) != 1 { 0 }
+  else {
+    rc_default_promote_maybe(value)
+    if rc_is_promoted_raw(region) != 0 {
+      rc_atomic_lock(region)
+      let cell = rc_persistent_region_alloc_unlocked(region, 16, 8)
+      __mem_store64(cell, __mem_load64(region + 8))
+      __mem_store64(cell + 8, value)
+      __mem_store64(region + 8, cell)
+      rc_atomic_unlock(region)
+    } else {
+      let cell = rc_persistent_region_alloc_unlocked(region, 16, 8)
+      __mem_store64(cell, __mem_load64(region + 8))
+      __mem_store64(cell + 8, value)
+      __mem_store64(region + 8, cell)
+    }
+    value
+  } }
+}
+
+fn rc_persistent_region_retain_managed(region: i64, value: i64) -> i64 {
+  if value == 0 { 0 }
+  else { if rc_default_payload_has_magic(value) != 1 { 0 }
+  else {
+    rc_default_retain(value)
+    rc_persistent_region_register_retained(region, value)
+  } }
 }
 
 -- Ctor-init allocations (variant/record) skip the zero fill: emission
@@ -789,7 +910,26 @@ fn rc_default_weak_load(payload: i64) -> i64 {
 }
 
 fn rc_default_promote(payload: i64) -> i64 {
-  rc_mark_promoted(payload)
+  if payload == 0 { 0 }
+  else {
+    let promoted = rc_mark_promoted(payload)
+    -- Persistent collection boxes are two-word payloads whose second
+    -- field owns a family-region descriptor. Promotion remains O(1):
+    -- mark that one descriptor so later version retains/releases and
+    -- arena reservations take their atomic paths; immutable trie storage
+    -- and managed-element cleanup ledgers are not walked.
+    let word = __mem_load64(rc_header_from_payload(payload) + rc_payload_size_offset())
+    let region = if rc_size_word_size(word) == 16 and rc_size_word_mask(word) == 4 {
+      __mem_load64(payload + 8)
+    } else { 0 }
+    if region != 0 and rc_default_payload_has_magic(region) == 1 {
+      let region_word = __mem_load64(rc_header_from_payload(region) + rc_payload_size_offset())
+      if rc_size_word_finalizer(region_word) == rc_finalizer_persistent_region() {
+        rc_mark_promoted(region)
+      } else { 0 }
+    } else { 0 }
+    promoted
+  }
 }
 
 fn closure_env_count_offset() -> i64 { 0 }
