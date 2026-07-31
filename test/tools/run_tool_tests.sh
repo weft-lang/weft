@@ -256,10 +256,10 @@ assert_contains "check_reports_diagnostics" "$diag_out" "type error: unknown ide
 assert_equals "diagnostic_snapshot_exact" "$diag_out" $'line 1, col 20: type error: unknown identifier\ncheck: 1 functions, 1 errors'
 
 mcp_out=$(printf '%s' '{ "jsonrpc" : "2.0", "id" : 1, "method" : "tools/list" }' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"parse_summary"},{"name":"check_summary"},{"name":"ir_summary"},{"name":"type_lookup"},{"name":"effect_lookup"},{"name":"diagnostics"},{"name":"grammar_parse"},{"name":"grammar_check"},{"name":"grammar_diagnostics"}]}}'
+assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"parse_summary"},{"name":"check_summary"},{"name":"ir_summary"},{"name":"type_lookup"},{"name":"effect_lookup"},{"name":"diagnostics"},{"name":"grammar_parse"},{"name":"grammar_check"},{"name":"grammar_diagnostics"},{"name":"opt_counters"}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/list","meta":[true,null,1,-2.5,3e4,{"x":"y"}]}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_nested_extra_json_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"parse_summary"},{"name":"check_summary"},{"name":"ir_summary"},{"name":"type_lookup"},{"name":"effect_lookup"},{"name":"diagnostics"},{"name":"grammar_parse"},{"name":"grammar_check"},{"name":"grammar_diagnostics"}]}}'
+assert_equals "mcp_nested_extra_json_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"parse_summary"},{"name":"check_summary"},{"name":"ir_summary"},{"name":"type_lookup"},{"name":"effect_lookup"},{"name":"diagnostics"},{"name":"grammar_parse"},{"name":"grammar_check"},{"name":"grammar_diagnostics"},{"name":"opt_counters"}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"parse_summary","arguments":{"source" : "fn main() -> i64 { 42 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_parse_summary_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"parse_summary","ok":true,"functions":1,"first_body_tag":1}}'
@@ -766,6 +766,27 @@ assert_equals "mcp_type_lookup_invalid_source_json_only_snapshot" "$mcp_out" '{"
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"effect_lookup","arguments":{"source":"effect Log { fn hit() -> i64 } fn main() -> i64 { missing }","name":"Log"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_effect_lookup_invalid_source_json_only_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"effect_lookup","ok":true,"name":"Log","found":true,"kind":"effect","ops":1,"first_op":"hit","first_op_params":0,"first_op_return_type_tag":2,"first_op_return_type_prim":0,"first_op_deferred":0}}'
+
+# opt_counters: full optimise + native-lower pipeline counter report
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"fn add(a: i64, b: i64) -> i64 { a + b }\nfn main() -> i64 { add(1, 2) }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_opt_counters_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"opt_counters","ok":true,"handler_inline_sites":0,"handler_residual_sites":0,"handler_evidence_candidate_sites":0,"const_fold_sites":0,"algebraic_fold_sites":0,"dead_inst_sites":0,"pure_call_dce_sites":0,"match_final_arm_elision_sites":0,"block_entry_narrowing_sites":0,"direct_call_inline_sites":1,"functions":2,"insts":6,"sp_load":0,"sp_store":0,"sp_pair_load":7,"sp_pair_store":7,"sp_fp_pair_load":0,"sp_fp_pair_store":0,"rc_elision":0,"rc_borrowable_param_facts":0,"managed_drop_specializations":0,"managed_reuse_candidates":0,"managed_reuse_lowerings":0,"static_pair_slots":0,"static_pair_sites":0,"alloc_elisions":0,"fusions":0,"vector_bounds_elisions":0,"vector_full_bounds_elisions":0,"vector_scaled_addrs":0,"vector_push_no_grows":0,"param_residents":0,"volatile_residents":0,"fp_residents":0,"register_pinned":0,"pinned_slots":0,"loop_pinned_slots":0,"cs_residents":0,"bank_swaps":0,"typed_lowering_failures":0,"residency_audit_violations":0}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"fn main() -> i64 { nope() }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_opt_counters_check_error_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"opt_counters","ok":false,"reason":"check errors"}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_opt_counters_missing_source_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"missing source"}}'
+
+# JSON \uXXXX escapes are mandatory spec syntax: BMP escape decodes into
+# source bytes, surrogate pairs decode to 4-byte UTF-8, invalid hex rejects.
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"check_summary","arguments":{"source":"\u0066n main() -> i64 { 42 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_json_unicode_escape_bmp_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"check_summary","ok":true,"functions":1,"first_body_tag":1}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"parse_summary","arguments":{"source":"-- \ud83d\ude00\nfn main() -> i64 { 42 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_json_unicode_escape_surrogate_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"parse_summary","ok":true,"functions":1,"first_body_tag":1}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"check_summary","arguments":{"source":"fn main() -> i64 { \uZZZZ }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_json_unicode_escape_invalid_hex_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"invalid json-rpc"}}'
 
 lsp_init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 lsp_out=$(lsp_frame "$lsp_init" | "$WEFT" lsp 2>&1)
