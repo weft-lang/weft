@@ -49,7 +49,9 @@ import time
 
 ZOO_CASES = ["sieve", "vector_sort", "graph_reach", "mandelbrot", "nbody", "sorted_lookup"]
 TOOL_WORKLOADS = ["self_compile", "check_tree", "fmt_tree", "test_runner", "mcp_roundtrip"]
-DEFAULT_WORKLOADS = ZOO_CASES + ["self_compile"]
+# §3.12(a): the real-program workloads are pinned into the default paired
+# set so optimizer tuning stops being fit to the integer zoo alone.
+DEFAULT_WORKLOADS = ZOO_CASES + TOOL_WORKLOADS
 
 # Verdict thresholds. The sign test answers "is B consistently on one side of
 # A"; the floor keeps a consistent-but-small drift from being called a result.
@@ -281,17 +283,21 @@ def make_workload(name):
 
 
 class SelfCompile(CompilerCmd):
+    # The source path must stay repo-relative: the transitional trust ring
+    # classifies trusted sources by relative path root (compiler/...), so
+    # an absolute path fails the sealed-trust check.
     def __init__(self):
-        super().__init__("self_compile", ["compile", os.path.join(REPO, "compiler", "main.weft")])
+        super().__init__("self_compile", ["compile", "compiler/main.weft"])
 
     def sample(self, side):
         # discard the emitted binary; time the compile itself
         compiler = self.compilers[side]
         start = time.perf_counter_ns()
         result = subprocess.run(
-            [compiler, "compile", os.path.join(REPO, "compiler", "main.weft")],
+            [compiler, "compile", "compiler/main.weft"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            cwd=REPO,
         )
         elapsed_ms = (time.perf_counter_ns() - start) / 1e6
         if result.returncode != 0:
