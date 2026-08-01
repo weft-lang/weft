@@ -1,0 +1,354 @@
+-- test/alloc_checker_generator_metrics.weft -- 2v Stage 0 deterministic
+-- SSA function generator. Enumeration/counter-based (no RNG — §3.11),
+-- test-tier only: each family builds a Weft source module shaped to
+-- stress the allocator (register pressure across calls, deep loops,
+-- if/else diamonds that become block params under mem2reg, f64/GPR pool
+-- mixes, live-across-call values, arity spread), compiles it through the
+-- audited pipeline, and gates on the allocation checker: ZERO violations
+-- and a checked-read floor high enough that a vacuous module (generator
+-- emitting garbage the checker never sees) cannot pass. Generated
+-- functions are emitted but never executed (same discipline as the
+-- probe programs in alloc_checker_metrics.weft), so shapes are chosen
+-- for emission stress, not runtime cost.
+
+use "compiler/codegen.weft"
+use "compiler/typeck.weft"
+use "compiler/macho.weft"
+use "compiler/object.weft"
+use "compiler/ir.weft"
+use "compiler/grammar.weft"
+use "compiler/pipeline.weft"
+
+-- Decimal writer into the source buffer (non-negative only).
+fn ckg_i(b: i64, n: i64) -> i64 {
+  if n < 10 { bu8(b, 48 + n) } else {
+    ckg_i(b, n / 10)
+    bu8(b, 48 + n - n / 10 * 10)
+  }
+  0
+}
+
+fn ckg_var(b: i64, prefix: str, i: i64) -> i64 {
+  bstr(b, prefix)
+  ckg_i(b, i)
+  0
+}
+
+-- Shared recursive helper: multi-call recursion resists inlining, so
+-- call sites in generated functions stay real calls (clobber points).
+fn ckg_prelude(b: i64) -> i64 {
+  bstr(b, "fn ghelp(x: i64) -> i64 { if x < 2 { 1 } else { ghelp(x - 1) + ghelp(x - 2) * 3 } }\n")
+  0
+}
+
+fn ckg_main(b: i64) -> i64 {
+  bstr(b, "fn main() -> i64 { 0 }\n")
+  0
+}
+
+fn ckg_native(b: i64) -> NativeModule {
+  let typed = pipeline_check_source_with_origin(buf_ptr(b), buf_len(b), 1, 0)
+  let ir = pipeline_lower_ir(typed)
+  let optimised = pipeline_optimise_typed_ir(typed, ir)
+  pipeline_lower_native_module_with_audit(typed, optimised, 1)
+}
+
+-- Floors sit at roughly half the current deterministic checked counts
+-- (pressure 589, loops 86, diamonds 229, f64 64, call-loop 112, arity
+-- 39, combined 159 at introduction): low enough to survive optimizer
+-- evolution shifting read counts, high enough that a vacuous module
+-- (generator emitting source the pipeline rejects or never checks)
+-- cannot pass.
+fn ckg_floor(count: i64, floor: i64) -> i64 {
+  if count > floor { 1 } else { 0 }
+}
+
+-- Family P: k chained values, ALL live across a recursive call, all
+-- consumed after it. k crosses the identity-home boundary (values 0-7
+-- get x19-x26, 8+ spill) and runs past the volatile pool.
+fn ckg_pressure_fn(b: i64, k: i64) -> i64 {
+  bstr(b, "fn gp")
+  ckg_i(b, k)
+  bstr(b, "(a: i64, c: i64) -> i64 {\n")
+  bstr(b, "let v0 = a * 1 + c\n")
+  for i in 1..k {
+    ckg_var(b, "let v", i)
+    bstr(b, " = a * ")
+    ckg_i(b, i + 1)
+    ckg_var(b, " + v", i - 1)
+    bstr(b, "\n")
+  }
+  bstr(b, "let m = ghelp(a + c)\n")
+  bstr(b, "v0")
+  for i in 1..k {
+    ckg_var(b, " + v", i)
+  }
+  bstr(b, " + m\n}\n")
+  0
+}
+
+-- Family L: while nests of depth d. Each level's counter bounds the
+-- next level and stays live across it; conditions use `and` so the
+-- short-circuit lowering path is exercised at every depth.
+fn ckg_loops_level(b: i64, lv: i64, d: i64) -> i64 {
+  ckg_var(b, "let mut i", lv)
+  bstr(b, " = 0\n")
+  ckg_var(b, "while i", lv)
+  if lv == 0 { bstr(b, " < a") } else {
+    bstr(b, " < i")
+    ckg_i(b, lv - 1)
+  }
+  bstr(b, " and acc >= 0 {\n")
+  bstr(b, "acc = acc + i")
+  ckg_i(b, lv)
+  bstr(b, " * ")
+  ckg_i(b, lv + 2)
+  bstr(b, " + a\n")
+  if lv + 1 < d { ckg_loops_level(b, lv + 1, d) } else { 0 }
+  ckg_var(b, "i", lv)
+  bstr(b, " = i")
+  ckg_i(b, lv)
+  bstr(b, " + 1\n}\n")
+  0
+}
+
+fn ckg_loops_fn(b: i64, d: i64) -> i64 {
+  bstr(b, "fn gl")
+  ckg_i(b, d)
+  bstr(b, "(a: i64, c: i64) -> i64 {\n")
+  bstr(b, "let mut acc = c\n")
+  ckg_loops_level(b, 0, d)
+  bstr(b, "acc + i0\n}\n")
+  0
+}
+
+-- Family D: c chained if/else diamonds over mutable locals (mem2reg
+-- turns each join into block params); every diamond output feeds the
+-- next and all stay live to the final sum.
+fn ckg_diamond_fn(b: i64, c: i64) -> i64 {
+  bstr(b, "fn gd")
+  ckg_i(b, c)
+  bstr(b, "(a: i64, c: i64) -> i64 {\n")
+  bstr(b, "let mut x0 = a\n")
+  bstr(b, "if a > 0 { x0 = x0 * 3 + c } else { x0 = x0 + 5 * c }\n")
+  for i in 1..c {
+    ckg_var(b, "let mut x", i)
+    ckg_var(b, " = x", i - 1)
+    bstr(b, " + a\n")
+    bstr(b, "if a > ")
+    ckg_i(b, i)
+    ckg_var(b, " { x", i)
+    ckg_var(b, " = x", i)
+    ckg_var(b, " * 2 + x", i - 1)
+    ckg_var(b, " } else { x", i)
+    ckg_var(b, " = x", i)
+    ckg_var(b, " - x", i - 1)
+    bstr(b, " }\n")
+  }
+  bstr(b, "x0")
+  for i in 1..c {
+    ckg_var(b, " + x", i)
+  }
+  bstr(b, " + a + c\n}\n")
+  0
+}
+
+-- Family F: n chained f64 accumulators in a loop beside i64 values that
+-- live across both the FP loop and a call (FP pools + GPR pools + call
+-- clobbers interacting).
+fn ckg_f64_fn(b: i64, n: i64) -> i64 {
+  bstr(b, "fn gf")
+  ckg_i(b, n)
+  bstr(b, "(a: i64, c: i64) -> i64 {\n")
+  for j in 0..n {
+    ckg_var(b, "let mut f", j)
+    bstr(b, " = ")
+    ckg_i(b, j)
+    bstr(b, ".5\n")
+  }
+  bstr(b, "let k0 = a * 3 + c\n")
+  bstr(b, "let mut i = 0\n")
+  bstr(b, "while i < a {\n")
+  bstr(b, "f0 = f0 * 0.5 + 1.5\n")
+  for j in 1..n {
+    ckg_var(b, "f", j)
+    ckg_var(b, " = f", j)
+    ckg_var(b, " + f", j - 1)
+    bstr(b, " * 2.0\n")
+  }
+  bstr(b, "i = i + 1\n}\n")
+  bstr(b, "let k1 = ghelp(k0)\n")
+  bstr(b, "if f0 > f")
+  ckg_i(b, n - 1)
+  bstr(b, " { k0 + k1 } else { k0 - k1 + i }\n}\n")
+  0
+}
+
+-- Family C: v precomputed values live across a loop whose body calls
+-- the recursive helper every iteration.
+fn ckg_call_loop_fn(b: i64, v: i64) -> i64 {
+  bstr(b, "fn gc")
+  ckg_i(b, v)
+  bstr(b, "(a: i64, c: i64) -> i64 {\n")
+  for j in 0..v {
+    ckg_var(b, "let p", j)
+    bstr(b, " = a * ")
+    ckg_i(b, j * 6 + 7)
+    bstr(b, " + c\n")
+  }
+  bstr(b, "let mut s = 0\n")
+  bstr(b, "let mut i = 0\n")
+  bstr(b, "while i < a {\n")
+  bstr(b, "s = s + ghelp(i + p0)\n")
+  bstr(b, "i = i + 1\n}\n")
+  bstr(b, "s")
+  for j in 0..v {
+    ckg_var(b, " + p", j)
+  }
+  bstr(b, "\n}\n")
+  0
+}
+
+-- Family A: arity spread — p params all live across a call.
+fn ckg_arity_fn(b: i64, p: i64) -> i64 {
+  bstr(b, "fn ga")
+  ckg_i(b, p)
+  bstr(b, "(q0: i64")
+  for j in 1..p {
+    ckg_var(b, ", q", j)
+    bstr(b, ": i64")
+  }
+  bstr(b, ") -> i64 {\n")
+  bstr(b, "let m = ghelp(q0)\n")
+  bstr(b, "q0")
+  for j in 1..p {
+    ckg_var(b, " + q", j)
+  }
+  bstr(b, " + m\n}\n")
+  0
+}
+
+-- Family X: everything at once — pressure across a call, a depth-2
+-- while nest with an in-loop call, a diamond join, and f64 accumulators.
+fn ckg_combined_fn(b: i64, k: i64) -> i64 {
+  bstr(b, "fn gx")
+  ckg_i(b, k)
+  bstr(b, "(a: i64, c: i64) -> i64 {\n")
+  bstr(b, "let v0 = a * 1 + c\n")
+  for i in 1..k {
+    ckg_var(b, "let v", i)
+    bstr(b, " = a * ")
+    ckg_i(b, i + 1)
+    ckg_var(b, " + v", i - 1)
+    bstr(b, "\n")
+  }
+  bstr(b, "let mut fa = 1.5\n")
+  bstr(b, "let mut acc = c\n")
+  bstr(b, "let mut i0 = 0\n")
+  bstr(b, "while i0 < a and acc >= 0 {\n")
+  bstr(b, "let mut i1 = 0\n")
+  bstr(b, "while i1 < i0 and acc < 1000000 {\n")
+  bstr(b, "acc = acc + ghelp(i1 + v0)\n")
+  bstr(b, "fa = fa * 0.5 + 1.5\n")
+  bstr(b, "i1 = i1 + 1\n}\n")
+  bstr(b, "i0 = i0 + 1\n}\n")
+  bstr(b, "let mut y = acc\n")
+  bstr(b, "if fa > 2.5 { y = y * 3 + v0 } else { y = y + v1 }\n")
+  bstr(b, "y")
+  for i in 0..k {
+    ckg_var(b, " + v", i)
+  }
+  bstr(b, " + i0\n}\n")
+  0
+}
+
+test "ckg_pressure_family_checker_clean" {
+  let b = buf_new(16384)
+  ckg_prelude(b)
+  ckg_pressure_fn(b, 4)
+  ckg_pressure_fn(b, 8)
+  ckg_pressure_fn(b, 12)
+  ckg_pressure_fn(b, 16)
+  ckg_pressure_fn(b, 24)
+  ckg_pressure_fn(b, 32)
+  ckg_main(b)
+  let native = ckg_native(b)
+  Test.assert_eq(pipeline_native_ck_violation_count(native), 0)
+  Test.assert_eq(ckg_floor(pipeline_native_ck_checked_count(native), 100), 1)
+}
+
+test "ckg_loop_family_checker_clean" {
+  let b = buf_new(16384)
+  ckg_prelude(b)
+  ckg_loops_fn(b, 1)
+  ckg_loops_fn(b, 2)
+  ckg_loops_fn(b, 3)
+  ckg_loops_fn(b, 4)
+  ckg_main(b)
+  let native = ckg_native(b)
+  Test.assert_eq(pipeline_native_ck_violation_count(native), 0)
+  Test.assert_eq(ckg_floor(pipeline_native_ck_checked_count(native), 40), 1)
+}
+
+test "ckg_diamond_family_checker_clean" {
+  let b = buf_new(16384)
+  ckg_prelude(b)
+  ckg_diamond_fn(b, 1)
+  ckg_diamond_fn(b, 2)
+  ckg_diamond_fn(b, 4)
+  ckg_diamond_fn(b, 6)
+  ckg_diamond_fn(b, 9)
+  ckg_main(b)
+  let native = ckg_native(b)
+  Test.assert_eq(pipeline_native_ck_violation_count(native), 0)
+  Test.assert_eq(ckg_floor(pipeline_native_ck_checked_count(native), 40), 1)
+}
+
+test "ckg_f64_family_checker_clean" {
+  let b = buf_new(16384)
+  ckg_prelude(b)
+  ckg_f64_fn(b, 1)
+  ckg_f64_fn(b, 2)
+  ckg_f64_fn(b, 3)
+  ckg_f64_fn(b, 5)
+  ckg_main(b)
+  let native = ckg_native(b)
+  Test.assert_eq(pipeline_native_ck_violation_count(native), 0)
+  Test.assert_eq(ckg_floor(pipeline_native_ck_checked_count(native), 20), 1)
+}
+
+test "ckg_call_loop_family_checker_clean" {
+  let b = buf_new(16384)
+  ckg_prelude(b)
+  ckg_call_loop_fn(b, 1)
+  ckg_call_loop_fn(b, 2)
+  ckg_call_loop_fn(b, 4)
+  ckg_call_loop_fn(b, 8)
+  ckg_main(b)
+  let native = ckg_native(b)
+  Test.assert_eq(pipeline_native_ck_violation_count(native), 0)
+  Test.assert_eq(ckg_floor(pipeline_native_ck_checked_count(native), 40), 1)
+}
+
+test "ckg_arity_family_checker_clean" {
+  let b = buf_new(16384)
+  ckg_prelude(b)
+  ckg_arity_fn(b, 1)
+  ckg_arity_fn(b, 3)
+  ckg_arity_fn(b, 6)
+  ckg_main(b)
+  let native = ckg_native(b)
+  Test.assert_eq(pipeline_native_ck_violation_count(native), 0)
+  Test.assert_eq(ckg_floor(pipeline_native_ck_checked_count(native), 15), 1)
+}
+
+test "ckg_combined_family_checker_clean" {
+  let b = buf_new(16384)
+  ckg_prelude(b)
+  ckg_combined_fn(b, 8)
+  ckg_combined_fn(b, 16)
+  ckg_main(b)
+  let native = ckg_native(b)
+  Test.assert_eq(pipeline_native_ck_violation_count(native), 0)
+  Test.assert_eq(ckg_floor(pipeline_native_ck_checked_count(native), 60), 1)
+}
