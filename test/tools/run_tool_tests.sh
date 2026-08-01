@@ -1072,6 +1072,26 @@ assert_test_compile_rejects "test_fixture_rejects_unhandled_state" 'test "bad_st
 assert_test_compile_rejects "test_fixture_rejects_wrong_effect_body" 'test "bad_fixture_effect" { Test.with_state_i64(0, () => IO.write(1, 0, 1)) }' "type error: effect not available in caller"
 assert_test_compile_rejects "test_fixture_rejects_wrong_return_body" 'test "bad_fixture_return" { Test.with_io_i64(() => "nope") }' "type error: return type mismatch"
 
+# Emission errors must fail the compile (exit nonzero, no binary written).
+# Compiling a constructor-allocating program from a directory without the
+# runtime tree leaves rc_default_alloc_masked unbound; before the fix this
+# printed the error but exited 0 with a poisoned (BRK-carrying) binary.
+printf 'type Pair {\n  MkPair(i64, i64)\n}\nfn main() -> i64 {\n  let p = MkPair(40, 2)\n  match p { MkPair(a, b) -> a + b }\n}\n' > "$tmp_outside_dir/emit_fail.weft"
+set +e
+(cd "$tmp_outside_dir" && "$WEFT_ABS" compile emit_fail.weft > emit_fail.bin 2> emit_fail.err)
+emit_fail_exit=$?
+set -e
+emit_fail_err=$(<"$tmp_outside_dir/emit_fail.err")
+if [ "$emit_fail_exit" != "0" ]; then
+  echo "  ok compile_emission_error_exits_nonzero"
+else
+  echo "  fail compile_emission_error_exits_nonzero"
+  echo "    expected nonzero exit, got 0"
+  exit 1
+fi
+assert_contains "compile_emission_error_reports_missing_runtime_fn" "$emit_fail_err" "required runtime function unavailable"
+assert_equals "compile_emission_error_writes_no_binary" "$(wc -c < "$tmp_outside_dir/emit_fail.bin" | tr -d ' ')" "0"
+
 : > "$tmp_src"
 for ((i = 0; i < 1800; i++)); do
   printf 'test "t%d" { Test.assert_eq(1, 1) }\n' "$i" >> "$tmp_src"
