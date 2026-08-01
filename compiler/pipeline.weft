@@ -852,6 +852,48 @@ fn pipeline_native_ck_checked_count(native: NativeModule) -> i64 {
   }
 }
 
+fn pipeline_native_max_pressure(native: NativeModule) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_max_pressure(fm)
+  }
+}
+
+fn pipeline_native_max_call_crossing(native: NativeModule) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_max_call_crossing(fm)
+  }
+}
+
+fn pipeline_native_call_sites_measured(native: NativeModule) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_call_sites_measured(fm)
+  }
+}
+
+fn pipeline_native_live_functions_measured(native: NativeModule) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_live_functions_measured(fm)
+  }
+}
+
+fn pipeline_native_pressure_bucket(native: NativeModule, i: i64) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_pressure_bucket(fm, i)
+  }
+}
+
+fn pipeline_native_call_crossing_bucket(native: NativeModule, i: i64) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_call_crossing_bucket(fm, i)
+  }
+}
+
+fn pipeline_native_spill_load_bucket(native: NativeModule, i: i64) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_spill_load_bucket(fm, i)
+  }
+}
+
 fn pipeline_native_ck_first_fn_hash(native: NativeModule) -> i64 {
   match native {
     NativeModule(code, fm, functions) -> fmap_ck_first_fn_hash(fm)
@@ -25798,6 +25840,34 @@ fn pipeline_ir_native_alloc_checker_function(code: i64, fm: i64, fn_hash: i64, f
         pipeline_ir_native_ck_replay_block(code, fm, fn_hash, content, ncells, events, mem_load64_at(eb, b * 8), mem_load64_at(eb, (b + 1) * 8), mem_load64_at(starts, b * 8), mem_load64_at(starts, (b + 1) * 8), 1)
       } else { 0 }
     }
+    -- Stage 1 pre-measurement: loads-per-spilled-def over this
+    -- function's ledger (static loads recorded between consecutive
+    -- defs of each spill slot; ledger order is emission order).
+    let spb = alloc_words(ncells)
+    for i in 0..ncells {
+      mem_store64_at(spb, i * 8, 0 - 1)
+    }
+    for i in 0..n {
+      let spev = nlist_get(events, i)
+      let sploc = node_f2(spev)
+      if sploc < 0 {
+        let spidx = pipeline_ir_native_ck_content_index(sploc)
+        if spidx < ncells {
+          if node_tag(spev) == 1 {
+            let spopen = mem_load64_at(spb, spidx * 8)
+            if spopen >= 0 { fmap_note_spill_def_loads(fm, spopen) } else { 0 }
+            mem_store64_at(spb, spidx * 8, 0)
+          } else {
+            let spopen = mem_load64_at(spb, spidx * 8)
+            if spopen >= 0 { mem_store64_at(spb, spidx * 8, spopen + 1) } else { 0 }
+          }
+        } else { 0 }
+      } else { 0 }
+    }
+    for i in 0..ncells {
+      let spopen = mem_load64_at(spb, i * 8)
+      if spopen >= 0 { fmap_note_spill_def_loads(fm, spopen) } else { 0 }
+    }
     0
   } else { 0 }
 }
@@ -26084,7 +26154,11 @@ fn pipeline_lower_native_module_with_audit(typed: TypedModule, ir: IrModule, aud
       let functions = pipeline_ir_functions(ir)
       let code = buf_new(1048576)
       let fm = fmap_new()
-      if audit == 1 { fmap_set_audit_mode(fm, 1) } else { 0 }
+      if audit == 1 {
+        fmap_set_audit_mode(fm, 1)
+        pipeline_ir_live_measure_module(functions, fm)
+        0
+      } else { 0 }
       let native_facts = if pipeline_ir_is_optimised(ir) == 1 {
         pipeline_ir_semantic_facts(ir)
       } else {
@@ -26963,6 +27037,406 @@ fn pipeline_ir_max_block_list_value(blocks: IrBlockList, current: i64) -> i64 {
 
 fn pipeline_ir_function_next_value(param_count: i64, blocks: IrBlockList) -> i64 {
   pipeline_ir_max_block_list_value(blocks, param_count - 1) + 1
+}
+
+-- =====================================================================
+-- 2v Stage 1 pre-measurement: register pressure + live-across-call
+-- liveness over optimized typed IR. Pure fact producer (audit-tier):
+-- backward bitset liveness with block-arg semantics — live-out(B) =
+-- ∪_s (live-in(s) \ params(s)); jump edge args, branch conds, and
+-- return values are uses at B's terminator. Slots are values (they can
+-- be register-resident): IrStore defs its slot, IrLoad uses it,
+-- address-taken slots stay live conservatively. Fixpoint sweeps to
+-- convergence (liveness only grows — monotone), then one recording
+-- pass notes per-function max simultaneous live values and, at every
+-- call-shaped instruction, the count of values live across the call
+-- (live-after minus the result). Call-shaped = anything lowering
+-- through BL/BLR (calls, method/generic/indirect, performs, handler
+-- installs/direct dispatch, resume, string concat, owned drop);
+-- inline-fast-path allocs (variant/record init) are not counted.
+-- Nested handler-clause bodies are separate emission domains and are
+-- not yet measured (named gap); closure-embedded functions are
+-- measured once, deduped by hash like the emission mono cache.
+
+fn pipeline_ir_live_words(nv: i64) -> i64 { nv / 64 + 1 }
+
+fn pipeline_ir_live_get(set: i64, v: i64) -> i64 {
+  (mem_load64_at(set, (v / 64) * 8) bshr (v - v / 64 * 64)) band 1
+}
+
+fn pipeline_ir_live_add(set: i64, v: i64, count: i64) -> i64 {
+  if v < 0 { count }
+  else { if pipeline_ir_live_get(set, v) == 1 { count }
+  else {
+    mem_store64_at(set, (v / 64) * 8, mem_load64_at(set, (v / 64) * 8) bor (1 bshl (v - v / 64 * 64)))
+    count + 1
+  } }
+}
+
+fn pipeline_ir_live_kill(set: i64, v: i64, count: i64) -> i64 {
+  if v < 0 { count }
+  else { if pipeline_ir_live_get(set, v) == 0 { count }
+  else {
+    mem_store64_at(set, (v / 64) * 8, mem_load64_at(set, (v / 64) * 8) bxor (1 bshl (v - v / 64 * 64)))
+    count - 1
+  } }
+}
+
+fn pipeline_ir_live_popcount(set: i64, words: i64) -> i64 {
+  let mut c = 0
+  for w in 0..words {
+    let x = mem_load64_at(set, w * 8)
+    if x != 0 {
+      for b in 0..64 {
+        c = c + ((x bshr b) band 1)
+      }
+    } else { 0 }
+  }
+  c
+}
+
+fn pipeline_ir_live_add_value_list(set: i64, values: IrValueList, count: i64) -> i64 {
+  match values {
+    IrValueNil -> count
+    IrValueCons(value, rest) -> pipeline_ir_live_add_value_list(set, rest, pipeline_ir_live_add(set, value, count))
+  }
+}
+
+fn pipeline_ir_live_kill_value_list(set: i64, values: IrValueList, count: i64) -> i64 {
+  match values {
+    IrValueNil -> count
+    IrValueCons(value, rest) -> pipeline_ir_live_kill_value_list(set, rest, pipeline_ir_live_kill(set, value, count))
+  }
+}
+
+fn pipeline_ir_live_add_record_fields(set: i64, fields: IrRecordFieldList, count: i64) -> i64 {
+  match fields {
+    IrRecordFieldNil -> count
+    IrRecordFieldCons(field_hash, value, rest) -> pipeline_ir_live_add_record_fields(set, rest, pipeline_ir_live_add(set, value, count))
+  }
+}
+
+fn pipeline_ir_live_add_captures(set: i64, captures: i64, count: i64) -> i64 {
+  let mut c = count
+  let n = if captures == 0 { 0 } else { nlist_len(captures) }
+  for i in 0..n {
+    c = pipeline_ir_live_add(set, node_f3(nlist_get(captures, i)), c)
+  }
+  c
+}
+
+fn pipeline_ir_live_add_clause_captures(set: i64, clauses: IrHandlerClauseBodyList, count: i64) -> i64 {
+  match clauses {
+    IrHandlerClauseBodyNil -> count
+    IrHandlerClauseBodyCons(body, rest) -> {
+      let next = match body {
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, blocks) -> pipeline_ir_live_add_captures(set, captures, count)
+        IrHandlerClauseBodyInvalid(reason) -> count
+      }
+      pipeline_ir_live_add_clause_captures(set, rest, next)
+    }
+  }
+}
+
+fn pipeline_ir_live_add_deferred_captures(set: i64, body: IrDeferredHandlerBody, count: i64) -> i64 {
+  match body {
+    IrDeferredHandlerBody(captures, ops_value, first_value, blocks) -> pipeline_ir_live_add_captures(set, captures, count)
+    IrDeferredHandlerBodyInvalid(reason) -> count
+  }
+}
+
+fn pipeline_ir_live_inst_def(inst: IrInst) -> i64 {
+  match inst {
+    IrConstI64(dst, value) -> dst
+    IrNilI64(dst) -> dst
+    IrStringLit(dst, start, len) -> dst
+    IrStringConcatI64(dst, left, right) -> dst
+    IrBinaryI64(dst, op, lhs, rhs) -> dst
+    IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> dst
+    IrUnaryI64(dst, op, value) -> dst
+    IrClosureI64(dst, f, captures, eff) -> dst
+    IrFunctionRefI64(dst, callee_hash) -> dst
+    IrAddressOfSlotI64(dst, slot) -> dst
+    IrPtrLoadI64(dst, ptr) -> dst
+    IrPtrStoreI64(dst, ptr, value) -> dst
+    IrLoweringFailureI64(reason) -> 0 - 1
+    IrPerformI64(dst, effect_hash, op_hash, args) -> dst
+    IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> dst
+    IrHandlerPopI64(frame) -> 0 - 1
+    IrBindI64(ns, nl, value, ty) -> 0 - 1
+    IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, reserved) -> dst
+    IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> dst
+    IrResumeI64(dst, value) -> dst
+    IrTryI64(dst, value) -> dst
+    IrOptChainI64(dst, base, field_hash, field_index) -> dst
+    IrCallI64(dst, callee_hash, args) -> dst
+    IrIndirectCallI64(dst, callee, args) -> dst
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> dst
+    IrVectorGetI64(dst, vec, index, fallback, check_mode) -> dst
+    IrVectorSetI64(dst, vec, index, value, check_mode) -> dst
+    IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> dst
+    IrOwnedDropI64(value, type_hash) -> 0 - 1
+    IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> dst
+    IrVariantTagI64(dst, base) -> dst
+    IrVariantPayloadI64(dst, base, index) -> dst
+    IrRecordInitI64(dst, type_hash, fields) -> dst
+    IrFieldLoadI64(dst, base, field_hash, field_index) -> dst
+    IrSlotI64(slot) -> slot
+    IrLoadI64(dst, slot) -> dst
+    IrStoreI64(slot, value) -> slot
+  }
+}
+
+fn pipeline_ir_live_inst_is_call(inst: IrInst) -> i64 {
+  match inst {
+    IrCallI64(dst, callee_hash, args) -> 1
+    IrIndirectCallI64(dst, callee, args) -> 1
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> 1
+    IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> 1
+    IrPerformI64(dst, effect_hash, op_hash, args) -> 1
+    IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> 1
+    IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, reserved) -> 1
+    IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> 1
+    IrResumeI64(dst, value) -> 1
+    IrStringConcatI64(dst, left, right) -> 1
+    IrOwnedDropI64(value, type_hash) -> 1
+    _ -> 0
+  }
+}
+
+fn pipeline_ir_live_add_inst_uses(set: i64, inst: IrInst, count: i64) -> i64 {
+  match inst {
+    IrConstI64(dst, value) -> count
+    IrNilI64(dst) -> count
+    IrStringLit(dst, start, len) -> count
+    IrStringConcatI64(dst, left, right) -> pipeline_ir_live_add(set, right, pipeline_ir_live_add(set, left, count))
+    IrBinaryI64(dst, op, lhs, rhs) -> pipeline_ir_live_add(set, rhs, pipeline_ir_live_add(set, lhs, count))
+    IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> pipeline_ir_live_add(set, rhs, pipeline_ir_live_add(set, lhs, count))
+    IrUnaryI64(dst, op, value) -> pipeline_ir_live_add(set, value, count)
+    IrClosureI64(dst, f, captures, eff) -> pipeline_ir_live_add_captures(set, captures, count)
+    IrFunctionRefI64(dst, callee_hash) -> count
+    IrAddressOfSlotI64(dst, slot) -> pipeline_ir_live_add(set, slot, count)
+    IrPtrLoadI64(dst, ptr) -> pipeline_ir_live_add(set, ptr, count)
+    IrPtrStoreI64(dst, ptr, value) -> pipeline_ir_live_add(set, value, pipeline_ir_live_add(set, ptr, count))
+    IrLoweringFailureI64(reason) -> count
+    IrPerformI64(dst, effect_hash, op_hash, args) -> pipeline_ir_live_add_value_list(set, args, count)
+    IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> pipeline_ir_live_add_value_list(set, args, count)
+    IrHandlerPopI64(frame) -> pipeline_ir_live_add(set, frame, count)
+    IrBindI64(ns, nl, value, ty) -> pipeline_ir_live_add(set, value, count)
+    IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, reserved) -> pipeline_ir_live_add_clause_captures(set, clauses, count)
+    IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> pipeline_ir_live_add_deferred_captures(set, body, pipeline_ir_live_add_clause_captures(set, clauses, count))
+    IrResumeI64(dst, value) -> pipeline_ir_live_add(set, value, count)
+    IrTryI64(dst, value) -> pipeline_ir_live_add(set, value, count)
+    IrOptChainI64(dst, base, field_hash, field_index) -> pipeline_ir_live_add(set, base, count)
+    IrCallI64(dst, callee_hash, args) -> pipeline_ir_live_add_value_list(set, args, count)
+    IrIndirectCallI64(dst, callee, args) -> pipeline_ir_live_add_value_list(set, args, pipeline_ir_live_add(set, callee, count))
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> pipeline_ir_live_add_value_list(set, args, count)
+    IrVectorGetI64(dst, vec, index, fallback, check_mode) -> pipeline_ir_live_add(set, fallback, pipeline_ir_live_add(set, index, pipeline_ir_live_add(set, vec, count)))
+    IrVectorSetI64(dst, vec, index, value, check_mode) -> pipeline_ir_live_add(set, value, pipeline_ir_live_add(set, index, pipeline_ir_live_add(set, vec, count)))
+    IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> pipeline_ir_live_add_value_list(set, args, pipeline_ir_live_add(set, receiver, count))
+    IrOwnedDropI64(value, type_hash) -> pipeline_ir_live_add(set, value, count)
+    IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> pipeline_ir_live_add_value_list(set, payloads, count)
+    IrVariantTagI64(dst, base) -> pipeline_ir_live_add(set, base, count)
+    IrVariantPayloadI64(dst, base, index) -> pipeline_ir_live_add(set, base, count)
+    IrRecordInitI64(dst, type_hash, fields) -> pipeline_ir_live_add_record_fields(set, fields, count)
+    IrFieldLoadI64(dst, base, field_hash, field_index) -> pipeline_ir_live_add(set, base, count)
+    IrSlotI64(slot) -> count
+    IrLoadI64(dst, slot) -> pipeline_ir_live_add(set, slot, count)
+    IrStoreI64(slot, value) -> pipeline_ir_live_add(set, value, count)
+  }
+}
+
+fn pipeline_ir_live_add_term_uses(set: i64, term: IrTerminator, count: i64) -> i64 {
+  match term {
+    IrTermNone -> count
+    IrTermReturn(value) -> pipeline_ir_live_add(set, value, count)
+    IrTermJump(target, args) -> pipeline_ir_live_add_value_list(set, args, count)
+    IrTermBranch(cond, then_block, else_block) -> pipeline_ir_live_add(set, cond, count)
+  }
+}
+
+fn pipeline_ir_live_prepass(blocks: IrBlockList, i: i64, ids: i64, params_sets: i64, words: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> i
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          mem_store64_at(ids, i * 8, id)
+          pipeline_ir_live_add_value_list(params_sets + i * words * 8, params, 0)
+          0
+        }
+      }
+      pipeline_ir_live_prepass(rest, i + 1, ids, params_sets, words)
+    }
+  }
+}
+
+fn pipeline_ir_live_block_index(ids: i64, nb: i64, id: i64) -> i64 {
+  let mut found = 0 - 1
+  for i in 0..nb {
+    if mem_load64_at(ids, i * 8) == id { found = i } else { 0 }
+  }
+  found
+}
+
+fn pipeline_ir_live_merge_succ(scratch: i64, words: i64, livein_sets: i64, params_sets: i64, si: i64) -> i64 {
+  if si < 0 { 0 }
+  else {
+    for w in 0..words {
+      mem_store64_at(scratch, w * 8, mem_load64_at(scratch, w * 8) bor (mem_load64_at(livein_sets, (si * words + w) * 8) band (mem_load64_at(params_sets, (si * words + w) * 8) bxor (0 - 1))))
+    }
+    0
+  }
+}
+
+fn pipeline_ir_live_out_build(scratch: i64, words: i64, term: IrTerminator, ids: i64, nb: i64, livein_sets: i64, params_sets: i64) -> i64 {
+  for w in 0..words {
+    mem_store64_at(scratch, w * 8, 0)
+  }
+  match term {
+    IrTermNone -> 0
+    IrTermReturn(value) -> 0
+    IrTermJump(target, args) -> pipeline_ir_live_merge_succ(scratch, words, livein_sets, params_sets, pipeline_ir_live_block_index(ids, nb, target))
+    IrTermBranch(cond, then_block, else_block) -> {
+      pipeline_ir_live_merge_succ(scratch, words, livein_sets, params_sets, pipeline_ir_live_block_index(ids, nb, then_block))
+      pipeline_ir_live_merge_succ(scratch, words, livein_sets, params_sets, pipeline_ir_live_block_index(ids, nb, else_block))
+    }
+  }
+  pipeline_ir_live_popcount(scratch, words)
+}
+
+fn pipeline_ir_live_insts_backward(insts: IrInstList, set: i64, count: i64, fm: i64, stats: i64, record: i64) -> i64 {
+  match insts {
+    IrInstNil -> count
+    IrInstCons(inst, rest) -> {
+      let after = pipeline_ir_live_insts_backward(rest, set, count, fm, stats, record)
+      let killed = pipeline_ir_live_kill(set, pipeline_ir_live_inst_def(inst), after)
+      if record == 1 and pipeline_ir_live_inst_is_call(inst) == 1 {
+        fmap_note_call_crossing(fm, killed)
+      } else { 0 }
+      let live = pipeline_ir_live_add_inst_uses(set, inst, killed)
+      if record == 1 and live > mem_load64_at(stats, 0) {
+        mem_store64_at(stats, 0, live)
+      } else { 0 }
+      live
+    }
+  }
+}
+
+fn pipeline_ir_live_block_process(block: IrBlock, i: i64, ids: i64, nb: i64, words: i64, livein_sets: i64, params_sets: i64, scratch: i64, fm: i64, stats: i64, record: i64) -> i64 {
+  match block {
+    IrBlock(id, params, insts, term) -> {
+      let out_count = pipeline_ir_live_out_build(scratch, words, term, ids, nb, livein_sets, params_sets)
+      let with_term = pipeline_ir_live_add_term_uses(scratch, term, out_count)
+      if record == 1 and with_term > mem_load64_at(stats, 0) {
+        mem_store64_at(stats, 0, with_term)
+      } else { 0 }
+      let in_count = pipeline_ir_live_insts_backward(insts, scratch, with_term, fm, stats, record)
+      pipeline_ir_live_kill_value_list(scratch, params, in_count)
+      let mut changed = 0
+      for w in 0..words {
+        let old = mem_load64_at(livein_sets, (i * words + w) * 8)
+        let new = mem_load64_at(scratch, w * 8)
+        if new != old {
+          mem_store64_at(livein_sets, (i * words + w) * 8, new)
+          changed = 1
+        } else { 0 }
+      }
+      changed
+    }
+  }
+}
+
+-- Post-order recursion processes the last block first — the natural
+-- direction for backward dataflow, so most functions converge in two
+-- sweeps.
+fn pipeline_ir_live_sweep(blocks: IrBlockList, i: i64, ids: i64, nb: i64, words: i64, livein_sets: i64, params_sets: i64, scratch: i64, fm: i64, stats: i64, record: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      let changed_rest = pipeline_ir_live_sweep(rest, i + 1, ids, nb, words, livein_sets, params_sets, scratch, fm, stats, record)
+      let changed_here = pipeline_ir_live_block_process(block, i, ids, nb, words, livein_sets, params_sets, scratch, fm, stats, record)
+      if changed_rest == 1 or changed_here == 1 { 1 } else { 0 }
+    }
+  }
+}
+
+fn pipeline_ir_live_measure_function(irf: IrFunction, fm: i64, seen: i64) -> i64 {
+  match irf {
+    IrFunction(hash, param_count, blocks, src) -> {
+      if pipeline_hash_nlist_contains(seen, hash) == 1 { 0 }
+      else {
+        nlist_add(seen, hash)
+        let nb = ir_block_list_len(blocks)
+        if nb == 0 { 0 } else {
+          let nv = pipeline_ir_function_next_value(param_count, blocks)
+          let words = pipeline_ir_live_words(nv)
+          let ids = alloc_words(nb)
+          let params_sets = alloc_words(nb * words)
+          let livein_sets = alloc_words(nb * words)
+          let total = nb * words
+          for i in 0..total {
+            mem_store64_at(params_sets, i * 8, 0)
+            mem_store64_at(livein_sets, i * 8, 0)
+          }
+          let scratch = alloc_words(words)
+          pipeline_ir_live_prepass(blocks, 0, ids, params_sets, words)
+          let mut changed = 1
+          let mut rounds = 0
+          while changed == 1 and rounds < 1000 {
+            changed = pipeline_ir_live_sweep(blocks, 0, ids, nb, words, livein_sets, params_sets, scratch, fm, 0, 0)
+            rounds = rounds + 1
+          }
+          let stats = alloc_words(1)
+          mem_store64_at(stats, 0, 0)
+          pipeline_ir_live_sweep(blocks, 0, ids, nb, words, livein_sets, params_sets, scratch, fm, stats, 1)
+          fmap_note_fn_pressure(fm, mem_load64_at(stats, 0))
+          pipeline_ir_live_measure_closures_blocks(blocks, fm, seen)
+          0
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_live_measure_closures_insts(insts: IrInstList, fm: i64, seen: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      match inst {
+        IrClosureI64(dst, f, captures, eff) -> pipeline_ir_live_measure_function(f, fm, seen)
+        _ -> 0
+      }
+      pipeline_ir_live_measure_closures_insts(rest, fm, seen)
+    }
+  }
+}
+
+fn pipeline_ir_live_measure_closures_blocks(blocks: IrBlockList, fm: i64, seen: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_live_measure_closures_insts(insts, fm, seen)
+      }
+      pipeline_ir_live_measure_closures_blocks(rest, fm, seen)
+    }
+  }
+}
+
+fn pipeline_ir_live_measure_function_list(functions: IrFunctionList, fm: i64, seen: i64) -> i64 {
+  match functions {
+    IrFunctionNil -> 0
+    IrFunctionCons(irf, rest) -> {
+      pipeline_ir_live_measure_function(irf, fm, seen)
+      pipeline_ir_live_measure_function_list(rest, fm, seen)
+    }
+    _ -> 0
+  }
+}
+
+fn pipeline_ir_live_measure_module(functions: IrFunctionList, fm: i64) -> i64 {
+  pipeline_ir_live_measure_function_list(functions, fm, nlist_new())
 }
 
 fn pipeline_ir_native_max_block_param_count(blocks: IrBlockList, current: i64) -> i64 {
