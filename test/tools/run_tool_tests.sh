@@ -788,6 +788,27 @@ assert_equals "mcp_json_unicode_escape_surrogate_snapshot" "$mcp_out" '{"jsonrpc
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"check_summary","arguments":{"source":"fn main() -> i64 { \uZZZZ }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_json_unicode_escape_invalid_hex_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"invalid json-rpc"}}'
 
+# MCP serve mode: persistent newline-delimited JSON-RPC. One process
+# handles the whole session: initialize handshake (protocol version
+# echoed), the initialized notification is not answered, tools/list
+# carries input schemas, tools/call echoes the request id (string ids
+# included) and wraps the payload as MCP text content.
+mcp_serve_out=$(
+  { printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":"call-2","method":"tools/call","params":{"name":"parse_summary","arguments":{"source":"fn main() -> i64 { 42 }"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"ping"}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"bogus/method"}'
+  } | "$WEFT" mcp serve 2>&1)
+assert_contains "mcp_serve_initialize_echoes_protocol" "$mcp_serve_out" '"protocolVersion":"2025-06-18"'
+assert_contains "mcp_serve_initialize_serverinfo" "$mcp_serve_out" '"serverInfo":{"name":"weft"'
+assert_contains "mcp_serve_tools_list_has_schema" "$mcp_serve_out" '"inputSchema":{"type":"object"'
+assert_contains "mcp_serve_call_wraps_content_and_echoes_id" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"call-2","result":{"content":[{"type":"text","text":"{\"tool\":\"parse_summary\",\"ok\":true'
+assert_contains "mcp_serve_ping" "$mcp_serve_out" '{"jsonrpc":"2.0","id":3,"result":{}}'
+assert_contains "mcp_serve_unknown_method_error" "$mcp_serve_out" '{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"method not found"}}'
+assert_equals "mcp_serve_notification_not_answered" "$(printf '%s\n' "$mcp_serve_out" | grep -c jsonrpc)" "5"
+
 lsp_init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 lsp_out=$(lsp_frame "$lsp_init" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_initialize_framed_header" "$lsp_out" "Content-Length:"
@@ -1103,4 +1124,4 @@ chmod +x "$tmp_bin"
 run_binary_guarded "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 257 passed, 0 failed"
+echo "Tool boundary summary: 267 passed, 0 failed"
