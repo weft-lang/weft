@@ -1962,11 +1962,20 @@ fn synth_call(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
     if nl >= 2 {
       if mem_load8_at(src, ns) == 95 {
         if mem_load8_at(src, ns + 1) == 95 { synth_intrinsic_call(src, ns, nl) }
-        else { synth_call_lookup(env, ft, src, ns, nl) }
-      } else { synth_call_lookup(env, ft, src, ns, nl) }
-    } else { synth_call_lookup(env, ft, src, ns, nl) }
+        else { synth_call_general(node, env, ft, src, tt) }
+      } else { synth_call_general(node, env, ft, src, tt) }
+    } else { synth_call_general(node, env, ft, src, tt) }
   }
   } }
+}
+
+-- Bare calls try generic type-arg inference first (which rewrites the
+-- node to an explicit GenericCall when it solves); otherwise ordinary
+-- return-type lookup.
+fn synth_call_general(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
+  let inferred = synth_call_infer_generic(node, env, ft, src, tt)
+  if inferred != 0 { inferred }
+  else { synth_call_lookup(env, ft, src, node_f1(node), node_f2(node)) }
 }
 
 fn synth_call_lookup(env: i64, ft: i64, src: i64, ns: i64, nl: i64) -> i64 {
@@ -2022,6 +2031,332 @@ fn synth_generic_call(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
       if ret_ty == 0 { ty_any() } else { ty_subst(ret_ty, s) }
     }
   }
+}
+
+-- ══════════════════════════════════════════════════════════════
+-- Generic instantiation inference (2u follow-up)
+--
+-- Bare calls to generic ctors/functions solve their type args from
+-- argument types (synth_call path); generic ctors in result positions
+-- additionally solve from the expected type (return position, let
+-- annotation, argument position, assignment). Successful inference
+-- rewrites the node in place into the explicit GenericCall (tag 36)
+-- shape the parser produces for name<targs>(args), so checking,
+-- monomorphisation, and codegen all see the one explicit shape.
+--
+-- Inference only fires where the program would otherwise fail to
+-- check (context sites are second-chance-on-mismatch; the synth_call
+-- path only rewrites calls whose bare form cannot check against
+-- var-typed params), so it strictly accepts more programs.
+-- ══════════════════════════════════════════════════════════════
+
+-- Structural type identity for conflict detection. Conservative: shapes
+-- it does not model compare unequal, which aborts inference rather than
+-- risking a wrong instantiation.
+fn ty_infer_same(a: i64, b: i64) -> i64 {
+  if a == b { 1 }
+  else { if a == 0 or b == 0 { 0 }
+  else {
+    let atag = ty_tag(a)
+    if atag != ty_tag(b) { 0 }
+    else {
+      match atag {
+        0 -> 1
+        1 -> 1
+        2 -> if ty_f1(a) == ty_f1(b) { 1 } else { 0 }
+        12 -> if ty_f1(a) == ty_f1(b) { 1 } else { 0 }
+        3 -> if ty_infer_same(ty_f1(a), ty_f1(b)) == 1 { ty_infer_same(ty_f2(a), ty_f2(b)) } else { 0 }
+        9 -> {
+          if ty_f1(a) != ty_f1(b) { 0 }
+          else { ty_infer_same_list(ty_f3(a), ty_f3(b)) }
+        }
+        16 -> ty_infer_same(ty_f1(a), ty_f1(b))
+        17 -> ty_infer_same(ty_f1(a), ty_f1(b))
+        18 -> ty_infer_same(ty_f1(a), ty_f1(b))
+        19 -> ty_infer_same(ty_f1(a), ty_f1(b))
+        _ -> 0
+      }
+    }
+  } }
+}
+
+fn ty_infer_same_list(a: i64, b: i64) -> i64 {
+  if a == 0 and b == 0 { 1 }
+  else { if a == 0 or b == 0 { 0 }
+  else {
+    let n = nlist_len(a)
+    if n != nlist_len(b) { 0 }
+    else {
+      let mut same = 1
+      for i in 0..n {
+        if ty_infer_same(nlist_get(a, i), nlist_get(b, i)) == 0 { same = 0 } else { 0 }
+      }
+      same
+    }
+  } }
+}
+
+-- Solve type vars in pat against a concrete type, extending s. Returns
+-- 1 on success (bindings may or may not have been added), 0 on a
+-- conflict with an existing binding. Shapes that carry no information
+-- succeed without binding — validation stays with the ordinary checks
+-- that run over the rewritten node.
+fn ty_infer_solve(pat: i64, concrete: i64, s: i64) -> i64 {
+  if pat == 0 or concrete == 0 { 1 }
+  else {
+    let ptag = ty_tag(pat)
+    if ptag == 12 {
+      -- A type-var "concrete" carries no information: it is either an
+      -- unsolved nested ctor (its instantiation cascades later from the
+      -- rewritten parameter type) or an enclosing template's tparam
+      -- (templates stay unmutated by inference — mono owns them).
+      if ty_tag(concrete) == 12 { 1 }
+      else {
+        let existing = subst_lookup(s, ty_f1(pat))
+        if existing == 0 {
+          if type_is_unknown_or_any(concrete) { 1 }
+          else {
+            subst_add(s, ty_f1(pat), concrete)
+            1
+          }
+        } else {
+          if type_is_unknown_or_any(concrete) { 1 } else { ty_infer_same(existing, concrete) }
+        }
+      }
+    }
+    else { if ptag == 9 and ty_tag(concrete) == 9 {
+      if ty_f1(pat) != ty_f1(concrete) { 1 }
+      else { ty_infer_solve_list(ty_f3(pat), ty_f3(concrete), s) }
+    }
+    else { if ptag == 3 and ty_tag(concrete) == 3 {
+      if ty_infer_solve(ty_f1(pat), ty_f1(concrete), s) == 1 {
+        ty_infer_solve(ty_f2(pat), ty_f2(concrete), s)
+      } else { 0 }
+    }
+    else { if ptag == 6 and ty_tag(concrete) == 6 {
+      if ty_infer_solve_list(ty_f1(pat), ty_f1(concrete), s) == 1 {
+        ty_infer_solve(ty_f2(pat), ty_f2(concrete), s)
+      } else { 0 }
+    }
+    else { if ty_tag(concrete) == ptag and (ptag == 16 or ptag == 17 or ptag == 18 or ptag == 19 or ptag == 15) {
+      ty_infer_solve(ty_f1(pat), ty_f1(concrete), s)
+    }
+    else { 1 } } } } }
+  }
+}
+
+fn ty_infer_solve_list(pats: i64, concretes: i64, s: i64) -> i64 {
+  if pats == 0 or concretes == 0 { 1 }
+  else {
+    let n = nlist_len(pats)
+    if n != nlist_len(concretes) { 1 }
+    else {
+      let mut ok = 1
+      for i in 0..n {
+        if ty_infer_solve(nlist_get(pats, i), nlist_get(concretes, i), s) == 0 { ok = 0 } else { 0 }
+      }
+      ok
+    }
+  }
+}
+
+-- Solved type-arg list in tparam order, or 0 if any tparam is unsolved.
+fn generic_infer_solved_targs(tparams: i64, s: i64) -> i64 {
+  let n = nlist_len(tparams)
+  if n == 0 { 0 }
+  else {
+    let targs = nlist_new()
+    let mut ok = 1
+    for i in 0..n {
+      let v = subst_lookup(s, node_f3(nlist_get(tparams, i)))
+      if v == 0 { ok = 0 } else { nlist_add(targs, v) }
+    }
+    if ok == 1 { targs } else { 0 }
+  }
+}
+
+-- Rewrite a bare call/ident node in place to GenericCall(targs, Call).
+-- Tag 36 layout: f1=type_args_list, f2=inner_call_node, f3=count, f4=0.
+fn generic_call_rewrite_to_explicit(node: i64, ns: i64, nl: i64, args: i64, nargs: i64, targs: i64) -> i64 {
+  let inner = node_new(4, ns, nl, args, nargs)
+  mem_store64_at(node, 0, 36)
+  mem_store64_at(node, 8, targs)
+  mem_store64_at(node, 16, inner)
+  mem_store64_at(node, 24, nlist_len(targs))
+  mem_store64_at(node, 32, 0)
+  0
+}
+
+-- Argument-driven inference for a bare tag-4 call to a generic callee.
+-- Returns the substituted return type after rewriting the node, or 0
+-- when inference does not apply or does not fully solve.
+fn synth_call_infer_generic(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
+  let ns = node_f1(node)
+  let nl = node_f2(node)
+  if tenv_lookup(env, src, ns, nl) != 0 { 0 }
+  else {
+    let tparams = ftypes_lookup_tparams(ft, src, ns, nl)
+    if tparams == 0 { 0 }
+    else {
+      let params = ftypes_lookup_params(ft, src, ns, nl)
+      let args = node_f3(node)
+      let nargs = node_f4(node)
+      if params == 0 or nargs == 0 { 0 }
+      else { if nlist_len(params) != nargs { 0 }
+      else {
+        let s = subst_new()
+        let mut ok = 1
+        for i in 0..nargs {
+          let pty = node_f3(nlist_get(params, i))
+          if pty != 0 {
+            if ty_infer_solve(pty, synth(nlist_get(args, i), env, ft, src, tt), s) == 0 { ok = 0 } else { 0 }
+          } else { 0 }
+        }
+        if ok == 0 { 0 }
+        else {
+          let targs = generic_infer_solved_targs(tparams, s)
+          if targs == 0 { 0 }
+          else {
+            let ret_ty = ftypes_lookup(ft, src, ns, nl)
+            generic_call_rewrite_to_explicit(node, ns, nl, args, nargs, targs)
+            if ret_ty == 0 { ty_any() } else { ty_subst(ret_ty, s) }
+          }
+        }
+      } }
+    }
+  }
+}
+
+-- Context-driven inference for a generic ctor meeting an expected type.
+-- Ctors only: their declared return type is exactly parent<vars>, so
+-- unifying it against the expected type either fully solves the
+-- instantiation or leaves vars for payload args to fill.
+fn try_infer_ctor_from_expected(node: i64, target_ty: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
+  let tag = node_tag(node)
+  let ns = node_f1(node)
+  let nl = node_f2(node)
+  if tag == 2 and tenv_lookup(env, src, ns, nl) != 0 { 0 }
+  else { if ttable_variant_payload_count(tt, src, ns, nl) < 0 { 0 }
+  else {
+    let tparams = ftypes_lookup_tparams(ft, src, ns, nl)
+    if tparams == 0 { 0 }
+    else {
+      let ret_ty = ftypes_lookup(ft, src, ns, nl)
+      if ret_ty == 0 { 0 }
+      else {
+        let s = subst_new()
+        if ty_infer_solve(ret_ty, target_ty, s) == 0 { 0 }
+        else {
+          let mut ok = 1
+          if tag == 4 {
+            let params = ftypes_lookup_params(ft, src, ns, nl)
+            let args = node_f3(node)
+            let nargs = node_f4(node)
+            if params != 0 and nlist_len(params) == nargs {
+              for i in 0..nargs {
+                let pty = node_f3(nlist_get(params, i))
+                if pty != 0 {
+                  if ty_infer_solve(pty, synth(nlist_get(args, i), env, ft, src, tt), s) == 0 { ok = 0 } else { 0 }
+                } else { 0 }
+              }
+            } else { 0 }
+          } else { 0 }
+          if ok == 0 { 0 }
+          else {
+            let targs = generic_infer_solved_targs(tparams, s)
+            if targs == 0 { 0 }
+            else {
+              let args = if tag == 4 { node_f3(node) } else { nlist_new() }
+              let nargs = if tag == 4 { node_f4(node) } else { 0 }
+              generic_call_rewrite_to_explicit(node, ns, nl, args, nargs, targs)
+              1
+            }
+          }
+        }
+      }
+    }
+  } }
+}
+
+-- Walk an expression tree trying ctor instantiation inference against
+-- the expected type. is_result = 1 means the current node's value flows
+-- to the expected type (block tails, if branches, match arm bodies, let
+-- bodies); statement positions recurse with is_result = 0 purely to
+-- reach `return` values, which are always result positions. Env is
+-- threaded through let/pattern bindings the same way check_return_values
+-- threads it. Returns 1 if any node was rewritten.
+fn infer_generic_ctor_walk(node: i64, target_ty: i64, env: i64, ft: i64, src: i64, tt: i64, is_result: i64) -> i64 {
+  if node == 0 or target_ty == 0 { 0 }
+  else { if type_is_unknown_or_any(target_ty) { 0 }
+  else {
+    let tag = node_tag(node)
+    if tag == 2 or tag == 4 {
+      if is_result == 1 { try_infer_ctor_from_expected(node, target_ty, env, ft, src, tt) } else { 0 }
+    }
+    else { if tag == 25 {
+      infer_generic_ctor_walk(node_f1(node), target_ty, env, ft, src, tt, 1)
+    }
+    else { if tag == 7 {
+      let rest = node_f2(node)
+      if rest == 0 { infer_generic_ctor_walk(node_f1(node), target_ty, env, ft, src, tt, is_result) }
+      else {
+        let a = infer_generic_ctor_walk(node_f1(node), target_ty, env, ft, src, tt, 0)
+        let b = infer_generic_ctor_walk(rest, target_ty, env, ft, src, tt, is_result)
+        if a == 1 or b == 1 { 1 } else { 0 }
+      }
+    }
+    else { if tag == 5 {
+      let c = infer_generic_ctor_walk(node_f1(node), target_ty, env, ft, src, tt, 0)
+      let a = infer_generic_ctor_walk(node_f2(node), target_ty, env, ft, src, tt, is_result)
+      let b = infer_generic_ctor_walk(node_f3(node), target_ty, env, ft, src, tt, is_result)
+      if a == 1 or b == 1 or c == 1 { 1 } else { 0 }
+    }
+    else { if tag == 15 {
+      let scr_ty = synth(node_f1(node), env, ft, src, tt)
+      let arms = node_f2(node)
+      let n_arms = node_f3(node)
+      let mut any = infer_generic_ctor_walk(node_f1(node), target_ty, env, ft, src, tt, 0)
+      for i in 0..n_arms {
+        let arm = nlist_get(arms, i)
+        let arm_env = bind_pattern(node_f1(arm), env, src, scr_ty, tt)
+        if infer_generic_ctor_walk(node_f2(arm), target_ty, arm_env, ft, src, tt, is_result) == 1 { any = 1 } else { 0 }
+      }
+      any
+    }
+    else { if tag == 6 or tag == 11 {
+      let a = infer_generic_ctor_walk(node_f3(node), target_ty, env, ft, src, tt, 0)
+      let val_ty = synth(node_f3(node), env, ft, src, tt)
+      let new_env = if tag == 11 { tenv_bind_mut(env, src, node_f1(node), node_f2(node), val_ty) }
+        else { tenv_bind(env, src, node_f1(node), node_f2(node), val_ty) }
+      let b = infer_generic_ctor_walk(node_f4(node), target_ty, new_env, ft, src, tt, is_result)
+      if a == 1 or b == 1 { 1 } else { 0 }
+    }
+    else { if tag == 37 {
+      let inner = node_f1(node)
+      let ann_ty = node_f2(node)
+      let a = infer_generic_ctor_walk(node_f3(inner), target_ty, env, ft, src, tt, 0)
+      let new_env = if node_tag(inner) == 11 { tenv_bind_mut(env, src, node_f1(inner), node_f2(inner), ann_ty) }
+        else { tenv_bind(env, src, node_f1(inner), node_f2(inner), ann_ty) }
+      let b = infer_generic_ctor_walk(node_f4(inner), target_ty, new_env, ft, src, tt, is_result)
+      if a == 1 or b == 1 { 1 } else { 0 }
+    }
+    else { if tag == 10 {
+      let a = infer_generic_ctor_walk(node_f1(node), target_ty, env, ft, src, tt, 0)
+      let b = infer_generic_ctor_walk(node_f2(node), target_ty, env, ft, src, tt, 0)
+      if a == 1 or b == 1 { 1 } else { 0 }
+    }
+    else { if tag == 33 {
+      infer_generic_ctor_walk(node_f1(node), target_ty, env, ft, src, tt, is_result)
+    }
+    else { if tag == 52 {
+      infer_generic_ctor_walk(node_f2(node), target_ty, env, ft, src, tt, is_result)
+    }
+    else { 0 } } } } } } } } } }
+  } }
+}
+
+fn infer_generic_ctor_result(node: i64, target_ty: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
+  infer_generic_ctor_walk(node, target_ty, env, ft, src, tt, 1)
 }
 
 fn check_generic_type_arg_count(tparams: i64, type_args: i64, src: i64, ns: i64) -[Diagnose]> i64 {
@@ -3835,8 +4170,13 @@ fn check_arg_against_param_mode(arg: i64, param_ty: i64, env: i64, ft: i64, src:
           1
         } else { 0 }
       } else { if expr_matches_type_contextual(arg, arg_ty, param_ty, src) != 1 {
-        typeck_error_maybe(src, pos, "type error: argument type mismatch")
-        1
+        -- Second chance: generic ctor argument solves its type args from
+        -- the declared parameter type.
+        if infer_generic_ctor_result(arg, param_ty, env, ft, src, tt) == 1 and expr_matches_type_contextual(arg, synth(arg, env, ft, src, tt), param_ty, src) == 1 { 0 }
+        else {
+          typeck_error_maybe(src, pos, "type error: argument type mismatch")
+          1
+        }
       } else { 0 } }
     }
   }
@@ -6591,10 +6931,11 @@ fn check_assign_target(node: i64, env: i64, ft: i64, src: i64, tt: i64) -[Confor
     if type_is_unknown_or_any(target_ty) { errors }
     else { if type_is_unknown_or_any(val_ty) { errors }
     else { if expr_matches_type_contextual(val, val_ty, target_ty, src) == 1 { errors }
+    else { if infer_generic_ctor_result(val, target_ty, env, ft, src, tt) == 1 and expr_matches_type_contextual(val, synth(val, env, ft, src, tt), target_ty, src) == 1 { errors }
     else {
       typeck_error_maybe(src, ns, "type error: assignment type mismatch")
       errors + 1
-    } } }
+    } } } }
   }
 }
 
@@ -6603,11 +6944,12 @@ fn check_return_value_type(val: i64, env: i64, ft: i64, src: i64, ret_ty: i64, t
   if type_is_unknown_or_any(val_ty) { 0 }
   else { if type_is_unknown_or_any(ret_ty) { 0 }
   else { if expr_matches_type_contextual(val, val_ty, ret_ty, src) == 1 { 0 }
+  else { if infer_generic_ctor_result(val, ret_ty, env, ft, src, tt) == 1 and expr_matches_type_contextual(val, synth(val, env, ft, src, tt), ret_ty, src) == 1 { 0 }
   else {
     let pos = if val != 0 { expr_diag_pos(val) } else { 0 }
     typeck_error_maybe(src, pos, "type error: return type mismatch")
     1
-  } } }
+  } } } }
 }
 
 fn check_return_values_list(list: i64, n: i64, env: i64, ft: i64, src: i64, ret_ty: i64, tt: i64) -[Conformance, Diagnose]> i64 {
@@ -7257,8 +7599,13 @@ fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) 
       if ann_ty != 0 {
         if val_ty != 0 {
           if expr_matches_type_contextual(val, val_ty, ann_ty, src) != 1 {
-            typeck_error_maybe(src, node_f1(inner), "type error: value does not match let type annotation")
-            errors = errors + 1
+            -- Second chance: generic ctor solves type args from the annotation.
+            if infer_generic_ctor_result(val, ann_ty, env, ft, src, tt) == 1 and expr_matches_type_contextual(val, synth(val, env, ft, src, tt), ann_ty, src) == 1 {
+              errors = errors
+            } else {
+              typeck_error_maybe(src, node_f1(inner), "type error: value does not match let type annotation")
+              errors = errors + 1
+            }
           } else { errors = errors }
         } else { errors = errors }
       } else { errors = errors }
@@ -7362,7 +7709,10 @@ fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) 
       errors
     }
     4 -> {
-      -- Call: check arguments recursively + check arg types match params
+      -- Call: check arguments recursively + check arg types match params.
+      -- Bare calls to generic callees are handled inside check_call_args:
+      -- var-typed params trigger type-arg inference there (rewriting the
+      -- node to an explicit GenericCall) at zero cost to ordinary calls.
       let args = node_f3(node)
       let nargs = node_f4(node)
       for i in 0..nargs {
@@ -7378,56 +7728,14 @@ fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) 
     }
     36 -> {
       -- GenericCall: check inner call args with substituted param types
-      let type_args = node_f1(node)
       let call_node = node_f2(node)
       let call_args = node_f3(call_node)
       let nargs = node_f4(call_node)
-      let ns = node_f1(call_node)
-      let nl = node_f2(call_node)
-      errors = errors + check_public_arc_type_list(tt, src, ns, type_args)
-      errors = errors + check_move_only_storage_type_list(src, ns, type_args)
       -- Check arg expressions recursively
       for ai in 0..nargs {
         errors = errors + check_expr(nlist_get(call_args, ai), env, ft, src, caller_eff, tt)
       }
-      errors = errors + check_internal_par_prepared_call_sealed(tt, call_node, src)
-      -- Check arg types against substituted param types
-      let tparams = ftypes_lookup_tparams(ft, src, ns, nl)
-      let params = ftypes_lookup_params(ft, src, ns, nl)
-      if tparams != 0 {
-        errors = errors + check_generic_type_arg_count(tparams, type_args, src, ns)
-        errors = errors + check_generator_new_shape(node, env, ft, src)
-        if params != 0 {
-          errors = errors + check_arity(nlist_len(params), nargs, src, ns)
-          let s = build_subst(tparams, type_args)
-          -- Check trait bounds on type parameters
-          errors = errors + check_trait_bounds(tparams, type_args, src, ns, tt)
-          for pi in 0..nargs {
-            if pi < nlist_len(params) {
-              let param = nlist_get(params, pi)
-              let param_ty = node_f3(param)
-              if param_ty != 0 {
-                let subst_ty = ty_subst(param_ty, s)
-                errors = errors + check_arg_against_param(nlist_get(call_args, pi), subst_ty, env, ft, src, tt, ns)
-              } else { errors = errors }
-            } else { errors = errors }
-          }
-        } else { 0 }
-      } else {
-        errors = errors + check_generic_call_target_defined(call_node, env, ft, src, tt)
-        errors = errors + check_call_args(call_node, env, ft, src, caller_eff, tt)
-      }
-      -- Effect checking for generic calls
-      let callee_eff = ftypes_lookup_effects(ft, src, ns, nl)
-      if caller_eff > 0 {
-        if callee_eff > 0 {
-          if not effect_is_subset(callee_eff, caller_eff) {
-            typeck_error(src, ns, "type error: effect not available in caller")
-            errors = errors + 1
-          } else { errors = errors }
-        } else { errors = errors }
-      } else { errors = errors }
-      errors = errors + check_scoped_region_helper(node, src)
+      errors = errors + check_generic_call_post_args(node, env, ft, src, caller_eff, tt)
       errors
     }
     15 -> {
@@ -7494,7 +7802,7 @@ fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) 
             errors = errors + check_expr(nlist_get(pa, pai), env, ft, src, caller_eff, tt)
           }
           errors
-        }
+        } }
       }
     }
     41 -> {
@@ -8189,6 +8497,104 @@ fn check_generator_new_shape(node: i64, env: i64, ft: i64, src: i64) -[Diagnose]
   }
 }
 
+-- Everything the GenericCall (tag 36) arm checks EXCEPT recursing into
+-- the argument expressions: type-arg count, trait bounds, arity,
+-- substituted param checks, effect availability. Shared by the tag-36
+-- check_expr arm and the bare-generic-call inference path in
+-- check_call_args_inner (whose caller already recursed into the args).
+fn check_generic_call_post_args(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) -[Conformance, Diagnose]> i64 {
+  let type_args = node_f1(node)
+  let call_node = node_f2(node)
+  let call_args = node_f3(call_node)
+  let nargs = node_f4(call_node)
+  let ns = node_f1(call_node)
+  let nl = node_f2(call_node)
+  let mut errors = check_public_arc_type_list(tt, src, ns, type_args)
+  errors = errors + check_move_only_storage_type_list(src, ns, type_args)
+  errors = errors + check_internal_par_prepared_call_sealed(tt, call_node, src)
+  -- Check arg types against substituted param types
+  let tparams = ftypes_lookup_tparams(ft, src, ns, nl)
+  let params = ftypes_lookup_params(ft, src, ns, nl)
+  if tparams != 0 {
+    errors = errors + check_generic_type_arg_count(tparams, type_args, src, ns)
+    errors = errors + check_generator_new_shape(node, env, ft, src)
+    if params != 0 {
+      errors = errors + check_arity(nlist_len(params), nargs, src, ns)
+      let s = build_subst(tparams, type_args)
+      -- Check trait bounds on type parameters
+      errors = errors + check_trait_bounds(tparams, type_args, src, ns, tt)
+      for pi in 0..nargs {
+        if pi < nlist_len(params) {
+          let param = nlist_get(params, pi)
+          let param_ty = node_f3(param)
+          if param_ty != 0 {
+            let subst_ty = ty_subst(param_ty, s)
+            errors = errors + check_arg_against_param(nlist_get(call_args, pi), subst_ty, env, ft, src, tt, ns)
+          } else { errors = errors }
+        } else { errors = errors }
+      }
+    } else { 0 }
+  } else {
+    errors = errors + check_generic_call_target_defined(call_node, env, ft, src, tt)
+    errors = errors + check_call_args(call_node, env, ft, src, caller_eff, tt)
+  }
+  -- Effect checking for generic calls
+  let callee_eff = ftypes_lookup_effects(ft, src, ns, nl)
+  if caller_eff > 0 {
+    if callee_eff > 0 {
+      if not effect_is_subset(callee_eff, caller_eff) {
+        typeck_error(src, ns, "type error: effect not available in caller")
+        errors = errors + 1
+      } else { errors = errors }
+    } else { errors = errors }
+  } else { errors = errors }
+  errors = errors + check_scoped_region_helper(node, src)
+  errors
+}
+
+-- 1 when any declared param type mentions a type variable — the marker
+-- of a generic callee reached as a bare (unparameterized) call. Cheap:
+-- walks the handful of param type nodes, no table lookups.
+fn params_mention_type_var(params: i64) -> i64 {
+  let n = nlist_len(params)
+  let mut found = 0
+  for i in 0..n {
+    if found == 0 and ty_mentions_type_var(node_f3(nlist_get(params, i))) == 1 { found = 1 } else { 0 }
+  }
+  found
+}
+
+fn ty_mentions_type_var(ty: i64) -> i64 {
+  if ty == 0 { 0 }
+  else {
+    let tag = ty_tag(ty)
+    if tag == 12 { 1 }
+    else { if tag == 9 { ty_list_mentions_type_var(ty_f3(ty)) }
+    else { if tag == 3 or tag == 4 {
+      if ty_mentions_type_var(ty_f1(ty)) == 1 { 1 } else { ty_mentions_type_var(ty_f2(ty)) }
+    }
+    else { if tag == 6 {
+      if ty_list_mentions_type_var(ty_f1(ty)) == 1 { 1 } else { ty_mentions_type_var(ty_f2(ty)) }
+    }
+    else { if tag == 5 or tag == 15 or tag == 16 or tag == 17 or tag == 18 or tag == 19 {
+      ty_mentions_type_var(ty_f1(ty))
+    }
+    else { 0 } } } } }
+  }
+}
+
+fn ty_list_mentions_type_var(types: i64) -> i64 {
+  if types == 0 { 0 }
+  else {
+    let n = nlist_len(types)
+    let mut found = 0
+    for i in 0..n {
+      if found == 0 and ty_mentions_type_var(nlist_get(types, i)) == 1 { found = 1 } else { 0 }
+    }
+    found
+  }
+}
+
 fn check_call_args_inner(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) -[Conformance, Diagnose]> i64 {
   let ns = node_f1(node)
   let nl = node_f2(node)
@@ -8203,8 +8609,33 @@ fn check_call_args_inner(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64
   } else {
     let params = ftypes_lookup_params(ft, src, ns, nl)
     if params == 0 { 0 }
+  else { if params_mention_type_var(params) == 1 and node_tag(node) == 4 {
+    -- Bare call to a generic callee (var-typed params betray it at zero
+    -- lookup cost — an upfront tparams probe per call node cost ~5% on
+    -- check_tree). Synthesis solves type args from the arguments and
+    -- rewrites the node to an explicit GenericCall; args were already
+    -- recursed by the tag-4 arm, so only the post-args checks run here.
+    synth_call(node, env, ft, src, tt)
+    if node_tag(node) == 36 {
+      check_generic_call_post_args(node, env, ft, src, caller_eff, tt)
+    } else {
+      check_call_args_declared(node, params, env, ft, src, caller_eff, tt)
+    }
+  }
   else {
-    let nparams = nlist_len(params)
+    check_call_args_declared(node, params, env, ft, src, caller_eff, tt)
+  } }
+  }
+}
+
+-- The ordinary declared-params arg check (shared by the plain path and
+-- the bare-generic path when inference does not solve).
+fn check_call_args_declared(node: i64, params: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) -[Conformance, Diagnose]> i64 {
+  let ns = node_f1(node)
+  let nl = node_f2(node)
+  let args = node_f3(node)
+  let nargs = node_f4(node)
+  let nparams = nlist_len(params)
     let mut errors = 0
     errors = errors + check_generator_i64_new_shape(node, env, ft, src)
     errors = errors + check_arity(nparams, nargs, src, ns)
@@ -8229,8 +8660,6 @@ fn check_call_args_inner(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64
       } else { errors = errors }
     }
     errors
-  }
-  }
 }
 
 fn check_fn(fn_node: i64, ft: i64, src: i64, tt: i64) -[Conformance, Diagnose]> i64 {
@@ -8259,7 +8688,16 @@ fn check_fn(fn_node: i64, ft: i64, src: i64, tt: i64) -[Conformance, Diagnose]> 
   let caller_eff = fn_effects(fn_node)
   errors = errors + check_owned_drop_param_effects(params, nparams, tt, src, caller_eff)
   -- synth first to convert tag-32 dot-calls to tag-41 method calls
-  let body_ty = synth(body, env, ft, src, tt)
+  let body_ty_pre = synth(body, env, ft, src, tt)
+  -- Generic ctor inference pre-pass: result-position (and returned) bare
+  -- generic ctors solve their type args from the declared return type
+  -- and are rewritten to explicit GenericCall nodes BEFORE check_expr
+  -- would flag their bare form. Gated on the return type being a named
+  -- type — the only expected-type shape context inference can solve —
+  -- so ordinary functions never pay for the walk.
+  let body_ty = if ty_tag(ret_ty) == 9 and infer_generic_ctor_result(body, ret_ty, env, ft, src, tt) == 1 {
+    synth(body, env, ft, src, tt)
+  } else { body_ty_pre }
   -- check_expr recurses deeper and resolves remaining tag-32 nodes
   errors = errors + check_expr(body, env, ft, src, caller_eff, tt)
   errors = errors + check_resume_scope(body, src, 0)
@@ -8270,6 +8708,7 @@ fn check_fn(fn_node: i64, ft: i64, src: i64, tt: i64) -[Conformance, Diagnose]> 
   } else { errors = errors }
   errors = errors + check_return_values(body, env, ft, src, ret_ty, tt)
   -- Check return type: body type must be subtype of declared return type
+  -- (the inference pre-pass above already resolved result-position ctors).
   if type_is_unknown_or_any(body_ty) { errors = errors }
   else { if expr_matches_type_contextual(body, body_ty, ret_ty, src) != 1 {
     typeck_error_maybe(src, node_f1(inner), "type error: return type mismatch")
