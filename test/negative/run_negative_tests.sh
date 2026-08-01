@@ -436,6 +436,12 @@ check_rejects "generic_type_arg_count" "test/negative/generic_type_arg_count.wef
 check_rejects "generic_type_pattern_payload_mismatch" "test/negative/generic_type_pattern_payload_mismatch.weft" "type error: return type mismatch"
 check_rejects "narrowing_unguarded_nilable_use" "test/negative/narrowing_unguarded_nilable_use.weft" "type error: argument type mismatch"
 check_rejects "narrowing_mut_guard_not_narrowed" "test/negative/narrowing_mut_guard_not_narrowed.weft" "type error: argument type mismatch"
+check_rejects "generic_ctor_no_context" "test/negative/generic_ctor_no_context.weft" "type error: return type mismatch"
+check_rejects "generic_ctor_annotation_mismatch" "test/negative/generic_ctor_annotation_mismatch.weft" "type error: value does not match let type annotation"
+check_rejects "generic_ctor_conflicting_args" "test/negative/generic_ctor_conflicting_args.weft" "type error: argument type mismatch"
+check_rejects "qualified_ctor_call" "test/negative/qualified_ctor_call.weft" "type error: qualified constructor syntax is not supported"
+check_rejects "qualified_ctor_nullary" "test/negative/qualified_ctor_nullary.weft" "type error: qualified constructor syntax is not supported"
+check_rejects "interp_display_missing_import" "test/negative/interp_display_missing_import.weft" "add use \"stdlib/display.weft\""
 
 echo ""
 echo "=== Negative Summary ==="
