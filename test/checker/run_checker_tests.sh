@@ -22,6 +22,7 @@ run_guarded() {
   local pid=$!
   local start
   start=$(now_s)
+  local polls=0
 
   while kill -0 "$pid" 2>/dev/null; do
     local stat
@@ -50,7 +51,14 @@ run_guarded() {
       return 124
     fi
 
-    sleep 1
+    # Fine-grained polling early so sub-second guarded processes are not
+    # billed a full 1s sleep quantum; long-running ones fall back to 1s.
+    polls=$((polls+1))
+    if [ "$polls" -le 20 ]; then
+      sleep 0.1
+    else
+      sleep 1
+    fi
   done
 
   wait "$pid"

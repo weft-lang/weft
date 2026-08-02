@@ -6,9 +6,14 @@ set -e
 WEFT=${WEFT:-./weft}
 WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-120}
 WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-8000000}
+WEFT_TEST_JOBS=${WEFT_TEST_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 PASS=0
 FAIL=0
 ERRORS=""
+
+export WEFT
+export WEFT_TEST_COMPILE_TIMEOUT
+export WEFT_TEST_COMPILE_RSS_LIMIT_KB
 
 now_s() {
   date +%s
@@ -23,6 +28,7 @@ run_guarded() {
   local pid=$!
   local start
   start=$(now_s)
+  local polls=0
 
   while kill -0 "$pid" 2>/dev/null; do
     local stat
@@ -51,21 +57,31 @@ run_guarded() {
       return 124
     fi
 
-    sleep 1
+    # Fine-grained polling early: each negative case is a sub-second
+    # `weft check`, and a 1s quantum billed 349 cases ~6 minutes of
+    # pure sleep. Long-running processes fall back to 1s polls.
+    polls=$((polls+1))
+    if [ "$polls" -le 20 ]; then
+      sleep 0.1
+    else
+      sleep 1
+    fi
   done
 
   wait "$pid"
 }
 
-echo "=== Negative Test Suite ==="
-echo ""
-
-check_rejects() {
-  local name="$1"
-  local file="$2"
-  local pattern="$3"
-  local out
-  local status
+# ---------------------------------------------------------------------------
+# Worker mode: `bash run_negative_tests.sh __worker <jobfile>` runs ONE
+# check (jobfile lines: name / file / pattern), streams its ✓/✗ line, and
+# writes a .meta (pass|fail) + .err record beside the jobfile. Always
+# exits 0; the parent aggregates in job order.
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "__worker" ]; then
+  jobf="$2"
+  name=$(sed -n 1p "$jobf")
+  file=$(sed -n 2p "$jobf")
+  pattern=$(sed -n 3p "$jobf")
 
   set +e
   out=$(run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" check "$file" 2>&1 >/dev/null)
@@ -73,24 +89,40 @@ check_rejects() {
   set -e
   if [ "$status" -eq 124 ]; then
     echo "  ✗ $name"
-    FAIL=$((FAIL+1))
-    ERRORS="$ERRORS\n  $name: checker timed out"
-    return
+    echo "  $name: checker timed out" > "$jobf.err"
+    echo "fail" > "$jobf.meta"
+    exit 0
   fi
   if [ "$status" -eq 125 ]; then
     echo "  ✗ $name"
-    FAIL=$((FAIL+1))
-    ERRORS="$ERRORS\n  $name: checker exceeded ${WEFT_TEST_COMPILE_RSS_LIMIT_KB} KB RSS"
-    return
+    echo "  $name: checker exceeded ${WEFT_TEST_COMPILE_RSS_LIMIT_KB} KB RSS" > "$jobf.err"
+    echo "fail" > "$jobf.meta"
+    exit 0
   fi
   if echo "$out" | grep -q "$pattern"; then
     echo "  ✓ $name"
-    PASS=$((PASS+1))
+    echo "pass" > "$jobf.meta"
   else
     echo "  ✗ $name"
-    FAIL=$((FAIL+1))
-    ERRORS="$ERRORS\n  $name: expected diagnostic '$pattern'"
+    echo "  $name: expected diagnostic '$pattern'" > "$jobf.err"
+    echo "fail" > "$jobf.meta"
   fi
+  exit 0
+fi
+
+echo "=== Negative Test Suite ==="
+echo ""
+
+JOBS_DIR=$(mktemp -d /tmp/weft_negative_XXXXXX)
+JOB_N=0
+
+# Enqueue only — the 349 call sites below stay untouched; the pool at the
+# end runs them WEFT_TEST_JOBS wide through worker mode.
+check_rejects() {
+  JOB_N=$((JOB_N+1))
+  local jf
+  jf=$(printf '%s/job_%04d' "$JOBS_DIR" "$JOB_N")
+  printf '%s\n%s\n%s\n' "$1" "$2" "$3" > "$jf"
 }
 
 check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" "type error: argument type mismatch"
@@ -442,6 +474,25 @@ check_rejects "generic_ctor_conflicting_args" "test/negative/generic_ctor_confli
 check_rejects "qualified_ctor_call" "test/negative/qualified_ctor_call.weft" "type error: qualified constructor syntax is not supported"
 check_rejects "qualified_ctor_nullary" "test/negative/qualified_ctor_nullary.weft" "type error: qualified constructor syntax is not supported"
 check_rejects "interp_display_missing_import" "test/negative/interp_display_missing_import.weft" "add use \"stdlib/display.weft\""
+
+ls "$JOBS_DIR"/job_???? | xargs -n1 -P "$WEFT_TEST_JOBS" bash "$0" __worker || true
+
+ji=1
+while [ "$ji" -le "$JOB_N" ]; do
+  jf=$(printf '%s/job_%04d' "$JOBS_DIR" "$ji")
+  if [ -f "$jf.meta" ] && [ "$(cat "$jf.meta")" = "pass" ]; then
+    PASS=$((PASS+1))
+  else
+    FAIL=$((FAIL+1))
+    if [ -f "$jf.err" ]; then
+      ERRORS="$ERRORS\n$(cat "$jf.err")"
+    else
+      ERRORS="$ERRORS\n  $(sed -n 1p "$jf"): worker produced no result"
+    fi
+  fi
+  ji=$((ji+1))
+done
+rm -rf "$JOBS_DIR"
 
 echo ""
 echo "=== Negative Summary ==="
