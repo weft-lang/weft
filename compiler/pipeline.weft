@@ -1128,6 +1128,17 @@ fn pipeline_native_dead_store_elision_count(native: NativeModule) -> i64 {
   }
 }
 
+fn pipeline_native_remat_probe_count(native: NativeModule, which: i64) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> {
+      if which == 0 { fmap_ir_native_remat_small_def_count(fm) }
+      else { if which == 1 { fmap_ir_native_remat_small_use_count(fm) }
+      else { if which == 2 { fmap_ir_native_remat_large_def_count(fm) }
+      else { fmap_ir_native_remat_large_use_count(fm) } } }
+    }
+  }
+}
+
 fn pipeline_native_bank_swap_count(native: NativeModule) -> i64 {
   match native {
     NativeModule(code, fm, functions) -> fmap_ir_native_bank_swap_count(fm)
@@ -18953,6 +18964,16 @@ fn pipeline_ir_native_forward_marker() -> i64 { 0 - 987654321 }
 -- perform, handler frames, closures, vector lanes) can never carry it.
 fn pipeline_ir_native_discard_home() -> i64 { 999 }
 
+-- 2v Stage 3 constant rematerialization: a frame-homed IrConstI64 in
+-- [0, 65535] whose every use reads through the pinned-aware load path
+-- re-materializes with a single movz at each use instead of reloading
+-- from its slot — and its canonical store disappears with the loads.
+-- The constant is carried IN the pinned-map phys encoding:
+-- phys = remat_base + k. Runs after every placement pass, so it only
+-- takes constants no register class wanted (a pool/bank home is
+-- strictly better: uses read the register for free).
+fn pipeline_ir_native_remat_base() -> i64 { 1000000 }
+
 fn pipeline_ir_native_forward_record(facts: PipelineIrNativeValueHomeFacts, code: i64, value: i64, phys: i64) -> i64 {
   let cell = pipeline_ir_native_value_home_facts_forward(facts)
   if cell == 0 { 0 }
@@ -19022,12 +19043,17 @@ fn pipeline_ir_native_ck_def(code: i64, facts: PipelineIrNativeValueHomeFacts, l
 -- the GPR helpers trap loudly instead of emitting a garbage register.
 fn pipeline_ir_native_fp_resident_fd(facts: PipelineIrNativeValueHomeFacts, value: i64) -> i64 {
   let phys = pipeline_ir_native_value_home_lookup(facts, value)
-  if phys >= 1000 { phys - 1000 } else { 0 }
+  -- FP homes occupy exactly 1000+d0 .. 1000+d15; discard and remat
+  -- pseudo-homes live outside this window and are not FP residents.
+  if phys >= 1000 and phys <= 1015 { phys - 1000 } else { 0 }
 }
 
 fn pipeline_ir_native_load_reg(code: i64, facts: PipelineIrNativeValueHomeFacts, value: i64) -> i64 {
   let phys = pipeline_ir_native_value_home_lookup(facts, value)
-  if phys >= 1000 or phys == pipeline_ir_native_discard_home() {
+  if phys >= pipeline_ir_native_remat_base() {
+    bu32(code, encode_movz(16, phys - pipeline_ir_native_remat_base(), 0))
+    16
+  } else { if phys >= 1000 or phys == pipeline_ir_native_discard_home() {
     bu32(code, encode_brk(20))
     17
   } else { if phys < 0 {
@@ -19040,12 +19066,15 @@ fn pipeline_ir_native_load_reg(code: i64, facts: PipelineIrNativeValueHomeFacts,
   } else {
     bu32(code, encode_brk(20))
     17
-  } } }
+  } } } }
 }
 
 fn pipeline_ir_native_load_rhs(code: i64, facts: PipelineIrNativeValueHomeFacts, value: i64) -> i64 {
   let phys = pipeline_ir_native_value_home_lookup(facts, value)
-  if phys >= 1000 or phys == pipeline_ir_native_discard_home() {
+  if phys >= pipeline_ir_native_remat_base() {
+    bu32(code, encode_movz(17, phys - pipeline_ir_native_remat_base(), 0))
+    17
+  } else { if phys >= 1000 or phys == pipeline_ir_native_discard_home() {
     bu32(code, encode_brk(20))
     17
   } else { if phys < 0 {
@@ -19058,16 +19087,17 @@ fn pipeline_ir_native_load_rhs(code: i64, facts: PipelineIrNativeValueHomeFacts,
   } else {
     bu32(code, encode_brk(20))
     17
-  } } }
+  } } } }
 }
 
 fn pipeline_ir_native_store_reg_pinned(code: i64, facts: PipelineIrNativeValueHomeFacts, dst: i64, phys: i64) -> i64 {
   if dst < 0 { 0 }
   else {
     let pinned_phys = pipeline_ir_native_value_home_lookup(facts, dst)
-    if pinned_phys == pipeline_ir_native_discard_home() {
-      -- Dead result: the defining instruction already executed for its
-      -- effects; the store (and its ck events) is deleted outright.
+    if pinned_phys == pipeline_ir_native_discard_home() or pinned_phys >= pipeline_ir_native_remat_base() {
+      -- Discard: dead result, store deleted. Remat: every use
+      -- re-materializes the constant, so the home is never read and
+      -- the store is equally dead.
       0
     } else {
     if pinned_phys >= 1000 {
@@ -19664,11 +19694,16 @@ fn pipeline_ir_native_result_reg(dst: i64, pinned: PipelineIrNativeValueHomeFact
 }
 
 fn pipeline_ir_native_emit_const(code: i64, dst: i64, value: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
-  let rd = pipeline_ir_native_result_reg(dst, pinned)
-  emit_mov_imm_safe(code, rd, value)
-  if rd == 17 {
-    if dst >= 0 { pipeline_ir_native_store_reg_pinned(code, pinned, dst, 17) } else { 0 }
-  } else { pipeline_ir_native_ck_def(code, pinned, rd, dst) }
+  -- A remat-homed constant emits nothing at its def: every use
+  -- re-materializes it and the home is never read.
+  if dst >= 0 and pipeline_ir_native_value_home_lookup(pinned, dst) >= pipeline_ir_native_remat_base() { 0 }
+  else {
+    let rd = pipeline_ir_native_result_reg(dst, pinned)
+    emit_mov_imm_safe(code, rd, value)
+    if rd == 17 {
+      if dst >= 0 { pipeline_ir_native_store_reg_pinned(code, pinned, dst, 17) } else { 0 }
+    } else { pipeline_ir_native_ck_def(code, pinned, rd, dst) }
+  }
 }
 
 fn pipeline_ir_native_emit_binary(code: i64, dst: i64, op: IrBinaryOp, lhs: i64, rhs: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
@@ -21648,7 +21683,10 @@ fn pipeline_ir_native_lambda_store_capture_value(code: i64, fm: i64, env_ctr: i6
 -- sites that recover value ids outside the main instruction walk.
 fn pipeline_ir_native_load_value_temp_pinned(code: i64, pinned: PipelineIrNativeValueHomeFacts, value: i64, temp: i64) -> i64 {
   let phys = pipeline_ir_native_value_home_lookup(pinned, value)
-  if phys >= 1000 or phys == pipeline_ir_native_discard_home() {
+  if phys >= pipeline_ir_native_remat_base() {
+    bu32(code, encode_movz(temp, phys - pipeline_ir_native_remat_base(), 0))
+    temp
+  } else { if phys >= 1000 or phys == pipeline_ir_native_discard_home() {
     bu32(code, encode_brk(20))
     17
   } else { if phys < 0 {
@@ -21657,7 +21695,7 @@ fn pipeline_ir_native_load_value_temp_pinned(code: i64, pinned: PipelineIrNative
   } else { if phys != 0 { phys } else {
     bu32(code, encode_brk(20))
     17
-  } } }
+  } } } }
 }
 
 fn pipeline_ir_native_spill_pinned_value(code: i64, value: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
@@ -24320,7 +24358,10 @@ fn pipeline_ir_native_resident_mark_slot_like(inst: IrInst, slot_like: i64, addr
 -- 14 use_last_kind (0 simple, 1 call-read-safe, 2 other non-simple),
 -- 15 use_last_pre_barrier (barrier count BEFORE the last use's inst),
 -- 16 use_nonfinal_unsafe (some non-final use was non-simple),
--- 17 def_discard_safe (defining inst is a dead_store_safe shape)
+-- 17 def_discard_safe (defining inst is a dead_store_safe shape),
+-- 18 use_count (raw use-site tally),
+-- 19 def_const_kind (0 none, 1 single-instruction movz const, 2 other const),
+-- 20 def_const_val (the constant, valid when def_const_kind != 0)
 fn pipeline_ir_native_resident_record_use(u: i64, gpos: i64, block_id: i64, simple: i64, fp_allowed: i64, cs_safe: i64, call_safe: i64, pre_barrier: i64, next_value: i64, arrays: i64, w: i64) -> i64 {
   if u >= 0 and u < next_value {
     -- Call-window tenancy bookkeeping (2v Stage 1): only the FINAL use
@@ -24340,6 +24381,7 @@ fn pipeline_ir_native_resident_record_use(u: i64, gpos: i64, block_id: i64, simp
     pipeline_ir_native_resident_dense_set(nlist_get(arrays, 7), u, 1)
     pipeline_ir_native_resident_dense_set(nlist_get(arrays, 3), u, gpos)
     pipeline_ir_native_resident_dense_set(nlist_get(arrays, 10), u, nlist_get(nlist_get(arrays, 10), u) + w)
+    pipeline_ir_native_resident_dense_set(nlist_get(arrays, 18), u, nlist_get(nlist_get(arrays, 18), u) + 1)
     if simple == 0 { pipeline_ir_native_resident_dense_set(nlist_get(arrays, 5), u, 0) } else { 0 }
     if cs_safe == 0 { pipeline_ir_native_resident_dense_set(nlist_get(arrays, 13), u, 0) } else { 0 }
     if fp_allowed == 0 { pipeline_ir_native_resident_dense_set(nlist_get(arrays, 6), u, 0) } else { 0 }
@@ -24608,7 +24650,9 @@ fn pipeline_ir_native_pinned_has_cs_fp(pinned: i64) -> i64 {
   let mut cur = pinned
   let mut found = 0
   while cur != 0 and found == 0 {
-    if node_f2(cur) >= 1008 { found = 1 } else { cur = node_f3(cur) }
+    -- Callee-saved FP homes are exactly 1008-1015 (d8-d15); the remat
+    -- pseudo-home range lies far above and must not trip preserve_fp.
+    if node_f2(cur) >= 1008 and node_f2(cur) <= 1015 { found = 1 } else { cur = node_f3(cur) }
   }
   found
 }
@@ -24772,6 +24816,9 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
       nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
       nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
+      nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
+      nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
+      nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
       let def_pos = nlist_get(arrays, 0)
       let def_block = nlist_get(arrays, 1)
       let def_simple = nlist_get(arrays, 2)
@@ -24790,6 +24837,9 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       let use_last_pre_barrier = nlist_get(arrays, 15)
       let use_nonfinal_unsafe = nlist_get(arrays, 16)
       let def_discard_safe = nlist_get(arrays, 17)
+      let use_count = nlist_get(arrays, 18)
+      let def_const_kind = nlist_get(arrays, 19)
+      let def_const_val = nlist_get(arrays, 20)
       let region_bundle = pipeline_ir_native_resident_regions(blocks)
       let region_of = node_f1(region_bundle)
       let layout_pos = node_f2(region_bundle)
@@ -24874,6 +24924,14 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
                           pipeline_ir_native_resident_dense_set(def_block, d, block_id)
                           pipeline_ir_native_resident_dense_set(def_simple, d, def_class)
                           pipeline_ir_native_resident_dense_set(def_discard_safe, d, pipeline_ir_native_resident_inst_dead_store_safe(inst))
+                          match inst {
+                            IrConstI64(cd, cv) -> {
+                              let ckind = if cv >= 0 and cv <= 65535 { 1 } else { 2 }
+                              pipeline_ir_native_resident_dense_set(def_const_kind, d, ckind)
+                              pipeline_ir_native_resident_dense_set(def_const_val, d, cv)
+                            }
+                            _ -> 0
+                          }
                           pipeline_ir_native_resident_dense_set(fp_def, d, pipeline_ir_native_resident_inst_fp_def(inst, f64_facts))
                         }
                         pipeline_ir_native_resident_dense_set(weight, d, nlist_get(weight, d) + block_w)
@@ -25328,6 +25386,29 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
         } else { 0 }
         0
       } else { 0 }
+      -- Stage 3 constant remat: constants still frame-homed after every
+      -- placement pass (pool, swaps, cs reuse) reload via ldr at each
+      -- use. movz-range constants whose every use reads through the
+      -- pinned-aware path re-materialize instead: phys carries the
+      -- constant (remat_base + k), each load becomes one movz, and the
+      -- def store disappears. use_cs_ok guards the bespoke-reader
+      -- sites (intrinsics, perform, handler machinery, float staging);
+      -- swap_excluded guards lambda identity-home scratch. The large
+      -- counters keep sizing the multi-instruction residue.
+      let mut pv = 8
+      while pv < next_value {
+        if nlist_get(def_const_kind, pv) != 0 and nlist_get(def_pos, pv) >= 0 and nlist_get(use_seen, pv) == 1 and pipeline_ir_native_pinned_slot_lookup(pinned, pv) == 0 {
+          if nlist_get(def_const_kind, pv) == 1 and nlist_get(use_cs_ok, pv) == 1 and nlist_get(slot_like, pv) == 0 and nlist_get(addr_taken, pv) == 0 and nlist_get(swap_excluded, pv) == 0 {
+            pinned = pipeline_ir_native_pinned_slot_new(pv, pipeline_ir_native_remat_base() + nlist_get(def_const_val, pv), pipeline_ir_native_pinned_slot_kind_resident(), pinned)
+            fmap_add_ir_native_remat_small_def_count(fm, 1)
+            fmap_add_ir_native_remat_small_use_count(fm, nlist_get(use_count, pv))
+          } else { if nlist_get(def_const_kind, pv) == 2 {
+            fmap_add_ir_native_remat_large_def_count(fm, 1)
+            fmap_add_ir_native_remat_large_use_count(fm, nlist_get(use_count, pv))
+          } else { 0 } }
+        } else { 0 }
+        pv = pv + 1
+      }
       fmap_add_ir_native_cs_resident_count(fm, cs_assigned)
       fmap_add_ir_native_volatile_resident_count(fm, assigned)
       fmap_add_ir_native_fp_resident_count(fm, fp_assigned)
