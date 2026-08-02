@@ -25384,40 +25384,53 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
         }
         if nlist_len(cs_pre) > 0 {
         let reusable_param_homes = pipeline_ir_native_reusable_param_homes(blocks, param_count)
-        -- home_free[k]: -2 = home unavailable, otherwise the gpos where
-        -- its current tenant's loop-rounded window ends (-1 = owner never
-        -- touched). Owner windows mirror the tenancy math: plain defs use
-        -- [def, last_use], block params use their writer-extended window,
-        -- and both round out over enclosing-loop backedges.
-        let home_free = pipeline_ir_native_resident_dense_new(8, 0 - 2)
+        -- Per-home occupancy as INTERVAL SETS (node(lo, hi) lists), not a
+        -- single expiry scalar: weight-ordered seating below places
+        -- windows in arbitrary start order, so a tenant may legally end
+        -- before a late owner's window begins — the owner interval keeps
+        -- its START as well as its end. home_ok[k] = 0 marks a home the
+        -- pass may not touch at all. Owner windows mirror the tenancy
+        -- math: plain defs use [def, last_use], block params their
+        -- writer-extended window, entry params [0, last_use], all
+        -- rounded over enclosing-loop backedges.
+        let home_ok = pipeline_ir_native_resident_dense_new(8, 0)
+        let home_ivs = nlist_new()
         let mut hk = 0
         while hk < 8 {
+          nlist_add(home_ivs, nlist_new())
           let owner_reusable = if hk >= param_count { 1 } else { nlist_get(reusable_param_homes, hk) }
           if owner_reusable == 1 and nlist_get(swap_excluded, hk) == 0 and pipeline_ir_native_pinned_slot_lookup(pinned, hk) == 0 and pipeline_ir_native_f64_slot_home_lookup(f64_facts, hk) < 0 {
             let own_dp = nlist_get(def_pos, hk)
-            let own_end = if own_dp >= 0 {
+            let own_iv = if own_dp >= 0 {
               let own_hi = if nlist_get(last_use, hk) > own_dp { nlist_get(last_use, hk) } else { own_dp }
-              node_f2(pipeline_ir_native_cs_round_window(backedge_terms, block_entry_gpos, entry_gpos_size, own_dp, own_hi))
+              pipeline_ir_native_cs_round_window(backedge_terms, block_entry_gpos, entry_gpos_size, own_dp, own_hi)
             } else { if hk < param_count {
               if nlist_get(use_seen, hk) == 1 {
-                node_f2(pipeline_ir_native_cs_round_window(backedge_terms, block_entry_gpos, entry_gpos_size, 0, nlist_get(last_use, hk)))
-              } else { 0 - 1 }
+                pipeline_ir_native_cs_round_window(backedge_terms, block_entry_gpos, entry_gpos_size, 0, nlist_get(last_use, hk))
+              } else { 0 }
             } else { if nlist_get(param_entry, hk) >= 0 or nlist_get(param_writer_count, hk) > 0 {
               let own_lo = nlist_get(param_lo, hk)
               let own_hi2 = if nlist_get(param_hi, hk) > nlist_get(last_use, hk) { nlist_get(param_hi, hk) } else { nlist_get(last_use, hk) }
-              node_f2(pipeline_ir_native_cs_round_window(backedge_terms, block_entry_gpos, entry_gpos_size, own_lo, own_hi2))
-            } else { if nlist_get(use_seen, hk) == 1 { 0 - 2 } else { 0 - 1 } } } }
-            pipeline_ir_native_resident_dense_set(home_free, hk, own_end)
+              pipeline_ir_native_cs_round_window(backedge_terms, block_entry_gpos, entry_gpos_size, own_lo, own_hi2)
+            } else { if nlist_get(use_seen, hk) == 1 { 0 - 1 } else { 0 } } } }
+            if own_iv == (0 - 1) {
+              -- Touched in a shape the owner math cannot window: the
+              -- home stays out of the pool entirely.
+              0
+            } else {
+              pipeline_ir_native_resident_dense_set(home_ok, hk, 1)
+              if own_iv != 0 { nlist_add(nlist_get(home_ivs, hk), own_iv) } else { 0 }
+            }
           } else { 0 }
           hk = hk + 1
         }
-        -- Two-tier start-ordered first-fit with per-home expiry:
-        -- barrier-crossers (and params) process first in start order,
-        -- then barrier-free overflow in start order — the tier bias in
-        -- the sort key keeps the greedy sound because within a home
-        -- every accepted window still starts after the previous
-        -- tenant's rounded end (hf < tlo), regardless of tier.
-        let cs_tier_bias = 1000000000
+        -- Weight-ordered seating (Stage 5): candidates process in
+        -- descending static benefit (use_count reloads + 1 store per
+        -- seat), ties broken by ascending window start then value id
+        -- for determinism. A candidate seats in the first home whose
+        -- interval set has no overlap with its rounded window. This
+        -- replaces the start-ordered first-fit whose single-expiry
+        -- greedy gave homes to whoever came first regardless of value.
         let ncand = nlist_len(cs_pre)
         let mut si = 0
         while si < ncand {
@@ -25426,17 +25439,20 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
           while sj < ncand {
             let vj = nlist_get(cs_pre, sj)
             let vb = nlist_get(cs_pre, best)
+            -- Static benefit of a seat: every use stops reloading, and
+            -- every WRITE stops storing — one def store for ordinary
+            -- values, one edge store per incoming writer for block
+            -- params.
+            let wr_j = if nlist_get(def_pos, vj) >= 0 { 1 } else { nlist_get(param_writer_count, vj) }
+            let wr_b = if nlist_get(def_pos, vb) >= 0 { 1 } else { nlist_get(param_writer_count, vb) }
+            let uc_j = nlist_get(use_count, vj) + wr_j
+            let uc_b = nlist_get(use_count, vb) + wr_b
             let kj_base = if nlist_get(def_pos, vj) >= 0 { nlist_get(def_pos, vj) } else { nlist_get(param_lo, vj) }
             let kb_base = if nlist_get(def_pos, vb) >= 0 { nlist_get(def_pos, vb) } else { nlist_get(param_lo, vb) }
-            let kj_free = if nlist_get(def_pos, vj) >= 0 {
-              if nlist_get(barrier_at, nlist_get(last_use, vj)) == nlist_get(barrier_at, nlist_get(def_pos, vj)) { 1 } else { 0 }
-            } else { 0 }
-            let kb_free = if nlist_get(def_pos, vb) >= 0 {
-              if nlist_get(barrier_at, nlist_get(last_use, vb)) == nlist_get(barrier_at, nlist_get(def_pos, vb)) { 1 } else { 0 }
-            } else { 0 }
-            let kj = kj_free * cs_tier_bias + kj_base
-            let kb = kb_free * cs_tier_bias + kb_base
-            if kj < kb { best = sj } else { 0 }
+            let take = if uc_j > uc_b { 1 }
+              else { if uc_j == uc_b and kj_base < kb_base { 1 }
+              else { if uc_j == uc_b and kj_base == kb_base and vj < vb { 1 } else { 0 } } }
+            if take == 1 { best = sj } else { 0 }
             sj = sj + 1
           }
           if best != si {
@@ -25457,18 +25473,27 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
           let mut hk2 = 0
           let mut placed_cs = 0
           while hk2 < 8 and placed_cs == 0 {
-            let hf = nlist_get(home_free, hk2)
-            if hf != (0 - 2) and hf < tlo {
-              pinned = pipeline_ir_native_pinned_slot_new(cvv, 19 + hk2, pipeline_ir_native_pinned_slot_kind_resident(), pinned)
-              pipeline_ir_native_resident_dense_set(home_free, hk2, ive)
-              cs_assigned = cs_assigned + 1
-              if cvv_dp >= 0 {
-                pipeline_ir_native_audit_note_range(fm, cvv, 19 + hk2, cvv_dp, nlist_get(last_use, cvv))
-              } else {
-                fmap_inc_ir_native_param_resident_count(fm)
-                pipeline_ir_native_audit_note_param_range(fm, 19 + hk2, nlist_get(param_lo, cvv), ive, nlist_get(param_writers, cvv))
+            if nlist_get(home_ok, hk2) == 1 {
+              let ivs = nlist_get(home_ivs, hk2)
+              let niv = nlist_len(ivs)
+              let mut ii = 0
+              let mut clash = 0
+              while ii < niv and clash == 0 {
+                let iv = nlist_get(ivs, ii)
+                if tlo <= node_f2(iv) and node_f1(iv) <= ive { clash = 1 } else { ii = ii + 1 }
               }
-              placed_cs = 1
+              if clash == 0 {
+                pinned = pipeline_ir_native_pinned_slot_new(cvv, 19 + hk2, pipeline_ir_native_pinned_slot_kind_resident(), pinned)
+                nlist_add(ivs, tw)
+                cs_assigned = cs_assigned + 1
+                if cvv_dp >= 0 {
+                  pipeline_ir_native_audit_note_range(fm, cvv, 19 + hk2, cvv_dp, nlist_get(last_use, cvv))
+                } else {
+                  fmap_inc_ir_native_param_resident_count(fm)
+                  pipeline_ir_native_audit_note_param_range(fm, 19 + hk2, nlist_get(param_lo, cvv), ive, nlist_get(param_writers, cvv))
+                }
+                placed_cs = 1
+              } else { hk2 = hk2 + 1 }
             } else { hk2 = hk2 + 1 }
           }
           si = si + 1
