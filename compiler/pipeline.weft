@@ -1159,6 +1159,16 @@ fn pipeline_native_crossblock_probe_count(native: NativeModule, which: i64) -> i
   }
 }
 
+fn pipeline_native_split_probe_count(native: NativeModule, which: i64) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> {
+      if which == 0 { fmap_ir_native_split_candidate_count(fm) }
+      else { if which == 1 { fmap_ir_native_split_segment_use_count(fm) }
+      else { fmap_ir_native_split_resident_count(fm) } }
+    }
+  }
+}
+
 fn pipeline_native_residual_probe_count(native: NativeModule, which: i64) -> i64 {
   match native {
     NativeModule(code, fm, functions) -> {
@@ -22951,7 +22961,83 @@ fn pipeline_ir_native_emit_ctx_vector_data_facts(ctx: PipelineNativeEmitCtx) -> 
   }
 }
 
+-- Def-segment split tenancy (2v Stage 4): a still-spilled value with
+-- uses both inside and beyond its def's barrier-free segment starts
+-- REGISTER-homed (the pinned map carries the pool reg). Right after
+-- its def, the walker persists the register to the canonical slot;
+-- at the first barrier (and at block boundaries) the value's home
+-- FLIPS back to the slot. Segment reads hit the register for free,
+-- post-barrier reads hit the slot the walker wrote — the split
+-- deletes exactly the segment reloads.
+fn pipeline_ir_native_value_home_flip(facts: PipelineIrNativeValueHomeFacts, value: i64, phys: i64) -> i64 {
+  match facts {
+    PipelineIrNativeValueHomeFacts(homes, assignments, forward) -> {
+      if value >= 0 and value < nlist_len(homes) {
+        pipeline_ir_native_resident_dense_set(homes, value, phys)
+      } else { 0 }
+    }
+    PipelineIrNativeIdentityHomeFacts(next_value, forward) -> 0
+  }
+}
+
+fn pipeline_ir_native_split_flip_actives(fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  let actives = fmap_current_split_actives(fm)
+  if actives == 0 { 0 }
+  else {
+    let n = nlist_len(actives)
+    if n == 0 { 0 }
+    else {
+      let mut i = 0
+      while i < n {
+        let v = nlist_get(actives, i)
+        pipeline_ir_native_value_home_flip(pinned, v, pipeline_ir_native_identity_home(v))
+        i = i + 1
+      }
+      fmap_set_current_split_actives(fm, nlist_new())
+      0
+    }
+  }
+}
+
+fn pipeline_ir_native_split_activate(code: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts, d: i64) -> i64 {
+  if d < 8 { 0 }
+  else {
+    let sm = fmap_current_split_map(fm)
+    if sm == 0 { 0 }
+    else {
+      if d >= nlist_len(sm) { 0 }
+      else {
+        let reg = nlist_get(sm, d)
+        if reg == 0 { 0 }
+        else {
+          -- The def just wrote the split register (its pinned home);
+          -- persist it so post-flip readers find the value in the
+          -- canonical slot.
+          let slot_home = pipeline_ir_native_identity_home(d)
+          emit_store_spill_offset(code, reg, (0 - slot_home - 1) * 8)
+          pipeline_ir_native_ck_def(code, pinned, slot_home, d)
+          nlist_add(fmap_current_split_actives(fm), d)
+          0
+        }
+      }
+    }
+  }
+}
+
 fn pipeline_ir_native_emit_inst(inst: IrInst, code: i64, src: i64, fm: i64, ctx: PipelineNativeEmitCtx) -> PipelineNativeEmitCtx {
+  -- Split hooks bracket the dispatch: a barrier ends every active
+  -- segment BEFORE its own emission (its operand reads then hit the
+  -- slots, conservatively), and a split value's def persists to its
+  -- slot right AFTER the defining instruction.
+  if pipeline_ir_native_resident_inst_simple(inst) == 0 {
+    pipeline_ir_native_split_flip_actives(fm, pipeline_ir_native_emit_ctx_pinned(ctx))
+  } else { 0 }
+  let out_ctx = pipeline_ir_native_emit_inst_dispatch(inst, code, src, fm, ctx)
+  pipeline_ir_native_split_activate(code, fm, pipeline_ir_native_emit_ctx_pinned(out_ctx), pipeline_ir_inst_def_or(inst, 0 - 1))
+  out_ctx
+}
+
+fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, src: i64, fm: i64, ctx: PipelineNativeEmitCtx) -> PipelineNativeEmitCtx {
   let scope = pipeline_ir_native_emit_ctx_scope(ctx)
   let handlers = pipeline_ir_native_emit_ctx_handlers(ctx)
   let pinned = pipeline_ir_native_emit_ctx_pinned(ctx)
@@ -23522,6 +23608,9 @@ fn pipeline_ir_native_emit_blocks(blocks: IrBlockList, all_blocks: IrBlockList, 
       match block {
         IrBlock(id, params, insts, term) -> {
           let next_labels = pipeline_ir_native_label_map_add(labels, id, buf_len(code))
+          -- A split segment never survives its block: any active from
+          -- the previous block flips home before this block's reads.
+          pipeline_ir_native_split_flip_actives(fm, pinned)
           let branch_cmp_info = pipeline_ir_native_direct_branch_cmp_info_for_term(insts, term)
           let ctx = pipeline_ir_native_emit_inst_list_for_term(insts, code, src, fm, PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, pipeline_ir_native_fp_env_empty(), vector_data_facts), branch_cmp_info)
           let next_handlers_ctx = pipeline_ir_native_emit_ctx_handlers(ctx)
@@ -24437,7 +24526,14 @@ fn pipeline_ir_native_resident_mark_slot_like(inst: IrInst, slot_like: i64, addr
 -- 17 def_discard_safe (defining inst is a dead_store_safe shape),
 -- 18 use_count (raw use-site tally),
 -- 19 def_const_kind (0 none, 1 single-instruction movz const, 2 other const),
--- 20 def_const_val (the constant, valid when def_const_kind != 0)
+-- 20 def_const_val (the constant, valid when def_const_kind != 0),
+-- 21 def_segment_uses (uses inside the def's own barrier-free segment:
+--    same block, no barrier between — the loads a def-segment split
+--    tenancy would delete),
+-- 22 def_barrier (barrier count at the def, barrier_at[def_pos] cached
+--    per value so record_use can compare without the gpos list),
+-- 23 def_segment_last_use (latest simple-inst segment-use gpos — the
+--    split tenancy's window end)
 fn pipeline_ir_native_resident_record_use(u: i64, gpos: i64, block_id: i64, simple: i64, fp_allowed: i64, cs_safe: i64, call_safe: i64, pre_barrier: i64, next_value: i64, arrays: i64, w: i64) -> i64 {
   if u >= 0 and u < next_value {
     -- Call-window tenancy bookkeeping (2v Stage 1): only the FINAL use
@@ -24458,6 +24554,12 @@ fn pipeline_ir_native_resident_record_use(u: i64, gpos: i64, block_id: i64, simp
     pipeline_ir_native_resident_dense_set(nlist_get(arrays, 3), u, gpos)
     pipeline_ir_native_resident_dense_set(nlist_get(arrays, 10), u, nlist_get(nlist_get(arrays, 10), u) + w)
     pipeline_ir_native_resident_dense_set(nlist_get(arrays, 18), u, nlist_get(nlist_get(arrays, 18), u) + 1)
+    if simple == 1 and nlist_get(nlist_get(arrays, 0), u) >= 0 and nlist_get(nlist_get(arrays, 1), u) == block_id {
+      if nlist_get(nlist_get(arrays, 22), u) == pre_barrier {
+        pipeline_ir_native_resident_dense_set(nlist_get(arrays, 21), u, nlist_get(nlist_get(arrays, 21), u) + 1)
+        pipeline_ir_native_resident_dense_set(nlist_get(arrays, 23), u, gpos)
+      } else { 0 }
+    } else { 0 }
     if simple == 0 { pipeline_ir_native_resident_dense_set(nlist_get(arrays, 5), u, 0) } else { 0 }
     if cs_safe == 0 { pipeline_ir_native_resident_dense_set(nlist_get(arrays, 13), u, 0) } else { 0 }
     if fp_allowed == 0 { pipeline_ir_native_resident_dense_set(nlist_get(arrays, 6), u, 0) } else { 0 }
@@ -24866,6 +24968,10 @@ fn pipeline_ir_native_reusable_param_homes(blocks: IrBlockList, param_count: i64
 }
 
 fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, raw_pinned: i64, fm: i64, f64_facts: PipelineIrNativeF64Facts, vector_data_facts: PipelineIrNativeVectorDataFacts) -> i64 {
+  -- Split state is per-function; bail paths must not leak a previous
+  -- function's map into this one's emission hooks.
+  fmap_set_current_split_map(fm, 0)
+  fmap_set_current_split_actives(fm, 0)
   if pipeline_ir_native_blocks_have_handles(blocks) == 1 { raw_pinned }
   else {
     -- FP candidates can have any value id, so even bank-only functions
@@ -24895,6 +25001,9 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
       nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
       nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
+      nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
+      nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
+      nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0 - 1))
       let def_pos = nlist_get(arrays, 0)
       let def_block = nlist_get(arrays, 1)
       let def_simple = nlist_get(arrays, 2)
@@ -24916,6 +25025,9 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       let use_count = nlist_get(arrays, 18)
       let def_const_kind = nlist_get(arrays, 19)
       let def_const_val = nlist_get(arrays, 20)
+      let def_segment_uses = nlist_get(arrays, 21)
+      let def_barrier = nlist_get(arrays, 22)
+      let def_segment_last_use = nlist_get(arrays, 23)
       let region_bundle = pipeline_ir_native_resident_regions(blocks)
       let region_of = node_f1(region_bundle)
       let layout_pos = node_f2(region_bundle)
@@ -25000,6 +25112,7 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
                           pipeline_ir_native_resident_dense_set(def_block, d, block_id)
                           pipeline_ir_native_resident_dense_set(def_simple, d, def_class)
                           pipeline_ir_native_resident_dense_set(def_discard_safe, d, pipeline_ir_native_resident_inst_dead_store_safe(inst))
+                          pipeline_ir_native_resident_dense_set(def_barrier, d, barrier_cum)
                           match inst {
                             IrConstI64(cd, cv) -> {
                               let ckind = if cv >= 0 and cv <= 65535 { 1 } else { 2 }
@@ -25518,6 +25631,14 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
         -- exclusion reason. This is the map of what's left.
         if nlist_get(def_pos, pv) >= 0 and nlist_get(use_seen, pv) == 1 and pipeline_ir_native_pinned_slot_lookup(pinned, pv) == 0 {
           fmap_add_ir_native_residual_use_sum_count(fm, nlist_get(use_count, pv))
+          -- Split sizing: a still-spilled value with SOME uses in its
+          -- def's barrier-free segment and MORE beyond it — a
+          -- def-segment split tenancy would delete exactly the
+          -- segment loads.
+          if nlist_get(def_segment_uses, pv) > 0 and nlist_get(def_segment_uses, pv) < nlist_get(use_count, pv) {
+            fmap_add_ir_native_split_candidate_count(fm, 1)
+            fmap_add_ir_native_split_segment_use_count(fm, nlist_get(def_segment_uses, pv))
+          } else { 0 }
           if nlist_get(slot_like, pv) == 1 or nlist_get(addr_taken, pv) == 1 {
             fmap_add_ir_native_residual_slotlike_count(fm, 1)
           } else { if nlist_get(use_cs_ok, pv) == 0 {
@@ -25556,6 +25677,40 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
         } else { 0 }
         pv = pv + 1
       }
+      -- Def-segment split tenancy (Stage 4): a value with uses both
+      -- inside and beyond its def's barrier-free segment takes a pool
+      -- register for [def, segment-last-use] only. The walker persists
+      -- the def to the canonical slot and flips the home at the first
+      -- barrier or block end, so later uses read the slot. Runs after
+      -- remat and every whole-range pass — splits take leftovers.
+      let split_map = pipeline_ir_native_resident_dense_new(next_value, 0)
+      let mut split_assigned = 0
+      let mut sv = 8
+      while sv < next_value {
+        if nlist_get(def_pos, sv) >= 0 and nlist_get(use_seen, sv) == 1 and nlist_get(def_segment_uses, sv) > 0 and nlist_get(def_segment_uses, sv) < nlist_get(use_count, sv) and nlist_get(slot_like, sv) == 0 and nlist_get(addr_taken, sv) == 0 and nlist_get(swap_excluded, sv) == 0 and nlist_get(fp_def, sv) == 0 and pipeline_ir_native_pinned_slot_lookup(pinned, sv) == 0 and pipeline_ir_native_f64_slot_home_lookup(f64_facts, sv) < 0 {
+          let sdp = nlist_get(def_pos, sv)
+          let slu = nlist_get(def_segment_last_use, sv)
+          if slu > sdp {
+            let mut spr = 0
+            let mut placed_split = 0
+            while spr < pool_n and placed_split == 0 {
+              if sdp > nlist_get(pool_busy, spr) {
+                pinned = pipeline_ir_native_pinned_slot_new(sv, nlist_get(pool_regs, spr), pipeline_ir_native_pinned_slot_kind_resident(), pinned)
+                pipeline_ir_native_resident_dense_set(pool_busy, spr, slu)
+                pipeline_ir_native_resident_dense_set(split_map, sv, nlist_get(pool_regs, spr))
+                split_assigned = split_assigned + 1
+                pipeline_ir_native_audit_note_range(fm, sv, nlist_get(pool_regs, spr), sdp, slu)
+                placed_split = 1
+              } else { spr = spr + 1 }
+            }
+            0
+          } else { 0 }
+        } else { 0 }
+        sv = sv + 1
+      }
+      fmap_set_current_split_map(fm, split_map)
+      fmap_set_current_split_actives(fm, nlist_new())
+      fmap_add_ir_native_split_resident_count(fm, split_assigned)
       -- Stage 2 sizing probe: barrier-free (leaf) functions never
       -- clobber caller-saved registers, so a caller-saved bank would
       -- shed their x19-x26 pairs, fp/lr save, and frame entirely.
@@ -26501,6 +26656,8 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
           pipeline_ir_native_alloc_checker_function(code, fm, hash, fn_off, pipeline_ir_native_ck_events(pinned))
         } else { 0 }
         emit_epilogue_current(code, fm)
+        fmap_set_current_split_map(fm, 0)
+        fmap_set_current_split_actives(fm, 0)
         cg_cleanup_restore(fm, old_cleanup_depth)
         fmap_set_current_frame_size(fm, old_frame)
         fmap_set_current_preserve_fp(fm, old_preserve_fp)
