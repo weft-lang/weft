@@ -894,6 +894,12 @@ fn pipeline_native_spill_load_bucket(native: NativeModule, i: i64) -> i64 {
   }
 }
 
+fn pipeline_native_shape_census_count(native: NativeModule, set: i64, shape: i64) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_shape_census_count(fm, set, shape)
+  }
+}
+
 fn pipeline_native_ck_first_fn_hash(native: NativeModule) -> i64 {
   match native {
     NativeModule(code, fm, functions) -> fmap_ck_first_fn_hash(fm)
@@ -24991,11 +24997,64 @@ fn pipeline_ir_native_reusable_param_homes(blocks: IrBlockList, param_count: i64
   }
 }
 
+-- Def-shape classes for the spill census (2v). Recorded at first-def
+-- during the residents walk, consumed by the checker's ledger walk to
+-- bucket slot tenancies by what defined them. Classes: 0 none (block
+-- param — no inst def recorded), 1 call result, 2 small const / nil,
+-- 3 large const, 4 field/ptr load, 5 variant tag/payload, 6 slot load,
+-- 7 arith, 8 constructor, 9 address materialisation, 10 effect/handler
+-- op, 11 fp def, 12 vector get (fp candidate, element type unknown),
+-- 13 zero-use variant extraction (rewritten from 5 post-walk),
+-- 14 other, 15 function never scanned (handler-bearing bail).
+fn pipeline_ir_native_resident_def_shape(inst: IrInst, fpd: i64) -> i64 {
+  match inst {
+    IrVectorGetI64(vdst, vec, index, fallback, check_mode) -> 12
+    _ -> {
+      if fpd == 1 { 11 }
+      else {
+        match inst {
+          IrCallI64(dst, callee_hash, args) -> 1
+          IrIndirectCallI64(dst, callee, args) -> 1
+          IrGenericCallI64(dst, callee_hash, tys, args) -> 1
+          IrMethodCallI64(dst, recv, mhash, arity, args) -> 1
+          IrConstI64(dst, cv) -> if cv >= 0 and cv <= 65535 { 2 } else { 3 }
+          IrNilI64(dst) -> 2
+          IrFieldLoadI64(dst, base, off, mask) -> 4
+          IrPtrLoadI64(dst, ptr) -> 4
+          IrVariantTagI64(dst, src) -> 5
+          IrVariantPayloadI64(dst, src, index) -> 5
+          IrLoadI64(dst, slot) -> 6
+          IrBinaryI64(dst, op, lhs, rhs) -> 7
+          IrUnaryI64(dst, uop, src) -> 7
+          IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> 7
+          IrVariantInitI64(dst, tag, payload, mask) -> 8
+          IrRecordInitI64(dst, count, fields) -> 8
+          IrClosureI64(dst, f, captures, evidence) -> 8
+          IrStringConcatI64(dst, lhs, rhs) -> 8
+          IrAddressOfSlotI64(dst, slot) -> 9
+          IrFunctionRefI64(dst, fhash) -> 9
+          IrStringLit(dst, start, len) -> 9
+          IrPerformI64(dst, eff, op_hash, args) -> 10
+          IrHandlerDirectI64(dst, h1, h2, h3, h4, args) -> 10
+          IrHandleI64(dst, handle_src, eff, clauses, nclauses, reserved) -> 10
+          IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, eff, scratch_base) -> 10
+          IrResumeI64(dst, v) -> 10
+          IrBindI64(ns, nl, value, ty) -> 10
+          _ -> 14
+        }
+      }
+    }
+  }
+}
+
 fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, raw_pinned: i64, fm: i64, f64_facts: PipelineIrNativeF64Facts, vector_data_facts: PipelineIrNativeVectorDataFacts) -> i64 {
   -- Split state is per-function; bail paths must not leak a previous
-  -- function's map into this one's emission hooks.
+  -- function's map into this one's emission hooks. The def-shape map
+  -- follows the same discipline: a bailed function leaves it 0 so the
+  -- checker buckets its tenancies as class 15 (never scanned).
   fmap_set_current_split_map(fm, 0)
   fmap_set_current_split_actives(fm, 0)
+  fmap_set_current_def_shapes(fm, 0)
   if pipeline_ir_native_blocks_have_handles(blocks) == 1 { raw_pinned }
   else {
     -- FP candidates can have any value id, so even bank-only functions
@@ -25056,6 +25115,8 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       let def_segment_last_use = nlist_get(arrays, 23)
       let use_last_fwd = nlist_get(arrays, 24)
       let def_x17_simple = nlist_get(arrays, 25)
+      let def_shapes = pipeline_ir_native_resident_dense_new(next_value, 0)
+      fmap_set_current_def_shapes(fm, def_shapes)
       let region_bundle = pipeline_ir_native_resident_regions(blocks)
       let region_of = node_f1(region_bundle)
       let layout_pos = node_f2(region_bundle)
@@ -25155,6 +25216,7 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
                             _ -> 0
                           }
                           pipeline_ir_native_resident_dense_set(fp_def, d, pipeline_ir_native_resident_inst_fp_def(inst, f64_facts))
+                          pipeline_ir_native_resident_dense_set(def_shapes, d, pipeline_ir_native_resident_def_shape(inst, nlist_get(fp_def, d)))
                         }
                         pipeline_ir_native_resident_dense_set(weight, d, nlist_get(weight, d) + block_w)
                       } else { 0 }
@@ -25226,6 +25288,15 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
         }
       }
       if fmap_audit_ranges(fm) != 0 { fmap_set_audit_expected_gpos(fm, gpos) } else { 0 }
+      -- Census refinement: a variant extraction whose value has no uses
+      -- anywhere is a pure dead store (class 13); class 5 keeps the
+      -- extractions whose uses were all load-free at the ledger. use_seen
+      -- is final once the walk completes.
+      for sv in 0..next_value {
+        if nlist_get(def_shapes, sv) == 5 and nlist_get(use_seen, sv) == 0 {
+          pipeline_ir_native_resident_dense_set(def_shapes, sv, 13)
+        } else { 0 }
+      }
       let mut pinned = raw_pinned
       -- Volatile GPR pool membership: x8/x10/x11 join only when the
       -- slot-pin pass (whose bank is x8/x10/x11, function-wide) has not
@@ -26517,10 +26588,15 @@ fn pipeline_ir_native_alloc_checker_function(code: i64, fm: i64, fn_hash: i64, f
     }
     -- Stage 1 pre-measurement: loads-per-spilled-def over this
     -- function's ledger (static loads recorded between consecutive
-    -- defs of each spill slot; ledger order is emission order).
+    -- defs of each spill slot; ledger order is emission order). Each
+    -- closing tenancy is also bucketed by the def shape of the value
+    -- the def event carried (spv tracks the open tenancy's value id —
+    -- the event's own value, so slot sharing cannot mismap it).
     let spb = alloc_words(ncells)
+    let spv = alloc_words(ncells)
     for i in 0..ncells {
       mem_store64_at(spb, i * 8, 0 - 1)
+      mem_store64_at(spv, i * 8, 0 - 1)
     }
     for i in 0..n {
       let spev = nlist_get(events, i)
@@ -26530,8 +26606,12 @@ fn pipeline_ir_native_alloc_checker_function(code: i64, fm: i64, fn_hash: i64, f
         if spidx < ncells {
           if node_tag(spev) == 1 {
             let spopen = mem_load64_at(spb, spidx * 8)
-            if spopen >= 0 { fmap_note_spill_def_loads(fm, spopen) } else { 0 }
+            if spopen >= 0 {
+              fmap_note_spill_def_loads(fm, spopen)
+              fmap_note_shape_spill_loads(fm, pipeline_ir_native_ck_shape_of(fm, mem_load64_at(spv, spidx * 8)), spopen)
+            } else { 0 }
             mem_store64_at(spb, spidx * 8, 0)
+            mem_store64_at(spv, spidx * 8, node_f3(spev))
           } else {
             let spopen = mem_load64_at(spb, spidx * 8)
             if spopen >= 0 { mem_store64_at(spb, spidx * 8, spopen + 1) } else { 0 }
@@ -26541,10 +26621,24 @@ fn pipeline_ir_native_alloc_checker_function(code: i64, fm: i64, fn_hash: i64, f
     }
     for i in 0..ncells {
       let spopen = mem_load64_at(spb, i * 8)
-      if spopen >= 0 { fmap_note_spill_def_loads(fm, spopen) } else { 0 }
+      if spopen >= 0 {
+        fmap_note_spill_def_loads(fm, spopen)
+        fmap_note_shape_spill_loads(fm, pipeline_ir_native_ck_shape_of(fm, mem_load64_at(spv, i * 8)), spopen)
+      } else { 0 }
     }
     0
   } else { 0 }
+}
+
+-- Shape class for a ledger tenancy's value: the residents walk's map if
+-- this function was scanned (0 there means no inst def — a block
+-- param), class 15 if the walk bailed before building one.
+fn pipeline_ir_native_ck_shape_of(fm: i64, v: i64) -> i64 {
+  let shapes = fmap_current_def_shapes(fm)
+  if shapes == 0 { 15 }
+  else {
+    if v >= 0 and v < nlist_len(shapes) { nlist_get(shapes, v) } else { 0 }
+  }
 }
 
 fn pipeline_ir_lambda_evidence_register_handler_clauses(clauses: IrHandlerClauseBodyList, fm: i64) -> i64 {
@@ -26698,6 +26792,7 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         emit_epilogue_current(code, fm)
         fmap_set_current_split_map(fm, 0)
         fmap_set_current_split_actives(fm, 0)
+        fmap_set_current_def_shapes(fm, 0)
         cg_cleanup_restore(fm, old_cleanup_depth)
         fmap_set_current_frame_size(fm, old_frame)
         fmap_set_current_preserve_fp(fm, old_preserve_fp)
