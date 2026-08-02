@@ -906,6 +906,12 @@ fn pipeline_native_split2_counter(native: NativeModule, which: i64) -> i64 {
   }
 }
 
+fn pipeline_native_pair_census_counter(native: NativeModule, which: i64) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_pair_census_counter(fm, which)
+  }
+}
+
 
 fn pipeline_native_ck_first_fn_hash(native: NativeModule) -> i64 {
   match native {
@@ -24314,11 +24320,19 @@ fn pipeline_ir_native_blocks_use_fiber_intrinsics(blocks: IrBlockList) -> i64 {
 
 fn pipeline_ir_native_gpr_pairs_for_function(param_count: i64, blocks: IrBlockList) -> i64 {
   if pipeline_ir_native_blocks_use_fiber_intrinsics(blocks) == 1 { 4 }
-  else {
+  else { if pipeline_ir_native_blocks_have_handles(blocks) == 1 {
+    -- Handler clause bodies are emitted inline in this function's code
+    -- region with their OWN value numbering: a clause-local value 4-7
+    -- writes its canonical bank home even when the parent's next_value
+    -- is small. The saved prefix must cover every numbering emitted in
+    -- the region, so handle-bearing functions save all four pairs (the
+    -- pair census's written-unsaved canary is the regression gate).
+    4
+  } else {
     let next_value = pipeline_ir_function_next_value(param_count, blocks)
     let bank_used = if next_value > 8 { 8 } else { next_value }
     (bank_used + 1) / 2
-  }
+  } }
 }
 
 -- Volatile-resident selection (2l stage 3 v0). An SSA value whose whole
@@ -26688,6 +26702,80 @@ fn pipeline_ir_native_alloc_checker_function(code: i64, fm: i64, fn_hash: i64, f
   } else { 0 }
 }
 
+-- Prologue-pair census (2v Stage 2 pre-measurement). Runs at the same
+-- audit point as the checker — the epilogue is not yet emitted, so
+-- scanning [fn_start, buf_len) sees the prologue (stp writes only sp)
+-- and the body, never the restore ldps. A saved pair is dead when the
+-- body writes neither register: tail-dead pairs fall to a simple
+-- prefix-count shrink, interior-dead need bank remapping. The
+-- written-unsaved counter is the soundness canary for the ledger to
+-- come: a body write to a callee-saved register beyond the saved
+-- prefix would corrupt the caller (must stay 0).
+fn pipeline_ir_native_pair_census_function(code: i64, fm: i64, fn_start: i64, fn_hash: i64) -> i64 {
+  let gpr_pairs = fmap_current_gpr_pairs(fm)
+  fmap_add_pair_census_counter(fm, 0, gpr_pairs)
+  let end = buf_len(code)
+  let mut written = 0
+  let mut unknown = 0
+  let mut p = fn_start
+  while p < end {
+    let writes = decode_writes_aarch64(pipeline_native_code_word(code, p))
+    if (writes band decode_writes_unknown_bit()) != 0 { unknown = 1 } else { 0 }
+    written = written bor writes
+    p = p + 4
+  }
+  if unknown == 1 {
+    fmap_add_pair_census_counter(fm, 5, 1)
+  } else {
+    let mut tail_dead = 0
+    let mut interior_dead = 0
+    let mut half_dead = 0
+    let mut in_tail = 1
+    let mut j = gpr_pairs - 1
+    while j >= 0 {
+      let r0 = 19 + j * 2
+      let w0 = if (written band decode_writes_gpr_bit(r0)) != 0 { 1 } else { 0 }
+      let w1 = if (written band decode_writes_gpr_bit(r0 + 1)) != 0 { 1 } else { 0 }
+      if w0 == 0 and w1 == 0 {
+        if in_tail == 1 { tail_dead = tail_dead + 1 } else { interior_dead = interior_dead + 1 }
+      } else {
+        in_tail = 0
+        if w0 == 0 or w1 == 0 { half_dead = half_dead + 1 } else { 0 }
+      }
+      j = j - 1
+    }
+    fmap_add_pair_census_counter(fm, 1, tail_dead)
+    fmap_add_pair_census_counter(fm, 2, interior_dead)
+    fmap_add_pair_census_counter(fm, 3, half_dead)
+    let mut r = 19 + gpr_pairs * 2
+    while r <= 26 {
+      if (written band decode_writes_gpr_bit(r)) != 0 {
+        fmap_add_pair_census_counter(fm, 4, 1)
+        -- Diagnostic specimen: first offender's hash, reg, and first
+        -- offending write's delta + word — zero in the green state,
+        -- self-identifying when the canary fires.
+        if fmap_pair_census_counter(fm, 6) == 0 {
+          fmap_add_pair_census_counter(fm, 6, fn_hash)
+          fmap_add_pair_census_counter(fm, 7, r)
+          let mut sp2 = fn_start
+          let mut found = 0
+          while sp2 < end and found == 0 {
+            let w2 = pipeline_native_code_word(code, sp2)
+            if (decode_writes_aarch64(w2) band decode_writes_gpr_bit(r)) != 0 {
+              fmap_add_pair_census_counter(fm, 8, sp2 - fn_start)
+              fmap_add_pair_census_counter(fm, 9, w2)
+              found = 1
+            } else { 0 }
+            sp2 = sp2 + 4
+          }
+        } else { 0 }
+      } else { 0 }
+      r = r + 1
+    }
+  }
+  0
+}
+
 -- Shape class for a ledger tenancy's value: the residents walk's map if
 -- this function was scanned (0 there means no inst def — a block
 -- param), class 15 if the walk bailed before building one.
@@ -26856,6 +26944,7 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         if fmap_audit_mode(fm) == 1 { pipeline_ir_native_residency_audit_function(code, fm, hash) } else { 0 }
         if fmap_audit_mode(fm) == 1 {
           pipeline_ir_native_alloc_checker_function(code, fm, hash, fn_off, pipeline_ir_native_ck_events(pinned))
+          pipeline_ir_native_pair_census_function(code, fm, fn_off, hash)
         } else { 0 }
         emit_epilogue_current(code, fm)
         fmap_set_current_split_map(fm, 0)
