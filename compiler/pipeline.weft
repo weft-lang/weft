@@ -912,6 +912,12 @@ fn pipeline_native_pair_census_counter(native: NativeModule, which: i64) -> i64 
   }
 }
 
+fn pipeline_native_naked_leaf_counter(native: NativeModule, which: i64) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_naked_leaf_counter(fm, which)
+  }
+}
+
 
 fn pipeline_native_ck_first_fn_hash(native: NativeModule) -> i64 {
   match native {
@@ -25110,6 +25116,7 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
   fmap_set_current_split_actives(fm, 0)
   fmap_set_current_def_shapes(fm, 0)
   fmap_set_current_use_segs(fm, 0)
+  fmap_set_current_naked_leaf(fm, 0)
   if pipeline_ir_native_blocks_have_handles(blocks) == 1 { raw_pinned }
   else {
     -- FP candidates can have any value id, so even bank-only functions
@@ -25205,6 +25212,7 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       let mut barrier_cum = 0
       let mut barrier_fp_cum = 0
       let mut barrier_fp_cs_cum = 0
+      let mut saw_slot_inst = 0
       let mut cur_blocks = blocks
       let mut blocks_done = 0
       while blocks_done == 0 {
@@ -25239,6 +25247,12 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
                     IrInstNil -> { done = 1 }
                     IrInstCons(inst, tail) -> {
                       let simple = pipeline_ir_native_resident_inst_simple(inst)
+                      match inst {
+                        IrSlotI64(slot_decl) -> { saw_slot_inst = 1 0 }
+                        IrLoadI64(sl_dst, sl_slot) -> { saw_slot_inst = 1 0 }
+                        IrStoreI64(sl_slot2, sl_val) -> { saw_slot_inst = 1 0 }
+                        _ -> 0
+                      }
                       let fp_simple = pipeline_ir_native_resident_inst_fp_simple(inst)
                       let fp_cs_simple = pipeline_ir_native_resident_inst_fp_cs_simple(inst)
                       let barrier_pre = barrier_cum
@@ -25903,6 +25917,34 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
         if next_value <= 8 {
           fmap_add_ir_native_leaf_small_fn_count(fm, 1)
           fmap_add_ir_native_leaf_small_fn_pair_count(fm, (leaf_bank + 1) / 2)
+          -- Naked-leaf qualification: barrier-free, bank-sized, no slot
+          -- instructions (the frame would be unread), no f64 slot homes.
+          -- Block params gate the shuffle-temp hazard path conservatively;
+          -- entry-param cleanup releases are BLs and need x30 saved.
+          if saw_slot_inst == 0 and pipeline_ir_native_f64_slot_home_count(f64_facts) == 0 {
+            if pipeline_ir_native_max_block_param_count(blocks, 0) == 0 {
+              if pipeline_ir_native_blocks_entry_params_need_cleanup(blocks, param_count) == 0 {
+                -- Realize: every value lives in a caller-saved register
+                -- (value 0 -> x8 because phys 0 is the pinned-map
+                -- sentinel; 1-7 stay in their arrival registers), the
+                -- prologue and epilogue vanish, and no callee-saved
+                -- register is touched at all.
+                fmap_set_current_naked_leaf(fm, 1)
+                fmap_set_current_gpr_pairs(fm, 0)
+                let mut nakedv = 0
+                while nakedv < next_value {
+                  pinned = pipeline_ir_native_pinned_slot_new(nakedv, if nakedv == 0 { 8 } else { nakedv }, pipeline_ir_native_pinned_slot_kind_resident(), pinned)
+                  nakedv = nakedv + 1
+                }
+                fmap_add_naked_leaf_counter(fm, 0, 1)
+                fmap_add_naked_leaf_counter(fm, 1, (leaf_bank + 1) / 2 + 1)
+              } else {
+                fmap_add_naked_leaf_counter(fm, 3, 1)
+              }
+            } else {
+              fmap_add_naked_leaf_counter(fm, 2, 1)
+            }
+          } else { 0 }
         } else { 0 }
       } else { 0 }
       fmap_add_ir_native_cs_resident_count(fm, cs_assigned)
@@ -25963,9 +26005,15 @@ fn pipeline_ir_function_src(irf: IrFunction) -> i64 {
 
 fn pipeline_cg_ir_only_params_from_regs(code: i64, param_count: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
   -- Params arrive in x0..x7; their homes may be reassigned by the bank
-  -- permutation, so the stores go through the pinned-aware path.
+  -- permutation, so the stores go through the pinned-aware path. A
+  -- naked-leaf param whose home IS its arrival register needs no move —
+  -- record the checker DEF claim without emitting anything.
   for i in 0..param_count {
-    pipeline_ir_native_store_reg_pinned(code, pinned, i, i)
+    if pipeline_ir_native_value_home_lookup(pinned, i) == i {
+      pipeline_ir_native_ck_def(code, pinned, i, i)
+    } else {
+      pipeline_ir_native_store_reg_pinned(code, pinned, i, i)
+    }
   }
   0
 }
@@ -26038,6 +26086,42 @@ fn pipeline_ir_native_push_param_cleanup_from_bind_prefix(insts: IrInstList, par
             }
           }
           _ -> 0
+        }
+      }
+    }
+  }
+}
+
+-- Pure twin of the cleanup push walk: does any entry param carry a
+-- managed drop kind (and no borrow fact)? Naked leaves must exclude
+-- these — the release at return is a BL and x30 goes unsaved.
+fn pipeline_ir_native_entry_cleanup_probe(insts: IrInstList, param_count: i64, seen: i64, borrowed_mask: i64) -> i64 {
+  if seen >= param_count { 0 }
+  else {
+    match insts {
+      IrInstNil -> 0
+      IrInstCons(inst, rest) -> {
+        match inst {
+          IrBindI64(ns, nl, value, ty) -> {
+            if value >= 0 and value < param_count {
+              if cg_mask_has(borrowed_mask, value) == 0 and cg_managed_drop_kind_for_ty(ty) != continuation_cleanup_kind_none() { 1 }
+              else { pipeline_ir_native_entry_cleanup_probe(rest, param_count, seen + 1, borrowed_mask) }
+            } else { 0 }
+          }
+          _ -> 0
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_native_blocks_entry_params_need_cleanup(blocks: IrBlockList, param_count: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          pipeline_ir_native_entry_cleanup_probe(insts, param_count, 0, pipeline_ir_native_borrowed_param_mask_from_inst_list(insts))
         }
       }
     }
@@ -26951,6 +27035,7 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         fmap_set_current_split_actives(fm, 0)
         fmap_set_current_def_shapes(fm, 0)
         fmap_set_current_use_segs(fm, 0)
+        fmap_set_current_naked_leaf(fm, 0)
         cg_cleanup_restore(fm, old_cleanup_depth)
         fmap_set_current_frame_size(fm, old_frame)
         fmap_set_current_preserve_fp(fm, old_preserve_fp)
