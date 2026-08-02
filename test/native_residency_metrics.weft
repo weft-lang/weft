@@ -25,10 +25,10 @@ fn residency_src_answer() -> str {
 }
 
 fn residency_src_pressure() -> str {
-  -- Widened past the seven-register volatile pool
-  -- (x12-x14 + idle x8/x9/x10/x11)
+  -- Widened past the full caller-saved pool (2v Stage 1: x1-x7 +
+  -- x12-x14 + idle x8/x9/x10/x11 = 13 homes, plus the 8 bank homes)
   -- so overlapping windows still force sp spill traffic.
-  "fn work(a: i64, b: i64) -> i64 { let c = a + b; let d = c + a; let e = d + b; let f = e + c; let g = f + d; let h = g + e; let i = h + f; let j = i + g; let k = j + h; let l = k + i; let m = l + j; let n = m + k; let o = n + l; let p = o + m; let q = p + n; let r = q + o; a + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p + q + r } fn main() -> i64 { work(1, 2) }"
+  "fn work(a: i64, b: i64) -> i64 { let c = a + b; let d = c + a; let e = d + b; let f = e + c; let g = f + d; let h = g + e; let i = h + f; let j = i + g; let k = j + h; let l = k + i; let m = l + j; let n = m + k; let o = n + l; let p = o + m; let q = p + n; let r = q + o; let s = r + p; let t = s + q; let u = t + r; let v = u + s; let w = v + t; let x = w + u; let y = x + v; let z = y + w; a + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p + q + r + s + t + u + v + w + x + y + z } fn main() -> i64 { work(1, 2) }"
 }
 
 fn residency_positive(count: i64) -> i64 {
@@ -108,15 +108,16 @@ test "residency_spill_pressure_produces_sp_scalar_traffic" {
 }
 
 test "residency_volatile_pool_holds_block_local_values" {
-  -- Stage 3: barrier-free block-local SSA values live in the shared
-  -- x12-x14 + idle x8/x9/x10/x11 volatile pool.
+  -- Stage 3 + 2v Stage 1: barrier-free block-local SSA values live in the
+  -- full caller-saved pool (x1-x7 preferred, then x12-x14 and idle
+  -- x8/x9/x10/x11).
   let native = residency_native(residency_src_pressure())
   Test.assert_eq(residency_positive(pipeline_native_volatile_resident_count(native) - 2), 1)
 }
 
 fn residency_x8_pressure_insts() -> IrInstList {
   -- Six simultaneously live spill values consume the first six homes in
-  -- allocation order: x12, x13, x14, x8, x9, x10.
+  -- allocation order: x1-x6 (2v Stage 1 pool order).
   let mut insts = ir_inst_list_empty()
   insts = ir_inst_list_prepend(ir_inst_binary_i64(18, ir_binary_op_add(), 17, 16), insts)
   insts = ir_inst_list_prepend(ir_inst_binary_i64(17, ir_binary_op_add(), 14, 15), insts)
@@ -136,12 +137,6 @@ fn residency_x8_pressure_blocks() -> IrBlockList {
   ir_block_list_prepend(ir_block_new_term(0, residency_x8_pressure_insts(), ir_term_return(18)), ir_block_list_empty())
 }
 
-fn residency_x9_pressure_with_vector_blocks() -> IrBlockList {
-  let vector_tail = ir_inst_list_prepend(ir_inst_vector_get_i64(21, 0, 1, 2, 0), ir_inst_list_empty())
-  let insts = ir_inst_list_append(residency_x8_pressure_insts(), vector_tail)
-  ir_block_list_prepend(ir_block_new_term(0, insts, ir_term_return(18)), ir_block_list_empty())
-}
-
 fn residency_vector_data_facts(blocks: IrBlockList) -> PipelineIrNativeVectorDataFacts {
   pipeline_ir_native_vector_data_facts_assign_home(pipeline_ir_native_vector_data_facts_for_blocks(blocks))
 }
@@ -150,40 +145,153 @@ fn residency_f64_facts(blocks: IrBlockList) -> PipelineIrNativeF64Facts {
   pipeline_ir_native_f64_facts_assign_slot_homes(blocks, pipeline_ir_native_f64_facts_for_blocks(blocks))
 }
 
-test "residency_volatile_pool_borrows_unclaimed_x8" {
+-- nconsts simultaneously-live consts (values 8..8+nconsts-1) followed by a
+-- pairwise add reduction; every const stays live until its consuming add,
+-- so the first nconsts pool homes fill in allocation order
+-- x1-x7, x12-x14, x8, x10, x11, x9. Final value id is 8 + 2*nconsts - 2.
+fn residency_wide_pressure_insts(nconsts: i64) -> IrInstList {
+  let mut insts = ir_inst_list_empty()
+  let queue = nlist_new()
+  let mut i = 0
+  while i < nconsts {
+    insts = ir_inst_list_append(insts, ir_inst_list_prepend(ir_inst_const_i64(8 + i, i + 1), ir_inst_list_empty()))
+    nlist_add(queue, 8 + i)
+    i = i + 1
+  }
+  let mut next = 8 + nconsts
+  let mut qi = 0
+  while qi + 1 < nlist_len(queue) {
+    insts = ir_inst_list_append(insts, ir_inst_list_prepend(ir_inst_binary_i64(next, ir_binary_op_add(), nlist_get(queue, qi), nlist_get(queue, qi + 1)), ir_inst_list_empty()))
+    nlist_add(queue, next)
+    next = next + 1
+    qi = qi + 2
+  }
+  insts
+}
+
+fn residency_wide_pressure_final(nconsts: i64) -> i64 { 8 + nconsts * 2 - 2 }
+
+fn residency_wide_pressure_blocks(nconsts: i64) -> IrBlockList {
+  ir_block_list_prepend(ir_block_new_term(0, residency_wide_pressure_insts(nconsts), ir_term_return(residency_wide_pressure_final(nconsts))), ir_block_list_empty())
+}
+
+test "residency_volatile_pool_prefers_x1_x7" {
+  -- 2v Stage 1: the low caller-saved registers head the pool order.
   let fm = fmap_new()
   let blocks = residency_x8_pressure_blocks()
   let homes = pipeline_ir_native_volatile_residents(0, blocks, pipeline_ir_native_pinned_slot_none(), fm, residency_f64_facts(blocks), residency_vector_data_facts(blocks))
-  Test.assert_eq(pipeline_ir_native_pinned_slot_lookup(homes, 11), 8)
+  Test.assert_eq(pipeline_ir_native_pinned_slot_lookup(homes, 8), 1)
+  Test.assert_eq(pipeline_ir_native_pinned_slot_lookup(homes, 13), 6)
+}
+
+test "residency_volatile_pool_borrows_unclaimed_x8" {
+  -- The 11th simultaneously-live value reaches x8 (after x1-x7 and
+  -- x12-x14) when the slot-pin pass has not claimed it.
+  let fm = fmap_new()
+  let blocks = residency_wide_pressure_blocks(11)
+  let homes = pipeline_ir_native_volatile_residents(0, blocks, pipeline_ir_native_pinned_slot_none(), fm, residency_f64_facts(blocks), residency_vector_data_facts(blocks))
+  Test.assert_eq(pipeline_ir_native_pinned_slot_lookup(homes, 18), 8)
 }
 
 test "residency_slot_tenant_keeps_x8_from_volatile_pool" {
   let fm = fmap_new()
-  let blocks = residency_x8_pressure_blocks()
+  let blocks = residency_wide_pressure_blocks(11)
   let slot_homes = pipeline_ir_native_pinned_slot_new(99, 8, pipeline_ir_native_pinned_slot_kind_loop(), pipeline_ir_native_pinned_slot_none())
   let homes = pipeline_ir_native_volatile_residents(0, blocks, slot_homes, fm, residency_f64_facts(blocks), residency_vector_data_facts(blocks))
   Test.assert_eq(pipeline_ir_native_pinned_slot_lookup(homes, 99), 8)
-  Test.assert_eq(if pipeline_ir_native_pinned_slot_lookup(homes, 11) == 8 { 1 } else { 0 }, 0)
+  Test.assert_eq(if pipeline_ir_native_pinned_slot_lookup(homes, 18) == 8 { 1 } else { 0 }, 0)
 }
 
 test "residency_volatile_pool_borrows_idle_vector_cache_x9" {
+  -- x9 is the last pool member; the 14th simultaneously-live value
+  -- reaches it only when no vector lane access claims the cache.
   let fm = fmap_new()
-  let blocks = residency_x8_pressure_blocks()
+  let blocks = residency_wide_pressure_blocks(14)
   let vector_data_facts = residency_vector_data_facts(blocks)
   Test.assert_eq(pipeline_ir_native_vector_data_facts_have_access(vector_data_facts), 0)
   Test.assert_eq(pipeline_ir_native_vector_data_facts_home(vector_data_facts), 0)
   let homes = pipeline_ir_native_volatile_residents(0, blocks, pipeline_ir_native_pinned_slot_none(), fm, residency_f64_facts(blocks), vector_data_facts)
-  Test.assert_eq(pipeline_ir_native_pinned_slot_lookup(homes, 12), 9)
+  Test.assert_eq(pipeline_ir_native_pinned_slot_lookup(homes, 21), 9)
 }
 
 test "residency_vector_access_reserves_cache_x9" {
-  let blocks = residency_x9_pressure_with_vector_blocks()
+  let vector_tail = ir_inst_list_prepend(ir_inst_vector_get_i64(40, 0, 1, 2, 0), ir_inst_list_empty())
+  let insts = ir_inst_list_append(residency_wide_pressure_insts(14), vector_tail)
+  let blocks = ir_block_list_prepend(ir_block_new_term(0, insts, ir_term_return(40)), ir_block_list_empty())
   let vector_data_facts = residency_vector_data_facts(blocks)
   Test.assert_eq(pipeline_ir_native_vector_data_facts_have_access(vector_data_facts), 1)
   Test.assert_eq(pipeline_ir_native_vector_data_facts_home(vector_data_facts), 9)
   let fm = fmap_new()
   let homes = pipeline_ir_native_volatile_residents(3, blocks, pipeline_ir_native_pinned_slot_none(), fm, residency_f64_facts(blocks), vector_data_facts)
-  Test.assert_eq(if pipeline_ir_native_pinned_slot_lookup(homes, 12) == 9 { 1 } else { 0 }, 0)
+  Test.assert_eq(if pipeline_ir_native_pinned_slot_lookup(homes, 21) == 9 { 1 } else { 0 }, 0)
+}
+
+-- 2v Stage 1 call-window tenancy: a value whose FINAL use is a
+-- pinned-aware call lives in the arg-safe segment (x12 first) up to the
+-- call itself.
+
+test "residency_call_final_use_lives_in_arg_safe_register" {
+  let call = ir_inst_list_prepend(ir_inst_call_i64(9, 123, ir_value_list_prepend(8, ir_value_list_empty())), ir_inst_list_empty())
+  let insts = ir_inst_list_prepend(ir_inst_const_i64(8, 41), call)
+  let blocks = ir_block_list_prepend(ir_block_new_term(0, insts, ir_term_return(9)), ir_block_list_empty())
+  let fm = fmap_new()
+  let homes = pipeline_ir_native_volatile_residents(0, blocks, pipeline_ir_native_pinned_slot_none(), fm, residency_f64_facts(blocks), residency_vector_data_facts(blocks))
+  Test.assert_eq(pipeline_ir_native_pinned_slot_lookup(homes, 8), 12)
+}
+
+test "residency_call_result_feeding_call_lives_in_arg_safe_register" {
+  -- g(f()) — the inner call's result is defined after its own clobber
+  -- and read before the outer call's, so the window is clobber-free.
+  let outer = ir_inst_list_prepend(ir_inst_call_i64(9, 456, ir_value_list_prepend(8, ir_value_list_empty())), ir_inst_list_empty())
+  let insts = ir_inst_list_prepend(ir_inst_call_i64(8, 123, ir_value_list_empty()), outer)
+  let blocks = ir_block_list_prepend(ir_block_new_term(0, insts, ir_term_return(9)), ir_block_list_empty())
+  let fm = fmap_new()
+  let homes = pipeline_ir_native_volatile_residents(0, blocks, pipeline_ir_native_pinned_slot_none(), fm, residency_f64_facts(blocks), residency_vector_data_facts(blocks))
+  Test.assert_eq(pipeline_ir_native_pinned_slot_lookup(homes, 8), 12)
+}
+
+-- The negative cases must never land in the caller-saved pool (x1-x14);
+-- a callee-saved x19-x26 home from the cs home-reuse scan (which calls
+-- preserve) or no assignment at all are both correct outcomes.
+fn residency_in_caller_saved_pool(homes: i64, value: i64) -> i64 {
+  let phys = pipeline_ir_native_pinned_slot_lookup(homes, value)
+  if phys >= 1 and phys <= 14 { 1 } else { 0 }
+}
+
+test "residency_value_reused_after_call_avoids_call_window" {
+  -- A non-final call use would leave a caller-saved register clobbered
+  -- while the value is still needed: no caller-saved tenancy.
+  let tail = ir_inst_list_prepend(ir_inst_binary_i64(10, ir_binary_op_add(), 8, 9), ir_inst_list_empty())
+  let call = ir_inst_list_prepend(ir_inst_call_i64(9, 123, ir_value_list_prepend(8, ir_value_list_empty())), tail)
+  let insts = ir_inst_list_prepend(ir_inst_const_i64(8, 41), call)
+  let blocks = ir_block_list_prepend(ir_block_new_term(0, insts, ir_term_return(10)), ir_block_list_empty())
+  let fm = fmap_new()
+  let homes = pipeline_ir_native_volatile_residents(0, blocks, pipeline_ir_native_pinned_slot_none(), fm, residency_f64_facts(blocks), residency_vector_data_facts(blocks))
+  Test.assert_eq(residency_in_caller_saved_pool(homes, 8), 0)
+}
+
+test "residency_call_final_use_with_prior_barrier_avoids_call_window" {
+  -- An intervening call between def and final use clobbers any
+  -- caller-saved home: no caller-saved tenancy.
+  let outer = ir_inst_list_prepend(ir_inst_call_i64(10, 456, ir_value_list_prepend(8, ir_value_list_empty())), ir_inst_list_empty())
+  let mid = ir_inst_list_prepend(ir_inst_call_i64(9, 123, ir_value_list_empty()), outer)
+  let insts = ir_inst_list_prepend(ir_inst_const_i64(8, 41), mid)
+  let blocks = ir_block_list_prepend(ir_block_new_term(0, insts, ir_term_return(10)), ir_block_list_empty())
+  let fm = fmap_new()
+  let homes = pipeline_ir_native_volatile_residents(0, blocks, pipeline_ir_native_pinned_slot_none(), fm, residency_f64_facts(blocks), residency_vector_data_facts(blocks))
+  Test.assert_eq(residency_in_caller_saved_pool(homes, 8), 0)
+}
+
+test "residency_vector_lane_final_use_stays_out_of_call_window" {
+  -- Lane emitters stage operands through x12-x17 scratch before their
+  -- reads complete, so a vector get/set final use grants no
+  -- caller-saved tenancy.
+  let get = ir_inst_list_prepend(ir_inst_vector_get_i64(9, 0, 1, 8, 0), ir_inst_list_empty())
+  let insts = ir_inst_list_prepend(ir_inst_const_i64(8, 41), get)
+  let blocks = ir_block_list_prepend(ir_block_new_term(0, insts, ir_term_return(9)), ir_block_list_empty())
+  let fm = fmap_new()
+  let homes = pipeline_ir_native_volatile_residents(2, blocks, pipeline_ir_native_pinned_slot_none(), fm, residency_f64_facts(blocks), residency_vector_data_facts(blocks))
+  Test.assert_eq(residency_in_caller_saved_pool(homes, 8), 0)
 }
 
 fn residency_vector_fact_insts_same_vec() -> IrInstList {
