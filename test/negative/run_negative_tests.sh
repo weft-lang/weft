@@ -478,6 +478,13 @@ check_rejects "typed_match_untagged_union" "test/negative/typed_match_untagged_u
 check_rejects "typed_match_non_exhaustive" "test/negative/typed_match_non_exhaustive.weft" "type error: non-exhaustive match"
 check_rejects "typed_match_foreign_annotation" "test/negative/typed_match_foreign_annotation.weft" "type error: typed match arm annotation is not part of the scrutinee type"
 check_rejects "typed_match_nil_never" "test/negative/typed_match_nil_never.weft" "type error: nil match arm on a scrutinee that is never nil"
+check_rejects "structural_record_type_unsupported" "test/negative/structural_record_type_unsupported.weft" "type error: structural record types are not implemented yet"
+check_rejects "tuple_type_unsupported" "test/negative/tuple_type_unsupported.weft" "type error: tuple types are not implemented yet"
+check_rejects "array_type_unsupported" "test/negative/array_type_unsupported.weft" "type error: array and slice types are not implemented yet"
+check_rejects "array_literal_unsupported" "test/negative/array_literal_unsupported.weft" "error: array/slice syntax is not implemented yet"
+check_rejects "effect_type_args_unsupported" "test/negative/effect_type_args_unsupported.weft" "type error: parameterized effects are not implemented yet"
+check_rejects "trait_complement_surface" "test/negative/trait_complement_surface.weft" "type error: trait complement is not a surface type"
+check_rejects "import_cycle" "test/negative/import_cycle.weft" "error: circular import"
 
 ls "$JOBS_DIR"/job_???? | xargs -n1 -P "$WEFT_TEST_JOBS" bash "$0" __worker || true
 
