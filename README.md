@@ -98,22 +98,23 @@ The same mechanism handles allocation strategy — a handler can serve `Alloc.al
 ### Types are sets, and control flow narrows them
 
 ```weft
-use "stdlib/string.weft"
-use "stdlib/display.weft"
+type Shape { Circle(i64), Square(i64) }
 
-fn label(x: str | nil) -> str {
-  -- after the guard, x : (str | nil) & ~nil = str
-  if x != nil { "some: {x}" } else { "none" }
+fn area3(input: Shape | nil) -> i64 {
+  match input {
+    s: Shape -> match s { Circle(r) -> r * 3, Square(w) -> w * 4 }
+    nil      -> 0 - 1
+  }
 }
 
 fn main() -> i64 {
-  if str_eq(label("weft"), "some: weft") == 1 {
-    if str_eq(label(nil), "none") == 1 { 0 } else { 2 }
+  if area3(Circle(5)) == 15 {
+    if area3(nil) == 0 - 1 { 0 } else { 2 }
   } else { 1 }
 }
 ```
 
-`T?` is sugar for `T | nil`. The checker reasons about unions, intersections, and complements as sets — exhaustiveness is set coverage, narrowing is set difference.
+After `s: Shape`, the binding is `Shape` — the union has been narrowed by set difference, and exhaustiveness is checked as residual-set emptiness. The same narrowing works in guard position: after `if x != nil`, an `x: str | nil` binding is `str`. `T?` is sugar for `T | nil`. Typed arms require a runtime-discriminable union (nil-sentinel or variant family) — untagged unions like `i64 | str` carry no invisible boxing, and the diagnostic suggests a variant type instead.
 
 ### Memory: four layers, one visible boundary
 
