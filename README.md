@@ -1,6 +1,6 @@
 # -[weft]>
 
-A compiled systems language with set-theoretic types, algebraic effects, and deterministic managed memory.
+A compiled, general-purpose language with set-theoretic types, algebraic effects, and deterministic managed memory.
 
 **Every type is a set. Every side effect is in the signature.**
 
