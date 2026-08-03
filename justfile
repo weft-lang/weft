@@ -1,21 +1,12 @@
-default: check
+default: test
 
-check:
-    zig build
-
+# Full test suite + bootstrap gate
 test:
-    zig build test
+    bash run_tests.sh
 
-build:
-    zig build -Doptimize=ReleaseSafe
-
-fmt:
-    zig fmt src/
-
-run *args:
-    zig build run -- {{args}}
-
-checkpoint: check test
+# Type-check the compiler tree (no codegen)
+check:
+    ./weft check compiler/main.weft
 
 # Verify the bootstrap chain + byte-identical gate. Does NOT touch ./weft —
 # a trust-root refresh is a deliberate, separate act: `just update-root`.
