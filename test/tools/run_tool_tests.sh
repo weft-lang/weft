@@ -1033,7 +1033,7 @@ chmod +x "$tmp_bin"
 run_binary_guarded "$tmp_bin"
 echo "  ok test_harness_binds_runtime_after_synthesis"
 
-printf 'fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.forall_i64_range(0, 3, x => x < 3) Test.assert_eq(Test.with_state_i64(4, () => State.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
+printf 'fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_supports_assertion_helpers" "$tmp_err" "unknown effect operation"
 chmod +x "$tmp_bin"
@@ -1087,17 +1087,23 @@ assert_test_exit_code "test_assert_ne_failure_returns_one" 'test "fail_ne" { Tes
 assert_test_exit_code "test_assert_bool_failures_return_two" $'test "fail_true" { Test.assert_true(1 == 2) }\ntest "fail_false" { Test.assert_false(1 == 1) }' 2
 assert_test_exit_code "test_assert_comparison_failure_returns_one" 'test "fail_cmp" { Test.assert_lt(2, 1) }' 1
 assert_test_failure_contains "test_assertion_failure_reports_diagnostic" 'test "fail_eq_diag" { Test.assert_eq(1, 2) }' 1 "test assertion failed: assert_eq"
+assert_test_failure_contains "test_assert_eq_f64_failure_reports_diagnostic" 'test "fail_eq_f64" { Test.assert_eq_f64(1.0, 2.0) }' 1 "test assertion failed: assert_eq_f64"
+assert_test_failure_contains "test_assert_eq_f64_nan_fails" 'test "fail_eq_f64_nan" { Test.assert_eq_f64(0.0 / 0.0, 0.0 / 0.0) }' 1 "test assertion failed: assert_eq_f64"
+assert_test_failure_contains "test_assert_near_f64_outside_epsilon_fails" 'test "fail_near_f64" { Test.assert_near_f64(1.0, 1.5, 0.25) }' 1 "test assertion failed: assert_near_f64"
+assert_test_failure_contains "test_assert_near_f64_negative_epsilon_fails" 'test "fail_near_f64_epsilon" { Test.assert_near_f64(1.0, 1.0, 0.0 - 0.1) }' 1 "test assertion failed: assert_near_f64"
 assert_test_failure_contains "test_snapshot_mismatch_reports_diagnostic" 'test "fail_snapshot" { Test.assert_snapshot("actual", "expected") }' 1 "test assertion failed: snapshot"
 assert_test_failure_contains "test_property_failure_reports_diagnostic" 'test "fail_property" { Test.forall_i64_range(0, 4, x => x < 2) }' 1 "test assertion failed: forall_i64_range"
 assert_test_failure_contains "test_property_empty_range_reports_exhaustion" 'test "empty_property" { Test.forall_i64_range(3, 3, x => true) }' 1 "test assertion failed: forall_i64_range_empty"
-assert_test_exit_code "test_effect_fixtures_pass" 'fn tool_fail8() -[Fail<i64>]> i64 { Fail.fail(8) } test "fixtures" { Test.assert_eq(Test.with_state_i64(2, () => { State.put(State.get() + 1) State.get() }), 3) Test.assert_eq(Test.expect_fail_i64(8, () => tool_fail8()), 8) Test.assert_eq(Test.with_io_i64(() => IO.open("path", 7, 0)), 107) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.note("ok", 0)), 3) }' 0
+assert_test_exit_code "test_effect_fixtures_pass" 'fn tool_fail8() -[Fail<i64>]> i64 { Fail.fail(8) } test "fixtures" { Test.assert_eq(Test.with_state_i64(2, () => { TestState.put(TestState.get() + 1) TestState.get() }), 3) Test.assert_eq(Test.expect_fail_i64(8, () => tool_fail8()), 8) Test.assert_eq(Test.with_io_i64(() => IO.open("path", 7, 0)), 107) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.note("ok", 0)), 3) }' 0
 assert_test_failure_contains "test_fixture_missing_fail_reports_diagnostic" 'test "missing_fail" { Test.expect_fail_i64(1, () => 0) }' 1 "test assertion failed: expect_fail_missing"
 assert_test_failure_contains "test_fixture_wrong_fail_reports_diagnostic" 'fn tool_fail2() -[Fail<i64>]> i64 { Fail.fail(2) } test "wrong_fail" { Test.expect_fail_i64(1, () => tool_fail2()) }' 1 "test assertion failed: expect_fail_i64"
 assert_test_compile_rejects "test_assert_true_rejects_i64" 'test "bad_bool" { Test.assert_true(2) }' "type error: argument type mismatch"
 assert_test_compile_rejects "test_assert_str_eq_rejects_i64" 'test "bad_str" { Test.assert_str_eq(1, "one") }' "type error: argument type mismatch"
+assert_test_compile_rejects "test_assert_eq_f64_rejects_i64" 'test "bad_f64" { Test.assert_eq_f64(1, 1.0) }' "type error: argument type mismatch"
+assert_test_compile_rejects "test_assert_near_f64_rejects_i64_epsilon" 'test "bad_f64_epsilon" { Test.assert_near_f64(1.0, 1.0, 1) }' "type error: argument type mismatch"
 assert_test_compile_rejects "test_property_rejects_i64_predicate" 'test "bad_property" { Test.forall_i64_range(0, 1, x => x + 1) }' "type error: return type mismatch"
 assert_test_compile_rejects "test_property_rejects_effectful_predicate" $'effect Log { fn hit() -> i64 }\ntest "bad_property_effect" { Test.forall_i64_range(0, 1, x => Log.hit() == x) }' "type error: effect not available in caller"
-assert_test_compile_rejects "test_fixture_rejects_unhandled_state" 'test "bad_state" { State.get() }' "type error: effect not available in caller"
+assert_test_compile_rejects "test_fixture_rejects_unhandled_state" 'test "bad_state" { TestState.get() }' "type error: effect not available in caller"
 assert_test_compile_rejects "test_fixture_rejects_wrong_effect_body" 'test "bad_fixture_effect" { Test.with_state_i64(0, () => IO.write(1, 0, 1)) }' "type error: effect not available in caller"
 assert_test_compile_rejects "test_fixture_rejects_wrong_return_body" 'test "bad_fixture_return" { Test.with_io_i64(() => "nope") }' "type error: return type mismatch"
 
