@@ -1,0 +1,140 @@
+-- NOTE: the `_metrics.weft` suffix is the established trust root for
+-- compiler-internal tests (source_trust.weft:76) — it is what lets this
+-- file call pipeline_parse_source_with_origin. Not a metrics test.
+--
+-- 4j J1: handler-clause abort classification is THE fact for the typed-IR
+-- phase (rule 10 — codegen asserts on it instead of re-scanning bodies).
+-- These tests pin the producer against typeck's node-phase
+-- `clause_body_has_resume`, which must agree on every clause shape, and
+-- pin the two deliberate non-obvious rules: a nested handle's clauses do
+-- not count, and deferred (`with k`) clauses are not "abortive".
+
+use "compiler/codegen.weft"
+use "compiler/typeck.weft"
+use "compiler/macho.weft"
+use "compiler/object.weft"
+use "compiler/ir.weft"
+use "compiler/grammar.weft"
+use "compiler/pipeline.weft"
+
+-- Parse a source string, take the first declared function, convert its
+-- body to typed IR, and return the first handler clause found in it.
+fn abort_first_clause_of(src_str: str) -> HandlerClause {
+  let module = pipeline_parse_source_with_origin(__str_ptr(src_str), __str_len(src_str), 0, 0)
+  match module {
+    AstModule(fns, src, tt) -> abort_scan_fns(fns, 0, nlist_len(fns))
+  }
+}
+
+fn abort_scan_fns(fns: i64, i: i64, n: i64) -> HandlerClause {
+  if i >= n { UnknownHandlerClause(0) }
+  else {
+    let pair = nlist_get(fns, i)
+    let fn_node = node_f1(pair)
+    let inner = if node_tag(fn_node) == 23 { node_f1(fn_node) } else { fn_node }
+    let found = abort_find_clause_in_expr(expr_from_node(node_f4(inner)))
+    match found {
+      UnknownHandlerClause(t) -> abort_scan_fns(fns, i + 1, n)
+      _ -> found
+    }
+  }
+}
+
+fn abort_find_clause_in_expr(expr: Expr) -> HandlerClause {
+  match expr {
+    Handle(body, clauses, hret) -> {
+      match clauses {
+        HandlerClauseListNil -> UnknownHandlerClause(0)
+        HandlerClauseListCons(c, rest) -> c
+      }
+    }
+    Let(ns, nl, value, body) -> abort_merge_clause(abort_find_clause_in_expr(value), body)
+    LetMut(ns, nl, value, body) -> abort_merge_clause(abort_find_clause_in_expr(value), body)
+    LetTyped(inner, ann) -> abort_find_clause_in_expr(inner)
+    Block(first, rest) -> abort_merge_clause(abort_find_clause_in_expr(first), rest)
+    _ -> UnknownHandlerClause(0)
+  }
+}
+
+fn abort_merge_clause(found: HandlerClause, fallback: Expr) -> HandlerClause {
+  match found {
+    UnknownHandlerClause(t) -> abort_find_clause_in_expr(fallback)
+    _ -> found
+  }
+}
+
+fn abort_is_abortive(src_str: str) -> i64 {
+  handler_clause_is_abortive(abort_first_clause_of(src_str))
+}
+
+test "abort_class_resuming_clause_is_not_abortive" {
+  let src = "effect E { fn op() -> i64 }
+fn f() -[E]> i64 { E.op() }
+fn main() -> i64 { handle f() { E.op() -> resume(1) } }
+"
+  Test.assert_eq(abort_is_abortive(src), 0)
+}
+
+test "abort_class_non_resuming_clause_is_abortive" {
+  let src = "effect E { fn op() -> i64 }
+fn f() -[E]> i64 { E.op() }
+fn main() -> i64 { handle f() { E.op() -> 42 } }
+"
+  Test.assert_eq(abort_is_abortive(src), 1)
+}
+
+test "abort_class_resume_nested_in_if_counts" {
+  let src = "effect E { fn op() -> i64 }
+fn f() -[E]> i64 { E.op() }
+fn main() -> i64 { handle f() { E.op() -> if 1 == 1 { resume(1) } else { resume(2) } } }
+"
+  Test.assert_eq(abort_is_abortive(src), 0)
+}
+
+test "abort_class_resume_nested_in_match_counts" {
+  let src = "effect E { fn op(v: i64) -> i64 }
+fn f() -[E]> i64 { E.op(1) }
+fn main() -> i64 { handle f() { E.op(v) -> match v { 0 -> resume(0) _ -> resume(9) } } }
+"
+  Test.assert_eq(abort_is_abortive(src), 0)
+}
+
+test "abort_class_resume_nested_in_let_body_counts" {
+  let src = "effect E { fn op() -> i64 }
+fn f() -[E]> i64 { E.op() }
+fn main() -> i64 { handle f() { E.op() -> { let x = 5 resume(x) } } }
+"
+  Test.assert_eq(abort_is_abortive(src), 0)
+}
+
+test "abort_class_resume_in_call_arg_counts" {
+  let src = "effect E { fn op() -> i64 }
+fn idf(x: i64) -> i64 { x }
+fn f() -[E]> i64 { E.op() }
+fn main() -> i64 { handle f() { E.op() -> idf(resume(3)) } }
+"
+  Test.assert_eq(abort_is_abortive(src), 0)
+}
+
+test "abort_class_inner_handle_resume_does_not_count" {
+  -- The resume belongs to the INNER handler, so the outer clause is
+  -- still abortive. Getting this wrong would emit a normal epilogue for
+  -- a clause that never returns to its perform site.
+  let src = "effect E { fn op() -> i64 }
+effect G { fn go() -> i64 }
+fn f() -[E]> i64 { E.op() }
+fn g() -[G]> i64 { G.go() }
+fn main() -> i64 { handle f() { E.op() -> handle g() { G.go() -> resume(7) } } }
+"
+  Test.assert_eq(abort_is_abortive(src), 1)
+}
+
+test "abort_class_deferred_clause_is_not_abortive" {
+  -- `with k` clauses reify the continuation; abandonment there is the
+  -- §7.3 drop path (L3/B1.7), not the abort edge.
+  let src = "effect E { @deferred fn op() -> i64 }
+fn f() -[E]> i64 { E.op() }
+fn main() -> i64 { handle f() { E.op() with k -> 5 } }
+"
+  Test.assert_eq(abort_is_abortive(src), 0)
+}
