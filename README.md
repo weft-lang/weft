@@ -138,18 +138,18 @@ fn copy_first_line(path: str) -[IO]> str {
 
 ## Benchmarks
 
-Small algorithm kernels with sibling Weft, Go, and Rust implementations (same algorithm, same data sizes, checksum-verified). Rust is built `-C opt-level=3 -C target-cpu=native`, Go with its default toolchain. Minimum of 7 runs after warmup, Apple M-series, 2026-08-03, repo commit `5307a96`:
+Small algorithm kernels with sibling Weft, Go, and Rust implementations (same algorithm, same data sizes, checksum-verified). Every Weft program is written against the public surface — bounds-checked stdlib vectors, managed memory — not runtime internals. Rust is built `-C opt-level=3 -C target-cpu=native`, Go with its default toolchain. Minimum of 7 runs after warmup, Apple M-series, 2026-08-03, repo commit `d7d6813`:
 
 | workload | Weft | Go | Rust | Weft binary | Weft build |
 |---|---|---|---|---|---|
-| vector_sort | 3.7 ms | 3.4 ms | 3.0 ms | 115 KB | 87 ms |
-| sieve | 20.0 ms | 15.1 ms | 9.8 ms | 115 KB | 71 ms |
-| graph_reach | 6.4 ms | 4.7 ms | 3.8 ms | 115 KB | ~80 ms |
-| nbody | 9.5 ms | 5.6 ms | 5.3 ms | 115 KB | ~80 ms |
-| mandelbrot | 29.6 ms | 15.7 ms | 16.5 ms | 115 KB | ~80 ms |
-| sorted_lookup | 63.5 ms | 28.6 ms | 13.5 ms | 180 KB | 265 ms |
+| vector_sort | 3.9 ms | 4.0 ms | 3.9 ms | 144 KB | 184 ms |
+| graph_reach | 6.5 ms | 5.1 ms | 3.8 ms | 144 KB | 184 ms |
+| nbody | 8.9 ms | 5.7 ms | 5.4 ms | 144 KB | 204 ms |
+| sieve | 26.5 ms | 14.6 ms | 10.0 ms | 144 KB | 177 ms |
+| mandelbrot | 29.5 ms | 15.7 ms | 16.2 ms | 192 KB | 258 ms |
+| sorted_lookup | 69.1 ms | 28.4 ms | 13.4 ms | 192 KB | 256 ms |
 
-Read this honestly: integer/branchy code runs at 1.1–1.4× Go; floating-point and allocation-heavy code trails further while the FP register file and reference-count elision are still being built out (both are active work). Go and Rust binaries for the same programs are 1.7 MB and 460 KB. The compiler — a 240,000-instruction self-hosted program — builds itself in about 5 seconds.
+Read this honestly: vector-heavy integer code is at parity with Go (and Rust, on vector_sort); branchy and floating-point kernels run at 1.3–1.9× Go while the FP register file and bounds machinery mature; allocation-heavy lookup code trails furthest while reference-count elision is built out. All three are active, measured work. Go and Rust binaries for the same programs are 1.7 MB and 460 KB. The compiler — a 240,000-instruction self-hosted program — builds itself in about 5 seconds.
 
 Reproduce with `bash bench_compare.sh` (records JSONL with commit + timestamps). These are lowering/codegen tracking benchmarks, not a language scorecard; the most representative single number is the self-compile.
 
