@@ -489,7 +489,7 @@ check_rejects "effect_instantiation_mismatch" "test/negative/effect_instantiatio
 check_rejects "effect_duplicate_head_instantiations" "test/negative/effect_duplicate_head_instantiations.weft" "type error: duplicate effect heads in one signature are not yet supported"
 check_rejects "effect_perform_arg_instantiation_mismatch" "test/negative/effect_perform_arg_instantiation_mismatch.weft" "type error: argument type mismatch"
 check_rejects "effect_resume_instantiation_mismatch" "test/negative/effect_resume_instantiation_mismatch.weft" "type error: resume type mismatch"
-check_rejects "return_clause_non_resuming" "test/negative/return_clause_non_resuming.weft" "type error: return clause with a non-resuming clause is not yet supported"
+check_rejects "return_clause_deferred" "test/negative/return_clause_deferred.weft" "type error: return clause with deferred clauses is not yet supported"
 check_rejects "handler_two_return_clauses" "test/negative/handler_two_return_clauses.weft" "error: at most one return clause per handler"
 check_rejects "trait_complement_surface" "test/negative/trait_complement_surface.weft" "type error: trait complement is not a surface type"
 check_rejects "import_cycle" "test/negative/import_cycle.weft" "error: circular import"

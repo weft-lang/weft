@@ -26,8 +26,14 @@ fn cg_ldrb(rt: i64, rn: i64, off: i64) -> i64 { encode_ldrb(rt, rn, off) }
 -- perform site can run the clause with its own handler frame masked
 -- (self-label performs must dispatch outward). Runtime twin:
 -- handler_dispatch_prev_offset in runtime/effects.weft.
-fn runtime_state_size() -> i64 { 128 }
+-- 128 -> 160 (4j): the found handler frame plus J3's abort-cleanup shadow
+-- chain and active-abortive-handler pointer. Tail padding is unnecessary at
+-- 160: the bump arena remains 16-byte aligned.
+fn runtime_state_size() -> i64 { 160 }
 fn runtime_state_dispatch_prev_offset() -> i64 { 120 }
+fn runtime_state_dispatch_frame_offset() -> i64 { 128 }
+fn runtime_state_abort_cleanup_top_offset() -> i64 { 136 }
+fn runtime_state_abort_cleanup_active_offset() -> i64 { 144 }
 fn runtime_state_bump_offset() -> i64 { 0 }
 -- Base of the CURRENT bump segment's allocatable range. Written at
 -- startup and on every segment chain; alloc_bump_restore_same_segment
@@ -1164,7 +1170,7 @@ fn cg_ftypes_lookup_fn_type(ft: i64, src: i64, ns: i64, nl: i64) -> i64 {
 -- ======================================================================
 
 fn fmap_new() -> i64 {
-  let h = cg_alloc_bytes(2816)
+  let h = cg_alloc_bytes(2848)
   let d = cg_alloc_bytes(80000)
   mem_store64_at(h, 0, d)
   mem_store64_at(h + 8, 0, 0)
@@ -1500,6 +1506,13 @@ fn fmap_new() -> i64 {
     mem_store64_at(h + lvo, 0, 0)
     lvo = lvo + 8
   }
+  -- 4j J3 per-native-function abort-cleanup emission state: descriptor
+  -- facts, the byte offset where stack-resident records begin, and the saved
+  -- handle-entry chain head used by the shared epilogue.
+  mem_store64_at(h + 2816, 0, 0)
+  mem_store64_at(h + 2824, 0, 0)
+  mem_store64_at(h + 2832, 0, 0)
+  mem_store64_at(h + 2840, 0, 0 - 1)
   h
 }
 
@@ -1703,6 +1716,14 @@ fn fmap_add_fn_param_resident_counter(fm: i64, which: i64, count: i64) -> i64 { 
 -- Base 2792; 2808 stays the last spare slot.
 fn fmap_crossblock_pool_counter(fm: i64, which: i64) -> i64 { mem_load64_at(fm + 2792 + which * 8, 0) }
 fn fmap_add_crossblock_pool_counter(fm: i64, which: i64, count: i64) -> i64 { mem_store64_at(fm + 2792 + which * 8, 0, mem_load64_at(fm + 2792 + which * 8, 0) + count) 0 }
+fn fmap_current_abort_cleanup_facts(fm: i64) -> i64 { mem_load64_at(fm + 2816, 0) }
+fn fmap_set_current_abort_cleanup_facts(fm: i64, facts: i64) -> i64 { mem_store64_at(fm + 2816, 0, facts) 0 }
+fn fmap_current_abort_cleanup_base(fm: i64) -> i64 { mem_load64_at(fm + 2824, 0) }
+fn fmap_set_current_abort_cleanup_base(fm: i64, base: i64) -> i64 { mem_store64_at(fm + 2824, 0, base) 0 }
+fn fmap_current_abort_cleanup_boundary(fm: i64) -> i64 { mem_load64_at(fm + 2832, 0) }
+fn fmap_set_current_abort_cleanup_boundary(fm: i64, off: i64) -> i64 { mem_store64_at(fm + 2832, 0, off) 0 }
+fn fmap_current_abort_cleanup_block(fm: i64) -> i64 { mem_load64_at(fm + 2840, 0) }
+fn fmap_set_current_abort_cleanup_block(fm: i64, block_id: i64) -> i64 { mem_store64_at(fm + 2840, 0, block_id) 0 }
 fn fmap_ir_native_leaf_fn_count(fm: i64) -> i64 { mem_load64_at(fm + 1792, 0) }
 fn fmap_add_ir_native_leaf_fn_count(fm: i64, count: i64) -> i64 { mem_store64_at(fm + 1792, 0, mem_load64_at(fm + 1792, 0) + count) 0 }
 fn fmap_ir_native_leaf_fn_pair_count(fm: i64) -> i64 { mem_load64_at(fm + 1800, 0) }
@@ -2499,12 +2520,25 @@ fn reg_phys(counter: i64) -> i64 {
 fn cg_f64_fp_reg_base() -> i64 { 1000 }
 fn cg_f64_fp_regid(fd: i64) -> i64 { cg_f64_fp_reg_base() + fd }
 
+-- Register-form ADD names xzr, not sp, when rn=31. Materialise sp in a
+-- reserved scratch register before adding a far byte offset; the old direct
+-- encode_add_reg(dst, 31, dst) silently produced the offset alone.
+fn emit_stack_address_offset(code: i64, dst: i64, byte_off: i64) -> i64 {
+  if byte_off <= 4095 {
+    bu32(code, encode_add_imm(dst, 31, byte_off))
+  } else {
+    emit_mov_imm_safe(code, dst, byte_off)
+    let base = if dst == 16 { 17 } else { 16 }
+    bu32(code, encode_add_imm(base, 31, 0))
+    bu32(code, encode_add_reg(dst, base, dst))
+  }
+}
+
 fn emit_load_spill_offset(code: i64, dst: i64, byte_off: i64) -> i64 {
   if byte_off <= cg_spill_inline_offset_limit() {
     bu32(code, cg_ldr(dst, 31, byte_off))
   } else {
-    emit_mov_imm_safe(code, dst, byte_off)
-    bu32(code, encode_add_reg(dst, 31, dst))
+    emit_stack_address_offset(code, dst, byte_off)
     bu32(code, cg_ldr(dst, dst, 0))
   }
 }
@@ -2515,7 +2549,10 @@ fn emit_store_spill_offset(code: i64, src: i64, byte_off: i64) -> i64 {
   } else {
     let addr = if src != 16 { 16 } else { 17 }
     emit_mov_imm_safe(code, addr, byte_off)
-    bu32(code, encode_add_reg(addr, 31, addr))
+    let base = if src != 15 and addr != 15 { 15 }
+      else { if src != 17 and addr != 17 { 17 } else { 16 } }
+    bu32(code, encode_add_imm(base, 31, 0))
+    bu32(code, encode_add_reg(addr, base, addr))
     bu32(code, cg_str(src, addr, 0))
   }
 }
@@ -4558,6 +4595,11 @@ fn cg_hbuild_frame_maybe_abort(code: i64, eff_hash: i64, nclauses: i64, ops_ctr:
     let pos = buf_len(code)
     bu32(code, 0)
     cg_fiber_save_regs(code, 15, handler_frame_abort_regs_offset(), 17)
+    bu32(code, cg_ldr(17, 28, runtime_state_abort_cleanup_top_offset()))
+    bu32(code, cg_str(17, 15, handler_frame_abort_cleanup_boundary_offset()))
+    bu32(code, cg_ldr(17, 28, runtime_state_abort_cleanup_active_offset()))
+    bu32(code, cg_str(17, 15, handler_frame_abort_prev_active_offset()))
+    bu32(code, cg_str(15, 28, runtime_state_abort_cleanup_active_offset()))
     pos
   } else { 0 }
   -- Push: x27 = frame_ptr
@@ -4570,9 +4612,43 @@ fn cg_hbuild_frame_maybe_abort(code: i64, eff_hash: i64, nclauses: i64, ops_ctr:
 -- address. `value_reg` carries the aborting clause's value into x0.
 -- Mirrors cg_fiber_restore_handler_and_ret.
 fn cg_habort_restore_and_ret(code: i64, frame_reg: i64, value_reg: i64) -> i64 {
-  if frame_reg != 9 { bu32(code, encode_add_imm(9, frame_reg, 0)) } else { 0 }
-  if value_reg != 11 { bu32(code, encode_add_imm(11, value_reg, 0)) } else { 0 }
-  bu32(code, cg_ldr(10, 9, handler_frame_abort_sp_offset()))
+  -- x25/x26 are callee-saved, so cleanup functions may freely use the
+  -- ordinary ABI while the target frame and abort value remain stable.
+  if frame_reg != 25 { bu32(code, encode_add_imm(25, frame_reg, 0)) } else { 0 }
+  if value_reg != 26 { bu32(code, encode_add_imm(26, value_reg, 0)) } else { 0 }
+  bu32(code, cg_ldr(24, 25, handler_frame_abort_cleanup_boundary_offset()))
+  -- The aborting handler is already masked out of x27. Restore the active
+  -- cleanup guard before invoking Drop so effects and nested cleanup inside a
+  -- destructor observe the enclosing abortive handler, never the abandoned
+  -- one.
+  bu32(code, cg_ldr(23, 25, handler_frame_abort_prev_active_offset()))
+  bu32(code, cg_str(23, 28, runtime_state_abort_cleanup_active_offset()))
+  let cleanup_loop = buf_len(code)
+  bu32(code, cg_ldr(9, 28, runtime_state_abort_cleanup_top_offset()))
+  bu32(code, encode_cmp(9, 24))
+  let cleanup_done_pos = buf_len(code)
+  bu32(code, 0)
+  -- Reaching null before the saved boundary is a corrupt descriptor chain;
+  -- trap instead of restoring sp over an uncleaned frame.
+  let cleanup_nonnull_pos = buf_len(code)
+  bu32(code, 0)
+  bu32(code, encode_brk(26))
+  let cleanup_one = buf_len(code)
+  cg_patch_b_cond(code, cleanup_nonnull_pos, 1, cleanup_one)
+  bu32(code, cg_ldr(10, 9, handler_abort_cleanup_record_prev_offset()))
+  bu32(code, cg_str(10, 28, runtime_state_abort_cleanup_top_offset()))
+  bu32(code, cg_ldr(16, 9, handler_abort_cleanup_record_fn_offset()))
+  bu32(code, cg_ldr(0, 9, handler_abort_cleanup_record_value_offset()))
+  bu32(code, encode_blr(16))
+  let cleanup_back = buf_len(code)
+  bu32(code, encode_b(cleanup_loop - cleanup_back))
+  let cleanup_done = buf_len(code)
+  cg_patch_b_cond(code, cleanup_done_pos, 0, cleanup_done)
+  -- The loop has popped exactly to the handle-entry boundary.
+  bu32(code, cg_str(24, 28, runtime_state_abort_cleanup_top_offset()))
+  bu32(code, cg_ldr(10, 25, handler_frame_abort_sp_offset()))
+  bu32(code, encode_add_imm(9, 25, 0))
+  bu32(code, encode_add_imm(11, 26, 0))
   cg_fiber_restore_regs(code, 9, handler_frame_abort_regs_offset())
   cg_fiber_restore_sp_from(code, 10)
   bu32(code, encode_add_imm(0, 11, 0))

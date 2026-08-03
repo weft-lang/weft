@@ -345,8 +345,9 @@ type PipelineFnLowerCtx {
 
 type PipelineNativeHandlerCtx {
   PipelineNativeHandlerCtxNil,
-  -- effect hash, emitted clause infos, count, ops SSA, frame SSA, rest.
-  PipelineNativeHandlerCtxCons(i64, i64, i64, i64, i64, PipelineNativeHandlerCtx)
+  -- effect hash, emitted clause infos, count, ops SSA, frame SSA,
+  -- abortive-frame bit, rest.
+  PipelineNativeHandlerCtxCons(i64, i64, i64, i64, i64, i64, PipelineNativeHandlerCtx)
 }
 
 type PipelineLoweredHandlerClauses {
@@ -388,7 +389,9 @@ type PipelineIrNativeValueHomeFacts {
 }
 
 type PipelineNativeEmitCtx {
-  PipelineNativeEmitCtx(i64, PipelineNativeHandlerCtx, PipelineIrNativeValueHomeFacts, PipelineIrNativeF64Facts, i64, PipelineIrNativeFpEnv, PipelineIrNativeVectorDataFacts)
+  -- The final field is a mutable list of handle-abort ADR patches owned by
+  -- the current CFG emission. Nested clause functions get their own list.
+  PipelineNativeEmitCtx(i64, PipelineNativeHandlerCtx, PipelineIrNativeValueHomeFacts, PipelineIrNativeF64Facts, i64, PipelineIrNativeFpEnv, PipelineIrNativeVectorDataFacts, i64)
 }
 
 type PipelineIrNativeTermEmitInfo {
@@ -7083,7 +7086,7 @@ fn pipeline_lower_handler_clause_body_typed(clause: HandlerClause, fn_params: i6
       if pipeline_lowered_blocks_is_valid(lowered) == 0 {
         IrHandlerClauseBodyInvalid(4)
       } else {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, pipeline_lowered_blocks_blocks(lowered))
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, handler_clause_is_abortive(clause), first_value, pipeline_lowered_blocks_blocks(lowered))
       }
     }
     UnknownHandlerClause(tag) -> IrHandlerClauseBodyInvalid(5)
@@ -7097,11 +7100,11 @@ fn pipeline_lower_handler_clauses_typed(clauses: HandlerClauseList, fn_params: i
       let body = pipeline_lower_handler_clause_body_typed(clause, fn_params, outer_locals, module)
       let lowered_rest = pipeline_lower_handler_clauses_typed(rest, fn_params, outer_locals, module)
       let body_valid = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, blocks) -> 1
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, first_value, blocks) -> 1
         IrHandlerClauseBodyInvalid(reason) -> 0
       }
       let body_safe = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, blocks) -> if nlist_len(captures) == 0 { 1 } else { 0 }
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, first_value, blocks) -> if nlist_len(captures) == 0 { 1 } else { 0 }
         IrHandlerClauseBodyInvalid(reason) -> 0
       }
       PipelineLoweredHandlerClauses(
@@ -7177,16 +7180,26 @@ fn pipeline_lower_handle_typed_to_target_blocks(body_expr: Expr, clauses: Handle
       pipeline_lowered_handler_clauses_out_of_line_safe(lowered_clauses)
     )
     let body_module = pipeline_lower_module_with_handlers(module, next_handlers)
-    let marker = ir_inst_list_prepend(IrHandleI64(0 - 1, src, eff_hash, clause_bodies, nclauses, 0), ir_inst_list_empty())
-    if pipeline_expr_needs_lowering_cfg_typed(body_expr, src) == 1 {
-      let pop_block = next_block
-      let body_start = next_block + 1
-      let body_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(body_expr, params, locals, body_module, next_value, body_start, next_block + 2, pop_block)
+    let has_abortive = handler_clause_list_has_abortive(clauses)
+    let pop_block = next_block
+    let abort_block = if has_abortive == 1 { next_block + 1 } else { 0 - 1 }
+    let body_start = if has_abortive == 1 { next_block + 2 } else { next_block + 1 }
+    let body_next_block = if has_abortive == 1 { next_block + 3 } else { next_block + 2 }
+    let marker = ir_inst_list_prepend(IrHandleI64(0 - 1, src, eff_hash, clause_bodies, nclauses, abort_block), ir_inst_list_empty())
+    if pipeline_expr_needs_lowering_cfg_typed(body_expr, src) == 1 or has_abortive == 1 {
+      let body_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(body_expr, params, locals, body_module, next_value, body_start, body_next_block, pop_block)
       if pipeline_lowered_blocks_is_valid(body_blocks) == 1 {
         if pipeline_lowered_blocks_falls_through(body_blocks) == 1 {
           let body_value = pipeline_lowered_blocks_next_value(body_blocks)
+          let abort_value = body_value + 1
           let pop_params = ir_value_list_prepend(body_value, ir_value_list_empty())
           let pop_insts = ir_inst_list_prepend(ir_inst_handler_pop_i64(0 - 1), ir_inst_list_empty())
+          let abort_tail = if has_abortive == 1 {
+            let abort_params = ir_value_list_prepend(abort_value, ir_value_list_empty())
+            let abort_insts = ir_inst_list_prepend(ir_inst_abort_landing_i64(abort_value), ir_inst_list_empty())
+            let abort_args = ir_value_list_prepend(abort_value, ir_value_list_empty())
+            ir_block_list_prepend(ir_block_new_params(abort_block, abort_params, abort_insts, ir_term_jump_args(target_block, abort_args)), ir_block_list_empty())
+          } else { ir_block_list_empty() }
           let entry = ir_block_new_term(start_block, marker, ir_term_jump(body_start))
           match hret {
             NoHandleReturn -> {
@@ -7194,9 +7207,9 @@ fn pipeline_lower_handle_typed_to_target_blocks(body_expr: Expr, clauses: Handle
               let pop = ir_block_new_params(pop_block, pop_params, pop_insts, ir_term_jump_args(target_block, pop_args))
               let blocks = ir_block_list_prepend(
                 entry,
-                ir_block_list_append(pipeline_lowered_blocks_blocks(body_blocks), ir_block_list_prepend(pop, ir_block_list_empty()))
+                ir_block_list_append(pipeline_lowered_blocks_blocks(body_blocks), ir_block_list_prepend(pop, abort_tail))
               )
-              pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(body_blocks), body_value + 1, blocks, 1)
+              pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(body_blocks), body_value + 1 + has_abortive, blocks, 1)
             }
             HandleReturnClause(rns, rnl, rb) -> {
               -- 4c §7.3: transform the completion value. Runs OUTSIDE the
@@ -7207,13 +7220,13 @@ fn pipeline_lower_handle_typed_to_target_blocks(body_expr: Expr, clauses: Handle
               -- genuine completion.
               let ret_start = pipeline_lowered_blocks_next_block(body_blocks)
               let ret_locals = pipeline_value_env_push(locals, rns, rnl, body_value)
-              let ret_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(rb, params, ret_locals, module, body_value + 1, ret_start, ret_start + 1, target_block)
+              let ret_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(rb, params, ret_locals, module, body_value + 1 + has_abortive, ret_start, ret_start + 1, target_block)
               if pipeline_lowered_blocks_is_valid(ret_blocks) == 1 {
                 let pop = ir_block_new_params(pop_block, pop_params, pop_insts, ir_term_jump(ret_start))
                 let blocks = ir_block_list_prepend(
                   entry,
                   ir_block_list_append(pipeline_lowered_blocks_blocks(body_blocks),
-                    ir_block_list_prepend(pop, pipeline_lowered_blocks_blocks(ret_blocks)))
+                    ir_block_list_prepend(pop, ir_block_list_append(pipeline_lowered_blocks_blocks(ret_blocks), abort_tail)))
                 )
                 pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(ret_blocks), pipeline_lowered_blocks_next_value(ret_blocks), blocks, 1)
               } else {
@@ -8117,11 +8130,17 @@ fn pipeline_lower_loop_let_to_target_blocks(expr: i64, ctx: PipelineLoopCtx, nex
         if pipeline_lowered_loop_blocks_is_valid(body_blocks) == 1 {
           let local_params = ir_value_list_prepend(local_value, ir_value_list_empty())
           let cleanup_dst = pipeline_lowered_loop_blocks_next_value(body_blocks)
-          let cleanup_count = if pipeline_managed_release_hash_for_ty(effective_type_node) != 0 {
+          let owned_type_hash = cg_owned_drop_type_hash(effective_type_node)
+          let managed_release_hash = pipeline_managed_release_hash_for_ty(effective_type_node)
+          let cleanup_count = if managed_release_hash != 0 or owned_type_hash != 0 {
             pipeline_ir_block_list_loop_scope_cleanup_count(pipeline_lowered_loop_blocks_blocks(body_blocks), local_value, normal_block, continue_block, target_block)
           } else { 0 }
           let cleaned_body_blocks = if cleanup_count > 0 {
-            pipeline_ir_block_list_append_loop_scope_cleanup_indexed(pipeline_lowered_loop_blocks_blocks(body_blocks), local_value, effective_type_node, cleanup_dst, 0, normal_block, continue_block, target_block)
+            if owned_type_hash != 0 {
+              pipeline_ir_block_list_append_loop_owned_cleanup_indexed(pipeline_lowered_loop_blocks_blocks(body_blocks), local_value, owned_type_hash, 0, normal_block, continue_block, target_block)
+            } else {
+              pipeline_ir_block_list_append_loop_scope_cleanup_indexed(pipeline_lowered_loop_blocks_blocks(body_blocks), local_value, effective_type_node, cleanup_dst, 0, normal_block, continue_block, target_block)
+            }
           } else { pipeline_lowered_loop_blocks_blocks(body_blocks) }
           let next_after_cleanup = cleanup_dst + cleanup_count
           let local_merge = ir_block_new_params(local_merge_block, local_params, retain_insts, ir_term_jump(body_start))
@@ -8173,11 +8192,17 @@ fn pipeline_lower_loop_let_to_target_blocks(expr: i64, ctx: PipelineLoopCtx, nex
       let body_blocks = pipeline_lower_loop_body_to_target_blocks(body_expr, body_ctx, body_next_value, body_start, body_start + 1)
       if pipeline_lowered_loop_blocks_is_valid(body_blocks) == 1 {
         let cleanup_dst = pipeline_lowered_loop_blocks_next_value(body_blocks)
-        let cleanup_count = if pipeline_managed_release_hash_for_ty(effective_type_node) != 0 {
+        let owned_type_hash = cg_owned_drop_type_hash(effective_type_node)
+        let managed_release_hash = pipeline_managed_release_hash_for_ty(effective_type_node)
+        let cleanup_count = if managed_release_hash != 0 or owned_type_hash != 0 {
           pipeline_ir_block_list_loop_scope_cleanup_count(pipeline_lowered_loop_blocks_blocks(body_blocks), bind_value, normal_block, continue_block, target_block)
         } else { 0 }
         let cleaned_body_blocks = if cleanup_count > 0 {
-          pipeline_ir_block_list_append_loop_scope_cleanup_indexed(pipeline_lowered_loop_blocks_blocks(body_blocks), bind_value, effective_type_node, cleanup_dst, 0, normal_block, continue_block, target_block)
+          if owned_type_hash != 0 {
+            pipeline_ir_block_list_append_loop_owned_cleanup_indexed(pipeline_lowered_loop_blocks_blocks(body_blocks), bind_value, owned_type_hash, 0, normal_block, continue_block, target_block)
+          } else {
+            pipeline_ir_block_list_append_loop_scope_cleanup_indexed(pipeline_lowered_loop_blocks_blocks(body_blocks), bind_value, effective_type_node, cleanup_dst, 0, normal_block, continue_block, target_block)
+          }
         } else { pipeline_lowered_loop_blocks_blocks(body_blocks) }
         let next_after_cleanup = cleanup_dst + cleanup_count
         let entry = ir_block_new_term(start_block, ir_inst_list_append(ir_lowered_expr_insts(init), retain_insts), ir_term_jump(body_start))
@@ -9261,13 +9286,13 @@ fn pipeline_lower_perform_to_target_blocks(expr: i64, params: i64, locals: Pipel
 fn pipeline_ir_handle_inst_list_typed(src: i64, eff_hash: i64, clauses: IrHandlerClauseBodyList, nclauses: i64, body_insts: IrInstList) -> IrInstList {
   let pop = ir_inst_list_prepend(ir_inst_handler_pop_i64(0 - 1), ir_inst_list_empty())
   let body_then_pop = ir_inst_list_append(body_insts, pop)
-  ir_inst_list_prepend(IrHandleI64(0 - 1, src, eff_hash, clauses, nclauses, 0), body_then_pop)
+  ir_inst_list_prepend(IrHandleI64(0 - 1, src, eff_hash, clauses, nclauses, 0 - 1), body_then_pop)
 }
 
 fn pipeline_ir_handle_inst_list_nodes(src: i64, eff_hash: i64, clauses: IrHandlerClauseBodyList, nclauses: i64, body_insts: IrInstList) -> IrInstList {
   let pop = ir_inst_list_prepend(ir_inst_handler_pop_i64(0 - 1), ir_inst_list_empty())
   let body_then_pop = ir_inst_list_append(body_insts, pop)
-  ir_inst_list_prepend(IrHandleI64(0 - 1, src, eff_hash, clauses, nclauses, 0), body_then_pop)
+  ir_inst_list_prepend(IrHandleI64(0 - 1, src, eff_hash, clauses, nclauses, 0 - 1), body_then_pop)
 }
 
 fn pipeline_lower_handle_to_target_blocks(expr: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
@@ -10592,6 +10617,24 @@ fn pipeline_ir_block_list_append_loop_scope_cleanup_indexed(blocks: IrBlockList,
       IrBlockListCons(
         patched,
         pipeline_ir_block_list_append_loop_scope_cleanup_indexed(rest, bind_value, ty, base_dst, index + applies, normal_block, continue_block, target_block)
+      )
+    }
+  }
+}
+
+fn pipeline_ir_block_list_append_loop_owned_cleanup_indexed(blocks: IrBlockList, bind_value: i64, type_hash: i64, index: i64, normal_block: i64, continue_block: i64, target_block: i64) -> IrBlockList {
+  match blocks {
+    IrBlockListNil -> IrBlockListNil
+    IrBlockListCons(block, rest) -> {
+      let applies = pipeline_ir_block_loop_scope_cleanup_applies(block, bind_value, normal_block, continue_block, target_block)
+      let patched = if applies == 1 {
+        match block {
+          IrBlock(id, params, insts, term) -> IrBlock(id, params, ir_inst_list_append(insts, ir_inst_list_prepend(ir_inst_owned_drop_i64(bind_value, type_hash), ir_inst_list_empty())), term)
+        }
+      } else { block }
+      IrBlockListCons(
+        patched,
+        pipeline_ir_block_list_append_loop_owned_cleanup_indexed(rest, bind_value, type_hash, index + applies, normal_block, continue_block, target_block)
       )
     }
   }
@@ -19137,7 +19180,7 @@ fn pipeline_ir_native_value_home_count_include_evidence(count: i64, fm: i64) -> 
 fn pipeline_ir_native_value_home_count_include_handlers(count: i64, handlers: PipelineNativeHandlerCtx) -> i64 {
   match handlers {
     PipelineNativeHandlerCtxNil -> count
-    PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, rest) -> {
+    PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, is_abortive, rest) -> {
       let with_ops = pipeline_ir_native_value_home_count_include(count, ops_ctr)
       let with_frame = pipeline_ir_native_value_home_count_include(with_ops, frame_ctr)
       pipeline_ir_native_value_home_count_include_handlers(with_frame, rest)
@@ -19171,6 +19214,7 @@ fn pipeline_ir_native_handler_home_scan_insts(insts: IrInstList, scan: PipelineI
           PipelineIrNativeHandlerHomeScan(pushed, if pushed > max_depth { pushed } else { max_depth })
         }
         IrHandlerPopI64(frame) -> PipelineIrNativeHandlerHomeScan(if depth > 0 { depth - 1 } else { 0 }, max_depth)
+        IrAbortLandingI64(dst) -> scan
         _ -> scan
       }
       pipeline_ir_native_handler_home_scan_insts(rest, next)
@@ -19504,6 +19548,7 @@ fn pipeline_ir_native_inst_preserves_vector_data_fact(inst: IrInst) -> i64 {
     IrVariantPayloadI64(dst, value, index) -> 1
     IrFieldLoadI64(dst, base, field_hash, field_index) -> 1
     IrResumeI64(dst, value) -> 1
+    IrAbortLandingI64(dst) -> 1
     _ -> 0
   }
 }
@@ -20151,14 +20196,14 @@ fn pipeline_ir_native_emit_unary(code: i64, dst: i64, op: IrUnaryOp, value: i64,
 fn pipeline_ir_native_handler_ctx_len(ctx: PipelineNativeHandlerCtx) -> i64 {
   match ctx {
     PipelineNativeHandlerCtxNil -> 0
-    PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, rest) -> 1 + pipeline_ir_native_handler_ctx_len(rest)
+    PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, is_abortive, rest) -> 1 + pipeline_ir_native_handler_ctx_len(rest)
   }
 }
 
 fn pipeline_ir_native_handler_ctx_at(ctx: PipelineNativeHandlerCtx, depth: i64) -> PipelineNativeHandlerCtx {
   match ctx {
     PipelineNativeHandlerCtxNil -> PipelineNativeHandlerCtxNil
-    PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, rest) -> {
+    PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, is_abortive, rest) -> {
       if depth <= 0 { ctx } else { pipeline_ir_native_handler_ctx_at(rest, depth - 1) }
     }
   }
@@ -20182,15 +20227,497 @@ fn pipeline_ir_native_hclause_infos_uncaptured(infos: i64, nclauses: i64) -> i64
 fn pipeline_ir_native_handler_ctx_uncaptured(ctx: PipelineNativeHandlerCtx) -> PipelineNativeHandlerCtx {
   match ctx {
     PipelineNativeHandlerCtxNil -> PipelineNativeHandlerCtxNil
-    PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, rest) -> {
+    PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, is_abortive, rest) -> {
       let filtered_rest = pipeline_ir_native_handler_ctx_uncaptured(rest)
       if pipeline_ir_native_hclause_infos_uncaptured(infos, nclauses) == 1 {
-        PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, filtered_rest)
+        PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, is_abortive, filtered_rest)
       } else {
         filtered_rest
       }
     }
   }
+}
+
+-- ======================================================================
+-- 4j J3: abort-cleanup descriptor facts and stack-resident shadow chain
+-- ======================================================================
+--
+-- The 2q continuation descriptor vocabulary establishes the cleanup kinds,
+-- but one captured segment cannot describe an ordinary dynamic call chain.
+-- Tier-2 abort therefore uses a dedicated walk structure: one 24-byte record
+-- per IR binding that owns an eventual release/Drop, stored in that native
+-- function's stack frame. Records link only while an abortive handler is
+-- active. Ordinary cleanup disarms the exact record; abort pops records and
+-- calls their stored cleanup pointers until the handle-entry boundary.
+--
+-- Fact node fields: acquisition-site SSA, owned value SSA, action (release
+-- hash or owned type hash), kind (1 managed release / 2 owned Drop), record
+-- index. The site is the unique result SSA of the instruction that acquires
+-- the obligation; this keeps two retains of the same pointer as two records.
+fn pipeline_ir_abort_cleanup_managed_kind() -> i64 { 1 }
+fn pipeline_ir_abort_cleanup_owned_kind() -> i64 { 2 }
+
+fn pipeline_ir_abort_cleanup_inst_has_action(inst: IrInst, value: i64, action: i64, kind: i64) -> i64 {
+  match inst {
+    IrCallI64(dst, callee_hash, args) -> {
+      if kind == pipeline_ir_abort_cleanup_managed_kind() and callee_hash == action and pipeline_ir_value_list_get_or(args, 0, 0 - 1) == value { 1 } else { 0 }
+    }
+    IrOwnedDropI64(drop_value, type_hash) -> {
+      if kind == pipeline_ir_abort_cleanup_owned_kind() and drop_value == value and type_hash == action { 1 } else { 0 }
+    }
+    _ -> 0
+  }
+}
+
+fn pipeline_ir_abort_cleanup_inst_list_has_action(insts: IrInstList, value: i64, action: i64, kind: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      if pipeline_ir_abort_cleanup_inst_has_action(inst, value, action, kind) == 1 { 1 }
+      else { pipeline_ir_abort_cleanup_inst_list_has_action(rest, value, action, kind) }
+    }
+  }
+}
+
+fn pipeline_ir_abort_cleanup_blocks_have_action(blocks: IrBlockList, value: i64, action: i64, kind: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          if pipeline_ir_abort_cleanup_inst_list_has_action(insts, value, action, kind) == 1 { 1 }
+          else { pipeline_ir_abort_cleanup_blocks_have_action(rest, value, action, kind) }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_abort_cleanup_fact_exists(facts: i64, value: i64, action: i64, kind: i64) -> i64 {
+  let mut found = 0
+  let n = nlist_len(facts)
+  let mut i = 0
+  while i < n and found == 0 {
+    let fact = nlist_get(facts, i)
+    if node_f1(fact) == value and node_f2(fact) == action and node_f3(fact) == kind { found = 1 }
+    else { i = i + 1 }
+  }
+  found
+}
+
+fn pipeline_ir_abort_cleanup_is_managed_release_hash(hash: i64) -> i64 {
+  if hash == pipeline_rc_default_release_hash() or hash == pipeline_closure_default_release_hash() or hash == pipeline_rc_default_weak_release_hash() { 1 } else { 0 }
+}
+
+fn pipeline_ir_abort_cleanup_is_managed_retain_hash(hash: i64) -> i64 {
+  if hash == pipeline_rc_default_retain_hash() or hash == pipeline_closure_default_retain_hash() or hash == pipeline_rc_default_weak_retain_hash() { 1 } else { 0 }
+}
+
+fn pipeline_ir_abort_cleanup_release_for_retain(hash: i64) -> i64 {
+  if hash == pipeline_rc_default_retain_hash() { pipeline_rc_default_release_hash() }
+  else { if hash == pipeline_closure_default_retain_hash() { pipeline_closure_default_release_hash() }
+  else { if hash == pipeline_rc_default_weak_retain_hash() { pipeline_rc_default_weak_release_hash() }
+  else { 0 } } }
+}
+
+fn pipeline_ir_abort_cleanup_rc_alloc_hash() -> i64 {
+  str_hash(__str_ptr("rc_default_alloc"), 0, __str_len("rc_default_alloc"))
+}
+
+fn pipeline_ir_abort_cleanup_add_action_fact(facts: i64, value: i64, action: i64, kind: i64) -> i64 {
+  if value < 0 or action == 0 or pipeline_ir_abort_cleanup_fact_exists(facts, value, action, kind) == 1 { 0 }
+  else { nlist_add(facts, node_new(0, value, action, kind, nlist_len(facts))) }
+}
+
+fn pipeline_ir_abort_cleanup_collect_inst_list(insts: IrInstList, all_blocks: IrBlockList, facts: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      match inst {
+        IrCallI64(dst, callee_hash, args) -> {
+          if pipeline_ir_abort_cleanup_is_managed_release_hash(callee_hash) == 1 {
+            pipeline_ir_abort_cleanup_add_action_fact(facts, pipeline_ir_value_list_get_or(args, 0, 0 - 1), callee_hash, pipeline_ir_abort_cleanup_managed_kind())
+          } else { 0 }
+        }
+        IrOwnedDropI64(value, type_hash) -> pipeline_ir_abort_cleanup_add_action_fact(facts, value, type_hash, pipeline_ir_abort_cleanup_owned_kind())
+        _ -> 0
+      }
+      pipeline_ir_abort_cleanup_collect_inst_list(rest, all_blocks, facts)
+    }
+  }
+}
+
+fn pipeline_ir_abort_cleanup_collect_blocks(blocks: IrBlockList, all_blocks: IrBlockList, facts: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_abort_cleanup_collect_inst_list(insts, all_blocks, facts)
+      }
+      pipeline_ir_abort_cleanup_collect_blocks(rest, all_blocks, facts)
+    }
+  }
+}
+
+fn pipeline_ir_abort_cleanup_acquisition_fact_exists(facts: i64, site: i64, value: i64, action: i64, kind: i64) -> i64 {
+  let mut found = 0
+  let n = nlist_len(facts)
+  let mut i = 0
+  while i < n and found == 0 {
+    let fact = nlist_get(facts, i)
+    if node_tag(fact) == site and node_f1(fact) == value and node_f2(fact) == action and node_f3(fact) == kind { found = 1 }
+    else { i = i + 1 }
+  }
+  found
+}
+
+fn pipeline_ir_abort_cleanup_add_acquisition_fact(facts: i64, site: i64, value: i64, action: i64, kind: i64) -> i64 {
+  if site < 0 or value < 0 or action == 0 or pipeline_ir_abort_cleanup_acquisition_fact_exists(facts, site, value, action, kind) == 1 { 0 }
+  else { nlist_add(facts, node_new(site, value, action, kind, nlist_len(facts))) }
+}
+
+fn pipeline_ir_abort_cleanup_find_action_kind(actions: i64, value: i64, kind: i64) -> i64 {
+  let mut found = 0
+  let n = nlist_len(actions)
+  let mut i = 0
+  while i < n and found == 0 {
+    let fact = nlist_get(actions, i)
+    if node_f1(fact) == value and node_f3(fact) == kind { found = fact }
+    else { i = i + 1 }
+  }
+  found
+}
+
+fn pipeline_ir_abort_cleanup_call_result_release_hash(callee_hash: i64, fns: i64) -> i64 {
+  if callee_hash == pipeline_ir_abort_cleanup_rc_alloc_hash() or callee_hash == pipeline_rc_default_weak_load_hash() {
+    pipeline_rc_default_release_hash()
+  } else {
+    pipeline_managed_release_hash_for_ty(pipeline_fns_lookup_ret_type_node_by_hash(fns, callee_hash, 0))
+  }
+}
+
+fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst, actions: i64, facts: i64, fns: i64) -> i64 {
+  let site = pipeline_ir_inst_def_or(inst, 0 - 1)
+  let owned = if site >= 0 { pipeline_ir_abort_cleanup_find_action_kind(actions, site, pipeline_ir_abort_cleanup_owned_kind()) } else { 0 }
+  let managed = if site >= 0 { pipeline_ir_abort_cleanup_find_action_kind(actions, site, pipeline_ir_abort_cleanup_managed_kind()) } else { 0 }
+  if owned != 0 {
+    pipeline_ir_abort_cleanup_add_acquisition_fact(facts, site, site, node_f2(owned), pipeline_ir_abort_cleanup_owned_kind())
+  } else {
+    if managed != 0 {
+      pipeline_ir_abort_cleanup_add_acquisition_fact(facts, site, site, node_f2(managed), pipeline_ir_abort_cleanup_managed_kind())
+    } else { 0 }
+  }
+  match inst {
+    IrCallI64(dst, callee_hash, args) -> {
+      if pipeline_ir_abort_cleanup_is_managed_retain_hash(callee_hash) == 1 {
+        pipeline_ir_abort_cleanup_add_acquisition_fact(
+          facts,
+          dst,
+          pipeline_ir_value_list_get_or(args, 0, 0 - 1),
+          pipeline_ir_abort_cleanup_release_for_retain(callee_hash),
+          pipeline_ir_abort_cleanup_managed_kind()
+        )
+      } else {
+        let ret_ty = pipeline_fns_lookup_ret_type_node_by_hash(fns, callee_hash, 0)
+        let owned_action = cg_owned_drop_type_hash(ret_ty)
+        if owned_action != 0 {
+          pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, owned_action, pipeline_ir_abort_cleanup_owned_kind())
+        } else {
+          let release = pipeline_ir_abort_cleanup_call_result_release_hash(callee_hash, fns)
+          if release != 0 {
+            pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, release, pipeline_ir_abort_cleanup_managed_kind())
+          } else { 0 }
+        }
+      }
+    }
+    IrStringLit(dst, start, len) -> pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_managed_kind())
+    IrStringConcatI64(dst, left, right) -> pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_managed_kind())
+    IrClosureI64(dst, fn_value, captures, evidence) -> pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_closure_default_release_hash(), pipeline_ir_abort_cleanup_managed_kind())
+    IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> {
+      if owned == 0 { pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_managed_kind()) } else { 0 }
+    }
+    IrRecordInitI64(dst, type_hash, fields) -> {
+      if owned == 0 { pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_managed_kind()) } else { 0 }
+    }
+    _ -> 0
+  }
+}
+
+fn pipeline_ir_abort_cleanup_collect_acquisition_inst_list(insts: IrInstList, actions: i64, facts: i64, fns: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      pipeline_ir_abort_cleanup_collect_acquisition_inst(inst, actions, facts, fns)
+      pipeline_ir_abort_cleanup_collect_acquisition_inst_list(rest, actions, facts, fns)
+    }
+  }
+}
+
+fn pipeline_ir_abort_cleanup_collect_acquisition_blocks(blocks: IrBlockList, actions: i64, facts: i64, fns: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_abort_cleanup_collect_acquisition_inst_list(insts, actions, facts, fns)
+      }
+      pipeline_ir_abort_cleanup_collect_acquisition_blocks(rest, actions, facts, fns)
+    }
+  }
+}
+
+fn pipeline_ir_abort_cleanup_facts_for_blocks(blocks: IrBlockList, fns: i64) -> i64 {
+  let actions = nlist_new()
+  pipeline_ir_abort_cleanup_collect_blocks(blocks, blocks, actions)
+  let facts = nlist_new()
+  pipeline_ir_abort_cleanup_collect_acquisition_blocks(blocks, actions, facts, fns)
+  facts
+}
+
+fn pipeline_ir_abort_cleanup_blocks_need_instrumentation(blocks: IrBlockList, facts: i64) -> i64 {
+  if facts != 0 and nlist_len(facts) > 0 { 1 }
+  else {
+    let actions = nlist_new()
+    pipeline_ir_abort_cleanup_collect_blocks(blocks, blocks, actions)
+    if nlist_len(actions) > 0 { 1 } else { 0 }
+  }
+}
+
+fn pipeline_ir_abort_cleanup_frame_size(base_frame: i64, facts: i64, instrumented: i64) -> i64 {
+  let n = if facts == 0 { 0 } else { nlist_len(facts) }
+  if instrumented == 0 { base_frame }
+  else { cg_align16(base_frame + 32 + n * handler_abort_cleanup_record_size()) }
+}
+
+fn pipeline_ir_abort_cleanup_record_offset(base: i64, fact: i64) -> i64 {
+  base + 32 + node_f4(fact) * handler_abort_cleanup_record_size()
+}
+
+fn pipeline_ir_abort_cleanup_expected_value_offset(base: i64) -> i64 { base + 8 }
+fn pipeline_ir_abort_cleanup_expected_action_offset(base: i64) -> i64 { base + 16 }
+fn pipeline_ir_abort_cleanup_link_address_offset(base: i64) -> i64 { base + 24 }
+
+fn pipeline_ir_abort_cleanup_emit_sp_address(code: i64, dst: i64, byte_off: i64) -> i64 {
+  emit_stack_address_offset(code, dst, byte_off)
+}
+
+fn pipeline_ir_abort_cleanup_emit_function_address(code: i64, target: i64, patch_key: i64, available: i64, fm: i64) -> i64 {
+  let direct_off = target - buf_len(code)
+  if target > 1 and pipeline_ir_native_adr_offset_fits(direct_off) == 1 {
+    let adr_pos = buf_len(code)
+    bu32(code, encode_adr(17, target - adr_pos))
+  } else {
+    -- Adjacent B thunk gives ADR a fixed in-range target and lets the shared
+    -- hash patcher resolve forward or distant cleanup functions.
+    bu32(code, encode_b(8))
+    let thunk = buf_len(code)
+    if target > 1 {
+      bu32(code, encode_b(target - thunk))
+    } else {
+      if available == 1 {
+        fmap_add_branch_patch_by_hash(fm, thunk, patch_key)
+        bu32(code, encode_b(0))
+      } else {
+        bu32(code, encode_brk(27))
+      }
+    }
+    let adr_pos = buf_len(code)
+    bu32(code, encode_adr(17, thunk - adr_pos))
+  }
+}
+
+fn pipeline_ir_abort_cleanup_emit_action_address(code: i64, fact: i64, fm: i64) -> i64 {
+  let action = node_f2(fact)
+  let kind = node_f3(fact)
+  if kind == pipeline_ir_abort_cleanup_managed_kind() {
+    let mono_target = mono_cache_lookup(fmap_mono_cache(fm), action)
+    let target = if mono_target > 1 { mono_target } else { fmap_lookup_by_hash(fm, action) }
+    let available = if mono_target != 0 or fmap_contains_hash(fm, action) == 1 { 1 } else { 0 }
+    pipeline_ir_abort_cleanup_emit_function_address(code, target, action, available, fm)
+  } else {
+    let method_hash = cg_drop_method_hash()
+    let mm = fmap_mmap(fm)
+    let target = mmap_lookup(mm, action, method_hash)
+    let patch_key = pipeline_ir_native_method_forward_key(mm, action, method_hash, 0)
+    let available = if target > 0 or (patch_key != 0 and mono_cache_lookup(fmap_mono_cache(fm), patch_key) != 0) { 1 } else { 0 }
+    pipeline_ir_abort_cleanup_emit_function_address(code, target, patch_key, available, fm)
+  }
+}
+
+fn pipeline_ir_abort_cleanup_emit_function_entry(code: i64, fm: i64) -> i64 {
+  let facts = fmap_current_abort_cleanup_facts(fm)
+  if facts == 0 or nlist_len(facts) == 0 { 0 }
+  else {
+    bu32(code, cg_ldr(15, 28, runtime_state_abort_cleanup_active_offset()))
+    let inactive = buf_len(code)
+    bu32(code, 0)
+    bu32(code, cg_ldr(16, 28, runtime_state_abort_cleanup_top_offset()))
+    emit_store_spill_offset(code, 16, fmap_current_abort_cleanup_boundary(fm))
+    cg_patch_cbz(code, inactive, 15, buf_len(code))
+  }
+}
+
+fn pipeline_ir_abort_cleanup_emit_function_exit(code: i64, fm: i64) -> i64 {
+  let facts = fmap_current_abort_cleanup_facts(fm)
+  if facts == 0 or nlist_len(facts) == 0 { 0 }
+  else {
+    bu32(code, cg_ldr(15, 28, runtime_state_abort_cleanup_active_offset()))
+    let inactive = buf_len(code)
+    bu32(code, 0)
+    emit_load_spill_offset(code, 16, fmap_current_abort_cleanup_boundary(fm))
+    bu32(code, cg_str(16, 28, runtime_state_abort_cleanup_top_offset()))
+    cg_patch_cbz(code, inactive, 15, buf_len(code))
+  }
+}
+
+fn pipeline_ir_abort_cleanup_emit_register_fact(code: i64, fact: i64, value: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  -- x1-x14 are allocator residents. Bookkeeping only reads a value's home
+  -- and otherwise stays in the reserved x15-x17 scratch set.
+  pipeline_ir_abort_cleanup_emit_disarm_fact(code, fact, fm)
+  bu32(code, cg_ldr(15, 28, runtime_state_abort_cleanup_active_offset()))
+  let inactive = buf_len(code)
+  bu32(code, 0)
+  pipeline_ir_abort_cleanup_emit_sp_address(code, 17, pipeline_ir_abort_cleanup_record_offset(fmap_current_abort_cleanup_base(fm), fact))
+  bu32(code, cg_ldr(15, 28, runtime_state_abort_cleanup_top_offset()))
+  bu32(code, cg_str(15, 17, handler_abort_cleanup_record_prev_offset()))
+  if node_tag(fact) == value {
+    let value_phys = pipeline_ir_native_load_reg(code, pinned, value)
+    bu32(code, cg_str(value_phys, 17, handler_abort_cleanup_record_value_offset()))
+  } else { 0 }
+  pipeline_ir_abort_cleanup_emit_sp_address(code, 15, pipeline_ir_abort_cleanup_record_offset(fmap_current_abort_cleanup_base(fm), fact))
+  pipeline_ir_abort_cleanup_emit_action_address(code, fact, fm)
+  bu32(code, cg_str(17, 15, handler_abort_cleanup_record_fn_offset()))
+  bu32(code, cg_str(15, 28, runtime_state_abort_cleanup_top_offset()))
+  cg_patch_cbz(code, inactive, 15, buf_len(code))
+}
+
+fn pipeline_ir_abort_cleanup_emit_register_site_from(code: i64, facts: i64, site: i64, index: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if facts == 0 or index >= nlist_len(facts) { 0 }
+  else {
+    let fact = nlist_get(facts, index)
+    if node_tag(fact) == site { pipeline_ir_abort_cleanup_emit_register_fact(code, fact, node_f1(fact), fm, pinned) } else { 0 }
+    pipeline_ir_abort_cleanup_emit_register_site_from(code, facts, site, index + 1, fm, pinned)
+  }
+}
+
+fn pipeline_ir_abort_cleanup_emit_register_site(code: i64, site: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if site < 0 { 0 }
+  else { pipeline_ir_abort_cleanup_emit_register_site_from(code, fmap_current_abort_cleanup_facts(fm), site, 0, fm, pinned) }
+}
+
+-- A retain's cleanup value is an INPUT while the acquisition site is the
+-- call's result SSA. Stage that input before the call, while the allocator's
+-- ordinary argument liveness still guarantees its home; link the prepared
+-- record only after the call returns successfully.
+fn pipeline_ir_abort_cleanup_emit_prepare_site_from(code: i64, facts: i64, site: i64, index: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if facts == 0 or index >= nlist_len(facts) { 0 }
+  else {
+    let fact = nlist_get(facts, index)
+    if node_tag(fact) == site and node_f1(fact) != site {
+      pipeline_ir_abort_cleanup_emit_sp_address(code, 17, pipeline_ir_abort_cleanup_record_offset(fmap_current_abort_cleanup_base(fm), fact))
+      let value_phys = pipeline_ir_native_load_reg(code, pinned, node_f1(fact))
+      bu32(code, cg_str(value_phys, 17, handler_abort_cleanup_record_value_offset()))
+    } else { 0 }
+    pipeline_ir_abort_cleanup_emit_prepare_site_from(code, facts, site, index + 1, fm, pinned)
+  }
+}
+
+fn pipeline_ir_abort_cleanup_emit_prepare_site(code: i64, site: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if site < 0 { 0 }
+  else { pipeline_ir_abort_cleanup_emit_prepare_site_from(code, fmap_current_abort_cleanup_facts(fm), site, 0, fm, pinned) }
+}
+
+fn pipeline_ir_abort_cleanup_emit_disarm_fact(code: i64, fact: i64, fm: i64) -> i64 {
+  if fact == 0 { 0 }
+  else {
+    bu32(code, cg_ldr(15, 28, runtime_state_abort_cleanup_active_offset()))
+    let inactive = buf_len(code)
+    bu32(code, 0)
+    bu32(code, encode_add_imm(15, 28, runtime_state_abort_cleanup_top_offset()))
+    emit_store_spill_offset(code, 15, pipeline_ir_abort_cleanup_link_address_offset(fmap_current_abort_cleanup_base(fm)))
+    pipeline_ir_abort_cleanup_emit_sp_address(code, 16, pipeline_ir_abort_cleanup_record_offset(fmap_current_abort_cleanup_base(fm), fact))
+    emit_store_spill_offset(code, 16, pipeline_ir_abort_cleanup_expected_value_offset(fmap_current_abort_cleanup_base(fm)))
+    bu32(code, encode_add_imm(15, 28, runtime_state_abort_cleanup_top_offset()))
+    bu32(code, cg_ldr(15, 15, 0))
+    let scan = buf_len(code)
+    bu32(code, encode_cmp(15, 31))
+    let done_empty = buf_len(code)
+    bu32(code, 0)
+    emit_load_spill_offset(code, 16, pipeline_ir_abort_cleanup_expected_value_offset(fmap_current_abort_cleanup_base(fm)))
+    bu32(code, encode_cmp(15, 16))
+    let found = buf_len(code)
+    bu32(code, 0)
+    bu32(code, encode_add_imm(17, 15, handler_abort_cleanup_record_prev_offset()))
+    emit_store_spill_offset(code, 17, pipeline_ir_abort_cleanup_link_address_offset(fmap_current_abort_cleanup_base(fm)))
+    bu32(code, cg_ldr(15, 15, handler_abort_cleanup_record_prev_offset()))
+    let scan_back = buf_len(code)
+    bu32(code, encode_b(scan - scan_back))
+    let splice = buf_len(code)
+    cg_patch_b_cond(code, found, 0, splice)
+    emit_load_spill_offset(code, 16, pipeline_ir_abort_cleanup_link_address_offset(fmap_current_abort_cleanup_base(fm)))
+    bu32(code, cg_ldr(17, 15, handler_abort_cleanup_record_prev_offset()))
+    bu32(code, cg_str(17, 16, 0))
+    let done = buf_len(code)
+    cg_patch_b_cond(code, done_empty, 0, done)
+    cg_patch_cbz(code, inactive, 15, done)
+  }
+}
+
+-- Remove one dynamic obligation matching (value, cleanup function). This is
+-- deliberately a one-record operation: two retains of the same pointer are
+-- two counts and two records, and one ordinary release consumes only one.
+fn pipeline_ir_abort_cleanup_emit_disarm_action(code: i64, value: i64, action: i64, kind: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if value < 0 or action == 0 { 0 }
+  else {
+    let value_phys = pipeline_ir_native_load_reg(code, pinned, value)
+    emit_store_spill_offset(code, value_phys, pipeline_ir_abort_cleanup_expected_value_offset(fmap_current_abort_cleanup_base(fm)))
+    pipeline_ir_abort_cleanup_emit_action_address(code, node_new(0, 0, action, kind, 0), fm)
+    emit_store_spill_offset(code, 17, pipeline_ir_abort_cleanup_expected_action_offset(fmap_current_abort_cleanup_base(fm)))
+    bu32(code, cg_ldr(15, 28, runtime_state_abort_cleanup_active_offset()))
+    let inactive = buf_len(code)
+    bu32(code, 0)
+    bu32(code, encode_add_imm(15, 28, runtime_state_abort_cleanup_top_offset()))
+    emit_store_spill_offset(code, 15, pipeline_ir_abort_cleanup_link_address_offset(fmap_current_abort_cleanup_base(fm)))
+    bu32(code, cg_ldr(15, 15, 0))
+    let scan = buf_len(code)
+    bu32(code, encode_cmp(15, 31))
+    let done_empty = buf_len(code)
+    bu32(code, 0)
+    emit_load_spill_offset(code, 16, pipeline_ir_abort_cleanup_expected_value_offset(fmap_current_abort_cleanup_base(fm)))
+    bu32(code, cg_ldr(17, 15, handler_abort_cleanup_record_value_offset()))
+    bu32(code, encode_cmp(17, 16))
+    let advance_value = buf_len(code)
+    bu32(code, 0)
+    emit_load_spill_offset(code, 16, pipeline_ir_abort_cleanup_expected_action_offset(fmap_current_abort_cleanup_base(fm)))
+    bu32(code, cg_ldr(17, 15, handler_abort_cleanup_record_fn_offset()))
+    bu32(code, encode_cmp(17, 16))
+    let found = buf_len(code)
+    bu32(code, 0)
+    let advance = buf_len(code)
+    cg_patch_b_cond(code, advance_value, 1, advance)
+    bu32(code, encode_add_imm(17, 15, handler_abort_cleanup_record_prev_offset()))
+    emit_store_spill_offset(code, 17, pipeline_ir_abort_cleanup_link_address_offset(fmap_current_abort_cleanup_base(fm)))
+    bu32(code, cg_ldr(15, 15, handler_abort_cleanup_record_prev_offset()))
+    let scan_back = buf_len(code)
+    bu32(code, encode_b(scan - scan_back))
+    let splice = buf_len(code)
+    cg_patch_b_cond(code, found, 0, splice)
+    emit_load_spill_offset(code, 16, pipeline_ir_abort_cleanup_link_address_offset(fmap_current_abort_cleanup_base(fm)))
+    bu32(code, cg_ldr(17, 15, handler_abort_cleanup_record_prev_offset()))
+    bu32(code, cg_str(17, 16, 0))
+    let done = buf_len(code)
+    cg_patch_b_cond(code, done_empty, 0, done)
+    cg_patch_cbz(code, inactive, 15, done)
+  }
+}
+
+fn pipeline_ir_abort_cleanup_emit_disarm_managed(code: i64, value: i64, callee_hash: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if pipeline_ir_abort_cleanup_is_managed_release_hash(callee_hash) == 1 {
+    pipeline_ir_abort_cleanup_emit_disarm_action(code, value, callee_hash, pipeline_ir_abort_cleanup_managed_kind(), fm, pinned)
+  } else { 0 }
+}
+
+fn pipeline_ir_abort_cleanup_emit_disarm_owned(code: i64, value: i64, type_hash: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  pipeline_ir_abort_cleanup_emit_disarm_action(code, value, type_hash, pipeline_ir_abort_cleanup_owned_kind(), fm, pinned)
 }
 
 fn pipeline_ir_native_move_args(code: i64, args: IrValueList, index: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
@@ -20931,7 +21458,7 @@ fn pipeline_ir_native_emit_hclause_continuation_lowered(code: i64, fm: i64, npar
 fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBody, code: i64, src: i64, fm: i64, active_handlers: PipelineNativeHandlerCtx, fns: i64) -> i64 {
   match body {
     IrHandlerClauseBodyInvalid(reason) -> pipeline_ir_native_emit_hclause_body_trap(code, fm)
-    IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, blocks) -> {
+    IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, first_value, blocks) -> {
       let nfree = if captures == 0 { 0 } else { nlist_len(captures) }
       let skip_pos = buf_len(code)
       bu32(code, 0)
@@ -20939,44 +21466,79 @@ fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBody, code: i64,
       let old_frame = fmap_current_frame_size(fm)
       let old_preserve_fp = fmap_current_preserve_fp(fm)
       let old_gpr_pairs = fmap_current_gpr_pairs(fm)
+      let old_abort_cleanup_facts = fmap_current_abort_cleanup_facts(fm)
+      let old_abort_cleanup_base = fmap_current_abort_cleanup_base(fm)
+      let old_abort_cleanup_boundary = fmap_current_abort_cleanup_boundary(fm)
+      let old_abort_cleanup_block = fmap_current_abort_cleanup_block(fm)
       let f64_facts = pipeline_ir_native_f64_facts_assign_slot_homes(blocks, pipeline_ir_native_f64_facts_for_blocks(blocks))
       let vector_data_facts = pipeline_ir_native_vector_data_facts_assign_home(pipeline_ir_native_vector_data_facts_for_blocks(blocks))
       let f64_slot_count = pipeline_ir_native_f64_slot_home_count(f64_facts)
       let body_max_next = pipeline_ir_function_next_value(first_value, blocks)
       let return_save = if has_continuation == 1 { body_max_next + 8 } else { body_max_next }
+      let abort_frame_value = return_save + 1
       let block_frame = pipeline_ir_native_frame_size_for_blocks(first_value, blocks)
-      let save_frame = if has_continuation == 1 { pipeline_ir_native_frame_size_for_next_value(return_save + 1) } else { block_frame }
-      fmap_set_current_frame_size(fm, pipeline_ir_max_i64(block_frame, save_frame))
+      let continuation_frame = if has_continuation == 1 { pipeline_ir_native_frame_size_for_next_value(return_save + 1) } else { block_frame }
+      let save_frame = if is_abortive == 1 { pipeline_ir_native_frame_size_for_next_value(abort_frame_value + 1) } else { continuation_frame }
+      let abort_cleanup_facts = pipeline_ir_abort_cleanup_facts_for_blocks(blocks, fns)
+      let abort_cleanup_instrumented = pipeline_ir_abort_cleanup_blocks_need_instrumentation(blocks, abort_cleanup_facts)
+      let abort_cleanup_base = pipeline_ir_max_i64(block_frame, save_frame)
+      fmap_set_current_abort_cleanup_facts(fm, abort_cleanup_facts)
+      fmap_set_current_abort_cleanup_base(fm, abort_cleanup_base)
+      fmap_set_current_abort_cleanup_boundary(fm, abort_cleanup_base)
+      fmap_set_current_frame_size(fm, pipeline_ir_abort_cleanup_frame_size(abort_cleanup_base, abort_cleanup_facts, abort_cleanup_instrumented))
       if f64_slot_count > 0 { fmap_set_current_preserve_fp(fm, 1) } else { 0 }
       fmap_set_current_gpr_pairs(fm, 4)
       emit_prologue_current(code, fm)
-      pipeline_ir_native_emit_hclause_loads(code, nparams, captures, nfree)
       let continuation_token_value = nparams + nfree + nparams
       let continuation_segment_value = continuation_token_value + 1
       let continuation_closure_value = continuation_token_value + 2
       let continuation_env_value = continuation_token_value + 3
       let safe_handlers = pipeline_ir_native_handler_ctx_uncaptured(active_handlers)
-      let body_home_count = pipeline_ir_native_value_home_count_include_evidence(pipeline_ir_native_value_home_count_for_blocks(first_value, blocks), fm)
+      let base_home_count = pipeline_ir_native_value_home_count_include_evidence(pipeline_ir_native_value_home_count_for_blocks(first_value, blocks), fm)
+      let body_home_count = if is_abortive == 1 { pipeline_ir_native_value_home_count_include(base_home_count, abort_frame_value) } else { base_home_count }
       let contextual_home_count = pipeline_ir_native_value_home_count_include_handlers(body_home_count, safe_handlers)
       let pinned = pipeline_ir_native_identity_home_facts(pipeline_ir_native_value_home_count_include_handler_scratch(contextual_home_count, blocks, pipeline_ir_native_handler_ctx_len(safe_handlers)))
+      -- Capture before any clause-body work can perform another effect and
+      -- overwrite the shared dispatcher slot.
+      if is_abortive == 1 {
+        bu32(code, cg_ldr(9, 28, runtime_state_dispatch_frame_offset()))
+        pipeline_ir_native_store_reg(code, pinned, abort_frame_value, 9)
+      } else { 0 }
+      pipeline_ir_native_emit_hclause_loads(code, nparams, captures, nfree)
+      -- Boundary capture uses scratch registers, so it must follow incoming
+      -- clause-parameter/capture materialisation under Weft's wide register
+      -- ABI.
+      pipeline_ir_abort_cleanup_emit_function_entry(code, fm)
       if has_continuation == 1 {
         pipeline_ir_native_emit_hclause_continuation_lowered(code, fm, nparams, captures, continuation_token_value, continuation_segment_value, has_continuation)
         pipeline_ir_native_emit_hclause_continuation_closure(code, fm, continuation_token_value, continuation_closure_value, continuation_env_value, has_continuation, pinned)
       } else { 0 }
       let temp_base = body_max_next + 8
-      let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, scope_new(), src, fm, safe_handlers, fns, f64_facts, vector_data_facts, pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
+      let abort_adr_patches = nlist_new()
+      let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, scope_new(), src, fm, safe_handlers, fns, f64_facts, vector_data_facts, abort_adr_patches, pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
       let labels = pipeline_ir_native_label_map_add(pipeline_ir_native_cfg_state_labels(state), pipeline_ir_native_epilogue_label(), buf_len(code))
       pipeline_ir_native_patch_all(code, labels, pipeline_ir_native_cfg_state_patches(state))
+      pipeline_ir_native_patch_abort_adrs(code, labels, abort_adr_patches)
       if has_continuation == 1 {
         pipeline_ir_native_store_reg(code, pinned, return_save, 0)
         pipeline_ir_native_release_hclause_continuation_closure(code, fm, has_continuation, continuation_closure_value, pinned)
         let saved_result = emit_load_reg(code, return_save)
         bu32(code, encode_add_imm(0, saved_result, 0))
       } else { 0 }
-      emit_epilogue_current(code, fm)
+      if is_abortive == 1 {
+        let abort_frame_phys = pipeline_ir_native_load_reg(code, pinned, abort_frame_value)
+        cg_habort_restore_and_ret(code, abort_frame_phys, 0)
+      } else {
+        pipeline_ir_abort_cleanup_emit_function_exit(code, fm)
+        emit_epilogue_current(code, fm)
+      }
       fmap_set_current_frame_size(fm, old_frame)
       fmap_set_current_preserve_fp(fm, old_preserve_fp)
       fmap_set_current_gpr_pairs(fm, old_gpr_pairs)
+      fmap_set_current_abort_cleanup_facts(fm, old_abort_cleanup_facts)
+      fmap_set_current_abort_cleanup_base(fm, old_abort_cleanup_base)
+      fmap_set_current_abort_cleanup_boundary(fm, old_abort_cleanup_boundary)
+      fmap_set_current_abort_cleanup_block(fm, old_abort_cleanup_block)
       cg_patch_b(code, skip_pos, buf_len(code))
       pipeline_hclause_info_new(clause_start, captures, nfree)
     }
@@ -21051,7 +21613,7 @@ fn pipeline_ir_native_hfill_ops(clauses: IrHandlerClauseBodyList, n: i64, infos:
   for ci in 0..n {
     let clause = ir_handler_clause_body_list_nth(clauses, ci)
     let op_hash = match clause {
-      IrHandlerClauseBody(body_op_hash, nparams, captures, has_continuation, first_value, blocks) -> body_op_hash
+      IrHandlerClauseBody(body_op_hash, nparams, captures, has_continuation, is_abortive, first_value, blocks) -> body_op_hash
       IrHandlerClauseBodyInvalid(reason) -> 0
     }
     let info = pipeline_word_array_get(infos, ci)
@@ -21087,30 +21649,48 @@ fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredHandlerBody, e
       let old_frame = fmap_current_frame_size(fm)
       let old_preserve_fp = fmap_current_preserve_fp(fm)
       let old_gpr_pairs = fmap_current_gpr_pairs(fm)
+      let old_abort_cleanup_facts = fmap_current_abort_cleanup_facts(fm)
+      let old_abort_cleanup_base = fmap_current_abort_cleanup_base(fm)
+      let old_abort_cleanup_boundary = fmap_current_abort_cleanup_boundary(fm)
+      let old_abort_cleanup_block = fmap_current_abort_cleanup_block(fm)
       let f64_facts = pipeline_ir_native_f64_facts_assign_slot_homes(blocks, pipeline_ir_native_f64_facts_for_blocks(blocks))
       let vector_data_facts = pipeline_ir_native_vector_data_facts_assign_home(pipeline_ir_native_vector_data_facts_for_blocks(blocks))
       let f64_slot_count = pipeline_ir_native_f64_slot_home_count(f64_facts)
-      fmap_set_current_frame_size(fm, pipeline_ir_native_frame_size_for_blocks(first_value, blocks))
+      let abort_cleanup_facts = pipeline_ir_abort_cleanup_facts_for_blocks(blocks, fns)
+      let abort_cleanup_instrumented = pipeline_ir_abort_cleanup_blocks_need_instrumentation(blocks, abort_cleanup_facts)
+      let abort_cleanup_base = pipeline_ir_native_frame_size_for_blocks(first_value, blocks)
+      fmap_set_current_abort_cleanup_facts(fm, abort_cleanup_facts)
+      fmap_set_current_abort_cleanup_base(fm, abort_cleanup_base)
+      fmap_set_current_abort_cleanup_boundary(fm, abort_cleanup_base)
+      fmap_set_current_frame_size(fm, pipeline_ir_abort_cleanup_frame_size(abort_cleanup_base, abort_cleanup_facts, abort_cleanup_instrumented))
       if f64_slot_count > 0 { fmap_set_current_preserve_fp(fm, 1) } else { 0 }
       fmap_set_current_gpr_pairs(fm, 4)
       emit_prologue_current(code, fm)
+      pipeline_ir_abort_cleanup_emit_function_entry(code, fm)
       pipeline_ir_native_emit_lambda_loads(code, 0, nfree)
       let body_next_value = pipeline_ir_function_next_value(first_value, blocks)
       let safe_handlers = pipeline_ir_native_handler_ctx_uncaptured(active_handlers)
-      let fiber_handlers = PipelineNativeHandlerCtxCons(eff_hash, clause_infos, nclauses, ops_value, 0 - 1, safe_handlers)
+      let fiber_handlers = PipelineNativeHandlerCtxCons(eff_hash, clause_infos, nclauses, ops_value, 0 - 1, 0, safe_handlers)
       let body_home_count = pipeline_ir_native_value_home_count_include_evidence(pipeline_ir_native_value_home_count_for_blocks(first_value, blocks), fm)
       let contextual_home_count = pipeline_ir_native_value_home_count_include_handlers(body_home_count, fiber_handlers)
       let pinned = pipeline_ir_native_identity_home_facts(pipeline_ir_native_value_home_count_include_handler_scratch(contextual_home_count, blocks, pipeline_ir_native_handler_ctx_len(fiber_handlers)))
       bu32(code, cg_ldr(17, 28, runtime_state_deferred_ops_offset()))
       pipeline_ir_native_store_reg(code, pinned, ops_value, 17)
       let temp_base = body_next_value + 8
-      let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, scope_new(), src, fm, fiber_handlers, fns, f64_facts, vector_data_facts, pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
+      let abort_adr_patches = nlist_new()
+      let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, scope_new(), src, fm, fiber_handlers, fns, f64_facts, vector_data_facts, abort_adr_patches, pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
       let labels = pipeline_ir_native_label_map_add(pipeline_ir_native_cfg_state_labels(state), pipeline_ir_native_epilogue_label(), buf_len(code))
       pipeline_ir_native_patch_all(code, labels, pipeline_ir_native_cfg_state_patches(state))
+      pipeline_ir_native_patch_abort_adrs(code, labels, abort_adr_patches)
+      pipeline_ir_abort_cleanup_emit_function_exit(code, fm)
       emit_epilogue_current(code, fm)
       fmap_set_current_frame_size(fm, old_frame)
       fmap_set_current_preserve_fp(fm, old_preserve_fp)
       fmap_set_current_gpr_pairs(fm, old_gpr_pairs)
+      fmap_set_current_abort_cleanup_facts(fm, old_abort_cleanup_facts)
+      fmap_set_current_abort_cleanup_base(fm, old_abort_cleanup_base)
+      fmap_set_current_abort_cleanup_boundary(fm, old_abort_cleanup_boundary)
+      fmap_set_current_abort_cleanup_block(fm, old_abort_cleanup_block)
       cg_patch_b(code, skip_pos, buf_len(code))
       pipeline_hclause_info_new(body_start, captures, nfree)
     }
@@ -21195,7 +21775,10 @@ fn pipeline_ir_native_emit_deferred_handle(code: i64, dst: i64, src: i64, body: 
   pipeline_ir_native_store_reg(code, pinned, ops_ctr, 16)
   pipeline_ir_native_hfill_ops(clauses, nclauses, clause_infos, code, ops_ctr, pinned)
   pipeline_ir_native_emit_capture_env_entries(code, fm, env_ctr, pipeline_hclause_info_free_vars(body_info), pinned)
-  emit_mov_imm(code, 0, 65536)
+  -- Match runtime/effects.weft fiber_default_stack_size(). The native
+  -- backend reserves a conservative 2 KiB home area per recursive frame;
+  -- abort-cleanup records pushed the 64 KiB segment past its safe depth.
+  emit_mov_imm(code, 0, 131072)
   cg_emit_call_lit(code, fm, "fiber_segment_new")
   pipeline_ir_native_store_reg(code, pinned, segment_ctr, 0)
   let segment_phys = pipeline_ir_native_load_reg_temp(code, pinned, segment_ctr, 16)
@@ -21235,7 +21818,7 @@ fn pipeline_ir_native_emit_deferred_handle(code: i64, dst: i64, src: i64, body: 
   pipeline_ir_native_emit_deferred_pop_runtime_state(code)
 }
 
-fn pipeline_ir_native_emit_handle(code: i64, src: i64, fm: i64, eff_hash: i64, clauses: IrHandlerClauseBodyList, nclauses: i64, emit_ctx: PipelineNativeEmitCtx) -> PipelineNativeHandlerCtx {
+fn pipeline_ir_native_emit_handle(code: i64, src: i64, fm: i64, eff_hash: i64, clauses: IrHandlerClauseBodyList, nclauses: i64, abort_block: i64, emit_ctx: PipelineNativeEmitCtx) -> PipelineNativeHandlerCtx {
   let ctx = pipeline_ir_native_emit_ctx_handlers(emit_ctx)
   let fns = pipeline_ir_native_emit_ctx_fns(emit_ctx)
   let pinned = pipeline_ir_native_emit_ctx_pinned(emit_ctx)
@@ -21252,9 +21835,12 @@ fn pipeline_ir_native_emit_handle(code: i64, src: i64, fm: i64, eff_hash: i64, c
     cg_bump_alloc_imm(code, 16, nclauses * handler_ops_entry_size())
     pipeline_ir_native_store_reg(code, pinned, ops_ctr, 16)
     pipeline_ir_native_hfill_ops(clauses, nclauses, clause_infos, code, ops_ctr, pinned)
-    cg_hbuild_frame(code, eff_hash, nclauses, ops_ctr)
+    let adr_pos = cg_hbuild_frame_maybe_abort(code, eff_hash, nclauses, ops_ctr, if abort_block >= 0 { 1 } else { 0 })
+    if adr_pos > 0 {
+      nlist_add(pipeline_ir_native_emit_ctx_adr_patches(emit_ctx), node_new(0, adr_pos, abort_block, 0, 0))
+    } else { 0 }
     pipeline_ir_native_store_reg(code, pinned, frame_ctr, 27)
-    PipelineNativeHandlerCtxCons(eff_hash, clause_infos, nclauses, ops_ctr, frame_ctr, ctx)
+    PipelineNativeHandlerCtxCons(eff_hash, clause_infos, nclauses, ops_ctr, frame_ctr, if abort_block >= 0 { 1 } else { 0 }, ctx)
   }
 }
 
@@ -21262,7 +21848,7 @@ fn pipeline_ir_native_emit_direct(code: i64, dst: i64, handler_depth: i64, claus
   let found = pipeline_ir_native_handler_ctx_at(ctx, handler_depth)
   match found {
     PipelineNativeHandlerCtxNil -> 0
-    PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, rest) -> {
+    PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, is_abortive, rest) -> {
       if frame_ctr < 0 {
         let ops_phys = pipeline_ir_native_load_reg(code, pinned, ops_ctr)
         bu32(code, encode_add_imm(13, ops_phys, clause_index * handler_ops_entry_size()))
@@ -21285,6 +21871,10 @@ fn pipeline_ir_native_emit_direct(code: i64, dst: i64, handler_depth: i64, claus
         -- statically known frame register gives prev without the
         -- runtime-state slot.
         let frame_phys = pipeline_ir_native_load_reg(code, pinned, frame_ctr)
+        -- The clause cannot read x27: it is masked for sound dispatch.
+        -- Hand the actual frame over through runtime state, matching the
+        -- dynamic handler_find_entry path. Its prologue snapshots the slot.
+        bu32(code, cg_str(frame_phys, 28, runtime_state_dispatch_frame_offset()))
         bu32(code, cg_ldr(15, frame_phys, handler_frame_prev_offset()))
         bu32(code, encode_sub_imm(31, 31, 16))
         bu32(code, encode_str(27, 31, 0))
@@ -22186,7 +22776,7 @@ fn pipeline_ir_lambda_evidence_registry_add(fm: i64, fn_hash: i64, evidence: IrL
 fn pipeline_ir_native_handler_evidence_ops_value(handlers: PipelineNativeHandlerCtx, eff_hash: i64, src: i64) -> i64 {
   match handlers {
     PipelineNativeHandlerCtxNil -> 0 - 1
-    PipelineNativeHandlerCtxCons(ctx_eff, infos, nclauses, ops_ctr, frame_ctr, rest) -> {
+    PipelineNativeHandlerCtxCons(ctx_eff, infos, nclauses, ops_ctr, frame_ctr, is_abortive, rest) -> {
       if frame_ctr >= 0 and nclauses > 0 {
         if ctx_eff == eff_hash { ops_ctr }
         else { pipeline_ir_native_handler_evidence_ops_value(rest, eff_hash, src) }
@@ -23190,8 +23780,14 @@ fn pipeline_ir_native_emit_vector_set_i64(code: i64, dst: i64, vec: i64, index: 
 fn pipeline_ir_native_pop_one(code: i64, facts: PipelineIrNativeValueHomeFacts, ctx: PipelineNativeHandlerCtx) -> PipelineNativeHandlerCtx {
   match ctx {
     PipelineNativeHandlerCtxNil -> PipelineNativeHandlerCtxNil
-    PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, rest) -> {
+    PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, is_abortive, rest) -> {
       let fp = pipeline_ir_native_load_reg_raw(code, facts, frame_ctr)
+      if is_abortive == 1 {
+        bu32(code, cg_ldr(9, fp, handler_frame_abort_cleanup_boundary_offset()))
+        bu32(code, cg_str(9, 28, runtime_state_abort_cleanup_top_offset()))
+        bu32(code, cg_ldr(9, fp, handler_frame_abort_prev_active_offset()))
+        bu32(code, cg_str(9, 28, runtime_state_abort_cleanup_active_offset()))
+      } else { 0 }
       bu32(code, cg_ldr(27, fp, handler_frame_prev_offset()))
       rest
     }
@@ -23200,43 +23796,43 @@ fn pipeline_ir_native_pop_one(code: i64, facts: PipelineIrNativeValueHomeFacts, 
 
 fn pipeline_ir_native_emit_ctx_scope(ctx: PipelineNativeEmitCtx) -> i64 {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts) -> scope
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> scope
   }
 }
 
 fn pipeline_ir_native_emit_ctx_handlers(ctx: PipelineNativeEmitCtx) -> PipelineNativeHandlerCtx {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts) -> handlers
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> handlers
   }
 }
 
 fn pipeline_ir_native_emit_ctx_pinned(ctx: PipelineNativeEmitCtx) -> PipelineIrNativeValueHomeFacts {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts) -> pinned
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> pinned
   }
 }
 
 fn pipeline_ir_native_emit_ctx_f64_facts(ctx: PipelineNativeEmitCtx) -> PipelineIrNativeF64Facts {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts) -> f64_facts
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> f64_facts
   }
 }
 
 fn pipeline_ir_native_emit_ctx_fns(ctx: PipelineNativeEmitCtx) -> i64 {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts) -> fns
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> fns
   }
 }
 
 fn pipeline_ir_native_emit_ctx_fp_env(ctx: PipelineNativeEmitCtx) -> PipelineIrNativeFpEnv {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts) -> fp_env
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> fp_env
   }
 }
 
 fn pipeline_ir_native_emit_ctx_with_fp_env(ctx: PipelineNativeEmitCtx, fp_env: PipelineIrNativeFpEnv) -> PipelineNativeEmitCtx {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, old_fp_env, vector_data_facts) -> PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts)
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, old_fp_env, vector_data_facts, adr_patches) -> PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches)
   }
 }
 
@@ -23246,7 +23842,13 @@ fn pipeline_ir_native_emit_ctx_clear_fp(ctx: PipelineNativeEmitCtx) -> PipelineN
 
 fn pipeline_ir_native_emit_ctx_vector_data_facts(ctx: PipelineNativeEmitCtx) -> PipelineIrNativeVectorDataFacts {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts) -> vector_data_facts
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> vector_data_facts
+  }
+}
+
+fn pipeline_ir_native_emit_ctx_adr_patches(ctx: PipelineNativeEmitCtx) -> i64 {
+  match ctx {
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> adr_patches
   }
 }
 
@@ -23321,8 +23923,10 @@ fn pipeline_ir_native_emit_inst(inst: IrInst, code: i64, src: i64, fm: i64, ctx:
   if pipeline_ir_native_resident_inst_simple(inst) == 0 {
     pipeline_ir_native_split_flip_actives(fm, pipeline_ir_native_emit_ctx_pinned(ctx))
   } else { 0 }
+  pipeline_ir_abort_cleanup_emit_prepare_site(code, pipeline_ir_inst_def_or(inst, 0 - 1), fm, pipeline_ir_native_emit_ctx_pinned(ctx))
   let out_ctx = pipeline_ir_native_emit_inst_dispatch(inst, code, src, fm, ctx)
   pipeline_ir_native_split_activate(code, fm, pipeline_ir_native_emit_ctx_pinned(out_ctx), pipeline_ir_inst_def_or(inst, 0 - 1))
+  pipeline_ir_abort_cleanup_emit_register_site(code, pipeline_ir_inst_def_or(inst, 0 - 1), fm, pipeline_ir_native_emit_ctx_pinned(out_ctx))
   out_ctx
 }
 
@@ -23385,6 +23989,7 @@ fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, src: i64, fm: 
       }
     }
     IrCallI64(dst, callee_hash, args) -> {
+      pipeline_ir_abort_cleanup_emit_disarm_managed(code, pipeline_ir_value_list_get_or(args, 0, 0 - 1), callee_hash, fm, pinned)
       pipeline_ir_native_emit_call(code, dst, callee_hash, args, fm, pinned)
       ctx
     }
@@ -23409,6 +24014,7 @@ fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, src: i64, fm: 
       ctx
     }
     IrOwnedDropI64(value, type_hash) -> {
+      pipeline_ir_abort_cleanup_emit_disarm_owned(code, value, type_hash, fm, pinned)
       pipeline_ir_native_emit_owned_drop(code, value, type_hash, fm, pinned)
       ctx
     }
@@ -23473,16 +24079,22 @@ fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, src: i64, fm: 
       bu32(code, encode_brk(20 + reason))
       ctx
     }
-    IrBindI64(ns, nl, value, ty) -> PipelineNativeEmitCtx(scope_push_typed(scope, ns, nl, pipeline_ir_native_value_home_lookup(pinned, value), ty), handlers, pinned, pipeline_ir_native_emit_ctx_f64_facts(ctx), fns, pipeline_ir_native_emit_ctx_fp_env(ctx), pipeline_ir_native_emit_ctx_vector_data_facts(ctx))
-    IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, reserved) -> {
-      let next_handlers = pipeline_ir_native_emit_handle(code, handle_src, fm, effect_hash, clauses, nclauses, ctx)
-      PipelineNativeEmitCtx(scope, next_handlers, pinned, pipeline_ir_native_emit_ctx_f64_facts(ctx), fns, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_emit_ctx_vector_data_facts(ctx))
+    IrBindI64(ns, nl, value, ty) -> {
+      PipelineNativeEmitCtx(scope_push_typed(scope, ns, nl, pipeline_ir_native_value_home_lookup(pinned, value), ty), handlers, pinned, pipeline_ir_native_emit_ctx_f64_facts(ctx), fns, pipeline_ir_native_emit_ctx_fp_env(ctx), pipeline_ir_native_emit_ctx_vector_data_facts(ctx), pipeline_ir_native_emit_ctx_adr_patches(ctx))
+    }
+    IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, abort_block) -> {
+      let next_handlers = pipeline_ir_native_emit_handle(code, handle_src, fm, effect_hash, clauses, nclauses, abort_block, ctx)
+      PipelineNativeEmitCtx(scope, next_handlers, pinned, pipeline_ir_native_emit_ctx_f64_facts(ctx), fns, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_emit_ctx_vector_data_facts(ctx), pipeline_ir_native_emit_ctx_adr_patches(ctx))
     }
     IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> {
       pipeline_ir_native_emit_deferred_handle(code, dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base, fm, ctx)
       ctx
     }
-    IrHandlerPopI64(frame) -> PipelineNativeEmitCtx(scope, pipeline_ir_native_pop_one(code, pinned, handlers), pinned, pipeline_ir_native_emit_ctx_f64_facts(ctx), fns, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_emit_ctx_vector_data_facts(ctx))
+    IrHandlerPopI64(frame) -> PipelineNativeEmitCtx(scope, pipeline_ir_native_pop_one(code, pinned, handlers), pinned, pipeline_ir_native_emit_ctx_f64_facts(ctx), fns, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_emit_ctx_vector_data_facts(ctx), pipeline_ir_native_emit_ctx_adr_patches(ctx))
+    IrAbortLandingI64(dst) -> {
+      pipeline_ir_native_store_reg_pinned(code, pinned, dst, 0)
+      ctx
+    }
     IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> {
       pipeline_ir_native_emit_direct(code, dst, handler_depth, clause_index, args, handlers, fm, pinned)
       ctx
@@ -23645,6 +24257,26 @@ fn pipeline_ir_native_patch_all(code: i64, labels: i64, patches: i64) -> i64 {
       0
     }
     cur = node_f4(cur)
+  }
+  0
+}
+
+-- 4j handle-abort continuations are forward ADRs materialised while an
+-- IrHandle instruction is emitted. Instruction emission does not own the CFG
+-- label map, so it records (position, target block) pairs in the current
+-- emission context and this pass resolves them once every block has a label.
+fn pipeline_ir_native_patch_abort_adrs(code: i64, labels: i64, patches: i64) -> i64 {
+  let n = if patches == 0 { 0 } else { nlist_len(patches) }
+  for i in 0..n {
+    let patch = nlist_get(patches, i)
+    let pos = node_f1(patch)
+    let target = pipeline_ir_native_label_map_lookup(labels, node_f2(patch))
+    if target >= 0 {
+      bytes_set_u32(code, pos, encode_adr(17, target - pos))
+    } else {
+      -- Missing landing labels must fail loudly if malformed IR escapes.
+      bytes_set_u32(code, pos, encode_brk(24))
+    }
   }
   0
 }
@@ -23875,7 +24507,7 @@ fn pipeline_ir_native_cfg_state_temp_base(state: PipelineIrNativeCfgState) -> i6
   }
 }
 
-fn pipeline_ir_native_emit_blocks(blocks: IrBlockList, all_blocks: IrBlockList, code: i64, scope: i64, src: i64, fm: i64, handlers: PipelineNativeHandlerCtx, fns: i64, f64_facts: PipelineIrNativeF64Facts, vector_data_facts: PipelineIrNativeVectorDataFacts, state: PipelineIrNativeCfgState) -> PipelineIrNativeCfgState {
+fn pipeline_ir_native_emit_blocks(blocks: IrBlockList, all_blocks: IrBlockList, code: i64, scope: i64, src: i64, fm: i64, handlers: PipelineNativeHandlerCtx, fns: i64, f64_facts: PipelineIrNativeF64Facts, vector_data_facts: PipelineIrNativeVectorDataFacts, adr_patches: i64, state: PipelineIrNativeCfgState) -> PipelineIrNativeCfgState {
   let labels = pipeline_ir_native_cfg_state_labels(state)
   let patches = pipeline_ir_native_cfg_state_patches(state)
   let pinned = pipeline_ir_native_cfg_state_pinned(state)
@@ -23885,12 +24517,13 @@ fn pipeline_ir_native_emit_blocks(blocks: IrBlockList, all_blocks: IrBlockList, 
     IrBlockListCons(block, rest) -> {
       match block {
         IrBlock(id, params, insts, term) -> {
+          fmap_set_current_abort_cleanup_block(fm, id)
           let next_labels = pipeline_ir_native_label_map_add(labels, id, buf_len(code))
           -- A split segment never survives its block: any active from
           -- the previous block flips home before this block's reads.
           pipeline_ir_native_split_flip_actives(fm, pinned)
           let branch_cmp_info = pipeline_ir_native_direct_branch_cmp_info_for_term(insts, term)
-          let ctx = pipeline_ir_native_emit_inst_list_for_term(insts, code, src, fm, PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, pipeline_ir_native_fp_env_empty(), vector_data_facts), branch_cmp_info)
+          let ctx = pipeline_ir_native_emit_inst_list_for_term(insts, code, src, fm, PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, pipeline_ir_native_fp_env_empty(), vector_data_facts, adr_patches), branch_cmp_info)
           let next_handlers_ctx = pipeline_ir_native_emit_ctx_handlers(ctx)
           let branch_return = match rest {
             IrBlockListNil -> 0
@@ -23902,7 +24535,7 @@ fn pipeline_ir_native_emit_blocks(blocks: IrBlockList, all_blocks: IrBlockList, 
           let audit_offsets = fmap_audit_offsets(fm)
           if audit_offsets != 0 { nlist_add(audit_offsets, buf_len(code)) 0 } else { 0 }
           let next_patches = pipeline_ir_native_emit_term_cfg(term, all_blocks, code, next_labels, patches, fm, info)
-          pipeline_ir_native_emit_blocks(rest, all_blocks, code, scope, src, fm, next_handlers_ctx, fns, f64_facts, vector_data_facts, pipeline_ir_native_cfg_state(next_labels, next_patches, pinned, temp_base))
+          pipeline_ir_native_emit_blocks(rest, all_blocks, code, scope, src, fm, next_handlers_ctx, fns, f64_facts, vector_data_facts, adr_patches, pipeline_ir_native_cfg_state(next_labels, next_patches, pinned, temp_base))
         }
       }
     }
@@ -23912,13 +24545,15 @@ fn pipeline_ir_native_emit_blocks(blocks: IrBlockList, all_blocks: IrBlockList, 
 fn pipeline_ir_native_emit_block(block: IrBlock, code: i64, scope: i64, src: i64, fm: i64) -> i64 {
   match block {
     IrBlock(id, params, insts, term) -> {
+      fmap_set_current_abort_cleanup_block(fm, id)
       let branch_cmp_info = pipeline_ir_native_direct_branch_cmp_info_for_term(insts, term)
       let single = ir_block_list_prepend(block, ir_block_list_empty())
       let home_count = pipeline_ir_native_value_home_count_include_evidence(pipeline_ir_native_value_home_count_for_blocks(0, single), fm)
       let pinned = pipeline_ir_native_identity_home_facts(pipeline_ir_native_value_home_count_include_handler_scratch(home_count, single, 0))
       let f64_facts = pipeline_ir_native_f64_facts_assign_slot_homes(single, pipeline_ir_native_f64_facts_for_blocks(single))
       let vector_data_facts = pipeline_ir_native_vector_data_facts_assign_home(pipeline_ir_native_vector_data_facts_for_blocks(single))
-      let ctx = pipeline_ir_native_emit_inst_list_for_term(insts, code, src, fm, PipelineNativeEmitCtx(scope, PipelineNativeHandlerCtxNil, pinned, f64_facts, 0, pipeline_ir_native_fp_env_empty(), vector_data_facts), branch_cmp_info)
+      let adr_patches = nlist_new()
+      let ctx = pipeline_ir_native_emit_inst_list_for_term(insts, code, src, fm, PipelineNativeEmitCtx(scope, PipelineNativeHandlerCtxNil, pinned, f64_facts, 0, pipeline_ir_native_fp_env_empty(), vector_data_facts, adr_patches), branch_cmp_info)
       pipeline_ir_native_emit_term_cfg(
         term,
         single,
@@ -23928,6 +24563,7 @@ fn pipeline_ir_native_emit_block(block: IrBlock, code: i64, scope: i64, src: i64
         fm,
         pipeline_ir_native_term_emit_info(0, branch_cmp_info, pinned, 240)
       )
+      pipeline_ir_native_patch_abort_adrs(code, pipeline_ir_native_label_map_add(pipeline_ir_native_label_map_empty(), id, 0), adr_patches)
       0
     }
   }
@@ -25026,12 +25662,30 @@ fn pipeline_ir_native_resident_max_block_id(blocks: IrBlockList) -> i64 {
   }
 }
 
+fn pipeline_ir_native_resident_count_abort_preds(insts: IrInstList, pred_count: i64, max_id: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      match inst {
+        IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, abort_block) -> {
+          if abort_block >= 0 and abort_block <= max_id {
+            pipeline_ir_native_resident_dense_set(pred_count, abort_block, nlist_get(pred_count, abort_block) + 1)
+          } else { 0 }
+        }
+        _ -> 0
+      }
+      pipeline_ir_native_resident_count_abort_preds(rest, pred_count, max_id)
+    }
+  }
+}
+
 fn pipeline_ir_native_resident_count_preds(blocks: IrBlockList, pred_count: i64, jump_pred: i64, max_id: i64) -> i64 {
   match blocks {
     IrBlockListNil -> 0
     IrBlockListCons(block, rest) -> {
       match block {
         IrBlock(id, params, insts, term) -> {
+          pipeline_ir_native_resident_count_abort_preds(insts, pred_count, max_id)
           match term {
             IrTermJump(target, args) -> {
               if target >= 0 and target <= max_id {
@@ -25367,6 +26021,7 @@ fn pipeline_ir_native_resident_def_shape(inst: IrInst, fpd: i64) -> i64 {
           IrHandleI64(dst, handle_src, eff, clauses, nclauses, reserved) -> 10
           IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, eff, scratch_base) -> 10
           IrResumeI64(dst, v) -> 10
+          IrAbortLandingI64(dst) -> 10
           IrBindI64(ns, nl, value, ty) -> 10
           _ -> 14
         }
@@ -27486,7 +28141,7 @@ fn pipeline_ir_lambda_evidence_register_handler_clauses(clauses: IrHandlerClause
     IrHandlerClauseBodyNil -> 0
     IrHandlerClauseBodyCons(body, rest) -> {
       match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, blocks) -> pipeline_ir_lambda_evidence_register_blocks(blocks, fm)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, first_value, blocks) -> pipeline_ir_lambda_evidence_register_blocks(blocks, fm)
         IrHandlerClauseBodyInvalid(reason) -> 0
       }
       pipeline_ir_lambda_evidence_register_handler_clauses(rest, fm)
@@ -27565,6 +28220,9 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         let old_ev_eff = fmap_lambda_evidence_eff(fm)
         let old_ev_ops = fmap_lambda_evidence_ops(fm)
         let old_ev_value = fmap_lambda_evidence_value(fm)
+        let old_abort_cleanup_facts = fmap_current_abort_cleanup_facts(fm)
+        let old_abort_cleanup_base = fmap_current_abort_cleanup_base(fm)
+        let old_abort_cleanup_boundary = fmap_current_abort_cleanup_boundary(fm)
         let evidence_fact = pipeline_ir_lambda_evidence_registry_lookup(fm, hash)
         if evidence_fact == 0 {
           fmap_set_lambda_evidence(fm, 0, 0, 0)
@@ -27576,7 +28234,13 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         let f64_facts = pipeline_ir_native_f64_facts_assign_slot_homes(blocks, pipeline_ir_native_f64_facts_for_blocks(blocks))
         let vector_data_facts = pipeline_ir_native_vector_data_facts_assign_home(pipeline_ir_native_vector_data_facts_for_blocks(blocks))
         let f64_slot_count = pipeline_ir_native_f64_slot_home_count(f64_facts)
-        fmap_set_current_frame_size(fm, pipeline_ir_native_frame_size_for_blocks(param_count, blocks))
+        let abort_cleanup_facts = pipeline_ir_abort_cleanup_facts_for_blocks(blocks, fns)
+        let abort_cleanup_instrumented = pipeline_ir_abort_cleanup_blocks_need_instrumentation(blocks, abort_cleanup_facts)
+        let abort_cleanup_base = pipeline_ir_native_frame_size_for_blocks(param_count, blocks)
+        fmap_set_current_abort_cleanup_facts(fm, abort_cleanup_facts)
+        fmap_set_current_abort_cleanup_base(fm, abort_cleanup_base)
+        fmap_set_current_abort_cleanup_boundary(fm, abort_cleanup_base)
+        fmap_set_current_frame_size(fm, pipeline_ir_abort_cleanup_frame_size(abort_cleanup_base, abort_cleanup_facts, abort_cleanup_instrumented))
         if f64_slot_count > 0 {
           fmap_set_current_preserve_fp(fm, 1)
           fmap_inc_fp_preserve_function_count(fm)
@@ -27589,6 +28253,9 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         fmap_add_ir_native_pinned_slot_count(fm, pipeline_ir_native_pinned_slot_count(raw_pinned))
         fmap_add_ir_native_loop_pinned_slot_count(fm, pipeline_ir_native_pinned_slot_kind_count(raw_pinned, pipeline_ir_native_pinned_slot_kind_loop()))
         if fmap_audit_mode(fm) == 1 { fmap_set_audit_ranges(fm, nlist_new()) } else { 0 }
+        -- J3 bookkeeping is emitted between semantic IR instructions. It
+        -- uses only allocator-reserved x15-x17 scratch and records every
+        -- cleanup-value read, so ordinary x1-x14 residency remains valid.
         let resident_pinned = pipeline_ir_native_volatile_residents(param_count, blocks, raw_pinned, fm, f64_facts, vector_data_facts)
         if fmap_audit_mode(fm) == 1 {
           -- Arm the emission offset ledger only when this function has pool
@@ -27614,22 +28281,28 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         } else { 0 }
         emit_prologue_current(code, fm)
         pipeline_cg_ir_only_params_from_regs(code, param_count, pinned)
+        -- Weft direct calls may pass parameters in x8 and above. Preserve
+        -- every incoming register until the parameter-home copies consume it.
+        pipeline_ir_abort_cleanup_emit_function_entry(code, fm)
         fmap_add_loop_addr_recur_count(fm, pipeline_ir_native_scaled_recur_count_for_blocks(blocks))
         let temp_base = next_value + 8
         let base_scope = pipeline_ir_native_scope_from_entry_param_binds(blocks, param_count, pinned)
         pipeline_ir_native_push_entry_param_cleanup(blocks, param_count, fm, pinned)
-        let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, base_scope, src, fm, PipelineNativeHandlerCtxNil, fns, f64_facts, vector_data_facts, pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
+        let abort_adr_patches = nlist_new()
+        let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, base_scope, src, fm, PipelineNativeHandlerCtxNil, fns, f64_facts, vector_data_facts, abort_adr_patches, pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
         -- Residency audit: final sentinel entry marks the end of the last
         -- window (windows never reach the epilogue).
         let audit_offsets_done = fmap_audit_offsets(fm)
         if audit_offsets_done != 0 { nlist_add(audit_offsets_done, buf_len(code)) 0 } else { 0 }
         let labels = pipeline_ir_native_label_map_add(pipeline_ir_native_cfg_state_labels(state), pipeline_ir_native_epilogue_label(), buf_len(code))
         pipeline_ir_native_patch_all(code, labels, pipeline_ir_native_cfg_state_patches(state))
+        pipeline_ir_native_patch_abort_adrs(code, labels, abort_adr_patches)
         if fmap_audit_mode(fm) == 1 { pipeline_ir_native_residency_audit_function(code, fm, hash) } else { 0 }
         if fmap_audit_mode(fm) == 1 {
           pipeline_ir_native_alloc_checker_function(code, fm, hash, fn_off, pipeline_ir_native_ck_events(pinned))
           pipeline_ir_native_pair_census_function(code, fm, fn_off, hash)
         } else { 0 }
+        pipeline_ir_abort_cleanup_emit_function_exit(code, fm)
         emit_epilogue_current(code, fm)
         fmap_set_current_split_map(fm, 0)
         fmap_set_current_split_actives(fm, 0)
@@ -27641,6 +28314,9 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         fmap_set_current_preserve_fp(fm, old_preserve_fp)
         fmap_set_current_gpr_pairs(fm, old_gpr_pairs)
         fmap_set_lambda_evidence(fm, old_ev_eff, old_ev_ops, old_ev_value)
+        fmap_set_current_abort_cleanup_facts(fm, old_abort_cleanup_facts)
+        fmap_set_current_abort_cleanup_base(fm, old_abort_cleanup_base)
+        fmap_set_current_abort_cleanup_boundary(fm, old_abort_cleanup_boundary)
         1
       }
     }
@@ -28482,6 +29158,7 @@ fn pipeline_ir_rewrite_inst_uses(inst: IrInst, aliases: PipelineIrAliasEnv) -> I
     IrPerformI64(dst, effect_hash, op_hash, args) -> IrPerformI64(dst, effect_hash, op_hash, pipeline_ir_rewrite_value_list(args, aliases))
     IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, pipeline_ir_rewrite_value_list(args, aliases))
     IrHandlerPopI64(frame) -> IrHandlerPopI64(pipeline_ir_alias_env_lookup_or(aliases, frame))
+    IrAbortLandingI64(dst) -> inst
     IrBindI64(ns, nl, value, ty) -> IrBindI64(ns, nl, pipeline_ir_alias_env_lookup_or(aliases, value), ty)
     IrHandleI64(dst, handle_src, body, clauses, nclauses, captures) -> inst
     IrDeferredHandleI64(dst, handle_src, body_expr, clauses, nclauses, captures, scratch_base) -> inst
@@ -28552,7 +29229,7 @@ fn pipeline_ir_max_handler_clause_captures(clauses: IrHandlerClauseBodyList, cur
     IrHandlerClauseBodyNil -> current
     IrHandlerClauseBodyCons(body, rest) -> {
       let next = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, blocks) -> pipeline_ir_max_lambda_captures(captures, current)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, first_value, blocks) -> pipeline_ir_max_lambda_captures(captures, current)
         IrHandlerClauseBodyInvalid(reason) -> current
       }
       pipeline_ir_max_handler_clause_captures(rest, next)
@@ -28585,6 +29262,7 @@ fn pipeline_ir_max_inst_value(inst: IrInst, current: i64) -> i64 {
     IrPerformI64(dst, effect_hash, op_hash, args) -> pipeline_ir_max_value_list(args, pipeline_ir_max_i64(current, dst))
     IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> pipeline_ir_max_value_list(args, pipeline_ir_max_i64(current, dst))
     IrHandlerPopI64(frame) -> pipeline_ir_max_i64(current, frame)
+    IrAbortLandingI64(dst) -> pipeline_ir_max_i64(current, dst)
     IrBindI64(ns, nl, value, ty) -> pipeline_ir_max_i64(current, value)
     IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, reserved) -> pipeline_ir_max_handler_clause_captures(clauses, pipeline_ir_max_i64(current, dst))
     IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> {
@@ -28745,7 +29423,7 @@ fn pipeline_ir_live_add_clause_captures(set: i64, clauses: IrHandlerClauseBodyLi
     IrHandlerClauseBodyNil -> count
     IrHandlerClauseBodyCons(body, rest) -> {
       let next = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, blocks) -> pipeline_ir_live_add_captures(set, captures, count)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, first_value, blocks) -> pipeline_ir_live_add_captures(set, captures, count)
         IrHandlerClauseBodyInvalid(reason) -> count
       }
       pipeline_ir_live_add_clause_captures(set, rest, next)
@@ -28778,6 +29456,7 @@ fn pipeline_ir_live_inst_def(inst: IrInst) -> i64 {
     IrPerformI64(dst, effect_hash, op_hash, args) -> dst
     IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> dst
     IrHandlerPopI64(frame) -> 0 - 1
+    IrAbortLandingI64(dst) -> dst
     IrBindI64(ns, nl, value, ty) -> 0 - 1
     IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, reserved) -> dst
     IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> dst
@@ -28837,6 +29516,7 @@ fn pipeline_ir_live_add_inst_uses(set: i64, inst: IrInst, count: i64) -> i64 {
     IrPerformI64(dst, effect_hash, op_hash, args) -> pipeline_ir_live_add_value_list(set, args, count)
     IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> pipeline_ir_live_add_value_list(set, args, count)
     IrHandlerPopI64(frame) -> pipeline_ir_live_add(set, frame, count)
+    IrAbortLandingI64(dst) -> count
     IrBindI64(ns, nl, value, ty) -> pipeline_ir_live_add(set, value, count)
     IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, reserved) -> pipeline_ir_live_add_clause_captures(set, clauses, count)
     IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> pipeline_ir_live_add_deferred_captures(set, body, pipeline_ir_live_add_clause_captures(set, clauses, count))
@@ -31089,12 +31769,25 @@ fn pipeline_ir_term_predecessor_count(term: IrTerminator, target: i64) -> i64 {
   }
 }
 
+fn pipeline_ir_inst_list_abort_predecessor_count(insts: IrInstList, target: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let add = match inst {
+        IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, abort_block) -> if abort_block == target { 1 } else { 0 }
+        _ -> 0
+      }
+      add + pipeline_ir_inst_list_abort_predecessor_count(rest, target)
+    }
+  }
+}
+
 fn pipeline_ir_block_predecessor_count(blocks: IrBlockList, target: i64) -> i64 {
   match blocks {
     IrBlockListNil -> 0
     IrBlockListCons(block, rest) -> {
       match block {
-        IrBlock(id, params, insts, term) -> pipeline_ir_term_predecessor_count(term, target) + pipeline_ir_block_predecessor_count(rest, target)
+        IrBlock(id, params, insts, term) -> pipeline_ir_term_predecessor_count(term, target) + pipeline_ir_inst_list_abort_predecessor_count(insts, target) + pipeline_ir_block_predecessor_count(rest, target)
       }
     }
   }
@@ -31110,12 +31803,26 @@ fn pipeline_ir_block_pred_count_bump(pc: i64, target: i64) -> i64 {
   } else { 0 }
 }
 
+fn pipeline_ir_block_abort_pred_counts_accumulate(pc: i64, insts: IrInstList) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      match inst {
+        IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, abort_block) -> pipeline_ir_block_pred_count_bump(pc, abort_block)
+        _ -> 0
+      }
+      pipeline_ir_block_abort_pred_counts_accumulate(pc, rest)
+    }
+  }
+}
+
 fn pipeline_ir_block_pred_counts_accumulate(pc: i64, blocks: IrBlockList) -> i64 {
   match blocks {
     IrBlockListNil -> 0
     IrBlockListCons(block, rest) -> {
       match block {
         IrBlock(id, params, insts, term) -> {
+          pipeline_ir_block_abort_pred_counts_accumulate(pc, insts)
           match term {
             IrTermJump(target, args) -> pipeline_ir_block_pred_count_bump(pc, target)
             IrTermBranch(cond, then_block, else_block) -> {
@@ -31404,7 +32111,7 @@ fn pipeline_ir_unique_pred_or(blocks: IrBlockList, target: i64) -> i64 {
     IrBlockListCons(block, rest) -> {
       match block {
         IrBlock(id, params, insts, term) -> {
-          if pipeline_ir_term_predecessor_count(term, target) > 0 { id }
+          if pipeline_ir_term_predecessor_count(term, target) + pipeline_ir_inst_list_abort_predecessor_count(insts, target) > 0 { id }
           else { pipeline_ir_unique_pred_or(rest, target) }
         }
       }
@@ -32445,12 +33152,28 @@ fn pipeline_ir_dominators_bit_get(sets: i64, words: i64, block: i64, other: i64)
   if (word band (1 bshl (other % 64))) != 0 { 1 } else { 0 }
 }
 
+fn pipeline_ir_dominators_collect_abort_edges(insts: IrInstList, block_id: i64, edges: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      match inst {
+        IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, abort_block) -> {
+          if abort_block >= 0 { nlist_add(edges, node_new(0, block_id, abort_block, 0, 0)) 0 } else { 0 }
+        }
+        _ -> 0
+      }
+      pipeline_ir_dominators_collect_abort_edges(rest, block_id, edges)
+    }
+  }
+}
+
 fn pipeline_ir_dominators_collect_edges(blocks: IrBlockList, edges: i64) -> i64 {
   match blocks {
     IrBlockListNil -> 0
     IrBlockListCons(block, rest) -> {
       match block {
         IrBlock(id, params, insts, term) -> {
+          pipeline_ir_dominators_collect_abort_edges(insts, id, edges)
           match term {
             IrTermJump(target, args) -> {
               nlist_add(edges, node_new(0, id, target, 0, 0))
@@ -36866,7 +37589,7 @@ fn pipeline_ir_live_set_add_handler_clause_captures(clauses: IrHandlerClauseBody
     IrHandlerClauseBodyNil -> live
     IrHandlerClauseBodyCons(body, rest) -> {
       let next = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, blocks) -> pipeline_ir_live_set_add_lambda_captures(captures, live)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, first_value, blocks) -> pipeline_ir_live_set_add_lambda_captures(captures, live)
         IrHandlerClauseBodyInvalid(reason) -> live
       }
       pipeline_ir_live_set_add_handler_clause_captures(rest, next)
@@ -37024,11 +37747,26 @@ fn pipeline_ir_reachable_add_term(term: IrTerminator, reachable: PipelineIrLiveS
   }
 }
 
+fn pipeline_ir_reachable_add_abort_insts(insts: IrInstList, reachable: PipelineIrLiveSet) -> PipelineIrLiveSet {
+  match insts {
+    IrInstNil -> reachable
+    IrInstCons(inst, rest) -> {
+      let next = match inst {
+        IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, abort_block) -> {
+          if abort_block >= 0 { pipeline_ir_live_set_add(reachable, abort_block) } else { reachable }
+        }
+        _ -> reachable
+      }
+      pipeline_ir_reachable_add_abort_insts(rest, next)
+    }
+  }
+}
+
 fn pipeline_ir_reachable_add_block_successors(block: IrBlock, reachable: PipelineIrLiveSet) -> PipelineIrLiveSet {
   match block {
     IrBlock(id, params, insts, term) -> {
       if pipeline_ir_live_set_contains(reachable, id) == 1 {
-        pipeline_ir_reachable_add_term(term, reachable)
+        pipeline_ir_reachable_add_term(term, pipeline_ir_reachable_add_abort_insts(insts, reachable))
       } else {
         reachable
       }
@@ -37096,6 +37834,7 @@ fn pipeline_ir_inst_def_or(inst: IrInst, default: i64) -> i64 {
     IrPerformI64(dst, effect_hash, op_hash, args) -> dst
     IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> dst
     IrHandlerPopI64(frame) -> default
+    IrAbortLandingI64(dst) -> dst
     IrBindI64(ns, nl, value, ty) -> default
     IrHandleI64(dst, handle_src, body, clauses, nclauses, captures) -> dst
     IrDeferredHandleI64(dst, handle_src, body_expr, clauses, nclauses, captures, scratch_base) -> dst
@@ -37172,6 +37911,7 @@ fn pipeline_ir_live_set_add_inst_uses(inst: IrInst, live: PipelineIrLiveSet) -> 
     IrPerformI64(dst, effect_hash, op_hash, args) -> pipeline_ir_live_set_add_values(live, args)
     IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> pipeline_ir_live_set_add_values(live, args)
     IrHandlerPopI64(frame) -> pipeline_ir_live_set_add(live, frame)
+    IrAbortLandingI64(dst) -> live
     IrBindI64(ns, nl, value, ty) -> pipeline_ir_live_set_add(live, value)
     IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, reserved) -> pipeline_ir_live_set_add_handler_clause_captures(clauses, live)
     IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> {
@@ -39755,6 +40495,7 @@ fn pipeline_mem2reg_mark_inst_uses_dense(inst: IrInst, declared: i64, disq: i64,
     IrPerformI64(dst, effect_hash, op_hash, args) -> pipeline_mem2reg_mark_values(args, declared, disq, next_value)
     IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> pipeline_mem2reg_mark_values(args, declared, disq, next_value)
     IrHandlerPopI64(frame) -> pipeline_mem2reg_mark_use(frame, declared, disq, next_value)
+    IrAbortLandingI64(dst) -> 0
     IrResumeI64(dst, value) -> pipeline_mem2reg_mark_use(value, declared, disq, next_value)
     IrTryI64(dst, value) -> pipeline_mem2reg_mark_use(value, declared, disq, next_value)
     IrOptChainI64(dst, base, field_hash, field_index) -> pipeline_mem2reg_mark_use(base, declared, disq, next_value)
@@ -41144,7 +41885,7 @@ fn pipeline_ir_hoisted_fns_handler_clauses(clauses: IrHandlerClauseBodyList, acc
     IrHandlerClauseBodyNil -> acc
     IrHandlerClauseBodyCons(body, rest) -> {
       let next = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, first_value, blocks) -> pipeline_ir_hoisted_fns_blocks(blocks, acc)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, first_value, blocks) -> pipeline_ir_hoisted_fns_blocks(blocks, acc)
         IrHandlerClauseBodyInvalid(reason) -> acc
       }
       pipeline_ir_hoisted_fns_handler_clauses(rest, next)
