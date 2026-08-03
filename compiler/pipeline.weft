@@ -930,6 +930,12 @@ fn pipeline_native_fn_param_resident_counter(native: NativeModule, which: i64) -
   }
 }
 
+fn pipeline_native_crossblock_pool_counter(native: NativeModule, which: i64) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_crossblock_pool_counter(fm, which)
+  }
+}
+
 
 fn pipeline_native_ck_first_fn_hash(native: NativeModule) -> i64 {
   match native {
@@ -24758,7 +24764,12 @@ fn pipeline_ir_native_resident_mark_slot_like(inst: IrInst, slot_like: i64, addr
 --    shape: move_call_args writes x0..arity-1 — NOT just x0-x7 — so a
 --    call-window seat must sit at or above the final call's arity or
 --    the staging of a lower-indexed argument clobbers the seat before
---    this value's own read; 0 for non-call shapes)
+--    this value's own read; 0 for non-call shapes),
+-- 29 redefined (a second inst def was seen: def_pos keeps the FIRST
+--    def and use_local conflates redefinition with cross-block use, so
+--    the single-window volatile classes need this to tell them apart —
+--    a trailing dead redefinition would write a shared seat OUTSIDE
+--    the occupancy window)
 fn pipeline_ir_native_resident_record_use(u: i64, gpos: i64, block_id: i64, simple: i64, fp_allowed: i64, cs_safe: i64, call_safe: i64, fwd_use: i64, pre_barrier: i64, next_value: i64, arrays: i64, w: i64, call_arity: i64) -> i64 {
   if u >= 0 and u < next_value {
     -- Call-window tenancy bookkeeping (2v Stage 1): only the FINAL use
@@ -25138,6 +25149,20 @@ fn pipeline_ir_native_cs_round_window(edges: i64, block_entry_gpos: i64, block_c
   node_new(0, lo, hi, 0, 0)
 }
 
+-- Interval-set occupancy probe (2v Stage 2 C3): does [lo, hi] overlap
+-- any tenant interval already seated in this register's set? Windows
+-- are inclusive on both ends, matching the cs home-reuse pass.
+fn pipeline_ir_native_pool_iv_clash(ivs: i64, lo: i64, hi: i64) -> i64 {
+  let n = nlist_len(ivs)
+  let mut i = 0
+  let mut clash = 0
+  while i < n and clash == 0 {
+    let iv = nlist_get(ivs, i)
+    if lo <= node_f2(iv) and node_f1(iv) <= hi { clash = 1 } else { i = i + 1 }
+  }
+  clash
+}
+
 fn pipeline_ir_native_param_round_hi(edges: i64, block_entry_gpos: i64, block_count: i64, lo: i64, hi0: i64) -> i64 {
   let mut hi = hi0
   let mut changed = 1
@@ -25305,6 +25330,7 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0 - 1))
       nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
       nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
+      nlist_add(arrays, pipeline_ir_native_resident_dense_new(next_value, 0))
       let def_pos = nlist_get(arrays, 0)
       let def_block = nlist_get(arrays, 1)
       let def_simple = nlist_get(arrays, 2)
@@ -25332,6 +25358,7 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       let use_last_fwd = nlist_get(arrays, 24)
       let def_x17_simple = nlist_get(arrays, 25)
       let use_last_call_arity = nlist_get(arrays, 28)
+      let redefined = nlist_get(arrays, 29)
       let def_shapes = pipeline_ir_native_resident_dense_new(next_value, 0)
       fmap_set_current_def_shapes(fm, def_shapes)
       fmap_set_current_use_segs(fm, nlist_get(arrays, 27))
@@ -25450,6 +25477,7 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
                       if d >= 0 and d < next_value {
                         if nlist_get(def_pos, d) >= 0 {
                           pipeline_ir_native_resident_dense_set(use_local, d, 0)
+                          pipeline_ir_native_resident_dense_set(redefined, d, 1)
                         } else {
                           let def_class = if simple == 1 { 1 } else { pipeline_ir_native_resident_inst_call_def(inst) }
                           pipeline_ir_native_resident_dense_set(def_pos, d, gpos)
@@ -25631,13 +25659,29 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       let class2_hi = nlist_len(pool_regs)
       if pipeline_ir_native_vector_data_facts_home(vector_data_facts) != 9 { nlist_add(pool_regs, 9) } else { 0 }
       let pool_n = nlist_len(pool_regs)
+      -- 2v Stage 2 C3 — per-register occupancy as INTERVAL SETS
+      -- (node(lo, hi) lists), replacing the single-expiry scalar +
+      -- first-start pair: weight-ordered seating places windows in
+      -- arbitrary start order, and cross-block/param windows may
+      -- legally sandwich between existing tenants. A candidate seats
+      -- in the first allowed register whose interval set has no
+      -- overlap with its occupancy window; the split pass shares the
+      -- same sets, so leftover capacity stays exact.
+      let pool_ivs = nlist_new()
+      let mut piv0 = 0
+      while piv0 < pool_n {
+        nlist_add(pool_ivs, nlist_new())
+        piv0 = piv0 + 1
+      }
+      -- The bulk classes (barrier-free local + call-final local, ~95%
+      -- of all seats) STILL seat greedily in ascending def order
+      -- against the scalar expiry — a full weight-ordered interval
+      -- pass over them measured +1.3% self-compile wall-clock (the
+      -- selection sort plus per-candidate interval scans) for ~zero
+      -- code-quality return. Each greedy seat also records its
+      -- interval so the leftover classes and the split pass see exact
+      -- occupancy.
       let pool_busy = pipeline_ir_native_resident_dense_new(pool_n, 0 - 1)
-      -- First tenant start per pool register (S0): instruction tenants
-      -- seat in ascending def order, so a fn-param window [0, hi] fits
-      -- a register exactly when the register's FIRST tenant starts
-      -- after hi (or it has none). pool_busy alone cannot answer that
-      -- — it holds the LAST expiry.
-      let pool_first_dp = pipeline_ir_native_resident_dense_new(pool_n, 0 - 1)
       let mut assigned = 0
       let mut call_window_assigned = 0
       let mut low_pool_assigned = 0
@@ -25678,13 +25722,17 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
       -- weft-test harness counts corrupted in lambda fns). Both the
       -- param classes and the low-value floor honor it.
       let param_admit = if naked_candidate == 0 and param_cleanup_fn == 0 and pipeline_ir_native_blocks_use_fiber_intrinsics(blocks) == 0 and pipeline_ir_native_blocks_have_handles(blocks) == 0 and pipeline_ir_native_blocks_have_lambdas(blocks) == 0 { 1 } else { 0 }
-      -- Param candidates seat AFTER the whole instruction-tenant scan:
-      -- params-first seating measured as a corpus pessimization
-      -- (+1.5k scalar loads — a one-use param displacing a five-load
-      -- value). Leftover-capacity seating is strictly additive over
-      -- the C1b baseline. node(v, hi, arity).
-      let fnp_pool_cands = nlist_new()
-      let fnp_call_cands = nlist_new()
+      -- C3: the leftover-capacity classes collect into ONE candidate
+      -- list and seat after the scan in descending static benefit — S0
+      -- measured params-first displacement as +1.5k scalar loads (a
+      -- one-use param displacing a five-load value), so no class here
+      -- may pre-empt the greedy bulk, but among THEMSELVES the heavy
+      -- window deserves the seat. Nodes are node(class, v, occ_lo,
+      -- occ_hi): class 1 barrier-free cross-block window (occupancy
+      -- rounded over enclosing-loop backedges), 3 block param, 4 fn
+      -- param whole-window, 5 fn param call-final, 6 call-final
+      -- cross-block window.
+      let pool_cands = nlist_new()
       let mut v = 0
       while v < next_value {
         let dp = nlist_get(def_pos, v)
@@ -25713,6 +25761,41 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
         -- last use always clears use_gpr_ok.
         let call_lu_eligible = if v >= pool_floor and base_ok == 1 and nlist_get(def_simple, v) == 1 and nlist_get(fp_def, v) == 0 and nlist_get(use_nonfinal_unsafe, v) == 0 and nlist_get(use_last_kind, v) == 1 and nlist_get(swap_excluded, v) == 0 {
           if nlist_get(use_last_pre_barrier, v) == nlist_get(barrier_at, dp) { 1 } else { 0 }
+        } else { 0 }
+        -- Cross-block admission (2v Stage 2 C3): every def and use of
+        -- these values already routes through the pinned-aware paths
+        -- (the cs home-reuse pass hosts the same shapes in x19-x26),
+        -- so a caller-saved seat is sound exactly when the OCCUPANCY
+        -- window — [def, last_use] rounded bidirectionally over
+        -- enclosing-loop backedges — contains no barrier at all. The
+        -- comparison anchors one inst BEFORE the rounded lo:
+        -- barrier_at[g] includes g's own inst, and a rounded-back lo
+        -- may itself sit on a barrier that executes inside the loop.
+        -- Redefined values are excluded (use_local conflates them with
+        -- cross-block use; a trailing dead redefinition would write a
+        -- shared seat outside the occupancy window), as are values
+        -- with jump-edge writers (same out-of-window write hazard).
+        let cross_base = if v >= pool_floor and dp >= 0 and nlist_get(use_local, v) == 0 and nlist_get(redefined, v) == 0 and nlist_get(param_writer_count, v) == 0 and nlist_get(param_entry, v) < 0 and nlist_get(use_seen, v) == 1 and nlist_get(last_use, v) > dp and nlist_get(slot_like, v) == 0 and nlist_get(addr_taken, v) == 0 and nlist_get(fp_def, v) == 0 and nlist_get(def_simple, v) == 1 and nlist_get(swap_excluded, v) == 0 and pipeline_ir_native_pinned_slot_lookup(pinned, v) == 0 and pipeline_ir_native_f64_slot_home_lookup(f64_facts, v) < 0 { 1 } else { 0 }
+        let cross_w = if cross_base == 1 and nlist_get(use_gpr_ok, v) == 1 {
+          pipeline_ir_native_cs_round_window(backedge_terms, block_entry_gpos, entry_gpos_size, dp, nlist_get(last_use, v))
+        } else { 0 }
+        let cross_eligible = if cross_w != 0 {
+          let crlo = node_f1(cross_w)
+          let crpre = if crlo > 0 { nlist_get(barrier_at, crlo - 1) } else { 0 }
+          if nlist_get(barrier_at, node_f2(cross_w)) == crpre { 1 } else { 0 }
+        } else { 0 }
+        -- Cross-block call-final: mirrors the local class — zero
+        -- barriers strictly before the final call — and additionally
+        -- requires rounding to leave the window exactly [def, call]:
+        -- an enclosing loop would re-read the seat after the BL
+        -- clobbered it, and a pulled-back lo means the window is
+        -- dynamically re-entered.
+        let cross_call_base = if cross_base == 1 and nlist_get(use_gpr_ok, v) == 0 and nlist_get(use_nonfinal_unsafe, v) == 0 and nlist_get(use_last_kind, v) == 1 {
+          if nlist_get(use_last_pre_barrier, v) == nlist_get(barrier_at, dp) { 1 } else { 0 }
+        } else { 0 }
+        let cross_call_eligible = if cross_call_base == 1 {
+          let ccw = pipeline_ir_native_cs_round_window(backedge_terms, block_entry_gpos, entry_gpos_size, dp, nlist_get(last_use, v))
+          if node_f1(ccw) == dp and node_f2(ccw) == nlist_get(last_use, v) { 1 } else { 0 }
         } else { 0 }
         -- Block-param tenancy: window = [earliest writer/entry, latest of
         -- last use and latest writer], rounded out to enclosing loops,
@@ -25760,9 +25843,9 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
           let mut pool_placed = 0
           while pr < pool_n and pool_placed == 0 {
             if dp > nlist_get(pool_busy, pr) {
-              if nlist_get(pool_busy, pr) < 0 { pipeline_ir_native_resident_dense_set(pool_first_dp, pr, dp) } else { 0 }
               pinned = pipeline_ir_native_pinned_slot_new(v, nlist_get(pool_regs, pr), pipeline_ir_native_pinned_slot_kind_resident(), pinned)
               pipeline_ir_native_resident_dense_set(pool_busy, pr, lu)
+              nlist_add(nlist_get(pool_ivs, pr), node_new(0, dp, lu, 0, 0))
               assigned = assigned + 1
               if nlist_get(pool_regs, pr) <= 7 { low_pool_assigned = low_pool_assigned + 1 } else { 0 }
               pipeline_ir_native_audit_note_range(fm, v, nlist_get(pool_regs, pr), dp, lu)
@@ -25813,9 +25896,9 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
             -- checker (pre-S0 pool pressure never seated x8 under a
             -- 9+-arg call) had ever seen it fire.
             if nlist_get(pool_regs, cpr) >= nlist_get(use_last_call_arity, v) and dp > nlist_get(pool_busy, cpr) {
-              if nlist_get(pool_busy, cpr) < 0 { pipeline_ir_native_resident_dense_set(pool_first_dp, cpr, dp) } else { 0 }
               pinned = pipeline_ir_native_pinned_slot_new(v, nlist_get(pool_regs, cpr), pipeline_ir_native_pinned_slot_kind_resident(), pinned)
               pipeline_ir_native_resident_dense_set(pool_busy, cpr, clu)
+              nlist_add(nlist_get(pool_ivs, cpr), node_new(0, dp, clu, 0, 0))
               assigned = assigned + 1
               call_window_assigned = call_window_assigned + 1
               -- The audited window stops one gpos short of the call: the
@@ -25828,6 +25911,8 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
           }
           0
         } else { 0 }
+        if cross_eligible == 1 { nlist_add(pool_cands, node_new(1, v, node_f1(cross_w), node_f2(cross_w), 0)) } else { 0 }
+        if cross_call_eligible == 1 { nlist_add(pool_cands, node_new(6, v, dp, nlist_get(last_use, v), 0)) } else { 0 }
         -- Dead spill-store deletion (2v Stage 2): an effectful
         -- call-shaped def whose result has NO uses anywhere (IR DCE
         -- already deleted the dead PURE defs) keeps its call but loses
@@ -25837,92 +25922,108 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
           pinned = pipeline_ir_native_pinned_slot_new(v, pipeline_ir_native_discard_home(), pipeline_ir_native_pinned_slot_kind_resident(), pinned)
           dead_store_elided = dead_store_elided + 1
         } else { 0 }
-        if param_eligible == 1 {
-          let plo = nlist_get(param_lo, v)
-          let mut ppr = 0
-          let mut param_placed = 0
-          while ppr < pool_n and param_placed == 0 {
-            if plo > nlist_get(pool_busy, ppr) {
-              if nlist_get(pool_busy, ppr) < 0 { pipeline_ir_native_resident_dense_set(pool_first_dp, ppr, plo) } else { 0 }
-              pinned = pipeline_ir_native_pinned_slot_new(v, nlist_get(pool_regs, ppr), pipeline_ir_native_pinned_slot_kind_resident(), pinned)
-              pipeline_ir_native_resident_dense_set(pool_busy, ppr, param_hi_ext)
-              assigned = assigned + 1
-              if nlist_get(pool_regs, ppr) <= 7 { low_pool_assigned = low_pool_assigned + 1 } else { 0 }
-              fmap_inc_ir_native_param_resident_count(fm)
-              pipeline_ir_native_audit_note_param_range(fm, nlist_get(pool_regs, ppr), plo, param_hi_ext, nlist_get(param_writers, v))
-              param_placed = 1
-            } else { ppr = ppr + 1 }
-          }
-          0
-        } else { 0 }
-        if fnp_eligible == 1 { nlist_add(fnp_pool_cands, node_new(0, v, fnp_hi_ext, 0, 0)) } else { 0 }
-        if fnp_call_eligible == 1 { nlist_add(fnp_call_cands, node_new(0, v, nlist_get(last_use, v), nlist_get(use_last_call_arity, v), 0)) } else { 0 }
+        if param_eligible == 1 { nlist_add(pool_cands, node_new(3, v, nlist_get(param_lo, v), param_hi_ext, 0)) } else { 0 }
+        if fnp_eligible == 1 { nlist_add(pool_cands, node_new(4, v, 0, fnp_hi_ext, 0)) } else { 0 }
+        if fnp_call_eligible == 1 { nlist_add(pool_cands, node_new(5, v, 0, nlist_get(last_use, v), 0)) } else { 0 }
         v = v + 1
       }
-      -- Fn-param seating (2v Stage 2 S0), leftover capacity only: seats
-      -- must sit AT OR ABOVE param_count — arrivals occupy
-      -- x0..x(param_count-1), NOT just x0-x7 (9+ parameter functions
-      -- receive params 8+ in x8/x9/x10...), and entry staging runs in
-      -- param order, so a seat equal to a LATER param's arrival
-      -- register clobbers that arrival before its own staging move.
-      -- Neither verification net catches that class: the staging zone
-      -- precedes every audit window, and arrival reads are not
-      -- checker-evented (store_reg_pinned trusts its source register)
-      -- — found by a three-generation bisect, not by the gates.
-      -- Call-final seats additionally sit at or above the final call's
-      -- staged arity and are audited to the instruction before the BL;
-      -- whole-window seats audit as plain [0, hi] windows with an
-      -- EMPTY (not absent) writers list so the audit starts at
-      -- offsets[0] instead of skipping a def write params do not have.
-      let fnp_n = nlist_len(fnp_pool_cands)
-      for fnp_i in 0..fnp_n {
-        let fnp_c = nlist_get(fnp_pool_cands, fnp_i)
-        let fnp_v = node_f1(fnp_c)
-        let fnp_hi = node_f2(fnp_c)
-        let mut fpr = 0
-        let mut fnp_placed = 0
-        while fpr < pool_n and fnp_placed == 0 {
-          let fnp_reg = nlist_get(pool_regs, fpr)
-          -- Window fit, not virgin registers: the param [0, hi] shares
-          -- a register whose FIRST instruction tenant starts after hi.
-          let fnp_fits = if nlist_get(pool_busy, fpr) < 0 { 1 } else { if nlist_get(pool_first_dp, fpr) > fnp_hi { 1 } else { 0 } }
-          if fnp_reg >= param_count and fnp_fits == 1 {
-            pinned = pipeline_ir_native_pinned_slot_new(fnp_v, fnp_reg, pipeline_ir_native_pinned_slot_kind_resident(), pinned)
-            if fnp_hi > nlist_get(pool_busy, fpr) { pipeline_ir_native_resident_dense_set(pool_busy, fpr, fnp_hi) } else { 0 }
-            -- A param window starts at 0: first_dp = 0 blocks any
-            -- second param from sharing this register.
-            pipeline_ir_native_resident_dense_set(pool_first_dp, fpr, 0)
-            assigned = assigned + 1
-            if fnp_reg <= 7 { low_pool_assigned = low_pool_assigned + 1 } else { 0 }
-            fmap_add_fn_param_resident_counter(fm, 0, 1)
-            if fmap_audit_ranges(fm) != 0 { pipeline_ir_native_audit_note_param_range(fm, fnp_reg, 0, fnp_hi, nlist_new()) } else { 0 }
-            fnp_placed = 1
-          } else { fpr = fpr + 1 }
+      -- Weight-ordered interval seating (C3): the leftover classes
+      -- seat together in descending static benefit (use_count reloads
+      -- + writes — one def store, or one edge store per incoming
+      -- writer for block params), ties by ascending window start then
+      -- value id for determinism. A candidate takes the first allowed
+      -- register whose interval set has no overlap with its occupancy
+      -- window — cross-block and [0, hi] param windows legally
+      -- sandwich between or around greedy tenants, which the old
+      -- single-expiry scalar could not express (that fit-check lost
+      -- retain's long param window to packed first-starts).
+      -- Register constraints per class:
+      --   * call-final classes (2/5/6) take class-2 seats only, at or
+      --     above the final call's staged arity — move_call_args
+      --     writes x0..arity-1 (the S0 fix of a latent Stage 1 hole:
+      --     staging bytes sit inside the call, past the audit window,
+      --     and the checker had never seen pool pressure seat x8
+      --     under a 9+-arg call). Their audited window stops one gpos
+      --     short of the call: the write-window audit treats a BL's
+      --     caller-saved clobber as foreign, while the checker's
+      --     exact-offset READ events verify the staging reads.
+      --   * fn-param classes (4/5) sit AT OR ABOVE param_count —
+      --     arrivals occupy x0..x(param_count-1), NOT just x0-x7, and
+      --     entry staging runs in param order, so a seat equal to a
+      --     LATER param's arrival register clobbers that arrival
+      --     before its own staging move. Neither verification net
+      --     catches that class: the staging zone precedes every audit
+      --     window, and arrival reads are not checker-evented
+      --     (store_reg_pinned trusts its source register) — found by
+      --     a three-generation bisect, not by the gates. Whole-window
+      --     param seats audit as plain [0, hi] windows with an EMPTY
+      --     (not absent) writers list so the audit starts at
+      --     offsets[0] instead of skipping a def write params lack.
+      --   * barrier-free classes (0/1/3/4) roam the whole pool.
+      let pc_n = nlist_len(pool_cands)
+      let mut pci = 0
+      while pci < pc_n {
+        let mut pc_best = pci
+        let mut pcj = pci + 1
+        while pcj < pc_n {
+          let cj = nlist_get(pool_cands, pcj)
+          let cb = nlist_get(pool_cands, pc_best)
+          let wr_j = if node_tag(cj) == 3 { nlist_get(param_writer_count, node_f1(cj)) } else { 1 }
+          let wr_b = if node_tag(cb) == 3 { nlist_get(param_writer_count, node_f1(cb)) } else { 1 }
+          let uc_j = nlist_get(use_count, node_f1(cj)) + wr_j
+          let uc_b = nlist_get(use_count, node_f1(cb)) + wr_b
+          let take = if uc_j > uc_b { 1 }
+            else { if uc_j == uc_b and node_f2(cj) < node_f2(cb) { 1 }
+            else { if uc_j == uc_b and node_f2(cj) == node_f2(cb) and node_f1(cj) < node_f1(cb) { 1 } else { 0 } } }
+          if take == 1 { pc_best = pcj } else { 0 }
+          pcj = pcj + 1
         }
-      }
-      let fnp_call_n = nlist_len(fnp_call_cands)
-      for fnp_ci in 0..fnp_call_n {
-        let fnp_cc = nlist_get(fnp_call_cands, fnp_ci)
-        let fnp_cv = node_f1(fnp_cc)
-        let fnp_clu = node_f2(fnp_cc)
-        let fnp_carity = node_f3(fnp_cc)
-        let mut fcpr = class2_lo
-        let mut fnp_call_placed = 0
-        while fcpr < class2_hi and fnp_call_placed == 0 {
-          let fnp_call_reg = nlist_get(pool_regs, fcpr)
-          let fnp_call_reg_ok = if fnp_call_reg >= param_count and fnp_call_reg >= fnp_carity { 1 } else { 0 }
-          let fnp_call_fits = if nlist_get(pool_busy, fcpr) < 0 { 1 } else { if nlist_get(pool_first_dp, fcpr) > fnp_clu { 1 } else { 0 } }
-          if fnp_call_reg_ok == 1 and fnp_call_fits == 1 {
-            pinned = pipeline_ir_native_pinned_slot_new(fnp_cv, fnp_call_reg, pipeline_ir_native_pinned_slot_kind_resident(), pinned)
-            if fnp_clu > nlist_get(pool_busy, fcpr) { pipeline_ir_native_resident_dense_set(pool_busy, fcpr, fnp_clu) } else { 0 }
-            pipeline_ir_native_resident_dense_set(pool_first_dp, fcpr, 0)
+        if pc_best != pci {
+          let pc_tmp = nlist_get(pool_cands, pci)
+          pipeline_ir_native_resident_dense_set(pool_cands, pci, nlist_get(pool_cands, pc_best))
+          pipeline_ir_native_resident_dense_set(pool_cands, pc_best, pc_tmp)
+        } else { 0 }
+        let cnd = nlist_get(pool_cands, pci)
+        let cls = node_tag(cnd)
+        let cv2 = node_f1(cnd)
+        let occ_lo = node_f2(cnd)
+        let occ_hi = node_f3(cnd)
+        let call_cls = if cls == 2 or cls == 5 or cls == 6 { 1 } else { 0 }
+        let seg_lo = if call_cls == 1 { class2_lo } else { 0 }
+        let seg_hi = if call_cls == 1 { class2_hi } else { pool_n }
+        let min_reg_arity = if call_cls == 1 { nlist_get(use_last_call_arity, cv2) } else { 0 }
+        let min_reg_param = if cls == 4 or cls == 5 { param_count } else { 0 }
+        let min_reg = if min_reg_arity > min_reg_param { min_reg_arity } else { min_reg_param }
+        let mut spr2 = seg_lo
+        let mut placed2 = 0
+        while spr2 < seg_hi and placed2 == 0 {
+          let sreg = nlist_get(pool_regs, spr2)
+          if sreg >= min_reg and pipeline_ir_native_pool_iv_clash(nlist_get(pool_ivs, spr2), occ_lo, occ_hi) == 0 {
+            pinned = pipeline_ir_native_pinned_slot_new(cv2, sreg, pipeline_ir_native_pinned_slot_kind_resident(), pinned)
+            nlist_add(nlist_get(pool_ivs, spr2), node_new(0, occ_lo, occ_hi, 0, 0))
             assigned = assigned + 1
-            call_window_assigned = call_window_assigned + 1
-            fmap_add_fn_param_resident_counter(fm, 1, 1)
-            if fmap_audit_ranges(fm) != 0 { pipeline_ir_native_audit_note_param_range(fm, fnp_call_reg, 0, fnp_clu - 1, nlist_new()) } else { 0 }
-            fnp_call_placed = 1
-          } else { fcpr = fcpr + 1 }
+            if sreg <= 7 { low_pool_assigned = low_pool_assigned + 1 } else { 0 }
+            if call_cls == 1 { call_window_assigned = call_window_assigned + 1 } else { 0 }
+            if cls == 1 { fmap_add_crossblock_pool_counter(fm, 0, 1) } else { 0 }
+            if cls == 6 { fmap_add_crossblock_pool_counter(fm, 1, 1) } else { 0 }
+            if cls == 3 { fmap_inc_ir_native_param_resident_count(fm) } else { 0 }
+            if cls == 4 { fmap_add_fn_param_resident_counter(fm, 0, 1) } else { 0 }
+            if cls == 5 { fmap_add_fn_param_resident_counter(fm, 1, 1) } else { 0 }
+            if cls == 0 or cls == 1 {
+              pipeline_ir_native_audit_note_range(fm, cv2, sreg, nlist_get(def_pos, cv2), nlist_get(last_use, cv2))
+            } else { if cls == 2 or cls == 6 {
+              pipeline_ir_native_audit_note_range(fm, cv2, sreg, nlist_get(def_pos, cv2), nlist_get(last_use, cv2) - 1)
+            } else { if cls == 3 {
+              pipeline_ir_native_audit_note_param_range(fm, sreg, occ_lo, occ_hi, nlist_get(param_writers, cv2))
+            } else { if cls == 4 {
+              if fmap_audit_ranges(fm) != 0 { pipeline_ir_native_audit_note_param_range(fm, sreg, 0, occ_hi, nlist_new()) } else { 0 }
+            } else {
+              if fmap_audit_ranges(fm) != 0 { pipeline_ir_native_audit_note_param_range(fm, sreg, 0, occ_hi - 1, nlist_new()) } else { 0 }
+            } } } }
+            placed2 = 1
+          } else { spr2 = spr2 + 1 }
         }
+        pci = pci + 1
       }
       -- Callee-saved home reuse (2l stage 3 linear scan): a barrier-
       -- crossing value whose rounded window starts strictly after a
@@ -26247,9 +26348,9 @@ fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: IrBlockList, 
             let mut spr = 0
             let mut placed_split = 0
             while spr < pool_n and placed_split == 0 {
-              if sdp > nlist_get(pool_busy, spr) {
+              if pipeline_ir_native_pool_iv_clash(nlist_get(pool_ivs, spr), sdp, slu) == 0 {
                 pinned = pipeline_ir_native_pinned_slot_new(sv, nlist_get(pool_regs, spr), pipeline_ir_native_pinned_slot_kind_resident(), pinned)
-                pipeline_ir_native_resident_dense_set(pool_busy, spr, slu)
+                nlist_add(nlist_get(pool_ivs, spr), node_new(0, sdp, slu, 0, 0))
                 pipeline_ir_native_resident_dense_set(split_map, sv, nlist_get(pool_regs, spr))
                 split_assigned = split_assigned + 1
                 pipeline_ir_native_audit_note_range(fm, sv, nlist_get(pool_regs, spr), sdp, slu)
