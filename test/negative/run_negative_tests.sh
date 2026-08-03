@@ -485,6 +485,9 @@ check_rejects "array_literal_unsupported" "test/negative/array_literal_unsupport
 check_rejects "effect_type_args_unsupported" "test/negative/effect_type_args_unsupported.weft" "type error: parameterized effects are not implemented yet"
 check_rejects "trait_complement_surface" "test/negative/trait_complement_surface.weft" "type error: trait complement is not a surface type"
 check_rejects "import_cycle" "test/negative/import_cycle.weft" "error: circular import"
+check_rejects "call_site_label_unsupported" "test/negative/call_site_label_unsupported.weft" "error: call-site argument labels are not supported yet"
+check_rejects "rigid_tail_concrete_perform" "test/negative/rigid_tail_concrete_perform.weft" "type error: effect not available in caller"
+check_rejects "rigid_tail_concrete_call" "test/negative/rigid_tail_concrete_call.weft" "type error: effect not available in caller"
 
 ls "$JOBS_DIR"/job_???? | xargs -n1 -P "$WEFT_TEST_JOBS" bash "$0" __worker || true
 
