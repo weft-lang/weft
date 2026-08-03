@@ -1026,7 +1026,17 @@ fn check_public_arc_ty_inner(tt: i64, policy: i64, src: i64, diag_pos: i64, ty: 
       6 -> check_public_arc_type_list_inner(tt, policy, src, diag_pos, ty_f1(ty)) + check_public_arc_ty_inner(tt, policy, src, diag_pos, ty_f2(ty)) + check_public_arc_ty_inner(tt, policy, src, diag_pos, ty_f3(ty))
       8 -> check_public_arc_ty_inner(tt, policy, src, diag_pos, ty_f2(ty))
       9 -> check_public_arc_ty_inner(tt, policy, src, diag_pos, ty_f2(ty)) + check_public_arc_type_list_inner(tt, policy, src, diag_pos, ty_f3(ty))
-      10 -> check_public_arc_effect_list_inner(tt, policy, src, diag_pos, ty_f1(ty))
+      10 -> {
+        -- 4c: duplicate effect heads in one signature are fenced —
+        -- perform-site/clause disambiguation syntax is undesigned
+        -- (kernel §7.1 ambiguity, flagged in the brief).
+        let elist = ty_f1(ty)
+        let dup_errors = if effect_list_has_duplicate_head(elist) == 1 {
+          typeck_error_maybe(src, diag_pos, "type error: duplicate effect heads in one signature are not yet supported")
+          1
+        } else { 0 }
+        dup_errors + check_public_arc_effect_list_inner(tt, policy, src, diag_pos, elist)
+      }
       11 -> {
         -- 4c: effect atom arity vs its declaration (unconditional).
         let entry = ttable_find_entry_by_hash_kind(tt, ty_f1(ty), 2)
@@ -3394,7 +3404,13 @@ fn synth_effect_perform(node: i64, src: i64, tt: i64) -> i64 {
           let op_name_hash = effect_name_hash(entry_src, node_f1(op), node_f2(op))
           if op_name_hash == op_hash {
             let op_ret = effect_op_ret_type(op)
-            ret = if op_ret != 0 { op_ret } else { ty_any() }
+            -- 4c: instantiate a generic effect's op return type from the
+            -- enclosing function's declared atom (found by head).
+            let eff_hash = effect_name_hash(src, eff_ns, eff_nl)
+            let atom = effect_sig_find_atom_by_head(ttable_get_current_fn_eff(tt), eff_hash)
+            let s = effect_entry_atom_subst(entry, atom)
+            let inst_ret = if op_ret != 0 and s != 0 { ty_subst(op_ret, s) } else { op_ret }
+            ret = if inst_ret != 0 { inst_ret } else { ty_any() }
             i = nops
           } else { i = i + 1 }
         }
@@ -3426,6 +3442,25 @@ fn effect_list_add_hash(effects: i64, eff_hash: i64) -> i64 {
   }
 }
 
+-- 4c: add a full atom to a collected effect list, deduping by head
+-- (head dedupe == atom dedupe while duplicate heads are fenced). A bare
+-- atom never displaces an args-carrying one already present.
+fn effect_list_add_atom(effects: i64, atom: i64) -> i64 {
+  let eff_hash = ty_f1(atom)
+  if eff_hash == 0 { 0 }
+  else {
+    let mut found = false
+    let mut i = 0
+    while i < nlist_len(effects) {
+      if ty_f1(nlist_get(effects, i)) == eff_hash {
+        found = true
+        i = nlist_len(effects)
+      } else { i = i + 1 }
+    }
+    if not found { nlist_add(effects, atom) } else { 0 }
+  }
+}
+
 fn effect_list_merge_sig(effects: i64, eff: i64) -> i64 {
   if eff == 0 { 0 }
   else {
@@ -3434,7 +3469,10 @@ fn effect_list_merge_sig(effects: i64, eff: i64) -> i64 {
       let apps = ty_f1(eff)
       let n = nlist_len(apps)
       for i in 0..n {
-        effect_list_add_hash(effects, ty_f1(nlist_get(apps, i)))
+        -- 4c: preserve the full atom (args included) when merging a
+        -- declared sig into a collected set, so handler-clause and
+        -- discharge paths can recover the instantiation.
+        effect_list_add_atom(effects, nlist_get(apps, i))
       }
       0
     }
@@ -3629,11 +3667,15 @@ fn collect_expr_effects(node: i64, env: i64, ft: i64, src: i64, tt: i64, effects
 fn check_effect_hash_available(eff_hash: i64, src: i64, pos: i64, caller_eff: i64) -[Diagnose]> i64 {
   if caller_eff == 0 { 0 }
   else {
-    if effect_is_subset_rigid(effect_sig_one(eff_hash), caller_eff) { 0 }
+    -- 4c: a perform names only the head; membership is head-based (the
+    -- caller's atom may be parameterized). Fall back to the rigid subset
+    -- for the no-atom cases (pure sig, tail-only sig).
+    if effect_sig_find_atom_by_head(caller_eff, eff_hash) != 0 { 0 }
+    else { if effect_is_subset_rigid(effect_sig_one(eff_hash), caller_eff) { 0 }
     else {
       typeck_error_maybe(src, pos, "type error: effect not available in caller")
       1
-    }
+    } }
   }
 }
 
@@ -3689,6 +3731,37 @@ fn lookup_effect_perform_op(node: i64, src: i64, tt: i64) -> i64 {
   }
 }
 
+-- 4c: substitution instantiating a generic effect's op signatures from a
+-- parameterized atom's args. 0 when the effect is not generic or the atom
+-- carries no args (op types then pass through unchanged).
+fn effect_entry_atom_subst(entry: i64, atom: i64) -> i64 {
+  if entry == 0 { 0 }
+  else {
+    let tparams = mem_load64_at(entry, 40)
+    let args = if atom == 0 { 0 } else { ty_f2(atom) }
+    if tparams != 0 and args != 0 { build_subst(tparams, args) } else { 0 }
+  }
+}
+
+-- 4c: the instantiating substitution for a perform site: the atom comes
+-- from the enclosing function's declared effect sig (ttable slot), found
+-- by head. Direct performs under a handle whose enclosing sig lacks the
+-- atom get no substitution (op TypeVars stay opaque) — recorded 4c debt.
+fn effect_perform_site_subst(node: i64, src: i64, tt: i64) -> i64 {
+  let lhs = node_f1(node)
+  if tt == 0 { 0 }
+  else {
+    let entry = ttable_lookup(tt, src, node_f1(lhs), node_f2(lhs))
+    if entry == 0 { 0 }
+    else { if mem_load64_at(entry, 16) != 2 { 0 }
+    else {
+      let eff_hash = effect_name_hash(src, node_f1(lhs), node_f2(lhs))
+      let atom = effect_sig_find_atom_by_head(ttable_get_current_fn_eff(tt), eff_hash)
+      effect_entry_atom_subst(entry, atom)
+    } }
+  }
+}
+
 fn check_effect_perform_args(node: i64, env: i64, ft: i64, src: i64, tt: i64) -[Conformance, Diagnose]> i64 {
   let op = lookup_effect_perform_op(node, src, tt)
   if op == 0 { 0 }
@@ -3699,12 +3772,14 @@ fn check_effect_perform_args(node: i64, env: i64, ft: i64, src: i64, tt: i64) -[
     let nargs = nlist_len(args)
     let mut errors = 0
     errors = errors + check_arity(nparams, nargs, src, node_f2(node))
+    let s = effect_perform_site_subst(node, src, tt)
     let ncheck = if nargs < nparams { nargs } else { nparams }
     for i in 0..ncheck {
       let param = nlist_get(params, i)
       let param_ty = node_f3(param)
       if param_ty != 0 {
-        errors = errors + check_arg_against_param(nlist_get(args, i), param_ty, env, ft, src, tt, node_f2(node))
+        let inst_ty = if s != 0 { ty_subst(param_ty, s) } else { param_ty }
+        errors = errors + check_arg_against_param(nlist_get(args, i), inst_ty, env, ft, src, tt, node_f2(node))
       } else { errors = errors }
     }
     errors
@@ -5857,11 +5932,15 @@ fn check_handler_clause(clause: i64, handled_eff_hash: i64, env: i64, ft: i64, s
       } else { errors = errors }
     } else { errors = errors }
     let nbind = if nparams < noparams { nparams } else { noparams }
+    -- 4c: instantiating substitution for a parameterized handled atom,
+    -- carried in cont_ctx f3 (0 for bare effects).
+    let hsubst = node_f3(cont_ctx)
     let mut clause_env = env
     for pi in 0..nbind {
       let param = nlist_get(params, pi)
       let op_param = nlist_get(op_params, pi)
-      let op_ty = node_f3(op_param)
+      let raw_op_ty = node_f3(op_param)
+      let op_ty = if raw_op_ty != 0 and hsubst != 0 { ty_subst(raw_op_ty, hsubst) } else { raw_op_ty }
       let ann_ty = node_f3(param)
       let bind_ty = if ann_ty != 0 {
         if op_ty != 0 {
@@ -5878,7 +5957,8 @@ fn check_handler_clause(clause: i64, handled_eff_hash: i64, env: i64, ft: i64, s
     }
     let handle_result_ty = node_f1(cont_ctx)
     let allow_non_tail = node_f2(cont_ctx)
-    let op_ret = effect_op_ret_type(op)
+    let raw_op_ret = effect_op_ret_type(op)
+    let op_ret = if raw_op_ret != 0 and hsubst != 0 { ty_subst(raw_op_ret, hsubst) } else { raw_op_ret }
     let expected_ret = if op_ret != 0 { op_ret } else { ty_any() }
     if cont != 0 {
       clause_env = tenv_bind(clause_env, src, node_f1(cont), node_f2(cont), continuation_fn_type(expected_ret, handle_result_ty))
@@ -7890,8 +7970,16 @@ fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) 
         let cn = node_f1(nlist_get(clauses, 0))
         effect_name_hash(src, node_f1(cn), node_f2(cn))
       } else { 0 }
-      -- Expand caller_eff to include the handled effect
-      let expanded_eff = effect_add(caller_eff, handled_eff_hash)
+      -- 4c: recover the handled atom's instantiation from the body's
+      -- collected effects (callee declared sigs preserve args). Bare when
+      -- the body only performs directly — recorded 4c debt.
+      let handled_atom = if handled_eff_hash != 0 {
+        let body_effects = nlist_new()
+        collect_expr_effects(handle_body, env, ft, src, tt, body_effects)
+        effect_list_find_atom_by_head(body_effects, handled_eff_hash)
+      } else { 0 }
+      -- Expand caller_eff to include the handled effect (full atom form)
+      let expanded_eff = effect_add_with_atom(caller_eff, handled_eff_hash, handled_atom)
       -- Check structural handler shape before validating clause bodies.
       errors = errors + check_handler_duplicate_clauses(clauses, nclauses, src)
       -- Check body with expanded effects (body is allowed to perform the handled effect)
@@ -7900,13 +7988,18 @@ fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) 
       -- Check clause bodies (they run in the handler's scope, not the body's)
       -- Clause layout: f1=name_info, f2=params, f3=body, f4=0
       let handle_result_ty = synth(handle_body, env, ft, src, tt)
+      -- 4c: instantiating substitution for the clauses' op signatures.
+      let hsubst = if nclauses > 0 and handled_atom != 0 {
+        let cn0 = node_f1(nlist_get(clauses, 0))
+        effect_entry_atom_subst(ttable_lookup(tt, src, node_f1(cn0), node_f2(cn0)), handled_atom)
+      } else { 0 }
       for ci in 0..nclauses {
         let clause = nlist_get(clauses, ci)
         let allow_non_tail = if node_f4(clause) != 0 {
           deferred_split_body_supports_clause(handle_body, clause, src, ft) or
           deferred_fiber_handle_supports_clause(handle_body, clauses, nclauses, clause, src, env, ft)
         } else { 0 }
-        errors = errors + check_handler_clause(clause, handled_eff_hash, env, ft, src, caller_eff, tt, node_new(0, handle_result_ty, allow_non_tail, 0, 0))
+        errors = errors + check_handler_clause(clause, handled_eff_hash, env, ft, src, caller_eff, tt, node_new(0, handle_result_ty, allow_non_tail, hsubst, 0))
       }
       errors
     }
@@ -8751,8 +8844,13 @@ fn check_generic_call_post_args(node: i64, env: i64, ft: i64, src: i64, caller_e
     errors = errors + check_generic_call_target_defined(call_node, env, ft, src, tt)
     errors = errors + check_call_args(call_node, env, ft, src, caller_eff, tt)
   }
-  -- Effect checking for generic calls
-  let callee_eff = ftypes_lookup_effects(ft, src, ns, nl)
+  -- Effect checking for generic calls. 4c: substitute the call's type
+  -- args into the callee's declared sig first, so -[Box<T>]> charges the
+  -- instantiated atom (Box<str>), not Box<TypeVar>.
+  let callee_eff_raw = ftypes_lookup_effects(ft, src, ns, nl)
+  let callee_eff = if callee_eff_raw > 0 and tparams != 0 {
+    ty_subst(callee_eff_raw, build_subst(tparams, type_args))
+  } else { callee_eff_raw }
   if caller_eff > 0 {
     if callee_eff > 0 {
       if not effect_is_subset_rigid(callee_eff, caller_eff) {
@@ -8899,6 +8997,10 @@ fn check_fn(fn_node: i64, ft: i64, src: i64, tt: i64) -[Conformance, Diagnose]> 
   let saved_tparams = ttable_get_tparams(tt)
   ttable_set_tparams(tt, tparams)
   let caller_eff = fn_effects(fn_node)
+  -- 4c: expose the declared effect sig to synth-time perform checking
+  -- (parameterized-atom instantiation), mirroring the tparams slot.
+  let saved_fn_eff = ttable_get_current_fn_eff(tt)
+  ttable_set_current_fn_eff(tt, caller_eff)
   -- 4a S1: the declared effect list can carry unsupported-surface markers
   -- (effect type arguments); walk it like params and the return type.
   errors = errors + check_public_arc_ty(tt, src, node_f1(inner), caller_eff)
@@ -8932,6 +9034,7 @@ fn check_fn(fn_node: i64, ft: i64, src: i64, tt: i64) -[Conformance, Diagnose]> 
   } else { errors = errors } }
   -- Restore previous function's tparams
   ttable_set_tparams(tt, saved_tparams)
+  ttable_set_current_fn_eff(tt, saved_fn_eff)
   errors
 }
 
@@ -9042,6 +9145,28 @@ fn effect_add(eff: i64, eff_hash: i64) -> i64 {
         }
         -- Add the new effect
         nlist_add(new_list, ty_effect_app(eff_hash))
+        ty_effect_sig(new_list)
+      }
+    }
+  }
+}
+
+-- 4c: effect_add variant that appends a specific (possibly parameterized)
+-- atom rather than a bare head, so a handle body's callees can charge
+-- their instantiated atoms against the expanded set.
+fn effect_add_with_atom(eff: i64, eff_hash: i64, atom: i64) -> i64 {
+  if atom == 0 { effect_add(eff, eff_hash) }
+  else {
+    if eff == 0 { 0 }
+    else {
+      if ty_tag(eff) != 10 { eff }
+      else {
+        let old_list = ty_f1(eff)
+        let new_list = nlist_new()
+        for i in 0..nlist_len(old_list) {
+          nlist_add(new_list, nlist_get(old_list, i))
+        }
+        nlist_add(new_list, atom)
         ty_effect_sig(new_list)
       }
     }
