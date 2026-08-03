@@ -474,6 +474,10 @@ check_rejects "generic_ctor_conflicting_args" "test/negative/generic_ctor_confli
 check_rejects "qualified_ctor_call" "test/negative/qualified_ctor_call.weft" "type error: qualified constructor syntax is not supported"
 check_rejects "qualified_ctor_nullary" "test/negative/qualified_ctor_nullary.weft" "type error: qualified constructor syntax is not supported"
 check_rejects "interp_display_missing_import" "test/negative/interp_display_missing_import.weft" "add use \"stdlib/display.weft\""
+check_rejects "typed_match_untagged_union" "test/negative/typed_match_untagged_union.weft" "type error: typed match arm needs a runtime-discriminable union"
+check_rejects "typed_match_non_exhaustive" "test/negative/typed_match_non_exhaustive.weft" "type error: non-exhaustive match"
+check_rejects "typed_match_foreign_annotation" "test/negative/typed_match_foreign_annotation.weft" "type error: typed match arm annotation is not part of the scrutinee type"
+check_rejects "typed_match_nil_never" "test/negative/typed_match_nil_never.weft" "type error: nil match arm on a scrutinee that is never nil"
 
 ls "$JOBS_DIR"/job_???? | xargs -n1 -P "$WEFT_TEST_JOBS" bash "$0" __worker || true
 
