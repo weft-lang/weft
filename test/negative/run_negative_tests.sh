@@ -273,6 +273,7 @@ check_rejects "map_sentinel_lookup_removed" "test/negative/map_sentinel_lookup_r
 check_rejects "option_expect_message_type_mismatch" "test/negative/option_expect_message_type_mismatch.weft" "type error: argument type mismatch"
 check_rejects "result_expect_message_type_mismatch" "test/negative/result_expect_message_type_mismatch.weft" "type error: argument type mismatch"
 check_rejects "assert_eq_type_mismatch" "test/negative/assert_eq_type_mismatch.weft" "type error: argument type mismatch"
+check_rejects "stdlib_test_assert_true_type_mismatch" "test/negative/stdlib_test_assert_true_type_mismatch.weft" "type error: argument type mismatch"
 check_rejects "list_sentinel_head_removed" "test/negative/list_sentinel_head_removed.weft" "type error: unknown method"
 check_rejects "self_outside_method" "test/negative/self_outside_method.weft" "type error: Self is only valid in trait and impl method signatures"
 check_rejects "self_in_data_type" "test/negative/self_in_data_type.weft" "type error: Self is only valid in trait and impl method signatures"
