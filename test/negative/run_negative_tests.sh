@@ -116,7 +116,7 @@ echo ""
 JOBS_DIR=$(mktemp -d /tmp/weft_negative_XXXXXX)
 JOB_N=0
 
-# Enqueue only — the 349 call sites below stay untouched; the pool at the
+# Enqueue only — the call sites below stay declarative; the pool at the
 # end runs them WEFT_TEST_JOBS wide through worker mode.
 check_rejects() {
   JOB_N=$((JOB_N+1))
@@ -250,6 +250,12 @@ check_rejects "ord_effectful_signature" "test/negative/ord_effectful_signature.w
 check_rejects "display_missing_impl" "test/negative/display_missing_impl.weft" "type error: type does not satisfy trait bound"
 check_rejects "display_wrong_signature" "test/negative/display_wrong_signature.weft" "type error: impl method return type mismatch"
 check_rejects "display_effectful_signature" "test/negative/display_effectful_signature.weft" "type error: impl method effect mismatch"
+check_rejects "default_missing_impl" "test/negative/default_missing_impl.weft" "type error: type does not satisfy trait bound"
+check_rejects "default_impl_return_mismatch" "test/negative/default_impl_return_mismatch.weft" "type error: impl method return type mismatch"
+check_rejects "default_impl_effect_mismatch" "test/negative/default_impl_effect_mismatch.weft" "type error: impl method effect mismatch"
+check_rejects "associated_function_value_call" "test/negative/associated_function_value_call.weft" "type error: associated function must be called on a type"
+check_rejects "associated_function_arity_mismatch" "test/negative/associated_function_arity_mismatch.weft" "type error: arity mismatch"
+check_rejects "instance_method_type_call" "test/negative/instance_method_type_call.weft" "type error: instance method must be called on a value"
 check_rejects "option_unwrap_or_type_mismatch" "test/negative/option_unwrap_or_type_mismatch.weft" "type error: argument type mismatch"
 check_rejects "result_unwrap_or_type_mismatch" "test/negative/result_unwrap_or_type_mismatch.weft" "type error: argument type mismatch"
 check_rejects "list_prepend_type_mismatch" "test/negative/list_prepend_type_mismatch.weft" "type error: argument type mismatch"
