@@ -260,6 +260,8 @@ check_rejects "option_unwrap_or_type_mismatch" "test/negative/option_unwrap_or_t
 check_rejects "result_unwrap_or_type_mismatch" "test/negative/result_unwrap_or_type_mismatch.weft" "type error: argument type mismatch"
 check_rejects "list_prepend_type_mismatch" "test/negative/list_prepend_type_mismatch.weft" "type error: argument type mismatch"
 check_rejects "vector_cross_type_push" "test/negative/vector_cross_type_push.weft" "type error: argument type mismatch"
+check_rejects "vector_sort_missing_ord" "test/negative/vector_sort_missing_ord.weft" "type error: type does not satisfy trait bound"
+check_rejects "vector_sort_effectful_comparator" "test/negative/vector_sort_effectful_comparator.weft" "type error: argument type mismatch"
 check_rejects "generic_function_ref_unresolved" "test/negative/generic_function_ref_unresolved.weft" "type error: cannot infer generic function reference"
 check_rejects "map_wrong_key_type" "test/negative/map_wrong_key_type.weft" "type error: argument type mismatch"
 check_rejects "map_wrong_value_type" "test/negative/map_wrong_value_type.weft" "type error: argument type mismatch"

@@ -1,12 +1,37 @@
-fn insertion_sort(items: &mut [i64]) {
-    for i in 1..items.len() {
-        let key = items[i];
-        let mut j = i;
-        while j > 0 && items[j - 1] > key {
-            items[j] = items[j - 1];
-            j -= 1;
+fn sift_down(items: &mut [i64], start: usize, end: usize) {
+    let mut root = start;
+    loop {
+        let child = root * 2 + 1;
+        if child >= end {
+            return;
         }
-        items[j] = key;
+        let mut candidate = root;
+        if items[candidate] < items[child] {
+            candidate = child;
+        }
+        let right = child + 1;
+        if right < end && items[candidate] < items[right] {
+            candidate = right;
+        }
+        if candidate == root {
+            return;
+        }
+        items.swap(root, candidate);
+        root = candidate;
+    }
+}
+
+fn heap_sort(items: &mut [i64]) {
+    let mut start = items.len() / 2;
+    while start > 0 {
+        start -= 1;
+        sift_down(items, start, items.len());
+    }
+    let mut end = items.len();
+    while end > 1 {
+        end -= 1;
+        items.swap(0, end);
+        sift_down(items, 0, end);
     }
 }
 
@@ -47,8 +72,11 @@ fn checksum(items: &[i64]) -> i64 {
 
 fn run_once(n: i64) -> i64 {
     let mut items = build_reverse(n);
-    insertion_sort(&mut items);
-    checksum(&items) + binary_search(&items, 0) + binary_search(&items, n / 2) + binary_search(&items, n - 1)
+    heap_sort(&mut items);
+    checksum(&items)
+        + binary_search(&items, 0)
+        + binary_search(&items, n / 2)
+        + binary_search(&items, n - 1)
 }
 
 fn main() {

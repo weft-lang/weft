@@ -22,7 +22,7 @@ WEFT=/tmp/weft-under-test bash bench_compare.sh
 The workload set covers integer-heavy and float-heavy kernels:
 
 - `sieve`: raw word-memory loops and stores
-- `vector_sort`: vector-backed insertion sort plus binary search
+- `vector_sort`: vector-backed in-place heapsort plus binary search
 - `graph_reach`: adjacency-matrix reachability with vector queues
 - `mandelbrot`: `f64` escape-count loops with explicit `i64` to `f64`
   conversion

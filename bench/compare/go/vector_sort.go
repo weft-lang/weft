@@ -1,14 +1,37 @@
 package main
 
-func insertionSort(items []int64) {
-	for i := 1; i < len(items); i++ {
-		key := items[i]
-		j := i - 1
-		for j >= 0 && items[j] > key {
-			items[j+1] = items[j]
-			j--
+func siftDown(items []int64, start, end int) {
+	root := start
+	for {
+		child := root*2 + 1
+		if child >= end {
+			return
 		}
-		items[j+1] = key
+		candidate := root
+		if items[candidate] < items[child] {
+			candidate = child
+		}
+		right := child + 1
+		if right < end && items[candidate] < items[right] {
+			candidate = right
+		}
+		if candidate == root {
+			return
+		}
+		items[root], items[candidate] = items[candidate], items[root]
+		root = candidate
+	}
+}
+
+func heapSort(items []int64) {
+	for start := len(items) / 2; start > 0; {
+		start--
+		siftDown(items, start, len(items))
+	}
+	for end := len(items); end > 1; {
+		end--
+		items[0], items[end] = items[end], items[0]
+		siftDown(items, 0, end)
 	}
 }
 
@@ -48,7 +71,7 @@ func checksum(items []int64) int64 {
 
 func runOnce(n int64) int64 {
 	items := buildReverse(n)
-	insertionSort(items)
+	heapSort(items)
 	return checksum(items) + binarySearch(items, 0) + binarySearch(items, n/2) + binarySearch(items, n-1)
 }
 
