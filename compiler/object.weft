@@ -7,6 +7,22 @@
 
 use "compiler/lib.weft"
 use "runtime/object_storage.weft"
+use "stdlib/vector.weft"
+
+-- Typed, contiguous object-emitter tables. Both records contain only scalar
+-- fields, so Vector stores their payloads inline without per-entry nodes.
+type ObjectSymbol {
+  name_start: i64,
+  name_len: i64,
+  value: i64,
+  section: i64
+}
+
+type ObjectRelocation {
+  address: i64,
+  symbol_or_addend: i64,
+  kind: i64
+}
 
 -- External symbol names for GOT indices used by linked user programs.
 fn got_sym_name(gi: i64) -> str {
@@ -55,19 +71,18 @@ fn compile_object(code: i64, fm: i64, src: i64, ngot: i64) -> rc i64 {
   -- Symbol order must match relocation indices. Defined symbols are
   -- emitted first, so a present wstatic base symbol takes final index 1
   -- and shifts the undefined externals by one.
-  let syms = nlist_new()
+  let syms = vector_with_capacity<ObjectSymbol>(got_sym_count() + 2)
   let names = object_storage_alloc_scratch(512)
   -- _main symbol points to offset 0 (our startup code: mmap + call main + ret).
   -- The actual main() function is called via BL from the startup code.
   let mut p = 0
   mem_copy(names + p, __str_ptr("main"), 4)
-  nlist_add(syms, node_new(0, names + p - src, 4, 0, 1))
+  vector_push<ObjectSymbol>(syms, ObjectSymbol { name_start: names + p - src, name_len: 4, value: 0, section: 1 })
   p = p + 4
   if nslots > 0 {
     let wname_len = __str_len("weft_static_pairs")
     mem_copy(names + p, __str_ptr("weft_static_pairs"), wname_len)
-    -- f4 = 2: defined symbol in section 2 (__wstatic).
-    nlist_add(syms, node_new(0, names + p - src, wname_len, wstatic_addr, 2))
+    vector_push<ObjectSymbol>(syms, ObjectSymbol { name_start: names + p - src, name_len: wname_len, value: wstatic_addr, section: 2 })
     p = p + wname_len
   } else { 0 }
   -- External symbols: indices 1-10 match GOT indices 0-9.
@@ -75,30 +90,30 @@ fn compile_object(code: i64, fm: i64, src: i64, ngot: i64) -> rc i64 {
     let name = got_sym_name(gi)
     let nl = __str_len(name)
     mem_copy(names + p, __str_ptr(name), nl)
-    nlist_add(syms, node_new(0, names + p - src, nl, 0, 0))
+    vector_push<ObjectSymbol>(syms, ObjectSymbol { name_start: names + p - src, name_len: nl, value: 0, section: 0 })
     p = p + nl
   }
   let extdef_shift = if nslots > 0 { 1 } else { 0 }
 
   -- Build relocation list from GOT patches.
-  let relocs = nlist_new()
   let gn = object_storage_got_patch_count(fm)
+  let spn = object_storage_static_pair_patch_count(fm)
+  let relocs = vector_with_capacity<ObjectRelocation>(gn + spn * 4)
   for i in 0..gn {
     let code_pos = object_storage_got_patch_code_pos(fm, i)
     let gi = object_storage_got_patch_index(fm, i)
     -- Final symbol index = gi + 1 + extdef_shift (defined symbols first).
-    nlist_add(relocs, node_new(0, code_pos, gi + 1 + extdef_shift, object_reloc_kind_branch26(), 0))
+    vector_push<ObjectRelocation>(relocs, ObjectRelocation { address: code_pos, symbol_or_addend: gi + 1 + extdef_shift, kind: object_reloc_kind_branch26() })
   }
   -- Static-pair ADRP/ADD sites: ADDEND must directly precede the entry
   -- it modifies. The wstatic base symbol has final index 1.
-  let spn = object_storage_static_pair_patch_count(fm)
   for i in 0..spn {
     let adrp_pos = object_storage_static_pair_patch_code_pos(fm, i)
     let slot_off = object_storage_static_pair_patch_slot_off(fm, i)
-    nlist_add(relocs, node_new(0, adrp_pos, slot_off, object_reloc_kind_addend(), 0))
-    nlist_add(relocs, node_new(0, adrp_pos, 1, object_reloc_kind_page21(), 0))
-    nlist_add(relocs, node_new(0, adrp_pos + 4, slot_off, object_reloc_kind_addend(), 0))
-    nlist_add(relocs, node_new(0, adrp_pos + 4, 1, object_reloc_kind_pageoff12(), 0))
+    vector_push<ObjectRelocation>(relocs, ObjectRelocation { address: adrp_pos, symbol_or_addend: slot_off, kind: object_reloc_kind_addend() })
+    vector_push<ObjectRelocation>(relocs, ObjectRelocation { address: adrp_pos, symbol_or_addend: 1, kind: object_reloc_kind_page21() })
+    vector_push<ObjectRelocation>(relocs, ObjectRelocation { address: adrp_pos + 4, symbol_or_addend: slot_off, kind: object_reloc_kind_addend() })
+    vector_push<ObjectRelocation>(relocs, ObjectRelocation { address: adrp_pos + 4, symbol_or_addend: 1, kind: object_reloc_kind_pageoff12() })
   }
 
   emit_object(code, relocs, syms, src, wstatic_addr, wsize)
@@ -106,15 +121,15 @@ fn compile_object(code: i64, fm: i64, src: i64, ngot: i64) -> rc i64 {
 
 -- Emit a complete .o file from code buffer + relocation list + symbol info
 -- code: buf with machine code
--- relocs: list of {code_offset, symbol_index_or_addend, kind} entries
--- syms: list of {name_ns, name_nl, value, sect_or_undef} symbol entries
---       (f4 = 0 undefined, 1 defined in __text, 2 defined in __wstatic)
+-- relocs: typed vector of {address, symbol_or_addend, kind} entries
+-- syms: typed vector of {name_start, name_len, value, section} entries
+--       (section = 0 undefined, 1 __text, 2 __wstatic)
 -- src: source buffer (for symbol name bytes)
 -- wstatic_addr/wsize: zerofill __wstatic section placement (wsize 0 = absent)
-fn emit_object(code: i64, relocs: i64, syms: i64, src: i64, wstatic_addr: i64, wsize: i64) -> rc i64 {
+fn emit_object(code: i64, relocs: Vector<ObjectRelocation>, syms: Vector<ObjectSymbol>, src: i64, wstatic_addr: i64, wsize: i64) -> rc i64 {
   let code_size = buf_len(code)
-  let nrelocs = nlist_len(relocs)
-  let nsyms = nlist_len(syms)
+  let nrelocs = vector_len<ObjectRelocation>(relocs)
+  let nsyms = vector_len<ObjectSymbol>(syms)
   let nsects = if wsize > 0 { 2 } else { 1 }
 
   -- Compute offsets
@@ -134,9 +149,9 @@ fn emit_object(code: i64, relocs: i64, syms: i64, src: i64, wstatic_addr: i64, w
   bu8(strtab, 0)
   let str_indices = object_storage_alloc_scratch(nsyms * 8)
   for i in 0..nsyms {
-    let sym = nlist_get(syms, i)
-    let ns = node_f1(sym)
-    let nl = node_f2(sym)
+    let sym = vector_get_in_bounds<ObjectSymbol>(syms, i)
+    let ns = sym.name_start
+    let nl = sym.name_len
     object_storage_store_word(str_indices, i, buf_len(strtab))
     bu8(strtab, 95)
     bscopy(strtab, src + ns, nl, 0)
@@ -148,8 +163,8 @@ fn emit_object(code: i64, relocs: i64, syms: i64, src: i64, wstatic_addr: i64, w
   let mut nextdef = 0
   let mut nundef = 0
   for i in 0..nsyms {
-    let sym = nlist_get(syms, i)
-    if node_f4(sym) >= 1 { nextdef = nextdef + 1 } else { nundef = nundef + 1 }
+    let sym = vector_get_in_bounds<ObjectSymbol>(syms, i)
+    if sym.section >= 1 { nextdef = nextdef + 1 } else { nundef = nundef + 1 }
   }
 
   let total_size = str_off + strsize
@@ -237,10 +252,10 @@ fn emit_object(code: i64, relocs: i64, syms: i64, src: i64, wstatic_addr: i64, w
 
   -- Relocation entries (8 bytes each)
   for i in 0..nrelocs {
-    let rel = nlist_get(relocs, i)
-    let r_address = node_f1(rel)
-    let r_symidx = node_f2(rel)
-    let r_kind = node_f3(rel)
+    let rel = vector_get_in_bounds<ObjectRelocation>(relocs, i)
+    let r_address = rel.address
+    let r_symidx = rel.symbol_or_addend
+    let r_kind = rel.kind
     bu32(o, r_address)
     -- Second word: symidx/addend | pcrel<<24 | length<<25 | extern<<27 | type<<28
     if r_kind == object_reloc_kind_branch26() {
@@ -260,22 +275,22 @@ fn emit_object(code: i64, relocs: i64, syms: i64, src: i64, wstatic_addr: i64, w
   }
 
   -- Symbol table (nlist_64, 16 bytes each)
-  -- Defined symbols first, then undefined. f4 carries the section number
+  -- Defined symbols first, then undefined. section carries the section number
   -- for defined symbols (1 = __text, 2 = __wstatic).
   for i in 0..nsyms {
-    let sym = nlist_get(syms, i)
-    if node_f4(sym) >= 1 {
+    let sym = vector_get_in_bounds<ObjectSymbol>(syms, i)
+    if sym.section >= 1 {
       let strx = object_storage_word_at(str_indices, i)
       bu32(o, strx)
       bu8(o, 15)           -- n_type: N_SECT | N_EXT = 0x0F
-      bu8(o, node_f4(sym)) -- n_sect
+      bu8(o, sym.section)  -- n_sect
       bu8(o, 0) bu8(o, 0)  -- n_desc: 0
-      bu64(o, node_f3(sym)) -- n_value: address in object
+      bu64(o, sym.value)    -- n_value: address in object
     } else { 0 }
   }
   for i in 0..nsyms {
-    let sym = nlist_get(syms, i)
-    if node_f4(sym) == 0 {
+    let sym = vector_get_in_bounds<ObjectSymbol>(syms, i)
+    if sym.section == 0 {
       let strx = object_storage_word_at(str_indices, i)
       bu32(o, strx)
       bu8(o, 1)            -- n_type: N_UNDF | N_EXT = 0x01
