@@ -204,6 +204,24 @@ assert_test_compile_rejects() {
   assert_contains "$name" "$out" "$pattern"
 }
 
+assert_program_failure_equals() {
+  local name="$1"
+  local source_path="$2"
+  local expected_exit="$3"
+  local expected_stderr="$4"
+  local exit_code
+  local err
+  run_weft_compile_guarded "$WEFT" compile "$source_path" > "$tmp_bin" 2>"$tmp_err"
+  chmod +x "$tmp_bin"
+  set +e
+  run_binary_guarded "$tmp_bin" >/dev/null 2>"$tmp_err"
+  exit_code=$?
+  set -e
+  err=$(<"$tmp_err")
+  assert_equals "${name}_exit" "$exit_code" "$expected_exit"
+  assert_equals "${name}_stderr" "$err" "$expected_stderr"
+}
+
 write_large_padding() {
   local file="$1"
   : > "$file"
@@ -252,6 +270,12 @@ run_binary_guarded "$tmp_bin" >/dev/null 2>&1
 compile_path_exit=$?
 set -e
 assert_equals "compile_path_binary_exit" "$compile_path_exit" "42"
+
+assert_program_failure_equals "panic_boundary" "test/panic_exit.weft" "101" "weft: panic: direct panic boundary"
+assert_program_failure_equals "result_unwrap_panic" "test/result_unwrap_exit.weft" "101" "weft: panic: Result.unwrap called on Err"
+assert_program_failure_equals "result_expect_panic" "test/result_expect_exit.weft" "101" "weft: panic: required result failed"
+assert_program_failure_equals "option_unwrap_panic" "test/option_unwrap_exit.weft" "101" "weft: panic: Option.unwrap called on None"
+assert_program_failure_equals "option_expect_panic" "test/option_expect_exit.weft" "101" "weft: panic: required option missing"
 
 printf 'fn broken() -> i64 { 1\nfn after() -> i64 { 2 }\n' > "$tmp_src"
 parse_recovery_out=$("$WEFT" ast < "$tmp_src" 2>&1)
