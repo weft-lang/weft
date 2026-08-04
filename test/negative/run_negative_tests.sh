@@ -240,6 +240,8 @@ check_rejects "trait_assoc_bound_concrete" "test/negative/trait_assoc_bound_conc
 check_rejects "trait_assoc_bound_generic" "test/negative/trait_assoc_bound_generic.weft" "type error: associated type does not satisfy trait bound"
 check_rejects "trait_assoc_signature_mismatch" "test/negative/trait_assoc_signature_mismatch.weft" "type error: impl method parameter type mismatch"
 check_rejects "trait_impl_conflict" "test/negative/trait_impl_conflict.weft" "type error: conflicting implementations of trait for type"
+check_rejects "orphan_neither_local" "test/negative/orphan_neither_local.weft" "type error: orphan impl is not allowed — define the trait or target type in this file"
+check_rejects "orphan_primitive_foreign_trait" "test/negative/orphan_primitive_foreign_trait.weft" "type error: orphan impl is not allowed — define the trait or target type in this file"
 check_rejects "self_outside_method" "test/negative/self_outside_method.weft" "type error: Self is only valid in trait and impl method signatures"
 check_rejects "self_in_data_type" "test/negative/self_in_data_type.weft" "type error: Self is only valid in trait and impl method signatures"
 check_rejects "drop_impl_missing_method" "test/negative/drop_impl_missing_method.weft" "type error: Drop impl missing concrete drop method"

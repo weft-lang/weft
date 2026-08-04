@@ -111,6 +111,8 @@ check_accepts "function_value_effect_call" "test/checker/function_value_effect_c
 check_accepts "method_calls" "test/checker/method_calls.weft"
 check_accepts "trait_impl_signatures" "test/checker/trait_impl_signatures.weft"
 check_accepts "trait_associated_types" "test/checker/trait_associated_types.weft"
+check_accepts "orphan_trait_local" "test/checker/orphan_trait_local.weft"
+check_accepts "orphan_type_local" "test/checker/orphan_type_local.weft"
 check_accepts "let_bound_lambdas" "test/checker/let_bound_lambdas.weft"
 check_accepts "name_resolution" "test/checker/name_resolution.weft"
 check_accepts "field_access" "test/checker/field_access.weft"
