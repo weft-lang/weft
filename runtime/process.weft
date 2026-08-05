@@ -1,18 +1,42 @@
 -- runtime/process.weft -- trusted libSystem process bridge
 
 use "runtime/alloc.weft"
+use "runtime/buffer.weft"
 use "runtime/string.weft"
 use "runtime/unsafe.weft"
 use "runtime/env.weft"
+use "stdlib/drop.weft"
 use "stdlib/list.weft"
 
--- Proc capability effect: spawn a program and wait for its exit status.
--- Ordinary code declares -[Proc]> and performs Proc.run; the platform
--- handler below marshals str arguments into the null-terminated char**
--- posix_spawn expects and discharges Unsafe inside this trusted module.
--- Tests can install their own Proc handler to mock spawning.
+type ProcHandle {
+  pid: i64,
+  stdout_fd: i64,
+  stderr_fd: i64,
+  spawn_error: i64
+}
+
+type ProcOutput {
+  status: i64,
+  stdout_text: str,
+  stderr_text: str,
+  error: i64
+}
+
+-- Proc capability effect. `run` remains the compact synchronous operation;
+-- spawn/wait is the process-level async surface with captured output. Handles
+-- are owned resources: wait consumes one, while dropping an un-waited handle
+-- routes through release so the child and pipe descriptors cannot leak.
 effect Proc {
   fn run(path: str, args: List<str>) -> i64
+  fn spawn(path: str, args: List<str>) -> owned ProcHandle
+  fn wait(resource: owned ProcHandle) -> ProcOutput
+  fn release(resource: ProcHandle) -> i64
+}
+
+impl Drop for ProcHandle {
+  fn drop(self) -[Proc]> i64 {
+    Proc.release(self)
+  }
 }
 
 -- These functions are trusted platform leaves. They keep raw GOT calls and
@@ -33,6 +57,65 @@ fn runtime_libc_exit(code: i64) -[Unsafe]> i64 {
 
 fn runtime_libsystem_write(fd: i64, buf: i64, len: i64) -[Unsafe]> i64 {
   __got_write(fd, buf, len, 0, 0, 0)
+}
+
+fn runtime_process_pipe(fds: i64) -[Unsafe]> i64 {
+  __got_pipe(fds, 0, 0, 0, 0, 0)
+}
+
+fn runtime_process_fcntl(fd: i64, command: i64, value: i64) -[Unsafe]> i64 {
+  __got_fcntl(fd, command, value, 0, 0, 0)
+}
+
+fn runtime_process_actions_init(actions: i64) -[Unsafe]> i64 {
+  __got_posix_spawn_file_actions_init(actions, 0, 0, 0, 0, 0)
+}
+
+fn runtime_process_actions_adddup2(actions: i64, fd: i64, target: i64) -[Unsafe]> i64 {
+  __got_posix_spawn_file_actions_adddup2(actions, fd, target, 0, 0, 0)
+}
+
+fn runtime_process_actions_addclose(actions: i64, fd: i64) -[Unsafe]> i64 {
+  __got_posix_spawn_file_actions_addclose(actions, fd, 0, 0, 0, 0)
+}
+
+fn runtime_process_actions_destroy(actions: i64) -[Unsafe]> i64 {
+  __got_posix_spawn_file_actions_destroy(actions, 0, 0, 0, 0, 0)
+}
+
+fn runtime_process_read(fd: i64, buf: i64, len: i64) -[Unsafe]> i64 {
+  __got_read(fd, buf, len, 0, 0, 0)
+}
+
+fn runtime_process_close(fd: i64) -[Unsafe]> i64 {
+  __got_close(fd, 0, 0, 0, 0, 0)
+}
+
+fn runtime_process_kill(pid: i64, signal: i64) -[Unsafe]> i64 {
+  __got_kill(pid, signal, 0, 0, 0, 0)
+}
+
+fn runtime_process_nanosleep(request: i64) -[Unsafe]> i64 {
+  __got_nanosleep(request, 0, 0, 0, 0, 0)
+}
+
+fn runtime_process_errno_ptr() -[Unsafe]> i64 {
+  __got___error(0, 0, 0, 0, 0, 0)
+}
+
+fn runtime_process_errno() -[Unsafe]> i64 {
+  let ptr = runtime_process_errno_ptr()
+  __mem_load8(ptr) +
+    __mem_load8(ptr + 1) * 256 +
+    __mem_load8(ptr + 2) * 65536 +
+    __mem_load8(ptr + 3) * 16777216
+}
+
+fn runtime_process_load_i32(ptr: i64) -[Unsafe]> i64 {
+  __mem_load8(ptr) +
+    __mem_load8(ptr + 1) * 256 +
+    __mem_load8(ptr + 2) * 65536 +
+    __mem_load8(ptr + 3) * 16777216
 }
 
 fn runtime_process_make_cstr(s: str) -> i64 {
@@ -76,6 +159,216 @@ fn runtime_proc_fill_argv(argv_buf: i64, index: i64, args: List<str>) -[Unsafe]>
   }
 }
 
+fn runtime_proc_close_if_open(fd: i64) -[Unsafe]> i64 {
+  if fd < 0 { 0 } else { runtime_process_close(fd) }
+}
+
+fn runtime_proc_set_nonblocking(fd: i64) -[Unsafe]> i64 {
+  let flags = runtime_process_fcntl(fd, 3, 0)
+  if flags < 0 { runtime_process_errno() }
+  else {
+    let status = runtime_process_fcntl(fd, 4, flags bor 4)
+    if status < 0 { runtime_process_errno() } else { 0 }
+  }
+}
+
+fn runtime_proc_action_status(current: i64, next: i64) -> i64 {
+  if current != 0 { current } else { next }
+}
+
+fn runtime_proc_spawn(path: str, args: List<str>) -[Unsafe]> owned ProcHandle {
+  let mark = alloc_bump_mark()
+  let stdout_pipe = alloc_bump(8)
+  let stderr_pipe = alloc_bump(8)
+  __mem_store64(stdout_pipe, 0)
+  __mem_store64(stderr_pipe, 0)
+
+  let mut stdout_read = 0 - 1
+  let mut stdout_write = 0 - 1
+  let mut stderr_read = 0 - 1
+  let mut stderr_write = 0 - 1
+  let mut error = 0
+
+  if runtime_process_pipe(stdout_pipe) == 0 {
+    stdout_read = runtime_process_load_i32(stdout_pipe)
+    stdout_write = runtime_process_load_i32(stdout_pipe + 4)
+  } else {
+    error = runtime_process_errno()
+  }
+  if error == 0 {
+    if runtime_process_pipe(stderr_pipe) == 0 {
+      stderr_read = runtime_process_load_i32(stderr_pipe)
+      stderr_write = runtime_process_load_i32(stderr_pipe + 4)
+    } else {
+      error = runtime_process_errno()
+    }
+  } else { 0 }
+
+  let actions = alloc_bump(8)
+  __mem_store64(actions, 0)
+  let mut actions_ready = 0
+  if error == 0 {
+    let init_status = runtime_process_actions_init(actions)
+    if init_status == 0 { actions_ready = 1 } else { error = init_status }
+  } else { 0 }
+  if error == 0 { error = runtime_proc_action_status(error, runtime_process_actions_adddup2(actions, stdout_write, 1)) } else { 0 }
+  if error == 0 { error = runtime_proc_action_status(error, runtime_process_actions_adddup2(actions, stderr_write, 2)) } else { 0 }
+  if error == 0 { error = runtime_proc_action_status(error, runtime_process_actions_addclose(actions, stdout_read)) } else { 0 }
+  if error == 0 { error = runtime_proc_action_status(error, runtime_process_actions_addclose(actions, stderr_read)) } else { 0 }
+  if error == 0 { error = runtime_proc_action_status(error, runtime_process_actions_addclose(actions, stdout_write)) } else { 0 }
+  if error == 0 { error = runtime_proc_action_status(error, runtime_process_actions_addclose(actions, stderr_write)) } else { 0 }
+
+  if error == 0 { error = runtime_proc_set_nonblocking(stdout_read) } else { 0 }
+  if error == 0 { error = runtime_proc_set_nonblocking(stderr_read) } else { 0 }
+
+  let path_c = runtime_str_cstring(path)
+  let n = runtime_proc_args_count(args)
+  let argv_buf = alloc_bump((n + 2) * 8)
+  __mem_store64(argv_buf, path_c)
+  runtime_proc_fill_argv(argv_buf, 1, args)
+  let pid_ptr = alloc_bump(8)
+  __mem_store64(pid_ptr, 0)
+  let mut pid = 0
+  if error == 0 {
+    let spawn_status = runtime_posix_spawn(pid_ptr, path_c, actions, 0, argv_buf, 0)
+    if spawn_status == 0 { pid = runtime_process_load_i32(pid_ptr) } else { error = spawn_status }
+  } else { 0 }
+
+  if actions_ready == 1 { runtime_process_actions_destroy(actions) } else { 0 }
+  runtime_proc_close_if_open(stdout_write)
+  runtime_proc_close_if_open(stderr_write)
+  if error != 0 {
+    runtime_proc_close_if_open(stdout_read)
+    runtime_proc_close_if_open(stderr_read)
+    stdout_read = 0 - 1
+    stderr_read = 0 - 1
+    pid = 0
+  } else { 0 }
+
+  alloc_bump_restore_same_segment(mark)
+  ProcHandle { pid: pid, stdout_fd: stdout_read, stderr_fd: stderr_read, spawn_error: error }
+}
+
+-- Drain all bytes immediately available from a nonblocking pipe.
+-- 1 = EOF, 0 = would block, negative = errno.
+fn runtime_proc_drain(fd: i64, scratch: i64, out: i64) -[Unsafe]> i64 {
+  let mut done = 0
+  let mut result = 0
+  while done == 0 {
+    let n = runtime_process_read(fd, scratch, 4096)
+    if n > 0 {
+      bscopy(out, scratch, n, 0)
+    } else { if n == 0 {
+      result = 1
+      done = 1
+    } else {
+      let error = runtime_process_errno()
+      if error == 4 {
+        0
+      } else {
+        result = if error == 35 { 0 } else { 0 - error }
+        done = 1
+      }
+    } }
+  }
+  result
+}
+
+fn runtime_proc_decode_wait_status(status_ptr: i64) -[Unsafe]> i64 {
+  let raw = runtime_process_load_i32(status_ptr)
+  let signal = raw band 127
+  if signal == 0 { (raw bshr 8) band 255 } else { 128 + signal }
+}
+
+fn runtime_proc_wait(resource: ProcHandle) -[Unsafe]> ProcOutput {
+  if resource.spawn_error != 0 {
+    ProcOutput { status: 0 - 1, stdout_text: "", stderr_text: "", error: resource.spawn_error }
+  } else {
+    let mark = alloc_bump_mark()
+    let scratch = alloc_bump(4096)
+    let status_ptr = alloc_bump(8)
+    let pause_request = alloc_bump(16)
+    __mem_store64(status_ptr, 0)
+    __mem_store64(pause_request, 0)
+    __mem_store64(pause_request + 8, 1000000)
+    let stdout_buf = buf_new(4096)
+    let stderr_buf = buf_new(4096)
+    let mut stdout_eof = if resource.stdout_fd < 0 { 1 } else { 0 }
+    let mut stderr_eof = if resource.stderr_fd < 0 { 1 } else { 0 }
+    let mut capture_error = 0
+    let mut wait_error = 0
+    let mut status = 0 - 1
+    let mut child_done = 0
+
+    while child_done == 0 {
+      if stdout_eof == 0 {
+        let state = runtime_proc_drain(resource.stdout_fd, scratch, stdout_buf)
+        if state == 1 { stdout_eof = 1 }
+        else { if state < 0 and capture_error == 0 { capture_error = 0 - state } else { 0 } }
+      } else { 0 }
+      if stderr_eof == 0 {
+        let state = runtime_proc_drain(resource.stderr_fd, scratch, stderr_buf)
+        if state == 1 { stderr_eof = 1 }
+        else { if state < 0 and capture_error == 0 { capture_error = 0 - state } else { 0 } }
+      } else { 0 }
+
+      let waited = runtime_waitpid(resource.pid, status_ptr, 1)
+      if waited == resource.pid {
+        status = runtime_proc_decode_wait_status(status_ptr)
+        child_done = 1
+      } else { if waited < 0 {
+        wait_error = runtime_process_errno()
+        child_done = 1
+      } else {
+        runtime_process_nanosleep(pause_request)
+      } }
+    }
+
+    if stdout_eof == 0 {
+      let state = runtime_proc_drain(resource.stdout_fd, scratch, stdout_buf)
+      if state < 0 and capture_error == 0 { capture_error = 0 - state } else { 0 }
+    } else { 0 }
+    if stderr_eof == 0 {
+      let state = runtime_proc_drain(resource.stderr_fd, scratch, stderr_buf)
+      if state < 0 and capture_error == 0 { capture_error = 0 - state } else { 0 }
+    } else { 0 }
+    runtime_proc_close_if_open(resource.stdout_fd)
+    runtime_proc_close_if_open(resource.stderr_fd)
+
+    let stdout_text = runtime_str_from_bytes(buf_ptr(stdout_buf), buf_len(stdout_buf))
+    let stderr_text = runtime_str_from_bytes(buf_ptr(stderr_buf), buf_len(stderr_buf))
+    let error = if wait_error != 0 { wait_error } else { capture_error }
+    alloc_bump_restore_same_segment(mark)
+    ProcOutput { status: status, stdout_text: stdout_text, stderr_text: stderr_text, error: error }
+  }
+}
+
+fn runtime_proc_release(resource: ProcHandle) -[Unsafe]> i64 {
+  if resource.pid > 0 { runtime_process_kill(resource.pid, 9) } else { 0 }
+  runtime_proc_close_if_open(resource.stdout_fd)
+  runtime_proc_close_if_open(resource.stderr_fd)
+  if resource.pid > 0 {
+    let mark = alloc_bump_mark()
+    let status_ptr = alloc_bump(8)
+    __mem_store64(status_ptr, 0)
+    let waited = runtime_waitpid(resource.pid, status_ptr, 0)
+    alloc_bump_restore_same_segment(mark)
+    if waited < 0 { runtime_process_errno() } else { 0 }
+  } else { resource.spawn_error }
+}
+
+fn proc_spawn(path: str, args: List<str>) -[Proc]> owned ProcHandle {
+  Proc.spawn(path, args)
+}
+
+fn proc_wait(resource: owned ProcHandle) -[Proc]> ProcOutput {
+  Proc.wait(resource)
+}
+
+fn proc_handle_pid(resource: ProcHandle) -> i64 {
+  resource.pid
+}
+
 -- argv = [path, args..., 0]; returns the child's exit status (or -1 when
 -- the spawn itself fails), matching runtime_process_run_command.
 fn runtime_proc_run(path: str, args: List<str>) -[Unsafe]> i64 {
@@ -96,6 +389,9 @@ fn runtime_proc_run(path: str, args: List<str>) -[Unsafe]> i64 {
 fn runtime_proc_handle(body: () -[Proc]> i64) -[Unsafe]> i64 {
   handle body() {
     Proc.run(path, args) -> resume(runtime_proc_run(path, args))
+    Proc.spawn(path, args) -> resume(runtime_proc_spawn(path, args))
+    Proc.wait(resource) -> resume(runtime_proc_wait(resource))
+    Proc.release(resource) -> resume(runtime_proc_release(resource))
   }
 }
 
@@ -110,6 +406,9 @@ fn runtime_platform_proc(body: () -[Proc]> i64) -> i64 {
 fn runtime_proc_inner_with_env(body: () -[Env, Proc]> i64) -[Env, Unsafe]> i64 {
   handle body() {
     Proc.run(path, args) -> resume(runtime_proc_run(path, args))
+    Proc.spawn(path, args) -> resume(runtime_proc_spawn(path, args))
+    Proc.wait(resource) -> resume(runtime_proc_wait(resource))
+    Proc.release(resource) -> resume(runtime_proc_release(resource))
   }
 }
 
