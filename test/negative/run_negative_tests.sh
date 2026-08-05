@@ -551,6 +551,8 @@ check_rejects "effect_generic_bare_use" "test/negative/effect_generic_bare_use.w
 check_rejects "effect_type_args_wrong_count" "test/negative/effect_type_args_wrong_count.weft" "type error: effect type argument count mismatch"
 check_rejects "effect_instantiation_mismatch" "test/negative/effect_instantiation_mismatch.weft" "type error: effect not available in caller"
 check_rejects "effect_duplicate_head_instantiations" "test/negative/effect_duplicate_head_instantiations.weft" "type error: duplicate effect heads in one signature are not yet supported"
+check_rejects "effect_qualified_perform_mismatch" "test/negative/effect_qualified_perform_mismatch.weft" "type error: effect atom not available in caller"
+check_rejects "effect_qualified_handler_mismatch" "test/negative/effect_qualified_handler_mismatch.weft" "type error: effect not available in caller"
 check_rejects "effect_perform_arg_instantiation_mismatch" "test/negative/effect_perform_arg_instantiation_mismatch.weft" "type error: argument type mismatch"
 check_rejects "effect_resume_instantiation_mismatch" "test/negative/effect_resume_instantiation_mismatch.weft" "type error: resume type mismatch"
 check_rejects "return_clause_deferred" "test/negative/return_clause_deferred.weft" "type error: return clause with deferred clauses is not yet supported"
