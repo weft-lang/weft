@@ -1955,7 +1955,8 @@ fn pipeline_fn_declares_par_effect(fn_wrap: i64) -> i64 {
 }
 
 fn pipeline_type_value_lane_count_or_one(ty: i64) -> i64 {
-  if ir_value_shape_kind_for_type(ty) == ir_value_shape_kind_gpr_pair() { 2 } else { 1 }
+  let words = ty_value_storage_word_count(ty)
+  if words > 0 { words } else { 1 }
 }
 
 fn pipeline_params_value_lane_count(params: i64) -> i64 {
@@ -2400,6 +2401,36 @@ fn pipeline_expected_arg_type_node(expected_params: i64, expected_types: i64, in
 fn pipeline_ir_value_lane_ids(value: i64, lane: i64, count: i64) -> IrValueList {
   if lane >= count { ir_value_list_empty() }
   else { ir_value_list_prepend(value + lane, pipeline_ir_value_lane_ids(value, lane + 1, count)) }
+}
+
+fn pipeline_ir_record_field_lane_entries_inner(field_hash: i64, word_offset: i64, value: i64, lane: i64, count: i64) -> IrRecordFieldList {
+  if lane >= count { ir_record_field_list_empty() }
+  else {
+    ir_record_field_list_prepend(
+      field_hash,
+      word_offset + lane,
+      value + lane,
+      pipeline_ir_record_field_lane_entries_inner(field_hash, word_offset, value, lane + 1, count)
+    )
+  }
+}
+
+fn pipeline_ir_record_field_lane_entries(field_hash: i64, word_offset: i64, value: i64, ty: i64) -> IrRecordFieldList {
+  pipeline_ir_record_field_lane_entries_inner(field_hash, word_offset, value, 0, pipeline_type_value_lane_count_or_one(ty))
+}
+
+fn pipeline_ir_field_load_lane_insts_inner(dst: i64, base: i64, field_hash: i64, word_offset: i64, lane: i64, count: i64) -> IrInstList {
+  if lane >= count { ir_inst_list_empty() }
+  else {
+    ir_inst_list_prepend(
+      ir_inst_field_load_i64(dst + lane, base, field_hash, word_offset + lane),
+      pipeline_ir_field_load_lane_insts_inner(dst, base, field_hash, word_offset, lane + 1, count)
+    )
+  }
+}
+
+fn pipeline_ir_field_load_lane_insts(dst: i64, base: i64, field_hash: i64, word_offset: i64, ty: i64) -> IrInstList {
+  pipeline_ir_field_load_lane_insts_inner(dst, base, field_hash, word_offset, 0, pipeline_type_value_lane_count_or_one(ty))
 }
 
 fn pipeline_expr_value_lane_count(expr: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
@@ -5695,17 +5726,19 @@ fn pipeline_lower_field_like_typed_to_target_blocks(base_expr: Expr, field_ns: i
       let base_value = pipeline_lowered_blocks_next_value(base_blocks)
       let dst = base_value + 1
       let base_params = ir_value_list_prepend(base_value, ir_value_list_empty())
-      let result_args = ir_value_list_prepend(dst, ir_value_list_empty())
+      let field_ty = if is_opt == 1 { 0 } else { pipeline_typed_field_type_for_base(tt, src, field_ns, field_nl, base_expr, params, locals, module) }
+      let result_lanes = if is_opt == 1 { 1 } else { pipeline_type_value_lane_count_or_one(field_ty) }
+      let result_args = pipeline_ir_value_lane_ids(dst, 0, result_lanes)
       let base_field_index = pipeline_typed_field_index_for_base(tt, src, field_ns, field_nl, base_expr, params, locals, module)
-      let inst = if is_opt == 1 {
+      let insts = if is_opt == 1 {
         let effect_key = pipeline_effect_atom_dispatch_key(effect_atom, pipeline_lower_module_subst(module), effect_maybe_head_hash())
-        ir_inst_opt_chain_i64(dst, base_value, str_hash(src, field_ns, field_nl), base_field_index, effect_key)
+        ir_inst_list_prepend(ir_inst_opt_chain_i64(dst, base_value, str_hash(src, field_ns, field_nl), base_field_index, effect_key), ir_inst_list_empty())
       } else {
-        ir_inst_field_load_i64(dst, base_value, str_hash(src, field_ns, field_nl), base_field_index)
+        pipeline_ir_field_load_lane_insts(dst, base_value, str_hash(src, field_ns, field_nl), base_field_index, field_ty)
       }
-      let merge = ir_block_new_params(base_merge_block, base_params, ir_inst_list_prepend(inst, ir_inst_list_empty()), ir_term_jump_args(target_block, result_args))
+      let merge = ir_block_new_params(base_merge_block, base_params, insts, ir_term_jump_args(target_block, result_args))
       let blocks = ir_block_list_append(pipeline_lowered_blocks_blocks(base_blocks), ir_block_list_prepend(merge, ir_block_list_empty()))
-      pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(base_blocks), dst + 1, blocks, 1)
+      pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(base_blocks), dst + result_lanes, blocks, 1)
     }
   } else {
     pipeline_lowered_blocks_invalid(start_block, next_value)
@@ -5716,17 +5749,51 @@ fn pipeline_lower_field_like_typed_to_target_blocks(base_expr: Expr, field_ns: i
 -- expression to an owned count from the declaration's field type, just as
 -- variant construction and owning call parameters do. Looking the type up
 -- here keeps this an ownership fact rather than a record-name recogniser.
+fn pipeline_record_field_word_offset_in_entry(entry: i64, caller_src: i64, field_ns: i64, field_nl: i64, subst: i64) -> i64 {
+  if entry == 0 { 0 - 1 }
+  else {
+    let entry_src = mem_load64_at(entry, 48)
+    let nfields = mem_load64_at(entry, 24)
+    let fields = mem_load64_at(entry, 32)
+    let mut i = 0
+    let mut word_offset = 0
+    let mut result = 0 - 1
+    while i < nfields and result < 0 {
+      let declared_ns = mem_load64_at(fields, i * 24)
+      let declared_nl = mem_load64_at(fields, i * 24 + 8)
+      if declared_nl == field_nl and src_eq_at(caller_src, field_ns, entry_src + declared_ns, 0, field_nl) == 1 {
+        result = word_offset
+      } else {
+        let raw_ty = mem_load64_at(fields, i * 24 + 16)
+        let field_ty = if subst == 0 { raw_ty } else { ty_subst(raw_ty, subst) }
+        word_offset = word_offset + pipeline_type_value_lane_count_or_one(field_ty)
+        i = i + 1
+      }
+    }
+    result
+  }
+}
+
+fn pipeline_record_field_type_in_entry(entry: i64, caller_src: i64, field_ns: i64, field_nl: i64, subst: i64) -> i64 {
+  if entry == 0 { 0 }
+  else {
+    let entry_src = mem_load64_at(entry, 48)
+    let raw_ty = ttable_field_type(entry, entry_src, caller_src, field_ns, field_nl)
+    if raw_ty == 0 { 0 } else { if subst == 0 { raw_ty } else { ty_subst(raw_ty, subst) } }
+  }
+}
+
 fn pipeline_record_field_expected_type(tt: i64, src: i64, type_ns: i64, type_nl: i64, field_ns: i64, field_nl: i64, subst: i64) -> i64 {
   if tt == 0 { 0 }
   else {
     let entry = ttable_lookup(tt, src, type_ns, type_nl)
-    if entry == 0 { 0 }
-    else {
-      let entry_src = mem_load64_at(entry, 48)
-      let raw_ty = ttable_field_type(entry, entry_src, src, field_ns, field_nl)
-      if raw_ty == 0 { 0 } else { if subst == 0 { raw_ty } else { ty_subst(raw_ty, subst) } }
-    }
+    pipeline_record_field_type_in_entry(entry, src, field_ns, field_nl, subst)
   }
+}
+
+fn pipeline_record_field_word_offset(tt: i64, src: i64, type_ns: i64, type_nl: i64, field_ns: i64, field_nl: i64, subst: i64) -> i64 {
+  if tt == 0 { 0 - 1 }
+  else { pipeline_record_field_word_offset_in_entry(ttable_lookup(tt, src, type_ns, type_nl), src, field_ns, field_nl, subst) }
 }
 
 fn pipeline_lower_record_field_blocks_typed(fields: RecordFieldList, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, type_ns: i64, type_nl: i64, record_block: i64, next_value: i64, next_block: i64, values: IrRecordFieldList) -> PipelineLoweredRecordFieldBlocks {
@@ -5738,7 +5805,10 @@ fn pipeline_lower_record_field_blocks_typed(fields: RecordFieldList, params: i64
       match field {
         RecordField(ns, nl, value_expr) -> {
           let field_hash = str_hash(src, ns, nl)
-          let field_ty = pipeline_record_field_expected_type(tt, src, type_ns, type_nl, ns, nl, pipeline_lower_module_subst(module))
+          let subst = pipeline_lower_module_subst(module)
+          let field_ty = pipeline_record_field_expected_type(tt, src, type_ns, type_nl, ns, nl, subst)
+          let word_offset = pipeline_record_field_word_offset(tt, src, type_ns, type_nl, ns, nl, subst)
+          let field_lanes = pipeline_type_value_lane_count_or_one(field_ty)
           if pipeline_expr_needs_lowering_cfg_typed(value_expr, src) == 1 {
             let field_merge_block = next_block + 1
             let field_next_block = next_block + 2
@@ -5756,12 +5826,12 @@ fn pipeline_lower_record_field_blocks_typed(fields: RecordFieldList, params: i64
               } else {
                 let field_value = pipeline_lowered_blocks_next_value(field_blocks)
                 let rest_start = pipeline_lowered_blocks_next_block(field_blocks)
-                let retain = pipeline_managed_borrow_retain_arg_typed(value_expr, field_value, field_ty, field_value + 1, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), tt)
-                let next_values = ir_record_field_list_append(values, ir_record_field_list_prepend(field_hash, field_value, ir_record_field_list_empty()))
+                let retain = pipeline_managed_borrow_retain_arg_typed(value_expr, field_value, field_ty, field_value + field_lanes, src, pipeline_lower_module_fns(module), subst, tt)
+                let next_values = ir_record_field_list_append(values, pipeline_ir_record_field_lane_entries(field_hash, word_offset, field_value, field_ty))
                 let rest = pipeline_lower_record_field_blocks_typed(rest_fields, params, locals, module, type_ns, type_nl, record_block, pipeline_lowered_args_next_value(retain), rest_start, next_values)
                 if pipeline_lowered_record_field_blocks_is_valid(rest) == 1 {
                   let target = if record_field_list_len(rest_fields) == 0 { record_block } else { rest_start }
-                  let field_params = ir_value_list_prepend(field_value, ir_value_list_empty())
+                  let field_params = pipeline_ir_value_lane_ids(field_value, 0, field_lanes)
                   let field_merge = ir_block_new_params(field_merge_block, field_params, pipeline_lowered_args_insts(retain), ir_term_jump(target))
                   let blocks = ir_block_list_append(
                     pipeline_lowered_blocks_blocks(field_blocks),
@@ -5788,7 +5858,7 @@ fn pipeline_lower_record_field_blocks_typed(fields: RecordFieldList, params: i64
             if ir_lowered_expr_is_valid(lowered) == 1 {
               let rest_start = next_block + 1
               let retain = pipeline_managed_borrow_retain_arg_typed(value_expr, ir_lowered_expr_value(lowered), field_ty, ir_lowered_expr_next_value(lowered), src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), tt)
-              let next_values = ir_record_field_list_append(values, ir_record_field_list_prepend(field_hash, ir_lowered_expr_value(lowered), ir_record_field_list_empty()))
+              let next_values = ir_record_field_list_append(values, pipeline_ir_record_field_lane_entries(field_hash, word_offset, ir_lowered_expr_value(lowered), field_ty))
               let rest = pipeline_lower_record_field_blocks_typed(rest_fields, params, locals, module, type_ns, type_nl, record_block, pipeline_lowered_args_next_value(retain), rest_start, next_values)
               if pipeline_lowered_record_field_blocks_is_valid(rest) == 1 {
                 let target = if record_field_list_len(rest_fields) == 0 { record_block } else { rest_start }
@@ -9748,7 +9818,10 @@ fn pipeline_lower_record_field_blocks(ctx: PipelineRecordFieldCtx, index: i64, n
         let field = nlist_get(fields, index)
         let field_hash = str_hash(src, node_f1(field), node_f2(field))
         let value_expr = node_f3(field)
-        let field_ty = pipeline_record_field_expected_type(tt, src, type_ns, type_nl, node_f1(field), node_f2(field), pipeline_lower_module_subst(module))
+        let subst = pipeline_lower_module_subst(module)
+        let field_ty = pipeline_record_field_expected_type(tt, src, type_ns, type_nl, node_f1(field), node_f2(field), subst)
+        let word_offset = pipeline_record_field_word_offset(tt, src, type_ns, type_nl, node_f1(field), node_f2(field), subst)
+        let field_lanes = pipeline_type_value_lane_count_or_one(field_ty)
         if pipeline_expr_needs_cfg(value_expr) == 1 {
           let field_merge_block = next_block + 1
           let field_next_block = next_block + 2
@@ -9766,12 +9839,12 @@ fn pipeline_lower_record_field_blocks(ctx: PipelineRecordFieldCtx, index: i64, n
             } else {
               let field_value = pipeline_lowered_blocks_next_value(field_blocks)
               let rest_start = pipeline_lowered_blocks_next_block(field_blocks)
-              let retain = pipeline_managed_borrow_retain_arg_node(value_expr, field_value, field_ty, field_value + 1, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), tt)
-              let next_values = ir_record_field_list_append(values, ir_record_field_list_prepend(field_hash, field_value, ir_record_field_list_empty()))
+              let retain = pipeline_managed_borrow_retain_arg_node(value_expr, field_value, field_ty, field_value + field_lanes, src, pipeline_lower_module_fns(module), subst, tt)
+              let next_values = ir_record_field_list_append(values, pipeline_ir_record_field_lane_entries(field_hash, word_offset, field_value, field_ty))
               let rest = pipeline_lower_record_field_blocks(ctx, index + 1, pipeline_lowered_args_next_value(retain), rest_start, next_values)
               if pipeline_lowered_record_field_blocks_is_valid(rest) == 1 {
                 let target = if index + 1 >= nfields { record_block } else { rest_start }
-                let field_params = ir_value_list_prepend(field_value, ir_value_list_empty())
+                let field_params = pipeline_ir_value_lane_ids(field_value, 0, field_lanes)
                 let field_merge = ir_block_new_params(field_merge_block, field_params, pipeline_lowered_args_insts(retain), ir_term_jump(target))
                 let blocks = ir_block_list_append(
                   pipeline_lowered_blocks_blocks(field_blocks),
@@ -9798,7 +9871,7 @@ fn pipeline_lower_record_field_blocks(ctx: PipelineRecordFieldCtx, index: i64, n
           if ir_lowered_expr_is_valid(lowered) == 1 {
             let rest_start = next_block + 1
             let retain = pipeline_managed_borrow_retain_arg_node(value_expr, ir_lowered_expr_value(lowered), field_ty, ir_lowered_expr_next_value(lowered), src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), tt)
-            let next_values = ir_record_field_list_append(values, ir_record_field_list_prepend(field_hash, ir_lowered_expr_value(lowered), ir_record_field_list_empty()))
+            let next_values = ir_record_field_list_append(values, pipeline_ir_record_field_lane_entries(field_hash, word_offset, ir_lowered_expr_value(lowered), field_ty))
             let rest = pipeline_lower_record_field_blocks(ctx, index + 1, pipeline_lowered_args_next_value(retain), rest_start, next_values)
             if pipeline_lowered_record_field_blocks_is_valid(rest) == 1 {
               let target = if index + 1 >= nfields { record_block } else { rest_start }
@@ -9877,17 +9950,17 @@ fn pipeline_lower_field_access_to_target_blocks(expr: i64, params: i64, locals: 
         let base_value = pipeline_lowered_blocks_next_value(base_blocks)
         let dst = base_value + 1
         let base_params = ir_value_list_prepend(base_value, ir_value_list_empty())
-        let result_args = ir_value_list_prepend(dst, ir_value_list_empty())
-        let field_inst = ir_inst_list_prepend(
-          ir_inst_field_load_i64(dst, base_value, str_hash(src, node_f2(expr), node_f3(expr)), pipeline_field_access_index(expr)),
-          ir_inst_list_empty()
-        )
+        let field_ty = pipeline_typed_field_type_for_base_node(tt, src, node_f2(expr), node_f3(expr), base_expr, params, locals, module)
+        let result_lanes = pipeline_type_value_lane_count_or_one(field_ty)
+        let result_args = pipeline_ir_value_lane_ids(dst, 0, result_lanes)
+        let word_offset = pipeline_typed_field_index_for_base_node(tt, src, node_f2(expr), node_f3(expr), base_expr, params, locals, module)
+        let field_inst = pipeline_ir_field_load_lane_insts(dst, base_value, str_hash(src, node_f2(expr), node_f3(expr)), word_offset, field_ty)
         let merge = ir_block_new_params(base_merge_block, base_params, field_inst, ir_term_jump_args(target_block, result_args))
         let blocks = ir_block_list_append(
           pipeline_lowered_blocks_blocks(base_blocks),
           ir_block_list_prepend(merge, ir_block_list_empty())
         )
-        pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(base_blocks), dst + 1, blocks, 1)
+        pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(base_blocks), dst + result_lanes, blocks, 1)
       }
     } else {
       pipeline_lowered_blocks_invalid(start_block, next_value)
@@ -15820,7 +15893,8 @@ fn pipeline_lower_record_fields_typed_sidecar_handler_opt(fields: RecordFieldLis
             let rest = pipeline_lower_record_fields_typed_sidecar_handler_opt(rest_fields, type_ns, type_nl, pipeline_lowered_args_next_value(retain), lower_ctx)
             if pipeline_lowered_record_fields_is_valid(rest) == 1 {
               let field_hash = str_hash(src, ns, nl)
-              let values = ir_record_field_list_prepend(field_hash, ir_lowered_expr_value(value), pipeline_lowered_record_fields_values(rest))
+              let word_offset = pipeline_record_field_word_offset(tt, src, type_ns, type_nl, ns, nl, subst)
+              let values = ir_record_field_list_append(pipeline_ir_record_field_lane_entries(field_hash, word_offset, ir_lowered_expr_value(value), field_ty), pipeline_lowered_record_fields_values(rest))
               let insts = ir_inst_list_append(ir_lowered_expr_insts(value), ir_inst_list_append(pipeline_lowered_args_insts(retain), pipeline_lowered_record_fields_insts(rest)))
               pipeline_lowered_record_fields(values, pipeline_lowered_record_fields_next_value(rest), insts, 1)
             } else {
@@ -15899,11 +15973,46 @@ fn pipeline_field_base_type_hash_direct(base_expr: Expr, src: i64, params: i64, 
   }
 }
 
+fn pipeline_field_base_type_node_typed(base_expr: Expr, src: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
+  let inferred = pipeline_return_expr_type_node_typed(base_expr, params, locals, module)
+  if inferred != 0 { inferred }
+  else {
+    let type_hash = pipeline_field_base_type_hash_direct(base_expr, src, params, locals, module)
+    if type_hash == 0 { 0 } else { ty_named(type_hash, ty_i64()) }
+  }
+}
+
+fn pipeline_record_instance_subst(entry: i64, base_ty: i64, fallback_subst: i64) -> i64 {
+  if entry == 0 or base_ty == 0 or ty_tag(base_ty) != 9 or ty_f3(base_ty) == 0 {
+    fallback_subst
+  } else {
+    let tparams = mem_load64_at(entry, 40)
+    if tparams == 0 { fallback_subst } else { build_subst(tparams, ty_f3(base_ty)) }
+  }
+}
+
+fn pipeline_typed_field_entry_for_base(tt: i64, base_ty: i64) -> i64 {
+  if tt == 0 or base_ty == 0 or ty_tag(base_ty) != 9 { 0 }
+  else { ttable_lookup_by_type_hash(tt, ty_f1(base_ty)) }
+}
+
+fn pipeline_typed_field_type_for_base(tt: i64, src: i64, field_ns: i64, field_nl: i64, base_expr: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
+  let base_ty = pipeline_field_base_type_node_typed(base_expr, src, params, locals, module)
+  let entry = pipeline_typed_field_entry_for_base(tt, base_ty)
+  let subst = pipeline_record_instance_subst(entry, base_ty, pipeline_lower_module_subst(module))
+  pipeline_record_field_type_in_entry(entry, src, field_ns, field_nl, subst)
+}
+
 fn pipeline_typed_field_index_for_base(tt: i64, src: i64, field_ns: i64, field_nl: i64, base_expr: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
-  let base_ty = pipeline_return_expr_type_node_typed(base_expr, params, locals, module)
-  let node_hash = if base_ty == 0 { 0 } else { type_hash_of(base_ty) }
-  let type_hash = if node_hash != 0 { node_hash } else { pipeline_field_base_type_hash_direct(base_expr, src, params, locals, module) }
-  pipeline_typed_field_index_for_type_hash(tt, src, field_ns, field_nl, type_hash)
+  let base_ty = pipeline_field_base_type_node_typed(base_expr, src, params, locals, module)
+  let entry = pipeline_typed_field_entry_for_base(tt, base_ty)
+  let subst = pipeline_record_instance_subst(entry, base_ty, pipeline_lower_module_subst(module))
+  let word_offset = pipeline_record_field_word_offset_in_entry(entry, src, field_ns, field_nl, subst)
+  if word_offset >= 0 { word_offset }
+  else {
+    let node_hash = if base_ty == 0 { 0 } else { type_hash_of(base_ty) }
+    pipeline_typed_field_index_for_type_hash(tt, src, field_ns, field_nl, node_hash)
+  }
 }
 
 fn pipeline_typed_field_index_for_base_node(tt: i64, src: i64, field_ns: i64, field_nl: i64, base_node: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
@@ -15913,6 +16022,12 @@ fn pipeline_typed_field_index_for_base_node(tt: i64, src: i64, field_ns: i64, fi
   } else {
     pipeline_typed_field_index_for_base(tt, src, field_ns, field_nl, expr_from_node(stripped), params, locals, module)
   }
+}
+
+fn pipeline_typed_field_type_for_base_node(tt: i64, src: i64, field_ns: i64, field_nl: i64, base_node: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
+  let stripped = pipeline_expr_node_strip_typed(base_node)
+  if stripped == 0 { 0 }
+  else { pipeline_typed_field_type_for_base(tt, src, field_ns, field_nl, expr_from_node(stripped), params, locals, module) }
 }
 
 fn pipeline_lower_field_access_expr_typed_sidecar_handler_opt(base_expr: Expr, field_ns: i64, field_nl: i64, next_value: i64, lower_ctx: PipelineHandlerLowerCtx) -> IrLoweredExpr {
@@ -15925,11 +16040,10 @@ fn pipeline_lower_field_access_expr_typed_sidecar_handler_opt(base_expr: Expr, f
   let base = pipeline_lower_expr_typed_sidecar_handler_ctx(base_expr, next_value, lower_ctx)
   if ir_lowered_expr_is_valid(base) == 1 {
     let dst = ir_lowered_expr_next_value(base)
-    let field = ir_inst_list_prepend(
-      ir_inst_field_load_i64(dst, ir_lowered_expr_value(base), str_hash(src, field_ns, field_nl), pipeline_typed_field_index_for_base(tt, src, field_ns, field_nl, base_expr, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))),
-      ir_inst_list_empty()
-    )
-    ir_lowered_expr(dst, dst + 1, ir_inst_list_append(ir_lowered_expr_insts(base), field))
+    let field_ty = pipeline_typed_field_type_for_base(tt, src, field_ns, field_nl, base_expr, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
+    let lanes = pipeline_type_value_lane_count_or_one(field_ty)
+    let field = pipeline_ir_field_load_lane_insts(dst, ir_lowered_expr_value(base), str_hash(src, field_ns, field_nl), pipeline_typed_field_index_for_base(tt, src, field_ns, field_nl, base_expr, params, locals, pipeline_handler_lower_ctx_module(lower_ctx)), field_ty)
+    ir_lowered_expr(dst, dst + lanes, ir_inst_list_append(ir_lowered_expr_insts(base), field))
   } else {
     ir_lowered_expr_invalid(next_value)
   }
@@ -16476,7 +16590,8 @@ fn pipeline_lower_record_field_nodes_handler_opt(fields: i64, field_count: i64, 
         let rest = pipeline_lower_record_field_nodes_handler_opt(fields, field_count, index + 1, type_ns, type_nl, pipeline_lowered_args_next_value(retain), lower_ctx)
         if pipeline_lowered_record_fields_is_valid(rest) == 1 {
           let field_hash = str_hash(src, node_f1(field), node_f2(field))
-          let values = ir_record_field_list_prepend(field_hash, ir_lowered_expr_value(value), pipeline_lowered_record_fields_values(rest))
+          let word_offset = pipeline_record_field_word_offset(tt, src, type_ns, type_nl, node_f1(field), node_f2(field), subst)
+          let values = ir_record_field_list_append(pipeline_ir_record_field_lane_entries(field_hash, word_offset, ir_lowered_expr_value(value), field_ty), pipeline_lowered_record_fields_values(rest))
           let insts = ir_inst_list_append(ir_lowered_expr_insts(value), ir_inst_list_append(pipeline_lowered_args_insts(retain), pipeline_lowered_record_fields_insts(rest)))
           pipeline_lowered_record_fields(values, pipeline_lowered_record_fields_next_value(rest), insts, 1)
         } else {
@@ -17326,8 +17441,10 @@ fn pipeline_lower_field_access_node_typed_sidecar_handler_opt(base_node: i64, fi
   let base = pipeline_lower_expr_node_typed_sidecar_handler_ctx(base_node, next_value, lower_ctx)
   if ir_lowered_expr_is_valid(base) == 1 {
     let dst = ir_lowered_expr_next_value(base)
-    let field = ir_inst_list_prepend(ir_inst_field_load_i64(dst, ir_lowered_expr_value(base), str_hash(src, field_ns, field_nl), pipeline_typed_field_index_for_base_node(tt, src, field_ns, field_nl, base_node, pipeline_handler_lower_ctx_params(lower_ctx), pipeline_handler_lower_ctx_locals(lower_ctx), pipeline_handler_lower_ctx_module(lower_ctx))), ir_inst_list_empty())
-    ir_lowered_expr(dst, dst + 1, ir_inst_list_append(ir_lowered_expr_insts(base), field))
+    let field_ty = pipeline_typed_field_type_for_base_node(tt, src, field_ns, field_nl, base_node, pipeline_handler_lower_ctx_params(lower_ctx), pipeline_handler_lower_ctx_locals(lower_ctx), pipeline_handler_lower_ctx_module(lower_ctx))
+    let lanes = pipeline_type_value_lane_count_or_one(field_ty)
+    let field = pipeline_ir_field_load_lane_insts(dst, ir_lowered_expr_value(base), str_hash(src, field_ns, field_nl), pipeline_typed_field_index_for_base_node(tt, src, field_ns, field_nl, base_node, pipeline_handler_lower_ctx_params(lower_ctx), pipeline_handler_lower_ctx_locals(lower_ctx), pipeline_handler_lower_ctx_module(lower_ctx)), field_ty)
+    ir_lowered_expr(dst, dst + lanes, ir_inst_list_append(ir_lowered_expr_insts(base), field))
   } else {
     ir_lowered_expr_invalid(next_value)
   }
@@ -20211,7 +20328,7 @@ fn pipeline_ir_native_mark_value_list(values: IrValueList, out: i64) -> i64 {
 fn pipeline_ir_native_mark_record_field_values(fields: IrRecordFieldList, out: i64) -> i64 {
   match fields {
     IrRecordFieldNil -> 0
-    IrRecordFieldCons(field_hash, value, rest) -> {
+    IrRecordFieldCons(field_hash, word_offset, value, rest) -> {
       pipeline_ir_native_int_list_add_unique(out, value) +
         pipeline_ir_native_mark_record_field_values(rest, out)
     }
@@ -24136,11 +24253,13 @@ fn pipeline_record_field_mask(tt: i64, type_hash: i64) -> i64 {
       let fields = mem_load64_at(entry, 32)
       let mut mask = 0
       let mut i = 0
+      let mut word = 0
       while i < nfields {
-        if i < 16 {
-          let ty = mem_load64_at(fields + i * 24 + 16, 0)
-          mask = mask bor (cg_field_mask_kind(ty) bshl (i * 2))
+        let ty = mem_load64_at(fields + i * 24 + 16, 0)
+        if word < 16 {
+          mask = mask bor (cg_field_mask_kind(ty) bshl (word * 2))
         } else { 0 }
+        word = word + pipeline_type_value_lane_count_or_one(ty)
         i = i + 1
       }
       mask
@@ -24239,9 +24358,8 @@ fn pipeline_ir_native_record_field_index_by_hash(tt: i64, type_hash: i64, field_
 fn pipeline_ir_native_emit_record_fields(code: i64, base_reg: i64, fields: IrRecordFieldList, type_hash: i64, index: i64, tt: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
   match fields {
     IrRecordFieldNil -> 0
-    IrRecordFieldCons(field_hash, value, rest) -> {
-      let field_index = pipeline_ir_native_record_field_index_by_hash(tt, type_hash, field_hash)
-      let idx = if field_index >= 0 { field_index } else { index }
+    IrRecordFieldCons(field_hash, word_offset, value, rest) -> {
+      let idx = if word_offset >= 0 { word_offset } else { index }
       let val_phys = pipeline_ir_native_load_reg(code, pinned, value)
       bu32(code, cg_str(val_phys, base_reg, idx * 8))
       pipeline_ir_native_emit_record_fields(code, base_reg, rest, type_hash, index + 1, tt, pinned)
@@ -29840,8 +29958,8 @@ fn pipeline_ir_rewrite_value_list(values: IrValueList, aliases: PipelineIrAliasE
 fn pipeline_ir_rewrite_record_fields(fields: IrRecordFieldList, aliases: PipelineIrAliasEnv) -> IrRecordFieldList {
   match fields {
     IrRecordFieldNil -> IrRecordFieldNil
-    IrRecordFieldCons(field_hash, value, rest) -> {
-      IrRecordFieldCons(field_hash, pipeline_ir_alias_env_lookup_or(aliases, value), pipeline_ir_rewrite_record_fields(rest, aliases))
+    IrRecordFieldCons(field_hash, word_offset, value, rest) -> {
+      IrRecordFieldCons(field_hash, word_offset, pipeline_ir_alias_env_lookup_or(aliases, value), pipeline_ir_rewrite_record_fields(rest, aliases))
     }
   }
 }
@@ -29918,7 +30036,7 @@ fn pipeline_ir_max_value_list(values: IrValueList, current: i64) -> i64 {
 fn pipeline_ir_max_record_fields(fields: IrRecordFieldList, current: i64) -> i64 {
   match fields {
     IrRecordFieldNil -> current
-    IrRecordFieldCons(field_hash, value, rest) -> pipeline_ir_max_record_fields(rest, pipeline_ir_max_i64(current, value))
+    IrRecordFieldCons(field_hash, word_offset, value, rest) -> pipeline_ir_max_record_fields(rest, pipeline_ir_max_i64(current, value))
   }
 }
 
@@ -30117,7 +30235,7 @@ fn pipeline_ir_live_kill_value_list(set: i64, values: IrValueList, count: i64) -
 fn pipeline_ir_live_add_record_fields(set: i64, fields: IrRecordFieldList, count: i64) -> i64 {
   match fields {
     IrRecordFieldNil -> count
-    IrRecordFieldCons(field_hash, value, rest) -> pipeline_ir_live_add_record_fields(set, rest, pipeline_ir_live_add(set, value, count))
+    IrRecordFieldCons(field_hash, word_offset, value, rest) -> pipeline_ir_live_add_record_fields(set, rest, pipeline_ir_live_add(set, value, count))
   }
 }
 
@@ -38311,7 +38429,7 @@ fn pipeline_ir_live_set_add_values(live: PipelineIrLiveSet, values: IrValueList)
 fn pipeline_ir_live_set_add_record_fields(live: PipelineIrLiveSet, fields: IrRecordFieldList) -> PipelineIrLiveSet {
   match fields {
     IrRecordFieldNil -> live
-    IrRecordFieldCons(field_hash, value, rest) -> pipeline_ir_live_set_add_record_fields(pipeline_ir_live_set_add(live, value), rest)
+    IrRecordFieldCons(field_hash, word_offset, value, rest) -> pipeline_ir_live_set_add_record_fields(pipeline_ir_live_set_add(live, value), rest)
   }
 }
 
@@ -41208,7 +41326,7 @@ fn pipeline_mem2reg_mark_values(values: IrValueList, declared: i64, disq: i64, n
 fn pipeline_mem2reg_mark_record_fields(fields: IrRecordFieldList, declared: i64, disq: i64, next_value: i64) -> i64 {
   match fields {
     IrRecordFieldNil -> 0
-    IrRecordFieldCons(field_hash, value, rest) -> {
+    IrRecordFieldCons(field_hash, word_offset, value, rest) -> {
       pipeline_mem2reg_mark_use(value, declared, disq, next_value)
       pipeline_mem2reg_mark_record_fields(rest, declared, disq, next_value)
     }
