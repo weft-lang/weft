@@ -79,7 +79,7 @@ for f in test/linked/*.weft; do
   # Compile test blocks to .o. The test harness emits an object whenever
   # __got_* calls are present.
   compile_exit=0
-  run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" test "$f" > "$tmpobj" 2>/dev/null || compile_exit=$?
+  run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" test --emit "$f" > "$tmpobj" 2>/dev/null || compile_exit=$?
   if [ "$compile_exit" -ne 0 ]; then
     if [ "$compile_exit" -eq 124 ]; then
       echo "  ✗ $name (compilation timed out)"

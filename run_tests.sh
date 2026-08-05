@@ -1,6 +1,6 @@
 #!/bin/bash
 # run_tests.sh — thin test runner for weft test files
-# Compiles each test/*.weft file with `weft test`, runs the binary, reports results.
+# Compiles each test/*.weft file with `weft test --emit`, runs the binary, reports results.
 # Test files are independent (own temp binary, read-only compiler/sources), so
 # they compile and run through a bounded parallel pool (WEFT_TEST_JOBS wide);
 # per-process timeout and RSS guards are unchanged. Result lines stream as
@@ -112,7 +112,7 @@ if [ "${1:-}" = "__worker" ]; then
 
     compile_exit=0
     compile_start=$(now_s)
-    run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" test "$f" > "$tmpbin" 2>/dev/null || compile_exit=$?
+    run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" test --emit "$f" > "$tmpbin" 2>/dev/null || compile_exit=$?
     compile_elapsed=$(($(now_s) - compile_start))
     if [ $compile_exit -ne 0 ]; then
       if [ $compile_exit -eq 124 ]; then

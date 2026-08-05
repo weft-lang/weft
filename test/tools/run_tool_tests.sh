@@ -15,6 +15,10 @@ tmp_src=$(mktemp /tmp/weft_tool_src_XXXXXX)
 tmp_import=$(mktemp /tmp/weft_tool_import_XXXXXX)
 tmp_bin=$(mktemp /tmp/weft_tool_bin_XXXXXX)
 tmp_err=$(mktemp /tmp/weft_tool_err_XXXXXX)
+tmp_out=$(mktemp /tmp/weft_tool_out_XXXXXX)
+tmp_test_fail_one=$(mktemp /tmp/weft_tool_test_fail_one_XXXXXX.weft)
+tmp_test_fail_two=$(mktemp /tmp/weft_tool_test_fail_two_XXXXXX.weft)
+tmp_test_after=$(mktemp /tmp/weft_tool_test_after_XXXXXX.weft)
 tmp_pkg_dir=$(mktemp -d /tmp/weft_tool_pkg_XXXXXX)
 tmp_pkg_cli_dir=$(mktemp -d /tmp/weft_tool_pkg_cli_XXXXXX)
 tmp_pkg_missing_dir=$(mktemp -d /tmp/weft_tool_pkg_missing_XXXXXX)
@@ -22,7 +26,7 @@ tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir"' EXIT
 
 now_s() {
   date +%s
@@ -1065,11 +1069,45 @@ run_binary_guarded "$tmp_bin"
 echo "  ok test_assertion_helpers_pass"
 
 printf 'test "path" { Test.assert_eq(21 + 21, 42) }\n' > "$tmp_src"
-run_weft_compile_guarded "$WEFT" test "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+run_weft_compile_guarded "$WEFT" test --emit "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_path_compiles_strict_source" "$tmp_err" "type error:"
 chmod +x "$tmp_bin"
 run_binary_guarded "$tmp_bin"
 echo "  ok test_path_binary_runs"
+
+run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+if cmp "$tmp_bin" "$tmp_out"; then
+  echo "  ok test_path_emit_matches_stdin"
+else
+  echo "  fail test_path_emit_matches_stdin"
+  exit 1
+fi
+
+set +e
+run_weft_compile_guarded "$WEFT" test "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+test_path_native_exit=$?
+set -e
+assert_equals "test_path_native_exit_zero" "$test_path_native_exit" "0"
+assert_equals "test_path_native_stdout_empty" "$(<"$tmp_out")" ""
+test_path_native_err=$(<"$tmp_err")
+assert_contains "test_path_native_reports_pass" "$test_path_native_err" "  pass: $tmp_src ("
+assert_contains "test_path_native_reports_summary" "$test_path_native_err" "1 passed, 0 failed"
+
+printf 'test "first failure" { Test.assert_eq(1, 2) }\n' > "$tmp_test_fail_one"
+printf 'test "second failure" { Test.assert_true(false) }\n' > "$tmp_test_fail_two"
+printf 'test "runs after failure" { Test.assert_eq(42, 42) }\n' > "$tmp_test_after"
+set +e
+run_weft_compile_guarded "$WEFT" test "$tmp_test_fail_one" "$tmp_test_after" "$tmp_test_fail_two" > "$tmp_out" 2>"$tmp_err"
+test_path_multi_exit=$?
+set -e
+assert_equals "test_path_native_counts_failed_files" "$test_path_multi_exit" "2"
+assert_equals "test_path_native_failure_stdout_empty" "$(<"$tmp_out")" ""
+test_path_multi_err=$(<"$tmp_err")
+assert_contains "test_path_native_preserves_assertion_diagnostic" "$test_path_multi_err" "test assertion failed: assert_eq got=1 want=2"
+assert_contains "test_path_native_reports_first_failure" "$test_path_multi_err" "  FAIL: $tmp_test_fail_one ("
+assert_contains "test_path_native_continues_after_failure" "$test_path_multi_err" "  pass: $tmp_test_after ("
+assert_contains "test_path_native_reports_second_failure" "$test_path_multi_err" "  FAIL: $tmp_test_fail_two ("
+assert_contains "test_path_native_aggregates_summary" "$test_path_multi_err" "1 passed, 2 failed"
 
 printf 'test "raw" { let p = __bump_alloc(8) Test.assert_eq(p, p) }\n' > "$tmp_src"
 test_path_raw_out=$(run_weft_compile_guarded "$WEFT" test "$tmp_src" > "$tmp_bin" 2>"$tmp_err" || true; cat "$tmp_err")
@@ -1162,4 +1200,4 @@ chmod +x "$tmp_bin"
 run_binary_guarded "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 267 passed, 0 failed"
+echo "Tool boundary summary: 279 passed, 0 failed"
