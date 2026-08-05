@@ -128,6 +128,7 @@ check_accepts "arity_happy_paths" "test/checker/arity_happy_paths.weft"
 check_accepts "handler_clause_typing" "test/checker/handler_clause_typing.weft"
 check_accepts "handler_clause_coverage" "test/checker/handler_clause_coverage.weft"
 check_accepts "generic_type_declarations" "test/checker/generic_type_declarations.weft"
+check_accepts "array_slice_types" "test/checker/array_slice_types.weft"
 check_accepts "no_else_nil" "test/checker/no_else_nil.weft"
 check_accepts "compiler_self_check" "compiler/main.weft"
 
