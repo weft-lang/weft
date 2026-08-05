@@ -300,6 +300,8 @@ check_rejects "unknown_intrinsic_call" "test/negative/unknown_intrinsic_call.wef
 check_rejects "unknown_function_in_import" "test/negative/unknown_function_in_import.weft" "type error: unknown function"
 check_rejects "proc_run_requires_effect" "test/negative/proc_run_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "env_arg_requires_effect" "test/negative/env_arg_requires_effect.weft" "type error: effect not available in caller"
+check_rejects "env_var_requires_effect" "test/negative/env_var_requires_effect.weft" "type error: effect not available in caller"
+check_rejects "env_raw_getenv_requires_trusted" "test/negative/env_raw_getenv_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "time_now_nanos_requires_effect" "test/negative/time_now_nanos_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "time_sleep_requires_effect" "test/negative/time_sleep_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "time_raw_clock_requires_trusted" "test/negative/time_raw_clock_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
