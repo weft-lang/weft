@@ -268,6 +268,7 @@ check_rejects "vector_concat_type_mismatch" "test/negative/vector_concat_type_mi
 check_rejects "generic_function_ref_unresolved" "test/negative/generic_function_ref_unresolved.weft" "type error: cannot infer generic function reference"
 check_rejects "map_wrong_key_type" "test/negative/map_wrong_key_type.weft" "type error: argument type mismatch"
 check_rejects "map_wrong_value_type" "test/negative/map_wrong_value_type.weft" "type error: argument type mismatch"
+check_rejects "map_key_requires_hash" "test/negative/map_key_requires_hash.weft" "type error: type does not satisfy trait bound"
 check_rejects "set_wrong_element_type" "test/negative/set_wrong_element_type.weft" "type error: argument type mismatch"
 check_rejects "map_set_handle_confusion" "test/negative/map_set_handle_confusion.weft" "type error: argument type mismatch"
 check_rejects "map_sentinel_lookup_removed" "test/negative/map_sentinel_lookup_removed.weft" "type error: arity mismatch"

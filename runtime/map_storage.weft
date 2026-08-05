@@ -6,9 +6,8 @@ use "runtime/rc.weft"
 use "runtime/unsafe.weft"
 
 -- Map<K, V> is a sealed nominal machine-word handle. The shipped CHAMP
--- payload is still word-keyed/word-valued; stdlib/map.weft currently exposes
--- only Map<i64, i64> while this bridge preserves the generic static identity
--- needed for the eventual ownership-aware payload generalisation.
+-- Payloads occupy one word. The cleanup-kind fact below makes those raw words
+-- ownership-aware without exposing the trusted representation to stdlib code.
 fn map_storage_handle_from_owned_word<K, V>(value: i64) -> Map<K, V> {
   handle unsafe_transmute<i64, Map<K, V>>(value) {
     Unsafe.transmute(raw) -> resume(__transmute(raw))
@@ -43,10 +42,23 @@ fn map_storage_load_owned<T>(value: i64) -> T {
   map_storage_word_as<T>(value)
 }
 
+fn map_storage_retain_word<T>(region: i64, value: i64) -> i64 {
+  rc_persistent_region_retain_kind(region, value, map_storage_cleanup_kind_of<T>())
+}
+
 fn map_storage_retain_stored<T>(region: i64, value: T) -> i64 {
   let word = map_storage_word_from<T>(value)
   rc_persistent_region_retain_kind(region, word, map_storage_cleanup_kind_of<T>())
   word
+}
+
+fn map_storage_collision_content<K, V>(region: i64, key: K, val: V, next: i64) -> i64 {
+  let size = if next == 0 { 16 } else { 24 }
+  let content = rc_persistent_region_alloc(region, size, 8)
+  __mem_store64(content, map_storage_retain_stored<K>(region, key))
+  __mem_store64(content + 8, map_storage_retain_stored<V>(region, val))
+  if next != 0 { __mem_store64(content + 16, next) } else { 0 }
+  content
 }
 
 -- Set<T> shares the Map<T, i64> machine-word representation while keeping a
@@ -117,51 +129,85 @@ fn map_storage_content_len(node: i64) -> i64 {
   __mem_load64(node + map_storage_content_len_offset())
 }
 
-fn map_storage_data_key(node: i64, idx: i64) -> i64 {
+fn map_storage_data_key_word(node: i64, idx: i64) -> i64 {
   __mem_load64(map_storage_content(node) + idx * 16)
 }
 
-fn map_storage_data_val(node: i64, idx: i64) -> i64 {
+fn map_storage_data_key<K>(node: i64, idx: i64) -> K {
+  map_storage_load_owned<K>(map_storage_data_key_word(node, idx))
+}
+
+fn map_storage_data_val_word(node: i64, idx: i64) -> i64 {
   __mem_load64(map_storage_content(node) + idx * 16 + 8)
+}
+
+fn map_storage_data_val<V>(node: i64, idx: i64) -> V {
+  map_storage_load_owned<V>(map_storage_data_val_word(node, idx))
 }
 
 fn map_storage_sub_node(node: i64, data_count: i64, idx: i64) -> i64 {
   __mem_load64(map_storage_content(node) + data_count * 16 + idx * 8)
 }
 
-fn map_storage_content_data_key(content: i64, idx: i64) -> i64 {
+fn map_storage_content_data_key_word(content: i64, idx: i64) -> i64 {
   __mem_load64(content + idx * 16)
 }
 
-fn map_storage_content_data_val(content: i64, idx: i64) -> i64 {
+fn map_storage_content_data_key<K>(content: i64, idx: i64) -> K {
+  map_storage_load_owned<K>(map_storage_content_data_key_word(content, idx))
+}
+
+fn map_storage_content_data_val_word(content: i64, idx: i64) -> i64 {
   __mem_load64(content + idx * 16 + 8)
+}
+
+fn map_storage_content_data_val<V>(content: i64, idx: i64) -> V {
+  map_storage_load_owned<V>(map_storage_content_data_val_word(content, idx))
 }
 
 fn map_storage_content_sub_node(content: i64, data_count: i64, idx: i64) -> i64 {
   __mem_load64(content + data_count * 16 + idx * 8)
 }
 
-fn map_storage_copy_content(region: i64, content: i64, size: i64) -> i64 {
+fn map_storage_retain_content_payloads<K, V>(region: i64, content: i64, data_count: i64) -> i64 {
+  for i in 0..data_count {
+    map_storage_retain_word<K>(region, map_storage_content_data_key_word(content, i))
+    map_storage_retain_word<V>(region, map_storage_content_data_val_word(content, i))
+  }
+  0
+}
+
+fn map_storage_copy_content<K, V>(region: i64, content: i64, data_count: i64, node_count: i64) -> i64 {
+  let size = data_count * 16 + node_count * 8
   let next = rc_persistent_region_alloc(region, size, 8)
   mem_copy(next, content, size)
+  map_storage_retain_content_payloads<K, V>(region, next, data_count)
   next
 }
 
-fn map_storage_copy_content_update_val(region: i64, content: i64, size: i64, idx: i64, val: i64) -> i64 {
-  let next = map_storage_copy_content(region, content, size)
-  __mem_store64(next + idx * 16 + 8, val)
+fn map_storage_copy_content_update_val<K, V>(region: i64, content: i64, data_count: i64, node_count: i64, idx: i64, val: V) -> i64 {
+  let size = data_count * 16 + node_count * 8
+  let next = rc_persistent_region_alloc(region, size, 8)
+  mem_copy(next, content, size)
+  for i in 0..data_count {
+    map_storage_retain_word<K>(region, map_storage_content_data_key_word(next, i))
+    if i != idx {
+      map_storage_retain_word<V>(region, map_storage_content_data_val_word(next, i))
+    } else { 0 }
+  }
+  __mem_store64(next + idx * 16 + 8, map_storage_retain_stored<V>(region, val))
   next
 }
 
-fn map_storage_insert_data_content(region: i64, old_content: i64, dc: i64, nc: i64, idx: i64, key: i64, val: i64) -> i64 {
+fn map_storage_insert_data_content<K, V>(region: i64, old_content: i64, dc: i64, nc: i64, idx: i64, key: K, val: V) -> i64 {
   let new_total = (dc + 1) * 16 + nc * 8
   let next = rc_persistent_region_alloc(region, new_total, 8)
   for i in 0..idx {
     __mem_store64(next + i * 16, __mem_load64(old_content + i * 16))
     __mem_store64(next + i * 16 + 8, __mem_load64(old_content + i * 16 + 8))
   }
-  __mem_store64(next + idx * 16, key)
-  __mem_store64(next + idx * 16 + 8, val)
+  __mem_store64(next + idx * 16, map_storage_retain_stored<K>(region, key))
+  __mem_store64(next + idx * 16 + 8, map_storage_retain_stored<V>(region, val))
   for i in idx..dc {
     __mem_store64(next + (i + 1) * 16, __mem_load64(old_content + i * 16))
     __mem_store64(next + (i + 1) * 16 + 8, __mem_load64(old_content + i * 16 + 8))
@@ -169,27 +215,15 @@ fn map_storage_insert_data_content(region: i64, old_content: i64, dc: i64, nc: i
   for i in 0..nc {
     __mem_store64(next + (dc + 1) * 16 + i * 8, __mem_load64(old_content + dc * 16 + i * 8))
   }
-  next
-}
-
-fn map_storage_migrate_to_node_content(region: i64, old_content: i64, dc: i64, data_idx: i64, node_idx: i64, sub: i64) -> i64 {
-  let new_dc = dc - 1
-  let new_nc = 1
-  let new_total = new_dc * 16 + new_nc * 8
-  let next = rc_persistent_region_alloc(region, new_total, 8)
-  let mut di = 0
   for i in 0..dc {
-    if i != data_idx {
-      __mem_store64(next + di * 16, __mem_load64(old_content + i * 16))
-      __mem_store64(next + di * 16 + 8, __mem_load64(old_content + i * 16 + 8))
-      di = di + 1
-    } else { 0 }
+    let copied = if i < idx { i } else { i + 1 }
+    map_storage_retain_word<K>(region, map_storage_content_data_key_word(next, copied))
+    map_storage_retain_word<V>(region, map_storage_content_data_val_word(next, copied))
   }
-  __mem_store64(next + new_dc * 16 + node_idx * 8, sub)
   next
 }
 
-fn map_storage_migrate_with_nodes_content(region: i64, old_content: i64, dc: i64, new_nc: i64, data_idx: i64, node_idx: i64, sub: i64) -> i64 {
+fn map_storage_migrate_with_nodes_content<K, V>(region: i64, old_content: i64, dc: i64, new_nc: i64, data_idx: i64, node_idx: i64, sub: i64) -> i64 {
   let new_dc = dc - 1
   let next = rc_persistent_region_alloc(region, new_dc * 16 + new_nc * 8, 8)
   let mut di = 0
@@ -209,11 +243,12 @@ fn map_storage_migrate_with_nodes_content(region: i64, old_content: i64, dc: i64
       ni = ni + 1
     }
   }
+  map_storage_retain_content_payloads<K, V>(region, next, new_dc)
   next
 }
 
-fn map_storage_replace_sub_content(region: i64, old_content: i64, total: i64, data_count: i64, idx: i64, new_sub: i64) -> i64 {
-  let next = map_storage_copy_content(region, old_content, total)
+fn map_storage_replace_sub_content<K, V>(region: i64, old_content: i64, data_count: i64, node_count: i64, idx: i64, new_sub: i64) -> i64 {
+  let next = map_storage_copy_content<K, V>(region, old_content, data_count, node_count)
   __mem_store64(next + data_count * 16 + idx * 8, new_sub)
   next
 }
