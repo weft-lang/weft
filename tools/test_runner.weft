@@ -1,45 +1,155 @@
--- tools/test_runner.weft — Native test runner over the Env/Proc capability
--- effects. Usage: ./test_runner ./weft test/basics.weft test/effects.weft ...
+-- tools/test_runner.weft -- native test runner capability showcase
 --
--- This tool is ordinary untrusted code: arguments arrive as str values via
--- the Env effect and processes run through the Proc effect; the trusted
--- platform handlers are installed once at the program boundary in main.
--- A test can mock either capability by installing its own handler.
+-- Usage: ./test_runner ./weft test/basics.weft test/effects.weft ...
+--        ./test_runner ./weft test/
+--
+-- This is ordinary untrusted code. Env supplies arguments, Dir discovers
+-- immediate .weft files, Time supplies monotonic deadlines/timings, and Proc
+-- spawns the compiler with captured output. The trusted platform handlers are
+-- installed once at main; no shell command, raw descriptor, or Unsafe surface
+-- crosses into this file.
 
 use "compiler/lib.weft"
-use "stdlib/string.weft"
+use "runtime/tool_platform.weft"
+use "stdlib/dir.weft"
 use "stdlib/list.weft"
 use "stdlib/process.weft"
+use "stdlib/string.weft"
+use "stdlib/time.weft"
+use "stdlib/vector.weft"
 
--- $$ keeps the compiled binary's path unique per spawn: macOS kills
--- binaries rewritten at a previously-executed path (signature cache).
-fn runner_command(weft: str, file: str) -> str {
-  str_concat(weft, str_concat(" test < ", str_concat(file, " > /tmp/_wtr$$ 2>/dev/null; chmod +x /tmp/_wtr$$; /tmp/_wtr$$; s=$?; rm -f /tmp/_wtr$$; exit $s")))
+fn runner_timeout_nanos() -> i64 { 120000000000 }
+
+fn runner_add_unique(paths: Vector<str>, path: str) -> i64 {
+  if vector_contains<str>(paths, path) == 1 { 0 }
+  else { vector_push<str>(paths, path) }
 }
 
-fn run_test_file(weft: str, file: str) -[Proc]> i64 {
-  Proc.run("/bin/sh", list_cons<str>("-c", list_cons<str>(runner_command(weft, file), list_nil<str>())))
+fn runner_join_path(dir: str, name: str) -> str {
+  if str_ends_with(dir, "/") == 1 { str_concat(dir, name) }
+  else { str_concat(dir, str_concat("/", name)) }
 }
 
-fn run_all_tests() -[Env, Proc]> i64 {
-  let weft = Env.arg(1)
-  let argc = Env.arg_count()
-  let mut pass = 0
-  let mut fail = 0
-  for i in 2..argc {
-    let file = Env.arg(i)
-    let r = run_test_file(weft, file)
-    if r == 0 {
-      eprint("  pass: ")
-      eprint(file)
-      eprint("\n")
-      pass = pass + 1
-    } else {
-      eprint("  FAIL: ")
-      eprint(file)
-      eprint("\n")
-      fail = fail + 1
+fn runner_collect_directory(paths: Vector<str>, dir: str) -[Dir]> i64 {
+  match Dir.list(dir) {
+    Err(error) -> {
+      eprint("test_runner: could not list directory: ")
+      eprint(dir)
+      eprint(" (errno ")
+      eprint_i(error)
+      eprint(")\n")
+      1
     }
+    Ok(entries) -> {
+      vector_sort<str>(entries)
+      let before = vector_len<str>(paths)
+      for i in 0..vector_len<str>(entries) {
+        let name = vector_get_in_bounds<str>(entries, i)
+        if str_ends_with(name, ".weft") == 1 {
+          let path = runner_join_path(dir, name)
+          match Dir.stat(path) {
+            Ok(metadata) -> if metadata.exists and dir_kind_code(metadata.kind) == 1 {
+              runner_add_unique(paths, path)
+            } else { 0 }
+            Err(error) -> 0
+          }
+        } else { 0 }
+      }
+      if vector_len<str>(paths) == before {
+        eprint("test_runner: no .weft files in directory: ")
+        eprint(dir)
+        eprint("\n")
+        1
+      } else { 0 }
+    }
+  }
+}
+
+fn runner_collect_arg(paths: Vector<str>, path: str) -[Dir]> i64 {
+  match Dir.stat(path) {
+    Err(error) -> {
+      eprint("test_runner: could not inspect path: ")
+      eprint(path)
+      eprint(" (errno ")
+      eprint_i(error)
+      eprint(")\n")
+      1
+    }
+    Ok(metadata) -> {
+      if metadata.exists == false {
+        eprint("test_runner: path does not exist: ")
+        eprint(path)
+        eprint("\n")
+        1
+      } else { if dir_kind_code(metadata.kind) == 2 {
+        runner_collect_directory(paths, path)
+      } else {
+        runner_add_unique(paths, path)
+        0
+      } }
+    }
+  }
+}
+
+fn runner_test_args(file: str) -> List<str> {
+  list_cons<str>("test",
+    list_cons<str>("--jobs",
+      list_cons<str>("1",
+        list_cons<str>(file, list_nil<str>()))))
+}
+
+fn runner_elapsed_millis(start: i64, finish: i64) -> i64 {
+  if start < 0 or finish < start { 0 } else { (finish - start) / 1000000 }
+}
+
+fn runner_report(file: str, output: ProcOutput, elapsed_millis: i64) -> i64 {
+  let failed = output.error != 0 or output.timed_out or output.status != 0
+  if failed {
+    if str_len(output.stdout_text) > 0 { eprint(output.stdout_text) } else { 0 }
+    if str_len(output.stderr_text) > 0 { eprint(output.stderr_text) } else { 0 }
+    eprint("  FAIL: ")
+  } else {
+    -- Test programs may intentionally write stdout. Proc captures it so the
+    -- runner must replay it even though normal harness output lives on stderr.
+    if str_len(output.stdout_text) > 0 { eprint(output.stdout_text) } else { 0 }
+    eprint("  pass: ")
+  }
+  eprint(file)
+  eprint(" (")
+  eprint_i(elapsed_millis)
+  eprint(" ms")
+  if output.timed_out { eprint(", timeout") }
+  else { if output.error != 0 {
+    eprint(", error ")
+    eprint_i(output.error)
+  } else { if output.status != 0 {
+    eprint(", exit ")
+    eprint_i(output.status)
+  } else { 0 } } }
+  eprint(")\n")
+  if failed { 1 } else { 0 }
+}
+
+fn run_test_file(weft: str, file: str) -[Proc, Time]> i64 {
+  let start = Time.now_nanos()
+  let deadline = if start < 0 { 0 - 1 } else { start + runner_timeout_nanos() }
+  let output = Proc.wait_until(Proc.spawn(weft, runner_test_args(file)), deadline)
+  runner_report(file, output, runner_elapsed_millis(start, Time.now_nanos()))
+}
+
+fn run_all_tests() -[Dir, Env, Proc, Time]> i64 {
+  let weft = Env.arg(1)
+  let paths = vector_new<str>()
+  let mut discovery_failures = 0
+  for i in 2..Env.arg_count() {
+    discovery_failures = discovery_failures + runner_collect_arg(paths, Env.arg(i))
+  }
+  vector_sort<str>(paths)
+  let mut pass = 0
+  let mut fail = discovery_failures
+  for i in 0..vector_len<str>(paths) {
+    let result = run_test_file(weft, vector_get_in_bounds<str>(paths, i))
+    if result == 0 { pass = pass + 1 } else { fail = fail + 1 }
   }
   eprint("\n")
   eprint_i(pass)
@@ -49,13 +159,13 @@ fn run_all_tests() -[Env, Proc]> i64 {
   fail
 }
 
-fn runner_entry() -[Env, Proc]> i64 {
+fn runner_entry() -[Dir, Env, Proc, Time]> i64 {
   if Env.arg_count() < 3 {
-    eprint("usage: test_runner <weft> <files...>\n")
+    eprint("usage: test_runner <weft> <paths...>\n")
     1
   } else { run_all_tests() }
 }
 
 fn main(argc: i64, argv: i64) -> i64 {
-  runtime_platform_env_proc(argc, argv, () => runner_entry())
+  runtime_platform_tool(argc, argv, runner_entry)
 }
