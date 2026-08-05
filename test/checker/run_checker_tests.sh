@@ -103,6 +103,7 @@ check_accepts "imported_effect_perform_args" "test/checker/imported_effect_perfo
 check_accepts "runtime_syscall_unsafe_wrapper" "runtime/syscall.weft"
 check_accepts "runtime_rc_unsafe_wrapper" "runtime/rc.weft"
 check_accepts "stdlib_process_unsafe_surface" "stdlib/process.weft"
+check_accepts "stdlib_io_typed_drop_receiver" "stdlib/io.weft"
 check_accepts "contextual_lambda_pure" "test/checker/contextual_lambda_pure.weft"
 check_accepts "contextual_lambda_effectful" "test/checker/contextual_lambda_effectful.weft"
 check_accepts "contextual_effect_op_lambda" "test/checker/contextual_effect_op_lambda.weft"
