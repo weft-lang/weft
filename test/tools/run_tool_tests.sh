@@ -16,6 +16,8 @@ tmp_import=$(mktemp /tmp/weft_tool_import_XXXXXX)
 tmp_bin=$(mktemp /tmp/weft_tool_bin_XXXXXX)
 tmp_err=$(mktemp /tmp/weft_tool_err_XXXXXX)
 tmp_out=$(mktemp /tmp/weft_tool_out_XXXXXX)
+tmp_tool_obj=$(mktemp /tmp/weft_tool_runner_obj_XXXXXX)
+tmp_tool_bin=$(mktemp /tmp/weft_tool_runner_bin_XXXXXX)
 tmp_test_fail_one=$(mktemp /tmp/weft_tool_test_fail_one_XXXXXX.weft)
 tmp_test_fail_two=$(mktemp /tmp/weft_tool_test_fail_two_XXXXXX.weft)
 tmp_test_after=$(mktemp /tmp/weft_tool_test_after_XXXXXX.weft)
@@ -27,7 +29,7 @@ tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir"' EXIT
 
 now_s() {
   date +%s
@@ -1155,6 +1157,44 @@ set -e
 assert_equals "test_jobs_rejects_zero" "$test_jobs_exit" "1"
 assert_contains "test_jobs_reports_valid_range" "$(<"$tmp_err")" "test: --jobs must be an integer from 1 to 64"
 
+run_weft_compile_guarded "$WEFT" compile tools/test_runner.weft > "$tmp_tool_obj" 2>"$tmp_err"
+/usr/bin/ld -o "$tmp_tool_bin" "$tmp_tool_obj" -lSystem \
+  -syslibroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
+  -e _main -arch arm64 -platform_version macos 11.0 15.0 2>/dev/null
+codesign -s - "$tmp_tool_bin"
+echo "  ok test_runner_capability_tool_builds"
+
+if grep -Eq '/bin/sh|runner_command|sh -c' tools/test_runner.weft; then
+  echo "  fail test_runner_capability_tool_has_no_shell_pipeline"
+  exit 1
+else
+  echo "  ok test_runner_capability_tool_has_no_shell_pipeline"
+fi
+
+set +e
+run_binary_guarded "$tmp_tool_bin" "$WEFT_ABS" "$tmp_test_dir/a_pass.weft" "$tmp_test_dir/b_pass.weft" > "$tmp_out" 2>"$tmp_err"
+test_tool_explicit_exit=$?
+set -e
+assert_equals "test_runner_capability_tool_explicit_exit_zero" "$test_tool_explicit_exit" "0"
+assert_equals "test_runner_capability_tool_stdout_empty" "$(<"$tmp_out")" ""
+assert_contains "test_runner_capability_tool_explicit_summary" "$(<"$tmp_err")" "2 passed, 0 failed"
+
+set +e
+run_binary_guarded "$tmp_tool_bin" "$WEFT_ABS" "$tmp_test_dir" > "$tmp_out" 2>"$tmp_err"
+test_tool_dir_exit=$?
+set -e
+assert_equals "test_runner_capability_tool_directory_exit_zero" "$test_tool_dir_exit" "0"
+assert_contains "test_runner_capability_tool_directory_summary" "$(<"$tmp_err")" "2 passed, 0 failed"
+
+set +e
+run_binary_guarded "$tmp_tool_bin" "$WEFT_ABS" "$tmp_test_fail_one" > "$tmp_out" 2>"$tmp_err"
+test_tool_failure_exit=$?
+set -e
+assert_equals "test_runner_capability_tool_failure_exit_one" "$test_tool_failure_exit" "1"
+test_tool_failure_err=$(<"$tmp_err")
+assert_contains "test_runner_capability_tool_preserves_diagnostic" "$test_tool_failure_err" "test assertion failed: assert_eq got=1 want=2"
+assert_contains "test_runner_capability_tool_failure_summary" "$test_tool_failure_err" "0 passed, 1 failed"
+
 printf 'test "raw" { let p = __bump_alloc(8) Test.assert_eq(p, p) }\n' > "$tmp_src"
 test_path_raw_out=$(run_weft_compile_guarded "$WEFT" test "$tmp_src" > "$tmp_bin" 2>"$tmp_err" || true; cat "$tmp_err")
 assert_contains "test_path_rejects_root_raw_memory" "$test_path_raw_out" "type error: raw allocation is sealed to trusted runtime/platform code"
@@ -1246,4 +1286,4 @@ chmod +x "$tmp_bin"
 run_binary_guarded "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 293 passed, 0 failed"
+echo "Tool boundary summary: 303 passed, 0 failed"
