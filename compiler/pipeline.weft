@@ -2433,6 +2433,20 @@ fn pipeline_ir_field_load_lane_insts(dst: i64, base: i64, field_hash: i64, word_
   pipeline_ir_field_load_lane_insts_inner(dst, base, field_hash, word_offset, 0, pipeline_type_value_lane_count_or_one(ty))
 }
 
+fn pipeline_ir_variant_payload_lane_insts_inner(dst: i64, base: i64, word_offset: i64, lane: i64, count: i64) -> IrInstList {
+  if lane >= count { ir_inst_list_empty() }
+  else {
+    ir_inst_list_prepend(
+      ir_inst_variant_payload_i64(dst + lane, base, word_offset + lane),
+      pipeline_ir_variant_payload_lane_insts_inner(dst, base, word_offset, lane + 1, count)
+    )
+  }
+}
+
+fn pipeline_ir_variant_payload_lane_insts(dst: i64, base: i64, word_offset: i64, ty: i64) -> IrInstList {
+  pipeline_ir_variant_payload_lane_insts_inner(dst, base, word_offset, 0, pipeline_type_value_lane_count_or_one(ty))
+}
+
 fn pipeline_expr_value_lane_count(expr: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
   pipeline_type_value_lane_count_or_one(pipeline_return_expr_type_node_typed(expr, params, locals, module))
 }
@@ -2817,7 +2831,10 @@ fn pipeline_return_expr_type_node_typed(expr: Expr, params: i64, locals: Pipelin
       let else_ty = pipeline_return_expr_type_node_typed(else_expr, params, locals, module)
       if then_ty != 0 and else_ty != 0 and type_hash_of(then_ty) == type_hash_of(else_ty) { then_ty } else { 0 }
     }
-    Match(scrutinee, arms) -> pipeline_match_arms_result_type_node_typed(arms, params, locals, module)
+    Match(scrutinee, arms) -> {
+      let scrutinee_ty = pipeline_return_expr_type_node_typed(scrutinee, params, locals, module)
+      pipeline_match_arms_result_type_node_with_scrutinee_typed(arms, params, locals, module, scrutinee_ty)
+    }
     _ -> pipeline_expr_type_node_typed(expr)
   }
 }
@@ -2885,7 +2902,25 @@ fn pipeline_match_arm_result_type_node_typed(arm: MatchArm, params: i64, locals:
 
 fn pipeline_match_arm_result_type_node_with_scrutinee_typed(arm: MatchArm, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, scrutinee_ty: i64) -> i64 {
   let direct = pipeline_match_arm_result_type_node_typed(arm, params, locals, module)
-  if direct != 0 { direct }
+  if direct != 0 {
+    match arm {
+      Arm(pattern, body, guard, has_guard) -> match pattern {
+        CtorPattern(tag_ns, tag_nl, bindings) -> {
+          let subst = pipeline_match_variant_instance_subst(
+            pipeline_lower_module_tt(module),
+            pipeline_lower_module_src(module),
+            tag_ns,
+            tag_nl,
+            scrutinee_ty,
+            pipeline_lower_module_subst(module)
+          )
+          if subst == 0 { direct } else { ty_subst(direct, subst) }
+        }
+        _ -> direct
+      }
+      UnknownArm(tag) -> direct
+    }
+  }
   else {
     match arm {
       Arm(pattern, body, guard, has_guard) -> {
@@ -2912,6 +2947,25 @@ fn pipeline_match_arms_result_type_node_typed(arms: MatchArmList, params: i64, l
           MatchArmListNil -> ty
           MatchArmListCons(next_arm, next_rest) -> {
             let rest_ty = pipeline_match_arms_result_type_node_typed(rest, params, locals, module)
+            if rest_ty != 0 and type_hash_of(rest_ty) == type_hash_of(ty) { ty } else { 0 }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_match_arms_result_type_node_with_scrutinee_typed(arms: MatchArmList, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, scrutinee_ty: i64) -> i64 {
+  match arms {
+    MatchArmListNil -> 0
+    MatchArmListCons(arm, rest) -> {
+      let ty = pipeline_match_arm_result_type_node_with_scrutinee_typed(arm, params, locals, module, scrutinee_ty)
+      if ty == 0 { 0 }
+      else {
+        match rest {
+          MatchArmListNil -> ty
+          MatchArmListCons(next_arm, next_rest) -> {
+            let rest_ty = pipeline_match_arms_result_type_node_with_scrutinee_typed(rest, params, locals, module, scrutinee_ty)
             if rest_ty != 0 and type_hash_of(rest_ty) == type_hash_of(ty) { ty } else { 0 }
           }
         }
@@ -4046,19 +4100,33 @@ fn pipeline_match_scrutinee_release_hash(scrutinee: Expr, arms: MatchArmList, pa
 -- Interposes a release block between the match arms and their merge
 -- target: takes the merged result as its param, releases the scrutinee
 -- temp, forwards the result. Mirrors pipeline_managed_arm_retain_append.
-fn pipeline_managed_scrutinee_release_append(arm_blocks: PipelineLoweredBlocks, release_hash: i64, release_block: i64, target_block: i64, scrutinee_value: i64) -> PipelineLoweredBlocks {
+fn pipeline_ir_first_jump_arg_count_to_target(blocks: IrBlockList, target_block: i64, default: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> default
+    IrBlockListCons(block, rest) -> match block {
+      IrBlock(id, params, insts, term) -> match term {
+        IrTermJump(target, args) -> if target == target_block { ir_value_list_len(args) } else { pipeline_ir_first_jump_arg_count_to_target(rest, target_block, default) }
+        _ -> pipeline_ir_first_jump_arg_count_to_target(rest, target_block, default)
+      }
+    }
+  }
+}
+
+fn pipeline_managed_scrutinee_release_append(arm_blocks: PipelineLoweredBlocks, release_hash: i64, release_block: i64, target_block: i64, scrutinee_value: i64, carried_lanes: i64) -> PipelineLoweredBlocks {
   if release_hash == 0 or pipeline_lowered_blocks_is_valid(arm_blocks) == 0 or pipeline_lowered_blocks_falls_through(arm_blocks) == 0 {
     arm_blocks
   } else {
     let carried = pipeline_lowered_blocks_next_value(arm_blocks)
+    let edge_lanes = pipeline_ir_first_jump_arg_count_to_target(pipeline_lowered_blocks_blocks(arm_blocks), release_block, carried_lanes)
     let release_insts = ir_inst_list_prepend(
-      ir_inst_call_i64(carried + 1, release_hash, ir_value_list_prepend(scrutinee_value, ir_value_list_empty())),
+      ir_inst_call_i64(carried + edge_lanes, release_hash, ir_value_list_prepend(scrutinee_value, ir_value_list_empty())),
       ir_inst_list_empty()
     )
-    let block = ir_block_new_params(release_block, ir_value_list_prepend(carried, ir_value_list_empty()), release_insts, ir_term_jump_args(target_block, ir_value_list_prepend(carried, ir_value_list_empty())))
+    let carried_values = pipeline_ir_value_lane_ids(carried, 0, edge_lanes)
+    let block = ir_block_new_params(release_block, carried_values, release_insts, ir_term_jump_args(target_block, carried_values))
     pipeline_lowered_blocks_control(
       pipeline_lowered_blocks_next_block(arm_blocks),
-      carried + 2,
+      carried + edge_lanes + 1,
       ir_block_list_append(pipeline_lowered_blocks_blocks(arm_blocks), ir_block_list_prepend(block, ir_block_list_empty())),
       1,
       1
@@ -4072,6 +4140,8 @@ fn pipeline_lower_match_typed_core_to_target_blocks(scrutinee_typed: Expr, arms:
   let n_arms = match_arm_list_len(arms)
   let normalise_owned = pipeline_expr_owned_rvalue_temp_typed(scrutinee_typed, src, tt)
   let scrutinee_ty = pipeline_return_expr_type_node_typed(scrutinee_typed, params, locals, module)
+  let result_ty = pipeline_match_arms_result_type_node_with_scrutinee_typed(arms, params, locals, module, scrutinee_ty)
+  let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
   let scrutinee_release_hash = pipeline_match_scrutinee_release_hash(scrutinee_typed, arms, params, locals, module)
   if n_arms <= 0 {
     pipeline_lowered_blocks_invalid(start_block, next_value)
@@ -4090,7 +4160,7 @@ fn pipeline_lower_match_typed_core_to_target_blocks(scrutinee_typed: Expr, arms:
           let first_arm = pipeline_lower_internal_block_after_target(first_arm_seed, target_block)
           let ctx = PipelineMatchCtx(arms, n_arms, scrutinee_value, params, locals, module, arms_target, normalise_owned, scrutinee_ty)
           let arm_blocks_raw = pipeline_lower_match_arm_to_blocks(ctx, 0, scrutinee_value + 1, first_arm, first_arm + 1)
-          let arm_blocks = pipeline_managed_scrutinee_release_append(arm_blocks_raw, scrutinee_release_hash, release_block, target_block, scrutinee_value)
+          let arm_blocks = pipeline_managed_scrutinee_release_append(arm_blocks_raw, scrutinee_release_hash, release_block, target_block, scrutinee_value, result_lanes)
           if pipeline_lowered_blocks_is_valid(arm_blocks) == 1 {
             let scrutinee_params = ir_value_list_prepend(scrutinee_value, ir_value_list_empty())
             let scrutinee_merge = ir_block_new_params(scrutinee_merge_block, scrutinee_params, ir_inst_list_empty(), ir_term_jump(first_arm))
@@ -4122,7 +4192,7 @@ fn pipeline_lower_match_typed_core_to_target_blocks(scrutinee_typed: Expr, arms:
         let first_arm = pipeline_lower_internal_block_after_target(first_arm_seed, target_block)
         let ctx = PipelineMatchCtx(arms, n_arms, ir_lowered_expr_value(scrutinee), params, locals, module, arms_target, normalise_owned, scrutinee_ty)
         let arm_blocks_raw = pipeline_lower_match_arm_to_blocks(ctx, 0, ir_lowered_expr_next_value(scrutinee), first_arm, first_arm + 1)
-        let arm_blocks = pipeline_managed_scrutinee_release_append(arm_blocks_raw, scrutinee_release_hash, release_block, target_block, ir_lowered_expr_value(scrutinee))
+        let arm_blocks = pipeline_managed_scrutinee_release_append(arm_blocks_raw, scrutinee_release_hash, release_block, target_block, ir_lowered_expr_value(scrutinee), result_lanes)
         if pipeline_lowered_blocks_is_valid(arm_blocks) == 1 {
           let entry = ir_block_new_term(start_block, ir_lowered_expr_insts(scrutinee), ir_term_jump(first_arm))
           let blocks = ir_block_list_prepend(entry, pipeline_lowered_blocks_blocks(arm_blocks))
@@ -5534,9 +5604,11 @@ fn pipeline_lower_call_typed_to_target_blocks(ns: i64, nl: i64, args_expr: ExprL
           let call_dst = pipeline_lowered_call_blocks_next_value(lowered_args)
           let indirect_callee = if callee_slot >= 0 { next_value } else { callee_value }
           let logical_args = pipeline_lowered_call_blocks_values(lowered_args)
-          let abi_args = if direct_fn != 0 {
+          let abi_args = if variant_payloads != 0 {
+            pipeline_call_abi_args(logical_args, 0, variant_payloads, subst, 0, 0)
+          } else { if direct_fn != 0 {
             pipeline_call_abi_args(logical_args, expected_params, 0, subst, 0, 0)
-          } else { logical_args }
+          } else { logical_args } }
           let call_head = ir_inst_list_prepend(
             pipeline_call_inst_resolved(call_dst, direct, indirect_callee, src, tt, ns, nl, abi_args),
             ir_inst_list_empty()
@@ -5977,9 +6049,11 @@ fn pipeline_lower_generic_call_typed_to_target_blocks(type_args: TypeExprList, i
           } else {
             let call_dst = pipeline_lowered_call_blocks_next_value(lowered_args)
             let logical_args = pipeline_lowered_call_blocks_values(lowered_args)
-            let abi_args = if template_pair != 0 and stable_handle_word == 0 {
+            let abi_args = if variant_payloads != 0 {
+              pipeline_call_abi_args(logical_args, 0, variant_payloads, expected_subst, 0, 0)
+            } else { if template_pair != 0 and stable_handle_word == 0 {
               pipeline_call_abi_args(logical_args, expected_params, 0, expected_subst, 0, 0)
-            } else { logical_args }
+            } else { logical_args } }
             let call_head = ir_inst_list_prepend(
               if stable_handle_word == 1 {
                 pipeline_collection_handle_word_inst(call_dst, logical_args)
@@ -9467,7 +9541,8 @@ fn pipeline_lower_call_to_target_blocks(expr: i64, params: i64, locals: Pipeline
       ir_inst_list_prepend(ir_inst_load_i64(next_value, callee_slot), ir_inst_list_empty())
     } else { ir_inst_list_empty() }
     let base_ctx = pipeline_call_arg_ctx_with_fns(node_f3(expr), arg_count, params, locals, src, tt, call_block, fns)
-    let expected_params = if direct == 1 { pipeline_fns_lookup_params(fns, src, node_f1(expr), node_f2(expr)) } else { 0 }
+    let variant_payloads = if direct == 1 { pipeline_variant_payload_types(tt, src, node_f1(expr), node_f2(expr)) } else { 0 }
+    let expected_params = if variant_payloads == 0 and direct == 1 { pipeline_fns_lookup_params(fns, src, node_f1(expr), node_f2(expr)) } else { 0 }
     let direct_fn = if direct == 1 { pipeline_fns_lookup_pair(fns, src, node_f1(expr), node_f2(expr)) } else { 0 }
     let result_ty = if direct_fn != 0 { pipeline_fns_lookup_ret_type_node(fns, src, node_f1(expr), node_f2(expr), subst) } else { 0 }
     let ctx = pipeline_call_arg_ctx_expected(base_ctx, expected_params, 0)
@@ -9487,9 +9562,11 @@ fn pipeline_lower_call_to_target_blocks(expr: i64, params: i64, locals: Pipeline
         let call_dst = pipeline_lowered_call_blocks_next_value(lowered_args)
         let indirect_callee = if callee_slot >= 0 { next_value } else { callee_value }
         let logical_args = pipeline_lowered_call_blocks_values(lowered_args)
-        let abi_args = if direct_fn != 0 {
+        let abi_args = if variant_payloads != 0 {
+          pipeline_call_abi_args(logical_args, 0, variant_payloads, subst, 0, 0)
+        } else { if direct_fn != 0 {
           pipeline_call_abi_args(logical_args, expected_params, 0, subst, 0, 0)
-        } else { logical_args }
+        } else { logical_args } }
         let call_head = ir_inst_list_prepend(
           pipeline_call_inst_resolved(call_dst, direct, indirect_callee, src, tt, node_f1(expr), node_f2(expr), abi_args),
           ir_inst_list_empty()
@@ -9499,7 +9576,7 @@ fn pipeline_lower_call_to_target_blocks(expr: i64, params: i64, locals: Pipeline
         } else { 0 }
         let result_lanes = if direct_fn != 0 { pipeline_type_value_lane_count_or_one(result_ty) } else { 1 }
         let call_result_lanes = if direct_fn != 0 { pipeline_ir_call_result_lane_insts(call_dst, result_ty) } else { ir_inst_list_empty() }
-        let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(node_f3(expr), arg_count, logical_args, 0, call_dst + result_lanes, borrowed_mask, 0, expected_params, 0, subst, pipeline_lower_module_src(module), pipeline_lower_module_tt(module))
+        let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(node_f3(expr), arg_count, logical_args, 0, call_dst + result_lanes, borrowed_mask, 0, expected_params, variant_payloads, subst, pipeline_lower_module_src(module), pipeline_lower_module_tt(module))
         let call_args = pipeline_ir_value_lane_ids(call_dst, 0, result_lanes)
         let call = ir_block_new_term(call_block, ir_inst_list_append(call_head, ir_inst_list_append(call_result_lanes, pipeline_lowered_args_insts(cleanup))), ir_term_jump_args(target_block, call_args))
         let blocks = ir_block_list_prepend(
@@ -9610,10 +9687,16 @@ fn pipeline_lower_generic_call_to_target_blocks(expr: i64, params: i64, locals: 
     let arg_count = node_f4(call_node)
     let first_arg_block = pipeline_lower_operation_child_start_block(call_block, arg_count)
     let base_ctx = pipeline_call_arg_ctx_with_fns(node_f3(call_node), arg_count, params, locals, src, tt, call_block, pipeline_lower_module_fns(module))
-    let template_pair = pipeline_generic_template_find(pipeline_lower_module_fns(module), src, str_hash(src, node_f1(call_node), node_f2(call_node)))
     let concrete_type_args = if pipeline_lower_module_subst(module) == 0 { node_f1(expr) } else { type_list_subst(node_f1(expr), pipeline_lower_module_subst(module)) }
+    let variant_payloads = pipeline_variant_payload_types(tt, src, node_f1(call_node), node_f2(call_node))
+    let variant_tparams = if variant_payloads == 0 { 0 } else { ttable_variant_tparams(tt, src, node_f1(call_node), node_f2(call_node)) }
+    let template_pair = if variant_payloads == 0 { pipeline_generic_template_find(pipeline_lower_module_fns(module), src, str_hash(src, node_f1(call_node), node_f2(call_node))) } else { 0 }
     let expected_params = if template_pair == 0 { 0 } else { node_f3(pipeline_fn_inner(node_f1(template_pair))) }
-    let expected_subst = if template_pair == 0 { 0 } else { cg_build_subst(fn_tparams(node_f1(template_pair)), concrete_type_args) }
+    let expected_subst = if variant_payloads != 0 {
+      if variant_tparams == 0 { pipeline_lower_module_subst(module) } else { cg_build_subst(variant_tparams, concrete_type_args) }
+    } else {
+      if template_pair == 0 { 0 } else { cg_build_subst(fn_tparams(node_f1(template_pair)), concrete_type_args) }
+    }
     let ctx = pipeline_call_arg_ctx_expected(base_ctx, expected_params, expected_subst)
     let lowered_args = pipeline_lower_call_arg_blocks(ctx, 0, next_value, first_arg_block, ir_value_list_empty())
     if pipeline_lowered_call_blocks_is_valid(lowered_args) == 1 {
@@ -9630,9 +9713,11 @@ fn pipeline_lower_generic_call_to_target_blocks(expr: i64, params: i64, locals: 
       } else {
         let call_dst = pipeline_lowered_call_blocks_next_value(lowered_args)
         let logical_args = pipeline_lowered_call_blocks_values(lowered_args)
-        let abi_args = if template_pair != 0 {
+        let abi_args = if variant_payloads != 0 {
+          pipeline_call_abi_args(logical_args, 0, variant_payloads, expected_subst, 0, 0)
+        } else { if template_pair != 0 {
           pipeline_call_abi_args(logical_args, expected_params, 0, expected_subst, 0, 0)
-        } else { logical_args }
+        } else { logical_args } }
         let call_head = ir_inst_list_prepend(
           pipeline_generic_call_inst(call_dst, src, tt, node_f1(call_node), node_f2(call_node), concrete_type_args, abi_args),
           ir_inst_list_empty()
@@ -14219,9 +14304,11 @@ fn pipeline_lower_call_expr_typed_sidecar_handler_opt(ns: i64, nl: i64, args_exp
         ir_inst_list_prepend(ir_inst_load_i64(next_value, callee_slot), ir_inst_list_empty())
       } else { ir_inst_list_empty() }
       let logical_args = pipeline_lowered_args_values(args)
-      let abi_args = if direct_fn != 0 {
+      let abi_args = if variant_payloads != 0 {
+        pipeline_call_abi_args(logical_args, 0, variant_payloads, subst, 0, 0)
+      } else { if direct_fn != 0 {
         pipeline_call_abi_args(logical_args, expected_params, 0, subst, 0, 0)
-      } else { logical_args }
+      } else { logical_args } }
       let call_head = ir_inst_list_prepend(
         pipeline_call_inst_resolved(dst, direct, indirect_callee, src, tt, ns, nl, abi_args),
         ir_inst_list_empty()
@@ -15812,9 +15899,11 @@ fn pipeline_lower_generic_call_expr_typed_sidecar_handler_opt(type_args: TypeExp
           if pipeline_lowered_args_is_valid(args) == 1 {
             let dst = pipeline_lowered_args_next_value(args)
             let logical_args = pipeline_lowered_args_values(args)
-            let abi_args = if template_pair != 0 and stable_handle_word == 0 {
+            let abi_args = if variant_payloads != 0 {
+              pipeline_call_abi_args(logical_args, 0, variant_payloads, expected_subst, 0, 0)
+            } else { if template_pair != 0 and stable_handle_word == 0 {
               pipeline_call_abi_args(logical_args, expected_params, 0, expected_subst, 0, 0)
-            } else { logical_args }
+            } else { logical_args } }
             let call_head = ir_inst_list_prepend(
               if stable_handle_word == 1 {
                 pipeline_collection_handle_word_inst(dst, logical_args)
@@ -16963,9 +17052,11 @@ fn pipeline_lower_call_node_typed_sidecar_handler_opt(ns: i64, nl: i64, args: i6
         ir_inst_list_prepend(ir_inst_load_i64(next_value, callee_slot), ir_inst_list_empty())
       } else { ir_inst_list_empty() }
       let logical_args = pipeline_lowered_args_values(lowered_args)
-      let abi_args = if direct_fn != 0 {
+      let abi_args = if variant_payloads != 0 {
+        pipeline_call_abi_args(logical_args, 0, variant_payloads, subst, 0, 0)
+      } else { if direct_fn != 0 {
         pipeline_call_abi_args(logical_args, expected_params, 0, subst, 0, 0)
-      } else { logical_args }
+      } else { logical_args } }
       let call_head = ir_inst_list_prepend(
         pipeline_call_inst_resolved(dst, direct, indirect_callee, src, tt, ns, nl, abi_args),
         ir_inst_list_empty()
@@ -17039,9 +17130,11 @@ fn pipeline_lower_generic_call_node_typed_sidecar_handler_opt(type_args: i64, in
       if pipeline_lowered_args_is_valid(lowered_args) == 1 {
         let dst = pipeline_lowered_args_next_value(lowered_args)
         let logical_args = pipeline_lowered_args_values(lowered_args)
-        let abi_args = if template_pair != 0 and stable_handle_word == 0 {
+        let abi_args = if variant_payloads != 0 {
+          pipeline_call_abi_args(logical_args, 0, variant_payloads, expected_subst, 0, 0)
+        } else { if template_pair != 0 and stable_handle_word == 0 {
           pipeline_call_abi_args(logical_args, expected_params, 0, expected_subst, 0, 0)
-        } else { logical_args }
+        } else { logical_args } }
         let call_head = ir_inst_list_prepend(
           if stable_handle_word == 1 {
             pipeline_collection_handle_word_inst(dst, logical_args)
@@ -17055,7 +17148,7 @@ fn pipeline_lower_generic_call_node_typed_sidecar_handler_opt(type_args: i64, in
           ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(dst, result_ty))
         } else { call_head }
         let result_lanes = if template_pair != 0 and stable_handle_word == 0 { pipeline_type_value_lane_count_or_one(result_ty) } else { 1 }
-        let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, logical_args, 0, dst + result_lanes, borrowed_mask, 0, expected_params, 0, expected_subst, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
+        let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, logical_args, 0, dst + result_lanes, borrowed_mask, 0, expected_params, variant_payloads, expected_subst, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
         ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup))))
       } else {
         ir_lowered_expr_invalid(next_value)
@@ -24224,12 +24317,13 @@ fn pipeline_variant_field_mask(tt: i64, tag_hash: i64, subst: i64) -> i64 {
             if payload_types != 0 {
               let np = nlist_len(payload_types)
               let mut i = 0
+              let mut word = 1
               while i < np {
-                let word = i + 1
+                let ty = pipeline_expected_arg_type_node(0, payload_types, i, 0, subst)
                 if word < 16 {
-                  let ty = pipeline_expected_arg_type_node(0, payload_types, i, 0, subst)
                   mask = mask bor (cg_field_mask_kind(ty) bshl (word * 2))
                 } else { 0 }
+                word = word + pipeline_type_value_lane_count_or_one(ty)
                 i = i + 1
               }
             } else { 0 }
