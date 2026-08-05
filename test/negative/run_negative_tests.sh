@@ -301,6 +301,7 @@ check_rejects "unknown_function_in_import" "test/negative/unknown_function_in_im
 check_rejects "proc_run_requires_effect" "test/negative/proc_run_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "proc_spawn_requires_effect" "test/negative/proc_spawn_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "proc_wait_requires_effect" "test/negative/proc_wait_requires_effect.weft" "type error: effect not available in caller"
+check_rejects "proc_wait_until_requires_effect" "test/negative/proc_wait_until_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "proc_release_requires_effect" "test/negative/proc_release_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "proc_handle_used_twice" "test/negative/proc_handle_used_twice.weft" "type error: owned value used more than once"
 check_rejects "proc_handle_drop_requires_effect" "test/negative/proc_handle_drop_requires_effect.weft" "type error: owned Drop effect not available in caller"

@@ -3,6 +3,8 @@
 use "runtime/alloc.weft"
 use "runtime/buffer.weft"
 use "runtime/string.weft"
+use "runtime/syscall.weft"
+use "runtime/time.weft"
 use "runtime/unsafe.weft"
 use "runtime/env.weft"
 use "stdlib/drop.weft"
@@ -19,17 +21,21 @@ type ProcOutput {
   status: i64,
   stdout_text: str,
   stderr_text: str,
-  error: i64
+  error: i64,
+  timed_out: bool
 }
 
 -- Proc capability effect. `run` remains the compact synchronous operation;
 -- spawn/wait is the process-level async surface with captured output. Handles
 -- are owned resources: wait consumes one, while dropping an un-waited handle
 -- routes through release so the child and pipe descriptors cannot leak.
+-- wait_until accepts an absolute Time.now_nanos deadline; callers own timeout
+-- policy while the platform handler owns deadlock-safe draining and cleanup.
 effect Proc {
   fn run(path: str, args: List<str>) -> i64
   fn spawn(path: str, args: List<str>) -> owned ProcHandle
   fn wait(resource: owned ProcHandle) -> ProcOutput
+  fn wait_until(resource: owned ProcHandle, deadline_nanos: i64) -> ProcOutput
   fn release(resource: ProcHandle) -> i64
 }
 
@@ -64,7 +70,10 @@ fn runtime_process_pipe(fds: i64) -[Unsafe]> i64 {
 }
 
 fn runtime_process_fcntl(fd: i64, command: i64, value: i64) -[Unsafe]> i64 {
-  __got_fcntl(fd, command, value, 0, 0, 0)
+  -- Darwin arm64 passes variadic arguments on the stack, so the generic GOT
+  -- bridge cannot call fcntl's third argument correctly. The BSD syscall ABI
+  -- is fixed-arity and preserves the same sealed platform boundary.
+  sys_raw(92, fd, command, value, 0, 0, 0)
 }
 
 fn runtime_process_actions_init(actions: i64) -[Unsafe]> i64 {
@@ -165,10 +174,15 @@ fn runtime_proc_close_if_open(fd: i64) -[Unsafe]> i64 {
 
 fn runtime_proc_set_nonblocking(fd: i64) -[Unsafe]> i64 {
   let flags = runtime_process_fcntl(fd, 3, 0)
-  if flags < 0 { runtime_process_errno() }
+  if flags < 0 { 0 - flags }
   else {
     let status = runtime_process_fcntl(fd, 4, flags bor 4)
-    if status < 0 { runtime_process_errno() } else { 0 }
+    if status < 0 { 0 - status }
+    else {
+      let updated = runtime_process_fcntl(fd, 3, 0)
+      if updated < 0 { 0 - updated }
+      else { if (updated band 4) == 0 { 5 } else { 0 } }
+    }
   }
 }
 
@@ -280,9 +294,38 @@ fn runtime_proc_decode_wait_status(status_ptr: i64) -[Unsafe]> i64 {
   if signal == 0 { (raw bshr 8) band 255 } else { 128 + signal }
 }
 
-fn runtime_proc_wait(resource: ProcHandle) -[Unsafe]> ProcOutput {
+fn runtime_proc_wait_blocking(pid: i64, status_ptr: i64) -[Unsafe]> i64 {
+  let mut done = 0
+  let mut result = 0
+  while done == 0 {
+    let waited = runtime_waitpid(pid, status_ptr, 0)
+    if waited < 0 {
+      let error = runtime_process_errno()
+      if error == 4 { 0 }
+      else {
+        result = 0 - error
+        done = 1
+      }
+    } else {
+      result = waited
+      done = 1
+    }
+  }
+  result
+}
+
+-- A negative deadline waits without a timeout. Non-negative deadlines are
+-- absolute values from Time.now_nanos, so timeout policy stays with the caller
+-- and already-running children do not receive a fresh budget at wait time.
+fn runtime_proc_wait_until(resource: ProcHandle, deadline_nanos: i64) -[Unsafe]> ProcOutput {
   if resource.spawn_error != 0 {
-    ProcOutput { status: 0 - 1, stdout_text: "", stderr_text: "", error: resource.spawn_error }
+    ProcOutput {
+      status: 0 - 1,
+      stdout_text: "",
+      stderr_text: "",
+      error: resource.spawn_error,
+      timed_out: false
+    }
   } else {
     let mark = alloc_bump_mark()
     let scratch = alloc_bump(4096)
@@ -299,6 +342,7 @@ fn runtime_proc_wait(resource: ProcHandle) -[Unsafe]> ProcOutput {
     let mut wait_error = 0
     let mut status = 0 - 1
     let mut child_done = 0
+    let mut timed_out = false
 
     while child_done == 0 {
       if stdout_eof == 0 {
@@ -317,10 +361,28 @@ fn runtime_proc_wait(resource: ProcHandle) -[Unsafe]> ProcOutput {
         status = runtime_proc_decode_wait_status(status_ptr)
         child_done = 1
       } else { if waited < 0 {
-        wait_error = runtime_process_errno()
-        child_done = 1
+        let error = runtime_process_errno()
+        if error == 4 { runtime_process_nanosleep(pause_request) }
+        else {
+          wait_error = error
+          child_done = 1
+        }
       } else {
-        runtime_process_nanosleep(pause_request)
+        let now = if deadline_nanos < 0 { 0 } else { runtime_time_now_nanos() }
+        if deadline_nanos >= 0 and (now < 0 or now >= deadline_nanos) {
+          runtime_process_kill(resource.pid, 9)
+          let reaped = runtime_proc_wait_blocking(resource.pid, status_ptr)
+          if reaped == resource.pid {
+            status = runtime_proc_decode_wait_status(status_ptr)
+            timed_out = if now < 0 { false } else { true }
+            if now < 0 { wait_error = 5 } else { 0 }
+          } else {
+            wait_error = 0 - reaped
+          }
+          child_done = 1
+        } else {
+          runtime_process_nanosleep(pause_request)
+        }
       } }
     }
 
@@ -339,8 +401,18 @@ fn runtime_proc_wait(resource: ProcHandle) -[Unsafe]> ProcOutput {
     let stderr_text = runtime_str_from_bytes(buf_ptr(stderr_buf), buf_len(stderr_buf))
     let error = if wait_error != 0 { wait_error } else { capture_error }
     alloc_bump_restore_same_segment(mark)
-    ProcOutput { status: status, stdout_text: stdout_text, stderr_text: stderr_text, error: error }
+    ProcOutput {
+      status: status,
+      stdout_text: stdout_text,
+      stderr_text: stderr_text,
+      error: error,
+      timed_out: timed_out
+    }
   }
+}
+
+fn runtime_proc_wait(resource: ProcHandle) -[Unsafe]> ProcOutput {
+  runtime_proc_wait_until(resource, 0 - 1)
 }
 
 fn runtime_proc_release(resource: ProcHandle) -[Unsafe]> i64 {
@@ -351,9 +423,9 @@ fn runtime_proc_release(resource: ProcHandle) -[Unsafe]> i64 {
     let mark = alloc_bump_mark()
     let status_ptr = alloc_bump(8)
     __mem_store64(status_ptr, 0)
-    let waited = runtime_waitpid(resource.pid, status_ptr, 0)
+    let waited = runtime_proc_wait_blocking(resource.pid, status_ptr)
     alloc_bump_restore_same_segment(mark)
-    if waited < 0 { runtime_process_errno() } else { 0 }
+    if waited < 0 { 0 - waited } else { 0 }
   } else { resource.spawn_error }
 }
 
@@ -363,6 +435,10 @@ fn proc_spawn(path: str, args: List<str>) -[Proc]> owned ProcHandle {
 
 fn proc_wait(resource: owned ProcHandle) -[Proc]> ProcOutput {
   Proc.wait(resource)
+}
+
+fn proc_wait_until(resource: owned ProcHandle, deadline_nanos: i64) -[Proc]> ProcOutput {
+  Proc.wait_until(resource, deadline_nanos)
 }
 
 fn proc_handle_pid(resource: ProcHandle) -> i64 {
@@ -391,6 +467,7 @@ fn runtime_proc_handle(body: () -[Proc]> i64) -[Unsafe]> i64 {
     Proc.run(path, args) -> resume(runtime_proc_run(path, args))
     Proc.spawn(path, args) -> resume(runtime_proc_spawn(path, args))
     Proc.wait(resource) -> resume(runtime_proc_wait(resource))
+    Proc.wait_until(resource, deadline_nanos) -> resume(runtime_proc_wait_until(resource, deadline_nanos))
     Proc.release(resource) -> resume(runtime_proc_release(resource))
   }
 }
@@ -408,6 +485,7 @@ fn runtime_proc_inner_with_env(body: () -[Env, Proc]> i64) -[Env, Unsafe]> i64 {
     Proc.run(path, args) -> resume(runtime_proc_run(path, args))
     Proc.spawn(path, args) -> resume(runtime_proc_spawn(path, args))
     Proc.wait(resource) -> resume(runtime_proc_wait(resource))
+    Proc.wait_until(resource, deadline_nanos) -> resume(runtime_proc_wait_until(resource, deadline_nanos))
     Proc.release(resource) -> resume(runtime_proc_release(resource))
   }
 }
