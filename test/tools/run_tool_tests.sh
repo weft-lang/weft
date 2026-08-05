@@ -19,6 +19,7 @@ tmp_out=$(mktemp /tmp/weft_tool_out_XXXXXX)
 tmp_test_fail_one=$(mktemp /tmp/weft_tool_test_fail_one_XXXXXX.weft)
 tmp_test_fail_two=$(mktemp /tmp/weft_tool_test_fail_two_XXXXXX.weft)
 tmp_test_after=$(mktemp /tmp/weft_tool_test_after_XXXXXX.weft)
+tmp_test_dir=$(mktemp -d /tmp/weft_tool_test_dir_XXXXXX)
 tmp_pkg_dir=$(mktemp -d /tmp/weft_tool_pkg_XXXXXX)
 tmp_pkg_cli_dir=$(mktemp -d /tmp/weft_tool_pkg_cli_XXXXXX)
 tmp_pkg_missing_dir=$(mktemp -d /tmp/weft_tool_pkg_missing_XXXXXX)
@@ -26,7 +27,7 @@ tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir"' EXIT
 
 now_s() {
   date +%s
@@ -1109,6 +1110,51 @@ assert_contains "test_path_native_continues_after_failure" "$test_path_multi_err
 assert_contains "test_path_native_reports_second_failure" "$test_path_multi_err" "  FAIL: $tmp_test_fail_two ("
 assert_contains "test_path_native_aggregates_summary" "$test_path_multi_err" "1 passed, 2 failed"
 
+printf 'test "directory a" { Test.assert_eq(1, 1) }\n' > "$tmp_test_dir/a_pass.weft"
+printf 'test "directory b" { Test.assert_eq(2, 2) }\n' > "$tmp_test_dir/b_pass.weft"
+printf 'not a test source\n' > "$tmp_test_dir/ignored.txt"
+set +e
+run_weft_compile_guarded "$WEFT" test --jobs 2 "$tmp_test_dir" > "$tmp_out" 2>"$tmp_err"
+test_dir_exit=$?
+set -e
+assert_equals "test_directory_native_exit_zero" "$test_dir_exit" "0"
+assert_equals "test_directory_native_stdout_empty" "$(<"$tmp_out")" ""
+test_dir_err=$(<"$tmp_err")
+assert_contains "test_directory_discovers_a" "$test_dir_err" "  pass: $tmp_test_dir/a_pass.weft ("
+assert_contains "test_directory_discovers_b" "$test_dir_err" "  pass: $tmp_test_dir/b_pass.weft ("
+assert_contains "test_directory_reports_summary" "$test_dir_err" "2 passed, 0 failed"
+assert_not_contains "test_directory_ignores_non_weft" "$test_dir_err" "ignored.txt"
+
+test_glob="$tmp_test_dir/?_pass.weft"
+set +e
+run_weft_compile_guarded "$WEFT" test --jobs 2 "$test_glob" > "$tmp_out" 2>"$tmp_err"
+test_glob_exit=$?
+set -e
+assert_equals "test_glob_native_exit_zero" "$test_glob_exit" "0"
+assert_contains "test_glob_discovers_matches" "$(<"$tmp_err")" "2 passed, 0 failed"
+
+set +e
+run_weft_compile_guarded "$WEFT" test --jobs 2 "$tmp_test_dir/a_pass.weft" "$tmp_test_dir" > "$tmp_out" 2>"$tmp_err"
+test_overlap_exit=$?
+set -e
+assert_equals "test_directory_overlap_exit_zero" "$test_overlap_exit" "0"
+assert_contains "test_directory_overlap_deduplicates" "$(<"$tmp_err")" "2 passed, 0 failed"
+
+test_no_match="$tmp_test_dir/nope*.weft"
+set +e
+run_weft_compile_guarded "$WEFT" test "$test_no_match" > "$tmp_out" 2>"$tmp_err"
+test_no_match_exit=$?
+set -e
+assert_equals "test_glob_no_match_exits_one" "$test_no_match_exit" "1"
+assert_contains "test_glob_no_match_reports_pattern" "$(<"$tmp_err")" "test: no test files matched: $test_no_match"
+
+set +e
+run_weft_compile_guarded "$WEFT" test --jobs 0 "$tmp_test_dir/a_pass.weft" > "$tmp_out" 2>"$tmp_err"
+test_jobs_exit=$?
+set -e
+assert_equals "test_jobs_rejects_zero" "$test_jobs_exit" "1"
+assert_contains "test_jobs_reports_valid_range" "$(<"$tmp_err")" "test: --jobs must be an integer from 1 to 64"
+
 printf 'test "raw" { let p = __bump_alloc(8) Test.assert_eq(p, p) }\n' > "$tmp_src"
 test_path_raw_out=$(run_weft_compile_guarded "$WEFT" test "$tmp_src" > "$tmp_bin" 2>"$tmp_err" || true; cat "$tmp_err")
 assert_contains "test_path_rejects_root_raw_memory" "$test_path_raw_out" "type error: raw allocation is sealed to trusted runtime/platform code"
@@ -1200,4 +1246,4 @@ chmod +x "$tmp_bin"
 run_binary_guarded "$tmp_bin"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 279 passed, 0 failed"
+echo "Tool boundary summary: 293 passed, 0 failed"
