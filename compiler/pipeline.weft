@@ -8037,23 +8037,44 @@ fn pipeline_lower_handler_clause_body_typed(clause: HandlerClause, fn_params: i6
       let result_ty = if abortive == 1 {
         if abort_result_ty == 0 { handle_result_ty } else { abort_result_ty }
       } else { if has_continuation == 1 { handle_result_ty } else { resume_ty } }
+      let typed_params = if expected_params == 0 { param_nodes } else { expected_params }
+      let returned_param_index = pipeline_expr_exact_result_param_index_typed(body, param_nodes, src)
+      let returned_param_ty = if returned_param_index >= 0 and returned_param_index < nlist_len(typed_params) {
+        node_f3(nlist_get(typed_params, returned_param_index))
+      } else { 0 }
+      -- Operation parameters arrive with an owned transport stake. When
+      -- every result path returns one parameter unchanged, transfer that
+      -- existing stake directly instead of retaining at the merge and then
+      -- releasing the same parameter. Mixed results keep ordinary arm
+      -- normalisation.
+      let returned_param_mask = if returned_param_index >= 0 and cg_managed_drop_kind_for_ty(returned_param_ty) != continuation_cleanup_kind_none() {
+        cg_bit(returned_param_index)
+      } else { 0 }
       let body_locals = pipeline_handler_clause_locals_with_continuation(base_locals, continuation, continuation_closure_value, resume_ty, result_ty)
       let lower_ctx = pipeline_handler_lower_ctx_from_module(0, body_locals, body_module)
-      let lowered = pipeline_lower_expr_typed_hclause_blocks(body, first_value, lower_ctx, result_ty)
+      let lowered = pipeline_lower_expr_typed_hclause_blocks(body, first_value, lower_ctx, result_ty, if returned_param_mask != 0 { 1 } else { 0 })
       if pipeline_lowered_blocks_is_valid(lowered) == 0 {
         IrHandlerClauseBodyInvalid(4)
       } else {
-        let typed_params = if expected_params == 0 { param_nodes } else { expected_params }
+        -- Abortive clauses never return to the perform site. J3 walks the
+        -- abandoned frame and consumes every managed transport acquisition,
+        -- so releasing those parameters inside the clause would consume the
+        -- same stakes twice. Non-abortive clauses still release locally;
+        -- an exactly returned parameter transfers its stake instead.
+        let param_release_mask = if abortive == 1 { cg_params_managed_mask(typed_params) } else { returned_param_mask }
         let param_drops = pipeline_managed_param_release_insts_at_with_borrow_mask(
           typed_params,
           0,
           nlist_len(typed_params),
           param_lanes + capture_lanes,
           pipeline_lowered_blocks_next_value(lowered),
-          0
+          param_release_mask
         )
         let dropped_blocks = pipeline_ir_block_list_append_return_drops(pipeline_lowered_blocks_blocks(lowered), param_drops)
-        IrHandlerClauseBody(op_hash, param_lanes, captures, has_continuation, abortive, pipeline_type_value_lane_count_or_one(resume_ty), pipeline_type_value_lane_count_or_one(result_ty), first_value, dropped_blocks)
+        let transferred_param_value_fact = if returned_param_mask != 0 {
+          param_lanes + capture_lanes + pipeline_param_value_index_at(typed_params, returned_param_index) + 1
+        } else { 0 }
+        IrHandlerClauseBody(op_hash, param_lanes, captures, has_continuation, abortive, cg_managed_drop_kind_for_ty(result_ty), transferred_param_value_fact, pipeline_type_value_lane_count_or_one(resume_ty), pipeline_type_value_lane_count_or_one(result_ty), first_value, dropped_blocks)
       }
     }
     UnknownHandlerClause(tag) -> IrHandlerClauseBodyInvalid(5)
@@ -8067,11 +8088,11 @@ fn pipeline_lower_handler_clauses_typed(clauses: HandlerClauseList, fn_params: i
       let body = pipeline_lower_handler_clause_body_typed(clause, fn_params, outer_locals, module, handle_result_ty)
       let lowered_rest = pipeline_lower_handler_clauses_typed(rest, fn_params, outer_locals, module, handle_result_ty)
       let body_valid = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> 1
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> 1
         IrHandlerClauseBodyInvalid(reason) -> 0
       }
       let body_safe = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> if nlist_len(captures) == 0 { 1 } else { 0 }
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> if nlist_len(captures) == 0 { 1 } else { 0 }
         IrHandlerClauseBodyInvalid(reason) -> 0
       }
       PipelineLoweredHandlerClauses(
@@ -8107,7 +8128,7 @@ fn pipeline_lower_deferred_handler_body_typed(body: Expr, clauses: HandlerClause
   let lower_ctx = pipeline_handler_lower_ctx_from_module(0, body_locals, body_module)
   let result_ty = pipeline_return_expr_type_node_typed(body, fn_params, outer_locals, module)
   let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
-  let lowered = pipeline_lower_expr_typed_hclause_blocks(body, first_value, lower_ctx, result_ty)
+  let lowered = pipeline_lower_expr_typed_hclause_blocks(body, first_value, lower_ctx, result_ty, 0)
   if pipeline_lowered_blocks_is_valid(lowered) == 0 {
     IrDeferredHandlerBodyInvalid(1)
   } else {
@@ -16011,6 +16032,36 @@ fn pipeline_expr_final_returns_binding_typed(expr: Expr, src: i64, ns: i64, nl: 
   }
 }
 
+fn pipeline_expr_exact_result_param_index_typed(expr: Expr, params: i64, src: i64) -> i64 {
+  match expr {
+    Ident(ns, nl) -> pipeline_param_index(params, src, ns, nl)
+    Resume(value) -> pipeline_expr_exact_result_param_index_typed(value, params, src)
+    Block(first, rest) -> pipeline_expr_exact_result_param_index_typed(rest, params, src)
+    Let(ns, nl, value, body) -> {
+      let index = pipeline_expr_exact_result_param_index_typed(body, params, src)
+      if index >= 0 {
+        let param = nlist_get(params, index)
+        if pipeline_name_matches(src, node_f1(param), node_f2(param), ns, nl) == 1 { 0 - 1 } else { index }
+      } else { 0 - 1 }
+    }
+    LetMut(ns, nl, value, body) -> {
+      let index = pipeline_expr_exact_result_param_index_typed(body, params, src)
+      if index >= 0 {
+        let param = nlist_get(params, index)
+        if pipeline_name_matches(src, node_f1(param), node_f2(param), ns, nl) == 1 { 0 - 1 } else { index }
+      } else { 0 - 1 }
+    }
+    LetTyped(inner, ann_type) -> pipeline_expr_exact_result_param_index_typed(inner, params, src)
+    If(cond, then_expr, else_expr) -> {
+      let left = pipeline_expr_exact_result_param_index_typed(then_expr, params, src)
+      let right = pipeline_expr_exact_result_param_index_typed(else_expr, params, src)
+      if left >= 0 and left == right { left } else { 0 - 1 }
+    }
+    Defer(cleanup, body) -> pipeline_expr_exact_result_param_index_typed(body, params, src)
+    _ -> 0 - 1
+  }
+}
+
 fn pipeline_match_arms_final_return_binding_typed(arms: MatchArmList, src: i64, ns: i64, nl: i64) -> i64 {
   match arms {
     MatchArmListNil -> 0
@@ -17057,7 +17108,7 @@ fn pipeline_lower_if_expr_typed_hclause_blocks(cond_expr: Expr, then_expr: Expr,
   }
 }
 
-fn pipeline_lower_expr_typed_hclause_blocks(body_expr: Expr, next_value: i64, lower_ctx: PipelineHandlerLowerCtx, return_ty: i64) -> PipelineLoweredBlocks {
+fn pipeline_lower_expr_typed_hclause_blocks(body_expr: Expr, next_value: i64, lower_ctx: PipelineHandlerLowerCtx, return_ty: i64, transfers_owned_param: i64) -> PipelineLoweredBlocks {
   let locals = pipeline_handler_lower_ctx_locals(lower_ctx)
   let module = pipeline_handler_lower_ctx_module(lower_ctx)
   let return_block = 1
@@ -17067,15 +17118,19 @@ fn pipeline_lower_expr_typed_hclause_blocks(body_expr: Expr, next_value: i64, lo
       let return_value = pipeline_lowered_blocks_next_value(lowered)
       let return_lanes = pipeline_type_value_lane_count_or_one(return_ty)
       let return_params = pipeline_ir_value_lane_ids(return_value, 0, return_lanes)
-      let transfer = pipeline_lower_return_transfer_typed_with_ty(
-        body_expr,
-        return_value,
-        return_value + return_lanes,
-        pipeline_handler_lower_ctx_params(lower_ctx),
-        locals,
-        module,
-        return_ty
-      )
+      let transfer = if transfers_owned_param == 1 {
+        ir_lowered_expr(return_value, return_value + return_lanes, ir_inst_list_empty())
+      } else {
+        pipeline_lower_return_transfer_typed_with_ty(
+          body_expr,
+          return_value,
+          return_value + return_lanes,
+          pipeline_handler_lower_ctx_params(lower_ctx),
+          locals,
+          module,
+          return_ty
+        )
+      }
       let return_insts = ir_inst_list_append(ir_lowered_expr_insts(transfer), pipeline_ir_return_lane_insts(ir_lowered_expr_value(transfer), return_ty))
       let return_node = ir_block_new_params(return_block, return_params, return_insts, ir_term_return(ir_lowered_expr_value(transfer)))
       let blocks = ir_block_list_append(
@@ -22635,19 +22690,56 @@ fn pipeline_ir_native_deferred_cleanup_stack_count(fm: i64) -> i64 {
   count
 }
 
+fn pipeline_ir_native_emit_deferred_capture_owner_load(code: i64, owner_reg: i64, prompt_reg: i64) -> i64 {
+  emit_mov_imm(code, owner_reg, 0)
+  bu32(code, cg_ldr(prompt_reg, 28, runtime_state_deferred_prompt_offset()))
+  let no_prompt_pos = buf_len(code)
+  bu32(code, 0)
+  bu32(code, cg_ldr(owner_reg, prompt_reg, fiber_prompt_capture_owner_offset()))
+  cg_patch_cbz(code, no_prompt_pos, prompt_reg, buf_len(code))
+  owner_reg
+}
+
+fn pipeline_ir_native_emit_deferred_capture_owner_cleanup_entry(code: i64, desc_reg: i64, segment_reg: i64, index: i64, owner_reg: i64) -> i64 {
+  bu32(code, cg_str(owner_reg, segment_reg, index * 8))
+  emit_mov_imm(code, 9, continuation_cleanup_kind_closure_drop_only())
+  bu32(code, cg_str(9, desc_reg, continuation_cleanup_desc_header_size() + index * continuation_cleanup_entry_size() + continuation_cleanup_entry_kind_offset()))
+  emit_mov_imm(code, 9, index * 8)
+  bu32(code, cg_str(9, desc_reg, continuation_cleanup_desc_header_size() + index * continuation_cleanup_entry_size() + continuation_cleanup_entry_slot_offset()))
+  emit_mov_imm(code, 9, 1)
+  bu32(code, cg_str(9, desc_reg, continuation_cleanup_desc_header_size() + index * continuation_cleanup_entry_size() + continuation_cleanup_entry_live_offset()))
+  0
+}
+
 fn pipeline_ir_native_emit_deferred_packet_cleanup(code: i64, packet_phys: i64, fm: i64) -> i64 {
   let stack = cg_cleanup_stack(fm)
   let n = nlist_len(stack)
   let count = pipeline_ir_native_deferred_cleanup_stack_count(fm)
   if count <= 0 {
+    pipeline_ir_native_emit_deferred_capture_owner_load(code, 14, 13)
+    let no_cleanup_pos = buf_len(code)
+    bu32(code, 0)
+    cg_bump_alloc_imm(code, 10, continuation_cleanup_desc_size(1))
+    emit_mov_imm(code, 9, 1)
+    bu32(code, cg_str(9, 10, 0))
+    cg_bump_alloc_imm(code, 12, 8)
+    pipeline_ir_native_emit_deferred_capture_owner_load(code, 14, 13)
+    pipeline_ir_native_emit_deferred_capture_owner_cleanup_entry(code, 10, 12, 0, 14)
+    bu32(code, cg_str(10, packet_phys, 16))
+    bu32(code, cg_str(12, packet_phys, 24))
+    let cleanup_done_pos = buf_len(code)
+    bu32(code, 0)
+    let no_cleanup = buf_len(code)
+    cg_patch_cbz(code, no_cleanup_pos, 14, no_cleanup)
     emit_mov_imm(code, 9, 0)
     bu32(code, cg_str(9, packet_phys, 16))
     bu32(code, cg_str(9, packet_phys, 24))
+    cg_patch_b(code, cleanup_done_pos, buf_len(code))
   } else {
-    cg_bump_alloc_imm(code, 10, continuation_cleanup_desc_size(count))
-    emit_mov_imm(code, 9, count)
+    cg_bump_alloc_imm(code, 10, continuation_cleanup_desc_size(count + 1))
+    emit_mov_imm(code, 9, count + 1)
     bu32(code, cg_str(9, 10, 0))
-    cg_bump_alloc_imm(code, 12, count * 8)
+    cg_bump_alloc_imm(code, 12, (count + 1) * 8)
     let mut out = 0
     let mut i = 0
     while i < n {
@@ -22667,6 +22759,8 @@ fn pipeline_ir_native_emit_deferred_packet_cleanup(code: i64, packet_phys: i64, 
       } else { 0 }
       i = i + 1
     }
+    pipeline_ir_native_emit_deferred_capture_owner_load(code, 14, 13)
+    pipeline_ir_native_emit_deferred_capture_owner_cleanup_entry(code, 10, 12, out, 14)
     bu32(code, cg_str(10, packet_phys, 16))
     bu32(code, cg_str(12, packet_phys, 24))
   }
@@ -23208,7 +23302,7 @@ fn pipeline_ir_native_emit_hclause_continuation_lowered(code: i64, fm: i64, npar
 fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBody, code: i64, src: i64, fm: i64, active_handlers: PipelineNativeHandlerCtx, fns: i64) -> i64 {
   match body {
     IrHandlerClauseBodyInvalid(reason) -> pipeline_ir_native_emit_hclause_body_trap(code, fm)
-    IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> {
+    IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> {
       let nfree = pipeline_capture_value_lane_count(captures)
       let skip_pos = buf_len(code)
       bu32(code, 0)
@@ -23221,6 +23315,11 @@ fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBody, code: i64,
       let old_abort_cleanup_boundary = fmap_current_abort_cleanup_boundary(fm)
       let old_abort_cleanup_block = fmap_current_abort_cleanup_block(fm)
       let old_array_storage_facts = fmap_current_array_storage_facts(fm)
+      let old_cleanup_depth = nlist_len(cg_cleanup_stack(fm))
+      -- A handler clause is an out-of-line synthetic function. SSA ids in
+      -- its parameter/capture ABI start again at zero and must not alias
+      -- cleanup entries owned by the function whose handle emitted it.
+      cg_cleanup_restore(fm, 0)
       let f64_facts = pipeline_ir_native_f64_facts_assign_slot_homes(blocks, pipeline_ir_native_f64_facts_for_blocks(blocks))
       let vector_data_facts = pipeline_ir_native_vector_data_facts_assign_home(pipeline_ir_native_vector_data_facts_for_blocks(blocks))
       let f64_slot_count = pipeline_ir_native_f64_slot_home_count(f64_facts)
@@ -23273,6 +23372,18 @@ fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBody, code: i64,
       let labels = pipeline_ir_native_label_map_add(pipeline_ir_native_cfg_state_labels(state), pipeline_ir_native_epilogue_label(), buf_len(code))
       pipeline_ir_native_patch_all(code, labels, pipeline_ir_native_cfg_state_patches(state))
       pipeline_ir_native_patch_abort_adrs(code, labels, abort_adr_patches)
+      if is_abortive == 1 and result_cleanup_kind != continuation_cleanup_kind_none() {
+        -- x0 is the actual clause-result head. The abort walk consumes every
+        -- tracked stake acquired after the handle boundary, including the
+        -- result's original transport/retain/allocation stake. Create one
+        -- untracked ABI-edge stake here, then restore the result pointer;
+        -- native epilogue calls are deliberately outside the clause IR fact
+        -- set, so the walk cannot consume this crossing stake as well.
+        pipeline_ir_native_store_reg(code, pinned, return_save, 0)
+        cg_emit_managed_retain_kind_regid(code, fm, result_cleanup_kind, pipeline_ir_native_identity_home(return_save))
+        let retained_result = emit_load_reg(code, return_save)
+        bu32(code, encode_add_imm(0, retained_result, 0))
+      } else { 0 }
       if has_continuation == 1 {
         for lane in 0..result_lanes {
           pipeline_ir_native_store_reg(code, pinned, return_save + lane, lane)
@@ -23298,6 +23409,7 @@ fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBody, code: i64,
       fmap_set_current_abort_cleanup_boundary(fm, old_abort_cleanup_boundary)
       fmap_set_current_abort_cleanup_block(fm, old_abort_cleanup_block)
       fmap_set_current_array_storage_facts(fm, old_array_storage_facts)
+      cg_cleanup_restore(fm, old_cleanup_depth)
       cg_patch_b(code, skip_pos, buf_len(code))
       pipeline_hclause_info_new(clause_start, captures, nfree)
     }
@@ -23377,7 +23489,7 @@ fn pipeline_ir_native_hfill_ops(clauses: IrHandlerClauseBodyList, n: i64, infos:
   for ci in 0..n {
     let clause = ir_handler_clause_body_list_nth(clauses, ci)
     let op_hash = match clause {
-      IrHandlerClauseBody(body_op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> body_op_hash
+      IrHandlerClauseBody(body_op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> body_op_hash
       IrHandlerClauseBodyInvalid(reason) -> 0
     }
     let info = pipeline_word_array_get(infos, ci)
@@ -23402,6 +23514,60 @@ fn pipeline_ir_native_hfill_ops(clauses: IrHandlerClauseBodyList, n: i64, infos:
   0
 }
 
+fn pipeline_ir_native_deferred_managed_capture_count(captures: i64) -> i64 {
+  let n = if captures == 0 { 0 } else { nlist_len(captures) }
+  let mut count = 0
+  for i in 0..n {
+    let capture = nlist_get(captures, i)
+    if cg_managed_drop_kind_for_ty(node_f4(capture)) != continuation_cleanup_kind_none() { count = count + 1 } else { 0 }
+  }
+  count
+}
+
+fn pipeline_ir_native_emit_deferred_capture_owner_release(code: i64, fm: i64) -> i64 {
+  bu32(code, cg_ldr(16, 28, runtime_state_deferred_prompt_offset()))
+  let no_prompt_pos = buf_len(code)
+  bu32(code, 0)
+  bu32(code, cg_ldr(0, 16, fiber_prompt_capture_owner_offset()))
+  bu32(code, cg_str(31, 16, fiber_prompt_capture_owner_offset()))
+  let no_owner_pos = buf_len(code)
+  bu32(code, 0)
+  cg_emit_call_lit(code, fm, "closure_default_release")
+  let done = buf_len(code)
+  cg_patch_cbz(code, no_prompt_pos, 16, done)
+  cg_patch_cbz(code, no_owner_pos, 0, done)
+  0
+}
+
+fn pipeline_ir_native_emit_deferred_capture_owner_new(code: i64, fm: i64, prompt_ctr: i64, env_ctr: i64, captures: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if pipeline_ir_native_deferred_managed_capture_count(captures) > 0 {
+    cg_emit_rc_default_alloc_nozero_lit(code, fm, continuation_cleanup_kind_closure(), 16, 8)
+    emit_mov_imm(code, 9, 0)
+    bu32(code, cg_str(9, 0, 0))
+    let env_phys = pipeline_ir_native_load_reg_temp(code, pinned, env_ctr, 17)
+    bu32(code, cg_str(env_phys, 0, 8))
+    let prompt_phys = pipeline_ir_native_load_reg_temp(code, pinned, prompt_ctr, 16)
+    bu32(code, cg_str(0, prompt_phys, fiber_prompt_capture_owner_offset()))
+  } else { 0 }
+  0
+}
+
+fn pipeline_ir_native_emit_deferred_capture_env_release_if_unowned(code: i64, fm: i64, captures: i64, nfree: i64) -> i64 {
+  if nfree > 0 and pipeline_ir_native_deferred_managed_capture_count(captures) == 0 {
+    cg_emit_call_lit(code, fm, "rc_default_release")
+  } else { 0 }
+  0
+}
+
+fn pipeline_ir_native_emit_deferred_capture_owner_release_if_owned(code: i64, fm: i64, captures: i64) -> i64 {
+  if pipeline_ir_native_deferred_managed_capture_count(captures) > 0 {
+    pipeline_ir_native_emit_deferred_capture_owner_release(code, fm)
+  } else {
+    0
+  }
+  0
+}
+
 fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredHandlerBody, eff_hash: i64, nclauses: i64, clause_infos: i64, code: i64, src: i64, fm: i64, active_handlers: PipelineNativeHandlerCtx, fns: i64) -> i64 {
   match body {
     IrDeferredHandlerBodyInvalid(reason) -> pipeline_ir_native_emit_hclause_body_trap(code, fm)
@@ -23418,12 +23584,24 @@ fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredHandlerBody, e
       let old_abort_cleanup_boundary = fmap_current_abort_cleanup_boundary(fm)
       let old_abort_cleanup_block = fmap_current_abort_cleanup_block(fm)
       let old_array_storage_facts = fmap_current_array_storage_facts(fm)
+      let old_cleanup_depth = nlist_len(cg_cleanup_stack(fm))
+      -- The deferred body is a synthetic fiber function. Its capture
+      -- environment borrows from the enclosing handle frame, so inheriting
+      -- that frame's parameter cleanup entries makes dropping k release a
+      -- borrowed capture before the outer epilogue releases its real stake.
+      -- Callees running inside the fiber establish their own parameter
+      -- cleanup scopes when emitted as ordinary functions.
+      cg_cleanup_restore(fm, 0)
       let f64_facts = pipeline_ir_native_f64_facts_assign_slot_homes(blocks, pipeline_ir_native_f64_facts_for_blocks(blocks))
       let vector_data_facts = pipeline_ir_native_vector_data_facts_assign_home(pipeline_ir_native_vector_data_facts_for_blocks(blocks))
       let f64_slot_count = pipeline_ir_native_f64_slot_home_count(f64_facts)
+      let body_next_value = pipeline_ir_function_next_value(first_value, blocks)
+      let return_save = body_next_value + 8
+      let block_frame = pipeline_ir_native_scalar_frame_size_for_blocks(first_value, blocks)
+      let return_frame = pipeline_ir_native_frame_size_for_next_value(return_save + result_lanes)
       let abort_cleanup_facts = pipeline_ir_abort_cleanup_facts_for_blocks(blocks, fns)
       let abort_cleanup_instrumented = pipeline_ir_abort_cleanup_blocks_need_instrumentation(blocks, abort_cleanup_facts)
-      let array_storage_base = pipeline_ir_native_scalar_frame_size_for_blocks(first_value, blocks)
+      let array_storage_base = pipeline_ir_max_i64(block_frame, return_frame)
       let array_storage_facts = pipeline_ir_native_array_storage_facts_for_blocks(blocks, array_storage_base)
       let abort_cleanup_base = pipeline_ir_native_array_storage_frame_size(array_storage_base, array_storage_facts)
       fmap_set_current_array_storage_facts(fm, array_storage_facts)
@@ -23436,20 +23614,32 @@ fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredHandlerBody, e
       emit_prologue_current(code, fm)
       pipeline_ir_abort_cleanup_emit_function_entry(code, fm)
       pipeline_ir_native_emit_lambda_loads(code, 0, nfree)
-      let body_next_value = pipeline_ir_function_next_value(first_value, blocks)
+      -- An all-unmanaged environment dies after the prologue loads. A managed
+      -- environment belongs to the prompt's closure-shaped capture owner and
+      -- survives until normal fiber completion or continuation drop.
+      pipeline_ir_native_emit_deferred_capture_env_release_if_unowned(code, fm, captures, nfree)
       let safe_handlers = pipeline_ir_native_handler_ctx_uncaptured(active_handlers)
       let fiber_handlers = PipelineNativeHandlerCtxCons(eff_hash, clause_infos, nclauses, ops_value, 0 - 1, 0, safe_handlers)
       let body_home_count = pipeline_ir_native_value_home_count_include_evidence(pipeline_ir_native_value_home_count_for_blocks(first_value, blocks), fm)
-      let contextual_home_count = pipeline_ir_native_value_home_count_include_handlers(body_home_count, fiber_handlers)
+      let saved_home_count = pipeline_ir_native_value_home_count_include(body_home_count, return_save + result_lanes - 1)
+      let contextual_home_count = pipeline_ir_native_value_home_count_include_handlers(saved_home_count, fiber_handlers)
       let pinned = pipeline_ir_native_identity_home_facts(pipeline_ir_native_value_home_count_include_handler_scratch(contextual_home_count, blocks, pipeline_ir_native_handler_ctx_len(fiber_handlers)))
       bu32(code, cg_ldr(17, 28, runtime_state_deferred_ops_offset()))
       pipeline_ir_native_store_reg(code, pinned, ops_value, 17)
-      let temp_base = body_next_value + 8
+      let temp_base = return_save + result_lanes
       let abort_adr_patches = nlist_new()
       let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, scope_new(), src, fm, fiber_handlers, fns, f64_facts, vector_data_facts, abort_adr_patches, pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
       let labels = pipeline_ir_native_label_map_add(pipeline_ir_native_cfg_state_labels(state), pipeline_ir_native_epilogue_label(), buf_len(code))
       pipeline_ir_native_patch_all(code, labels, pipeline_ir_native_cfg_state_patches(state))
       pipeline_ir_native_patch_abort_adrs(code, labels, abort_adr_patches)
+      for lane in 0..result_lanes {
+        pipeline_ir_native_store_reg(code, pinned, return_save + lane, lane)
+      }
+      pipeline_ir_native_emit_deferred_capture_owner_release_if_owned(code, fm, captures)
+      for lane in 0..result_lanes {
+        let saved_result = emit_load_reg(code, return_save + lane)
+        bu32(code, encode_add_imm(lane, saved_result, 0))
+      }
       pipeline_ir_abort_cleanup_emit_function_exit(code, fm)
       emit_epilogue_current(code, fm)
       fmap_set_current_frame_size(fm, old_frame)
@@ -23460,6 +23650,7 @@ fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredHandlerBody, e
       fmap_set_current_abort_cleanup_boundary(fm, old_abort_cleanup_boundary)
       fmap_set_current_abort_cleanup_block(fm, old_abort_cleanup_block)
       fmap_set_current_array_storage_facts(fm, old_array_storage_facts)
+      cg_cleanup_restore(fm, old_cleanup_depth)
       cg_patch_b(code, skip_pos, buf_len(code))
       pipeline_hclause_info_new(body_start, captures, nfree)
     }
@@ -23507,10 +23698,10 @@ fn pipeline_ir_native_emit_capture_env_entries(code: i64, fm: i64, env_ctr: i64,
     let env_phys = pipeline_ir_native_load_reg_raw(code, pinned, env_ctr)
     emit_mov_imm(code, 9, capture_lanes)
     bu32(code, cg_str(9, env_phys, 0))
-    -- The fiber/continuation cleanup stack owns managed values suspended
-    -- from the body. This environment is a non-owning snapshot, matching
-    -- the previous deferred-body ABI; retaining here would double-own every
-    -- managed value also recorded in the continuation segment.
+    -- The environment is closure-shaped. Managed semantic heads receive one
+    -- fiber stake and publish their exact release kinds; when any exist, a
+    -- prompt-owned closure pair releases the complete bundle on normal fiber
+    -- completion or continuation drop.
     let nfree = if captures == 0 { 0 } else { nlist_len(captures) }
     for i in 0..nfree {
       let capture = nlist_get(captures, i)
@@ -23521,7 +23712,11 @@ fn pipeline_ir_native_emit_capture_env_entries(code: i64, fm: i64, env_ctr: i64,
         let value_phys = pipeline_ir_native_load_value_temp_pinned(code, pinned, node_f3(capture) + lane, 9)
         let current_env = pipeline_ir_native_load_reg_temp(code, pinned, env_ctr, 16)
         bu32(code, cg_str(value_phys, current_env, 8 + word * 16))
-        emit_mov_imm(code, 9, 0)
+        let kind = if lane == 0 { cg_managed_drop_kind_for_ty(node_f4(capture)) } else { continuation_cleanup_kind_none() }
+        if kind == continuation_cleanup_kind_rc() { cg_emit_rc_retain_phys(code, fm, value_phys) }
+        else { if kind == continuation_cleanup_kind_closure() { cg_emit_closure_retain_phys(code, fm, value_phys) }
+        else { if kind == continuation_cleanup_kind_weak() { cg_emit_weak_retain_phys(code, fm, value_phys) } else { 0 } } }
+        emit_mov_imm(code, 9, kind)
         let current_env2 = pipeline_ir_native_load_reg_temp(code, pinned, env_ctr, 16)
         bu32(code, cg_str(9, current_env2, 16 + word * 16))
       }
@@ -23564,6 +23759,7 @@ fn pipeline_ir_native_emit_deferred_handle(code: i64, dst: i64, src: i64, body: 
   bu32(code, encode_add_imm(0, segment_phys, 0))
   cg_emit_call_lit(code, fm, "fiber_prompt_new")
   pipeline_ir_native_store_reg(code, pinned, prompt_ctr, 0)
+  pipeline_ir_native_emit_deferred_capture_owner_new(code, fm, prompt_ctr, env_ctr, pipeline_hclause_info_free_vars(body_info), pinned)
   let prompt_phys = pipeline_ir_native_load_reg_temp(code, pinned, prompt_ctr, 16)
   bu32(code, cg_str(prompt_phys, 28, runtime_state_deferred_prompt_offset()))
   let ops_phys = pipeline_ir_native_load_reg_temp(code, pinned, ops_ctr, 17)
@@ -30522,7 +30718,7 @@ fn pipeline_ir_lambda_evidence_register_handler_clauses(clauses: IrHandlerClause
     IrHandlerClauseBodyNil -> 0
     IrHandlerClauseBodyCons(body, rest) -> {
       match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_lambda_evidence_register_blocks(blocks, fm)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_lambda_evidence_register_blocks(blocks, fm)
         IrHandlerClauseBodyInvalid(reason) -> 0
       }
       pipeline_ir_lambda_evidence_register_handler_clauses(rest, fm)
@@ -31646,7 +31842,7 @@ fn pipeline_ir_max_handler_clause_captures(clauses: IrHandlerClauseBodyList, cur
     IrHandlerClauseBodyNil -> current
     IrHandlerClauseBodyCons(body, rest) -> {
       let next = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_max_lambda_captures(captures, current)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_max_lambda_captures(captures, current)
         IrHandlerClauseBodyInvalid(reason) -> current
       }
       pipeline_ir_max_handler_clause_captures(rest, next)
@@ -31861,7 +32057,7 @@ fn pipeline_ir_live_add_clause_captures(set: i64, clauses: IrHandlerClauseBodyLi
     IrHandlerClauseBodyNil -> count
     IrHandlerClauseBodyCons(body, rest) -> {
       let next = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_live_add_captures(set, captures, count)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_live_add_captures(set, captures, count)
         IrHandlerClauseBodyInvalid(reason) -> count
       }
       pipeline_ir_live_add_clause_captures(set, rest, next)
@@ -37899,7 +38095,7 @@ fn pipeline_ir_borrow_pass_handler_clauses(clauses: IrHandlerClauseBodyList, pas
     IrHandlerClauseBodyNil -> pass
     IrHandlerClauseBodyCons(body, rest) -> {
       let next = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_borrow_pass_blocks_once(blocks, pass, facts)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_borrow_pass_blocks_once(blocks, pass, facts)
         IrHandlerClauseBodyInvalid(reason) -> pass
       }
       pipeline_ir_borrow_pass_handler_clauses(rest, next, facts)
@@ -38097,7 +38293,7 @@ fn pipeline_ir_borrow_handler_clauses_have_values(clauses: IrHandlerClauseBodyLi
     IrHandlerClauseBodyNil -> 0
     IrHandlerClauseBodyCons(body, rest) -> {
       let hit = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_borrow_blocks_have_values(blocks)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_borrow_blocks_have_values(blocks)
         IrHandlerClauseBodyInvalid(reason) -> 0
       }
       if hit == 1 { 1 } else { pipeline_ir_borrow_handler_clauses_have_values(rest) }
@@ -38355,7 +38551,7 @@ fn pipeline_ir_borrow_values_complete_handler_clauses(clauses: IrHandlerClauseBo
     IrHandlerClauseBodyNil -> 1
     IrHandlerClauseBodyCons(body, rest) -> {
       let valid = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_borrow_values_complete_blocks(blocks, blocks, values)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_borrow_values_complete_blocks(blocks, blocks, values)
         IrHandlerClauseBodyInvalid(reason) -> 1
       }
       if valid != 1 { 0 } else { pipeline_ir_borrow_values_complete_handler_clauses(rest, values) }
@@ -41237,7 +41433,7 @@ fn pipeline_ir_live_set_add_handler_clause_captures(clauses: IrHandlerClauseBody
     IrHandlerClauseBodyNil -> live
     IrHandlerClauseBodyCons(body, rest) -> {
       let next = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_live_set_add_lambda_captures(captures, live)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_live_set_add_lambda_captures(captures, live)
         IrHandlerClauseBodyInvalid(reason) -> live
       }
       pipeline_ir_live_set_add_handler_clause_captures(rest, next)
@@ -45579,7 +45775,7 @@ fn pipeline_ir_hoisted_fns_handler_clauses(clauses: IrHandlerClauseBodyList, acc
     IrHandlerClauseBodyNil -> acc
     IrHandlerClauseBodyCons(body, rest) -> {
       let next = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_hoisted_fns_blocks(blocks, acc)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_hoisted_fns_blocks(blocks, acc)
         IrHandlerClauseBodyInvalid(reason) -> acc
       }
       pipeline_ir_hoisted_fns_handler_clauses(rest, next)
@@ -45656,7 +45852,7 @@ fn pipeline_ir_lambda_semantic_facts_handler_clauses(clauses: IrHandlerClauseBod
     IrHandlerClauseBodyNil -> facts
     IrHandlerClauseBodyCons(body, rest) -> {
       let next = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_lambda_semantic_facts_blocks(blocks, facts)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_lambda_semantic_facts_blocks(blocks, facts)
         IrHandlerClauseBodyInvalid(reason) -> facts
       }
       pipeline_ir_lambda_semantic_facts_handler_clauses(rest, next)
