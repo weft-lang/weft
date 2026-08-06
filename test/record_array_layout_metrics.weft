@@ -21,6 +21,49 @@ fn record_array_layout_word_count(code: i64, target: i64) -> i64 {
   count
 }
 
+fn record_array_layout_call_count_insts(insts: IrInstList, target_hash: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let here = match inst {
+        IrCallI64(dst, callee_hash, args) -> if callee_hash == target_hash { 1 } else { 0 }
+        _ -> 0
+      }
+      here + record_array_layout_call_count_insts(rest, target_hash)
+    }
+  }
+}
+
+fn record_array_layout_call_count_blocks(blocks: IrBlockList, target_hash: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      let here = match block {
+        IrBlock(id, params, insts, term) -> record_array_layout_call_count_insts(insts, target_hash)
+      }
+      here + record_array_layout_call_count_blocks(rest, target_hash)
+    }
+  }
+}
+
+fn record_array_layout_call_count_function(functions: IrFunctionList, fn_hash: i64, target_hash: i64) -> i64 {
+  match functions {
+    IrFunctionNil -> 0
+    IrFunctionCons(function, rest) -> {
+      match function {
+        IrFunction(hash, nparams, blocks, src) -> {
+          if hash == fn_hash { record_array_layout_call_count_blocks(blocks, target_hash) }
+          else { record_array_layout_call_count_function(rest, fn_hash, target_hash) }
+        }
+      }
+    }
+  }
+}
+
+fn record_array_layout_name_hash(name: str) -> i64 {
+  str_hash(__str_ptr(name), 0, __str_len(name))
+}
+
 fn record_array_layout_register_runtime(fm: i64, name: str, offset: i64) -> i64 {
   fmap_add(fm, __str_ptr(name), 0, __str_len(name), offset)
   0
@@ -181,6 +224,9 @@ test "record_array_layout_unmanaged_f64_bytes_need_no_retain_entry" {
   pipeline_ir_native_emit_record_layout_init(code, 2, 303, 32, 8, fields, fm, pipeline_ir_native_identity_home_facts(3))
   let descriptor = mono_cache_lookup(fmap_mono_cache(fm), pipeline_record_layout_descriptor_hash(32, fields))
   Test.assert_eq(mem_load64_at(buf_ptr(code), descriptor + 16), 0)
+  -- With no retain helper in this buffer, this uniquely pins the storage
+  -- handle's payload-data load before the inline byte copy.
+  Test.assert_eq(record_array_layout_word_count(code, cg_ldr(16, 16, 0)), 1)
   Test.assert_eq(record_array_layout_word_count(code, cg_ldrb(12, 13, 0)), 1)
   Test.assert_eq(record_array_layout_word_count(code, encode_ret()), 0)
   Test.assert_eq(fmap_emit_error_count(fm), 0)
@@ -210,6 +256,34 @@ test "record_array_layout_is_an_abort_cleanup_acquisition" {
   Test.assert_eq(node_f1(fact), 2)
   Test.assert_eq(node_f2(fact), pipeline_rc_default_release_hash())
   Test.assert_eq(node_f3(fact), pipeline_ir_abort_cleanup_managed_kind())
+}
+
+test "record_array_projection_storage_is_an_abort_cleanup_acquisition" {
+  let new_args = ir_value_list_prepend(1, ir_value_list_prepend(2, ir_value_list_prepend(3, ir_value_list_prepend(4, ir_value_list_prepend(5, ir_value_list_empty())))))
+  let release_args = ir_value_list_prepend(6, ir_value_list_empty())
+  let insts = ir_inst_list_prepend(
+    ir_inst_call_i64(6, pipeline_rc_array_storage_new_hash(), new_args),
+    ir_inst_list_prepend(ir_inst_call_i64(7, pipeline_rc_default_release_hash(), release_args), ir_inst_list_empty())
+  )
+  let blocks = ir_block_list_prepend(ir_block_new_term(0, insts, ir_term_return(7)), ir_block_list_empty())
+  let facts = pipeline_ir_abort_cleanup_facts_for_blocks(blocks, 0)
+  Test.assert_eq(nlist_len(facts), 1)
+  let fact = nlist_get(facts, 0)
+  Test.assert_eq(node_tag(fact), 6)
+  Test.assert_eq(node_f1(fact), 6)
+  Test.assert_eq(node_f2(fact), pipeline_rc_default_release_hash())
+  Test.assert_eq(node_f3(fact), pipeline_ir_abort_cleanup_managed_kind())
+}
+
+test "record_array_projection_lowering_defines_managed_storage_before_copy" {
+  let lowered = pipeline_ir_owned_record_array_load(1, 0, 32, 8, 24, 8, 3, 8, continuation_cleanup_kind_rc())
+  Test.assert_eq(ir_lowered_expr_value(lowered), 1)
+  Test.assert_eq(ir_lowered_expr_next_value(lowered), 8)
+  Test.assert_eq(record_array_layout_call_count_insts(ir_lowered_expr_insts(lowered), pipeline_rc_array_storage_new_hash()), 1)
+  Test.assert_eq(record_array_layout_call_count_insts(ir_lowered_expr_insts(lowered), pipeline_rc_array_storage_data_hash()), 1)
+  Test.assert_eq(ir_inst_list_count_tag(ir_lowered_expr_insts(lowered), 47), 1)
+  let function = ir_function_new_src(74304, 1, ir_block_new_term(0, ir_lowered_expr_insts(lowered), ir_term_return(ir_lowered_expr_value(lowered))), 0)
+  Test.assert_eq(pipeline_ir_verify_function(function), 0)
 }
 
 fn record_array_layout_load_function(dst_data: i64, base: i64) -> IrFunction {
@@ -568,6 +642,97 @@ test "record_array_layout_pipeline_materializes_declaration_order_from_source_or
   }
 }
 
+test "record_array_layout_pipeline_consumes_array_source_handles_after_copy" {
+  let src = __str_ptr("LayoutBoxheaditemsviewfoot")
+  let tt = ttable_new()
+  let entry = record_array_layout_mixed_entry(tt, src)
+  let values = ir_record_field_list_prepend(
+    str_hash(src, 9, 4), 0, 11,
+    ir_record_field_list_prepend(
+      str_hash(src, 13, 5), 1, 22,
+      ir_record_field_list_prepend(
+        str_hash(src, 18, 4), 2, 33,
+        ir_record_field_list_prepend(
+          str_hash(src, 18, 4), 3, 34,
+          ir_record_field_list_prepend(str_hash(src, 22, 4), 4, 44, ir_record_field_list_empty())
+        )
+      )
+    )
+  )
+  let cleanup = pipeline_record_array_source_releases_for_storage_layout(tt, entry, 0, values, 60)
+  Test.assert_eq(pipeline_lowered_args_is_valid(cleanup), 1)
+  Test.assert_eq(pipeline_lowered_args_next_value(cleanup), 61)
+  Test.assert_eq(record_array_layout_call_count_insts(pipeline_lowered_args_insts(cleanup), pipeline_rc_default_release_hash()), 1)
+  match pipeline_lowered_args_insts(cleanup) {
+    IrInstCons(inst, rest) -> {
+      match inst {
+        IrCallI64(dst, callee_hash, args) -> {
+          Test.assert_eq(dst, 60)
+          Test.assert_eq(callee_hash, pipeline_rc_default_release_hash())
+          Test.assert_eq(pipeline_ir_value_list_get_or(args, 0, 0 - 1), 22)
+        }
+        _ -> Test.assert_eq(0, 1)
+      }
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+}
+
+test "record_array_layout_array_placement_fact_distinguishes_owned_projection" {
+  let src = __str_ptr("boxitems")
+  let tt = ttable_new()
+  let array_ty = ty_array(ty_i64(), 3)
+  let ident = Ident(0, 3)
+  let projection = FieldAccess(ident, 3, 5)
+  Test.assert_eq(pipeline_expr_result_is_borrowed_for_ty_typed(ident, array_ty, src, 0, 0, tt), 1)
+  Test.assert_eq(pipeline_expr_result_is_borrowed_for_ty_typed(projection, array_ty, src, 0, 0, tt), 0)
+  Test.assert_eq(pipeline_expr_owned_array_value_typed(ident, array_ty, src, 0, 0, tt), 0)
+  Test.assert_eq(pipeline_expr_owned_array_value_typed(projection, array_ty, src, 0, 0, tt), 1)
+  -- Scalar field loads retain the established interior-borrow semantics.
+  Test.assert_eq(pipeline_expr_result_is_borrowed_for_ty_typed(projection, ty_i64(), src, 0, 0, tt), 1)
+  Test.assert_eq(cg_managed_drop_kind_for_ty(array_ty), continuation_cleanup_kind_rc())
+  Test.assert_eq(if pipeline_ty_needs_rc_runtime(array_ty) { 1 } else { 0 }, 1)
+  Test.assert_eq(if pipeline_expr_needs_rc_runtime_typed(projection, src, tt) { 1 } else { 0 }, 1)
+}
+
+test "record_array_layout_borrowed_call_releases_owned_projection_temp" {
+  let src = __str_ptr("boxitems")
+  let tt = ttable_new()
+  let expected_types = nlist_new()
+  nlist_add(expected_types, ty_array(ty_i64(), 3))
+  let projection = FieldAccess(Ident(0, 3), 3, 5)
+  let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(
+    expr_list_prepend(projection, expr_list_empty()),
+    ir_value_list_prepend(7, ir_value_list_empty()),
+    0,
+    10,
+    1,
+    0,
+    0,
+    expected_types,
+    0,
+    src,
+    tt
+  )
+  Test.assert_eq(pipeline_lowered_args_next_value(cleanup), 11)
+  Test.assert_eq(record_array_layout_call_count_insts(pipeline_lowered_args_insts(cleanup), pipeline_rc_default_release_hash()), 1)
+  let borrowed = pipeline_managed_lambda_temp_release_args_masked_typed(
+    expr_list_prepend(Ident(0, 3), expr_list_empty()),
+    ir_value_list_prepend(7, ir_value_list_empty()),
+    0,
+    10,
+    1,
+    0,
+    0,
+    expected_types,
+    0,
+    src,
+    tt
+  )
+  Test.assert_eq(pipeline_lowered_args_next_value(borrowed), 10)
+  Test.assert_eq(record_array_layout_call_count_insts(pipeline_lowered_args_insts(borrowed), pipeline_rc_default_release_hash()), 0)
+}
+
 test "record_array_layout_pipeline_preserves_compact_records_and_rejects_unknown_arrays" {
   let compact_src = __str_ptr("CompactBoxvalue")
   let compact_tt = ttable_new()
@@ -586,7 +751,7 @@ test "record_array_layout_pipeline_preserves_compact_records_and_rejects_unknown
   Test.assert_eq(pipeline_record_storage_layout_is_invalid(pipeline_record_storage_layout_for_entry(invalid_tt, ttable_lookup(invalid_tt, invalid_src, 0, 10), 0)), 1)
 }
 
-test "record_array_layout_pipeline_routes_scalar_loads_and_fences_array_ownership" {
+test "record_array_layout_pipeline_routes_scalar_and_owned_array_loads" {
   let src = __str_ptr("LayoutBoxheaditemsviewfoot")
   let tt = ttable_new()
   let layout = pipeline_record_storage_layout_for_entry(tt, record_array_layout_mixed_entry(tt, src), 0)
@@ -595,23 +760,40 @@ test "record_array_layout_pipeline_routes_scalar_loads_and_fences_array_ownershi
   Test.assert_eq(ir_inst_list_count_tag(head, 11), 0)
   let view = pipeline_ir_field_load_lane_insts_for_storage_layout(20, 2, str_hash(src, 18, 4), 2, ty_slice(ty_i64()), layout)
   Test.assert_eq(ir_inst_list_count_tag(view, 48), 2)
-  let items = pipeline_ir_field_load_lane_insts_for_storage_layout(30, 2, str_hash(src, 13, 5), 1, ty_array(ty_str(), 3), layout)
-  Test.assert_eq(ir_inst_list_count_tag(items, 44), 1)
-  Test.assert_eq(ir_inst_list_count_tag(items, 36), 1)
+  let items = pipeline_lower_field_load_for_storage_layout(30, 2, str_hash(src, 13, 5), 1, ty_array(ty_str(), 3), layout)
+  Test.assert_eq(ir_lowered_expr_value(items), 30)
+  Test.assert_eq(ir_lowered_expr_next_value(items), 37)
+  Test.assert_eq(ir_inst_list_count_tag(ir_lowered_expr_insts(items), 1), 5)
+  Test.assert_eq(ir_inst_list_count_tag(ir_lowered_expr_insts(items), 4), 2)
+  Test.assert_eq(ir_inst_list_count_tag(ir_lowered_expr_insts(items), 47), 1)
+  Test.assert_eq(ir_inst_list_count_tag(ir_lowered_expr_insts(items), 44), 0)
+  Test.assert_eq(ir_inst_list_count_tag(ir_lowered_expr_insts(items), 36), 0)
+  Test.assert_eq(record_array_layout_call_count_insts(ir_lowered_expr_insts(items), pipeline_rc_array_storage_new_hash()), 1)
+  Test.assert_eq(record_array_layout_call_count_insts(ir_lowered_expr_insts(items), pipeline_rc_array_storage_data_hash()), 1)
   let opt = pipeline_ir_opt_chain_insts_for_storage_layout(40, 2, str_hash(src, 9, 4), 0, 99, layout)
   Test.assert_eq(ir_inst_list_count_tag(opt, 23), 0)
   Test.assert_eq(ir_inst_list_count_tag(opt, 36), 1)
 }
 
-test "record_array_layout_surface_lowering_shares_construction_and_scalar_projection_facts" {
+test "record_array_layout_surface_lowering_shares_construction_and_projection_ownership_facts" {
   let src = "type SurfaceArrayBox { head: i64, items: [i64; 3], foot: i64 } fn pack(items: [i64; 3]) -> SurfaceArrayBox { SurfaceArrayBox { foot: 9, items: items, head: 7 } } fn head_of(box: SurfaceArrayBox) -> i64 { box.head } fn items_of(box: SurfaceArrayBox) -> [i64; 3] { box.items } fn main() -> i64 { 0 }"
   let functions = pipeline_ir_functions(pipeline_lower_ir(pipeline_check_source_with_origin(__str_ptr(src), __str_len(src), 1, 0)))
   Test.assert_eq(ir_function_list_count_tag(functions, 46), 1)
   Test.assert_eq(ir_function_list_count_tag(functions, 10), 0)
   Test.assert_eq(ir_function_list_count_tag(functions, 48), 1)
   Test.assert_eq(ir_function_list_count_tag(functions, 11), 0)
-  Test.assert_eq(ir_function_list_count_tag(functions, 44), 1)
-  Test.assert_eq(ir_function_list_count_tag(functions, 36), 1)
+  Test.assert_eq(ir_function_list_count_tag(functions, 47), 1)
+  Test.assert_eq(ir_function_list_count_tag(functions, 44), 0)
+  Test.assert_eq(ir_function_list_count_tag(functions, 36), 0)
+  let pack_hash = record_array_layout_name_hash("pack")
+  let items_hash = record_array_layout_name_hash("items_of")
+  Test.assert_eq(record_array_layout_call_count_function(functions, pack_hash, pipeline_rc_default_retain_hash()), 1)
+  -- One release consumes the retained record-field source after the copy;
+  -- the second is the function's ordinary owned-parameter cleanup.
+  Test.assert_eq(record_array_layout_call_count_function(functions, pack_hash, pipeline_rc_default_release_hash()), 2)
+  Test.assert_eq(record_array_layout_call_count_function(functions, items_hash, pipeline_rc_array_storage_new_hash()), 1)
+  Test.assert_eq(record_array_layout_call_count_function(functions, items_hash, pipeline_rc_array_storage_data_hash()), 1)
+  Test.assert_eq(record_array_layout_call_count_function(functions, items_hash, pipeline_rc_default_release_hash()), 0)
 }
 
 test "record_array_layout_surface_lowering_keeps_ordinary_record_ir_compact" {
