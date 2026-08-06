@@ -4855,6 +4855,13 @@ fn pipeline_managed_release_hash_for_kind(kind: i64) -> i64 {
   else { 0 } } }
 }
 
+fn pipeline_managed_retain_hash_for_kind(kind: i64) -> i64 {
+  if kind == continuation_cleanup_kind_rc() { pipeline_rc_default_retain_hash() }
+  else { if kind == continuation_cleanup_kind_closure() { pipeline_closure_default_retain_hash() }
+  else { if kind == continuation_cleanup_kind_weak() { pipeline_rc_default_weak_retain_hash() }
+  else { 0 } } }
+}
+
 -- Domain-separated synthetic key for one generated array destruction plan.
 -- Function/name hashes already use a 64-bit key without collision recovery;
 -- this follows the same contract while retaining every plan component.
@@ -4870,6 +4877,23 @@ fn pipeline_array_drop_plan_is_active(leaf_count: i64, leaf_stride: i64, leaf_ki
 fn pipeline_array_drop_plan_is_valid(leaf_count: i64, leaf_stride: i64, leaf_kind: i64) -> i64 {
   if leaf_count == 0 and leaf_stride >= 0 and leaf_kind == continuation_cleanup_kind_none() { 1 }
   else { pipeline_array_drop_plan_is_active(leaf_count, leaf_stride, leaf_kind) }
+}
+
+-- Copy/retain glue has a separate synthetic identity from destruction glue:
+-- both may coexist for the same shape in one native code stream.
+fn pipeline_array_copy_retain_glue_hash(leaf_count: i64, leaf_stride: i64, leaf_kind: i64) -> i64 {
+  let raw = (((4705214434749589 * 33 + leaf_count) * 33 + leaf_stride) * 33 + leaf_kind) band 9223372036854775807
+  if raw == 0 { 4705214434749589 } else { raw }
+}
+
+fn pipeline_array_copy_plan_is_valid(byte_size: i64, leaf_count: i64, leaf_stride: i64, leaf_kind: i64) -> i64 {
+  if byte_size < 0 or pipeline_array_drop_plan_is_valid(leaf_count, leaf_stride, leaf_kind) == 0 { 0 }
+  else { if pipeline_array_drop_plan_is_active(leaf_count, leaf_stride, leaf_kind) == 0 { 1 }
+  else {
+    let last = cg_layout_checked_mul_nonnegative(leaf_count - 1, leaf_stride)
+    if last < 0 or last > 9223372036854775799 { 0 }
+    else { if last + 8 <= byte_size { 1 } else { 0 } }
+  } }
 }
 
 fn pipeline_managed_retain_hash_for_ty(ty: i64) -> i64 {
@@ -20814,6 +20838,7 @@ fn pipeline_ir_native_f64_gpr_pass_inst(inst: IrInst, f64_slots: i64, gpr_values
     IrVectorSetI64(dst, vec, index, value, check_mode) -> pipeline_ir_native_int_list_add_unique(gpr_values, vec) + pipeline_ir_native_int_list_add_unique(gpr_values, index) + pipeline_ir_native_int_list_add_unique(gpr_values, value)
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> pipeline_ir_native_int_list_add_unique(gpr_values, receiver) + pipeline_ir_native_mark_value_list(args, gpr_values)
     IrOwnedDropI64(value, type_hash) -> pipeline_ir_native_int_list_add_unique(gpr_values, value)
+    IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_native_int_list_add_unique(gpr_values, dst_data) + pipeline_ir_native_int_list_add_unique(gpr_values, src_data)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_native_int_list_add_unique(gpr_values, data)
     IrVariantInitI64(dst, tag_hash, args, field_mask) -> pipeline_ir_native_mark_value_list(args, gpr_values)
     IrVariantTagI64(dst, value) -> pipeline_ir_native_int_list_add_unique(gpr_values, value)
@@ -24599,6 +24624,81 @@ fn pipeline_ir_native_emit_array_storage(code: i64, dst: i64, byte_size: i64, al
   }
 }
 
+fn pipeline_ir_native_emit_array_leaf_retain(code: i64, leaf_kind: i64, fm: i64) -> i64 {
+  if leaf_kind == continuation_cleanup_kind_rc() {
+    cg_emit_call_lit(code, fm, "rc_default_retain")
+  } else { if leaf_kind == continuation_cleanup_kind_closure() {
+    cg_emit_call_lit(code, fm, "closure_default_retain")
+  } else { if leaf_kind == continuation_cleanup_kind_weak() {
+    cg_emit_call_lit(code, fm, "rc_default_weak_retain")
+  } else { 0 } } }
+}
+
+fn pipeline_ir_native_ensure_array_copy_retain_glue(code: i64, leaf_count: i64, leaf_stride: i64, leaf_kind: i64, fm: i64) -> i64 {
+  let key = pipeline_array_copy_retain_glue_hash(leaf_count, leaf_stride, leaf_kind)
+  let cached = mono_cache_lookup(fmap_mono_cache(fm), key)
+  if cached > 1 { cached }
+  else {
+    let skip = buf_len(code)
+    bu32(code, 0)
+    let entry = buf_len(code)
+    mono_cache_add(fmap_mono_cache(fm), key, entry)
+    -- [sp+0]=cursor, [sp+8]=remaining, [sp+16]=stride, [sp+24]=LR.
+    bu32(code, encode_sub_imm(31, 31, 32))
+    emit_store_spill_offset(code, 0, 0)
+    emit_mov_imm_safe(code, 16, leaf_count)
+    emit_store_spill_offset(code, 16, 8)
+    emit_mov_imm_safe(code, 16, leaf_stride)
+    emit_store_spill_offset(code, 16, 16)
+    emit_store_spill_offset(code, 30, 24)
+    let loop_start = buf_len(code)
+    emit_load_spill_offset(code, 16, 8)
+    let done_pos = buf_len(code)
+    bu32(code, 0)
+    emit_load_spill_offset(code, 15, 0)
+    bu32(code, cg_ldr(0, 15, 0))
+    pipeline_ir_native_emit_array_leaf_retain(code, leaf_kind, fm)
+    emit_load_spill_offset(code, 15, 0)
+    emit_load_spill_offset(code, 16, 16)
+    bu32(code, encode_add_reg(15, 15, 16))
+    emit_store_spill_offset(code, 15, 0)
+    emit_load_spill_offset(code, 16, 8)
+    bu32(code, encode_sub_imm(16, 16, 1))
+    emit_store_spill_offset(code, 16, 8)
+    let back = buf_len(code)
+    bu32(code, encode_b(loop_start - back))
+    let done = buf_len(code)
+    cg_patch_cbz(code, done_pos, 16, done)
+    emit_load_spill_offset(code, 30, 24)
+    bu32(code, encode_add_imm(31, 31, 32))
+    bu32(code, encode_ret())
+    cg_patch_b(code, skip, buf_len(code))
+    entry
+  }
+}
+
+fn pipeline_ir_native_emit_array_copy(code: i64, dst_data: i64, src_data: i64, byte_size: i64, leaf_count: i64, leaf_stride: i64, leaf_kind: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if pipeline_array_copy_plan_is_valid(byte_size, leaf_count, leaf_stride, leaf_kind) == 0 {
+    fmap_inc_emit_error_count(fm)
+    bu32(code, encode_brk(30))
+  } else {
+    if byte_size > 0 {
+      let dst_phys = pipeline_ir_native_load_reg(code, pinned, dst_data)
+      if dst_phys == 15 { 0 } else { bu32(code, encode_add_imm(15, dst_phys, 0)) }
+      let src_phys = pipeline_ir_native_load_reg(code, pinned, src_data)
+      if src_phys == 16 { 0 } else { bu32(code, encode_add_imm(16, src_phys, 0)) }
+      emit_mov_imm_safe(code, 17, byte_size)
+      cg_emit_mem_copy_regs(code, 15, 16, 17)
+      if pipeline_array_drop_plan_is_active(leaf_count, leaf_stride, leaf_kind) == 1 {
+        let target = pipeline_ir_native_ensure_array_copy_retain_glue(code, leaf_count, leaf_stride, leaf_kind, fm)
+        bu32(code, encode_add_imm(0, 15, 0))
+        let call = buf_len(code)
+        bu32(code, encode_bl(target - call))
+      } else { 0 }
+    } else { 0 }
+  }
+}
+
 fn pipeline_ir_native_emit_array_leaf_release(code: i64, leaf_kind: i64, fm: i64) -> i64 {
   if leaf_kind == continuation_cleanup_kind_rc() {
     cg_emit_call_lit(code, fm, "rc_default_release")
@@ -25378,6 +25478,10 @@ fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, src: i64, fm: 
       pipeline_ir_native_emit_array_storage(code, dst, byte_size, align, fm, pinned)
       ctx
     }
+    IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> {
+      pipeline_ir_native_emit_array_copy(code, dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind, fm, pinned)
+      ctx
+    }
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> {
       pipeline_ir_abort_cleanup_emit_disarm_array(code, data, leaf_count, leaf_stride, leaf_kind, fm, pinned)
       pipeline_ir_native_emit_array_drop(code, data, leaf_count, leaf_stride, leaf_kind, fm, pinned)
@@ -25493,6 +25597,7 @@ fn pipeline_ir_native_inst_preserves_fp_env(inst: IrInst) -> i64 {
     IrGenericCallI64(dst, callee_hash, type_args, args) -> 0
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> 0
     IrOwnedDropI64(value, type_hash) -> 0
+    IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> 0
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 0
     IrStringConcatI64(dst, left, right) -> 0
     IrPerformI64(dst, effect_hash, op_hash, args) -> 0
@@ -26493,6 +26598,7 @@ fn pipeline_ir_native_inst_clobbers_pinned(inst: IrInst) -> i64 {
     IrGenericCallI64(dst, callee_hash, type_args, args) -> 1
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> 1
     IrOwnedDropI64(value, type_hash) -> 1
+    IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> 1
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 1
     IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> 1
     IrPerformI64(dst, effect_hash, op_hash, args) -> 1
@@ -27004,6 +27110,7 @@ fn pipeline_ir_native_resident_inst_fp_cs_simple(inst: IrInst) -> i64 {
       IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> 1
       IrStringConcatI64(dst, left, right) -> 1
       IrOwnedDropI64(value, type_hash) -> 1
+      IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> 1
       IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 1
       IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> 1
       IrRecordInitI64(dst, type_hash, fields) -> 1
@@ -30559,6 +30666,7 @@ fn pipeline_ir_rewrite_inst_uses(inst: IrInst, aliases: PipelineIrAliasEnv) -> I
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> IrMethodCallI64(dst, type_hash, method_hash, pipeline_ir_alias_env_lookup_or(aliases, receiver), pipeline_ir_rewrite_value_list(args, aliases))
     IrOwnedDropI64(value, type_hash) -> IrOwnedDropI64(pipeline_ir_alias_env_lookup_or(aliases, value), type_hash)
     IrArrayStorageI64(dst, byte_size, align) -> inst
+    IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> IrArrayCopyI64(pipeline_ir_alias_env_lookup_or(aliases, dst_data), pipeline_ir_alias_env_lookup_or(aliases, src_data), byte_size, leaf_count, leaf_stride, leaf_kind)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> IrArrayDropI64(pipeline_ir_alias_env_lookup_or(aliases, data), leaf_count, leaf_stride, leaf_kind)
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> IrVariantInitI64(dst, tag_hash, pipeline_ir_rewrite_value_list(payloads, aliases), field_mask)
     IrVariantTagI64(dst, base) -> IrVariantTagI64(dst, pipeline_ir_alias_env_lookup_or(aliases, base))
@@ -30678,6 +30786,7 @@ fn pipeline_ir_max_inst_value(inst: IrInst, current: i64) -> i64 {
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> pipeline_ir_max_value_list(args, pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst), receiver))
     IrOwnedDropI64(value, type_hash) -> pipeline_ir_max_i64(current, value)
     IrArrayStorageI64(dst, byte_size, align) -> pipeline_ir_max_i64(current, dst)
+    IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst_data), src_data)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_max_i64(current, data)
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> pipeline_ir_max_value_list(payloads, pipeline_ir_max_i64(current, dst))
     IrVariantTagI64(dst, base) -> pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst), base)
@@ -30873,6 +30982,7 @@ fn pipeline_ir_live_inst_def(inst: IrInst) -> i64 {
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> dst
     IrOwnedDropI64(value, type_hash) -> 0 - 1
     IrArrayStorageI64(dst, byte_size, align) -> dst
+    IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> 0 - 1
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 0 - 1
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> dst
     IrVariantTagI64(dst, base) -> dst
@@ -30898,6 +31008,7 @@ fn pipeline_ir_live_inst_is_call(inst: IrInst) -> i64 {
     IrResumeI64(dst, value) -> 1
     IrStringConcatI64(dst, left, right) -> 1
     IrOwnedDropI64(value, type_hash) -> 1
+    IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_array_drop_plan_is_active(leaf_count, leaf_stride, leaf_kind)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 1
     _ -> 0
   }
@@ -30939,6 +31050,7 @@ fn pipeline_ir_live_add_inst_uses(set: i64, inst: IrInst, count: i64) -> i64 {
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> pipeline_ir_live_add_value_list(set, args, pipeline_ir_live_add(set, receiver, count))
     IrOwnedDropI64(value, type_hash) -> pipeline_ir_live_add(set, value, count)
     IrArrayStorageI64(dst, byte_size, align) -> count
+    IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_live_add(set, src_data, pipeline_ir_live_add(set, dst_data, count))
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_live_add(set, data, count)
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> pipeline_ir_live_add_value_list(set, payloads, count)
     IrVariantTagI64(dst, base) -> pipeline_ir_live_add(set, base, count)
@@ -40405,6 +40517,7 @@ fn pipeline_ir_inst_def_or(inst: IrInst, default: i64) -> i64 {
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> dst
     IrOwnedDropI64(value, type_hash) -> default
     IrArrayStorageI64(dst, byte_size, align) -> dst
+    IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> default
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> default
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> dst
     IrVariantTagI64(dst, base) -> dst
@@ -40489,6 +40602,7 @@ fn pipeline_ir_live_set_add_inst_uses(inst: IrInst, live: PipelineIrLiveSet) -> 
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> pipeline_ir_live_set_add_values(pipeline_ir_live_set_add(live, receiver), args)
     IrOwnedDropI64(value, type_hash) -> pipeline_ir_live_set_add(live, value)
     IrArrayStorageI64(dst, byte_size, align) -> live
+    IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_live_set_add(pipeline_ir_live_set_add(live, dst_data), src_data)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_live_set_add(live, data)
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> pipeline_ir_live_set_add_values(live, payloads)
     IrVariantTagI64(dst, base) -> pipeline_ir_live_set_add(live, base)
@@ -43084,6 +43198,10 @@ fn pipeline_mem2reg_mark_inst_uses_dense(inst: IrInst, declared: i64, disq: i64,
       pipeline_mem2reg_mark_values(args, declared, disq, next_value)
     }
     IrOwnedDropI64(value, type_hash) -> pipeline_mem2reg_mark_use(value, declared, disq, next_value)
+    IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> {
+      pipeline_mem2reg_mark_use(dst_data, declared, disq, next_value)
+      pipeline_mem2reg_mark_use(src_data, declared, disq, next_value)
+    }
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> pipeline_mem2reg_mark_use(data, declared, disq, next_value)
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> pipeline_mem2reg_mark_values(payloads, declared, disq, next_value)
     IrVariantTagI64(dst, base) -> pipeline_mem2reg_mark_use(base, declared, disq, next_value)
