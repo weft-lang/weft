@@ -2543,14 +2543,86 @@ fn pipeline_ir_field_load_lane_insts_for_storage_layout(dst: i64, base: i64, fie
             pipeline_ir_record_layout_word_load_lane_insts_inner(dst, base, record_data_size, field_hash, byte_offset, 0, lanes)
           } else { pipeline_ir_invalid_field_load_lane_insts(dst, 0, lanes) }
         }
-        -- Array projection needs an owned placement/drop fact, not merely an
-        -- address calculation. Keep it fail-closed until that producer lands.
+        -- Array projection changes ownership and therefore goes through the
+        -- IrLoweredExpr-producing wrapper below. A caller that bypasses that
+        -- semantic placement fact remains fail-closed.
         PipelineRecordStorageFieldFactArray(fact_hash, fact_word_offset, byte_offset, field_ty, byte_size, align, leaf_count, leaf_stride, leaf_kind, rest) -> {
-          ir_inst_list_prepend(ir_inst_array_storage_i64(dst, byte_size, align), ir_inst_list_prepend(ir_inst_lowering_failure_i64(14), ir_inst_list_empty()))
+          pipeline_ir_invalid_field_load_lane_insts(dst, 0, lanes)
         }
         PipelineRecordStorageFieldFactNil -> pipeline_ir_invalid_field_load_lane_insts(dst, 0, lanes)
       }
     }
+  }
+}
+
+fn pipeline_ir_array_storage_new_args(byte_size_value: i64, align_value: i64, leaf_count_value: i64, leaf_stride_value: i64, leaf_kind_value: i64) -> IrValueList {
+  ir_value_list_prepend(
+    byte_size_value,
+    ir_value_list_prepend(
+      align_value,
+      ir_value_list_prepend(
+        leaf_count_value,
+        ir_value_list_prepend(leaf_stride_value, ir_value_list_prepend(leaf_kind_value, ir_value_list_empty()))
+      )
+    )
+  )
+}
+
+-- An extracted array is a fresh semantic value, not an interior borrow of the
+-- record. Allocate its default-managed backing first, expose the backing data
+-- only to the copy instruction, and return the owned storage handle. Higher
+-- lowering then uses the ordinary managed-value ownership machinery.
+fn pipeline_ir_owned_record_array_load(dst: i64, base: i64, record_data_size: i64, byte_offset: i64, byte_size: i64, align: i64, leaf_count: i64, leaf_stride: i64, leaf_kind: i64) -> IrLoweredExpr {
+  let byte_size_value = dst + 1
+  let align_value = dst + 2
+  let leaf_count_value = dst + 3
+  let leaf_stride_value = dst + 4
+  let leaf_kind_value = dst + 5
+  let data = dst + 6
+  let insts = ir_inst_list_prepend(
+    ir_inst_const_i64(byte_size_value, byte_size),
+    ir_inst_list_prepend(
+      ir_inst_const_i64(align_value, align),
+      ir_inst_list_prepend(
+        ir_inst_const_i64(leaf_count_value, leaf_count),
+        ir_inst_list_prepend(
+          ir_inst_const_i64(leaf_stride_value, leaf_stride),
+          ir_inst_list_prepend(
+            ir_inst_const_i64(leaf_kind_value, leaf_kind),
+            ir_inst_list_prepend(
+              ir_inst_call_i64(dst, pipeline_rc_array_storage_new_hash(), pipeline_ir_array_storage_new_args(byte_size_value, align_value, leaf_count_value, leaf_stride_value, leaf_kind_value)),
+              ir_inst_list_prepend(
+                ir_inst_call_i64(data, pipeline_rc_array_storage_data_hash(), ir_value_list_prepend(dst, ir_value_list_empty())),
+                ir_inst_list_prepend(
+                  ir_inst_record_layout_array_load_i64(data, base, record_data_size, byte_offset, byte_size, leaf_count, leaf_stride, leaf_kind),
+                  ir_inst_list_empty()
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  ir_lowered_expr(dst, data + 1, insts)
+}
+
+fn pipeline_lower_field_load_for_storage_layout(dst: i64, base: i64, field_hash: i64, word_offset: i64, ty: i64, layout: PipelineRecordStorageLayout) -> IrLoweredExpr {
+  let lanes = pipeline_type_value_lane_count_or_one(ty)
+  match layout {
+    PipelineRecordStorageLayoutDescribed(record_data_size, record_align, fields) -> {
+      match pipeline_record_storage_field_fact_at_word_offset(fields, word_offset) {
+        PipelineRecordStorageFieldFactArray(fact_hash, fact_word_offset, byte_offset, field_ty, byte_size, align, leaf_count, leaf_stride, leaf_kind, rest) -> {
+          if fact_hash == field_hash and ty_is_array(ty) {
+            pipeline_ir_owned_record_array_load(dst, base, record_data_size, byte_offset, byte_size, align, leaf_count, leaf_stride, leaf_kind)
+          } else {
+            ir_lowered_expr(dst, dst + lanes, pipeline_ir_invalid_field_load_lane_insts(dst, 0, lanes))
+          }
+        }
+        _ -> ir_lowered_expr(dst, dst + lanes, pipeline_ir_field_load_lane_insts_for_storage_layout(dst, base, field_hash, word_offset, ty, layout))
+      }
+    }
+    _ -> ir_lowered_expr(dst, dst + lanes, pipeline_ir_field_load_lane_insts_for_storage_layout(dst, base, field_hash, word_offset, ty, layout))
   }
 }
 
@@ -3187,7 +3259,7 @@ fn pipeline_lower_return_transfer_typed_with_ty(value_expr: Expr, value: i64, ne
   let subst = pipeline_lower_module_subst(module)
   let inferred_ty = pipeline_return_expr_type_node_typed(value_expr, params, locals, module)
   let ty = if forced_ty != 0 { forced_ty } else { inferred_ty }
-  let retain = if ty != 0 and ty_is_continuation(ty) == 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, fns, subst, pipeline_lower_module_tt(module)) == 1 {
+  let retain = if ty != 0 and ty_is_continuation(ty) == 0 and pipeline_expr_result_is_borrowed_for_ty_typed(value_expr, ty, src, fns, subst, pipeline_lower_module_tt(module)) == 1 {
     pipeline_managed_retain_inst_list(value, ty, next_value)
   } else {
     ir_inst_list_empty()
@@ -3215,7 +3287,7 @@ fn pipeline_lower_return_transfer_from_node(value_expr: i64, value: i64, next_va
   let fns = pipeline_lower_module_fns(module)
   let subst = pipeline_lower_module_subst(module)
   let ty = pipeline_return_expr_type_node_from_node(value_expr, params, locals, module)
-  let retain = if ty != 0 and ty_is_continuation(ty) == 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(value_expr, src, fns, subst, pipeline_lower_module_tt(module)) == 1 {
+  let retain = if ty != 0 and ty_is_continuation(ty) == 0 and pipeline_expr_node_result_is_borrowed_for_ty_typed(value_expr, ty, src, fns, subst, pipeline_lower_module_tt(module)) == 1 {
     pipeline_managed_retain_inst_list(value, ty, next_value)
   } else {
     ir_inst_list_empty()
@@ -4263,9 +4335,9 @@ fn pipeline_match_arms_any_unprotected_borrow(arms: MatchArmList, whole_borrowed
     MatchArmListCons(arm, rest) -> {
       let unsafe_arm = match arm {
         Arm(pattern, body, guard, has_guard) -> {
-          if pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, pipeline_lower_module_tt(module)) == 0 { 0 }
+          let ty = pipeline_match_arm_result_type_node_with_scrutinee_typed(arm, params, locals, module, scrutinee_ty)
+          if pipeline_expr_result_is_borrowed_for_ty_typed(body, ty, src, fns, subst, pipeline_lower_module_tt(module)) == 0 { 0 }
           else {
-            let ty = pipeline_match_arm_result_type_node_with_scrutinee_typed(arm, params, locals, module, scrutinee_ty)
             if ty == 0 { 1 }
             else { if pipeline_managed_release_hash_for_ty(ty) != 0 and whole_borrowed == 1 { 1 } else { 0 } }
           }
@@ -4278,12 +4350,15 @@ fn pipeline_match_arms_any_unprotected_borrow(arms: MatchArmList, whole_borrowed
 }
 
 fn pipeline_match_scrutinee_release_hash(scrutinee: Expr, arms: MatchArmList, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
-  if pipeline_expr_owned_rvalue_temp_typed(scrutinee, pipeline_lower_module_src(module), pipeline_lower_module_tt(module)) == 0 { 0 }
+  let src = pipeline_lower_module_src(module)
+  let tt = pipeline_lower_module_tt(module)
+  let ty = pipeline_return_expr_type_node_typed(scrutinee, params, locals, module)
+  let is_owned = if pipeline_expr_owned_rvalue_temp_typed(scrutinee, src, tt) == 1 { 1 }
+    else { pipeline_expr_owned_array_value_typed(scrutinee, ty, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), tt) }
+  if is_owned == 0 { 0 }
   else {
-    let src = pipeline_lower_module_src(module)
     let fns = pipeline_lower_module_fns(module)
     let subst = pipeline_lower_module_subst(module)
-    let ty = pipeline_return_expr_type_node_typed(scrutinee, params, locals, module)
     let blocked = pipeline_match_arms_any_unprotected_borrow(arms, 0, params, locals, module, src, fns, subst, ty)
     if blocked == 1 { 0 }
     else {
@@ -4902,6 +4977,14 @@ fn pipeline_rc_default_release_hash() -> i64 {
   str_hash(__str_ptr("rc_default_release"), 0, __str_len("rc_default_release"))
 }
 
+fn pipeline_rc_array_storage_new_hash() -> i64 {
+  str_hash(__str_ptr("rc_array_storage_new"), 0, __str_len("rc_array_storage_new"))
+}
+
+fn pipeline_rc_array_storage_data_hash() -> i64 {
+  str_hash(__str_ptr("rc_array_storage_data"), 0, __str_len("rc_array_storage_data"))
+}
+
 fn pipeline_rc_default_weak_release_hash() -> i64 {
   str_hash(__str_ptr("rc_default_weak_release"), 0, __str_len("rc_default_weak_release"))
 }
@@ -5035,7 +5118,7 @@ fn pipeline_managed_retain_inst_list(value: i64, ty: i64, dst: i64) -> IrInstLis
 }
 
 fn pipeline_managed_borrow_retain_arg_typed(expr: Expr, value: i64, expected_ty: i64, next_value: i64, src: i64, fns: i64, subst: i64, tt: i64) -> PipelineLoweredArgs {
-  let insts = if expected_ty != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(expr, src, fns, subst, tt) == 1 {
+  let insts = if expected_ty != 0 and pipeline_expr_result_is_borrowed_for_ty_typed(expr, expected_ty, src, fns, subst, tt) == 1 {
     pipeline_managed_retain_inst_list(value, expected_ty, next_value)
   } else {
     ir_inst_list_empty()
@@ -5045,7 +5128,7 @@ fn pipeline_managed_borrow_retain_arg_typed(expr: Expr, value: i64, expected_ty:
 }
 
 fn pipeline_managed_borrow_retain_arg_node(arg_node: i64, value: i64, expected_ty: i64, next_value: i64, src: i64, fns: i64, subst: i64, tt: i64) -> PipelineLoweredArgs {
-  let insts = if expected_ty != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(arg_node, src, fns, subst, tt) == 1 {
+  let insts = if expected_ty != 0 and pipeline_expr_node_result_is_borrowed_for_ty_typed(arg_node, expected_ty, src, fns, subst, tt) == 1 {
     pipeline_managed_retain_inst_list(value, expected_ty, next_value)
   } else {
     ir_inst_list_empty()
@@ -5089,6 +5172,20 @@ fn pipeline_expr_owned_rvalue_temp_typed(expr: Expr, src: i64, tt: i64) -> i64 {
 fn pipeline_expr_node_owned_rvalue_temp_typed(expr: i64, src: i64, tt: i64) -> i64 {
   let stripped = pipeline_expr_node_strip_typed(expr)
   if stripped == 0 { 0 } else { pipeline_expr_owned_rvalue_temp_typed(expr_from_node(stripped), src, tt) }
+}
+
+-- An array projection materialises a fresh default-managed backing. It is an
+-- owned temporary even though ordinary scalar/managed field projections stay
+-- borrowed from their record owner.
+fn pipeline_expr_owned_array_value_typed(expr: Expr, expected_ty: i64, src: i64, fns: i64, subst: i64, tt: i64) -> i64 {
+  if expected_ty != 0 and ty_is_array(expected_ty) and pipeline_array_expr_result_is_borrowed_typed(expr, src, fns, subst, tt) == 0 { 1 }
+  else { 0 }
+}
+
+fn pipeline_expr_node_owned_array_value_typed(expr: i64, expected_ty: i64, src: i64, fns: i64, subst: i64, tt: i64) -> i64 {
+  let stripped = pipeline_expr_node_strip_typed(expr)
+  if stripped == 0 { 0 }
+  else { pipeline_expr_owned_array_value_typed(expr_from_node(stripped), expected_ty, src, fns, subst, tt) }
 }
 
 fn pipeline_expr_node_owned_temp_drop_kind_typed(expr: i64) -> i64 {
@@ -5173,7 +5270,10 @@ fn pipeline_managed_lambda_temp_release_args_masked_typed(args: ExprList, values
     ExprListNil -> pipeline_lowered_args(ir_value_list_empty(), next_value, ir_inst_list_empty(), 1)
     ExprListCons(expr, rest_exprs) -> {
       let expr_kind = pipeline_expr_owned_temp_drop_kind_typed(expr)
-      let drop_kind = pipeline_managed_temp_release_arg_kind(expr_kind, pipeline_expr_owned_rvalue_temp_typed(expr, src, tt), expected_params, expected_types, index, mask_offset, expected_subst)
+      let expected_ty = pipeline_expected_arg_type_node(expected_params, expected_types, index, mask_offset, expected_subst)
+      let is_rvalue_temp = if pipeline_expr_owned_rvalue_temp_typed(expr, src, tt) == 1 { 1 }
+        else { pipeline_expr_owned_array_value_typed(expr, expected_ty, src, 0, expected_subst, tt) }
+      let drop_kind = pipeline_managed_temp_release_arg_kind(expr_kind, is_rvalue_temp, expected_params, expected_types, index, mask_offset, expected_subst)
       let value = pipeline_ir_value_list_get_or(values, index, 0 - 1)
       let callee = pipeline_managed_release_hash_for_kind(drop_kind)
       let release_insts = if drop_kind != continuation_cleanup_kind_none() and callee != 0 and value >= 0 and cg_mask_has(borrowed_mask, index + mask_offset) == 1 {
@@ -5194,7 +5294,10 @@ fn pipeline_managed_lambda_temp_release_arg_nodes_masked(args: i64, arg_count: i
   } else {
     let arg_node = nlist_get(args, index)
     let expr_kind = pipeline_expr_node_owned_temp_drop_kind_typed(arg_node)
-    let drop_kind = pipeline_managed_temp_release_arg_kind(expr_kind, pipeline_expr_node_owned_rvalue_temp_typed(arg_node, src, tt), expected_params, expected_types, index, mask_offset, expected_subst)
+    let expected_ty = pipeline_expected_arg_type_node(expected_params, expected_types, index, mask_offset, expected_subst)
+    let is_rvalue_temp = if pipeline_expr_node_owned_rvalue_temp_typed(arg_node, src, tt) == 1 { 1 }
+      else { pipeline_expr_node_owned_array_value_typed(arg_node, expected_ty, src, 0, expected_subst, tt) }
+    let drop_kind = pipeline_managed_temp_release_arg_kind(expr_kind, is_rvalue_temp, expected_params, expected_types, index, mask_offset, expected_subst)
     let value = pipeline_ir_value_list_get_or(values, index, 0 - 1)
     let callee = pipeline_managed_release_hash_for_kind(drop_kind)
     let release_insts = if drop_kind != continuation_cleanup_kind_none() and callee != 0 and value >= 0 and cg_mask_has(borrowed_mask, index + mask_offset) == 1 {
@@ -6036,18 +6139,18 @@ fn pipeline_lower_field_like_typed_to_target_blocks(base_expr: Expr, field_ns: i
       let base_params = ir_value_list_prepend(base_value, ir_value_list_empty())
       let field_ty = if is_opt == 1 { 0 } else { pipeline_typed_field_type_for_base(tt, src, field_ns, field_nl, base_expr, params, locals, module) }
       let result_lanes = if is_opt == 1 { 1 } else { pipeline_type_value_lane_count_or_one(field_ty) }
-      let result_args = pipeline_ir_value_lane_ids(dst, 0, result_lanes)
       let base_field_index = pipeline_typed_field_index_for_base(tt, src, field_ns, field_nl, base_expr, params, locals, module)
       let storage_layout = pipeline_record_storage_layout_for_base(tt, src, base_expr, params, locals, module)
-      let insts = if is_opt == 1 {
+      let field = if is_opt == 1 {
         let effect_key = pipeline_effect_atom_dispatch_key(effect_atom, pipeline_lower_module_subst(module), effect_maybe_head_hash())
-        pipeline_ir_opt_chain_insts_for_storage_layout(dst, base_value, str_hash(src, field_ns, field_nl), base_field_index, effect_key, storage_layout)
+        ir_lowered_expr(dst, dst + 1, pipeline_ir_opt_chain_insts_for_storage_layout(dst, base_value, str_hash(src, field_ns, field_nl), base_field_index, effect_key, storage_layout))
       } else {
-        pipeline_ir_field_load_lane_insts_for_storage_layout(dst, base_value, str_hash(src, field_ns, field_nl), base_field_index, field_ty, storage_layout)
+        pipeline_lower_field_load_for_storage_layout(dst, base_value, str_hash(src, field_ns, field_nl), base_field_index, field_ty, storage_layout)
       }
-      let merge = ir_block_new_params(base_merge_block, base_params, insts, ir_term_jump_args(target_block, result_args))
+      let result_args = pipeline_ir_value_lane_ids(ir_lowered_expr_value(field), 0, result_lanes)
+      let merge = ir_block_new_params(base_merge_block, base_params, ir_lowered_expr_insts(field), ir_term_jump_args(target_block, result_args))
       let blocks = ir_block_list_append(pipeline_lowered_blocks_blocks(base_blocks), ir_block_list_prepend(merge, ir_block_list_empty()))
-      pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(base_blocks), dst + result_lanes, blocks, 1)
+      pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(base_blocks), ir_lowered_expr_next_value(field), blocks, 1)
     }
   } else {
     pipeline_lowered_blocks_invalid(start_block, next_value)
@@ -6294,6 +6397,44 @@ fn pipeline_record_init_inst_for_storage_layout(tt: i64, entry: i64, subst: i64,
   }
 }
 
+-- Described records copy fixed-array bytes into their own allocation. Each
+-- source array handle contributes one owned count: borrowed sources were
+-- retained while lowering the field, while owned projections transfer their
+-- freshly allocated count. Consume that count after the copy has retained any
+-- managed leaves for the record's inline representation.
+fn pipeline_record_array_source_releases_for_facts(facts: PipelineRecordStorageFieldFactList, values: IrRecordFieldList, next_value: i64) -> PipelineLoweredArgs {
+  match facts {
+    PipelineRecordStorageFieldFactNil -> pipeline_lowered_args(ir_value_list_empty(), next_value, ir_inst_list_empty(), 1)
+    PipelineRecordStorageFieldFactWord(field_hash, word_offset, byte_offset, field_ty, lanes, rest) -> {
+      pipeline_record_array_source_releases_for_facts(rest, values, next_value)
+    }
+    PipelineRecordStorageFieldFactArray(field_hash, word_offset, byte_offset, field_ty, byte_size, align, leaf_count, leaf_stride, leaf_kind, rest) -> {
+      let value = pipeline_ir_record_field_value_at_word_offset(values, word_offset)
+      if value < 0 {
+        pipeline_lowered_args_invalid(next_value)
+      } else {
+        let release = ir_inst_list_prepend(
+          ir_inst_call_i64(next_value, pipeline_rc_default_release_hash(), ir_value_list_prepend(value, ir_value_list_empty())),
+          ir_inst_list_empty()
+        )
+        let tail = pipeline_record_array_source_releases_for_facts(rest, values, next_value + 1)
+        if pipeline_lowered_args_is_valid(tail) == 1 {
+          pipeline_lowered_args(ir_value_list_empty(), pipeline_lowered_args_next_value(tail), ir_inst_list_append(release, pipeline_lowered_args_insts(tail)), 1)
+        } else {
+          pipeline_lowered_args_invalid(next_value)
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_record_array_source_releases_for_storage_layout(tt: i64, entry: i64, subst: i64, values: IrRecordFieldList, next_value: i64) -> PipelineLoweredArgs {
+  match pipeline_record_storage_layout_for_entry(tt, entry, subst) {
+    PipelineRecordStorageLayoutDescribed(data_size, align, facts) -> pipeline_record_array_source_releases_for_facts(facts, values, next_value)
+    _ -> pipeline_lowered_args(ir_value_list_empty(), next_value, ir_inst_list_empty(), 1)
+  }
+}
+
 fn pipeline_lower_record_field_blocks_typed(fields: RecordFieldList, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, type_ns: i64, type_nl: i64, record_block: i64, next_value: i64, next_block: i64, values: IrRecordFieldList) -> PipelineLoweredRecordFieldBlocks {
   let src = pipeline_lower_module_src(module)
   let tt = pipeline_lower_module_tt(module)
@@ -6396,10 +6537,11 @@ fn pipeline_lower_record_init_typed_to_target_blocks(type_ns: i64, type_nl: i64,
       pipeline_lowered_blocks_control(pipeline_lowered_record_field_blocks_next_block(lowered_fields), pipeline_lowered_record_field_blocks_next_value(lowered_fields), blocks, 1, 0)
     } else {
       let record_dst = pipeline_lowered_record_field_blocks_next_value(lowered_fields)
+      let record_entry = ttable_lookup(pipeline_lower_module_tt(module), src, type_ns, type_nl)
       let record_inst = ir_inst_list_prepend(
         pipeline_record_init_inst_for_storage_layout(
           pipeline_lower_module_tt(module),
-          ttable_lookup(pipeline_lower_module_tt(module), src, type_ns, type_nl),
+          record_entry,
           pipeline_lower_module_subst(module),
           record_dst,
           str_hash(src, type_ns, type_nl),
@@ -6407,13 +6549,24 @@ fn pipeline_lower_record_init_typed_to_target_blocks(type_ns: i64, type_nl: i64,
         ),
         ir_inst_list_empty()
       )
-      let record_args = ir_value_list_prepend(record_dst, ir_value_list_empty())
-      let record = ir_block_new_term(record_block, record_inst, ir_term_jump_args(target_block, record_args))
-      let blocks = ir_block_list_prepend(
-        entry,
-        ir_block_list_append(pipeline_lowered_record_field_blocks_blocks(lowered_fields), ir_block_list_prepend(record, ir_block_list_empty()))
+      let cleanup = pipeline_record_array_source_releases_for_storage_layout(
+        pipeline_lower_module_tt(module),
+        record_entry,
+        pipeline_lower_module_subst(module),
+        pipeline_lowered_record_field_blocks_values(lowered_fields),
+        record_dst + 1
       )
-      pipeline_lowered_blocks(pipeline_lowered_record_field_blocks_next_block(lowered_fields), record_dst + 1, blocks, 1)
+      if pipeline_lowered_args_is_valid(cleanup) == 1 {
+        let record_args = ir_value_list_prepend(record_dst, ir_value_list_empty())
+        let record = ir_block_new_term(record_block, ir_inst_list_append(record_inst, pipeline_lowered_args_insts(cleanup)), ir_term_jump_args(target_block, record_args))
+        let blocks = ir_block_list_prepend(
+          entry,
+          ir_block_list_append(pipeline_lowered_record_field_blocks_blocks(lowered_fields), ir_block_list_prepend(record, ir_block_list_empty()))
+        )
+        pipeline_lowered_blocks(pipeline_lowered_record_field_blocks_next_block(lowered_fields), pipeline_lowered_args_next_value(cleanup), blocks, 1)
+      } else {
+        pipeline_lowered_blocks_invalid(start_block, next_value)
+      }
     }
   } else {
     pipeline_lowered_blocks_invalid(start_block, next_value)
@@ -6965,7 +7118,7 @@ fn pipeline_lower_let_typed_to_target_blocks_with_float(ns: i64, nl: i64, init_e
         } else {
           pipeline_ir_max_i64(pipeline_lowered_blocks_next_value(init_blocks), local_value + local_lanes)
         }
-        let retain_insts = if address_taken == 1 or pipeline_expr_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 0 {
+        let retain_insts = if address_taken == 1 or pipeline_expr_result_is_borrowed_for_ty_typed(init_expr, effective_type_node, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 0 {
           ir_inst_list_empty()
         } else {
           pipeline_managed_retain_inst_list(bind_value, effective_type_node, retain_start)
@@ -7062,7 +7215,7 @@ fn pipeline_lower_let_typed_to_target_blocks_with_float(ns: i64, nl: i64, init_e
       } else { ir_inst_list_empty() }
       let bind_value = if address_taken == 1 { slot } else { ir_lowered_expr_value(init) }
       let retain_start = if address_taken == 1 { slot + 1 } else { ir_lowered_expr_next_value(init) }
-      let retain_insts = if address_taken == 1 or pipeline_expr_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 0 {
+      let retain_insts = if address_taken == 1 or pipeline_expr_result_is_borrowed_for_ty_typed(init_expr, effective_type_node, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 0 {
         ir_inst_list_empty()
       } else {
         pipeline_managed_retain_inst_list(bind_value, effective_type_node, retain_start)
@@ -7180,7 +7333,7 @@ fn pipeline_lower_let_mut_typed_to_target_blocks_with_float(ns: i64, nl: i64, in
         let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_typed(init_expr, inferred_type_hash, params, locals, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) } } }
-        let retain_insts = if effective_type_node != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
+        let retain_insts = if effective_type_node != 0 and pipeline_expr_result_is_borrowed_for_ty_typed(init_expr, effective_type_node, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
           pipeline_managed_retain_inst_list(local_value, effective_type_node, retain_start)
         } else {
           ir_inst_list_empty()
@@ -7250,7 +7403,7 @@ fn pipeline_lower_let_mut_typed_to_target_blocks_with_float(ns: i64, nl: i64, in
       let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_typed(init_expr, inferred_type_hash, params, locals, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) } } }
-      let retain_insts = if effective_type_node != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
+      let retain_insts = if effective_type_node != 0 and pipeline_expr_result_is_borrowed_for_ty_typed(init_expr, effective_type_node, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
         pipeline_managed_retain_inst_list(ir_lowered_expr_value(init), effective_type_node, slot + 1)
       } else {
         ir_inst_list_empty()
@@ -7473,9 +7626,13 @@ fn pipeline_lower_expr_typed_to_target_blocks(expr: Expr, params: i64, locals: P
 -- owned rvalue (call/ctor/record result whose value nobody binds) must
 -- drop its count at the discard point or every such statement leaks.
 fn pipeline_discard_release_hash(expr: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
-  if pipeline_expr_owned_rvalue_temp_typed(expr, pipeline_lower_module_src(module), pipeline_lower_module_tt(module)) == 0 { 0 }
+  let src = pipeline_lower_module_src(module)
+  let tt = pipeline_lower_module_tt(module)
+  let ty = pipeline_return_expr_type_node_typed(expr, params, locals, module)
+  let is_owned = if pipeline_expr_owned_rvalue_temp_typed(expr, src, tt) == 1 { 1 }
+    else { pipeline_expr_owned_array_value_typed(expr, ty, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), tt) }
+  if is_owned == 0 { 0 }
   else {
-    let ty = pipeline_return_expr_type_node_typed(expr, params, locals, module)
     if ty == 0 { 0 } else { pipeline_managed_release_hash_for_ty(ty) }
   }
 }
@@ -7527,7 +7684,7 @@ fn pipeline_lower_assign_typed_to_target_blocks(ns: i64, nl: i64, value_expr: Ex
             value_blocks
           } else {
             let assign_value = pipeline_lowered_blocks_next_value(value_blocks)
-            let retain_insts = if slot_ty != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
+            let retain_insts = if slot_ty != 0 and pipeline_expr_result_is_borrowed_for_ty_typed(value_expr, slot_ty, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
               pipeline_managed_retain_inst_list(assign_value, slot_ty, assign_value + 1)
             } else {
               ir_inst_list_empty()
@@ -7614,11 +7771,13 @@ fn pipeline_lower_if_typed_to_target_blocks(cond_expr: Expr, then_expr: Expr, el
   let src = pipeline_lower_module_src(module)
   let fns = pipeline_lower_module_fns(module)
   let subst = pipeline_lower_module_subst(module)
-  let then_borrowed = pipeline_expr_result_is_borrowed_with_ctx_typed(then_expr, src, fns, subst, pipeline_lower_module_tt(module))
-  let else_borrowed = pipeline_expr_result_is_borrowed_with_ctx_typed(else_expr, src, fns, subst, pipeline_lower_module_tt(module))
+  let then_ty = pipeline_return_expr_type_node_typed(then_expr, params, locals, module)
+  let else_ty = pipeline_return_expr_type_node_typed(else_expr, params, locals, module)
+  let then_borrowed = pipeline_expr_result_is_borrowed_for_ty_typed(then_expr, then_ty, src, fns, subst, pipeline_lower_module_tt(module))
+  let else_borrowed = pipeline_expr_result_is_borrowed_for_ty_typed(else_expr, else_ty, src, fns, subst, pipeline_lower_module_tt(module))
   let whole_borrowed = if then_borrowed == 1 { else_borrowed } else { 0 }
-  let then_retain_hash = pipeline_managed_arm_retain_hash(then_borrowed, whole_borrowed, pipeline_return_expr_type_node_typed(then_expr, params, locals, module))
-  let else_retain_hash = pipeline_managed_arm_retain_hash(else_borrowed, whole_borrowed, pipeline_return_expr_type_node_typed(else_expr, params, locals, module))
+  let then_retain_hash = pipeline_managed_arm_retain_hash(then_borrowed, whole_borrowed, then_ty)
+  let else_retain_hash = pipeline_managed_arm_retain_hash(else_borrowed, whole_borrowed, else_ty)
   if pipeline_expr_needs_lowering_cfg_typed(cond_expr, src) == 1 {
     let cond_merge_block = pipeline_lower_internal_block_after_target(next_block, target_block)
     let cond_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(cond_expr, params, locals, module, next_value, start_block, cond_merge_block + 1, cond_merge_block)
@@ -8116,9 +8275,13 @@ fn pipeline_lower_straight_expr_to_control_target_blocks(expr: i64, params: i64,
 
 -- Node twin of the typed discard-release classifier.
 fn pipeline_discard_release_hash_node(expr: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
-  if pipeline_expr_node_owned_rvalue_temp_typed(expr, pipeline_lower_module_src(module), pipeline_lower_module_tt(module)) == 0 { 0 }
+  let src = pipeline_lower_module_src(module)
+  let tt = pipeline_lower_module_tt(module)
+  let ty = pipeline_return_expr_type_node_from_node(expr, params, locals, module)
+  let is_owned = if pipeline_expr_node_owned_rvalue_temp_typed(expr, src, tt) == 1 { 1 }
+    else { pipeline_expr_node_owned_array_value_typed(expr, ty, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), tt) }
+  if is_owned == 0 { 0 }
   else {
-    let ty = pipeline_return_expr_type_node_from_node(expr, params, locals, module)
     if ty == 0 { 0 } else { pipeline_managed_release_hash_for_ty(ty) }
   }
 }
@@ -8934,7 +9097,7 @@ fn pipeline_lower_loop_let_to_target_blocks(expr: i64, ctx: PipelineLoopCtx, nex
         let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_node(init_expr, inferred_type_hash, params, locals, src, tt, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) } } }
         let next_locals = pipeline_value_env_push_float_typed_node(locals, node_f1(expr), node_f2(expr), local_value, float_prim, local_type_hash, effective_type_node)
-        let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
+        let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_for_ty_typed(init_expr, effective_type_node, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
           pipeline_managed_retain_inst_list(local_value, effective_type_node, body_next_value)
         } else {
           ir_inst_list_empty()
@@ -8996,7 +9159,7 @@ fn pipeline_lower_loop_let_to_target_blocks(expr: i64, ctx: PipelineLoopCtx, nex
       let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_node(init_expr, inferred_type_hash, params, locals, src, tt, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) } } }
       let bind_value = ir_lowered_expr_value(init)
-      let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
+      let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_for_ty_typed(init_expr, effective_type_node, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
         pipeline_managed_retain_inst_list(bind_value, effective_type_node, ir_lowered_expr_next_value(init))
       } else {
         ir_inst_list_empty()
@@ -9075,7 +9238,7 @@ fn pipeline_lower_loop_let_mut_to_target_blocks(expr: i64, ctx: PipelineLoopCtx,
         let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_node(init_expr, inferred_type_hash, params, locals, src, tt, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) } } }
-        let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
+        let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_for_ty_typed(init_expr, effective_type_node, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
           pipeline_managed_retain_inst_list(local_value, effective_type_node, body_next_value)
         } else {
           ir_inst_list_empty()
@@ -9136,7 +9299,7 @@ fn pipeline_lower_loop_let_mut_to_target_blocks(expr: i64, ctx: PipelineLoopCtx,
       let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_node(init_expr, inferred_type_hash, params, locals, src, tt, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module)) } } }
-      let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
+      let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_for_ty_typed(init_expr, effective_type_node, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
         pipeline_managed_retain_inst_list(ir_lowered_expr_value(init), effective_type_node, slot + 1)
       } else {
         ir_inst_list_empty()
@@ -9513,11 +9676,13 @@ fn pipeline_lower_if_to_target_blocks(expr: i64, params: i64, locals: PipelineVa
     let cond_expr = node_f1(expr)
     let fns = pipeline_lower_module_fns(module)
     let subst = pipeline_lower_module_subst(module)
-    let then_borrowed = pipeline_expr_node_result_is_borrowed_with_ctx_typed(node_f2(expr), src, fns, subst, tt)
-    let else_borrowed = pipeline_expr_node_result_is_borrowed_with_ctx_typed(else_expr, src, fns, subst, tt)
+    let then_ty = pipeline_return_expr_type_node_from_node(node_f2(expr), params, locals, module)
+    let else_ty = pipeline_return_expr_type_node_from_node(else_expr, params, locals, module)
+    let then_borrowed = pipeline_expr_node_result_is_borrowed_for_ty_typed(node_f2(expr), then_ty, src, fns, subst, tt)
+    let else_borrowed = pipeline_expr_node_result_is_borrowed_for_ty_typed(else_expr, else_ty, src, fns, subst, tt)
     let whole_borrowed = if then_borrowed == 1 { else_borrowed } else { 0 }
-    let then_retain_hash = pipeline_managed_arm_retain_hash(then_borrowed, whole_borrowed, pipeline_return_expr_type_node_from_node(node_f2(expr), params, locals, module))
-    let else_retain_hash = pipeline_managed_arm_retain_hash(else_borrowed, whole_borrowed, pipeline_return_expr_type_node_from_node(else_expr, params, locals, module))
+    let then_retain_hash = pipeline_managed_arm_retain_hash(then_borrowed, whole_borrowed, then_ty)
+    let else_retain_hash = pipeline_managed_arm_retain_hash(else_borrowed, whole_borrowed, else_ty)
     if pipeline_expr_needs_cfg(cond_expr) == 1 {
       let cond_merge_block = pipeline_lower_internal_block_after_target(next_block, target_block)
       let cond_blocks = pipeline_lower_expr_to_target_blocks_reserved(cond_expr, params, locals, module, next_value, start_block, cond_merge_block + 1, cond_merge_block)
@@ -10431,10 +10596,11 @@ fn pipeline_lower_record_init_to_target_blocks(expr: i64, params: i64, locals: P
       )
     } else {
       let record_dst = pipeline_lowered_record_field_blocks_next_value(lowered_fields)
+      let record_entry = ttable_lookup(tt, src, node_f1(expr), node_f2(expr))
       let record_inst = ir_inst_list_prepend(
         pipeline_record_init_inst_for_storage_layout(
           tt,
-          ttable_lookup(tt, src, node_f1(expr), node_f2(expr)),
+          record_entry,
           pipeline_lower_module_subst(module),
           record_dst,
           str_hash(src, node_f1(expr), node_f2(expr)),
@@ -10442,13 +10608,24 @@ fn pipeline_lower_record_init_to_target_blocks(expr: i64, params: i64, locals: P
         ),
         ir_inst_list_empty()
       )
-      let record_args = ir_value_list_prepend(record_dst, ir_value_list_empty())
-      let record = ir_block_new_term(record_block, record_inst, ir_term_jump_args(target_block, record_args))
-      let blocks = ir_block_list_prepend(
-        entry,
-        ir_block_list_append(pipeline_lowered_record_field_blocks_blocks(lowered_fields), ir_block_list_prepend(record, ir_block_list_empty()))
+      let cleanup = pipeline_record_array_source_releases_for_storage_layout(
+        tt,
+        record_entry,
+        pipeline_lower_module_subst(module),
+        pipeline_lowered_record_field_blocks_values(lowered_fields),
+        record_dst + 1
       )
-      pipeline_lowered_blocks(pipeline_lowered_record_field_blocks_next_block(lowered_fields), record_dst + 1, blocks, 1)
+      if pipeline_lowered_args_is_valid(cleanup) == 1 {
+        let record_args = ir_value_list_prepend(record_dst, ir_value_list_empty())
+        let record = ir_block_new_term(record_block, ir_inst_list_append(record_inst, pipeline_lowered_args_insts(cleanup)), ir_term_jump_args(target_block, record_args))
+        let blocks = ir_block_list_prepend(
+          entry,
+          ir_block_list_append(pipeline_lowered_record_field_blocks_blocks(lowered_fields), ir_block_list_prepend(record, ir_block_list_empty()))
+        )
+        pipeline_lowered_blocks(pipeline_lowered_record_field_blocks_next_block(lowered_fields), pipeline_lowered_args_next_value(cleanup), blocks, 1)
+      } else {
+        pipeline_lowered_blocks_invalid(start_block, next_value)
+      }
     }
   } else {
     pipeline_lowered_blocks_invalid(start_block, next_value)
@@ -10471,16 +10648,16 @@ fn pipeline_lower_field_access_to_target_blocks(expr: i64, params: i64, locals: 
         let base_params = ir_value_list_prepend(base_value, ir_value_list_empty())
         let field_ty = pipeline_typed_field_type_for_base_node(tt, src, node_f2(expr), node_f3(expr), base_expr, params, locals, module)
         let result_lanes = pipeline_type_value_lane_count_or_one(field_ty)
-        let result_args = pipeline_ir_value_lane_ids(dst, 0, result_lanes)
         let word_offset = pipeline_typed_field_index_for_base_node(tt, src, node_f2(expr), node_f3(expr), base_expr, params, locals, module)
         let storage_layout = pipeline_record_storage_layout_for_base_node(tt, src, base_expr, params, locals, module)
-        let field_inst = pipeline_ir_field_load_lane_insts_for_storage_layout(dst, base_value, str_hash(src, node_f2(expr), node_f3(expr)), word_offset, field_ty, storage_layout)
-        let merge = ir_block_new_params(base_merge_block, base_params, field_inst, ir_term_jump_args(target_block, result_args))
+        let field = pipeline_lower_field_load_for_storage_layout(dst, base_value, str_hash(src, node_f2(expr), node_f3(expr)), word_offset, field_ty, storage_layout)
+        let result_args = pipeline_ir_value_lane_ids(ir_lowered_expr_value(field), 0, result_lanes)
+        let merge = ir_block_new_params(base_merge_block, base_params, ir_lowered_expr_insts(field), ir_term_jump_args(target_block, result_args))
         let blocks = ir_block_list_append(
           pipeline_lowered_blocks_blocks(base_blocks),
           ir_block_list_prepend(merge, ir_block_list_empty())
         )
-        pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(base_blocks), dst + result_lanes, blocks, 1)
+        pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(base_blocks), ir_lowered_expr_next_value(field), blocks, 1)
       }
     } else {
       pipeline_lowered_blocks_invalid(start_block, next_value)
@@ -10660,7 +10837,7 @@ fn pipeline_lower_let_mut_to_target_blocks(expr: i64, params: i64, locals: Pipel
         let effective_type_node = pipeline_expr_type_node_from_node(init_expr)
         let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
         let local_type_hash = if inferred_node_type_hash != 0 { inferred_node_type_hash } else { inferred_type_hash }
-        let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
+        let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_for_ty_typed(init_expr, effective_type_node, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
           pipeline_managed_retain_inst_list(local_value, effective_type_node, retain_start)
         } else {
           ir_inst_list_empty()
@@ -10726,7 +10903,7 @@ fn pipeline_lower_let_mut_to_target_blocks(expr: i64, params: i64, locals: Pipel
       let effective_type_node = pipeline_expr_type_node_from_node(init_expr)
       let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
       let local_type_hash = if inferred_node_type_hash != 0 { inferred_node_type_hash } else { inferred_type_hash }
-      let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(init_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
+      let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_for_ty_typed(init_expr, effective_type_node, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 1 {
         pipeline_managed_retain_inst_list(ir_lowered_expr_value(init), effective_type_node, slot + 1)
       } else {
         ir_inst_list_empty()
@@ -12210,7 +12387,7 @@ fn pipeline_ty_contains_closure(ty: i64) -> bool {
 }
 
 fn pipeline_ty_needs_rc_runtime(ty: i64) -> bool {
-  pipeline_ty_contains_rc(ty) or pipeline_ty_contains_closure(ty) or pipeline_ty_contains_weak(ty)
+  ty_is_array(ty) or pipeline_ty_contains_rc(ty) or pipeline_ty_contains_closure(ty) or pipeline_ty_contains_weak(ty)
 }
 
 fn pipeline_type_expr_list_contains_rc_typed(types: TypeExprList) -> bool {
@@ -12265,6 +12442,7 @@ fn pipeline_type_expr_contains_closure_typed(ty: TypeExpr) -> bool {
 }
 
 fn pipeline_type_expr_needs_rc_runtime(ty: TypeExpr) -> bool {
+  type_expr_tag_or(ty, 0 - 1) == 22 or
   pipeline_type_expr_contains_rc_typed(ty) or
   pipeline_type_expr_contains_closure_typed(ty) or
   pipeline_type_expr_contains_weak_typed(ty)
@@ -12927,7 +13105,10 @@ fn pipeline_expr_needs_rc_runtime(node: i64, src: i64) -> bool {
       10 -> pipeline_expr_needs_rc_runtime(node_f1(node), src) or pipeline_expr_needs_rc_runtime(node_f2(node), src)
       11 -> pipeline_expr_needs_rc_runtime(node_f3(node), src) or pipeline_expr_needs_rc_runtime(node_f4(node), src)
       12 -> pipeline_expr_needs_rc_runtime(node_f3(node), src)
-      13 -> pipeline_expr_needs_rc_runtime(node_f1(node), src)
+      -- A described fixed-array field projection allocates managed backing.
+      -- Keep this syntax-level producer conservative until field-resolution
+      -- facts are available in the runtime-selection pass.
+      13 -> true
       14 -> pipeline_record_fields_need_rc_runtime(node_f3(node), node_f4(node), src)
       15 -> pipeline_expr_needs_rc_runtime(node_f1(node), src) or pipeline_match_arms_need_rc_runtime(node_f2(node), node_f3(node), src)
       22 -> pipeline_expr_needs_rc_runtime(node_f1(node), src)
@@ -13026,7 +13207,10 @@ fn pipeline_expr_needs_rc_runtime_typed(expr: Expr, src: i64, tt: i64) -> bool {
     Deref(ptr) -> pipeline_expr_needs_rc_runtime_typed(ptr, src, tt)
     PtrAssign(ptr, value) -> pipeline_expr_needs_rc_runtime_typed(ptr, src, tt) or pipeline_expr_needs_rc_runtime_typed(value, src, tt)
     Block(first, rest) -> pipeline_expr_needs_rc_runtime_typed(first, src, tt) or pipeline_expr_needs_rc_runtime_typed(rest, src, tt)
-    FieldAccess(base, field_ns, field_nl) -> pipeline_expr_needs_rc_runtime_typed(base, src, tt)
+    -- A described fixed-array field projection allocates managed backing.
+    -- Runtime selection runs before declaration-aware lowering, so field
+    -- access conservatively keeps the RC support reachable.
+    FieldAccess(base, field_ns, field_nl) -> true
     -- Record construction allocates a headered rc node (2q slice 2).
     RecordInit(type_ns, type_nl, fields) -> true
     Match(scrutinee, arms) -> pipeline_expr_needs_rc_runtime_typed(scrutinee, src, tt) or pipeline_match_arms_need_rc_runtime_typed(arms, src, tt)
@@ -15869,6 +16053,69 @@ fn pipeline_expr_result_is_borrowed_with_ctx_typed(expr: Expr, src: i64, fns: i6
   }
 }
 
+-- Fixed-array values use one managed storage handle at typed-IR boundaries.
+-- A field projection creates a fresh backing copy and is therefore owned;
+-- identifiers remain borrowed aliases, while calls retain their established
+-- owned-result convention. This is a semantic placement fact shared by every
+-- ownership consumer rather than a codegen-side field recognizer.
+fn pipeline_array_expr_result_is_borrowed_typed(expr: Expr, src: i64, fns: i64, subst: i64, tt: i64) -> i64 {
+  match expr {
+    Ident(ns, nl) -> if pipeline_ident_is_payloadless_ctor(tt, src, ns, nl) == 1 { 0 } else { 1 }
+    FieldAccess(base, field_ns, field_nl) -> 0
+    Call(ns, nl, args) -> 0
+    GenericCall(type_args, inner_call) -> {
+      match inner_call {
+        Call(ns, nl, args) -> 0
+        _ -> pipeline_array_expr_result_is_borrowed_typed(inner_call, src, fns, subst, tt)
+      }
+    }
+    MethodCall(recv, method_hash, args, type_hash) -> 0
+    Block(first, rest) -> pipeline_array_expr_result_is_borrowed_typed(rest, src, fns, subst, tt)
+    Let(ns, nl, value, body) -> {
+      if pipeline_expr_final_returns_binding_typed(body, src, ns, nl) == 1 and pipeline_array_expr_result_is_borrowed_typed(value, src, fns, subst, tt) == 0 { 0 }
+      else { pipeline_array_expr_result_is_borrowed_typed(body, src, fns, subst, tt) }
+    }
+    LetMut(ns, nl, value, body) -> pipeline_array_expr_result_is_borrowed_typed(body, src, fns, subst, tt)
+    LetTyped(inner, ann_type) -> pipeline_array_expr_result_is_borrowed_typed(inner, src, fns, subst, tt)
+    If(cond, then_expr, else_expr) -> {
+      if pipeline_array_expr_result_is_borrowed_typed(then_expr, src, fns, subst, tt) == 1 {
+        pipeline_array_expr_result_is_borrowed_typed(else_expr, src, fns, subst, tt)
+      } else { 0 }
+    }
+    Match(scrutinee, arms) -> pipeline_array_match_arms_result_is_borrowed_typed(arms, src, fns, subst, tt)
+    Defer(cleanup, body) -> pipeline_array_expr_result_is_borrowed_typed(body, src, fns, subst, tt)
+    Resume(value) -> pipeline_array_expr_result_is_borrowed_typed(value, src, fns, subst, tt)
+    Handle(body, clauses, hret) -> {
+      match hret {
+        NoHandleReturn -> pipeline_array_expr_result_is_borrowed_typed(body, src, fns, subst, tt)
+        HandleReturnClause(rns, rnl, rb) -> pipeline_array_expr_result_is_borrowed_typed(rb, src, fns, subst, tt)
+      }
+    }
+    _ -> 0
+  }
+}
+
+fn pipeline_array_match_arms_result_is_borrowed_typed(arms: MatchArmList, src: i64, fns: i64, subst: i64, tt: i64) -> i64 {
+  match arms {
+    MatchArmListNil -> 1
+    MatchArmListCons(arm, rest) -> {
+      match arm {
+        Arm(pattern, body, guard, has_guard) -> {
+          if pipeline_array_expr_result_is_borrowed_typed(body, src, fns, subst, tt) == 1 {
+            pipeline_array_match_arms_result_is_borrowed_typed(rest, src, fns, subst, tt)
+          } else { 0 }
+        }
+        UnknownArm(tag) -> 0
+      }
+    }
+  }
+}
+
+fn pipeline_expr_result_is_borrowed_for_ty_typed(expr: Expr, ty: i64, src: i64, fns: i64, subst: i64, tt: i64) -> i64 {
+  if ty_is_array(ty) { pipeline_array_expr_result_is_borrowed_typed(expr, src, fns, subst, tt) }
+  else { pipeline_expr_result_is_borrowed_with_ctx_typed(expr, src, fns, subst, tt) }
+}
+
 fn pipeline_match_arms_result_is_borrowed_with_ctx_typed(arms: MatchArmList, src: i64, fns: i64, subst: i64, tt: i64) -> i64 {
   match arms {
     MatchArmListNil -> 1
@@ -15888,6 +16135,11 @@ fn pipeline_match_arms_result_is_borrowed_with_ctx_typed(arms: MatchArmList, src
 fn pipeline_expr_node_result_is_borrowed_with_ctx_typed(expr: i64, src: i64, fns: i64, subst: i64, tt: i64) -> i64 {
   let stripped = pipeline_expr_node_strip_typed(expr)
   if stripped == 0 { 0 } else { pipeline_expr_result_is_borrowed_with_ctx_typed(expr_from_node(stripped), src, fns, subst, tt) }
+}
+
+fn pipeline_expr_node_result_is_borrowed_for_ty_typed(expr: i64, ty: i64, src: i64, fns: i64, subst: i64, tt: i64) -> i64 {
+  let stripped = pipeline_expr_node_strip_typed(expr)
+  if stripped == 0 { 0 } else { pipeline_expr_result_is_borrowed_for_ty_typed(expr_from_node(stripped), ty, src, fns, subst, tt) }
 }
 
 fn pipeline_expr_result_is_any_param_borrow_typed(expr: Expr, params: i64, src: i64) -> i64 {
@@ -16140,7 +16392,7 @@ fn pipeline_lower_let_expr_typed_sidecar_handler_opt_with_float_prim(ns: i64, nl
     let address_taken = pipeline_expr_address_of_binding(body_expr, src, ns, nl)
     let slot = pipeline_ir_addressable_slot_id(ir_lowered_expr_next_value(value))
     let bind_value_for_retain = if address_taken == 1 { slot } else { ir_lowered_expr_value(value) }
-    let retain_insts = if address_taken == 1 or pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 0 {
+    let retain_insts = if address_taken == 1 or pipeline_expr_result_is_borrowed_for_ty_typed(value_expr, effective_type_node, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 0 {
       ir_inst_list_empty()
     } else {
       pipeline_managed_retain_inst_list(bind_value_for_retain, effective_type_node, ir_lowered_expr_next_value(value))
@@ -16513,10 +16765,11 @@ fn pipeline_lower_record_init_expr_typed_sidecar_handler_opt(type_ns: i64, type_
   let fields = pipeline_lower_record_fields_typed_sidecar_handler_opt(fields_exprs, type_ns, type_nl, next_value, lower_ctx)
   if pipeline_lowered_record_fields_is_valid(fields) == 1 {
     let dst = pipeline_lowered_record_fields_next_value(fields)
+    let record_entry = ttable_lookup(pipeline_handler_lower_ctx_tt(lower_ctx), src, type_ns, type_nl)
     let record = ir_inst_list_prepend(
       pipeline_record_init_inst_for_storage_layout(
         pipeline_handler_lower_ctx_tt(lower_ctx),
-        ttable_lookup(pipeline_handler_lower_ctx_tt(lower_ctx), src, type_ns, type_nl),
+        record_entry,
         pipeline_handler_lower_ctx_subst(lower_ctx),
         dst,
         str_hash(src, type_ns, type_nl),
@@ -16524,7 +16777,18 @@ fn pipeline_lower_record_init_expr_typed_sidecar_handler_opt(type_ns: i64, type_
       ),
       ir_inst_list_empty()
     )
-    ir_lowered_expr(dst, dst + 1, ir_inst_list_append(pipeline_lowered_record_fields_insts(fields), record))
+    let cleanup = pipeline_record_array_source_releases_for_storage_layout(
+      pipeline_handler_lower_ctx_tt(lower_ctx),
+      record_entry,
+      pipeline_handler_lower_ctx_subst(lower_ctx),
+      pipeline_lowered_record_fields_values(fields),
+      dst + 1
+    )
+    if pipeline_lowered_args_is_valid(cleanup) == 1 {
+      ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(pipeline_lowered_record_fields_insts(fields), ir_inst_list_append(record, pipeline_lowered_args_insts(cleanup))))
+    } else {
+      ir_lowered_expr_invalid(next_value)
+    }
   } else {
     ir_lowered_expr_invalid(next_value)
   }
@@ -16666,10 +16930,9 @@ fn pipeline_lower_field_access_expr_typed_sidecar_handler_opt(base_expr: Expr, f
   if ir_lowered_expr_is_valid(base) == 1 {
     let dst = ir_lowered_expr_next_value(base)
     let field_ty = pipeline_typed_field_type_for_base(tt, src, field_ns, field_nl, base_expr, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
-    let lanes = pipeline_type_value_lane_count_or_one(field_ty)
     let storage_layout = pipeline_record_storage_layout_for_base(tt, src, base_expr, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
-    let field = pipeline_ir_field_load_lane_insts_for_storage_layout(dst, ir_lowered_expr_value(base), str_hash(src, field_ns, field_nl), pipeline_typed_field_index_for_base(tt, src, field_ns, field_nl, base_expr, params, locals, pipeline_handler_lower_ctx_module(lower_ctx)), field_ty, storage_layout)
-    ir_lowered_expr(dst, dst + lanes, ir_inst_list_append(ir_lowered_expr_insts(base), field))
+    let field = pipeline_lower_field_load_for_storage_layout(dst, ir_lowered_expr_value(base), str_hash(src, field_ns, field_nl), pipeline_typed_field_index_for_base(tt, src, field_ns, field_nl, base_expr, params, locals, pipeline_handler_lower_ctx_module(lower_ctx)), field_ty, storage_layout)
+    ir_lowered_expr(ir_lowered_expr_value(field), ir_lowered_expr_next_value(field), ir_inst_list_append(ir_lowered_expr_insts(base), ir_lowered_expr_insts(field)))
   } else {
     ir_lowered_expr_invalid(next_value)
   }
@@ -16831,7 +17094,7 @@ fn pipeline_lower_let_mut_expr_typed_sidecar_handler_opt_with_float_prim(ns: i64
     let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
     let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
     let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_typed(value_expr, inferred_type_hash, params, locals, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst) } } }
-    let retain_insts = if effective_type_node != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 1 {
+    let retain_insts = if effective_type_node != 0 and pipeline_expr_result_is_borrowed_for_ty_typed(value_expr, effective_type_node, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 1 {
       pipeline_managed_retain_inst_list(ir_lowered_expr_value(value), effective_type_node, slot + 1)
     } else {
       ir_inst_list_empty()
@@ -16953,7 +17216,7 @@ fn pipeline_lower_assign_expr_typed_sidecar_handler_opt(ns: i64, nl: i64, value_
       pipeline_lower_expr_typed_sidecar_handler_ctx(value_expr, next_value, lower_ctx)
     }
     if ir_lowered_expr_is_valid(value) == 1 {
-      let retain_insts = if slot_ty != 0 and pipeline_expr_result_is_borrowed_with_ctx_typed(value_expr, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 1 {
+      let retain_insts = if slot_ty != 0 and pipeline_expr_result_is_borrowed_for_ty_typed(value_expr, slot_ty, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 1 {
         pipeline_managed_retain_inst_list(ir_lowered_expr_value(value), slot_ty, ir_lowered_expr_next_value(value))
       } else {
         ir_inst_list_empty()
@@ -17867,7 +18130,7 @@ fn pipeline_lower_let_node_typed_sidecar_handler_opt_with_float_prim(ns: i64, nl
     let address_taken = pipeline_expr_node_address_of_binding(body_node, src, ns, nl)
     let slot = pipeline_ir_addressable_slot_id(ir_lowered_expr_next_value(value))
     let bind_value_for_retain = if address_taken == 1 { slot } else { ir_lowered_expr_value(value) }
-    let retain_insts = if address_taken == 1 or pipeline_expr_node_result_is_borrowed_with_ctx_typed(value_node, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 0 {
+    let retain_insts = if address_taken == 1 or pipeline_expr_node_result_is_borrowed_for_ty_typed(value_node, effective_type_node, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 0 {
       ir_inst_list_empty()
     } else {
       pipeline_managed_retain_inst_list(bind_value_for_retain, effective_type_node, ir_lowered_expr_next_value(value))
@@ -17941,7 +18204,7 @@ fn pipeline_lower_let_mut_node_typed_sidecar_handler_opt_with_float_prim(ns: i64
     let annotated_type_hash = if local_type_node != 0 and effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
     let inferred_node_type_hash = if effective_type_node != 0 { type_hash_of(effective_type_node) } else { 0 }
     let local_type_hash = if annotated_type_hash != 0 { annotated_type_hash } else { if inferred_node_type_hash != 0 { inferred_node_type_hash } else { if local_float != 0 and pipeline_prim_is_numeric_context(local_float) == 1 { pipeline_type_hash_of_prim_id(local_float) } else { pipeline_expr_type_hash_sharpen_int_node(value_node, inferred_type_hash, params, locals, src, tt, pipeline_handler_lower_ctx_fns(lower_ctx), subst) } } }
-    let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(value_node, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 1 {
+    let retain_insts = if effective_type_node != 0 and pipeline_expr_node_result_is_borrowed_for_ty_typed(value_node, effective_type_node, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 1 {
       pipeline_managed_retain_inst_list(ir_lowered_expr_value(value), effective_type_node, slot + 1)
     } else {
       ir_inst_list_empty()
@@ -17977,7 +18240,7 @@ fn pipeline_lower_assign_node_typed_sidecar_handler_opt(ns: i64, nl: i64, value_
       pipeline_lower_expr_node_typed_sidecar_handler_ctx(value_node, next_value, lower_ctx)
     }
     if ir_lowered_expr_is_valid(value) == 1 {
-      let retain_insts = if slot_ty != 0 and pipeline_expr_node_result_is_borrowed_with_ctx_typed(value_node, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 1 {
+      let retain_insts = if slot_ty != 0 and pipeline_expr_node_result_is_borrowed_for_ty_typed(value_node, slot_ty, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, pipeline_handler_lower_ctx_tt(lower_ctx)) == 1 {
         pipeline_managed_retain_inst_list(ir_lowered_expr_value(value), slot_ty, ir_lowered_expr_next_value(value))
       } else {
         ir_inst_list_empty()
@@ -18073,10 +18336,9 @@ fn pipeline_lower_field_access_node_typed_sidecar_handler_opt(base_node: i64, fi
   if ir_lowered_expr_is_valid(base) == 1 {
     let dst = ir_lowered_expr_next_value(base)
     let field_ty = pipeline_typed_field_type_for_base_node(tt, src, field_ns, field_nl, base_node, pipeline_handler_lower_ctx_params(lower_ctx), pipeline_handler_lower_ctx_locals(lower_ctx), pipeline_handler_lower_ctx_module(lower_ctx))
-    let lanes = pipeline_type_value_lane_count_or_one(field_ty)
     let storage_layout = pipeline_record_storage_layout_for_base_node(tt, src, base_node, pipeline_handler_lower_ctx_params(lower_ctx), pipeline_handler_lower_ctx_locals(lower_ctx), pipeline_handler_lower_ctx_module(lower_ctx))
-    let field = pipeline_ir_field_load_lane_insts_for_storage_layout(dst, ir_lowered_expr_value(base), str_hash(src, field_ns, field_nl), pipeline_typed_field_index_for_base_node(tt, src, field_ns, field_nl, base_node, pipeline_handler_lower_ctx_params(lower_ctx), pipeline_handler_lower_ctx_locals(lower_ctx), pipeline_handler_lower_ctx_module(lower_ctx)), field_ty, storage_layout)
-    ir_lowered_expr(dst, dst + lanes, ir_inst_list_append(ir_lowered_expr_insts(base), field))
+    let field = pipeline_lower_field_load_for_storage_layout(dst, ir_lowered_expr_value(base), str_hash(src, field_ns, field_nl), pipeline_typed_field_index_for_base_node(tt, src, field_ns, field_nl, base_node, pipeline_handler_lower_ctx_params(lower_ctx), pipeline_handler_lower_ctx_locals(lower_ctx), pipeline_handler_lower_ctx_module(lower_ctx)), field_ty, storage_layout)
+    ir_lowered_expr(ir_lowered_expr_value(field), ir_lowered_expr_next_value(field), ir_inst_list_append(ir_lowered_expr_insts(base), ir_lowered_expr_insts(field)))
   } else {
     ir_lowered_expr_invalid(next_value)
   }
@@ -18102,10 +18364,11 @@ fn pipeline_lower_record_init_node_typed_sidecar_handler_opt(type_ns: i64, type_
   let lowered_fields = pipeline_lower_record_field_nodes_handler_opt(fields, field_count, 0, type_ns, type_nl, next_value, lower_ctx)
   if pipeline_lowered_record_fields_is_valid(lowered_fields) == 1 {
     let dst = pipeline_lowered_record_fields_next_value(lowered_fields)
+    let record_entry = ttable_lookup(pipeline_handler_lower_ctx_tt(lower_ctx), src, type_ns, type_nl)
     let record = ir_inst_list_prepend(
       pipeline_record_init_inst_for_storage_layout(
         pipeline_handler_lower_ctx_tt(lower_ctx),
-        ttable_lookup(pipeline_handler_lower_ctx_tt(lower_ctx), src, type_ns, type_nl),
+        record_entry,
         pipeline_handler_lower_ctx_subst(lower_ctx),
         dst,
         str_hash(src, type_ns, type_nl),
@@ -18113,7 +18376,18 @@ fn pipeline_lower_record_init_node_typed_sidecar_handler_opt(type_ns: i64, type_
       ),
       ir_inst_list_empty()
     )
-    ir_lowered_expr(dst, dst + 1, ir_inst_list_append(pipeline_lowered_record_fields_insts(lowered_fields), record))
+    let cleanup = pipeline_record_array_source_releases_for_storage_layout(
+      pipeline_handler_lower_ctx_tt(lower_ctx),
+      record_entry,
+      pipeline_handler_lower_ctx_subst(lower_ctx),
+      pipeline_lowered_record_fields_values(lowered_fields),
+      dst + 1
+    )
+    if pipeline_lowered_args_is_valid(cleanup) == 1 {
+      ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(pipeline_lowered_record_fields_insts(lowered_fields), ir_inst_list_append(record, pipeline_lowered_args_insts(cleanup))))
+    } else {
+      ir_lowered_expr_invalid(next_value)
+    }
   } else {
     ir_lowered_expr_invalid(next_value)
   }
@@ -21778,7 +22052,7 @@ fn pipeline_ir_abort_cleanup_find_action_kind(actions: i64, value: i64, kind: i6
 }
 
 fn pipeline_ir_abort_cleanup_call_result_release_hash(callee_hash: i64, fns: i64) -> i64 {
-  if callee_hash == pipeline_ir_abort_cleanup_rc_alloc_hash() or callee_hash == pipeline_rc_default_weak_load_hash() {
+  if callee_hash == pipeline_ir_abort_cleanup_rc_alloc_hash() or callee_hash == pipeline_rc_array_storage_new_hash() or callee_hash == pipeline_rc_default_weak_load_hash() {
     pipeline_rc_default_release_hash()
   } else {
     pipeline_managed_release_hash_for_ty(pipeline_fns_lookup_ret_type_node_by_hash(fns, callee_hash, 0))
@@ -25481,12 +25755,13 @@ fn pipeline_ir_native_emit_record_layout_fields(code: i64, dst: i64, fields: IrR
       bu32(code, cg_str(17, 15, 0))
       pipeline_ir_native_emit_record_layout_fields(code, dst, rest, fm, pinned)
     }
-    IrRecordLayoutFieldArray(field_hash, byte_offset, data, byte_size, leaf_count, leaf_stride, leaf_kind, rest) -> {
+    IrRecordLayoutFieldArray(field_hash, byte_offset, storage, byte_size, leaf_count, leaf_stride, leaf_kind, rest) -> {
       if byte_size > 0 {
         let base_phys = pipeline_ir_native_load_reg(code, pinned, dst)
         if base_phys == 14 { 0 } else { bu32(code, encode_add_imm(14, base_phys, 0)) }
-        let data_phys = pipeline_ir_native_load_reg(code, pinned, data)
-        if data_phys == 16 { 0 } else { bu32(code, encode_add_imm(16, data_phys, 0)) }
+        let storage_phys = pipeline_ir_native_load_reg(code, pinned, storage)
+        if storage_phys == 16 { 0 } else { bu32(code, encode_add_imm(16, storage_phys, 0)) }
+        bu32(code, cg_ldr(16, 16, 0))
         pipeline_ir_native_emit_addr_plus_imm(code, 15, 14, byte_offset + 8)
         emit_mov_imm_safe(code, 17, byte_size)
         cg_emit_mem_copy_regs(code, 15, 16, 17)
