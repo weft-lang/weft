@@ -595,6 +595,8 @@ check_rejects "array_literal_length_mismatch" "test/negative/array_literal_lengt
 check_rejects "array_literal_element_mismatch" "test/negative/array_literal_element_mismatch.weft" "type error: return type mismatch"
 check_rejects "array_literal_missing_comma" "test/negative/array_literal_missing_comma.weft" "error: expected ',' or ']' in array literal"
 check_rejects "array_literal_mixed_storage_union" "test/negative/array_literal_mixed_storage_union.weft" "type error: array element union has no uniform untagged storage; use a variant type"
+check_rejects "array_len_unknown_field" "test/negative/array_len_unknown_field.weft" "type error: unknown indexed-storage field; arrays and slices expose .len"
+check_rejects "slice_len_unknown_field" "test/negative/slice_len_unknown_field.weft" "type error: unknown indexed-storage field; arrays and slices expose .len"
 check_rejects "effect_type_args_arity" "test/negative/effect_type_args_arity.weft" "type error: effect type argument count mismatch"
 check_rejects "effect_generic_bare_use" "test/negative/effect_generic_bare_use.weft" "type error: effect type argument count mismatch"
 check_rejects "effect_type_args_wrong_count" "test/negative/effect_type_args_wrong_count.weft" "type error: effect type argument count mismatch"
