@@ -1,0 +1,131 @@
+-- Fixed-array values are indirect only at typed-IR boundaries. Their backing
+-- bytes still live in a checked, aligned native-frame region, and the region
+-- is zeroed before any managed leaf can become an abort-cleanup obligation.
+
+use "compiler/codegen.weft"
+use "compiler/typeck.weft"
+use "compiler/macho.weft"
+use "compiler/object.weft"
+use "compiler/ir.weft"
+use "compiler/grammar.weft"
+use "compiler/pipeline.weft"
+use "runtime/unsafe.weft"
+
+fn array_storage_word_count(code: i64, target: i64) -> i64 {
+  let mut count = 0
+  let mut pos = 0
+  while pos + 4 <= buf_len(code) {
+    if pipeline_native_code_word(code, pos) == target { count = count + 1 } else { 0 }
+    pos = pos + 4
+  }
+  count
+}
+
+fn array_storage_blocks() -> IrBlockList {
+  let insts = ir_inst_list_prepend(
+    ir_inst_array_storage_i64(0, 3, 1),
+    ir_inst_list_prepend(
+      ir_inst_array_storage_i64(1, 6, 2),
+      ir_inst_list_prepend(ir_inst_array_storage_i64(2, 8, 8), ir_inst_list_empty())
+    )
+  )
+  ir_block_list_prepend(ir_block_new_term(0, insts, ir_term_return(2)), ir_block_list_empty())
+}
+
+test "array_storage_ir_publishes_one_pointer_definition" {
+  let inst = ir_inst_array_storage_i64(7, 24, 8)
+  Test.assert_eq(ir_inst_tag(inst), 44)
+  Test.assert_eq(pipeline_ir_live_inst_def(inst), 7)
+  Test.assert_eq(pipeline_ir_inst_def_or(inst, 0 - 1), 7)
+  Test.assert_eq(pipeline_ir_live_inst_is_call(inst), 0)
+  Test.assert_eq(pipeline_ir_max_inst_value(inst, 3), 7)
+  Test.assert_eq(pipeline_ir_live_set_len(pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty())), 0)
+  match pipeline_ir_rewrite_inst_uses(inst, pipeline_ir_alias_env_bind(pipeline_ir_alias_env_empty(), 7, 3)) {
+    IrArrayStorageI64(dst, byte_size, align) -> {
+      Test.assert_eq(dst, 7)
+      Test.assert_eq(byte_size, 24)
+      Test.assert_eq(align, 8)
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+}
+
+test "array_storage_verifier_accepts_frame_owned_definition" {
+  let insts = ir_inst_list_prepend(ir_inst_array_storage_i64(0, 16, 8), ir_inst_list_empty())
+  let f = ir_function_new_src(74101, 0, ir_block_new_term(0, insts, ir_term_return(0)), 0)
+  Test.assert_eq(pipeline_ir_verify_function(f), 0)
+}
+
+test "array_storage_layout_aligns_each_region_and_final_frame" {
+  let facts = pipeline_ir_native_array_storage_facts_for_blocks(array_storage_blocks(), 2048)
+  Test.assert_eq(nlist_len(facts), 3)
+  Test.assert_eq(pipeline_ir_native_array_storage_offset_or(facts, 0, 0 - 1), 2048)
+  Test.assert_eq(pipeline_ir_native_array_storage_offset_or(facts, 1, 0 - 1), 2052)
+  Test.assert_eq(pipeline_ir_native_array_storage_offset_or(facts, 2, 0 - 1), 2064)
+  Test.assert_eq(pipeline_ir_native_array_storage_frame_size(2048, facts), 2080)
+  Test.assert_eq(pipeline_ir_native_frame_size_for_blocks(0, array_storage_blocks()), 2080)
+}
+
+test "array_storage_can_follow_handler_save_homes_without_overlap" {
+  let facts = pipeline_ir_native_array_storage_facts_for_blocks(array_storage_blocks(), 2112)
+  Test.assert_eq(pipeline_ir_native_array_storage_offset_or(facts, 0, 0 - 1), 2112)
+  Test.assert_eq(pipeline_ir_native_array_storage_offset_or(facts, 1, 0 - 1), 2116)
+  Test.assert_eq(pipeline_ir_native_array_storage_offset_or(facts, 2, 0 - 1), 2128)
+  Test.assert_eq(pipeline_ir_native_array_storage_frame_size(2112, facts), 2144)
+}
+
+test "array_storage_shape_validation_fails_closed" {
+  Test.assert_eq(pipeline_ir_native_array_storage_shape_is_valid(0, 1), 1)
+  Test.assert_eq(pipeline_ir_native_array_storage_shape_is_valid(16, 16), 1)
+  Test.assert_eq(pipeline_ir_native_array_storage_shape_is_valid(0 - 1, 8), 0)
+  Test.assert_eq(pipeline_ir_native_array_storage_shape_is_valid(16, 0), 0)
+  Test.assert_eq(pipeline_ir_native_array_storage_shape_is_valid(16, 3), 0)
+  Test.assert_eq(pipeline_ir_native_array_storage_shape_is_valid(16, 32), 0)
+  let insts = ir_inst_list_prepend(ir_inst_array_storage_i64(0, 16, 3), ir_inst_list_empty())
+  let blocks = ir_block_list_prepend(ir_block_new_term(0, insts, ir_term_return(0)), ir_block_list_empty())
+  let facts = pipeline_ir_native_array_storage_facts_for_blocks(blocks, 2048)
+  Test.assert_eq(pipeline_ir_native_array_storage_offset_or(facts, 0, 99), 0 - 1)
+  Test.assert_eq(pipeline_ir_native_array_storage_frame_size(2048, facts), 2048)
+}
+
+test "array_storage_native_materialises_and_zeroes_exact_region" {
+  let blocks = array_storage_blocks()
+  let facts = pipeline_ir_native_array_storage_facts_for_blocks(blocks, 2048)
+  let fm = fmap_new()
+  fmap_set_current_array_storage_facts(fm, facts)
+  let code = buf_new(512)
+  pipeline_ir_native_emit_array_storage(code, 0, 3, 1, fm, pipeline_ir_native_identity_home_facts(3))
+  Test.assert_eq(pipeline_native_code_word(code, 0), encode_add_imm(15, 31, 2048))
+  Test.assert_eq(array_storage_word_count(code, cg_strb(17, 15, 0)), 1)
+  Test.assert_eq(array_storage_word_count(code, encode_sub_imm(16, 16, 1)), 1)
+  Test.assert_eq(fmap_emit_error_count(fm), 0)
+}
+
+test "array_storage_native_zero_size_and_invalid_shape_are_total" {
+  let zero_insts = ir_inst_list_prepend(ir_inst_array_storage_i64(0, 0, 8), ir_inst_list_empty())
+  let zero_blocks = ir_block_list_prepend(ir_block_new_term(0, zero_insts, ir_term_return(0)), ir_block_list_empty())
+  let fm = fmap_new()
+  fmap_set_current_array_storage_facts(fm, pipeline_ir_native_array_storage_facts_for_blocks(zero_blocks, 2048))
+  let code = buf_new(128)
+  pipeline_ir_native_emit_array_storage(code, 0, 0, 8, fm, pipeline_ir_native_identity_home_facts(1))
+  Test.assert_eq(array_storage_word_count(code, cg_strb(17, 15, 0)), 0)
+  Test.assert_eq(fmap_emit_error_count(fm), 0)
+  pipeline_ir_native_emit_array_storage(code, 0, 8, 3, fm, pipeline_ir_native_identity_home_facts(1))
+  Test.assert_eq(pipeline_native_code_word(code, buf_len(code) - 4), encode_brk(29))
+  Test.assert_eq(fmap_emit_error_count(fm), 1)
+}
+
+test "array_storage_is_the_abort_cleanup_acquisition_site" {
+  let insts = ir_inst_list_prepend(
+    ir_inst_array_storage_i64(0, 24, 8),
+    ir_inst_list_prepend(ir_inst_array_drop_i64(0, 3, 8, continuation_cleanup_kind_rc()), ir_inst_list_empty())
+  )
+  let blocks = ir_block_list_prepend(ir_block_new_term(0, insts, ir_term_return(0)), ir_block_list_empty())
+  let facts = pipeline_ir_abort_cleanup_facts_for_blocks(blocks, 0)
+  Test.assert_eq(nlist_len(facts), 1)
+  let fact = nlist_get(facts, 0)
+  Test.assert_eq(node_tag(fact), 0)
+  Test.assert_eq(node_f1(fact), 0)
+  Test.assert_eq(node_f2(fact), pipeline_array_drop_glue_hash(3, 8, continuation_cleanup_kind_rc()))
+  Test.assert_eq(node_f3(fact), pipeline_ir_abort_cleanup_array_kind())
+}
