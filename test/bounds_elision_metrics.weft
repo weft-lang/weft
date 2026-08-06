@@ -80,6 +80,117 @@ fn bounds_probe_modes(src: str) -> i64 {
   )
 }
 
+fn indexed_bounds_probe_mode_insts(insts: IrInstList, acc: i64) -> i64 {
+  match insts {
+    IrInstNil -> acc
+    IrInstCons(inst, rest) -> {
+      let next = match inst {
+        IrCallI64(dst, callee_hash, args) -> {
+          let mode = pipeline_runtime_index_address_check_mode(callee_hash)
+          if mode >= 0 { acc + (1 bshl (mode * 8)) } else { acc }
+        }
+        _ -> acc
+      }
+      indexed_bounds_probe_mode_insts(rest, next)
+    }
+  }
+}
+
+fn indexed_bounds_probe_mode_blocks(blocks: IrBlockList, acc: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> acc
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> indexed_bounds_probe_mode_blocks(rest, indexed_bounds_probe_mode_insts(insts, acc))
+      }
+    }
+  }
+}
+
+fn indexed_bounds_probe_mode_functions(functions: IrFunctionList, want_hash: i64) -> i64 {
+  match functions {
+    IrFunctionNil -> 0
+    IrFunctionCons(f, rest) -> {
+      match f {
+        IrFunction(hash, params, blocks, src) -> {
+          if hash == want_hash { indexed_bounds_probe_mode_blocks(blocks, 0) }
+          else { indexed_bounds_probe_mode_functions(rest, want_hash) }
+        }
+      }
+    }
+  }
+}
+
+fn indexed_bounds_probe_modes(src: str) -> i64 {
+  indexed_bounds_probe_mode_functions(
+    pipeline_ir_functions(bounds_probe_ir(src)),
+    str_hash(__str_ptr("f"), 0, __str_len("f"))
+  )
+}
+
+fn indexed_bounds_probe_native(src: str) -> NativeModule {
+  let typed = pipeline_check_source_with_origin(__str_ptr(src), __str_len(src), 1, 0)
+  let ir = pipeline_lower_ir(typed)
+  pipeline_lower_native_module(typed, pipeline_optimise_typed_ir(typed, ir))
+}
+
+test "indexed_bounds_unconditional_slice_keeps_upper_check" {
+  let src = "fn f(xs: [i64], i: usize) -> i64 { xs[i] } fn main() -> i64 { 0 }"
+  Test.assert_eq(indexed_bounds_probe_modes(src), 65536)
+}
+
+test "indexed_bounds_guarded_slice_elides_full_check" {
+  let src = "fn f(xs: [i64], i: usize) -> i64 { if i < xs.len { xs[i] } else { 0 } } fn main() -> i64 { 0 }"
+  Test.assert_eq(indexed_bounds_probe_modes(src), 281474976710656)
+}
+
+test "indexed_bounds_reversed_and_false_polarities_elide" {
+  let reversed = "fn f(xs: [i64], i: usize) -> i64 { if xs.len > i { xs[i] } else { 0 } } fn main() -> i64 { 0 }"
+  let false_edge = "fn f(xs: [i64], i: usize) -> i64 { if i >= xs.len { 0 } else { xs[i] } } fn main() -> i64 { 0 }"
+  Test.assert_eq(indexed_bounds_probe_modes(reversed), 281474976710656)
+  Test.assert_eq(indexed_bounds_probe_modes(false_edge), 281474976710656)
+}
+
+test "indexed_bounds_fixed_array_constant_and_guard_elide" {
+  let constant = "fn f() -> i64 { let xs = [10, 20, 30] xs[1] } fn main() -> i64 { 0 }"
+  let guarded = "fn f(xs: [i64; 3], i: usize) -> i64 { if i < xs.len { xs[i] } else { 0 } } fn main() -> i64 { 0 }"
+  Test.assert_eq(indexed_bounds_probe_modes(constant), 281474976710656)
+  -- rc_array_storage_data is inlined to a null-check diamond before the
+  -- access; the exact indexed fact must survive that common join.
+  Test.assert_eq(indexed_bounds_probe_modes(guarded), 281474976710656)
+}
+
+test "indexed_bounds_mutable_slice_write_consumes_same_fact" {
+  let src = "fn f(xs: [mut i64], i: usize) -> nil { if i < xs.len { xs[i] = 7 } else { nil } } fn main() -> i64 { 0 }"
+  Test.assert_eq(indexed_bounds_probe_modes(src), 281474976710656)
+}
+
+test "indexed_bounds_wrong_length_and_nonstrict_guard_rejected" {
+  let wrong_storage = "fn f(xs: [i64], ys: [i64], i: usize) -> i64 { if i < ys.len { xs[i] } else { 0 } } fn main() -> i64 { 0 }"
+  let nonstrict = "fn f(xs: [i64], i: usize) -> i64 { if i <= xs.len { xs[i] } else { 0 } } fn main() -> i64 { 0 }"
+  Test.assert_eq(indexed_bounds_probe_modes(wrong_storage), 65536)
+  Test.assert_eq(indexed_bounds_probe_modes(nonstrict), 65536)
+}
+
+test "indexed_bounds_native_counters_pair_partial_and_full_proofs" {
+  let unchecked_src = "fn f(xs: [i64], i: usize) -> i64 { xs[i] } fn main() -> i64 { 0 }"
+  let unchecked_native = indexed_bounds_probe_native(unchecked_src)
+  Test.assert_eq(pipeline_native_indexed_bounds_elision_count(unchecked_native), 1)
+  Test.assert_eq(pipeline_native_indexed_full_bounds_elision_count(unchecked_native), 0)
+  let guarded_src = "fn f(xs: [i64], i: usize) -> i64 { if i < xs.len { xs[i] } else { 0 } } fn main() -> i64 { 0 }"
+  let guarded_native = indexed_bounds_probe_native(guarded_src)
+  Test.assert_eq(pipeline_native_indexed_bounds_elision_count(guarded_native), 1)
+  Test.assert_eq(pipeline_native_indexed_full_bounds_elision_count(guarded_native), 1)
+}
+
+test "indexed_bounds_shared_counters_include_vector_sites" {
+  let src = "use \"stdlib/vector.weft\" fn f(v: Vector<i64>, i: i64) -> i64 { if i >= 0 { if i < vector_len<i64>(v) { vector_get<i64>(v, i, 0) } else { 0 } } else { 0 } } fn main() -> i64 { 0 }"
+  let native = indexed_bounds_probe_native(src)
+  Test.assert_eq(pipeline_native_indexed_bounds_elision_count(native), pipeline_native_vector_bounds_elision_count(native))
+  Test.assert_eq(pipeline_native_indexed_full_bounds_elision_count(native), pipeline_native_vector_full_bounds_elision_count(native))
+  Test.assert_eq(if pipeline_native_indexed_full_bounds_elision_count(native) >= 1 { 1 } else { 0 }, 1)
+}
+
 fn bounds_shrink_subject(v: Vector<i64>, i: i64) -> i64 {
   if i >= 0 {
     if i < vector_len<i64>(v) {
