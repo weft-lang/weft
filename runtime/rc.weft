@@ -51,9 +51,13 @@ fn rc_count(payload: i64) -> i64 {
 
 -- The header's size word packs the deep-release field mask into its
 -- high 32 bits (2 bits per payload word: 0 none, 1 rc, 2 closure,
--- 3 weak; first 16 words). Sizes stay in the low 32 — every reader
--- must go through rc_size_word_size.
-fn rc_size_word_size(word: i64) -> i64 { word band 4294967295 }
+-- 3 weak; first 16 words). Bit 31 marks an inline aggregate whose arbitrary
+-- managed-leaf walk is described by a compiler-generated layout descriptor;
+-- actual payload sizes occupy the remaining low 31 bits. Every reader must go
+-- through rc_size_word_size.
+fn rc_layout_descriptor_flag() -> i64 { 2147483648 }
+fn rc_size_word_size(word: i64) -> i64 { word band 2147483647 }
+fn rc_size_word_has_layout_descriptor(word: i64) -> i64 { if (word band rc_layout_descriptor_flag()) != 0 { 1 } else { 0 } }
 fn rc_size_word_mask(word: i64) -> i64 { (word bshr 32) band 4294967295 }
 
 -- Payloads shorter than sixteen words leave the mask's high two bits
@@ -77,6 +81,18 @@ fn rc_array_storage_leaf_count_offset() -> i64 { 16 }
 fn rc_array_storage_leaf_stride_offset() -> i64 { 24 }
 fn rc_array_storage_leaf_kind_offset() -> i64 { 32 }
 fn rc_array_storage_drop_glue_offset() -> i64 { 40 }
+-- Compiler-generated inline aggregate descriptor:
+-- [magic, data byte size, entry count], then 32-byte entries
+-- [byte offset, leaf count, byte stride, managed kind]. Described payloads
+-- reserve word 0 for the descriptor pointer; aggregate data begins at +8.
+fn rc_layout_descriptor_magic() -> i64 { 6289345512910263 }
+fn rc_layout_descriptor_header_size() -> i64 { 24 }
+fn rc_layout_descriptor_entry_size() -> i64 { 32 }
+fn rc_layout_descriptor_data_offset() -> i64 { 8 }
+fn rc_layout_descriptor_offset_offset(index: i64) -> i64 { rc_layout_descriptor_header_size() + index * rc_layout_descriptor_entry_size() }
+fn rc_layout_descriptor_count_offset(index: i64) -> i64 { rc_layout_descriptor_offset_offset(index) + 8 }
+fn rc_layout_descriptor_stride_offset(index: i64) -> i64 { rc_layout_descriptor_offset_offset(index) + 16 }
+fn rc_layout_descriptor_kind_offset(index: i64) -> i64 { rc_layout_descriptor_offset_offset(index) + 24 }
 fn rc_persistent_region_arena_next_offset() -> i64 { 32 }
 -- One demand-paged 64 KiB reservation covers the measured 100-element
 -- CHAMP lifetime without a growth mmap; physical pages are committed only
@@ -180,7 +196,7 @@ fn rc_finalize_zero_count_payload(heap: i64, payload: i64) -> i64 {
 
 fn rc_alloc_core(heap: i64, payload_size: i64, align: i64, zero: i64) -> i64 {
   if heap == 0 { 0 }
-  else { if payload_size < 0 { 0 }
+  else { if payload_size < 0 or payload_size >= rc_layout_descriptor_flag() { 0 }
   else {
     let block = heap_alloc(heap, rc_header_size() + payload_size, align)
     if block == 0 { 0 }
@@ -627,6 +643,149 @@ fn rc_array_storage_promote_elements(payload: i64) -> i64 {
   promoted
 }
 
+fn rc_layout_descriptor_drop_kind_is_valid(kind: i64) -> i64 {
+  if kind == continuation_cleanup_kind_rc() or kind == continuation_cleanup_kind_closure() or kind == continuation_cleanup_kind_weak() { 1 } else { 0 }
+}
+
+fn rc_layout_descriptor_entry_is_valid(descriptor: i64, index: i64, data_size: i64) -> i64 {
+  let offset = __mem_load64(descriptor + rc_layout_descriptor_offset_offset(index))
+  let count = __mem_load64(descriptor + rc_layout_descriptor_count_offset(index))
+  let stride = __mem_load64(descriptor + rc_layout_descriptor_stride_offset(index))
+  let kind = __mem_load64(descriptor + rc_layout_descriptor_kind_offset(index))
+  if offset < 0 or count <= 0 or stride <= 0 or rc_layout_descriptor_drop_kind_is_valid(kind) == 0 { 0 }
+  else {
+    let remaining = data_size - offset
+    if remaining < 8 { 0 }
+    else {
+      let max_steps = (remaining - 8) / stride
+      if count - 1 <= max_steps { 1 } else { 0 }
+    }
+  }
+}
+
+fn rc_layout_descriptor_shape_is_valid(descriptor: i64, data_size: i64) -> i64 {
+  if descriptor == 0 or data_size < 0 or __mem_load64(descriptor) != rc_layout_descriptor_magic() { 0 }
+  else { if __mem_load64(descriptor + 8) != data_size { 0 }
+  else {
+    let count = __mem_load64(descriptor + 16)
+    if count < 0 or count > 4096 { 0 }
+    else {
+      let mut i = 0
+      let mut valid = 1
+      while i < count and valid == 1 {
+        valid = rc_layout_descriptor_entry_is_valid(descriptor, i, data_size)
+        i = i + 1
+      }
+      valid
+    }
+  } }
+}
+
+fn rc_layout_descriptor_for_payload(payload: i64) -> i64 {
+  if payload == 0 { 0 } else { __mem_load64(payload) }
+}
+
+fn rc_layout_descriptor_payload_is_valid(payload: i64) -> i64 {
+  if payload == 0 { 0 }
+  else {
+    let size = rc_payload_size(payload)
+    if size < rc_layout_descriptor_data_offset() { 0 }
+    else { rc_layout_descriptor_shape_is_valid(rc_layout_descriptor_for_payload(payload), size - rc_layout_descriptor_data_offset()) }
+  }
+}
+
+fn rc_layout_descriptor_release_pending(payload: i64, pending_start: i64) -> i64 {
+  let descriptor = rc_layout_descriptor_for_payload(payload)
+  if rc_layout_descriptor_payload_is_valid(payload) == 0 { pending_start }
+  else {
+    let data = payload + rc_layout_descriptor_data_offset()
+    let entries = __mem_load64(descriptor + 16)
+    let mut pending = pending_start
+    let mut i = 0
+    while i < entries {
+      let offset = __mem_load64(descriptor + rc_layout_descriptor_offset_offset(i))
+      let count = __mem_load64(descriptor + rc_layout_descriptor_count_offset(i))
+      let stride = __mem_load64(descriptor + rc_layout_descriptor_stride_offset(i))
+      let kind = __mem_load64(descriptor + rc_layout_descriptor_kind_offset(i))
+      let mut leaf = 0
+      while leaf < count {
+        let value = __mem_load64(data + offset + leaf * stride)
+        if kind == continuation_cleanup_kind_rc() {
+          pending = rc_deep_release_child(value, pending)
+        } else { if kind == continuation_cleanup_kind_closure() {
+          closure_default_release(value)
+        } else { if kind == continuation_cleanup_kind_weak() {
+          rc_default_weak_release(value)
+        } else { 0 } } }
+        leaf = leaf + 1
+      }
+      i = i + 1
+    }
+    pending
+  }
+}
+
+fn rc_layout_descriptor_release_promoted(payload: i64) -> i64 {
+  let descriptor = rc_layout_descriptor_for_payload(payload)
+  if rc_layout_descriptor_payload_is_valid(payload) == 0 { 0 }
+  else {
+    let data = payload + rc_layout_descriptor_data_offset()
+    let entries = __mem_load64(descriptor + 16)
+    let mut i = 0
+    while i < entries {
+      let offset = __mem_load64(descriptor + rc_layout_descriptor_offset_offset(i))
+      let count = __mem_load64(descriptor + rc_layout_descriptor_count_offset(i))
+      let stride = __mem_load64(descriptor + rc_layout_descriptor_stride_offset(i))
+      let kind = __mem_load64(descriptor + rc_layout_descriptor_kind_offset(i))
+      let mut leaf = 0
+      while leaf < count {
+        let value = __mem_load64(data + offset + leaf * stride)
+        if kind == continuation_cleanup_kind_rc() {
+          rc_default_release(value)
+        } else { if kind == continuation_cleanup_kind_closure() {
+          closure_default_release(value)
+        } else { if kind == continuation_cleanup_kind_weak() {
+          rc_default_weak_release(value)
+        } else { 0 } } }
+        leaf = leaf + 1
+      }
+      i = i + 1
+    }
+    0
+  }
+}
+
+fn rc_layout_descriptor_promote_elements(payload: i64) -> i64 {
+  let descriptor = rc_layout_descriptor_for_payload(payload)
+  if rc_layout_descriptor_payload_is_valid(payload) == 0 { 0 }
+  else {
+    let data = payload + rc_layout_descriptor_data_offset()
+    let entries = __mem_load64(descriptor + 16)
+    let mut promoted = 0
+    let mut i = 0
+    while i < entries {
+      let offset = __mem_load64(descriptor + rc_layout_descriptor_offset_offset(i))
+      let count = __mem_load64(descriptor + rc_layout_descriptor_count_offset(i))
+      let stride = __mem_load64(descriptor + rc_layout_descriptor_stride_offset(i))
+      let kind = __mem_load64(descriptor + rc_layout_descriptor_kind_offset(i))
+      let mut leaf = 0
+      while leaf < count {
+        let value = __mem_load64(data + offset + leaf * stride)
+        if kind == continuation_cleanup_kind_rc() {
+          promoted = promoted + rc_default_promote_maybe(value)
+        } else { if kind == continuation_cleanup_kind_closure() {
+          promoted = promoted + closure_default_promote(value)
+        } else { if kind == continuation_cleanup_kind_weak() {
+          promoted = promoted + rc_default_promote_maybe(value)
+        } else { 0 } } }
+        leaf = leaf + 1
+      }
+      i = i + 1
+    }
+    promoted
+  }
+}
+
 fn rc_deep_release_custom(payload: i64, word: i64, pending_start: i64, heap: i64) -> i64 {
   let kind = rc_size_word_finalizer(word)
   if kind == rc_finalizer_buffer() {
@@ -671,13 +830,17 @@ fn rc_deep_release_walk(first: i64) -> i64 {
     __mem_store64(header + rc_promoted_offset(), 0)
     let word = __mem_load64(header + rc_payload_size_offset())
     let mask = rc_size_word_mask(word)
+    let has_layout_descriptor = rc_size_word_has_layout_descriptor(word)
+    if has_layout_descriptor == 1 {
+      pending = rc_layout_descriptor_release_pending(node, pending)
+    } else { 0 }
     -- Ordinary aggregates never pay a finalizer call. Only descriptors
     -- using the high mask pair can be runtime containers (or a real
     -- word-15 field, rejected by the helper's payload-size check).
     if mask >= 1073741824 {
       pending = rc_deep_release_custom(node, word, pending, heap)
     } else { 0 }
-    if mask != 0 {
+    if mask != 0 and has_layout_descriptor == 0 {
       let words = rc_size_word_size(word) / 8
       let limit = if words < 16 { words } else { 16 }
       let mut i = 0
@@ -699,7 +862,7 @@ fn rc_deep_release_walk(first: i64) -> i64 {
     -- finalize/free path.
     let wk = __mem_load64(header + rc_weak_count_offset())
     if wk <= 0 {
-      let rounded = (rc_header_size() + (word band 4294967295) + 7) / 8 * 8
+      let rounded = (rc_header_size() + rc_size_word_size(word) + 7) / 8 * 8
       let need = if rounded < heap_min_block_size() { heap_min_block_size() } else { rounded }
       __mem_store64(header + rc_magic_offset(), 0)
       if need <= heap_bin_limit() {
@@ -759,6 +922,7 @@ fn rc_deep_release_promoted_fields(payload: i64) -> i64 {
   let header = rc_header_from_payload(payload)
   let word = __mem_load64(header + rc_payload_size_offset())
   let mask = rc_size_word_mask(word)
+  let has_layout_descriptor = rc_size_word_has_layout_descriptor(word)
   let finalizer = if mask >= 1073741824 { rc_size_word_finalizer(word) } else { rc_finalizer_none() }
   if finalizer == rc_finalizer_buffer() {
     let data = __mem_load64(payload)
@@ -797,7 +961,10 @@ fn rc_deep_release_promoted_fields(payload: i64) -> i64 {
   if finalizer == rc_finalizer_array_storage() {
     rc_array_storage_release_promoted(payload)
   } else { 0 }
-  if mask == 0 { 0 } else {
+  if has_layout_descriptor == 1 {
+    rc_layout_descriptor_release_promoted(payload)
+  } else { 0 }
+  if mask == 0 or has_layout_descriptor == 1 { 0 } else {
     let words = rc_size_word_size(word) / 8
     let limit = if words < 16 { words } else { 16 }
     let mut i = 0
@@ -846,10 +1013,36 @@ fn rc_default_release(payload: i64) -> i64 {
 }
 
 fn rc_set_field_mask_word(payload: i64, payload_size: i64, mask: i64) -> i64 {
-  if payload == 0 { 0 }
+  if payload == 0 or payload_size < 0 or payload_size >= rc_layout_descriptor_flag() { 0 }
   else {
     __mem_store64(rc_header_from_payload(payload) + rc_payload_size_offset(), payload_size bor (mask bshl 32))
     0
+  }
+}
+
+fn rc_set_layout_descriptor_word(payload: i64, payload_size: i64) -> i64 {
+  if payload == 0 or payload_size < rc_layout_descriptor_data_offset() or payload_size >= rc_layout_descriptor_flag() { 0 }
+  else {
+    __mem_store64(rc_header_from_payload(payload) + rc_payload_size_offset(), payload_size bor rc_layout_descriptor_flag())
+    1
+  }
+}
+
+-- Allocate one default-managed inline aggregate. Word 0 is a hidden pointer
+-- to immutable compiler-generated layout facts; callers fill every data byte
+-- at payload+8 before publishing the value.
+fn rc_default_alloc_described(data_size: i64, align: i64, descriptor: i64) -> i64 {
+  if data_size < 0 or data_size > rc_layout_descriptor_flag() - rc_layout_descriptor_data_offset() - 1 or align <= 0 or
+    rc_layout_descriptor_shape_is_valid(descriptor, data_size) == 0 { 0 }
+  else {
+    let payload_size = data_size + rc_layout_descriptor_data_offset()
+    let payload = rc_default_alloc_masked(payload_size, align, 0)
+    if payload == 0 { 0 }
+    else {
+      rc_set_layout_descriptor_word(payload, payload_size)
+      __mem_store64(payload, descriptor)
+      payload
+    }
   }
 }
 
@@ -1033,9 +1226,10 @@ fn rc_default_alloc_masked(payload_size: i64, align: i64, mask: i64) -> i64 {
     Unsafe.runtime_state() -> resume(__runtime_state())
   }
   let heap = __mem_load64(st + rc_default_heap_offset())
-  let rounded = (rc_header_size() + payload_size + 7) / 8 * 8
+  let valid_size = if payload_size >= 0 and payload_size < rc_layout_descriptor_flag() { 1 } else { 0 }
+  let rounded = if valid_size == 1 { (rc_header_size() + payload_size + 7) / 8 * 8 } else { 0 }
   let need = if rounded < heap_min_block_size() { heap_min_block_size() } else { rounded }
-  let binned = if heap != 0 and payload_size >= 0 and align <= 8 and need <= heap_bin_limit() {
+  let binned = if heap != 0 and valid_size == 1 and align > 0 and align <= 8 and need <= heap_bin_limit() {
     let cell = heap + 16 + (need / 8) * 8
     let head = __mem_load64(cell)
     if head != 0 {
@@ -1111,6 +1305,9 @@ fn rc_default_promote(payload: i64) -> i64 {
     let finalizer = rc_size_word_finalizer(word)
     if finalizer == rc_finalizer_array_storage() {
       rc_array_storage_promote_elements(payload)
+    } else { 0 }
+    if rc_size_word_has_layout_descriptor(word) == 1 {
+      rc_layout_descriptor_promote_elements(payload)
     } else { 0 }
     let region = if rc_size_word_size(word) == 16 and rc_size_word_mask(word) == 4 {
       __mem_load64(payload + 8)
