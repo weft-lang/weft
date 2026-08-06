@@ -640,6 +640,36 @@ fn pipeline_ir_semantic_fact_count(ir: IrModule) -> i64 {
   pipeline_ir_semantic_fact_count_list(pipeline_ir_semantic_facts(ir))
 }
 
+fn pipeline_ir_semantic_borrow_parameter_owner_count_list(facts: PipelineIrSemanticFactList, index: i64) -> i64 {
+  match facts {
+    PipelineIrSemanticFactNil -> 0
+    PipelineIrSemanticFactNode(hash, fact, borrow, left, right) -> {
+      ir_borrow_value_facts_count_parameter_owner(ir_borrow_facts_values(borrow), index) +
+      pipeline_ir_semantic_borrow_parameter_owner_count_list(left, index) +
+      pipeline_ir_semantic_borrow_parameter_owner_count_list(right, index)
+    }
+  }
+}
+
+fn pipeline_ir_semantic_borrow_parameter_owner_count(ir: IrModule, index: i64) -> i64 {
+  pipeline_ir_semantic_borrow_parameter_owner_count_list(pipeline_ir_semantic_facts(ir), index)
+}
+
+fn pipeline_ir_semantic_borrow_unknown_owner_count_list(facts: PipelineIrSemanticFactList) -> i64 {
+  match facts {
+    PipelineIrSemanticFactNil -> 0
+    PipelineIrSemanticFactNode(hash, fact, borrow, left, right) -> {
+      ir_borrow_value_facts_count_unknown_owner(ir_borrow_facts_values(borrow)) +
+      pipeline_ir_semantic_borrow_unknown_owner_count_list(left) +
+      pipeline_ir_semantic_borrow_unknown_owner_count_list(right)
+    }
+  }
+}
+
+fn pipeline_ir_semantic_borrow_unknown_owner_count(ir: IrModule) -> i64 {
+  pipeline_ir_semantic_borrow_unknown_owner_count_list(pipeline_ir_semantic_facts(ir))
+}
+
 fn pipeline_ir_semantic_closed_effect_fact_count_list(facts: PipelineIrSemanticFactList) -> i64 {
   match facts {
     PipelineIrSemanticFactNil -> 0
@@ -11704,10 +11734,11 @@ fn pipeline_lower_lambda_hoisted(lambda_params: ParamList, lambda_body: Expr, la
     ir_inst_list_prepend(ir_inst_lowering_failure_i64(13), ir_inst_list_empty())
   } else {
     let param_nodes = param_list_to_nodes(lambda_params)
+    let inferred_return_ty = pipeline_return_expr_type_node_typed(lambda_body, param_nodes, locals, module)
+    let return_ty = if inferred_return_ty != 0 { inferred_return_ty } else { ty_any() }
     let mut lambda_drop_next = pipeline_lowered_blocks_next_value(lowered)
     let raw_blocks = if pipeline_lowered_blocks_falls_through(lowered) == 1 {
       let return_value = pipeline_lowered_blocks_next_value(lowered)
-      let return_ty = pipeline_return_expr_type_node_typed(lambda_body, param_nodes, locals, module)
       let return_lanes = pipeline_type_value_lane_count_or_one(return_ty)
       let transfer = pipeline_lower_return_transfer_typed(lambda_body, return_value, return_value + return_lanes, param_nodes, locals, module)
       lambda_drop_next = ir_lowered_expr_next_value(transfer)
@@ -11727,7 +11758,8 @@ fn pipeline_lower_lambda_hoisted(lambda_params: ParamList, lambda_body: Expr, la
     let blocks = pipeline_ir_block_list_prepend_entry_insts(dropped, 0, preamble)
     let fn_hash = pipeline_lambda_hoist_hash(src, expr_to_node(lambda_body), subst, evidence)
     let f = IrFunction(fn_hash, param_lanes + 1, blocks, src)
-    ir_inst_list_prepend(ir_inst_closure_i64(dst, f, lambda_captures, evidence), ir_inst_list_empty())
+    let facts = pipeline_ir_lambda_semantic_facts(lambda_params, lambda_body, lambda_captures, src, fns, return_ty, base, evidence)
+    ir_inst_list_prepend(ir_inst_closure_i64(dst, f, lambda_captures, facts), ir_inst_list_empty())
   }
 }
 
@@ -25222,7 +25254,7 @@ fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, src: i64, fm: 
       ctx
     }
     IrClosureI64(dst, f, captures, eff) -> {
-      pipeline_ir_native_emit_closure(code, dst, f, captures, eff, fm, ctx)
+      pipeline_ir_native_emit_closure(code, dst, f, captures, ir_lambda_semantic_facts_evidence(eff), fm, ctx)
       ctx
     }
     IrFunctionRefI64(dst, callee_hash) -> {
@@ -29342,7 +29374,7 @@ fn pipeline_ir_lambda_evidence_register_insts(insts: IrInstList, fm: i64) -> i64
     IrInstCons(inst, rest) -> {
       match inst {
         IrClosureI64(dst, f, captures, evidence) -> {
-          pipeline_ir_lambda_evidence_registry_add(fm, pipeline_ir_function_hash(f), evidence)
+          pipeline_ir_lambda_evidence_registry_add(fm, pipeline_ir_function_hash(f), ir_lambda_semantic_facts_evidence(evidence))
         }
         IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, reserved) -> {
           pipeline_ir_lambda_evidence_register_handler_clauses(clauses, fm)
@@ -36266,6 +36298,70 @@ fn pipeline_ir_borrow_facts_for_signature(params: i64, ret_ty: i64) -> IrBorrowF
   ir_borrow_facts_new(param_facts, value_facts, return_mutability, summary)
 }
 
+fn pipeline_ir_borrow_summary_shift_values(values: IrValueList, offset: i64) -> IrValueList {
+  match values {
+    IrValueNil -> ir_value_list_empty()
+    IrValueCons(value, rest) -> ir_value_list_prepend(value + offset, pipeline_ir_borrow_summary_shift_values(rest, offset))
+  }
+}
+
+fn pipeline_ir_borrow_summary_shift(summary: IrBorrowSummary, offset: i64) -> IrBorrowSummary {
+  match summary {
+    IrBorrowSummaryUnknown -> ir_borrow_summary_unknown()
+    IrBorrowSummaryKnown(values) -> ir_borrow_summary_known(pipeline_ir_borrow_summary_shift_values(values, offset))
+  }
+}
+
+fn pipeline_ir_lambda_abi_params(lambda_params: ParamList) -> i64 {
+  let source_params = param_list_to_nodes(lambda_params)
+  let source_count = if source_params == 0 { 0 } else { nlist_len(source_params) }
+  let params = nlist_new_capacity(source_count + 1)
+  -- Hidden closure environment parameter. It is an unmanaged ABI word and is
+  -- logical parameter zero for direct-call summary substitution.
+  nlist_add(params, node_new(0, 0, 0, ty_i64(), 0))
+  for i in 0..source_count { nlist_add(params, nlist_get(source_params, i)) }
+  params
+}
+
+fn pipeline_ir_lambda_capture_borrow_values(captures: i64, base: i64, values: IrBorrowValueFactList) -> IrBorrowValueFactList {
+  let mut result = values
+  let mut word = 0
+  let count = if captures == 0 { 0 } else { nlist_len(captures) }
+  for i in 0..count {
+    let capture = nlist_get(captures, i)
+    let ty = node_f4(capture)
+    if ty_is_slice(ty) {
+      let head = base + word
+      result = ir_borrow_value_facts_set(result, head, pipeline_ir_borrow_unknown_origins(head, ty_slice_mutable(ty)))
+    } else { 0 }
+    word = word + pipeline_capture_lane_count(capture)
+  }
+  result
+}
+
+fn pipeline_ir_lambda_semantic_facts(lambda_params: ParamList, lambda_body: Expr, captures: i64, src: i64, fns: i64, ret_ty: i64, capture_base: i64, evidence: IrLambdaEvidence) -> IrLambdaSemanticFacts {
+  let source_params = param_list_to_nodes(lambda_params)
+  let abi_params = pipeline_ir_lambda_abi_params(lambda_params)
+  let signature = pipeline_ir_borrow_facts_for_signature(abi_params, ret_ty)
+  let summary = if ty_is_slice(ret_ty) {
+    pipeline_ir_borrow_summary_shift(
+      pipeline_ir_borrow_expr_summary(lambda_body, source_params, PipelineIrBorrowEnvNil, src, fns, ir_value_list_empty()),
+      1
+    )
+  } else { ir_borrow_summary_known(ir_value_list_empty()) }
+  let borrow_with_summary = ir_borrow_facts_with_summary(signature, summary)
+  let borrow = ir_borrow_facts_with_values(
+    borrow_with_summary,
+    pipeline_ir_lambda_capture_borrow_values(captures, capture_base, ir_borrow_facts_values(borrow_with_summary))
+  )
+  -- Lambdas do not yet carry their inferred effect set as a first-class
+  -- source node. Publish an open (therefore never assumed pure) effect summary
+  -- while still making parameter/return shapes and ownership exact.
+  let effect_summary = cg_semantic_effect_summary_new(0, 0, 0, 0)
+  let fact = cg_semantic_fact_new_with_effect_summary(0, effect_summary, abi_params, ret_ty, 0, 0)
+  ir_lambda_semantic_facts(evidence, fact, borrow)
+}
+
 fn pipeline_ir_borrow_aggregate_empty() -> PipelineIrBorrowAggregateFactList {
   PipelineIrBorrowAggregateFactNil
 }
@@ -36862,6 +36958,19 @@ fn pipeline_type_table_contains_slice(tt: i64) -> bool {
   }
 }
 
+fn pipeline_ir_semantic_borrow_signatures_have_values(facts: PipelineIrSemanticFactList) -> i64 {
+  match facts {
+    PipelineIrSemanticFactNil -> 0
+    PipelineIrSemanticFactNode(hash, fact, borrow, left, right) -> {
+      if ir_borrow_param_fact_count(ir_borrow_facts_params(borrow)) > 0 or ir_borrow_facts_return_mutability(borrow) >= 0 { 1 }
+      else {
+        if pipeline_ir_semantic_borrow_signatures_have_values(left) == 1 { 1 }
+        else { pipeline_ir_semantic_borrow_signatures_have_values(right) }
+      }
+    }
+  }
+}
+
 fn pipeline_ir_semantic_borrow_values_enrich(facts: PipelineIrSemanticFactList, all_facts: PipelineIrSemanticFactList, functions: PipelineIrBorrowFunctionIndex) -> PipelineIrSemanticFactList {
   match facts {
     PipelineIrSemanticFactNil -> PipelineIrSemanticFactNil
@@ -36888,7 +36997,7 @@ fn pipeline_ir_semantic_borrow_values_enrich_functions(facts: PipelineIrSemantic
   -- The typed signature graph is the semantic producer for whether a module
   -- can contain slice values. Two-word ABI shapes are not sufficient evidence:
   -- other transports share them and would spuriously enable this whole pass.
-  if pipeline_typed_signatures_contain_slice(typed_fns) == 0 and pipeline_type_table_contains_slice(tt) == 0 { facts }
+  if pipeline_typed_signatures_contain_slice(typed_fns) == 0 and pipeline_type_table_contains_slice(tt) == 0 and pipeline_ir_semantic_borrow_signatures_have_values(facts) == 0 { facts }
   else { pipeline_ir_semantic_borrow_values_enrich(facts, facts, pipeline_ir_borrow_function_index(functions)) }
 }
 
@@ -44142,6 +44251,79 @@ fn pipeline_ir_hoisted_lambda_fns_extend(functions: IrFunctionList) -> IrFunctio
   }
 }
 
+fn pipeline_ir_lambda_semantic_facts_handler_clauses(clauses: IrHandlerClauseBodyList, facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
+  match clauses {
+    IrHandlerClauseBodyNil -> facts
+    IrHandlerClauseBodyCons(body, rest) -> {
+      let next = match body {
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_lambda_semantic_facts_blocks(blocks, facts)
+        IrHandlerClauseBodyInvalid(reason) -> facts
+      }
+      pipeline_ir_lambda_semantic_facts_handler_clauses(rest, next)
+    }
+  }
+}
+
+fn pipeline_ir_lambda_semantic_facts_deferred_body(body: IrDeferredHandlerBody, facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
+  match body {
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_lambda_semantic_facts_blocks(blocks, facts)
+    IrDeferredHandlerBodyInvalid(reason) -> facts
+  }
+}
+
+fn pipeline_ir_lambda_semantic_facts_insts(insts: IrInstList, facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
+  match insts {
+    IrInstNil -> facts
+    IrInstCons(inst, rest) -> {
+      let next = match inst {
+        IrClosureI64(dst, f, captures, lambda_facts) -> {
+          match f {
+            IrFunction(hash, nparams, blocks, src) -> {
+              let with_current = pipeline_ir_semantic_facts_prepend_with_borrow(
+                hash,
+                ir_lambda_semantic_facts_fact(lambda_facts),
+                ir_lambda_semantic_facts_borrow(lambda_facts),
+                facts
+              )
+              pipeline_ir_lambda_semantic_facts_blocks(blocks, with_current)
+            }
+          }
+        }
+        IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, reserved) -> pipeline_ir_lambda_semantic_facts_handler_clauses(clauses, facts)
+        IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> {
+          pipeline_ir_lambda_semantic_facts_deferred_body(body, pipeline_ir_lambda_semantic_facts_handler_clauses(clauses, facts))
+        }
+        _ -> facts
+      }
+      pipeline_ir_lambda_semantic_facts_insts(rest, next)
+    }
+  }
+}
+
+fn pipeline_ir_lambda_semantic_facts_blocks(blocks: IrBlockList, facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
+  match blocks {
+    IrBlockListNil -> facts
+    IrBlockListCons(block, rest) -> {
+      let next = match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_lambda_semantic_facts_insts(insts, facts)
+      }
+      pipeline_ir_lambda_semantic_facts_blocks(rest, next)
+    }
+  }
+}
+
+fn pipeline_ir_lambda_semantic_facts_extend(functions: IrFunctionList, facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
+  match functions {
+    IrFunctionNil -> facts
+    IrFunctionCons(f, rest) -> {
+      let next = match f {
+        IrFunction(hash, nparams, blocks, src) -> pipeline_ir_lambda_semantic_facts_blocks(blocks, facts)
+      }
+      pipeline_ir_lambda_semantic_facts_extend(rest, next)
+    }
+  }
+}
+
 fn pipeline_optimise_typed_ir(typed: TypedModule, ir: IrModule) -> IrModule {
   pipeline_optimise_typed_ir_with_promotion(typed, ir, 1)
 }
@@ -44167,13 +44349,14 @@ fn pipeline_optimise_typed_ir_with_promotion(typed: TypedModule, ir: IrModule, p
       -- substituted signature at every generic call site, which is the
       -- same site-driven discovery the spec collector itself uses.
       let spec_facts = pipeline_ir_spec_facts_extend(canonical_functions, templates, pipeline_ir_semantic_facts_effect_flag_map(decl_facts), decl_facts)
+      let lambda_facts = pipeline_ir_lambda_semantic_facts_extend(canonical_functions, spec_facts)
       -- Static named-function pairs are semantic identity producers.
       -- Clone generic specs per proven callback recipe, then copy the
       -- canonical spec fact to each clone so all existing consumers
       -- (purity, ownership masks, tiny inlining) see the same contract.
       let identities = pipeline_ir_identity_specialise(canonical_functions)
       let functions = pipeline_ir_identity_specialisations_functions(identities)
-      let semantic_facts = pipeline_ir_identity_facts_extend(pipeline_ir_identity_specialisations_requests(identities), spec_facts)
+      let semantic_facts = pipeline_ir_identity_facts_extend(pipeline_ir_identity_specialisations_requests(identities), lambda_facts)
       -- Reconnect the per-function IR optimiser (copy propagation, liveness,
       -- block-parameter trimming, DCE) on the typed path. It was bypassed
       -- during the migration for compile-time cost; the block-entry fact
