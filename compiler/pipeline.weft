@@ -173,6 +173,30 @@ type PipelineIrBorrowEnv {
   PipelineIrBorrowEnvCons(i64, i64, IrBorrowSummary, PipelineIrBorrowEnv)
 }
 
+-- Local aggregate provenance is keyed by the aggregate SSA value and physical
+-- word offset. It lets a slice stored in a record/variant retain the original
+-- owner when projected again without pretending the aggregate owns its data.
+type PipelineIrBorrowAggregateFactList {
+  PipelineIrBorrowAggregateFactNil,
+  PipelineIrBorrowAggregateFactCons(i64, i64, IrBorrowOriginList, PipelineIrBorrowAggregateFactList)
+}
+
+-- Monotone per-function dataflow state: SSA origins, slot origins, aggregate
+-- field origins, and a changed bit for CFG/fixpoint propagation.
+type PipelineIrBorrowValuePass {
+  PipelineIrBorrowValuePass(IrBorrowValueFactList, IrBorrowValueFactList, PipelineIrBorrowAggregateFactList, i64)
+}
+
+-- A fixed-depth hash trie keeps function lookup logarithmic regardless of
+-- declaration/hash order. The ordinary candidate BST is optimised for its
+-- small eligible subset; building it over every compiler function can become
+-- a degenerate persistent chain during self-compilation.
+type PipelineIrBorrowFunctionIndex {
+  PipelineIrBorrowFunctionIndexNil,
+  PipelineIrBorrowFunctionIndexBranch(PipelineIrBorrowFunctionIndex, PipelineIrBorrowFunctionIndex),
+  PipelineIrBorrowFunctionIndexLeaf(i64, IrFunction, PipelineIrBorrowFunctionIndex)
+}
+
 type PipelineGenericSpecClosureState {
   PipelineGenericSpecClosureState(IrFunctionList, IrFunctionList)
 }
@@ -36242,6 +36266,745 @@ fn pipeline_ir_borrow_facts_for_signature(params: i64, ret_ty: i64) -> IrBorrowF
   ir_borrow_facts_new(param_facts, value_facts, return_mutability, summary)
 }
 
+fn pipeline_ir_borrow_aggregate_empty() -> PipelineIrBorrowAggregateFactList {
+  PipelineIrBorrowAggregateFactNil
+}
+
+fn pipeline_ir_borrow_aggregate_find(facts: PipelineIrBorrowAggregateFactList, base: i64, offset: i64) -> IrBorrowOriginList {
+  match facts {
+    PipelineIrBorrowAggregateFactNil -> ir_borrow_origin_list_empty()
+    PipelineIrBorrowAggregateFactCons(fact_base, fact_offset, origins, rest) -> {
+      if fact_base == base and fact_offset == offset { origins }
+      else { pipeline_ir_borrow_aggregate_find(rest, base, offset) }
+    }
+  }
+}
+
+fn pipeline_ir_borrow_aggregate_set(facts: PipelineIrBorrowAggregateFactList, base: i64, offset: i64, origins: IrBorrowOriginList) -> PipelineIrBorrowAggregateFactList {
+  match facts {
+    PipelineIrBorrowAggregateFactNil -> PipelineIrBorrowAggregateFactCons(base, offset, origins, PipelineIrBorrowAggregateFactNil)
+    PipelineIrBorrowAggregateFactCons(fact_base, fact_offset, current, rest) -> {
+      if fact_base == base and fact_offset == offset { PipelineIrBorrowAggregateFactCons(base, offset, origins, rest) }
+      else { PipelineIrBorrowAggregateFactCons(fact_base, fact_offset, current, pipeline_ir_borrow_aggregate_set(rest, base, offset, origins)) }
+    }
+  }
+}
+
+fn pipeline_ir_borrow_pass_new(values: IrBorrowValueFactList) -> PipelineIrBorrowValuePass {
+  PipelineIrBorrowValuePass(values, ir_borrow_value_facts_empty(), pipeline_ir_borrow_aggregate_empty(), 0)
+}
+
+fn pipeline_ir_borrow_pass_values(pass: PipelineIrBorrowValuePass) -> IrBorrowValueFactList {
+  match pass { PipelineIrBorrowValuePass(values, slots, aggregates, changed) -> values }
+}
+
+fn pipeline_ir_borrow_pass_slots(pass: PipelineIrBorrowValuePass) -> IrBorrowValueFactList {
+  match pass { PipelineIrBorrowValuePass(values, slots, aggregates, changed) -> slots }
+}
+
+fn pipeline_ir_borrow_pass_aggregates(pass: PipelineIrBorrowValuePass) -> PipelineIrBorrowAggregateFactList {
+  match pass { PipelineIrBorrowValuePass(values, slots, aggregates, changed) -> aggregates }
+}
+
+fn pipeline_ir_borrow_pass_changed(pass: PipelineIrBorrowValuePass) -> i64 {
+  match pass { PipelineIrBorrowValuePass(values, slots, aggregates, changed) -> changed }
+}
+
+fn pipeline_ir_borrow_pass_clear_changed(pass: PipelineIrBorrowValuePass) -> PipelineIrBorrowValuePass {
+  match pass { PipelineIrBorrowValuePass(values, slots, aggregates, changed) -> PipelineIrBorrowValuePass(values, slots, aggregates, 0) }
+}
+
+fn pipeline_ir_borrow_unknown_origins(head: i64, mutable: i64) -> IrBorrowOriginList {
+  ir_borrow_origin_list_prepend(
+    ir_borrow_origin(ir_borrow_owner_unknown(), head, head + 1, mutable),
+    ir_borrow_origin_list_empty()
+  )
+}
+
+fn pipeline_ir_borrow_pass_merge_value(pass: PipelineIrBorrowValuePass, value: i64, incoming: IrBorrowOriginList, mutable: i64) -> PipelineIrBorrowValuePass {
+  match pass {
+    PipelineIrBorrowValuePass(values, slots, aggregates, changed) -> {
+      let current = ir_borrow_value_facts_find(values, value)
+      let next = ir_borrow_origin_list_union_rebased_mutable(incoming, current, value, mutable)
+      if ir_borrow_origin_list_set_eq(current, next) == 1 { pass }
+      else { PipelineIrBorrowValuePass(ir_borrow_value_facts_set(values, value, next), slots, aggregates, 1) }
+    }
+  }
+}
+
+fn pipeline_ir_borrow_pass_merge_slot(pass: PipelineIrBorrowValuePass, slot: i64, incoming: IrBorrowOriginList) -> PipelineIrBorrowValuePass {
+  match pass {
+    PipelineIrBorrowValuePass(values, slots, aggregates, changed) -> {
+      let current = ir_borrow_value_facts_find(slots, slot)
+      let next = ir_borrow_origin_list_union_rebased(incoming, current, slot)
+      if ir_borrow_origin_list_set_eq(current, next) == 1 { pass }
+      else { PipelineIrBorrowValuePass(values, ir_borrow_value_facts_set(slots, slot, next), aggregates, 1) }
+    }
+  }
+}
+
+fn pipeline_ir_borrow_pass_merge_aggregate(pass: PipelineIrBorrowValuePass, base: i64, offset: i64, incoming: IrBorrowOriginList) -> PipelineIrBorrowValuePass {
+  match pass {
+    PipelineIrBorrowValuePass(values, slots, aggregates, changed) -> {
+      let current = pipeline_ir_borrow_aggregate_find(aggregates, base, offset)
+      -- Aggregate storage does not become the owner. Preserve the source SSA
+      -- pair in the fact and rebase only when a projection creates a new pair.
+      let next = ir_borrow_origin_list_union(incoming, current)
+      if ir_borrow_origin_list_set_eq(current, next) == 1 { pass }
+      else { PipelineIrBorrowValuePass(values, slots, pipeline_ir_borrow_aggregate_set(aggregates, base, offset, next), 1) }
+    }
+  }
+}
+
+fn pipeline_ir_borrow_call_map_origins(indices: IrValueList, args: IrValueList, params: i64, values: IrBorrowValueFactList, dst: i64, mutable: i64, result: IrBorrowOriginList) -> IrBorrowOriginList {
+  match indices {
+    IrValueNil -> result
+    IrValueCons(index, rest) -> {
+      let physical = if params == 0 or index < 0 or index >= nlist_len(params) { 0 - 1 } else { pipeline_param_value_index_at(params, index) }
+      let arg = if physical < 0 { 0 - 1 } else { ir_value_list_nth_or(args, physical, 0 - 1) }
+      let incoming = if arg < 0 { ir_borrow_origin_list_empty() } else { ir_borrow_value_facts_find(values, arg) }
+      let next = match incoming {
+        IrBorrowOriginNil -> ir_borrow_origin_list_add_unique(result, ir_borrow_origin(ir_borrow_owner_unknown(), dst, dst + 1, mutable))
+        _ -> ir_borrow_origin_list_union_rebased_mutable(incoming, result, dst, mutable)
+      }
+      pipeline_ir_borrow_call_map_origins(rest, args, params, values, dst, mutable, next)
+    }
+  }
+}
+
+fn pipeline_ir_borrow_call_origins(callee_hash: i64, args: IrValueList, dst: i64, facts: PipelineIrSemanticFactList, values: IrBorrowValueFactList) -> IrBorrowOriginList {
+  let borrow = pipeline_ir_semantic_borrow_fact_find(facts, callee_hash)
+  let mutable = ir_borrow_facts_return_mutability(borrow)
+  if mutable < 0 { ir_borrow_origin_list_empty() }
+  else {
+    match ir_borrow_facts_summary(borrow) {
+      IrBorrowSummaryUnknown -> pipeline_ir_borrow_unknown_origins(dst, mutable)
+      IrBorrowSummaryKnown(indices) -> {
+        let fact = pipeline_ir_semantic_fact_find(facts, callee_hash)
+        let params = if fact == 0 { 0 } else { cg_semantic_fact_param_shapes(fact) }
+        let mapped = pipeline_ir_borrow_call_map_origins(indices, args, params, values, dst, mutable, ir_borrow_origin_list_empty())
+        match mapped {
+          IrBorrowOriginNil -> pipeline_ir_borrow_unknown_origins(dst, mutable)
+          _ -> mapped
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_borrow_pass_direct_call(pass: PipelineIrBorrowValuePass, dst: i64, callee_hash: i64, args: IrValueList, facts: PipelineIrSemanticFactList) -> PipelineIrBorrowValuePass {
+  let origins = pipeline_ir_borrow_call_origins(callee_hash, args, dst, facts, pipeline_ir_borrow_pass_values(pass))
+  match origins {
+    IrBorrowOriginNil -> pass
+    _ -> pipeline_ir_borrow_pass_merge_value(pass, dst, origins, 0 - 1)
+  }
+}
+
+fn pipeline_ir_borrow_pass_record_fields(pass: PipelineIrBorrowValuePass, base: i64, fields: IrRecordFieldList) -> PipelineIrBorrowValuePass {
+  match fields {
+    IrRecordFieldNil -> pass
+    IrRecordFieldCons(field_hash, offset, value, rest) -> {
+      let origins = ir_borrow_value_facts_find(pipeline_ir_borrow_pass_values(pass), value)
+      let next = match origins {
+        IrBorrowOriginNil -> pass
+        _ -> pipeline_ir_borrow_pass_merge_aggregate(pass, base, offset, origins)
+      }
+      pipeline_ir_borrow_pass_record_fields(next, base, rest)
+    }
+  }
+}
+
+fn pipeline_ir_borrow_pass_variant_payloads(pass: PipelineIrBorrowValuePass, base: i64, payloads: IrValueList, offset: i64) -> PipelineIrBorrowValuePass {
+  match payloads {
+    IrValueNil -> pass
+    IrValueCons(value, rest) -> {
+      let origins = ir_borrow_value_facts_find(pipeline_ir_borrow_pass_values(pass), value)
+      let next = match origins {
+        IrBorrowOriginNil -> pass
+        _ -> pipeline_ir_borrow_pass_merge_aggregate(pass, base, offset, origins)
+      }
+      pipeline_ir_borrow_pass_variant_payloads(next, base, rest, offset + 1)
+    }
+  }
+}
+
+fn pipeline_ir_borrow_insts_start_field_pair(rest: IrInstList, dst: i64, base: i64, field_hash: i64, offset: i64) -> i64 {
+  match rest {
+    IrInstCons(next, tail) -> match next {
+      IrFieldLoadI64(next_dst, next_base, next_hash, next_offset) -> if next_dst == dst + 1 and next_base == base and next_hash == field_hash and next_offset == offset + 1 { 1 } else { 0 }
+      _ -> 0
+    }
+    _ -> 0
+  }
+}
+
+fn pipeline_ir_borrow_insts_start_variant_pair(rest: IrInstList, dst: i64, base: i64, offset: i64) -> i64 {
+  match rest {
+    IrInstCons(next, tail) -> match next {
+      IrVariantPayloadI64(next_dst, next_base, next_offset) -> if next_dst == dst + 1 and next_base == base and next_offset == offset + 1 { 1 } else { 0 }
+      _ -> 0
+    }
+    _ -> 0
+  }
+}
+
+fn pipeline_ir_borrow_insts_start_load_pair(rest: IrInstList, dst: i64, slot: i64) -> i64 {
+  match rest {
+    IrInstCons(next, tail) -> match next {
+      IrLoadI64(next_dst, next_slot) -> if next_dst == dst + 1 and next_slot == slot + 1 { 1 } else { 0 }
+      _ -> 0
+    }
+    _ -> 0
+  }
+}
+
+fn pipeline_ir_borrow_pass_handler_clauses(clauses: IrHandlerClauseBodyList, pass: PipelineIrBorrowValuePass, facts: PipelineIrSemanticFactList) -> PipelineIrBorrowValuePass {
+  match clauses {
+    IrHandlerClauseBodyNil -> pass
+    IrHandlerClauseBodyCons(body, rest) -> {
+      let next = match body {
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_borrow_pass_blocks_once(blocks, pass, facts)
+        IrHandlerClauseBodyInvalid(reason) -> pass
+      }
+      pipeline_ir_borrow_pass_handler_clauses(rest, next, facts)
+    }
+  }
+}
+
+fn pipeline_ir_borrow_pass_deferred_body(body: IrDeferredHandlerBody, pass: PipelineIrBorrowValuePass, facts: PipelineIrSemanticFactList) -> PipelineIrBorrowValuePass {
+  match body {
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_borrow_pass_blocks_once(blocks, pass, facts)
+    IrDeferredHandlerBodyInvalid(reason) -> pass
+  }
+}
+
+fn pipeline_ir_borrow_pass_insts(insts: IrInstList, pass: PipelineIrBorrowValuePass, facts: PipelineIrSemanticFactList) -> PipelineIrBorrowValuePass {
+  match insts {
+    IrInstNil -> pass
+    IrInstCons(inst, rest) -> {
+      let next = match inst {
+        IrCallI64(dst, callee_hash, args) -> pipeline_ir_borrow_pass_direct_call(pass, dst, callee_hash, args, facts)
+        IrGenericCallI64(dst, callee_hash, type_args, args) -> {
+          let spec_hash = mono_spec_hash(callee_hash, type_expr_list_to_nodes(type_args))
+          pipeline_ir_borrow_pass_direct_call(pass, dst, spec_hash, args, facts)
+        }
+        IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> {
+          let qualified = pipeline_ir_method_patch_key(type_hash, method_hash)
+          let callee_hash = if pipeline_ir_semantic_fact_find(facts, qualified) != 0 { qualified } else { method_hash }
+          pipeline_ir_borrow_pass_direct_call(pass, dst, callee_hash, ir_value_list_prepend(receiver, args), facts)
+        }
+        IrCallResultLaneI64(dst, lane) -> {
+          let head = dst - lane
+          if lane == 1 and ir_borrow_origin_list_len(ir_borrow_value_facts_find(pipeline_ir_borrow_pass_values(pass), head)) == 0 {
+            pipeline_ir_borrow_pass_merge_value(pass, head, pipeline_ir_borrow_unknown_origins(head, 0), 0 - 1)
+          } else { pass }
+        }
+        IrStoreI64(slot, value) -> {
+          let origins = ir_borrow_value_facts_find(pipeline_ir_borrow_pass_values(pass), value)
+          match origins { IrBorrowOriginNil -> pass _ -> pipeline_ir_borrow_pass_merge_slot(pass, slot, origins) }
+        }
+        IrLoadI64(dst, slot) -> {
+          let origins = ir_borrow_value_facts_find(pipeline_ir_borrow_pass_slots(pass), slot)
+          match origins {
+            IrBorrowOriginNil -> if pipeline_ir_borrow_insts_start_load_pair(rest, dst, slot) == 1 { pipeline_ir_borrow_pass_merge_value(pass, dst, pipeline_ir_borrow_unknown_origins(dst, 0), 0 - 1) } else { pass }
+            _ -> pipeline_ir_borrow_pass_merge_value(pass, dst, origins, 0 - 1)
+          }
+        }
+        IrRecordInitI64(dst, type_hash, fields) -> pipeline_ir_borrow_pass_record_fields(pass, dst, fields)
+        IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> pipeline_ir_borrow_pass_variant_payloads(pass, dst, payloads, 0)
+        IrFieldLoadI64(dst, base, field_hash, offset) -> {
+          let origins = pipeline_ir_borrow_aggregate_find(pipeline_ir_borrow_pass_aggregates(pass), base, offset)
+          match origins {
+            IrBorrowOriginNil -> if pipeline_ir_borrow_insts_start_field_pair(rest, dst, base, field_hash, offset) == 1 { pipeline_ir_borrow_pass_merge_value(pass, dst, pipeline_ir_borrow_unknown_origins(dst, 0), 0 - 1) } else { pass }
+            _ -> pipeline_ir_borrow_pass_merge_value(pass, dst, origins, 0 - 1)
+          }
+        }
+        IrVariantPayloadI64(dst, base, offset) -> {
+          let origins = pipeline_ir_borrow_aggregate_find(pipeline_ir_borrow_pass_aggregates(pass), base, offset)
+          match origins {
+            IrBorrowOriginNil -> if pipeline_ir_borrow_insts_start_variant_pair(rest, dst, base, offset) == 1 { pipeline_ir_borrow_pass_merge_value(pass, dst, pipeline_ir_borrow_unknown_origins(dst, 0), 0 - 1) } else { pass }
+            _ -> pipeline_ir_borrow_pass_merge_value(pass, dst, origins, 0 - 1)
+          }
+        }
+        IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, abort_block) -> pipeline_ir_borrow_pass_handler_clauses(clauses, pass, facts)
+        IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> pipeline_ir_borrow_pass_deferred_body(body, pipeline_ir_borrow_pass_handler_clauses(clauses, pass, facts), facts)
+        _ -> pass
+      }
+      pipeline_ir_borrow_pass_insts(rest, next, facts)
+    }
+  }
+}
+
+fn pipeline_ir_borrow_pass_jump_args(args: IrValueList, params: IrValueList, pass: PipelineIrBorrowValuePass) -> PipelineIrBorrowValuePass {
+  match args {
+    IrValueNil -> pass
+    IrValueCons(arg, arg_rest) -> {
+      match params {
+        IrValueNil -> pass
+        IrValueCons(param, param_rest) -> {
+          let origins = ir_borrow_value_facts_find(pipeline_ir_borrow_pass_values(pass), arg)
+          let next = match origins { IrBorrowOriginNil -> pass _ -> pipeline_ir_borrow_pass_merge_value(pass, param, origins, 0 - 1) }
+          pipeline_ir_borrow_pass_jump_args(arg_rest, param_rest, next)
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_borrow_pass_blocks_once_inner(blocks: IrBlockList, all_blocks: IrBlockList, pass: PipelineIrBorrowValuePass, facts: PipelineIrSemanticFactList) -> PipelineIrBorrowValuePass {
+  match blocks {
+    IrBlockListNil -> pass
+    IrBlockListCons(block, rest) -> {
+      let next = match block {
+        IrBlock(id, params, insts, term) -> {
+          let after_insts = pipeline_ir_borrow_pass_insts(insts, pass, facts)
+          match term {
+            IrTermJump(target, args) -> pipeline_ir_borrow_pass_jump_args(args, ir_block_list_params_for_id(all_blocks, target), after_insts)
+            _ -> after_insts
+          }
+        }
+      }
+      pipeline_ir_borrow_pass_blocks_once_inner(rest, all_blocks, next, facts)
+    }
+  }
+}
+
+fn pipeline_ir_borrow_pass_blocks_once(blocks: IrBlockList, pass: PipelineIrBorrowValuePass, facts: PipelineIrSemanticFactList) -> PipelineIrBorrowValuePass {
+  pipeline_ir_borrow_pass_blocks_once_inner(blocks, blocks, pass, facts)
+}
+
+fn pipeline_ir_borrow_values_for_function(f: IrFunction, borrow: IrBorrowFacts, facts: PipelineIrSemanticFactList) -> IrBorrowFacts {
+  match f {
+    IrFunction(hash, nparams, blocks, src) -> {
+      let mut pass = pipeline_ir_borrow_pass_new(ir_borrow_facts_values(borrow))
+      let mut budget = (pipeline_ir_function_next_value(nparams, blocks) + 2) * (ir_borrow_param_fact_count(ir_borrow_facts_params(borrow)) + 2) + ir_block_list_len(blocks) + 1
+      let mut walking = 1
+      while walking == 1 and budget > 0 {
+        pass = pipeline_ir_borrow_pass_blocks_once(blocks, pipeline_ir_borrow_pass_clear_changed(pass), facts)
+        if pipeline_ir_borrow_pass_changed(pass) == 0 { walking = 0 } else { 0 }
+        budget = budget - 1
+      }
+      ir_borrow_facts_with_values(borrow, pipeline_ir_borrow_pass_values(pass))
+    }
+  }
+}
+
+fn pipeline_ir_borrow_function_index_insert(index: PipelineIrBorrowFunctionIndex, hash: i64, f: IrFunction, bit: i64) -> PipelineIrBorrowFunctionIndex {
+  if bit >= 63 {
+    match index {
+      PipelineIrBorrowFunctionIndexNil -> PipelineIrBorrowFunctionIndexLeaf(hash, f, PipelineIrBorrowFunctionIndexNil)
+      PipelineIrBorrowFunctionIndexLeaf(entry_hash, entry, rest) -> {
+        if entry_hash == hash { PipelineIrBorrowFunctionIndexLeaf(hash, f, rest) }
+        else { PipelineIrBorrowFunctionIndexLeaf(entry_hash, entry, pipeline_ir_borrow_function_index_insert(rest, hash, f, bit)) }
+      }
+      _ -> index
+    }
+  } else {
+    let high = (hash bshr bit) band 1
+    match index {
+      PipelineIrBorrowFunctionIndexNil -> {
+        if high == 0 {
+          PipelineIrBorrowFunctionIndexBranch(pipeline_ir_borrow_function_index_insert(PipelineIrBorrowFunctionIndexNil, hash, f, bit + 1), PipelineIrBorrowFunctionIndexNil)
+        } else {
+          PipelineIrBorrowFunctionIndexBranch(PipelineIrBorrowFunctionIndexNil, pipeline_ir_borrow_function_index_insert(PipelineIrBorrowFunctionIndexNil, hash, f, bit + 1))
+        }
+      }
+      PipelineIrBorrowFunctionIndexBranch(low, upper) -> {
+        if high == 0 { PipelineIrBorrowFunctionIndexBranch(pipeline_ir_borrow_function_index_insert(low, hash, f, bit + 1), upper) }
+        else { PipelineIrBorrowFunctionIndexBranch(low, pipeline_ir_borrow_function_index_insert(upper, hash, f, bit + 1)) }
+      }
+      _ -> index
+    }
+  }
+}
+
+fn pipeline_ir_borrow_function_index(functions: IrFunctionList) -> PipelineIrBorrowFunctionIndex {
+  let mut index = PipelineIrBorrowFunctionIndexNil
+  let mut cur = functions
+  let mut walking = 1
+  while walking == 1 {
+    match cur {
+      IrFunctionNil -> { walking = 0 }
+      IrFunctionCons(f, rest) -> {
+        match f { IrFunction(hash, nparams, blocks, src) -> { index = pipeline_ir_borrow_function_index_insert(index, hash, f, 0) } }
+        cur = rest
+      }
+    }
+  }
+  index
+}
+
+fn pipeline_ir_borrow_function_index_lookup(index: PipelineIrBorrowFunctionIndex, hash: i64, bit: i64) -> IrFunctionList {
+  match index {
+    PipelineIrBorrowFunctionIndexNil -> ir_function_list_empty()
+    PipelineIrBorrowFunctionIndexBranch(low, upper) -> {
+      if ((hash bshr bit) band 1) == 0 { pipeline_ir_borrow_function_index_lookup(low, hash, bit + 1) }
+      else { pipeline_ir_borrow_function_index_lookup(upper, hash, bit + 1) }
+    }
+    PipelineIrBorrowFunctionIndexLeaf(entry_hash, f, rest) -> {
+      if entry_hash == hash { ir_function_list_prepend(f, ir_function_list_empty()) }
+      else { pipeline_ir_borrow_function_index_lookup(rest, hash, bit) }
+    }
+  }
+}
+
+fn pipeline_ir_borrow_handler_clauses_have_values(clauses: IrHandlerClauseBodyList) -> i64 {
+  match clauses {
+    IrHandlerClauseBodyNil -> 0
+    IrHandlerClauseBodyCons(body, rest) -> {
+      let hit = match body {
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_borrow_blocks_have_values(blocks)
+        IrHandlerClauseBodyInvalid(reason) -> 0
+      }
+      if hit == 1 { 1 } else { pipeline_ir_borrow_handler_clauses_have_values(rest) }
+    }
+  }
+}
+
+fn pipeline_ir_borrow_deferred_body_has_values(body: IrDeferredHandlerBody) -> i64 {
+  match body {
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_borrow_blocks_have_values(blocks)
+    IrDeferredHandlerBodyInvalid(reason) -> 0
+  }
+}
+
+fn pipeline_ir_borrow_insts_have_values(insts: IrInstList) -> i64 {
+  let mut cur = insts
+  let mut found = 0
+  let mut walking = 1
+  while walking == 1 {
+    match cur {
+      IrInstNil -> { walking = 0 }
+      IrInstCons(inst, rest) -> {
+        let hit = match inst {
+          IrCallResultLaneI64(dst, lane) -> if lane == 1 { 1 } else { 0 }
+          IrLoadI64(dst, slot) -> pipeline_ir_borrow_insts_start_load_pair(rest, dst, slot)
+          IrFieldLoadI64(dst, base, field_hash, offset) -> pipeline_ir_borrow_insts_start_field_pair(rest, dst, base, field_hash, offset)
+          IrVariantPayloadI64(dst, base, offset) -> pipeline_ir_borrow_insts_start_variant_pair(rest, dst, base, offset)
+          IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, abort_block) -> pipeline_ir_borrow_handler_clauses_have_values(clauses)
+          IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> {
+            if pipeline_ir_borrow_handler_clauses_have_values(clauses) == 1 { 1 } else { pipeline_ir_borrow_deferred_body_has_values(body) }
+          }
+          _ -> 0
+        }
+        if hit == 1 { found = 1 walking = 0 } else { cur = rest }
+      }
+    }
+  }
+  found
+}
+
+fn pipeline_ir_borrow_blocks_have_values(blocks: IrBlockList) -> i64 {
+  let mut cur = blocks
+  let mut found = 0
+  let mut walking = 1
+  while walking == 1 {
+    match cur {
+      IrBlockListNil -> { walking = 0 }
+      IrBlockListCons(block, rest) -> {
+        let hit = match block { IrBlock(id, params, insts, term) -> pipeline_ir_borrow_insts_have_values(insts) }
+        if hit == 1 { found = 1 walking = 0 } else { cur = rest }
+      }
+    }
+  }
+  found
+}
+
+fn pipeline_ir_borrow_function_has_values(f: IrFunction, borrow: IrBorrowFacts) -> i64 {
+  if ir_borrow_param_fact_count(ir_borrow_facts_params(borrow)) > 0 or ir_borrow_facts_return_mutability(borrow) >= 0 { 1 }
+  else { match f { IrFunction(hash, nparams, blocks, src) -> pipeline_ir_borrow_blocks_have_values(blocks) } }
+}
+
+fn pipeline_type_list_contains_slice(types: i64) -> bool {
+  if types == 0 { false }
+  else {
+    let mut found = false
+    for i in 0..nlist_len(types) {
+      if pipeline_type_contains_slice(nlist_get(types, i)) == 1 { found = true } else { found = found }
+    }
+    found
+  }
+}
+
+fn pipeline_type_contains_slice(ty: i64) -> bool {
+  if ty == 0 { false }
+  else {
+    match ty_tag(ty) {
+      3 -> pipeline_type_contains_slice(ty_f1(ty)) or pipeline_type_contains_slice(ty_f2(ty))
+      4 -> pipeline_type_contains_slice(ty_f1(ty)) or pipeline_type_contains_slice(ty_f2(ty))
+      5 -> pipeline_type_contains_slice(ty_f1(ty))
+      6 -> pipeline_type_list_contains_slice(ty_f1(ty)) or pipeline_type_contains_slice(ty_f2(ty))
+      8 -> pipeline_type_contains_slice(ty_f2(ty))
+      9 -> pipeline_type_contains_slice(ty_f2(ty)) or pipeline_type_list_contains_slice(ty_f3(ty))
+      11 -> pipeline_type_list_contains_slice(ty_f2(ty))
+      14 -> pipeline_type_contains_slice(ty_f1(ty)) or pipeline_type_contains_slice(ty_f2(ty))
+      15 -> pipeline_type_contains_slice(ty_f1(ty))
+      16 -> pipeline_type_contains_slice(ty_f1(ty))
+      17 -> pipeline_type_contains_slice(ty_f1(ty))
+      18 -> pipeline_type_contains_slice(ty_f1(ty))
+      19 -> pipeline_type_contains_slice(ty_f1(ty))
+      22 -> pipeline_type_contains_slice(ty_array_inner(ty))
+      23 -> true
+      _ -> false
+    }
+  }
+}
+
+fn pipeline_param_nodes_contain_slice(params: i64) -> bool {
+  if params == 0 { false }
+  else {
+    let mut found = false
+    for i in 0..nlist_len(params) {
+      if pipeline_type_contains_slice(node_f3(nlist_get(params, i))) == 1 { found = true } else { found = found }
+    }
+    found
+  }
+}
+
+fn pipeline_typed_decl_signature_contains_slice(decl: i64) -> bool {
+  if decl == 0 { false }
+  else {
+    match node_tag(decl) {
+      8 -> pipeline_param_nodes_contain_slice(node_f3(decl))
+      23 -> {
+        if pipeline_typed_decl_signature_contains_slice(node_f1(decl)) == 1 { true }
+        else { pipeline_type_contains_slice(node_f2(decl)) }
+      }
+      30 -> {
+        let ops = node_f3(decl)
+        let mut found = false
+        if ops != 0 {
+          for i in 0..nlist_len(ops) {
+            let op = nlist_get(ops, i)
+            if pipeline_param_nodes_contain_slice(node_f3(op)) or pipeline_type_contains_slice(type_effect_op_node_ret(op)) { found = true } else { found = found }
+          }
+        } else { false }
+        found
+      }
+      38 -> {
+        let members = node_f3(decl)
+        let mut found = false
+        if members != 0 {
+          for i in 0..nlist_len(members) {
+            let member = nlist_get(members, i)
+            if node_tag(member) == 39 {
+              let ret_wrap = node_f4(member)
+              let ret_ty = if ret_wrap == 0 { 0 } else { node_f1(ret_wrap) }
+              if pipeline_param_nodes_contain_slice(node_f3(member)) or pipeline_type_contains_slice(ret_ty) { found = true } else { found = found }
+            } else { found = found }
+          }
+        } else { false }
+        found
+      }
+      40 -> {
+        let members = node_f3(decl)
+        let mut found = false
+        if members != 0 {
+          for i in 0..nlist_len(members) {
+            if pipeline_typed_decl_signature_contains_slice(nlist_get(members, i)) == 1 { found = true } else { found = found }
+          }
+        } else { false }
+        found
+      }
+      _ -> false
+    }
+  }
+}
+
+fn pipeline_typed_signatures_contain_slice(fns: i64) -> bool {
+  let mut found = false
+  for i in 0..nlist_len(fns) {
+    if pipeline_typed_decl_signature_contains_slice(node_f1(nlist_get(fns, i))) == 1 { found = true } else { found = found }
+  }
+  found
+}
+
+fn pipeline_type_table_contains_slice(tt: i64) -> bool {
+  if tt == 0 { false }
+  else {
+    let entries = mem_load64_at(tt, 0)
+    let count = mem_load64_at(tt, 8)
+    let mut found = false
+    for i in 0..count {
+      let entry = entries + i * 64
+      let kind = types_storage_type_entry_kind(entry)
+      let item_count = types_storage_type_entry_payload_count(entry)
+      let payload = types_storage_type_entry_payload(entry)
+      if kind == 0 {
+        for j in 0..item_count {
+          if pipeline_type_contains_slice(types_storage_record_field_type_node(payload, j)) == 1 { found = true } else { found = found }
+        }
+      } else { if kind == 1 {
+        for j in 0..item_count {
+          if pipeline_type_list_contains_slice(types_storage_variant_payloads(payload, j)) == 1 { found = true } else { found = found }
+        }
+      } else { if kind == 2 {
+        for j in 0..item_count {
+          let op = nlist_get(payload, j)
+          if pipeline_param_nodes_contain_slice(node_f3(op)) or pipeline_type_contains_slice(type_effect_op_node_ret(op)) { found = true } else { found = found }
+        }
+      } else { if kind == 3 {
+        for j in 0..item_count {
+          let member = nlist_get(payload, j)
+          if node_tag(member) == 39 {
+            let ret_wrap = node_f4(member)
+            let ret_ty = if ret_wrap == 0 { 0 } else { node_f1(ret_wrap) }
+            if pipeline_param_nodes_contain_slice(node_f3(member)) or pipeline_type_contains_slice(ret_ty) { found = true } else { found = found }
+          } else { found = found }
+        }
+      } else { if kind == 4 {
+        for j in 0..item_count {
+          if pipeline_typed_decl_signature_contains_slice(nlist_get(payload, j)) == 1 { found = true } else { found = found }
+        }
+      } else { found = found } } } } }
+    }
+    found
+  }
+}
+
+fn pipeline_ir_semantic_borrow_values_enrich(facts: PipelineIrSemanticFactList, all_facts: PipelineIrSemanticFactList, functions: PipelineIrBorrowFunctionIndex) -> PipelineIrSemanticFactList {
+  match facts {
+    PipelineIrSemanticFactNil -> PipelineIrSemanticFactNil
+    PipelineIrSemanticFactNode(hash, fact, borrow, left, right) -> {
+      let enriched = match pipeline_ir_borrow_function_index_lookup(functions, hash, 0) {
+        IrFunctionNil -> borrow
+        IrFunctionCons(f, rest) -> {
+          if pipeline_ir_borrow_function_has_values(f, borrow) == 1 { pipeline_ir_borrow_values_for_function(f, borrow, all_facts) }
+          else { borrow }
+        }
+      }
+      PipelineIrSemanticFactNode(
+        hash,
+        fact,
+        enriched,
+        pipeline_ir_semantic_borrow_values_enrich(left, all_facts, functions),
+        pipeline_ir_semantic_borrow_values_enrich(right, all_facts, functions)
+      )
+    }
+  }
+}
+
+fn pipeline_ir_semantic_borrow_values_enrich_functions(facts: PipelineIrSemanticFactList, functions: IrFunctionList, typed_fns: i64, tt: i64) -> PipelineIrSemanticFactList {
+  -- The typed signature graph is the semantic producer for whether a module
+  -- can contain slice values. Two-word ABI shapes are not sufficient evidence:
+  -- other transports share them and would spuriously enable this whole pass.
+  if pipeline_typed_signatures_contain_slice(typed_fns) == 0 and pipeline_type_table_contains_slice(tt) == 0 { facts }
+  else { pipeline_ir_semantic_borrow_values_enrich(facts, facts, pipeline_ir_borrow_function_index(functions)) }
+}
+
+fn pipeline_ir_borrow_values_complete_handler_clauses(clauses: IrHandlerClauseBodyList, values: IrBorrowValueFactList) -> i64 {
+  match clauses {
+    IrHandlerClauseBodyNil -> 1
+    IrHandlerClauseBodyCons(body, rest) -> {
+      let valid = match body {
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_borrow_values_complete_blocks(blocks, blocks, values)
+        IrHandlerClauseBodyInvalid(reason) -> 1
+      }
+      if valid != 1 { 0 } else { pipeline_ir_borrow_values_complete_handler_clauses(rest, values) }
+    }
+  }
+}
+
+fn pipeline_ir_borrow_values_complete_deferred_body(body: IrDeferredHandlerBody, values: IrBorrowValueFactList) -> i64 {
+  match body {
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_borrow_values_complete_blocks(blocks, blocks, values)
+    IrDeferredHandlerBodyInvalid(reason) -> 1
+  }
+}
+
+fn pipeline_ir_borrow_values_complete_insts(insts: IrInstList, values: IrBorrowValueFactList) -> i64 {
+  match insts {
+    IrInstNil -> 1
+    IrInstCons(inst, rest) -> {
+      let valid = match inst {
+        IrCallResultLaneI64(dst, lane) -> {
+          if lane != 1 { 1 }
+          else { if ir_borrow_origin_list_len(ir_borrow_value_facts_find(values, dst - lane)) > 0 { 1 } else { 0 } }
+        }
+        IrLoadI64(dst, slot) -> {
+          if pipeline_ir_borrow_insts_start_load_pair(rest, dst, slot) != 1 { 1 }
+          else { if ir_borrow_origin_list_len(ir_borrow_value_facts_find(values, dst)) > 0 { 1 } else { 0 } }
+        }
+        IrFieldLoadI64(dst, base, field_hash, offset) -> {
+          if pipeline_ir_borrow_insts_start_field_pair(rest, dst, base, field_hash, offset) != 1 { 1 }
+          else { if ir_borrow_origin_list_len(ir_borrow_value_facts_find(values, dst)) > 0 { 1 } else { 0 } }
+        }
+        IrVariantPayloadI64(dst, base, offset) -> {
+          if pipeline_ir_borrow_insts_start_variant_pair(rest, dst, base, offset) != 1 { 1 }
+          else { if ir_borrow_origin_list_len(ir_borrow_value_facts_find(values, dst)) > 0 { 1 } else { 0 } }
+        }
+        IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, abort_block) -> pipeline_ir_borrow_values_complete_handler_clauses(clauses, values)
+        IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> {
+          if pipeline_ir_borrow_values_complete_handler_clauses(clauses, values) != 1 { 0 }
+          else { pipeline_ir_borrow_values_complete_deferred_body(body, values) }
+        }
+        _ -> 1
+      }
+      if valid != 1 { 0 } else { pipeline_ir_borrow_values_complete_insts(rest, values) }
+    }
+  }
+}
+
+fn pipeline_ir_borrow_values_complete_jump(args: IrValueList, params: IrValueList, values: IrBorrowValueFactList) -> i64 {
+  match args {
+    IrValueNil -> 1
+    IrValueCons(arg, arg_rest) -> {
+      match params {
+        IrValueNil -> 1
+        IrValueCons(param, param_rest) -> {
+          let incoming = ir_borrow_value_facts_find(values, arg)
+          let current = ir_borrow_value_facts_find(values, param)
+          if ir_borrow_origin_list_rebased_contained(incoming, current, param) != 1 { 0 }
+          else { pipeline_ir_borrow_values_complete_jump(arg_rest, param_rest, values) }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_borrow_values_complete_blocks(blocks: IrBlockList, all_blocks: IrBlockList, values: IrBorrowValueFactList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 1
+    IrBlockListCons(block, rest) -> {
+      let valid = match block {
+        IrBlock(id, params, insts, term) -> {
+          if pipeline_ir_borrow_values_complete_insts(insts, values) != 1 { 0 }
+          else {
+            match term {
+              IrTermJump(target, args) -> pipeline_ir_borrow_values_complete_jump(args, ir_block_list_params_for_id(all_blocks, target), values)
+              _ -> 1
+            }
+          }
+        }
+      }
+      if valid != 1 { 0 } else { pipeline_ir_borrow_values_complete_blocks(rest, all_blocks, values) }
+    }
+  }
+}
+
+fn pipeline_ir_semantic_borrow_values_first_incomplete_hash_or(functions: IrFunctionList, facts: PipelineIrSemanticFactList, default: i64) -> i64 {
+  match functions {
+    IrFunctionNil -> default
+    IrFunctionCons(f, rest) -> {
+      match f {
+        IrFunction(hash, nparams, blocks, src) -> {
+          let fact = pipeline_ir_semantic_fact_find(facts, hash)
+          if fact != 0 {
+            let borrow = pipeline_ir_semantic_borrow_fact_find(facts, hash)
+            if pipeline_ir_borrow_values_complete_blocks(blocks, blocks, ir_borrow_facts_values(borrow)) != 1 { hash }
+            else { pipeline_ir_semantic_borrow_values_first_incomplete_hash_or(rest, facts, default) }
+          } else { pipeline_ir_semantic_borrow_values_first_incomplete_hash_or(rest, facts, default) }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_ir_semantic_borrow_values_complete(ir: IrModule) -> i64 {
+  let default = 0 - 1
+  if pipeline_ir_semantic_borrow_values_first_incomplete_hash_or(pipeline_ir_functions(ir), pipeline_ir_semantic_facts(ir), default) == default { 1 } else { 0 }
+}
+
 fn pipeline_ir_semantic_borrow_facts_valid_list(facts: PipelineIrSemanticFactList) -> i64 {
   match facts {
     PipelineIrSemanticFactNil -> 1
@@ -36287,9 +37050,10 @@ fn pipeline_ir_semantic_facts_from_fns_with_flags(fns: i64, user_src: i64, effec
       let eff = effect_sig_from_node(fn_effects(fn_wrap))
       let declared_alloc = effect_sig_contains_hash(eff, effect_name_hash(__str_ptr("Alloc"), 0, 5))
       let declared_unsafe = effect_sig_contains_hash(eff, effect_name_hash(__str_ptr("Unsafe"), 0, 6))
-      let hash = str_hash(fn_src, node_f1(inner), node_f2(inner))
+      let name_hash = str_hash(fn_src, node_f1(inner), node_f2(inner))
+      let hash = pipeline_ir_function_key(name_hash, node_f3(pair))
       let effect_summary = cg_semantic_effect_summary_new(effect_sig_is_closed_or(eff, 1), effect_sig_count_or(eff, 0), declared_alloc, declared_unsafe)
-      let fact = cg_semantic_fact_new_with_effect_summary(0, effect_summary, params, ret_ty, 0, pipeline_ir_effect_flag_map_lookup(effect_flags, hash))
+      let fact = cg_semantic_fact_new_with_effect_summary(0, effect_summary, params, ret_ty, 0, pipeline_ir_effect_flag_map_lookup(effect_flags, name_hash))
       let signature_borrow = pipeline_ir_borrow_facts_for_signature(params, ret_ty)
       let summary = if ty_is_slice(ret_ty) or fn_tparams(fn_wrap) != 0 {
         pipeline_ir_borrow_pair_summary(pair, fns, ir_value_list_empty())
@@ -43422,6 +44186,10 @@ fn pipeline_optimise_typed_ir_with_promotion(typed: TypedModule, ir: IrModule, p
       } else {
         pipeline_optimised_functions_functions(opt)
       }
+      -- Publish provenance against the IR that leaves the optimiser. This is
+      -- deliberately after copy-prop/mem2reg renumbering: consumers see facts
+      -- for the SSA values in the module, never stale pre-optimisation ids.
+      let final_semantic_facts = pipeline_ir_semantic_borrow_values_enrich_functions(semantic_facts, final_functions, fns, tt)
       OptimisedIrModule(
         final_functions,
         0,
@@ -43430,7 +44198,7 @@ fn pipeline_optimise_typed_ir_with_promotion(typed: TypedModule, ir: IrModule, p
         pipeline_optimised_functions_const_fold_sites(opt),
         pipeline_optimised_functions_algebraic_fold_sites(opt),
         pipeline_optimised_functions_dead_inst_sites(opt),
-        semantic_facts,
+        final_semantic_facts,
         pipeline_optimised_functions_pure_call_dce_sites(opt),
         0,
         pipeline_optimised_functions_block_entry_narrowing_sites(opt),
