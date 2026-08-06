@@ -280,6 +280,7 @@ assert_equals "compile_path_binary_exit" "$compile_path_exit" "42"
 
 assert_program_failure_equals "panic_boundary" "test/panic_exit.weft" "101" "weft: panic: direct panic boundary"
 assert_program_failure_equals "checked_index_bounds_panic" "test/array_index_oob_exit.weft" "101" "weft: panic: index out of bounds"
+assert_program_failure_equals "checked_index_mutation_bounds_panic" "test/array_index_set_oob_exit.weft" "101" "weft: panic: index out of bounds"
 assert_program_failure_equals "result_unwrap_panic" "test/result_unwrap_exit.weft" "101" "weft: panic: Result.unwrap called on Err"
 assert_program_failure_equals "result_expect_panic" "test/result_expect_exit.weft" "101" "weft: panic: required result failed"
 assert_program_failure_equals "option_unwrap_panic" "test/option_unwrap_exit.weft" "101" "weft: panic: Option.unwrap called on None"
