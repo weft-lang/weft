@@ -361,7 +361,7 @@ check_rejects "pattern_constructor_arity_too_few" "test/negative/pattern_constru
 check_rejects "pattern_constructor_arity_too_many" "test/negative/pattern_constructor_arity_too_many.weft" "type error: constructor pattern arity mismatch"
 check_rejects "if_condition_not_bool" "test/negative/if_condition_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "while_condition_not_bool" "test/negative/while_condition_not_bool.weft" "type error: boolean expression is not bool"
-check_rejects "for_iter_non_list" "test/negative/for_iter_non_list.weft" "type error: for iterator requires a Cons/Nil list"
+check_rejects "for_iter_non_list" "test/negative/for_iter_non_list.weft" "type error: for iterator requires an array, slice, or Cons/Nil list"
 check_rejects "not_operand_not_bool" "test/negative/not_operand_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "logical_operand_not_bool" "test/negative/logical_operand_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "match_guard_not_bool" "test/negative/match_guard_not_bool.weft" "type error: boolean expression is not bool"
