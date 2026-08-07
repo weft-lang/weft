@@ -4752,7 +4752,10 @@ fn pipeline_expr_needs_par_scope_cfg_typed(expr: Expr, src: i64) -> i64 {
         }
       }
     }
-    GenericCall(type_args, inner_call) -> pipeline_expr_needs_par_scope_cfg_typed(inner_call, src)
+    GenericCall(type_args, inner_call) -> {
+      if pipeline_expr_is_vector_to_array_typed(expr, src) == 1 { 1 }
+      else { pipeline_expr_needs_par_scope_cfg_typed(inner_call, src) }
+    }
     If(cond, then_expr, else_expr) -> {
       if pipeline_expr_needs_par_scope_cfg_typed(cond, src) == 1 { 1 }
       else {
@@ -4852,12 +4855,27 @@ fn pipeline_handler_clauses_need_par_scope_cfg_typed(clauses: HandlerClauseList,
   }
 }
 
+fn pipeline_expr_is_vector_to_array_typed(expr: Expr, src: i64) -> i64 {
+  match expr {
+    GenericCall(type_args, inner_call) -> {
+      match inner_call {
+        Call(ns, nl, args) -> if src_eq(src, ns, nl, "to_array") == 1 and type_expr_list_len(type_args) == 2 and expr_list_len(args) == 1 { 1 } else { 0 }
+        _ -> 0
+      }
+    }
+    LetTyped(inner, ann_type) -> pipeline_expr_is_vector_to_array_typed(inner, src)
+    _ -> 0
+  }
+}
+
 fn pipeline_expr_needs_lowering_cfg_typed(expr: Expr, src: i64) -> i64 {
-  if pipeline_expr_needs_cfg_typed(expr) == 1 {
+  if pipeline_expr_is_vector_to_array_typed(expr, src) == 1 {
+    1
+  } else { if pipeline_expr_needs_cfg_typed(expr) == 1 {
     1
   } else {
     pipeline_expr_needs_par_scope_cfg_typed(expr, src)
-  }
+  } }
 }
 
 fn pipeline_expr_list_needs_lowering_cfg_typed(args: ExprList, src: i64) -> i64 {
@@ -7065,6 +7083,125 @@ fn pipeline_collection_handle_word_inst(dst: i64, args: IrValueList) -> IrInst {
   ir_inst_call_i64(dst, pipeline_ir_native_intrinsic_transmute_hash(), args)
 }
 
+fn pipeline_option_some_hash() -> i64 {
+  str_hash(__str_ptr("option_some"), 0, __str_len("option_some"))
+}
+
+fn pipeline_option_none_hash() -> i64 {
+  str_hash(__str_ptr("option_none"), 0, __str_len("option_none"))
+}
+
+fn pipeline_vector_to_array_call_shape(src: i64, ns: i64, nl: i64, args: ExprList, type_args: TypeExprList) -> i64 {
+  if src_eq(src, ns, nl, "to_array") != 1 or expr_list_len(args) != 1 or type_expr_list_len(type_args) != 2 { 0 }
+  else {
+    let element_ty = type_expr_to_node(type_expr_list_nth(type_args, 0))
+    let array_ty = type_expr_to_node(type_expr_list_nth(type_args, 1))
+    if ty_is_array(array_ty) and ty_eq(ty_array_inner(array_ty), element_ty) and ty_array_length(array_ty) >= 0 { 1 } else { 0 }
+  }
+}
+
+-- Lower the checker-produced `to_array<T, [T; N]>` fact. The length branch
+-- precedes allocation; the success edge copies with the shared array leaf
+-- plan (including managed retains), then constructs Some. The failure edge
+-- constructs None. A temporary Vector receiver is released on either edge.
+fn pipeline_lower_vector_to_array_typed_to_target_blocks(type_args: TypeExprList, args: ExprList, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
+  let src = pipeline_lower_module_src(module)
+  let tt = pipeline_lower_module_tt(module)
+  let fns = pipeline_lower_module_fns(module)
+  let subst = pipeline_lower_module_subst(module)
+  let concrete_type_args = pipeline_type_expr_list_subst(type_args, subst)
+  let valid_shape = if expr_list_len(args) != 1 or type_expr_list_len(concrete_type_args) != 2 { 0 }
+    else {
+      let expected_element = type_expr_to_node(type_expr_list_nth(concrete_type_args, 0))
+      let expected_array = type_expr_to_node(type_expr_list_nth(concrete_type_args, 1))
+      if ty_is_array(expected_array) and ty_eq(ty_array_inner(expected_array), expected_element) and ty_array_length(expected_array) >= 0 { 1 } else { 0 }
+    }
+  if valid_shape == 0 {
+    pipeline_lowered_blocks_invalid(start_block, next_value)
+  } else {
+    let receiver_expr = pipeline_expr_list_nth_or(args, 0, NilExpr)
+    let element_ty = type_expr_to_node(type_expr_list_nth(concrete_type_args, 0))
+    let array_ty = type_expr_to_node(type_expr_list_nth(concrete_type_args, 1))
+    let length = ty_array_length(array_ty)
+    let check_block = next_block
+    let receiver_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(receiver_expr, params, locals, module, next_value, start_block, next_block + 1, check_block)
+    if pipeline_lowered_blocks_is_valid(receiver_blocks) == 0 { pipeline_lowered_blocks_invalid(start_block, next_value) }
+    else { if pipeline_lowered_blocks_falls_through(receiver_blocks) == 0 { receiver_blocks }
+    else {
+      let receiver_value = pipeline_lowered_blocks_next_value(receiver_blocks)
+      let len_value = receiver_value + 1
+      let expected_value = len_value + 1
+      let equal_value = expected_value + 1
+      let element_type_nodes = nlist_new_capacity(1)
+      nlist_add(element_type_nodes, element_ty)
+      let check_insts = ir_inst_list_prepend(
+        ir_inst_generic_call_i64(len_value, pipeline_ir_vector_len_hash(), element_type_nodes, ir_value_list_prepend(receiver_value, ir_value_list_empty())),
+        ir_inst_list_prepend(
+          ir_inst_const_i64(expected_value, length),
+          ir_inst_list_prepend(ir_inst_binary_i64(equal_value, ir_binary_op_eq(), len_value, expected_value), ir_inst_list_empty())
+        )
+      )
+      let match_block = pipeline_lower_internal_block_after_target(pipeline_lowered_blocks_next_block(receiver_blocks), target_block)
+      let none_block = pipeline_lower_internal_block_after_target(match_block + 1, target_block)
+      let check = ir_block_new_params(check_block, ir_value_list_prepend(receiver_value, ir_value_list_empty()), check_insts, ir_term_branch(equal_value, match_block, none_block))
+
+      let storage = pipeline_lower_array_literal_storage(array_ty, length, equal_value + 1, tt)
+      if ir_lowered_expr_is_valid(storage) == 0 { pipeline_lowered_blocks_invalid(start_block, next_value) }
+      else {
+        let byte_size = cg_layout_array_size(tt, array_ty)
+        let leaf_count = cg_layout_array_leaf_count(array_ty)
+        let leaf_stride = pipeline_array_literal_leaf_stride(tt, array_ty)
+        let leaf_kind = pipeline_array_literal_leaf_kind(tt, array_ty)
+        if pipeline_array_copy_plan_is_valid(byte_size, leaf_count, leaf_stride, leaf_kind) == 0 { pipeline_lowered_blocks_invalid(start_block, next_value) }
+        else {
+          let dest_data = ir_lowered_expr_next_value(storage) - 1
+          let source_data = ir_lowered_expr_next_value(storage)
+          let some_result = source_data + 1
+          let array_type_nodes = nlist_new_capacity(1)
+          nlist_add(array_type_nodes, array_ty)
+          let source_and_copy = ir_inst_list_prepend(
+            ir_inst_generic_call_i64(source_data, pipeline_vector_data_hash(), element_type_nodes, ir_value_list_prepend(receiver_value, ir_value_list_empty())),
+            if byte_size == 0 { ir_inst_list_empty() }
+            else { ir_inst_list_prepend(ir_inst_array_copy_i64(dest_data, source_data, byte_size, leaf_count, leaf_stride, leaf_kind), ir_inst_list_empty()) }
+          )
+          let some_call = ir_inst_list_prepend(
+            ir_inst_generic_call_i64(some_result, pipeline_option_some_hash(), array_type_nodes, ir_value_list_prepend(ir_lowered_expr_value(storage), ir_value_list_empty())),
+            ir_inst_list_empty()
+          )
+          let receiver_ty = pipeline_return_expr_type_node_typed(receiver_expr, params, locals, module)
+          let receiver_borrowed = if receiver_ty == 0 { 1 }
+            else { pipeline_expr_result_is_borrowed_for_ty_typed(receiver_expr, receiver_ty, src, fns, subst, tt) }
+          let some_release_dst = some_result + 1
+          let some_release = if receiver_borrowed == 0 {
+            ir_inst_list_prepend(ir_inst_call_i64(some_release_dst, pipeline_rc_default_release_hash(), ir_value_list_prepend(receiver_value, ir_value_list_empty())), ir_inst_list_empty())
+          } else { ir_inst_list_empty() }
+          let some_next = if receiver_borrowed == 0 { some_release_dst + 1 } else { some_result + 1 }
+          let some = ir_block_new_term(
+            match_block,
+            ir_inst_list_append(ir_lowered_expr_insts(storage), ir_inst_list_append(source_and_copy, ir_inst_list_append(some_call, some_release))),
+            ir_term_jump_args(target_block, ir_value_list_prepend(some_result, ir_value_list_empty()))
+          )
+
+          let none_result = some_next
+          let none_call = ir_inst_list_prepend(ir_inst_generic_call_i64(none_result, pipeline_option_none_hash(), array_type_nodes, ir_value_list_empty()), ir_inst_list_empty())
+          let none_release_dst = none_result + 1
+          let none_release = if receiver_borrowed == 0 {
+            ir_inst_list_prepend(ir_inst_call_i64(none_release_dst, pipeline_rc_default_release_hash(), ir_value_list_prepend(receiver_value, ir_value_list_empty())), ir_inst_list_empty())
+          } else { ir_inst_list_empty() }
+          let final_value = if receiver_borrowed == 0 { none_release_dst + 1 } else { none_result + 1 }
+          let none = ir_block_new_term(none_block, ir_inst_list_append(none_call, none_release), ir_term_jump_args(target_block, ir_value_list_prepend(none_result, ir_value_list_empty())))
+          let after_block = pipeline_lower_internal_block_after_target(none_block + 1, target_block)
+          let blocks = ir_block_list_append(
+            pipeline_lowered_blocks_blocks(receiver_blocks),
+            ir_block_list_prepend(check, ir_block_list_prepend(some, ir_block_list_prepend(none, ir_block_list_empty())))
+          )
+          pipeline_lowered_blocks(after_block, final_value, blocks, 1)
+        }
+      }
+    } }
+  }
+}
+
 fn pipeline_lower_generic_call_typed_to_target_blocks(type_args: TypeExprList, inner_call: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
   let src = pipeline_lower_module_src(module)
   let tt = pipeline_lower_module_tt(module)
@@ -7073,7 +7210,9 @@ fn pipeline_lower_generic_call_typed_to_target_blocks(type_args: TypeExprList, i
   let concrete_type_args = pipeline_type_expr_list_subst(type_args, subst)
   match inner_call {
     Call(ns, nl, args_exprs) -> {
-      if pipeline_variant_payload_count(tt, src, ns, nl) >= 0 or pipeline_call_callee_is_direct(params, locals, src, ns, nl) == 1 {
+      if pipeline_vector_to_array_call_shape(src, ns, nl, args_exprs, concrete_type_args) == 1 {
+        pipeline_lower_vector_to_array_typed_to_target_blocks(type_args, args_exprs, params, locals, module, next_value, start_block, next_block, target_block)
+      } else { if pipeline_variant_payload_count(tt, src, ns, nl) >= 0 or pipeline_call_callee_is_direct(params, locals, src, ns, nl) == 1 {
         let call_block = next_block
         let arg_count = expr_list_len(args_exprs)
         let first_arg_block = pipeline_lower_operation_child_start_block(call_block, arg_count)
@@ -7131,7 +7270,7 @@ fn pipeline_lower_generic_call_typed_to_target_blocks(type_args: TypeExprList, i
         }
       } else {
         pipeline_lowered_blocks_invalid(start_block, next_value)
-      }
+      } }
     }
     _ -> pipeline_lowered_blocks_invalid(start_block, next_value)
   }
@@ -20832,9 +20971,16 @@ fn pipeline_collect_generic_specs_generic_call(expr: i64, fns: i64, user_src: i6
   let call_node = node_f2(expr)
   let arg_specs = pipeline_collect_generic_specs_list(node_f3(call_node), node_f4(call_node), fns, user_src, tt, handlers)
   let name_hash = str_hash(user_src, node_f1(call_node), node_f2(call_node))
-  let pair = pipeline_generic_template_find(fns, user_src, name_hash)
-  let specialised = pipeline_lower_generic_specialisation_handler_optimised(pair, node_f1(expr), tt, handlers, fns)
-  pipeline_ir_function_list_append(arg_specs, specialised)
+  if src_eq(user_src, node_f1(call_node), node_f2(call_node), "to_array") == 1 and nlist_len(node_f1(expr)) == 2 {
+    -- The checker-produced second argument is the exact `[T; N]` layout;
+    -- typed lowering replaces this call and the post-IR collector discovers
+    -- the generated Option constructor specialisations.
+    arg_specs
+  } else {
+    let pair = pipeline_generic_template_find(fns, user_src, name_hash)
+    let specialised = pipeline_lower_generic_specialisation_handler_optimised(pair, node_f1(expr), tt, handlers, fns)
+    pipeline_ir_function_list_append(arg_specs, specialised)
+  }
 }
 
 fn pipeline_collect_generic_specs_method_call(expr: i64, fns: i64, user_src: i64, tt: i64, handlers: PipelineHandlerInlineCtx) -> IrFunctionList {

@@ -3418,6 +3418,69 @@ fn synth_associated_method_call(node: i64, target_ty: i64, src: i64, tt: i64) ->
   synth_resolved_method_call(node, tt)
 }
 
+fn typeck_named_app_one(tt: i64, name: str, arg: i64) -> i64 {
+  let entry = ttable_lookup(tt, __str_ptr(name), 0, __str_len(name))
+  if entry == 0 { ty_any() }
+  else {
+    let args = nlist_new_capacity(1)
+    nlist_add(args, arg)
+    ty_named_app(mem_load64_at(entry, 56), ty_i64(), args)
+  }
+}
+
+fn typeck_dot_name_is(node: i64, src: i64, name: str) -> i64 {
+  src_eq(src, node_f2(node), node_f3(node), name)
+}
+
+-- Phase-E conversion surface is method-shaped, but its semantic fact is an
+-- ordinary explicit generic call. `to_vector<T>` is a real pure stdlib copy
+-- helper. `to_array<T, [T; N]>` is a checked compiler intrinsic whose second
+-- type argument carries the exact result layout; lowering never reparses the
+-- source spelling or the const argument.
+fn synth_indexed_conversion_dot_call(node: i64, recv_ty: i64, src: i64, tt: i64) -> i64 {
+  let surface_args = node_f4(node)
+  let nargs = if surface_args == 0 { 0 } else { nlist_len(surface_args) }
+  if typeck_dot_name_is(node, src, "to_vector") == 1 and nargs == 0 and (ty_is_array(recv_ty) or ty_is_slice(recv_ty)) {
+    let element_ty = if ty_is_array(recv_ty) { ty_array_inner(recv_ty) } else { ty_slice_inner(recv_ty) }
+    let receiver = node_f1(node)
+    let needs_view = if ty_is_array(recv_ty) { 1 } else { ty_slice_mutable(recv_ty) }
+    let source = if needs_view == 1 {
+      let fixed_len = if ty_is_array(recv_ty) { ty_array_length(recv_ty) } else { 0 - 1 }
+      node_new(62, receiver, node_new(51, 0, 0, 0, 0), node_new(51, 0, 0, 0, 0), node_new(0, element_ty, fixed_len, recv_ty, 0))
+    } else { receiver }
+    let call_args = nlist_new_capacity(1)
+    nlist_add(call_args, source)
+    let type_args = nlist_new_capacity(1)
+    nlist_add(type_args, element_ty)
+    let inner = node_new(4, node_f2(node), node_f3(node), call_args, 1)
+    mem_store64_at(node, 0, 36)
+    mem_store64_at(node, 8, type_args)
+    mem_store64_at(node, 16, inner)
+    mem_store64_at(node, 24, 1)
+    mem_store64_at(node, 32, 0)
+    typeck_named_app_one(tt, "Vector", element_ty)
+  } else { if typeck_dot_name_is(node, src, "to_array") == 1 and typeck_type_is_vector(tt, recv_ty) == 1 and nargs == 1 {
+    let length_arg = nlist_get(surface_args, 0)
+    if node_tag(length_arg) != 1 or node_f3(length_arg) >= 0 { 0 }
+    else {
+      let element_ty = typeck_vector_element_type(recv_ty)
+      let array_ty = ty_array(element_ty, node_f1(length_arg))
+      let call_args = nlist_new_capacity(1)
+      nlist_add(call_args, node_f1(node))
+      let type_args = nlist_new_capacity(2)
+      nlist_add(type_args, element_ty)
+      nlist_add(type_args, array_ty)
+      let inner = node_new(4, node_f2(node), node_f3(node), call_args, 1)
+      mem_store64_at(node, 0, 36)
+      mem_store64_at(node, 8, type_args)
+      mem_store64_at(node, 16, inner)
+      mem_store64_at(node, 24, 2)
+      mem_store64_at(node, 32, 0)
+      typeck_named_app_one(tt, "Option", array_ty)
+    }
+  } else { 0 } }
+}
+
 fn synth_dot_call(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
   let lhs = node_f1(node)
   -- Disambiguate: is LHS an effect name (not in scope) or a value (in scope)?
@@ -3438,12 +3501,14 @@ fn synth_dot_call(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
       }
     } else {
       -- In type env → method call. Resolve receiver type.
-      synth_method_call(node, var_ty, env, ft, src, tt)
+      let conversion = synth_indexed_conversion_dot_call(node, var_ty, src, tt)
+      if conversion != 0 { conversion } else { synth_method_call(node, var_ty, env, ft, src, tt) }
     }
   } else {
     -- Complex expression as receiver: synth type, then resolve method
     let recv_ty = synth(lhs, env, ft, src, tt)
-    synth_method_call(node, recv_ty, env, ft, src, tt)
+    let conversion = synth_indexed_conversion_dot_call(node, recv_ty, src, tt)
+    if conversion != 0 { conversion } else { synth_method_call(node, recv_ty, env, ft, src, tt) }
   } }
 }
 
@@ -9640,10 +9705,15 @@ fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) 
     29 -> check_lambda_standalone(node, env, ft, src, tt)
     32 -> {
       -- Perform/dot-call: resolve method calls (synth mutates tag 32 → 41)
-      -- and recurse into args so nested method calls also get resolved
+      -- and explicit indexed conversions (tag 32 → 36), then recurse into
+      -- args so nested calls also get resolved.  Ordinary function bodies
+      -- receive a whole-body synth pass, but generated test wrappers can
+      -- reach this recursive path first; both must consume the same fact.
       synth_dot_call(node, env, ft, src, tt)
       let new_tag = node_tag(node)
-      if new_tag == 41 {
+      if new_tag == 36 {
+        check_expr(node, env, ft, src, caller_eff, tt)
+      } else { if new_tag == 41 {
         -- Resolved as method call: validate the receiver too. A nested call
         -- may already have been resolved while synthesizing this outer call;
         -- skipping f1 let its argument/effect diagnostics evade the walk.
@@ -9694,7 +9764,7 @@ fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) 
           }
           errors
         } }
-      }
+      } }
     }
     41 -> {
       -- Already-resolved method call: recurse into receiver and args.
@@ -10419,6 +10489,22 @@ fn check_generator_new_shape(node: i64, env: i64, ft: i64, src: i64) -[Diagnose]
   }
 }
 
+fn check_vector_to_array_type_args(src: i64, ns: i64, nl: i64, type_args: i64) -[Diagnose]> i64 {
+  if src_eq(src, ns, nl, "to_array") != 1 { 0 }
+  else { if type_args == 0 or nlist_len(type_args) != 2 { 0 }
+  else {
+    let element_ty = nlist_get(type_args, 0)
+    let array_ty = nlist_get(type_args, 1)
+    if not ty_is_array(array_ty) or not ty_eq(ty_array_inner(array_ty), element_ty) {
+      typeck_error_maybe(src, ns, "type error: to_array result type must be [T; N]")
+      1
+    } else { if ty_array_length(array_ty) < 0 {
+      typeck_error_maybe(src, ns, "type error: to_array length must be a non-negative integer literal")
+      1
+    } else { 0 } }
+  } }
+}
+
 -- Everything the GenericCall (tag 36) arm checks EXCEPT recursing into
 -- the argument expressions: type-arg count, trait bounds, arity,
 -- substituted param checks, effect availability. Shared by the tag-36
@@ -10439,6 +10525,7 @@ fn check_generic_call_post_args(node: i64, env: i64, ft: i64, src: i64, caller_e
   let params = ftypes_lookup_params(ft, src, ns, nl)
   if tparams != 0 {
     errors = errors + check_generic_type_arg_count(tparams, type_args, src, ns)
+    errors = errors + check_vector_to_array_type_args(src, ns, nl, type_args)
     errors = errors + check_generator_new_shape(node, env, ft, src)
     if params != 0 {
       errors = errors + check_arity(nlist_len(params), nargs, src, ns)
@@ -11165,8 +11252,9 @@ fn slice_borrow_vector_call_is_read_only(src: i64, ns: i64, nl: i64) -> i64 {
   else { if src_eq(src, ns, nl, "vector_get_option") == 1 { 1 }
   else { if src_eq(src, ns, nl, "vector_sum_i64") == 1 { 1 }
   else { if src_eq(src, ns, nl, "vector_slice") == 1 { 1 }
-  else { if src_eq(src, ns, nl, "vector_concat") == 1 { 1 } else { 0 } }
-  } } } } } } } } } } } } } }
+  else { if src_eq(src, ns, nl, "vector_concat") == 1 { 1 }
+  else { if src_eq(src, ns, nl, "to_array") == 1 { 1 } else { 0 } }
+  } } } } } } } } } } } } } } }
 }
 
 fn slice_borrow_vector_method_is_read_only(method_hash: i64) -> i64 {
