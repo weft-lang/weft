@@ -13156,6 +13156,20 @@ fn pipeline_lambda_evidence_value_count(evidence: IrLambdaEvidence) -> i64 {
   }
 }
 
+-- Captures loaded from the closure environment are borrowed aliases, just
+-- like explicit function parameters. Return transfer must retain them for
+-- the caller without emitting the balancing release reserved for owned
+-- locals. Keep this classification separate from the physical parameter
+-- list: captures remain env fields in the closure ABI.
+fn pipeline_lambda_return_transfer_params(lambda_params: ParamList, captures: i64) -> i64 {
+  let params = param_list_to_nodes(lambda_params)
+  for i in 0..nlist_len(captures) {
+    let capture = nlist_get(captures, i)
+    nlist_add(params, node_new(2, node_f1(capture), node_f2(capture), node_f4(capture), 0))
+  }
+  params
+}
+
 -- Returns one closure-construction instruction. A failure is represented in
 -- IR and traps through the ordinary lowering-failure path; no AST-bearing
 -- lambda fallback survives phase 2.
@@ -13189,13 +13203,14 @@ fn pipeline_lower_lambda_hoisted(lambda_params: ParamList, lambda_body: Expr, la
     ir_inst_list_prepend(ir_inst_lowering_failure_i64(13), ir_inst_list_empty())
   } else {
     let param_nodes = param_list_to_nodes(lambda_params)
+    let return_transfer_params = pipeline_lambda_return_transfer_params(lambda_params, lambda_captures)
     let inferred_return_ty = pipeline_return_expr_type_node_typed(lambda_body, param_nodes, locals, module)
     let return_ty = if inferred_return_ty != 0 { inferred_return_ty } else { ty_any() }
     let mut lambda_drop_next = pipeline_lowered_blocks_next_value(lowered)
     let raw_blocks = if pipeline_lowered_blocks_falls_through(lowered) == 1 {
       let return_value = pipeline_lowered_blocks_next_value(lowered)
       let return_lanes = pipeline_type_value_lane_count_or_one(return_ty)
-      let transfer = pipeline_lower_return_transfer_typed(lambda_body, return_value, return_value + return_lanes, param_nodes, locals, module)
+      let transfer = pipeline_lower_return_transfer_typed(lambda_body, return_value, return_value + return_lanes, return_transfer_params, locals, module)
       lambda_drop_next = ir_lowered_expr_next_value(transfer)
       let return_params = pipeline_ir_value_lane_ids(ir_lowered_expr_value(transfer), 0, return_lanes)
       let return_insts = ir_inst_list_append(ir_lowered_expr_insts(transfer), pipeline_ir_return_lane_insts(ir_lowered_expr_value(transfer), return_ty))
@@ -33855,6 +33870,19 @@ fn pipeline_ir_rewrite_record_layout_fields(fields: IrRecordLayoutFieldList, ali
   }
 }
 
+fn pipeline_ir_lambda_captures_need_alias_rewrite(captures: i64, aliases: PipelineIrAliasEnv) -> i64 {
+  let mut changed = 0
+  let mut i = 0
+  let count = if captures == 0 { 0 } else { nlist_len(captures) }
+  while i < count and changed == 0 {
+    let capture = nlist_get(captures, i)
+    let value = node_f3(capture)
+    if pipeline_ir_alias_env_lookup_or(aliases, value) != value { changed = 1 } else { 0 }
+    i = i + 1
+  }
+  changed
+}
+
 fn pipeline_ir_rewrite_inst_uses(inst: IrInst, aliases: PipelineIrAliasEnv) -> IrInst {
   match inst {
     IrConstI64(dst, value) -> inst
@@ -33864,7 +33892,31 @@ fn pipeline_ir_rewrite_inst_uses(inst: IrInst, aliases: PipelineIrAliasEnv) -> I
     IrBinaryI64(dst, op, lhs, rhs) -> IrBinaryI64(dst, op, pipeline_ir_alias_env_lookup_or(aliases, lhs), pipeline_ir_alias_env_lookup_or(aliases, rhs))
     IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> IrFloatBinaryI64(dst, prim, op, pipeline_ir_alias_env_lookup_or(aliases, lhs), pipeline_ir_alias_env_lookup_or(aliases, rhs))
     IrUnaryI64(dst, op, value) -> IrUnaryI64(dst, op, pipeline_ir_alias_env_lookup_or(aliases, value))
-    IrClosureI64(dst, f, captures, eff) -> inst
+    IrClosureI64(dst, f, captures, eff) -> {
+      if pipeline_ir_lambda_captures_need_alias_rewrite(captures, aliases) == 0 { inst }
+      else {
+        let count = nlist_len(captures)
+        let rewritten = nlist_new_capacity(count)
+        let mut i = 0
+        while i < count {
+          -- Match payloads are block-local SSA values. Re-extract from the
+          -- stable function parameter after each arena-allocation call so a
+          -- payload pointer never has to cross the call/loop backedge.
+          let source_captures = match inst {
+            IrClosureI64(source_dst, source_f, source, source_eff) -> source
+            _ -> 0
+          }
+          let capture = nlist_get(source_captures, i)
+          let ns = node_f1(capture)
+          let nl = node_f2(capture)
+          let value = pipeline_ir_alias_env_lookup_or(aliases, node_f3(capture))
+          let ty = node_f4(capture)
+          nlist_add(rewritten, pipeline_lambda_capture_entry(ns, nl, value, ty))
+          i = i + 1
+        }
+        IrClosureI64(dst, f, rewritten, eff)
+      }
+    }
     IrFunctionRefI64(dst, callee_hash) -> inst
     IrGenericFunctionRefI64(dst, callee_hash, type_args) -> inst
     IrAddressOfSlotI64(dst, slot) -> inst
@@ -46629,6 +46681,47 @@ fn pipeline_optimise_ir_function(f: IrFunction, inline_candidates: PipelineIrInl
   }
 }
 
+fn pipeline_ir_capture_payload_in_range(captures: i64, lower: i64, upper: i64) -> i64 {
+  if captures != 0 and captures >= lower and captures < upper { 1 } else { 0 }
+}
+
+fn pipeline_ir_inst_list_capture_payload_in_range(insts: IrInstList, lower: i64, upper: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let hit = match inst {
+        IrClosureI64(dst, f, captures, eff) -> pipeline_ir_capture_payload_in_range(captures, lower, upper)
+        _ -> 0
+      }
+      if hit == 1 { 1 } else { pipeline_ir_inst_list_capture_payload_in_range(rest, lower, upper) }
+    }
+  }
+}
+
+fn pipeline_ir_block_list_capture_payload_in_range(blocks: IrBlockList, lower: i64, upper: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      let hit = match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_inst_list_capture_payload_in_range(insts, lower, upper)
+      }
+      if hit == 1 { 1 } else { pipeline_ir_block_list_capture_payload_in_range(rest, lower, upper) }
+    }
+  }
+}
+
+fn pipeline_ir_function_list_capture_payload_in_range(functions: IrFunctionList, lower: i64, upper: i64) -> i64 {
+  match functions {
+    IrFunctionNil -> 0
+    IrFunctionCons(f, rest) -> {
+      let hit = match f {
+        IrFunction(hash, nparams, blocks, src) -> pipeline_ir_block_list_capture_payload_in_range(blocks, lower, upper)
+      }
+      if hit == 1 { 1 } else { pipeline_ir_function_list_capture_payload_in_range(rest, lower, upper) }
+    }
+  }
+}
+
 fn pipeline_optimise_ir_function_list_with_candidates(functions: IrFunctionList, inline_candidates: PipelineIrInlineCandidateList, multi_candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, user_src: i64, pure_callees: i64, tt: i64) -> PipelineOptimisedFunctions {
   match functions {
     IrFunctionNil -> pipeline_optimised_functions(ir_function_list_empty(), 0, 0, 0, 0, 0, 0)
@@ -46652,7 +46745,15 @@ fn pipeline_optimise_ir_function_list_with_candidates(functions: IrFunctionList,
       -- same-segment membership against the live segment base.
       let osr_mark = alloc_bump_mark()
       let head = pipeline_optimise_ir_function(f, local_candidates, multi_candidates, facts, pure_callees, tt)
-      alloc_bump_restore_same_segment(osr_mark)
+      let osr_end = alloc_bump_mark()
+      -- Alias rewriting is normally allocation-free at the result boundary,
+      -- but a closure capture whose SSA value changes needs a replacement
+      -- nlist to preserve optimiser purity. That list is a genuine output
+      -- payload: keep this function's bump window committed so the recursive
+      -- tail starts its own scratch mark above it. Functions without such an
+      -- escaping payload retain the per-function reclaim fast path.
+      let keeps_bump_payload = pipeline_ir_function_list_capture_payload_in_range(pipeline_optimised_functions_functions(head), osr_mark, osr_end)
+      if keeps_bump_payload == 0 { alloc_bump_restore_same_segment(osr_mark) } else { 0 }
       let tail = pipeline_optimise_ir_function_list_with_candidates(rest, inline_candidates, multi_candidates, facts, user_src, pure_callees, tt)
       pipeline_optimised_functions(
         pipeline_ir_function_list_append(pipeline_optimised_functions_functions(head), pipeline_optimised_functions_functions(tail)),
