@@ -10039,7 +10039,7 @@ fn pipeline_for_iter_elem_type_hash(collection_expr: Expr, params: i64, locals: 
   if elem_ty == 0 { 0 } else { type_hash_of(elem_ty) }
 }
 
-fn pipeline_lower_for_iter_loop_to_target_blocks(for_ctx: PipelineForIterCtx, current_slot: i64, next_value: i64, start_block: i64, next_block: i64) -> PipelineLoweredBlocks {
+fn pipeline_lower_for_list_iter_loop_to_target_blocks(for_ctx: PipelineForIterCtx, current_slot: i64, next_value: i64, start_block: i64, next_block: i64) -> PipelineLoweredBlocks {
   match for_ctx {
     PipelineForIterCtx(expr, params, locals, module, target_block) -> {
       let src = pipeline_lower_module_src(module)
@@ -10106,7 +10106,7 @@ fn pipeline_lower_for_iter_loop_to_target_blocks(for_ctx: PipelineForIterCtx, cu
   }
 }
 
-fn pipeline_lower_for_iter_to_target_blocks(expr: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
+fn pipeline_lower_for_list_iter_to_target_blocks(expr: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
   let src = pipeline_lower_module_src(module)
   let tt = pipeline_lower_module_tt(module)
   let collection_expr = node_f3(expr)
@@ -10127,7 +10127,7 @@ fn pipeline_lower_for_iter_to_target_blocks(expr: i64, params: i64, locals: Pipe
         let collection_params = ir_value_list_prepend(collection_value, ir_value_list_empty())
         let collection_merge = ir_block_new_params(collection_merge_block, collection_params, slot_insts, ir_term_jump(loop_start))
         let for_ctx = PipelineForIterCtx(expr, params, locals, module, target_block)
-        let loop_blocks = pipeline_lower_for_iter_loop_to_target_blocks(for_ctx, current_slot, current_slot + 1, loop_start, loop_start + 1)
+        let loop_blocks = pipeline_lower_for_list_iter_loop_to_target_blocks(for_ctx, current_slot, current_slot + 1, loop_start, loop_start + 1)
         if pipeline_lowered_blocks_is_valid(loop_blocks) == 1 {
           let blocks = ir_block_list_append(
             pipeline_lowered_blocks_blocks(collection_blocks),
@@ -10159,7 +10159,7 @@ fn pipeline_lower_for_iter_to_target_blocks(expr: i64, params: i64, locals: Pipe
       let entry_insts = ir_inst_list_append(ir_lowered_expr_insts(collection), slot_insts)
       let entry = ir_block_new_term(start_block, entry_insts, ir_term_jump(loop_start))
       let for_ctx = PipelineForIterCtx(expr, params, locals, module, target_block)
-      let loop_blocks = pipeline_lower_for_iter_loop_to_target_blocks(for_ctx, current_slot, current_slot + 1, loop_start, next_block + 1)
+      let loop_blocks = pipeline_lower_for_list_iter_loop_to_target_blocks(for_ctx, current_slot, current_slot + 1, loop_start, next_block + 1)
       if pipeline_lowered_blocks_is_valid(loop_blocks) == 1 {
         let blocks = ir_block_list_prepend(entry, pipeline_lowered_blocks_blocks(loop_blocks))
         pipeline_lowered_blocks(
@@ -10174,6 +10174,188 @@ fn pipeline_lower_for_iter_to_target_blocks(expr: i64, params: i64, locals: Pipe
     } else {
       pipeline_lowered_blocks_invalid(start_block, next_value)
     }
+  }
+}
+
+-- Arrays and slices are primitive finite sequences. Their for lowering keeps
+-- the already-evaluated collection live across the loop and consumes the same
+-- indexed-address boundary as an explicit `collection[index]`. The typed loop
+-- construction itself establishes `0 <= index < len`, so it selects the shared
+-- full-proven address fact without a for-specific codegen recognizer.
+fn pipeline_lower_for_indexed_iter_loop_to_target_blocks(for_ctx: PipelineForIterCtx, collection_ty: i64, collection_value: i64, release_collection: i64, index_slot: i64, next_value: i64, start_block: i64, next_block: i64) -> PipelineLoweredBlocks {
+  match for_ctx {
+    PipelineForIterCtx(expr, params, locals, module, target_block) -> {
+      let src = pipeline_lower_module_src(module)
+      let tt = pipeline_lower_module_tt(module)
+      let subst = pipeline_lower_module_subst(module)
+      let concrete_collection_ty = if subst == 0 { collection_ty } else { ty_subst(collection_ty, subst) }
+      let elem_ty = if ty_is_array(concrete_collection_ty) { ty_array_inner(concrete_collection_ty) } else { ty_slice_inner(concrete_collection_ty) }
+      let fixed_len = if ty_is_array(concrete_collection_ty) { ty_array_length(concrete_collection_ty) } else { 0 - 1 }
+      let body_block = next_block
+      let exit_block = next_block + 1
+      let advance_block = next_block + 2
+      let body_expr_start = next_block + 3
+      let body_next_block = next_block + 4
+
+      let check_index = next_value
+      let mut check_cursor = check_index + 1
+      let mut check_insts = ir_inst_list_prepend(ir_inst_load_i64(check_index, index_slot), ir_inst_list_empty())
+      let check_len = if fixed_len < 0 { collection_value + 1 } else { check_cursor }
+      if fixed_len >= 0 {
+        check_insts = ir_inst_list_append(check_insts, ir_inst_list_prepend(ir_inst_const_i64(check_len, fixed_len), ir_inst_list_empty()))
+        check_cursor = check_cursor + 1
+      } else { 0 }
+      let has_item = check_cursor
+      check_insts = ir_inst_list_append(check_insts, ir_inst_list_prepend(ir_inst_float_binary_i64(has_item, PRIM_USIZE(), IrLt, check_index, check_len), ir_inst_list_empty()))
+      check_cursor = check_cursor + 1
+      let check_node = ir_block_new_term(start_block, check_insts, ir_term_branch(has_item, body_block, exit_block))
+
+      let body_index = check_cursor
+      -- Reaching this block proves the branch condition above; the index starts
+      -- at zero and advances by one while the collection length stays fixed.
+      let item = pipeline_lower_indexed_get_after_values_typed_with_release(elem_ty, fixed_len, collection_value, body_index, body_index + 1, 0, pipeline_runtime_index_address_full_proven_hash(), pipeline_handler_lower_ctx_from_module(params, locals, module))
+      if ir_lowered_expr_is_valid(item) == 0 { pipeline_lowered_blocks_invalid(start_block, next_value) }
+      else {
+        let item_value = ir_lowered_expr_value(item)
+        let elem_hash = type_hash_of(elem_ty)
+        let elem_prim = if elem_hash < 0 { (0 - elem_hash) - 1 } else { 0 - 1 }
+        let elem_float = if elem_prim == PRIM_F64() { elem_prim } else { if elem_prim == PRIM_F32() { elem_prim } else { 0 } }
+        let body_locals = pipeline_value_env_push_float_typed_node(locals, node_f1(expr), node_f2(expr), item_value, elem_float, elem_hash, elem_ty)
+        let loop_ctx = pipeline_loop_ctx(params, body_locals, module, target_block, advance_block, advance_block, 1)
+        let body_blocks = pipeline_lower_loop_body_to_target_blocks(node_f4(expr), loop_ctx, ir_lowered_expr_next_value(item), body_expr_start, body_next_block)
+        if pipeline_lowered_loop_blocks_is_valid(body_blocks) == 0 { pipeline_lowered_blocks_invalid(start_block, next_value) }
+        else {
+          let item_cleanup_dst = pipeline_lowered_loop_blocks_next_value(body_blocks)
+          let item_owned_hash = cg_owned_drop_type_hash(elem_ty)
+          let item_release_hash = pipeline_managed_release_hash_for_ty(elem_ty)
+          let item_cleanup_count = if item_release_hash != 0 or item_owned_hash != 0 {
+            pipeline_ir_block_list_loop_scope_cleanup_count(pipeline_lowered_loop_blocks_blocks(body_blocks), item_value, advance_block, advance_block, target_block)
+          } else { 0 }
+          let item_cleaned_blocks = if item_cleanup_count > 0 {
+            if item_owned_hash != 0 {
+              pipeline_ir_block_list_append_loop_owned_cleanup_indexed(pipeline_lowered_loop_blocks_blocks(body_blocks), item_value, item_owned_hash, 0, advance_block, advance_block, target_block)
+            } else {
+              pipeline_ir_block_list_append_loop_scope_cleanup_indexed(pipeline_lowered_loop_blocks_blocks(body_blocks), item_value, elem_ty, item_cleanup_dst, 0, advance_block, advance_block, target_block)
+            }
+          } else { pipeline_lowered_loop_blocks_blocks(body_blocks) }
+          let after_item_cleanup = item_cleanup_dst + item_cleanup_count
+
+          -- An owned collection temporary is released on break/return here;
+          -- normal exhaustion releases it in the exit block below. Borrowed
+          -- named arrays and all non-owning slices carry no collection cleanup.
+          let collection_cleanup_count = if release_collection == 1 {
+            pipeline_ir_block_list_loop_scope_cleanup_count(item_cleaned_blocks, collection_value, 0 - 1, 0 - 1, target_block)
+          } else { 0 }
+          let body_cleaned_blocks = if collection_cleanup_count > 0 {
+            pipeline_ir_block_list_append_loop_scope_cleanup_indexed(item_cleaned_blocks, collection_value, concrete_collection_ty, after_item_cleanup, 0, 0 - 1, 0 - 1, target_block)
+          } else { item_cleaned_blocks }
+          let after_collection_cleanup = after_item_cleanup + collection_cleanup_count
+
+          let advance_index = after_collection_cleanup
+          let one_value = advance_index + 1
+          let next_index = one_value + 1
+          let advance_insts = ir_inst_list_prepend(
+            ir_inst_load_i64(advance_index, index_slot),
+            ir_inst_list_prepend(
+              ir_inst_const_i64(one_value, 1),
+              ir_inst_list_prepend(
+                ir_inst_float_binary_i64(next_index, PRIM_USIZE(), IrAdd, advance_index, one_value),
+                ir_inst_list_prepend(ir_inst_store_i64(index_slot, next_index), ir_inst_list_empty())
+              )
+            )
+          )
+          let advance_node = ir_block_new_term(advance_block, advance_insts, ir_term_jump(start_block))
+
+          let exit_release_dst = next_index + 1
+          let exit_release = if release_collection == 1 {
+            pipeline_managed_release_inst_list(collection_value, concrete_collection_ty, exit_release_dst)
+          } else { ir_inst_list_empty() }
+          let nil_result = if ir_inst_list_len(exit_release) > 0 { exit_release_dst + 1 } else { exit_release_dst }
+          let exit_insts = ir_inst_list_append(exit_release, ir_inst_list_prepend(ir_inst_const_i64(nil_result, 0), ir_inst_list_empty()))
+          let exit_node = ir_block_new_term(exit_block, exit_insts, ir_term_jump_args(target_block, ir_value_list_prepend(nil_result, ir_value_list_empty())))
+          let body_entry_insts = ir_inst_list_prepend(ir_inst_load_i64(body_index, index_slot), ir_lowered_expr_insts(item))
+          let body_entry = ir_block_new_term(body_block, body_entry_insts, ir_term_jump(body_expr_start))
+          let blocks = ir_block_list_prepend(
+            check_node,
+            ir_block_list_prepend(
+              body_entry,
+              ir_block_list_append(body_cleaned_blocks, ir_block_list_prepend(advance_node, ir_block_list_prepend(exit_node, ir_block_list_empty())))
+            )
+          )
+          pipeline_lowered_blocks(pipeline_lowered_loop_blocks_next_block(body_blocks), nil_result + 1, blocks, 1)
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_lower_for_indexed_iter_to_target_blocks(expr: i64, collection_ty: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
+  let collection_expr = expr_from_node(node_f3(expr))
+  let src = pipeline_lower_module_src(module)
+  let collection_lanes = pipeline_type_value_lane_count_or_one(collection_ty)
+  let release_collection = if ty_is_array(collection_ty) and pipeline_array_expr_result_is_borrowed_typed(collection_expr, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), pipeline_lower_module_tt(module)) == 0 { 1 } else { 0 }
+  if pipeline_expr_needs_lowering_cfg_typed(collection_expr, src) == 1 {
+    let collection_merge_block = next_block
+    let collection_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(collection_expr, params, locals, module, next_value, start_block, next_block + 1, collection_merge_block)
+    if pipeline_lowered_blocks_is_valid(collection_blocks) == 0 { pipeline_lowered_blocks_invalid(start_block, next_value) }
+    else { if pipeline_lowered_blocks_falls_through(collection_blocks) == 0 { collection_blocks }
+    else {
+      let collection_value = pipeline_lowered_blocks_next_value(collection_blocks)
+      let index_slot = collection_value + collection_lanes
+      let zero_value = index_slot + 1
+      let loop_start = pipeline_lowered_blocks_next_block(collection_blocks)
+      let init_insts = ir_inst_list_prepend(
+        ir_inst_slot_i64(index_slot),
+        ir_inst_list_prepend(
+          ir_inst_const_i64(zero_value, 0),
+          ir_inst_list_prepend(ir_inst_store_i64(index_slot, zero_value), ir_inst_list_empty())
+        )
+      )
+      let collection_merge = ir_block_new_params(collection_merge_block, pipeline_ir_value_lane_ids(collection_value, 0, collection_lanes), init_insts, ir_term_jump(loop_start))
+      let for_ctx = PipelineForIterCtx(expr, params, locals, module, target_block)
+      let loop_blocks = pipeline_lower_for_indexed_iter_loop_to_target_blocks(for_ctx, collection_ty, collection_value, release_collection, index_slot, zero_value + 1, loop_start, loop_start + 1)
+      if pipeline_lowered_blocks_is_valid(loop_blocks) == 0 { pipeline_lowered_blocks_invalid(start_block, next_value) }
+      else {
+        let blocks = ir_block_list_append(pipeline_lowered_blocks_blocks(collection_blocks), ir_block_list_prepend(collection_merge, pipeline_lowered_blocks_blocks(loop_blocks)))
+        pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(loop_blocks), pipeline_lowered_blocks_next_value(loop_blocks), blocks, 1)
+      }
+    } }
+  } else {
+    let collection = pipeline_lower_expr_typed_sidecar_handler_ctx(collection_expr, next_value, pipeline_handler_lower_ctx_from_module(params, locals, module))
+    if ir_lowered_expr_is_valid(collection) == 0 { pipeline_lowered_blocks_invalid(start_block, next_value) }
+    else {
+      let index_slot = ir_lowered_expr_next_value(collection)
+      let zero_value = index_slot + 1
+      let init_insts = ir_inst_list_prepend(
+        ir_inst_slot_i64(index_slot),
+        ir_inst_list_prepend(
+          ir_inst_const_i64(zero_value, 0),
+          ir_inst_list_prepend(ir_inst_store_i64(index_slot, zero_value), ir_inst_list_empty())
+        )
+      )
+      let loop_start = next_block
+      let entry = ir_block_new_term(start_block, ir_inst_list_append(ir_lowered_expr_insts(collection), init_insts), ir_term_jump(loop_start))
+      let for_ctx = PipelineForIterCtx(expr, params, locals, module, target_block)
+      let loop_blocks = pipeline_lower_for_indexed_iter_loop_to_target_blocks(for_ctx, collection_ty, ir_lowered_expr_value(collection), release_collection, index_slot, zero_value + 1, loop_start, next_block + 1)
+      if pipeline_lowered_blocks_is_valid(loop_blocks) == 0 { pipeline_lowered_blocks_invalid(start_block, next_value) }
+      else {
+        pipeline_lowered_blocks(
+          pipeline_lowered_blocks_next_block(loop_blocks),
+          pipeline_lowered_blocks_next_value(loop_blocks),
+          ir_block_list_prepend(entry, pipeline_lowered_blocks_blocks(loop_blocks)),
+          1
+        )
+      }
+    }
+  }
+}
+
+fn pipeline_lower_for_iter_to_target_blocks(expr: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
+  let collection_ty = pipeline_return_expr_type_node_from_node(node_f3(expr), params, locals, module)
+  if ty_is_array(collection_ty) or ty_is_slice(collection_ty) {
+    pipeline_lower_for_indexed_iter_to_target_blocks(expr, collection_ty, params, locals, module, next_value, start_block, next_block, target_block)
+  } else {
+    pipeline_lower_for_list_iter_to_target_blocks(expr, params, locals, module, next_value, start_block, next_block, target_block)
   }
 }
 
@@ -18039,7 +18221,7 @@ fn pipeline_lower_indexed_slice_value(address: i64, next_value: i64) -> IrLowere
 -- Consume only checker-produced indexed-storage facts. The runtime boundary
 -- owns the unsigned bounds check and canonical panic; layout, ownership, and
 -- nested-array value copying stay explicit in typed lowering.
-fn pipeline_lower_indexed_get_after_values_typed(base_expr: Expr, index_expr: Expr, element_ty: i64, fixed_len: i64, base_value: i64, index_value: i64, next_value: i64, lower_ctx: PipelineHandlerLowerCtx) -> IrLoweredExpr {
+fn pipeline_lower_indexed_get_after_values_typed_with_release(element_ty: i64, fixed_len: i64, base_value: i64, index_value: i64, next_value: i64, release_base: i64, address_hash: i64, lower_ctx: PipelineHandlerLowerCtx) -> IrLoweredExpr {
   let tt = pipeline_handler_lower_ctx_tt(lower_ctx)
   let concrete_element_ty = ty_subst(element_ty, pipeline_handler_lower_ctx_subst(lower_ctx))
   let stride = pipeline_indexed_element_stride(tt, concrete_element_ty)
@@ -18058,7 +18240,7 @@ fn pipeline_lower_indexed_get_after_values_typed(base_expr: Expr, index_expr: Ex
     let address = stride_value + 1
     let address_insts = ir_inst_list_prepend(
       ir_inst_const_i64(stride_value, stride),
-      ir_inst_list_prepend(ir_inst_call_i64(address, pipeline_runtime_index_address_hash(), pipeline_index_address_args(data_value, len_value, index_value, stride_value)), ir_inst_list_empty())
+      ir_inst_list_prepend(ir_inst_call_i64(address, address_hash, pipeline_index_address_args(data_value, len_value, index_value, stride_value)), ir_inst_list_empty())
     )
     let after_address = address + 1
     let loaded = if ty_is_array(concrete_element_ty) {
@@ -18095,17 +18277,21 @@ fn pipeline_lower_indexed_get_after_values_typed(base_expr: Expr, index_expr: Ex
     } }
     if ir_lowered_expr_is_valid(loaded) == 0 { loaded }
     else {
-      let borrowed_base = if fixed_len < 0 { 1 }
-        else { pipeline_array_expr_result_is_borrowed_typed(base_expr, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_fns(lower_ctx), pipeline_handler_lower_ctx_subst(lower_ctx), tt) }
       let release_dst = ir_lowered_expr_next_value(loaded)
-      let release = if borrowed_base == 0 {
+      let release = if release_base == 1 {
         ir_inst_list_prepend(ir_inst_call_i64(release_dst, pipeline_rc_default_release_hash(), ir_value_list_prepend(base_value, ir_value_list_empty())), ir_inst_list_empty())
       } else { ir_inst_list_empty() }
-      let next = if borrowed_base == 0 { release_dst + 1 } else { release_dst }
+      let next = if release_base == 1 { release_dst + 1 } else { release_dst }
       let prefix = ir_inst_list_append(data_insts, ir_inst_list_append(len_insts, address_insts))
       ir_lowered_expr(ir_lowered_expr_value(loaded), next, ir_inst_list_append(prefix, ir_inst_list_append(ir_lowered_expr_insts(loaded), release)))
     }
   }
+}
+
+fn pipeline_lower_indexed_get_after_values_typed(base_expr: Expr, index_expr: Expr, element_ty: i64, fixed_len: i64, base_value: i64, index_value: i64, next_value: i64, lower_ctx: PipelineHandlerLowerCtx) -> IrLoweredExpr {
+  let borrowed_base = if fixed_len < 0 { 1 }
+    else { pipeline_array_expr_result_is_borrowed_typed(base_expr, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_fns(lower_ctx), pipeline_handler_lower_ctx_subst(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx)) }
+  pipeline_lower_indexed_get_after_values_typed_with_release(element_ty, fixed_len, base_value, index_value, next_value, if borrowed_base == 0 { 1 } else { 0 }, pipeline_runtime_index_address_hash(), lower_ctx)
 }
 
 fn pipeline_lower_indexed_get_expr_typed_sidecar_handler_opt(base_expr: Expr, index_expr: Expr, element_ty: i64, fixed_len: i64, next_value: i64, lower_ctx: PipelineHandlerLowerCtx) -> IrLoweredExpr {
