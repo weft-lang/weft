@@ -601,6 +601,7 @@ check_rejects "anonymous_record_expr_duplicate" "test/negative/anonymous_record_
 check_rejects "anonymous_record_expr_malformed" "test/negative/anonymous_record_expr_malformed.weft" "error: expected ',' or '}' after structural record field"
 check_rejects "anonymous_record_expr_arg_mismatch" "test/negative/anonymous_record_expr_arg_mismatch.weft" "type error: argument type mismatch"
 check_rejects "anonymous_record_expr_missing_field" "test/negative/anonymous_record_expr_missing_field.weft" "type error: argument type mismatch"
+check_rejects "structural_complement_rejects_field" "test/negative/structural_complement_rejects_field.weft" "type error: argument type mismatch"
 check_rejects "tuple_expr_arg_mismatch" "test/negative/tuple_expr_arg_mismatch.weft" "type error: argument type mismatch"
 check_rejects "tuple_expr_singleton_requires_comma" "test/negative/tuple_expr_singleton_requires_comma.weft" "type error: argument type mismatch"
 check_rejects "record_pattern_duplicate_field" "test/negative/record_pattern_duplicate_field.weft" "type error: duplicate record pattern field"
