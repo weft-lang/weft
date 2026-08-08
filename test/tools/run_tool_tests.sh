@@ -1243,6 +1243,22 @@ assert_test_exit_code "test_assert_eq_and_ne_two_clause_harness_runs" 'test "eq_
 assert_test_exit_code "test_assert_ne_failure_returns_one" 'test "fail_ne" { Test.assert_ne(2, 2) }' 1
 assert_test_exit_code "test_assert_bool_failures_return_two" $'test "fail_true" { Test.assert_true(1 == 2) }\ntest "fail_false" { Test.assert_false(1 == 1) }' 2
 assert_test_exit_code "test_assert_comparison_failure_returns_one" 'test "fail_cmp" { Test.assert_lt(2, 1) }' 1
+
+printf '%s\n' $'test "first named failure" { Test.assert_eq(1, 2) }\ntest "passing middle" { Test.assert_eq(3, 3) }\ntest "last named failure" { Test.assert_true(false) }' > "$tmp_src"
+run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+chmod +x "$tmp_bin"
+set +e
+run_binary_guarded "$tmp_bin" >/dev/null 2>"$tmp_err"
+test_named_failures_exit=$?
+set -e
+assert_equals "test_named_failures_count_all_blocks" "$test_named_failures_exit" "2"
+test_named_failures_err=$(<"$tmp_err")
+assert_contains "test_named_failures_reports_first_name" "$test_named_failures_err" "test failure: first named failure"
+assert_contains "test_named_failures_reports_first_detail" "$test_named_failures_err" "test assertion failed: assert_eq got=1 want=2"
+assert_contains "test_named_failures_continues_past_pass" "$test_named_failures_err" "test failure: last named failure"
+assert_contains "test_named_failures_reports_last_detail" "$test_named_failures_err" "test assertion failed: assert_true"
+assert_not_contains "test_named_failures_omits_passing_name" "$test_named_failures_err" "test failure: passing middle"
+
 assert_test_failure_contains "test_assertion_failure_reports_diagnostic" 'test "fail_eq_diag" { Test.assert_eq(1, 2) }' 1 "test assertion failed: assert_eq"
 assert_test_failure_contains "test_assert_eq_f64_failure_reports_diagnostic" 'test "fail_eq_f64" { Test.assert_eq_f64(1.0, 2.0) }' 1 "test assertion failed: assert_eq_f64"
 assert_test_failure_contains "test_assert_eq_f64_nan_fails" 'test "fail_eq_f64_nan" { Test.assert_eq_f64(0.0 / 0.0, 0.0 / 0.0) }' 1 "test assertion failed: assert_eq_f64"
