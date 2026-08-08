@@ -236,6 +236,8 @@ fn pipeline_pattern_nested_list_needs_recursive_lowering(patterns: PatternList) 
 fn pipeline_pattern_needs_recursive_lowering(pattern: Pattern) -> i64 {
   match pattern {
     CtorPattern(tag_ns, tag_nl, patterns) -> pipeline_pattern_nested_list_needs_recursive_lowering(patterns)
+    RecordPattern(fields) -> 1
+    TuplePattern(items) -> 1
     _ -> 0
   }
 }
@@ -312,6 +314,17 @@ fn pipeline_plan_recursive_pattern(pattern: Pattern, value: i64, value_ty: i64, 
         pipeline_plan_recursive_ctor_children(children, payload_types, subst, 0, 0, value, locals, module, next_value + 3, next_steps)
       }
     }
+    RecordPattern(fields) -> {
+      -- Products have no runtime discriminator once the checker proves the
+      -- shape. Keep one unconditional step so a binding-only product still
+      -- has a CFG entry and shares the recursive arm path.
+      let product_steps = pipeline_pattern_step_list_append(steps, PipelinePatternStep(ir_inst_list_empty(), 0 - 1))
+      pipeline_plan_recursive_record_fields(fields, value, value_ty, locals, module, next_value, product_steps)
+    }
+    TuplePattern(items) -> {
+      let product_steps = pipeline_pattern_step_list_append(steps, PipelinePatternStep(ir_inst_list_empty(), 0 - 1))
+      pipeline_plan_recursive_tuple_children(items, value, value_ty, 0, 0, locals, module, next_value, product_steps)
+    }
     UnknownPattern(tag) -> PipelinePatternPlan(locals, steps, next_value, 0)
   }
 }
@@ -332,6 +345,93 @@ fn pipeline_plan_recursive_ctor_children(children: PatternList, payload_types: i
             PipelinePatternPlan(child_locals, child_steps, after_child, valid) -> {
               if valid == 0 { PipelinePatternPlan(locals, steps, next_value, 0) }
               else { pipeline_plan_recursive_ctor_children(rest, payload_types, subst, payload_index + 1, payload_word + child_lanes, base_value, child_locals, module, after_child, child_steps) }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_pattern_nominal_record_layout(value_ty: i64, module: PipelineLowerModule) -> PipelineRecordStorageLayout {
+  let tt = pipeline_lower_module_tt(module)
+  let entry = if value_ty == 0 or ty_tag(value_ty) != 9 { 0 } else { ttable_lookup_by_type_hash(tt, ty_f1(value_ty)) }
+  if entry == 0 { PipelineRecordStorageLayoutInvalid }
+  else {
+    let subst = pipeline_record_instance_subst(entry, value_ty, pipeline_lower_module_subst(module))
+    pipeline_record_storage_layout_for_entry(tt, entry, subst)
+  }
+}
+
+fn pipeline_plan_recursive_record_fields(fields: PatternFieldList, base_value: i64, base_ty: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, steps: PipelinePatternStepList) -> PipelinePatternPlan {
+  match fields {
+    PatternFieldListNil -> PipelinePatternPlan(locals, steps, next_value, 1)
+    PatternFieldListCons(field, rest) -> {
+      match field {
+        PatternField(ns, nl, child, fact) -> {
+          let raw_ty = field_access_fact_field_type_node(fact)
+          let child_ty = if raw_ty == 0 { 0 } else { ty_subst(raw_ty, pipeline_lower_module_subst(module)) }
+          let field_hash = str_hash(pipeline_lower_module_src(module), ns, nl)
+          let fact_offset = field_access_fact_word_offset_or(fact, 0 - 1)
+          let structural = if ty_is_record(base_ty) { 1 } else { 0 }
+          let word_offset = if structural == 1 { ty_record_field_word_offset(base_ty, field_hash) }
+            else {
+              let entry = if base_ty == 0 or ty_tag(base_ty) != 9 { 0 } else { ttable_lookup_by_type_hash(pipeline_lower_module_tt(module), ty_f1(base_ty)) }
+              let record_subst = pipeline_record_instance_subst(entry, base_ty, pipeline_lower_module_subst(module))
+              let specialised = pipeline_record_field_word_offset_in_entry(entry, pipeline_lower_module_src(module), ns, nl, record_subst)
+              if specialised >= 0 { specialised } else { fact_offset }
+            }
+          match child {
+            Wildcard -> pipeline_plan_recursive_record_fields(rest, base_value, base_ty, locals, module, next_value, steps)
+            _ -> {
+              if word_offset < 0 or child_ty == 0 {
+                PipelinePatternPlan(locals, steps, next_value, 0)
+              } else { if structural == 1 {
+                match pipeline_plan_recursive_pattern(child, base_value + word_offset, child_ty, locals, module, next_value, steps) {
+                  PipelinePatternPlan(child_locals, child_steps, after_child, valid) -> {
+                    if valid == 0 { PipelinePatternPlan(locals, steps, next_value, 0) }
+                    else { pipeline_plan_recursive_record_fields(rest, base_value, base_ty, child_locals, module, after_child, child_steps) }
+                  }
+                }
+              } else {
+                let loaded = pipeline_lower_field_load_for_storage_layout(next_value, base_value, field_hash, word_offset, child_ty, pipeline_pattern_nominal_record_layout(base_ty, module))
+                if ir_lowered_expr_is_valid(loaded) == 0 {
+                  PipelinePatternPlan(locals, steps, next_value, 0)
+                } else {
+                  let load_steps = pipeline_pattern_step_list_append(steps, PipelinePatternStep(ir_lowered_expr_insts(loaded), 0 - 1))
+                  match pipeline_plan_recursive_pattern(child, ir_lowered_expr_value(loaded), child_ty, locals, module, ir_lowered_expr_next_value(loaded), load_steps) {
+                    PipelinePatternPlan(child_locals, child_steps, after_child, valid) -> {
+                      if valid == 0 { PipelinePatternPlan(locals, steps, next_value, 0) }
+                      else { pipeline_plan_recursive_record_fields(rest, base_value, base_ty, child_locals, module, after_child, child_steps) }
+                    }
+                  }
+                }
+              } }
+            }
+          }
+        }
+        UnknownPatternField(tag) -> PipelinePatternPlan(locals, steps, next_value, 0)
+      }
+    }
+  }
+}
+
+fn pipeline_plan_recursive_tuple_children(items: PatternList, base_value: i64, tuple_ty: i64, index: i64, word_offset: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, steps: PipelinePatternStepList) -> PipelinePatternPlan {
+  match items {
+    PatternListNil -> PipelinePatternPlan(locals, steps, next_value, 1)
+    PatternListCons(child, rest) -> {
+      let field = ty_record_field_at_layout_index(tuple_ty, index)
+      let child_ty = if field == 0 { 0 } else { ty_record_field_type(field) }
+      let lanes = pipeline_type_value_lane_count_or_one(child_ty)
+      if child_ty == 0 {
+        PipelinePatternPlan(locals, steps, next_value, 0)
+      } else {
+        match child {
+          Wildcard -> pipeline_plan_recursive_tuple_children(rest, base_value, tuple_ty, index + 1, word_offset + lanes, locals, module, next_value, steps)
+          _ -> match pipeline_plan_recursive_pattern(child, base_value + word_offset, child_ty, locals, module, next_value, steps) {
+            PipelinePatternPlan(child_locals, child_steps, after_child, valid) -> {
+              if valid == 0 { PipelinePatternPlan(locals, steps, next_value, 0) }
+              else { pipeline_plan_recursive_tuple_children(rest, base_value, tuple_ty, index + 1, word_offset + lanes, child_locals, module, after_child, child_steps) }
             }
           }
         }
@@ -856,6 +956,8 @@ fn pipeline_lower_match_arm_to_blocks(ctx: PipelineMatchCtx, index: i64, next_va
               }
             }
             NilPattern(pn_ns, pn_nl) -> pipeline_lower_match_tested_arm_to_blocks(ctx, index, next_value, start_block, next_block)
+            RecordPattern(fields) -> pipeline_lower_match_recursive_pattern_arm_to_blocks(ctx, index, next_value, start_block)
+            TuplePattern(items) -> pipeline_lower_match_recursive_pattern_arm_to_blocks(ctx, index, next_value, start_block)
             _ -> pipeline_lowered_blocks_invalid(start_block, next_value)
           }
         } else {
@@ -882,6 +984,8 @@ fn pipeline_lower_match_arm_to_blocks(ctx: PipelineMatchCtx, index: i64, next_va
               }
             }
             NilPattern(pn_ns, pn_nl) -> pipeline_lower_match_tested_arm_to_blocks(ctx, index, next_value, start_block, next_block)
+            RecordPattern(fields) -> pipeline_lower_match_recursive_pattern_arm_to_blocks(ctx, index, next_value, start_block)
+            TuplePattern(items) -> pipeline_lower_match_recursive_pattern_arm_to_blocks(ctx, index, next_value, start_block)
             _ -> pipeline_lowered_blocks_invalid(start_block, next_value)
           }
         }
