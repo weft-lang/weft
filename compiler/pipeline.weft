@@ -7325,6 +7325,118 @@ fn pipeline_record_update_base_ownership(base: Expr, fields: RecordFieldList, ba
   pipeline_lowered_args(ir_value_list_empty(), after_retains + ir_inst_list_len(releases), ir_inst_list_append(retains, releases), 1)
 }
 
+fn pipeline_ir_record_field_values_args(fields: IrRecordFieldList) -> IrValueList {
+  match fields {
+    IrRecordFieldNil -> ir_value_list_empty()
+    IrRecordFieldCons(field_hash, word_offset, value, rest) -> ir_value_list_prepend(value, pipeline_ir_record_field_values_args(rest))
+  }
+}
+
+fn pipeline_ir_record_field_values_rebase(fields: IrRecordFieldList, start: i64, index: i64) -> IrRecordFieldList {
+  match fields {
+    IrRecordFieldNil -> ir_record_field_list_empty()
+    IrRecordFieldCons(field_hash, word_offset, value, rest) -> {
+      ir_record_field_list_prepend(field_hash, word_offset, start + index, pipeline_ir_record_field_values_rebase(rest, start, index + 1))
+    }
+  }
+}
+
+fn pipeline_nominal_record_field_load_is_owned(layout: PipelineRecordStorageLayout, word_offset: i64, field_hash: i64, field_ty: i64) -> i64 {
+  match layout {
+    PipelineRecordStorageLayoutDescribed(data_size, align, facts) -> match pipeline_record_storage_field_fact_at_word_offset(facts, word_offset) {
+      PipelineRecordStorageFieldFactArray(fact_hash, fact_word_offset, byte_offset, fact_ty, byte_size, field_align, leaf_count, leaf_stride, leaf_kind, rest) -> {
+        if fact_hash == field_hash and ty_is_array(field_ty) { 1 } else { 0 }
+      }
+      _ -> 0
+    }
+    _ -> 0
+  }
+}
+
+-- Project the untouched portion of a nominal record through its declaration
+-- layout. Direct fields are borrowed loads and therefore retained before the
+-- old aggregate can be consumed; descriptor-backed arrays already load as an
+-- owned copy and must not receive a second count.
+fn pipeline_nominal_record_update_base_fields(entry: i64, record_subst: i64, updates: RecordFieldList, caller_src: i64, base_value: i64, next_value: i64, layout: PipelineRecordStorageLayout) -> PipelineLoweredRecordFields {
+  if entry == 0 { pipeline_lowered_record_fields_invalid(next_value) }
+  else {
+    let entry_src = mem_load64_at(entry, 48)
+    let declared = mem_load64_at(entry, 32)
+    let count = mem_load64_at(entry, 24)
+    let mut values = ir_record_field_list_empty()
+    let mut insts = ir_inst_list_empty()
+    let mut cursor = next_value
+    let mut word_offset = 0
+    let mut valid = 1
+    for i in 0..count {
+      let field_ns = mem_load64_at(declared, i * 24)
+      let field_nl = mem_load64_at(declared, i * 24 + 8)
+      let field_hash = effect_name_hash(entry_src, field_ns, field_nl)
+      let raw_ty = mem_load64_at(declared, i * 24 + 16)
+      let field_ty = if record_subst == 0 { raw_ty } else { ty_subst(raw_ty, record_subst) }
+      let lanes = pipeline_type_value_lane_count_or_one(field_ty)
+      if field_ty == 0 or lanes <= 0 {
+        valid = 0
+      } else {
+        if pipeline_record_update_fields_have_hash(updates, caller_src, field_hash) == 0 {
+          let loaded = pipeline_lower_field_load_for_storage_layout(cursor, base_value, field_hash, word_offset, field_ty, layout)
+          if ir_lowered_expr_is_valid(loaded) == 0 {
+            valid = 0
+          } else {
+            values = ir_record_field_list_append(values, pipeline_ir_record_field_lane_entries(field_hash, word_offset, ir_lowered_expr_value(loaded), field_ty))
+            insts = ir_inst_list_append(insts, ir_lowered_expr_insts(loaded))
+            cursor = ir_lowered_expr_next_value(loaded)
+            if pipeline_nominal_record_field_load_is_owned(layout, word_offset, field_hash, field_ty) == 0 {
+              let retains = pipeline_managed_retain_inst_list(ir_lowered_expr_value(loaded), field_ty, cursor)
+              insts = ir_inst_list_append(insts, retains)
+              cursor = cursor + ir_inst_list_len(retains)
+            } else { 0 }
+          }
+        } else { 0 }
+      }
+      word_offset = word_offset + lanes
+    }
+    pipeline_lowered_record_fields(values, cursor, insts, valid)
+  }
+}
+
+fn pipeline_nominal_record_update_param_values(entry: i64, record_subst: i64, start: i64) -> IrRecordFieldList {
+  let mut values = ir_record_field_list_empty()
+  if entry != 0 {
+    let entry_src = mem_load64_at(entry, 48)
+    let declared = mem_load64_at(entry, 32)
+    let count = mem_load64_at(entry, 24)
+    let mut word_offset = 0
+    for i in 0..count {
+      let field_ns = mem_load64_at(declared, i * 24)
+      let field_nl = mem_load64_at(declared, i * 24 + 8)
+      let raw_ty = mem_load64_at(declared, i * 24 + 16)
+      let field_ty = if record_subst == 0 { raw_ty } else { ty_subst(raw_ty, record_subst) }
+      let field_hash = effect_name_hash(entry_src, field_ns, field_nl)
+      values = ir_record_field_list_append(values, pipeline_ir_record_field_lane_entries(field_hash, word_offset, start + word_offset, field_ty))
+      word_offset = word_offset + pipeline_type_value_lane_count_or_one(field_ty)
+    }
+  } else { 0 }
+  values
+}
+
+fn pipeline_nominal_record_update_value_lane_count(entry: i64, record_subst: i64) -> i64 {
+  if entry == 0 { 0 }
+  else {
+    let declared = mem_load64_at(entry, 32)
+    let count = mem_load64_at(entry, 24)
+    let mut lanes = 0
+    let mut valid = 1
+    for i in 0..count {
+      let raw_ty = mem_load64_at(declared, i * 24 + 16)
+      let field_ty = if record_subst == 0 { raw_ty } else { ty_subst(raw_ty, record_subst) }
+      if field_ty == 0 { valid = 0 }
+      else { lanes = lanes + pipeline_type_value_lane_count_or_one(field_ty) }
+    }
+    if valid == 1 { lanes } else { 0 - 1 }
+  }
+}
+
 fn pipeline_record_update_field_entry_params(blocks: IrBlockList, entry_id: i64, params: IrValueList) -> IrBlockList {
   match blocks {
     IrBlockListNil -> IrBlockListNil
@@ -7337,12 +7449,90 @@ fn pipeline_record_update_field_entry_params(blocks: IrBlockList, entry_id: i64,
   }
 }
 
+fn pipeline_lower_nominal_record_update_typed_to_target_blocks(base: Expr, fields: RecordFieldList, base_ty: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
+  let tt = pipeline_lower_module_tt(module)
+  let entry = if base_ty == 0 or ty_tag(base_ty) != 9 { 0 } else { ttable_lookup_by_type_hash(tt, ty_f1(base_ty)) }
+  if entry == 0 {
+    pipeline_lowered_blocks_invalid(start_block, next_value)
+  } else {
+    let base_merge_block = next_block
+    let record_block = next_block + 1
+    let base_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(base, params, locals, module, next_value, start_block, next_block + 2, base_merge_block)
+    if pipeline_lowered_blocks_is_valid(base_blocks) == 0 {
+      pipeline_lowered_blocks_invalid(start_block, next_value)
+    } else { if pipeline_lowered_blocks_falls_through(base_blocks) == 0 {
+      base_blocks
+    } else {
+      let base_value = pipeline_lowered_blocks_next_value(base_blocks)
+      let base_params = ir_value_list_prepend(base_value, ir_value_list_empty())
+      let record_subst = pipeline_record_instance_subst(entry, base_ty, pipeline_lower_module_subst(module))
+      let layout = pipeline_record_storage_layout_for_entry(tt, entry, record_subst)
+      let loaded = pipeline_nominal_record_update_base_fields(entry, record_subst, fields, pipeline_lower_module_src(module), base_value, base_value + 1, layout)
+      if pipeline_lowered_record_fields_is_valid(loaded) == 0 {
+        pipeline_lowered_blocks_invalid(start_block, next_value)
+      } else {
+        let borrowed = pipeline_expr_result_is_borrowed_for_ty_typed(base, base_ty, pipeline_lower_module_src(module), pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), tt)
+        let base_releases = if borrowed == 0 { pipeline_managed_release_inst_list(base_value, base_ty, pipeline_lowered_record_fields_next_value(loaded)) } else { ir_inst_list_empty() }
+        let ownership_insts = ir_inst_list_append(pipeline_lowered_record_fields_insts(loaded), base_releases)
+        let field_base_value = pipeline_lowered_record_fields_next_value(loaded) + ir_inst_list_len(base_releases)
+        let unchanged_lanes = ir_record_field_list_len(pipeline_lowered_record_fields_values(loaded))
+        let field_base_params = pipeline_ir_value_lane_ids(field_base_value, 0, unchanged_lanes)
+        let initial_values = pipeline_ir_record_field_values_rebase(pipeline_lowered_record_fields_values(loaded), field_base_value, 0)
+        let merge_args = pipeline_ir_record_field_values_args(pipeline_lowered_record_fields_values(loaded))
+        let record_lanes = pipeline_nominal_record_update_value_lane_count(entry, record_subst)
+        if record_lanes < 0 {
+          pipeline_lowered_blocks_invalid(start_block, next_value)
+        } else { if record_field_list_len(fields) == 0 {
+          let record_params_start = field_base_value
+          let record_params = pipeline_ir_value_lane_ids(record_params_start, 0, record_lanes)
+          let record_values = pipeline_nominal_record_update_param_values(entry, record_subst, record_params_start)
+          let result_dst = record_params_start + record_lanes
+          let record_inst = ir_inst_list_prepend(pipeline_record_init_inst_for_storage_layout(tt, entry, record_subst, result_dst, ty_f1(base_ty), record_values), ir_inst_list_empty())
+          let cleanup = pipeline_record_array_source_releases_for_storage_layout(tt, entry, record_subst, record_values, result_dst + 1)
+          if pipeline_lowered_args_is_valid(cleanup) == 0 {
+            pipeline_lowered_blocks_invalid(start_block, next_value)
+          } else {
+            let merge = ir_block_new_params(base_merge_block, base_params, ownership_insts, ir_term_jump_args(record_block, merge_args))
+            let record = ir_block_new_params(record_block, record_params, ir_inst_list_append(record_inst, pipeline_lowered_args_insts(cleanup)), ir_term_jump_args(target_block, ir_value_list_prepend(result_dst, ir_value_list_empty())))
+            let blocks = ir_block_list_append(pipeline_lowered_blocks_blocks(base_blocks), ir_block_list_prepend(merge, ir_block_list_prepend(record, ir_block_list_empty())))
+            pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(base_blocks), pipeline_lowered_args_next_value(cleanup), blocks, 1)
+          }
+        } else {
+          let first_field_block = pipeline_lowered_blocks_next_block(base_blocks)
+          let lowered_fields = pipeline_lower_record_field_blocks_typed(fields, params, locals, module, 0, 0, record_block, field_base_value + unchanged_lanes, first_field_block, initial_values)
+          if pipeline_lowered_record_field_blocks_is_valid(lowered_fields) == 0 {
+            pipeline_lowered_blocks_invalid(start_block, next_value)
+          } else {
+            let record_params_start = pipeline_lowered_record_field_blocks_next_value(lowered_fields)
+            let record_params = pipeline_ir_value_lane_ids(record_params_start, 0, record_lanes)
+            let record_values = pipeline_nominal_record_update_param_values(entry, record_subst, record_params_start)
+            let result_dst = record_params_start + record_lanes
+            let record_inst = ir_inst_list_prepend(pipeline_record_init_inst_for_storage_layout(tt, entry, record_subst, result_dst, ty_f1(base_ty), record_values), ir_inst_list_empty())
+            let cleanup = pipeline_record_array_source_releases_for_storage_layout(tt, entry, record_subst, record_values, result_dst + 1)
+            if pipeline_lowered_args_is_valid(cleanup) == 0 {
+              pipeline_lowered_blocks_invalid(start_block, next_value)
+            } else {
+              let merge = ir_block_new_params(base_merge_block, base_params, ownership_insts, ir_term_jump_args(first_field_block, merge_args))
+              let field_blocks = pipeline_record_update_field_entry_params(pipeline_lowered_record_field_blocks_blocks(lowered_fields), first_field_block, field_base_params)
+              let record = ir_block_new_params(record_block, record_params, ir_inst_list_append(record_inst, pipeline_lowered_args_insts(cleanup)), ir_term_jump_args(target_block, ir_value_list_prepend(result_dst, ir_value_list_empty())))
+              let blocks = ir_block_list_append(pipeline_lowered_blocks_blocks(base_blocks), ir_block_list_prepend(merge, ir_block_list_append(field_blocks, ir_block_list_prepend(record, ir_block_list_empty()))))
+              pipeline_lowered_blocks(pipeline_lowered_record_field_blocks_next_block(lowered_fields), pipeline_lowered_args_next_value(cleanup), blocks, 1)
+            }
+          }
+        } }
+      }
+    } }
+  }
+}
+
 fn pipeline_lower_record_update_typed_to_target_blocks(base: Expr, fields: RecordFieldList, fact: RecordUpdateFact, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
   let subst = pipeline_lower_module_subst(module)
   let base_ty = ty_subst(record_update_fact_base_type_node(fact), subst)
   let result_ty = ty_subst(record_update_fact_result_type_node(fact), subst)
   if base_ty == 0 or result_ty == 0 {
     pipeline_lowered_blocks_invalid(start_block, next_value)
+  } else { if ty_tag(base_ty) == 9 {
+    pipeline_lower_nominal_record_update_typed_to_target_blocks(base, fields, base_ty, params, locals, module, next_value, start_block, next_block, target_block)
   } else {
     let base_merge_block = next_block
     let record_block = next_block + 1
@@ -7390,7 +7580,7 @@ fn pipeline_lower_record_update_typed_to_target_blocks(base: Expr, fields: Recor
         }
       }
     } }
-  }
+  } }
 }
 
 -- Collection handles are sealed, zero-wrapper machine words. A bridge call on
