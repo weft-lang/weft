@@ -33,6 +33,25 @@ type NativeModule {
   NativeModule(rc i64, i64, IrFunctionList)
 }
 
+-- Shared native provenance facts join semantic function identity with the
+-- final code layout. Emission offsets and frame shape stay codegen-owned;
+-- source identity comes only from checked declarations. Consumers (symbols,
+-- embedded fatal reporting) use this API instead of rescanning syntax or the
+-- monomorphisation cache.
+type PipelineNativeSourceLocation {
+  PipelineNativeSourceUnknown,
+  PipelineNativeSourceKnown(i64, i64, i64, i64, i64, i64, i64)
+}
+
+type PipelineNativeProvenanceFact {
+  PipelineNativeProvenanceFact(i64, i64, i64, i64, i64, PipelineNativeSourceLocation)
+}
+
+type PipelineNativeProvenanceFactList {
+  PipelineNativeProvenanceFactNil,
+  PipelineNativeProvenanceFactCons(PipelineNativeProvenanceFact, PipelineNativeProvenanceFactList)
+}
+
 type BinaryObject {
   BinaryObject(rc i64, i64)
 }
@@ -842,6 +861,139 @@ fn pipeline_native_fmap(native: NativeModule) -> i64 {
 fn pipeline_native_functions(native: NativeModule) -> IrFunctionList {
   match native {
     NativeModule(code, fm, functions) -> functions
+  }
+}
+
+fn pipeline_native_source_location_for_pair(pair: i64, tt: i64) -> PipelineNativeSourceLocation {
+  if pair == 0 { PipelineNativeSourceUnknown }
+  else {
+    let fn_wrap = node_f1(pair)
+    let inner = pipeline_fn_inner(fn_wrap)
+    let src = node_f2(pair)
+    let name_start = node_f1(inner)
+    let name_len = node_f2(inner)
+    let span = src + name_start
+    let entry = if tt == 0 { 0 } else { ttable_find_source_entry(tt, span) }
+    let source_buf = if entry == 0 { src } else { mem_load64_at(entry, 0) }
+    let path_ptr = if entry == 0 { 0 } else { mem_load64_at(entry + 16, 0) }
+    let path_len = if entry == 0 { 0 } else { mem_load64_at(entry + 24, 0) }
+    let offset = span - source_buf
+    let mut line = 1
+    let mut col = 1
+    let mut i = 0
+    while i < offset {
+      if mem_load8_at(source_buf, i) == 10 {
+        line = line + 1
+        col = 1
+      } else { col = col + 1 }
+      i = i + 1
+    }
+    PipelineNativeSourceKnown(src, name_start, name_len, path_ptr, path_len, line, col)
+  }
+}
+
+fn pipeline_native_source_location_for_hash(fns: i64, hash: i64, tt: i64) -> PipelineNativeSourceLocation {
+  if pipeline_fns_fact_list_valid(fns) == 0 { PipelineNativeSourceUnknown }
+  else {
+    let bundle = pipeline_fns_index_bundle(fns)
+    let named = pipeline_fns_index_probe(node_f1(bundle), hash)
+    let pair = if named != 0 { named } else { pipeline_fns_index_probe(node_f2(bundle), hash) }
+    pipeline_native_source_location_for_pair(pair, tt)
+  }
+}
+
+fn pipeline_native_ir_source_for_hash(functions: IrFunctionList, hash: i64) -> i64 {
+  match functions {
+    IrFunctionNil -> 0
+    IrFunctionCons(f, rest) -> {
+      match f {
+        IrFunction(fn_hash, params, blocks, src) -> {
+          if fn_hash == hash { src } else { pipeline_native_ir_source_for_hash(rest, hash) }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_native_provenance_facts_from(native: NativeModule) -> PipelineNativeProvenanceFactList {
+  match native {
+    NativeModule(code, fm, functions) -> {
+      let layout = fmap_native_layout_facts(fm)
+      let fns = fmap_native_fns(fm)
+      let tt = fmap_get_tt(fm)
+      let mut facts = PipelineNativeProvenanceFactNil
+      let mut i = nlist_len(layout)
+      while i > 0 {
+        i = i - 1
+        let entry = nlist_get(layout, i)
+        let start = node_f1(entry)
+        let end = node_f2(entry)
+        let hash = node_f3(entry)
+        let framed = node_f4(entry)
+        let src = pipeline_native_ir_source_for_hash(functions, hash)
+        let location = pipeline_native_source_location_for_hash(fns, hash, tt)
+        facts = PipelineNativeProvenanceFactCons(
+          PipelineNativeProvenanceFact(start, end, hash, framed, src, location),
+          facts
+        )
+      }
+      facts
+    }
+  }
+}
+
+fn pipeline_native_provenance_facts(native: NativeModule) -> PipelineNativeProvenanceFactList {
+  pipeline_native_provenance_facts_from(native)
+}
+
+fn pipeline_native_provenance_fact_count(facts: PipelineNativeProvenanceFactList) -> i64 {
+  match facts {
+    PipelineNativeProvenanceFactNil -> 0
+    PipelineNativeProvenanceFactCons(fact, rest) -> 1 + pipeline_native_provenance_fact_count(rest)
+  }
+}
+
+fn pipeline_native_provenance_named_count(facts: PipelineNativeProvenanceFactList) -> i64 {
+  match facts {
+    PipelineNativeProvenanceFactNil -> 0
+    PipelineNativeProvenanceFactCons(fact, rest) -> {
+      match fact {
+        PipelineNativeProvenanceFact(start, end, hash, framed, src, location) -> {
+          match location {
+            PipelineNativeSourceUnknown -> pipeline_native_provenance_named_count(rest)
+            PipelineNativeSourceKnown(name_src, name_start, name_len, path_ptr, path_len, line, col) -> 1 + pipeline_native_provenance_named_count(rest)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_native_provenance_ranges_valid(facts: PipelineNativeProvenanceFactList, previous_end: i64) -> i64 {
+  match facts {
+    PipelineNativeProvenanceFactNil -> 1
+    PipelineNativeProvenanceFactCons(fact, rest) -> {
+      match fact {
+        PipelineNativeProvenanceFact(start, end, hash, framed, src, location) -> {
+          if start < previous_end or end <= start or (framed != 0 and framed != 1) { 0 }
+          else { pipeline_native_provenance_ranges_valid(rest, end) }
+        }
+      }
+    }
+  }
+}
+
+fn pipeline_native_provenance_lookup_hash_or(facts: PipelineNativeProvenanceFactList, code_offset: i64, default: i64) -> i64 {
+  match facts {
+    PipelineNativeProvenanceFactNil -> default
+    PipelineNativeProvenanceFactCons(fact, rest) -> {
+      match fact {
+        PipelineNativeProvenanceFact(start, end, hash, framed, src, location) -> {
+          if code_offset >= start and code_offset < end { hash }
+          else { pipeline_native_provenance_lookup_hash_or(rest, code_offset, default) }
+        }
+      }
+    }
   }
 }
 
@@ -33866,6 +34018,10 @@ fn pipeline_ir_lambda_evidence_register_functions(functions: IrFunctionList, fm:
   }
 }
 
+fn pipeline_native_layout_fact_record(fm: i64, start: i64, end: i64, hash: i64, framed: i64) -> i64 {
+  nlist_add(fmap_native_layout_facts(fm), node_new(0, start, end, hash, framed))
+}
+
 fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: PipelineIrSemanticFactList, fns: i64) -> i64 {
   match irf {
     IrFunction(hash, param_count, blocks, src) -> {
@@ -33970,6 +34126,7 @@ fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: Pipe
         } else { 0 }
         pipeline_ir_abort_cleanup_emit_function_exit(code, fm)
         emit_epilogue_current(code, fm)
+        pipeline_native_layout_fact_record(fm, fn_off, buf_len(code), hash, if fmap_current_naked_leaf(fm) == 1 { 0 } else { 1 })
         fmap_set_current_split_map(fm, 0)
         fmap_set_current_split_actives(fm, 0)
         fmap_set_current_def_shapes(fm, 0)
@@ -34112,6 +34269,7 @@ fn pipeline_lower_native_module_with_audit(typed: TypedModule, ir: IrModule, aud
       let functions = pipeline_ir_functions(ir)
       let code = buf_new(1048576)
       let fm = fmap_new()
+      fmap_set_native_fns(fm, fns)
       if audit == 1 {
         fmap_set_audit_mode(fm, 1)
         pipeline_ir_live_measure_module(functions, fm)

@@ -1067,6 +1067,14 @@ else
   assert_contains "pkg_init_rejects_invalid_name" "$bad_init_out" "pkg: invalid package name"
 fi
 
+printf 'fn helper() -> i64 { 42 }\nfn main() -> i64 { helper() }\n' > "$tmp_src"
+run_weft_compile_guarded "$WEFT" symbols "$tmp_src" > "$tmp_out" 2> "$tmp_err"
+symbols_out=$(<"$tmp_out")
+symbols_lines=$(wc -l < "$tmp_out" | tr -d ' ')
+assert_equals "symbols_emits_one_fact_per_native_function" "$symbols_lines" "2"
+assert_contains "symbols_uses_checked_main_name" "$symbols_out" " main"
+assert_contains "symbols_uses_checked_helper_name" "$symbols_out" " helper"
+
 printf 'test "plain" { Test.assert_eq(1, 1) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_binds_runtime_without_missing_symbols" "$tmp_err" "required runtime function unavailable"
@@ -1328,4 +1336,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 311 passed, 0 failed"
+echo "Tool boundary summary: 314 passed, 0 failed"
