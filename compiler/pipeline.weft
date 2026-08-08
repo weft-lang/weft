@@ -5543,6 +5543,14 @@ fn pipeline_lower_array_literal_store_value_typed(element: Expr, value: i64, dat
         let next = if borrowed == 0 { src_data + 2 } else { src_data + 1 }
         pipeline_lowered_args(ir_value_list_empty(), next, ir_inst_list_append(prefix, ir_inst_list_append(copy, release)), 1)
       }
+    } else { if ty_is_record(element_ty) {
+      if pipeline_type_managed_release_lane_count(element_ty) > 0 {
+        pipeline_lowered_args_invalid(next_value)
+      } else {
+        let stored = pipeline_lower_indexed_structural_store_value(addr, value, 0, element_ty, addr + 1, tt)
+        if pipeline_lowered_args_is_valid(stored) == 0 { pipeline_lowered_args_invalid(next_value) }
+        else { pipeline_lowered_args(ir_value_list_empty(), pipeline_lowered_args_next_value(stored), ir_inst_list_append(prefix, pipeline_lowered_args_insts(stored)), 1) }
+      }
     } else { if cg_layout_vector_record_inline_eligible(tt, element_ty) == 1 {
       let size_value = addr + 1
       let mode_value = size_value + 1
@@ -5582,7 +5590,7 @@ fn pipeline_lower_array_literal_store_value_typed(element: Expr, value: i64, dat
         ir_inst_list_prepend(ir_inst_const_i64(mode_value, cg_layout_array_element_mode(tt, array_ty)), ir_inst_list_empty())
       )
       pipeline_lowered_args(ir_value_list_empty(), next, ir_inst_list_append(prefix, ir_inst_list_append(facts, ir_inst_list_append(retain, ir_inst_list_append(store, release)))), 1)
-    } }
+    } } }
   }
 }
 
@@ -7194,14 +7202,15 @@ fn pipeline_lower_array_literal_element_blocks_typed(elements: ExprList, index: 
           child
         } else {
           let element_value = pipeline_lowered_blocks_next_value(child)
-          let stored = pipeline_lower_array_literal_store_value_typed(element, element_value, data, index, array_ty, element_value + 1, lower_ctx)
+          let element_lanes = pipeline_type_value_lane_count_or_one(ty_array_inner(array_ty))
+          let stored = pipeline_lower_array_literal_store_value_typed(element, element_value, data, index, array_ty, element_value + element_lanes, lower_ctx)
           if pipeline_lowered_args_is_valid(stored) == 0 {
             pipeline_lowered_blocks_invalid(start_block, next_value)
           } else {
             let jump = if is_last == 1 {
               ir_term_jump_args(target_block, ir_value_list_prepend(storage, ir_value_list_empty()))
             } else { ir_term_jump(rest_start) }
-            let merge = ir_block_new_params(merge_block, ir_value_list_prepend(element_value, ir_value_list_empty()), pipeline_lowered_args_insts(stored), jump)
+            let merge = ir_block_new_params(merge_block, pipeline_ir_value_lane_ids(element_value, 0, element_lanes), pipeline_lowered_args_insts(stored), jump)
             if is_last == 1 {
               pipeline_lowered_blocks_control(
                 pipeline_lowered_blocks_next_block(child),
@@ -15255,7 +15264,11 @@ fn pipeline_expr_needs_index_runtime_typed(expr: Expr) -> bool {
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_expr_needs_index_runtime_typed(recv) or pipeline_expr_list_needs_index_runtime_typed(args)
     Try(inner, effect_atom) -> pipeline_expr_needs_index_runtime_typed(inner)
     InterpConcat(left, right) -> pipeline_expr_needs_index_runtime_typed(left) or pipeline_expr_needs_index_runtime_typed(right)
-    ForIter(var_ns, var_nl, collection, body) -> pipeline_expr_needs_index_runtime_typed(collection) or pipeline_expr_needs_index_runtime_typed(body)
+    -- Built-in array/slice iteration lowers through the indexed-address
+    -- boundary even when neither source child contains explicit indexing.
+    -- ForIter does not yet carry its resolved collection kind, so retain the
+    -- dependency conservatively for list iteration too.
+    ForIter(var_ns, var_nl, collection, body) -> true
     OptChain(base, field_ns, field_nl, effect_atom) -> pipeline_expr_needs_index_runtime_typed(base)
     LetTyped(inner, ann_type) -> pipeline_expr_needs_index_runtime_typed(inner)
     _ -> false
@@ -19237,6 +19250,148 @@ fn pipeline_lower_indexed_slice_value(address: i64, next_value: i64) -> IrLowere
   ir_lowered_expr(result, result + 2, insts)
 }
 
+-- Structural records use contiguous semantic lanes but indexed containers use
+-- their byte layout. These two recursive plans are the missing transport
+-- seam: flatten/unflatten at the producer, never in a later recognizer.
+fn pipeline_lower_indexed_structural_load_lane(address: i64, dst: i64, byte_offset: i64, byte_size: i64, mode: i64, next_value: i64) -> PipelineLoweredArgs {
+  if byte_offset < 0 or byte_size <= 0 or byte_size > 8 { pipeline_lowered_args_invalid(next_value) }
+  else {
+    let offset_value = next_value
+    let lane_address = offset_value + 1
+    let size_value = lane_address + 1
+    let mode_value = size_value + 1
+    let load_args = ir_value_list_prepend(lane_address, ir_value_list_prepend(size_value, ir_value_list_prepend(mode_value, ir_value_list_empty())))
+    let insts = ir_inst_list_prepend(
+      ir_inst_const_i64(offset_value, byte_offset),
+      ir_inst_list_prepend(
+        ir_inst_binary_i64(lane_address, ir_binary_op_add(), address, offset_value),
+        ir_inst_list_prepend(
+          ir_inst_const_i64(size_value, byte_size),
+          ir_inst_list_prepend(
+            ir_inst_const_i64(mode_value, mode),
+            ir_inst_list_prepend(ir_inst_call_i64(dst, pipeline_ir_native_intrinsic_mem_load_sized_hash(), load_args), ir_inst_list_empty())
+          )
+        )
+      )
+    )
+    pipeline_lowered_args(ir_value_list_empty(), mode_value + 1, insts, 1)
+  }
+}
+
+fn pipeline_lower_indexed_structural_load_value(address: i64, dst: i64, byte_offset: i64, ty: i64, next_value: i64, tt: i64) -> PipelineLoweredArgs {
+  if ty_is_record(ty) {
+    pipeline_lower_indexed_structural_load_fields(address, dst, byte_offset, ty, 0, next_value, tt)
+  } else { if ty_is_slice(ty) {
+    let first = pipeline_lower_indexed_structural_load_lane(address, dst, byte_offset, 8, 0, next_value)
+    if pipeline_lowered_args_is_valid(first) == 0 { first }
+    else {
+      let second = pipeline_lower_indexed_structural_load_lane(address, dst + 1, byte_offset + 8, 8, 0, pipeline_lowered_args_next_value(first))
+      if pipeline_lowered_args_is_valid(second) == 0 { second }
+      else { pipeline_lowered_args(ir_value_list_empty(), pipeline_lowered_args_next_value(second), ir_inst_list_append(pipeline_lowered_args_insts(first), pipeline_lowered_args_insts(second)), 1) }
+    }
+  } else {
+    let lanes = pipeline_type_value_lane_count_or_one(ty)
+    let size = cg_layout_inline_size(tt, ty)
+    if lanes != 1 { pipeline_lowered_args_invalid(next_value) }
+    else { pipeline_lower_indexed_structural_load_lane(address, dst, byte_offset, size, cg_layout_storage_mode(tt, ty), next_value) }
+  } }
+}
+
+fn pipeline_lower_indexed_structural_load_fields(address: i64, dst: i64, byte_offset: i64, record_ty: i64, field_index: i64, next_value: i64, tt: i64) -> PipelineLoweredArgs {
+  let fields = ty_record_fields(record_ty)
+  let count = if fields == 0 { 0 } else { nlist_len(fields) }
+  if field_index >= count { pipeline_lowered_args(ir_value_list_empty(), next_value, ir_inst_list_empty(), 1) }
+  else {
+    let field = ty_record_field_at_layout_index(record_ty, field_index)
+    let field_hash = ty_record_field_hash(field)
+    let field_ty = ty_record_field_type(field)
+    let field_word_offset = ty_record_field_word_offset(record_ty, field_hash)
+    let field_byte_offset = cg_layout_structural_record_field_offset(tt, record_ty, field_hash)
+    let current = pipeline_lower_indexed_structural_load_value(address, dst + field_word_offset, byte_offset + field_byte_offset, field_ty, next_value, tt)
+    if pipeline_lowered_args_is_valid(current) == 0 { current }
+    else {
+      let rest = pipeline_lower_indexed_structural_load_fields(address, dst, byte_offset, record_ty, field_index + 1, pipeline_lowered_args_next_value(current), tt)
+      if pipeline_lowered_args_is_valid(rest) == 0 { rest }
+      else { pipeline_lowered_args(ir_value_list_empty(), pipeline_lowered_args_next_value(rest), ir_inst_list_append(pipeline_lowered_args_insts(current), pipeline_lowered_args_insts(rest)), 1) }
+    }
+  }
+}
+
+fn pipeline_lower_indexed_structural_store_lane(address: i64, value: i64, byte_offset: i64, byte_size: i64, mode: i64, next_value: i64) -> PipelineLoweredArgs {
+  if byte_offset < 0 or byte_size <= 0 or byte_size > 8 { pipeline_lowered_args_invalid(next_value) }
+  else {
+    let offset_value = next_value
+    let lane_address = offset_value + 1
+    let size_value = lane_address + 1
+    let mode_value = size_value + 1
+    let store_dst = mode_value + 1
+    let store_args = ir_value_list_prepend(lane_address, ir_value_list_prepend(size_value, ir_value_list_prepend(mode_value, ir_value_list_prepend(value, ir_value_list_empty()))))
+    let insts = ir_inst_list_prepend(
+      ir_inst_const_i64(offset_value, byte_offset),
+      ir_inst_list_prepend(
+        ir_inst_binary_i64(lane_address, ir_binary_op_add(), address, offset_value),
+        ir_inst_list_prepend(
+          ir_inst_const_i64(size_value, byte_size),
+          ir_inst_list_prepend(
+            ir_inst_const_i64(mode_value, mode),
+            ir_inst_list_prepend(ir_inst_call_i64(store_dst, pipeline_ir_native_intrinsic_mem_store_sized_hash(), store_args), ir_inst_list_empty())
+          )
+        )
+      )
+    )
+    pipeline_lowered_args(ir_value_list_empty(), store_dst + 1, insts, 1)
+  }
+}
+
+fn pipeline_lower_indexed_structural_store_value(address: i64, value: i64, byte_offset: i64, ty: i64, next_value: i64, tt: i64) -> PipelineLoweredArgs {
+  if ty_is_record(ty) {
+    pipeline_lower_indexed_structural_store_fields(address, value, byte_offset, ty, 0, next_value, tt)
+  } else { if ty_is_slice(ty) {
+    let first = pipeline_lower_indexed_structural_store_lane(address, value, byte_offset, 8, 0, next_value)
+    if pipeline_lowered_args_is_valid(first) == 0 { first }
+    else {
+      let second = pipeline_lower_indexed_structural_store_lane(address, value + 1, byte_offset + 8, 8, 0, pipeline_lowered_args_next_value(first))
+      if pipeline_lowered_args_is_valid(second) == 0 { second }
+      else { pipeline_lowered_args(ir_value_list_empty(), pipeline_lowered_args_next_value(second), ir_inst_list_append(pipeline_lowered_args_insts(first), pipeline_lowered_args_insts(second)), 1) }
+    }
+  } else {
+    let lanes = pipeline_type_value_lane_count_or_one(ty)
+    let size = cg_layout_inline_size(tt, ty)
+    if lanes != 1 { pipeline_lowered_args_invalid(next_value) }
+    else { pipeline_lower_indexed_structural_store_lane(address, value, byte_offset, size, cg_layout_storage_mode(tt, ty), next_value) }
+  } }
+}
+
+fn pipeline_lower_indexed_structural_store_fields(address: i64, value: i64, byte_offset: i64, record_ty: i64, field_index: i64, next_value: i64, tt: i64) -> PipelineLoweredArgs {
+  let fields = ty_record_fields(record_ty)
+  let count = if fields == 0 { 0 } else { nlist_len(fields) }
+  if field_index >= count { pipeline_lowered_args(ir_value_list_empty(), next_value, ir_inst_list_empty(), 1) }
+  else {
+    let field = ty_record_field_at_layout_index(record_ty, field_index)
+    let field_hash = ty_record_field_hash(field)
+    let field_ty = ty_record_field_type(field)
+    let field_word_offset = ty_record_field_word_offset(record_ty, field_hash)
+    let field_byte_offset = cg_layout_structural_record_field_offset(tt, record_ty, field_hash)
+    let current = pipeline_lower_indexed_structural_store_value(address, value + field_word_offset, byte_offset + field_byte_offset, field_ty, next_value, tt)
+    if pipeline_lowered_args_is_valid(current) == 0 { current }
+    else {
+      let rest = pipeline_lower_indexed_structural_store_fields(address, value, byte_offset, record_ty, field_index + 1, pipeline_lowered_args_next_value(current), tt)
+      if pipeline_lowered_args_is_valid(rest) == 0 { rest }
+      else { pipeline_lowered_args(ir_value_list_empty(), pipeline_lowered_args_next_value(rest), ir_inst_list_append(pipeline_lowered_args_insts(current), pipeline_lowered_args_insts(rest)), 1) }
+    }
+  }
+}
+
+fn pipeline_lower_indexed_structural_record_value(address: i64, element_ty: i64, next_value: i64, tt: i64) -> IrLoweredExpr {
+  let lanes = pipeline_type_value_lane_count_or_one(element_ty)
+  if not ty_is_record(element_ty) or pipeline_type_managed_release_lane_count(element_ty) > 0 { ir_lowered_expr_invalid(next_value) }
+  else {
+    let plan = pipeline_lower_indexed_structural_load_value(address, next_value, 0, element_ty, next_value + lanes, tt)
+    if pipeline_lowered_args_is_valid(plan) == 0 { ir_lowered_expr_invalid(next_value) }
+    else { ir_lowered_expr(next_value, pipeline_lowered_args_next_value(plan), pipeline_lowered_args_insts(plan)) }
+  }
+}
+
 -- Consume only checker-produced indexed-storage facts. The runtime boundary
 -- owns the unsigned bounds check and canonical panic; layout, ownership, and
 -- nested-array value copying stay explicit in typed lowering.
@@ -19278,6 +19433,8 @@ fn pipeline_lower_indexed_get_after_values_typed_with_release(element_ty: i64, f
       }
     } else { if ty_is_slice(concrete_element_ty) {
       pipeline_lower_indexed_slice_value(address, after_address)
+    } else { if ty_is_record(concrete_element_ty) {
+      pipeline_lower_indexed_structural_record_value(address, concrete_element_ty, after_address, tt)
     } else { if cg_layout_vector_record_inline_eligible(tt, concrete_element_ty) == 1 {
       let size_value = after_address
       let mode_value = size_value + 1
@@ -19308,7 +19465,7 @@ fn pipeline_lower_indexed_get_after_values_typed_with_release(element_ty: i64, f
       let retain = pipeline_managed_retain_inst_list(result, concrete_element_ty, result + 1)
       let after_retain = result + 1 + ir_inst_list_len(retain)
       ir_lowered_expr(result, after_retain, ir_inst_list_append(load, retain))
-    } } }
+    } } } }
     if ir_lowered_expr_is_valid(loaded) == 0 { loaded }
     else {
       let release_dst = ir_lowered_expr_next_value(loaded)
