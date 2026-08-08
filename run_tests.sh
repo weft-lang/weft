@@ -132,19 +132,26 @@ if [ "${1:-}" = "__worker" ]; then
 
     chmod +x "$tmpbin"
 
+    tmp_run_err=$(mktemp /tmp/weft_test_result_XXXXXX)
     exit_code=0
     run_start=$(now_s)
-    run_guarded "$WEFT_TEST_RUN_TIMEOUT" "$WEFT_TEST_RUN_RSS_LIMIT_KB" "$tmpbin" 2>/dev/null || exit_code=$?
+    run_guarded "$WEFT_TEST_RUN_TIMEOUT" "$WEFT_TEST_RUN_RSS_LIMIT_KB" "$tmpbin" 2>"$tmp_run_err" || exit_code=$?
     run_elapsed=$(($(now_s) - run_start))
 
-    if [ $exit_code -eq 0 ]; then
-      if [ "$WEFT_TEST_SHOW_TIMINGS" -eq 1 ]; then
-        echo "  ✓ $name (compile ${compile_elapsed}s, run ${run_elapsed}s)"
-      else
-        echo "  ✓ $name"
+    result_line=$(grep -E '^WEFT_TEST_RESULT 1 [0-9]+ [0-9]+ [0-9]+$' "$tmp_run_err" | tail -1 || true)
+    result_valid=0
+    result_passed=0
+    result_failed=0
+    result_total=0
+    if [ -n "$result_line" ]; then
+      read -r result_marker result_version result_passed result_failed result_total result_extra <<< "$result_line"
+      if [ "$result_marker" = "WEFT_TEST_RESULT" ] && [ "$result_version" = "1" ] && [ -z "${result_extra:-}" ] && [ $((result_passed + result_failed)) -eq "$result_total" ]; then
+        result_valid=1
+        file_tests=$result_total
       fi
-      echo "pass $file_tests $compile_elapsed $run_elapsed" > "$meta"
-    elif [ $exit_code -eq 124 ]; then
+    fi
+
+    if [ $exit_code -eq 124 ]; then
       echo "  ✗ $name (runtime timed out after ${WEFT_TEST_RUN_TIMEOUT}s; compile ${compile_elapsed}s, run ${run_elapsed}s)"
       echo "  $name: runtime timed out after ${WEFT_TEST_RUN_TIMEOUT}s (compile ${compile_elapsed}s, run ${run_elapsed}s)" > "$errf"
       echo "fail $file_tests $compile_elapsed $run_elapsed" > "$meta"
@@ -152,13 +159,36 @@ if [ "${1:-}" = "__worker" ]; then
       echo "  ✗ $name (runtime exceeded ${WEFT_TEST_RUN_RSS_LIMIT_KB} KB RSS; compile ${compile_elapsed}s, run ${run_elapsed}s)"
       echo "  $name: runtime exceeded ${WEFT_TEST_RUN_RSS_LIMIT_KB} KB RSS (compile ${compile_elapsed}s, run ${run_elapsed}s)" > "$errf"
       echo "fail $file_tests $compile_elapsed $run_elapsed" > "$meta"
+    elif [ $exit_code -gt 1 ]; then
+      echo "  ✗ $name (runtime exited $exit_code without a completed test result; compile ${compile_elapsed}s, run ${run_elapsed}s)"
+      grep -v '^WEFT_TEST_RESULT ' "$tmp_run_err" > "$errf" || true
+      echo "  $name: runtime exited $exit_code without a completed test result (compile ${compile_elapsed}s, run ${run_elapsed}s)" >> "$errf"
+      echo "fail $file_tests $compile_elapsed $run_elapsed" > "$meta"
+    elif [ $result_valid -ne 1 ]; then
+      echo "  ✗ $name (missing or malformed structured test result; compile ${compile_elapsed}s, run ${run_elapsed}s)"
+      grep -v '^WEFT_TEST_RESULT ' "$tmp_run_err" > "$errf" || true
+      echo "  $name: missing or malformed structured test result (compile ${compile_elapsed}s, run ${run_elapsed}s)" >> "$errf"
+      echo "fail $file_tests $compile_elapsed $run_elapsed" > "$meta"
+    elif { [ $result_failed -eq 0 ] && [ $exit_code -ne 0 ]; } || { [ $result_failed -ne 0 ] && [ $exit_code -ne 1 ]; }; then
+      echo "  ✗ $name (test result/exit disagreement; compile ${compile_elapsed}s, run ${run_elapsed}s)"
+      grep -v '^WEFT_TEST_RESULT ' "$tmp_run_err" > "$errf" || true
+      echo "  $name: structured result and boolean exit disagree (compile ${compile_elapsed}s, run ${run_elapsed}s)" >> "$errf"
+      echo "fail $file_tests $compile_elapsed $run_elapsed" > "$meta"
+    elif [ $result_failed -eq 0 ]; then
+      if [ "$WEFT_TEST_SHOW_TIMINGS" -eq 1 ]; then
+        echo "  ✓ $name (compile ${compile_elapsed}s, run ${run_elapsed}s)"
+      else
+        echo "  ✓ $name"
+      fi
+      echo "pass $file_tests $compile_elapsed $run_elapsed" > "$meta"
     else
-      echo "  ✗ $name ($exit_code failures; compile ${compile_elapsed}s, run ${run_elapsed}s)"
-      echo "  $name: $exit_code failures (compile ${compile_elapsed}s, run ${run_elapsed}s)" > "$errf"
+      echo "  ✗ $name ($result_failed failures; compile ${compile_elapsed}s, run ${run_elapsed}s)"
+      grep -v '^WEFT_TEST_RESULT ' "$tmp_run_err" > "$errf" || true
+      echo "  $name: $result_failed failures (compile ${compile_elapsed}s, run ${run_elapsed}s)" >> "$errf"
       echo "fail $file_tests $compile_elapsed $run_elapsed" > "$meta"
     fi
 
-    rm -f "$tmpbin"
+    rm -f "$tmpbin" "$tmp_run_err"
     exit 0
   fi
 
@@ -350,4 +380,10 @@ if [ -n "$ERRORS" ]; then
   echo ""
   echo "Failures:"
   echo -e "$ERRORS"
+fi
+
+if [ "$FAIL" -eq 0 ]; then
+  exit 0
+else
+  exit 1
 fi

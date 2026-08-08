@@ -18,6 +18,7 @@ tmp_err=$(mktemp /tmp/weft_tool_err_XXXXXX)
 tmp_out=$(mktemp /tmp/weft_tool_out_XXXXXX)
 tmp_tool_obj=$(mktemp /tmp/weft_tool_runner_obj_XXXXXX)
 tmp_tool_bin=$(mktemp /tmp/weft_tool_runner_bin_XXXXXX)
+tmp_fake_weft=$(mktemp /tmp/weft_tool_fake_weft_XXXXXX)
 tmp_test_fail_one=$(mktemp /tmp/weft_tool_test_fail_one_XXXXXX.weft)
 tmp_test_fail_two=$(mktemp /tmp/weft_tool_test_fail_two_XXXXXX.weft)
 tmp_test_after=$(mktemp /tmp/weft_tool_test_after_XXXXXX.weft)
@@ -29,7 +30,7 @@ tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir"' EXIT
 
 now_s() {
   date +%s
@@ -1070,21 +1071,24 @@ printf 'test "plain" { Test.assert_eq(1, 1) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_binds_runtime_without_missing_symbols" "$tmp_err" "required runtime function unavailable"
 chmod +x "$tmp_bin"
-run_binary_guarded "$tmp_bin"
+run_binary_guarded "$tmp_bin" 2>"$tmp_err"
+assert_contains "test_harness_emits_passing_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
 echo "  ok test_harness_binds_runtime_after_synthesis"
 
 printf 'fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_supports_assertion_helpers" "$tmp_err" "unknown effect operation"
 chmod +x "$tmp_bin"
-run_binary_guarded "$tmp_bin"
+run_binary_guarded "$tmp_bin" 2>"$tmp_err"
+assert_contains "test_assertion_helpers_emit_passing_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
 echo "  ok test_assertion_helpers_pass"
 
 printf 'test "path" { Test.assert_eq(21 + 21, 42) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test --emit "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_path_compiles_strict_source" "$tmp_err" "type error:"
 chmod +x "$tmp_bin"
-run_binary_guarded "$tmp_bin"
+run_binary_guarded "$tmp_bin" 2>"$tmp_err"
+assert_contains "test_path_binary_emits_passing_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
 echo "  ok test_path_binary_runs"
 
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
@@ -1104,6 +1108,7 @@ assert_equals "test_path_native_stdout_empty" "$(<"$tmp_out")" ""
 test_path_native_err=$(<"$tmp_err")
 assert_contains "test_path_native_reports_pass" "$test_path_native_err" "  pass: $tmp_src ("
 assert_contains "test_path_native_reports_summary" "$test_path_native_err" "1 passed, 0 failed"
+assert_contains "test_path_native_consumes_structured_result" "$test_path_native_err" "WEFT_TEST_RESULT 1 1 0 1"
 
 printf 'test "first failure" { Test.assert_eq(1, 2) }\n' > "$tmp_test_fail_one"
 printf 'test "second failure" { Test.assert_true(false) }\n' > "$tmp_test_fail_two"
@@ -1112,7 +1117,7 @@ set +e
 run_weft_compile_guarded "$WEFT" test "$tmp_test_fail_one" "$tmp_test_after" "$tmp_test_fail_two" > "$tmp_out" 2>"$tmp_err"
 test_path_multi_exit=$?
 set -e
-assert_equals "test_path_native_counts_failed_files" "$test_path_multi_exit" "2"
+assert_equals "test_path_native_returns_boolean_failure" "$test_path_multi_exit" "1"
 assert_equals "test_path_native_failure_stdout_empty" "$(<"$tmp_out")" ""
 test_path_multi_err=$(<"$tmp_err")
 assert_contains "test_path_native_preserves_assertion_diagnostic" "$test_path_multi_err" "test assertion failed: assert_eq got=1 want=2"
@@ -1202,7 +1207,17 @@ set -e
 assert_equals "test_runner_capability_tool_failure_exit_one" "$test_tool_failure_exit" "1"
 test_tool_failure_err=$(<"$tmp_err")
 assert_contains "test_runner_capability_tool_preserves_diagnostic" "$test_tool_failure_err" "test assertion failed: assert_eq got=1 want=2"
+assert_contains "test_runner_capability_tool_consumes_structured_result" "$test_tool_failure_err" "WEFT_TEST_RESULT 1 0 1 1"
 assert_contains "test_runner_capability_tool_failure_summary" "$test_tool_failure_err" "0 passed, 1 failed"
+
+printf '#!/bin/sh\nexit 0\n' > "$tmp_fake_weft"
+chmod +x "$tmp_fake_weft"
+set +e
+run_binary_guarded "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_dir/a_pass.weft" > "$tmp_out" 2>"$tmp_err"
+test_tool_protocol_exit=$?
+set -e
+assert_equals "test_runner_capability_tool_rejects_missing_result" "$test_tool_protocol_exit" "1"
+assert_contains "test_runner_capability_tool_reports_protocol_failure" "$(<"$tmp_err")" "invalid test-result protocol"
 
 printf 'test "raw" { let p = __bump_alloc(8) Test.assert_eq(p, p) }\n' > "$tmp_src"
 test_path_raw_out=$(run_weft_compile_guarded "$WEFT" test "$tmp_src" > "$tmp_bin" 2>"$tmp_err" || true; cat "$tmp_err")
@@ -1241,7 +1256,7 @@ rm -f "$tmp_stdlib_probe"
 assert_test_exit_code "test_assert_eq_failure_returns_one" 'test "fail_eq" { Test.assert_eq(1, 2) }' 1
 assert_test_exit_code "test_assert_eq_and_ne_two_clause_harness_runs" 'test "eq_ne" { Test.assert_eq(0, 0) Test.assert_ne(1, 2) }' 0
 assert_test_exit_code "test_assert_ne_failure_returns_one" 'test "fail_ne" { Test.assert_ne(2, 2) }' 1
-assert_test_exit_code "test_assert_bool_failures_return_two" $'test "fail_true" { Test.assert_true(1 == 2) }\ntest "fail_false" { Test.assert_false(1 == 1) }' 2
+assert_test_exit_code "test_assert_bool_failures_return_boolean" $'test "fail_true" { Test.assert_true(1 == 2) }\ntest "fail_false" { Test.assert_false(1 == 1) }' 1
 assert_test_exit_code "test_assert_comparison_failure_returns_one" 'test "fail_cmp" { Test.assert_lt(2, 1) }' 1
 
 printf '%s\n' $'test "first named failure" { Test.assert_eq(1, 2) }\ntest "passing middle" { Test.assert_eq(3, 3) }\ntest "last named failure" { Test.assert_true(false) }' > "$tmp_src"
@@ -1251,8 +1266,9 @@ set +e
 run_binary_guarded "$tmp_bin" >/dev/null 2>"$tmp_err"
 test_named_failures_exit=$?
 set -e
-assert_equals "test_named_failures_count_all_blocks" "$test_named_failures_exit" "2"
+assert_equals "test_named_failures_return_boolean" "$test_named_failures_exit" "1"
 test_named_failures_err=$(<"$tmp_err")
+assert_contains "test_named_failures_report_structured_counts" "$test_named_failures_err" "WEFT_TEST_RESULT 1 1 2 3"
 assert_contains "test_named_failures_reports_first_name" "$test_named_failures_err" "test failure: first named failure"
 assert_contains "test_named_failures_reports_first_detail" "$test_named_failures_err" "test assertion failed: assert_eq got=1 want=2"
 assert_contains "test_named_failures_continues_past_pass" "$test_named_failures_err" "test failure: last named failure"
@@ -1308,7 +1324,8 @@ large_test_check_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_reads_large_test_harness" "$large_test_check_out" "0 errors"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>/dev/null
 chmod +x "$tmp_bin"
-run_binary_guarded "$tmp_bin"
+run_binary_guarded "$tmp_bin" 2>"$tmp_err"
+assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 303 passed, 0 failed"
+echo "Tool boundary summary: 311 passed, 0 failed"
