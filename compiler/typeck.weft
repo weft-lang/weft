@@ -2670,6 +2670,33 @@ fn typeck_named_record_field_word_offset(entry: i64, base_ty: i64, caller_src: i
   }
 }
 
+-- Every nominal record publishes the finite-map predicate its declaration
+-- proves.  Keep this in the checker/type-relation layer: consumers compare
+-- the projection as a semantic type, while lowering continues to use the
+-- nominal value's concrete storage layout.
+fn typeck_named_record_projection(tt: i64, named_ty: i64) -> i64 {
+  if named_ty == 0 or ty_tag(named_ty) != 9 { 0 }
+  else {
+    let entry = ttable_lookup_by_type_hash(tt, ty_f1(named_ty))
+    if entry == 0 { 0 }
+    else {
+      let entry_src = mem_load64_at(entry, 48)
+      let fields = mem_load64_at(entry, 32)
+      let nfields = mem_load64_at(entry, 24)
+      let subst = type_cycle_subst_for_entry(entry, ty_f3(named_ty))
+      let projected = nlist_new_capacity(nfields)
+      for i in 0..nfields {
+        let field_ns = mem_load64_at(fields, i * 24)
+        let field_nl = mem_load64_at(fields, i * 24 + 8)
+        let raw_ty = mem_load64_at(fields, i * 24 + 16)
+        let field_ty = type_cycle_maybe_subst(raw_ty, subst)
+        nlist_add(projected, ty_record_field(effect_name_hash(entry_src, field_ns, field_nl), field_ty, field_ns, field_nl))
+      }
+      ty_record(projected, 0)
+    }
+  }
+}
+
 fn synth_field_access(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
   let base = node_f1(node)
   let field_ns = node_f2(node)
@@ -2681,7 +2708,7 @@ fn synth_field_access(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
     let field = ty_record_field_by_hash(ty_record_fields(base_ty), field_hash)
     let word_offset = ty_record_field_word_offset(base_ty, field_hash)
     let field_ty = if field == 0 { ty_any() } else { ty_record_field_type(field) }
-    if field != 0 and word_offset >= 0 {
+    if field != 0 {
       mem_store64_at(node, 32, node_new(1, field_ty, word_offset, base_ty, 1))
     } else { 0 }
     field_ty
@@ -2989,7 +3016,10 @@ fn synth_generic_call(node: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
     -- Check type arg count matches
     let n_tparams = nlist_len(tparams)
     let n_targs = nlist_len(type_args)
-    if n_tparams != n_targs {
+    -- Compiler-produced shape specialisations append one exact type per
+    -- value parameter after the source-written generic arguments.  The
+    -- ordinary substitution deliberately consumes only the tparam prefix.
+    if n_targs < n_tparams {
       if ret_ty == 0 { ty_any() } else { ret_ty }
     } else {
       -- Build substitution and apply to return type
@@ -5632,6 +5662,10 @@ fn check_lambda_against_fn(lambda: i64, expected: i64, env: i64, ft: i64, src: i
     let expected_params = ty_f1(expected)
     let nexpected = nlist_len(expected_params)
     let mut errors = 0
+    if typeck_fn_type_has_open_structural_shape(expected) == 1 {
+      typeck_error_maybe(src, if pos > 0 { pos } else { lambda_span(lambda) }, "type error: open structural parameters cannot cross a function-value boundary")
+      errors = errors + 1
+    } else { errors = errors }
     if nparams != nexpected {
       if pos > 0 {
         typeck_error(src, pos, "type error: argument type mismatch")
@@ -5698,7 +5732,11 @@ fn check_lambda_standalone(lambda: i64, env: i64, ft: i64, src: i64, tt: i64) -[
       check_unique_param_usage(params, nparams, body, src) +
       check_unique_linear_expr(body, lambda_env, ft, src, tt)
   } else { 0 }
-  check_closure_mut_captures(body, params, nparams, env, src) +
+  let shape_errors = if typeck_params_have_open_structural_shape(params) == 1 {
+    typeck_error_maybe(src, lambda_span(lambda), "type error: open structural parameters require a direct named function")
+    1
+  } else { 0 }
+  shape_errors + check_closure_mut_captures(body, params, nparams, env, src) +
     unique_errors +
     check_expr(body, lambda_env, ft, src, infer_expr_effects(body, lambda_env, ft, src, tt), tt) +
     check_return_values(body, lambda_env, ft, src, body_ty, tt)
@@ -5757,6 +5795,60 @@ fn check_arg_against_param_mode(arg: i64, param_ty: i64, env: i64, ft: i64, src:
 
 fn check_arg_against_param(arg: i64, param_ty: i64, env: i64, ft: i64, src: i64, tt: i64, pos: i64) -[Conformance, Diagnose]> i64 {
   check_arg_against_param_mode(arg, param_ty, env, ft, src, tt, pos, 0)
+}
+
+-- A direct declaration call may preserve an argument's exact record shape by
+-- specialising the callee.  `2` means the semantic subtype relation holds but
+-- the ordinary ABI does not: either a nominal record projects to the expected
+-- predicate, or a closed structural value refines a different/open predicate.
+fn typeck_structural_call_match_kind(tt: i64, actual_ty: i64, expected_ty: i64) -> i64 {
+  if actual_ty == 0 or expected_ty == 0 or not ty_is_record(expected_ty) { 0 }
+  else { if ty_tag(actual_ty) == 9 {
+    if typecheck_subtype(tt, actual_ty, expected_ty) == 1 { 2 } else { 0 }
+  } else { if ty_is_record(actual_ty) and typecheck_subtype(tt, actual_ty, expected_ty) == 1 {
+    if ty_record_open(actual_ty) == 1 { 3 }
+    else { if ty_eq(actual_ty, expected_ty) { 1 } else { 2 } }
+  } else { 0 } } }
+}
+
+fn check_arg_against_direct_param_mode(arg: i64, param_ty: i64, env: i64, ft: i64, src: i64, tt: i64, pos: i64, allow_direct_continuation_i64: i64) -[Conformance, Diagnose]> i64 {
+  prepare_expr_contextual(arg, param_ty, env, ft, src, tt)
+  let actual_ty = synth(arg, env, ft, src, tt)
+  if typeck_structural_call_match_kind(tt, actual_ty, param_ty) >= 2 { 0 }
+  else { check_arg_against_param_mode(arg, param_ty, env, ft, src, tt, pos, allow_direct_continuation_i64) }
+}
+
+fn check_arg_against_opaque_param(arg: i64, param_ty: i64, env: i64, ft: i64, src: i64, tt: i64, pos: i64) -[Conformance, Diagnose]> i64 {
+  prepare_expr_contextual(arg, param_ty, env, ft, src, tt)
+  let actual_ty = synth(arg, env, ft, src, tt)
+  if typeck_structural_call_match_kind(tt, actual_ty, param_ty) >= 2 {
+    typeck_error_maybe(src, pos, "type error: structural shape adaptation requires a direct function call")
+    1
+  } else { check_arg_against_param(arg, param_ty, env, ft, src, tt, pos) }
+}
+
+fn typeck_call_shape_type_args(args: i64, nargs: i64, params: i64, subst: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
+  if params == 0 or nargs != nlist_len(params) { 0 }
+  else {
+    let exact = nlist_new_capacity(nargs)
+    let mut needs_shape = 0
+    for i in 0..nargs {
+      let raw_param_ty = node_f3(nlist_get(params, i))
+      let param_ty = if subst == 0 or raw_param_ty == 0 { raw_param_ty } else { ty_subst(raw_param_ty, subst) }
+      let actual_ty = synth(nlist_get(args, i), env, ft, src, tt)
+      if typeck_structural_call_match_kind(tt, actual_ty, param_ty) >= 2 { needs_shape = 1 } else { 0 }
+      nlist_add(exact, actual_ty)
+    }
+    if needs_shape == 1 { exact } else { 0 }
+  }
+}
+
+fn typeck_append_shape_type_args(type_args: i64, exact: i64) -> i64 {
+  if exact == 0 { 0 }
+  else {
+    for i in 0..nlist_len(exact) { nlist_add(type_args, nlist_get(exact, i)) }
+    1
+  }
 }
 
 fn is_intrinsic_name(src: i64, ns: i64, nl: i64) -> i64 {
@@ -6435,7 +6527,13 @@ fn check_ident_defined(node: i64, env: i64, ft: i64, src: i64, tt: i64) -[Diagno
   let nl = node_f2(node)
   if tenv_lookup(env, src, ns, nl) != 0 { 0 }
   else {
-    if ftypes_lookup_fn_type(ft, src, ns, nl) != 0 { 0 }
+    let declared_fn_ty = ftypes_lookup_fn_type(ft, src, ns, nl)
+    if declared_fn_ty != 0 {
+      if typeck_fn_type_has_open_structural_shape(declared_fn_ty) == 1 {
+        typeck_error_maybe(src, ns, "type error: shape-polymorphic function cannot cross an opaque function-value boundary")
+        1
+      } else { 0 }
+    }
     else {
       if ttable_variant_payload_count(tt, src, ns, nl) == 0 { 0 }
       else {
@@ -6519,10 +6617,7 @@ fn check_field_access(node: i64, env: i64, ft: i64, src: i64, tt: i64) -[Diagnos
     if field == 0 {
       typeck_error(src, field_ns, "type error: unknown structural record field")
       1
-    } else { if ty_record_open(base_ty) == 1 {
-      typeck_error(src, field_ns, "type error: structural field access requires a concrete closed shape")
-      1
-    } else { 0 } }
+    } else { 0 }
   } else { if tag == 9 {
     let resolved_field_ty = synth_field_access(node, env, ft, src, tt)
     let idx = ttable_find_field_by_type_hash(tt, ty_f1(base_ty), src, field_ns, field_nl)
@@ -6775,8 +6870,12 @@ fn typecheck_resolve_field_type(tt: i64, base_ty: i64, field_src: i64, field_sta
 fn typecheck_subtype(tt: i64, actual_ty: i64, expected_ty: i64) -> i64 {
   if actual_ty == 0 or expected_ty == 0 { 0 }
   else {
+    let projected = if ty_tag(actual_ty) == 9 and ty_is_record(expected_ty) {
+      typeck_named_record_projection(tt, actual_ty)
+    } else { 0 }
+    let compared_actual = if projected != 0 { projected } else { actual_ty }
     let ct = ttable_get_ct(tt)
-    handle is_subtype(actual_ty, expected_ty) {
+    handle is_subtype(compared_actual, expected_ty) {
       Conformance.conforms(ty, trh) -> {
         if ct == 0 { resume(0) } else { resume(ctable_conforms_type(ct, ty, trh)) }
       }
@@ -6930,7 +7029,7 @@ fn check_call_fn_type(node: i64, fn_ty: i64, env: i64, ft: i64, src: i64, caller
   } else { errors = errors }
   for i in 0..nargs {
     if i < nparams {
-      errors = errors + check_arg_against_param(nlist_get(args, i), nlist_get(params, i), env, ft, src, tt, ns)
+      errors = errors + check_arg_against_opaque_param(nlist_get(args, i), nlist_get(params, i), env, ft, src, tt, ns)
     } else { errors = errors }
   }
   errors
@@ -10103,6 +10202,10 @@ fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) 
           errors = errors + check_trait_bounds(tparams, type_args, src, node_f1(call_node), tt)
         }
         let instantiated = synth_generic_call(node, env, ft, src, tt)
+        if typeck_fn_type_has_open_structural_shape(instantiated) == 1 {
+          typeck_error_maybe(src, node_f1(call_node), "type error: shape-polymorphic function cannot cross an opaque function-value boundary")
+          errors = errors + 1
+        } else { 0 }
         if ty_tag(instantiated) == 6 {
           errors = errors + check_native_result_abi_ty(src, node_f1(call_node), ty_f2(instantiated))
         } else { errors = errors }
@@ -10994,10 +11097,14 @@ fn check_generic_call_post_args(node: i64, env: i64, ft: i64, src: i64, caller_e
           let param_ty = node_f3(param)
           if param_ty != 0 {
             let subst_ty = ty_subst(param_ty, s)
-            errors = errors + check_arg_against_param(nlist_get(call_args, pi), subst_ty, env, ft, src, tt, ns)
+            errors = errors + check_arg_against_direct_param_mode(nlist_get(call_args, pi), subst_ty, env, ft, src, tt, ns, 0)
           } else { errors = errors }
         } else { errors = errors }
       }
+      let exact_shapes = typeck_call_shape_type_args(call_args, nargs, params, s, env, ft, src, tt)
+      if typeck_append_shape_type_args(type_args, exact_shapes) == 1 {
+        mem_store64_at(node, 24, nlist_len(type_args))
+      } else { 0 }
     } else { 0 }
   } else {
     errors = errors + check_generic_call_target_defined(call_node, env, ft, src, tt)
@@ -11079,6 +11186,31 @@ fn ty_list_mentions_type_var(types: i64) -> i64 {
   }
 }
 
+fn typeck_params_have_open_structural_shape(params: i64) -> i64 {
+  if params == 0 { 0 }
+  else {
+    let mut found = 0
+    for i in 0..nlist_len(params) {
+      let param_ty = node_f3(nlist_get(params, i))
+      if ty_is_record(param_ty) and ty_record_open(param_ty) == 1 { found = 1 } else { 0 }
+    }
+    found
+  }
+}
+
+fn typeck_fn_type_has_open_structural_shape(fn_ty: i64) -> i64 {
+  if fn_ty == 0 or ty_tag(fn_ty) != 6 { 0 }
+  else {
+    let params = ty_f1(fn_ty)
+    let mut found = 0
+    for i in 0..nlist_len(params) {
+      let param_ty = nlist_get(params, i)
+      if ty_is_record(param_ty) and ty_record_open(param_ty) == 1 { found = 1 } else { 0 }
+    }
+    found
+  }
+}
+
 fn check_call_args_inner(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) -[Conformance, Diagnose]> i64 {
   let ns = node_f1(node)
   let nl = node_f2(node)
@@ -11139,10 +11271,14 @@ fn check_call_args_declared(node: i64, params: i64, env: i64, ft: i64, src: i64,
         let param_ty = node_f3(param)
         if param_ty != 0 {
           let allow_direct_continuation_i64 = continuation_call_arg_accepts_direct(ft, src, ns, nl, i)
-          errors = errors + check_arg_against_param_mode(nlist_get(args, i), param_ty, env, ft, src, tt, ns, allow_direct_continuation_i64)
+          errors = errors + check_arg_against_direct_param_mode(nlist_get(args, i), param_ty, env, ft, src, tt, ns, allow_direct_continuation_i64)
         } else { errors = errors }
       } else { errors = errors }
     }
+    let exact_shapes = typeck_call_shape_type_args(args, nargs, params, 0, env, ft, src, tt)
+    if exact_shapes != 0 {
+      generic_call_rewrite_to_explicit(node, ns, nl, args, nargs, exact_shapes)
+    } else { 0 }
     errors
 }
 
