@@ -1100,12 +1100,15 @@ assert_contains "test_path_binary_emits_passing_result" "$(<"$tmp_err")" "WEFT_T
 echo "  ok test_path_binary_runs"
 
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
-if cmp "$tmp_bin" "$tmp_out"; then
-  echo "  ok test_path_emit_matches_stdin"
-else
-  echo "  fail test_path_emit_matches_stdin"
+if cmp -s "$tmp_bin" "$tmp_out"; then
+  echo "  fail test_path_emit_records_origin"
   exit 1
+else
+  echo "  ok test_path_emit_records_origin"
 fi
+chmod +x "$tmp_out"
+run_binary_guarded "$tmp_out" 2>"$tmp_err"
+assert_contains "test_stdin_emit_preserves_behavior" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
 
 set +e
 run_weft_compile_guarded "$WEFT" test "$tmp_src" > "$tmp_out" 2>"$tmp_err"
@@ -1336,4 +1339,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 314 passed, 0 failed"
+echo "Tool boundary summary: 315 passed, 0 failed"
