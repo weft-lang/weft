@@ -511,6 +511,8 @@ check_rejects "region_scoped_deferred_continuation_store_outer" "test/negative/r
 check_rejects "region_scoped_par_spawn_lambda_capture" "test/negative/region_scoped_par_spawn_lambda_capture.weft" "type error: region value cannot escape scoped arena"
 check_rejects "region_scoped_par_spawn_region_arg" "test/negative/region_scoped_par_spawn_region_arg.weft" "type error: region value cannot escape scoped arena"
 check_rejects "region_scoped_par_spawn_branch_lambda_capture" "test/negative/region_scoped_par_spawn_branch_lambda_capture.weft" "type error: region value cannot escape scoped arena"
+check_rejects "region_scoped_generator_escape" "test/negative/region_scoped_generator_escape.weft" "type error: region value cannot escape scoped arena"
+check_rejects "region_scoped_iterator_escape" "test/negative/region_scoped_iterator_escape.weft" "type error: region value cannot escape scoped arena"
 check_rejects "lambda_capture_mut_binding" "test/negative/lambda_capture_mut_binding.weft" "type error: cannot capture mut binding"
 check_rejects "lambda_capture_mut_assignment" "test/negative/lambda_capture_mut_assignment.weft" "type error: cannot capture mut binding"
 check_rejects "return_branch_type_mismatch" "test/negative/return_branch_type_mismatch.weft" "type error: return type mismatch"
