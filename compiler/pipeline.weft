@@ -82,7 +82,7 @@ fn pipeline_hclause_info_nfree(info: i64) -> i64 { mem_load64_at(info, 16) }
 
 type PipelineParLowerCtx {
   PipelineParLowerNone,
-  PipelineParLowerSequential,
+  PipelineParLowerSequential(i64),
   PipelineParLowerPthread(i64)
 }
 
@@ -2445,7 +2445,7 @@ fn pipeline_lower_module_inline_depth(module: PipelineLowerModule) -> i64 {
 fn pipeline_par_lower_ctx_is_active(par_ctx: PipelineParLowerCtx) -> i64 {
   match par_ctx {
     PipelineParLowerNone -> 0
-    PipelineParLowerSequential -> 1
+    PipelineParLowerSequential(task_scope_slot) -> 1
     PipelineParLowerPthread(pool_slot) -> 1
   }
 }
@@ -6411,23 +6411,75 @@ fn pipeline_par_marker_inst(dst: i64) -> IrInstList {
   ir_inst_list_prepend(ir_inst_call_i64(dst, pipeline_ir_pseudo_par_lowering_marker_hash(), ir_value_list_empty()), ir_inst_list_empty())
 }
 
-fn pipeline_lower_par_sequential_scope_typed(body_arg: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
+-- Static Par scope lowering bypasses the source helper body, so reproduce
+-- its defer as typed IR rather than teaching native code a second resource
+-- recogniser. The closure captures the raw pool word and calls shutdown;
+-- runtime_defer_abort_cleanup remains the shared J3 action identity.
+fn pipeline_par_pthread_pool_cleanup_closure(pool_value: i64, dst: i64, src: i64) -> IrInstList {
+  let captures = nlist_new()
+  nlist_add(captures, pipeline_lambda_capture_entry(0, 0, pool_value, ty_i64()))
+  let preamble = ir_inst_list_prepend(
+    ir_inst_const_i64(2, 8),
+    ir_inst_list_prepend(
+      ir_inst_binary_i64(3, ir_binary_op_from_parser(1), 0, 2),
+      ir_inst_list_prepend(ir_inst_ptr_load_i64(1, 3), ir_inst_list_empty())
+    )
+  )
+  let shutdown = ir_inst_list_prepend(
+    ir_inst_call_i64(4, pipeline_par_pthread_pool_shutdown_hash(), ir_value_list_prepend(1, ir_value_list_empty())),
+    ir_inst_list_empty()
+  )
+  let body = ir_block_new_term(0, ir_inst_list_append(preamble, shutdown), ir_term_return(4))
+  let blocks = ir_block_list_prepend(body, ir_block_list_empty())
+  let fn_hash = str_hash(__str_ptr("__weft_par_pthread_pool_scope_cleanup"), 0, __str_len("__weft_par_pthread_pool_scope_cleanup"))
+  let cleanup_fn = IrFunction(fn_hash, 1, blocks, src)
+  let facts = ir_lambda_semantic_facts(IrLambdaEvidenceNone, 0, ir_borrow_facts_empty())
+  ir_inst_list_prepend(ir_inst_closure_i64(dst, cleanup_fn, captures, facts), ir_inst_list_empty())
+}
+
+fn pipeline_lower_par_sequential_scope_body_typed(body_arg: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64, emit_marker: i64) -> PipelineLoweredBlocks {
   let body_expr = pipeline_par_scope_body_expr_typed(body_arg)
   if pipeline_par_scope_body_valid(body_expr) == 0 {
     pipeline_lowered_blocks_invalid(start_block, next_value)
   } else {
-    let body_start = next_block
+    let cleanup_block = next_block
+    let body_start = pipeline_lower_internal_block_after_target(cleanup_block + 1, target_block)
     let body_next_block = pipeline_lower_internal_block_after_target(body_start + 1, target_block)
-    let body_module = pipeline_lower_module_with_par_ctx(module, PipelineParLowerSequential)
-    let body_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(body_expr, params, locals, body_module, next_value + 1, body_start, body_next_block, target_block)
+    let scope_value = next_value + if emit_marker == 1 { 1 } else { 0 }
+    let scope_slot = pipeline_ir_addressable_slot_id(scope_value + 1)
+    let after_setup_value = pipeline_ir_max_i64(scope_value + 1, scope_slot + 1)
+    let body_module = pipeline_lower_module_with_par_ctx(module, PipelineParLowerSequential(scope_slot))
+    let body_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(body_expr, params, locals, body_module, after_setup_value, body_start, body_next_block, cleanup_block)
     if pipeline_lowered_blocks_is_valid(body_blocks) == 1 {
-      let entry = ir_block_new_term(start_block, pipeline_par_marker_inst(next_value), ir_term_jump(body_start))
-      let blocks = ir_block_list_prepend(entry, pipeline_lowered_blocks_blocks(body_blocks))
-      pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(body_blocks), pipeline_lowered_blocks_next_value(body_blocks), blocks, 1)
+      if pipeline_lowered_blocks_falls_through(body_blocks) == 0 {
+        pipeline_lowered_blocks_invalid(start_block, next_value)
+      } else {
+        let setup = ir_inst_list_prepend(
+          ir_inst_call_i64(scope_value, pipeline_par_task_scope_new_hash(), ir_value_list_empty()),
+          ir_inst_list_prepend(ir_inst_slot_i64(scope_slot), ir_inst_list_prepend(ir_inst_store_i64(scope_slot, scope_value), ir_inst_list_empty()))
+        )
+        let entry_insts = if emit_marker == 1 { ir_inst_list_append(pipeline_par_marker_inst(next_value), setup) } else { setup }
+        let entry = ir_block_new_term(start_block, entry_insts, ir_term_jump(body_start))
+        let body_value = pipeline_lowered_blocks_next_value(body_blocks)
+        let cleanup_dst = body_value + 1
+        let cleanup_args = ir_value_list_prepend(scope_value, ir_value_list_empty())
+        let cleanup = ir_block_new_params(
+          cleanup_block,
+          ir_value_list_prepend(body_value, ir_value_list_empty()),
+          ir_inst_list_prepend(ir_inst_call_i64(cleanup_dst, pipeline_par_task_scope_cleanup_hash(), cleanup_args), ir_inst_list_empty()),
+          ir_term_jump_args(target_block, ir_value_list_prepend(body_value, ir_value_list_empty()))
+        )
+        let blocks = ir_block_list_prepend(entry, ir_block_list_append(pipeline_lowered_blocks_blocks(body_blocks), ir_block_list_prepend(cleanup, ir_block_list_empty())))
+        pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(body_blocks), cleanup_dst + 1, blocks, 1)
+      }
     } else {
       pipeline_lowered_blocks_invalid(start_block, next_value)
     }
   }
+}
+
+fn pipeline_lower_par_sequential_scope_typed(body_arg: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
+  pipeline_lower_par_sequential_scope_body_typed(body_arg, params, locals, module, next_value, start_block, next_block, target_block, 1)
 }
 
 fn pipeline_lower_par_pthread_scope_typed(args_expr: ExprList, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
@@ -6453,23 +6505,24 @@ fn pipeline_lower_par_pthread_scope_typed(args_expr: ExprList, params: i64, loca
         } else {
           let pool_value = pipeline_lowered_call_blocks_next_value(lowered_args)
           let pool_slot = pipeline_ir_addressable_slot_id(pool_value + 1)
-          let start_inst = ir_inst_list_prepend(
+          let pool_cleanup_value = pipeline_ir_max_i64(pool_value + 1, pool_slot + 1)
+          let start_and_slot = ir_inst_list_prepend(
             ir_inst_call_i64(pool_value, pipeline_par_pthread_pool_start_hash(), pipeline_lowered_call_blocks_values(lowered_args)),
             ir_inst_list_prepend(ir_inst_slot_i64(pool_slot), ir_inst_list_prepend(ir_inst_store_i64(pool_slot, pool_value), ir_inst_list_empty()))
           )
-          let after_pool_value = pipeline_ir_max_i64(pool_value + 1, pool_slot + 1)
-          let seq_start = pipeline_lower_internal_block_after_target(pipeline_lowered_call_blocks_next_block(lowered_args), target_block)
+          let start_inst = ir_inst_list_append(start_and_slot, pipeline_par_pthread_pool_cleanup_closure(pool_value, pool_cleanup_value, pipeline_lower_module_src(module)))
+          let after_pool_value = pool_cleanup_value + 2
+          let pool_cleanup_block = pipeline_lower_internal_block_after_target(pipeline_lowered_call_blocks_next_block(lowered_args), target_block)
+          let seq_start = pipeline_lower_internal_block_after_target(pool_cleanup_block + 1, target_block)
           let seq_next = pipeline_lower_internal_block_after_target(seq_start + 1, target_block)
-          let seq_module = pipeline_lower_module_with_par_ctx(module, PipelineParLowerSequential)
-          let seq_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(body_expr, params, locals, seq_module, after_pool_value, seq_start, seq_next, target_block)
+          let seq_blocks = pipeline_lower_par_sequential_scope_body_typed(body_arg, params, locals, module, after_pool_value, seq_start, seq_next, pool_cleanup_block, 0)
           if pipeline_lowered_blocks_is_valid(seq_blocks) == 0 {
             pipeline_lowered_blocks_invalid(start_block, next_value)
           } else {
             let pthread_start = pipeline_lower_internal_block_after_target(pipeline_lowered_blocks_next_block(seq_blocks), target_block)
-            let shutdown_block = pipeline_lower_internal_block_after_target(pthread_start + 1, target_block)
-            let pthread_next = pipeline_lower_internal_block_after_target(shutdown_block + 1, target_block)
+            let pthread_next = pipeline_lower_internal_block_after_target(pthread_start + 1, target_block)
             let pthread_module = pipeline_lower_module_with_par_ctx(module, PipelineParLowerPthread(pool_slot))
-            let pthread_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(body_expr, params, locals, pthread_module, pipeline_lowered_blocks_next_value(seq_blocks), pthread_start, pthread_next, shutdown_block)
+            let pthread_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(body_expr, params, locals, pthread_module, pipeline_lowered_blocks_next_value(seq_blocks), pthread_start, pthread_next, pool_cleanup_block)
             if pipeline_lowered_blocks_is_valid(pthread_blocks) == 0 {
               pipeline_lowered_blocks_invalid(start_block, next_value)
             } else {
@@ -6477,14 +6530,9 @@ fn pipeline_lower_par_pthread_scope_typed(args_expr: ExprList, params: i64, loca
                 pipeline_lowered_blocks_invalid(start_block, next_value)
               } else {
                 let body_value = pipeline_lowered_blocks_next_value(pthread_blocks)
-                let shutdown_pool = body_value + 1
-                let shutdown_dst = shutdown_pool + 1
-                let shutdown_args = ir_value_list_prepend(shutdown_pool, ir_value_list_empty())
-                let shutdown_inst = ir_inst_list_prepend(
-                  ir_inst_load_i64(shutdown_pool, pool_slot),
-                  ir_inst_list_prepend(ir_inst_call_i64(shutdown_dst, pipeline_par_pthread_pool_shutdown_hash(), shutdown_args), ir_inst_list_empty())
-                )
-                let shutdown_block_node = ir_block_new_params(shutdown_block, ir_value_list_prepend(body_value, ir_value_list_empty()), shutdown_inst, ir_term_jump_args(target_block, ir_value_list_prepend(body_value, ir_value_list_empty())))
+                let cleanup_dst = body_value + 1
+                let cleanup_inst = pipeline_defer_cleanup_insts(pool_cleanup_value, cleanup_dst)
+                let cleanup_block_node = ir_block_new_params(pool_cleanup_block, ir_value_list_prepend(body_value, ir_value_list_empty()), cleanup_inst, ir_term_jump_args(target_block, ir_value_list_prepend(body_value, ir_value_list_empty())))
                 let call_block_node = ir_block_new_term(call_block, start_inst, ir_term_branch(pool_value, pthread_start, seq_start))
                 let blocks = ir_block_list_prepend(
                   entry,
@@ -6496,14 +6544,14 @@ fn pipeline_lower_par_pthread_scope_typed(args_expr: ExprList, params: i64, loca
                         pipeline_lowered_blocks_blocks(seq_blocks),
                         ir_block_list_append(
                           pipeline_lowered_blocks_blocks(pthread_blocks),
-                          ir_block_list_prepend(shutdown_block_node, ir_block_list_empty())
+                          ir_block_list_prepend(cleanup_block_node, ir_block_list_empty())
                         )
                       )
                     )
                   )
                 )
-                let out_next_block = pipeline_lower_internal_block_after_target(pipeline_lowered_blocks_next_block(pthread_blocks), shutdown_block + 1)
-                let out_next_value = shutdown_dst + 1
+                let out_next_block = pipeline_lower_internal_block_after_target(pipeline_lowered_blocks_next_block(pthread_blocks), pool_cleanup_block + 1)
+                let out_next_value = cleanup_dst + 2
                 pipeline_lowered_blocks(out_next_block, out_next_value, blocks, 1)
               }
             }
@@ -6538,7 +6586,7 @@ fn pipeline_lower_par_map_call_typed_to_target_blocks(ns: i64, nl: i64, args_exp
   } else {
     match pipeline_lower_module_par_ctx(module) {
       PipelineParLowerNone -> pipeline_lowered_blocks_invalid(start_block, next_value)
-      PipelineParLowerSequential -> {
+      PipelineParLowerSequential(task_scope_slot) -> {
         let target_hash = pipeline_par_sequential_map_i64_hash()
         let call_block = next_block
         let arg_count = 2
@@ -8301,7 +8349,10 @@ fn pipeline_lower_generic_call_typed_to_target_blocks(type_args: TypeExprList, i
   let concrete_type_args = pipeline_type_expr_list_subst(type_args, subst)
   match inner_call {
     Call(ns, nl, args_exprs) -> {
-      if pipeline_vector_to_array_call_shape(src, ns, nl, args_exprs, concrete_type_args) == 1 {
+      let par_scope = pipeline_lower_par_scope_call_typed_to_target_blocks(ns, nl, args_exprs, params, locals, module, next_value, start_block, next_block, target_block)
+      if pipeline_lowered_blocks_is_valid(par_scope) == 1 {
+        par_scope
+      } else { if pipeline_vector_to_array_call_shape(src, ns, nl, args_exprs, concrete_type_args) == 1 {
         pipeline_lower_vector_to_array_typed_to_target_blocks(type_args, args_exprs, params, locals, module, next_value, start_block, next_block, target_block)
       } else { if pipeline_variant_payload_count(tt, src, ns, nl) >= 0 or pipeline_call_callee_is_direct(params, locals, src, ns, nl) == 1 {
         let call_block = next_block
@@ -8368,7 +8419,7 @@ fn pipeline_lower_generic_call_typed_to_target_blocks(type_args: TypeExprList, i
         }
       } else {
         pipeline_lowered_blocks_invalid(start_block, next_value)
-      } }
+      } } }
     }
     _ -> pipeline_lowered_blocks_invalid(start_block, next_value)
   }
@@ -8504,11 +8555,17 @@ fn pipeline_lower_par_spawn_inst_typed(args_exprs: ExprList, values: IrValueList
     } else {
       match pipeline_lower_module_par_ctx(module) {
         PipelineParLowerNone -> ir_lowered_expr_invalid(dst)
-        PipelineParLowerSequential -> {
+        PipelineParLowerSequential(task_scope_slot) -> {
           let call_args = ir_value_list_prepend(f_value, ir_value_list_prepend(arg_value, ir_value_list_empty()))
           let call = ir_inst_list_prepend(ir_inst_call_i64(dst, pipeline_par_sequential_submit_hash(), call_args), ir_inst_list_empty())
-          let cleanup = pipeline_managed_owned_temp_release_args_typed(args_exprs, values, 0, dst + 1, expected_params, 0, 0, 0)
-          ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup)))
+          let scope_value = dst + 1
+          let scope_load = ir_inst_list_prepend(ir_inst_load_i64(scope_value, task_scope_slot), ir_inst_list_empty())
+          let tracked_task = dst + 2
+          let track_args = ir_value_list_prepend(scope_value, ir_value_list_prepend(dst, ir_value_list_empty()))
+          let track = ir_inst_list_prepend(ir_inst_call_i64(tracked_task, pipeline_par_task_scope_track_hash(), track_args), ir_inst_list_empty())
+          let cleanup = pipeline_managed_owned_temp_release_args_typed(args_exprs, values, 0, tracked_task + 1, expected_params, 0, 0, 0)
+          let insts = ir_inst_list_append(call, ir_inst_list_append(scope_load, ir_inst_list_append(track, pipeline_lowered_args_insts(cleanup))))
+          ir_lowered_expr(tracked_task, pipeline_lowered_args_next_value(cleanup), insts)
         }
         PipelineParLowerPthread(pool_slot) -> {
           let closure_promote = ir_inst_list_prepend(
@@ -8550,7 +8607,7 @@ fn pipeline_lower_par_await_inst_typed(values: IrValueList, dst: i64, module: Pi
     } else {
       match pipeline_lower_module_par_ctx(module) {
         PipelineParLowerNone -> ir_lowered_expr_invalid(dst)
-        PipelineParLowerSequential -> {
+        PipelineParLowerSequential(task_scope_slot) -> {
           let call = ir_inst_list_prepend(ir_inst_call_i64(dst, pipeline_par_task_await_hash(), ir_value_list_prepend(handle_value, ir_value_list_empty())), ir_inst_list_empty())
           ir_lowered_expr(dst, dst + 1, call)
         }
@@ -16849,6 +16906,10 @@ fn pipeline_ir_pseudo_bridge_store8_discard_hash() -> i64 { 0 - 700009 }
 fn pipeline_ir_pseudo_par_lowering_marker_hash() -> i64 { 0 - 700020 }
 
 fn pipeline_par_sequential_submit_hash() -> i64 { str_hash(__str_ptr("par_sequential_submit"), 0, __str_len("par_sequential_submit")) }
+fn pipeline_par_task_scope_new_hash() -> i64 { str_hash(__str_ptr("par_task_scope_new"), 0, __str_len("par_task_scope_new")) }
+fn pipeline_par_task_scope_track_hash() -> i64 { str_hash(__str_ptr("par_task_scope_track"), 0, __str_len("par_task_scope_track")) }
+fn pipeline_par_task_scope_cleanup_hash() -> i64 { str_hash(__str_ptr("par_task_scope_cleanup"), 0, __str_len("par_task_scope_cleanup")) }
+fn pipeline_runtime_par_task_scope_cleanup_hash() -> i64 { str_hash(__str_ptr("runtime_par_task_scope_cleanup"), 0, __str_len("runtime_par_task_scope_cleanup")) }
 fn pipeline_par_task_await_hash() -> i64 { str_hash(__str_ptr("par_task_await"), 0, __str_len("par_task_await")) }
 fn pipeline_par_pthread_pool_start_hash() -> i64 { str_hash(__str_ptr("par_pthread_pool_start"), 0, __str_len("par_pthread_pool_start")) }
 fn pipeline_par_pthread_pool_submit_prepared_hash() -> i64 { str_hash(__str_ptr("par_pthread_pool_submit_prepared"), 0, __str_len("par_pthread_pool_submit_prepared")) }
@@ -25395,17 +25456,18 @@ fn pipeline_ir_native_handler_ctx_uncaptured(ctx: PipelineNativeHandlerCtx) -> P
 -- calls their stored cleanup pointers until the handle-entry boundary.
 --
 -- Fact node fields: acquisition-site SSA, owned value SSA, action (release
--- hash or owned type hash), kind (1 managed release / 2 owned Drop), record
+-- hash or owned type hash), kind (1 direct cleanup call / 2 owned Drop /
+-- 3 array drop glue), record
 -- index. The site is the unique result SSA of the instruction that acquires
 -- the obligation; this keeps two retains of the same pointer as two records.
-fn pipeline_ir_abort_cleanup_managed_kind() -> i64 { 1 }
+fn pipeline_ir_abort_cleanup_direct_kind() -> i64 { 1 }
 fn pipeline_ir_abort_cleanup_owned_kind() -> i64 { 2 }
 fn pipeline_ir_abort_cleanup_array_kind() -> i64 { 3 }
 
 fn pipeline_ir_abort_cleanup_inst_has_action(inst: IrInst, value: i64, action: i64, kind: i64) -> i64 {
   match inst {
     IrCallI64(dst, callee_hash, args) -> {
-      if kind == pipeline_ir_abort_cleanup_managed_kind() and callee_hash == action and pipeline_ir_value_list_get_or(args, 0, 0 - 1) == value { 1 } else { 0 }
+      if kind == pipeline_ir_abort_cleanup_direct_kind() and callee_hash == action and pipeline_ir_value_list_get_or(args, 0, 0 - 1) == value { 1 } else { 0 }
     }
     IrOwnedDropI64(drop_value, type_hash) -> {
       if kind == pipeline_ir_abort_cleanup_owned_kind() and drop_value == value and type_hash == action { 1 } else { 0 }
@@ -25454,8 +25516,8 @@ fn pipeline_ir_abort_cleanup_fact_exists(facts: i64, value: i64, action: i64, ki
   found
 }
 
-fn pipeline_ir_abort_cleanup_is_managed_release_hash(hash: i64) -> i64 {
-  if hash == pipeline_rc_default_release_hash() or hash == pipeline_closure_default_release_hash() or hash == pipeline_rc_default_weak_release_hash() or hash == pipeline_runtime_defer_abort_cleanup_hash() { 1 } else { 0 }
+fn pipeline_ir_abort_cleanup_is_direct_action_hash(hash: i64) -> i64 {
+  if hash == pipeline_rc_default_release_hash() or hash == pipeline_closure_default_release_hash() or hash == pipeline_rc_default_weak_release_hash() or hash == pipeline_runtime_defer_abort_cleanup_hash() or hash == pipeline_par_task_scope_cleanup_hash() or hash == pipeline_runtime_par_task_scope_cleanup_hash() { 1 } else { 0 }
 }
 
 fn pipeline_ir_abort_cleanup_inst_is_closure(inst: IrInst) -> i64 {
@@ -25516,8 +25578,8 @@ fn pipeline_ir_abort_cleanup_collect_inst_list(insts: IrInstList, all_blocks: Ir
     IrInstCons(inst, rest) -> {
       match inst {
         IrCallI64(dst, callee_hash, args) -> {
-          if pipeline_ir_abort_cleanup_is_managed_release_hash(callee_hash) == 1 {
-            pipeline_ir_abort_cleanup_add_action_fact(facts, pipeline_ir_value_list_get_or(args, 0, 0 - 1), callee_hash, pipeline_ir_abort_cleanup_managed_kind())
+          if pipeline_ir_abort_cleanup_is_direct_action_hash(callee_hash) == 1 {
+            pipeline_ir_abort_cleanup_add_action_fact(facts, pipeline_ir_value_list_get_or(args, 0, 0 - 1), callee_hash, pipeline_ir_abort_cleanup_direct_kind())
           } else { 0 }
         }
         IrOwnedDropI64(value, type_hash) -> pipeline_ir_abort_cleanup_add_action_fact(facts, value, type_hash, pipeline_ir_abort_cleanup_owned_kind())
@@ -25626,7 +25688,7 @@ fn pipeline_ir_abort_cleanup_ret_type_lane_release_hash(ret_ty: i64, lane: i64) 
 fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst, all_blocks: IrBlockList, actions: i64, facts: i64, fns: i64) -> i64 {
   let site = pipeline_ir_inst_def_or(inst, 0 - 1)
   let owned = if site >= 0 { pipeline_ir_abort_cleanup_find_action_kind(actions, site, pipeline_ir_abort_cleanup_owned_kind()) } else { 0 }
-  let managed = if site >= 0 { pipeline_ir_abort_cleanup_find_action_kind(actions, site, pipeline_ir_abort_cleanup_managed_kind()) } else { 0 }
+  let direct_action = if site >= 0 { pipeline_ir_abort_cleanup_find_action_kind(actions, site, pipeline_ir_abort_cleanup_direct_kind()) } else { 0 }
   let array = if site >= 0 { pipeline_ir_abort_cleanup_find_action_kind(actions, site, pipeline_ir_abort_cleanup_array_kind()) } else { 0 }
   if owned != 0 {
     pipeline_ir_abort_cleanup_add_acquisition_fact(facts, site, site, node_f2(owned), pipeline_ir_abort_cleanup_owned_kind())
@@ -25634,8 +25696,8 @@ fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst, all_blocks: 
     if array != 0 {
       pipeline_ir_abort_cleanup_add_acquisition_fact(facts, site, site, node_f2(array), pipeline_ir_abort_cleanup_array_kind())
     } else {
-      if managed != 0 and pipeline_ir_abort_cleanup_inst_is_closure(inst) == 0 and pipeline_ir_abort_cleanup_blocks_have_retain_for_value(all_blocks, site, node_f2(managed)) == 0 {
-        pipeline_ir_abort_cleanup_add_acquisition_fact(facts, site, site, node_f2(managed), pipeline_ir_abort_cleanup_managed_kind())
+      if direct_action != 0 and pipeline_ir_abort_cleanup_inst_is_closure(inst) == 0 and pipeline_ir_abort_cleanup_blocks_have_retain_for_value(all_blocks, site, node_f2(direct_action)) == 0 {
+        pipeline_ir_abort_cleanup_add_acquisition_fact(facts, site, site, node_f2(direct_action), pipeline_ir_abort_cleanup_direct_kind())
       } else { 0 }
     }
   }
@@ -25663,7 +25725,7 @@ fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst, all_blocks: 
           dst,
           retained,
           release,
-          pipeline_ir_abort_cleanup_managed_kind()
+          pipeline_ir_abort_cleanup_direct_kind()
         )
       } else {
         let ret_ty = pipeline_fns_lookup_ret_type_node_by_hash(fns, callee_hash, 0)
@@ -25673,7 +25735,7 @@ fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst, all_blocks: 
         } else {
           let release = pipeline_ir_abort_cleanup_call_result_lane_release_hash(callee_hash, fns, 0)
           if release != 0 {
-            pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, release, pipeline_ir_abort_cleanup_managed_kind())
+            pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, release, pipeline_ir_abort_cleanup_direct_kind())
           } else { 0 }
         }
       }
@@ -25686,29 +25748,29 @@ fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst, all_blocks: 
       } else {
         let release = pipeline_ir_abort_cleanup_ret_type_lane_release_hash(ret_ty, 0)
         if release != 0 {
-          pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, release, pipeline_ir_abort_cleanup_managed_kind())
+          pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, release, pipeline_ir_abort_cleanup_direct_kind())
         } else { 0 }
       }
     }
-    IrStringLit(dst, start, len) -> pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_managed_kind())
-    IrStringConcatI64(dst, left, right) -> pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_managed_kind())
+    IrStringLit(dst, start, len) -> pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_direct_kind())
+    IrStringConcatI64(dst, left, right) -> pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_direct_kind())
     IrClosureI64(dst, fn_value, captures, evidence) -> {
       -- The closure backing environment is released after any scheduled
       -- defer action which uses it. Facts register in list order, so add the
       -- release first and the action second: the latter becomes chain-top.
-      pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_closure_default_release_hash(), pipeline_ir_abort_cleanup_managed_kind())
-      if managed != 0 and node_f2(managed) != pipeline_closure_default_release_hash() {
-        pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, node_f2(managed), pipeline_ir_abort_cleanup_managed_kind())
+      pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_closure_default_release_hash(), pipeline_ir_abort_cleanup_direct_kind())
+      if direct_action != 0 and node_f2(direct_action) != pipeline_closure_default_release_hash() {
+        pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, node_f2(direct_action), pipeline_ir_abort_cleanup_direct_kind())
       } else { 0 }
     }
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> {
-      if owned == 0 { pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_managed_kind()) } else { 0 }
+      if owned == 0 { pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_direct_kind()) } else { 0 }
     }
     IrRecordInitI64(dst, type_hash, fields) -> {
-      if owned == 0 { pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_managed_kind()) } else { 0 }
+      if owned == 0 { pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_direct_kind()) } else { 0 }
     }
     IrRecordLayoutInitI64(dst, type_hash, data_size, align, fields) -> {
-      if owned == 0 { pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_managed_kind()) } else { 0 }
+      if owned == 0 { pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_direct_kind()) } else { 0 }
     }
     _ -> 0
   }
@@ -25726,7 +25788,7 @@ fn pipeline_ir_abort_cleanup_collect_acquisition_inst_list_with_call(insts: IrIn
           if call_ret_ty != 0 and lane > 0 and dst == call_dst + lane {
             let release = pipeline_ir_abort_cleanup_ret_type_lane_release_hash(call_ret_ty, lane)
             if release != 0 {
-              pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, release, pipeline_ir_abort_cleanup_managed_kind())
+              pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, release, pipeline_ir_abort_cleanup_direct_kind())
             } else { 0 }
             pipeline_ir_abort_cleanup_collect_acquisition_inst_list_with_call(rest, all_blocks, actions, facts, fns, call_ret_ty, call_dst)
           } else {
@@ -25814,7 +25876,7 @@ fn pipeline_ir_abort_cleanup_emit_function_address(code: i64, target: i64, patch
 fn pipeline_ir_abort_cleanup_emit_action_address(code: i64, fact: i64, fm: i64) -> i64 {
   let action = node_f2(fact)
   let kind = node_f3(fact)
-  if kind == pipeline_ir_abort_cleanup_managed_kind() {
+  if kind == pipeline_ir_abort_cleanup_direct_kind() {
     let mono_target = mono_cache_lookup(fmap_mono_cache(fm), action)
     let target = if mono_target > 1 { mono_target } else { fmap_lookup_by_hash(fm, action) }
     let available = if mono_target != 0 or fmap_contains_hash(fm, action) == 1 { 1 } else { 0 }
@@ -26013,9 +26075,9 @@ fn pipeline_ir_abort_cleanup_emit_disarm_action(code: i64, value: i64, action: i
   }
 }
 
-fn pipeline_ir_abort_cleanup_emit_disarm_managed(code: i64, value: i64, callee_hash: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
-  if pipeline_ir_abort_cleanup_is_managed_release_hash(callee_hash) == 1 {
-    pipeline_ir_abort_cleanup_emit_disarm_action(code, value, callee_hash, pipeline_ir_abort_cleanup_managed_kind(), fm, pinned)
+fn pipeline_ir_abort_cleanup_emit_disarm_direct(code: i64, value: i64, callee_hash: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if pipeline_ir_abort_cleanup_is_direct_action_hash(callee_hash) == 1 {
+    pipeline_ir_abort_cleanup_emit_disarm_action(code, value, callee_hash, pipeline_ir_abort_cleanup_direct_kind(), fm, pinned)
   } else { 0 }
 }
 
@@ -30109,7 +30171,7 @@ fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, src: i64, fm: 
       }
     }
     IrCallI64(dst, callee_hash, args) -> {
-      pipeline_ir_abort_cleanup_emit_disarm_managed(code, pipeline_ir_value_list_get_or(args, 0, 0 - 1), callee_hash, fm, pinned)
+      pipeline_ir_abort_cleanup_emit_disarm_direct(code, pipeline_ir_value_list_get_or(args, 0, 0 - 1), callee_hash, fm, pinned)
       pipeline_ir_native_emit_call(code, dst, callee_hash, args, fm, pinned)
       pipeline_ir_native_record_indexed_call_elision(fm, callee_hash)
       ctx
