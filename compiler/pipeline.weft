@@ -1704,6 +1704,56 @@ fn pipeline_native_code_word(code: i64, pos: i64) -> i64 {
   b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
 }
 
+-- Every remaining BRK after forward-reference resolution is a deliberate
+-- fail-loud edge. Preserve its one-word site (and therefore every final code
+-- offset) by branching to a per-site island appended after ordinary native
+-- functions. The island transports both the immediate reason and original
+-- code offset, then tail-branches to runtime_trap; no signal handler or
+-- ucontext parsing enters the trusted boundary.
+fn pipeline_native_brk_reason(word: i64) -> i64 {
+  let delta = word - 3560890368
+  if delta < 0 or delta > 2097120 or delta % 32 != 0 { 0 - 1 } else { delta / 32 }
+}
+
+fn pipeline_native_materialize_traps(code: i64, runtime_trap_target: i64) -> i64 {
+  let original_end = buf_len(code)
+  let sites = nlist_new()
+  let mut pos = 0
+  while pos < original_end {
+    let reason = pipeline_native_brk_reason(pipeline_native_code_word(code, pos))
+    if reason >= 0 { nlist_add(sites, node_new(0, pos, reason, 0, 0)) 0 } else { 0 }
+    pos = pos + 4
+  }
+  for i in 0..nlist_len(sites) {
+    let site = nlist_get(sites, i)
+    let trap_pos = node_f1(site)
+    let reason = node_f2(site)
+    let island = buf_len(code)
+    emit_mov_imm_safe(code, 0, reason)
+    emit_mov_imm_safe(code, 1, trap_pos)
+    let tail = buf_len(code)
+    bu32(code, encode_b(runtime_trap_target - tail))
+    bytes_set_u32(code, trap_pos, encode_b(island - trap_pos))
+  }
+  nlist_len(sites)
+}
+
+fn pipeline_native_code_brk_count(code: i64, limit: i64) -> i64 {
+  let mut count = 0
+  let mut pos = 0
+  while pos < limit {
+    if pipeline_native_brk_reason(pipeline_native_code_word(code, pos)) >= 0 { count = count + 1 } else { 0 }
+    pos = pos + 4
+  }
+  count
+}
+
+fn pipeline_native_unmaterialized_trap_count(native: NativeModule) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> pipeline_native_code_brk_count(code, fmap_native_provenance_table_offset(fm))
+  }
+}
+
 -- kind 0: ldr Xt, [sp, #imm]      (spill reloads)
 -- kind 1: str Xt, [sp, #imm]      (spill stores)
 -- kind 2: ldp Xt, Xt2, [sp], #16  (GPR epilogue pair loads)
@@ -15663,6 +15713,25 @@ fn pipeline_bind_runtime_preludes(fns: i64, src: i64, tt: i64) -> i64 {
     Diagnose.warn(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
     Diagnose.note(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
   }
+}
+
+-- Native artifacts always carry the fatal reporter because backend
+-- invariants can fail independently of the source constructs that selected
+-- the ordinary conditional runtime preludes. Parse/check/tooling probes keep
+-- using the minimal binder above; only code-producing paths opt into this
+-- additional sealed leaf.
+fn pipeline_bind_native_runtime_preludes(fns: i64, src: i64, tt: i64) -> i64 {
+  handle pipeline_bind_native_runtime_preludes_inner(fns, src, tt) {
+    Diagnose.error(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
+    Diagnose.warn(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
+    Diagnose.note(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
+  }
+}
+
+fn pipeline_bind_native_runtime_preludes_inner(fns: i64, src: i64, tt: i64) -[Diagnose]> i64 {
+  parse_use_file(fns, tt, "runtime/panic.weft")
+  pipeline_bind_runtime_preludes_inner(fns, src, tt)
+  fns
 }
 
 fn pipeline_bind_runtime_preludes_inner(fns: i64, src: i64, tt: i64) -[Diagnose]> i64 {
@@ -34514,6 +34583,13 @@ fn pipeline_lower_native_module_with_audit(typed: TypedModule, ir: IrModule, aud
         -- poisoned internal paths from recursively allocating until OOM.
         bytes_set_u32(code, bl_main_pos, encode_brk(31))
       }
+      let trap_hash = pipeline_ir_native_hash_name("runtime_trap")
+      let trap_mono_target = mono_cache_lookup(fmap_mono_cache(fm), trap_hash)
+      let trap_target = if trap_mono_target > 1 { trap_mono_target } else { fmap_lookup_by_hash(fm, trap_hash) }
+      if trap_target > 1 {
+        pipeline_native_materialize_traps(code, trap_target)
+        0
+      } else { 0 }
       pipeline_native_provenance_append_table(code, fm, functions)
       NativeModule(code, fm, functions)
     }
@@ -49990,9 +50066,12 @@ fn pipeline_emit_native(typed: TypedModule) -> BinaryObject {
         eprint_i(errors)
         eprint(" errors\n")
         BinaryObject(buf_new(0), binary_format_kind(pipeline_native_binary_format(native)))
+      } else { if pipeline_native_unmaterialized_trap_count(native) != 0 {
+        eprint("compile: emission retained signal-only traps\n")
+        BinaryObject(buf_new(0), binary_format_kind(pipeline_native_binary_format(native)))
       } else {
         pipeline_emit_native_binary(native, src)
-      }
+      } }
     }
   }
 }

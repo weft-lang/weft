@@ -302,6 +302,18 @@ assert_contains "panic_trace_header" "$panic_trace_err" "stack backtrace:"
 assert_contains "panic_trace_leaf" "$panic_trace_err" "panic_trace_leaf at test/panic_trace_exit.weft:5:4"
 assert_contains "panic_trace_main" "$panic_trace_err" "main at test/panic_trace_exit.weft:13:4"
 
+run_weft_compile_guarded "$WEFT" compile "test/trap_exit.weft" > "$tmp_bin" 2>"$tmp_err"
+chmod +x "$tmp_bin"
+set +e
+run_binary_guarded "$tmp_bin" >/dev/null 2>"$tmp_err"
+trap_exit=$?
+set -e
+trap_err=$(<"$tmp_err")
+assert_equals "trap_exit" "$trap_exit" "102"
+assert_contains "trap_reason" "$trap_err" "weft: trap: invalid native value home (code 20)"
+assert_contains "trap_trace_header" "$trap_err" "stack backtrace:"
+assert_contains "trap_trace_main" "$trap_err" "main at test/trap_exit.weft:5:4"
+
 printf 'fn broken() -> i64 { 1\nfn after() -> i64 { 2 }\n' > "$tmp_src"
 parse_recovery_out=$("$WEFT" ast < "$tmp_src" 2>&1)
 assert_contains "ast_reports_parse_recovery" "$parse_recovery_out" "error: expected '}' before declaration"
@@ -1386,4 +1398,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 330 passed, 0 failed"
+echo "Tool boundary summary: 334 passed, 0 failed"
