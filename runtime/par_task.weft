@@ -1,6 +1,7 @@
 -- runtime/par_task.weft -- trusted Par task/future cell storage
 
 use "runtime/alloc.weft"
+use "runtime/panic.weft"
 use "runtime/rc.weft"
 use "runtime/unsafe.weft"
 
@@ -72,11 +73,12 @@ fn runtime_par_work_descriptor_is_valid(descriptor: i64) -> i64 {
 -- promotion/publication, moved after join or drop. The carrier never infers a
 -- type from its raw words; every operation validates and walks the descriptor.
 fn runtime_par_work_descriptor_offset() -> i64 { 0 }
-fn runtime_par_work_fn_ptr_offset() -> i64 { 8 }
-fn runtime_par_work_env_ptr_offset() -> i64 { 16 }
-fn runtime_par_work_result_state_offset() -> i64 { 24 }
-fn runtime_par_work_result_initialized_mask_offset() -> i64 { 32 }
-fn runtime_par_work_result_data_offset() -> i64 { 40 }
+fn runtime_par_work_entry_ptr_offset() -> i64 { 8 }
+fn runtime_par_work_fn_ptr_offset() -> i64 { 16 }
+fn runtime_par_work_env_ptr_offset() -> i64 { 24 }
+fn runtime_par_work_result_state_offset() -> i64 { 32 }
+fn runtime_par_work_result_initialized_mask_offset() -> i64 { 40 }
+fn runtime_par_work_result_data_offset() -> i64 { 48 }
 fn runtime_par_work_result_empty() -> i64 { 0 }
 fn runtime_par_work_result_ready() -> i64 { 1 }
 fn runtime_par_work_result_moved() -> i64 { 2 }
@@ -105,20 +107,36 @@ fn runtime_par_work_size_for_descriptor(descriptor: i64) -> i64 {
   else { runtime_par_work_result_data_offset() + runtime_par_work_descriptor_storage_size(descriptor) }
 }
 
-fn runtime_par_work_new_raw(descriptor: i64, fn_ptr: i64, env_ptr: i64) -> i64 {
+fn runtime_par_work_new_raw(descriptor: i64, entry_ptr: i64, fn_ptr: i64, env_ptr: i64) -> i64 {
   let size = runtime_par_work_size_for_descriptor(descriptor)
-  if size == 0 { 0 }
+  if size == 0 or entry_ptr == 0 or fn_ptr == 0 { 0 }
   else {
     let work = alloc_zeroed(size)
     __mem_store64(work + runtime_par_work_descriptor_offset(), descriptor)
+    __mem_store64(work + runtime_par_work_entry_ptr_offset(), entry_ptr)
     __mem_store64(work + runtime_par_work_fn_ptr_offset(), fn_ptr)
     __mem_store64(work + runtime_par_work_env_ptr_offset(), closure_env_bump_clone_raw(env_ptr))
     work
   }
 }
 
+-- These generic declarations are compiler-intercepted carrier operations.
+-- Their trap bodies are a fail-closed backstop for any path that attempts to
+-- take a function value instead of making the direct, specialised call.
+fn runtime_par_work_pack<T>(f: () -> T) -> i64 {
+  runtime_trap(46, 0)
+}
+
+fn runtime_par_work_take<T>(work: i64) -> T {
+  runtime_trap(46, 0)
+}
+
 fn runtime_par_work_descriptor(work: i64) -> i64 {
   if work == 0 { 0 } else { __mem_load64(work + runtime_par_work_descriptor_offset()) }
+}
+
+fn runtime_par_work_entry(work: i64) -> i64 {
+  if work == 0 { 0 } else { __mem_load64(work + runtime_par_work_entry_ptr_offset()) }
 }
 
 fn runtime_par_work_result_state(work: i64) -> i64 {
@@ -246,6 +264,11 @@ fn runtime_par_work_result_move_to(work: i64, destination: i64) -> i64 {
   }
 }
 
+fn runtime_par_work_result_move_to_expected(work: i64, expected_descriptor: i64, destination: i64) -> i64 {
+  if runtime_par_work_descriptor(work) != expected_descriptor { 0 }
+  else { runtime_par_work_result_move_to(work, destination) }
+}
+
 fn runtime_par_work_result_drop(work: i64) -> i64 {
   let descriptor = runtime_par_work_descriptor(work)
   if runtime_par_work_descriptor_is_valid(descriptor) == 0 or runtime_par_work_result_state(work) == runtime_par_work_result_moved() { 0 }
@@ -288,6 +311,63 @@ fn runtime_par_work_discard(work: i64) -> i64 {
     let released = runtime_par_work_result_drop(work)
     runtime_par_work_release_closure(work)
     released
+  }
+}
+
+fn runtime_par_work_run_raw(work: i64) -[Unsafe]> i64 {
+  let entry = runtime_par_work_entry(work)
+  if runtime_par_work_descriptor_is_valid(runtime_par_work_descriptor(work)) == 0 or entry == 0 or
+    runtime_par_work_result_state(work) != runtime_par_work_result_empty() { 0 }
+  else { __call_i64(entry, work) }
+}
+
+fn runtime_par_work_run(work: i64) -> i64 {
+  handle unsafe_raw_syscall(0, 0, 0, 0, 0, 0, 0) {
+    Unsafe.raw_syscall(num, a0, a1, a2, a3, a4, a5) -> resume(runtime_par_work_run_raw(work))
+  }
+}
+
+-- Handler scopes own carriers independently of the public move-only
+-- observation right. Await moves the result out; cleanup destroys only a
+-- still-initialized result and is therefore idempotent for observed work.
+fn runtime_par_work_scope_head_offset() -> i64 { 0 }
+fn runtime_par_work_scope_size() -> i64 { 8 }
+fn runtime_par_work_scope_node_work_offset() -> i64 { 0 }
+fn runtime_par_work_scope_node_next_offset() -> i64 { 8 }
+fn runtime_par_work_scope_node_size() -> i64 { 16 }
+
+fn runtime_par_work_scope_new() -> i64 {
+  let scope = alloc_bump(runtime_par_work_scope_size())
+  __mem_store64(scope + runtime_par_work_scope_head_offset(), 0)
+  scope
+}
+
+fn runtime_par_work_scope_track(scope: i64, work: i64) -> i64 {
+  if scope == 0 or work == 0 { work }
+  else {
+    let node = alloc_bump(runtime_par_work_scope_node_size())
+    __mem_store64(node + runtime_par_work_scope_node_work_offset(), work)
+    __mem_store64(node + runtime_par_work_scope_node_next_offset(), __mem_load64(scope + runtime_par_work_scope_head_offset()))
+    __mem_store64(scope + runtime_par_work_scope_head_offset(), node)
+    work
+  }
+}
+
+fn runtime_par_work_join(work: i64) -> i64 {
+  if work == 0 or runtime_par_work_result_state(work) != runtime_par_work_result_ready() { 0 }
+  else { work }
+}
+
+fn runtime_par_work_scope_cleanup(scope: i64) -> i64 {
+  if scope == 0 { 0 }
+  else {
+    let mut node = __mem_load64(scope + runtime_par_work_scope_head_offset())
+    while node != 0 {
+      runtime_par_work_discard(__mem_load64(node + runtime_par_work_scope_node_work_offset()))
+      node = __mem_load64(node + runtime_par_work_scope_node_next_offset())
+    }
+    __mem_store64(scope + runtime_par_work_scope_head_offset(), 0)
+    0
   }
 }
 
