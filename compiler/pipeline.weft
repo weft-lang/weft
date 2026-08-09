@@ -6811,6 +6811,70 @@ fn pipeline_lower_par_map_call_typed_to_target_blocks(ns: i64, nl: i64, args_exp
   }
 }
 
+-- Generic par_map keeps T/U on the call edge. The selected helper builds one
+-- typed carrier per indexed slice element and returns the owned Vector<U>;
+-- routing a GenericCall through the legacy List<i64> helper would erase both
+-- layout and ownership and is therefore a type-confusing miscompile.
+fn pipeline_lower_par_map_generic_typed_to_target_blocks(type_args: TypeExprList, ns: i64, nl: i64, args_expr: ExprList, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
+  let src = pipeline_lower_module_src(module)
+  let fns = pipeline_lower_module_fns(module)
+  if src_eq(src, ns, nl, "par_map") == 0 or type_expr_list_len(type_args) != 2 or expr_list_len(args_expr) != 2 {
+    pipeline_lowered_blocks_invalid(start_block, next_value)
+  } else {
+    let target_hash = match pipeline_lower_module_par_ctx(module) {
+      PipelineParLowerNone -> 0
+      PipelineParLowerSequential(task_scope_slot, work_scope_slot) -> pipeline_par_sequential_map_hash()
+      PipelineParLowerPthread(pool_slot, work_scope_slot) -> pipeline_par_pthread_pool_map_scoped_hash()
+    }
+    if target_hash == 0 {
+      pipeline_lowered_blocks_invalid(start_block, next_value)
+    } else {
+      let template_pair = pipeline_generic_template_find(fns, src, target_hash)
+      let expected_params = if template_pair == 0 { 0 } else {
+        cg_params_shape_specialise(node_f3(pipeline_fn_inner(node_f1(template_pair))), fn_tparams(node_f1(template_pair)), type_expr_list_to_nodes(type_args))
+      }
+      let expected_subst = if template_pair == 0 { 0 } else { cg_build_subst(fn_tparams(node_f1(template_pair)), type_expr_list_to_nodes(type_args)) }
+      let borrowed_mask = if template_pair == 0 { 0 }
+        else { pipeline_fn_effective_borrowable_param_mask_from_pair(fns, template_pair, expected_params, expected_subst) }
+      let call_block = next_block
+      let arg_count = 2
+      let first_arg_block = pipeline_lower_operation_child_start_block(call_block, arg_count)
+      let lowered_args = pipeline_lower_call_arg_blocks_typed_with_borrow_mask(args_expr, arg_count, params, locals, module, call_block, expected_params, 0, expected_subst, 0, borrowed_mask, 0, next_value, first_arg_block, ir_value_list_empty())
+      if pipeline_lowered_call_blocks_is_valid(lowered_args) == 0 {
+        pipeline_lowered_blocks_invalid(start_block, next_value)
+      } else {
+        let entry = ir_block_new_term(start_block, ir_inst_list_empty(), ir_term_jump(first_arg_block))
+        if pipeline_lowered_call_blocks_falls_through(lowered_args) == 0 {
+          let blocks = ir_block_list_prepend(entry, pipeline_lowered_call_blocks_blocks(lowered_args))
+          pipeline_lowered_blocks_control(pipeline_lowered_call_blocks_next_block(lowered_args), pipeline_lowered_call_blocks_next_value(lowered_args), blocks, 1, 0)
+        } else {
+          let policy = pipeline_lower_module_par_ctx(module)
+          let pool_load = pipeline_lowered_call_blocks_next_value(lowered_args)
+          let pthread = match policy {
+            PipelineParLowerPthread(pool_slot, work_scope_slot) -> 1
+            _ -> 0
+          }
+          let call_dst = if pthread == 1 { pool_load + 1 } else { pool_load }
+          let call_values = match policy {
+            PipelineParLowerPthread(pool_slot, work_scope_slot) -> ir_value_list_append(pipeline_lowered_call_blocks_values(lowered_args), ir_value_list_prepend(pool_load, ir_value_list_empty()))
+            _ -> pipeline_lowered_call_blocks_values(lowered_args)
+          }
+          let call_insts = match policy {
+            PipelineParLowerPthread(pool_slot, work_scope_slot) -> ir_inst_list_prepend(
+              ir_inst_load_i64(pool_load, pool_slot),
+              ir_inst_list_prepend(IrGenericCallI64(call_dst, target_hash, type_args, call_values), ir_inst_list_empty())
+            )
+            _ -> ir_inst_list_prepend(IrGenericCallI64(call_dst, target_hash, type_args, call_values), ir_inst_list_empty())
+          }
+          let call = ir_block_new_term(call_block, call_insts, ir_term_jump_args(target_block, ir_value_list_prepend(call_dst, ir_value_list_empty())))
+          let blocks = ir_block_list_prepend(entry, ir_block_list_append(pipeline_lowered_call_blocks_blocks(lowered_args), ir_block_list_prepend(call, ir_block_list_empty())))
+          pipeline_lowered_blocks(pipeline_lowered_call_blocks_next_block(lowered_args), call_dst + 1, blocks, 1)
+        }
+      }
+    }
+  }
+}
+
 fn pipeline_expr_typed_size(expr: Expr, budget: i64) -> i64 {
   if budget <= 0 { 0 }
   else {
@@ -8638,6 +8702,10 @@ fn pipeline_lower_generic_call_typed_to_target_blocks(type_args: TypeExprList, i
   let concrete_type_args = pipeline_type_expr_list_subst(type_args, subst)
   match inner_call {
     Call(ns, nl, args_exprs) -> {
+      let par_map = pipeline_lower_par_map_generic_typed_to_target_blocks(concrete_type_args, ns, nl, args_exprs, params, locals, module, next_value, start_block, next_block, target_block)
+      if pipeline_lowered_blocks_is_valid(par_map) == 1 {
+        par_map
+      } else {
       let par_task = pipeline_lower_par_generic_call_typed_to_target_blocks(concrete_type_args, inner_call, params, locals, module, next_value, start_block, next_block, target_block)
       if pipeline_lowered_blocks_is_valid(par_task) == 1 {
         par_task
@@ -8712,7 +8780,7 @@ fn pipeline_lower_generic_call_typed_to_target_blocks(type_args: TypeExprList, i
         }
       } else {
         pipeline_lowered_blocks_invalid(start_block, next_value)
-      } } } }
+      } } } } }
     }
     _ -> pipeline_lowered_blocks_invalid(start_block, next_value)
   }
@@ -17219,6 +17287,8 @@ fn pipeline_par_pthread_pool_await_hash() -> i64 { str_hash(__str_ptr("par_pthre
 fn pipeline_par_pthread_pool_stop_and_join_hash() -> i64 { str_hash(__str_ptr("par_pthread_pool_stop_and_join"), 0, __str_len("par_pthread_pool_stop_and_join")) }
 fn pipeline_par_pthread_pool_destroy_hash() -> i64 { str_hash(__str_ptr("par_pthread_pool_destroy"), 0, __str_len("par_pthread_pool_destroy")) }
 fn pipeline_par_pthread_pool_shutdown_hash() -> i64 { str_hash(__str_ptr("par_pthread_pool_shutdown"), 0, __str_len("par_pthread_pool_shutdown")) }
+fn pipeline_par_sequential_map_hash() -> i64 { str_hash(__str_ptr("par_sequential_map"), 0, __str_len("par_sequential_map")) }
+fn pipeline_par_pthread_pool_map_scoped_hash() -> i64 { str_hash(__str_ptr("par_pthread_pool_map_scoped"), 0, __str_len("par_pthread_pool_map_scoped")) }
 fn pipeline_par_sequential_map_i64_hash() -> i64 { str_hash(__str_ptr("par_sequential_map_i64"), 0, __str_len("par_sequential_map_i64")) }
 fn pipeline_par_pthread_pool_map_scoped_i64_hash() -> i64 { str_hash(__str_ptr("par_pthread_pool_map_scoped_i64"), 0, __str_len("par_pthread_pool_map_scoped_i64")) }
 fn pipeline_closure_default_promote_hash() -> i64 { str_hash(__str_ptr("closure_default_promote"), 0, __str_len("closure_default_promote")) }
@@ -50618,7 +50688,7 @@ fn pipeline_mem2reg_retighten_function(irf: IrFunction, facts: PipelineIrSemanti
           }
           }
         }
-      } } }
+      } } } }
     }
   }
 }
