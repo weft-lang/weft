@@ -1139,6 +1139,10 @@ assert_contains "test_path_native_aggregates_summary" "$test_path_multi_err" "1 
 
 printf 'test "directory a" { Test.assert_eq(1, 1) }\n' > "$tmp_test_dir/a_pass.weft"
 printf 'test "directory b" { Test.assert_eq(2, 2) }\n' > "$tmp_test_dir/b_pass.weft"
+mkdir -p "$tmp_test_dir/nested/deeper" "$tmp_test_dir/empty"
+printf 'test "directory nested" { Test.assert_eq(3, 3) }\n' > "$tmp_test_dir/nested/c_pass.weft"
+printf 'test "directory deep" { Test.assert_eq(4, 4) }\n' > "$tmp_test_dir/nested/deeper/d_pass.weft"
+ln -s "$tmp_test_dir" "$tmp_test_dir/nested/loop"
 printf 'not a test source\n' > "$tmp_test_dir/ignored.txt"
 set +e
 run_weft_compile_guarded "$WEFT" test --jobs 2 "$tmp_test_dir" > "$tmp_out" 2>"$tmp_err"
@@ -1149,8 +1153,27 @@ assert_equals "test_directory_native_stdout_empty" "$(<"$tmp_out")" ""
 test_dir_err=$(<"$tmp_err")
 assert_contains "test_directory_discovers_a" "$test_dir_err" "  pass: $tmp_test_dir/a_pass.weft ("
 assert_contains "test_directory_discovers_b" "$test_dir_err" "  pass: $tmp_test_dir/b_pass.weft ("
-assert_contains "test_directory_reports_summary" "$test_dir_err" "2 passed, 0 failed"
+assert_contains "test_directory_discovers_nested" "$test_dir_err" "  pass: $tmp_test_dir/nested/c_pass.weft ("
+assert_contains "test_directory_discovers_deep" "$test_dir_err" "  pass: $tmp_test_dir/nested/deeper/d_pass.weft ("
+assert_contains "test_directory_reports_summary" "$test_dir_err" "4 passed, 0 failed"
 assert_not_contains "test_directory_ignores_non_weft" "$test_dir_err" "ignored.txt"
+assert_not_contains "test_directory_breaks_symlink_cycles" "$test_dir_err" "/nested/loop/"
+
+set +e
+run_weft_compile_guarded "$WEFT" test --jobs 1 "$tmp_test_dir" > "$tmp_out" 2>"$tmp_err"
+test_dir_order_exit=$?
+set -e
+assert_equals "test_directory_order_exit_zero" "$test_dir_order_exit" "0"
+a_line=$(grep -nF "  pass: $tmp_test_dir/a_pass.weft (" "$tmp_err" | cut -d: -f1)
+b_line=$(grep -nF "  pass: $tmp_test_dir/b_pass.weft (" "$tmp_err" | cut -d: -f1)
+c_line=$(grep -nF "  pass: $tmp_test_dir/nested/c_pass.weft (" "$tmp_err" | cut -d: -f1)
+d_line=$(grep -nF "  pass: $tmp_test_dir/nested/deeper/d_pass.weft (" "$tmp_err" | cut -d: -f1)
+if [ "$a_line" -lt "$b_line" ] && [ "$b_line" -lt "$c_line" ] && [ "$c_line" -lt "$d_line" ]; then
+  echo "  ok test_directory_order_is_deterministic"
+else
+  echo "  fail test_directory_order_is_deterministic"
+  exit 1
+fi
 
 test_glob="$tmp_test_dir/?_pass.weft"
 set +e
@@ -1165,7 +1188,7 @@ run_weft_compile_guarded "$WEFT" test --jobs 2 "$tmp_test_dir/a_pass.weft" "$tmp
 test_overlap_exit=$?
 set -e
 assert_equals "test_directory_overlap_exit_zero" "$test_overlap_exit" "0"
-assert_contains "test_directory_overlap_deduplicates" "$(<"$tmp_err")" "2 passed, 0 failed"
+assert_contains "test_directory_overlap_deduplicates" "$(<"$tmp_err")" "4 passed, 0 failed"
 
 test_no_match="$tmp_test_dir/nope*.weft"
 set +e
@@ -1209,7 +1232,11 @@ run_binary_guarded "$tmp_tool_bin" "$WEFT_ABS" "$tmp_test_dir" > "$tmp_out" 2>"$
 test_tool_dir_exit=$?
 set -e
 assert_equals "test_runner_capability_tool_directory_exit_zero" "$test_tool_dir_exit" "0"
-assert_contains "test_runner_capability_tool_directory_summary" "$(<"$tmp_err")" "2 passed, 0 failed"
+test_tool_dir_err=$(<"$tmp_err")
+assert_contains "test_runner_capability_tool_directory_summary" "$test_tool_dir_err" "4 passed, 0 failed"
+assert_contains "test_runner_capability_tool_discovers_nested" "$test_tool_dir_err" "  pass: $tmp_test_dir/nested/c_pass.weft ("
+assert_contains "test_runner_capability_tool_discovers_deep" "$test_tool_dir_err" "  pass: $tmp_test_dir/nested/deeper/d_pass.weft ("
+assert_not_contains "test_runner_capability_tool_breaks_symlink_cycles" "$test_tool_dir_err" "/nested/loop/"
 
 set +e
 run_binary_guarded "$tmp_tool_bin" "$WEFT_ABS" "$tmp_test_fail_one" > "$tmp_out" 2>"$tmp_err"
@@ -1339,4 +1366,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 315 passed, 0 failed"
+echo "Tool boundary summary: 323 passed, 0 failed"
