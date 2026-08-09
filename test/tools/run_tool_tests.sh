@@ -212,7 +212,7 @@ assert_test_compile_rejects() {
   assert_contains "$name" "$out" "$pattern"
 }
 
-assert_program_failure_equals() {
+assert_program_failure_contains() {
   local name="$1"
   local source_path="$2"
   local expected_exit="$3"
@@ -227,7 +227,7 @@ assert_program_failure_equals() {
   set -e
   err=$(<"$tmp_err")
   assert_equals "${name}_exit" "$exit_code" "$expected_exit"
-  assert_equals "${name}_stderr" "$err" "$expected_stderr"
+  assert_contains "${name}_stderr" "$err" "$expected_stderr"
 }
 
 write_large_padding() {
@@ -279,15 +279,28 @@ compile_path_exit=$?
 set -e
 assert_equals "compile_path_binary_exit" "$compile_path_exit" "42"
 
-assert_program_failure_equals "panic_boundary" "test/panic_exit.weft" "101" "weft: panic: direct panic boundary"
-assert_program_failure_equals "checked_index_bounds_panic" "test/array_index_oob_exit.weft" "101" "weft: panic: index out of bounds"
-assert_program_failure_equals "checked_index_mutation_bounds_panic" "test/array_index_set_oob_exit.weft" "101" "weft: panic: index out of bounds"
-assert_program_failure_equals "checked_slice_order_panic" "test/array_slice_order_oob_exit.weft" "101" "weft: panic: index out of bounds"
-assert_program_failure_equals "checked_slice_upper_panic" "test/array_slice_upper_oob_exit.weft" "101" "weft: panic: index out of bounds"
-assert_program_failure_equals "result_unwrap_panic" "test/result_unwrap_exit.weft" "101" "weft: panic: Result.unwrap called on Err"
-assert_program_failure_equals "result_expect_panic" "test/result_expect_exit.weft" "101" "weft: panic: required result failed"
-assert_program_failure_equals "option_unwrap_panic" "test/option_unwrap_exit.weft" "101" "weft: panic: Option.unwrap called on None"
-assert_program_failure_equals "option_expect_panic" "test/option_expect_exit.weft" "101" "weft: panic: required option missing"
+assert_program_failure_contains "panic_boundary" "test/panic_exit.weft" "101" "weft: panic: direct panic boundary"
+assert_program_failure_contains "checked_index_bounds_panic" "test/array_index_oob_exit.weft" "101" "weft: panic: index out of bounds"
+assert_program_failure_contains "checked_index_mutation_bounds_panic" "test/array_index_set_oob_exit.weft" "101" "weft: panic: index out of bounds"
+assert_program_failure_contains "checked_slice_order_panic" "test/array_slice_order_oob_exit.weft" "101" "weft: panic: index out of bounds"
+assert_program_failure_contains "checked_slice_upper_panic" "test/array_slice_upper_oob_exit.weft" "101" "weft: panic: index out of bounds"
+assert_program_failure_contains "result_unwrap_panic" "test/result_unwrap_exit.weft" "101" "weft: panic: Result.unwrap called on Err"
+assert_program_failure_contains "result_expect_panic" "test/result_expect_exit.weft" "101" "weft: panic: required result failed"
+assert_program_failure_contains "option_unwrap_panic" "test/option_unwrap_exit.weft" "101" "weft: panic: Option.unwrap called on None"
+assert_program_failure_contains "option_expect_panic" "test/option_expect_exit.weft" "101" "weft: panic: required option missing"
+
+run_weft_compile_guarded "$WEFT" compile "test/panic_trace_exit.weft" > "$tmp_bin" 2>"$tmp_err"
+chmod +x "$tmp_bin"
+set +e
+run_binary_guarded "$tmp_bin" >/dev/null 2>"$tmp_err"
+panic_trace_exit=$?
+set -e
+panic_trace_err=$(<"$tmp_err")
+assert_equals "panic_trace_exit" "$panic_trace_exit" "101"
+assert_contains "panic_trace_message" "$panic_trace_err" "weft: panic: traced panic boundary"
+assert_contains "panic_trace_header" "$panic_trace_err" "stack backtrace:"
+assert_contains "panic_trace_leaf" "$panic_trace_err" "panic_trace_leaf at test/panic_trace_exit.weft:5:4"
+assert_contains "panic_trace_main" "$panic_trace_err" "main at test/panic_trace_exit.weft:13:4"
 
 printf 'fn broken() -> i64 { 1\nfn after() -> i64 { 2 }\n' > "$tmp_src"
 parse_recovery_out=$("$WEFT" ast < "$tmp_src" 2>&1)
@@ -1373,4 +1386,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 325 passed, 0 failed"
+echo "Tool boundary summary: 330 passed, 0 failed"
