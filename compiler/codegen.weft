@@ -28,15 +28,16 @@ fn cg_ldrb(rt: i64, rn: i64, off: i64) -> i64 { encode_ldrb(rt, rn, off) }
 -- (self-label performs must dispatch outward). Runtime twin:
 -- handler_dispatch_prev_offset in runtime/effects.weft.
 -- 128 -> 160 (4j): the found handler frame plus J3's abort-cleanup shadow
--- chain and active-abortive-handler pointer. 6b claims the final word at 152
--- for the read-only native-provenance table pointer; the bump arena remains
--- 16-byte aligned at 160.
-fn runtime_state_size() -> i64 { 160 }
+-- chain and active-abortive-handler pointer. 6b claims the word at 152 for
+-- the read-only native-provenance table pointer. 4l adds a default-heap
+-- initialization lock at 160; round the bump arena start to 16-byte alignment.
+fn runtime_state_size() -> i64 { 176 }
 fn runtime_state_dispatch_prev_offset() -> i64 { 120 }
 fn runtime_state_dispatch_frame_offset() -> i64 { 128 }
 fn runtime_state_abort_cleanup_top_offset() -> i64 { 136 }
 fn runtime_state_abort_cleanup_active_offset() -> i64 { 144 }
 fn runtime_state_native_provenance_offset() -> i64 { 152 }
+fn runtime_state_default_heap_init_lock_offset() -> i64 { 160 }
 fn runtime_state_bump_offset() -> i64 { 0 }
 -- Base of the CURRENT bump segment's allocatable range. Written at
 -- startup and on every segment chain; alloc_bump_restore_same_segment
@@ -62,10 +63,6 @@ fn deferred_runtime_context_effect_hash_offset() -> i64 { 16 }
 fn deferred_runtime_context_op_count_offset() -> i64 { 24 }
 fn deferred_runtime_context_prev_offset() -> i64 { 32 }
 fn runtime_bump_segment_size() -> i64 { 536870912 }
-
-fn cg_bump_tmp(dst: i64, size_reg: i64) -> i64 {
-  if dst != 9 and size_reg != 9 { 9 } else { 10 }
-}
 
 fn cg_stack_frame_default_size() -> i64 { 2048 }
 fn cg_stack_adjust_chunk_size() -> i64 { 4080 }
@@ -102,34 +99,62 @@ fn cg_bump_emit_grow(code: i64, dst: i64, size_reg: i64) -> i64 {
   cg_patch_b_cond(code, ok_pos, 3, buf_len(code))
   bu32(code, encode_add_imm(17, 0, runtime_state_size()))
   bu32(code, encode_add_reg(10, 17, 12))
-  bu32(code, cg_str(10, 28, runtime_state_bump_offset()))
   bu32(code, cg_str(17, 28, runtime_state_bump_base_offset()))
   bu32(code, encode_add_reg(11, 0, 13))
   bu32(code, cg_str(11, 28, runtime_state_bump_end_offset()))
+  -- A failed fast-path reservation publishes -1 in the bump cell while it
+  -- grows. Publish the new cursor last with release ordering; peer workers
+  -- spin on the sentinel and cannot observe a cursor paired with stale bounds.
+  bu32(code, encode_stlr(10, 28))
   if dst != 17 { bu32(code, encode_add_imm(dst, 17, 0)) } else { 0 }
 }
 
+fn cg_bump_scratch(dst: i64, size_reg: i64, first: i64, second: i64, third: i64) -> i64 {
+  let mut reg = 9
+  while reg <= 17 and (reg == dst or reg == size_reg or reg == first or reg == second or reg == third) {
+    reg = reg + 1
+  }
+  reg
+}
+
 fn cg_bump_alloc_reg(code: i64, dst: i64, size_reg: i64) -> i64 {
-  bu32(code, cg_ldr(dst, 28, runtime_state_bump_offset()))
-  let tmp = cg_bump_tmp(dst, size_reg)
-  bu32(code, encode_add_reg(tmp, dst, size_reg))
-  bu32(code, cg_ldr(11, 28, runtime_state_bump_end_offset()))
-  bu32(code, encode_cmp(tmp, 11))
+  let next = cg_bump_scratch(dst, size_reg, 0 - 1, 0 - 1, 0 - 1)
+  let end = cg_bump_scratch(dst, size_reg, next, 0 - 1, 0 - 1)
+  let status = cg_bump_scratch(dst, size_reg, next, end, 0 - 1)
+  let retry = buf_len(code)
+  bu32(code, encode_ldaxr(dst, 28))
+  bu32(code, encode_cmp(dst, 31))
+  let growing_pos = buf_len(code)
+  bu32(code, 0)
+  bu32(code, encode_add_reg(next, dst, size_reg))
+  bu32(code, cg_ldr(end, 28, runtime_state_bump_end_offset()))
+  bu32(code, encode_cmp(next, end))
   let grow_pos = buf_len(code)
   bu32(code, 0)
-  bu32(code, cg_str(tmp, 28, runtime_state_bump_offset()))
+  bu32(code, encode_stlxr(status, next, 28))
+  bu32(code, encode_cbnz(status, retry - buf_len(code)))
   let done_pos = buf_len(code)
   bu32(code, 0)
   let grow_start = buf_len(code)
+  emit_mov_imm_safe(code, end, 0 - 1)
+  bu32(code, encode_stlxr(status, end, 28))
+  bu32(code, encode_cbnz(status, retry - buf_len(code)))
   cg_bump_emit_grow(code, dst, size_reg)
   let done = buf_len(code)
+  cg_patch_b_cond(code, growing_pos, 11, retry)
   cg_patch_b_cond(code, grow_pos, 8, grow_start)
   cg_patch_b(code, done_pos, done)
 }
 
 fn cg_bump_alloc_imm(code: i64, dst: i64, size: i64) -> i64 {
-  bu32(code, cg_ldr(dst, 28, runtime_state_bump_offset()))
-  let tmp = cg_bump_tmp(dst, 0)
+  let next = cg_bump_scratch(dst, 0 - 1, 0 - 1, 0 - 1, 0 - 1)
+  let end = cg_bump_scratch(dst, 0 - 1, next, 0 - 1, 0 - 1)
+  let status = cg_bump_scratch(dst, 0 - 1, next, end, 0 - 1)
+  let retry = buf_len(code)
+  bu32(code, encode_ldaxr(dst, 28))
+  bu32(code, encode_cmp(dst, 31))
+  let growing_pos = buf_len(code)
+  bu32(code, 0)
   -- ADD's imm12 caps at 4095. In the raw encoding, bit 22 of the
   -- immediate term is the LSL-12 flag and bit 23 is unallocated, so an
   -- oversized size used to either silently over-advance the bump
@@ -138,23 +163,28 @@ fn cg_bump_alloc_imm(code: i64, dst: i64, size: i64) -> i64 {
   -- (>= 8192). Bigger sizes go through a register; x13/x14 are dead in
   -- the fast path (the grow arm sets them up itself).
   if size > 4095 {
-    let size_tmp = if dst == 13 { 14 } else { 13 }
+    let size_tmp = cg_bump_scratch(dst, 0 - 1, next, end, status)
     emit_mov_imm_safe(code, size_tmp, size)
-    bu32(code, encode_add_reg(tmp, dst, size_tmp))
+    bu32(code, encode_add_reg(next, dst, size_tmp))
   } else {
-    bu32(code, encode_add_imm(tmp, dst, size))
+    bu32(code, encode_add_imm(next, dst, size))
   }
-  bu32(code, cg_ldr(11, 28, runtime_state_bump_end_offset()))
-  bu32(code, encode_cmp(tmp, 11))
+  bu32(code, cg_ldr(end, 28, runtime_state_bump_end_offset()))
+  bu32(code, encode_cmp(next, end))
   let grow_pos = buf_len(code)
   bu32(code, 0)
-  bu32(code, cg_str(tmp, 28, runtime_state_bump_offset()))
+  bu32(code, encode_stlxr(status, next, 28))
+  bu32(code, encode_cbnz(status, retry - buf_len(code)))
   let done_pos = buf_len(code)
   bu32(code, 0)
   let grow_start = buf_len(code)
+  emit_mov_imm_safe(code, end, 0 - 1)
+  bu32(code, encode_stlxr(status, end, 28))
+  bu32(code, encode_cbnz(status, retry - buf_len(code)))
   emit_mov_imm_safe(code, 12, size)
   cg_bump_emit_grow(code, dst, 12)
   let done = buf_len(code)
+  cg_patch_b_cond(code, growing_pos, 11, retry)
   cg_patch_b_cond(code, grow_pos, 8, grow_start)
   cg_patch_b(code, done_pos, done)
 }
@@ -232,6 +262,9 @@ fn emit_heap_init(code: i64, fm: i64) -> i64 {
   bu32(code, encode_adrp(17, 0))
   bu32(code, encode_add_imm(17, 17, 0))
   bu32(code, cg_str(17, 28, runtime_state_native_provenance_offset()))
+  -- Default-heap initialization lock; the mapping is already zero-filled,
+  -- but keeping startup explicit pins the runtime-state ABI.
+  bu32(code, cg_str(31, 28, runtime_state_default_heap_init_lock_offset()))
   fmap_set_native_provenance_adrp_pos(fm, provenance_adrp_pos)
   -- MOV x27, #0 (handler stack = empty)
   bu32(code, encode_movz(27, 0, 0))
