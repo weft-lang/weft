@@ -1108,7 +1108,7 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_harness_emits_passing_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
 echo "  ok test_harness_binds_runtime_after_synthesis"
 
-printf 'fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
+printf 'use "stdlib/vector.weft" fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) let va = vector_new<i64>() let vb = vector_new<i64>() vector_push<i64>(va, 7) vector_push<i64>(vb, 7) Test.assert_i64_vector_eq(va, vb) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_supports_assertion_helpers" "$tmp_err" "unknown effect operation"
 chmod +x "$tmp_bin"
@@ -1163,7 +1163,9 @@ set -e
 assert_equals "test_path_native_returns_boolean_failure" "$test_path_multi_exit" "1"
 assert_equals "test_path_native_failure_stdout_empty" "$(<"$tmp_out")" ""
 test_path_multi_err=$(<"$tmp_err")
-assert_contains "test_path_native_preserves_assertion_diagnostic" "$test_path_multi_err" "test assertion failed: assert_eq got=1 want=2"
+assert_contains "test_path_native_preserves_assertion_diagnostic" "$test_path_multi_err" "test assertion failed: assert_eq"
+assert_contains "test_path_native_preserves_expected_payload" "$test_path_multi_err" "  expected: 2"
+assert_contains "test_path_native_preserves_actual_payload" "$test_path_multi_err" "  actual:   1"
 assert_contains "test_path_native_reports_first_failure" "$test_path_multi_err" "  FAIL: $tmp_test_fail_one ("
 assert_contains "test_path_native_continues_after_failure" "$test_path_multi_err" "  pass: $tmp_test_after ("
 assert_contains "test_path_native_reports_second_failure" "$test_path_multi_err" "  FAIL: $tmp_test_fail_two ("
@@ -1276,7 +1278,9 @@ test_tool_failure_exit=$?
 set -e
 assert_equals "test_runner_capability_tool_failure_exit_one" "$test_tool_failure_exit" "1"
 test_tool_failure_err=$(<"$tmp_err")
-assert_contains "test_runner_capability_tool_preserves_diagnostic" "$test_tool_failure_err" "test assertion failed: assert_eq got=1 want=2"
+assert_contains "test_runner_capability_tool_preserves_diagnostic" "$test_tool_failure_err" "test assertion failed: assert_eq"
+assert_contains "test_runner_capability_tool_preserves_expected_payload" "$test_tool_failure_err" "  expected: 2"
+assert_contains "test_runner_capability_tool_preserves_actual_payload" "$test_tool_failure_err" "  actual:   1"
 assert_contains "test_runner_capability_tool_consumes_structured_result" "$test_tool_failure_err" "WEFT_TEST_RESULT 1 0 1 1"
 assert_contains "test_runner_capability_tool_failure_summary" "$test_tool_failure_err" "0 passed, 1 failed"
 
@@ -1340,9 +1344,13 @@ assert_equals "test_named_failures_return_boolean" "$test_named_failures_exit" "
 test_named_failures_err=$(<"$tmp_err")
 assert_contains "test_named_failures_report_structured_counts" "$test_named_failures_err" "WEFT_TEST_RESULT 1 1 2 3"
 assert_contains "test_named_failures_reports_first_name" "$test_named_failures_err" "test failure: first named failure"
-assert_contains "test_named_failures_reports_first_detail" "$test_named_failures_err" "test assertion failed: assert_eq got=1 want=2"
+assert_contains "test_named_failures_reports_first_detail" "$test_named_failures_err" "test assertion failed: assert_eq"
+assert_contains "test_named_failures_reports_first_expected" "$test_named_failures_err" "  expected: 2"
+assert_contains "test_named_failures_reports_first_actual" "$test_named_failures_err" "  actual:   1"
 assert_contains "test_named_failures_continues_past_pass" "$test_named_failures_err" "test failure: last named failure"
 assert_contains "test_named_failures_reports_last_detail" "$test_named_failures_err" "test assertion failed: assert_true"
+assert_contains "test_named_failures_reports_last_expected" "$test_named_failures_err" "  expected: true"
+assert_contains "test_named_failures_reports_last_actual" "$test_named_failures_err" "  actual:   false"
 assert_not_contains "test_named_failures_omits_passing_name" "$test_named_failures_err" "test failure: passing middle"
 
 assert_test_failure_contains "test_assertion_failure_reports_diagnostic" 'test "fail_eq_diag" { Test.assert_eq(1, 2) }' 1 "test assertion failed: assert_eq"
@@ -1352,14 +1360,29 @@ assert_test_failure_contains "test_assert_near_f64_outside_epsilon_fails" 'test 
 assert_test_failure_contains "test_assert_near_f64_negative_epsilon_fails" 'test "fail_near_f64_epsilon" { Test.assert_near_f64(1.0, 1.0, 0.0 - 0.1) }' 1 "test assertion failed: assert_near_f64"
 assert_test_failure_contains "test_snapshot_mismatch_reports_diagnostic" 'test "fail_snapshot" { Test.assert_snapshot("actual", "expected") }' 1 "test assertion failed: snapshot"
 assert_test_failure_contains "test_property_failure_reports_diagnostic" 'test "fail_property" { Test.forall_i64_range(0, 4, x => x < 2) }' 1 "test assertion failed: forall_i64_range"
+assert_test_failure_contains "test_property_failure_reports_counterexample" 'test "fail_property" { Test.forall_i64_range(0, 4, x => x < 2) }' 1 "  counterexample: 2"
 assert_test_failure_contains "test_property_empty_range_reports_exhaustion" 'test "empty_property" { Test.forall_i64_range(3, 3, x => true) }' 1 "test assertion failed: forall_i64_range_empty"
 assert_test_exit_code "test_effect_fixtures_pass" 'fn tool_fail8() -[Fail<i64>]> i64 { Fail.fail(8) } test "fixtures" { Test.assert_eq(Test.with_state_i64(2, () => { TestState.put(TestState.get() + 1) TestState.get() }), 3) Test.assert_eq(Test.expect_fail_i64(8, () => tool_fail8()), 8) Test.assert_eq(Test.with_io_i64(() => IO.open("path", 7, 0)), 107) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.note("ok", 0)), 3) }' 0
 assert_test_failure_contains "test_fixture_missing_fail_reports_diagnostic" 'test "missing_fail" { Test.expect_fail_i64(1, () => 0) }' 1 "test assertion failed: expect_fail_missing"
 assert_test_failure_contains "test_fixture_wrong_fail_reports_diagnostic" 'fn tool_fail2() -[Fail<i64>]> i64 { Fail.fail(2) } test "wrong_fail" { Test.expect_fail_i64(1, () => tool_fail2()) }' 1 "test assertion failed: expect_fail_i64"
+assert_test_failure_contains "test_fixture_wrong_fail_reports_expected" 'fn tool_fail2() -[Fail<i64>]> i64 { Fail.fail(2) } test "wrong_fail" { Test.expect_fail_i64(1, () => tool_fail2()) }' 1 "  expected: 1"
+assert_test_failure_contains "test_fixture_wrong_fail_reports_actual" 'fn tool_fail2() -[Fail<i64>]> i64 { Fail.fail(2) } test "wrong_fail" { Test.expect_fail_i64(1, () => tool_fail2()) }' 1 "  actual:   2"
+
+assert_test_failure_contains "test_string_diff_reports_byte" 'test "string_diff" { Test.assert_str_eq("a\nsnow", "a\nrain") }' 1 "  diff at byte 2:"
+assert_test_failure_contains "test_string_diff_reports_expected" 'test "string_diff" { Test.assert_str_eq("a\nsnow", "a\nrain") }' 1 '    - expected "a\nrain"'
+assert_test_failure_contains "test_string_diff_reports_actual" 'test "string_diff" { Test.assert_str_eq("a\nsnow", "a\nrain") }' 1 '    + actual   "a\nsnow"'
+assert_test_failure_contains "test_string_ne_reports_equal_value" 'test "string_ne" { Test.assert_str_ne("same\n", "same\n") }' 1 '  value was unexpectedly equal: "same\n"'
+
+vector_diff_source='use "stdlib/vector.weft" test "vector_diff" { let actual = vector_new<i64>() vector_push<i64>(actual, 1) vector_push<i64>(actual, 2) vector_push<i64>(actual, 3) vector_push<i64>(actual, 4) let expected = vector_new<i64>() vector_push<i64>(expected, 1) vector_push<i64>(expected, 9) vector_push<i64>(expected, 3) Test.assert_i64_vector_eq(actual, expected) }'
+assert_test_failure_contains "test_vector_diff_reports_header" "$vector_diff_source" 1 "test assertion failed: assert_i64_vector_eq"
+assert_test_failure_contains "test_vector_diff_reports_index_and_lengths" "$vector_diff_source" 1 "  collection diff at index 1 (expected length 3, actual length 4):"
+assert_test_failure_contains "test_vector_diff_reports_expected" "$vector_diff_source" 1 "    - expected [1, 9, 3]"
+assert_test_failure_contains "test_vector_diff_reports_actual" "$vector_diff_source" 1 "    + actual   [1, 2, 3, 4]"
 assert_test_compile_rejects "test_assert_true_rejects_i64" 'test "bad_bool" { Test.assert_true(2) }' "type error: argument type mismatch"
 assert_test_compile_rejects "test_assert_str_eq_rejects_i64" 'test "bad_str" { Test.assert_str_eq(1, "one") }' "type error: argument type mismatch"
 assert_test_compile_rejects "test_assert_eq_f64_rejects_i64" 'test "bad_f64" { Test.assert_eq_f64(1, 1.0) }' "type error: argument type mismatch"
 assert_test_compile_rejects "test_assert_near_f64_rejects_i64_epsilon" 'test "bad_f64_epsilon" { Test.assert_near_f64(1.0, 1.0, 1) }' "type error: argument type mismatch"
+assert_test_compile_rejects "test_assert_i64_vector_rejects_wrong_element_type" 'use "stdlib/vector.weft" test "bad_vector" { let a = vector_new<str>() let b = vector_new<str>() Test.assert_i64_vector_eq(a, b) }' "type error: argument type mismatch"
 assert_test_compile_rejects "test_property_rejects_i64_predicate" 'test "bad_property" { Test.forall_i64_range(0, 1, x => x + 1) }' "type error: return type mismatch"
 assert_test_compile_rejects "test_property_rejects_effectful_predicate" $'effect Log { fn hit() -> i64 }\ntest "bad_property_effect" { Test.forall_i64_range(0, 1, x => Log.hit() == x) }' "type error: effect not available in caller"
 assert_test_compile_rejects "test_fixture_rejects_unhandled_state" 'test "bad_state" { TestState.get() }' "type error: effect not available in caller"
@@ -1398,4 +1421,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 334 passed, 0 failed"
+echo "Tool boundary summary: 354 passed, 0 failed"
