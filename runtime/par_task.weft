@@ -4,6 +4,293 @@ use "runtime/alloc.weft"
 use "runtime/rc.weft"
 use "runtime/unsafe.weft"
 
+-- Runtime twin of compiler/pipeline.weft's static ParWork descriptor ABI.
+-- Keep these offsets literal and versioned: descriptors are compiler-emitted
+-- read-only data and are the only authority for typed result transport.
+fn runtime_par_work_descriptor_magic() -> i64 { 6289459449259127 }
+fn runtime_par_work_descriptor_version() -> i64 { 1 }
+fn runtime_par_work_descriptor_magic_offset() -> i64 { 0 }
+fn runtime_par_work_descriptor_version_offset() -> i64 { 8 }
+fn runtime_par_work_descriptor_lane_count_offset() -> i64 { 16 }
+fn runtime_par_work_descriptor_storage_size_offset() -> i64 { 24 }
+fn runtime_par_work_descriptor_storage_align_offset() -> i64 { 32 }
+fn runtime_par_work_descriptor_header_size() -> i64 { 40 }
+fn runtime_par_work_descriptor_entry_size() -> i64 { 16 }
+fn runtime_par_work_descriptor_lane_class_offset(lane: i64) -> i64 { runtime_par_work_descriptor_header_size() + lane * runtime_par_work_descriptor_entry_size() }
+fn runtime_par_work_descriptor_lane_cleanup_offset(lane: i64) -> i64 { runtime_par_work_descriptor_lane_class_offset(lane) + 8 }
+
+fn runtime_par_work_descriptor_lane_count(descriptor: i64) -> i64 {
+  if descriptor == 0 { 0 - 1 } else { __mem_load64(descriptor + runtime_par_work_descriptor_lane_count_offset()) }
+}
+
+fn runtime_par_work_descriptor_storage_size(descriptor: i64) -> i64 {
+  if descriptor == 0 { 0 - 1 } else { __mem_load64(descriptor + runtime_par_work_descriptor_storage_size_offset()) }
+}
+
+fn runtime_par_work_descriptor_storage_align(descriptor: i64) -> i64 {
+  if descriptor == 0 { 0 - 1 } else { __mem_load64(descriptor + runtime_par_work_descriptor_storage_align_offset()) }
+}
+
+fn runtime_par_work_descriptor_lane_class(descriptor: i64, lane: i64) -> i64 {
+  let lanes = runtime_par_work_descriptor_lane_count(descriptor)
+  if lane < 0 or lane >= lanes { 0 }
+  else { __mem_load64(descriptor + runtime_par_work_descriptor_lane_class_offset(lane)) }
+}
+
+fn runtime_par_work_descriptor_lane_cleanup_kind(descriptor: i64, lane: i64) -> i64 {
+  let lanes = runtime_par_work_descriptor_lane_count(descriptor)
+  if lane < 0 or lane >= lanes { continuation_cleanup_kind_none() }
+  else { __mem_load64(descriptor + runtime_par_work_descriptor_lane_cleanup_offset(lane)) }
+}
+
+fn runtime_par_work_descriptor_is_valid(descriptor: i64) -> i64 {
+  if descriptor == 0 or __mem_load64(descriptor + runtime_par_work_descriptor_magic_offset()) != runtime_par_work_descriptor_magic() or
+    __mem_load64(descriptor + runtime_par_work_descriptor_version_offset()) != runtime_par_work_descriptor_version() { 0 }
+  else {
+    let lanes = runtime_par_work_descriptor_lane_count(descriptor)
+    let storage_size = runtime_par_work_descriptor_storage_size(descriptor)
+    let storage_align = runtime_par_work_descriptor_storage_align(descriptor)
+    if lanes < 0 or lanes > 8 or storage_size != lanes * 8 or storage_align != if lanes == 0 { 1 } else { 8 } { 0 }
+    else {
+      let mut valid = 1
+      let mut lane = 0
+      while lane < lanes and valid == 1 {
+        let lane_class = runtime_par_work_descriptor_lane_class(descriptor, lane)
+        let cleanup_kind = runtime_par_work_descriptor_lane_cleanup_kind(descriptor, lane)
+        let class_valid = if lane_class == 1 or lane_class == 2 or lane_class == 3 { 1 } else { 0 }
+        let cleanup_valid = if cleanup_kind == continuation_cleanup_kind_none() or rc_layout_descriptor_drop_kind_is_valid(cleanup_kind) == 1 { 1 } else { 0 }
+        if class_valid == 0 or cleanup_valid == 0 or (lane_class != 1 and cleanup_kind != continuation_cleanup_kind_none()) { valid = 0 }
+        else { lane = lane + 1 }
+      }
+      valid
+    }
+  }
+}
+
+-- A ParWork owns one closure pair and storage for a concrete result shape.
+-- Result states: empty while the worker initializes lanes, ready after
+-- promotion/publication, moved after join or drop. The carrier never infers a
+-- type from its raw words; every operation validates and walks the descriptor.
+fn runtime_par_work_descriptor_offset() -> i64 { 0 }
+fn runtime_par_work_fn_ptr_offset() -> i64 { 8 }
+fn runtime_par_work_env_ptr_offset() -> i64 { 16 }
+fn runtime_par_work_result_state_offset() -> i64 { 24 }
+fn runtime_par_work_result_initialized_mask_offset() -> i64 { 32 }
+fn runtime_par_work_result_data_offset() -> i64 { 40 }
+fn runtime_par_work_result_empty() -> i64 { 0 }
+fn runtime_par_work_result_ready() -> i64 { 1 }
+fn runtime_par_work_result_moved() -> i64 { 2 }
+
+fn runtime_par_work_lane_bit(lane: i64) -> i64 {
+  if lane < 0 or lane >= 8 { 0 }
+  else {
+    let mut bit = 1
+    for i in 0..lane { bit = bit * 2 }
+    bit
+  }
+}
+
+fn runtime_par_work_result_full_mask(descriptor: i64) -> i64 {
+  let lanes = runtime_par_work_descriptor_lane_count(descriptor)
+  if lanes < 0 or lanes > 8 { 0 - 1 }
+  else {
+    let mut mask = 0
+    for lane in 0..lanes { mask = mask bor runtime_par_work_lane_bit(lane) }
+    mask
+  }
+}
+
+fn runtime_par_work_size_for_descriptor(descriptor: i64) -> i64 {
+  if runtime_par_work_descriptor_is_valid(descriptor) == 0 { 0 }
+  else { runtime_par_work_result_data_offset() + runtime_par_work_descriptor_storage_size(descriptor) }
+}
+
+fn runtime_par_work_new_raw(descriptor: i64, fn_ptr: i64, env_ptr: i64) -> i64 {
+  let size = runtime_par_work_size_for_descriptor(descriptor)
+  if size == 0 { 0 }
+  else {
+    let work = alloc_zeroed(size)
+    __mem_store64(work + runtime_par_work_descriptor_offset(), descriptor)
+    __mem_store64(work + runtime_par_work_fn_ptr_offset(), fn_ptr)
+    __mem_store64(work + runtime_par_work_env_ptr_offset(), closure_env_bump_clone_raw(env_ptr))
+    work
+  }
+}
+
+fn runtime_par_work_descriptor(work: i64) -> i64 {
+  if work == 0 { 0 } else { __mem_load64(work + runtime_par_work_descriptor_offset()) }
+}
+
+fn runtime_par_work_result_state(work: i64) -> i64 {
+  if work == 0 { 0 - 1 } else { __mem_load64(work + runtime_par_work_result_state_offset()) }
+}
+
+fn runtime_par_work_result_initialized_mask(work: i64) -> i64 {
+  if work == 0 { 0 } else { __mem_load64(work + runtime_par_work_result_initialized_mask_offset()) }
+}
+
+fn runtime_par_work_result_data(work: i64) -> i64 {
+  if work == 0 { 0 } else { work + runtime_par_work_result_data_offset() }
+}
+
+fn runtime_par_work_result_store_lane(work: i64, lane: i64, value: i64) -> i64 {
+  let descriptor = runtime_par_work_descriptor(work)
+  let lane_bit = runtime_par_work_lane_bit(lane)
+  if runtime_par_work_descriptor_is_valid(descriptor) == 0 or runtime_par_work_result_state(work) != runtime_par_work_result_empty() or
+    lane < 0 or lane >= runtime_par_work_descriptor_lane_count(descriptor) or lane_bit == 0 or
+    (runtime_par_work_result_initialized_mask(work) band lane_bit) != 0 { 0 }
+  else {
+    __mem_store64(runtime_par_work_result_data(work) + lane * 8, value)
+    __mem_store64(work + runtime_par_work_result_initialized_mask_offset(), runtime_par_work_result_initialized_mask(work) bor lane_bit)
+    1
+  }
+}
+
+fn runtime_par_work_result_load_lane_or(work: i64, lane: i64, default: i64) -> i64 {
+  let descriptor = runtime_par_work_descriptor(work)
+  let lane_bit = runtime_par_work_lane_bit(lane)
+  if runtime_par_work_descriptor_is_valid(descriptor) == 0 or lane < 0 or lane >= runtime_par_work_descriptor_lane_count(descriptor) or
+    lane_bit == 0 or (runtime_par_work_result_initialized_mask(work) band lane_bit) == 0 { default }
+  else { __mem_load64(runtime_par_work_result_data(work) + lane * 8) }
+}
+
+fn runtime_par_work_promote_lane(value: i64, kind: i64) -> i64 {
+  if value == 0 or kind == continuation_cleanup_kind_none() { 0 }
+  else {
+    if kind == continuation_cleanup_kind_closure() { closure_default_promote(value) }
+    else { if kind == continuation_cleanup_kind_rc() or kind == continuation_cleanup_kind_weak() { rc_default_promote_maybe(value) }
+    else { 0 } }
+  }
+}
+
+fn runtime_par_work_result_promote(work: i64) -> i64 {
+  let descriptor = runtime_par_work_descriptor(work)
+  let state = runtime_par_work_result_state(work)
+  if runtime_par_work_descriptor_is_valid(descriptor) == 0 or state == runtime_par_work_result_moved() { 0 }
+  else {
+    let mut promoted = 0
+    for lane in 0..runtime_par_work_descriptor_lane_count(descriptor) {
+      if (runtime_par_work_result_initialized_mask(work) band runtime_par_work_lane_bit(lane)) != 0 {
+        promoted = promoted + runtime_par_work_promote_lane(
+          runtime_par_work_result_load_lane_or(work, lane, 0),
+          runtime_par_work_descriptor_lane_cleanup_kind(descriptor, lane)
+        )
+      } else { 0 }
+    }
+    promoted
+  }
+}
+
+fn runtime_par_work_result_publish(work: i64) -> i64 {
+  let descriptor = runtime_par_work_descriptor(work)
+  if runtime_par_work_descriptor_is_valid(descriptor) == 0 or runtime_par_work_result_state(work) != runtime_par_work_result_empty() or
+    runtime_par_work_result_initialized_mask(work) != runtime_par_work_result_full_mask(descriptor) { 0 }
+  else {
+    runtime_par_work_result_promote(work)
+    __mem_store64(work + runtime_par_work_result_state_offset(), runtime_par_work_result_ready())
+    1
+  }
+}
+
+fn runtime_par_work_result_clear(work: i64) -> i64 {
+  let descriptor = runtime_par_work_descriptor(work)
+  if runtime_par_work_descriptor_is_valid(descriptor) == 0 { 0 }
+  else {
+    mem_zero(runtime_par_work_result_data(work), runtime_par_work_descriptor_storage_size(descriptor))
+    __mem_store64(work + runtime_par_work_result_initialized_mask_offset(), 0)
+    1
+  }
+}
+
+fn runtime_par_work_result_destination_is_valid(work: i64, destination: i64) -> i64 {
+  let descriptor = runtime_par_work_descriptor(work)
+  if runtime_par_work_descriptor_is_valid(descriptor) == 0 { 0 }
+  else {
+    let size = runtime_par_work_descriptor_storage_size(descriptor)
+    if size == 0 { 1 }
+    else {
+      if destination == 0 { 0 }
+      else {
+        let source = runtime_par_work_result_data(work)
+        if destination < source + size and source < destination + size { 0 } else { 1 }
+      }
+    }
+  }
+}
+
+fn runtime_par_work_result_copy_to(work: i64, destination: i64) -> i64 {
+  let descriptor = runtime_par_work_descriptor(work)
+  let lanes = runtime_par_work_descriptor_lane_count(descriptor)
+  if runtime_par_work_descriptor_is_valid(descriptor) == 0 or runtime_par_work_result_state(work) != runtime_par_work_result_ready() or
+    runtime_par_work_result_destination_is_valid(work, destination) == 0 { 0 }
+  else {
+    for lane in 0..lanes {
+      let value = runtime_par_work_result_load_lane_or(work, lane, 0)
+      rc_retain_kind(value, runtime_par_work_descriptor_lane_cleanup_kind(descriptor, lane))
+      __mem_store64(destination + lane * 8, value)
+    }
+    1
+  }
+}
+
+fn runtime_par_work_result_move_to(work: i64, destination: i64) -> i64 {
+  let descriptor = runtime_par_work_descriptor(work)
+  let lanes = runtime_par_work_descriptor_lane_count(descriptor)
+  if runtime_par_work_descriptor_is_valid(descriptor) == 0 or runtime_par_work_result_state(work) != runtime_par_work_result_ready() or
+    runtime_par_work_result_destination_is_valid(work, destination) == 0 { 0 }
+  else {
+    if lanes > 0 { mem_copy(destination, runtime_par_work_result_data(work), lanes * 8) } else { 0 }
+    runtime_par_work_result_clear(work)
+    __mem_store64(work + runtime_par_work_result_state_offset(), runtime_par_work_result_moved())
+    1
+  }
+}
+
+fn runtime_par_work_result_drop(work: i64) -> i64 {
+  let descriptor = runtime_par_work_descriptor(work)
+  if runtime_par_work_descriptor_is_valid(descriptor) == 0 or runtime_par_work_result_state(work) == runtime_par_work_result_moved() { 0 }
+  else {
+    let mut lane = runtime_par_work_descriptor_lane_count(descriptor)
+    let mut released = 0
+    while lane > 0 {
+      lane = lane - 1
+      if (runtime_par_work_result_initialized_mask(work) band runtime_par_work_lane_bit(lane)) != 0 {
+        released = released + continuation_cleanup_release_value(
+          runtime_par_work_descriptor_lane_cleanup_kind(descriptor, lane),
+          runtime_par_work_result_load_lane_or(work, lane, 0)
+        )
+      } else { 0 }
+    }
+    runtime_par_work_result_clear(work)
+    __mem_store64(work + runtime_par_work_result_state_offset(), runtime_par_work_result_moved())
+    released
+  }
+}
+
+fn runtime_par_work_release_closure(work: i64) -> i64 {
+  if work == 0 { 0 }
+  else {
+    let fn_ptr = __mem_load64(work + runtime_par_work_fn_ptr_offset())
+    let env_ptr = __mem_load64(work + runtime_par_work_env_ptr_offset())
+    if fn_ptr == 0 and env_ptr == 0 { 0 }
+    else {
+      closure_env_release_captures_raw(env_ptr)
+      __mem_store64(work + runtime_par_work_fn_ptr_offset(), 0)
+      __mem_store64(work + runtime_par_work_env_ptr_offset(), 0)
+      1
+    }
+  }
+}
+
+fn runtime_par_work_discard(work: i64) -> i64 {
+  if work == 0 { 0 }
+  else {
+    let released = runtime_par_work_result_drop(work)
+    runtime_par_work_release_closure(work)
+    released
+  }
+}
+
 fn runtime_par_task_closure_offset() -> i64 { 0 }
 fn runtime_par_task_fn_ptr_offset() -> i64 { 0 }
 fn runtime_par_task_env_ptr_offset() -> i64 { 8 }
