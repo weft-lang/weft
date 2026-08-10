@@ -112,8 +112,16 @@ fn tenv_lookup_mutable(env: i64, src: i64, ns: i64, nl: i64) -> i64 {
 -- For now, a simple list. Built during pass 1 of type checking.
 fn ftypes_new() -> i64 { nlist_new() }
 
+fn ftypes_new_with_ttable(tt: i64) -> i64 {
+  let ft = nlist_new()
+  -- The index-cache node's tag carries the semantic context without changing
+  -- every lookup signature. f1..f4 retain the existing cache contract.
+  mem_store64_at(ft, 24, node_new(tt, 0, 0, ft, ftypes_index_magic()))
+  ft
+}
+
 fn ftypes_add(ft: i64, src: i64, ns: i64, nl: i64, ret_ty: i64, params: i64, effects: i64, tparams: i64) -> i64 {
-  let e = alloc_words(10)
+  let e = alloc_words(11)
   mem_store64_at(e, 0, ns)
   mem_store64_at(e, 8, nl)
   mem_store64_at(e, 16, ret_ty)
@@ -128,9 +136,21 @@ fn ftypes_add(ft: i64, src: i64, ns: i64, nl: i64, ret_ty: i64, params: i64, eff
   -- offset 72: nonzero when this entry is an impl method registered under
   -- its bare name; such entries never shadow plain functions.
   mem_store64_at(e, 72, 0)
+  -- offset 80: producer-owned top-level declaration identity. Constructors
+  -- and impl-method compatibility entries remain zero until their own G2
+  -- resolution slices land.
+  mem_store64_at(e, 80, 0)
   nlist_add(ft, e)
   e
 }
+
+fn ftypes_bind_decl_fact(entry: i64, tt: i64, src: i64, ns: i64, nl: i64) -> i64 {
+  let decl = module_decl_fact_find(tt, src, module_decl_namespace_value(), src, ns, nl)
+  if decl != 0 and module_decl_fact_owner(decl) == 0 { mem_store64_at(entry, 80, decl) } else { 0 }
+  decl
+}
+
+fn ftypes_entry_decl_fact(entry: i64) -> i64 { if entry == 0 { 0 } else { mem_load64_at(entry, 80) } }
 
 -- Function-type lookups were linear byte-compare scans per call
 -- expression; a hash-ordered tree in the list's fourth header word
@@ -194,33 +214,89 @@ fn ftypes_index(ft: i64) -> i64 {
       tree = ftypes_index_insert(tree, str_hash(mem_load64_at(e, 24), mem_load64_at(e, 0), mem_load64_at(e, 8)), e)
       i = i + 1
     }
-    mem_store64_at(ft, 24, node_new(0, tree, n, ft, ftypes_index_magic()))
+    let context_tt = if valid == 1 { node_tag(cached) } else { 0 }
+    mem_store64_at(ft, 24, node_new(context_tt, tree, n, ft, ftypes_index_magic()))
     tree
   }
 }
 
-fn ftypes_find(ft: i64, src: i64, ns: i64, nl: i64) -> i64 {
-  let tree = ftypes_index(ft)
-  let hash = str_hash(src, ns, nl)
+fn ftypes_context_ttable(ft: i64) -> i64 {
+  let cached = mem_load64_at(ft, 24)
+  if cached != 0 and node_f3(cached) == ft and node_f4(cached) == ftypes_index_magic() { node_tag(cached) } else { 0 }
+}
+
+fn ftypes_entry_name_eq(entry: i64, name_ptr: i64, name_len: i64) -> i64 {
+  if mem_load64_at(entry, 8) != name_len { 0 }
+  else { src_eq_at(mem_load64_at(entry, 24), mem_load64_at(entry, 0), name_ptr, 0, name_len) }
+}
+
+fn ftypes_find_hash_head(tree: i64, hash: i64) -> i64 {
   let mut cur = tree
   let mut result = 0
-  while cur != 0 {
+  while cur != 0 and result == 0 {
     let cur_hash = node_f1(cur)
-    if hash == cur_hash {
-      result = node_f2(cur)
-      -- On a name collision, a non-method declaration in the caller's own
-      -- source shadows imported ones; otherwise first declaration wins.
-      let mut chain = mem_load64_at(result, 64)
-      while chain != 0 {
-        if mem_load64_at(chain, 24) == src and mem_load64_at(chain, 72) == 0 {
-          result = chain
-          chain = 0
-        } else { chain = mem_load64_at(chain, 64) }
-      }
-      cur = 0
-    } else { if hash < cur_hash { cur = node_f3(cur) } else { cur = node_f4(cur) } }
+    if hash == cur_hash { result = node_f2(cur) }
+    else { if hash < cur_hash { cur = node_f3(cur) } else { cur = node_f4(cur) } }
   }
   result
+}
+
+fn ftypes_find(ft: i64, src: i64, ns: i64, nl: i64) -> i64 {
+  let tree = ftypes_index(ft)
+  let tt = ftypes_context_ttable(ft)
+  let caller_module = if tt == 0 { 0 } else { module_fact_find_source(tt, src) }
+  let resolved_decl = if caller_module == 0 { 0 }
+    else { module_scope_lookup_declaration(tt, src, module_decl_namespace_value(), src, ns, nl) }
+  let lookup_ptr = if resolved_decl == 0 { src + ns } else { module_decl_fact_name_ptr(resolved_decl) }
+  let lookup_len = if resolved_decl == 0 { nl } else { module_decl_fact_name_len(resolved_decl) }
+  let hash = str_hash(lookup_ptr, 0, lookup_len)
+  let head = ftypes_find_hash_head(tree, hash)
+  let mut result = 0
+  if resolved_decl != 0 {
+    -- Aliases and diamonds terminate here: only the exact origin identity is
+    -- eligible, independent of spelling or declaration order.
+    let mut chain = head
+    while chain != 0 and result == 0 {
+      if ftypes_entry_decl_fact(chain) == resolved_decl { result = chain }
+      else { chain = mem_load64_at(chain, 64) }
+    }
+  } else { if caller_module != 0 and module_fact_module_uses_legacy_flat(tt, caller_module) == 0 {
+    -- A registered module with no value binding must not fall through to an
+    -- unrelated flat top-level declaration. Keep only unowned compatibility
+    -- entries (constructors and impl methods) until their dedicated slices.
+    let mut chain = head
+    while chain != 0 and result == 0 {
+      if ftypes_entry_decl_fact(chain) == 0 and ftypes_entry_name_eq(chain, lookup_ptr, lookup_len) == 1 { result = chain }
+      else { chain = mem_load64_at(chain, 64) }
+    }
+  } else {
+    -- Non-module callers and quoted-import compatibility modules retain the
+    -- old flat catalog until G3 migrates the tree. Canonical modules never
+    -- enter this branch.
+    let mut chain = head
+    while chain != 0 {
+      if ftypes_entry_name_eq(chain, lookup_ptr, lookup_len) == 1 {
+        if result == 0 { result = chain } else { 0 }
+        if mem_load64_at(chain, 24) == src and mem_load64_at(chain, 72) == 0 { result = chain }
+      } else { 0 }
+      chain = mem_load64_at(chain, 64)
+    }
+  } }
+  result
+}
+
+fn ftypes_add_module_decl(ft: i64, tt: i64, src: i64, ns: i64, nl: i64, ret_ty: i64, params: i64, effects: i64, tparams: i64) -> i64 {
+  let entry = ftypes_add(ft, src, ns, nl, ret_ty, params, effects, tparams)
+  ftypes_bind_decl_fact(entry, tt, src, ns, nl)
+  entry
+}
+
+fn ftypes_set_body_entry(entry: i64, body: i64) -> i64 {
+  if entry == 0 { 0 }
+  else {
+    mem_store64_at(entry, 56, body)
+    1
+  }
 }
 
 fn ftypes_set_body(ft: i64, src: i64, ns: i64, nl: i64, body: i64) -> i64 {
@@ -13954,7 +14030,7 @@ fn effect_add_with_atom(eff: i64, eff_hash: i64, atom: i64) -> i64 {
 -- effect drift, and type errors in use'd files pass with 0 errors.)
 fn check_user_fns(fns: i64, user_src: i64, tt: i64) -[Conformance, Diagnose]> i64 {
   let n = nlist_len(fns)
-  let ft = ftypes_new()
+  let ft = ftypes_new_with_ttable(tt)
   -- Pass 1: register all function return types
   for i in 0..n {
     let pair = nlist_get(fns, i)
@@ -13962,8 +14038,9 @@ fn check_user_fns(fns: i64, user_src: i64, tt: i64) -[Conformance, Diagnose]> i6
     let fn_src = node_f2(pair)
     let inner = fn_inner(fn_wrap)
     let reg_entry = ftypes_add(ft, fn_src, node_f1(inner), node_f2(inner), fn_ret_type(fn_wrap), node_f3(inner), fn_effects(fn_wrap), fn_tparams(fn_wrap))
-    if node_f3(pair) != 0 { mem_store64_at(reg_entry, 72, 1) } else { 0 }
-    ftypes_set_body(ft, fn_src, node_f1(inner), node_f2(inner), node_f4(inner))
+    if node_f3(pair) != 0 { mem_store64_at(reg_entry, 72, 1) }
+    else { ftypes_bind_decl_fact(reg_entry, tt, fn_src, node_f1(inner), node_f2(inner)) }
+    ftypes_set_body_entry(reg_entry, node_f4(inner))
   }
   -- Register variant constructors from type table
   register_ctors(ft, tt, user_src)
@@ -13982,15 +14059,17 @@ fn check_user_fns(fns: i64, user_src: i64, tt: i64) -[Conformance, Diagnose]> i6
 -- Check all functions in a module
 fn check_module(fns: i64, tt: i64) -[Conformance, Diagnose]> i64 {
   let n = nlist_len(fns)
-  let ft = ftypes_new()
+  let ft = ftypes_new_with_ttable(tt)
   -- Pass 1: register all function return types (use declared type or any)
   for i in 0..n {
     let pair = nlist_get(fns, i)
     let fn_node = node_f1(pair)
     let fn_src = node_f2(pair)
     let inner = fn_inner(fn_node)
-    ftypes_add(ft, fn_src, node_f1(inner), node_f2(inner), fn_ret_type(fn_node), node_f3(inner), fn_effects(fn_node), fn_tparams(fn_node))
-    ftypes_set_body(ft, fn_src, node_f1(inner), node_f2(inner), node_f4(inner))
+    let reg_entry = ftypes_add(ft, fn_src, node_f1(inner), node_f2(inner), fn_ret_type(fn_node), node_f3(inner), fn_effects(fn_node), fn_tparams(fn_node))
+    if node_f3(pair) != 0 { mem_store64_at(reg_entry, 72, 1) }
+    else { ftypes_bind_decl_fact(reg_entry, tt, fn_src, node_f1(inner), node_f2(inner)) }
+    ftypes_set_body_entry(reg_entry, node_f4(inner))
   }
   -- Pass 2: check impl declarations and all function bodies
   let mut total_errors = check_type_cycles(tt, 0) + check_aggregate_release_mask_capacity(tt, 0) + check_impl_decls(tt, 0) + check_decl_signature_surfaces(tt, 0) + check_reserved_structural_trait_decls(tt, 0)
