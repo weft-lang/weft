@@ -130,12 +130,38 @@ if [ "${1:-}" = "__worker" ]; then
       exit 0
     fi
 
-    chmod +x "$tmpbin"
+    runbin="$tmpbin"
+    linkedbin=""
+    artifact_kind=$(/usr/bin/file -b "$tmpbin")
+    if [[ "$artifact_kind" == *"Mach-O 64-bit object"* ]]; then
+      linkedbin=$(mktemp /tmp/weft_test_linked_XXXXXX)
+      link_exit=0
+      run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" /usr/bin/clang -o "$linkedbin" "$tmpbin" 2>/dev/null || link_exit=$?
+      compile_elapsed=$(($(now_s) - compile_start))
+      if [ $link_exit -ne 0 ]; then
+        if [ $link_exit -eq 124 ]; then
+          echo "  ✗ $name (linking timed out after ${WEFT_TEST_COMPILE_TIMEOUT}s; compile+link ${compile_elapsed}s)"
+          echo "  $name: linking timed out after ${WEFT_TEST_COMPILE_TIMEOUT}s (compile+link ${compile_elapsed}s)" > "$errf"
+        elif [ $link_exit -eq 125 ]; then
+          echo "  ✗ $name (linking exceeded ${WEFT_TEST_COMPILE_RSS_LIMIT_KB} KB RSS; compile+link ${compile_elapsed}s)"
+          echo "  $name: linking exceeded ${WEFT_TEST_COMPILE_RSS_LIMIT_KB} KB RSS (compile+link ${compile_elapsed}s)" > "$errf"
+        else
+          echo "  ✗ $name (linking failed; exit $link_exit; compile+link ${compile_elapsed}s)"
+          echo "  $name: linking failed (exit $link_exit, compile+link ${compile_elapsed}s)" > "$errf"
+        fi
+        echo "fail $file_tests $compile_elapsed 0" > "$meta"
+        rm -f "$tmpbin" "$linkedbin"
+        exit 0
+      fi
+      runbin="$linkedbin"
+    fi
+
+    chmod +x "$runbin"
 
     tmp_run_err=$(mktemp /tmp/weft_test_result_XXXXXX)
     exit_code=0
     run_start=$(now_s)
-    run_guarded "$WEFT_TEST_RUN_TIMEOUT" "$WEFT_TEST_RUN_RSS_LIMIT_KB" "$tmpbin" 2>"$tmp_run_err" || exit_code=$?
+    run_guarded "$WEFT_TEST_RUN_TIMEOUT" "$WEFT_TEST_RUN_RSS_LIMIT_KB" "$runbin" 2>"$tmp_run_err" || exit_code=$?
     run_elapsed=$(($(now_s) - run_start))
 
     result_line=$(grep -E '^WEFT_TEST_RESULT 1 [0-9]+ [0-9]+ [0-9]+$' "$tmp_run_err" | tail -1 || true)
@@ -188,7 +214,7 @@ if [ "${1:-}" = "__worker" ]; then
       echo "fail $file_tests $compile_elapsed $run_elapsed" > "$meta"
     fi
 
-    rm -f "$tmpbin" "$tmp_run_err"
+    rm -f "$tmpbin" "$linkedbin" "$tmp_run_err"
     exit 0
   fi
 
