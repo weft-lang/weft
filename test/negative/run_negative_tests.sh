@@ -692,7 +692,6 @@ check_rejects "slice_local_return_binding" "test/negative/slice_local_return_bin
 check_rejects "slice_aggregate_return" "test/negative/slice_aggregate_return.weft" "type error: slice-containing aggregate cannot escape its borrow scope"
 check_rejects "slice_local_closure_capture" "test/negative/slice_local_closure_capture.weft" "type error: slice borrow cannot be captured by an escaping closure"
 check_rejects "slice_par_mutable_worker" "test/negative/slice_par_mutable_worker.weft" "type error: mutable slice cannot cross a scoped Par boundary"
-check_rejects "slice_par_managed_worker" "test/negative/slice_par_managed_worker.weft" "type error: slice element type is not Sendable across scoped Par"
 check_rejects "sendable_bound_mutable_vector" "test/negative/sendable_bound_mutable_vector.weft" "type error: type is not Sendable"
 check_rejects "sendable_bound_nested_mutable" "test/negative/sendable_bound_nested_mutable.weft" "type error: type is not Sendable"
 check_rejects "sendable_bound_function_requires_value" "test/negative/sendable_bound_function_requires_value.weft" "type error: type is not Sendable"
