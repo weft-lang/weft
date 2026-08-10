@@ -305,6 +305,7 @@ check_rejects "unknown_identifier" "test/negative/unknown_identifier.weft" "type
 check_rejects "unknown_function" "test/negative/unknown_function.weft" "type error: unknown function"
 check_rejects "unknown_intrinsic_call" "test/negative/unknown_intrinsic_call.weft" "type error: unknown function"
 check_rejects "unknown_function_in_import" "test/negative/unknown_function_in_import.weft" "type error: unknown function"
+check_rejects "module_plain_import_does_not_leak_value" "test/negative/module_plain_import_does_not_leak_value.weft" "type error: unknown function"
 check_rejects "proc_run_requires_effect" "test/negative/proc_run_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "proc_spawn_requires_effect" "test/negative/proc_spawn_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "proc_wait_requires_effect" "test/negative/proc_wait_requires_effect.weft" "type error: effect not available in caller"
