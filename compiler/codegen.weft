@@ -73,7 +73,7 @@ fn cg_align16(size: i64) -> i64 {
   if rem == 0 { size } else { size + (16 - rem) }
 }
 
-fn cg_bump_emit_grow(code: i64, dst: i64, size_reg: i64) -> i64 {
+fn cg_bump_emit_grow(code: i64, dst: i64, size_reg: i64, next_reg: i64, status_reg: i64) -> i64 {
   -- Preserve requested size before setting up the mmap syscall.
   if size_reg != 12 { bu32(code, encode_add_imm(12, size_reg, 0)) } else { 0 }
   bu32(code, encode_add_imm(14, 12, runtime_state_size()))
@@ -92,48 +92,68 @@ fn cg_bump_emit_grow(code: i64, dst: i64, size_reg: i64) -> i64 {
   bu32(code, encode_movz(3, 4098, 0))
   bu32(code, encode_movn(4, 0))
   bu32(code, encode_movz(5, 0, 0))
-  -- The kernel owns the caller-saved register file across svc. Preserve the
-  -- dynamic request and mapping length explicitly; both remain live below.
+  -- The grow arm is inlined into arbitrary generated code. Preserve its
+  -- caller-saved scratch population across svc: the kernel already proved it
+  -- may clobber more than x0, and values such as a just-built continuation
+  -- descriptor can remain live in x10/x15 across the next bump reservation.
   -- LDP does not alter NZCV, so the syscall carry test still observes svc.
-  bu32(code, encode_stp_pre(12, 13, 31, 0 - 16))
+  bu32(code, encode_stp_pre(9, 10, 31, 0 - 16))
+  bu32(code, encode_stp_pre(11, 12, 31, 0 - 16))
+  bu32(code, encode_stp_pre(13, 14, 31, 0 - 16))
+  bu32(code, encode_stp_pre(15, 16, 31, 0 - 16))
   bu32(code, encode_svc())
-  bu32(code, encode_ldp_post(12, 13, 31, 16))
+  bu32(code, encode_ldp_post(15, 16, 31, 16))
+  bu32(code, encode_ldp_post(13, 14, 31, 16))
+  bu32(code, encode_ldp_post(11, 12, 31, 16))
+  bu32(code, encode_ldp_post(9, 10, 31, 16))
   let ok_pos = buf_len(code)
   bu32(code, 0)
   bu32(code, encode_brk(5))
   cg_patch_b_cond(code, ok_pos, 3, buf_len(code))
   bu32(code, encode_add_imm(17, 0, runtime_state_size()))
-  bu32(code, encode_add_reg(10, 17, 12))
+  bu32(code, encode_add_reg(next_reg, 17, 12))
   bu32(code, cg_str(17, 28, runtime_state_bump_base_offset()))
-  bu32(code, encode_add_reg(11, 0, 13))
-  bu32(code, cg_str(11, 28, runtime_state_bump_end_offset()))
+  bu32(code, encode_add_reg(status_reg, 0, 13))
+  bu32(code, cg_str(status_reg, 28, runtime_state_bump_end_offset()))
   -- A failed fast-path reservation publishes -1 in the bump cell while it
   -- grows. Publish the new cursor last with release ordering; peer workers
   -- spin on the sentinel and cannot observe a cursor paired with stale bounds.
-  bu32(code, encode_stlr(10, 28))
+  bu32(code, encode_stlr(next_reg, 28))
   if dst != 17 { bu32(code, encode_add_imm(dst, 17, 0)) } else { 0 }
 }
 
-fn cg_bump_scratch(dst: i64, size_reg: i64, first: i64, second: i64, third: i64) -> i64 {
-  let mut reg = 9
-  while reg <= 17 and (reg == dst or reg == size_reg or reg == first or reg == second or reg == third) {
-    reg = reg + 1
-  }
-  reg
+-- Inline bump reservations have a deliberately narrow fast-path clobber
+-- contract. Prefer the historical x9/x11 pair; several emission sequences
+-- keep independently allocated objects live in x10/x12 between reservations.
+fn cg_bump_scratch_primary(dst: i64, size_reg: i64) -> i64 {
+  if dst != 9 and size_reg != 9 { 9 }
+  else { if dst != 11 and size_reg != 11 { 11 }
+  else { if dst != 10 and size_reg != 10 { 10 } else { 12 } } }
+}
+
+fn cg_bump_scratch_secondary(dst: i64, size_reg: i64, first: i64) -> i64 {
+  if dst != 11 and size_reg != 11 and first != 11 { 11 }
+  else { if dst != 9 and size_reg != 9 and first != 9 { 9 }
+  else { if dst != 10 and size_reg != 10 and first != 10 { 10 } else { 12 } } }
+}
+
+fn cg_bump_large_imm_tmp(dst: i64, next: i64, status: i64) -> i64 {
+  if dst != 13 and next != 13 and status != 13 { 13 }
+  else { if dst != 14 and next != 14 and status != 14 { 14 }
+  else { if dst != 12 and next != 12 and status != 12 { 12 } else { 10 } } }
 }
 
 fn cg_bump_alloc_reg(code: i64, dst: i64, size_reg: i64) -> i64 {
-  let next = cg_bump_scratch(dst, size_reg, 0 - 1, 0 - 1, 0 - 1)
-  let end = cg_bump_scratch(dst, size_reg, next, 0 - 1, 0 - 1)
-  let status = cg_bump_scratch(dst, size_reg, next, end, 0 - 1)
+  let next = cg_bump_scratch_primary(dst, size_reg)
+  let status = cg_bump_scratch_secondary(dst, size_reg, next)
   let retry = buf_len(code)
   bu32(code, encode_ldaxr(dst, 28))
   bu32(code, encode_cmp(dst, 31))
   let growing_pos = buf_len(code)
   bu32(code, 0)
   bu32(code, encode_add_reg(next, dst, size_reg))
-  bu32(code, cg_ldr(end, 28, runtime_state_bump_end_offset()))
-  bu32(code, encode_cmp(next, end))
+  bu32(code, cg_ldr(status, 28, runtime_state_bump_end_offset()))
+  bu32(code, encode_cmp(next, status))
   let grow_pos = buf_len(code)
   bu32(code, 0)
   bu32(code, encode_stlxr(status, next, 28))
@@ -141,10 +161,10 @@ fn cg_bump_alloc_reg(code: i64, dst: i64, size_reg: i64) -> i64 {
   let done_pos = buf_len(code)
   bu32(code, 0)
   let grow_start = buf_len(code)
-  emit_mov_imm_safe(code, end, 0 - 1)
-  bu32(code, encode_stlxr(status, end, 28))
+  emit_mov_imm_safe(code, next, 0 - 1)
+  bu32(code, encode_stlxr(status, next, 28))
   bu32(code, encode_cbnz(status, retry - buf_len(code)))
-  cg_bump_emit_grow(code, dst, size_reg)
+  cg_bump_emit_grow(code, dst, size_reg, next, status)
   let done = buf_len(code)
   cg_patch_b_cond(code, growing_pos, 11, retry)
   cg_patch_b_cond(code, grow_pos, 8, grow_start)
@@ -152,9 +172,8 @@ fn cg_bump_alloc_reg(code: i64, dst: i64, size_reg: i64) -> i64 {
 }
 
 fn cg_bump_alloc_imm(code: i64, dst: i64, size: i64) -> i64 {
-  let next = cg_bump_scratch(dst, 0 - 1, 0 - 1, 0 - 1, 0 - 1)
-  let end = cg_bump_scratch(dst, 0 - 1, next, 0 - 1, 0 - 1)
-  let status = cg_bump_scratch(dst, 0 - 1, next, end, 0 - 1)
+  let next = cg_bump_scratch_primary(dst, 0 - 1)
+  let status = cg_bump_scratch_secondary(dst, 0 - 1, next)
   let retry = buf_len(code)
   bu32(code, encode_ldaxr(dst, 28))
   bu32(code, encode_cmp(dst, 31))
@@ -168,14 +187,14 @@ fn cg_bump_alloc_imm(code: i64, dst: i64, size: i64) -> i64 {
   -- (>= 8192). Bigger sizes go through a register; x13/x14 are dead in
   -- the fast path (the grow arm sets them up itself).
   if size > 4095 {
-    let size_tmp = cg_bump_scratch(dst, 0 - 1, next, end, status)
+    let size_tmp = cg_bump_large_imm_tmp(dst, next, status)
     emit_mov_imm_safe(code, size_tmp, size)
     bu32(code, encode_add_reg(next, dst, size_tmp))
   } else {
     bu32(code, encode_add_imm(next, dst, size))
   }
-  bu32(code, cg_ldr(end, 28, runtime_state_bump_end_offset()))
-  bu32(code, encode_cmp(next, end))
+  bu32(code, cg_ldr(status, 28, runtime_state_bump_end_offset()))
+  bu32(code, encode_cmp(next, status))
   let grow_pos = buf_len(code)
   bu32(code, 0)
   bu32(code, encode_stlxr(status, next, 28))
@@ -183,11 +202,11 @@ fn cg_bump_alloc_imm(code: i64, dst: i64, size: i64) -> i64 {
   let done_pos = buf_len(code)
   bu32(code, 0)
   let grow_start = buf_len(code)
-  emit_mov_imm_safe(code, end, 0 - 1)
-  bu32(code, encode_stlxr(status, end, 28))
+  emit_mov_imm_safe(code, next, 0 - 1)
+  bu32(code, encode_stlxr(status, next, 28))
   bu32(code, encode_cbnz(status, retry - buf_len(code)))
   emit_mov_imm_safe(code, 12, size)
-  cg_bump_emit_grow(code, dst, 12)
+  cg_bump_emit_grow(code, dst, 12, next, status)
   let done = buf_len(code)
   cg_patch_b_cond(code, growing_pos, 11, retry)
   cg_patch_b_cond(code, grow_pos, 8, grow_start)
