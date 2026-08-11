@@ -314,6 +314,7 @@ check_rejects "module_qualified_effect_unknown" "test/negative/module_qualified_
 check_rejects "module_qualified_effect_private" "test/negative/module_qualified_effect_private.weft" "type error: module member is not visible"
 check_rejects "module_qualified_effect_arity" "test/negative/module_qualified_effect_arity.weft" "type error: effect type argument count mismatch"
 check_rejects "module_qualified_effect_operation" "test/negative/module_qualified_effect_operation.weft" "type error: unknown effect operation"
+check_rejects "module_qualified_effect_identity_mismatch" "test/negative/module_qualified_effect_identity_mismatch.weft" "type error: effect atom not available in caller"
 check_rejects "proc_run_requires_effect" "test/negative/proc_run_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "proc_spawn_requires_effect" "test/negative/proc_spawn_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "proc_wait_requires_effect" "test/negative/proc_wait_requires_effect.weft" "type error: effect not available in caller"
