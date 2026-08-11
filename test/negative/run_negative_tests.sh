@@ -316,6 +316,8 @@ check_rejects "module_qualified_constructor_argument" "test/negative/module_qual
 check_rejects "module_qualified_pattern_unknown" "test/negative/module_qualified_pattern_unknown.weft" "type error: unknown module member"
 check_rejects "module_qualified_pattern_private" "test/negative/module_qualified_pattern_private.weft" "type error: module member is not visible"
 check_rejects "module_qualified_pattern_identity_mismatch" "test/negative/module_qualified_pattern_identity_mismatch.weft" "type error: constructor pattern does not match scrutinee"
+check_rejects "module_inherent_method_private" "test/negative/module_inherent_method_private.weft" "type error: method is not visible"
+check_rejects "module_inherent_method_unknown" "test/negative/module_inherent_method_unknown.weft" "type error: unknown method"
 check_rejects "module_qualified_effect_unknown" "test/negative/module_qualified_effect_unknown.weft" "type error: unknown module member"
 check_rejects "module_qualified_effect_private" "test/negative/module_qualified_effect_private.weft" "type error: module member is not visible"
 check_rejects "module_qualified_effect_arity" "test/negative/module_qualified_effect_arity.weft" "type error: effect type argument count mismatch"
