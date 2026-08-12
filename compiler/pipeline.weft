@@ -266,6 +266,12 @@ type PipelineIrBorrowFunctionIndex {
   PipelineIrBorrowFunctionIndexLeaf(i64, IrFunction, PipelineIrBorrowFunctionIndex)
 }
 
+type PipelineIrBorrowBlockParamIndex {
+  PipelineIrBorrowBlockParamIndexNil,
+  PipelineIrBorrowBlockParamIndexBranch(PipelineIrBorrowBlockParamIndex, PipelineIrBorrowBlockParamIndex),
+  PipelineIrBorrowBlockParamIndexLeaf(i64, IrValueList, PipelineIrBorrowBlockParamIndex)
+}
+
 type PipelineGenericSpecClosureState {
   PipelineGenericSpecClosureState(IrFunctionList, IrFunctionList)
 }
@@ -43313,7 +43319,78 @@ fn pipeline_ir_borrow_pass_jump_args(args: IrValueList, params: IrValueList, pas
   }
 }
 
-fn pipeline_ir_borrow_pass_blocks_once_inner(blocks: IrBlockList, all_blocks: IrBlockList, pass: PipelineIrBorrowValuePass, facts: PipelineIrSemanticFactList) -> PipelineIrBorrowValuePass {
+-- Block ids are stable within one function. Build their parameter lookup once
+-- per borrow round instead of recursively scanning the whole block list at
+-- every jump (the old O(rounds * blocks^2) self-compile wall).
+fn pipeline_ir_borrow_block_param_index_insert(index: PipelineIrBorrowBlockParamIndex, block_id: i64, params: IrValueList, bit: i64) -> PipelineIrBorrowBlockParamIndex {
+  if bit >= 8 {
+    match index {
+      PipelineIrBorrowBlockParamIndexNil -> PipelineIrBorrowBlockParamIndexLeaf(block_id, params, PipelineIrBorrowBlockParamIndexNil)
+      PipelineIrBorrowBlockParamIndexLeaf(entry_id, entry_params, rest) -> {
+        if entry_id == block_id { PipelineIrBorrowBlockParamIndexLeaf(block_id, params, rest) }
+        else { PipelineIrBorrowBlockParamIndexLeaf(entry_id, entry_params, pipeline_ir_borrow_block_param_index_insert(rest, block_id, params, bit)) }
+      }
+      _ -> index
+    }
+  } else {
+    let high = (block_id bshr bit) band 1
+    match index {
+      PipelineIrBorrowBlockParamIndexNil -> {
+        if high == 0 {
+          PipelineIrBorrowBlockParamIndexBranch(pipeline_ir_borrow_block_param_index_insert(PipelineIrBorrowBlockParamIndexNil, block_id, params, bit + 1), PipelineIrBorrowBlockParamIndexNil)
+        } else {
+          PipelineIrBorrowBlockParamIndexBranch(PipelineIrBorrowBlockParamIndexNil, pipeline_ir_borrow_block_param_index_insert(PipelineIrBorrowBlockParamIndexNil, block_id, params, bit + 1))
+        }
+      }
+      PipelineIrBorrowBlockParamIndexBranch(low, upper) -> {
+        if high == 0 { PipelineIrBorrowBlockParamIndexBranch(pipeline_ir_borrow_block_param_index_insert(low, block_id, params, bit + 1), upper) }
+        else { PipelineIrBorrowBlockParamIndexBranch(low, pipeline_ir_borrow_block_param_index_insert(upper, block_id, params, bit + 1)) }
+      }
+      _ -> index
+    }
+  }
+}
+
+fn pipeline_ir_borrow_block_param_map(blocks: IrBlockList) -> PipelineIrBorrowBlockParamIndex {
+  let mut map = PipelineIrBorrowBlockParamIndexNil
+  let mut current = blocks
+  let mut walking = 1
+  while walking == 1 {
+    match current {
+      IrBlockListNil -> { walking = 0 }
+      IrBlockListCons(block, rest) -> {
+        match block {
+          IrBlock(id, params, insts, term) -> { map = pipeline_ir_borrow_block_param_index_insert(map, id, params, 0) }
+        }
+        current = rest
+      }
+    }
+  }
+  map
+}
+
+fn pipeline_ir_borrow_block_params_for_id(map: PipelineIrBorrowBlockParamIndex, block_id: i64) -> IrValueList {
+  let mut current = map
+  let mut bit = 0
+  let mut result = ir_value_list_empty()
+  let mut walking = 1
+  while walking == 1 {
+    match current {
+      PipelineIrBorrowBlockParamIndexNil -> { walking = 0 }
+      PipelineIrBorrowBlockParamIndexBranch(low, upper) -> {
+        current = if ((block_id bshr bit) band 1) == 0 { low } else { upper }
+        bit = bit + 1
+      }
+      PipelineIrBorrowBlockParamIndexLeaf(entry_id, params, rest) -> {
+        if entry_id == block_id { result = params walking = 0 }
+        else { current = rest }
+      }
+    }
+  }
+  result
+}
+
+fn pipeline_ir_borrow_pass_blocks_once_inner(blocks: IrBlockList, param_map: PipelineIrBorrowBlockParamIndex, pass: PipelineIrBorrowValuePass, facts: PipelineIrSemanticFactList) -> PipelineIrBorrowValuePass {
   match blocks {
     IrBlockListNil -> pass
     IrBlockListCons(block, rest) -> {
@@ -43321,18 +43398,18 @@ fn pipeline_ir_borrow_pass_blocks_once_inner(blocks: IrBlockList, all_blocks: Ir
         IrBlock(id, params, insts, term) -> {
           let after_insts = pipeline_ir_borrow_pass_insts(insts, pass, facts)
           match term {
-            IrTermJump(target, args) -> pipeline_ir_borrow_pass_jump_args(args, ir_block_list_params_for_id(all_blocks, target), after_insts)
+            IrTermJump(target, args) -> pipeline_ir_borrow_pass_jump_args(args, pipeline_ir_borrow_block_params_for_id(param_map, target), after_insts)
             _ -> after_insts
           }
         }
       }
-      pipeline_ir_borrow_pass_blocks_once_inner(rest, all_blocks, next, facts)
+      pipeline_ir_borrow_pass_blocks_once_inner(rest, param_map, next, facts)
     }
   }
 }
 
 fn pipeline_ir_borrow_pass_blocks_once(blocks: IrBlockList, pass: PipelineIrBorrowValuePass, facts: PipelineIrSemanticFactList) -> PipelineIrBorrowValuePass {
-  pipeline_ir_borrow_pass_blocks_once_inner(blocks, blocks, pass, facts)
+  pipeline_ir_borrow_pass_blocks_once_inner(blocks, pipeline_ir_borrow_block_param_map(blocks), pass, facts)
 }
 
 fn pipeline_ir_borrow_values_for_function(f: IrFunction, borrow: IrBorrowFacts, facts: PipelineIrSemanticFactList) -> IrBorrowFacts {
@@ -43684,7 +43761,7 @@ fn pipeline_ir_borrow_values_complete_handler_clauses(clauses: IrHandlerClauseBo
     IrHandlerClauseBodyNil -> 1
     IrHandlerClauseBodyCons(body, rest) -> {
       let valid = match body {
-        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_borrow_values_complete_blocks(blocks, blocks, values)
+        IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> pipeline_ir_borrow_values_complete_blocks(blocks, pipeline_ir_borrow_block_param_map(blocks), values)
         IrHandlerClauseBodyInvalid(reason) -> 1
       }
       if valid != 1 { 0 } else { pipeline_ir_borrow_values_complete_handler_clauses(rest, values) }
@@ -43694,7 +43771,7 @@ fn pipeline_ir_borrow_values_complete_handler_clauses(clauses: IrHandlerClauseBo
 
 fn pipeline_ir_borrow_values_complete_deferred_body(body: IrDeferredHandlerBody, values: IrBorrowValueFactList) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_borrow_values_complete_blocks(blocks, blocks, values)
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_borrow_values_complete_blocks(blocks, pipeline_ir_borrow_block_param_map(blocks), values)
     IrDeferredHandlerBodyInvalid(reason) -> 1
   }
 }
@@ -43753,7 +43830,7 @@ fn pipeline_ir_borrow_values_complete_jump(args: IrValueList, params: IrValueLis
   }
 }
 
-fn pipeline_ir_borrow_values_complete_blocks(blocks: IrBlockList, all_blocks: IrBlockList, values: IrBorrowValueFactList) -> i64 {
+fn pipeline_ir_borrow_values_complete_blocks(blocks: IrBlockList, param_map: PipelineIrBorrowBlockParamIndex, values: IrBorrowValueFactList) -> i64 {
   match blocks {
     IrBlockListNil -> 1
     IrBlockListCons(block, rest) -> {
@@ -43762,13 +43839,13 @@ fn pipeline_ir_borrow_values_complete_blocks(blocks: IrBlockList, all_blocks: Ir
           if pipeline_ir_borrow_values_complete_insts(insts, values) != 1 { 0 }
           else {
             match term {
-              IrTermJump(target, args) -> pipeline_ir_borrow_values_complete_jump(args, ir_block_list_params_for_id(all_blocks, target), values)
+              IrTermJump(target, args) -> pipeline_ir_borrow_values_complete_jump(args, pipeline_ir_borrow_block_params_for_id(param_map, target), values)
               _ -> 1
             }
           }
         }
       }
-      if valid != 1 { 0 } else { pipeline_ir_borrow_values_complete_blocks(rest, all_blocks, values) }
+      if valid != 1 { 0 } else { pipeline_ir_borrow_values_complete_blocks(rest, param_map, values) }
     }
   }
 }
@@ -43782,7 +43859,7 @@ fn pipeline_ir_semantic_borrow_values_first_incomplete_hash_or(functions: IrFunc
           let fact = pipeline_ir_semantic_fact_find(facts, hash)
           if fact != 0 {
             let borrow = pipeline_ir_semantic_borrow_fact_find(facts, hash)
-            if pipeline_ir_borrow_values_complete_blocks(blocks, blocks, ir_borrow_facts_values(borrow)) != 1 { hash }
+            if pipeline_ir_borrow_values_complete_blocks(blocks, pipeline_ir_borrow_block_param_map(blocks), ir_borrow_facts_values(borrow)) != 1 { hash }
             else { pipeline_ir_semantic_borrow_values_first_incomplete_hash_or(rest, facts, default) }
           } else { pipeline_ir_semantic_borrow_values_first_incomplete_hash_or(rest, facts, default) }
         }
