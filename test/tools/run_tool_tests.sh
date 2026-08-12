@@ -1409,6 +1409,20 @@ fi
 assert_contains "compile_emission_error_reports_missing_runtime_fn" "$emit_fail_err" "required runtime function unavailable"
 assert_equals "compile_emission_error_writes_no_binary" "$(wc -c < "$tmp_outside_dir/emit_fail.bin" | tr -d ' ')" "0"
 
+# The authoritative Mach-O fixture must emit a signed, runnable nested binary.
+run_weft_compile_guarded "$WEFT" compile test/emit_test.weft > "$tmp_bin" 2>"$tmp_err"
+chmod +x "$tmp_bin"
+run_binary_guarded "$tmp_bin" > "$tmp_out" 2>"$tmp_err"
+assert_contains "signed_emitter_writes_macho" "$(/usr/bin/file -b "$tmp_out")" "Mach-O 64-bit executable arm64"
+codesign -v "$tmp_out"
+echo "  ok signed_emitter_embeds_valid_signature"
+chmod +x "$tmp_out"
+set +e
+run_binary_guarded "$tmp_out" >/dev/null 2>"$tmp_err"
+signed_emitter_exit=$?
+set -e
+assert_equals "signed_emitter_nested_binary_exits_42" "$signed_emitter_exit" "42"
+
 : > "$tmp_src"
 for ((i = 0; i < 1800; i++)); do
   printf 'test "t%d" { Test.assert_eq(1, 1) }\n' "$i" >> "$tmp_src"
@@ -1421,4 +1435,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 354 passed, 0 failed"
+echo "Tool boundary summary: 357 passed, 0 failed"
