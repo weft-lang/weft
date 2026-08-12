@@ -62,10 +62,6 @@ counters:
     echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"use \"compiler/main.weft\""}}}' | "$bin" mcp
     echo ""
 
-# Run the full self-hosting test suite
-selfhost:
-    bash test_self_host.sh
-
 # Run benchmarks and record results
 bench:
     bash bench.sh
