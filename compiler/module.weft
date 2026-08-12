@@ -199,6 +199,55 @@ fn module_fact_decl_at(tt: i64, index: i64) -> i64 { nlist_get(module_fact_decls
 fn module_fact_import_at(tt: i64, index: i64) -> i64 { nlist_get(module_fact_imports(tt), index) }
 fn module_fact_scope_at(tt: i64, index: i64) -> i64 { nlist_get(module_fact_scopes(tt), index) }
 
+-- The declaration and scope registries are producer-owned nlists. Their
+-- otherwise-unused cache word carries a hash tree whose leaves own collision
+-- buckets; equality is always rechecked against the complete semantic key.
+-- This keeps hashes as accelerators only and preserves DeclId/scope identity
+-- under adversarial collisions.
+fn module_fact_index_find_node(tree: i64, key: i64) -> i64 {
+  let mut current = tree
+  let mut result = 0
+  while current != 0 and result == 0 {
+    let current_key = node_f1(current)
+    if key == current_key { result = current }
+    else { if key < current_key { current = node_f3(current) } else { current = node_f4(current) } }
+  }
+  result
+}
+
+fn module_fact_index_insert(tree: i64, key: i64, entry: i64) -> i64 {
+  let existing = module_fact_index_find_node(tree, key)
+  if existing != 0 {
+    nlist_add(node_f2(existing), entry)
+    tree
+  } else {
+    let bucket = nlist_new_capacity(1)
+    nlist_add(bucket, entry)
+    let leaf = node_new(0, key, bucket, 0, 0)
+    if tree == 0 { leaf }
+    else {
+      let mut current = tree
+      let mut done = 0
+      while done == 0 {
+        if key < node_f1(current) {
+          if node_f3(current) == 0 { mem_store64_at(current, 24, leaf) done = 1 }
+          else { current = node_f3(current) }
+        } else {
+          if node_f4(current) == 0 { mem_store64_at(current, 32, leaf) done = 1 }
+          else { current = node_f4(current) }
+        }
+      }
+      tree
+    }
+  }
+}
+
+fn module_fact_index_add(registry: i64, key: i64, entry: i64) -> i64 {
+  let root = mem_load64_at(registry, 24)
+  mem_store64_at(registry, 24, module_fact_index_insert(root, key, entry))
+  entry
+}
+
 -- Declaration entry: module entry, owner declaration entry, namespace,
 -- absolute name ptr, name len, visibility, source span, derived native key,
 -- bootstrap function-pair bridge = 72 bytes. The last two fields are derived
@@ -215,7 +264,12 @@ fn module_decl_fact_register(tt: i64, src: i64, owner: i64, namespace: i64, name
   mem_store64_at(entry + 48, 0, src + name_start)
   mem_store64_at(entry + 56, 0, 0)
   mem_store64_at(entry + 64, 0, 0)
-  nlist_add(module_fact_decls(tt), entry)
+  let decls = module_fact_decls(tt)
+  nlist_add(decls, entry)
+  -- The legacy module-wide query intentionally sees owned members as well as
+  -- roots; exact member consumers additionally query by owner DeclId.
+  module_fact_index_add(decls, module_decl_fact_lookup_key(module_entry, 0, namespace, src + name_start, name_len), entry)
+  if owner != 0 { module_fact_index_add(decls, module_decl_fact_lookup_key(0, owner, namespace, src + name_start, name_len), entry) } else { 0 }
   entry
 }
 
@@ -235,30 +289,40 @@ fn module_decl_fact_name_eq(entry: i64, namespace: i64, name_src: i64, name_star
   else { src_eq_at(mem_load64_at(entry + 24, 0), 0, name_src + name_start, 0, name_len) } }
 }
 
+fn module_decl_fact_lookup_key(module_entry: i64, owner: i64, namespace: i64, name_ptr: i64, name_len: i64) -> i64 {
+  let identity = if owner != 0 { owner } else { module_entry }
+  module_identity_hash(name_ptr, name_len, identity * 131 + namespace * 17)
+}
+
+fn module_decl_fact_find_indexed(tt: i64, module_entry: i64, owner: i64, namespace: i64, name_src: i64, name_start: i64, name_len: i64) -> i64 {
+  let decls = module_fact_decls(tt)
+  let key = module_decl_fact_lookup_key(module_entry, owner, namespace, name_src + name_start, name_len)
+  let indexed = module_fact_index_find_node(mem_load64_at(decls, 24), key)
+  if indexed == 0 { 0 }
+  else {
+    let bucket = node_f2(indexed)
+    let mut i = 0
+    let mut result = 0
+    while i < nlist_len(bucket) and result == 0 {
+      let entry = nlist_get(bucket, i)
+      let identity_ok = if owner != 0 { module_decl_fact_owner(entry) == owner }
+        else { module_decl_fact_module(entry) == module_entry }
+      if identity_ok and module_decl_fact_name_eq(entry, namespace, name_src, name_start, name_len) == 1 { result = entry }
+      else { i = i + 1 }
+    }
+    result
+  }
+}
+
 fn module_decl_fact_find(tt: i64, src: i64, namespace: i64, name_src: i64, name_start: i64, name_len: i64) -> i64 {
   let module_entry = module_fact_find_source(tt, src)
-  let decls = module_fact_decls(tt)
-  let mut i = 0
-  let mut result = 0
-  while i < nlist_len(decls) and result == 0 {
-    let entry = nlist_get(decls, i)
-    if mem_load64_at(entry, 0) == module_entry and module_decl_fact_name_eq(entry, namespace, name_src, name_start, name_len) == 1 {
-      result = entry
-    } else { i = i + 1 }
-  }
-  result
+  if module_entry == 0 { 0 }
+  else { module_decl_fact_find_indexed(tt, module_entry, 0, namespace, name_src, name_start, name_len) }
 }
 
 fn module_decl_fact_find_member(tt: i64, owner: i64, namespace: i64, name_src: i64, name_start: i64, name_len: i64) -> i64 {
-  let decls = module_fact_decls(tt)
-  let mut i = 0
-  let mut result = 0
-  while i < nlist_len(decls) and result == 0 {
-    let entry = nlist_get(decls, i)
-    if module_decl_fact_owner(entry) == owner and module_decl_fact_name_eq(entry, namespace, name_src, name_start, name_len) == 1 { result = entry }
-    else { i = i + 1 }
-  }
-  result
+  if owner == 0 { 0 }
+  else { module_decl_fact_find_indexed(tt, 0, owner, namespace, name_src, name_start, name_len) }
 }
 
 fn module_decl_fact_find_visible_flat(tt: i64, preferred_src: i64, namespace: i64, name_src: i64, name_start: i64, name_len: i64) -> i64 {
@@ -426,17 +490,25 @@ fn module_scope_name_eq(entry: i64, module_entry: i64, name_ptr: i64, name_len: 
   else { src_eq_at(module_scope_entry_name_ptr(entry), 0, name_ptr, 0, name_len) } }
 }
 
+fn module_scope_lookup_key(module_entry: i64, name_ptr: i64, name_len: i64) -> i64 {
+  module_identity_hash(name_ptr, name_len, module_entry * 131)
+}
+
 fn module_scope_find_binding(tt: i64, module_entry: i64, name_ptr: i64, name_len: i64) -> i64 {
   let scopes = module_fact_scopes(tt)
-  let mut i = 0
-  let mut result = 0
-  while i < nlist_len(scopes) and result == 0 {
-    let entry = nlist_get(scopes, i)
-    if module_scope_entry_kind(entry) != module_scope_kind_issue() and module_scope_name_eq(entry, module_entry, name_ptr, name_len) == 1 {
-      result = entry
-    } else { i = i + 1 }
+  let indexed = module_fact_index_find_node(mem_load64_at(scopes, 24), module_scope_lookup_key(module_entry, name_ptr, name_len))
+  if indexed == 0 { 0 }
+  else {
+    let bucket = node_f2(indexed)
+    let mut i = 0
+    let mut result = 0
+    while i < nlist_len(bucket) and result == 0 {
+      let entry = nlist_get(bucket, i)
+      if module_scope_entry_kind(entry) != module_scope_kind_issue() and module_scope_name_eq(entry, module_entry, name_ptr, name_len) == 1 { result = entry }
+      else { i = i + 1 }
+    }
+    result
   }
-  result
 }
 
 fn module_scope_find_issue(tt: i64, module_entry: i64, name_ptr: i64, name_len: i64, status: i64) -> i64 {
@@ -471,7 +543,9 @@ fn module_scope_add_binding(tt: i64, module_entry: i64, name_ptr: i64, name_len:
   let existing = module_scope_find_binding(tt, module_entry, name_ptr, name_len)
   if existing == 0 {
     let entry = module_scope_new_entry(module_entry, name_ptr, name_len, kind, target, import_entry, visibility, module_scope_status_resolved())
-    nlist_add(module_fact_scopes(tt), entry)
+    let scopes = module_fact_scopes(tt)
+    nlist_add(scopes, entry)
+    module_fact_index_add(scopes, module_scope_lookup_key(module_entry, name_ptr, name_len), entry)
     entry
   } else {
     if module_scope_entry_kind(existing) == kind and module_scope_entry_target(existing) == target {
