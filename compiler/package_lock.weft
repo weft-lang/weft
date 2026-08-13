@@ -1,0 +1,327 @@
+-- compiler/package_lock.weft -- deterministic local package graph locking
+
+use compiler/lib.{*}
+use compiler/package.{*}
+use compiler/sha256.{sha256}
+use runtime/alloc.{*}
+use runtime/buffer.{*}
+use runtime/memory.{*}
+use runtime/string.{runtime_str_from_bytes_copy}
+use stdlib/dir.{*}
+use stdlib/json.{*}
+use stdlib/list.{*}
+use stdlib/option.{*}
+use stdlib/ord.{*}
+use stdlib/result.{*}
+use stdlib/string.{*}
+use stdlib/vector.{*}
+
+pub(package) type PackageContentEntry {
+  PackageContentEntry(str, str)
+}
+
+pub(package) type PackageLockEntry {
+  PackageLockEntry(str, str, str, str)
+}
+
+pub(package) fn pkg_content_entry(path: str, content: str) -> PackageContentEntry {
+  PackageContentEntry(path, content)
+}
+
+pub(package) fn pkg_content_entry_path(entry: PackageContentEntry) -> str {
+  match entry { PackageContentEntry(path, content) -> path }
+}
+
+pub(package) fn pkg_content_entry_compare(a: PackageContentEntry, b: PackageContentEntry) -> i64 {
+  ord_compare<str>(pkg_content_entry_path(a), pkg_content_entry_path(b))
+}
+
+pub(package) fn pkg_lock_entry_name(entry: PackageLockEntry) -> str {
+  match entry { PackageLockEntry(name, version, source, content) -> name }
+}
+
+pub(package) fn pkg_lock_entry_compare(a: PackageLockEntry, b: PackageLockEntry) -> i64 {
+  ord_compare<str>(pkg_lock_entry_name(a), pkg_lock_entry_name(b))
+}
+
+pub(package) fn pkg_lock_hex_digit(value: i64) -> i64 {
+  if value < 10 { 48 + value } else { 87 + value }
+}
+
+pub(package) fn pkg_lock_digest_hex(raw: i64) -> str {
+  let b = buf_new(71)
+  bstr(b, "sha256:")
+  for i in 0..32 {
+    let byte = mem_load8_at(raw, i)
+    bu8(b, pkg_lock_hex_digit(byte / 16))
+    bu8(b, pkg_lock_hex_digit(byte - byte / 16 * 16))
+  }
+  runtime_str_from_bytes_copy(buf_ptr(b), buf_len(b))
+}
+
+pub(package) fn pkg_content_digest(entries: Vector<PackageContentEntry>) -> str {
+  vector_sort_by<PackageContentEntry>(entries, pkg_content_entry_compare)
+  let bytes = buf_new(4096)
+  bstr(bytes, "weft-package-content-v1")
+  bu8(bytes, 0)
+  for i in 0..vector_len<PackageContentEntry>(entries) {
+    match vector_get_in_bounds<PackageContentEntry>(entries, i) {
+      PackageContentEntry(path, content) -> {
+        bu64(bytes, str_len(path))
+        bscopy(bytes, __str_ptr(path), str_len(path), 0)
+        bu64(bytes, str_len(content))
+        bscopy(bytes, __str_ptr(content), str_len(content), 0)
+      }
+    }
+  }
+  let out = alloc_zeroed(32)
+  sha256(buf_ptr(bytes), buf_len(bytes), out)
+  pkg_lock_digest_hex(out)
+}
+
+pub(package) fn pkg_lock_join_path(root: str, rel: str) -> str {
+  if str_len(rel) == 0 { root }
+  else { if str_len(root) == 0 or str_eq(root, ".") == 1 { rel }
+  else { if str_ends_with(root, "/") == 1 { str_concat(root, rel) }
+  else { str_concat(root, str_concat("/", rel)) } } }
+}
+
+pub(package) fn pkg_lock_join_rel(parent: str, name: str) -> str {
+  if str_len(parent) == 0 { name } else { str_concat(parent, str_concat("/", name)) }
+}
+
+pub(package) fn pkg_lock_path_pair(path: str) -> i64 {
+  let pair = alloc_words(2)
+  mem_store64_at(pair, 0, __str_ptr(path))
+  mem_store64_at(pair, 8, __str_len(path))
+  pair
+}
+
+pub(package) fn pkg_lock_directory_identity_add(identities: Vector<i64>, metadata: DirMetadata) -> i64 {
+  let mut i = 0
+  let mut duplicate = false
+  while i < vector_len<i64>(identities) and duplicate == false {
+    if vector_get_in_bounds<i64>(identities, i) == metadata.device and vector_get_in_bounds<i64>(identities, i + 1) == metadata.inode {
+      duplicate = true
+    } else { i = i + 2 }
+  }
+  if duplicate { 0 }
+  else {
+    vector_push<i64>(identities, metadata.device)
+    vector_push<i64>(identities, metadata.inode)
+    1
+  }
+}
+
+pub(package) fn pkg_lock_rel_is_dependency_tree(manifest: i64, rel: str) -> i64 {
+  let deps = pkg_manifest_deps(manifest)
+  let mut i = 0
+  let mut found = 0
+  while i < nlist_len(deps) and found == 0 {
+    let dep = nlist_get(deps, i)
+    let dep_src = pkg_dep_src(dep)
+    let dep_path = pkg_str_view(dep_src + pkg_dep_path_start(dep), pkg_dep_path_len(dep))
+    if str_eq(rel, dep_path) == 1 { found = 1 }
+    else {
+      let prefix = str_concat(dep_path, "/")
+      if str_starts_with(rel, prefix) == 1 { found = 1 } else { i = i + 1 }
+    }
+  }
+  found
+}
+
+pub(package) fn pkg_lock_should_skip_dir(name: str) -> i64 {
+  if str_eq(name, ".git") == 1 or str_eq(name, ".weft") == 1 { 1 } else { 0 }
+}
+
+pub(package) fn pkg_lock_collect_source_entries(root: str, manifest: i64, out: Vector<PackageContentEntry>) -[Dir]> i64 {
+  let pending = vector_new<str>()
+  let identities = vector_new<i64>()
+  vector_push<str>(pending, "")
+  match Dir.stat(root) {
+    Err(error) -> error
+    Ok(root_metadata) -> {
+      if root_metadata.exists == false or dir_kind_code(root_metadata.kind) != 2 { 2 }
+      else {
+        pkg_lock_directory_identity_add(identities, root_metadata)
+        let mut index = 0
+        let mut failure = 0
+        while index < vector_len<str>(pending) and failure == 0 {
+          let rel_dir = vector_get_in_bounds<str>(pending, index)
+          let dir = pkg_lock_join_path(root, rel_dir)
+          match Dir.list(dir) {
+            Err(error) -> {
+              failure = error
+              0
+            }
+            Ok(entries) -> {
+              vector_sort<str>(entries)
+              for i in 0..vector_len<str>(entries) {
+                let name = vector_get_in_bounds<str>(entries, i)
+                let rel = pkg_lock_join_rel(rel_dir, name)
+                if pkg_lock_rel_is_dependency_tree(manifest, rel) == 0 {
+                  let path = pkg_lock_join_path(root, rel)
+                  match Dir.stat(path) {
+                    Err(error) -> {
+                      failure = error
+                      0
+                    }
+                    Ok(metadata) -> {
+                      if metadata.exists and dir_kind_code(metadata.kind) == 2 and pkg_lock_should_skip_dir(name) == 0 {
+                        if pkg_lock_directory_identity_add(identities, metadata) == 1 { vector_push<str>(pending, rel) } else { 0 }
+                      } else { if metadata.exists and dir_kind_code(metadata.kind) == 1 and (str_eq(rel, "weft.pkg") == 1 or str_ends_with(rel, ".weft") == 1) {
+                        let file = read_file(pkg_lock_path_pair(path))
+                        vector_push<PackageContentEntry>(out, pkg_content_entry(rel, pkg_str_view(mem_load64_at(file, 0), mem_load64_at(file, 8))))
+                      } else { 0 } }
+                      0
+                    }
+                  }
+                } else { 0 }
+              }
+              vector_sort<str>(pending)
+              0
+            }
+          }
+          index = index + 1
+        }
+        failure
+      }
+    }
+  }
+}
+
+pub(package) fn pkg_lock_entry_find(entries: Vector<PackageLockEntry>, name: str) -> i64 {
+  let mut i = 0
+  let mut found = 0 - 1
+  while i < vector_len<PackageLockEntry>(entries) and found < 0 {
+    if str_eq(pkg_lock_entry_name(vector_get_in_bounds<PackageLockEntry>(entries, i)), name) == 1 { found = i }
+    else { i = i + 1 }
+  }
+  found
+}
+
+pub(package) fn pkg_lock_entry_identity_equal(entry: PackageLockEntry, version: str, source: str, content: str) -> i64 {
+  match entry {
+    PackageLockEntry(name, old_version, old_source, old_content) -> {
+      if str_eq(old_version, version) == 1 and str_eq(old_source, source) == 1 and str_eq(old_content, content) == 1 { 1 } else { 0 }
+    }
+  }
+}
+
+-- Status: 0 success, 1 manifest, 2 key/name mismatch,
+-- 3 identity conflict, 4 dependency cycle, 5 source traversal.
+pub(package) fn pkg_lock_collect_package(root: str, expected_name: str, source: str, entries: Vector<PackageLockEntry>, stack: Vector<str>) -[Dir]> i64 {
+  let manifest = pkg_manifest_load_at_root(__str_ptr(root), __str_len(root))
+  if pkg_manifest_error_count(manifest) > 0 or pkg_manifest_package_len(manifest) <= 0 { 1 }
+  else {
+    let name = pkg_str_view(pkg_manifest_package_start(manifest), pkg_manifest_package_len(manifest))
+    if str_len(expected_name) > 0 and str_eq(name, expected_name) == 0 { 2 }
+    else { if vector_contains<str>(stack, name) == 1 { 4 }
+    else {
+      let files = vector_new<PackageContentEntry>()
+      let file_status = pkg_lock_collect_source_entries(root, manifest, files)
+      if file_status != 0 { 5 }
+      else {
+        let version = pkg_str_view(pkg_manifest_version_ptr(manifest), pkg_manifest_version_len(manifest))
+        let content = pkg_content_digest(files)
+        let existing_index = pkg_lock_entry_find(entries, name)
+        if existing_index >= 0 {
+          if pkg_lock_entry_identity_equal(vector_get_in_bounds<PackageLockEntry>(entries, existing_index), version, source, content) == 1 { 0 } else { 3 }
+        } else {
+          vector_push<PackageLockEntry>(entries, PackageLockEntry(name, version, source, content))
+          vector_push<str>(stack, name)
+          let deps = pkg_manifest_deps(manifest)
+          let mut i = 0
+          let mut failure = 0
+          while i < nlist_len(deps) and failure == 0 {
+            let dep = nlist_get(deps, i)
+            let dep_src = pkg_dep_src(dep)
+            let dep_name = pkg_str_view(dep_src + pkg_dep_name_start(dep), pkg_dep_name_len(dep))
+            let dep_rel = pkg_str_view(dep_src + pkg_dep_path_start(dep), pkg_dep_path_len(dep))
+            let dep_root = pkg_lock_join_path(root, dep_rel)
+            let dep_source = str_concat("path:", dep_root)
+            failure = pkg_lock_collect_package(dep_root, dep_name, dep_source, entries, stack)
+            i = i + 1
+          }
+          vector_pop<str>(stack)
+          failure
+        }
+      }
+    } }
+  }
+}
+
+pub(package) fn pkg_lock_entry_json(entry: PackageLockEntry) -> Json {
+  match entry {
+    PackageLockEntry(name, version, source, content) -> json_object(
+      list_cons<JsonEntry>(json_entry("name", json_string(name)),
+      list_cons<JsonEntry>(json_entry("version", json_string(version)),
+      list_cons<JsonEntry>(json_entry("source", json_string(source)),
+      list_cons<JsonEntry>(json_entry("content", json_string(content)), list_nil<JsonEntry>()))))
+    )
+  }
+}
+
+pub(package) fn pkg_lock_to_json(entries: Vector<PackageLockEntry>) -> Json {
+  vector_sort_by<PackageLockEntry>(entries, pkg_lock_entry_compare)
+  let mut packages: List<Json> = list_nil<Json>()
+  let mut i = vector_len<PackageLockEntry>(entries) - 1
+  while i >= 0 {
+    packages = list_cons<Json>(pkg_lock_entry_json(vector_get_in_bounds<PackageLockEntry>(entries, i)), packages)
+    i = i - 1
+  }
+  json_object(
+    list_cons<JsonEntry>(json_entry("lock_version", json_number(1)),
+    list_cons<JsonEntry>(json_entry("manifest_version", json_number(1)),
+    list_cons<JsonEntry>(json_entry("weft", json_string("0.1")),
+    list_cons<JsonEntry>(json_entry("packages", json_array(packages)), list_nil<JsonEntry>()))))
+  )
+}
+
+pub(package) fn pkg_lock_render_into(buf: i64, entries: Vector<PackageLockEntry>) -> i64 {
+  bstr(buf, json_stringify(pkg_lock_to_json(entries)))
+  bu8(buf, 10)
+  buf_len(buf)
+}
+
+pub(package) fn pkg_lock_file_path() -> i64 {
+  let path = alloc_words(2)
+  mem_store64_at(path, 0, __str_ptr("weft.lock"))
+  mem_store64_at(path, 8, __str_len("weft.lock"))
+  path
+}
+
+pub(package) fn pkg_lock_temp_file_path() -> i64 {
+  let path = alloc_words(2)
+  mem_store64_at(path, 0, __str_ptr("weft.lock.tmp"))
+  mem_store64_at(path, 8, __str_len("weft.lock.tmp"))
+  path
+}
+
+pub(package) fn pkg_cli_lock() -[Dir]> i64 {
+  let entries = vector_new<PackageLockEntry>()
+  let stack = vector_new<str>()
+  let status = pkg_lock_collect_package(".", "", "path:.", entries, stack)
+  if status != 0 {
+    if status == 2 { pkg_stderr("pkg: dependency key does not match package name\n") }
+    else { if status == 3 { pkg_stderr("pkg: package identity conflict in dependency graph\n") }
+    else { if status == 4 { pkg_stderr("pkg: package dependency cycle\n") }
+    else { if status == 5 { pkg_stderr("pkg: could not traverse package source tree\n") }
+    else { pkg_stderr("pkg: malformed or missing package manifest\n") } } } }
+    1
+  } else {
+    let b = buf_new(1024)
+    pkg_lock_render_into(b, entries)
+    if pkg_write_file(pkg_lock_temp_file_path(), buf_ptr(b), buf_len(b)) != 0 {
+      pkg_stderr("pkg: could not write weft.lock\n")
+      1
+    } else { if Dir.rename("weft.lock.tmp", "weft.lock") != 0 {
+      Dir.remove("weft.lock.tmp")
+      pkg_stderr("pkg: could not replace weft.lock\n")
+      1
+    } else {
+      pkg_stdout("pkg: wrote weft.lock\n")
+      0
+    } }
+  }
+}
