@@ -1008,6 +1008,51 @@ lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_open_local")" "$(lsp_frame "$lsp_lo
 assert_contains "lsp_hover_local" "$lsp_out" '"value":"local value: i64"'
 assert_contains "lsp_definition_local" "$lsp_out" '"range":{"start":{"line":0,"character":23},"end":{"line":0,"character":28}}'
 
+lsp_pattern_before='fn main(value: ((i64, str), i64)) -> i64 { let ((left, '
+lsp_pattern_middle='label), right) = value __str_len('
+lsp_pattern_after='label) + left + right }'
+lsp_pattern_source="${lsp_pattern_before}${lsp_pattern_middle}${lsp_pattern_after}"
+lsp_pattern_def=$((${#lsp_pattern_before}))
+lsp_pattern_use=$((${#lsp_pattern_before} + ${#lsp_pattern_middle}))
+lsp_open_pattern="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///pattern.weft\",\"version\":1,\"text\":\"$lsp_pattern_source\"}}}"
+lsp_pattern_hover="{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///pattern.weft\"},\"position\":{\"line\":0,\"character\":$lsp_pattern_use}}}"
+lsp_pattern_definition="{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"file:///pattern.weft\"},\"position\":{\"line\":0,\"character\":$lsp_pattern_use}}}"
+lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_open_pattern")" "$(lsp_frame "$lsp_pattern_hover")" "$(lsp_frame "$lsp_pattern_definition")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_hover_recursive_pattern_binding" "$lsp_out" '"value":"pattern binding label: str"'
+assert_contains "lsp_definition_recursive_pattern_binding" "$lsp_out" "\"character\":$lsp_pattern_def},\"end\":{\"line\":0,\"character\":$((lsp_pattern_def + 5))}"
+
+lsp_module_prefix='use module_fixtures/g2_function_left.{work} fn main(value: i64) -> i64 { value + '
+lsp_module_source="${lsp_module_prefix}work() }"
+lsp_module_work=$((${#lsp_module_prefix}))
+lsp_open_module_symbols="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///Users/chris/Projects/weft/lsp-root.weft\",\"version\":1,\"text\":\"$lsp_module_source\"}}}"
+lsp_module_definition="{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"file:///Users/chris/Projects/weft/lsp-root.weft\"},\"position\":{\"line\":0,\"character\":$lsp_module_work}}}"
+lsp_module_completion="{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"file:///Users/chris/Projects/weft/lsp-root.weft\"},\"position\":{\"line\":0,\"character\":$lsp_module_work}}}"
+lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_open_module_symbols")" "$(lsp_frame "$lsp_module_definition")" "$(lsp_frame "$lsp_module_completion")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_definition_crosses_import" "$lsp_out" '"uri":"file:///Users/chris/Projects/weft/module_fixtures/g2_function_left.weft"'
+assert_contains "lsp_definition_cross_import_range" "$lsp_out" '"start":{"line":0,"character":7},"end":{"line":0,"character":11}'
+assert_contains "lsp_completion_includes_visible_import" "$lsp_out" '"label":"work","kind":3,"detail":"() -> i64"'
+assert_contains "lsp_completion_includes_lexical_parameter" "$lsp_out" '"label":"value","kind":6,"detail":"i64"'
+assert_not_contains "lsp_completion_excludes_private_import_member" "$lsp_out" '"label":"hidden"'
+
+lsp_field_prefix='fn main(point: {x: i64, y: str}) -> i64 { point.'
+lsp_field_source="${lsp_field_prefix}x }"
+lsp_field_pos=$((${#lsp_field_prefix}))
+lsp_open_field="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///field.weft\",\"version\":1,\"text\":\"$lsp_field_source\"}}}"
+lsp_field_completion="{\"jsonrpc\":\"2.0\",\"id\":45,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"file:///field.weft\"},\"position\":{\"line\":0,\"character\":$lsp_field_pos}}}"
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_field")" "$(lsp_frame "$lsp_field_completion")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_completion_structural_field_i64" "$lsp_out" '"label":"x","kind":5,"detail":"i64"'
+assert_contains "lsp_completion_structural_field_str" "$lsp_out" '"label":"y","kind":5,"detail":"str"'
+assert_not_contains "lsp_completion_field_mode_excludes_keywords" "$lsp_out" '"label":"handle"'
+
+lsp_nominal_field_prefix='type LspPoint { x: i64, y: str } fn main(point: LspPoint) -> i64 { point.'
+lsp_nominal_field_source="${lsp_nominal_field_prefix}x }"
+lsp_nominal_field_pos=$((${#lsp_nominal_field_prefix}))
+lsp_open_nominal_field="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///nominal-field.weft\",\"version\":1,\"text\":\"$lsp_nominal_field_source\"}}}"
+lsp_nominal_field_completion="{\"jsonrpc\":\"2.0\",\"id\":46,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"file:///nominal-field.weft\"},\"position\":{\"line\":0,\"character\":$lsp_nominal_field_pos}}}"
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_nominal_field")" "$(lsp_frame "$lsp_nominal_field_completion")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_completion_nominal_bridge_field_i64" "$lsp_out" '"label":"x","kind":5,"detail":"i64"'
+assert_contains "lsp_completion_nominal_bridge_field_str" "$lsp_out" '"label":"y","kind":5,"detail":"str"'
+
 lsp_unknown_hover='{"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///missing.weft"},"position":{"line":0,"character":0}}}'
 lsp_out=$(lsp_frame "$lsp_unknown_hover" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_unknown_file_hover_null" "$lsp_out" '"result":null'
@@ -1038,7 +1083,7 @@ assert_contains "lsp_slow_writer_definition" "$lsp_out" '"range":{"start":{"line
 
 lsp_completion='{"jsonrpc":"2.0","id":7,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///hover.weft"},"position":{"line":0,"character":1}}}'
 lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_hover")" "$(lsp_frame "$lsp_completion")" | "$WEFT" lsp 2>&1)
-assert_contains "lsp_completion_hook_items" "$lsp_out" '"label":"par_map"'
+assert_contains "lsp_completion_hook_items" "$lsp_out" '"label":"add","kind":3,"detail":"(i64) -> i64"'
 
 lsp_code_action='{"jsonrpc":"2.0","id":8,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///hover.weft"},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"context":{"diagnostics":[]}}}'
 lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_hover")" "$(lsp_frame "$lsp_code_action")" | "$WEFT" lsp 2>&1)
@@ -1839,4 +1884,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 391 passed, 0 failed"
+echo "Tool boundary summary: 403 passed, 0 failed"
