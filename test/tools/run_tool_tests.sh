@@ -1065,11 +1065,26 @@ echo "  ok package_local_dep_import_compiles"
 mkdir -p "$tmp_pkg_dir/.weft/cache/math"
 printf 'pub fn cached_value() -> i64 { 1 }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
 printf 'pub fn cached_value() -> i64 { 42 }\n' > "$tmp_pkg_dir/.weft/cache/math/lib.weft"
-printf 'use math/lib.{*}\nfn main() -> i64 { if cached_value() == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_dir/app.weft"
+printf 'use math/lib.{*}\nfn main() -> i64 { if cached_value() == 1 { 0 } else { 1 } }\n' > "$tmp_pkg_dir/app.weft"
 (cd "$tmp_pkg_dir" && run_weft_compile_guarded "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
 chmod +x "$tmp_pkg_dir/app"
 run_binary_guarded "$tmp_pkg_dir/app"
-echo "  ok package_cache_hit_prefers_cached_file"
+echo "  ok package_live_path_dep_ignores_cache_shadow"
+
+printf 'pub fn public_value() -> i64 { 42 }\npub(package) fn package_value() -> i64 { 7 }\nfn private_value() -> i64 { 9 }\n' > "$tmp_pkg_dir/deps/math/visibility.weft"
+printf 'use math/visibility.{public_value}\nfn main() -> i64 { if public_value() == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_dir/app.weft"
+(cd "$tmp_pkg_dir" && run_weft_compile_guarded "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
+chmod +x "$tmp_pkg_dir/app"
+run_binary_guarded "$tmp_pkg_dir/app"
+echo "  ok package_public_member_crosses_dependency_boundary"
+
+printf 'use math/visibility.{package_value}\nfn main() -> i64 { package_value() }\n' > "$tmp_pkg_dir/app.weft"
+package_visible_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
+assert_contains "package_package_member_stays_inside_dependency" "$package_visible_out" "error[E4004]: module member 'package_value' is not visible in this import"
+
+printf 'use math/visibility.{private_value}\nfn main() -> i64 { private_value() }\n' > "$tmp_pkg_dir/app.weft"
+package_private_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
+assert_contains "package_private_member_stays_inside_dependency_module" "$package_private_out" "error[E4004]: module member 'private_value' is not visible in this import"
 
 outside_name=$(basename "$tmp_outside_dir")
 printf 'fn hidden() -> i64 { 0 }\n' > "$tmp_outside_dir/lib.weft"
