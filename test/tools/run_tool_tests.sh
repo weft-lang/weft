@@ -295,6 +295,34 @@ fmt_path_out=$("$WEFT" fmt "$tmp_src" 2>"$tmp_err")
 assert_equals "fmt_path_snapshot_exact" "$fmt_path_out" "fn main() -> i64 { 42 }"
 assert_equals "fmt_path_stderr_empty" "$(<"$tmp_err")" ""
 
+printf '%s\n' '-- leading  text' 'fn   main ( )  ->  i64   {  42  } -- trailing  text' > "$tmp_src"
+"$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+assert_equals "fmt_canonical_horizontal_gaps_and_comments" "$(<"$tmp_out")" $'-- leading  text\nfn main() -> i64 { 42 } -- trailing  text'
+"$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
+assert_files_equal "fmt_canonical_horizontal_idempotent" "$tmp_bin" "$tmp_out"
+"$WEFT" compile < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+"$WEFT" compile < "$tmp_out" > "$tmp_tool_obj" 2>"$tmp_err"
+chmod +x "$tmp_bin" "$tmp_tool_obj"
+set +e
+run_binary_guarded "$tmp_bin" >/dev/null 2>"$tmp_err"
+fmt_original_status=$?
+run_binary_guarded "$tmp_tool_obj" >/dev/null 2>"$tmp_err"
+fmt_formatted_status=$?
+set -e
+assert_equals "fmt_canonical_native_equivalent" "$fmt_original_status:$fmt_formatted_status" "42:42"
+
+printf 'fn   value ( ) -> str {  "a\\n\\\"b"  }\n' > "$tmp_src"
+fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
+assert_equals "fmt_preserves_literal_spelling" "$fmt_out" 'fn value() -> str { "a\n\"b" }'
+
+printf 'fn main() -> i64 { let x = 41;  x + 1 }\n' > "$tmp_src"
+fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
+assert_equals "fmt_preserves_explicit_semicolon" "$fmt_out" 'fn main() -> i64 { let x = 41; x + 1 }'
+
+printf 'fn main() -> i64 {\n  let x = 41\n  x + 1\n}\n' > "$tmp_src"
+"$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+assert_files_equal "fmt_preserves_inserted_semicolon_newlines" "$tmp_out" "$tmp_src"
+
 "$WEFT" fmt compiler/main.weft > "$tmp_out" 2>"$tmp_err"
 assert_files_equal "fmt_lossless_compiler_surface" "$tmp_out" "compiler/main.weft"
 assert_equals "fmt_lossless_compiler_stderr_empty" "$(<"$tmp_err")" ""
@@ -2145,4 +2173,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 480 passed, 0 failed"
+echo "Tool boundary summary: 486 passed, 0 failed"
