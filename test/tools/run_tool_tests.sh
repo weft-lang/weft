@@ -1077,6 +1077,35 @@ lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_bad_tuple")" "$(lsp_frame "$lsp_
 assert_contains "lsp_unknown_tuple_position_diagnostic" "$lsp_out" 'type error: unknown tuple position'
 assert_contains "lsp_unknown_tuple_position_has_no_hover" "$lsp_out" '"id":70,"result":null'
 
+lsp_match_before_first='fn main(value: str | nil) -> i64 { match value { '
+lsp_match_first_arm='text: str if __str_len(text) > 3 -> 1, '
+lsp_match_second_arm='text: str -> 2, '
+lsp_match_nil_arm='nil -> 3 } }'
+lsp_match_source="${lsp_match_before_first}${lsp_match_first_arm}${lsp_match_second_arm}${lsp_match_nil_arm}"
+lsp_match_first=${#lsp_match_before_first}
+lsp_match_second=$((${#lsp_match_before_first} + ${#lsp_match_first_arm}))
+lsp_match_nil=$((${#lsp_match_before_first} + ${#lsp_match_first_arm} + ${#lsp_match_second_arm}))
+lsp_open_match="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///match.weft\",\"version\":1,\"text\":\"$lsp_match_source\"}}}"
+lsp_match_first_hover="{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///match.weft\"},\"position\":{\"line\":0,\"character\":$lsp_match_first}}}"
+lsp_match_second_hover="{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///match.weft\"},\"position\":{\"line\":0,\"character\":$lsp_match_second}}}"
+lsp_match_nil_hover="{\"jsonrpc\":\"2.0\",\"id\":73,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///match.weft\"},\"position\":{\"line\":0,\"character\":$lsp_match_nil}}}"
+lsp_match_definition="{\"jsonrpc\":\"2.0\",\"id\":74,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"file:///match.weft\"},\"position\":{\"line\":0,\"character\":$lsp_match_second}}}"
+lsp_out=$(printf '%s%s%s%s%s' "$(lsp_frame "$lsp_open_match")" "$(lsp_frame "$lsp_match_first_hover")" "$(lsp_frame "$lsp_match_second_hover")" "$(lsp_frame "$lsp_match_nil_hover")" "$(lsp_frame "$lsp_match_definition")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_typed_match_source_is_clean" "$lsp_out" '"diagnostics":[]'
+assert_contains "lsp_hover_guarded_match_arm_teaches_residual_rule" "$lsp_out" '"value":"match arm: narrowed str; residual after guarded arm str | nil (guards do not subtract)"'
+assert_contains "lsp_hover_typed_match_arm_shows_residual" "$lsp_out" '"value":"match arm: narrowed str; residual after arm nil"'
+assert_contains "lsp_hover_nil_match_arm_shows_empty_residual" "$lsp_out" '"value":"match arm: narrowed nil; residual after arm never"'
+assert_contains "lsp_match_arm_has_no_definition" "$lsp_out" '"id":74,"result":null'
+
+lsp_bad_match_before='fn main(value: str | nil) -> i64 { match value { '
+lsp_bad_match_source="${lsp_bad_match_before}number: i64 -> 0, nil -> 1 } }"
+lsp_bad_match_pos=${#lsp_bad_match_before}
+lsp_open_bad_match="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///bad-match.weft\",\"version\":1,\"text\":\"$lsp_bad_match_source\"}}}"
+lsp_bad_match_hover="{\"jsonrpc\":\"2.0\",\"id\":75,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///bad-match.weft\"},\"position\":{\"line\":0,\"character\":$lsp_bad_match_pos}}}"
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_bad_match")" "$(lsp_frame "$lsp_bad_match_hover")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_invalid_typed_match_diagnostic" "$lsp_out" 'typed match arm annotation is not part of the scrutinee type'
+assert_not_contains "lsp_invalid_typed_match_has_no_residual_fact" "$lsp_out" 'match arm:'
+
 lsp_effect_decl_prefix='effect LspState<S> { fn '
 lsp_effect_prefix='effect LspState<S> { fn get() -> S fn put(value: S) -> nil } fn read() -[LspState<i64>]> i64 { LspState.'
 lsp_effect_source="${lsp_effect_prefix}get() }"
@@ -1958,4 +1987,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 423 passed, 0 failed"
+echo "Tool boundary summary: 430 passed, 0 failed"
