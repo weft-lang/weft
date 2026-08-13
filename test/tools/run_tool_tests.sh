@@ -1094,6 +1094,15 @@ assert_contains "lsp_associated_type_source_is_clean" "$lsp_out" '"diagnostics":
 assert_contains "lsp_hover_resolves_associated_type" "$lsp_out" '"value":"associated type LspAssocBox.Item = [i64; 4]"'
 assert_contains "lsp_definition_associated_type_binding" "$lsp_out" "\"character\":$lsp_assoc_binding},\"end\":{\"line\":0,\"character\":$((lsp_assoc_binding + 4))}"
 
+lsp_missing_assoc_prefix='trait LspMissingAssoc { type Item fn get(self, value: Self.Item) -> Self.Item } type LspMissingBox { value: i64 } impl LspMissingAssoc for LspMissingBox { fn get(self, value: '
+lsp_missing_assoc_source="${lsp_missing_assoc_prefix}Self.Item) -> Self.Item { value } } fn main() -> i64 { 0 }"
+lsp_missing_assoc_use=${#lsp_missing_assoc_prefix}
+lsp_open_missing_assoc="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///missing-assoc.weft\",\"version\":1,\"text\":\"$lsp_missing_assoc_source\"}}}"
+lsp_missing_assoc_hover="{\"jsonrpc\":\"2.0\",\"id\":54,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///missing-assoc.weft\"},\"position\":{\"line\":0,\"character\":$lsp_missing_assoc_use}}}"
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_missing_assoc")" "$(lsp_frame "$lsp_missing_assoc_hover")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_missing_associated_binding_diagnostic" "$lsp_out" 'type error: impl missing required associated type'
+assert_contains "lsp_missing_associated_binding_has_no_hover_fact" "$lsp_out" '"id":54,"result":null'
+
 lsp_unknown_hover='{"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///missing.weft"},"position":{"line":0,"character":0}}}'
 lsp_out=$(lsp_frame "$lsp_unknown_hover" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_unknown_file_hover_null" "$lsp_out" '"result":null'
@@ -1925,4 +1934,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 413 passed, 0 failed"
+echo "Tool boundary summary: 415 passed, 0 failed"
