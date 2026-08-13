@@ -940,6 +940,7 @@ lsp_init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 lsp_out=$(lsp_frame "$lsp_init" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_initialize_framed_header" "$lsp_out" "Content-Length:"
 assert_contains "lsp_initialize_capabilities" "$lsp_out" '"hoverProvider":true'
+assert_contains "lsp_initialize_advertises_open_close" "$lsp_out" '"textDocumentSync":{"openClose":true,"change":1}'
 assert_contains "lsp_initialize_definition_capability" "$lsp_out" '"definitionProvider":true'
 assert_contains "lsp_initialize_completion_hook" "$lsp_out" '"completionProvider"'
 assert_contains "lsp_initialize_code_action_hook" "$lsp_out" '"codeActionProvider":true'
@@ -1175,6 +1176,67 @@ lsp_stale_change='{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"
 lsp_open_stale='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///stale.weft","version":2,"text":"fn main() -> i64 { 0 }"}}}'
 lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_stale")" "$(lsp_frame "$lsp_stale_change")" | "$WEFT" lsp 2>&1)
 assert_not_contains "lsp_stale_update_ignored" "$lsp_out" "type error: unknown identifier"
+
+# Active document graph: the dependency paths below deliberately do not exist
+# on disk. The shared resolver selects their normal module identities, while
+# the source registry overlays bytes supplied by didOpen/didChange.
+lsp_active_stem="_weft_lsp_active_$$_dep"
+lsp_active_module="module_fixtures/$lsp_active_stem"
+lsp_active_root_uri="file://$PWD/_weft_lsp_active_$$_root.weft"
+lsp_active_dep_uri="file://$PWD/$lsp_active_module.weft"
+lsp_active_root_prefix="use $lsp_active_module.{active_value} fn main() -> i64 { "
+lsp_active_root_source="${lsp_active_root_prefix}active_value() }"
+lsp_active_use=${#lsp_active_root_prefix}
+lsp_active_dep_source='pub fn active_value() -> i64 { 42 }'
+lsp_active_init="{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"initialize\",\"params\":{\"rootUri\":\"file://$PWD\"}}"
+lsp_active_open_root="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_root_uri\",\"version\":1,\"text\":\"$lsp_active_root_source\"}}}"
+lsp_active_open_dep="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_dep_uri\",\"version\":1,\"text\":\"$lsp_active_dep_source\"}}}"
+lsp_active_hover="{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_root_uri\"},\"position\":{\"line\":0,\"character\":$lsp_active_use}}}"
+lsp_active_definition="{\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_root_uri\"},\"position\":{\"line\":0,\"character\":$lsp_active_use}}}"
+lsp_active_change_bad="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_dep_uri\",\"version\":2},\"contentChanges\":[{\"text\":\"pub fn renamed() -> i64 { 0 }\"}]}}"
+lsp_active_change_good="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_dep_uri\",\"version\":3},\"contentChanges\":[{\"text\":\"$lsp_active_dep_source\"}]}}"
+lsp_active_change_stale="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_dep_uri\",\"version\":2},\"contentChanges\":[{\"text\":\"pub fn stale() -> i64 { 0 }\"}]}}"
+lsp_active_hover_after_stale="{\"jsonrpc\":\"2.0\",\"id\":83,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_root_uri\"},\"position\":{\"line\":0,\"character\":$lsp_active_use}}}"
+lsp_active_close_dep="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_dep_uri\"}}}"
+lsp_active_hover_closed="{\"jsonrpc\":\"2.0\",\"id\":84,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_dep_uri\"},\"position\":{\"line\":0,\"character\":7}}}"
+lsp_out=$(printf '%s%s%s%s%s%s%s%s%s%s%s' "$(lsp_frame "$lsp_active_init")" "$(lsp_frame "$lsp_active_open_root")" "$(lsp_frame "$lsp_active_open_dep")" "$(lsp_frame "$lsp_active_hover")" "$(lsp_frame "$lsp_active_definition")" "$(lsp_frame "$lsp_active_change_bad")" "$(lsp_frame "$lsp_active_change_good")" "$(lsp_frame "$lsp_active_change_stale")" "$(lsp_frame "$lsp_active_hover_after_stale")" "$(lsp_frame "$lsp_active_close_dep")" "$(lsp_frame "$lsp_active_hover_closed")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_active_graph_observes_missing_disk_module" "$lsp_out" 'type error: unknown function'
+assert_contains "lsp_active_graph_overlay_clears_importer" "$lsp_out" "\"uri\":\"$lsp_active_root_uri\",\"diagnostics\":[]"
+assert_contains "lsp_active_graph_publishes_dependency_clean" "$lsp_out" "\"uri\":\"$lsp_active_dep_uri\",\"diagnostics\":[]"
+assert_contains "lsp_active_graph_hover_uses_overlay" "$lsp_out" '"id":81,"result":{"contents":{"kind":"plaintext","value":"function active_value: () -> i64"'
+assert_contains "lsp_active_graph_definition_uses_overlay_uri" "$lsp_out" "\"id\":82,\"result\":{\"uri\":\"$lsp_active_dep_uri\""
+assert_contains "lsp_active_graph_definition_uses_overlay_range" "$lsp_out" '"start":{"line":0,"character":7},"end":{"line":0,"character":19}'
+assert_contains "lsp_active_graph_change_invalidates_importer" "$lsp_out" '"code":"E4002"'
+assert_equals "lsp_active_graph_stale_change_is_ignored" "$(printf '%s' "$lsp_out" | grep -o '"code":"E4002"' | wc -l | tr -d ' ')" "1"
+assert_contains "lsp_active_graph_good_version_survives_stale_change" "$lsp_out" '"id":83,"result":{"contents":{"kind":"plaintext","value":"function active_value: () -> i64"'
+assert_equals "lsp_active_graph_close_invalidates_importer" "$(printf '%s' "$lsp_out" | grep -o 'type error: unknown function' | wc -l | tr -d ' ')" "2"
+assert_contains "lsp_active_graph_close_clears_dependency" "$lsp_out" "\"uri\":\"$lsp_active_dep_uri\",\"diagnostics\":[]"
+assert_contains "lsp_active_graph_close_removes_document" "$lsp_out" '"id":84,"result":null'
+
+lsp_active_bad_dep='pub fn active_value() -> i64 { missing }'
+lsp_active_open_bad_dep="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_dep_uri\",\"version\":1,\"text\":\"$lsp_active_bad_dep\"}}}"
+lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_active_init")" "$(lsp_frame "$lsp_active_open_bad_dep")" "$(lsp_frame "$lsp_active_open_root")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_active_graph_routes_dependency_diagnostic" "$lsp_out" "\"uri\":\"$lsp_active_dep_uri\",\"diagnostics\":[{"
+assert_contains "lsp_active_graph_preserves_dependency_diagnostic" "$lsp_out" 'type error: unknown identifier'
+assert_contains "lsp_active_graph_keeps_importer_clean_for_dependency_body_error" "$lsp_out" "\"uri\":\"$lsp_active_root_uri\",\"diagnostics\":[]"
+
+lsp_reexport_mid="_weft_lsp_reexport_$$_mid"
+lsp_reexport_leaf="_weft_lsp_reexport_$$_leaf"
+lsp_reexport_root_uri="file://$PWD/_weft_lsp_reexport_$$_root.weft"
+lsp_reexport_mid_uri="file://$PWD/module_fixtures/$lsp_reexport_mid.weft"
+lsp_reexport_leaf_uri="file://$PWD/module_fixtures/$lsp_reexport_leaf.weft"
+lsp_reexport_root_prefix="use module_fixtures/$lsp_reexport_mid.{active_value} fn main() -> i64 { "
+lsp_reexport_root_source="${lsp_reexport_root_prefix}active_value() }"
+lsp_reexport_mid_source="pub use module_fixtures/$lsp_reexport_leaf.{active_value}"
+lsp_reexport_leaf_source='pub fn active_value() -> i64 { 42 }'
+lsp_reexport_open_leaf="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_reexport_leaf_uri\",\"version\":1,\"text\":\"$lsp_reexport_leaf_source\"}}}"
+lsp_reexport_open_mid="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_reexport_mid_uri\",\"version\":1,\"text\":\"$lsp_reexport_mid_source\"}}}"
+lsp_reexport_open_root="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_reexport_root_uri\",\"version\":1,\"text\":\"$lsp_reexport_root_source\"}}}"
+lsp_reexport_definition="{\"jsonrpc\":\"2.0\",\"id\":85,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_reexport_root_uri\"},\"position\":{\"line\":0,\"character\":${#lsp_reexport_root_prefix}}}}"
+lsp_out=$(printf '%s%s%s%s%s' "$(lsp_frame "$lsp_active_init")" "$(lsp_frame "$lsp_reexport_open_leaf")" "$(lsp_frame "$lsp_reexport_open_mid")" "$(lsp_frame "$lsp_reexport_open_root")" "$(lsp_frame "$lsp_reexport_definition")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_active_reexport_graph_is_clean" "$lsp_out" "\"uri\":\"$lsp_reexport_root_uri\",\"diagnostics\":[]"
+assert_contains "lsp_active_reexport_definition_reaches_origin" "$lsp_out" "\"id\":85,\"result\":{\"uri\":\"$lsp_reexport_leaf_uri\""
+assert_contains "lsp_active_reexport_definition_preserves_origin_range" "$lsp_out" '"start":{"line":0,"character":7},"end":{"line":0,"character":19}'
 
 # Slow writer: frames delivered across multiple pipe reads must not be
 # truncated (read_fd_all once treated any short read as EOF).
@@ -1987,4 +2049,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 430 passed, 0 failed"
+echo "Tool boundary summary: 449 passed, 0 failed"
