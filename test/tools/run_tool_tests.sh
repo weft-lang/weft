@@ -1139,6 +1139,16 @@ printf 'use cycle_a/lib.{cycle_a_value}\nfn main() -> i64 { cycle_a_value() }\n'
 package_cycle_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
 assert_contains "package_dependency_cycle_stable_code" "$package_cycle_out" "error[E5004]: dependency 'cycle_a' forms a package dependency cycle"
 
+mkdir -p "$tmp_pkg_dir/deps/lib/deps/app"
+printf '{"package":"app","dependencies":{"lib":"deps/lib"}}\n' > "$tmp_pkg_dir/weft.pkg"
+printf '{"package":"lib","dependencies":{"app":"deps/app"}}\n' > "$tmp_pkg_dir/deps/lib/weft.pkg"
+printf '{"package":"app","dependencies":{}}\n' > "$tmp_pkg_dir/deps/lib/deps/app/weft.pkg"
+printf 'use app/lib.{app_value}\npub fn lib_value() -> i64 { app_value() }\n' > "$tmp_pkg_dir/deps/lib/lib.weft"
+printf 'pub fn app_value() -> i64 { 1 }\n' > "$tmp_pkg_dir/deps/lib/deps/app/lib.weft"
+printf 'use lib/lib.{lib_value}\nfn main() -> i64 { lib_value() }\n' > "$tmp_pkg_dir/app.weft"
+package_root_cycle_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
+assert_contains "package_dependency_cycle_back_to_root_code" "$package_root_cycle_out" "error[E5004]: dependency 'app' forms a package dependency cycle"
+
 outside_name=$(basename "$tmp_outside_dir")
 printf 'fn hidden() -> i64 { 0 }\n' > "$tmp_outside_dir/lib.weft"
 printf 'package app\ndep evil ../%s\n' "$outside_name" > "$tmp_pkg_dir/weft.pkg"
