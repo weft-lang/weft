@@ -12,6 +12,7 @@ use compiler/type_registry.{*}
 use runtime/alloc.{*}
 use runtime/buffer.{*}
 use runtime/memory.{*}
+use runtime/string.{runtime_str_from_bytes_copy}
 
 -- span is an offset into src; the diagnostic carries the absolute address so
 -- the renderer can resolve which loaded source buffer it belongs to.
@@ -3242,6 +3243,22 @@ pub(package) fn parse_register_function_decl(tt: i64, src: i64, fn_wrap: i64, vi
 
 pub(package) fn parse_module(toks: i64, src: i64, tt: i64) -[Diagnose]> i64 {
   let fns = nlist_new()
+  -- A path-aware root participates in the same logical-identity load graph as
+  -- its imports. Without this entry, A -> B -> A reread A into a second source
+  -- buffer before noticing B's back-edge.
+  let root_module = module_fact_find_source(tt, src)
+  let loaded = mem_load64_at(tt, 24)
+  let loading = mem_load64_at(tt, 96)
+  let mut root_pushed = 0
+  if root_module != 0 and module_fact_entry_anonymous(root_module) == 0 {
+    let root_path = module_fact_entry_path_ptr(root_module)
+    let root_len = module_fact_entry_path_len(root_module)
+    if is_file_loaded(loaded, root_path, 0, root_len) == false {
+      mark_file_loaded(loaded, root_path, 0, root_len)
+      loading_stack_push(loading, root_path, root_len)
+      root_pushed = 1
+    } else { 0 }
+  } else { 0 }
   -- The loop terminates on the EOF token (tag 7), but a sub-parser that
   -- consumes past EOF would leave p pointing beyond the buffer, and the
   -- token accessors are raw loads: the walk then reads unmapped memory
@@ -3320,6 +3337,8 @@ pub(package) fn parse_module(toks: i64, src: i64, tt: i64) -[Diagnose]> i64 {
       p = p + 1
     } }
   }
+  if root_pushed == 1 { loading_stack_pop(loading) } else { 0 }
+  parse_diagnose_module_cycle(tt, src)
   fns
 }
 
@@ -3523,15 +3542,16 @@ pub(package) fn parse_use_surface(toks: i64, src: i64, pos: i64) -[Diagnose]> i6
   }
 }
 
-pub(package) fn parse_use_register_fact(tt: i64, importer_src: i64, target_module: i64, surface: i64, visibility: i64) -> i64 {
+pub(package) fn parse_use_register_fact(tt: i64, importer_src: i64, target_module: i64, surface: i64, visibility: i64, source_offset: i64) -> i64 {
   let info = node_f4(surface)
-  module_import_fact_register(tt, importer_src, target_module, node_f1(info), node_f2(info), node_f3(info), visibility, 0)
+  module_import_fact_register_at(tt, importer_src, target_module, node_f1(info), node_f2(info), node_f3(info), visibility, 0, source_offset)
 }
 
 pub(package) fn parse_use(toks: i64, src: i64, pos: i64, fns: i64, tt: i64, visibility: i64) -[Diagnose]> i64 {
   let surface = parse_use_surface(toks, src, pos)
   let path_ptr = node_f1(surface)
   let path_len = node_f2(surface)
+  let logical_len = module_logical_path_len(path_ptr, path_len)
   let end_pos = node_f3(surface)
   if path_ptr == 0 or path_len == 0 { end_pos }
   else {
@@ -3541,22 +3561,19 @@ pub(package) fn parse_use(toks: i64, src: i64, pos: i64, fns: i64, tt: i64, visi
   let loaded = mem_load64_at(tt, 24)
   if pkg_resolve_status(resolved) < 0 {
     end_pos
-  } else { if is_file_loaded(loaded, resolved_ptr, 0, resolved_len) {
-    -- Already loaded: a diamond re-import stays silently deduped, but a
-    -- file still on the in-progress stack is a genuine cycle (4a S6).
-    if loading_stack_contains(mem_load64_at(tt, 96), resolved_ptr, 0, resolved_len) {
-      parse_error(src, tok_span(toks, pos), "error: circular import")
-    } else { 0 }
-    let target_module = module_fact_find_path(tt, resolved_ptr, resolved_len, 0)
+  } else { if is_file_loaded(loaded, path_ptr, 0, logical_len) {
+    -- Logical identity deduplicates diamonds and terminates back-edges. The
+    -- producer-owned graph audit below distinguishes the two semantically.
+    let target_module = module_fact_find_path(tt, path_ptr, path_len, 0)
     if target_module != 0 {
-      parse_use_register_fact(tt, src, target_module, surface, visibility)
+      parse_use_register_fact(tt, src, target_module, surface, visibility, tok_span(toks, pos))
       module_fact_append_function_closure(tt, fns, target_module)
     } else { 0 }
     end_pos
   } else {
-    mark_file_loaded(loaded, resolved_ptr, 0, resolved_len)
+    mark_file_loaded(loaded, path_ptr, 0, logical_len)
     let loading = mem_load64_at(tt, 96)
-    loading_stack_push(loading, resolved_ptr, resolved_len)
+    loading_stack_push(loading, path_ptr, logical_len)
     let path = alloc_words(2)
     mem_store64_at(path, 0, resolved_ptr)
     mem_store64_at(path, 8, resolved_len)
@@ -3567,7 +3584,10 @@ pub(package) fn parse_use(toks: i64, src: i64, pos: i64, fns: i64, tt: i64, visi
       mark_trusted_import_source(tt, resolved_ptr, resolved_len, file_buf)
       ttable_register_source(tt, file_buf, file_len, resolved_ptr, resolved_len)
       let target_module = module_fact_find_source(tt, file_buf)
-      parse_use_register_fact(tt, src, target_module, surface, visibility)
+      -- Source provenance keeps the physical resolver path; semantic module
+      -- identity is the canonical path-form spelling from the import.
+      module_fact_upgrade_named(target_module, path_ptr, path_len, 0)
+      parse_use_register_fact(tt, src, target_module, surface, visibility, tok_span(toks, pos))
       let file_toks = lex(file_buf, file_len)
       parse_use_module(file_toks, file_buf, fns, tt)
     } else { 0 }
@@ -3580,13 +3600,14 @@ pub(package) fn parse_use(toks: i64, src: i64, pos: i64, fns: i64, tt: i64, visi
 pub(package) fn parse_use_file(fns: i64, tt: i64, path_str: str) -[Diagnose]> i64 {
   let path_ptr = __str_ptr(path_str)
   let path_len = __str_len(path_str)
+  let logical_len = module_logical_path_len(path_ptr, path_len)
   let loaded = mem_load64_at(tt, 24)
-  if is_file_loaded(loaded, path_ptr, 0, path_len) {
+  if is_file_loaded(loaded, path_ptr, 0, logical_len) {
     0
   } else {
-    mark_file_loaded(loaded, path_ptr, 0, path_len)
+    mark_file_loaded(loaded, path_ptr, 0, logical_len)
     let loading = mem_load64_at(tt, 96)
-    loading_stack_push(loading, path_ptr, path_len)
+    loading_stack_push(loading, path_ptr, logical_len)
     let path = alloc_words(2)
     mem_store64_at(path, 0, path_ptr)
     mem_store64_at(path, 8, path_len)
@@ -3600,6 +3621,7 @@ pub(package) fn parse_use_file(fns: i64, tt: i64, path_str: str) -[Diagnose]> i6
       parse_use_module(file_toks, file_buf, fns, tt)
     } else { 0 }
     loading_stack_pop(loading)
+    parse_diagnose_module_cycle(tt, 0)
     0
   }
 }
@@ -3615,6 +3637,44 @@ pub(package) fn parse_import_fact_exists(tt: i64, importer: i64, target: i64, we
     } else { i = i + 1 }
   }
   found
+}
+
+pub(package) fn parse_append_module_cycle_path(buf: i64, module_entry: i64) -> i64 {
+  if module_fact_entry_anonymous(module_entry) != 0 { bstr(buf, "<anonymous>") }
+  else { bscopy(buf, module_fact_entry_path_ptr(module_entry), module_fact_entry_path_len(module_entry), 0) }
+}
+
+pub(package) fn parse_module_cycle_message(cycle: ModuleImportCycle) -> str {
+  let message = buf_new(128)
+  bstr(message, "error: circular import: ")
+  let count = module_import_cycle_count(cycle)
+  for i in 0..count {
+    if i > 0 { bstr(message, " -> ") } else { 0 }
+    parse_append_module_cycle_path(message, module_import_cycle_module_at(cycle, i))
+  }
+  if count > 0 {
+    bstr(message, " -> ")
+    parse_append_module_cycle_path(message, module_import_cycle_module_at(cycle, 0))
+  } else { 0 }
+  runtime_str_from_bytes_copy(buf_ptr(message), buf_len(message))
+}
+
+pub(package) fn parse_diagnose_module_cycle(tt: i64, fallback_src: i64) -[Diagnose]> i64 {
+  if module_graph_audit_needed(tt) == 0 { 0 }
+  else {
+    let cycle = module_graph_find_cycle(tt)
+    if module_import_cycle_is_present(cycle) == 0 {
+      module_graph_mark_audited(tt, 0)
+      0
+    } else {
+      let edge = module_import_cycle_edge_at(cycle, module_import_cycle_count(cycle) - 1)
+      let importer = module_import_fact_importer(edge)
+      let diag_src = if importer == 0 { fallback_src } else { module_fact_entry_source(importer) }
+      let source_offset = module_import_fact_source_offset(edge)
+      module_graph_mark_audited(tt, 1)
+      parse_error(diag_src, source_offset, parse_module_cycle_message(cycle))
+    }
+  }
 }
 
 -- The language prelude is an ordinary wildcard edge to one facade module.
@@ -3638,6 +3698,7 @@ pub(package) fn parse_bind_implicit_prelude(fns: i64, src: i64, tt: i64) -[Diagn
       nlist_add(selections, node_new(0, 0, 0 - 1, 0, 0))
       module_import_fact_register(tt, src, target, selections, 0, 0, module_visibility_private(), 1)
     } else { 0 }
+    parse_diagnose_module_cycle(tt, src)
     fns
   }
 }
