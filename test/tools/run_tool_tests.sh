@@ -12,7 +12,7 @@ case "$WEFT" in
   *) WEFT_ABS="$(pwd)/$WEFT" ;;
 esac
 tmp_src=$(mktemp /tmp/weft_tool_src_XXXXXX)
-tmp_import=$(mktemp /tmp/weft_tool_import_XXXXXX)
+tmp_import="module_fixtures/_weft_tool_import_$$.weft"
 tmp_bin=$(mktemp /tmp/weft_tool_bin_XXXXXX)
 tmp_err=$(mktemp /tmp/weft_tool_err_XXXXXX)
 tmp_out=$(mktemp /tmp/weft_tool_out_XXXXXX)
@@ -1003,8 +1003,8 @@ run_binary_guarded "$tmp_bin"
 echo "  ok compile_reads_large_stdin"
 
 write_large_padding "$tmp_import"
-printf 'fn sentinel() -> i64 { 99 }\n' >> "$tmp_import"
-printf 'use "%s"\nfn main() -> i64 { sentinel() }\n' "$tmp_import" > "$tmp_src"
+printf 'pub fn sentinel() -> i64 { 99 }\n' >> "$tmp_import"
+printf 'use module_fixtures/_weft_tool_import_%s.{*}\nfn main() -> i64 { sentinel() }\n' "$$" > "$tmp_src"
 large_import_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_reads_large_import" "$large_import_out" "check: 2 functions, 0 errors"
 
@@ -1019,17 +1019,17 @@ echo "  ok compile_reads_huge_stdin_offsets"
 
 mkdir -p "$tmp_pkg_dir/deps/math"
 printf '{"package":"app","dependencies":{"math":"deps/math"}}\n' > "$tmp_pkg_dir/weft.pkg"
-printf 'fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
-printf 'use "math/lib.weft"\nfn main() -> i64 { if add(40, 2) == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_dir/app.weft"
+printf 'pub fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
+printf 'use math/lib.{*}\nfn main() -> i64 { if add(40, 2) == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_dir/app.weft"
 (cd "$tmp_pkg_dir" && run_weft_compile_guarded "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
 chmod +x "$tmp_pkg_dir/app"
 run_binary_guarded "$tmp_pkg_dir/app"
 echo "  ok package_local_dep_import_compiles"
 
 mkdir -p "$tmp_pkg_dir/.weft/cache/math"
-printf 'fn cached_value() -> i64 { 1 }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
-printf 'fn cached_value() -> i64 { 42 }\n' > "$tmp_pkg_dir/.weft/cache/math/lib.weft"
-printf 'use "math/lib.weft"\nfn main() -> i64 { if cached_value() == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_dir/app.weft"
+printf 'pub fn cached_value() -> i64 { 1 }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
+printf 'pub fn cached_value() -> i64 { 42 }\n' > "$tmp_pkg_dir/.weft/cache/math/lib.weft"
+printf 'use math/lib.{*}\nfn main() -> i64 { if cached_value() == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_dir/app.weft"
 (cd "$tmp_pkg_dir" && run_weft_compile_guarded "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
 chmod +x "$tmp_pkg_dir/app"
 run_binary_guarded "$tmp_pkg_dir/app"
@@ -1038,12 +1038,12 @@ echo "  ok package_cache_hit_prefers_cached_file"
 outside_name=$(basename "$tmp_outside_dir")
 printf 'fn hidden() -> i64 { 0 }\n' > "$tmp_outside_dir/lib.weft"
 printf 'package app\ndep evil ../%s\n' "$outside_name" > "$tmp_pkg_dir/weft.pkg"
-printf 'use "evil/lib.weft"\nfn main() -> i64 { hidden() }\n' > "$tmp_pkg_dir/app.weft"
+printf 'use evil/lib.{*}\nfn main() -> i64 { hidden() }\n' > "$tmp_pkg_dir/app.weft"
 traversal_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
 assert_contains "package_rejects_traversal_dep_path" "$traversal_out" "type error: unknown function"
 
 printf 'package app\ndep math deps/math 1.0.0\n' > "$tmp_pkg_dir/weft.pkg"
-printf 'use "math/lib.weft"\nfn main() -> i64 { add(1, 2) }\n' > "$tmp_pkg_dir/app.weft"
+printf 'use math/lib.{*}\nfn main() -> i64 { add(1, 2) }\n' > "$tmp_pkg_dir/app.weft"
 unsupported_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
 assert_contains "package_rejects_unsupported_version_token" "$unsupported_out" "type error: unknown function"
 
@@ -1057,8 +1057,8 @@ pkg_add_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg add math deps/math 2>&1)
 assert_contains "pkg_add_records_dependency" "$pkg_add_out" "pkg: added dependency"
 pkg_manifest=$(< "$tmp_pkg_cli_dir/weft.pkg")
 assert_contains "pkg_add_manifest_dep" "$pkg_manifest" '"math":"deps/math"'
-printf 'fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp_pkg_cli_dir/deps/math/lib.weft"
-printf 'use "math/lib.weft"\nfn main() -> i64 { if add(40, 2) == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_cli_dir/app.weft"
+printf 'pub fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp_pkg_cli_dir/deps/math/lib.weft"
+printf 'use math/lib.{*}\nfn main() -> i64 { if add(40, 2) == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_cli_dir/app.weft"
 (cd "$tmp_pkg_cli_dir" && run_weft_compile_guarded "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
 chmod +x "$tmp_pkg_cli_dir/app"
 run_binary_guarded "$tmp_pkg_cli_dir/app"
@@ -1108,7 +1108,7 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_harness_emits_passing_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
 echo "  ok test_harness_binds_runtime_after_synthesis"
 
-printf 'use "stdlib/vector.weft" fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) let va = vector_new<i64>() let vb = vector_new<i64>() vector_push<i64>(va, 7) vector_push<i64>(vb, 7) Test.assert_i64_vector_eq(va, vb) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
+printf 'use stdlib/vector.{*} fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) let va = vector_new<i64>() let vb = vector_new<i64>() vector_push<i64>(va, 7) vector_push<i64>(vb, 7) Test.assert_i64_vector_eq(va, vb) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_supports_assertion_helpers" "$tmp_err" "unknown effect operation"
 chmod +x "$tmp_bin"
@@ -1300,29 +1300,29 @@ assert_contains "test_path_rejects_root_raw_memory" "$test_path_raw_out" "type e
 test_stdin_raw_out=$(run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err" || true; cat "$tmp_err")
 assert_contains "test_stdin_rejects_root_raw_memory" "$test_stdin_raw_out" "type error: raw allocation is sealed to trusted runtime/platform code"
 
-printf 'fn leaked() -> i64 { __mem_load64(0) }\n' > "$tmp_compiler_probe"
+printf 'pub fn leaked() -> i64 { __mem_load64(0) }\n' > "$tmp_compiler_probe"
 compiler_probe_root_out=$("$WEFT" check "$tmp_compiler_probe" 2>&1 || true)
 assert_contains "compiler_unlisted_root_rejects_raw_memory" "$compiler_probe_root_out" "type error: Unsafe is sealed to trusted runtime/platform code"
 
-printf 'use "%s"\nfn main() -> i64 { leaked() }\n' "$tmp_compiler_probe" > "$tmp_src"
+printf 'use compiler/_weft_trust_probe_%s.{*}\nfn main() -> i64 { leaked() }\n' "$$" > "$tmp_src"
 compiler_probe_import_out=$("$WEFT" check "$tmp_src" 2>&1 || true)
 assert_contains "compiler_unlisted_import_rejects_raw_memory" "$compiler_probe_import_out" "type error: Unsafe is sealed to trusted runtime/platform code"
 rm -f "$tmp_compiler_probe"
 
-printf 'fn leaked() -> i64 { __mem_load64(0) }\n' > "$tmp_runtime_probe"
+printf 'pub fn leaked() -> i64 { __mem_load64(0) }\n' > "$tmp_runtime_probe"
 runtime_probe_root_out=$("$WEFT" check "$tmp_runtime_probe" 2>&1 || true)
 assert_contains "runtime_unlisted_root_rejects_raw_memory" "$runtime_probe_root_out" "type error: Unsafe is sealed to trusted runtime/platform code"
 
-printf 'use "%s"\nfn main() -> i64 { leaked() }\n' "$tmp_runtime_probe" > "$tmp_src"
+printf 'use runtime/_weft_trust_probe_%s.{*}\nfn main() -> i64 { leaked() }\n' "$$" > "$tmp_src"
 runtime_probe_import_out=$("$WEFT" check "$tmp_src" 2>&1 || true)
 assert_contains "runtime_unlisted_import_rejects_raw_memory" "$runtime_probe_import_out" "type error: Unsafe is sealed to trusted runtime/platform code"
 rm -f "$tmp_runtime_probe"
 
-printf 'fn leaked() -> i64 { __mem_load64(0) }\n' > "$tmp_stdlib_probe"
+printf 'pub fn leaked() -> i64 { __mem_load64(0) }\n' > "$tmp_stdlib_probe"
 stdlib_probe_root_out=$("$WEFT" check "$tmp_stdlib_probe" 2>&1 || true)
 assert_contains "stdlib_unlisted_root_rejects_raw_memory" "$stdlib_probe_root_out" "type error: Unsafe is sealed to trusted runtime/platform code"
 
-printf 'use "%s"\nfn main() -> i64 { leaked() }\n' "$tmp_stdlib_probe" > "$tmp_src"
+printf 'use stdlib/_weft_trust_probe_%s.{*}\nfn main() -> i64 { leaked() }\n' "$$" > "$tmp_src"
 stdlib_probe_import_out=$("$WEFT" check "$tmp_src" 2>&1 || true)
 assert_contains "stdlib_unlisted_import_rejects_raw_memory" "$stdlib_probe_import_out" "type error: Unsafe is sealed to trusted runtime/platform code"
 rm -f "$tmp_stdlib_probe"
@@ -1373,7 +1373,7 @@ assert_test_failure_contains "test_string_diff_reports_expected" 'test "string_d
 assert_test_failure_contains "test_string_diff_reports_actual" 'test "string_diff" { Test.assert_str_eq("a\nsnow", "a\nrain") }' 1 '    + actual   "a\nsnow"'
 assert_test_failure_contains "test_string_ne_reports_equal_value" 'test "string_ne" { Test.assert_str_ne("same\n", "same\n") }' 1 '  value was unexpectedly equal: "same\n"'
 
-vector_diff_source='use "stdlib/vector.weft" test "vector_diff" { let actual = vector_new<i64>() vector_push<i64>(actual, 1) vector_push<i64>(actual, 2) vector_push<i64>(actual, 3) vector_push<i64>(actual, 4) let expected = vector_new<i64>() vector_push<i64>(expected, 1) vector_push<i64>(expected, 9) vector_push<i64>(expected, 3) Test.assert_i64_vector_eq(actual, expected) }'
+vector_diff_source='use stdlib/vector.{*} test "vector_diff" { let actual = vector_new<i64>() vector_push<i64>(actual, 1) vector_push<i64>(actual, 2) vector_push<i64>(actual, 3) vector_push<i64>(actual, 4) let expected = vector_new<i64>() vector_push<i64>(expected, 1) vector_push<i64>(expected, 9) vector_push<i64>(expected, 3) Test.assert_i64_vector_eq(actual, expected) }'
 assert_test_failure_contains "test_vector_diff_reports_header" "$vector_diff_source" 1 "test assertion failed: assert_i64_vector_eq"
 assert_test_failure_contains "test_vector_diff_reports_index_and_lengths" "$vector_diff_source" 1 "  collection diff at index 1 (expected length 3, actual length 4):"
 assert_test_failure_contains "test_vector_diff_reports_expected" "$vector_diff_source" 1 "    - expected [1, 9, 3]"
@@ -1382,7 +1382,7 @@ assert_test_compile_rejects "test_assert_true_rejects_i64" 'test "bad_bool" { Te
 assert_test_compile_rejects "test_assert_str_eq_rejects_i64" 'test "bad_str" { Test.assert_str_eq(1, "one") }' "type error: argument type mismatch"
 assert_test_compile_rejects "test_assert_eq_f64_rejects_i64" 'test "bad_f64" { Test.assert_eq_f64(1, 1.0) }' "type error: argument type mismatch"
 assert_test_compile_rejects "test_assert_near_f64_rejects_i64_epsilon" 'test "bad_f64_epsilon" { Test.assert_near_f64(1.0, 1.0, 1) }' "type error: argument type mismatch"
-assert_test_compile_rejects "test_assert_i64_vector_rejects_wrong_element_type" 'use "stdlib/vector.weft" test "bad_vector" { let a = vector_new<str>() let b = vector_new<str>() Test.assert_i64_vector_eq(a, b) }' "type error: argument type mismatch"
+assert_test_compile_rejects "test_assert_i64_vector_rejects_wrong_element_type" 'use stdlib/vector.{*} test "bad_vector" { let a = vector_new<str>() let b = vector_new<str>() Test.assert_i64_vector_eq(a, b) }' "type error: argument type mismatch"
 assert_test_compile_rejects "test_property_rejects_i64_predicate" 'test "bad_property" { Test.forall_i64_range(0, 1, x => x + 1) }' "type error: return type mismatch"
 assert_test_compile_rejects "test_property_rejects_effectful_predicate" $'effect Log { fn hit() -> i64 }\ntest "bad_property_effect" { Test.forall_i64_range(0, 1, x => Log.hit() == x) }' "type error: effect not available in caller"
 assert_test_compile_rejects "test_fixture_rejects_unhandled_state" 'test "bad_state" { TestState.get() }' "type error: effect not available in caller"
