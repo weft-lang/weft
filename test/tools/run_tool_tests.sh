@@ -370,6 +370,10 @@ mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"
 assert_contains "mcp_module_cycle_stable_code" "$mcp_out" '"code":"E4001"'
 assert_contains "mcp_module_cycle_message" "$mcp_out" 'circular import: test/negative/import_cycle_direct -> test/negative/import_cycle_direct'
 
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"use module_fixtures/g2_function_left as left fn main() -> i64 { left.missing() }"}}}' | "$WEFT" mcp 2>&1)
+assert_contains "mcp_module_member_stable_code" "$mcp_out" '"code":"E4002"'
+assert_contains "mcp_module_member_qualified_name" "$mcp_out" "unknown module member 'left.missing'"
+
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -[Unsafe]> i64 { __mem_load64(0) }"}}}' | "$WEFT" mcp 2>&1)
 assert_contains "mcp_diagnostics_rejects_root_raw_memory" "$mcp_out" "type error: Unsafe is sealed to trusted runtime/platform code"
 
@@ -914,6 +918,11 @@ lsp_open_module_cycle='{"jsonrpc":"2.0","method":"textDocument/didOpen","params"
 lsp_out=$(lsp_frame "$lsp_open_module_cycle" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_module_cycle_stable_code" "$lsp_out" '"code":"E4001"'
 assert_contains "lsp_module_cycle_message" "$lsp_out" 'circular import: test/negative/import_cycle_direct -> test/negative/import_cycle_direct'
+
+lsp_open_module_member='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///module-member.weft","version":1,"text":"use module_fixtures/g2_function_left as left fn main() -> i64 { left.missing() }"}}}'
+lsp_out=$(lsp_frame "$lsp_open_module_member" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_module_member_stable_code" "$lsp_out" '"code":"E4002"'
+assert_contains "lsp_module_member_qualified_name" "$lsp_out" "unknown module member 'left.missing'"
 
 lsp_open_raw='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///raw.weft","version":1,"text":"fn main() -[Unsafe]> i64 { __mem_load64(0) }"}}}'
 lsp_out=$(lsp_frame "$lsp_open_raw" | "$WEFT" lsp 2>&1)
