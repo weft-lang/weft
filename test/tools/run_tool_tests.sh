@@ -1236,6 +1236,7 @@ printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","de
 printf 'fn main() -> i64 { 0 }\n' > "$tmp_pkg_lock_dir/main.weft"
 printf '{"package":"lib","manifest_version":1,"version":"2.0.0","weft":"0.1","dependencies":{"base":"deps/base"}}\n' > "$tmp_pkg_lock_dir/deps/lib/weft.pkg"
 printf 'pub fn lib_value() -> i64 { 2 }\n' > "$tmp_pkg_lock_dir/deps/lib/lib.weft"
+printf 'use lib/lib.{lib_value}\nfn main() -> i64 { lib_value() }\n' > "$tmp_pkg_lock_dir/app.weft"
 printf '{"package":"base","manifest_version":1,"version":"3.0.0","weft":"0.1","dependencies":{}}\n' > "$tmp_pkg_lock_dir/deps/lib/deps/base/weft.pkg"
 printf 'pub fn base_value() -> i64 { 3 }\n' > "$tmp_pkg_lock_dir/deps/lib/deps/base/base.weft"
 printf 'ignored cache source\n' > "$tmp_pkg_lock_dir/.weft/cache/shadow.weft"
@@ -1255,6 +1256,23 @@ if [ -e "$tmp_pkg_lock_dir/weft.lock.tmp" ]; then
 else
   echo "  ok pkg_lock_atomic_replace_cleans_temp"
 fi
+
+pkg_locked_check=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" check < app.weft 2>&1)
+assert_contains "package_valid_lock_identity_compiles" "$pkg_locked_check" "check: 2 functions, 0 errors"
+
+printf '{"lock_version":2,"manifest_version":1,"weft":"0.1","packages":[]}\n' > "$tmp_pkg_lock_dir/weft.lock"
+pkg_malformed_lock_out=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
+assert_contains "package_malformed_lock_stable_code" "$pkg_malformed_lock_out" "error[E5005]: dependency 'lib' is blocked by a malformed or unsupported package lock"
+
+printf '{"lock_version":1,"manifest_version":1,"weft":"0.1","packages":[{"name":"app","version":"1.0.0","source":"path:.","content":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}]}\n' > "$tmp_pkg_lock_dir/weft.lock"
+pkg_missing_lock_entry_out=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
+assert_contains "package_missing_lock_entry_stable_code" "$pkg_missing_lock_entry_out" "error[E5006]: dependency 'lib' does not match the identity recorded in weft.lock"
+
+printf '{"lock_version":1,"manifest_version":1,"weft":"0.1","packages":[{"name":"app","version":"1.0.0","source":"path:.","content":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},{"name":"lib","version":"9.0.0","source":"path:deps/lib","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111"}]}\n' > "$tmp_pkg_lock_dir/weft.lock"
+pkg_wrong_lock_version_out=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
+assert_contains "package_wrong_lock_version_stable_code" "$pkg_wrong_lock_version_out" "error[E5006]: dependency 'lib' does not match the identity recorded in weft.lock"
+
+printf '%s\n' "$pkg_lock_first" > "$tmp_pkg_lock_dir/weft.lock"
 
 (cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock >/dev/null)
 assert_equals "pkg_lock_rerun_is_byte_deterministic" "$(< "$tmp_pkg_lock_dir/weft.lock")" "$pkg_lock_first"
@@ -1670,4 +1688,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 357 passed, 0 failed"
+echo "Tool boundary summary: 361 passed, 0 failed"
