@@ -317,6 +317,12 @@ assert_equals "fmt_distinguishes_generic_angles_and_comparisons" "$(<"$tmp_out")
 "$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
 assert_files_equal "fmt_angle_roles_are_idempotent" "$tmp_bin" "$tmp_out"
 
+printf 'use compiler / formatter.{ * }\nfn f() -[ Diagnose ]> i64 { resume (0) }\nfn main() -> i64 { for i in 0 .. 2 { 0 } 0 }\n' > "$tmp_src"
+"$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+assert_equals "fmt_canonical_context_punctuation" "$(<"$tmp_out")" $'use compiler/formatter.{*}\nfn f() -[Diagnose]> i64 { resume(0) }\nfn main() -> i64 { for i in 0..2 { 0 } 0 }'
+"$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
+assert_files_equal "fmt_context_punctuation_is_idempotent" "$tmp_bin" "$tmp_out"
+
 printf 'fn   value ( ) -> str {  "a\\n\\\"b"  }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
 assert_equals "fmt_preserves_literal_spelling" "$fmt_out" 'fn value() -> str { "a\n\"b" }'
@@ -2179,4 +2185,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 488 passed, 0 failed"
+echo "Tool boundary summary: 490 passed, 0 failed"
