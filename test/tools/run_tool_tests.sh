@@ -124,6 +124,19 @@ assert_equals() {
   fi
 }
 
+assert_files_equal() {
+  local name="$1"
+  local actual="$2"
+  local expected="$3"
+  if cmp -s "$actual" "$expected"; then
+    echo "  ok $name"
+  else
+    echo "  fail $name"
+    echo "    files differ: $actual != $expected"
+    exit 1
+  fi
+}
+
 assert_not_equals() {
   local name="$1"
   local actual="$2"
@@ -273,13 +286,38 @@ write_huge_padding() {
 
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 
-fmt_out=$("$WEFT" fmt < "$tmp_src" 2>&1)
+fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
 assert_contains "fmt_parse_only" "$fmt_out" "fn main() -> i64 { 42 }"
 assert_equals "fmt_snapshot_exact" "$fmt_out" "fn main() -> i64 { 42 }"
+assert_equals "fmt_valid_stderr_empty" "$(<"$tmp_err")" ""
 
-fmt_path_out=$("$WEFT" fmt "$tmp_src" 2>&1)
+fmt_path_out=$("$WEFT" fmt "$tmp_src" 2>"$tmp_err")
 assert_equals "fmt_path_snapshot_exact" "$fmt_path_out" "fn main() -> i64 { 42 }"
+assert_equals "fmt_path_stderr_empty" "$(<"$tmp_err")" ""
 
+"$WEFT" fmt compiler/main.weft > "$tmp_out" 2>"$tmp_err"
+assert_files_equal "fmt_lossless_compiler_surface" "$tmp_out" "compiler/main.weft"
+assert_equals "fmt_lossless_compiler_stderr_empty" "$(<"$tmp_err")" ""
+"$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
+assert_files_equal "fmt_idempotent_compiler_surface" "$tmp_bin" "$tmp_out"
+
+printf 'fn main() -> i64 { missing }\n' > "$tmp_src"
+fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
+assert_equals "fmt_remains_parse_only" "$fmt_out" "fn main() -> i64 { missing }"
+assert_equals "fmt_parse_only_stderr_empty" "$(<"$tmp_err")" ""
+
+printf 'fn broken() -> i64 { 1\nfn after() -> i64 { 2 }\n' > "$tmp_src"
+set +e
+"$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+fmt_parse_failure_exit=$?
+set -e
+assert_equals "fmt_parse_failure_exit" "$fmt_parse_failure_exit" "1"
+assert_equals "fmt_parse_failure_no_stdout" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+fmt_parse_failure_err=$(<"$tmp_err")
+assert_contains "fmt_parse_failure_diagnostic" "$fmt_parse_failure_err" "error: expected '}' before declaration"
+assert_contains "fmt_parse_failure_summary" "$fmt_parse_failure_err" "fmt: parse failed with 1 errors; no output written"
+
+printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 ast_out=$("$WEFT" ast < "$tmp_src" 2>&1)
 assert_contains "ast_parse_only_header" "$ast_out" "--- AST: 1 functions ---"
 assert_contains "ast_parse_only_literal" "$ast_out" "IntLit(42)"
@@ -2100,4 +2138,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 466 passed, 0 failed"
+echo "Tool boundary summary: 477 passed, 0 failed"
