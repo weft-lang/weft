@@ -1086,6 +1086,23 @@ printf 'use math/visibility.{private_value}\nfn main() -> i64 { private_value() 
 package_private_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
 assert_contains "package_private_member_stays_inside_dependency_module" "$package_private_out" "error[E4004]: module member 'private_value' is not visible in this import"
 
+mkdir -p "$tmp_pkg_dir/deps/lib/deps/base" "$tmp_pkg_dir/deps/mirror"
+printf '{"package":"app","dependencies":{"lib":"deps/lib","mirror":"deps/mirror"}}\n' > "$tmp_pkg_dir/weft.pkg"
+printf '{"package":"lib","dependencies":{"base":"deps/base"}}\n' > "$tmp_pkg_dir/deps/lib/weft.pkg"
+printf '{"package":"base","dependencies":{}}\n' > "$tmp_pkg_dir/deps/lib/deps/base/weft.pkg"
+printf '{"package":"mirror","dependencies":{}}\n' > "$tmp_pkg_dir/deps/mirror/weft.pkg"
+printf 'pub(package) fn package_value() -> i64 { 40 }\n' > "$tmp_pkg_dir/deps/lib/deps/base/value.weft"
+printf 'use value.{package_value}\npub fn base_value() -> i64 { package_value() + 2 }\n' > "$tmp_pkg_dir/deps/lib/deps/base/api.weft"
+printf 'pub use base/api.{base_value}\n' > "$tmp_pkg_dir/deps/lib/lib.weft"
+printf 'pub fn mirror_value() -> i64 { 9 }\n' > "$tmp_pkg_dir/deps/mirror/value.weft"
+printf 'use lib/lib.{base_value}\nuse mirror/value.{mirror_value}\nfn main() -> i64 { if base_value() == 42 and mirror_value() == 9 { 0 } else { 1 } }\n' > "$tmp_pkg_dir/app.weft"
+(cd "$tmp_pkg_dir" && run_weft_compile_guarded "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
+chmod +x "$tmp_pkg_dir/app"
+run_binary_guarded "$tmp_pkg_dir/app"
+echo "  ok package_transitive_owner_relative_reexport_compiles"
+echo "  ok package_loader_keeps_same_module_path_per_owner"
+echo "  ok package_visibility_allows_package_member_inside_owner"
+
 outside_name=$(basename "$tmp_outside_dir")
 printf 'fn hidden() -> i64 { 0 }\n' > "$tmp_outside_dir/lib.weft"
 printf 'package app\ndep evil ../%s\n' "$outside_name" > "$tmp_pkg_dir/weft.pkg"
