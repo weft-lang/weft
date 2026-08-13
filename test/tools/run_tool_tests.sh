@@ -301,6 +301,13 @@ assert_equals "fmt_lossless_compiler_stderr_empty" "$(<"$tmp_err")" ""
 "$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
 assert_files_equal "fmt_idempotent_compiler_surface" "$tmp_bin" "$tmp_out"
 
+"$WEFT" compile tools/fmt.weft > "$tmp_tool_bin" 2>"$tmp_err"
+chmod +x "$tmp_tool_bin"
+echo "  ok fmt_standalone_builds"
+"$tmp_tool_bin" < compiler/main.weft > "$tmp_bin" 2>"$tmp_err"
+assert_files_equal "fmt_standalone_shares_engine" "$tmp_bin" "$tmp_out"
+assert_equals "fmt_standalone_stderr_empty" "$(<"$tmp_err")" ""
+
 printf 'fn main() -> i64 { missing }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
 assert_equals "fmt_remains_parse_only" "$fmt_out" "fn main() -> i64 { missing }"
@@ -2138,4 +2145,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 477 passed, 0 failed"
+echo "Tool boundary summary: 480 passed, 0 failed"
