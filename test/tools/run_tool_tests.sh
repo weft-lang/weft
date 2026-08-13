@@ -1053,6 +1053,30 @@ lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_nominal_field")" "$(lsp_frame "$
 assert_contains "lsp_completion_nominal_bridge_field_i64" "$lsp_out" '"label":"x","kind":5,"detail":"i64"'
 assert_contains "lsp_completion_nominal_bridge_field_str" "$lsp_out" '"label":"y","kind":5,"detail":"str"'
 
+lsp_tuple_prefix='fn main(pair: (i64, str)) -> i64 { pair.'
+lsp_tuple_source="${lsp_tuple_prefix}0 }"
+lsp_tuple_pos=${#lsp_tuple_prefix}
+lsp_open_tuple="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tuple.weft\",\"version\":1,\"text\":\"$lsp_tuple_source\"}}}"
+lsp_tuple_completion="{\"jsonrpc\":\"2.0\",\"id\":67,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"file:///tuple.weft\"},\"position\":{\"line\":0,\"character\":$lsp_tuple_pos}}}"
+lsp_tuple_hover="{\"jsonrpc\":\"2.0\",\"id\":68,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///tuple.weft\"},\"position\":{\"line\":0,\"character\":$lsp_tuple_pos}}}"
+lsp_tuple_definition="{\"jsonrpc\":\"2.0\",\"id\":69,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"file:///tuple.weft\"},\"position\":{\"line\":0,\"character\":$lsp_tuple_pos}}}"
+lsp_out=$(printf '%s%s%s%s' "$(lsp_frame "$lsp_open_tuple")" "$(lsp_frame "$lsp_tuple_completion")" "$(lsp_frame "$lsp_tuple_hover")" "$(lsp_frame "$lsp_tuple_definition")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_tuple_position_source_is_clean" "$lsp_out" '"diagnostics":[]'
+assert_contains "lsp_completion_tuple_position_i64" "$lsp_out" '"label":"0","kind":5,"detail":"i64"'
+assert_contains "lsp_completion_tuple_position_str" "$lsp_out" '"label":"1","kind":5,"detail":"str"'
+assert_contains "lsp_hover_tuple_position" "$lsp_out" '"value":"tuple position 0: i64"'
+assert_contains "lsp_tuple_position_has_no_definition" "$lsp_out" '"id":69,"result":null'
+assert_not_contains "lsp_completion_tuple_mode_excludes_keywords" "$lsp_out" '"label":"handle"'
+
+lsp_bad_tuple_prefix='fn main(pair: (i64, str)) -> i64 { pair.'
+lsp_bad_tuple_source="${lsp_bad_tuple_prefix}2 }"
+lsp_bad_tuple_pos=${#lsp_bad_tuple_prefix}
+lsp_open_bad_tuple="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///bad-tuple.weft\",\"version\":1,\"text\":\"$lsp_bad_tuple_source\"}}}"
+lsp_bad_tuple_hover="{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///bad-tuple.weft\"},\"position\":{\"line\":0,\"character\":$lsp_bad_tuple_pos}}}"
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_bad_tuple")" "$(lsp_frame "$lsp_bad_tuple_hover")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_unknown_tuple_position_diagnostic" "$lsp_out" 'type error: unknown tuple position'
+assert_contains "lsp_unknown_tuple_position_has_no_hover" "$lsp_out" '"id":70,"result":null'
+
 lsp_effect_decl_prefix='effect LspState<S> { fn '
 lsp_effect_prefix='effect LspState<S> { fn get() -> S fn put(value: S) -> nil } fn read() -[LspState<i64>]> i64 { LspState.'
 lsp_effect_source="${lsp_effect_prefix}get() }"
@@ -1934,4 +1958,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 415 passed, 0 failed"
+echo "Tool boundary summary: 423 passed, 0 failed"
