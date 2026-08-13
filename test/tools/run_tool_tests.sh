@@ -1470,6 +1470,23 @@ printf 'use left/tools/inspect as left_inspect\nuse right/tools/inspect as right
 pkg_export_grammar=$(cd "$tmp_pkg_trust_dir/exports" && "$WEFT_ABS" check main.weft 2>&1)
 assert_contains "package_grammar_export_resolves_public_type" "$pkg_export_grammar" "check: 2 functions, 0 errors"
 
+# L7 is a package-product boundary, not only an in-memory visibility fact:
+# Stable fact/diagnostic APIs cross a resolved dependency edge while typed IR
+# remains available only inside the compiler package.
+mkdir -p "$tmp_pkg_trust_dir/l7/deps/compiler"
+printf '{"package":"app","dependencies":{"compiler":"deps/compiler"}}\n' > "$tmp_pkg_trust_dir/l7/weft.pkg"
+printf '{"package":"compiler","dependencies":{}}\n' > "$tmp_pkg_trust_dir/l7/deps/compiler/weft.pkg"
+printf 'pub fn semantic_fact_version() -> i64 { 1 }\n' > "$tmp_pkg_trust_dir/l7/deps/compiler/facts.weft"
+printf 'pub fn diagnostic_schema_version() -> i64 { 1 }\n' > "$tmp_pkg_trust_dir/l7/deps/compiler/diagnostics.weft"
+printf 'pub(package) fn typed_ir_version() -> i64 { 1 }\n' > "$tmp_pkg_trust_dir/l7/deps/compiler/ir.weft"
+printf 'use compiler/facts.{semantic_fact_version}\nuse compiler/diagnostics.{diagnostic_schema_version}\nfn main() -> i64 { semantic_fact_version() + diagnostic_schema_version() - 2 }\n' > "$tmp_pkg_trust_dir/l7/main.weft"
+pkg_l7_stable=$(cd "$tmp_pkg_trust_dir/l7" && "$WEFT_ABS" check main.weft 2>&1)
+assert_contains "package_l7_stable_fact_and_diagnostic_cross_boundary" "$pkg_l7_stable" "check: 3 functions, 0 errors"
+
+printf 'use compiler/ir.{typed_ir_version}\nfn main() -> i64 { typed_ir_version() }\n' > "$tmp_pkg_trust_dir/l7/main.weft"
+pkg_l7_unstable=$(cd "$tmp_pkg_trust_dir/l7" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_l7_unstable_ir_stays_inside_owner" "$pkg_l7_unstable" "error[E4004]: module member 'typed_ir_version' is not visible in this import"
+
 printf 'fn helper() -> i64 { 42 }\nfn main() -> i64 { helper() }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" symbols "$tmp_src" > "$tmp_out" 2> "$tmp_err"
 symbols_out=$(<"$tmp_out")
@@ -1813,4 +1830,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 384 passed, 0 failed"
+echo "Tool boundary summary: 386 passed, 0 failed"
