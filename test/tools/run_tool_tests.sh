@@ -25,12 +25,13 @@ tmp_test_after=$(mktemp /tmp/weft_tool_test_after_XXXXXX.weft)
 tmp_test_dir=$(mktemp -d /tmp/weft_tool_test_dir_XXXXXX)
 tmp_pkg_dir=$(mktemp -d /tmp/weft_tool_pkg_XXXXXX)
 tmp_pkg_cli_dir=$(mktemp -d /tmp/weft_tool_pkg_cli_XXXXXX)
+tmp_pkg_lock_dir=$(mktemp -d /tmp/weft_tool_pkg_lock_XXXXXX)
 tmp_pkg_missing_dir=$(mktemp -d /tmp/weft_tool_pkg_missing_XXXXXX)
 tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir"' EXIT
 
 now_s() {
   date +%s
@@ -120,6 +121,27 @@ assert_equals() {
     echo "    actual: $actual"
     exit 1
   fi
+}
+
+assert_not_equals() {
+  local name="$1"
+  local actual="$2"
+  local unexpected="$3"
+  if [[ "$actual" != "$unexpected" ]]; then
+    echo "  ok $name"
+  else
+    echo "  fail $name"
+    echo "    unexpected equality: $actual"
+    exit 1
+  fi
+}
+
+pkg_lock_digest() {
+  local json="$1"
+  local name="$2"
+  local tail=${json#*\"name\":\"$name\"}
+  tail=${tail#*\"content\":\"}
+  printf '%s' "${tail%%\"*}"
 }
 
 assert_not_contains() {
@@ -1207,6 +1229,102 @@ if bad_init_out=$(cd "$tmp_pkg_missing_dir" && "$WEFT_ABS" pkg init bad.name 2>&
   exit 1
 else
   assert_contains "pkg_init_rejects_invalid_name" "$bad_init_out" "pkg: invalid package name"
+fi
+
+mkdir -p "$tmp_pkg_lock_dir/deps/lib/deps/base" "$tmp_pkg_lock_dir/.weft/cache"
+printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"lib":"deps/lib"}}\n' > "$tmp_pkg_lock_dir/weft.pkg"
+printf 'fn main() -> i64 { 0 }\n' > "$tmp_pkg_lock_dir/main.weft"
+printf '{"package":"lib","manifest_version":1,"version":"2.0.0","weft":"0.1","dependencies":{"base":"deps/base"}}\n' > "$tmp_pkg_lock_dir/deps/lib/weft.pkg"
+printf 'pub fn lib_value() -> i64 { 2 }\n' > "$tmp_pkg_lock_dir/deps/lib/lib.weft"
+printf '{"package":"base","manifest_version":1,"version":"3.0.0","weft":"0.1","dependencies":{}}\n' > "$tmp_pkg_lock_dir/deps/lib/deps/base/weft.pkg"
+printf 'pub fn base_value() -> i64 { 3 }\n' > "$tmp_pkg_lock_dir/deps/lib/deps/base/base.weft"
+printf 'ignored cache source\n' > "$tmp_pkg_lock_dir/.weft/cache/shadow.weft"
+
+pkg_lock_out=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock 2>&1)
+assert_contains "pkg_lock_reports_write" "$pkg_lock_out" "pkg: wrote weft.lock"
+pkg_lock_first=$(< "$tmp_pkg_lock_dir/weft.lock")
+assert_contains "pkg_lock_pins_lock_schema" "$pkg_lock_first" '"lock_version":1'
+assert_contains "pkg_lock_pins_manifest_schema" "$pkg_lock_first" '"manifest_version":1'
+assert_contains "pkg_lock_records_root_identity" "$pkg_lock_first" '"name":"app","version":"1.0.0","source":"path:."'
+assert_contains "pkg_lock_records_transitive_identity" "$pkg_lock_first" '"name":"base","version":"3.0.0","source":"path:deps/lib/deps/base"'
+assert_contains "pkg_lock_sorts_package_entries" "$pkg_lock_first" '"name":"lib","version":"2.0.0","source":"path:deps/lib"'
+assert_contains "pkg_lock_records_sha256_content" "$(pkg_lock_digest "$pkg_lock_first" app)" 'sha256:'
+if [ -e "$tmp_pkg_lock_dir/weft.lock.tmp" ]; then
+  echo "  fail pkg_lock_atomic_replace_cleans_temp"
+  exit 1
+else
+  echo "  ok pkg_lock_atomic_replace_cleans_temp"
+fi
+
+(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock >/dev/null)
+assert_equals "pkg_lock_rerun_is_byte_deterministic" "$(< "$tmp_pkg_lock_dir/weft.lock")" "$pkg_lock_first"
+
+printf 'not package content\n' > "$tmp_pkg_lock_dir/README.md"
+printf 'changed ignored cache source\n' > "$tmp_pkg_lock_dir/.weft/cache/shadow.weft"
+(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock >/dev/null)
+assert_equals "pkg_lock_ignores_non_source_and_cache_files" "$(< "$tmp_pkg_lock_dir/weft.lock")" "$pkg_lock_first"
+
+printf 'fn escaped() -> i64 { 99 }\n' > "$tmp_outside_dir/escaped.weft"
+ln -s "$tmp_outside_dir" "$tmp_pkg_lock_dir/outside_link"
+(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock >/dev/null)
+assert_equals "pkg_lock_does_not_follow_source_symlinks" "$(< "$tmp_pkg_lock_dir/weft.lock")" "$pkg_lock_first"
+
+app_before=$(pkg_lock_digest "$pkg_lock_first" app)
+lib_before=$(pkg_lock_digest "$pkg_lock_first" lib)
+base_before=$(pkg_lock_digest "$pkg_lock_first" base)
+printf 'pub fn base_value() -> i64 { 30 }\n' > "$tmp_pkg_lock_dir/deps/lib/deps/base/base.weft"
+(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock >/dev/null)
+pkg_lock_base_changed=$(< "$tmp_pkg_lock_dir/weft.lock")
+assert_equals "pkg_lock_dependency_change_does_not_rehash_root" "$(pkg_lock_digest "$pkg_lock_base_changed" app)" "$app_before"
+assert_equals "pkg_lock_nested_dependency_change_does_not_rehash_owner" "$(pkg_lock_digest "$pkg_lock_base_changed" lib)" "$lib_before"
+assert_not_equals "pkg_lock_source_change_rehashes_own_package" "$(pkg_lock_digest "$pkg_lock_base_changed" base)" "$base_before"
+
+printf 'fn main() -> i64 { 1 }\n' > "$tmp_pkg_lock_dir/main.weft"
+(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock >/dev/null)
+pkg_lock_root_changed=$(< "$tmp_pkg_lock_dir/weft.lock")
+assert_not_equals "pkg_lock_root_source_change_rehashes_root" "$(pkg_lock_digest "$pkg_lock_root_changed" app)" "$app_before"
+assert_equals "pkg_lock_root_change_preserves_dependency_digest" "$(pkg_lock_digest "$pkg_lock_root_changed" lib)" "$lib_before"
+
+printf '{"package":"app","dependencies":{"wrong":"deps/lib"}}\n' > "$tmp_pkg_lock_dir/weft.pkg"
+if pkg_lock_mismatch=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock 2>&1); then
+  echo "  fail pkg_lock_rejects_dependency_name_mismatch"
+  exit 1
+else
+  assert_contains "pkg_lock_rejects_dependency_name_mismatch" "$pkg_lock_mismatch" "pkg: dependency key does not match package name"
+fi
+
+mkdir -p "$tmp_pkg_lock_dir/deps/lib/deps/app"
+printf '{"package":"app","dependencies":{"lib":"deps/lib"}}\n' > "$tmp_pkg_lock_dir/weft.pkg"
+printf '{"package":"lib","dependencies":{"app":"deps/app"}}\n' > "$tmp_pkg_lock_dir/deps/lib/weft.pkg"
+printf '{"package":"app","dependencies":{}}\n' > "$tmp_pkg_lock_dir/deps/lib/deps/app/weft.pkg"
+if pkg_lock_cycle=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock 2>&1); then
+  echo "  fail pkg_lock_rejects_dependency_cycle"
+  exit 1
+else
+  assert_contains "pkg_lock_rejects_dependency_cycle" "$pkg_lock_cycle" "pkg: package dependency cycle"
+fi
+
+mkdir -p "$tmp_pkg_lock_dir/deps/left/deps/common" "$tmp_pkg_lock_dir/deps/right/deps/common"
+printf '{"package":"app","dependencies":{"left":"deps/left","right":"deps/right"}}\n' > "$tmp_pkg_lock_dir/weft.pkg"
+printf '{"package":"left","dependencies":{"common":"deps/common"}}\n' > "$tmp_pkg_lock_dir/deps/left/weft.pkg"
+printf '{"package":"right","dependencies":{"common":"deps/common"}}\n' > "$tmp_pkg_lock_dir/deps/right/weft.pkg"
+printf '{"package":"common","version":"1.0.0","dependencies":{}}\n' > "$tmp_pkg_lock_dir/deps/left/deps/common/weft.pkg"
+printf '{"package":"common","version":"1.0.0","dependencies":{}}\n' > "$tmp_pkg_lock_dir/deps/right/deps/common/weft.pkg"
+printf 'pub fn value() -> i64 { 1 }\n' > "$tmp_pkg_lock_dir/deps/left/deps/common/value.weft"
+printf 'pub fn value() -> i64 { 2 }\n' > "$tmp_pkg_lock_dir/deps/right/deps/common/value.weft"
+if pkg_lock_conflict=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock 2>&1); then
+  echo "  fail pkg_lock_rejects_content_identity_conflict"
+  exit 1
+else
+  assert_contains "pkg_lock_rejects_content_identity_conflict" "$pkg_lock_conflict" "pkg: package identity conflict in dependency graph"
+fi
+
+printf '{"package":' > "$tmp_pkg_lock_dir/weft.pkg"
+if pkg_lock_malformed=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock 2>&1); then
+  echo "  fail pkg_lock_rejects_malformed_root_manifest"
+  exit 1
+else
+  assert_contains "pkg_lock_rejects_malformed_root_manifest" "$pkg_lock_malformed" "pkg: malformed or missing package manifest"
 fi
 
 printf 'fn helper() -> i64 { 42 }\nfn main() -> i64 { helper() }\n' > "$tmp_src"

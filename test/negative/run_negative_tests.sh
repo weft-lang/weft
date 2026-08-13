@@ -379,6 +379,7 @@ check_rejects "time_raw_clock_requires_trusted" "test/negative/time_raw_clock_re
 check_rejects "time_raw_sleep_requires_trusted" "test/negative/time_raw_sleep_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "dir_list_requires_effect" "test/negative/dir_list_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "dir_stat_requires_effect" "test/negative/dir_stat_requires_effect.weft" "type error: effect not available in caller"
+check_rejects "dir_lstat_requires_effect" "test/negative/dir_lstat_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "dir_mkdir_requires_effect" "test/negative/dir_mkdir_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "dir_remove_requires_effect" "test/negative/dir_remove_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "dir_rename_requires_effect" "test/negative/dir_rename_requires_effect.weft" "type error: effect not available in caller"
