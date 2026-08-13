@@ -348,10 +348,10 @@ assert_contains "check_reports_diagnostics" "$diag_out" "type error: unknown ide
 assert_equals "diagnostic_snapshot_exact" "$diag_out" $'line 1, col 20: type error: unknown identifier\ncheck: 1 functions, 1 errors'
 
 mcp_out=$(printf '%s' '{ "jsonrpc" : "2.0", "id" : 1, "method" : "tools/list" }' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"experimental"},{"name":"effect_lookup","stability":"experimental"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"}]}}'
+assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/list","meta":[true,null,1,-2.5,3e4,{"x":"y"}]}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_nested_extra_json_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"experimental"},{"name":"effect_lookup","stability":"experimental"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"}]}}'
+assert_equals "mcp_nested_extra_json_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"parse_summary","arguments":{"source" : "fn main() -> i64 { 42 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_parse_summary_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"parse_summary","ok":true,"schema_version":1,"stability":"internal","functions":1,"first_body_tag":1}}'
@@ -375,22 +375,28 @@ mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"
 assert_equals "mcp_ir_summary_test_deferred_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"ir_summary","ok":true,"schema_version":1,"stability":"internal","functions":2,"blocks":3,"insts":4}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"type_lookup","arguments":{"source":"fn add(x: i64, y: i64) -[Log]> i64 { x + y }\neffect Log { fn hit() -> i64 }","name":"add"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_type_lookup_function_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"schema_version":1,"stability":"experimental","name":"add","found":true,"kind":"function","params":2,"return_type_tag":2,"return_type_prim":0,"effects":1,"effect_tail":0}}'
+assert_equals "mcp_type_lookup_function_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"schema_version":1,"stability":"stable","name":"add","found":true,"fact":{"kind":"function","name":"add","parameters":[{"name":"x","type":{"kind":"primitive","name":"i64"}},{"name":"y","type":{"kind":"primitive","name":"i64"}}],"return_type":{"kind":"primitive","name":"i64"},"effects":{"kind":"closed","atoms":[{"name":"Log","arguments":[]}]},"purity":"effectful","ownership":{"kind":"unknown"},"return_shape":{"kind":"words","count":1},"bounds":{"kind":"unknown"}}}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"type_lookup","arguments":{"source":"type Pair { left: i64, right: str }\nfn main() -> i64 { 0 }","name":"Pair"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_type_lookup_record_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"schema_version":1,"stability":"experimental","name":"Pair","found":true,"kind":"record","items":2,"type_params":0}}'
+assert_equals "mcp_type_lookup_record_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"schema_version":1,"stability":"stable","name":"Pair","found":true,"fact":{"kind":"type_declaration","name":"Pair","declaration_kind":"record","type_parameters":[],"items":2}}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"type_lookup","arguments":{"source":"fn main() -> i64 { 0 }","name":"missing"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_type_lookup_missing_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"schema_version":1,"stability":"experimental","name":"missing","found":false}}'
+assert_equals "mcp_type_lookup_missing_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"schema_version":1,"stability":"stable","name":"missing","found":false}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"effect_lookup","arguments":{"source":"effect Log { fn hit(x: i64) -> bool }\nfn main() -> i64 { 0 }","name":"Log"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_effect_lookup_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"effect_lookup","ok":true,"schema_version":1,"stability":"experimental","name":"Log","found":true,"kind":"effect","ops":1,"first_op":"hit","first_op_params":1,"first_op_return_type_tag":2,"first_op_return_type_prim":2,"first_op_deferred":0}}'
+assert_equals "mcp_effect_lookup_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"effect_lookup","ok":true,"schema_version":1,"stability":"stable","name":"Log","found":true,"fact":{"kind":"effect_declaration","name":"Log","type_parameters":[],"operations":[{"name":"hit","parameters":[{"name":"x","type":{"kind":"primitive","name":"i64"}}],"return_type":{"kind":"primitive","name":"bool"},"deferred":false}]}}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"effect_lookup","arguments":{"source":"effect Async { @deferred fn wait() -> i64 }\nfn main() -> i64 { 0 }","name":"Async"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_effect_lookup_deferred_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"effect_lookup","ok":true,"schema_version":1,"stability":"experimental","name":"Async","found":true,"kind":"effect","ops":1,"first_op":"wait","first_op_params":0,"first_op_return_type_tag":2,"first_op_return_type_prim":0,"first_op_deferred":1}}'
+assert_equals "mcp_effect_lookup_deferred_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"effect_lookup","ok":true,"schema_version":1,"stability":"stable","name":"Async","found":true,"fact":{"kind":"effect_declaration","name":"Async","type_parameters":[],"operations":[{"name":"wait","parameters":[],"return_type":{"kind":"primitive","name":"i64"},"deferred":true}]}}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"type_lookup","arguments":{"source":"fn fact_invoke<E>(body: () -[E]> i64) -[E]> i64 { body() }","name":"fact_invoke"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_type_lookup_open_effect_fact_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"schema_version":1,"stability":"stable","name":"fact_invoke","found":true,"fact":{"kind":"function","name":"fact_invoke","parameters":[{"name":"body","type":{"kind":"function","parameters":[],"return_type":{"kind":"primitive","name":"i64"},"effects":{"kind":"open","atoms":[],"tail":"E"}}}],"return_type":{"kind":"primitive","name":"i64"},"effects":{"kind":"open","atoms":[],"tail":"E"},"purity":"open","ownership":{"kind":"unknown"},"return_shape":{"kind":"words","count":1},"bounds":{"kind":"unknown"}}}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"effect_lookup","arguments":{"source":"effect Box<T> { fn get(value: T) -> T } fn main() -> i64 { 0 }","name":"Box"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_effect_lookup_parameterized_fact_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"effect_lookup","ok":true,"schema_version":1,"stability":"stable","name":"Box","found":true,"fact":{"kind":"effect_declaration","name":"Box","type_parameters":[{"name":"T","bounds":{"kind":"unknown"}}],"operations":[{"name":"get","parameters":[{"name":"value","type":{"kind":"variable","name":"T"}}],"return_type":{"kind":"variable","name":"T"},"deferred":false}]}}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"effect_lookup","arguments":{"source":"fn main() -> i64 { 0 }","name":"Missing"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_effect_lookup_missing_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"effect_lookup","ok":true,"schema_version":1,"stability":"experimental","name":"Missing","found":false}}'
+assert_equals "mcp_effect_lookup_missing_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"effect_lookup","ok":true,"schema_version":1,"stability":"stable","name":"Missing","found":false}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -> i64 { 42 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_clean_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":0,"functions":1,"check_errors":0,"items":[]}}'
@@ -875,10 +881,10 @@ mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"
 assert_equals "mcp_ir_summary_invalid_source_json_only_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"ir_summary","ok":true,"schema_version":1,"stability":"internal","functions":0,"blocks":0,"insts":0}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"type_lookup","arguments":{"source":"fn main() -> i64 { missing }","name":"main"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_type_lookup_invalid_source_json_only_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"schema_version":1,"stability":"experimental","name":"main","found":true,"kind":"function","params":0,"return_type_tag":2,"return_type_prim":0,"effects":0,"effect_tail":0}}'
+assert_equals "mcp_type_lookup_invalid_source_json_only_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"schema_version":1,"stability":"stable","name":"main","found":true,"fact":{"kind":"function","name":"main","parameters":[],"return_type":{"kind":"primitive","name":"i64"},"effects":{"kind":"closed","atoms":[]},"purity":"pure","ownership":{"kind":"unknown"},"return_shape":{"kind":"words","count":1},"bounds":{"kind":"unknown"}}}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"effect_lookup","arguments":{"source":"effect Log { fn hit() -> i64 } fn main() -> i64 { missing }","name":"Log"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_effect_lookup_invalid_source_json_only_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"effect_lookup","ok":true,"schema_version":1,"stability":"experimental","name":"Log","found":true,"kind":"effect","ops":1,"first_op":"hit","first_op_params":0,"first_op_return_type_tag":2,"first_op_return_type_prim":0,"first_op_deferred":0}}'
+assert_equals "mcp_effect_lookup_invalid_source_json_only_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"effect_lookup","ok":true,"schema_version":1,"stability":"stable","name":"Log","found":true,"fact":{"kind":"effect_declaration","name":"Log","type_parameters":[],"operations":[{"name":"hit","parameters":[],"return_type":{"kind":"primitive","name":"i64"},"deferred":false}]}}}'
 
 # opt_counters: full optimise + native-lower pipeline counter report
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"fn add(a: i64, b: i64) -> i64 { a + b }\nfn main() -> i64 { add(1, 2) }"}}}' | "$WEFT" mcp 2>&1)
@@ -923,7 +929,7 @@ assert_contains "mcp_serve_initialize_echoes_protocol" "$mcp_serve_out" '"protoc
 assert_contains "mcp_serve_initialize_serverinfo" "$mcp_serve_out" '"serverInfo":{"name":"weft"'
 assert_contains "mcp_serve_tools_list_has_schema" "$mcp_serve_out" '"inputSchema":{"type":"object"'
 assert_contains "mcp_serve_tools_list_marks_stable_diagnostics" "$mcp_serve_out" '"name":"diagnostics","x-weft-stability":"stable"'
-assert_contains "mcp_serve_tools_list_marks_experimental_lookup" "$mcp_serve_out" '"name":"type_lookup","x-weft-stability":"experimental"'
+assert_contains "mcp_serve_tools_list_marks_stable_lookup" "$mcp_serve_out" '"name":"type_lookup","x-weft-stability":"stable"'
 assert_contains "mcp_serve_tools_list_marks_internal_ir" "$mcp_serve_out" '"name":"ir_summary","x-weft-stability":"internal"'
 assert_contains "mcp_serve_call_wraps_content_and_echoes_id" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"call-2","result":{"content":[{"type":"text","text":"{\"tool\":\"parse_summary\",\"ok\":true'
 assert_contains "mcp_serve_ping" "$mcp_serve_out" '{"jsonrpc":"2.0","id":3,"result":{}}'
@@ -1833,4 +1839,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 389 passed, 0 failed"
+echo "Tool boundary summary: 391 passed, 0 failed"
