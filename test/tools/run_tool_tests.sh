@@ -26,12 +26,13 @@ tmp_test_dir=$(mktemp -d /tmp/weft_tool_test_dir_XXXXXX)
 tmp_pkg_dir=$(mktemp -d /tmp/weft_tool_pkg_XXXXXX)
 tmp_pkg_cli_dir=$(mktemp -d /tmp/weft_tool_pkg_cli_XXXXXX)
 tmp_pkg_lock_dir=$(mktemp -d /tmp/weft_tool_pkg_lock_XXXXXX)
+tmp_pkg_trust_dir=$(mktemp -d /tmp/weft_tool_pkg_trust_XXXXXX)
 tmp_pkg_missing_dir=$(mktemp -d /tmp/weft_tool_pkg_missing_XXXXXX)
 tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir"' EXIT
 
 now_s() {
   date +%s
@@ -1345,6 +1346,91 @@ else
   assert_contains "pkg_lock_rejects_malformed_root_manifest" "$pkg_lock_malformed" "pkg: malformed or missing package manifest"
 fi
 
+# Root authority and dependency declaration must compose over the exact locked
+# package identity. Neither half is independently sufficient.
+mkdir -p "$tmp_pkg_trust_dir/direct/deps/dep/native"
+printf 'use dep/native/raw.{*}\nfn main() -> i64 { 0 }\n' > "$tmp_pkg_trust_dir/direct/main.weft"
+printf 'pub fn raw_probe(p: i64) -> i64 { __mem_load64(p) }\n' > "$tmp_pkg_trust_dir/direct/deps/dep/native/raw.weft"
+printf '{"package":"dep","manifest_version":1,"version":"2.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["native/raw"]}\n' > "$tmp_pkg_trust_dir/direct/deps/dep/weft.pkg"
+printf '{"lock_version":1,"manifest_version":1,"weft":"0.1","packages":[{"name":"app","version":"1.0.0","source":"path:.","content":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},{"name":"dep","version":"2.0.0","source":"path:deps/dep","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111"}]}\n' > "$tmp_pkg_trust_dir/direct/weft.lock"
+
+printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"dep":"deps/dep"},"trust":{"dep":{"version":"2.0.0","source":"path:deps/dep","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111","modules":["native/raw"]}}}\n' > "$tmp_pkg_trust_dir/direct/weft.pkg"
+pkg_trust_exact=$(cd "$tmp_pkg_trust_dir/direct" && "$WEFT_ABS" check main.weft 2>&1)
+assert_contains "package_binding_exact_locked_grant_compiles" "$pkg_trust_exact" "check: 2 functions, 0 errors"
+
+printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"dep":"deps/dep"},"trust":{"dep":{"version":"9.0.0","source":"path:deps/dep","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111","modules":["native/raw"]}}}\n' > "$tmp_pkg_trust_dir/direct/weft.pkg"
+pkg_trust_wrong_version=$(cd "$tmp_pkg_trust_dir/direct" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_binding_rejects_wrong_grant_version" "$pkg_trust_wrong_version" "error[E5008]: binding module 'native/raw' in package 'dep' lacks an exact root trust grant"
+
+printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"dep":"deps/dep"},"trust":{"dep":{"version":"2.0.0","source":"path:vendor/dep","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111","modules":["native/raw"]}}}\n' > "$tmp_pkg_trust_dir/direct/weft.pkg"
+pkg_trust_wrong_source=$(cd "$tmp_pkg_trust_dir/direct" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_binding_rejects_wrong_grant_source" "$pkg_trust_wrong_source" "error[E5008]: binding module 'native/raw' in package 'dep' lacks an exact root trust grant"
+
+printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"dep":"deps/dep"},"trust":{"dep":{"version":"2.0.0","source":"path:deps/dep","content":"sha256:2222222222222222222222222222222222222222222222222222222222222222","modules":["native/raw"]}}}\n' > "$tmp_pkg_trust_dir/direct/weft.pkg"
+pkg_trust_wrong_content=$(cd "$tmp_pkg_trust_dir/direct" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_binding_rejects_wrong_grant_content" "$pkg_trust_wrong_content" "error[E5008]: binding module 'native/raw' in package 'dep' lacks an exact root trust grant"
+
+printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"dep":"deps/dep"},"trust":{"dep":{"version":"2.0.0","source":"path:deps/dep","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111","modules":["native/other"]}}}\n' > "$tmp_pkg_trust_dir/direct/weft.pkg"
+pkg_trust_wrong_module=$(cd "$tmp_pkg_trust_dir/direct" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_binding_rejects_wrong_grant_module" "$pkg_trust_wrong_module" "error[E5008]: binding module 'native/raw' in package 'dep' lacks an exact root trust grant"
+
+printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"dep":"deps/dep"}}\n' > "$tmp_pkg_trust_dir/direct/weft.pkg"
+pkg_trust_missing_grant=$(cd "$tmp_pkg_trust_dir/direct" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_binding_rejects_missing_root_grant" "$pkg_trust_missing_grant" "error[E5008]: binding module 'native/raw' in package 'dep' lacks an exact root trust grant"
+
+printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"dep":"deps/dep"},"trust":{"dep":{"version":"2.0.0","source":"path:deps/dep","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111","modules":["native/raw"]}}}\n' > "$tmp_pkg_trust_dir/direct/weft.pkg"
+printf '{"package":"dep","manifest_version":1,"version":"2.0.0","weft":"0.1","dependencies":{}}\n' > "$tmp_pkg_trust_dir/direct/deps/dep/weft.pkg"
+pkg_trust_missing_declaration=$(cd "$tmp_pkg_trust_dir/direct" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_binding_rejects_missing_dependency_declaration" "$pkg_trust_missing_declaration" "error[E5008]: binding module 'native/raw' in package 'dep' lacks an exact root trust grant"
+
+printf '{"package":"dep","manifest_version":1,"version":"2.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["native/raw"]}\n' > "$tmp_pkg_trust_dir/direct/deps/dep/weft.pkg"
+mv "$tmp_pkg_trust_dir/direct/weft.lock" "$tmp_pkg_trust_dir/direct/weft.lock.saved"
+pkg_trust_unlocked=$(cd "$tmp_pkg_trust_dir/direct" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_binding_rejects_unlocked_dependency" "$pkg_trust_unlocked" "error[E5008]: binding module 'native/raw' in package 'dep' lacks an exact root trust grant"
+mv "$tmp_pkg_trust_dir/direct/weft.lock.saved" "$tmp_pkg_trust_dir/direct/weft.lock"
+
+printf '{"package":"dep","manifest_version":1,"version":"2.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["native/raw"],"trust":{"other":{"version":"1.0.0","source":"path:deps/other","content":"sha256:3333333333333333333333333333333333333333333333333333333333333333","modules":["native/raw"]}}}\n' > "$tmp_pkg_trust_dir/direct/deps/dep/weft.pkg"
+pkg_trust_dependency_grant=$(cd "$tmp_pkg_trust_dir/direct" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_binding_rejects_dependency_grant" "$pkg_trust_dependency_grant" "error[E5007]: dependency 'dep' attempts to grant package trust from a dependency manifest"
+
+# A root may authorize its own binding without a circular content hash.
+mkdir -p "$tmp_pkg_trust_dir/root_owned/native"
+printf '{"package":"app","trusted_bindings":["native/raw"]}\n' > "$tmp_pkg_trust_dir/root_owned/weft.pkg"
+printf 'use native/raw.{*}\nfn main() -> i64 { 0 }\n' > "$tmp_pkg_trust_dir/root_owned/main.weft"
+printf 'pub fn raw_probe(p: i64) -> i64 { __mem_load64(p) }\n' > "$tmp_pkg_trust_dir/root_owned/native/raw.weft"
+pkg_trust_root_owned=$(cd "$tmp_pkg_trust_dir/root_owned" && "$WEFT_ABS" check main.weft 2>&1)
+assert_contains "package_root_owned_binding_compiles" "$pkg_trust_root_owned" "check: 2 functions, 0 errors"
+
+# Trust belongs to the exact source buffer; importing an unlisted helper from
+# a trusted binding does not make that helper trusted.
+printf 'use native/helper.{*}\npub fn raw_probe(p: i64) -> i64 { helper_probe(p) }\n' > "$tmp_pkg_trust_dir/root_owned/native/raw.weft"
+printf 'pub fn helper_probe(p: i64) -> i64 { __mem_load64(p) }\n' > "$tmp_pkg_trust_dir/root_owned/native/helper.weft"
+pkg_trust_nonpropagating=$(cd "$tmp_pkg_trust_dir/root_owned" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_binding_trust_does_not_propagate_to_imports" "$pkg_trust_nonpropagating" "type error: Unsafe is sealed to trusted runtime/platform code"
+
+# A dependency physically rooted at runtime/ cannot inherit the compiler's
+# transitional root-package path trust.
+mkdir -p "$tmp_pkg_trust_dir/path_alias/runtime"
+printf '{"package":"app","dependencies":{"runtime":"runtime"}}\n' > "$tmp_pkg_trust_dir/path_alias/weft.pkg"
+printf '{"package":"runtime","dependencies":{}}\n' > "$tmp_pkg_trust_dir/path_alias/runtime/weft.pkg"
+printf 'use runtime/alloc.{*}\nfn main() -> i64 { 0 }\n' > "$tmp_pkg_trust_dir/path_alias/main.weft"
+printf 'pub fn raw_probe(p: i64) -> i64 { __mem_load64(p) }\n' > "$tmp_pkg_trust_dir/path_alias/runtime/alloc.weft"
+pkg_trust_path_alias=$(cd "$tmp_pkg_trust_dir/path_alias" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_dependency_cannot_alias_builtin_trust_path" "$pkg_trust_path_alias" "type error: Unsafe is sealed to trusted runtime/platform code"
+
+# Root authority may explicitly name a transitive package, but the
+# intermediate dependency cannot forward or synthesize that authority.
+mkdir -p "$tmp_pkg_trust_dir/transitive/deps/mid/deps/leaf/native"
+printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"mid":"deps/mid"},"trust":{"leaf":{"version":"3.0.0","source":"path:deps/mid/deps/leaf","content":"sha256:2222222222222222222222222222222222222222222222222222222222222222","modules":["native/raw"]}}}\n' > "$tmp_pkg_trust_dir/transitive/weft.pkg"
+printf '{"package":"mid","manifest_version":1,"version":"2.0.0","weft":"0.1","dependencies":{"leaf":"deps/leaf"}}\n' > "$tmp_pkg_trust_dir/transitive/deps/mid/weft.pkg"
+printf '{"package":"leaf","manifest_version":1,"version":"3.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["native/raw"]}\n' > "$tmp_pkg_trust_dir/transitive/deps/mid/deps/leaf/weft.pkg"
+printf 'use leaf/native/raw.{*}\npub fn wrapped() -> i64 { 0 }\n' > "$tmp_pkg_trust_dir/transitive/deps/mid/wrapper.weft"
+printf 'pub fn raw_probe(p: i64) -> i64 { __mem_load64(p) }\n' > "$tmp_pkg_trust_dir/transitive/deps/mid/deps/leaf/native/raw.weft"
+printf 'use mid/wrapper.{*}\nfn main() -> i64 { wrapped() }\n' > "$tmp_pkg_trust_dir/transitive/main.weft"
+printf '{"lock_version":1,"manifest_version":1,"weft":"0.1","packages":[{"name":"app","version":"1.0.0","source":"path:.","content":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},{"name":"leaf","version":"3.0.0","source":"path:deps/mid/deps/leaf","content":"sha256:2222222222222222222222222222222222222222222222222222222222222222"},{"name":"mid","version":"2.0.0","source":"path:deps/mid","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111"}]}\n' > "$tmp_pkg_trust_dir/transitive/weft.lock"
+pkg_trust_transitive=$(cd "$tmp_pkg_trust_dir/transitive" && "$WEFT_ABS" check main.weft 2>&1)
+assert_contains "package_root_can_explicitly_grant_transitive_binding" "$pkg_trust_transitive" "check: 3 functions, 0 errors"
+
 printf 'fn helper() -> i64 { 42 }\nfn main() -> i64 { helper() }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" symbols "$tmp_src" > "$tmp_out" 2> "$tmp_err"
 symbols_out=$(<"$tmp_out")
@@ -1688,4 +1774,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 361 passed, 0 failed"
+echo "Tool boundary summary: 374 passed, 0 failed"
