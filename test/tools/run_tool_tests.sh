@@ -1129,6 +1129,16 @@ printf 'use left/lib.{left_value}\nuse right/lib.{right_value}\nfn main() -> i64
 package_conflict_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
 assert_contains "package_source_conflict_stable_code" "$package_conflict_out" "error[E5003]: dependency 'common' resolves to conflicting source identities"
 
+mkdir -p "$tmp_pkg_dir/deps/cycle_a/deps/cycle_b"
+printf '{"package":"app","dependencies":{"cycle_a":"deps/cycle_a"}}\n' > "$tmp_pkg_dir/weft.pkg"
+printf '{"package":"cycle_a","dependencies":{"cycle_b":"deps/cycle_b"}}\n' > "$tmp_pkg_dir/deps/cycle_a/weft.pkg"
+printf '{"package":"cycle_b","dependencies":{"cycle_a":"deps/cycle_a"}}\n' > "$tmp_pkg_dir/deps/cycle_a/deps/cycle_b/weft.pkg"
+printf 'use cycle_b/lib.{cycle_b_value}\npub fn cycle_a_value() -> i64 { cycle_b_value() }\n' > "$tmp_pkg_dir/deps/cycle_a/lib.weft"
+printf 'use cycle_a/lib.{cycle_a_value}\npub fn cycle_b_value() -> i64 { cycle_a_value() }\n' > "$tmp_pkg_dir/deps/cycle_a/deps/cycle_b/lib.weft"
+printf 'use cycle_a/lib.{cycle_a_value}\nfn main() -> i64 { cycle_a_value() }\n' > "$tmp_pkg_dir/app.weft"
+package_cycle_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
+assert_contains "package_dependency_cycle_stable_code" "$package_cycle_out" "error[E5004]: dependency 'cycle_a' forms a package dependency cycle"
+
 outside_name=$(basename "$tmp_outside_dir")
 printf 'fn hidden() -> i64 { 0 }\n' > "$tmp_outside_dir/lib.weft"
 printf 'package app\ndep evil ../%s\n' "$outside_name" > "$tmp_pkg_dir/weft.pkg"
