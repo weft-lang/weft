@@ -348,10 +348,10 @@ assert_contains "check_reports_diagnostics" "$diag_out" "type error: unknown ide
 assert_equals "diagnostic_snapshot_exact" "$diag_out" $'line 1, col 20: type error: unknown identifier\ncheck: 1 functions, 1 errors'
 
 mcp_out=$(printf '%s' '{ "jsonrpc" : "2.0", "id" : 1, "method" : "tools/list" }' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"}]}}'
+assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"},{"name":"fact_at_position","stability":"stable"},{"name":"visible_bindings","stability":"stable"},{"name":"conformance_at_position","stability":"stable"}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/list","meta":[true,null,1,-2.5,3e4,{"x":"y"}]}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_nested_extra_json_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"}]}}'
+assert_equals "mcp_nested_extra_json_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"},{"name":"fact_at_position","stability":"stable"},{"name":"visible_bindings","stability":"stable"},{"name":"conformance_at_position","stability":"stable"}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"parse_summary","arguments":{"source" : "fn main() -> i64 { 42 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_parse_summary_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"parse_summary","ok":true,"schema_version":1,"stability":"internal","functions":1,"first_body_tag":1}}'
@@ -397,6 +397,42 @@ assert_equals "mcp_effect_lookup_parameterized_fact_snapshot" "$mcp_out" '{"json
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"effect_lookup","arguments":{"source":"fn main() -> i64 { 0 }","name":"Missing"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_effect_lookup_missing_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"effect_lookup","ok":true,"schema_version":1,"stability":"stable","name":"Missing","found":false}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fact_at_position","arguments":{"source":"fn main() -> i64 { 0 }","offset":7}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_fact_at_position_cursor_end_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"fact_at_position","ok":true,"schema_version":1,"stability":"stable","offset":7,"found":true,"fact":{"kind":"symbol","name":"main","symbol_kind":"function","type":{"kind":"function","parameters":[],"return_type":{"kind":"primitive","name":"i64"},"effects":{"kind":"closed","atoms":[]}},"occurrence":{"path":"","start":3,"length":4},"definition":{"path":"","start":3,"length":4}}}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fact_at_position","arguments":{"source":"fn main() -> i64 { 0 }","offset":8}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_fact_at_position_missing_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"fact_at_position","ok":true,"schema_version":1,"stability":"stable","offset":8,"found":false}}'
+
+mcp_binding_source='fn inspect(value: i64) -> i64 { value }'
+mcp_binding_prefix='fn inspect(value: i64) -> i64 { '
+mcp_binding_offset=${#mcp_binding_prefix}
+mcp_out=$(printf '%s' "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"visible_bindings\",\"arguments\":{\"source\":\"$mcp_binding_source\",\"offset\":$mcp_binding_offset}}}" | "$WEFT" mcp 2>&1)
+assert_contains "mcp_visible_bindings_schema" "$mcp_out" "{\"tool\":\"visible_bindings\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"offset\":$mcp_binding_offset,\"bindings\":["
+assert_contains "mcp_visible_bindings_typed_parameter" "$mcp_out" '{"name":"value","symbol_kind":"parameter","type":{"kind":"primitive","name":"i64"}}'
+
+mcp_conformance_source='trait Mark { fn mark(self) -> i64 } impl Mark for i64 { fn mark(self: i64) -> i64 { self } } fn main() -> i64 { let value = 1 let other = true if other { value } else { value } }'
+mcp_conformance_value_prefix='trait Mark { fn mark(self) -> i64 } impl Mark for i64 { fn mark(self: i64) -> i64 { self } } fn main() -> i64 { let value = 1 let other = true if other { '
+mcp_conformance_value_offset=${#mcp_conformance_value_prefix}
+mcp_conformance_bool_prefix='trait Mark { fn mark(self) -> i64 } impl Mark for i64 { fn mark(self: i64) -> i64 { self } } fn main() -> i64 { let value = 1 let other = true if '
+mcp_conformance_bool_offset=${#mcp_conformance_bool_prefix}
+mcp_out=$(printf '%s' "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"conformance_at_position\",\"arguments\":{\"source\":\"$mcp_conformance_source\",\"offset\":$mcp_conformance_value_offset,\"trait\":\"Mark\"}}}" | "$WEFT" mcp 2>&1)
+assert_equals "mcp_conformance_at_position_yes_snapshot" "$mcp_out" "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tool\":\"conformance_at_position\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"offset\":$mcp_conformance_value_offset,\"found\":true,\"fact\":{\"kind\":\"conformance\",\"type\":{\"kind\":\"primitive\",\"name\":\"i64\"},\"trait\":\"Mark\",\"decision\":\"yes\"}}}"
+
+mcp_out=$(printf '%s' "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"conformance_at_position\",\"arguments\":{\"source\":\"$mcp_conformance_source\",\"offset\":$mcp_conformance_bool_offset,\"trait\":\"Mark\"}}}" | "$WEFT" mcp 2>&1)
+assert_equals "mcp_conformance_at_position_no_snapshot" "$mcp_out" "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tool\":\"conformance_at_position\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"offset\":$mcp_conformance_bool_offset,\"found\":true,\"fact\":{\"kind\":\"conformance\",\"type\":{\"kind\":\"primitive\",\"name\":\"bool\"},\"trait\":\"Mark\",\"decision\":\"no\"}}}"
+
+mcp_out=$(printf '%s' "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"conformance_at_position\",\"arguments\":{\"source\":\"$mcp_conformance_source\",\"offset\":$mcp_conformance_value_offset,\"trait\":\"MissingTrait\"}}}" | "$WEFT" mcp 2>&1)
+assert_equals "mcp_conformance_at_position_unknown_trait_snapshot" "$mcp_out" "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tool\":\"conformance_at_position\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"offset\":$mcp_conformance_value_offset,\"found\":true,\"fact\":{\"kind\":\"conformance\",\"type\":{\"kind\":\"primitive\",\"name\":\"i64\"},\"trait\":\"MissingTrait\",\"decision\":{\"kind\":\"unknown\",\"reason\":\"unknown_trait\"}}}}"
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fact_at_position","arguments":{"source":"fn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_fact_at_position_requires_offset" "$mcp_out" '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"missing position offset"}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fact_at_position","arguments":{"source":"fn main() -> i64 { 0 }","offset":99}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_fact_at_position_rejects_out_of_range" "$mcp_out" '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"position offset out of range"}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"conformance_at_position","arguments":{"source":"fn main() -> i64 { 0 }","offset":3}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_conformance_at_position_requires_trait" "$mcp_out" '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"missing trait name"}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -> i64 { 42 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_clean_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":0,"functions":1,"check_errors":0,"items":[]}}'
@@ -930,6 +966,7 @@ assert_contains "mcp_serve_initialize_serverinfo" "$mcp_serve_out" '"serverInfo"
 assert_contains "mcp_serve_tools_list_has_schema" "$mcp_serve_out" '"inputSchema":{"type":"object"'
 assert_contains "mcp_serve_tools_list_marks_stable_diagnostics" "$mcp_serve_out" '"name":"diagnostics","x-weft-stability":"stable"'
 assert_contains "mcp_serve_tools_list_marks_stable_lookup" "$mcp_serve_out" '"name":"type_lookup","x-weft-stability":"stable"'
+assert_contains "mcp_serve_tools_list_marks_stable_position_facts" "$mcp_serve_out" '"name":"fact_at_position","x-weft-stability":"stable"'
 assert_contains "mcp_serve_tools_list_marks_internal_ir" "$mcp_serve_out" '"name":"ir_summary","x-weft-stability":"internal"'
 assert_contains "mcp_serve_call_wraps_content_and_echoes_id" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"call-2","result":{"content":[{"type":"text","text":"{\"tool\":\"parse_summary\",\"ok\":true'
 assert_contains "mcp_serve_ping" "$mcp_serve_out" '{"jsonrpc":"2.0","id":3,"result":{}}'
@@ -2049,4 +2086,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 449 passed, 0 failed"
+echo "Tool boundary summary: 460 passed, 0 failed"
