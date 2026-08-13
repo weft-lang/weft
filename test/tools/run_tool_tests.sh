@@ -1166,6 +1166,9 @@ pkg_init_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg init cli_app 2>&1)
 assert_contains "pkg_init_writes_manifest" "$pkg_init_out" "pkg: wrote weft.pkg"
 pkg_manifest=$(< "$tmp_pkg_cli_dir/weft.pkg")
 assert_contains "pkg_init_manifest_package" "$pkg_manifest" '"package":"cli_app"'
+assert_contains "pkg_init_manifest_schema_version" "$pkg_manifest" '"manifest_version":1'
+assert_contains "pkg_init_manifest_package_version" "$pkg_manifest" '"version":"0.1.0"'
+assert_contains "pkg_init_manifest_weft_version" "$pkg_manifest" '"weft":"0.1"'
 
 pkg_add_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg add math deps/math 2>&1)
 assert_contains "pkg_add_records_dependency" "$pkg_add_out" "pkg: added dependency"
