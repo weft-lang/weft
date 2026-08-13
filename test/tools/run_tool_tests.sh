@@ -1103,6 +1103,32 @@ echo "  ok package_transitive_owner_relative_reexport_compiles"
 echo "  ok package_loader_keeps_same_module_path_per_owner"
 echo "  ok package_visibility_allows_package_member_inside_owner"
 
+mkdir -p "$tmp_pkg_dir/deps/broken"
+printf '{"package":"app","dependencies":{"broken":"deps/broken"}}\n' > "$tmp_pkg_dir/weft.pkg"
+printf '{"package":' > "$tmp_pkg_dir/deps/broken/weft.pkg"
+printf 'pub fn value() -> i64 { 1 }\n' > "$tmp_pkg_dir/deps/broken/lib.weft"
+printf 'use broken/lib.{value}\nfn main() -> i64 { value() }\n' > "$tmp_pkg_dir/app.weft"
+package_malformed_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
+assert_contains "package_malformed_manifest_stable_code" "$package_malformed_out" "error[E5001]: dependency 'broken' has a malformed manifest"
+
+printf '{"package":"different","dependencies":{}}\n' > "$tmp_pkg_dir/deps/broken/weft.pkg"
+package_mismatch_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
+assert_contains "package_name_mismatch_stable_code" "$package_mismatch_out" "error[E5002]: dependency 'broken' does not match the package name in its manifest"
+
+mkdir -p "$tmp_pkg_dir/deps/left/deps/common" "$tmp_pkg_dir/deps/right/deps/common"
+printf '{"package":"app","dependencies":{"left":"deps/left","right":"deps/right"}}\n' > "$tmp_pkg_dir/weft.pkg"
+printf '{"package":"left","dependencies":{"common":"deps/common"}}\n' > "$tmp_pkg_dir/deps/left/weft.pkg"
+printf '{"package":"right","dependencies":{"common":"deps/common"}}\n' > "$tmp_pkg_dir/deps/right/weft.pkg"
+printf '{"package":"common","dependencies":{}}\n' > "$tmp_pkg_dir/deps/left/deps/common/weft.pkg"
+printf '{"package":"common","dependencies":{}}\n' > "$tmp_pkg_dir/deps/right/deps/common/weft.pkg"
+printf 'pub fn common_value() -> i64 { 1 }\n' > "$tmp_pkg_dir/deps/left/deps/common/value.weft"
+printf 'pub fn common_value() -> i64 { 2 }\n' > "$tmp_pkg_dir/deps/right/deps/common/value.weft"
+printf 'use common/value.{common_value}\npub fn left_value() -> i64 { common_value() }\n' > "$tmp_pkg_dir/deps/left/lib.weft"
+printf 'use common/value.{common_value}\npub fn right_value() -> i64 { common_value() }\n' > "$tmp_pkg_dir/deps/right/lib.weft"
+printf 'use left/lib.{left_value}\nuse right/lib.{right_value}\nfn main() -> i64 { left_value() + right_value() }\n' > "$tmp_pkg_dir/app.weft"
+package_conflict_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
+assert_contains "package_source_conflict_stable_code" "$package_conflict_out" "error[E5003]: dependency 'common' resolves to conflicting source identities"
+
 outside_name=$(basename "$tmp_outside_dir")
 printf 'fn hidden() -> i64 { 0 }\n' > "$tmp_outside_dir/lib.weft"
 printf 'package app\ndep evil ../%s\n' "$outside_name" > "$tmp_pkg_dir/weft.pkg"
