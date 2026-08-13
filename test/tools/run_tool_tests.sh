@@ -374,6 +374,10 @@ mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"
 assert_contains "mcp_module_member_stable_code" "$mcp_out" '"code":"E4002"'
 assert_contains "mcp_module_member_qualified_name" "$mcp_out" "unknown module member 'left.missing'"
 
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"use module_fixtures/g2_function_left.{missing} fn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_contains "mcp_module_scope_audit_stable_code" "$mcp_out" '"code":"E4002"'
+assert_contains "mcp_module_scope_audit_message" "$mcp_out" "unknown module member 'missing' in import"
+
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -[Unsafe]> i64 { __mem_load64(0) }"}}}' | "$WEFT" mcp 2>&1)
 assert_contains "mcp_diagnostics_rejects_root_raw_memory" "$mcp_out" "type error: Unsafe is sealed to trusted runtime/platform code"
 
@@ -923,6 +927,11 @@ lsp_open_module_member='{"jsonrpc":"2.0","method":"textDocument/didOpen","params
 lsp_out=$(lsp_frame "$lsp_open_module_member" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_module_member_stable_code" "$lsp_out" '"code":"E4002"'
 assert_contains "lsp_module_member_qualified_name" "$lsp_out" "unknown module member 'left.missing'"
+
+lsp_open_module_scope='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///module-scope.weft","version":1,"text":"use module_fixtures/g2_function_left.{missing} fn main() -> i64 { 0 }"}}}'
+lsp_out=$(lsp_frame "$lsp_open_module_scope" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_module_scope_audit_stable_code" "$lsp_out" '"code":"E4002"'
+assert_contains "lsp_module_scope_audit_message" "$lsp_out" "unknown module member 'missing' in import"
 
 lsp_open_raw='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///raw.weft","version":1,"text":"fn main() -[Unsafe]> i64 { __mem_load64(0) }"}}}'
 lsp_out=$(lsp_frame "$lsp_open_raw" | "$WEFT" lsp 2>&1)

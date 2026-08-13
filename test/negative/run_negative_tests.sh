@@ -73,7 +73,8 @@ run_guarded() {
 
 # ---------------------------------------------------------------------------
 # Worker mode: `bash run_negative_tests.sh __worker <jobfile>` runs ONE
-# check (jobfile lines: name / file / pattern), streams its ✓/✗ line, and
+# check (jobfile lines: name / file / pattern / optional checker error count),
+# streams its ✓/✗ line, and
 # writes a .meta (pass|fail) + .err record beside the jobfile. Always
 # exits 0; the parent aggregates in job order.
 # ---------------------------------------------------------------------------
@@ -82,6 +83,7 @@ if [ "${1:-}" = "__worker" ]; then
   name=$(sed -n 1p "$jobf")
   file=$(sed -n 2p "$jobf")
   pattern=$(sed -n 3p "$jobf")
+  expected_errors=$(sed -n 4p "$jobf")
 
   set +e
   out=$(run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" check "$file" 2>&1 >/dev/null)
@@ -99,12 +101,19 @@ if [ "${1:-}" = "__worker" ]; then
     echo "fail" > "$jobf.meta"
     exit 0
   fi
-  if echo "$out" | grep -q "$pattern"; then
+  match_count=$(echo "$out" | grep -c "$pattern" || true)
+  exact_errors=1
+  if [ -n "$expected_errors" ] && ! echo "$out" | grep -q "check: .* $expected_errors errors"; then exact_errors=0; fi
+  if [ "$match_count" -gt 0 ] && [ "$exact_errors" -eq 1 ]; then
     echo "  ✓ $name"
     echo "pass" > "$jobf.meta"
   else
     echo "  ✗ $name"
-    echo "  $name: expected diagnostic '$pattern'" > "$jobf.err"
+    if [ -n "$expected_errors" ]; then
+      echo "  $name: expected diagnostic '$pattern' with exactly $expected_errors checker error(s)" > "$jobf.err"
+    else
+      echo "  $name: expected diagnostic '$pattern'" > "$jobf.err"
+    fi
     echo "fail" > "$jobf.meta"
   fi
   exit 0
@@ -122,7 +131,7 @@ check_rejects() {
   JOB_N=$((JOB_N+1))
   local jf
   jf=$(printf '%s/job_%04d' "$JOBS_DIR" "$JOB_N")
-  printf '%s\n%s\n%s\n' "$1" "$2" "$3" > "$jf"
+  printf '%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${4:-}" > "$jf"
 }
 
 check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" "type error: argument type mismatch"
@@ -335,7 +344,17 @@ check_rejects "module_qualified_trait_identity_mismatch" "test/negative/module_q
 check_rejects "module_qualified_trait_bound_identity_mismatch" "test/negative/module_qualified_trait_bound_identity_mismatch.weft" "type error: type does not satisfy trait bound"
 check_rejects "module_qualified_trait_bound_unknown" "test/negative/module_qualified_trait_bound_unknown.weft" "error\[E4002\]: unknown module member 'traits.Missing'"
 check_rejects "module_qualified_trait_bound_private" "test/negative/module_qualified_trait_bound_private.weft" "error\[E4004\]: module member 'traits.HiddenGauge' is not visible"
-check_rejects "module_qualified_member_ambiguous" "test/negative/module_qualified_member_ambiguous.weft" "error\[E4003\]: module member 'ambiguous.work' is ambiguous"
+check_rejects "module_qualified_member_ambiguous" "test/negative/module_qualified_member_ambiguous.weft" "error\[E4003\]: module item 'work' is ambiguous in this scope" 1
+check_rejects "module_selection_missing_unused" "test/negative/module_selection_missing_unused.weft" "error\[E4002\]: unknown module member 'missing' in import" 1
+check_rejects "module_selection_private_unused" "test/negative/module_selection_private_unused.weft" "error\[E4004\]: module member 'hidden' is not visible in this import" 1
+check_rejects "module_selection_missing_referenced" "test/negative/module_selection_missing_referenced.weft" "error\[E4002\]: unknown module member 'missing' in import" 1
+check_rejects "module_selection_private_referenced" "test/negative/module_selection_private_referenced.weft" "error\[E4004\]: module member 'hidden' is not visible in this import" 1
+check_rejects "module_reexport_widening_unused" "test/negative/module_reexport_widening_unused.weft" "error\[E4006\]: module member 'package_value' cannot be re-exported at wider visibility" 1
+check_rejects "module_selection_alias_collision" "test/negative/module_selection_alias_collision.weft" "error\[E4003\]: module item 'duplicate' is ambiguous in this scope" 1
+check_rejects "module_alias_collision" "test/negative/module_alias_collision.weft" "error\[E4003\]: module item 'duplicate' is ambiguous in this scope" 1
+check_rejects "module_local_collision" "test/negative/module_local_collision.weft" "error\[E4003\]: module item 'duplicate' is ambiguous in this scope" 1
+check_rejects "module_local_import_collision" "test/negative/module_local_import_collision.weft" "error\[E4003\]: module item 'duplicate' is ambiguous in this scope" 1
+check_rejects "module_import_local_collision" "test/negative/module_import_local_collision.weft" "error\[E4003\]: module item 'duplicate' is ambiguous in this scope" 1
 check_rejects "module_qualified_member_wrong_kind" "test/negative/module_qualified_member_wrong_kind.weft" "error\[E4005\]: module member 'left.LeftChoice' is not a function value"
 check_rejects "proc_run_requires_effect" "test/negative/proc_run_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "proc_spawn_requires_effect" "test/negative/proc_spawn_requires_effect.weft" "type error: effect not available in caller"
