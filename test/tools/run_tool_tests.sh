@@ -1053,6 +1053,33 @@ lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_nominal_field")" "$(lsp_frame "$
 assert_contains "lsp_completion_nominal_bridge_field_i64" "$lsp_out" '"label":"x","kind":5,"detail":"i64"'
 assert_contains "lsp_completion_nominal_bridge_field_str" "$lsp_out" '"label":"y","kind":5,"detail":"str"'
 
+lsp_effect_decl_prefix='effect LspState<S> { fn '
+lsp_effect_prefix='effect LspState<S> { fn get() -> S fn put(value: S) -> nil } fn read() -[LspState<i64>]> i64 { LspState.'
+lsp_effect_source="${lsp_effect_prefix}get() }"
+lsp_effect_decl_get=${#lsp_effect_decl_prefix}
+lsp_effect_atom=$((${#lsp_effect_prefix} - 9))
+lsp_effect_operation=${#lsp_effect_prefix}
+lsp_open_effect="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///effect.weft\",\"version\":1,\"text\":\"$lsp_effect_source\"}}}"
+lsp_effect_atom_hover="{\"jsonrpc\":\"2.0\",\"id\":47,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///effect.weft\"},\"position\":{\"line\":0,\"character\":$lsp_effect_atom}}}"
+lsp_effect_operation_hover="{\"jsonrpc\":\"2.0\",\"id\":48,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///effect.weft\"},\"position\":{\"line\":0,\"character\":$lsp_effect_operation}}}"
+lsp_effect_operation_definition="{\"jsonrpc\":\"2.0\",\"id\":49,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"file:///effect.weft\"},\"position\":{\"line\":0,\"character\":$lsp_effect_operation}}}"
+lsp_effect_completion="{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"file:///effect.weft\"},\"position\":{\"line\":0,\"character\":$lsp_effect_operation}}}"
+lsp_out=$(printf '%s%s%s%s%s' "$(lsp_frame "$lsp_open_effect")" "$(lsp_frame "$lsp_effect_atom_hover")" "$(lsp_frame "$lsp_effect_operation_hover")" "$(lsp_frame "$lsp_effect_operation_definition")" "$(lsp_frame "$lsp_effect_completion")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_hover_exact_effect_atom" "$lsp_out" '"value":"effect LspState<i64>"'
+assert_contains "lsp_hover_exact_effect_operation" "$lsp_out" '"value":"effect operation LspState<i64>.get: () -[LspState<i64>]> i64"'
+assert_contains "lsp_definition_effect_operation" "$lsp_out" "\"character\":$lsp_effect_decl_get},\"end\":{\"line\":0,\"character\":$((lsp_effect_decl_get + 3))}"
+assert_contains "lsp_completion_exact_effect_get" "$lsp_out" '"label":"get","kind":3,"detail":"() -[LspState<i64>]> i64"'
+assert_contains "lsp_completion_exact_effect_put" "$lsp_out" '"label":"put","kind":3,"detail":"(i64) -[LspState<i64>]> nil"'
+assert_not_contains "lsp_completion_effect_mode_excludes_fields" "$lsp_out" '"kind":5'
+
+lsp_handler_prefix='effect LspHandle<S> { fn get() -> S } fn go() -[LspHandle<i64>]> i64 { LspHandle.get() } fn main() -> i64 { handle go() { LspHandle<i64>.'
+lsp_handler_source="${lsp_handler_prefix}get() -> resume(42) } }"
+lsp_handler_operation=${#lsp_handler_prefix}
+lsp_open_handler="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///handler.weft\",\"version\":1,\"text\":\"$lsp_handler_source\"}}}"
+lsp_handler_hover="{\"jsonrpc\":\"2.0\",\"id\":51,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///handler.weft\"},\"position\":{\"line\":0,\"character\":$lsp_handler_operation}}}"
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_handler")" "$(lsp_frame "$lsp_handler_hover")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_hover_exact_handler_operation" "$lsp_out" '"value":"effect operation LspHandle<i64>.get: () -[LspHandle<i64>]> i64"'
+
 lsp_unknown_hover='{"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///missing.weft"},"position":{"line":0,"character":0}}}'
 lsp_out=$(lsp_frame "$lsp_unknown_hover" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_unknown_file_hover_null" "$lsp_out" '"result":null'
@@ -1884,4 +1911,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 403 passed, 0 failed"
+echo "Tool boundary summary: 410 passed, 0 failed"
