@@ -1431,6 +1431,45 @@ printf '{"lock_version":1,"manifest_version":1,"weft":"0.1","packages":[{"name":
 pkg_trust_transitive=$(cd "$tmp_pkg_trust_dir/transitive" && "$WEFT_ABS" check main.weft 2>&1)
 assert_contains "package_root_can_explicitly_grant_transitive_binding" "$pkg_trust_transitive" "check: 3 functions, 0 errors"
 
+# Package export discovery is deterministic metadata over ordinary public
+# declarations. The repository manifest is the first package-root fixture.
+pkg_exports_out=$("$WEFT" pkg exports 2>&1)
+assert_contains "pkg_exports_reports_first_party_sql_grammar" "$pkg_exports_out" '"sql":{"module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"validate_only"}'
+assert_contains "pkg_exports_reports_ast_tool" "$pkg_exports_out" '"ast":{"module":"tools/ast","declaration":"main"}'
+assert_contains "pkg_exports_reports_check_tool" "$pkg_exports_out" '"check":{"module":"tools/check","declaration":"main"}'
+assert_contains "pkg_exports_reports_fmt_tool" "$pkg_exports_out" '"fmt":{"module":"tools/fmt","declaration":"main"}'
+assert_contains "pkg_exports_reports_test_tool" "$pkg_exports_out" '"test":{"module":"tools/test_runner","declaration":"main"}'
+
+mkdir -p "$tmp_pkg_trust_dir/exports/deps/left/tools" "$tmp_pkg_trust_dir/exports/deps/right/tools"
+printf '{"package":"app","dependencies":{"left":"deps/left","right":"deps/right"}}\n' > "$tmp_pkg_trust_dir/exports/weft.pkg"
+printf '{"package":"left","dependencies":{},"exports":{"tools":{"inspect":{"module":"tools/inspect","declaration":"run"}}}}\n' > "$tmp_pkg_trust_dir/exports/deps/left/weft.pkg"
+printf '{"package":"right","dependencies":{},"exports":{"tools":{"inspect":{"module":"tools/inspect","declaration":"run"}}}}\n' > "$tmp_pkg_trust_dir/exports/deps/right/weft.pkg"
+printf 'pub fn run() -> i64 { 20 }\n' > "$tmp_pkg_trust_dir/exports/deps/left/tools/inspect.weft"
+printf 'pub fn run() -> i64 { 22 }\n' > "$tmp_pkg_trust_dir/exports/deps/right/tools/inspect.weft"
+printf 'use left/tools/inspect as left_inspect\nuse right/tools/inspect as right_inspect\nfn main() -> i64 { if left_inspect.run() + right_inspect.run() == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_trust_dir/exports/main.weft"
+pkg_exports_qualified=$(cd "$tmp_pkg_trust_dir/exports" && "$WEFT_ABS" check main.weft 2>&1)
+assert_contains "package_exports_are_qualified_by_package_identity" "$pkg_exports_qualified" "check: 3 functions, 0 errors"
+
+printf 'fn run() -> i64 { 20 }\n' > "$tmp_pkg_trust_dir/exports/deps/left/tools/inspect.weft"
+pkg_export_private=$(cd "$tmp_pkg_trust_dir/exports" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_export_rejects_package_private_l7_target" "$pkg_export_private" "error[E5009]: package tool export 'inspect' names a declaration that is not public"
+
+printf 'pub type Run { Run }\n' > "$tmp_pkg_trust_dir/exports/deps/left/tools/inspect.weft"
+printf '{"package":"left","dependencies":{},"exports":{"tools":{"inspect":{"module":"tools/inspect","declaration":"Run"}}}}\n' > "$tmp_pkg_trust_dir/exports/deps/left/weft.pkg"
+pkg_export_wrong_kind=$(cd "$tmp_pkg_trust_dir/exports" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_export_rejects_wrong_declaration_kind" "$pkg_export_wrong_kind" "error[E5009]: package tool export 'inspect' names the wrong declaration kind"
+
+printf 'pub fn run() -> i64 { 20 }\n' > "$tmp_pkg_trust_dir/exports/deps/left/tools/inspect.weft"
+printf '{"package":"left","dependencies":{},"exports":{"tools":{"inspect":{"module":"tools/inspect","declaration":"missing"}}}}\n' > "$tmp_pkg_trust_dir/exports/deps/left/weft.pkg"
+pkg_export_missing=$(cd "$tmp_pkg_trust_dir/exports" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_export_rejects_missing_declaration" "$pkg_export_missing" "error[E5009]: package tool export 'inspect' does not name a declaration in its module"
+
+printf '{"package":"left","dependencies":{},"exports":{"grammars":{"inspect":{"module":"tools/inspect","declaration":"Run","execution":"validate_only"}}}}\n' > "$tmp_pkg_trust_dir/exports/deps/left/weft.pkg"
+printf 'pub type Run { Run }\n' > "$tmp_pkg_trust_dir/exports/deps/left/tools/inspect.weft"
+printf 'use left/tools/inspect as left_inspect\nuse right/tools/inspect as right_inspect\nfn main() -> i64 { right_inspect.run() - 22 }\n' > "$tmp_pkg_trust_dir/exports/main.weft"
+pkg_export_grammar=$(cd "$tmp_pkg_trust_dir/exports" && "$WEFT_ABS" check main.weft 2>&1)
+assert_contains "package_grammar_export_resolves_public_type" "$pkg_export_grammar" "check: 2 functions, 0 errors"
+
 printf 'fn helper() -> i64 { 42 }\nfn main() -> i64 { helper() }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" symbols "$tmp_src" > "$tmp_out" 2> "$tmp_err"
 symbols_out=$(<"$tmp_out")
@@ -1774,4 +1813,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 374 passed, 0 failed"
+echo "Tool boundary summary: 384 passed, 0 failed"
