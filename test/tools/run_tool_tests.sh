@@ -1367,6 +1367,15 @@ assert_contains "lsp_initialize_definition_capability" "$lsp_out" '"definitionPr
 assert_contains "lsp_initialize_completion_hook" "$lsp_out" '"completionProvider"'
 assert_contains "lsp_initialize_code_action_hook" "$lsp_out" '"codeActionProvider":true'
 assert_contains "lsp_initialize_formatting_hook" "$lsp_out" '"documentFormattingProvider":true'
+assert_contains "lsp_initialize_defaults_to_utf16_positions" "$lsp_out" '"positionEncoding":"utf-16"'
+
+lsp_init_utf8='{"jsonrpc":"2.0","id":12,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-16","utf-8"]}}}}'
+lsp_out=$(lsp_frame "$lsp_init_utf8" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_initialize_prefers_offered_utf8" "$lsp_out" '"positionEncoding":"utf-8"'
+
+lsp_init_utf32='{"jsonrpc":"2.0","id":13,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-32"]}}}}'
+lsp_out=$(lsp_frame "$lsp_init_utf32" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_initialize_accepts_explicit_utf32" "$lsp_out" '"positionEncoding":"utf-32"'
 
 lsp_format_open="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///format.weft\",\"version\":1,\"text\":\"$format_transport_source_json\"}}}"
 lsp_format_request='{"jsonrpc":"2.0","id":9,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///format.weft"},"options":{"tabSize":2,"insertSpaces":true}}}'
@@ -1422,7 +1431,24 @@ assert_contains "lsp_open_rejects_root_raw_memory" "$lsp_out" "type error: Unsaf
 lsp_open_unicode='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///unicode.weft","version":1,"text":"fn main() -> i64 { let s = \"Ω\" missing }"}}}'
 lsp_out=$(lsp_frame "$lsp_open_unicode" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_unicode_source_diagnostic" "$lsp_out" "type error: unknown identifier"
-assert_contains "lsp_unicode_source_range" "$lsp_out" '"line":0'
+assert_contains "lsp_unicode_source_range_uses_default_utf16" "$lsp_out" '"range":{"start":{"line":0,"character":31},"end":{"line":0,"character":32}'
+
+lsp_unicode_position_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///unicode-position.weft","version":1,"text":"fn add() -> i64 { 1 } fn main() -> i64 { let s = \"😀\" add() }"}}}'
+lsp_unicode_position_hover16='{"jsonrpc":"2.0","id":14,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///unicode-position.weft"},"position":{"line":0,"character":54}}}'
+lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_init")" "$(lsp_frame "$lsp_unicode_position_open")" "$(lsp_frame "$lsp_unicode_position_hover16")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_utf16_supplementary_cursor_reaches_fact" "$lsp_out" '"id":14,"result":{"contents":{"kind":"plaintext","value":"function add: () -> i64"'
+
+lsp_unicode_position_hover8='{"jsonrpc":"2.0","id":15,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///unicode-position.weft"},"position":{"line":0,"character":56}}}'
+lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_init_utf8")" "$(lsp_frame "$lsp_unicode_position_open")" "$(lsp_frame "$lsp_unicode_position_hover8")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_utf8_supplementary_cursor_reaches_fact" "$lsp_out" '"id":15,"result":{"contents":{"kind":"plaintext","value":"function add: () -> i64"'
+
+lsp_unicode_position_hover32='{"jsonrpc":"2.0","id":16,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///unicode-position.weft"},"position":{"line":0,"character":53}}}'
+lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_init_utf32")" "$(lsp_frame "$lsp_unicode_position_open")" "$(lsp_frame "$lsp_unicode_position_hover32")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_utf32_supplementary_cursor_reaches_fact" "$lsp_out" '"id":16,"result":{"contents":{"kind":"plaintext","value":"function add: () -> i64"'
+
+lsp_unicode_utf8_diagnostic_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///unicode-utf8-diagnostic.weft","version":1,"text":"fn main() -> i64 { let s = \"😀\" missing }"}}}'
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_init_utf8")" "$(lsp_frame "$lsp_unicode_utf8_diagnostic_open")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_utf8_diagnostic_range_counts_bytes" "$lsp_out" '"range":{"start":{"line":0,"character":34},"end":{"line":0,"character":35}'
 
 large_lsp_source=""
 for ((i = 0; i < 40; i++)); do
