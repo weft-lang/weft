@@ -1963,10 +1963,18 @@ assert_contains "pkg_init_manifest_schema_version" "$pkg_manifest" '"manifest_ve
 assert_contains "pkg_init_manifest_package_version" "$pkg_manifest" '"version":"0.1.0"'
 assert_contains "pkg_init_manifest_weft_version" "$pkg_manifest" '"weft":"0.1"'
 
+printf 'occupied-add-temp\n' > "$tmp_pkg_cli_dir/weft.pkg.weft-tmp-0"
 pkg_add_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg add math deps/math 2>&1)
 assert_contains "pkg_add_records_dependency" "$pkg_add_out" "pkg: added dependency"
 pkg_manifest=$(< "$tmp_pkg_cli_dir/weft.pkg")
 assert_contains "pkg_add_manifest_dep" "$pkg_manifest" '"math":"deps/math"'
+assert_equals "pkg_add_preserves_occupied_atomic_temp" "$(< "$tmp_pkg_cli_dir/weft.pkg.weft-tmp-0")" "occupied-add-temp"
+if [ -e "$tmp_pkg_cli_dir/weft.pkg.weft-tmp-1" ]; then
+  echo "  fail pkg_add_atomic_replace_cleans_selected_temp"
+  exit 1
+else
+  echo "  ok pkg_add_atomic_replace_cleans_selected_temp"
+fi
 printf 'pub fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp_pkg_cli_dir/deps/math/lib.weft"
 printf 'use math/lib.{*}\nfn main() -> i64 { if add(40, 2) == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_cli_dir/app.weft"
 (cd "$tmp_pkg_cli_dir" && run_weft_compile_guarded "$WEFT_ABS" < app.weft > app 2>"$tmp_err")
@@ -2002,6 +2010,15 @@ else
   assert_contains "pkg_init_rejects_invalid_name" "$bad_init_out" "pkg: invalid package name"
 fi
 
+: > "$tmp_pkg_missing_dir/weft.pkg"
+if empty_init_out=$(cd "$tmp_pkg_missing_dir" && "$WEFT_ABS" pkg init app 2>&1); then
+  echo "  fail pkg_init_create_new_rejects_empty_existing_manifest"
+  exit 1
+else
+  assert_contains "pkg_init_create_new_rejects_empty_existing_manifest" "$empty_init_out" "pkg: could not write weft.pkg"
+fi
+assert_equals "pkg_init_create_new_preserves_empty_existing_manifest" "$(wc -c < "$tmp_pkg_missing_dir/weft.pkg" | tr -d ' ')" "0"
+
 mkdir -p "$tmp_pkg_lock_dir/deps/lib/deps/base" "$tmp_pkg_lock_dir/.weft/cache"
 printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"lib":"deps/lib"}}\n' > "$tmp_pkg_lock_dir/weft.pkg"
 printf 'fn main() -> i64 { 0 }\n' > "$tmp_pkg_lock_dir/main.weft"
@@ -2012,6 +2029,7 @@ printf '{"package":"base","manifest_version":1,"version":"3.0.0","weft":"0.1","d
 printf 'pub fn base_value() -> i64 { 3 }\n' > "$tmp_pkg_lock_dir/deps/lib/deps/base/base.weft"
 printf 'ignored cache source\n' > "$tmp_pkg_lock_dir/.weft/cache/shadow.weft"
 
+printf 'occupied-lock-temp\n' > "$tmp_pkg_lock_dir/weft.lock.weft-tmp-0"
 pkg_lock_out=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock 2>&1)
 assert_contains "pkg_lock_reports_write" "$pkg_lock_out" "pkg: wrote weft.lock"
 pkg_lock_first=$(< "$tmp_pkg_lock_dir/weft.lock")
@@ -2021,12 +2039,14 @@ assert_contains "pkg_lock_records_root_identity" "$pkg_lock_first" '"name":"app"
 assert_contains "pkg_lock_records_transitive_identity" "$pkg_lock_first" '"name":"base","version":"3.0.0","source":"path:deps/lib/deps/base"'
 assert_contains "pkg_lock_sorts_package_entries" "$pkg_lock_first" '"name":"lib","version":"2.0.0","source":"path:deps/lib"'
 assert_contains "pkg_lock_records_sha256_content" "$(pkg_lock_digest "$pkg_lock_first" app)" 'sha256:'
-if [ -e "$tmp_pkg_lock_dir/weft.lock.tmp" ]; then
+assert_equals "pkg_lock_preserves_occupied_atomic_temp" "$(< "$tmp_pkg_lock_dir/weft.lock.weft-tmp-0")" "occupied-lock-temp"
+if [ -e "$tmp_pkg_lock_dir/weft.lock.weft-tmp-1" ] || [ -e "$tmp_pkg_lock_dir/weft.lock.tmp" ]; then
   echo "  fail pkg_lock_atomic_replace_cleans_temp"
   exit 1
 else
   echo "  ok pkg_lock_atomic_replace_cleans_temp"
 fi
+rm -f "$tmp_pkg_lock_dir/weft.lock.weft-tmp-0"
 
 pkg_locked_check=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" check < app.weft 2>&1)
 assert_contains "package_valid_lock_identity_compiles" "$pkg_locked_check" "check: 2 functions, 0 errors"
