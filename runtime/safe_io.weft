@@ -1,0 +1,477 @@
+-- runtime/safe_io.weft — safe typed I/O over the transitional raw adapters
+--
+-- Public effects carry Path, Bytes and IoError. Descriptor integers, native
+-- flags, pointer-shaped buffers and errno remain inside this platform bridge.
+
+use runtime/dir.{runtime_platform_dir, runtime_platform_dir_with}
+use runtime/string.{runtime_str_byte_at, runtime_str_from_bytes_copy, runtime_str_len}
+use stdlib/bytes.{Bytes, bytes_empty, bytes_from_str, bytes_from_vector, bytes_to_vector}
+use stdlib/console.{ConsoleRead, ConsoleStderr, ConsoleStdout, ConsoleStream, ConsoleWrite}
+use stdlib/dir.{Dir, DirInspect, DirMetadata, DirMutate}
+use stdlib/file.{FileAppend, FileAtomicReplace, FileCreateNew, FileCreateOrTruncate, FileRead, FileWrite, FileWriteMode}
+use stdlib/io.{io_mode_user_rw, io_o_creat, io_o_rdonly, io_o_trunc, io_o_wronly, raw_close, raw_open, raw_read, raw_write}
+use stdlib/io_types.{IoAlreadyExists, IoError, IoInterrupted, IoInvalidProgress, IoLimitExceeded, io_error_from_errno}
+use stdlib/num.{num_i64_to_u8_checked, num_i64_to_usize_checked, num_int_cast_value_or, num_u64_to_i64_checked, num_usize_to_u64}
+use stdlib/path.{Path, path_bytes, path_from_bytes}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/string.{int_to_str, str_concat}
+use stdlib/vector.{vector_get_in_bounds, vector_len, vector_push, vector_with_capacity, vector_data}
+use stdlib/vector_type.{Vector}
+
+fn runtime_safe_io_chunk_size() -> i64 { 4096 }
+
+fn runtime_safe_usize_to_i64(value: usize) -> i64 {
+  num_int_cast_value_or<i64>(num_u64_to_i64_checked(num_usize_to_u64(value)), 0 - 1)
+}
+
+fn runtime_safe_i64_to_usize(value: i64) -> usize {
+  num_int_cast_value_or<usize>(num_i64_to_usize_checked(value), 0)
+}
+
+fn runtime_safe_u8(value: i64) -> u8 {
+  num_int_cast_value_or<u8>(num_i64_to_u8_checked(value), 0)
+}
+
+fn runtime_safe_path_string(path: Path) -> str {
+  let values = bytes_to_vector(path_bytes(path))
+  runtime_str_from_bytes_copy(vector_data<u8>(values), vector_len<u8>(values))
+}
+
+fn runtime_safe_append_str_bytes(out: Vector<u8>, suffix: str) -> i64 {
+  let n = runtime_str_len(suffix)
+  for i in 0..n {
+    vector_push<u8>(out, runtime_safe_u8(runtime_str_byte_at(suffix, i)))
+  }
+  n
+}
+
+fn runtime_safe_temp_path_string(path: Path, attempt: i64) -> str {
+  let out = bytes_to_vector(path_bytes(path))
+  runtime_safe_append_str_bytes(out, str_concat(".weft-tmp-", int_to_str(attempt)))
+  runtime_str_from_bytes_copy(vector_data<u8>(out), vector_len<u8>(out))
+}
+
+fn runtime_safe_scratch() -> Vector<u8> {
+  let size = runtime_safe_io_chunk_size()
+  let values = vector_with_capacity<u8>(size)
+  for i in 0..size { vector_push<u8>(values, 0) }
+  values
+}
+
+fn runtime_safe_read_path(path: Path, limit: usize) -> Result<Bytes, IoError> {
+  let raw_limit = runtime_safe_usize_to_i64(limit)
+  if raw_limit < 0 {
+    result_err<Bytes, IoError>(IoLimitExceeded(limit))
+  } else {
+    let fd = raw_open(runtime_safe_path_string(path), io_o_rdonly(), 0)
+    if fd < 0 {
+      result_err<Bytes, IoError>(io_error_from_errno(fd))
+    } else {
+      let scratch = runtime_safe_scratch()
+      let out = vector_with_capacity<u8>(if raw_limit < runtime_safe_io_chunk_size() { raw_limit } else { runtime_safe_io_chunk_size() })
+      let mut done = false
+      let mut failed = false
+      let mut failure = IoInvalidProgress
+      while not done and not failed {
+        let remaining = raw_limit - vector_len<u8>(out)
+        let request = if remaining < runtime_safe_io_chunk_size() { remaining + 1 } else { runtime_safe_io_chunk_size() }
+        let status = raw_read(fd, vector_data<u8>(scratch), request)
+        if status > 0 {
+          if status > request {
+            failure = IoInvalidProgress
+            failed = true
+          } else { if status > remaining {
+            failure = IoLimitExceeded(limit)
+            failed = true
+          } else {
+            for i in 0..status {
+              vector_push<u8>(out, vector_get_in_bounds<u8>(scratch, i))
+            }
+          } }
+        } else { if status == 0 {
+          done = true
+        } else {
+          match io_error_from_errno(status) {
+            IoInterrupted -> 0
+            error -> {
+              failure = error
+              failed = true
+              0
+            }
+          }
+        } }
+      }
+      let close_status = raw_close(fd)
+      if failed {
+        result_err<Bytes, IoError>(failure)
+      } else { if close_status != 0 {
+        result_err<Bytes, IoError>(io_error_from_errno(close_status))
+      } else {
+        result_ok<Bytes, IoError>(bytes_from_vector(out))
+      } }
+    }
+  }
+}
+
+fn runtime_safe_write_fd(fd: i64, values: Bytes) -> Result<usize, IoError> {
+  let contiguous = bytes_to_vector(values)
+  let total = vector_len<u8>(contiguous)
+  let mut offset = 0
+  let mut failed = false
+  let mut failure = IoInvalidProgress
+  while offset < total and not failed {
+    let status = raw_write(fd, vector_data<u8>(contiguous) + offset, total - offset)
+    if status > 0 {
+      if status > total - offset {
+        failure = IoInvalidProgress
+        failed = true
+      } else {
+        offset = offset + status
+      }
+    } else { if status == 0 {
+      failure = IoInvalidProgress
+      failed = true
+    } else {
+      match io_error_from_errno(status) {
+        IoInterrupted -> 0
+        error -> {
+          failure = error
+          failed = true
+          0
+        }
+      }
+    } }
+  }
+  if failed { result_err<usize, IoError>(failure) }
+  else { result_ok<usize, IoError>(runtime_safe_i64_to_usize(offset)) }
+}
+
+fn runtime_safe_open_flags(mode: FileWriteMode) -> i64 {
+  match mode {
+    FileCreateNew -> io_o_wronly() + io_o_creat() + 2048
+    FileCreateOrTruncate -> io_o_wronly() + io_o_creat() + io_o_trunc()
+    FileAppend -> io_o_wronly() + io_o_creat() + 8
+    FileAtomicReplace -> io_o_wronly() + io_o_creat() + 2048
+  }
+}
+
+fn runtime_safe_write_opened(fd: i64, values: Bytes) -> Result<usize, IoError> {
+  let result = runtime_safe_write_fd(fd, values)
+  let close_status = raw_close(fd)
+  match result {
+    Err(error) -> result_err<usize, IoError>(error)
+    Ok(count) -> if close_status == 0 {
+      result_ok<usize, IoError>(count)
+    } else {
+      result_err<usize, IoError>(io_error_from_errno(close_status))
+    }
+  }
+}
+
+fn runtime_safe_write_direct(path: Path, values: Bytes, mode: FileWriteMode) -> Result<usize, IoError> {
+  let fd = raw_open(runtime_safe_path_string(path), runtime_safe_open_flags(mode), io_mode_user_rw())
+  if fd < 0 { result_err<usize, IoError>(io_error_from_errno(fd)) }
+  else { runtime_safe_write_opened(fd, values) }
+}
+
+fn runtime_safe_write_atomic(path: Path, values: Bytes) -[Dir]> Result<usize, IoError> {
+  -- The same-directory rename makes replacement namespace-atomic. Durability
+  -- needs a future typed sync primitive; this bridge does not promise it.
+  let target = runtime_safe_path_string(path)
+  let mut attempt = 0
+  let mut fd = 0 - 1
+  let mut temp = ""
+  let mut failed = false
+  let mut failure = IoAlreadyExists
+  while fd < 0 and attempt < 64 and not failed {
+    temp = runtime_safe_temp_path_string(path, attempt)
+    let opened = raw_open(temp, runtime_safe_open_flags(FileAtomicReplace), io_mode_user_rw())
+    if opened >= 0 {
+      fd = opened
+    } else {
+      match io_error_from_errno(opened) {
+        IoAlreadyExists -> {
+          attempt = attempt + 1
+          0
+        }
+        error -> {
+          failure = error
+          failed = true
+          0
+        }
+      }
+    }
+  }
+  if failed or fd < 0 {
+    result_err<usize, IoError>(failure)
+  } else {
+    match runtime_safe_write_opened(fd, values) {
+      Err(error) -> {
+        Dir.remove(temp)
+        result_err<usize, IoError>(error)
+      }
+      Ok(count) -> {
+        let renamed = Dir.rename(temp, target)
+        if renamed == 0 {
+          result_ok<usize, IoError>(count)
+        } else {
+          Dir.remove(temp)
+          result_err<usize, IoError>(io_error_from_errno(renamed))
+        }
+      }
+    }
+  }
+}
+
+fn runtime_safe_file_write_result(path: Path, values: Bytes, mode: FileWriteMode) -[Dir]> Result<usize, IoError> {
+  match mode {
+    FileAtomicReplace -> runtime_safe_write_atomic(path, values)
+    _ -> runtime_safe_write_direct(path, values, mode)
+  }
+}
+
+fn runtime_safe_console_fd(stream: ConsoleStream) -> i64 {
+  match stream {
+    ConsoleStdout -> 1
+    ConsoleStderr -> 2
+  }
+}
+
+fn runtime_safe_console_read(limit: usize) -> Result<Bytes, IoError> {
+  let raw_limit = runtime_safe_usize_to_i64(limit)
+  if raw_limit < 0 {
+    result_err<Bytes, IoError>(IoLimitExceeded(limit))
+  } else { if raw_limit == 0 {
+    result_ok<Bytes, IoError>(bytes_empty())
+  } else {
+    let request = if raw_limit < runtime_safe_io_chunk_size() { raw_limit } else { runtime_safe_io_chunk_size() }
+    let scratch = runtime_safe_scratch()
+    let mut done = false
+    let mut failed = false
+    let mut count = 0
+    let mut failure = IoInvalidProgress
+    while not done and not failed {
+      let status = raw_read(0, vector_data<u8>(scratch), request)
+      if status >= 0 {
+        count = status
+        done = true
+      } else {
+        match io_error_from_errno(status) {
+          IoInterrupted -> 0
+          error -> {
+            failure = error
+            failed = true
+            0
+          }
+        }
+      }
+    }
+    if failed {
+      result_err<Bytes, IoError>(failure)
+    } else {
+      let out = vector_with_capacity<u8>(count)
+      for i in 0..count { vector_push<u8>(out, vector_get_in_bounds<u8>(scratch, i)) }
+      result_ok<Bytes, IoError>(bytes_from_vector(out))
+    }
+  } }
+}
+
+fn runtime_safe_path_from_raw(value: str) -> Path {
+  match path_from_bytes(bytes_from_str(value)) {
+    Ok(path) -> path
+    Err(error) -> runtime_safe_path_from_raw("")
+  }
+}
+
+fn runtime_safe_dir_list_result(result: Result<Vector<str>, i64>) -> Result<Vector<Path>, IoError> {
+  match result {
+    Err(error) -> result_err<Vector<Path>, IoError>(io_error_from_errno(error))
+    Ok(entries) -> {
+      let paths = vector_with_capacity<Path>(vector_len<str>(entries))
+      for i in 0..vector_len<str>(entries) {
+        vector_push<Path>(paths, runtime_safe_path_from_raw(vector_get_in_bounds<str>(entries, i)))
+      }
+      result_ok<Vector<Path>, IoError>(paths)
+    }
+  }
+}
+
+fn runtime_safe_dir_metadata_result(result: Result<DirMetadata, i64>) -> Result<DirMetadata, IoError> {
+  match result {
+    Ok(metadata) -> result_ok<DirMetadata, IoError>(metadata)
+    Err(error) -> result_err<DirMetadata, IoError>(io_error_from_errno(error))
+  }
+}
+
+fn runtime_safe_dir_path_result(result: Result<str, i64>) -> Result<Path, IoError> {
+  match result {
+    Ok(path) -> result_ok<Path, IoError>(runtime_safe_path_from_raw(path))
+    Err(error) -> result_err<Path, IoError>(io_error_from_errno(error))
+  }
+}
+
+fn runtime_safe_nil_status(status: i64) -> Result<nil, IoError> {
+  if status == 0 { result_ok<nil, IoError>(nil) }
+  else { result_err<nil, IoError>(io_error_from_errno(status)) }
+}
+
+pub fn runtime_platform_file_read(body: () -[FileRead]> i64) -> i64 {
+  handle body() {
+    FileRead.read_all(path, limit) -> resume(runtime_safe_read_path(path, limit))
+  }
+}
+
+pub fn runtime_platform_file_read_with<E>(body: () -[FileRead, E]> i64) -[E]> i64 {
+  handle body() {
+    FileRead.read_all(path, limit) -> resume(runtime_safe_read_path(path, limit))
+  }
+}
+
+fn runtime_safe_file_write_layer<E>(body: () -[FileWrite, E]> i64) -[Dir, E]> i64 {
+  handle body() {
+    FileWrite.write_all(path, values, mode) -> resume(runtime_safe_file_write_result(path, values, mode))
+  }
+}
+
+pub fn runtime_platform_file_write(body: () -[FileWrite]> i64) -> i64 {
+  runtime_platform_dir(() => handle body() {
+    FileWrite.write_all(path, values, mode) -> resume(runtime_safe_file_write_result(path, values, mode))
+  })
+}
+
+pub fn runtime_platform_file_write_with<E>(body: () -[FileWrite, E]> i64) -[E]> i64 {
+  runtime_platform_dir_with<E>(() => runtime_safe_file_write_layer<E>(body))
+}
+
+pub fn runtime_platform_console_read(body: () -[ConsoleRead]> i64) -> i64 {
+  handle body() {
+    ConsoleRead.read(limit) -> resume(runtime_safe_console_read(limit))
+  }
+}
+
+pub fn runtime_platform_console_read_with<E>(body: () -[ConsoleRead, E]> i64) -[E]> i64 {
+  handle body() {
+    ConsoleRead.read(limit) -> resume(runtime_safe_console_read(limit))
+  }
+}
+
+pub fn runtime_platform_console_write(body: () -[ConsoleWrite]> i64) -> i64 {
+  handle body() {
+    ConsoleWrite.write_all(stream, values) -> resume(runtime_safe_write_fd(runtime_safe_console_fd(stream), values))
+    -- Raw descriptor writes are unbuffered at this layer.
+    ConsoleWrite.flush(stream) -> resume(result_ok<nil, IoError>(nil))
+  }
+}
+
+pub fn runtime_platform_console_write_with<E>(body: () -[ConsoleWrite, E]> i64) -[E]> i64 {
+  handle body() {
+    ConsoleWrite.write_all(stream, values) -> resume(runtime_safe_write_fd(runtime_safe_console_fd(stream), values))
+    ConsoleWrite.flush(stream) -> resume(result_ok<nil, IoError>(nil))
+  }
+}
+
+fn runtime_safe_dir_inspect_layer<E>(body: () -[DirInspect, E]> i64) -[Dir, E]> i64 {
+  handle body() {
+    DirInspect.list(path) -> resume(runtime_safe_dir_list_result(Dir.list(runtime_safe_path_string(path))))
+    DirInspect.stat(path) -> resume(runtime_safe_dir_metadata_result(Dir.stat(runtime_safe_path_string(path))))
+    DirInspect.lstat(path) -> resume(runtime_safe_dir_metadata_result(Dir.lstat(runtime_safe_path_string(path))))
+    DirInspect.current() -> resume(runtime_safe_dir_path_result(Dir.getcwd()))
+  }
+}
+
+pub fn runtime_platform_dir_inspect(body: () -[DirInspect]> i64) -> i64 {
+  runtime_platform_dir(() => handle body() {
+    DirInspect.list(path) -> resume(runtime_safe_dir_list_result(Dir.list(runtime_safe_path_string(path))))
+    DirInspect.stat(path) -> resume(runtime_safe_dir_metadata_result(Dir.stat(runtime_safe_path_string(path))))
+    DirInspect.lstat(path) -> resume(runtime_safe_dir_metadata_result(Dir.lstat(runtime_safe_path_string(path))))
+    DirInspect.current() -> resume(runtime_safe_dir_path_result(Dir.getcwd()))
+  })
+}
+
+pub fn runtime_platform_dir_inspect_with<E>(body: () -[DirInspect, E]> i64) -[E]> i64 {
+  runtime_platform_dir_with<E>(() => runtime_safe_dir_inspect_layer<E>(body))
+}
+
+fn runtime_safe_dir_mutate_layer<E>(body: () -[DirMutate, E]> i64) -[Dir, E]> i64 {
+  handle body() {
+    DirMutate.mkdir(path) -> resume(runtime_safe_nil_status(Dir.mkdir(runtime_safe_path_string(path))))
+    DirMutate.remove(path) -> resume(runtime_safe_nil_status(Dir.remove(runtime_safe_path_string(path))))
+    DirMutate.rename(from, to) -> resume(runtime_safe_nil_status(Dir.rename(runtime_safe_path_string(from), runtime_safe_path_string(to))))
+  }
+}
+
+pub fn runtime_platform_dir_mutate(body: () -[DirMutate]> i64) -> i64 {
+  runtime_platform_dir(() => handle body() {
+    DirMutate.mkdir(path) -> resume(runtime_safe_nil_status(Dir.mkdir(runtime_safe_path_string(path))))
+    DirMutate.remove(path) -> resume(runtime_safe_nil_status(Dir.remove(runtime_safe_path_string(path))))
+    DirMutate.rename(from, to) -> resume(runtime_safe_nil_status(Dir.rename(runtime_safe_path_string(from), runtime_safe_path_string(to))))
+  })
+}
+
+pub fn runtime_platform_dir_mutate_with<E>(body: () -[DirMutate, E]> i64) -[E]> i64 {
+  runtime_platform_dir_with<E>(() => runtime_safe_dir_mutate_layer<E>(body))
+}
+
+fn runtime_safe_all_file_read(
+  body: () -[FileRead, FileWrite, ConsoleRead, ConsoleWrite, DirInspect, DirMutate]> i64
+) -[FileWrite, ConsoleRead, ConsoleWrite, DirInspect, DirMutate]> i64 {
+  handle body() {
+    FileRead.read_all(path, limit) -> resume(runtime_safe_read_path(path, limit))
+  }
+}
+
+fn runtime_safe_all_file_write(
+  body: () -[FileWrite, ConsoleRead, ConsoleWrite, DirInspect, DirMutate]> i64
+) -[ConsoleRead, ConsoleWrite, DirInspect, DirMutate, Dir]> i64 {
+  handle body() {
+    FileWrite.write_all(path, values, mode) -> resume(runtime_safe_file_write_result(path, values, mode))
+  }
+}
+
+fn runtime_safe_all_console_read(
+  body: () -[ConsoleRead, ConsoleWrite, DirInspect, DirMutate, Dir]> i64
+) -[ConsoleWrite, DirInspect, DirMutate, Dir]> i64 {
+  handle body() {
+    ConsoleRead.read(limit) -> resume(runtime_safe_console_read(limit))
+  }
+}
+
+fn runtime_safe_all_console_write(
+  body: () -[ConsoleWrite, DirInspect, DirMutate, Dir]> i64
+) -[DirInspect, DirMutate, Dir]> i64 {
+  handle body() {
+    ConsoleWrite.write_all(stream, values) -> resume(runtime_safe_write_fd(runtime_safe_console_fd(stream), values))
+    ConsoleWrite.flush(stream) -> resume(result_ok<nil, IoError>(nil))
+  }
+}
+
+fn runtime_safe_all_dir_inspect(
+  body: () -[DirInspect, DirMutate, Dir]> i64
+) -[DirMutate, Dir]> i64 {
+  handle body() {
+    DirInspect.list(path) -> resume(runtime_safe_dir_list_result(Dir.list(runtime_safe_path_string(path))))
+    DirInspect.stat(path) -> resume(runtime_safe_dir_metadata_result(Dir.stat(runtime_safe_path_string(path))))
+    DirInspect.lstat(path) -> resume(runtime_safe_dir_metadata_result(Dir.lstat(runtime_safe_path_string(path))))
+    DirInspect.current() -> resume(runtime_safe_dir_path_result(Dir.getcwd()))
+  }
+}
+
+fn runtime_safe_all_dir_mutate(body: () -[DirMutate, Dir]> i64) -[Dir]> i64 {
+  handle body() {
+    DirMutate.mkdir(path) -> resume(runtime_safe_nil_status(Dir.mkdir(runtime_safe_path_string(path))))
+    DirMutate.remove(path) -> resume(runtime_safe_nil_status(Dir.remove(runtime_safe_path_string(path))))
+    DirMutate.rename(from, to) -> resume(runtime_safe_nil_status(Dir.rename(runtime_safe_path_string(from), runtime_safe_path_string(to))))
+  }
+}
+
+pub fn runtime_platform_safe_io(
+  body: () -[FileRead, FileWrite, ConsoleRead, ConsoleWrite, DirInspect, DirMutate]> i64
+) -> i64 {
+  runtime_platform_dir(() =>
+    runtime_safe_all_dir_mutate(() =>
+      runtime_safe_all_dir_inspect(() =>
+        runtime_safe_all_console_write(() =>
+          runtime_safe_all_console_read(() =>
+            runtime_safe_all_file_write(() =>
+              runtime_safe_all_file_read(body)))))))
+}

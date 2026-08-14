@@ -461,6 +461,7 @@ check_rejects "io_helper_effect_unavailable" "test/negative/io_helper_effect_una
 check_rejects "file_read_cannot_write" "test/negative/file_read_cannot_write.weft" "type error: effect not available in caller"
 check_rejects "dir_inspect_cannot_mutate" "test/negative/dir_inspect_cannot_mutate.weft" "type error: effect not available in caller"
 check_rejects "console_cannot_write_file" "test/negative/console_cannot_write_file.weft" "type error: effect not available in caller"
+check_rejects "safe_io_platform_residual_effect" "test/negative/safe_io_platform_residual_effect.weft" "type error: effect not available in caller"
 check_rejects "if_condition_not_bool" "test/negative/if_condition_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "while_condition_not_bool" "test/negative/while_condition_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "for_iter_non_list" "test/negative/for_iter_non_list.weft" "type error: for iterator requires an array, slice, or Cons/Nil list"
