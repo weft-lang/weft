@@ -306,6 +306,12 @@ fmt_path_out=$("$WEFT" fmt "$tmp_src" 2>"$tmp_err")
 assert_equals "fmt_path_snapshot_exact" "$fmt_path_out" "fn main() -> i64 { 42 }"
 assert_equals "fmt_path_stderr_empty" "$(<"$tmp_err")" ""
 
+printf '%s\n' 'fn   πρόσθεση ( α : i64, β: i64 ) -> i64 { α + β }' > "$tmp_src"
+"$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+assert_equals "fmt_preserves_unicode_identifier_identity" "$(<"$tmp_out")" 'fn πρόσθεση(α: i64, β: i64) -> i64 { α + β }'
+"$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
+assert_files_equal "fmt_unicode_identifiers_are_idempotent" "$tmp_bin" "$tmp_out"
+
 printf '%s\n' '-- leading  text' 'fn   main ( )  ->  i64   {  42  } -- trailing  text' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
 assert_equals "fmt_canonical_horizontal_gaps_and_comments" "$(<"$tmp_out")" $'-- leading  text\n\nfn main() -> i64 { 42 } -- trailing  text'
@@ -703,6 +709,14 @@ printf 'fn main() -> i64 { let s = "😀" missing }\n' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
 assert_equals "diagnostic_unicode_columns_count_scalars" "$diag_out" $'line 1, col 32: type error: unknown identifier\ncheck: 1 functions, 1 errors'
 
+printf '%s\n' 'fn main() -> i64 { let café = 1 café }' > "$tmp_src"
+diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
+assert_equals "diagnostic_rejects_non_nfc_identifier_at_scalar_column" "$diag_out" $'line 1, col 24: error: identifier must use NFC normalization\ncheck: 0 functions, 1 errors'
+
+printf '\303(' > "$tmp_src"
+diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
+assert_equals "diagnostic_rejects_malformed_utf8_before_tokenization" "$diag_out" $'line 1, col 1: error: source is not valid UTF-8\ncheck: 0 functions, 1 errors'
+
 mcp_out=$(printf '%s' '{ "jsonrpc" : "2.0", "id" : 1, "method" : "tools/list" }' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"},{"name":"fact_at_position","stability":"stable"},{"name":"visible_bindings","stability":"stable"},{"name":"conformance_at_position","stability":"stable"},{"name":"format_source","stability":"stable"}]}}'
 
@@ -1029,6 +1043,12 @@ assert_equals "mcp_diagnostics_unknown_identifier_snapshot" "$mcp_out" '{"jsonrp
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -> i64 { let s = \"😀\" missing }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_names_byte_scalar_and_utf16_columns" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: unknown identifier","span":34,"line":1,"col":35,"scalar_col":32,"utf16_col":33}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -> i64 { let café = 1 café }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_diagnostics_preserves_non_nfc_identifier_range" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":0,"check_errors":0,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"identifier must use NFC normalization","span":23,"line":1,"col":24,"scalar_col":24,"utf16_col":24,"end_span":29,"end_line":1,"end_col":30,"end_scalar_col":29,"end_utf16_col":29}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn πρόσθεση(α: i64, β: i64) -> i64 { α + β } fn main() -> i64 { πρόσθεση(40, 2) }"}}}' | "$WEFT" mcp 2>&1)
+assert_contains "mcp_diagnostics_accepts_unicode_identifier_identity" "$mcp_out" '"diagnostics":0,"functions":2,"check_errors":0'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn call() -> i64 { missing_fn() }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_unknown_function_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: unknown function","span":19,"line":1,"col":20,"scalar_col":20,"utf16_col":20}]}}'
@@ -1439,6 +1459,15 @@ lsp_open_unicode='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"te
 lsp_out=$(lsp_frame "$lsp_open_unicode" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_unicode_source_diagnostic" "$lsp_out" "type error: unknown identifier"
 assert_contains "lsp_unicode_source_range_uses_default_utf16" "$lsp_out" '"range":{"start":{"line":0,"character":31},"end":{"line":0,"character":32}'
+
+lsp_non_nfc_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///non-nfc.weft","version":1,"text":"fn main() -> i64 { let café = 1 café }"}}}'
+lsp_out=$(lsp_frame "$lsp_non_nfc_open" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_non_nfc_identifier_diagnostic" "$lsp_out" '"message":"identifier must use NFC normalization"'
+assert_contains "lsp_non_nfc_identifier_range_is_complete" "$lsp_out" '"range":{"start":{"line":0,"character":23},"end":{"line":0,"character":28}'
+
+lsp_unicode_identifier_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///unicode-identifiers.weft","version":1,"text":"fn πρόσθεση(α: i64, β: i64) -> i64 { α + β } fn main() -> i64 { πρόσθεση(40, 2) }"}}}'
+lsp_out=$(lsp_frame "$lsp_unicode_identifier_open" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_accepts_unicode_identifier_identity" "$lsp_out" '"diagnostics":[]'
 
 lsp_unicode_position_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///unicode-position.weft","version":1,"text":"fn add() -> i64 { 1 } fn main() -> i64 { let s = \"😀\" add() }"}}}'
 lsp_unicode_position_hover16='{"jsonrpc":"2.0","id":14,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///unicode-position.weft"},"position":{"line":0,"character":54}}}'
@@ -2522,4 +2551,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 583 passed, 0 failed"
+echo "Tool boundary summary: 592 passed, 0 failed"
