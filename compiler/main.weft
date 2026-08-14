@@ -1217,7 +1217,16 @@ fn run_fmt() -> i64 {
 
 fn main_fmt_bytes_equal(src: i64, n: i64, formatted: str) -> i64 {
   if n != __str_len(formatted) { 0 }
-  else { src_eq_at(src, 0, __str_ptr(formatted), 0, n) }
+  else {
+    let formatted_src = __str_ptr(formatted)
+    let mut i = 0
+    let mut equal = 1
+    while i < n and equal == 1 {
+      if mem_load8_at(src, i) != mem_load8_at(formatted_src, i) { equal = 0 }
+      else { i = i + 1 }
+    }
+    equal
+  }
 }
 
 fn main_fmt_lstat_mode(path: i64) -> i64 {
@@ -1284,36 +1293,37 @@ fn main_fmt_write_result(path: i64, metadata: i64, formatted: str) -> i64 {
 -- operation 1 checks without mutation; operation 2 atomically rewrites.
 fn main_fmt_process_path(path: i64, operation: i64) -> i64 {
   let path_len = cstr_len(path)
-  let metadata = main_test_path_metadata(path)
-  if metadata == 0 {
+  let file = read_cpath_file(path, path_len)
+  let src = mem_load64_at(file, 0)
+  let n = mem_load64_at(file, 8)
+  if src == 0 {
     main_test_eprint_path_error("fmt: could not read input file: ", path)
     1
   } else {
-    let file = read_cpath_file(path, path_len)
-    let src = mem_load64_at(file, 0)
-    let n = mem_load64_at(file, 8)
-    if src == 0 {
-      main_test_eprint_path_error("fmt: could not read input file: ", path)
-      1
-    } else {
-      match main_fmt_result(src, n, path, path_len, cpath_is_trusted_source(path, path_len)) {
-        FormatterFailure(error_count) -> {
-          eprint("fmt: parse failed for ")
-          main_test_eprint_cpath(path)
-          eprint(" with ")
-          eprint_i(error_count)
-          eprint(" errors; source left unchanged\n")
+    match main_fmt_result(src, n, path, path_len, cpath_is_trusted_source(path, path_len)) {
+      FormatterFailure(error_count) -> {
+        eprint("fmt: parse failed for ")
+        main_test_eprint_cpath(path)
+        eprint(" with ")
+        eprint_i(error_count)
+        eprint(" errors; source left unchanged\n")
+        1
+      }
+      FormatterSuccess(formatted) -> {
+        if main_fmt_bytes_equal(src, n, formatted) == 1 { 0 }
+        else { if operation == 1 {
+          main_test_eprint_path_error("fmt: would reformat: ", path)
           1
-        }
-        FormatterSuccess(formatted) -> {
-          if main_fmt_bytes_equal(src, n, formatted) == 1 { 0 }
-          else { if operation == 1 {
-            main_test_eprint_path_error("fmt: would reformat: ", path)
+        } else {
+          -- Metadata is needed only for replacement safety. Acquiring it
+          -- after parsing keeps check mode identical to the proven
+          -- single-path formatter allocation shape, including large files.
+          let metadata = main_test_path_metadata(path)
+          if metadata == 0 {
+            main_test_eprint_path_error("fmt: could not inspect source file: ", path)
             1
-          } else {
-            main_fmt_write_result(path, metadata, formatted)
-          } }
-        }
+          } else { main_fmt_write_result(path, metadata, formatted) }
+        } }
       }
     }
   }
@@ -1334,14 +1344,49 @@ fn main_fmt_expand_arg(paths: i64, arg: i64) -> i64 {
   }
 }
 
+fn main_fmt_process_path_isolated(path: i64, operation: i64, worker_argv: i64, envp: i64, status_ptr: i64) -> i64 {
+  mem_store64_at(worker_argv, 16, if operation == 1 { __str_ptr("--internal-check-one") } else { __str_ptr("--internal-write-one") })
+  mem_store64_at(worker_argv, 24, path)
+  let fork_result = sys_raw(2, 0, 0, 0, 0, 0, 0)
+  if fork_result < 0 {
+    main_test_eprint_path_error("fmt: could not start formatter worker: ", path)
+    1
+  } else {
+    let current_pid = sys_raw(20, 0, 0, 0, 0, 0, 0)
+    if fork_result == current_pid {
+      sys_raw(59, mem_load64_at(worker_argv, 0), worker_argv, envp, 0, 0, 0)
+      sys_exit(127)
+    } else {
+      mem_store64_at(status_ptr, 0, 0)
+      let waited = main_test_wait_blocking(fork_result, status_ptr)
+      if waited != fork_result {
+        main_test_eprint_path_error("fmt: formatter worker failed: ", path)
+        1
+      } else {
+        let result = main_test_decode_wait_status(status_ptr)
+        if result == 0 { 0 } else { 1 }
+      }
+    }
+  }
+}
+
 fn run_fmt_paths(argc: i64, argv: i64, first_path: i64, operation: i64) -> i64 {
   let paths = nlist_new()
+  let status_ptr = alloc_zeroed(8)
+  let worker_argv = alloc_zeroed(40)
+  let envp = argv + (argc + 1) * 8
+  mem_store64_at(worker_argv, 0, mem_load64_at(argv, 0))
+  mem_store64_at(worker_argv, 8, __str_ptr("fmt"))
   let mut failures = 0
   for i in first_path..argc {
     failures = failures + main_fmt_expand_arg(paths, mem_load64_at(argv, i * 8))
   }
   for i in 0..nlist_len(paths) {
-    failures = failures + main_fmt_process_path(nlist_get(paths, i), operation)
+    -- A path's parse/render state dies with its short-lived worker. This
+    -- keeps corpus-sized invocations bounded without rewinding allocations
+    -- that managed cleanup or process-global compiler state may still own.
+    -- Waiting immediately retains deterministic path/diagnostic order.
+    failures = failures + main_fmt_process_path_isolated(nlist_get(paths, i), operation, worker_argv, envp, status_ptr)
   }
   if failures == 0 { 0 } else { 1 }
 }
@@ -1350,7 +1395,11 @@ fn run_fmt_command(argc: i64, argv: i64) -> i64 {
   if argc == 2 { run_fmt() }
   else {
     let first = mem_load64_at(argv, 16)
-    if cstr_eq(first, "--check") == 1 or cstr_eq(first, "--write") == 1 {
+    if cstr_eq(first, "--internal-check-one") == 1 or cstr_eq(first, "--internal-write-one") == 1 {
+      if argc == 4 {
+        main_fmt_process_path(mem_load64_at(argv, 24), if cstr_eq(first, "--internal-check-one") == 1 { 1 } else { 2 })
+      } else { 1 }
+    } else { if cstr_eq(first, "--check") == 1 or cstr_eq(first, "--write") == 1 {
       if argc < 4 {
         eprint("usage: weft fmt [path]\nusage: weft fmt (--check | --write) <path...>\n")
         1
@@ -1361,7 +1410,7 @@ fn run_fmt_command(argc: i64, argv: i64) -> i64 {
     else {
       eprint("usage: weft fmt [path]\nusage: weft fmt (--check | --write) <path...>\n")
       1
-    } }
+    } } }
   }
 }
 
