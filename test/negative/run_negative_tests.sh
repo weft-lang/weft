@@ -450,6 +450,7 @@ check_rejects "opaque_construct_reexported" "test/negative/opaque_construct_reex
 check_rejects "opaque_missing_drop" "test/negative/opaque_missing_drop.weft" "type error: owned type requires Drop resource conformance"
 check_rejects "opaque_use_after_move" "test/negative/opaque_use_after_move.weft" "type error: owned value used more than once"
 check_rejects "opaque_representation_too_wide" "test/negative/opaque_representation_too_wide.weft" "type error: result type exceeds 8-lane native ABI"
+check_rejects "opaque_mutable_representation_not_sendable" "test/negative/opaque_mutable_representation_not_sendable.weft" "type error: type is not Sendable"
 check_rejects "file_handle_constructor_private" "test/negative/file_handle_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "file_handle_record_fabrication" "test/negative/file_handle_record_fabrication.weft" "type error: not a record type"
 check_rejects "file_handle_field_private" "test/negative/file_handle_field_private.weft" "type error: unknown field"
