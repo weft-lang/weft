@@ -457,6 +457,7 @@ check_rejects "file_handle_field_private" "test/negative/file_handle_field_priva
 check_rejects "file_handle_raw_factory_private" "test/negative/file_handle_raw_factory_private.weft" "module member 'io_file_from_fd' is not visible in this import"
 check_rejects "bytes_constructor_private" "test/negative/bytes_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "path_constructor_private" "test/negative/path_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "io_helper_effect_unavailable" "test/negative/io_helper_effect_unavailable.weft" "type error: effect not available in caller"
 check_rejects "if_condition_not_bool" "test/negative/if_condition_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "while_condition_not_bool" "test/negative/while_condition_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "for_iter_non_list" "test/negative/for_iter_non_list.weft" "type error: for iterator requires an array, slice, or Cons/Nil list"
