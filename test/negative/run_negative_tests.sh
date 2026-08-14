@@ -833,6 +833,11 @@ check_rejects "import_cycle_direct" "test/negative/import_cycle_direct.weft" "er
 check_rejects "call_site_label_unsupported" "test/negative/call_site_label_unsupported.weft" "error: call-site argument labels are not supported yet"
 check_rejects "rigid_tail_concrete_perform" "test/negative/rigid_tail_concrete_perform.weft" "type error: effect not available in caller"
 check_rejects "rigid_tail_concrete_call" "test/negative/rigid_tail_concrete_call.weft" "type error: effect not available in caller"
+check_rejects "borrow_return_position" "test/negative/borrow_return_position.weft" "type error: borrow is only valid on callable parameters"
+check_rejects "borrow_local_position" "test/negative/borrow_local_position.weft" "type error: borrow is only valid on callable parameters"
+check_rejects "borrow_field_position" "test/negative/borrow_field_position.weft" "type error: borrow is only valid on callable parameters"
+check_rejects "borrow_non_resource" "test/negative/borrow_non_resource.weft" "type error: borrow requires an owned resource type"
+check_rejects "borrow_nested_ownership" "test/negative/borrow_nested_ownership.weft" "type error: borrow cannot wrap another ownership qualifier"
 
 ls "$JOBS_DIR"/job_???? | xargs -n1 -P "$WEFT_TEST_JOBS" bash "$0" __worker || true
 
