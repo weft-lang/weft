@@ -387,6 +387,16 @@ else
 fi
 
 echo ""
+echo "=== Formatter Dogfood ==="
+if bash test/tools/run_formatter_dogfood.sh; then
+  PASS=$((PASS+1))
+else
+  echo "  ✗ formatter dogfood failed"
+  FAIL=$((FAIL+1))
+  ERRORS="$ERRORS\n  formatter dogfood failed"
+fi
+
+echo ""
 echo "=== Negative Tests ==="
 if bash test/negative/run_negative_tests.sh; then
   PASS=$((PASS+1))
