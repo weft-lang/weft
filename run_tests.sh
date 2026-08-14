@@ -282,7 +282,12 @@ for f in $(grep -l 'test "' test/*.weft 2>/dev/null); do
 done > "$LIST"
 for f in test/*.weft; do
   grep -q 'test "' "$f" && continue
-  echo "main:$f"
+  # Imported helper/data modules also live under test/. Only standalone
+  # programs with an actual main declaration belong to the legacy runner;
+  # once selected, the worker still requires an Expected-exit annotation.
+  if grep -qE '(^|[[:space:]])fn[[:space:]]+main[[:space:]]*\(' "$f"; then
+    echo "main:$f"
+  fi
 done >> "$LIST"
 
 # Bounded pool: xargs re-invokes this script in worker mode, one item per
