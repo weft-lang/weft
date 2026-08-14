@@ -845,6 +845,10 @@ check_rejects "borrow_actual_type_mismatch" "test/negative/borrow_actual_type_mi
 check_rejects "borrow_conflicting_call" "test/negative/borrow_conflicting_call.weft" "type error: conflicting resource borrows in one call"
 check_rejects "borrow_escape_to_owned" "test/negative/borrow_escape_to_owned.weft" "type error: argument type mismatch"
 check_rejects "borrow_mut_method_immutable_owner" "test/negative/borrow_mut_method_immutable_owner.weft" "type error: exclusive resource borrow requires a mutable owner binding"
+check_rejects "borrow_effect_conflicting_perform" "test/negative/borrow_effect_conflicting_perform.weft" "type error: conflicting resource borrows in one call" 1
+check_rejects "borrow_effect_deferred_continuation" "test/negative/borrow_effect_deferred_continuation.weft" "type error: borrowed effect parameter cannot enter a deferred continuation" 1
+check_rejects "borrow_closure_capture" "test/negative/borrow_closure_capture.weft" "type error: borrowed resource cannot be captured by closure" 1
+check_rejects "borrow_par_spawn_capture" "test/negative/borrow_par_spawn_capture.weft" "type error: borrowed resource cannot be captured by closure" 1
 
 ls "$JOBS_DIR"/job_???? | xargs -n1 -P "$WEFT_TEST_JOBS" bash "$0" __worker || true
 
