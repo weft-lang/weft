@@ -2019,6 +2019,21 @@ else
 fi
 assert_equals "pkg_init_create_new_preserves_empty_existing_manifest" "$(wc -c < "$tmp_pkg_missing_dir/weft.pkg" | tr -d ' ')" "0"
 
+printf '\377' > "$tmp_pkg_missing_dir/weft.pkg"
+if (cd "$tmp_pkg_missing_dir" && "$WEFT_ABS" pkg add math deps/math >/dev/null 2>&1); then
+  echo "  fail pkg_add_rejects_non_utf8_manifest"
+  exit 1
+else
+  echo "  ok pkg_add_rejects_non_utf8_manifest"
+fi
+if (cd "$tmp_pkg_missing_dir" && "$WEFT_ABS" pkg exports >/dev/null 2>&1); then
+  echo "  fail pkg_exports_rejects_non_utf8_manifest"
+  exit 1
+else
+  echo "  ok pkg_exports_rejects_non_utf8_manifest"
+fi
+assert_equals "pkg_non_utf8_manifest_is_preserved" "$(od -An -tu1 "$tmp_pkg_missing_dir/weft.pkg" | tr -d ' ')" "255"
+
 mkdir -p "$tmp_pkg_lock_dir/deps/lib/deps/base" "$tmp_pkg_lock_dir/.weft/cache"
 printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"lib":"deps/lib"}}\n' > "$tmp_pkg_lock_dir/weft.pkg"
 printf 'fn main() -> i64 { 0 }\n' > "$tmp_pkg_lock_dir/main.weft"
@@ -2047,6 +2062,19 @@ else
   echo "  ok pkg_lock_atomic_replace_cleans_temp"
 fi
 rm -f "$tmp_pkg_lock_dir/weft.lock.weft-tmp-0"
+
+# Package identity hashes arbitrary source bytes through FileRead/Bytes. NUL
+# and malformed UTF-8 are content here, never a pointer-shaped text surrogate.
+printf '\000\377\200A' > "$tmp_pkg_lock_dir/raw_bytes.weft"
+pkg_lock_binary_out=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock 2>&1)
+assert_contains "pkg_lock_accepts_binary_source_bytes" "$pkg_lock_binary_out" "pkg: wrote weft.lock"
+pkg_lock_binary_first=$(< "$tmp_pkg_lock_dir/weft.lock")
+assert_not_equals "pkg_lock_binary_source_changes_digest" "$(pkg_lock_digest "$pkg_lock_binary_first" app)" "$(pkg_lock_digest "$pkg_lock_first" app)"
+(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock >/dev/null)
+assert_equals "pkg_lock_binary_source_is_deterministic" "$(< "$tmp_pkg_lock_dir/weft.lock")" "$pkg_lock_binary_first"
+rm -f "$tmp_pkg_lock_dir/raw_bytes.weft"
+(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" pkg lock >/dev/null)
+assert_equals "pkg_lock_binary_source_removal_restores_digest" "$(pkg_lock_digest "$(< "$tmp_pkg_lock_dir/weft.lock")" app)" "$(pkg_lock_digest "$pkg_lock_first" app)"
 
 pkg_locked_check=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" check < app.weft 2>&1)
 assert_contains "package_valid_lock_identity_compiles" "$pkg_locked_check" "check: 2 functions, 0 errors"
