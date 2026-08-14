@@ -400,6 +400,35 @@ fmt_parse_failure_err=$(<"$tmp_err")
 assert_contains "fmt_parse_failure_diagnostic" "$fmt_parse_failure_err" "error: expected '}' before declaration"
 assert_contains "fmt_parse_failure_summary" "$fmt_parse_failure_err" "fmt: parse failed with 1 errors; no output written"
 
+printf '%s\n' 'extern fn placeholder(n: i64) -> i64 { n }' 'fn main() -> i64 { 42 }' > "$tmp_src"
+set +e
+"$WEFT" check < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+check_parse_failure_exit=$?
+set -e
+assert_equals "check_parse_failure_exit" "$check_parse_failure_exit" "1"
+assert_equals "check_parse_failure_no_stdout" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+assert_contains "check_parse_failure_diagnostic" "$(<"$tmp_err")" "error: unexpected token at module level"
+assert_contains "check_parse_failure_summary" "$(<"$tmp_err")" "check: 2 functions, 1 errors"
+
+set +e
+"$WEFT" compile < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+compile_parse_failure_exit=$?
+set -e
+assert_equals "compile_parse_failure_exit" "$compile_parse_failure_exit" "1"
+assert_equals "compile_parse_failure_no_binary" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+assert_contains "compile_parse_failure_diagnostic" "$(<"$tmp_err")" "error: unexpected token at module level"
+assert_contains "compile_parse_failure_summary" "$(<"$tmp_err")" "compile: parse failed with 1 errors"
+
+printf '%s\n' 'extern fn placeholder(n: i64) -> i64 { n }' 'test "recovered body must not run" { Test.assert_eq(1, 1) }' > "$tmp_src"
+set +e
+"$WEFT" test < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+test_parse_failure_exit=$?
+set -e
+assert_equals "test_parse_failure_exit" "$test_parse_failure_exit" "1"
+assert_equals "test_parse_failure_no_binary" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+assert_contains "test_parse_failure_diagnostic" "$(<"$tmp_err")" "line 1, col 1: error: unexpected token at module level"
+assert_contains "test_parse_failure_summary" "$(<"$tmp_err")" "test: parse failed with 1 errors"
+
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 ast_out=$("$WEFT" ast < "$tmp_src" 2>&1)
 assert_contains "ast_parse_only_header" "$ast_out" "--- AST: 1 functions ---"
@@ -2221,4 +2250,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 502 passed, 0 failed"
+echo "Tool boundary summary: 514 passed, 0 failed"
