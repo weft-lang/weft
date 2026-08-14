@@ -1,0 +1,162 @@
+-- runtime/safe_file_core.weft — backend-neutral typed file-write engine
+--
+-- The linked and standalone program boundaries share these exact partial-write,
+-- close and atomic-replace semantics. Directory installation stays outside so
+-- importing this module never selects object/GOT output by itself.
+
+use runtime/string.{runtime_str_byte_at, runtime_str_from_bytes_copy, runtime_str_len}
+use stdlib/bytes.{Bytes, bytes_to_vector}
+use stdlib/dir.{Dir}
+use stdlib/file.{FileAppend, FileAtomicReplace, FileCreateNew, FileCreateOrTruncate, FileWriteMode}
+use stdlib/io.{io_mode_user_rw, io_o_creat, io_o_trunc, io_o_wronly, raw_close, raw_open, raw_write}
+use stdlib/io_types.{IoAlreadyExists, IoError, IoInterrupted, IoInvalidProgress, io_error_from_errno}
+use stdlib/num.{num_i64_to_u8_checked, num_i64_to_usize_checked, num_int_cast_value_or}
+use stdlib/path.{Path, path_bytes}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/string.{int_to_str, str_concat}
+use stdlib/vector.{vector_data, vector_len, vector_push}
+use stdlib/vector_type.{Vector}
+
+fn runtime_safe_file_i64_to_usize(value: i64) -> usize {
+  num_int_cast_value_or<usize>(num_i64_to_usize_checked(value), 0)
+}
+
+fn runtime_safe_file_u8(value: i64) -> u8 {
+  num_int_cast_value_or<u8>(num_i64_to_u8_checked(value), 0)
+}
+
+pub(package) fn runtime_safe_path_string(path: Path) -> str {
+  let values = bytes_to_vector(path_bytes(path))
+  runtime_str_from_bytes_copy(vector_data<u8>(values), vector_len<u8>(values))
+}
+
+fn runtime_safe_file_append_str_bytes(out: Vector<u8>, suffix: str) -> i64 {
+  let n = runtime_str_len(suffix)
+  for i in 0..n {
+    vector_push<u8>(out, runtime_safe_file_u8(runtime_str_byte_at(suffix, i)))
+  }
+  n
+}
+
+fn runtime_safe_file_temp_path_string(path: Path, attempt: i64) -> str {
+  let out = bytes_to_vector(path_bytes(path))
+  runtime_safe_file_append_str_bytes(out, str_concat(".weft-tmp-", int_to_str(attempt)))
+  runtime_str_from_bytes_copy(vector_data<u8>(out), vector_len<u8>(out))
+}
+
+pub(package) fn runtime_safe_write_fd(fd: i64, values: Bytes) -> Result<usize, IoError> {
+  let contiguous = bytes_to_vector(values)
+  let total = vector_len<u8>(contiguous)
+  let mut offset = 0
+  let mut failed = false
+  let mut failure = IoInvalidProgress
+  while offset < total and not failed {
+    let status = raw_write(fd, vector_data<u8>(contiguous) + offset, total - offset)
+    if status > 0 {
+      if status > total - offset {
+        failure = IoInvalidProgress
+        failed = true
+      } else {
+        offset = offset + status
+      }
+    } else { if status == 0 {
+      failure = IoInvalidProgress
+      failed = true
+    } else {
+      match io_error_from_errno(status) {
+        IoInterrupted -> 0
+        error -> {
+          failure = error
+          failed = true
+          0
+        }
+      }
+    } }
+  }
+  if failed { result_err<usize, IoError>(failure) }
+  else { result_ok<usize, IoError>(runtime_safe_file_i64_to_usize(offset)) }
+}
+
+fn runtime_safe_file_open_flags(mode: FileWriteMode) -> i64 {
+  match mode {
+    FileCreateNew -> io_o_wronly() + io_o_creat() + 2048
+    FileCreateOrTruncate -> io_o_wronly() + io_o_creat() + io_o_trunc()
+    FileAppend -> io_o_wronly() + io_o_creat() + 8
+    FileAtomicReplace -> io_o_wronly() + io_o_creat() + 2048
+  }
+}
+
+fn runtime_safe_file_write_opened(fd: i64, values: Bytes) -> Result<usize, IoError> {
+  let result = runtime_safe_write_fd(fd, values)
+  let close_status = raw_close(fd)
+  match result {
+    Err(error) -> result_err<usize, IoError>(error)
+    Ok(count) -> if close_status == 0 {
+      result_ok<usize, IoError>(count)
+    } else {
+      result_err<usize, IoError>(io_error_from_errno(close_status))
+    }
+  }
+}
+
+fn runtime_safe_file_write_direct(path: Path, values: Bytes, mode: FileWriteMode) -> Result<usize, IoError> {
+  let fd = raw_open(runtime_safe_path_string(path), runtime_safe_file_open_flags(mode), io_mode_user_rw())
+  if fd < 0 { result_err<usize, IoError>(io_error_from_errno(fd)) }
+  else { runtime_safe_file_write_opened(fd, values) }
+}
+
+fn runtime_safe_file_write_atomic(path: Path, values: Bytes) -[Dir]> Result<usize, IoError> {
+  -- The same-directory rename makes replacement namespace-atomic. Durability
+  -- needs a future typed sync primitive; this bridge does not promise it.
+  let target = runtime_safe_path_string(path)
+  let mut attempt = 0
+  let mut fd = 0 - 1
+  let mut temp = ""
+  let mut failed = false
+  let mut failure = IoAlreadyExists
+  while fd < 0 and attempt < 64 and not failed {
+    temp = runtime_safe_file_temp_path_string(path, attempt)
+    let opened = raw_open(temp, runtime_safe_file_open_flags(FileAtomicReplace), io_mode_user_rw())
+    if opened >= 0 {
+      fd = opened
+    } else {
+      match io_error_from_errno(opened) {
+        IoAlreadyExists -> {
+          attempt = attempt + 1
+          0
+        }
+        error -> {
+          failure = error
+          failed = true
+          0
+        }
+      }
+    }
+  }
+  if failed or fd < 0 {
+    result_err<usize, IoError>(failure)
+  } else {
+    match runtime_safe_file_write_opened(fd, values) {
+      Err(error) -> {
+        Dir.remove(temp)
+        result_err<usize, IoError>(error)
+      }
+      Ok(count) -> {
+        let renamed = Dir.rename(temp, target)
+        if renamed == 0 {
+          result_ok<usize, IoError>(count)
+        } else {
+          Dir.remove(temp)
+          result_err<usize, IoError>(io_error_from_errno(renamed))
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn runtime_safe_file_write_result(path: Path, values: Bytes, mode: FileWriteMode) -[Dir]> Result<usize, IoError> {
+  match mode {
+    FileAtomicReplace -> runtime_safe_file_write_atomic(path, values)
+    _ -> runtime_safe_file_write_direct(path, values, mode)
+  }
+}
