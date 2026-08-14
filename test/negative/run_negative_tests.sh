@@ -838,6 +838,13 @@ check_rejects "borrow_local_position" "test/negative/borrow_local_position.weft"
 check_rejects "borrow_field_position" "test/negative/borrow_field_position.weft" "type error: borrow is only valid on callable parameters"
 check_rejects "borrow_non_resource" "test/negative/borrow_non_resource.weft" "type error: borrow requires an owned resource type"
 check_rejects "borrow_nested_ownership" "test/negative/borrow_nested_ownership.weft" "type error: borrow cannot wrap another ownership qualifier"
+check_rejects "borrow_temporary_actual" "test/negative/borrow_temporary_actual.weft" "type error: resource borrow requires a named owned binding"
+check_rejects "borrow_mut_immutable_owner" "test/negative/borrow_mut_immutable_owner.weft" "type error: exclusive resource borrow requires a mutable owner binding"
+check_rejects "borrow_shared_to_exclusive" "test/negative/borrow_shared_to_exclusive.weft" "type error: shared resource borrow cannot be forwarded as exclusive"
+check_rejects "borrow_actual_type_mismatch" "test/negative/borrow_actual_type_mismatch.weft" "type error: resource borrow type mismatch"
+check_rejects "borrow_conflicting_call" "test/negative/borrow_conflicting_call.weft" "type error: conflicting resource borrows in one call"
+check_rejects "borrow_escape_to_owned" "test/negative/borrow_escape_to_owned.weft" "type error: argument type mismatch"
+check_rejects "borrow_mut_method_immutable_owner" "test/negative/borrow_mut_method_immutable_owner.weft" "type error: exclusive resource borrow requires a mutable owner binding"
 
 ls "$JOBS_DIR"/job_???? | xargs -n1 -P "$WEFT_TEST_JOBS" bash "$0" __worker || true
 
