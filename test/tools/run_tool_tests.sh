@@ -23,6 +23,7 @@ tmp_test_fail_one=$(mktemp /tmp/weft_tool_test_fail_one_XXXXXX.weft)
 tmp_test_fail_two=$(mktemp /tmp/weft_tool_test_fail_two_XXXXXX.weft)
 tmp_test_after=$(mktemp /tmp/weft_tool_test_after_XXXXXX.weft)
 tmp_test_dir=$(mktemp -d /tmp/weft_tool_test_dir_XXXXXX)
+tmp_fmt_dir=$(mktemp -d /tmp/weft_tool_fmt_dir_XXXXXX)
 tmp_pkg_dir=$(mktemp -d /tmp/weft_tool_pkg_XXXXXX)
 tmp_pkg_cli_dir=$(mktemp -d /tmp/weft_tool_pkg_cli_XXXXXX)
 tmp_pkg_lock_dir=$(mktemp -d /tmp/weft_tool_pkg_lock_XXXXXX)
@@ -32,7 +33,7 @@ tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_fmt_dir"' EXIT
 
 now_s() {
   date +%s
@@ -399,6 +400,197 @@ assert_equals "fmt_parse_failure_no_stdout" "$(wc -c < "$tmp_out" | tr -d ' ')" 
 fmt_parse_failure_err=$(<"$tmp_err")
 assert_contains "fmt_parse_failure_diagnostic" "$fmt_parse_failure_err" "error: expected '}' before declaration"
 assert_contains "fmt_parse_failure_summary" "$fmt_parse_failure_err" "fmt: parse failed with 1 errors; no output written"
+
+set +e
+"$WEFT" fmt --check > "$tmp_out" 2>"$tmp_err"
+fmt_check_usage_exit=$?
+set -e
+assert_equals "fmt_check_requires_paths" "$fmt_check_usage_exit" "1"
+assert_equals "fmt_check_usage_stdout_empty" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+assert_contains "fmt_check_usage_is_actionable" "$(<"$tmp_err")" "usage: weft fmt (--check | --write) <path...>"
+
+fmt_clean="$tmp_fmt_dir/clean.weft"
+fmt_dirty="$tmp_fmt_dir/dirty.weft"
+printf 'fn clean() -> i64 { 1 }\n' > "$fmt_clean"
+printf 'fn dirty()  ->  i64 { 2 }\n' > "$fmt_dirty"
+set +e
+"$WEFT" fmt --check "$fmt_clean" > "$tmp_out" 2>"$tmp_err"
+fmt_check_clean_exit=$?
+set -e
+assert_equals "fmt_check_clean_exit_zero" "$fmt_check_clean_exit" "0"
+assert_equals "fmt_check_clean_stdout_empty" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+assert_equals "fmt_check_clean_stderr_empty" "$(<"$tmp_err")" ""
+
+cp "$fmt_dirty" "$tmp_bin"
+set +e
+"$WEFT" fmt --check "$fmt_dirty" > "$tmp_out" 2>"$tmp_err"
+fmt_check_dirty_exit=$?
+set -e
+assert_equals "fmt_check_dirty_exits_one" "$fmt_check_dirty_exit" "1"
+assert_equals "fmt_check_dirty_stdout_empty" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+assert_contains "fmt_check_dirty_names_path" "$(<"$tmp_err")" "fmt: would reformat: $fmt_dirty"
+assert_files_equal "fmt_check_dirty_leaves_source_unchanged" "$fmt_dirty" "$tmp_bin"
+
+chmod 664 "$fmt_dirty"
+fmt_dirty_mode_before=$(stat -f '%Lp' "$fmt_dirty")
+set +e
+"$WEFT" fmt --write "$fmt_dirty" > "$tmp_out" 2>"$tmp_err"
+fmt_write_dirty_exit=$?
+set -e
+assert_equals "fmt_write_dirty_exit_zero" "$fmt_write_dirty_exit" "0"
+assert_equals "fmt_write_dirty_stdout_empty" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+assert_equals "fmt_write_dirty_stderr_empty" "$(<"$tmp_err")" ""
+assert_equals "fmt_write_dirty_replaces_canonically" "$(<"$fmt_dirty")" "fn dirty() -> i64 { 2 }"
+assert_equals "fmt_write_preserves_permissions" "$(stat -f '%Lp' "$fmt_dirty")" "$fmt_dirty_mode_before"
+assert_equals "fmt_write_removes_temporary" "$(test -e "$fmt_dirty.weft-fmt.tmp"; echo $?)" "1"
+set +e
+"$WEFT" fmt --check "$fmt_dirty" > "$tmp_out" 2>"$tmp_err"
+fmt_write_idempotent_exit=$?
+set -e
+assert_equals "fmt_write_result_passes_check" "$fmt_write_idempotent_exit" "0"
+assert_equals "fmt_write_result_check_stderr_empty" "$(<"$tmp_err")" ""
+
+fmt_recursive_root="$tmp_fmt_dir/recursive"
+mkdir -p "$fmt_recursive_root/nested/deeper"
+fmt_recursive_a="$fmt_recursive_root/a.weft"
+fmt_recursive_b="$fmt_recursive_root/nested/deeper/b.weft"
+printf 'fn a()  ->  i64 { 3 }\n' > "$fmt_recursive_a"
+printf 'fn b()  ->  i64 { 4 }\n' > "$fmt_recursive_b"
+printf 'leave  this alone\n' > "$fmt_recursive_root/ignored.txt"
+ln -s "$fmt_recursive_root" "$fmt_recursive_root/nested/loop"
+set +e
+"$WEFT" fmt --write "$fmt_recursive_root" > "$tmp_out" 2>"$tmp_err"
+fmt_recursive_write_exit=$?
+set -e
+assert_equals "fmt_write_directory_exit_zero" "$fmt_recursive_write_exit" "0"
+assert_equals "fmt_write_directory_stdout_empty" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+assert_equals "fmt_write_directory_stderr_empty" "$(<"$tmp_err")" ""
+assert_equals "fmt_write_directory_formats_root_file" "$(<"$fmt_recursive_a")" "fn a() -> i64 { 3 }"
+assert_equals "fmt_write_directory_formats_nested_file" "$(<"$fmt_recursive_b")" "fn b() -> i64 { 4 }"
+assert_equals "fmt_write_directory_ignores_other_extensions" "$(<"$fmt_recursive_root/ignored.txt")" "leave  this alone"
+
+printf 'fn a()  ->  i64 { 3 }\n' > "$fmt_recursive_a"
+cp "$fmt_recursive_a" "$tmp_bin"
+set +e
+"$WEFT" fmt --check "$fmt_recursive_a" "$fmt_recursive_root" > "$tmp_out" 2>"$tmp_err"
+fmt_overlap_exit=$?
+set -e
+assert_equals "fmt_overlap_dirty_exits_one" "$fmt_overlap_exit" "1"
+assert_equals "fmt_overlap_deduplicates_path" "$(grep -cF "fmt: would reformat: $fmt_recursive_a" "$tmp_err")" "1"
+assert_files_equal "fmt_overlap_check_leaves_source_unchanged" "$fmt_recursive_a" "$tmp_bin"
+
+fmt_order_a="$tmp_fmt_dir/a_order.weft"
+fmt_order_z="$tmp_fmt_dir/z_order.weft"
+printf 'fn order_a()  ->  i64 { 1 }\n' > "$fmt_order_a"
+printf 'fn order_z()  ->  i64 { 2 }\n' > "$fmt_order_z"
+set +e
+"$WEFT" fmt --check "$fmt_order_z" "$fmt_order_a" > "$tmp_out" 2>"$tmp_err"
+fmt_order_exit=$?
+set -e
+assert_equals "fmt_multiple_paths_dirty_exit_one" "$fmt_order_exit" "1"
+fmt_order_a_line=$(grep -nF "fmt: would reformat: $fmt_order_a" "$tmp_err" | cut -d: -f1)
+fmt_order_z_line=$(grep -nF "fmt: would reformat: $fmt_order_z" "$tmp_err" | cut -d: -f1)
+if [ "$fmt_order_a_line" -lt "$fmt_order_z_line" ]; then
+  echo "  ok fmt_multiple_paths_are_deterministic"
+else
+  echo "  fail fmt_multiple_paths_are_deterministic"
+  exit 1
+fi
+
+fmt_broken="$tmp_fmt_dir/broken.weft"
+printf 'fn broken() -> i64 {\n' > "$fmt_broken"
+cp "$fmt_broken" "$tmp_bin"
+set +e
+"$WEFT" fmt --write "$fmt_broken" > "$tmp_out" 2>"$tmp_err"
+fmt_broken_write_exit=$?
+set -e
+assert_equals "fmt_write_parse_error_exits_one" "$fmt_broken_write_exit" "1"
+assert_equals "fmt_write_parse_error_stdout_empty" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+assert_contains "fmt_write_parse_error_preserves_eof_coordinate" "$(<"$tmp_err")" "line 2, col 1: error: expected '}' before end of file"
+assert_contains "fmt_write_parse_error_summary" "$(<"$tmp_err")" "fmt: parse failed for $fmt_broken"
+assert_files_equal "fmt_write_parse_error_leaves_source_unchanged" "$fmt_broken" "$tmp_bin"
+assert_equals "fmt_write_parse_error_creates_no_temporary" "$(test -e "$fmt_broken.weft-fmt.tmp"; echo $?)" "1"
+
+fmt_readonly="$tmp_fmt_dir/readonly.weft"
+printf 'fn readonly()  ->  i64 { 5 }\n' > "$fmt_readonly"
+cp "$fmt_readonly" "$tmp_bin"
+chmod 444 "$fmt_readonly"
+set +e
+"$WEFT" fmt --write "$fmt_readonly" > "$tmp_out" 2>"$tmp_err"
+fmt_readonly_exit=$?
+set -e
+assert_equals "fmt_write_readonly_exits_one" "$fmt_readonly_exit" "1"
+assert_contains "fmt_write_readonly_is_explicit" "$(<"$tmp_err")" "fmt: source file is read-only: $fmt_readonly"
+assert_files_equal "fmt_write_readonly_leaves_source_unchanged" "$fmt_readonly" "$tmp_bin"
+assert_equals "fmt_write_readonly_creates_no_temporary" "$(test -e "$fmt_readonly.weft-fmt.tmp"; echo $?)" "1"
+chmod 644 "$fmt_readonly"
+
+fmt_interrupted="$tmp_fmt_dir/interrupted.weft"
+fmt_interrupted_temp="$fmt_interrupted.weft-fmt.tmp"
+printf 'fn interrupted()  ->  i64 { 6 }\n' > "$fmt_interrupted"
+printf 'previous temporary bytes\n' > "$fmt_interrupted_temp"
+cp "$fmt_interrupted" "$tmp_bin"
+set +e
+"$WEFT" fmt --write "$fmt_interrupted" > "$tmp_out" 2>"$tmp_err"
+fmt_interrupted_exit=$?
+set -e
+assert_equals "fmt_write_interrupted_exits_one" "$fmt_interrupted_exit" "1"
+assert_contains "fmt_write_interrupted_reports_temporary" "$(<"$tmp_err")" "fmt: could not create temporary file: $fmt_interrupted_temp"
+assert_files_equal "fmt_write_interrupted_leaves_source_unchanged" "$fmt_interrupted" "$tmp_bin"
+assert_equals "fmt_write_interrupted_preserves_existing_temporary" "$(<"$fmt_interrupted_temp")" "previous temporary bytes"
+rm -f "$fmt_interrupted_temp"
+
+fmt_symlink_target="$tmp_fmt_dir/symlink_target.weft"
+fmt_symlink_path="$tmp_fmt_dir/symlink.weft"
+printf 'fn symlink_target()  ->  i64 { 7 }\n' > "$fmt_symlink_target"
+cp "$fmt_symlink_target" "$tmp_bin"
+ln -s "$fmt_symlink_target" "$fmt_symlink_path"
+set +e
+"$WEFT" fmt --write "$fmt_symlink_path" > "$tmp_out" 2>"$tmp_err"
+fmt_symlink_exit=$?
+set -e
+assert_equals "fmt_write_symlink_exits_one" "$fmt_symlink_exit" "1"
+assert_contains "fmt_write_symlink_is_explicit" "$(<"$tmp_err")" "fmt: refusing to replace symbolic link: $fmt_symlink_path"
+assert_files_equal "fmt_write_symlink_leaves_target_unchanged" "$fmt_symlink_target" "$tmp_bin"
+if [ -L "$fmt_symlink_path" ]; then
+  echo "  ok fmt_write_symlink_remains_link"
+else
+  echo "  fail fmt_write_symlink_remains_link"
+  exit 1
+fi
+
+fmt_empty="$tmp_fmt_dir/empty.weft"
+: > "$fmt_empty"
+set +e
+"$WEFT" fmt --check "$fmt_empty" > "$tmp_out" 2>"$tmp_err"
+fmt_empty_exit=$?
+set -e
+assert_equals "fmt_check_accepts_empty_file" "$fmt_empty_exit" "0"
+assert_equals "fmt_check_empty_file_stderr_empty" "$(<"$tmp_err")" ""
+
+fmt_empty_dir="$tmp_fmt_dir/no_sources"
+mkdir -p "$fmt_empty_dir"
+set +e
+"$WEFT" fmt --check "$fmt_empty_dir" > "$tmp_out" 2>"$tmp_err"
+fmt_empty_dir_exit=$?
+set -e
+assert_equals "fmt_check_empty_directory_exits_one" "$fmt_empty_dir_exit" "1"
+assert_contains "fmt_check_empty_directory_names_path" "$(<"$tmp_err")" "fmt: no .weft files in directory: $fmt_empty_dir"
+
+fmt_missing="$tmp_fmt_dir/missing.weft"
+set +e
+"$WEFT" fmt --check "$fmt_missing" > "$tmp_out" 2>"$tmp_err"
+fmt_missing_exit=$?
+set -e
+assert_equals "fmt_check_missing_file_exits_one" "$fmt_missing_exit" "1"
+assert_contains "fmt_check_missing_file_names_path" "$(<"$tmp_err")" "fmt: could not read input file: $fmt_missing"
+
+set +e
+"$WEFT" fmt "$fmt_clean" "$fmt_dirty" > "$tmp_out" 2>"$tmp_err"
+fmt_plain_multiple_exit=$?
+set -e
+assert_equals "fmt_plain_multiple_paths_require_mode" "$fmt_plain_multiple_exit" "1"
+assert_contains "fmt_plain_multiple_paths_show_usage" "$(<"$tmp_err")" "usage: weft fmt (--check | --write) <path...>"
 
 printf '%s\n' 'extern fn placeholder(n: i64) -> i64 { n }' 'fn main() -> i64 { 42 }' > "$tmp_src"
 set +e
@@ -2250,4 +2442,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 514 passed, 0 failed"
+echo "Tool boundary summary: 569 passed, 0 failed"
