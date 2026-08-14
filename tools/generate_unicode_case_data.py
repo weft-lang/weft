@@ -25,6 +25,8 @@ INPUTS = {
         "ff8d8fefbf123574205085d6714c36149eb946d717a0c585c27f0f4ef58c4183",
     ),
 }
+EXPECTED_COUNTS = (1580, 1488, 1507, 1585)
+EXPECTED_UNCONDITIONAL_SPECIAL = 103
 
 
 def load(path: pathlib.Path | None, name: str) -> bytes:
@@ -127,6 +129,56 @@ def non_identity(
         for scalar, target in mappings.items()
         if target != (scalar,)
     )
+
+
+def scalar_is_valid(scalar: int) -> bool:
+    return 0 <= scalar <= 0x10FFFF and not 0xD800 <= scalar <= 0xDFFF
+
+
+def apply_mapping(
+    values: tuple[int, ...], mappings: dict[int, tuple[int, ...]]
+) -> tuple[int, ...]:
+    return tuple(
+        mapped
+        for scalar in values
+        for mapped in mappings.get(scalar, (scalar,))
+    )
+
+
+def validate_tables(
+    upper: dict[int, tuple[int, ...]],
+    lower: dict[int, tuple[int, ...]],
+    title: dict[int, tuple[int, ...]],
+    folding: dict[int, tuple[int, ...]],
+    special_count: int,
+) -> None:
+    tables = (upper, lower, title, folding)
+    counts = tuple(len(non_identity(table)) for table in tables)
+    if counts != EXPECTED_COUNTS:
+        raise SystemExit(f"Unicode 17 case table counts changed: {counts}")
+    if special_count != EXPECTED_UNCONDITIONAL_SPECIAL:
+        raise SystemExit(
+            f"Unicode 17 unconditional SpecialCasing count changed: {special_count}"
+        )
+    for table in tables:
+        for scalar, target in table.items():
+            if not scalar_is_valid(scalar) or not all(map(scalar_is_valid, target)):
+                raise SystemExit(f"case mapping contains a non-scalar at U+{scalar:04X}")
+            if len(target) > 255:
+                raise SystemExit(f"case mapping expansion exceeds packed length at U+{scalar:04X}")
+    for scalar, target in folding.items():
+        if apply_mapping(target, folding) != target:
+            raise SystemExit(f"full case folding is not idempotent at U+{scalar:04X}")
+    required = (
+        (upper, 0x00DF, (0x0053, 0x0053)),
+        (title, 0x00DF, (0x0053, 0x0073)),
+        (lower, 0x0130, (0x0069, 0x0307)),
+        (lower, 0x03A3, (0x03C3,)),
+        (folding, 0x03C2, (0x03C3,)),
+    )
+    for table, scalar, expected in required:
+        if table.get(scalar) != expected:
+            raise SystemExit(f"required case mapping changed at U+{scalar:04X}")
 
 
 def mapping_chunks(
@@ -282,6 +334,7 @@ def main() -> int:
             + ", ".join(sorted(contexts))
         )
     folding = parse_full_case_folding(loaded["case_folding"])
+    validate_tables(upper, lower, title, folding, special_count)
     tables = tuple(non_identity(table) for table in (upper, lower, title, folding))
     generated = generate_source(*tables, special_count).encode("utf-8")
 
