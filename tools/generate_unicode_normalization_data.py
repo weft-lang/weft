@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the pinned Unicode NFC quick-check substrate for Weft."""
+"""Generate Weft's pinned Unicode normalization substrate."""
 
 from __future__ import annotations
 
@@ -65,9 +65,12 @@ def merge_value_ranges(
     return merged
 
 
-def parse_derived(data: bytes) -> tuple[list[tuple[int, int]], list[tuple[int, int]], set[int]]:
-    no: list[tuple[int, int]] = []
-    maybe: list[tuple[int, int]] = []
+def parse_derived(
+    data: bytes,
+) -> tuple[dict[str, tuple[list[tuple[int, int]], list[tuple[int, int]]]], set[int]]:
+    quick_checks: dict[str, dict[str, list[tuple[int, int]]]] = {
+        form: {"N": [], "M": []} for form in ("NFC", "NFD", "NFKC", "NFKD")
+    }
     exclusions: set[int] = set()
     for raw_line in data.decode("utf-8").splitlines():
         body = raw_line.split("#", 1)[0].strip()
@@ -75,13 +78,20 @@ def parse_derived(data: bytes) -> tuple[list[tuple[int, int]], list[tuple[int, i
             continue
         fields = [field.strip() for field in body.split(";")]
         lo, hi = parse_range(fields[0])
-        if fields[1] == "NFC_QC" and fields[2] == "N":
-            no.append((lo, hi))
-        elif fields[1] == "NFC_QC" and fields[2] == "M":
-            maybe.append((lo, hi))
-        elif fields[1] == "Full_Composition_Exclusion":
+        property_name = fields[1]
+        if property_name.endswith("_QC") and property_name[:-3] in quick_checks:
+            value = fields[2]
+            if value in ("N", "M"):
+                quick_checks[property_name[:-3]][value].append((lo, hi))
+        elif property_name == "Full_Composition_Exclusion":
             exclusions.update(range(lo, hi + 1))
-    return merge_ranges(no), merge_ranges(maybe), exclusions
+    return (
+        {
+            form: (merge_ranges(values["N"]), merge_ranges(values["M"]))
+            for form, values in quick_checks.items()
+        },
+        exclusions,
+    )
 
 
 def parse_unicode_data(
@@ -89,10 +99,12 @@ def parse_unicode_data(
 ) -> tuple[
     list[tuple[int, int, int]],
     list[tuple[int, tuple[int, ...]]],
+    list[tuple[int, tuple[int, ...]]],
     list[tuple[int, int, int]],
 ]:
     combining: list[tuple[int, int]] = []
-    decompositions: list[tuple[int, tuple[int, ...]]] = []
+    canonical_decompositions: list[tuple[int, tuple[int, ...]]] = []
+    compatibility_decompositions: list[tuple[int, tuple[int, ...]]] = []
     compositions: list[tuple[int, int, int]] = []
     pending_range: tuple[int, int] | None = None
     for line in data.decode("utf-8").splitlines():
@@ -113,16 +125,25 @@ def parse_unicode_data(
             combining.append((codepoint, ccc))
 
         decomposition = fields[5]
-        if decomposition and not decomposition.startswith("<"):
-            parts = [int(part, 16) for part in decomposition.split()]
-            decompositions.append((codepoint, tuple(parts)))
+        if decomposition:
+            decomposition_fields = decomposition.split()
+            is_compatibility = decomposition_fields[0].startswith("<")
+            if is_compatibility:
+                decomposition_fields = decomposition_fields[1:]
+            parts = tuple(int(part, 16) for part in decomposition_fields)
+            if is_compatibility:
+                compatibility_decompositions.append((codepoint, parts))
+            else:
+                canonical_decompositions.append((codepoint, parts))
             if len(parts) == 2 and codepoint not in exclusions:
-                compositions.append((parts[0], parts[1], codepoint))
+                if not is_compatibility:
+                    compositions.append((parts[0], parts[1], codepoint))
     if pending_range is not None:
         raise SystemExit("UnicodeData unterminated range")
     return (
         merge_value_ranges(combining),
-        sorted(decompositions),
+        sorted(canonical_decompositions),
+        sorted(compatibility_decompositions),
         sorted(set(compositions)),
     )
 
@@ -170,9 +191,11 @@ def hangul_composition(first: int, second: int) -> int | None:
     return None
 
 
-def canonical_decompose(
+def decompose(
     scalar: int,
-    decompositions: dict[int, tuple[int, ...]],
+    canonical_decompositions: dict[int, tuple[int, ...]],
+    compatibility_decompositions: dict[int, tuple[int, ...]],
+    compatibility: bool,
 ) -> tuple[int, ...]:
     if 0xAC00 <= scalar < 0xAC00 + 11172:
         s_index = scalar - 0xAC00
@@ -182,26 +205,43 @@ def canonical_decompose(
         if trailing_index:
             return (leading, vowel, 0x11A7 + trailing_index)
         return (leading, vowel)
-    direct = decompositions.get(scalar)
+    direct = (
+        compatibility_decompositions.get(scalar) if compatibility else None
+    )
+    if direct is None:
+        direct = canonical_decompositions.get(scalar)
     if direct is None:
         return (scalar,)
     return tuple(
         nested
         for part in direct
-        for nested in canonical_decompose(part, decompositions)
+        for nested in decompose(
+            part,
+            canonical_decompositions,
+            compatibility_decompositions,
+            compatibility,
+        )
     )
 
 
-def normalize_nfc(
+def normalize(
     scalars: tuple[int, ...],
     combining: list[tuple[int, int, int]],
-    decompositions: dict[int, tuple[int, ...]],
+    canonical_decompositions: dict[int, tuple[int, ...]],
+    compatibility_decompositions: dict[int, tuple[int, ...]],
     compositions: dict[tuple[int, int], int],
+    compatibility: bool,
+    compose: bool,
 ) -> tuple[int, ...]:
     ordered: list[int] = []
     segment_start = 0
     for scalar in scalars:
-        for part in canonical_decompose(scalar, decompositions):
+        for part in decompose(
+            scalar,
+            canonical_decompositions,
+            compatibility_decompositions,
+            compatibility,
+        ):
             ccc = combining_class(part, combining)
             if ccc == 0:
                 ordered.append(part)
@@ -215,8 +255,8 @@ def normalize_nfc(
                     insert -= 1
                 ordered.insert(insert, part)
 
-    if not ordered:
-        return ()
+    if not compose or not ordered:
+        return tuple(ordered)
     composed = [ordered[0]]
     starter_index = 0 if combining_class(ordered[0], combining) == 0 else -1
     last_ccc = 0
@@ -246,10 +286,12 @@ def parse_sequence(text: str) -> tuple[int, ...]:
 def verify_conformance(
     data: bytes,
     combining: list[tuple[int, int, int]],
-    decompositions: list[tuple[int, tuple[int, ...]]],
+    canonical_decompositions: list[tuple[int, tuple[int, ...]]],
+    compatibility_decompositions: list[tuple[int, tuple[int, ...]]],
     compositions: list[tuple[int, int, int]],
 ) -> int:
-    decomposition_map = dict(decompositions)
+    canonical_map = dict(canonical_decompositions)
+    compatibility_map = dict(compatibility_decompositions)
     composition_map = {(first, second): result for first, second, result in compositions}
     checked = 0
     for line_number, raw_line in enumerate(data.decode("utf-8").splitlines(), 1):
@@ -258,17 +300,31 @@ def verify_conformance(
             continue
         columns = [parse_sequence(column) for column in body.split(";")[:5]]
         c1, c2, c3, c4, c5 = columns
-        expected = (c1 == c2, True, c3 == c2, True, c5 == c4)
-        for index, (sequence, wanted) in enumerate(zip(columns, expected), 1):
-            actual = normalize_nfc(
-                sequence, combining, decomposition_map, composition_map
-            ) == sequence
-            if actual != wanted:
-                raise SystemExit(
-                    f"NormalizationTest line {line_number} column {index}: "
-                    f"is_nfc={actual}, expected {wanted}"
+        expectations = {
+            "NFC": (c2, c2, c2, c4, c4),
+            "NFD": (c3, c3, c3, c5, c5),
+            "NFKC": (c4, c4, c4, c4, c4),
+            "NFKD": (c5, c5, c5, c5, c5),
+        }
+        for form, targets in expectations.items():
+            compatibility = form.startswith("NFK")
+            compose = form.endswith("C")
+            for index, (sequence, wanted) in enumerate(zip(columns, targets), 1):
+                actual = normalize(
+                    sequence,
+                    combining,
+                    canonical_map,
+                    compatibility_map,
+                    composition_map,
+                    compatibility,
+                    compose,
                 )
-            checked += 1
+                if actual != wanted:
+                    raise SystemExit(
+                        f"NormalizationTest line {line_number} column {index}: "
+                        f"{form} produced {actual!r}, expected {wanted!r}"
+                    )
+                checked += 1
     return checked
 
 
@@ -297,6 +353,67 @@ def encode_compositions(values: list[tuple[int, int, int]]) -> str:
 
 def chunks(values: list[tuple], size: int) -> list[list[tuple]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def decomposition_chunks(
+    values: list[tuple[int, tuple[int, ...]]],
+    max_entries: int = 700,
+    max_scalars: int = 1800,
+) -> list[list[tuple[int, tuple[int, ...]]]]:
+    result: list[list[tuple[int, tuple[int, ...]]]] = []
+    current: list[tuple[int, tuple[int, ...]]] = []
+    scalar_count = 0
+    for entry in values:
+        entry_scalars = len(entry[1])
+        if current and (
+            len(current) >= max_entries or scalar_count + entry_scalars > max_scalars
+        ):
+            result.append(current)
+            current = []
+            scalar_count = 0
+        current.append(entry)
+        scalar_count += entry_scalars
+    if current:
+        result.append(current)
+    return result
+
+
+def encode_variable_decomposition_index(
+    values: list[tuple[int, tuple[int, ...]]],
+) -> str:
+    offset = 0
+    encoded: list[str] = []
+    for scalar, parts in values:
+        if offset > 0xFFFF or len(parts) > 0xFF:
+            raise SystemExit("compatibility decomposition encoding overflow")
+        encoded.append(f"{scalar:06X}{offset:04X}{len(parts):02X}")
+        offset += len(parts)
+    return "".join(encoded)
+
+
+def encode_variable_decomposition_values(
+    values: list[tuple[int, tuple[int, ...]]],
+) -> str:
+    return "".join(f"{part:06X}" for _, parts in values for part in parts)
+
+
+def maximum_decomposition_expansion(
+    canonical_decompositions: list[tuple[int, tuple[int, ...]]],
+    compatibility_decompositions: list[tuple[int, tuple[int, ...]]],
+    compatibility: bool,
+) -> int:
+    canonical_map = dict(canonical_decompositions)
+    compatibility_map = dict(compatibility_decompositions)
+    candidates = set(canonical_map)
+    if compatibility:
+        candidates.update(compatibility_map)
+    maximum = 3  # Algorithmic Hangul decomposition.
+    for scalar in candidates:
+        maximum = max(
+            maximum,
+            len(decompose(scalar, canonical_map, compatibility_map, compatibility)),
+        )
+    return maximum
 
 
 def generate_decomposition_lookup(values: list[tuple[int, tuple[int, ...]]]) -> str:
@@ -366,6 +483,53 @@ def generate_composition_lookup(values: list[tuple[int, int, int]]) -> str:
         parts.append(
             "    unicode_canonical_composition_lookup(first, second, "
             f'__str_ptr("{encode_compositions(chunk)}"), {len(chunk)})'
+        )
+        parts.append("  }" if index == 0 else "  }")
+    parts.append("  else { 0 - 1 }" + " }" * (len(table_chunks) - 1))
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def generate_compatibility_decomposition_lookup(
+    values: list[tuple[int, tuple[int, ...]]],
+) -> str:
+    parts = [
+        "pub(package) fn unicode_compatibility_decomposition_lookup(scalar: i64, entries: i64, entry_count: i64, values: i64, out: i64, count: i64) -> i64 {",
+        "  let mut lo = 0",
+        "  let mut hi = entry_count",
+        "  let mut found = 0 - 1",
+        "  while lo < hi and found < 0 {",
+        "    let mid = lo + (hi - lo) / 2",
+        "    let key = unicode_normalization_hex(entries, mid * 12, 6)",
+        "    if scalar < key { hi = mid }",
+        "    else { if scalar > key { lo = mid + 1 } else { found = mid } }",
+        "  }",
+        "  if found < 0 { 0 - 1 }",
+        "  else {",
+        "    let entry_offset = found * 12",
+        "    let value_offset = unicode_normalization_hex(entries, entry_offset + 6, 4)",
+        "    let value_count = unicode_normalization_hex(entries, entry_offset + 10, 2)",
+        "    let mut next = count",
+        "    let mut i = 0",
+        "    while i < value_count {",
+        "      let part = unicode_normalization_hex(values, (value_offset + i) * 6, 6)",
+        "      next = unicode_compatibility_decompose_into(part, out, next)",
+        "      i = i + 1",
+        "    }",
+        "    next",
+        "  }",
+        "}",
+        "",
+        "pub(package) fn unicode_compatibility_decomposition(scalar: i64, out: i64, count: i64) -> i64 {",
+    ]
+    table_chunks = decomposition_chunks(values)
+    for index, chunk in enumerate(table_chunks):
+        prefix = "  if" if index == 0 else "  else { if"
+        parts.append(f"{prefix} scalar <= {chunk[-1][0]} {{")
+        parts.append(
+            "    unicode_compatibility_decomposition_lookup(scalar, "
+            f'__str_ptr("{encode_variable_decomposition_index(chunk)}"), {len(chunk)}, '
+            f'__str_ptr("{encode_variable_decomposition_values(chunk)}"), out, count)'
         )
         parts.append("  }" if index == 0 else "  }")
     parts.append("  else { 0 - 1 }" + " }" * (len(table_chunks) - 1))
@@ -575,6 +739,57 @@ pub(package) fn unicode_bytes_are_nfc(src: i64, start: i64, len: i64) -> i64 {{
 '''
 
 
+def generate_compatibility_source(
+    canonical_decompositions: list[tuple[int, tuple[int, ...]]],
+    compatibility_decompositions: list[tuple[int, tuple[int, ...]]],
+    conformance_cases: int,
+) -> str:
+    maximum_expansion = maximum_decomposition_expansion(
+        canonical_decompositions, compatibility_decompositions, True
+    )
+    return f'''-- stdlib/unicode_compatibility_data.weft -- GENERATED; DO NOT EDIT
+-- Unicode {UNICODE_VERSION} compatibility-decomposition substrate.
+-- UnicodeData SHA-256: {INPUTS['unicode_data'][1]}
+-- DerivedNormalizationProps SHA-256: {INPUTS['derived_normalization'][1]}
+-- NormalizationTest SHA-256: {INPUTS['normalization_test'][1]}
+-- Generator: tools/generate_unicode_normalization_data.py
+-- Generator conformance: {conformance_cases} NormalizationTest transformations.
+
+use compiler/unicode_normalization_data.{{unicode_canonical_decomposition, unicode_normalization_hex}}
+use runtime/memory.{{mem_store64_at}}
+
+pub(package) fn unicode_compatibility_max_expansion() -> i64 {{ {maximum_expansion} }}
+
+{generate_compatibility_decomposition_lookup(compatibility_decompositions)}
+
+pub(package) fn unicode_compatibility_decompose_into(scalar: i64, out: i64, count: i64) -> i64 {{
+  if scalar >= 44032 and scalar < 55204 {{
+    let s_index = scalar - 44032
+    mem_store64_at(out, count * 8, 4352 + s_index / 588)
+    mem_store64_at(out, count * 8 + 8, 4449 + (s_index % 588) / 28)
+    let trailing = s_index % 28
+    if trailing == 0 {{ count + 2 }}
+    else {{ mem_store64_at(out, count * 8 + 16, 4519 + trailing) count + 3 }}
+  }} else {{
+    let compatibility_count = unicode_compatibility_decomposition(scalar, out, count)
+    if compatibility_count >= 0 {{ compatibility_count }}
+    else {{
+      let packed = unicode_canonical_decomposition(scalar)
+      if packed == 0 {{ mem_store64_at(out, count * 8, scalar) count + 1 }}
+      else {{
+        let parts = packed / 4398046511104
+        let remainder = packed - parts * 4398046511104
+        let first = remainder / 2097152
+        let second = remainder - first * 2097152
+        let after_first = unicode_compatibility_decompose_into(first, out, count)
+        if parts == 1 {{ after_first }} else {{ unicode_compatibility_decompose_into(second, out, after_first) }}
+      }}
+    }}
+  }}
+}}
+'''
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--unicode-data", type=pathlib.Path)
@@ -585,36 +800,69 @@ def main() -> int:
         type=pathlib.Path,
         default=pathlib.Path("compiler/unicode_normalization_data.weft"),
     )
+    parser.add_argument(
+        "--compatibility-output",
+        type=pathlib.Path,
+        default=pathlib.Path("stdlib/unicode_compatibility_data.weft"),
+    )
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
 
     unicode_data = load(args.unicode_data, "unicode_data")
     derived = load(args.derived_normalization, "derived_normalization")
     normalization_test = load(args.normalization_test, "normalization_test")
-    no, maybe, exclusions = parse_derived(derived)
-    combining, decompositions, compositions = parse_unicode_data(unicode_data, exclusions)
-    conformance_cases = verify_conformance(
-        normalization_test, combining, decompositions, compositions
+    quick_checks, exclusions = parse_derived(derived)
+    combining, canonical_decompositions, compatibility_decompositions, compositions = (
+        parse_unicode_data(unicode_data, exclusions)
     )
+    conformance_cases = verify_conformance(
+        normalization_test,
+        combining,
+        canonical_decompositions,
+        compatibility_decompositions,
+        compositions,
+    )
+    no, maybe = quick_checks["NFC"]
     generated = generate_source(
-        no, maybe, combining, decompositions, compositions, conformance_cases
+        no,
+        maybe,
+        combining,
+        canonical_decompositions,
+        compositions,
+        conformance_cases // 4,
+    ).encode("utf-8")
+    compatibility_generated = generate_compatibility_source(
+        canonical_decompositions,
+        compatibility_decompositions,
+        conformance_cases,
     ).encode("utf-8")
 
     if args.check:
+        stale = []
         if not args.output.exists() or args.output.read_bytes() != generated:
-            print(f"out of date: {args.output}", file=sys.stderr)
+            stale.append(args.output)
+        if (
+            not args.compatibility_output.exists()
+            or args.compatibility_output.read_bytes() != compatibility_generated
+        ):
+            stale.append(args.compatibility_output)
+        if stale:
+            for path in stale:
+                print(f"out of date: {path}", file=sys.stderr)
             return 1
         print(
-            f"ok: {args.output} (Unicode {UNICODE_VERSION}; "
-            f"{conformance_cases} conformance checks)"
+            f"ok: {args.output}, {args.compatibility_output} "
+            f"(Unicode {UNICODE_VERSION}; {conformance_cases} transformations)"
         )
         return 0
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(generated)
+    args.compatibility_output.parent.mkdir(parents=True, exist_ok=True)
+    args.compatibility_output.write_bytes(compatibility_generated)
     print(
-        f"wrote {args.output} (Unicode {UNICODE_VERSION}; "
-        f"{conformance_cases} conformance checks)"
+        f"wrote {args.output}, {args.compatibility_output} "
+        f"(Unicode {UNICODE_VERSION}; {conformance_cases} transformations)"
     )
     return 0
 
