@@ -193,6 +193,16 @@ lsp_frame() {
   printf 'Content-Length: %s\r\n\r\n%s' "$len" "$body"
 }
 
+json_escape_bytes() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "$value"
+}
+
 assert_test_exit_code() {
   local name="$1"
   local source="$2"
@@ -690,10 +700,28 @@ assert_contains "check_reports_diagnostics" "$diag_out" "type error: unknown ide
 assert_equals "diagnostic_snapshot_exact" "$diag_out" $'line 1, col 20: type error: unknown identifier\ncheck: 1 functions, 1 errors'
 
 mcp_out=$(printf '%s' '{ "jsonrpc" : "2.0", "id" : 1, "method" : "tools/list" }' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"},{"name":"fact_at_position","stability":"stable"},{"name":"visible_bindings","stability":"stable"},{"name":"conformance_at_position","stability":"stable"}]}}'
+assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"},{"name":"fact_at_position","stability":"stable"},{"name":"visible_bindings","stability":"stable"},{"name":"conformance_at_position","stability":"stable"},{"name":"format_source","stability":"stable"}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/list","meta":[true,null,1,-2.5,3e4,{"x":"y"}]}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_nested_extra_json_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"},{"name":"fact_at_position","stability":"stable"},{"name":"visible_bindings","stability":"stable"},{"name":"conformance_at_position","stability":"stable"}]}}'
+assert_equals "mcp_nested_extra_json_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"},{"name":"fact_at_position","stability":"stable"},{"name":"visible_bindings","stability":"stable"},{"name":"conformance_at_position","stability":"stable"},{"name":"format_source","stability":"stable"}]}}'
+
+# Formatter transports are framing-only adapters over the CLI engine. Derive
+# the expected bytes from `weft fmt` so Unicode and JSON escape handling cannot
+# silently drift between CLI, MCP, and LSP.
+format_transport_source=$'-- Ω\n''fn   value ( ) -> str { "a\n\"b" }'
+format_cli=$(printf '%s' "$format_transport_source" | "$WEFT" fmt 2>"$tmp_err")
+assert_equals "format_transport_cli_stderr_empty" "$(<"$tmp_err")" ""
+format_transport_source_json=$(json_escape_bytes "$format_transport_source")
+format_cli_json=$(json_escape_bytes "$format_cli")
+
+mcp_out=$(printf '%s' "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"format_source\",\"arguments\":{\"source\":\"$format_transport_source_json\"}}}" | "$WEFT" mcp 2>&1)
+assert_equals "mcp_format_source_matches_cli_bytes" "$mcp_out" "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tool\":\"format_source\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"formatted\":\"$format_cli_json\",\"diagnostics\":0,\"items\":[]}}"
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"format_source","arguments":{"source":"fn broken -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_format_source_parse_failure_is_structured" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"format_source","ok":false,"schema_version":1,"stability":"stable","error_count":1,"diagnostics":1,"items":[{"severity":"error","message":"error: expected '\''('\'' after function name","span":3,"line":1,"col":4}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"format_source","arguments":{}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_format_source_requires_source" "$mcp_out" '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"missing source"}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"parse_summary","arguments":{"source" : "fn main() -> i64 { 42 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_parse_summary_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"parse_summary","ok":true,"schema_version":1,"stability":"internal","functions":1,"first_body_tag":1}}'
@@ -1323,6 +1351,7 @@ assert_contains "mcp_serve_tools_list_marks_stable_diagnostics" "$mcp_serve_out"
 assert_contains "mcp_serve_tools_list_marks_stable_lookup" "$mcp_serve_out" '"name":"type_lookup","x-weft-stability":"stable"'
 assert_contains "mcp_serve_type_lookup_describes_return_provenance" "$mcp_serve_out" 'including optimizer-produced return provenance'
 assert_contains "mcp_serve_tools_list_marks_stable_position_facts" "$mcp_serve_out" '"name":"fact_at_position","x-weft-stability":"stable"'
+assert_contains "mcp_serve_tools_list_marks_stable_formatter" "$mcp_serve_out" '"name":"format_source","x-weft-stability":"stable"'
 assert_contains "mcp_serve_tools_list_marks_internal_ir" "$mcp_serve_out" '"name":"ir_summary","x-weft-stability":"internal"'
 assert_contains "mcp_serve_call_wraps_content_and_echoes_id" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"call-2","result":{"content":[{"type":"text","text":"{\"tool\":\"parse_summary\",\"ok\":true'
 assert_contains "mcp_serve_ping" "$mcp_serve_out" '{"jsonrpc":"2.0","id":3,"result":{}}'
@@ -1337,6 +1366,24 @@ assert_contains "lsp_initialize_advertises_open_close" "$lsp_out" '"textDocument
 assert_contains "lsp_initialize_definition_capability" "$lsp_out" '"definitionProvider":true'
 assert_contains "lsp_initialize_completion_hook" "$lsp_out" '"completionProvider"'
 assert_contains "lsp_initialize_code_action_hook" "$lsp_out" '"codeActionProvider":true'
+assert_contains "lsp_initialize_formatting_hook" "$lsp_out" '"documentFormattingProvider":true'
+
+lsp_format_open="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///format.weft\",\"version\":1,\"text\":\"$format_transport_source_json\"}}}"
+lsp_format_request='{"jsonrpc":"2.0","id":9,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///format.weft"},"options":{"tabSize":2,"insertSpaces":true}}}'
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_format_open")" "$(lsp_frame "$lsp_format_request")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_formatting_matches_cli_bytes" "$lsp_out" "\"newText\":\"$format_cli_json\""
+assert_contains "lsp_formatting_replaces_whole_document" "$lsp_out" '"range":{"start":{"line":0,"character":0},"end":{"line":1'
+
+lsp_bad_format_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///bad-format.weft","version":1,"text":"fn broken -> i64 { 0 }"}}}'
+lsp_bad_format_request='{"jsonrpc":"2.0","id":10,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///bad-format.weft"},"options":{"tabSize":2,"insertSpaces":true}}}'
+lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_bad_format_open")" "$(lsp_frame "$lsp_bad_format_request")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_formatting_failure_uses_request_failed" "$lsp_out" '"id":10,"error":{"code":-32803,"message":"formatting failed"'
+assert_contains "lsp_formatting_failure_returns_structured_diagnostics" "$lsp_out" '"data":{"error_count":1,"diagnostics":[{"range":{"start":{"line":0,"character":3}'
+assert_contains "lsp_formatting_failure_preserves_message" "$lsp_out" "error: expected '(' after function name"
+
+lsp_missing_format='{"jsonrpc":"2.0","id":11,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///missing-format.weft"},"options":{"tabSize":2,"insertSpaces":true}}}'
+lsp_out=$(lsp_frame "$lsp_missing_format" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_formatting_unknown_document_is_empty" "$lsp_out" '"id":11,"result":[]'
 
 lsp_open_clean='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///clean.weft","version":1,"text":"fn main() -> i64 { 0 }"}}}'
 lsp_out=$(lsp_frame "$lsp_open_clean" | "$WEFT" lsp 2>&1)
@@ -2442,4 +2489,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 569 passed, 0 failed"
+echo "Tool boundary summary: 581 passed, 0 failed"
