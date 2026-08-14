@@ -313,13 +313,13 @@ assert_equals "fmt_canonical_native_equivalent" "$fmt_original_status:$fmt_forma
 
 printf 'fn id < T > (x: T) -> T { x }\nfn main() -> i64 { if 1   <   2 { id < i64 > (42) } else { 0 } }\n' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
-assert_equals "fmt_distinguishes_generic_angles_and_comparisons" "$(<"$tmp_out")" $'fn id<T>(x: T) -> T { x }\nfn main() -> i64 { if 1 < 2 { id<i64>(42) } else { 0 } }'
+assert_equals "fmt_distinguishes_generic_angles_and_comparisons" "$(<"$tmp_out")" $'fn id<T>(x: T) -> T { x }\n\nfn main() -> i64 { if 1 < 2 { id<i64>(42) } else { 0 } }'
 "$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
 assert_files_equal "fmt_angle_roles_are_idempotent" "$tmp_bin" "$tmp_out"
 
 printf 'use compiler / formatter.{ * }\nfn f() -[ Diagnose ]> i64 { resume (0) }\nfn main() -> i64 { for i in 0 .. 2 { 0 } 0 }\n' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
-assert_equals "fmt_canonical_context_punctuation" "$(<"$tmp_out")" $'use compiler/formatter.{*}\nfn f() -[Diagnose]> i64 { resume(0) }\nfn main() -> i64 { for i in 0..2 { 0 } 0 }'
+assert_equals "fmt_canonical_context_punctuation" "$(<"$tmp_out")" $'use compiler/formatter.{*}\n\nfn f() -[Diagnose]> i64 { resume(0) }\n\nfn main() -> i64 { for i in 0..2 { 0 } 0 }'
 "$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
 assert_files_equal "fmt_context_punctuation_is_idempotent" "$tmp_bin" "$tmp_out"
 
@@ -354,6 +354,16 @@ printf 'fn main() -> i64 {\r\n  let x = 41\r\n  x + 1\r\n}\r\n' > "$tmp_bin"
 assert_files_equal "fmt_preserves_crlf_while_indenting" "$tmp_out" "$tmp_bin"
 "$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
 assert_files_equal "fmt_crlf_indentation_is_idempotent" "$tmp_bin" "$tmp_out"
+
+printf '%s\n' 'use compiler/formatter.{*}' '' '' 'use compiler/lex.{*}' 'fn first() -> i64 { 1 }' '' '' 'fn second() -> i64 { 2 }' > "$tmp_src"
+"$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+assert_equals "fmt_groups_top_level_imports_and_declarations" "$(<"$tmp_out")" $'use compiler/formatter.{*}\nuse compiler/lex.{*}\n\nfn first() -> i64 { 1 }\n\nfn second() -> i64 { 2 }'
+"$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
+assert_files_equal "fmt_top_level_grouping_is_idempotent" "$tmp_bin" "$tmp_out"
+
+printf '%s\n' 'fn first() -> i64 { 1 } fn second() -> i64 { 2 }' > "$tmp_src"
+"$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+assert_equals "fmt_does_not_invent_synthetic_separators" "$(<"$tmp_out")" 'fn first() -> i64 { 1 } fn second() -> i64 { 2 }'
 
 "$WEFT" fmt compiler/main.weft > "$tmp_out" 2>"$tmp_err"
 echo "  ok fmt_canonical_compiler_surface"
@@ -2205,4 +2215,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 497 passed, 0 failed"
+echo "Tool boundary summary: 500 passed, 0 failed"
