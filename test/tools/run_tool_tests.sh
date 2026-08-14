@@ -721,6 +721,10 @@ printf '%s\n' 'fn paypal() -> i64 { 20 } fn pаypаl() -> i64 { 22 } fn main() -
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_equals "diagnostic_unicode_security_warnings_do_not_fail_check" "$diag_out" $'line 1, col 30: warning[W0001]: identifier contains mixed scripts\nline 1, col 30: warning[W0002]: identifier is confusable with another spelling in this source\ncheck: 3 functions, 0 errors'
 
+printf '%s' $'-- abc\u202Edef\nfn main() -> i64 { 42 }\n' > "$tmp_src"
+diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
+assert_equals "diagnostic_bidi_comment_warning_does_not_fail_check" "$diag_out" $'line 1, col 7: warning[W0003]: source text contains an invisible bidi formatting control\ncheck: 1 functions, 0 errors'
+
 mcp_out=$(printf '%s' '{ "jsonrpc" : "2.0", "id" : 1, "method" : "tools/list" }' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"},{"name":"fact_at_position","stability":"stable"},{"name":"visible_bindings","stability":"stable"},{"name":"conformance_at_position","stability":"stable"},{"name":"format_source","stability":"stable"}]}}'
 
@@ -1059,6 +1063,13 @@ assert_contains "mcp_unicode_security_warning_severity" "$mcp_out" '"severity":"
 assert_contains "mcp_unicode_security_warning_mixed_script_code" "$mcp_out" '"code":"W0001"'
 assert_contains "mcp_unicode_security_warning_confusable_code" "$mcp_out" '"code":"W0002"'
 assert_contains "mcp_unicode_security_warnings_keep_zero_errors" "$mcp_out" '"check_errors":0'
+
+bidi_source=$'fn main() -> str { "abc\u202Edef" }'
+bidi_source_json=$(json_escape_bytes "$bidi_source")
+mcp_out=$(printf '%s' "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"diagnostics\",\"arguments\":{\"source\":\"$bidi_source_json\"}}}" | "$WEFT" mcp 2>&1)
+assert_contains "mcp_bidi_source_warning_code" "$mcp_out" '"code":"W0003"'
+assert_contains "mcp_bidi_source_warning_range" "$mcp_out" '"span":23,"line":1,"col":24,"scalar_col":24,"utf16_col":24,"end_span":26'
+assert_contains "mcp_bidi_source_warning_keeps_zero_errors" "$mcp_out" '"check_errors":0'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn call() -> i64 { missing_fn() }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_unknown_function_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: unknown function","span":19,"line":1,"col":20,"scalar_col":20,"utf16_col":20}]}}'
@@ -1484,6 +1495,12 @@ lsp_out=$(lsp_frame "$lsp_unicode_security_open" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_unicode_security_warning_severity" "$lsp_out" '"severity":2'
 assert_contains "lsp_unicode_security_warning_mixed_script_code" "$lsp_out" '"code":"W0001"'
 assert_contains "lsp_unicode_security_warning_confusable_code" "$lsp_out" '"code":"W0002"'
+
+lsp_bidi_source_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///bidi-source.weft","version":1,"text":"fn main() -> str { \"abc\u202Edef\" }"}}}'
+lsp_out=$(lsp_frame "$lsp_bidi_source_open" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_bidi_source_warning_severity" "$lsp_out" '"severity":2'
+assert_contains "lsp_bidi_source_warning_code" "$lsp_out" '"code":"W0003"'
+assert_contains "lsp_bidi_source_warning_exact_range" "$lsp_out" '"range":{"start":{"line":0,"character":23},"end":{"line":0,"character":24}'
 
 lsp_unicode_position_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///unicode-position.weft","version":1,"text":"fn add() -> i64 { 1 } fn main() -> i64 { let s = \"😀\" add() }"}}}'
 lsp_unicode_position_hover16='{"jsonrpc":"2.0","id":14,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///unicode-position.weft"},"position":{"line":0,"character":54}}}'
