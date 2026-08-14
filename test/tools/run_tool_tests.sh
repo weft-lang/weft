@@ -297,7 +297,7 @@ assert_equals "fmt_path_stderr_empty" "$(<"$tmp_err")" ""
 
 printf '%s\n' '-- leading  text' 'fn   main ( )  ->  i64   {  42  } -- trailing  text' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
-assert_equals "fmt_canonical_horizontal_gaps_and_comments" "$(<"$tmp_out")" $'-- leading  text\nfn main() -> i64 { 42 } -- trailing  text'
+assert_equals "fmt_canonical_horizontal_gaps_and_comments" "$(<"$tmp_out")" $'-- leading  text\n\nfn main() -> i64 { 42 } -- trailing  text'
 "$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
 assert_files_equal "fmt_canonical_horizontal_idempotent" "$tmp_bin" "$tmp_out"
 "$WEFT" compile < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
@@ -337,7 +337,7 @@ assert_files_equal "fmt_preserves_inserted_semicolon_newlines" "$tmp_out" "$tmp_
 
 printf '%s\n' '-- leading  text — exact' 'fn main() -> i64 {' ' let x = 40 -- inline  text' ' if true {' '    -- nested  text' ' x   +   2' ' } else {' '0' '}' '}' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
-assert_equals "fmt_canonical_block_indentation_and_comments" "$(<"$tmp_out")" $'-- leading  text — exact\nfn main() -> i64 {\n  let x = 40 -- inline  text\n  if true {\n    -- nested  text\n    x + 2\n  } else {\n    0\n  }\n}'
+assert_equals "fmt_canonical_block_indentation_and_comments" "$(<"$tmp_out")" $'-- leading  text — exact\n\nfn main() -> i64 {\n  let x = 40 -- inline  text\n  if true {\n    -- nested  text\n    x + 2\n  } else {\n    0\n  }\n}'
 assert_equals "fmt_indentation_stderr_empty" "$(<"$tmp_err")" ""
 "$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
 assert_files_equal "fmt_block_indentation_is_idempotent" "$tmp_bin" "$tmp_out"
@@ -364,6 +364,12 @@ assert_files_equal "fmt_top_level_grouping_is_idempotent" "$tmp_bin" "$tmp_out"
 printf '%s\n' 'fn first() -> i64 { 1 } fn second() -> i64 { 2 }' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
 assert_equals "fmt_does_not_invent_synthetic_separators" "$(<"$tmp_out")" 'fn first() -> i64 { 1 } fn second() -> i64 { 2 }'
+
+printf '%s\n' '-- module  header' '' '' 'use compiler/formatter.{*}' '' '' '-- import  note' '' 'use compiler/lex.{*}' '' 'fn first() -> i64 { 1 } -- trailing  exact' '' '' '--- next  docs' '' '' 'fn second() -> i64 { 2 }' > "$tmp_src"
+"$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+assert_equals "fmt_attaches_top_level_comments_canonically" "$(<"$tmp_out")" $'-- module  header\n\nuse compiler/formatter.{*}\n-- import  note\nuse compiler/lex.{*}\n\nfn first() -> i64 { 1 } -- trailing  exact\n\n--- next  docs\nfn second() -> i64 { 2 }'
+"$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
+assert_files_equal "fmt_top_level_comment_attachment_is_idempotent" "$tmp_bin" "$tmp_out"
 
 "$WEFT" fmt compiler/main.weft > "$tmp_out" 2>"$tmp_err"
 echo "  ok fmt_canonical_compiler_surface"
@@ -2215,4 +2221,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 500 passed, 0 failed"
+echo "Tool boundary summary: 502 passed, 0 failed"
