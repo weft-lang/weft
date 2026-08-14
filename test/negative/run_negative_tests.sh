@@ -318,6 +318,7 @@ check_rejects "module_plain_import_does_not_leak_value" "test/negative/module_pl
 check_rejects "prelude_excludes_option_helpers" "test/negative/prelude_excludes_option_helpers.weft" "type error: unknown function"
 check_rejects "prelude_methods_require_explicit_import" "test/negative/prelude_methods_require_explicit_import.weft" "type error: unknown method"
 check_rejects "quoted_import_removed" "test/negative/quoted_import_removed.weft" "error: expected path-form module after 'use'"
+check_rejects "extern_keyword_removed" "test/negative/extern_keyword_removed.weft" "error: unexpected token at module level"
 check_rejects "module_qualified_function_unknown" "test/negative/module_qualified_function_unknown.weft" "error\[E4002\]: unknown module member 'left.missing'"
 check_rejects "module_qualified_function_private" "test/negative/module_qualified_function_private.weft" "error\[E4004\]: module member 'left.hidden' is not visible"
 check_rejects "module_qualified_function_arity" "test/negative/module_qualified_function_arity.weft" "type error: arity mismatch"
