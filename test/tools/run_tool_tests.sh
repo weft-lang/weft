@@ -798,6 +798,9 @@ assert_contains "mcp_type_lookup_unknown_borrow_snapshot" "$mcp_out" '"ownership
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"type_lookup","arguments":{"source":"type Pair { left: i64, right: str }\nfn main() -> i64 { 0 }","name":"Pair"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_type_lookup_record_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"schema_version":1,"stability":"stable","name":"Pair","found":true,"fact":{"kind":"type_declaration","name":"Pair","declaration_kind":"record","type_parameters":[],"items":2}}}'
 
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"type_lookup","arguments":{"source":"type Secret<T> = opaque T\nfn main() -> i64 { 0 }","name":"Secret"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_type_lookup_opaque_hides_representation" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"schema_version":1,"stability":"stable","name":"Secret","found":true,"fact":{"kind":"type_declaration","name":"Secret","declaration_kind":"opaque","type_parameters":[{"name":"T","bounds":{"kind":"traits","traits":[]}}],"items":0}}}'
+
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"type_lookup","arguments":{"source":"fn main() -> i64 { 0 }","name":"missing"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_type_lookup_missing_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"schema_version":1,"stability":"stable","name":"missing","found":false}}'
 
