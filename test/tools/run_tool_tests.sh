@@ -717,6 +717,10 @@ printf '\303(' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
 assert_equals "diagnostic_rejects_malformed_utf8_before_tokenization" "$diag_out" $'line 1, col 1: error: source is not valid UTF-8\ncheck: 0 functions, 1 errors'
 
+printf '%s\n' 'fn paypal() -> i64 { 20 } fn pаypаl() -> i64 { 22 } fn main() -> i64 { paypal() + pаypаl() }' > "$tmp_src"
+diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
+assert_equals "diagnostic_unicode_security_warnings_do_not_fail_check" "$diag_out" $'line 1, col 30: warning[W0001]: identifier contains mixed scripts\nline 1, col 30: warning[W0002]: identifier is confusable with another spelling in this source\ncheck: 3 functions, 0 errors'
+
 mcp_out=$(printf '%s' '{ "jsonrpc" : "2.0", "id" : 1, "method" : "tools/list" }' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"},{"name":"fact_at_position","stability":"stable"},{"name":"visible_bindings","stability":"stable"},{"name":"conformance_at_position","stability":"stable"},{"name":"format_source","stability":"stable"}]}}'
 
@@ -1049,6 +1053,12 @@ assert_equals "mcp_diagnostics_preserves_non_nfc_identifier_range" "$mcp_out" '{
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn πρόσθεση(α: i64, β: i64) -> i64 { α + β } fn main() -> i64 { πρόσθεση(40, 2) }"}}}' | "$WEFT" mcp 2>&1)
 assert_contains "mcp_diagnostics_accepts_unicode_identifier_identity" "$mcp_out" '"diagnostics":0,"functions":2,"check_errors":0'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn paypal() -> i64 { 20 } fn pаypаl() -> i64 { 22 }"}}}' | "$WEFT" mcp 2>&1)
+assert_contains "mcp_unicode_security_warning_severity" "$mcp_out" '"severity":"warn"'
+assert_contains "mcp_unicode_security_warning_mixed_script_code" "$mcp_out" '"code":"W0001"'
+assert_contains "mcp_unicode_security_warning_confusable_code" "$mcp_out" '"code":"W0002"'
+assert_contains "mcp_unicode_security_warnings_keep_zero_errors" "$mcp_out" '"check_errors":0'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn call() -> i64 { missing_fn() }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_unknown_function_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: unknown function","span":19,"line":1,"col":20,"scalar_col":20,"utf16_col":20}]}}'
@@ -1468,6 +1478,12 @@ assert_contains "lsp_non_nfc_identifier_range_is_complete" "$lsp_out" '"range":{
 lsp_unicode_identifier_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///unicode-identifiers.weft","version":1,"text":"fn πρόσθεση(α: i64, β: i64) -> i64 { α + β } fn main() -> i64 { πρόσθεση(40, 2) }"}}}'
 lsp_out=$(lsp_frame "$lsp_unicode_identifier_open" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_accepts_unicode_identifier_identity" "$lsp_out" '"diagnostics":[]'
+
+lsp_unicode_security_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///unicode-security.weft","version":1,"text":"fn paypal() -> i64 { 20 } fn pаypаl() -> i64 { 22 }"}}}'
+lsp_out=$(lsp_frame "$lsp_unicode_security_open" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_unicode_security_warning_severity" "$lsp_out" '"severity":2'
+assert_contains "lsp_unicode_security_warning_mixed_script_code" "$lsp_out" '"code":"W0001"'
+assert_contains "lsp_unicode_security_warning_confusable_code" "$lsp_out" '"code":"W0002"'
 
 lsp_unicode_position_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///unicode-position.weft","version":1,"text":"fn add() -> i64 { 1 } fn main() -> i64 { let s = \"😀\" add() }"}}}'
 lsp_unicode_position_hover16='{"jsonrpc":"2.0","id":14,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///unicode-position.weft"},"position":{"line":0,"character":54}}}'
