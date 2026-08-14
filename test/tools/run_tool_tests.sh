@@ -363,7 +363,7 @@ assert_files_equal "fmt_top_level_grouping_is_idempotent" "$tmp_bin" "$tmp_out"
 
 printf '%s\n' 'fn first() -> i64 { 1 } fn second() -> i64 { 2 }' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
-assert_equals "fmt_does_not_invent_synthetic_separators" "$(<"$tmp_out")" 'fn first() -> i64 { 1 } fn second() -> i64 { 2 }'
+assert_equals "fmt_separates_same_line_top_level_declarations" "$(<"$tmp_out")" $'fn first() -> i64 { 1 }\n\nfn second() -> i64 { 2 }'
 
 printf '%s\n' '-- module  header' '' '' 'use compiler/formatter.{*}' '' '' '-- import  note' '' 'use compiler/lex.{*}' '' 'fn first() -> i64 { 1 } -- trailing  exact' '' '' '--- next  docs' '' '' 'fn second() -> i64 { 2 }' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
