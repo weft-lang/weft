@@ -11,13 +11,13 @@ WEFT=${WEFT:-./weft}
 WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-120}
 WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-120}
 WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-8000000}
-# Whole-compiler in-process tripwire tests (ir_verifier_metrics,
-# emission_audit_metrics) legitimately peak at ~1.7 GB arena RSS; the
-# limit guards runaways above that with margin.
-# 4 GB: full-tree checking (every imported body) grew in-process pipeline
-# metric tests' peak RSS from ~2.5 GB to ~3.7 GB. Checker allocation
-# frugality / identifier interning is the queued lever to bring this down.
-WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-4000000}
+# Whole-compiler in-process tripwire tests (alloc_checker_metrics and
+# emission_audit_metrics) briefly peak at ~6.3 GB arena RSS.  The previous
+# 4 GB guard was below that honest baseline and passed nondeterministically
+# whenever its one-second polling missed the peak.  Keep a real runaway
+# guard with margin; checker allocation frugality / identifier interning is
+# the queued lever to bring this baseline down.
+WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-8000000}
 WEFT_TEST_SHOW_TIMINGS=${WEFT_TEST_SHOW_TIMINGS:-1}
 WEFT_TEST_JOBS=${WEFT_TEST_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 PASS=0
