@@ -705,6 +705,50 @@ diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
 assert_contains "check_reports_diagnostics" "$diag_out" "error[E1001]: unknown identifier 'missing'"
 assert_equals "diagnostic_snapshot_exact" "$diag_out" $'line 1, col 20: error[E1001]: unknown identifier \x27missing\x27\n  |\n1 | fn main() -> i64 { missing }\n  |                    ^~~~~~~ unknown identifier \x27missing\x27\ncheck: 1 functions, 1 errors'
 
+ansi_escape=$'\033'
+color_out=$("$WEFT" --color=always check < "$tmp_src" 2>&1 || true)
+assert_contains "diagnostic_color_always_styles_error_heading" "$color_out" "${ansi_escape}[1;31merror[E1001]${ansi_escape}[0m"
+assert_contains "diagnostic_color_always_styles_primary_caret" "$color_out" "${ansi_escape}[1;31m^~~~~~~${ansi_escape}[0m unknown identifier"
+
+plain_out=$("$WEFT" --color=never check < "$tmp_src" 2>&1 || true)
+assert_equals "diagnostic_color_never_is_byte_stable" "$plain_out" "$diag_out"
+plain_out=$("$WEFT" --no-color check < "$tmp_src" 2>&1 || true)
+assert_equals "diagnostic_no_color_alias_is_byte_stable" "$plain_out" "$diag_out"
+color_out=$("$WEFT" --color always check < "$tmp_src" 2>&1 || true)
+assert_contains "diagnostic_color_accepts_separate_value" "$color_out" "${ansi_escape}[1;31merror[E1001]${ansi_escape}[0m"
+
+tty_out=$(env -u NO_COLOR TERM=xterm script -q /dev/null "$WEFT" check "$tmp_src" 2>&1 || true)
+assert_contains "diagnostic_color_auto_detects_tty" "$tty_out" "${ansi_escape}[1;31merror[E1001]${ansi_escape}[0m"
+tty_out=$(NO_COLOR=1 TERM=xterm script -q /dev/null "$WEFT" check "$tmp_src" 2>&1 || true)
+assert_not_contains "diagnostic_no_color_environment_disables_tty_ansi" "$tty_out" "$ansi_escape"
+tty_out=$(TERM=dumb env -u NO_COLOR script -q /dev/null "$WEFT" check "$tmp_src" 2>&1 || true)
+assert_not_contains "diagnostic_dumb_terminal_disables_tty_ansi" "$tty_out" "$ansi_escape"
+tty_out=$(NO_COLOR=1 TERM=dumb script -q /dev/null "$WEFT" --color=always check "$tmp_src" 2>&1 || true)
+assert_contains "diagnostic_explicit_color_overrides_environment" "$tty_out" "${ansi_escape}[1;31merror[E1001]${ansi_escape}[0m"
+
+set +e
+"$WEFT" --color=rainbow check "$tmp_src" >"$tmp_out" 2>"$tmp_err"
+color_invalid_exit=$?
+set -e
+assert_equals "diagnostic_invalid_color_value_exits_usage" "$color_invalid_exit" "2"
+assert_contains "diagnostic_invalid_color_value_is_actionable" "$(<"$tmp_err")" "expected auto, always, or never"
+set +e
+"$WEFT" --color >"$tmp_out" 2>"$tmp_err"
+color_missing_exit=$?
+set -e
+assert_equals "diagnostic_missing_color_value_exits_usage" "$color_missing_exit" "2"
+assert_contains "diagnostic_missing_color_value_is_actionable" "$(<"$tmp_err")" "--color requires auto, always, or never"
+
+run_weft_compile_guarded "$WEFT" compile test/fixtures/diagnostic_style_probe.weft > "$tmp_bin" 2>"$tmp_err"
+chmod +x "$tmp_bin"
+color_out=$(run_binary_guarded "$tmp_bin" 2>&1)
+assert_contains "diagnostic_warning_heading_is_yellow" "$color_out" "${ansi_escape}[1;33mwarning${ansi_escape}[0m: warning role"
+assert_contains "diagnostic_warning_caret_is_yellow" "$color_out" "${ansi_escape}[1;33m^~~~~${ansi_escape}[0m warning role"
+assert_contains "diagnostic_related_heading_is_blue" "$color_out" "${ansi_escape}[1;34mnote${ansi_escape}[0m: related role"
+assert_contains "diagnostic_related_caret_is_blue" "$color_out" "${ansi_escape}[1;34m^~~~${ansi_escape}[0m related role"
+assert_contains "diagnostic_note_heading_is_cyan" "$color_out" "${ansi_escape}[1;36mnote${ansi_escape}[0m: note role"
+assert_contains "diagnostic_note_caret_is_cyan" "$color_out" "${ansi_escape}[1;36m^~~~~${ansi_escape}[0m note role"
+
 printf 'fn main() -> i64 { let s = "😀" missing }\n' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
 assert_equals "diagnostic_unicode_columns_count_scalars" "$diag_out" $'line 1, col 32: error[E1001]: unknown identifier \x27missing\x27\n  |\n1 | fn main() -> i64 { let s = "😀" missing }\n  |                                ^~~~~~~ unknown identifier \x27missing\x27\ncheck: 1 functions, 1 errors'
@@ -723,11 +767,11 @@ assert_equals "diagnostic_exhaustiveness_teaches_counterexample_golden" "$diag_o
 
 printf '%s\n' 'effect Box<T> { fn get() -> T } fn need() -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_effect_discharge_teaches_parameter_identity_golden" "$diag_out" $'line 1, col 99: error[E2001]: effect `Box<str>` is not available in this context\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                             ^~~~ effect `Box<str>` is not available in this context\nline 1, col 108: note: nearest handler handles a different instantiation of this effect\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                                      ^~~ nearest handler handles a different instantiation of this effect\nline 1, col 36: note: callee declares this effect\n  |\n1 | ...T> { fn get() -> T } fn need() -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<...\n  |                            ^~~~ callee declares this effect\nhelp: `Box<i64>` is available, but it does not discharge `Box<str>`; effect type arguments are part of capability identity.\ncheck: 446 functions, 1 errors'
+assert_equals "diagnostic_effect_discharge_teaches_parameter_identity_golden" "$diag_out" $'line 1, col 99: error[E2001]: effect `Box<str>` is not available in this context\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                             ^~~~ effect `Box<str>` is not available in this context\nline 1, col 108: note: nearest handler handles a different instantiation of this effect\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                                      ^~~ nearest handler handles a different instantiation of this effect\nline 1, col 36: note: callee declares this effect\n  |\n1 | ...T> { fn get() -> T } fn need() -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<...\n  |                            ^~~~ callee declares this effect\nhelp: `Box<i64>` is available, but it does not discharge `Box<str>`; effect type arguments are part of capability identity.\ncheck: 448 functions, 1 errors'
 
 printf '%s\n' 'type Box<T> { Box(T) } trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> Identity for Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(Box<bool>(true)) }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_trait_conformance_replays_conditional_proof_golden" "$diag_out" $'line 1, col 200: error[E1004]: type `Box<bool>` does not implement `Identity`\n  |\n1 | ...ed<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(Box<bool>(true)) }\n  |                                                                           ^~~~~~~~~ type `Box<bool>` does not implement `Identity`\nline 1, col 113: note: matching impl candidate rejected by its own bound\n  |\n1 | ...T: Marked> Identity for Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bo...\n  |                            ^~~ matching impl candidate rejected by its own bound\nline 1, col 135: note: required by this trait bound\n  |\n1 | ...r Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(...\n  |                            ^~~~~~~~ required by this trait bound\nline 1, col 47: note: trait declared here\n  |\n1 | ... trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> Identity for Box<T> { }...\n  |                            ^~~~~~~~ trait declared here\nline 1, col 6: note: target type declared here\n  |\n1 | type Box<T> { Box(T) } trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> I...\n  |      ^~~ target type declared here\nhelp: a matching `Box<T>` impl candidate exists, but it requires `bool: Marked`; satisfy that nested bound or use another type.\ncheck: 446 functions, 1 errors'
+assert_equals "diagnostic_trait_conformance_replays_conditional_proof_golden" "$diag_out" $'line 1, col 200: error[E1004]: type `Box<bool>` does not implement `Identity`\n  |\n1 | ...ed<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(Box<bool>(true)) }\n  |                                                                           ^~~~~~~~~ type `Box<bool>` does not implement `Identity`\nline 1, col 113: note: matching impl candidate rejected by its own bound\n  |\n1 | ...T: Marked> Identity for Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bo...\n  |                            ^~~ matching impl candidate rejected by its own bound\nline 1, col 135: note: required by this trait bound\n  |\n1 | ...r Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(...\n  |                            ^~~~~~~~ required by this trait bound\nline 1, col 47: note: trait declared here\n  |\n1 | ... trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> Identity for Box<T> { }...\n  |                            ^~~~~~~~ trait declared here\nline 1, col 6: note: target type declared here\n  |\n1 | type Box<T> { Box(T) } trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> I...\n  |      ^~~ target type declared here\nhelp: a matching `Box<T>` impl candidate exists, but it requires `bool: Marked`; satisfy that nested bound or use another type.\ncheck: 448 functions, 1 errors'
 
 printf '%s\n' 'fn main() -> i64 { let café = 1 café }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
@@ -2719,4 +2763,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 596 passed, 0 failed"
+echo "Tool boundary summary: 615 passed, 0 failed"
