@@ -717,6 +717,10 @@ printf '%s\n' 'fn takes(value: i64) -> i64 { value } fn main() -> i64 { takes("s
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
 assert_equals "diagnostic_type_mismatch_teaches_contract_golden" "$diag_out" $'line 1, col 64: error[E1002]: argument type mismatch: expected `i64`, found `str`\nline 1, col 10: note: expected type established here\nhelp: Weft accepts a value here when its type is a subtype of the expected type.\ncheck: 2 functions, 1 errors'
 
+printf '%s\n' 'type Choice { Left(i64), Right(i64) } fn bad(value: Choice) -> i64 { match value { Left(n) -> n } }' > "$tmp_src"
+diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
+assert_equals "diagnostic_exhaustiveness_teaches_counterexample_golden" "$diag_out" $'line 1, col 76: error[E1003]: non-exhaustive match: value `Right(0)` is not covered\nline 1, col 6: note: matched type declared here\nhelp: add an arm matching `Right(0)`; the uncovered witness is `Right(0)`.\ncheck: 1 functions, 1 errors'
+
 printf '%s\n' 'fn main() -> i64 { let café = 1 café }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
 assert_equals "diagnostic_rejects_non_nfc_identifier_at_scalar_column" "$diag_out" $'line 1, col 24: error: identifier must use NFC normalization\ncheck: 0 functions, 1 errors'
@@ -1261,10 +1265,10 @@ mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"
 assert_equals "mcp_diagnostics_match_arm_type_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"match arm type mismatch: expected `i64`, found `str`","code":"E1002","span":55,"line":1,"col":56,"scalar_col":56,"utf16_col":56,"end_span":61,"end_line":1,"end_col":62,"end_scalar_col":62,"end_utf16_col":62}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad(n: i64) -> i64 { match n { 1 -> 2 } }"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_diagnostics_match_int_exhaustive_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: non-exhaustive match","span":30,"line":1,"col":31,"scalar_col":31,"utf16_col":31}]}}'
+assert_equals "mcp_diagnostics_match_int_exhaustive_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"non-exhaustive match: value `0` is not covered","code":"E1003","span":30,"line":1,"col":31,"scalar_col":31,"utf16_col":31,"end_span":31,"end_line":1,"end_col":32,"end_scalar_col":32,"end_utf16_col":32}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"type Choice { Left(i64), Right(i64) } fn bad(x: Choice) -> i64 { match x { Left(v) -> v } }"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_diagnostics_match_ctor_exhaustive_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: non-exhaustive match","span":71,"line":1,"col":72,"scalar_col":72,"utf16_col":72}]}}'
+assert_equals "mcp_diagnostics_match_ctor_exhaustive_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"non-exhaustive match: value `Right(0)` is not covered","code":"E1003","span":71,"line":1,"col":72,"scalar_col":72,"utf16_col":72,"end_span":72,"end_line":1,"end_col":73,"end_scalar_col":73,"end_utf16_col":73}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"type Choice { Left(i64), Right(i64) } fn bad(x: Choice) -> i64 { match x { Left(v) -> v Left(v) -> v + 1 Right(v) -> v } }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_match_duplicate_ctor_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: duplicate match constructor arm","span":88,"line":1,"col":89,"scalar_col":89,"utf16_col":89}]}}'
@@ -1490,6 +1494,12 @@ lsp_out=$(lsp_frame "$lsp_open_type_mismatch" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_type_mismatch_stable_code" "$lsp_out" '"code":"E1002"'
 assert_contains "lsp_type_mismatch_message" "$lsp_out" 'argument type mismatch: expected `i64`, found `str`'
 assert_contains "lsp_type_mismatch_precise_range" "$lsp_out" '"start":{"line":0,"character":63},"end":{"line":0,"character":69}'
+
+lsp_open_non_exhaustive='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///non-exhaustive.weft","version":1,"text":"type Choice { Left(i64), Right(i64) } fn bad(value: Choice) -> i64 { match value { Left(n) -> n } }"}}}'
+lsp_out=$(lsp_frame "$lsp_open_non_exhaustive" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_non_exhaustive_stable_code" "$lsp_out" '"code":"E1003"'
+assert_contains "lsp_non_exhaustive_teaches_witness" "$lsp_out" 'non-exhaustive match: value `Right(0)` is not covered'
+assert_contains "lsp_non_exhaustive_precise_scrutinee_range" "$lsp_out" '"start":{"line":0,"character":75},"end":{"line":0,"character":80}'
 
 lsp_open_module_cycle='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///module-cycle.weft","version":1,"text":"use test/negative/import_cycle_direct fn main() -> i64 { 0 }"}}}'
 lsp_out=$(lsp_frame "$lsp_open_module_cycle" | "$WEFT" lsp 2>&1)

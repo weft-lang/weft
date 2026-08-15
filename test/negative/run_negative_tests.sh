@@ -412,10 +412,10 @@ check_rejects "record_field_access_type_mismatch" "test/negative/record_field_ac
 check_rejects "match_arm_i64_str_mismatch" "test/negative/match_arm_i64_str_mismatch.weft" 'error[E1002]: match arm type mismatch: expected `i64`, found `str`'
 check_rejects "match_arm_str_bool_mismatch" "test/negative/match_arm_str_bool_mismatch.weft" 'error[E1002]: match arm type mismatch: expected `str`, found `bool`'
 check_rejects "match_arm_record_mismatch" "test/negative/match_arm_record_mismatch.weft" 'error[E1002]: match arm type mismatch: expected `Point`, found `Person`'
-check_rejects "match_non_exhaustive_int" "test/negative/match_non_exhaustive_int.weft" "type error: non-exhaustive match"
-check_rejects "match_non_exhaustive_constructor" "test/negative/match_non_exhaustive_constructor.weft" "type error: non-exhaustive match"
+check_rejects "match_non_exhaustive_int" "test/negative/match_non_exhaustive_int.weft" 'error[E1003]: non-exhaustive match: value `0` is not covered'
+check_rejects "match_non_exhaustive_constructor" "test/negative/match_non_exhaustive_constructor.weft" 'error[E1003]: non-exhaustive match: value `Right(0)` is not covered'
 check_rejects "match_duplicate_constructor" "test/negative/match_duplicate_constructor.weft" "type error: duplicate match constructor arm"
-check_rejects "match_final_guarded" "test/negative/match_final_guarded.weft" "type error: non-exhaustive match"
+check_rejects "match_final_guarded" "test/negative/match_final_guarded.weft" 'error[E1003]: non-exhaustive match: value `0` is not covered'
 check_rejects "pattern_literal_str_scrutinee" "test/negative/pattern_literal_str_scrutinee.weft" "type error: literal pattern does not match scrutinee"
 check_rejects "pattern_unknown_constructor" "test/negative/pattern_unknown_constructor.weft" "type error: unknown constructor pattern"
 check_rejects "pattern_constructor_on_i64" "test/negative/pattern_constructor_on_i64.weft" "type error: constructor pattern does not match scrutinee"
@@ -427,7 +427,7 @@ check_rejects "pattern_nested_constructor_wrong_payload" "test/negative/pattern_
 check_rejects "pattern_nested_constructor_arity" "test/negative/pattern_nested_constructor_arity.weft" "type error: constructor pattern arity mismatch"
 check_rejects "pattern_nested_literal_mismatch" "test/negative/pattern_nested_literal_mismatch.weft" "type error: literal pattern does not match scrutinee"
 check_rejects "pattern_nested_typed_nondiscriminable" "test/negative/pattern_nested_typed_nondiscriminable.weft" "type error: typed match arm needs a runtime-discriminable union"
-check_rejects "pattern_nested_non_exhaustive" "test/negative/pattern_nested_non_exhaustive.weft" "type error: non-exhaustive match"
+check_rejects "pattern_nested_non_exhaustive" "test/negative/pattern_nested_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `Wrap(Right)` is not covered'
 check_rejects "pattern_nested_malformed" "test/negative/pattern_nested_malformed.weft" "error: expected ',' or ')' after constructor pattern payload"
 check_rejects "pattern_nested_unclosed" "test/negative/pattern_nested_unclosed.weft" "error: expected ')' after constructor pattern"
 check_rejects "opaque_construct_imported" "test/negative/opaque_construct_imported.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
@@ -439,7 +439,7 @@ check_rejects "opaque_type_arg_arity" "test/negative/opaque_type_arg_arity.weft"
 check_rejects "opaque_recursive_representation" "test/negative/opaque_recursive_representation.weft" "type error: opaque value representation is recursively defined"
 check_rejects "opaque_projection_arity_zero" "test/negative/opaque_projection_arity_zero.weft" "type error: opaque projection pattern requires exactly one child pattern"
 check_rejects "opaque_projection_arity_many" "test/negative/opaque_projection_arity_many.weft" "type error: opaque projection pattern requires exactly one child pattern" 3
-check_rejects "opaque_projection_non_exhaustive" "test/negative/opaque_projection_non_exhaustive.weft" "type error: non-exhaustive match"
+check_rejects "opaque_projection_non_exhaustive" "test/negative/opaque_projection_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `UserId(1)` is not covered'
 check_rejects "opaque_missing_marker" "test/negative/opaque_missing_marker.weft" "error: expected 'opaque' after '=' in type declaration"
 check_rejects "opaque_missing_representation" "test/negative/opaque_missing_representation.weft" "error: expected representation type after 'opaque'"
 check_rejects "opaque_any_return" "test/negative/opaque_any_return.weft" 'error[E1002]: return value type mismatch: expected `Secret`, found `any`'
@@ -679,7 +679,7 @@ check_rejects "qualified_ctor_call" "test/negative/qualified_ctor_call.weft" "ty
 check_rejects "qualified_ctor_nullary" "test/negative/qualified_ctor_nullary.weft" "type error: qualified constructor syntax is not supported"
 check_rejects "interp_display_missing_import" "test/negative/interp_display_missing_import.weft" "add use \"stdlib/display.weft\""
 check_rejects "typed_match_untagged_union" "test/negative/typed_match_untagged_union.weft" "type error: typed match arm needs a runtime-discriminable union"
-check_rejects "typed_match_non_exhaustive" "test/negative/typed_match_non_exhaustive.weft" "type error: non-exhaustive match"
+check_rejects "typed_match_non_exhaustive" "test/negative/typed_match_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `nil` is not covered'
 check_rejects "typed_match_foreign_annotation" "test/negative/typed_match_foreign_annotation.weft" "type error: typed match arm annotation is not part of the scrutinee type"
 check_rejects "typed_match_nil_never" "test/negative/typed_match_nil_never.weft" "type error: nil match arm on a scrutinee that is never nil"
 check_rejects "structural_record_duplicate_field" "test/negative/structural_record_duplicate_field.weft" "type error: duplicate structural record field"
@@ -715,10 +715,10 @@ check_rejects "record_pattern_malformed" "test/negative/record_pattern_malformed
 check_rejects "tuple_pattern_malformed" "test/negative/tuple_pattern_malformed.weft" "error: expected ')' after grouped pattern"
 check_rejects "record_pattern_nested_untagged_union" "test/negative/record_pattern_nested_untagged_union.weft" "type error: typed match arm needs a runtime-discriminable union"
 check_rejects "record_pattern_literal_mismatch" "test/negative/record_pattern_literal_mismatch.weft" "type error: literal pattern does not match scrutinee"
-check_rejects "pattern_matrix_tuple_non_exhaustive" "test/negative/pattern_matrix_tuple_non_exhaustive.weft" "type error: non-exhaustive match"
-check_rejects "pattern_matrix_record_non_exhaustive" "test/negative/pattern_matrix_record_non_exhaustive.weft" "type error: non-exhaustive match"
-check_rejects "pattern_matrix_nested_ctor_non_exhaustive" "test/negative/pattern_matrix_nested_ctor_non_exhaustive.weft" "type error: non-exhaustive match"
-check_rejects "pattern_matrix_guard_non_exhaustive" "test/negative/pattern_matrix_guard_non_exhaustive.weft" "type error: non-exhaustive match"
+check_rejects "pattern_matrix_tuple_non_exhaustive" "test/negative/pattern_matrix_tuple_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `(MatrixTupleOne, MatrixTupleOne)` is not covered'
+check_rejects "pattern_matrix_record_non_exhaustive" "test/negative/pattern_matrix_record_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `{item: nil}` is not covered'
+check_rejects "pattern_matrix_nested_ctor_non_exhaustive" "test/negative/pattern_matrix_nested_ctor_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `MatrixOuterWrap(MatrixInnerRight)` is not covered'
+check_rejects "pattern_matrix_guard_non_exhaustive" "test/negative/pattern_matrix_guard_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `(MatrixGuardZero, MatrixGuardZero)` is not covered'
 check_rejects "pattern_matrix_duplicate_literal" "test/negative/pattern_matrix_duplicate_literal.weft" "type error: unreachable match arm"
 check_rejects "pattern_matrix_duplicate_tuple" "test/negative/pattern_matrix_duplicate_tuple.weft" "type error: unreachable match arm"
 check_rejects "pattern_matrix_duplicate_nested_ctor" "test/negative/pattern_matrix_duplicate_nested_ctor.weft" "type error: duplicate match constructor arm"
