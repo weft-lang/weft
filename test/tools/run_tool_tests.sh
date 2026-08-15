@@ -703,47 +703,64 @@ assert_contains "ast_recovers_after_parse_error" "$parse_recovery_out" "--- AST:
 printf 'fn main() -> i64 { missing }\n' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
 assert_contains "check_reports_diagnostics" "$diag_out" "error[E1001]: unknown identifier 'missing'"
-assert_equals "diagnostic_snapshot_exact" "$diag_out" $'line 1, col 20: error[E1001]: unknown identifier \x27missing\x27\ncheck: 1 functions, 1 errors'
+assert_equals "diagnostic_snapshot_exact" "$diag_out" $'line 1, col 20: error[E1001]: unknown identifier \x27missing\x27\n  |\n1 | fn main() -> i64 { missing }\n  |                    ^~~~~~~ unknown identifier \x27missing\x27\ncheck: 1 functions, 1 errors'
 
 printf 'fn main() -> i64 { let s = "😀" missing }\n' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_unicode_columns_count_scalars" "$diag_out" $'line 1, col 32: error[E1001]: unknown identifier \x27missing\x27\ncheck: 1 functions, 1 errors'
+assert_equals "diagnostic_unicode_columns_count_scalars" "$diag_out" $'line 1, col 32: error[E1001]: unknown identifier \x27missing\x27\n  |\n1 | fn main() -> i64 { let s = "😀" missing }\n  |                                ^~~~~~~ unknown identifier \x27missing\x27\ncheck: 1 functions, 1 errors'
 
 printf 'fn main() -> i64 { let counter = 1 counte }\n' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_unknown_name_suggestion_golden" "$diag_out" $'line 1, col 36: error[E1001]: unknown identifier \x27counte\x27\nline 1, col 24: note: similarly named declaration\nhelp: did you mean \x27counter\x27?\ncheck: 1 functions, 1 errors'
+assert_equals "diagnostic_unknown_name_suggestion_golden" "$diag_out" $'line 1, col 36: error[E1001]: unknown identifier \x27counte\x27\n  |\n1 | fn main() -> i64 { let counter = 1 counte }\n  |                                    ^~~~~~ unknown identifier \x27counte\x27\nline 1, col 24: note: similarly named declaration\n  |\n1 | fn main() -> i64 { let counter = 1 counte }\n  |                        ^~~~~~~ similarly named declaration\nhelp: did you mean \x27counter\x27?\ncheck: 1 functions, 1 errors'
 
 printf '%s\n' 'fn takes(value: i64) -> i64 { value } fn main() -> i64 { takes("snow") }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_type_mismatch_teaches_contract_golden" "$diag_out" $'line 1, col 64: error[E1002]: argument type mismatch: expected `i64`, found `str`\nline 1, col 10: note: expected type established here\nhelp: Weft accepts a value here when its type is a subtype of the expected type.\ncheck: 2 functions, 1 errors'
+assert_equals "diagnostic_type_mismatch_teaches_contract_golden" "$diag_out" $'line 1, col 64: error[E1002]: argument type mismatch: expected `i64`, found `str`\n  |\n1 | fn takes(value: i64) -> i64 { value } fn main() -> i64 { takes("snow") }\n  |                                                                ^~~~~~ argument type mismatch: expected `i64`, found `str`\nline 1, col 10: note: expected type established here\n  |\n1 | fn takes(value: i64) -> i64 { value } fn main() -> i64 { takes("snow") }\n  |          ^~~~~ expected type established here\nhelp: Weft accepts a value here when its type is a subtype of the expected type.\ncheck: 2 functions, 1 errors'
 
 printf '%s\n' 'type Choice { Left(i64), Right(i64) } fn bad(value: Choice) -> i64 { match value { Left(n) -> n } }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_exhaustiveness_teaches_counterexample_golden" "$diag_out" $'line 1, col 76: error[E1003]: non-exhaustive match: value `Right(0)` is not covered\nline 1, col 6: note: matched type declared here\nhelp: add an arm matching `Right(0)`; the uncovered witness is `Right(0)`.\ncheck: 1 functions, 1 errors'
+assert_equals "diagnostic_exhaustiveness_teaches_counterexample_golden" "$diag_out" $'line 1, col 76: error[E1003]: non-exhaustive match: value `Right(0)` is not covered\n  |\n1 | type Choice { Left(i64), Right(i64) } fn bad(value: Choice) -> i64 { match value { Left(n) -> n } }\n  |                                                                            ^~~~~ non-exhaustive match: value `Right(0)` is not covered\nline 1, col 6: note: matched type declared here\n  |\n1 | type Choice { Left(i64), Right(i64) } fn bad(value: Choice) -> i64 { match value { Left(n) -> n } }\n  |      ^~~~~~ matched type declared here\nhelp: add an arm matching `Right(0)`; the uncovered witness is `Right(0)`.\ncheck: 1 functions, 1 errors'
 
 printf '%s\n' 'effect Box<T> { fn get() -> T } fn need() -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_effect_discharge_teaches_parameter_identity_golden" "$diag_out" $'line 1, col 99: error[E2001]: effect `Box<str>` is not available in this context\nline 1, col 108: note: nearest handler handles a different instantiation of this effect\nline 1, col 36: note: callee declares this effect\nhelp: `Box<i64>` is available, but it does not discharge `Box<str>`; effect type arguments are part of capability identity.\ncheck: 446 functions, 1 errors'
+assert_equals "diagnostic_effect_discharge_teaches_parameter_identity_golden" "$diag_out" $'line 1, col 99: error[E2001]: effect `Box<str>` is not available in this context\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                             ^~~~ effect `Box<str>` is not available in this context\nline 1, col 108: note: nearest handler handles a different instantiation of this effect\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                                      ^~~ nearest handler handles a different instantiation of this effect\nline 1, col 36: note: callee declares this effect\n  |\n1 | ...T> { fn get() -> T } fn need() -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<...\n  |                            ^~~~ callee declares this effect\nhelp: `Box<i64>` is available, but it does not discharge `Box<str>`; effect type arguments are part of capability identity.\ncheck: 446 functions, 1 errors'
 
 printf '%s\n' 'type Box<T> { Box(T) } trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> Identity for Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(Box<bool>(true)) }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_trait_conformance_replays_conditional_proof_golden" "$diag_out" $'line 1, col 200: error[E1004]: type `Box<bool>` does not implement `Identity`\nline 1, col 113: note: matching impl candidate rejected by its own bound\nline 1, col 135: note: required by this trait bound\nline 1, col 47: note: trait declared here\nline 1, col 6: note: target type declared here\nhelp: a matching `Box<T>` impl candidate exists, but it requires `bool: Marked`; satisfy that nested bound or use another type.\ncheck: 446 functions, 1 errors'
+assert_equals "diagnostic_trait_conformance_replays_conditional_proof_golden" "$diag_out" $'line 1, col 200: error[E1004]: type `Box<bool>` does not implement `Identity`\n  |\n1 | ...ed<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(Box<bool>(true)) }\n  |                                                                           ^~~~~~~~~ type `Box<bool>` does not implement `Identity`\nline 1, col 113: note: matching impl candidate rejected by its own bound\n  |\n1 | ...T: Marked> Identity for Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bo...\n  |                            ^~~ matching impl candidate rejected by its own bound\nline 1, col 135: note: required by this trait bound\n  |\n1 | ...r Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(...\n  |                            ^~~~~~~~ required by this trait bound\nline 1, col 47: note: trait declared here\n  |\n1 | ... trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> Identity for Box<T> { }...\n  |                            ^~~~~~~~ trait declared here\nline 1, col 6: note: target type declared here\n  |\n1 | type Box<T> { Box(T) } trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> I...\n  |      ^~~ target type declared here\nhelp: a matching `Box<T>` impl candidate exists, but it requires `bool: Marked`; satisfy that nested bound or use another type.\ncheck: 446 functions, 1 errors'
 
 printf '%s\n' 'fn main() -> i64 { let café = 1 café }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_rejects_non_nfc_identifier_at_scalar_column" "$diag_out" $'line 1, col 24: error[E0001]: identifier must use NFC normalization\ncheck: 0 functions, 1 errors'
+assert_equals "diagnostic_rejects_non_nfc_identifier_at_scalar_column" "$diag_out" $'line 1, col 24: error[E0001]: identifier must use NFC normalization\n  |\n1 | fn main() -> i64 { let café = 1 café }\n  |                        ^~~~~ identifier must use NFC normalization\ncheck: 0 functions, 1 errors'
 
 printf '\303(' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_rejects_malformed_utf8_before_tokenization" "$diag_out" $'line 1, col 1: error[E0001]: source is not valid UTF-8\ncheck: 0 functions, 1 errors'
+assert_equals "diagnostic_rejects_malformed_utf8_before_tokenization" "$diag_out" $'line 1, col 1: error[E0001]: source is not valid UTF-8\n  |\n1 | \x5cxC3(\n  | ^~~~ source is not valid UTF-8\ncheck: 0 functions, 1 errors'
 
 printf '%s\n' 'fn paypal() -> i64 { 20 } fn pаypаl() -> i64 { 22 } fn main() -> i64 { paypal() + pаypаl() }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
-assert_equals "diagnostic_unicode_security_warnings_do_not_fail_check" "$diag_out" $'line 1, col 30: warning[W0001]: identifier contains mixed scripts\nline 1, col 30: warning[W0002]: identifier is confusable with another spelling in this source\nline 1, col 4: note: confusable spelling appears here\ncheck: 3 functions, 0 errors'
+assert_equals "diagnostic_unicode_security_warnings_do_not_fail_check" "$diag_out" $'line 1, col 30: warning[W0001]: identifier contains mixed scripts\n  |\n1 | fn paypal() -> i64 { 20 } fn pаypаl() -> i64 { 22 } fn main() -> i64 { paypal() + pаypаl() }\n  |                              ^~~~~~ identifier contains mixed scripts\nline 1, col 30: warning[W0002]: identifier is confusable with another spelling in this source\n  |\n1 | fn paypal() -> i64 { 20 } fn pаypаl() -> i64 { 22 } fn main() -> i64 { paypal() + pаypаl() }\n  |                              ^~~~~~ identifier is confusable with another spelling in this source\nline 1, col 4: note: confusable spelling appears here\n  |\n1 | fn paypal() -> i64 { 20 } fn pаypаl() -> i64 { 22 } fn main() -> i64 { paypal() + pаypаl() }\n  |    ^~~~~~ confusable spelling appears here\ncheck: 3 functions, 0 errors'
 
 printf '%s' $'-- abc\u202Edef\nfn main() -> i64 { 42 }\n' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
-assert_equals "diagnostic_bidi_comment_warning_does_not_fail_check" "$diag_out" $'line 1, col 7: warning[W0003]: source text contains an invisible bidi formatting control\ncheck: 1 functions, 0 errors'
+assert_equals "diagnostic_bidi_comment_warning_does_not_fail_check" "$diag_out" $'line 1, col 7: warning[W0003]: source text contains an invisible bidi formatting control\n  |\n1 | -- abc\x5cu{202E}def\n  |       ^~~~~~~~ source text contains an invisible bidi formatting control\ncheck: 1 functions, 0 errors'
+
+printf 'fn broken() -> i64 { 1\n' > "$tmp_src"
+diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
+assert_equals "diagnostic_eof_insertion_has_zero_width_caret" "$diag_out" $'line 2, col 1: error[E0002]: expected \x27}\x27 before end of file\n  |\n2 | \n  | ^ expected \x27}\x27 before end of file\nline 1, col 20: note: construct opened here\n  |\n1 | fn broken() -> i64 { 1\n  |                    ^ construct opened here\nhelp: insert `}` to close this block.\ncheck: 1 functions, 1 errors'
+
+printf 'fn main() -> i64 {\n\tmissing\n}\n' > "$tmp_src"
+diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
+assert_equals "diagnostic_tabs_expand_with_matching_caret" "$diag_out" $'line 2, col 2: error[E1001]: unknown identifier \x27missing\x27\n  |\n2 |     missing\n  |     ^~~~~~~ unknown identifier \x27missing\x27\ncheck: 1 functions, 1 errors'
+
+printf '%s\n' 'fn main() -> i64 { let abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz = 1 missing }' > "$tmp_src"
+diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
+assert_equals "diagnostic_long_line_clips_around_primary" "$diag_out" $'line 1, col 133: error[E1001]: unknown identifier \x27missing\x27\n  |\n1 | ...stuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz = 1 missing }\n  |                                                                                               ^~~~~~~ unknown identifier \x27missing\x27\ncheck: 1 functions, 1 errors'
+
+run_weft_compile_guarded "$WEFT" compile test/fixtures/diagnostic_frame_probe.weft > "$tmp_bin" 2>"$tmp_err"
+chmod +x "$tmp_bin"
+diag_out=$(run_binary_guarded "$tmp_bin" 2>&1)
+assert_equals "diagnostic_multiline_range_clips_middle_lines" "$diag_out" $'probe.weft: line 1, col 3: error: range crosses the omitted middle\n  |\n1 | zero\n  |   ^~\n2 | one two\n  | ^~~~~~~\n... | ...\n6 | six seven\n  | ^~~~~~~~~\n7 | eight\n  | ^~~ range crosses the omitted middle'
 
 mcp_out=$(printf '%s' '{ "jsonrpc" : "2.0", "id" : 1, "method" : "tools/list" }' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"},{"name":"fact_at_position","stability":"stable"},{"name":"visible_bindings","stability":"stable"},{"name":"conformance_at_position","stability":"stable"},{"name":"format_source","stability":"stable"}]}}'
@@ -2702,4 +2719,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 592 passed, 0 failed"
+echo "Tool boundary summary: 596 passed, 0 failed"
