@@ -20,6 +20,7 @@ use compiler/module.{*}
 use compiler/module_diagnostics.{module_diagnostic_decl_location, module_diagnostic_import_local_location, module_diagnostic_qualified_member}
 use compiler/parse.{*}
 use compiler/source_trust.{*}
+use compiler/semantic_type_projection.{*}
 use compiler/typecheck_effect.{*}
 use compiler/type_registry.{*}
 use compiler/types.{*}
@@ -28,8 +29,10 @@ use runtime/buffer.{*}
 use runtime/memory.{*}
 use runtime/string.{runtime_str_from_bytes_copy}
 use stdlib/diagnostic.{*}
-use stdlib/diagnostic_registry.{diagnostic_code_unknown_name}
+use stdlib/diagnostic_registry.{diagnostic_code_type_mismatch, diagnostic_code_unknown_name}
 use stdlib/diagnostic_type.{*}
+use stdlib/semantic_type.{*}
+use stdlib/semantic_type_render.{semantic_type_render}
 use stdlib/utf8.{utf8_decode_is_ok, utf8_decode_next_bytes, utf8_decode_next_pos, utf8_decode_scalar}
 
 -- span is an offset into src; the diagnostic carries the absolute address so
@@ -44,6 +47,181 @@ pub(package) fn typeck_error(src: i64, span: i64, msg: str) -[Diagnose]> i64 {
 pub(package) fn typeck_error_maybe(src: i64, span: i64, msg: str) -[Diagnose]> i64 {
   let diag_span = if span > 0 { span } else { 0 - 1 }
   typeck_error(src, diag_span, msg)
+}
+
+pub(package) fn typeck_source_location(src: i64, start: i64, len: i64) -> DiagnosticLocation {
+  if start < 0 { DiagnosticLocationNone }
+  else { DiagnosticSourceRange(DiagnosticSourceBuffer(src), start, start + if len > 0 { len } else { 1 }) }
+}
+
+pub(package) fn typeck_location_source_or(location: DiagnosticLocation, fallback: i64) -> i64 {
+  match location {
+    DiagnosticSourceRange(DiagnosticSourceBuffer(source), start, end) -> source
+    _ -> fallback
+  }
+}
+
+pub(package) fn typeck_text_eq(value: str, expected: str) -> i64 {
+  if __str_len(value) != __str_len(expected) { 0 }
+  else { src_eq(__str_ptr(value), 0, __str_len(value), expected) }
+}
+
+pub(package) fn typeck_mismatch_message(reason: str, context: str, expected: str, found: str) -> str {
+  let b = buf_new(96)
+  if typeck_text_eq(reason, "integer_literal_range") == 1 {
+    bstr(b, "integer literal does not fit expected type `")
+    bstr(b, expected)
+    bstr(b, "`")
+  } else {
+    bstr(b, context)
+    bstr(b, " type mismatch: expected `")
+    bstr(b, expected)
+    bstr(b, "`, found `")
+    bstr(b, found)
+    bstr(b, "`")
+  }
+  runtime_str_from_bytes_copy(buf_ptr(b), buf_len(b))
+}
+
+pub(package) fn typeck_mismatch_reason(expected_ty: i64, found_ty: i64) -[Conformance]> str {
+  let found_non_nil = if type_allows_nil(found_ty) == 1 { ty_narrow_drop_nil(found_ty) } else { 0 }
+  if type_allows_nil(expected_ty) == 0 and found_non_nil != 0 and is_subtype(found_non_nil, expected_ty) {
+    "possibly_nil"
+  } else { if ty_is_array(expected_ty) and ty_is_array(found_ty) and ty_eq(ty_array_inner(expected_ty), ty_array_inner(found_ty)) and ty_array_length(expected_ty) != ty_array_length(found_ty) {
+    "array_length"
+  } else { if ty_is_slice(expected_ty) and ty_is_slice(found_ty) and (ty_slice_mutable(expected_ty) != ty_slice_mutable(found_ty) or not ty_eq(ty_slice_inner(expected_ty), ty_slice_inner(found_ty))) {
+    "mutable_slice_contract"
+  } else { if ty_tag(expected_ty) == 9 and ty_tag(found_ty) == 9 and ty_f1(expected_ty) == ty_f1(found_ty) {
+    "nominal_type_arguments"
+  } else { if ty_is_record(expected_ty) or ty_is_record(found_ty) {
+    "structural_shape"
+  } else { "incompatible_types" } } } } }
+}
+
+pub(package) fn typeck_mismatch_reason_for_expr(node: i64, expected_ty: i64, found_ty: i64, src: i64) -[Conformance]> str {
+  if node != 0 and expr_is_contextual_int_lit_shape(node) == 1 and type_int_prim(expected_ty) >= 0 and expr_contextual_int_lit_matches_type(node, expected_ty, src) != 1 {
+    "integer_literal_range"
+  } else { typeck_mismatch_reason(expected_ty, found_ty) }
+}
+
+pub(package) fn typeck_int_prim_min_str(prim: i64) -> str {
+  if prim_is_unsigned_integer(prim) == 1 { "0" }
+  else { if prim == PRIM_I8() { "-128" }
+  else { if prim == PRIM_I16() { "-32768" }
+  else { if prim == PRIM_I32() { "-2147483648" }
+  else { "-9223372036854775808" } } } }
+}
+
+pub(package) fn typeck_mismatch_detail_fields(reason: str, expected_ty: i64, expected_origin: DiagnosticLocation) -> DiagnosticFieldList {
+  let tail = DiagnosticFieldCons(DiagnosticFieldLocation("expected_origin", expected_origin), DiagnosticFieldNil)
+  if typeck_text_eq(reason, "integer_literal_range") == 1 {
+    let prim = type_int_prim(expected_ty)
+    DiagnosticFieldCons(
+      DiagnosticFieldText("expected_min", typeck_int_prim_min_str(prim)),
+      DiagnosticFieldCons(DiagnosticFieldText("expected_max", int_prim_positive_max_str(prim)), tail)
+    )
+  } else { tail }
+}
+
+pub(package) fn typeck_type_mismatch_diagnostic_with_reason(
+  src: i64,
+  start: i64,
+  len: i64,
+  expected_ty: i64,
+  found_ty: i64,
+  context: str,
+  expected_origin: DiagnosticLocation,
+  tt: i64,
+  reason: str
+) -[Conformance]> Diagnostic {
+  let expected = semantic_type_fact_from_checker(expected_ty, tt, typeck_location_source_or(expected_origin, src))
+  let found = semantic_type_fact_from_checker(found_ty, tt, src)
+  let expected_text = semantic_type_render(expected)
+  let found_text = semantic_type_render(found)
+  let relationship = if typeck_text_eq(reason, "integer_literal_range") == 1 { "literal_out_of_range" }
+    else { "found_not_subtype_of_expected" }
+  let related = match expected_origin {
+    DiagnosticLocationNone -> DiagnosticRelatedLocationNil
+    _ -> DiagnosticRelatedLocationCons(DiagnosticRelatedLocation("expected type established here", expected_origin), DiagnosticRelatedLocationNil)
+  }
+  diagnostic_new(
+    DiagnosticSeverityError,
+    DiagnosticClassType,
+    diagnostic_code_type_mismatch(),
+    typeck_mismatch_message(reason, context, expected_text, found_text),
+    typeck_source_location(src, start, len),
+    related,
+    DiagnosticFieldCons(
+      DiagnosticFieldText("context", context),
+      DiagnosticFieldCons(
+        DiagnosticFieldType("expected_type", expected),
+        DiagnosticFieldCons(
+          DiagnosticFieldType("found_type", found),
+          DiagnosticFieldCons(
+            DiagnosticFieldText("expected", expected_text),
+            DiagnosticFieldCons(
+              DiagnosticFieldText("found", found_text),
+              DiagnosticFieldCons(
+              DiagnosticFieldText("relationship", relationship),
+                DiagnosticFieldCons(
+                  DiagnosticFieldText("reason", reason),
+                  typeck_mismatch_detail_fields(reason, expected_ty, expected_origin)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+}
+
+pub(package) fn typeck_type_mismatch_diagnostic(
+  src: i64,
+  start: i64,
+  len: i64,
+  expected_ty: i64,
+  found_ty: i64,
+  context: str,
+  expected_origin: DiagnosticLocation,
+  tt: i64
+) -[Conformance]> Diagnostic {
+  typeck_type_mismatch_diagnostic_with_reason(src, start, len, expected_ty, found_ty, context, expected_origin, tt, typeck_mismatch_reason(expected_ty, found_ty))
+}
+
+pub(package) fn typeck_report_type_mismatch(
+  src: i64,
+  start: i64,
+  len: i64,
+  expected_ty: i64,
+  found_ty: i64,
+  context: str,
+  expected_origin: DiagnosticLocation,
+  tt: i64
+) -[Conformance, Diagnose]> i64 {
+  diagnostic_report(typeck_type_mismatch_diagnostic(src, start, len, expected_ty, found_ty, context, expected_origin, tt))
+}
+
+pub(package) fn typeck_report_expr_type_mismatch(
+  src: i64,
+  node: i64,
+  expected_ty: i64,
+  found_ty: i64,
+  context: str,
+  expected_origin: DiagnosticLocation,
+  tt: i64
+) -[Conformance, Diagnose]> i64 {
+  diagnostic_report(typeck_type_mismatch_diagnostic_with_reason(
+    src,
+    if node == 0 { 0 } else { expr_diag_pos(node) },
+    if node == 0 { 1 } else { expr_diag_len(node) },
+    expected_ty,
+    found_ty,
+    context,
+    expected_origin,
+    tt,
+    typeck_mismatch_reason_for_expr(node, expected_ty, found_ty, src)
+  ))
 }
 
 -- E1001 carries the unresolved spelling and the best semantically eligible
@@ -4252,25 +4430,26 @@ pub(package) fn synth_call_infer_generic(node: i64, env: i64, ft: i64, src: i64,
       else { if nlist_len(params) != nargs { 0 }
       else {
         let s = subst_new()
-        let mut ok = 1
         for i in 0..nargs {
           let pty = node_f3(nlist_get(params, i))
           if pty != 0 {
             let actual_ty = synth(nlist_get(args, i), env, ft, src, tt)
             let projected = if ty_is_record(pty) and ty_tag(actual_ty) == 9 { typeck_named_record_projection(tt, actual_ty) } else { 0 }
             let inference_ty = if projected != 0 { projected } else { actual_ty }
-            if ty_infer_solve(pty, inference_ty, s) == 0 { ok = 0 } else { 0 }
+            ty_infer_solve(pty, inference_ty, s)
           } else { 0 }
         }
-        if ok == 0 { 0 }
+        -- A conflicting later argument must not erase facts solved by an
+        -- earlier one. If every type parameter has a witness, retain that
+        -- recovery specialization: the ordinary substituted argument checker
+        -- then reports the actual conflict once with concrete expected/found
+        -- types instead of cascading `unknown` diagnostics over every arg.
+        let targs = generic_infer_solved_targs(tparams, s)
+        if targs == 0 { 0 }
         else {
-          let targs = generic_infer_solved_targs(tparams, s)
-          if targs == 0 { 0 }
-          else {
-            let ret_ty = ftypes_lookup(ft, src, ns, nl)
-            generic_call_rewrite_to_explicit(node, ns, nl, args, nargs, targs)
-            if ret_ty == 0 { ty_any() } else { ty_subst(ret_ty, s) }
-          }
+          let ret_ty = ftypes_lookup(ft, src, ns, nl)
+          generic_call_rewrite_to_explicit(node, ns, nl, args, nargs, targs)
+          if ret_ty == 0 { ty_any() } else { ty_subst(ret_ty, s) }
         }
       } }
     }
@@ -4295,25 +4474,21 @@ pub(package) fn synth_qualified_call_infer_generic(node: i64, entry: i64, env: i
   if tparams == 0 or params == 0 or nargs == 0 or nlist_len(params) != nargs { 0 }
   else {
     let s = subst_new()
-    let mut ok = 1
     for i in 0..nargs {
       let pty = node_f3(nlist_get(params, i))
       if pty != 0 {
         let actual_ty = synth(nlist_get(args, i), env, ft, src, tt)
         let projected = if ty_is_record(pty) and ty_tag(actual_ty) == 9 { typeck_named_record_projection(tt, actual_ty) } else { 0 }
         let inference_ty = if projected != 0 { projected } else { actual_ty }
-        if ty_infer_solve(pty, inference_ty, s) == 0 { ok = 0 } else { 0 }
+        ty_infer_solve(pty, inference_ty, s)
       } else { 0 }
     }
-    if ok == 0 { 0 }
+    let targs = generic_infer_solved_targs(tparams, s)
+    if targs == 0 { 0 }
     else {
-      let targs = generic_infer_solved_targs(tparams, s)
-      if targs == 0 { 0 }
-      else {
-        let ret_ty = ftypes_entry_return_type(entry)
-        generic_qualified_call_rewrite_to_explicit(node, targs)
-        if ret_ty == 0 { ty_any() } else { ty_subst(ret_ty, s) }
-      }
+      let ret_ty = ftypes_entry_return_type(entry)
+      generic_qualified_call_rewrite_to_explicit(node, targs)
+      if ret_ty == 0 { ty_any() } else { ty_subst(ret_ty, s) }
     }
   }
 }
@@ -6175,6 +6350,8 @@ pub(package) fn check_effect_perform_args(node: i64, env: i64, ft: i64, src: i64
     let args = node_f4(node)
     let nparams = nlist_len(params)
     let nargs = nlist_len(args)
+    let effect_entry = typeck_effect_ref_entry(node_f1(node), src, tt)
+    let effect_src = if effect_entry == 0 { src } else { ttable_entry_source(effect_entry) }
     let mut errors = 0
     errors = errors + check_arity(nparams, nargs, src, node_f2(node))
     let s = effect_perform_site_subst(node, src, tt)
@@ -6184,7 +6361,10 @@ pub(package) fn check_effect_perform_args(node: i64, env: i64, ft: i64, src: i64
       let param_ty = node_f3(param)
       if param_ty != 0 {
         let inst_ty = if s != 0 { ty_subst(param_ty, s) } else { param_ty }
-        errors = errors + check_arg_against_param(nlist_get(args, i), inst_ty, env, ft, src, tt, node_f2(node))
+        errors = errors + check_arg_against_param_at(
+          nlist_get(args, i), inst_ty, env, ft, src, tt, node_f2(node),
+          typeck_source_location(effect_src, node_f1(param), node_f2(param))
+        )
       } else { errors = errors }
     }
     -- Borrow loans created by one perform overlap exactly as they do for an
@@ -6777,11 +6957,16 @@ pub(package) fn check_lambda_against_fn(lambda: i64, expected: i64, env: i64, ft
       let ann_ty = node_f3(p)
       let bind_ty = if ann_ty != 0 {
         if not is_subtype(expected_param, ann_ty) {
-          if pos > 0 {
-            typeck_error(src, pos, "type error: argument type mismatch")
-          } else {
-            typeck_error(src, node_f1(p), "type error: argument type mismatch")
-          }
+          typeck_report_type_mismatch(
+            src,
+            node_f1(p),
+            node_f2(p),
+            expected_param,
+            ann_ty,
+            "lambda parameter",
+            typeck_source_location(src, if pos > 0 { pos } else { lambda_span(lambda) }, 1),
+            tt
+          )
           errors = errors + 1
         } else { errors = errors }
         ann_ty
@@ -6799,14 +6984,21 @@ pub(package) fn check_lambda_against_fn(lambda: i64, expected: i64, env: i64, ft
       errors = errors + check_unique_param_usage_against_types(params, expected_params, nbind, body, src)
       errors = errors + check_unique_linear_expr(body, lambda_env, ft, src, tt)
     } else { errors = errors }
-    errors = errors + check_return_values(body, lambda_env, ft, src, ty_f2(expected), tt)
+    errors = errors + check_return_values_at(
+      body, lambda_env, ft, src, ty_f2(expected), tt,
+      typeck_source_location(src, if pos > 0 { pos } else { lambda_span(lambda) }, 1)
+    )
     if type_is_unknown_or_any(body_ty) and ty_contains_opaque(ty_f2(expected)) == 0 { errors = errors }
     else { if expr_matches_type_contextual(body, body_ty, ty_f2(expected), src) != 1 {
-      if pos > 0 {
-        typeck_error(src, pos, "type error: return type mismatch")
-      } else {
-        typeck_error(src, lambda_span(lambda), "type error: return type mismatch")
-      }
+      typeck_report_expr_type_mismatch(
+        src,
+        body,
+        ty_f2(expected),
+        body_ty,
+        "lambda return value",
+        typeck_source_location(src, if pos > 0 { pos } else { lambda_span(lambda) }, 1),
+        tt
+      )
       errors = errors + 1
     } else { errors = errors } }
     ttable_set_current_fn_eff(tt, saved_fn_eff)
@@ -6859,7 +7051,7 @@ pub(package) fn typeck_mark_borrow_use(arg: i64, owner: i64, param_ty: i64) -> i
   0
 }
 
-pub(package) fn check_arg_against_borrow_param(arg: i64, param_ty: i64, env: i64, src: i64, pos: i64) -[Diagnose]> i64 {
+pub(package) fn check_arg_against_borrow_param(arg: i64, param_ty: i64, env: i64, src: i64, pos: i64, expected_origin: DiagnosticLocation, tt: i64) -[Conformance, Diagnose]> i64 {
   if node_tag(arg) != 2 {
     typeck_error_maybe(src, expr_diag_pos(arg), "type error: resource borrow requires a named owned binding")
     1
@@ -6878,7 +7070,7 @@ pub(package) fn check_arg_against_borrow_param(arg: i64, param_ty: i64, env: i64
       } else {
         let actual_inner = if actual_is_owned { ty_owned_inner(actual_ty) } else { ty_borrow_inner(actual_ty) }
         if not ty_eq(actual_inner, ty_borrow_inner(param_ty)) {
-          typeck_error_maybe(src, expr_diag_pos(arg), "type error: resource borrow type mismatch")
+          typeck_report_expr_type_mismatch(src, arg, ty_borrow_inner(param_ty), actual_inner, "borrowed argument", expected_origin, tt)
           1
         } else { if ty_borrow_mutable(param_ty) == 1 and actual_is_borrow and ty_borrow_mutable(actual_ty) == 0 {
           typeck_error_maybe(src, expr_diag_pos(arg), "type error: shared resource borrow cannot be forwarded as exclusive")
@@ -6925,9 +7117,9 @@ pub(package) fn check_borrow_call_conflicts(args: i64, nargs: i64, src: i64, pos
   check_borrow_call_conflicts_with_receiver(args, nargs, 0, src, pos)
 }
 
-pub(package) fn check_arg_against_param_mode(arg: i64, param_ty: i64, env: i64, ft: i64, src: i64, tt: i64, pos: i64, allow_direct_continuation_i64: i64) -[Conformance, Diagnose]> i64 {
+pub(package) fn check_arg_against_param_mode_at(arg: i64, param_ty: i64, env: i64, ft: i64, src: i64, tt: i64, pos: i64, allow_direct_continuation_i64: i64, expected_origin: DiagnosticLocation) -[Conformance, Diagnose]> i64 {
   if param_ty == 0 { 0 }
-  else { if ty_is_borrow(param_ty) { check_arg_against_borrow_param(arg, param_ty, env, src, pos) }
+  else { if ty_is_borrow(param_ty) { check_arg_against_borrow_param(arg, param_ty, env, src, pos, expected_origin, tt) }
   else {
     prepare_expr_contextual(arg, param_ty, env, ft, src, tt)
     if ty_tag(param_ty) == 6 {
@@ -6949,11 +7141,11 @@ pub(package) fn check_arg_against_param_mode(arg: i64, param_ty: i64, env: i64, 
         } else { if bound_errors > 0 { bound_errors }
         else { if ty_is_continuation(arg_ty) == 1 {
           if ty_is_continuation(param_ty) == 0 and not (allow_direct_continuation_i64 == 1 and type_is_i64_like(param_ty) == 1) {
-            typeck_error_maybe(src, pos, "type error: argument type mismatch")
+            typeck_report_expr_type_mismatch(src, arg, param_ty, arg_ty, "argument", expected_origin, tt)
             1
           } else { 0 }
         } else { if expr_matches_type_contextual(arg, arg_ty, param_ty, src) != 1 {
-          typeck_error_maybe(src, pos, "type error: argument type mismatch")
+          typeck_report_expr_type_mismatch(src, arg, param_ty, arg_ty, "argument", expected_origin, tt)
           1
         } else { 0 } } } }
       }
@@ -6961,7 +7153,7 @@ pub(package) fn check_arg_against_param_mode(arg: i64, param_ty: i64, env: i64, 
       let arg_ty = synth(arg, env, ft, src, tt)
       if ty_is_continuation(arg_ty) == 1 {
         if ty_is_continuation(param_ty) == 0 and not (allow_direct_continuation_i64 == 1 and type_is_i64_like(param_ty) == 1) {
-          typeck_error_maybe(src, pos, "type error: argument type mismatch")
+          typeck_report_expr_type_mismatch(src, arg, param_ty, arg_ty, "argument", expected_origin, tt)
           1
         } else { 0 }
       } else { if expr_matches_type_contextual(arg, arg_ty, param_ty, src) != 1 {
@@ -6969,7 +7161,7 @@ pub(package) fn check_arg_against_param_mode(arg: i64, param_ty: i64, env: i64, 
         -- the declared parameter type.
         if infer_generic_ctor_result(arg, param_ty, env, ft, src, tt) == 1 and expr_matches_type_contextual(arg, synth(arg, env, ft, src, tt), param_ty, src) == 1 { 0 }
         else {
-          typeck_error_maybe(src, pos, "type error: argument type mismatch")
+          typeck_report_expr_type_mismatch(src, arg, param_ty, arg_ty, "argument", expected_origin, tt)
           1
         }
       } else { 0 } }
@@ -6977,8 +7169,16 @@ pub(package) fn check_arg_against_param_mode(arg: i64, param_ty: i64, env: i64, 
   } }
 }
 
+pub(package) fn check_arg_against_param_mode(arg: i64, param_ty: i64, env: i64, ft: i64, src: i64, tt: i64, pos: i64, allow_direct_continuation_i64: i64) -[Conformance, Diagnose]> i64 {
+  check_arg_against_param_mode_at(arg, param_ty, env, ft, src, tt, pos, allow_direct_continuation_i64, typeck_source_location(src, pos, 1))
+}
+
 pub(package) fn check_arg_against_param(arg: i64, param_ty: i64, env: i64, ft: i64, src: i64, tt: i64, pos: i64) -[Conformance, Diagnose]> i64 {
   check_arg_against_param_mode(arg, param_ty, env, ft, src, tt, pos, 0)
+}
+
+pub(package) fn check_arg_against_param_at(arg: i64, param_ty: i64, env: i64, ft: i64, src: i64, tt: i64, pos: i64, expected_origin: DiagnosticLocation) -[Conformance, Diagnose]> i64 {
+  check_arg_against_param_mode_at(arg, param_ty, env, ft, src, tt, pos, 0, expected_origin)
 }
 
 -- A direct declaration call may preserve an argument's exact record shape by
@@ -6996,19 +7196,23 @@ pub(package) fn typeck_structural_call_match_kind(tt: i64, actual_ty: i64, expec
 }
 
 pub(package) fn check_arg_against_direct_param_mode(arg: i64, param_ty: i64, env: i64, ft: i64, src: i64, tt: i64, pos: i64, allow_direct_continuation_i64: i64) -[Conformance, Diagnose]> i64 {
+  check_arg_against_direct_param_mode_at(arg, param_ty, env, ft, src, tt, pos, allow_direct_continuation_i64, typeck_source_location(src, pos, 1))
+}
+
+pub(package) fn check_arg_against_direct_param_mode_at(arg: i64, param_ty: i64, env: i64, ft: i64, src: i64, tt: i64, pos: i64, allow_direct_continuation_i64: i64, expected_origin: DiagnosticLocation) -[Conformance, Diagnose]> i64 {
   prepare_expr_contextual(arg, param_ty, env, ft, src, tt)
   let actual_ty = synth(arg, env, ft, src, tt)
   if typeck_structural_call_match_kind(tt, actual_ty, param_ty) >= 2 { 0 }
-  else { check_arg_against_param_mode(arg, param_ty, env, ft, src, tt, pos, allow_direct_continuation_i64) }
+  else { check_arg_against_param_mode_at(arg, param_ty, env, ft, src, tt, pos, allow_direct_continuation_i64, expected_origin) }
 }
 
-pub(package) fn check_arg_against_opaque_param(arg: i64, param_ty: i64, env: i64, ft: i64, src: i64, tt: i64, pos: i64) -[Conformance, Diagnose]> i64 {
+pub(package) fn check_arg_against_opaque_param(arg: i64, param_ty: i64, env: i64, ft: i64, src: i64, tt: i64, pos: i64, expected_origin: DiagnosticLocation) -[Conformance, Diagnose]> i64 {
   prepare_expr_contextual(arg, param_ty, env, ft, src, tt)
   let actual_ty = synth(arg, env, ft, src, tt)
   if typeck_structural_call_match_kind(tt, actual_ty, param_ty) >= 2 {
     typeck_error_maybe(src, pos, "type error: structural shape adaptation requires a direct function call")
     1
-  } else { check_arg_against_param(arg, param_ty, env, ft, src, tt, pos) }
+  } else { check_arg_against_param_at(arg, param_ty, env, ft, src, tt, pos, expected_origin) }
 }
 
 pub(package) fn typeck_call_shape_type_args(args: i64, nargs: i64, params: i64, subst: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
@@ -7154,7 +7358,7 @@ pub(package) fn check_intrinsic_raw_offset_args(node: i64, env: i64, ft: i64, sr
     let mut errors = if type_is_unknown_or_any(ptr_ty) { 0 }
     else { if ty_is_ptr(ptr_ty) == 1 { 0 }
     else {
-      typeck_error_maybe(src, expr_diag_pos(ptr_arg), "type error: argument type mismatch")
+      typeck_report_expr_type_mismatch(src, ptr_arg, ty_ptr(ty_any()), ptr_ty, "argument", typeck_source_location(src, node_f1(node), node_f2(node)), tt)
       1
     } }
     errors = errors + check_arg_against_param(off_arg, ty_i64(), env, ft, src, tt, node_f1(node))
@@ -7997,9 +8201,13 @@ pub(package) fn check_qualified_call_declared(node: i64, entry: i64, env: i64, f
     } else { 0 }
     for i in 0..nargs {
       if i < nlist_len(params) {
-        let param_ty = node_f3(nlist_get(params, i))
+        let param = nlist_get(params, i)
+        let param_ty = node_f3(param)
         if param_ty != 0 {
-          errors = errors + check_arg_against_direct_param_mode(nlist_get(args, i), param_ty, env, ft, src, tt, member_ns, 0)
+          errors = errors + check_arg_against_direct_param_mode_at(
+            nlist_get(args, i), param_ty, env, ft, src, tt, member_ns, 0,
+            typeck_source_location(ftypes_entry_source(entry), node_f1(param), node_f2(param))
+          )
         } else { 0 }
       } else { 0 }
     }
@@ -8057,7 +8265,7 @@ pub(package) fn check_ptr_assign(node: i64, env: i64, ft: i64, src: i64, caller_
     else { if type_is_unknown_or_any(val_ty) and ty_contains_opaque(target_ty) == 0 { errors }
     else { if expr_matches_type_contextual(val, val_ty, target_ty, src) == 1 { errors }
     else {
-      typeck_error_maybe(src, expr_diag_pos(val), "type error: pointer assignment type mismatch")
+      typeck_report_expr_type_mismatch(src, val, target_ty, val_ty, "pointer assignment", typeck_source_location(src, expr_diag_pos(ptr), expr_diag_len(ptr)), tt)
       errors + 1
     } } }
   } } }
@@ -8173,7 +8381,7 @@ pub(package) fn check_indexed_set(node: i64, env: i64, ft: i64, src: i64, caller
   if type_is_unknown_or_any(element_ty) or type_is_unknown_or_any(value_ty) { errors }
   else { if expr_matches_type_contextual(value, value_ty, element_ty, src) == 1 { errors }
   else {
-    typeck_error_maybe(src, expr_diag_pos(value), "type error: indexed assignment type mismatch")
+    typeck_report_expr_type_mismatch(src, value, element_ty, value_ty, "indexed assignment", typeck_source_location(src, expr_diag_pos(base), expr_diag_len(base)), tt)
     errors + 1
   } }
 }
@@ -8345,7 +8553,10 @@ pub(package) fn check_record_init_shape(node: i64, env: i64, ft: i64, src: i64, 
               prepare_expr_contextual(value, expected_ty, env, ft, src, tt)
               let value_ty = synth(value, env, ft, src, tt)
               if expr_matches_type_contextual(value, value_ty, expected_ty, src) != 1 {
-                typeck_error(src, node_f1(field), "type error: record field type mismatch")
+                let decl_fields = mem_load64_at(entry, 32)
+                let decl_ns = mem_load64_at(decl_fields, idx * 24)
+                let decl_nl = mem_load64_at(decl_fields, idx * 24 + 8)
+                typeck_report_expr_type_mismatch(src, value, expected_ty, value_ty, "record field", typeck_source_location(entry_src, decl_ns, decl_nl), tt)
                 errors = errors + 1
               } else { errors = errors }
             } else { errors = errors }
@@ -8393,8 +8604,13 @@ pub(package) fn check_record_update_shape(node: i64, env: i64, ft: i64, src: i64
           let expected_ty = type_cycle_maybe_subst(raw_ty, field_subst)
           let value = node_f3(field)
           prepare_expr_contextual(value, expected_ty, env, ft, src, tt)
-          if expr_matches_type_contextual(value, synth(value, env, ft, src, tt), expected_ty, src) != 1 {
-            typeck_error_maybe(src, field_ns, "type error: nominal record update field type mismatch")
+          let value_ty = synth(value, env, ft, src, tt)
+          if expr_matches_type_contextual(value, value_ty, expected_ty, src) != 1 {
+            let field_index = ttable_field_index(entry, entry_src, src, field_ns, field_nl)
+            let decl_fields = mem_load64_at(entry, 32)
+            let decl_ns = if field_index < 0 { 0 } else { mem_load64_at(decl_fields, field_index * 24) }
+            let decl_nl = if field_index < 0 { 0 } else { mem_load64_at(decl_fields, field_index * 24 + 8) }
+            typeck_report_expr_type_mismatch(src, value, expected_ty, value_ty, "record update", typeck_source_location(entry_src, decl_ns, decl_nl), tt)
             errors = errors + 1
           } else {
             let field_hash = record_value_field_hash(field, src)
@@ -8430,6 +8646,7 @@ pub(package) fn check_record_update_shape(node: i64, env: i64, ft: i64, src: i64
 
 pub(package) fn check_call_fn_type(node: i64, fn_ty: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) -[Conformance, Diagnose]> i64 {
   let ns = node_f1(node)
+  let nl = node_f2(node)
   let args = node_f3(node)
   let nargs = node_f4(node)
   let params = ty_f1(fn_ty)
@@ -8437,6 +8654,12 @@ pub(package) fn check_call_fn_type(node: i64, fn_ty: i64, env: i64, ft: i64, src
   let mut errors = check_native_result_abi_ty(src, ns, ty_f2(fn_ty))
   errors = errors + check_arity(nparams, nargs, src, ns)
   let callee_eff = ty_f3(fn_ty)
+  let callee_entry = tenv_find_entry(env, src, ns, nl)
+  let expected_origin = if callee_entry == 0 {
+    typeck_source_location(src, ns, nl)
+  } else {
+    typeck_source_location(tenv_entry_source(callee_entry), tenv_entry_name_start(callee_entry), tenv_entry_name_len(callee_entry))
+  }
   if caller_eff > 0 {
     if callee_eff > 0 {
       if not effect_is_subset_rigid(callee_eff, caller_eff) {
@@ -8447,7 +8670,7 @@ pub(package) fn check_call_fn_type(node: i64, fn_ty: i64, env: i64, ft: i64, src
   } else { errors = errors }
   for i in 0..nargs {
     if i < nparams {
-      errors = errors + check_arg_against_opaque_param(nlist_get(args, i), nlist_get(params, i), env, ft, src, tt, ns)
+      errors = errors + check_arg_against_opaque_param(nlist_get(args, i), nlist_get(params, i), env, ft, src, tt, ns, expected_origin)
     } else { errors = errors }
   }
   errors = errors + check_borrow_call_conflicts(args, nargs, src, ns)
@@ -8456,12 +8679,19 @@ pub(package) fn check_call_fn_type(node: i64, fn_ty: i64, env: i64, ft: i64, src
 
 pub(package) fn check_call_continuation_type(node: i64, cont_ty: i64, env: i64, ft: i64, src: i64, tt: i64) -[Conformance, Diagnose]> i64 {
   let ns = node_f1(node)
+  let nl = node_f2(node)
   let args = node_f3(node)
   let nargs = node_f4(node)
   let mut errors = check_native_result_abi_ty(src, ns, ty_f2(cont_ty))
   errors = errors + check_arity(1, nargs, src, ns)
   if nargs > 0 {
-    errors = errors + check_arg_against_param(nlist_get(args, 0), ty_f1(cont_ty), env, ft, src, tt, ns)
+    let callee_entry = tenv_find_entry(env, src, ns, nl)
+    let expected_origin = if callee_entry == 0 {
+      typeck_source_location(src, ns, nl)
+    } else {
+      typeck_source_location(tenv_entry_source(callee_entry), tenv_entry_name_start(callee_entry), tenv_entry_name_len(callee_entry))
+    }
+    errors = errors + check_arg_against_param_at(nlist_get(args, 0), ty_f1(cont_ty), env, ft, src, tt, ns, expected_origin)
   } else { errors = errors }
   errors
 }
@@ -8486,6 +8716,8 @@ pub(package) fn check_tyvar_method_call(node: i64, env: i64, ft: i64, src: i64, 
   }
   else {
     let params = ttable_lookup_trait_method_params_atom(tt, trait_atom, method_hash)
+    let trait_entry = ttable_find_entry_by_hash_kind(tt, trait_atom_head(trait_atom), 3)
+    let trait_src = if trait_entry == 0 { src } else { ttable_entry_source(trait_entry) }
     let mut errors = 0
     let args = node_f4(node)
     let nargs = nlist_len(args)
@@ -8507,7 +8739,10 @@ pub(package) fn check_tyvar_method_call(node: i64, env: i64, ft: i64, src: i64, 
           -- unsolved type; substitute before checking method arguments.
           let param_ty = ty_subst(node_f3(param), self_subst)
           if param_ty != 0 {
-            errors = errors + check_arg_against_param(nlist_get(args, i), param_ty, env, ft, src, tt, node_f2(node))
+            errors = errors + check_arg_against_param_at(
+              nlist_get(args, i), param_ty, env, ft, src, tt, node_f2(node),
+              typeck_source_location(trait_src, node_f1(param), node_f2(param))
+            )
           } else { errors = errors }
         } else { errors = errors }
       }
@@ -8574,14 +8809,19 @@ pub(package) fn check_method_call(node: i64, env: i64, ft: i64, src: i64, caller
     let expected = if associated { 0 } else { if nparams > 0 { nparams - 1 } else { 0 } }
     errors = errors + check_arity(expected, nargs, src, expr_diag_pos(recv))
     if not associated and nparams > 0 {
-      let raw_self_ty = node_f3(nlist_get(params, 0))
+      let self_param = nlist_get(params, 0)
+      let raw_self_ty = node_f3(self_param)
       let self_ty = if delayed_trait != 0 {
         let self_subst = subst_new()
         subst_add(self_subst, 0 - 1, recv_ty)
         ty_subst(raw_self_ty, self_subst)
       } else { raw_self_ty }
       if ty_is_borrow(self_ty) {
-        errors = errors + check_arg_against_borrow_param(recv, self_ty, env, src, expr_diag_pos(recv))
+        let method_src = if method_decl == 0 { src } else { module_decl_fact_source(method_decl) }
+        errors = errors + check_arg_against_borrow_param(
+          recv, self_ty, env, src, expr_diag_pos(recv),
+          typeck_source_location(method_src, node_f1(self_param), node_f2(self_param)), tt
+        )
       } else { 0 }
     } else { 0 }
     for i in 0..nargs {
@@ -8594,7 +8834,11 @@ pub(package) fn check_method_call(node: i64, env: i64, ft: i64, src: i64, caller
           ty_subst(raw_param_ty, self_subst)
         } else { raw_param_ty }
         if param_ty != 0 {
-          errors = errors + check_arg_against_param(nlist_get(args, i), param_ty, env, ft, src, tt, expr_diag_pos(recv))
+          let method_src = if method_decl == 0 { src } else { module_decl_fact_source(method_decl) }
+          let origin = if method_decl == 0 {
+            typeck_source_location(src, expr_diag_pos(recv), expr_diag_len(recv))
+          } else { typeck_source_location(method_src, node_f1(param), node_f2(param)) }
+          errors = errors + check_arg_against_param_at(nlist_get(args, i), param_ty, env, ft, src, tt, expr_diag_pos(recv), origin)
         } else { errors = errors }
       } else { errors = errors }
     }
@@ -9205,6 +9449,8 @@ pub(package) fn check_handler_clause(clause: i64, handled_eff_hash: i64, env: i6
     errors
   } else {
     let op_params = node_f3(op)
+    let effect_entry = typeck_effect_ref_entry(effect_ref, src, tt)
+    let effect_src = if effect_entry == 0 { src } else { ttable_entry_source(effect_entry) }
     let cont = node_f4(clause)
     let nparams = nlist_len(params)
     let noparams = nlist_len(op_params)
@@ -9233,7 +9479,10 @@ pub(package) fn check_handler_clause(clause: i64, handled_eff_hash: i64, env: i6
       let bind_ty = if ann_ty != 0 {
         if op_ty != 0 {
           if not is_subtype(op_ty, ann_ty) {
-            typeck_error(src, node_f1(param), "type error: argument type mismatch")
+            typeck_report_type_mismatch(
+              src, node_f1(param), node_f2(param), op_ty, ann_ty, "handler parameter",
+              typeck_source_location(effect_src, node_f1(op_param), node_f2(op_param)), tt
+            )
             errors = errors + 1
           } else { errors = errors }
         } else { errors = errors }
@@ -9267,9 +9516,15 @@ pub(package) fn check_handler_clause(clause: i64, handled_eff_hash: i64, env: i6
     -- body types against the handle result, not the operation's return.
     let clause_ret = if cont != 0 { handle_result_ty }
       else { if clause_body_has_resume(cbody) == 1 { expected_ret } else { handle_result_ty } }
-    errors = errors + check_return_values(cbody, clause_env, ft, src, clause_ret, tt)
+    errors = errors + check_return_values_at(
+      cbody, clause_env, ft, src, clause_ret, tt,
+      typeck_source_location(effect_src, node_f1(op), node_f2(op))
+    )
     if not is_subtype(body_ty, clause_ret) {
-      typeck_error(src, handler_clause_op_name_start(clause), "type error: resume type mismatch")
+      typeck_report_expr_type_mismatch(
+        src, cbody, clause_ret, body_ty, "handler clause result",
+        typeck_source_location(effect_src, node_f1(op), node_f2(op)), tt
+      )
       errors = errors + 1
     } else { errors = errors }
     errors
@@ -10144,7 +10399,15 @@ pub(package) fn check_match_arm_type_consistency(arms: i64, n: i64, env: i64, ft
       -- bool and i64 arms form a chain under bool <: i64 and union to i64,
       -- while genuinely unrelated arms (i64 vs str) still error.
       else { if not is_subtype(got, expected) and not is_subtype(expected, got) {
-        typeck_error_maybe(src, pattern_diag_pos(node_f1(arm)), "type error: match arm type mismatch")
+        typeck_report_expr_type_mismatch(
+          src,
+          node_f2(arm),
+          expected,
+          got,
+          "match arm",
+          typeck_source_location(src, expr_diag_pos(node_f2(first_arm)), expr_diag_len(node_f2(first_arm))),
+          tt
+        )
         errors = errors + 1
       } else { errors = errors } } }
     }
@@ -11695,6 +11958,9 @@ pub(package) fn expr_diag_pos(node: i64) -> i64 {
   if tag == 1 { if node_f3(node) > 0 { node_f2(node) } else { 0 } }
   else { if tag == 2 { node_f1(node) }
   else { if tag == 4 { node_f1(node) }
+  else { if tag == 9 { if node_f4(node) > 0 { node_f3(node) } else { 0 } }
+  else { if tag == 54 { node_f1(node) }
+  else { if tag == 24 { if node_f3(node) > 0 { node_f2(node) } else { 0 } }
   else { if tag == 13 { node_f2(node) }
   else { if tag == 59 { node_f3(node) }
   else { if tag == 60 { expr_diag_pos(node_f2(node)) }
@@ -11709,7 +11975,19 @@ pub(package) fn expr_diag_pos(node: i64) -> i64 {
   -- GenericCall: locate at the inner call.
   else { if tag == 36 { expr_diag_pos(node_f2(node)) }
   else { if tag == 58 { node_f4(node) }
-  else { 0 } } } } } } } } } } } } }
+  else { 0 } } } } } } } } } } } } } } } }
+}
+
+pub(package) fn expr_diag_len(node: i64) -> i64 {
+  let tag = node_tag(node)
+  if tag == 1 { if node_f3(node) > 0 { node_f3(node) } else { 1 } }
+  else { if tag == 2 or tag == 4 { node_f2(node) }
+  else { if tag == 9 { if node_f4(node) > 0 { node_f4(node) } else { 1 } }
+  else { if tag == 24 { if node_f3(node) > 0 { node_f3(node) } else { 1 } }
+  else { if tag == 54 { node_f2(node) }
+  else { if tag == 13 { node_f3(node) }
+  else { if tag == 36 { expr_diag_len(node_f2(node)) }
+  else { 1 } } } } } } }
 }
 
 pub(package) fn expr_int_literal_fits_default_i64(node: i64, src: i64) -> i64 {
@@ -11747,7 +12025,8 @@ pub(package) fn check_assign_target(node: i64, env: i64, ft: i64, src: i64, tt: 
   let ns = node_f1(node)
   let nl = node_f2(node)
   let val = node_f3(node)
-  let target_ty = tenv_lookup(env, src, ns, nl)
+  let target_entry = tenv_find_entry(env, src, ns, nl)
+  let target_ty = if target_entry == 0 { 0 } else { tenv_entry_type(target_entry) }
   if target_ty == 0 {
     if module_scope_problem_is_diagnosed(tt, src, src, ns, nl) == 0 {
       typeck_report_unknown_name(src, ns, nl, env, ft, tt, 0)
@@ -11766,13 +12045,21 @@ pub(package) fn check_assign_target(node: i64, env: i64, ft: i64, src: i64, tt: 
     else { if expr_matches_type_contextual(val, val_ty, target_ty, src) == 1 { errors }
     else { if infer_generic_ctor_result(val, target_ty, env, ft, src, tt) == 1 and expr_matches_type_contextual(val, synth(val, env, ft, src, tt), target_ty, src) == 1 { errors }
     else {
-      typeck_error_maybe(src, ns, "type error: assignment type mismatch")
+      typeck_report_expr_type_mismatch(
+        src,
+        val,
+        target_ty,
+        val_ty,
+        "assignment",
+        typeck_source_location(tenv_entry_source(target_entry), tenv_entry_name_start(target_entry), tenv_entry_name_len(target_entry)),
+        tt
+      )
       errors + 1
     } } } }
   }
 }
 
-pub(package) fn check_return_value_type(val: i64, env: i64, ft: i64, src: i64, ret_ty: i64, tt: i64) -[Conformance, Diagnose]> i64 {
+pub(package) fn check_return_value_type_at(val: i64, env: i64, ft: i64, src: i64, ret_ty: i64, tt: i64, expected_origin: DiagnosticLocation) -[Conformance, Diagnose]> i64 {
   if val != 0 { prepare_expr_contextual(val, ret_ty, env, ft, src, tt) } else { 0 }
   let val_ty = if val == 0 { ty_nil() } else { synth(val, env, ft, src, tt) }
   if type_is_unknown_or_any(val_ty) and ty_contains_opaque(ret_ty) == 0 { 0 }
@@ -11780,100 +12067,103 @@ pub(package) fn check_return_value_type(val: i64, env: i64, ft: i64, src: i64, r
   else { if expr_matches_type_contextual(val, val_ty, ret_ty, src) == 1 { 0 }
   else { if infer_generic_ctor_result(val, ret_ty, env, ft, src, tt) == 1 and expr_matches_type_contextual(val, synth(val, env, ft, src, tt), ret_ty, src) == 1 { 0 }
   else {
-    let pos = if val != 0 { expr_diag_pos(val) } else { 0 }
-    typeck_error_maybe(src, pos, "type error: return type mismatch")
+    typeck_report_expr_type_mismatch(src, val, ret_ty, val_ty, "return value", expected_origin, tt)
     1
   } } } }
 }
 
-pub(package) fn check_return_values_list(list: i64, n: i64, env: i64, ft: i64, src: i64, ret_ty: i64, tt: i64) -[Conformance, Diagnose]> i64 {
+pub(package) fn check_return_values_list_at(list: i64, n: i64, env: i64, ft: i64, src: i64, ret_ty: i64, tt: i64, expected_origin: DiagnosticLocation) -[Conformance, Diagnose]> i64 {
   let mut errors = 0
   for i in 0..n {
-    errors = errors + check_return_values(nlist_get(list, i), env, ft, src, ret_ty, tt)
+    errors = errors + check_return_values_at(nlist_get(list, i), env, ft, src, ret_ty, tt, expected_origin)
   }
   errors
 }
 
-pub(package) fn check_return_values(node: i64, env: i64, ft: i64, src: i64, ret_ty: i64, tt: i64) -[Conformance, Diagnose]> i64 {
+pub(package) fn check_return_values_at(node: i64, env: i64, ft: i64, src: i64, ret_ty: i64, tt: i64, expected_origin: DiagnosticLocation) -[Conformance, Diagnose]> i64 {
   if node == 0 { 0 }
   else {
     let tag = node_tag(node)
     match tag {
-      3 -> check_return_values(node_f2(node), env, ft, src, ret_ty, tt) + check_return_values(node_f3(node), env, ft, src, ret_ty, tt)
-      4 -> check_return_values_list(node_f3(node), node_f4(node), env, ft, src, ret_ty, tt)
-      5 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt) + check_return_values(node_f2(node), env, ft, src, ret_ty, tt) + check_return_values(node_f3(node), env, ft, src, ret_ty, tt)
+      3 -> check_return_values_at(node_f2(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f3(node), env, ft, src, ret_ty, tt, expected_origin)
+      4 -> check_return_values_list_at(node_f3(node), node_f4(node), env, ft, src, ret_ty, tt, expected_origin)
+      5 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f2(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f3(node), env, ft, src, ret_ty, tt, expected_origin)
       6 -> {
         let val = node_f3(node)
         let val_ty = synth(val, env, ft, src, tt)
         let new_env = tenv_bind(env, src, node_f1(node), node_f2(node), val_ty)
-        check_return_values(val, env, ft, src, ret_ty, tt) + check_return_values(node_f4(node), new_env, ft, src, ret_ty, tt)
+        check_return_values_at(val, env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f4(node), new_env, ft, src, ret_ty, tt, expected_origin)
       }
-      7 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt) + check_return_values(node_f2(node), env, ft, src, ret_ty, tt)
-      10 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt) + check_return_values(node_f2(node), env, ft, src, ret_ty, tt)
+      7 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f2(node), env, ft, src, ret_ty, tt, expected_origin)
+      10 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f2(node), env, ft, src, ret_ty, tt, expected_origin)
       11 -> {
         let val = node_f3(node)
         let val_ty = synth(val, env, ft, src, tt)
         let new_env = tenv_bind_mut(env, src, node_f1(node), node_f2(node), val_ty)
-        check_return_values(val, env, ft, src, ret_ty, tt) + check_return_values(node_f4(node), new_env, ft, src, ret_ty, tt)
+        check_return_values_at(val, env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f4(node), new_env, ft, src, ret_ty, tt, expected_origin)
       }
-      12 -> check_return_values(node_f3(node), env, ft, src, ret_ty, tt)
-      57 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt) + check_return_values(node_f2(node), env, ft, src, ret_ty, tt)
-      13 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt)
-      59 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt)
-      60 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt) + check_return_values(node_f2(node), env, ft, src, ret_ty, tt)
-      61 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt) + check_return_values(node_f2(node), env, ft, src, ret_ty, tt) + check_return_values(node_f3(node), env, ft, src, ret_ty, tt)
-      62 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt) + check_return_values(node_f2(node), env, ft, src, ret_ty, tt) + check_return_values(node_f3(node), env, ft, src, ret_ty, tt)
+      12 -> check_return_values_at(node_f3(node), env, ft, src, ret_ty, tt, expected_origin)
+      57 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f2(node), env, ft, src, ret_ty, tt, expected_origin)
+      13 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin)
+      59 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin)
+      60 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f2(node), env, ft, src, ret_ty, tt, expected_origin)
+      61 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f2(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f3(node), env, ft, src, ret_ty, tt, expected_origin)
+      62 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f2(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f3(node), env, ft, src, ret_ty, tt, expected_origin)
       14 -> {
         let fields = node_f3(node)
         let nfields = node_f4(node)
         let mut errors = 0
         for i in 0..nfields {
-          errors = errors + check_return_values(node_f3(nlist_get(fields, i)), env, ft, src, ret_ty, tt)
+          errors = errors + check_return_values_at(node_f3(nlist_get(fields, i)), env, ft, src, ret_ty, tt, expected_origin)
         }
         errors
       }
-      63 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt) + check_return_values_list(record_field_expr_nodes(node_f2(node), node_f3(node)), node_f3(node), env, ft, src, ret_ty, tt)
-      58 -> check_return_values_list(node_f1(node), node_f2(node), env, ft, src, ret_ty, tt)
+      63 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_list_at(record_field_expr_nodes(node_f2(node), node_f3(node)), node_f3(node), env, ft, src, ret_ty, tt, expected_origin)
+      58 -> check_return_values_list_at(node_f1(node), node_f2(node), env, ft, src, ret_ty, tt, expected_origin)
       15 -> {
         let scrutinee = node_f1(node)
         let arms = node_f2(node)
         let n = node_f3(node)
         let scr_ty = synth(scrutinee, env, ft, src, tt)
-        let mut errors = check_return_values(scrutinee, env, ft, src, ret_ty, tt)
+        let mut errors = check_return_values_at(scrutinee, env, ft, src, ret_ty, tt, expected_origin)
         for i in 0..n {
           let arm = nlist_get(arms, i)
           let arm_env = bind_match_pattern(node_f1(arm), env, src, scr_ty, tt)
           let guard = node_f3(arm)
-          if guard != 0 { errors = errors + check_return_values(guard, arm_env, ft, src, ret_ty, tt) } else { errors = errors }
-          errors = errors + check_return_values(node_f2(arm), arm_env, ft, src, ret_ty, tt)
+          if guard != 0 { errors = errors + check_return_values_at(guard, arm_env, ft, src, ret_ty, tt, expected_origin) } else { errors = errors }
+          errors = errors + check_return_values_at(node_f2(arm), arm_env, ft, src, ret_ty, tt, expected_origin)
         }
         errors
       }
-      22 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt)
-      25 -> check_return_value_type(node_f1(node), env, ft, src, ret_ty, tt)
-      26 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt)
+      22 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin)
+      25 -> check_return_value_type_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin)
+      26 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin)
       29 -> 0
-      32 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt) + check_return_values_list(node_f4(node), nlist_len(node_f4(node)), env, ft, src, ret_ty, tt)
-      33 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt)
-      35 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt)
+      32 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_list_at(node_f4(node), nlist_len(node_f4(node)), env, ft, src, ret_ty, tt, expected_origin)
+      33 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin)
+      35 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin)
       36 -> {
         let call_node = node_f2(node)
-        check_return_values_list(generic_call_inner_args(call_node), generic_call_inner_arg_count(call_node), env, ft, src, ret_ty, tt)
+        check_return_values_list_at(generic_call_inner_args(call_node), generic_call_inner_arg_count(call_node), env, ft, src, ret_ty, tt, expected_origin)
       }
-      37 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt)
-      41 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt) + check_return_values_list(node_f3(node), nlist_len(node_f3(node)), env, ft, src, ret_ty, tt)
-      45 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt)
-      46 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt) + check_return_values(node_f2(node), env, ft, src, ret_ty, tt)
+      37 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin)
+      41 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_list_at(node_f3(node), nlist_len(node_f3(node)), env, ft, src, ret_ty, tt, expected_origin)
+      45 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin)
+      46 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f2(node), env, ft, src, ret_ty, tt, expected_origin)
       47 -> {
         let loop_env = tenv_bind(env, src, node_f1(node), node_f2(node), for_iter_item_type(node, env, ft, src, tt))
-        check_return_values(node_f3(node), env, ft, src, ret_ty, tt) + check_return_values(node_f4(node), loop_env, ft, src, ret_ty, tt)
+        check_return_values_at(node_f3(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f4(node), loop_env, ft, src, ret_ty, tt, expected_origin)
       }
-      48 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt)
-      49 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt)
-      52 -> check_return_values(node_f1(node), env, ft, src, ret_ty, tt) + check_return_values(node_f2(node), env, ft, src, ret_ty, tt)
+      48 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin)
+      49 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin)
+      52 -> check_return_values_at(node_f1(node), env, ft, src, ret_ty, tt, expected_origin) + check_return_values_at(node_f2(node), env, ft, src, ret_ty, tt, expected_origin)
       _ -> 0
     }
   }
+}
+
+pub(package) fn check_return_values(node: i64, env: i64, ft: i64, src: i64, ret_ty: i64, tt: i64) -[Conformance, Diagnose]> i64 {
+  check_return_values_at(node, env, ft, src, ret_ty, tt, DiagnosticLocationNone)
 }
 
 pub(package) fn unique_name_matches(use_src: i64, use_ns: i64, use_nl: i64, bind_src: i64, bind_ns: i64, bind_nl: i64) -> i64 {
@@ -12514,7 +12804,15 @@ pub(package) fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i
             if infer_generic_ctor_result(val, ann_ty, env, ft, src, tt) == 1 and expr_matches_type_contextual(val, synth(val, env, ft, src, tt), ann_ty, src) == 1 {
               errors = errors
             } else {
-              typeck_error_maybe(src, node_f1(inner), "type error: value does not match let type annotation")
+              typeck_report_expr_type_mismatch(
+                src,
+                val,
+                ann_ty,
+                val_ty,
+                "type annotation",
+                typeck_source_location(src, node_f1(inner), node_f2(inner)),
+                tt
+              )
               errors = errors + 1
             }
           } else { errors = errors }
@@ -13706,7 +14004,10 @@ pub(package) fn check_generic_call_post_args(node: i64, env: i64, ft: i64, src: 
           let param_ty = node_f3(param)
           if param_ty != 0 {
             let subst_ty = ty_subst(param_ty, s)
-            errors = errors + check_arg_against_direct_param_mode(nlist_get(call_args, pi), subst_ty, env, ft, src, tt, ns, 0)
+            errors = errors + check_arg_against_direct_param_mode_at(
+              nlist_get(call_args, pi), subst_ty, env, ft, src, tt, ns, 0,
+              typeck_source_location(ftypes_entry_source(entry), node_f1(param), node_f2(param))
+            )
           } else { errors = errors }
         } else { errors = errors }
       }
@@ -13722,9 +14023,13 @@ pub(package) fn check_generic_call_post_args(node: i64, env: i64, ft: i64, src: 
     errors = errors + check_arity(nparams, nargs, src, ns)
     for pi in 0..nargs {
       if pi < nparams {
-        let param_ty = node_f3(nlist_get(params, pi))
+        let param = nlist_get(params, pi)
+        let param_ty = node_f3(param)
         if param_ty != 0 {
-          errors = errors + check_arg_against_direct_param_mode(nlist_get(call_args, pi), param_ty, env, ft, src, tt, ns, 0)
+          errors = errors + check_arg_against_direct_param_mode_at(
+            nlist_get(call_args, pi), param_ty, env, ft, src, tt, ns, 0,
+            typeck_source_location(ftypes_entry_source(entry), node_f1(param), node_f2(param))
+          )
         } else { 0 }
       } else { 0 }
     }
@@ -13890,6 +14195,8 @@ pub(package) fn check_call_args_declared(node: i64, params: i64, env: i64, ft: i
   let args = node_f3(node)
   let nargs = node_f4(node)
   let nparams = nlist_len(params)
+    let callee_entry = ftypes_find(ft, src, ns, nl)
+    let callee_src = if callee_entry == 0 { src } else { ftypes_entry_source(callee_entry) }
     let mut errors = 0
     errors = errors + check_generator_i64_new_shape(node, env, ft, src)
     errors = errors + check_arity(nparams, nargs, src, ns)
@@ -13909,7 +14216,10 @@ pub(package) fn check_call_args_declared(node: i64, params: i64, env: i64, ft: i
         let param_ty = node_f3(param)
         if param_ty != 0 {
           let allow_direct_continuation_i64 = continuation_call_arg_accepts_direct(ft, src, ns, nl, i)
-          errors = errors + check_arg_against_direct_param_mode(nlist_get(args, i), param_ty, env, ft, src, tt, ns, allow_direct_continuation_i64)
+          errors = errors + check_arg_against_direct_param_mode_at(
+            nlist_get(args, i), param_ty, env, ft, src, tt, ns, allow_direct_continuation_i64,
+            typeck_source_location(callee_src, node_f1(param), node_f2(param))
+          )
         } else { errors = errors }
       } else { errors = errors }
     }
@@ -15738,12 +16048,23 @@ pub(package) fn check_fn(fn_node: i64, ft: i64, src: i64, tt: i64) -[Conformance
     errors = errors + check_unique_param_usage(params, nparams, body, src)
     errors = errors + check_unique_linear_expr(body, env, ft, src, tt)
   } else { errors = errors }
-  errors = errors + check_return_values(body, env, ft, src, ret_ty, tt)
+  errors = errors + check_return_values_at(
+    body, env, ft, src, ret_ty, tt,
+    typeck_source_location(src, node_f1(inner), node_f2(inner))
+  )
   -- Check return type: body type must be subtype of declared return type
   -- (the inference pre-pass above already resolved result-position ctors).
   if type_is_unknown_or_any(body_ty) and ty_contains_opaque(ret_ty) == 0 { errors = errors }
   else { if expr_matches_type_contextual(body, body_ty, ret_ty, src) != 1 {
-    typeck_error_maybe(src, node_f1(inner), "type error: return type mismatch")
+    typeck_report_expr_type_mismatch(
+      src,
+      body,
+      ret_ty,
+      body_ty,
+      "return value",
+      typeck_source_location(src, node_f1(inner), node_f2(inner)),
+      tt
+    )
     errors = errors + 1
   } else { errors = errors } }
   -- Restore previous function's tparams
