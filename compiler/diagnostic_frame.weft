@@ -1,0 +1,304 @@
+-- compiler/diagnostic_frame.weft -- bounded, source-aware diagnostic rails
+
+use compiler/lib.{*}
+use compiler/source_position.{*}
+use compiler/type_registry.{*}
+use runtime/alloc.{alloc_words}
+use runtime/memory.{*}
+use runtime/syscall.{*}
+use stdlib/diagnostic_type.{*}
+
+pub(package) type DiagnosticFrameSource {
+  DiagnosticFrameSourceMissing,
+  DiagnosticFrameSourceKnown(i64, i64, i64, i64)
+}
+
+pub(package) fn diagnostic_frame_source(tt: i64, source: DiagnosticSource) -> DiagnosticFrameSource {
+  let entry = match source {
+    DiagnosticSourceBuffer(src) -> ttable_find_source_buffer_entry(tt, src)
+    DiagnosticSourceNamed(name) -> ttable_find_source_path_entry(tt, __str_ptr(name), __str_len(name))
+    DiagnosticSourceUnknown -> 0
+  }
+  if entry == 0 { DiagnosticFrameSourceMissing }
+  else {
+    DiagnosticFrameSourceKnown(
+      mem_load64_at(entry, 0),
+      mem_load64_at(entry + 8, 0),
+      mem_load64_at(entry + 16, 0),
+      mem_load64_at(entry + 24, 0)
+    )
+  }
+}
+
+pub(package) fn diagnostic_frame_clamp(value: i64, low: i64, high: i64) -> i64 {
+  if value < low { low } else { if value > high { high } else { value } }
+}
+
+pub(package) fn diagnostic_frame_spaces(count: i64) -> i64 {
+  let mut i = 0
+  while i < count { eprint(" ") i = i + 1 }
+  0
+}
+
+pub(package) fn diagnostic_frame_digits(value: i64) -> i64 {
+  if value < 10 { 1 } else { 1 + diagnostic_frame_digits(value / 10) }
+}
+
+pub(package) fn diagnostic_frame_hex_digit(value: i64) -> i64 {
+  let byte = if value < 10 { 48 + value } else { 55 + value }
+  let out = alloc_words(1)
+  mem_store8_at(out, 0, byte)
+  sys_write(2, out, 1)
+}
+
+pub(package) fn diagnostic_frame_hex(value: i64) -> i64 {
+  if value >= 16 { diagnostic_frame_hex(value / 16) } else { 0 }
+  diagnostic_frame_hex_digit(value - value / 16 * 16)
+}
+
+pub(package) fn diagnostic_frame_hex_byte(value: i64) -> i64 {
+  diagnostic_frame_hex_digit(value / 16)
+  diagnostic_frame_hex_digit(value - value / 16 * 16)
+}
+
+-- Never reproduce terminal-control source invisibly in a diagnostic. These
+-- are the UAX #9 formatting controls plus Unicode line separators and BOM.
+pub(package) fn diagnostic_frame_scalar_is_escaped(scalar: i64) -> i64 {
+  if scalar >= 128 and scalar <= 159 { 1 }
+  else { if scalar == 1564 or scalar == 8206 or scalar == 8207 { 1 }
+  else { if scalar >= 8232 and scalar <= 8238 { 1 }
+  else { if scalar >= 8294 and scalar <= 8297 { 1 }
+  else { if scalar == 65279 { 1 } else { 0 } } } } }
+}
+
+pub(package) fn diagnostic_frame_scalar_escape_width(scalar: i64) -> i64 {
+  -- "\\u{" + at least one hexadecimal digit + "}"
+  4 + if scalar < 16 { 1 }
+    else { if scalar < 256 { 2 }
+    else { if scalar < 4096 { 3 }
+    else { if scalar < 65536 { 4 }
+    else { if scalar < 1048576 { 5 } else { 6 } } } } }
+}
+
+-- Width here intentionally follows Weft's documented scalar-column contract,
+-- with deterministic expansion for tabs and visible escapes. Terminal-cell
+-- and emoji-presentation policy is a separately named Unicode concern.
+pub(package) fn diagnostic_frame_unit_width(src: i64, n: i64, pos: i64, column: i64) -> i64 {
+  let byte = mem_load8_at(src, pos)
+  if byte == 9 { 4 - column / 4 * 4 }
+  else { if byte < 32 or byte == 127 { 4 }
+  else {
+    let width = source_position_utf8_width(src, n, pos)
+    if width < 0 { 4 }
+    else {
+      let scalar = source_position_utf8_scalar(src, n, pos)
+      if diagnostic_frame_scalar_is_escaped(scalar) == 1 { diagnostic_frame_scalar_escape_width(scalar) } else { 1 }
+    }
+  } }
+}
+
+pub(package) fn diagnostic_frame_next_offset(src: i64, n: i64, pos: i64) -> i64 {
+  let width = source_position_utf8_width(src, n, pos)
+  if width < 0 { pos + 1 } else { pos + width }
+}
+
+pub(package) fn diagnostic_frame_width(src: i64, n: i64, start: i64, end: i64, initial_column: i64) -> i64 {
+  let mut pos = start
+  let mut column = initial_column
+  while pos < end {
+    column = column + diagnostic_frame_unit_width(src, n, pos, column)
+    pos = diagnostic_frame_next_offset(src, n, pos)
+  }
+  column - initial_column
+}
+
+-- Return the last scalar boundary whose rendered column does not exceed the
+-- target. A tab or escaped control is never split merely to satisfy clipping.
+pub(package) fn diagnostic_frame_offset_at_column(src: i64, n: i64, start: i64, end: i64, target: i64) -> i64 {
+  let mut actual = start
+  let mut actual_column = 0
+  let mut done = 0
+  while actual < end and done == 0 {
+    let width = diagnostic_frame_unit_width(src, n, actual, actual_column)
+    if actual_column + width > target { done = 1 }
+    else {
+      actual_column = actual_column + width
+      actual = diagnostic_frame_next_offset(src, n, actual)
+    }
+  }
+  actual
+}
+
+pub(package) fn diagnostic_frame_render_unit(src: i64, n: i64, pos: i64, column: i64) -> i64 {
+  let byte = mem_load8_at(src, pos)
+  if byte == 9 {
+    diagnostic_frame_spaces(4 - column / 4 * 4)
+  } else { if byte < 32 or byte == 127 {
+    eprint("\\x")
+    diagnostic_frame_hex_byte(byte)
+  } else {
+    let width = source_position_utf8_width(src, n, pos)
+    if width < 0 {
+      eprint("\\x")
+      diagnostic_frame_hex_byte(byte)
+    } else {
+      let scalar = source_position_utf8_scalar(src, n, pos)
+      if diagnostic_frame_scalar_is_escaped(scalar) == 1 {
+        eprint("\\u{")
+        diagnostic_frame_hex(scalar)
+        eprint("}")
+      } else { sys_write(2, src + pos, width) }
+    }
+  } }
+}
+
+pub(package) fn diagnostic_frame_render_segment(src: i64, n: i64, start: i64, end: i64, initial_column: i64) -> i64 {
+  let mut pos = start
+  let mut column = initial_column
+  while pos < end {
+    let width = diagnostic_frame_unit_width(src, n, pos, column)
+    diagnostic_frame_render_unit(src, n, pos, column)
+    column = column + width
+    pos = diagnostic_frame_next_offset(src, n, pos)
+  }
+  column - initial_column
+}
+
+pub(package) fn diagnostic_frame_line_start(src: i64, n: i64, offset: i64) -> i64 {
+  let mut pos = diagnostic_frame_clamp(offset, 0, n)
+  while pos > 0 and mem_load8_at(src, pos - 1) != 10 and mem_load8_at(src, pos - 1) != 13 { pos = pos - 1 }
+  pos
+}
+
+pub(package) fn diagnostic_frame_line_end(src: i64, n: i64, offset: i64) -> i64 {
+  let mut pos = diagnostic_frame_clamp(offset, 0, n)
+  while pos < n and mem_load8_at(src, pos) != 10 and mem_load8_at(src, pos) != 13 { pos = pos + 1 }
+  pos
+}
+
+pub(package) fn diagnostic_frame_render_gutter(gutter: i64, line_number: i64) -> i64 {
+  diagnostic_frame_spaces(gutter - diagnostic_frame_digits(line_number))
+  eprint_i(line_number)
+  eprint(" | ")
+}
+
+pub(package) fn diagnostic_frame_render_marker_gutter(gutter: i64) -> i64 {
+  diagnostic_frame_spaces(gutter)
+  eprint(" | ")
+}
+
+pub(package) fn diagnostic_frame_render_line(
+  src: i64,
+  n: i64,
+  line_start: i64,
+  line_end: i64,
+  line_number: i64,
+  gutter: i64,
+  mark_start: i64,
+  mark_end: i64,
+  label: str
+) -> i64 {
+  let line_width = diagnostic_frame_width(src, n, line_start, line_end, 0)
+  let start_width = diagnostic_frame_width(src, n, line_start, mark_start, 0)
+  let end_width = diagnostic_frame_width(src, n, line_start, mark_end, 0)
+  let max_width = 100
+  let desired_left = if start_width > 24 { start_width - 24 } else { 0 }
+  let mut left_column = if line_width > max_width { desired_left } else { 0 }
+  if left_column + max_width > line_width { left_column = if line_width > max_width { line_width - max_width } else { 0 } } else { 0 }
+  let window_start = diagnostic_frame_offset_at_column(src, n, line_start, line_end, left_column)
+  let actual_left = diagnostic_frame_width(src, n, line_start, window_start, 0)
+  let window_end = if line_width - actual_left > max_width {
+    diagnostic_frame_offset_at_column(src, n, line_start, line_end, actual_left + max_width)
+  } else { line_end }
+  let clipped_left = if window_start > line_start { 1 } else { 0 }
+  let clipped_right = if window_end < line_end { 1 } else { 0 }
+
+  diagnostic_frame_render_gutter(gutter, line_number)
+  if clipped_left == 1 { eprint("...") } else { 0 }
+  diagnostic_frame_render_segment(src, n, window_start, window_end, actual_left)
+  if clipped_right == 1 { eprint("...") } else { 0 }
+  eprint("\n")
+
+  diagnostic_frame_render_marker_gutter(gutter)
+  if clipped_left == 1 { diagnostic_frame_spaces(3) } else { 0 }
+  let visible_start = if mark_start < window_start { window_start } else { mark_start }
+  let visible_end = if mark_end > window_end { window_end } else { mark_end }
+  diagnostic_frame_spaces(diagnostic_frame_width(src, n, window_start, visible_start, actual_left))
+  let marked_width = if mark_start == mark_end { 1 }
+    else { diagnostic_frame_width(src, n, visible_start, visible_end, actual_left + diagnostic_frame_width(src, n, window_start, visible_start, actual_left)) }
+  let caret_width = if marked_width < 1 { 1 } else { marked_width }
+  let mut i = 0
+  while i < caret_width { eprint(if i == 0 { "^" } else { "~" }) i = i + 1 }
+  if __str_len(label) > 0 { eprint(" ") eprint(label) } else { 0 }
+  eprint("\n")
+}
+
+pub(package) fn diagnostic_frame_render_ellipsis(gutter: i64) -> i64 {
+  diagnostic_frame_spaces(if gutter > 3 { gutter - 3 } else { 0 })
+  eprint("... | ...\n")
+}
+
+pub(package) fn diagnostic_frame_render_known(src: i64, n: i64, start: i64, end: i64, label: str) -> i64 {
+  let safe_start = diagnostic_frame_clamp(start, 0, n)
+  let safe_end = diagnostic_frame_clamp(if end < safe_start { safe_start } else { end }, safe_start, n)
+  let last_offset = if safe_end > safe_start { safe_end - 1 } else { safe_start }
+  let first_position = source_position_at(src, n, safe_start)
+  let last_position = source_position_at(src, n, last_offset)
+  let first_line = if source_position_line0(first_position) < 0 { 0 } else { source_position_line0(first_position) }
+  let last_line = if source_position_line0(last_position) < first_line { first_line } else { source_position_line0(last_position) }
+  let line_count = last_line - first_line + 1
+  let gutter = diagnostic_frame_digits(last_line + 1)
+  let mut line_start = diagnostic_frame_line_start(src, n, safe_start)
+  let mut line_index = 0
+  let mut ellipsis_rendered = 0
+  eprint("  |\n")
+  while line_index < line_count {
+    let line_end = diagnostic_frame_line_end(src, n, line_start)
+    let should_render = if line_count <= 4 { 1 }
+      else { if line_index < 2 or line_index >= line_count - 2 { 1 } else { 0 } }
+    if should_render == 1 {
+      let mark_start = if line_index == 0 { safe_start } else { line_start }
+      let mark_end = if line_index == line_count - 1 { safe_end } else { line_end }
+      let line_label = if line_index == line_count - 1 { label } else { "" }
+      diagnostic_frame_render_line(src, n, line_start, line_end, first_line + line_index + 1, gutter, mark_start, mark_end, line_label)
+    } else { if ellipsis_rendered == 0 {
+      diagnostic_frame_render_ellipsis(gutter)
+      ellipsis_rendered = 1
+    } else { 0 } }
+    let newline_width = source_position_is_newline_at(src, n, line_end)
+    line_start = line_end + if newline_width > 0 { newline_width } else { 0 }
+    line_index = line_index + 1
+  }
+  0
+}
+
+pub(package) fn diagnostic_frame_render_prefix(tt: i64, location: DiagnosticLocation) -> i64 {
+  match location {
+    DiagnosticLocationNone -> 0
+    DiagnosticSourceRange(source, start, end) -> match diagnostic_frame_source(tt, source) {
+      DiagnosticFrameSourceKnown(src, n, path_ptr, path_len) -> {
+        if path_len > 0 { sys_write(2, path_ptr, path_len) eprint(": ") } else { 0 }
+        let position = source_position_at(src, n, diagnostic_frame_clamp(start, 0, n))
+        let line0 = source_position_line0(position)
+        let col0 = source_position_scalar_column0(position)
+        eprint("line ") eprint_i(if line0 < 0 { 1 } else { line0 + 1 })
+        eprint(", col ") eprint_i(if col0 < 0 { 1 } else { col0 + 1 }) eprint(": ")
+      }
+      DiagnosticFrameSourceMissing -> match source {
+        DiagnosticSourceUnknown -> 0
+        DiagnosticSourceBuffer(src) -> if start >= 0 { eprint_span(src, start) } else { 0 }
+        DiagnosticSourceNamed(name) -> { eprint(name) eprint(": ") }
+      }
+    }
+  }
+}
+
+pub(package) fn diagnostic_frame_render_location(tt: i64, location: DiagnosticLocation, label: str) -> i64 {
+  match location {
+    DiagnosticLocationNone -> 0
+    DiagnosticSourceRange(source, start, end) -> match diagnostic_frame_source(tt, source) {
+      DiagnosticFrameSourceMissing -> 0
+      DiagnosticFrameSourceKnown(src, n, path_ptr, path_len) -> diagnostic_frame_render_known(src, n, start, end, label)
+    }
+  }
+}
