@@ -101,7 +101,7 @@ if [ "${1:-}" = "__worker" ]; then
     echo "fail" > "$jobf.meta"
     exit 0
   fi
-  match_count=$(echo "$out" | grep -c "$pattern" || true)
+  match_count=$(echo "$out" | grep -F -c "$pattern" || true)
   exact_errors=1
   if [ -n "$expected_errors" ] && ! echo "$out" | grep -q "check: .* $expected_errors errors"; then exact_errors=0; fi
   if [ "$match_count" -gt 0 ] && [ "$exact_errors" -eq 1 ]; then
@@ -134,30 +134,30 @@ check_rejects() {
   printf '%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${4:-}" > "$jf"
 }
 
-check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" "type error: argument type mismatch"
+check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -[Log]> i64`'
 check_rejects "deep_release_mask_overflow_record" "test/negative/deep_release_mask_overflow_record.weft" "type error: aggregate field may require release beyond 16-word mask"
 check_rejects "deep_release_mask_overflow_variant_closure" "test/negative/deep_release_mask_overflow_variant_closure.weft" "type error: aggregate field may require release beyond 16-word mask"
 check_rejects "deep_release_mask_overflow_variant_array" "test/negative/deep_release_mask_overflow_variant_array.weft" "type error: aggregate field may require release beyond 16-word mask"
 check_rejects "deep_release_mask_overflow_weak" "test/negative/deep_release_mask_overflow_weak.weft" "type error: aggregate field may require release beyond 16-word mask"
 check_rejects "deep_release_mask_overflow_generic" "test/negative/deep_release_mask_overflow_generic.weft" "type error: aggregate field may require release beyond 16-word mask"
-check_rejects "par_map_scoped_effectful" "test/negative/par_map_scoped_effectful.weft" "type error: argument type mismatch"
-check_rejects "par_pool_submit_effectful" "test/negative/par_pool_submit_effectful.weft" "type error: argument type mismatch"
+check_rejects "par_map_scoped_effectful" "test/negative/par_map_scoped_effectful.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -[Log]> i64`'
+check_rejects "par_pool_submit_effectful" "test/negative/par_pool_submit_effectful.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -[Log]> i64`'
 check_rejects "par_prepared_submit_public" "test/negative/par_prepared_submit_public.weft" "type error: prepared Par submission is compiler-internal"
 check_rejects "generic_par_task_double_await" "test/negative/generic_par_task_double_await.weft" "type error: unique value used more than once"
 check_rejects "generic_par_task_non_sendable_result" "test/negative/generic_par_task_non_sendable_result.weft" "type error: type is not Sendable"
 check_rejects "generic_par_task_non_sendable_capture" "test/negative/generic_par_task_non_sendable_capture.weft" "type error: closure capture is not Sendable across scoped Par"
-check_rejects "generic_par_task_type_mismatch" "test/negative/generic_par_task_type_mismatch.weft" "type error: argument type mismatch"
+check_rejects "generic_par_task_type_mismatch" "test/negative/generic_par_task_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `unique ParTask<str>`, found `unique ParTask<i64>`'
 check_rejects "generic_par_task_forged" "test/negative/generic_par_task_forged.weft" "type error: ParTask is a sealed runtime token and cannot be constructed"
 check_rejects "generator_new_non_literal_producer" "test/negative/generator_new_non_literal_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_new_nonzero_arg_producer" "test/negative/generator_new_nonzero_arg_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_new_function_with_arg" "test/negative/generator_new_function_with_arg.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_new_mutable_closure_producer" "test/negative/generator_new_mutable_closure_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
-check_rejects "generator_new_return_type_mismatch" "test/negative/generator_new_return_type_mismatch.weft" "type error: return type mismatch"
+check_rejects "generator_new_return_type_mismatch" "test/negative/generator_new_return_type_mismatch.weft" 'error[E1002]: lambda return value type mismatch: expected `i64`, found `str`'
 check_rejects "generator_yield_unhandled" "test/negative/generator_yield_unhandled.weft" "type error: effect not available in caller"
 check_rejects "generator_generic_new_non_literal_producer" "test/negative/generator_generic_new_non_literal_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_generic_new_function_with_arg" "test/negative/generator_generic_new_function_with_arg.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_generic_new_mutable_closure_producer" "test/negative/generator_generic_new_mutable_closure_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
-check_rejects "generator_generic_new_return_type_mismatch" "test/negative/generator_generic_new_return_type_mismatch.weft" "type error: return type mismatch"
+check_rejects "generator_generic_new_return_type_mismatch" "test/negative/generator_generic_new_return_type_mismatch.weft" 'error[E1002]: lambda return value type mismatch: expected `i64`, found `str`'
 check_rejects "generator_generic_yield_unhandled" "test/negative/generator_generic_yield_unhandled.weft" "type error: effect not available in caller"
 check_rejects "unhandled_effect_perform" "test/negative/unhandled_effect_perform.weft" "type error: effect not available in caller"
 check_rejects "unhandled_alloc_effect" "test/negative/unhandled_alloc_effect.weft" "type error: effect not available in caller"
@@ -202,9 +202,9 @@ check_rejects "unsafe_wrapper_must_discharge" "test/negative/unsafe_wrapper_must
 check_rejects "unsafe_raw_offset_wrapper_requires_effect" "test/negative/unsafe_raw_offset_wrapper_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_transmute_wrapper_requires_effect" "test/negative/unsafe_transmute_wrapper_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_int_to_ptr_wrapper_requires_effect" "test/negative/unsafe_int_to_ptr_wrapper_requires_effect.weft" "type error: effect not available in caller"
-check_rejects "unsafe_raw_offset_pointer_arg_required" "test/negative/unsafe_raw_offset_pointer_arg_required.weft" "type error: argument type mismatch"
-check_rejects "unsafe_raw_offset_wrapper_pointer_arg_required" "test/negative/unsafe_raw_offset_wrapper_pointer_arg_required.weft" "type error: argument type mismatch"
-check_rejects "unsafe_int_to_ptr_addr_mismatch" "test/negative/unsafe_int_to_ptr_addr_mismatch.weft" "type error: argument type mismatch"
+check_rejects "unsafe_raw_offset_pointer_arg_required" "test/negative/unsafe_raw_offset_pointer_arg_required.weft" 'error[E1002]: argument type mismatch: expected `*any`, found `i64`'
+check_rejects "unsafe_raw_offset_wrapper_pointer_arg_required" "test/negative/unsafe_raw_offset_wrapper_pointer_arg_required.weft" 'error[E1002]: argument type mismatch: expected `*i64`, found `i64`'
+check_rejects "unsafe_int_to_ptr_addr_mismatch" "test/negative/unsafe_int_to_ptr_addr_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "unsafe_transmute_arity_mismatch" "test/negative/unsafe_transmute_arity_mismatch.weft" "type error: arity mismatch"
 check_rejects "unsafe_runtime_state_wrapper_requires_effect" "test/negative/unsafe_runtime_state_wrapper_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "unsafe_process_run_command_requires_effect" "test/negative/unsafe_process_run_command_requires_effect.weft" "type error: effect not available in caller"
@@ -215,23 +215,23 @@ check_rejects "unhandled_effect_in_while" "test/negative/unhandled_effect_in_whi
 check_rejects "unhandled_effect_in_defer" "test/negative/unhandled_effect_in_defer.weft" "type error: effect not available in caller"
 check_rejects "unhandled_try_effect" "test/negative/unhandled_try_effect.weft" "type error: effect atom not available in caller"
 check_rejects "unhandled_optional_chain_effect" "test/negative/unhandled_optional_chain_effect.weft" "type error: effect atom not available in caller"
-check_rejects "effect_perform_arg_mismatch" "test/negative/effect_perform_arg_mismatch.weft" "type error: argument type mismatch"
+check_rejects "effect_perform_arg_mismatch" "test/negative/effect_perform_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "effectful_lambda_to_pure_fn" "test/negative/effectful_lambda_to_pure_fn.weft" "type error: effect not available in caller"
 check_rejects "fusion_effectful_map_callback" "test/negative/fusion_effectful_map_callback.weft" "type error: effect not available in caller"
 check_rejects "fusion_effectful_filter_callback" "test/negative/fusion_effectful_filter_callback.weft" "type error: effect not available in caller"
-check_rejects "fusion_alloc_effect_callback" "test/negative/fusion_alloc_effect_callback.weft" "type error: argument type mismatch"
+check_rejects "fusion_alloc_effect_callback" "test/negative/fusion_alloc_effect_callback.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -[Alloc]> i64`'
 check_rejects "iter_fold_effectful_callback" "test/negative/iter_fold_effectful_callback.weft" "type error: effect not available in caller"
 check_rejects "iter_map_collect_effectful_callback" "test/negative/iter_map_collect_effectful_callback.weft" "type error: effect not available in caller"
 check_rejects "iter_map_effectful_callback" "test/negative/iter_map_effectful_callback.weft" "type error: effect not available in caller"
 check_rejects "iter_filter_effectful_callback" "test/negative/iter_filter_effectful_callback.weft" "type error: effect not available in caller"
 check_rejects "effectful_lambda_to_pure_effect_op" "test/negative/effectful_lambda_to_pure_effect_op.weft" "type error: effect not available in caller"
 check_rejects "function_value_effect_unavailable" "test/negative/function_value_effect_unavailable.weft" "type error: effect not available in caller"
-check_rejects "function_value_arg_mismatch" "test/negative/function_value_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "function_value_return_mismatch" "test/negative/function_value_return_mismatch.weft" "type error: return type mismatch"
+check_rejects "function_value_arg_mismatch" "test/negative/function_value_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
+check_rejects "function_value_return_mismatch" "test/negative/function_value_return_mismatch.weft" 'error[E1002]: return value type mismatch: expected `i64`, found `str`'
 check_rejects "method_call_arity_too_few" "test/negative/method_call_arity_too_few.weft" "type error: arity mismatch"
 check_rejects "method_call_arity_too_many" "test/negative/method_call_arity_too_many.weft" "type error: arity mismatch"
-check_rejects "method_call_arg_mismatch" "test/negative/method_call_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "method_call_trait_arg_mismatch" "test/negative/method_call_trait_arg_mismatch.weft" "type error: argument type mismatch"
+check_rejects "method_call_arg_mismatch" "test/negative/method_call_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
+check_rejects "method_call_trait_arg_mismatch" "test/negative/method_call_trait_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "method_call_effect_unavailable" "test/negative/method_call_effect_unavailable.weft" "type error: effect not available in caller"
 check_rejects "method_call_unknown" "test/negative/method_call_unknown.weft" "type error: unknown method"
 check_rejects "method_call_trait_unknown" "test/negative/method_call_trait_unknown.weft" "type error: unknown method"
@@ -273,31 +273,31 @@ check_rejects "default_impl_effect_mismatch" "test/negative/default_impl_effect_
 check_rejects "associated_function_value_call" "test/negative/associated_function_value_call.weft" "type error: associated function must be called on a type"
 check_rejects "associated_function_arity_mismatch" "test/negative/associated_function_arity_mismatch.weft" "type error: arity mismatch"
 check_rejects "instance_method_type_call" "test/negative/instance_method_type_call.weft" "type error: instance method must be called on a value"
-check_rejects "option_unwrap_or_type_mismatch" "test/negative/option_unwrap_or_type_mismatch.weft" "type error: argument type mismatch"
-check_rejects "result_unwrap_or_type_mismatch" "test/negative/result_unwrap_or_type_mismatch.weft" "type error: argument type mismatch"
-check_rejects "list_prepend_type_mismatch" "test/negative/list_prepend_type_mismatch.weft" "type error: argument type mismatch"
-check_rejects "vector_cross_type_push" "test/negative/vector_cross_type_push.weft" "type error: argument type mismatch"
-check_rejects "persistent_vector_cross_type_push" "test/negative/persistent_vector_cross_type_push.weft" "type error: argument type mismatch"
+check_rejects "option_unwrap_or_type_mismatch" "test/negative/option_unwrap_or_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
+check_rejects "result_unwrap_or_type_mismatch" "test/negative/result_unwrap_or_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
+check_rejects "list_prepend_type_mismatch" "test/negative/list_prepend_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
+check_rejects "vector_cross_type_push" "test/negative/vector_cross_type_push.weft" 'error[E1002]: argument type mismatch: expected `Vector<str>`, found `Vector<i64>`'
+check_rejects "persistent_vector_cross_type_push" "test/negative/persistent_vector_cross_type_push.weft" 'error[E1002]: argument type mismatch: expected `PersistentVector<str>`, found `PersistentVector<i64>`'
 check_rejects "vector_sort_missing_ord" "test/negative/vector_sort_missing_ord.weft" "type error: type does not satisfy trait bound"
-check_rejects "vector_sort_effectful_comparator" "test/negative/vector_sort_effectful_comparator.weft" "type error: argument type mismatch"
-check_rejects "vector_filter_effectful_predicate" "test/negative/vector_filter_effectful_predicate.weft" "type error: argument type mismatch"
-check_rejects "vector_concat_type_mismatch" "test/negative/vector_concat_type_mismatch.weft" "type error: argument type mismatch"
+check_rejects "vector_sort_effectful_comparator" "test/negative/vector_sort_effectful_comparator.weft" 'error[E1002]: argument type mismatch: expected `(i64, i64) -> i64`, found `(i64, i64) -[SortNoise]> i64`'
+check_rejects "vector_filter_effectful_predicate" "test/negative/vector_filter_effectful_predicate.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> bool`, found `(i64) -[FilterNoise]> bool`'
+check_rejects "vector_concat_type_mismatch" "test/negative/vector_concat_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `Vector<i64>`, found `Vector<str>`'
 check_rejects "generic_function_ref_unresolved" "test/negative/generic_function_ref_unresolved.weft" "type error: cannot infer generic function reference"
-check_rejects "map_wrong_key_type" "test/negative/map_wrong_key_type.weft" "type error: argument type mismatch"
-check_rejects "map_wrong_value_type" "test/negative/map_wrong_value_type.weft" "type error: argument type mismatch"
+check_rejects "map_wrong_key_type" "test/negative/map_wrong_key_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
+check_rejects "map_wrong_value_type" "test/negative/map_wrong_value_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "map_key_requires_hash" "test/negative/map_key_requires_hash.weft" "type error: type does not satisfy trait bound"
-check_rejects "set_wrong_element_type" "test/negative/set_wrong_element_type.weft" "type error: argument type mismatch"
-check_rejects "map_set_handle_confusion" "test/negative/map_set_handle_confusion.weft" "type error: argument type mismatch"
+check_rejects "set_wrong_element_type" "test/negative/set_wrong_element_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
+check_rejects "map_set_handle_confusion" "test/negative/map_set_handle_confusion.weft" 'error[E1002]: argument type mismatch: expected `Map<i64, i64>`, found `Set<i64>`'
 check_rejects "map_sentinel_lookup_removed" "test/negative/map_sentinel_lookup_removed.weft" "type error: arity mismatch"
-check_rejects "map_remove_wrong_key_type" "test/negative/map_remove_wrong_key_type.weft" "type error: argument type mismatch"
-check_rejects "set_remove_wrong_element_type" "test/negative/set_remove_wrong_element_type.weft" "type error: argument type mismatch"
-check_rejects "set_union_element_type_mismatch" "test/negative/set_union_element_type_mismatch.weft" "type error: argument type mismatch"
-check_rejects "set_intersection_element_type_mismatch" "test/negative/set_intersection_element_type_mismatch.weft" "type error: argument type mismatch"
-check_rejects "set_difference_element_type_mismatch" "test/negative/set_difference_element_type_mismatch.weft" "type error: argument type mismatch"
-check_rejects "option_expect_message_type_mismatch" "test/negative/option_expect_message_type_mismatch.weft" "type error: argument type mismatch"
-check_rejects "result_expect_message_type_mismatch" "test/negative/result_expect_message_type_mismatch.weft" "type error: argument type mismatch"
-check_rejects "assert_eq_type_mismatch" "test/negative/assert_eq_type_mismatch.weft" "type error: argument type mismatch"
-check_rejects "stdlib_test_assert_true_type_mismatch" "test/negative/stdlib_test_assert_true_type_mismatch.weft" "type error: argument type mismatch"
+check_rejects "map_remove_wrong_key_type" "test/negative/map_remove_wrong_key_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
+check_rejects "set_remove_wrong_element_type" "test/negative/set_remove_wrong_element_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
+check_rejects "set_union_element_type_mismatch" "test/negative/set_union_element_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `Set<i64>`, found `Set<str>`'
+check_rejects "set_intersection_element_type_mismatch" "test/negative/set_intersection_element_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `Set<i64>`, found `Set<str>`'
+check_rejects "set_difference_element_type_mismatch" "test/negative/set_difference_element_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `Set<i64>`, found `Set<str>`'
+check_rejects "option_expect_message_type_mismatch" "test/negative/option_expect_message_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
+check_rejects "result_expect_message_type_mismatch" "test/negative/result_expect_message_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
+check_rejects "assert_eq_type_mismatch" "test/negative/assert_eq_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
+check_rejects "stdlib_test_assert_true_type_mismatch" "test/negative/stdlib_test_assert_true_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `bool`, found `i64`'
 check_rejects "list_sentinel_head_removed" "test/negative/list_sentinel_head_removed.weft" "type error: unknown method"
 check_rejects "self_outside_method" "test/negative/self_outside_method.weft" "type error: Self is only valid in trait and impl method signatures"
 check_rejects "self_in_data_type" "test/negative/self_in_data_type.weft" "type error: Self is only valid in trait and impl method signatures"
@@ -305,62 +305,62 @@ check_rejects "drop_impl_missing_method" "test/negative/drop_impl_missing_method
 check_rejects "drop_impl_arity_mismatch" "test/negative/drop_impl_arity_mismatch.weft" "type error: Drop impl method arity mismatch"
 check_rejects "drop_impl_param_mismatch" "test/negative/drop_impl_param_mismatch.weft" "type error: Drop impl method parameter type mismatch"
 check_rejects "drop_impl_return_mismatch" "test/negative/drop_impl_return_mismatch.weft" "type error: Drop impl method return type mismatch"
-check_rejects "let_bound_lambda_effect_mismatch" "test/negative/let_bound_lambda_effect_mismatch.weft" "type error: argument type mismatch"
-check_rejects "let_bound_lambda_record_effect_mismatch" "test/negative/let_bound_lambda_record_effect_mismatch.weft" "type error: argument type mismatch"
-check_rejects "let_bound_lambda_method_effect_mismatch" "test/negative/let_bound_lambda_method_effect_mismatch.weft" "type error: argument type mismatch"
+check_rejects "let_bound_lambda_effect_mismatch" "test/negative/let_bound_lambda_effect_mismatch.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -[Log]> i64`'
+check_rejects "let_bound_lambda_record_effect_mismatch" "test/negative/let_bound_lambda_record_effect_mismatch.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> EffectRecord`, found `(i64) -[Log]> EffectRecord`'
+check_rejects "let_bound_lambda_method_effect_mismatch" "test/negative/let_bound_lambda_method_effect_mismatch.weft" 'error[E1002]: argument type mismatch: expected `(EffectMethodBox) -> i64`, found `(EffectMethodBox) -[Log]> i64`'
 check_rejects "let_bound_lambda_effect_unavailable" "test/negative/let_bound_lambda_effect_unavailable.weft" "type error: effect not available in caller"
-check_rejects "let_bound_lambda_return_mismatch" "test/negative/let_bound_lambda_return_mismatch.weft" "type error: argument type mismatch"
-check_rejects "unknown_identifier" "test/negative/unknown_identifier.weft" "error\[E1001\]: unknown identifier 'missing'"
+check_rejects "let_bound_lambda_return_mismatch" "test/negative/let_bound_lambda_return_mismatch.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -> str`'
+check_rejects "unknown_identifier" "test/negative/unknown_identifier.weft" "error[E1001]: unknown identifier 'missing'"
 check_rejects "unicode_identifier_non_nfc" "test/negative/unicode_identifier_non_nfc.weft" "error: identifier must use NFC normalization"
 check_rejects "unicode_identifier_default_ignorable" "test/negative/unicode_identifier_default_ignorable.weft" "error: default-ignorable code point is not permitted in an identifier"
 check_rejects "unicode_identifier_continue_only_start" "test/negative/unicode_identifier_continue_only_start.weft" "error: Unicode scalar is not permitted at this identifier position"
 check_rejects "unicode_identifier_non_xid" "test/negative/unicode_identifier_non_xid.weft" "error: Unicode scalar is not permitted at this identifier position"
-check_rejects "unknown_function" "test/negative/unknown_function.weft" "error\[E1001\]: unknown function 'missing'"
-check_rejects "unknown_intrinsic_call" "test/negative/unknown_intrinsic_call.weft" "error\[E1001\]: unknown function '__definitely_not_an_intrinsic'"
-check_rejects "unknown_function_in_import" "test/negative/unknown_function_in_import.weft" "error\[E1001\]: unknown function 'some_function_that_does_not_exist'"
-check_rejects "module_plain_import_does_not_leak_value" "test/negative/module_plain_import_does_not_leak_value.weft" "error\[E1001\]: unknown function 'work'"
-check_rejects "prelude_excludes_option_helpers" "test/negative/prelude_excludes_option_helpers.weft" "error\[E1001\]: unknown function 'option_some'"
+check_rejects "unknown_function" "test/negative/unknown_function.weft" "error[E1001]: unknown function 'missing'"
+check_rejects "unknown_intrinsic_call" "test/negative/unknown_intrinsic_call.weft" "error[E1001]: unknown function '__definitely_not_an_intrinsic'"
+check_rejects "unknown_function_in_import" "test/negative/unknown_function_in_import.weft" "error[E1001]: unknown function 'some_function_that_does_not_exist'"
+check_rejects "module_plain_import_does_not_leak_value" "test/negative/module_plain_import_does_not_leak_value.weft" "error[E1001]: unknown function 'work'"
+check_rejects "prelude_excludes_option_helpers" "test/negative/prelude_excludes_option_helpers.weft" "error[E1001]: unknown function 'option_some'"
 check_rejects "prelude_methods_require_explicit_import" "test/negative/prelude_methods_require_explicit_import.weft" "type error: unknown method"
 check_rejects "quoted_import_removed" "test/negative/quoted_import_removed.weft" "error: expected path-form module after 'use'"
 check_rejects "extern_keyword_removed" "test/negative/extern_keyword_removed.weft" "error: unexpected token at module level"
-check_rejects "module_qualified_function_unknown" "test/negative/module_qualified_function_unknown.weft" "error\[E4002\]: unknown module member 'left.missing'"
-check_rejects "module_qualified_function_private" "test/negative/module_qualified_function_private.weft" "error\[E4004\]: module member 'left.hidden' is not visible"
+check_rejects "module_qualified_function_unknown" "test/negative/module_qualified_function_unknown.weft" "error[E4002]: unknown module member 'left.missing'"
+check_rejects "module_qualified_function_private" "test/negative/module_qualified_function_private.weft" "error[E4004]: module member 'left.hidden' is not visible"
 check_rejects "module_qualified_function_arity" "test/negative/module_qualified_function_arity.weft" "type error: arity mismatch"
-check_rejects "module_qualified_function_argument" "test/negative/module_qualified_function_argument.weft" "type error: argument type mismatch"
-check_rejects "module_qualified_constructor_unknown" "test/negative/module_qualified_constructor_unknown.weft" "error\[E4002\]: unknown module member 'left.Missing'"
-check_rejects "module_qualified_constructor_private" "test/negative/module_qualified_constructor_private.weft" "error\[E4004\]: module member 'left.Hidden' is not visible"
-check_rejects "module_qualified_constructor_argument" "test/negative/module_qualified_constructor_argument.weft" "type error: argument type mismatch"
-check_rejects "module_qualified_pattern_unknown" "test/negative/module_qualified_pattern_unknown.weft" "error\[E4002\]: unknown module member 'left.Missing'"
-check_rejects "module_qualified_pattern_private" "test/negative/module_qualified_pattern_private.weft" "error\[E4004\]: module member 'left.Hidden' is not visible"
+check_rejects "module_qualified_function_argument" "test/negative/module_qualified_function_argument.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
+check_rejects "module_qualified_constructor_unknown" "test/negative/module_qualified_constructor_unknown.weft" "error[E4002]: unknown module member 'left.Missing'"
+check_rejects "module_qualified_constructor_private" "test/negative/module_qualified_constructor_private.weft" "error[E4004]: module member 'left.Hidden' is not visible"
+check_rejects "module_qualified_constructor_argument" "test/negative/module_qualified_constructor_argument.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
+check_rejects "module_qualified_pattern_unknown" "test/negative/module_qualified_pattern_unknown.weft" "error[E4002]: unknown module member 'left.Missing'"
+check_rejects "module_qualified_pattern_private" "test/negative/module_qualified_pattern_private.weft" "error[E4004]: module member 'left.Hidden' is not visible"
 check_rejects "module_qualified_pattern_identity_mismatch" "test/negative/module_qualified_pattern_identity_mismatch.weft" "type error: constructor pattern does not match scrutinee"
 check_rejects "module_inherent_method_private" "test/negative/module_inherent_method_private.weft" "type error: method is not visible"
 check_rejects "module_inherent_method_unknown" "test/negative/module_inherent_method_unknown.weft" "type error: unknown method"
 check_rejects "module_associated_method_private" "test/negative/module_associated_method_private.weft" "type error: method is not visible"
 check_rejects "module_associated_method_unknown" "test/negative/module_associated_method_unknown.weft" "type error: unknown method"
 check_rejects "module_associated_method_type_arity" "test/negative/module_associated_method_type_arity.weft" "type error: generic type argument count mismatch"
-check_rejects "module_qualified_effect_unknown" "test/negative/module_qualified_effect_unknown.weft" "error\[E4002\]: unknown module member 'bank.Missing'"
-check_rejects "module_qualified_effect_private" "test/negative/module_qualified_effect_private.weft" "error\[E4004\]: module member 'bank.Hidden' is not visible"
+check_rejects "module_qualified_effect_unknown" "test/negative/module_qualified_effect_unknown.weft" "error[E4002]: unknown module member 'bank.Missing'"
+check_rejects "module_qualified_effect_private" "test/negative/module_qualified_effect_private.weft" "error[E4004]: module member 'bank.Hidden' is not visible"
 check_rejects "module_qualified_effect_arity" "test/negative/module_qualified_effect_arity.weft" "type error: effect type argument count mismatch"
 check_rejects "module_qualified_effect_operation" "test/negative/module_qualified_effect_operation.weft" "type error: unknown effect operation"
 check_rejects "module_qualified_effect_identity_mismatch" "test/negative/module_qualified_effect_identity_mismatch.weft" "type error: effect atom not available in caller"
-check_rejects "module_qualified_trait_unknown" "test/negative/module_qualified_trait_unknown.weft" "error\[E4002\]: unknown module member 'traits.Missing'"
-check_rejects "module_qualified_trait_private" "test/negative/module_qualified_trait_private.weft" "error\[E4004\]: module member 'traits.HiddenGauge' is not visible"
+check_rejects "module_qualified_trait_unknown" "test/negative/module_qualified_trait_unknown.weft" "error[E4002]: unknown module member 'traits.Missing'"
+check_rejects "module_qualified_trait_private" "test/negative/module_qualified_trait_private.weft" "error[E4004]: module member 'traits.HiddenGauge' is not visible"
 check_rejects "module_qualified_trait_identity_mismatch" "test/negative/module_qualified_trait_identity_mismatch.weft" "type error: impl missing required method"
 check_rejects "module_qualified_trait_bound_identity_mismatch" "test/negative/module_qualified_trait_bound_identity_mismatch.weft" "type error: type does not satisfy trait bound"
-check_rejects "module_qualified_trait_bound_unknown" "test/negative/module_qualified_trait_bound_unknown.weft" "error\[E4002\]: unknown module member 'traits.Missing'"
-check_rejects "module_qualified_trait_bound_private" "test/negative/module_qualified_trait_bound_private.weft" "error\[E4004\]: module member 'traits.HiddenGauge' is not visible"
-check_rejects "module_qualified_member_ambiguous" "test/negative/module_qualified_member_ambiguous.weft" "error\[E4003\]: module item 'work' is ambiguous in this scope" 1
-check_rejects "module_selection_missing_unused" "test/negative/module_selection_missing_unused.weft" "error\[E4002\]: unknown module member 'missing' in import" 1
-check_rejects "module_selection_private_unused" "test/negative/module_selection_private_unused.weft" "error\[E4004\]: module member 'hidden' is not visible in this import" 1
-check_rejects "module_selection_missing_referenced" "test/negative/module_selection_missing_referenced.weft" "error\[E4002\]: unknown module member 'missing' in import" 1
-check_rejects "module_selection_private_referenced" "test/negative/module_selection_private_referenced.weft" "error\[E4004\]: module member 'hidden' is not visible in this import" 1
-check_rejects "module_reexport_widening_unused" "test/negative/module_reexport_widening_unused.weft" "error\[E4006\]: module member 'package_value' cannot be re-exported at wider visibility" 1
-check_rejects "module_selection_alias_collision" "test/negative/module_selection_alias_collision.weft" "error\[E4003\]: module item 'duplicate' is ambiguous in this scope" 1
-check_rejects "module_alias_collision" "test/negative/module_alias_collision.weft" "error\[E4003\]: module item 'duplicate' is ambiguous in this scope" 1
-check_rejects "module_local_collision" "test/negative/module_local_collision.weft" "error\[E4003\]: module item 'duplicate' is ambiguous in this scope" 1
-check_rejects "module_local_import_collision" "test/negative/module_local_import_collision.weft" "error\[E4003\]: module item 'duplicate' is ambiguous in this scope" 1
-check_rejects "module_import_local_collision" "test/negative/module_import_local_collision.weft" "error\[E4003\]: module item 'duplicate' is ambiguous in this scope" 1
-check_rejects "module_qualified_member_wrong_kind" "test/negative/module_qualified_member_wrong_kind.weft" "error\[E4005\]: module member 'left.LeftChoice' is not a function value"
+check_rejects "module_qualified_trait_bound_unknown" "test/negative/module_qualified_trait_bound_unknown.weft" "error[E4002]: unknown module member 'traits.Missing'"
+check_rejects "module_qualified_trait_bound_private" "test/negative/module_qualified_trait_bound_private.weft" "error[E4004]: module member 'traits.HiddenGauge' is not visible"
+check_rejects "module_qualified_member_ambiguous" "test/negative/module_qualified_member_ambiguous.weft" "error[E4003]: module item 'work' is ambiguous in this scope" 1
+check_rejects "module_selection_missing_unused" "test/negative/module_selection_missing_unused.weft" "error[E4002]: unknown module member 'missing' in import" 1
+check_rejects "module_selection_private_unused" "test/negative/module_selection_private_unused.weft" "error[E4004]: module member 'hidden' is not visible in this import" 1
+check_rejects "module_selection_missing_referenced" "test/negative/module_selection_missing_referenced.weft" "error[E4002]: unknown module member 'missing' in import" 1
+check_rejects "module_selection_private_referenced" "test/negative/module_selection_private_referenced.weft" "error[E4004]: module member 'hidden' is not visible in this import" 1
+check_rejects "module_reexport_widening_unused" "test/negative/module_reexport_widening_unused.weft" "error[E4006]: module member 'package_value' cannot be re-exported at wider visibility" 1
+check_rejects "module_selection_alias_collision" "test/negative/module_selection_alias_collision.weft" "error[E4003]: module item 'duplicate' is ambiguous in this scope" 1
+check_rejects "module_alias_collision" "test/negative/module_alias_collision.weft" "error[E4003]: module item 'duplicate' is ambiguous in this scope" 1
+check_rejects "module_local_collision" "test/negative/module_local_collision.weft" "error[E4003]: module item 'duplicate' is ambiguous in this scope" 1
+check_rejects "module_local_import_collision" "test/negative/module_local_import_collision.weft" "error[E4003]: module item 'duplicate' is ambiguous in this scope" 1
+check_rejects "module_import_local_collision" "test/negative/module_import_local_collision.weft" "error[E4003]: module item 'duplicate' is ambiguous in this scope" 1
+check_rejects "module_qualified_member_wrong_kind" "test/negative/module_qualified_member_wrong_kind.weft" "error[E4005]: module member 'left.LeftChoice' is not a function value"
 check_rejects "proc_run_requires_effect" "test/negative/proc_run_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "proc_spawn_requires_effect" "test/negative/proc_spawn_requires_effect.weft" "type error: effect not available in caller"
 check_rejects "proc_wait_requires_effect" "test/negative/proc_wait_requires_effect.weft" "type error: effect not available in caller"
@@ -407,11 +407,11 @@ check_rejects "record_init_unknown_field" "test/negative/record_init_unknown_fie
 check_rejects "record_init_missing_field" "test/negative/record_init_missing_field.weft" "type error: missing record field"
 check_rejects "record_init_duplicate_field" "test/negative/record_init_duplicate_field.weft" "type error: duplicate record field"
 check_rejects "record_init_variant_type" "test/negative/record_init_variant_type.weft" "type error: not a record type"
-check_rejects "record_init_field_type_mismatch" "test/negative/record_init_field_type_mismatch.weft" "type error: record field type mismatch"
-check_rejects "record_field_access_type_mismatch" "test/negative/record_field_access_type_mismatch.weft" "type error: return type mismatch"
-check_rejects "match_arm_i64_str_mismatch" "test/negative/match_arm_i64_str_mismatch.weft" "type error: match arm type mismatch"
-check_rejects "match_arm_str_bool_mismatch" "test/negative/match_arm_str_bool_mismatch.weft" "type error: match arm type mismatch"
-check_rejects "match_arm_record_mismatch" "test/negative/match_arm_record_mismatch.weft" "type error: match arm type mismatch"
+check_rejects "record_init_field_type_mismatch" "test/negative/record_init_field_type_mismatch.weft" 'error[E1002]: record field type mismatch: expected `str`, found `i64`'
+check_rejects "record_field_access_type_mismatch" "test/negative/record_field_access_type_mismatch.weft" 'error[E1002]: return value type mismatch: expected `i64`, found `str`'
+check_rejects "match_arm_i64_str_mismatch" "test/negative/match_arm_i64_str_mismatch.weft" 'error[E1002]: match arm type mismatch: expected `i64`, found `str`'
+check_rejects "match_arm_str_bool_mismatch" "test/negative/match_arm_str_bool_mismatch.weft" 'error[E1002]: match arm type mismatch: expected `str`, found `bool`'
+check_rejects "match_arm_record_mismatch" "test/negative/match_arm_record_mismatch.weft" 'error[E1002]: match arm type mismatch: expected `Point`, found `Person`'
 check_rejects "match_non_exhaustive_int" "test/negative/match_non_exhaustive_int.weft" "type error: non-exhaustive match"
 check_rejects "match_non_exhaustive_constructor" "test/negative/match_non_exhaustive_constructor.weft" "type error: non-exhaustive match"
 check_rejects "match_duplicate_constructor" "test/negative/match_duplicate_constructor.weft" "type error: duplicate match constructor arm"
@@ -432,9 +432,9 @@ check_rejects "pattern_nested_malformed" "test/negative/pattern_nested_malformed
 check_rejects "pattern_nested_unclosed" "test/negative/pattern_nested_unclosed.weft" "error: expected ')' after constructor pattern"
 check_rejects "opaque_construct_imported" "test/negative/opaque_construct_imported.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "opaque_project_imported" "test/negative/opaque_project_imported.weft" "type error: opaque projection pattern is private to its declaring module; use an exported accessor"
-check_rejects "opaque_identity_module_mismatch" "test/negative/opaque_identity_module_mismatch.weft" "type error: return type mismatch"
-check_rejects "opaque_representation_return" "test/negative/opaque_representation_return.weft" "type error: return type mismatch"
-check_rejects "opaque_representation_argument" "test/negative/opaque_representation_argument.weft" "type error: argument type mismatch"
+check_rejects "opaque_identity_module_mismatch" "test/negative/opaque_identity_module_mismatch.weft" 'error[E1002]: return value type mismatch: expected `opaque_left.Same`, found `opaque_right.Same`'
+check_rejects "opaque_representation_return" "test/negative/opaque_representation_return.weft" 'error[E1002]: return value type mismatch: expected `i64`, found `UserId`'
+check_rejects "opaque_representation_argument" "test/negative/opaque_representation_argument.weft" 'error[E1002]: argument type mismatch: expected `UserId`, found `i64`'
 check_rejects "opaque_type_arg_arity" "test/negative/opaque_type_arg_arity.weft" "type error: opaque type argument count mismatch"
 check_rejects "opaque_recursive_representation" "test/negative/opaque_recursive_representation.weft" "type error: opaque value representation is recursively defined"
 check_rejects "opaque_projection_arity_zero" "test/negative/opaque_projection_arity_zero.weft" "type error: opaque projection pattern requires exactly one child pattern"
@@ -442,8 +442,8 @@ check_rejects "opaque_projection_arity_many" "test/negative/opaque_projection_ar
 check_rejects "opaque_projection_non_exhaustive" "test/negative/opaque_projection_non_exhaustive.weft" "type error: non-exhaustive match"
 check_rejects "opaque_missing_marker" "test/negative/opaque_missing_marker.weft" "error: expected 'opaque' after '=' in type declaration"
 check_rejects "opaque_missing_representation" "test/negative/opaque_missing_representation.weft" "error: expected representation type after 'opaque'"
-check_rejects "opaque_any_return" "test/negative/opaque_any_return.weft" "type error: return type mismatch"
-check_rejects "opaque_any_assignment" "test/negative/opaque_any_assignment.weft" "type error: assignment type mismatch"
+check_rejects "opaque_any_return" "test/negative/opaque_any_return.weft" 'error[E1002]: return value type mismatch: expected `Secret`, found `any`'
+check_rejects "opaque_any_assignment" "test/negative/opaque_any_assignment.weft" 'error[E1002]: assignment type mismatch: expected `Secret`, found `any`'
 check_rejects "opaque_record_fabrication" "test/negative/opaque_record_fabrication.weft" "type error: not a record type"
 check_rejects "opaque_field_projection" "test/negative/opaque_field_projection.weft" "type error: unknown field"
 check_rejects "opaque_construct_reexported" "test/negative/opaque_construct_reexported.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
@@ -479,45 +479,45 @@ check_rejects "f64_modulo" "test/negative/f64_modulo.weft" "type error: arithmet
 check_rejects "f32_f64_arithmetic_mismatch" "test/negative/f32_f64_arithmetic_mismatch.weft" "type error: arithmetic operand type mismatch"
 check_rejects "f32_i64_arithmetic_mismatch" "test/negative/f32_i64_arithmetic_mismatch.weft" "type error: arithmetic operand type mismatch"
 check_rejects "f32_f64_comparison_mismatch" "test/negative/f32_f64_comparison_mismatch.weft" "type error: comparison operand type mismatch"
-check_rejects "f32_f64_assignment_mismatch" "test/negative/f32_f64_assignment_mismatch.weft" "type error: value does not match let type annotation"
+check_rejects "f32_f64_assignment_mismatch" "test/negative/f32_f64_assignment_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `f64`, found `f32`'
 check_rejects "f32_bitwise" "test/negative/f32_bitwise.weft" "type error: bitwise operand is not i64"
-check_rejects "f32_call_f64_arg_mismatch" "test/negative/f32_call_f64_arg_mismatch.weft" "type error: argument type mismatch"
+check_rejects "f32_call_f64_arg_mismatch" "test/negative/f32_call_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `f32`'
 check_rejects "i32_i64_arithmetic_mismatch" "test/negative/i32_i64_arithmetic_mismatch.weft" "type error: arithmetic operand type mismatch"
-check_rejects "i32_literal_out_of_range" "test/negative/i32_literal_out_of_range.weft" "type error: value does not match let type annotation"
-check_rejects "i64_positive_literal_out_of_range" "test/negative/i64_positive_literal_out_of_range.weft" "type error: value does not match let type annotation"
+check_rejects "i32_literal_out_of_range" "test/negative/i32_literal_out_of_range.weft" 'error[E1002]: integer literal does not fit expected type `i32`'
+check_rejects "i64_positive_literal_out_of_range" "test/negative/i64_positive_literal_out_of_range.weft" 'error[E1002]: integer literal does not fit expected type `i64`'
 check_rejects "untyped_integer_literal_out_of_range" "test/negative/untyped_integer_literal_out_of_range.weft" "type error: integer literal out of range"
-check_rejects "i32_i64_assignment_mismatch" "test/negative/i32_i64_assignment_mismatch.weft" "type error: value does not match let type annotation"
-check_rejects "i32_call_i64_arg_mismatch" "test/negative/i32_call_i64_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "i8_literal_out_of_range" "test/negative/i8_literal_out_of_range.weft" "type error: value does not match let type annotation"
-check_rejects "u8_negative_literal" "test/negative/u8_negative_literal.weft" "type error: value does not match let type annotation"
-check_rejects "u64_literal_out_of_range" "test/negative/u64_literal_out_of_range.weft" "type error: value does not match let type annotation"
-check_rejects "u64_return_literal_out_of_range" "test/negative/u64_return_literal_out_of_range.weft" "type error: return type mismatch"
-check_rejects "u64_negative_literal" "test/negative/u64_negative_literal.weft" "type error: value does not match let type annotation"
+check_rejects "i32_i64_assignment_mismatch" "test/negative/i32_i64_assignment_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `i32`, found `i64`'
+check_rejects "i32_call_i64_arg_mismatch" "test/negative/i32_call_i64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i32`, found `i64`'
+check_rejects "i8_literal_out_of_range" "test/negative/i8_literal_out_of_range.weft" 'error[E1002]: integer literal does not fit expected type `i8`'
+check_rejects "u8_negative_literal" "test/negative/u8_negative_literal.weft" 'error[E1002]: integer literal does not fit expected type `u8`'
+check_rejects "u64_literal_out_of_range" "test/negative/u64_literal_out_of_range.weft" 'error[E1002]: integer literal does not fit expected type `u64`'
+check_rejects "u64_return_literal_out_of_range" "test/negative/u64_return_literal_out_of_range.weft" 'error[E1002]: integer literal does not fit expected type `u64`'
+check_rejects "u64_negative_literal" "test/negative/u64_negative_literal.weft" 'error[E1002]: integer literal does not fit expected type `u64`'
 check_rejects "u64_pattern_literal_out_of_range" "test/negative/u64_pattern_literal_out_of_range.weft" "type error: literal pattern does not match scrutinee"
 check_rejects "u8_i8_arithmetic_mismatch" "test/negative/u8_i8_arithmetic_mismatch.weft" "type error: arithmetic operand type mismatch"
 check_rejects "u32_i32_comparison_mismatch" "test/negative/u32_i32_comparison_mismatch.weft" "type error: comparison operand type mismatch"
-check_rejects "usize_i64_assignment_mismatch" "test/negative/usize_i64_assignment_mismatch.weft" "type error: value does not match let type annotation"
-check_rejects "u8_call_i64_arg_mismatch" "test/negative/u8_call_i64_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "num_i64_to_f64_arg_mismatch" "test/negative/num_i64_to_f64_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "intrinsic_i64_to_f64_arg_mismatch" "test/negative/intrinsic_i64_to_f64_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "num_u32_to_f64_arg_mismatch" "test/negative/num_u32_to_f64_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "intrinsic_u64_to_f64_arg_mismatch" "test/negative/intrinsic_u64_to_f64_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "num_f64_to_i64_exact_arg_mismatch" "test/negative/num_f64_to_i64_exact_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "intrinsic_f64_to_i64_arg_mismatch" "test/negative/intrinsic_f64_to_i64_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "num_f32_to_f64_arg_mismatch" "test/negative/num_f32_to_f64_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "num_f64_to_f32_round_arg_mismatch" "test/negative/num_f64_to_f32_round_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "num_i32_to_f32_round_arg_mismatch" "test/negative/num_i32_to_f32_round_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "intrinsic_f32_to_f64_arg_mismatch" "test/negative/intrinsic_f32_to_f64_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "intrinsic_f64_to_f32_arg_mismatch" "test/negative/intrinsic_f64_to_f32_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "intrinsic_i16_to_f32_arg_mismatch" "test/negative/intrinsic_i16_to_f32_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "math_sqrt_f64_arg_mismatch" "test/negative/math_sqrt_f64_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "math_sqrt_f32_arg_mismatch" "test/negative/math_sqrt_f32_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "intrinsic_f64_sqrt_arg_mismatch" "test/negative/intrinsic_f64_sqrt_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "intrinsic_f32_sqrt_arg_mismatch" "test/negative/intrinsic_f32_sqrt_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "num_i64_to_i8_checked_arg_mismatch" "test/negative/num_i64_to_i8_checked_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "num_int_cast_value_or_default_mismatch" "test/negative/num_int_cast_value_or_default_mismatch.weft" "type error: argument type mismatch"
-check_rejects "intrinsic_i64_to_i8_arg_mismatch" "test/negative/intrinsic_i64_to_i8_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "intrinsic_u16_to_u64_arg_mismatch" "test/negative/intrinsic_u16_to_u64_arg_mismatch.weft" "type error: argument type mismatch"
+check_rejects "usize_i64_assignment_mismatch" "test/negative/usize_i64_assignment_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `usize`, found `i64`'
+check_rejects "u8_call_i64_arg_mismatch" "test/negative/u8_call_i64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u8`, found `i64`'
+check_rejects "num_i64_to_f64_arg_mismatch" "test/negative/num_i64_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `f64`'
+check_rejects "intrinsic_i64_to_f64_arg_mismatch" "test/negative/intrinsic_i64_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `f64`'
+check_rejects "num_u32_to_f64_arg_mismatch" "test/negative/num_u32_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u32`, found `i32`'
+check_rejects "intrinsic_u64_to_f64_arg_mismatch" "test/negative/intrinsic_u64_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u64`, found `i64`'
+check_rejects "num_f64_to_i64_exact_arg_mismatch" "test/negative/num_f64_to_i64_exact_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
+check_rejects "intrinsic_f64_to_i64_arg_mismatch" "test/negative/intrinsic_f64_to_i64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
+check_rejects "num_f32_to_f64_arg_mismatch" "test/negative/num_f32_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f32`, found `f64`'
+check_rejects "num_f64_to_f32_round_arg_mismatch" "test/negative/num_f64_to_f32_round_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
+check_rejects "num_i32_to_f32_round_arg_mismatch" "test/negative/num_i32_to_f32_round_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i32`, found `u32`'
+check_rejects "intrinsic_f32_to_f64_arg_mismatch" "test/negative/intrinsic_f32_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f32`, found `f64`'
+check_rejects "intrinsic_f64_to_f32_arg_mismatch" "test/negative/intrinsic_f64_to_f32_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
+check_rejects "intrinsic_i16_to_f32_arg_mismatch" "test/negative/intrinsic_i16_to_f32_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i16`, found `u16`'
+check_rejects "math_sqrt_f64_arg_mismatch" "test/negative/math_sqrt_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
+check_rejects "math_sqrt_f32_arg_mismatch" "test/negative/math_sqrt_f32_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f32`, found `i64`'
+check_rejects "intrinsic_f64_sqrt_arg_mismatch" "test/negative/intrinsic_f64_sqrt_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
+check_rejects "intrinsic_f32_sqrt_arg_mismatch" "test/negative/intrinsic_f32_sqrt_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f32`, found `i64`'
+check_rejects "num_i64_to_i8_checked_arg_mismatch" "test/negative/num_i64_to_i8_checked_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `f64`'
+check_rejects "num_int_cast_value_or_default_mismatch" "test/negative/num_int_cast_value_or_default_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i8`, found `str`'
+check_rejects "intrinsic_i64_to_i8_arg_mismatch" "test/negative/intrinsic_i64_to_i8_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `u64`'
+check_rejects "intrinsic_u16_to_u64_arg_mismatch" "test/negative/intrinsic_u16_to_u64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u16`, found `f64`'
 check_rejects "num_trait_bool_not_numeric" "test/negative/num_trait_bool_not_numeric.weft" "type error: type does not satisfy trait bound"
 check_rejects "num_trait_str_not_integer" "test/negative/num_trait_str_not_integer.weft" "type error: type does not satisfy trait bound"
 check_rejects "num_trait_float_not_integer" "test/negative/num_trait_float_not_integer.weft" "type error: type does not satisfy trait bound"
@@ -525,10 +525,10 @@ check_rejects "num_trait_unsigned_not_signed" "test/negative/num_trait_unsigned_
 check_rejects "num_trait_signed_not_unsigned" "test/negative/num_trait_signed_not_unsigned.weft" "type error: type does not satisfy trait bound"
 check_rejects "unhandled_effect_in_if_condition" "test/negative/unhandled_effect_in_if_condition.weft" "type error: effect not available in caller"
 check_rejects "unhandled_effect_in_match_guard" "test/negative/unhandled_effect_in_match_guard.weft" "type error: effect not available in caller"
-check_rejects "assignment_unknown_target" "test/negative/assignment_unknown_target.weft" "error\[E1001\]: unknown identifier 'missing'"
-check_rejects "assignment_i64_str_mismatch" "test/negative/assignment_i64_str_mismatch.weft" "type error: assignment type mismatch"
-check_rejects "assignment_str_i64_mismatch" "test/negative/assignment_str_i64_mismatch.weft" "type error: assignment type mismatch"
-check_rejects "assignment_bool_i64_mismatch" "test/negative/assignment_bool_i64_mismatch.weft" "type error: assignment type mismatch"
+check_rejects "assignment_unknown_target" "test/negative/assignment_unknown_target.weft" "error[E1001]: unknown identifier 'missing'"
+check_rejects "assignment_i64_str_mismatch" "test/negative/assignment_i64_str_mismatch.weft" 'error[E1002]: assignment type mismatch: expected `i64`, found `str`'
+check_rejects "assignment_str_i64_mismatch" "test/negative/assignment_str_i64_mismatch.weft" 'error[E1002]: assignment type mismatch: expected `str`, found `i64`'
+check_rejects "assignment_bool_i64_mismatch" "test/negative/assignment_bool_i64_mismatch.weft" 'error[E1002]: assignment type mismatch: expected `bool`, found `i64`'
 check_rejects "assignment_immutable_let" "test/negative/assignment_immutable_let.weft" "type error: cannot assign to immutable binding"
 check_rejects "assignment_immutable_typed_let" "test/negative/assignment_immutable_typed_let.weft" "type error: cannot assign to immutable binding"
 check_rejects "assignment_param_immutable" "test/negative/assignment_param_immutable.weft" "type error: cannot assign to immutable binding"
@@ -543,11 +543,11 @@ check_rejects "imported_pointer_store_requires_trusted" "test/negative/imported_
 check_rejects "pointer_address_of_literal" "test/negative/pointer_address_of_literal.weft" "type error: address-of target must be a binding"
 check_rejects "pointer_deref_non_pointer" "test/negative/pointer_deref_non_pointer.weft" "type error: dereference of non-pointer"
 check_rejects "pointer_mut_address_of_immutable" "test/negative/pointer_mut_address_of_immutable.weft" "type error: cannot take mutable pointer to immutable binding"
-check_rejects "pointer_value_to_param" "test/negative/pointer_value_to_param.weft" "type error: argument type mismatch"
+check_rejects "pointer_value_to_param" "test/negative/pointer_value_to_param.weft" 'error[E1002]: argument type mismatch: expected `*i64`, found `i64`'
 check_rejects "pointer_assignment_immutable" "test/negative/pointer_assignment_immutable.weft" "type error: cannot write through immutable pointer"
-check_rejects "pointer_assignment_type_mismatch" "test/negative/pointer_assignment_type_mismatch.weft" "type error: pointer assignment type mismatch"
+check_rejects "pointer_assignment_type_mismatch" "test/negative/pointer_assignment_type_mismatch.weft" 'error[E1002]: pointer assignment type mismatch: expected `i64`, found `str`'
 check_rejects "pointer_assignment_non_pointer" "test/negative/pointer_assignment_non_pointer.weft" "type error: dereference of non-pointer"
-check_rejects "rc_bind_non_rc" "test/negative/rc_bind_non_rc.weft" "type error: value does not match let type annotation"
+check_rejects "rc_bind_non_rc" "test/negative/rc_bind_non_rc.weft" 'error[E1002]: type annotation type mismatch: expected `unknown`, found `i64`'
 check_rejects "arc_public_param" "test/negative/arc_public_param.weft" "type error: arc is not public syntax"
 check_rejects "arc_public_type_field" "test/negative/arc_public_type_field.weft" "type error: arc is not public syntax"
 check_rejects "arc_public_let_annotation" "test/negative/arc_public_let_annotation.weft" "type error: arc is not public syntax"
@@ -586,7 +586,7 @@ check_rejects "ownership_cycle_vector_continuation" "test/negative/ownership_cyc
 check_rejects "weak_ref_unmanaged" "test/negative/weak_ref_unmanaged.weft" "type error: weak_ref requires managed value"
 check_rejects "weak_load_nonweak" "test/negative/weak_load_nonweak.weft" "type error: weak_load requires weak managed reference"
 check_rejects "weak_ref_arity" "test/negative/weak_ref_arity.weft" "type error: arity mismatch"
-check_rejects "weak_load_nullable_required" "test/negative/weak_load_nullable_required.weft" "type error: value does not match let type annotation"
+check_rejects "weak_load_nullable_required" "test/negative/weak_load_nullable_required.weft" 'error[E1002]: type annotation type mismatch: expected `RuntimeRcProbe`, found `RuntimeRcProbe | nil`'
 check_rejects "region_scoped_return_alloc" "test/negative/region_scoped_return_alloc.weft" "type error: region value cannot escape scoped arena"
 check_rejects "region_scoped_return_bound_alloc" "test/negative/region_scoped_return_bound_alloc.weft" "type error: region value cannot escape scoped arena"
 check_rejects "region_scoped_capture_alloc" "test/negative/region_scoped_capture_alloc.weft" "type error: region value cannot escape scoped arena"
@@ -609,12 +609,12 @@ check_rejects "region_scoped_generator_escape" "test/negative/region_scoped_gene
 check_rejects "region_scoped_iterator_escape" "test/negative/region_scoped_iterator_escape.weft" "type error: region value cannot escape scoped arena"
 check_rejects "lambda_capture_mut_binding" "test/negative/lambda_capture_mut_binding.weft" "type error: cannot capture mut binding"
 check_rejects "lambda_capture_mut_assignment" "test/negative/lambda_capture_mut_assignment.weft" "type error: cannot capture mut binding"
-check_rejects "return_branch_type_mismatch" "test/negative/return_branch_type_mismatch.weft" "type error: return type mismatch"
-check_rejects "return_str_i64_mismatch" "test/negative/return_str_i64_mismatch.weft" "type error: return type mismatch"
+check_rejects "return_branch_type_mismatch" "test/negative/return_branch_type_mismatch.weft" 'error[E1002]: return value type mismatch: expected `i64`, found `str`'
+check_rejects "return_str_i64_mismatch" "test/negative/return_str_i64_mismatch.weft" 'error[E1002]: return value type mismatch: expected `str`, found `i64`'
 check_rejects "unhandled_effect_in_return" "test/negative/unhandled_effect_in_return.weft" "type error: effect not available in caller"
 check_rejects "unhandled_effect_in_break" "test/negative/unhandled_effect_in_break.weft" "type error: effect not available in caller"
-check_rejects "contextual_lambda_return_stmt_mismatch" "test/negative/contextual_lambda_return_stmt_mismatch.weft" "type error: return type mismatch"
-check_rejects "let_bound_lambda_return_stmt_mismatch" "test/negative/let_bound_lambda_return_stmt_mismatch.weft" "type error: return type mismatch"
+check_rejects "contextual_lambda_return_stmt_mismatch" "test/negative/contextual_lambda_return_stmt_mismatch.weft" 'error[E1002]: return value type mismatch: expected `i64`, found `str`'
+check_rejects "let_bound_lambda_return_stmt_mismatch" "test/negative/let_bound_lambda_return_stmt_mismatch.weft" 'error[E1002]: return value type mismatch: expected `i64`, found `str`'
 check_rejects "call_arity_too_few" "test/negative/call_arity_too_few.weft" "type error: arity mismatch"
 check_rejects "call_arity_too_many" "test/negative/call_arity_too_many.weft" "type error: arity mismatch"
 check_rejects "generic_call_arity_mismatch" "test/negative/generic_call_arity_mismatch.weft" "type error: arity mismatch"
@@ -632,13 +632,13 @@ check_rejects "deferred_k_alias_multiple_use" "test/negative/deferred_k_alias_mu
 check_rejects "deferred_k_capture_lambda_body_multiple_use" "test/negative/deferred_k_capture_lambda_body_multiple_use.weft" "type error: continuation used more than once"
 check_rejects "deferred_k_capture_lambda_multiple_use" "test/negative/deferred_k_capture_lambda_multiple_use.weft" "type error: continuation used more than once"
 check_rejects "deferred_k_alias_capture_lambda" "test/negative/deferred_k_alias_capture_lambda.weft" "type error: continuation cannot escape"
-check_rejects "deferred_k_alias_pass_arg" "test/negative/deferred_k_alias_pass_arg.weft" "type error: argument type mismatch"
+check_rejects "deferred_k_alias_pass_arg" "test/negative/deferred_k_alias_pass_arg.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `continuation<i64, i64>`'
 check_rejects "deferred_k_non_tail" "test/negative/deferred_k_non_tail.weft" "type error: continuation call must be tail position"
 check_rejects "deferred_k_loop_non_tail" "test/negative/deferred_k_conditional_non_tail.weft" "type error: continuation call must be tail position"
 check_rejects "deferred_k_arity" "test/negative/deferred_k_arity.weft" "type error: arity mismatch"
 check_rejects "deferred_k_helper_multiple_use" "test/negative/deferred_k_helper_multiple_use.weft" "type error: continuation used more than once"
 check_rejects "continuation_param_multiple_use" "test/negative/continuation_param_multiple_use.weft" "type error: continuation used more than once"
-check_rejects "continuation_param_plain_function" "test/negative/continuation_param_plain_function.weft" "type error: argument type mismatch"
+check_rejects "continuation_param_plain_function" "test/negative/continuation_param_plain_function.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `continuation<i64, i64>`'
 check_rejects "continuation_param_return_any" "test/negative/continuation_param_return_any.weft" "type error: continuation cannot escape"
 check_rejects "deferred_k_direct_resume" "test/negative/deferred_k_direct_resume.weft" "type error: use continuation binding instead of resume"
 check_rejects "deferred_k_intrinsic_store" "test/negative/deferred_k_intrinsic_store.weft" "type error: continuation cannot escape"
@@ -655,9 +655,9 @@ check_rejects "handler_clause_unknown_op" "test/negative/handler_clause_unknown_
 check_rejects "handler_clause_effect_mismatch" "test/negative/handler_clause_effect_mismatch.weft" "type error: handler clause effect mismatch"
 check_rejects "handler_clause_arity_too_few" "test/negative/handler_clause_arity_too_few.weft" "type error: arity mismatch"
 check_rejects "handler_clause_arity_too_many" "test/negative/handler_clause_arity_too_many.weft" "type error: arity mismatch"
-check_rejects "handler_clause_param_type_mismatch" "test/negative/handler_clause_param_type_mismatch.weft" "type error: argument type mismatch"
-check_rejects "handler_clause_resume_type_mismatch" "test/negative/handler_clause_resume_type_mismatch.weft" "type error: resume type mismatch"
-check_rejects "handler_clause_return_type_mismatch" "test/negative/handler_clause_return_type_mismatch.weft" "type error: return type mismatch"
+check_rejects "handler_clause_param_type_mismatch" "test/negative/handler_clause_param_type_mismatch.weft" 'error[E1002]: handler parameter type mismatch: expected `i64`, found `str`'
+check_rejects "handler_clause_resume_type_mismatch" "test/negative/handler_clause_resume_type_mismatch.weft" 'error[E1002]: handler clause result type mismatch: expected `i64`, found `str`'
+check_rejects "handler_clause_return_type_mismatch" "test/negative/handler_clause_return_type_mismatch.weft" 'error[E1002]: return value type mismatch: expected `i64`, found `str`'
 check_rejects "handler_clause_resume_capture_lambda" "test/negative/handler_clause_resume_capture_lambda.weft" "type error: cannot capture resume"
 check_rejects "handler_clause_resume_capture_nested_lambda" "test/negative/handler_clause_resume_capture_nested_lambda.weft" "type error: cannot capture resume"
 check_rejects "handler_clause_duplicate" "test/negative/handler_clause_duplicate.weft" "type error: duplicate handler clause"
@@ -665,16 +665,16 @@ check_rejects "handler_clause_missing_direct" "test/negative/handler_clause_miss
 check_rejects "handler_clause_missing_branch" "test/negative/handler_clause_missing_branch.weft" "type error: missing handler clause"
 check_rejects "resume_outside_handler" "test/negative/resume_outside_handler.weft" "type error: resume outside handler clause"
 check_rejects "resume_outside_handler_lambda" "test/negative/resume_outside_handler_lambda.weft" "type error: resume outside handler clause"
-check_rejects "generic_type_payload_mismatch" "test/negative/generic_type_payload_mismatch.weft" "type error: argument type mismatch"
-check_rejects "generic_type_return_mismatch" "test/negative/generic_type_return_mismatch.weft" "type error: value does not match let type annotation"
+check_rejects "generic_type_payload_mismatch" "test/negative/generic_type_payload_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
+check_rejects "generic_type_return_mismatch" "test/negative/generic_type_return_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `List<i64>`, found `List<str>`'
 check_rejects "generic_type_constructor_arity" "test/negative/generic_type_constructor_arity.weft" "type error: arity mismatch"
 check_rejects "generic_type_arg_count" "test/negative/generic_type_arg_count.weft" "type error: wrong number of type arguments"
-check_rejects "generic_type_pattern_payload_mismatch" "test/negative/generic_type_pattern_payload_mismatch.weft" "type error: return type mismatch"
-check_rejects "narrowing_unguarded_nilable_use" "test/negative/narrowing_unguarded_nilable_use.weft" "type error: argument type mismatch"
-check_rejects "narrowing_mut_guard_not_narrowed" "test/negative/narrowing_mut_guard_not_narrowed.weft" "type error: argument type mismatch"
-check_rejects "generic_ctor_no_context" "test/negative/generic_ctor_no_context.weft" "type error: return type mismatch"
-check_rejects "generic_ctor_annotation_mismatch" "test/negative/generic_ctor_annotation_mismatch.weft" "type error: value does not match let type annotation"
-check_rejects "generic_ctor_conflicting_args" "test/negative/generic_ctor_conflicting_args.weft" "type error: argument type mismatch"
+check_rejects "generic_type_pattern_payload_mismatch" "test/negative/generic_type_pattern_payload_mismatch.weft" 'error[E1002]: return value type mismatch: expected `i64`, found `str`'
+check_rejects "narrowing_unguarded_nilable_use" "test/negative/narrowing_unguarded_nilable_use.weft" 'error[E1002]: argument type mismatch: expected `str`, found `str | nil`'
+check_rejects "narrowing_mut_guard_not_narrowed" "test/negative/narrowing_mut_guard_not_narrowed.weft" 'error[E1002]: argument type mismatch: expected `str`, found `str | nil`'
+check_rejects "generic_ctor_no_context" "test/negative/generic_ctor_no_context.weft" 'error[E1002]: return value type mismatch: expected `i64`, found `Opt<unknown>`'
+check_rejects "generic_ctor_annotation_mismatch" "test/negative/generic_ctor_annotation_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `Opt<i64>`, found `Opt<str>`'
+check_rejects "generic_ctor_conflicting_args" "test/negative/generic_ctor_conflicting_args.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "qualified_ctor_call" "test/negative/qualified_ctor_call.weft" "type error: qualified constructor syntax is not supported"
 check_rejects "qualified_ctor_nullary" "test/negative/qualified_ctor_nullary.weft" "type error: qualified constructor syntax is not supported"
 check_rejects "interp_display_missing_import" "test/negative/interp_display_missing_import.weft" "add use \"stdlib/display.weft\""
@@ -684,28 +684,28 @@ check_rejects "typed_match_foreign_annotation" "test/negative/typed_match_foreig
 check_rejects "typed_match_nil_never" "test/negative/typed_match_nil_never.weft" "type error: nil match arm on a scrutinee that is never nil"
 check_rejects "structural_record_duplicate_field" "test/negative/structural_record_duplicate_field.weft" "type error: duplicate structural record field"
 check_rejects "structural_record_malformed" "test/negative/structural_record_malformed.weft" "type error: structural record type is malformed"
-check_rejects "structural_record_width_reverse" "test/negative/structural_record_width_reverse.weft" "type error: return type mismatch"
-check_rejects "structural_record_missing_required" "test/negative/structural_record_missing_required.weft" "type error: return type mismatch"
-check_rejects "structural_record_depth_reverse" "test/negative/structural_record_depth_reverse.weft" "type error: return type mismatch"
-check_rejects "structural_record_exact_extra" "test/negative/structural_record_exact_extra.weft" "type error: return type mismatch"
-check_rejects "tuple_type_arity_mismatch" "test/negative/tuple_type_arity_mismatch.weft" "type error: return type mismatch"
-check_rejects "tuple_type_depth_reverse" "test/negative/tuple_type_depth_reverse.weft" "type error: return type mismatch"
+check_rejects "structural_record_width_reverse" "test/negative/structural_record_width_reverse.weft" 'error[E1002]: return value type mismatch: expected `{name: str, age: i64}`, found `{name: str, ..}`'
+check_rejects "structural_record_missing_required" "test/negative/structural_record_missing_required.weft" 'error[E1002]: return value type mismatch: expected `{name: str, age: i64, ..}`, found `{name: str}`'
+check_rejects "structural_record_depth_reverse" "test/negative/structural_record_depth_reverse.weft" 'error[E1002]: return value type mismatch: expected `{value: bool, ..}`, found `{value: i64}`'
+check_rejects "structural_record_exact_extra" "test/negative/structural_record_exact_extra.weft" 'error[E1002]: return value type mismatch: expected `{name: str}`, found `{name: str, age: i64}`'
+check_rejects "tuple_type_arity_mismatch" "test/negative/tuple_type_arity_mismatch.weft" 'error[E1002]: return value type mismatch: expected `(i64, str)`, found `(i64,)`'
+check_rejects "tuple_type_depth_reverse" "test/negative/tuple_type_depth_reverse.weft" 'error[E1002]: return value type mismatch: expected `(bool, str)`, found `(i64, str)`'
 check_rejects "tuple_position_out_of_bounds" "test/negative/tuple_position_out_of_bounds.weft" "type error: unknown tuple position"
 check_rejects "tuple_position_named" "test/negative/tuple_position_named.weft" "type error: tuple positions use numeric labels"
 check_rejects "record_numeric_field" "test/negative/record_numeric_field.weft" "type error: tuple position access on non-tuple record"
 check_rejects "structural_result_exceeds_native_abi" "test/negative/structural_result_exceeds_native_abi.weft" "type error: result type exceeds 8-lane native ABI"
 check_rejects "structural_effect_result_exceeds_native_abi" "test/negative/structural_effect_result_exceeds_native_abi.weft" "type error: result type exceeds 8-lane native ABI"
 check_rejects "structural_generic_result_exceeds_native_abi" "test/negative/structural_generic_result_exceeds_native_abi.weft" "type error: result type exceeds 8-lane native ABI"
-check_rejects "tuple_record_distinct" "test/negative/tuple_record_distinct.weft" "type error: return type mismatch"
+check_rejects "tuple_record_distinct" "test/negative/tuple_record_distinct.weft" 'error[E1002]: return value type mismatch: expected `{}`, found `()`'
 check_rejects "anonymous_record_expr_duplicate" "test/negative/anonymous_record_expr_duplicate.weft" "type error: duplicate record field"
 check_rejects "anonymous_record_expr_malformed" "test/negative/anonymous_record_expr_malformed.weft" "error: expected ',' or '}' after structural record field"
-check_rejects "anonymous_record_expr_arg_mismatch" "test/negative/anonymous_record_expr_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "anonymous_record_expr_missing_field" "test/negative/anonymous_record_expr_missing_field.weft" "type error: argument type mismatch"
-check_rejects "structural_complement_rejects_field" "test/negative/structural_complement_rejects_field.weft" "type error: argument type mismatch"
-check_rejects "diagnostic_report_wrong_type" "test/negative/diagnostic_report_wrong_type.weft" "type error: argument type mismatch"
-check_rejects "diagnostic_constructor_wrong_location" "test/negative/diagnostic_constructor_wrong_location.weft" "type error: argument type mismatch"
-check_rejects "tuple_expr_arg_mismatch" "test/negative/tuple_expr_arg_mismatch.weft" "type error: argument type mismatch"
-check_rejects "tuple_expr_singleton_requires_comma" "test/negative/tuple_expr_singleton_requires_comma.weft" "type error: argument type mismatch"
+check_rejects "anonymous_record_expr_arg_mismatch" "test/negative/anonymous_record_expr_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `{x: i64, y: i64}`, found `{x: i64, y: str}`'
+check_rejects "anonymous_record_expr_missing_field" "test/negative/anonymous_record_expr_missing_field.weft" 'error[E1002]: argument type mismatch: expected `{x: i64, y: i64}`, found `{x: i64}`'
+check_rejects "structural_complement_rejects_field" "test/negative/structural_complement_rejects_field.weft" 'error[E1002]: argument type mismatch: expected `{..} & ~{email: any, ..}`, found `{email: str}`'
+check_rejects "diagnostic_report_wrong_type" "test/negative/diagnostic_report_wrong_type.weft" 'error[E1002]: argument type mismatch: expected `Diagnostic`, found `str`'
+check_rejects "diagnostic_constructor_wrong_location" "test/negative/diagnostic_constructor_wrong_location.weft" 'error[E1002]: argument type mismatch: expected `diagnostic_type.DiagnosticLocation`, found `i64`'
+check_rejects "tuple_expr_arg_mismatch" "test/negative/tuple_expr_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `(i64, str)`, found `(i64, i64)`'
+check_rejects "tuple_expr_singleton_requires_comma" "test/negative/tuple_expr_singleton_requires_comma.weft" 'error[E1002]: argument type mismatch: expected `(i64,)`, found `i64`'
 check_rejects "record_pattern_duplicate_field" "test/negative/record_pattern_duplicate_field.weft" "type error: duplicate record pattern field"
 check_rejects "record_pattern_unknown_field" "test/negative/record_pattern_unknown_field.weft" "type error: unknown record pattern field"
 check_rejects "record_pattern_tuple_mismatch" "test/negative/record_pattern_tuple_mismatch.weft" "type error: record pattern does not match scrutinee"
@@ -727,20 +727,20 @@ check_rejects "destructuring_let_refutable_literal" "test/negative/destructuring
 check_rejects "destructuring_let_refutable_nil" "test/negative/destructuring_let_refutable_nil.weft" "type error: refutable pattern in let binding; use if let or match"
 check_rejects "destructuring_for_refutable_constructor" "test/negative/destructuring_for_refutable_constructor.weft" "type error: refutable pattern in for binding; use if let or match inside the loop"
 check_rejects "destructuring_let_mutable" "test/negative/destructuring_let_mutable.weft" "error: mutable destructuring bindings are not supported"
-check_rejects "destructuring_let_annotation_mismatch" "test/negative/destructuring_let_annotation_mismatch.weft" "type error: value does not match let type annotation"
+check_rejects "destructuring_let_annotation_mismatch" "test/negative/destructuring_let_annotation_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `(str, str)`, found `(i64, i64)`'
 check_rejects "destructuring_let_tuple_arity" "test/negative/destructuring_let_tuple_arity.weft" "type error: tuple pattern arity mismatch"
-check_rejects "structural_shape_missing_field" "test/negative/structural_shape_missing_field.weft" "type error: argument type mismatch"
-check_rejects "structural_shape_wrong_field_type" "test/negative/structural_shape_wrong_field_type.weft" "type error: argument type mismatch"
-check_rejects "structural_shape_closed_extra_nominal" "test/negative/structural_shape_closed_extra_nominal.weft" "type error: argument type mismatch"
+check_rejects "structural_shape_missing_field" "test/negative/structural_shape_missing_field.weft" 'error[E1002]: argument type mismatch: expected `{answer: i64, ..}`, found `StructuralShapeMissing`'
+check_rejects "structural_shape_wrong_field_type" "test/negative/structural_shape_wrong_field_type.weft" 'error[E1002]: argument type mismatch: expected `{answer: i64, ..}`, found `StructuralShapeWrong`'
+check_rejects "structural_shape_closed_extra_nominal" "test/negative/structural_shape_closed_extra_nominal.weft" 'error[E1002]: argument type mismatch: expected `{answer: i64}`, found `StructuralShapeExtra`'
 check_rejects "structural_shape_function_value" "test/negative/structural_shape_function_value.weft" "type error: shape-polymorphic function cannot cross an opaque function-value boundary"
 check_rejects "structural_shape_indirect_adaptation" "test/negative/structural_shape_indirect_adaptation.weft" "type error: structural shape adaptation requires a direct function call"
-check_rejects "structural_shape_generic_conflict" "test/negative/structural_shape_generic_conflict.weft" "type error: argument type mismatch"
+check_rejects "structural_shape_generic_conflict" "test/negative/structural_shape_generic_conflict.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
 check_rejects "structural_update_duplicate_field" "test/negative/structural_update_duplicate_field.weft" "type error: duplicate record field"
 check_rejects "structural_update_malformed" "test/negative/structural_update_malformed.weft" "error: expected ',' or '}' after record update field"
 check_rejects "structural_update_nonrecord" "test/negative/structural_update_nonrecord.weft" "type error: functional update requires a record value"
 check_rejects "structural_update_open_shape" "test/negative/structural_update_open_shape.weft" "type error: functional update requires a concrete closed structural shape"
 check_rejects "nominal_update_unknown_field" "test/negative/nominal_update_unknown_field.weft" "type error: unknown record field in functional update"
-check_rejects "nominal_update_field_type_mismatch" "test/negative/nominal_update_field_type_mismatch.weft" "type error: nominal record update field type mismatch"
+check_rejects "nominal_update_field_type_mismatch" "test/negative/nominal_update_field_type_mismatch.weft" 'error[E1002]: record update type mismatch: expected `i64`, found `str`'
 check_rejects "nominal_update_duplicate_field" "test/negative/nominal_update_duplicate_field.weft" "type error: duplicate record field"
 check_rejects "nominal_update_variant" "test/negative/nominal_update_variant.weft" "type error: functional update requires a record value"
 check_rejects "structural_update_tuple" "test/negative/structural_update_tuple.weft" "type error: named-field functional update is not available on tuples"
@@ -750,14 +750,14 @@ check_rejects "array_length_overflow" "test/negative/array_length_overflow.weft"
 check_rejects "array_type_bad_shape" "test/negative/array_type_bad_shape.weft" "type error: array or slice type must be"
 check_rejects "array_type_empty" "test/negative/array_type_empty.weft" "type error: array or slice type must be"
 check_rejects "array_type_mut_fixed" "test/negative/array_type_mut_fixed.weft" "type error: fixed arrays cannot use mut in the element position"
-check_rejects "array_length_mismatch" "test/negative/array_length_mismatch.weft" "type error: return type mismatch"
-check_rejects "array_covariance_reverse" "test/negative/array_covariance_reverse.weft" "type error: return type mismatch"
-check_rejects "slice_covariance_reverse" "test/negative/slice_covariance_reverse.weft" "type error: return type mismatch"
-check_rejects "mutable_slice_invariant" "test/negative/mutable_slice_invariant.weft" "type error: return type mismatch"
-check_rejects "mutable_slice_requires_reborrow" "test/negative/mutable_slice_requires_reborrow.weft" "type error: return type mismatch"
+check_rejects "array_length_mismatch" "test/negative/array_length_mismatch.weft" 'error[E1002]: return value type mismatch: expected `[i64; 3]`, found `[i64; 2]`'
+check_rejects "array_covariance_reverse" "test/negative/array_covariance_reverse.weft" 'error[E1002]: return value type mismatch: expected `[bool; 2]`, found `[i64; 2]`'
+check_rejects "slice_covariance_reverse" "test/negative/slice_covariance_reverse.weft" 'error[E1002]: return value type mismatch: expected `[bool]`, found `[i64]`'
+check_rejects "mutable_slice_invariant" "test/negative/mutable_slice_invariant.weft" 'error[E1002]: return value type mismatch: expected `[mut i64]`, found `[mut bool]`'
+check_rejects "mutable_slice_requires_reborrow" "test/negative/mutable_slice_requires_reborrow.weft" 'error[E1002]: return value type mismatch: expected `[i64]`, found `[mut i64]`'
 check_rejects "array_literal_repetition_unsupported" "test/negative/array_literal_unsupported.weft" "error: array repetition syntax is not supported; write every element"
-check_rejects "array_literal_length_mismatch" "test/negative/array_literal_length_mismatch.weft" "type error: return type mismatch"
-check_rejects "array_literal_element_mismatch" "test/negative/array_literal_element_mismatch.weft" "type error: return type mismatch"
+check_rejects "array_literal_length_mismatch" "test/negative/array_literal_length_mismatch.weft" 'error[E1002]: return value type mismatch: expected `[i64; 3]`, found `[i64; 2]`'
+check_rejects "array_literal_element_mismatch" "test/negative/array_literal_element_mismatch.weft" 'error[E1002]: return value type mismatch: expected `[u8; 2]`, found `[i64; 2]`'
 check_rejects "array_literal_missing_comma" "test/negative/array_literal_missing_comma.weft" "error: expected ',' or ']' in array literal"
 check_rejects "array_literal_mixed_storage_union" "test/negative/array_literal_mixed_storage_union.weft" "type error: array element union has no uniform untagged storage; use a variant type"
 check_rejects "array_len_unknown_field" "test/negative/array_len_unknown_field.weft" "type error: unknown indexed-storage field; arrays and slices expose .len"
@@ -770,7 +770,7 @@ check_rejects "index_set_immutable_slice" "test/negative/index_set_immutable_sli
 check_rejects "index_set_unnamed_container" "test/negative/index_set_unnamed_container.weft" "type error: indexed mutation requires a named container binding"
 check_rejects "index_set_non_indexed" "test/negative/index_set_non_indexed.weft" "type error: indexed mutation requires an array or mutable slice"
 check_rejects "index_set_wrong_index_type" "test/negative/index_set_wrong_index_type.weft" "type error: index must be usize"
-check_rejects "index_set_value_mismatch" "test/negative/index_set_value_mismatch.weft" "type error: indexed assignment type mismatch"
+check_rejects "index_set_value_mismatch" "test/negative/index_set_value_mismatch.weft" 'error[E1002]: indexed assignment type mismatch: expected `i64`, found `str`'
 check_rejects "slice_non_indexed" "test/negative/slice_non_indexed.weft" "type error: slicing requires an array, slice, or Vector"
 check_rejects "slice_start_wrong_type" "test/negative/slice_start_wrong_type.weft" "type error: slice bound must be usize"
 check_rejects "slice_end_wrong_type" "test/negative/slice_end_wrong_type.weft" "type error: slice bound must be usize"
@@ -823,13 +823,13 @@ check_rejects "effect_unqualified_perform_ambiguous" "test/negative/effect_unqua
 check_rejects "effect_unqualified_handler_ambiguous" "test/negative/effect_unqualified_handler_ambiguous.weft" "type error: ambiguous handler effect atom; qualify the clause"
 check_rejects "effect_qualified_perform_mismatch" "test/negative/effect_qualified_perform_mismatch.weft" "type error: effect atom not available in caller"
 check_rejects "effect_qualified_handler_mismatch" "test/negative/effect_qualified_handler_mismatch.weft" "type error: effect not available in caller"
-check_rejects "effect_perform_arg_instantiation_mismatch" "test/negative/effect_perform_arg_instantiation_mismatch.weft" "type error: argument type mismatch"
-check_rejects "effect_resume_instantiation_mismatch" "test/negative/effect_resume_instantiation_mismatch.weft" "type error: resume type mismatch"
+check_rejects "effect_perform_arg_instantiation_mismatch" "test/negative/effect_perform_arg_instantiation_mismatch.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
+check_rejects "effect_resume_instantiation_mismatch" "test/negative/effect_resume_instantiation_mismatch.weft" 'error[E1002]: handler clause result type mismatch: expected `str`, found `i64`'
 check_rejects "return_clause_deferred" "test/negative/return_clause_deferred.weft" "type error: return clause with deferred clauses is not yet supported"
 check_rejects "handler_two_return_clauses" "test/negative/handler_two_return_clauses.weft" "error: at most one return clause per handler"
 check_rejects "trait_complement_surface" "test/negative/trait_complement_surface.weft" "type error: trait complement is not a surface type"
-check_rejects "import_cycle" "test/negative/import_cycle.weft" "error\[E4001\]: circular import: test/negative/import_cycle -> test/negative/import_cycle_helper -> test/negative/import_cycle"
-check_rejects "import_cycle_direct" "test/negative/import_cycle_direct.weft" "error\[E4001\]: circular import: test/negative/import_cycle_direct -> test/negative/import_cycle_direct"
+check_rejects "import_cycle" "test/negative/import_cycle.weft" "error[E4001]: circular import: test/negative/import_cycle -> test/negative/import_cycle_helper -> test/negative/import_cycle"
+check_rejects "import_cycle_direct" "test/negative/import_cycle_direct.weft" "error[E4001]: circular import: test/negative/import_cycle_direct -> test/negative/import_cycle_direct"
 check_rejects "call_site_label_unsupported" "test/negative/call_site_label_unsupported.weft" "error: call-site argument labels are not supported yet"
 check_rejects "rigid_tail_concrete_perform" "test/negative/rigid_tail_concrete_perform.weft" "type error: effect not available in caller"
 check_rejects "rigid_tail_concrete_call" "test/negative/rigid_tail_concrete_call.weft" "type error: effect not available in caller"
@@ -841,9 +841,9 @@ check_rejects "borrow_nested_ownership" "test/negative/borrow_nested_ownership.w
 check_rejects "borrow_temporary_actual" "test/negative/borrow_temporary_actual.weft" "type error: resource borrow requires a named owned binding"
 check_rejects "borrow_mut_immutable_owner" "test/negative/borrow_mut_immutable_owner.weft" "type error: exclusive resource borrow requires a mutable owner binding"
 check_rejects "borrow_shared_to_exclusive" "test/negative/borrow_shared_to_exclusive.weft" "type error: shared resource borrow cannot be forwarded as exclusive"
-check_rejects "borrow_actual_type_mismatch" "test/negative/borrow_actual_type_mismatch.weft" "type error: resource borrow type mismatch"
+check_rejects "borrow_actual_type_mismatch" "test/negative/borrow_actual_type_mismatch.weft" 'error[E1002]: borrowed argument type mismatch: expected `BorrowExpectedToken`, found `BorrowActualToken`'
 check_rejects "borrow_conflicting_call" "test/negative/borrow_conflicting_call.weft" "type error: conflicting resource borrows in one call"
-check_rejects "borrow_escape_to_owned" "test/negative/borrow_escape_to_owned.weft" "type error: argument type mismatch"
+check_rejects "borrow_escape_to_owned" "test/negative/borrow_escape_to_owned.weft" 'error[E1002]: argument type mismatch: expected `owned BorrowEscapeToken`, found `borrow BorrowEscapeToken`'
 check_rejects "borrow_mut_method_immutable_owner" "test/negative/borrow_mut_method_immutable_owner.weft" "type error: exclusive resource borrow requires a mutable owner binding"
 check_rejects "borrow_effect_conflicting_perform" "test/negative/borrow_effect_conflicting_perform.weft" "type error: conflicting resource borrows in one call" 1
 check_rejects "borrow_effect_deferred_continuation" "test/negative/borrow_effect_deferred_continuation.weft" "type error: borrowed effect parameter cannot enter a deferred continuation" 1
