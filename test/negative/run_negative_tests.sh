@@ -144,7 +144,7 @@ check_rejects "par_map_scoped_effectful" "test/negative/par_map_scoped_effectful
 check_rejects "par_pool_submit_effectful" "test/negative/par_pool_submit_effectful.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -[Log]> i64`'
 check_rejects "par_prepared_submit_public" "test/negative/par_prepared_submit_public.weft" "type error: prepared Par submission is compiler-internal"
 check_rejects "generic_par_task_double_await" "test/negative/generic_par_task_double_await.weft" "type error: unique value used more than once"
-check_rejects "generic_par_task_non_sendable_result" "test/negative/generic_par_task_non_sendable_result.weft" "type error: type is not Sendable"
+check_rejects "generic_par_task_non_sendable_result" "test/negative/generic_par_task_non_sendable_result.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
 check_rejects "generic_par_task_non_sendable_capture" "test/negative/generic_par_task_non_sendable_capture.weft" "type error: closure capture is not Sendable across scoped Par"
 check_rejects "generic_par_task_type_mismatch" "test/negative/generic_par_task_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `unique ParTask<str>`, found `unique ParTask<i64>`'
 check_rejects "generic_par_task_forged" "test/negative/generic_par_task_forged.weft" "type error: ParTask is a sealed runtime token and cannot be constructed"
@@ -243,7 +243,7 @@ check_rejects "trait_impl_return_mismatch" "test/negative/trait_impl_return_mism
 check_rejects "trait_impl_effect_mismatch" "test/negative/trait_impl_effect_mismatch.weft" "type error: impl method effect mismatch"
 check_rejects "generic_impl_overlap_conflict" "test/negative/generic_impl_overlap_conflict.weft" "type error: conflicting implementations of trait for type"
 check_rejects "generic_impl_repeated_overlap_conflict" "test/negative/generic_impl_repeated_overlap_conflict.weft" "type error: conflicting implementations of trait for type"
-check_rejects "generic_impl_conditional_bound" "test/negative/generic_impl_conditional_bound.weft" "type error: type does not satisfy trait bound"
+check_rejects "generic_impl_conditional_bound" "test/negative/generic_impl_conditional_bound.weft" 'error[E1004]: type `ConditionalBox<bool>` does not implement `Identity`'
 check_rejects "generic_impl_target_arity" "test/negative/generic_impl_target_arity.weft" "type error: impl target type argument count mismatch"
 check_rejects "generic_impl_unconstrained_parameter" "test/negative/generic_impl_unconstrained_parameter.weft" "type error: impl parameter is not determined by the target type"
 check_rejects "generic_impl_repeated_receiver_mismatch" "test/negative/generic_impl_repeated_receiver_mismatch.weft" "type error: unknown method"
@@ -252,22 +252,22 @@ check_rejects "impl_method_type_params_unsupported" "test/negative/impl_method_t
 check_rejects "trait_assoc_missing" "test/negative/trait_assoc_missing.weft" "type error: impl missing required associated type"
 check_rejects "trait_assoc_duplicate" "test/negative/trait_assoc_duplicate.weft" "type error: duplicate associated type binding"
 check_rejects "trait_assoc_extra" "test/negative/trait_assoc_extra.weft" "type error: impl associated type is not declared by trait"
-check_rejects "trait_assoc_bound_concrete" "test/negative/trait_assoc_bound_concrete.weft" "type error: associated type does not satisfy trait bound"
-check_rejects "trait_assoc_bound_generic" "test/negative/trait_assoc_bound_generic.weft" "type error: associated type does not satisfy trait bound"
+check_rejects "trait_assoc_bound_concrete" "test/negative/trait_assoc_bound_concrete.weft" 'error[E1004]: type `str` does not implement `AssocBoundConcreteValue`'
+check_rejects "trait_assoc_bound_generic" "test/negative/trait_assoc_bound_generic.weft" 'error[E1004]: type `T` does not implement `AssocBoundGenericValue`'
 check_rejects "trait_assoc_signature_mismatch" "test/negative/trait_assoc_signature_mismatch.weft" "type error: impl method parameter type mismatch"
 check_rejects "trait_impl_conflict" "test/negative/trait_impl_conflict.weft" "type error: conflicting implementations of trait for type"
 check_rejects "orphan_neither_local" "test/negative/orphan_neither_local.weft" "type error: orphan impl is not allowed — define the trait or target type in this file"
 check_rejects "orphan_primitive_foreign_trait" "test/negative/orphan_primitive_foreign_trait.weft" "type error: orphan impl is not allowed — define the trait or target type in this file"
-check_rejects "ord_missing_impl" "test/negative/ord_missing_impl.weft" "type error: ordering operands must implement Ord"
+check_rejects "ord_missing_impl" "test/negative/ord_missing_impl.weft" 'error[E1004]: type `Unordered` does not implement `Ord`'
 check_rejects "ord_operand_mismatch" "test/negative/ord_operand_mismatch.weft" "type error: ordering operand type mismatch"
-check_rejects "ord_unbounded_generic" "test/negative/ord_unbounded_generic.weft" "type error: ordering operands must implement Ord"
+check_rejects "ord_unbounded_generic" "test/negative/ord_unbounded_generic.weft" 'error[E1004]: type `T` does not implement `Ord`'
 check_rejects "ord_wrong_signature" "test/negative/ord_wrong_signature.weft" "type error: Ord must define compare(self, Self) -> i64"
 check_rejects "ord_effectful_signature" "test/negative/ord_effectful_signature.weft" "type error: Ord must define compare(self, Self) -> i64"
-check_rejects "display_missing_impl" "test/negative/display_missing_impl.weft" "type error: type does not satisfy trait bound"
-check_rejects "hash_missing_impl" "test/negative/hash_missing_impl.weft" "type error: type does not satisfy trait bound"
+check_rejects "display_missing_impl" "test/negative/display_missing_impl.weft" "error[E1004]:"
+check_rejects "hash_missing_impl" "test/negative/hash_missing_impl.weft" 'error[E1004]: type `bool` does not implement `Hash`'
 check_rejects "display_wrong_signature" "test/negative/display_wrong_signature.weft" "type error: impl method return type mismatch"
 check_rejects "display_effectful_signature" "test/negative/display_effectful_signature.weft" "type error: impl method effect mismatch"
-check_rejects "default_missing_impl" "test/negative/default_missing_impl.weft" "type error: type does not satisfy trait bound"
+check_rejects "default_missing_impl" "test/negative/default_missing_impl.weft" "error[E1004]:"
 check_rejects "default_impl_return_mismatch" "test/negative/default_impl_return_mismatch.weft" "type error: impl method return type mismatch"
 check_rejects "default_impl_effect_mismatch" "test/negative/default_impl_effect_mismatch.weft" "type error: impl method effect mismatch"
 check_rejects "associated_function_value_call" "test/negative/associated_function_value_call.weft" "type error: associated function must be called on a type"
@@ -278,14 +278,14 @@ check_rejects "result_unwrap_or_type_mismatch" "test/negative/result_unwrap_or_t
 check_rejects "list_prepend_type_mismatch" "test/negative/list_prepend_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
 check_rejects "vector_cross_type_push" "test/negative/vector_cross_type_push.weft" 'error[E1002]: argument type mismatch: expected `Vector<str>`, found `Vector<i64>`'
 check_rejects "persistent_vector_cross_type_push" "test/negative/persistent_vector_cross_type_push.weft" 'error[E1002]: argument type mismatch: expected `PersistentVector<str>`, found `PersistentVector<i64>`'
-check_rejects "vector_sort_missing_ord" "test/negative/vector_sort_missing_ord.weft" "type error: type does not satisfy trait bound"
+check_rejects "vector_sort_missing_ord" "test/negative/vector_sort_missing_ord.weft" "error[E1004]:"
 check_rejects "vector_sort_effectful_comparator" "test/negative/vector_sort_effectful_comparator.weft" 'error[E1002]: argument type mismatch: expected `(i64, i64) -> i64`, found `(i64, i64) -[SortNoise]> i64`'
 check_rejects "vector_filter_effectful_predicate" "test/negative/vector_filter_effectful_predicate.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> bool`, found `(i64) -[FilterNoise]> bool`'
 check_rejects "vector_concat_type_mismatch" "test/negative/vector_concat_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `Vector<i64>`, found `Vector<str>`'
 check_rejects "generic_function_ref_unresolved" "test/negative/generic_function_ref_unresolved.weft" "type error: cannot infer generic function reference"
 check_rejects "map_wrong_key_type" "test/negative/map_wrong_key_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "map_wrong_value_type" "test/negative/map_wrong_value_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
-check_rejects "map_key_requires_hash" "test/negative/map_key_requires_hash.weft" "type error: type does not satisfy trait bound"
+check_rejects "map_key_requires_hash" "test/negative/map_key_requires_hash.weft" "error[E1004]:"
 check_rejects "set_wrong_element_type" "test/negative/set_wrong_element_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "map_set_handle_confusion" "test/negative/map_set_handle_confusion.weft" 'error[E1002]: argument type mismatch: expected `Map<i64, i64>`, found `Set<i64>`'
 check_rejects "map_sentinel_lookup_removed" "test/negative/map_sentinel_lookup_removed.weft" "type error: arity mismatch"
@@ -346,7 +346,7 @@ check_rejects "module_qualified_effect_identity_mismatch" "test/negative/module_
 check_rejects "module_qualified_trait_unknown" "test/negative/module_qualified_trait_unknown.weft" "error[E4002]: unknown module member 'traits.Missing'"
 check_rejects "module_qualified_trait_private" "test/negative/module_qualified_trait_private.weft" "error[E4004]: module member 'traits.HiddenGauge' is not visible"
 check_rejects "module_qualified_trait_identity_mismatch" "test/negative/module_qualified_trait_identity_mismatch.weft" "type error: impl missing required method"
-check_rejects "module_qualified_trait_bound_identity_mismatch" "test/negative/module_qualified_trait_bound_identity_mismatch.weft" "type error: type does not satisfy trait bound"
+check_rejects "module_qualified_trait_bound_identity_mismatch" "test/negative/module_qualified_trait_bound_identity_mismatch.weft" 'error[E1004]: type `QualifiedBoundMismatchBox` does not implement `module_fixtures/g2_trait_right.Gauge`'
 check_rejects "module_qualified_trait_bound_unknown" "test/negative/module_qualified_trait_bound_unknown.weft" "error[E4002]: unknown module member 'traits.Missing'"
 check_rejects "module_qualified_trait_bound_private" "test/negative/module_qualified_trait_bound_private.weft" "error[E4004]: module member 'traits.HiddenGauge' is not visible"
 check_rejects "module_qualified_member_ambiguous" "test/negative/module_qualified_member_ambiguous.weft" "error[E4003]: module item 'work' is ambiguous in this scope" 1
@@ -450,7 +450,7 @@ check_rejects "opaque_construct_reexported" "test/negative/opaque_construct_reex
 check_rejects "opaque_missing_drop" "test/negative/opaque_missing_drop.weft" "type error: owned type requires Drop resource conformance"
 check_rejects "opaque_use_after_move" "test/negative/opaque_use_after_move.weft" "type error: owned value used more than once"
 check_rejects "opaque_representation_too_wide" "test/negative/opaque_representation_too_wide.weft" "type error: result type exceeds 8-lane native ABI"
-check_rejects "opaque_mutable_representation_not_sendable" "test/negative/opaque_mutable_representation_not_sendable.weft" "type error: type is not Sendable"
+check_rejects "opaque_mutable_representation_not_sendable" "test/negative/opaque_mutable_representation_not_sendable.weft" 'error[E1004]: type `MutableOpaque` does not implement `Sendable`'
 check_rejects "file_handle_constructor_private" "test/negative/file_handle_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "file_handle_record_fabrication" "test/negative/file_handle_record_fabrication.weft" "type error: not a record type"
 check_rejects "file_handle_field_private" "test/negative/file_handle_field_private.weft" "type error: unknown field"
@@ -469,7 +469,7 @@ check_rejects "not_operand_not_bool" "test/negative/not_operand_not_bool.weft" "
 check_rejects "logical_operand_not_bool" "test/negative/logical_operand_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "match_guard_not_bool" "test/negative/match_guard_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "operator_equality_mismatch" "test/negative/operator_equality_mismatch.weft" "type error: equality operand mismatch"
-check_rejects "operator_relational_str" "test/negative/operator_relational_str.weft" "type error: ordering operands must implement Ord"
+check_rejects "operator_relational_str" "test/negative/operator_relational_str.weft" 'error[E1004]: type `str` does not implement `Ord`'
 check_rejects "operator_bitwise_bool" "test/negative/operator_bitwise_bool.weft" "type error: bitwise operand is not i64"
 check_rejects "operator_shift_bool" "test/negative/operator_shift_bool.weft" "type error: bitwise operand is not i64"
 check_rejects "f64_i64_arithmetic_mismatch" "test/negative/f64_i64_arithmetic_mismatch.weft" "type error: arithmetic operand type mismatch"
@@ -518,11 +518,11 @@ check_rejects "num_i64_to_i8_checked_arg_mismatch" "test/negative/num_i64_to_i8_
 check_rejects "num_int_cast_value_or_default_mismatch" "test/negative/num_int_cast_value_or_default_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i8`, found `str`'
 check_rejects "intrinsic_i64_to_i8_arg_mismatch" "test/negative/intrinsic_i64_to_i8_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `u64`'
 check_rejects "intrinsic_u16_to_u64_arg_mismatch" "test/negative/intrinsic_u16_to_u64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u16`, found `f64`'
-check_rejects "num_trait_bool_not_numeric" "test/negative/num_trait_bool_not_numeric.weft" "type error: type does not satisfy trait bound"
-check_rejects "num_trait_str_not_integer" "test/negative/num_trait_str_not_integer.weft" "type error: type does not satisfy trait bound"
-check_rejects "num_trait_float_not_integer" "test/negative/num_trait_float_not_integer.weft" "type error: type does not satisfy trait bound"
-check_rejects "num_trait_unsigned_not_signed" "test/negative/num_trait_unsigned_not_signed.weft" "type error: type does not satisfy trait bound"
-check_rejects "num_trait_signed_not_unsigned" "test/negative/num_trait_signed_not_unsigned.weft" "type error: type does not satisfy trait bound"
+check_rejects "num_trait_bool_not_numeric" "test/negative/num_trait_bool_not_numeric.weft" "error[E1004]:"
+check_rejects "num_trait_str_not_integer" "test/negative/num_trait_str_not_integer.weft" "error[E1004]:"
+check_rejects "num_trait_float_not_integer" "test/negative/num_trait_float_not_integer.weft" "error[E1004]:"
+check_rejects "num_trait_unsigned_not_signed" "test/negative/num_trait_unsigned_not_signed.weft" "error[E1004]:"
+check_rejects "num_trait_signed_not_unsigned" "test/negative/num_trait_signed_not_unsigned.weft" "error[E1004]:"
 check_rejects "unhandled_effect_in_if_condition" "test/negative/unhandled_effect_in_if_condition.weft" "error[E2001]:"
 check_rejects "unhandled_effect_in_match_guard" "test/negative/unhandled_effect_in_match_guard.weft" "error[E2001]:"
 check_rejects "assignment_unknown_target" "test/negative/assignment_unknown_target.weft" "error[E1001]: unknown identifier 'missing'"
@@ -784,10 +784,10 @@ check_rejects "slice_local_return_binding" "test/negative/slice_local_return_bin
 check_rejects "slice_aggregate_return" "test/negative/slice_aggregate_return.weft" "type error: slice-containing aggregate cannot escape its borrow scope"
 check_rejects "slice_local_closure_capture" "test/negative/slice_local_closure_capture.weft" "type error: slice borrow cannot be captured by an escaping closure"
 check_rejects "slice_par_mutable_worker" "test/negative/slice_par_mutable_worker.weft" "type error: mutable slice cannot cross a scoped Par boundary"
-check_rejects "sendable_bound_mutable_vector" "test/negative/sendable_bound_mutable_vector.weft" "type error: type is not Sendable"
-check_rejects "sendable_bound_nested_mutable" "test/negative/sendable_bound_nested_mutable.weft" "type error: type is not Sendable"
-check_rejects "sendable_bound_function_requires_value" "test/negative/sendable_bound_function_requires_value.weft" "type error: type is not Sendable"
-check_rejects "sendable_bound_slice_requires_scope" "test/negative/sendable_bound_slice_requires_scope.weft" "type error: type is not Sendable"
+check_rejects "sendable_bound_mutable_vector" "test/negative/sendable_bound_mutable_vector.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
+check_rejects "sendable_bound_nested_mutable" "test/negative/sendable_bound_nested_mutable.weft" 'error[E1004]: type `SendableEnvelope<Vector<i64>>` does not implement `Sendable`'
+check_rejects "sendable_bound_function_requires_value" "test/negative/sendable_bound_function_requires_value.weft" 'error[E1004]: type `(i64) -> i64` does not implement `Sendable`'
+check_rejects "sendable_bound_slice_requires_scope" "test/negative/sendable_bound_slice_requires_scope.weft" 'error[E1004]: type `[i64]` does not implement `Sendable`'
 check_rejects "sendable_par_worker_mutable_state_capture" "test/negative/sendable_par_worker_mutable_state_capture.weft" "type error: closure capture is not Sendable across scoped Par"
 check_rejects "sendable_reserved_trait" "test/negative/sendable_reserved_trait.weft" "type error: Sendable is reserved as a sealed structural predicate"
 check_rejects "sendable_sealed_impl" "test/negative/sendable_sealed_impl.weft" "type error: Sendable is a sealed structural predicate and cannot be implemented"
