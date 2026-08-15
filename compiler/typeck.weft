@@ -29,10 +29,10 @@ use runtime/buffer.{*}
 use runtime/memory.{*}
 use runtime/string.{runtime_int_to_str, runtime_str_from_bytes_copy}
 use stdlib/diagnostic.{*}
-use stdlib/diagnostic_registry.{diagnostic_code_non_exhaustive_match, diagnostic_code_type_mismatch, diagnostic_code_unknown_name}
+use stdlib/diagnostic_registry.{diagnostic_code_effect_unavailable, diagnostic_code_non_exhaustive_match, diagnostic_code_type_mismatch, diagnostic_code_unknown_name}
 use stdlib/diagnostic_type.{*}
 use stdlib/semantic_type.{*}
-use stdlib/semantic_type_render.{semantic_type_render}
+use stdlib/semantic_type_render.{semantic_effect_atom_render, semantic_effect_set_render, semantic_type_render}
 use stdlib/utf8.{utf8_decode_is_ok, utf8_decode_next_bytes, utf8_decode_next_pos, utf8_decode_scalar}
 
 -- span is an offset into src; the diagnostic carries the absolute address so
@@ -6167,32 +6167,209 @@ pub(package) fn collect_expr_effects(node: i64, env: i64, ft: i64, src: i64, tt:
   }
 }
 
-pub(package) fn check_effect_hash_available(eff_hash: i64, src: i64, pos: i64, caller_eff: i64) -[Diagnose]> i64 {
-  if caller_eff == 0 { 0 }
+-- Active-handler frames are checker facts, not syntax rediscovery. They let a
+-- diagnostic distinguish "unhandled" from the more useful "the nearest
+-- handler handles the same effect head at a different instantiation".
+pub(package) fn typeck_handler_frame(atom: i64, src: i64, start: i64, len: i64, parent: i64) -> i64 {
+  let frame = alloc_words(5)
+  mem_store64_at(frame, 0, atom)
+  mem_store64_at(frame + 8, 0, src)
+  mem_store64_at(frame + 16, 0, start)
+  mem_store64_at(frame + 24, 0, len)
+  mem_store64_at(frame + 32, 0, parent)
+  frame
+}
+
+pub(package) fn typeck_handler_frame_atom(frame: i64) -> i64 { if frame == 0 { 0 } else { mem_load64_at(frame, 0) } }
+pub(package) fn typeck_handler_frame_parent(frame: i64) -> i64 { if frame == 0 { 0 } else { mem_load64_at(frame + 32, 0) } }
+pub(package) fn typeck_handler_frame_location(frame: i64) -> DiagnosticLocation {
+  if frame == 0 { DiagnosticLocationNone }
+  else { typeck_source_location(mem_load64_at(frame + 8, 0), mem_load64_at(frame + 16, 0), mem_load64_at(frame + 24, 0)) }
+}
+
+pub(package) fn typeck_nearest_same_head_handler(tt: i64, atom: i64) -> i64 {
+  if tt == 0 or atom == 0 { 0 }
   else {
-    -- 4c: a perform names only the head; membership is head-based (the
-    -- caller's atom may be parameterized). Fall back to the rigid subset
-    -- for the no-atom cases (pure sig, tail-only sig).
-    if effect_sig_find_atom_by_head(caller_eff, eff_hash) != 0 { 0 }
-    else { if effect_is_subset_rigid(effect_sig_one(eff_hash), caller_eff) { 0 }
-    else {
-      typeck_error_maybe(src, pos, "type error: effect not available in caller")
-      1
-    } }
+    let mut frame = ttable_get_current_handler(tt)
+    let mut found = 0
+    while frame != 0 and found == 0 {
+      let handled = typeck_handler_frame_atom(frame)
+      if handled != 0 and effect_atom_head(handled) == effect_atom_head(atom) and not effect_atom_eq(handled, atom) {
+        found = frame
+      } else { frame = typeck_handler_frame_parent(frame) }
+    }
+    found
   }
 }
 
-pub(package) fn check_effect_atom_available(atom: i64, src: i64, pos: i64, caller_eff: i64) -[Diagnose]> i64 {
-  if atom == 0 or caller_eff == 0 { 0 }
+pub(package) fn typeck_effect_sig_from_atom(atom: i64) -> i64 {
+  let atoms = nlist_new()
+  if atom != 0 { nlist_add(atoms, atom) } else { 0 }
+  ty_effect_sig(atoms)
+}
+
+pub(package) fn typeck_missing_effects(required: i64, available: i64) -> i64 {
+  if required == 0 or ty_tag(required) != 10 { ty_effect_pure() }
   else {
-    let one = nlist_new()
-    nlist_add(one, atom)
-    if effect_is_subset_rigid(ty_effect_sig(one), caller_eff) { 0 }
-    else {
-      typeck_error_maybe(src, pos, "type error: effect atom not available in caller")
-      1
+    let missing = nlist_new()
+    let available_atoms = if available != 0 and ty_tag(available) == 10 { ty_f1(available) } else { nlist_new() }
+    for i in 0..nlist_len(ty_f1(required)) {
+      let required_atom = nlist_get(ty_f1(required), i)
+      let mut found = false
+      for j in 0..nlist_len(available_atoms) {
+        if effect_atom_eq(required_atom, nlist_get(available_atoms, j)) { found = true } else { 0 }
+      }
+      if not found { nlist_add(missing, required_atom) } else { 0 }
     }
+    let missing_tail = if ty_f2(required) > 0 and (available == 0 or ty_tag(available) != 10 or ty_f2(available) == 0) { ty_f2(required) } else { 0 }
+    ty_effect_sig_with_tail(missing, missing_tail)
   }
+}
+
+pub(package) fn typeck_first_effect_atom(effects: i64) -> i64 {
+  if effects == 0 or ty_tag(effects) != 10 or nlist_len(ty_f1(effects)) == 0 { 0 }
+  else { nlist_get(ty_f1(effects), 0) }
+}
+
+pub(package) fn typeck_effect_unavailable_reason(missing: i64, available: i64) -> str {
+  let atom = typeck_first_effect_atom(missing)
+  let same_head = if atom == 0 or available == 0 or ty_tag(available) != 10 { 0 }
+    else { effect_sig_find_atom_by_head(available, effect_atom_head(atom)) }
+  if available != 0 and ty_tag(available) == 10 and nlist_len(ty_f1(available)) == 0 and ty_f2(available) == 0 { "pure_context" }
+  else { if same_head != 0 and not effect_atom_eq(atom, same_head) {
+    if effect_atom_same_declaration(atom, same_head) { "different_instantiation" } else { "different_effect_declaration" }
+  }
+  else { if atom == 0 and missing != 0 and ty_tag(missing) == 10 and ty_f2(missing) > 0 { "open_effect_tail" }
+  else { "missing_effect" } } }
+}
+
+pub(package) fn typeck_effect_unavailable_message(missing_text: str, missing: i64) -> str {
+  let b = buf_new(__str_len(missing_text) + 64)
+  let atom_count = if missing == 0 or ty_tag(missing) != 10 { 0 } else { nlist_len(ty_f1(missing)) }
+  let has_tail = if missing == 0 or ty_tag(missing) != 10 { false } else { ty_f2(missing) > 0 }
+  if atom_count == 1 and not has_tail { bstr(b, "effect `") } else { bstr(b, "effects `") }
+  bstr(b, missing_text)
+  bstr(b, "` ")
+  if atom_count == 1 and not has_tail { bstr(b, "is") } else { bstr(b, "are") }
+  bstr(b, " not available in this context")
+  runtime_str_from_bytes_copy(buf_ptr(b), buf_len(b))
+}
+
+pub(package) fn typeck_effect_origin_label(context: str) -> str {
+  if typeck_text_eq(context, "effect operation") == 1 { "operation requires this effect" }
+  else { if typeck_text_eq(context, "method call") == 1 { "method declares this effect" }
+  else { "callee declares this effect" } }
+}
+
+pub(package) fn typeck_report_effect_unavailable(
+  required: i64,
+  src: i64,
+  start: i64,
+  len: i64,
+  available: i64,
+  tt: i64,
+  context: str,
+  origin: DiagnosticLocation
+) -[Diagnose]> i64 {
+  let missing = typeck_missing_effects(required, available)
+  let tparams = if tt == 0 { 0 } else { ttable_get_tparams(tt) }
+  let required_fact = semantic_type_fact_effects(required, tt, src, tparams)
+  let available_fact = semantic_type_fact_effects(available, tt, src, tparams)
+  let missing_fact = semantic_type_fact_effects(missing, tt, src, tparams)
+  let missing_text = semantic_effect_set_render(missing_fact)
+  let available_text = semantic_effect_set_render(available_fact)
+  let reason = typeck_effect_unavailable_reason(missing, available)
+  let missing_atom = typeck_first_effect_atom(missing)
+  let available_same_head = if missing_atom == 0 or available == 0 or ty_tag(available) != 10 { 0 }
+    else { effect_sig_find_atom_by_head(available, effect_atom_head(missing_atom)) }
+  let near_handler = typeck_nearest_same_head_handler(tt, missing_atom)
+  let near_atom = if near_handler != 0 { typeck_handler_frame_atom(near_handler) } else { available_same_head }
+  let near_text = if near_atom == 0 { "" }
+    else { semantic_effect_atom_render(semantic_type_fact_effect_atom(near_atom, tt, src, tparams)) }
+  let mut fields = DiagnosticFieldCons(
+    DiagnosticFieldText("context", context),
+    DiagnosticFieldCons(
+      DiagnosticFieldText("reason", reason),
+      DiagnosticFieldCons(
+        DiagnosticFieldEffectSet("required_effects", required_fact),
+        DiagnosticFieldCons(
+          DiagnosticFieldEffectSet("available_effects", available_fact),
+          DiagnosticFieldCons(
+            DiagnosticFieldEffectSet("missing_effects", missing_fact),
+            DiagnosticFieldCons(
+              DiagnosticFieldText("missing_effects_text", missing_text),
+              DiagnosticFieldCons(
+                DiagnosticFieldText("available_effects_text", available_text),
+                DiagnosticFieldCons(
+                  DiagnosticFieldSuggestion(DiagnosticSuggestion(
+                    "add the missing effect to the enclosing signature or handle it here",
+                    DiagnosticSuggestionMaybeIncorrect,
+                    DiagnosticTextEditNil
+                  )),
+                  DiagnosticFieldNil
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  if missing_atom != 0 {
+    fields = DiagnosticFieldCons(DiagnosticFieldEffectAtom("missing_effect", semantic_type_fact_effect_atom(missing_atom, tt, src, tparams)), fields)
+  } else { 0 }
+  if near_atom != 0 {
+    fields = DiagnosticFieldCons(
+      DiagnosticFieldEffectAtom("nearby_effect", semantic_type_fact_effect_atom(near_atom, tt, src, tparams)),
+      DiagnosticFieldCons(DiagnosticFieldText("nearby_effect_text", near_text), fields)
+    )
+  } else { 0 }
+  let origin_related = match origin {
+    DiagnosticLocationNone -> DiagnosticRelatedLocationNil
+    _ -> DiagnosticRelatedLocationCons(DiagnosticRelatedLocation(typeck_effect_origin_label(context), origin), DiagnosticRelatedLocationNil)
+  }
+  let related = if near_handler == 0 { origin_related }
+    else {
+      DiagnosticRelatedLocationCons(
+        DiagnosticRelatedLocation(
+          if typeck_text_eq(reason, "different_effect_declaration") == 1 {
+            "nearest handler handles a different effect declaration with the same short name"
+          } else { "nearest handler handles a different instantiation of this effect" },
+          typeck_handler_frame_location(near_handler)
+        ),
+        origin_related
+      )
+    }
+  diagnostic_report(diagnostic_new(
+    DiagnosticSeverityError,
+    DiagnosticClassEffect,
+    diagnostic_code_effect_unavailable(),
+    typeck_effect_unavailable_message(missing_text, missing),
+    typeck_source_location(src, start, len),
+    related,
+    fields
+  ))
+}
+
+pub(package) fn check_effect_sig_available(required: i64, src: i64, pos: i64, len: i64, caller_eff: i64, tt: i64, context: str, origin: DiagnosticLocation) -[Diagnose]> i64 {
+  if required == 0 or caller_eff == 0 or effect_is_subset_rigid(required, caller_eff) { 0 }
+  else { typeck_report_effect_unavailable(required, src, pos, len, caller_eff, tt, context, origin) 1 }
+}
+
+pub(package) fn check_effect_hash_available(eff_hash: i64, src: i64, pos: i64, caller_eff: i64, tt: i64, context: str) -[Diagnose]> i64 {
+  if caller_eff == 0 { 0 }
+  else {
+    -- A bare operation selects the unique in-scope atom by head. Preserve
+    -- that exact atom in the diagnostic whenever one exists.
+    let atom = effect_sig_find_atom_by_head(caller_eff, eff_hash)
+    if atom != 0 { 0 }
+    else { check_effect_sig_available(effect_sig_one(eff_hash), src, pos, 1, caller_eff, tt, context, DiagnosticLocationNone) }
+  }
+}
+
+pub(package) fn check_effect_atom_available(atom: i64, src: i64, pos: i64, len: i64, caller_eff: i64, tt: i64, context: str, origin: DiagnosticLocation) -[Diagnose]> i64 {
+  if atom == 0 { 0 }
+  else { check_effect_sig_available(typeck_effect_sig_from_atom(atom), src, pos, len, caller_eff, tt, context, origin) }
 }
 
 pub(package) fn effect_ref_with_atom(effect_ref: i64, atom: i64) -> i64 {
@@ -6258,14 +6435,22 @@ pub(package) fn check_effect_perform_available(node: i64, src: i64, caller_eff: 
   if typeck_is_effect_ref(lhs, src, tt) {
     let ident = effect_ref_ident_node(lhs)
     let eff_hash = typeck_effect_ref_name_hash(lhs, src)
+    let entry = typeck_effect_ref_entry(lhs, src, tt)
+    let op = lookup_effect_perform_op(node, src, tt)
+    let origin = if entry == 0 or op == 0 { DiagnosticLocationNone }
+      else { typeck_source_location(mem_load64_at(entry, 48), node_f1(op), node_f2(op)) }
     let availability = if typeck_effect_ref_is_parameterized(lhs) == 1 {
-      check_effect_atom_available(typeck_effect_ref_atom(lhs, src), src, typeck_effect_ref_name_start(lhs), caller_eff)
+      check_effect_atom_available(
+        typeck_effect_ref_atom(lhs, src), src, typeck_effect_ref_name_start(lhs), typeck_effect_ref_name_len(lhs), caller_eff, tt,
+        "effect operation", origin
+      )
     } else { if effect_sig_head_is_ambiguous(caller_eff, eff_hash) == 1 {
       typeck_error_maybe(src, typeck_effect_ref_name_start(lhs), "type error: ambiguous effect atom; qualify the operation")
       1
     } else {
       let atom = effect_sig_find_atom_by_head(caller_eff, eff_hash)
-      let checked = check_effect_hash_available(eff_hash, src, typeck_effect_ref_name_start(lhs), caller_eff)
+      let checked = if atom != 0 { 0 }
+        else { check_effect_sig_available(effect_sig_one(eff_hash), src, typeck_effect_ref_name_start(lhs), typeck_effect_ref_name_len(lhs), caller_eff, tt, "effect operation", origin) }
       if atom != 0 { canonicalize_perform_effect_ref(node, atom) } else { 0 }
       checked
     } }
@@ -7563,11 +7748,11 @@ pub(package) fn is_unsafe_raw_call_name(src: i64, ns: i64, nl: i64) -> bool {
   } } } } } } } } } } } }
 }
 
-pub(package) fn check_unsafe_raw_call_available(node: i64, src: i64, caller_eff: i64) -[Diagnose]> i64 {
+pub(package) fn check_unsafe_raw_call_available(node: i64, src: i64, caller_eff: i64, tt: i64) -[Diagnose]> i64 {
   let ns = node_f1(node)
   let nl = node_f2(node)
   if is_unsafe_raw_call_name(src, ns, nl) {
-    check_effect_hash_available(effect_hash_unsafe(), src, ns, caller_eff)
+    check_effect_hash_available(effect_hash_unsafe(), src, ns, caller_eff, tt, "unsafe operation")
   } else { 0 }
 }
 
@@ -8195,10 +8380,10 @@ pub(package) fn check_qualified_call_declared(node: i64, entry: i64, env: i64, f
   } else {
     errors = errors + check_arity(nlist_len(params), nargs, src, member_ns)
     let callee_eff = ftypes_entry_effects(entry)
-    if caller_eff > 0 and callee_eff > 0 and not effect_is_subset_rigid(callee_eff, caller_eff) {
-      typeck_error(src, member_ns, "type error: effect not available in caller")
-      errors = errors + 1
-    } else { 0 }
+    errors = errors + check_effect_sig_available(
+      callee_eff, src, member_ns, node_f3(node), caller_eff, tt, "call",
+      typeck_source_location(ftypes_entry_source(entry), ftypes_entry_name_start(entry), ftypes_entry_name_len(entry))
+    )
     for i in 0..nargs {
       if i < nlist_len(params) {
         let param = nlist_get(params, i)
@@ -8220,7 +8405,7 @@ pub(package) fn check_qualified_call_declared(node: i64, entry: i64, env: i64, f
 pub(package) fn check_address_of(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) -[Conformance, Diagnose]> i64 {
   let target = node_f2(node)
   let mutable = node_f1(node)
-  let mut errors = check_effect_hash_available(effect_hash_unsafe(), src, expr_diag_pos(node), caller_eff) + check_expr(target, env, ft, src, caller_eff, tt)
+  let mut errors = check_effect_hash_available(effect_hash_unsafe(), src, expr_diag_pos(node), caller_eff, tt, "unsafe operation") + check_expr(target, env, ft, src, caller_eff, tt)
   if node_tag(target) != 2 {
     typeck_error_maybe(src, expr_diag_pos(target), "type error: address-of target must be a binding")
     errors = errors + 1
@@ -8235,7 +8420,7 @@ pub(package) fn check_address_of(node: i64, env: i64, ft: i64, src: i64, caller_
 
 pub(package) fn check_deref(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) -[Conformance, Diagnose]> i64 {
   let ptr = node_f1(node)
-  let mut errors = check_effect_hash_available(effect_hash_unsafe(), src, expr_diag_pos(node), caller_eff) + check_expr(ptr, env, ft, src, caller_eff, tt)
+  let mut errors = check_effect_hash_available(effect_hash_unsafe(), src, expr_diag_pos(node), caller_eff, tt, "unsafe operation") + check_expr(ptr, env, ft, src, caller_eff, tt)
   let ptr_ty = synth(ptr, env, ft, src, tt)
   if type_is_unknown_or_any(ptr_ty) { errors }
   else { if ty_is_ptr(ptr_ty) == 1 { errors }
@@ -8248,7 +8433,7 @@ pub(package) fn check_deref(node: i64, env: i64, ft: i64, src: i64, caller_eff: 
 pub(package) fn check_ptr_assign(node: i64, env: i64, ft: i64, src: i64, caller_eff: i64, tt: i64) -[Conformance, Diagnose]> i64 {
   let ptr = node_f1(node)
   let val = node_f2(node)
-  let mut errors = check_effect_hash_available(effect_hash_unsafe(), src, expr_diag_pos(node), caller_eff) + check_expr(ptr, env, ft, src, caller_eff, tt) + check_expr(val, env, ft, src, caller_eff, tt)
+  let mut errors = check_effect_hash_available(effect_hash_unsafe(), src, expr_diag_pos(node), caller_eff, tt, "unsafe operation") + check_expr(ptr, env, ft, src, caller_eff, tt) + check_expr(val, env, ft, src, caller_eff, tt)
   let ptr_ty = synth(ptr, env, ft, src, tt)
   if type_is_unknown_or_any(ptr_ty) { errors }
   else { if ty_is_ptr(ptr_ty) != 1 {
@@ -8660,14 +8845,7 @@ pub(package) fn check_call_fn_type(node: i64, fn_ty: i64, env: i64, ft: i64, src
   } else {
     typeck_source_location(tenv_entry_source(callee_entry), tenv_entry_name_start(callee_entry), tenv_entry_name_len(callee_entry))
   }
-  if caller_eff > 0 {
-    if callee_eff > 0 {
-      if not effect_is_subset_rigid(callee_eff, caller_eff) {
-        typeck_error(src, ns, "type error: effect not available in caller")
-        errors = errors + 1
-      } else { errors = errors }
-    } else { errors = errors }
-  } else { errors = errors }
+  errors = errors + check_effect_sig_available(callee_eff, src, ns, nl, caller_eff, tt, "call", expected_origin)
   for i in 0..nargs {
     if i < nparams {
       errors = errors + check_arg_against_opaque_param(nlist_get(args, i), nlist_get(params, i), env, ft, src, tt, ns, expected_origin)
@@ -8859,15 +9037,10 @@ pub(package) fn check_method_call(node: i64, env: i64, ft: i64, src: i64, caller
   } }
   let method_eff = if delayed_trait != 0 { ttable_lookup_trait_method_effects_atom(tt, delayed_trait, method_hash) }
     else { if resolution == 0 { 0 } else { method_resolution_effects(resolution) } }
-  if caller_eff > 0 {
-    if method_eff > 0 {
-      if not effect_is_subset_rigid(method_eff, caller_eff) {
-        let pos = expr_diag_pos(recv)
-        typeck_error_maybe(src, pos, "type error: effect not available in caller")
-        errors = errors + 1
-      } else { errors = errors }
-    } else { errors = errors }
-  } else { errors = errors }
+  let method_origin = if method_decl == 0 { DiagnosticLocationNone } else { module_diagnostic_decl_location(method_decl) }
+  let method_start = if method_ref_name_len(method_ref) > 0 { method_ref_name_start(method_ref) } else { expr_diag_pos(recv) }
+  let method_len = if method_ref_name_len(method_ref) > 0 { method_ref_name_len(method_ref) } else { expr_diag_len(recv) }
+  errors = errors + check_effect_sig_available(method_eff, src, method_start, method_len, caller_eff, tt, "method call", method_origin)
   errors
 }
 
@@ -10262,7 +10435,9 @@ pub(package) fn synth_method_call(node: i64, recv_ty: i64, env: i64, ft: i64, sr
   else { if ty_is_borrow(recv_ty) { synth_method_call(node, ty_borrow_inner(recv_ty), env, ft, src, tt) }
   else {
   -- Perform node: f1=lhs, f2=op_ns, f3=op_nl, f4=args
-  let method_hash = effect_name_hash(src, node_f2(node), node_f3(node))
+  let method_ns = node_f2(node)
+  let method_nl = node_f3(node)
+  let method_hash = effect_name_hash(src, method_ns, method_nl)
   -- Extract type_hash from the receiver type
   -- Must match the convention in type_name_hash (parse.weft):
   -- Primitives: i64=-1, str=-2, bool=-3, nil=-4
@@ -10294,12 +10469,12 @@ pub(package) fn synth_method_call(node: i64, recv_ty: i64, env: i64, ft: i64, sr
     mem_store64_at(node, 0, 41)
     mem_store64_at(node, 16, method_hash)
     mem_store64_at(node, 24, args)
-    mem_store64_at(node, 32, method_ref_with_declaration(method_ref_new(
+    mem_store64_at(node, 32, method_ref_with_source(method_ref_with_declaration(method_ref_new(
       type_hash,
       recv_ty,
       if resolution == 0 { 0 } else { method_resolution_ref_type_args(resolution, recv_ty) },
       if resolution != 0 and method_resolution_tparams(resolution) != 0 { 1 } else { 0 }
-    ), if resolution == 0 { 0 } else { method_resolution_declaration(resolution) }))
+    ), if resolution == 0 { 0 } else { method_resolution_declaration(resolution) }), method_ns, method_nl))
   }
   let resolution = if ty_tag(recv_ty) == 12 { 0 } else { ttable_resolve_method(tt, recv_ty, type_hash, method_hash) }
   let raw_method_ret = if resolution == 0 { ttable_lookup_method_ret(tt, type_hash, method_hash) } else { method_resolution_ret(resolution) }
@@ -13265,7 +13440,15 @@ pub(package) fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i
       -- Check structural handler shape before validating clause bodies.
       errors = errors + check_handler_duplicate_clauses(clauses, nclauses, src)
       -- Check body with expanded effects (body is allowed to perform the handled effect)
+      let saved_handler = ttable_get_current_handler(tt)
+      let handler_frame = if nclauses == 0 { 0 }
+        else {
+          let first_ref = handler_clause_effect_ref_node(nlist_get(clauses, 0))
+          typeck_handler_frame(handled_atom, src, typeck_effect_ref_name_start(first_ref), typeck_effect_ref_name_len(first_ref), saved_handler)
+        }
+      if handler_frame != 0 { ttable_set_current_handler(tt, handler_frame) } else { 0 }
       errors = errors + check_expr(handle_body, env, ft, src, expanded_eff, tt)
+      ttable_set_current_handler(tt, saved_handler)
       errors = errors + check_missing_handler_clauses(handle_body, clauses, nclauses, handled_eff_hash, src, tt)
       -- Check clause bodies (they run in the handler's scope, not the body's)
       -- Clause layout: f1=name_info, f2=params, f3=body, f4=0
@@ -13327,7 +13510,7 @@ pub(package) fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i
       }
       errors = errors + check_call_defined(node, env, ft, src, tt)
       errors = errors + check_internal_par_prepared_call_sealed(tt, node, src)
-      errors = errors + check_unsafe_raw_call_available(node, src, caller_eff)
+      errors = errors + check_unsafe_raw_call_available(node, src, caller_eff, tt)
       -- Check arg types match declared param types
       errors = errors + check_call_args(node, env, ft, src, caller_eff, tt)
       -- check_call_args may rewrite a bare generic constructor to tag 36;
@@ -13545,7 +13728,10 @@ pub(package) fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i
       } else { errors = errors }
       let atom = typeck_try_effect_atom(node, env, ft, src, tt, caller_eff)
       typeck_record_try_effect_atom(node, atom)
-      errors = errors + check_effect_atom_available(atom, src, expr_diag_pos(node_f1(node)), caller_eff)
+      errors = errors + check_effect_atom_available(
+        atom, src, expr_diag_pos(node_f1(node)), expr_diag_len(node_f1(node)), caller_eff, tt,
+        "? operator", DiagnosticLocationNone
+      )
       errors
     }
     47 -> {
@@ -13563,7 +13749,10 @@ pub(package) fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i
       errors = errors + check_expr(node_f1(node), env, ft, src, caller_eff, tt)
       let atom = typeck_maybe_effect_atom(node)
       typeck_record_maybe_effect_atom(node, atom)
-      errors = errors + check_effect_atom_available(atom, src, expr_diag_pos(node_f1(node)), caller_eff)
+      errors = errors + check_effect_atom_available(
+        atom, src, expr_diag_pos(node_f1(node)), expr_diag_len(node_f1(node)), caller_eff, tt,
+        "optional chain", DiagnosticLocationNone
+      )
       errors
     }
     49 -> {
@@ -14361,14 +14550,11 @@ pub(package) fn check_generic_call_post_args(node: i64, env: i64, ft: i64, src: 
   let callee_eff = if callee_eff_raw > 0 and tparams != 0 {
     ty_subst(callee_eff_raw, build_subst(tparams, type_args))
   } else { callee_eff_raw }
-  if caller_eff > 0 {
-    if callee_eff > 0 {
-      if not effect_is_subset_rigid(callee_eff, caller_eff) {
-        typeck_error(src, ns, "type error: effect not available in caller")
-        errors = errors + 1
-      } else { errors = errors }
-    } else { errors = errors }
-  } else { errors = errors }
+  errors = errors + check_effect_sig_available(
+    callee_eff, src, ns, nl, caller_eff, tt, "call",
+    if entry == 0 { DiagnosticLocationNone }
+    else { typeck_source_location(ftypes_entry_source(entry), ftypes_entry_name_start(entry), ftypes_entry_name_len(entry)) }
+  )
   let instantiated = synth_generic_call(node, env, ft, src, tt)
   let result_ty = if node_tag(call_node) == 2 and ty_tag(instantiated) == 6 { ty_f2(instantiated) } else { instantiated }
   errors = errors + check_native_result_abi_ty(src, ns, result_ty)
@@ -14514,14 +14700,11 @@ pub(package) fn check_call_args_declared(node: i64, params: i64, env: i64, ft: i
     errors = errors + check_arity(nparams, nargs, src, ns)
     -- Effect checking: only when caller has explicit annotation
     let callee_eff = ftypes_lookup_effects(ft, src, ns, nl)
-    if caller_eff > 0 {
-      if callee_eff > 0 {
-        if not effect_is_subset_rigid(callee_eff, caller_eff) {
-          typeck_error(src, ns, "type error: effect not available in caller")
-          errors = errors + 1
-        } else { errors = errors }
-      } else { errors = errors }
-    } else { errors = errors }
+    errors = errors + check_effect_sig_available(
+      callee_eff, src, ns, nl, caller_eff, tt, "call",
+      if callee_entry == 0 { DiagnosticLocationNone }
+      else { typeck_source_location(callee_src, ftypes_entry_name_start(callee_entry), ftypes_entry_name_len(callee_entry)) }
+    )
     for i in 0..nargs {
       if i < nparams {
         let param = nlist_get(params, i)
