@@ -149,7 +149,7 @@ pub(package) fn alloc_mmap_prot_rw() -> i64 { 3 }
 pub(package) fn alloc_mmap_flags_private_anon() -> i64 { 4098 }
 
 -- Arena header layout:
--- [base(8), offset(8), capacity(8), mapped_len(8)] = 32 bytes.
+-- [base(8), offset(8), capacity(8), mapped_len(8), previous(8)] = 40 bytes.
 -- The descriptor lives at the HEAD OF ITS OWN MAPPING (data starts 64
 -- bytes in), never in bump memory: arenas are created and grown from
 -- inside bump mark/restore windows (optimiser scratch reclaim, probe
@@ -179,6 +179,10 @@ pub(package) fn arena_base(arena: i64) -> i64 { __mem_load64(arena) }
 pub(package) fn arena_offset(arena: i64) -> i64 { __mem_load64(arena + 8) }
 pub(package) fn arena_capacity(arena: i64) -> i64 { __mem_load64(arena + 16) }
 pub(package) fn arena_mapped_len(arena: i64) -> i64 { __mem_load64(arena + 24) }
+pub(package) fn arena_previous(arena: i64) -> i64 { if arena == 0 { 0 } else { __mem_load64(arena + 32) } }
+pub(package) fn arena_set_previous(arena: i64, previous: i64) -> i64 {
+  if arena == 0 { 0 } else { __mem_store64(arena + 32, previous) }
+}
 pub(package) fn arena_remaining(arena: i64) -> i64 { arena_capacity(arena) - arena_offset(arena) }
 
 pub(package) fn arena_reset(arena: i64) -> i64 {
@@ -324,6 +328,29 @@ pub(package) fn heap_remaining(heap: i64) -> i64 {
   if heap == 0 { 0 } else { arena_remaining(heap_arena(heap)) }
 }
 
+-- Heap growth preserves every superseded arena: live objects and free-list
+-- blocks may both still point into them. The current arena stays the fast
+-- allocation path; validation falls back to this short geometric chain only
+-- when a pointer misses the current arena's cached bounds.
+pub(package) fn heap_contains_range(heap: i64, ptr: i64, size: i64) -> i64 {
+  if heap == 0 or ptr == 0 or size < 0 { 0 }
+  else {
+    let range_end = ptr + size
+    if range_end < ptr { 0 }
+    else {
+      let mut arena = heap_arena(heap)
+      let mut found = 0
+      while arena != 0 and found == 0 {
+        let base = arena_base(arena)
+        let end = base + arena_capacity(arena)
+        if ptr >= base and range_end <= end { found = 1 }
+        else { arena = arena_previous(arena) }
+      }
+      found
+    }
+  }
+}
+
 pub(package) fn heap_alloc_unlocked(heap: i64, size: i64, align: i64) -> i64 {
   if heap == 0 { 0 }
   else { if size < 0 { 0 }
@@ -392,7 +419,8 @@ pub(package) fn heap_alloc_unlocked(heap: i64, size: i64, align: i64) -> i64 {
         -- bounded leak of the old arena's unused tail. If the OS
         -- refuses the new mapping, abort with a diagnostic — a null
         -- return here becomes a store through zero in safe code.
-        let old_cap = arena_capacity(heap_arena(heap))
+        let old_arena = heap_arena(heap)
+        let old_cap = arena_capacity(old_arena)
         let doubled = if old_cap * 2 > need * 2 { old_cap * 2 } else { need * 2 }
         let grown = arena_new(doubled)
         if grown == 0 {
@@ -400,6 +428,7 @@ pub(package) fn heap_alloc_unlocked(heap: i64, size: i64, align: i64) -> i64 {
           sys_exit(70)
           0
         } else {
+          arena_set_previous(grown, old_arena)
           __mem_store64(heap, grown)
           -- If this is the DEFAULT rc heap, refresh the cached arena
           -- bounds the retain/release magic guard reads (runtime state
@@ -471,8 +500,16 @@ pub(package) fn heap_free(heap: i64, ptr: i64, size: i64) -> i64 {
 pub(package) fn heap_destroy(heap: i64) -> i64 {
   if heap == 0 { 0 - 1 }
   else {
-    -- The header lives inside the heap's arena mapping and dies with it.
-    arena_free(heap_arena(heap))
+    -- The header lives inside the oldest arena mapping. Read each predecessor
+    -- before unmapping the current descriptor; the final unmap also destroys
+    -- the heap header itself.
+    let mut arena = heap_arena(heap)
+    while arena != 0 {
+      let previous = arena_previous(arena)
+      arena_free(arena)
+      arena = previous
+    }
+    0
   }
 }
 
