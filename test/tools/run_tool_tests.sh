@@ -414,7 +414,7 @@ set -e
 assert_equals "fmt_parse_failure_exit" "$fmt_parse_failure_exit" "1"
 assert_equals "fmt_parse_failure_no_stdout" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
 fmt_parse_failure_err=$(<"$tmp_err")
-assert_contains "fmt_parse_failure_diagnostic" "$fmt_parse_failure_err" "error: expected '}' before declaration"
+assert_contains "fmt_parse_failure_diagnostic" "$fmt_parse_failure_err" "error[E0002]: expected '}' before declaration"
 assert_contains "fmt_parse_failure_summary" "$fmt_parse_failure_err" "fmt: parse failed with 1 errors; no output written"
 
 set +e
@@ -522,7 +522,7 @@ fmt_broken_write_exit=$?
 set -e
 assert_equals "fmt_write_parse_error_exits_one" "$fmt_broken_write_exit" "1"
 assert_equals "fmt_write_parse_error_stdout_empty" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
-assert_contains "fmt_write_parse_error_preserves_eof_coordinate" "$(<"$tmp_err")" "line 2, col 1: error: expected '}' before end of file"
+assert_contains "fmt_write_parse_error_preserves_eof_coordinate" "$(<"$tmp_err")" "line 2, col 1: error[E0002]: expected '}' before end of file"
 assert_contains "fmt_write_parse_error_summary" "$(<"$tmp_err")" "fmt: parse failed for $fmt_broken"
 assert_files_equal "fmt_write_parse_error_leaves_source_unchanged" "$fmt_broken" "$tmp_bin"
 assert_equals "fmt_write_parse_error_creates_no_temporary" "$(test -e "$fmt_broken.weft-fmt.tmp"; echo $?)" "1"
@@ -615,7 +615,7 @@ check_parse_failure_exit=$?
 set -e
 assert_equals "check_parse_failure_exit" "$check_parse_failure_exit" "1"
 assert_equals "check_parse_failure_no_stdout" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
-assert_contains "check_parse_failure_diagnostic" "$(<"$tmp_err")" "error: unexpected token at module level"
+assert_contains "check_parse_failure_diagnostic" "$(<"$tmp_err")" "error[E0002]: unexpected token at module level"
 assert_contains "check_parse_failure_summary" "$(<"$tmp_err")" "check: 2 functions, 1 errors"
 
 set +e
@@ -624,7 +624,7 @@ compile_parse_failure_exit=$?
 set -e
 assert_equals "compile_parse_failure_exit" "$compile_parse_failure_exit" "1"
 assert_equals "compile_parse_failure_no_binary" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
-assert_contains "compile_parse_failure_diagnostic" "$(<"$tmp_err")" "error: unexpected token at module level"
+assert_contains "compile_parse_failure_diagnostic" "$(<"$tmp_err")" "error[E0002]: unexpected token at module level"
 assert_contains "compile_parse_failure_summary" "$(<"$tmp_err")" "compile: parse failed with 1 errors"
 
 printf '%s\n' 'extern fn placeholder(n: i64) -> i64 { n }' 'test "recovered body must not run" { Test.assert_eq(1, 1) }' > "$tmp_src"
@@ -634,7 +634,7 @@ test_parse_failure_exit=$?
 set -e
 assert_equals "test_parse_failure_exit" "$test_parse_failure_exit" "1"
 assert_equals "test_parse_failure_no_binary" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
-assert_contains "test_parse_failure_diagnostic" "$(<"$tmp_err")" "line 1, col 1: error: unexpected token at module level"
+assert_contains "test_parse_failure_diagnostic" "$(<"$tmp_err")" "line 1, col 1: error[E0002]: unexpected token at module level"
 assert_contains "test_parse_failure_summary" "$(<"$tmp_err")" "test: parse failed with 1 errors"
 
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
@@ -697,7 +697,7 @@ assert_contains "trap_trace_main" "$trap_err" "main at test/trap_exit.weft:5:4"
 
 printf 'fn broken() -> i64 { 1\nfn after() -> i64 { 2 }\n' > "$tmp_src"
 parse_recovery_out=$("$WEFT" ast < "$tmp_src" 2>&1)
-assert_contains "ast_reports_parse_recovery" "$parse_recovery_out" "error: expected '}' before declaration"
+assert_contains "ast_reports_parse_recovery" "$parse_recovery_out" "error[E0002]: expected '}' before declaration"
 assert_contains "ast_recovers_after_parse_error" "$parse_recovery_out" "--- AST: 2 functions ---"
 
 printf 'fn main() -> i64 { missing }\n' > "$tmp_src"
@@ -731,11 +731,11 @@ assert_equals "diagnostic_trait_conformance_replays_conditional_proof_golden" "$
 
 printf '%s\n' 'fn main() -> i64 { let café = 1 café }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_rejects_non_nfc_identifier_at_scalar_column" "$diag_out" $'line 1, col 24: error: identifier must use NFC normalization\ncheck: 0 functions, 1 errors'
+assert_equals "diagnostic_rejects_non_nfc_identifier_at_scalar_column" "$diag_out" $'line 1, col 24: error[E0001]: identifier must use NFC normalization\ncheck: 0 functions, 1 errors'
 
 printf '\303(' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_rejects_malformed_utf8_before_tokenization" "$diag_out" $'line 1, col 1: error: source is not valid UTF-8\ncheck: 0 functions, 1 errors'
+assert_equals "diagnostic_rejects_malformed_utf8_before_tokenization" "$diag_out" $'line 1, col 1: error[E0001]: source is not valid UTF-8\ncheck: 0 functions, 1 errors'
 
 printf '%s\n' 'fn paypal() -> i64 { 20 } fn pаypаl() -> i64 { 22 } fn main() -> i64 { paypal() + pаypаl() }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
@@ -777,7 +777,7 @@ mcp_out=$(printf '%s' "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\
 assert_equals "mcp_format_source_matches_cli_bytes" "$mcp_out" "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tool\":\"format_source\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"formatted\":\"$format_cli_json\",\"diagnostics\":0,\"position_units\":{\"span\":\"utf-8-byte-offset\",\"line_base\":1,\"col\":\"utf-8-byte-column\",\"scalar_col\":\"unicode-scalar-column\",\"utf16_col\":\"utf-16-code-unit-column\"},\"items\":[]}}"
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"format_source","arguments":{"source":"fn broken -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_format_source_parse_failure_is_structured" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"format_source","ok":false,"schema_version":1,"stability":"stable","error_count":1,"diagnostics":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"error: expected '\''('\'' after function name","span":3,"line":1,"col":4,"scalar_col":4,"utf16_col":4}]}}'
+assert_equals "mcp_format_source_parse_failure_is_structured" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"format_source","ok":false,"schema_version":1,"stability":"stable","error_count":1,"diagnostics":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"expected '\''('\'' after function name","code":"E0002","span":10,"line":1,"col":11,"scalar_col":11,"utf16_col":11,"end_span":12,"end_line":1,"end_col":13,"end_scalar_col":13,"end_utf16_col":13}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"format_source","arguments":{}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_format_source_requires_source" "$mcp_out" '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"missing source"}}'
@@ -1072,10 +1072,10 @@ mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"
 assert_equals "mcp_grammar_missing_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"missing grammar"}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"\nfn broken -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_diagnostics_parse_error_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":0,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"error: expected '\''('\'' after function name","span":4,"line":2,"col":4,"scalar_col":4,"utf16_col":4}]}}'
+assert_equals "mcp_diagnostics_parse_error_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":0,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"expected '\''('\'' after function name","code":"E0002","span":11,"line":2,"col":11,"scalar_col":11,"utf16_col":11,"end_span":13,"end_line":2,"end_col":13,"end_scalar_col":13,"end_utf16_col":13}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn one -> i64 { 0 }\nfn two -> i64 { 1 }"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_diagnostics_many_parse_errors_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":2,"functions":2,"check_errors":0,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"error: expected '\''('\'' after function name","span":3,"line":1,"col":4,"scalar_col":4,"utf16_col":4},{"severity":"error","message":"error: expected '\''('\'' after function name","span":23,"line":2,"col":4,"scalar_col":4,"utf16_col":4}]}}'
+assert_equals "mcp_diagnostics_many_parse_errors_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":2,"functions":2,"check_errors":0,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"expected '\''('\'' after function name","code":"E0002","span":7,"line":1,"col":8,"scalar_col":8,"utf16_col":8,"end_span":9,"end_line":1,"end_col":10,"end_scalar_col":10,"end_utf16_col":10},{"severity":"error","message":"expected '\''('\'' after function name","code":"E0002","span":27,"line":2,"col":8,"scalar_col":8,"utf16_col":8,"end_span":29,"end_line":2,"end_col":10,"end_scalar_col":10,"end_utf16_col":10}]}}'
 
 large_mcp_source=""
 for ((i = 0; i < 40; i++)); do
@@ -1092,7 +1092,7 @@ mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"
 assert_equals "mcp_diagnostics_names_byte_scalar_and_utf16_columns" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"unknown identifier '\''missing'\''","code":"E1001","span":34,"line":1,"col":35,"scalar_col":32,"utf16_col":33,"end_span":41,"end_line":1,"end_col":42,"end_scalar_col":39,"end_utf16_col":40}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -> i64 { let café = 1 café }"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_diagnostics_preserves_non_nfc_identifier_range" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":0,"check_errors":0,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"identifier must use NFC normalization","span":23,"line":1,"col":24,"scalar_col":24,"utf16_col":24,"end_span":29,"end_line":1,"end_col":30,"end_scalar_col":29,"end_utf16_col":29}]}}'
+assert_equals "mcp_diagnostics_preserves_non_nfc_identifier_range" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":0,"check_errors":0,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"identifier must use NFC normalization","code":"E0001","span":23,"line":1,"col":24,"scalar_col":24,"utf16_col":24,"end_span":29,"end_line":1,"end_col":30,"end_scalar_col":29,"end_utf16_col":29}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn πρόσθεση(α: i64, β: i64) -> i64 { α + β } fn main() -> i64 { πρόσθεση(40, 2) }"}}}' | "$WEFT" mcp 2>&1)
 assert_contains "mcp_diagnostics_accepts_unicode_identifier_identity" "$mcp_out" '"diagnostics":0,"functions":2,"check_errors":0'
@@ -1480,8 +1480,8 @@ lsp_bad_format_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{
 lsp_bad_format_request='{"jsonrpc":"2.0","id":10,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///bad-format.weft"},"options":{"tabSize":2,"insertSpaces":true}}}'
 lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_bad_format_open")" "$(lsp_frame "$lsp_bad_format_request")" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_formatting_failure_uses_request_failed" "$lsp_out" '"id":10,"error":{"code":-32803,"message":"formatting failed"'
-assert_contains "lsp_formatting_failure_returns_structured_diagnostics" "$lsp_out" '"data":{"error_count":1,"diagnostics":[{"range":{"start":{"line":0,"character":3}'
-assert_contains "lsp_formatting_failure_preserves_message" "$lsp_out" "error: expected '(' after function name"
+assert_contains "lsp_formatting_failure_returns_structured_diagnostics" "$lsp_out" '"data":{"error_count":1,"diagnostics":[{"range":{"start":{"line":0,"character":10}'
+assert_contains "lsp_formatting_failure_preserves_message" "$lsp_out" "expected '(' after function name"
 
 lsp_missing_format='{"jsonrpc":"2.0","id":11,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///missing-format.weft"},"options":{"tabSize":2,"insertSpaces":true}}}'
 lsp_out=$(lsp_frame "$lsp_missing_format" | "$WEFT" lsp 2>&1)
@@ -1494,8 +1494,8 @@ assert_contains "lsp_open_clean_empty_diagnostics" "$lsp_out" '"diagnostics":[]'
 
 lsp_open_parse='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///parse.weft","version":1,"text":"fn broken -> i64 { 0 }"}}}'
 lsp_out=$(lsp_frame "$lsp_open_parse" | "$WEFT" lsp 2>&1)
-assert_contains "lsp_open_parse_error_diagnostic" "$lsp_out" "error: expected"
-assert_contains "lsp_open_parse_error_range" "$lsp_out" '"range":{"start":{"line":0,"character":3}'
+assert_contains "lsp_open_parse_error_diagnostic" "$lsp_out" "expected"
+assert_contains "lsp_open_parse_error_range" "$lsp_out" '"range":{"start":{"line":0,"character":10}'
 
 lsp_open_type='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///type.weft","version":1,"text":"fn main() -> i64 { missing }"}}}'
 lsp_out=$(lsp_frame "$lsp_open_type" | "$WEFT" lsp 2>&1)
@@ -1596,7 +1596,7 @@ done
 lsp_large_open="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///large.weft\",\"version\":1,\"text\":\"$large_lsp_source\"}}}"
 lsp_out=$(lsp_frame "$lsp_large_open" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_large_diagnostics_response" "$lsp_out" '"diagnostics":[{"range"'
-assert_contains "lsp_large_diagnostics_late_range" "$lsp_out" '"character":997'
+assert_contains "lsp_large_diagnostics_late_range" "$lsp_out" '"range":{"start":{"line":0,"character":1006},"end":{"line":0,"character":1008}'
 
 lsp_open_hover='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///hover.weft","version":1,"text":"fn add(x: i64) -> i64 { x } fn main() -> i64 { add(1) }"}}}'
 lsp_hover='{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///hover.weft"},"position":{"line":0,"character":3}}}'
@@ -1868,7 +1868,7 @@ assert_contains "lsp_unknown_method_error" "$lsp_out" '"code":-32601'
 
 printf 'fn main() -> i64 { let mut i = 0 let mut stop = 0 while i < 5 && stop == 0 { i = i + 1 } i }\n' > "$tmp_src"
 amp_diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_contains "check_rejects_symbolic_and" "$amp_diag_out" "error: expected '}'"
+assert_contains "check_rejects_symbolic_and" "$amp_diag_out" "error[E0002]: expected '{' after while condition"
 
 printf 'test "plain" { Test.assert_eq(1, 1) }\n' > "$tmp_src"
 test_check_out=$("$WEFT" check < "$tmp_src" 2>&1)

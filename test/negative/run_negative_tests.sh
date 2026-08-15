@@ -311,18 +311,18 @@ check_rejects "let_bound_lambda_method_effect_mismatch" "test/negative/let_bound
 check_rejects "let_bound_lambda_effect_unavailable" "test/negative/let_bound_lambda_effect_unavailable.weft" "error[E2001]:"
 check_rejects "let_bound_lambda_return_mismatch" "test/negative/let_bound_lambda_return_mismatch.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -> str`'
 check_rejects "unknown_identifier" "test/negative/unknown_identifier.weft" "error[E1001]: unknown identifier 'missing'"
-check_rejects "unicode_identifier_non_nfc" "test/negative/unicode_identifier_non_nfc.weft" "error: identifier must use NFC normalization"
-check_rejects "unicode_identifier_default_ignorable" "test/negative/unicode_identifier_default_ignorable.weft" "error: default-ignorable code point is not permitted in an identifier"
-check_rejects "unicode_identifier_continue_only_start" "test/negative/unicode_identifier_continue_only_start.weft" "error: Unicode scalar is not permitted at this identifier position"
-check_rejects "unicode_identifier_non_xid" "test/negative/unicode_identifier_non_xid.weft" "error: Unicode scalar is not permitted at this identifier position"
+check_rejects "unicode_identifier_non_nfc" "test/negative/unicode_identifier_non_nfc.weft" "error[E0001]: identifier must use NFC normalization"
+check_rejects "unicode_identifier_default_ignorable" "test/negative/unicode_identifier_default_ignorable.weft" "error[E0001]: default-ignorable code point is not permitted in an identifier"
+check_rejects "unicode_identifier_continue_only_start" "test/negative/unicode_identifier_continue_only_start.weft" "error[E0001]: Unicode scalar is not permitted at this identifier position"
+check_rejects "unicode_identifier_non_xid" "test/negative/unicode_identifier_non_xid.weft" "error[E0001]: Unicode scalar is not permitted at this identifier position"
 check_rejects "unknown_function" "test/negative/unknown_function.weft" "error[E1001]: unknown function 'missing'"
 check_rejects "unknown_intrinsic_call" "test/negative/unknown_intrinsic_call.weft" "error[E1001]: unknown function '__definitely_not_an_intrinsic'"
 check_rejects "unknown_function_in_import" "test/negative/unknown_function_in_import.weft" "error[E1001]: unknown function 'some_function_that_does_not_exist'"
 check_rejects "module_plain_import_does_not_leak_value" "test/negative/module_plain_import_does_not_leak_value.weft" "error[E1001]: unknown function 'work'"
 check_rejects "prelude_excludes_option_helpers" "test/negative/prelude_excludes_option_helpers.weft" "error[E1001]: unknown function 'option_some'"
 check_rejects "prelude_methods_require_explicit_import" "test/negative/prelude_methods_require_explicit_import.weft" "type error: unknown method"
-check_rejects "quoted_import_removed" "test/negative/quoted_import_removed.weft" "error: expected path-form module after 'use'"
-check_rejects "extern_keyword_removed" "test/negative/extern_keyword_removed.weft" "error: unexpected token at module level"
+check_rejects "quoted_import_removed" "test/negative/quoted_import_removed.weft" "error[E0002]: expected path-form module after 'use'"
+check_rejects "extern_keyword_removed" "test/negative/extern_keyword_removed.weft" "error[E0002]: unexpected token at module level"
 check_rejects "module_qualified_function_unknown" "test/negative/module_qualified_function_unknown.weft" "error[E4002]: unknown module member 'left.missing'"
 check_rejects "module_qualified_function_private" "test/negative/module_qualified_function_private.weft" "error[E4004]: module member 'left.hidden' is not visible"
 check_rejects "module_qualified_function_arity" "test/negative/module_qualified_function_arity.weft" "type error: arity mismatch"
@@ -428,8 +428,8 @@ check_rejects "pattern_nested_constructor_arity" "test/negative/pattern_nested_c
 check_rejects "pattern_nested_literal_mismatch" "test/negative/pattern_nested_literal_mismatch.weft" "type error: literal pattern does not match scrutinee"
 check_rejects "pattern_nested_typed_nondiscriminable" "test/negative/pattern_nested_typed_nondiscriminable.weft" "type error: typed match arm needs a runtime-discriminable union"
 check_rejects "pattern_nested_non_exhaustive" "test/negative/pattern_nested_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `Wrap(Right)` is not covered'
-check_rejects "pattern_nested_malformed" "test/negative/pattern_nested_malformed.weft" "error: expected ',' or ')' after constructor pattern payload"
-check_rejects "pattern_nested_unclosed" "test/negative/pattern_nested_unclosed.weft" "error: expected ')' after constructor pattern"
+check_rejects "pattern_nested_malformed" "test/negative/pattern_nested_malformed.weft" "error[E0002]: expected ',' or ')' after constructor pattern payload"
+check_rejects "pattern_nested_unclosed" "test/negative/pattern_nested_unclosed.weft" "error[E0002]: expected ')' after constructor pattern"
 check_rejects "opaque_construct_imported" "test/negative/opaque_construct_imported.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "opaque_project_imported" "test/negative/opaque_project_imported.weft" "type error: opaque projection pattern is private to its declaring module; use an exported accessor"
 check_rejects "opaque_identity_module_mismatch" "test/negative/opaque_identity_module_mismatch.weft" 'error[E1002]: return value type mismatch: expected `opaque_left.Same`, found `opaque_right.Same`'
@@ -440,8 +440,8 @@ check_rejects "opaque_recursive_representation" "test/negative/opaque_recursive_
 check_rejects "opaque_projection_arity_zero" "test/negative/opaque_projection_arity_zero.weft" "type error: opaque projection pattern requires exactly one child pattern"
 check_rejects "opaque_projection_arity_many" "test/negative/opaque_projection_arity_many.weft" "type error: opaque projection pattern requires exactly one child pattern" 3
 check_rejects "opaque_projection_non_exhaustive" "test/negative/opaque_projection_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `UserId(1)` is not covered'
-check_rejects "opaque_missing_marker" "test/negative/opaque_missing_marker.weft" "error: expected 'opaque' after '=' in type declaration"
-check_rejects "opaque_missing_representation" "test/negative/opaque_missing_representation.weft" "error: expected representation type after 'opaque'"
+check_rejects "opaque_missing_marker" "test/negative/opaque_missing_marker.weft" "error[E0002]: expected 'opaque' after '=' in type declaration"
+check_rejects "opaque_missing_representation" "test/negative/opaque_missing_representation.weft" "error[E0002]: expected representation type after 'opaque'"
 check_rejects "opaque_any_return" "test/negative/opaque_any_return.weft" 'error[E1002]: return value type mismatch: expected `Secret`, found `any`'
 check_rejects "opaque_any_assignment" "test/negative/opaque_any_assignment.weft" 'error[E1002]: assignment type mismatch: expected `Secret`, found `any`'
 check_rejects "opaque_record_fabrication" "test/negative/opaque_record_fabrication.weft" "type error: not a record type"
@@ -698,7 +698,7 @@ check_rejects "structural_effect_result_exceeds_native_abi" "test/negative/struc
 check_rejects "structural_generic_result_exceeds_native_abi" "test/negative/structural_generic_result_exceeds_native_abi.weft" "type error: result type exceeds 8-lane native ABI"
 check_rejects "tuple_record_distinct" "test/negative/tuple_record_distinct.weft" 'error[E1002]: return value type mismatch: expected `{}`, found `()`'
 check_rejects "anonymous_record_expr_duplicate" "test/negative/anonymous_record_expr_duplicate.weft" "type error: duplicate record field"
-check_rejects "anonymous_record_expr_malformed" "test/negative/anonymous_record_expr_malformed.weft" "error: expected ',' or '}' after structural record field"
+check_rejects "anonymous_record_expr_malformed" "test/negative/anonymous_record_expr_malformed.weft" "error[E0002]: expected ',' or '}' after structural record field"
 check_rejects "anonymous_record_expr_arg_mismatch" "test/negative/anonymous_record_expr_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `{x: i64, y: i64}`, found `{x: i64, y: str}`'
 check_rejects "anonymous_record_expr_missing_field" "test/negative/anonymous_record_expr_missing_field.weft" 'error[E1002]: argument type mismatch: expected `{x: i64, y: i64}`, found `{x: i64}`'
 check_rejects "structural_complement_rejects_field" "test/negative/structural_complement_rejects_field.weft" 'error[E1002]: argument type mismatch: expected `{..} & ~{email: any, ..}`, found `{email: str}`'
@@ -711,8 +711,8 @@ check_rejects "record_pattern_unknown_field" "test/negative/record_pattern_unkno
 check_rejects "record_pattern_tuple_mismatch" "test/negative/record_pattern_tuple_mismatch.weft" "type error: record pattern does not match scrutinee"
 check_rejects "tuple_pattern_record_mismatch" "test/negative/tuple_pattern_record_mismatch.weft" "type error: tuple pattern does not match scrutinee"
 check_rejects "tuple_pattern_arity_mismatch" "test/negative/tuple_pattern_arity_mismatch.weft" "type error: tuple pattern arity mismatch"
-check_rejects "record_pattern_malformed" "test/negative/record_pattern_malformed.weft" "error: expected ',' or '}' after record pattern field"
-check_rejects "tuple_pattern_malformed" "test/negative/tuple_pattern_malformed.weft" "error: expected ')' after grouped pattern"
+check_rejects "record_pattern_malformed" "test/negative/record_pattern_malformed.weft" "error[E0002]: expected ',' or '}' after record pattern field"
+check_rejects "tuple_pattern_malformed" "test/negative/tuple_pattern_malformed.weft" "error[E0002]: expected ')' after grouped pattern"
 check_rejects "record_pattern_nested_untagged_union" "test/negative/record_pattern_nested_untagged_union.weft" "type error: typed match arm needs a runtime-discriminable union"
 check_rejects "record_pattern_literal_mismatch" "test/negative/record_pattern_literal_mismatch.weft" "type error: literal pattern does not match scrutinee"
 check_rejects "pattern_matrix_tuple_non_exhaustive" "test/negative/pattern_matrix_tuple_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `(MatrixTupleOne, MatrixTupleOne)` is not covered'
@@ -726,7 +726,7 @@ check_rejects "destructuring_let_refutable_constructor" "test/negative/destructu
 check_rejects "destructuring_let_refutable_literal" "test/negative/destructuring_let_refutable_literal.weft" "type error: refutable pattern in let binding; use if let or match"
 check_rejects "destructuring_let_refutable_nil" "test/negative/destructuring_let_refutable_nil.weft" "type error: refutable pattern in let binding; use if let or match"
 check_rejects "destructuring_for_refutable_constructor" "test/negative/destructuring_for_refutable_constructor.weft" "type error: refutable pattern in for binding; use if let or match inside the loop"
-check_rejects "destructuring_let_mutable" "test/negative/destructuring_let_mutable.weft" "error: mutable destructuring bindings are not supported"
+check_rejects "destructuring_let_mutable" "test/negative/destructuring_let_mutable.weft" "error[E0003]: mutable destructuring bindings are not supported"
 check_rejects "destructuring_let_annotation_mismatch" "test/negative/destructuring_let_annotation_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `(str, str)`, found `(i64, i64)`'
 check_rejects "destructuring_let_tuple_arity" "test/negative/destructuring_let_tuple_arity.weft" "type error: tuple pattern arity mismatch"
 check_rejects "structural_shape_missing_field" "test/negative/structural_shape_missing_field.weft" 'error[E1002]: argument type mismatch: expected `{answer: i64, ..}`, found `StructuralShapeMissing`'
@@ -736,7 +736,7 @@ check_rejects "structural_shape_function_value" "test/negative/structural_shape_
 check_rejects "structural_shape_indirect_adaptation" "test/negative/structural_shape_indirect_adaptation.weft" "type error: structural shape adaptation requires a direct function call"
 check_rejects "structural_shape_generic_conflict" "test/negative/structural_shape_generic_conflict.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
 check_rejects "structural_update_duplicate_field" "test/negative/structural_update_duplicate_field.weft" "type error: duplicate record field"
-check_rejects "structural_update_malformed" "test/negative/structural_update_malformed.weft" "error: expected ',' or '}' after record update field"
+check_rejects "structural_update_malformed" "test/negative/structural_update_malformed.weft" "error[E0002]: expected ',' or '}' after record update field"
 check_rejects "structural_update_nonrecord" "test/negative/structural_update_nonrecord.weft" "type error: functional update requires a record value"
 check_rejects "structural_update_open_shape" "test/negative/structural_update_open_shape.weft" "type error: functional update requires a concrete closed structural shape"
 check_rejects "nominal_update_unknown_field" "test/negative/nominal_update_unknown_field.weft" "type error: unknown record field in functional update"
@@ -755,16 +755,16 @@ check_rejects "array_covariance_reverse" "test/negative/array_covariance_reverse
 check_rejects "slice_covariance_reverse" "test/negative/slice_covariance_reverse.weft" 'error[E1002]: return value type mismatch: expected `[bool]`, found `[i64]`'
 check_rejects "mutable_slice_invariant" "test/negative/mutable_slice_invariant.weft" 'error[E1002]: return value type mismatch: expected `[mut i64]`, found `[mut bool]`'
 check_rejects "mutable_slice_requires_reborrow" "test/negative/mutable_slice_requires_reborrow.weft" 'error[E1002]: return value type mismatch: expected `[i64]`, found `[mut i64]`'
-check_rejects "array_literal_repetition_unsupported" "test/negative/array_literal_unsupported.weft" "error: array repetition syntax is not supported; write every element"
+check_rejects "array_literal_repetition_unsupported" "test/negative/array_literal_unsupported.weft" "error[E0003]: array repetition syntax is not supported; write every element"
 check_rejects "array_literal_length_mismatch" "test/negative/array_literal_length_mismatch.weft" 'error[E1002]: return value type mismatch: expected `[i64; 3]`, found `[i64; 2]`'
 check_rejects "array_literal_element_mismatch" "test/negative/array_literal_element_mismatch.weft" 'error[E1002]: return value type mismatch: expected `[u8; 2]`, found `[i64; 2]`'
-check_rejects "array_literal_missing_comma" "test/negative/array_literal_missing_comma.weft" "error: expected ',' or ']' in array literal"
+check_rejects "array_literal_missing_comma" "test/negative/array_literal_missing_comma.weft" "error[E0002]: expected ',' or ']' in array literal"
 check_rejects "array_literal_mixed_storage_union" "test/negative/array_literal_mixed_storage_union.weft" "type error: array element union has no uniform untagged storage; use a variant type"
 check_rejects "array_len_unknown_field" "test/negative/array_len_unknown_field.weft" "type error: unknown indexed-storage field; arrays and slices expose .len"
 check_rejects "slice_len_unknown_field" "test/negative/slice_len_unknown_field.weft" "type error: unknown indexed-storage field; arrays and slices expose .len"
 check_rejects "index_non_indexed" "test/negative/index_non_indexed.weft" "type error: indexing requires an array or slice"
 check_rejects "index_wrong_type" "test/negative/index_wrong_type.weft" "type error: index must be usize"
-check_rejects "index_missing_close" "test/negative/index_missing_close.weft" "error: expected ']' after index"
+check_rejects "index_missing_close" "test/negative/index_missing_close.weft" "error[E0002]: expected ']' after index"
 check_rejects "index_set_immutable_array" "test/negative/index_set_immutable_array.weft" "type error: cannot mutate immutable array binding"
 check_rejects "index_set_immutable_slice" "test/negative/index_set_immutable_slice.weft" "type error: cannot mutate through immutable slice"
 check_rejects "index_set_unnamed_container" "test/negative/index_set_unnamed_container.weft" "type error: indexed mutation requires a named container binding"
@@ -774,7 +774,7 @@ check_rejects "index_set_value_mismatch" "test/negative/index_set_value_mismatch
 check_rejects "slice_non_indexed" "test/negative/slice_non_indexed.weft" "type error: slicing requires an array, slice, or Vector"
 check_rejects "slice_start_wrong_type" "test/negative/slice_start_wrong_type.weft" "type error: slice bound must be usize"
 check_rejects "slice_end_wrong_type" "test/negative/slice_end_wrong_type.weft" "type error: slice bound must be usize"
-check_rejects "slice_missing_close" "test/negative/slice_missing_close.weft" "error: expected ']' after slice"
+check_rejects "slice_missing_close" "test/negative/slice_missing_close.weft" "error[E0002]: expected ']' after slice"
 check_rejects "slice_mutable_immutable_array" "test/negative/slice_mutable_immutable_array.weft" "type error: cannot mutably slice immutable array binding"
 check_rejects "slice_mutable_reborrow_immutable" "test/negative/slice_mutable_reborrow_immutable.weft" "type error: cannot mutably reborrow immutable slice"
 check_rejects "slice_temporary_array_owner" "test/negative/slice_temporary_array_owner.weft" "type error: slicing an owning container temporary requires a named owner binding"
@@ -805,9 +805,9 @@ check_rejects "vector_mutable_slice_owner_access" "test/negative/vector_mutable_
 check_rejects "vector_slice_unknown_call_while_live" "test/negative/vector_slice_unknown_call_while_live.weft" "type error: Vector mutation or reallocation conflicts with a live slice borrow"
 check_rejects "vector_slice_local_return" "test/negative/vector_slice_local_return.weft" "type error: slice borrow escapes its owner"
 check_rejects "vector_slice_temporary_owner" "test/negative/vector_slice_temporary_owner.weft" "type error: slicing an owning container temporary requires a named owner binding"
-check_rejects "vector_to_array_missing_length" "test/negative/vector_to_array_missing_length.weft" "error: to_array length must be a non-negative integer literal"
-check_rejects "vector_to_array_non_literal_length" "test/negative/vector_to_array_non_literal_length.weft" "error: to_array length must be a non-negative integer literal"
-check_rejects "vector_to_array_negative_length" "test/negative/vector_to_array_negative_length.weft" "error: to_array length must be a non-negative integer literal"
+check_rejects "vector_to_array_missing_length" "test/negative/vector_to_array_missing_length.weft" "error[E0002]: to_array length must be a non-negative integer literal"
+check_rejects "vector_to_array_non_literal_length" "test/negative/vector_to_array_non_literal_length.weft" "error[E0002]: to_array length must be a non-negative integer literal"
+check_rejects "vector_to_array_negative_length" "test/negative/vector_to_array_negative_length.weft" "error[E0002]: to_array length must be a non-negative integer literal"
 check_rejects "vector_to_array_type_mismatch" "test/negative/vector_to_array_type_mismatch.weft" "type error: to_array result type must be"
 check_rejects "vector_to_array_non_vector" "test/negative/vector_to_array_non_vector.weft" "type error: unknown method"
 check_rejects "vector_mutable_slice_to_array_access" "test/negative/vector_mutable_slice_to_array_access.weft" "type error: Vector access conflicts with a live mutable slice borrow"
@@ -826,11 +826,11 @@ check_rejects "effect_qualified_handler_mismatch" "test/negative/effect_qualifie
 check_rejects "effect_perform_arg_instantiation_mismatch" "test/negative/effect_perform_arg_instantiation_mismatch.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
 check_rejects "effect_resume_instantiation_mismatch" "test/negative/effect_resume_instantiation_mismatch.weft" 'error[E1002]: handler clause result type mismatch: expected `str`, found `i64`'
 check_rejects "return_clause_deferred" "test/negative/return_clause_deferred.weft" "type error: return clause with deferred clauses is not yet supported"
-check_rejects "handler_two_return_clauses" "test/negative/handler_two_return_clauses.weft" "error: at most one return clause per handler"
+check_rejects "handler_two_return_clauses" "test/negative/handler_two_return_clauses.weft" "error[E0002]: at most one return clause per handler"
 check_rejects "trait_complement_surface" "test/negative/trait_complement_surface.weft" "type error: trait complement is not a surface type"
 check_rejects "import_cycle" "test/negative/import_cycle.weft" "error[E4001]: circular import: test/negative/import_cycle -> test/negative/import_cycle_helper -> test/negative/import_cycle"
 check_rejects "import_cycle_direct" "test/negative/import_cycle_direct.weft" "error[E4001]: circular import: test/negative/import_cycle_direct -> test/negative/import_cycle_direct"
-check_rejects "call_site_label_unsupported" "test/negative/call_site_label_unsupported.weft" "error: call-site argument labels are not supported yet"
+check_rejects "call_site_label_unsupported" "test/negative/call_site_label_unsupported.weft" "error[E0003]: call-site argument labels are not supported yet"
 check_rejects "rigid_tail_concrete_perform" "test/negative/rigid_tail_concrete_perform.weft" "error[E2001]:"
 check_rejects "rigid_tail_concrete_call" "test/negative/rigid_tail_concrete_call.weft" "error[E2001]:"
 check_rejects "borrow_return_position" "test/negative/borrow_return_position.weft" "type error: borrow is only valid on callable parameters"
