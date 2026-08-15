@@ -702,12 +702,16 @@ assert_contains "ast_recovers_after_parse_error" "$parse_recovery_out" "--- AST:
 
 printf 'fn main() -> i64 { missing }\n' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_contains "check_reports_diagnostics" "$diag_out" "type error: unknown identifier"
-assert_equals "diagnostic_snapshot_exact" "$diag_out" $'line 1, col 20: type error: unknown identifier\ncheck: 1 functions, 1 errors'
+assert_contains "check_reports_diagnostics" "$diag_out" "error[E1001]: unknown identifier 'missing'"
+assert_equals "diagnostic_snapshot_exact" "$diag_out" $'line 1, col 20: error[E1001]: unknown identifier \x27missing\x27\ncheck: 1 functions, 1 errors'
 
 printf 'fn main() -> i64 { let s = "😀" missing }\n' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_unicode_columns_count_scalars" "$diag_out" $'line 1, col 32: type error: unknown identifier\ncheck: 1 functions, 1 errors'
+assert_equals "diagnostic_unicode_columns_count_scalars" "$diag_out" $'line 1, col 32: error[E1001]: unknown identifier \x27missing\x27\ncheck: 1 functions, 1 errors'
+
+printf 'fn main() -> i64 { let counter = 1 counte }\n' > "$tmp_src"
+diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
+assert_equals "diagnostic_unknown_name_suggestion_golden" "$diag_out" $'line 1, col 36: error[E1001]: unknown identifier \x27counte\x27\nhelp: did you mean \x27counter\x27?\ncheck: 1 functions, 1 errors'
 
 printf '%s\n' 'fn main() -> i64 { let café = 1 café }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
@@ -1066,10 +1070,10 @@ assert_contains "mcp_diagnostics_large_response_count" "$mcp_out" '"diagnostics"
 assert_contains "mcp_diagnostics_large_response_items" "$mcp_out" '"items":[{"severity":"error"'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -> i64 { missing }"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_diagnostics_unknown_identifier_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: unknown identifier","span":19,"line":1,"col":20,"scalar_col":20,"utf16_col":20}]}}'
+assert_equals "mcp_diagnostics_unknown_identifier_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"unknown identifier '\''missing'\''","code":"E1001","span":19,"line":1,"col":20,"scalar_col":20,"utf16_col":20,"end_span":26,"end_line":1,"end_col":27,"end_scalar_col":27,"end_utf16_col":27}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -> i64 { let s = \"😀\" missing }"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_diagnostics_names_byte_scalar_and_utf16_columns" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: unknown identifier","span":34,"line":1,"col":35,"scalar_col":32,"utf16_col":33}]}}'
+assert_equals "mcp_diagnostics_names_byte_scalar_and_utf16_columns" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"unknown identifier '\''missing'\''","code":"E1001","span":34,"line":1,"col":35,"scalar_col":32,"utf16_col":33,"end_span":41,"end_line":1,"end_col":42,"end_scalar_col":39,"end_utf16_col":40}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -> i64 { let café = 1 café }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_preserves_non_nfc_identifier_range" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":0,"check_errors":0,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"identifier must use NFC normalization","span":23,"line":1,"col":24,"scalar_col":24,"utf16_col":24,"end_span":29,"end_line":1,"end_col":30,"end_scalar_col":29,"end_utf16_col":29}]}}'
@@ -1091,7 +1095,7 @@ assert_contains "mcp_bidi_source_warning_range" "$mcp_out" '"span":23,"line":1,"
 assert_contains "mcp_bidi_source_warning_keeps_zero_errors" "$mcp_out" '"check_errors":0'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn call() -> i64 { missing_fn() }"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_diagnostics_unknown_function_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: unknown function","span":19,"line":1,"col":20,"scalar_col":20,"utf16_col":20}]}}'
+assert_equals "mcp_diagnostics_unknown_function_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"unknown function '\''missing_fn'\''","code":"E1001","span":19,"line":1,"col":20,"scalar_col":20,"utf16_col":20,"end_span":29,"end_line":1,"end_col":30,"end_scalar_col":30,"end_utf16_col":30}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad() -> i64 { let x = 1 x() }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_non_function_call_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: called value is not a function","span":28,"line":1,"col":29,"scalar_col":29,"utf16_col":29}]}}'
@@ -1310,7 +1314,7 @@ mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"
 assert_equals "mcp_diagnostics_arithmetic_operand_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: arithmetic operand is not i64","span":-1,"line":-1,"col":-1,"scalar_col":-1,"utf16_col":-1}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad() -> i64 { missing = 1 0 }"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_diagnostics_assignment_unknown_target_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: unknown identifier","span":18,"line":1,"col":19,"scalar_col":19,"utf16_col":19}]}}'
+assert_equals "mcp_diagnostics_assignment_unknown_target_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"unknown identifier '\''missing'\''","code":"E1001","span":18,"line":1,"col":19,"scalar_col":19,"utf16_col":19,"end_span":25,"end_line":1,"end_col":26,"end_scalar_col":26,"end_utf16_col":26}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad() -> i64 { let x = 0 x = 1 x }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_assignment_immutable_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: cannot assign to immutable binding","span":28,"line":1,"col":29,"scalar_col":29,"utf16_col":29}]}}'
@@ -1473,7 +1477,8 @@ assert_contains "lsp_open_parse_error_range" "$lsp_out" '"range":{"start":{"line
 
 lsp_open_type='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///type.weft","version":1,"text":"fn main() -> i64 { missing }"}}}'
 lsp_out=$(lsp_frame "$lsp_open_type" | "$WEFT" lsp 2>&1)
-assert_contains "lsp_open_type_error_diagnostic" "$lsp_out" "type error: unknown identifier"
+assert_contains "lsp_open_type_error_diagnostic" "$lsp_out" "unknown identifier 'missing'"
+assert_contains "lsp_open_type_error_stable_code" "$lsp_out" '"code":"E1001"'
 assert_contains "lsp_open_type_error_range" "$lsp_out" '"character":19'
 
 lsp_open_module_cycle='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///module-cycle.weft","version":1,"text":"use test/negative/import_cycle_direct fn main() -> i64 { 0 }"}}}'
@@ -1497,8 +1502,8 @@ assert_contains "lsp_open_rejects_root_raw_memory" "$lsp_out" "type error: Unsaf
 
 lsp_open_unicode='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///unicode.weft","version":1,"text":"fn main() -> i64 { let s = \"Ω\" missing }"}}}'
 lsp_out=$(lsp_frame "$lsp_open_unicode" | "$WEFT" lsp 2>&1)
-assert_contains "lsp_unicode_source_diagnostic" "$lsp_out" "type error: unknown identifier"
-assert_contains "lsp_unicode_source_range_uses_default_utf16" "$lsp_out" '"range":{"start":{"line":0,"character":31},"end":{"line":0,"character":32}'
+assert_contains "lsp_unicode_source_diagnostic" "$lsp_out" "unknown identifier 'missing'"
+assert_contains "lsp_unicode_source_range_uses_default_utf16" "$lsp_out" '"range":{"start":{"line":0,"character":31},"end":{"line":0,"character":38}'
 
 lsp_non_nfc_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///non-nfc.weft","version":1,"text":"fn main() -> i64 { let café = 1 café }"}}}'
 lsp_out=$(lsp_frame "$lsp_non_nfc_open" | "$WEFT" lsp 2>&1)
@@ -1536,7 +1541,7 @@ assert_contains "lsp_utf32_supplementary_cursor_reaches_fact" "$lsp_out" '"id":1
 
 lsp_unicode_utf8_diagnostic_open='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///unicode-utf8-diagnostic.weft","version":1,"text":"fn main() -> i64 { let s = \"😀\" missing }"}}}'
 lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_init_utf8")" "$(lsp_frame "$lsp_unicode_utf8_diagnostic_open")" | "$WEFT" lsp 2>&1)
-assert_contains "lsp_utf8_diagnostic_range_counts_bytes" "$lsp_out" '"range":{"start":{"line":0,"character":34},"end":{"line":0,"character":35}'
+assert_contains "lsp_utf8_diagnostic_range_counts_bytes" "$lsp_out" '"range":{"start":{"line":0,"character":34},"end":{"line":0,"character":41}'
 
 large_lsp_source=""
 for ((i = 0; i < 40; i++)); do
@@ -1723,13 +1728,13 @@ lsp_change_bad='{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"te
 lsp_change_good='{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///rapid.weft","version":3},"contentChanges":[{"text":"fn main() -> i64 { 1 }"}]}}'
 lsp_open_rapid='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///rapid.weft","version":1,"text":"fn main() -> i64 { 0 }"}}}'
 lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_open_rapid")" "$(lsp_frame "$lsp_change_bad")" "$(lsp_frame "$lsp_change_good")" | "$WEFT" lsp 2>&1)
-assert_contains "lsp_rapid_edit_bad_diagnostic" "$lsp_out" "type error: unknown identifier"
+assert_contains "lsp_rapid_edit_bad_diagnostic" "$lsp_out" "unknown identifier 'missing'"
 assert_contains "lsp_rapid_edit_final_clean" "$lsp_out" '"uri":"file:///rapid.weft","diagnostics":[]'
 
 lsp_stale_change='{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///stale.weft","version":1},"contentChanges":[{"text":"fn main() -> i64 { missing }"}]}}'
 lsp_open_stale='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///stale.weft","version":2,"text":"fn main() -> i64 { 0 }"}}}'
 lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_stale")" "$(lsp_frame "$lsp_stale_change")" | "$WEFT" lsp 2>&1)
-assert_not_contains "lsp_stale_update_ignored" "$lsp_out" "type error: unknown identifier"
+assert_not_contains "lsp_stale_update_ignored" "$lsp_out" "unknown identifier 'missing'"
 
 # Active document graph: the dependency paths below deliberately do not exist
 # on disk. The shared resolver selects their normal module identities, while
@@ -1754,7 +1759,7 @@ lsp_active_hover_after_stale="{\"jsonrpc\":\"2.0\",\"id\":83,\"method\":\"textDo
 lsp_active_close_dep="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_dep_uri\"}}}"
 lsp_active_hover_closed="{\"jsonrpc\":\"2.0\",\"id\":84,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_dep_uri\"},\"position\":{\"line\":0,\"character\":7}}}"
 lsp_out=$(printf '%s%s%s%s%s%s%s%s%s%s%s' "$(lsp_frame "$lsp_active_init")" "$(lsp_frame "$lsp_active_open_root")" "$(lsp_frame "$lsp_active_open_dep")" "$(lsp_frame "$lsp_active_hover")" "$(lsp_frame "$lsp_active_definition")" "$(lsp_frame "$lsp_active_change_bad")" "$(lsp_frame "$lsp_active_change_good")" "$(lsp_frame "$lsp_active_change_stale")" "$(lsp_frame "$lsp_active_hover_after_stale")" "$(lsp_frame "$lsp_active_close_dep")" "$(lsp_frame "$lsp_active_hover_closed")" | "$WEFT" lsp 2>&1)
-assert_contains "lsp_active_graph_observes_missing_disk_module" "$lsp_out" 'type error: unknown function'
+assert_contains "lsp_active_graph_observes_missing_disk_module" "$lsp_out" "unknown function 'active_value'"
 assert_contains "lsp_active_graph_overlay_clears_importer" "$lsp_out" "\"uri\":\"$lsp_active_root_uri\",\"diagnostics\":[]"
 assert_contains "lsp_active_graph_publishes_dependency_clean" "$lsp_out" "\"uri\":\"$lsp_active_dep_uri\",\"diagnostics\":[]"
 assert_contains "lsp_active_graph_hover_uses_overlay" "$lsp_out" '"id":81,"result":{"contents":{"kind":"plaintext","value":"function active_value: () -> i64"'
@@ -1763,7 +1768,7 @@ assert_contains "lsp_active_graph_definition_uses_overlay_range" "$lsp_out" '"st
 assert_contains "lsp_active_graph_change_invalidates_importer" "$lsp_out" '"code":"E4002"'
 assert_equals "lsp_active_graph_stale_change_is_ignored" "$(printf '%s' "$lsp_out" | grep -o '"code":"E4002"' | wc -l | tr -d ' ')" "1"
 assert_contains "lsp_active_graph_good_version_survives_stale_change" "$lsp_out" '"id":83,"result":{"contents":{"kind":"plaintext","value":"function active_value: () -> i64"'
-assert_equals "lsp_active_graph_close_invalidates_importer" "$(printf '%s' "$lsp_out" | grep -o 'type error: unknown function' | wc -l | tr -d ' ')" "2"
+assert_equals "lsp_active_graph_close_invalidates_importer" "$(printf '%s' "$lsp_out" | grep -o "unknown function 'active_value'" | wc -l | tr -d ' ')" "2"
 assert_contains "lsp_active_graph_close_clears_dependency" "$lsp_out" "\"uri\":\"$lsp_active_dep_uri\",\"diagnostics\":[]"
 assert_contains "lsp_active_graph_close_removes_document" "$lsp_out" '"id":84,"result":null'
 
@@ -1771,7 +1776,7 @@ lsp_active_bad_dep='pub fn active_value() -> i64 { missing }'
 lsp_active_open_bad_dep="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_dep_uri\",\"version\":1,\"text\":\"$lsp_active_bad_dep\"}}}"
 lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_active_init")" "$(lsp_frame "$lsp_active_open_bad_dep")" "$(lsp_frame "$lsp_active_open_root")" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_active_graph_routes_dependency_diagnostic" "$lsp_out" "\"uri\":\"$lsp_active_dep_uri\",\"diagnostics\":[{"
-assert_contains "lsp_active_graph_preserves_dependency_diagnostic" "$lsp_out" 'type error: unknown identifier'
+assert_contains "lsp_active_graph_preserves_dependency_diagnostic" "$lsp_out" "unknown identifier 'missing'"
 assert_contains "lsp_active_graph_keeps_importer_clean_for_dependency_body_error" "$lsp_out" "\"uri\":\"$lsp_active_root_uri\",\"diagnostics\":[]"
 
 lsp_reexport_mid="_weft_lsp_reexport_$$_mid"
@@ -1950,12 +1955,12 @@ printf 'fn hidden() -> i64 { 0 }\n' > "$tmp_outside_dir/lib.weft"
 printf 'package app\ndep evil ../%s\n' "$outside_name" > "$tmp_pkg_dir/weft.pkg"
 printf 'use evil/lib.{*}\nfn main() -> i64 { hidden() }\n' > "$tmp_pkg_dir/app.weft"
 traversal_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
-assert_contains "package_rejects_traversal_dep_path" "$traversal_out" "type error: unknown function"
+assert_contains "package_rejects_traversal_dep_path" "$traversal_out" "error[E1001]: unknown function"
 
 printf 'package app\ndep math deps/math 1.0.0\n' > "$tmp_pkg_dir/weft.pkg"
 printf 'use math/lib.{*}\nfn main() -> i64 { add(1, 2) }\n' > "$tmp_pkg_dir/app.weft"
 unsupported_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
-assert_contains "package_rejects_unsupported_version_token" "$unsupported_out" "type error: unknown function"
+assert_contains "package_rejects_unsupported_version_token" "$unsupported_out" "error[E1001]: unknown function"
 
 mkdir -p "$tmp_pkg_cli_dir/deps/math"
 pkg_init_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg init cli_app 2>&1)
