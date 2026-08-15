@@ -17,15 +17,20 @@ use compiler/diagnose.{*}
 use compiler/effect_ref.{*}
 use compiler/lib.{*}
 use compiler/module.{*}
-use compiler/module_diagnostics.{module_diagnostic_qualified_member}
+use compiler/module_diagnostics.{module_diagnostic_decl_location, module_diagnostic_import_local_location, module_diagnostic_qualified_member}
 use compiler/parse.{*}
 use compiler/source_trust.{*}
 use compiler/typecheck_effect.{*}
 use compiler/type_registry.{*}
 use compiler/types.{*}
 use runtime/alloc.{*}
+use runtime/buffer.{*}
 use runtime/memory.{*}
-use stdlib/diagnostic.{diagnostic_report}
+use runtime/string.{runtime_str_from_bytes_copy}
+use stdlib/diagnostic.{*}
+use stdlib/diagnostic_registry.{diagnostic_code_unknown_name}
+use stdlib/diagnostic_type.{*}
+use stdlib/utf8.{utf8_decode_is_ok, utf8_decode_next_bytes, utf8_decode_next_pos, utf8_decode_scalar}
 
 -- span is an offset into src; the diagnostic carries the absolute address so
 -- the renderer can resolve which loaded source buffer it belongs to. Spans
@@ -39,6 +44,285 @@ pub(package) fn typeck_error(src: i64, span: i64, msg: str) -[Diagnose]> i64 {
 pub(package) fn typeck_error_maybe(src: i64, span: i64, msg: str) -[Diagnose]> i64 {
   let diag_span = if span > 0 { span } else { 0 - 1 }
   typeck_error(src, diag_span, msg)
+}
+
+-- E1001 carries the unresolved spelling and the best semantically eligible
+-- in-scope replacement. Distance is over Unicode scalar values rather than
+-- UTF-8 bytes, so an international identifier is not penalised per byte.
+pub(package) type TypeckNameSuggestion {
+  NoTypeckNameSuggestion
+  TypeckNameSuggestion(str, DiagnosticLocation, i64, i64) -- spelling, location, distance, rank
+}
+
+pub(package) fn typeck_name_scalars(ptr: i64, len: i64) -> i64 {
+  let values = nlist_new_capacity(if len < 1 { 1 } else { len })
+  let mut pos = 0
+  while pos < len {
+    let decoded = utf8_decode_next_bytes(ptr, len, pos)
+    if utf8_decode_is_ok(decoded) == 1 {
+      nlist_add(values, utf8_decode_scalar(decoded))
+      pos = utf8_decode_next_pos(decoded)
+    } else {
+      -- Lexer-produced identifiers are valid UTF-8. This fallback keeps the
+      -- helper total for raw unit tests and malformed trusted inputs.
+      nlist_add(values, mem_load8_at(ptr, pos))
+      pos = pos + 1
+    }
+  }
+  values
+}
+
+pub(package) fn typeck_name_edit_distance(left_ptr: i64, left_len: i64, right_ptr: i64, right_len: i64) -> i64 {
+  -- Suggestions are deliberately bounded. Long hostile names retain a full
+  -- diagnostic but cannot force an unbounded quadratic allocation.
+  if left_len > 256 or right_len > 256 { 257 }
+  else {
+    let left = typeck_name_scalars(left_ptr, left_len)
+    let right = typeck_name_scalars(right_ptr, right_len)
+    let ln = nlist_len(left)
+    let rn = nlist_len(right)
+    let mut two_ago = alloc_words(rn + 1)
+    let mut previous = alloc_words(rn + 1)
+    let mut current = alloc_words(rn + 1)
+    for j in 0..rn + 1 { mem_store64_at(previous, j * 8, j) }
+    for i in 0..ln {
+      mem_store64_at(current, 0, i + 1)
+      for j in 0..rn {
+        let deletion = mem_load64_at(previous, (j + 1) * 8) + 1
+        let insertion = mem_load64_at(current, j * 8) + 1
+        let substitution = mem_load64_at(previous, j * 8) + if nlist_get(left, i) == nlist_get(right, j) { 0 } else { 1 }
+        let first = if deletion < insertion { deletion } else { insertion }
+        let ordinary = if substitution < first { substitution } else { first }
+        let transposition = if i > 0 and j > 0 and nlist_get(left, i) == nlist_get(right, j - 1) and nlist_get(left, i - 1) == nlist_get(right, j) {
+          mem_load64_at(two_ago, (j - 1) * 8) + 1
+        } else { ordinary }
+        mem_store64_at(current, (j + 1) * 8, if transposition < ordinary { transposition } else { ordinary })
+      }
+      let reusable = two_ago
+      two_ago = previous
+      previous = current
+      current = reusable
+    }
+    mem_load64_at(previous, rn * 8)
+  }
+}
+
+pub(package) fn typeck_name_scalar_count(ptr: i64, len: i64) -> i64 {
+  if len > 256 { 257 } else { nlist_len(typeck_name_scalars(ptr, len)) }
+}
+
+pub(package) fn typeck_name_suggestion_threshold(scalar_count: i64) -> i64 {
+  if scalar_count <= 4 { 1 } else { if scalar_count <= 8 { 2 } else { 3 } }
+}
+
+pub(package) fn typeck_name_bytes_compare(left_ptr: i64, left_len: i64, right_ptr: i64, right_len: i64) -> i64 {
+  let n = if left_len < right_len { left_len } else { right_len }
+  let mut i = 0
+  let mut result = 0
+  while i < n and result == 0 {
+    let left = mem_load8_at(left_ptr, i)
+    let right = mem_load8_at(right_ptr, i)
+    if left < right { result = 0 - 1 } else { if left > right { result = 1 } else { i = i + 1 } }
+  }
+  if result != 0 { result }
+  else { if left_len < right_len { 0 - 1 } else { if left_len > right_len { 1 } else { 0 } } }
+}
+
+pub(package) fn typeck_name_suggestion_consider(
+  current: TypeckNameSuggestion,
+  query_ptr: i64,
+  query_len: i64,
+  candidate_ptr: i64,
+  candidate_len: i64,
+  location: DiagnosticLocation,
+  rank: i64
+) -> TypeckNameSuggestion {
+  let query_count = typeck_name_scalar_count(query_ptr, query_len)
+  let candidate_count = typeck_name_scalar_count(candidate_ptr, candidate_len)
+  let threshold = typeck_name_suggestion_threshold(query_count)
+  let length_delta = if query_count > candidate_count { query_count - candidate_count } else { candidate_count - query_count }
+  if query_count > 64 or candidate_count > 64 or length_delta > threshold { current }
+  else {
+    let distance = typeck_name_edit_distance(query_ptr, query_len, candidate_ptr, candidate_len)
+    if distance == 0 or distance > threshold { current }
+    else {
+      let replace = match current {
+        NoTypeckNameSuggestion -> 1
+        TypeckNameSuggestion(spelling, prior_location, prior_distance, prior_rank) -> {
+          if distance < prior_distance { 1 }
+          else { if distance > prior_distance { 0 }
+          else { if rank < prior_rank { 1 }
+          else { if rank > prior_rank { 0 }
+          else { if typeck_name_bytes_compare(candidate_ptr, candidate_len, __str_ptr(spelling), __str_len(spelling)) < 0 { 1 } else { 0 } } } } }
+        }
+      }
+      if replace == 1 {
+        TypeckNameSuggestion(runtime_str_from_bytes_copy(candidate_ptr, candidate_len), location, distance, rank)
+      } else { current }
+    }
+  }
+}
+
+pub(package) fn typeck_name_suggest_env(current: TypeckNameSuggestion, query_ptr: i64, query_len: i64, env: i64, function_only: i64) -> TypeckNameSuggestion {
+  let mut candidate = current
+  let mut entry = env
+  while entry != 0 {
+    let candidate_ty = tenv_entry_type(entry)
+    let callable = if ty_tag(candidate_ty) == 6 or ty_tag(candidate_ty) == 14 { 1 } else { 0 }
+    if function_only == 0 or callable == 1 {
+      let source = tenv_entry_source(entry)
+      let start = tenv_entry_name_start(entry)
+      let len = tenv_entry_name_len(entry)
+      candidate = typeck_name_suggestion_consider(
+        candidate,
+        query_ptr,
+        query_len,
+        source + start,
+        len,
+        DiagnosticSourceRange(DiagnosticSourceBuffer(source), start, start + len),
+        0
+      )
+    } else { 0 }
+    entry = mem_load64_at(entry, 32)
+  }
+  candidate
+}
+
+pub(package) fn typeck_name_scope_candidate_ok(entry: i64) -> i64 {
+  if module_scope_entry_status(entry) != module_scope_status_resolved() or module_scope_entry_kind(entry) != module_scope_kind_declaration() { 0 }
+  else {
+    let namespace = module_decl_fact_namespace(module_scope_entry_target(entry))
+    if namespace == module_decl_namespace_value() or namespace == module_decl_namespace_constructor() { 1 } else { 0 }
+  }
+}
+
+pub(package) fn typeck_name_suggest_scope(current: TypeckNameSuggestion, query_ptr: i64, query_len: i64, src: i64, tt: i64) -> TypeckNameSuggestion {
+  let module_entry = module_fact_find_source(tt, src)
+  if module_entry == 0 { current }
+  else {
+    module_scope_build_all(tt)
+    let scopes = module_fact_scopes(tt)
+    let mut candidate = current
+    for i in 0..nlist_len(scopes) {
+      let entry = nlist_get(scopes, i)
+      if module_scope_entry_module(entry) == module_entry and typeck_name_scope_candidate_ok(entry) == 1 {
+        let import_entry = module_scope_entry_import(entry)
+        let location = if import_entry == 0 { module_diagnostic_decl_location(module_scope_entry_target(entry)) }
+          else { module_diagnostic_import_local_location(entry, import_entry) }
+        candidate = typeck_name_suggestion_consider(
+          candidate,
+          query_ptr,
+          query_len,
+          module_scope_entry_name_ptr(entry),
+          module_scope_entry_name_len(entry),
+          location,
+          1
+        )
+      } else { 0 }
+    }
+    candidate
+  }
+}
+
+pub(package) fn typeck_name_suggest_ftypes(current: TypeckNameSuggestion, query_ptr: i64, query_len: i64, ft: i64) -> TypeckNameSuggestion {
+  let mut candidate = current
+  for i in 0..nlist_len(ft) {
+    let entry = nlist_get(ft, i)
+    let source = ftypes_entry_source(entry)
+    let start = ftypes_entry_name_start(entry)
+    let len = ftypes_entry_name_len(entry)
+    candidate = typeck_name_suggestion_consider(
+      candidate,
+      query_ptr,
+      query_len,
+      source + start,
+      len,
+      DiagnosticSourceRange(DiagnosticSourceBuffer(source), start, start + len),
+      2
+    )
+  }
+  candidate
+}
+
+pub(package) fn typeck_name_suggestion(src: i64, start: i64, len: i64, env: i64, ft: i64, tt: i64, function_only: i64) -> TypeckNameSuggestion {
+  let local = typeck_name_suggest_env(NoTypeckNameSuggestion(), src + start, len, env, function_only)
+  let scoped = typeck_name_suggest_scope(local, src + start, len, src, tt)
+  if module_fact_find_source(tt, src) == 0 { typeck_name_suggest_ftypes(scoped, src + start, len, ft) } else { scoped }
+}
+
+pub(package) fn typeck_unknown_name_message(name: str, name_kind: str) -> str {
+  let message = buf_new(__str_len(name) + __str_len(name_kind) + 12)
+  bstr(message, "unknown ")
+  bstr(message, name_kind)
+  bstr(message, " '")
+  bstr(message, name)
+  bstr(message, "'")
+  runtime_str_from_bytes_copy(buf_ptr(message), buf_len(message))
+}
+
+pub(package) fn typeck_unknown_name_diagnostic(src: i64, start: i64, len: i64, name_kind: str, suggestion: TypeckNameSuggestion) -> Diagnostic {
+  let name = runtime_str_from_bytes_copy(src + start, len)
+  let primary = DiagnosticSourceRange(DiagnosticSourceBuffer(src), start, start + len)
+  let base_fields = DiagnosticFieldCons(
+    DiagnosticFieldText("name", name),
+    DiagnosticFieldCons(DiagnosticFieldText("name_kind", name_kind), DiagnosticFieldNil)
+  )
+  match suggestion {
+    NoTypeckNameSuggestion -> diagnostic_new(
+      DiagnosticSeverityError,
+      DiagnosticClassType,
+      diagnostic_code_unknown_name(),
+      typeck_unknown_name_message(name, name_kind),
+      primary,
+      DiagnosticRelatedLocationNil,
+      base_fields
+    )
+    TypeckNameSuggestion(spelling, location, distance, rank) -> diagnostic_new(
+      DiagnosticSeverityError,
+      DiagnosticClassType,
+      diagnostic_code_unknown_name(),
+      typeck_unknown_name_message(name, name_kind),
+      primary,
+      match location {
+        DiagnosticLocationNone -> DiagnosticRelatedLocationNil
+        _ -> DiagnosticRelatedLocationCons(DiagnosticRelatedLocation("similarly named declaration", location), DiagnosticRelatedLocationNil)
+      },
+      DiagnosticFieldCons(
+        DiagnosticFieldText("name", name),
+        DiagnosticFieldCons(
+          DiagnosticFieldText("name_kind", name_kind),
+          DiagnosticFieldCons(
+            DiagnosticFieldText("suggestion", spelling),
+            DiagnosticFieldCons(
+              DiagnosticFieldI64("suggestion_distance", distance),
+              DiagnosticFieldCons(
+                DiagnosticFieldText("suggestion_confidence", if distance == 1 { "high" } else { "medium" }),
+                DiagnosticFieldCons(
+                  DiagnosticFieldText("suggestion_origin", if rank == 0 { "local" } else { if rank == 1 { "module-scope" } else { "function-catalog" } }),
+                  DiagnosticFieldCons(
+                    DiagnosticFieldLocation("suggestion_declaration", location),
+                    DiagnosticFieldCons(
+                      DiagnosticFieldSuggestion(DiagnosticSuggestion(
+                        "replace the unresolved name",
+                        DiagnosticSuggestionMaybeIncorrect,
+                        DiagnosticTextEditCons(DiagnosticTextEdit(primary, spelling), DiagnosticTextEditNil)
+                      )),
+                      DiagnosticFieldNil
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  }
+}
+
+pub(package) fn typeck_report_unknown_name(src: i64, start: i64, len: i64, env: i64, ft: i64, tt: i64, function_only: i64) -[Diagnose]> i64 {
+  let name_kind = if function_only == 1 { "function" } else { "identifier" }
+  diagnostic_report(typeck_unknown_name_diagnostic(src, start, len, name_kind, typeck_name_suggestion(src, start, len, env, ft, tt, function_only)))
 }
 
 -- Type environment: maps variable names to types
@@ -7516,7 +7800,7 @@ pub(package) fn check_ident_defined(node: i64, env: i64, ft: i64, src: i64, tt: 
       if ttable_variant_payload_count(tt, src, ns, nl) == 0 { 0 }
       else {
         if module_scope_problem_is_diagnosed(tt, src, src, ns, nl) == 0 {
-          typeck_error(src, ns, "type error: unknown identifier")
+          typeck_report_unknown_name(src, ns, nl, env, ft, tt, 0)
           1
         } else { 0 }
       }
@@ -7550,7 +7834,7 @@ pub(package) fn check_call_defined(node: i64, env: i64, ft: i64, src: i64, tt: i
           typeck_error(src, ns, "type error: opaque constructor is private to its declaring module; use an exported factory")
           1
         } else { if module_scope_problem_is_diagnosed(tt, src, src, ns, nl) == 0 {
-          typeck_error(src, ns, "type error: unknown function")
+          typeck_report_unknown_name(src, ns, nl, env, ft, tt, 1)
           1
         } else { 0 } }
       }
@@ -7585,7 +7869,7 @@ pub(package) fn check_generic_call_target_defined(node: i64, env: i64, ft: i64, 
       1
     } else {
       if module_scope_problem_is_diagnosed(tt, src, src, ns, nl) == 0 {
-        typeck_error(src, ns, "type error: unknown function")
+        typeck_report_unknown_name(src, ns, nl, env, ft, tt, 1)
         1
       } else { 0 }
     } }
@@ -11466,7 +11750,7 @@ pub(package) fn check_assign_target(node: i64, env: i64, ft: i64, src: i64, tt: 
   let target_ty = tenv_lookup(env, src, ns, nl)
   if target_ty == 0 {
     if module_scope_problem_is_diagnosed(tt, src, src, ns, nl) == 0 {
-      typeck_error_maybe(src, ns, "type error: unknown identifier")
+      typeck_report_unknown_name(src, ns, nl, env, ft, tt, 0)
       1
     } else { 0 }
   } else {
