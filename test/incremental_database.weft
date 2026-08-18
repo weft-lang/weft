@@ -365,3 +365,145 @@ test "input mutation is rejected while a query evaluation is active" {
   Test.assert_eq(incremental_database_revision(db), 1)
   Test.assert_eq(incremental_database_active_depth(db), 0)
 }
+
+test "unchanged observed leaves preserve their cached value and dependents" {
+  let db = incremental_database_new()
+  let table = incremental_query_table_new<i64>(db)
+  let observed = incremental_test_key<i64>(table, "observed", 0, 1)
+  let dependent = incremental_test_key<i64>(table, "dependent", 0, 2)
+  let fingerprint = incremental_test_fingerprint("same bytes", 77)
+  match incremental_query_begin<i64>(table, observed) {
+    IncrementalQueryMiss(ticket) -> incremental_query_finish<i64>(ticket, 10, fingerprint)
+    _ -> IncrementalQueryCommitRejected<i64>()
+  }
+  match incremental_query_begin<i64>(table, dependent) {
+    IncrementalQueryMiss(ticket) -> {
+      incremental_query_begin<i64>(table, observed)
+      incremental_query_finish<i64>(ticket, 11, incremental_test_fingerprint("dependent", 2))
+      0
+    }
+    _ -> 0
+  }
+  let revision = incremental_database_revision(db)
+  let executions = incremental_database_execution_count(db)
+
+  match incremental_query_refresh_leaf<i64>(table, observed, 999, fingerprint) {
+    IncrementalLeafUnchanged(value) -> Test.assert_eq(value, 10)
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(incremental_database_revision(db), revision)
+  Test.assert_eq(incremental_database_invalidation_count(db), 0)
+  Test.assert_eq(incremental_database_execution_count(db), executions)
+  Test.assert_eq(incremental_query_is_ready<i64>(table, dependent), 1)
+  match incremental_query_begin<i64>(table, dependent) {
+    IncrementalQueryHit(value) -> Test.assert_eq(value, 11)
+    _ -> Test.assert_eq(0, 1)
+  }
+}
+
+test "changed observed leaves invalidate only their exact reverse closure" {
+  let db = incremental_database_new()
+  let table = incremental_query_table_new<i64>(db)
+  let observed = incremental_test_key<i64>(table, "observed", 0, 1)
+  let middle = incremental_test_key<i64>(table, "middle", 0, 2)
+  let root = incremental_test_key<i64>(table, "root", 0, 3)
+  let unrelated = incremental_test_key<i64>(table, "unrelated", 0, 4)
+  incremental_test_compute_i64(table, observed, 10, "old bytes")
+  match incremental_query_begin<i64>(table, middle) {
+    IncrementalQueryMiss(ticket) -> {
+      incremental_query_begin<i64>(table, observed)
+      incremental_query_finish<i64>(ticket, 11, incremental_test_fingerprint("middle", 2))
+      0
+    }
+    _ -> 0
+  }
+  match incremental_query_begin<i64>(table, root) {
+    IncrementalQueryMiss(ticket) -> {
+      incremental_query_begin<i64>(table, middle)
+      incremental_query_finish<i64>(ticket, 12, incremental_test_fingerprint("root", 3))
+      0
+    }
+    _ -> 0
+  }
+  incremental_test_compute_i64(table, unrelated, 13, "unrelated")
+  let revision = incremental_database_revision(db)
+
+  -- Equal hashes are only a fast reject: distinct bytes still change the leaf.
+  match incremental_query_refresh_leaf<i64>(table, observed, 20, incremental_test_fingerprint("new bytes", 10)) {
+    IncrementalLeafChanged(value) -> Test.assert_eq(value, 20)
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(incremental_database_revision(db), revision + 1)
+  Test.assert_eq(incremental_database_invalidation_count(db), 2)
+  Test.assert_eq(incremental_query_is_ready<i64>(table, observed), 1)
+  Test.assert_eq(incremental_query_is_stale<i64>(table, middle), 1)
+  Test.assert_eq(incremental_query_is_stale<i64>(table, root), 1)
+  Test.assert_eq(incremental_query_is_ready<i64>(table, unrelated), 1)
+  match incremental_query_begin<i64>(table, observed) {
+    IncrementalQueryHit(value) -> Test.assert_eq(value, 20)
+    _ -> Test.assert_eq(0, 1)
+  }
+}
+
+test "observed leaf refresh rejects inputs non-leaves missing keys and foreign databases" {
+  let db = incremental_database_new()
+  let table = incremental_query_table_new<i64>(db)
+  let input = incremental_test_key<i64>(table, "input", 0, 1)
+  let child = incremental_test_key<i64>(table, "child", 0, 2)
+  let non_leaf = incremental_test_key<i64>(table, "non-leaf", 0, 3)
+  let missing = incremental_test_key<i64>(table, "missing", 0, 4)
+  incremental_input_set<i64>(table, input, 1, incremental_test_fingerprint("input", 1))
+  incremental_test_compute_i64(table, child, 2, "child")
+  match incremental_query_begin<i64>(table, non_leaf) {
+    IncrementalQueryMiss(ticket) -> {
+      incremental_query_begin<i64>(table, child)
+      incremental_query_finish<i64>(ticket, 3, incremental_test_fingerprint("non-leaf", 3))
+      0
+    }
+    _ -> 0
+  }
+  match incremental_query_refresh_leaf<i64>(table, input, 9, incremental_test_fingerprint("changed", 9)) {
+    IncrementalLeafRefreshRejected -> Test.assert_eq(1, 1)
+    _ -> Test.assert_eq(0, 1)
+  }
+  match incremental_query_refresh_leaf<i64>(table, non_leaf, 9, incremental_test_fingerprint("changed", 9)) {
+    IncrementalLeafRefreshRejected -> Test.assert_eq(1, 1)
+    _ -> Test.assert_eq(0, 1)
+  }
+  match incremental_query_refresh_leaf<i64>(table, missing, 9, incremental_test_fingerprint("changed", 9)) {
+    IncrementalLeafRefreshRejected -> Test.assert_eq(1, 1)
+    _ -> Test.assert_eq(0, 1)
+  }
+
+  let other_db = incremental_database_new()
+  let other_table = incremental_query_table_new<i64>(other_db)
+  let foreign = incremental_test_key<i64>(other_table, "foreign", 0, 5)
+  incremental_test_compute_i64(other_table, foreign, 5, "foreign")
+  match incremental_query_refresh_leaf<i64>(table, foreign, 9, incremental_test_fingerprint("changed", 9)) {
+    IncrementalLeafRefreshRejected -> Test.assert_eq(1, 1)
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(incremental_database_revision(db), 1)
+}
+
+test "observed leaf refresh is rejected during active evaluation" {
+  let db = incremental_database_new()
+  let table = incremental_query_table_new<i64>(db)
+  let observed = incremental_test_key<i64>(table, "observed", 0, 1)
+  let active = incremental_test_key<i64>(table, "active", 0, 2)
+  incremental_test_compute_i64(table, observed, 1, "old")
+  match incremental_query_begin<i64>(table, active) {
+    IncrementalQueryMiss(ticket) -> {
+      match incremental_query_refresh_leaf<i64>(table, observed, 2, incremental_test_fingerprint("new", 2)) {
+        IncrementalLeafRefreshRejected -> Test.assert_eq(1, 1)
+        _ -> Test.assert_eq(0, 1)
+      }
+      Test.assert_eq(incremental_query_abort<i64>(ticket), 1)
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+  match incremental_query_begin<i64>(table, observed) {
+    IncrementalQueryHit(value) -> Test.assert_eq(value, 1)
+    _ -> Test.assert_eq(0, 1)
+  }
+}
