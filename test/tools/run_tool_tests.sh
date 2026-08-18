@@ -1592,6 +1592,10 @@ assert_equals "mcp_json_unicode_escape_invalid_hex_snapshot" "$mcp_out" '{"jsonr
 # echoed), the initialized notification is not answered, tools/list
 # carries input schemas, tools/call echoes the request id (string ids
 # included) and wraps the payload as MCP text content.
+mcp_session_fact_source='trait Mark { fn mark(self) -> i64 } impl Mark for i64 { fn mark(self: i64) -> i64 { self } } effect Log { fn hit() -> i64 } fn inspect(value: i64) -> i64 { value }'
+mcp_session_fact_prefix='trait Mark { fn mark(self) -> i64 } impl Mark for i64 { fn mark(self: i64) -> i64 { self } } effect Log { fn hit() -> i64 } fn inspect(value: i64) -> i64 { '
+mcp_session_fact_json=$(json_escape_bytes "$mcp_session_fact_source")
+mcp_session_fact_offset=${#mcp_session_fact_prefix}
 mcp_serve_out=$(
   { printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}'
     printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
@@ -1608,6 +1612,13 @@ mcp_serve_out=$(
     printf '%s\n' '{"jsonrpc":"2.0","id":"diagnostics-cache","method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -> i64 { missing }"}}}'
     printf '%s\n' '{"jsonrpc":"2.0","id":"diagnostics-edit","method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -> i64 { 42 }"}}}'
     printf '%s\n' '{"jsonrpc":"2.0","id":"diagnostics-test","method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"test \"bad\" { Test.assert_true(2) }"}}}'
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"fact-type\",\"method\":\"tools/call\",\"params\":{\"name\":\"type_lookup\",\"arguments\":{\"source\":\"$mcp_session_fact_json\",\"name\":\"inspect\"}}}"
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"fact-effect\",\"method\":\"tools/call\",\"params\":{\"name\":\"effect_lookup\",\"arguments\":{\"source\":\"$mcp_session_fact_json\",\"name\":\"Log\"}}}"
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"fact-position\",\"method\":\"tools/call\",\"params\":{\"name\":\"fact_at_position\",\"arguments\":{\"source\":\"$mcp_session_fact_json\",\"offset\":$mcp_session_fact_offset}}}"
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"fact-bindings\",\"method\":\"tools/call\",\"params\":{\"name\":\"visible_bindings\",\"arguments\":{\"source\":\"$mcp_session_fact_json\",\"offset\":$mcp_session_fact_offset}}}"
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"fact-conformance\",\"method\":\"tools/call\",\"params\":{\"name\":\"conformance_at_position\",\"arguments\":{\"source\":\"$mcp_session_fact_json\",\"offset\":$mcp_session_fact_offset,\"trait\":\"Mark\"}}}"
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"fact-type-cache\",\"method\":\"tools/call\",\"params\":{\"name\":\"type_lookup\",\"arguments\":{\"source\":\"$mcp_session_fact_json\",\"name\":\"inspect\"}}}"
+    printf '%s\n' '{"jsonrpc":"2.0","id":"fact-edit","method":"tools/call","params":{"name":"type_lookup","arguments":{"source":"fn changed() -> str { \"edited\" }","name":"inspect"}}}'
     printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"ping"}'
     printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"bogus/method"}'
   } | "$WEFT" mcp serve 2>&1)
@@ -1632,9 +1643,17 @@ assert_contains "mcp_serve_diagnostics_use_cached_check" "$mcp_serve_out" '{"jso
 assert_contains "mcp_serve_reuses_identical_diagnostics" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"diagnostics-cache","result":{"content":[{"type":"text","text":"{\"tool\":\"diagnostics\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"phase\":\"parse+check\",\"diagnostics\":1'
 assert_contains "mcp_serve_invalidates_edited_diagnostics" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"diagnostics-edit","result":{"content":[{"type":"text","text":"{\"tool\":\"diagnostics\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"phase\":\"parse+check\",\"diagnostics\":0,\"functions\":1,\"check_errors\":0'
 assert_contains "mcp_serve_test_diagnostics_use_prepared_check" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"diagnostics-test","result":{"content":[{"type":"text","text":"{\"tool\":\"diagnostics\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"phase\":\"parse+check\",\"diagnostics\":1,\"functions\":1,\"check_errors\":1'
+assert_contains "mcp_serve_type_fact_uses_shared_check" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"fact-type","result":{"content":[{"type":"text","text":"{\"tool\":\"type_lookup\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"name\":\"inspect\",\"found\":true'
+assert_contains "mcp_serve_effect_fact_reuses_shared_check" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"fact-effect","result":{"content":[{"type":"text","text":"{\"tool\":\"effect_lookup\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"name\":\"Log\",\"found\":true'
+assert_contains "mcp_serve_position_fact_reuses_shared_check" "$mcp_serve_out" '"id":"fact-position","result":{"content":[{"type":"text","text":"{\"tool\":\"fact_at_position\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"offset\":'"$mcp_session_fact_offset"',\"found\":true,\"fact\":{\"kind\":\"symbol\",\"name\":\"value\"'
+mcp_session_bindings_response=$(printf '%s\n' "$mcp_serve_out" | grep -F '"id":"fact-bindings"')
+assert_contains "mcp_serve_bindings_reuse_shared_check" "$mcp_session_bindings_response" '{\"name\":\"value\",\"symbol_kind\":\"parameter\",\"type\":{\"kind\":\"primitive\",\"name\":\"i64\"}}'
+assert_contains "mcp_serve_conformance_reuses_shared_check" "$mcp_serve_out" '"id":"fact-conformance","result":{"content":[{"type":"text","text":"{\"tool\":\"conformance_at_position\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"offset\":'"$mcp_session_fact_offset"',\"found\":true,\"fact\":{\"kind\":\"conformance\",\"type\":{\"kind\":\"primitive\",\"name\":\"i64\"},\"trait\":\"Mark\",\"decision\":\"yes\"'
+assert_contains "mcp_serve_reuses_check_after_cross_tool_facts" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"fact-type-cache","result":{"content":[{"type":"text","text":"{\"tool\":\"type_lookup\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"name\":\"inspect\",\"found\":true'
+assert_contains "mcp_serve_fact_edit_invalidates_shared_check" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"fact-edit","result":{"content":[{"type":"text","text":"{\"tool\":\"type_lookup\",\"ok\":true,\"schema_version\":1,\"stability\":\"stable\",\"name\":\"inspect\",\"found\":false}'
 assert_contains "mcp_serve_ping" "$mcp_serve_out" '{"jsonrpc":"2.0","id":3,"result":{}}'
 assert_contains "mcp_serve_unknown_method_error" "$mcp_serve_out" '{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"method not found"}}'
-assert_equals "mcp_serve_notification_not_answered" "$(printf '%s\n' "$mcp_serve_out" | grep -c jsonrpc)" "16"
+assert_equals "mcp_serve_notification_not_answered" "$(printf '%s\n' "$mcp_serve_out" | grep -c jsonrpc)" "23"
 
 lsp_init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 lsp_out=$(lsp_frame "$lsp_init" | "$WEFT" lsp 2>&1)
@@ -2908,4 +2927,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 657 passed, 0 failed"
+echo "Tool boundary summary: 664 passed, 0 failed"
