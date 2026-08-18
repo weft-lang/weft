@@ -1,0 +1,416 @@
+-- compiler/project_session.weft -- reusable project compilation session
+--
+-- A ProjectSession owns source inputs and the first honest compiler-as-data
+-- query boundaries. Source bytes stay managed for as long as cached AST,
+-- typed, and diagnostic values can refer to them. Disk and overlay identities
+-- are distinct, and every semantic context dimension participates in keys.
+
+use compiler/diagnose.{diagnose_report_severity_tag}
+use compiler/grammar.{weft_grammar}
+use compiler/incremental.{*}
+use compiler/lib.{read_file_text}
+use compiler/package.{pkg_identity_register_root, pkg_manifest_load_default_for_table}
+use compiler/pipeline.{*}
+use compiler/type_registry.{str_hash, ttable_new, ttable_register_source}
+use runtime/memory.{mem_load64_at}
+use runtime/string.{runtime_str_from_bytes_copy}
+use stdlib/diagnostic.{diagnostic_uncoded}
+use stdlib/diagnostic_type.{*}
+use stdlib/string.{str_concat}
+use stdlib/vector.{vector_get_in_bounds, vector_len, vector_new, vector_push, vector_set}
+use stdlib/vector_type.{Vector}
+
+pub(package) fn project_source_origin_disk() -> i64 { 1 }
+
+pub(package) fn project_source_origin_overlay() -> i64 { 2 }
+
+pub(package) fn project_source_origin_generated() -> i64 { 3 }
+
+pub(package) type ProjectQueryContext {
+  package_id: i64,
+    identity: str,
+    physical_path: str,
+    origin: i64,
+    semantic_options: i64,
+    target: i64,
+}
+
+pub(package) type ProjectSourceSnapshot {
+  ProjectSourcePresent(str),
+    ProjectSourceMissing,
+}
+
+pub(package) type ProjectDiagnostics {
+  ProjectDiagnostics(Vector<Diagnostic>, Vector<i64>)
+}
+
+pub(package) type ProjectParseResult {
+  ProjectParseSucceeded(AstModule, ProjectDiagnostics),
+    ProjectParseFailed(AstModule, ProjectDiagnostics),
+    ProjectParseSourceUnset,
+    ProjectParseCycle(IncrementalDependencyCycle),
+    ProjectParseCorrupt,
+}
+
+pub(package) type ProjectCheckResult {
+  ProjectCheckSucceeded(TypedModule, ProjectDiagnostics, ProjectDiagnostics),
+    ProjectCheckFailed(TypedModule, ProjectDiagnostics, ProjectDiagnostics),
+    ProjectCheckParseFailed(ProjectParseResult),
+    ProjectCheckSourceUnset,
+    ProjectCheckCycle(IncrementalDependencyCycle),
+    ProjectCheckCorrupt,
+}
+
+pub(package) type ProjectSession {
+  ProjectSession(
+    IncrementalDatabase,
+    IncrementalQueryTable<ProjectSourceSnapshot>,
+    IncrementalQueryTable<ProjectParseResult>,
+    IncrementalQueryTable<ProjectCheckResult>,
+    i64
+  )
+}
+
+pub(package) fn project_query_context(
+  package_id: i64,
+  identity: str,
+  physical_path: str,
+  origin: i64,
+  semantic_options: i64,
+  target: i64
+) -> ProjectQueryContext {
+  ProjectQueryContext {
+    package_id: package_id,
+      identity: identity,
+      physical_path: physical_path,
+      origin: origin,
+      semantic_options: semantic_options,
+      target: target,
+  }
+}
+
+fn project_session_db(session: ProjectSession) -> IncrementalDatabase {
+  match session { ProjectSession(db, sources, parses, checks, schema) -> db }
+}
+
+fn project_session_sources(session: ProjectSession) -> IncrementalQueryTable<ProjectSourceSnapshot> {
+  match session { ProjectSession(db, sources, parses, checks, schema) -> sources }
+}
+
+fn project_session_parses(session: ProjectSession) -> IncrementalQueryTable<ProjectParseResult> {
+  match session { ProjectSession(db, sources, parses, checks, schema) -> parses }
+}
+
+fn project_session_checks(session: ProjectSession) -> IncrementalQueryTable<ProjectCheckResult> {
+  match session { ProjectSession(db, sources, parses, checks, schema) -> checks }
+}
+
+fn project_session_schema(session: ProjectSession) -> i64 {
+  match session { ProjectSession(db, sources, parses, checks, schema) -> schema }
+}
+
+fn project_context_options(context: ProjectQueryContext) -> i64 {
+  context.semantic_options
+}
+
+fn project_context_hash(context: ProjectQueryContext) -> i64 {
+  str_hash(__str_ptr(context.identity), 0, __str_len(context.identity))
+}
+
+pub(package) fn project_session_new(schema: i64) -> ProjectSession {
+  let db = incremental_database_new()
+  ProjectSession(
+    db,
+    incremental_query_table_new<ProjectSourceSnapshot>(db),
+    incremental_query_table_new<ProjectParseResult>(db),
+    incremental_query_table_new<ProjectCheckResult>(db),
+    schema
+  )
+}
+
+pub(package) fn project_session_database(session: ProjectSession) -> IncrementalDatabase {
+  project_session_db(session)
+}
+
+pub(package) fn project_session_source_key(session: ProjectSession, context: ProjectQueryContext) -> IncrementalQueryKey {
+  incremental_query_key<ProjectSourceSnapshot>(
+    project_session_sources(session),
+    context.package_id,
+    context.identity,
+    context.origin,
+    0,
+    0,
+    project_session_schema(session),
+    project_context_hash(context)
+  )
+}
+
+pub(package) fn project_session_parse_key(session: ProjectSession, context: ProjectQueryContext) -> IncrementalQueryKey {
+  incremental_query_key<ProjectParseResult>(
+    project_session_parses(session),
+    context.package_id,
+    context.identity,
+    context.origin,
+    project_context_options(context),
+    context.target,
+    project_session_schema(session),
+    project_context_hash(context)
+  )
+}
+
+pub(package) fn project_session_check_key(session: ProjectSession, context: ProjectQueryContext) -> IncrementalQueryKey {
+  incremental_query_key<ProjectCheckResult>(
+    project_session_checks(session),
+    context.package_id,
+    context.identity,
+    context.origin,
+    project_context_options(context),
+    context.target,
+    project_session_schema(session),
+    project_context_hash(context)
+  )
+}
+
+fn project_source_fingerprint(snapshot: ProjectSourceSnapshot) -> IncrementalFingerprint {
+  match snapshot {
+    ProjectSourcePresent(content) -> {
+      -- The explicit tag keeps a missing source distinct from every possible
+      -- byte sequence, including the empty source.
+      let tagged = str_concat("present:", content)
+      incremental_fingerprint(tagged, str_hash(__str_ptr(tagged), 0, __str_len(tagged)))
+    }
+    ProjectSourceMissing -> incremental_fingerprint("missing:", str_hash(__str_ptr("missing:"), 0, __str_len("missing:")))
+  }
+}
+
+pub(package) fn project_session_set_source(session: ProjectSession, context: ProjectQueryContext, content: str) -> IncrementalInputUpdate<ProjectSourceSnapshot> {
+  let snapshot = ProjectSourcePresent(content)
+  incremental_input_set<ProjectSourceSnapshot>(
+    project_session_sources(session),
+    project_session_source_key(session, context),
+    snapshot,
+    project_source_fingerprint(snapshot)
+  )
+}
+
+pub(package) fn project_session_set_missing(session: ProjectSession, context: ProjectQueryContext) -> IncrementalInputUpdate<ProjectSourceSnapshot> {
+  let snapshot = ProjectSourceMissing
+  incremental_input_set<ProjectSourceSnapshot>(
+    project_session_sources(session),
+    project_session_source_key(session, context),
+    snapshot,
+    project_source_fingerprint(snapshot)
+  )
+}
+
+pub(package) fn project_session_refresh_disk_source(session: ProjectSession, context: ProjectQueryContext) -> IncrementalInputUpdate<ProjectSourceSnapshot> {
+  if context.origin != project_source_origin_disk() or __str_len(context.physical_path) == 0 {
+    IncrementalInputRejected<ProjectSourceSnapshot>()
+  } else {
+    let file = read_file_text(context.physical_path)
+    let ptr = mem_load64_at(file, 0)
+    let len = mem_load64_at(file, 8)
+    if ptr == 0 { project_session_set_missing(session, context) }
+    else { project_session_set_source(session, context, runtime_str_from_bytes_copy(ptr, len)) }
+  }
+}
+
+fn project_diagnostics_items(diagnostics: ProjectDiagnostics) -> Vector<Diagnostic> {
+  match diagnostics { ProjectDiagnostics(items, counters) -> items }
+}
+
+fn project_diagnostics_counters(diagnostics: ProjectDiagnostics) -> Vector<i64> {
+  match diagnostics { ProjectDiagnostics(items, counters) -> counters }
+}
+
+fn project_diagnostics_new() -> ProjectDiagnostics {
+  let counters = vector_new<i64>()
+  vector_push<i64>(counters, 0)
+  ProjectDiagnostics(vector_new<Diagnostic>(), counters)
+}
+
+fn project_diagnostics_add(diagnostics: ProjectDiagnostics, diagnostic: Diagnostic) -> i64 {
+  vector_push<Diagnostic>(project_diagnostics_items(diagnostics), diagnostic)
+  if diagnose_report_severity_tag(diagnostic) == 1 {
+    let counters = project_diagnostics_counters(diagnostics)
+    vector_set<i64>(counters, 0, vector_get_in_bounds<i64>(counters, 0) + 1)
+  } else { 0 }
+}
+
+fn project_legacy_location(src: i64, span: i64) -> DiagnosticLocation {
+  let start = if span >= src { span - src } else { span }
+  if start < 0 { DiagnosticLocationNone }
+  else { DiagnosticSourceRange(DiagnosticSourceBuffer(src), start, start + 1) }
+}
+
+fn project_diagnostics_add_legacy(diagnostics: ProjectDiagnostics, src: i64, severity: DiagnosticSeverity, class: DiagnosticClass, msg: str, span: i64) -> i64 {
+  project_diagnostics_add(diagnostics, diagnostic_uncoded(severity, class, msg, project_legacy_location(src, span)))
+}
+
+pub(package) fn project_diagnostics_len(diagnostics: ProjectDiagnostics) -> i64 {
+  vector_len<Diagnostic>(project_diagnostics_items(diagnostics))
+}
+
+pub(package) fn project_diagnostics_error_count(diagnostics: ProjectDiagnostics) -> i64 {
+  vector_get_in_bounds<i64>(project_diagnostics_counters(diagnostics), 0)
+}
+
+pub(package) fn project_diagnostics_get(diagnostics: ProjectDiagnostics, index: i64) -> Diagnostic {
+  vector_get_in_bounds<Diagnostic>(project_diagnostics_items(diagnostics), index)
+}
+
+fn project_register_root(context: ProjectQueryContext, content: str) -> i64 {
+  let src = __str_ptr(content)
+  let tt = ttable_new()
+  pipeline_mark_untrusted_root_origin(tt, src)
+  if __str_len(context.physical_path) > 0 {
+    ttable_register_source(tt, src, __str_len(content), __str_ptr(context.physical_path), __str_len(context.physical_path))
+    pkg_identity_register_root(tt, pkg_manifest_load_default_for_table(tt))
+  } else { 0 }
+  tt
+}
+
+fn project_parse_compute(session: ProjectSession, context: ProjectQueryContext, ticket: IncrementalQueryTicket<ProjectParseResult>) -> ProjectParseResult {
+  let sources = project_session_sources(session)
+  let source_key = project_session_source_key(session, context)
+  if incremental_query_is_ready<ProjectSourceSnapshot>(sources, source_key) == 0 {
+    incremental_query_abort<ProjectParseResult>(ticket)
+    ProjectParseSourceUnset
+  } else {
+    match incremental_query_begin<ProjectSourceSnapshot>(sources, source_key) {
+      IncrementalQueryHit(snapshot) -> match snapshot {
+        ProjectSourceMissing -> {
+          let result = ProjectParseSourceUnset
+          match incremental_query_finish<ProjectParseResult>(ticket, result, project_source_fingerprint(snapshot)) {
+            IncrementalQueryCommitted(committed) -> committed
+            IncrementalQueryCommitRejected -> ProjectParseCorrupt
+          }
+        }
+        ProjectSourcePresent(content) -> {
+          let src = __str_ptr(content)
+          let diagnostics = project_diagnostics_new()
+          let tt = project_register_root(context, content)
+          let grammar = weft_grammar()
+          let fns = handle grammar.parse(src, __str_len(content), tt) {
+            Diagnose.report(diagnostic) -> { project_diagnostics_add(diagnostics, diagnostic) resume(0) }
+            Diagnose.error(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, DiagnosticSeverityError, DiagnosticClassParse, msg, span) resume(0) }
+            Diagnose.warn(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, DiagnosticSeverityWarning, DiagnosticClassParse, msg, span) resume(0) }
+            Diagnose.note(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, DiagnosticSeverityNote, DiagnosticClassParse, msg, span) resume(0) }
+          }
+          let ast = AstModule(fns, src, tt)
+          let result = if project_diagnostics_error_count(diagnostics) == 0 {
+            ProjectParseSucceeded(ast, diagnostics)
+          } else { ProjectParseFailed(ast, diagnostics) }
+          match incremental_query_finish<ProjectParseResult>(ticket, result, project_source_fingerprint(snapshot)) {
+            IncrementalQueryCommitted(committed) -> committed
+            IncrementalQueryCommitRejected -> ProjectParseCorrupt
+          }
+        }
+      }
+      IncrementalQueryMiss(source_ticket) -> {
+        incremental_query_abort<ProjectSourceSnapshot>(source_ticket)
+        incremental_query_abort<ProjectParseResult>(ticket)
+        ProjectParseSourceUnset
+      }
+      IncrementalQueryCycle(cycle) -> {
+        incremental_query_abort<ProjectParseResult>(ticket)
+        ProjectParseCycle(cycle)
+      }
+      IncrementalQueryCorrupt -> {
+        incremental_query_abort<ProjectParseResult>(ticket)
+        ProjectParseCorrupt
+      }
+    }
+  }
+}
+
+pub(package) fn project_session_parse(session: ProjectSession, context: ProjectQueryContext) -> ProjectParseResult {
+  match incremental_query_begin<ProjectParseResult>(project_session_parses(session), project_session_parse_key(session, context)) {
+    IncrementalQueryHit(result) -> result
+    IncrementalQueryMiss(ticket) -> project_parse_compute(session, context, ticket)
+    IncrementalQueryCycle(cycle) -> ProjectParseCycle(cycle)
+    IncrementalQueryCorrupt -> ProjectParseCorrupt
+  }
+}
+
+fn project_check_compute(session: ProjectSession, context: ProjectQueryContext, ticket: IncrementalQueryTicket<ProjectCheckResult>) -> ProjectCheckResult {
+  match project_session_parse(session, context) {
+    ProjectParseSucceeded(ast, parse_diagnostics) -> match ast {
+      AstModule(fns, src, tt) -> {
+        pipeline_bind_runtime_preludes(fns, src, tt)
+        let diagnostics = project_diagnostics_new()
+        let errors = handle pipeline_check(weft_grammar(), fns, src, tt) {
+          Diagnose.report(diagnostic) -> { project_diagnostics_add(diagnostics, diagnostic) resume(0) }
+          Diagnose.error(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, DiagnosticSeverityError, DiagnosticClassType, msg, span) resume(0) }
+          Diagnose.warn(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, DiagnosticSeverityWarning, DiagnosticClassType, msg, span) resume(0) }
+          Diagnose.note(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, DiagnosticSeverityNote, DiagnosticClassType, msg, span) resume(0) }
+        }
+        let typed = TypedModule(fns, src, tt)
+        let result = if errors == 0 and project_diagnostics_error_count(diagnostics) == 0 {
+          ProjectCheckSucceeded(typed, parse_diagnostics, diagnostics)
+        } else { ProjectCheckFailed(typed, parse_diagnostics, diagnostics) }
+        match incremental_query_finish<ProjectCheckResult>(ticket, result, incremental_fingerprint("project-check", project_session_schema(session))) {
+          IncrementalQueryCommitted(committed) -> committed
+          IncrementalQueryCommitRejected -> ProjectCheckCorrupt
+        }
+      }
+    }
+    ProjectParseFailed(ast, diagnostics) -> {
+      let result = ProjectCheckParseFailed(ProjectParseFailed(ast, diagnostics))
+      match incremental_query_finish<ProjectCheckResult>(ticket, result, incremental_fingerprint("project-parse-failed", project_session_schema(session))) {
+        IncrementalQueryCommitted(committed) -> committed
+        IncrementalQueryCommitRejected -> ProjectCheckCorrupt
+      }
+    }
+    ProjectParseSourceUnset -> {
+      let result = ProjectCheckSourceUnset
+      match incremental_query_finish<ProjectCheckResult>(ticket, result, incremental_fingerprint("project-source-unset", project_session_schema(session))) {
+        IncrementalQueryCommitted(committed) -> committed
+        IncrementalQueryCommitRejected -> ProjectCheckCorrupt
+      }
+    }
+    ProjectParseCycle(cycle) -> {
+      incremental_query_abort<ProjectCheckResult>(ticket)
+      ProjectCheckCycle(cycle)
+    }
+    ProjectParseCorrupt -> {
+      incremental_query_abort<ProjectCheckResult>(ticket)
+      ProjectCheckCorrupt
+    }
+  }
+}
+
+pub(package) fn project_session_check(session: ProjectSession, context: ProjectQueryContext) -> ProjectCheckResult {
+  match incremental_query_begin<ProjectCheckResult>(project_session_checks(session), project_session_check_key(session, context)) {
+    IncrementalQueryHit(result) -> result
+    IncrementalQueryMiss(ticket) -> project_check_compute(session, context, ticket)
+    IncrementalQueryCycle(cycle) -> ProjectCheckCycle(cycle)
+    IncrementalQueryCorrupt -> ProjectCheckCorrupt
+  }
+}
+
+pub(package) fn project_session_parse_execution_count(session: ProjectSession, context: ProjectQueryContext) -> i64 {
+  incremental_query_execution_count<ProjectParseResult>(project_session_parses(session), project_session_parse_key(session, context))
+}
+
+pub(package) fn project_session_check_execution_count(session: ProjectSession, context: ProjectQueryContext) -> i64 {
+  incremental_query_execution_count<ProjectCheckResult>(project_session_checks(session), project_session_check_key(session, context))
+}
+
+pub(package) fn project_session_check_depends_on_parse(session: ProjectSession, context: ProjectQueryContext) -> i64 {
+  incremental_query_depends_on<ProjectCheckResult, ProjectParseResult>(
+    project_session_checks(session),
+    project_session_check_key(session, context),
+    project_session_parses(session),
+    project_session_parse_key(session, context)
+  )
+}
+
+pub(package) fn project_session_parse_depends_on_source(session: ProjectSession, context: ProjectQueryContext) -> i64 {
+  incremental_query_depends_on<ProjectParseResult, ProjectSourceSnapshot>(
+    project_session_parses(session),
+    project_session_parse_key(session, context),
+    project_session_sources(session),
+    project_session_source_key(session, context)
+  )
+}
