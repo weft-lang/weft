@@ -1,0 +1,367 @@
+use compiler/incremental.{*}
+
+type IncrementalTestOutcome {
+  IncrementalTestSuccess(i64),
+    IncrementalTestFailure(str)
+}
+
+fn incremental_test_key<T>(table: IncrementalQueryTable<T>, identity: str, subject: i64, hash: i64) -> IncrementalQueryKey {
+  incremental_query_key<T>(table, 1, identity, subject, 7, 11, 1, hash)
+}
+
+fn incremental_test_fingerprint(content: str, hash: i64) -> IncrementalFingerprint {
+  incremental_fingerprint(content, hash)
+}
+
+fn incremental_test_compute_i64(table: IncrementalQueryTable<i64>, key: IncrementalQueryKey, value: i64, content: str) -> i64 {
+  match incremental_query_begin<i64>(table, key) {
+    IncrementalQueryHit(cached) -> cached
+    IncrementalQueryMiss(ticket) -> match incremental_query_finish<i64>(ticket, value, incremental_test_fingerprint(content, value)) {
+      IncrementalQueryCommitted(committed) -> committed
+      IncrementalQueryCommitRejected -> 0 - 1000
+    }
+    IncrementalQueryCycle(cycle) -> 0 - 2000
+    IncrementalQueryCorrupt -> 0 - 3000
+  }
+}
+
+test "typed query tables share one dependency graph without erasing values" {
+  let db = incremental_database_new()
+  let input_table = incremental_query_table_new<i64>(db)
+  let summary_table = incremental_query_table_new<str>(db)
+  let input = incremental_test_key<i64>(input_table, "source/main.weft", 0, 41)
+  let summary = incremental_test_key<str>(summary_table, "typed-summary", 0, 42)
+
+  match incremental_input_set<i64>(input_table, input, 17, incremental_test_fingerprint("source-v1", 101)) {
+    IncrementalInputInserted(value) -> Test.assert_eq(value, 17)
+    _ -> Test.assert_eq(0, 1)
+  }
+  match incremental_query_begin<str>(summary_table, summary) {
+    IncrementalQueryMiss(ticket) -> {
+      match incremental_query_begin<i64>(input_table, input) {
+        IncrementalQueryHit(value) -> Test.assert_eq(value, 17)
+        _ -> Test.assert_eq(0, 1)
+      }
+      match incremental_query_finish<str>(ticket, "checked", incremental_test_fingerprint("summary-v1", 102)) {
+        IncrementalQueryCommitted(value) -> Test.assert_str_eq(value, "checked")
+        IncrementalQueryCommitRejected -> Test.assert_eq(0, 1)
+      }
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+  match incremental_query_begin<str>(summary_table, summary) {
+    IncrementalQueryHit(value) -> Test.assert_str_eq(value, "checked")
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(incremental_query_depends_on<str, i64>(summary_table, summary, input_table, input), 1)
+  Test.assert_eq(incremental_database_query_count(db), 2)
+  Test.assert_eq(incremental_database_execution_count(db), 1)
+  Test.assert_eq(incremental_database_hit_count(db), 2)
+}
+
+test "unchanged inputs retain cached values without advancing the revision" {
+  let db = incremental_database_new()
+  let table = incremental_query_table_new<i64>(db)
+  let key = incremental_test_key<i64>(table, "same", 0, 1)
+  let fingerprint = incremental_test_fingerprint("identical bytes", 77)
+  match incremental_input_set<i64>(table, key, 10, fingerprint) {
+    IncrementalInputInserted(value) -> Test.assert_eq(value, 10)
+    _ -> Test.assert_eq(0, 1)
+  }
+  let revision = incremental_database_revision(db)
+  match incremental_input_set<i64>(table, key, 999, fingerprint) {
+    IncrementalInputUnchanged(value) -> Test.assert_eq(value, 10)
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(incremental_database_revision(db), revision)
+  Test.assert_eq(incremental_database_invalidation_count(db), 0)
+}
+
+test "diamond invalidation marks the exact reverse closure once" {
+  let db = incremental_database_new()
+  let table = incremental_query_table_new<i64>(db)
+  let source = incremental_test_key<i64>(table, "source", 0, 1)
+  let left = incremental_test_key<i64>(table, "left", 0, 2)
+  let right = incremental_test_key<i64>(table, "right", 0, 3)
+  let root = incremental_test_key<i64>(table, "root", 0, 4)
+  let unrelated = incremental_test_key<i64>(table, "unrelated", 0, 5)
+  incremental_input_set<i64>(table, source, 1, incremental_test_fingerprint("s1", 1))
+
+  match incremental_query_begin<i64>(table, left) {
+    IncrementalQueryMiss(ticket) -> {
+      incremental_query_begin<i64>(table, source)
+      incremental_query_finish<i64>(ticket, 2, incremental_test_fingerprint("l1", 2))
+      0
+    }
+    _ -> 0
+  }
+  match incremental_query_begin<i64>(table, right) {
+    IncrementalQueryMiss(ticket) -> {
+      incremental_query_begin<i64>(table, source)
+      incremental_query_finish<i64>(ticket, 3, incremental_test_fingerprint("r1", 3))
+      0
+    }
+    _ -> 0
+  }
+  match incremental_query_begin<i64>(table, root) {
+    IncrementalQueryMiss(ticket) -> {
+      incremental_query_begin<i64>(table, left)
+      incremental_query_begin<i64>(table, right)
+      incremental_query_finish<i64>(ticket, 5, incremental_test_fingerprint("root1", 5))
+      0
+    }
+    _ -> 0
+  }
+  Test.assert_eq(incremental_test_compute_i64(table, unrelated, 9, "u1"), 9)
+
+  match incremental_input_set<i64>(table, source, 2, incremental_test_fingerprint("s2", 2)) {
+    IncrementalInputChanged(value) -> Test.assert_eq(value, 2)
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(incremental_query_is_stale<i64>(table, left), 1)
+  Test.assert_eq(incremental_query_is_stale<i64>(table, right), 1)
+  Test.assert_eq(incremental_query_is_stale<i64>(table, root), 1)
+  Test.assert_eq(incremental_query_is_ready<i64>(table, unrelated), 1)
+  Test.assert_eq(incremental_database_invalidation_count(db), 3)
+}
+
+test "recomputation replaces dynamic dependencies rather than accumulating them" {
+  let db = incremental_database_new()
+  let table = incremental_query_table_new<i64>(db)
+  let x = incremental_test_key<i64>(table, "x", 0, 1)
+  let y = incremental_test_key<i64>(table, "y", 0, 2)
+  let derived = incremental_test_key<i64>(table, "derived", 0, 3)
+  incremental_input_set<i64>(table, x, 1, incremental_test_fingerprint("x1", 1))
+  incremental_input_set<i64>(table, y, 2, incremental_test_fingerprint("y1", 2))
+
+  match incremental_query_begin<i64>(table, derived) {
+    IncrementalQueryMiss(ticket) -> {
+      incremental_query_begin<i64>(table, x)
+      incremental_query_finish<i64>(ticket, 1, incremental_test_fingerprint("d-x", 3))
+      0
+    }
+    _ -> 0
+  }
+  Test.assert_eq(incremental_query_depends_on<i64, i64>(table, derived, table, x), 1)
+  incremental_input_set<i64>(table, x, 3, incremental_test_fingerprint("x2", 4))
+  match incremental_query_begin<i64>(table, derived) {
+    IncrementalQueryMiss(ticket) -> {
+      incremental_query_begin<i64>(table, y)
+      incremental_query_finish<i64>(ticket, 2, incremental_test_fingerprint("d-y", 5))
+      0
+    }
+    _ -> 0
+  }
+  Test.assert_eq(incremental_query_depends_on<i64, i64>(table, derived, table, x), 0)
+  Test.assert_eq(incremental_query_depends_on<i64, i64>(table, derived, table, y), 1)
+  Test.assert_eq(incremental_query_dependency_count<i64>(table, derived), 1)
+
+  incremental_input_set<i64>(table, x, 4, incremental_test_fingerprint("x3", 6))
+  Test.assert_eq(incremental_query_is_ready<i64>(table, derived), 1)
+  incremental_input_set<i64>(table, y, 5, incremental_test_fingerprint("y2", 7))
+  Test.assert_eq(incremental_query_is_stale<i64>(table, derived), 1)
+}
+
+test "hash collisions never alias distinct full keys or fingerprints" {
+  let db = incremental_database_new()
+  let table = incremental_query_table_new<i64>(db)
+  let first = incremental_test_key<i64>(table, "alpha", 0, 99)
+  let second = incremental_test_key<i64>(table, "beta", 0, 99)
+  incremental_input_set<i64>(table, first, 10, incremental_test_fingerprint("one", 55))
+  incremental_input_set<i64>(table, second, 20, incremental_test_fingerprint("two", 55))
+  match incremental_query_begin<i64>(table, first) {
+    IncrementalQueryHit(value) -> Test.assert_eq(value, 10)
+    _ -> Test.assert_eq(0, 1)
+  }
+  match incremental_query_begin<i64>(table, second) {
+    IncrementalQueryHit(value) -> Test.assert_eq(value, 20)
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(incremental_database_query_count(db), 2)
+  match incremental_input_set<i64>(table, first, 11, incremental_test_fingerprint("different", 55)) {
+    IncrementalInputChanged(value) -> Test.assert_eq(value, 11)
+    _ -> Test.assert_eq(0, 1)
+  }
+}
+
+test "every semantic key dimension participates in identity" {
+  let db = incremental_database_new()
+  let table = incremental_query_table_new<i64>(db)
+  let base = incremental_query_key<i64>(table, 1, "same", 2, 3, 4, 5, 100)
+  let package_key = incremental_query_key<i64>(table, 9, "same", 2, 3, 4, 5, 100)
+  let subject = incremental_query_key<i64>(table, 1, "same", 9, 3, 4, 5, 100)
+  let options = incremental_query_key<i64>(table, 1, "same", 2, 9, 4, 5, 100)
+  let target = incremental_query_key<i64>(table, 1, "same", 2, 3, 9, 5, 100)
+  let schema = incremental_query_key<i64>(table, 1, "same", 2, 3, 4, 9, 100)
+  incremental_input_set<i64>(table, base, 1, incremental_test_fingerprint("1", 1))
+  incremental_input_set<i64>(table, package_key, 2, incremental_test_fingerprint("2", 2))
+  incremental_input_set<i64>(table, subject, 3, incremental_test_fingerprint("3", 3))
+  incremental_input_set<i64>(table, options, 4, incremental_test_fingerprint("4", 4))
+  incremental_input_set<i64>(table, target, 5, incremental_test_fingerprint("5", 5))
+  incremental_input_set<i64>(table, schema, 6, incremental_test_fingerprint("6", 6))
+  Test.assert_eq(incremental_database_query_count(db), 6)
+}
+
+test "keys cannot cross database identity boundaries" {
+  let left_db = incremental_database_new()
+  let right_db = incremental_database_new()
+  let left_table = incremental_query_table_new<i64>(left_db)
+  let right_table = incremental_query_table_new<i64>(right_db)
+  let left_key = incremental_test_key<i64>(left_table, "same", 0, 100)
+  let right_key = incremental_test_key<i64>(right_table, "same", 0, 100)
+  incremental_input_set<i64>(left_table, left_key, 1, incremental_test_fingerprint("left", 1))
+  incremental_input_set<i64>(right_table, right_key, 2, incremental_test_fingerprint("right", 2))
+  match incremental_input_set<i64>(left_table, right_key, 3, incremental_test_fingerprint("cross", 3)) {
+    IncrementalInputRejected -> Test.assert_eq(1, 1)
+    _ -> Test.assert_eq(0, 1)
+  }
+  match incremental_query_begin<i64>(left_table, right_key) {
+    IncrementalQueryCorrupt -> Test.assert_eq(1, 1)
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(incremental_query_depends_on<i64, i64>(left_table, left_key, right_table, right_key), 0)
+  Test.assert_eq(incremental_database_query_count(left_db), 1)
+  Test.assert_eq(incremental_database_query_count(right_db), 1)
+}
+
+test "dependency cycles report the complete path and unwind for retry" {
+  let db = incremental_database_new()
+  let table = incremental_query_table_new<i64>(db)
+  let a = incremental_test_key<i64>(table, "a", 0, 1)
+  let b = incremental_test_key<i64>(table, "b", 0, 2)
+  match incremental_query_begin<i64>(table, a) {
+    IncrementalQueryMiss(a_ticket) -> match incremental_query_begin<i64>(table, b) {
+      IncrementalQueryMiss(b_ticket) -> {
+        match incremental_query_begin<i64>(table, a) {
+          IncrementalQueryCycle(cycle) -> {
+            Test.assert_eq(incremental_dependency_cycle_len(cycle), 3)
+            Test.assert_eq(if incremental_query_key_equal(incremental_dependency_cycle_key(cycle, 0), a) { 1 } else { 0 }, 1)
+            Test.assert_eq(if incremental_query_key_equal(incremental_dependency_cycle_key(cycle, 1), b) { 1 } else { 0 }, 1)
+            Test.assert_eq(if incremental_query_key_equal(incremental_dependency_cycle_key(cycle, 2), a) { 1 } else { 0 }, 1)
+          }
+          _ -> Test.assert_eq(0, 1)
+        }
+        Test.assert_eq(incremental_query_abort<i64>(b_ticket), 1)
+        Test.assert_eq(incremental_query_abort<i64>(a_ticket), 1)
+      }
+      _ -> Test.assert_eq(0, 1)
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(incremental_database_active_depth(db), 0)
+  Test.assert_eq(incremental_database_cycle_count(db), 1)
+  Test.assert_eq(incremental_test_compute_i64(table, a, 7, "retry"), 7)
+}
+
+test "query tickets enforce stack order and cannot commit out of order" {
+  let db = incremental_database_new()
+  let table = incremental_query_table_new<i64>(db)
+  let outer = incremental_test_key<i64>(table, "outer", 0, 1)
+  let inner = incremental_test_key<i64>(table, "inner", 0, 2)
+  match incremental_query_begin<i64>(table, outer) {
+    IncrementalQueryMiss(outer_ticket) -> match incremental_query_begin<i64>(table, inner) {
+      IncrementalQueryMiss(inner_ticket) -> {
+        match incremental_query_finish<i64>(outer_ticket, 1, incremental_test_fingerprint("bad", 1)) {
+          IncrementalQueryCommitRejected -> Test.assert_eq(1, 1)
+          _ -> Test.assert_eq(0, 1)
+        }
+        match incremental_query_finish<i64>(inner_ticket, 2, incremental_test_fingerprint("inner", 2)) {
+          IncrementalQueryCommitted(value) -> Test.assert_eq(value, 2)
+          _ -> Test.assert_eq(0, 1)
+        }
+        match incremental_query_finish<i64>(outer_ticket, 3, incremental_test_fingerprint("outer", 3)) {
+          IncrementalQueryCommitted(value) -> Test.assert_eq(value, 3)
+          _ -> Test.assert_eq(0, 1)
+        }
+      }
+      _ -> Test.assert_eq(0, 1)
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(incremental_database_active_depth(db), 0)
+}
+
+test "typed failures are cached and invalidated like successful results" {
+  let db = incremental_database_new()
+  let inputs = incremental_query_table_new<i64>(db)
+  let outcomes = incremental_query_table_new<IncrementalTestOutcome>(db)
+  let source = incremental_test_key<i64>(inputs, "source", 0, 1)
+  let checked = incremental_test_key<IncrementalTestOutcome>(outcomes, "check", 0, 2)
+  incremental_input_set<i64>(inputs, source, 1, incremental_test_fingerprint("bad source", 1))
+  match incremental_query_begin<IncrementalTestOutcome>(outcomes, checked) {
+    IncrementalQueryMiss(ticket) -> {
+      incremental_query_begin<i64>(inputs, source)
+      incremental_query_finish<IncrementalTestOutcome>(ticket, IncrementalTestFailure("E1002"), incremental_test_fingerprint("failure", 2))
+      0
+    }
+    _ -> 0
+  }
+  match incremental_query_begin<IncrementalTestOutcome>(outcomes, checked) {
+    IncrementalQueryHit(outcome) -> match outcome {
+      IncrementalTestFailure(code) -> Test.assert_str_eq(code, "E1002")
+      _ -> Test.assert_eq(0, 1)
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+  incremental_input_set<i64>(inputs, source, 2, incremental_test_fingerprint("good source", 3))
+  Test.assert_eq(incremental_query_is_stale<IncrementalTestOutcome>(outcomes, checked), 1)
+  match incremental_query_begin<IncrementalTestOutcome>(outcomes, checked) {
+    IncrementalQueryMiss(ticket) -> {
+      incremental_query_begin<i64>(inputs, source)
+      incremental_query_finish<IncrementalTestOutcome>(ticket, IncrementalTestSuccess(42), incremental_test_fingerprint("success", 4))
+      0
+    }
+    _ -> 0
+  }
+  match incremental_query_begin<IncrementalTestOutcome>(outcomes, checked) {
+    IncrementalQueryHit(outcome) -> match outcome {
+      IncrementalTestSuccess(value) -> Test.assert_eq(value, 42)
+      _ -> Test.assert_eq(0, 1)
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+}
+
+test "deep invalidation walks iteratively without recursive stack growth" {
+  let db = incremental_database_new()
+  let table = incremental_query_table_new<i64>(db)
+  let input = incremental_test_key<i64>(table, "chain", 0, 999)
+  incremental_input_set<i64>(table, input, 0, incremental_test_fingerprint("chain-0", 0))
+  let mut prior = input
+  for i in 1..257 {
+    let next = incremental_test_key<i64>(table, "chain", i, 999)
+    match incremental_query_begin<i64>(table, next) {
+      IncrementalQueryMiss(ticket) -> {
+        incremental_query_begin<i64>(table, prior)
+        incremental_query_finish<i64>(ticket, i, incremental_test_fingerprint("chain-derived", i))
+        0
+      }
+      _ -> 0
+    }
+    prior = next
+  }
+  Test.assert_eq(incremental_database_execution_count(db), 256)
+  incremental_input_set<i64>(table, input, 1, incremental_test_fingerprint("chain-1", 1))
+  Test.assert_eq(incremental_query_is_stale<i64>(table, prior), 1)
+  Test.assert_eq(incremental_database_invalidation_count(db), 256)
+}
+
+test "input mutation is rejected while a query evaluation is active" {
+  let db = incremental_database_new()
+  let table = incremental_query_table_new<i64>(db)
+  let input = incremental_test_key<i64>(table, "input", 0, 1)
+  let derived = incremental_test_key<i64>(table, "derived", 0, 2)
+  incremental_input_set<i64>(table, input, 1, incremental_test_fingerprint("v1", 1))
+  match incremental_query_begin<i64>(table, derived) {
+    IncrementalQueryMiss(ticket) -> {
+      match incremental_input_set<i64>(table, input, 2, incremental_test_fingerprint("v2", 2)) {
+        IncrementalInputRejected -> Test.assert_eq(1, 1)
+        _ -> Test.assert_eq(0, 1)
+      }
+      Test.assert_eq(incremental_query_abort<i64>(ticket), 1)
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(incremental_database_revision(db), 1)
+  Test.assert_eq(incremental_database_active_depth(db), 0)
+}

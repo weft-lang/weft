@@ -1,0 +1,595 @@
+-- compiler/incremental.weft -- demand-driven incremental query core
+--
+-- The database owns query lifecycle and dependency identity; typed tables own
+-- values. Cross-kind dependencies therefore share one revision graph without
+-- erasing results to `any`. Entry ids, rather than managed references, form
+-- graph edges so reverse dependencies cannot create ownership cycles.
+
+use stdlib/option.{None, Option, Some, option_none, option_some}
+use stdlib/eq.{Eq}
+use stdlib/hash.{Hash}
+use stdlib/map.{Map, map_get, map_new, map_put}
+use stdlib/string.{str_eq}
+use stdlib/vector.{vector_get_in_bounds, vector_len, vector_new, vector_pop, vector_push, vector_remove_at, vector_set}
+use stdlib/vector_type.{Vector}
+
+pub(package) type IncrementalDatabaseIdentity {
+  IncrementalDatabaseIdentity(Vector<i64>)
+}
+
+pub(package) type IncrementalQueryKey {
+  database: IncrementalDatabaseIdentity,
+    table_id: i64,
+    package_id: i64,
+    identity: str,
+    subject: i64,
+    options: i64,
+    target: i64,
+    schema: i64,
+    hash: i64,
+}
+
+pub(package) type IncrementalFingerprint {
+  content: str,
+    hash: i64,
+}
+
+type IncrementalQueryEntry {
+  key: IncrementalQueryKey,
+    state: i64,
+    mode: i64,
+    fingerprint: Option<IncrementalFingerprint>,
+    dependencies: Vector<i64>,
+    reverse_dependencies: Vector<i64>,
+    changed_revision: i64,
+    invalidated_revision: i64,
+    executions: i64,
+    hits: i64,
+}
+
+pub(package) type IncrementalDatabase {
+  IncrementalDatabase(IncrementalDatabaseIdentity, Vector<i64>, Vector<IncrementalQueryEntry>, Vector<i64>, Vector<Map<IncrementalQueryKey, i64>>)
+}
+
+pub(package) type IncrementalQueryTable<T> {
+  IncrementalQueryTable(IncrementalDatabase, i64, Vector<Option<T>>)
+}
+
+pub(package) type IncrementalDependencyCycle {
+  IncrementalDependencyCycle(Vector<IncrementalQueryKey>)
+}
+
+pub(package) type IncrementalQueryTicket<T> {
+  IncrementalQueryTicket(IncrementalQueryTable<T>, i64)
+}
+
+pub(package) type IncrementalQueryDecision<T> {
+  IncrementalQueryHit(T),
+    IncrementalQueryMiss(IncrementalQueryTicket<T>),
+    IncrementalQueryCycle(IncrementalDependencyCycle),
+    IncrementalQueryCorrupt,
+}
+
+pub(package) type IncrementalQueryCommit<T> {
+  IncrementalQueryCommitted(T),
+    IncrementalQueryCommitRejected,
+}
+
+pub(package) type IncrementalInputUpdate<T> {
+  IncrementalInputInserted(T),
+    IncrementalInputChanged(T),
+    IncrementalInputUnchanged(T),
+    IncrementalInputRejected,
+    IncrementalInputCorrupt,
+}
+
+fn incremental_state_stale() -> i64 { 0 }
+
+fn incremental_state_computing() -> i64 { 1 }
+
+fn incremental_state_ready() -> i64 { 2 }
+
+fn incremental_mode_unassigned() -> i64 { 0 }
+
+fn incremental_mode_input() -> i64 { 1 }
+
+fn incremental_mode_derived() -> i64 { 2 }
+
+fn incremental_counter_revision() -> i64 { 0 }
+
+fn incremental_counter_next_table() -> i64 { 1 }
+
+fn incremental_counter_hits() -> i64 { 2 }
+
+fn incremental_counter_misses() -> i64 { 3 }
+
+fn incremental_counter_invalidations() -> i64 { 4 }
+
+fn incremental_counter_cycles() -> i64 { 5 }
+
+fn incremental_counter_dependencies() -> i64 { 6 }
+
+fn incremental_counter_executions() -> i64 { 7 }
+
+fn incremental_counter_count() -> i64 { 8 }
+
+fn incremental_db_counters(db: IncrementalDatabase) -> Vector<i64> {
+  match db { IncrementalDatabase(identity, counters, entries, active, index) -> counters }
+}
+
+fn incremental_db_entries(db: IncrementalDatabase) -> Vector<IncrementalQueryEntry> {
+  match db { IncrementalDatabase(identity, counters, entries, active, index) -> entries }
+}
+
+fn incremental_db_active(db: IncrementalDatabase) -> Vector<i64> {
+  match db { IncrementalDatabase(identity, counters, entries, active, index) -> active }
+}
+
+fn incremental_db_index_slot(db: IncrementalDatabase) -> Vector<Map<IncrementalQueryKey, i64>> {
+  match db { IncrementalDatabase(identity, counters, entries, active, index) -> index }
+}
+
+fn incremental_db_identity(db: IncrementalDatabase) -> IncrementalDatabaseIdentity {
+  match db { IncrementalDatabase(identity, counters, entries, active, index) -> identity }
+}
+
+fn incremental_database_identity_equal(left: IncrementalDatabaseIdentity, right: IncrementalDatabaseIdentity) -> bool {
+  match left {
+    IncrementalDatabaseIdentity(left_token) -> match right {
+      IncrementalDatabaseIdentity(right_token) -> left_token == right_token
+    }
+  }
+}
+
+fn incremental_db_index(db: IncrementalDatabase) -> Map<IncrementalQueryKey, i64> {
+  vector_get_in_bounds<Map<IncrementalQueryKey, i64>>(incremental_db_index_slot(db), 0)
+}
+
+fn incremental_counter_get(db: IncrementalDatabase, index: i64) -> i64 {
+  vector_get_in_bounds<i64>(incremental_db_counters(db), index)
+}
+
+fn incremental_counter_set(db: IncrementalDatabase, index: i64, value: i64) -> i64 {
+  vector_set<i64>(incremental_db_counters(db), index, value)
+}
+
+fn incremental_counter_add(db: IncrementalDatabase, index: i64, amount: i64) -> i64 {
+  incremental_counter_set(db, index, incremental_counter_get(db, index) + amount)
+}
+
+pub(package) fn incremental_database_new() -> IncrementalDatabase {
+  let counters = vector_new<i64>()
+  for i in 0..incremental_counter_count() { vector_push<i64>(counters, 0) }
+  let index = vector_new<Map<IncrementalQueryKey, i64>>()
+  vector_push<Map<IncrementalQueryKey, i64>>(index, map_new<IncrementalQueryKey, i64>())
+  IncrementalDatabase(IncrementalDatabaseIdentity(counters), counters, vector_new<IncrementalQueryEntry>(), vector_new<i64>(), index)
+}
+
+pub(package) fn incremental_database_revision(db: IncrementalDatabase) -> i64 {
+  incremental_counter_get(db, incremental_counter_revision())
+}
+
+pub(package) fn incremental_database_hit_count(db: IncrementalDatabase) -> i64 {
+  incremental_counter_get(db, incremental_counter_hits())
+}
+
+pub(package) fn incremental_database_miss_count(db: IncrementalDatabase) -> i64 {
+  incremental_counter_get(db, incremental_counter_misses())
+}
+
+pub(package) fn incremental_database_invalidation_count(db: IncrementalDatabase) -> i64 {
+  incremental_counter_get(db, incremental_counter_invalidations())
+}
+
+pub(package) fn incremental_database_cycle_count(db: IncrementalDatabase) -> i64 {
+  incremental_counter_get(db, incremental_counter_cycles())
+}
+
+pub(package) fn incremental_database_dependency_count(db: IncrementalDatabase) -> i64 {
+  incremental_counter_get(db, incremental_counter_dependencies())
+}
+
+pub(package) fn incremental_database_execution_count(db: IncrementalDatabase) -> i64 {
+  incremental_counter_get(db, incremental_counter_executions())
+}
+
+pub(package) fn incremental_database_query_count(db: IncrementalDatabase) -> i64 {
+  vector_len<IncrementalQueryEntry>(incremental_db_entries(db))
+}
+
+pub(package) fn incremental_database_active_depth(db: IncrementalDatabase) -> i64 {
+  vector_len<i64>(incremental_db_active(db))
+}
+
+pub(package) fn incremental_query_table_new<T>(db: IncrementalDatabase) -> IncrementalQueryTable<T> {
+  let next = incremental_counter_get(db, incremental_counter_next_table()) + 1
+  incremental_counter_set(db, incremental_counter_next_table(), next)
+  IncrementalQueryTable<T>(db, next, vector_new<Option<T>>())
+}
+
+fn incremental_query_table_db<T>(table: IncrementalQueryTable<T>) -> IncrementalDatabase {
+  match table { IncrementalQueryTable(db, table_id, values) -> db }
+}
+
+pub(package) fn incremental_query_table_id<T>(table: IncrementalQueryTable<T>) -> i64 {
+  match table { IncrementalQueryTable(db, table_id, values) -> table_id }
+}
+
+fn incremental_query_table_values<T>(table: IncrementalQueryTable<T>) -> Vector<Option<T>> {
+  match table { IncrementalQueryTable(db, table_id, values) -> values }
+}
+
+pub(package) fn incremental_query_key<T>(table: IncrementalQueryTable<T>, package_id: i64, identity: str, subject: i64, options: i64, target: i64, schema: i64, hash: i64) -> IncrementalQueryKey {
+  IncrementalQueryKey {
+    database: incremental_db_identity(incremental_query_table_db<T>(table)),
+      table_id: incremental_query_table_id<T>(table),
+      package_id: package_id,
+      identity: identity,
+      subject: subject,
+      options: options,
+      target: target,
+      schema: schema,
+      hash: hash,
+  }
+}
+
+pub(package) fn incremental_fingerprint(content: str, hash: i64) -> IncrementalFingerprint {
+  IncrementalFingerprint { content: content, hash: hash }
+}
+
+pub(package) fn incremental_query_key_equal(left: IncrementalQueryKey, right: IncrementalQueryKey) -> bool {
+  incremental_database_identity_equal(left.database, right.database) and
+    left.hash == right.hash and
+    left.table_id == right.table_id and
+    left.package_id == right.package_id and
+    left.subject == right.subject and
+    left.options == right.options and
+    left.target == right.target and
+    left.schema == right.schema and
+    str_eq(left.identity, right.identity) == 1
+}
+
+impl Hash for IncrementalQueryKey {
+  fn hash(self: IncrementalQueryKey) -> i64 {
+    self.hash bxor (self.table_id * 2654435761) bxor (self.package_id * 2246822519) bxor (self.subject * 3266489917) bxor (self.options * 668265263) bxor (self.target * 374761393) bxor (self.schema * 1274126177)
+  }
+}
+
+impl Eq for IncrementalQueryKey {
+  fn eq(self: IncrementalQueryKey, other: IncrementalQueryKey) -> bool {
+    incremental_query_key_equal(self, other)
+  }
+}
+
+pub(package) fn incremental_fingerprint_equal(left: IncrementalFingerprint, right: IncrementalFingerprint) -> bool {
+  left.hash == right.hash and str_eq(left.content, right.content) == 1
+}
+
+fn incremental_fingerprint_matches(current: Option<IncrementalFingerprint>, next: IncrementalFingerprint) -> bool {
+  match current {
+    Some(value) -> incremental_fingerprint_equal(value, next)
+    None -> false
+  }
+}
+
+fn incremental_entry_new(key: IncrementalQueryKey) -> IncrementalQueryEntry {
+  IncrementalQueryEntry {
+    key: key,
+      state: incremental_state_stale(),
+      mode: incremental_mode_unassigned(),
+      fingerprint: option_none<IncrementalFingerprint>(),
+      dependencies: vector_new<i64>(),
+      reverse_dependencies: vector_new<i64>(),
+      changed_revision: 0,
+      invalidated_revision: 0,
+      executions: 0,
+      hits: 0,
+  }
+}
+
+fn incremental_db_find(db: IncrementalDatabase, key: IncrementalQueryKey) -> i64 {
+  match map_get<IncrementalQueryKey, i64>(incremental_db_index(db), key) {
+    Some(entry_id) -> entry_id
+    None -> 0 - 1
+  }
+}
+
+fn incremental_db_find_or_add(db: IncrementalDatabase, key: IncrementalQueryKey) -> i64 {
+  let found = incremental_db_find(db, key)
+  if found >= 0 { found }
+  else {
+    let entries = incremental_db_entries(db)
+    let id = vector_len<IncrementalQueryEntry>(entries)
+    vector_push<IncrementalQueryEntry>(entries, incremental_entry_new(key))
+    let next_index = map_put<IncrementalQueryKey, i64>(incremental_db_index(db), key, id)
+    vector_set<Map<IncrementalQueryKey, i64>>(incremental_db_index_slot(db), 0, next_index)
+    id
+  }
+}
+
+fn incremental_vector_contains(values: Vector<i64>, value: i64) -> bool {
+  let mut index = 0
+  let mut found = false
+  while index < vector_len<i64>(values) and not found {
+    if vector_get_in_bounds<i64>(values, index) == value { found = true }
+    else { index = index + 1 }
+  }
+  found
+}
+
+fn incremental_vector_remove(values: Vector<i64>, value: i64) -> i64 {
+  let mut index = 0
+  let mut found = 0 - 1
+  while index < vector_len<i64>(values) and found < 0 {
+    if vector_get_in_bounds<i64>(values, index) == value { found = index }
+    else { index = index + 1 }
+  }
+  if found < 0 { 0 }
+  else { vector_remove_at<i64>(values, found) 1 }
+}
+
+fn incremental_db_record_dependency(db: IncrementalDatabase, parent_id: i64, child_id: i64) -> i64 {
+  let entries = incremental_db_entries(db)
+  let parent = vector_get_in_bounds<IncrementalQueryEntry>(entries, parent_id)
+  if incremental_vector_contains(parent.dependencies, child_id) { 0 }
+  else {
+    let child = vector_get_in_bounds<IncrementalQueryEntry>(entries, child_id)
+    vector_push<i64>(parent.dependencies, child_id)
+    vector_push<i64>(child.reverse_dependencies, parent_id)
+    incremental_counter_add(db, incremental_counter_dependencies(), 1)
+    1
+  }
+}
+
+fn incremental_db_record_active_dependency(db: IncrementalDatabase, child_id: i64) -> i64 {
+  let active = incremental_db_active(db)
+  let depth = vector_len<i64>(active)
+  if depth == 0 { 0 }
+  else { incremental_db_record_dependency(db, vector_get_in_bounds<i64>(active, depth - 1), child_id) }
+}
+
+fn incremental_db_clear_dependencies(db: IncrementalDatabase, entry_id: i64) -> i64 {
+  let entries = incremental_db_entries(db)
+  let entry = vector_get_in_bounds<IncrementalQueryEntry>(entries, entry_id)
+  while vector_len<i64>(entry.dependencies) > 0 {
+    let last = vector_len<i64>(entry.dependencies) - 1
+    let child_id = vector_get_in_bounds<i64>(entry.dependencies, last)
+    let child = vector_get_in_bounds<IncrementalQueryEntry>(entries, child_id)
+    incremental_vector_remove(child.reverse_dependencies, entry_id)
+    vector_pop<i64>(entry.dependencies)
+  }
+  0
+}
+
+fn incremental_db_next_revision(db: IncrementalDatabase) -> i64 {
+  let revision = incremental_database_revision(db) + 1
+  incremental_counter_set(db, incremental_counter_revision(), revision)
+  revision
+}
+
+fn incremental_db_invalidate_dependents(db: IncrementalDatabase, source_id: i64, revision: i64) -> i64 {
+  let entries = incremental_db_entries(db)
+  let work = vector_new<i64>()
+  let source = vector_get_in_bounds<IncrementalQueryEntry>(entries, source_id)
+  for i in 0..vector_len<i64>(source.reverse_dependencies) {
+    vector_push<i64>(work, vector_get_in_bounds<i64>(source.reverse_dependencies, i))
+  }
+  while vector_len<i64>(work) > 0 {
+    match vector_pop<i64>(work) {
+      Some(entry_id) -> {
+        let entry = vector_get_in_bounds<IncrementalQueryEntry>(entries, entry_id)
+        if entry.invalidated_revision != revision {
+          let was_ready = entry.state == incremental_state_ready()
+          let next = entry.{state: incremental_state_stale(), invalidated_revision: revision}
+          vector_set<IncrementalQueryEntry>(entries, entry_id, next)
+          if was_ready { incremental_counter_add(db, incremental_counter_invalidations(), 1) } else { 0 }
+          for i in 0..vector_len<i64>(entry.reverse_dependencies) {
+            vector_push<i64>(work, vector_get_in_bounds<i64>(entry.reverse_dependencies, i))
+          }
+        } else { 0 }
+      }
+      None -> 0
+    }
+  }
+  0
+}
+
+fn incremental_query_table_ensure_slot<T>(table: IncrementalQueryTable<T>, entry_id: i64) -> i64 {
+  let values = incremental_query_table_values<T>(table)
+  while vector_len<Option<T>>(values) <= entry_id {
+    vector_push<Option<T>>(values, option_none<T>())
+  }
+  0
+}
+
+fn incremental_query_table_value<T>(table: IncrementalQueryTable<T>, entry_id: i64) -> Option<T> {
+  incremental_query_table_ensure_slot<T>(table, entry_id)
+  vector_get_in_bounds<Option<T>>(incremental_query_table_values<T>(table), entry_id)
+}
+
+fn incremental_query_table_store<T>(table: IncrementalQueryTable<T>, entry_id: i64, value: T) -> i64 {
+  incremental_query_table_ensure_slot<T>(table, entry_id)
+  vector_set<Option<T>>(incremental_query_table_values<T>(table), entry_id, option_some<T>(value))
+}
+
+pub(package) fn incremental_input_set<T>(table: IncrementalQueryTable<T>, key: IncrementalQueryKey, value: T, fingerprint: IncrementalFingerprint) -> IncrementalInputUpdate<T> {
+  let db = incremental_query_table_db<T>(table)
+  if not incremental_database_identity_equal(key.database, incremental_db_identity(db)) or key.table_id != incremental_query_table_id<T>(table) or incremental_database_active_depth(db) != 0 {
+    IncrementalInputRejected<T>()
+  } else {
+    let entry_id = incremental_db_find_or_add(db, key)
+    let entries = incremental_db_entries(db)
+    let entry = vector_get_in_bounds<IncrementalQueryEntry>(entries, entry_id)
+    if entry.mode == incremental_mode_derived() { IncrementalInputRejected<T>() }
+    else { if entry.mode == incremental_mode_input() and entry.state == incremental_state_ready() and incremental_fingerprint_matches(entry.fingerprint, fingerprint) {
+        match incremental_query_table_value<T>(table, entry_id) {
+          Some(cached) -> IncrementalInputUnchanged<T>(cached)
+          None -> IncrementalInputCorrupt<T>()
+        }
+      } else {
+        let inserted = entry.mode == incremental_mode_unassigned()
+        let revision = incremental_db_next_revision(db)
+        incremental_db_invalidate_dependents(db, entry_id, revision)
+        incremental_query_table_store<T>(table, entry_id, value)
+        let next = entry.{
+          state: incremental_state_ready(),
+            mode: incremental_mode_input(),
+            fingerprint: option_some<IncrementalFingerprint>(fingerprint),
+            changed_revision: revision,
+            invalidated_revision: 0,
+        }
+        vector_set<IncrementalQueryEntry>(entries, entry_id, next)
+        if inserted { IncrementalInputInserted<T>(value) } else { IncrementalInputChanged<T>(value) }
+      } }
+  }
+}
+
+fn incremental_db_cycle(db: IncrementalDatabase, entry_id: i64) -> IncrementalDependencyCycle {
+  let active = incremental_db_active(db)
+  let entries = incremental_db_entries(db)
+  let keys = vector_new<IncrementalQueryKey>()
+  let mut start = 0
+  while start < vector_len<i64>(active) and vector_get_in_bounds<i64>(active, start) != entry_id {
+    start = start + 1
+  }
+  for i in start..vector_len<i64>(active) {
+    vector_push<IncrementalQueryKey>(keys, vector_get_in_bounds<IncrementalQueryEntry>(entries, vector_get_in_bounds<i64>(active, i)).key)
+  }
+  vector_push<IncrementalQueryKey>(keys, vector_get_in_bounds<IncrementalQueryEntry>(entries, entry_id).key)
+  IncrementalDependencyCycle(keys)
+}
+
+pub(package) fn incremental_query_begin<T>(table: IncrementalQueryTable<T>, key: IncrementalQueryKey) -> IncrementalQueryDecision<T> {
+  let db = incremental_query_table_db<T>(table)
+  if not incremental_database_identity_equal(key.database, incremental_db_identity(db)) or key.table_id != incremental_query_table_id<T>(table) { IncrementalQueryCorrupt<T>() }
+  else {
+    let entry_id = incremental_db_find_or_add(db, key)
+    incremental_db_record_active_dependency(db, entry_id)
+    let entries = incremental_db_entries(db)
+    let entry = vector_get_in_bounds<IncrementalQueryEntry>(entries, entry_id)
+    if entry.state == incremental_state_computing() {
+      incremental_counter_add(db, incremental_counter_cycles(), 1)
+      IncrementalQueryCycle<T>(incremental_db_cycle(db, entry_id))
+    } else { if entry.state == incremental_state_ready() {
+        match incremental_query_table_value<T>(table, entry_id) {
+          Some(value) -> {
+            incremental_counter_add(db, incremental_counter_hits(), 1)
+            vector_set<IncrementalQueryEntry>(entries, entry_id, entry.{hits: entry.hits + 1})
+            IncrementalQueryHit<T>(value)
+          }
+          None -> IncrementalQueryCorrupt<T>()
+        }
+      } else { if entry.mode == incremental_mode_input() { IncrementalQueryCorrupt<T>() }
+        else {
+          incremental_db_clear_dependencies(db, entry_id)
+          let next = entry.{state: incremental_state_computing(), mode: incremental_mode_derived()}
+          vector_set<IncrementalQueryEntry>(entries, entry_id, next)
+          vector_push<i64>(incremental_db_active(db), entry_id)
+          incremental_counter_add(db, incremental_counter_misses(), 1)
+          IncrementalQueryMiss<T>(IncrementalQueryTicket<T>(table, entry_id))
+        } } }
+  }
+}
+
+fn incremental_ticket_table<T>(ticket: IncrementalQueryTicket<T>) -> IncrementalQueryTable<T> {
+  match ticket { IncrementalQueryTicket(table, entry_id) -> table }
+}
+
+fn incremental_ticket_entry<T>(ticket: IncrementalQueryTicket<T>) -> i64 {
+  match ticket { IncrementalQueryTicket(table, entry_id) -> entry_id }
+}
+
+fn incremental_ticket_is_top<T>(ticket: IncrementalQueryTicket<T>) -> bool {
+  let table = incremental_ticket_table<T>(ticket)
+  let active = incremental_db_active(incremental_query_table_db<T>(table))
+  let depth = vector_len<i64>(active)
+  depth > 0 and vector_get_in_bounds<i64>(active, depth - 1) == incremental_ticket_entry<T>(ticket)
+}
+
+pub(package) fn incremental_query_finish<T>(ticket: IncrementalQueryTicket<T>, value: T, fingerprint: IncrementalFingerprint) -> IncrementalQueryCommit<T> {
+  if not incremental_ticket_is_top<T>(ticket) { IncrementalQueryCommitRejected<T>() }
+  else {
+    let table = incremental_ticket_table<T>(ticket)
+    let db = incremental_query_table_db<T>(table)
+    let entry_id = incremental_ticket_entry<T>(ticket)
+    let entries = incremental_db_entries(db)
+    let entry = vector_get_in_bounds<IncrementalQueryEntry>(entries, entry_id)
+    if entry.state != incremental_state_computing() or entry.mode != incremental_mode_derived() {
+      IncrementalQueryCommitRejected<T>()
+    } else {
+      incremental_query_table_store<T>(table, entry_id, value)
+      vector_pop<i64>(incremental_db_active(db))
+      let next = entry.{
+        state: incremental_state_ready(),
+          fingerprint: option_some<IncrementalFingerprint>(fingerprint),
+          changed_revision: incremental_database_revision(db),
+          executions: entry.executions + 1,
+      }
+      vector_set<IncrementalQueryEntry>(entries, entry_id, next)
+      incremental_counter_add(db, incremental_counter_executions(), 1)
+      IncrementalQueryCommitted<T>(value)
+    }
+  }
+}
+
+pub(package) fn incremental_query_abort<T>(ticket: IncrementalQueryTicket<T>) -> i64 {
+  if not incremental_ticket_is_top<T>(ticket) { 0 }
+  else {
+    let table = incremental_ticket_table<T>(ticket)
+    let db = incremental_query_table_db<T>(table)
+    let entry_id = incremental_ticket_entry<T>(ticket)
+    let entries = incremental_db_entries(db)
+    let entry = vector_get_in_bounds<IncrementalQueryEntry>(entries, entry_id)
+    incremental_db_clear_dependencies(db, entry_id)
+    vector_set<IncrementalQueryEntry>(entries, entry_id, entry.{state: incremental_state_stale()})
+    vector_pop<i64>(incremental_db_active(db))
+    1
+  }
+}
+
+pub(package) fn incremental_query_is_ready<T>(table: IncrementalQueryTable<T>, key: IncrementalQueryKey) -> i64 {
+  let db = incremental_query_table_db<T>(table)
+  let entry_id = incremental_db_find(db, key)
+  if entry_id < 0 { 0 }
+  else { if vector_get_in_bounds<IncrementalQueryEntry>(incremental_db_entries(db), entry_id).state == incremental_state_ready() { 1 } else { 0 } }
+}
+
+pub(package) fn incremental_query_is_stale<T>(table: IncrementalQueryTable<T>, key: IncrementalQueryKey) -> i64 {
+  let db = incremental_query_table_db<T>(table)
+  let entry_id = incremental_db_find(db, key)
+  if entry_id < 0 { 0 }
+  else { if vector_get_in_bounds<IncrementalQueryEntry>(incremental_db_entries(db), entry_id).state == incremental_state_stale() { 1 } else { 0 } }
+}
+
+pub(package) fn incremental_query_execution_count<T>(table: IncrementalQueryTable<T>, key: IncrementalQueryKey) -> i64 {
+  let db = incremental_query_table_db<T>(table)
+  let entry_id = incremental_db_find(db, key)
+  if entry_id < 0 { 0 }
+  else { vector_get_in_bounds<IncrementalQueryEntry>(incremental_db_entries(db), entry_id).executions }
+}
+
+pub(package) fn incremental_query_dependency_count<T>(table: IncrementalQueryTable<T>, key: IncrementalQueryKey) -> i64 {
+  let db = incremental_query_table_db<T>(table)
+  let entry_id = incremental_db_find(db, key)
+  if entry_id < 0 { 0 }
+  else { vector_len<i64>(vector_get_in_bounds<IncrementalQueryEntry>(incremental_db_entries(db), entry_id).dependencies) }
+}
+
+pub(package) fn incremental_query_depends_on<T, U>(parent_table: IncrementalQueryTable<T>, parent_key: IncrementalQueryKey, child_table: IncrementalQueryTable<U>, child_key: IncrementalQueryKey) -> i64 {
+  let db = incremental_query_table_db<T>(parent_table)
+  if not incremental_database_identity_equal(incremental_db_identity(incremental_query_table_db<U>(child_table)), incremental_db_identity(db)) { 0 }
+  else {
+    let parent_id = incremental_db_find(db, parent_key)
+    let child_id = incremental_db_find(db, child_key)
+    if parent_id < 0 or child_id < 0 { 0 }
+    else { if incremental_vector_contains(vector_get_in_bounds<IncrementalQueryEntry>(incremental_db_entries(db), parent_id).dependencies, child_id) { 1 } else { 0 } }
+  }
+}
+
+pub(package) fn incremental_dependency_cycle_len(cycle: IncrementalDependencyCycle) -> i64 {
+  match cycle { IncrementalDependencyCycle(keys) -> vector_len<IncrementalQueryKey>(keys) }
+}
+
+pub(package) fn incremental_dependency_cycle_key(cycle: IncrementalDependencyCycle, index: i64) -> IncrementalQueryKey {
+  match cycle { IncrementalDependencyCycle(keys) -> vector_get_in_bounds<IncrementalQueryKey>(keys, index) }
+}
