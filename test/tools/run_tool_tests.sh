@@ -2007,6 +2007,21 @@ lsp_open_stale='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"text
 lsp_out=$(printf '%s%s' "$(lsp_frame "$lsp_open_stale")" "$(lsp_frame "$lsp_stale_change")" | "$WEFT" lsp 2>&1)
 assert_not_contains "lsp_stale_update_ignored" "$lsp_out" "unknown identifier 'missing'"
 
+# A newer version may carry byte-identical text (save hooks and editor
+# normalization do this routinely). It must preserve the cached semantic
+# product while still advancing the document version used to reject stale
+# traffic.
+lsp_unchanged_source='fn same_value() -> i64 { 42 } fn main() -> i64 { same_value() }'
+lsp_unchanged_prefix='fn same_value() -> i64 { 42 } fn main() -> i64 { '
+lsp_open_unchanged="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///unchanged.weft\",\"version\":1,\"text\":\"$lsp_unchanged_source\"}}}"
+lsp_change_unchanged="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///unchanged.weft\",\"version\":2},\"contentChanges\":[{\"text\":\"$lsp_unchanged_source\"}]}}"
+lsp_change_unchanged_stale='{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///unchanged.weft","version":1},"contentChanges":[{"text":"fn main() -> i64 { missing }"}]}}'
+lsp_unchanged_hover="{\"jsonrpc\":\"2.0\",\"id\":86,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///unchanged.weft\"},\"position\":{\"line\":0,\"character\":${#lsp_unchanged_prefix}}}}"
+lsp_out=$(printf '%s%s%s%s' "$(lsp_frame "$lsp_open_unchanged")" "$(lsp_frame "$lsp_change_unchanged")" "$(lsp_frame "$lsp_change_unchanged_stale")" "$(lsp_frame "$lsp_unchanged_hover")" | "$WEFT" lsp 2>&1)
+assert_equals "lsp_unchanged_newer_version_republishes_clean" "$(printf '%s' "$lsp_out" | grep -o '"uri":"file:///unchanged.weft","diagnostics":\[\]' | wc -l | tr -d ' ')" "2"
+assert_not_contains "lsp_unchanged_newer_version_advances_stale_fence" "$lsp_out" "unknown identifier 'missing'"
+assert_contains "lsp_unchanged_newer_version_reuses_semantics" "$lsp_out" '"id":86,"result":{"contents":{"kind":"plaintext","value":"function same_value: () -> i64"'
+
 # Active document graph: the dependency paths below deliberately do not exist
 # on disk. The shared resolver selects their normal module identities, while
 # the source registry overlays bytes supplied by didOpen/didChange.
@@ -2927,4 +2942,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 664 passed, 0 failed"
+echo "Tool boundary summary: 667 passed, 0 failed"
