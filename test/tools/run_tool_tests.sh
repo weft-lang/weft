@@ -1599,6 +1599,11 @@ mcp_serve_out=$(
     printf '%s\n' '{"jsonrpc":"2.0","id":"call-2","method":"tools/call","params":{"name":"parse_summary","arguments":{"source":"fn main() -> i64 { 42 }"}}}'
     printf '%s\n' '{"jsonrpc":"2.0","id":"cache-2","method":"tools/call","params":{"name":"parse_summary","arguments":{"source":"fn main() -> i64 { 42 }"}}}'
     printf '%s\n' '{"jsonrpc":"2.0","id":"edit-3","method":"tools/call","params":{"name":"parse_summary","arguments":{"source":"fn main() -> str { \"changed\" }"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":"check-1","method":"tools/call","params":{"name":"check_summary","arguments":{"source":"fn main() -> i64 { 42 }"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":"check-cache","method":"tools/call","params":{"name":"check_summary","arguments":{"source":"fn main() -> i64 { 42 }"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":"check-edit","method":"tools/call","params":{"name":"check_summary","arguments":{"source":"fn main() -> str { \"changed\" }"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":"ir-test-1","method":"tools/call","params":{"name":"ir_summary","arguments":{"source":"test \"ok\" { Test.assert_eq(1, 1) }"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":"ir-test-cache","method":"tools/call","params":{"name":"ir_summary","arguments":{"source":"test \"ok\" { Test.assert_eq(1, 1) }"}}}'
     printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"ping"}'
     printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"bogus/method"}'
   } | "$WEFT" mcp serve 2>&1)
@@ -1614,9 +1619,14 @@ assert_contains "mcp_serve_tools_list_marks_internal_ir" "$mcp_serve_out" '"name
 assert_contains "mcp_serve_call_wraps_content_and_echoes_id" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"call-2","result":{"content":[{"type":"text","text":"{\"tool\":\"parse_summary\",\"ok\":true'
 assert_contains "mcp_serve_reuses_identical_parse_request" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"cache-2","result":{"content":[{"type":"text","text":"{\"tool\":\"parse_summary\",\"ok\":true,\"schema_version\":1,\"stability\":\"internal\",\"functions\":1,\"first_body_tag\":1}'
 assert_contains "mcp_serve_invalidates_edited_parse_request" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"edit-3","result":{"content":[{"type":"text","text":"{\"tool\":\"parse_summary\",\"ok\":true,\"schema_version\":1,\"stability\":\"internal\",\"functions\":1,\"first_body_tag\":9}'
+assert_contains "mcp_serve_checks_source_through_session" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"check-1","result":{"content":[{"type":"text","text":"{\"tool\":\"check_summary\",\"ok\":true,\"schema_version\":1,\"stability\":\"internal\",\"functions\":1,\"first_body_tag\":1}'
+assert_contains "mcp_serve_reuses_identical_check_request" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"check-cache","result":{"content":[{"type":"text","text":"{\"tool\":\"check_summary\",\"ok\":true,\"schema_version\":1,\"stability\":\"internal\",\"functions\":1,\"first_body_tag\":1}'
+assert_contains "mcp_serve_invalidates_edited_check_request" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"check-edit","result":{"content":[{"type":"text","text":"{\"tool\":\"check_summary\",\"ok\":true,\"schema_version\":1,\"stability\":\"internal\",\"functions\":1,\"first_body_tag\":9}'
+assert_contains "mcp_serve_ir_uses_prepared_test_check" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"ir-test-1","result":{"content":[{"type":"text","text":"{\"tool\":\"ir_summary\",\"ok\":true,\"schema_version\":1,\"stability\":\"internal\",\"functions\":1,\"blocks\":1,\"insts\":3}'
+assert_contains "mcp_serve_ir_reuses_prepared_test_check" "$mcp_serve_out" '{"jsonrpc":"2.0","id":"ir-test-cache","result":{"content":[{"type":"text","text":"{\"tool\":\"ir_summary\",\"ok\":true,\"schema_version\":1,\"stability\":\"internal\",\"functions\":1,\"blocks\":1,\"insts\":3}'
 assert_contains "mcp_serve_ping" "$mcp_serve_out" '{"jsonrpc":"2.0","id":3,"result":{}}'
 assert_contains "mcp_serve_unknown_method_error" "$mcp_serve_out" '{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"method not found"}}'
-assert_equals "mcp_serve_notification_not_answered" "$(printf '%s\n' "$mcp_serve_out" | grep -c jsonrpc)" "7"
+assert_equals "mcp_serve_notification_not_answered" "$(printf '%s\n' "$mcp_serve_out" | grep -c jsonrpc)" "12"
 
 lsp_init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 lsp_out=$(lsp_frame "$lsp_init" | "$WEFT" lsp 2>&1)
@@ -2890,4 +2900,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 648 passed, 0 failed"
+echo "Tool boundary summary: 653 passed, 0 failed"
