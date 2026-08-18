@@ -2,9 +2,14 @@ use compiler/incremental.{*}
 use compiler/project_session.{*}
 use stdlib/diagnostic.{diagnostic_primary}
 use stdlib/diagnostic_type.{*}
+use stdlib/string.{str_concat}
 
 fn project_test_overlay(identity: str, package_id: i64, options: i64, target: i64) -> ProjectQueryContext {
   project_query_context(package_id, identity, "", project_source_origin_overlay(), options, target)
+}
+
+fn project_test_workspace_overlay(identity: str, physical_path: str, overlay_set: str) -> ProjectQueryContext {
+  project_query_context_with_overlay_set(1, identity, physical_path, project_source_origin_overlay(), 0, 1, overlay_set)
 }
 
 fn project_test_expect_success(result: ProjectCheckResult) -> i64 {
@@ -12,6 +17,14 @@ fn project_test_expect_success(result: ProjectCheckResult) -> i64 {
     ProjectCheckSucceeded(typed, source_n, parse_diagnostics, check_diagnostics) -> {
       if project_diagnostics_error_count(parse_diagnostics) == 0 and project_diagnostics_error_count(check_diagnostics) == 0 { 1 } else { 0 }
     }
+    _ -> 0
+  }
+}
+
+fn project_test_expect_failure(result: ProjectCheckResult) -> i64 {
+  match result {
+    ProjectCheckFailed(typed, source_n, parse_diagnostics, check_diagnostics) -> 1
+    ProjectCheckParseFailed(parse) -> 1
     _ -> 0
   }
 }
@@ -223,6 +236,117 @@ test "project diagnostics retain legacy transport metadata" {
     }
     _ -> Test.assert_eq(0, 1)
   }
+}
+
+test "overlay membership and bytes invalidate their exact project dependents" {
+  let session = project_session_new(1)
+  let overlay_identity = "overlay-set://workspace"
+  let root = project_test_workspace_overlay("overlay://workspace/root.weft", "project_session_overlay_root.weft", overlay_identity)
+  let dependency = project_test_workspace_overlay(
+    "overlay://workspace/dependency.weft",
+    "module_fixtures/project_session_overlay_dependency.weft",
+    overlay_identity
+  )
+  let late_mutation = project_test_workspace_overlay(
+    "overlay://workspace/late.weft",
+    "module_fixtures/project_session_overlay_late.weft",
+    overlay_identity
+  )
+  let unrelated = project_test_overlay("overlay://unrelated.weft", 1, 0, 1)
+  -- Split after `{` so the fixture's selective import is not interpolated by
+  -- this outer test source before it reaches the project parser.
+  let root_source = str_concat(
+    "use module_fixtures/project_session_overlay_dependency.{",
+    "answer} fn main() -> i64 { answer() }"
+  )
+  let dependency_source = "pub fn answer() -> i64 { 42 }"
+
+  project_session_set_source(session, root, root_source)
+  project_session_set_source(session, dependency, dependency_source)
+  project_session_set_source(session, unrelated, "fn unrelated() -> i64 { 7 }")
+  let initial = project_overlay_set_new()
+  project_overlay_set_add(initial, root)
+  project_overlay_set_add(initial, dependency)
+  match project_session_set_overlay_set(session, root, initial) {
+    IncrementalInputInserted(overlays) -> Test.assert_eq(project_overlay_set_len(overlays), 2)
+    _ -> Test.assert_eq(0, 1)
+  }
+  -- The session owns an immutable snapshot, not the caller's mutable builder.
+  project_overlay_set_add(initial, late_mutation)
+  project_overlay_set_add(initial, dependency)
+  Test.assert_eq(project_overlay_set_len(initial), 3)
+
+  Test.assert_eq(project_test_expect_success(project_session_check(session, root)), 1)
+  Test.assert_eq(project_test_expect_success(project_session_check(session, unrelated)), 1)
+  Test.assert_eq(project_session_parse_depends_on_overlay_set(session, root), 1)
+  Test.assert_eq(project_session_parse_depends_on_overlay_source(session, root, dependency), 1)
+  Test.assert_eq(project_session_parse_execution_count(session, root), 1)
+
+  let same = project_overlay_set_new()
+  project_overlay_set_add(same, dependency)
+  project_overlay_set_add(same, root)
+  match project_session_set_overlay_set(session, root, same) {
+    IncrementalInputUnchanged(overlays) -> Test.assert_eq(project_overlay_set_len(overlays), 2)
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(project_test_expect_success(project_session_check(session, root)), 1)
+  Test.assert_eq(project_session_parse_execution_count(session, root), 1)
+
+  project_session_set_source(session, dependency, "pub fn renamed() -> i64 { 0 }")
+  Test.assert_eq(project_test_expect_failure(project_session_check(session, root)), 1)
+  Test.assert_eq(project_session_parse_execution_count(session, root), 2)
+  Test.assert_eq(project_session_check_execution_count(session, unrelated), 1)
+
+  project_session_set_source(session, dependency, dependency_source)
+  Test.assert_eq(project_test_expect_success(project_session_check(session, root)), 1)
+  Test.assert_eq(project_session_parse_execution_count(session, root), 3)
+
+  let without_dependency = project_overlay_set_new()
+  project_overlay_set_add(without_dependency, root)
+  match project_session_set_overlay_set(session, root, without_dependency) {
+    IncrementalInputChanged(overlays) -> Test.assert_eq(project_overlay_set_len(overlays), 1)
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(project_test_expect_failure(project_session_check(session, root)), 1)
+  Test.assert_eq(project_session_parse_depends_on_overlay_source(session, root, dependency), 0)
+  let executions_without_dependency = project_session_parse_execution_count(session, root)
+  project_session_set_source(session, dependency, "pub fn answer() -> i64 { 99 }")
+  Test.assert_eq(project_test_expect_failure(project_session_check(session, root)), 1)
+  Test.assert_eq(project_session_parse_execution_count(session, root), executions_without_dependency)
+
+  let restored = project_overlay_set_new()
+  project_overlay_set_add(restored, root)
+  project_overlay_set_add(restored, dependency)
+  project_session_set_overlay_set(session, root, restored)
+  Test.assert_eq(project_test_expect_success(project_session_check(session, root)), 1)
+  Test.assert_eq(project_session_parse_depends_on_overlay_source(session, root, dependency), 1)
+}
+
+test "overlay contexts fail closed until membership is installed" {
+  let session = project_session_new(1)
+  let context = project_test_workspace_overlay("overlay://unset/root.weft", "unset_root.weft", "overlay-set://unset")
+  project_session_set_source(session, context, "fn main() -> i64 { 42 }")
+  match project_session_check(session, context) {
+    ProjectCheckCorrupt -> Test.assert_eq(1, 1)
+    _ -> Test.assert_eq(0, 1)
+  }
+  let empty = project_overlay_set_new()
+  project_session_set_overlay_set(session, context, empty)
+  Test.assert_eq(project_test_expect_success(project_session_check(session, context)), 1)
+
+  let other_overlay_identity = project_test_workspace_overlay(
+    "overlay://unset/root.weft",
+    "unset_root.weft",
+    "overlay-set://other"
+  )
+  Test.assert_eq(
+    if not incremental_query_key_equal(project_session_check_key(session, context), project_session_check_key(session, other_overlay_identity)) { 1 } else { 0 },
+    1
+  )
+  Test.assert_eq(
+    if incremental_query_key_equal(project_session_source_key(session, context), project_session_source_key(session, other_overlay_identity)) { 1 } else { 0 },
+    1
+  )
 }
 
 test "missing and empty sources have distinct exact fingerprints" {
