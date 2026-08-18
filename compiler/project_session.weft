@@ -11,6 +11,7 @@ use compiler/incremental.{*}
 use compiler/lib.{read_file_text}
 use compiler/package.{pkg_identity_register_root, pkg_manifest_load_default_for_table}
 use compiler/pipeline.{*}
+use compiler/test_prepare.{*}
 use compiler/type_registry.{str_hash, ttable_new, ttable_register_source}
 use runtime/memory.{mem_load64_at}
 use runtime/string.{runtime_str_from_bytes_copy}
@@ -52,10 +53,30 @@ pub(package) type ProjectParseResult {
     ProjectParseCorrupt,
 }
 
+-- The preparation query is also the lifetime owner for generated test input.
+-- Plain sources carry their already-parsed module so the next query can reuse
+-- it without a second parse.
+pub(package) type ProjectPreparedSourceResult {
+  ProjectPreparedSourcePlain(AstModule, ProjectDiagnostics),
+    ProjectPreparedSourceTests(TestPreparedSource),
+    ProjectPreparedSourceParseFailed(ProjectParseResult),
+    ProjectPreparedSourceUnset,
+    ProjectPreparedSourceCycle(IncrementalDependencyCycle),
+    ProjectPreparedSourceCorrupt,
+}
+
+pub(package) type ProjectPreparedParseResult {
+  ProjectPreparedParseSucceeded(AstModule, ProjectDiagnostics),
+    ProjectPreparedParseFailed(AstModule, ProjectDiagnostics),
+    ProjectPreparedParseSourceUnset,
+    ProjectPreparedParseCycle(IncrementalDependencyCycle),
+    ProjectPreparedParseCorrupt,
+}
+
 pub(package) type ProjectCheckResult {
   ProjectCheckSucceeded(TypedModule, ProjectDiagnostics, ProjectDiagnostics),
     ProjectCheckFailed(TypedModule, ProjectDiagnostics, ProjectDiagnostics),
-    ProjectCheckParseFailed(ProjectParseResult),
+    ProjectCheckParseFailed(ProjectPreparedParseResult),
     ProjectCheckSourceUnset,
     ProjectCheckCycle(IncrementalDependencyCycle),
     ProjectCheckCorrupt,
@@ -66,6 +87,8 @@ pub(package) type ProjectSession {
     IncrementalDatabase,
     IncrementalQueryTable<ProjectSourceSnapshot>,
     IncrementalQueryTable<ProjectParseResult>,
+    IncrementalQueryTable<ProjectPreparedSourceResult>,
+    IncrementalQueryTable<ProjectPreparedParseResult>,
     IncrementalQueryTable<ProjectCheckResult>,
     i64
   )
@@ -90,23 +113,31 @@ pub(package) fn project_query_context(
 }
 
 fn project_session_db(session: ProjectSession) -> IncrementalDatabase {
-  match session { ProjectSession(db, sources, parses, checks, schema) -> db }
+  match session { ProjectSession(db, sources, parses, prepared_sources, prepared_parses, checks, schema) -> db }
 }
 
 fn project_session_sources(session: ProjectSession) -> IncrementalQueryTable<ProjectSourceSnapshot> {
-  match session { ProjectSession(db, sources, parses, checks, schema) -> sources }
+  match session { ProjectSession(db, sources, parses, prepared_sources, prepared_parses, checks, schema) -> sources }
 }
 
 fn project_session_parses(session: ProjectSession) -> IncrementalQueryTable<ProjectParseResult> {
-  match session { ProjectSession(db, sources, parses, checks, schema) -> parses }
+  match session { ProjectSession(db, sources, parses, prepared_sources, prepared_parses, checks, schema) -> parses }
+}
+
+fn project_session_prepared_sources(session: ProjectSession) -> IncrementalQueryTable<ProjectPreparedSourceResult> {
+  match session { ProjectSession(db, sources, parses, prepared_sources, prepared_parses, checks, schema) -> prepared_sources }
+}
+
+fn project_session_prepared_parses(session: ProjectSession) -> IncrementalQueryTable<ProjectPreparedParseResult> {
+  match session { ProjectSession(db, sources, parses, prepared_sources, prepared_parses, checks, schema) -> prepared_parses }
 }
 
 fn project_session_checks(session: ProjectSession) -> IncrementalQueryTable<ProjectCheckResult> {
-  match session { ProjectSession(db, sources, parses, checks, schema) -> checks }
+  match session { ProjectSession(db, sources, parses, prepared_sources, prepared_parses, checks, schema) -> checks }
 }
 
 fn project_session_schema(session: ProjectSession) -> i64 {
-  match session { ProjectSession(db, sources, parses, checks, schema) -> schema }
+  match session { ProjectSession(db, sources, parses, prepared_sources, prepared_parses, checks, schema) -> schema }
 }
 
 fn project_context_options(context: ProjectQueryContext) -> i64 {
@@ -123,6 +154,8 @@ pub(package) fn project_session_new(schema: i64) -> ProjectSession {
     db,
     incremental_query_table_new<ProjectSourceSnapshot>(db),
     incremental_query_table_new<ProjectParseResult>(db),
+    incremental_query_table_new<ProjectPreparedSourceResult>(db),
+    incremental_query_table_new<ProjectPreparedParseResult>(db),
     incremental_query_table_new<ProjectCheckResult>(db),
     schema
   )
@@ -161,6 +194,32 @@ pub(package) fn project_session_parse_key(session: ProjectSession, context: Proj
 pub(package) fn project_session_check_key(session: ProjectSession, context: ProjectQueryContext) -> IncrementalQueryKey {
   incremental_query_key<ProjectCheckResult>(
     project_session_checks(session),
+    context.package_id,
+    context.identity,
+    context.origin,
+    project_context_options(context),
+    context.target,
+    project_session_schema(session),
+    project_context_hash(context)
+  )
+}
+
+pub(package) fn project_session_prepared_source_key(session: ProjectSession, context: ProjectQueryContext) -> IncrementalQueryKey {
+  incremental_query_key<ProjectPreparedSourceResult>(
+    project_session_prepared_sources(session),
+    context.package_id,
+    context.identity,
+    context.origin,
+    project_context_options(context),
+    context.target,
+    project_session_schema(session),
+    project_context_hash(context)
+  )
+}
+
+pub(package) fn project_session_prepared_parse_key(session: ProjectSession, context: ProjectQueryContext) -> IncrementalQueryKey {
+  incremental_query_key<ProjectPreparedParseResult>(
+    project_session_prepared_parses(session),
     context.package_id,
     context.identity,
     context.origin,
@@ -333,9 +392,166 @@ pub(package) fn project_session_parse(session: ProjectSession, context: ProjectQ
   }
 }
 
-fn project_check_compute(session: ProjectSession, context: ProjectQueryContext, ticket: IncrementalQueryTicket<ProjectCheckResult>) -> ProjectCheckResult {
+fn project_prepared_source_fingerprint(result: ProjectPreparedSourceResult, schema: i64) -> IncrementalFingerprint {
+  match result {
+    ProjectPreparedSourceTests(prepared) -> {
+      let content = test_prepare_source_content(prepared)
+      incremental_fingerprint(content, str_hash(__str_ptr(content), 0, __str_len(content)))
+    }
+    ProjectPreparedSourcePlain(ast, diagnostics) -> incremental_fingerprint("project-plain-source", schema)
+    ProjectPreparedSourceParseFailed(parse) -> incremental_fingerprint("project-prepare-parse-failed", schema)
+    ProjectPreparedSourceUnset -> incremental_fingerprint("project-prepare-source-unset", schema)
+    ProjectPreparedSourceCycle(cycle) -> incremental_fingerprint("project-prepare-cycle", schema)
+    ProjectPreparedSourceCorrupt -> incremental_fingerprint("project-prepare-corrupt", schema)
+  }
+}
+
+fn project_prepared_source_commit(session: ProjectSession, ticket: IncrementalQueryTicket<ProjectPreparedSourceResult>, result: ProjectPreparedSourceResult) -> ProjectPreparedSourceResult {
+  match incremental_query_finish<ProjectPreparedSourceResult>(ticket, result, project_prepared_source_fingerprint(result, project_session_schema(session))) {
+    IncrementalQueryCommitted(committed) -> committed
+    IncrementalQueryCommitRejected -> ProjectPreparedSourceCorrupt
+  }
+}
+
+fn project_prepared_source_compute(session: ProjectSession, context: ProjectQueryContext, ticket: IncrementalQueryTicket<ProjectPreparedSourceResult>) -> ProjectPreparedSourceResult {
   match project_session_parse(session, context) {
-    ProjectParseSucceeded(ast, parse_diagnostics) -> match ast {
+    ProjectParseSucceeded(ast, diagnostics) -> match ast {
+      AstModule(fns, src, tt) -> {
+        let test_count = test_prepare_fns_test_count(fns)
+        if test_count == 0 {
+          project_prepared_source_commit(session, ticket, ProjectPreparedSourcePlain(ast, diagnostics))
+        } else {
+          let sources = project_session_sources(session)
+          match incremental_query_begin<ProjectSourceSnapshot>(sources, project_session_source_key(session, context)) {
+            IncrementalQueryHit(snapshot) -> match snapshot {
+              ProjectSourcePresent(content) -> project_prepared_source_commit(session, ticket, ProjectPreparedSourceTests(test_prepare_source(content, test_count)))
+              ProjectSourceMissing -> project_prepared_source_commit(session, ticket, ProjectPreparedSourceUnset)
+            }
+            IncrementalQueryMiss(source_ticket) -> {
+              incremental_query_abort<ProjectSourceSnapshot>(source_ticket)
+              incremental_query_abort<ProjectPreparedSourceResult>(ticket)
+              ProjectPreparedSourceUnset
+            }
+            IncrementalQueryCycle(cycle) -> {
+              incremental_query_abort<ProjectPreparedSourceResult>(ticket)
+              ProjectPreparedSourceCycle(cycle)
+            }
+            IncrementalQueryCorrupt -> {
+              incremental_query_abort<ProjectPreparedSourceResult>(ticket)
+              ProjectPreparedSourceCorrupt
+            }
+          }
+        }
+      }
+    }
+    ProjectParseFailed(ast, diagnostics) -> project_prepared_source_commit(session, ticket, ProjectPreparedSourceParseFailed(ProjectParseFailed(ast, diagnostics)))
+    ProjectParseSourceUnset -> project_prepared_source_commit(session, ticket, ProjectPreparedSourceUnset)
+    ProjectParseCycle(cycle) -> {
+      incremental_query_abort<ProjectPreparedSourceResult>(ticket)
+      ProjectPreparedSourceCycle(cycle)
+    }
+    ProjectParseCorrupt -> {
+      incremental_query_abort<ProjectPreparedSourceResult>(ticket)
+      ProjectPreparedSourceCorrupt
+    }
+  }
+}
+
+pub(package) fn project_session_prepared_source(session: ProjectSession, context: ProjectQueryContext) -> ProjectPreparedSourceResult {
+  match incremental_query_begin<ProjectPreparedSourceResult>(project_session_prepared_sources(session), project_session_prepared_source_key(session, context)) {
+    IncrementalQueryHit(result) -> result
+    IncrementalQueryMiss(ticket) -> project_prepared_source_compute(session, context, ticket)
+    IncrementalQueryCycle(cycle) -> ProjectPreparedSourceCycle(cycle)
+    IncrementalQueryCorrupt -> ProjectPreparedSourceCorrupt
+  }
+}
+
+fn project_prepared_parse_commit(session: ProjectSession, ticket: IncrementalQueryTicket<ProjectPreparedParseResult>, result: ProjectPreparedParseResult, fingerprint: IncrementalFingerprint) -> ProjectPreparedParseResult {
+  match incremental_query_finish<ProjectPreparedParseResult>(ticket, result, fingerprint) {
+    IncrementalQueryCommitted(committed) -> committed
+    IncrementalQueryCommitRejected -> ProjectPreparedParseCorrupt
+  }
+}
+
+fn project_prepared_parse_tests(session: ProjectSession, context: ProjectQueryContext, ticket: IncrementalQueryTicket<ProjectPreparedParseResult>, prepared: TestPreparedSource) -> ProjectPreparedParseResult {
+  let content = test_prepare_source_content(prepared)
+  let src = __str_ptr(content)
+  let diagnostics = project_diagnostics_new()
+  let tt = project_register_root(context, content)
+  let grammar = weft_grammar()
+  let parsed = handle grammar.parse(src, __str_len(content), tt) {
+    Diagnose.report(diagnostic) -> { project_diagnostics_add(diagnostics, diagnostic) resume(0) }
+    Diagnose.error(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, DiagnosticSeverityError, DiagnosticClassParse, msg, span) resume(0) }
+    Diagnose.warn(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, DiagnosticSeverityWarning, DiagnosticClassParse, msg, span) resume(0) }
+    Diagnose.note(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, DiagnosticSeverityNote, DiagnosticClassParse, msg, span) resume(0) }
+  }
+  let fns = test_prepare_wrap_fns(parsed, test_prepare_source_wrapper_bank_start(prepared), tt)
+  let ast = AstModule(fns, src, tt)
+  let result = if project_diagnostics_error_count(diagnostics) == 0 {
+    ProjectPreparedParseSucceeded(ast, diagnostics)
+  } else { ProjectPreparedParseFailed(ast, diagnostics) }
+  project_prepared_parse_commit(
+    session,
+    ticket,
+    result,
+    incremental_fingerprint(content, str_hash(src, 0, __str_len(content)))
+  )
+}
+
+fn project_prepared_parse_compute(session: ProjectSession, context: ProjectQueryContext, ticket: IncrementalQueryTicket<ProjectPreparedParseResult>) -> ProjectPreparedParseResult {
+  match project_session_prepared_source(session, context) {
+    ProjectPreparedSourcePlain(ast, diagnostics) -> project_prepared_parse_commit(
+      session,
+      ticket,
+      ProjectPreparedParseSucceeded(ast, diagnostics),
+      incremental_fingerprint("project-plain-parse", project_session_schema(session))
+    )
+    ProjectPreparedSourceTests(prepared) -> project_prepared_parse_tests(session, context, ticket, prepared)
+    ProjectPreparedSourceParseFailed(parse) -> match parse {
+      ProjectParseFailed(ast, diagnostics) -> project_prepared_parse_commit(
+        session,
+        ticket,
+        ProjectPreparedParseFailed(ast, diagnostics),
+        incremental_fingerprint("project-prepared-parse-failed", project_session_schema(session))
+      )
+      ProjectParseSourceUnset -> project_prepared_parse_commit(session, ticket, ProjectPreparedParseSourceUnset, incremental_fingerprint("project-prepared-source-unset", project_session_schema(session)))
+      ProjectParseCycle(cycle) -> {
+        incremental_query_abort<ProjectPreparedParseResult>(ticket)
+        ProjectPreparedParseCycle(cycle)
+      }
+      ProjectParseCorrupt -> {
+        incremental_query_abort<ProjectPreparedParseResult>(ticket)
+        ProjectPreparedParseCorrupt
+      }
+      ProjectParseSucceeded(ast, diagnostics) -> {
+        incremental_query_abort<ProjectPreparedParseResult>(ticket)
+        ProjectPreparedParseCorrupt
+      }
+    }
+    ProjectPreparedSourceUnset -> project_prepared_parse_commit(session, ticket, ProjectPreparedParseSourceUnset, incremental_fingerprint("project-prepared-source-unset", project_session_schema(session)))
+    ProjectPreparedSourceCycle(cycle) -> {
+      incremental_query_abort<ProjectPreparedParseResult>(ticket)
+      ProjectPreparedParseCycle(cycle)
+    }
+    ProjectPreparedSourceCorrupt -> {
+      incremental_query_abort<ProjectPreparedParseResult>(ticket)
+      ProjectPreparedParseCorrupt
+    }
+  }
+}
+
+pub(package) fn project_session_prepared_parse(session: ProjectSession, context: ProjectQueryContext) -> ProjectPreparedParseResult {
+  match incremental_query_begin<ProjectPreparedParseResult>(project_session_prepared_parses(session), project_session_prepared_parse_key(session, context)) {
+    IncrementalQueryHit(result) -> result
+    IncrementalQueryMiss(ticket) -> project_prepared_parse_compute(session, context, ticket)
+    IncrementalQueryCycle(cycle) -> ProjectPreparedParseCycle(cycle)
+    IncrementalQueryCorrupt -> ProjectPreparedParseCorrupt
+  }
+}
+
+fn project_check_compute(session: ProjectSession, context: ProjectQueryContext, ticket: IncrementalQueryTicket<ProjectCheckResult>) -> ProjectCheckResult {
+  match project_session_prepared_parse(session, context) {
+    ProjectPreparedParseSucceeded(ast, parse_diagnostics) -> match ast {
       AstModule(fns, src, tt) -> {
         pipeline_bind_runtime_preludes(fns, src, tt)
         let diagnostics = project_diagnostics_new()
@@ -355,25 +571,25 @@ fn project_check_compute(session: ProjectSession, context: ProjectQueryContext, 
         }
       }
     }
-    ProjectParseFailed(ast, diagnostics) -> {
-      let result = ProjectCheckParseFailed(ProjectParseFailed(ast, diagnostics))
+    ProjectPreparedParseFailed(ast, diagnostics) -> {
+      let result = ProjectCheckParseFailed(ProjectPreparedParseFailed(ast, diagnostics))
       match incremental_query_finish<ProjectCheckResult>(ticket, result, incremental_fingerprint("project-parse-failed", project_session_schema(session))) {
         IncrementalQueryCommitted(committed) -> committed
         IncrementalQueryCommitRejected -> ProjectCheckCorrupt
       }
     }
-    ProjectParseSourceUnset -> {
+    ProjectPreparedParseSourceUnset -> {
       let result = ProjectCheckSourceUnset
       match incremental_query_finish<ProjectCheckResult>(ticket, result, incremental_fingerprint("project-source-unset", project_session_schema(session))) {
         IncrementalQueryCommitted(committed) -> committed
         IncrementalQueryCommitRejected -> ProjectCheckCorrupt
       }
     }
-    ProjectParseCycle(cycle) -> {
+    ProjectPreparedParseCycle(cycle) -> {
       incremental_query_abort<ProjectCheckResult>(ticket)
       ProjectCheckCycle(cycle)
     }
-    ProjectParseCorrupt -> {
+    ProjectPreparedParseCorrupt -> {
       incremental_query_abort<ProjectCheckResult>(ticket)
       ProjectCheckCorrupt
     }
@@ -393,16 +609,51 @@ pub(package) fn project_session_parse_execution_count(session: ProjectSession, c
   incremental_query_execution_count<ProjectParseResult>(project_session_parses(session), project_session_parse_key(session, context))
 }
 
+pub(package) fn project_session_prepared_source_execution_count(session: ProjectSession, context: ProjectQueryContext) -> i64 {
+  incremental_query_execution_count<ProjectPreparedSourceResult>(project_session_prepared_sources(session), project_session_prepared_source_key(session, context))
+}
+
+pub(package) fn project_session_prepared_parse_execution_count(session: ProjectSession, context: ProjectQueryContext) -> i64 {
+  incremental_query_execution_count<ProjectPreparedParseResult>(project_session_prepared_parses(session), project_session_prepared_parse_key(session, context))
+}
+
 pub(package) fn project_session_check_execution_count(session: ProjectSession, context: ProjectQueryContext) -> i64 {
   incremental_query_execution_count<ProjectCheckResult>(project_session_checks(session), project_session_check_key(session, context))
 }
 
-pub(package) fn project_session_check_depends_on_parse(session: ProjectSession, context: ProjectQueryContext) -> i64 {
-  incremental_query_depends_on<ProjectCheckResult, ProjectParseResult>(
+pub(package) fn project_session_check_depends_on_prepared_parse(session: ProjectSession, context: ProjectQueryContext) -> i64 {
+  incremental_query_depends_on<ProjectCheckResult, ProjectPreparedParseResult>(
     project_session_checks(session),
     project_session_check_key(session, context),
+    project_session_prepared_parses(session),
+    project_session_prepared_parse_key(session, context)
+  )
+}
+
+pub(package) fn project_session_prepared_parse_depends_on_prepared_source(session: ProjectSession, context: ProjectQueryContext) -> i64 {
+  incremental_query_depends_on<ProjectPreparedParseResult, ProjectPreparedSourceResult>(
+    project_session_prepared_parses(session),
+    project_session_prepared_parse_key(session, context),
+    project_session_prepared_sources(session),
+    project_session_prepared_source_key(session, context)
+  )
+}
+
+pub(package) fn project_session_prepared_source_depends_on_parse(session: ProjectSession, context: ProjectQueryContext) -> i64 {
+  incremental_query_depends_on<ProjectPreparedSourceResult, ProjectParseResult>(
+    project_session_prepared_sources(session),
+    project_session_prepared_source_key(session, context),
     project_session_parses(session),
     project_session_parse_key(session, context)
+  )
+}
+
+pub(package) fn project_session_prepared_source_depends_on_source(session: ProjectSession, context: ProjectQueryContext) -> i64 {
+  incremental_query_depends_on<ProjectPreparedSourceResult, ProjectSourceSnapshot>(
+    project_session_prepared_sources(session),
+    project_session_prepared_source_key(session, context),
+    project_session_sources(session),
+    project_session_source_key(session, context)
   )
 }
 
