@@ -424,6 +424,28 @@ doc_stdlib_out=$(<"$tmp_out")
 assert_contains "doc_stdlib_facade_constituent_names_api" "$doc_stdlib_out" '# API: `stdlib/result.weft`'
 assert_contains "doc_stdlib_facade_constituent_renders_checked_variant" "$doc_stdlib_out" $'pub type Result<T, E> {\n  Ok(T),\n  Err(E)\n}'
 
+# The implicit prelude is the first frozen reference island. Every public API
+# item in each constituent must remain documented; adding an exported member
+# without its adjacent `---` prose fails this boundary immediately.
+for stdlib_doc_module in stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft stdlib/maybe.weft; do
+  stdlib_doc_name=${stdlib_doc_module#stdlib/}
+  stdlib_doc_name=${stdlib_doc_name%.weft}
+  set +e
+  "$WEFT" doc "$stdlib_doc_module" > "$tmp_out" 2> "$tmp_err"
+  stdlib_doc_exit=$?
+  set -e
+  assert_equals "doc_stdlib_${stdlib_doc_name}_exits_zero" "$stdlib_doc_exit" "0"
+  assert_equals "doc_stdlib_${stdlib_doc_name}_stderr_empty" "$(<"$tmp_err")" ""
+  stdlib_doc_coverage=$(grep -m1 '^Public API items:' "$tmp_out" || true)
+  if [[ "$stdlib_doc_coverage" =~ ^Public\ API\ items:\ ([0-9]+)\.\ Documented:\ ([0-9]+)\.$ ]]; then
+    assert_equals "doc_stdlib_${stdlib_doc_name}_fully_documented" "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}"
+  else
+    echo "  fail doc_stdlib_${stdlib_doc_name}_coverage_shape"
+    echo "    actual: $stdlib_doc_coverage"
+    exit 1
+  fi
+done
+
 printf 'pub fn broken(\n' > "$tmp_src"
 set +e
 "$WEFT" doc "$tmp_src" > "$tmp_out" 2> "$tmp_err"
@@ -3048,4 +3070,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 708 passed, 0 failed"
+echo "Tool boundary summary: 723 passed, 0 failed"
