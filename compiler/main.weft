@@ -17,6 +17,7 @@ use compiler/module.{*}
 use compiler/package.{*}
 use compiler/package_lock.{pkg_cli_lock}
 use compiler/pipeline.{*}
+use compiler/parse.{parse_use_file}
 use compiler/project_session.{*}
 use compiler/source_trust.{*}
 use compiler/semantic_fact.{*}
@@ -372,9 +373,8 @@ type MainTestStructuredResult {
   InvalidMainTestStructuredResult
 }
 
--- The batch owner prepares immutable parse/module products before forking a
--- worker. Each worker then mutates its private process snapshot during
--- checking, lowering, emission, and execution.
+-- A worker prepares and compiles one root against its private fork snapshot.
+-- The parent snapshot contains only immutable universal support modules.
 type MainTestPreparation {
   MainTestPrepared(i64, i64, i64, i64, i64), -- fns, src, tt, wrapper bank, trusted
   MainTestPreparationComplete(i64),           -- terminal status, already diagnosed
@@ -892,7 +892,42 @@ fn main_test_parse_jobs(raw: i64) -> i64 {
 
 fn main_test_root_timeout_millis() -> i64 { 240000 }
 
-fn main_test_spawn_worker(preparation: MainTestPreparation, envp: i64, index: i64) -> i64 {
+fn main_test_prewarm_file(tt: i64, path: str) -> i64 {
+  let errors = alloc_words(1)
+  mem_store64_at(errors, 0, 0)
+  handle parse_use_file(nlist_new(), tt, path) {
+    Diagnose.report(diagnostic) -> {
+      if diagnose_report_severity_tag(diagnostic) == 1 {
+        mem_store64_at(errors, 0, mem_load64_at(errors, 0) + 1)
+      } else { 0 }
+      resume(0)
+    }
+    Diagnose.error(msg, span) -> { mem_store64_at(errors, 0, mem_load64_at(errors, 0) + 1) resume(0) }
+    Diagnose.warn(msg, span) -> resume(0)
+    Diagnose.note(msg, span) -> resume(0)
+  }
+  mem_load64_at(errors, 0)
+}
+
+fn main_test_project_base() -> i64 {
+  let tt = ttable_new()
+  let mut errors = 0
+  -- Every generated test root imports Test, and every harness imports these
+  -- five support modules. Parse them once before forking; module entries cache
+  -- their function closures, while each child retains a root-local checker
+  -- table snapshot and all subsequent mutations remain process-private.
+  errors = errors + main_test_prewarm_file(tt, "stdlib/test.weft")
+  errors = errors + main_test_prewarm_file(tt, "runtime/syscall.weft")
+  errors = errors + main_test_prewarm_file(tt, "runtime/alloc.weft")
+  errors = errors + main_test_prewarm_file(tt, "runtime/rc.weft")
+  errors = errors + main_test_prewarm_file(tt, "stdlib/string.weft")
+  errors = errors + main_test_prewarm_file(tt, "stdlib/test_report.weft")
+  -- Missing/corrupt support must retain the canonical per-root diagnostic.
+  -- Discard the partial cache and let each child take the normal load path.
+  if errors == 0 { tt } else { ttable_new() }
+}
+
+fn main_test_spawn_worker(path: i64, project_base: i64, envp: i64, index: i64) -> i64 {
   let fork_result = sys_raw(2, 0, 0, 0, 0, 0, 0)
   if fork_result < 0 { fork_result }
   else {
@@ -901,7 +936,7 @@ fn main_test_spawn_worker(preparation: MainTestPreparation, envp: i64, index: i6
       -- A separate process group lets the scheduler kill both this compiler
       -- worker and any test executable it has spawned at the outer deadline.
       sys_raw(82, 0, 0, 0, 0, 0, 0)
-      let result = main_test_finish_preparation(preparation, 0, envp, index)
+      let result = main_test_finish_preparation(main_test_prepare_path(path, project_base), 0, envp, index)
       sys_exit(if result > 255 { 1 } else { result })
       0
     } else {
@@ -933,7 +968,7 @@ fn main_test_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -> i64 {
   let starts = alloc_zeroed(jobs * 8)
   let status_ptr = alloc_zeroed(8)
   let pause = alloc_zeroed(16)
-  let mut project_tt = ttable_new()
+  let project_base = main_test_project_base()
   let mut next = 0
   let mut active = 0
   let mut failed = 0
@@ -942,46 +977,15 @@ fn main_test_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -> i64 {
       let slot = main_test_find_free_worker(pids, jobs)
       let path = nlist_get(paths, next)
       let start = main_test_now_millis()
-      let preparation = main_test_prepare_path(path, project_tt)
-      match preparation {
-        MainTestPreparationComplete(result) -> {
-          let now = main_test_now_millis()
-          let elapsed = if start < 0 or now < start { 0 } else { now - start }
-          let charged_result = if elapsed >= main_test_root_timeout_millis() { 256 } else { result }
-          main_test_report(path, charged_result, elapsed)
-          if charged_result != 0 {
-            failed = failed + 1
-            -- Parsing is intentionally append-only. A failed root may have
-            -- installed partial facts before diagnosing; rotate the batch
-            -- table so later roots can never observe that poisoned prefix.
-            project_tt = ttable_new()
-          } else { 0 }
-        }
-        MainTestPrepared(fns, src, tt, wrapper_bank, trusted) -> {
-          let now = main_test_now_millis()
-          if start >= 0 and now >= start and now - start >= main_test_root_timeout_millis() {
-            main_test_report(path, 256, now - start)
-            failed = failed + 1
-            project_tt = ttable_new()
-          } else {
-            let pid = main_test_spawn_worker(preparation, envp, next)
-            if pid < 0 {
-              main_test_report(path, 257, 0)
-              failed = failed + 1
-            } else {
-              mem_store64_at(pids, slot * 8, pid)
-              mem_store64_at(worker_paths, slot * 8, path)
-              mem_store64_at(starts, slot * 8, start)
-              active = active + 1
-            }
-            -- A checker table is one root's semantic universe. Parsed module
-            -- products may be cached across roots only after they can be
-            -- composed into a fresh table; carrying the whole append-only
-            -- table leaks unrelated declaration/visibility facts. The child
-            -- already owns its fork snapshot, so rotate the parent here.
-            project_tt = ttable_new()
-          }
-        }
+      let pid = main_test_spawn_worker(path, project_base, envp, next)
+      if pid < 0 {
+        main_test_report(path, 257, 0)
+        failed = failed + 1
+      } else {
+        mem_store64_at(pids, slot * 8, pid)
+        mem_store64_at(worker_paths, slot * 8, path)
+        mem_store64_at(starts, slot * 8, start)
+        active = active + 1
       }
       next = next + 1
     }
