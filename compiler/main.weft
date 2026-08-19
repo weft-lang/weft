@@ -14,6 +14,7 @@ use compiler/incremental.{*}
 use compiler/ir.{*}
 use compiler/lib.{*}
 use compiler/module.{*}
+use compiler/module_product.{*}
 use compiler/package.{*}
 use compiler/package_lock.{pkg_cli_lock}
 use compiler/pipeline.{*}
@@ -378,6 +379,22 @@ type MainTestStructuredResult {
 type MainTestPreparation {
   MainTestPrepared(i64, i64, i64, i64, i64), -- fns, src, tt, wrapper bank, trusted
   MainTestPreparationComplete(i64),           -- terminal status, already diagnosed
+}
+
+type MainTestRootPlan {
+  -- index, path, source, source length, exact dependency entries, pair count
+  MainTestReusableRoot(i64, i64, i64, i64, i64, i64),
+  MainTestUnplannedRoot(i64, i64),
+}
+
+type MainTestRootPlanList {
+  MainTestRootPlanNil,
+  MainTestRootPlanCons(MainTestRootPlan, MainTestRootPlanList),
+}
+
+type MainTestProjectBases {
+  -- The session owns every source/AST graph referenced by the raw base tables.
+  MainTestProjectBases(i64, ProjectSession),
 }
 
 fn main_test_parse_result_count(raw: i64, n: i64, pos_cell: i64, delimiter: i64) -> i64 {
@@ -952,6 +969,235 @@ fn main_test_project_base() -> i64 {
   } else { ttable_new() }
 }
 
+fn main_test_dependency_selection_is_named(selected: i64) -> i64 {
+  let mut i = 0
+  let mut named = 1
+  while i < nlist_len(selected) and named == 1 {
+    if module_fact_entry_anonymous(nlist_get(selected, i)) != 0 { named = 0 }
+    else { i = i + 1 }
+  }
+  named
+}
+
+fn main_test_dependency_pair_count(selected: i64) -> i64 {
+  let mut count = 0
+  for i in 0..nlist_len(selected) {
+    count = count + nlist_len(module_fact_entry_function_pairs(nlist_get(selected, i)))
+  }
+  count
+}
+
+fn main_test_discover_root(tt: i64, path: i64, index: i64) -> MainTestRootPlan {
+  let path_len = cstr_len(path)
+  let file = read_cpath_file(path, path_len)
+  let raw = mem_load64_at(file, 0)
+  let raw_n = mem_load64_at(file, 8)
+  if raw_n <= 0 { MainTestUnplannedRoot(index, path) }
+  else {
+    main_mark_root_origin_with_grant(
+      tt,
+      raw,
+      cpath_is_trusted_source(path, path_len),
+      cpath_is_strict_source(path, path_len),
+      cpath_can_grant_import_trust(path, path_len)
+    )
+    main_register_source_path(tt, raw, raw_n, path, path_len)
+    let errors = alloc_words(1)
+    mem_store64_at(errors, 0, 0)
+    let grammar = weft_grammar()
+    let fns = handle grammar.parse(raw, raw_n, tt) {
+      Diagnose.report(diagnostic) -> {
+        if diagnose_report_severity_tag(diagnostic) == 1 {
+          mem_store64_at(errors, 0, mem_load64_at(errors, 0) + 1)
+        } else { 0 }
+        resume(0)
+      }
+      Diagnose.error(msg, span) -> { mem_store64_at(errors, 0, mem_load64_at(errors, 0) + 1) resume(0) }
+      Diagnose.warn(msg, span) -> resume(0)
+      Diagnose.note(msg, span) -> resume(0)
+    }
+    let root_module = module_fact_find_source(tt, raw)
+    if mem_load64_at(errors, 0) != 0 or root_module == 0 {
+      MainTestUnplannedRoot(index, path)
+    } else {
+      let selected = module_product_collect_dependencies(tt, root_module)
+      if nlist_len(selected) == 0 or main_test_dependency_selection_is_named(selected) == 0 {
+        MainTestUnplannedRoot(index, path)
+      } else {
+        MainTestReusableRoot(index, path, raw, raw_n, selected, main_test_dependency_pair_count(selected))
+      }
+    }
+  }
+}
+
+fn main_test_discover_roots(paths: i64) -> MainTestRootPlanList {
+  let tt = ttable_new()
+  let mut plans = MainTestRootPlanNil
+  for i in 0..nlist_len(paths) {
+    plans = MainTestRootPlanCons(main_test_discover_root(tt, nlist_get(paths, i), i), plans)
+  }
+  plans
+}
+
+fn main_test_dependency_selection_contains(selected: i64, wanted: i64) -> i64 {
+  let mut i = 0
+  let mut found = 0
+  while i < nlist_len(selected) and found == 0 {
+    if module_entry_identity_compare(nlist_get(selected, i), wanted) == 0 { found = 1 }
+    else { i = i + 1 }
+  }
+  found
+}
+
+fn main_test_dependency_selections_equal(left: i64, right: i64) -> i64 {
+  if nlist_len(left) != nlist_len(right) { 0 }
+  else {
+    let mut i = 0
+    let mut equal = 1
+    while i < nlist_len(left) and equal == 1 {
+      if main_test_dependency_selection_contains(right, nlist_get(left, i)) == 0 { equal = 0 }
+      else { i = i + 1 }
+    }
+    equal
+  }
+}
+
+fn main_test_root_plan_index(plan: MainTestRootPlan) -> i64 {
+  match plan {
+    MainTestReusableRoot(index, path, raw, raw_n, selected, pair_count) -> index
+    MainTestUnplannedRoot(index, path) -> index
+  }
+}
+
+fn main_test_root_plans_equal(left: MainTestRootPlan, right: MainTestRootPlan) -> i64 {
+  match left {
+    MainTestReusableRoot(left_index, left_path, left_raw, left_n, left_selected, left_pairs) -> match right {
+      MainTestReusableRoot(right_index, right_path, right_raw, right_n, right_selected, right_pairs) -> main_test_dependency_selections_equal(left_selected, right_selected)
+      MainTestUnplannedRoot(right_index, right_path) -> 0
+    }
+    MainTestUnplannedRoot(left_index, left_path) -> 0
+  }
+}
+
+fn main_test_root_plan_group_count(plans: MainTestRootPlanList, leader: MainTestRootPlan, claimed: i64) -> i64 {
+  match plans {
+    MainTestRootPlanNil -> 0
+    MainTestRootPlanCons(plan, rest) -> {
+      let index = main_test_root_plan_index(plan)
+      let here = if mem_load64_at(claimed, index * 8) == 0 and main_test_root_plans_equal(leader, plan) == 1 { 1 } else { 0 }
+      here + main_test_root_plan_group_count(rest, leader, claimed)
+    }
+  }
+}
+
+fn main_test_root_plan_assign_group(plans: MainTestRootPlanList, leader: MainTestRootPlan, claimed: i64, bases: i64, base: i64) -> i64 {
+  match plans {
+    MainTestRootPlanNil -> 0
+    MainTestRootPlanCons(plan, rest) -> {
+      let index = main_test_root_plan_index(plan)
+      if mem_load64_at(claimed, index * 8) == 0 and main_test_root_plans_equal(leader, plan) == 1 {
+        mem_store64_at(claimed, index * 8, 1)
+        mem_store64_at(bases, index * 8, base)
+      } else { 0 }
+      main_test_root_plan_assign_group(rest, leader, claimed, bases, base)
+    }
+  }
+}
+
+fn main_test_root_plan_checked_base(session: ProjectSession, plan: MainTestRootPlan) -> i64 {
+  match plan {
+    MainTestReusableRoot(index, path, raw, raw_n, selected, pair_count) -> {
+      let path_len = cstr_len(path)
+      let source_path = runtime_str_from_bytes_copy(path, path_len)
+      let context = project_query_context_with_trust(
+        0,
+        source_path,
+        source_path,
+        project_source_origin_disk(),
+        0,
+        1,
+        cpath_is_trusted_source(path, path_len),
+        cpath_is_strict_source(path, path_len),
+        cpath_can_grant_import_trust(path, path_len)
+      )
+      project_session_set_source(session, context, runtime_str_from_bytes_copy(raw, raw_n))
+      match project_session_checked_dependency_product(session, context) {
+        ModuleCheckedInstance(fns, tt) -> tt
+        InvalidModuleCheckedInstance -> 0
+      }
+    }
+    MainTestUnplannedRoot(index, path) -> 0
+  }
+}
+
+fn main_test_root_plan_pair_count(plan: MainTestRootPlan) -> i64 {
+  match plan {
+    MainTestReusableRoot(index, path, raw, raw_n, selected, pair_count) -> pair_count
+    MainTestUnplannedRoot(index, path) -> 0
+  }
+}
+
+fn main_test_plan_groups(plans: MainTestRootPlanList, all_plans: MainTestRootPlanList, session: ProjectSession, claimed: i64, bases: i64, metrics: i64) -> i64 {
+  match plans {
+    MainTestRootPlanNil -> 0
+    MainTestRootPlanCons(plan, rest) -> {
+      let index = main_test_root_plan_index(plan)
+      if mem_load64_at(claimed, index * 8) == 0 {
+        let group_count = main_test_root_plan_group_count(all_plans, plan, claimed)
+        let reused_roots = group_count - 1
+        let pair_count = main_test_root_plan_pair_count(plan)
+        let threshold = if reused_roots <= 0 { 0 } else { (32 + reused_roots - 1) / reused_roots }
+        if group_count > 1 and pair_count >= threshold {
+          let base = main_test_root_plan_checked_base(session, plan)
+          if base != 0 {
+            main_test_root_plan_assign_group(all_plans, plan, claimed, bases, base)
+            mem_store64_at(metrics, 0, mem_load64_at(metrics, 0) + 1)
+            mem_store64_at(metrics + 8, 0, mem_load64_at(metrics + 8, 0) + group_count)
+          } else {
+            mem_store64_at(claimed, index * 8, 1)
+          }
+        } else {
+          mem_store64_at(claimed, index * 8, 1)
+        }
+      } else { 0 }
+      main_test_plan_groups(rest, all_plans, session, claimed, bases, metrics)
+    }
+  }
+}
+
+fn main_test_env_flag(envp: i64, prefix: str) -> i64 {
+  let prefix_len = __str_len(prefix)
+  let mut i = 0
+  let mut found = 0
+  while mem_load64_at(envp, i * 8) != 0 and found == 0 {
+    let entry = mem_load64_at(envp, i * 8)
+    if cstr_len(entry) == prefix_len + 1 and src_eq_at(entry, 0, __str_ptr(prefix), 0, prefix_len) == 1 and mem_load8_at(entry, prefix_len) == 49 {
+      found = 1
+    } else { i = i + 1 }
+  }
+  found
+}
+
+fn main_test_project_bases(paths: i64, envp: i64) -> MainTestProjectBases {
+  let count = nlist_len(paths)
+  let bases = alloc_zeroed(count * 8)
+  let session = project_session_new_with_root_registration(1, main_project_register_root)
+  if count > 1 {
+    let plans = main_test_discover_roots(paths)
+    let claimed = alloc_zeroed(count * 8)
+    let metrics = alloc_zeroed(16)
+    main_test_plan_groups(plans, plans, session, claimed, bases, metrics)
+    if main_test_env_flag(envp, "WEFT_TEST_PLAN_TRACE=") == 1 {
+      eprint("test plan: shared checked dependency groups=")
+      eprint_i(mem_load64_at(metrics, 0))
+      eprint(" roots=")
+      eprint_i(mem_load64_at(metrics + 8, 0))
+      eprint("\n")
+    } else { 0 }
+  } else { 0 }
+  MainTestProjectBases(bases, session)
+}
+
 fn main_test_spawn_worker(path: i64, project_base: i64, envp: i64, index: i64) -> i64 {
   let fork_result = sys_raw(2, 0, 0, 0, 0, 0, 0)
   if fork_result < 0 { fork_result }
@@ -994,6 +1240,9 @@ fn main_test_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -> i64 {
   let status_ptr = alloc_zeroed(8)
   let pause = alloc_zeroed(16)
   let project_base = main_test_project_base()
+  let planned_products = main_test_project_bases(paths, envp)
+  let project_bases = match planned_products { MainTestProjectBases(bases, owner) -> bases }
+  let project_owner = match planned_products { MainTestProjectBases(bases, owner) -> owner }
   let mut next = 0
   let mut active = 0
   let mut failed = 0
@@ -1002,7 +1251,9 @@ fn main_test_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -> i64 {
       let slot = main_test_find_free_worker(pids, jobs)
       let path = nlist_get(paths, next)
       let start = main_test_now_millis()
-      let pid = main_test_spawn_worker(path, project_base, envp, next)
+      let planned_base = mem_load64_at(project_bases, next * 8)
+      let worker_base = if planned_base == 0 { project_base } else { planned_base }
+      let pid = main_test_spawn_worker(path, worker_base, envp, next)
       if pid < 0 {
         main_test_report(path, 257, 0)
         failed = failed + 1
@@ -1054,6 +1305,9 @@ fn main_test_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -> i64 {
     }
     if active > 0 and progressed == 0 { main_test_pause_poll(pause) } else { 0 }
   }
+  -- Keep the checked-product owner live through the final child exit. Its
+  -- source and AST values are the backing storage for inherited raw tables.
+  project_session_database(project_owner)
   failed
 }
 
