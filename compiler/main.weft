@@ -372,6 +372,14 @@ type MainTestStructuredResult {
   InvalidMainTestStructuredResult
 }
 
+-- The batch owner prepares immutable parse/module products before forking a
+-- worker. Each worker then mutates its private process snapshot during
+-- checking, lowering, emission, and execution.
+type MainTestPreparation {
+  MainTestPrepared(i64, i64, i64, i64, i64), -- fns, src, tt, wrapper bank, trusted
+  MainTestPreparationComplete(i64),           -- terminal status, already diagnosed
+}
+
 fn main_test_parse_result_count(raw: i64, n: i64, pos_cell: i64, delimiter: i64) -> i64 {
   let start = mem_load64_at(pos_cell, 0)
   let mut pos = start
@@ -882,7 +890,9 @@ fn main_test_parse_jobs(raw: i64) -> i64 {
   if valid == 1 and value > 0 { value } else { 0 }
 }
 
-fn main_test_spawn_worker(path: i64, envp: i64, index: i64) -> i64 {
+fn main_test_root_timeout_millis() -> i64 { 240000 }
+
+fn main_test_spawn_worker(preparation: MainTestPreparation, envp: i64, index: i64) -> i64 {
   let fork_result = sys_raw(2, 0, 0, 0, 0, 0, 0)
   if fork_result < 0 { fork_result }
   else {
@@ -891,7 +901,7 @@ fn main_test_spawn_worker(path: i64, envp: i64, index: i64) -> i64 {
       -- A separate process group lets the scheduler kill both this compiler
       -- worker and any test executable it has spawned at the outer deadline.
       sys_raw(82, 0, 0, 0, 0, 0, 0)
-      let result = run_test_path_native(path, envp, index)
+      let result = main_test_finish_preparation(preparation, 0, envp, index)
       sys_exit(if result > 255 { 1 } else { result })
       0
     } else {
@@ -923,6 +933,7 @@ fn main_test_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -> i64 {
   let starts = alloc_zeroed(jobs * 8)
   let status_ptr = alloc_zeroed(8)
   let pause = alloc_zeroed(16)
+  let mut project_tt = ttable_new()
   let mut next = 0
   let mut active = 0
   let mut failed = 0
@@ -930,15 +941,41 @@ fn main_test_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -> i64 {
     while next < count and active < jobs {
       let slot = main_test_find_free_worker(pids, jobs)
       let path = nlist_get(paths, next)
-      let pid = main_test_spawn_worker(path, envp, next)
-      if pid < 0 {
-        main_test_report(path, 257, 0)
-        failed = failed + 1
-      } else {
-        mem_store64_at(pids, slot * 8, pid)
-        mem_store64_at(worker_paths, slot * 8, path)
-        mem_store64_at(starts, slot * 8, main_test_now_millis())
-        active = active + 1
+      let start = main_test_now_millis()
+      let preparation = main_test_prepare_path(path, project_tt)
+      match preparation {
+        MainTestPreparationComplete(result) -> {
+          let now = main_test_now_millis()
+          let elapsed = if start < 0 or now < start { 0 } else { now - start }
+          let charged_result = if elapsed >= main_test_root_timeout_millis() { 256 } else { result }
+          main_test_report(path, charged_result, elapsed)
+          if charged_result != 0 {
+            failed = failed + 1
+            -- Parsing is intentionally append-only. A failed root may have
+            -- installed partial facts before diagnosing; rotate the batch
+            -- table so later roots can never observe that poisoned prefix.
+            project_tt = ttable_new()
+          } else { 0 }
+        }
+        MainTestPrepared(fns, src, tt, wrapper_bank, trusted) -> {
+          let now = main_test_now_millis()
+          if start >= 0 and now >= start and now - start >= main_test_root_timeout_millis() {
+            main_test_report(path, 256, now - start)
+            failed = failed + 1
+            project_tt = ttable_new()
+          } else {
+            let pid = main_test_spawn_worker(preparation, envp, next)
+            if pid < 0 {
+              main_test_report(path, 257, 0)
+              failed = failed + 1
+            } else {
+              mem_store64_at(pids, slot * 8, pid)
+              mem_store64_at(worker_paths, slot * 8, path)
+              mem_store64_at(starts, slot * 8, start)
+              active = active + 1
+            }
+          }
+        }
       }
       next = next + 1
     }
@@ -952,7 +989,7 @@ fn main_test_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -> i64 {
         let waited = sys_raw(7, pid, status_ptr, 1, 0, 0, 0)
         let now = main_test_now_millis()
         let start = mem_load64_at(starts, slot * 8)
-        let expired = start >= 0 and now >= start and now - start >= 240000
+        let expired = start >= 0 and now >= start and now - start >= main_test_root_timeout_millis()
         let mut result = 0 - 1
         let mut complete = 0
         if waited == pid {
@@ -6298,7 +6335,7 @@ fn test_effects_for_source(trusted: i64) -> i64 {
   } else { test_effects }
 }
 
-fn run_test_source_mode_with_path(raw: i64, raw_n: i64, path_ptr: i64, path_len: i64, trusted: i64, strict: i64, emit: i64, envp: i64, index: i64) -> i64 {
+fn main_test_prepare_source_with_table(raw: i64, raw_n: i64, path_ptr: i64, path_len: i64, trusted: i64, strict: i64, tt: i64) -> MainTestPreparation {
   -- Parse the user's source before adding the Test import prefix so parse
   -- diagnostics retain the user's original line/column coordinates.
   let grammar = weft_grammar()
@@ -6311,7 +6348,7 @@ fn run_test_source_mode_with_path(raw: i64, raw_n: i64, path_ptr: i64, path_len:
     eprint("test: parse failed with ")
     eprint_i(probe_errors)
     eprint(" errors\n")
-    return 1
+    return MainTestPreparationComplete(1)
   } else { 0 }
   let probe_fns = match probe_parsed { PipelineParseResult(fns, errors) -> fns }
   -- Prepare the final source before loading the module graph. The root-local
@@ -6322,7 +6359,6 @@ fn run_test_source_mode_with_path(raw: i64, raw_n: i64, path_ptr: i64, path_len:
   let src = node_f1(banked)
   let n = node_f2(banked)
   let name_bank_start = test_source_wrapper_bank_start(banked)
-  let tt = ttable_new()
   pipeline_mark_root_origin(tt, src, trusted, strict)
   main_register_source_path(tt, src, n, path_ptr, path_len)
   let parsed = pipeline_parse_with_error_count(grammar, src, n, tt)
@@ -6331,13 +6367,20 @@ fn run_test_source_mode_with_path(raw: i64, raw_n: i64, path_ptr: i64, path_len:
     eprint("test: parse failed with ")
     eprint_i(parse_errors)
     eprint(" errors\n")
-    return 1
+    return MainTestPreparationComplete(1)
   } else { 0 }
   let fns = match parsed { PipelineParseResult(parsed_fns, errors) -> parsed_fns }
   if fns_test_count(fns) == 0 {
     eprint("test: no test blocks found\n")
-    0
-  } else {
+    MainTestPreparationComplete(0)
+  } else { MainTestPrepared(fns, src, tt, name_bank_start, trusted) }
+}
+
+fn main_test_finish_preparation(preparation: MainTestPreparation, emit: i64, envp: i64, index: i64) -> i64 {
+  match preparation {
+    MainTestPreparationComplete(result) -> result
+    MainTestPrepared(fns, src, tt, name_bank_start, trusted) -> {
+    let grammar = weft_grammar()
     let regular = nlist_new()
     let mut test_entries_rev = test_harness_decl_list_empty()
     let mut regular_entries_rev = test_harness_decl_list_empty()
@@ -6431,6 +6474,17 @@ fn run_test_source_mode_with_path(raw: i64, raw_n: i64, path_ptr: i64, path_len:
       else { main_test_run_binary(binary, envp, index) }
     }
   }
+  }
+}
+
+fn run_test_source_mode_with_path(raw: i64, raw_n: i64, path_ptr: i64, path_len: i64, trusted: i64, strict: i64, emit: i64, envp: i64, index: i64) -> i64 {
+  let tt = ttable_new()
+  main_test_finish_preparation(
+    main_test_prepare_source_with_table(raw, raw_n, path_ptr, path_len, trusted, strict, tt),
+    emit,
+    envp,
+    index
+  )
 }
 
 fn run_test_source_mode(raw: i64, raw_n: i64, trusted: i64, strict: i64, emit: i64, envp: i64, index: i64) -> i64 {
@@ -6443,6 +6497,19 @@ fn run_test_source(raw: i64, raw_n: i64, trusted: i64, strict: i64) -> i64 {
 
 fn run_test_source_with_path(raw: i64, raw_n: i64, path_ptr: i64, path_len: i64, trusted: i64, strict: i64) -> i64 {
   run_test_source_mode_with_path(raw, raw_n, path_ptr, path_len, trusted, strict, 1, 0, 0)
+}
+
+fn main_test_prepare_path(path: i64, tt: i64) -> MainTestPreparation {
+  let len = cstr_len(path)
+  let file = read_cpath_file(path, len)
+  let raw = mem_load64_at(file, 0)
+  let raw_n = mem_load64_at(file, 8)
+  if raw_n <= 0 {
+    eprint("test: could not read input file\n")
+    MainTestPreparationComplete(1)
+  } else {
+    main_test_prepare_source_with_table(raw, raw_n, path, len, cpath_is_trusted_source(path, len), cpath_is_strict_source(path, len), tt)
+  }
 }
 
 fn run_test_path(path: i64) -> i64 {
