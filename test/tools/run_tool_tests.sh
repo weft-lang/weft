@@ -424,9 +424,8 @@ doc_stdlib_out=$(<"$tmp_out")
 assert_contains "doc_stdlib_facade_constituent_names_api" "$doc_stdlib_out" '# API: `stdlib/result.weft`'
 assert_contains "doc_stdlib_facade_constituent_renders_checked_variant" "$doc_stdlib_out" $'pub type Result<T, E> {\n  Ok(T),\n  Err(E)\n}'
 
-# The implicit prelude is the first frozen reference island. Every public API
-# item in each constituent must remain documented; adding an exported member
-# without its adjacent `---` prose fails this boundary immediately.
+# Every module in the frozen stdlib reference island must remain complete;
+# adding an exported member without adjacent `---` prose fails immediately.
 stdlib_doc_modules=(
   stdlib/assert.weft stdlib/default.weft stdlib/display.weft stdlib/drop.weft
   stdlib/eq.weft stdlib/hash.weft stdlib/ord.weft stdlib/panic.weft
@@ -434,6 +433,7 @@ stdlib_doc_modules=(
   stdlib/maybe.weft stdlib/bytes.weft stdlib/path.weft stdlib/io_types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft stdlib/json.weft
+  stdlib/state.weft
 )
 for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   stdlib_doc_name=${stdlib_doc_module#stdlib/}
@@ -453,6 +453,15 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     exit 1
   fi
 done
+
+# Stored continuation cells are package runtime plumbing, not public API.
+set +e
+"$WEFT" doc stdlib/continuation.weft > "$tmp_out" 2> "$tmp_err"
+doc_continuation_exit=$?
+set -e
+assert_equals "doc_continuation_internal_module_exits_zero" "$doc_continuation_exit" "0"
+assert_equals "doc_continuation_internal_module_stderr_empty" "$(<"$tmp_err")" ""
+assert_contains "doc_continuation_internal_module_has_no_public_api" "$(<"$tmp_out")" "Public API items: 0. Documented: 0."
 
 printf 'pub fn broken(\n' > "$tmp_src"
 set +e
@@ -3078,4 +3087,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 780 passed, 0 failed"
+echo "Tool boundary summary: 786 passed, 0 failed"
