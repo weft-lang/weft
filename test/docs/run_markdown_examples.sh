@@ -3,6 +3,7 @@
 #
 #   ```weft check   type-check the complete fenced module
 #   ```weft run     compile and run it; default expected exit is zero
+#   ```weft test    compile and run it through the native Test harness
 #
 # A run block may contain `-- doctest-exit: N` to select another exit code.
 set -e
@@ -39,7 +40,11 @@ run_example() {
     fi
   else
     set +e
-    "$WEFT" compile "$tmp_src" > "$tmp_bin" 2> "$tmp_err"
+    if [ "$mode" = "test" ]; then
+      "$WEFT" test --emit "$tmp_src" > "$tmp_bin" 2> "$tmp_err"
+    else
+      "$WEFT" compile "$tmp_src" > "$tmp_bin" 2> "$tmp_err"
+    fi
     local compile_exit=$?
     set -e
     if [ "$compile_exit" -ne 0 ]; then
@@ -104,6 +109,12 @@ for markdown_file in "$@"; do
       elif [ "$line" = '```weft run' ]; then
         in_block=1
         block_mode="run"
+        block_number=$((block_number + 1))
+        expected_exit=0
+        : > "$tmp_src"
+      elif [ "$line" = '```weft test' ]; then
+        in_block=1
+        block_mode="test"
         block_number=$((block_number + 1))
         expected_exit=0
         : > "$tmp_src"

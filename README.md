@@ -60,6 +60,10 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 ## Quick Start
 
+For the complete checked first-project path, including tests, effects, Unicode,
+local packages, diagnostics, and the current alpha boundary, see
+[Getting started with Weft](docs/getting-started.md).
+
 **Prerequisites:** macOS on Apple Silicon. No toolchain — the checked-in binary is the compiler.
 
 ```bash
