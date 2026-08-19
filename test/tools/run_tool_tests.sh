@@ -434,7 +434,7 @@ stdlib_doc_modules=(
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft stdlib/json.weft
   stdlib/state.weft stdlib/diagnostic_type.weft stdlib/diagnostic.weft
-  stdlib/diagnostic_registry.weft stdlib/set.weft
+  stdlib/diagnostic_registry.weft stdlib/map.weft stdlib/set.weft
 )
 for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   stdlib_doc_name=${stdlib_doc_module#stdlib/}
@@ -3088,4 +3088,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 798 passed, 0 failed"
+echo "Tool boundary summary: 801 passed, 0 failed"
