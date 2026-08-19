@@ -409,7 +409,7 @@ assert_equals "doc_checked_module_stderr_empty" "$(<"$tmp_err")" ""
 doc_out=$(<"$tmp_out")
 assert_contains "doc_checked_module_names_source" "$doc_out" "# API: \`$tmp_src\`"
 assert_contains "doc_checked_module_marks_fact_origin" "$doc_out" "Generated from checked semantic facts"
-assert_contains "doc_checked_module_reports_coverage" "$doc_out" "Public declarations: 1. Documented: 1."
+assert_contains "doc_checked_module_reports_coverage" "$doc_out" "Public API items: 1. Documented: 1."
 assert_contains "doc_checked_module_attaches_comment" "$doc_out" "Returns the checked answer."
 assert_contains "doc_checked_module_renders_signature" "$doc_out" "pub fn answer(value: i64) -> i64"
 assert_not_contains "doc_checked_module_omits_private" "$doc_out" "hidden"
