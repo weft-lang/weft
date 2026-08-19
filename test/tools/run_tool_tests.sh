@@ -438,7 +438,7 @@ stdlib_doc_modules=(
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector_type.weft
   stdlib/vector.weft stdlib/generator.weft stdlib/iter.weft
   stdlib/semantic_type.weft stdlib/semantic_type_render.weft
-  stdlib/f64_table.weft stdlib/num.weft stdlib/par.weft
+  stdlib/f64_table.weft stdlib/num.weft stdlib/io.weft stdlib/par.weft
 )
 for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   stdlib_doc_name=${stdlib_doc_module#stdlib/}
@@ -457,11 +457,11 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     echo "    actual: $stdlib_doc_coverage"
     exit 1
   fi
+  # These deliberately tiny facades must not regrow legacy runtime mechanics.
+  if [ "$stdlib_doc_name" = "io" ] || [ "$stdlib_doc_name" = "par" ]; then
+    assert_contains "doc_stdlib_${stdlib_doc_name}_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
+  fi
 done
-
-# Par's eight-item algebraic surface is deliberate: runtime handles, queues,
-# workers, and pool mechanics remain package implementation details.
-assert_contains "doc_stdlib_par_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
 
 # Stored continuation cells are package runtime plumbing, not public API.
 set +e
@@ -3096,4 +3096,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 835 passed, 0 failed"
+echo "Tool boundary summary: 839 passed, 0 failed"
