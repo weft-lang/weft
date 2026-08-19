@@ -364,6 +364,41 @@ write_huge_padding() {
 
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 
+set +e
+"$WEFT" explain E1002 > "$tmp_out" 2> "$tmp_err"
+explain_exit=$?
+set -e
+assert_equals "explain_known_code_exits_zero" "$explain_exit" "0"
+assert_equals "explain_known_code_stderr_empty" "$(<"$tmp_err")" ""
+explain_out=$(<"$tmp_out")
+assert_contains "explain_known_code_prints_heading" "$explain_out" "E1002 [type]"
+assert_contains "explain_known_code_prints_registry_summary" "$explain_out" "expression does not match the expected type"
+assert_contains "explain_known_code_teaches_cause" "$explain_out" "What happened:"
+assert_contains "explain_known_code_teaches_fix" "$explain_out" "How to fix:"
+assert_contains "explain_known_code_includes_example" "$explain_out" "Example:"
+
+set +e
+"$WEFT" explain E9999 > "$tmp_out" 2> "$tmp_err"
+explain_unknown_exit=$?
+set -e
+assert_equals "explain_unknown_code_exits_one" "$explain_unknown_exit" "1"
+assert_equals "explain_unknown_code_stdout_empty" "$(<"$tmp_out")" ""
+assert_contains "explain_unknown_code_is_actionable" "$(<"$tmp_err")" "unknown diagnostic code: E9999"
+
+set +e
+"$WEFT" explain > "$tmp_out" 2> "$tmp_err"
+explain_missing_exit=$?
+set -e
+assert_equals "explain_missing_code_exits_usage" "$explain_missing_exit" "2"
+assert_contains "explain_missing_code_prints_usage" "$(<"$tmp_err")" "usage: weft explain CODE"
+
+set +e
+"$WEFT" explain E1002 extra > "$tmp_out" 2> "$tmp_err"
+explain_extra_exit=$?
+set -e
+assert_equals "explain_extra_arg_exits_usage" "$explain_extra_exit" "2"
+assert_contains "explain_extra_arg_prints_usage" "$(<"$tmp_err")" "usage: weft explain CODE"
+
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
 assert_contains "fmt_parse_only" "$fmt_out" "fn main() -> i64 { 42 }"
 assert_equals "fmt_snapshot_exact" "$fmt_out" "fn main() -> i64 { 42 }"
@@ -2945,4 +2980,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 667 passed, 0 failed"
+echo "Tool boundary summary: 681 passed, 0 failed"
