@@ -438,7 +438,8 @@ stdlib_doc_modules=(
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector_type.weft
   stdlib/vector.weft stdlib/generator.weft stdlib/iter.weft
   stdlib/semantic_type.weft stdlib/semantic_type_render.weft
-  stdlib/f64_table.weft stdlib/num.weft stdlib/string.weft
+  stdlib/f64_table.weft stdlib/num.weft stdlib/io_helpers.weft
+  stdlib/string.weft
   stdlib/io.weft stdlib/par.weft
 )
 for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
@@ -459,7 +460,9 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     exit 1
   fi
   # These audited facades must not regrow legacy runtime mechanics.
-  if [ "$stdlib_doc_name" = "string" ]; then
+  if [ "$stdlib_doc_name" = "io_helpers" ]; then
+    assert_contains "doc_stdlib_io_helpers_pins_public_surface" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
+  elif [ "$stdlib_doc_name" = "string" ]; then
     assert_contains "doc_stdlib_string_pins_public_surface" "$(<"$tmp_out")" "Public API items: 17. Documented: 17."
   elif [ "$stdlib_doc_name" = "io" ] || [ "$stdlib_doc_name" = "par" ]; then
     assert_contains "doc_stdlib_${stdlib_doc_name}_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
@@ -3099,4 +3102,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 843 passed, 0 failed"
+echo "Tool boundary summary: 847 passed, 0 failed"
