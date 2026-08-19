@@ -2862,8 +2862,11 @@ assert_not_contains "test_named_failures_omits_passing_name" "$test_named_failur
 
 assert_test_failure_contains "test_assertion_failure_reports_diagnostic" 'test "fail_eq_diag" { Test.assert_eq(1, 2) }' 1 "test assertion failed: assert_eq"
 assert_test_failure_contains "test_assert_eq_f64_failure_reports_diagnostic" 'test "fail_eq_f64" { Test.assert_eq_f64(1.0, 2.0) }' 1 "test assertion failed: assert_eq_f64"
+assert_test_failure_contains "test_assert_eq_f64_failure_reports_expected" 'test "fail_eq_f64" { Test.assert_eq_f64(1.25, 2.5) }' 1 "  expected: 2.5"
+assert_test_failure_contains "test_assert_eq_f64_failure_reports_actual" 'test "fail_eq_f64" { Test.assert_eq_f64(1.25, 2.5) }' 1 "  actual:   1.25"
 assert_test_failure_contains "test_assert_eq_f64_nan_fails" 'test "fail_eq_f64_nan" { Test.assert_eq_f64(0.0 / 0.0, 0.0 / 0.0) }' 1 "test assertion failed: assert_eq_f64"
 assert_test_failure_contains "test_assert_near_f64_outside_epsilon_fails" 'test "fail_near_f64" { Test.assert_near_f64(1.0, 1.5, 0.25) }' 1 "test assertion failed: assert_near_f64"
+assert_test_failure_contains "test_assert_near_f64_reports_epsilon" 'test "fail_near_f64" { Test.assert_near_f64(1.0, 1.5, 0.25) }' 1 "  epsilon:  0.25"
 assert_test_failure_contains "test_assert_near_f64_negative_epsilon_fails" 'test "fail_near_f64_epsilon" { Test.assert_near_f64(1.0, 1.0, 0.0 - 0.1) }' 1 "test assertion failed: assert_near_f64"
 assert_test_failure_contains "test_snapshot_mismatch_reports_diagnostic" 'test "fail_snapshot" { Test.assert_snapshot("actual", "expected") }' 1 "test assertion failed: snapshot"
 assert_test_failure_contains "test_property_failure_reports_diagnostic" 'test "fail_property" { Test.forall_i64_range(0, 4, x => x < 2) }' 1 "test assertion failed: forall_i64_range"
