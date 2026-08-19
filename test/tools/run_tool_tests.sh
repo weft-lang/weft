@@ -471,18 +471,24 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   fi
 done
 
-# Stored continuation cells are package runtime plumbing, not public API.
-set +e
-"$WEFT" doc stdlib/continuation.weft > "$tmp_out" 2> "$tmp_err"
-doc_continuation_exit=$?
-set -e
-assert_equals "doc_continuation_internal_module_exits_zero" "$doc_continuation_exit" "0"
-assert_equals "doc_continuation_internal_module_stderr_empty" "$(<"$tmp_err")" ""
-assert_contains "doc_continuation_internal_module_has_no_public_api" "$(<"$tmp_out")" "Public API items: 0. Documented: 0."
-
-# Raw process/thread mechanics and native Test rendering are package plumbing.
-# Pinning zero prevents them from silently regrowing a public alpha contract.
-for internal_stdlib_module in process thread test_report; do
+# Package plumbing and generated Unicode tables deliberately expose no public
+# API. Pinning every zero-public module closes the other half of the reference
+# tripwire: none can silently sprout an undocumented alpha contract.
+internal_stdlib_modules=(
+  continuation
+  prelude
+  process
+  test_report
+  thread
+  unicode_case_data
+  unicode_compatibility_data
+  unicode_property_data
+  unicode_security
+  unicode_segmentation
+  unicode_segmentation_data
+  unsafe
+)
+for internal_stdlib_module in "${internal_stdlib_modules[@]}"; do
   set +e
   "$WEFT" doc "stdlib/${internal_stdlib_module}.weft" > "$tmp_out" 2> "$tmp_err"
   internal_stdlib_exit=$?
@@ -3116,4 +3122,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 860 passed, 0 failed"
+echo "Tool boundary summary: 884 passed, 0 failed"
