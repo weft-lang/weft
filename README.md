@@ -53,10 +53,10 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 **Self-hosted.** The compiler is written in Weft, compiles itself to native aarch64 Mach-O (including its own ad-hoc code signature), and the bootstrap gate requires generation two and generation three to be byte-identical. The Zig seed interpreter is archived in git history; `./weft` is the checked-in trust root.
 
-- 2,500+ runtime test blocks across 200+ files, plus ~350 negative (must-fail) tests
-- Tools as handler configurations over one pipeline: `weft compile`, `weft fmt`, `weft check`, `weft ast`, `weft test`, and a JSON-RPC MCP server (`weft mcp`)
+- 3680 runtime test blocks across 309 files, plus 718 negative (must-fail) cases
+- Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
-- Current work: register allocation (the compiler self-compiles in ~5s; see benchmarks below)
+- Current work: the public-alpha product gate—fast project feedback, complete docs/tooling, safe networking, the Linux/aarch64 platform row, and build/release UX
 
 ## Quick Start
 
@@ -78,7 +78,7 @@ echo 'fn main() -> i64 { 42 }' > answer.weft
 # Verify self-hosting: the gate is byte-identical generations
 just bootstrap
 
-# Run the full test suite (~3 minutes, parallel)
+# Run the full test suite (parallel; duration is host-dependent)
 bash run_tests.sh
 ```
 
@@ -166,7 +166,13 @@ Small algorithm kernels with sibling Weft, Go, and Rust implementations (same al
 | mandelbrot | 29.5 ms | 15.7 ms | 16.2 ms | 192 KB | 258 ms |
 | sorted_lookup | 69.1 ms | 28.4 ms | 13.4 ms | 192 KB | 256 ms |
 
-Read this honestly: vector-heavy integer code is at parity with Go (and Rust, on vector_sort); branchy and floating-point kernels run at 1.3–1.9× Go while the FP register file and bounds machinery mature; allocation-heavy lookup code trails furthest while reference-count elision is built out. All three are active, measured work. Go and Rust binaries for the same programs are 1.7 MB and 460 KB. The compiler — a 240,000-instruction self-hosted program — builds itself in about 5 seconds.
+Read this table as a dated lowering/codegen snapshot, not a current performance
+claim. The language and compiler corpus changed substantially after August 3;
+quiet-machine same-source checks now put self-compilation around 17–18 seconds,
+with the absolute regression/restoration work owned by the active fast-project-
+feedback brief. The formal performance baseline is intentionally reset and will
+be republished by the 3r measurement pass after the public API stops reshaping
+the corpus.
 
 Reproduce with `bash bench_compare.sh` (records JSONL with commit + timestamps). These are lowering/codegen tracking benchmarks, not a language scorecard; the most representative single number is the self-compile.
 
@@ -181,7 +187,10 @@ The compiler is a Weft program: the IR is a Weft type, passes are effect-annotat
 | `weft check` | parse + check | no emission effects |
 | `weft ast` | parse | structure dump |
 | `weft test` | full pipeline | `Test` effect harness |
+| `weft doc` | parse + check | checker-owned API facts; no lower/emit |
+| `weft explain` | diagnostic registry | append-only code teaching bodies |
 | `weft mcp` | parse + check + counters | JSON-RPC handlers |
+| `weft lsp` | incremental parse + check | persistent project-query handlers |
 
 ## License
 

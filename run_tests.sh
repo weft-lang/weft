@@ -403,7 +403,7 @@ fi
 
 echo ""
 echo "=== Markdown Examples ==="
-if bash test/docs/run_markdown_examples.sh README.md docs/getting-started.md; then
+if bash test/docs/run_markdown_examples.sh README.md docs/getting-started.md && bash test/docs/check_readme_facts.sh; then
   PASS=$((PASS+1))
 else
   echo "  ✗ markdown examples failed"
