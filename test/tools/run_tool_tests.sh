@@ -414,6 +414,16 @@ assert_contains "doc_checked_module_attaches_comment" "$doc_out" "Returns the ch
 assert_contains "doc_checked_module_renders_signature" "$doc_out" "pub fn answer(value: i64) -> i64"
 assert_not_contains "doc_checked_module_omits_private" "$doc_out" "hidden"
 
+set +e
+"$WEFT" doc stdlib/result.weft > "$tmp_out" 2> "$tmp_err"
+doc_stdlib_exit=$?
+set -e
+assert_equals "doc_stdlib_facade_constituent_exits_zero" "$doc_stdlib_exit" "0"
+assert_equals "doc_stdlib_facade_constituent_stderr_empty" "$(<"$tmp_err")" ""
+doc_stdlib_out=$(<"$tmp_out")
+assert_contains "doc_stdlib_facade_constituent_names_api" "$doc_stdlib_out" '# API: `stdlib/result.weft`'
+assert_contains "doc_stdlib_facade_constituent_renders_checked_variant" "$doc_stdlib_out" $'pub type Result<T, E> {\n  Ok(T),\n  Err(E)\n}'
+
 printf 'pub fn broken(\n' > "$tmp_src"
 set +e
 "$WEFT" doc "$tmp_src" > "$tmp_out" 2> "$tmp_err"
@@ -3038,4 +3048,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 704 passed, 0 failed"
+echo "Tool boundary summary: 708 passed, 0 failed"
