@@ -1,0 +1,207 @@
+-- compiler/module_product.weft -- instantiate immutable parsed module graphs.
+--
+-- A project parse table may contain products for many roots. It is never a
+-- checker environment: this module copies exactly one root's import closure
+-- into a fresh table, remapping every mutable module/declaration/function-pair
+-- identity while retaining immutable source bytes, syntax, and package data.
+
+use compiler/lib.{*}
+use compiler/module.{*}
+use compiler/package.{pkg_table_clone_resolution_state}
+use compiler/parse.{mark_file_loaded}
+use compiler/type_registry.{*}
+use runtime/alloc.{*}
+use runtime/memory.{*}
+
+pub(package) type ModuleParseInstance {
+  ModuleParseInstance(i64, i64), -- root-local function pairs, fresh checker table
+  InvalidModuleParseInstance
+}
+
+pub(package) fn module_product_map_find(old_values: i64, new_values: i64, wanted: i64) -> i64 {
+  let mut i = 0
+  let mut result = 0
+  while i < nlist_len(old_values) and result == 0 {
+    if nlist_get(old_values, i) == wanted { result = nlist_get(new_values, i) }
+    else { i = i + 1 }
+  }
+  result
+}
+
+pub(package) fn module_product_collect_closure(source_tt: i64, module_entry: i64, selected: i64) -> i64 {
+  if module_entry == 0 or module_entry_list_contains(selected, module_entry) == 1 { selected }
+  else {
+    nlist_add(selected, module_entry)
+    for i in 0..module_fact_import_count(source_tt) {
+      let import_entry = module_fact_import_at(source_tt, i)
+      if module_import_fact_importer(import_entry) == module_entry {
+        module_product_collect_closure(source_tt, module_import_fact_target(import_entry), selected)
+      } else { 0 }
+    }
+    selected
+  }
+}
+
+pub(package) fn module_product_selected_source(selected: i64, src: i64) -> i64 {
+  let mut i = 0
+  let mut found = 0
+  while i < nlist_len(selected) and found == 0 {
+    if module_fact_entry_source(nlist_get(selected, i)) == src { found = 1 }
+    else { i = i + 1 }
+  }
+  found
+}
+
+pub(package) fn module_product_clone_modules(source_tt: i64, dest_tt: i64, selected: i64, old_modules: i64, new_modules: i64) -> i64 {
+  for i in 0..nlist_len(selected) {
+    let old_module = nlist_get(selected, i)
+    let src = module_fact_entry_source(old_module)
+    let source_entry = ttable_find_source_buffer_entry(source_tt, src)
+    let source_len = if source_entry == 0 { 0 } else { mem_load64_at(source_entry + 8, 0) }
+    let physical_ptr = if source_entry == 0 { 0 } else { mem_load64_at(source_entry + 16, 0) }
+    let physical_len = if source_entry == 0 { 0 } else { mem_load64_at(source_entry + 24, 0) }
+    let package_id = module_fact_entry_package(old_module)
+    ttable_register_source_in_package(dest_tt, src, source_len, physical_ptr, physical_len, package_id)
+    let new_module = module_fact_find_source(dest_tt, src)
+    if module_fact_entry_anonymous(old_module) == 0 {
+      module_fact_upgrade_named(new_module, module_fact_entry_path_ptr(old_module), module_fact_entry_path_len(old_module), package_id)
+      mark_file_loaded(mem_load64_at(dest_tt, 24), module_fact_entry_path_ptr(old_module), 0, module_fact_entry_path_len(old_module), package_id)
+    } else { 0 }
+    ttable_copy_source_policy(source_tt, dest_tt, src)
+    nlist_add(old_modules, old_module)
+    nlist_add(new_modules, new_module)
+  }
+  dest_tt
+}
+
+pub(package) fn module_product_clone_types(source_tt: i64, dest_tt: i64, selected: i64) -> i64 {
+  for i in 0..ttable_entry_count(source_tt) {
+    let entry = ttable_entry_at(source_tt, i)
+    if module_product_selected_source(selected, ttable_entry_source(entry)) == 1 {
+      ttable_add(
+        dest_tt,
+        ttable_entry_source(entry),
+        mem_load64_at(entry, 0),
+        ttable_entry_name_len(entry),
+        ttable_entry_kind(entry),
+        ttable_entry_item_count(entry),
+        ttable_entry_items(entry),
+        ttable_entry_tparams(entry)
+      )
+    } else { 0 }
+  }
+  dest_tt
+}
+
+pub(package) fn module_product_clone_decl(source_tt: i64, dest_tt: i64, old_decl: i64, old_modules: i64, new_modules: i64, old_decls: i64, new_decls: i64) -> i64 {
+  let existing = module_product_map_find(old_decls, new_decls, old_decl)
+  if existing != 0 { existing }
+  else {
+    let old_module = module_decl_fact_module(old_decl)
+    let new_module = module_product_map_find(old_modules, new_modules, old_module)
+    if new_module == 0 { 0 }
+    else {
+      let old_owner = module_decl_fact_owner(old_decl)
+      let new_owner = if old_owner == 0 { 0 }
+        else { module_product_clone_decl(source_tt, dest_tt, old_owner, old_modules, new_modules, old_decls, new_decls) }
+      let src = module_fact_entry_source(old_module)
+      let new_decl = module_decl_fact_register(
+        dest_tt,
+        src,
+        new_owner,
+        module_decl_fact_namespace(old_decl),
+        module_decl_fact_name_ptr(old_decl) - src,
+        module_decl_fact_name_len(old_decl),
+        module_decl_fact_visibility_code(old_decl)
+      )
+      nlist_add(old_decls, old_decl)
+      nlist_add(new_decls, new_decl)
+      new_decl
+    }
+  }
+}
+
+pub(package) fn module_product_clone_declarations(source_tt: i64, dest_tt: i64, selected: i64, old_modules: i64, new_modules: i64, old_decls: i64, new_decls: i64) -> i64 {
+  for i in 0..module_fact_decl_count(source_tt) {
+    let old_decl = module_fact_decl_at(source_tt, i)
+    if module_entry_list_contains(selected, module_decl_fact_module(old_decl)) == 1 {
+      module_product_clone_decl(source_tt, dest_tt, old_decl, old_modules, new_modules, old_decls, new_decls)
+    } else { 0 }
+  }
+  dest_tt
+}
+
+pub(package) fn module_product_clone_imports(source_tt: i64, dest_tt: i64, selected: i64, old_modules: i64, new_modules: i64) -> i64 {
+  for i in 0..module_fact_import_count(source_tt) {
+    let old_import = module_fact_import_at(source_tt, i)
+    let old_importer = module_import_fact_importer(old_import)
+    let old_target = module_import_fact_target(old_import)
+    if module_entry_list_contains(selected, old_importer) == 1 and module_entry_list_contains(selected, old_target) == 1 {
+      module_import_fact_register_at(
+        dest_tt,
+        module_fact_entry_source(old_importer),
+        module_product_map_find(old_modules, new_modules, old_target),
+        mem_load64_at(old_import + 16, 0),
+        module_import_fact_alias_ptr(old_import),
+        module_import_fact_alias_len(old_import),
+        module_import_fact_visibility_code(old_import),
+        module_import_fact_is_weak(old_import),
+        module_import_fact_source_offset(old_import)
+      )
+    } else { 0 }
+  }
+  dest_tt
+}
+
+pub(package) fn module_product_clone_pairs(source_tt: i64, dest_tt: i64, selected: i64, old_modules: i64, new_modules: i64, old_decls: i64, new_decls: i64, old_pairs: i64, new_pairs: i64) -> i64 {
+  for i in 0..nlist_len(selected) {
+    let old_module = nlist_get(selected, i)
+    let pairs = module_fact_entry_function_pairs(old_module)
+    for pair_index in 0..nlist_len(pairs) {
+      let old_pair = nlist_get(pairs, pair_index)
+      let new_decl = module_product_map_find(old_decls, new_decls, node_tag(old_pair))
+      if new_decl != 0 {
+        let new_pair = node_new(new_decl, node_f1(old_pair), node_f2(old_pair), node_f3(old_pair), node_f4(old_pair))
+        module_decl_fact_bind_function_pair(new_decl, new_pair)
+        module_fact_cache_function_pair(dest_tt, module_fact_entry_source(old_module), new_pair)
+        nlist_add(old_pairs, old_pair)
+        nlist_add(new_pairs, new_pair)
+      } else { 0 }
+    }
+  }
+  dest_tt
+}
+
+pub(package) fn module_product_root_pairs(root_fns: i64, old_pairs: i64, new_pairs: i64) -> i64 {
+  let result = nlist_new_capacity(nlist_len(root_fns))
+  for i in 0..nlist_len(root_fns) {
+    let old_pair = nlist_get(root_fns, i)
+    let new_pair = module_product_map_find(old_pairs, new_pairs, old_pair)
+    -- Test declarations have no declaration fact and remain immutable syntax
+    -- pairs until the root-local harness creates ordinary wrapper functions.
+    nlist_add(result, if new_pair == 0 { old_pair } else { new_pair })
+  }
+  result
+}
+
+pub(package) fn module_parse_product_instantiate(source_tt: i64, root_src: i64, root_fns: i64) -> ModuleParseInstance {
+  let root_module = module_fact_find_source(source_tt, root_src)
+  if root_module == 0 { InvalidModuleParseInstance }
+  else {
+    let selected = module_product_collect_closure(source_tt, root_module, nlist_new())
+    let dest_tt = ttable_new()
+    pkg_table_clone_resolution_state(source_tt, dest_tt)
+    let old_modules = nlist_new_capacity(nlist_len(selected))
+    let new_modules = nlist_new_capacity(nlist_len(selected))
+    module_product_clone_modules(source_tt, dest_tt, selected, old_modules, new_modules)
+    module_product_clone_types(source_tt, dest_tt, selected)
+    let old_decls = nlist_new()
+    let new_decls = nlist_new()
+    module_product_clone_declarations(source_tt, dest_tt, selected, old_modules, new_modules, old_decls, new_decls)
+    module_product_clone_imports(source_tt, dest_tt, selected, old_modules, new_modules)
+    let old_pairs = nlist_new()
+    let new_pairs = nlist_new()
+    module_product_clone_pairs(source_tt, dest_tt, selected, old_modules, new_modules, old_decls, new_decls, old_pairs, new_pairs)
+    ModuleParseInstance(module_product_root_pairs(root_fns, old_pairs, new_pairs), dest_tt)
+  }
+}
