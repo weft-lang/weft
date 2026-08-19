@@ -22,6 +22,11 @@ tmp_fake_weft=$(mktemp /tmp/weft_tool_fake_weft_XXXXXX)
 tmp_test_fail_one=$(mktemp /tmp/weft_tool_test_fail_one_XXXXXX.weft)
 tmp_test_fail_two=$(mktemp /tmp/weft_tool_test_fail_two_XXXXXX.weft)
 tmp_test_after=$(mktemp /tmp/weft_tool_test_after_XXXXXX.weft)
+tmp_test_parse_fail=$(mktemp /tmp/weft_tool_a_parse_fail_XXXXXX.weft)
+tmp_test_shared_one=$(mktemp /tmp/weft_tool_shared_one_XXXXXX.weft)
+tmp_test_shared_two=$(mktemp /tmp/weft_tool_shared_two_XXXXXX.weft)
+tmp_test_shared_module="_weft_tool_test_shared_$$"
+tmp_test_shared_support="module_fixtures/${tmp_test_shared_module}.weft"
 tmp_test_dir=$(mktemp -d /tmp/weft_tool_test_dir_XXXXXX)
 tmp_fmt_dir=$(mktemp -d /tmp/weft_tool_fmt_dir_XXXXXX)
 tmp_pkg_dir=$(mktemp -d /tmp/weft_tool_pkg_XXXXXX)
@@ -33,7 +38,7 @@ tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_fmt_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_fmt_dir"' EXIT
 
 now_s() {
   date +%s
@@ -2855,6 +2860,27 @@ assert_contains "test_path_native_continues_after_failure" "$test_path_multi_err
 assert_contains "test_path_native_reports_second_failure" "$test_path_multi_err" "  FAIL: $tmp_test_fail_two ("
 assert_contains "test_path_native_aggregates_summary" "$test_path_multi_err" "1 passed, 2 failed"
 
+printf 'pub fn shared_value() -> i64 { 42 }\n' > "$tmp_test_shared_support"
+printf 'use module_fixtures/%s.{shared_value} test "shared one" { Test.assert_eq(shared_value(), 42) }\n' "$tmp_test_shared_module" > "$tmp_test_shared_one"
+printf 'use module_fixtures/%s.{shared_value} test "shared two" { Test.assert_eq(shared_value(), 42) }\n' "$tmp_test_shared_module" > "$tmp_test_shared_two"
+set +e
+run_weft_compile_guarded "$WEFT" test --jobs 1 "$tmp_test_shared_one" "$tmp_test_shared_two" > "$tmp_out" 2>"$tmp_err"
+test_shared_roots_exit=$?
+set -e
+assert_equals "test_batch_shared_module_exit_zero" "$test_shared_roots_exit" "0"
+assert_contains "test_batch_shared_module_runs_both_roots" "$(<"$tmp_err")" "2 passed, 0 failed"
+
+printf 'use "removed/quoted/import.weft"\n' > "$tmp_test_parse_fail"
+set +e
+run_weft_compile_guarded "$WEFT" test --jobs 1 "$tmp_test_parse_fail" "$tmp_test_after" > "$tmp_out" 2>"$tmp_err"
+test_parse_then_pass_exit=$?
+set -e
+test_parse_then_pass_err=$(<"$tmp_err")
+assert_equals "test_batch_parse_failure_returns_one" "$test_parse_then_pass_exit" "1"
+assert_contains "test_batch_parse_failure_preserves_diagnostic" "$test_parse_then_pass_err" "expected path-form module after 'use'"
+assert_contains "test_batch_parse_failure_rotates_and_continues" "$test_parse_then_pass_err" "  pass: $tmp_test_after ("
+assert_contains "test_batch_parse_failure_aggregates_summary" "$test_parse_then_pass_err" "1 passed, 1 failed"
+
 printf 'test "directory a" { Test.assert_eq(1, 1) }\n' > "$tmp_test_dir/a_pass.weft"
 printf 'test "directory b" { Test.assert_eq(2, 2) }\n' > "$tmp_test_dir/b_pass.weft"
 mkdir -p "$tmp_test_dir/nested/deeper" "$tmp_test_dir/empty"
@@ -3122,4 +3148,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 884 passed, 0 failed"
+echo "Tool boundary summary: 890 passed, 0 failed"
