@@ -1,0 +1,134 @@
+#!/bin/bash
+# Compile-verify fenced Weft examples in public Markdown documentation.
+#
+#   ```weft check   type-check the complete fenced module
+#   ```weft run     compile and run it; default expected exit is zero
+#
+# A run block may contain `-- doctest-exit: N` to select another exit code.
+set -e
+
+WEFT=${WEFT:-./weft}
+if [ "$#" -eq 0 ]; then
+  set -- README.md
+fi
+
+tmp_src=$(mktemp /tmp/weft_markdown_example_XXXXXX.weft)
+tmp_bin=$(mktemp /tmp/weft_markdown_example_bin_XXXXXX)
+tmp_linked=$(mktemp /tmp/weft_markdown_example_linked_XXXXXX)
+tmp_err=$(mktemp /tmp/weft_markdown_example_err_XXXXXX)
+trap 'rm -f "$tmp_src" "$tmp_bin" "$tmp_linked" "$tmp_err"' EXIT
+
+passed=0
+
+run_example() {
+  local source_file="$1"
+  local block_number="$2"
+  local mode="$3"
+  local expected_exit="$4"
+  local label="${source_file}#${block_number}"
+
+  if [ "$mode" = "check" ]; then
+    set +e
+    "$WEFT" check "$tmp_src" > /dev/null 2> "$tmp_err"
+    local check_exit=$?
+    set -e
+    if [ "$check_exit" -ne 0 ]; then
+      echo "  fail $label (check)"
+      sed 's/^/    /' "$tmp_err"
+      exit 1
+    fi
+  else
+    set +e
+    "$WEFT" compile "$tmp_src" > "$tmp_bin" 2> "$tmp_err"
+    local compile_exit=$?
+    set -e
+    if [ "$compile_exit" -ne 0 ]; then
+      echo "  fail $label (compile)"
+      sed 's/^/    /' "$tmp_err"
+      exit 1
+    fi
+    local run_bin="$tmp_bin"
+    local artifact_kind
+    artifact_kind=$(/usr/bin/file -b "$tmp_bin")
+    if [[ "$artifact_kind" == *"Mach-O 64-bit object"* ]]; then
+      set +e
+      /usr/bin/clang -o "$tmp_linked" "$tmp_bin" 2> "$tmp_err"
+      local link_exit=$?
+      set -e
+      if [ "$link_exit" -ne 0 ]; then
+        echo "  fail $label (link)"
+        sed 's/^/    /' "$tmp_err"
+        exit 1
+      fi
+      run_bin="$tmp_linked"
+    fi
+    chmod +x "$run_bin"
+    set +e
+    "$run_bin" > /dev/null 2> "$tmp_err"
+    local run_exit=$?
+    set -e
+    if [ "$run_exit" -ne "$expected_exit" ]; then
+      echo "  fail $label (run)"
+      echo "    expected exit: $expected_exit"
+      echo "    actual exit: $run_exit"
+      sed 's/^/    /' "$tmp_err"
+      exit 1
+    fi
+  fi
+
+  echo "  ok $label ($mode)"
+  passed=$((passed + 1))
+}
+
+for markdown_file in "$@"; do
+  if [ ! -f "$markdown_file" ]; then
+    echo "  fail $markdown_file (missing documentation file)"
+    exit 1
+  fi
+
+  in_block=0
+  block_mode=""
+  block_number=0
+  file_blocks=0
+  expected_exit=0
+  : > "$tmp_src"
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$in_block" -eq 0 ]; then
+      if [ "$line" = '```weft check' ]; then
+        in_block=1
+        block_mode="check"
+        block_number=$((block_number + 1))
+        expected_exit=0
+        : > "$tmp_src"
+      elif [ "$line" = '```weft run' ]; then
+        in_block=1
+        block_mode="run"
+        block_number=$((block_number + 1))
+        expected_exit=0
+        : > "$tmp_src"
+      fi
+    elif [ "$line" = '```' ]; then
+      run_example "$markdown_file" "$block_number" "$block_mode" "$expected_exit"
+      file_blocks=$((file_blocks + 1))
+      in_block=0
+      block_mode=""
+    else
+      if [[ "$line" =~ ^[[:space:]]*--[[:space:]]doctest-exit:[[:space:]]([0-9]+)$ ]]; then
+        expected_exit="${BASH_REMATCH[1]}"
+      fi
+      printf '%s\n' "$line" >> "$tmp_src"
+    fi
+  done < "$markdown_file"
+
+  if [ "$in_block" -ne 0 ]; then
+    echo "  fail $markdown_file (unterminated checked Weft fence)"
+    exit 1
+  fi
+  if [ "$file_blocks" -eq 0 ]; then
+    echo "  fail $markdown_file (no checked Weft fences)"
+    exit 1
+  fi
+done
+
+echo "Markdown example summary: $passed passed, 0 failed"

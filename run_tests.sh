@@ -402,6 +402,16 @@ else
 fi
 
 echo ""
+echo "=== Markdown Examples ==="
+if bash test/docs/run_markdown_examples.sh README.md; then
+  PASS=$((PASS+1))
+else
+  echo "  ✗ markdown examples failed"
+  FAIL=$((FAIL+1))
+  ERRORS="$ERRORS\n  markdown examples failed"
+fi
+
+echo ""
 echo "=== Negative Tests ==="
 if bash test/negative/run_negative_tests.sh; then
   PASS=$((PASS+1))

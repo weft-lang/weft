@@ -4,22 +4,27 @@ A compiled, general-purpose language with set-theoretic types, algebraic effects
 
 **Every type is a set. Every side effect is in the signature.**
 
-```weft
-use "stdlib/io.weft"
-use "stdlib/display.weft"
+```weft run
+use runtime/safe_io.{runtime_platform_console_write}
+use stdlib/console.{ConsoleWrite, console_print_text}
+use stdlib/result.{Err, Ok}
+use stdlib/string.{str_concat}
 
 effect Greet {
   fn greet(name: str) -> nil
 }
 
-fn hello() -[Greet, IO]> nil {
+fn hello() -[Greet]> nil {
   Greet.greet("world")
 }
 
-fn run() -[IO]> i64 {
+fn run() -[ConsoleWrite]> i64 {
   handle hello() {
     Greet.greet(name) -> {
-      io_print("hello {name}\n")
+      match console_print_text(str_concat(str_concat("hello ", name), "\n")) {
+        Ok(count) -> 0
+        Err(error) -> 0
+      }
       resume(nil)
     }
   }
@@ -27,11 +32,12 @@ fn run() -[IO]> i64 {
 }
 
 fn main() -> i64 {
-  with_raw_io_i64(run)
+  runtime_platform_console_write(run)
 }
 ```
 
-Every code example in this README compiles and runs with the checked-in `./weft` binary.
+Every Weft example in this README is checked by the suite; complete programs
+are compiled and run with the checked-in `./weft` binary.
 
 ## What is Weft?
 
@@ -78,16 +84,17 @@ bash run_tests.sh
 
 The function says *what* it needs; the handler at the boundary decides *how* — and not resuming is an early exit, which is how error handling falls out for free:
 
-```weft
-use "stdlib/fail.weft"
+```weft run
+use stdlib/fail.{Fail}
 
-fn risky(n: i64) -[Fail]> i64 {
-  if n < 0 { Fail.fail(1) } else { n * 2 }
+fn risky(n: i64) -[Fail<i64>]> i64 {
+  if n < 0 { Fail<i64>.fail(1) } else { n * 2 }
 }
 
 fn main() -> i64 {
+  -- doctest-exit: 99
   handle risky(0 - 5) {
-    Fail.fail(e) -> 99   -- no resume: unwind to the handler
+    Fail<i64>.fail(e) -> 99   -- no resume: unwind to the handler
   }
 }
 -- exits 99
@@ -97,7 +104,7 @@ The same mechanism handles allocation strategy — a handler can serve `Alloc.al
 
 ### Types are sets, and control flow narrows them
 
-```weft
+```weft run
 type Shape { Circle(i64), Square(i64) }
 
 fn area3(input: Shape | nil) -> i64 {
@@ -127,14 +134,19 @@ After `s: Shape`, the binding is `Shape` — the union has been narrowed by set 
 
 Application code just writes `T`. The compiler classifies storage (stack, inline, managed, region) and inserts retain/release, then elides them where lifetimes provably nest — ownership operations are a first-class optimizer target, not a fixed tax. `weak` breaks reference cycles. Values that cross a thread boundary are atomically promoted at that boundary — there is no separate `arc` type. And `Unsafe` is not an escape hatch you opt into: it is sealed inside the runtime, so an ordinary module *cannot* fabricate a pointer, and you can audit the entire trusted ring.
 
-```weft
-use "stdlib/io.weft"
+```weft check
+use stdlib/fail.{Fail}
+use stdlib/file.{file_close, file_open_read}
+use stdlib/io.{FileHandle, IO}
+use stdlib/io_types.{IoError}
+use stdlib/path.{Path}
+use stdlib/result.{Result}
 
--- owned resource: single owner, Drop runs on scope exit
-fn copy_first_line(path: str) -[IO]> str {
-  let f: owned FileHandle = io_file_open_read(path)
-  io_read_line(f)
-}   -- f dropped here: IO.close runs, in order
+-- owned resource: one owner, explicit consuming close
+fn open_and_close(path: Path) -[IO, Fail<IoError>]> Result<nil, IoError> {
+  let file: owned FileHandle = file_open_read(path)
+  file_close(file)
+}
 ```
 
 ## Benchmarks
