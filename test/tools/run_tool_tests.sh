@@ -399,6 +399,64 @@ set -e
 assert_equals "explain_extra_arg_exits_usage" "$explain_extra_exit" "2"
 assert_contains "explain_extra_arg_prints_usage" "$(<"$tmp_err")" "usage: weft explain CODE"
 
+printf '%s\n' '--- Returns the checked answer.' 'pub fn answer(value: i64) -> i64 { value }' 'fn hidden() -> i64 { 0 }' > "$tmp_src"
+set +e
+"$WEFT" doc "$tmp_src" > "$tmp_out" 2> "$tmp_err"
+doc_exit=$?
+set -e
+assert_equals "doc_checked_module_exits_zero" "$doc_exit" "0"
+assert_equals "doc_checked_module_stderr_empty" "$(<"$tmp_err")" ""
+doc_out=$(<"$tmp_out")
+assert_contains "doc_checked_module_names_source" "$doc_out" "# API: \`$tmp_src\`"
+assert_contains "doc_checked_module_marks_fact_origin" "$doc_out" "Generated from checked semantic facts"
+assert_contains "doc_checked_module_reports_coverage" "$doc_out" "Public declarations: 1. Documented: 1."
+assert_contains "doc_checked_module_attaches_comment" "$doc_out" "Returns the checked answer."
+assert_contains "doc_checked_module_renders_signature" "$doc_out" "pub fn answer(value: i64) -> i64"
+assert_not_contains "doc_checked_module_omits_private" "$doc_out" "hidden"
+
+printf 'pub fn broken(\n' > "$tmp_src"
+set +e
+"$WEFT" doc "$tmp_src" > "$tmp_out" 2> "$tmp_err"
+doc_parse_exit=$?
+set -e
+assert_equals "doc_parse_failure_exits_one" "$doc_parse_exit" "1"
+assert_equals "doc_parse_failure_stdout_empty" "$(<"$tmp_out")" ""
+assert_contains "doc_parse_failure_preserves_diagnostic" "$(<"$tmp_err")" "error[E0002]"
+assert_contains "doc_parse_failure_reports_summary" "$(<"$tmp_err")" "doc: parse failed with"
+
+printf 'pub fn bad() -> i64 { "wrong" }\n' > "$tmp_src"
+set +e
+"$WEFT" doc "$tmp_src" > "$tmp_out" 2> "$tmp_err"
+doc_type_exit=$?
+set -e
+assert_equals "doc_type_failure_exits_one" "$doc_type_exit" "1"
+assert_equals "doc_type_failure_stdout_empty" "$(<"$tmp_out")" ""
+assert_contains "doc_type_failure_preserves_diagnostic" "$(<"$tmp_err")" "error[E1002]"
+assert_contains "doc_type_failure_reports_summary" "$(<"$tmp_err")" "doc: type check failed with"
+
+set +e
+"$WEFT" doc "$tmp_src.missing" > "$tmp_out" 2> "$tmp_err"
+doc_missing_path_exit=$?
+set -e
+assert_equals "doc_missing_path_exits_one" "$doc_missing_path_exit" "1"
+assert_equals "doc_missing_path_stdout_empty" "$(<"$tmp_out")" ""
+assert_contains "doc_missing_path_is_actionable" "$(<"$tmp_err")" "doc: could not read input file"
+
+set +e
+"$WEFT" doc > "$tmp_out" 2> "$tmp_err"
+doc_missing_arg_exit=$?
+set -e
+assert_equals "doc_missing_arg_exits_usage" "$doc_missing_arg_exit" "2"
+assert_contains "doc_missing_arg_prints_usage" "$(<"$tmp_err")" "usage: weft doc PATH"
+
+set +e
+"$WEFT" doc "$tmp_src" extra > "$tmp_out" 2> "$tmp_err"
+doc_extra_arg_exit=$?
+set -e
+assert_equals "doc_extra_arg_exits_usage" "$doc_extra_arg_exit" "2"
+assert_contains "doc_extra_arg_prints_usage" "$(<"$tmp_err")" "usage: weft doc PATH"
+
+printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
 assert_contains "fmt_parse_only" "$fmt_out" "fn main() -> i64 { 42 }"
 assert_equals "fmt_snapshot_exact" "$fmt_out" "fn main() -> i64 { 42 }"
@@ -2980,4 +3038,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 681 passed, 0 failed"
+echo "Tool boundary summary: 704 passed, 0 failed"
