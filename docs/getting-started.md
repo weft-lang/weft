@@ -116,20 +116,20 @@ text; both preserve a typed failure with the invalid byte offset.
 
 ## Local path packages
 
-Package identity is content-locked and module imports are qualified. The
-current CLI manages local/path dependencies:
+Package identity is content-locked and module imports are qualified. Put the
+repository directory on `PATH` (`export PATH=/path/to/weft:$PATH`), then start
+in an empty project directory. The current CLI manages local/path dependencies:
 
-```bash
+```bash project
 mkdir -p deps/math
-(cd deps/math && ../../weft pkg init math)
-./weft pkg init app
-./weft pkg add math deps/math
-./weft pkg lock
+(cd deps/math && weft pkg init math)
+weft pkg init app
+weft pkg add math deps/math
 ```
 
 Put a public module in `deps/math/lib.weft`:
 
-```weft check
+```weft file=deps/math/lib.weft
 --- Add two integers.
 pub fn add(left: i64, right: i64) -> i64 {
   left + right
@@ -138,17 +138,39 @@ pub fn add(left: i64, right: i64) -> i64 {
 
 Then import the package/module/declaration from `app.weft`:
 
-```weft
+```weft file=app.weft
 use math/lib.{add}
 
 fn answer() -> i64 {
   add(20, 22)
 }
+
+fn main() -> i64 {
+  if answer() == 42 { 0 } else { 1 }
+}
 ```
 
-Compile from the directory containing `weft.pkg` so dependency paths and the
-lockfile have an unambiguous root. A hosted registry and full semver solver are
-not part of the first alpha; local locked source dependencies are.
+Lock only after the package source exists, then check, compile, and run
+from the directory containing `weft.pkg`:
+
+```bash project
+weft pkg lock
+weft check app.weft
+weft compile app.weft > app
+chmod +x app
+./app
+```
+
+That ordering matters: changing any package source after `pkg lock` changes
+its content identity, and the next consuming command rejects the stale lock.
+A hosted registry and full semver solver are not part of the first alpha;
+local locked source dependencies are.
+
+The native test workflow earlier in this guide is checked from the repository
+toolchain root. Making its bundled stdlib/runtime resources discoverable from
+an arbitrary project directory belongs to the not-yet-landed installed project
+workflow; this guide does not disguise that gap by copying compiler sources
+into the project.
 
 ## Diagnostics, formatting, and API docs
 

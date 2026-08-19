@@ -4,6 +4,9 @@
 #   ```weft check   type-check the complete fenced module
 #   ```weft run     compile and run it; default expected exit is zero
 #   ```weft test    compile and run it through the native Test harness
+#   ```weft file=PATH
+#                    write a project source file in the clean workspace
+#   ```bash project  execute the shown commands there, in order
 #
 # A run block may contain `-- doctest-exit: N` to select another exit code.
 set -e
@@ -17,7 +20,12 @@ tmp_src=$(mktemp /tmp/weft_markdown_example_XXXXXX.weft)
 tmp_bin=$(mktemp /tmp/weft_markdown_example_bin_XXXXXX)
 tmp_linked=$(mktemp /tmp/weft_markdown_example_linked_XXXXXX)
 tmp_err=$(mktemp /tmp/weft_markdown_example_err_XXXXXX)
-trap 'rm -f "$tmp_src" "$tmp_bin" "$tmp_linked" "$tmp_err"' EXIT
+tmp_project=$(mktemp -d /tmp/weft_markdown_project_XXXXXX)
+tmp_project_bin=$(mktemp -d /tmp/weft_markdown_tools_XXXXXX)
+trap 'rm -f "$tmp_src" "$tmp_bin" "$tmp_linked" "$tmp_err"; rm -rf "$tmp_project" "$tmp_project_bin"' EXIT
+
+WEFT_ABS=$(cd "$(dirname "$WEFT")" && pwd)/$(basename "$WEFT")
+ln -s "$WEFT_ABS" "$tmp_project_bin/weft"
 
 passed=0
 
@@ -26,9 +34,29 @@ run_example() {
   local block_number="$2"
   local mode="$3"
   local expected_exit="$4"
+  local project_path="$5"
   local label="${source_file}#${block_number}"
 
-  if [ "$mode" = "check" ]; then
+  if [ "$mode" = "file" ]; then
+    if [[ ! "$project_path" =~ ^[A-Za-z0-9_./-]+$ ]] ||
+       [[ "$project_path" = /* || "$project_path" = ".." || "$project_path" = ../* ||
+          "$project_path" = */../* || "$project_path" = */.. ]]; then
+      echo "  fail $label (invalid project path: $project_path)"
+      exit 1
+    fi
+    mkdir -p "$tmp_project/$(dirname "$project_path")"
+    cp "$tmp_src" "$tmp_project/$project_path"
+  elif [ "$mode" = "project" ]; then
+    set +e
+    (cd "$tmp_project" && PATH="$tmp_project_bin:$PATH" /bin/bash -e "$tmp_src") > /dev/null 2> "$tmp_err"
+    local project_exit=$?
+    set -e
+    if [ "$project_exit" -ne 0 ]; then
+      echo "  fail $label (project)"
+      sed 's/^/    /' "$tmp_err"
+      exit 1
+    fi
+  elif [ "$mode" = "check" ]; then
     set +e
     "$WEFT" check "$tmp_src" > /dev/null 2> "$tmp_err"
     local check_exit=$?
@@ -96,6 +124,7 @@ for markdown_file in "$@"; do
   block_number=0
   file_blocks=0
   expected_exit=0
+  project_path=""
   : > "$tmp_src"
 
   while IFS= read -r line || [ -n "$line" ]; do
@@ -118,12 +147,27 @@ for markdown_file in "$@"; do
         block_number=$((block_number + 1))
         expected_exit=0
         : > "$tmp_src"
+      elif [[ "$line" == '```weft file='* ]]; then
+        in_block=1
+        block_mode="file"
+        block_number=$((block_number + 1))
+        expected_exit=0
+        project_path="${line#*file=}"
+        : > "$tmp_src"
+      elif [ "$line" = '```bash project' ]; then
+        in_block=1
+        block_mode="project"
+        block_number=$((block_number + 1))
+        expected_exit=0
+        project_path=""
+        : > "$tmp_src"
       fi
     elif [ "$line" = '```' ]; then
-      run_example "$markdown_file" "$block_number" "$block_mode" "$expected_exit"
+      run_example "$markdown_file" "$block_number" "$block_mode" "$expected_exit" "$project_path"
       file_blocks=$((file_blocks + 1))
       in_block=0
       block_mode=""
+      project_path=""
     else
       if [[ "$line" =~ ^[[:space:]]*--[[:space:]]doctest-exit:[[:space:]]([0-9]+)$ ]]; then
         expected_exit="${BASH_REMATCH[1]}"
