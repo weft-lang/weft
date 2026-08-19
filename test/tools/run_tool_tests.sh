@@ -2864,11 +2864,33 @@ printf 'pub fn shared_value() -> i64 { 42 }\n' > "$tmp_test_shared_support"
 printf 'use module_fixtures/%s.{shared_value} test "shared one" { Test.assert_eq(shared_value(), 42) }\n' "$tmp_test_shared_module" > "$tmp_test_shared_one"
 printf 'use module_fixtures/%s.{shared_value} test "shared two" { Test.assert_eq(shared_value(), 42) }\n' "$tmp_test_shared_module" > "$tmp_test_shared_two"
 set +e
+export WEFT_TEST_PLAN_TRACE=1
 run_weft_compile_guarded "$WEFT" test --jobs 1 "$tmp_test_shared_one" "$tmp_test_shared_two" > "$tmp_out" 2>"$tmp_err"
 test_shared_roots_exit=$?
+unset WEFT_TEST_PLAN_TRACE
 set -e
 assert_equals "test_batch_shared_module_exit_zero" "$test_shared_roots_exit" "0"
 assert_contains "test_batch_shared_module_runs_both_roots" "$(<"$tmp_err")" "2 passed, 0 failed"
+assert_contains "test_batch_tiny_dependency_stays_below_reuse_threshold" "$(<"$tmp_err")" "test plan: shared checked dependency groups=0 roots=0"
+
+printf 'pub type BatchSharedBox { value: i64 }\nimpl BatchSharedBox { pub fn value(self: BatchSharedBox) -> i64 { self.value } }\n' > "$tmp_test_shared_support"
+batch_pad=0
+while [ "$batch_pad" -lt 32 ]; do
+  printf 'pub fn batch_pad_%s() -> i64 { %s }\n' "$batch_pad" "$batch_pad" >> "$tmp_test_shared_support"
+  batch_pad=$((batch_pad + 1))
+done
+printf 'use module_fixtures/%s.{BatchSharedBox} test "checked dependency one" { Test.assert_eq(BatchSharedBox { value: 41 }.value(), 41) }\n' "$tmp_test_shared_module" > "$tmp_test_shared_one"
+printf 'use module_fixtures/%s.{BatchSharedBox} test "checked dependency two" { Test.assert_eq(BatchSharedBox { value: 42 }.value(), 42) }\n' "$tmp_test_shared_module" > "$tmp_test_shared_two"
+set +e
+export WEFT_TEST_PLAN_TRACE=1
+run_weft_compile_guarded "$WEFT" test --jobs 1 "$tmp_test_shared_one" "$tmp_test_shared_two" > "$tmp_out" 2>"$tmp_err"
+test_checked_dependency_exit=$?
+unset WEFT_TEST_PLAN_TRACE
+set -e
+assert_equals "test_batch_checked_dependency_exit_zero" "$test_checked_dependency_exit" "0"
+assert_contains "test_batch_checked_dependency_admits_exact_group" "$(<"$tmp_err")" "test plan: shared checked dependency groups=1 roots=2"
+assert_contains "test_batch_checked_dependency_runs_both_roots" "$(<"$tmp_err")" "2 passed, 0 failed"
+assert_not_contains_file "test_batch_checked_dependency_has_no_missing_method" "$tmp_err" "missing method implementation"
 
 printf 'trait BatchLocal { fn get(self: BatchBox) -> i64 } type BatchBox { value: i64 } impl BatchLocal for BatchBox { fn get(self: BatchBox) -> i64 { self.value } } test "isolated one" { Test.assert_eq(BatchBox { value: 41 }.get(), 41) }\n' > "$tmp_test_shared_one"
 printf 'trait BatchLocal { fn get(self: BatchBox) -> i64 } type BatchBox { value: i64 } impl BatchLocal for BatchBox { fn get(self: BatchBox) -> i64 { self.value } } test "isolated two" { Test.assert_eq(BatchBox { value: 42 }.get(), 42) }\n' > "$tmp_test_shared_two"
@@ -3157,4 +3179,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 892 passed, 0 failed"
+echo "Tool boundary summary: 897 passed, 0 failed"
