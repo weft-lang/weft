@@ -427,7 +427,7 @@ assert_contains "doc_stdlib_facade_constituent_renders_checked_variant" "$doc_st
 # The implicit prelude is the first frozen reference island. Every public API
 # item in each constituent must remain documented; adding an exported member
 # without its adjacent `---` prose fails this boundary immediately.
-for stdlib_doc_module in stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft stdlib/maybe.weft stdlib/bytes.weft stdlib/path.weft stdlib/io_types.weft stdlib/console.weft stdlib/file.weft stdlib/dir.weft; do
+for stdlib_doc_module in stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft stdlib/maybe.weft stdlib/bytes.weft stdlib/path.weft stdlib/io_types.weft stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft; do
   stdlib_doc_name=${stdlib_doc_module#stdlib/}
   stdlib_doc_name=${stdlib_doc_name%.weft}
   set +e
@@ -3070,4 +3070,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 741 passed, 0 failed"
+echo "Tool boundary summary: 744 passed, 0 failed"
