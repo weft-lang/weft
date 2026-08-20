@@ -26,6 +26,8 @@ tmp_test_timeout=$(mktemp /tmp/weft_tool_test_timeout_XXXXXX.weft)
 tmp_test_parse_fail=$(mktemp /tmp/weft_tool_a_parse_fail_XXXXXX.weft)
 tmp_test_shared_one=$(mktemp /tmp/weft_tool_shared_one_XXXXXX.weft)
 tmp_test_shared_two=$(mktemp /tmp/weft_tool_shared_two_XXXXXX.weft)
+tmp_check_clean=$(mktemp /tmp/weft_tool_check_clean_XXXXXX.weft)
+tmp_check_fail=$(mktemp /tmp/weft_tool_check_fail_XXXXXX.weft)
 tmp_test_shared_module="_weft_tool_test_shared_$$"
 tmp_test_shared_support="module_fixtures/${tmp_test_shared_module}.weft"
 tmp_test_dir=$(mktemp -d /tmp/weft_tool_test_dir_XXXXXX)
@@ -39,7 +41,7 @@ tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_timeout" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_fmt_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_timeout" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_check_clean" "$tmp_check_fail" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_fmt_dir"' EXIT
 
 now_s() {
   date +%s
@@ -901,6 +903,40 @@ assert_contains "check_parse_and_typecheck" "$check_out" "check: 1 functions, 0 
 
 check_path_out=$("$WEFT" check "$tmp_src" 2>&1)
 assert_contains "check_path_parse_and_typecheck" "$check_path_out" "check: 1 functions, 0 errors"
+
+printf 'fn clean() -> i64 { 42 }\n' > "$tmp_check_clean"
+printf 'fn first_bad() -> i64 { missing_first }\n' > "$tmp_check_fail"
+tmp_check_spaced="$tmp_test_dir/check spaced.weft"
+printf 'fn second_bad() -> i64 { missing_second }\n' > "$tmp_check_spaced"
+tmp_check_missing="$tmp_test_dir/check missing.weft"
+set +e
+"$WEFT" check --jobs 2 "$tmp_check_fail" "$tmp_check_clean" "$tmp_check_spaced" "$tmp_check_missing" > "$tmp_out" 2> "$tmp_err"
+check_batch_exit=$?
+set -e
+assert_equals "check_batch_failure_exit" "$check_batch_exit" "1"
+assert_equals "check_batch_stdout_empty" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+check_batch_headers=$(grep '^==> ' "$tmp_err")
+assert_equals "check_batch_replays_argument_order" "$check_batch_headers" "$(printf '==> %s <==\n==> %s <==\n==> %s <==\n==> %s <==' "$tmp_check_fail" "$tmp_check_clean" "$tmp_check_spaced" "$tmp_check_missing")"
+check_batch_out=$(<"$tmp_err")
+assert_contains "check_batch_keeps_first_diagnostic" "$check_batch_out" "unknown identifier 'missing_first'"
+assert_contains "check_batch_continues_through_clean_root" "$check_batch_out" "==> $tmp_check_clean <=="$'\n'"check: 1 functions, 0 errors"
+assert_contains "check_batch_supports_spaced_path" "$check_batch_out" "==> $tmp_check_spaced <=="
+assert_contains "check_batch_keeps_later_diagnostic" "$check_batch_out" "unknown identifier 'missing_second'"
+assert_contains "check_batch_isolates_missing_root" "$check_batch_out" "==> $tmp_check_missing <=="$'\n'"check: could not read input file"
+
+set +e
+"$WEFT" check --jobs 0 "$tmp_check_clean" > "$tmp_out" 2> "$tmp_err"
+check_bad_jobs_exit=$?
+set -e
+assert_equals "check_batch_rejects_invalid_jobs" "$check_bad_jobs_exit" "2"
+assert_contains "check_batch_invalid_jobs_is_actionable" "$(<"$tmp_err")" "check: --jobs must be an integer from 1 to 64"
+
+set +e
+"$WEFT" check -j 1 > "$tmp_out" 2> "$tmp_err"
+check_missing_paths_exit=$?
+set -e
+assert_equals "check_batch_requires_paths" "$check_missing_paths_exit" "2"
+assert_contains "check_batch_missing_paths_shows_usage" "$(<"$tmp_err")" "usage: weft check [--jobs N] <path...>"
 
 run_weft_compile_guarded "$WEFT" compile "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 chmod +x "$tmp_bin"
