@@ -302,6 +302,24 @@ pub(package) type PipelineIrIdentitySpecialisations {
   PipelineIrIdentitySpecialisations(IrFunctionList, i64)
 }
 
+-- Fact-selected consuming same-layout specialisations. Requests are scratch
+-- nodes [base hash, clone hash, physical argument lane, cleanup kind]. Only
+-- requests whose canonical body exposes one provable fresh allocation root
+-- become clones; callers are rewritten against that validated function list.
+pub(package) type PipelineIrConsumingSpecialisations {
+  PipelineIrConsumingSpecialisations(IrFunctionList, PipelineIrSemanticFactList, i64)
+}
+
+pub(package) type PipelineIrConsumingCloneResult {
+  PipelineIrConsumingCloneOk(IrInstList, i64),
+  PipelineIrConsumingCloneInvalid
+}
+
+pub(package) type PipelineIrConsumingBlockResult {
+  PipelineIrConsumingBlocksOk(IrBlockList, i64),
+  PipelineIrConsumingBlocksInvalid
+}
+
 pub(package) type PipelineIrIdentityInstRewrite {
   PipelineIrIdentityInstRewrite(IrInstList, i64)
 }
@@ -46151,6 +46169,21 @@ pub(package) fn pipeline_ir_inline_clone_inst(inst: IrInst, inline_env: Pipeline
       )
       pipeline_ir_inline_clone_result(1, ir_inst_list_prepend(cloned, ir_inst_list_empty()), pipeline_ir_inline_value_env_bind(inline_env, dst, new_dst), pipeline_ir_inline_clone_next(new_dst, next_value))
     }
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> {
+      let new_dst = pipeline_ir_inline_clone_dst(dst, return_value, desired_result, next_value)
+      let cloned = IrGenericCallI64(
+        new_dst,
+        callee_hash,
+        type_args,
+        pipeline_ir_rewrite_inline_value_list(args, inline_env)
+      )
+      pipeline_ir_inline_clone_result(1, ir_inst_list_prepend(cloned, ir_inst_list_empty()), pipeline_ir_inline_value_env_bind(inline_env, dst, new_dst), pipeline_ir_inline_clone_next(new_dst, next_value))
+    }
+    IrResumeI64(dst, value) -> {
+      let new_dst = pipeline_ir_inline_clone_dst(dst, return_value, desired_result, next_value)
+      let cloned = IrResumeI64(new_dst, pipeline_ir_inline_value_env_lookup_or(inline_env, value, value))
+      pipeline_ir_inline_clone_result(1, ir_inst_list_prepend(cloned, ir_inst_list_empty()), pipeline_ir_inline_value_env_bind(inline_env, dst, new_dst), pipeline_ir_inline_clone_next(new_dst, next_value))
+    }
     IrManagedStakeI64(dst, value, cleanup_kind, delta) -> {
       let new_dst = pipeline_ir_inline_clone_dst(dst, return_value, desired_result, next_value)
       let cloned = IrManagedStakeI64(
@@ -53319,6 +53352,862 @@ pub(package) fn pipeline_ir_ownership_transfer_functions(functions: IrFunctionLi
   }
 }
 
+-- ======================================================================
+-- B2.2 consuming same-layout specialisation (Morphic / Perceus ladder)
+--
+-- A persistent update is eligible only when the shared semantic plane says:
+-- closed/pure effect contract, fresh managed result, and an exact managed
+-- parameter lane with the same representation. The callee's entry marker must
+-- independently prove that lane borrowed. No collection or constructor name
+-- participates in selection.
+-- ======================================================================
+
+pub(package) fn pipeline_ir_consuming_request_lookup(requests: i64, base_hash: i64, arg_lane: i64) -> i64 {
+  let mut clone_hash = 0
+  let mut i = 0
+  while i < nlist_len(requests) and clone_hash == 0 {
+    let request = nlist_get(requests, i)
+    if node_f1(request) == base_hash and node_f3(request) == arg_lane { clone_hash = node_f2(request) }
+    else { i = i + 1 }
+  }
+  clone_hash
+}
+
+pub(package) fn pipeline_ir_consuming_request_hash_exists(requests: i64, hash: i64) -> i64 {
+  let mut found = 0
+  let mut i = 0
+  while i < nlist_len(requests) and found == 0 {
+    if node_f2(nlist_get(requests, i)) == hash { found = 1 } else { i = i + 1 }
+  }
+  found
+}
+
+pub(package) fn pipeline_ir_consuming_request_hash(base_hash: i64, arg_lane: i64) -> i64 {
+  let hash = base_hash * 1000003 + arg_lane * 104729 + 86028121
+  if hash == 0 { 86028121 } else { hash }
+}
+
+pub(package) fn pipeline_ir_consuming_request_ensure(requests: i64, functions: IrFunctionList, base_hash: i64, arg_lane: i64, cleanup_kind: i64) -> i64 {
+  let existing = pipeline_ir_consuming_request_lookup(requests, base_hash, arg_lane)
+  if existing != 0 { existing }
+  else {
+    let mut clone_hash = pipeline_ir_consuming_request_hash(base_hash, arg_lane)
+    while pipeline_ir_identity_function_hash_exists(functions, clone_hash) == 1 or pipeline_ir_consuming_request_hash_exists(requests, clone_hash) == 1 {
+      clone_hash = clone_hash + 104729
+      if clone_hash == 0 { clone_hash = 86028121 } else { 0 }
+    }
+    nlist_add(requests, node_new(0, base_hash, clone_hash, arg_lane, cleanup_kind))
+    clone_hash
+  }
+}
+
+-- Result: 1 owned, 2 borrowed, 0 not an exact managed lane. Entry binds map
+-- logical parameters to physical ABI heads; the marker is logical-param keyed.
+pub(package) fn pipeline_ir_consuming_lane_mode_insts(insts: IrInstList, param_count: i64, arg_lane: i64, cleanup_kind: i64, borrowed_mask: i64, logical_index: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> match inst {
+      IrBindI64(ns, nl, head, ty) -> {
+        if head >= 0 and head < param_count {
+          let lanes = pipeline_type_value_lane_count_or_one(ty)
+          if arg_lane >= head and arg_lane < head + lanes {
+            if pipeline_type_value_lane_release_kind(ty, arg_lane - head) != cleanup_kind { 0 }
+            else { if cg_mask_has(borrowed_mask, logical_index) == 1 { 2 } else { 1 } }
+          } else {
+            pipeline_ir_consuming_lane_mode_insts(rest, param_count, arg_lane, cleanup_kind, borrowed_mask, logical_index + 1)
+          }
+        } else {
+          pipeline_ir_consuming_lane_mode_insts(rest, param_count, arg_lane, cleanup_kind, borrowed_mask, logical_index)
+        }
+      }
+      _ -> pipeline_ir_consuming_lane_mode_insts(rest, param_count, arg_lane, cleanup_kind, borrowed_mask, logical_index)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_function_lane_mode(function: IrFunction, arg_count: i64, arg_lane: i64, cleanup_kind: i64) -> i64 {
+  match function {
+    IrFunction(hash, param_count, blocks, src) -> {
+      if arg_count != param_count or arg_lane < 0 or arg_lane >= param_count { 0 }
+      else { match blocks {
+        IrBlockListCons(block, rest) -> match block {
+          IrBlock(id, params, insts, term) -> pipeline_ir_consuming_lane_mode_insts(insts, param_count, arg_lane, cleanup_kind, pipeline_ir_native_borrowed_param_mask_from_inst_list(insts), 0)
+        }
+        _ -> 0
+      } }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_function_candidate_eligible(function: IrFunction, facts: PipelineIrSemanticFactList) -> i64 {
+  match function {
+    IrFunction(hash, param_count, blocks, src) -> {
+      let fact = pipeline_ir_semantic_fact_find(facts, hash)
+      if fact != 0 and
+         cg_semantic_fact_effect_contract_pure(fact) == 1 and
+         cg_semantic_fact_managed_return(fact) == 1 and
+         cg_semantic_fact_fresh_managed_return(fact) == 1 and
+         cg_semantic_fact_same_managed_return_param_mask(fact) != 0 { 1 }
+      else { 0 }
+    }
+  }
+}
+
+-- A small, fact-selected hash tree keeps the all-instruction walks cheap.
+-- Building it visits each function once; discovery then avoids consulting the
+-- full fact plane or function list for the overwhelmingly common noncandidate
+-- call head.
+pub(package) fn pipeline_ir_consuming_function_candidates(functions: IrFunctionList, facts: PipelineIrSemanticFactList) -> PipelineIrInlineCandidateList {
+  match functions {
+    IrFunctionNil -> PipelineIrInlineCandidateNil
+    IrFunctionCons(function, rest) -> {
+      let tail = pipeline_ir_consuming_function_candidates(rest, facts)
+      match function {
+        IrFunction(hash, param_count, blocks, src) -> {
+          if pipeline_ir_consuming_function_candidate_eligible(function, facts) == 1 {
+            pipeline_ir_inline_candidate_prepend(hash, function, tail)
+          } else { tail }
+        }
+      }
+    }
+  }
+}
+
+-- Exact physical source lane or -1. Multiple eligible dead lanes are left
+-- unspecialised: choosing among them would make reuse identity order-sensitive.
+pub(package) fn pipeline_ir_consuming_candidate_lane(inst: IrInst, rest: IrInstList, term: IrTerminator, facts: PipelineIrSemanticFactList, candidates: PipelineIrInlineCandidateList) -> i64 {
+  let callee_hash = pipeline_ir_ownership_transfer_call_hash(inst)
+  if callee_hash == 0 { 0 - 1 }
+  else { match pipeline_ir_inline_candidate_lookup(candidates, callee_hash) {
+    IrFunctionNil -> 0 - 1
+    IrFunctionCons(function, IrFunctionNil) -> {
+    let args = pipeline_ir_ownership_transfer_call_args(inst)
+    let fact = pipeline_ir_semantic_fact_find(facts, callee_hash)
+    if fact == 0 or ir_value_list_len(args) == 0 { 0 - 1 }
+    else {
+      let same_mask = cg_semantic_fact_same_managed_return_param_mask(fact)
+      let mut lane = 0
+      let mut found = 0 - 1
+      let mut count = 0
+      while lane < ir_value_list_len(args) and lane < 60 {
+        if (same_mask band cg_bit(lane)) != 0 {
+          let source = ir_value_list_nth_or(args, lane, 0 - 1)
+          let borrowed = pipeline_ir_consuming_function_lane_mode(function, ir_value_list_len(args), lane, continuation_cleanup_kind_rc())
+          if source >= 0 and borrowed == 2 and pipeline_ir_ownership_transfer_after_is_exact(rest, term, source, continuation_cleanup_kind_rc()) == 1 {
+            found = lane
+            count = count + 1
+          } else { 0 }
+        } else { 0 }
+        lane = lane + 1
+      }
+      if count == 1 { found } else { 0 - 1 }
+    }
+    }
+    _ -> 0 - 1
+  } }
+}
+
+pub(package) fn pipeline_ir_consuming_discover_insts(insts: IrInstList, term: IrTerminator, facts: PipelineIrSemanticFactList, candidates: PipelineIrInlineCandidateList, functions: IrFunctionList, requests: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let lane = pipeline_ir_consuming_candidate_lane(inst, rest, term, facts, candidates)
+      if lane >= 0 {
+        pipeline_ir_consuming_request_ensure(requests, functions, pipeline_ir_ownership_transfer_call_hash(inst), lane, continuation_cleanup_kind_rc())
+      } else { 0 }
+      pipeline_ir_consuming_discover_insts(rest, term, facts, candidates, functions, requests)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_discover_blocks(blocks: IrBlockList, facts: PipelineIrSemanticFactList, candidates: PipelineIrInlineCandidateList, functions: IrFunctionList, requests: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block { IrBlock(id, params, insts, term) -> pipeline_ir_consuming_discover_insts(insts, term, facts, candidates, functions, requests) }
+      pipeline_ir_consuming_discover_blocks(rest, facts, candidates, functions, requests)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_discover_functions(functions: IrFunctionList, all_functions: IrFunctionList, facts: PipelineIrSemanticFactList, candidates: PipelineIrInlineCandidateList, requests: i64) -> i64 {
+  match functions {
+    IrFunctionNil -> 0
+    IrFunctionCons(function, rest) -> {
+      match function { IrFunction(hash, param_count, blocks, src) -> pipeline_ir_consuming_discover_blocks(blocks, facts, candidates, all_functions, requests) }
+      pipeline_ir_consuming_discover_functions(rest, all_functions, facts, candidates, requests)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_needed_seed_terms(blocks: IrBlockList, needed: PipelineIrLiveSet) -> PipelineIrLiveSet {
+  match blocks {
+    IrBlockListNil -> needed
+    IrBlockListCons(block, rest) -> match block {
+      IrBlock(id, params, insts, term) -> {
+        let next = match term {
+          IrTermReturn(value) -> pipeline_ir_live_set_add(needed, value)
+          _ -> needed
+        }
+        pipeline_ir_consuming_needed_seed_terms(rest, next)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_needed_add_alias_args(mask: i64, index: i64, args: IrValueList, shapes: i64, needed: PipelineIrLiveSet) -> PipelineIrLiveSet {
+  if index >= 60 or shapes == 0 or index >= nlist_len(shapes) { needed }
+  else {
+    let next = if (mask band cg_bit(index)) == 0 { needed }
+    else {
+      let head = pipeline_ir_fresh_return_param_head_or(shapes, index, 0 - 1)
+      let arg = if head < 0 { 0 - 1 } else { ir_value_list_nth_or(args, head, 0 - 1) }
+      if arg < 0 { needed } else { pipeline_ir_live_set_add(needed, arg) }
+    }
+    pipeline_ir_consuming_needed_add_alias_args(mask, index + 1, args, shapes, next)
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_needed_add_call(dst: i64, callee_hash: i64, args: IrValueList, facts: PipelineIrSemanticFactList, needed: PipelineIrLiveSet) -> PipelineIrLiveSet {
+  if pipeline_ir_live_set_contains(needed, dst) != 1 { needed }
+  else { if callee_hash == pipeline_ir_native_intrinsic_transmute_hash() {
+    let source = ir_value_list_nth_or(args, 0, 0 - 1)
+    if source < 0 { needed } else { pipeline_ir_live_set_add(needed, source) }
+  } else {
+    let fact = pipeline_ir_semantic_fact_find(facts, callee_hash)
+    if fact == 0 { needed }
+    else {
+      let mask = cg_semantic_fact_return_alias_param_mask(fact)
+      if mask == 0 { needed }
+      else { pipeline_ir_consuming_needed_add_alias_args(mask, 0, args, cg_semantic_fact_param_shapes(fact), needed) }
+    }
+  } }
+}
+
+pub(package) fn pipeline_ir_consuming_needed_add_inst(inst: IrInst, facts: PipelineIrSemanticFactList, needed: PipelineIrLiveSet) -> PipelineIrLiveSet {
+  match inst {
+    IrResumeI64(dst, value) -> if pipeline_ir_live_set_contains(needed, dst) == 1 { pipeline_ir_live_set_add(needed, value) } else { needed }
+    IrCallI64(dst, callee_hash, args) -> pipeline_ir_consuming_needed_add_call(dst, callee_hash, args, facts, needed)
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> pipeline_ir_consuming_needed_add_call(dst, pipeline_ir_function_ref_target_hash(callee_hash, type_args), args, facts, needed)
+    IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> {
+      let qualified = pipeline_ir_method_patch_key(type_hash, method_hash)
+      let callee_hash = if pipeline_ir_semantic_fact_find(facts, qualified) != 0 { qualified } else { method_hash }
+      pipeline_ir_consuming_needed_add_call(dst, callee_hash, ir_value_list_prepend(receiver, args), facts, needed)
+    }
+    _ -> needed
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_needed_add_insts(insts: IrInstList, facts: PipelineIrSemanticFactList, needed: PipelineIrLiveSet) -> PipelineIrLiveSet {
+  match insts {
+    IrInstNil -> needed
+    IrInstCons(inst, rest) -> pipeline_ir_consuming_needed_add_insts(rest, facts, pipeline_ir_consuming_needed_add_inst(inst, facts, needed))
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_needed_add_block_insts(blocks: IrBlockList, facts: PipelineIrSemanticFactList, needed: PipelineIrLiveSet) -> PipelineIrLiveSet {
+  match blocks {
+    IrBlockListNil -> needed
+    IrBlockListCons(block, rest) -> match block {
+      IrBlock(id, params, insts, term) -> pipeline_ir_consuming_needed_add_block_insts(rest, facts, pipeline_ir_consuming_needed_add_insts(insts, facts, needed))
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_needed_add_jump_args(args: IrValueList, params: IrValueList, needed: PipelineIrLiveSet) -> PipelineIrLiveSet {
+  match args {
+    IrValueNil -> needed
+    IrValueCons(arg, arg_rest) -> match params {
+      IrValueNil -> needed
+      IrValueCons(param, param_rest) -> {
+        let next = if pipeline_ir_live_set_contains(needed, param) == 1 { pipeline_ir_live_set_add(needed, arg) } else { needed }
+        pipeline_ir_consuming_needed_add_jump_args(arg_rest, param_rest, next)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_needed_add_jumps(blocks: IrBlockList, all_blocks: IrBlockList, needed: PipelineIrLiveSet) -> PipelineIrLiveSet {
+  match blocks {
+    IrBlockListNil -> needed
+    IrBlockListCons(block, rest) -> match block {
+      IrBlock(id, params, insts, term) -> {
+        let next = match term {
+          IrTermJump(target, args) -> pipeline_ir_consuming_needed_add_jump_args(args, pipeline_ir_native_block_params_or(all_blocks, target, ir_value_list_empty()), needed)
+          _ -> needed
+        }
+        pipeline_ir_consuming_needed_add_jumps(rest, all_blocks, next)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_needed_values(blocks: IrBlockList, facts: PipelineIrSemanticFactList, next_value: i64) -> PipelineIrLiveSet {
+  let mut needed = pipeline_ir_consuming_needed_seed_terms(blocks, pipeline_ir_live_set_dense(next_value + 1))
+  let mut changed = 1
+  let mut budget = next_value + ir_block_list_len(blocks) + 2
+  while changed == 1 and budget > 0 {
+    let before = pipeline_ir_live_set_len(needed)
+    needed = pipeline_ir_consuming_needed_add_block_insts(blocks, facts, needed)
+    needed = pipeline_ir_consuming_needed_add_jumps(blocks, blocks, needed)
+    changed = if pipeline_ir_live_set_len(needed) == before { 0 } else { 1 }
+    budget = budget - 1
+  }
+  needed
+}
+
+pub(package) fn pipeline_ir_consuming_raw_root_count(insts: IrInstList, needed: PipelineIrLiveSet) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let add = match inst {
+        IrCallI64(dst, callee_hash, args) -> {
+          if callee_hash == pipeline_ir_native_hash_name("rc_default_alloc") and ir_value_list_len(args) == 2 and pipeline_ir_live_set_contains(needed, dst) == 1 { 1 } else { 0 }
+        }
+        _ -> 0
+      }
+      add + pipeline_ir_consuming_raw_root_count(rest, needed)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_managed_retain_arg_or(inst: IrInst, default: i64) -> i64 {
+  match inst {
+    IrCallI64(dst, callee_hash, args) -> {
+      if pipeline_ir_abort_cleanup_is_managed_retain_hash(callee_hash) == 1 { ir_value_list_nth_or(args, 0, default) } else { default }
+    }
+    IrManagedStakeI64(dst, value, cleanup_kind, delta) -> if delta == 1 { value } else { default }
+    _ -> default
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_insts_define_value(insts: IrInstList, value: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      if pipeline_ir_inst_def_or(inst, 0 - 1) == value { 1 }
+      else { pipeline_ir_consuming_insts_define_value(rest, value) }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_retain_suffix_valid_inner(insts: IrInstList, all_insts: IrInstList, root_dst: i64, source: i64) -> i64 {
+  match insts {
+    IrInstNil -> 1
+    IrInstCons(inst, rest) -> {
+      let arg = pipeline_ir_consuming_managed_retain_arg_or(inst, 0 - 1)
+      if arg >= 0 and (arg == root_dst or arg == source or pipeline_ir_consuming_insts_define_value(all_insts, arg) == 1) { 0 }
+      else { pipeline_ir_consuming_retain_suffix_valid_inner(rest, all_insts, root_dst, source) }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_retain_suffix_valid(insts: IrInstList, root_dst: i64, source: i64) -> i64 {
+  pipeline_ir_consuming_retain_suffix_valid_inner(insts, insts, root_dst, source)
+}
+
+pub(package) fn pipeline_ir_consuming_collect_retains(insts: IrInstList) -> IrInstList {
+  match insts {
+    IrInstNil -> IrInstNil
+    IrInstCons(inst, rest) -> {
+      if pipeline_ir_consuming_managed_retain_arg_or(inst, 0 - 1) >= 0 {
+        IrInstCons(inst, pipeline_ir_consuming_collect_retains(rest))
+      } else { pipeline_ir_consuming_collect_retains(rest) }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_remove_retains(insts: IrInstList) -> IrInstList {
+  match insts {
+    IrInstNil -> IrInstNil
+    IrInstCons(inst, rest) -> {
+      if pipeline_ir_consuming_managed_retain_arg_or(inst, 0 - 1) >= 0 { pipeline_ir_consuming_remove_retains(rest) }
+      else { IrInstCons(inst, pipeline_ir_consuming_remove_retains(rest)) }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_rewrite_raw_root(insts: IrInstList, needed: PipelineIrLiveSet, source: i64, next_value: i64) -> PipelineIrConsumingCloneResult {
+  match insts {
+    IrInstNil -> PipelineIrConsumingCloneInvalid
+    IrInstCons(inst, rest) -> match inst {
+      IrCallI64(dst, callee_hash, args) -> {
+        if callee_hash == pipeline_ir_native_hash_name("rc_default_alloc") and ir_value_list_len(args) == 2 and pipeline_ir_live_set_contains(needed, dst) == 1 {
+          if pipeline_ir_consuming_retain_suffix_valid(rest, dst, source) != 1 { PipelineIrConsumingCloneInvalid }
+          else {
+            let retains = pipeline_ir_consuming_collect_retains(rest)
+            let suffix = pipeline_ir_consuming_remove_retains(rest)
+            let producer = IrCallI64(next_value, pipeline_ir_reuse_drop_hash(), ir_value_list_prepend(source, ir_value_list_empty()))
+            let reused = IrReuseInitI64(next_value, inst)
+            PipelineIrConsumingCloneOk(
+              ir_inst_list_append(retains, IrInstCons(producer, IrInstCons(reused, suffix))),
+              next_value + 1
+            )
+          }
+        } else {
+          match pipeline_ir_consuming_rewrite_raw_root(rest, needed, source, next_value) {
+            PipelineIrConsumingCloneInvalid -> PipelineIrConsumingCloneInvalid
+            PipelineIrConsumingCloneOk(rewritten, next) -> PipelineIrConsumingCloneOk(IrInstCons(inst, rewritten), next)
+          }
+        }
+      }
+      _ -> match pipeline_ir_consuming_rewrite_raw_root(rest, needed, source, next_value) {
+        PipelineIrConsumingCloneInvalid -> PipelineIrConsumingCloneInvalid
+        PipelineIrConsumingCloneOk(rewritten, next) -> PipelineIrConsumingCloneOk(IrInstCons(inst, rewritten), next)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_expandable_call_info(insts: IrInstList, needed: PipelineIrLiveSet, facts: PipelineIrSemanticFactList, functions: IrFunctionList) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let dst = pipeline_ir_ownership_transfer_call_dst_or(inst, 0 - 1)
+      let hash = pipeline_ir_ownership_transfer_call_hash(inst)
+      let fact = pipeline_ir_semantic_fact_find(facts, hash)
+      let eligible = if dst < 0 or hash == 0 or fact == 0 or pipeline_ir_live_set_contains(needed, dst) != 1 { 0 }
+      else { if pipeline_ir_fresh_return_allocator_hash(hash) == 1 { 0 }
+      else { if cg_semantic_fact_fresh_managed_return(fact) != 1 { 0 }
+      else { match pipeline_ir_function_list_find_hash(functions, hash) {
+        IrFunctionCons(function, IrFunctionNil) -> 1
+        _ -> 0
+      } } } }
+      if eligible == 1 { node_new(0, dst, hash, 0, 0) }
+      else { pipeline_ir_consuming_expandable_call_info(rest, needed, facts, functions) }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_clone_call(inst: IrInst, callee: IrFunction, next_value: i64) -> PipelineIrConsumingCloneResult {
+  let args = pipeline_ir_ownership_transfer_call_args(inst)
+  let desired_result = pipeline_ir_ownership_transfer_call_dst_or(inst, 0 - 1)
+  match callee {
+    IrFunction(hash, param_count, blocks, src) -> {
+      if desired_result < 0 or ir_value_list_len(args) != param_count { PipelineIrConsumingCloneInvalid }
+      else { match blocks {
+        IrBlockListCons(block, IrBlockListNil) -> match block {
+          IrBlock(id, params, callee_insts, term) -> {
+            if ir_value_list_len(params) != 0 { PipelineIrConsumingCloneInvalid }
+            else { match term {
+              IrTermReturn(return_value) -> {
+                let cloned = pipeline_ir_inline_clone_inst_list(callee_insts, pipeline_ir_inline_arg_env(args, 0, PipelineIrInlineValueEnvNil), return_value, desired_result, next_value)
+                if pipeline_ir_inline_clone_result_ok(cloned) != 1 { PipelineIrConsumingCloneInvalid }
+                else { PipelineIrConsumingCloneOk(pipeline_ir_inline_clone_result_insts(cloned), pipeline_ir_inline_clone_result_next_value(cloned)) }
+              }
+              _ -> PipelineIrConsumingCloneInvalid
+            } }
+          }
+        }
+        _ -> PipelineIrConsumingCloneInvalid
+      } }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_splice_call(insts: IrInstList, target_dst: i64, target_hash: i64, functions: IrFunctionList, next_value: i64) -> PipelineIrConsumingCloneResult {
+  match insts {
+    IrInstNil -> PipelineIrConsumingCloneInvalid
+    IrInstCons(inst, rest) -> {
+      if pipeline_ir_ownership_transfer_call_dst_or(inst, 0 - 1) == target_dst and pipeline_ir_ownership_transfer_call_hash(inst) == target_hash {
+        match pipeline_ir_function_list_find_hash(functions, target_hash) {
+          IrFunctionCons(callee, IrFunctionNil) -> match pipeline_ir_consuming_clone_call(inst, callee, next_value) {
+            PipelineIrConsumingCloneInvalid -> PipelineIrConsumingCloneInvalid
+            PipelineIrConsumingCloneOk(cloned, next) -> PipelineIrConsumingCloneOk(ir_inst_list_append(cloned, rest), next)
+          }
+          _ -> PipelineIrConsumingCloneInvalid
+        }
+      } else {
+        match pipeline_ir_consuming_splice_call(rest, target_dst, target_hash, functions, next_value) {
+          PipelineIrConsumingCloneInvalid -> PipelineIrConsumingCloneInvalid
+          PipelineIrConsumingCloneOk(rewritten, next) -> PipelineIrConsumingCloneOk(IrInstCons(inst, rewritten), next)
+        }
+      }
+    }
+  }
+}
+
+-- Expand only the fresh producer chain that feeds this result. Each recursive
+-- step removes one named factory boundary; the budget prevents recursive or
+-- malformed fact graphs from cloning indefinitely. At the bottom exactly one
+-- canonical raw allocation must remain on the return provenance path.
+pub(package) fn pipeline_ir_consuming_expand_factory(insts: IrInstList, result_value: i64, source: i64, next_value: i64, facts: PipelineIrSemanticFactList, functions: IrFunctionList, budget: i64) -> PipelineIrConsumingCloneResult {
+  if budget <= 0 { PipelineIrConsumingCloneInvalid }
+  else {
+    let blocks = ir_block_list_prepend(ir_block_new_term(0, insts, IrTermReturn(result_value)), ir_block_list_empty())
+    let needed = pipeline_ir_consuming_needed_values(blocks, facts, next_value)
+    let info = pipeline_ir_consuming_expandable_call_info(insts, needed, facts, functions)
+    if info != 0 {
+      match pipeline_ir_consuming_splice_call(insts, node_f1(info), node_f2(info), functions, next_value) {
+        PipelineIrConsumingCloneInvalid -> PipelineIrConsumingCloneInvalid
+        PipelineIrConsumingCloneOk(rewritten, next) -> pipeline_ir_consuming_expand_factory(rewritten, result_value, source, next, facts, functions, budget - 1)
+      }
+    } else {
+      if pipeline_ir_consuming_raw_root_count(insts, needed) != 1 { PipelineIrConsumingCloneInvalid }
+      else { pipeline_ir_consuming_rewrite_raw_root(insts, needed, source, next_value) }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_expand_call(inst: IrInst, source: i64, next_value: i64, facts: PipelineIrSemanticFactList, functions: IrFunctionList) -> PipelineIrConsumingCloneResult {
+  let hash = pipeline_ir_ownership_transfer_call_hash(inst)
+  match pipeline_ir_function_list_find_hash(functions, hash) {
+    IrFunctionCons(callee, IrFunctionNil) -> match pipeline_ir_consuming_clone_call(inst, callee, next_value) {
+      PipelineIrConsumingCloneInvalid -> PipelineIrConsumingCloneInvalid
+      PipelineIrConsumingCloneOk(cloned, next) -> pipeline_ir_consuming_expand_factory(cloned, pipeline_ir_ownership_transfer_call_dst_or(inst, 0 - 1), source, next, facts, functions, ir_function_list_len(functions) + 1)
+    }
+    _ -> PipelineIrConsumingCloneInvalid
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_rewrite_block_insts(insts: IrInstList, needed: PipelineIrLiveSet, source: i64, facts: PipelineIrSemanticFactList, functions: IrFunctionList, next_value: i64) -> PipelineIrConsumingCloneResult {
+  match insts {
+    IrInstNil -> PipelineIrConsumingCloneOk(IrInstNil, next_value)
+    IrInstCons(inst, rest) -> {
+      let dst = pipeline_ir_ownership_transfer_call_dst_or(inst, 0 - 1)
+      let hash = pipeline_ir_ownership_transfer_call_hash(inst)
+      let fact = pipeline_ir_semantic_fact_find(facts, hash)
+      let eligible = if dst < 0 or hash == 0 or fact == 0 or pipeline_ir_live_set_contains(needed, dst) != 1 { 0 }
+      else { if pipeline_ir_fresh_return_allocator_hash(hash) == 1 or cg_semantic_fact_fresh_managed_return(fact) != 1 { 0 } else { 1 } }
+      let head = if eligible == 1 { pipeline_ir_consuming_expand_call(inst, source, next_value, facts, functions) }
+        else { PipelineIrConsumingCloneOk(IrInstCons(inst, IrInstNil), next_value) }
+      match head {
+        PipelineIrConsumingCloneInvalid -> PipelineIrConsumingCloneInvalid
+        PipelineIrConsumingCloneOk(head_insts, head_next) -> match pipeline_ir_consuming_rewrite_block_insts(rest, needed, source, facts, functions, head_next) {
+          PipelineIrConsumingCloneInvalid -> PipelineIrConsumingCloneInvalid
+          PipelineIrConsumingCloneOk(tail_insts, tail_next) -> PipelineIrConsumingCloneOk(ir_inst_list_append(head_insts, tail_insts), tail_next)
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_rewrite_blocks(blocks: IrBlockList, needed: PipelineIrLiveSet, source: i64, facts: PipelineIrSemanticFactList, functions: IrFunctionList, next_value: i64) -> PipelineIrConsumingBlockResult {
+  match blocks {
+    IrBlockListNil -> PipelineIrConsumingBlocksOk(IrBlockListNil, next_value)
+    IrBlockListCons(block, rest) -> match block {
+      IrBlock(id, params, insts, term) -> {
+        match pipeline_ir_consuming_rewrite_block_insts(insts, needed, source, facts, functions, next_value) {
+          PipelineIrConsumingCloneInvalid -> PipelineIrConsumingBlocksInvalid
+          PipelineIrConsumingCloneOk(rewritten, rewritten_next) -> {
+            let root_count = pipeline_ir_consuming_raw_root_count(rewritten, needed)
+            let rooted = if root_count == 0 { PipelineIrConsumingCloneOk(rewritten, rewritten_next) }
+              else { if root_count == 1 { pipeline_ir_consuming_rewrite_raw_root(rewritten, needed, source, rewritten_next) }
+              else { PipelineIrConsumingCloneInvalid } }
+            match rooted {
+              PipelineIrConsumingCloneInvalid -> PipelineIrConsumingBlocksInvalid
+              PipelineIrConsumingCloneOk(rooted_insts, rooted_next) -> match pipeline_ir_consuming_rewrite_blocks(rest, needed, source, facts, functions, rooted_next) {
+                PipelineIrConsumingBlocksInvalid -> PipelineIrConsumingBlocksInvalid
+                PipelineIrConsumingBlocksOk(rest_blocks, final_next) -> PipelineIrConsumingBlocksOk(IrBlockListCons(IrBlock(id, params, rooted_insts, term), rest_blocks), final_next)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_logical_param_for_lane_insts(insts: IrInstList, param_count: i64, arg_lane: i64, logical_index: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0 - 1
+    IrInstCons(inst, rest) -> match inst {
+      IrBindI64(ns, nl, head, ty) -> {
+        if head >= 0 and head < param_count {
+          let lanes = pipeline_type_value_lane_count_or_one(ty)
+          if arg_lane >= head and arg_lane < head + lanes { logical_index }
+          else { pipeline_ir_consuming_logical_param_for_lane_insts(rest, param_count, arg_lane, logical_index + 1) }
+        } else { pipeline_ir_consuming_logical_param_for_lane_insts(rest, param_count, arg_lane, logical_index) }
+      }
+      _ -> pipeline_ir_consuming_logical_param_for_lane_insts(rest, param_count, arg_lane, logical_index)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_clear_borrow_marker_insts(insts: IrInstList, logical_index: i64) -> IrInstList {
+  match insts {
+    IrInstNil -> IrInstNil
+    IrInstCons(inst, rest) -> match inst {
+      IrSlotI64(slot) -> {
+        if pipeline_ir_borrowed_param_mask_slot_is(slot) == 1 {
+          let mask = pipeline_ir_borrowed_param_mask_slot_decode(slot)
+          let next_mask = mask band (cg_bit(logical_index) bxor (0 - 1))
+          if next_mask == 0 { pipeline_ir_consuming_clear_borrow_marker_insts(rest, logical_index) }
+          else { IrInstCons(IrSlotI64(pipeline_ir_borrowed_param_mask_slot(next_mask)), pipeline_ir_consuming_clear_borrow_marker_insts(rest, logical_index)) }
+        } else { IrInstCons(inst, pipeline_ir_consuming_clear_borrow_marker_insts(rest, logical_index)) }
+      }
+      _ -> IrInstCons(inst, pipeline_ir_consuming_clear_borrow_marker_insts(rest, logical_index))
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_clear_borrow_marker_blocks(blocks: IrBlockList, logical_index: i64, entry: i64) -> IrBlockList {
+  match blocks {
+    IrBlockListNil -> IrBlockListNil
+    IrBlockListCons(block, rest) -> match block {
+      IrBlock(id, params, insts, term) -> {
+        let next_insts = if id == entry { pipeline_ir_consuming_clear_borrow_marker_insts(insts, logical_index) } else { insts }
+        IrBlockListCons(IrBlock(id, params, next_insts, term), pipeline_ir_consuming_clear_borrow_marker_blocks(rest, logical_index, entry))
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_block_has_drop(insts: IrInstList, source: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> match inst {
+      IrCallI64(dst, callee_hash, args) -> {
+        if callee_hash == pipeline_ir_reuse_drop_hash() and ir_value_list_nth_or(args, 0, 0 - 1) == source { 1 }
+        else { pipeline_ir_consuming_block_has_drop(rest, source) }
+      }
+      _ -> pipeline_ir_consuming_block_has_drop(rest, source)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_abort_edge_count(insts: IrInstList, target: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let add = match inst {
+        IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, abort_block) -> if abort_block == target { 1 } else { 0 }
+        _ -> 0
+      }
+      add + pipeline_ir_consuming_abort_edge_count(rest, target)
+    }
+  }
+}
+
+-- Positive means at least one reachable predecessor and all predecessor-out
+-- facts are true; negative records a failing predecessor.
+pub(package) fn pipeline_ir_consuming_predecessor_state(blocks: IrBlockList, target: i64, out: i64, reachable: PipelineIrLiveSet, state: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> state
+    IrBlockListCons(block, rest) -> match block {
+      IrBlock(id, params, insts, term) -> {
+        let edges = pipeline_ir_term_predecessor_count(term, target) + pipeline_ir_consuming_abort_edge_count(insts, target)
+        let next = if edges == 0 or pipeline_ir_live_set_contains(reachable, id) != 1 { state }
+        else { if state < 0 or mem_load64_at(out, id * 8) != 1 { 0 - (if state < 0 { 0 - state } else { state }) - edges }
+        else { state + edges } }
+        pipeline_ir_consuming_predecessor_state(rest, target, out, reachable, next)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_must_step(blocks: IrBlockList, all_blocks: IrBlockList, entry: i64, source: i64, reachable: PipelineIrLiveSet, out: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> match block {
+      IrBlock(id, params, insts, term) -> {
+        let next = if pipeline_ir_live_set_contains(reachable, id) != 1 { 0 }
+        else { if pipeline_ir_consuming_block_has_drop(insts, source) == 1 { 1 }
+        else { if id == entry { 0 }
+        else { if pipeline_ir_consuming_predecessor_state(all_blocks, id, out, reachable, 0) > 0 { 1 } else { 0 } } } }
+        let changed = if mem_load64_at(out, id * 8) == next { 0 } else { mem_store64_at(out, id * 8, next) 1 }
+        changed bor pipeline_ir_consuming_must_step(rest, all_blocks, entry, source, reachable, out)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_seed_must_out(blocks: IrBlockList, entry: i64, source: i64, reachable: PipelineIrLiveSet, out: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> match block {
+      IrBlock(id, params, insts, term) -> {
+        if pipeline_ir_live_set_contains(reachable, id) == 1 {
+          mem_store64_at(out, id * 8, if id == entry { pipeline_ir_consuming_block_has_drop(insts, source) } else { 1 })
+        } else { 0 }
+        pipeline_ir_consuming_seed_must_out(rest, entry, source, reachable, out)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_returns_must_drop(blocks: IrBlockList, reachable: PipelineIrLiveSet, out: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 1
+    IrBlockListCons(block, rest) -> match block {
+      IrBlock(id, params, insts, term) -> {
+        let ok = if pipeline_ir_live_set_contains(reachable, id) != 1 { 1 }
+        else { match term { IrTermReturn(value) -> mem_load64_at(out, id * 8) _ -> 1 } }
+        if ok != 1 { 0 } else { pipeline_ir_consuming_returns_must_drop(rest, reachable, out) }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_function_must_drop(blocks: IrBlockList, source: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(first, rest) -> match first {
+      IrBlock(entry, params, insts, term) -> {
+        let max_id = pipeline_ir_verify_max_block_id(blocks)
+        let reachable = pipeline_ir_reachable_fixpoint(blocks, pipeline_ir_reachable_seed(blocks))
+        let out = alloc_zeroed((max_id + 1) * 8)
+        pipeline_ir_consuming_seed_must_out(blocks, entry, source, reachable, out)
+        let mut changed = 1
+        let mut rounds = 0
+        while changed == 1 and rounds <= max_id + 2 {
+          changed = pipeline_ir_consuming_must_step(blocks, blocks, entry, source, reachable, out)
+          rounds = rounds + 1
+        }
+        pipeline_ir_consuming_returns_must_drop(blocks, reachable, out)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_clone_function(base: IrFunction, clone_hash: i64, arg_lane: i64, facts: PipelineIrSemanticFactList, functions: IrFunctionList) -> IrFunctionList {
+  match base {
+    IrFunction(base_hash, param_count, blocks, src) -> {
+      if pipeline_ir_consuming_function_lane_mode(base, param_count, arg_lane, continuation_cleanup_kind_rc()) != 2 { IrFunctionNil }
+      else { match blocks {
+        IrBlockListNil -> IrFunctionNil
+        IrBlockListCons(entry_block, rest) -> match entry_block {
+          IrBlock(entry, params, insts, term) -> {
+            let logical_index = pipeline_ir_consuming_logical_param_for_lane_insts(insts, param_count, arg_lane, 0)
+            if logical_index < 0 { IrFunctionNil }
+            else {
+              let next_value = pipeline_ir_function_next_value(param_count, blocks)
+              let needed = pipeline_ir_consuming_needed_values(blocks, facts, next_value)
+              match pipeline_ir_consuming_rewrite_blocks(blocks, needed, arg_lane, facts, functions, next_value) {
+                PipelineIrConsumingBlocksInvalid -> IrFunctionNil
+                PipelineIrConsumingBlocksOk(rewritten, next) -> {
+                  let owned_blocks = pipeline_ir_consuming_clear_borrow_marker_blocks(rewritten, logical_index, entry)
+                  if pipeline_ir_consuming_function_must_drop(owned_blocks, arg_lane) != 1 { IrFunctionNil }
+                  else { IrFunctionCons(IrFunction(clone_hash, param_count, owned_blocks, src), IrFunctionNil) }
+                }
+              }
+            }
+          }
+        }
+      } }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_build_clones(requests: i64, index: i64, functions: IrFunctionList, facts: PipelineIrSemanticFactList) -> IrFunctionList {
+  if index >= nlist_len(requests) { IrFunctionNil }
+  else {
+    let request = nlist_get(requests, index)
+    let clone = match pipeline_ir_function_list_find_hash(functions, node_f1(request)) {
+      IrFunctionCons(base, IrFunctionNil) -> pipeline_ir_consuming_clone_function(base, node_f2(request), node_f3(request), facts, functions)
+      _ -> IrFunctionNil
+    }
+    pipeline_ir_function_list_append(clone, pipeline_ir_consuming_build_clones(requests, index + 1, functions, facts))
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_facts_extend(requests: i64, index: i64, valid_clones: IrFunctionList, base_facts: PipelineIrSemanticFactList, facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
+  if index >= nlist_len(requests) { facts }
+  else {
+    let request = nlist_get(requests, index)
+    let clone_hash = node_f2(request)
+    let next = if pipeline_ir_identity_function_hash_exists(valid_clones, clone_hash) != 1 { facts }
+    else {
+      let base_hash = node_f1(request)
+      let fact = pipeline_ir_semantic_fact_find(base_facts, base_hash)
+      if fact == 0 { facts }
+      else { pipeline_ir_semantic_facts_prepend_with_borrow(clone_hash, fact, pipeline_ir_semantic_borrow_fact_find(base_facts, base_hash), facts) }
+    }
+    pipeline_ir_consuming_facts_extend(requests, index + 1, valid_clones, base_facts, next)
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_rewrite_call(inst: IrInst, clone_hash: i64) -> IrInst {
+  match inst {
+    IrCallI64(dst, callee_hash, args) -> IrCallI64(dst, clone_hash, args)
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> IrCallI64(dst, clone_hash, args)
+    _ -> inst
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_rewrite_insts(insts: IrInstList, term: IrTerminator, facts: PipelineIrSemanticFactList, candidates: PipelineIrInlineCandidateList, requests: i64, valid_clones: IrFunctionList) -> IrInstList {
+  match insts {
+    IrInstNil -> IrInstNil
+    IrInstCons(inst, rest) -> {
+      let lane = pipeline_ir_consuming_candidate_lane(inst, rest, term, facts, candidates)
+      let base_hash = pipeline_ir_ownership_transfer_call_hash(inst)
+      let clone_hash = if lane < 0 { 0 } else { pipeline_ir_consuming_request_lookup(requests, base_hash, lane) }
+      if clone_hash != 0 and pipeline_ir_identity_function_hash_exists(valid_clones, clone_hash) == 1 {
+        let args = pipeline_ir_ownership_transfer_call_args(inst)
+        let source = ir_value_list_nth_or(args, lane, 0 - 1)
+        let dst = pipeline_ir_ownership_transfer_call_dst_or(inst, 0 - 1)
+        let marker = IrManagedTransferI64(dst, clone_hash, source, lane, continuation_cleanup_kind_rc())
+        let call = pipeline_ir_consuming_rewrite_call(inst, clone_hash)
+        let tail = pipeline_ir_ownership_transfer_remove_release(rest, source, continuation_cleanup_kind_rc())
+        IrInstCons(marker, IrInstCons(call, pipeline_ir_consuming_rewrite_insts(tail, term, facts, candidates, requests, valid_clones)))
+      } else {
+        IrInstCons(inst, pipeline_ir_consuming_rewrite_insts(rest, term, facts, candidates, requests, valid_clones))
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_rewrite_blocks_final(blocks: IrBlockList, facts: PipelineIrSemanticFactList, candidates: PipelineIrInlineCandidateList, requests: i64, valid_clones: IrFunctionList) -> IrBlockList {
+  match blocks {
+    IrBlockListNil -> IrBlockListNil
+    IrBlockListCons(block, rest) -> match block {
+      IrBlock(id, params, insts, term) -> IrBlockListCons(
+        IrBlock(id, params, pipeline_ir_consuming_rewrite_insts(insts, term, facts, candidates, requests, valid_clones), term),
+        pipeline_ir_consuming_rewrite_blocks_final(rest, facts, candidates, requests, valid_clones)
+      )
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_rewrite_functions(functions: IrFunctionList, facts: PipelineIrSemanticFactList, candidates: PipelineIrInlineCandidateList, requests: i64, valid_clones: IrFunctionList) -> IrFunctionList {
+  match functions {
+    IrFunctionNil -> IrFunctionNil
+    IrFunctionCons(function, rest) -> match function {
+      IrFunction(hash, param_count, blocks, src) -> IrFunctionCons(
+        IrFunction(hash, param_count, pipeline_ir_consuming_rewrite_blocks_final(blocks, facts, candidates, requests, valid_clones), src),
+        pipeline_ir_consuming_rewrite_functions(rest, facts, candidates, requests, valid_clones)
+      )
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_consuming_specialisations_functions(result: PipelineIrConsumingSpecialisations) -> IrFunctionList {
+  match result { PipelineIrConsumingSpecialisations(functions, facts, count) -> functions }
+}
+
+pub(package) fn pipeline_ir_consuming_specialisations_facts(result: PipelineIrConsumingSpecialisations) -> PipelineIrSemanticFactList {
+  match result { PipelineIrConsumingSpecialisations(functions, facts, count) -> facts }
+}
+
+pub(package) fn pipeline_ir_consuming_specialisations_count(result: PipelineIrConsumingSpecialisations) -> i64 {
+  match result { PipelineIrConsumingSpecialisations(functions, facts, count) -> count }
+}
+
+pub(package) fn pipeline_ir_consuming_specialise(functions: IrFunctionList, canonical_functions: IrFunctionList, facts: PipelineIrSemanticFactList, typed_fns: i64, src: i64, tt: i64) -> PipelineIrConsumingSpecialisations {
+  let requests = nlist_new()
+  let candidates = pipeline_ir_consuming_function_candidates(functions, facts)
+  pipeline_ir_consuming_discover_functions(functions, functions, facts, candidates, requests)
+  if nlist_len(requests) == 0 { PipelineIrConsumingSpecialisations(functions, facts, 0) }
+  else {
+    let raw_clones = pipeline_ir_consuming_build_clones(requests, 0, canonical_functions, facts)
+    if ir_function_list_len(raw_clones) == 0 { PipelineIrConsumingSpecialisations(functions, facts, 0) }
+    else {
+      let clone_facts = pipeline_ir_consuming_facts_extend(requests, 0, raw_clones, facts, facts)
+      let clone_universe = pipeline_ir_function_list_append(canonical_functions, raw_clones)
+      let clone_opt = pipeline_optimise_ir_function_list(raw_clones, clone_universe, clone_facts, src, tt)
+      let optimised_clones = pipeline_mem2reg_retighten_function_list(
+        pipeline_mem2reg_function_list(pipeline_optimised_functions_functions(clone_opt)),
+        clone_facts,
+        pipeline_ir_pure_callee_tree(clone_facts)
+      )
+      let rewritten = pipeline_ir_consuming_rewrite_functions(functions, facts, candidates, requests, optimised_clones)
+      let combined = pipeline_ir_function_list_append(rewritten, optimised_clones)
+      let enriched_facts = pipeline_ir_semantic_borrow_values_enrich_functions(clone_facts, combined, typed_fns, tt)
+      PipelineIrConsumingSpecialisations(combined, enriched_facts, ir_function_list_len(optimised_clones))
+    }
+  }
+}
+
 pub(package) fn pipeline_ir_reuse_functions(functions: IrFunctionList) -> IrFunctionList {
   match functions {
     IrFunctionNil -> IrFunctionNil
@@ -53387,13 +54276,24 @@ pub(package) fn pipeline_optimise_typed_ir_with_promotion(typed: TypedModule, ir
       -- deliberately after copy-prop/mem2reg renumbering: consumers see facts
       -- for the SSA values in the module, never stale pre-optimisation ids.
       let final_semantic_facts = pipeline_ir_semantic_borrow_values_enrich_functions(fresh_return_facts, promoted_functions, fns, tt)
+      -- A borrowed persistent update gets a direct-call-only consuming clone
+      -- only after post-mem2reg last-use identities and the canonical fresh
+      -- producer chain agree. The clone owns the unchanged visible argument
+      -- lane, expands just that producer chain, and replaces its allocation
+      -- root with a linear drop/reuse pair. Failed mechanical proofs leave the
+      -- original call and ownership untouched.
+      let consuming = if promote == 1 {
+        pipeline_ir_consuming_specialise(promoted_functions, functions, final_semantic_facts, fns, src, tt)
+      } else { PipelineIrConsumingSpecialisations(promoted_functions, final_semantic_facts, 0) }
+      let consuming_functions = pipeline_ir_consuming_specialisations_functions(consuming)
+      let consuming_facts = pipeline_ir_consuming_specialisations_facts(consuming)
       -- Transfer exact last-use caller stakes only after mem2reg has fixed the
       -- final SSA identities. Generic specialisations and their substituted
       -- semantic facts already exist here, so the marker records the concrete
       -- mono hash rather than a template name.
       let transferred_functions = if promote == 1 {
-        pipeline_ir_ownership_transfer_functions(promoted_functions, promoted_functions, final_semantic_facts)
-      } else { promoted_functions }
+        pipeline_ir_ownership_transfer_functions(consuming_functions, consuming_functions, consuming_facts)
+      } else { consuming_functions }
       -- Reuse consumes the post-mem2reg SSA shape. The pre-promotion entry is
       -- intentionally an optimiser-only observation point and must retain its
       -- bounded per-function scratch contract.
@@ -53406,7 +54306,7 @@ pub(package) fn pipeline_optimise_typed_ir_with_promotion(typed: TypedModule, ir
         pipeline_optimised_functions_const_fold_sites(opt),
         pipeline_optimised_functions_algebraic_fold_sites(opt),
         pipeline_optimised_functions_dead_inst_sites(opt),
-        final_semantic_facts,
+        consuming_facts,
         pipeline_optimised_functions_pure_call_dce_sites(opt),
         0,
         pipeline_optimised_functions_block_entry_narrowing_sites(opt),
