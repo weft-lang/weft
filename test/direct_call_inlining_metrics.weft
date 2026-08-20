@@ -2,6 +2,7 @@ use runtime/alloc.{*}
 use runtime/memory.{*}
 -- test/direct_call_inlining_metrics.weft -- native evidence for tiny pure direct-call inlining
 
+use stdlib/vector.{*}
 use compiler/codegen.{*}
 use compiler/typeck.{*}
 use compiler/macho.{*}
@@ -9,6 +10,7 @@ use compiler/object.{*}
 use compiler/ir.{*}
 use compiler/grammar.{*}
 use compiler/pipeline.{*}
+use compiler/type_registry.{*}
 
 fn direct_inline_metric_native(src: str) -> NativeModule {
   let typed = pipeline_check_source_with_origin(__str_ptr(src), __str_len(src), 1, 0)
@@ -31,6 +33,55 @@ fn direct_inline_metric_alias_count(src: str) -> i64 {
 
 fn direct_inline_metric_spill_value_count(src: str) -> i64 {
   pipeline_native_register_spill_value_count(direct_inline_metric_native(src))
+}
+
+fn direct_inline_metric_optimised(src: str) -> IrModule {
+  let typed = pipeline_check_source_with_origin(__str_ptr(src), __str_len(src), 1, 0)
+  pipeline_optimise_typed_ir(typed, pipeline_lower_ir(typed))
+}
+
+fn direct_inline_metric_inst_call_count(insts: IrInstList, callee_hash: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let this = match inst {
+        IrCallI64(dst, actual_hash, args) -> if actual_hash == callee_hash { 1 } else { 0 }
+        _ -> 0
+      }
+      this + direct_inline_metric_inst_call_count(rest, callee_hash)
+    }
+  }
+}
+
+fn direct_inline_metric_block_call_count(blocks: IrBlockList, callee_hash: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> direct_inline_metric_inst_call_count(insts, callee_hash) + direct_inline_metric_block_call_count(rest, callee_hash)
+      }
+    }
+  }
+}
+
+fn direct_inline_metric_named_call_count(src: str, host_name: str, callee_name: str) -> i64 {
+  let functions = pipeline_ir_functions(direct_inline_metric_optimised(src))
+  let host_hash = str_hash(__str_ptr(host_name), 0, __str_len(host_name))
+  let callee_hash = str_hash(__str_ptr(callee_name), 0, __str_len(callee_name))
+  match pipeline_ir_function_list_find_hash(functions, host_hash) {
+    IrFunctionNil -> 0 - 1
+    IrFunctionCons(host, rest) -> {
+      match host {
+        IrFunction(hash, param_count, blocks, host_src) -> direct_inline_metric_block_call_count(blocks, callee_hash)
+      }
+    }
+  }
+}
+
+fn direct_inline_metric_named_tag_count(src: str, host_name: str, tag: i64) -> i64 {
+  let functions = pipeline_ir_functions(direct_inline_metric_optimised(src))
+  let host_hash = str_hash(__str_ptr(host_name), 0, __str_len(host_name))
+  ir_function_list_count_tag(pipeline_ir_function_list_find_hash(functions, host_hash), tag)
 }
 
 test "direct_call_inline_metric_inlines_multiple_tiny_arithmetic_sites" {
@@ -79,6 +130,18 @@ test "direct_call_inline_metric_inlines_control_flow_helper" {
   -- helpers; the old "control flow keeps the call" limitation is gone.
   let src = "fn clamp_positive(x: i64) -> i64 { if x > 0 { x } else { 0 } } fn main() -> i64 { clamp_positive(3) }"
   Test.assert_eq(direct_inline_metric_count(src), 1)
+}
+
+test "direct_call_inline_metric_inlines_typed_vector_get_wrapper" {
+  let src = "use stdlib/vector.{*} fn metric_vector_at(values: Vector<i64>, index: i64) -> i64 { vector_get<i64>(values, index, 0 - 7) } fn metric_sum(values: Vector<i64>, n: i64) -> i64 { let mut i = 0 let mut total = 0 while i < n { total = total + metric_vector_at(values, i) i = i + 1 } total } fn main(values: Vector<i64>, n: i64) -> i64 { metric_sum(values, n) }"
+  Test.assert_eq(direct_inline_metric_named_call_count(src, "metric_sum", "metric_vector_at"), 0)
+  Test.assert_eq(direct_inline_metric_named_tag_count(src, "metric_sum", 28), 1)
+}
+
+test "direct_call_inline_metric_inlines_typed_vector_set_wrapper" {
+  let src = "use stdlib/vector.{*} fn metric_vector_put(values: Vector<i64>, index: i64, value: i64) -> i64 { vector_set<i64>(values, index, value) } fn metric_fill(values: Vector<i64>, n: i64) -> i64 { let mut i = 0 let mut status = 1 while i < n { status = metric_vector_put(values, i, i + 10) i = i + 1 } status } fn main(values: Vector<i64>, n: i64) -> i64 { metric_fill(values, n) }"
+  Test.assert_eq(direct_inline_metric_named_call_count(src, "metric_fill", "metric_vector_put"), 0)
+  Test.assert_eq(direct_inline_metric_named_tag_count(src, "metric_fill", 29), 1)
 }
 
 test "direct_call_inline_metric_keeps_recursive_control_flow_helper_as_call" {
@@ -151,6 +214,14 @@ fn inline_sqrt_f64(x: f64) -> f64 {
   __f64_sqrt(x)
 }
 
+fn inline_vector_get_i64(values: Vector<i64>, index: i64, fallback: i64) -> i64 {
+  vector_get<i64>(values, index, fallback)
+}
+
+fn inline_vector_set_i64(values: Vector<i64>, index: i64, value: i64) -> i64 {
+  vector_set<i64>(values, index, value)
+}
+
 fn inline_bump_to_nine_f64(p: i64) -> f64 {
   mem_store64(p, mem_load64(p) + 1)
   9.0
@@ -193,4 +264,18 @@ test "direct_call_inline_runtime_f64_sqrt_evaluates_argument_once" {
   Test.assert_eq(inline_f64_same(got, 3.0), 1)
   Test.assert_eq(mem_load64(p), 1)
   arena_free(arena)
+}
+
+test "direct_call_inline_runtime_vector_wrappers_preserve_checks" {
+  let values = vector_with_capacity<i64>(2)
+  vector_push<i64>(values, 11)
+  vector_push<i64>(values, 22)
+  Test.assert_eq(inline_vector_get_i64(values, 1, 99), 22)
+  Test.assert_eq(inline_vector_get_i64(values, 0 - 1, 99), 99)
+  Test.assert_eq(inline_vector_get_i64(values, 2, 99), 99)
+  Test.assert_eq(inline_vector_set_i64(values, 1, 41), 1)
+  Test.assert_eq(inline_vector_set_i64(values, 0 - 1, 7), 0)
+  Test.assert_eq(inline_vector_set_i64(values, 2, 7), 0)
+  Test.assert_eq(vector_get<i64>(values, 0, 0), 11)
+  Test.assert_eq(vector_get<i64>(values, 1, 0), 41)
 }
