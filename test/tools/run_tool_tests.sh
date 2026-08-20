@@ -22,6 +22,7 @@ tmp_fake_weft=$(mktemp /tmp/weft_tool_fake_weft_XXXXXX)
 tmp_test_fail_one=$(mktemp /tmp/weft_tool_test_fail_one_XXXXXX.weft)
 tmp_test_fail_two=$(mktemp /tmp/weft_tool_test_fail_two_XXXXXX.weft)
 tmp_test_after=$(mktemp /tmp/weft_tool_test_after_XXXXXX.weft)
+tmp_test_timeout=$(mktemp /tmp/weft_tool_test_timeout_XXXXXX.weft)
 tmp_test_parse_fail=$(mktemp /tmp/weft_tool_a_parse_fail_XXXXXX.weft)
 tmp_test_shared_one=$(mktemp /tmp/weft_tool_shared_one_XXXXXX.weft)
 tmp_test_shared_two=$(mktemp /tmp/weft_tool_shared_two_XXXXXX.weft)
@@ -38,7 +39,7 @@ tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_fmt_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_timeout" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_fmt_dir"' EXIT
 
 now_s() {
   date +%s
@@ -2841,6 +2842,7 @@ test_path_native_err=$(<"$tmp_err")
 assert_contains "test_path_native_reports_pass" "$test_path_native_err" "  pass: $tmp_src ("
 assert_contains "test_path_native_reports_summary" "$test_path_native_err" "1 passed, 0 failed"
 assert_contains "test_path_native_consumes_structured_result" "$test_path_native_err" "WEFT_TEST_RESULT 1 1 0 1"
+assert_not_contains "test_path_native_omits_metrics_by_default" "$test_path_native_err" "WEFT_TEST_METRICS"
 
 printf 'test "first failure" { Test.assert_eq(1, 2) }\n' > "$tmp_test_fail_one"
 printf 'test "second failure" { Test.assert_true(false) }\n' > "$tmp_test_fail_two"
@@ -2859,6 +2861,54 @@ assert_contains "test_path_native_reports_first_failure" "$test_path_multi_err" 
 assert_contains "test_path_native_continues_after_failure" "$test_path_multi_err" "  pass: $tmp_test_after ("
 assert_contains "test_path_native_reports_second_failure" "$test_path_multi_err" "  FAIL: $tmp_test_fail_two ("
 assert_contains "test_path_native_aggregates_summary" "$test_path_multi_err" "1 passed, 2 failed"
+
+export WEFT_TEST_METRICS=1
+set +e
+run_weft_compile_guarded "$WEFT" test --jobs 1 "$tmp_test_after" > "$tmp_out" 2>"$tmp_err"
+test_metrics_exit=$?
+set -e
+unset WEFT_TEST_METRICS
+assert_equals "test_metrics_exit_zero" "$test_metrics_exit" "0"
+test_metrics_err=$(<"$tmp_err")
+test_metrics_line=$(grep '^WEFT_TEST_METRICS ' "$tmp_err")
+read -r metric_tag metric_version metric_roots metric_measured metric_wall metric_discovery metric_planning metric_compile metric_link metric_run metric_user metric_system metric_peak metric_extra <<< "$test_metrics_line"
+assert_equals "test_metrics_machine_schema_version" "$metric_tag:$metric_version" "WEFT_TEST_METRICS:1"
+assert_equals "test_metrics_machine_counts_root" "$metric_roots:$metric_measured" "1:1"
+assert_equals "test_metrics_machine_schema_has_exact_fields" "$metric_extra" ""
+if [[ "$metric_wall" =~ ^[0-9]+$ ]] && [[ "$metric_compile" =~ ^[0-9]+$ ]] && [[ "$metric_user" =~ ^[0-9]+$ ]] && [[ "$metric_peak" =~ ^[0-9]+$ ]] && [ "$metric_wall" -gt 0 ] && [ "$metric_compile" -gt 0 ] && [ "$metric_user" -gt 0 ] && [ "$metric_peak" -gt 0 ]; then
+  echo "  ok test_metrics_machine_reports_positive_resources"
+else
+  echo "  fail test_metrics_machine_reports_positive_resources"
+  echo "    metrics: $test_metrics_line"
+  exit 1
+fi
+assert_contains "test_metrics_human_summary_names_phase_and_resource_fields" "$test_metrics_err" "test metrics: roots=1 measured=1 wall_ms="
+
+printf 'test "timeout" { while true { Test.assert_eq(1, 1) } }\n' > "$tmp_test_timeout"
+set +e
+env WEFT_TEST_COMPILE_TIMEOUT=30 WEFT_TEST_RUN_TIMEOUT=1 "$WEFT" test --jobs 1 "$tmp_test_timeout" > "$tmp_out" 2>"$tmp_err"
+test_timeout_exit=$?
+set -e
+assert_equals "test_timeout_returns_failure" "$test_timeout_exit" "1"
+test_timeout_err=$(<"$tmp_err")
+assert_contains "test_timeout_preserves_exact_worker_status" "$test_timeout_err" "  FAIL: $tmp_test_timeout ("
+assert_contains "test_timeout_reports_reason" "$test_timeout_err" ", timeout)"
+
+set +e
+env WEFT_TEST_COMPILE_RSS_LIMIT_KB=1 "$WEFT" test --jobs 1 "$tmp_test_after" > "$tmp_out" 2>"$tmp_err"
+test_rss_exit=$?
+set -e
+assert_equals "test_rss_limit_returns_failure" "$test_rss_exit" "1"
+test_rss_err=$(<"$tmp_err")
+assert_contains "test_rss_limit_reports_peak_and_limit" "$test_rss_err" "KB exceeded limit"
+assert_contains "test_rss_limit_reports_failed_summary" "$test_rss_err" "0 passed, 1 failed"
+
+set +e
+env WEFT_TEST_COMPILE_RSS_LIMIT_KB=1 "$WEFT" test --jobs 1 "$tmp_test_fail_one" > "$tmp_out" 2>"$tmp_err"
+test_failure_rss_exit=$?
+set -e
+assert_equals "test_semantic_failure_with_rss_overage_returns_failure" "$test_failure_rss_exit" "1"
+assert_not_contains_file "test_semantic_failure_precedes_rss_overage" "$tmp_err" "peak RSS"
 
 printf 'pub fn shared_value() -> i64 { 42 }\n' > "$tmp_test_shared_support"
 printf 'use module_fixtures/%s.{shared_value} test "shared one" { Test.assert_eq(shared_value(), 42) }\n' "$tmp_test_shared_module" > "$tmp_test_shared_one"
@@ -3179,4 +3229,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 897 passed, 0 failed"
+echo "Tool boundary summary: 912 passed, 0 failed"
