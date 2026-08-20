@@ -22,138 +22,39 @@ WEFT_TEST_JOBS=${WEFT_TEST_JOBS:-$(default_test_jobs)}
 PASS=0
 FAIL=0
 ERRORS=""
+NAMES=()
+FILES=()
+PATTERNS=()
+EXPECTED_ERRORS=()
+OUTPUTS=()
 
 export WEFT
 export WEFT_TEST_COMPILE_TIMEOUT
 export WEFT_TEST_COMPILE_RSS_LIMIT_KB
-
-now_s() {
-  date +%s
-}
-
-run_guarded() {
-  local timeout_s="$1"
-  local rss_limit_kb="$2"
-  shift 2
-
-  "$@" <&0 &
-  local pid=$!
-  local start
-  start=$(now_s)
-  local polls=0
-
-  while kill -0 "$pid" 2>/dev/null; do
-    local stat
-    stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
-    if [[ "$stat" == Z* ]]; then
-      break
-    fi
-
-    local rss
-    rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
-    if [ -n "$rss" ] && [ "$rss" -gt "$rss_limit_kb" ]; then
-      kill "$pid" 2>/dev/null || true
-      sleep 1
-      kill -9 "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-      return 125
-    fi
-
-    local elapsed
-    elapsed=$(($(now_s) - start))
-    if [ "$elapsed" -ge "$timeout_s" ]; then
-      kill "$pid" 2>/dev/null || true
-      sleep 1
-      kill -9 "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-      return 124
-    fi
-
-    # Fine-grained polling early: each negative case is a sub-second
-    # `weft check`, and a 1s quantum billed 349 cases ~6 minutes of
-    # pure sleep. Long-running processes fall back to 1s polls.
-    polls=$((polls+1))
-    if [ "$polls" -le 20 ]; then
-      sleep 0.1
-    else
-      sleep 1
-    fi
-  done
-
-  wait "$pid"
-}
-
-# ---------------------------------------------------------------------------
-# Worker mode: `bash run_negative_tests.sh __worker <jobfile>` runs ONE
-# check (jobfile lines: name / file / pattern / optional checker error count),
-# streams its ✓/✗ line, and
-# writes a .meta (pass|fail) + .err record beside the jobfile. Always
-# exits 0; the parent aggregates in job order.
-# ---------------------------------------------------------------------------
-if [ "${1:-}" = "__worker" ]; then
-  jobf="$2"
-  name=$(sed -n 1p "$jobf")
-  file=$(sed -n 2p "$jobf")
-  pattern=$(sed -n 3p "$jobf")
-  expected_errors=$(sed -n 4p "$jobf")
-
-  set +e
-  out=$(run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" check "$file" 2>&1 >/dev/null)
-  status=$?
-  set -e
-  if [ "$status" -eq 124 ]; then
-    echo "  ✗ $name"
-    echo "  $name: checker timed out" > "$jobf.err"
-    echo "fail" > "$jobf.meta"
-    exit 0
-  fi
-  if [ "$status" -eq 125 ]; then
-    echo "  ✗ $name"
-    echo "  $name: checker exceeded ${WEFT_TEST_COMPILE_RSS_LIMIT_KB} KB RSS" > "$jobf.err"
-    echo "fail" > "$jobf.meta"
-    exit 0
-  fi
-  match_count=$(echo "$out" | grep -F -c "$pattern" || true)
-  exact_errors=1
-  if [ -n "$expected_errors" ] && ! echo "$out" | grep -q "check: .* $expected_errors errors"; then exact_errors=0; fi
-  if [ "$match_count" -gt 0 ] && [ "$exact_errors" -eq 1 ]; then
-    echo "  ✓ $name"
-    echo "pass" > "$jobf.meta"
-  else
-    echo "  ✗ $name"
-    if [ -n "$expected_errors" ]; then
-      echo "  $name: expected diagnostic '$pattern' with exactly $expected_errors checker error(s)" > "$jobf.err"
-    else
-      echo "  $name: expected diagnostic '$pattern'" > "$jobf.err"
-    fi
-    echo "fail" > "$jobf.meta"
-  fi
-  exit 0
-fi
 
 CENSUS_ONLY=0
 if [ "${1:-}" = "__census" ]; then
   CENSUS_ONLY=1
 fi
 
-JOBS_DIR=""
 if [ "$CENSUS_ONLY" -eq 0 ]; then
   echo "=== Negative Test Suite ==="
   echo ""
-  JOBS_DIR=$(mktemp -d /tmp/weft_negative_XXXXXX)
 fi
 JOB_N=0
 
-# Enqueue only — the call sites below stay declarative; the pool at the
-# end runs them WEFT_TEST_JOBS wide through worker mode.
+# Register only. One public multi-root project check below owns every source,
+# runs bounded root workers, and replays diagnostics in this exact order.
 check_rejects() {
-  JOB_N=$((JOB_N+1))
   if [ "$CENSUS_ONLY" -eq 1 ]; then
+    JOB_N=$((JOB_N+1))
     return
   fi
-  local jf
-  jf=$(printf '%s/job_%04d' "$JOBS_DIR" "$JOB_N")
-  printf '%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${4:-}" > "$jf"
+  NAMES[$JOB_N]="$1"
+  FILES[$JOB_N]="$2"
+  PATTERNS[$JOB_N]="$3"
+  EXPECTED_ERRORS[$JOB_N]="${4:-}"
+  JOB_N=$((JOB_N+1))
 }
 
 check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -[Log]> i64`'
@@ -879,24 +780,59 @@ if [ "$CENSUS_ONLY" -eq 1 ]; then
   exit 0
 fi
 
-ls "$JOBS_DIR"/job_???? | xargs -n1 -P "$WEFT_TEST_JOBS" bash "$0" __worker || true
+BATCH_OUTPUT=$(mktemp /tmp/weft_negative_batch_XXXXXX)
+trap 'rm -f "$BATCH_OUTPUT"' EXIT
+set +e
+"$WEFT" check --jobs "$WEFT_TEST_JOBS" "${FILES[@]}" > /dev/null 2> "$BATCH_OUTPUT"
+BATCH_STATUS=$?
+set -e
 
-ji=1
-while [ "$ji" -le "$JOB_N" ]; do
-  jf=$(printf '%s/job_%04d' "$JOBS_DIR" "$ji")
-  if [ -f "$jf.meta" ] && [ "$(cat "$jf.meta")" = "pass" ]; then
+# The compiler's canonical root headers make the human diagnostic stream a
+# deterministic sequence without sacrificing the exact rendered messages
+# these regressions pin.
+SECTION=-1
+NEXT_SECTION=0
+while IFS= read -r line || [ -n "$line" ]; do
+  if [ "$NEXT_SECTION" -lt "$JOB_N" ] && [ "$line" = "==> ${FILES[$NEXT_SECTION]} <==" ]; then
+    SECTION=$NEXT_SECTION
+    NEXT_SECTION=$((NEXT_SECTION+1))
+  elif [ "$SECTION" -ge 0 ]; then
+    OUTPUTS[$SECTION]="${OUTPUTS[$SECTION]}${line}"$'\n'
+  else
+    ERRORS="$ERRORS\n  batch checker emitted output before the first root boundary"
+  fi
+done < "$BATCH_OUTPUT"
+
+if [ "$NEXT_SECTION" -ne "$JOB_N" ]; then
+  ERRORS="$ERRORS\n  batch checker returned $NEXT_SECTION of $JOB_N root sections (exit $BATCH_STATUS)"
+fi
+
+ji=0
+while [ "$ji" -lt "$JOB_N" ]; do
+  name=${NAMES[$ji]}
+  pattern=${PATTERNS[$ji]}
+  expected_errors=${EXPECTED_ERRORS[$ji]}
+  out=${OUTPUTS[$ji]}
+  diagnostic_match=0
+  if [[ "$out" == *"$pattern"* ]]; then diagnostic_match=1; fi
+  exact_errors=1
+  if [ -n "$expected_errors" ] && [[ "$out" != *"check: "*" $expected_errors errors"* ]]; then exact_errors=0; fi
+  if [ "$diagnostic_match" -eq 1 ] && [ "$exact_errors" -eq 1 ]; then
+    echo "  ✓ $name"
     PASS=$((PASS+1))
   else
+    echo "  ✗ $name"
     FAIL=$((FAIL+1))
-    if [ -f "$jf.err" ]; then
-      ERRORS="$ERRORS\n$(cat "$jf.err")"
+    if [ -n "$expected_errors" ]; then
+      ERRORS="$ERRORS\n  $name: expected diagnostic '$pattern' with exactly $expected_errors checker error(s)"
     else
-      ERRORS="$ERRORS\n  $(sed -n 1p "$jf"): worker produced no result"
+      ERRORS="$ERRORS\n  $name: expected diagnostic '$pattern'"
     fi
   fi
   ji=$((ji+1))
 done
-rm -rf "$JOBS_DIR"
+rm -f "$BATCH_OUTPUT"
+trap - EXIT
 
 echo ""
 echo "=== Negative Summary ==="
