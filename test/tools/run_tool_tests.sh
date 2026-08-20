@@ -2844,6 +2844,32 @@ assert_contains "test_path_native_reports_summary" "$test_path_native_err" "1 pa
 assert_contains "test_path_native_consumes_structured_result" "$test_path_native_err" "WEFT_TEST_RESULT 1 1 0 1"
 assert_not_contains "test_path_native_omits_metrics_by_default" "$test_path_native_err" "WEFT_TEST_METRICS"
 
+printf 'test "mixed modern root" { Test.assert_eq(6 * 7, 42) }\n' > "$tmp_test_shared_two"
+set +e
+run_weft_compile_guarded "$WEFT" test --jobs 2 test/parse_test.weft "$tmp_test_shared_two" > "$tmp_out" 2> "$tmp_err"
+test_legacy_mixed_exit=$?
+set -e
+assert_equals "test_legacy_expected_exit_mixes_with_modern_root" "$test_legacy_mixed_exit" "0"
+assert_contains "test_legacy_expected_exit_reports_pass" "$(<"$tmp_err")" "  pass: test/parse_test.weft ("
+assert_contains "test_legacy_expected_exit_supplies_eof_stdin" "$(<"$tmp_err")" "2 passed, 0 failed"
+assert_contains "test_legacy_mixed_root_preserves_structured_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
+
+printf '%s\n' '-- Expected exit code: 41' 'fn main() -> i64 { 42 }' > "$tmp_test_shared_one"
+set +e
+run_weft_compile_guarded "$WEFT" test --jobs 1 "$tmp_test_shared_one" > "$tmp_out" 2> "$tmp_err"
+test_legacy_mismatch_exit=$?
+set -e
+assert_equals "test_legacy_expected_exit_mismatch_fails" "$test_legacy_mismatch_exit" "1"
+assert_contains "test_legacy_expected_exit_mismatch_is_exact" "$(<"$tmp_err")" "legacy main exited 42, expected 41"
+
+printf '%s\n' '-- Expected exit code: 124' 'fn main() -> i64 { 42 }' > "$tmp_test_shared_one"
+set +e
+run_weft_compile_guarded "$WEFT" test --jobs 1 "$tmp_test_shared_one" > "$tmp_out" 2> "$tmp_err"
+test_legacy_malformed_exit=$?
+set -e
+assert_equals "test_legacy_reserved_status_is_rejected" "$test_legacy_malformed_exit" "1"
+assert_contains "test_legacy_reserved_status_explains_range" "$(<"$tmp_err")" "malformed legacy expected-exit directive (use 0..123)"
+
 printf 'test "first failure" { Test.assert_eq(1, 2) }\n' > "$tmp_test_fail_one"
 printf 'test "second failure" { Test.assert_true(false) }\n' > "$tmp_test_fail_two"
 printf 'effect Maybe { fn none() -> i64 } fn local_maybe() -[Maybe]> i64 { Maybe.none() } test "runs after failure" { Test.assert_eq(handle local_maybe() { Maybe.none() -> 42 }, 42) }\n' > "$tmp_test_after"
@@ -3229,4 +3255,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 912 passed, 0 failed"
+echo "Tool boundary summary: 920 passed, 0 failed"
