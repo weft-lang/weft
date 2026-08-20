@@ -28,6 +28,7 @@ tmp_test_shared_one=$(mktemp /tmp/weft_tool_shared_one_XXXXXX.weft)
 tmp_test_shared_two=$(mktemp /tmp/weft_tool_shared_two_XXXXXX.weft)
 tmp_check_clean=$(mktemp /tmp/weft_tool_check_clean_XXXXXX.weft)
 tmp_check_fail=$(mktemp /tmp/weft_tool_check_fail_XXXXXX.weft)
+tmp_rc_census_src=$(mktemp /tmp/weft_tool_rc_census_XXXXXX.weft)
 tmp_test_shared_module="_weft_tool_test_shared_$$"
 tmp_test_shared_support="module_fixtures/${tmp_test_shared_module}.weft"
 tmp_test_dir=$(mktemp -d /tmp/weft_tool_test_dir_XXXXXX)
@@ -42,7 +43,7 @@ tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_timeout" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_check_clean" "$tmp_check_fail" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_timeout" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_check_clean" "$tmp_check_fail" "$tmp_rc_census_src" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir"' EXIT
 
 now_s() {
   date +%s
@@ -1009,6 +1010,59 @@ compile_metrics_extra_exit=$?
 set -e
 assert_equals "compile_metrics_extra_path_exits_usage" "$compile_metrics_extra_exit" "2"
 assert_contains "compile_metrics_extra_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics] PATH"
+
+printf 'type CensusBox { value: i64 } fn main() -> i64 { let box = CensusBox { value: 42 } box.value }\n' > "$tmp_rc_census_src"
+set +e
+run_weft_compile_guarded "$WEFT" compile --rc-census "$tmp_rc_census_src" > "$tmp_out" 2> "$tmp_err"
+compile_rc_census_exit=$?
+set -e
+assert_equals "compile_rc_census_exit_zero" "$compile_rc_census_exit" "0"
+rc_site_line=$(grep '^WEFT_RC_SITE_CENSUS ' "$tmp_err")
+read -r rc_site_tag rc_site_version rc_site_counted rc_site_stack rc_site_region rc_site_arena rc_site_reuse rc_site_unique rc_site_owned rc_site_frozen rc_site_promotions rc_site_total rc_site_extra <<< "$rc_site_line"
+assert_equals "compile_rc_census_site_schema_version" "$rc_site_tag:$rc_site_version" "WEFT_RC_SITE_CENSUS:1"
+assert_equals "compile_rc_census_site_schema_has_exact_fields" "$rc_site_extra" ""
+if [[ "$rc_site_counted" =~ ^[0-9]+$ && "$rc_site_stack" =~ ^[0-9]+$ && "$rc_site_region" =~ ^[0-9]+$ && "$rc_site_arena" =~ ^[0-9]+$ && "$rc_site_reuse" =~ ^[0-9]+$ && "$rc_site_unique" =~ ^[0-9]+$ && "$rc_site_owned" =~ ^[0-9]+$ && "$rc_site_frozen" =~ ^[0-9]+$ && "$rc_site_promotions" =~ ^[0-9]+$ && "$rc_site_total" =~ ^[0-9]+$ ]] && [ "$rc_site_counted" -gt 0 ] && [ "$rc_site_total" -ge "$rc_site_counted" ]; then
+  echo "  ok compile_rc_census_site_fields_are_numeric_and_populated"
+else
+  echo "  fail compile_rc_census_site_fields_are_numeric_and_populated"
+  echo "    census: $rc_site_line"
+  exit 1
+fi
+assert_contains "compile_rc_census_site_human_names_classes" "$(<"$tmp_err")" "rc site census: counted="
+
+chmod +x "$tmp_out"
+set +e
+run_binary_guarded "$tmp_out" >/dev/null 2> "$tmp_err"
+compile_rc_census_binary_exit=$?
+set -e
+assert_equals "compile_rc_census_binary_preserves_exit" "$compile_rc_census_binary_exit" "42"
+rc_dynamic_line=$(grep '^WEFT_RC_CENSUS ' "$tmp_err")
+read -r rc_dynamic_tag rc_dynamic_version rc_dynamic_alloc rc_dynamic_retain rc_dynamic_release rc_dynamic_child rc_dynamic_promoted_retain rc_dynamic_promoted_release rc_dynamic_closure_retain rc_dynamic_closure_release rc_dynamic_closure_promoted_release rc_dynamic_weak_retain rc_dynamic_weak_release rc_dynamic_weak_load rc_dynamic_region_alloc rc_dynamic_promotions rc_dynamic_extra <<< "$rc_dynamic_line"
+assert_equals "compile_rc_census_dynamic_schema_version" "$rc_dynamic_tag:$rc_dynamic_version" "WEFT_RC_CENSUS:1"
+assert_equals "compile_rc_census_dynamic_schema_has_exact_fields" "$rc_dynamic_extra" ""
+if [[ "$rc_dynamic_alloc" =~ ^[0-9]+$ && "$rc_dynamic_retain" =~ ^[0-9]+$ && "$rc_dynamic_release" =~ ^[0-9]+$ && "$rc_dynamic_child" =~ ^[0-9]+$ && "$rc_dynamic_promoted_retain" =~ ^[0-9]+$ && "$rc_dynamic_promoted_release" =~ ^[0-9]+$ && "$rc_dynamic_closure_retain" =~ ^[0-9]+$ && "$rc_dynamic_closure_release" =~ ^[0-9]+$ && "$rc_dynamic_closure_promoted_release" =~ ^[0-9]+$ && "$rc_dynamic_weak_retain" =~ ^[0-9]+$ && "$rc_dynamic_weak_release" =~ ^[0-9]+$ && "$rc_dynamic_weak_load" =~ ^[0-9]+$ && "$rc_dynamic_region_alloc" =~ ^[0-9]+$ && "$rc_dynamic_promotions" =~ ^[0-9]+$ ]] && [ "$rc_dynamic_alloc" -gt 0 ] && [ "$rc_dynamic_release" -gt 0 ]; then
+  echo "  ok compile_rc_census_dynamic_fields_are_numeric_and_populated"
+else
+  echo "  fail compile_rc_census_dynamic_fields_are_numeric_and_populated"
+  echo "    census: $rc_dynamic_line"
+  exit 1
+fi
+assert_contains "compile_rc_census_dynamic_human_names_events" "$(<"$tmp_err")" "rc census: default_alloc="
+
+set +e
+"$WEFT" compile --rc-census > "$tmp_out" 2> "$tmp_err"
+compile_rc_census_missing_exit=$?
+set -e
+assert_equals "compile_rc_census_missing_path_exits_usage" "$compile_rc_census_missing_exit" "2"
+assert_equals "compile_rc_census_missing_path_stdout_empty" "$(<"$tmp_out")" ""
+assert_contains "compile_rc_census_missing_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics|--rc-census] PATH"
+
+set +e
+"$WEFT" compile --rc-census "$tmp_rc_census_src" "$tmp_check_clean" > "$tmp_out" 2> "$tmp_err"
+compile_rc_census_extra_exit=$?
+set -e
+assert_equals "compile_rc_census_extra_path_exits_usage" "$compile_rc_census_extra_exit" "2"
+assert_contains "compile_rc_census_extra_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics|--rc-census] PATH"
 
 assert_program_failure_contains "panic_boundary" "test/panic_exit.weft" "101" "weft: panic: direct panic boundary"
 assert_program_failure_contains "checked_index_bounds_panic" "test/array_index_oob_exit.weft" "101" "weft: panic: index out of bounds"
