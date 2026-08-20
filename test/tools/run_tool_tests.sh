@@ -31,6 +31,7 @@ tmp_check_fail=$(mktemp /tmp/weft_tool_check_fail_XXXXXX.weft)
 tmp_test_shared_module="_weft_tool_test_shared_$$"
 tmp_test_shared_support="module_fixtures/${tmp_test_shared_module}.weft"
 tmp_test_dir=$(mktemp -d /tmp/weft_tool_test_dir_XXXXXX)
+tmp_check_dir=$(mktemp -d /tmp/weft_tool_check_dir_XXXXXX)
 tmp_fmt_dir=$(mktemp -d /tmp/weft_tool_fmt_dir_XXXXXX)
 tmp_pkg_dir=$(mktemp -d /tmp/weft_tool_pkg_XXXXXX)
 tmp_pkg_cli_dir=$(mktemp -d /tmp/weft_tool_pkg_cli_XXXXXX)
@@ -41,7 +42,7 @@ tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_timeout" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_check_clean" "$tmp_check_fail" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_fmt_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_timeout" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_check_clean" "$tmp_check_fail" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir"' EXIT
 
 now_s() {
   date +%s
@@ -906,9 +907,9 @@ assert_contains "check_path_parse_and_typecheck" "$check_path_out" "check: 1 fun
 
 printf 'fn clean() -> i64 { 42 }\n' > "$tmp_check_clean"
 printf 'fn first_bad() -> i64 { missing_first }\n' > "$tmp_check_fail"
-tmp_check_spaced="$tmp_test_dir/check spaced.weft"
+tmp_check_spaced="$tmp_check_dir/check spaced.weft"
 printf 'fn second_bad() -> i64 { missing_second }\n' > "$tmp_check_spaced"
-tmp_check_missing="$tmp_test_dir/check missing.weft"
+tmp_check_missing="$tmp_check_dir/check missing.weft"
 set +e
 "$WEFT" check --jobs 2 "$tmp_check_fail" "$tmp_check_clean" "$tmp_check_spaced" "$tmp_check_missing" > "$tmp_out" 2> "$tmp_err"
 check_batch_exit=$?
@@ -2834,7 +2835,7 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_harness_emits_passing_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
 echo "  ok test_harness_binds_runtime_after_synthesis"
 
-printf 'use stdlib/vector.{*} fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) let va = vector_new<i64>() let vb = vector_new<i64>() vector_push<i64>(va, 7) vector_push<i64>(vb, 7) Test.assert_i64_vector_eq(va, vb) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
+printf 'use stdlib/diagnostic_type.{Diagnose} use stdlib/vector.{*} fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) let va = vector_new<i64>() let vb = vector_new<i64>() vector_push<i64>(va, 7) vector_push<i64>(vb, 7) Test.assert_i64_vector_eq(va, vb) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_supports_assertion_helpers" "$tmp_err" "unknown effect operation"
 chmod +x "$tmp_bin"
@@ -3218,7 +3219,7 @@ assert_test_failure_contains "test_snapshot_mismatch_reports_diagnostic" 'test "
 assert_test_failure_contains "test_property_failure_reports_diagnostic" 'test "fail_property" { Test.forall_i64_range(0, 4, x => x < 2) }' 1 "test assertion failed: forall_i64_range"
 assert_test_failure_contains "test_property_failure_reports_counterexample" 'test "fail_property" { Test.forall_i64_range(0, 4, x => x < 2) }' 1 "  counterexample: 2"
 assert_test_failure_contains "test_property_empty_range_reports_exhaustion" 'test "empty_property" { Test.forall_i64_range(3, 3, x => true) }' 1 "test assertion failed: forall_i64_range_empty"
-assert_test_exit_code "test_effect_fixtures_pass" 'fn tool_fail8() -[Fail<i64>]> i64 { Fail.fail(8) } test "fixtures" { Test.assert_eq(Test.with_state_i64(2, () => { TestState.put(TestState.get() + 1) TestState.get() }), 3) Test.assert_eq(Test.expect_fail_i64(8, () => tool_fail8()), 8) Test.assert_eq(Test.with_io_i64(() => IO.open("path", 7, 0)), 107) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.note("ok", 0)), 3) }' 0
+assert_test_exit_code "test_effect_fixtures_pass" 'use stdlib/diagnostic_type.{Diagnose} fn tool_fail8() -[Fail<i64>]> i64 { Fail.fail(8) } test "fixtures" { Test.assert_eq(Test.with_state_i64(2, () => { TestState.put(TestState.get() + 1) TestState.get() }), 3) Test.assert_eq(Test.expect_fail_i64(8, () => tool_fail8()), 8) Test.assert_eq(Test.with_io_i64(() => IO.open("path", 7, 0)), 107) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.note("ok", 0)), 3) }' 0
 assert_test_failure_contains "test_fixture_missing_fail_reports_diagnostic" 'test "missing_fail" { Test.expect_fail_i64(1, () => 0) }' 1 "test assertion failed: expect_fail_missing"
 assert_test_failure_contains "test_fixture_wrong_fail_reports_diagnostic" 'fn tool_fail2() -[Fail<i64>]> i64 { Fail.fail(2) } test "wrong_fail" { Test.expect_fail_i64(1, () => tool_fail2()) }' 1 "test assertion failed: expect_fail_i64"
 assert_test_failure_contains "test_fixture_wrong_fail_reports_expected" 'fn tool_fail2() -[Fail<i64>]> i64 { Fail.fail(2) } test "wrong_fail" { Test.expect_fail_i64(1, () => tool_fail2()) }' 1 "  expected: 1"
@@ -3291,4 +3292,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 920 passed, 0 failed"
+echo "Tool boundary summary: 932 passed, 0 failed"
