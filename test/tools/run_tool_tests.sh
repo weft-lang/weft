@@ -940,12 +940,75 @@ assert_equals "check_batch_requires_paths" "$check_missing_paths_exit" "2"
 assert_contains "check_batch_missing_paths_shows_usage" "$(<"$tmp_err")" "usage: weft check [--jobs N] <path...>"
 
 run_weft_compile_guarded "$WEFT" compile "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+assert_equals "compile_path_default_stderr_empty" "$(<"$tmp_err")" ""
 chmod +x "$tmp_bin"
 set +e
 run_binary_guarded "$tmp_bin" >/dev/null 2>&1
 compile_path_exit=$?
 set -e
 assert_equals "compile_path_binary_exit" "$compile_path_exit" "42"
+
+set +e
+run_weft_compile_guarded "$WEFT" compile --metrics "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+compile_metrics_exit=$?
+set -e
+assert_equals "compile_metrics_exit_zero" "$compile_metrics_exit" "0"
+if cmp -s "$tmp_bin" "$tmp_out"; then
+  echo "  ok compile_metrics_preserves_binary_bytes"
+else
+  echo "  fail compile_metrics_preserves_binary_bytes"
+  exit 1
+fi
+compile_metrics_line=$(grep '^WEFT_COMPILE_METRICS ' "$tmp_err")
+read -r compile_metric_tag compile_metric_version compile_metric_source compile_metric_parse compile_metric_check compile_metric_lower compile_metric_optimise compile_metric_native compile_metric_package compile_metric_write compile_metric_total compile_metric_checked_fns compile_metric_ir_fns compile_metric_native_fns compile_metric_extra <<< "$compile_metrics_line"
+assert_equals "compile_metrics_machine_schema_version" "$compile_metric_tag:$compile_metric_version" "WEFT_COMPILE_METRICS:1"
+assert_equals "compile_metrics_machine_schema_has_exact_fields" "$compile_metric_extra" ""
+if [[ "$compile_metric_source" =~ ^[0-9]+$ ]] && [[ "$compile_metric_parse" =~ ^[0-9]+$ ]] && [[ "$compile_metric_check" =~ ^[0-9]+$ ]] && [[ "$compile_metric_lower" =~ ^[0-9]+$ ]] && [[ "$compile_metric_optimise" =~ ^[0-9]+$ ]] && [[ "$compile_metric_native" =~ ^[0-9]+$ ]] && [[ "$compile_metric_package" =~ ^[0-9]+$ ]] && [[ "$compile_metric_write" =~ ^[0-9]+$ ]] && [[ "$compile_metric_total" =~ ^[0-9]+$ ]]; then
+  echo "  ok compile_metrics_machine_stages_are_numeric"
+else
+  echo "  fail compile_metrics_machine_stages_are_numeric"
+  echo "    metrics: $compile_metrics_line"
+  exit 1
+fi
+compile_metric_accounted=$((compile_metric_source + compile_metric_parse + compile_metric_check + compile_metric_lower + compile_metric_optimise + compile_metric_native + compile_metric_package + compile_metric_write))
+if [ "$compile_metric_total" -gt 0 ] && [ "$compile_metric_total" -ge "$compile_metric_accounted" ]; then
+  echo "  ok compile_metrics_total_covers_accounted_phases"
+else
+  echo "  fail compile_metrics_total_covers_accounted_phases"
+  echo "    metrics: $compile_metrics_line"
+  exit 1
+fi
+if [[ "$compile_metric_checked_fns" =~ ^[0-9]+$ ]] && [[ "$compile_metric_ir_fns" =~ ^[0-9]+$ ]] && [[ "$compile_metric_native_fns" =~ ^[0-9]+$ ]] && [ "$compile_metric_checked_fns" -gt 0 ] && [ "$compile_metric_ir_fns" -gt 0 ] && [ "$compile_metric_native_fns" -gt 0 ]; then
+  echo "  ok compile_metrics_machine_counts_functions"
+else
+  echo "  fail compile_metrics_machine_counts_functions"
+  echo "    metrics: $compile_metrics_line"
+  exit 1
+fi
+compile_metrics_err=$(<"$tmp_err")
+assert_contains "compile_metrics_human_reports_total" "$compile_metrics_err" "compile metrics: total_ms="
+assert_contains "compile_metrics_human_reports_expensive_phases" "$compile_metrics_err" "optimise_ms="
+chmod +x "$tmp_out"
+set +e
+run_binary_guarded "$tmp_out" >/dev/null 2>&1
+compile_metrics_binary_exit=$?
+set -e
+assert_equals "compile_metrics_binary_exit" "$compile_metrics_binary_exit" "42"
+
+set +e
+"$WEFT" compile --metrics > "$tmp_out" 2>"$tmp_err"
+compile_metrics_missing_exit=$?
+set -e
+assert_equals "compile_metrics_missing_path_exits_usage" "$compile_metrics_missing_exit" "2"
+assert_equals "compile_metrics_missing_path_stdout_empty" "$(<"$tmp_out")" ""
+assert_contains "compile_metrics_missing_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics] PATH"
+
+set +e
+"$WEFT" compile --metrics "$tmp_src" "$tmp_check_clean" > "$tmp_out" 2>"$tmp_err"
+compile_metrics_extra_exit=$?
+set -e
+assert_equals "compile_metrics_extra_path_exits_usage" "$compile_metrics_extra_exit" "2"
+assert_contains "compile_metrics_extra_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics] PATH"
 
 assert_program_failure_contains "panic_boundary" "test/panic_exit.weft" "101" "weft: panic: direct panic boundary"
 assert_program_failure_contains "checked_index_bounds_panic" "test/array_index_oob_exit.weft" "101" "weft: panic: index out of bounds"
@@ -3292,4 +3355,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 932 passed, 0 failed"
+echo "Tool boundary summary: 948 passed, 0 failed"
