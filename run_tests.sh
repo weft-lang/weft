@@ -4,6 +4,18 @@
 # dependency products survive across both test blocks and expected-exit programs.
 set -e
 
+default_test_jobs() {
+  local detected
+  detected=$(sysctl -n hw.ncpu 2>/dev/null || true)
+  if ! [[ "$detected" =~ ^[0-9]+$ ]] || [ "$detected" -lt 1 ]; then
+    detected=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+  fi
+  if ! [[ "$detected" =~ ^[0-9]+$ ]] || [ "$detected" -lt 1 ]; then
+    detected=4
+  fi
+  echo "$detected"
+}
+
 WEFT=${WEFT:-./weft}
 WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-120}
 WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-120}
@@ -16,7 +28,7 @@ WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-8000000}
 # the queued lever to bring this baseline down.
 WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-8000000}
 WEFT_TEST_SHOW_TIMINGS=${WEFT_TEST_SHOW_TIMINGS:-1}
-WEFT_TEST_JOBS=${WEFT_TEST_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}
+WEFT_TEST_JOBS=${WEFT_TEST_JOBS:-$(default_test_jobs)}
 PASS=0
 FAIL=0
 ERRORS=""
