@@ -38896,15 +38896,18 @@ pub(package) fn pipeline_ir_semantic_fact_lookup_scalar_result(facts: PipelineIr
   }
 }
 
--- Word-call fact: every param and the return travel in word registers
--- (i64 scalars or managed pointers — return class 1 or 2 — and no
--- f32/f64 anywhere in the signature). This is the boundary condition
--- an IR-level splice needs; ownership is embedded in lowered bodies.
-pub(package) fn pipeline_ir_semantic_fact_lookup_word_call(facts: PipelineIrSemanticFactList, hash: i64) -> i64 {
+-- Scalar-lane call fact: every logical parameter and the return occupy one
+-- known physical lane (GPR, f32, or f64). Typed-IR splicing maps those SSA
+-- lanes directly; aggregate/multiword and unknown shapes remain opaque.
+pub(package) fn pipeline_ir_semantic_fact_lookup_single_lane_call(facts: PipelineIrSemanticFactList, hash: i64) -> i64 {
   let fact = pipeline_ir_semantic_fact_find(facts, hash)
   if fact == 0 { 0 } else {
     let class = cg_semantic_fact_return_class(fact)
-    if (class == 1 or class == 2) and cg_semantic_fact_word_abi(fact) == 1 { 1 } else { 0 }
+    -- Preserve the constant-time common path: the established word-ABI bit
+    -- already proves one GPR lane per argument, so only FP candidates need
+    -- the explicit shape-list walk added by the wider scalar-lane contract.
+    if (class == 1 or class == 2) and cg_semantic_fact_word_abi(fact) == 1 { 1 }
+    else { if cg_value_shapes_all_single_lane(cg_semantic_fact_param_shapes(fact)) == 1 and ir_value_shape_lane_count(cg_semantic_fact_return_shape(fact)) == 1 { 1 } else { 0 } }
   }
 }
 
@@ -45483,6 +45486,30 @@ pub(package) fn pipeline_ir_pure_intrinsic_bridge_inline_eligible(insts: IrInstL
   if pipeline_ir_pure_intrinsic_inline_inst_count(insts) == 1 { 1 } else { 0 }
 }
 
+pub(package) fn pipeline_ir_tiny_inline_borrowed_param_mask(insts: IrInstList) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      match inst {
+        IrSlotI64(slot) -> {
+          if pipeline_ir_borrowed_param_mask_slot_is(slot) == 1 { pipeline_ir_borrowed_param_mask_slot_decode(slot) }
+          else { pipeline_ir_tiny_inline_borrowed_param_mask(rest) }
+        }
+        _ -> pipeline_ir_tiny_inline_borrowed_param_mask(rest)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_tiny_inline_managed_params_borrowed(facts: PipelineIrSemanticFactList, hash: i64, insts: IrInstList) -> i64 {
+  let managed = pipeline_ir_semantic_fact_lookup_managed_param_mask(facts, hash)
+  if managed == 0 { 1 }
+  else {
+    let borrowed = pipeline_ir_tiny_inline_borrowed_param_mask(insts)
+    if (borrowed band managed) == managed { 1 } else { 0 }
+  }
+}
+
 pub(package) fn pipeline_ir_function_tiny_inline_eligible(f: IrFunction, facts: PipelineIrSemanticFactList, tiny_pure: i64) -> i64 {
   match f {
     IrFunction(hash, param_count, blocks, src) -> {
@@ -45492,9 +45519,11 @@ pub(package) fn pipeline_ir_function_tiny_inline_eligible(f: IrFunction, facts: 
             IrBlock(id, params, insts, term) -> {
               let param_len = ir_value_list_len(params)
               let inst_len = ir_inst_list_len(insts)
-              -- The clone path does not yet reify callee parameter ownership
-              -- cleanups, so managed parameters stay behind the call boundary.
-              if param_len != 0 or inst_len > 9 or pipeline_ir_tiny_inline_inst_list_supported(insts, tiny_pure, hash) != 1 or pipeline_ir_semantic_fact_lookup_managed_param_mask(facts, hash) != 0 {
+              -- Owned managed parameters retain their cleanup boundary. A
+              -- borrowed managed parameter has no callee-owned cleanup; its
+              -- lowered marker proves that the linear clone may dissolve the
+              -- call while leaving ownership with the surrounding caller.
+              if param_len != 0 or inst_len > 9 or pipeline_ir_tiny_inline_inst_list_supported(insts, tiny_pure, hash) != 1 or pipeline_ir_tiny_inline_managed_params_borrowed(facts, hash, insts) != 1 {
                 0
               } else {
                 match term {
@@ -46164,6 +46193,9 @@ pub(package) fn pipeline_ir_tiny_inline_inst_supported(inst: IrInst, tiny_pure: 
       else { if callee_hash != self_hash and pipeline_ir_hash_tree_contains(tiny_pure, callee_hash) == 1 { 1 } else { 0 } }
     }
     IrManagedStakeI64(dst, value, cleanup_kind, delta, origin) -> 1
+    -- Borrow-mask markers describe the callee boundary and disappear when
+    -- every managed parameter is proven borrowed by candidate eligibility.
+    IrSlotI64(slot) -> pipeline_ir_borrowed_param_mask_slot_is(slot)
     IrPtrLoadI64(dst, ptr) -> 1
     IrPtrStoreI64(dst, ptr, value) -> 1
     IrVectorGetI64(dst, vec, index, fallback, check_mode) -> 1
@@ -46342,6 +46374,13 @@ pub(package) fn pipeline_ir_inline_clone_inst(inst: IrInst, inline_env: Pipeline
         origin
       )
       pipeline_ir_inline_clone_result(1, ir_inst_list_prepend(cloned, ir_inst_list_empty()), pipeline_ir_inline_value_env_bind(inline_env, dst, new_dst), pipeline_ir_inline_clone_next(new_dst, next_value))
+    }
+    IrSlotI64(slot) -> {
+      if pipeline_ir_borrowed_param_mask_slot_is(slot) == 1 {
+        pipeline_ir_inline_clone_result(1, ir_inst_list_empty(), inline_env, next_value)
+      } else {
+        pipeline_ir_inline_clone_result(0, ir_inst_list_empty(), inline_env, next_value)
+      }
     }
     IrPtrLoadI64(dst, ptr) -> {
       let new_dst = pipeline_ir_inline_clone_dst(dst, return_value, desired_result, next_value)
@@ -46597,6 +46636,7 @@ pub(package) fn pipeline_ir_multi_inline_inst_supported(inst: IrInst, self_hash:
     IrConstI64(dst, value) -> 1
     IrNilI64(dst) -> 1
     IrBinaryI64(dst, op, lhs, rhs) -> ir_binary_op_is_supported(op)
+    IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> ir_binary_op_is_supported(op)
     IrUnaryI64(dst, op, value) -> 1
     IrPtrLoadI64(dst, ptr) -> 1
     IrBindI64(ns, nl, value, ty) -> 1
@@ -46674,26 +46714,36 @@ pub(package) fn pipeline_ir_multi_inline_entry_params_empty(blocks: IrBlockList)
   }
 }
 
-pub(package) fn pipeline_ir_multi_inline_eligible(f: IrFunction, facts: PipelineIrSemanticFactList, index_hash: i64, index_lower_hash: i64, index_upper_hash: i64, index_full_hash: i64, slice_hashes: i64) -> i64 {
+pub(package) fn pipeline_ir_multi_inline_eligible(f: IrFunction, facts: PipelineIrSemanticFactList, index_hash: i64, index_lower_hash: i64, index_upper_hash: i64, index_full_hash: i64, table_get_hash: i64, table_set_hash: i64, slice_hashes: i64) -> i64 {
   match f {
     IrFunction(hash, param_count, blocks, src) -> {
       let nblocks = ir_block_list_len(blocks)
-      -- vector_len and f64_table_row_count are bounds fact carriers;
-      -- indexed-address proof modes are the matching observable consumer
-      -- ABI. Dissolving any of these calls before fact consumption destroys
-      -- the producer/consumer contract and reinstates checks. The generated
-      -- defer action is likewise a cleanup-fact carrier: J3 must see its
-      -- named call to pair the scheduled closure with the abort descriptor.
-      if hash == pipeline_runtime_defer_abort_cleanup_hash() or hash == pipeline_ir_vector_len_hash() or hash == pipeline_ir_f64_table_row_count_hash() or hash == index_hash or hash == index_lower_hash or hash == index_upper_hash or hash == index_full_hash or pipeline_hash_list_contains(slice_hashes, hash) == 1 { 0 }
+      -- vector_len/f64_table_row_count are bounds fact producers, while the
+      -- f64_table get/set names and indexed-address proof modes are their
+      -- observable consumer ABI. Dissolving any of these calls in the CFG
+      -- splice before the local rewrite/fact pass consumes them destroys the
+      -- producer/consumer contract and reinstates checks. The generated defer
+      -- action is likewise a cleanup-fact carrier: J3 must see its named call
+      -- to pair the scheduled closure with the abort descriptor.
+      if hash == pipeline_runtime_defer_abort_cleanup_hash() or hash == pipeline_ir_vector_len_hash() or hash == pipeline_ir_f64_table_row_count_hash() or hash == table_get_hash or hash == table_set_hash or hash == index_hash or hash == index_lower_hash or hash == index_upper_hash or hash == index_full_hash or pipeline_hash_list_contains(slice_hashes, hash) == 1 { 0 }
       else { if nblocks < 1 or nblocks > pipeline_ir_multi_inline_blocks_cap() { 0 }
       else { if ir_block_list_inst_count(blocks) > pipeline_ir_multi_inline_insts_cap() { 0 }
       -- Managed params and managed returns are admissible: lowered
       -- bodies embed their whole ownership protocol (transfer retains,
       -- borrow-masked or owned param releases, return transfers), so a
-      -- verbatim splice preserves balance. What must hold is the word
-      -- ABI — f32/f64 params or returns cross the boundary in FP
-      -- registers the scalar clone path does not model.
-      else { if pipeline_ir_semantic_fact_lookup_word_call(facts, hash) != 1 { 0 }
+      -- verbatim splice preserves balance. What must hold is a scalar-lane
+      -- ABI: each logical param and the result has exactly one known GPR,
+      -- f32, or f64 lane. Aggregate and unknown shapes stay behind calls.
+      else { if pipeline_ir_semantic_fact_lookup_single_lane_call(facts, hash) != 1 { 0 }
+      -- A single-return identity currently materialises the destination with
+      -- integer add-zero in the continuation. That is valid for a GPR lane,
+      -- but would destroy an FP lane's representation contract. Keep only
+      -- that exact float-alias shape behind the call until the splice can
+      -- publish an explicit SSA alias.
+      else {
+        let return_value = pipeline_ir_multi_single_return_value(blocks)
+        let fact = pipeline_ir_semantic_fact_find(facts, hash)
+        if pipeline_ir_multi_return_count(blocks) == 1 and return_value >= 0 and return_value < param_count and ir_value_shape_is_single_gpr(cg_semantic_fact_return_shape(fact)) != 1 { 0 }
       -- Single-block candidates are admitted. The historic exclusion
       -- (sorted_map put wrote search flags as entry keys) was not a
       -- splice-mechanics bug: the miswire was constant-intrinsic
@@ -46701,20 +46751,21 @@ pub(package) fn pipeline_ir_multi_inline_eligible(f: IrFunction, facts: Pipeline
       -- spec bodies are placeholders — those sites are now opaque at
       -- the split site, see
       -- pipeline_ir_native_generic_call_constant_intrinsic.
-      else { if pipeline_ir_multi_inline_entry_params_empty(blocks) == 0 { 0 }
-      else { pipeline_ir_multi_inline_blocks_ok(blocks, hash) } } } } }
+        else { if pipeline_ir_multi_inline_entry_params_empty(blocks) == 0 { 0 }
+        else { pipeline_ir_multi_inline_blocks_ok(blocks, hash) } }
+      } } } } }
     }
   }
 }
 
-pub(package) fn pipeline_ir_multi_inline_candidates_walk_with_index_hashes(functions: IrFunctionList, facts: PipelineIrSemanticFactList, index_hash: i64, index_lower_hash: i64, index_upper_hash: i64, index_full_hash: i64, slice_hashes: i64) -> PipelineIrInlineCandidateList {
+pub(package) fn pipeline_ir_multi_inline_candidates_walk_with_index_hashes(functions: IrFunctionList, facts: PipelineIrSemanticFactList, index_hash: i64, index_lower_hash: i64, index_upper_hash: i64, index_full_hash: i64, table_get_hash: i64, table_set_hash: i64, slice_hashes: i64) -> PipelineIrInlineCandidateList {
   match functions {
     IrFunctionNil -> PipelineIrInlineCandidateNil
     IrFunctionCons(f, rest) -> {
-      let tail = pipeline_ir_multi_inline_candidates_walk_with_index_hashes(rest, facts, index_hash, index_lower_hash, index_upper_hash, index_full_hash, slice_hashes)
+      let tail = pipeline_ir_multi_inline_candidates_walk_with_index_hashes(rest, facts, index_hash, index_lower_hash, index_upper_hash, index_full_hash, table_get_hash, table_set_hash, slice_hashes)
       match f {
         IrFunction(hash, param_count, blocks, src) -> {
-          if pipeline_ir_multi_inline_eligible(f, facts, index_hash, index_lower_hash, index_upper_hash, index_full_hash, slice_hashes) == 1 {
+          if pipeline_ir_multi_inline_eligible(f, facts, index_hash, index_lower_hash, index_upper_hash, index_full_hash, table_get_hash, table_set_hash, slice_hashes) == 1 {
             pipeline_ir_inline_candidate_prepend(hash, f, tail)
           } else {
             tail
@@ -46736,6 +46787,8 @@ pub(package) fn pipeline_ir_multi_inline_candidates_walk(functions: IrFunctionLi
     pipeline_runtime_index_address_lower_proven_hash(),
     pipeline_runtime_index_address_upper_proven_hash(),
     pipeline_runtime_index_address_full_proven_hash(),
+    pipeline_ir_f64_table_get_hash(),
+    pipeline_ir_f64_table_set_hash(),
     pipeline_runtime_slice_address_hashes()
   )
 }
@@ -46774,6 +46827,7 @@ pub(package) fn pipeline_ir_multi_inline_inst_dst(inst: IrInst) -> i64 {
     IrConstI64(dst, value) -> dst
     IrNilI64(dst) -> dst
     IrBinaryI64(dst, op, lhs, rhs) -> dst
+    IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> dst
     IrUnaryI64(dst, op, value) -> dst
     IrPtrLoadI64(dst, ptr) -> dst
     IrCallI64(dst, callee_hash, args) -> dst
@@ -46867,6 +46921,10 @@ pub(package) fn pipeline_ir_multi_uses_bound_inst(inst: IrInst, venv: PipelineIr
       if pipeline_ir_inline_value_env_lookup_or(venv, lhs, 0 - 1) < 0 { 0 }
       else { if pipeline_ir_inline_value_env_lookup_or(venv, rhs, 0 - 1) < 0 { 0 } else { 1 } }
     }
+    IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> {
+      if pipeline_ir_inline_value_env_lookup_or(venv, lhs, 0 - 1) < 0 { 0 }
+      else { if pipeline_ir_inline_value_env_lookup_or(venv, rhs, 0 - 1) < 0 { 0 } else { 1 } }
+    }
     IrUnaryI64(dst, op, value) -> if pipeline_ir_inline_value_env_lookup_or(venv, value, 0 - 1) < 0 { 0 } else { 1 }
     IrPtrLoadI64(dst, ptr) -> if pipeline_ir_inline_value_env_lookup_or(venv, ptr, 0 - 1) < 0 { 0 } else { 1 }
     IrBindI64(ns, nl, value, ty) -> 1
@@ -46954,6 +47012,7 @@ pub(package) fn pipeline_ir_multi_clone_insts(insts: IrInstList, venv: PipelineI
         IrConstI64(dst, value) -> IrInstCons(ir_inst_const_i64(pipeline_ir_multi_map_value(venv, dst), value), tail)
         IrNilI64(dst) -> IrInstCons(ir_inst_nil_i64(pipeline_ir_multi_map_value(venv, dst)), tail)
         IrBinaryI64(dst, op, lhs, rhs) -> IrInstCons(ir_inst_binary_i64(pipeline_ir_multi_map_value(venv, dst), op, pipeline_ir_multi_map_value(venv, lhs), pipeline_ir_multi_map_value(venv, rhs)), tail)
+        IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> IrInstCons(ir_inst_float_binary_i64(pipeline_ir_multi_map_value(venv, dst), prim, op, pipeline_ir_multi_map_value(venv, lhs), pipeline_ir_multi_map_value(venv, rhs)), tail)
         IrUnaryI64(dst, op, value) -> IrInstCons(ir_inst_unary_i64(pipeline_ir_multi_map_value(venv, dst), op, pipeline_ir_multi_map_value(venv, value)), tail)
         IrPtrLoadI64(dst, ptr) -> IrInstCons(ir_inst_ptr_load_i64(pipeline_ir_multi_map_value(venv, dst), pipeline_ir_multi_map_value(venv, ptr)), tail)
         IrBindI64(ns, nl, value, ty) -> tail
