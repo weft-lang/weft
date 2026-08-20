@@ -119,16 +119,26 @@ if [ "${1:-}" = "__worker" ]; then
   exit 0
 fi
 
-echo "=== Negative Test Suite ==="
-echo ""
+CENSUS_ONLY=0
+if [ "${1:-}" = "__census" ]; then
+  CENSUS_ONLY=1
+fi
 
-JOBS_DIR=$(mktemp -d /tmp/weft_negative_XXXXXX)
+JOBS_DIR=""
+if [ "$CENSUS_ONLY" -eq 0 ]; then
+  echo "=== Negative Test Suite ==="
+  echo ""
+  JOBS_DIR=$(mktemp -d /tmp/weft_negative_XXXXXX)
+fi
 JOB_N=0
 
 # Enqueue only — the call sites below stay declarative; the pool at the
 # end runs them WEFT_TEST_JOBS wide through worker mode.
 check_rejects() {
   JOB_N=$((JOB_N+1))
+  if [ "$CENSUS_ONLY" -eq 1 ]; then
+    return
+  fi
   local jf
   jf=$(printf '%s/job_%04d' "$JOBS_DIR" "$JOB_N")
   printf '%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${4:-}" > "$jf"
@@ -851,6 +861,11 @@ check_rejects "borrow_effect_conflicting_perform" "test/negative/borrow_effect_c
 check_rejects "borrow_effect_deferred_continuation" "test/negative/borrow_effect_deferred_continuation.weft" "type error: borrowed effect parameter cannot enter a deferred continuation" 1
 check_rejects "borrow_closure_capture" "test/negative/borrow_closure_capture.weft" "type error: borrowed resource cannot be captured by closure" 1
 check_rejects "borrow_par_spawn_capture" "test/negative/borrow_par_spawn_capture.weft" "type error: borrowed resource cannot be captured by closure" 1
+
+if [ "$CENSUS_ONLY" -eq 1 ]; then
+  echo "$JOB_N"
+  exit 0
+fi
 
 ls "$JOBS_DIR"/job_???? | xargs -n1 -P "$WEFT_TEST_JOBS" bash "$0" __worker || true
 

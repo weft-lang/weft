@@ -16,16 +16,11 @@ for test_file in test/*.weft; do
   fi
 done
 
-negative_files=0
-for negative_file in test/negative/*.weft; do
-  if [ -f "$negative_file" ]; then
-    negative_files=$((negative_files + 1))
-  fi
-done
+negative_cases=$(bash test/negative/run_negative_tests.sh __census)
 
-expected="${runtime_blocks} runtime test blocks across ${runtime_files} files, plus ${negative_files} negative (must-fail) cases"
+expected="${runtime_blocks} runtime test blocks across ${runtime_files} files, plus ${negative_cases} negative (must-fail) cases"
 if grep -Fq "$expected" README.md; then
-  echo "  ok README corpus census ($runtime_blocks blocks, $runtime_files files, $negative_files negatives)"
+  echo "  ok README corpus census ($runtime_blocks blocks, $runtime_files files, $negative_cases negatives)"
 else
   echo "  fail README corpus census"
   echo "    expected README.md to contain: $expected"
