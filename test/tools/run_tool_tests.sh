@@ -3059,9 +3059,11 @@ unset WEFT_TEST_METRICS
 assert_equals "test_metrics_exit_zero" "$test_metrics_exit" "0"
 test_metrics_err=$(<"$tmp_err")
 test_metrics_line=$(grep '^WEFT_TEST_METRICS ' "$tmp_err")
-read -r metric_tag metric_version metric_roots metric_measured metric_wall metric_discovery metric_planning metric_compile metric_link metric_run metric_user metric_system metric_peak metric_extra <<< "$test_metrics_line"
-assert_equals "test_metrics_machine_schema_version" "$metric_tag:$metric_version" "WEFT_TEST_METRICS:1"
+read -r metric_tag metric_version metric_roots metric_measured metric_wall metric_discovery metric_planning metric_compile metric_link metric_run metric_user metric_system metric_peak metric_shared_groups metric_shared_roots metric_reused_pairs metric_query_hits metric_query_misses metric_query_executions metric_extra <<< "$test_metrics_line"
+assert_equals "test_metrics_machine_schema_version" "$metric_tag:$metric_version" "WEFT_TEST_METRICS:2"
 assert_equals "test_metrics_machine_counts_root" "$metric_roots:$metric_measured" "1:1"
+assert_equals "test_metrics_single_root_has_no_shared_product" "$metric_shared_groups:$metric_shared_roots:$metric_reused_pairs" "0:0:0"
+assert_equals "test_metrics_single_root_has_no_project_queries" "$metric_query_hits:$metric_query_misses:$metric_query_executions" "0:0:0"
 assert_equals "test_metrics_machine_schema_has_exact_fields" "$metric_extra" ""
 if [[ "$metric_wall" =~ ^[0-9]+$ ]] && [[ "$metric_compile" =~ ^[0-9]+$ ]] && [[ "$metric_user" =~ ^[0-9]+$ ]] && [[ "$metric_peak" =~ ^[0-9]+$ ]] && [ "$metric_wall" -gt 0 ] && [ "$metric_compile" -gt 0 ] && [ "$metric_user" -gt 0 ] && [ "$metric_peak" -gt 0 ]; then
   echo "  ok test_metrics_machine_reports_positive_resources"
@@ -3121,14 +3123,27 @@ printf 'use module_fixtures/%s.{BatchSharedBox} test "checked dependency one" { 
 printf 'use module_fixtures/%s.{BatchSharedBox} test "checked dependency two" { Test.assert_eq(BatchSharedBox { value: 42 }.value(), 42) }\n' "$tmp_test_shared_module" > "$tmp_test_shared_two"
 set +e
 export WEFT_TEST_PLAN_TRACE=1
+export WEFT_TEST_METRICS=1
 run_weft_compile_guarded "$WEFT" test --jobs 1 "$tmp_test_shared_one" "$tmp_test_shared_two" > "$tmp_out" 2>"$tmp_err"
 test_checked_dependency_exit=$?
 unset WEFT_TEST_PLAN_TRACE
+unset WEFT_TEST_METRICS
 set -e
 assert_equals "test_batch_checked_dependency_exit_zero" "$test_checked_dependency_exit" "0"
 assert_contains "test_batch_checked_dependency_admits_exact_group" "$(<"$tmp_err")" "test plan: shared checked dependency groups=1 roots=2"
 assert_contains "test_batch_checked_dependency_runs_both_roots" "$(<"$tmp_err")" "2 passed, 0 failed"
 assert_not_contains_file "test_batch_checked_dependency_has_no_missing_method" "$tmp_err" "missing method implementation"
+checked_dependency_metrics=$(grep '^WEFT_TEST_METRICS ' "$tmp_err")
+read -r dependency_metric_tag dependency_metric_version dependency_metric_roots dependency_metric_measured dependency_metric_wall dependency_metric_discovery dependency_metric_planning dependency_metric_compile dependency_metric_link dependency_metric_run dependency_metric_user dependency_metric_system dependency_metric_peak dependency_metric_groups dependency_metric_shared_roots dependency_metric_reused_pairs dependency_metric_hits dependency_metric_misses dependency_metric_executions dependency_metric_extra <<< "$checked_dependency_metrics"
+assert_equals "test_batch_checked_dependency_metrics_schema" "$dependency_metric_tag:$dependency_metric_version:$dependency_metric_extra" "WEFT_TEST_METRICS:2:"
+assert_equals "test_batch_checked_dependency_metrics_group" "$dependency_metric_groups:$dependency_metric_shared_roots" "1:2"
+if [[ "$dependency_metric_reused_pairs" =~ ^[0-9]+$ ]] && [[ "$dependency_metric_hits" =~ ^[0-9]+$ ]] && [[ "$dependency_metric_misses" =~ ^[0-9]+$ ]] && [[ "$dependency_metric_executions" =~ ^[0-9]+$ ]] && [ "$dependency_metric_reused_pairs" -ge 32 ] && [ "$dependency_metric_hits" -gt 0 ] && [ "$dependency_metric_misses" -gt 0 ] && [ "$dependency_metric_executions" -gt 0 ]; then
+  echo "  ok test_batch_checked_dependency_metrics_report_reuse"
+else
+  echo "  fail test_batch_checked_dependency_metrics_report_reuse"
+  echo "    metrics: $checked_dependency_metrics"
+  exit 1
+fi
 
 printf 'trait BatchLocal { fn get(self: BatchBox) -> i64 } type BatchBox { value: i64 } impl BatchLocal for BatchBox { fn get(self: BatchBox) -> i64 { self.value } } test "isolated one" { Test.assert_eq(BatchBox { value: 41 }.get(), 41) }\n' > "$tmp_test_shared_one"
 printf 'trait BatchLocal { fn get(self: BatchBox) -> i64 } type BatchBox { value: i64 } impl BatchLocal for BatchBox { fn get(self: BatchBox) -> i64 { self.value } } test "isolated two" { Test.assert_eq(BatchBox { value: 42 }.get(), 42) }\n' > "$tmp_test_shared_two"
