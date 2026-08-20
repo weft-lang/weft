@@ -1011,7 +1011,7 @@ set -e
 assert_equals "compile_metrics_extra_path_exits_usage" "$compile_metrics_extra_exit" "2"
 assert_contains "compile_metrics_extra_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics] PATH"
 
-printf 'type CensusBox { value: i64 } fn main() -> i64 { let box = CensusBox { value: 42 } box.value }\n' > "$tmp_rc_census_src"
+printf 'type CensusBox { value: i64 } type CensusOuter { inner: CensusBox } fn census_observe(box: CensusBox) -> i64 { box.value } fn census_consume(box: CensusBox) -> i64 { let outer = CensusOuter { inner: box } outer.inner.value } fn main() -> i64 { let box = CensusBox { value: 42 } let left = census_observe(box) let right = census_consume(box) if left == right { 42 } else { 0 } }\n' > "$tmp_rc_census_src"
 set +e
 run_weft_compile_guarded "$WEFT" compile --rc-census "$tmp_rc_census_src" > "$tmp_out" 2> "$tmp_err"
 compile_rc_census_exit=$?
@@ -1037,10 +1037,10 @@ compile_rc_census_binary_exit=$?
 set -e
 assert_equals "compile_rc_census_binary_preserves_exit" "$compile_rc_census_binary_exit" "42"
 rc_dynamic_line=$(grep '^WEFT_RC_CENSUS ' "$tmp_err")
-read -r rc_dynamic_tag rc_dynamic_version rc_dynamic_alloc rc_dynamic_retain rc_dynamic_release rc_dynamic_child rc_dynamic_promoted_retain rc_dynamic_promoted_release rc_dynamic_closure_retain rc_dynamic_closure_release rc_dynamic_closure_promoted_release rc_dynamic_weak_retain rc_dynamic_weak_release rc_dynamic_weak_load rc_dynamic_region_alloc rc_dynamic_promotions rc_dynamic_extra <<< "$rc_dynamic_line"
-assert_equals "compile_rc_census_dynamic_schema_version" "$rc_dynamic_tag:$rc_dynamic_version" "WEFT_RC_CENSUS:1"
+read -r rc_dynamic_tag rc_dynamic_version rc_dynamic_alloc rc_dynamic_retain rc_dynamic_release rc_dynamic_child rc_dynamic_promoted_retain rc_dynamic_promoted_release rc_dynamic_closure_retain rc_dynamic_closure_release rc_dynamic_closure_promoted_release rc_dynamic_weak_retain rc_dynamic_weak_release rc_dynamic_weak_load rc_dynamic_region_alloc rc_dynamic_promotions rc_dynamic_call_owned rc_dynamic_call_borrowed rc_dynamic_extra <<< "$rc_dynamic_line"
+assert_equals "compile_rc_census_dynamic_schema_version" "$rc_dynamic_tag:$rc_dynamic_version" "WEFT_RC_CENSUS:2"
 assert_equals "compile_rc_census_dynamic_schema_has_exact_fields" "$rc_dynamic_extra" ""
-if [[ "$rc_dynamic_alloc" =~ ^[0-9]+$ && "$rc_dynamic_retain" =~ ^[0-9]+$ && "$rc_dynamic_release" =~ ^[0-9]+$ && "$rc_dynamic_child" =~ ^[0-9]+$ && "$rc_dynamic_promoted_retain" =~ ^[0-9]+$ && "$rc_dynamic_promoted_release" =~ ^[0-9]+$ && "$rc_dynamic_closure_retain" =~ ^[0-9]+$ && "$rc_dynamic_closure_release" =~ ^[0-9]+$ && "$rc_dynamic_closure_promoted_release" =~ ^[0-9]+$ && "$rc_dynamic_weak_retain" =~ ^[0-9]+$ && "$rc_dynamic_weak_release" =~ ^[0-9]+$ && "$rc_dynamic_weak_load" =~ ^[0-9]+$ && "$rc_dynamic_region_alloc" =~ ^[0-9]+$ && "$rc_dynamic_promotions" =~ ^[0-9]+$ ]] && [ "$rc_dynamic_alloc" -gt 0 ] && [ "$rc_dynamic_release" -gt 0 ]; then
+if [[ "$rc_dynamic_alloc" =~ ^[0-9]+$ && "$rc_dynamic_retain" =~ ^[0-9]+$ && "$rc_dynamic_release" =~ ^[0-9]+$ && "$rc_dynamic_child" =~ ^[0-9]+$ && "$rc_dynamic_promoted_retain" =~ ^[0-9]+$ && "$rc_dynamic_promoted_release" =~ ^[0-9]+$ && "$rc_dynamic_closure_retain" =~ ^[0-9]+$ && "$rc_dynamic_closure_release" =~ ^[0-9]+$ && "$rc_dynamic_closure_promoted_release" =~ ^[0-9]+$ && "$rc_dynamic_weak_retain" =~ ^[0-9]+$ && "$rc_dynamic_weak_release" =~ ^[0-9]+$ && "$rc_dynamic_weak_load" =~ ^[0-9]+$ && "$rc_dynamic_region_alloc" =~ ^[0-9]+$ && "$rc_dynamic_promotions" =~ ^[0-9]+$ && "$rc_dynamic_call_owned" =~ ^[0-9]+$ && "$rc_dynamic_call_borrowed" =~ ^[0-9]+$ ]] && [ "$rc_dynamic_alloc" -gt 0 ] && [ "$rc_dynamic_release" -gt 0 ] && [ "$rc_dynamic_call_owned" -gt 0 ] && [ "$rc_dynamic_call_borrowed" -gt 0 ]; then
   echo "  ok compile_rc_census_dynamic_fields_are_numeric_and_populated"
 else
   echo "  fail compile_rc_census_dynamic_fields_are_numeric_and_populated"

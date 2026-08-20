@@ -35333,6 +35333,44 @@ pub(package) fn pipeline_ir_native_borrowed_param_mask_from_inst_list(insts: IrI
   }
 }
 
+-- Exact dynamic call-boundary volume is a function-entry fact, not a scan of
+-- retain/release spellings. Typed entry binds carry each logical parameter's
+-- lane ownership and the hidden mask carries the inferred borrow contract.
+-- Counting the two partitions here therefore includes direct, generic,
+-- method, and indirect executions once they enter typed code, without
+-- guessing which source call shape produced them.
+pub(package) fn pipeline_ir_native_param_managed_lane_count_from_bind_prefix(insts: IrInstList, param_count: i64, index: i64, borrowed_mask: i64, want_borrowed: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      match inst {
+        IrBindI64(ns, nl, value, ty) -> {
+          if value >= 0 and value < param_count {
+            let borrowed = cg_mask_has(borrowed_mask, index)
+            let add = if borrowed == want_borrowed { pipeline_type_managed_release_lane_count(ty) } else { 0 }
+            add + pipeline_ir_native_param_managed_lane_count_from_bind_prefix(rest, param_count, index + 1, borrowed_mask, want_borrowed)
+          } else { 0 }
+        }
+        _ -> 0
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_native_entry_param_managed_lane_count(blocks: IrBlockList, param_count: i64, want_borrowed: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> {
+          let borrowed_mask = pipeline_ir_native_borrowed_param_mask_from_inst_list(insts)
+          pipeline_ir_native_param_managed_lane_count_from_bind_prefix(insts, param_count, 0, borrowed_mask, want_borrowed)
+        }
+      }
+    }
+  }
+}
+
 pub(package) fn pipeline_ir_native_push_param_cleanup_from_bind_prefix(insts: IrInstList, param_count: i64, seen: i64, fm: i64, borrowed_mask: i64, homes: PipelineIrNativeValueHomeFacts) -> i64 {
   if seen >= param_count {
     0
@@ -36255,22 +36293,40 @@ pub(package) fn pipeline_rc_census_event_for_function_hash(hash: i64) -> i64 {
   else { 0 - 1 } } } } } } } } } } } } } }
 }
 
+pub(package) fn pipeline_rc_census_emit_event_amount(code: i64, fm: i64, event: i64, amount: i64) -> i64 {
+  if fmap_rc_census_mode(fm) == 0 or event < 0 or event >= runtime_state_rc_census_event_count() or amount <= 0 { 0 }
+  else {
+    -- Counters are shared by every worker using this runtime state. Use an
+    -- acquire/release exclusive loop so a parallel workload remains exact.
+    -- x15-x17 are allocator-reserved scratch and entry parameters have
+    -- already been copied to their homes before this sequence is emitted.
+    bu32(code, encode_add_imm(16, 28, runtime_state_rc_census_base_offset() + event * 8))
+    let retry = buf_len(code)
+    bu32(code, encode_ldaxr(17, 16))
+    if amount < 4096 {
+      bu32(code, encode_add_imm(17, 17, amount))
+    } else {
+      emit_mov_imm_safe(code, 15, amount)
+      bu32(code, encode_add_reg(17, 17, 15))
+    }
+    bu32(code, encode_stlxr(15, 17, 16))
+    bu32(code, encode_cbnz(15, retry - buf_len(code)))
+    amount
+  }
+}
+
 pub(package) fn pipeline_rc_census_emit_function_entry(code: i64, fm: i64, hash: i64) -> i64 {
+  pipeline_rc_census_emit_event_amount(code, fm, pipeline_rc_census_event_for_function_hash(hash), 1)
+}
+
+pub(package) fn pipeline_rc_census_emit_param_entry(code: i64, fm: i64, blocks: IrBlockList, param_count: i64) -> i64 {
   if fmap_rc_census_mode(fm) == 0 { 0 }
   else {
-    let event = pipeline_rc_census_event_for_function_hash(hash)
-    if event < 0 { 0 }
-    else {
-      -- Counters are shared by every worker using this runtime state. Use an
-      -- acquire/release exclusive loop so a parallel workload remains exact.
-      bu32(code, encode_add_imm(16, 28, runtime_state_rc_census_base_offset() + event * 8))
-      let retry = buf_len(code)
-      bu32(code, encode_ldaxr(17, 16))
-      bu32(code, encode_add_imm(17, 17, 1))
-      bu32(code, encode_stlxr(15, 17, 16))
-      bu32(code, encode_cbnz(15, retry - buf_len(code)))
-      1
-    }
+    let owned = pipeline_ir_native_entry_param_managed_lane_count(blocks, param_count, 0)
+    let borrowed = pipeline_ir_native_entry_param_managed_lane_count(blocks, param_count, 1)
+    pipeline_rc_census_emit_event_amount(code, fm, 14, owned)
+    pipeline_rc_census_emit_event_amount(code, fm, 15, borrowed)
+    owned + borrowed
   }
 }
 
@@ -36357,6 +36413,7 @@ pub(package) fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64
         emit_prologue_current(code, fm)
         pipeline_cg_ir_only_params_from_regs(code, param_count, pinned)
         pipeline_rc_census_emit_function_entry(code, fm, hash)
+        pipeline_rc_census_emit_param_entry(code, fm, blocks, param_count)
         -- Weft direct calls may pass parameters in x8 and above. Preserve
         -- every incoming register until the parameter-home copies consume it.
         pipeline_ir_abort_cleanup_emit_function_entry(code, fm)
