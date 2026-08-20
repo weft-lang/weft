@@ -62,6 +62,22 @@ counters:
     echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"use \"compiler/main.weft\""}}}' | "$bin" mcp
     echo ""
 
+# Build the live compiler with 5a's measurement-only reclamation census, then
+# use it for one self-compile. Static site classes and dynamic RC helper-entry
+# counts are emitted on stderr; both temporary binaries are removed.
+rc-census:
+    #!/usr/bin/env bash
+    set -e
+    live=$(mktemp /tmp/weft_rc_census_live_XXXXXX)
+    instrumented=$(mktemp /tmp/weft_rc_census_XXXXXX)
+    output=$(mktemp /tmp/weft_rc_census_output_XXXXXX)
+    trap 'rm -f "$live" "$instrumented" "$output"' EXIT
+    ./weft compile compiler/main.weft > "$live"
+    chmod +x "$live"
+    "$live" compile --rc-census compiler/main.weft > "$instrumented"
+    chmod +x "$instrumented"
+    "$instrumented" compile compiler/main.weft > "$output"
+
 # Run benchmarks and record results
 bench:
     bash bench.sh
