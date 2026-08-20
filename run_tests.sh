@@ -1,8 +1,7 @@
 #!/bin/bash
 # run_tests.sh — repository gate over the public project test planner.
-# Modern `test` roots enter one `weft test` project session so shared checked
-# dependency products survive across roots. Legacy expected-exit programs keep
-# their bounded worker pool until the project planner owns that product shape.
+# Every runnable root enters one `weft test` project session so shared checked
+# dependency products survive across both test blocks and expected-exit programs.
 set -e
 
 WEFT=${WEFT:-./weft}
@@ -75,10 +74,8 @@ run_guarded() {
       return 124
     fi
 
-    # Fine-grained polling early so sub-second processes are not billed a
-    # full 1s sleep quantum (at 200+ guarded invocations that overhead
-    # dominated the suite); fall back to 1s once the process is clearly
-    # long-running.
+    # Fine-grained polling keeps sub-second guarded commands from being billed
+    # a full 1s sleep quantum; fall back to 1s for long-running processes.
     polls=$((polls+1))
     if [ "$polls" -le 20 ]; then
       sleep 0.1
@@ -90,74 +87,6 @@ run_guarded() {
   wait "$pid"
 }
 
-# ---------------------------------------------------------------------------
-# Compatibility worker mode handles one legacy main-style file: compile, run,
-# one streamed result line, and a meta record
-# (`status file_tests compile_s run_s`) plus optional .err text for the
-# parent's ordered summary. Always exits 0; status travels in the meta.
-# ---------------------------------------------------------------------------
-if [ "${1:-}" = "__worker" ]; then
-  item="$2"
-  mode="${item%%:*}"
-  f="${item#*:}"
-  name=$(basename "$f" .weft)
-  meta="$WEFT_TEST_RESULTS_DIR/$name.meta"
-  errf="$WEFT_TEST_RESULTS_DIR/$name.err"
-
-  if [ "$mode" != "main" ]; then
-    echo "  ✗ $name (unknown compatibility worker mode: $mode)"
-    echo "  $name: unknown compatibility worker mode: $mode" > "$errf"
-    echo "fail 1 0 0" > "$meta"
-    exit 0
-  fi
-
-  # Main-style legacy programs (no test blocks): compile + run, comparing
-  # the exit code against the REQUIRED '-- Expected exit code: N'
-  # annotation. A missing annotation is a failure — these files were
-  # silently skipped for months because the old loop only iterated
-  # files containing test blocks (2u).
-  expected=$(grep -o 'Expected exit code: [0-9]*' "$f" | head -1 | grep -o '[0-9]*$' || true)
-  if [ -z "$expected" ]; then
-    echo "  ✗ $name (main-style file missing '-- Expected exit code: N' annotation)"
-    echo "  $name: missing expected-exit annotation" > "$errf"
-    echo "fail 1 0 0" > "$meta"
-    exit 0
-  fi
-  tmpbin=$(mktemp /tmp/weft_main_XXXXXX)
-  compile_exit=0
-  compile_start=$(now_s)
-  run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" compile "$f" > "$tmpbin" 2>/dev/null || compile_exit=$?
-  compile_elapsed=$(($(now_s) - compile_start))
-  if [ $compile_exit -ne 0 ]; then
-    echo "  ✗ $name (compilation failed; exit $compile_exit; compile ${compile_elapsed}s)"
-    echo "  $name: compilation failed (exit $compile_exit)" > "$errf"
-    echo "fail 1 $compile_elapsed 0" > "$meta"
-    rm -f "$tmpbin"
-    exit 0
-  fi
-  chmod +x "$tmpbin"
-  # Expected values must stay below 124: run_guarded reserves 124/125
-  # for timeout/RSS kills, and exit codes are mod-256 anyway.
-  exit_code=0
-  run_start=$(now_s)
-  run_guarded "$WEFT_TEST_RUN_TIMEOUT" "$WEFT_TEST_RUN_RSS_LIMIT_KB" "$tmpbin" >/dev/null 2>/dev/null || exit_code=$?
-  run_elapsed=$(($(now_s) - run_start))
-  if [ "$exit_code" = "$expected" ]; then
-    if [ "$WEFT_TEST_SHOW_TIMINGS" -eq 1 ]; then
-      echo "  ✓ $name (=$expected; compile ${compile_elapsed}s, run ${run_elapsed}s)"
-    else
-      echo "  ✓ $name"
-    fi
-    echo "pass 1 $compile_elapsed $run_elapsed" > "$meta"
-  else
-    echo "  ✗ $name (exit $exit_code, expected $expected)"
-    echo "  $name: exit $exit_code != expected $expected" > "$errf"
-    echo "fail 1 $compile_elapsed $run_elapsed" > "$meta"
-  fi
-  rm -f "$tmpbin"
-  exit 0
-fi
-
 echo "=== Weft Test Suite ==="
 echo "runtime compile timeout: ${WEFT_TEST_COMPILE_TIMEOUT}s"
 echo "runtime run timeout: ${WEFT_TEST_RUN_TIMEOUT}s"
@@ -167,39 +96,37 @@ echo "runtime jobs: ${WEFT_TEST_JOBS}"
 echo ""
 
 RESULTS_DIR=$(mktemp -d /tmp/weft_suite_XXXXXX)
-export WEFT_TEST_RESULTS_DIR="$RESULTS_DIR"
-LIST="$RESULTS_DIR/files.list"
-MODERN_ERR="$RESULTS_DIR/modern.err"
-MODERN_OUT="$RESULTS_DIR/modern.out"
-MODERN_TEST_FILES=()
-MODERN_TEST_BLOCKS=0
-: > "$LIST"
+PLANNER_ERR="$RESULTS_DIR/planner.err"
+PLANNER_OUT="$RESULTS_DIR/planner.out"
+RUNTIME_TEST_FILES=()
+RUNTIME_TEST_BLOCKS=0
 
 for f in test/*.weft; do
   if grep -q 'test "' "$f"; then
-    MODERN_TEST_FILES+=("$f")
+    RUNTIME_TEST_FILES+=("$f")
     file_blocks=$(grep -c 'test "' "$f")
-    MODERN_TEST_BLOCKS=$((MODERN_TEST_BLOCKS + file_blocks))
+    RUNTIME_TEST_BLOCKS=$((RUNTIME_TEST_BLOCKS + file_blocks))
   elif grep -qE '(^|[[:space:]])fn[[:space:]]+main[[:space:]]*\(' "$f"; then
     # Imported helper/data modules also live under test/. Only standalone
-    # programs with an actual main declaration belong to the legacy runner.
-    echo "main:$f"
+    # programs with an actual main declaration are project roots. The planner
+    # validates their required expected-exit directive.
+    RUNTIME_TEST_FILES+=("$f")
+    RUNTIME_TEST_BLOCKS=$((RUNTIME_TEST_BLOCKS + 1))
   fi
-done >> "$LIST"
+done
 
 # The public planner owns discovery, checked-dependency sharing, root
 # isolation, compile/link/run timeouts, RSS accounting, and worker scheduling.
 # Capture once, then replay root results in canonical path order so repository
 # observation stays deterministic even though workers finish out of order.
-modern_count=${#MODERN_TEST_FILES[@]}
-if [ "$modern_count" -gt 0 ]; then
-  modern_exit=0
-  WEFT_TEST_METRICS=1 "$WEFT" test --jobs "$WEFT_TEST_JOBS" "${MODERN_TEST_FILES[@]}" > "$MODERN_OUT" 2> "$MODERN_ERR" || modern_exit=$?
-  modern_failures=0
-  for f in "${MODERN_TEST_FILES[@]}"; do
-    name=$(basename "$f" .weft)
-    pass_report=$(grep -F "  pass: $f (" "$MODERN_ERR" | tail -1 || true)
-    fail_report=$(grep -F "  FAIL: $f (" "$MODERN_ERR" | tail -1 || true)
+runtime_count=${#RUNTIME_TEST_FILES[@]}
+if [ "$runtime_count" -gt 0 ]; then
+  planner_exit=0
+  WEFT_TEST_METRICS=1 "$WEFT" test --jobs "$WEFT_TEST_JOBS" "${RUNTIME_TEST_FILES[@]}" > "$PLANNER_OUT" 2> "$PLANNER_ERR" || planner_exit=$?
+  planner_failures=0
+  for f in "${RUNTIME_TEST_FILES[@]}"; do
+    pass_report=$(grep -F "  pass: $f (" "$PLANNER_ERR" | tail -1 || true)
+    fail_report=$(grep -F "  FAIL: $f (" "$PLANNER_ERR" | tail -1 || true)
     RUNTIME_FILES=$((RUNTIME_FILES+1))
     if [ -n "$pass_report" ] && [ -z "$fail_report" ]; then
       echo "$pass_report"
@@ -207,31 +134,31 @@ if [ "$modern_count" -gt 0 ]; then
     elif [ -n "$fail_report" ]; then
       echo "$fail_report"
       FAIL=$((FAIL+1))
-      modern_failures=$((modern_failures+1))
+      planner_failures=$((planner_failures+1))
     else
       echo "  FAIL: $f (public planner produced no root result)"
       FAIL=$((FAIL+1))
-      modern_failures=$((modern_failures+1))
+      planner_failures=$((planner_failures+1))
     fi
   done
-  RUNTIME_TESTS=$((RUNTIME_TESTS + MODERN_TEST_BLOCKS))
+  RUNTIME_TESTS=$((RUNTIME_TESTS + RUNTIME_TEST_BLOCKS))
 
-  metrics_line=$(grep '^WEFT_TEST_METRICS ' "$MODERN_ERR" | tail -1 || true)
+  metrics_line=$(grep '^WEFT_TEST_METRICS ' "$PLANNER_ERR" | tail -1 || true)
   read -r metrics_marker metrics_version metrics_roots metrics_measured metrics_wall metrics_discovery metrics_planning metrics_compile metrics_link metrics_run metrics_user metrics_system metrics_peak metrics_extra <<< "$metrics_line"
   metrics_valid=1
   if [ "$metrics_marker" != "WEFT_TEST_METRICS" ] || [ "$metrics_version" != "1" ] || [ -n "${metrics_extra:-}" ]; then
     metrics_valid=0
   elif ! [[ "$metrics_roots" =~ ^[0-9]+$ && "$metrics_measured" =~ ^[0-9]+$ && "$metrics_wall" =~ ^[0-9]+$ && "$metrics_discovery" =~ ^[0-9]+$ && "$metrics_planning" =~ ^[0-9]+$ && "$metrics_compile" =~ ^[0-9]+$ && "$metrics_link" =~ ^[0-9]+$ && "$metrics_run" =~ ^[0-9]+$ && "$metrics_user" =~ ^[0-9]+$ && "$metrics_system" =~ ^[0-9]+$ && "$metrics_peak" =~ ^[0-9]+$ ]]; then
     metrics_valid=0
-  elif [ "$metrics_roots" -ne "$modern_count" ] || [ "$metrics_measured" -gt "$metrics_roots" ]; then
+  elif [ "$metrics_roots" -ne "$runtime_count" ] || [ "$metrics_measured" -gt "$metrics_roots" ]; then
     metrics_valid=0
-  elif [ "$modern_failures" -eq 0 ] && [ "$metrics_measured" -ne "$modern_count" ]; then
+  elif [ "$planner_failures" -eq 0 ] && [ "$metrics_measured" -ne "$runtime_count" ]; then
     metrics_valid=0
   fi
   if [ "$metrics_valid" -eq 1 ]; then
     RUNTIME_COMPILE_SECONDS=$((RUNTIME_COMPILE_SECONDS + (metrics_compile + metrics_link + 999) / 1000))
     RUNTIME_RUN_SECONDS=$((RUNTIME_RUN_SECONDS + (metrics_run + 999) / 1000))
-    human_metrics=$(grep '^test metrics:' "$MODERN_ERR" | tail -1 || true)
+    human_metrics=$(grep '^test metrics:' "$PLANNER_ERR" | tail -1 || true)
     if [ -n "$human_metrics" ]; then echo "  $human_metrics"; fi
   else
     echo "  FAIL: public planner emitted invalid aggregate metrics"
@@ -239,48 +166,17 @@ if [ "$modern_count" -gt 0 ]; then
     ERRORS="$ERRORS\n  public planner emitted invalid aggregate metrics: $metrics_line"
   fi
 
-  expected_modern_exit=0
-  if [ "$modern_failures" -gt 0 ]; then expected_modern_exit=1; fi
-  if [ "$modern_exit" -ne "$expected_modern_exit" ]; then
-    echo "  FAIL: public planner exit $modern_exit disagrees with $modern_failures failed roots"
+  expected_planner_exit=0
+  if [ "$planner_failures" -gt 0 ]; then expected_planner_exit=1; fi
+  if [ "$planner_exit" -ne "$expected_planner_exit" ]; then
+    echo "  FAIL: public planner exit $planner_exit disagrees with $planner_failures failed roots"
     FAIL=$((FAIL+1))
     ERRORS="$ERRORS\n  public planner exit/result disagreement"
   fi
-  if [ "$modern_failures" -gt 0 ]; then
-    ERRORS="$ERRORS\n$(cat "$MODERN_ERR")"
+  if [ "$planner_failures" -gt 0 ]; then
+    ERRORS="$ERRORS\n$(cat "$PLANNER_ERR")"
   fi
 fi
-
-# Main-style fixtures still compile and execute independently because their
-# expected process exit is the assertion. Keep this compatibility pool bounded.
-if [ -s "$LIST" ]; then
-  xargs -n1 -P "$WEFT_TEST_JOBS" bash "$0" __worker < "$LIST" || true
-fi
-
-while IFS= read -r item; do
-  f="${item#*:}"
-  name=$(basename "$f" .weft)
-  meta="$RESULTS_DIR/$name.meta"
-  RUNTIME_FILES=$((RUNTIME_FILES+1))
-  if [ -f "$meta" ]; then
-    read -r status file_tests compile_s run_s < "$meta"
-    RUNTIME_TESTS=$((RUNTIME_TESTS+file_tests))
-    RUNTIME_COMPILE_SECONDS=$((RUNTIME_COMPILE_SECONDS+compile_s))
-    RUNTIME_RUN_SECONDS=$((RUNTIME_RUN_SECONDS+run_s))
-    if [ "$status" = "pass" ]; then
-      PASS=$((PASS+1))
-    else
-      FAIL=$((FAIL+1))
-      if [ -f "$RESULTS_DIR/$name.err" ]; then
-        ERRORS="$ERRORS\n$(cat "$RESULTS_DIR/$name.err")"
-      fi
-    fi
-  else
-    echo "  ✗ $name (worker produced no result)"
-    FAIL=$((FAIL+1))
-    ERRORS="$ERRORS\n  $name: worker produced no result"
-  fi
-done < "$LIST"
 
 rm -rf "$RESULTS_DIR"
 
@@ -386,7 +282,7 @@ echo ""
 echo "=== Summary ==="
 echo "$PASS suite groups passed, $FAIL failed"
 echo "Runtime tests: $RUNTIME_FILES files, $RUNTIME_TESTS test blocks"
-echo "Runtime compile time: ${RUNTIME_COMPILE_SECONDS}s (cpu-summed; pool width ${WEFT_TEST_JOBS})"
+echo "Runtime compile time: ${RUNTIME_COMPILE_SECONDS}s (cpu-summed; planner worker width ${WEFT_TEST_JOBS})"
 echo "Runtime execution time: ${RUNTIME_RUN_SECONDS}s (cpu-summed)"
 if [ -n "$ERRORS" ]; then
   echo ""
