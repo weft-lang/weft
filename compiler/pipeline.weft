@@ -26434,6 +26434,7 @@ pub(package) fn pipeline_ir_native_f64_gpr_pass_inst(inst: IrInst, f64_slots: i6
     IrPtrStoreI64(dst, ptr, value) -> pipeline_ir_native_int_list_add_unique(gpr_values, ptr) + pipeline_ir_native_int_list_add_unique(gpr_values, value)
     IrCallI64(dst, callee_hash, args) -> pipeline_ir_native_mark_value_list(args, gpr_values)
     IrManagedStakeI64(dst, value, cleanup_kind, delta) -> pipeline_ir_native_int_list_add_unique(gpr_values, value)
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> pipeline_ir_native_int_list_add_unique(gpr_values, value)
     IrIndirectCallI64(dst, callee, args) -> pipeline_ir_native_int_list_add_unique(gpr_values, callee) + pipeline_ir_native_mark_value_list(args, gpr_values)
     IrGenericCallI64(dst, callee_hash, type_args, args) -> pipeline_ir_native_mark_value_list(args, gpr_values)
     IrVectorGetI64(dst, vec, index, fallback, check_mode) -> pipeline_ir_native_int_list_add_unique(gpr_values, vec) + pipeline_ir_native_int_list_add_unique(gpr_values, index) + pipeline_ir_native_int_list_add_unique(gpr_values, fallback)
@@ -26931,6 +26932,9 @@ pub(package) fn pipeline_ir_abort_cleanup_inst_has_action(inst: IrInst, value: i
     IrManagedStakeI64(dst, stake_value, cleanup_kind, delta) -> {
       if kind == pipeline_ir_abort_cleanup_direct_kind() and delta == 0 - 1 and stake_value == value and pipeline_managed_release_hash_for_kind(cleanup_kind) == action { 1 } else { 0 }
     }
+    IrManagedTransferI64(call_dst, callee_hash, transfer_value, arg_lane, cleanup_kind) -> {
+      if kind == pipeline_ir_abort_cleanup_direct_kind() and transfer_value == value and pipeline_managed_release_hash_for_kind(cleanup_kind) == action { 1 } else { 0 }
+    }
     IrOwnedDropI64(drop_value, type_hash) -> {
       if kind == pipeline_ir_abort_cleanup_owned_kind() and drop_value == value and type_hash == action { 1 } else { 0 }
     }
@@ -27075,6 +27079,9 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_inst_list(insts: IrInstList, a
           if delta == 0 - 1 {
             pipeline_ir_abort_cleanup_add_action_fact(facts, value, pipeline_managed_release_hash_for_kind(cleanup_kind), pipeline_ir_abort_cleanup_direct_kind())
           } else { 0 }
+        }
+        IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> {
+          pipeline_ir_abort_cleanup_add_action_fact(facts, value, pipeline_managed_release_hash_for_kind(cleanup_kind), pipeline_ir_abort_cleanup_direct_kind())
         }
         IrOwnedDropI64(value, type_hash) -> pipeline_ir_abort_cleanup_add_action_fact(facts, value, type_hash, pipeline_ir_abort_cleanup_owned_kind())
         IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> {
@@ -31998,6 +32005,19 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
       }
       ctx
     }
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> {
+      let release_hash = pipeline_managed_release_hash_for_kind(cleanup_kind)
+      if call_dst < 0 or callee_hash == 0 or value < 0 or arg_lane < 0 or release_hash == 0 {
+        fmap_inc_emit_error_count(fm)
+        bu32(code, encode_brk(65))
+      } else {
+        -- The callee now owns the caller's original stake. No RC call is
+        -- emitted, but an active abort-cleanup shadow record must be disarmed
+        -- at the transfer point so a later abort cannot release it twice.
+        pipeline_ir_abort_cleanup_emit_disarm_direct(code, value, release_hash, fm, pinned)
+      }
+      ctx
+    }
     IrCallResultLaneI64(dst, lane) -> {
       pipeline_ir_native_emit_call_result_lane(code, dst, lane, pinned)
       ctx
@@ -33308,6 +33328,8 @@ pub(package) fn pipeline_ir_native_resident_inst_simple(inst: IrInst) -> i64 {
     IrFieldLoadI64(dst, base, field_hash, field_index) -> 1
     IrRecordLayoutWordLoadI64(dst, base, record_data_size, field_hash, byte_offset) -> 1
     IrVariantPayloadI64(dst, base, index) -> 1
+    -- No RC call: only abort-shadow disarm bookkeeping through x15-x17.
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> 1
     -- 2v Stage 2 C1 simple-flip: pool-transparent intrinsics (clobber
     -- mask misses x1-x14 entirely) are plain inline instructions, not
     -- barriers. Their reads stage via move_call_args and their x17
@@ -33380,6 +33402,7 @@ pub(package) fn pipeline_ir_native_resident_inst_cs_use_safe(inst: IrInst) -> i6
       if callee_hash == pipeline_ir_pseudo_par_lowering_marker_hash() { 0 } else { 1 }
     }
     IrManagedStakeI64(dst, value, cleanup_kind, delta) -> 1
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> 1
     IrPerformI64(dst, effect_hash, op_hash, args) -> 1
     IrResumeI64(dst, value) -> 1
     IrIndirectCallI64(dst, callee, args) -> 1
@@ -36747,10 +36770,62 @@ pub(package) fn pipeline_ir_materialise_managed_stake_inst(inst: IrInst) -> IrIn
   }
 }
 
+pub(package) fn pipeline_ir_managed_transfer_matches_call(marker: IrInst, call: IrInst) -> i64 {
+  match marker {
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> {
+      let release_hash = pipeline_managed_release_hash_for_kind(cleanup_kind)
+      if release_hash == 0 or call_dst < 0 or callee_hash == 0 or value < 0 or arg_lane < 0 { 0 }
+      else {
+        let actual_dst = pipeline_ir_ownership_transfer_call_dst_or(call, 0 - 1)
+        let actual_hash = pipeline_ir_ownership_transfer_call_hash(call)
+        let actual_value = pipeline_ir_value_list_get_or(pipeline_ir_ownership_transfer_call_args(call), arg_lane, 0 - 1)
+        if actual_dst == call_dst and actual_hash == callee_hash and actual_value == value { 1 } else { 0 }
+      }
+    }
+    _ -> 0
+  }
+}
+
+pub(package) fn pipeline_ir_managed_transfer_following_call(insts: IrInstList) -> IrInst {
+  match insts {
+    IrInstCons(inst, rest) -> match inst {
+      IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> pipeline_ir_managed_transfer_following_call(rest)
+      _ -> inst
+    }
+    IrInstNil -> IrLoweringFailureI64(65)
+  }
+}
+
+pub(package) fn pipeline_ir_managed_transfer_run_has_duplicate(marker: IrInst, insts: IrInstList) -> i64 {
+  match marker {
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> match insts {
+      IrInstCons(inst, rest) -> match inst {
+        IrManagedTransferI64(next_dst, next_hash, next_value, next_lane, next_kind) -> {
+          if next_value == value or next_lane == arg_lane { 1 }
+          else { pipeline_ir_managed_transfer_run_has_duplicate(marker, rest) }
+        }
+        _ -> 0
+      }
+      IrInstNil -> 0
+    }
+    _ -> 1
+  }
+}
+
 pub(package) fn pipeline_ir_materialise_managed_stake_insts(insts: IrInstList) -> IrInstList {
   match insts {
     IrInstNil -> IrInstNil
-    IrInstCons(inst, rest) -> IrInstCons(pipeline_ir_materialise_managed_stake_inst(inst), pipeline_ir_materialise_managed_stake_insts(rest))
+    IrInstCons(inst, rest) -> match inst {
+      IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> {
+        let call = pipeline_ir_managed_transfer_following_call(rest)
+        if pipeline_ir_managed_transfer_matches_call(inst, call) == 1 and pipeline_ir_managed_transfer_run_has_duplicate(inst, rest) == 0 {
+          IrInstCons(inst, pipeline_ir_materialise_managed_stake_insts(rest))
+        } else {
+          IrInstCons(IrLoweringFailureI64(65), pipeline_ir_materialise_managed_stake_insts(rest))
+        }
+      }
+      _ -> IrInstCons(pipeline_ir_materialise_managed_stake_inst(inst), pipeline_ir_materialise_managed_stake_insts(rest))
+    }
   }
 }
 
@@ -37611,6 +37686,7 @@ pub(package) fn pipeline_ir_rewrite_inst_uses(inst: IrInst, aliases: PipelineIrA
     IrLoadI64(dst, slot) -> IrLoadI64(dst, slot)
     IrStoreI64(slot, value) -> IrStoreI64(slot, pipeline_ir_alias_env_lookup_or(aliases, value))
     IrManagedStakeI64(dst, value, cleanup_kind, delta) -> IrManagedStakeI64(dst, pipeline_ir_alias_env_lookup_or(aliases, value), cleanup_kind, delta)
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> IrManagedTransferI64(call_dst, callee_hash, pipeline_ir_alias_env_lookup_or(aliases, value), arg_lane, cleanup_kind)
     IrReuseInitI64(token, constructor) -> IrReuseInitI64(pipeline_ir_alias_env_lookup_or(aliases, token), pipeline_ir_rewrite_inst_uses(constructor, aliases))
   }
 }
@@ -37741,6 +37817,7 @@ pub(package) fn pipeline_ir_max_inst_value(inst: IrInst, current: i64) -> i64 {
     IrLoadI64(dst, slot) -> pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst), slot)
     IrStoreI64(slot, value) -> pipeline_ir_max_i64(pipeline_ir_max_i64(current, slot), value)
     IrManagedStakeI64(dst, value, cleanup_kind, delta) -> pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst), value)
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> pipeline_ir_max_i64(pipeline_ir_max_i64(current, call_dst), value)
     IrReuseInitI64(token, constructor) -> pipeline_ir_max_inst_value(constructor, pipeline_ir_max_i64(current, token))
   }
 }
@@ -37950,6 +38027,7 @@ pub(package) fn pipeline_ir_live_inst_def(inst: IrInst) -> i64 {
     IrLoadI64(dst, slot) -> dst
     IrStoreI64(slot, value) -> slot
     IrManagedStakeI64(dst, value, cleanup_kind, delta) -> dst
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> 0 - 1
     IrReuseInitI64(token, constructor) -> pipeline_ir_live_inst_def(constructor)
   }
 }
@@ -38025,6 +38103,7 @@ pub(package) fn pipeline_ir_live_add_inst_uses(set: i64, inst: IrInst, count: i6
     IrLoadI64(dst, slot) -> pipeline_ir_live_add(set, slot, count)
     IrStoreI64(slot, value) -> pipeline_ir_live_add(set, value, count)
     IrManagedStakeI64(dst, value, cleanup_kind, delta) -> pipeline_ir_live_add(set, value, count)
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> pipeline_ir_live_add(set, value, count)
     IrReuseInitI64(token, constructor) -> pipeline_ir_live_add_inst_uses(set, constructor, pipeline_ir_live_add(set, token, count))
   }
 }
@@ -48114,6 +48193,7 @@ pub(package) fn pipeline_ir_inst_def_or(inst: IrInst, default: i64) -> i64 {
     IrLoadI64(dst, slot) -> dst
     IrStoreI64(slot, value) -> default
     IrManagedStakeI64(dst, value, cleanup_kind, delta) -> dst
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> default
     IrReuseInitI64(token, constructor) -> pipeline_ir_inst_def_or(constructor, default)
   }
 }
@@ -48213,6 +48293,7 @@ pub(package) fn pipeline_ir_live_set_add_inst_uses(inst: IrInst, live: PipelineI
     IrLoadI64(dst, slot) -> pipeline_ir_live_set_add(live, slot)
     IrStoreI64(slot, value) -> pipeline_ir_live_set_add(pipeline_ir_live_set_add(live, slot), value)
     IrManagedStakeI64(dst, value, cleanup_kind, delta) -> pipeline_ir_live_set_add(live, value)
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> pipeline_ir_live_set_add(live, value)
     IrReuseInitI64(token, constructor) -> pipeline_ir_live_set_add_inst_uses(constructor, pipeline_ir_live_set_add(live, token))
   }
 }
@@ -52641,6 +52722,244 @@ pub(package) fn pipeline_ir_reuse_blocks(blocks: IrBlockList) -> IrBlockList {
   }
 }
 
+-- ======================================================================
+-- B2.2 ownership motion (Morphic / Swift SIL ladder)
+--
+-- A compiler-generated retain immediately establishes a callee-owned stake.
+-- When the caller's original stake has its exact last use at that call, move
+-- the original stake instead: delete the temporary acquire and the caller's
+-- later consume, and record the transfer explicitly. This first rung is
+-- deliberately same-block and exact-identity. It crosses neither aliases nor
+-- CFG joins; RC-identity classes are a later producer, not a guess here.
+-- ======================================================================
+
+pub(package) fn pipeline_ir_ownership_transfer_call_hash(inst: IrInst) -> i64 {
+  match inst {
+    IrCallI64(dst, callee_hash, args) -> callee_hash
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> mono_spec_hash(callee_hash, type_expr_list_to_nodes(type_args))
+    _ -> 0
+  }
+}
+
+pub(package) fn pipeline_ir_ownership_transfer_call_dst_or(inst: IrInst, default: i64) -> i64 {
+  match inst {
+    IrCallI64(dst, callee_hash, args) -> dst
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> dst
+    _ -> default
+  }
+}
+
+-- Exact physical ABI lane, or -1 unless the value occurs exactly once.
+pub(package) fn pipeline_ir_ownership_transfer_arg_lane(values: IrValueList, source: i64) -> i64 {
+  let mut cur = values
+  let mut index = 0
+  let mut found = 0 - 1
+  let mut count = 0
+  let mut done = 0
+  while done == 0 {
+    match cur {
+      IrValueNil -> { done = 1 }
+      IrValueCons(value, rest) -> {
+        if value == source {
+          found = index
+          count = count + 1
+        } else { 0 }
+        index = index + 1
+        cur = rest
+      }
+    }
+  }
+  if count == 1 { found } else { 0 - 1 }
+}
+
+pub(package) fn pipeline_ir_ownership_transfer_call_args(inst: IrInst) -> IrValueList {
+  match inst {
+    IrCallI64(dst, callee_hash, args) -> args
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> args
+    _ -> IrValueNil
+  }
+}
+
+-- Entry binds are the canonical logical-parameter -> physical-lane map. The
+-- borrowed-mask marker is generated from the same checked signature. Reading
+-- both facts avoids re-inferring ownership from source syntax or helper names.
+pub(package) fn pipeline_ir_ownership_transfer_owned_lane_insts(insts: IrInstList, param_count: i64, arg_lane: i64, cleanup_kind: i64, borrowed_mask: i64, logical_index: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> match inst {
+      IrBindI64(ns, nl, head, ty) -> {
+        if head >= 0 and head < param_count {
+          let lanes = pipeline_type_value_lane_count_or_one(ty)
+          if arg_lane >= head and arg_lane < head + lanes {
+            if cg_mask_has(borrowed_mask, logical_index) == 0 and pipeline_type_value_lane_release_kind(ty, arg_lane - head) == cleanup_kind { 1 } else { 0 }
+          } else {
+            pipeline_ir_ownership_transfer_owned_lane_insts(rest, param_count, arg_lane, cleanup_kind, borrowed_mask, logical_index + 1)
+          }
+        } else {
+          pipeline_ir_ownership_transfer_owned_lane_insts(rest, param_count, arg_lane, cleanup_kind, borrowed_mask, logical_index)
+        }
+      }
+      _ -> pipeline_ir_ownership_transfer_owned_lane_insts(rest, param_count, arg_lane, cleanup_kind, borrowed_mask, logical_index)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_ownership_transfer_function_owns_lane(function: IrFunction, arg_count: i64, arg_lane: i64, cleanup_kind: i64) -> i64 {
+  match function {
+    IrFunction(hash, param_count, blocks, src) -> {
+      if arg_count != param_count or arg_lane < 0 or arg_lane >= param_count { 0 }
+      else {
+        match blocks {
+          IrBlockListCons(block, rest) -> match block {
+            IrBlock(id, params, insts, term) -> {
+              let borrowed_mask = pipeline_ir_native_borrowed_param_mask_from_inst_list(insts)
+              pipeline_ir_ownership_transfer_owned_lane_insts(insts, param_count, arg_lane, cleanup_kind, borrowed_mask, 0)
+            }
+          }
+          _ -> 0
+        }
+      }
+    }
+  }
+}
+
+-- Result fields: tag=1, call destination, exact (possibly mono) callee hash,
+-- physical argument lane, cleanup kind. Zero means the call is not an exact
+-- owned-lane consumer of this provenance.
+pub(package) fn pipeline_ir_ownership_transfer_call_info(inst: IrInst, source: i64, cleanup_kind: i64, facts: PipelineIrSemanticFactList, functions: IrFunctionList) -> i64 {
+  let callee_hash = pipeline_ir_ownership_transfer_call_hash(inst)
+  let args = pipeline_ir_ownership_transfer_call_args(inst)
+  let arg_lane = pipeline_ir_ownership_transfer_arg_lane(args, source)
+  let call_dst = pipeline_ir_ownership_transfer_call_dst_or(inst, 0 - 1)
+  if callee_hash == 0 or call_dst < 0 or arg_lane < 0 or pipeline_ir_semantic_fact_lookup_pure(facts, callee_hash) != 1 { 0 }
+  else {
+    match pipeline_ir_function_list_find_hash(functions, callee_hash) {
+      IrFunctionCons(function, IrFunctionNil) -> {
+        if pipeline_ir_ownership_transfer_function_owns_lane(function, ir_value_list_len(args), arg_lane, cleanup_kind) == 1 {
+          node_new(1, call_dst, callee_hash, arg_lane, cleanup_kind)
+        } else { 0 }
+      }
+      _ -> 0
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_ownership_transfer_value_unused(insts: IrInstList, term: IrTerminator, value: i64) -> i64 {
+  let live = pipeline_ir_reuse_term_add_uses(term, pipeline_ir_reuse_inst_list_add_uses(insts, pipeline_ir_live_set_empty()))
+  if pipeline_ir_live_set_contains(live, value) == 1 { 0 } else { 1 }
+}
+
+pub(package) fn pipeline_ir_ownership_transfer_after_is_exact(insts: IrInstList, term: IrTerminator, source: i64, cleanup_kind: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> match inst {
+      IrManagedStakeI64(dst, value, release_kind, delta) -> {
+        if value == source and release_kind == cleanup_kind and delta == 0 - 1 {
+          if pipeline_ir_ownership_transfer_value_unused(rest, term, dst) == 1 and pipeline_ir_ownership_transfer_value_unused(rest, term, source) == 1 { 1 } else { 0 }
+        } else {
+          let uses = pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty())
+          if pipeline_ir_live_set_contains(uses, source) == 1 { 0 }
+          else { pipeline_ir_ownership_transfer_after_is_exact(rest, term, source, cleanup_kind) }
+        }
+      }
+      _ -> {
+        let uses = pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty())
+        if pipeline_ir_live_set_contains(uses, source) == 1 { 0 }
+        else { pipeline_ir_ownership_transfer_after_is_exact(rest, term, source, cleanup_kind) }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_ownership_transfer_candidate(insts: IrInstList, term: IrTerminator, retain_dst: i64, source: i64, cleanup_kind: i64, facts: PipelineIrSemanticFactList, functions: IrFunctionList) -> i64 {
+  if pipeline_ir_ownership_transfer_value_unused(insts, term, retain_dst) != 1 { 0 }
+  else {
+    match insts {
+      IrInstNil -> 0
+      IrInstCons(inst, rest) -> {
+        let info = pipeline_ir_ownership_transfer_call_info(inst, source, cleanup_kind, facts, functions)
+        if info != 0 {
+          if pipeline_ir_ownership_transfer_after_is_exact(rest, term, source, cleanup_kind) == 1 { info } else { 0 }
+        } else {
+          let uses = pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty())
+          if pipeline_ir_live_set_contains(uses, source) == 1 { 0 }
+          else { pipeline_ir_ownership_transfer_candidate(rest, term, retain_dst, source, cleanup_kind, facts, functions) }
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_ownership_transfer_remove_release(insts: IrInstList, source: i64, cleanup_kind: i64) -> IrInstList {
+  match insts {
+    IrInstNil -> IrInstNil
+    IrInstCons(inst, rest) -> match inst {
+      IrManagedStakeI64(dst, value, release_kind, delta) -> {
+        if value == source and release_kind == cleanup_kind and delta == 0 - 1 { rest }
+        else { IrInstCons(inst, pipeline_ir_ownership_transfer_remove_release(rest, source, cleanup_kind)) }
+      }
+      _ -> IrInstCons(inst, pipeline_ir_ownership_transfer_remove_release(rest, source, cleanup_kind))
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_ownership_transfer_rewrite_rest(insts: IrInstList, source: i64, cleanup_kind: i64, info: i64) -> IrInstList {
+  match insts {
+    IrInstNil -> IrInstNil
+    IrInstCons(inst, rest) -> {
+      let call_dst = pipeline_ir_ownership_transfer_call_dst_or(inst, 0 - 1)
+      let call_hash = pipeline_ir_ownership_transfer_call_hash(inst)
+      if call_dst == node_f1(info) and call_hash == node_f2(info) and pipeline_ir_ownership_transfer_arg_lane(pipeline_ir_ownership_transfer_call_args(inst), source) == node_f3(info) {
+        let marker = IrManagedTransferI64(call_dst, call_hash, source, node_f3(info), cleanup_kind)
+        IrInstCons(marker, IrInstCons(inst, pipeline_ir_ownership_transfer_remove_release(rest, source, cleanup_kind)))
+      } else {
+        IrInstCons(inst, pipeline_ir_ownership_transfer_rewrite_rest(rest, source, cleanup_kind, info))
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_ownership_transfer_insts(insts: IrInstList, term: IrTerminator, facts: PipelineIrSemanticFactList, functions: IrFunctionList) -> IrInstList {
+  match insts {
+    IrInstNil -> IrInstNil
+    IrInstCons(inst, rest) -> match inst {
+      IrManagedStakeI64(dst, source, cleanup_kind, delta) -> {
+        let info = if delta == 1 { pipeline_ir_ownership_transfer_candidate(rest, term, dst, source, cleanup_kind, facts, functions) } else { 0 }
+        if info != 0 {
+          pipeline_ir_ownership_transfer_insts(pipeline_ir_ownership_transfer_rewrite_rest(rest, source, cleanup_kind, info), term, facts, functions)
+        } else {
+          IrInstCons(inst, pipeline_ir_ownership_transfer_insts(rest, term, facts, functions))
+        }
+      }
+      _ -> IrInstCons(inst, pipeline_ir_ownership_transfer_insts(rest, term, facts, functions))
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_ownership_transfer_blocks(blocks: IrBlockList, facts: PipelineIrSemanticFactList, functions: IrFunctionList) -> IrBlockList {
+  match blocks {
+    IrBlockListNil -> IrBlockListNil
+    IrBlockListCons(block, rest) -> {
+      let rewritten = match block {
+        IrBlock(id, params, insts, term) -> IrBlock(id, params, pipeline_ir_ownership_transfer_insts(insts, term, facts, functions), term)
+      }
+      IrBlockListCons(rewritten, pipeline_ir_ownership_transfer_blocks(rest, facts, functions))
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_ownership_transfer_functions(functions: IrFunctionList, all_functions: IrFunctionList, facts: PipelineIrSemanticFactList) -> IrFunctionList {
+  match functions {
+    IrFunctionNil -> IrFunctionNil
+    IrFunctionCons(function, rest) -> {
+      let rewritten = match function {
+        IrFunction(hash, params, blocks, src) -> IrFunction(hash, params, pipeline_ir_ownership_transfer_blocks(blocks, facts, all_functions), src)
+      }
+      IrFunctionCons(rewritten, pipeline_ir_ownership_transfer_functions(rest, all_functions, facts))
+    }
+  }
+}
+
 pub(package) fn pipeline_ir_reuse_functions(functions: IrFunctionList) -> IrFunctionList {
   match functions {
     IrFunctionNil -> IrFunctionNil
@@ -52703,10 +53022,17 @@ pub(package) fn pipeline_optimise_typed_ir_with_promotion(typed: TypedModule, ir
       -- deliberately after copy-prop/mem2reg renumbering: consumers see facts
       -- for the SSA values in the module, never stale pre-optimisation ids.
       let final_semantic_facts = pipeline_ir_semantic_borrow_values_enrich_functions(semantic_facts, promoted_functions, fns, tt)
+      -- Transfer exact last-use caller stakes only after mem2reg has fixed the
+      -- final SSA identities. Generic specialisations and their substituted
+      -- semantic facts already exist here, so the marker records the concrete
+      -- mono hash rather than a template name.
+      let transferred_functions = if promote == 1 {
+        pipeline_ir_ownership_transfer_functions(promoted_functions, promoted_functions, final_semantic_facts)
+      } else { promoted_functions }
       -- Reuse consumes the post-mem2reg SSA shape. The pre-promotion entry is
       -- intentionally an optimiser-only observation point and must retain its
       -- bounded per-function scratch contract.
-      let final_functions = if promote == 1 { pipeline_ir_reuse_functions(promoted_functions) } else { promoted_functions }
+      let final_functions = if promote == 1 { pipeline_ir_reuse_functions(transferred_functions) } else { transferred_functions }
       OptimisedIrModule(
         final_functions,
         0,

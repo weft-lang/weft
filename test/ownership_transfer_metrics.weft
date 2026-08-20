@@ -1,0 +1,286 @@
+-- B2.2: exact last-use caller stakes move into callee-owned ABI lanes.
+-- The fact is semantic typed IR; native emission performs no RC operation.
+
+use compiler/codegen.{*}
+use compiler/typeck.{*}
+use compiler/macho.{*}
+use compiler/object.{*}
+use compiler/ir.{*}
+use compiler/grammar.{*}
+use compiler/pipeline.{*}
+use compiler/lib.{*}
+use compiler/type_registry.{*}
+use compiler/types.{*}
+use runtime/effects.{*}
+
+fn ownership_transfer_test_callee(hash: i64, borrowed: i64) -> IrFunction {
+  let bind = IrBindI64(0, 0, 0, ty_str())
+  let marker = if borrowed == 1 {
+    ir_inst_list_prepend(IrSlotI64(pipeline_ir_borrowed_param_mask_slot(1)), ir_inst_list_empty())
+  } else { ir_inst_list_empty() }
+  let tail = ir_inst_list_prepend(
+    IrConstI64(1, 7),
+    if borrowed == 1 {
+      ir_inst_list_empty()
+    } else {
+      ir_inst_list_prepend(IrManagedStakeI64(2, 0, continuation_cleanup_kind_rc(), 0 - 1), ir_inst_list_empty())
+    }
+  )
+  let insts = ir_inst_list_prepend(bind, ir_inst_list_append(marker, tail))
+  let block = IrBlock(0, ir_value_list_empty(), insts, IrTermReturn(1))
+  IrFunction(hash, 1, ir_block_list_prepend(block, ir_block_list_empty()), 0)
+}
+
+fn ownership_transfer_test_fact(pure: i64) -> i64 {
+  cg_semantic_fact_new_raw(0, 1, pure, if pure == 1 { 0 } else { 1 }, 0, 1, 2, 0)
+}
+
+fn ownership_transfer_test_apply(insts: IrInstList, term: IrTerminator, callee: IrFunction, pure: i64) -> IrInstList {
+  let hash = pipeline_ir_function_hash(callee)
+  let functions = ir_function_list_prepend(callee, ir_function_list_empty())
+  let facts = pipeline_ir_semantic_facts_prepend(hash, ownership_transfer_test_fact(pure), pipeline_ir_semantic_facts_empty())
+  pipeline_ir_ownership_transfer_insts(insts, term, facts, functions)
+}
+
+fn ownership_transfer_test_direct_insts(hash: i64, source: i64, retain_dst: i64, call_dst: i64, release_dst: i64, cleanup_kind: i64) -> IrInstList {
+  ir_inst_list_prepend(
+    IrManagedStakeI64(retain_dst, source, cleanup_kind, 1),
+    ir_inst_list_prepend(
+      IrCallI64(call_dst, hash, ir_value_list_prepend(source, ir_value_list_empty())),
+      ir_inst_list_prepend(IrManagedStakeI64(release_dst, source, cleanup_kind, 0 - 1), ir_inst_list_empty())
+    )
+  )
+}
+
+fn ownership_transfer_test_count(insts: IrInstList, tag: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let here = if ir_inst_tag(inst) == tag { 1 } else { 0 }
+      here + ownership_transfer_test_count(rest, tag)
+    }
+  }
+}
+
+fn ownership_transfer_test_is_marker(inst: IrInst, call_dst: i64, callee_hash: i64, value: i64, arg_lane: i64, cleanup_kind: i64) -> i64 {
+  match inst {
+    IrManagedTransferI64(actual_dst, actual_hash, actual_value, actual_lane, actual_kind) -> {
+      if actual_dst == call_dst and actual_hash == callee_hash and actual_value == value and actual_lane == arg_lane and actual_kind == cleanup_kind { 1 } else { 0 }
+    }
+    _ -> 0
+  }
+}
+
+fn ownership_transfer_test_first_failure_or(insts: IrInstList, default: i64) -> i64 {
+  match insts {
+    IrInstCons(inst, rest) -> match inst {
+      IrLoweringFailureI64(reason) -> reason
+      _ -> default
+    }
+    _ -> default
+  }
+}
+
+test "ownership_transfer_moves_exact_last_use_into_owned_lane" {
+  let hash = 7101
+  let out = ownership_transfer_test_apply(
+    ownership_transfer_test_direct_insts(hash, 5, 10, 11, 12, continuation_cleanup_kind_rc()),
+    IrTermReturn(11),
+    ownership_transfer_test_callee(hash, 0),
+    1
+  )
+  Test.assert_eq(ir_inst_list_len(out), 2)
+  Test.assert_eq(ownership_transfer_test_count(out, 50), 0)
+  Test.assert_eq(ownership_transfer_test_count(out, 51), 1)
+  match out {
+    IrInstCons(marker, IrInstCons(call, IrInstNil)) -> {
+      Test.assert_eq(ownership_transfer_test_is_marker(marker, 11, hash, 5, 0, continuation_cleanup_kind_rc()), 1)
+      Test.assert_eq(pipeline_ir_managed_transfer_matches_call(marker, call), 1)
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+}
+
+test "ownership_transfer_crosses_only_source_free_bookkeeping" {
+  let hash = 7102
+  let input = ir_inst_list_prepend(
+    IrManagedStakeI64(10, 5, continuation_cleanup_kind_rc(), 1),
+    ir_inst_list_prepend(
+      IrConstI64(20, 9),
+      ir_inst_list_prepend(
+        IrCallI64(11, hash, ir_value_list_prepend(5, ir_value_list_empty())),
+        ir_inst_list_prepend(
+          IrConstI64(21, 10),
+          ir_inst_list_prepend(IrManagedStakeI64(12, 5, continuation_cleanup_kind_rc(), 0 - 1), ir_inst_list_empty())
+        )
+      )
+    )
+  )
+  let out = ownership_transfer_test_apply(input, IrTermReturn(11), ownership_transfer_test_callee(hash, 0), 1)
+  Test.assert_eq(ir_inst_list_len(out), 4)
+  Test.assert_eq(ownership_transfer_test_count(out, 51), 1)
+  Test.assert_eq(ownership_transfer_test_count(out, 50), 0)
+}
+
+test "ownership_transfer_rejects_borrowed_impure_and_unknown_callees" {
+  let hash = 7103
+  let input = ownership_transfer_test_direct_insts(hash, 5, 10, 11, 12, continuation_cleanup_kind_rc())
+  let borrowed = ownership_transfer_test_apply(input, IrTermReturn(11), ownership_transfer_test_callee(hash, 1), 1)
+  let impure = ownership_transfer_test_apply(input, IrTermReturn(11), ownership_transfer_test_callee(hash, 0), 0)
+  let unknown = pipeline_ir_ownership_transfer_insts(input, IrTermReturn(11), pipeline_ir_semantic_facts_empty(), ir_function_list_empty())
+  Test.assert_eq(ownership_transfer_test_count(borrowed, 51), 0)
+  Test.assert_eq(ownership_transfer_test_count(impure, 51), 0)
+  Test.assert_eq(ownership_transfer_test_count(unknown, 51), 0)
+  Test.assert_eq(ownership_transfer_test_count(unknown, 50), 2)
+}
+
+test "ownership_transfer_rejects_future_source_and_live_helper_results" {
+  let hash = 7104
+  let input = ownership_transfer_test_direct_insts(hash, 5, 10, 11, 12, continuation_cleanup_kind_rc())
+  let future_source = ownership_transfer_test_apply(input, IrTermReturn(5), ownership_transfer_test_callee(hash, 0), 1)
+  let live_retain = ownership_transfer_test_apply(input, IrTermReturn(10), ownership_transfer_test_callee(hash, 0), 1)
+  let release_result_used = ir_inst_list_append(input, ir_inst_list_prepend(IrUnaryI64(20, IrNot, 12), ir_inst_list_empty()))
+  let live_release = ownership_transfer_test_apply(release_result_used, IrTermReturn(20), ownership_transfer_test_callee(hash, 0), 1)
+  Test.assert_eq(ownership_transfer_test_count(future_source, 51), 0)
+  Test.assert_eq(ownership_transfer_test_count(live_retain, 51), 0)
+  Test.assert_eq(ownership_transfer_test_count(live_release, 51), 0)
+}
+
+test "ownership_transfer_rejects_duplicate_lane_and_kind_mismatch" {
+  let hash = 7105
+  let duplicate = ir_inst_list_prepend(
+    IrManagedStakeI64(10, 5, continuation_cleanup_kind_rc(), 1),
+    ir_inst_list_prepend(
+      IrCallI64(11, hash, ir_value_list_prepend(5, ir_value_list_prepend(5, ir_value_list_empty()))),
+      ir_inst_list_prepend(IrManagedStakeI64(12, 5, continuation_cleanup_kind_rc(), 0 - 1), ir_inst_list_empty())
+    )
+  )
+  let wrong_kind = ownership_transfer_test_direct_insts(hash, 5, 10, 11, 12, continuation_cleanup_kind_closure())
+  Test.assert_eq(ownership_transfer_test_count(ownership_transfer_test_apply(duplicate, IrTermReturn(11), ownership_transfer_test_callee(hash, 0), 1), 51), 0)
+  Test.assert_eq(ownership_transfer_test_count(ownership_transfer_test_apply(wrong_kind, IrTermReturn(11), ownership_transfer_test_callee(hash, 0), 1), 51), 0)
+}
+
+test "ownership_transfer_generic_marker_carries_exact_specialisation" {
+  let base_hash = 7200
+  let type_args = TypeExprListCons(TypeExpr(2, PRIM_I64(), 0, TypeExprListNil), TypeExprListNil)
+  let spec_hash = mono_spec_hash(base_hash, type_expr_list_to_nodes(type_args))
+  let input = ir_inst_list_prepend(
+    IrManagedStakeI64(10, 5, continuation_cleanup_kind_rc(), 1),
+    ir_inst_list_prepend(
+      IrGenericCallI64(11, base_hash, type_args, ir_value_list_prepend(5, ir_value_list_empty())),
+      ir_inst_list_prepend(IrManagedStakeI64(12, 5, continuation_cleanup_kind_rc(), 0 - 1), ir_inst_list_empty())
+    )
+  )
+  let out = ownership_transfer_test_apply(input, IrTermReturn(11), ownership_transfer_test_callee(spec_hash, 0), 1)
+  match out {
+    IrInstCons(marker, IrInstCons(call, IrInstNil)) -> {
+      Test.assert_eq(ownership_transfer_test_is_marker(marker, 11, spec_hash, 5, 0, continuation_cleanup_kind_rc()), 1)
+      Test.assert_eq(if spec_hash != base_hash { 1 } else { 0 }, 1)
+      Test.assert_eq(pipeline_ir_managed_transfer_matches_call(marker, call), 1)
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+}
+
+test "ownership_transfer_native_boundary_is_no_rc_and_abort_aware" {
+  let hash = 7300
+  let marker = IrManagedTransferI64(11, hash, 5, 0, continuation_cleanup_kind_rc())
+  let call = IrCallI64(11, hash, ir_value_list_prepend(5, ir_value_list_empty()))
+  let insts = ir_inst_list_prepend(marker, ir_inst_list_prepend(call, ir_inst_list_empty()))
+  let materialised = pipeline_ir_materialise_managed_stake_insts(insts)
+  let blocks = ir_block_list_prepend(IrBlock(0, ir_value_list_empty(), materialised, IrTermReturn(11)), ir_block_list_empty())
+  Test.assert_eq(ownership_transfer_test_count(materialised, 51), 1)
+  Test.assert_eq(ownership_transfer_test_count(materialised, 50), 0)
+  Test.assert_eq(pipeline_ir_inst_def_or(marker, 0 - 9), 0 - 9)
+  Test.assert_eq(pipeline_ir_native_inst_clobbers_pinned(marker), 0)
+  Test.assert_eq(pipeline_ir_native_resident_inst_simple(marker), 1)
+  Test.assert_eq(pipeline_ir_native_resident_inst_cs_use_safe(marker), 1)
+  Test.assert_eq(pipeline_ir_native_inst_preserves_fp_env(marker), 1)
+  Test.assert_eq(if pipeline_ir_intervals_inst_is_call(marker) { 1 } else { 0 }, 0)
+  Test.assert_eq(pipeline_ir_abort_cleanup_blocks_have_action(blocks, 5, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_direct_kind()), 1)
+}
+
+test "ownership_transfer_native_boundary_accepts_exact_marker_runs" {
+  let hash = 7301
+  let first = IrManagedTransferI64(11, hash, 5, 0, continuation_cleanup_kind_rc())
+  let second = IrManagedTransferI64(11, hash, 6, 1, continuation_cleanup_kind_rc())
+  let call = IrCallI64(11, hash, ir_value_list_prepend(5, ir_value_list_prepend(6, ir_value_list_empty())))
+  let insts = ir_inst_list_prepend(first, ir_inst_list_prepend(second, ir_inst_list_prepend(call, ir_inst_list_empty())))
+  let materialised = pipeline_ir_materialise_managed_stake_insts(insts)
+  Test.assert_eq(ownership_transfer_test_count(materialised, 51), 2)
+  Test.assert_eq(ownership_transfer_test_count(materialised, 36), 0)
+  Test.assert_eq(pipeline_ir_managed_transfer_matches_call(first, pipeline_ir_managed_transfer_following_call(ir_inst_list_prepend(second, ir_inst_list_prepend(call, ir_inst_list_empty())))), 1)
+}
+
+test "ownership_transfer_native_boundary_rejects_malformed_association" {
+  let hash = 7302
+  let wrong_dst = IrManagedTransferI64(99, hash, 5, 0, continuation_cleanup_kind_rc())
+  let wrong_lane = IrManagedTransferI64(11, hash, 5, 1, continuation_cleanup_kind_rc())
+  let bad_kind = IrManagedTransferI64(11, hash, 5, 0, continuation_cleanup_kind_none())
+  let duplicate = IrManagedTransferI64(11, hash, 5, 0, continuation_cleanup_kind_rc())
+  let call = IrCallI64(11, hash, ir_value_list_prepend(5, ir_value_list_empty()))
+  Test.assert_eq(ownership_transfer_test_first_failure_or(pipeline_ir_materialise_managed_stake_insts(ir_inst_list_prepend(wrong_dst, ir_inst_list_prepend(call, ir_inst_list_empty()))), 0), 65)
+  Test.assert_eq(ownership_transfer_test_first_failure_or(pipeline_ir_materialise_managed_stake_insts(ir_inst_list_prepend(wrong_lane, ir_inst_list_prepend(call, ir_inst_list_empty()))), 0), 65)
+  Test.assert_eq(ownership_transfer_test_first_failure_or(pipeline_ir_materialise_managed_stake_insts(ir_inst_list_prepend(bad_kind, ir_inst_list_prepend(call, ir_inst_list_empty()))), 0), 65)
+  Test.assert_eq(ownership_transfer_test_first_failure_or(pipeline_ir_materialise_managed_stake_insts(ir_inst_list_prepend(wrong_dst, ir_inst_list_empty())), 0), 65)
+  Test.assert_eq(ownership_transfer_test_first_failure_or(pipeline_ir_materialise_managed_stake_insts(ir_inst_list_prepend(duplicate, ir_inst_list_prepend(duplicate, ir_inst_list_prepend(call, ir_inst_list_empty())))), 0), 65)
+  Test.assert_eq(ownership_transfer_test_first_failure_or(pipeline_ir_materialise_managed_stake_insts(ir_inst_list_prepend(duplicate, ir_inst_list_prepend(IrConstI64(20, 1), ir_inst_list_prepend(call, ir_inst_list_empty())))), 0), 65)
+}
+
+test "ownership_transfer_source_lowering_elides_real_stakes" {
+  let src = "use stdlib/string.{*} fn ownership_sink(value: str, seed: i64) -> i64 { let a1 = seed + 1 let a2 = a1 + 2 let a3 = a2 + 3 let a4 = a3 + 4 let a5 = a4 + 5 let a6 = a5 + 6 let a7 = a6 + 7 let a8 = a7 + 8 let a9 = a8 + 9 let a10 = a9 + 10 let a11 = a10 + 11 let a12 = a11 + 12 let a13 = a12 + 13 let a14 = a13 + 14 let a15 = a14 + 15 let a16 = a15 + 16 let a17 = a16 + 17 let a18 = a17 + 18 let a19 = a18 + 19 let a20 = a19 + 20 a20 } fn ownership_caller() -> i64 { let name = int_to_str(42) ownership_sink(name, 1) } fn main() -> i64 { let address_taken = ownership_sink ownership_caller() }"
+  let typed = pipeline_check_source(__str_ptr(src), __str_len(src))
+  let lowered = pipeline_lower_ir(typed)
+  let optimised = pipeline_optimise_typed_ir(typed, lowered)
+  let caller_hash = str_hash(__str_ptr("ownership_caller"), 0, __str_len("ownership_caller"))
+  let mut lowered_stakes = 0
+  let mut optimised_stakes = 0
+  let mut optimised_transfers = 0
+  let mut cur = pipeline_ir_functions(lowered)
+  let mut done = 0
+  while done == 0 {
+    match cur {
+      IrFunctionNil -> { done = 1 }
+      IrFunctionCons(function, rest) -> match function {
+        IrFunction(hash, params, blocks, origin) -> {
+          if hash == caller_hash {
+            match blocks {
+              IrBlockListCons(block, tail) -> match block {
+                IrBlock(id, ps, insts, term) -> { lowered_stakes = ownership_transfer_test_count(insts, 50) nil }
+              }
+              _ -> nil
+            }
+          } else { 0 }
+          cur = rest
+        }
+      }
+    }
+  }
+  cur = pipeline_ir_functions(optimised)
+  done = 0
+  while done == 0 {
+    match cur {
+      IrFunctionNil -> { done = 1 }
+      IrFunctionCons(function, rest) -> match function {
+        IrFunction(hash, params, blocks, origin) -> {
+          if hash == caller_hash {
+            match blocks {
+              IrBlockListCons(block, tail) -> match block {
+                IrBlock(id, ps, insts, term) -> {
+                  optimised_stakes = ownership_transfer_test_count(insts, 50)
+                  optimised_transfers = ownership_transfer_test_count(insts, 51)
+                  nil
+                }
+              }
+              _ -> nil
+            }
+          } else { 0 }
+          cur = rest
+        }
+      }
+    }
+  }
+  Test.assert_eq(lowered_stakes, 2)
+  Test.assert_eq(optimised_stakes, 0)
+  Test.assert_eq(optimised_transfers, 1)
+}
