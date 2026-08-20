@@ -2846,7 +2846,7 @@ assert_not_contains "test_path_native_omits_metrics_by_default" "$test_path_nati
 
 printf 'test "first failure" { Test.assert_eq(1, 2) }\n' > "$tmp_test_fail_one"
 printf 'test "second failure" { Test.assert_true(false) }\n' > "$tmp_test_fail_two"
-printf 'test "runs after failure" { Test.assert_eq(42, 42) }\n' > "$tmp_test_after"
+printf 'effect Maybe { fn none() -> i64 } fn local_maybe() -[Maybe]> i64 { Maybe.none() } test "runs after failure" { Test.assert_eq(handle local_maybe() { Maybe.none() -> 42 }, 42) }\n' > "$tmp_test_after"
 set +e
 run_weft_compile_guarded "$WEFT" test "$tmp_test_fail_one" "$tmp_test_after" "$tmp_test_fail_two" > "$tmp_out" 2>"$tmp_err"
 test_path_multi_exit=$?
