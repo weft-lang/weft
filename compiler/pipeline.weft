@@ -220,6 +220,14 @@ pub(package) type PipelinePatternPlan {
   PipelinePatternPlan(PipelineValueEnv, PipelinePatternStepList, i64, i64)
 }
 
+-- A successful consuming pattern is committed only after every discriminator
+-- and guard succeeds. Entries describe independent arm-owned bindings:
+-- tag 1 linear (f1 value, f2 type, f3/f4 name), tag 2 managed copy.
+-- The residual plan contains only wildcard/unbound linear leaves.
+pub(package) type PipelinePatternOwnership {
+  PipelinePatternOwnership(i64, i64, i64, i64)
+}
+
 pub(package) type PipelineHandlerInlineStats {
   PipelineHandlerInlineStats(i64, i64)
 }
@@ -7573,10 +7581,26 @@ pub(package) fn pipeline_lower_pure_call_inline_sidecar(ns: i64, nl: i64, args_e
             let inlined = pipeline_lower_expr_node_typed_sidecar_handler_ctx(body, pipeline_lowered_args_next_value(lowered_args), callee_ctx)
             if ir_lowered_expr_is_valid(inlined) == 0 { ir_lowered_expr_invalid(next_value) }
             else {
+              -- The sidecar used to splice only the source body. That erased
+              -- compiler-inserted cleanup for an unused owned/linear
+              -- parameter, even though the CFG inline path below preserved
+              -- the same epilogue. Keep both inline forms ownership-identical.
+              let linear_drops = pipeline_linear_param_drop_value_insts(
+                callee_params,
+                pipeline_lowered_args_values(lowered_args),
+                0,
+                arg_count,
+                body,
+                fn_src,
+                tt
+              )
               ir_lowered_expr(
                 ir_lowered_expr_value(inlined),
-                ir_lowered_expr_next_value(inlined),
-                ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_lowered_expr_insts(inlined))
+                ir_lowered_expr_next_value(inlined) + ir_inst_list_len(linear_drops),
+                ir_inst_list_append(
+                  pipeline_lowered_args_insts(lowered_args),
+                  ir_inst_list_append(ir_lowered_expr_insts(inlined), linear_drops)
+                )
               )
             }
           }
@@ -26709,6 +26733,7 @@ pub(package) fn pipeline_ir_native_f64_gpr_pass_inst(inst: IrInst, f64_slots: i6
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> pipeline_ir_native_int_list_add_unique(gpr_values, receiver) + pipeline_ir_native_mark_value_list(args, gpr_values)
     IrOwnedDropI64(value, type_hash) -> pipeline_ir_native_int_list_add_unique(gpr_values, value)
     IrStructuralDropI64(value, plan) -> pipeline_ir_native_mark_structural_drop_values(value, plan, gpr_values)
+    IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> pipeline_ir_native_mark_structural_drop_values(value, parent_plan, gpr_values)
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_native_int_list_add_unique(gpr_values, dst_data) + pipeline_ir_native_int_list_add_unique(gpr_values, src_data)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_native_int_list_add_unique(gpr_values, data)
     IrVariantInitI64(dst, tag_hash, args, field_mask) -> pipeline_ir_native_mark_value_list(args, gpr_values)
@@ -27198,6 +27223,10 @@ pub(package) fn pipeline_ir_structural_drop_register_plan(plan: i64, fm: i64) ->
 pub(package) fn pipeline_ir_structural_drop_register_inst(inst: IrInst, fm: i64, fns: i64) -> i64 {
   match inst {
     IrStructuralDropI64(value, plan) -> pipeline_ir_structural_drop_register_plan(plan, fm)
+    IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> {
+      pipeline_ir_structural_drop_register_plan(parent_plan, fm)
+      pipeline_ir_structural_drop_register_plan(residual_plan, fm)
+    }
     IrBindI64(ns, nl, value, ty) -> {
       -- A referenced linear binding may transfer its whole value and therefore
       -- has no eventual IrStructuralDropI64. Its typed bind is still the
@@ -27264,6 +27293,9 @@ pub(package) fn pipeline_ir_abort_cleanup_inst_has_action(inst: IrInst, value: i
     }
     IrStructuralDropI64(drop_value, plan) -> {
       if kind == pipeline_ir_abort_cleanup_structural_kind() and drop_value == value and pipeline_structural_drop_glue_hash(plan) == action { 1 } else { 0 }
+    }
+    IrStructuralSplitI64(split_value, parent_plan, residual_plan, release_backing) -> {
+      if kind == pipeline_ir_abort_cleanup_structural_kind() and split_value == value and pipeline_structural_drop_glue_hash(parent_plan) == action { 1 } else { 0 }
     }
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> {
       if kind == pipeline_ir_abort_cleanup_array_kind() and data == value and
@@ -27418,6 +27450,7 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_inst_list(insts: IrInstList, a
         }
         IrOwnedDropI64(value, type_hash) -> pipeline_ir_abort_cleanup_add_action_fact(facts, value, type_hash, pipeline_ir_abort_cleanup_owned_kind())
         IrStructuralDropI64(value, plan) -> pipeline_ir_abort_cleanup_add_structural_action_fact(facts, value, plan)
+        IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> pipeline_ir_abort_cleanup_add_structural_action_fact(facts, value, parent_plan)
         IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> {
           if pipeline_array_drop_plan_is_active(leaf_count, leaf_stride, leaf_kind) == 1 {
             pipeline_ir_abort_cleanup_add_action_fact(facts, data, pipeline_array_drop_glue_hash(leaf_count, leaf_stride, leaf_kind), pipeline_ir_abort_cleanup_array_kind())
@@ -31780,7 +31813,8 @@ pub(package) fn pipeline_structural_drop_plan_storage_mode(plan: i64) -> i64 {
   else { if kind == 2 or kind == 3 { 2 }
   else { if kind == 4 or kind == 5 { 3 }
   else { if kind == 6 { pipeline_structural_drop_plan_storage_mode(typeck_linear_layout_plan_children(plan)) }
-  else { 0 } } } }
+  else { if kind == 7 { 3 }
+  else { 0 } } } } }
 }
 
 -- The generic IR vocabulary deliberately exposes structural cleanup as one
@@ -31843,7 +31877,8 @@ pub(package) fn pipeline_structural_drop_plan_is_valid(plan: i64) -> i64 {
     } else { if kind == 6 {
       if words > 0 and children != 0 and pipeline_structural_drop_plan_is_valid(children) == 1 and
         pipeline_structural_drop_plan_value_words(children) == words { 1 } else { 0 }
-    } else { 0 } } } }
+    } else { if kind == 7 { if words == 1 and children == 0 { 1 } else { 0 } }
+    else { 0 } } } } }
   }
 }
 
@@ -31900,7 +31935,8 @@ pub(package) fn pipeline_ir_native_emit_structural_memory_plan(code: i64, plan: 
     0
   } else { if kind == 6 {
     pipeline_ir_native_emit_structural_memory_plan(code, typeck_linear_layout_plan_children(plan), word_offset, fm)
-  } else { 0 } } } }
+  } else { if kind == 7 { 0 }
+  else { 0 } } } } }
 }
 
 pub(package) fn pipeline_ir_native_emit_structural_memory_components(code: i64, components: i64, base_word_offset: i64, fm: i64) -> i64 {
@@ -31981,7 +32017,7 @@ pub(package) fn pipeline_ir_native_emit_structural_value_plan(code: i64, value: 
       i = i - 1
     }
     0
-  } else { if kind == 4 or kind == 5 {
+  } else { if kind == 4 or kind == 5 or kind == 7 {
     let target = pipeline_ir_native_ensure_structural_drop_glue(code, plan, fm)
     let phys = pipeline_ir_native_load_reg(code, pinned, value)
     if phys == 0 { 0 } else { bu32(code, encode_add_imm(0, phys, 0)) }
@@ -32001,6 +32037,28 @@ pub(package) fn pipeline_ir_native_emit_structural_drop(code: i64, value: i64, p
     -- abort. The shared thunk then consumes every owned child and backing.
     pipeline_ir_abort_cleanup_emit_disarm_structural(code, value, plan, fm, pinned)
     pipeline_ir_native_emit_structural_value_plan(code, value, plan, fm, pinned)
+  }
+}
+
+pub(package) fn pipeline_ir_native_emit_structural_split(code: i64, value: i64, parent_plan: i64, residual_plan: i64, release_backing: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if pipeline_structural_drop_plan_is_valid(parent_plan) == 0 or
+    (residual_plan != 0 and pipeline_structural_drop_plan_is_valid(residual_plan) == 0) {
+    fmap_inc_emit_error_count(fm)
+    bu32(code, encode_brk(68))
+  } else {
+    -- Pattern loads are aliases until this instruction. Moved child binds have
+    -- already armed their replacement records; now detach the exact parent
+    -- record before wildcard Drop or backing release can enter user code.
+    pipeline_ir_abort_cleanup_emit_disarm_linear_fact(
+      code, value, pipeline_structural_drop_glue_hash(parent_plan), pipeline_ir_abort_cleanup_structural_kind(), fm
+    )
+    if residual_plan != 0 {
+      pipeline_ir_native_emit_structural_value_plan(code, value, residual_plan, fm, pinned)
+    } else { if release_backing == 1 {
+      let phys = pipeline_ir_native_load_reg(code, pinned, value)
+      if phys == 0 { 0 } else { bu32(code, encode_add_imm(0, phys, 0)) }
+      cg_emit_call_lit(code, fm, "rc_default_release")
+    } else { 0 } }
   }
 }
 
@@ -33233,6 +33291,10 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
       pipeline_ir_native_emit_structural_drop(code, value, plan, fm, pinned)
       ctx
     }
+    IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> {
+      pipeline_ir_native_emit_structural_split(code, value, parent_plan, residual_plan, release_backing, fm, pinned)
+      ctx
+    }
     IrArrayStorageI64(dst, byte_size, align) -> {
       pipeline_ir_native_emit_array_storage(code, dst, byte_size, align, fm, pinned)
       ctx
@@ -33403,6 +33465,7 @@ pub(package) fn pipeline_ir_native_inst_preserves_fp_env(inst: IrInst) -> i64 {
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> 0
     IrOwnedDropI64(value, type_hash) -> 0
     IrStructuralDropI64(value, plan) -> 0
+    IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> 0
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> 0
     IrRecordLayoutArrayLoadI64(dst_data, base, record_data_size, byte_offset, byte_size, leaf_count, leaf_stride, leaf_kind) -> 0
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 0
@@ -34409,6 +34472,7 @@ pub(package) fn pipeline_ir_native_inst_clobbers_pinned(inst: IrInst) -> i64 {
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> 1
     IrOwnedDropI64(value, type_hash) -> 1
     IrStructuralDropI64(value, plan) -> 1
+    IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> 1
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> 1
     IrRecordLayoutArrayLoadI64(dst_data, base, record_data_size, byte_offset, byte_size, leaf_count, leaf_stride, leaf_kind) -> 1
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 1
@@ -34940,6 +35004,7 @@ pub(package) fn pipeline_ir_native_resident_inst_fp_cs_simple(inst: IrInst) -> i
       IrStringConcatI64(dst, left, right) -> 1
       IrOwnedDropI64(value, type_hash) -> 1
       IrStructuralDropI64(value, plan) -> 1
+      IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> 1
       IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> 1
       IrRecordLayoutArrayLoadI64(dst_data, base, record_data_size, byte_offset, byte_size, leaf_count, leaf_stride, leaf_kind) -> 1
       IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 1
@@ -38974,6 +39039,7 @@ pub(package) fn pipeline_ir_rewrite_inst_uses(inst: IrInst, aliases: PipelineIrA
     -- Merge aliases preserve flattened value-lane order, so rewriting the
     -- base carries the whole consecutive range to its canonical producer.
     IrStructuralDropI64(value, plan) -> IrStructuralDropI64(pipeline_ir_alias_env_lookup_or(aliases, value), plan)
+    IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> IrStructuralSplitI64(pipeline_ir_alias_env_lookup_or(aliases, value), parent_plan, residual_plan, release_backing)
     IrArrayStorageI64(dst, byte_size, align) -> inst
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> IrArrayCopyI64(pipeline_ir_alias_env_lookup_or(aliases, dst_data), pipeline_ir_alias_env_lookup_or(aliases, src_data), byte_size, leaf_count, leaf_stride, leaf_kind)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> IrArrayDropI64(pipeline_ir_alias_env_lookup_or(aliases, data), leaf_count, leaf_stride, leaf_kind)
@@ -39109,6 +39175,7 @@ pub(package) fn pipeline_ir_max_inst_value(inst: IrInst, current: i64) -> i64 {
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> pipeline_ir_max_value_list(args, pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst), receiver))
     IrOwnedDropI64(value, type_hash) -> pipeline_ir_max_i64(current, value)
     IrStructuralDropI64(value, plan) -> pipeline_ir_max_i64(current, value + pipeline_structural_drop_plan_use_words(plan) - 1)
+    IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> pipeline_ir_max_i64(current, value + pipeline_structural_drop_plan_use_words(parent_plan) - 1)
     IrArrayStorageI64(dst, byte_size, align) -> pipeline_ir_max_i64(current, dst)
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst_data), src_data)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_max_i64(current, data)
@@ -39329,6 +39396,7 @@ pub(package) fn pipeline_ir_live_inst_def(inst: IrInst) -> i64 {
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> dst
     IrOwnedDropI64(value, type_hash) -> 0 - 1
     IrStructuralDropI64(value, plan) -> 0 - 1
+    IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> 0 - 1
     IrArrayStorageI64(dst, byte_size, align) -> dst
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> 0 - 1
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 0 - 1
@@ -39364,6 +39432,7 @@ pub(package) fn pipeline_ir_live_inst_is_call(inst: IrInst) -> i64 {
     IrStringConcatI64(dst, left, right) -> 1
     IrOwnedDropI64(value, type_hash) -> 1
     IrStructuralDropI64(value, plan) -> 1
+    IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> 1
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_array_drop_plan_is_active(leaf_count, leaf_stride, leaf_kind)
     IrRecordLayoutArrayLoadI64(dst_data, base, record_data_size, byte_offset, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_array_drop_plan_is_active(leaf_count, leaf_stride, leaf_kind)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 1
@@ -39407,6 +39476,7 @@ pub(package) fn pipeline_ir_live_add_inst_uses(set: i64, inst: IrInst, count: i6
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> pipeline_ir_live_add_value_list(set, args, pipeline_ir_live_add(set, receiver, count))
     IrOwnedDropI64(value, type_hash) -> pipeline_ir_live_add(set, value, count)
     IrStructuralDropI64(value, plan) -> pipeline_ir_live_add_structural_drop(set, value, plan, count)
+    IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> pipeline_ir_live_add_structural_drop(set, value, parent_plan, count)
     IrArrayStorageI64(dst, byte_size, align) -> count
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_live_add(set, src_data, pipeline_ir_live_add(set, dst_data, count))
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_live_add(set, data, count)
@@ -49677,6 +49747,7 @@ pub(package) fn pipeline_ir_inst_def_or(inst: IrInst, default: i64) -> i64 {
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> dst
     IrOwnedDropI64(value, type_hash) -> default
     IrStructuralDropI64(value, plan) -> default
+    IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> default
     IrArrayStorageI64(dst, byte_size, align) -> dst
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> default
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> default
@@ -49778,6 +49849,7 @@ pub(package) fn pipeline_ir_live_set_add_inst_uses(inst: IrInst, live: PipelineI
     IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> pipeline_ir_live_set_add_values(pipeline_ir_live_set_add(live, receiver), args)
     IrOwnedDropI64(value, type_hash) -> pipeline_ir_live_set_add(live, value)
     IrStructuralDropI64(value, plan) -> pipeline_ir_live_set_add_structural_drop(live, value, plan)
+    IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> pipeline_ir_live_set_add_structural_drop(live, value, parent_plan)
     IrArrayStorageI64(dst, byte_size, align) -> live
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_live_set_add(pipeline_ir_live_set_add(live, dst_data), src_data)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_live_set_add(live, data)
@@ -50443,6 +50515,10 @@ pub(package) fn pipeline_ir_inst_multi_lane_capture_uses(inst: IrInst, value: i6
     -- aliasing its lanes can place unrelated SSA definitions between them.
     IrStructuralDropI64(base, plan) -> {
       let words = pipeline_structural_drop_plan_use_words(plan)
+      if words > 1 and value >= base and value < base + words { 1 } else { 0 }
+    }
+    IrStructuralSplitI64(base, parent_plan, residual_plan, release_backing) -> {
+      let words = pipeline_structural_drop_plan_use_words(parent_plan)
       if words > 1 and value >= base and value < base + words { 1 } else { 0 }
     }
     _ -> 0
@@ -52528,6 +52604,7 @@ pub(package) fn pipeline_mem2reg_mark_inst_uses_dense(inst: IrInst, declared: i6
     }
     IrOwnedDropI64(value, type_hash) -> pipeline_mem2reg_mark_use(value, declared, disq, next_value)
     IrStructuralDropI64(value, plan) -> pipeline_mem2reg_mark_structural_drop(value, plan, declared, disq, next_value)
+    IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> pipeline_mem2reg_mark_structural_drop(value, parent_plan, declared, disq, next_value)
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> {
       pipeline_mem2reg_mark_use(dst_data, declared, disq, next_value)
       pipeline_mem2reg_mark_use(src_data, declared, disq, next_value)
@@ -56757,11 +56834,35 @@ pub(package) fn pipeline_match_ctor_arms_exhaustive_typed(tt: i64, src: i64, arm
   }
 }
 
-pub(package) fn pipeline_lower_match_body_to_blocks(body_expr: Expr, locals: PipelineValueEnv, entry_insts: IrInstList, ctx: PipelineMatchCtx, next_value: i64, start_block: i64) -> PipelineLoweredBlocks {
+pub(package) fn pipeline_lower_match_body_to_blocks(body_expr: Expr, locals: PipelineValueEnv, entry_insts: IrInstList, ctx: PipelineMatchCtx, arm_index: i64, next_value: i64, start_block: i64) -> PipelineLoweredBlocks {
   match ctx {
     PipelineMatchCtx(arms, n_arms, scrutinee_value, params, outer_locals, module, target_block, normalise_owned, scrutinee_ty, result_prim) -> {
       let src = pipeline_lower_module_src(module)
       let tt = pipeline_lower_module_tt(module)
+      let arm = match_arm_list_nth(arms, arm_index)
+      let pattern = match_arm_pattern(arm)
+      let parent_plan = pipeline_linear_cleanup_plan(tt, scrutinee_ty)
+      let ownership_entries = nlist_new()
+      let ownership = if parent_plan == 0 {
+        pipeline_pattern_ownership_result(0, 0, 1)
+      } else {
+        pipeline_pattern_ownership_collect(pattern, scrutinee_ty, parent_plan, locals, module, ownership_entries)
+      }
+      let ownership_valid = match ownership { PipelinePatternOwnership(residual, release_backing, valid, reserved) -> valid }
+      let ownership_commit = pipeline_pattern_ownership_commit(
+        ownership_entries, 0, scrutinee_value, parent_plan, next_value, ir_inst_list_empty(), tt
+      )
+      let residual_plan = match ownership { PipelinePatternOwnership(residual, release_backing, valid, reserved) -> residual }
+      let release_backing = match ownership { PipelinePatternOwnership(residual, release, valid, reserved) -> release }
+      let whole_binding = match pattern { Binding(ns, nl) -> 1 TypedBinding(ns, nl, ann) -> 1 _ -> 0 }
+      let split_insts = if parent_plan != 0 and whole_binding == 0 {
+        ir_inst_list_prepend(ir_inst_structural_split_i64(scrutinee_value, parent_plan, residual_plan, release_backing), ir_inst_list_empty())
+      } else { ir_inst_list_empty() }
+      let ownership_entry_insts = ir_inst_list_append(
+        entry_insts, ir_inst_list_append(ir_lowered_expr_insts(ownership_commit), split_insts)
+      )
+      let body_next_value = ir_lowered_expr_next_value(ownership_commit)
+      let cleanup_needed = pipeline_pattern_ownership_cleanup_needed(ownership_entries, body_expr, src, tt)
       -- Per-arm ownership normalization (2q slice 2): a borrowed arm in
       -- a mixed borrowed/owned match retains on its way to the merge so
       -- the merged value carries the count consumers assume. See
@@ -56772,21 +56873,43 @@ pub(package) fn pipeline_lower_match_body_to_blocks(body_expr: Expr, locals: Pip
       let arm_borrowed = pipeline_expr_result_is_borrowed_with_ctx_typed(body_expr, src, fns, subst, tt)
       let whole_borrowed = if normalise_owned == 1 { 0 } else { pipeline_match_arms_result_is_borrowed_with_ctx_typed(arms, src, fns, subst, tt) }
       let retain_hash = pipeline_managed_arm_needs_retain(arm_borrowed, whole_borrowed, body_ty)
-      if pipeline_expr_needs_cfg_typed(body_expr) == 1 {
+      if ownership_valid == 0 {
+        pipeline_lowered_blocks_invalid(start_block, next_value)
+      } else { if pipeline_expr_needs_cfg_typed(body_expr) == 1 {
         let body_start = if target_block == start_block + 1 { start_block + 2 } else { start_block + 1 }
         let retain_seed = if target_block == body_start + 1 { body_start + 2 } else { body_start + 1 }
         let retain_block = if retain_hash != 0 { retain_seed } else { 0 }
-        let body_target = if retain_hash != 0 { retain_block } else { target_block }
-        let body_next_seed = if retain_hash != 0 { retain_block + 1 } else { body_start + 1 }
+        let cleanup_seed_raw = if retain_hash != 0 { retain_block + 1 } else { retain_seed }
+        let cleanup_seed = pipeline_lower_internal_block_after_target(cleanup_seed_raw, target_block)
+        let cleanup_block = if cleanup_needed == 1 { cleanup_seed } else { 0 }
+        let after_arm_target = if cleanup_needed == 1 { cleanup_block } else { target_block }
+        let body_target = if retain_hash != 0 { retain_block } else { after_arm_target }
+        let body_next_seed = if cleanup_needed == 1 { cleanup_block + 1 } else { if retain_hash != 0 { retain_block + 1 } else { body_start + 1 } }
         let body_next = if target_block == body_next_seed { body_next_seed + 1 } else { body_next_seed }
-        let body_blocks_raw = pipeline_lower_expr_typed_to_target_blocks_reserved_with_float(body_expr, params, locals, module, next_value, body_start, body_next, body_target, result_prim)
-        let body_blocks = pipeline_managed_arm_retain_append(body_blocks_raw, retain_hash, body_ty, retain_block, target_block)
+        let body_blocks_raw = pipeline_lower_expr_typed_to_target_blocks_reserved_with_float(body_expr, params, locals, module, body_next_value, body_start, body_next, body_target, result_prim)
+        let body_blocks = pipeline_managed_arm_retain_append(body_blocks_raw, retain_hash, body_ty, retain_block, after_arm_target)
         if pipeline_lowered_blocks_is_valid(body_blocks) == 1 {
-          let entry = ir_block_new_term(start_block, entry_insts, ir_term_jump(body_start))
-          let blocks = ir_block_list_prepend(entry, pipeline_lowered_blocks_blocks(body_blocks))
+          let result_lanes = pipeline_type_value_lane_count_or_one(body_ty)
+          let fallthrough_value = pipeline_lowered_blocks_next_value(body_blocks)
+          let fallthrough_cleanup = pipeline_pattern_ownership_cleanup(ownership_entries, body_expr, src, tt, fallthrough_value + result_lanes)
+          let cleanup_span = ir_lowered_expr_next_value(fallthrough_cleanup) - fallthrough_value - result_lanes
+          let return_base = ir_lowered_expr_next_value(fallthrough_cleanup)
+          let cleaned_body_blocks = pipeline_ir_block_list_append_return_pattern_cleanup(
+            pipeline_lowered_blocks_blocks(body_blocks), ownership_entries, body_expr, src, tt, return_base, 0
+          )
+          let return_count = pipeline_ir_block_list_return_count(pipeline_lowered_blocks_blocks(body_blocks))
+          let cleanup_node = if cleanup_needed == 1 and pipeline_lowered_blocks_falls_through(body_blocks) == 1 {
+            let carried = pipeline_ir_value_lane_ids(fallthrough_value, 0, result_lanes)
+            ir_block_list_prepend(
+              ir_block_new_params(cleanup_block, carried, ir_lowered_expr_insts(fallthrough_cleanup), ir_term_jump_args(target_block, carried)),
+              ir_block_list_empty()
+            )
+          } else { ir_block_list_empty() }
+          let entry = ir_block_new_term(start_block, ownership_entry_insts, ir_term_jump(body_start))
+          let blocks = ir_block_list_prepend(entry, ir_block_list_append(cleaned_body_blocks, cleanup_node))
           pipeline_lowered_blocks_control(
             pipeline_lowered_blocks_next_block(body_blocks),
-            pipeline_lowered_blocks_next_value(body_blocks),
+            return_base + return_count * cleanup_span,
             blocks,
             1,
             pipeline_lowered_blocks_falls_through(body_blocks)
@@ -56797,21 +56920,22 @@ pub(package) fn pipeline_lower_match_body_to_blocks(body_expr: Expr, locals: Pip
       } else {
         let lower_ctx = pipeline_handler_lower_ctx_from_module(params, locals, module)
         let lowered = if pipeline_prim_is_forced_numeric_context(result_prim) == 1 {
-          pipeline_lower_expr_typed_sidecar_handler_opt_with_float_prim(body_expr, next_value, lower_ctx, result_prim)
-        } else { pipeline_lower_expr_typed_sidecar_handler_ctx(body_expr, next_value, lower_ctx) }
+          pipeline_lower_expr_typed_sidecar_handler_opt_with_float_prim(body_expr, body_next_value, lower_ctx, result_prim)
+        } else { pipeline_lower_expr_typed_sidecar_handler_ctx(body_expr, body_next_value, lower_ctx) }
         if ir_lowered_expr_is_valid(lowered) == 1 {
           let retain_insts = if retain_hash != 0 {
             pipeline_managed_retain_inst_list_with_origin(ir_lowered_expr_value(lowered), body_ty, ir_lowered_expr_next_value(lowered), ir_managed_stake_origin_arm_normalization())
           } else { ir_inst_list_empty() }
           let after_retain = ir_lowered_expr_next_value(lowered) + ir_inst_list_len(retain_insts)
+          let cleanup = pipeline_pattern_ownership_cleanup(ownership_entries, body_expr, src, tt, after_retain)
           let args = pipeline_ir_value_lane_ids(ir_lowered_expr_value(lowered), 0, pipeline_type_value_lane_count_or_one(body_ty))
-          let insts = ir_inst_list_append(entry_insts, ir_inst_list_append(ir_lowered_expr_insts(lowered), retain_insts))
+          let insts = ir_inst_list_append(ownership_entry_insts, ir_inst_list_append(ir_lowered_expr_insts(lowered), ir_inst_list_append(retain_insts, ir_lowered_expr_insts(cleanup))))
           let block = ir_block_new_term(start_block, insts, ir_term_jump_args(target_block, args))
-          pipeline_lowered_blocks(start_block + 1, after_retain, ir_block_list_prepend(block, ir_block_list_empty()), 1)
+          pipeline_lowered_blocks(start_block + 1, ir_lowered_expr_next_value(cleanup), ir_block_list_prepend(block, ir_block_list_empty()), 1)
         } else {
           pipeline_lowered_blocks_invalid(start_block, next_value)
         }
-      }
+      } }
     }
   }
 }
@@ -57113,6 +57237,330 @@ pub(package) fn pipeline_plan_recursive_tuple_children(items: PatternList, base_
   }
 }
 
+pub(package) fn pipeline_pattern_ownership_result(residual: i64, release_backing: i64, valid: i64) -> PipelinePatternOwnership {
+  PipelinePatternOwnership(residual, release_backing, valid, 0)
+}
+
+pub(package) fn pipeline_pattern_ownership_add_binding(entries: i64, pattern: Pattern, value_ty: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
+  let src = pipeline_lower_module_src(module)
+  let tt = pipeline_lower_module_tt(module)
+  match pattern {
+    Binding(ns, nl) -> {
+      let value = pipeline_value_env_lookup(locals, src, ns, nl)
+      let plan = pipeline_linear_cleanup_plan(tt, value_ty)
+      if value < 0 { 0 }
+      else { if plan != 0 { nlist_add(entries, node_new(1, value, value_ty, ns, nl)) }
+      else { if value_ty != 0 and ty_value_has_release_lane(value_ty) == 1 { nlist_add(entries, node_new(2, value, value_ty, ns, nl)) } else { 0 } } }
+      1
+    }
+    TypedBinding(ns, nl, ann) -> {
+      let value = pipeline_value_env_lookup(locals, src, ns, nl)
+      let ty = if ann == 0 { value_ty } else { ann }
+      let plan = pipeline_linear_cleanup_plan(tt, ty)
+      if value < 0 { 0 }
+      else { if plan != 0 { nlist_add(entries, node_new(1, value, ty, ns, nl)) }
+      else { if ty != 0 and ty_value_has_release_lane(ty) == 1 { nlist_add(entries, node_new(2, value, ty, ns, nl)) } else { 0 } } }
+      1
+    }
+    _ -> 0
+  }
+}
+
+pub(package) fn pipeline_pattern_ownership_component_at(components: i64, index: i64) -> i64 {
+  let mut found = 0
+  let count = if components == 0 { 0 } else { nlist_len(components) }
+  let mut i = 0
+  while i < count and found == 0 {
+    let component = nlist_get(components, i)
+    if typeck_linear_layout_component_index(component) == index { found = component } else { i = i + 1 }
+  }
+  found
+}
+
+pub(package) fn pipeline_pattern_ownership_component_hash(components: i64, field_hash: i64) -> i64 {
+  let mut found = 0
+  let count = if components == 0 { 0 } else { nlist_len(components) }
+  let mut i = 0
+  while i < count and found == 0 {
+    let component = nlist_get(components, i)
+    if typeck_linear_layout_component_key(component) == field_hash { found = component } else { i = i + 1 }
+  }
+  found
+}
+
+pub(package) fn pipeline_pattern_ownership_variant_alternative(plan: i64, tag_hash: i64) -> i64 {
+  if plan == 0 or typeck_linear_layout_plan_kind(plan) != 5 { 0 }
+  else { pipeline_ir_abort_cleanup_variant_alternative_for_tag(typeck_linear_layout_plan_children(plan), tag_hash) }
+}
+
+pub(package) fn pipeline_pattern_ownership_pattern_list(patterns: PatternList, payload_types: i64, subst: i64, index: i64, plan_components: i64, locals: PipelineValueEnv, module: PipelineLowerModule, entries: i64, residuals: i64) -> i64 {
+  match patterns {
+    PatternListNil -> 1
+    PatternListCons(pattern, rest) -> {
+      let child_ty = pipeline_expected_arg_type_node(0, payload_types, index, 0, subst)
+      let component = pipeline_pattern_ownership_component_at(plan_components, index)
+      let child_plan = if component == 0 { 0 } else { typeck_linear_layout_component_plan(component) }
+      match pipeline_pattern_ownership_collect(pattern, child_ty, child_plan, locals, module, entries) {
+        PipelinePatternOwnership(residual, release_backing, valid, reserved) -> {
+          if valid == 0 { 0 }
+          else {
+            if residual != 0 {
+              let carried = if component != 0 {
+                typeck_linear_layout_component(
+                  typeck_linear_layout_component_kind(component), typeck_linear_layout_component_key(component),
+                  typeck_linear_layout_component_index(component), typeck_linear_layout_component_offset(component), residual
+                )
+              } else { typeck_linear_layout_component(3, 0, index, index + 1, residual) }
+              nlist_add(residuals, carried)
+            } else { 0 }
+            pipeline_pattern_ownership_pattern_list(rest, payload_types, subst, index + 1, plan_components, locals, module, entries, residuals)
+          }
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_pattern_ownership_record_fields(fields: PatternFieldList, plan_components: i64, locals: PipelineValueEnv, module: PipelineLowerModule, entries: i64, residuals: i64, seen: i64) -> i64 {
+  match fields {
+    PatternFieldListNil -> 1
+    PatternFieldListCons(field, rest) -> {
+      match field {
+        PatternField(ns, nl, pattern, fact) -> {
+          let raw_ty = field_access_fact_field_type_node(fact)
+          let child_ty = if raw_ty == 0 { 0 } else { ty_subst(raw_ty, pipeline_lower_module_subst(module)) }
+          let field_hash = str_hash(pipeline_lower_module_src(module), ns, nl)
+          let component = pipeline_pattern_ownership_component_hash(plan_components, field_hash)
+          let child_plan = if component == 0 { 0 } else { typeck_linear_layout_component_plan(component) }
+          match pipeline_pattern_ownership_collect(pattern, child_ty, child_plan, locals, module, entries) {
+            PipelinePatternOwnership(residual, release_backing, valid, reserved) -> {
+              if valid == 0 { 0 }
+              else {
+                nlist_add(seen, field_hash)
+                if residual != 0 and component != 0 {
+                  nlist_add(residuals, typeck_linear_layout_component(
+                    typeck_linear_layout_component_kind(component), typeck_linear_layout_component_key(component),
+                    typeck_linear_layout_component_index(component), typeck_linear_layout_component_offset(component), residual
+                  ))
+                } else { 0 }
+                pipeline_pattern_ownership_record_fields(rest, plan_components, locals, module, entries, residuals, seen)
+              }
+            }
+          }
+        }
+        UnknownPatternField(tag) -> 0
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_pattern_ownership_hash_seen(seen: i64, hash: i64) -> i64 {
+  let mut found = 0
+  let mut i = 0
+  while i < nlist_len(seen) and found == 0 {
+    if nlist_get(seen, i) == hash { found = 1 } else { i = i + 1 }
+  }
+  found
+}
+
+-- Rebuild a record residual in semantic declaration order. Patterns are free
+-- to spell fields in any order, but Drop order belongs to the layout fact,
+-- never the source pattern traversal.
+pub(package) fn pipeline_pattern_ownership_canonical_record_components(components: i64, seen: i64, replacements: i64) -> i64 {
+  let residuals = nlist_new()
+  let count = if components == 0 { 0 } else { nlist_len(components) }
+  for i in 0..count {
+    let component = nlist_get(components, i)
+    let replacement = pipeline_pattern_ownership_component_hash(replacements, typeck_linear_layout_component_key(component))
+    if replacement != 0 { nlist_add(residuals, replacement) }
+    else { if pipeline_pattern_ownership_hash_seen(seen, typeck_linear_layout_component_key(component)) == 0 {
+      nlist_add(residuals, component)
+    } else { 0 } }
+  }
+  residuals
+}
+
+pub(package) fn pipeline_pattern_ownership_tuple_items(items: PatternList, tuple_ty: i64, index: i64, plan_components: i64, locals: PipelineValueEnv, module: PipelineLowerModule, entries: i64, residuals: i64) -> i64 {
+  match items {
+    PatternListNil -> 1
+    PatternListCons(pattern, rest) -> {
+      let destructured_ty = if ty_is_borrow(tuple_ty) { ty_borrow_inner(tuple_ty) } else { tuple_ty }
+      let field = ty_record_field_at_layout_index(destructured_ty, index)
+      let child_ty = if field == 0 { 0 } else { ty_record_field_type(field) }
+      let component = pipeline_pattern_ownership_component_at(plan_components, index)
+      let child_plan = if component == 0 { 0 } else { typeck_linear_layout_component_plan(component) }
+      match pipeline_pattern_ownership_collect(pattern, child_ty, child_plan, locals, module, entries) {
+        PipelinePatternOwnership(residual, release_backing, valid, reserved) -> {
+          if valid == 0 { 0 }
+          else {
+            if residual != 0 and component != 0 {
+              nlist_add(residuals, typeck_linear_layout_component(
+                typeck_linear_layout_component_kind(component), typeck_linear_layout_component_key(component),
+                typeck_linear_layout_component_index(component), typeck_linear_layout_component_offset(component), residual
+              ))
+            } else { 0 }
+            pipeline_pattern_ownership_tuple_items(rest, tuple_ty, index + 1, plan_components, locals, module, entries, residuals)
+          }
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_pattern_ownership_collect(pattern: Pattern, value_ty: i64, plan: i64, locals: PipelineValueEnv, module: PipelineLowerModule, entries: i64) -> PipelinePatternOwnership {
+  let tt = pipeline_lower_module_tt(module)
+  match pattern {
+    Wildcard -> pipeline_pattern_ownership_result(plan, 0, 1)
+    Binding(ns, nl) -> {
+      pipeline_pattern_ownership_add_binding(entries, pattern, value_ty, locals, module)
+      pipeline_pattern_ownership_result(0, 0, 1)
+    }
+    TypedBinding(ns, nl, ann) -> {
+      pipeline_pattern_ownership_add_binding(entries, pattern, value_ty, locals, module)
+      pipeline_pattern_ownership_result(0, 0, 1)
+    }
+    IntPattern(expected, start, len) -> pipeline_pattern_ownership_result(plan, 0, 1)
+    NilPattern(ns, nl) -> pipeline_pattern_ownership_result(plan, 0, 1)
+    CtorPattern(tag_ns, tag_nl, children, declaration) -> {
+      let destructured_ty = if ty_is_borrow(value_ty) { ty_borrow_inner(value_ty) } else { value_ty }
+      let opaque_entry = if declaration == 0 { 0 } else { ttable_lookup_decl_fact(tt, declaration) }
+      if opaque_entry != 0 and mem_load64_at(opaque_entry, 16) == 5 {
+        let representation = if ty_named_is_opaque(destructured_ty) { ty_named_opaque_representation(destructured_ty) }
+          else { ty_subst(ttable_entry_opaque_representation(opaque_entry), pipeline_lower_module_subst(module)) }
+        let child_plan = if plan != 0 and typeck_linear_layout_plan_kind(plan) == 6 { typeck_linear_layout_plan_children(plan) } else { 0 }
+        match children {
+          PatternListCons(child, PatternListNil) -> match pipeline_pattern_ownership_collect(child, representation, child_plan, locals, module, entries) {
+            PipelinePatternOwnership(residual, child_release, valid, reserved) -> {
+              pipeline_pattern_ownership_result(typeck_linear_layout_residual_wrapper_plan(plan, residual), child_release, valid)
+            }
+          }
+          _ -> pipeline_pattern_ownership_result(0, 0, 0)
+        }
+      } else {
+        let ctor_src = pipeline_pattern_ctor_source(declaration, pipeline_lower_module_src(module))
+        let ctor_ns = pipeline_pattern_ctor_start(declaration, tag_ns, ctor_src)
+        let tag_hash = pipeline_variant_tag_hash(tt, ctor_src, ctor_ns, tag_nl)
+        let payload_types = pipeline_variant_payload_types(tt, ctor_src, ctor_ns, tag_nl)
+        let subst = pipeline_match_variant_instance_subst(tt, ctor_src, ctor_ns, tag_nl, destructured_ty, pipeline_lower_module_subst(module))
+        let alternative = pipeline_pattern_ownership_variant_alternative(plan, tag_hash)
+        let plan_components = if alternative == 0 { 0 } else { typeck_linear_layout_variant_payloads(alternative) }
+        let residuals = nlist_new()
+        let valid = pipeline_pattern_ownership_pattern_list(children, payload_types, subst, 0, plan_components, locals, module, entries, residuals)
+        if valid == 0 { pipeline_pattern_ownership_result(0, 0, 0) }
+        else {
+          let alternatives = nlist_new()
+          if nlist_len(residuals) > 0 {
+            let alt_index = if alternative == 0 { 0 } else { typeck_linear_layout_variant_index(alternative) }
+            let words = if alternative == 0 { 1 } else { typeck_linear_layout_variant_words(alternative) }
+            nlist_add(alternatives, typeck_linear_layout_variant_alternative(tag_hash, alt_index, residuals, words))
+          } else { 0 }
+          let residual = typeck_linear_layout_residual_plan(plan, alternatives)
+          let exact_residual = if residual == 0 and plan != 0 and pipeline_structural_drop_plan_storage_mode(plan) == 3 {
+            typeck_linear_layout_residual_backing_plan(plan)
+          } else { residual }
+          pipeline_pattern_ownership_result(exact_residual, 0, 1)
+        }
+      }
+    }
+    RecordPattern(fields) -> {
+      let components = if plan == 0 { 0 } else { typeck_linear_layout_plan_children(plan) }
+      let replacements = nlist_new()
+      let seen = nlist_new()
+      let valid = pipeline_pattern_ownership_record_fields(fields, components, locals, module, entries, replacements, seen)
+      let residuals = pipeline_pattern_ownership_canonical_record_components(components, seen, replacements)
+      if valid == 0 { pipeline_pattern_ownership_result(0, 0, 0) }
+      else {
+        let residual = typeck_linear_layout_residual_plan(plan, residuals)
+        let exact_residual = if residual == 0 and plan != 0 and pipeline_structural_drop_plan_storage_mode(plan) == 3 {
+          typeck_linear_layout_residual_backing_plan(plan)
+        } else { residual }
+        pipeline_pattern_ownership_result(exact_residual, 0, 1)
+      }
+    }
+    TuplePattern(items) -> {
+      let components = if plan == 0 { 0 } else { typeck_linear_layout_plan_children(plan) }
+      let residuals = nlist_new()
+      let valid = pipeline_pattern_ownership_tuple_items(items, value_ty, 0, components, locals, module, entries, residuals)
+      if valid == 0 { pipeline_pattern_ownership_result(0, 0, 0) }
+      else { pipeline_pattern_ownership_result(typeck_linear_layout_residual_plan(plan, residuals), 0, 1) }
+    }
+    UnknownPattern(tag) -> pipeline_pattern_ownership_result(0, 0, 0)
+  }
+}
+
+pub(package) fn pipeline_pattern_ownership_commit(entries: i64, index: i64, parent_value: i64, parent_plan: i64, next_value: i64, insts: IrInstList, tt: i64) -> IrLoweredExpr {
+  if entries == 0 or index >= nlist_len(entries) { ir_lowered_expr(0, next_value, insts) }
+  else {
+    let entry = nlist_get(entries, index)
+    let kind = node_tag(entry)
+    let value = node_f1(entry)
+    let ty = node_f2(entry)
+    let add = if kind == 1 {
+      let entry_plan = pipeline_linear_cleanup_plan(tt, ty)
+      if value == parent_value and entry_plan != 0 and parent_plan != 0 and typeck_linear_layout_plan_identity(entry_plan) == typeck_linear_layout_plan_identity(parent_plan) {
+        ir_inst_list_empty()
+      } else { ir_inst_list_prepend(ir_inst_bind_typed_i64(node_f3(entry), node_f4(entry), value, ty), ir_inst_list_empty()) }
+    } else { if kind == 2 {
+      pipeline_managed_retain_inst_list_with_origin(value, ty, next_value, ir_managed_stake_origin_binding())
+    } else { ir_inst_list_empty() } }
+    pipeline_pattern_ownership_commit(entries, index + 1, parent_value, parent_plan, next_value + ir_inst_list_len(add), ir_inst_list_append(insts, add), tt)
+  }
+}
+
+pub(package) fn pipeline_pattern_ownership_cleanup(entries: i64, body: Expr, src: i64, tt: i64, next_value: i64) -> IrLoweredExpr {
+  let mut insts = ir_inst_list_empty()
+  let mut next = next_value
+  let count = if entries == 0 { 0 } else { nlist_len(entries) }
+  for reverse_index in 0..count {
+    let entry = nlist_get(entries, count - reverse_index - 1)
+    let kind = node_tag(entry)
+    let value = node_f1(entry)
+    let ty = node_f2(entry)
+    let ns = node_f3(entry)
+    let nl = node_f4(entry)
+    let cleanup = if kind == 1 {
+      let plan = pipeline_linear_cleanup_plan(tt, ty)
+      if plan != 0 and pipeline_expr_refs_name_typed(body, src, ns, nl) == 0 {
+        pipeline_linear_cleanup_inst_list(value, plan)
+      } else { ir_inst_list_empty() }
+    } else { if kind == 2 {
+      if pipeline_expr_final_returns_binding_typed(body, src, ns, nl) == 1 { ir_inst_list_empty() }
+      else { pipeline_managed_release_inst_list_with_origin(value, ty, next, ir_managed_stake_origin_binding()) }
+    } else { ir_inst_list_empty() } }
+    insts = ir_inst_list_append(insts, cleanup)
+    next = next + ir_inst_list_len(cleanup)
+  }
+  ir_lowered_expr(0, next, insts)
+}
+
+pub(package) fn pipeline_pattern_ownership_cleanup_needed(entries: i64, body: Expr, src: i64, tt: i64) -> i64 {
+  let cleanup = pipeline_pattern_ownership_cleanup(entries, body, src, tt, 0)
+  if ir_inst_list_len(ir_lowered_expr_insts(cleanup)) > 0 { 1 } else { 0 }
+}
+
+pub(package) fn pipeline_ir_block_list_append_return_pattern_cleanup(blocks: IrBlockList, entries: i64, body: Expr, src: i64, tt: i64, base_dst: i64, return_index: i64) -> IrBlockList {
+  match blocks {
+    IrBlockListNil -> IrBlockListNil
+    IrBlockListCons(block, rest) -> {
+      let applies = match block {
+        IrBlock(id, params, insts, term) -> match term { IrTermReturn(value) -> 1 _ -> 0 }
+      }
+      let patched = if applies == 1 {
+        let stride_probe = pipeline_pattern_ownership_cleanup(entries, body, src, tt, 0)
+        let stride = ir_lowered_expr_next_value(stride_probe)
+        let cleanup = pipeline_pattern_ownership_cleanup(entries, body, src, tt, base_dst + return_index * stride)
+        match block {
+          IrBlock(id, params, insts, term) -> IrBlock(id, params, ir_inst_list_append(insts, ir_lowered_expr_insts(cleanup)), term)
+        }
+      } else { block }
+      IrBlockListCons(
+        patched,
+        pipeline_ir_block_list_append_return_pattern_cleanup(rest, entries, body, src, tt, base_dst, return_index + applies)
+      )
+    }
+  }
+}
+
 pub(package) fn pipeline_pattern_block_after_steps(block: i64, steps: PipelinePatternStepList, target_block: i64) -> i64 {
   match steps {
     PipelinePatternStepNil -> block
@@ -57165,7 +57613,7 @@ pub(package) fn pipeline_lower_match_recursive_pattern_arm_to_blocks(ctx: Pipeli
                 )
               }
             } else {
-              let body = pipeline_lower_match_body_to_blocks(match_arm_body_expr(arm), pattern_locals, ir_inst_list_empty(), ctx, after_pattern, success_start)
+              let body = pipeline_lower_match_body_to_blocks(match_arm_body_expr(arm), pattern_locals, ir_inst_list_empty(), ctx, index, after_pattern, success_start)
               if pipeline_lowered_blocks_is_valid(body) == 0 {
                 pipeline_lowered_blocks_invalid(start_block, next_value)
               } else {
@@ -57188,7 +57636,7 @@ pub(package) fn pipeline_lower_match_recursive_pattern_arm_to_blocks(ctx: Pipeli
   }
 }
 
-pub(package) fn pipeline_lower_match_ctor_body_to_blocks(pat: Pattern, body: Expr, ctx: PipelineMatchCtx, next_value: i64, start_block: i64) -> PipelineLoweredBlocks {
+pub(package) fn pipeline_lower_match_ctor_body_to_blocks(pat: Pattern, body: Expr, ctx: PipelineMatchCtx, arm_index: i64, next_value: i64, start_block: i64) -> PipelineLoweredBlocks {
   match ctx {
     PipelineMatchCtx(arms, n_arms, scrutinee_value, params, locals, module, target_block, normalise_owned, scrutinee_ty, result_prim) -> {
       let src = pipeline_lower_module_src(module)
@@ -57206,7 +57654,7 @@ pub(package) fn pipeline_lower_match_ctor_body_to_blocks(pat: Pattern, body: Exp
             match pipeline_lower_match_ctor_bindings_to_result(bindings, payload_types, subst, 0, 0, scrutinee_value, locals, ir_inst_list_empty(), next_value) {
               PipelinePatternBindResult(payload_locals, payload_insts, body_start_value, valid) -> {
                 if valid == 1 {
-                  pipeline_lower_match_body_to_blocks(body, payload_locals, payload_insts, ctx, body_start_value, start_block)
+                  pipeline_lower_match_body_to_blocks(body, payload_locals, payload_insts, ctx, arm_index, body_start_value, start_block)
                 } else {
                   pipeline_lowered_blocks_invalid(start_block, next_value)
                 }
@@ -57220,8 +57668,8 @@ pub(package) fn pipeline_lower_match_ctor_body_to_blocks(pat: Pattern, body: Exp
   }
 }
 
-pub(package) fn pipeline_lower_match_multi_ctor_body_to_blocks(pat: Pattern, body: Expr, ctx: PipelineMatchCtx, next_value: i64, start_block: i64) -> PipelineLoweredBlocks {
-  pipeline_lower_match_ctor_body_to_blocks(pat, body, ctx, next_value, start_block)
+pub(package) fn pipeline_lower_match_multi_ctor_body_to_blocks(pat: Pattern, body: Expr, ctx: PipelineMatchCtx, arm_index: i64, next_value: i64, start_block: i64) -> PipelineLoweredBlocks {
+  pipeline_lower_match_ctor_body_to_blocks(pat, body, ctx, arm_index, next_value, start_block)
 }
 
 pub(package) fn pipeline_lower_match_no_match_to_blocks(ctx: PipelineMatchCtx, next_value: i64, start_block: i64) -> PipelineLoweredBlocks {
@@ -57268,7 +57716,7 @@ pub(package) fn pipeline_lower_match_guarded_arm_to_blocks(ctx: PipelineMatchCtx
         let guard_value = pipeline_lower_expr_typed_sidecar_handler_ctx(guard_expr, next_value, lower_ctx)
         if ir_lowered_expr_is_valid(guard_value) == 1 {
           let body_start = next_block
-          let body_blocks = pipeline_lower_match_body_to_blocks(match_arm_body_expr(arm), arm_locals, ir_inst_list_empty(), ctx, ir_lowered_expr_next_value(guard_value), body_start)
+          let body_blocks = pipeline_lower_match_body_to_blocks(match_arm_body_expr(arm), arm_locals, ir_inst_list_empty(), ctx, index, ir_lowered_expr_next_value(guard_value), body_start)
           if pipeline_lowered_blocks_is_valid(body_blocks) == 1 {
             let rest_start = pipeline_lowered_blocks_next_block(body_blocks)
             let rest_blocks = pipeline_lower_match_rest_to_blocks(ctx, index + 1, pipeline_lowered_blocks_next_value(body_blocks), rest_start, rest_start + 1)
@@ -57310,7 +57758,7 @@ pub(package) fn pipeline_lower_match_cfg_guarded_arm_to_blocks(ctx: PipelineMatc
         } else {
           let guard_value = pipeline_lowered_blocks_next_value(guard_blocks)
           let body_start = pipeline_lowered_blocks_next_block(guard_blocks)
-          let body_blocks = pipeline_lower_match_body_to_blocks(match_arm_body_expr(arm), arm_locals, ir_inst_list_empty(), ctx, guard_value + 1, body_start)
+          let body_blocks = pipeline_lower_match_body_to_blocks(match_arm_body_expr(arm), arm_locals, ir_inst_list_empty(), ctx, index, guard_value + 1, body_start)
           if pipeline_lowered_blocks_is_valid(body_blocks) == 1 {
             let rest_start = pipeline_lowered_blocks_next_block(body_blocks)
             let rest_blocks = pipeline_lower_match_rest_to_blocks(ctx, index + 1, pipeline_lowered_blocks_next_value(body_blocks), rest_start, rest_start + 1)
@@ -57399,7 +57847,7 @@ pub(package) fn pipeline_lower_match_tested_arm_with_compare_to_blocks(ctx: Pipe
                       let lower_ctx = pipeline_handler_lower_ctx_with_fns_subst(params, payload_locals, src, tt, pipeline_handler_inline_ctx_empty(), pipeline_lower_module_fns(module), 0)
                       let guard_value = pipeline_lower_expr_typed_sidecar_handler_ctx(guard_expr, guard_start_value, lower_ctx)
                       if ir_lowered_expr_is_valid(guard_value) == 1 {
-                        let body_blocks = pipeline_lower_match_body_to_blocks(body, payload_locals, ir_inst_list_empty(), ctx, ir_lowered_expr_next_value(guard_value), body_start)
+                        let body_blocks = pipeline_lower_match_body_to_blocks(body, payload_locals, ir_inst_list_empty(), ctx, index, ir_lowered_expr_next_value(guard_value), body_start)
                         if pipeline_lowered_blocks_is_valid(body_blocks) == 1 {
                           let rest_start = pipeline_lowered_blocks_next_block(body_blocks)
                           let rest_blocks = pipeline_lower_match_rest_to_blocks(ctx, index + 1, pipeline_lowered_blocks_next_value(body_blocks), rest_start, rest_start + 1)
@@ -57457,7 +57905,7 @@ pub(package) fn pipeline_lower_match_tested_arm_with_compare_to_blocks(ctx: Pipe
             let lower_ctx = pipeline_handler_lower_ctx_with_fns_subst(params, base_locals, src, tt, pipeline_handler_inline_ctx_empty(), pipeline_lower_module_fns(module), 0)
             let guard_value = pipeline_lower_expr_typed_sidecar_handler_ctx(guard_expr, cmp_value + 1, lower_ctx)
             if ir_lowered_expr_is_valid(guard_value) == 1 {
-              let body_blocks = pipeline_lower_match_body_to_blocks(body, base_locals, ir_inst_list_empty(), ctx, ir_lowered_expr_next_value(guard_value), body_start)
+              let body_blocks = pipeline_lower_match_body_to_blocks(body, base_locals, ir_inst_list_empty(), ctx, index, ir_lowered_expr_next_value(guard_value), body_start)
               if pipeline_lowered_blocks_is_valid(body_blocks) == 1 {
                 let rest_start = pipeline_lowered_blocks_next_block(body_blocks)
                 let rest_blocks = pipeline_lower_match_rest_to_blocks(ctx, index + 1, pipeline_lowered_blocks_next_value(body_blocks), rest_start, rest_start + 1)
@@ -57487,9 +57935,9 @@ pub(package) fn pipeline_lower_match_tested_arm_with_compare_to_blocks(ctx: Pipe
       } else {
         let body_start = next_block
         let body_blocks = if is_ctor == 1 {
-          pipeline_lower_match_ctor_body_to_blocks(pat, body, ctx, cmp_value + 1, body_start)
+          pipeline_lower_match_ctor_body_to_blocks(pat, body, ctx, index, cmp_value + 1, body_start)
         } else {
-          pipeline_lower_match_body_to_blocks(body, base_locals, ir_inst_list_empty(), ctx, cmp_value + 1, body_start)
+          pipeline_lower_match_body_to_blocks(body, base_locals, ir_inst_list_empty(), ctx, index, cmp_value + 1, body_start)
         }
         if pipeline_lowered_blocks_is_valid(body_blocks) == 1 {
           let rest_start = pipeline_lowered_blocks_next_block(body_blocks)
@@ -57641,11 +58089,11 @@ pub(package) fn pipeline_lower_match_arm_to_blocks(ctx: PipelineMatchCtx, index:
           }
         } else {
           match pat {
-            Wildcard -> pipeline_lower_match_body_to_blocks(match_arm_body_expr(arm), locals, ir_inst_list_empty(), ctx, next_value, start_block)
+            Wildcard -> pipeline_lower_match_body_to_blocks(match_arm_body_expr(arm), locals, ir_inst_list_empty(), ctx, index, next_value, start_block)
             Binding(ns, nl) -> {
               let scrutinee_type_hash = if scrutinee_ty == 0 { 0 } else { type_hash_of(scrutinee_ty) }
               let match_locals = pipeline_value_env_push_float_typed_node(locals, ns, nl, scrutinee_value, 0, scrutinee_type_hash, scrutinee_ty)
-              pipeline_lower_match_body_to_blocks(match_arm_body_expr(arm), match_locals, ir_inst_list_empty(), ctx, next_value, start_block)
+              pipeline_lower_match_body_to_blocks(match_arm_body_expr(arm), match_locals, ir_inst_list_empty(), ctx, index, next_value, start_block)
             }
             IntPattern(value, start, len) -> pipeline_lower_match_tested_arm_to_blocks(ctx, index, next_value, start_block, next_block)
             CtorPattern(tag_ns, tag_nl, bindings, declaration) -> {
@@ -57659,7 +58107,7 @@ pub(package) fn pipeline_lower_match_arm_to_blocks(ctx: PipelineMatchCtx, index:
               } else {
                 let tb_hash = if tb_ann == 0 { 0 } else { type_hash_of(tb_ann) }
                 let tb_locals = pipeline_value_env_push_float_typed_node(locals, tb_ns, tb_nl, scrutinee_value, 0, tb_hash, tb_ann)
-                pipeline_lower_match_body_to_blocks(match_arm_body_expr(arm), tb_locals, ir_inst_list_empty(), ctx, next_value, start_block)
+                pipeline_lower_match_body_to_blocks(match_arm_body_expr(arm), tb_locals, ir_inst_list_empty(), ctx, index, next_value, start_block)
               }
             }
             NilPattern(pn_ns, pn_nl) -> pipeline_lower_match_tested_arm_to_blocks(ctx, index, next_value, start_block, next_block)
