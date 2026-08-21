@@ -1,0 +1,710 @@
+-- stdlib/idna.weft — canonical international domain-name identity
+--
+-- DomainName is the shared semantic value for DNS, URL hosts, and certificate
+-- matching. Construction applies the pinned strict Unicode 17 UTS #46
+-- nontransitional ToASCII profile; consumers never reinterpret source text.
+
+use compiler/unicode_normalization_data.{unicode_canonical_combining_class}
+use runtime/alloc.{alloc_bump_mark, alloc_bump_restore_same_segment, alloc_words}
+use runtime/memory.{mem_load64_at, mem_load8_at, mem_store64_at, mem_store8_at}
+use runtime/string.{runtime_str_alloc_uninit, runtime_str_eq, runtime_str_len, runtime_str_ptr}
+use stdlib/display.{Display}
+use stdlib/eq.{Eq}
+use stdlib/result.{Result, result_err, result_ok}
+use stdlib/string.{str_concat}
+use stdlib/unicode.{unicode_is_normalized_nfc, unicode_normalize_nfc}
+use stdlib/unicode_idna_data.{*}
+use stdlib/unicode_property_data.{unicode_general_category_code}
+use stdlib/utf8.{utf8_decode_is_ok, utf8_decode_next, utf8_decode_next_pos, utf8_decode_scalar, utf8_encode_scalar_into, utf8_encode_scalar_len}
+
+--- A canonical international domain name under Weft's Unicode 17 profile.
+---
+--- The hidden string contains lowercase ASCII labels without a trailing dot;
+--- the second lane records whether the source named the absolute DNS root.
+pub type DomainName = opaque(str, bool)
+
+--- A typed failure to construct canonical domain identity.
+---
+--- Every constructor carries the zero-based source byte offset followed by
+--- the zero-based label index.
+pub type IdnaError {
+  --- The source was empty or contained an empty label.
+  IdnaEmptyLabel(i64, i64),
+    --- A forged string violated Weft's valid UTF-8 invariant.
+    IdnaInvalidUtf8(i64, i64),
+    --- UTS #46 or strict STD3 rules disallow a source scalar.
+    IdnaDisallowed(i64, i64),
+    --- A label violated the leading, trailing, or third/fourth hyphen rule.
+    IdnaHyphen(i64, i64),
+    --- An `xn--` label was not a canonical non-ASCII Punycode label.
+    IdnaInvalidPunycode(i64, i64),
+    --- A label began with a Unicode combining mark.
+    IdnaLeadingCombiningMark(i64, i64),
+    --- A join control violated the IDNA ContextJ rule.
+    IdnaJoinerContext(i64, i64),
+    --- A bidirectional label violated RFC 5893's domain-wide rules.
+    IdnaBidi(i64, i64),
+    --- A canonical ASCII label exceeded 63 octets.
+    IdnaLabelTooLong(i64, i64),
+    --- The canonical name exceeded 253 octets without its root marker.
+    IdnaNameTooLong(i64, i64)
+}
+
+fn idna_domain_text(value: DomainName) -> str {
+  match value { DomainName(parts) -> match parts { (text, absolute) -> text } }
+}
+
+fn idna_domain_absolute(value: DomainName) -> bool {
+  match value { DomainName(parts) -> match parts { (text, absolute) -> absolute } }
+}
+
+impl DomainName {
+  --- Return canonical lowercase ASCII A-label text without a trailing root dot.
+  pub fn ascii(self) -> str { idna_domain_text(self) }
+
+  --- Return whether the source explicitly named the absolute DNS root.
+  pub fn is_absolute(self) -> bool { idna_domain_absolute(self) }
+}
+
+impl Eq for DomainName {
+  fn eq(self: Self, other: Self) -> bool {
+    match self {
+      DomainName(left_parts) -> match left_parts {
+        (left_text, left_absolute) -> match other {
+          DomainName(right_parts) -> match right_parts {
+            (right_text, right_absolute) ->
+              runtime_str_eq(left_text, right_text) == 1 and left_absolute == right_absolute
+          }
+        }
+      }
+    }
+  }
+}
+
+impl Display for DomainName {
+  fn display(self: Self) -> str {
+    match self {
+      DomainName(parts) -> match parts {
+        (text, absolute) -> if absolute { str_concat(text, ".") } else { text }
+      }
+    }
+  }
+}
+
+fn idna_error_none() -> i64 { 0 }
+
+fn idna_error_empty() -> i64 { 1 }
+
+fn idna_error_utf8() -> i64 { 2 }
+
+fn idna_error_disallowed() -> i64 { 3 }
+
+fn idna_error_hyphen() -> i64 { 4 }
+
+fn idna_error_punycode() -> i64 { 5 }
+
+fn idna_error_combining() -> i64 { 6 }
+
+fn idna_error_joiner() -> i64 { 7 }
+
+fn idna_error_bidi() -> i64 { 8 }
+
+fn idna_error_label_length() -> i64 { 9 }
+
+fn idna_error_name_length() -> i64 { 10 }
+
+fn idna_store_error(info: i64, code: i64, offset: i64, label: i64) -> i64 {
+  mem_store64_at(info, 0, code)
+  mem_store64_at(info, 8, offset)
+  mem_store64_at(info, 16, label)
+  code
+}
+
+fn idna_result_error(code: i64, offset: i64, label: i64) -> Result<DomainName, IdnaError> {
+  match code {
+    1 -> result_err<DomainName, IdnaError>(IdnaEmptyLabel(offset, label))
+    2 -> result_err<DomainName, IdnaError>(IdnaInvalidUtf8(offset, label))
+    3 -> result_err<DomainName, IdnaError>(IdnaDisallowed(offset, label))
+    4 -> result_err<DomainName, IdnaError>(IdnaHyphen(offset, label))
+    5 -> result_err<DomainName, IdnaError>(IdnaInvalidPunycode(offset, label))
+    6 -> result_err<DomainName, IdnaError>(IdnaLeadingCombiningMark(offset, label))
+    7 -> result_err<DomainName, IdnaError>(IdnaJoinerContext(offset, label))
+    8 -> result_err<DomainName, IdnaError>(IdnaBidi(offset, label))
+    9 -> result_err<DomainName, IdnaError>(IdnaLabelTooLong(offset, label))
+    _ -> result_err<DomainName, IdnaError>(IdnaNameTooLong(offset, label))
+  }
+}
+
+fn idna_scalars_to_text(scalars: i64, count: i64) -> str {
+  let mut byte_count = 0
+  let mut i = 0
+  while i < count {
+    byte_count = byte_count + utf8_encode_scalar_len(mem_load64_at(scalars, i * 8))
+    i = i + 1
+  }
+  let text = runtime_str_alloc_uninit(byte_count)
+  let out = runtime_str_ptr(text)
+  let mut pos = 0
+  i = 0
+  while i < count {
+    pos = utf8_encode_scalar_into(out, pos, mem_load64_at(scalars, i * 8))
+    i = i + 1
+  }
+  text
+}
+
+-- Map source scalars and retain one original byte offset per resulting label.
+fn idna_map_source(source: str, mapped: i64, label_offsets: i64, scratch: i64, info: i64) -> i64 {
+  let n = runtime_str_len(source)
+  let mut source_pos = 0
+  let mut out_count = 0
+  let mut label = 0
+  mem_store64_at(label_offsets, 0, 0)
+  while source_pos < n and mem_load64_at(info, 0) == idna_error_none() {
+    let decoded = utf8_decode_next(source, source_pos)
+    if utf8_decode_is_ok(decoded) == 0 {
+      idna_store_error(info, idna_error_utf8(), source_pos, label)
+    } else {
+      let next_pos = utf8_decode_next_pos(decoded)
+      let scalar = utf8_decode_scalar(decoded)
+      let mapped_count = unicode_idna_map_into(scalar, scratch)
+      if mapped_count < 0 {
+        idna_store_error(info, idna_error_disallowed(), source_pos, label)
+      } else {
+        let mut j = 0
+        while j < mapped_count {
+          let value = mem_load64_at(scratch, j * 8)
+          mem_store64_at(mapped, out_count * 8, value)
+          out_count = out_count + 1
+          if value == 46 {
+            label = label + 1
+            mem_store64_at(label_offsets, label * 8, next_pos)
+          } else { 0 }
+          j = j + 1
+        }
+        source_pos = next_pos
+      }
+    }
+  }
+  mem_store64_at(info, 24, label + 1)
+  out_count
+}
+
+fn idna_decode_text(text: str, scalars: i64, starts: i64, ends: i64, info: i64) -> i64 {
+  let n = runtime_str_len(text)
+  let mut pos = 0
+  let mut count = 0
+  let mut label = 0
+  mem_store64_at(starts, 0, 0)
+  while pos < n and mem_load64_at(info, 0) == idna_error_none() {
+    let decoded = utf8_decode_next(text, pos)
+    if utf8_decode_is_ok(decoded) == 0 {
+      idna_store_error(info, idna_error_utf8(), pos, label)
+    } else {
+      let scalar = utf8_decode_scalar(decoded)
+      if scalar == 46 {
+        mem_store64_at(ends, label * 8, count)
+        label = label + 1
+        mem_store64_at(starts, label * 8, count)
+      } else {
+        mem_store64_at(scalars, count * 8, scalar)
+        count = count + 1
+      }
+      pos = utf8_decode_next_pos(decoded)
+    }
+  }
+  mem_store64_at(ends, label * 8, count)
+  mem_store64_at(info, 32, label + 1)
+  count
+}
+
+fn idna_ascii_lower(byte: i64) -> i64 {
+  if byte >= 65 and byte <= 90 { byte + 32 } else { byte }
+}
+
+fn idna_is_alabel(scalars: i64, start: i64, end: i64) -> i64 {
+  if end - start < 4 { 0 }
+  else {
+    if idna_ascii_lower(mem_load64_at(scalars, start * 8)) == 120 and
+      idna_ascii_lower(mem_load64_at(scalars, (start + 1) * 8)) == 110 and
+      mem_load64_at(scalars, (start + 2) * 8) == 45 and
+      mem_load64_at(scalars, (start + 3) * 8) == 45 { 1 }
+    else { 0 }
+  }
+}
+
+fn idna_puny_digit(scalar: i64) -> i64 {
+  let byte = idna_ascii_lower(scalar)
+  if byte >= 97 and byte <= 122 { byte - 97 }
+  else { if byte >= 48 and byte <= 57 { byte - 22 } else { 0 - 1 } }
+}
+
+fn idna_puny_byte(digit: i64) -> i64 {
+  if digit < 26 { 97 + digit } else { 22 + digit }
+}
+
+fn idna_puny_adapt(delta: i64, points: i64, first: i64) -> i64 {
+  let mut value = if first == 1 { delta / 700 } else { delta / 2 }
+  value = value + value / points
+  let mut k = 0
+  while value > 455 {
+    value = value / 35
+    k = k + 36
+  }
+  k + (36 * value) / (value + 38)
+}
+
+-- Decode one Punycode payload. `-1` is a syntax/arithmetic failure.
+fn idna_puny_decode(input: i64, start: i64, end: i64, out: i64) -> i64 {
+  let mut delimiter = 0 - 1
+  let mut scan = start
+  let mut syntax_ok = 1
+  while scan < end {
+    let scalar = mem_load64_at(input, scan * 8)
+    if scalar >= 128 { syntax_ok = 0 } else { if scalar == 45 { delimiter = scan } else { 0 } }
+    scan = scan + 1
+  }
+  let basic_end = if delimiter >= start { delimiter } else { start }
+  let mut out_count = 0
+  scan = start
+  while scan < basic_end and syntax_ok == 1 {
+    let scalar = mem_load64_at(input, scan * 8)
+    if scalar >= 128 { syntax_ok = 0 }
+    else {
+      mem_store64_at(out, out_count * 8, scalar)
+      out_count = out_count + 1
+    }
+    scan = scan + 1
+  }
+  let mut index = if delimiter >= start { delimiter + 1 } else { start }
+  let mut n = 128
+  let mut i = 0
+  let mut bias = 72
+  let mut first_delta = 1
+  while index < end and syntax_ok == 1 {
+    let old_i = i
+    let mut weight = 1
+    let mut k = 36
+    let mut done = 0
+    while done == 0 and syntax_ok == 1 {
+      if index >= end { syntax_ok = 0 }
+      else {
+        let digit = idna_puny_digit(mem_load64_at(input, index * 8))
+        index = index + 1
+        if digit < 0 or digit > (2147483647 - i) / weight { syntax_ok = 0 }
+        else {
+          i = i + digit * weight
+          let threshold = if k <= bias { 1 } else { if k >= bias + 26 { 26 } else { k - bias } }
+          if digit < threshold { done = 1 }
+          else {
+            let base = 36 - threshold
+            if weight > 2147483647 / base { syntax_ok = 0 }
+            else { weight = weight * base k = k + 36 }
+          }
+        }
+      }
+    }
+    if syntax_ok == 1 {
+      let points = out_count + 1
+      bias = idna_puny_adapt(i - old_i, points, first_delta)
+      first_delta = 0
+      if i / points > 1114111 - n { syntax_ok = 0 }
+      else {
+        n = n + i / points
+        i = i - (i / points) * points
+        if n > 1114111 or n >= 55296 and n <= 57343 { syntax_ok = 0 }
+        else {
+          let mut move = out_count
+          while move > i {
+            mem_store64_at(out, move * 8, mem_load64_at(out, (move - 1) * 8))
+            move = move - 1
+          }
+          mem_store64_at(out, i * 8, n)
+          out_count = out_count + 1
+          i = i + 1
+        }
+      }
+    }
+  }
+  if syntax_ok == 1 { out_count } else { 0 - 1 }
+}
+
+fn idna_label_text_is_nfc(scalars: i64, start: i64, end: i64) -> i64 {
+  unicode_is_normalized_nfc(idna_scalars_to_text(scalars + start * 8, end - start))
+}
+
+-- Decode A-labels into the shared U-label buffer and retain label metadata.
+fn idna_prepare_labels(input: i64, starts: i64, ends: i64, label_count: i64, source_offsets: i64, u: i64, u_starts: i64, u_ends: i64, alabels: i64, info: i64) -> i64 {
+  let mut label = 0
+  let mut u_count = 0
+  while label < label_count and mem_load64_at(info, 0) == idna_error_none() {
+    let start = mem_load64_at(starts, label * 8)
+    let end = mem_load64_at(ends, label * 8)
+    let source_offset = mem_load64_at(source_offsets, label * 8)
+    mem_store64_at(u_starts, label * 8, u_count)
+    if start == end {
+      idna_store_error(info, idna_error_empty(), source_offset, label)
+    } else {
+      let is_alabel = idna_is_alabel(input, start, end)
+      mem_store64_at(alabels, label * 8, is_alabel)
+      if is_alabel == 1 {
+        let decoded = idna_puny_decode(input, start + 4, end, u + u_count * 8)
+        if decoded <= 0 {
+          idna_store_error(info, idna_error_punycode(), source_offset, label)
+        } else {
+          let mut has_non_ascii = 0
+          let mut i = 0
+          while i < decoded {
+            if mem_load64_at(u, (u_count + i) * 8) >= 128 { has_non_ascii = 1 } else { 0 }
+            i = i + 1
+          }
+          if has_non_ascii == 0 or idna_label_text_is_nfc(u, u_count, u_count + decoded) == 0 {
+            idna_store_error(info, idna_error_punycode(), source_offset, label)
+          } else { u_count = u_count + decoded }
+        }
+      } else {
+        let mut i = start
+        while i < end {
+          mem_store64_at(u, u_count * 8, mem_load64_at(input, i * 8))
+          u_count = u_count + 1
+          i = i + 1
+        }
+      }
+    }
+    mem_store64_at(u_ends, label * 8, u_count)
+    label = label + 1
+  }
+  u_count
+}
+
+fn idna_is_std3_scalar(scalar: i64) -> i64 {
+  if scalar >= 97 and scalar <= 122 { 1 }
+  else { if scalar >= 48 and scalar <= 57 { 1 }
+    else { if scalar == 45 { 1 } else { if scalar >= 128 { 1 } else { 0 } } } }
+}
+
+fn idna_is_mark(scalar: i64) -> i64 {
+  let category = unicode_general_category_code(scalar)
+  if category == 10 or category == 11 or category == 12 { 1 } else { 0 }
+}
+
+fn idna_contextj_ok(scalars: i64, start: i64, end: i64, index: i64) -> i64 {
+  let scalar = mem_load64_at(scalars, index * 8)
+  if scalar == 8205 {
+    if index > start and unicode_canonical_combining_class(mem_load64_at(scalars, (index - 1) * 8)) == 9 { 1 } else { 0 }
+  } else { if scalar == 8204 {
+      if index > start and unicode_canonical_combining_class(mem_load64_at(scalars, (index - 1) * 8)) == 9 { 1 }
+      else {
+        let transparent = unicode_idna_joining_transparent()
+        let mut before = index - 1
+        while before >= start and unicode_idna_joining_code(mem_load64_at(scalars, before * 8)) == transparent {
+          before = before - 1
+        }
+        let mut after = index + 1
+        while after < end and unicode_idna_joining_code(mem_load64_at(scalars, after * 8)) == transparent {
+          after = after + 1
+        }
+        if before < start or after >= end { 0 }
+        else {
+          let left = unicode_idna_joining_code(mem_load64_at(scalars, before * 8))
+          let right = unicode_idna_joining_code(mem_load64_at(scalars, after * 8))
+          let left_ok = if left == unicode_idna_joining_left_joining() or left == unicode_idna_joining_dual_joining() { 1 } else { 0 }
+          let right_ok = if right == unicode_idna_joining_right_joining() or right == unicode_idna_joining_dual_joining() { 1 } else { 0 }
+          if left_ok == 1 and right_ok == 1 { 1 } else { 0 }
+        }
+      }
+    } else { 1 } }
+}
+
+fn idna_domain_has_rtl(scalars: i64, count: i64) -> i64 {
+  let mut i = 0
+  let mut rtl = 0
+  while i < count and rtl == 0 {
+    let code = unicode_idna_bidi_code(mem_load64_at(scalars, i * 8))
+    if code == unicode_idna_bidi_right_to_left() or code == unicode_idna_bidi_arabic_letter() or code == unicode_idna_bidi_arabic_number() {
+      rtl = 1
+    } else { i = i + 1 }
+  }
+  rtl
+}
+
+fn idna_bidi_ltr_allowed(code: i64) -> i64 {
+  if code == unicode_idna_bidi_left_to_right() or code == unicode_idna_bidi_european_number() or
+    code == unicode_idna_bidi_european_separator() or code == unicode_idna_bidi_common_separator() or
+    code == unicode_idna_bidi_european_terminator() or code == unicode_idna_bidi_other_neutral() or
+    code == unicode_idna_bidi_boundary_neutral() or code == unicode_idna_bidi_nonspacing_mark() { 1 } else { 0 }
+}
+
+fn idna_bidi_rtl_allowed(code: i64) -> i64 {
+  if code == unicode_idna_bidi_right_to_left() or code == unicode_idna_bidi_arabic_letter() or
+    code == unicode_idna_bidi_arabic_number() or code == unicode_idna_bidi_european_number() or
+    code == unicode_idna_bidi_european_separator() or code == unicode_idna_bidi_common_separator() or
+    code == unicode_idna_bidi_european_terminator() or code == unicode_idna_bidi_other_neutral() or
+    code == unicode_idna_bidi_boundary_neutral() or code == unicode_idna_bidi_nonspacing_mark() { 1 } else { 0 }
+}
+
+fn idna_bidi_label_ok(scalars: i64, start: i64, end: i64) -> i64 {
+  let first = unicode_idna_bidi_code(mem_load64_at(scalars, start * 8))
+  let rtl = if first == unicode_idna_bidi_right_to_left() or first == unicode_idna_bidi_arabic_letter() { 1 } else { 0 }
+  let ltr = if first == unicode_idna_bidi_left_to_right() { 1 } else { 0 }
+  let mut ok = if rtl == 1 or ltr == 1 { 1 } else { 0 }
+  let mut has_en = 0
+  let mut has_an = 0
+  let mut i = start
+  while i < end and ok == 1 {
+    let code = unicode_idna_bidi_code(mem_load64_at(scalars, i * 8))
+    if code == unicode_idna_bidi_european_number() { has_en = 1 } else { 0 }
+    if code == unicode_idna_bidi_arabic_number() { has_an = 1 } else { 0 }
+    if rtl == 1 {
+      if idna_bidi_rtl_allowed(code) == 0 { ok = 0 } else { 0 }
+    } else {
+      if idna_bidi_ltr_allowed(code) == 0 { ok = 0 } else { 0 }
+    }
+    i = i + 1
+  }
+  let mut last = end - 1
+  while last > start and unicode_idna_bidi_code(mem_load64_at(scalars, last * 8)) == unicode_idna_bidi_nonspacing_mark() {
+    last = last - 1
+  }
+  let last_code = unicode_idna_bidi_code(mem_load64_at(scalars, last * 8))
+  if rtl == 1 {
+    let last_ok = if last_code == unicode_idna_bidi_right_to_left() or last_code == unicode_idna_bidi_arabic_letter() or last_code == unicode_idna_bidi_european_number() or last_code == unicode_idna_bidi_arabic_number() { 1 } else { 0 }
+    if last_ok == 0 or has_en == 1 and has_an == 1 { 0 } else { ok }
+  } else {
+    let last_ok = if last_code == unicode_idna_bidi_left_to_right() or last_code == unicode_idna_bidi_european_number() { 1 } else { 0 }
+    if last_ok == 0 { 0 } else { ok }
+  }
+}
+
+fn idna_validate_labels(scalars: i64, starts: i64, ends: i64, label_count: i64, source_offsets: i64, scratch: i64, info: i64) -> i64 {
+  let total = mem_load64_at(ends, (label_count - 1) * 8)
+  let domain_bidi = idna_domain_has_rtl(scalars, total)
+  let mut label = 0
+  while label < label_count and mem_load64_at(info, 0) == idna_error_none() {
+    let start = mem_load64_at(starts, label * 8)
+    let end = mem_load64_at(ends, label * 8)
+    let offset = mem_load64_at(source_offsets, label * 8)
+    if start >= end {
+      idna_store_error(info, idna_error_empty(), offset, label)
+    } else {
+      let first = mem_load64_at(scalars, start * 8)
+      let last = mem_load64_at(scalars, (end - 1) * 8)
+      if first == 45 or last == 45 or end - start >= 4 and mem_load64_at(scalars, (start + 2) * 8) == 45 and mem_load64_at(scalars, (start + 3) * 8) == 45 {
+        idna_store_error(info, idna_error_hyphen(), offset, label)
+      } else { if idna_is_mark(first) == 1 {
+          idna_store_error(info, idna_error_combining(), offset, label)
+        } else {
+          let mut i = start
+          while i < end and mem_load64_at(info, 0) == idna_error_none() {
+            let scalar = mem_load64_at(scalars, i * 8)
+            let mapped_count = unicode_idna_map_into(scalar, scratch)
+            if idna_is_std3_scalar(scalar) == 0 or mapped_count != 1 or mem_load64_at(scratch, 0) != scalar {
+              idna_store_error(info, idna_error_disallowed(), offset, label)
+            } else { if scalar == 8204 or scalar == 8205 {
+                if idna_contextj_ok(scalars, start, end, i) == 0 {
+                  idna_store_error(info, idna_error_joiner(), offset, label)
+                } else { 0 }
+              } else { 0 } }
+            i = i + 1
+          }
+          if mem_load64_at(info, 0) == idna_error_none() and domain_bidi == 1 and idna_bidi_label_ok(scalars, start, end) == 0 {
+            idna_store_error(info, idna_error_bidi(), offset, label)
+          } else { 0 }
+        } }
+    }
+    label = label + 1
+  }
+  mem_load64_at(info, 0)
+}
+
+fn idna_puny_encode(scalars: i64, start: i64, end: i64, out: i64, out_pos: i64) -> i64 {
+  let mut pos = out_pos
+  let mut basic = 0
+  let mut i = start
+  while i < end {
+    let scalar = mem_load64_at(scalars, i * 8)
+    if scalar < 128 {
+      mem_store8_at(out, pos, scalar)
+      pos = pos + 1
+      basic = basic + 1
+    } else { 0 }
+    i = i + 1
+  }
+  let count = end - start
+  let mut handled = basic
+  if basic > 0 and handled < count { mem_store8_at(out, pos, 45) pos = pos + 1 } else { 0 }
+  let mut n = 128
+  let mut delta = 0
+  let mut bias = 72
+  let mut ok = 1
+  while handled < count and ok == 1 {
+    let mut minimum = 1114112
+    i = start
+    while i < end {
+      let scalar = mem_load64_at(scalars, i * 8)
+      if scalar >= n and scalar < minimum { minimum = scalar } else { 0 }
+      i = i + 1
+    }
+    if minimum > 1114111 or minimum - n > (2147483647 - delta) / (handled + 1) { ok = 0 }
+    else {
+      delta = delta + (minimum - n) * (handled + 1)
+      n = minimum
+      i = start
+      while i < end and ok == 1 {
+        let scalar = mem_load64_at(scalars, i * 8)
+        if scalar < n {
+          if delta == 2147483647 { ok = 0 } else { delta = delta + 1 }
+        } else { if scalar == n {
+            let mut q = delta
+            let mut k = 36
+            let mut done = 0
+            while done == 0 {
+              let threshold = if k <= bias { 1 } else { if k >= bias + 26 { 26 } else { k - bias } }
+              if q < threshold {
+                mem_store8_at(out, pos, idna_puny_byte(q))
+                pos = pos + 1
+                done = 1
+              } else {
+                mem_store8_at(out, pos, idna_puny_byte(threshold + (q - threshold) - ((q - threshold) / (36 - threshold)) * (36 - threshold)))
+                pos = pos + 1
+                q = (q - threshold) / (36 - threshold)
+                k = k + 36
+              }
+            }
+            bias = idna_puny_adapt(delta, handled + 1, if handled == basic { 1 } else { 0 })
+            delta = 0
+            handled = handled + 1
+          } else { 0 } }
+        i = i + 1
+      }
+      delta = delta + 1
+      n = n + 1
+    }
+  }
+  if ok == 1 { pos } else { 0 - 1 }
+}
+
+fn idna_ascii_matches_scalars(out: i64, out_start: i64, out_end: i64, input: i64, start: i64, end: i64) -> i64 {
+  if out_end - out_start != end - start { 0 }
+  else {
+    let mut i = 0
+    let mut same = 1
+    while i < end - start and same == 1 {
+      if mem_load8_at(out, out_start + i) != mem_load64_at(input, (start + i) * 8) { same = 0 } else { i = i + 1 }
+    }
+    same
+  }
+}
+
+fn idna_emit_name(input: i64, input_starts: i64, input_ends: i64, scalars: i64, starts: i64, ends: i64, alabels: i64, label_count: i64, source_offsets: i64, out: i64, info: i64) -> i64 {
+  let mut label = 0
+  let mut pos = 0
+  while label < label_count and mem_load64_at(info, 0) == idna_error_none() {
+    if label > 0 { mem_store8_at(out, pos, 46) pos = pos + 1 } else { 0 }
+    let label_out_start = pos
+    let start = mem_load64_at(starts, label * 8)
+    let end = mem_load64_at(ends, label * 8)
+    let mut non_ascii = 0
+    let mut i = start
+    while i < end {
+      if mem_load64_at(scalars, i * 8) >= 128 { non_ascii = 1 } else { 0 }
+      i = i + 1
+    }
+    if non_ascii == 0 {
+      i = start
+      while i < end { mem_store8_at(out, pos, mem_load64_at(scalars, i * 8)) pos = pos + 1 i = i + 1 }
+    } else {
+      mem_store8_at(out, pos, 120)
+      mem_store8_at(out, pos + 1, 110)
+      mem_store8_at(out, pos + 2, 45)
+      mem_store8_at(out, pos + 3, 45)
+      pos = idna_puny_encode(scalars, start, end, out, pos + 4)
+      if pos < 0 { idna_store_error(info, idna_error_punycode(), mem_load64_at(source_offsets, label * 8), label) } else { 0 }
+    }
+    if mem_load64_at(info, 0) == idna_error_none() {
+      let label_len = pos - label_out_start
+      if label_len > 63 {
+        idna_store_error(info, idna_error_label_length(), mem_load64_at(source_offsets, label * 8), label)
+      } else { if mem_load64_at(alabels, label * 8) == 1 {
+          let input_start = mem_load64_at(input_starts, label * 8)
+          let input_end = mem_load64_at(input_ends, label * 8)
+          if idna_ascii_matches_scalars(out, label_out_start, pos, input, input_start, input_end) == 0 {
+            idna_store_error(info, idna_error_punycode(), mem_load64_at(source_offsets, label * 8), label)
+          } else { 0 }
+        } else { 0 } }
+    }
+    label = label + 1
+  }
+  pos
+}
+
+fn idna_text_from_ascii(data: i64, count: i64) -> str {
+  let text = runtime_str_alloc_uninit(count)
+  let out = runtime_str_ptr(text)
+  let mut i = 0
+  while i < count { mem_store8_at(out, i, mem_load8_at(data, i)) i = i + 1 }
+  text
+}
+
+--- Construct canonical domain identity using Unicode 17 UTS #46 ToASCII.
+---
+--- Processing is nontransitional and enables strict STD3, hyphen, Bidi,
+--- ContextJ, and DNS-length checks. One trailing root dot is retained as
+--- semantic state; it is not part of `DomainName.ascii()`.
+pub fn domain_name_parse(source: str) -> Result<DomainName, IdnaError> {
+  let mark = alloc_bump_mark()
+  let n = runtime_str_len(source)
+  let capacity = n * unicode_idna_max_mapping_expansion() + 16
+  let mapped = alloc_words(capacity)
+  let input = alloc_words(capacity)
+  let source_offsets = alloc_words(n + 4)
+  let input_starts = alloc_words(n + 4)
+  let input_ends = alloc_words(n + 4)
+  let u = alloc_words(capacity)
+  let u_starts = alloc_words(n + 4)
+  let u_ends = alloc_words(n + 4)
+  let alabels = alloc_words(n + 4)
+  let scratch = alloc_words(unicode_idna_max_mapping_expansion() + 4)
+  let info = alloc_words(8)
+  let ascii_out = alloc_words(capacity + 64)
+  mem_store64_at(info, 0, idna_error_none())
+
+  let mapped_count = idna_map_source(source, mapped, source_offsets, scratch, info)
+  let normalized = if mem_load64_at(info, 0) == idna_error_none() {
+    unicode_normalize_nfc(idna_scalars_to_text(mapped, mapped_count))
+  } else { "" }
+  let input_count = if mem_load64_at(info, 0) == idna_error_none() {
+    idna_decode_text(normalized, input, input_starts, input_ends, info)
+  } else { 0 }
+  let mut label_count = mem_load64_at(info, 32)
+  let normalized_len = runtime_str_len(normalized)
+  let absolute = if normalized_len > 0 and mem_load8_at(runtime_str_ptr(normalized), normalized_len - 1) == 46 { true } else { false }
+  -- Dots are removed while decoding, so a final dot appears as a final empty label.
+  if mem_load64_at(info, 0) == idna_error_none() and label_count > 1 and mem_load64_at(input_starts, (label_count - 1) * 8) == mem_load64_at(input_ends, (label_count - 1) * 8) {
+    label_count = label_count - 1
+  } else { 0 }
+  if mem_load64_at(info, 0) == idna_error_none() and (n == 0 or label_count <= 0) {
+    idna_store_error(info, idna_error_empty(), 0, 0)
+  } else { 0 }
+  let u_count = if mem_load64_at(info, 0) == idna_error_none() {
+    idna_prepare_labels(input, input_starts, input_ends, label_count, source_offsets, u, u_starts, u_ends, alabels, info)
+  } else { 0 }
+  if mem_load64_at(info, 0) == idna_error_none() {
+    idna_validate_labels(u, u_starts, u_ends, label_count, source_offsets, scratch, info)
+  } else { 0 }
+  let ascii_count = if mem_load64_at(info, 0) == idna_error_none() {
+    idna_emit_name(input, input_starts, input_ends, u, u_starts, u_ends, alabels, label_count, source_offsets, ascii_out, info)
+  } else { 0 }
+  if mem_load64_at(info, 0) == idna_error_none() and ascii_count > 253 {
+    idna_store_error(info, idna_error_name_length(), n, label_count - 1)
+  } else { 0 }
+
+  let code = mem_load64_at(info, 0)
+  let offset = mem_load64_at(info, 8)
+  let label = mem_load64_at(info, 16)
+  let result = if code == idna_error_none() {
+    result_ok<DomainName, IdnaError>(DomainName((idna_text_from_ascii(ascii_out, ascii_count), absolute)))
+  } else { idna_result_error(code, offset, label) }
+  alloc_bump_restore_same_segment(mark)
+  result
+}

@@ -443,7 +443,7 @@ stdlib_doc_modules=(
   stdlib/maybe.weft stdlib/bytes.weft stdlib/path.weft stdlib/io_types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft stdlib/json.weft
-  stdlib/secure_random.weft stdlib/net_address.weft
+  stdlib/secure_random.weft stdlib/net_address.weft stdlib/idna.weft
   stdlib/state.weft stdlib/diagnostic_type.weft stdlib/diagnostic.weft
   stdlib/diagnostic_registry.weft stdlib/map.weft stdlib/set.weft
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector_type.weft
@@ -479,6 +479,8 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_string_pins_public_surface" "$(<"$tmp_out")" "Public API items: 17. Documented: 17."
   elif [ "$stdlib_doc_name" = "net_address" ]; then
     assert_contains "doc_stdlib_net_address_pins_public_surface" "$(<"$tmp_out")" "Public API items: 23. Documented: 23."
+  elif [ "$stdlib_doc_name" = "idna" ]; then
+    assert_contains "doc_stdlib_idna_pins_public_surface" "$(<"$tmp_out")" "Public API items: 15. Documented: 15."
   elif [ "$stdlib_doc_name" = "io" ] || [ "$stdlib_doc_name" = "par" ]; then
     assert_contains "doc_stdlib_${stdlib_doc_name}_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
   fi
@@ -495,6 +497,7 @@ internal_stdlib_modules=(
   thread
   unicode_case_data
   unicode_compatibility_data
+  unicode_idna_data
   unicode_property_data
   unicode_security
   unicode_segmentation
@@ -3435,4 +3438,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 952 passed, 0 failed"
+echo "Tool boundary summary: 959 passed, 0 failed"
