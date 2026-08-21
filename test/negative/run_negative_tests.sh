@@ -83,6 +83,8 @@ check_rejects "generator_generic_new_mutable_closure_producer" "test/negative/ge
 check_rejects "generator_generic_new_return_type_mismatch" "test/negative/generator_generic_new_return_type_mismatch.weft" 'error[E1002]: lambda return value type mismatch: expected `i64`, found `str`'
 check_rejects "generator_generic_yield_unhandled" "test/negative/generator_generic_yield_unhandled.weft" "error[E2001]:"
 check_rejects "unhandled_effect_perform" "test/negative/unhandled_effect_perform.weft" 'error[E2001]: effect `State` is not available in this context'
+check_rejects "secure_random_effect_unavailable" "test/negative/secure_random_effect_unavailable.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
+check_rejects "secure_random_raw_backend_private" "test/negative/secure_random_raw_backend_private.weft" "module member 'runtime_secure_random_fill_raw' is not visible in this import" 1
 check_rejects "unhandled_alloc_effect" "test/negative/unhandled_alloc_effect.weft" "error[E2001]:"
 check_rejects "unsafe_raw_syscall_requires_effect" "test/negative/unsafe_raw_syscall_requires_effect.weft" "error[E2001]:"
 check_rejects "unsafe_raw_offset_requires_effect" "test/negative/unsafe_raw_offset_requires_effect.weft" "error[E2001]:"
