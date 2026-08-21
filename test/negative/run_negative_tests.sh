@@ -85,6 +85,8 @@ check_rejects "generator_generic_yield_unhandled" "test/negative/generator_gener
 check_rejects "unhandled_effect_perform" "test/negative/unhandled_effect_perform.weft" 'error[E2001]: effect `State` is not available in this context'
 check_rejects "secure_random_effect_unavailable" "test/negative/secure_random_effect_unavailable.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
 check_rejects "secure_random_raw_backend_private" "test/negative/secure_random_raw_backend_private.weft" "module member 'runtime_secure_random_fill_raw' is not visible in this import" 1
+check_rejects "net_address_constructor_private" "test/negative/net_address_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "net_address_projection_private" "test/negative/net_address_projection_private.weft" "type error: opaque projection pattern is private to its declaring module; use an exported accessor"
 check_rejects "unhandled_alloc_effect" "test/negative/unhandled_alloc_effect.weft" "error[E2001]:"
 check_rejects "unsafe_raw_syscall_requires_effect" "test/negative/unsafe_raw_syscall_requires_effect.weft" "error[E2001]:"
 check_rejects "unsafe_raw_offset_requires_effect" "test/negative/unsafe_raw_offset_requires_effect.weft" "error[E2001]:"
