@@ -27114,9 +27114,11 @@ pub(package) fn pipeline_ir_native_handler_ctx_uncaptured(ctx: PipelineNativeHan
 --
 -- Fact node fields: acquisition-site SSA, owned value SSA, action (release
 -- hash or owned type hash), kind (1 direct cleanup call / 2 owned Drop /
--- 3 array drop glue / 4 structural-plan glue), record
--- index. The site is the unique result SSA of the instruction that acquires
--- the obligation; this keeps two retains of the same pointer as two records.
+-- 3 array drop glue / 4 structural-plan glue), record index. Flat structural
+-- facts additionally own a frame-resident word shadow derived from their
+-- exact registered plan. The site is the unique result SSA of the instruction
+-- that acquires the obligation; this keeps two retains of the same pointer as
+-- two records.
 pub(package) fn pipeline_ir_abort_cleanup_direct_kind() -> i64 { 1 }
 pub(package) fn pipeline_ir_abort_cleanup_owned_kind() -> i64 { 2 }
 pub(package) fn pipeline_ir_abort_cleanup_array_kind() -> i64 { 3 }
@@ -27306,6 +27308,12 @@ pub(package) fn pipeline_ir_abort_cleanup_add_action_fact(facts: i64, value: i64
   else { nlist_add(facts, node_new(0, value, action, kind, nlist_len(facts))) }
 }
 
+pub(package) fn pipeline_ir_abort_cleanup_add_structural_action_fact(facts: i64, value: i64, plan: i64) -> i64 {
+  let action = pipeline_structural_drop_glue_hash(plan)
+  if value < 0 or action == 0 or pipeline_ir_abort_cleanup_fact_exists(facts, value, action, pipeline_ir_abort_cleanup_structural_kind()) == 1 { 0 }
+  else { nlist_add(facts, node_new(0, value, action, pipeline_ir_abort_cleanup_structural_kind(), plan)) }
+}
+
 pub(package) fn pipeline_ir_abort_cleanup_collect_inst_list(insts: IrInstList, all_blocks: IrBlockList, facts: i64) -> i64 {
   match insts {
     IrInstNil -> 0
@@ -27325,7 +27333,7 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_inst_list(insts: IrInstList, a
           pipeline_ir_abort_cleanup_add_action_fact(facts, value, pipeline_managed_release_hash_for_kind(cleanup_kind), pipeline_ir_abort_cleanup_direct_kind())
         }
         IrOwnedDropI64(value, type_hash) -> pipeline_ir_abort_cleanup_add_action_fact(facts, value, type_hash, pipeline_ir_abort_cleanup_owned_kind())
-        IrStructuralDropI64(value, plan) -> pipeline_ir_abort_cleanup_add_action_fact(facts, value, pipeline_structural_drop_glue_hash(plan), pipeline_ir_abort_cleanup_structural_kind())
+        IrStructuralDropI64(value, plan) -> pipeline_ir_abort_cleanup_add_structural_action_fact(facts, value, plan)
         IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> {
           if pipeline_array_drop_plan_is_active(leaf_count, leaf_stride, leaf_kind) == 1 {
             pipeline_ir_abort_cleanup_add_action_fact(facts, data, pipeline_array_drop_glue_hash(leaf_count, leaf_stride, leaf_kind), pipeline_ir_abort_cleanup_array_kind())
@@ -27386,6 +27394,18 @@ pub(package) fn pipeline_ir_abort_cleanup_find_acquisition_site_kind(facts: i64,
   while i < n and found == 0 {
     let fact = nlist_get(facts, i)
     if node_tag(fact) == site and node_f3(fact) == kind { found = fact }
+    else { i = i + 1 }
+  }
+  found
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_find_acquisition_value_action_kind(facts: i64, value: i64, action: i64, kind: i64) -> i64 {
+  let mut found = 0
+  let n = if facts == 0 { 0 } else { nlist_len(facts) }
+  let mut i = 0
+  while i < n and found == 0 {
+    let fact = nlist_get(facts, i)
+    if node_f1(fact) == value and node_f2(fact) == action and node_f3(fact) == kind { found = fact }
     else { i = i + 1 }
   }
   found
@@ -27454,14 +27474,31 @@ pub(package) fn pipeline_ir_abort_cleanup_ret_type_lane_release_hash(ret_ty: i64
   pipeline_managed_release_hash_for_kind(cg_managed_drop_kind_for_ty_lane(ret_ty, lane))
 }
 
+pub(package) fn pipeline_ir_abort_cleanup_inst_acquires_structural(inst: IrInst) -> i64 {
+  match inst {
+    IrCallI64(dst, callee_hash, args) -> 1
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> 1
+    IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> 1
+    IrRecordInitI64(dst, type_hash, fields) -> 1
+    IrRecordLayoutInitI64(dst, type_hash, data_size, align, fields) -> 1
+    IrReuseInitI64(token, constructor) -> pipeline_ir_abort_cleanup_inst_acquires_structural(constructor)
+    _ -> 0
+  }
+}
+
 pub(package) fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst, all_blocks: IrBlockList, actions: i64, facts: i64, fns: i64) -> i64 {
   let site = pipeline_ir_inst_def_or(inst, 0 - 1)
   let structural = if site >= 0 { pipeline_ir_abort_cleanup_find_action_kind(actions, site, pipeline_ir_abort_cleanup_structural_kind()) } else { 0 }
   let owned = if site >= 0 { pipeline_ir_abort_cleanup_find_action_kind(actions, site, pipeline_ir_abort_cleanup_owned_kind()) } else { 0 }
   let direct_action = if site >= 0 { pipeline_ir_abort_cleanup_find_action_kind(actions, site, pipeline_ir_abort_cleanup_direct_kind()) } else { 0 }
   let array = if site >= 0 { pipeline_ir_abort_cleanup_find_action_kind(actions, site, pipeline_ir_abort_cleanup_array_kind()) } else { 0 }
-  if structural != 0 {
-    pipeline_ir_abort_cleanup_add_acquisition_fact(facts, site, site, node_f2(structural), pipeline_ir_abort_cleanup_structural_kind())
+  if structural != 0 and pipeline_ir_abort_cleanup_inst_acquires_structural(inst) == 1 {
+    let plan = node_f4(structural)
+    -- A wide call is not an acquisition until its final ABI lane has been
+    -- materialised. The call-list walker below arms that delayed site.
+    if (match inst { IrCallI64(dst, callee_hash, args) -> 1 IrGenericCallI64(dst, callee_hash, type_args, args) -> 1 _ -> 0 }) == 1 and
+      pipeline_structural_drop_plan_storage_mode(plan) == 2 and typeck_linear_layout_plan_words(plan) > 1 { 0 }
+    else { pipeline_ir_abort_cleanup_add_acquisition_fact(facts, site, site, node_f2(structural), pipeline_ir_abort_cleanup_structural_kind()) }
   } else { if owned != 0 {
     if pipeline_ir_abort_cleanup_blocks_have_owned_bind(all_blocks, site, node_f2(owned)) == 0 {
       pipeline_ir_abort_cleanup_add_acquisition_fact(facts, site, site, node_f2(owned), pipeline_ir_abort_cleanup_owned_kind())
@@ -27575,7 +27612,7 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst,
       let action = cg_owned_drop_type_hash(ty)
       let structural_eventual = pipeline_ir_abort_cleanup_find_action_kind(actions, value, pipeline_ir_abort_cleanup_structural_kind())
       let eventual = pipeline_ir_abort_cleanup_find_action_kind(actions, value, pipeline_ir_abort_cleanup_owned_kind())
-      if structural_eventual != 0 {
+      if structural_eventual != 0 and pipeline_ir_abort_cleanup_fact_exists(facts, value, node_f2(structural_eventual), pipeline_ir_abort_cleanup_structural_kind()) == 0 {
         pipeline_ir_abort_cleanup_add_acquisition_fact(
           facts,
           pipeline_ir_abort_cleanup_owned_bind_site(value),
@@ -27608,6 +27645,14 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_acquisition_inst_list_with_cal
         IrCallResultLaneI64(dst, lane) -> {
           let physical_lane = ir_call_result_lane_physical(lane)
           if call_ret_ty != 0 and physical_lane > 0 and ir_call_result_lane_head(dst, lane) == call_dst {
+            let structural = pipeline_ir_abort_cleanup_find_action_kind(actions, call_dst, pipeline_ir_abort_cleanup_structural_kind())
+            let structural_plan = if structural == 0 { 0 } else { node_f4(structural) }
+            if structural_plan != 0 and pipeline_structural_drop_plan_storage_mode(structural_plan) == 2 and
+              physical_lane == typeck_linear_layout_plan_words(structural_plan) - 1 {
+              pipeline_ir_abort_cleanup_add_acquisition_fact(
+                facts, dst, call_dst, node_f2(structural), pipeline_ir_abort_cleanup_structural_kind()
+              )
+            } else { 0 }
             let release = pipeline_ir_abort_cleanup_ret_type_lane_release_hash(call_ret_ty, physical_lane)
             if release != 0 {
               pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, release, pipeline_ir_abort_cleanup_direct_kind())
@@ -27652,10 +27697,46 @@ pub(package) fn pipeline_ir_abort_cleanup_blocks_need_instrumentation(blocks: Ir
   }
 }
 
-pub(package) fn pipeline_ir_abort_cleanup_frame_size(base_frame: i64, facts: i64, instrumented: i64) -> i64 {
+pub(package) fn pipeline_ir_abort_cleanup_fact_structural_plan(fact: i64, fm: i64) -> i64 {
+  if fact == 0 or node_f3(fact) != pipeline_ir_abort_cleanup_structural_kind() { 0 }
+  else { fmap_structural_drop_plan_lookup(fm, node_f2(fact)) }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_fact_shadow_words(fact: i64, fm: i64) -> i64 {
+  let plan = pipeline_ir_abort_cleanup_fact_structural_plan(fact, fm)
+  if pipeline_structural_drop_plan_storage_mode(plan) == 2 { typeck_linear_layout_plan_words(plan) } else { 0 }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_shadow_words_before(facts: i64, fact: i64, fm: i64) -> i64 {
+  let mut words = 0
+  let stop = if fact == 0 { 0 } else { node_f4(fact) }
+  let mut i = 0
+  while facts != 0 and i < nlist_len(facts) and i < stop {
+    words = words + pipeline_ir_abort_cleanup_fact_shadow_words(nlist_get(facts, i), fm)
+    i = i + 1
+  }
+  words
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_shadow_base(base: i64, facts: i64) -> i64 {
+  base + 32 + (if facts == 0 { 0 } else { nlist_len(facts) }) * handler_abort_cleanup_record_size()
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_shadow_offset(base: i64, facts: i64, fact: i64, fm: i64) -> i64 {
+  pipeline_ir_abort_cleanup_shadow_base(base, facts) + pipeline_ir_abort_cleanup_shadow_words_before(facts, fact, fm) * 8
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_total_shadow_words(facts: i64, fm: i64) -> i64 {
+  let mut words = 0
+  let n = if facts == 0 { 0 } else { nlist_len(facts) }
+  for i in 0..n { words = words + pipeline_ir_abort_cleanup_fact_shadow_words(nlist_get(facts, i), fm) }
+  words
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_frame_size(base_frame: i64, facts: i64, instrumented: i64, fm: i64) -> i64 {
   let n = if facts == 0 { 0 } else { nlist_len(facts) }
   if instrumented == 0 { base_frame }
-  else { cg_align16(base_frame + 32 + n * handler_abort_cleanup_record_size()) }
+  else { cg_align16(base_frame + 32 + n * handler_abort_cleanup_record_size() + pipeline_ir_abort_cleanup_total_shadow_words(facts, fm) * 8) }
 }
 
 pub(package) fn pipeline_ir_abort_cleanup_record_offset(base: i64, fact: i64) -> i64 {
@@ -27711,8 +27792,8 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_action_address(code: i64, fact: i
       pipeline_ir_abort_cleanup_emit_function_address(code, if target > 1 { target } else { 0 }, action, 1, fm)
     } else { if kind == pipeline_ir_abort_cleanup_structural_kind() {
       let plan = fmap_structural_drop_plan_lookup(fm, action)
-      let plan_kind = typeck_linear_layout_plan_kind(plan)
-      if plan != 0 and pipeline_structural_drop_plan_is_valid(plan) == 1 and (plan_kind == 4 or plan_kind == 5) {
+      let storage_mode = pipeline_structural_drop_plan_storage_mode(plan)
+      if plan != 0 and pipeline_structural_drop_plan_is_valid(plan) == 1 and storage_mode >= 1 and storage_mode <= 3 {
         let target = pipeline_ir_native_ensure_structural_drop_glue(code, plan, fm)
         pipeline_ir_abort_cleanup_emit_function_address(code, target, action, 1, fm)
       } else {
@@ -27754,6 +27835,24 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_function_exit(code: i64, fm: i64)
   }
 }
 
+pub(package) fn pipeline_ir_abort_cleanup_emit_pack_shadow(code: i64, fact: i64, plan: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  let words = typeck_linear_layout_plan_words(plan)
+  let value = node_f1(fact)
+  let facts = fmap_current_abort_cleanup_facts(fm)
+  let shadow = pipeline_ir_abort_cleanup_shadow_offset(fmap_current_abort_cleanup_base(fm), facts, fact, fm)
+  if value < 0 or words <= 0 or pipeline_structural_drop_plan_storage_mode(plan) != 2 {
+    fmap_inc_emit_error_count(fm)
+    bu32(code, encode_brk(67))
+  } else {
+    for lane in 0..words {
+      let value_phys = pipeline_ir_native_load_reg(code, pinned, value + lane)
+      pipeline_ir_abort_cleanup_emit_sp_address(code, 15, shadow + lane * 8)
+      bu32(code, cg_str(value_phys, 15, 0))
+    }
+    0
+  }
+}
+
 pub(package) fn pipeline_ir_abort_cleanup_emit_register_fact(code: i64, fact: i64, value: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
   -- x1-x14 are allocator residents. Bookkeeping only reads a value's home
   -- and otherwise stays in the reserved x15-x17 scratch set.
@@ -27764,10 +27863,20 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_register_fact(code: i64, fact: i6
   pipeline_ir_abort_cleanup_emit_sp_address(code, 17, pipeline_ir_abort_cleanup_record_offset(fmap_current_abort_cleanup_base(fm), fact))
   bu32(code, cg_ldr(15, 28, runtime_state_abort_cleanup_top_offset()))
   bu32(code, cg_str(15, 17, handler_abort_cleanup_record_prev_offset()))
-  if node_tag(fact) == value {
+  let structural_plan = pipeline_ir_abort_cleanup_fact_structural_plan(fact, fm)
+  let structural_mode = pipeline_structural_drop_plan_storage_mode(structural_plan)
+  if structural_mode == 2 {
+    pipeline_ir_abort_cleanup_emit_pack_shadow(code, fact, structural_plan, fm, pinned)
+    pipeline_ir_abort_cleanup_emit_sp_address(code, 17, pipeline_ir_abort_cleanup_record_offset(fmap_current_abort_cleanup_base(fm), fact))
+    pipeline_ir_abort_cleanup_emit_sp_address(
+      code, 16,
+      pipeline_ir_abort_cleanup_shadow_offset(fmap_current_abort_cleanup_base(fm), fmap_current_abort_cleanup_facts(fm), fact, fm)
+    )
+    bu32(code, cg_str(16, 17, handler_abort_cleanup_record_value_offset()))
+  } else { if node_f3(fact) == pipeline_ir_abort_cleanup_structural_kind() or node_tag(fact) == value {
     let value_phys = pipeline_ir_native_load_reg(code, pinned, value)
     bu32(code, cg_str(value_phys, 17, handler_abort_cleanup_record_value_offset()))
-  } else { 0 }
+  } else { 0 } }
   pipeline_ir_abort_cleanup_emit_sp_address(code, 15, pipeline_ir_abort_cleanup_record_offset(fmap_current_abort_cleanup_base(fm), fact))
   pipeline_ir_abort_cleanup_emit_action_address(code, fact, fm)
   bu32(code, cg_str(17, 15, handler_abort_cleanup_record_fn_offset()))
@@ -27799,7 +27908,7 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_prepare_site_from(code: i64, fact
   if facts == 0 or index >= nlist_len(facts) { 0 }
   else {
     let fact = nlist_get(facts, index)
-    if node_tag(fact) == site and node_f1(fact) != site {
+    if node_tag(fact) == site and node_f1(fact) != site and node_f3(fact) != pipeline_ir_abort_cleanup_structural_kind() {
       pipeline_ir_abort_cleanup_emit_sp_address(code, 17, pipeline_ir_abort_cleanup_record_offset(fmap_current_abort_cleanup_base(fm), fact))
       let value_phys = pipeline_ir_native_load_reg(code, pinned, node_f1(fact))
       bu32(code, cg_str(value_phys, 17, handler_abort_cleanup_record_value_offset()))
@@ -27857,10 +27966,9 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_fact(code: i64, fact: i64,
 -- Remove one dynamic obligation matching (value, cleanup function). This is
 -- deliberately a one-record operation: two retains of the same pointer are
 -- two counts and two records, and one ordinary release consumes only one.
-pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_action_with_boundary(code: i64, value: i64, action: i64, kind: i64, stop_at_boundary: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
-  if value < 0 or action == 0 { 0 }
+pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_action_phys_with_boundary(code: i64, value_phys: i64, action: i64, kind: i64, stop_at_boundary: i64, fm: i64) -> i64 {
+  if action == 0 { 0 }
   else {
-    let value_phys = pipeline_ir_native_load_reg(code, pinned, value)
     emit_store_spill_offset(code, value_phys, pipeline_ir_abort_cleanup_expected_value_offset(fmap_current_abort_cleanup_base(fm)))
     emit_mov_imm_safe(code, 17, action)
     emit_store_spill_offset(code, 17, pipeline_ir_abort_cleanup_expected_action_offset(fmap_current_abort_cleanup_base(fm)))
@@ -27923,6 +28031,14 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_action_with_boundary(code:
   }
 }
 
+pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_action_with_boundary(code: i64, value: i64, action: i64, kind: i64, stop_at_boundary: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if value < 0 or action == 0 { 0 }
+  else {
+    let value_phys = pipeline_ir_native_load_reg(code, pinned, value)
+    pipeline_ir_abort_cleanup_emit_disarm_action_phys_with_boundary(code, value_phys, action, kind, stop_at_boundary, fm)
+  }
+}
+
 pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_action(code: i64, value: i64, action: i64, kind: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
   pipeline_ir_abort_cleanup_emit_disarm_action_with_boundary(code, value, action, kind, 1, fm, pinned)
 }
@@ -27953,7 +28069,24 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_owned(code: i64, value: i6
 }
 
 pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_structural(code: i64, value: i64, plan: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
-  pipeline_ir_abort_cleanup_emit_disarm_action(code, value, pipeline_structural_drop_glue_hash(plan), pipeline_ir_abort_cleanup_structural_kind(), fm, pinned)
+  let action = pipeline_structural_drop_glue_hash(plan)
+  if pipeline_structural_drop_plan_storage_mode(plan) == 2 {
+    let fact = pipeline_ir_abort_cleanup_find_acquisition_value_action_kind(
+      fmap_current_abort_cleanup_facts(fm), value, action, pipeline_ir_abort_cleanup_structural_kind()
+    )
+    if fact == 0 { 0 }
+    else {
+      pipeline_ir_abort_cleanup_emit_sp_address(
+        code, 16,
+        pipeline_ir_abort_cleanup_shadow_offset(fmap_current_abort_cleanup_base(fm), fmap_current_abort_cleanup_facts(fm), fact, fm)
+      )
+      pipeline_ir_abort_cleanup_emit_disarm_action_phys_with_boundary(
+        code, 16, action, pipeline_ir_abort_cleanup_structural_kind(), 1, fm
+      )
+    }
+  } else {
+    pipeline_ir_abort_cleanup_emit_disarm_action(code, value, action, pipeline_ir_abort_cleanup_structural_kind(), fm, pinned)
+  }
 }
 
 pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_array(code: i64, data: i64, leaf_count: i64, leaf_stride: i64, leaf_kind: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
@@ -28042,7 +28175,9 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_commit_structural_leaf(code: i64,
 
 pub(package) fn pipeline_ir_abort_cleanup_emit_commit_variant_plan(code: i64, payloads: IrValueList, base_index: i64, plan: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
   let kind = typeck_linear_layout_plan_kind(plan)
-  if kind == 2 or kind == 3 {
+  if kind == 6 and pipeline_structural_drop_plan_storage_mode(plan) == 2 {
+    pipeline_ir_abort_cleanup_emit_commit_variant_plan(code, payloads, base_index, typeck_linear_layout_plan_children(plan), fm, pinned)
+  } else { if kind == 2 or kind == 3 {
     let children = typeck_linear_layout_plan_children(plan)
     let mut i = 0
     while i < nlist_len(children) {
@@ -28058,7 +28193,7 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_commit_variant_plan(code: i64, pa
     pipeline_ir_abort_cleanup_emit_commit_structural_leaf(
       code, pipeline_ir_value_list_get_or(payloads, base_index, 0 - 1), plan, fm, pinned
     )
-  }
+  } }
 }
 
 pub(package) fn pipeline_ir_abort_cleanup_variant_alternative_for_tag(alternatives: i64, tag_hash: i64) -> i64 {
@@ -28101,7 +28236,9 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_commit_variant_structural(code: i
 
 pub(package) fn pipeline_ir_abort_cleanup_emit_commit_record_plan(code: i64, fields: IrRecordFieldList, base_word: i64, plan: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
   let kind = typeck_linear_layout_plan_kind(plan)
-  if kind == 2 or kind == 3 {
+  if kind == 6 and pipeline_structural_drop_plan_storage_mode(plan) == 2 {
+    pipeline_ir_abort_cleanup_emit_commit_record_plan(code, fields, base_word, typeck_linear_layout_plan_children(plan), fm, pinned)
+  } else { if kind == 2 or kind == 3 {
     let children = typeck_linear_layout_plan_children(plan)
     let mut i = 0
     while i < nlist_len(children) {
@@ -28117,7 +28254,7 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_commit_record_plan(code: i64, fie
     pipeline_ir_abort_cleanup_emit_commit_structural_leaf(
       code, pipeline_ir_record_field_value_at_word_offset(fields, base_word), plan, fm, pinned
     )
-  }
+  } }
 }
 
 pub(package) fn pipeline_ir_abort_cleanup_emit_commit_record_structural(code: i64, dst: i64, fields: IrRecordFieldList, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
@@ -28155,7 +28292,9 @@ pub(package) fn pipeline_ir_record_layout_word_value_at_byte_offset(fields: IrRe
 
 pub(package) fn pipeline_ir_abort_cleanup_emit_commit_record_layout_plan(code: i64, fields: IrRecordLayoutFieldList, base_word: i64, plan: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
   let kind = typeck_linear_layout_plan_kind(plan)
-  if kind == 2 or kind == 3 {
+  if kind == 6 and pipeline_structural_drop_plan_storage_mode(plan) == 2 {
+    pipeline_ir_abort_cleanup_emit_commit_record_layout_plan(code, fields, base_word, typeck_linear_layout_plan_children(plan), fm, pinned)
+  } else { if kind == 2 or kind == 3 {
     let children = typeck_linear_layout_plan_children(plan)
     let mut i = 0
     while i < nlist_len(children) {
@@ -28171,7 +28310,7 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_commit_record_layout_plan(code: i
     pipeline_ir_abort_cleanup_emit_commit_structural_leaf(
       code, pipeline_ir_record_layout_word_value_at_byte_offset(fields, base_word * 8), plan, fm, pinned
     )
-  }
+  } }
 }
 
 pub(package) fn pipeline_ir_abort_cleanup_emit_commit_record_layout_structural(code: i64, dst: i64, fields: IrRecordLayoutFieldList, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
@@ -29073,7 +29212,7 @@ pub(package) fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBod
       fmap_set_current_abort_cleanup_base(fm, abort_cleanup_base)
       fmap_set_current_abort_cleanup_boundary(fm, abort_cleanup_base)
       fmap_set_current_abort_cleanup_instrumented(fm, abort_cleanup_instrumented)
-      fmap_set_current_frame_size(fm, pipeline_ir_abort_cleanup_frame_size(abort_cleanup_base, abort_cleanup_facts, abort_cleanup_instrumented))
+      fmap_set_current_frame_size(fm, pipeline_ir_abort_cleanup_frame_size(abort_cleanup_base, abort_cleanup_facts, abort_cleanup_instrumented, fm))
       if f64_slot_count > 0 { fmap_set_current_preserve_fp(fm, 1) } else { 0 }
       fmap_set_current_gpr_pairs(fm, 4)
       emit_prologue_current(code, fm)
@@ -29356,7 +29495,7 @@ pub(package) fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredH
       fmap_set_current_abort_cleanup_base(fm, abort_cleanup_base)
       fmap_set_current_abort_cleanup_boundary(fm, abort_cleanup_base)
       fmap_set_current_abort_cleanup_instrumented(fm, abort_cleanup_instrumented)
-      fmap_set_current_frame_size(fm, pipeline_ir_abort_cleanup_frame_size(abort_cleanup_base, abort_cleanup_facts, abort_cleanup_instrumented))
+      fmap_set_current_frame_size(fm, pipeline_ir_abort_cleanup_frame_size(abort_cleanup_base, abort_cleanup_facts, abort_cleanup_instrumented, fm))
       if f64_slot_count > 0 { fmap_set_current_preserve_fp(fm, 1) } else { 0 }
       fmap_set_current_gpr_pairs(fm, 4)
       emit_prologue_current(code, fm)
@@ -31443,6 +31582,18 @@ pub(package) fn pipeline_structural_drop_plan_value_words(plan: i64) -> i64 {
   else { typeck_linear_layout_plan_words(plan) }
 }
 
+-- Native root storage: 1 one scalar resource word, 2 flattened SSA words,
+-- 3 one managed aggregate pointer. Opaque declarations preserve their exact
+-- representation mode rather than becoming a fourth backend shape.
+pub(package) fn pipeline_structural_drop_plan_storage_mode(plan: i64) -> i64 {
+  let kind = typeck_linear_layout_plan_kind(plan)
+  if kind == 1 { 1 }
+  else { if kind == 2 or kind == 3 { 2 }
+  else { if kind == 4 or kind == 5 { 3 }
+  else { if kind == 6 { pipeline_structural_drop_plan_storage_mode(typeck_linear_layout_plan_children(plan)) }
+  else { 0 } } } }
+}
+
 pub(package) fn pipeline_structural_drop_components_are_valid(components: i64, words: i64) -> i64 {
   if components == 0 or nlist_len(components) == 0 { 0 }
   else {
@@ -31558,8 +31709,8 @@ pub(package) fn pipeline_ir_native_emit_structural_memory_components(code: i64, 
     let component = nlist_get(components, i - 1)
     let child = typeck_linear_layout_component_plan(component)
     let child_offset = base_word_offset + typeck_linear_layout_component_offset(component)
-    let child_kind = typeck_linear_layout_plan_kind(child)
-    if child_kind == 4 or child_kind == 5 {
+    let child_mode = pipeline_structural_drop_plan_storage_mode(child)
+    if child_mode == 3 {
       let target = pipeline_ir_native_ensure_structural_drop_glue(code, child, fm)
       emit_load_spill_offset(code, 15, 0)
       pipeline_ir_native_emit_addr_plus_imm(code, 16, 15, child_offset * 8)
@@ -31572,6 +31723,16 @@ pub(package) fn pipeline_ir_native_emit_structural_memory_components(code: i64, 
     i = i - 1
   }
   0
+}
+
+pub(package) fn pipeline_ir_native_emit_structural_scalar_plan_x0(code: i64, plan: i64, fm: i64) -> i64 {
+  let kind = typeck_linear_layout_plan_kind(plan)
+  if kind == 1 { pipeline_ir_native_emit_structural_owned_leaf_x0(code, plan, fm) }
+  else { if kind == 6 { pipeline_ir_native_emit_structural_scalar_plan_x0(code, typeck_linear_layout_plan_children(plan), fm) }
+  else {
+    fmap_inc_emit_error_count(fm)
+    bu32(code, encode_brk(66))
+  } }
 }
 
 pub(package) fn pipeline_ir_native_ensure_structural_drop_glue(code: i64, plan: i64, fm: i64) -> i64 {
@@ -31587,14 +31748,16 @@ pub(package) fn pipeline_ir_native_ensure_structural_drop_glue(code: i64, plan: 
     bu32(code, encode_sub_imm(31, 31, 16))
     emit_store_spill_offset(code, 0, 0)
     emit_store_spill_offset(code, 30, 8)
-    let kind = typeck_linear_layout_plan_kind(plan)
-    if kind == 4 {
-      pipeline_ir_native_emit_structural_memory_components(code, typeck_linear_layout_plan_children(plan), 0, fm)
+    let storage_mode = pipeline_structural_drop_plan_storage_mode(plan)
+    if storage_mode == 1 {
+      pipeline_ir_native_emit_structural_scalar_plan_x0(code, plan, fm)
     } else {
       pipeline_ir_native_emit_structural_memory_plan(code, plan, 0, fm)
     }
-    emit_load_spill_offset(code, 0, 0)
-    cg_emit_call_lit(code, fm, "rc_default_release")
+    if storage_mode == 3 {
+      emit_load_spill_offset(code, 0, 0)
+      cg_emit_call_lit(code, fm, "rc_default_release")
+    } else { 0 }
     emit_load_spill_offset(code, 30, 8)
     bu32(code, encode_add_imm(31, 31, 16))
     bu32(code, encode_ret())
@@ -37391,7 +37554,7 @@ pub(package) fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64
         fmap_set_current_abort_cleanup_base(fm, abort_cleanup_base)
         fmap_set_current_abort_cleanup_boundary(fm, abort_cleanup_base)
         fmap_set_current_abort_cleanup_instrumented(fm, abort_cleanup_instrumented)
-        fmap_set_current_frame_size(fm, pipeline_ir_abort_cleanup_frame_size(abort_cleanup_base, abort_cleanup_facts, abort_cleanup_instrumented))
+        fmap_set_current_frame_size(fm, pipeline_ir_abort_cleanup_frame_size(abort_cleanup_base, abort_cleanup_facts, abort_cleanup_instrumented, fm))
         if f64_slot_count > 0 {
           fmap_set_current_preserve_fp(fm, 1)
           fmap_inc_fp_preserve_function_count(fm)
