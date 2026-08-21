@@ -27769,7 +27769,7 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_fact(code: i64, fact: i64,
 -- Remove one dynamic obligation matching (value, cleanup function). This is
 -- deliberately a one-record operation: two retains of the same pointer are
 -- two counts and two records, and one ordinary release consumes only one.
-pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_action(code: i64, value: i64, action: i64, kind: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_action_with_boundary(code: i64, value: i64, action: i64, kind: i64, stop_at_boundary: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
   if value < 0 or action == 0 { 0 }
   else {
     let value_phys = pipeline_ir_native_load_reg(code, pinned, value)
@@ -27786,10 +27786,13 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_action(code: i64, value: i
     bu32(code, encode_cmp(15, 31))
     let done_empty = buf_len(code)
     bu32(code, 0)
-    emit_load_spill_offset(code, 16, fmap_current_abort_cleanup_boundary(fm))
-    bu32(code, encode_cmp(15, 16))
-    let done_boundary = buf_len(code)
-    bu32(code, 0)
+    let done_boundary = if stop_at_boundary == 1 {
+      emit_load_spill_offset(code, 16, fmap_current_abort_cleanup_boundary(fm))
+      bu32(code, encode_cmp(15, 16))
+      let patch = buf_len(code)
+      bu32(code, 0)
+      patch
+    } else { 0 }
     emit_load_spill_offset(code, 16, pipeline_ir_abort_cleanup_expected_value_offset(fmap_current_abort_cleanup_base(fm)))
     bu32(code, cg_ldr(17, 15, handler_abort_cleanup_record_value_offset()))
     bu32(code, encode_cmp(17, 16))
@@ -27812,16 +27815,48 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_action(code: i64, value: i
     emit_load_spill_offset(code, 16, pipeline_ir_abort_cleanup_link_address_offset(fmap_current_abort_cleanup_base(fm)))
     bu32(code, cg_ldr(17, 15, handler_abort_cleanup_record_prev_offset()))
     bu32(code, cg_str(17, 16, 0))
+    -- A transferred parameter may consume the caller record which was the
+    -- callee's entry boundary. The ordinary epilogue restores that saved
+    -- boundary, so advance it with the splice; otherwise the epilogue would
+    -- resurrect the just-consumed record. Removing a record below the boundary
+    -- already updates a live prev link and needs no boundary rewrite.
+    if stop_at_boundary == 0 {
+      emit_load_spill_offset(code, 16, fmap_current_abort_cleanup_boundary(fm))
+      bu32(code, encode_cmp(15, 16))
+      let keep_boundary = buf_len(code)
+      bu32(code, 0)
+      emit_store_spill_offset(code, 17, fmap_current_abort_cleanup_boundary(fm))
+      cg_patch_b_cond(code, keep_boundary, 1, buf_len(code))
+    } else { 0 }
     let done = buf_len(code)
     cg_patch_b_cond(code, done_empty, 0, done)
-    cg_patch_b_cond(code, done_boundary, 0, done)
+    if done_boundary != 0 { cg_patch_b_cond(code, done_boundary, 0, done) } else { 0 }
     cg_patch_cbz(code, inactive, 15, done)
   }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_action(code: i64, value: i64, action: i64, kind: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  pipeline_ir_abort_cleanup_emit_disarm_action_with_boundary(code, value, action, kind, 1, fm, pinned)
+}
+
+-- A callee's explicit parameter cleanup consumes a transport stake acquired
+-- in its caller. That record is intentionally below the callee's entry
+-- boundary: interrupted calls must leave it armed, while a normal parameter
+-- cleanup must splice it before releasing the value. Only the typed cleanup
+-- origin selects this cross-boundary form.
+pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_action_transferred(code: i64, value: i64, action: i64, kind: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  pipeline_ir_abort_cleanup_emit_disarm_action_with_boundary(code, value, action, kind, 0, fm, pinned)
 }
 
 pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_direct(code: i64, value: i64, callee_hash: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
   if pipeline_ir_abort_cleanup_is_direct_action_hash(callee_hash) == 1 {
     pipeline_ir_abort_cleanup_emit_disarm_action(code, value, callee_hash, pipeline_ir_abort_cleanup_direct_kind(), fm, pinned)
+  } else { 0 }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_direct_transferred(code: i64, value: i64, callee_hash: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if pipeline_ir_abort_cleanup_is_direct_action_hash(callee_hash) == 1 {
+    pipeline_ir_abort_cleanup_emit_disarm_action_transferred(code, value, callee_hash, pipeline_ir_abort_cleanup_direct_kind(), fm, pinned)
   } else { 0 }
 }
 
@@ -27833,6 +27868,64 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_array(code: i64, data: i64
   if pipeline_array_drop_plan_is_active(leaf_count, leaf_stride, leaf_kind) == 1 {
     pipeline_ir_abort_cleanup_emit_disarm_action(code, data, pipeline_array_drop_glue_hash(leaf_count, leaf_stride, leaf_kind), pipeline_ir_abort_cleanup_array_kind(), fm, pinned)
   } else { 0 }
+}
+
+-- Aggregate construction commits each transported field stake to the freshly
+-- created aggregate. Before this point an abort must clean the standalone
+-- stake; afterwards the aggregate's deep release owns that obligation. Splice
+-- the standalone record only after every field store has completed, while the
+-- constructor's own result record is registered by the ordinary post-inst
+-- hook immediately afterwards.
+pub(package) fn pipeline_ir_abort_cleanup_mask_cleanup_kind(mask: i64, word: i64) -> i64 {
+  let encoded = if word < 0 or word >= 16 { 0 } else { (mask bshr (word * 2)) band 3 }
+  if encoded == 1 { continuation_cleanup_kind_rc() }
+  else { if encoded == 2 { continuation_cleanup_kind_closure() }
+  else { if encoded == 3 { continuation_cleanup_kind_weak() }
+  else { continuation_cleanup_kind_none() } } }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_emit_commit_managed_value(code: i64, value: i64, cleanup_kind: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  let release_hash = pipeline_managed_release_hash_for_kind(cleanup_kind)
+  if release_hash == 0 { 0 }
+  else { pipeline_ir_abort_cleanup_emit_disarm_direct(code, value, release_hash, fm, pinned) }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_emit_commit_variant_payloads(code: i64, payloads: IrValueList, field_mask: i64, index: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  match payloads {
+    IrValueNil -> 0
+    IrValueCons(value, rest) -> {
+      -- Variant word zero is the tag; payload lane zero occupies word one.
+      pipeline_ir_abort_cleanup_emit_commit_managed_value(code, value, pipeline_ir_abort_cleanup_mask_cleanup_kind(field_mask, index + 1), fm, pinned)
+      pipeline_ir_abort_cleanup_emit_commit_variant_payloads(code, rest, field_mask, index + 1, fm, pinned)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_emit_commit_record_fields(code: i64, fields: IrRecordFieldList, field_mask: i64, index: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  match fields {
+    IrRecordFieldNil -> 0
+    IrRecordFieldCons(field_hash, word_offset, value, rest) -> {
+      let word = if word_offset >= 0 { word_offset } else { index }
+      pipeline_ir_abort_cleanup_emit_commit_managed_value(code, value, pipeline_ir_abort_cleanup_mask_cleanup_kind(field_mask, word), fm, pinned)
+      pipeline_ir_abort_cleanup_emit_commit_record_fields(code, rest, field_mask, index + 1, fm, pinned)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_emit_commit_record_layout_fields(code: i64, fields: IrRecordLayoutFieldList, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  match fields {
+    IrRecordLayoutFieldNil -> 0
+    IrRecordLayoutFieldWord(field_hash, byte_offset, value, managed_kind, rest) -> {
+      pipeline_ir_abort_cleanup_emit_commit_managed_value(code, value, managed_kind, fm, pinned)
+      pipeline_ir_abort_cleanup_emit_commit_record_layout_fields(code, rest, fm, pinned)
+    }
+    IrRecordLayoutFieldArray(field_hash, byte_offset, storage, byte_size, leaf_count, leaf_stride, leaf_kind, rest) -> {
+      -- Described records copy array bytes and retain their leaves. The source
+      -- storage handle remains a standalone temporary consumed by the explicit
+      -- aggregate-origin release which follows the constructor.
+      pipeline_ir_abort_cleanup_emit_commit_record_layout_fields(code, rest, fm, pinned)
+    }
+  }
 }
 
 pub(package) fn pipeline_ir_native_move_args(code: i64, args: IrValueList, index: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
@@ -32217,16 +32310,23 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
       ctx
     }
     IrManagedStakeI64(dst, value, cleanup_kind, delta, origin) -> {
-      let callee_hash = if delta == 1 {
+      let base_hash = if delta == 1 {
         pipeline_managed_retain_hash_for_kind(cleanup_kind)
       } else { if delta == 0 - 1 {
         pipeline_managed_release_hash_for_kind(cleanup_kind)
       } else { 0 } }
+      let callee_hash = if fmap_rc_census_mode(fm) == 1 {
+        pipeline_ir_materialise_managed_stake_census_hash(cleanup_kind, delta, origin)
+      } else { base_hash }
       if callee_hash == 0 {
         fmap_inc_emit_error_count(fm)
         bu32(code, encode_brk(64))
       } else {
-        pipeline_ir_abort_cleanup_emit_disarm_direct(code, value, callee_hash, fm, pinned)
+        if delta == 0 - 1 and origin == ir_managed_stake_origin_cleanup() {
+          pipeline_ir_abort_cleanup_emit_disarm_direct_transferred(code, value, base_hash, fm, pinned)
+        } else {
+          pipeline_ir_abort_cleanup_emit_disarm_direct(code, value, base_hash, fm, pinned)
+        }
         pipeline_ir_native_emit_call(code, dst, callee_hash, ir_value_list_prepend(value, ir_value_list_empty()), fm, pinned)
       }
       ctx
@@ -32292,6 +32392,7 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
     }
     IrVariantInitI64(dst, tag_hash, args, field_mask) -> {
       pipeline_ir_native_emit_variant_init(code, dst, tag_hash, args, field_mask, fm, pinned)
+      pipeline_ir_abort_cleanup_emit_commit_variant_payloads(code, args, field_mask, 0, fm, pinned)
       ctx
     }
     IrVariantTagI64(dst, value) -> {
@@ -32304,10 +32405,12 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
     }
     IrRecordInitI64(dst, type_hash, fields) -> {
       pipeline_ir_native_emit_record_init(code, dst, type_hash, fields, fm, pinned)
+      pipeline_ir_abort_cleanup_emit_commit_record_fields(code, fields, pipeline_record_field_mask(fmap_get_tt(fm), type_hash), 0, fm, pinned)
       ctx
     }
     IrRecordLayoutInitI64(dst, type_hash, data_size, align, fields) -> {
       pipeline_ir_native_emit_record_layout_init(code, dst, type_hash, data_size, align, fields, fm, pinned)
+      pipeline_ir_abort_cleanup_emit_commit_record_layout_fields(code, fields, fm, pinned)
       ctx
     }
     IrRecordLayoutArrayLoadI64(dst_data, base, record_data_size, byte_offset, byte_size, leaf_count, leaf_stride, leaf_kind) -> {
@@ -32349,8 +32452,14 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
     }
     IrReuseInitI64(token, constructor) -> {
       match constructor {
-        IrVariantInitI64(dst, tag_hash, args, field_mask) -> pipeline_ir_native_emit_variant_reuse_init(code, token, dst, tag_hash, args, field_mask, fm, pinned)
-        IrRecordInitI64(dst, type_hash, fields) -> pipeline_ir_native_emit_record_reuse_init(code, token, dst, type_hash, fields, fm, pinned)
+        IrVariantInitI64(dst, tag_hash, args, field_mask) -> {
+          pipeline_ir_native_emit_variant_reuse_init(code, token, dst, tag_hash, args, field_mask, fm, pinned)
+          pipeline_ir_abort_cleanup_emit_commit_variant_payloads(code, args, field_mask, 0, fm, pinned)
+        }
+        IrRecordInitI64(dst, type_hash, fields) -> {
+          pipeline_ir_native_emit_record_reuse_init(code, token, dst, type_hash, fields, fm, pinned)
+          pipeline_ir_abort_cleanup_emit_commit_record_fields(code, fields, pipeline_record_field_mask(fmap_get_tt(fm), type_hash), 0, fm, pinned)
+        }
         IrCallI64(dst, callee_hash, args) -> pipeline_ir_native_emit_raw_call_reuse_init(code, token, dst, callee_hash, args, fm, pinned)
         _ -> {
           fmap_inc_emit_error_count(fm)
@@ -37059,10 +37168,17 @@ pub(package) fn pipeline_ir_materialise_managed_stake_deferred_body(body: IrDefe
 pub(package) fn pipeline_ir_materialise_managed_stake_inst_with_census(inst: IrInst, census: i64) -> IrInst {
   match inst {
     IrManagedStakeI64(dst, value, cleanup_kind, delta, origin) -> {
-      let callee_hash = if census == 1 { pipeline_ir_materialise_managed_stake_census_hash(cleanup_kind, delta, origin) }
-        else { pipeline_ir_materialise_managed_stake_hash(cleanup_kind, delta) }
-      if callee_hash == 0 or ir_managed_stake_origin_is_valid(origin) == 0 { IrLoweringFailureI64(64) }
-      else { IrCallI64(dst, callee_hash, ir_value_list_prepend(value, ir_value_list_empty())) }
+      -- Parameter/loop cleanup may consume a stake acquired in the caller.
+      -- Keep that semantic origin through native emission so J3 can cross
+      -- the current frame boundary only for this proven transfer case.
+      if delta == 0 - 1 and origin == ir_managed_stake_origin_cleanup() {
+        inst
+      } else {
+        let callee_hash = if census == 1 { pipeline_ir_materialise_managed_stake_census_hash(cleanup_kind, delta, origin) }
+          else { pipeline_ir_materialise_managed_stake_hash(cleanup_kind, delta) }
+        if callee_hash == 0 or ir_managed_stake_origin_is_valid(origin) == 0 { IrLoweringFailureI64(64) }
+        else { IrCallI64(dst, callee_hash, ir_value_list_prepend(value, ir_value_list_empty())) }
+      }
     }
     IrClosureI64(dst, f, captures, evidence) -> IrClosureI64(dst, pipeline_ir_materialise_managed_stake_function_with_census(f, census), captures, evidence)
     IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, reserved) -> IrHandleI64(dst, handle_src, effect_hash, pipeline_ir_materialise_managed_stake_handler_clauses_with_census(clauses, census), nclauses, reserved)
