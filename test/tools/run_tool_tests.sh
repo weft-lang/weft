@@ -424,6 +424,13 @@ assert_contains "doc_checked_module_attaches_comment" "$doc_out" "Returns the ch
 assert_contains "doc_checked_module_renders_signature" "$doc_out" "pub fn answer(value: i64) -> i64"
 assert_not_contains "doc_checked_module_omits_private" "$doc_out" "hidden"
 
+printf '%s\n' '--- The public answer.' 'pub const ANSWER: i64 = 42' 'const PRIVATE: i64 = 7' 'fn main() -> i64 { ANSWER }' > "$tmp_src"
+"$WEFT" doc "$tmp_src" > "$tmp_out" 2> "$tmp_err"
+assert_equals "doc_constant_stderr_empty" "$(<"$tmp_err")" ""
+assert_contains "doc_constant_has_distinct_heading" "$(<"$tmp_out")" '## Constant `ANSWER`'
+assert_contains "doc_constant_renders_typed_signature" "$(<"$tmp_out")" 'pub const ANSWER: i64'
+assert_not_contains "doc_constant_omits_private" "$(<"$tmp_out")" 'PRIVATE'
+
 set +e
 "$WEFT" doc stdlib/result.weft > "$tmp_out" 2> "$tmp_err"
 doc_stdlib_exit=$?
@@ -568,6 +575,12 @@ assert_equals "fmt_valid_stderr_empty" "$(<"$tmp_err")" ""
 fmt_path_out=$("$WEFT" fmt "$tmp_src" 2>"$tmp_err")
 assert_equals "fmt_path_snapshot_exact" "$fmt_path_out" "fn main() -> i64 { 42 }"
 assert_equals "fmt_path_stderr_empty" "$(<"$tmp_err")" ""
+
+printf '%s\n' 'pub   const ANSWER:i64=40+2' 'fn main()->i64{ANSWER}' > "$tmp_src"
+"$WEFT" fmt "$tmp_src" > "$tmp_out" 2> "$tmp_err"
+assert_equals "fmt_constant_snapshot_exact" "$(<"$tmp_out")" $'pub const ANSWER: i64 = 40 + 2\n\nfn main() -> i64 { ANSWER }'
+"$WEFT" fmt "$tmp_out" > "$tmp_bin" 2> "$tmp_err"
+assert_files_equal "fmt_constants_are_idempotent" "$tmp_bin" "$tmp_out"
 
 printf '%s\n' 'fn   πρόσθεση ( α : i64, β: i64 ) -> i64 { α + β }' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
@@ -1333,6 +1346,10 @@ assert_equals "mcp_fact_at_position_cursor_end_snapshot" "$mcp_out" '{"jsonrpc":
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fact_at_position","arguments":{"source":"fn main() -> i64 { 0 }","offset":8}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_fact_at_position_missing_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"fact_at_position","ok":true,"schema_version":1,"stability":"stable","offset":8,"found":false}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fact_at_position","arguments":{"source":"const ANSWER: i64 = 42 fn main() -> i64 { ANSWER }","offset":47}}}' | "$WEFT" mcp 2>&1)
+assert_contains "mcp_fact_at_position_constant_kind" "$mcp_out" '"symbol_kind":"constant"'
+assert_contains "mcp_fact_at_position_constant_type" "$mcp_out" '"type":{"kind":"primitive","name":"i64"}'
 
 mcp_binding_source='fn inspect(value: i64) -> i64 { value }'
 mcp_binding_prefix='fn inspect(value: i64) -> i64 { '
@@ -2192,6 +2209,16 @@ lsp_local_definition='{"jsonrpc":"2.0","id":5,"method":"textDocument/definition"
 lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_open_local")" "$(lsp_frame "$lsp_local_hover")" "$(lsp_frame "$lsp_local_definition")" | "$WEFT" lsp 2>&1)
 assert_contains "lsp_hover_local" "$lsp_out" '"value":"local value: i64"'
 assert_contains "lsp_definition_local" "$lsp_out" '"range":{"start":{"line":0,"character":23},"end":{"line":0,"character":28}}'
+
+lsp_constant_prefix='const answer: i64 = 42 fn main() -> i64 { '
+lsp_constant_source="${lsp_constant_prefix}answer }"
+lsp_constant_use=${#lsp_constant_prefix}
+lsp_open_constant="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///constant.weft\",\"version\":1,\"text\":\"$lsp_constant_source\"}}}"
+lsp_constant_hover="{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///constant.weft\"},\"position\":{\"line\":0,\"character\":$lsp_constant_use}}}"
+lsp_constant_definition="{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"file:///constant.weft\"},\"position\":{\"line\":0,\"character\":$lsp_constant_use}}}"
+lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_open_constant")" "$(lsp_frame "$lsp_constant_hover")" "$(lsp_frame "$lsp_constant_definition")" | "$WEFT" lsp 2>&1)
+assert_contains "lsp_hover_constant" "$lsp_out" '"value":"constant answer: i64"'
+assert_contains "lsp_definition_constant" "$lsp_out" '"range":{"start":{"line":0,"character":6},"end":{"line":0,"character":12}}'
 
 lsp_pattern_before='fn main(value: ((i64, str), i64)) -> i64 { let ((left, '
 lsp_pattern_middle='label), right) = value __str_len('
