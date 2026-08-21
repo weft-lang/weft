@@ -224,6 +224,25 @@ def parse_status(field: str, fallback: frozenset[str]) -> frozenset[str]:
     return frozenset(part.strip() for part in value[1:-1].split(",") if part.strip())
 
 
+def absolute_root_artifact_is_only_error(
+    ascii_value: str, ascii_status: frozenset[str]
+) -> bool:
+    """Accept the trailing DNS root while preserving real A4_2 failures."""
+    if not ascii_value.endswith(".") or ascii_status != frozenset(("A4_2",)):
+        return False
+    canonical = ascii_value[:-1]
+    try:
+        canonical_bytes = canonical.encode("ascii")
+        labels = [label.encode("ascii") for label in canonical.split(".")]
+    except UnicodeEncodeError:
+        return False
+    return (
+        bool(canonical)
+        and len(canonical_bytes) <= 253
+        and all(0 < len(label) <= 63 for label in labels)
+    )
+
+
 def parse_tests(
     data: bytes,
 ) -> tuple[list[tuple[bytes, bytes, int, int]], int]:
@@ -251,8 +270,10 @@ def parse_tests(
             raise SystemExit("well-formed IDNA source has an ill-formed ASCII result")
         ascii_status = parse_status(fields[4], unicode_status)
         absolute = 1 if ascii_value.endswith(".") else 0
-        root_only_status = absolute == 1 and ascii_status == frozenset(("A4_2",))
-        succeeds = 1 if not ascii_status or root_only_status else 0
+        root_artifact_only = absolute_root_artifact_is_only_error(
+            ascii_value, ascii_status
+        )
+        succeeds = 1 if not ascii_status or root_artifact_only else 0
         expected = ascii_value[:-1] if absolute == 1 else ascii_value
         source_bytes = source.encode("utf-8")
         expected_bytes = expected.encode("ascii") if succeeds == 1 else b""
