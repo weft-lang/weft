@@ -99,6 +99,104 @@ run_guarded() {
   wait "$pid"
 }
 
+process_tree_snapshot() {
+  ps -axo pid=,ppid=,rss= 2>/dev/null
+}
+
+process_tree_members() {
+  local root_pid="$1"
+  process_tree_snapshot | awk -v root="$root_pid" '
+    { order[NR] = $1; parent[$1] = $2 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        pid = order[i]
+        cursor = pid
+        depth = 0
+        while (cursor > 1 && depth < 128) {
+          if (cursor == root) { print pid; break }
+          cursor = parent[cursor]
+          depth++
+        }
+      }
+    }
+  '
+}
+
+terminate_process_tree() {
+  local root_pid="$1"
+  local members
+  members=$(process_tree_members "$root_pid")
+
+  # Stop the scheduler before its current workers so it cannot refill slots
+  # while the tree is being drained.
+  kill "$root_pid" 2>/dev/null || true
+  for member in $members; do
+    if [ "$member" != "$root_pid" ]; then kill "$member" 2>/dev/null || true; fi
+  done
+  sleep 1
+
+  members=$(process_tree_members "$root_pid")
+  for member in $members; do kill -9 "$member" 2>/dev/null || true; done
+  wait "$root_pid" 2>/dev/null || true
+}
+
+run_tree_rss_guarded() {
+  local rss_limit_kb="$1"
+  shift
+
+  "$@" <&0 &
+  local pid=$!
+  local interrupted=0
+  local polls=0
+  trap 'interrupted=1' INT TERM
+
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$interrupted" -eq 1 ]; then
+      terminate_process_tree "$pid"
+      trap - INT TERM
+      return 130
+    fi
+
+    local stat
+    stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [[ "$stat" == Z* ]]; then break; fi
+
+    local offender
+    offender=$(process_tree_snapshot | awk -v root="$pid" -v limit="$rss_limit_kb" '
+      { order[NR] = $1; parent[$1] = $2; rss[$1] = $3 }
+      END {
+        for (i = 1; i <= NR; i++) {
+          candidate = order[i]
+          cursor = candidate
+          depth = 0
+          while (cursor > 1 && depth < 128) {
+            if (cursor == root) {
+              if (rss[candidate] > limit) { print candidate " " rss[candidate]; exit }
+              break
+            }
+            cursor = parent[cursor]
+            depth++
+          }
+        }
+      }
+    ')
+    if [ -n "$offender" ]; then
+      echo "planner process tree RSS limit exceeded: pid ${offender%% *} used ${offender##* } KB (limit ${rss_limit_kb} KB)" >&2
+      terminate_process_tree "$pid"
+      trap - INT TERM
+      return 125
+    fi
+
+    polls=$((polls+1))
+    if [ "$polls" -le 20 ]; then sleep 0.1; else sleep 1; fi
+  done
+
+  local status=0
+  wait "$pid" || status=$?
+  trap - INT TERM
+  return "$status"
+}
+
 echo "=== Weft Test Suite ==="
 echo "runtime compile timeout: ${WEFT_TEST_COMPILE_TIMEOUT}s"
 echo "runtime run timeout: ${WEFT_TEST_RUN_TIMEOUT}s"
@@ -134,7 +232,11 @@ done
 runtime_count=${#RUNTIME_TEST_FILES[@]}
 if [ "$runtime_count" -gt 0 ]; then
   planner_exit=0
-  WEFT_TEST_METRICS=1 "$WEFT" test --jobs "$WEFT_TEST_JOBS" "${RUNTIME_TEST_FILES[@]}" > "$PLANNER_OUT" 2> "$PLANNER_ERR" || planner_exit=$?
+  planner_rss_limit_kb="$WEFT_TEST_COMPILE_RSS_LIMIT_KB"
+  if [ "$WEFT_TEST_RUN_RSS_LIMIT_KB" -gt "$planner_rss_limit_kb" ]; then
+    planner_rss_limit_kb="$WEFT_TEST_RUN_RSS_LIMIT_KB"
+  fi
+  run_tree_rss_guarded "$planner_rss_limit_kb" env WEFT_TEST_METRICS=1 "$WEFT" test --jobs "$WEFT_TEST_JOBS" "${RUNTIME_TEST_FILES[@]}" > "$PLANNER_OUT" 2> "$PLANNER_ERR" || planner_exit=$?
   planner_failures=0
   for f in "${RUNTIME_TEST_FILES[@]}"; do
     pass_report=$(grep -F "  pass: $f (" "$PLANNER_ERR" | tail -1 || true)
