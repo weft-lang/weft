@@ -506,6 +506,7 @@ check_rejects "owned_param_used_twice" "test/negative/owned_param_used_twice.wef
 check_rejects "owned_let_used_twice" "test/negative/owned_let_used_twice.weft" "type error: owned value used more than once"
 check_rejects "linear_pattern_binding_used_twice" "test/negative/linear_pattern_binding_used_twice.weft" "type error: owned value used more than once"
 check_rejects "linear_pattern_guard_consumes_binding" "test/negative/linear_pattern_guard_consumes_binding.weft" "type error: linear pattern binding cannot be consumed in a match guard"
+check_rejects "linear_try_result_used_after_move" "test/negative/linear_try_result_used_after_move.weft" "type error: linear aggregate value used more than once"
 check_rejects "owned_closure_capture" "test/negative/owned_closure_capture.weft" "type error: owned value cannot be captured by closure"
 check_rejects "owned_plain_i64_requires_drop" "test/negative/owned_plain_i64_requires_drop.weft" "type error: owned type requires Drop resource conformance"
 check_rejects "owned_inherent_drop_requires_trait" "test/negative/owned_inherent_drop_requires_trait.weft" "type error: owned type requires Drop resource conformance"
