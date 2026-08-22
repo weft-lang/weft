@@ -2989,6 +2989,49 @@ printf '%s\n' '{"package":"dep","manifest_version":1,"version":"2.0.0","weft":"0
 pkg_native_wrong_target=$(cd "$tmp_pkg_trust_dir/native_typed" && "$WEFT_ABS" check main.weft 2>&1 || true)
 assert_contains "package_native_binding_rejects_target_substitution" "$pkg_native_wrong_target" "error[E5010]: native binding 'native/raw' has no declaration for compilation target 'macos-aarch64'"
 
+# A root-owned binding follows the same typed producer as imports and lowers
+# only called symbols into the object's undefined-symbol/relocation plan. The
+# linked program crosses integer, f32, f64 and mixed GPR/FP Darwin ABI lanes.
+mkdir -p "$tmp_pkg_trust_dir/native_linked"
+printf '%s\n' '{"package":"native-smoke","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"system","kind":"system","link":"System","search":["toolchain"],"content":"toolchain","optional":false}],"symbols":[{"declaration":"native_abs","symbol":"labs","library":"system","params":["i64"],"result":"i64","optional":false},{"declaration":"native_fabs","symbol":"fabs","library":"system","params":["f64"],"result":"f64","optional":false},{"declaration":"native_roundf","symbol":"roundf","library":"system","params":["f32"],"result":"f32","optional":false},{"declaration":"native_ldexp","symbol":"ldexp","library":"system","params":["f64","i32"],"result":"f64","optional":false},{"declaration":"native_jn","symbol":"jn","library":"system","params":["i32","f64"],"result":"f64","optional":false},{"declaration":"native_unused","symbol":"weft_symbol_intentionally_absent","library":"system","params":[],"result":"nil","optional":true}]}}}}}' > "$tmp_pkg_trust_dir/native_linked/weft.pkg"
+printf '%s\n' \
+  'fn main() -[Unsafe]> i64 {' \
+  '  let rounded32: f32 = native_roundf(41.6)' \
+  '  let checked64 = __f64_to_i64_trunc(native_fabs(0.0 - 42.75))' \
+  '  let fp_then_gpr = __f64_to_i64_trunc(native_ldexp(10.5, 2))' \
+  '  let gpr_then_fp = __f64_to_i64_trunc(native_jn(0, 0.0))' \
+  '  if checked64 == 42 {' \
+  '    if fp_then_gpr == 42 {' \
+  '      if gpr_then_fp == 1 {' \
+  '        native_abs(0 - __f64_to_i64_trunc(__f32_to_f64(rounded32)))' \
+  '      } else { 2 }' \
+  '    } else { 3 }' \
+  '  } else { 1 }' \
+  '}' > "$tmp_pkg_trust_dir/native_linked/main.weft"
+(cd "$tmp_pkg_trust_dir/native_linked" && run_weft_compile_guarded "$WEFT_ABS" compile main.weft) > "$tmp_pkg_trust_dir/native_linked/native.o"
+(cd "$tmp_pkg_trust_dir/native_linked" && run_weft_compile_guarded "$WEFT_ABS" compile main.weft) > "$tmp_pkg_trust_dir/native_linked/native_second.o"
+if cmp -s "$tmp_pkg_trust_dir/native_linked/native.o" "$tmp_pkg_trust_dir/native_linked/native_second.o"; then
+  echo "  ok package_native_object_is_deterministic"
+else
+  echo "  fail package_native_object_is_deterministic"
+  exit 1
+fi
+native_undefined=$(nm -u "$tmp_pkg_trust_dir/native_linked/native.o")
+assert_contains "package_native_object_emits_integer_symbol" "$native_undefined" "_labs"
+assert_contains "package_native_object_emits_f32_symbol" "$native_undefined" "_roundf"
+assert_contains "package_native_object_emits_mixed_fp_gpr_symbol" "$native_undefined" "_ldexp"
+assert_contains "package_native_object_emits_mixed_gpr_fp_symbol" "$native_undefined" "_jn"
+assert_not_contains "package_native_object_omits_unused_optional_symbol" "$native_undefined" "_weft_symbol_intentionally_absent"
+/usr/bin/ld -o "$tmp_pkg_trust_dir/native_linked/native" "$tmp_pkg_trust_dir/native_linked/native.o" -lSystem \
+  -syslibroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
+  -e _main -arch arm64 -platform_version macos 11.0 15.0 2>/dev/null
+codesign -s - "$tmp_pkg_trust_dir/native_linked/native" >/dev/null
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_linked/native"
+pkg_native_linked_exit=$?
+set -e
+assert_equals "package_native_manifest_call_links_and_runs" "$pkg_native_linked_exit" "42"
+
 # Trust belongs to the exact source buffer; importing an unlisted helper from
 # a trusted binding does not make that helper trusted.
 printf 'use native/helper.{*}\npub fn raw_probe(p: i64) -> i64 { helper_probe(p) }\n' > "$tmp_pkg_trust_dir/root_owned/native/raw.weft"
