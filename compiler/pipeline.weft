@@ -11090,6 +11090,22 @@ pub(package) fn pipeline_handler_clause_typed_param_nodes(
   pipeline_handler_clause_typed_param_nodes_into(clause_params, expected_params, 0, nlist_new())
 }
 
+pub(package) fn pipeline_handler_clause_param_bind_insts(
+  params: i64,
+  index: i64,
+  value_base: i64
+) -> IrInstList {
+  if params == 0 or index >= nlist_len(params) { ir_inst_list_empty() }
+  else {
+    let param = nlist_get(params, index)
+    let value = value_base + pipeline_param_value_index_at(params, index)
+    ir_inst_list_prepend(
+      ir_inst_bind_typed_i64(node_f1(param), node_f2(param), value, node_f3(param)),
+      pipeline_handler_clause_param_bind_insts(params, index + 1, value_base)
+    )
+  }
+}
+
 pub(package) fn pipeline_deferred_body_lowering_locals(captures: i64) -> PipelineValueEnv {
   pipeline_handler_capture_locals(captures, 0, 0, pipeline_value_env_empty())
 }
@@ -11220,10 +11236,23 @@ pub(package) fn pipeline_lower_handler_clause_body_typed(clause: HandlerClause, 
           pipeline_lowered_blocks_blocks(lowered),
           ir_inst_list_append(cleanup_reactivation, ir_inst_list_append(param_drops, linear_param_drops))
         )
+        -- Clause parameters are real ownership acquisitions, not mere ABI
+        -- aliases. Materialise their typed binds at entry so the shared J3
+        -- producer records them while a deferred prompt is live; dropping a
+        -- suspended clause can then run owned/structural cleanup exactly once.
+        let bound_blocks = pipeline_ir_block_list_prepend_entry_insts(
+          dropped_blocks,
+          0,
+          pipeline_handler_clause_param_bind_insts(
+            typed_params,
+            0,
+            param_lanes + capture_lanes
+          )
+        )
         let transferred_param_value_fact = if returned_param_mask != 0 {
           param_lanes + capture_lanes + pipeline_param_value_index_at(typed_params, returned_param_index) + 1
         } else { 0 }
-        IrHandlerClauseBody(op_hash, param_lanes, captures, has_continuation, abortive, pipeline_type_value_lane_cleanup_mask(result_ty), transferred_param_value_fact, pipeline_type_value_lane_count_or_one(resume_ty), pipeline_type_value_lane_count_or_one(result_ty), first_value, dropped_blocks)
+        IrHandlerClauseBody(op_hash, param_lanes, captures, has_continuation, abortive, pipeline_type_value_lane_cleanup_mask(result_ty), transferred_param_value_fact, pipeline_type_value_lane_count_or_one(resume_ty), pipeline_type_value_lane_count_or_one(result_ty), first_value, bound_blocks)
       }
     }
     UnknownHandlerClause(tag) -> IrHandlerClauseBodyInvalid(5)
@@ -29670,27 +29699,6 @@ pub(package) fn pipeline_ir_native_emit_deferred_packet_args(code: i64, packet_p
   }
 }
 
-pub(package) fn pipeline_ir_native_deferred_cleanup_drop_kind(kind: i64) -> i64 {
-  if kind == continuation_cleanup_kind_rc() { continuation_cleanup_kind_rc_drop_only() }
-  else { if kind == continuation_cleanup_kind_closure() { continuation_cleanup_kind_closure_drop_only() }
-  else { if kind == continuation_cleanup_kind_weak() { continuation_cleanup_kind_weak_drop_only() }
-  else { continuation_cleanup_kind_none() } } }
-}
-
-pub(package) fn pipeline_ir_native_deferred_cleanup_stack_count(fm: i64) -> i64 {
-  let stack = cg_cleanup_stack(fm)
-  let n = nlist_len(stack)
-  let mut count = 0
-  let mut i = 0
-  while i < n {
-    let entry = nlist_get(stack, i)
-    let kind = pipeline_ir_native_deferred_cleanup_drop_kind(cg_cleanup_descriptor_kind(entry))
-    if kind != continuation_cleanup_kind_none() { count = count + 1 } else { 0 }
-    i = i + 1
-  }
-  count
-}
-
 pub(package) fn pipeline_ir_native_emit_deferred_capture_owner_load(code: i64, owner_reg: i64, prompt_reg: i64) -> i64 {
   emit_mov_imm(code, owner_reg, 0)
   bu32(code, cg_ldr(prompt_reg, 28, runtime_state_deferred_prompt_offset()))
@@ -29712,59 +29720,33 @@ pub(package) fn pipeline_ir_native_emit_deferred_capture_owner_cleanup_entry(cod
   0
 }
 
+pub(package) fn pipeline_ir_native_emit_deferred_prompt_cleanup_entry(code: i64, desc_reg: i64, segment_reg: i64, index: i64, prompt_reg: i64) -> i64 {
+  bu32(code, cg_str(prompt_reg, segment_reg, index * 8))
+  emit_mov_imm(code, 9, continuation_cleanup_kind_prompt_drop_only())
+  bu32(code, cg_str(9, desc_reg, continuation_cleanup_desc_header_size() + index * continuation_cleanup_entry_size() + continuation_cleanup_entry_kind_offset()))
+  emit_mov_imm(code, 9, index * 8)
+  bu32(code, cg_str(9, desc_reg, continuation_cleanup_desc_header_size() + index * continuation_cleanup_entry_size() + continuation_cleanup_entry_slot_offset()))
+  emit_mov_imm(code, 9, 1)
+  bu32(code, cg_str(9, desc_reg, continuation_cleanup_desc_header_size() + index * continuation_cleanup_entry_size() + continuation_cleanup_entry_live_offset()))
+  0
+}
+
 pub(package) fn pipeline_ir_native_emit_deferred_packet_cleanup(code: i64, packet_phys: i64, fm: i64) -> i64 {
-  let stack = cg_cleanup_stack(fm)
-  let n = nlist_len(stack)
-  let count = pipeline_ir_native_deferred_cleanup_stack_count(fm)
-  if count <= 0 {
-    pipeline_ir_native_emit_deferred_capture_owner_load(code, 14, 13)
-    let no_cleanup_pos = buf_len(code)
-    bu32(code, 0)
-    cg_bump_alloc_imm(code, 10, continuation_cleanup_desc_size(1))
-    emit_mov_imm(code, 9, 1)
-    bu32(code, cg_str(9, 10, 0))
-    cg_bump_alloc_imm(code, 12, 8)
-    pipeline_ir_native_emit_deferred_capture_owner_load(code, 14, 13)
-    pipeline_ir_native_emit_deferred_capture_owner_cleanup_entry(code, 10, 12, 0, 14)
-    bu32(code, cg_str(10, packet_phys, 16))
-    bu32(code, cg_str(12, packet_phys, 24))
-    let cleanup_done_pos = buf_len(code)
-    bu32(code, 0)
-    let no_cleanup = buf_len(code)
-    cg_patch_cbz(code, no_cleanup_pos, 14, no_cleanup)
-    emit_mov_imm(code, 9, 0)
-    bu32(code, cg_str(9, packet_phys, 16))
-    bu32(code, cg_str(9, packet_phys, 24))
-    cg_patch_b(code, cleanup_done_pos, buf_len(code))
-  } else {
-    cg_bump_alloc_imm(code, 10, continuation_cleanup_desc_size(count + 1))
-    emit_mov_imm(code, 9, count + 1)
-    bu32(code, cg_str(9, 10, 0))
-    cg_bump_alloc_imm(code, 12, (count + 1) * 8)
-    let mut out = 0
-    let mut i = 0
-    while i < n {
-      let entry = nlist_get(stack, i)
-      let kind = pipeline_ir_native_deferred_cleanup_drop_kind(cg_cleanup_descriptor_kind(entry))
-      if kind != continuation_cleanup_kind_none() {
-        let rid = node_f1(entry)
-        let value_phys = emit_load_home(code, rid, 17)
-        bu32(code, cg_str(value_phys, 12, out * 8))
-        emit_mov_imm(code, 9, kind)
-        bu32(code, cg_str(9, 10, continuation_cleanup_desc_header_size() + out * continuation_cleanup_entry_size() + continuation_cleanup_entry_kind_offset()))
-        emit_mov_imm(code, 9, out * 8)
-        bu32(code, cg_str(9, 10, continuation_cleanup_desc_header_size() + out * continuation_cleanup_entry_size() + continuation_cleanup_entry_slot_offset()))
-        emit_mov_imm(code, 9, 1)
-        bu32(code, cg_str(9, 10, continuation_cleanup_desc_header_size() + out * continuation_cleanup_entry_size() + continuation_cleanup_entry_live_offset()))
-        out = out + 1
-      } else { 0 }
-      i = i + 1
-    }
-    pipeline_ir_native_emit_deferred_capture_owner_load(code, 14, 13)
-    pipeline_ir_native_emit_deferred_capture_owner_cleanup_entry(code, 10, 12, out, 14)
-    bu32(code, cg_str(10, packet_phys, 16))
-    bu32(code, cg_str(12, packet_phys, 24))
-  }
+  -- The prompt's detached J3 chain is the single typed source of cleanup
+  -- truth for suspended fiber locals, including managed captures, owned
+  -- resources, and structural values. Copying cg_cleanup_stack as well would
+  -- duplicate its managed obligations. The enclosing capture owner remains a
+  -- separate final entry because it lives outside the prompt stack.
+  cg_bump_alloc_imm(code, 10, continuation_cleanup_desc_size(2))
+  emit_mov_imm(code, 9, 2)
+  bu32(code, cg_str(9, 10, 0))
+  cg_bump_alloc_imm(code, 12, 16)
+  bu32(code, cg_ldr(13, 28, runtime_state_deferred_prompt_offset()))
+  pipeline_ir_native_emit_deferred_prompt_cleanup_entry(code, 10, 12, 0, 13)
+  pipeline_ir_native_emit_deferred_capture_owner_load(code, 14, 13)
+  pipeline_ir_native_emit_deferred_capture_owner_cleanup_entry(code, 10, 12, 1, 14)
+  bu32(code, cg_str(10, packet_phys, 16))
+  bu32(code, cg_str(12, packet_phys, 24))
 }
 
 pub(package) fn pipeline_ir_native_emit_deferred_suspend_direct(code: i64, dst: i64, entry_phys: i64, args: IrValueList, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
