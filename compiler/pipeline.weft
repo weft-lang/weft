@@ -5760,6 +5760,33 @@ pub(package) fn pipeline_perform_inst(dst: i64, src: i64, lhs: i64, op_ns: i64, 
   ir_inst_perform_i64(dst, effect_name_hash(src, node_f1(lhs), node_f2(lhs)), effect_name_hash(src, op_ns, op_nl), args)
 }
 
+-- Effect operations are typed call boundaries: a by-value linear argument
+-- moves into the selected handler clause exactly as it moves into an ordinary
+-- function parameter. Preserve that producer fact explicitly in IR because
+-- effect dispatch has no callee declaration hash from which native emission
+-- could recover the parameter types.
+pub(package) fn pipeline_effect_linear_transfer_insts(
+  params: i64,
+  index: i64,
+  arg_word: i64,
+  args: IrValueList,
+  tt: i64
+) -> IrInstList {
+  if params == 0 or index >= nlist_len(params) { ir_inst_list_empty() }
+  else {
+    let param_ty = node_f3(nlist_get(params, index))
+    let lanes = pipeline_type_value_lane_count_or_one(param_ty)
+    let plan = pipeline_linear_cleanup_plan(tt, param_ty)
+    let rest = pipeline_effect_linear_transfer_insts(params, index + 1, arg_word + lanes, args, tt)
+    if plan == 0 { rest }
+    else {
+      let value = pipeline_ir_value_list_get_or(args, arg_word, 0 - 1)
+      if value < 0 { rest }
+      else { ir_inst_list_prepend(ir_inst_linear_effect_transfer_i64(value, plan), rest) }
+    }
+  }
+}
+
 pub(package) fn pipeline_lower_internal_block_after_target(next_block: i64, target_block: i64) -> i64 {
   if next_block <= target_block { target_block + 1 } else { next_block }
 }
@@ -11029,6 +11056,40 @@ pub(package) fn pipeline_handler_clause_lowering_locals(clause_params: ParamList
   pipeline_handler_clause_lowering_params(clause_params, expected_params, 0, param_lanes + capture_lanes, with_captures)
 }
 
+-- Handler source may rename operation parameters. Cleanup and transfer facts
+-- need the clause-local names but the declaration's instantiated types. A
+-- list carrying declaration names misclassifies every renamed linear
+-- parameter as unused and drops it after `resume`.
+pub(package) fn pipeline_handler_clause_typed_param_nodes_into(
+  clause_params: ParamList,
+  expected_params: i64,
+  index: i64,
+  out: i64
+) -> i64 {
+  match clause_params {
+    ParamListNil -> out
+    ParamListCons(param, rest) -> {
+      match param {
+        Param(ns, nl, raw_ty, label) -> {
+          let ty = if expected_params != 0 and index < nlist_len(expected_params) {
+            node_f3(nlist_get(expected_params, index))
+          } else { pipeline_param_type_node_default_i64(param) }
+          nlist_add(out, node_new(2, ns, nl, ty, param_label_to_node(label)))
+        }
+        UnknownParam(tag) -> { nlist_add(out, 0) }
+      }
+      pipeline_handler_clause_typed_param_nodes_into(rest, expected_params, index + 1, out)
+    }
+  }
+}
+
+pub(package) fn pipeline_handler_clause_typed_param_nodes(
+  clause_params: ParamList,
+  expected_params: i64
+) -> i64 {
+  pipeline_handler_clause_typed_param_nodes_into(clause_params, expected_params, 0, nlist_new())
+}
+
 pub(package) fn pipeline_deferred_body_lowering_locals(captures: i64) -> PipelineValueEnv {
   pipeline_handler_capture_locals(captures, 0, 0, pipeline_value_env_empty())
 }
@@ -11079,7 +11140,7 @@ pub(package) fn pipeline_lower_handler_clause_body_typed(clause: HandlerClause, 
       -- Deferred handlers still describe exact capture cleanup kinds below.
       let capture_lanes = pipeline_capture_value_lane_count(captures)
       let base_next = param_lanes + capture_lanes + param_lanes
-      let typed_params = if expected_params == 0 { param_nodes } else { expected_params }
+      let typed_params = pipeline_handler_clause_typed_param_nodes(clause_params, expected_params)
       let abortive = handler_clause_is_abortive(clause)
       -- The clause body must keep the handled frame masked, but scope-exit
       -- Drop is compiler code whose declared effects remain available at the
@@ -14941,7 +15002,7 @@ pub(package) fn pipeline_linear_param_drop_insts(params: i64, index: i64, count:
     let param = nlist_get(params, index)
     let plan = pipeline_linear_cleanup_plan(tt, node_f3(param))
     let rest = pipeline_linear_param_drop_insts(params, index + 1, count, body, src, tt)
-    if plan != 0 and pipeline_expr_refs_name(body, src, node_f1(param), node_f2(param)) == 0 {
+    if plan != 0 and pipeline_expr_refs_name_typed(expr_from_node(body), src, node_f1(param), node_f2(param)) == 0 {
       ir_inst_list_append(pipeline_linear_cleanup_inst_list(pipeline_param_value_index_at(params, index), plan), rest)
     } else {
       rest
@@ -24021,7 +24082,13 @@ pub(package) fn pipeline_lower_perform_node_typed_sidecar_handler_opt(lhs_node: 
         } else {
           ir_inst_perform_i64(dst, eff_hash, op_hash, abi_args)
         }
-        let perform = ir_inst_list_append(ir_inst_list_prepend(op_inst, ir_inst_list_empty()), pipeline_ir_call_result_lane_insts(dst, return_ty))
+        let transfers = pipeline_effect_linear_transfer_insts(
+          expected_params, 0, 0, abi_args, pipeline_handler_lower_ctx_tt(lower_ctx)
+        )
+        let perform = ir_inst_list_append(
+          transfers,
+          ir_inst_list_append(ir_inst_list_prepend(op_inst, ir_inst_list_empty()), pipeline_ir_call_result_lane_insts(dst, return_ty))
+        )
         let insts = ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), perform)
         ir_lowered_expr(dst, dst + result_lanes, insts)
         }
@@ -28536,7 +28603,7 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_value_sources(blocks: IrBlockL
 pub(package) fn pipeline_ir_abort_cleanup_collect_rebind_flow_alias(inst: IrInst, blocks: IrBlockList, facts: i64) -> i64 {
   match inst {
     IrStructuralSlotI64(value, slot, plan, mode) -> {
-      if mode == 2 and plan != 0 {
+      if (mode == 2 or mode == 3) and plan != 0 {
         let plan_kind = typeck_linear_layout_plan_kind(plan)
         let kind = if plan_kind == 1 { pipeline_ir_abort_cleanup_owned_kind() } else { pipeline_ir_abort_cleanup_structural_kind() }
         let action = if plan_kind == 1 {
@@ -29141,6 +29208,26 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_commit_flat_value(code: i64, valu
   } else {
     pipeline_ir_abort_cleanup_emit_commit_structural_leaf(code, value, plan, fm, pinned)
   } }
+}
+
+-- Transfer one typed linear value into an effect clause. Like an ordinary
+-- call, this consumes the exact caller-side abort record before dispatch; the
+-- clause's typed parameter bind arms the replacement. CFG aliases enumerate
+-- finite predecessor records and never compare runtime resource bits.
+pub(package) fn pipeline_ir_abort_cleanup_emit_effect_transfer(code: i64, value: i64, plan: i64, fm: i64) -> i64 {
+  let plan_kind = typeck_linear_layout_plan_kind(plan)
+  let kind = if plan_kind == 1 {
+    pipeline_ir_abort_cleanup_owned_kind()
+  } else { pipeline_ir_abort_cleanup_structural_kind() }
+  let action = if plan_kind == 1 {
+    cg_owned_drop_type_hash(typeck_linear_layout_plan_type(plan))
+  } else { pipeline_structural_drop_glue_hash(plan) }
+  let facts = fmap_current_abort_cleanup_facts(fm)
+  let source = pipeline_ir_abort_cleanup_find_acquisition_value_action_kind(facts, value, action, kind)
+  if source != 0 {
+    pipeline_ir_abort_cleanup_emit_disarm_transferred_fact(code, source, fm)
+  } else { 0 }
+  pipeline_ir_abort_cleanup_emit_rebind_flow_aliases_from(code, facts, value, action, 0, fm)
 }
 
 pub(package) fn pipeline_ir_abort_cleanup_emit_rebind_flow_aliases_from(code: i64, facts: i64, value: i64, action: i64, index: i64, fm: i64) -> i64 {
@@ -34308,10 +34395,12 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
       if mode == 1 { 0 }
       else { if mode == 2 and pipeline_structural_drop_plan_is_valid(plan) == 1 {
         pipeline_ir_abort_cleanup_emit_rebind_structural_slot(code, value, slot, plan, fm, pinned)
+      } else { if mode == 3 and pipeline_structural_drop_plan_is_valid(plan) == 1 {
+        pipeline_ir_abort_cleanup_emit_effect_transfer(code, value, plan, fm)
       } else {
         fmap_inc_emit_error_count(fm)
         bu32(code, encode_brk(67))
-      } }
+      } } }
       ctx
     }
     IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> {
