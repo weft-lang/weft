@@ -569,6 +569,8 @@ check_rejects "region_scoped_generator_escape" "test/negative/region_scoped_gene
 check_rejects "region_scoped_iterator_escape" "test/negative/region_scoped_iterator_escape.weft" "type error: region value cannot escape scoped arena"
 check_rejects "lambda_capture_mut_binding" "test/negative/lambda_capture_mut_binding.weft" "type error: cannot capture mut binding"
 check_rejects "lambda_capture_mut_assignment" "test/negative/lambda_capture_mut_assignment.weft" "type error: cannot capture mut binding"
+check_rejects "immediate_handler_mut_capture" "test/negative/immediate_handler_mut_capture.weft" "type error: cannot capture mut binding"
+check_rejects "deferred_handler_outer_borrow_capture" "test/negative/deferred_handler_outer_borrow_capture.weft" "type error: borrowed resource cannot be captured by closure"
 check_rejects "return_branch_type_mismatch" "test/negative/return_branch_type_mismatch.weft" 'error[E1002]: return value type mismatch: expected `i64`, found `str`'
 check_rejects "return_str_i64_mismatch" "test/negative/return_str_i64_mismatch.weft" 'error[E1002]: return value type mismatch: expected `str`, found `i64`'
 check_rejects "unhandled_effect_in_return" "test/negative/unhandled_effect_in_return.weft" "error[E2001]:"
