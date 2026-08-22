@@ -4262,6 +4262,55 @@ pub(package) fn pipeline_expr_type_node_from_node(expr: i64) -> i64 {
   }
 }
 
+-- Qualified module calls are represented as Perform(FieldAccess(...)) so the
+-- declaration fact, rather than the surface spelling, distinguishes them
+-- from effect operations. Preserve that producer-owned result type here;
+-- otherwise a let-bound imported `Generic<T>` loses T's concrete shape and
+-- constructor patterns fall back to a single payload lane.
+pub(package) fn pipeline_qualified_function_result_type_node_typed(call: Expr, type_args: TypeExprList, module: PipelineLowerModule) -> i64 {
+  match call {
+    Perform(FieldAccess(base, field_ns, field_nl, fact), op_ns, op_nl, args) -> {
+      let pair = module_decl_fact_function_pair(field_access_fact_declaration(fact))
+      if pair == 0 { 0 }
+      else {
+        let fn_wrap = node_f1(pair)
+        let concrete_args = pipeline_type_expr_list_subst(type_args, pipeline_lower_module_subst(module))
+        let call_subst = if fn_tparams(fn_wrap) == 0 or type_expr_list_len(concrete_args) == 0 {
+          pipeline_lower_module_subst(module)
+        } else {
+          cg_build_subst(fn_tparams(fn_wrap), type_expr_list_to_nodes(concrete_args))
+        }
+        if call_subst == 0 { fn_ret_type(fn_wrap) } else { ty_subst(fn_ret_type(fn_wrap), call_subst) }
+      }
+    }
+    _ -> 0
+  }
+}
+
+-- A handler return clause binds the handled body's completion value. Result
+-- shape is therefore a two-step fact: infer the body first, then infer the
+-- transform with that typed binder in scope. Treating the clause like an
+-- ordinary expression loses generic/wide completion shapes (`T`, tuples,
+-- slices) and makes later CFG edges carry only the head lane.
+pub(package) fn pipeline_handle_result_type_node_typed(body: Expr, hret: HandleReturn, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
+  let body_ty = pipeline_return_expr_type_node_typed(body, params, locals, module)
+  match hret {
+    NoHandleReturn -> body_ty
+    HandleReturnClause(rns, rnl, rb) -> {
+      let return_locals = pipeline_value_env_push_float_typed_node(
+        locals,
+        rns,
+        rnl,
+        0,
+        pipeline_type_node_prim_id_or(body_ty, 0),
+        if body_ty == 0 { 0 } else { type_hash_of(body_ty) },
+        body_ty
+      )
+      pipeline_return_expr_type_node_typed(rb, params, return_locals, module)
+    }
+  }
+}
+
 pub(package) fn pipeline_return_expr_type_node_typed(expr: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule) -> i64 {
   let src = pipeline_lower_module_src(module)
   let fns = pipeline_lower_module_fns(module)
@@ -4275,7 +4324,9 @@ pub(package) fn pipeline_return_expr_type_node_typed(expr: Expr, params: i64, lo
       pipeline_call_result_type_node(params, locals, src, pipeline_lower_module_tt(module), fns, subst, ns, nl)
     }
     GenericCall(type_args, inner_call) -> {
-      match inner_call {
+      let qualified = pipeline_qualified_function_result_type_node_typed(inner_call, type_args, module)
+      if qualified != 0 { qualified }
+      else { match inner_call {
         Call(ns, nl, args) -> {
           let pair = pipeline_generic_template_find(fns, src, str_hash(src, ns, nl))
           if pair == 0 {
@@ -4296,16 +4347,20 @@ pub(package) fn pipeline_return_expr_type_node_typed(expr: Expr, params: i64, lo
           }
         }
         _ -> pipeline_return_expr_type_node_typed(inner_call, params, locals, module)
-      }
+      } }
     }
-    Perform(lhs, op_ns, op_nl, args) -> pipeline_effect_op_return_type_typed(
-      pipeline_lower_module_tt(module),
-      src,
-      lhs,
-      op_ns,
-      op_nl,
-      subst
-    )
+    Perform(lhs, op_ns, op_nl, args) -> {
+      let qualified = pipeline_qualified_function_result_type_node_typed(expr, type_expr_list_empty(), module)
+      if qualified != 0 { qualified }
+      else { pipeline_effect_op_return_type_typed(
+        pipeline_lower_module_tt(module),
+        src,
+        lhs,
+        op_ns,
+        op_nl,
+        subst
+      ) }
+    }
     RecordInit(type_ns, type_nl, fields) -> if type_ns == 0 and type_nl <= 0 {
       ty_subst(
         pipeline_structural_record_value_type(fields, if type_nl < 0 { 1 } else { 0 }),
@@ -4380,12 +4435,7 @@ pub(package) fn pipeline_return_expr_type_node_typed(expr: Expr, params: i64, lo
     Try(inner, effect_atom) -> pipeline_try_success_type(
       pipeline_return_expr_type_node_typed(inner, params, locals, module)
     )
-    Handle(body, clauses, hret) -> {
-      match hret {
-        NoHandleReturn -> pipeline_return_expr_type_node_typed(body, params, locals, module)
-        HandleReturnClause(rns, rnl, rb) -> pipeline_return_expr_type_node_typed(rb, params, locals, module)
-      }
-    }
+    Handle(body, clauses, hret) -> pipeline_handle_result_type_node_typed(body, hret, params, locals, module)
     If(cond, then_expr, else_expr) -> {
       let then_ty = pipeline_return_expr_type_node_typed(then_expr, params, locals, module)
       let else_ty = pipeline_return_expr_type_node_typed(else_expr, params, locals, module)
@@ -9726,8 +9776,9 @@ pub(package) fn pipeline_lower_constructor_decl_call_typed_to_target_blocks(decl
   let name_start = name_ptr - origin_src
   let payloads = pipeline_variant_payload_types(tt, origin_src, name_start, name_len)
   let tparams = ttable_variant_tparams(tt, origin_src, name_start, name_len)
-  let type_nodes = type_expr_list_to_nodes(type_args)
-  let inst_subst = if tparams == 0 or type_expr_list_len(type_args) == 0 { pipeline_lower_module_subst(module) } else { cg_build_subst(tparams, type_nodes) }
+  let concrete_type_args = pipeline_type_expr_list_subst(type_args, pipeline_lower_module_subst(module))
+  let type_nodes = type_expr_list_to_nodes(concrete_type_args)
+  let inst_subst = if tparams == 0 or type_expr_list_len(concrete_type_args) == 0 { pipeline_lower_module_subst(module) } else { cg_build_subst(tparams, type_nodes) }
   let arg_count = expr_list_len(args_exprs)
   let call_block = next_block
   let first_arg_block = pipeline_lower_operation_child_start_block(call_block, arg_count)
@@ -11179,10 +11230,7 @@ pub(package) fn pipeline_lower_handle_typed_to_target_blocks(body_expr: Expr, cl
   if nclauses <= 0 {
     pipeline_lowered_blocks_invalid(start_block, next_value)
   } else {
-    let handle_result_ty = match hret {
-      NoHandleReturn -> pipeline_return_expr_type_node_typed(body_expr, params, locals, module)
-      HandleReturnClause(rns, rnl, rb) -> pipeline_return_expr_type_node_typed(rb, params, locals, module)
-    }
+    let handle_result_ty = pipeline_handle_result_type_node_typed(body_expr, hret, params, locals, module)
     let lowered_clauses = pipeline_lower_handler_clauses_typed(clauses, params, locals, module, handle_result_ty)
     let clause_bodies = pipeline_lowered_handler_clauses_bodies(lowered_clauses)
     if pipeline_handler_clause_list_has_continuation_handler_typed(clauses) == 1 {
@@ -23225,8 +23273,10 @@ pub(package) fn pipeline_lower_constructor_decl_call_node(decl: i64, type_args: 
   let name_start = name_ptr - origin_src
   let payloads = pipeline_variant_payload_types(tt, origin_src, name_start, name_len)
   let tparams = ttable_variant_tparams(tt, origin_src, name_start, name_len)
-  let inst_subst = if tparams == 0 or type_args == 0 { pipeline_handler_lower_ctx_subst(lower_ctx) }
-    else { cg_build_subst(tparams, type_args) }
+  let outer_subst = pipeline_handler_lower_ctx_subst(lower_ctx)
+  let concrete_type_args = if outer_subst == 0 or type_args == 0 { type_args } else { type_list_subst(type_args, outer_subst) }
+  let inst_subst = if tparams == 0 or concrete_type_args == 0 { outer_subst }
+    else { cg_build_subst(tparams, concrete_type_args) }
   let lowered_args = pipeline_lower_node_handler_opt_args_expected_offset_borrow_mask_origin(args, arg_count, 0, next_value, lower_ctx, 0, payloads, inst_subst, 0, 0, ir_managed_stake_origin_aggregate())
   if pipeline_lowered_args_is_valid(lowered_args) == 0 { ir_lowered_expr_invalid(next_value) }
   else {
