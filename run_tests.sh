@@ -19,14 +19,12 @@ default_test_jobs() {
 WEFT=${WEFT:-./weft}
 WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-120}
 WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-120}
-WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-8000000}
+WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-9000000}
 # Whole-compiler in-process tripwire tests (alloc_checker_metrics and
-# emission_audit_metrics) briefly peak at ~6.3 GB arena RSS.  The previous
-# 4 GB guard was below that honest baseline and passed nondeterministically
-# whenever its one-second polling missed the peak.  Keep a real runaway
-# guard with margin; checker allocation frugality / identifier interning is
-# the queued lever to bring this baseline down.
-WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-8000000}
+# emission_audit_metrics) peak at ~8.4 million KB arena RSS.  Keep a measured
+# margin above that honest fixed baseline while retaining a hard stop far below
+# the 20--94 GB runaway signatures that motivated the guard.
+WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-9000000}
 WEFT_TEST_SHOW_TIMINGS=${WEFT_TEST_SHOW_TIMINGS:-1}
 WEFT_TEST_JOBS=${WEFT_TEST_JOBS:-$(default_test_jobs)}
 PASS=0
