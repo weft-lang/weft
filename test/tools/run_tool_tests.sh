@@ -2963,6 +2963,32 @@ printf 'pub fn raw_probe(p: i64) -> i64 { __mem_load64(p) }\n' > "$tmp_pkg_trust
 pkg_trust_root_owned=$(cd "$tmp_pkg_trust_dir/root_owned" && "$WEFT_ABS" check main.weft 2>&1)
 assert_contains "package_root_owned_binding_compiles" "$pkg_trust_root_owned" "check: 2 functions, 0 errors"
 
+# Manifest-native declarations are synthesized only inside the exact trusted
+# leaf. The checker consumes their typed ABI fact and charges Unsafe without
+# adding source syntax or exposing the raw symbol through module imports.
+mkdir -p "$tmp_pkg_trust_dir/native_typed/deps/dep/native"
+printf 'use dep/native/raw as raw\nfn main() -> i64 { 0 }\n' > "$tmp_pkg_trust_dir/native_typed/main.weft"
+printf 'fn raw_probe(value: i64) -[Unsafe]> i64 { native_abs(value) }\n' > "$tmp_pkg_trust_dir/native_typed/deps/dep/native/raw.weft"
+printf '%s\n' '{"package":"dep","manifest_version":1,"version":"2.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["native/raw"],"native_bindings":{"native/raw":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"system","kind":"system","link":"System","search":["toolchain"],"content":"toolchain","optional":false}],"symbols":[{"declaration":"native_abs","symbol":"labs","library":"system","params":["i64"],"result":"i64","optional":false}]}}}}}' > "$tmp_pkg_trust_dir/native_typed/deps/dep/weft.pkg"
+printf '%s\n' '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"dep":"deps/dep"},"trust":{"dep":{"version":"2.0.0","source":"path:deps/dep","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111","modules":["native/raw"]}}}' > "$tmp_pkg_trust_dir/native_typed/weft.pkg"
+printf '%s\n' '{"lock_version":1,"manifest_version":1,"weft":"0.1","packages":[{"name":"app","version":"1.0.0","source":"path:.","content":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},{"name":"dep","version":"2.0.0","source":"path:deps/dep","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111"}]}' > "$tmp_pkg_trust_dir/native_typed/weft.lock"
+pkg_native_typed=$(cd "$tmp_pkg_trust_dir/native_typed" && "$WEFT_ABS" check main.weft 2>&1)
+assert_contains "package_native_manifest_symbol_checks_in_exact_binding" "$pkg_native_typed" "0 errors"
+
+printf 'fn raw_probe(value: i64) -> i64 { native_abs(value) }\n' > "$tmp_pkg_trust_dir/native_typed/deps/dep/native/raw.weft"
+pkg_native_unsafe_required=$(cd "$tmp_pkg_trust_dir/native_typed" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_native_manifest_symbol_requires_unsafe" "$pkg_native_unsafe_required" "error[E2001]"
+printf 'fn raw_probe(value: i64) -[Unsafe]> i64 { native_abs(value) }\n' > "$tmp_pkg_trust_dir/native_typed/deps/dep/native/raw.weft"
+
+printf 'use dep/native/raw.{native_abs}\nfn main() -> i64 { native_abs(1) }\n' > "$tmp_pkg_trust_dir/native_typed/main.weft"
+pkg_native_private=$(cd "$tmp_pkg_trust_dir/native_typed" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_native_manifest_symbol_is_private" "$pkg_native_private" "error[E4004]"
+
+printf 'use dep/native/raw as raw\nfn main() -> i64 { 0 }\n' > "$tmp_pkg_trust_dir/native_typed/main.weft"
+printf '%s\n' '{"package":"dep","manifest_version":1,"version":"2.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["native/raw"],"native_bindings":{"native/raw":{"abi_version":1,"targets":{"linux-aarch64":{"libraries":[{"id":"system","kind":"system","link":"c","search":["toolchain"],"content":"toolchain","optional":false}],"symbols":[{"declaration":"native_abs","symbol":"labs","library":"system","params":["i64"],"result":"i64","optional":false}]}}}}}' > "$tmp_pkg_trust_dir/native_typed/deps/dep/weft.pkg"
+pkg_native_wrong_target=$(cd "$tmp_pkg_trust_dir/native_typed" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_native_binding_rejects_target_substitution" "$pkg_native_wrong_target" "error[E5010]: native binding 'native/raw' has no declaration for compilation target 'macos-aarch64'"
+
 # Trust belongs to the exact source buffer; importing an unlisted helper from
 # a trusted binding does not make that helper trusted.
 printf 'use native/helper.{*}\npub fn raw_probe(p: i64) -> i64 { helper_probe(p) }\n' > "$tmp_pkg_trust_dir/root_owned/native/raw.weft"
