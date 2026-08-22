@@ -1,0 +1,142 @@
+use runtime/process.{Proc, ProcHandle, ProcOutput, runtime_platform_proc}
+use runtime/rc_implicit_test.{RuntimeRcProbe, runtime_rc_probe_count, runtime_rc_probe_new}
+use runtime/shutdown.{runtime_shutdown_set_disposition}
+use stdlib/channel.{Channel, ChannelCapacity, ChannelSendAccepted, ChannelSendClosed, channel_capacity, channel_send}
+use stdlib/cancellation as cancellation
+use stdlib/cancellation.{CancellationOutcome}
+use stdlib/list.{List, list_cons, list_nil}
+use stdlib/result.{Result}
+use stdlib/shutdown as shutdown
+use stdlib/spawn as spawn
+use stdlib/time as time
+use stdlib/vector.{vector_get_in_bounds, vector_len, vector_new, vector_push}
+use stdlib/vector_type.{Vector}
+
+fn shutdown_args(command: str) -> List<str> {
+  list_cons<str>("-c", list_cons<str>(command, list_nil<str>()))
+}
+
+fn shutdown_wait_body(trace: Vector<i64>) -[time.Time]> i64 {
+  defer vector_push<i64>(trace, 1)
+  {
+    defer vector_push<i64>(trace, 2)
+    time.time_sleep_millis(10000)
+  }
+  99
+}
+
+fn shutdown_outcome_signal_code(
+  outcome: CancellationOutcome<i64>
+) -> i64 {
+  match outcome {
+    cancellation.CancellationCompleted(value) -> 1000 + value
+    cancellation.CancellationCancelled(reason) -> match reason {
+      cancellation.CancellationRequested() -> 0 - 1
+      cancellation.CancellationDeadlineExceeded(deadline) -> 0 - 2
+      cancellation.CancellationShutdown(signal) -> match signal {
+        shutdown.ShutdownInterrupt() -> 2
+        shutdown.ShutdownTerminate() -> 15
+      }
+    }
+  }
+}
+
+fn shutdown_trace_code(trace: Vector<i64>) -> i64 {
+  if vector_len<i64>(trace) != 2 { 0 }
+  else {
+    vector_get_in_bounds<i64>(trace, 0) * 10 +
+      vector_get_in_bounds<i64>(trace, 1)
+  }
+}
+
+fn shutdown_process_ok(output: ProcOutput) -> bool {
+  output.error == 0 and output.timed_out == false and output.status == 0
+}
+
+fn shutdown_signal_probe(command: str) -[Proc]> i64 {
+  let trace = vector_new<i64>()
+  let child: owned ProcHandle = Proc.spawn("/bin/sh", shutdown_args(command))
+  let outcome = spawn.with_event_loop_shutdown(() => shutdown_wait_body(trace))
+  let output = Proc.wait(child)
+  if shutdown_process_ok(output) {
+    shutdown_outcome_signal_code(outcome) * 100 + shutdown_trace_code(trace)
+  } else { 0 }
+}
+
+fn shutdown_channel_send(value: RuntimeRcProbe) -[Channel<RuntimeRcProbe>]> i64 {
+  match channel_send<RuntimeRcProbe>(value) {
+    ChannelSendAccepted -> 1
+    ChannelSendClosed(returned) -> runtime_rc_probe_count(returned)
+  }
+}
+
+fn shutdown_channel_body(
+  first: RuntimeRcProbe,
+  second: RuntimeRcProbe
+) -[spawn.Spawn, time.Time, Channel<RuntimeRcProbe>]> i64 {
+  let filling = spawn.spawn(() => shutdown_channel_send(first))
+  let blocked = spawn.spawn(() => shutdown_channel_send(second))
+  time.time_sleep_millis(10000)
+  spawn.join(filling) + spawn.join(blocked)
+}
+
+fn shutdown_channel_probe() -[Proc]> i64 {
+  let first = runtime_rc_probe_new(11)
+  let second = runtime_rc_probe_new(22)
+  let capacity: ChannelCapacity<RuntimeRcProbe> = channel_capacity<RuntimeRcProbe>(1).expect("valid managed channel capacity")
+  let child: owned ProcHandle = Proc.spawn(
+    "/bin/sh",
+    shutdown_args("sleep 0.05; kill -TERM $PPID")
+  )
+  let outcome = spawn.with_event_loop_channel_shutdown(
+    capacity,
+    () => shutdown_channel_body(first, second)
+  )
+  let output = Proc.wait(child)
+  if shutdown_process_ok(output) and
+    shutdown_outcome_signal_code(outcome) == 15 and
+    runtime_rc_probe_count(first) == 1 and
+    runtime_rc_probe_count(second) == 1 { 1 }
+  else { 0 }
+}
+
+fn shutdown_disposition_restoration_probe() -> i64 {
+  let original = runtime_shutdown_set_disposition(15, 1)
+  if original == 0 - 1 { 0 }
+  else {
+    let outcome = spawn.with_event_loop_shutdown(() => 42)
+    let after = runtime_shutdown_set_disposition(15, 1)
+    let restored = runtime_shutdown_set_disposition(15, original)
+    let completed = match outcome {
+      cancellation.CancellationCompleted(value) -> value == 42
+      cancellation.CancellationCancelled(reason) -> false
+    }
+    if after == 1 and restored != 0 - 1 and completed { 1 } else { 0 }
+  }
+}
+
+test "SIGINT wakes a blocked event loop and runs LIFO cleanup" {
+  Test.assert_eq(
+    runtime_platform_proc(() => shutdown_signal_probe(
+    "sleep 0.05; kill -INT $PPID"
+  )),
+    221
+  )
+}
+
+test "repeated SIGTERM notifications coalesce to one typed reason" {
+  Test.assert_eq(
+    runtime_platform_proc(() => shutdown_signal_probe(
+    "sleep 0.05; kill -TERM $PPID $PPID $PPID"
+  )),
+    1521
+  )
+}
+
+test "normal scope exit restores the prior process disposition" {
+  Test.assert_eq(shutdown_disposition_restoration_probe(), 1)
+}
+
+test "signal abort drops bounded buffered and suspended channel values" {
+  Test.assert_eq(runtime_platform_proc(shutdown_channel_probe), 1)
+}

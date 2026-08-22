@@ -8,6 +8,7 @@
 
 use runtime/alloc.{alloc_bump, alloc_bump_mark, alloc_bump_restore_same_segment, alloc_mmap_flags_private_anon, alloc_mmap_prot_rw, alloc_page_size, alloc_runtime_state_ptr}
 use runtime/memory.{mem_load8_at, mem_load64_at, mem_store8_at, mem_store64_at, mem_zero}
+use runtime/shutdown.{runtime_shutdown_set_disposition}
 use runtime/syscall.{sys_close, sys_mmap, sys_munmap, sys_raw}
 use stdlib/drop.{Drop}
 use stdlib/num.{num_int_cast_value_or, num_u64_to_i64_checked, num_usize_to_u64}
@@ -36,6 +37,8 @@ const NET_POLLER_EVFILT_READ: i64 = 65535
 
 const NET_POLLER_EVFILT_WRITE: i64 = 65534
 
+const NET_POLLER_EVFILT_SIGNAL: i64 = 65530
+
 const NET_POLLER_EV_ADD: i64 = 1
 
 const NET_POLLER_EV_DELETE: i64 = 2
@@ -57,6 +60,20 @@ const NET_POLLER_STATE_DESCRIPTOR_OFFSET: i64 = 0
 const NET_POLLER_STATE_NEXT_RESOURCE_OFFSET: i64 = 8
 
 const NET_POLLER_STATE_EPOCH_OFFSET: i64 = 16
+
+const NET_POLLER_STATE_INTERRUPT_DISPOSITION_OFFSET: i64 = 24
+
+const NET_POLLER_STATE_TERMINATE_DISPOSITION_OFFSET: i64 = 32
+
+const NET_POLLER_STATE_SHUTDOWN_ACTIVE_OFFSET: i64 = 40
+
+const NET_POLLER_SIGINT: i64 = 2
+
+const NET_POLLER_SIGTERM: i64 = 15
+
+const NET_POLLER_SIG_IGN: i64 = 1
+
+const NET_POLLER_SIG_ERR: i64 = 0 - 1
 
 -- Runtime twin: runtime_state_net_poller_epoch_offset in compiler/codegen.weft.
 const NET_POLLER_RUNTIME_EPOCH_OFFSET: i64 = 176
@@ -100,7 +117,13 @@ pub (package) type NetPollCancel {
 
 pub (package) type NetPollEvent {
   NetPollReady(NetPollRegistration, i64, bool),
-    NetPollReadyError(NetPollRegistration, NetPollError)
+    NetPollReadyError(NetPollRegistration, NetPollError),
+    NetPollTermination(NetPollTerminationSignal, i64)
+}
+
+pub (package) type NetPollTerminationSignal {
+  NetPollInterrupt,
+    NetPollTerminate
 }
 
 pub (package) type NetPollWait {
@@ -242,10 +265,21 @@ fn net_poll_error(status: i64) -> NetPollError {
 
 fn net_poller_release_state(state: i64) -> i64 {
   let descriptor = mem_load64_at(state, NET_POLLER_STATE_DESCRIPTOR_OFFSET)
+  let shutdown_active = mem_load64_at(state, NET_POLLER_STATE_SHUTDOWN_ACTIVE_OFFSET)
+  let interrupt_disposition = mem_load64_at(state, NET_POLLER_STATE_INTERRUPT_DISPOSITION_OFFSET)
+  let terminate_disposition = mem_load64_at(state, NET_POLLER_STATE_TERMINATE_DISPOSITION_OFFSET)
   mem_store64_at(state, NET_POLLER_STATE_DESCRIPTOR_OFFSET, 0 - 1)
+  mem_store64_at(state, NET_POLLER_STATE_SHUTDOWN_ACTIVE_OFFSET, 0)
   let closed = if descriptor < 0 { 0 } else { sys_close(descriptor) }
+  let restored_terminate = if shutdown_active == 0 { 0 }
+  else { runtime_shutdown_set_disposition(NET_POLLER_SIGTERM, terminate_disposition) }
+  let restored_interrupt = if shutdown_active == 0 { 0 }
+  else { runtime_shutdown_set_disposition(NET_POLLER_SIGINT, interrupt_disposition) }
   let unmapped = sys_munmap(state, alloc_page_size())
-  if closed < 0 { closed } else { unmapped }
+  if closed < 0 { closed }
+  else { if restored_terminate == NET_POLLER_SIG_ERR { NET_POLLER_SIG_ERR }
+    else { if restored_interrupt == NET_POLLER_SIG_ERR { NET_POLLER_SIG_ERR }
+      else { unmapped } } }
 }
 
 impl Drop for NetPoller {
@@ -293,6 +327,9 @@ pub (package) fn net_poller_open() -> Result<owned NetPoller, NetPollError> {
         mem_store64_at(state, NET_POLLER_STATE_DESCRIPTOR_OFFSET, descriptor)
         mem_store64_at(state, NET_POLLER_STATE_NEXT_RESOURCE_OFFSET, 1)
         mem_store64_at(state, NET_POLLER_STATE_EPOCH_OFFSET, epoch)
+        mem_store64_at(state, NET_POLLER_STATE_INTERRUPT_DISPOSITION_OFFSET, 0)
+        mem_store64_at(state, NET_POLLER_STATE_TERMINATE_DISPOSITION_OFFSET, 0)
+        mem_store64_at(state, NET_POLLER_STATE_SHUTDOWN_ACTIVE_OFFSET, 0)
         result_ok<owned NetPoller, NetPollError>(NetPoller(state))
       }
     }
@@ -394,6 +431,95 @@ fn net_poller_store_change(
   net_poller_store_u16(event, 10, flags)
   mem_store64_at(event, 24, token)
   nil
+}
+
+fn net_poller_submit_signal_change(
+  poller: borrow mut NetPoller,
+  signal: i64,
+  flags: i64
+) -> i64 {
+  let mark = alloc_bump_mark()
+  let change = alloc_bump(NET_POLLER_KEVENT_SIZE)
+  net_poller_store_change(change, signal, NET_POLLER_EVFILT_SIGNAL, flags, 0)
+  let status = sys_raw(
+    NET_POLLER_SYS_KEVENT,
+    net_poller_descriptor(poller),
+    change,
+    1,
+    0,
+    0,
+    0
+  )
+  alloc_bump_restore_same_segment(mark)
+  status
+}
+
+pub (package) fn net_poller_enable_shutdown(
+  poller: borrow mut NetPoller
+) -> Result<nil, NetPollError> {
+  let state = net_poller_state(poller)
+  if mem_load64_at(state, NET_POLLER_STATE_SHUTDOWN_ACTIVE_OFFSET) != 0 {
+    result_err<nil, NetPollError>(NetPollInvalidRegistration)
+  } else {
+    -- SIG_IGN makes delivery inert in async context. EVFILT_SIGNAL still
+    -- records attempts, which the scheduler consumes later in ordinary code.
+    let interrupt_disposition = runtime_shutdown_set_disposition(
+      NET_POLLER_SIGINT,
+      NET_POLLER_SIG_IGN
+    )
+    if interrupt_disposition == NET_POLLER_SIG_ERR {
+      result_err<nil, NetPollError>(NetPollPlatform(1))
+    } else {
+      let terminate_disposition = runtime_shutdown_set_disposition(
+        NET_POLLER_SIGTERM,
+        NET_POLLER_SIG_IGN
+      )
+      if terminate_disposition == NET_POLLER_SIG_ERR {
+        runtime_shutdown_set_disposition(NET_POLLER_SIGINT, interrupt_disposition)
+        result_err<nil, NetPollError>(NetPollPlatform(1))
+      } else {
+        let interrupt_status = net_poller_submit_signal_change(
+          poller,
+          NET_POLLER_SIGINT,
+          NET_POLLER_EV_ADD bor NET_POLLER_EV_ENABLE
+        )
+        if interrupt_status < 0 {
+          runtime_shutdown_set_disposition(NET_POLLER_SIGTERM, terminate_disposition)
+          runtime_shutdown_set_disposition(NET_POLLER_SIGINT, interrupt_disposition)
+          result_err<nil, NetPollError>(net_poll_error(interrupt_status))
+        } else {
+          let terminate_status = net_poller_submit_signal_change(
+            poller,
+            NET_POLLER_SIGTERM,
+            NET_POLLER_EV_ADD bor NET_POLLER_EV_ENABLE
+          )
+          if terminate_status < 0 {
+            net_poller_submit_signal_change(
+              poller,
+              NET_POLLER_SIGINT,
+              NET_POLLER_EV_DELETE
+            )
+            runtime_shutdown_set_disposition(NET_POLLER_SIGTERM, terminate_disposition)
+            runtime_shutdown_set_disposition(NET_POLLER_SIGINT, interrupt_disposition)
+            result_err<nil, NetPollError>(net_poll_error(terminate_status))
+          } else {
+            mem_store64_at(
+              state,
+              NET_POLLER_STATE_INTERRUPT_DISPOSITION_OFFSET,
+              interrupt_disposition
+            )
+            mem_store64_at(
+              state,
+              NET_POLLER_STATE_TERMINATE_DISPOSITION_OFFSET,
+              terminate_disposition
+            )
+            mem_store64_at(state, NET_POLLER_STATE_SHUTDOWN_ACTIVE_OFFSET, 1)
+            result_ok<nil, NetPollError>(nil)
+          }
+        }
+      }
+    }
+  }
 }
 
 fn net_poller_submit_registration(
@@ -564,25 +690,49 @@ fn net_poller_decode_event(
   let filter_flags = net_poller_load_u32(event, 12)
   let data = mem_load64_at(event, 16)
   let token = mem_load64_at(event, 24)
-  let interest = net_poll_token_interest(token)
-  let identity = net_poll_token_identity(token)
-  let generation = net_poll_token_generation(token)
-  let filter_valid = (filter == NET_POLLER_EVFILT_READ and interest == 0) or
-    (filter == NET_POLLER_EVFILT_WRITE and interest == 1)
-  if descriptor < 0 or token <= 0 or identity <= 0 or
-    identity >= NET_POLLER_ID_LIMIT or generation <= 0 or
-    generation >= NET_POLLER_ID_LIMIT or not filter_valid {
-    result_err<NetPollWait, NetPollError>(NetPollInvalidEvent)
-  } else {
-    let registration = NetPollRegistration((descriptor, identity, (generation, interest, (net_poller_state(poller), net_poller_epoch(poller)))))
-    let outcome = if (flags band NET_POLLER_EV_ERROR) != 0 {
-      NetPollReadyError(registration, net_poll_error(data))
-    } else { if (flags band NET_POLLER_EV_EOF) != 0 and filter_flags != 0 {
-        NetPollReadyError(registration, net_poll_error(filter_flags))
+  if filter == NET_POLLER_EVFILT_SIGNAL {
+    if (flags band NET_POLLER_EV_ERROR) != 0 {
+      result_err<NetPollWait, NetPollError>(net_poll_error(data))
+    } else {
+      if data <= 0 {
+        result_err<NetPollWait, NetPollError>(NetPollInvalidEvent)
       } else {
-        NetPollReady(registration, data, (flags band NET_POLLER_EV_EOF) != 0)
-      } }
-    result_ok<NetPollWait, NetPollError>(NetPollEventReady(outcome))
+        if descriptor == NET_POLLER_SIGINT {
+          result_ok<NetPollWait, NetPollError>(
+            NetPollEventReady(NetPollTermination(NetPollInterrupt, data))
+          )
+        } else {
+          if descriptor == NET_POLLER_SIGTERM {
+            result_ok<NetPollWait, NetPollError>(
+              NetPollEventReady(NetPollTermination(NetPollTerminate, data))
+            )
+          } else {
+            result_err<NetPollWait, NetPollError>(NetPollInvalidEvent)
+          }
+        }
+      }
+    }
+  } else {
+    let interest = net_poll_token_interest(token)
+    let identity = net_poll_token_identity(token)
+    let generation = net_poll_token_generation(token)
+    let filter_valid = (filter == NET_POLLER_EVFILT_READ and interest == 0) or
+      (filter == NET_POLLER_EVFILT_WRITE and interest == 1)
+    if descriptor < 0 or token <= 0 or identity <= 0 or
+      identity >= NET_POLLER_ID_LIMIT or generation <= 0 or
+      generation >= NET_POLLER_ID_LIMIT or not filter_valid {
+      result_err<NetPollWait, NetPollError>(NetPollInvalidEvent)
+    } else {
+      let registration = NetPollRegistration((descriptor, identity, (generation, interest, (net_poller_state(poller), net_poller_epoch(poller)))))
+      let outcome = if (flags band NET_POLLER_EV_ERROR) != 0 {
+        NetPollReadyError(registration, net_poll_error(data))
+      } else { if (flags band NET_POLLER_EV_EOF) != 0 and filter_flags != 0 {
+          NetPollReadyError(registration, net_poll_error(filter_flags))
+        } else {
+          NetPollReady(registration, data, (flags band NET_POLLER_EV_EOF) != 0)
+        } }
+      result_ok<NetPollWait, NetPollError>(NetPollEventReady(outcome))
+    }
   }
 }
 

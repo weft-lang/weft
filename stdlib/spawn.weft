@@ -1,16 +1,17 @@
 -- stdlib/spawn.weft -- effectful structured tasks without function colouring
 
 use runtime/spawn_task.{*}
-use runtime/net_poller.{NetPollCancel, NetPollDeadline, NetPollError, NetPollEvent, NetPollInterest, NetPollRegistration, NetPollWait, NetPoller, NetPollAlreadyResolved, NetPollCancelled, NetPollEventReady, NetPollForMillis, NetPollForever, NetPollImmediate, NetPollInterrupted, NetPollInvalidEvent, NetPollInvalidRegistration, NetPollLimit, NetPollPlatform, NetPollReady, NetPollReadyError, NetPollReadable, NetPollTimedOut, NetPollWritable, net_poll_registration_same, net_poller_adopt_listener, net_poller_adopt_stream, net_poller_cancel, net_poller_open, net_poller_register, net_poller_wait}
+use runtime/net_poller.{NetPollCancel, NetPollDeadline, NetPollError, NetPollEvent, NetPollInterest, NetPollRegistration, NetPollTerminationSignal, NetPollWait, NetPoller, NetPollAlreadyResolved, NetPollCancelled, NetPollEventReady, NetPollForMillis, NetPollForever, NetPollImmediate, NetPollInterrupt, NetPollInterrupted, NetPollInvalidEvent, NetPollInvalidRegistration, NetPollLimit, NetPollPlatform, NetPollReady, NetPollReadyError, NetPollReadable, NetPollTerminate, NetPollTermination, NetPollTimedOut, NetPollWritable, net_poll_registration_same, net_poller_adopt_listener, net_poller_adopt_stream, net_poller_cancel, net_poller_enable_shutdown, net_poller_open, net_poller_register, net_poller_wait}
 use runtime/panic.{runtime_trap}
 use runtime/time.{runtime_platform_now_millis, runtime_platform_now_nanos, runtime_platform_sleep_millis}
 use stdlib/cancellation.{Cancellation, CancellationOutcome, with_deadline, with_scope}
-use stdlib/cancellation.{CancellationReason}
+use stdlib/cancellation.{CancellationReason, CancellationShutdown, request}
 use stdlib/channel.{Channel, ChannelAlreadyClosed, ChannelCapacity, ChannelClose, ChannelClosedNow, ChannelDrained, ChannelReceive, ChannelReceived, ChannelSend, ChannelSendAccepted, ChannelSendClosed, ChannelState, channel_capacity_value, channel_state_close, channel_state_disabled, channel_state_is_closed, channel_state_is_empty, channel_state_is_full, channel_state_new, channel_state_offer, channel_state_take}
 use stdlib/continuation.{continuation_cell_from_ptr, continuation_cell_resume_i64, continuation_cell_store_i64}
 use stdlib/fail.{Fail}
 use stdlib/option.{None, Some}
 use stdlib/result.{Err, Ok, Result, result_err}
+use stdlib/shutdown.{ShutdownInterrupt, ShutdownSignal, ShutdownTerminate}
 use stdlib/tcp.{TcpListener, TcpListenerReadiness, TcpListenerReadinessFailed, TcpListenerReady, TcpReadiness, TcpReadinessError, TcpReadinessInterrupted, TcpReadinessInvalidated, TcpReadinessPlatform, TcpReadinessResourceExhausted, TcpStream, TcpStreamReadiness, TcpStreamReadinessFailed, TcpStreamReady}
 use stdlib/time.{Instant, Time}
 use stdlib/vector.{vector_get_in_bounds, vector_len, vector_pop, vector_push, vector_remove_at, vector_with_capacity}
@@ -45,6 +46,14 @@ effect EventLoopPoll {
     fn cancel(registration: NetPollRegistration) -> Result<NetPollCancel, NetPollError>
 }
 
+-- Signal delivery reaches this private scheduler seam only after kqueue has
+-- returned in ordinary execution context. Public code receives the exact
+-- CancellationReason through the enclosing cancellation scope instead of a
+-- callback or arbitrary signal-control capability.
+effect EventLoopShutdown {
+  fn observed(signal: NetPollTerminationSignal) -> nil
+}
+
 type EventLoopRegistration {
   task: i64,
     registration: NetPollRegistration
@@ -69,6 +78,13 @@ fn event_loop_readiness_error(status: i64) -> TcpReadinessError {
   else { if status == 0 - 2 { TcpReadinessResourceExhausted }
     else { if status == 0 - 3 { TcpReadinessInvalidated }
       else { TcpReadinessPlatform(0 - status - 1000) } } }
+}
+
+fn event_loop_shutdown_signal(signal: NetPollTerminationSignal) -> ShutdownSignal {
+  match signal {
+    NetPollInterrupt -> ShutdownInterrupt
+    NetPollTerminate -> ShutdownTerminate
+  }
 }
 
 fn event_loop_track_registration(
@@ -338,8 +354,9 @@ pub fn with_sequential_channel<C: Sendable, T, E>(
 fn event_loop_drive<C: Sendable, E>(
   channel: ChannelState<C>,
   scope: i64,
-  registrations: Vector<EventLoopRegistration>
-) -[EventLoopPoll, E]> i64 {
+  registrations: Vector<EventLoopRegistration>,
+  shutdown_enabled: i64
+) -[EventLoopPoll, EventLoopShutdown, E]> i64 {
   let mut result = 0
   let mut active = runtime_spawn_scope_has_active(scope)
   while active == 1 {
@@ -357,7 +374,7 @@ fn event_loop_drive<C: Sendable, E>(
       }
     } else {
       let delay = runtime_spawn_scope_next_sleep_millis(scope, now)
-      if vector_len<EventLoopRegistration>(registrations) > 0 {
+      if vector_len<EventLoopRegistration>(registrations) > 0 or shutdown_enabled == 1 {
         let deadline = if delay < 0 { NetPollForever }
         else { if delay == 0 { NetPollImmediate }
           else { NetPollForMillis(__i64_to_usize(delay)) } }
@@ -374,6 +391,10 @@ fn event_loop_drive<C: Sendable, E>(
                   registration,
                   event_loop_poll_error_status(error)
                 )
+              }
+              NetPollTermination(signal, occurrences) -> {
+                EventLoopShutdown.observed(signal)
+                0
               }
             }
           }
@@ -546,20 +567,22 @@ fn event_loop_execute<C: Sendable, T, E>(
   channel: ChannelState<C>,
   body: () -[Spawn, Time, TcpReadiness, Channel<C>, E]> T,
   scope: i64,
-  registrations: Vector<EventLoopRegistration>
-) -[EventLoopPoll, E]> T {
+  registrations: Vector<EventLoopRegistration>,
+  shutdown_enabled: i64
+) -[EventLoopPoll, EventLoopShutdown, E]> T {
   let work = runtime_spawn_work_pack<T, Spawn | Time | TcpReadiness | Channel<C> | E>(body)
   let root = runtime_spawn_scope_track(scope, work)
   if root == 0 { runtime_trap(47, 0) } else { nil }
-  event_loop_drive<C, E>(channel, scope, registrations)
+  event_loop_drive<C, E>(channel, scope, registrations, shutdown_enabled)
   runtime_spawn_work_take<T>(runtime_spawn_task_join(root))
 }
 
 fn event_loop_with_poller<C: Sendable, T, E>(
   poller: borrow mut NetPoller,
   channel: ChannelState<C>,
-  body: () -[Spawn, Time, TcpReadiness, Channel<C>, E]> T
-) -[E]> T {
+  body: () -[Spawn, Time, TcpReadiness, Channel<C>, E]> T,
+  shutdown_enabled: i64
+) -[EventLoopShutdown, E]> T {
   let scope = runtime_spawn_scope_new()
   let registrations = vector_with_capacity<EventLoopRegistration>(8)
   defer runtime_spawn_scope_cleanup(scope)
@@ -568,7 +591,7 @@ fn event_loop_with_poller<C: Sendable, T, E>(
   -- cleanup therefore both remains handled and precedes continuation/resource
   -- drops by the LIFO ordering above.
   defer event_loop_cancel_registrations(poller, registrations)
-  handle event_loop_execute<C, T, E>(channel, body, scope, registrations) {
+  handle event_loop_execute<C, T, E>(channel, body, scope, registrations, shutdown_enabled) {
     EventLoopPoll.register_stream(stream, interest) -> {
       match net_poller_adopt_stream(poller, stream) {
         Err(error) -> resume(result_err<NetPollRegistration, NetPollError>(error))
@@ -598,7 +621,9 @@ pub fn with_event_loop<T, E>(
     Err(error) -> runtime_trap(47, 0)
     Ok(opened) -> {
       let mut poller: owned NetPoller = opened
-      event_loop_with_poller<EventLoopNoChannel, T, E>(poller, channel, body)
+      handle event_loop_with_poller<EventLoopNoChannel, T, E>(poller, channel, body, 0) {
+        EventLoopShutdown.observed(signal) -> runtime_trap(47, 0)
+      }
     }
   }
 }
@@ -617,9 +642,69 @@ pub fn with_event_loop_channel<C: Sendable, T, E>(
     Err(error) -> runtime_trap(47, 0)
     Ok(opened) -> {
       let mut poller: owned NetPoller = opened
-      event_loop_with_poller<C, T, E>(poller, channel, body)
+      handle event_loop_with_poller<C, T, E>(poller, channel, body, 0) {
+        EventLoopShutdown.observed(signal) -> runtime_trap(47, 0)
+      }
     }
   }
+}
+
+fn event_loop_shutdown_with_channel<C: Sendable, T, E>(
+  channel: ChannelState<C>,
+  body: () -[Spawn, Time, TcpReadiness, Channel<C>, Cancellation, Fail<CancellationReason>, E]> T
+) -[Cancellation, Fail<CancellationReason>, E]> T {
+  match net_poller_open() {
+    Err(error) -> runtime_trap(47, 0)
+    Ok(opened) -> {
+      let mut poller: owned NetPoller = opened
+      match net_poller_enable_shutdown(poller) {
+        Err(error) -> runtime_trap(47, 0)
+        Ok(ready) -> {
+          handle event_loop_with_poller<
+            C,
+            T,
+            Cancellation | Fail<CancellationReason> | E
+          >(poller, channel, body, 1) {
+            EventLoopShutdown.observed(signal) -> {
+              let reason = CancellationShutdown(event_loop_shutdown_signal(signal))
+              request(reason)
+              Fail<CancellationReason>.fail(reason)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- Run the production event loop with scoped SIGINT/SIGTERM cancellation.
+---
+--- Delivery is coalesced by the platform poller and observed only after the
+--- kernel wait returns in ordinary execution context. The first signal
+--- becomes an exact `CancellationShutdown` reason; abort then runs structured
+--- LIFO cleanup before process dispositions are restored.
+pub fn with_event_loop_shutdown<T, E>(
+  body: () -[Spawn, Time, TcpReadiness, Cancellation, Fail<CancellationReason>, E]> T
+) -[E]> CancellationOutcome<T> {
+  let channel = channel_state_disabled<EventLoopNoChannel>()
+  with_scope<T, E>(() => event_loop_shutdown_with_channel<
+    EventLoopNoChannel,
+    T,
+    E
+  >(channel, body))
+}
+
+--- Run one bounded channel with scoped SIGINT/SIGTERM cancellation.
+---
+--- Signal delivery and channel backpressure share the same structured event
+--- loop. An external shutdown drops or resumes every owned continuation
+--- exactly once while the fixed-capacity buffer remains bounded.
+pub fn with_event_loop_channel_shutdown<C: Sendable, T, E>(
+  capacity: ChannelCapacity<C>,
+  body: () -[Spawn, Time, TcpReadiness, Channel<C>, Cancellation, Fail<CancellationReason>, E]> T
+) -[E]> CancellationOutcome<T> {
+  let channel = channel_state_new<C>(channel_capacity_value<C>(capacity))
+  with_scope<T, E>(() => event_loop_shutdown_with_channel<C, T, E>(channel, body))
 }
 
 --- Run a deterministic sequential Spawn scope with cooperative cancellation.
