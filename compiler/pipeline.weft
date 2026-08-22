@@ -13,6 +13,7 @@ use compiler/object.{*}
 use compiler/package.{*}
 use compiler/package_exports.{package_export_audit_loaded}
 use compiler/parse.{*}
+use compiler/sha256.{sha256}
 use compiler/binary_format.{*}
 use compiler/diagnose.{*}
 use compiler/type_registry.{*}
@@ -39463,6 +39464,30 @@ pub(package) fn pipeline_native_binding_register_symbols(fm: i64, tt: i64) -> i6
   let mut registered = 0
   for source_index in 0..ttable_native_binding_source_count(tt) {
     let source_entry = ttable_native_binding_source_at(tt, source_index)
+    let owner = pkg_identity_find_id(tt, ttable_native_binding_source_package(source_entry))
+    let root_ptr = if owner == 0 { 0 } else { pkg_identity_root_ptr(owner) }
+    let root_len = if owner == 0 { 0 } else { pkg_identity_root_len(owner) }
+    let target = ttable_native_binding_source_target(source_entry)
+    let libraries = pkg_native_target_libraries(target)
+    -- Register every selected-target library before its declarations. Calls
+    -- only mark these entries reachable, so final link order is manifest order
+    -- even when optimisation changes call traversal.
+    for library_index in 0..nlist_len(libraries) {
+      let library = nlist_get(libraries, library_index)
+      fmap_native_link_library_add(
+        fm,
+        library,
+        pkg_native_library_kind(library),
+        pkg_native_library_link_ptr(library),
+        pkg_native_library_link_len(library),
+        pkg_native_library_search(library),
+        pkg_native_library_content_ptr(library),
+        pkg_native_library_content_len(library),
+        pkg_native_library_optional(library),
+        root_ptr,
+        root_len
+      )
+    }
     let decls = ttable_native_binding_source_decls(source_entry)
     for decl_index in 0..nlist_len(decls) {
       let fact = nlist_get(decls, decl_index)
@@ -39470,6 +39495,9 @@ pub(package) fn pipeline_native_binding_register_symbols(fm: i64, tt: i64) -> i6
       let decl = ttable_native_decl_fact_decl(fact)
       let name_hash = str_hash(pkg_native_symbol_declaration_ptr(symbol), 0, pkg_native_symbol_declaration_len(symbol))
       let key = module_decl_fact_derived_native_key(decl, name_hash)
+      let raw_library = pkg_native_target_find_library(target, pkg_native_symbol_library_ptr(symbol), pkg_native_symbol_library_len(symbol))
+      let link_library = fmap_native_link_library_find_raw(fm, raw_library)
+      if raw_library == 0 or link_library == 0 { fmap_inc_emit_error_count(fm) } else { 0 }
       fmap_native_external_add(
         fm,
         key,
@@ -39477,12 +39505,118 @@ pub(package) fn pipeline_native_binding_register_symbols(fm: i64, tt: i64) -> i6
         pkg_native_symbol_name_len(symbol),
         pkg_native_symbol_params(symbol),
         pkg_native_symbol_result(symbol),
-        decl
+        decl,
+        link_library
       )
       registered = registered + 1
     }
   }
   registered
+}
+
+pub(package) fn pipeline_native_link_hex_value(ch: i64) -> i64 {
+  if ch >= 48 and ch <= 57 { ch - 48 } else { ch - 87 }
+}
+
+pub(package) fn pipeline_native_link_digest_matches(data: i64, len: i64, content_ptr: i64, content_len: i64) -> i64 {
+  if content_len != 71 { 0 }
+  else {
+    let digest = alloc_zeroed(32)
+    sha256(data, len, digest)
+    let mut i = 0
+    let mut matches = 1
+    while i < 32 {
+      let hi = pipeline_native_link_hex_value(mem_load8_at(content_ptr, 7 + i * 2))
+      let lo = pipeline_native_link_hex_value(mem_load8_at(content_ptr, 8 + i * 2))
+      if mem_load8_at(digest, i) != hi * 16 + lo { matches = 0 } else { 0 }
+      i = i + 1
+    }
+    matches
+  }
+}
+
+pub(package) fn pipeline_native_link_artifact_path(entry: i64, search_index: i64) -> i64 {
+  let root_ptr = fmap_native_link_library_root_ptr(entry)
+  let root_len = fmap_native_link_library_root_len(entry)
+  let search = fmap_native_link_library_search(entry)
+  let search_entry = nlist_get(search, search_index)
+  let search_ptr = pkg_manifest_text_ptr(search_entry)
+  let search_len = pkg_manifest_text_len(search_entry)
+  let link_ptr = fmap_native_link_library_link_ptr(entry)
+  let link_len = fmap_native_link_library_link_len(entry)
+  let suffix = if fmap_native_link_library_kind(entry) == pkg_native_library_kind_archive() { ".a" } else { ".dylib" }
+  let b = buf_new(root_len + search_len + link_len + 16)
+  if root_len > 0 { bscopy(b, root_ptr, root_len, 0) bu8(b, 47) } else { 0 }
+  bscopy(b, search_ptr, search_len, 0)
+  bstr(b, "/lib")
+  bscopy(b, link_ptr, link_len, 0)
+  bstr(b, suffix)
+  let len = buf_len(b)
+  let path = alloc_words(2)
+  -- `b` is managed; transfer its data because this legacy path handle crosses
+  -- the function boundary into the trusted file reader.
+  mem_store64_at(path, 0, buf_take_data(b))
+  mem_store64_at(path, 8, len)
+  path
+}
+
+-- Validate exactly the artifact selected by deterministic first-found search.
+-- System libraries are toolchain-provenanced; archive/dynamic artifacts are
+-- package-relative and must match their manifest digest before object output.
+pub(package) fn pipeline_native_link_validate_library(entry: i64) -> i64 {
+  if fmap_native_link_library_kind(entry) == pkg_native_library_kind_system() { 1 }
+  else {
+    let search = fmap_native_link_library_search(entry)
+    let mut i = 0
+    let mut found = 0
+    let mut valid = 0
+    let mut attempted = 0
+    while i < nlist_len(search) and found == 0 {
+      let path = pipeline_native_link_artifact_path(entry, i)
+      attempted = path
+      let file = read_file(path)
+      let len = mem_load64_at(file, 8)
+      if len > 0 {
+        found = 1
+        valid = pipeline_native_link_digest_matches(
+          mem_load64_at(file, 0),
+          len,
+          fmap_native_link_library_content_ptr(entry),
+          fmap_native_link_library_content_len(entry)
+        )
+        if valid == 1 { fmap_native_link_library_set_selected_path(entry, path) } else { 0 }
+      } else { i = i + 1 }
+    }
+    if found == 0 {
+      eprint("compile: referenced native library '")
+      eprint(pkg_str_view(fmap_native_link_library_link_ptr(entry), fmap_native_link_library_link_len(entry)))
+      if fmap_native_link_library_optional(entry) == 1 { eprint("' is optional but unavailable in its declared search paths\n") }
+      else { eprint("' is unavailable in its declared search paths\n") }
+      if attempted != 0 {
+        eprint("compile: native library search tried '")
+        eprint(pkg_str_view(mem_load64_at(attempted, 0), mem_load64_at(attempted, 8)))
+        eprint("'\n")
+      } else { 0 }
+      0
+    } else { if valid == 0 {
+      eprint("compile: native library '")
+      eprint(pkg_str_view(fmap_native_link_library_link_ptr(entry), fmap_native_link_library_link_len(entry)))
+      eprint("' does not match its manifest sha256 content\n")
+      0
+    } else { 1 } }
+  }
+}
+
+pub(package) fn pipeline_native_link_validate_used(fm: i64) -> i64 {
+  let mut errors = 0
+  for i in 0..fmap_native_link_library_count(fm) {
+    let entry = fmap_native_link_library_at(fm, i)
+    if fmap_native_link_library_is_used(entry) == 1 and pipeline_native_link_validate_library(entry) == 0 {
+      fmap_inc_emit_error_count(fm)
+      errors = errors + 1
+    } else { 0 }
+  }
+  errors
 }
 
 -- audit = 1 arms the emission-level residency audit (2o): every pool
@@ -39530,6 +39664,7 @@ pub(package) fn pipeline_lower_native_module_with_audit(typed: TypedModule, ir: 
       pipeline_native_binding_register_symbols(fm, tt)
       fmap_set_rc_elision_enabled(fm, cg_rc_elision_enabled_for_fns(fns, src))
       pipeline_cg_module_with_ir(fns, functions, code, fm, native_facts)
+      pipeline_native_link_validate_used(fm)
       patch_forward_refs(fm, code)
       let main_hash = str_hash(__str_ptr("main"), 0, 4)
       let main_from_ir = mono_cache_lookup(fmap_mono_cache(fm), main_hash)
