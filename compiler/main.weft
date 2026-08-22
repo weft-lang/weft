@@ -18,7 +18,7 @@ use compiler/module_product.{*}
 use compiler/package.{*}
 use compiler/package_lock.{pkg_cli_lock}
 use compiler/pipeline.{*}
-use compiler/parse.{parse_use_file}
+use compiler/parse.{parse_module, parse_use_file}
 use compiler/project_session.{*}
 use compiler/source_trust.{*}
 use compiler/semantic_fact.{*}
@@ -112,8 +112,12 @@ fn main_fns_source_count(fns: i64, src: i64) -> i64 {
 }
 
 fn main_register_source_path(tt: i64, src: i64, n: i64, path_ptr: i64, path_len: i64) -> i64 {
+  -- The effect-decomposed pipeline calls Grammar.lex + parse_tokens directly,
+  -- so Grammar.parse no longer performs this registration for anonymous
+  -- stdin roots. Diagnostics still need the source buffer even without a
+  -- physical path in order to render excerpts and primary carets.
+  ttable_register_source(tt, src, n, path_ptr, path_len)
   if path_len > 0 {
-    ttable_register_source(tt, src, n, path_ptr, path_len)
     -- A path-aware root is a package graph node even when the root source has
     -- no imports. This makes manifest exports and L7 package identity facts
     -- available to every path-form command, not only as an import side effect.
@@ -1342,7 +1346,7 @@ fn main_test_dependency_pair_count(selected: i64) -> i64 {
   count
 }
 
-fn main_test_discover_root(tt: i64, path: i64, index: i64) -> MainTestRootPlan {
+fn main_test_discover_root(tt: i64, path: i64, index: i64) -[SourceAcquire]> MainTestRootPlan {
   let path_len = cstr_len(path)
   let file = read_cpath_file(path, path_len)
   let raw = mem_load64_at(file, 0)
@@ -1360,7 +1364,10 @@ fn main_test_discover_root(tt: i64, path: i64, index: i64) -> MainTestRootPlan {
     let errors = alloc_words(1)
     mem_store64_at(errors, 0, 0)
     let grammar = weft_grammar()
-    let fns = handle grammar.parse(raw, raw_n, tt) {
+    -- Discovery needs the exact imported-module closure it may later share.
+    -- Grammar.parse is intentionally root-local; use the source-acquiring
+    -- module parser for this whole-graph planning query.
+    let fns = handle parse_module(grammar.lex(raw, raw_n), raw, tt) {
       Diagnose.report(diagnostic) -> {
         if diagnose_report_severity_tag(diagnostic) == 1 {
           mem_store64_at(errors, 0, mem_load64_at(errors, 0) + 1)
@@ -1385,7 +1392,7 @@ fn main_test_discover_root(tt: i64, path: i64, index: i64) -> MainTestRootPlan {
   }
 }
 
-fn main_test_discover_roots(paths: i64) -> MainTestRootPlanList {
+fn main_test_discover_roots(paths: i64) -[SourceAcquire]> MainTestRootPlanList {
   let tt = ttable_new()
   let mut plans = MainTestRootPlanNil
   for i in 0..nlist_len(paths) {
@@ -1581,7 +1588,7 @@ fn main_test_rss_limit_kb(envp: i64) -> i64 {
   else { if compile_limit < run_limit { compile_limit } else { run_limit } } }
 }
 
-fn main_test_project_bases(paths: i64, envp: i64, aggregate_metrics: i64) -> MainTestProjectBases {
+fn main_test_project_bases(paths: i64, envp: i64, aggregate_metrics: i64) -[SourceAcquire]> MainTestProjectBases {
   let count = nlist_len(paths)
   let bases = alloc_zeroed(count * 8)
   let session = project_session_new_with_root_registration(1, main_project_register_root)
@@ -4327,6 +4334,29 @@ fn mcp_emit_project_diagnostics_result(b: i64, typed: TypedModule, parse_diagnos
   mcp_end_result(b)
 }
 
+fn mcp_emit_project_parse_diagnostics_result(b: i64, ast: AstModule, diagnostics: ProjectDiagnostics) -> i64 {
+  let items = buf_new(65536)
+  let count = main_alloc_bytes(8)
+  mem_store64_at(count, 0, 0)
+  mcp_diag_items_append_project(items, count, diagnostics)
+  match ast {
+    AstModule(fns, src, tt) -> {
+      mcp_begin_result(b, "diagnostics")
+      mcp_write(b, ",\"phase\":\"parse+check\",\"diagnostics\":")
+      mcp_write_i(b, main_diag_items_count(count))
+      mcp_write(b, ",\"functions\":")
+      mcp_write_i(b, main_fns_source_count(fns, src))
+      -- The checker does not run after a parse failure. Keep that distinct
+      -- from the structured parse diagnostic count above.
+      mcp_write(b, ",\"check_errors\":0")
+      mcp_emit_position_units(b)
+      mcp_write(b, ",\"items\":")
+      main_diag_items_append_array(b, items)
+      mcp_end_result(b)
+    }
+  }
+}
+
 fn mcp_emit_diagnostics(b: i64, session: ProjectSession, src: i64, n: i64) -> i64 {
   let context = mcp_project_update_source(session, src, n)
   match project_session_check(session, context) {
@@ -4338,8 +4368,9 @@ fn mcp_emit_diagnostics(b: i64, session: ProjectSession, src: i64, n: i64) -> i6
       check_diagnostics,
       project_diagnostics_error_count(check_diagnostics)
     )
-    -- Parse recovery is not a checked query product yet; keep its historical
-    -- secondary diagnostics and function count until that result is modeled.
+    ProjectCheckParseFailed(ProjectPreparedParseFailed(ast, source_n, diagnostics)) ->
+      mcp_emit_project_parse_diagnostics_result(b, ast, diagnostics)
+    -- Unset/cyclic/corrupt query state has no semantic product to render.
     _ -> mcp_emit_diagnostics_legacy(b, src, n)
   }
 }
