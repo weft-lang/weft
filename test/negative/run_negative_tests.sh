@@ -78,6 +78,9 @@ check_rejects "spawn_non_sendable_capture" "test/negative/spawn_non_sendable_cap
 check_rejects "spawn_task_scope_escape" "test/negative/spawn_task_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
 check_rejects "spawn_task_double_join" "test/negative/spawn_task_double_join.weft" "type error: unique value used more than once"
 check_rejects "spawn_task_constructor_private" "test/negative/spawn_task_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "cancellation_request_requires_effect" "test/negative/cancellation_request_requires_effect.weft" 'error[E2001]: effect `Cancellation` is not available in this context'
+check_rejects "cancellation_checkpoint_requires_effect" "test/negative/cancellation_checkpoint_requires_effect.weft" 'error[E2001]: effects `Cancellation, Fail<cancellation.CancellationReason>` are not available in this context'
+check_rejects "cancellation_deadline_requires_time" "test/negative/cancellation_deadline_requires_time.weft" 'error[E2001]: effect `Time` is not available in this context'
 check_rejects "generator_new_non_literal_producer" "test/negative/generator_new_non_literal_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_new_nonzero_arg_producer" "test/negative/generator_new_nonzero_arg_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_new_function_with_arg" "test/negative/generator_new_function_with_arg.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"

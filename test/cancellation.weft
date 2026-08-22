@@ -1,0 +1,224 @@
+use runtime/rc_implicit_test.{RuntimeRcProbe, runtime_rc_probe_count, runtime_rc_probe_load, runtime_rc_probe_new}
+use stdlib/cancellation as cancellation
+use stdlib/cancellation.{CancellationOutcome, CancellationReason, CancellationState}
+use stdlib/fail.{Fail}
+use stdlib/spawn as spawn
+use stdlib/time as time
+
+fn cancellation_reason_code(reason: CancellationReason) -> i64 {
+  match reason {
+    cancellation.CancellationRequested() -> 1
+    cancellation.CancellationDeadlineExceeded(deadline) -> 1000 + time.instant_to_millis(deadline)
+  }
+}
+
+fn cancellation_state_code(state: CancellationState) -> i64 {
+  match state {
+    cancellation.CancellationActive() -> 0
+    cancellation.CancellationPending(reason) -> cancellation_reason_code(reason)
+  }
+}
+
+fn cancellation_outcome_code(outcome: CancellationOutcome<i64>) -> i64 {
+  match outcome {
+    cancellation.CancellationCompleted(value) -> value
+    cancellation.CancellationCancelled(reason) -> 0 - cancellation_reason_code(reason)
+  }
+}
+
+fn cancellation_with_fixed_time<T, E>(now: i64, body: () -[time.Time, E]> T) -[E]> T {
+  handle body() {
+    time.Time.now_millis() -> resume(now)
+    time.Time.now_nanos() -> resume(now * 1000000)
+    time.Time.sleep_millis(ms) -> resume(0)
+  }
+}
+
+fn cancellation_child() -[cancellation.Cancellation, Fail<CancellationReason>]> i64 {
+  cancellation.request(cancellation.CancellationRequested())
+  cancellation.checkpoint()
+  42
+}
+
+fn cancellation_probe_child(payload: RuntimeRcProbe) -[cancellation.Cancellation, Fail<CancellationReason>]> i64 {
+  let observed = runtime_rc_probe_load(payload)
+  cancellation.request(cancellation.CancellationRequested())
+  cancellation.checkpoint()
+  observed
+}
+
+fn cancellation_deadline_child() -[cancellation.Cancellation, Fail<CancellationReason>]> i64 {
+  cancellation.checkpoint()
+  42
+}
+
+test "cancellation scope completes with its ordinary value" {
+  let outcome = cancellation.with_scope(() => {
+    Test.assert_eq(cancellation_state_code(cancellation.state()), 0)
+    42
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 42)
+}
+
+test "cancellation outcome preserves managed multi-lane completion" {
+  let prefix = "weft"
+  let outcome = cancellation.with_scope(() => (prefix, 42))
+  match outcome {
+    cancellation.CancellationCompleted(value) -> {
+      let (name, number): (str, i64) = value
+      Test.assert_eq(if name == "weft" { number } else { 0 }, 42)
+    }
+    cancellation.CancellationCancelled(reason) -> Test.assert_eq(cancellation_reason_code(reason), 0)
+  }
+}
+
+test "cancellation request is first-wins and idempotent" {
+  let outcome = cancellation.with_scope(() => {
+    let first = cancellation.request(cancellation.CancellationRequested())
+    let second = cancellation.request(cancellation.CancellationDeadlineExceeded(time.instant_from_millis(99)))
+    let third = cancellation.request(cancellation.CancellationRequested())
+    Test.assert_eq(cancellation_state_code(first), 1)
+    Test.assert_eq(cancellation_state_code(second), 1)
+    Test.assert_eq(cancellation_state_code(third), 1)
+    42
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 42)
+}
+
+test "checkpoint delivers an explicit cancellation request" {
+  let outcome = cancellation.with_scope(() => {
+    cancellation.request(cancellation.CancellationRequested())
+    cancellation.checkpoint()
+    42
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 0 - 1)
+}
+
+test "checkpoint preserves a typed deadline reason requested by a task" {
+  let outcome = cancellation.with_scope(() => {
+    cancellation.request(cancellation.CancellationDeadlineExceeded(time.instant_from_millis(77)))
+    cancellation.checkpoint()
+    42
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 0 - 1077)
+}
+
+test "masked checkpoint defers delivery but preserves pending state" {
+  let outcome = cancellation.with_scope(() => {
+    cancellation.request(cancellation.CancellationRequested())
+    let inside = cancellation.masked(() => {
+      cancellation.checkpoint()
+      cancellation_state_code(cancellation.state())
+    })
+    Test.assert_eq(inside, 1)
+    cancellation.checkpoint()
+    42
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 0 - 1)
+}
+
+test "nested cancellation scope isolates the nearest handler" {
+  let outcome = cancellation.with_scope(() => {
+    cancellation.request(cancellation.CancellationRequested())
+    let inner = cancellation.with_scope(() => {
+      cancellation.checkpoint()
+      42
+    })
+    Test.assert_eq(cancellation_outcome_code(inner), 42)
+    cancellation.checkpoint()
+    0
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 0 - 1)
+}
+
+test "deadline before threshold completes without polling" {
+  let outcome = cancellation_with_fixed_time(99, () => {
+    cancellation.with_deadline(time.instant_from_millis(100), () => {
+      cancellation.checkpoint()
+      42
+    })
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 42)
+}
+
+test "deadline scope does not read time without a checkpoint" {
+  let outcome = cancellation_with_fixed_time(1000, () => {
+    cancellation.with_deadline(time.instant_from_millis(1), () => 42)
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 42)
+}
+
+test "deadline equality expires inclusively" {
+  let outcome = cancellation_with_fixed_time(100, () => {
+    cancellation.with_deadline(time.instant_from_millis(100), () => {
+      cancellation.checkpoint()
+      42
+    })
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 0 - 1100)
+}
+
+test "deadline after threshold expires with its typed instant" {
+  let outcome = cancellation_with_fixed_time(101, () => {
+    cancellation.with_deadline(time.instant_from_millis(100), () => {
+      cancellation.checkpoint()
+      42
+    })
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 0 - 1100)
+}
+
+test "explicit request wins over an already expired deadline" {
+  let outcome = cancellation_with_fixed_time(101, () => {
+    cancellation.with_deadline(time.instant_from_millis(100), () => {
+      cancellation.request(cancellation.CancellationRequested())
+      cancellation.checkpoint()
+      42
+    })
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 0 - 1)
+}
+
+test "deadline delivery is deferred across a masked checkpoint" {
+  let outcome = cancellation_with_fixed_time(100, () => {
+    cancellation.with_deadline(time.instant_from_millis(100), () => {
+      let inside = cancellation.masked(() => {
+        cancellation.checkpoint()
+        42
+      })
+      Test.assert_eq(inside, 42)
+      cancellation.checkpoint()
+      0
+    })
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 0 - 1100)
+}
+
+test "child cancellation reaches the shared structured Spawn scope" {
+  let outcome = spawn.with_sequential_cancellation(() => {
+    let task = spawn.spawn(() => cancellation_child())
+    spawn.join(task)
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 0 - 1)
+}
+
+test "child deadline reaches the shared structured Spawn scope" {
+  let outcome = cancellation_with_fixed_time(100, () => {
+    spawn.with_sequential_deadline(time.instant_from_millis(100), () => {
+      let task = spawn.spawn(() => cancellation_deadline_child())
+      spawn.join(task)
+    })
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 0 - 1100)
+}
+
+test "cancelling child releases its managed capture and task carrier" {
+  let payload = runtime_rc_probe_new(42)
+  let baseline = runtime_rc_probe_count(payload)
+  let outcome = spawn.with_sequential_cancellation(() => {
+    let task = spawn.spawn(() => cancellation_probe_child(payload))
+    spawn.join(task)
+  })
+  Test.assert_eq(cancellation_outcome_code(outcome), 0 - 1)
+  Test.assert_eq(runtime_rc_probe_count(payload), baseline)
+}

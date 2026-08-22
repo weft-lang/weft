@@ -1,0 +1,169 @@
+-- stdlib/cancellation.weft -- cooperative structured cancellation
+--
+-- Cancellation is an explicit capability separate from Spawn. A request is
+-- first-wins and idempotent; computation stops only when it reaches an
+-- explicit checkpoint. Handlers choose ordinary, masked, deterministic-time,
+-- or future event-loop interpretation without changing application code.
+
+use stdlib/time.{Instant, Time, instant_cmp, time_now}
+use stdlib/fail.{Fail}
+use stdlib/vector.{vector_get_in_bounds, vector_new, vector_push, vector_set}
+use stdlib/vector_type.{Vector}
+
+--- Why a structured cancellation scope stopped.
+pub type CancellationReason {
+  --- A task in the scope explicitly requested cancellation.
+  CancellationRequested,
+  --- The first observed checkpoint was at or beyond this deadline.
+  CancellationDeadlineExceeded(Instant),
+}
+
+--- Current state of the nearest structured cancellation scope.
+pub type CancellationState {
+  --- No cancellation request has been observed.
+  CancellationActive,
+  --- Cancellation is pending with the first accepted reason.
+  CancellationPending(CancellationReason),
+}
+
+--- Typed completion of a cancellable structured scope.
+pub type CancellationOutcome<T> {
+  --- The scope completed normally with its ordinary value.
+  CancellationCompleted(T),
+  --- A checkpoint abandoned the scope with this reason.
+  CancellationCancelled(CancellationReason),
+}
+
+--- Cooperative cancellation for the nearest structured scope.
+---
+--- Requesting cancellation records intent but does not preempt native code.
+--- `checkpoint` either resumes normally or abandons the handled computation.
+pub effect Cancellation {
+  --- Read the current scope state without changing it.
+  fn state() -> CancellationState
+  --- Record the first reason and return the resulting stable state.
+  fn request(reason: CancellationReason) -> CancellationState
+  --- Read the state at a cooperative cancellation checkpoint.
+  fn checkpoint() -> CancellationState
+}
+
+type CancellationSlotValue {
+  CancellationSlotValue(CancellationState)
+}
+
+fn cancellation_slot_new() -> Vector<CancellationSlotValue> {
+  let slot = vector_new<CancellationSlotValue>()
+  vector_push<CancellationSlotValue>(slot, CancellationSlotValue(CancellationActive()))
+  slot
+}
+
+fn cancellation_slot_get(slot: Vector<CancellationSlotValue>) -> CancellationState {
+  match vector_get_in_bounds<CancellationSlotValue>(slot, 0) {
+    CancellationSlotValue(value) -> value
+  }
+}
+
+fn cancellation_slot_request(slot: Vector<CancellationSlotValue>, reason: CancellationReason) -> CancellationState {
+  match cancellation_slot_get(slot) {
+    CancellationActive() -> {
+      let pending = CancellationPending(reason)
+      vector_set<CancellationSlotValue>(slot, 0, CancellationSlotValue(pending))
+      pending
+    }
+    CancellationPending(first) -> CancellationPending(first)
+  }
+}
+
+--- Read the nearest cancellation scope's typed state.
+pub fn state() -[Cancellation]> CancellationState {
+  Cancellation.state()
+}
+
+--- Request cancellation. The first accepted reason remains authoritative.
+pub fn request(reason: CancellationReason) -[Cancellation]> CancellationState {
+  Cancellation.request(reason)
+}
+
+--- Cooperatively observe pending cancellation at this program point.
+---
+--- Delivery uses the canonical typed Fail effect. Scope handlers below turn
+--- that exact failure atom into `CancellationCancelled`; masking prevents the
+--- failure by interpreting only the checkpoint query as active.
+pub fn checkpoint() -[Cancellation, Fail<CancellationReason>]> nil {
+  match Cancellation.checkpoint() {
+    CancellationActive() -> nil
+    CancellationPending(reason) -> Fail.fail(reason)
+  }
+}
+
+fn cancellation_handle<T, E>(slot: Vector<CancellationSlotValue>, body: () -[Cancellation, E]> T) -[E]> T {
+  handle body() {
+    Cancellation.state() -> resume(cancellation_slot_get(slot))
+    Cancellation.request(reason) -> resume(cancellation_slot_request(slot, reason))
+    Cancellation.checkpoint() -> resume(cancellation_slot_get(slot))
+    return value -> value
+  }
+}
+
+fn cancellation_catch<T, E>(body: () -[Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T> {
+  handle body() {
+    Fail.fail(reason) -> CancellationCancelled<T>(reason)
+    return value -> CancellationCompleted<T>(value)
+  }
+}
+
+fn cancellation_catch_with_time<T, E>(body: () -[Fail<CancellationReason>, Time, E]> T) -[Time, E]> CancellationOutcome<T> {
+  handle body() {
+    Fail.fail(reason) -> CancellationCancelled<T>(reason)
+    return value -> CancellationCompleted<T>(value)
+  }
+}
+
+--- Run a cancellable scope with deterministic first-request semantics.
+pub fn with_scope<T, E>(body: () -[Cancellation, Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T> {
+  let slot = cancellation_slot_new()
+  cancellation_catch<T, E>(() => cancellation_handle<T, Fail<CancellationReason> | E>(slot, body))
+}
+
+fn cancellation_deadline_handle<T, E>(deadline: Instant, slot: Vector<CancellationSlotValue>, body: () -[Cancellation, E]> T) -[Time, E]> T {
+  handle body() {
+    Cancellation.state() -> resume(cancellation_slot_get(slot))
+    Cancellation.request(reason) -> resume(cancellation_slot_request(slot, reason))
+    Cancellation.checkpoint() -> resume(match cancellation_slot_get(slot) {
+      CancellationPending(reason) -> CancellationPending(reason)
+      CancellationActive() -> {
+        if instant_cmp(time_now(), deadline) >= 0 {
+          let reason = CancellationDeadlineExceeded(deadline)
+          cancellation_slot_request(slot, reason)
+          CancellationPending(reason)
+        } else {
+          CancellationActive()
+        }
+      }
+    })
+    return value -> value
+  }
+}
+
+--- Run a cancellable scope whose checkpoints also observe `deadline`.
+---
+--- Expiry is inclusive (`now >= deadline`) and cooperative: the clock is read
+--- only at checkpoints. The surrounding Time handler defines determinism.
+pub fn with_deadline<T, E>(deadline: Instant, body: () -[Cancellation, Fail<CancellationReason>, E]> T) -[Time, E]> CancellationOutcome<T> {
+  let slot = cancellation_slot_new()
+  cancellation_catch_with_time<T, E>(() => cancellation_deadline_handle<T, Fail<CancellationReason> | E>(deadline, slot, body))
+}
+
+--- Suppress cancellation delivery inside one tiny commit/cleanup region.
+---
+--- Requests and state queries still reach the enclosing scope. Only
+--- checkpoints are masked; pending cancellation is delivered at the next
+--- checkpoint after this handler returns.
+pub fn masked<T, E>(body: () -[Cancellation, Fail<CancellationReason>, E]> T) -[Cancellation, Fail<CancellationReason>, E]> T {
+  handle body() {
+    Cancellation.state() -> resume(Cancellation.state())
+    Cancellation.request(reason) -> resume(Cancellation.request(reason))
+    Cancellation.checkpoint() -> resume(CancellationActive())
+    return value -> value
+  }
+}
