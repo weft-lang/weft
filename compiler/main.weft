@@ -4,7 +4,7 @@
 
 use compiler/codegen.{*}
 use compiler/diagnose.{*}
-use compiler/docgen.{docgen_render_module}
+use compiler/docgen.{docgen_append_function_signature, docgen_decl_is_public_root, docgen_render_module}
 use compiler/effect_ref.{*}
 use compiler/formatter.{*}
 use compiler/typeck.{*}
@@ -40,8 +40,11 @@ use runtime/test_harness.{*}
 use stdlib/diagnostic.{diagnostic_class_name}
 use stdlib/diagnostic_registry.{*}
 use stdlib/semantic_type.{*}
-use stdlib/semantic_type_render.{semantic_type_append, semantic_type_append_effect_atom}
+use stdlib/semantic_type_render.{semantic_effect_set_render, semantic_type_append, semantic_type_append_effect_atom}
 use stdlib/diagnostic_type.{*}
+use stdlib/json.{*}
+use stdlib/list.{List, list_append, list_cons, list_nil}
+use stdlib/result.{Err, Ok, Result}
 
 fn main_alloc_bytes(size: i64) -> i64 {
   alloc_words((size + 7) / 8)
@@ -2078,9 +2081,105 @@ fn run_test_paths(argc: i64, argv: i64, first_path: i64, jobs: i64) -[SourceAcqu
   if final_fail == 0 { 0 } else { 1 }
 }
 
-fn run_pkg(argc: i64, argv: i64) -> i64 {
+fn main_pkg_native_wrapper_json(tt: i64, module_path: str, package_name: str, declaration: i64, fact: SemanticFunctionFact) -> Json {
+  let signature_buffer = buf_new(128)
+  docgen_append_function_signature(signature_buffer, tt, declaration)
+  let signature = runtime_str_from_bytes_copy(buf_ptr(signature_buffer), buf_len(signature_buffer))
+  match fact {
+    SemanticFunction(name, parameters, result, effects, purity, ownership, shape, bounds) -> {
+      list_cons<JsonEntry>(json_entry("package", json_string(package_name)),
+        list_cons<JsonEntry>(json_entry("module", json_string(module_path)),
+        list_cons<JsonEntry>(json_entry("name", json_string(name)),
+        list_cons<JsonEntry>(json_entry("signature", json_string(signature)),
+        list_cons<JsonEntry>(json_entry("effects", json_string(semantic_effect_set_render(effects))), list_nil<JsonEntry>()))))) |> json_object
+    }
+    SemanticFunctionOther(name) -> {
+      list_cons<JsonEntry>(json_entry("package", json_string(package_name)),
+        list_cons<JsonEntry>(json_entry("module", json_string(module_path)),
+        list_cons<JsonEntry>(json_entry("name", json_string(name)),
+        list_cons<JsonEntry>(json_entry("signature", json_string(signature)),
+        list_cons<JsonEntry>(json_entry("effects", json_string("unknown")), list_nil<JsonEntry>()))))) |> json_object
+    }
+  }
+}
+
+fn main_pkg_native_wrapper_facts_from_table(tt: i64) -> List<Json> {
+  let mut wrappers = list_nil<Json>()
+  let checked_functions = ttable_get_checked_functions(tt)
+  for source_index in 0..ttable_native_binding_source_count(tt) {
+    let source_entry = ttable_native_binding_source_at(tt, source_index)
+    let source = ttable_native_binding_source_source(source_entry)
+    let module_entry = module_fact_find_source(tt, source)
+    let package_id = ttable_native_binding_source_package(source_entry)
+    let package_identity = pkg_identity_find_id(tt, package_id)
+    let module_path = if module_entry == 0 { "unknown" }
+      else { runtime_str_from_bytes_copy(module_fact_entry_path_ptr(module_entry), module_fact_entry_path_len(module_entry)) }
+    let package_name = if package_identity == 0 { "unknown" }
+      else { runtime_str_from_bytes_copy(pkg_identity_name_ptr(package_identity), pkg_identity_name_len(package_identity)) }
+    for declaration_index in 0..module_fact_decl_count(tt) {
+      let declaration = module_fact_decl_at(tt, declaration_index)
+      if docgen_decl_is_public_root(declaration, source) and module_decl_fact_namespace(declaration) == module_decl_namespace_value() {
+        let entry = if checked_functions == 0 { 0 } else { ftypes_find_decl(checked_functions, declaration) }
+        match semantic_fact_function_entry(tt, entry) {
+          SemanticFactEnvelope(SemanticFactSchemaV1, SemanticFactFound(SemanticFactFunction(fact))) -> {
+            wrappers = list_append<Json>(wrappers, main_pkg_native_wrapper_json(tt, module_path, package_name, declaration, fact))
+            0
+          }
+          _ -> 0
+        }
+      } else { 0 }
+    }
+  }
+  wrappers
+}
+
+fn main_pkg_native_wrapper_facts(source: str) -[SourceAcquire]> Result<List<Json>, str> {
+  let grammar = weft_grammar()
+  let tt = ttable_new()
+  let path = "native_audit.weft"
+  main_mark_root_origin_with_grant(tt, __str_ptr(source), 0, 1, 0)
+  main_register_source_path(tt, __str_ptr(source), __str_len(source), __str_ptr(path), __str_len(path))
+  match pipeline_parse_with_error_count(grammar, __str_ptr(source), __str_len(source), tt) {
+    PipelineParseResult(fns, parse_errors) -> {
+      if parse_errors != 0 { Err("pkg: native audit import graph did not parse") }
+      else {
+        let check_errors = pipeline_check_fns_error_count(fns, __str_ptr(source), tt)
+        if check_errors != 0 { Err("pkg: native audit import graph did not check") }
+        else { Ok(main_pkg_native_wrapper_facts_from_table(tt)) }
+      }
+    }
+  }
+}
+
+fn main_pkg_native_audit_source_into(holder: i64) -[FileRead]> i64 {
+  match pkg_native_audit_import_source() {
+    Err(message) -> { pkg_stderr(message) pkg_stderr("\n") 1 }
+    Ok(source) -> {
+      let stable = main_alloc_bytes(__str_len(source))
+      mem_copy(stable, __str_ptr(source), __str_len(source))
+      mem_store64_at(holder, 0, stable)
+      mem_store64_at(holder, 8, __str_len(source))
+      0
+    }
+  }
+}
+
+fn main_pkg_cli_audit() -[SourceAcquire]> i64 {
+  let source_holder = alloc_zeroed(16)
+  let source_status = runtime_standalone_file_read(() => main_pkg_native_audit_source_into(source_holder))
+  if source_status != 0 { source_status }
+  else {
+    let source = runtime_str_from_bytes_copy(mem_load64_at(source_holder, 0), mem_load64_at(source_holder, 8))
+    match main_pkg_native_wrapper_facts(source) {
+      Err(message) -> { pkg_stderr(message) pkg_stderr("\n") 1 }
+      Ok(wrappers) -> runtime_standalone_file_read(() => pkg_cli_audit_with_wrappers(wrappers))
+    }
+  }
+}
+
+fn run_pkg(argc: i64, argv: i64) -[SourceAcquire]> i64 {
   if argc < 3 {
-    pkg_stderr("usage: weft pkg init [name]\nusage: weft pkg add NAME PATH\nusage: weft pkg lock\nusage: weft pkg exports\n")
+    pkg_stderr("usage: weft pkg init [name]\nusage: weft pkg add NAME PATH\nusage: weft pkg lock\nusage: weft pkg exports\nusage: weft pkg audit\n")
     1
   } else {
     let sub = mem_load64_at(argv, 16)
@@ -2104,10 +2203,12 @@ fn run_pkg(argc: i64, argv: i64) -> i64 {
       runtime_standalone_package_io(() => pkg_cli_lock())
     } else { if cstr_eq(sub, "exports") == 1 {
       runtime_standalone_file_read(() => pkg_cli_exports())
+    } else { if cstr_eq(sub, "audit") == 1 {
+      main_pkg_cli_audit()
     } else {
       pkg_stderr("pkg: unknown command\n")
       1
-    } } } }
+    } } } } }
   }
 }
 
