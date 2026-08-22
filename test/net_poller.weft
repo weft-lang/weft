@@ -1,0 +1,287 @@
+-- test/net_poller.weft — generation-safe Darwin kqueue contract
+
+use runtime/net_poller.{*}
+use runtime/tcp.{runtime_platform_tcp}
+use stdlib/fail.{Fail}
+use stdlib/io_types.{IoEndOfFile, IoReadBytes, IoWroteBytes}
+use stdlib/net_address.{SocketAddress, SocketV4, ipv4_address}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/tcp.{*}
+use stdlib/test.{Test}
+use stdlib/vector.{vector_get_in_bounds, vector_push, vector_with_capacity}
+use stdlib/vector_type.{Vector}
+
+fn net_poller_test_error_code(error: NetPollError) -> i64 {
+  match error {
+    NetPollInterrupted -> 1
+    NetPollLimit -> 2
+    NetPollInvalidRegistration -> 3
+    NetPollInvalidEvent -> 4
+    NetPollPlatform(code) -> 1000 + code
+  }
+}
+
+fn net_poller_test_tcp_error_code(error: TcpError) -> i64 {
+  match error {
+    TcpInterrupted -> 1
+    TcpWouldBlock -> 2
+    TcpConnectionRefused -> 3
+    TcpConnectionReset -> 4
+    TcpConnectionAborted -> 5
+    TcpBrokenPipe -> 6
+    TcpNotConnected -> 7
+    TcpAddressInUse -> 8
+    TcpAddressUnavailable -> 9
+    TcpNetworkUnreachable -> 10
+    TcpTimedOut -> 11
+    TcpPermissionDenied -> 12
+    TcpResourceExhausted -> 13
+    TcpInvalidProgress -> 14
+    TcpPlatform(code) -> 1000 + code
+  }
+}
+
+fn net_poller_test_handle_poll_error(
+  body: () -[TcpConnect, TcpListen, TcpStreamIO, TcpListenerIO, Fail<TcpError>, Fail<NetPollError>]> i64
+) -[TcpConnect, TcpListen, TcpStreamIO, TcpListenerIO, Fail<TcpError>]> i64 {
+  handle body() {
+    Fail<NetPollError>.fail(error) -> 0 - 10000 - net_poller_test_error_code(error)
+  }
+}
+
+fn net_poller_test_run(
+  body: () -[TcpConnect, TcpListen, TcpStreamIO, TcpListenerIO, Fail<TcpError>, Fail<NetPollError>]> i64
+) -> i64 {
+  runtime_platform_tcp(() => handle net_poller_test_handle_poll_error(body) {
+    Fail<TcpError>.fail(error) -> 0 - 20000 - net_poller_test_tcp_error_code(error)
+  })
+}
+
+fn net_poller_test_timeout_probe() -[Fail<NetPollError>]> i64 {
+  let mut poller: owned NetPoller = net_poller_open()?
+  let score = match net_poller_wait(poller, NetPollImmediate)? {
+    NetPollTimedOut -> 1
+    NetPollEventReady(event) -> 0
+  }
+  net_poller_close(poller)?
+  score
+}
+
+fn net_poller_test_timeout_run() -> i64 {
+  handle net_poller_test_timeout_probe() {
+    Fail<NetPollError>.fail(error) -> 0 - net_poller_test_error_code(error)
+  }
+}
+
+fn net_poller_test_interest_is(
+  registration: NetPollRegistration,
+  expected: NetPollInterest
+) -> bool {
+  match net_poll_registration_interest(registration) {
+    NetPollReadable -> match expected {
+      NetPollReadable -> true
+      NetPollWritable -> false
+    }
+    NetPollWritable -> match expected {
+      NetPollReadable -> false
+      NetPollWritable -> true
+    }
+  }
+}
+
+fn net_poller_test_ready_matches(
+  wait: NetPollWait,
+  expected: NetPollRegistration,
+  interest: NetPollInterest,
+  need_data: bool,
+  need_eof: bool
+) -> i64 {
+  match wait {
+    NetPollTimedOut -> 0
+    NetPollEventReady(event) -> match event {
+      NetPollReady(registration, available, eof) -> {
+        if net_poll_registration_same(registration, expected) and
+          net_poller_test_interest_is(registration, interest) and
+          (not need_data or available > 0) and eof == need_eof { 1 }
+        else { 0 }
+      }
+      NetPollReadyError(registration, error) -> 0
+    }
+  }
+}
+
+fn net_poller_test_loopback_probe(
+) -[TcpConnect, TcpListen, TcpStreamIO, TcpListenerIO, Fail<TcpError>, Fail<NetPollError>]> i64 {
+  let mut score = 0
+  let mut poller: owned NetPoller = net_poller_open()?
+  let mut listener: owned TcpListener = tcp_listen(
+    SocketV4(ipv4_address(127, 0, 0, 1), 0),
+    TcpListenOptions { backlog: 8, reuse_address: true }
+  )?
+  let bound: SocketAddress = tcp_listener_local_address(listener)?
+  let mut client: owned TcpStream = tcp_connect(bound, tcp_connect_options_default())?
+
+  -- kqueue evaluates the filter during registration, so a connection queued
+  -- before registration must still become readable.
+  let listener_resource = net_poller_adopt_listener(poller, listener)?
+  let listener_ready = net_poller_register(poller, listener_resource, NetPollReadable)?
+  score = score + net_poller_test_ready_matches(
+    net_poller_wait(poller, NetPollForMillis(__i64_to_usize(1000)))?,
+    listener_ready,
+    NetPollReadable,
+    true,
+    false
+  )
+
+  let mut server: owned TcpStream = tcp_accept(listener)?
+  let client_resource = net_poller_adopt_stream(poller, client)?
+  let server_resource = net_poller_adopt_stream(poller, server)?
+
+  let client_writable = net_poller_register(poller, client_resource, NetPollWritable)?
+  score = score + net_poller_test_ready_matches(
+    net_poller_wait(poller, NetPollForMillis(__i64_to_usize(1000)))?,
+    client_writable,
+    NetPollWritable,
+    false,
+    false
+  )
+
+  -- Once delivery wins, exact deletion reports that cancellation has already
+  -- been resolved instead of cancelling a later generation.
+  match net_poller_cancel(poller, client_writable)? {
+    NetPollCancelled -> { score = score + 0 }
+    NetPollAlreadyResolved -> { score = score + 1 }
+  }
+
+  -- Rearming retains resource identity and advances exactly one generation.
+  let client_writable_next = net_poller_rearm(poller, client_writable)?
+  if net_poll_registration_resource_id(client_writable_next) ==
+    net_poll_registration_resource_id(client_writable) and
+    net_poll_registration_generation(client_writable_next) ==
+    net_poll_registration_generation(client_writable) + 1 and
+    not net_poll_registration_same(client_writable_next, client_writable) {
+    score = score + 1
+  } else { score = score + 0 }
+
+  -- Exact udata-specific deletion lets cancellation win without consuming an
+  -- unrelated generation for the same integer descriptor.
+  match net_poller_cancel(poller, client_writable_next)? {
+    NetPollCancelled -> { score = score + 1 }
+    NetPollAlreadyResolved -> { score = score + 0 }
+  }
+  match net_poller_wait(poller, NetPollImmediate)? {
+    NetPollTimedOut -> { score = score + 1 }
+    NetPollEventReady(event) -> { score = score + 0 }
+  }
+
+  let source: Vector<u8> = vector_with_capacity<u8>(1)
+  vector_push<u8>(source, __u64_to_u8(__i64_to_u64(42)))
+  let source_view: [u8] = source[..]
+  match tcp_write(client, source_view)? {
+    IoWroteBytes(count) -> if __u64_to_i64(__usize_to_u64(count)) == 1 {
+      score = score + 1
+    } else { score = score + 0 }
+  }
+
+  let server_readable = net_poller_register(poller, server_resource, NetPollReadable)?
+  score = score + net_poller_test_ready_matches(
+    net_poller_wait(poller, NetPollForMillis(__i64_to_usize(1000)))?,
+    server_readable,
+    NetPollReadable,
+    true,
+    false
+  )
+
+  let received: Vector<u8> = vector_with_capacity<u8>(1)
+  vector_push<u8>(received, __u64_to_u8(__i64_to_u64(0)))
+  let received_view: [mut u8] = received[..]
+  match tcp_read(server, received_view)? {
+    IoReadBytes(count) -> if __u64_to_i64(__usize_to_u64(count)) == 1 and
+      __u64_to_i64(__u8_to_u64(vector_get_in_bounds<u8>(received, 0))) == 42 {
+      score = score + 1
+    } else { score = score + 0 }
+    IoEndOfFile -> { score = score + 0 }
+  }
+
+  let server_eof = net_poller_rearm(poller, server_readable)?
+  tcp_shutdown(client, TcpShutdownWrite)?
+  score = score + net_poller_test_ready_matches(
+    net_poller_wait(poller, NetPollForMillis(__i64_to_usize(1000)))?,
+    server_eof,
+    NetPollReadable,
+    false,
+    true
+  )
+
+  -- Registration identities are scoped to their owning poller state.
+  let mut other: owned NetPoller = net_poller_open()?
+  match net_poller_rearm(other, server_eof) {
+    Err(NetPollInvalidRegistration) -> { score = score + 1 }
+    Err(error) -> { score = score + 0 }
+    Ok(registration) -> { score = score + 0 }
+  }
+  net_poller_close(other)?
+
+  -- Closing and reopening may reuse both the kqueue descriptor and mmap
+  -- address. A process-lifetime epoch keeps an old registration invalid even
+  -- when the new poller begins again at resource 1, generation 1.
+  net_poller_close(poller)?
+  let mut replacement: owned NetPoller = net_poller_open()?
+  match net_poller_rearm(replacement, server_eof) {
+    Err(NetPollInvalidRegistration) -> { score = score + 1 }
+    Err(error) -> { score = score + 0 }
+    Ok(registration) -> { score = score + 0 }
+  }
+  let replacement_resource = net_poller_adopt_listener(replacement, listener)?
+  let replacement_registration = net_poller_register(
+    replacement,
+    replacement_resource,
+    NetPollReadable
+  )?
+  if net_poll_registration_resource_id(replacement_registration) == 1 and
+    net_poll_registration_generation(replacement_registration) == 1 and
+    net_poll_registration_poller_epoch(replacement_registration) !=
+    net_poll_registration_poller_epoch(server_eof) {
+    score = score + 1
+  } else { score = score + 0 }
+  -- Closing with an armed registration removes the kernel registration. A
+  -- later poller must reject the old key before it can reach kevent.
+  net_poller_close(replacement)?
+  let mut after_close: owned NetPoller = net_poller_open()?
+  match net_poller_rearm(after_close, replacement_registration) {
+    Err(NetPollInvalidRegistration) -> { score = score + 1 }
+    Err(error) -> { score = score + 0 }
+    Ok(registration) -> { score = score + 0 }
+  }
+  net_poller_close(after_close)?
+
+  tcp_stream_close(client)?
+  tcp_stream_close(server)?
+  tcp_listener_close(listener)?
+  score
+}
+
+fn net_poller_test_abort_probe() -[Fail<NetPollError>]> i64 {
+  let poller: owned NetPoller = net_poller_open()?
+  Fail<NetPollError>.fail(NetPollPlatform(42))
+}
+
+fn net_poller_test_abort_then_reopen() -> i64 {
+  let aborted = handle net_poller_test_abort_probe() {
+    Fail<NetPollError>.fail(error) -> net_poller_test_error_code(error)
+  }
+  let reopened = net_poller_test_timeout_run()
+  aborted * 10 + reopened
+}
+
+test "Darwin poller reports a typed immediate timeout" {
+  Test.assert_eq(net_poller_test_timeout_run(), 1)
+}
+
+test "Darwin kqueue preserves generation-safe TCP readiness and cancellation" {
+  Test.assert_eq(net_poller_test_run(net_poller_test_loopback_probe), 14)
+}
+
+test "aborting a poller owner runs Drop before a later poller is opened" {
+  Test.assert_eq(net_poller_test_abort_then_reopen(), 10421)
+}
