@@ -76,6 +76,9 @@ check_rejects "spawn_child_effect_requires_contract" "test/negative/spawn_child_
 check_rejects "spawn_non_sendable_result" "test/negative/spawn_non_sendable_result.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
 check_rejects "spawn_non_sendable_capture" "test/negative/spawn_non_sendable_capture.weft" "type error: task closure is not Sendable across structured Spawn"
 check_rejects "spawn_task_scope_escape" "test/negative/spawn_task_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
+check_rejects "spawn_task_event_loop_scope_escape" "test/negative/spawn_task_event_loop_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
+check_rejects "spawn_task_channel_scope_escape" "test/negative/spawn_task_channel_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
+check_rejects "channel_non_sendable_element" "test/negative/channel_non_sendable_element.weft" 'does not implement `Sendable`'
 check_rejects "spawn_task_double_join" "test/negative/spawn_task_double_join.weft" "type error: unique value used more than once"
 check_rejects "spawn_task_constructor_private" "test/negative/spawn_task_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "cancellation_request_requires_effect" "test/negative/cancellation_request_requires_effect.weft" 'error[E2001]: effect `Cancellation` is not available in this context'

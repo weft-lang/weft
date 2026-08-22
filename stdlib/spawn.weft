@@ -6,6 +6,7 @@ use runtime/panic.{runtime_trap}
 use runtime/time.{runtime_platform_now_millis, runtime_platform_now_nanos, runtime_platform_sleep_millis}
 use stdlib/cancellation.{Cancellation, CancellationOutcome, with_deadline, with_scope}
 use stdlib/cancellation.{CancellationReason}
+use stdlib/channel.{Channel, ChannelAlreadyClosed, ChannelCapacity, ChannelClose, ChannelClosedNow, ChannelDrained, ChannelReceive, ChannelReceived, ChannelSend, ChannelSendAccepted, ChannelSendClosed, ChannelState, channel_capacity_value, channel_state_close, channel_state_disabled, channel_state_is_closed, channel_state_is_empty, channel_state_is_full, channel_state_new, channel_state_offer, channel_state_take}
 use stdlib/continuation.{continuation_cell_from_ptr, continuation_cell_resume_i64, continuation_cell_store_i64}
 use stdlib/fail.{Fail}
 use stdlib/option.{None, Some}
@@ -20,13 +21,16 @@ use stdlib/vector_type.{Vector}
 --- Operations carry sealed runtime tokens. Application code uses `spawn` and
 --- `join`, whose typed wrappers preserve callback effects and result layouts.
 pub effect Spawn {
+  --- Submit one compiler-sealed work carrier to the nearest scope.
   fn submit(work: i64) -> i64,
-  fn join(task: i64) -> i64
+    --- Consume one compiler-sealed task identity and return its carrier.
+    fn join(task: i64) -> i64
 }
 
 -- One internal suspension atom keeps public capabilities tail-resumptive and
 -- makes the scheduler—not Time or Spawn—the sole owner of stored one-shot
--- continuations. Modes are sealed below: runnable value, task join, timer.
+-- continuations. Modes are sealed below: runnable value, task join, timer,
+-- readiness, channel send and channel receive.
 effect EventLoopSuspend {
   @deferred fn suspend(task: i64, mode: i64, value: i64) -> i64
 }
@@ -36,14 +40,18 @@ effect EventLoopSuspend {
 -- stores a continuation containing the corresponding owner.
 effect EventLoopPoll {
   fn register_stream(stream: borrow TcpStream, interest: NetPollInterest) -> Result<NetPollRegistration, NetPollError>
-  fn register_listener(listener: borrow TcpListener, interest: NetPollInterest) -> Result<NetPollRegistration, NetPollError>
-  fn wait(deadline: NetPollDeadline) -> Result<NetPollWait, NetPollError>
-  fn cancel(registration: NetPollRegistration) -> Result<NetPollCancel, NetPollError>
+    fn register_listener(listener: borrow TcpListener, interest: NetPollInterest) -> Result<NetPollRegistration, NetPollError>
+    fn wait(deadline: NetPollDeadline) -> Result<NetPollWait, NetPollError>
+    fn cancel(registration: NetPollRegistration) -> Result<NetPollCancel, NetPollError>
 }
 
 type EventLoopRegistration {
   task: i64,
-  registration: NetPollRegistration
+    registration: NetPollRegistration
+}
+
+type EventLoopNoChannel {
+  EventLoopNoChannel
 }
 
 fn event_loop_poll_error_status(error: NetPollError) -> i64 {
@@ -59,8 +67,8 @@ fn event_loop_poll_error_status(error: NetPollError) -> i64 {
 fn event_loop_readiness_error(status: i64) -> TcpReadinessError {
   if status == 0 - 1 { TcpReadinessInterrupted }
   else { if status == 0 - 2 { TcpReadinessResourceExhausted }
-  else { if status == 0 - 3 { TcpReadinessInvalidated }
-  else { TcpReadinessPlatform(0 - status - 1000) } } }
+    else { if status == 0 - 3 { TcpReadinessInvalidated }
+      else { TcpReadinessPlatform(0 - status - 1000) } } }
 }
 
 fn event_loop_track_registration(
@@ -142,6 +150,55 @@ fn event_loop_cancel_registrations(
   count
 }
 
+fn event_loop_channel_send<T: Sendable>(
+  state: ChannelState<T>,
+  scope: i64,
+  task: i64,
+  value: T
+) -[EventLoopSuspend]> ChannelSend<T> {
+  while not channel_state_is_closed<T>(state) and channel_state_is_full<T>(state) {
+    EventLoopSuspend.suspend(task, 4, 0)
+  }
+  if channel_state_is_closed<T>(state) { ChannelSendClosed<T>(value) }
+  else {
+    if channel_state_offer<T>(state, value) != 1 { runtime_trap(47, 0) } else { nil }
+    runtime_spawn_scope_wake_next_channel(scope, runtime_spawn_task_channel_receiving(), 0)
+    ChannelSendAccepted<T>()
+  }
+}
+
+fn event_loop_channel_receive<T: Sendable>(
+  state: ChannelState<T>,
+  scope: i64,
+  task: i64
+) -[EventLoopSuspend]> ChannelReceive<T> {
+  while not channel_state_is_closed<T>(state) and channel_state_is_empty<T>(state) {
+    EventLoopSuspend.suspend(task, 5, 0)
+  }
+  match channel_state_take<T>(state) {
+    Some(value) -> {
+      runtime_spawn_scope_wake_next_channel(scope, runtime_spawn_task_channel_sending(), 0)
+      ChannelReceived<T>(value)
+    }
+    None -> {
+      if channel_state_is_closed<T>(state) { ChannelDrained<T>() }
+      else { runtime_trap(47, 0) }
+    }
+  }
+}
+
+fn event_loop_channel_close<T: Sendable>(
+  state: ChannelState<T>,
+  scope: i64
+) -> ChannelClose {
+  let outcome = channel_state_close<T>(state)
+  match outcome {
+    ChannelClosedNow -> { runtime_spawn_scope_wake_all_channel(scope, 0) }
+    ChannelAlreadyClosed -> { 0 }
+  }
+  outcome
+}
+
 --- Submit an effectful Sendable task to the enclosing structured scope.
 ---
 --- The callback keeps its ordinary result `T` and its real effects `E`.
@@ -186,7 +243,100 @@ pub fn with_sequential<T, E>(body: () -[Spawn, E]> T) -[E]> T {
   }
 }
 
-fn event_loop_drive<E>(
+fn sequential_channel_run_task<C: Sendable, E>(
+  state: ChannelState<C>,
+  scope: i64,
+  task: i64
+) -[E]> i64 {
+  let result = handle {
+    handle {
+      handle runtime_spawn_task_run<Spawn | Channel<C> | E>(task) {
+        Spawn.submit(work) -> {
+          let child = runtime_spawn_scope_track(scope, work)
+          if child == 0 { runtime_trap(47, 0) } else { nil }
+          resume(EventLoopSuspend.suspend(task, 0, child))
+        }
+        Spawn.join(target) -> {
+          if runtime_spawn_task_state(target) == runtime_spawn_task_complete() {
+            resume(runtime_spawn_task_join(target))
+          } else {
+            resume(EventLoopSuspend.suspend(task, 1, target))
+          }
+        }
+      }
+    } {
+      Channel<C>.send(value) -> resume(event_loop_channel_send<C>(state, scope, task, value))
+      Channel<C>.receive() -> resume(event_loop_channel_receive<C>(state, scope, task))
+      Channel<C>.close() -> resume(event_loop_channel_close<C>(state, scope))
+    }
+  } {
+    EventLoopSuspend.suspend(current, mode, value) with k -> {
+      if current != task { runtime_trap(47, 0) } else { nil }
+      let cell = continuation_cell_from_ptr(runtime_spawn_task_continuation_cell(task))
+      if continuation_cell_store_i64(cell, k) != 1 { runtime_trap(47, 0) } else { nil }
+      if mode == 0 {
+        if runtime_spawn_task_suspend_runnable(task, value) != 1 { runtime_trap(47, 0) } else { 0 }
+      } else { if mode == 1 {
+          if runtime_spawn_task_wait_for(task, value) != 1 { runtime_trap(47, 0) } else { 0 }
+        } else { if mode == 4 {
+            if runtime_spawn_task_suspend_channel(task, runtime_spawn_task_channel_sending()) != 1 {
+              runtime_trap(47, 0)
+            } else { 0 }
+          } else { if mode == 5 {
+              if runtime_spawn_task_suspend_channel(task, runtime_spawn_task_channel_receiving()) != 1 {
+                runtime_trap(47, 0)
+              } else { 0 }
+            } else { runtime_trap(47, 0) } } } }
+    }
+  }
+  runtime_spawn_task_wake_waiter(task)
+  result
+}
+
+fn sequential_channel_drive<C: Sendable, E>(
+  state: ChannelState<C>,
+  scope: i64
+) -[E]> i64 {
+  let mut result = 0
+  let mut active = runtime_spawn_scope_has_active(scope)
+  while active == 1 {
+    let task = runtime_spawn_scope_next_runnable(scope)
+    if task == 0 { runtime_trap(47, 0) }
+    else {
+      if runtime_spawn_task_state(task) == runtime_spawn_task_pending() {
+        result = sequential_channel_run_task<C, E>(state, scope, task)
+      } else {
+        let resume_value = runtime_spawn_task_begin_resume(task)
+        let cell = continuation_cell_from_ptr(runtime_spawn_task_continuation_cell(task))
+        result = continuation_cell_resume_i64(cell, resume_value, 0)
+        runtime_spawn_task_wake_waiter(task)
+      }
+    }
+    active = runtime_spawn_scope_has_active(scope)
+  }
+  result
+}
+
+--- Run one bounded channel and its structured tasks under deterministic issue-order scheduling.
+---
+--- Full producers and empty consumers yield their one-shot continuations. The
+--- fixed buffer never grows, and close wakes every waiter exactly once.
+pub fn with_sequential_channel<C: Sendable, T, E>(
+  capacity: ChannelCapacity<C>,
+  body: () -[Spawn, Channel<C>, E]> T
+) -[E]> T {
+  let scope = runtime_spawn_scope_new()
+  let state = channel_state_new<C>(channel_capacity_value<C>(capacity))
+  defer runtime_spawn_scope_cleanup(scope)
+  let work = runtime_spawn_work_pack<T, Spawn | Channel<C> | E>(body)
+  let root = runtime_spawn_scope_track(scope, work)
+  if root == 0 { runtime_trap(47, 0) } else { nil }
+  sequential_channel_drive<C, E>(state, scope)
+  runtime_spawn_work_take<T>(runtime_spawn_task_join(root))
+}
+
+fn event_loop_drive<C: Sendable, E>(
+  channel: ChannelState<C>,
   scope: i64,
   registrations: Vector<EventLoopRegistration>
 ) -[EventLoopPoll, E]> i64 {
@@ -198,7 +348,7 @@ fn event_loop_drive<E>(
     let task = runtime_spawn_scope_next_runnable(scope)
     if task != 0 {
       if runtime_spawn_task_state(task) == runtime_spawn_task_pending() {
-        result = event_loop_run_task<E>(scope, task, registrations)
+        result = event_loop_run_task<C, E>(channel, scope, task, registrations)
       } else {
         let resume_value = runtime_spawn_task_begin_resume(task)
         let cell = continuation_cell_from_ptr(runtime_spawn_task_continuation_cell(task))
@@ -209,7 +359,7 @@ fn event_loop_drive<E>(
       let delay = runtime_spawn_scope_next_sleep_millis(scope, now)
       if vector_len<EventLoopRegistration>(registrations) > 0 {
         let deadline = if delay < 0 { NetPollForever }
-          else { if delay == 0 { NetPollImmediate }
+        else { if delay == 0 { NetPollImmediate }
           else { NetPollForMillis(__i64_to_usize(delay)) } }
         match EventLoopPoll.wait(deadline) {
           Ok(wait) -> match wait {
@@ -245,7 +395,8 @@ fn event_loop_drive<E>(
   result
 }
 
-fn event_loop_run_task<E>(
+fn event_loop_run_task<C: Sendable, E>(
+  channel: ChannelState<C>,
   scope: i64,
   task: i64,
   registrations: Vector<EventLoopRegistration>
@@ -253,93 +404,99 @@ fn event_loop_run_task<E>(
   let result = handle {
     handle {
       handle {
-        handle runtime_spawn_task_run<Spawn | Time | TcpReadiness | E>(task) {
-          Spawn.submit(work) -> {
-            let child = runtime_spawn_scope_track(scope, work)
-            if child == 0 { runtime_trap(47, 0) } else { nil }
-            resume(EventLoopSuspend.suspend(task, 0, child))
-          }
-          Spawn.join(target) -> {
-            if runtime_spawn_task_state(target) == runtime_spawn_task_complete() {
-              resume(runtime_spawn_task_join(target))
-            } else {
-              resume(EventLoopSuspend.suspend(task, 1, target))
+        handle {
+          handle runtime_spawn_task_run<Spawn | Time | TcpReadiness | Channel<C> | E>(task) {
+            Spawn.submit(work) -> {
+              let child = runtime_spawn_scope_track(scope, work)
+              if child == 0 { runtime_trap(47, 0) } else { nil }
+              resume(EventLoopSuspend.suspend(task, 0, child))
             }
+            Spawn.join(target) -> {
+              if runtime_spawn_task_state(target) == runtime_spawn_task_complete() {
+                resume(runtime_spawn_task_join(target))
+              } else {
+                resume(EventLoopSuspend.suspend(task, 1, target))
+              }
+            }
+          }
+        } {
+          Time.now_millis() -> resume(runtime_platform_now_millis())
+          Time.now_nanos() -> resume(runtime_platform_now_nanos())
+          Time.sleep_millis(ms) -> {
+            if ms < 0 {
+              resume(0 - 1)
+            } else { if ms == 0 {
+                resume(0)
+              } else {
+                let now = runtime_platform_now_nanos()
+                if now < 0 or ms > 9223372036854 or now > 9223372036854775807 - ms * 1000000 {
+                  resume(0 - 1)
+                } else {
+                  resume(EventLoopSuspend.suspend(task, 2, now + ms * 1000000))
+                }
+              } }
           }
         }
       } {
-        Time.now_millis() -> resume(runtime_platform_now_millis())
-        Time.now_nanos() -> resume(runtime_platform_now_nanos())
-        Time.sleep_millis(ms) -> {
-          if ms < 0 {
-            resume(0 - 1)
-          } else { if ms == 0 {
-            resume(0)
-          } else {
-            let now = runtime_platform_now_nanos()
-            if now < 0 or ms > 9223372036854 or now > 9223372036854775807 - ms * 1000000 {
-              resume(0 - 1)
-            } else {
-              resume(EventLoopSuspend.suspend(task, 2, now + ms * 1000000))
+        TcpReadiness.readable(stream) -> {
+          match EventLoopPoll.register_stream(stream, NetPollReadable) {
+            Err(error) -> resume(TcpStreamReadinessFailed(stream, event_loop_readiness_error(event_loop_poll_error_status(error))))
+            Ok(registration) -> {
+              if event_loop_track_registration(registrations, task, registration) != 1 {
+                let cancelled = EventLoopPoll.cancel(registration)
+                resume(TcpStreamReadinessFailed(stream, TcpReadinessResourceExhausted))
+              } else {
+                let status = EventLoopSuspend.suspend(task, 3, 0)
+                if status == 0 {
+                  resume(TcpStreamReady(stream))
+                } else {
+                  resume(TcpStreamReadinessFailed(stream, event_loop_readiness_error(status)))
+                }
+              }
             }
-          } }
+          }
+        }
+        TcpReadiness.writable(stream) -> {
+          match EventLoopPoll.register_stream(stream, NetPollWritable) {
+            Err(error) -> resume(TcpStreamReadinessFailed(stream, event_loop_readiness_error(event_loop_poll_error_status(error))))
+            Ok(registration) -> {
+              if event_loop_track_registration(registrations, task, registration) != 1 {
+                let cancelled = EventLoopPoll.cancel(registration)
+                resume(TcpStreamReadinessFailed(stream, TcpReadinessResourceExhausted))
+              } else {
+                let status = EventLoopSuspend.suspend(task, 3, 0)
+                if status == 0 {
+                  resume(TcpStreamReady(stream))
+                } else {
+                  resume(TcpStreamReadinessFailed(stream, event_loop_readiness_error(status)))
+                }
+              }
+            }
+          }
+        }
+        TcpReadiness.acceptable(listener) -> {
+          match EventLoopPoll.register_listener(listener, NetPollReadable) {
+            Err(error) -> resume(TcpListenerReadinessFailed(listener, event_loop_readiness_error(event_loop_poll_error_status(error))))
+            Ok(registration) -> {
+              if event_loop_track_registration(registrations, task, registration) != 1 {
+                let cancelled = EventLoopPoll.cancel(registration)
+                resume(TcpListenerReadinessFailed(listener, TcpReadinessResourceExhausted))
+              } else {
+                let status = EventLoopSuspend.suspend(task, 3, 0)
+                if status == 0 {
+                  resume(TcpListenerReady(listener))
+                } else {
+                  resume(TcpListenerReadinessFailed(listener, event_loop_readiness_error(status)))
+                }
+              }
+            }
+          }
         }
       }
     } {
-      TcpReadiness.readable(stream) -> {
-        match EventLoopPoll.register_stream(stream, NetPollReadable) {
-          Err(error) -> resume(TcpStreamReadinessFailed(stream, event_loop_readiness_error(event_loop_poll_error_status(error))))
-          Ok(registration) -> {
-            if event_loop_track_registration(registrations, task, registration) != 1 {
-              let cancelled = EventLoopPoll.cancel(registration)
-              resume(TcpStreamReadinessFailed(stream, TcpReadinessResourceExhausted))
-            } else {
-              let status = EventLoopSuspend.suspend(task, 3, 0)
-              if status == 0 {
-                resume(TcpStreamReady(stream))
-              } else {
-                resume(TcpStreamReadinessFailed(stream, event_loop_readiness_error(status)))
-              }
-            }
-          }
-        }
-      }
-      TcpReadiness.writable(stream) -> {
-        match EventLoopPoll.register_stream(stream, NetPollWritable) {
-          Err(error) -> resume(TcpStreamReadinessFailed(stream, event_loop_readiness_error(event_loop_poll_error_status(error))))
-          Ok(registration) -> {
-            if event_loop_track_registration(registrations, task, registration) != 1 {
-              let cancelled = EventLoopPoll.cancel(registration)
-              resume(TcpStreamReadinessFailed(stream, TcpReadinessResourceExhausted))
-            } else {
-              let status = EventLoopSuspend.suspend(task, 3, 0)
-              if status == 0 {
-                resume(TcpStreamReady(stream))
-              } else {
-                resume(TcpStreamReadinessFailed(stream, event_loop_readiness_error(status)))
-              }
-            }
-          }
-        }
-      }
-      TcpReadiness.acceptable(listener) -> {
-        match EventLoopPoll.register_listener(listener, NetPollReadable) {
-          Err(error) -> resume(TcpListenerReadinessFailed(listener, event_loop_readiness_error(event_loop_poll_error_status(error))))
-          Ok(registration) -> {
-            if event_loop_track_registration(registrations, task, registration) != 1 {
-              let cancelled = EventLoopPoll.cancel(registration)
-              resume(TcpListenerReadinessFailed(listener, TcpReadinessResourceExhausted))
-            } else {
-              let status = EventLoopSuspend.suspend(task, 3, 0)
-              if status == 0 {
-                resume(TcpListenerReady(listener))
-              } else {
-                resume(TcpListenerReadinessFailed(listener, event_loop_readiness_error(status)))
-              }
-            }
-          }
-        }
-      }
+      Channel<C>.send(value) -> resume(event_loop_channel_send<C>(channel, scope, task, value))
+      Channel<C>.receive() -> resume(event_loop_channel_receive<C>(channel, scope, task))
+      Channel<C>.close() -> resume(event_loop_channel_close<C>(channel, scope))
     }
   } {
     EventLoopSuspend.suspend(current, mode, value) with k -> {
@@ -351,20 +508,28 @@ fn event_loop_run_task<E>(
           runtime_trap(47, 0)
         } else { 0 }
       } else { if mode == 1 {
-        if runtime_spawn_task_wait_for(task, value) != 1 {
-          runtime_trap(47, 0)
-        } else { 0 }
-      } else { if mode == 2 {
-        if runtime_spawn_task_suspend_sleeping(task, value) != 1 {
-          runtime_trap(47, 0)
-        } else { 0 }
-      } else { if mode == 3 {
-        if runtime_spawn_task_suspend_polling(task) != 1 {
-          runtime_trap(47, 0)
-        } else { 0 }
-      } else {
-        runtime_trap(47, 0)
-      } } } }
+          if runtime_spawn_task_wait_for(task, value) != 1 {
+            runtime_trap(47, 0)
+          } else { 0 }
+        } else { if mode == 2 {
+            if runtime_spawn_task_suspend_sleeping(task, value) != 1 {
+              runtime_trap(47, 0)
+            } else { 0 }
+          } else { if mode == 3 {
+              if runtime_spawn_task_suspend_polling(task) != 1 {
+                runtime_trap(47, 0)
+              } else { 0 }
+            } else { if mode == 4 {
+                if runtime_spawn_task_suspend_channel(task, runtime_spawn_task_channel_sending()) != 1 {
+                  runtime_trap(47, 0)
+                } else { 0 }
+              } else { if mode == 5 {
+                  if runtime_spawn_task_suspend_channel(task, runtime_spawn_task_channel_receiving()) != 1 {
+                    runtime_trap(47, 0)
+                  } else { 0 }
+                } else {
+                  runtime_trap(47, 0)
+                } } } } } }
     }
   }
   runtime_spawn_task_wake_waiter(task)
@@ -373,25 +538,27 @@ fn event_loop_run_task<E>(
 
 --- Run a single-threaded production event loop over stored continuations.
 ---
---- Spawn, Time and TCP readiness keep their ordinary effect signatures.
---- Sleeping and readiness-bound tasks yield their one-shot continuation; the
---- executor blocks in the platform only when no accepted task is runnable,
---- and the structured scope drains every task before returning.
-fn event_loop_execute<T, E>(
-  body: () -[Spawn, Time, TcpReadiness, E]> T,
+--- Spawn, Time, TCP readiness and bounded channels keep their ordinary effect
+--- signatures. Waiting tasks yield their one-shot continuation; the executor
+--- blocks in the platform only when no accepted task is runnable, and the
+--- structured scope drains every task before returning.
+fn event_loop_execute<C: Sendable, T, E>(
+  channel: ChannelState<C>,
+  body: () -[Spawn, Time, TcpReadiness, Channel<C>, E]> T,
   scope: i64,
   registrations: Vector<EventLoopRegistration>
 ) -[EventLoopPoll, E]> T {
-  let work = runtime_spawn_work_pack<T, Spawn | Time | TcpReadiness | E>(body)
+  let work = runtime_spawn_work_pack<T, Spawn | Time | TcpReadiness | Channel<C> | E>(body)
   let root = runtime_spawn_scope_track(scope, work)
   if root == 0 { runtime_trap(47, 0) } else { nil }
-  event_loop_drive<E>(scope, registrations)
+  event_loop_drive<C, E>(channel, scope, registrations)
   runtime_spawn_work_take<T>(runtime_spawn_task_join(root))
 }
 
-fn event_loop_with_poller<T, E>(
+fn event_loop_with_poller<C: Sendable, T, E>(
   poller: borrow mut NetPoller,
-  body: () -[Spawn, Time, TcpReadiness, E]> T
+  channel: ChannelState<C>,
+  body: () -[Spawn, Time, TcpReadiness, Channel<C>, E]> T
 ) -[E]> T {
   let scope = runtime_spawn_scope_new()
   let registrations = vector_with_capacity<EventLoopRegistration>(8)
@@ -401,7 +568,7 @@ fn event_loop_with_poller<T, E>(
   -- cleanup therefore both remains handled and precedes continuation/resource
   -- drops by the LIFO ordering above.
   defer event_loop_cancel_registrations(poller, registrations)
-  handle event_loop_execute<T, E>(body, scope, registrations) {
+  handle event_loop_execute<C, T, E>(channel, body, scope, registrations) {
     EventLoopPoll.register_stream(stream, interest) -> {
       match net_poller_adopt_stream(poller, stream) {
         Err(error) -> resume(result_err<NetPollRegistration, NetPollError>(error))
@@ -419,14 +586,38 @@ fn event_loop_with_poller<T, E>(
   }
 }
 
+--- Run a single-threaded production event loop over stored continuations.
+---
+--- Timer and TCP-readiness waits suspend without blocking runnable tasks. The
+--- structured scope drains every accepted task before returning.
 pub fn with_event_loop<T, E>(
   body: () -[Spawn, Time, TcpReadiness, E]> T
 ) -[E]> T {
+  let channel = channel_state_disabled<EventLoopNoChannel>()
   match net_poller_open() {
     Err(error) -> runtime_trap(47, 0)
     Ok(opened) -> {
       let mut poller: owned NetPoller = opened
-      event_loop_with_poller<T, E>(poller, body)
+      event_loop_with_poller<EventLoopNoChannel, T, E>(poller, channel, body)
+    }
+  }
+}
+
+--- Run one bounded channel inside the production timer/readiness event loop.
+---
+--- The body uses the same `Channel<C>` operations as
+--- `with_sequential_channel`; handler choice does not change its task or
+--- publication signatures.
+pub fn with_event_loop_channel<C: Sendable, T, E>(
+  capacity: ChannelCapacity<C>,
+  body: () -[Spawn, Time, TcpReadiness, Channel<C>, E]> T
+) -[E]> T {
+  let channel = channel_state_new<C>(channel_capacity_value<C>(capacity))
+  match net_poller_open() {
+    Err(error) -> runtime_trap(47, 0)
+    Ok(opened) -> {
+      let mut poller: owned NetPoller = opened
+      event_loop_with_poller<C, T, E>(poller, channel, body)
     }
   }
 }

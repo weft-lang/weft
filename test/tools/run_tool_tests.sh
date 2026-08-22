@@ -463,7 +463,8 @@ stdlib_doc_modules=(
   stdlib/semantic_type.weft stdlib/semantic_type_render.weft
   stdlib/f64_table.weft stdlib/num.weft stdlib/io_helpers.weft
   stdlib/utf8.weft stdlib/string.weft
-  stdlib/io.weft stdlib/par.weft
+  stdlib/io.weft stdlib/par.weft stdlib/cancellation.weft
+  stdlib/channel.weft stdlib/spawn.weft
 )
 for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   stdlib_doc_name=${stdlib_doc_module#stdlib/}
@@ -501,6 +502,15 @@ assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public AP
     assert_contains "doc_stdlib_tcp_connect_preserves_owned_authority_fact" "$(<"$tmp_out")" "pub fn tcp_connect(address: SocketAddress, options: TcpConnectOptions) -[TcpConnect]> Result<owned TcpStream, TcpError>"
     assert_contains "doc_stdlib_tcp_connect_policy_preserves_authority_fact" "$(<"$tmp_out")" "pub fn tcp_connect_with_policy<T, E>(policy: TcpConnectPolicy, body: () -[TcpConnect, E]> T) -[TcpConnect, E]> T"
     assert_contains "doc_stdlib_tcp_listen_policy_preserves_authority_fact" "$(<"$tmp_out")" "pub fn tcp_listen_with_policy<T, E>(policy: TcpListenPolicy, body: () -[TcpListen, E]> T) -[TcpListen, E]> T"
+  elif [ "$stdlib_doc_name" = "channel" ]; then
+    assert_contains "doc_stdlib_channel_pins_public_surface" "$(<"$tmp_out")" "Public API items: 21. Documented: 21."
+    assert_contains "doc_stdlib_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"
+    assert_contains "doc_stdlib_channel_pins_bounded_send" "$(<"$tmp_out")" "pub fn channel_send<T: Sendable>(value: T) -[Channel<T>]> ChannelSend<T>"
+  elif [ "$stdlib_doc_name" = "spawn" ]; then
+    assert_contains "doc_stdlib_spawn_pins_public_surface" "$(<"$tmp_out")" "Public API items: 11. Documented: 11."
+    assert_contains "doc_stdlib_spawn_pins_channel_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel<C: Sendable, T, E>(capacity: ChannelCapacity<C>, body: () -[Spawn, Time, TcpReadiness, Channel<C>, E]> T) -[E]> T"
+  elif [ "$stdlib_doc_name" = "cancellation" ]; then
+    assert_contains "doc_stdlib_cancellation_pins_public_surface" "$(<"$tmp_out")" "Public API items: 19. Documented: 19."
   elif [ "$stdlib_doc_name" = "io" ] || [ "$stdlib_doc_name" = "par" ]; then
     assert_contains "doc_stdlib_${stdlib_doc_name}_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
   fi
@@ -3523,4 +3533,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 978 passed, 0 failed"
+echo "Tool boundary summary: 993 passed, 0 failed"

@@ -1,0 +1,162 @@
+-- stdlib/channel.weft -- bounded effectful channels with exact close outcomes
+
+use stdlib/num.{num_int_cast_value_or, num_u64_to_i64_checked, num_usize_to_u64}
+use stdlib/option.{None, Option, Some}
+use stdlib/result.{Result, result_err, result_ok}
+use stdlib/vector.{vector_get_option, vector_len, vector_push, vector_remove_at, vector_set, vector_with_capacity}
+use stdlib/vector_type.{Vector}
+
+--- A validated nonzero bound for one channel's buffered values.
+pub type ChannelCapacity<T: Sendable> = opaque usize
+
+--- A typed failure to construct a bounded channel capacity.
+pub type ChannelCapacityError {
+  --- Zero cannot provide a buffered backpressure boundary.
+  ChannelCapacityZero,
+    --- The requested platform-sized count cannot fit the runtime index domain.
+    ChannelCapacityTooLarge
+}
+
+--- The exact result of publishing one value.
+pub type ChannelSend<T: Sendable> {
+  --- The channel accepted the value.
+  ChannelSendAccepted,
+    --- The channel was closed and returns the unconsumed value to its owner.
+    ChannelSendClosed(T)
+}
+
+--- The exact result of receiving from a channel.
+pub type ChannelReceive<T: Sendable> {
+  --- One buffered value was received.
+  ChannelReceived(T),
+    --- The channel is closed and every accepted value has been drained.
+    ChannelDrained
+}
+
+--- The exact result of closing a channel.
+pub type ChannelClose {
+  --- This operation performed the first close transition.
+  ChannelClosedNow,
+    --- The channel had already been closed.
+    ChannelAlreadyClosed
+}
+
+--- One scoped bounded publication capability for `T`.
+---
+--- Distinct element types are distinct effect atoms. Nested handlers provide
+--- distinct nearest scopes for the same atom; no first-class channel handle
+--- can escape its owning handler.
+pub effect Channel<T: Sendable> {
+  --- Publish one value or return it when the scope is closed.
+  fn send(value: T) -> ChannelSend<T>
+    --- Receive one accepted value or report a closed, drained scope.
+    fn receive() -> ChannelReceive<T>
+    --- Close the scope idempotently and wake every suspended operation.
+    fn close() -> ChannelClose
+}
+
+--- Validate a nonzero bounded channel capacity.
+pub fn channel_capacity<T: Sendable>(value: usize) -> Result<ChannelCapacity<T>, ChannelCapacityError> {
+  let raw = num_int_cast_value_or<i64>(num_u64_to_i64_checked(num_usize_to_u64(value)), 0 - 1)
+  if raw < 0 { result_err<ChannelCapacity<T>, ChannelCapacityError>(ChannelCapacityTooLarge) }
+  else { if raw == 0 { result_err<ChannelCapacity<T>, ChannelCapacityError>(ChannelCapacityZero) }
+    else { result_ok<ChannelCapacity<T>, ChannelCapacityError>(ChannelCapacity<T>(value)) } }
+}
+
+--- Publish `value`, suspending while the bounded buffer is full.
+pub fn channel_send<T: Sendable>(value: T) -[Channel<T>]> ChannelSend<T> {
+  Channel<T>.send(value)
+}
+
+--- Receive one value, suspending while an open channel is empty.
+pub fn channel_receive<T: Sendable>() -[Channel<T>]> ChannelReceive<T> {
+  Channel<T>.receive()
+}
+
+--- Close the nearest channel scope idempotently.
+pub fn channel_close<T: Sendable>() -[Channel<T>]> ChannelClose {
+  Channel<T>.close()
+}
+
+-- The handler-owned state contains the fixed buffer and a one-word close
+-- slot. Waiters live in structured task records, never in an unbounded side
+-- queue. The buffer cannot grow because offers are admitted only below the
+-- validated capacity.
+pub (package) type ChannelState<T: Sendable> {
+  ChannelStateDisabled,
+    ChannelState(i64, Vector<T>, Vector<i64>)
+}
+
+pub (package) fn channel_capacity_value<T: Sendable>(capacity: ChannelCapacity<T>) -> i64 {
+  match capacity {
+    ChannelCapacity(value) -> num_int_cast_value_or<i64>(
+      num_u64_to_i64_checked(num_usize_to_u64(value)),
+      0
+    )
+  }
+}
+
+pub (package) fn channel_state_new<T: Sendable>(capacity: i64) -> ChannelState<T> {
+  let values = vector_with_capacity<T>(capacity)
+  let closed = vector_with_capacity<i64>(1)
+  vector_push<i64>(closed, 0)
+  ChannelState<T>(capacity, values, closed)
+}
+
+pub (package) fn channel_state_disabled<T: Sendable>() -> ChannelState<T> {
+  ChannelStateDisabled<T>()
+}
+
+pub (package) fn channel_state_is_closed<T: Sendable>(state: ChannelState<T>) -> bool {
+  match state {
+    ChannelStateDisabled -> true
+    ChannelState(capacity, values, closed) -> match vector_get_option<i64>(closed, 0) {
+      Some(value) -> value != 0
+      None -> true
+    }
+  }
+}
+
+pub (package) fn channel_state_is_full<T: Sendable>(state: ChannelState<T>) -> bool {
+  match state {
+    ChannelStateDisabled -> true
+    ChannelState(capacity, values, closed) -> vector_len<T>(values) >= capacity
+  }
+}
+
+pub (package) fn channel_state_is_empty<T: Sendable>(state: ChannelState<T>) -> bool {
+  match state {
+    ChannelStateDisabled -> true
+    ChannelState(capacity, values, closed) -> vector_len<T>(values) == 0
+  }
+}
+
+pub (package) fn channel_state_offer<T: Sendable>(state: ChannelState<T>, value: T) -> i64 {
+  match state {
+    ChannelStateDisabled -> 0
+    ChannelState(capacity, values, closed) -> {
+      if channel_state_is_closed<T>(state) or vector_len<T>(values) >= capacity { 0 }
+      else { vector_push<T>(values, value) }
+    }
+  }
+}
+
+pub (package) fn channel_state_take<T: Sendable>(state: ChannelState<T>) -> Option<T> {
+  match state {
+    ChannelStateDisabled -> None<T>()
+    ChannelState(capacity, values, closed) -> vector_remove_at<T>(values, 0)
+  }
+}
+
+pub (package) fn channel_state_close<T: Sendable>(state: ChannelState<T>) -> ChannelClose {
+  match state {
+    ChannelStateDisabled -> ChannelAlreadyClosed
+    ChannelState(capacity, values, closed) -> {
+      if channel_state_is_closed<T>(state) { ChannelAlreadyClosed }
+      else {
+        vector_set<i64>(closed, 0, 1)
+        ChannelClosedNow
+      }
+    }
+  }
+}
