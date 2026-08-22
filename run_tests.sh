@@ -19,13 +19,19 @@ default_test_jobs() {
 WEFT=${WEFT:-./weft}
 WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-120}
 WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-120}
-WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-9000000}
-# Whole-compiler in-process tripwire tests (alloc_checker_metrics and
-# emission_audit_metrics) peak at ~8.4 million KB arena RSS.  Keep a measured
-# margin above that honest fixed baseline while retaining a hard stop far below
-# the 20--94 GB runaway signatures that motivated the guard.
-WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-9000000}
+# This is a per-process runaway-regression stop, not a memory scheduler or a
+# worker-count throttle. Whole-compiler test workers inherit a large
+# copy-on-write project image and legitimately report up to ~8.65 million KiB
+# max RSS; that figure cannot be summed across the fork tree without double
+# counting shared pages. The repaired structural-layout leak crossed 47 GiB
+# in one worker and left abandoned trees above 94 GiB. Keep generous headroom
+# above the bounded baseline while still terminating that failure mode live.
+WEFT_TEST_RUNAWAY_RSS_LIMIT_KB=${WEFT_TEST_RUNAWAY_RSS_LIMIT_KB:-16000000}
+WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB}
+WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB}
 WEFT_TEST_SHOW_TIMINGS=${WEFT_TEST_SHOW_TIMINGS:-1}
+# Parallelism remains CPU-selected unless the caller explicitly chooses a
+# width. The runaway stop observes workers; it never admits or delays them.
 WEFT_TEST_JOBS=${WEFT_TEST_JOBS:-$(default_test_jobs)}
 PASS=0
 FAIL=0
@@ -38,6 +44,7 @@ RUNTIME_RUN_SECONDS=0
 export WEFT
 export WEFT_TEST_COMPILE_TIMEOUT
 export WEFT_TEST_RUN_TIMEOUT
+export WEFT_TEST_RUNAWAY_RSS_LIMIT_KB
 export WEFT_TEST_COMPILE_RSS_LIMIT_KB
 export WEFT_TEST_RUN_RSS_LIMIT_KB
 export WEFT_TEST_SHOW_TIMINGS
@@ -138,7 +145,7 @@ terminate_process_tree() {
   wait "$root_pid" 2>/dev/null || true
 }
 
-run_tree_rss_guarded() {
+run_tree_process_rss_guarded() {
   local rss_limit_kb="$1"
   shift
 
@@ -179,7 +186,7 @@ run_tree_rss_guarded() {
       }
     ')
     if [ -n "$offender" ]; then
-      echo "planner process tree RSS limit exceeded: pid ${offender%% *} used ${offender##* } KB (limit ${rss_limit_kb} KB)" >&2
+      echo "planner runaway RSS stop: pid ${offender%% *} used ${offender##* } KB (per-process limit ${rss_limit_kb} KB)" >&2
       terminate_process_tree "$pid"
       trap - INT TERM
       return 125
@@ -198,8 +205,9 @@ run_tree_rss_guarded() {
 echo "=== Weft Test Suite ==="
 echo "runtime compile timeout: ${WEFT_TEST_COMPILE_TIMEOUT}s"
 echo "runtime run timeout: ${WEFT_TEST_RUN_TIMEOUT}s"
-echo "runtime compile RSS limit: ${WEFT_TEST_COMPILE_RSS_LIMIT_KB} KB"
-echo "runtime run RSS limit: ${WEFT_TEST_RUN_RSS_LIMIT_KB} KB"
+echo "runtime per-worker compile RSS result limit: ${WEFT_TEST_COMPILE_RSS_LIMIT_KB} KB"
+echo "runtime per-worker run RSS result limit: ${WEFT_TEST_RUN_RSS_LIMIT_KB} KB"
+echo "live per-process runaway RSS stop: ${WEFT_TEST_RUNAWAY_RSS_LIMIT_KB} KB"
 echo "runtime jobs: ${WEFT_TEST_JOBS}"
 echo ""
 
@@ -230,11 +238,7 @@ done
 runtime_count=${#RUNTIME_TEST_FILES[@]}
 if [ "$runtime_count" -gt 0 ]; then
   planner_exit=0
-  planner_rss_limit_kb="$WEFT_TEST_COMPILE_RSS_LIMIT_KB"
-  if [ "$WEFT_TEST_RUN_RSS_LIMIT_KB" -gt "$planner_rss_limit_kb" ]; then
-    planner_rss_limit_kb="$WEFT_TEST_RUN_RSS_LIMIT_KB"
-  fi
-  run_tree_rss_guarded "$planner_rss_limit_kb" env WEFT_TEST_METRICS=1 "$WEFT" test --jobs "$WEFT_TEST_JOBS" "${RUNTIME_TEST_FILES[@]}" > "$PLANNER_OUT" 2> "$PLANNER_ERR" || planner_exit=$?
+  run_tree_process_rss_guarded "$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB" env WEFT_TEST_METRICS=1 "$WEFT" test --jobs "$WEFT_TEST_JOBS" "${RUNTIME_TEST_FILES[@]}" > "$PLANNER_OUT" 2> "$PLANNER_ERR" || planner_exit=$?
   planner_failures=0
   for f in "${RUNTIME_TEST_FILES[@]}"; do
     pass_report=$(grep -F "  pass: $f (" "$PLANNER_ERR" | tail -1 || true)
