@@ -3601,19 +3601,20 @@ pub(package) fn pipeline_ir_slot_load_lane_insts(dst: i64, slot: i64, lane: i64,
   }
 }
 
--- A flattened mutable aggregate is represented by several ordinary slot
--- lanes, but its abort obligation is one stable cleanup record. Loads retain
--- the slot provenance as a semantic fact; rebinding commits a newly evaluated
--- value only after its lanes have been stored. Managed/named aggregates keep
--- their existing runtime-identity path and emit neither marker.
+-- A mutable linear binding owns the value currently stored in its slot.
+-- Loads retain the slot provenance as a semantic fact; rebinding commits a
+-- newly evaluated value only after its lanes have been stored. One marker
+-- vocabulary covers scalar owned resources, flattened aggregates, and
+-- pointer-backed named aggregates so abort cleanup consumes the same fact as
+-- ordinary cleanup instead of rediscovering ownership from runtime identity.
 pub(package) fn pipeline_ir_structural_slot_alias_insts(value: i64, slot: i64, plan: i64) -> IrInstList {
-  if plan != 0 and pipeline_structural_drop_plan_storage_mode(plan) == 2 {
+  if plan != 0 {
     ir_inst_list_prepend(ir_inst_structural_slot_alias_i64(value, slot, plan), ir_inst_list_empty())
   } else { ir_inst_list_empty() }
 }
 
 pub(package) fn pipeline_ir_structural_slot_rebind_insts(value: i64, slot: i64, plan: i64) -> IrInstList {
-  if plan != 0 and pipeline_structural_drop_plan_storage_mode(plan) == 2 {
+  if plan != 0 {
     ir_inst_list_prepend(ir_inst_structural_slot_rebind_i64(value, slot, plan), ir_inst_list_empty())
   } else { ir_inst_list_empty() }
 }
@@ -15313,6 +15314,19 @@ pub(package) fn pipeline_owned_slot_cleanup_inst_list(slot: i64, type_hash: i64,
   )
 }
 
+pub(package) fn pipeline_owned_slot_cleanup_inst_list_with_plan(slot: i64, plan: i64, next_value: i64) -> IrInstList {
+  ir_inst_list_prepend(
+    ir_inst_load_i64(next_value, slot),
+    ir_inst_list_append(
+      pipeline_ir_structural_slot_alias_insts(next_value, slot, plan),
+      ir_inst_list_prepend(
+        ir_inst_owned_drop_i64(next_value, cg_owned_drop_type_hash(typeck_linear_layout_plan_type(plan))),
+        ir_inst_list_empty()
+      )
+    )
+  )
+}
+
 pub(package) fn pipeline_slot_cleanup_inst_list(slot: i64, ty: i64, next_value: i64) -> IrInstList {
   let owned_type_hash = cg_owned_drop_type_hash(ty)
   if owned_type_hash != 0 { pipeline_owned_slot_cleanup_inst_list(slot, owned_type_hash, next_value) }
@@ -15336,19 +15350,18 @@ pub(package) fn pipeline_structural_slot_cleanup_inst_list(slot: i64, plan: i64,
 }
 
 pub(package) fn pipeline_slot_cleanup_inst_list_with_plan(slot: i64, ty: i64, plan: i64, next_value: i64) -> IrInstList {
-  if plan != 0 and typeck_linear_layout_plan_kind(plan) != 1 {
+  if plan != 0 and typeck_linear_layout_plan_kind(plan) == 1 {
+    pipeline_owned_slot_cleanup_inst_list_with_plan(slot, plan, next_value)
+  } else { if plan != 0 {
     pipeline_structural_slot_cleanup_inst_list(slot, plan, next_value)
-  } else {
-    pipeline_slot_cleanup_inst_list(slot, ty, next_value)
-  }
+  } else { pipeline_slot_cleanup_inst_list(slot, ty, next_value) } }
 }
 
 pub(package) fn pipeline_slot_cleanup_inst_count_with_plan(ty: i64, plan: i64) -> i64 {
-  if plan != 0 and typeck_linear_layout_plan_kind(plan) != 1 {
+  if plan != 0 and typeck_linear_layout_plan_kind(plan) == 1 { 3 }
+  else { if plan != 0 {
     pipeline_structural_drop_plan_use_words(plan) + (if pipeline_structural_drop_plan_storage_mode(plan) == 2 { 2 } else { 1 })
-  } else {
-    pipeline_slot_cleanup_inst_count(ty)
-  }
+  } else { pipeline_slot_cleanup_inst_count(ty) } }
 }
 
 pub(package) fn pipeline_managed_slot_cleanup_lane_inst_list(slot: i64, ty: i64, lane: i64, next_value: i64) -> IrInstList {
@@ -27623,9 +27636,14 @@ pub(package) fn pipeline_ir_abort_cleanup_direct_kind() -> i64 { 1 }
 pub(package) fn pipeline_ir_abort_cleanup_owned_kind() -> i64 { 2 }
 pub(package) fn pipeline_ir_abort_cleanup_array_kind() -> i64 { 3 }
 pub(package) fn pipeline_ir_abort_cleanup_structural_kind() -> i64 { 4 }
--- Alias facts do not own records. They map an SSA loaded from a flattened
--- mutable slot back to that slot's canonical structural record index.
+-- Alias facts do not own records. They map an SSA loaded from a mutable
+-- linear slot back to that slot's canonical cleanup-record index.
 pub(package) fn pipeline_ir_abort_cleanup_slot_alias_kind() -> i64 { 5 }
+-- A control-flow alias maps a merge SSA to every exact acquisition record
+-- that can reach it. Only one predecessor is live at runtime; emission tries
+-- the finite typed alternatives by record address and never matches resource
+-- representation bits.
+pub(package) fn pipeline_ir_abort_cleanup_flow_alias_kind() -> i64 { 6 }
 
 pub(package) fn pipeline_ir_structural_drop_register_plan(plan: i64, fm: i64) -> i64 {
   if plan != 0 and typeck_linear_layout_plan_kind(plan) != 1 {
@@ -27804,6 +27822,38 @@ pub(package) fn pipeline_ir_abort_cleanup_blocks_rebind_structural_slot(blocks: 
   }
 }
 
+pub(package) fn pipeline_ir_abort_cleanup_inst_list_has_linear_slot_alias(insts: IrInstList, value: i64, action: i64, kind: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let found = match inst {
+        IrStructuralSlotI64(alias_value, slot, plan, mode) -> {
+          let plan_kind = typeck_linear_layout_plan_kind(plan)
+          let alias_kind = if plan_kind == 1 { pipeline_ir_abort_cleanup_owned_kind() } else { pipeline_ir_abort_cleanup_structural_kind() }
+          let alias_action = if plan_kind == 1 {
+            cg_owned_drop_type_hash(typeck_linear_layout_plan_type(plan))
+          } else { pipeline_structural_drop_glue_hash(plan) }
+          if mode == 1 and alias_value == value and alias_action == action and alias_kind == kind { 1 } else { 0 }
+        }
+        _ -> 0
+      }
+      if found == 1 { 1 } else { pipeline_ir_abort_cleanup_inst_list_has_linear_slot_alias(rest, value, action, kind) }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_blocks_have_linear_slot_alias(blocks: IrBlockList, value: i64, action: i64, kind: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      let found = match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_abort_cleanup_inst_list_has_linear_slot_alias(insts, value, action, kind)
+      }
+      if found == 1 { 1 } else { pipeline_ir_abort_cleanup_blocks_have_linear_slot_alias(rest, value, action, kind) }
+    }
+  }
+}
+
 pub(package) fn pipeline_ir_abort_cleanup_fact_exists(facts: i64, value: i64, action: i64, kind: i64) -> i64 {
   let mut found = 0
   let n = nlist_len(facts)
@@ -27972,7 +28022,7 @@ pub(package) fn pipeline_ir_abort_cleanup_find_acquisition_value_action_kind(fac
   while i < n and found == 0 {
     let fact = nlist_get(facts, i)
     if node_f1(fact) == value and node_f2(fact) == action and
-      (node_f3(fact) == kind or (kind == pipeline_ir_abort_cleanup_structural_kind() and node_f3(fact) == pipeline_ir_abort_cleanup_slot_alias_kind())) { found = fact }
+      (node_f3(fact) == kind or node_f3(fact) == pipeline_ir_abort_cleanup_slot_alias_kind()) { found = fact }
     else { i = i + 1 }
   }
   found
@@ -28087,7 +28137,9 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst,
       pipeline_structural_drop_plan_storage_mode(structural_plan) == 2 and typeck_linear_layout_plan_words(structural_plan) > 1 { 0 }
     else { pipeline_ir_abort_cleanup_add_acquisition_fact(facts, site, site, structural_action, pipeline_ir_abort_cleanup_structural_kind()) }
   } else { if owned != 0 {
-    if pipeline_ir_abort_cleanup_blocks_have_owned_bind(all_blocks, site, node_f2(owned)) == 0 {
+    if (pipeline_ir_abort_cleanup_blocks_have_owned_bind(all_blocks, site, node_f2(owned)) == 0 or
+      pipeline_ir_abort_cleanup_blocks_rebind_structural_slot(all_blocks, site) == 1) and
+      pipeline_ir_abort_cleanup_blocks_have_linear_slot_alias(all_blocks, site, node_f2(owned), pipeline_ir_abort_cleanup_owned_kind()) == 0 {
       pipeline_ir_abort_cleanup_add_acquisition_fact(facts, site, site, node_f2(owned), pipeline_ir_abort_cleanup_owned_kind())
     } else { 0 }
   } else {
@@ -28146,7 +28198,8 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst,
         let ret_ty = pipeline_fns_lookup_ret_type_node_by_hash(fns, callee_hash, 0)
         let owned_action = cg_owned_drop_type_hash(ret_ty)
         if owned_action != 0 {
-          if pipeline_ir_abort_cleanup_blocks_have_owned_bind(all_blocks, dst, owned_action) == 0 {
+          if pipeline_ir_abort_cleanup_blocks_have_owned_bind(all_blocks, dst, owned_action) == 0 or
+            pipeline_ir_abort_cleanup_blocks_rebind_structural_slot(all_blocks, dst) == 1 {
             pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, owned_action, pipeline_ir_abort_cleanup_owned_kind())
           } else { 0 }
         } else {
@@ -28163,7 +28216,8 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst,
         let ret_ty = pipeline_ir_abort_cleanup_generic_ret_type(callee_hash, type_args, fns)
         let owned_action = cg_owned_drop_type_hash(ret_ty)
         if owned_action != 0 {
-          if pipeline_ir_abort_cleanup_blocks_have_owned_bind(all_blocks, dst, owned_action) == 0 {
+          if pipeline_ir_abort_cleanup_blocks_have_owned_bind(all_blocks, dst, owned_action) == 0 or
+            pipeline_ir_abort_cleanup_blocks_rebind_structural_slot(all_blocks, dst) == 1 {
             pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, owned_action, pipeline_ir_abort_cleanup_owned_kind())
           } else { 0 }
         } else {
@@ -28211,10 +28265,10 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst,
       -- the replacement record before any language-level operation can abort.
       -- Locals use the same fact, and exact identity prevents a producer plus
       -- its following bind from arming twice.
-      if structural_action != 0 and pipeline_structural_drop_plan_storage_mode(plan) == 2 and pipeline_ir_abort_cleanup_blocks_rebind_structural_slot(all_blocks, value) == 1 {
-        -- Mutable flattened slots acquire through IrStructuralSlotI64 after
-        -- every lane store, not at the lexical bind. That stable record is
-        -- reused by replacement and carries exact provenance for later loads.
+      if (structural_action != 0 or action != 0) and pipeline_ir_abort_cleanup_blocks_rebind_structural_slot(all_blocks, value) == 1 {
+        -- Mutable linear slots acquire through IrStructuralSlotI64 after every
+        -- lane store, not at the lexical bind. That stable record is reused by
+        -- replacement and carries exact provenance for later loads.
         0
       } else { if structural_action != 0 and pipeline_ir_abort_cleanup_fact_exists(facts, value, structural_action, pipeline_ir_abort_cleanup_structural_kind()) == 0 {
         pipeline_ir_abort_cleanup_add_acquisition_fact(
@@ -28235,7 +28289,15 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst,
       } else { 0 } } }
     }
     IrStructuralSlotI64(value, slot, plan, mode) -> {
-      if mode == 2 and plan != 0 and pipeline_structural_drop_plan_storage_mode(plan) == 2 {
+      if mode == 2 and plan != 0 and typeck_linear_layout_plan_kind(plan) == 1 {
+        pipeline_ir_abort_cleanup_add_acquisition_fact(
+          facts,
+          pipeline_ir_abort_cleanup_structural_slot_site(slot),
+          slot,
+          cg_owned_drop_type_hash(typeck_linear_layout_plan_type(plan)),
+          pipeline_ir_abort_cleanup_owned_kind()
+        )
+      } else { if mode == 2 and plan != 0 {
         pipeline_ir_abort_cleanup_add_acquisition_fact(
           facts,
           pipeline_ir_abort_cleanup_structural_slot_site(slot),
@@ -28243,7 +28305,7 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst,
           pipeline_structural_drop_glue_hash(plan),
           pipeline_ir_abort_cleanup_structural_kind()
         )
-      } else { 0 }
+      } else { 0 } }
     }
     _ -> 0
   }
@@ -28300,9 +28362,13 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_acquisition_blocks(blocks: IrB
 }
 
 pub(package) fn pipeline_ir_abort_cleanup_add_slot_alias_fact(facts: i64, value: i64, slot: i64, plan: i64) -> i64 {
-  let action = pipeline_structural_drop_glue_hash(plan)
+  let plan_kind = typeck_linear_layout_plan_kind(plan)
+  let owning_kind = if plan_kind == 1 { pipeline_ir_abort_cleanup_owned_kind() } else { pipeline_ir_abort_cleanup_structural_kind() }
+  let action = if plan_kind == 1 {
+    cg_owned_drop_type_hash(typeck_linear_layout_plan_type(plan))
+  } else { pipeline_structural_drop_glue_hash(plan) }
   let canonical = pipeline_ir_abort_cleanup_find_acquisition_value_action_kind(
-    facts, slot, action, pipeline_ir_abort_cleanup_structural_kind()
+    facts, slot, action, owning_kind
   )
   if canonical == 0 or pipeline_ir_abort_cleanup_fact_exists(facts, value, action, pipeline_ir_abort_cleanup_slot_alias_kind()) == 1 { 0 }
   else {
@@ -28340,12 +28406,181 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_slot_alias_blocks(blocks: IrBl
   }
 }
 
+pub(package) fn pipeline_ir_abort_cleanup_value_list_index(values: IrValueList, wanted: i64, index: i64) -> i64 {
+  match values {
+    IrValueNil -> 0 - 1
+    IrValueCons(value, rest) -> {
+      if value == wanted { index }
+      else { pipeline_ir_abort_cleanup_value_list_index(rest, wanted, index + 1) }
+    }
+  }
+}
+
+-- Return a private pair [block id, parameter index] for one SSA block
+-- parameter. SSA ids are unique within a function, so at most one block can
+-- own the requested parameter.
+pub(package) fn pipeline_ir_abort_cleanup_block_param_location(blocks: IrBlockList, wanted: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> match block {
+      IrBlock(id, params, insts, term) -> {
+        let index = pipeline_ir_abort_cleanup_value_list_index(params, wanted, 0)
+        if index >= 0 { node_new(0, id, index, 0, 0) }
+        else { pipeline_ir_abort_cleanup_block_param_location(rest, wanted) }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_flow_alias_exists(facts: i64, value: i64, action: i64, source_index: i64) -> i64 {
+  let mut found = 0
+  let mut i = 0
+  while i < nlist_len(facts) and found == 0 {
+    let fact = nlist_get(facts, i)
+    if node_f1(fact) == value and node_f2(fact) == action and
+      node_f3(fact) == pipeline_ir_abort_cleanup_flow_alias_kind() and
+      node_f4(fact) == source_index { found = 1 }
+    else { i = i + 1 }
+  }
+  found
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_add_flow_alias(facts: i64, value: i64, action: i64, source_index: i64) -> i64 {
+  if source_index < 0 or pipeline_ir_abort_cleanup_flow_alias_exists(facts, value, action, source_index) == 1 { 0 }
+  else {
+    nlist_add(facts, node_new(0 - 1, value, action, pipeline_ir_abort_cleanup_flow_alias_kind(), source_index))
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_collect_value_sources_from_facts(facts: i64, value: i64, action: i64, kind: i64, alias_value: i64, index: i64) -> i64 {
+  if index >= nlist_len(facts) { 0 }
+  else {
+    let fact = nlist_get(facts, index)
+    if node_f1(fact) == value and node_f2(fact) == action and
+      (node_f3(fact) == kind or node_f3(fact) == pipeline_ir_abort_cleanup_slot_alias_kind()) {
+      pipeline_ir_abort_cleanup_add_flow_alias(facts, alias_value, action, node_f4(fact))
+    } else { 0 }
+    pipeline_ir_abort_cleanup_collect_value_sources_from_facts(facts, value, action, kind, alias_value, index + 1)
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_collect_value_sources_from_predecessors(blocks: IrBlockList, all_blocks: IrBlockList, facts: i64, target_block: i64, param_index: i64, action: i64, kind: i64, alias_value: i64, visited: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> match term {
+          IrTermJump(target, args) -> {
+            if target == target_block {
+              let incoming = pipeline_ir_value_list_get_or(args, param_index, 0 - 1)
+              if incoming >= 0 {
+                pipeline_ir_abort_cleanup_collect_value_sources(all_blocks, facts, incoming, action, kind, alias_value, visited)
+              } else { 0 }
+            } else { 0 }
+          }
+          _ -> 0
+        }
+      }
+      pipeline_ir_abort_cleanup_collect_value_sources_from_predecessors(rest, all_blocks, facts, target_block, param_index, action, kind, alias_value, visited)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_collect_value_sources_from_insts(insts: IrInstList, blocks: IrBlockList, facts: i64, value: i64, action: i64, kind: i64, alias_value: i64, visited: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      match inst {
+        -- Resume is the only scalar identity definition that can transport a
+        -- linear result without acquiring a new obligation of its own.
+        IrResumeI64(dst, source) -> {
+          if dst == value {
+            pipeline_ir_abort_cleanup_collect_value_sources(blocks, facts, source, action, kind, alias_value, visited)
+          } else { 0 }
+        }
+        _ -> 0
+      }
+      pipeline_ir_abort_cleanup_collect_value_sources_from_insts(rest, blocks, facts, value, action, kind, alias_value, visited)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_collect_value_sources_from_blocks(current: IrBlockList, blocks: IrBlockList, facts: i64, value: i64, action: i64, kind: i64, alias_value: i64, visited: i64) -> i64 {
+  match current {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_abort_cleanup_collect_value_sources_from_insts(insts, blocks, facts, value, action, kind, alias_value, visited)
+      }
+      pipeline_ir_abort_cleanup_collect_value_sources_from_blocks(rest, blocks, facts, value, action, kind, alias_value, visited)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_collect_value_sources(blocks: IrBlockList, facts: i64, value: i64, action: i64, kind: i64, alias_value: i64, visited: i64) -> i64 {
+  if value < 0 or pipeline_hash_nlist_contains(visited, value) == 1 { 0 }
+  else {
+    nlist_add(visited, value)
+    pipeline_ir_abort_cleanup_collect_value_sources_from_facts(facts, value, action, kind, alias_value, 0)
+    pipeline_ir_abort_cleanup_collect_value_sources_from_blocks(blocks, blocks, facts, value, action, kind, alias_value, visited)
+    let location = pipeline_ir_abort_cleanup_block_param_location(blocks, value)
+    if location == 0 { 0 }
+    else {
+      pipeline_ir_abort_cleanup_collect_value_sources_from_predecessors(
+        blocks, blocks, facts, node_f1(location), node_f2(location), action, kind, alias_value, visited
+      )
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_collect_rebind_flow_alias(inst: IrInst, blocks: IrBlockList, facts: i64) -> i64 {
+  match inst {
+    IrStructuralSlotI64(value, slot, plan, mode) -> {
+      if mode == 2 and plan != 0 {
+        let plan_kind = typeck_linear_layout_plan_kind(plan)
+        let kind = if plan_kind == 1 { pipeline_ir_abort_cleanup_owned_kind() } else { pipeline_ir_abort_cleanup_structural_kind() }
+        let action = if plan_kind == 1 {
+          cg_owned_drop_type_hash(typeck_linear_layout_plan_type(plan))
+        } else { pipeline_structural_drop_glue_hash(plan) }
+        let direct = pipeline_ir_abort_cleanup_find_acquisition_value_action_kind(facts, value, action, kind)
+        if direct == 0 {
+          pipeline_ir_abort_cleanup_collect_value_sources(blocks, facts, value, action, kind, value, nlist_new())
+        } else { 0 }
+      } else { 0 }
+    }
+    _ -> 0
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_collect_rebind_flow_alias_insts(insts: IrInstList, blocks: IrBlockList, facts: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      pipeline_ir_abort_cleanup_collect_rebind_flow_alias(inst, blocks, facts)
+      pipeline_ir_abort_cleanup_collect_rebind_flow_alias_insts(rest, blocks, facts)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_collect_rebind_flow_alias_blocks(blocks: IrBlockList, all_blocks: IrBlockList, facts: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> {
+      match block {
+        IrBlock(id, params, insts, term) -> pipeline_ir_abort_cleanup_collect_rebind_flow_alias_insts(insts, all_blocks, facts)
+      }
+      pipeline_ir_abort_cleanup_collect_rebind_flow_alias_blocks(rest, all_blocks, facts)
+    }
+  }
+}
+
 pub(package) fn pipeline_ir_abort_cleanup_facts_for_blocks(blocks: IrBlockList, fns: i64, tt: i64) -> i64 {
   let actions = nlist_new()
   pipeline_ir_abort_cleanup_collect_blocks(blocks, blocks, actions)
   let facts = nlist_new()
   pipeline_ir_abort_cleanup_collect_acquisition_blocks(blocks, blocks, actions, facts, fns, tt)
   pipeline_ir_abort_cleanup_collect_slot_alias_blocks(blocks, facts)
+  pipeline_ir_abort_cleanup_collect_rebind_flow_alias_blocks(blocks, blocks, facts)
   facts
 }
 
@@ -28534,7 +28769,8 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_register_fact(code: i64, fact: i6
       pipeline_ir_abort_cleanup_shadow_offset(fmap_current_abort_cleanup_base(fm), fmap_current_abort_cleanup_facts(fm), fact, fm)
     )
     bu32(code, cg_str(16, 17, handler_abort_cleanup_record_value_offset()))
-  } else { if node_f3(fact) == pipeline_ir_abort_cleanup_structural_kind() or node_tag(fact) == value {
+  } else { if node_f3(fact) == pipeline_ir_abort_cleanup_structural_kind() or
+    node_f3(fact) == pipeline_ir_abort_cleanup_owned_kind() or node_tag(fact) == value {
     let value_phys = pipeline_ir_native_load_reg(code, pinned, value)
     bu32(code, cg_str(value_phys, 17, handler_abort_cleanup_record_value_offset()))
   } else { 0 } }
@@ -28586,11 +28822,17 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_prepare_site(code: i64, site: i64
 pub(package) fn pipeline_ir_abort_cleanup_emit_advance_active_boundaries(code: i64, target_reg: i64, prev_reg: i64) -> i64 {
   -- Handler frames remember the cleanup-chain head at entry. Splicing that
   -- exact record must advance every active saved boundary as well, or a later
-  -- abort walk searches for a detached node and reaches null.
+  -- abort walk searches for a detached node and reaches null. Deferred
+  -- prompts use 1 as a recording-only sentinel when no abortive handler frame
+  -- exists; it is a guard, not a dereferenceable frame-chain link.
   bu32(code, cg_ldr(16, 28, runtime_state_abort_cleanup_active_offset()))
   let scan = buf_len(code)
   bu32(code, encode_cmp(16, 31))
-  let done = buf_len(code)
+  let done_null = buf_len(code)
+  bu32(code, 0)
+  emit_mov_imm_safe(code, 10, 1)
+  bu32(code, encode_cmp(16, 10))
+  let done_sentinel = buf_len(code)
   bu32(code, 0)
   bu32(code, cg_ldr(10, 16, handler_frame_abort_cleanup_boundary_offset()))
   bu32(code, encode_cmp(10, target_reg))
@@ -28601,7 +28843,9 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_advance_active_boundaries(code: i
   bu32(code, cg_ldr(16, 16, handler_frame_abort_prev_active_offset()))
   let back = buf_len(code)
   bu32(code, encode_b(scan - back))
-  cg_patch_b_cond(code, done, 0, buf_len(code))
+  let done = buf_len(code)
+  cg_patch_b_cond(code, done_null, 0, done)
+  cg_patch_b_cond(code, done_sentinel, 0, done)
 }
 
 pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_fact_with_boundary_advance(code: i64, fact: i64, fm: i64, advance_active: i64) -> i64 {
@@ -28899,17 +29143,38 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_commit_flat_value(code: i64, valu
   } }
 }
 
+pub(package) fn pipeline_ir_abort_cleanup_emit_rebind_flow_aliases_from(code: i64, facts: i64, value: i64, action: i64, index: i64, fm: i64) -> i64 {
+  if facts == 0 or index >= nlist_len(facts) { 0 }
+  else {
+    let fact = nlist_get(facts, index)
+    let matched = if node_f1(fact) == value and node_f2(fact) == action and
+      node_f3(fact) == pipeline_ir_abort_cleanup_flow_alias_kind() {
+      pipeline_ir_abort_cleanup_emit_disarm_transferred_fact(code, fact, fm)
+      1
+    } else { 0 }
+    matched + pipeline_ir_abort_cleanup_emit_rebind_flow_aliases_from(code, facts, value, action, index + 1, fm)
+  }
+}
+
 pub(package) fn pipeline_ir_abort_cleanup_emit_rebind_structural_slot(code: i64, value: i64, slot: i64, plan: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
-  let action = pipeline_structural_drop_glue_hash(plan)
+  let plan_kind = typeck_linear_layout_plan_kind(plan)
+  let owning_kind = if plan_kind == 1 { pipeline_ir_abort_cleanup_owned_kind() } else { pipeline_ir_abort_cleanup_structural_kind() }
+  let action = if plan_kind == 1 {
+    cg_owned_drop_type_hash(typeck_linear_layout_plan_type(plan))
+  } else { pipeline_structural_drop_glue_hash(plan) }
+  let facts = fmap_current_abort_cleanup_facts(fm)
   let source_fact = pipeline_ir_abort_cleanup_find_acquisition_value_action_kind(
-    fmap_current_abort_cleanup_facts(fm), value, action, pipeline_ir_abort_cleanup_structural_kind()
+    facts, value, action, owning_kind
   )
-  -- A call result, parameter, or prior slot load already owns one aggregate
-  -- record. Tuple/anonymous-record literals instead own independent child
-  -- records. Consume exactly the representation which the producer supplied.
+  -- A call result, parameter, or prior slot load already owns one linear
+  -- record. Flattened tuple/anonymous-record literals instead own independent
+  -- child records. Consume exactly the representation the producer supplied.
   if source_fact != 0 {
     pipeline_ir_abort_cleanup_emit_disarm_transferred_fact(code, source_fact, fm)
-  } else {
+  } else { 0 }
+  let flow_aliases = pipeline_ir_abort_cleanup_emit_rebind_flow_aliases_from(code, facts, value, action, 0, fm)
+  if source_fact == 0 and flow_aliases == 0 {
+    if plan_kind != 1 {
     -- Optimisation may independently alias flattened lanes, so `value + n`
     -- is not a reliable identity after the store sequence. The slot lanes are
     -- stable homes containing the exact new runtime words. At this point the
@@ -28917,7 +29182,15 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_rebind_structural_slot(code: i64,
     -- one dynamic child-record splice per owned lane both exact in count and
     -- safe even when distinct resources have identical representations.
     pipeline_ir_abort_cleanup_emit_commit_flat_value(code, slot, plan, fm, pinned)
-  }
+    } else {
+      -- Zero-cost opaque construction and inlined owned identities can reach
+      -- the slot without an earlier acquisition record. The typed rebind is
+      -- then the acquisition point itself. A real producer record, including
+      -- any CFG alternative, is always consumed by the branches above; no
+      -- runtime value-equality fallback is permitted.
+      0
+    }
+  } else { 0 }
   -- The stores precede this fact in IR. Reusing one canonical slot record
   -- gives replacement, normal Drop, call transfer, and abort the same exact
   -- ownership identity even when two resources have identical runtime bits.
@@ -34033,7 +34306,7 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
     }
     IrStructuralSlotI64(value, slot, plan, mode) -> {
       if mode == 1 { 0 }
-      else { if mode == 2 and pipeline_structural_drop_plan_storage_mode(plan) == 2 {
+      else { if mode == 2 and pipeline_structural_drop_plan_is_valid(plan) == 1 {
         pipeline_ir_abort_cleanup_emit_rebind_structural_slot(code, value, slot, plan, fm, pinned)
       } else {
         fmap_inc_emit_error_count(fm)
