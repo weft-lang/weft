@@ -1,0 +1,224 @@
+-- runtime/spawn_task.weft -- reclaimable structured-Spawn task storage
+--
+-- Spawn reuses the compiler-described ParWork result layout, but not Par's
+-- bump-lifetime carrier allocation. Long-running Spawn scopes reclaim joined
+-- carriers immediately and release unobserved/aborted carriers at scope exit.
+
+use runtime/alloc.{heap_alloc_zeroed, heap_free}
+use runtime/memory.{mem_load64_at, mem_store64_at}
+use runtime/panic.{runtime_trap}
+use runtime/par_task.{*}
+use runtime/rc.{closure_env_heap_clone_raw, closure_env_heap_release_raw, rc_default_heap}
+use runtime/unsafe.{*}
+
+-- A SpawnTask is a sealed one-word observation right. The handler owns the
+-- task record; the public unique value only carries its runtime address.
+pub type SpawnTask<T> = opaque i64
+
+pub(package) fn runtime_spawn_task_from_word<T>(word: i64) -> unique SpawnTask<T> {
+  handle unsafe_transmute<i64, unique SpawnTask<T>>(word) {
+    Unsafe.transmute(raw) -> resume(__transmute(raw))
+  }
+}
+
+pub(package) fn runtime_spawn_task_observation_word<T>(task: unique SpawnTask<T>) -> i64 {
+  handle unsafe_transmute<unique SpawnTask<T>, i64>(task) {
+    Unsafe.transmute(raw) -> resume(__transmute(raw))
+  }
+}
+
+-- Compiler-intercepted typed carrier operations. The source bodies are
+-- fail-closed backstops; native emission preserves T's exact descriptor and
+-- E remains the callback's checked effect contract.
+pub(package) fn runtime_spawn_work_pack<T, E>(f: () -[E]> T) -> i64 {
+  runtime_trap(46, 0)
+}
+
+pub(package) fn runtime_spawn_work_take<T>(work: i64) -> T {
+  runtime_trap(46, 0)
+}
+
+pub(package) fn runtime_spawn_work_new_raw(descriptor: i64, entry_ptr: i64, fn_ptr: i64, env_ptr: i64) -> i64 {
+  let size = runtime_par_work_size_for_descriptor(descriptor)
+  if size == 0 or entry_ptr == 0 or fn_ptr == 0 { 0 }
+  else {
+    let work = heap_alloc_zeroed(rc_default_heap(), size, 8)
+    if work == 0 { 0 }
+    else {
+      let cloned_env = closure_env_heap_clone_raw(env_ptr)
+      if env_ptr != 0 and cloned_env == 0 {
+        heap_free(rc_default_heap(), work, size)
+        0
+      } else {
+        mem_store64_at(work, runtime_par_work_descriptor_offset(), descriptor)
+        mem_store64_at(work, runtime_par_work_entry_ptr_offset(), entry_ptr)
+        mem_store64_at(work, runtime_par_work_fn_ptr_offset(), fn_ptr)
+        mem_store64_at(work, runtime_par_work_env_ptr_offset(), cloned_env)
+        work
+      }
+    }
+  }
+}
+
+pub(package) fn runtime_spawn_work_release_closure(work: i64) -> i64 {
+  if work == 0 { 0 }
+  else {
+    let fn_ptr = mem_load64_at(work, runtime_par_work_fn_ptr_offset())
+    let env_ptr = mem_load64_at(work, runtime_par_work_env_ptr_offset())
+    if fn_ptr == 0 and env_ptr == 0 { 0 }
+    else {
+      closure_env_heap_release_raw(env_ptr)
+      mem_store64_at(work, runtime_par_work_fn_ptr_offset(), 0)
+      mem_store64_at(work, runtime_par_work_env_ptr_offset(), 0)
+      1
+    }
+  }
+}
+
+pub(package) fn runtime_spawn_work_result_publish(work: i64) -> i64 {
+  let descriptor = runtime_par_work_descriptor(work)
+  if runtime_par_work_descriptor_is_valid(descriptor) == 0 { 0 }
+  else {
+    __atomic_lock64(work + runtime_par_work_result_lock_offset())
+    let published = if runtime_par_work_result_state(work) != runtime_par_work_result_empty() or
+      runtime_par_work_result_initialized_mask(work) != runtime_par_work_result_full_mask(descriptor) { 0 }
+    else {
+      runtime_par_work_result_promote(work)
+      runtime_spawn_work_release_closure(work)
+      mem_store64_at(work, runtime_par_work_result_state_offset(), runtime_par_work_result_ready())
+      1
+    }
+    __atomic_unlock64(work + runtime_par_work_result_lock_offset())
+    published
+  }
+}
+
+pub(package) fn runtime_spawn_work_free_moved(work: i64) -> i64 {
+  if work == 0 or runtime_par_work_result_state(work) != runtime_par_work_result_moved() { 0 }
+  else {
+    let size = runtime_par_work_size_for_descriptor(runtime_par_work_descriptor(work))
+    if size == 0 or heap_free(rc_default_heap(), work, size) != 0 { 0 } else { 1 }
+  }
+}
+
+pub(package) fn runtime_spawn_work_discard(work: i64) -> i64 {
+  if work == 0 { 0 }
+  else {
+    let size = runtime_par_work_size_for_descriptor(runtime_par_work_descriptor(work))
+    runtime_par_work_result_drop(work)
+    runtime_spawn_work_release_closure(work)
+    if size == 0 or heap_free(rc_default_heap(), work, size) != 0 { 0 } else { 1 }
+  }
+}
+
+-- Spawn callbacks retain their checked residual effect contract across the
+-- sealed indirect-call boundary. Reusing Par's pure runner here would be an
+-- L6 effect lie: the callback can perform E even though the raw ABI is the
+-- same one-word carrier entry used by pure Par work.
+fn runtime_spawn_work_call_raw<E>(entry: i64, work: i64) -[Unsafe, E]> i64 {
+  unsafe_raw_call_i64(entry, work)
+}
+
+pub(package) fn runtime_spawn_work_run<E>(work: i64) -[E]> i64 {
+  let entry = runtime_par_work_entry(work)
+  if runtime_par_work_descriptor_is_valid(runtime_par_work_descriptor(work)) == 0 or entry == 0 or
+    runtime_par_work_result_state(work) != runtime_par_work_result_empty() { 0 }
+  else {
+    handle runtime_spawn_work_call_raw<E>(entry, work) {
+      Unsafe.raw_call_i64(fn_ptr, arg) -> resume(__call_i64(fn_ptr, arg))
+    }
+  }
+}
+
+pub(package) fn runtime_spawn_task_pending() -> i64 { 0 }
+pub(package) fn runtime_spawn_task_running() -> i64 { 1 }
+pub(package) fn runtime_spawn_task_complete() -> i64 { 2 }
+pub(package) fn runtime_spawn_task_joined() -> i64 { 3 }
+
+pub(package) fn runtime_spawn_scope_head_offset() -> i64 { 0 }
+pub(package) fn runtime_spawn_scope_next_id_offset() -> i64 { 8 }
+pub(package) fn runtime_spawn_scope_size() -> i64 { 16 }
+
+pub(package) fn runtime_spawn_task_work_offset() -> i64 { 0 }
+pub(package) fn runtime_spawn_task_next_offset() -> i64 { 8 }
+pub(package) fn runtime_spawn_task_id_offset() -> i64 { 16 }
+pub(package) fn runtime_spawn_task_state_offset() -> i64 { 24 }
+pub(package) fn runtime_spawn_task_size() -> i64 { 32 }
+
+pub(package) fn runtime_spawn_scope_new() -> i64 {
+  let scope = heap_alloc_zeroed(rc_default_heap(), runtime_spawn_scope_size(), 8)
+  if scope != 0 { mem_store64_at(scope, runtime_spawn_scope_next_id_offset(), 1) } else { 0 }
+  scope
+}
+
+pub(package) fn runtime_spawn_scope_track(scope: i64, work: i64) -> i64 {
+  if scope == 0 or work == 0 { 0 }
+  else {
+    let task = heap_alloc_zeroed(rc_default_heap(), runtime_spawn_task_size(), 8)
+    if task == 0 { 0 }
+    else {
+      let id = mem_load64_at(scope, runtime_spawn_scope_next_id_offset())
+      mem_store64_at(scope, runtime_spawn_scope_next_id_offset(), id + 1)
+      mem_store64_at(task, runtime_spawn_task_work_offset(), work)
+      mem_store64_at(task, runtime_spawn_task_next_offset(), mem_load64_at(scope, runtime_spawn_scope_head_offset()))
+      mem_store64_at(task, runtime_spawn_task_id_offset(), id)
+      mem_store64_at(task, runtime_spawn_task_state_offset(), runtime_spawn_task_pending())
+      mem_store64_at(scope, runtime_spawn_scope_head_offset(), task)
+      task
+    }
+  }
+}
+
+pub(package) fn runtime_spawn_task_id(task: i64) -> i64 {
+  if task == 0 { 0 } else { mem_load64_at(task, runtime_spawn_task_id_offset()) }
+}
+
+pub(package) fn runtime_spawn_task_state(task: i64) -> i64 {
+  if task == 0 { 0 - 1 } else { mem_load64_at(task, runtime_spawn_task_state_offset()) }
+}
+
+-- E is supplied by the handler from the checked callback contract. The raw
+-- worker call may perform exactly those effects; this runtime boundary does
+-- not erase them to an apparently pure call.
+pub(package) fn runtime_spawn_task_run<E>(task: i64) -[E]> i64 {
+  if task == 0 or runtime_spawn_task_state(task) != runtime_spawn_task_pending() { 0 }
+  else {
+    mem_store64_at(task, runtime_spawn_task_state_offset(), runtime_spawn_task_running())
+    let work = mem_load64_at(task, runtime_spawn_task_work_offset())
+    runtime_spawn_work_run<E>(work)
+    if runtime_par_work_result_state_acquire(work) == runtime_par_work_result_ready() {
+      mem_store64_at(task, runtime_spawn_task_state_offset(), runtime_spawn_task_complete())
+      1
+    } else { 0 }
+  }
+}
+
+-- Joining transfers the carrier out of scope ownership. The immediately
+-- following typed take moves T out and frees that carrier; the task node stays
+-- as an inert scope record until cleanup, so no linked-list pointer dangles.
+pub(package) fn runtime_spawn_task_join(task: i64) -> i64 {
+  if task == 0 or runtime_spawn_task_state(task) != runtime_spawn_task_complete() { 0 }
+  else {
+    let work = mem_load64_at(task, runtime_spawn_task_work_offset())
+    mem_store64_at(task, runtime_spawn_task_work_offset(), 0)
+    mem_store64_at(task, runtime_spawn_task_state_offset(), runtime_spawn_task_joined())
+    work
+  }
+}
+
+pub(package) fn runtime_spawn_scope_cleanup(scope: i64) -> i64 {
+  if scope == 0 { 0 }
+  else {
+    let mut task = mem_load64_at(scope, runtime_spawn_scope_head_offset())
+    mem_store64_at(scope, runtime_spawn_scope_head_offset(), 0)
+    while task != 0 {
+      let next = mem_load64_at(task, runtime_spawn_task_next_offset())
+      let work = mem_load64_at(task, runtime_spawn_task_work_offset())
+      if work != 0 { runtime_spawn_work_discard(work) } else { 0 }
+      heap_free(rc_default_heap(), task, runtime_spawn_task_size())
+      task = next
+    }
+    heap_free(rc_default_heap(), scope, runtime_spawn_scope_size())
+    1
+  }
+}

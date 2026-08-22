@@ -71,6 +71,13 @@ check_rejects "generic_par_task_non_sendable_result" "test/negative/generic_par_
 check_rejects "generic_par_task_non_sendable_capture" "test/negative/generic_par_task_non_sendable_capture.weft" "type error: closure capture is not Sendable across scoped Par"
 check_rejects "generic_par_task_type_mismatch" "test/negative/generic_par_task_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `unique ParTask<str>`, found `unique ParTask<i64>`'
 check_rejects "generic_par_task_forged" "test/negative/generic_par_task_forged.weft" "type error: ParTask is a sealed runtime token and cannot be constructed"
+check_rejects "spawn_requires_effect" "test/negative/spawn_requires_effect.weft" 'error[E2001]: effect `Spawn` is not available in this context'
+check_rejects "spawn_child_effect_requires_contract" "test/negative/spawn_child_effect_requires_contract.weft" 'error[E2001]: effect `SpawnChildNoise` is not available in this context'
+check_rejects "spawn_non_sendable_result" "test/negative/spawn_non_sendable_result.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
+check_rejects "spawn_non_sendable_capture" "test/negative/spawn_non_sendable_capture.weft" "type error: task closure is not Sendable across structured Spawn"
+check_rejects "spawn_task_scope_escape" "test/negative/spawn_task_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
+check_rejects "spawn_task_double_join" "test/negative/spawn_task_double_join.weft" "type error: unique value used more than once"
+check_rejects "spawn_task_constructor_private" "test/negative/spawn_task_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "generator_new_non_literal_producer" "test/negative/generator_new_non_literal_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_new_nonzero_arg_producer" "test/negative/generator_new_nonzero_arg_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_new_function_with_arg" "test/negative/generator_new_function_with_arg.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
