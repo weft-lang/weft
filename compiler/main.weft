@@ -6167,6 +6167,13 @@ fn lsp_emit_error_response(req: i64, n: i64, root: i64, code: i64, message: str)
   lsp_write_body(body)
 }
 
+fn lsp_emit_null_response(req: i64, n: i64, root: i64) -> i64 {
+  let body = buf_new(128)
+  lsp_response_start(body, req, n, root)
+  bstr(body, "null}")
+  lsp_write_body(body)
+}
+
 fn lsp_span_line0(src: i64, n: i64, span: i64) -> i64 {
   let line = source_position_line0(source_position_at(src, n, span))
   if line < 0 { 0 } else { line }
@@ -6877,10 +6884,17 @@ fn lsp_process_body(req: i64, n: i64, st: i64, session: ProjectSession) -[Source
   } else {
     let jsonrpc = mcp_json_field_value_start(req, n, root, "jsonrpc")
     let method = mcp_json_field_value_start(req, n, root, "method")
+    let has_id = mcp_json_field_value_start(req, n, root, "id") >= 0
     if mcp_json_string_value_eq(req, n, jsonrpc, "2.0") == 0 or method < 0 {
       lsp_emit_error_response(req, n, root, 0 - 32600, "invalid request")
     } else { if mcp_json_string_value_eq(req, n, method, "initialize") == 1 {
       lsp_handle_initialize(req, n, root, st)
+    } else { if mcp_json_string_value_eq(req, n, method, "initialized") == 1 {
+      0
+    } else { if mcp_json_string_value_eq(req, n, method, "shutdown") == 1 {
+      lsp_emit_null_response(req, n, root)
+    } else { if mcp_json_string_value_eq(req, n, method, "exit") == 1 {
+      0
     } else { if mcp_json_string_value_eq(req, n, method, "textDocument/didOpen") == 1 {
       lsp_handle_open(req, n, root, st, session)
     } else { if mcp_json_string_value_eq(req, n, method, "textDocument/didChange") == 1 {
@@ -6897,9 +6911,20 @@ fn lsp_process_body(req: i64, n: i64, st: i64, session: ProjectSession) -[Source
       lsp_emit_code_action(req, n, root)
     } else { if mcp_json_string_value_eq(req, n, method, "textDocument/formatting") == 1 {
       lsp_emit_formatting(req, n, root, st)
+    } else { if not has_id {
+      0
     } else {
       lsp_emit_error_response(req, n, root, 0 - 32601, "unknown method")
-    } } } } } } } } } }
+    } } } } } } } } } } } } } } }
+  }
+}
+
+fn lsp_body_method_eq(req: i64, n: i64, method_name: str) -> i64 {
+  let root = mcp_json_root_object_start(req, n)
+  if root < 0 { 0 }
+  else {
+    let method = mcp_json_field_value_start(req, n, root, "method")
+    mcp_json_string_value_eq(req, n, method, method_name)
   }
 }
 
@@ -6935,42 +6960,127 @@ fn lsp_content_length(src: i64, n: i64, pos: i64, header_end: i64) -> i64 {
   result
 }
 
-fn run_lsp() -[SourceAcquire]> i64 {
-  let input = read_stdin_all()
-  let src = mem_load64_at(input, 0)
-  let n = mem_load64_at(input, 8)
-  let st = lsp_state_new()
-  let session = project_session_new(1)
+fn lsp_stream_reset(b: i64) -> i64 {
+  mem_store64_at(b, 8, 0)
+}
+
+fn lsp_stream_header_complete(b: i64) -> i64 {
+  let n = buf_len(b)
+  let src = buf_ptr(b)
+  if n < 4 { 0 }
+  else {
+    if mem_load8_at(src, n - 4) == 13 and mem_load8_at(src, n - 3) == 10 and mem_load8_at(src, n - 2) == 13 and mem_load8_at(src, n - 1) == 10 { 1 } else { 0 }
+  }
+}
+
+fn lsp_stream_header_is_raw_json(b: i64) -> i64 {
+  let src = buf_ptr(b)
+  let n = buf_len(b)
+  let mut i = 0
+  while i < n and is_ws(mem_load8_at(src, i)) == 1 { i = i + 1 }
+  if i < n and mem_load8_at(src, i) == 123 { 1 } else { 0 }
+}
+
+-- Read exactly one transport header without consuming any body bytes.
+-- 0 = clean EOF, 1 = framed header, 2 = legacy raw JSON, 3 = truncated header.
+fn lsp_stream_read_header(header: i64, scratch: i64) -> i64 {
+  lsp_stream_reset(header)
+  let mut result = 0
+  let mut done = false
+  while not done {
+    let count = sys_read(0, scratch, 1)
+    if count <= 0 {
+      done = true
+      result = if buf_len(header) == 0 { 0 } else { 3 }
+    } else {
+      bu8(header, mem_load8_at(scratch, 0))
+      if lsp_stream_header_is_raw_json(header) == 1 {
+        done = true
+        result = 2
+      } else { if lsp_stream_header_complete(header) == 1 {
+        done = true
+        result = 1
+      } else { 0 } }
+    }
+  }
+  result
+}
+
+fn lsp_stream_read_exact(body: i64, len: i64) -> i64 {
+  lsp_stream_reset(body)
+  let mut got = 0
+  let mut done = false
+  while got < len and not done {
+    let count = sys_read(0, buf_ptr(body) + got, len - got)
+    if count <= 0 { done = true } else { got = got + count }
+  }
+  mem_store64_at(body, 8, got)
+  got
+}
+
+fn lsp_stream_read_to_eof(body: i64, scratch: i64) -> i64 {
+  let mut done = false
+  while not done {
+    let count = sys_read(0, scratch, 4096)
+    if count <= 0 { done = true }
+    else { mcp_buf_append_bytes(body, scratch, count) }
+  }
+  buf_len(body)
+}
+
+fn lsp_process_raw_batch(src: i64, n: i64, st: i64, session: ProjectSession) -[SourceAcquire]> i64 {
   let mut pos = mcp_skip_json_ws(src, n, 0)
   let mut done = 0
   while pos < n and done == 0 {
-    if mem_load8_at(src, pos) == 123 {
-      let parsed = mcp_json_parse_value(src, n, pos)
-      if mcp_json_result_ok(parsed) == 0 {
-        lsp_emit_error_response(src + pos, n - pos, 0 - 1, 0 - 32700, "invalid json-rpc")
-        done = 1
-      } else {
-        let end = mcp_json_result_pos(parsed)
-        lsp_process_body(src + pos, end - pos, st, session)
-        pos = mcp_skip_json_ws(src, n, end)
-      }
+    let parsed = mcp_json_parse_value(src, n, pos)
+    if mcp_json_result_ok(parsed) == 0 {
+      lsp_emit_error_response(src + pos, n - pos, 0 - 1, 0 - 32700, "invalid json-rpc")
+      done = 1
     } else {
-      let header_end = lsp_header_end(src, n, pos)
-      if header_end < 0 {
-        lsp_emit_error_response(src + pos, n - pos, 0 - 1, 0 - 32700, "invalid json-rpc")
-        done = 1
+      let end = mcp_json_result_pos(parsed)
+      lsp_process_body(src + pos, end - pos, st, session)
+      pos = mcp_skip_json_ws(src, n, end)
+    }
+  }
+  0
+}
+
+fn run_lsp() -[SourceAcquire]> i64 {
+  let st = lsp_state_new()
+  let session = project_session_new(1)
+  let header = buf_new(4096)
+  let scratch = main_alloc_bytes(4096)
+  let mut done = false
+  while not done {
+    let transport = lsp_stream_read_header(header, scratch)
+    if transport == 0 {
+      done = true
+    } else { if transport == 2 {
+      lsp_stream_read_to_eof(header, scratch)
+      lsp_process_raw_batch(buf_ptr(header), buf_len(header), st, session)
+      done = true
+    } else { if transport != 1 {
+      lsp_emit_error_response(buf_ptr(header), buf_len(header), 0 - 1, 0 - 32700, "invalid json-rpc")
+      done = true
+    } else {
+      let src = buf_ptr(header)
+      let n = buf_len(header)
+      let header_end = lsp_header_end(src, n, 0)
+      let len = lsp_content_length(src, n, 0, header_end)
+      if header_end < 0 or len < 0 {
+        lsp_emit_error_response(src, n, 0 - 1, 0 - 32700, "invalid json-rpc")
+        done = true
       } else {
-        let len = lsp_content_length(src, n, pos, header_end)
-        let body_start = header_end + 4
-        if len < 0 or body_start + len > n {
-          lsp_emit_error_response(src + pos, n - pos, 0 - 1, 0 - 32700, "invalid json-rpc")
-          done = 1
+        let body = buf_new(if len < 1 { 1 } else { len })
+        if lsp_stream_read_exact(body, len) != len {
+          lsp_emit_error_response(buf_ptr(body), buf_len(body), 0 - 1, 0 - 32700, "invalid json-rpc")
+          done = true
         } else {
-          lsp_process_body(src + body_start, len, st, session)
-          pos = mcp_skip_json_ws(src, n, body_start + len)
+          lsp_process_body(buf_ptr(body), len, st, session)
+          if lsp_body_method_eq(buf_ptr(body), len, "exit") == 1 { done = true } else { 0 }
         }
       }
-    }
+    } } }
   }
   0
 }
