@@ -1,0 +1,656 @@
+-- runtime/net_poller.weft — generation-safe Darwin readiness seam
+--
+-- The scheduler-facing contract keeps descriptors and kqueue ABI storage
+-- inside the runtime package. A monotonically assigned resource identity,
+-- one-shot generation and interest are carried through kqueue udata, so a
+-- readiness notification for a closed descriptor can never match a later
+-- resource that happens to reuse the same integer descriptor.
+
+use runtime/alloc.{alloc_bump, alloc_bump_mark, alloc_bump_restore_same_segment, alloc_mmap_flags_private_anon, alloc_mmap_prot_rw, alloc_page_size, alloc_runtime_state_ptr}
+use runtime/memory.{mem_load8_at, mem_load64_at, mem_store8_at, mem_store64_at, mem_zero}
+use runtime/syscall.{sys_close, sys_mmap, sys_munmap, sys_raw}
+use stdlib/drop.{Drop}
+use stdlib/num.{num_int_cast_value_or, num_u64_to_i64_checked, num_usize_to_u64}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/tcp.{TcpListener, TcpStream, tcp_listener_token, tcp_stream_token}
+
+const NET_POLLER_SYS_FCNTL: i64 = 92
+
+const NET_POLLER_SYS_KQUEUE: i64 = 362
+
+const NET_POLLER_SYS_KEVENT: i64 = 363
+
+const NET_POLLER_F_GETFL: i64 = 3
+
+const NET_POLLER_F_SETFL: i64 = 4
+
+const NET_POLLER_O_NONBLOCK: i64 = 4
+
+const NET_POLLER_EINTR: i64 = 4
+
+const NET_POLLER_EBADF: i64 = 9
+
+const NET_POLLER_ENOENT: i64 = 2
+
+const NET_POLLER_EVFILT_READ: i64 = 65535
+
+const NET_POLLER_EVFILT_WRITE: i64 = 65534
+
+const NET_POLLER_EV_ADD: i64 = 1
+
+const NET_POLLER_EV_DELETE: i64 = 2
+
+const NET_POLLER_EV_ENABLE: i64 = 4
+
+const NET_POLLER_EV_ONESHOT: i64 = 16
+
+const NET_POLLER_EV_UDATA_SPECIFIC: i64 = 256
+
+const NET_POLLER_EV_ERROR: i64 = 16384
+
+const NET_POLLER_EV_EOF: i64 = 32768
+
+const NET_POLLER_KEVENT_SIZE: i64 = 32
+
+const NET_POLLER_STATE_DESCRIPTOR_OFFSET: i64 = 0
+
+const NET_POLLER_STATE_NEXT_RESOURCE_OFFSET: i64 = 8
+
+const NET_POLLER_STATE_EPOCH_OFFSET: i64 = 16
+
+-- Runtime twin: runtime_state_net_poller_epoch_offset in compiler/codegen.weft.
+const NET_POLLER_RUNTIME_EPOCH_OFFSET: i64 = 176
+
+const NET_POLLER_RUNTIME_EPOCH_LOCK_OFFSET: i64 = 184
+
+const NET_POLLER_ID_LIMIT: i64 = 1073741824
+
+-- Runtime-internal types are package-visible for the 3y executor. None of
+-- their hidden pointer/descriptor representations cross the public package
+-- boundary.
+pub (package) type NetPoller = opaque i64
+
+pub (package) type NetPollResource = opaque(i64, i64, (i64, i64))
+
+pub (package) type NetPollRegistration = opaque(i64, i64, (i64, i64, (i64, i64)))
+
+pub (package) type NetPollInterest {
+  NetPollReadable,
+    NetPollWritable
+}
+
+pub (package) type NetPollDeadline {
+  NetPollForever,
+    NetPollImmediate,
+    NetPollForMillis(usize)
+}
+
+pub (package) type NetPollError {
+  NetPollInterrupted,
+    NetPollLimit,
+    NetPollInvalidRegistration,
+    NetPollInvalidEvent,
+    NetPollPlatform(i64)
+}
+
+pub (package) type NetPollCancel {
+  NetPollCancelled,
+    NetPollAlreadyResolved
+}
+
+pub (package) type NetPollEvent {
+  NetPollReady(NetPollRegistration, i64, bool),
+    NetPollReadyError(NetPollRegistration, NetPollError)
+}
+
+pub (package) type NetPollWait {
+  NetPollTimedOut,
+    NetPollEventReady(NetPollEvent)
+}
+
+fn net_poller_state(poller: borrow NetPoller) -> i64 {
+  match poller { NetPoller(state) -> state }
+}
+
+fn net_poller_descriptor(poller: borrow NetPoller) -> i64 {
+  mem_load64_at(net_poller_state(poller), NET_POLLER_STATE_DESCRIPTOR_OFFSET)
+}
+
+fn net_poller_epoch(poller: borrow NetPoller) -> i64 {
+  mem_load64_at(net_poller_state(poller), NET_POLLER_STATE_EPOCH_OFFSET)
+}
+
+fn net_poll_resource_descriptor(resource: NetPollResource) -> i64 {
+  match resource {
+    NetPollResource(parts) -> match parts { (descriptor, identity, owner) -> descriptor }
+  }
+}
+
+fn net_poll_resource_identity(resource: NetPollResource) -> i64 {
+  match resource {
+    NetPollResource(parts) -> match parts { (descriptor, identity, owner) -> identity }
+  }
+}
+
+fn net_poll_resource_state(resource: NetPollResource) -> i64 {
+  match resource {
+    NetPollResource(parts) -> match parts {
+      (descriptor, identity, owner) -> match owner { (state, epoch) -> state }
+    }
+  }
+}
+
+fn net_poll_resource_epoch(resource: NetPollResource) -> i64 {
+  match resource {
+    NetPollResource(parts) -> match parts {
+      (descriptor, identity, owner) -> match owner { (state, epoch) -> epoch }
+    }
+  }
+}
+
+fn net_poll_registration_descriptor(registration: NetPollRegistration) -> i64 {
+  match registration {
+    NetPollRegistration(parts) -> match parts {
+      (descriptor, identity, rest) -> descriptor
+    }
+  }
+}
+
+fn net_poll_registration_identity(registration: NetPollRegistration) -> i64 {
+  match registration {
+    NetPollRegistration(parts) -> match parts {
+      (descriptor, identity, rest) -> identity
+    }
+  }
+}
+
+fn net_poll_registration_generation_raw(registration: NetPollRegistration) -> i64 {
+  match registration {
+    NetPollRegistration(parts) -> match parts {
+      (descriptor, identity, rest) -> match rest {
+        (generation, interest, owner) -> generation
+      }
+    }
+  }
+}
+
+fn net_poll_registration_interest_code(registration: NetPollRegistration) -> i64 {
+  match registration {
+    NetPollRegistration(parts) -> match parts {
+      (descriptor, identity, rest) -> match rest {
+        (generation, interest, owner) -> interest
+      }
+    }
+  }
+}
+
+fn net_poll_registration_state(registration: NetPollRegistration) -> i64 {
+  match registration {
+    NetPollRegistration(parts) -> match parts {
+      (descriptor, identity, rest) -> match rest {
+        (generation, interest, owner) -> match owner { (state, epoch) -> state }
+      }
+    }
+  }
+}
+
+fn net_poll_registration_epoch_raw(registration: NetPollRegistration) -> i64 {
+  match registration {
+    NetPollRegistration(parts) -> match parts {
+      (descriptor, identity, rest) -> match rest {
+        (generation, interest, owner) -> match owner { (state, epoch) -> epoch }
+      }
+    }
+  }
+}
+
+fn net_poll_interest_code(interest: NetPollInterest) -> i64 {
+  match interest {
+    NetPollReadable -> 0
+    NetPollWritable -> 1
+  }
+}
+
+fn net_poll_interest_from_code(code: i64) -> NetPollInterest {
+  if code == 0 { NetPollReadable } else { NetPollWritable }
+}
+
+fn net_poll_filter(interest_code: i64) -> i64 {
+  if interest_code == 0 { NET_POLLER_EVFILT_READ }
+  else { NET_POLLER_EVFILT_WRITE }
+}
+
+fn net_poll_token(identity: i64, generation: i64, interest: i64) -> i64 {
+  (identity * NET_POLLER_ID_LIMIT + generation) * 2 + interest
+}
+
+fn net_poll_token_identity(token: i64) -> i64 {
+  (token / 2) / NET_POLLER_ID_LIMIT
+}
+
+fn net_poll_token_generation(token: i64) -> i64 {
+  (token / 2) % NET_POLLER_ID_LIMIT
+}
+
+fn net_poll_token_interest(token: i64) -> i64 { token band 1 }
+
+fn net_poll_error(status: i64) -> NetPollError {
+  let code = if status < 0 { 0 - status } else { status }
+  if code == NET_POLLER_EINTR { NetPollInterrupted }
+  else { NetPollPlatform(code) }
+}
+
+fn net_poller_release_state(state: i64) -> i64 {
+  let descriptor = mem_load64_at(state, NET_POLLER_STATE_DESCRIPTOR_OFFSET)
+  mem_store64_at(state, NET_POLLER_STATE_DESCRIPTOR_OFFSET, 0 - 1)
+  let closed = if descriptor < 0 { 0 } else { sys_close(descriptor) }
+  let unmapped = sys_munmap(state, alloc_page_size())
+  if closed < 0 { closed } else { unmapped }
+}
+
+impl Drop for NetPoller {
+  fn drop(self) -> i64 {
+    match self { NetPoller(state) -> net_poller_release_state(state) }
+  }
+}
+
+fn net_poller_next_epoch() -> i64 {
+  let runtime_state = alloc_runtime_state_ptr()
+  __atomic_lock64(runtime_state + NET_POLLER_RUNTIME_EPOCH_LOCK_OFFSET)
+  let current = mem_load64_at(runtime_state, NET_POLLER_RUNTIME_EPOCH_OFFSET)
+  let next = if current < 0 or current + 1 >= NET_POLLER_ID_LIMIT {
+    0
+  } else {
+    current + 1
+  }
+  if next != 0 {
+    mem_store64_at(runtime_state, NET_POLLER_RUNTIME_EPOCH_OFFSET, next)
+  } else { 0 }
+  __atomic_unlock64(runtime_state + NET_POLLER_RUNTIME_EPOCH_LOCK_OFFSET)
+  next
+}
+
+pub (package) fn net_poller_open() -> Result<owned NetPoller, NetPollError> {
+  let epoch = net_poller_next_epoch()
+  if epoch == 0 { result_err<owned NetPoller, NetPollError>(NetPollLimit) }
+  else {
+    let descriptor = sys_raw(NET_POLLER_SYS_KQUEUE, 0, 0, 0, 0, 0, 0)
+    if descriptor < 0 {
+      result_err<owned NetPoller, NetPollError>(net_poll_error(descriptor))
+    } else {
+      let state = sys_mmap(
+        0,
+        alloc_page_size(),
+        alloc_mmap_prot_rw(),
+        alloc_mmap_flags_private_anon(),
+        0 - 1,
+        0
+      )
+      if state <= 0 {
+        sys_close(descriptor)
+        result_err<owned NetPoller, NetPollError>(net_poll_error(state))
+      } else {
+        mem_store64_at(state, NET_POLLER_STATE_DESCRIPTOR_OFFSET, descriptor)
+        mem_store64_at(state, NET_POLLER_STATE_NEXT_RESOURCE_OFFSET, 1)
+        mem_store64_at(state, NET_POLLER_STATE_EPOCH_OFFSET, epoch)
+        result_ok<owned NetPoller, NetPollError>(NetPoller(state))
+      }
+    }
+  }
+}
+
+pub (package) fn net_poller_close(
+  poller: owned NetPoller
+) -> Result<nil, NetPollError> {
+  let status = poller.drop()
+  if status < 0 { result_err<nil, NetPollError>(net_poll_error(status)) }
+  else { result_ok<nil, NetPollError>(nil) }
+}
+
+fn net_poller_set_nonblocking(descriptor: i64) -> i64 {
+  let flags = sys_raw(
+    NET_POLLER_SYS_FCNTL,
+    descriptor,
+    NET_POLLER_F_GETFL,
+    0,
+    0,
+    0,
+    0
+  )
+  if flags < 0 { flags }
+  else {
+    sys_raw(
+      NET_POLLER_SYS_FCNTL,
+      descriptor,
+      NET_POLLER_F_SETFL,
+      flags bor NET_POLLER_O_NONBLOCK,
+      0,
+      0,
+      0
+    )
+  }
+}
+
+fn net_poller_adopt_descriptor(
+  poller: borrow mut NetPoller,
+  descriptor: i64
+) -> Result<NetPollResource, NetPollError> {
+  let state = net_poller_state(poller)
+  let identity = mem_load64_at(state, NET_POLLER_STATE_NEXT_RESOURCE_OFFSET)
+  if identity <= 0 or identity >= NET_POLLER_ID_LIMIT {
+    result_err<NetPollResource, NetPollError>(NetPollLimit)
+  } else {
+    let status = net_poller_set_nonblocking(descriptor)
+    if status < 0 {
+      result_err<NetPollResource, NetPollError>(net_poll_error(status))
+    } else {
+      mem_store64_at(state, NET_POLLER_STATE_NEXT_RESOURCE_OFFSET, identity + 1)
+      result_ok<NetPollResource, NetPollError>(NetPollResource((descriptor, identity, (state, net_poller_epoch(poller)))))
+    }
+  }
+}
+
+pub (package) fn net_poller_adopt_stream(
+  poller: borrow mut NetPoller,
+  stream: borrow TcpStream
+) -> Result<NetPollResource, NetPollError> {
+  net_poller_adopt_descriptor(poller, tcp_stream_token(stream))
+}
+
+pub (package) fn net_poller_adopt_listener(
+  poller: borrow mut NetPoller,
+  listener: borrow TcpListener
+) -> Result<NetPollResource, NetPollError> {
+  net_poller_adopt_descriptor(poller, tcp_listener_token(listener))
+}
+
+fn net_poller_store_u16(pointer: i64, offset: i64, value: i64) -> nil {
+  mem_store8_at(pointer, offset, value band 255)
+  mem_store8_at(pointer, offset + 1, (value bshr 8) band 255)
+  nil
+}
+
+fn net_poller_load_u16(pointer: i64, offset: i64) -> i64 {
+  mem_load8_at(pointer, offset) + mem_load8_at(pointer, offset + 1) * 256
+}
+
+fn net_poller_load_u32(pointer: i64, offset: i64) -> i64 {
+  mem_load8_at(pointer, offset) +
+    mem_load8_at(pointer, offset + 1) * 256 +
+    mem_load8_at(pointer, offset + 2) * 65536 +
+    mem_load8_at(pointer, offset + 3) * 16777216
+}
+
+fn net_poller_store_change(
+  event: i64,
+  descriptor: i64,
+  filter: i64,
+  flags: i64,
+  token: i64
+) -> nil {
+  mem_zero(event, NET_POLLER_KEVENT_SIZE)
+  mem_store64_at(event, 0, descriptor)
+  net_poller_store_u16(event, 8, filter)
+  net_poller_store_u16(event, 10, flags)
+  mem_store64_at(event, 24, token)
+  nil
+}
+
+fn net_poller_submit_registration(
+  poller: borrow mut NetPoller,
+  registration: NetPollRegistration,
+  flags: i64
+) -> i64 {
+  let mark = alloc_bump_mark()
+  let change = alloc_bump(NET_POLLER_KEVENT_SIZE)
+  net_poller_store_change(
+    change,
+    net_poll_registration_descriptor(registration),
+    net_poll_filter(net_poll_registration_interest_code(registration)),
+    flags,
+    net_poll_token(
+    net_poll_registration_identity(registration),
+    net_poll_registration_generation_raw(registration),
+    net_poll_registration_interest_code(registration)
+  )
+  )
+  let status = sys_raw(
+    NET_POLLER_SYS_KEVENT,
+    net_poller_descriptor(poller),
+    change,
+    1,
+    0,
+    0,
+    0
+  )
+  alloc_bump_restore_same_segment(mark)
+  status
+}
+
+fn net_poll_registration_valid_for(
+  poller: borrow NetPoller,
+  registration: NetPollRegistration
+) -> bool {
+  let identity = net_poll_registration_identity(registration)
+  let generation = net_poll_registration_generation_raw(registration)
+  let interest = net_poll_registration_interest_code(registration)
+  net_poll_registration_state(registration) == net_poller_state(poller) and
+    net_poll_registration_epoch_raw(registration) == net_poller_epoch(poller) and
+    net_poll_registration_descriptor(registration) >= 0 and
+    identity > 0 and identity < NET_POLLER_ID_LIMIT and
+    generation > 0 and generation < NET_POLLER_ID_LIMIT and
+    (interest == 0 or interest == 1)
+}
+
+fn net_poller_register_generation(
+  poller: borrow mut NetPoller,
+  descriptor: i64,
+  identity: i64,
+  generation: i64,
+  interest: i64
+) -> Result<NetPollRegistration, NetPollError> {
+  let registration = NetPollRegistration((descriptor, identity, (generation, interest, (net_poller_state(poller), net_poller_epoch(poller)))))
+  let status = net_poller_submit_registration(
+    poller,
+    registration,
+    NET_POLLER_EV_ADD bor NET_POLLER_EV_ENABLE bor
+    NET_POLLER_EV_ONESHOT bor NET_POLLER_EV_UDATA_SPECIFIC
+  )
+  if status < 0 {
+    result_err<NetPollRegistration, NetPollError>(net_poll_error(status))
+  } else {
+    result_ok<NetPollRegistration, NetPollError>(registration)
+  }
+}
+
+pub (package) fn net_poller_register(
+  poller: borrow mut NetPoller,
+  resource: NetPollResource,
+  interest: NetPollInterest
+) -> Result<NetPollRegistration, NetPollError> {
+  if net_poll_resource_state(resource) != net_poller_state(poller) or
+    net_poll_resource_epoch(resource) != net_poller_epoch(poller) {
+    result_err<NetPollRegistration, NetPollError>(NetPollInvalidRegistration)
+  } else {
+    net_poller_register_generation(
+      poller,
+      net_poll_resource_descriptor(resource),
+      net_poll_resource_identity(resource),
+      1,
+      net_poll_interest_code(interest)
+    )
+  }
+}
+
+pub (package) fn net_poller_rearm(
+  poller: borrow mut NetPoller,
+  registration: NetPollRegistration
+) -> Result<NetPollRegistration, NetPollError> {
+  let generation = net_poll_registration_generation_raw(registration)
+  if not net_poll_registration_valid_for(poller, registration) {
+    result_err<NetPollRegistration, NetPollError>(NetPollInvalidRegistration)
+  } else { if generation + 1 >= NET_POLLER_ID_LIMIT {
+      result_err<NetPollRegistration, NetPollError>(NetPollLimit)
+    } else {
+      net_poller_register_generation(
+        poller,
+        net_poll_registration_descriptor(registration),
+        net_poll_registration_identity(registration),
+        generation + 1,
+        net_poll_registration_interest_code(registration)
+      )
+    } }
+}
+
+pub (package) fn net_poller_cancel(
+  poller: borrow mut NetPoller,
+  registration: NetPollRegistration
+) -> Result<NetPollCancel, NetPollError> {
+  if not net_poll_registration_valid_for(poller, registration) {
+    result_err<NetPollCancel, NetPollError>(NetPollInvalidRegistration)
+  } else {
+    let status = net_poller_submit_registration(
+      poller,
+      registration,
+      NET_POLLER_EV_DELETE bor NET_POLLER_EV_UDATA_SPECIFIC
+    )
+    if status == 0 {
+      result_ok<NetPollCancel, NetPollError>(NetPollCancelled)
+    } else {
+      let code = 0 - status
+      if status < 0 and (code == NET_POLLER_ENOENT or code == NET_POLLER_EBADF) {
+        result_ok<NetPollCancel, NetPollError>(NetPollAlreadyResolved)
+      } else {
+        result_err<NetPollCancel, NetPollError>(net_poll_error(status))
+      }
+    }
+  }
+}
+
+fn net_poller_timeout_pointer(
+  deadline: NetPollDeadline,
+  storage: i64
+) -> Result<i64, NetPollError> {
+  match deadline {
+    NetPollForever -> result_ok<i64, NetPollError>(0)
+    NetPollImmediate -> {
+      mem_store64_at(storage, 0, 0)
+      mem_store64_at(storage, 8, 0)
+      result_ok<i64, NetPollError>(storage)
+    }
+    NetPollForMillis(milliseconds) -> {
+      let value = num_int_cast_value_or<i64>(
+        num_u64_to_i64_checked(num_usize_to_u64(milliseconds)),
+        0 - 1
+      )
+      if value < 0 {
+        result_err<i64, NetPollError>(NetPollLimit)
+      } else {
+        mem_store64_at(storage, 0, value / 1000)
+        mem_store64_at(storage, 8, (value % 1000) * 1000000)
+        result_ok<i64, NetPollError>(storage)
+      }
+    }
+  }
+}
+
+fn net_poller_decode_event(
+  poller: borrow NetPoller,
+  event: i64
+) -> Result<NetPollWait, NetPollError> {
+  let descriptor = mem_load64_at(event, 0)
+  let filter = net_poller_load_u16(event, 8)
+  let flags = net_poller_load_u16(event, 10)
+  let filter_flags = net_poller_load_u32(event, 12)
+  let data = mem_load64_at(event, 16)
+  let token = mem_load64_at(event, 24)
+  let interest = net_poll_token_interest(token)
+  let identity = net_poll_token_identity(token)
+  let generation = net_poll_token_generation(token)
+  let filter_valid = (filter == NET_POLLER_EVFILT_READ and interest == 0) or
+    (filter == NET_POLLER_EVFILT_WRITE and interest == 1)
+  if descriptor < 0 or token <= 0 or identity <= 0 or
+    identity >= NET_POLLER_ID_LIMIT or generation <= 0 or
+    generation >= NET_POLLER_ID_LIMIT or not filter_valid {
+    result_err<NetPollWait, NetPollError>(NetPollInvalidEvent)
+  } else {
+    let registration = NetPollRegistration((descriptor, identity, (generation, interest, (net_poller_state(poller), net_poller_epoch(poller)))))
+    let outcome = if (flags band NET_POLLER_EV_ERROR) != 0 {
+      NetPollReadyError(registration, net_poll_error(data))
+    } else { if (flags band NET_POLLER_EV_EOF) != 0 and filter_flags != 0 {
+        NetPollReadyError(registration, net_poll_error(filter_flags))
+      } else {
+        NetPollReady(registration, data, (flags band NET_POLLER_EV_EOF) != 0)
+      } }
+    result_ok<NetPollWait, NetPollError>(NetPollEventReady(outcome))
+  }
+}
+
+pub (package) fn net_poller_wait(
+  poller: borrow mut NetPoller,
+  deadline: NetPollDeadline
+) -> Result<NetPollWait, NetPollError> {
+  let mark = alloc_bump_mark()
+  let event = alloc_bump(NET_POLLER_KEVENT_SIZE)
+  let timeout = alloc_bump(16)
+  mem_zero(event, NET_POLLER_KEVENT_SIZE)
+  let result = match net_poller_timeout_pointer(deadline, timeout) {
+    Err(error) -> result_err<NetPollWait, NetPollError>(error)
+    Ok(timeout_pointer) -> {
+      let status = sys_raw(
+        NET_POLLER_SYS_KEVENT,
+        net_poller_descriptor(poller),
+        0,
+        0,
+        event,
+        1,
+        timeout_pointer
+      )
+      if status < 0 {
+        result_err<NetPollWait, NetPollError>(net_poll_error(status))
+      } else { if status == 0 {
+          result_ok<NetPollWait, NetPollError>(NetPollTimedOut)
+        } else {
+          net_poller_decode_event(poller, event)
+        } }
+    }
+  }
+  alloc_bump_restore_same_segment(mark)
+  result
+}
+
+pub (package) fn net_poll_registration_same(
+  left: NetPollRegistration,
+  right: NetPollRegistration
+) -> bool {
+  net_poll_registration_descriptor(left) == net_poll_registration_descriptor(right) and
+    net_poll_registration_identity(left) == net_poll_registration_identity(right) and
+    net_poll_registration_generation_raw(left) == net_poll_registration_generation_raw(right) and
+    net_poll_registration_interest_code(left) == net_poll_registration_interest_code(right) and
+    net_poll_registration_state(left) == net_poll_registration_state(right) and
+    net_poll_registration_epoch_raw(left) == net_poll_registration_epoch_raw(right)
+}
+
+pub (package) fn net_poll_registration_resource_id(
+  registration: NetPollRegistration
+) -> i64 {
+  net_poll_registration_identity(registration)
+}
+
+pub (package) fn net_poll_registration_generation(
+  registration: NetPollRegistration
+) -> i64 {
+  net_poll_registration_generation_raw(registration)
+}
+
+pub (package) fn net_poll_registration_poller_epoch(
+  registration: NetPollRegistration
+) -> i64 {
+  net_poll_registration_epoch_raw(registration)
+}
+
+pub (package) fn net_poll_registration_interest(
+  registration: NetPollRegistration
+) -> NetPollInterest {
+  net_poll_interest_from_code(net_poll_registration_interest_code(registration))
+}
