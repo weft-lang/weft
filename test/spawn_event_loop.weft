@@ -1,0 +1,171 @@
+use runtime/alloc.{arena_alloc, arena_free, arena_new}
+use runtime/memory.{mem_load64, mem_store64}
+use runtime/rc_implicit_test.{RuntimeRcProbe, runtime_rc_probe_count, runtime_rc_probe_load, runtime_rc_probe_new}
+use stdlib/spawn as spawn
+use stdlib/time as time
+
+effect EventLoopMark {
+  fn mark(value: i64) -> nil
+}
+
+effect EventLoopAbort {
+  fn stop() -> i64
+}
+
+fn event_loop_delayed_mark(delay: i64, value: i64) -[time.Time, EventLoopMark]> i64 {
+  time.time_sleep_millis(delay)
+  EventLoopMark.mark(value)
+  value
+}
+
+fn event_loop_sleeping_probe(payload: RuntimeRcProbe) -[time.Time]> i64 {
+  time.time_sleep_millis(100)
+  runtime_rc_probe_load(payload)
+}
+
+fn event_loop_aborting_child() -[EventLoopAbort]> i64 {
+  EventLoopAbort.stop()
+}
+
+fn event_loop_sleep_42() -[time.Time]> i64 {
+  time.time_sleep_millis(1)
+  42
+}
+
+fn event_loop_sleep_pair() -[time.Time]> (str, i64) {
+  time.time_sleep_millis(1)
+  ("weft", 42)
+}
+
+fn event_loop_nested_outer() -[spawn.Spawn, time.Time]> i64 {
+  time.time_sleep_millis(1)
+  let inner = spawn.spawn(event_loop_sleep_42)
+  spawn.join(inner)
+}
+
+fn event_loop_nested_scope() -> i64 {
+  spawn.with_event_loop(() => {
+    let task = spawn.spawn(event_loop_sleep_42)
+    spawn.join(task)
+  })
+}
+
+test "event loop joins an ordinary sleeping child" {
+  let got = spawn.with_event_loop(() => {
+    let task = spawn.spawn(event_loop_sleep_42)
+    spawn.join(task)
+  })
+  Test.assert_eq(got, 42)
+}
+
+test "event loop carrier preserves a managed multi-lane result" {
+  let got = spawn.with_event_loop(() => {
+    let task = spawn.spawn(event_loop_sleep_pair)
+    let (name, value): (str, i64) = spawn.join(task)
+    if name == "weft" { value } else { 0 }
+  })
+  Test.assert_eq(got, 42)
+}
+
+test "event loop runs another task while the first timer is pending" {
+  let arena = arena_new(64)
+  let cell = arena_alloc(arena, 16, 8)
+  mem_store64(cell, 0)
+  mem_store64(cell + 8, 0)
+  let got = handle spawn.with_event_loop(() => {
+    let slow = spawn.spawn(() => event_loop_delayed_mark(10, 20))
+    let fast = spawn.spawn(() => event_loop_delayed_mark(1, 10))
+    spawn.join(slow) + spawn.join(fast)
+  }) {
+    EventLoopMark.mark(value) -> {
+      let count = mem_load64(cell)
+      mem_store64(cell + 8, mem_load64(cell + 8) * 10 + value / 10)
+      mem_store64(cell, count + 1)
+      resume(nil)
+    }
+  }
+  Test.assert_eq(got, 30)
+  Test.assert_eq(mem_load64(cell), 2)
+  Test.assert_eq(mem_load64(cell + 8), 12)
+  arena_free(arena)
+}
+
+test "event loop drains an unobserved accepted task before scope return" {
+  let arena = arena_new(64)
+  let cell = arena_alloc(arena, 8, 8)
+  mem_store64(cell, 0)
+  let got = handle spawn.with_event_loop(() => {
+    let ignored = spawn.spawn(() => event_loop_delayed_mark(1, 42))
+    1
+  }) {
+    EventLoopMark.mark(value) -> {
+      mem_store64(cell, value)
+      resume(nil)
+    }
+  }
+  Test.assert_eq(got, 1)
+  Test.assert_eq(mem_load64(cell), 42)
+  arena_free(arena)
+}
+
+test "event loop accepts nested Spawn inside a suspended child" {
+  let got = spawn.with_event_loop(() => {
+    let outer = spawn.spawn(event_loop_nested_outer)
+    spawn.join(outer)
+  })
+  Test.assert_eq(got, 42)
+}
+
+test "event loop preserves Time invalid-duration status" {
+  let negative = spawn.with_event_loop(() => time.time_sleep_millis(0 - 1))
+  let zero = spawn.with_event_loop(() => time.time_sleep_millis(0))
+  let overflow = spawn.with_event_loop(() => time.time_sleep_millis(9223372036855))
+  Test.assert_eq(negative, 0 - 1)
+  Test.assert_eq(zero, 0)
+  Test.assert_eq(overflow, 0 - 1)
+}
+
+test "event loop abort drops a sleeping continuation and managed capture" {
+  let payload = runtime_rc_probe_new(42)
+  let baseline = runtime_rc_probe_count(payload)
+  let got = handle spawn.with_event_loop(() => {
+    let sleeping = spawn.spawn(() => event_loop_sleeping_probe(payload))
+    let aborting = spawn.spawn(event_loop_aborting_child)
+    spawn.join(aborting)
+  }) {
+    EventLoopAbort.stop() -> 7
+  }
+  Test.assert_eq(got, 7)
+  Test.assert_eq(runtime_rc_probe_count(payload), baseline)
+}
+
+test "event loop normal drain drops an unobserved managed result" {
+  let payload = runtime_rc_probe_new(42)
+  let baseline = runtime_rc_probe_count(payload)
+  let got = spawn.with_event_loop(() => {
+    let ignored = spawn.spawn(() => event_loop_sleeping_probe(payload))
+    7
+  })
+  Test.assert_eq(got, 7)
+  Test.assert_eq(runtime_rc_probe_count(payload), baseline)
+}
+
+test "event loop drives many task suspensions iteratively" {
+  let got = spawn.with_event_loop(() => {
+    let mut i = 0
+    while i < 128 {
+      let ignored = spawn.spawn(event_loop_sleep_42)
+      i = i + 1
+    }
+    42
+  })
+  Test.assert_eq(got, 42)
+}
+
+test "event loop handlers nest without sharing task scopes" {
+  let got = spawn.with_event_loop(() => {
+    let task = spawn.spawn(event_loop_nested_scope)
+    spawn.join(task)
+  })
+  Test.assert_eq(got, 42)
+}

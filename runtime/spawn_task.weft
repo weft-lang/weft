@@ -8,7 +8,7 @@ use runtime/alloc.{heap_alloc_zeroed, heap_free}
 use runtime/memory.{mem_load64_at, mem_store64_at}
 use runtime/panic.{runtime_trap}
 use runtime/par_task.{*}
-use runtime/rc.{closure_env_heap_clone_raw, closure_env_heap_release_raw, rc_default_heap}
+use runtime/rc.{closure_env_heap_clone_raw, closure_env_heap_release_raw, rc_default_heap, runtime_continuation_cell_drop_i64, runtime_continuation_cell_is_full}
 use runtime/unsafe.{*}
 
 -- A SpawnTask is a sealed one-word observation right. The handler owns the
@@ -134,6 +134,9 @@ pub(package) fn runtime_spawn_task_pending() -> i64 { 0 }
 pub(package) fn runtime_spawn_task_running() -> i64 { 1 }
 pub(package) fn runtime_spawn_task_complete() -> i64 { 2 }
 pub(package) fn runtime_spawn_task_joined() -> i64 { 3 }
+pub(package) fn runtime_spawn_task_runnable() -> i64 { 4 }
+pub(package) fn runtime_spawn_task_sleeping() -> i64 { 5 }
+pub(package) fn runtime_spawn_task_waiting() -> i64 { 6 }
 
 pub(package) fn runtime_spawn_scope_head_offset() -> i64 { 0 }
 pub(package) fn runtime_spawn_scope_next_id_offset() -> i64 { 8 }
@@ -143,7 +146,11 @@ pub(package) fn runtime_spawn_task_work_offset() -> i64 { 0 }
 pub(package) fn runtime_spawn_task_next_offset() -> i64 { 8 }
 pub(package) fn runtime_spawn_task_id_offset() -> i64 { 16 }
 pub(package) fn runtime_spawn_task_state_offset() -> i64 { 24 }
-pub(package) fn runtime_spawn_task_size() -> i64 { 32 }
+pub(package) fn runtime_spawn_task_continuation_offset() -> i64 { 32 }
+pub(package) fn runtime_spawn_task_resume_value_offset() -> i64 { 40 }
+pub(package) fn runtime_spawn_task_wake_nanos_offset() -> i64 { 48 }
+pub(package) fn runtime_spawn_task_waiter_offset() -> i64 { 56 }
+pub(package) fn runtime_spawn_task_size() -> i64 { 64 }
 
 pub(package) fn runtime_spawn_scope_new() -> i64 {
   let scope = heap_alloc_zeroed(rc_default_heap(), runtime_spawn_scope_size(), 8)
@@ -175,6 +182,145 @@ pub(package) fn runtime_spawn_task_id(task: i64) -> i64 {
 
 pub(package) fn runtime_spawn_task_state(task: i64) -> i64 {
   if task == 0 { 0 - 1 } else { mem_load64_at(task, runtime_spawn_task_state_offset()) }
+}
+
+pub(package) fn runtime_spawn_task_continuation_cell(task: i64) -> i64 {
+  if task == 0 { 0 } else { task + runtime_spawn_task_continuation_offset() }
+}
+
+pub(package) fn runtime_spawn_task_suspend_runnable(task: i64, value: i64) -> i64 {
+  if task == 0 or runtime_spawn_task_state(task) != runtime_spawn_task_running() or
+    runtime_continuation_cell_is_full(runtime_spawn_task_continuation_cell(task)) == 0 { 0 }
+  else {
+    mem_store64_at(task, runtime_spawn_task_resume_value_offset(), value)
+    mem_store64_at(task, runtime_spawn_task_state_offset(), runtime_spawn_task_runnable())
+    1
+  }
+}
+
+pub(package) fn runtime_spawn_task_suspend_sleeping(task: i64, wake_nanos: i64) -> i64 {
+  if task == 0 or wake_nanos < 0 or runtime_spawn_task_state(task) != runtime_spawn_task_running() or
+    runtime_continuation_cell_is_full(runtime_spawn_task_continuation_cell(task)) == 0 { 0 }
+  else {
+    mem_store64_at(task, runtime_spawn_task_wake_nanos_offset(), wake_nanos)
+    mem_store64_at(task, runtime_spawn_task_state_offset(), runtime_spawn_task_sleeping())
+    1
+  }
+}
+
+pub(package) fn runtime_spawn_task_wait_for(task: i64, target: i64) -> i64 {
+  if task == 0 or target == 0 or task == target or
+    runtime_spawn_task_state(task) != runtime_spawn_task_running() or
+    runtime_continuation_cell_is_full(runtime_spawn_task_continuation_cell(task)) == 0 or
+    mem_load64_at(target, runtime_spawn_task_waiter_offset()) != 0 { 0 }
+  else {
+    mem_store64_at(target, runtime_spawn_task_waiter_offset(), task)
+    mem_store64_at(task, runtime_spawn_task_state_offset(), runtime_spawn_task_waiting())
+    1
+  }
+}
+
+pub(package) fn runtime_spawn_task_begin_resume(task: i64) -> i64 {
+  if task == 0 or runtime_spawn_task_state(task) != runtime_spawn_task_runnable() or
+    runtime_continuation_cell_is_full(runtime_spawn_task_continuation_cell(task)) == 0 { 0 }
+  else {
+    let value = mem_load64_at(task, runtime_spawn_task_resume_value_offset())
+    mem_store64_at(task, runtime_spawn_task_resume_value_offset(), 0)
+    mem_store64_at(task, runtime_spawn_task_state_offset(), runtime_spawn_task_running())
+    value
+  }
+}
+
+pub(package) fn runtime_spawn_task_wake_waiter(task: i64) -> i64 {
+  if task == 0 or runtime_spawn_task_state(task) != runtime_spawn_task_complete() { 0 }
+  else {
+    let waiter = mem_load64_at(task, runtime_spawn_task_waiter_offset())
+    if waiter == 0 { 0 }
+    else { if runtime_spawn_task_state(waiter) != runtime_spawn_task_waiting() or
+      runtime_continuation_cell_is_full(runtime_spawn_task_continuation_cell(waiter)) == 0 { 0 }
+    else {
+      let work = runtime_spawn_task_join(task)
+      mem_store64_at(task, runtime_spawn_task_waiter_offset(), 0)
+      mem_store64_at(waiter, runtime_spawn_task_resume_value_offset(), work)
+      mem_store64_at(waiter, runtime_spawn_task_state_offset(), runtime_spawn_task_runnable())
+      1
+    } }
+  }
+}
+
+pub(package) fn runtime_spawn_scope_next_runnable(scope: i64) -> i64 {
+  if scope == 0 { 0 }
+  else {
+    let mut current = mem_load64_at(scope, runtime_spawn_scope_head_offset())
+    let mut selected = 0
+    while current != 0 {
+      let state = runtime_spawn_task_state(current)
+      if (state == runtime_spawn_task_pending() or state == runtime_spawn_task_runnable()) and
+        (selected == 0 or runtime_spawn_task_id(current) < runtime_spawn_task_id(selected)) {
+        selected = current
+      } else { 0 }
+      current = mem_load64_at(current, runtime_spawn_task_next_offset())
+    }
+    selected
+  }
+}
+
+pub(package) fn runtime_spawn_scope_has_active(scope: i64) -> i64 {
+  if scope == 0 { 0 }
+  else {
+    let mut current = mem_load64_at(scope, runtime_spawn_scope_head_offset())
+    let mut active = 0
+    while current != 0 and active == 0 {
+      let state = runtime_spawn_task_state(current)
+      if state == runtime_spawn_task_pending() or state == runtime_spawn_task_running() or
+        state == runtime_spawn_task_runnable() or state == runtime_spawn_task_sleeping() or
+        state == runtime_spawn_task_waiting() { active = 1 } else { 0 }
+      current = mem_load64_at(current, runtime_spawn_task_next_offset())
+    }
+    active
+  }
+}
+
+pub(package) fn runtime_spawn_scope_wake_due(scope: i64, now_nanos: i64) -> i64 {
+  if scope == 0 or now_nanos < 0 { 0 }
+  else {
+    let mut current = mem_load64_at(scope, runtime_spawn_scope_head_offset())
+    let mut count = 0
+    while current != 0 {
+      if runtime_spawn_task_state(current) == runtime_spawn_task_sleeping() and
+        mem_load64_at(current, runtime_spawn_task_wake_nanos_offset()) <= now_nanos {
+        mem_store64_at(current, runtime_spawn_task_wake_nanos_offset(), 0)
+        mem_store64_at(current, runtime_spawn_task_resume_value_offset(), 0)
+        mem_store64_at(current, runtime_spawn_task_state_offset(), runtime_spawn_task_runnable())
+        count = count + 1
+      } else { 0 }
+      current = mem_load64_at(current, runtime_spawn_task_next_offset())
+    }
+    count
+  }
+}
+
+-- Return the ceiling number of milliseconds until the earliest sleeping task,
+-- zero when one is already due, or -1 when the scope has no timer waiter.
+pub(package) fn runtime_spawn_scope_next_sleep_millis(scope: i64, now_nanos: i64) -> i64 {
+  if scope == 0 or now_nanos < 0 { 0 - 1 }
+  else {
+    let mut current = mem_load64_at(scope, runtime_spawn_scope_head_offset())
+    let mut earliest = 0 - 1
+    while current != 0 {
+      if runtime_spawn_task_state(current) == runtime_spawn_task_sleeping() {
+        let wake = mem_load64_at(current, runtime_spawn_task_wake_nanos_offset())
+        if earliest < 0 or wake < earliest { earliest = wake } else { 0 }
+      } else { 0 }
+      current = mem_load64_at(current, runtime_spawn_task_next_offset())
+    }
+    if earliest < 0 { 0 - 1 }
+    else { if earliest <= now_nanos { 0 }
+    else {
+      let delta = earliest - now_nanos
+      delta / 1000000 + if delta % 1000000 == 0 { 0 } else { 1 }
+    } }
+  }
 }
 
 -- E is supplied by the handler from the checked callback contract. The raw
@@ -213,6 +359,7 @@ pub(package) fn runtime_spawn_scope_cleanup(scope: i64) -> i64 {
     mem_store64_at(scope, runtime_spawn_scope_head_offset(), 0)
     while task != 0 {
       let next = mem_load64_at(task, runtime_spawn_task_next_offset())
+      runtime_continuation_cell_drop_i64(runtime_spawn_task_continuation_cell(task))
       let work = mem_load64_at(task, runtime_spawn_task_work_offset())
       if work != 0 { runtime_spawn_work_discard(work) } else { 0 }
       heap_free(rc_default_heap(), task, runtime_spawn_task_size())

@@ -1,8 +1,11 @@
 -- stdlib/spawn.weft -- effectful structured tasks without function colouring
 
 use runtime/spawn_task.{*}
+use runtime/panic.{runtime_trap}
+use runtime/time.{runtime_platform_now_millis, runtime_platform_now_nanos, runtime_platform_sleep_millis}
 use stdlib/cancellation.{Cancellation, CancellationOutcome, with_deadline, with_scope}
 use stdlib/cancellation.{CancellationReason}
+use stdlib/continuation.{continuation_cell_from_ptr, continuation_cell_resume_i64, continuation_cell_store_i64}
 use stdlib/fail.{Fail}
 use stdlib/time.{Instant, Time}
 
@@ -13,6 +16,13 @@ use stdlib/time.{Instant, Time}
 pub effect Spawn {
   fn submit(work: i64) -> i64,
   fn join(task: i64) -> i64
+}
+
+-- One internal suspension atom keeps public capabilities tail-resumptive and
+-- makes the scheduler—not Time or Spawn—the sole owner of stored one-shot
+-- continuations. Modes are sealed below: runnable value, task join, timer.
+effect EventLoopSuspend {
+  @deferred fn suspend(task: i64, mode: i64, value: i64) -> i64
 }
 
 --- Submit an effectful Sendable task to the enclosing structured scope.
@@ -57,6 +67,109 @@ pub fn with_sequential<T, E>(body: () -[Spawn, E]> T) -[E]> T {
     }
     Spawn.join(task) -> resume(runtime_spawn_task_join(task))
   }
+}
+
+fn event_loop_drive<E>(scope: i64) -[E]> i64 {
+  let mut result = 0
+  let mut active = runtime_spawn_scope_has_active(scope)
+  while active == 1 {
+    let now = runtime_platform_now_nanos()
+    if now < 0 { runtime_trap(47, 0) } else { runtime_spawn_scope_wake_due(scope, now) }
+    let task = runtime_spawn_scope_next_runnable(scope)
+    if task != 0 {
+      if runtime_spawn_task_state(task) == runtime_spawn_task_pending() {
+        result = event_loop_run_task<E>(scope, task)
+      } else {
+        let resume_value = runtime_spawn_task_begin_resume(task)
+        let cell = continuation_cell_from_ptr(runtime_spawn_task_continuation_cell(task))
+        result = continuation_cell_resume_i64(cell, resume_value, 0)
+        runtime_spawn_task_wake_waiter(task)
+      }
+    } else {
+      let delay = runtime_spawn_scope_next_sleep_millis(scope, now)
+      if delay < 0 { runtime_trap(47, 0) }
+      else { runtime_platform_sleep_millis(delay) }
+    }
+    active = runtime_spawn_scope_has_active(scope)
+  }
+  result
+}
+
+fn event_loop_run_task<E>(scope: i64, task: i64) -[E]> i64 {
+  let result = handle {
+    handle {
+      handle runtime_spawn_task_run<Spawn | Time | E>(task) {
+        Spawn.submit(work) -> {
+          let child = runtime_spawn_scope_track(scope, work)
+          if child == 0 { runtime_trap(47, 0) } else { nil }
+          resume(EventLoopSuspend.suspend(task, 0, child))
+        }
+        Spawn.join(target) -> {
+          if runtime_spawn_task_state(target) == runtime_spawn_task_complete() {
+            resume(runtime_spawn_task_join(target))
+          } else {
+            resume(EventLoopSuspend.suspend(task, 1, target))
+          }
+        }
+      }
+    } {
+      Time.now_millis() -> resume(runtime_platform_now_millis())
+      Time.now_nanos() -> resume(runtime_platform_now_nanos())
+      Time.sleep_millis(ms) -> {
+        if ms < 0 {
+          resume(0 - 1)
+        } else { if ms == 0 {
+          resume(0)
+        } else {
+          let now = runtime_platform_now_nanos()
+          if now < 0 or ms > 9223372036854 or now > 9223372036854775807 - ms * 1000000 {
+            resume(0 - 1)
+          } else {
+            resume(EventLoopSuspend.suspend(task, 2, now + ms * 1000000))
+          }
+        } }
+      }
+    }
+  } {
+    EventLoopSuspend.suspend(current, mode, value) with k -> {
+      if current != task { runtime_trap(47, 0) } else { nil }
+      let cell = continuation_cell_from_ptr(runtime_spawn_task_continuation_cell(task))
+      if continuation_cell_store_i64(cell, k) != 1 { runtime_trap(47, 0) } else { nil }
+      if mode == 0 {
+        if runtime_spawn_task_suspend_runnable(task, value) != 1 {
+          runtime_trap(47, 0)
+        } else { 0 }
+      } else { if mode == 1 {
+        if runtime_spawn_task_wait_for(task, value) != 1 {
+          runtime_trap(47, 0)
+        } else { 0 }
+      } else { if mode == 2 {
+        if runtime_spawn_task_suspend_sleeping(task, value) != 1 {
+          runtime_trap(47, 0)
+        } else { 0 }
+      } else {
+        runtime_trap(47, 0)
+      } } }
+    }
+  }
+  runtime_spawn_task_wake_waiter(task)
+  result
+}
+
+--- Run a single-threaded production event loop over stored continuations.
+---
+--- Spawn and Time keep their ordinary effect signatures. Sleeping tasks yield
+--- their one-shot continuation; the executor blocks in the platform only when
+--- no accepted task is runnable, and the structured scope drains every task
+--- before returning.
+pub fn with_event_loop<T, E>(body: () -[Spawn, Time, E]> T) -[E]> T {
+  let scope = runtime_spawn_scope_new()
+  defer runtime_spawn_scope_cleanup(scope)
+  let work = runtime_spawn_work_pack<T, Spawn | Time | E>(body)
+  let root = runtime_spawn_scope_track(scope, work)
+  if root == 0 { runtime_trap(47, 0) } else { nil }
+  event_loop_drive<E>(scope)
+  runtime_spawn_work_take<T>(runtime_spawn_task_join(root))
 }
 
 --- Run a deterministic sequential Spawn scope with cooperative cancellation.
