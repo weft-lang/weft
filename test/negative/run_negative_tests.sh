@@ -528,6 +528,7 @@ check_rejects "unique_contextual_lambda_param_used_twice" "test/negative/unique_
 check_rejects "unique_par_spawn_use_after_move" "test/negative/unique_par_spawn_use_after_move.weft" "type error: unique value used more than once"
 check_rejects "owned_param_used_twice" "test/negative/owned_param_used_twice.weft" "type error: owned value used more than once"
 check_rejects "owned_let_used_twice" "test/negative/owned_let_used_twice.weft" "type error: owned value used more than once"
+check_rejects "owned_borrow_after_move" "test/negative/owned_borrow_after_move.weft" "type error: owned value used more than once"
 check_rejects "linear_pattern_binding_used_twice" "test/negative/linear_pattern_binding_used_twice.weft" "type error: owned value used more than once"
 check_rejects "linear_pattern_guard_consumes_binding" "test/negative/linear_pattern_guard_consumes_binding.weft" "type error: linear pattern binding cannot be consumed in a match guard"
 check_rejects "linear_try_result_used_after_move" "test/negative/linear_try_result_used_after_move.weft" "type error: linear aggregate value used more than once"

@@ -8,6 +8,7 @@ WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-120}
 WEFT_TEST_RUNAWAY_RSS_LIMIT_KB=${WEFT_TEST_RUNAWAY_RSS_LIMIT_KB:-16000000}
 WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB}
 WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-1000000}
+PROJECT_ROOT=$(pwd)
 case "$WEFT" in
   /*) WEFT_ABS="$WEFT" ;;
   *) WEFT_ABS="$(pwd)/$WEFT" ;;
@@ -3035,6 +3036,214 @@ run_binary_guarded "$tmp_pkg_trust_dir/native_linked/native"
 pkg_native_linked_exit=$?
 set -e
 assert_equals "package_native_manifest_call_links_and_runs" "$pkg_native_linked_exit" "42"
+
+# Package archives and dynamic libraries are selected by manifest order and
+# exact package-relative path, hashed before object output, then handed to the
+# finalizer as those exact paths. A mismatched first candidate must not fall
+# through to a same-named artifact later in the search list.
+mkdir -p \
+  "$tmp_pkg_trust_dir/native_artifacts/native/archive_first" \
+  "$tmp_pkg_trust_dir/native_artifacts/native/archive_second" \
+  "$tmp_pkg_trust_dir/native_artifacts/native/dynamic"
+printf '%s\n' 'long weft_archive_value(void) { return 40; }' > "$tmp_pkg_trust_dir/native_artifacts/archive_first.c"
+printf '%s\n' 'long weft_archive_value(void) { return 99; }' > "$tmp_pkg_trust_dir/native_artifacts/archive_second.c"
+printf '%s\n' 'long weft_dynamic_value(void) { return 2; }' > "$tmp_pkg_trust_dir/native_artifacts/dynamic.c"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/archive_first.c" -o "$tmp_pkg_trust_dir/native_artifacts/archive_first.o"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/archive_second.c" -o "$tmp_pkg_trust_dir/native_artifacts/archive_second.o"
+/usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_first/libweft_fixture.a" "$tmp_pkg_trust_dir/native_artifacts/archive_first.o"
+/usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_second/libweft_fixture.a" "$tmp_pkg_trust_dir/native_artifacts/archive_second.o"
+/usr/bin/clang -dynamiclib \
+  "$tmp_pkg_trust_dir/native_artifacts/dynamic.c" \
+  -Wl,-install_name,"$tmp_pkg_trust_dir/native_artifacts/native/dynamic/libweft_fixture_dynamic.dylib" \
+  -o "$tmp_pkg_trust_dir/native_artifacts/native/dynamic/libweft_fixture_dynamic.dylib"
+codesign -s - "$tmp_pkg_trust_dir/native_artifacts/native/dynamic/libweft_fixture_dynamic.dylib" >/dev/null
+native_archive_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_first/libweft_fixture.a")
+native_archive_digest=${native_archive_digest_line%% *}
+native_dynamic_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/dynamic/libweft_fixture_dynamic.dylib")
+native_dynamic_digest=${native_dynamic_digest_line%% *}
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_fixture","search":["native/archive_first","native/archive_second"],"content":"sha256:'"$native_archive_digest"'","optional":false},{"id":"dynamic","kind":"dynamic","link":"weft_fixture_dynamic","search":["native/dynamic"],"content":"sha256:'"$native_dynamic_digest"'","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_archive_value","library":"archive","params":[],"result":"i64","optional":false},{"declaration":"native_dynamic_value","symbol":"weft_dynamic_value","library":"dynamic","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_archive_value() + native_dynamic_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_artifacts)
+codesign -s - "$tmp_pkg_trust_dir/native_artifacts/native_artifacts" >/dev/null
+native_artifact_dependencies=$(otool -L "$tmp_pkg_trust_dir/native_artifacts/native_artifacts")
+assert_contains "package_native_build_records_exact_dynamic_artifact" "$native_artifact_dependencies" "$tmp_pkg_trust_dir/native_artifacts/native/dynamic/libweft_fixture_dynamic.dylib"
+native_artifact_symbols=$(nm "$tmp_pkg_trust_dir/native_artifacts/native_artifacts")
+assert_contains "package_native_build_links_selected_archive" "$native_artifact_symbols" "_weft_archive_value"
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_artifacts"
+pkg_native_artifacts_exit=$?
+set -e
+assert_equals "package_native_archive_and_dynamic_link_and_run" "$pkg_native_artifacts_exit" "42"
+
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_fixture","search":["native/archive_first","native/archive_second"],"content":"sha256:0000000000000000000000000000000000000000000000000000000000000000","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_archive_value","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_archive_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+set +e
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" compile main.weft) > "$tmp_pkg_trust_dir/native_artifacts/mismatched.o" 2> "$tmp_pkg_trust_dir/native_artifacts/mismatched.err"
+pkg_native_mismatch_exit=$?
+set -e
+assert_equals "package_native_content_mismatch_fails" "$pkg_native_mismatch_exit" "1"
+assert_contains "package_native_content_mismatch_is_explicit" "$(<"$tmp_pkg_trust_dir/native_artifacts/mismatched.err")" "does not match its manifest sha256 content"
+if [ ! -s "$tmp_pkg_trust_dir/native_artifacts/mismatched.o" ]; then
+  echo "  ok package_native_content_mismatch_emits_no_object"
+else
+  echo "  fail package_native_content_mismatch_emits_no_object"
+  exit 1
+fi
+
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"optional","kind":"archive","link":"weft_optional","search":["native/missing"],"content":"sha256:0000000000000000000000000000000000000000000000000000000000000000","optional":true}],"symbols":[{"declaration":"native_optional_value","symbol":"weft_optional_value","library":"optional","params":[],"result":"i64","optional":true}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -> i64 { 0 }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" compile main.weft) > "$tmp_pkg_trust_dir/native_artifacts/optional_uncalled.o"
+optional_uncalled_symbols=$(nm -u "$tmp_pkg_trust_dir/native_artifacts/optional_uncalled.o")
+assert_not_contains "package_native_uncalled_optional_library_is_omitted" "$optional_uncalled_symbols" "_weft_optional_value"
+
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_optional_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+set +e
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" compile main.weft) > "$tmp_pkg_trust_dir/native_artifacts/optional_called.o" 2> "$tmp_pkg_trust_dir/native_artifacts/optional_called.err"
+pkg_native_optional_called_exit=$?
+set -e
+assert_equals "package_native_called_missing_optional_fails" "$pkg_native_optional_called_exit" "1"
+assert_contains "package_native_called_missing_optional_is_explicit" "$(<"$tmp_pkg_trust_dir/native_artifacts/optional_called.err")" "is optional but unavailable in its declared search paths"
+if [ ! -s "$tmp_pkg_trust_dir/native_artifacts/optional_called.o" ]; then
+  echo "  ok package_native_called_missing_optional_emits_no_object"
+else
+  echo "  fail package_native_called_missing_optional_emits_no_object"
+  exit 1
+fi
+
+# A dependency-owned trusted leaf seals a real C archive behind an ordinary
+# pure API. Opaque owned handles carry exact Drop, while const_bytes/mut_bytes
+# lower one scoped Weft slice to the C (pointer, length) product. The importing
+# root grants only the exact leaf and never receives Unsafe authority.
+mkdir -p \
+  "$tmp_pkg_trust_dir/native_safe/deps/fixture/native/lib" \
+  "$tmp_pkg_trust_dir/native_safe/deps/fixture/native"
+ln -s "$PROJECT_ROOT/runtime" "$tmp_pkg_trust_dir/native_safe/runtime"
+ln -s "$PROJECT_ROOT/stdlib" "$tmp_pkg_trust_dir/native_safe/stdlib"
+printf '%s\n' \
+  '#include <stdint.h>' \
+  '#include <stdlib.h>' \
+  'typedef struct fixture_handle { int64_t value; } fixture_handle;' \
+  'static int64_t fixture_drops = 0;' \
+  'void *fixture_open(int64_t value) { fixture_handle *resource = malloc(sizeof(fixture_handle)); if (resource != NULL) resource->value = value; return resource; }' \
+  'int64_t fixture_get(void *raw) { fixture_handle *resource = raw; return resource == NULL ? -1 : resource->value; }' \
+  'void fixture_close(void *raw) { fixture_drops += 1; free(raw); }' \
+  'int64_t fixture_drop_count(void) { return fixture_drops; }' \
+  'int64_t fixture_sum(const uint8_t *data, uint64_t len) { int64_t total = 0; for (uint64_t i = 0; i < len; i += 1) total += data[i]; return total; }' \
+  'int64_t fixture_fill(uint8_t *data, uint64_t len, int64_t value) { for (uint64_t i = 0; i < len; i += 1) data[i] = (uint8_t)value; return (int64_t)len; }' \
+  > "$tmp_pkg_trust_dir/native_safe/deps/fixture/fixture.c"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_safe/deps/fixture/fixture.c" -o "$tmp_pkg_trust_dir/native_safe/deps/fixture/fixture.o"
+/usr/bin/ar rcs "$tmp_pkg_trust_dir/native_safe/deps/fixture/native/lib/libfixture.a" "$tmp_pkg_trust_dir/native_safe/deps/fixture/fixture.o"
+native_safe_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_safe/deps/fixture/native/lib/libfixture.a")
+native_safe_digest=${native_safe_digest_line%% *}
+printf '%s\n' \
+  '{"package":"fixture","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["native/raw"],"native_bindings":{"native/raw":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"fixture","kind":"archive","link":"fixture","search":["native/lib"],"content":"sha256:'"$native_safe_digest"'","optional":false}],"symbols":[{"declaration":"native_open","symbol":"fixture_open","library":"fixture","params":["i64"],"result":"opaque_ptr","optional":false},{"declaration":"native_get","symbol":"fixture_get","library":"fixture","params":["opaque_ptr"],"result":"i64","optional":false},{"declaration":"native_close","symbol":"fixture_close","library":"fixture","params":["opaque_ptr"],"result":"nil","optional":false},{"declaration":"native_drop_count","symbol":"fixture_drop_count","library":"fixture","params":[],"result":"i64","optional":false},{"declaration":"native_sum","symbol":"fixture_sum","library":"fixture","params":["const_bytes"],"result":"i64","optional":false},{"declaration":"native_fill","symbol":"fixture_fill","library":"fixture","params":["mut_bytes","i64"],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_safe/deps/fixture/weft.pkg"
+printf '%s\n' \
+  'use runtime/unsafe.{*}' \
+  'use stdlib/drop.{*}' \
+  'pub type FixtureHandle = opaque *any' \
+  'fn fixture_seal_open(value: i64) -> *any { handle native_open(value) { Unsafe.transmute(raw) -> resume(__transmute(raw)) } }' \
+  'fn fixture_seal_get(raw: *any) -> i64 { handle native_get(raw) { Unsafe.transmute(value) -> resume(__transmute(value)) } }' \
+  'fn fixture_seal_close(raw: *any) -> i64 {' \
+  '  handle { native_close(raw) 0 } { Unsafe.transmute(value) -> resume(__transmute(value)) }' \
+  '}' \
+  'impl Drop for FixtureHandle {' \
+  '  fn drop(self) -> i64 { match self { FixtureHandle(raw) -> fixture_seal_close(raw) } }' \
+  '}' \
+  'pub fn fixture_open_safe(value: i64) -> owned FixtureHandle { FixtureHandle(fixture_seal_open(value)) }' \
+  'pub fn fixture_get_safe(resource: borrow FixtureHandle) -> i64 { match resource { FixtureHandle(raw) -> fixture_seal_get(raw) } }' \
+  'pub fn fixture_drop_count_safe() -> i64 { handle native_drop_count() { Unsafe.transmute(value) -> resume(__transmute(value)) } }' \
+  'pub fn fixture_sum_slice(values: [u8]) -> i64 {' \
+  '  handle native_sum(values) { Unsafe.transmute(value) -> resume(__transmute(value)) }' \
+  '}' \
+  'pub fn fixture_fill_bytes(values: [mut u8], value: i64) -> i64 {' \
+  '  handle native_fill(values, value) { Unsafe.transmute(raw) -> resume(__transmute(raw)) }' \
+  '}' \
+  > "$tmp_pkg_trust_dir/native_safe/deps/fixture/native/raw.weft"
+printf '%s\n' \
+  'use fixture/native/raw.{fixture_sum_slice}' \
+  'use stdlib/bytes.{*}' \
+  'use stdlib/vector.{*}' \
+  'pub fn fixture_sum_bytes(values: Bytes) -> i64 {' \
+  '  let contiguous = bytes_to_vector(values)' \
+  '  fixture_sum_slice(contiguous[..])' \
+  '}' \
+  > "$tmp_pkg_trust_dir/native_safe/safe_fixture.weft"
+printf '%s\n' \
+  '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"fixture":"deps/fixture"},"trust":{"fixture":{"version":"1.0.0","source":"path:deps/fixture","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111","modules":["native/raw"]}}}' \
+  > "$tmp_pkg_trust_dir/native_safe/weft.pkg"
+printf '%s\n' \
+  '{"lock_version":1,"manifest_version":1,"weft":"0.1","packages":[{"name":"app","version":"1.0.0","source":"path:.","content":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},{"name":"fixture","version":"1.0.0","source":"path:deps/fixture","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111"}]}' \
+  > "$tmp_pkg_trust_dir/native_safe/weft.lock"
+printf '%s\n' \
+  'use fixture/native/raw.{*}' \
+  'use safe_fixture.{fixture_sum_bytes}' \
+  'use stdlib/bytes.{*}' \
+  'use stdlib/vector.{*}' \
+  'fn scoped_handle_value() -> i64 {' \
+  '  let resource: owned FixtureHandle = fixture_open_safe(40)' \
+  '  fixture_get_safe(resource)' \
+  '}' \
+  'fn main() -> i64 {' \
+  '  let handle_value = scoped_handle_value()' \
+  '  let text_sum = fixture_sum_bytes(bytes_from_str("*"))' \
+  '  let mutable = bytes_to_vector(bytes_from_str("abc"))' \
+  '  let filled = fixture_fill_bytes(mutable[..], 14)' \
+  '  let filled_sum = fixture_sum_bytes(bytes_from_vector(mutable))' \
+  '  if handle_value == 40 and text_sum == 42 and filled == 3 and filled_sum == 42 and fixture_drop_count_safe() == 1 { 42 } else { 1 }' \
+  '}' \
+  > "$tmp_pkg_trust_dir/native_safe/main.weft"
+native_safe_check=$(cd "$tmp_pkg_trust_dir/native_safe" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_native_safe_dependency_hides_unsafe" "$native_safe_check" "0 errors"
+native_safe_audit=$(cd "$tmp_pkg_trust_dir/native_safe" && "$WEFT_ABS" pkg audit 2>/dev/null)
+native_safe_audit_second=$(cd "$tmp_pkg_trust_dir/native_safe" && "$WEFT_ABS" pkg audit 2>/dev/null)
+assert_equals "package_native_audit_is_deterministic" "$native_safe_audit_second" "$native_safe_audit"
+assert_contains "package_native_audit_pins_schema" "$native_safe_audit" '"schema_version":1'
+assert_contains "package_native_audit_names_exact_package" "$native_safe_audit" '"package":"fixture"'
+assert_contains "package_native_audit_names_exact_module" "$native_safe_audit" '"module":"native/raw"'
+assert_contains "package_native_audit_names_content_identity" "$native_safe_audit" '"content":"sha256:1111111111111111111111111111111111111111111111111111111111111111"'
+assert_contains "package_native_audit_lists_const_bytes" "$native_safe_audit" '"const_bytes"'
+assert_contains "package_native_audit_lists_mut_bytes" "$native_safe_audit" '"mut_bytes"'
+assert_contains "package_native_audit_lists_owned_handle_symbol" "$native_safe_audit" '"declaration":"native_open"'
+assert_contains "package_native_audit_lists_wrapper_facts" "$native_safe_audit" '"wrappers":['
+assert_contains "package_native_audit_lists_safe_wrapper" "$native_safe_audit" '"name":"fixture_open_safe"'
+assert_contains "package_native_audit_lists_safe_wrapper_signature" "$native_safe_audit" '"signature":"pub fn fixture_open_safe(value: i64) -> owned FixtureHandle"'
+assert_contains "package_native_audit_lists_safe_wrapper_effects" "$native_safe_audit" '"effects":"pure"'
+assert_not_contains "package_native_audit_wrapper_effects_hide_unsafe" "$native_safe_audit" '"effects":"Unsafe"'
+(cd "$tmp_pkg_trust_dir/native_safe" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_safe)
+codesign -s - "$tmp_pkg_trust_dir/native_safe/native_safe" >/dev/null
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_safe/native_safe"
+native_safe_exit=$?
+set -e
+assert_equals "package_native_owned_handle_and_scoped_bytes_run" "$native_safe_exit" "42"
+
+printf '%s\n' \
+  'use fixture/native/raw.{*}' \
+  'fn consume(resource: owned FixtureHandle) -> i64 { 0 }' \
+  'fn main() -> i64 {' \
+  '  let resource: owned FixtureHandle = fixture_open_safe(1)' \
+  '  consume(resource) + fixture_get_safe(resource)' \
+  '}' \
+  > "$tmp_pkg_trust_dir/native_safe/main.weft"
+native_double_drop=$(cd "$tmp_pkg_trust_dir/native_safe" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_native_owned_handle_rejects_double_consume" "$native_double_drop" "owned value used more than once"
+
+printf '%s\n' 'pub fn leaked_pointer(raw: *any) -> *any { raw }' > "$tmp_pkg_trust_dir/native_safe/deps/fixture/native/raw.weft"
+printf '%s\n' 'use fixture/native/raw.{leaked_pointer}' 'fn main() -> i64 { 0 }' > "$tmp_pkg_trust_dir/native_safe/main.weft"
+native_pointer_leak=$(cd "$tmp_pkg_trust_dir/native_safe" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_native_public_pointer_is_rejected" "$native_pointer_leak" "native binding public surface cannot expose raw pointers"
+
+printf '%s\n' 'use runtime/unsafe.{*}' 'pub fn leaked_authority() -[Unsafe]> i64 { 0 }' > "$tmp_pkg_trust_dir/native_safe/deps/fixture/native/raw.weft"
+printf '%s\n' 'use fixture/native/raw.{leaked_authority}' 'fn main() -> i64 { 0 }' > "$tmp_pkg_trust_dir/native_safe/main.weft"
+native_unsafe_leak=$(cd "$tmp_pkg_trust_dir/native_safe" && "$WEFT_ABS" check main.weft 2>&1 || true)
+assert_contains "package_native_public_unsafe_is_rejected" "$native_unsafe_leak" "native binding public wrapper cannot expose Unsafe"
 
 # Trust belongs to the exact source buffer; importing an unlisted helper from
 # a trusted binding does not make that helper trusted.
