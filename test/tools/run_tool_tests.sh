@@ -451,7 +451,7 @@ stdlib_doc_modules=(
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft stdlib/json.weft
   stdlib/secure_random.weft stdlib/net_address.weft stdlib/idna.weft
-  stdlib/dns.weft
+  stdlib/dns.weft stdlib/tcp.weft
   stdlib/state.weft stdlib/diagnostic_type.weft stdlib/diagnostic.weft
   stdlib/diagnostic_registry.weft stdlib/map.weft stdlib/set.weft
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector_type.weft
@@ -490,7 +490,13 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "idna" ]; then
     assert_contains "doc_stdlib_idna_pins_public_surface" "$(<"$tmp_out")" "Public API items: 15. Documented: 15."
   elif [ "$stdlib_doc_name" = "dns" ]; then
-    assert_contains "doc_stdlib_dns_pins_public_surface" "$(<"$tmp_out")" "Public API items: 19. Documented: 19."
+    assert_contains "doc_stdlib_dns_pins_public_surface" "$(<"$tmp_out")" "Public API items: 25. Documented: 25."
+    assert_contains "doc_stdlib_dns_policy_preserves_authority_fact" "$(<"$tmp_out")" "pub fn dns_with_policy<T, E>(policy: DnsPolicy, body: () -[DnsResolve, E]> T) -[DnsResolve, E]> T"
+  elif [ "$stdlib_doc_name" = "tcp" ]; then
+    assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public API items: 65. Documented: 65."
+    assert_contains "doc_stdlib_tcp_connect_preserves_owned_authority_fact" "$(<"$tmp_out")" "pub fn tcp_connect(address: SocketAddress, options: TcpConnectOptions) -[TcpConnect]> Result<owned TcpStream, TcpError>"
+    assert_contains "doc_stdlib_tcp_connect_policy_preserves_authority_fact" "$(<"$tmp_out")" "pub fn tcp_connect_with_policy<T, E>(policy: TcpConnectPolicy, body: () -[TcpConnect, E]> T) -[TcpConnect, E]> T"
+    assert_contains "doc_stdlib_tcp_listen_policy_preserves_authority_fact" "$(<"$tmp_out")" "pub fn tcp_listen_with_policy<T, E>(policy: TcpListenPolicy, body: () -[TcpListen, E]> T) -[TcpListen, E]> T"
   elif [ "$stdlib_doc_name" = "io" ] || [ "$stdlib_doc_name" = "par" ]; then
     assert_contains "doc_stdlib_${stdlib_doc_name}_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
   fi
@@ -3471,4 +3477,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 963 passed, 0 failed"
+echo "Tool boundary summary: 971 passed, 0 failed"

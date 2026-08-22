@@ -1,4 +1,5 @@
 use stdlib/fail.{Fail}
+use stdlib/eq.{Eq}
 use stdlib/io_types.{IoReadBytes, IoReadProgress, IoWriteProgress, IoWroteBytes}
 use stdlib/net_address.{SocketAddress, SocketV4, ipv4_address}
 use stdlib/result.{Err, Ok, Result, result_err, result_ok}
@@ -7,8 +8,16 @@ use stdlib/test.{Test}
 use stdlib/vector.{vector_get_in_bounds, vector_len, vector_push, vector_with_capacity}
 use stdlib/vector_type.{Vector}
 
+effect TcpPolicyResidual {
+  fn tick() -> i64
+}
+
 fn tcp_contract_address() -> SocketAddress {
   SocketV4(ipv4_address(127, 0, 0, 1), 8080)
+}
+
+fn tcp_contract_other_address() -> SocketAddress {
+  SocketV4(ipv4_address(127, 0, 0, 1), 8081)
 }
 
 fn tcp_contract_byte(value: i64) -> u8 {
@@ -29,6 +38,7 @@ fn tcp_contract_error_code(error: TcpError) -> i64 {
     TcpNetworkUnreachable -> 10
     TcpTimedOut -> 11
     TcpPermissionDenied -> 12
+    TcpPolicyDenied -> 15
     TcpResourceExhausted -> 13
     TcpInvalidProgress -> 14
     TcpPlatform(code) -> 1000 + code
@@ -94,6 +104,26 @@ fn tcp_contract_partial_io(
   wrote * 100 + read
 }
 
+fn tcp_contract_return_with_stream() -[TcpConnect, TcpStreamIO]> i64 {
+  let stream: owned TcpStream = match tcp_connect(
+    tcp_contract_address(),
+    tcp_connect_options_default()
+  ) {
+    Err(error) -> return 0 - tcp_contract_error_code(error)
+    Ok(acquired) -> acquired
+  }
+  return 47
+}
+
+fn tcp_contract_abort_with_stream(
+) -[TcpConnect, TcpStreamIO, Fail<TcpError>]> i64 {
+  let stream: owned TcpStream = tcp_connect(
+    tcp_contract_address(),
+    tcp_connect_options_default()
+  )?
+  Fail<TcpError>.fail(TcpTimedOut)
+}
+
 test "TCP option constructors preserve explicit policy" {
   let connect = tcp_connect_options_default()
   let listen = tcp_listen_options(32)
@@ -116,6 +146,7 @@ test "TCP errors remain typed alternatives with preserved platform detail" {
   Test.assert_eq(tcp_contract_error_code(TcpNetworkUnreachable), 10)
   Test.assert_eq(tcp_contract_error_code(TcpTimedOut), 11)
   Test.assert_eq(tcp_contract_error_code(TcpPermissionDenied), 12)
+  Test.assert_eq(tcp_contract_error_code(TcpPolicyDenied), 15)
   Test.assert_eq(tcp_contract_error_code(TcpResourceExhausted), 13)
   Test.assert_eq(tcp_contract_error_code(TcpInvalidProgress), 14)
   Test.assert_eq(tcp_contract_error_code(TcpPlatform(991)), 1991)
@@ -245,4 +276,147 @@ test "fake stream handler preserves partial write and read progress" {
   }
   Test.assert_eq(got, 201)
   Test.assert_eq(__u64_to_i64(__u8_to_u64(vector_get_in_bounds<u8>(destination, 0))), 55)
+}
+
+test "owned TCP streams drop exactly once on explicit return and effect abort" {
+  let released = vector_with_capacity<i64>(2)
+  let returned = handle {
+    handle tcp_contract_return_with_stream() {
+      TcpConnect.connect(address, options) ->
+        resume(result_ok<owned TcpStream, TcpError>(tcp_stream_from_token(81)))
+    }
+  } {
+    TcpStreamIO.release(stream) -> {
+      vector_push<i64>(released, tcp_stream_release_token(stream))
+      resume(0)
+    }
+  }
+  let aborted = handle {
+    handle {
+      handle tcp_contract_abort_with_stream() {
+        Fail<TcpError>.fail(error) -> tcp_contract_error_code(error)
+      }
+    } {
+      TcpConnect.connect(address, options) ->
+        resume(result_ok<owned TcpStream, TcpError>(tcp_stream_from_token(83)))
+    }
+  } {
+    TcpStreamIO.release(stream) -> {
+      vector_push<i64>(released, tcp_stream_release_token(stream))
+      resume(0)
+    }
+  }
+  Test.assert_eq(returned, 47)
+  Test.assert_eq(aborted, 11)
+  Test.assert_eq(vector_len<i64>(released), 2)
+  Test.assert_eq(vector_get_in_bounds<i64>(released, 0), 81)
+  Test.assert_eq(vector_get_in_bounds<i64>(released, 1), 83)
+}
+
+fn tcp_contract_connect_policy_probe(
+  source: Vector<SocketAddress>
+) -[TcpConnect, TcpStreamIO, TcpPolicyResidual]> i64 {
+  -- Mutation after handler entry must not widen the snapshotted policy.
+  vector_push<SocketAddress>(source, tcp_contract_other_address())
+  let denied = match tcp_connect(
+    tcp_contract_other_address(),
+    tcp_connect_options_default()
+  ) {
+    Err(TcpPolicyDenied) -> 1
+    Err(error) -> 0
+    Ok(stream) -> { tcp_stream_close(stream) 0 }
+  }
+  let allowed = match tcp_connect(
+    tcp_contract_address(),
+    tcp_connect_options_default()
+  ) {
+    Err(error) -> 0
+    Ok(stream) -> match tcp_stream_close(stream) {
+      Ok(nil) -> 1
+      Err(error) -> 0
+    }
+  }
+  denied + allowed + TcpPolicyResidual.tick()
+}
+
+test "outbound TCP policy snapshots exact endpoints and delegates allowed work" {
+  let policy_addresses = vector_with_capacity<SocketAddress>(1)
+  vector_push<SocketAddress>(policy_addresses, tcp_contract_address())
+  let delegated = vector_with_capacity<SocketAddress>(1)
+  let released = vector_with_capacity<i64>(1)
+  let got = handle {
+    handle {
+      handle tcp_connect_with_policy(
+        TcpConnectPolicyAllowOnly(policy_addresses),
+        () => tcp_contract_connect_policy_probe(policy_addresses)
+      ) {
+        TcpConnect.connect(address, options) -> {
+          vector_push<SocketAddress>(delegated, address)
+          resume(result_ok<owned TcpStream, TcpError>(tcp_stream_from_token(71)))
+        }
+      }
+    } {
+      TcpStreamIO.release(stream) -> {
+        vector_push<i64>(released, tcp_stream_release_token(stream))
+        resume(0)
+      }
+    }
+  } {
+    TcpPolicyResidual.tick() -> resume(40)
+  }
+  Test.assert_eq(got, 42)
+  Test.assert_eq(vector_len<SocketAddress>(delegated), 1)
+  Test.assert_eq(vector_get_in_bounds<SocketAddress>(delegated, 0).eq(tcp_contract_address()), true)
+  Test.assert_eq(vector_len<i64>(released), 1)
+  Test.assert_eq(vector_get_in_bounds<i64>(released, 0), 71)
+}
+
+fn tcp_contract_listen_policy_probe() -[TcpListen, TcpListenerIO]> i64 {
+  let denied = match tcp_listen(
+    tcp_contract_address(),
+    tcp_listen_options(1)
+  ) {
+    Err(TcpPolicyDenied) -> 1
+    Err(error) -> 0
+    Ok(listener) -> { tcp_listener_close(listener) 0 }
+  }
+  let allowed = match tcp_listen(
+    tcp_contract_other_address(),
+    tcp_listen_options(2)
+  ) {
+    Err(error) -> 0
+    Ok(listener) -> match tcp_listener_close(listener) {
+      Ok(nil) -> 1
+      Err(error) -> 0
+    }
+  }
+  denied + allowed
+}
+
+test "inbound TCP policy is distinct and delegates only its local allowlist" {
+  let policy_addresses = vector_with_capacity<SocketAddress>(1)
+  vector_push<SocketAddress>(policy_addresses, tcp_contract_other_address())
+  let delegated = vector_with_capacity<SocketAddress>(1)
+  let released = vector_with_capacity<i64>(1)
+  let got = handle {
+    handle tcp_listen_with_policy(
+      TcpListenPolicyAllowOnly(policy_addresses),
+      tcp_contract_listen_policy_probe
+    ) {
+      TcpListen.listen(address, options) -> {
+        vector_push<SocketAddress>(delegated, address)
+        resume(result_ok<owned TcpListener, TcpError>(tcp_listener_from_token(73)))
+      }
+    }
+  } {
+    TcpListenerIO.release(listener) -> {
+      vector_push<i64>(released, tcp_listener_release_token(listener))
+      resume(0)
+    }
+  }
+  Test.assert_eq(got, 2)
+  Test.assert_eq(vector_len<SocketAddress>(delegated), 1)
+  Test.assert_eq(vector_get_in_bounds<SocketAddress>(delegated, 0).eq(tcp_contract_other_address()), true)
+  Test.assert_eq(vector_len<i64>(released), 1)
+  Test.assert_eq(vector_get_in_bounds<i64>(released, 0), 73)
 }
