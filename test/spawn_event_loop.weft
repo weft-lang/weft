@@ -1,8 +1,16 @@
 use runtime/alloc.{arena_alloc, arena_free, arena_new}
 use runtime/memory.{mem_load64, mem_store64}
 use runtime/rc_implicit_test.{RuntimeRcProbe, runtime_rc_probe_count, runtime_rc_probe_load, runtime_rc_probe_new}
+use runtime/tcp.{runtime_platform_tcp}
+use stdlib/fail.{Fail}
+use stdlib/io_types.{IoEndOfFile, IoReadBytes, IoWroteBytes}
+use stdlib/net_address.{SocketAddress, SocketV4, ipv4_address}
+use stdlib/result.{Err, Ok, Result}
 use stdlib/spawn as spawn
+use stdlib/tcp.{TcpConnect, TcpError, TcpListener, TcpListenerIO, TcpListenerReadiness, TcpListenerReadinessFailed, TcpListenerReady, TcpReadiness, TcpReadinessError, TcpReadinessInterrupted, TcpReadinessInvalidated, TcpReadinessPlatform, TcpReadinessResourceExhausted, TcpStream, TcpStreamIO, TcpStreamReadiness, TcpStreamReadinessFailed, TcpStreamReady, tcp_accept, tcp_connect, tcp_connect_options_default, tcp_listen, tcp_listen_options, tcp_listener_close, tcp_listener_local_address, tcp_stream_close, tcp_wait_acceptable, tcp_wait_readable, tcp_wait_writable, tcp_read, tcp_write}
 use stdlib/time as time
+use stdlib/vector.{vector_get_in_bounds, vector_push, vector_with_capacity}
+use stdlib/vector_type.{Vector}
 
 effect EventLoopMark {
   fn mark(value: i64) -> nil
@@ -48,6 +56,194 @@ fn event_loop_nested_scope() -> i64 {
     let task = spawn.spawn(event_loop_sleep_42)
     spawn.join(task)
   })
+}
+
+fn event_loop_tcp_error_code(error: TcpError) -> i64 {
+  match error {
+    TcpInterrupted -> 1
+    TcpWouldBlock -> 2
+    TcpConnectionRefused -> 3
+    TcpConnectionReset -> 4
+    TcpConnectionAborted -> 5
+    TcpBrokenPipe -> 6
+    TcpNotConnected -> 7
+    TcpAddressInUse -> 8
+    TcpAddressUnavailable -> 9
+    TcpNetworkUnreachable -> 10
+    TcpTimedOut -> 11
+    TcpPermissionDenied -> 12
+    TcpResourceExhausted -> 13
+    TcpInvalidProgress -> 14
+    TcpPolicyDenied -> 15
+    TcpPlatform(code) -> 1000 + code
+  }
+}
+
+fn event_loop_readiness_error_code(error: TcpReadinessError) -> i64 {
+  match error {
+    TcpReadinessInterrupted -> 1
+    TcpReadinessResourceExhausted -> 2
+    TcpReadinessInvalidated -> 3
+    TcpReadinessPlatform(code) -> 1000 + code
+  }
+}
+
+fn event_loop_tcp_close_status(result: Result<nil, TcpError>) -> i64 {
+  match result {
+    Ok(nil) -> 1
+    Err(error) -> 0 - event_loop_tcp_error_code(error)
+  }
+}
+
+fn event_loop_delayed_connect(
+  address: SocketAddress
+) -[time.Time, TcpConnect, TcpStreamIO]> i64 {
+  time.time_sleep_millis(1)
+  match tcp_connect(address, tcp_connect_options_default()) {
+    Err(error) -> 0 - event_loop_tcp_error_code(error)
+    Ok(stream) -> event_loop_tcp_close_status(tcp_stream_close(stream))
+  }
+}
+
+fn event_loop_delayed_abort() -[time.Time, EventLoopAbort]> i64 {
+  time.time_sleep_millis(1)
+  EventLoopAbort.stop()
+}
+
+fn event_loop_require_stream_ready(
+  readiness: TcpStreamReadiness
+) -[Fail<TcpReadinessError>, TcpStreamIO]> owned TcpStream {
+  match readiness {
+    TcpStreamReadinessFailed(returned, error) -> {
+      let closed = tcp_stream_close(returned)
+      Fail<TcpReadinessError>.fail(error)
+    }
+    TcpStreamReady(returned) -> returned
+  }
+}
+
+fn event_loop_require_listener_ready(
+  readiness: TcpListenerReadiness
+) -[Fail<TcpReadinessError>, TcpListenerIO]> owned TcpListener {
+  match readiness {
+    TcpListenerReadinessFailed(returned, error) -> {
+      let closed = tcp_listener_close(returned)
+      Fail<TcpReadinessError>.fail(error)
+    }
+    TcpListenerReady(returned) -> returned
+  }
+}
+
+fn event_loop_tcp_accept_probe(
+) -[TcpConnect, TcpListen, TcpStreamIO, TcpListenerIO, Fail<TcpError>, Fail<TcpReadinessError>]> i64 {
+  spawn.with_event_loop(() => {
+    let listener: owned TcpListener = tcp_listen(
+      SocketV4(ipv4_address(127, 0, 0, 1), 0),
+      tcp_listen_options(8)
+    )?
+    let address = tcp_listener_local_address(listener)?
+    let connector = spawn.spawn(() => event_loop_delayed_connect(address))
+    let mut ready_listener: owned TcpListener = event_loop_require_listener_ready(
+      tcp_wait_acceptable(listener)
+    )
+    let server: owned TcpStream = tcp_accept(ready_listener)?
+    tcp_stream_close(server)?
+    tcp_listener_close(ready_listener)?
+    spawn.join(connector) * 100 + 11
+  })
+}
+
+fn event_loop_tcp_stream_probe(
+) -[TcpConnect, TcpListen, TcpStreamIO, TcpListenerIO, Fail<TcpError>, Fail<TcpReadinessError>]> i64 {
+  spawn.with_event_loop(() => {
+    let mut listener: owned TcpListener = tcp_listen(
+      SocketV4(ipv4_address(127, 0, 0, 1), 0),
+      tcp_listen_options(8)
+    )?
+    let address = tcp_listener_local_address(listener)?
+    let client: owned TcpStream = tcp_connect(address, tcp_connect_options_default())?
+    let server: owned TcpStream = tcp_accept(listener)?
+    tcp_listener_close(listener)?
+
+    let mut ready_client: owned TcpStream = event_loop_require_stream_ready(
+      tcp_wait_writable(client)
+    )
+    let source: Vector<u8> = vector_with_capacity<u8>(1)
+    vector_push<u8>(source, __u64_to_u8(__i64_to_u64(42)))
+    let source_view: [u8] = source[..]
+    let wrote = match tcp_write(ready_client, source_view)? {
+      IoWroteBytes(count) -> __u64_to_i64(__usize_to_u64(count))
+    }
+
+    let mut ready_server: owned TcpStream = event_loop_require_stream_ready(
+      tcp_wait_readable(server)
+    )
+    let received: Vector<u8> = vector_with_capacity<u8>(1)
+    vector_push<u8>(received, __u64_to_u8(__i64_to_u64(0)))
+    let received_view: [mut u8] = received[..]
+    let read = match tcp_read(ready_server, received_view)? {
+      IoEndOfFile -> 0
+      IoReadBytes(count) -> __u64_to_i64(__usize_to_u64(count))
+    }
+    tcp_stream_close(ready_client)?
+    tcp_stream_close(ready_server)?
+    wrote * 10000 + read * 1000 +
+      __u64_to_i64(__u8_to_u64(vector_get_in_bounds<u8>(received, 0))) * 10 + 2
+  })
+}
+
+fn event_loop_tcp_accept_run() -> i64 {
+  handle {
+    handle runtime_platform_tcp(event_loop_tcp_accept_probe) {
+      Fail<TcpError>.fail(error) -> 0 - event_loop_tcp_error_code(error)
+    }
+  } {
+    Fail<TcpReadinessError>.fail(error) -> 0 - 10000 - event_loop_readiness_error_code(error)
+  }
+}
+
+fn event_loop_tcp_stream_run() -> i64 {
+  handle {
+    handle runtime_platform_tcp(event_loop_tcp_stream_probe) {
+      Fail<TcpError>.fail(error) -> 0 - event_loop_tcp_error_code(error)
+    }
+  } {
+    Fail<TcpReadinessError>.fail(error) -> 0 - 10000 - event_loop_readiness_error_code(error)
+  }
+}
+
+fn event_loop_tcp_abort_readiness_probe(
+  observed: Vector<SocketAddress>
+) -[TcpConnect, TcpListen, TcpStreamIO, TcpListenerIO, Fail<TcpError>, Fail<TcpReadinessError>]> i64 {
+  let aborted = handle spawn.with_event_loop(() => {
+    let listener: owned TcpListener = tcp_listen(
+      SocketV4(ipv4_address(127, 0, 0, 1), 0),
+      tcp_listen_options(8)
+    )?
+    vector_push<SocketAddress>(observed, tcp_listener_local_address(listener)?)
+    let aborting = spawn.spawn(event_loop_delayed_abort)
+    let ready = event_loop_require_listener_ready(tcp_wait_acceptable(listener))
+    0
+  }) {
+    EventLoopAbort.stop() -> 7
+  }
+  let rebound: owned TcpListener = tcp_listen(
+    vector_get_in_bounds<SocketAddress>(observed, 0),
+    tcp_listen_options(1)
+  )?
+  tcp_listener_close(rebound)?
+  aborted * 10 + 1
+}
+
+fn event_loop_tcp_abort_readiness_run() -> i64 {
+  let observed = vector_with_capacity<SocketAddress>(1)
+  handle {
+    handle runtime_platform_tcp(() => event_loop_tcp_abort_readiness_probe(observed)) {
+      Fail<TcpError>.fail(error) -> 0 - event_loop_tcp_error_code(error)
+    }
+  } {
+    Fail<TcpReadinessError>.fail(error) -> 0 - 10000 - event_loop_readiness_error_code(error)
+  }
 }
 
 test "event loop joins an ordinary sleeping child" {
@@ -168,4 +364,16 @@ test "event loop handlers nest without sharing task scopes" {
     spawn.join(task)
   })
   Test.assert_eq(got, 42)
+}
+
+test "event loop resumes listener readiness after running a delayed connector" {
+  Test.assert_eq(event_loop_tcp_accept_run(), 111)
+}
+
+test "event loop returns stream owners across writable and readable readiness" {
+  Test.assert_eq(event_loop_tcp_stream_run(), 11422)
+}
+
+test "event loop abort cancels readiness before dropping and rebinding listener" {
+  Test.assert_eq(event_loop_tcp_abort_readiness_run(), 71)
 }
