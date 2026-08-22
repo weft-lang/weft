@@ -3023,7 +3023,10 @@ assert_contains "package_native_object_emits_f32_symbol" "$native_undefined" "_r
 assert_contains "package_native_object_emits_mixed_fp_gpr_symbol" "$native_undefined" "_ldexp"
 assert_contains "package_native_object_emits_mixed_gpr_fp_symbol" "$native_undefined" "_jn"
 assert_not_contains "package_native_object_omits_unused_optional_symbol" "$native_undefined" "_weft_symbol_intentionally_absent"
-/usr/bin/ld -o "$tmp_pkg_trust_dir/native_linked/native" "$tmp_pkg_trust_dir/native_linked/native.o" -lSystem \
+native_link_options=$(otool -l "$tmp_pkg_trust_dir/native_linked/native.o")
+assert_contains "package_native_object_autolinks_used_system_library" "$native_link_options" "string #1 -lSystem"
+assert_not_contains "package_native_object_does_not_autolink_unused_optional_symbol" "$native_link_options" "weft_symbol_intentionally_absent"
+/usr/bin/ld -o "$tmp_pkg_trust_dir/native_linked/native" "$tmp_pkg_trust_dir/native_linked/native.o" \
   -syslibroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
   -e _main -arch arm64 -platform_version macos 11.0 15.0 2>/dev/null
 codesign -s - "$tmp_pkg_trust_dir/native_linked/native" >/dev/null
