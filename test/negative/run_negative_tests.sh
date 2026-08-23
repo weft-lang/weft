@@ -168,6 +168,7 @@ check_rejects "platform_remap_rw_anonymous_fixed_requires_trusted" "test/negativ
 check_rejects "platform_unmap_requires_trusted" "test/negative/platform_unmap_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "platform_write_requires_trusted" "test/negative/platform_write_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "platform_exit_requires_trusted" "test/negative/platform_exit_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
+check_rejects "platform_thread_primitives_require_trusted" "test/negative/platform_thread_primitives_require_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code" 13
 check_rejects "root_raw_syscall_with_effect_requires_trusted" "test/negative/root_raw_syscall_with_effect_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "root_mem_with_effect_requires_trusted" "test/negative/root_mem_with_effect_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "frame_pointer_requires_trusted" "test/negative/frame_pointer_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"

@@ -866,6 +866,31 @@ assert_contains "elf_linux_process_invokes_linux_svc" "$elf_linux_process_disass
 assert_not_contains "elf_linux_process_has_no_interpreter" "$elf_linux_process_headers" "INTERP off"
 assert_not_contains "elf_linux_process_has_no_dynamic_segment" "$elf_linux_process_headers" "DYNAMIC off"
 
+# Par remains a typed, deterministic effect while its Linux production handler
+# creates guarded kernel threads and synchronizes them without libc. The
+# generated program exercises a bounded four-worker pool, skewed joins, and a
+# promoted managed capture; target-local execution is brief 1e's Docker gate.
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_par_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_par_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_par_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_par_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+assert_contains "elf_linux_par_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
+elf_linux_par_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+elf_linux_par_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+assert_contains "elf_linux_par_selects_futex" "$elf_linux_par_disassembly" $'mov\tx8, #0x62'
+assert_contains "elf_linux_par_selects_thread_exit" "$elf_linux_par_disassembly" $'mov\tx8, #0x5d'
+assert_contains "elf_linux_par_selects_clone" "$elf_linux_par_disassembly" $'mov\tx8, #0xdc'
+assert_contains "elf_linux_par_selects_munmap" "$elf_linux_par_disassembly" $'mov\tx8, #0xd7'
+assert_contains "elf_linux_par_selects_mmap" "$elf_linux_par_disassembly" $'mov\tx8, #0xde'
+assert_contains "elf_linux_par_selects_mprotect" "$elf_linux_par_disassembly" $'mov\tx8, #0xe2'
+assert_contains "elf_linux_par_selects_exit_group" "$elf_linux_par_disassembly" $'mov\tx8, #0x5e'
+assert_contains "elf_linux_par_invokes_linux_svc" "$elf_linux_par_disassembly" $'svc\t#0'
+assert_not_contains "elf_linux_par_has_no_interpreter" "$elf_linux_par_headers" "INTERP off"
+assert_not_contains "elf_linux_par_has_no_dynamic_segment" "$elf_linux_par_headers" "DYNAMIC off"
+
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
 assert_contains "fmt_parse_only" "$fmt_out" "fn main() -> i64 { 42 }"
