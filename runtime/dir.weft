@@ -1,76 +1,85 @@
--- runtime/dir.weft -- trusted Darwin directory/filesystem bridge
+-- runtime/dir.weft -- target-neutral direct directory/filesystem substrate
+--
+-- Syscall selectors, flags and native dirent/stat layouts are compiler-owned
+-- target facts. This trusted runtime consumes only semantic directory leaves
+-- and the canonical stat record defined by runtime/syscall.
 
-use runtime/alloc.{*}
-use runtime/dir_syscall.{*}
-use runtime/string.{*}
-use runtime/syscall.{sys_lstat}
-use runtime/unsafe.{*}
+use runtime/alloc.{alloc_bump_mark, alloc_bump_restore_same_segment, alloc_zeroed}
+use runtime/memory.{mem_load8_at, mem_store64_at}
+use runtime/string.{runtime_str_cstring, runtime_str_from_bytes_copy}
+use runtime/syscall.{*}
 use stdlib/dir.{*}
 use stdlib/result.{*}
 use stdlib/vector.{*}
 
-pub(package) fn runtime_dir_errno() -[Unsafe]> i64 {
-  let ptr = sys_errno_ptr()
-  __mem_load8(ptr) +
-    __mem_load8(ptr + 1) * 256 +
-    __mem_load8(ptr + 2) * 65536 +
-    __mem_load8(ptr + 3) * 16777216
+pub(package) fn runtime_dir_error(status: i64) -> i64 {
+  if status < 0 { 0 - status } else { status }
 }
 
-pub(package) fn runtime_dir_clear_errno() -[Unsafe]> i64 {
-  let ptr = sys_errno_ptr()
-  __mem_store8(ptr, 0)
-  __mem_store8(ptr + 1, 0)
-  __mem_store8(ptr + 2, 0)
-  __mem_store8(ptr + 3, 0)
-  0
+pub(package) fn runtime_dir_cstr_len_bounded(ptr: i64, capacity: i64) -> i64 {
+  let mut len = 0
+  while len < capacity and mem_load8_at(ptr, len) != 0 { len = len + 1 }
+  if len < capacity { len } else { 0 - 1 }
 }
 
-pub(package) fn runtime_dir_cstr_len(ptr: i64) -[Unsafe]> i64 {
-  let mut i = 0
-  while __mem_load8(ptr + i) != 0 { i = i + 1 }
-  i
+pub(package) fn runtime_dir_entry_name_len(entry: i64, record_len: i64) -> i64 {
+  let name = sys_dir_entry_name(entry)
+  let header_len = name - entry
+  if header_len < 0 or header_len >= record_len { 0 - 1 }
+  else { runtime_dir_cstr_len_bounded(name, record_len - header_len) }
 }
 
-pub(package) fn runtime_dir_entry_name_len(entry: i64) -[Unsafe]> i64 {
-  -- Darwin arm64 struct dirent: d_namlen is the u16 at byte 18.
-  __mem_load8(entry + 18) + __mem_load8(entry + 19) * 256
-}
-
-pub(package) fn runtime_dir_entry_is_dot(entry: i64, len: i64) -[Unsafe]> i64 {
-  let name = entry + 21
-  if len == 1 and __mem_load8(name) == 46 { 1 }
-  else { if len == 2 and __mem_load8(name) == 46 and __mem_load8(name + 1) == 46 { 1 }
+pub(package) fn runtime_dir_entry_is_dot(name: i64, len: i64) -> i64 {
+  if len == 1 and mem_load8_at(name, 0) == 46 { 1 }
+  else { if len == 2 and mem_load8_at(name, 0) == 46 and mem_load8_at(name, 1) == 46 { 1 }
   else { 0 } }
 }
 
-pub(package) fn runtime_dir_list(path: str) -[Unsafe]> Result<Vector<str>, i64> {
+pub(package) fn runtime_dir_list(path: str) -> Result<Vector<str>, i64> {
   let mark = alloc_bump_mark()
   let path_c = runtime_str_cstring(path)
-  let dir = sys_opendir(path_c)
-  let result: Result<Vector<str>, i64> = if dir == 0 {
-    result_err<Vector<str>, i64>(runtime_dir_errno())
+  let fd = sys_dir_open(path_c)
+  let result: Result<Vector<str>, i64> = if fd < 0 {
+    result_err<Vector<str>, i64>(runtime_dir_error(fd))
   } else {
     let entries = vector_new<str>()
-    let mut done = 0
-    let mut read_error = 0
-    while done == 0 {
-      runtime_dir_clear_errno()
-      let entry = sys_readdir(dir)
-      if entry == 0 {
-        read_error = runtime_dir_errno()
-        done = 1
+    let capacity = 16384
+    let bytes = alloc_zeroed(capacity)
+    let cookie = alloc_zeroed(8)
+    mem_store64_at(cookie, 0, 0)
+    let mut done = false
+    let mut failure = 0
+    while not done {
+      let count = sys_dir_read(fd, bytes, capacity, cookie)
+      if count == 0 { done = true }
+      else { if count < 0 {
+        failure = runtime_dir_error(count)
+        done = true
       } else {
-        let len = runtime_dir_entry_name_len(entry)
-        if runtime_dir_entry_is_dot(entry, len) == 0 {
-          vector_push<str>(entries, runtime_str_from_bytes(entry + 21, len))
-        } else { 0 }
-      }
+        let mut offset = 0
+        while offset < count and failure == 0 {
+          let entry = bytes + offset
+          let record_len = sys_dir_entry_record_len(entry)
+          if record_len <= 0 or offset + record_len > count {
+            failure = 5
+          } else {
+            let name = sys_dir_entry_name(entry)
+            let name_len = runtime_dir_entry_name_len(entry, record_len)
+            if name_len < 0 {
+              failure = 5
+            } else {
+              if runtime_dir_entry_is_dot(name, name_len) == 0 {
+                vector_push<str>(entries, runtime_str_from_bytes_copy(name, name_len))
+              } else { 0 }
+              offset = offset + record_len
+            }
+          }
+        }
+      } }
     }
-    let close_status = sys_closedir(dir)
-    let close_error = if close_status == 0 { 0 } else { runtime_dir_errno() }
-    if read_error != 0 { result_err<Vector<str>, i64>(read_error) }
-    else { if close_error != 0 { result_err<Vector<str>, i64>(close_error) }
+    let close_status = sys_close(fd)
+    if failure != 0 { result_err<Vector<str>, i64>(failure) }
+    else { if close_status != 0 { result_err<Vector<str>, i64>(runtime_dir_error(close_status)) }
     else { result_ok<Vector<str>, i64>(entries) } }
   }
   alloc_bump_restore_same_segment(mark)
@@ -78,10 +87,11 @@ pub(package) fn runtime_dir_list(path: str) -[Unsafe]> Result<Vector<str>, i64> 
 }
 
 pub(package) fn runtime_dir_stat_kind(mode: i64) -> DirKind {
-  let file_type = mode band 61440
-  if file_type == 32768 { DirFile }
-  else { if file_type == 16384 { DirDirectory }
-  else { DirOther } }
+  match mode band 61440 {
+    32768 -> DirFile
+    16384 -> DirDirectory
+    other -> DirOther
+  }
 }
 
 pub(package) fn runtime_dir_missing_metadata() -> DirMetadata {
@@ -89,47 +99,26 @@ pub(package) fn runtime_dir_missing_metadata() -> DirMetadata {
 }
 
 pub(package) fn runtime_dir_metadata_from_stat_buf(stat_buf: i64) -> DirMetadata {
-  let mode = __mem_load8(stat_buf + 4) + __mem_load8(stat_buf + 5) * 256
   DirMetadata {
     exists: true,
-    kind: runtime_dir_stat_kind(mode),
-    size: __mem_load64(stat_buf + 96),
-    modified_millis: __mem_load64(stat_buf + 48) * 1000 + __mem_load64(stat_buf + 56) / 1000000,
-    device: __mem_load8(stat_buf) + __mem_load8(stat_buf + 1) * 256 + __mem_load8(stat_buf + 2) * 65536 + __mem_load8(stat_buf + 3) * 16777216,
-    inode: __mem_load64(stat_buf + 8)
+    kind: runtime_dir_stat_kind(sys_stat_mode(stat_buf)),
+    size: sys_stat_size(stat_buf),
+    modified_millis: sys_stat_modified_seconds(stat_buf) * 1000 + sys_stat_modified_nanos(stat_buf) / 1000000,
+    device: sys_stat_device(stat_buf),
+    inode: sys_stat_inode(stat_buf)
   }
 }
 
-pub(package) fn runtime_dir_stat(path: str) -[Unsafe]> Result<DirMetadata, i64> {
+fn runtime_dir_stat_with(path: str, follow: bool) -> Result<DirMetadata, i64> {
   let mark = alloc_bump_mark()
   let path_c = runtime_str_cstring(path)
-  -- Locked against the installed Darwin arm64 SDK: sizeof(stat)=144,
-  -- st_mode=4, st_mtimespec=48, and st_size=96.
-  let stat_buf = alloc_bump(144)
-  let status = sys_stat(path_c, stat_buf)
+  let stat_buf = alloc_zeroed(sys_stat_scratch_size())
+  let status = if follow { sys_stat_follow(path_c, stat_buf) }
+  else { sys_stat_nofollow(path_c, stat_buf) }
   let result: Result<DirMetadata, i64> = if status == 0 {
     result_ok<DirMetadata, i64>(runtime_dir_metadata_from_stat_buf(stat_buf))
   } else {
-    let error = runtime_dir_errno()
-    if error == 2 {
-      result_ok<DirMetadata, i64>(runtime_dir_missing_metadata())
-    } else {
-      result_err<DirMetadata, i64>(error)
-    }
-  }
-  alloc_bump_restore_same_segment(mark)
-  result
-}
-
-pub(package) fn runtime_dir_lstat(path: str) -[Unsafe]> Result<DirMetadata, i64> {
-  let mark = alloc_bump_mark()
-  let path_c = runtime_str_cstring(path)
-  let stat_buf = alloc_bump(144)
-  let status = sys_lstat(path_c, stat_buf)
-  let result: Result<DirMetadata, i64> = if status == 0 {
-    result_ok<DirMetadata, i64>(runtime_dir_metadata_from_stat_buf(stat_buf))
-  } else {
-    let error = 0 - status
+    let error = runtime_dir_error(status)
     if error == 2 { result_ok<DirMetadata, i64>(runtime_dir_missing_metadata()) }
     else { result_err<DirMetadata, i64>(error) }
   }
@@ -137,49 +126,62 @@ pub(package) fn runtime_dir_lstat(path: str) -[Unsafe]> Result<DirMetadata, i64>
   result
 }
 
-pub(package) fn runtime_dir_mkdir(path: str) -[Unsafe]> i64 {
-  let mark = alloc_bump_mark()
-  let path_c = runtime_str_cstring(path)
-  let status = sys_mkdir(path_c, 493)
-  let result = if status == 0 { 0 } else { runtime_dir_errno() }
-  alloc_bump_restore_same_segment(mark)
-  result
+pub(package) fn runtime_dir_stat(path: str) -> Result<DirMetadata, i64> {
+  runtime_dir_stat_with(path, true)
 }
 
-pub(package) fn runtime_dir_remove(path: str) -[Unsafe]> i64 {
-  let mark = alloc_bump_mark()
-  let path_c = runtime_str_cstring(path)
-  let status = sys_remove(path_c)
-  let result = if status == 0 { 0 } else { runtime_dir_errno() }
-  alloc_bump_restore_same_segment(mark)
-  result
+pub(package) fn runtime_dir_lstat(path: str) -> Result<DirMetadata, i64> {
+  runtime_dir_stat_with(path, false)
 }
 
-pub(package) fn runtime_dir_rename(from: str, to: str) -[Unsafe]> i64 {
+pub(package) fn runtime_dir_mkdir(path: str) -> i64 {
+  let mark = alloc_bump_mark()
+  let status = sys_dir_mkdir(runtime_str_cstring(path), 493)
+  alloc_bump_restore_same_segment(mark)
+  runtime_dir_error(status)
+}
+
+pub(package) fn runtime_dir_remove(path: str) -> i64 {
+  let mark = alloc_bump_mark()
+  let path_c = runtime_str_cstring(path)
+  let stat_buf = alloc_zeroed(sys_stat_scratch_size())
+  let inspected = sys_stat_nofollow(path_c, stat_buf)
+  let status = if inspected < 0 { inspected }
+  else { match runtime_dir_stat_kind(sys_stat_mode(stat_buf)) {
+    DirDirectory -> sys_dir_remove_directory(path_c)
+    other -> sys_remove(path_c)
+  } }
+  alloc_bump_restore_same_segment(mark)
+  runtime_dir_error(status)
+}
+
+pub(package) fn runtime_dir_rename(from: str, to: str) -> i64 {
   let mark = alloc_bump_mark()
   let from_c = runtime_str_cstring(from)
   let to_c = runtime_str_cstring(to)
   let status = sys_rename(from_c, to_c)
-  let result = if status == 0 { 0 } else { runtime_dir_errno() }
   alloc_bump_restore_same_segment(mark)
-  result
+  runtime_dir_error(status)
 }
 
-pub(package) fn runtime_dir_getcwd() -[Unsafe]> Result<str, i64> {
+pub(package) fn runtime_dir_getcwd() -> Result<str, i64> {
   let mark = alloc_bump_mark()
   let capacity = 4096
-  let buf = alloc_bump(capacity)
-  let got = sys_getcwd(buf, capacity)
-  let result: Result<str, i64> = if got == 0 {
-    result_err<str, i64>(runtime_dir_errno())
+  let bytes = alloc_zeroed(capacity)
+  let dot_path = runtime_str_cstring(".")
+  let status = sys_dir_current(dot_path, bytes, capacity)
+  let result: Result<str, i64> = if status < 0 {
+    result_err<str, i64>(runtime_dir_error(status))
   } else {
-    result_ok<str, i64>(runtime_str_from_bytes(buf, runtime_dir_cstr_len(buf)))
+    let len = runtime_dir_cstr_len_bounded(bytes, capacity)
+    if len < 0 { result_err<str, i64>(22) }
+    else { result_ok<str, i64>(runtime_str_from_bytes_copy(bytes, len)) }
   }
   alloc_bump_restore_same_segment(mark)
   result
 }
 
-pub(package) fn runtime_dir_handle(body: () -[Dir]> i64) -[Unsafe]> i64 {
+pub(package) fn runtime_dir_handle(body: () -[Dir]> i64) -> i64 {
   handle body() {
     Dir.list(path) -> resume(runtime_dir_list(path))
     Dir.stat(path) -> resume(runtime_dir_stat(path))
@@ -191,9 +193,7 @@ pub(package) fn runtime_dir_handle(body: () -[Dir]> i64) -[Unsafe]> i64 {
   }
 }
 
--- Residual-tail form for safe platform adapters that discharge Dir while
--- preserving their caller's independent capability set.
-pub(package) fn runtime_dir_handle_with<E>(body: () -[Dir, E]> i64) -[Unsafe, E]> i64 {
+pub(package) fn runtime_dir_handle_with<E>(body: () -[Dir, E]> i64) -[E]> i64 {
   handle body() {
     Dir.list(path) -> resume(runtime_dir_list(path))
     Dir.stat(path) -> resume(runtime_dir_stat(path))
@@ -205,17 +205,10 @@ pub(package) fn runtime_dir_handle_with<E>(body: () -[Dir, E]> i64) -[Unsafe, E]
   }
 }
 
--- Program-boundary installer. Dir remains mockable in ordinary tests while
--- raw addresses, C strings, and platform errno stay inside this trusted leaf.
 pub(package) fn runtime_platform_dir(body: () -[Dir]> i64) -> i64 {
-  handle runtime_dir_handle(body) {
-    Unsafe.transmute(raw) -> resume(__transmute(raw))
-  }
+  runtime_dir_handle(body)
 }
-
 
 pub(package) fn runtime_platform_dir_with<E>(body: () -[Dir, E]> i64) -[E]> i64 {
-  handle runtime_dir_handle_with<E>(body) {
-    Unsafe.transmute(raw) -> resume(__transmute(raw))
-  }
+  runtime_dir_handle_with<E>(body)
 }
