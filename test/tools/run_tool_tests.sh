@@ -661,6 +661,23 @@ assert_contains "elf_linux_pipeline_invokes_linux_svc" "$elf_pipeline_disassembl
 assert_contains "elf_linux_pipeline_compiles_main_result" "$elf_pipeline_disassembly" $'mov\tx8, #0x2a'
 assert_contains "elf_linux_pipeline_selects_exit_group" "$elf_pipeline_disassembly" $'mov\tx8, #0x5e'
 
+# Fatal reporting is the first target-neutral runtime capability: its semantic
+# write/exit operations lower independently of arbitrary raw syscall numbers.
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_panic_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_panic_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_panic_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_panic_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+assert_contains "elf_linux_panic_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
+elf_linux_panic_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+elf_linux_panic_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+assert_contains "elf_linux_panic_selects_write" "$elf_linux_panic_disassembly" $'mov\tx8, #0x40'
+assert_contains "elf_linux_panic_selects_exit_group" "$elf_linux_panic_disassembly" $'mov\tx8, #0x5e'
+assert_contains "elf_linux_panic_invokes_linux_svc" "$elf_linux_panic_disassembly" $'svc\t#0'
+assert_contains "elf_linux_panic_maps_compiler_zero_fill_rw" "$elf_linux_panic_headers" "memsz 0x0000000000000010 flags rw-"
+
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
 assert_contains "fmt_parse_only" "$fmt_out" "fn main() -> i64 { 42 }"
@@ -4446,4 +4463,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 1104 passed, 0 failed"
+echo "Tool boundary summary: 1112 passed, 0 failed"
