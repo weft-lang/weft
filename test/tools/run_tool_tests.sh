@@ -46,10 +46,14 @@ tmp_lsp_stream_dir=$(mktemp -d /tmp/weft_tool_lsp_stream_XXXXXX)
 tmp_tree_sitter_grammar=$(mktemp /tmp/weft_tool_tree_sitter_grammar_XXXXXX)
 tmp_tree_sitter_grammar_second=$(mktemp /tmp/weft_tool_tree_sitter_grammar_second_XXXXXX)
 tmp_tree_sitter_generator=$(mktemp /tmp/weft_tool_tree_sitter_generator_XXXXXX)
+tmp_native_debug_dir=$(mktemp -d /tmp/weft_tool_native_debug_XXXXXX)
+chmod 755 "$tmp_native_debug_dir"
+tmp_native_debug_bin="$tmp_native_debug_dir/native_forward"
+tmp_native_debug_lldb=$(mktemp /tmp/weft_tool_native_debug_lldb_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_timeout" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_check_clean" "$tmp_check_fail" "$tmp_rc_census_src" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_timeout" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_check_clean" "$tmp_check_fail" "$tmp_rc_census_src" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir"' EXIT
 
 now_s() {
   date +%s
@@ -3252,7 +3256,7 @@ assert_contains "package_native_artifact_facts_name_second_member" "$native_forw
 assert_contains "package_native_artifact_facts_name_entry_symbol" "$native_forward_facts" '"name":"weft_forward_a","definition":"strong"'
 assert_contains "package_native_artifact_facts_name_provider_symbol" "$native_forward_facts" '"name":"weft_forward_b","definition":"strong"'
 assert_contains "package_native_artifact_facts_name_root_trust" "$native_forward_facts" '"trust_grants":[{"package":"native-artifacts","version":"1.0.0","source":"path:.","content":"root","module":"main"}]'
-assert_contains "package_native_artifact_facts_report_missing_debug_information" "$native_forward_facts" '"debug_information":{"kind":"absent"}'
+assert_contains "package_native_artifact_facts_report_dwarf_function_line_information" "$native_forward_facts" '"debug_information":{"kind":"dwarf","version":"dwarf-v4-function-file-line"}'
 assert_contains "package_native_artifact_facts_report_deterministic_ad_hoc_signing" "$native_forward_facts" '"signing":{"kind":"ad-hoc","identity":"weft","digest":"sha256","deterministic":true}'
 native_forward_dependencies=$(otool -L "$tmp_pkg_trust_dir/native_artifacts/native_forward")
 assert_not_contains "package_native_archive_closure_has_no_archive_runtime_dependency" "$native_forward_dependencies" "libweft_forward.a"
@@ -3261,7 +3265,37 @@ assert_contains "package_native_artifact_emits_build_version" "$native_forward_l
 assert_contains "package_native_artifact_emits_macos_platform" "$native_forward_load_commands" "platform 1"
 assert_contains "package_native_artifact_emits_minimum_macos_11" "$native_forward_load_commands" "minos 11.0"
 assert_contains "package_native_artifact_emits_deterministic_sdk_floor" "$native_forward_load_commands" "sdk 11.0"
-assert_not_contains "package_native_artifact_matches_absent_debug_fact" "$native_forward_load_commands" "__DWARF"
+assert_contains "package_native_artifact_emits_dwarf_segment" "$native_forward_load_commands" "__DWARF"
+assert_contains "package_native_artifact_emits_dwarf_abbreviations" "$native_forward_load_commands" "__debug_abbrev"
+assert_contains "package_native_artifact_emits_dwarf_compile_unit" "$native_forward_load_commands" "__debug_info"
+assert_contains "package_native_artifact_emits_dwarf_line_program" "$native_forward_load_commands" "__debug_line"
+assert_contains "package_native_artifact_emits_debugger_identity" "$native_forward_load_commands" "LC_UUID"
+native_forward_symbols=$(nm -n "$tmp_pkg_trust_dir/native_artifacts/native_forward")
+assert_contains "package_native_artifact_emits_main_symbol" "$native_forward_symbols" " T _main"
+native_forward_dwarf_verify=$(/usr/bin/dwarfdump --verify "$tmp_pkg_trust_dir/native_artifacts/native_forward" 2>&1)
+assert_contains "package_native_artifact_dwarf_verifies" "$native_forward_dwarf_verify" "No errors."
+native_forward_main_debug=$(/usr/bin/dwarfdump --name main "$tmp_pkg_trust_dir/native_artifacts/native_forward")
+assert_contains "package_native_artifact_names_main_subprogram" "$native_forward_main_debug" "DW_TAG_subprogram"
+assert_contains "package_native_artifact_maps_main_source_attribute" "$native_forward_main_debug" "DW_AT_decl_file"
+assert_contains "package_native_artifact_maps_main_source" "$native_forward_main_debug" "main.weft"
+assert_contains "package_native_artifact_maps_main_line" "$native_forward_main_debug" "DW_AT_decl_line"
+assert_contains "package_native_artifact_maps_main_line_one" "$native_forward_main_debug" "(1)"
+/bin/cp "$tmp_pkg_trust_dir/native_artifacts/native_forward" "$tmp_native_debug_bin"
+chmod +x "$tmp_native_debug_bin"
+set +e
+/usr/bin/lldb --batch \
+  -o "settings set target.inline-breakpoint-strategy always" \
+  -o "breakpoint set --name main --skip-prologue false" \
+  -o run \
+  -o bt \
+  "$tmp_native_debug_bin" > "$tmp_native_debug_lldb" 2>&1
+native_forward_lldb_exit=$?
+set -e
+native_forward_lldb=$(/bin/cat "$tmp_native_debug_lldb")
+assert_equals "package_native_artifact_lldb_session_exits_cleanly" "$native_forward_lldb_exit" "0"
+assert_contains "package_native_artifact_lldb_resolves_main" "$native_forward_lldb" "main at main.weft:1:4"
+assert_contains "package_native_artifact_lldb_stops_in_main" "$native_forward_lldb" "stop reason = breakpoint"
+assert_contains "package_native_artifact_lldb_walks_caller_frame" "$native_forward_lldb" "frame #1:"
 native_forward_signing=$(codesign -d --verbose=5 "$tmp_pkg_trust_dir/native_artifacts/native_forward" 2>&1)
 assert_contains "package_native_artifact_signature_is_ad_hoc" "$native_forward_signing" "Signature=adhoc"
 assert_contains "package_native_artifact_signature_names_weft" "$native_forward_signing" "Identifier=weft"
