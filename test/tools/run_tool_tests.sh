@@ -3240,8 +3240,9 @@ else
   exit 1
 fi
 native_forward_facts=$(/bin/cat "$tmp_pkg_trust_dir/native_artifacts/native_forward.facts.json")
-assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":1'
+assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":2'
 assert_contains "package_native_artifact_facts_name_target" "$native_forward_facts" '"target":"macos-aarch64"'
+assert_contains "package_native_artifact_facts_name_minimum_platform" "$native_forward_facts" '"minimum_platform_abi":{"platform":"macos","major":11,"minor":0,"patch":0}'
 assert_contains "package_native_artifact_facts_claim_standalone" "$native_forward_facts" '"standalone":true'
 assert_contains "package_native_artifact_facts_name_system_abi" "$native_forward_facts" '"kind":"system","identity":"/usr/lib/libSystem.B.dylib"'
 assert_contains "package_native_artifact_facts_name_archive_hash" "$native_forward_facts" '"content":"sha256:'"$native_forward_digest"'"'
@@ -3250,8 +3251,21 @@ assert_contains "package_native_artifact_facts_name_first_member" "$native_forwa
 assert_contains "package_native_artifact_facts_name_second_member" "$native_forward_facts" '"name":"forward_b.o","content":"sha256:'"$native_forward_b_member_digest"'"'
 assert_contains "package_native_artifact_facts_name_entry_symbol" "$native_forward_facts" '"name":"weft_forward_a","definition":"strong"'
 assert_contains "package_native_artifact_facts_name_provider_symbol" "$native_forward_facts" '"name":"weft_forward_b","definition":"strong"'
+assert_contains "package_native_artifact_facts_name_root_trust" "$native_forward_facts" '"trust_grants":[{"package":"native-artifacts","version":"1.0.0","source":"path:.","content":"root","module":"main"}]'
+assert_contains "package_native_artifact_facts_report_missing_debug_information" "$native_forward_facts" '"debug_information":{"kind":"absent"}'
+assert_contains "package_native_artifact_facts_report_deterministic_ad_hoc_signing" "$native_forward_facts" '"signing":{"kind":"ad-hoc","identity":"weft","digest":"sha256","deterministic":true}'
 native_forward_dependencies=$(otool -L "$tmp_pkg_trust_dir/native_artifacts/native_forward")
 assert_not_contains "package_native_archive_closure_has_no_archive_runtime_dependency" "$native_forward_dependencies" "libweft_forward.a"
+native_forward_load_commands=$(otool -l "$tmp_pkg_trust_dir/native_artifacts/native_forward")
+assert_contains "package_native_artifact_emits_build_version" "$native_forward_load_commands" "LC_BUILD_VERSION"
+assert_contains "package_native_artifact_emits_macos_platform" "$native_forward_load_commands" "platform 1"
+assert_contains "package_native_artifact_emits_minimum_macos_11" "$native_forward_load_commands" "minos 11.0"
+assert_contains "package_native_artifact_emits_deterministic_sdk_floor" "$native_forward_load_commands" "sdk 11.0"
+assert_not_contains "package_native_artifact_matches_absent_debug_fact" "$native_forward_load_commands" "__DWARF"
+native_forward_signing=$(codesign -d --verbose=5 "$tmp_pkg_trust_dir/native_artifacts/native_forward" 2>&1)
+assert_contains "package_native_artifact_signature_is_ad_hoc" "$native_forward_signing" "Signature=adhoc"
+assert_contains "package_native_artifact_signature_names_weft" "$native_forward_signing" "Identifier=weft"
+assert_contains "package_native_artifact_signature_uses_sha256" "$native_forward_signing" "Hash type=sha256"
 set +e
 run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_forward"
 pkg_native_forward_exit=$?
@@ -3548,6 +3562,9 @@ fi
 
 native_compiler_strings=$(strings "$WEFT_ABS")
 assert_not_contains "package_native_product_compiler_has_no_clang_fallback" "$native_compiler_strings" "/usr/bin/clang"
+native_compiler_load_commands=$(otool -l "$WEFT_ABS")
+assert_contains "package_native_compiler_emits_build_version" "$native_compiler_load_commands" "LC_BUILD_VERSION"
+assert_contains "package_native_compiler_emits_minimum_macos_11" "$native_compiler_load_commands" "minos 11.0"
 
 printf '%s\n' '!<arch>' 'not a Mach-O member' > "$tmp_pkg_trust_dir/native_artifacts/native/archive_closure/libweft_malformed.a"
 native_malformed_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_closure/libweft_malformed.a")
@@ -3710,7 +3727,9 @@ assert_contains "package_native_audit_lists_safe_wrapper" "$native_safe_audit" '
 assert_contains "package_native_audit_lists_safe_wrapper_signature" "$native_safe_audit" '"signature":"pub fn fixture_open_safe(value: i64) -> owned FixtureHandle"'
 assert_contains "package_native_audit_lists_safe_wrapper_effects" "$native_safe_audit" '"effects":"pure"'
 assert_not_contains "package_native_audit_wrapper_effects_hide_unsafe" "$native_safe_audit" '"effects":"Unsafe"'
-(cd "$tmp_pkg_trust_dir/native_safe" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_safe)
+(cd "$tmp_pkg_trust_dir/native_safe" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_safe --artifact-facts native_safe.facts.json)
+native_safe_facts=$(/bin/cat "$tmp_pkg_trust_dir/native_safe/native_safe.facts.json")
+assert_contains "package_native_artifact_facts_name_dependency_trust" "$native_safe_facts" '"package":"fixture","version":"1.0.0","source":"path:deps/fixture","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111","module":"native/raw"'
 codesign --verify "$tmp_pkg_trust_dir/native_safe/native_safe"
 set +e
 run_binary_guarded "$tmp_pkg_trust_dir/native_safe/native_safe"
@@ -4313,4 +4332,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 1057 passed, 0 failed"
+echo "Tool boundary summary: 1072 passed, 0 failed"
