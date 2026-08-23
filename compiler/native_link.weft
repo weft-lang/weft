@@ -150,8 +150,21 @@ pub(package) type NativeLinkRelocation {
   NativeLinkPageAddress(i64, NativeLinkAddressTarget)
 }
 
+pub(package) type NativeLinkRelocationEncoding {
+  NativeLinkBranch26Encoding,
+  NativeLinkPage21Encoding,
+  NativeLinkPageOff12Encoding,
+  NativeLinkGotPage21Encoding,
+  NativeLinkGotPageOff12Encoding,
+  NativeLinkPageAddressEncoding
+}
+
+pub(package) type NativeLinkImageLayout {
+  NativeLinkImageLayout(i64, i64, i64, i64, i64, i64, i64, i64, i64)
+}
+
 pub(package) type NativeLinkGraph {
-  NativeLinkGraph(NativeLinkTarget, rc i64, rc i64, i64, List<NativeLinkLibrary>, List<NativeLinkSymbol>, List<NativeLinkRelocation>, i64)
+  NativeLinkGraph(NativeLinkTarget, rc i64, rc i64, NativeLinkImageLayout, List<NativeLinkLibrary>, List<NativeLinkSymbol>, List<NativeLinkRelocation>, i64)
 }
 
 pub(package) type NativeArtifactDependency {
@@ -170,6 +183,9 @@ pub(package) type NativeLinkError {
   NativeLinkUndefinedArchiveSymbol(str),
   NativeLinkDuplicateStrongSymbol(str),
   NativeLinkUnsupportedArchiveRelocation(str, i64),
+  NativeLinkRelocationSiteOutOfRange(NativeLinkRelocationEncoding, i64),
+  NativeLinkRelocationTargetOutOfRange(NativeLinkRelocationEncoding, i64, i64),
+  NativeLinkRelocationTargetMisaligned(NativeLinkRelocationEncoding, i64, i64),
   NativeLinkMissingDynamicArtifact(str),
   NativeLinkInvalidImportIndex(i64),
   NativeLinkInvalidLibraryIndex(i64)
@@ -1778,6 +1794,156 @@ pub(package) fn native_link_validate_libraries(libraries: List<NativeLinkLibrary
   errors
 }
 
+pub(package) fn native_link_image_layout(code: i64, archive_data: i64, archive_align: i64, symbol_count: i64, static_slots: i64) -> NativeLinkImageLayout {
+  let stub_base = native_link_align(buf_len(code), 4)
+  let code_size = stub_base + symbol_count * 12
+  let text_size = native_link_align(16384 + code_size, 16384)
+  let static_offset = native_link_align(symbol_count * 8, 16)
+  let static_size = static_slots * 16
+  let archive_alignment = native_link_pow2(archive_align)
+  let archive_offset = native_link_align(text_size + static_offset + static_size, archive_alignment) - text_size
+  let archive_size = buf_len(archive_data)
+  let data_need = if archive_size > 0 { archive_offset + archive_size } else { static_offset + static_size }
+  let data_size = native_link_align(if data_need > 0 { data_need } else { 1 }, 16384)
+  NativeLinkImageLayout(stub_base, code_size, text_size, static_offset, static_size, archive_offset, archive_size, archive_align, data_size)
+}
+
+pub(package) fn native_link_branch_delta_valid(delta: i64) -> i64 {
+  if delta >= 0 - 134217728 and delta <= 134217724 and delta % 4 == 0 { 1 } else { 0 }
+}
+
+pub(package) fn native_link_page_delta_valid(delta: i64) -> i64 {
+  if delta >= 0 - 1048576 and delta <= 1048575 { 1 } else { 0 }
+}
+
+pub(package) fn native_link_pageoff12_is_valid(word: i64, page_offset: i64) -> i64 {
+  let add_immediate = if word band 2130706432 == 285212672 { 1 } else { 0 }
+  let scale = if add_immediate == 1 { 0 } else { word bshr 30 band 3 }
+  let divisor = native_link_pow2(scale)
+  if page_offset >= 0 and page_offset < 4096 and page_offset / divisor * divisor == page_offset { 1 } else { 0 }
+}
+
+pub(package) fn native_link_relocation_encoding(relocation: NativeLinkRelocation) -> NativeLinkRelocationEncoding {
+  match relocation {
+    NativeLinkBranch26(address, slot) -> NativeLinkBranch26Encoding
+    NativeLinkDirectBranch26(address, target) -> NativeLinkBranch26Encoding
+    NativeLinkArchivePage21(address, data_offset) -> NativeLinkPage21Encoding
+    NativeLinkArchivePageOff12(address, data_offset) -> NativeLinkPageOff12Encoding
+    NativeLinkArchiveGotPage21(address, data_offset) -> NativeLinkGotPage21Encoding
+    NativeLinkArchiveGotPageOff12(address, data_offset) -> NativeLinkGotPageOff12Encoding
+    NativeLinkPageAddress(address, target) -> NativeLinkPageAddressEncoding
+  }
+}
+
+pub(package) fn native_link_relocation_address(relocation: NativeLinkRelocation) -> i64 {
+  match relocation {
+    NativeLinkBranch26(address, slot) -> address
+    NativeLinkDirectBranch26(address, target) -> address
+    NativeLinkArchivePage21(address, data_offset) -> address
+    NativeLinkArchivePageOff12(address, data_offset) -> address
+    NativeLinkArchiveGotPage21(address, data_offset) -> address
+    NativeLinkArchiveGotPageOff12(address, data_offset) -> address
+    NativeLinkPageAddress(address, target) -> address
+  }
+}
+
+pub(package) fn native_link_validate_relocations(code: i64, relocations: List<NativeLinkRelocation>, layout: NativeLinkImageLayout, symbol_count: i64) -> List<NativeLinkError> {
+  let mut errors = list_nil<NativeLinkError>()
+  match layout {
+    NativeLinkImageLayout(stub_base, code_size, text_size, static_offset, static_size, archive_offset, archive_size, archive_align, data_size) -> {
+      let mut current = relocations
+      let mut done = false
+      while done == false {
+        match current {
+          Nil -> { done = true 0 }
+          Cons(relocation, rest) -> {
+            let encoding = native_link_relocation_encoding(relocation)
+            let address = native_link_relocation_address(relocation)
+            let site_size = match relocation { NativeLinkPageAddress(site, target) -> 8 _ -> 4 }
+            if address < 0 or address + site_size > buf_len(code) {
+              errors = list_append<NativeLinkError>(errors, NativeLinkRelocationSiteOutOfRange(encoding, address))
+            } else {
+              match relocation {
+                NativeLinkBranch26(site, slot) -> {
+                  let target = stub_base + slot * 12
+                  if slot < 0 or slot >= symbol_count or native_link_branch_delta_valid(target - site) == 0 {
+                    errors = list_append<NativeLinkError>(errors, NativeLinkRelocationTargetOutOfRange(encoding, site, target))
+                  } else { 0 }
+                }
+                NativeLinkDirectBranch26(site, target) -> {
+                  if target < 0 or target >= buf_len(code) or native_link_branch_delta_valid(target - site) == 0 {
+                    errors = list_append<NativeLinkError>(errors, NativeLinkRelocationTargetOutOfRange(encoding, site, target))
+                  } else { 0 }
+                }
+                NativeLinkArchivePage21(site, data_offset) -> {
+                  let target = text_size + archive_offset + data_offset
+                  let source = 16384 + site
+                  if data_offset < 0 or data_offset > archive_size or native_link_page_delta_valid(target / 4096 - source / 4096) == 0 {
+                    errors = list_append<NativeLinkError>(errors, NativeLinkRelocationTargetOutOfRange(encoding, site, target))
+                  } else { 0 }
+                }
+                NativeLinkArchivePageOff12(site, data_offset) -> {
+                  let target = text_size + archive_offset + data_offset
+                  let page_offset = target - target / 4096 * 4096
+                  let word = bytes_u32_le_at(buf_ptr(code), buf_len(code), site, 0)
+                  if data_offset < 0 or data_offset > archive_size {
+                    errors = list_append<NativeLinkError>(errors, NativeLinkRelocationTargetOutOfRange(encoding, site, target))
+                  } else {
+                    if native_link_pageoff12_is_valid(word, page_offset) == 0 {
+                      errors = list_append<NativeLinkError>(errors, NativeLinkRelocationTargetMisaligned(encoding, site, target))
+                    } else { 0 }
+                  }
+                }
+                NativeLinkArchiveGotPage21(site, data_offset) -> {
+                  let target = text_size + archive_offset + data_offset
+                  let source = 16384 + site
+                  if data_offset < 0 or data_offset > archive_size or native_link_page_delta_valid(target / 4096 - source / 4096) == 0 {
+                    errors = list_append<NativeLinkError>(errors, NativeLinkRelocationTargetOutOfRange(encoding, site, target))
+                  } else { 0 }
+                }
+                NativeLinkArchiveGotPageOff12(site, data_offset) -> {
+                  let target = text_size + archive_offset + data_offset
+                  let page_offset = target - target / 4096 * 4096
+                  if data_offset < 0 or data_offset > archive_size or page_offset < 0 or page_offset >= 4096 {
+                    errors = list_append<NativeLinkError>(errors, NativeLinkRelocationTargetOutOfRange(encoding, site, target))
+                  } else { 0 }
+                }
+                NativeLinkPageAddress(site, target_fact) -> {
+                  let target = match target_fact {
+                    NativeLinkCodeAddress(code_offset) -> 16384 + code_offset
+                    NativeLinkStaticAddress(slot_offset) -> text_size + static_offset + slot_offset
+                  }
+                  let target_valid = match target_fact {
+                    NativeLinkCodeAddress(code_offset) -> code_offset >= 0 and code_offset < buf_len(code)
+                    NativeLinkStaticAddress(slot_offset) -> slot_offset >= 0 and slot_offset < static_size
+                  }
+                  let source = 16384 + site
+                  if target_valid == false or native_link_page_delta_valid(target / 4096 - source / 4096) == 0 {
+                    errors = list_append<NativeLinkError>(errors, NativeLinkRelocationTargetOutOfRange(encoding, site, target))
+                  } else { 0 }
+                }
+              }
+            }
+            current = rest
+            0
+          }
+        }
+      }
+      let mut slot = 0
+      while slot < symbol_count {
+        let stub = stub_base + slot * 12
+        let got = text_size + slot * 8
+        if stub + 12 > code_size or native_link_page_delta_valid(got / 4096 - (16384 + stub) / 4096) == 0 {
+          errors = list_append<NativeLinkError>(errors, NativeLinkRelocationTargetOutOfRange(NativeLinkGotPage21Encoding, stub, got))
+        } else { 0 }
+        slot = slot + 1
+      }
+      0
+    }
+  }
+  errors
+}
+
 pub(package) fn native_link_library_ordinal(libraries: List<NativeLinkLibrary>, wanted: i64) -> i64 {
   let mut current = libraries
   let mut index = 0
@@ -2003,6 +2169,9 @@ pub(package) fn native_link_resolve(plan: NativeLinkPlan) -> NativeLinkOutcome {
       }
     }
   }
+  let resolved_relocations = list_reverse<NativeLinkRelocation>(relocations)
+  let image_layout = native_link_image_layout(merged_code, merged_data, archive_align, symbol_count, native_link_plan_static_slots(plan))
+  errors = list_concat<NativeLinkError>(errors, native_link_validate_relocations(merged_code, resolved_relocations, image_layout, symbol_count))
   if list_len<NativeLinkError>(errors) != 0 {
     NativeLinkRejected(errors)
   } else {
@@ -2010,10 +2179,10 @@ pub(package) fn native_link_resolve(plan: NativeLinkPlan) -> NativeLinkOutcome {
       native_link_plan_target(plan),
       merged_code,
       merged_data,
-      archive_align,
+      image_layout,
       libraries,
       symbols,
-      list_reverse<NativeLinkRelocation>(relocations),
+      resolved_relocations,
       native_link_plan_static_slots(plan)
     )
     let facts = native_link_artifact_facts(graph)
@@ -2022,11 +2191,11 @@ pub(package) fn native_link_resolve(plan: NativeLinkPlan) -> NativeLinkOutcome {
 }
 
 pub(package) fn native_link_graph_symbol_count(graph: NativeLinkGraph) -> i64 {
-  match graph { NativeLinkGraph(target, code, data, align, libraries, symbols, relocations, static_slots) -> list_len<NativeLinkSymbol>(symbols) }
+  match graph { NativeLinkGraph(target, code, data, layout, libraries, symbols, relocations, static_slots) -> list_len<NativeLinkSymbol>(symbols) }
 }
 
 pub(package) fn native_link_graph_relocation_count(graph: NativeLinkGraph) -> i64 {
-  match graph { NativeLinkGraph(target, code, data, align, libraries, symbols, relocations, static_slots) -> list_len<NativeLinkRelocation>(relocations) }
+  match graph { NativeLinkGraph(target, code, data, layout, libraries, symbols, relocations, static_slots) -> list_len<NativeLinkRelocation>(relocations) }
 }
 
 pub(package) fn native_link_error_count(outcome: NativeLinkOutcome) -> i64 {
@@ -2088,7 +2257,7 @@ pub(package) fn native_link_artifact_is_standalone(facts: NativeArtifactFacts) -
 
 pub(package) fn native_link_artifact_facts(graph: NativeLinkGraph) -> NativeArtifactFacts {
   match graph {
-    NativeLinkGraph(target, code, data, align, libraries, symbols, relocations, static_slots) -> {
+    NativeLinkGraph(target, code, data, layout, libraries, symbols, relocations, static_slots) -> {
       let mut standalone = true
       let mut current = libraries
       let mut done = false
@@ -2269,16 +2438,11 @@ pub(package) fn native_link_pageoff12_word(word: i64, page_offset: i64) -> i64 {
   let add_immediate = if word band 2130706432 == 285212672 { 1 } else { 0 }
   let scale = if add_immediate == 1 { 0 } else { word bshr 30 band 3 }
   let divisor = native_link_pow2(scale)
-  if page_offset < 0 or page_offset >= 4096 or page_offset / divisor * divisor != page_offset {
-    encode_brk(29)
-  } else {
-    (word band 4290774015) + page_offset / divisor * 1024
-  }
+  (word band 4290774015) + page_offset / divisor * 1024
 }
 
 pub(package) fn native_link_relax_got_pageoff12_word(word: i64, page_offset: i64) -> i64 {
-  if page_offset < 0 or page_offset >= 4096 { encode_brk(30) }
-  else { encode_add_imm(word band 31, word bshr 5 band 31, page_offset) }
+  encode_add_imm(word band 31, word bshr 5 band 31, page_offset)
 }
 
 pub(package) fn native_link_apply_relocations(code: i64, relocations: List<NativeLinkRelocation>, text_size: i64, stub_base: i64, static_offset: i64, archive_offset: i64) -> i64 {
