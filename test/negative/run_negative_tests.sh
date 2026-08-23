@@ -135,6 +135,8 @@ check_rejects "unsafe_fiber_suspend_requires_effect" "test/negative/unsafe_fiber
 check_rejects "unsafe_fiber_resume_requires_effect" "test/negative/unsafe_fiber_resume_requires_effect.weft" "error[E2001]:"
 check_rejects "unsafe_fiber_wrapper_requires_effect" "test/negative/unsafe_fiber_wrapper_requires_effect.weft" "error[E2001]:"
 check_rejects "unsafe_got_requires_effect" "test/negative/unsafe_got_requires_effect.weft" "error[E2001]:"
+check_rejects "platform_write_requires_trusted" "test/negative/platform_write_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
+check_rejects "platform_exit_requires_trusted" "test/negative/platform_exit_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "root_raw_syscall_with_effect_requires_trusted" "test/negative/root_raw_syscall_with_effect_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "root_mem_with_effect_requires_trusted" "test/negative/root_mem_with_effect_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "frame_pointer_requires_trusted" "test/negative/frame_pointer_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
