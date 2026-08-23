@@ -370,6 +370,7 @@ check_rejects "proc_raw_actions_addclose_requires_trusted" "test/negative/proc_r
 check_rejects "proc_raw_actions_destroy_requires_trusted" "test/negative/proc_raw_actions_destroy_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "proc_raw_kill_requires_trusted" "test/negative/proc_raw_kill_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "env_arg_requires_effect" "test/negative/env_arg_requires_effect.weft" "error[E2001]:"
+check_rejects "env_arg_requires_missing_case" "test/negative/env_arg_requires_missing_case.weft" 'type annotation type mismatch: expected `str`, found `str | nil`'
 check_rejects "env_var_requires_effect" "test/negative/env_var_requires_effect.weft" "error[E2001]:"
 check_rejects "env_raw_getenv_requires_trusted" "test/negative/env_raw_getenv_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "time_now_nanos_requires_effect" "test/negative/time_now_nanos_requires_effect.weft" "error[E2001]:"

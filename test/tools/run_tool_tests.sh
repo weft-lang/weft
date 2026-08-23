@@ -462,7 +462,8 @@ stdlib_doc_modules=(
   stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft
   stdlib/maybe.weft stdlib/bytes.weft stdlib/path.weft stdlib/io_types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
-  stdlib/test.weft stdlib/math.weft stdlib/time.weft stdlib/json.weft
+  stdlib/test.weft stdlib/math.weft stdlib/time.weft stdlib/env.weft
+  stdlib/json.weft
   stdlib/secure_random.weft stdlib/net_address.weft stdlib/idna.weft
   stdlib/dns.weft stdlib/tcp.weft
   stdlib/state.weft stdlib/diagnostic_type.weft stdlib/diagnostic.weft
@@ -497,6 +498,9 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
   elif [ "$stdlib_doc_name" = "io_helpers" ]; then
     assert_contains "doc_stdlib_io_helpers_pins_public_surface" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
+  elif [ "$stdlib_doc_name" = "env" ]; then
+    assert_contains "doc_stdlib_env_pins_public_surface" "$(<"$tmp_out")" "Public API items: 4. Documented: 4."
+    assert_contains "doc_stdlib_env_pins_optional_argument" "$(<"$tmp_out")" "fn arg(index: i64) -> str | nil"
   elif [ "$stdlib_doc_name" = "string" ]; then
     assert_contains "doc_stdlib_string_pins_public_surface" "$(<"$tmp_out")" "Public API items: 17. Documented: 17."
   elif [ "$stdlib_doc_name" = "net_address" ]; then
@@ -810,6 +814,23 @@ assert_contains "elf_linux_time_selects_exit_group" "$elf_linux_time_disassembly
 assert_contains "elf_linux_time_invokes_linux_svc" "$elf_linux_time_disassembly" $'svc\t#0'
 assert_not_contains "elf_linux_time_has_no_interpreter" "$elf_linux_time_headers" "INTERP off"
 assert_not_contains "elf_linux_time_has_no_dynamic_segment" "$elf_linux_time_headers" "DYNAMIC off"
+
+# Env consumes the kernel-provided startup vector and materializes managed
+# optional strings. The product has no getenv/libc or dynamic-loader boundary.
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_env_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_env_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_env_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_env_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+assert_contains "elf_linux_env_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
+elf_linux_env_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+elf_linux_env_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+assert_contains "elf_linux_env_selects_exit_group" "$elf_linux_env_disassembly" $'mov\tx8, #0x5e'
+assert_contains "elf_linux_env_invokes_linux_svc" "$elf_linux_env_disassembly" $'svc\t#0'
+assert_not_contains "elf_linux_env_has_no_interpreter" "$elf_linux_env_headers" "INTERP off"
+assert_not_contains "elf_linux_env_has_no_dynamic_segment" "$elf_linux_env_headers" "DYNAMIC off"
 
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
