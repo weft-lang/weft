@@ -87,6 +87,10 @@ just bootstrap
 bash run_tests.sh
 ```
 
+Development products include function/file/line DWARF by default. Add
+`--strip-debug` to `weft build` when the smaller release artifact matters; the
+artifact-facts sidecar reports whether debug information is present.
+
 ## The Ideas
 
 ### Effects make policy pluggable

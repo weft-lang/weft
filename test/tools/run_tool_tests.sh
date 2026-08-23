@@ -3296,6 +3296,31 @@ assert_equals "package_native_artifact_lldb_session_exits_cleanly" "$native_forw
 assert_contains "package_native_artifact_lldb_resolves_main" "$native_forward_lldb" "main at main.weft:1:4"
 assert_contains "package_native_artifact_lldb_stops_in_main" "$native_forward_lldb" "stop reason = breakpoint"
 assert_contains "package_native_artifact_lldb_walks_caller_frame" "$native_forward_lldb" "frame #1:"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_forward_stripped --artifact-facts native_forward_stripped.facts.json --strip-debug)
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_forward_stripped_second --strip-debug --artifact-facts native_forward_stripped_second.facts.json)
+if cmp -s "$tmp_pkg_trust_dir/native_artifacts/native_forward_stripped" "$tmp_pkg_trust_dir/native_artifacts/native_forward_stripped_second"; then
+  echo "  ok package_native_stripped_artifact_is_deterministic"
+else
+  echo "  fail package_native_stripped_artifact_is_deterministic"
+  exit 1
+fi
+native_forward_stripped_facts=$(/bin/cat "$tmp_pkg_trust_dir/native_artifacts/native_forward_stripped.facts.json")
+assert_contains "package_native_stripped_artifact_reports_absent_debug_information" "$native_forward_stripped_facts" '"debug_information":{"kind":"absent"}'
+native_forward_stripped_load_commands=$(otool -l "$tmp_pkg_trust_dir/native_artifacts/native_forward_stripped")
+assert_not_contains "package_native_stripped_artifact_omits_dwarf" "$native_forward_stripped_load_commands" "__DWARF"
+native_forward_size=$(stat -f '%z' "$tmp_pkg_trust_dir/native_artifacts/native_forward")
+native_forward_stripped_size=$(stat -f '%z' "$tmp_pkg_trust_dir/native_artifacts/native_forward_stripped")
+if [ "$native_forward_stripped_size" -lt "$native_forward_size" ]; then
+  echo "  ok package_native_strip_debug_reduces_artifact_size"
+else
+  echo "  fail package_native_strip_debug_reduces_artifact_size"
+  exit 1
+fi
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_forward_stripped"
+pkg_native_forward_stripped_exit=$?
+set -e
+assert_equals "package_native_stripped_artifact_preserves_behavior" "$pkg_native_forward_stripped_exit" "42"
 native_forward_signing=$(codesign -d --verbose=5 "$tmp_pkg_trust_dir/native_artifacts/native_forward" 2>&1)
 assert_contains "package_native_artifact_signature_is_ad_hoc" "$native_forward_signing" "Signature=adhoc"
 assert_contains "package_native_artifact_signature_names_weft" "$native_forward_signing" "Identifier=weft"
