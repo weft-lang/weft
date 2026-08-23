@@ -46,6 +46,9 @@ tmp_lsp_stream_dir=$(mktemp -d /tmp/weft_tool_lsp_stream_XXXXXX)
 tmp_tree_sitter_grammar=$(mktemp /tmp/weft_tool_tree_sitter_grammar_XXXXXX)
 tmp_tree_sitter_grammar_second=$(mktemp /tmp/weft_tool_tree_sitter_grammar_second_XXXXXX)
 tmp_tree_sitter_generator=$(mktemp /tmp/weft_tool_tree_sitter_generator_XXXXXX)
+tmp_elf_generator=$(mktemp /tmp/weft_tool_elf_generator_XXXXXX)
+tmp_elf_product=$(mktemp /tmp/weft_tool_elf_product_XXXXXX)
+tmp_elf_product_second=$(mktemp /tmp/weft_tool_elf_product_second_XXXXXX)
 tmp_native_debug_dir=$(mktemp -d /tmp/weft_tool_native_debug_XXXXXX)
 chmod 755 "$tmp_native_debug_dir"
 tmp_native_debug_bin="$tmp_native_debug_dir/native_forward"
@@ -53,7 +56,7 @@ tmp_native_debug_lldb=$(mktemp /tmp/weft_tool_native_debug_lldb_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_timeout" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_check_clean" "$tmp_check_fail" "$tmp_rc_census_src" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_timeout" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_check_clean" "$tmp_check_fail" "$tmp_rc_census_src" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product_second" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir"' EXIT
 
 now_s() {
   date +%s
@@ -605,6 +608,29 @@ assert_contains "tree_sitter_grammar_marks_generated_source" "$(<"$tmp_tree_sitt
 assert_contains "tree_sitter_grammar_has_source_file" "$(<"$tmp_tree_sitter_grammar")" 'source_file: $ => repeat(choice($._declaration, $.stray_closing_brace))'
 "$tmp_tree_sitter_generator" > "$tmp_tree_sitter_grammar_second" 2> "$tmp_err"
 assert_files_equal "tree_sitter_grammar_is_deterministic" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second"
+
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_aarch64_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_aarch64_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_aarch64_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+elf_file=$(/usr/bin/file -b "$tmp_elf_product")
+assert_contains "elf_linux_aarch64_file_reports_architecture" "$elf_file" "ARM aarch64"
+assert_contains "elf_linux_aarch64_file_reports_static_linkage" "$elf_file" "statically linked"
+elf_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --file-headers --private-headers "$tmp_elf_product")
+assert_contains "elf_linux_aarch64_has_little_endian_format" "$elf_headers" "file format elf64-littleaarch64"
+assert_contains "elf_linux_aarch64_has_aarch64_architecture" "$elf_headers" "architecture: aarch64"
+assert_contains "elf_linux_aarch64_has_exact_entry" "$elf_headers" "start address: 0x0000000000401000"
+assert_contains "elf_linux_aarch64_load_is_read_execute" "$elf_headers" "flags r-x"
+assert_contains "elf_linux_aarch64_stack_is_read_write" "$elf_headers" "flags rw-"
+assert_not_contains "elf_linux_aarch64_has_no_interpreter" "$elf_headers" "INTERP off"
+assert_not_contains "elf_linux_aarch64_has_no_dynamic_segment" "$elf_headers" "DYNAMIC off"
+elf_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+assert_contains "elf_linux_aarch64_sets_exit_status" "$elf_disassembly" $'mov\tx0, #0x2a'
+assert_contains "elf_linux_aarch64_sets_exit_syscall" "$elf_disassembly" $'mov\tx8, #0x5d'
+assert_contains "elf_linux_aarch64_invokes_linux_svc" "$elf_disassembly" $'svc\t#0'
 
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
@@ -4391,4 +4417,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 1072 passed, 0 failed"
+echo "Tool boundary summary: 1087 passed, 0 failed"
