@@ -1,9 +1,13 @@
 -- macho.weft — Mach-O binary format emission with ad-hoc code signing
 
 use compiler/lib.{*}
+use compiler/codegen.{bytes_set_u32}
+use compiler/encode.{*}
+use compiler/native_link.{*}
 use compiler/sha256.{*}
 use runtime/buffer.{*}
 use runtime/macho_storage.{*}
+use stdlib/list.{*}
 
 pub(package) fn emit_pz2(o: i64) -> i64 {
   bfill(o, 6) bu64(o, 0) bu64(o, 4294967296) bu64(o, 0) bu64(o, 0)
@@ -366,4 +370,140 @@ pub(package) fn emit_macho_hdr(o: i64, cs: i64, ts: i64, so: i64, ll: i64, ss: i
   emit_lcs(o, m)
   emit_codesig_lc(o, so, ss)
   bpad(o, 16384)
+}
+
+-- The Mach-O leaf owns managed output buffers; the shared native-link module
+-- remains a pure typed graph producer with no internal ownership privilege.
+pub(package) fn native_link_emit_bind_data(symbols: List<NativeLinkSymbol>) -> rc i64 {
+  let bind = buf_new(list_len<NativeLinkSymbol>(symbols) * 40 + 16)
+  if list_len<NativeLinkSymbol>(symbols) != 0 {
+    bu8(bind, 81)
+    bu8(bind, 114)
+    native_link_emit_uleb(bind, 0)
+    let mut current = symbols
+    let mut done = false
+    while done == false {
+      match current {
+        Nil -> { done = true 0 }
+        Cons(symbol, rest) -> {
+          match symbol {
+            NativeLinkUndefinedStrong(name, ordinal, origin) -> {
+              if ordinal <= 15 {
+                bu8(bind, 16 + ordinal)
+              } else {
+                bu8(bind, 32)
+                native_link_emit_uleb(bind, ordinal)
+              }
+              bu8(bind, 64)
+              bu8(bind, 95)
+              bstr(bind, name)
+              bu8(bind, 0)
+              bu8(bind, 144)
+            }
+          }
+          current = rest
+          0
+        }
+      }
+    }
+  } else { 0 }
+  bu8(bind, 0)
+  bind
+}
+
+pub(package) fn native_link_emit_strtab(symbols: List<NativeLinkSymbol>) -> rc i64 {
+  let strings = buf_new(list_len<NativeLinkSymbol>(symbols) * 32 + 8)
+  bu8(strings, 0)
+  let mut current = symbols
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(symbol, rest) -> {
+        match symbol {
+          NativeLinkUndefinedStrong(name, ordinal, origin) -> {
+            bu8(strings, 95)
+            bstr(strings, name)
+            bu8(strings, 0)
+          }
+        }
+        current = rest
+        0
+      }
+    }
+  }
+  strings
+}
+
+pub(package) fn emit_native_link_macho(graph: NativeLinkGraph) -> rc i64 {
+  match graph {
+    NativeLinkGraph(target, original_code, libraries, symbols, relocations, static_slots) -> {
+      let symbol_count = list_len<NativeLinkSymbol>(symbols)
+      let stub_base = native_link_align(buf_len(original_code), 4)
+      let code_size = stub_base + symbol_count * 12
+      let text_size = page_round(16384 + code_size)
+      let static_offset = native_link_align(symbol_count * 8, 16)
+      let static_size = static_slots * 16
+      let data_need = static_offset + static_size
+      let data_size = page_round(if data_need > 0 { data_need } else { 1 })
+      let linkedit_offset = text_size + data_size
+      let code = buf_new(code_size + 16)
+      bscopy(code, buf_ptr(original_code), buf_len(original_code), 0)
+      bpad(code, stub_base)
+      native_link_emit_stubs(code, symbols, text_size, stub_base, 0)
+      native_link_apply_relocations(code, relocations, text_size, stub_base, static_offset)
+
+      let bind = native_link_emit_bind_data(symbols)
+      let strings = native_link_emit_strtab(symbols)
+      let bind_size = buf_len(bind)
+      let bind_padded = native_link_align(bind_size, 8)
+      let indirect_size = symbol_count * 4
+      let indirect_padded = native_link_align(indirect_size, 8)
+      let symtab_size = symbol_count * 16
+      let linkedit_before_signature = bind_padded + indirect_padded + symtab_size + buf_len(strings)
+      let signature_offset = linkedit_offset + linkedit_before_signature
+      let hash_count = (signature_offset + 4095) / 4096
+      let signature_size = 20 + 93 + hash_count * 32
+      let linkedit_size = page_round(linkedit_before_signature + signature_size)
+
+      let dylibs = native_link_dylibs(libraries)
+      let dylib_count = list_len<str>(dylibs)
+      let data_command_size = 72 + (1 + (if static_size > 0 { 1 } else { 0 })) * 80
+      let commands_size = 72 + 152 + data_command_size + 72 + 24 + 24 + 32 + native_link_dylib_commands_size(dylibs) + 48 + 80 + 16
+      let output = buf_new(linkedit_offset + linkedit_size + 4096)
+      bu32(output, 4277009103) bu32(output, 16777228) bu32(output, 0) bu32(output, 2)
+      bu32(output, 10 + dylib_count) bu32(output, commands_size) bu32(output, 2097285) bu32(output, 0)
+      emit_pz(output)
+      emit_text_seg(output, text_size) emit_text_sec(output, code_size)
+      native_link_emit_data_segment(output, text_size, data_size, symbol_count, static_offset, static_size)
+      emit_linkedit_signed(output, text_size, linkedit_offset, linkedit_size)
+      emit_main_lc(output, 0)
+      emit_symtab_real(
+        output,
+        linkedit_offset + bind_padded + indirect_padded,
+        symbol_count,
+        linkedit_offset + bind_padded + indirect_padded + symtab_size,
+        buf_len(strings)
+      )
+      emit_dylinker(output)
+      native_link_emit_dylib_commands(output, dylibs)
+      emit_dyld_info_real(output, linkedit_offset, bind_size)
+      emit_dysymtab(output, linkedit_offset + bind_padded, symbol_count)
+      emit_codesig_lc(output, signature_offset, signature_size)
+      bpad(output, 16384)
+      bscopy(output, buf_ptr(code), buf_len(code), 0)
+      bpad(output, text_size)
+      bpad(output, linkedit_offset)
+      bscopy(output, buf_ptr(bind), bind_size, 0)
+      bpad(output, linkedit_offset + bind_padded)
+      for i in 0..symbol_count { bu32(output, i) }
+      bpad(output, linkedit_offset + bind_padded + indirect_padded)
+      native_link_emit_nlists(output, symbols)
+      bscopy(output, buf_ptr(strings), buf_len(strings), 0)
+      bpad(output, signature_offset)
+      emit_codesig(output, signature_offset, 16384, text_size - 16384)
+      bpad(output, linkedit_offset + linkedit_size)
+      output
+    }
+  }
 }

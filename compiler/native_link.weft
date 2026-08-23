@@ -1,0 +1,707 @@
+-- compiler/native_link.weft -- typed native final-link graph and Mach-O leaf
+--
+-- The compiler's selected-target facts are projected once into NativeLinkPlan.
+-- Resolution consumes only that typed value; Mach-O construction consumes the
+-- resulting closed graph. The temporary archive residual is explicit, so the
+-- platform-linker oracle cannot silently become part of link semantics.
+
+use compiler/codegen.{*}
+use compiler/encode.{*}
+use compiler/lib.{*}
+use compiler/object.{got_sym_count, got_sym_name}
+use compiler/package.{*}
+use runtime/buffer.{*}
+use stdlib/list.{*}
+use stdlib/option.{None, Some}
+use stdlib/string.{str_eq}
+
+pub(package) type NativeLinkTarget {
+  NativeLinkMacosAarch64,
+  NativeLinkLinuxAarch64
+}
+
+pub(package) type NativeLinkLibrary {
+  NativeLinkSystemLibrary(str, str),
+  NativeLinkStaticArchive(str, str, str),
+  NativeLinkDynamicLibrary(str, str, str, str)
+}
+
+pub(package) type NativeLinkDynamicIdentity {
+  NativeLinkDynamicIdentityKnown(i64, i64),
+  NativeLinkDynamicIdentityMissing,
+  NativeLinkDynamicIdentityMalformed
+}
+
+pub(package) type NativeLinkImportOrigin {
+  NativeLinkRuntimeImport,
+  NativeLinkManifestImport(i64)
+}
+
+pub(package) type NativeLinkImport {
+  NativeLinkImport(str, i64, NativeLinkImportOrigin),
+  NativeLinkInvalidImport
+}
+
+pub(package) type NativeLinkAddressTarget {
+  NativeLinkCodeAddress(i64),
+  NativeLinkStaticAddress(i64)
+}
+
+pub(package) type NativeLinkPlanRelocation {
+  NativeLinkPlanBranch26(i64, i64),
+  NativeLinkPlanPageAddress(i64, NativeLinkAddressTarget)
+}
+
+pub(package) type NativeLinkPlan {
+  NativeLinkPlan(NativeLinkTarget, i64, List<NativeLinkLibrary>, List<NativeLinkImport>, List<NativeLinkPlanRelocation>, i64)
+}
+
+pub(package) type NativeLinkSymbol {
+  NativeLinkUndefinedStrong(str, i64, NativeLinkImportOrigin)
+}
+
+pub(package) type NativeLinkRelocation {
+  NativeLinkBranch26(i64, i64),
+  NativeLinkPageAddress(i64, NativeLinkAddressTarget)
+}
+
+pub(package) type NativeLinkGraph {
+  NativeLinkGraph(NativeLinkTarget, i64, List<NativeLinkLibrary>, List<NativeLinkSymbol>, List<NativeLinkRelocation>, i64)
+}
+
+pub(package) type NativeArtifactDependency {
+  NativeArtifactSystemDependency(str),
+  NativeArtifactDynamicDependency(str)
+}
+
+pub(package) type NativeArtifactFacts {
+  NativeArtifactFacts(NativeLinkTarget, bool, List<NativeArtifactDependency>, List<NativeLinkSymbol>)
+}
+
+pub(package) type NativeLinkError {
+  NativeLinkUnsupportedSystemLibrary(str),
+  NativeLinkArchiveResolutionRequired(str, str),
+  NativeLinkMissingDynamicArtifact(str),
+  NativeLinkInvalidImportIndex(i64),
+  NativeLinkInvalidLibraryIndex(i64)
+}
+
+pub(package) type NativeLinkOutcome {
+  NativeLinkSucceeded(NativeLinkGraph, NativeArtifactFacts),
+  NativeLinkRejected(List<NativeLinkError>)
+}
+
+pub(package) fn native_link_plan_target(plan: NativeLinkPlan) -> NativeLinkTarget {
+  match plan { NativeLinkPlan(target, code, libraries, imports, relocations, static_slots) -> target }
+}
+
+pub(package) fn native_link_plan_code(plan: NativeLinkPlan) -> i64 {
+  match plan { NativeLinkPlan(target, code, libraries, imports, relocations, static_slots) -> code }
+}
+
+pub(package) fn native_link_plan_libraries(plan: NativeLinkPlan) -> List<NativeLinkLibrary> {
+  match plan { NativeLinkPlan(target, code, libraries, imports, relocations, static_slots) -> libraries }
+}
+
+pub(package) fn native_link_plan_imports(plan: NativeLinkPlan) -> List<NativeLinkImport> {
+  match plan { NativeLinkPlan(target, code, libraries, imports, relocations, static_slots) -> imports }
+}
+
+pub(package) fn native_link_plan_relocations(plan: NativeLinkPlan) -> List<NativeLinkPlanRelocation> {
+  match plan { NativeLinkPlan(target, code, libraries, imports, relocations, static_slots) -> relocations }
+}
+
+pub(package) fn native_link_plan_static_slots(plan: NativeLinkPlan) -> i64 {
+  match plan { NativeLinkPlan(target, code, libraries, imports, relocations, static_slots) -> static_slots }
+}
+
+pub(package) fn native_link_plan_library_count(plan: NativeLinkPlan) -> i64 {
+  list_len<NativeLinkLibrary>(native_link_plan_libraries(plan))
+}
+
+pub(package) fn native_link_plan_import_count(plan: NativeLinkPlan) -> i64 {
+  list_len<NativeLinkImport>(native_link_plan_imports(plan))
+}
+
+pub(package) fn native_link_plan_relocation_count(plan: NativeLinkPlan) -> i64 {
+  list_len<NativeLinkPlanRelocation>(native_link_plan_relocations(plan))
+}
+
+-- Parse the install identity from an acquired aarch64 Mach-O dylib. The path
+-- becomes loader metadata only after this structural check; a selected file
+-- path is provenance, not automatically its runtime identity.
+pub(package) fn native_link_macho_dynamic_identity(bytes: i64, len: i64) -> NativeLinkDynamicIdentity {
+  if len < 32 or bytes_u32_le_at(bytes, len, 0, 0) != 4277009103 or
+    bytes_u32_le_at(bytes, len, 4, 0) != 16777228 or bytes_u32_le_at(bytes, len, 12, 0) != 6 {
+    NativeLinkDynamicIdentityMalformed
+  } else {
+    let command_count = bytes_u32_le_at(bytes, len, 16, 0)
+    let command_bytes = bytes_u32_le_at(bytes, len, 20, 0)
+    let command_end = 32 + command_bytes
+    if command_end > len {
+      NativeLinkDynamicIdentityMalformed
+    } else {
+      let mut cursor = 32
+      let mut index = 0
+      let mut malformed = false
+      let mut identity_ptr = 0
+      let mut identity_len = 0
+      while index < command_count and malformed == false and identity_len == 0 {
+        let command = bytes_u32_le_at(bytes, command_end, cursor, 0 - 1)
+        let command_size = bytes_u32_le_at(bytes, command_end, cursor + 4, 0)
+        if command_size < 8 or cursor + command_size > command_end {
+          malformed = true
+        } else {
+          if command == 13 {
+            let name_offset = bytes_u32_le_at(bytes, command_end, cursor + 8, 0)
+            let name_start = cursor + name_offset
+            let name_len = if name_offset < 24 or name_start >= cursor + command_size { 0 - 1 }
+            else { bytes_cstr_len_bounded(bytes, cursor + command_size, name_start) }
+            if name_len <= 0 { malformed = true }
+            else {
+              -- Retain a view into the acquired artifact bytes. Constructing a
+              -- managed `str` here would make this cross-phase fact depend on
+              -- the parser temporary's lifetime.
+              identity_ptr = bytes + name_start
+              identity_len = name_len
+            }
+          } else { 0 }
+          cursor = cursor + command_size
+          index = index + 1
+        }
+      }
+      if malformed { NativeLinkDynamicIdentityMalformed }
+      else { if identity_len == 0 { NativeLinkDynamicIdentityMissing } else { NativeLinkDynamicIdentityKnown(identity_ptr, identity_len) } }
+    }
+  }
+}
+
+pub(package) fn native_link_library_from_fmap(entry: i64) -> NativeLinkLibrary {
+  let name = pkg_str_view(fmap_native_link_library_link_ptr(entry), fmap_native_link_library_link_len(entry))
+  let selected = pkg_str_view(fmap_native_link_library_selected_path_ptr(entry), fmap_native_link_library_selected_path_len(entry))
+  let content = pkg_str_view(fmap_native_link_library_content_ptr(entry), fmap_native_link_library_content_len(entry))
+  match pkg_native_library_kind_fact(fmap_native_link_library_kind(entry)) {
+    NativeSystemLibrary -> {
+      let load_path = if str_eq(name, "System") == 1 { "/usr/lib/libSystem.B.dylib" } else { "" }
+      NativeLinkSystemLibrary(name, load_path)
+    }
+    NativeArchiveLibrary -> NativeLinkStaticArchive(name, selected, content)
+    NativeDynamicLibrary -> NativeLinkDynamicLibrary(
+      name,
+      selected,
+      pkg_str_view(fmap_native_link_library_load_identity_ptr(entry), fmap_native_link_library_load_identity_len(entry)),
+      content
+    )
+  }
+}
+
+pub(package) fn native_link_plan_libraries_from_fmap(fm: i64) -> List<NativeLinkLibrary> {
+  let mut libraries = list_cons<NativeLinkLibrary>(NativeLinkSystemLibrary("System", "/usr/lib/libSystem.B.dylib"), list_nil<NativeLinkLibrary>())
+  for i in 0..fmap_native_link_library_count(fm) {
+    let entry = fmap_native_link_library_at(fm, i)
+    if fmap_native_link_library_is_used(entry) == 1 {
+      libraries = list_append<NativeLinkLibrary>(libraries, native_link_library_from_fmap(entry))
+    } else { 0 }
+  }
+  libraries
+}
+
+-- Library index zero is the platform contract. Manifest-selected libraries
+-- follow in manifest order, skipping unreachable entries.
+pub(package) fn native_link_used_library_index(fm: i64, wanted: i64) -> i64 {
+  let mut index = 1
+  let mut found = 0 - 1
+  let mut i = 0
+  while i < fmap_native_link_library_count(fm) and found < 0 {
+    let entry = fmap_native_link_library_at(fm, i)
+    if fmap_native_link_library_is_used(entry) == 1 {
+      if entry == wanted { found = index } else { index = index + 1 }
+    } else { 0 }
+    i = i + 1
+  }
+  found
+}
+
+pub(package) fn native_link_plan_imports_from_fmap(fm: i64) -> List<NativeLinkImport> {
+  let mut imports = list_nil<NativeLinkImport>()
+  for i in 0..got_sym_count() {
+    imports = list_append<NativeLinkImport>(imports, NativeLinkImport(got_sym_name(i), 0, NativeLinkRuntimeImport))
+  }
+  for i in 0..fmap_native_external_used_count(fm) {
+    let entry = fmap_native_external_used_at(fm, i)
+    let library_index = native_link_used_library_index(fm, fmap_native_external_entry_library(entry))
+    imports = list_append<NativeLinkImport>(
+      imports,
+      NativeLinkImport(
+        pkg_str_view(fmap_native_external_entry_symbol_ptr(entry), fmap_native_external_entry_symbol_len(entry)),
+        library_index,
+        NativeLinkManifestImport(i)
+      )
+    )
+  }
+  imports
+}
+
+pub(package) fn native_link_plan_relocations_from_fmap(fm: i64) -> List<NativeLinkPlanRelocation> {
+  let mut relocations = list_nil<NativeLinkPlanRelocation>()
+  for i in 0..fmap_got_patch_count(fm) {
+    relocations = list_cons<NativeLinkPlanRelocation>(
+      NativeLinkPlanBranch26(fmap_got_patch_code_pos(fm, i), fmap_got_patch_index(fm, i)),
+      relocations
+    )
+  }
+  relocations = list_cons<NativeLinkPlanRelocation>(
+    NativeLinkPlanPageAddress(fmap_native_provenance_adrp_pos(fm), NativeLinkCodeAddress(fmap_native_provenance_table_offset(fm))),
+    relocations
+  )
+  for i in 0..fmap_static_pair_patch_count(fm) {
+    relocations = list_cons<NativeLinkPlanRelocation>(
+      NativeLinkPlanPageAddress(fmap_static_pair_patch_code_pos(fm, i), NativeLinkStaticAddress(fmap_static_pair_patch_slot_off(fm, i))),
+      relocations
+    )
+  }
+  list_reverse<NativeLinkPlanRelocation>(relocations)
+}
+
+pub(package) fn native_link_plan_from_fmap(code: i64, fm: i64) -> NativeLinkPlan {
+  NativeLinkPlan(
+    NativeLinkMacosAarch64,
+    code,
+    native_link_plan_libraries_from_fmap(fm),
+    native_link_plan_imports_from_fmap(fm),
+    native_link_plan_relocations_from_fmap(fm),
+    fmap_static_pair_slot_count(fm)
+  )
+}
+
+pub(package) fn native_link_library_at(libraries: List<NativeLinkLibrary>, index: i64) -> Option<NativeLinkLibrary> {
+  list_nth<NativeLinkLibrary>(libraries, index)
+}
+
+pub(package) fn native_link_import_at(imports: List<NativeLinkImport>, index: i64) -> NativeLinkImport {
+  match list_nth<NativeLinkImport>(imports, index) {
+    Some(value) -> value
+    None -> NativeLinkInvalidImport
+  }
+}
+
+pub(package) type NativeLinkResolvedSlot {
+  NativeLinkResolvedSlot(i64, i64)
+}
+
+pub(package) fn native_link_resolved_slot(slots: List<NativeLinkResolvedSlot>, import_index: i64) -> i64 {
+  match slots {
+    Nil -> 0 - 1
+    Cons(entry, rest) -> match entry {
+      NativeLinkResolvedSlot(candidate, slot) -> {
+        if candidate == import_index { slot } else { native_link_resolved_slot(rest, import_index) }
+      }
+    }
+  }
+}
+
+pub(package) fn native_link_validate_libraries(libraries: List<NativeLinkLibrary>) -> List<NativeLinkError> {
+  let mut errors = list_nil<NativeLinkError>()
+  let mut current = libraries
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(library, rest) -> {
+        match library {
+          NativeLinkSystemLibrary(name, load_path) -> {
+            if __str_len(load_path) == 0 {
+              errors = list_append<NativeLinkError>(errors, NativeLinkUnsupportedSystemLibrary(name))
+              0
+            } else { 0 }
+          }
+          NativeLinkStaticArchive(name, path, content) -> {
+            errors = list_append<NativeLinkError>(errors, NativeLinkArchiveResolutionRequired(name, path))
+            0
+          }
+          NativeLinkDynamicLibrary(name, path, load_identity, content) -> {
+            if __str_len(path) == 0 or __str_len(load_identity) == 0 {
+              errors = list_append<NativeLinkError>(errors, NativeLinkMissingDynamicArtifact(name))
+              0
+            } else { 0 }
+          }
+        }
+        current = rest
+        0
+      }
+    }
+  }
+  errors
+}
+
+pub(package) fn native_link_library_ordinal(libraries: List<NativeLinkLibrary>, wanted: i64) -> i64 {
+  let mut current = libraries
+  let mut index = 0
+  let mut next_dynamic_ordinal = 2
+  let mut found = 0
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(library, rest) -> {
+        if index == wanted {
+          found = match library {
+            NativeLinkSystemLibrary(name, load_path) -> 1
+            NativeLinkDynamicLibrary(name, path, load_identity, content) -> next_dynamic_ordinal
+            NativeLinkStaticArchive(name, path, content) -> 0
+          }
+          done = true
+          0
+        } else {
+          match library {
+            NativeLinkDynamicLibrary(name, path, load_identity, content) -> { next_dynamic_ordinal = next_dynamic_ordinal + 1 0 }
+            _ -> 0
+          }
+          current = rest
+          index = index + 1
+          0
+        }
+      }
+    }
+  }
+  found
+}
+
+pub(package) fn native_link_resolve(plan: NativeLinkPlan) -> NativeLinkOutcome {
+  let libraries = native_link_plan_libraries(plan)
+  let imports = native_link_plan_imports(plan)
+  let plan_relocations = native_link_plan_relocations(plan)
+  let mut errors = native_link_validate_libraries(libraries)
+  let import_count = list_len<NativeLinkImport>(imports)
+  let mut slots = list_nil<NativeLinkResolvedSlot>()
+  let mut symbols = list_nil<NativeLinkSymbol>()
+  let mut relocations = list_nil<NativeLinkRelocation>()
+  let mut symbol_count = 0
+  let mut current = plan_relocations
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(relocation, rest) -> {
+        match relocation {
+          NativeLinkPlanBranch26(address, import_index) -> {
+            if import_index < 0 or import_index >= import_count {
+              errors = list_append<NativeLinkError>(errors, NativeLinkInvalidImportIndex(import_index))
+              0
+            } else {
+              let stored = native_link_resolved_slot(slots, import_index)
+              let slot = if stored >= 0 { stored }
+              else {
+                match native_link_import_at(imports, import_index) {
+                  NativeLinkImport(name, library_index, origin) -> {
+                    let ordinal = native_link_library_ordinal(libraries, library_index)
+                    if ordinal == 0 {
+                      errors = list_append<NativeLinkError>(errors, NativeLinkInvalidLibraryIndex(library_index))
+                      0
+                    } else {
+                      symbols = list_append<NativeLinkSymbol>(symbols, NativeLinkUndefinedStrong(name, ordinal, origin))
+                      slots = list_cons<NativeLinkResolvedSlot>(NativeLinkResolvedSlot(import_index, symbol_count), slots)
+                      symbol_count = symbol_count + 1
+                      0
+                    }
+                    symbol_count - 1
+                  }
+                  NativeLinkInvalidImport -> {
+                    errors = list_append<NativeLinkError>(errors, NativeLinkInvalidImportIndex(import_index))
+                    0
+                  }
+                }
+              }
+              relocations = list_cons<NativeLinkRelocation>(NativeLinkBranch26(address, slot), relocations)
+              0
+            }
+          }
+          NativeLinkPlanPageAddress(address, target) -> {
+            relocations = list_cons<NativeLinkRelocation>(NativeLinkPageAddress(address, target), relocations)
+            0
+          }
+        }
+        current = rest
+        0
+      }
+    }
+  }
+  if list_len<NativeLinkError>(errors) != 0 {
+    NativeLinkRejected(errors)
+  } else {
+    let graph = NativeLinkGraph(
+      native_link_plan_target(plan),
+      native_link_plan_code(plan),
+      libraries,
+      symbols,
+      list_reverse<NativeLinkRelocation>(relocations),
+      native_link_plan_static_slots(plan)
+    )
+    let facts = native_link_artifact_facts(graph)
+    NativeLinkSucceeded(graph, facts)
+  }
+}
+
+pub(package) fn native_link_graph_symbol_count(graph: NativeLinkGraph) -> i64 {
+  match graph { NativeLinkGraph(target, code, libraries, symbols, relocations, static_slots) -> list_len<NativeLinkSymbol>(symbols) }
+}
+
+pub(package) fn native_link_graph_relocation_count(graph: NativeLinkGraph) -> i64 {
+  match graph { NativeLinkGraph(target, code, libraries, symbols, relocations, static_slots) -> list_len<NativeLinkRelocation>(relocations) }
+}
+
+pub(package) fn native_link_error_count(outcome: NativeLinkOutcome) -> i64 {
+  match outcome {
+    NativeLinkSucceeded(graph, facts) -> 0
+    NativeLinkRejected(errors) -> list_len<NativeLinkError>(errors)
+  }
+}
+
+pub(package) fn native_link_dylibs(libraries: List<NativeLinkLibrary>) -> List<str> {
+  let mut dylibs = list_cons<str>("/usr/lib/libSystem.B.dylib", list_nil<str>())
+  let mut current = libraries
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(library, rest) -> {
+        match library {
+          NativeLinkDynamicLibrary(name, path, load_identity, content) -> { dylibs = list_append<str>(dylibs, load_identity) 0 }
+          _ -> 0
+        }
+        current = rest
+        0
+      }
+    }
+  }
+  dylibs
+}
+
+pub(package) fn native_link_artifact_dependencies(libraries: List<NativeLinkLibrary>) -> List<NativeArtifactDependency> {
+  let mut dependencies = list_cons<NativeArtifactDependency>(
+    NativeArtifactSystemDependency("/usr/lib/libSystem.B.dylib"),
+    list_nil<NativeArtifactDependency>()
+  )
+  let mut current = libraries
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(library, rest) -> {
+        match library {
+          NativeLinkDynamicLibrary(name, path, load_identity, content) -> {
+            dependencies = list_append<NativeArtifactDependency>(dependencies, NativeArtifactDynamicDependency(load_identity))
+            0
+          }
+          _ -> 0
+        }
+        current = rest
+        0
+      }
+    }
+  }
+  dependencies
+}
+
+pub(package) fn native_link_artifact_is_standalone(facts: NativeArtifactFacts) -> bool {
+  match facts { NativeArtifactFacts(target, standalone, dependencies, symbols) -> standalone }
+}
+
+pub(package) fn native_link_artifact_facts(graph: NativeLinkGraph) -> NativeArtifactFacts {
+  match graph {
+    NativeLinkGraph(target, code, libraries, symbols, relocations, static_slots) -> {
+      let mut standalone = true
+      let mut current = libraries
+      let mut done = false
+      while done == false {
+        match current {
+          Nil -> { done = true 0 }
+          Cons(library, rest) -> {
+            match library {
+              NativeLinkDynamicLibrary(name, path, load_identity, content) -> { standalone = false 0 }
+              _ -> 0
+            }
+            current = rest
+            0
+          }
+        }
+      }
+      NativeArtifactFacts(target, standalone, native_link_artifact_dependencies(libraries), symbols)
+    }
+  }
+}
+
+pub(package) fn native_link_align(n: i64, alignment: i64) -> i64 {
+  (n + alignment - 1) / alignment * alignment
+}
+
+pub(package) fn native_link_emit_uleb(buffer: i64, value: i64) -> i64 {
+  let mut remaining = value
+  let mut done = false
+  while done == false {
+    let low = remaining band 127
+    remaining = remaining bshr 7
+    if remaining == 0 {
+      bu8(buffer, low)
+      done = true
+    } else {
+      bu8(buffer, low + 128)
+    }
+  }
+  0
+}
+
+pub(package) fn native_link_emit_nlists(output: i64, symbols: List<NativeLinkSymbol>) -> i64 {
+  let mut string_offset = 1
+  let mut current = symbols
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(symbol, rest) -> {
+        match symbol {
+          NativeLinkUndefinedStrong(name, ordinal, origin) -> {
+            bu32(output, string_offset)
+            bu8(output, 1)
+            bu8(output, 0)
+            bu8(output, 0)
+            bu8(output, ordinal)
+            bu64(output, 0)
+            string_offset = string_offset + 2 + __str_len(name)
+          }
+        }
+        current = rest
+        0
+      }
+    }
+  }
+  0
+}
+
+pub(package) fn native_link_dylib_command_size(path: str) -> i64 {
+  native_link_align(24 + __str_len(path) + 1, 8)
+}
+
+pub(package) fn native_link_dylib_commands_size(dylibs: List<str>) -> i64 {
+  let mut size = 0
+  let mut current = dylibs
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(path, rest) -> {
+        size = size + native_link_dylib_command_size(path)
+        current = rest
+        0
+      }
+    }
+  }
+  size
+}
+
+pub(package) fn native_link_emit_dylib_commands(output: i64, dylibs: List<str>) -> i64 {
+  let mut current = dylibs
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(path, rest) -> {
+        let start = buf_len(output)
+        let size = native_link_dylib_command_size(path)
+        bu32(output, 12)
+        bu32(output, size)
+        bu32(output, 24)
+        bu32(output, 0)
+        bu32(output, 65536)
+        bu32(output, 65536)
+        bstr(output, path)
+        bu8(output, 0)
+        bpad(output, start + size)
+        current = rest
+        0
+      }
+    }
+  }
+  0
+}
+
+pub(package) fn native_link_emit_data_segment(output: i64, text_size: i64, data_size: i64, symbol_count: i64, static_offset: i64, static_size: i64) -> i64 {
+  let section_count = 1 + (if static_size > 0 { 1 } else { 0 })
+  let command_size = 72 + section_count * 80
+  bu32(output, 25)
+  bu32(output, command_size)
+  bstr(output, "__DATA") bfill(output, 10)
+  bu64(output, 4294967296 + text_size)
+  bu64(output, data_size)
+  bu64(output, text_size)
+  bu64(output, data_size)
+  bu32(output, 3) bu32(output, 3)
+  bu32(output, section_count) bu32(output, 0)
+  bstr(output, "__got") bfill(output, 11)
+  bstr(output, "__DATA") bfill(output, 10)
+  bu64(output, 4294967296 + text_size)
+  bu64(output, symbol_count * 8)
+  bu32(output, text_size)
+  bu32(output, 3)
+  bu32(output, 0) bu32(output, 0)
+  bu32(output, 6)
+  bu32(output, 0) bu32(output, 0) bu32(output, 0)
+  if static_size > 0 {
+    bstr(output, "__wstatic") bfill(output, 7)
+    bstr(output, "__DATA") bfill(output, 10)
+    bu64(output, 4294967296 + text_size + static_offset)
+    bu64(output, static_size)
+    bu32(output, text_size + static_offset)
+    bu32(output, 4)
+    bu32(output, 0) bu32(output, 0)
+    bu32(output, 0)
+    bu32(output, 0) bu32(output, 0) bu32(output, 0)
+  } else { 0 }
+  0
+}
+
+pub(package) fn native_link_emit_stubs(code: i64, symbols: List<NativeLinkSymbol>, text_size: i64, stub_base: i64, slot: i64) -> i64 {
+  match symbols {
+    Nil -> 0
+    Cons(symbol, rest) -> {
+      let stub = stub_base + slot * 12
+      let got = text_size + slot * 8
+      let page_delta = got / 4096 - (16384 + stub) / 4096
+      bu32(code, encode_adrp(16, page_delta))
+      bu32(code, encode_ldr(16, 16, got - got / 4096 * 4096))
+      bu32(code, encode_br(16))
+      native_link_emit_stubs(code, rest, text_size, stub_base, slot + 1)
+    }
+  }
+}
+
+pub(package) fn native_link_apply_relocations(code: i64, relocations: List<NativeLinkRelocation>, text_size: i64, stub_base: i64, static_offset: i64) -> i64 {
+  let mut current = relocations
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(relocation, rest) -> {
+        match relocation {
+          NativeLinkBranch26(address, slot) -> {
+            bytes_set_u32(code, address, encode_bl(stub_base + slot * 12 - address))
+            0
+          }
+          NativeLinkPageAddress(address, target) -> {
+            let target_offset = match target {
+              NativeLinkCodeAddress(code_offset) -> 16384 + code_offset
+              NativeLinkStaticAddress(slot_offset) -> text_size + static_offset + slot_offset
+            }
+            let source_offset = 16384 + address
+            bytes_set_u32(code, address, encode_adrp(17, target_offset / 4096 - source_offset / 4096))
+            bytes_set_u32(code, address + 4, encode_add_imm(17, 17, target_offset - target_offset / 4096 * 4096))
+            0
+          }
+        }
+        current = rest
+        0
+      }
+    }
+  }
+  0
+}
