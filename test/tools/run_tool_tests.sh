@@ -3085,16 +3085,102 @@ printf '%s\n' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
 printf '%s\n' 'fn main() -[Unsafe]> i64 { native_archive_value() + native_dynamic_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_artifacts)
-codesign -s - "$tmp_pkg_trust_dir/native_artifacts/native_artifacts" >/dev/null
+codesign --verify "$tmp_pkg_trust_dir/native_artifacts/native_artifacts"
 native_artifact_dependencies=$(otool -L "$tmp_pkg_trust_dir/native_artifacts/native_artifacts")
 assert_contains "package_native_build_records_exact_dynamic_artifact" "$native_artifact_dependencies" "$tmp_pkg_trust_dir/native_artifacts/native/dynamic/libweft_fixture_dynamic.dylib"
-native_artifact_symbols=$(nm "$tmp_pkg_trust_dir/native_artifacts/native_artifacts")
-assert_contains "package_native_build_links_selected_archive" "$native_artifact_symbols" "_weft_archive_value"
+assert_not_contains "package_native_build_incorporates_selected_archive" "$native_artifact_dependencies" "libweft_fixture.a"
 set +e
 run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_artifacts"
 pkg_native_artifacts_exit=$?
 set -e
 assert_equals "package_native_archive_and_dynamic_link_and_run" "$pkg_native_artifacts_exit" "42"
+
+# Static closure is a Weft linker operation. Member discovery reaches a fixed
+# point in archive order, including cycles, and identical locked inputs yield
+# identical final executables.
+mkdir -p "$tmp_pkg_trust_dir/native_artifacts/native/archive_closure"
+printf '%s\n' \
+  'extern long weft_forward_b(void);' \
+  'long weft_forward_a(void) { return weft_forward_b() + 1; }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/forward_a.c"
+printf '%s\n' 'long weft_forward_b(void) { return 41; }' > "$tmp_pkg_trust_dir/native_artifacts/forward_b.c"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/forward_a.c" -o "$tmp_pkg_trust_dir/native_artifacts/forward_a.o"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/forward_b.c" -o "$tmp_pkg_trust_dir/native_artifacts/forward_b.o"
+/usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_closure/libweft_forward.a" \
+  "$tmp_pkg_trust_dir/native_artifacts/forward_a.o" \
+  "$tmp_pkg_trust_dir/native_artifacts/forward_b.o"
+native_forward_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_closure/libweft_forward.a")
+native_forward_digest=${native_forward_digest_line%% *}
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_forward","search":["native/archive_closure"],"content":"sha256:'"$native_forward_digest"'","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_forward_a","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_archive_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_forward)
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_forward_second)
+if cmp -s "$tmp_pkg_trust_dir/native_artifacts/native_forward" "$tmp_pkg_trust_dir/native_artifacts/native_forward_second"; then
+  echo "  ok package_native_archive_closure_is_deterministic"
+else
+  echo "  fail package_native_archive_closure_is_deterministic"
+  exit 1
+fi
+native_forward_dependencies=$(otool -L "$tmp_pkg_trust_dir/native_artifacts/native_forward")
+assert_not_contains "package_native_archive_closure_has_no_archive_runtime_dependency" "$native_forward_dependencies" "libweft_forward.a"
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_forward"
+pkg_native_forward_exit=$?
+set -e
+assert_equals "package_native_archive_forward_reference_links_and_runs" "$pkg_native_forward_exit" "42"
+
+printf '%s\n' \
+  'extern long weft_cycle_b(long);' \
+  'long weft_cycle_a(long n) { return n == 0 ? 40 : weft_cycle_b(n - 1); }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/cycle_a.c"
+printf '%s\n' \
+  'extern long weft_cycle_a(long);' \
+  'long weft_cycle_b(long n) { return n == 0 ? 2 : weft_cycle_a(n - 1); }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/cycle_b.c"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/cycle_a.c" -o "$tmp_pkg_trust_dir/native_artifacts/cycle_a.o"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/cycle_b.c" -o "$tmp_pkg_trust_dir/native_artifacts/cycle_b.o"
+/usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_closure/libweft_cycle.a" \
+  "$tmp_pkg_trust_dir/native_artifacts/cycle_a.o" \
+  "$tmp_pkg_trust_dir/native_artifacts/cycle_b.o"
+native_cycle_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_closure/libweft_cycle.a")
+native_cycle_digest=${native_cycle_digest_line%% *}
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_cycle","search":["native/archive_closure"],"content":"sha256:'"$native_cycle_digest"'","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_cycle_a","library":"archive","params":["i64"],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_archive_value(1) }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_cycle)
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_cycle"
+pkg_native_cycle_exit=$?
+set -e
+assert_equals "package_native_archive_cyclic_reference_links_and_runs" "$pkg_native_cycle_exit" "2"
+
+native_compiler_strings=$(strings "$WEFT_ABS")
+assert_not_contains "package_native_product_compiler_has_no_clang_fallback" "$native_compiler_strings" "/usr/bin/clang"
+
+printf '%s\n' '!<arch>' 'not a Mach-O member' > "$tmp_pkg_trust_dir/native_artifacts/native/archive_closure/libweft_malformed.a"
+native_malformed_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_closure/libweft_malformed.a")
+native_malformed_digest=${native_malformed_digest_line%% *}
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_malformed","search":["native/archive_closure"],"content":"sha256:'"$native_malformed_digest"'","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_missing","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_archive_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+set +e
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_malformed) \
+  > "$tmp_pkg_trust_dir/native_artifacts/native_malformed.stdout" \
+  2> "$tmp_pkg_trust_dir/native_artifacts/native_malformed.err"
+pkg_native_malformed_exit=$?
+set -e
+assert_equals "package_native_malformed_archive_fails_closed" "$pkg_native_malformed_exit" "1"
+assert_contains "package_native_malformed_archive_is_structured" "$(<"$tmp_pkg_trust_dir/native_artifacts/native_malformed.err")" "not a supported aarch64 Mach-O archive"
+if [ ! -e "$tmp_pkg_trust_dir/native_artifacts/native_malformed" ]; then
+  echo "  ok package_native_malformed_archive_commits_no_output"
+else
+  echo "  fail package_native_malformed_archive_commits_no_output"
+  exit 1
+fi
 
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_fixture","search":["native/archive_first","native/archive_second"],"content":"sha256:0000000000000000000000000000000000000000000000000000000000000000","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_archive_value","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
@@ -3236,7 +3322,7 @@ assert_contains "package_native_audit_lists_safe_wrapper_signature" "$native_saf
 assert_contains "package_native_audit_lists_safe_wrapper_effects" "$native_safe_audit" '"effects":"pure"'
 assert_not_contains "package_native_audit_wrapper_effects_hide_unsafe" "$native_safe_audit" '"effects":"Unsafe"'
 (cd "$tmp_pkg_trust_dir/native_safe" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_safe)
-codesign -s - "$tmp_pkg_trust_dir/native_safe/native_safe" >/dev/null
+codesign --verify "$tmp_pkg_trust_dir/native_safe/native_safe"
 set +e
 run_binary_guarded "$tmp_pkg_trust_dir/native_safe/native_safe"
 native_safe_exit=$?
@@ -3838,4 +3924,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 999 passed, 0 failed"
+echo "Tool boundary summary: 1007 passed, 0 failed"

@@ -199,27 +199,16 @@ fi
 
 if ! run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" \
   "$WEFT_ABS" test --emit "$SOURCE_ROOT/test/linked/tool_platform.weft" \
-  > "$MIRROR/linked-original.o" 2> "$MIRROR/linked-original.err"; then
+  > "$MIRROR/linked-original" 2> "$MIRROR/linked-original.err"; then
   fail "formatter_linked_original_compiles" "$MIRROR/linked-original.err"
 fi
 if ! (
   cd "$MIRROR"
   run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" \
     "$WEFT_ABS" test --emit test/linked/tool_platform.weft \
-    > linked-formatted.o 2> linked-formatted.err
+    > linked-formatted 2> linked-formatted.err
 ); then
   fail "formatter_linked_formatted_compiles" "$MIRROR/linked-formatted.err"
-fi
-
-if ! /usr/bin/ld -o "$MIRROR/linked-original" "$MIRROR/linked-original.o" \
-  -lSystem -syslibroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
-  -e _main -arch arm64 -platform_version macos 11.0 15.0 2> "$MIRROR/linked-original-link.err"; then
-  fail "formatter_linked_original_links" "$MIRROR/linked-original-link.err"
-fi
-if ! /usr/bin/ld -o "$MIRROR/linked-formatted" "$MIRROR/linked-formatted.o" \
-  -lSystem -syslibroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
-  -e _main -arch arm64 -platform_version macos 11.0 15.0 2> "$MIRROR/linked-formatted-link.err"; then
-  fail "formatter_linked_formatted_links" "$MIRROR/linked-formatted-link.err"
 fi
 chmod +x "$MIRROR/linked-original" "$MIRROR/linked-formatted"
 
