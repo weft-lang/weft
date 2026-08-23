@@ -783,6 +783,310 @@ pub(package) fn cg_emit_platform_proc_kill(code: i64, target: NativeLinkTarget) 
   cg_emit_platform_syscall(code, target, 37, 129)
 }
 
+-- Threading is a semantic platform ABI. Darwin delegates to libSystem's
+-- pthread implementation; standalone Linux products use clone plus futex and
+-- therefore retain no libc or dynamic-loader edge.
+pub(package) fn cg_emit_platform_thread_stack_size(code: i64, target: NativeLinkTarget) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> emit_mov_imm_safe(code, 0, 0)
+    NativeLinkLinuxAarch64 -> emit_mov_imm_safe(code, 0, 8454144) -- 8 MiB + 64 KiB guard
+  }
+}
+
+pub(package) fn cg_emit_platform_thread_stack_guard(code: i64, target: NativeLinkTarget) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> emit_mov_imm_safe(code, 0, 0)
+    NativeLinkLinuxAarch64 -> {
+      emit_mov_imm_safe(code, 2, 0) -- PROT_NONE
+      cg_emit_linux_syscall(code, 226) -- mprotect
+    }
+  }
+}
+
+fn cg_emit_linux_futex_imm(code: i64, address_reg: i64, operation: i64, value: i64) -> i64 {
+  if address_reg == 0 { 0 } else { bu32(code, encode_add_imm(0, address_reg, 0)) }
+  emit_mov_imm_safe(code, 1, operation)
+  emit_mov_imm_safe(code, 2, value)
+  emit_mov_imm_safe(code, 3, 0)
+  emit_mov_imm_safe(code, 4, 0)
+  emit_mov_imm_safe(code, 5, 0)
+  cg_emit_linux_syscall(code, 98)
+}
+
+fn cg_emit_linux_thread_mutex_lock_at(code: i64, pointer_reg: i64) -> i64 {
+  if pointer_reg == 13 { 0 } else { bu32(code, encode_add_imm(13, pointer_reg, 0)) }
+
+  let fast = buf_len(code)
+  bu32(code, encode_ldaxr(14, 13))
+  bu32(code, encode_cmp(14, 31))
+  let contended_pos = buf_len(code)
+  bu32(code, 0)
+  emit_mov_imm_safe(code, 16, 1)
+  bu32(code, encode_stlxr(15, 16, 13))
+  bu32(code, encode_cmp(15, 31))
+  let fast_retry_pos = buf_len(code)
+  bu32(code, 0)
+  emit_mov_imm_safe(code, 0, 0)
+  let fast_done_pos = buf_len(code)
+  bu32(code, 0)
+
+  let contended = buf_len(code)
+  bu32(code, encode_ldaxr(14, 13))
+  bu32(code, encode_cmp(14, 31))
+  let held_pos = buf_len(code)
+  bu32(code, 0)
+  emit_mov_imm_safe(code, 16, 2)
+  bu32(code, encode_stlxr(15, 16, 13))
+  bu32(code, encode_cmp(15, 31))
+  let acquire_retry_pos = buf_len(code)
+  bu32(code, 0)
+  emit_mov_imm_safe(code, 0, 0)
+  let contended_done_pos = buf_len(code)
+  bu32(code, 0)
+
+  let held = buf_len(code)
+  emit_mov_imm_safe(code, 16, 1)
+  bu32(code, encode_cmp(14, 16))
+  let already_waiting_pos = buf_len(code)
+  bu32(code, 0)
+  emit_mov_imm_safe(code, 16, 2)
+  bu32(code, encode_stlxr(15, 16, 13))
+  bu32(code, encode_cmp(15, 31))
+  let mark_retry_pos = buf_len(code)
+  bu32(code, 0)
+  let wait = buf_len(code)
+  cg_emit_linux_futex_imm(code, 13, 128, 2) -- FUTEX_WAIT_PRIVATE
+  let wait_retry_pos = buf_len(code)
+  bu32(code, 0)
+
+  let done = buf_len(code)
+  cg_patch_b_cond(code, contended_pos, 1, contended)
+  cg_patch_b_cond(code, fast_retry_pos, 1, fast)
+  cg_patch_b(code, fast_done_pos, done)
+  cg_patch_b_cond(code, held_pos, 1, held)
+  cg_patch_b_cond(code, acquire_retry_pos, 1, contended)
+  cg_patch_b(code, contended_done_pos, done)
+  cg_patch_b_cond(code, already_waiting_pos, 1, wait)
+  cg_patch_b_cond(code, mark_retry_pos, 1, contended)
+  cg_patch_b(code, wait_retry_pos, contended)
+}
+
+fn cg_emit_linux_thread_mutex_unlock_at(code: i64, pointer_reg: i64) -> i64 {
+  if pointer_reg == 13 { 0 } else { bu32(code, encode_add_imm(13, pointer_reg, 0)) }
+  let release = buf_len(code)
+  bu32(code, encode_ldaxr(14, 13))
+  bu32(code, encode_stlxr(15, 31, 13))
+  bu32(code, encode_cmp(15, 31))
+  let release_retry_pos = buf_len(code)
+  bu32(code, 0)
+  emit_mov_imm_safe(code, 16, 1)
+  bu32(code, encode_cmp(14, 16))
+  let wake_pos = buf_len(code)
+  bu32(code, 0)
+  emit_mov_imm_safe(code, 0, 0)
+  let done_pos = buf_len(code)
+  bu32(code, 0)
+  let wake = buf_len(code)
+  cg_emit_linux_futex_imm(code, 13, 129, 1) -- FUTEX_WAKE_PRIVATE
+  emit_mov_imm_safe(code, 0, 0)
+  let done = buf_len(code)
+  cg_patch_b_cond(code, release_retry_pos, 1, release)
+  cg_patch_b_cond(code, wake_pos, 1, wake)
+  cg_patch_b(code, done_pos, done)
+}
+
+pub(package) fn cg_emit_platform_thread_create(code: i64, target: NativeLinkTarget, fm: i64) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> {
+      -- (tid_cell, entry, arg, stack_top, result_cell)
+      bu32(code, encode_add_imm(3, 2, 0))
+      bu32(code, encode_add_imm(2, 1, 0))
+      emit_mov_imm_safe(code, 1, 0)
+      cg_emit_platform_got_call(code, fm, 3) -- pthread_create
+    }
+    NativeLinkLinuxAarch64 -> {
+      -- The child stack starts with entry/arg/result context. CLONE_*TID lets
+      -- the kernel publish the tid before execution and clear+wake it only
+      -- after the child has actually exited, so join may safely unmap stack.
+      bu32(code, encode_add_imm(5, 0, 0))
+      bu32(code, encode_sub_imm(3, 3, 32))
+      bu32(code, cg_str(1, 3, 0))
+      bu32(code, cg_str(2, 3, 8))
+      bu32(code, cg_str(4, 3, 16))
+      emit_mov_imm_safe(code, 0, 20254464) -- 0x1350f00
+      bu32(code, encode_add_imm(1, 3, 0))
+      bu32(code, encode_add_imm(2, 5, 0))
+      emit_mov_imm_safe(code, 3, 0)
+      bu32(code, encode_add_imm(4, 5, 0))
+      cg_emit_linux_syscall(code, 220) -- clone
+      bu32(code, encode_cmp(0, 31))
+      let child_pos = buf_len(code)
+      bu32(code, 0)
+      let failed_pos = buf_len(code)
+      bu32(code, 0)
+      emit_mov_imm_safe(code, 0, 0)
+      let parent_done_pos = buf_len(code)
+      bu32(code, 0)
+
+      let child = buf_len(code)
+      bu32(code, cg_ldr(16, 31, 0))
+      bu32(code, cg_ldr(0, 31, 8))
+      bu32(code, encode_blr(16))
+      bu32(code, cg_ldr(15, 31, 16))
+      bu32(code, encode_stlr(0, 15))
+      cg_emit_linux_exit_status(code, 0)
+
+      let failed = buf_len(code)
+      bu32(code, encode_sub_reg(0, 31, 0))
+      let done = buf_len(code)
+      cg_patch_b_cond(code, child_pos, 0, child)
+      cg_patch_b_cond(code, failed_pos, 11, failed)
+      cg_patch_b(code, parent_done_pos, done)
+    }
+  }
+}
+
+pub(package) fn cg_emit_platform_thread_join(code: i64, target: NativeLinkTarget, fm: i64) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> {
+      bu32(code, cg_ldr(0, 0, 0))
+      cg_emit_platform_got_call(code, fm, 4) -- pthread_join
+    }
+    NativeLinkLinuxAarch64 -> {
+      bu32(code, encode_add_imm(14, 0, 0))
+      let wait = buf_len(code)
+      bu32(code, encode_ldaxr(16, 14))
+      bu32(code, encode_cmp(16, 31))
+      let done_pos = buf_len(code)
+      bu32(code, 0)
+      bu32(code, encode_uxtw(2, 16))
+      bu32(code, encode_add_imm(0, 14, 0))
+      emit_mov_imm_safe(code, 1, 128) -- FUTEX_WAIT_PRIVATE
+      emit_mov_imm_safe(code, 3, 0)
+      emit_mov_imm_safe(code, 4, 0)
+      emit_mov_imm_safe(code, 5, 0)
+      cg_emit_linux_syscall(code, 98)
+      let retry_pos = buf_len(code)
+      bu32(code, 0)
+      let done = buf_len(code)
+      emit_mov_imm_safe(code, 0, 0)
+      cg_patch_b_cond(code, done_pos, 0, done)
+      cg_patch_b(code, retry_pos, wait)
+    }
+  }
+}
+
+pub(package) fn cg_emit_platform_thread_mutex_init(code: i64, target: NativeLinkTarget, fm: i64) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> {
+      emit_mov_imm_safe(code, 1, 0)
+      cg_emit_platform_got_call(code, fm, 10)
+    }
+    NativeLinkLinuxAarch64 -> {
+      bu32(code, cg_str(31, 0, 0))
+      emit_mov_imm_safe(code, 0, 0)
+    }
+  }
+}
+
+pub(package) fn cg_emit_platform_thread_mutex_destroy(code: i64, target: NativeLinkTarget, fm: i64) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> cg_emit_platform_got_call(code, fm, 13)
+    NativeLinkLinuxAarch64 -> emit_mov_imm_safe(code, 0, 0)
+  }
+}
+
+pub(package) fn cg_emit_platform_thread_mutex_lock(code: i64, target: NativeLinkTarget, fm: i64) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> cg_emit_platform_got_call(code, fm, 11)
+    NativeLinkLinuxAarch64 -> cg_emit_linux_thread_mutex_lock_at(code, 0)
+  }
+}
+
+pub(package) fn cg_emit_platform_thread_mutex_unlock(code: i64, target: NativeLinkTarget, fm: i64) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> cg_emit_platform_got_call(code, fm, 12)
+    NativeLinkLinuxAarch64 -> cg_emit_linux_thread_mutex_unlock_at(code, 0)
+  }
+}
+
+pub(package) fn cg_emit_platform_thread_cond_init(code: i64, target: NativeLinkTarget, fm: i64) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> {
+      emit_mov_imm_safe(code, 1, 0)
+      cg_emit_platform_got_call(code, fm, 14)
+    }
+    NativeLinkLinuxAarch64 -> {
+      bu32(code, cg_str(31, 0, 0))
+      emit_mov_imm_safe(code, 0, 0)
+    }
+  }
+}
+
+pub(package) fn cg_emit_platform_thread_cond_destroy(code: i64, target: NativeLinkTarget, fm: i64) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> cg_emit_platform_got_call(code, fm, 18)
+    NativeLinkLinuxAarch64 -> emit_mov_imm_safe(code, 0, 0)
+  }
+}
+
+pub(package) fn cg_emit_platform_thread_cond_wait(code: i64, target: NativeLinkTarget, fm: i64) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> cg_emit_platform_got_call(code, fm, 15)
+    NativeLinkLinuxAarch64 -> {
+      -- Capture the condition sequence while the mutex is held. Unlock then
+      -- FUTEX_WAIT on that exact sequence: a signal in the gap changes the
+      -- word and makes the wait return EAGAIN rather than losing the wakeup.
+      bu32(code, encode_sub_imm(31, 31, 32))
+      bu32(code, cg_str(0, 31, 0))
+      bu32(code, cg_str(1, 31, 8))
+      bu32(code, encode_ldaxr(16, 0))
+      bu32(code, cg_str(16, 31, 16))
+      cg_emit_linux_thread_mutex_unlock_at(code, 1)
+      bu32(code, cg_ldr(13, 31, 0))
+      bu32(code, cg_ldr(16, 31, 16))
+      bu32(code, encode_uxtw(2, 16))
+      bu32(code, encode_add_imm(0, 13, 0))
+      emit_mov_imm_safe(code, 1, 128) -- FUTEX_WAIT_PRIVATE
+      emit_mov_imm_safe(code, 3, 0)
+      emit_mov_imm_safe(code, 4, 0)
+      emit_mov_imm_safe(code, 5, 0)
+      cg_emit_linux_syscall(code, 98)
+      bu32(code, cg_ldr(0, 31, 8))
+      cg_emit_linux_thread_mutex_lock_at(code, 0)
+      bu32(code, encode_add_imm(31, 31, 32))
+      emit_mov_imm_safe(code, 0, 0)
+    }
+  }
+}
+
+fn cg_emit_platform_thread_cond_wake(code: i64, target: NativeLinkTarget, fm: i64, broadcast: i64) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> cg_emit_platform_got_call(code, fm, if broadcast == 1 { 17 } else { 16 })
+    NativeLinkLinuxAarch64 -> {
+      bu32(code, encode_add_imm(13, 0, 0))
+      let increment = buf_len(code)
+      bu32(code, encode_ldaxr(14, 13))
+      bu32(code, encode_add_imm(16, 14, 1))
+      bu32(code, encode_stlxr(15, 16, 13))
+      bu32(code, encode_cmp(15, 31))
+      let retry_pos = buf_len(code)
+      bu32(code, 0)
+      cg_emit_linux_futex_imm(code, 13, 129, if broadcast == 1 { 2147483647 } else { 1 })
+      emit_mov_imm_safe(code, 0, 0)
+      cg_patch_b_cond(code, retry_pos, 1, increment)
+    }
+  }
+}
+
+pub(package) fn cg_emit_platform_thread_cond_signal(code: i64, target: NativeLinkTarget, fm: i64) -> i64 {
+  cg_emit_platform_thread_cond_wake(code, target, fm, 0)
+}
+
+pub(package) fn cg_emit_platform_thread_cond_broadcast(code: i64, target: NativeLinkTarget, fm: i64) -> i64 {
+  cg_emit_platform_thread_cond_wake(code, target, fm, 1)
+}
+
 pub(package) fn cg_emit_platform_close(code: i64, target: NativeLinkTarget) -> i64 {
   cg_emit_platform_syscall(code, target, 6, 57)
 }
