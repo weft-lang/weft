@@ -3271,6 +3271,42 @@ pkg_native_common_override_exit=$?
 set -e
 assert_equals "package_native_archive_strong_data_overrides_common" "$pkg_native_common_override_exit" "84"
 
+# One archive member may contribute independently aligned initialized,
+# constant, and zerofill sections. The output section carries the strongest
+# alignment so the member-relative layout remains valid after final placement.
+mkdir -p "$tmp_pkg_trust_dir/native_artifacts/native/archive_sections"
+printf '%s\n' \
+  '__attribute__((aligned(65536))) long weft_multi_initialized = 40;' \
+  'static const volatile long weft_multi_const = 2;' \
+  'static volatile long weft_multi_zero;' \
+  'long weft_multi_section_value(void) {' \
+  '  weft_multi_zero = weft_multi_const;' \
+  '  return weft_multi_initialized + weft_multi_zero;' \
+  '}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/multi_section.c"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/multi_section.c" -o "$tmp_pkg_trust_dir/native_artifacts/multi_section.o"
+native_multi_object_sections=$(otool -l "$tmp_pkg_trust_dir/native_artifacts/multi_section.o")
+assert_contains "package_native_archive_fixture_has_initialized_section" "$native_multi_object_sections" "sectname __data"
+assert_contains "package_native_archive_fixture_has_constant_section" "$native_multi_object_sections" "sectname __const"
+assert_contains "package_native_archive_fixture_has_zerofill_section" "$native_multi_object_sections" "sectname __bss"
+assert_contains "package_native_archive_fixture_has_64k_alignment" "$native_multi_object_sections" "align 2^16 (65536)"
+/usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_sections/libweft_sections.a" \
+  "$tmp_pkg_trust_dir/native_artifacts/multi_section.o"
+native_multi_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_sections/libweft_sections.a")
+native_multi_digest=${native_multi_digest_line%% *}
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_sections","search":["native/archive_sections"],"content":"sha256:'"$native_multi_digest"'","optional":false}],"symbols":[{"declaration":"native_multi_section_value","symbol":"weft_multi_section_value","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_multi_section_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_multi_section)
+native_multi_output_sections=$(otool -l "$tmp_pkg_trust_dir/native_artifacts/native_multi_section")
+assert_contains "package_native_archive_output_preserves_64k_alignment" "$native_multi_output_sections" "align 2^16 (65536)"
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_multi_section"
+pkg_native_multi_exit=$?
+set -e
+assert_equals "package_native_archive_multiple_sections_link_and_run" "$pkg_native_multi_exit" "42"
+
 printf '%s\n' \
   'long weft_duplicate(void) { return 1; }' \
   'long weft_pick_a(void) { return weft_duplicate(); }' \
@@ -4072,4 +4108,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 1015 passed, 0 failed"
+echo "Tool boundary summary: 1021 passed, 0 failed"
