@@ -26,7 +26,7 @@ pub(package) type NativeLinkTarget {
 pub(package) type NativeLinkLibrary {
   NativeLinkSystemLibrary(str, str),
   NativeLinkStaticArchive(str, str, str, NativeLibraryLicense, i64, i64),
-  NativeLinkDynamicLibrary(str, str, str, str, NativeLibraryLicense)
+  NativeLinkDynamicLibrary(str, str, str, str, NativeLibraryLicense, List<NativeLinkDynamicLoad>)
 }
 
 pub(package) type NativeLinkByteView {
@@ -109,10 +109,22 @@ pub(package) type NativeLinkObjectRelocation {
   NativeLinkObjectRelocationUnsupported(NativeLinkByteView, i64)
 }
 
-pub(package) type NativeLinkDynamicIdentity {
-  NativeLinkDynamicIdentityKnown(i64, i64),
-  NativeLinkDynamicIdentityMissing,
-  NativeLinkDynamicIdentityMalformed
+pub(package) type NativeLinkDynamicLoad {
+  NativeLinkRequiredDynamicLoad(NativeLinkByteView),
+  NativeLinkWeakDynamicLoad(NativeLinkByteView),
+  NativeLinkReexportDynamicLoad(NativeLinkByteView),
+  NativeLinkUpwardDynamicLoad(NativeLinkByteView),
+  NativeLinkLazyDynamicLoad(NativeLinkByteView)
+}
+
+pub(package) type NativeLinkDynamicImage {
+  NativeLinkDynamicImage(NativeLinkByteView, List<NativeLinkDynamicLoad>)
+}
+
+pub(package) type NativeLinkDynamicImageParse {
+  NativeLinkDynamicImageParsed(NativeLinkDynamicImage),
+  NativeLinkDynamicImageIdentityMissing,
+  NativeLinkDynamicImageMalformed
 }
 
 pub(package) type NativeLinkImportOrigin {
@@ -204,6 +216,7 @@ pub(package) type NativeLinkError {
   NativeLinkRelocationTargetOutOfRange(NativeLinkRelocationEncoding, i64, i64),
   NativeLinkRelocationTargetMisaligned(NativeLinkRelocationEncoding, i64, i64),
   NativeLinkMissingDynamicArtifact(str),
+  NativeLinkUndeclaredDynamicDependency(str, str),
   NativeLinkInvalidImportIndex(i64),
   NativeLinkInvalidLibraryIndex(i64)
 }
@@ -249,53 +262,92 @@ pub(package) fn native_link_plan_relocation_count(plan: NativeLinkPlan) -> i64 {
   list_len<NativeLinkPlanRelocation>(native_link_plan_relocations(plan))
 }
 
--- Parse the install identity from an acquired aarch64 Mach-O dylib. The path
--- becomes loader metadata only after this structural check; a selected file
--- path is provenance, not automatically its runtime identity.
-pub(package) fn native_link_macho_dynamic_identity(bytes: i64, len: i64) -> NativeLinkDynamicIdentity {
+pub(package) fn native_link_dynamic_load_from_command(command: i64, identity: NativeLinkByteView) -> NativeLinkDynamicLoad {
+  match command {
+    12 -> NativeLinkRequiredDynamicLoad(identity)
+    2147483672 -> NativeLinkWeakDynamicLoad(identity)
+    2147483679 -> NativeLinkReexportDynamicLoad(identity)
+    2147483683 -> NativeLinkUpwardDynamicLoad(identity)
+    _ -> NativeLinkLazyDynamicLoad(identity)
+  }
+}
+
+-- Parse the install identity and exact dependency closure from an acquired
+-- aarch64 Mach-O dylib. The selected path remains provenance: only LC_ID_DYLIB
+-- and the typed LC_LOAD_* family become loader semantics.
+pub(package) fn native_link_macho_dynamic_image(bytes: i64, len: i64) -> NativeLinkDynamicImageParse {
   if len < 32 or bytes_u32_le_at(bytes, len, 0, 0) != 4277009103 or
     bytes_u32_le_at(bytes, len, 4, 0) != 16777228 or bytes_u32_le_at(bytes, len, 12, 0) != 6 {
-    NativeLinkDynamicIdentityMalformed
+    NativeLinkDynamicImageMalformed
   } else {
     let command_count = bytes_u32_le_at(bytes, len, 16, 0)
     let command_bytes = bytes_u32_le_at(bytes, len, 20, 0)
     let command_end = 32 + command_bytes
     if command_end > len {
-      NativeLinkDynamicIdentityMalformed
+      NativeLinkDynamicImageMalformed
     } else {
       let mut cursor = 32
       let mut index = 0
       let mut malformed = false
       let mut identity_ptr = 0
       let mut identity_len = 0
-      while index < command_count and malformed == false and identity_len == 0 {
+      let mut loads = list_nil<NativeLinkDynamicLoad>()
+      while index < command_count and malformed == false {
         let command = bytes_u32_le_at(bytes, command_end, cursor, 0 - 1)
         let command_size = bytes_u32_le_at(bytes, command_end, cursor + 4, 0)
-        if command_size < 8 or cursor + command_size > command_end {
+        if command_size < 8 or command_size % 8 != 0 or cursor + command_size > command_end {
           malformed = true
         } else {
-          if command == 13 {
+          if command == 13 or command == 12 or command == 2147483672 or
+            command == 2147483679 or command == 2147483683 or command == 32 {
             let name_offset = bytes_u32_le_at(bytes, command_end, cursor + 8, 0)
             let name_start = cursor + name_offset
             let name_len = if name_offset < 24 or name_start >= cursor + command_size { 0 - 1 }
             else { bytes_cstr_len_bounded(bytes, cursor + command_size, name_start) }
             if name_len <= 0 { malformed = true }
-            else {
-              -- Retain a view into the acquired artifact bytes. Constructing a
-              -- managed `str` here would make this cross-phase fact depend on
-              -- the parser temporary's lifetime.
-              identity_ptr = bytes + name_start
-              identity_len = name_len
-            }
+            else { if command == 13 {
+              if identity_len != 0 { malformed = true }
+              else {
+                identity_ptr = bytes + name_start
+                identity_len = name_len
+              }
+            } else {
+              let load_identity = NativeLinkByteView(bytes + name_start, name_len)
+              loads = list_append<NativeLinkDynamicLoad>(loads, native_link_dynamic_load_from_command(command, load_identity))
+            } }
           } else { 0 }
           cursor = cursor + command_size
           index = index + 1
         }
       }
-      if malformed { NativeLinkDynamicIdentityMalformed }
-      else { if identity_len == 0 { NativeLinkDynamicIdentityMissing } else { NativeLinkDynamicIdentityKnown(identity_ptr, identity_len) } }
+      if malformed or cursor != command_end { NativeLinkDynamicImageMalformed }
+      else { if identity_len == 0 { NativeLinkDynamicImageIdentityMissing }
+      else { NativeLinkDynamicImageParsed(NativeLinkDynamicImage(NativeLinkByteView(identity_ptr, identity_len), loads)) } }
     }
   }
+}
+
+pub(package) fn native_link_dynamic_image_identity(image: NativeLinkDynamicImage) -> NativeLinkByteView {
+  match image { NativeLinkDynamicImage(identity, loads) -> identity }
+}
+
+pub(package) fn native_link_dynamic_image_loads(image: NativeLinkDynamicImage) -> List<NativeLinkDynamicLoad> {
+  match image { NativeLinkDynamicImage(identity, loads) -> loads }
+}
+
+pub(package) fn native_link_dynamic_load_view(load: NativeLinkDynamicLoad) -> NativeLinkByteView {
+  match load {
+    NativeLinkRequiredDynamicLoad(identity) -> identity
+    NativeLinkWeakDynamicLoad(identity) -> identity
+    NativeLinkReexportDynamicLoad(identity) -> identity
+    NativeLinkUpwardDynamicLoad(identity) -> identity
+    NativeLinkLazyDynamicLoad(identity) -> identity
+  }
+}
+
+pub(package) fn native_link_dynamic_load_identity(load: NativeLinkDynamicLoad) -> str {
+  let view = native_link_dynamic_load_view(load)
+  pkg_str_view(native_link_byte_view_ptr(view), native_link_byte_view_len(view))
 }
 
 pub(package) fn native_link_byte_view_ptr(view: NativeLinkByteView) -> i64 {
@@ -712,6 +764,23 @@ pub(package) fn native_link_object_defines(object: NativeLinkMachObject, name: s
   }
 }
 
+pub(package) fn native_link_dynamic_loads_from_fmap(entry: i64) -> List<NativeLinkDynamicLoad> {
+  let raw = fmap_native_link_library_dynamic_loads(entry)
+  let mut loads = list_nil<NativeLinkDynamicLoad>()
+  for i in 0..nlist_len(raw) {
+    let load = nlist_get(raw, i)
+    let identity = NativeLinkByteView(fmap_native_link_dynamic_load_ptr(load), fmap_native_link_dynamic_load_len(load))
+    loads = list_append<NativeLinkDynamicLoad>(loads, match fmap_native_link_dynamic_load_kind(load) {
+      1 -> NativeLinkRequiredDynamicLoad(identity)
+      2 -> NativeLinkWeakDynamicLoad(identity)
+      3 -> NativeLinkReexportDynamicLoad(identity)
+      4 -> NativeLinkUpwardDynamicLoad(identity)
+      _ -> NativeLinkLazyDynamicLoad(identity)
+    })
+  }
+  loads
+}
+
 pub(package) fn native_link_library_from_fmap(entry: i64) -> NativeLinkLibrary {
   let name = pkg_str_view(fmap_native_link_library_link_ptr(entry), fmap_native_link_library_link_len(entry))
   let selected = pkg_str_view(fmap_native_link_library_selected_path_ptr(entry), fmap_native_link_library_selected_path_len(entry))
@@ -735,7 +804,8 @@ pub(package) fn native_link_library_from_fmap(entry: i64) -> NativeLinkLibrary {
       selected,
       pkg_str_view(fmap_native_link_library_load_identity_ptr(entry), fmap_native_link_library_load_identity_len(entry)),
       content,
-      license
+      license,
+      native_link_dynamic_loads_from_fmap(entry)
     )
   }
 }
@@ -1792,6 +1862,57 @@ pub(package) fn native_link_append_selected_definition_errors(errors: List<Nativ
   result
 }
 
+pub(package) fn native_link_dynamic_identity_declared(libraries: List<NativeLinkLibrary>, wanted: str) -> i64 {
+  match libraries {
+    Nil -> 0
+    Cons(library, rest) -> {
+      let identity = match library {
+        NativeLinkSystemLibrary(name, load_path) -> load_path
+        NativeLinkDynamicLibrary(name, path, load_identity, content, license, loads) -> load_identity
+        NativeLinkStaticArchive(name, path, content, license, bytes, len) -> ""
+      }
+      if str_eq(identity, wanted) == 1 { 1 } else { native_link_dynamic_identity_declared(rest, wanted) }
+    }
+  }
+}
+
+pub(package) fn native_link_append_dynamic_closure_errors(errors: List<NativeLinkError>, libraries: List<NativeLinkLibrary>) -> List<NativeLinkError> {
+  let mut result = errors
+  let mut current = libraries
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(library, rest) -> {
+        match library {
+          NativeLinkDynamicLibrary(name, path, load_identity, content, license, loads) -> {
+            let mut pending = loads
+            let mut loads_done = false
+            while loads_done == false {
+              match pending {
+                Nil -> { loads_done = true 0 }
+                Cons(load, remaining) -> {
+                  let wanted = native_link_dynamic_load_identity(load)
+                  if native_link_dynamic_identity_declared(libraries, wanted) == 0 {
+                    result = list_append<NativeLinkError>(result, NativeLinkUndeclaredDynamicDependency(load_identity, wanted))
+                  } else { 0 }
+                  pending = remaining
+                  0
+                }
+              }
+            }
+            0
+          }
+          _ -> 0
+        }
+        current = rest
+        0
+      }
+    }
+  }
+  result
+}
+
 pub(package) fn native_link_validate_libraries(libraries: List<NativeLinkLibrary>) -> List<NativeLinkError> {
   let mut errors = list_nil<NativeLinkError>()
   let mut current = libraries
@@ -1821,7 +1942,7 @@ pub(package) fn native_link_validate_libraries(libraries: List<NativeLinkLibrary
               }
             }
           }
-          NativeLinkDynamicLibrary(name, path, load_identity, content, license) -> {
+          NativeLinkDynamicLibrary(name, path, load_identity, content, license, loads) -> {
             if __str_len(path) == 0 or __str_len(load_identity) == 0 {
               errors = list_append<NativeLinkError>(errors, NativeLinkMissingDynamicArtifact(name))
               0
@@ -1833,7 +1954,7 @@ pub(package) fn native_link_validate_libraries(libraries: List<NativeLinkLibrary
       }
     }
   }
-  errors
+  native_link_append_dynamic_closure_errors(errors, libraries)
 }
 
 pub(package) fn native_link_image_layout(code: i64, archive_data: i64, archive_align: i64, symbol_count: i64, static_slots: i64) -> NativeLinkImageLayout {
@@ -1999,14 +2120,14 @@ pub(package) fn native_link_library_ordinal(libraries: List<NativeLinkLibrary>, 
         if index == wanted {
           found = match library {
             NativeLinkSystemLibrary(name, load_path) -> 1
-            NativeLinkDynamicLibrary(name, path, load_identity, content, license) -> next_dynamic_ordinal
+            NativeLinkDynamicLibrary(name, path, load_identity, content, license, loads) -> next_dynamic_ordinal
             NativeLinkStaticArchive(name, path, content, license, bytes, len) -> 0
           }
           done = true
           0
         } else {
           match library {
-            NativeLinkDynamicLibrary(name, path, load_identity, content, license) -> { next_dynamic_ordinal = next_dynamic_ordinal + 1 0 }
+            NativeLinkDynamicLibrary(name, path, load_identity, content, license, loads) -> { next_dynamic_ordinal = next_dynamic_ordinal + 1 0 }
             _ -> 0
           }
           current = rest
@@ -2257,7 +2378,7 @@ pub(package) fn native_link_dylibs(libraries: List<NativeLinkLibrary>) -> List<s
       Nil -> { done = true 0 }
       Cons(library, rest) -> {
         match library {
-          NativeLinkDynamicLibrary(name, path, load_identity, content, license) -> { dylibs = list_append<str>(dylibs, load_identity) 0 }
+          NativeLinkDynamicLibrary(name, path, load_identity, content, license, loads) -> { dylibs = list_append<str>(dylibs, load_identity) 0 }
           _ -> 0
         }
         current = rest
@@ -2280,7 +2401,7 @@ pub(package) fn native_link_artifact_dependencies(libraries: List<NativeLinkLibr
       Nil -> { done = true 0 }
       Cons(library, rest) -> {
         match library {
-          NativeLinkDynamicLibrary(name, path, load_identity, content, license) -> {
+          NativeLinkDynamicLibrary(name, path, load_identity, content, license, loads) -> {
             dependencies = list_append<NativeArtifactDependency>(dependencies, NativeArtifactDynamicDependency(load_identity))
             0
           }
@@ -2412,7 +2533,7 @@ pub(package) fn native_link_artifact_facts(graph: NativeLinkGraph) -> NativeArti
           Nil -> { done = true 0 }
           Cons(library, rest) -> {
             match library {
-              NativeLinkDynamicLibrary(name, path, load_identity, content, license) -> { standalone = false 0 }
+              NativeLinkDynamicLibrary(name, path, load_identity, content, license, loads) -> { standalone = false 0 }
               _ -> 0
             }
             current = rest
