@@ -362,6 +362,8 @@ check_rejects "proc_wait_until_requires_effect" "test/negative/proc_wait_until_r
 check_rejects "proc_release_requires_effect" "test/negative/proc_release_requires_effect.weft" "error[E2001]:"
 check_rejects "proc_handle_used_twice" "test/negative/proc_handle_used_twice.weft" "type error: owned value used more than once"
 check_rejects "proc_handle_drop_requires_effect" "test/negative/proc_handle_drop_requires_effect.weft" "type error: owned Drop effect not available in caller"
+check_rejects "proc_handle_constructor_is_private" "test/negative/proc_handle_constructor_is_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "proc_handle_projection_is_private" "test/negative/proc_handle_projection_is_private.weft" "type error: opaque projection pattern is private to its declaring module; use an exported accessor"
 check_rejects "proc_raw_pipe_requires_trusted" "test/negative/proc_raw_pipe_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "proc_raw_fcntl_is_unsupported" "test/negative/proc_raw_fcntl_is_unsupported.weft" "type error: unknown GOT symbol"
 check_rejects "proc_raw_actions_init_requires_trusted" "test/negative/proc_raw_actions_init_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"

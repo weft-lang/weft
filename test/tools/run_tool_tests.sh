@@ -463,6 +463,7 @@ stdlib_doc_modules=(
   stdlib/maybe.weft stdlib/bytes.weft stdlib/path.weft stdlib/io_types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft stdlib/env.weft
+  stdlib/process.weft
   stdlib/json.weft
   stdlib/secure_random.weft stdlib/net_address.weft stdlib/idna.weft
   stdlib/dns.weft stdlib/tcp.weft
@@ -501,6 +502,10 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "env" ]; then
     assert_contains "doc_stdlib_env_pins_public_surface" "$(<"$tmp_out")" "Public API items: 4. Documented: 4."
     assert_contains "doc_stdlib_env_pins_optional_argument" "$(<"$tmp_out")" "fn arg(index: i64) -> str | nil"
+  elif [ "$stdlib_doc_name" = "process" ]; then
+    assert_contains "doc_stdlib_process_pins_public_surface" "$(<"$tmp_out")" "Public API items: 18. Documented: 18."
+    assert_contains "doc_stdlib_process_pins_typed_run" "$(<"$tmp_out")" "fn run(path: str, args: List<str>) -> Result<ProcTermination, ProcError>"
+    assert_contains "doc_stdlib_process_pins_opaque_owner" "$(<"$tmp_out")" "pub type ProcHandle = opaque"
   elif [ "$stdlib_doc_name" = "string" ]; then
     assert_contains "doc_stdlib_string_pins_public_surface" "$(<"$tmp_out")" "Public API items: 17. Documented: 17."
   elif [ "$stdlib_doc_name" = "net_address" ]; then
@@ -541,7 +546,6 @@ done
 internal_stdlib_modules=(
   continuation
   prelude
-  process
   test_report
   thread
   unicode_case_data
@@ -831,6 +835,36 @@ assert_contains "elf_linux_env_selects_exit_group" "$elf_linux_env_disassembly" 
 assert_contains "elf_linux_env_invokes_linux_svc" "$elf_linux_env_disassembly" $'svc\t#0'
 assert_not_contains "elf_linux_env_has_no_interpreter" "$elf_linux_env_headers" "INTERP off"
 assert_not_contains "elf_linux_env_has_no_dynamic_segment" "$elf_linux_env_headers" "DYNAMIC off"
+
+# Proc remains a typed, mockable capability while the sealed target runtime
+# selects the kernel process ABI. This product covers synchronous execution,
+# owned async handles, capture, environment inheritance, exec failure,
+# signal termination, timeout kill/reap and Drop cleanup without libc.
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_process_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_process_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_process_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_process_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+assert_contains "elf_linux_process_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
+elf_linux_process_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+elf_linux_process_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+assert_contains "elf_linux_process_selects_dup3" "$elf_linux_process_disassembly" $'mov\tx8, #0x18'
+assert_contains "elf_linux_process_selects_fcntl" "$elf_linux_process_disassembly" $'mov\tx8, #0x19'
+assert_contains "elf_linux_process_selects_close" "$elf_linux_process_disassembly" $'mov\tx8, #0x39'
+assert_contains "elf_linux_process_selects_pipe2" "$elf_linux_process_disassembly" $'mov\tx8, #0x3b'
+assert_contains "elf_linux_process_selects_read" "$elf_linux_process_disassembly" $'mov\tx8, #0x3f'
+assert_contains "elf_linux_process_selects_write" "$elf_linux_process_disassembly" $'mov\tx8, #0x40'
+assert_contains "elf_linux_process_selects_exit_group" "$elf_linux_process_disassembly" $'mov\tx8, #0x5e'
+assert_contains "elf_linux_process_selects_nanosleep" "$elf_linux_process_disassembly" $'mov\tx8, #0x65'
+assert_contains "elf_linux_process_selects_kill" "$elf_linux_process_disassembly" $'mov\tx8, #0x81'
+assert_contains "elf_linux_process_selects_clone" "$elf_linux_process_disassembly" $'mov\tx8, #0xdc'
+assert_contains "elf_linux_process_selects_execve" "$elf_linux_process_disassembly" $'mov\tx8, #0xdd'
+assert_contains "elf_linux_process_selects_wait4" "$elf_linux_process_disassembly" $'mov\tx8, #0x104'
+assert_contains "elf_linux_process_invokes_linux_svc" "$elf_linux_process_disassembly" $'svc\t#0'
+assert_not_contains "elf_linux_process_has_no_interpreter" "$elf_linux_process_headers" "INTERP off"
+assert_not_contains "elf_linux_process_has_no_dynamic_segment" "$elf_linux_process_headers" "DYNAMIC off"
 
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
