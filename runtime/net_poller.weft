@@ -8,30 +8,19 @@
 -- delete a registration for a reused descriptor.
 
 use runtime/alloc.{alloc_bump, alloc_bump_mark, alloc_bump_restore_same_segment, alloc_page_size, alloc_runtime_state_ptr}
-use runtime/memory.{mem_load64_at, mem_store8_at, mem_store64_at, mem_zero}
-use runtime/shutdown.{runtime_shutdown_set_disposition}
-use runtime/syscall.{sys_close, sys_map_rw_anonymous, sys_munmap, sys_raw}
+use runtime/memory.{mem_load64_at, mem_store64_at, mem_zero}
+use runtime/syscall.{sys_close, sys_map_rw_anonymous, sys_munmap}
 use runtime/unsafe.{Unsafe}
 use stdlib/drop.{Drop}
 use stdlib/num.{num_int_cast_value_or, num_u64_to_i64_checked, num_usize_to_u64}
 use stdlib/result.{Err, Ok, Result, result_err, result_ok}
 use stdlib/tcp.{TcpListener, TcpStream, tcp_listener_token, tcp_stream_token}
 
-const NET_POLLER_SYS_KEVENT: i64 = 363
-
 const NET_POLLER_EINTR: i64 = 4
 
 const NET_POLLER_EBADF: i64 = 9
 
 const NET_POLLER_ENOENT: i64 = 2
-
-const NET_POLLER_EVFILT_SIGNAL: i64 = 65530
-
-const NET_POLLER_EV_ADD: i64 = 1
-
-const NET_POLLER_EV_DELETE: i64 = 2
-
-const NET_POLLER_EV_ENABLE: i64 = 4
 
 const NET_POLLER_EVENT_SIZE: i64 = 32
 
@@ -41,9 +30,9 @@ const NET_POLLER_STATE_NEXT_RESOURCE_OFFSET: i64 = 8
 
 const NET_POLLER_STATE_EPOCH_OFFSET: i64 = 16
 
-const NET_POLLER_STATE_INTERRUPT_DISPOSITION_OFFSET: i64 = 24
+const NET_POLLER_STATE_SHUTDOWN_AUX0_OFFSET: i64 = 24
 
-const NET_POLLER_STATE_TERMINATE_DISPOSITION_OFFSET: i64 = 32
+const NET_POLLER_STATE_SHUTDOWN_AUX1_OFFSET: i64 = 32
 
 const NET_POLLER_STATE_SHUTDOWN_ACTIVE_OFFSET: i64 = 40
 
@@ -54,10 +43,6 @@ const NET_POLLER_STATE_RESOURCE_TABLE_OFFSET: i64 = 56
 const NET_POLLER_SIGINT: i64 = 2
 
 const NET_POLLER_SIGTERM: i64 = 15
-
-const NET_POLLER_SIG_IGN: i64 = 1
-
-const NET_POLLER_SIG_ERR: i64 = 0 - 1
 
 -- Runtime twin: runtime_state_net_poller_epoch_offset in compiler/codegen.weft.
 const NET_POLLER_RUNTIME_EPOCH_OFFSET: i64 = 176
@@ -310,6 +295,42 @@ fn net_poller_platform_event_error(
   }
 }
 
+fn net_poller_platform_enable_shutdown_unsafe(
+  poller: i64,
+  aux0: i64,
+  aux1: i64
+) -[Unsafe]> i64 {
+  __platform_net_poller_enable_shutdown(poller, aux0, aux1)
+}
+
+fn net_poller_platform_enable_shutdown(
+  poller: i64,
+  aux0: i64,
+  aux1: i64
+) -> i64 {
+  handle net_poller_platform_enable_shutdown_unsafe(poller, aux0, aux1) {
+    Unsafe.transmute(raw) -> resume(__transmute(raw))
+  }
+}
+
+fn net_poller_platform_disable_shutdown_unsafe(
+  poller: i64,
+  aux0: i64,
+  aux1: i64
+) -[Unsafe]> i64 {
+  __platform_net_poller_disable_shutdown(poller, aux0, aux1)
+}
+
+fn net_poller_platform_disable_shutdown(
+  poller: i64,
+  aux0: i64,
+  aux1: i64
+) -> i64 {
+  handle net_poller_platform_disable_shutdown_unsafe(poller, aux0, aux1) {
+    Unsafe.transmute(raw) -> resume(__transmute(raw))
+  }
+}
+
 fn net_poll_resource_descriptor(resource: NetPollResource) -> i64 {
   match resource {
     NetPollResource(parts) -> match parts { (descriptor, identity, owner) -> descriptor }
@@ -430,28 +451,29 @@ fn net_poller_release_state(state: i64) -> i64 {
   let active_table = mem_load64_at(state, NET_POLLER_STATE_ACTIVE_TABLE_OFFSET)
   let resource_table = mem_load64_at(state, NET_POLLER_STATE_RESOURCE_TABLE_OFFSET)
   let shutdown_active = mem_load64_at(state, NET_POLLER_STATE_SHUTDOWN_ACTIVE_OFFSET)
-  let interrupt_disposition = mem_load64_at(state, NET_POLLER_STATE_INTERRUPT_DISPOSITION_OFFSET)
-  let terminate_disposition = mem_load64_at(state, NET_POLLER_STATE_TERMINATE_DISPOSITION_OFFSET)
+  let shutdown_aux0 = mem_load64_at(state, NET_POLLER_STATE_SHUTDOWN_AUX0_OFFSET)
+  let shutdown_aux1 = mem_load64_at(state, NET_POLLER_STATE_SHUTDOWN_AUX1_OFFSET)
   mem_store64_at(state, NET_POLLER_STATE_DESCRIPTOR_OFFSET, 0 - 1)
   mem_store64_at(state, NET_POLLER_STATE_ACTIVE_TABLE_OFFSET, 0)
   mem_store64_at(state, NET_POLLER_STATE_RESOURCE_TABLE_OFFSET, 0)
   mem_store64_at(state, NET_POLLER_STATE_SHUTDOWN_ACTIVE_OFFSET, 0)
+  -- Darwin signal filters disappear with the kqueue before dispositions are
+  -- restored. Linux drains its coalesced shutdown snapshot, closes the
+  -- separate signalfd, and restores this event-loop thread's prior mask. No
+  -- asynchronous callback enters Weft.
   let closed = if descriptor < 0 { 0 } else { sys_close(descriptor) }
-  let restored_terminate = if shutdown_active == 0 { 0 }
-  else { runtime_shutdown_set_disposition(NET_POLLER_SIGTERM, terminate_disposition) }
-  let restored_interrupt = if shutdown_active == 0 { 0 }
-  else { runtime_shutdown_set_disposition(NET_POLLER_SIGINT, interrupt_disposition) }
+  let shutdown_disabled = if shutdown_active == 0 { 0 }
+  else { net_poller_platform_disable_shutdown(descriptor, shutdown_aux0, shutdown_aux1) }
   let unmapped_active = if active_table <= 0 { 0 }
   else { sys_munmap(active_table, NET_POLLER_ACTIVE_TABLE_SIZE) }
   let unmapped_resources = if resource_table <= 0 { 0 }
   else { sys_munmap(resource_table, NET_POLLER_RESOURCE_TABLE_SIZE) }
   let unmapped_state = sys_munmap(state, alloc_page_size())
   if closed < 0 { closed }
-  else { if restored_terminate == NET_POLLER_SIG_ERR { NET_POLLER_SIG_ERR }
-    else { if restored_interrupt == NET_POLLER_SIG_ERR { NET_POLLER_SIG_ERR }
+  else { if shutdown_disabled < 0 { shutdown_disabled }
     else { if unmapped_active < 0 { unmapped_active }
     else { if unmapped_resources < 0 { unmapped_resources }
-      else { unmapped_state } } } } }
+      else { unmapped_state } } } }
 }
 
 impl Drop for NetPoller {
@@ -505,8 +527,8 @@ pub (package) fn net_poller_open() -> Result<owned NetPoller, NetPollError> {
             mem_store64_at(state, NET_POLLER_STATE_DESCRIPTOR_OFFSET, descriptor)
             mem_store64_at(state, NET_POLLER_STATE_NEXT_RESOURCE_OFFSET, 1)
             mem_store64_at(state, NET_POLLER_STATE_EPOCH_OFFSET, epoch)
-            mem_store64_at(state, NET_POLLER_STATE_INTERRUPT_DISPOSITION_OFFSET, 0)
-            mem_store64_at(state, NET_POLLER_STATE_TERMINATE_DISPOSITION_OFFSET, 0)
+            mem_store64_at(state, NET_POLLER_STATE_SHUTDOWN_AUX0_OFFSET, 0)
+            mem_store64_at(state, NET_POLLER_STATE_SHUTDOWN_AUX1_OFFSET, 0)
             mem_store64_at(state, NET_POLLER_STATE_SHUTDOWN_ACTIVE_OFFSET, 0)
             mem_store64_at(state, NET_POLLER_STATE_ACTIVE_TABLE_OFFSET, active_table)
             mem_store64_at(state, NET_POLLER_STATE_RESOURCE_TABLE_OFFSET, resource_table)
@@ -596,48 +618,6 @@ pub (package) fn net_poller_adopt_listener(
   net_poller_adopt_descriptor(poller, tcp_listener_token(listener))
 }
 
-fn net_poller_store_u16(pointer: i64, offset: i64, value: i64) -> nil {
-  mem_store8_at(pointer, offset, value band 255)
-  mem_store8_at(pointer, offset + 1, (value bshr 8) band 255)
-  nil
-}
-
-fn net_poller_store_change(
-  event: i64,
-  descriptor: i64,
-  filter: i64,
-  flags: i64,
-  token: i64
-) -> nil {
-  mem_zero(event, NET_POLLER_EVENT_SIZE)
-  mem_store64_at(event, 0, descriptor)
-  net_poller_store_u16(event, 8, filter)
-  net_poller_store_u16(event, 10, flags)
-  mem_store64_at(event, 24, token)
-  nil
-}
-
-fn net_poller_submit_signal_change(
-  poller: borrow mut NetPoller,
-  signal: i64,
-  flags: i64
-) -> i64 {
-  let mark = alloc_bump_mark()
-  let change = alloc_bump(NET_POLLER_EVENT_SIZE)
-  net_poller_store_change(change, signal, NET_POLLER_EVFILT_SIGNAL, flags, 0)
-  let status = sys_raw(
-    NET_POLLER_SYS_KEVENT,
-    net_poller_descriptor(poller),
-    change,
-    1,
-    0,
-    0,
-    0
-  )
-  alloc_bump_restore_same_segment(mark)
-  status
-}
-
 pub (package) fn net_poller_enable_shutdown(
   poller: borrow mut NetPoller
 ) -> Result<nil, NetPollError> {
@@ -645,63 +625,20 @@ pub (package) fn net_poller_enable_shutdown(
   if mem_load64_at(state, NET_POLLER_STATE_SHUTDOWN_ACTIVE_OFFSET) != 0 {
     result_err<nil, NetPollError>(NetPollInvalidRegistration)
   } else {
-    -- SIG_IGN makes delivery inert in async context. EVFILT_SIGNAL still
-    -- records attempts, which the scheduler consumes later in ordinary code.
-    let interrupt_disposition = runtime_shutdown_set_disposition(
-      NET_POLLER_SIGINT,
-      NET_POLLER_SIG_IGN
+    -- Target policy is sealed behind the semantic ABI: kqueue records ignored
+    -- signals on Darwin; Linux blocks them on this executor thread and routes
+    -- signalfd through the same epoll instance. Both return scoped teardown
+    -- state through these two runtime-owned cells.
+    let status = net_poller_platform_enable_shutdown(
+      net_poller_descriptor(poller),
+      state + NET_POLLER_STATE_SHUTDOWN_AUX0_OFFSET,
+      state + NET_POLLER_STATE_SHUTDOWN_AUX1_OFFSET
     )
-    if interrupt_disposition == NET_POLLER_SIG_ERR {
-      result_err<nil, NetPollError>(NetPollPlatform(1))
+    if status < 0 {
+      result_err<nil, NetPollError>(net_poll_error(status))
     } else {
-      let terminate_disposition = runtime_shutdown_set_disposition(
-        NET_POLLER_SIGTERM,
-        NET_POLLER_SIG_IGN
-      )
-      if terminate_disposition == NET_POLLER_SIG_ERR {
-        runtime_shutdown_set_disposition(NET_POLLER_SIGINT, interrupt_disposition)
-        result_err<nil, NetPollError>(NetPollPlatform(1))
-      } else {
-        let interrupt_status = net_poller_submit_signal_change(
-          poller,
-          NET_POLLER_SIGINT,
-          NET_POLLER_EV_ADD bor NET_POLLER_EV_ENABLE
-        )
-        if interrupt_status < 0 {
-          runtime_shutdown_set_disposition(NET_POLLER_SIGTERM, terminate_disposition)
-          runtime_shutdown_set_disposition(NET_POLLER_SIGINT, interrupt_disposition)
-          result_err<nil, NetPollError>(net_poll_error(interrupt_status))
-        } else {
-          let terminate_status = net_poller_submit_signal_change(
-            poller,
-            NET_POLLER_SIGTERM,
-            NET_POLLER_EV_ADD bor NET_POLLER_EV_ENABLE
-          )
-          if terminate_status < 0 {
-            net_poller_submit_signal_change(
-              poller,
-              NET_POLLER_SIGINT,
-              NET_POLLER_EV_DELETE
-            )
-            runtime_shutdown_set_disposition(NET_POLLER_SIGTERM, terminate_disposition)
-            runtime_shutdown_set_disposition(NET_POLLER_SIGINT, interrupt_disposition)
-            result_err<nil, NetPollError>(net_poll_error(terminate_status))
-          } else {
-            mem_store64_at(
-              state,
-              NET_POLLER_STATE_INTERRUPT_DISPOSITION_OFFSET,
-              interrupt_disposition
-            )
-            mem_store64_at(
-              state,
-              NET_POLLER_STATE_TERMINATE_DISPOSITION_OFFSET,
-              terminate_disposition
-            )
-            mem_store64_at(state, NET_POLLER_STATE_SHUTDOWN_ACTIVE_OFFSET, 1)
-            result_ok<nil, NetPollError>(nil)
-          }
-        }
-      }
+      mem_store64_at(state, NET_POLLER_STATE_SHUTDOWN_ACTIVE_OFFSET, 1)
+      result_ok<nil, NetPollError>(nil)
     }
   }
 }

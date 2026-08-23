@@ -944,6 +944,31 @@ assert_contains "elf_linux_readiness_invokes_linux_svc" "$elf_linux_readiness_di
 assert_not_contains "elf_linux_readiness_has_no_interpreter" "$elf_linux_readiness_headers" "INTERP off"
 assert_not_contains "elf_linux_readiness_has_no_dynamic_segment" "$elf_linux_readiness_headers" "DYNAMIC off"
 
+# Scoped shutdown stays inside the same static event-loop substrate. Linux
+# blocks the two signals, registers a nonblocking signalfd with epoll, consumes
+# signalfd_siginfo in ordinary scheduler code, and restores the prior mask.
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_shutdown_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_shutdown_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_shutdown_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_shutdown_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+assert_contains "elf_linux_shutdown_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
+elf_linux_shutdown_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+elf_linux_shutdown_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+assert_contains "elf_linux_shutdown_selects_epoll_create1" "$elf_linux_shutdown_disassembly" $'mov\tx8, #0x14'
+assert_contains "elf_linux_shutdown_selects_epoll_ctl" "$elf_linux_shutdown_disassembly" $'mov\tx8, #0x15'
+assert_contains "elf_linux_shutdown_selects_epoll_pwait" "$elf_linux_shutdown_disassembly" $'mov\tx8, #0x16'
+assert_contains "elf_linux_shutdown_selects_read" "$elf_linux_shutdown_disassembly" $'mov\tx8, #0x3f'
+assert_contains "elf_linux_shutdown_selects_signalfd4" "$elf_linux_shutdown_disassembly" $'mov\tx8, #0x4a'
+assert_contains "elf_linux_shutdown_selects_rt_sigprocmask" "$elf_linux_shutdown_disassembly" $'mov\tx8, #0x87'
+assert_contains "elf_linux_shutdown_selects_clone" "$elf_linux_shutdown_disassembly" $'mov\tx8, #0xdc'
+assert_contains "elf_linux_shutdown_selects_execve" "$elf_linux_shutdown_disassembly" $'mov\tx8, #0xdd'
+assert_contains "elf_linux_shutdown_invokes_linux_svc" "$elf_linux_shutdown_disassembly" $'svc\t#0'
+assert_not_contains "elf_linux_shutdown_has_no_interpreter" "$elf_linux_shutdown_headers" "INTERP off"
+assert_not_contains "elf_linux_shutdown_has_no_dynamic_segment" "$elf_linux_shutdown_headers" "DYNAMIC off"
+
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
 assert_contains "fmt_parse_only" "$fmt_out" "fn main() -> i64 { 42 }"
