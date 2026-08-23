@@ -8,6 +8,7 @@
 use compiler/codegen.{*}
 use compiler/encode.{*}
 use compiler/lib.{*}
+use compiler/native_target.{*}
 use compiler/object.{got_sym_count, got_sym_name}
 use compiler/package.{*}
 use compiler/package_lock.{pkg_lock_digest_hex}
@@ -17,11 +18,6 @@ use stdlib/json.{*}
 use stdlib/list.{*}
 use stdlib/option.{None, Some}
 use stdlib/string.{str_concat, str_eq}
-
-pub(package) type NativeLinkTarget {
-  NativeLinkMacosAarch64,
-  NativeLinkLinuxAarch64
-}
 
 pub(package) type NativeArtifactPlatformAbi {
   NativeArtifactMacosPlatformAbi(i64, i64, i64),
@@ -238,6 +234,7 @@ pub(package) type NativeArtifactFacts {
 
 pub(package) type NativeLinkError {
   NativeLinkUnsupportedSystemLibrary(str),
+  NativeLinkUnsupportedTargetLibrary(NativeLinkTarget, str),
   NativeLinkMissingArchiveArtifact(str, str),
   NativeLinkMalformedArchive(str, str),
   NativeLinkUndefinedArchiveSymbol(str),
@@ -849,8 +846,11 @@ pub(package) fn native_link_library_from_fmap(entry: i64) -> NativeLinkLibrary {
   }
 }
 
-pub(package) fn native_link_plan_libraries_from_fmap(fm: i64) -> List<NativeLinkLibrary> {
-  let mut libraries = list_cons<NativeLinkLibrary>(NativeLinkSystemLibrary("System", "/usr/lib/libSystem.B.dylib"), list_nil<NativeLinkLibrary>())
+pub(package) fn native_link_plan_libraries_from_fmap(fm: i64, target: NativeLinkTarget) -> List<NativeLinkLibrary> {
+  let mut libraries = match target {
+    NativeLinkMacosAarch64 -> list_cons<NativeLinkLibrary>(NativeLinkSystemLibrary("System", "/usr/lib/libSystem.B.dylib"), list_nil<NativeLinkLibrary>())
+    NativeLinkLinuxAarch64 -> list_nil<NativeLinkLibrary>()
+  }
   for i in 0..fmap_native_link_library_count(fm) {
     let entry = fmap_native_link_library_at(fm, i)
     if fmap_native_link_library_is_used(entry) == 1 {
@@ -1996,6 +1996,37 @@ pub(package) fn native_link_validate_libraries(libraries: List<NativeLinkLibrary
   native_link_append_dynamic_closure_errors(errors, libraries)
 }
 
+-- The first Linux product is kernel-ABI-only. Foreign archive and dynamic
+-- image support needs an ELF object/parser leaf and an explicit libc/loader
+-- policy; rejecting those typed alternatives here prevents the mature Darwin
+-- linker from accidentally treating Mach-O inputs as Linux inputs.
+pub(package) fn native_link_validate_target_libraries(target: NativeLinkTarget, libraries: List<NativeLinkLibrary>) -> List<NativeLinkError> {
+  match target {
+    NativeLinkMacosAarch64 -> native_link_validate_libraries(libraries)
+    NativeLinkLinuxAarch64 -> {
+      let mut errors = list_nil<NativeLinkError>()
+      let mut current = libraries
+      let mut done = false
+      while done == false {
+        match current {
+          Nil -> { done = true 0 }
+          Cons(library, rest) -> {
+            let name = match library {
+              NativeLinkSystemLibrary(value, _) -> value
+              NativeLinkStaticArchive(value, _, _, _, _, _) -> value
+              NativeLinkDynamicLibrary(value, _, _, _, _, _) -> value
+            }
+            errors = list_append<NativeLinkError>(errors, NativeLinkUnsupportedTargetLibrary(target, name))
+            current = rest
+            0
+          }
+        }
+      }
+      errors
+    }
+  }
+}
+
 pub(package) fn native_link_image_layout(code: i64, archive_data: i64, archive_align: i64, symbol_count: i64, static_slots: i64) -> NativeLinkImageLayout {
   let stub_base = native_link_align(buf_len(code), 4)
   let code_size = stub_base + symbol_count * 12
@@ -2233,7 +2264,17 @@ pub(package) fn native_link_resolve(plan: NativeLinkPlan) -> NativeLinkOutcome {
   let libraries = native_link_plan_libraries(plan)
   let imports = native_link_plan_imports(plan)
   let plan_relocations = native_link_plan_relocations(plan)
-  let mut errors = native_link_validate_libraries(libraries)
+  let target = native_link_plan_target(plan)
+  let target_errors = native_link_validate_target_libraries(target, libraries)
+  match target {
+    NativeLinkMacosAarch64 -> 0
+    NativeLinkLinuxAarch64 -> {
+      if list_len<NativeLinkError>(target_errors) != 0 {
+        return NativeLinkRejected(target_errors)
+      } else { 0 }
+    }
+  }
+  let mut errors = target_errors
   let catalogs = native_link_archive_catalogs(libraries)
   let selected = native_link_select_archive_closure(plan, catalogs)
   errors = native_link_append_selected_definition_errors(errors, selected)
@@ -2436,6 +2477,10 @@ pub(package) fn native_link_graph_relocation_count(graph: NativeLinkGraph) -> i6
   match graph { NativeLinkGraph(target, platform, debug_information, signing, trust_grants, code, data, layout, libraries, placements, symbols, relocations, static_slots) -> list_len<NativeLinkRelocation>(relocations) }
 }
 
+pub(package) fn native_link_graph_target(graph: NativeLinkGraph) -> NativeLinkTarget {
+  match graph { NativeLinkGraph(target, platform, debug_information, signing, trust_grants, code, data, layout, libraries, placements, symbols, relocations, static_slots) -> target }
+}
+
 pub(package) fn native_link_error_count(outcome: NativeLinkOutcome) -> i64 {
   match outcome {
     NativeLinkSucceeded(graph, facts) -> 0
@@ -2463,11 +2508,14 @@ pub(package) fn native_link_dylibs(libraries: List<NativeLinkLibrary>) -> List<s
   dylibs
 }
 
-pub(package) fn native_link_artifact_dependencies(libraries: List<NativeLinkLibrary>) -> List<NativeArtifactDependency> {
-  let mut dependencies = list_cons<NativeArtifactDependency>(
-    NativeArtifactSystemDependency("/usr/lib/libSystem.B.dylib"),
-    list_nil<NativeArtifactDependency>()
-  )
+pub(package) fn native_link_artifact_dependencies(target: NativeLinkTarget, libraries: List<NativeLinkLibrary>) -> List<NativeArtifactDependency> {
+  let mut dependencies = match target {
+    NativeLinkMacosAarch64 -> list_cons<NativeArtifactDependency>(
+      NativeArtifactSystemDependency("/usr/lib/libSystem.B.dylib"),
+      list_nil<NativeArtifactDependency>()
+    )
+    NativeLinkLinuxAarch64 -> list_nil<NativeArtifactDependency>()
+  }
   let mut current = libraries
   let mut done = false
   while done == false {
@@ -2635,7 +2683,7 @@ pub(package) fn native_link_artifact_facts(graph: NativeLinkGraph) -> NativeArti
         target,
         platform,
         standalone,
-        native_link_artifact_dependencies(libraries),
+        native_link_artifact_dependencies(target, libraries),
         native_link_artifact_static_input_facts(libraries, placements),
         trust_grants,
         native_link_debug_artifact_information(debug_information),

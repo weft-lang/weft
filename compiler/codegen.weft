@@ -9,6 +9,7 @@ use compiler/types.{*}
 use compiler/typeck.{*}
 use compiler/ir.{*}
 use compiler/module.{*}
+use compiler/native_target.{*}
 use compiler/type_registry.{*}
 use compiler/lib.{*}
 use runtime/alloc.{*}
@@ -93,7 +94,61 @@ pub(package) fn cg_align16(size: i64) -> i64 {
   if rem == 0 { size } else { size + (16 - rem) }
 }
 
-pub(package) fn cg_bump_emit_grow(code: i64, dst: i64, size_reg: i64, next_reg: i64, status_reg: i64) -> i64 {
+pub(package) fn cg_target_mmap_flags(target: NativeLinkTarget) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> 4098 -- MAP_PRIVATE | MAP_ANON
+    NativeLinkLinuxAarch64 -> 34 -- MAP_PRIVATE | MAP_ANONYMOUS
+  }
+}
+
+pub(package) fn cg_emit_target_mmap_selector(code: i64, target: NativeLinkTarget) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> {
+      -- BSD syscall class | mmap(197), carried in x16.
+      bu32(code, encode_movz(16, 197, 0))
+      bu32(code, encode_movk(16, 512, 16))
+    }
+    NativeLinkLinuxAarch64 -> bu32(code, encode_movz(8, 222, 0))
+  }
+}
+
+pub(package) fn cg_emit_target_svc(code: i64, target: NativeLinkTarget) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> bu32(code, arch_encode_svc_immediate(arch_aarch64(), 128))
+    NativeLinkLinuxAarch64 -> bu32(code, arch_encode_svc_immediate(arch_aarch64(), 0))
+  }
+}
+
+pub(package) fn cg_emit_linux_exit_status(code: i64, status: i64) -> i64 {
+  emit_mov_imm_safe(code, 0, status)
+  bu32(code, encode_movz(8, 94, 0)) -- __NR_exit_group
+  bu32(code, arch_encode_svc_immediate(arch_aarch64(), 0))
+  -- A valid exit_group never returns. Retry only if an external sandbox has
+  -- replaced that kernel contract; do not leave a signal-only BRK in a
+  -- product whose runtime trap handler cannot run after process teardown.
+  bu32(code, encode_b(0 - 4))
+}
+
+pub(package) fn cg_emit_target_mmap_success_guard(code: i64, target: NativeLinkTarget) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> {
+      let ok_pos = buf_len(code)
+      bu32(code, 0)
+      bu32(code, encode_brk(5))
+      cg_patch_b_cond(code, ok_pos, 3, buf_len(code))
+    }
+    NativeLinkLinuxAarch64 -> {
+      bu32(code, encode_cmp(0, 31))
+      let ok_pos = buf_len(code)
+      bu32(code, 0)
+      cg_emit_linux_exit_status(code, 125)
+      cg_patch_b_cond(code, ok_pos, 10, buf_len(code))
+    }
+  }
+}
+
+pub(package) fn cg_bump_emit_grow(code: i64, fm: i64, dst: i64, size_reg: i64, next_reg: i64, status_reg: i64) -> i64 {
+  let target = fmap_native_target(fm)
   -- Preserve requested size before setting up the mmap syscall.
   if size_reg != 12 { bu32(code, encode_add_imm(12, size_reg, 0)) } else { 0 }
   bu32(code, encode_add_imm(14, 12, runtime_state_size()))
@@ -105,11 +160,10 @@ pub(package) fn cg_bump_emit_grow(code: i64, dst: i64, size_reg: i64, next_reg: 
   cg_patch_b_cond(code, default_len_pos, 9, buf_len(code))
   bu32(code, encode_add_imm(13, 1, 0))
   -- mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0)
-  bu32(code, encode_movz(16, 197, 0))
-  bu32(code, encode_movk(16, 512, 16))
+  cg_emit_target_mmap_selector(code, target)
   bu32(code, encode_movz(0, 0, 0))
   bu32(code, encode_movz(2, 3, 0))
-  bu32(code, encode_movz(3, 4098, 0))
+  bu32(code, encode_movz(3, cg_target_mmap_flags(target), 0))
   bu32(code, encode_movn(4, 0))
   bu32(code, encode_movz(5, 0, 0))
   -- The grow arm is inlined into arbitrary generated code. Preserve its
@@ -121,15 +175,12 @@ pub(package) fn cg_bump_emit_grow(code: i64, dst: i64, size_reg: i64, next_reg: 
   bu32(code, encode_stp_pre(11, 12, 31, 0 - 16))
   bu32(code, encode_stp_pre(13, 14, 31, 0 - 16))
   bu32(code, encode_stp_pre(15, 16, 31, 0 - 16))
-  bu32(code, encode_svc())
+  cg_emit_target_svc(code, target)
   bu32(code, encode_ldp_post(15, 16, 31, 16))
   bu32(code, encode_ldp_post(13, 14, 31, 16))
   bu32(code, encode_ldp_post(11, 12, 31, 16))
   bu32(code, encode_ldp_post(9, 10, 31, 16))
-  let ok_pos = buf_len(code)
-  bu32(code, 0)
-  bu32(code, encode_brk(5))
-  cg_patch_b_cond(code, ok_pos, 3, buf_len(code))
+  cg_emit_target_mmap_success_guard(code, target)
   bu32(code, encode_add_imm(17, 0, runtime_state_size()))
   bu32(code, encode_add_reg(next_reg, 17, 12))
   bu32(code, cg_str(17, 28, runtime_state_bump_base_offset()))
@@ -163,7 +214,7 @@ pub(package) fn cg_bump_large_imm_tmp(dst: i64, next: i64, status: i64) -> i64 {
   else { if dst != 12 and next != 12 and status != 12 { 12 } else { 10 } } }
 }
 
-pub(package) fn cg_bump_alloc_reg(code: i64, dst: i64, size_reg: i64) -> i64 {
+pub(package) fn cg_bump_alloc_reg(code: i64, fm: i64, dst: i64, size_reg: i64) -> i64 {
   let next = cg_bump_scratch_primary(dst, size_reg)
   let status = cg_bump_scratch_secondary(dst, size_reg, next)
   let retry = buf_len(code)
@@ -184,14 +235,14 @@ pub(package) fn cg_bump_alloc_reg(code: i64, dst: i64, size_reg: i64) -> i64 {
   emit_mov_imm_safe(code, next, 0 - 1)
   bu32(code, encode_stlxr(status, next, 28))
   bu32(code, encode_cbnz(status, retry - buf_len(code)))
-  cg_bump_emit_grow(code, dst, size_reg, next, status)
+  cg_bump_emit_grow(code, fm, dst, size_reg, next, status)
   let done = buf_len(code)
   cg_patch_b_cond(code, growing_pos, 11, retry)
   cg_patch_b_cond(code, grow_pos, 8, grow_start)
   cg_patch_b(code, done_pos, done)
 }
 
-pub(package) fn cg_bump_alloc_imm(code: i64, dst: i64, size: i64) -> i64 {
+pub(package) fn cg_bump_alloc_imm(code: i64, fm: i64, dst: i64, size: i64) -> i64 {
   let next = cg_bump_scratch_primary(dst, 0 - 1)
   let status = cg_bump_scratch_secondary(dst, 0 - 1, next)
   let retry = buf_len(code)
@@ -226,7 +277,7 @@ pub(package) fn cg_bump_alloc_imm(code: i64, dst: i64, size: i64) -> i64 {
   bu32(code, encode_stlxr(status, next, 28))
   bu32(code, encode_cbnz(status, retry - buf_len(code)))
   emit_mov_imm_safe(code, 12, size)
-  cg_bump_emit_grow(code, dst, 12, next, status)
+  cg_bump_emit_grow(code, fm, dst, 12, next, status)
   let done = buf_len(code)
   cg_patch_b_cond(code, growing_pos, 11, retry)
   cg_patch_b_cond(code, grow_pos, 8, grow_start)
@@ -253,16 +304,43 @@ pub(package) fn find_main_in_fmap(fm: i64) -> i64 {
   result
 }
 
--- Emit startup code: save argc/argv, mmap heap, init runtime, pass argc/argv to main.
+pub(package) fn emit_native_process_entry_capture(code: i64, target: NativeLinkTarget) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> {
+      -- dyld calls the entry with argc/argv in x0/x1 and a return address.
+      bu32(code, encode_stp_pre(29, 30, 31, 0 - 16))
+      bu32(code, encode_add_imm(25, 0, 0))
+      bu32(code, encode_add_imm(26, 1, 0))
+    }
+    NativeLinkLinuxAarch64 -> {
+      -- The Linux kernel enters at _start with argc at [sp] and argv at sp+8.
+      bu32(code, encode_ldr(25, 31, 0))
+      bu32(code, encode_add_imm(26, 31, 8))
+    }
+  }
+}
+
+pub(package) fn emit_native_process_return(code: i64, target: NativeLinkTarget) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> {
+      bu32(code, encode_ldp_post(29, 30, 31, 16))
+      bu32(code, encode_ret())
+    }
+    NativeLinkLinuxAarch64 -> {
+      -- main's x0 result is the process status.
+      bu32(code, encode_movz(8, 94, 0)) -- __NR_exit_group
+      cg_emit_target_svc(code, target)
+      bu32(code, encode_b(0 - 4))
+    }
+  }
+}
+
+-- Emit target entry code: capture argc/argv, mmap heap, initialize runtime,
+-- and restore argc/argv for the typed main function.
 pub(package) fn emit_heap_init(code: i64, fm: i64) -> i64 {
-  -- STP x29, x30, [sp, #-16]! (save link register to return to dyld)
-  bu32(code, encode_stp_pre(29, 30, 31, 0 - 16))
-  -- Save argc (x0) and argv (x1) in callee-saved registers across mmap
-  bu32(code, encode_add_imm(25, 0, 0))
-  bu32(code, encode_add_imm(26, 1, 0))
-  -- mmap syscall: x16 = 0x020000C5 (BSD class | 197)
-  bu32(code, encode_movz(16, 197, 0))
-  bu32(code, encode_movk(16, 512, 16))
+  let target = fmap_native_target(fm)
+  emit_native_process_entry_capture(code, target)
+  cg_emit_target_mmap_selector(code, target)
   -- x0 = 0 (addr = NULL)
   bu32(code, encode_movz(0, 0, 0))
   -- x1 = initial bump segment length
@@ -270,13 +348,24 @@ pub(package) fn emit_heap_init(code: i64, fm: i64) -> i64 {
   -- x2 = 3 (PROT_READ | PROT_WRITE)
   bu32(code, encode_movz(2, 3, 0))
   -- x3 = 4098 (MAP_PRIVATE | MAP_ANON)
-  bu32(code, encode_movz(3, 4098, 0))
+  bu32(code, encode_movz(3, cg_target_mmap_flags(target), 0))
   -- x4 = -1 (fd)
   bu32(code, encode_movn(4, 0))
   -- x5 = 0 (offset)
   bu32(code, encode_movz(5, 0, 0))
-  -- SVC #0x80
-  bu32(code, encode_svc())
+  cg_emit_target_svc(code, target)
+  -- Linux returns -errno in x0. Darwin's carry-based failure behavior stays
+  -- byte-identical here; its existing startup contract is unchanged.
+  match target {
+    NativeLinkMacosAarch64 -> 0
+    NativeLinkLinuxAarch64 -> {
+      bu32(code, encode_cmp(0, 31))
+      let ok_pos = buf_len(code)
+      bu32(code, 0)
+      cg_emit_linux_exit_status(code, 125)
+      cg_patch_b_cond(code, ok_pos, 10, buf_len(code))
+    }
+  }
   -- MOV x28, x0 (runtime state base)
   bu32(code, encode_add_imm(28, 0, 0))
   -- Census builds reserve a private metrics tail before the bump arena.
@@ -1219,7 +1308,7 @@ pub(package) fn cg_ftypes_lookup_fn_type(ft: i64, src: i64, ns: i64, nl: i64) ->
 -- ======================================================================
 
 pub(package) fn fmap_new() -> i64 {
-  let h = cg_alloc_bytes(2976)
+  let h = cg_alloc_bytes(2992)
   -- Selected-target native libraries in manifest order. Entries are the
   -- producer-owned link plan; call emission only marks reachability, so the
   -- final option order never depends on traversal or optimiser call order.
@@ -1232,6 +1321,9 @@ pub(package) fn fmap_new() -> i64 {
   -- undefined object symbol merely because its binding module was loaded.
   mem_store64_at(h + 2952, 0, nlist_new())
   mem_store64_at(h + 2960, 0, nlist_new())
+  -- Shared typed native target. The raw map stores only the boundary code;
+  -- all consumers recover and match the NativeLinkTarget variant.
+  mem_store64_at(h + 2976, 0, native_link_target_storage_kind(NativeLinkMacosAarch64))
   -- Captured handler-frame SSA for the currently emitted hoisted lambda.
   mem_store64_at(h + 2944, 0, 0)
   -- 4r structural-drop plans keyed by their stable generated-glue identity.
@@ -1643,6 +1735,13 @@ pub(package) fn fmap_spill_load_bucket(fm: i64, i: i64) -> i64 { mem_load64_at(f
 pub(package) fn fmap_live_functions_measured(fm: i64) -> i64 { mem_load64_at(fm + 1728, 0) }
 pub(package) fn fmap_set_tt(fm: i64, tt: i64) -> i64 { mem_store64_at(fm + 48, 0, tt) 0 }
 pub(package) fn fmap_get_tt(fm: i64) -> i64 { mem_load64_at(fm + 48, 0) }
+pub(package) fn fmap_set_native_target(fm: i64, target: NativeLinkTarget) -> i64 {
+  mem_store64_at(fm + 2976, 0, native_link_target_storage_kind(target))
+  0
+}
+pub(package) fn fmap_native_target(fm: i64) -> NativeLinkTarget {
+  native_link_target_from_storage_kind(mem_load64_at(fm + 2976, 0))
+}
 pub(package) fn fmap_native_external_declarations(fm: i64) -> i64 { mem_load64_at(fm + 2952, 0) }
 pub(package) fn fmap_native_external_used(fm: i64) -> i64 { mem_load64_at(fm + 2960, 0) }
 pub(package) fn fmap_native_link_libraries(fm: i64) -> i64 { mem_load64_at(fm + 2968, 0) }
@@ -4916,8 +5015,8 @@ pub(package) fn cg_hclause_store_x0(code: i64, ctr: i64) -> i64 {
 }
 
 -- Fill ops array entries for all handler clauses
-pub(package) fn cg_hbuild_frame(code: i64, eff_hash: i64, nclauses: i64, ops_ctr: i64) -> i64 {
-  cg_hbuild_frame_maybe_abort(code, eff_hash, nclauses, ops_ctr, 0)
+pub(package) fn cg_hbuild_frame(code: i64, fm: i64, eff_hash: i64, nclauses: i64, ops_ctr: i64) -> i64 {
+  cg_hbuild_frame_maybe_abort(code, fm, eff_hash, nclauses, ops_ctr, 0)
 }
 
 -- 4j: `has_abortive` selects the extended frame. When 0 the emitted code
@@ -4927,9 +5026,9 @@ pub(package) fn cg_hbuild_frame(code: i64, eff_hash: i64, nclauses: i64, ops_ctr
 -- x30 slot — see runtime/effects.weft for why. Returns the code position
 -- of the ADR that materialises that address (0 when not abortive) so the
 -- caller can patch it once the landing block's offset is known.
-pub(package) fn cg_hbuild_frame_maybe_abort(code: i64, eff_hash: i64, nclauses: i64, ops_ctr: i64, has_abortive: i64) -> i64 {
+pub(package) fn cg_hbuild_frame_maybe_abort(code: i64, fm: i64, eff_hash: i64, nclauses: i64, ops_ctr: i64, has_abortive: i64) -> i64 {
   -- Allocate handler frame from bump allocator
-  cg_bump_alloc_imm(code, 16, if has_abortive == 1 { handler_frame_abort_size() } else { handler_frame_size() })
+  cg_bump_alloc_imm(code, fm, 16, if has_abortive == 1 { handler_frame_abort_size() } else { handler_frame_size() })
   -- Save frame_ptr to x15 (x16 may be clobbered by emit_load_reg)
   bu32(code, encode_add_imm(15, 16, 0))
   -- Store eff_hash
