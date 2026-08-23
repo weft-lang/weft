@@ -53,7 +53,7 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 **Self-hosted.** The compiler is written in Weft, compiles itself to native aarch64 Mach-O (including its own ad-hoc code signature), and the bootstrap gate requires generation two and generation three to be byte-identical. The Zig seed interpreter is archived in git history; `./weft` is the checked-in trust root.
 
-- 4019 runtime test blocks across 331 files, plus 760 negative (must-fail) cases
+- 4021 runtime test blocks across 331 files, plus 760 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
 - Current work: the public-alpha product gate—fast project feedback, complete docs/tooling, safe networking, the Linux/aarch64 platform row, and build/release UX
@@ -76,6 +76,9 @@ echo 'fn main() -> i64 { 42 }' > answer.weft
 
 # Type-check without compiling
 ./weft check answer.weft
+
+# Build a final product and emit its versioned link/BOM facts
+./weft build answer.weft -o answer --artifact-facts answer.facts.json
 
 # Verify self-hosting: the gate is byte-identical generations
 just bootstrap

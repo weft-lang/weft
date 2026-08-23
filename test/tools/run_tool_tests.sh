@@ -3106,16 +3106,20 @@ printf '%s\n' \
 printf '%s\n' 'long weft_forward_b(void) { return 41; }' > "$tmp_pkg_trust_dir/native_artifacts/forward_b.c"
 /usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/forward_a.c" -o "$tmp_pkg_trust_dir/native_artifacts/forward_a.o"
 /usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/forward_b.c" -o "$tmp_pkg_trust_dir/native_artifacts/forward_b.o"
+native_forward_a_member_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/forward_a.o")
+native_forward_a_member_digest=${native_forward_a_member_digest_line%% *}
+native_forward_b_member_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/forward_b.o")
+native_forward_b_member_digest=${native_forward_b_member_digest_line%% *}
 /usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_closure/libweft_forward.a" \
   "$tmp_pkg_trust_dir/native_artifacts/forward_a.o" \
   "$tmp_pkg_trust_dir/native_artifacts/forward_b.o"
 native_forward_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_closure/libweft_forward.a")
 native_forward_digest=${native_forward_digest_line%% *}
 printf '%s\n' \
-  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_forward","search":["native/archive_closure"],"content":"sha256:'"$native_forward_digest"'","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_forward_a","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_forward","search":["native/archive_closure"],"content":"sha256:'"$native_forward_digest"'","license":"MIT","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_forward_a","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
 printf '%s\n' 'fn main() -[Unsafe]> i64 { native_archive_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
-(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_forward)
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_forward --artifact-facts native_forward.facts.json)
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_forward_second)
 if cmp -s "$tmp_pkg_trust_dir/native_artifacts/native_forward" "$tmp_pkg_trust_dir/native_artifacts/native_forward_second"; then
   echo "  ok package_native_archive_closure_is_deterministic"
@@ -3123,6 +3127,17 @@ else
   echo "  fail package_native_archive_closure_is_deterministic"
   exit 1
 fi
+native_forward_facts=$(/bin/cat "$tmp_pkg_trust_dir/native_artifacts/native_forward.facts.json")
+assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":1'
+assert_contains "package_native_artifact_facts_name_target" "$native_forward_facts" '"target":"macos-aarch64"'
+assert_contains "package_native_artifact_facts_claim_standalone" "$native_forward_facts" '"standalone":true'
+assert_contains "package_native_artifact_facts_name_system_abi" "$native_forward_facts" '"kind":"system","identity":"/usr/lib/libSystem.B.dylib"'
+assert_contains "package_native_artifact_facts_name_archive_hash" "$native_forward_facts" '"content":"sha256:'"$native_forward_digest"'"'
+assert_contains "package_native_artifact_facts_name_declared_license" "$native_forward_facts" '"license":"MIT"'
+assert_contains "package_native_artifact_facts_name_first_member" "$native_forward_facts" '"name":"forward_a.o","content":"sha256:'"$native_forward_a_member_digest"'"'
+assert_contains "package_native_artifact_facts_name_second_member" "$native_forward_facts" '"name":"forward_b.o","content":"sha256:'"$native_forward_b_member_digest"'"'
+assert_contains "package_native_artifact_facts_name_entry_symbol" "$native_forward_facts" '"name":"weft_forward_a","definition":"strong"'
+assert_contains "package_native_artifact_facts_name_provider_symbol" "$native_forward_facts" '"name":"weft_forward_b","definition":"strong"'
 native_forward_dependencies=$(otool -L "$tmp_pkg_trust_dir/native_artifacts/native_forward")
 assert_not_contains "package_native_archive_closure_has_no_archive_runtime_dependency" "$native_forward_dependencies" "libweft_forward.a"
 set +e
@@ -4186,4 +4201,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 1030 passed, 0 failed"
+echo "Tool boundary summary: 1040 passed, 0 failed"
