@@ -920,6 +920,30 @@ assert_contains "elf_linux_tcp_invokes_linux_svc" "$elf_linux_tcp_disassembly" $
 assert_not_contains "elf_linux_tcp_has_no_interpreter" "$elf_linux_tcp_headers" "INTERP off"
 assert_not_contains "elf_linux_tcp_has_no_dynamic_segment" "$elf_linux_tcp_headers" "DYNAMIC off"
 
+# Spawn and Time remain ordinary typed effects around target-neutral TCP
+# readiness. The product's only readiness substrate is the static Linux epoll
+# ABI; target-local execution is brief 1e's Docker gate.
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_readiness_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_readiness_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_readiness_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_readiness_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+assert_contains "elf_linux_readiness_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
+elf_linux_readiness_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+elf_linux_readiness_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+assert_contains "elf_linux_readiness_selects_epoll_create1" "$elf_linux_readiness_disassembly" $'mov\tx8, #0x14'
+assert_contains "elf_linux_readiness_selects_epoll_ctl" "$elf_linux_readiness_disassembly" $'mov\tx8, #0x15'
+assert_contains "elf_linux_readiness_selects_epoll_pwait" "$elf_linux_readiness_disassembly" $'mov\tx8, #0x16'
+assert_contains "elf_linux_readiness_selects_fcntl" "$elf_linux_readiness_disassembly" $'mov\tx8, #0x19'
+assert_contains "elf_linux_readiness_selects_getsockopt" "$elf_linux_readiness_disassembly" $'mov\tx8, #0xd1'
+assert_contains "elf_linux_readiness_selects_mmap" "$elf_linux_readiness_disassembly" $'mov\tx8, #0xde'
+assert_contains "elf_linux_readiness_selects_munmap" "$elf_linux_readiness_disassembly" $'mov\tx8, #0xd7'
+assert_contains "elf_linux_readiness_invokes_linux_svc" "$elf_linux_readiness_disassembly" $'svc\t#0'
+assert_not_contains "elf_linux_readiness_has_no_interpreter" "$elf_linux_readiness_headers" "INTERP off"
+assert_not_contains "elf_linux_readiness_has_no_dynamic_segment" "$elf_linux_readiness_headers" "DYNAMIC off"
+
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
 assert_contains "fmt_parse_only" "$fmt_out" "fn main() -> i64 { 42 }"

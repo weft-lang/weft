@@ -1,0 +1,126 @@
+-- Ordinary typed Spawn/Time/TCP-readiness product compiled as a static
+-- Linux/aarch64 executable by elf_linux_aarch64_readiness_smoke.weft.
+
+use runtime/safe_tcp.{runtime_platform_tcp}
+use stdlib/fail.{Fail}
+use stdlib/io_types.{IoEndOfFile, IoReadBytes, IoWroteBytes}
+use stdlib/net_address.{SocketAddress, SocketV4, ipv4_address}
+use stdlib/result.{Err, Ok}
+use stdlib/spawn as spawn
+use stdlib/tcp.{*}
+use stdlib/time as time
+use stdlib/vector.{vector_get_in_bounds, vector_push, vector_with_capacity}
+use stdlib/vector_type.{Vector}
+
+fn readiness_product_require_stream(
+  readiness: TcpStreamReadiness
+) -[Fail<TcpReadinessError>, TcpStreamIO]> owned TcpStream {
+  match readiness {
+    TcpStreamReadinessFailed(returned, error) -> {
+      let closed = tcp_stream_close(returned)
+      Fail<TcpReadinessError>.fail(error)
+    }
+    TcpStreamReady(returned) -> returned
+  }
+}
+
+fn readiness_product_require_listener(
+  readiness: TcpListenerReadiness
+) -[Fail<TcpReadinessError>, TcpListenerIO]> owned TcpListener {
+  match readiness {
+    TcpListenerReadinessFailed(returned, error) -> {
+      let closed = tcp_listener_close(returned)
+      Fail<TcpReadinessError>.fail(error)
+    }
+    TcpListenerReady(returned) -> returned
+  }
+}
+
+fn readiness_product_delayed_connect(
+  address: SocketAddress
+) -[time.Time, TcpConnect, TcpStreamIO, Fail<TcpError>]> i64 {
+  time.time_sleep_millis(1)
+  let stream: owned TcpStream = tcp_connect(address, tcp_connect_options_default())?
+  tcp_stream_close(stream)?
+  1
+}
+
+fn readiness_product_probe(
+) -[TcpConnect, TcpListen, TcpStreamIO, TcpListenerIO, Fail<TcpError>, Fail<TcpReadinessError>]> i64 {
+  spawn.with_event_loop(() => {
+    -- The listener wait genuinely suspends: another structured task sleeps,
+    -- connects, and closes while the root continuation is parked in epoll.
+    let listener: owned TcpListener = tcp_listen(
+      SocketV4(ipv4_address(127, 0, 0, 1), 0),
+      tcp_listen_options(8)
+    )?
+    let address = tcp_listener_local_address(listener)?
+    let connector = spawn.spawn(() => readiness_product_delayed_connect(address))
+    let mut ready_listener: owned TcpListener = readiness_product_require_listener(
+      tcp_wait_acceptable(listener)
+    )
+    let accepted: owned TcpStream = tcp_accept(ready_listener)?
+    tcp_stream_close(accepted)?
+    tcp_listener_close(ready_listener)?
+    if spawn.join(connector) != 1 { return 61 } else { nil }
+
+    -- A second pair exercises writable, readable, byte progress and EOF. The
+    -- second readable wait reuses the same descriptor after one-shot delivery,
+    -- forcing epoll's existing-entry MOD path.
+    let mut pair_listener: owned TcpListener = tcp_listen(
+      SocketV4(ipv4_address(127, 0, 0, 1), 0),
+      tcp_listen_options(8)
+    )?
+    let pair_address = tcp_listener_local_address(pair_listener)?
+    let client: owned TcpStream = tcp_connect(pair_address, tcp_connect_options_default())?
+    let server: owned TcpStream = tcp_accept(pair_listener)?
+    tcp_listener_close(pair_listener)?
+
+    let mut ready_client: owned TcpStream = readiness_product_require_stream(
+      tcp_wait_writable(client)
+    )
+    let source: Vector<u8> = vector_with_capacity<u8>(1)
+    vector_push<u8>(source, __u64_to_u8(__i64_to_u64(42)))
+    let wrote = match tcp_write(ready_client, source[..])? {
+      IoWroteBytes(count) -> __u64_to_i64(__usize_to_u64(count))
+    }
+
+    let mut ready_server: owned TcpStream = readiness_product_require_stream(
+      tcp_wait_readable(server)
+    )
+    let received: Vector<u8> = vector_with_capacity<u8>(1)
+    vector_push<u8>(received, __u64_to_u8(__i64_to_u64(0)))
+    let read = match tcp_read(ready_server, received[..])? {
+      IoEndOfFile -> 0
+      IoReadBytes(count) -> __u64_to_i64(__usize_to_u64(count))
+    }
+    if wrote != 1 or read != 1 or
+      __u64_to_i64(__u8_to_u64(vector_get_in_bounds<u8>(received, 0))) != 42 {
+      return 62
+    } else { nil }
+
+    tcp_shutdown(ready_client, TcpShutdownWrite)?
+    let mut eof_server: owned TcpStream = readiness_product_require_stream(
+      tcp_wait_readable(ready_server)
+    )
+    let eof_buffer: Vector<u8> = vector_with_capacity<u8>(1)
+    vector_push<u8>(eof_buffer, __u64_to_u8(__i64_to_u64(0)))
+    match tcp_read(eof_server, eof_buffer[..])? {
+      IoEndOfFile -> { nil }
+      IoReadBytes(count) -> { return 63 }
+    }
+    tcp_stream_close(ready_client)?
+    tcp_stream_close(eof_server)?
+    0
+  })
+}
+
+pub fn main() -> i64 {
+  handle {
+    handle runtime_platform_tcp(readiness_product_probe) {
+      Fail<TcpError>.fail(error) -> 64
+    }
+  } {
+    Fail<TcpReadinessError>.fail(error) -> 65
+  }
+}
