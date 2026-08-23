@@ -3157,6 +3157,154 @@ pkg_native_cycle_exit=$?
 set -e
 assert_equals "package_native_archive_cyclic_reference_links_and_runs" "$pkg_native_cycle_exit" "2"
 
+# Symbol strength is typed link data. A weak definition remains a valid
+# fallback, a later strong definition wins regardless of member order, and two
+# selected strong definitions fail before any output is committed.
+mkdir -p "$tmp_pkg_trust_dir/native_artifacts/native/archive_strength"
+printf '%s\n' '__attribute__((weak)) long weft_weak_only(void) { return 42; }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weak_only.c"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/weak_only.c" -o "$tmp_pkg_trust_dir/native_artifacts/weak_only.o"
+/usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_strength/libweft_weak_only.a" \
+  "$tmp_pkg_trust_dir/native_artifacts/weak_only.o"
+native_weak_only_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_strength/libweft_weak_only.a")
+native_weak_only_digest=${native_weak_only_digest_line%% *}
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_weak_only","search":["native/archive_strength"],"content":"sha256:'"$native_weak_only_digest"'","optional":false}],"symbols":[{"declaration":"native_weak_only","symbol":"weft_weak_only","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_weak_only() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_weak_only)
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_weak_only"
+pkg_native_weak_only_exit=$?
+set -e
+assert_equals "package_native_archive_weak_definition_is_fallback" "$pkg_native_weak_only_exit" "42"
+
+printf '%s\n' \
+  '__attribute__((weak)) long weft_choice(void) { return 7; }' \
+  'long weft_weak_anchor(void) { return weft_choice(); }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/choice_weak.c"
+printf '%s\n' \
+  'long weft_choice(void) { return 42; }' \
+  'long weft_strong_anchor(void) { return weft_choice(); }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/choice_strong.c"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/choice_weak.c" -o "$tmp_pkg_trust_dir/native_artifacts/choice_weak.o"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/choice_strong.c" -o "$tmp_pkg_trust_dir/native_artifacts/choice_strong.o"
+/usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_strength/libweft_strength.a" \
+  "$tmp_pkg_trust_dir/native_artifacts/choice_weak.o" \
+  "$tmp_pkg_trust_dir/native_artifacts/choice_strong.o"
+native_strength_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_strength/libweft_strength.a")
+native_strength_digest=${native_strength_digest_line%% *}
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_strength","search":["native/archive_strength"],"content":"sha256:'"$native_strength_digest"'","optional":false}],"symbols":[{"declaration":"native_choice","symbol":"weft_choice","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_choice() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_strength)
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_strength"
+pkg_native_strength_exit=$?
+set -e
+assert_equals "package_native_archive_strong_definition_beats_earlier_weak" "$pkg_native_strength_exit" "42"
+
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_strength","search":["native/archive_strength"],"content":"sha256:'"$native_strength_digest"'","optional":false}],"symbols":[{"declaration":"native_weak_anchor","symbol":"weft_weak_anchor","library":"archive","params":[],"result":"i64","optional":false},{"declaration":"native_strong_anchor","symbol":"weft_strong_anchor","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_weak_anchor() + native_strong_anchor() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_strength_selected)
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_strength_selected"
+pkg_native_strength_selected_exit=$?
+set -e
+assert_equals "package_native_archive_selected_strong_overrides_weak" "$pkg_native_strength_selected_exit" "84"
+
+# Tentative/common storage is coalesced once across selected members. A real
+# section definition outranks that coalesced storage and every reference is
+# redirected to the winning address.
+printf '%s\n' \
+  'long weft_common_value;' \
+  'long weft_common_set(long value) { weft_common_value = value; return 0; }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/common_set.c"
+printf '%s\n' \
+  'long weft_common_value;' \
+  'long weft_common_get(void) { return weft_common_value; }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/common_get.c"
+/usr/bin/clang -fcommon -c "$tmp_pkg_trust_dir/native_artifacts/common_set.c" -o "$tmp_pkg_trust_dir/native_artifacts/common_set.o"
+/usr/bin/clang -fcommon -c "$tmp_pkg_trust_dir/native_artifacts/common_get.c" -o "$tmp_pkg_trust_dir/native_artifacts/common_get.o"
+/usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_strength/libweft_common.a" \
+  "$tmp_pkg_trust_dir/native_artifacts/common_set.o" \
+  "$tmp_pkg_trust_dir/native_artifacts/common_get.o"
+native_common_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_strength/libweft_common.a")
+native_common_digest=${native_common_digest_line%% *}
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_common","search":["native/archive_strength"],"content":"sha256:'"$native_common_digest"'","optional":false}],"symbols":[{"declaration":"native_common_set","symbol":"weft_common_set","library":"archive","params":["i64"],"result":"i64","optional":false},{"declaration":"native_common_get","symbol":"weft_common_get","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_common_set(42) native_common_get() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_common)
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_common"
+pkg_native_common_exit=$?
+set -e
+assert_equals "package_native_archive_common_storage_coalesces" "$pkg_native_common_exit" "42"
+
+printf '%s\n' \
+  'long weft_override_value;' \
+  'long weft_common_read(void) { return weft_override_value; }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/common_override.c"
+printf '%s\n' \
+  'long weft_override_value = 42;' \
+  'long weft_strong_read(void) { return weft_override_value; }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/strong_override.c"
+/usr/bin/clang -fcommon -c "$tmp_pkg_trust_dir/native_artifacts/common_override.c" -o "$tmp_pkg_trust_dir/native_artifacts/common_override.o"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/strong_override.c" -o "$tmp_pkg_trust_dir/native_artifacts/strong_override.o"
+/usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_strength/libweft_common_override.a" \
+  "$tmp_pkg_trust_dir/native_artifacts/common_override.o" \
+  "$tmp_pkg_trust_dir/native_artifacts/strong_override.o"
+native_common_override_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_strength/libweft_common_override.a")
+native_common_override_digest=${native_common_override_digest_line%% *}
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_common_override","search":["native/archive_strength"],"content":"sha256:'"$native_common_override_digest"'","optional":false}],"symbols":[{"declaration":"native_common_read","symbol":"weft_common_read","library":"archive","params":[],"result":"i64","optional":false},{"declaration":"native_strong_read","symbol":"weft_strong_read","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_common_read() + native_strong_read() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_common_override)
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_common_override"
+pkg_native_common_override_exit=$?
+set -e
+assert_equals "package_native_archive_strong_data_overrides_common" "$pkg_native_common_override_exit" "84"
+
+printf '%s\n' \
+  'long weft_duplicate(void) { return 1; }' \
+  'long weft_pick_a(void) { return weft_duplicate(); }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/duplicate_a.c"
+printf '%s\n' \
+  'long weft_duplicate(void) { return 2; }' \
+  'long weft_pick_b(void) { return weft_duplicate(); }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/duplicate_b.c"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/duplicate_a.c" -o "$tmp_pkg_trust_dir/native_artifacts/duplicate_a.o"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/duplicate_b.c" -o "$tmp_pkg_trust_dir/native_artifacts/duplicate_b.o"
+/usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_strength/libweft_duplicate.a" \
+  "$tmp_pkg_trust_dir/native_artifacts/duplicate_a.o" \
+  "$tmp_pkg_trust_dir/native_artifacts/duplicate_b.o"
+native_duplicate_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_strength/libweft_duplicate.a")
+native_duplicate_digest=${native_duplicate_digest_line%% *}
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_duplicate","search":["native/archive_strength"],"content":"sha256:'"$native_duplicate_digest"'","optional":false}],"symbols":[{"declaration":"native_pick_a","symbol":"weft_pick_a","library":"archive","params":[],"result":"i64","optional":false},{"declaration":"native_pick_b","symbol":"weft_pick_b","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_pick_a() + native_pick_b() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+set +e
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_duplicate) \
+  > "$tmp_pkg_trust_dir/native_artifacts/native_duplicate.stdout" \
+  2> "$tmp_pkg_trust_dir/native_artifacts/native_duplicate.err"
+pkg_native_duplicate_exit=$?
+set -e
+assert_equals "package_native_archive_duplicate_strong_fails" "$pkg_native_duplicate_exit" "1"
+assert_contains "package_native_archive_duplicate_strong_is_structured" "$(<"$tmp_pkg_trust_dir/native_artifacts/native_duplicate.err")" "strong symbol 'weft_duplicate' more than once"
+if [ ! -e "$tmp_pkg_trust_dir/native_artifacts/native_duplicate" ]; then
+  echo "  ok package_native_archive_duplicate_strong_commits_no_output"
+else
+  echo "  fail package_native_archive_duplicate_strong_commits_no_output"
+  exit 1
+fi
+
 native_compiler_strings=$(strings "$WEFT_ABS")
 assert_not_contains "package_native_product_compiler_has_no_clang_fallback" "$native_compiler_strings" "/usr/bin/clang"
 
@@ -3924,4 +4072,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 1007 passed, 0 failed"
+echo "Tool boundary summary: 1015 passed, 0 failed"
