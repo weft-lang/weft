@@ -764,6 +764,33 @@ assert_contains "elf_linux_streaming_file_invokes_linux_svc" "$elf_linux_streami
 assert_not_contains "elf_linux_streaming_file_has_no_interpreter" "$elf_linux_streaming_file_headers" "INTERP off"
 assert_not_contains "elf_linux_streaming_file_has_no_dynamic_segment" "$elf_linux_streaming_file_headers" "DYNAMIC off"
 
+# The directory product exercises the typed inspection and mutation effects as
+# ordinary application code. Its sealed backend lowers to Linux directory and
+# metadata syscalls while retaining the same target-neutral runtime surface
+# used by Darwin.
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_directory_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_directory_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_directory_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_directory_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+assert_contains "elf_linux_directory_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
+elf_linux_directory_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+elf_linux_directory_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+assert_contains "elf_linux_directory_selects_getcwd" "$elf_linux_directory_disassembly" $'mov\tx8, #0x11'
+assert_contains "elf_linux_directory_selects_mkdirat" "$elf_linux_directory_disassembly" $'mov\tx8, #0x22'
+assert_contains "elf_linux_directory_selects_unlinkat" "$elf_linux_directory_disassembly" $'mov\tx8, #0x23'
+assert_contains "elf_linux_directory_selects_renameat" "$elf_linux_directory_disassembly" $'mov\tx8, #0x26'
+assert_contains "elf_linux_directory_selects_openat" "$elf_linux_directory_disassembly" $'mov\tx8, #0x38'
+assert_contains "elf_linux_directory_selects_close" "$elf_linux_directory_disassembly" $'mov\tx8, #0x39'
+assert_contains "elf_linux_directory_selects_getdents64" "$elf_linux_directory_disassembly" $'mov\tx8, #0x3d'
+assert_contains "elf_linux_directory_selects_newfstatat" "$elf_linux_directory_disassembly" $'mov\tx8, #0x4f'
+assert_contains "elf_linux_directory_selects_exit_group" "$elf_linux_directory_disassembly" $'mov\tx8, #0x5e'
+assert_contains "elf_linux_directory_invokes_linux_svc" "$elf_linux_directory_disassembly" $'svc\t#0'
+assert_not_contains "elf_linux_directory_has_no_interpreter" "$elf_linux_directory_headers" "INTERP off"
+assert_not_contains "elf_linux_directory_has_no_dynamic_segment" "$elf_linux_directory_headers" "DYNAMIC off"
+
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
 assert_contains "fmt_parse_only" "$fmt_out" "fn main() -> i64 { 42 }"
@@ -1399,11 +1426,11 @@ assert_equals "diagnostic_exhaustiveness_teaches_counterexample_golden" "$diag_o
 
 printf '%s\n' 'effect Box<T> { fn get() -> T } fn need() -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_effect_discharge_teaches_parameter_identity_golden" "$diag_out" $'line 1, col 99: error[E2001]: effect `Box<str>` is not available in this context\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                             ^~~~ effect `Box<str>` is not available in this context\nline 1, col 108: note: nearest handler handles a different instantiation of this effect\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                                      ^~~ nearest handler handles a different instantiation of this effect\nline 1, col 36: note: callee declares this effect\n  |\n1 | ...T> { fn get() -> T } fn need() -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<...\n  |                            ^~~~ callee declares this effect\nhelp: `Box<i64>` is available, but it does not discharge `Box<str>`; effect type arguments are part of capability identity.\ncheck: 465 functions, 1 errors'
+assert_equals "diagnostic_effect_discharge_teaches_parameter_identity_golden" "$diag_out" $'line 1, col 99: error[E2001]: effect `Box<str>` is not available in this context\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                             ^~~~ effect `Box<str>` is not available in this context\nline 1, col 108: note: nearest handler handles a different instantiation of this effect\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                                      ^~~ nearest handler handles a different instantiation of this effect\nline 1, col 36: note: callee declares this effect\n  |\n1 | ...T> { fn get() -> T } fn need() -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<...\n  |                            ^~~~ callee declares this effect\nhelp: `Box<i64>` is available, but it does not discharge `Box<str>`; effect type arguments are part of capability identity.\ncheck: 482 functions, 1 errors'
 
 printf '%s\n' 'type Box<T> { Box(T) } trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> Identity for Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(Box<bool>(true)) }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_trait_conformance_replays_conditional_proof_golden" "$diag_out" $'line 1, col 200: error[E1004]: type `Box<bool>` does not implement `Identity`\n  |\n1 | ...ed<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(Box<bool>(true)) }\n  |                                                                           ^~~~~~~~~ type `Box<bool>` does not implement `Identity`\nline 1, col 113: note: matching impl candidate rejected by its own bound\n  |\n1 | ...T: Marked> Identity for Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bo...\n  |                            ^~~ matching impl candidate rejected by its own bound\nline 1, col 135: note: required by this trait bound\n  |\n1 | ...r Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(...\n  |                            ^~~~~~~~ required by this trait bound\nline 1, col 47: note: trait declared here\n  |\n1 | ... trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> Identity for Box<T> { }...\n  |                            ^~~~~~~~ trait declared here\nline 1, col 6: note: target type declared here\n  |\n1 | type Box<T> { Box(T) } trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> I...\n  |      ^~~ target type declared here\nhelp: a matching `Box<T>` impl candidate exists, but it requires `bool: Marked`; satisfy that nested bound or use another type.\ncheck: 465 functions, 1 errors'
+assert_equals "diagnostic_trait_conformance_replays_conditional_proof_golden" "$diag_out" $'line 1, col 200: error[E1004]: type `Box<bool>` does not implement `Identity`\n  |\n1 | ...ed<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(Box<bool>(true)) }\n  |                                                                           ^~~~~~~~~ type `Box<bool>` does not implement `Identity`\nline 1, col 113: note: matching impl candidate rejected by its own bound\n  |\n1 | ...T: Marked> Identity for Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bo...\n  |                            ^~~ matching impl candidate rejected by its own bound\nline 1, col 135: note: required by this trait bound\n  |\n1 | ...r Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(...\n  |                            ^~~~~~~~ required by this trait bound\nline 1, col 47: note: trait declared here\n  |\n1 | ... trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> Identity for Box<T> { }...\n  |                            ^~~~~~~~ trait declared here\nline 1, col 6: note: target type declared here\n  |\n1 | type Box<T> { Box(T) } trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> I...\n  |      ^~~ target type declared here\nhelp: a matching `Box<T>` impl candidate exists, but it requires `bool: Marked`; satisfy that nested bound or use another type.\ncheck: 482 functions, 1 errors'
 
 printf '%s\n' 'fn main() -> i64 { let café = 1 café }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
