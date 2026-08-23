@@ -3157,6 +3157,41 @@ pkg_native_cycle_exit=$?
 set -e
 assert_equals "package_native_archive_cyclic_reference_links_and_runs" "$pkg_native_cycle_exit" "2"
 
+# The real-object relocation matrix pins the exact external call and GOT-load
+# alternatives admitted by the typed Mach-O parser. Closure selects the second
+# member for both code and data, and finalization relaxes its GOT pair locally.
+mkdir -p "$tmp_pkg_trust_dir/native_artifacts/native/archive_relocation_matrix"
+printf '%s\n' \
+  'extern long weft_matrix_data;' \
+  'extern long weft_matrix_call(void);' \
+  'long weft_matrix_entry(void) { return weft_matrix_call() + weft_matrix_data; }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/relocation_matrix_entry.c"
+printf '%s\n' \
+  'long weft_matrix_data = 40;' \
+  'long weft_matrix_call(void) { return 2; }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/relocation_matrix_definitions.c"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/relocation_matrix_entry.c" -o "$tmp_pkg_trust_dir/native_artifacts/relocation_matrix_entry.o"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/relocation_matrix_definitions.c" -o "$tmp_pkg_trust_dir/native_artifacts/relocation_matrix_definitions.o"
+native_relocation_matrix=$(otool -rv "$tmp_pkg_trust_dir/native_artifacts/relocation_matrix_entry.o")
+assert_contains "package_native_archive_fixture_has_branch26_relocation" "$native_relocation_matrix" "BR26"
+assert_contains "package_native_archive_fixture_has_got_page21_relocation" "$native_relocation_matrix" "GOTLDP  False"
+assert_contains "package_native_archive_fixture_has_got_pageoff12_relocation" "$native_relocation_matrix" "GOTLDPOF"
+/usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_relocation_matrix/libweft_relocation_matrix.a" \
+  "$tmp_pkg_trust_dir/native_artifacts/relocation_matrix_entry.o" \
+  "$tmp_pkg_trust_dir/native_artifacts/relocation_matrix_definitions.o"
+native_relocation_matrix_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_relocation_matrix/libweft_relocation_matrix.a")
+native_relocation_matrix_digest=${native_relocation_matrix_digest_line%% *}
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_relocation_matrix","search":["native/archive_relocation_matrix"],"content":"sha256:'"$native_relocation_matrix_digest"'","optional":false}],"symbols":[{"declaration":"native_relocation_matrix","symbol":"weft_matrix_entry","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_relocation_matrix() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_relocation_matrix)
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_relocation_matrix"
+pkg_native_relocation_matrix_exit=$?
+set -e
+assert_equals "package_native_archive_branch_and_got_matrix_links_and_runs" "$pkg_native_relocation_matrix_exit" "42"
+
 # Symbol strength is typed link data. A weak definition remains a valid
 # fallback, a later strong definition wins regardless of member order, and two
 # selected strong definitions fail before any output is committed.
@@ -3286,10 +3321,13 @@ printf '%s\n' \
   > "$tmp_pkg_trust_dir/native_artifacts/multi_section.c"
 /usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/multi_section.c" -o "$tmp_pkg_trust_dir/native_artifacts/multi_section.o"
 native_multi_object_sections=$(otool -l "$tmp_pkg_trust_dir/native_artifacts/multi_section.o")
+native_multi_object_relocations=$(otool -rv "$tmp_pkg_trust_dir/native_artifacts/multi_section.o")
 assert_contains "package_native_archive_fixture_has_initialized_section" "$native_multi_object_sections" "sectname __data"
 assert_contains "package_native_archive_fixture_has_constant_section" "$native_multi_object_sections" "sectname __const"
 assert_contains "package_native_archive_fixture_has_zerofill_section" "$native_multi_object_sections" "sectname __bss"
 assert_contains "package_native_archive_fixture_has_64k_alignment" "$native_multi_object_sections" "align 2^16 (65536)"
+assert_contains "package_native_archive_fixture_has_page21_relocation" "$native_multi_object_relocations" "PAGE21"
+assert_contains "package_native_archive_fixture_has_pageoff12_relocation" "$native_multi_object_relocations" "PAGOF12"
 /usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_sections/libweft_sections.a" \
   "$tmp_pkg_trust_dir/native_artifacts/multi_section.o"
 native_multi_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_sections/libweft_sections.a")
@@ -4148,4 +4186,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 1024 passed, 0 failed"
+echo "Tool boundary summary: 1030 passed, 0 failed"
