@@ -3044,7 +3044,9 @@ assert_equals "package_native_manifest_call_links_and_runs" "$pkg_native_linked_
 mkdir -p \
   "$tmp_pkg_trust_dir/native_artifacts/native/archive_first" \
   "$tmp_pkg_trust_dir/native_artifacts/native/archive_second" \
-  "$tmp_pkg_trust_dir/native_artifacts/native/dynamic"
+  "$tmp_pkg_trust_dir/native_artifacts/native/dynamic" \
+  "$tmp_pkg_trust_dir/native_artifacts/native/dynamic_closure" \
+  "$tmp_pkg_trust_dir/native_artifacts/native/dynamic_wrong_arch"
 printf '%s\n' 'long weft_archive_value(void) { return 40; }' > "$tmp_pkg_trust_dir/native_artifacts/archive_first.c"
 printf '%s\n' 'long weft_archive_value(void) { return 99; }' > "$tmp_pkg_trust_dir/native_artifacts/archive_second.c"
 printf '%s\n' 'long weft_dynamic_value(void) { return 2; }' > "$tmp_pkg_trust_dir/native_artifacts/dynamic.c"
@@ -3079,6 +3081,116 @@ run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_dynamic_only"
 pkg_native_dynamic_only_exit=$?
 set -e
 assert_equals "package_native_dynamic_build_links_and_runs" "$pkg_native_dynamic_only_exit" "2"
+
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"missing","kind":"dynamic","link":"weft_missing_dynamic","search":["native/dynamic_missing"],"content":"sha256:0000000000000000000000000000000000000000000000000000000000000000","optional":false}],"symbols":[{"declaration":"native_dynamic_value","symbol":"weft_dynamic_value","library":"missing","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+set +e
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_missing_dynamic) \
+  > "$tmp_pkg_trust_dir/native_artifacts/native_missing_dynamic.stdout" \
+  2> "$tmp_pkg_trust_dir/native_artifacts/native_missing_dynamic.err"
+pkg_native_missing_dynamic_exit=$?
+set -e
+assert_equals "package_native_dynamic_missing_fails" "$pkg_native_missing_dynamic_exit" "1"
+assert_contains "package_native_dynamic_missing_is_explicit" "$(<"$tmp_pkg_trust_dir/native_artifacts/native_missing_dynamic.err")" "is unavailable in its declared search paths"
+if [ ! -e "$tmp_pkg_trust_dir/native_artifacts/native_missing_dynamic" ]; then
+  echo "  ok package_native_dynamic_missing_commits_no_output"
+else
+  echo "  fail package_native_dynamic_missing_commits_no_output"
+  exit 1
+fi
+
+native_wrong_arch_path="$tmp_pkg_trust_dir/native_artifacts/native/dynamic_wrong_arch/libweft_wrong_arch.dylib"
+/usr/bin/clang -arch x86_64 -dynamiclib \
+  "$tmp_pkg_trust_dir/native_artifacts/dynamic.c" \
+  -Wl,-install_name,"$native_wrong_arch_path" \
+  -o "$native_wrong_arch_path"
+codesign -s - "$native_wrong_arch_path" >/dev/null
+assert_contains "package_native_dynamic_wrong_arch_fixture_is_x86_64" "$(/usr/bin/file -b "$native_wrong_arch_path")" "x86_64"
+native_wrong_arch_digest_line=$(/usr/bin/shasum -a 256 "$native_wrong_arch_path")
+native_wrong_arch_digest=${native_wrong_arch_digest_line%% *}
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"wrong","kind":"dynamic","link":"weft_wrong_arch","search":["native/dynamic_wrong_arch"],"content":"sha256:'"$native_wrong_arch_digest"'","optional":false}],"symbols":[{"declaration":"native_dynamic_value","symbol":"weft_dynamic_value","library":"wrong","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+set +e
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_wrong_arch) \
+  > "$tmp_pkg_trust_dir/native_artifacts/native_wrong_arch.stdout" \
+  2> "$tmp_pkg_trust_dir/native_artifacts/native_wrong_arch.err"
+pkg_native_wrong_arch_exit=$?
+set -e
+assert_equals "package_native_dynamic_wrong_arch_fails" "$pkg_native_wrong_arch_exit" "1"
+assert_contains "package_native_dynamic_wrong_arch_is_explicit" "$(<"$tmp_pkg_trust_dir/native_artifacts/native_wrong_arch.err")" "has no valid aarch64 Mach-O install identity"
+if [ ! -e "$tmp_pkg_trust_dir/native_artifacts/native_wrong_arch" ]; then
+  echo "  ok package_native_dynamic_wrong_arch_commits_no_output"
+else
+  echo "  fail package_native_dynamic_wrong_arch_commits_no_output"
+  exit 1
+fi
+
+# The actual Mach-O load commands define deployment closure. A direct owner is
+# insufficient when its locked image names another dylib: that identity must be
+# satisfied by another hash-verified manifest declaration, which is selected
+# transitively even when no Weft declaration directly calls it.
+printf '%s\n' 'long weft_transitive_dependency(void) { return 40; }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/transitive_dependency.c"
+printf '%s\n' \
+  'extern long weft_transitive_dependency(void);' \
+  'long weft_transitive_owner(void) { return weft_transitive_dependency() + 2; }' \
+  > "$tmp_pkg_trust_dir/native_artifacts/transitive_owner.c"
+native_transitive_dependency_path="$tmp_pkg_trust_dir/native_artifacts/native/dynamic_closure/libweft_transitive_dependency.dylib"
+native_transitive_owner_path="$tmp_pkg_trust_dir/native_artifacts/native/dynamic_closure/libweft_transitive_owner.dylib"
+/usr/bin/clang -dynamiclib \
+  "$tmp_pkg_trust_dir/native_artifacts/transitive_dependency.c" \
+  -Wl,-install_name,"$native_transitive_dependency_path" \
+  -o "$native_transitive_dependency_path"
+/usr/bin/clang -dynamiclib \
+  "$tmp_pkg_trust_dir/native_artifacts/transitive_owner.c" \
+  "$native_transitive_dependency_path" \
+  -Wl,-install_name,"$native_transitive_owner_path" \
+  -o "$native_transitive_owner_path"
+codesign -s - "$native_transitive_dependency_path" >/dev/null
+codesign -s - "$native_transitive_owner_path" >/dev/null
+native_transitive_dependency_digest_line=$(/usr/bin/shasum -a 256 "$native_transitive_dependency_path")
+native_transitive_dependency_digest=${native_transitive_dependency_digest_line%% *}
+native_transitive_owner_digest_line=$(/usr/bin/shasum -a 256 "$native_transitive_owner_path")
+native_transitive_owner_digest=${native_transitive_owner_digest_line%% *}
+
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"owner","kind":"dynamic","link":"weft_transitive_owner","search":["native/dynamic_closure"],"content":"sha256:'"$native_transitive_owner_digest"'","optional":false}],"symbols":[{"declaration":"native_transitive_value","symbol":"weft_transitive_owner","library":"owner","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_transitive_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+set +e
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_transitive_undeclared) \
+  > "$tmp_pkg_trust_dir/native_artifacts/native_transitive_undeclared.stdout" \
+  2> "$tmp_pkg_trust_dir/native_artifacts/native_transitive_undeclared.err"
+pkg_native_transitive_undeclared_exit=$?
+set -e
+assert_equals "package_native_dynamic_undeclared_transitive_fails" "$pkg_native_transitive_undeclared_exit" "1"
+assert_contains "package_native_dynamic_undeclared_transitive_names_owner" "$(<"$tmp_pkg_trust_dir/native_artifacts/native_transitive_undeclared.err")" "$native_transitive_owner_path"
+assert_contains "package_native_dynamic_undeclared_transitive_names_dependency" "$(<"$tmp_pkg_trust_dir/native_artifacts/native_transitive_undeclared.err")" "requires undeclared dynamic dependency '$native_transitive_dependency_path'"
+if [ ! -e "$tmp_pkg_trust_dir/native_artifacts/native_transitive_undeclared" ]; then
+  echo "  ok package_native_dynamic_undeclared_transitive_commits_no_output"
+else
+  echo "  fail package_native_dynamic_undeclared_transitive_commits_no_output"
+  exit 1
+fi
+
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"owner","kind":"dynamic","link":"weft_transitive_owner","search":["native/dynamic_closure"],"content":"sha256:'"$native_transitive_owner_digest"'","license":"MIT","optional":false},{"id":"dependency","kind":"dynamic","link":"weft_transitive_dependency","search":["native/dynamic_closure"],"content":"sha256:'"$native_transitive_dependency_digest"'","license":"MIT","optional":false}],"symbols":[{"declaration":"native_transitive_value","symbol":"weft_transitive_owner","library":"owner","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_transitive --artifact-facts native_transitive.facts.json)
+native_transitive_dependencies=$(otool -L "$tmp_pkg_trust_dir/native_artifacts/native_transitive")
+assert_contains "package_native_dynamic_closure_records_owner" "$native_transitive_dependencies" "$native_transitive_owner_path"
+assert_contains "package_native_dynamic_closure_records_dependency" "$native_transitive_dependencies" "$native_transitive_dependency_path"
+native_transitive_facts=$(/bin/cat "$tmp_pkg_trust_dir/native_artifacts/native_transitive.facts.json")
+assert_contains "package_native_dynamic_closure_facts_reject_standalone" "$native_transitive_facts" '"standalone":false'
+assert_contains "package_native_dynamic_closure_facts_name_owner" "$native_transitive_facts" '"kind":"dynamic","identity":"'"$native_transitive_owner_path"'"'
+assert_contains "package_native_dynamic_closure_facts_name_dependency" "$native_transitive_facts" '"kind":"dynamic","identity":"'"$native_transitive_dependency_path"'"'
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_transitive"
+pkg_native_transitive_exit=$?
+set -e
+assert_equals "package_native_dynamic_transitive_closure_links_and_runs" "$pkg_native_transitive_exit" "42"
 
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_fixture","search":["native/archive_first","native/archive_second"],"content":"sha256:'"$native_archive_digest"'","optional":false},{"id":"dynamic","kind":"dynamic","link":"weft_fixture_dynamic","search":["native/dynamic"],"content":"sha256:'"$native_dynamic_digest"'","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_archive_value","library":"archive","params":[],"result":"i64","optional":false},{"declaration":"native_dynamic_value","symbol":"weft_dynamic_value","library":"dynamic","params":[],"result":"i64","optional":false}]}}}}}' \
@@ -4201,4 +4313,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 1040 passed, 0 failed"
+echo "Tool boundary summary: 1057 passed, 0 failed"
