@@ -3061,6 +3061,25 @@ native_archive_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_a
 native_archive_digest=${native_archive_digest_line%% *}
 native_dynamic_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/dynamic/libweft_fixture_dynamic.dylib")
 native_dynamic_digest=${native_dynamic_digest_line%% *}
+
+# A dynamic-only product closes entirely through Weft's typed LinkGraph and
+# Mach-O leaf. The foreign dylib is test input; clang/ld are not a final-link
+# stage for the executable.
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"dynamic","kind":"dynamic","link":"weft_fixture_dynamic","search":["native/dynamic"],"content":"sha256:'"$native_dynamic_digest"'","optional":false}],"symbols":[{"declaration":"native_dynamic_value","symbol":"weft_dynamic_value","library":"dynamic","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_dynamic_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_dynamic_only)
+codesign --verify "$tmp_pkg_trust_dir/native_artifacts/native_dynamic_only"
+native_dynamic_only_dependencies=$(otool -L "$tmp_pkg_trust_dir/native_artifacts/native_dynamic_only")
+assert_contains "package_native_dynamic_build_records_exact_artifact" "$native_dynamic_only_dependencies" "$tmp_pkg_trust_dir/native_artifacts/native/dynamic/libweft_fixture_dynamic.dylib"
+assert_contains "package_native_dynamic_build_keeps_system_abi" "$native_dynamic_only_dependencies" "/usr/lib/libSystem.B.dylib"
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_dynamic_only"
+pkg_native_dynamic_only_exit=$?
+set -e
+assert_equals "package_native_dynamic_build_links_and_runs" "$pkg_native_dynamic_only_exit" "2"
+
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_fixture","search":["native/archive_first","native/archive_second"],"content":"sha256:'"$native_archive_digest"'","optional":false},{"id":"dynamic","kind":"dynamic","link":"weft_fixture_dynamic","search":["native/dynamic"],"content":"sha256:'"$native_dynamic_digest"'","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_archive_value","library":"archive","params":[],"result":"i64","optional":false},{"declaration":"native_dynamic_value","symbol":"weft_dynamic_value","library":"dynamic","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"

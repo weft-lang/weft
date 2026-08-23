@@ -1,6 +1,6 @@
 #!/bin/bash
-# run_linked_tests.sh — compile, link, and run test files that use __got_* calls
-# These tests emit .o files (not standalone binaries) and need ld to link.
+# run_linked_tests.sh — compile and run programs that use native system calls.
+# Weft's native linker owns the Mach-O/GOT/bind finalization exercised here.
 set -e
 
 WEFT=${WEFT:-./weft}
@@ -9,7 +9,6 @@ WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-120}
 WEFT_TEST_RUNAWAY_RSS_LIMIT_KB=${WEFT_TEST_RUNAWAY_RSS_LIMIT_KB:-16000000}
 WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB}
 WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-1000000}
-SDK=$(xcrun --show-sdk-path)
 PASS=0
 FAIL=0
 ERRORS=""
@@ -74,13 +73,12 @@ echo ""
 
 for f in test/linked/*.weft; do
   name=$(basename "$f" .weft)
-  tmpobj=$(mktemp /tmp/weft_linked_XXXXXX)
   tmpbin=$(mktemp /tmp/weft_linked_XXXXXX)
 
-  # Compile test blocks to .o. The test harness emits an object whenever
-  # __got_* calls are present.
+  # Compile straight to the final native-linked executable. No host linker or
+  # SDK discovery participates in this product gate.
   compile_exit=0
-  run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" test --emit "$f" > "$tmpobj" 2>/dev/null || compile_exit=$?
+  run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" test --emit "$f" > "$tmpbin" 2>/dev/null || compile_exit=$?
   if [ "$compile_exit" -ne 0 ]; then
     if [ "$compile_exit" -eq 124 ]; then
       echo "  ✗ $name (compilation timed out)"
@@ -93,16 +91,7 @@ for f in test/linked/*.weft; do
       ERRORS="$ERRORS\n  $name: compilation failed"
     fi
     FAIL=$((FAIL+1))
-    rm -f "$tmpobj" "$tmpbin"
-    continue
-  fi
-
-  # Link with ld
-  if ! /usr/bin/ld -o "$tmpbin" "$tmpobj" -lSystem -syslibroot "$SDK" -e _main -arch arm64 -platform_version macos 11.0 15.0 2>/dev/null; then
-    echo "  ✗ $name (linking failed)"
-    FAIL=$((FAIL+1))
-    ERRORS="$ERRORS\n  $name: linking failed"
-    rm -f "$tmpobj" "$tmpbin"
+    rm -f "$tmpbin"
     continue
   fi
 
@@ -130,7 +119,7 @@ for f in test/linked/*.weft; do
     FAIL=$((FAIL+1))
   fi
 
-  rm -f "$tmpobj" "$tmpbin"
+  rm -f "$tmpbin"
 done
 
 echo ""
