@@ -632,6 +632,35 @@ assert_contains "elf_linux_aarch64_sets_exit_status" "$elf_disassembly" $'mov\tx
 assert_contains "elf_linux_aarch64_sets_exit_syscall" "$elf_disassembly" $'mov\tx8, #0x5d'
 assert_contains "elf_linux_aarch64_invokes_linux_svc" "$elf_disassembly" $'svc\t#0'
 
+# The real target path must lower ordinary Weft source through the shared
+# NativeModule -> LinkPlan -> LinkGraph pipeline, not only package a hand-built
+# instruction fixture. It remains Darwin-hosted here; Linux execution is the
+# target-local product gate in brief 1e.
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_pipeline_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_pipeline_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_pipeline_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_pipeline_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+elf_pipeline_file=$(/usr/bin/file -b "$tmp_elf_product")
+assert_contains "elf_linux_pipeline_file_reports_architecture" "$elf_pipeline_file" "ARM aarch64"
+assert_contains "elf_linux_pipeline_file_reports_static_linkage" "$elf_pipeline_file" "statically linked"
+elf_pipeline_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --file-headers --private-headers "$tmp_elf_product")
+assert_contains "elf_linux_pipeline_has_little_endian_format" "$elf_pipeline_headers" "file format elf64-littleaarch64"
+assert_contains "elf_linux_pipeline_has_exact_entry" "$elf_pipeline_headers" "start address: 0x0000000000401000"
+assert_contains "elf_linux_pipeline_load_is_read_execute" "$elf_pipeline_headers" "flags r-x"
+assert_contains "elf_linux_pipeline_stack_is_read_write" "$elf_pipeline_headers" "flags rw-"
+assert_not_contains "elf_linux_pipeline_has_no_interpreter" "$elf_pipeline_headers" "INTERP off"
+assert_not_contains "elf_linux_pipeline_has_no_dynamic_segment" "$elf_pipeline_headers" "DYNAMIC off"
+elf_pipeline_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+assert_contains "elf_linux_pipeline_reads_argc_from_initial_stack" "$elf_pipeline_disassembly" $'ldr\tx25, [sp]'
+assert_contains "elf_linux_pipeline_selects_mmap_syscall" "$elf_pipeline_disassembly" $'mov\tx8, #0xde'
+assert_contains "elf_linux_pipeline_selects_anonymous_private_map" "$elf_pipeline_disassembly" $'mov\tx3, #0x22'
+assert_contains "elf_linux_pipeline_invokes_linux_svc" "$elf_pipeline_disassembly" $'svc\t#0'
+assert_contains "elf_linux_pipeline_compiles_main_result" "$elf_pipeline_disassembly" $'mov\tx8, #0x2a'
+assert_contains "elf_linux_pipeline_selects_exit_group" "$elf_pipeline_disassembly" $'mov\tx8, #0x5e'
+
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
 assert_contains "fmt_parse_only" "$fmt_out" "fn main() -> i64 { 42 }"
@@ -4417,4 +4446,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 1087 passed, 0 failed"
+echo "Tool boundary summary: 1104 passed, 0 failed"
