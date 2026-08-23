@@ -483,6 +483,306 @@ pub(package) fn cg_emit_platform_time_sleep(code: i64, target: NativeLinkTarget,
   }
 }
 
+-- Proc uses a target-neutral eight-word spawn plan owned by runtime/process:
+-- stdout read/write, stderr read/write, exec-error read/write, error scratch,
+-- and a capture flag. Darwin interprets capture through posix_spawn actions;
+-- Linux interprets it through clone/dup3/execve. The exec-error pipe is marked
+-- close-on-exec, so EOF proves that the new image crossed exec successfully.
+fn cg_proc_plan_stdout_read_offset() -> i64 { 0 }
+fn cg_proc_plan_stdout_write_offset() -> i64 { 8 }
+fn cg_proc_plan_stderr_read_offset() -> i64 { 16 }
+fn cg_proc_plan_stderr_write_offset() -> i64 { 24 }
+fn cg_proc_plan_exec_read_offset() -> i64 { 32 }
+fn cg_proc_plan_exec_write_offset() -> i64 { 40 }
+fn cg_proc_plan_error_offset() -> i64 { 48 }
+fn cg_proc_plan_capture_offset() -> i64 { 56 }
+
+pub(package) fn cg_emit_platform_proc_pipe(code: i64, target: NativeLinkTarget) -> i64 {
+  -- Normalize both kernels' pipe result into two i64 descriptor cells.
+  bu32(code, encode_sub_imm(31, 31, 32))
+  bu32(code, cg_str(0, 31, 16))
+  match target {
+    NativeLinkMacosAarch64 -> {
+      cg_emit_platform_syscall(code, target, 42, 59)
+      bu32(code, encode_cmp(0, 31))
+      let failed_pos = buf_len(code)
+      bu32(code, 0)
+      bu32(code, encode_uxtw(10, 0))
+      bu32(code, encode_uxtw(11, 1))
+      bu32(code, cg_ldr(15, 31, 16))
+      bu32(code, cg_str(10, 15, 0))
+      bu32(code, cg_str(11, 15, 8))
+      emit_mov_imm_safe(code, 0, 0)
+      let done = buf_len(code)
+      cg_patch_b_cond(code, failed_pos, 11, done)
+    }
+    NativeLinkLinuxAarch64 -> {
+      bu32(code, encode_add_imm(0, 31, 0))
+      emit_mov_imm_safe(code, 1, 0)
+      cg_emit_linux_syscall(code, 59) -- pipe2
+      bu32(code, encode_cmp(0, 31))
+      let failed_pos = buf_len(code)
+      bu32(code, 0)
+      bu32(code, cg_ldr(9, 31, 0))
+      bu32(code, encode_uxtw(10, 9))
+      emit_mov_imm_safe(code, 12, 32)
+      bu32(code, encode_lsr_reg(11, 9, 12))
+      bu32(code, cg_ldr(15, 31, 16))
+      bu32(code, cg_str(10, 15, 0))
+      bu32(code, cg_str(11, 15, 8))
+      emit_mov_imm_safe(code, 0, 0)
+      let done = buf_len(code)
+      cg_patch_b_cond(code, failed_pos, 11, done)
+    }
+  }
+  bu32(code, encode_add_imm(31, 31, 32))
+}
+
+pub(package) fn cg_emit_platform_proc_set_cloexec(code: i64, target: NativeLinkTarget) -> i64 {
+  -- fcntl(fd, F_SETFD, FD_CLOEXEC)
+  emit_mov_imm_safe(code, 1, 2)
+  emit_mov_imm_safe(code, 2, 1)
+  cg_emit_platform_syscall(code, target, 92, 25)
+}
+
+pub(package) fn cg_emit_platform_proc_set_nonblocking(code: i64, target: NativeLinkTarget) -> i64 {
+  -- Preserve the descriptor while F_GETFL returns the target-native flag set.
+  bu32(code, encode_sub_imm(31, 31, 16))
+  bu32(code, cg_str(0, 31, 0))
+  emit_mov_imm_safe(code, 1, 3)
+  emit_mov_imm_safe(code, 2, 0)
+  cg_emit_platform_syscall(code, target, 92, 25)
+  bu32(code, encode_cmp(0, 31))
+  let failed_pos = buf_len(code)
+  bu32(code, 0)
+  bu32(code, encode_add_imm(15, 0, 0))
+  bu32(code, cg_ldr(0, 31, 0))
+  emit_mov_imm_safe(code, 1, 4)
+  emit_mov_imm_safe(code, 16, match target {
+    NativeLinkMacosAarch64 -> 4
+    NativeLinkLinuxAarch64 -> 2048
+  })
+  bu32(code, encode_orr_reg(2, 15, 16))
+  cg_emit_platform_syscall(code, target, 92, 25)
+  let done = buf_len(code)
+  cg_patch_b_cond(code, failed_pos, 11, done)
+  bu32(code, encode_add_imm(31, 31, 16))
+}
+
+fn cg_emit_platform_proc_darwin_action(code: i64, fm: i64, got_symbol: i64, plan_offset: i64, target_fd: i64) -> i64 {
+  bu32(code, encode_add_imm(0, 31, 40))
+  bu32(code, cg_ldr(15, 31, 32))
+  bu32(code, cg_ldr(1, 15, plan_offset))
+  if target_fd >= 0 { emit_mov_imm_safe(code, 2, target_fd) } else { 0 }
+  cg_emit_platform_got_call(code, fm, got_symbol)
+  bu32(code, cg_str(0, 31, 48))
+  bu32(code, encode_cmp(0, 31))
+  let failed_pos = buf_len(code)
+  bu32(code, 0)
+  failed_pos
+}
+
+fn cg_emit_platform_proc_spawn_darwin(code: i64, fm: i64) -> i64 {
+  -- Saved arguments: pid, path, argv, envp, plan. The action object and the
+  -- last semantic status occupy the remaining words of this aligned frame.
+  bu32(code, encode_sub_imm(31, 31, 64))
+  bu32(code, cg_str(0, 31, 0))
+  bu32(code, cg_str(1, 31, 8))
+  bu32(code, cg_str(2, 31, 16))
+  bu32(code, cg_str(3, 31, 24))
+  bu32(code, cg_str(4, 31, 32))
+  bu32(code, cg_str(31, 31, 40))
+  bu32(code, cg_str(31, 31, 48))
+
+  bu32(code, cg_ldr(15, 4, cg_proc_plan_capture_offset()))
+  let inherit_pos = buf_len(code)
+  bu32(code, 0)
+
+  bu32(code, encode_add_imm(0, 31, 40))
+  cg_emit_platform_got_call(code, fm, 32) -- posix_spawn_file_actions_init
+  bu32(code, cg_str(0, 31, 48))
+  bu32(code, encode_cmp(0, 31))
+  let init_failed_pos = buf_len(code)
+  bu32(code, 0)
+
+  let dup_stdout_failed = cg_emit_platform_proc_darwin_action(code, fm, 33, cg_proc_plan_stdout_write_offset(), 1)
+  let dup_stderr_failed = cg_emit_platform_proc_darwin_action(code, fm, 33, cg_proc_plan_stderr_write_offset(), 2)
+  let close_stdout_read_failed = cg_emit_platform_proc_darwin_action(code, fm, 34, cg_proc_plan_stdout_read_offset(), 0 - 1)
+  let close_stderr_read_failed = cg_emit_platform_proc_darwin_action(code, fm, 34, cg_proc_plan_stderr_read_offset(), 0 - 1)
+  let close_stdout_write_failed = cg_emit_platform_proc_darwin_action(code, fm, 34, cg_proc_plan_stdout_write_offset(), 0 - 1)
+  let close_stderr_write_failed = cg_emit_platform_proc_darwin_action(code, fm, 34, cg_proc_plan_stderr_write_offset(), 0 - 1)
+
+  bu32(code, cg_ldr(0, 31, 0))
+  bu32(code, cg_ldr(1, 31, 8))
+  bu32(code, encode_add_imm(2, 31, 40))
+  emit_mov_imm_safe(code, 3, 0)
+  bu32(code, cg_ldr(4, 31, 16))
+  bu32(code, cg_ldr(5, 31, 24))
+  cg_emit_platform_got_call(code, fm, 0) -- posix_spawn
+  bu32(code, cg_str(0, 31, 48))
+
+  let destroy = buf_len(code)
+  bu32(code, encode_add_imm(0, 31, 40))
+  cg_emit_platform_got_call(code, fm, 35) -- actions_destroy
+  let return_status = buf_len(code)
+  bu32(code, cg_ldr(0, 31, 48))
+  let done_pos = buf_len(code)
+  bu32(code, 0)
+
+  let inherit = buf_len(code)
+  bu32(code, cg_ldr(0, 31, 0))
+  bu32(code, cg_ldr(1, 31, 8))
+  emit_mov_imm_safe(code, 2, 0)
+  emit_mov_imm_safe(code, 3, 0)
+  bu32(code, cg_ldr(4, 31, 16))
+  bu32(code, cg_ldr(5, 31, 24))
+  cg_emit_platform_got_call(code, fm, 0)
+  bu32(code, cg_str(0, 31, 48))
+
+  let done = buf_len(code)
+  bu32(code, cg_ldr(0, 31, 48))
+  bu32(code, encode_add_imm(31, 31, 64))
+
+  cg_patch_cbz(code, inherit_pos, 15, inherit)
+  cg_patch_b_cond(code, init_failed_pos, 1, return_status)
+  cg_patch_b_cond(code, dup_stdout_failed, 1, destroy)
+  cg_patch_b_cond(code, dup_stderr_failed, 1, destroy)
+  cg_patch_b_cond(code, close_stdout_read_failed, 1, destroy)
+  cg_patch_b_cond(code, close_stderr_read_failed, 1, destroy)
+  cg_patch_b_cond(code, close_stdout_write_failed, 1, destroy)
+  cg_patch_b_cond(code, close_stderr_write_failed, 1, destroy)
+  cg_patch_b(code, done_pos, done)
+}
+
+fn cg_emit_linux_proc_dup_plan_fd(code: i64, plan_offset: i64, target_fd: i64) -> i64 {
+  bu32(code, cg_ldr(15, 31, 32))
+  bu32(code, cg_ldr(0, 15, plan_offset))
+  bu32(code, encode_cmp(0, 31))
+  let absent_pos = buf_len(code)
+  bu32(code, 0)
+  emit_mov_imm_safe(code, 16, target_fd)
+  bu32(code, encode_cmp(0, 16))
+  let identical_pos = buf_len(code)
+  bu32(code, 0)
+  emit_mov_imm_safe(code, 1, target_fd)
+  emit_mov_imm_safe(code, 2, 0)
+  cg_emit_linux_syscall(code, 24) -- dup3
+  bu32(code, encode_cmp(0, 31))
+  let failed_pos = buf_len(code)
+  bu32(code, 0)
+  let done = buf_len(code)
+  cg_patch_b_cond(code, absent_pos, 11, done)
+  cg_patch_b_cond(code, identical_pos, 0, done)
+  failed_pos
+}
+
+fn cg_emit_linux_proc_close_plan_fd(code: i64, plan_offset: i64) -> i64 {
+  bu32(code, cg_ldr(15, 31, 32))
+  bu32(code, cg_ldr(0, 15, plan_offset))
+  emit_mov_imm_safe(code, 16, 2)
+  bu32(code, encode_cmp(0, 16))
+  let standard_pos = buf_len(code)
+  bu32(code, 0)
+  cg_emit_linux_syscall(code, 57) -- close
+  let done = buf_len(code)
+  cg_patch_b_cond(code, standard_pos, 13, done)
+}
+
+fn cg_emit_platform_proc_spawn_linux(code: i64) -> i64 {
+  -- The clone child shares this frame until exec. It performs only async-safe
+  -- direct syscalls and reports any dup/exec errno through the CLOEXEC pipe.
+  bu32(code, encode_sub_imm(31, 31, 48))
+  bu32(code, cg_str(0, 31, 0))
+  bu32(code, cg_str(1, 31, 8))
+  bu32(code, cg_str(2, 31, 16))
+  bu32(code, cg_str(3, 31, 24))
+  bu32(code, cg_str(4, 31, 32))
+  emit_mov_imm_safe(code, 0, 17) -- SIGCHLD termination signal
+  emit_mov_imm_safe(code, 1, 0)
+  emit_mov_imm_safe(code, 2, 0)
+  emit_mov_imm_safe(code, 3, 0)
+  emit_mov_imm_safe(code, 4, 0)
+  cg_emit_linux_syscall(code, 220) -- clone
+  bu32(code, encode_cmp(0, 31))
+  let child_pos = buf_len(code)
+  bu32(code, 0)
+  let clone_failed_pos = buf_len(code)
+  bu32(code, 0)
+
+  bu32(code, cg_ldr(15, 31, 0))
+  bu32(code, cg_str(0, 15, 0))
+  emit_mov_imm_safe(code, 0, 0)
+  let parent_done_pos = buf_len(code)
+  bu32(code, 0)
+
+  let child = buf_len(code)
+  cg_emit_linux_proc_close_plan_fd(code, cg_proc_plan_exec_read_offset())
+  bu32(code, cg_ldr(15, 31, 32))
+  bu32(code, cg_ldr(15, 15, cg_proc_plan_capture_offset()))
+  let inherit_pos = buf_len(code)
+  bu32(code, 0)
+  let dup_stdout_failed = cg_emit_linux_proc_dup_plan_fd(code, cg_proc_plan_stdout_write_offset(), 1)
+  let dup_stderr_failed = cg_emit_linux_proc_dup_plan_fd(code, cg_proc_plan_stderr_write_offset(), 2)
+  cg_emit_linux_proc_close_plan_fd(code, cg_proc_plan_stdout_read_offset())
+  cg_emit_linux_proc_close_plan_fd(code, cg_proc_plan_stdout_write_offset())
+  cg_emit_linux_proc_close_plan_fd(code, cg_proc_plan_stderr_read_offset())
+  cg_emit_linux_proc_close_plan_fd(code, cg_proc_plan_stderr_write_offset())
+  let exec = buf_len(code)
+  bu32(code, cg_ldr(0, 31, 8))
+  bu32(code, cg_ldr(1, 31, 16))
+  bu32(code, cg_ldr(2, 31, 24))
+  cg_emit_linux_syscall(code, 221) -- execve; only failure returns
+
+  let child_failed = buf_len(code)
+  bu32(code, encode_sub_reg(14, 31, 0))
+  bu32(code, cg_ldr(15, 31, 32))
+  bu32(code, cg_str(14, 15, cg_proc_plan_error_offset()))
+  bu32(code, cg_ldr(0, 15, cg_proc_plan_exec_write_offset()))
+  bu32(code, encode_add_imm(1, 15, cg_proc_plan_error_offset()))
+  emit_mov_imm_safe(code, 2, 8)
+  cg_emit_linux_syscall(code, 64) -- write the exact positive errno
+  cg_emit_linux_exit_status(code, 127)
+
+  let clone_failed = buf_len(code)
+  bu32(code, encode_sub_reg(0, 31, 0))
+  let done = buf_len(code)
+  bu32(code, encode_add_imm(31, 31, 48))
+
+  cg_patch_b_cond(code, child_pos, 0, child)
+  cg_patch_b_cond(code, clone_failed_pos, 11, clone_failed)
+  cg_patch_b(code, parent_done_pos, done)
+  cg_patch_cbz(code, inherit_pos, 15, exec)
+  cg_patch_b_cond(code, dup_stdout_failed, 11, child_failed)
+  cg_patch_b_cond(code, dup_stderr_failed, 11, child_failed)
+}
+
+pub(package) fn cg_emit_platform_proc_spawn(code: i64, target: NativeLinkTarget, fm: i64) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> cg_emit_platform_proc_spawn_darwin(code, fm)
+    NativeLinkLinuxAarch64 -> cg_emit_platform_proc_spawn_linux(code)
+  }
+}
+
+fn cg_emit_platform_proc_wait(code: i64, target: NativeLinkTarget, options: i64) -> i64 {
+  emit_mov_imm_safe(code, 2, options)
+  emit_mov_imm_safe(code, 3, 0)
+  cg_emit_platform_syscall(code, target, 7, 260)
+}
+
+pub(package) fn cg_emit_platform_proc_wait_blocking(code: i64, target: NativeLinkTarget) -> i64 {
+  cg_emit_platform_proc_wait(code, target, 0)
+}
+
+pub(package) fn cg_emit_platform_proc_wait_nonblocking(code: i64, target: NativeLinkTarget) -> i64 {
+  cg_emit_platform_proc_wait(code, target, 1)
+}
+
+pub(package) fn cg_emit_platform_proc_kill(code: i64, target: NativeLinkTarget) -> i64 {
+  emit_mov_imm_safe(code, 1, 9) -- SIGKILL is target-stable
+  emit_mov_imm_safe(code, 2, 0) -- Darwin's private posix argument
+  cg_emit_platform_syscall(code, target, 37, 129)
+}
+
 pub(package) fn cg_emit_platform_close(code: i64, target: NativeLinkTarget) -> i64 {
   cg_emit_platform_syscall(code, target, 6, 57)
 }
