@@ -3307,6 +3307,46 @@ pkg_native_multi_exit=$?
 set -e
 assert_equals "package_native_archive_multiple_sections_link_and_run" "$pkg_native_multi_exit" "42"
 
+# A scaled load cannot encode a byte-misaligned PAGEOFF12 target. Resolution
+# reports that typed residual before the product writer can commit an artifact.
+mkdir -p "$tmp_pkg_trust_dir/native_artifacts/native/archive_relocations"
+printf '%s\n' \
+  '.text' \
+  '.globl _weft_bad_reloc' \
+  '_weft_bad_reloc:' \
+  '  adrp x0, _weft_bad_data@PAGE' \
+  '  ldr x0, [x0, _weft_bad_data@PAGEOFF]' \
+  '  ret' \
+  '.data' \
+  '.byte 0' \
+  '.globl _weft_bad_data' \
+  '_weft_bad_data:' \
+  '  .byte 42' \
+  > "$tmp_pkg_trust_dir/native_artifacts/misaligned_pageoff.s"
+/usr/bin/clang -c "$tmp_pkg_trust_dir/native_artifacts/misaligned_pageoff.s" -o "$tmp_pkg_trust_dir/native_artifacts/misaligned_pageoff.o"
+/usr/bin/ar rcs "$tmp_pkg_trust_dir/native_artifacts/native/archive_relocations/libweft_bad_reloc.a" \
+  "$tmp_pkg_trust_dir/native_artifacts/misaligned_pageoff.o"
+native_bad_reloc_digest_line=$(/usr/bin/shasum -a 256 "$tmp_pkg_trust_dir/native_artifacts/native/archive_relocations/libweft_bad_reloc.a")
+native_bad_reloc_digest=${native_bad_reloc_digest_line%% *}
+printf '%s\n' \
+  '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_bad_reloc","search":["native/archive_relocations"],"content":"sha256:'"$native_bad_reloc_digest"'","optional":false}],"symbols":[{"declaration":"native_bad_reloc","symbol":"weft_bad_reloc","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
+  > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
+printf '%s\n' 'fn main() -[Unsafe]> i64 { native_bad_reloc() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+set +e
+(cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_bad_reloc) \
+  > "$tmp_pkg_trust_dir/native_artifacts/native_bad_reloc.stdout" \
+  2> "$tmp_pkg_trust_dir/native_artifacts/native_bad_reloc.err"
+pkg_native_bad_reloc_exit=$?
+set -e
+assert_equals "package_native_archive_misaligned_relocation_fails" "$pkg_native_bad_reloc_exit" "1"
+assert_contains "package_native_archive_misaligned_relocation_is_structured" "$(<"$tmp_pkg_trust_dir/native_artifacts/native_bad_reloc.err")" "pageoff12 relocation target is not aligned for its instruction"
+if [ ! -e "$tmp_pkg_trust_dir/native_artifacts/native_bad_reloc" ]; then
+  echo "  ok package_native_archive_misaligned_relocation_commits_no_output"
+else
+  echo "  fail package_native_archive_misaligned_relocation_commits_no_output"
+  exit 1
+fi
+
 printf '%s\n' \
   'long weft_duplicate(void) { return 1; }' \
   'long weft_pick_a(void) { return weft_duplicate(); }' \
@@ -4108,4 +4148,4 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 1021 passed, 0 failed"
+echo "Tool boundary summary: 1024 passed, 0 failed"
