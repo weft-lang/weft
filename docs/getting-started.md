@@ -1,26 +1,46 @@
 # Getting started with Weft
 
-Weft is self-hosted and usable today on macOS with Apple Silicon. The checked-in
-`weft` binary is the compiler; it does not download a second compiler or route
-through C/LLVM. It can build macOS/AArch64 Mach-O or Linux/AArch64 ELF directly;
-Linux release packaging and its final complete-suite gate remain public-alpha
-work, while x86-64 is post-alpha.
+Weft is self-hosted on macOS/AArch64 and Linux/AArch64. The checked-in `weft`
+binary is the macOS compiler; it does not download a second compiler or route
+through C/LLVM. It emits Mach-O or ELF directly, and the Linux product and
+compiler are static kernel-ABI executables. x86-64 is post-alpha.
 
-This guide describes the repository toolchain as it exists now. In particular,
-`weft build` is the native final-product path, including cross-target selection
-and artifact facts. The higher-level `weft run`, installed-SDK discovery and
-release workflow have not landed yet; that boundary is called out rather than
-hidden behind commands that do not exist.
+This guide describes both the repository toolchain and the extracted SDK shape
+as they exist now. `weft build` is the native final-product path, including
+cross-target selection and artifact facts. Installed-SDK discovery and
+deterministic target archives are implemented. The higher-level `weft run`,
+remote locked-source cache, and public signing/notarization channel have not
+landed yet.
 
-## Install the repository toolchain
+## Install a local SDK archive
 
-Clone the repository on an Apple-Silicon Mac, then verify the trust root:
+From a checkout, build and verify the target-specific archive:
+
+```bash
+mkdir -p dist
+tools/build_release_bundle.sh macos-aarch64 dist
+(cd dist && shasum -a 256 -c weft-0.1.0-macos-aarch64.tar.sha256)
+tar -xf dist/weft-0.1.0-macos-aarch64.tar
+export PATH="$PWD/weft-0.1.0-macos-aarch64/bin:$PATH"
+weft --version
+```
+
+For Linux/AArch64, select `linux-aarch64` and verify with `sha256sum -c`.
+Preserve the extracted layout: `bin/weft` locates canonical `stdlib/` and
+`runtime/` modules under the adjacent `lib/weft/` SDK. Installation is moving
+that directory to a user-owned location and putting its `bin/` on `PATH`;
+uninstallation removes that directory and its PATH entry. No unrelated files
+are mutated.
+
+The repository trust root remains a valid contributor setup. On an
+Apple-Silicon Mac, clone the repository and verify it directly:
 
 ```bash
 git clone <repository-url> weft
 cd weft
 chmod +x weft
 ./weft check examples/fibonacci.weft
+export PATH="$PWD:$PATH"
 ```
 
 Repository development additionally uses `just`; platform linkers compile test
@@ -40,8 +60,8 @@ fn main() -> i64 {
 Check it, compile it, and run it:
 
 ```bash
-./weft check hello.weft
-./weft compile hello.weft > hello
+weft check hello.weft
+weft compile hello.weft > hello
 chmod +x hello
 ./hello
 ```
@@ -53,8 +73,8 @@ For a named final product, use the Weft-owned native linker. The same command
 can cross-build standalone Linux/AArch64 ELF from the checked-in macOS compiler:
 
 ```bash
-./weft build hello.weft -o hello --artifact-facts hello.facts.json
-./weft build hello.weft -o hello-linux --target linux-aarch64 \
+weft build hello.weft -o hello --artifact-facts hello.facts.json
+weft build hello.weft -o hello-linux --target linux-aarch64 \
   --artifact-facts hello-linux.facts.json
 ```
 
@@ -66,10 +86,10 @@ deployment dependencies and are reported as non-standalone in the facts file.
 Inspect the installed compiler's compatibility and target facts directly:
 
 ```bash
-./weft --version
-./weft version --json
-./weft target list
-./weft target show linux-aarch64
+weft --version
+weft version --json
+weft target list
+weft target show linux-aarch64
 ```
 
 The version report includes the compiler and language versions plus the
@@ -96,8 +116,8 @@ test "integer division truncates" {
 Run one file or recursively discover every `.weft` test below a directory:
 
 ```bash
-./weft test test/arithmetic.weft
-./weft test test
+weft test test/arithmetic.weft
+weft test test
 ```
 
 Multiple paths and globs are accepted, duplicate discoveries are removed, and
@@ -146,9 +166,9 @@ text; both preserve a typed failure with the invalid byte offset.
 
 ## Local path packages
 
-Package identity is content-locked and module imports are qualified. Put the
-repository directory on `PATH` (`export PATH=/path/to/weft:$PATH`), then start
-in an empty project directory. The current CLI manages local/path dependencies:
+Package identity is content-locked and module imports are qualified. With an
+extracted SDK's `bin/` (or the repository root) on `PATH`, start in an empty
+project directory. The current CLI manages local/path dependencies:
 
 ```bash project
 mkdir -p deps/math
@@ -195,22 +215,23 @@ its content identity, and the next consuming command rejects the stale lock.
 A hosted registry and full semver solver are not part of the first alpha;
 local locked source dependencies are.
 
-The native test workflow earlier in this guide is checked from the repository
-toolchain root. Making its bundled stdlib/runtime resources discoverable from
-an arbitrary project directory belongs to the not-yet-landed installed project
-workflow; this guide does not disguise that gap by copying compiler sources
-into the project.
+An installed compiler resolves canonical `stdlib/` and `runtime/` imports from
+its own adjacent SDK while project and dependency imports continue through the
+project graph. `test/run_release_bundle.sh` verifies the commands above from an
+actual extracted archive, in a clean temporary project, with only the bundle's
+`bin/` on the compiler PATH. It performs the same exercise in a network-disabled
+Linux/AArch64 container.
 
 ## Diagnostics, formatting, and API docs
 
 Useful feedback commands are:
 
 ```bash
-./weft check app.weft
-./weft explain E1002
-./weft fmt --check .
-./weft fmt --write app.weft
-./weft doc stdlib/result.weft
+weft check app.weft
+weft explain E1002
+weft fmt --check .
+weft fmt --write app.weft
+weft doc deps/math/lib.weft
 ```
 
 Diagnostics have stable append-only codes, source provenance, related
@@ -221,9 +242,10 @@ documented/public API census; it never reconstructs signatures from text.
 ## Where the alpha deliberately stops
 
 Before the public-alpha cut, the workboard still requires the complete
-target-local Linux suite on an adequately sized runner, safe TLS/HTTP, the
-installed project/release workflow, and release hardening. x86-64, a hosted
-package registry, HTTP/2+ and a forever-stable native ABI are explicitly later.
+target-local Linux release matrix on CI, safe TLS/HTTP, remote locked-source
+cache/update behavior, normal `run`/target output UX, the final example-product
+exercise, and release signing/hardening. x86-64, a hosted package registry,
+HTTP/2+ and a forever-stable native ABI are explicitly later.
 The authoritative live status is the repository README and, for contributors,
 `internal/briefs/INDEX.md`.
 

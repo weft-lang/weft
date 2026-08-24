@@ -53,10 +53,10 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 **Self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root.
 
-- 4099 runtime test blocks across 334 files, plus 803 negative (must-fail) cases
+- 4100 runtime test blocks across 334 files, plus 803 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
-- Current work: the public-alpha product gate—fast project feedback, complete docs/tooling, safe networking, the Linux/aarch64 platform row, and build/release UX
+- Current work: the public-alpha product gate—fast project feedback, complete docs/tooling, safe networking, remote dependency workflow, and release/install UX
 
 ## Quick Start
 
@@ -110,6 +110,25 @@ native-binding ABI, artifact-facts schema, and supported-target identities as
 machine-readable data. These values come from the compatibility facts used by
 the manifest/lock validators and artifact-facts emitter; the banner is not a
 separately maintained version string.
+
+Target-specific SDK archives are built without a host linker and include the
+compiler, its `stdlib/` and `runtime/` sources, compatibility facts, provenance,
+licenses, and a checksum:
+
+```bash
+tools/build_release_bundle.sh macos-aarch64 dist
+(cd dist && shasum -a 256 -c weft-0.1.0-macos-aarch64.tar.sha256)
+tar -xf dist/weft-0.1.0-macos-aarch64.tar
+export PATH="$PWD/weft-0.1.0-macos-aarch64/bin:$PATH"
+weft --version
+```
+
+Use `linux-aarch64` and `sha256sum -c` on Linux. Keep the extracted `bin/` and
+`lib/weft/` tree together: the compiler discovers its SDK relative to its own
+executable, with no checkout path or environment override. Removing that one
+directory uninstalls it. The archive bytes and clean extracted project flow are
+tested on both targets; signing/notarization of the eventual macOS download
+channel remains a public-alpha release step.
 
 ## The Ideas
 
