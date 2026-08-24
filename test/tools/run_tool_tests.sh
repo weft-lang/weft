@@ -53,6 +53,7 @@ tmp_tree_sitter_generator=$(mktemp /tmp/weft_tool_tree_sitter_generator_XXXXXX)
 tmp_elf_generator=$(mktemp /tmp/weft_tool_elf_generator_XXXXXX)
 tmp_elf_product=$(mktemp /tmp/weft_tool_elf_product_XXXXXX)
 tmp_elf_product_second=$(mktemp /tmp/weft_tool_elf_product_second_XXXXXX)
+tmp_elf_archive_dir=$(mktemp -d /tmp/weft_tool_elf_archive_XXXXXX)
 tmp_native_debug_dir=$(mktemp -d /tmp/weft_tool_native_debug_XXXXXX)
 chmod 755 "$tmp_native_debug_dir"
 tmp_native_debug_bin="$tmp_native_debug_dir/native_forward"
@@ -60,7 +61,7 @@ tmp_native_debug_lldb=$(mktemp /tmp/weft_tool_native_debug_lldb_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product_second" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product_second" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir" "$tmp_elf_archive_dir"' EXIT
 
 now_s() {
   date +%s
@@ -719,6 +720,38 @@ assert_not_contains "elf_linux_debug_has_no_dynamic_segment" "$elf_linux_debug_h
 assert_contains "elf_linux_debug_dwarf_verifies" "$elf_linux_debug_verify" "No errors."
 assert_contains "elf_linux_debug_names_main" "$elf_linux_debug_main" $'DW_AT_name\t("main")'
 assert_contains "elf_linux_debug_maps_main_line" "$elf_linux_debug_main" $'DW_AT_decl_line\t(2)'
+
+# A real AArch64 ELF relocatable member travels through archive framing, typed
+# object parsing, symbol closure, shared graph layout, and Linux finalization.
+# The fixture needs no headers or sysroot and deliberately contains code only;
+# the semantic tests reject allocatable data until that typed slice lands.
+printf '%s\n' \
+  'long weft_linux_archive_value(void) { return 42; }' \
+  > "$tmp_elf_archive_dir/fixture.c"
+/usr/bin/clang \
+  --target=aarch64-linux-gnu \
+  -fno-asynchronous-unwind-tables \
+  -fno-unwind-tables \
+  -c "$tmp_elf_archive_dir/fixture.c" \
+  -o "$tmp_elf_archive_dir/fixture.o"
+/usr/bin/ar rcs "$tmp_elf_archive_dir/libfixture.a" "$tmp_elf_archive_dir/fixture.o" 2> "$tmp_err"
+assert_contains "elf_linux_archive_fixture_is_aarch64_relocatable" "$(/usr/bin/file -b "$tmp_elf_archive_dir/fixture.o")" "ELF 64-bit LSB relocatable, ARM aarch64"
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_archive_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_archive_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_generator_guarded "$tmp_elf_generator" < "$tmp_elf_archive_dir/libfixture.a" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_archive_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_generator_guarded "$tmp_elf_generator" < "$tmp_elf_archive_dir/libfixture.a" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_archive_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+elf_linux_archive_file=$(/usr/bin/file -b "$tmp_elf_product")
+elf_linux_archive_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_archive_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+assert_contains "elf_linux_archive_product_is_static" "$elf_linux_archive_file" "statically linked"
+assert_not_contains "elf_linux_archive_has_no_interpreter" "$elf_linux_archive_headers" "INTERP off"
+assert_not_contains "elf_linux_archive_has_no_dynamic_segment" "$elf_linux_archive_headers" "DYNAMIC off"
+assert_contains "elf_linux_archive_root_branches_to_member" "$elf_linux_archive_disassembly" $'bl\t0x40100c'
+assert_contains "elf_linux_archive_member_returns_value" "$elf_linux_archive_disassembly" $'mov\tx0, #0x2a'
+assert_contains "elf_linux_archive_root_preserves_exit_value" "$elf_linux_archive_disassembly" $'mov\tx8, #0x5d'
 
 # Fatal reporting is the first target-neutral runtime capability: its semantic
 # write/exit operations lower independently of arbitrary raw syscall numbers.
