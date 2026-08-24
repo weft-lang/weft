@@ -43,6 +43,7 @@ tmp_fmt_dir=$(mktemp -d /tmp/weft_tool_fmt_dir_XXXXXX)
 tmp_pkg_dir=$(mktemp -d /tmp/weft_tool_pkg_XXXXXX)
 tmp_pkg_cli_dir=$(mktemp -d /tmp/weft_tool_pkg_cli_XXXXXX)
 tmp_pkg_lock_dir=$(mktemp -d /tmp/weft_tool_pkg_lock_XXXXXX)
+tmp_pkg_remote_dir=$(mktemp -d /tmp/weft_tool_pkg_remote_XXXXXX)
 tmp_pkg_trust_dir=$(mktemp -d /tmp/weft_tool_pkg_trust_XXXXXX)
 tmp_pkg_missing_dir=$(mktemp -d /tmp/weft_tool_pkg_missing_XXXXXX)
 tmp_project_target_dir=$(mktemp -d /tmp/weft_tool_project_target_XXXXXX)
@@ -62,7 +63,7 @@ tmp_native_debug_lldb=$(mktemp /tmp/weft_tool_native_debug_lldb_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product.facts.json" "$tmp_elf_product_second" "$tmp_elf_product_second.facts.json" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_project_target_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir" "$tmp_elf_archive_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product.facts.json" "$tmp_elf_product_second" "$tmp_elf_product_second.facts.json" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_remote_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_project_target_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir" "$tmp_elf_archive_dir"' EXIT
 
 now_s() {
   date +%s
@@ -3528,6 +3529,59 @@ else
   echo "  ok pkg_exports_rejects_non_utf8_manifest"
 fi
 assert_equals "pkg_non_utf8_manifest_is_preserved" "$(od -An -tu1 "$tmp_pkg_missing_dir/weft.pkg" | tr -d ' ')" "255"
+
+mkdir -p "$tmp_pkg_remote_dir/dependency" "$tmp_pkg_remote_dir/provider" "$tmp_pkg_remote_dir/app"
+printf '{"package":"remote","manifest_version":1,"version":"1.2.3","weft":"0.1","dependencies":{},"source_roots":["."],"targets":{"remote":{"kind":"library","source":"lib.weft"}}}\n' > "$tmp_pkg_remote_dir/dependency/weft.pkg"
+printf 'pub fn remote_value() -> i64 { 9 }\n' > "$tmp_pkg_remote_dir/dependency/lib.weft"
+(
+  cd "$tmp_pkg_remote_dir/dependency"
+  git init -q
+  git add weft.pkg lib.weft
+  git -c user.name=Weft -c user.email=weft@example.invalid commit -qm fixture
+  git archive --format=tar --output="$tmp_pkg_remote_dir/source.tar" HEAD
+)
+remote_transport=$(shasum -a 256 "$tmp_pkg_remote_dir/source.tar" | awk '{print $1}')
+printf '#!/bin/sh\noutput=""\nwhile [ "$#" -gt 0 ]; do\n  if [ "$1" = "--output" ]; then output="$2"; shift 2; else shift; fi\ndone\ncp "$WEFT_FAKE_ARCHIVE" "$output"\n' > "$tmp_pkg_remote_dir/provider/curl"
+chmod +x "$tmp_pkg_remote_dir/provider/curl"
+printf 'use remote/lib.{remote_value}\nfn main() -> i64 { remote_value() }\n' > "$tmp_pkg_remote_dir/app/app.weft"
+(cd "$tmp_pkg_remote_dir/app" && "$WEFT_ABS" pkg init app >/dev/null)
+pkg_remote_add=$(cd "$tmp_pkg_remote_dir/app" && "$WEFT_ABS" pkg add remote --archive https://packages.example.invalid/remote.tar --sha256 "sha256:$remote_transport" 2>&1)
+assert_contains "pkg_remote_add_records_typed_source" "$pkg_remote_add" "pkg: added dependency"
+assert_contains "pkg_remote_add_manifest_pins_transport" "$(< "$tmp_pkg_remote_dir/app/weft.pkg")" '"archive":"https://packages.example.invalid/remote.tar"'
+pkg_remote_lock=$(cd "$tmp_pkg_remote_dir/app" && PATH="$tmp_pkg_remote_dir/provider:$PATH" WEFT_FAKE_ARCHIVE="$tmp_pkg_remote_dir/source.tar" "$WEFT_ABS" pkg lock 2>&1)
+assert_contains "pkg_remote_lock_acquires_and_writes" "$pkg_remote_lock" "pkg: wrote weft.lock"
+remote_content=$(pkg_lock_digest "$(< "$tmp_pkg_remote_dir/app/weft.lock")" remote)
+remote_cache="$tmp_pkg_remote_dir/app/.weft/cache/sha256/${remote_content#sha256:}"
+assert_equals "pkg_remote_cache_uses_content_address" "$(< "$remote_cache/lib.weft")" "pub fn remote_value() -> i64 { 9 }"
+pkg_remote_offline=$(cd "$tmp_pkg_remote_dir/app" && PATH=/usr/bin:/bin "$WEFT_ABS" pkg fetch --offline 2>&1)
+assert_contains "pkg_remote_offline_verifies_without_provider" "$pkg_remote_offline" "pkg: immutable package cache verified"
+pkg_remote_check=$(cd "$tmp_pkg_remote_dir/app" && "$WEFT_ABS" check app.weft 2>&1)
+assert_contains "pkg_remote_cached_source_compiles" "$pkg_remote_check" "check: 2 functions, 0 errors"
+cp "$tmp_pkg_remote_dir/app/weft.lock" "$tmp_pkg_remote_dir/app/weft.lock.good"
+printf '{"lock_version":2}\n' > "$tmp_pkg_remote_dir/app/weft.lock"
+pkg_remote_malformed=$(cd "$tmp_pkg_remote_dir/app" && "$WEFT_ABS" check app.weft 2>&1 || true)
+assert_contains "pkg_remote_malformed_lock_fails_cache_preflight" "$pkg_remote_malformed" "error[E5005]: package lock is malformed or unsupported"
+mv "$tmp_pkg_remote_dir/app/weft.lock.good" "$tmp_pkg_remote_dir/app/weft.lock"
+printf 'pub fn remote_value() -> i64 { 10 }\n' > "$remote_cache/lib.weft"
+pkg_remote_corrupt=$(cd "$tmp_pkg_remote_dir/app" && "$WEFT_ABS" check app.weft 2>&1 || true)
+assert_contains "pkg_remote_cache_drift_is_structured" "$pkg_remote_corrupt" "error[E5012]:"
+pkg_remote_heal=$(cd "$tmp_pkg_remote_dir/app" && PATH="$tmp_pkg_remote_dir/provider:$PATH" WEFT_FAKE_ARCHIVE="$tmp_pkg_remote_dir/source.tar" "$WEFT_ABS" pkg fetch 2>&1)
+assert_contains "pkg_remote_fetch_repairs_corruption" "$pkg_remote_heal" "pkg: immutable package cache verified"
+mv "$remote_cache" "$remote_cache.saved"
+pkg_remote_missing=$(cd "$tmp_pkg_remote_dir/app" && "$WEFT_ABS" pkg fetch --offline 2>&1 || true)
+assert_contains "pkg_remote_offline_miss_is_structured" "$pkg_remote_missing" "error[E5011]:"
+mv "$remote_cache.saved" "$remote_cache"
+wrong_transport=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+pkg_remote_bad_update=$(cd "$tmp_pkg_remote_dir/app" && PATH="$tmp_pkg_remote_dir/provider:$PATH" WEFT_FAKE_ARCHIVE="$tmp_pkg_remote_dir/source.tar" "$WEFT_ABS" pkg update remote --sha256 "sha256:$wrong_transport" 2>&1 || true)
+assert_contains "pkg_remote_update_rejects_transport_drift" "$pkg_remote_bad_update" "error[E5013]: package source was rejected: archive bytes do not match the declared SHA-256"
+(cd "$tmp_pkg_remote_dir/app" && PATH="$tmp_pkg_remote_dir/provider:$PATH" WEFT_FAKE_ARCHIVE="$tmp_pkg_remote_dir/source.tar" "$WEFT_ABS" pkg update remote --sha256 "sha256:$remote_transport" >/dev/null)
+assert_equals "pkg_remote_update_restores_offline_graph" "$(cd "$tmp_pkg_remote_dir/app" && "$WEFT_ABS" pkg fetch --offline >/dev/null; echo $?)" "0"
+if find "$tmp_pkg_remote_dir/app/.weft/staging" -mindepth 1 -print -quit | grep -q .; then
+  echo "  fail pkg_remote_staging_cleanup"
+  exit 1
+else
+  echo "  ok pkg_remote_staging_cleanup"
+fi
 
 mkdir -p "$tmp_pkg_lock_dir/deps/lib/deps/base" "$tmp_pkg_lock_dir/.weft/cache"
 printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"lib":"deps/lib"}}\n' > "$tmp_pkg_lock_dir/weft.pkg"

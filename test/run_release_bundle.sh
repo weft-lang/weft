@@ -23,7 +23,7 @@ project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 linux_image=${WEFT_LINUX_IMAGE:-debian:bookworm-slim}
 work=$(mktemp -d "${TMPDIR:-/tmp}/weft-release-gate.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
-mkdir -p "$work/one" "$work/two" "$work/extracted" "$work/project/deps/math" "$work/project/test"
+mkdir -p "$work/one" "$work/two" "$work/extracted" "$work/project/deps/math" "$work/project/provider" "$work/project/test"
 
 archive_one=$($project_root/tools/build_release_bundle.sh "$target" "$work/one")
 archive_two=$($project_root/tools/build_release_bundle.sh "$target" "$work/two")
@@ -112,6 +112,25 @@ run_weft_in() {
   fi
 }
 
+run_weft_with_provider_in() {
+  local relative=$1
+  shift
+  if [ "$target" = macos-aarch64 ]; then
+    (cd "$work/project/$relative" && env \
+      PATH="$work/project/provider:$bundle_root/bin:/usr/bin:/bin" \
+      WEFT_FAKE_ARCHIVE="$work/project/math.tar" \
+      weft "$@")
+  else
+    docker run --rm --network none \
+      -v "$bundle_root:/release:ro" \
+      -v "$work/project:/work" \
+      -w "/work/$relative" \
+      -e WEFT_FAKE_ARCHIVE=/work/math.tar \
+      "$linux_image" \
+      /bin/sh -c 'PATH=/work/provider:/release/bin:/usr/bin:/bin exec weft "$@"' sh "$@"
+  fi
+}
+
 run_product() {
   if [ "$target" = macos-aarch64 ]; then
     "$work/project/app.one"
@@ -126,7 +145,8 @@ run_product() {
 
 run_weft_in deps/math pkg init math >/dev/null
 run_weft_in . pkg init app >/dev/null
-run_weft_in . pkg add math deps/math >/dev/null
+
+printf '%s\n' '{"package":"math","manifest_version":1,"version":"0.1.0","weft":"0.1","source_roots":["."],"targets":{"math":{"kind":"library","source":"lib.weft"}},"dependencies":{}}' > "$work/project/deps/math/weft.pkg"
 
 printf '%s\n' \
   '--- Add two integers.' \
@@ -134,10 +154,28 @@ printf '%s\n' \
   '  left + right' \
   '}' > "$work/project/deps/math/lib.weft"
 
+(
+  cd "$work/project/deps/math"
+  git init -q
+  git add weft.pkg lib.weft
+  git -c user.name=Weft -c user.email=weft@example.invalid commit -qm fixture
+  git archive --format=tar --output="$work/project/math.tar" HEAD
+)
+math_transport=$(sha256_file "$work/project/math.tar")
+printf '%s\n' \
+  '#!/bin/sh' \
+  'output=""' \
+  'while [ "$#" -gt 0 ]; do' \
+  '  if [ "$1" = "--output" ]; then output="$2"; shift 2; else shift; fi' \
+  'done' \
+  'cp "$WEFT_FAKE_ARCHIVE" "$output"' > "$work/project/provider/curl"
+chmod +x "$work/project/provider/curl"
+run_weft_in . pkg add math --archive https://packages.example.invalid/math.tar --sha256 "sha256:$math_transport" >/dev/null
+
 printf '%s\n' \
   'use math/lib.{add}' \
   '' \
-  'fn answer() -> i64 {' \
+  'pub fn answer() -> i64 {' \
   '  add(20, 22)' \
   '}' \
   '' \
@@ -154,11 +192,13 @@ printf '%s\n' \
 
 run_weft_in . fmt --write .
 run_weft_in . fmt --check .
-run_weft_in . pkg lock >/dev/null
+run_weft_with_provider_in . pkg lock >/dev/null
+rm -rf "$work/project/deps" "$work/project/provider" "$work/project/math.tar"
+run_weft_in . pkg fetch --offline >/dev/null
 run_weft_in . check app.weft
 run_weft_in . test --jobs 2 test
-run_weft_in . doc deps/math/lib.weft > "$work/project/api.md"
-grep -q 'pub fn add(left: i64, right: i64) -> i64' "$work/project/api.md"
+run_weft_in . doc app.weft > "$work/project/api.md"
+grep -q 'pub fn answer() -> i64' "$work/project/api.md"
 build_output=$(run_weft_in . build)
 if [ "$build_output" != "target/$target/app" ]; then
   echo "release gate: normal build reported an unexpected artifact path" >&2
@@ -186,4 +226,4 @@ if LC_ALL=C grep -aF "$project_root" "$work/project/app.one" "$work/project/app.
   exit 1
 fi
 
-echo "release bundle gate: pass ($target, deterministic archive, extracted SDK, clean package workflow)"
+echo "release bundle gate: pass ($target, deterministic archive, extracted SDK, locked remote/offline workflow)"

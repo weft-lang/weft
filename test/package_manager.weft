@@ -1,21 +1,23 @@
 use compiler/package.{*}
-use compiler/lib.{nlist_get, nlist_len}
+use compiler/lib.{nlist_add, nlist_get, nlist_len}
 use compiler/package_lock.{*}
 use compiler/package_lock_data.{*}
+use compiler/package_source.{*}
 use compiler/product_identity.{WeftProductIdentity, weft_product_identity, weft_product_identity_json_render}
 use compiler/native_target.{NativeLinkTargetParsed, NativeLinkTargetUnsupported, native_link_supported_targets, native_link_target_name, native_link_target_parse}
 use compiler/type_registry.{ttable_get_root_manifest, ttable_native_binding_source_binding, ttable_native_binding_source_count, ttable_native_binding_source_package, ttable_native_binding_source_source, ttable_native_binding_source_target, ttable_native_compilation_target, ttable_new, ttable_set_native_compilation_target, ttable_set_root_manifest}
 use runtime/buffer.{*}
 use runtime/string.{runtime_str_from_bytes_copy}
 use runtime/syscall.{sys_native_host_target}
-use stdlib/bytes.{Bytes, bytes_from_str}
-use stdlib/dir.{DirDirectory, DirFile, DirInspect, DirMetadata}
+use stdlib/bytes.{Bytes, bytes_from_str, bytes_from_vector, bytes_to_vector}
+use stdlib/dir.{DirDirectory, DirFile, DirInspect, DirMetadata, DirOther}
 use stdlib/file.{FileRead}
 use stdlib/io_types.{IoError, IoNotFound}
-use stdlib/list.{list_first_or, list_len, list_nil}
+use stdlib/list.{List, list_first_or, list_len, list_nil, list_nth}
+use stdlib/option.{None, Some}
 use stdlib/path.{Path, path_from_utf8, path_from_vector, path_to_utf8}
 use stdlib/result.{Err, Ok, result_err, result_ok}
-use stdlib/string.{str_eq}
+use stdlib/string.{str_byte_at, str_ends_with, str_eq}
 use stdlib/vector.{*}
 
 fn pkg_test_path(text: str) -> Path {
@@ -210,6 +212,32 @@ test "pkg_manifest_dependency_sources_reject_ambiguous_and_unpinned_inputs" {
   Test.assert_eq(if pkg_manifest_error_count(weak_archive) > 0 { 1 } else { 0 }, 1)
   Test.assert_eq(if pkg_manifest_error_count(mixed) > 0 { 1 } else { 0 }, 1)
   Test.assert_eq(if pkg_manifest_error_count(extra) > 0 { 1 } else { 0 }, 1)
+}
+
+test "pkg_manifest_remote_pin_updates_preserve_the_typed_source" {
+  let first = "0123456789abcdef0123456789abcdef01234567"
+  let second = "89abcdef0123456789abcdef0123456789abcdef"
+  let m = pkg_manifest_parse_str("{\"package\":\"app\",\"dependencies\":{\"dep\":{\"git\":\"https://example.test/dep.git\",\"revision\":\"0123456789abcdef0123456789abcdef01234567\"}}}")
+  Test.assert_eq(pkg_manifest_replace_dep_source_from_parts(m, __str_ptr("dep"), __str_len("dep"), PackageGitSource("https://example.test/dep.git", second)), 0)
+  match pkg_dep_fact(pkg_manifest_find_dep(m, __str_ptr("dep"), __str_len("dep"))) {
+    PackageDependency(name, PackageGitSource(url, revision)) -> {
+      Test.assert_str_eq(name, "dep")
+      Test.assert_str_eq(url, "https://example.test/dep.git")
+      Test.assert_str_eq(revision, second)
+      Test.assert_eq(str_eq(revision, first), 0)
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+  Test.assert_eq(pkg_manifest_replace_dep_source_from_parts(m, __str_ptr("dep"), __str_len("dep"), PackageGitSource("https://example.test/dep.git", "main")), 1)
+}
+
+test "pkg_manifest_remote_dependency_fact_distinguishes_path_sources" {
+  let path_only = pkg_manifest_parse_str("{\"package\":\"app\",\"dependencies\":{\"local\":{\"path\":\"deps/local\"}}}")
+  let git = pkg_manifest_parse_str("{\"package\":\"app\",\"dependencies\":{\"remote\":{\"git\":\"https://example.test/remote.git\",\"revision\":\"0123456789abcdef0123456789abcdef01234567\"}}}")
+  let archive = pkg_manifest_parse_str("{\"package\":\"app\",\"dependencies\":{\"remote\":{\"archive\":\"https://example.test/remote.tar\",\"sha256\":\"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}}}")
+  Test.assert_false(pkg_manifest_has_remote_dependencies(path_only))
+  Test.assert_true(pkg_manifest_has_remote_dependencies(git))
+  Test.assert_true(pkg_manifest_has_remote_dependencies(archive))
 }
 
 test "pkg_manifest_json_happy_versioned_schema" {
@@ -475,6 +503,8 @@ test "pkg_resolve_carries_dependency_owner_and_relative_module_identity" {
   Test.assert_eq(pkg_resolve_package(r) > 0, true)
   Test.assert_eq(pkg_resolve_package(r), pkg_resolve_package(second))
   Test.assert_eq(pkg_bytes_eq_at(pkg_resolve_logical_ptr(r), 0, pkg_resolve_logical_len(r), __str_ptr("nested/lib.weft"), 0, __str_len("nested/lib.weft")), 1)
+  let identity = pkg_identity_find_id(tt, pkg_resolve_package(r))
+  Test.assert_eq(pkg_bytes_eq_at(pkg_identity_root_ptr(identity), 0, pkg_identity_root_len(identity), __str_ptr("deps/math"), 0, __str_len("deps/math")), 1)
 }
 
 test "pkg_resolve_keeps_local_import_in_owner_package" {
@@ -618,6 +648,241 @@ test "pkg_content_digest_frames_path_and_content_boundaries" {
   let right = vector_new<PackageContentEntry>()
   vector_push<PackageContentEntry>(right, pkg_content_entry("a", "bc"))
   Test.assert_eq(str_eq(pkg_content_digest(left), pkg_content_digest(right)), 0)
+}
+
+fn pkg_test_u8(value: i64) -> u8 { __u64_to_u8(__i64_to_u64(value)) }
+
+fn pkg_test_tar_write_text(values: Vector<u8>, start: i64, text: str) -> i64 {
+  for index in 0..__str_len(text) {
+    vector_set<u8>(values, start + index, pkg_test_u8(str_byte_at(text, index)))
+  }
+  __str_len(text)
+}
+
+fn pkg_test_tar_write_octal(values: Vector<u8>, start: i64, width: i64, value: i64) -> i64 {
+  for index in 0..width { vector_set<u8>(values, start + index, pkg_test_u8(0)) }
+  let mut remaining = value
+  let mut index = width - 2
+  while index >= 0 {
+    let digit = remaining - remaining / 8 * 8
+    vector_set<u8>(values, start + index, pkg_test_u8(48 + digit))
+    remaining = remaining / 8
+    index = index - 1
+  }
+  value
+}
+
+fn pkg_test_tar_archive(path: str, kind: i64, content: str) -> Bytes {
+  let values = vector_new<u8>()
+  for index in 0..2048 { vector_push<u8>(values, pkg_test_u8(0)) }
+  pkg_test_tar_write_text(values, 0, path)
+  pkg_test_tar_write_octal(values, 124, 12, __str_len(content))
+  vector_set<u8>(values, 156, pkg_test_u8(kind))
+  pkg_test_tar_write_text(values, 257, "ustar")
+  vector_set<u8>(values, 262, pkg_test_u8(0))
+  vector_set<u8>(values, 263, pkg_test_u8(48))
+  vector_set<u8>(values, 264, pkg_test_u8(48))
+  for index in 148..156 { vector_set<u8>(values, index, pkg_test_u8(32)) }
+  let mut checksum = 0
+  for index in 0..512 { checksum = checksum + __u64_to_i64(__u8_to_u64(vector_get_in_bounds<u8>(values, index))) }
+  let mut remaining = checksum
+  let mut checksum_index = 153
+  while checksum_index >= 148 {
+    let digit = remaining - remaining / 8 * 8
+    vector_set<u8>(values, checksum_index, pkg_test_u8(48 + digit))
+    remaining = remaining / 8
+    checksum_index = checksum_index - 1
+  }
+  vector_set<u8>(values, 154, pkg_test_u8(0))
+  vector_set<u8>(values, 155, pkg_test_u8(32))
+  for index in 0..__str_len(content) {
+    vector_set<u8>(values, 512 + index, pkg_test_u8(str_byte_at(content, index)))
+  }
+  bytes_from_vector(values)
+}
+
+fn pkg_test_list_value(values: List<str>, index: i64) -> str {
+  match list_nth<str>(values, index) {
+    Some(value) -> value
+    None -> ""
+  }
+}
+
+test "pkg_archive_parser_accepts_a_strict_ustar_file" {
+  match package_archive_parse(pkg_test_tar_archive("src/main.weft", 48, "fn value() -> i64 { 7 }\n")) {
+    PackageArchiveInvalid(message) -> Test.assert_eq(0, 1)
+    PackageArchiveParsed(entries) -> {
+      Test.assert_eq(vector_len<PackageArchiveEntry>(entries), 1)
+      match vector_get_in_bounds<PackageArchiveEntry>(entries, 0) {
+        PackageArchiveDirectory(path) -> Test.assert_eq(0, 1)
+        PackageArchiveFile(path, content) -> {
+          Test.assert_str_eq(path, "src/main.weft")
+          Test.assert_eq(vector_len<u8>(bytes_to_vector(content)), __str_len("fn value() -> i64 { 7 }\n"))
+        }
+      }
+    }
+  }
+}
+
+test "pkg_archive_parser_rejects_traversal_links_and_header_drift" {
+  let traversal = package_archive_parse(pkg_test_tar_archive("../outside.weft", 48, "bad"))
+  let link = package_archive_parse(pkg_test_tar_archive("alias.weft", 50, "target"))
+  let corrupt_bytes = bytes_to_vector(pkg_test_tar_archive("main.weft", 48, "ok"))
+  vector_set<u8>(corrupt_bytes, 0, pkg_test_u8(88))
+  let corrupt = package_archive_parse(bytes_from_vector(corrupt_bytes))
+  match traversal { PackageArchiveInvalid(message) -> Test.assert_eq(1, 1) _ -> Test.assert_eq(0, 1) }
+  match link { PackageArchiveInvalid(message) -> Test.assert_eq(1, 1) _ -> Test.assert_eq(0, 1) }
+  match corrupt { PackageArchiveInvalid(message) -> Test.assert_eq(1, 1) _ -> Test.assert_eq(0, 1) }
+}
+
+test "pkg_archive_paths_and_transport_digest_fail_closed" {
+  Test.assert_eq(package_archive_path_safe("src/main.weft"), true)
+  Test.assert_eq(package_archive_path_safe(".git/config"), false)
+  Test.assert_eq(package_archive_path_safe("src/.weft/state"), false)
+  Test.assert_eq(package_archive_path_safe("src/../outside"), false)
+  Test.assert_str_eq(package_source_digest(bytes_from_str("abc")), "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+}
+
+test "pkg_provider_plans_pin_protocol_config_and_limits" {
+  let revision = "0123456789abcdef0123456789abcdef01234567"
+  let git = package_provider_git_fetch_args("/usr/bin/git", ".weft/staging/repo", "https://example.test/repo.git", revision)
+  Test.assert_eq(list_len(git), 23)
+  Test.assert_str_eq(pkg_test_list_value(git, 0), "GIT_CONFIG_NOSYSTEM=1")
+  Test.assert_str_eq(pkg_test_list_value(git, 1), "GIT_CONFIG_GLOBAL=/dev/null")
+  Test.assert_str_eq(pkg_test_list_value(git, 8), "credential.interactive=never")
+  Test.assert_str_eq(pkg_test_list_value(git, 10), "core.hooksPath=/dev/null")
+  Test.assert_str_eq(pkg_test_list_value(git, 14), "fetch.fsckObjects=true")
+  Test.assert_str_eq(pkg_test_list_value(git, 17), "--no-tags")
+  Test.assert_str_eq(pkg_test_list_value(git, 18), "--no-recurse-submodules")
+  Test.assert_str_eq(pkg_test_list_value(git, 19), "--depth=1")
+  Test.assert_str_eq(pkg_test_list_value(git, 20), "--no-write-fetch-head")
+  Test.assert_str_eq(pkg_test_list_value(git, 22), revision)
+  let curl = package_provider_curl_args("https://example.test/source.tar", ".weft/staging/source.tar", 67108864)
+  Test.assert_eq(list_len(curl), 21)
+  Test.assert_str_eq(pkg_test_list_value(curl, 0), "--disable")
+  Test.assert_str_eq(pkg_test_list_value(curl, 5), "=https")
+  Test.assert_str_eq(pkg_test_list_value(curl, 7), "=https")
+  Test.assert_str_eq(pkg_test_list_value(curl, 11), "67108864")
+  Test.assert_str_eq(pkg_test_list_value(curl, 20), "https://example.test/source.tar")
+}
+
+test "pkg_locked_remote_sources_decode_to_typed_variants" {
+  let revision = "0123456789abcdef0123456789abcdef01234567"
+  match pkg_lock_remote_source_parse("git:0123456789abcdef0123456789abcdef01234567:https://example.test/repo.git") {
+    PackageRemoteSourceParsed(PackageGitSource(url, pin)) -> {
+      Test.assert_str_eq(url, "https://example.test/repo.git")
+      Test.assert_str_eq(pin, revision)
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+  match pkg_lock_remote_source_parse("archive:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:https://example.test/source.tar") {
+    PackageRemoteSourceParsed(PackageArchiveSource(url, checksum)) -> {
+      Test.assert_str_eq(url, "https://example.test/source.tar")
+      Test.assert_str_eq(checksum, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+  match pkg_lock_remote_source_parse("path:deps/local") {
+    PackageRemoteSourceInvalid -> Test.assert_eq(1, 1)
+    _ -> Test.assert_eq(0, 1)
+  }
+}
+
+fn pkg_test_cache_manifest_text() -> str {
+  "{\"package\":\"remote\",\"manifest_version\":1,\"version\":\"1.2.3\",\"weft\":\"0.1\",\"dependencies\":{}}\n"
+}
+
+fn pkg_test_cache_content(readme: str) -> str {
+  let entries = vector_new<PackageContentEntry>()
+  vector_push<PackageContentEntry>(entries, pkg_content_entry("README.md", readme))
+  vector_push<PackageContentEntry>(entries, pkg_content_entry("main.weft", "fn remote() -> i64 { 9 }\n"))
+  vector_push<PackageContentEntry>(entries, pkg_content_entry("weft.pkg", pkg_test_cache_manifest_text()))
+  pkg_content_digest(entries)
+}
+
+fn pkg_test_cache_lock(content: str) -> i64 {
+  let data = pkg_lock_data_new(1)
+  nlist_add(pkg_lock_data_entries(data), pkg_lock_entry_new(
+    "remote",
+    "1.2.3",
+    "git:0123456789abcdef0123456789abcdef01234567:https://example.test/remote.git",
+    content
+  ))
+  data
+}
+
+fn pkg_test_cache_file_read<T>(readme: str, body: () -[FileRead]> T) -> T {
+  handle body() {
+    FileRead.read_all(path, limit) -> {
+      let text = pkg_test_path_text(path)
+      let content = if str_ends_with(text, "/weft.pkg") == 1 { pkg_test_cache_manifest_text() }
+        else { if str_ends_with(text, "/main.weft") == 1 { "fn remote() -> i64 { 9 }\n" }
+        else { readme } }
+      resume(result_ok<Bytes, IoError>(bytes_from_str(content)))
+    }
+  }
+}
+
+-- mode 0: ordinary tree; 1: missing root; 2: hard-linked files; 3: root link.
+fn pkg_test_cache_dir_inspect<T>(mode: i64, root: str, body: () -[DirInspect, FileRead]> T) -[FileRead]> T {
+  handle body() {
+    DirInspect.list(path) -> {
+      let entries = vector_new<Path>()
+      vector_push<Path>(entries, pkg_test_path("README.md"))
+      vector_push<Path>(entries, pkg_test_path("main.weft"))
+      vector_push<Path>(entries, pkg_test_path("weft.pkg"))
+      resume(result_ok<Vector<Path>, IoError>(entries))
+    }
+    DirInspect.stat(path) -> resume(result_ok<DirMetadata, IoError>(DirMetadata {
+      exists: mode != 1, kind: if mode == 3 { DirOther } else { DirDirectory }, size: 0, modified_millis: 0, device: 41, inode: 1
+    }))
+    DirInspect.lstat(path) -> {
+      let text = pkg_test_path_text(path)
+      if str_eq(text, root) == 1 {
+        resume(result_ok<DirMetadata, IoError>(DirMetadata {
+          exists: mode != 1, kind: if mode == 3 { DirOther } else { DirDirectory }, size: 0, modified_millis: 0, device: 41, inode: 1
+        }))
+      } else {
+        let inode = if mode == 2 { 7 }
+          else { if str_ends_with(text, "/weft.pkg") == 1 { 8 }
+          else { if str_ends_with(text, "/main.weft") == 1 { 9 } else { 10 } } }
+        resume(result_ok<DirMetadata, IoError>(DirMetadata {
+          exists: true, kind: DirFile, size: 1, modified_millis: 0, device: 41, inode: inode
+        }))
+      }
+    }
+    DirInspect.current() -> resume(result_ok<Path, IoError>(pkg_test_path(".")))
+  }
+}
+
+test "pkg_cache_verification_covers_every_file_and_rejects_aliases" {
+  let content = pkg_test_cache_content("documentation\n")
+  let data = pkg_test_cache_lock(content)
+  let root = pkg_cache_root_for_content(content)
+  let verified = pkg_test_cache_file_read("documentation\n", () =>
+    pkg_test_cache_dir_inspect(0, root, () => pkg_lock_verify_cache_data(data)))
+  match verified { PackageCacheVerified -> Test.assert_eq(1, 1) _ -> Test.assert_eq(0, 1) }
+
+  let drift = pkg_test_cache_file_read("changed documentation\n", () =>
+    pkg_test_cache_dir_inspect(0, root, () => pkg_lock_verify_cache_data(data)))
+  match drift { PackageCacheCorrupt(name, digest) -> Test.assert_str_eq(name, "remote") _ -> Test.assert_eq(0, 1) }
+
+  let hard_link = pkg_test_cache_file_read("documentation\n", () =>
+    pkg_test_cache_dir_inspect(2, root, () => pkg_lock_verify_cache_data(data)))
+  match hard_link { PackageCacheCorrupt(name, digest) -> Test.assert_str_eq(digest, content) _ -> Test.assert_eq(0, 1) }
+}
+
+test "pkg_cache_verification_distinguishes_missing_and_non_directory_roots" {
+  let content = pkg_test_cache_content("documentation\n")
+  let data = pkg_test_cache_lock(content)
+  let root = pkg_cache_root_for_content(content)
+  let missing = pkg_test_cache_file_read("documentation\n", () =>
+    pkg_test_cache_dir_inspect(1, root, () => pkg_lock_verify_cache_data(data)))
+  match missing { PackageCacheMissing(name, digest) -> Test.assert_str_eq(name, "remote") _ -> Test.assert_eq(0, 1) }
+
+  let linked = pkg_test_cache_file_read("documentation\n", () =>
+    pkg_test_cache_dir_inspect(3, root, () => pkg_lock_verify_cache_data(data)))
+  match linked { PackageCacheCorrupt(name, digest) -> Test.assert_str_eq(digest, content) _ -> Test.assert_eq(0, 1) }
 }
 
 test "pkg_lock_traversal_uses_typed_path_and_byte_capabilities" {
