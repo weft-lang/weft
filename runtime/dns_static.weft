@@ -1,0 +1,354 @@
+-- runtime/dns_static.weft — pure bounded DNS wire and Linux text policy
+--
+-- This module contains no socket or filesystem authority. Resolver packets,
+-- resolv.conf policy and hosts entries are typed data so production transport
+-- and deterministic tests consume the same parser and error model.
+
+use runtime/string.{runtime_str_slice_bytes}
+use stdlib/idna.{DomainName, domain_name_parse}
+use stdlib/net_address.{IpAddress, IpV4, IpV6, ip_address_parse, ipv4_address, ipv6_address}
+use stdlib/num.{num_i64_to_u16_checked, num_i64_to_u8_checked, num_int_cast_value_or}
+use stdlib/result.{Err, Ok}
+use stdlib/string.{str_byte_at, str_len}
+use stdlib/vector.{vector_get_in_bounds, vector_len, vector_push, vector_with_capacity}
+use stdlib/vector_type.{Vector}
+
+pub(package) type DnsWireRecordType {
+  DnsWireA,
+  DnsWireAAAA
+}
+
+pub(package) type DnsWireReply {
+  DnsWireAnswers(Vector<IpAddress>),
+  DnsWireNoData,
+  DnsWireNameNotFound,
+  DnsWireTemporary,
+  DnsWireResourceExhausted,
+  DnsWirePermanent,
+  DnsWireTruncated,
+  DnsWireMalformed(i64)
+}
+
+pub(package) type DnsStaticConfig {
+  DnsStaticConfig(Vector<IpAddress>, i64, i64)
+}
+
+fn dns_static_u8(value: i64) -> u8 {
+  num_int_cast_value_or<u8>(num_i64_to_u8_checked(value), 0)
+}
+
+fn dns_static_u16(value: i64) -> u16 {
+  num_int_cast_value_or<u16>(num_i64_to_u16_checked(value), 0)
+}
+
+fn dns_static_byte(value: u8) -> i64 { __u64_to_i64(__u8_to_u64(value)) }
+
+fn dns_wire_byte(packet: Vector<u8>, index: i64) -> i64 {
+  if index < 0 or index >= vector_len<u8>(packet) { 0 - 1 }
+  else { dns_static_byte(vector_get_in_bounds<u8>(packet, index)) }
+}
+
+fn dns_wire_u16(packet: Vector<u8>, index: i64) -> i64 {
+  let high = dns_wire_byte(packet, index)
+  let low = dns_wire_byte(packet, index + 1)
+  if high < 0 or low < 0 { 0 - 1 } else { high * 256 + low }
+}
+
+fn dns_wire_push_u16(out: Vector<u8>, value: i64) -> i64 {
+  vector_push<u8>(out, dns_static_u8((value bshr 8) band 255))
+  vector_push<u8>(out, dns_static_u8(value band 255))
+}
+
+fn dns_wire_record_code(record: DnsWireRecordType) -> i64 {
+  match record {
+    DnsWireA -> 1
+    DnsWireAAAA -> 28
+  }
+}
+
+fn dns_wire_push_name(out: Vector<u8>, name: str) -> i64 {
+  let n = str_len(name)
+  let mut label_start = 0
+  let mut cursor = 0
+  while cursor <= n {
+    if cursor == n or str_byte_at(name, cursor) == 46 {
+      let label_len = cursor - label_start
+      vector_push<u8>(out, dns_static_u8(label_len))
+      for index in label_start..cursor {
+        vector_push<u8>(out, dns_static_u8(str_byte_at(name, index)))
+      }
+      label_start = cursor + 1
+    } else { 0 }
+    cursor = cursor + 1
+  }
+  vector_push<u8>(out, dns_static_u8(0))
+}
+
+pub(package) fn dns_wire_query(
+  transaction: i64,
+  name: str,
+  record: DnsWireRecordType
+) -> Vector<u8> {
+  let out = vector_with_capacity<u8>(str_len(name) + 18)
+  dns_wire_push_u16(out, transaction band 65535)
+  dns_wire_push_u16(out, 256) -- recursion desired
+  dns_wire_push_u16(out, 1)
+  dns_wire_push_u16(out, 0)
+  dns_wire_push_u16(out, 0)
+  dns_wire_push_u16(out, 0)
+  dns_wire_push_name(out, name)
+  dns_wire_push_u16(out, dns_wire_record_code(record))
+  dns_wire_push_u16(out, 1) -- IN
+  out
+}
+
+fn dns_wire_question_end(
+  packet: Vector<u8>,
+  transaction: i64,
+  name: str,
+  record: DnsWireRecordType
+) -> i64 {
+  let expected = dns_wire_query(transaction, name, record)
+  let expected_end = vector_len<u8>(expected)
+  if vector_len<u8>(packet) < expected_end { 0 - 1 }
+  else {
+    let mut cursor = 12
+    let mut same = true
+    while same and cursor < expected_end {
+      if dns_wire_byte(packet, cursor) != dns_wire_byte(expected, cursor) { same = false }
+      else { cursor = cursor + 1 }
+    }
+    if same { expected_end } else { 0 - 1 }
+  }
+}
+
+fn dns_wire_skip_name(packet: Vector<u8>, start: i64) -> i64 {
+  let n = vector_len<u8>(packet)
+  let mut cursor = start
+  let mut done = false
+  let mut invalid = false
+  let mut labels = 0
+  while not done and not invalid and cursor < n and labels <= 127 {
+    let size = dns_wire_byte(packet, cursor)
+    if size == 0 {
+      cursor = cursor + 1
+      done = true
+    } else { if (size band 192) == 192 {
+      let tail = dns_wire_byte(packet, cursor + 1)
+      let target = (size band 63) * 256 + tail
+      if tail < 0 or target < 0 or target >= cursor { invalid = true }
+      else { cursor = cursor + 2; done = true }
+    } else { if size > 63 or cursor + 1 + size > n {
+      invalid = true
+    } else {
+      cursor = cursor + 1 + size
+      labels = labels + 1
+    } }
+  }
+  }
+  if done and not invalid { cursor } else { 0 - 1 }
+}
+
+fn dns_wire_ipv6(packet: Vector<u8>, start: i64) -> IpAddress {
+  IpV6(ipv6_address(
+    dns_static_u16(dns_wire_u16(packet, start)),
+    dns_static_u16(dns_wire_u16(packet, start + 2)),
+    dns_static_u16(dns_wire_u16(packet, start + 4)),
+    dns_static_u16(dns_wire_u16(packet, start + 6)),
+    dns_static_u16(dns_wire_u16(packet, start + 8)),
+    dns_static_u16(dns_wire_u16(packet, start + 10)),
+    dns_static_u16(dns_wire_u16(packet, start + 12)),
+    dns_static_u16(dns_wire_u16(packet, start + 14))
+  ))
+}
+
+pub(package) fn dns_wire_parse_reply(
+  packet: Vector<u8>,
+  transaction: i64,
+  name: str,
+  record: DnsWireRecordType
+) -> DnsWireReply {
+  let n = vector_len<u8>(packet)
+  if n < 12 { return DnsWireMalformed(n) } else { 0 }
+  if dns_wire_u16(packet, 0) != (transaction band 65535) { return DnsWireMalformed(0) } else { 0 }
+  let flags = dns_wire_u16(packet, 2)
+  if (flags band 32768) == 0 or (flags band 30720) != 0 { return DnsWireMalformed(2) } else { 0 }
+  if (flags band 512) != 0 { return DnsWireTruncated } else { 0 }
+  let response_code = flags band 15
+  if response_code == 3 { return DnsWireNameNotFound } else { 0 }
+  if response_code == 2 { return DnsWireTemporary } else { 0 }
+  if response_code != 0 { return DnsWirePermanent } else { 0 }
+  if dns_wire_u16(packet, 4) != 1 { return DnsWireMalformed(4) } else { 0 }
+  let question_end = dns_wire_question_end(packet, transaction, name, record)
+  if question_end < 0 { return DnsWireMalformed(12) } else { 0 }
+
+  let answer_count = dns_wire_u16(packet, 6)
+  let answers = vector_with_capacity<IpAddress>(answer_count)
+  let wanted = dns_wire_record_code(record)
+  let mut cursor = question_end
+  let mut answer = 0
+  let mut malformed = 0 - 1
+  while answer < answer_count and malformed < 0 {
+    let header = dns_wire_skip_name(packet, cursor)
+    if header < 0 or header + 10 > n {
+      malformed = cursor
+    } else {
+      let record_type = dns_wire_u16(packet, header)
+      let record_class = dns_wire_u16(packet, header + 2)
+      let data_len = dns_wire_u16(packet, header + 8)
+      let data = header + 10
+      if data_len < 0 or data + data_len > n {
+        malformed = header + 8
+      } else {
+        if record_class == 1 and record_type == wanted {
+          match record {
+            DnsWireA -> if data_len == 4 {
+              vector_push<IpAddress>(answers, IpV4(ipv4_address(
+                dns_static_u8(dns_wire_byte(packet, data)),
+                dns_static_u8(dns_wire_byte(packet, data + 1)),
+                dns_static_u8(dns_wire_byte(packet, data + 2)),
+                dns_static_u8(dns_wire_byte(packet, data + 3))
+              )))
+            } else { malformed = data }
+            DnsWireAAAA -> if data_len == 16 {
+              vector_push<IpAddress>(answers, dns_wire_ipv6(packet, data))
+            } else { malformed = data }
+          }
+        } else { 0 }
+        cursor = data + data_len
+      }
+    }
+    answer = answer + 1
+  }
+  if malformed >= 0 { DnsWireMalformed(malformed) }
+  else { if vector_len<IpAddress>(answers) == 0 { DnsWireNoData }
+  else { DnsWireAnswers(answers) } }
+}
+
+fn dns_text_line_end(source: str, start: i64) -> i64 {
+  let n = str_len(source)
+  let mut cursor = start
+  while cursor < n and str_byte_at(source, cursor) != 10 and str_byte_at(source, cursor) != 13 {
+    cursor = cursor + 1
+  }
+  cursor
+}
+
+fn dns_text_next_line(source: str, end: i64) -> i64 {
+  let n = str_len(source)
+  let mut cursor = end
+  while cursor < n and (str_byte_at(source, cursor) == 10 or str_byte_at(source, cursor) == 13) {
+    cursor = cursor + 1
+  }
+  cursor
+}
+
+fn dns_text_is_space(byte: i64) -> bool { byte == 32 or byte == 9 }
+
+fn dns_text_line_tokens(source: str, start: i64, end: i64) -> Vector<str> {
+  let tokens = vector_with_capacity<str>(4)
+  let mut cursor = start
+  while cursor < end {
+    while cursor < end and dns_text_is_space(str_byte_at(source, cursor)) { cursor = cursor + 1 }
+    if cursor < end and str_byte_at(source, cursor) != 35 {
+      let token_start = cursor
+      while cursor < end and not dns_text_is_space(str_byte_at(source, cursor)) and str_byte_at(source, cursor) != 35 {
+        cursor = cursor + 1
+      }
+      if cursor > token_start {
+        vector_push<str>(tokens, runtime_str_slice_bytes(source, token_start, cursor - token_start))
+      } else { 0 }
+      if cursor < end and str_byte_at(source, cursor) == 35 { cursor = end } else { 0 }
+    } else { cursor = end }
+  }
+  tokens
+}
+
+fn dns_text_decimal_suffix(token: str, prefix: str, fallback: i64, maximum: i64) -> i64 {
+  let prefix_len = str_len(prefix)
+  let n = str_len(token)
+  if n <= prefix_len { fallback }
+  else {
+    let mut same = true
+    let mut cursor = 0
+    while same and cursor < prefix_len {
+      if str_byte_at(token, cursor) != str_byte_at(prefix, cursor) { same = false }
+      else { cursor = cursor + 1 }
+    }
+    let mut value = 0
+    let mut valid = same
+    while valid and cursor < n {
+      let byte = str_byte_at(token, cursor)
+      if byte < 48 or byte > 57 { valid = false }
+      else { value = value * 10 + byte - 48; cursor = cursor + 1 }
+    }
+    if valid and value > 0 { if value > maximum { maximum } else { value } }
+    else { fallback }
+  }
+}
+
+pub(package) fn dns_static_parse_resolv(source: str) -> DnsStaticConfig {
+  let servers = vector_with_capacity<IpAddress>(3)
+  let mut timeout_ms = 5000
+  let mut attempts = 2
+  let mut line = 0
+  while line < str_len(source) {
+    let end = dns_text_line_end(source, line)
+    let tokens = dns_text_line_tokens(source, line, end)
+    if vector_len<str>(tokens) >= 2 and vector_get_in_bounds<str>(tokens, 0) == "nameserver" {
+      match ip_address_parse(vector_get_in_bounds<str>(tokens, 1)) {
+        Ok(address) -> if vector_len<IpAddress>(servers) < 3 { vector_push<IpAddress>(servers, address) } else { 0 }
+        Err(_) -> 0
+      }
+    } else { if vector_len<str>(tokens) >= 2 and vector_get_in_bounds<str>(tokens, 0) == "options" {
+      for index in 1..vector_len<str>(tokens) {
+        let token = vector_get_in_bounds<str>(tokens, index)
+        timeout_ms = dns_text_decimal_suffix(token, "timeout:", timeout_ms / 1000, 30) * 1000
+        attempts = dns_text_decimal_suffix(token, "attempts:", attempts, 5)
+      }
+    } else { 0 } }
+    line = dns_text_next_line(source, end)
+  }
+  DnsStaticConfig(servers, timeout_ms, attempts)
+}
+
+pub(package) fn dns_static_hosts_lookup(source: str, host: DomainName) -> Vector<IpAddress> {
+  let addresses = vector_with_capacity<IpAddress>(2)
+  let wanted = host.ascii()
+  let mut line = 0
+  while line < str_len(source) {
+    let end = dns_text_line_end(source, line)
+    let tokens = dns_text_line_tokens(source, line, end)
+    if vector_len<str>(tokens) >= 2 {
+      match ip_address_parse(vector_get_in_bounds<str>(tokens, 0)) {
+        Err(_) -> 0
+        Ok(address) -> {
+          let mut matched = false
+          let mut index = 1
+          while not matched and index < vector_len<str>(tokens) {
+            match domain_name_parse(vector_get_in_bounds<str>(tokens, index)) {
+              Ok(alias) -> if alias.ascii() == wanted { matched = true } else { 0 }
+              Err(_) -> 0
+            }
+            index = index + 1
+          }
+          if matched { vector_push<IpAddress>(addresses, address) } else { 0 }
+        }
+      }
+    } else { 0 }
+    line = dns_text_next_line(source, end)
+  }
+  addresses
+}
+
+pub(package) fn dns_static_config_servers(config: DnsStaticConfig) -> Vector<IpAddress> {
+  match config { DnsStaticConfig(servers, timeout_ms, attempts) -> servers }
+}
+
+pub(package) fn dns_static_config_timeout_ms(config: DnsStaticConfig) -> i64 {
+  match config { DnsStaticConfig(servers, timeout_ms, attempts) -> timeout_ms }
+}
+
+pub(package) fn dns_static_config_attempts(config: DnsStaticConfig) -> i64 {
+  match config { DnsStaticConfig(servers, timeout_ms, attempts) -> attempts }
+}

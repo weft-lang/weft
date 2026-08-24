@@ -262,6 +262,16 @@ assert_not_contains() {
   fi
 }
 
+# Reduce a disassembly to the socket(2) call windows, one `|`-joined record per
+# call site, so an assertion can name the exact socket kind and protocol rather
+# than matching an immediate that occurs anywhere in the image.
+elf_socket_call_windows() {
+  printf '%s\n' "$1" \
+    | sed -E -e 's/^[[:space:]]*[0-9a-f]+:[[:space:]]+[0-9a-f]{8}[[:space:]]+//' -e 's/[[:space:]]+\/\/.*$//' \
+    | grep -B2 -A1 $'^mov\tx8, #0xc6$' \
+    | tr '\n' '|'
+}
+
 assert_not_contains_file() {
   local name="$1"
   local file="$2"
@@ -969,6 +979,59 @@ assert_contains "elf_linux_shutdown_invokes_linux_svc" "$elf_linux_shutdown_disa
 assert_not_contains "elf_linux_shutdown_has_no_interpreter" "$elf_linux_shutdown_headers" "INTERP off"
 assert_not_contains "elf_linux_shutdown_has_no_dynamic_segment" "$elf_linux_shutdown_headers" "DYNAMIC off"
 
+# The Linux resolver is a standalone DNS client: /etc/hosts and
+# /etc/resolv.conf are interpreted by typed Weft code, transaction ids come
+# from getrandom, connected UDP carries ordinary queries, and truncated
+# replies have a framed TCP fallback. No libc/NSS or dynamic loader participates.
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_dns_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_dns_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_dns_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_dns_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+assert_contains "elf_linux_dns_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
+elf_linux_dns_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+elf_linux_dns_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+assert_contains "elf_linux_dns_selects_openat" "$elf_linux_dns_disassembly" $'mov\tx8, #0x38'
+assert_contains "elf_linux_dns_selects_read" "$elf_linux_dns_disassembly" $'mov\tx8, #0x3f'
+assert_contains "elf_linux_dns_selects_write" "$elf_linux_dns_disassembly" $'mov\tx8, #0x40'
+assert_contains "elf_linux_dns_selects_close" "$elf_linux_dns_disassembly" $'mov\tx8, #0x39'
+assert_contains "elf_linux_dns_selects_socket" "$elf_linux_dns_disassembly" $'mov\tx8, #0xc6'
+assert_contains "elf_linux_dns_selects_connect" "$elf_linux_dns_disassembly" $'mov\tx8, #0xcb'
+assert_contains "elf_linux_dns_selects_setsockopt" "$elf_linux_dns_disassembly" $'mov\tx8, #0xd0'
+assert_contains "elf_linux_dns_selects_getrandom" "$elf_linux_dns_disassembly" $'mov\tx8, #0x116'
+assert_contains "elf_linux_dns_invokes_linux_svc" "$elf_linux_dns_disassembly" $'svc\t#0'
+assert_not_contains "elf_linux_dns_has_no_interpreter" "$elf_linux_dns_headers" "INTERP off"
+assert_not_contains "elf_linux_dns_has_no_dynamic_segment" "$elf_linux_dns_headers" "DYNAMIC off"
+# Both resolver transports must survive into the product: the TCP fallback is
+# mandatory on truncation, so a UDP-only image would be a silent capability
+# regression rather than a build failure.
+elf_linux_dns_socket_calls=$(elf_socket_call_windows "$elf_linux_dns_disassembly")
+assert_contains "elf_linux_dns_opens_cloexec_udp_socket" "$elf_linux_dns_socket_calls" $'movk\tx1, #0x8, lsl #16|mov\tx2, #0x11|mov\tx8, #0xc6|svc\t#0'
+assert_contains "elf_linux_dns_opens_cloexec_tcp_socket" "$elf_linux_dns_socket_calls" $'movk\tx1, #0x8, lsl #16|mov\tx2, #0x6|mov\tx8, #0xc6|svc\t#0'
+
+# The transport product is the ordinary source behind the hermetic Linux
+# resolver gate: truncation-to-TCP, NXDOMAIN, REFUSED, NODATA, dual-family
+# ordering and dead-nameserver failover.
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_dns_transport_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_dns_transport_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_dns_transport_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_dns_transport_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+assert_contains "elf_linux_dns_transport_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
+elf_linux_dns_transport_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+elf_linux_dns_transport_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_dns_transport_socket_calls=$(elf_socket_call_windows "$elf_linux_dns_transport_disassembly")
+assert_contains "elf_linux_dns_transport_opens_cloexec_udp_socket" "$elf_linux_dns_transport_socket_calls" $'movk\tx1, #0x8, lsl #16|mov\tx2, #0x11|mov\tx8, #0xc6|svc\t#0'
+assert_contains "elf_linux_dns_transport_opens_cloexec_tcp_socket" "$elf_linux_dns_transport_socket_calls" $'movk\tx1, #0x8, lsl #16|mov\tx2, #0x6|mov\tx8, #0xc6|svc\t#0'
+assert_contains "elf_linux_dns_transport_selects_getrandom" "$elf_linux_dns_transport_disassembly" $'mov\tx8, #0x116'
+assert_contains "elf_linux_dns_transport_invokes_linux_svc" "$elf_linux_dns_transport_disassembly" $'svc\t#0'
+assert_not_contains "elf_linux_dns_transport_has_no_interpreter" "$elf_linux_dns_transport_headers" "INTERP off"
+assert_not_contains "elf_linux_dns_transport_has_no_dynamic_segment" "$elf_linux_dns_transport_headers" "DYNAMIC off"
+
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
 assert_contains "fmt_parse_only" "$fmt_out" "fn main() -> i64 { 42 }"
@@ -1604,7 +1667,7 @@ assert_equals "diagnostic_exhaustiveness_teaches_counterexample_golden" "$diag_o
 
 printf '%s\n' 'effect Box<T> { fn get() -> T } fn need() -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_effect_discharge_teaches_parameter_identity_golden" "$diag_out" $'line 1, col 99: error[E2001]: effect `Box<str>` is not available in this context\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                             ^~~~ effect `Box<str>` is not available in this context\nline 1, col 108: note: nearest handler handles a different instantiation of this effect\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                                      ^~~ nearest handler handles a different instantiation of this effect\nline 1, col 36: note: callee declares this effect\n  |\n1 | ...T> { fn get() -> T } fn need() -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<...\n  |                            ^~~~ callee declares this effect\nhelp: `Box<i64>` is available, but it does not discharge `Box<str>`; effect type arguments are part of capability identity.\ncheck: 482 functions, 1 errors'
+assert_equals "diagnostic_effect_discharge_teaches_parameter_identity_golden" "$diag_out" $'line 1, col 99: error[E2001]: effect `Box<str>` is not available in this context\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                             ^~~~ effect `Box<str>` is not available in this context\nline 1, col 108: note: nearest handler handles a different instantiation of this effect\n  |\n1 | ... -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<i64>.get() -> resume(42) } 0 }\n  |                                                                      ^~~ nearest handler handles a different instantiation of this effect\nline 1, col 36: note: callee declares this effect\n  |\n1 | ...T> { fn get() -> T } fn need() -[Box<str>]> str { Box.get() } fn bad() -> i64 { handle need() { Box<...\n  |                            ^~~~ callee declares this effect\nhelp: `Box<i64>` is available, but it does not discharge `Box<str>`; effect type arguments are part of capability identity.\ncheck: 490 functions, 1 errors'
 
 printf '%s\n' 'type Box<T> { Box(T) } trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> Identity for Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(Box<bool>(true)) }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
