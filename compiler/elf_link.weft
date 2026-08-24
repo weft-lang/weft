@@ -13,7 +13,7 @@ use compiler/dwarf.{*}
 use compiler/lib.{bytes_u8_at}
 use compiler/native_link.{*}
 use compiler/native_target.{*}
-use runtime/buffer.{bpad, bscopy, buf_len, buf_new, buf_ptr}
+use runtime/buffer.{*}
 use stdlib/bytes.{*}
 use stdlib/list.{Cons, List, Nil, list_len}
 use stdlib/num.{num_i64_to_u8_checked, num_int_cast_value_or}
@@ -23,7 +23,7 @@ pub(package) type ElfNativeLinkEmission {
   ElfNativeLinkEmitted(Bytes),
   ElfNativeLinkTargetMismatch(NativeLinkTarget),
   ElfNativeLinkForeignInputsUnsupported(i64),
-  ElfNativeLinkDynamicSymbolsUnsupported(i64),
+  ElfNativeLinkUnboundDynamicSymbols(i64),
   ElfNativeLinkRelocationsUnsupported(i64),
   ElfNativeLinkArchiveDataUnsupported(i64),
   ElfNativeLinkInvalidEntryOffset(i64, i64)
@@ -50,6 +50,7 @@ fn elf_link_unsupported_relocation_count(relocations: List<NativeLinkRelocation>
     Nil -> 0
     Cons(relocation, rest) -> {
       let unsupported = match relocation {
+        NativeLinkBranch26(address, slot) -> 0
         NativeLinkDirectBranch26(address, target) -> 0
         NativeLinkArchivePage21(address, data_offset) -> 0
         NativeLinkArchivePageOff12(address, data_offset) -> 0
@@ -68,6 +69,7 @@ fn elf_link_unsupported_library_count(libraries: List<NativeLinkLibrary>) -> i64
     Cons(library, rest) -> {
       let unsupported = match library {
         NativeLinkStaticArchive(name, path, content, license, bytes, len) -> 0
+        NativeLinkDynamicLibrary(name, path, load_identity, content, license, loads) -> 0
         _ -> 1
       }
       unsupported + elf_link_unsupported_library_count(rest)
@@ -75,10 +77,263 @@ fn elf_link_unsupported_library_count(libraries: List<NativeLinkLibrary>) -> i64
   }
 }
 
+fn elf_link_dynamic_library_count(libraries: List<NativeLinkLibrary>) -> i64 {
+  match libraries {
+    Nil -> 0
+    Cons(library, rest) -> match library {
+      NativeLinkDynamicLibrary(name, path, load_identity, content, license, loads) -> 1 + elf_link_dynamic_library_count(rest)
+      _ -> elf_link_dynamic_library_count(rest)
+    }
+  }
+}
+
+fn elf_link_u16(output: i64, value: i64) -> i64 {
+  bu8(output, value - value / 256 * 256)
+  bu8(output, value / 256 - value / 65536 * 256)
+  0
+}
+
+fn elf_link_align(value: i64, alignment: i64) -> i64 {
+  (value + alignment - 1) / alignment * alignment
+}
+
+fn elf_link_dynamic_strings(libraries: List<NativeLinkLibrary>, symbols: List<NativeLinkSymbol>) -> i64 {
+  let strings = buf_new(4096)
+  bu8(strings, 0)
+  let mut current_library = libraries
+  let mut libraries_done = false
+  while libraries_done == false {
+    match current_library {
+      Nil -> { libraries_done = true 0 }
+      Cons(library, rest) -> {
+        match library {
+          NativeLinkDynamicLibrary(name, path, load_identity, content, license, loads) -> { bstr(strings, load_identity) bu8(strings, 0) 0 }
+          _ -> 0
+        }
+        current_library = rest
+        0
+      }
+    }
+  }
+  let mut current_symbol = symbols
+  let mut symbols_done = false
+  while symbols_done == false {
+    match current_symbol {
+      Nil -> { symbols_done = true 0 }
+      Cons(symbol, rest) -> {
+        match symbol { NativeLinkUndefinedStrong(name, ordinal, origin) -> { bstr(strings, name) bu8(strings, 0) 0 } }
+        current_symbol = rest
+        0
+      }
+    }
+  }
+  strings
+}
+
+fn elf_link_dynamic_symbol_name_start(libraries: List<NativeLinkLibrary>) -> i64 {
+  match libraries {
+    Nil -> 1
+    Cons(library, rest) -> match library {
+      NativeLinkDynamicLibrary(name, path, load_identity, content, license, loads) -> __str_len(load_identity) + 1 + elf_link_dynamic_symbol_name_start(rest)
+      _ -> elf_link_dynamic_symbol_name_start(rest)
+    }
+  }
+}
+
+fn elf_link_dynamic_symbols(symbols: List<NativeLinkSymbol>, name_offset: i64) -> i64 {
+  let table = buf_new(4096)
+  bfill(table, 24)
+  let mut current = symbols
+  let mut offset = name_offset
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(symbol, rest) -> match symbol {
+        NativeLinkUndefinedStrong(name, ordinal, origin) -> {
+          bu32(table, offset)
+          bu8(table, 16) -- STB_GLOBAL | STT_NOTYPE
+          bu8(table, 0)
+          elf_link_u16(table, 0)
+          bu64(table, 0)
+          bu64(table, 0)
+          offset = offset + __str_len(name) + 1
+          current = rest
+          0
+        }
+      }
+    }
+  }
+  table
+}
+
+fn elf_link_dynamic_relocations(symbols: List<NativeLinkSymbol>, data_address: i64) -> i64 {
+  let relocations = buf_new(4096)
+  let mut current = symbols
+  let mut slot = 0
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(symbol, rest) -> {
+        bu64(relocations, data_address + slot * 8)
+        bu64(relocations, (slot + 1) * 4294967296 + 1025) -- R_AARCH64_GLOB_DAT
+        bu64(relocations, 0)
+        slot = slot + 1
+        current = rest
+        0
+      }
+    }
+  }
+  relocations
+}
+
+fn elf_link_dynamic_entries(libraries: List<NativeLinkLibrary>, string_address: i64, symbol_address: i64, string_size: i64, relocation_address: i64, relocation_size: i64) -> i64 {
+  let dynamic = buf_new(4096)
+  let mut current = libraries
+  let mut string_offset = 1
+  let mut done = false
+  while done == false {
+    match current {
+      Nil -> { done = true 0 }
+      Cons(library, rest) -> {
+        match library {
+          NativeLinkDynamicLibrary(name, path, load_identity, content, license, loads) -> {
+            bu64(dynamic, 1) bu64(dynamic, string_offset)
+            string_offset = string_offset + __str_len(load_identity) + 1
+            0
+          }
+          _ -> 0
+        }
+        current = rest
+        0
+      }
+    }
+  }
+  bu64(dynamic, 5) bu64(dynamic, string_address)
+  bu64(dynamic, 6) bu64(dynamic, symbol_address)
+  bu64(dynamic, 10) bu64(dynamic, string_size)
+  bu64(dynamic, 11) bu64(dynamic, 24)
+  bu64(dynamic, 7) bu64(dynamic, relocation_address)
+  bu64(dynamic, 8) bu64(dynamic, relocation_size)
+  bu64(dynamic, 9) bu64(dynamic, 24)
+  bu64(dynamic, 21) bu64(dynamic, 0) -- DT_DEBUG: loader rendezvous for debuggers
+  bu64(dynamic, 0) bu64(dynamic, 0)
+  dynamic
+}
+
+fn elf_link_program(output: i64, kind: i64, flags: i64, offset: i64, address: i64, file_size: i64, memory_size: i64, align: i64) -> i64 {
+  bu32(output, kind) bu32(output, flags)
+  bu64(output, offset) bu64(output, address) bu64(output, address)
+  bu64(output, file_size) bu64(output, memory_size) bu64(output, align)
+  0
+}
+
+fn elf_link_section_header(output: i64, name: i64, kind: i64, offset: i64, size: i64, alignment: i64) -> i64 {
+  bu32(output, name) bu32(output, kind)
+  bu64(output, 0) bu64(output, 0)
+  bu64(output, offset) bu64(output, size)
+  bu32(output, 0) bu32(output, 0)
+  bu64(output, alignment) bu64(output, 0)
+  0
+}
+
+fn elf_link_debug_section_names(output: i64) -> i64 {
+  bu8(output, 0)
+  bstr(output, ".debug_abbrev") bu8(output, 0)
+  bstr(output, ".debug_info") bu8(output, 0)
+  bstr(output, ".debug_line") bu8(output, 0)
+  bstr(output, ".shstrtab") bu8(output, 0)
+  0
+}
+
+fn elf_link_dynamic_executable(
+  code: i64,
+  data: i64,
+  libraries: List<NativeLinkLibrary>,
+  symbols: List<NativeLinkSymbol>,
+  debug_information: NativeLinkDebugInformation
+) -> Bytes {
+  let image_base = elf_aarch64_image_base()
+  let code_offset = elf_aarch64_code_file_offset()
+  let interpreter_offset = 344
+  let interpreter = native_link_linux_aarch64_interpreter()
+  let data_offset = elf_aarch64_zero_fill_file_offset(buf_len(code))
+  let strings = elf_link_dynamic_strings(libraries, symbols)
+  let symbol_table = elf_link_dynamic_symbols(symbols, elf_link_dynamic_symbol_name_start(libraries))
+  let string_offset = elf_link_align(buf_len(data), 8)
+  let symbol_offset = elf_link_align(string_offset + buf_len(strings), 8)
+  let relocation_offset = elf_link_align(symbol_offset + buf_len(symbol_table), 8)
+  let relocations = elf_link_dynamic_relocations(symbols, image_base + data_offset)
+  let dynamic_offset = elf_link_align(relocation_offset + buf_len(relocations), 8)
+  let dynamic = elf_link_dynamic_entries(
+    libraries,
+    image_base + data_offset + string_offset,
+    image_base + data_offset + symbol_offset,
+    buf_len(strings),
+    image_base + data_offset + relocation_offset,
+    buf_len(relocations)
+  )
+  let data_file_size = dynamic_offset + buf_len(dynamic)
+  let loaded_file_size = data_offset + data_file_size
+  let dwarf = native_dwarf_sections(debug_information, image_base + code_offset)
+  let debug_abbrev = native_dwarf_abbrev(dwarf)
+  let debug_info = native_dwarf_info(dwarf)
+  let debug_line = native_dwarf_line(dwarf)
+  let has_debug = match debug_information {
+    NativeLinkDebugInformationAbsent -> false
+    NativeLinkDwarfFunctionLineInformation(functions) -> true
+  }
+  let abbrev_offset = loaded_file_size
+  let info_offset = abbrev_offset + buf_len(debug_abbrev)
+  let line_offset = info_offset + buf_len(debug_info)
+  let names_offset = line_offset + buf_len(debug_line)
+  let names_size = 49
+  let section_headers_offset = if has_debug { elf_link_align(names_offset + names_size, 8) } else { 0 }
+  let file_size = if has_debug { section_headers_offset + 5 * 64 } else { loaded_file_size }
+  let output = buf_new(file_size)
+  bu32(output, 1179403647)
+  bu8(output, 2) bu8(output, 1) bu8(output, 1) bu8(output, 0)
+  bfill(output, 8)
+  elf_link_u16(output, 2) elf_link_u16(output, 183) bu32(output, 1)
+  bu64(output, image_base + code_offset)
+  bu64(output, 64) bu64(output, section_headers_offset) bu32(output, 0)
+  elf_link_u16(output, 64) elf_link_u16(output, 56) elf_link_u16(output, 5)
+  elf_link_u16(output, if has_debug { 64 } else { 0 })
+  elf_link_u16(output, if has_debug { 5 } else { 0 })
+  elf_link_u16(output, if has_debug { 4 } else { 0 })
+  elf_link_program(output, 1, 5, 0, image_base, code_offset + buf_len(code), code_offset + buf_len(code), 65536)
+  elf_link_program(output, 1, 6, data_offset, image_base + data_offset, data_file_size, data_file_size, 65536)
+  elf_link_program(output, 3, 4, interpreter_offset, image_base + interpreter_offset, __str_len(interpreter) + 1, __str_len(interpreter) + 1, 1)
+  elf_link_program(output, 2, 6, data_offset + dynamic_offset, image_base + data_offset + dynamic_offset, buf_len(dynamic), buf_len(dynamic), 8)
+  elf_link_program(output, 1685382481, 6, 0, 0, 0, 0, 16)
+  bpad(output, interpreter_offset) bstr(output, interpreter) bu8(output, 0)
+  bpad(output, code_offset) bscopy(output, buf_ptr(code), buf_len(code), 0)
+  bpad(output, data_offset) bscopy(output, buf_ptr(data), buf_len(data), 0)
+  bpad(output, data_offset + string_offset) bscopy(output, buf_ptr(strings), buf_len(strings), 0)
+  bpad(output, data_offset + symbol_offset) bscopy(output, buf_ptr(symbol_table), buf_len(symbol_table), 0)
+  bpad(output, data_offset + relocation_offset) bscopy(output, buf_ptr(relocations), buf_len(relocations), 0)
+  bpad(output, data_offset + dynamic_offset) bscopy(output, buf_ptr(dynamic), buf_len(dynamic), 0)
+  if has_debug {
+    bpad(output, abbrev_offset) bscopy(output, buf_ptr(debug_abbrev), buf_len(debug_abbrev), 0)
+    bpad(output, info_offset) bscopy(output, buf_ptr(debug_info), buf_len(debug_info), 0)
+    bpad(output, line_offset) bscopy(output, buf_ptr(debug_line), buf_len(debug_line), 0)
+    bpad(output, names_offset) elf_link_debug_section_names(output)
+    bpad(output, section_headers_offset)
+    elf_link_section_header(output, 0, 0, 0, 0, 0)
+    elf_link_section_header(output, 1, 1, abbrev_offset, buf_len(debug_abbrev), 1)
+    elf_link_section_header(output, 15, 1, info_offset, buf_len(debug_info), 1)
+    elf_link_section_header(output, 27, 1, line_offset, buf_len(debug_line), 1)
+    elf_link_section_header(output, 39, 3, names_offset, names_size, 1)
+  } else { 0 }
+  elf_link_buffer_bytes(output)
+}
+
 pub(package) fn emit_native_link_elf(graph: NativeLinkGraph) -> ElfNativeLinkEmission {
   match graph {
     NativeLinkGraph(target, platform, debug_information, signing, trust_grants, code, archive_data, layout, libraries, placements, symbols, relocations, static_slots) -> {
       let unsupported_library_count = elf_link_unsupported_library_count(libraries)
+      let dynamic_library_count = elf_link_dynamic_library_count(libraries)
       let symbol_count = list_len<NativeLinkSymbol>(symbols)
       let unsupported_relocation_count = elf_link_unsupported_relocation_count(relocations)
       match target {
@@ -86,8 +341,8 @@ pub(package) fn emit_native_link_elf(graph: NativeLinkGraph) -> ElfNativeLinkEmi
         NativeLinkLinuxAarch64 -> {
           if unsupported_library_count != 0 {
             ElfNativeLinkForeignInputsUnsupported(unsupported_library_count)
-          } else { if symbol_count != 0 {
-            ElfNativeLinkDynamicSymbolsUnsupported(symbol_count)
+          } else { if symbol_count != 0 and dynamic_library_count == 0 {
+            ElfNativeLinkUnboundDynamicSymbols(symbol_count)
           } else { if unsupported_relocation_count != 0 {
             ElfNativeLinkRelocationsUnsupported(unsupported_relocation_count)
           } else {
@@ -96,14 +351,20 @@ pub(package) fn emit_native_link_elf(graph: NativeLinkGraph) -> ElfNativeLinkEmi
             match layout {
               NativeLinkImageLayout(stub_base, code_size, text_size, static_offset, static_size, archive_offset, archive_size, archive_align, data_size) -> {
                 let code_base = elf_aarch64_code_file_offset()
-                let data_base = elf_aarch64_zero_fill_file_offset(buf_len(code))
+                let data_base = elf_aarch64_zero_fill_file_offset(code_size)
+                if dynamic_library_count > 0 {
+                  bpad(linked_code, stub_base)
+                  native_link_emit_stubs_at(linked_code, symbols, code_base, data_base, stub_base, 0)
+                } else { 0 }
                 native_link_apply_relocations_at(linked_code, relocations, code_base, data_base, stub_base, static_offset, archive_offset)
                 let zero_fill_size = if static_slots > 0 { static_offset + static_size } else { 0 }
                 let linked_data = buf_new(archive_offset + buf_len(archive_data))
                 bpad(linked_data, archive_offset)
                 bscopy(linked_data, buf_ptr(archive_data), buf_len(archive_data), 0)
                 let linked_bytes = elf_link_buffer_bytes(linked_code)
-                match debug_information {
+                if dynamic_library_count > 0 {
+                  ElfNativeLinkEmitted(elf_link_dynamic_executable(linked_code, linked_data, libraries, symbols, debug_information))
+                } else { match debug_information {
                   NativeLinkDebugInformationAbsent -> {
                     if buf_len(archive_data) > 0 {
                       elf_link_executable_emission(emit_elf_aarch64_standalone_executable_with_data(
@@ -142,7 +403,7 @@ pub(package) fn emit_native_link_elf(graph: NativeLinkGraph) -> ElfNativeLinkEmi
                       ))
                     }
                   }
-                }
+                } }
               }
             }
           } } }
