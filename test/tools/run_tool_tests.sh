@@ -45,6 +45,7 @@ tmp_pkg_cli_dir=$(mktemp -d /tmp/weft_tool_pkg_cli_XXXXXX)
 tmp_pkg_lock_dir=$(mktemp -d /tmp/weft_tool_pkg_lock_XXXXXX)
 tmp_pkg_trust_dir=$(mktemp -d /tmp/weft_tool_pkg_trust_XXXXXX)
 tmp_pkg_missing_dir=$(mktemp -d /tmp/weft_tool_pkg_missing_XXXXXX)
+tmp_project_target_dir=$(mktemp -d /tmp/weft_tool_project_target_XXXXXX)
 tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_lsp_stream_dir=$(mktemp -d /tmp/weft_tool_lsp_stream_XXXXXX)
 tmp_tree_sitter_grammar=$(mktemp /tmp/weft_tool_tree_sitter_grammar_XXXXXX)
@@ -61,7 +62,7 @@ tmp_native_debug_lldb=$(mktemp /tmp/weft_tool_native_debug_lldb_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product.facts.json" "$tmp_elf_product_second" "$tmp_elf_product_second.facts.json" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir" "$tmp_elf_archive_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product.facts.json" "$tmp_elf_product_second" "$tmp_elf_product_second.facts.json" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_project_target_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir" "$tmp_elf_archive_dir"' EXIT
 
 now_s() {
   date +%s
@@ -723,13 +724,53 @@ run_weft_compile_guarded "$WEFT" run "$tmp_run_args_source" -- alpha "two words"
 assert_equals "run_forwards_exact_product_arguments_stdout" "$(<"$tmp_out")" ""
 assert_equals "run_forwards_exact_product_arguments_stderr" "$(<"$tmp_err")" ""
 
+project_init_out=$(cd "$tmp_project_target_dir" && "$WEFT_ABS" pkg init project 2>&1)
+assert_contains "project_target_init_writes_manifest" "$project_init_out" "pkg: wrote weft.pkg"
+cp "$tmp_run_source" "$tmp_project_target_dir/project.weft"
+
+project_build_out=$(cd "$tmp_project_target_dir" && run_weft_compile_guarded "$WEFT_ABS" build 2> "$tmp_err")
+assert_equals "build_default_target_reports_deterministic_output" "$project_build_out" "target/macos-aarch64/project"
+assert_equals "build_default_target_stderr_empty" "$(<"$tmp_err")" ""
+if [ -x "$tmp_project_target_dir/target/macos-aarch64/project" ]; then
+  echo "  ok build_default_target_writes_executable"
+else
+  echo "  fail build_default_target_writes_executable"
+  exit 1
+fi
+assert_contains "build_default_target_writes_adjacent_facts" "$(<"$tmp_project_target_dir/target/macos-aarch64/project.facts.json")" '"target":"macos-aarch64"'
+cp "$tmp_project_target_dir/target/macos-aarch64/project" "$tmp_project_target_dir/project.first"
+cp "$tmp_project_target_dir/target/macos-aarch64/project.facts.json" "$tmp_project_target_dir/project.first.facts.json"
+(cd "$tmp_project_target_dir" && run_weft_compile_guarded "$WEFT_ABS" build >/dev/null 2> "$tmp_err")
+assert_files_equal "build_default_target_is_byte_deterministic" "$tmp_project_target_dir/project.first" "$tmp_project_target_dir/target/macos-aarch64/project"
+assert_files_equal "build_default_target_facts_are_deterministic" "$tmp_project_target_dir/project.first.facts.json" "$tmp_project_target_dir/target/macos-aarch64/project.facts.json"
+
 set +e
-"$WEFT" run > "$tmp_out" 2> "$tmp_err"
-run_missing_exit=$?
+(cd "$tmp_project_target_dir" && run_weft_compile_guarded "$WEFT_ABS" run) > "$tmp_out" 2> "$tmp_err"
+run_default_target_exit=$?
 set -e
-assert_equals "run_requires_source_path" "$run_missing_exit" "2"
-assert_equals "run_missing_path_writes_no_stdout" "$(<"$tmp_out")" ""
-assert_contains "run_missing_path_prints_usage" "$(<"$tmp_err")" "usage: weft run PATH [-- ARG...]"
+assert_equals "run_default_target_forwards_product_exit" "$run_default_target_exit" "42"
+assert_equals "run_default_target_stdout_is_inherited" "$(<"$tmp_out")" ""
+assert_equals "run_default_target_stderr_is_inherited" "$(<"$tmp_err")" ""
+
+(cd "$tmp_project_target_dir" && run_weft_compile_guarded "$WEFT_ABS" build project --target linux-aarch64) > "$tmp_out" 2> "$tmp_err"
+assert_equals "build_named_cross_target_reports_output" "$(<"$tmp_out")" "target/linux-aarch64/project"
+assert_contains "build_named_cross_target_is_static_elf" "$(/usr/bin/file -b "$tmp_project_target_dir/target/linux-aarch64/project")" "statically linked"
+assert_contains "build_named_cross_target_facts_are_typed" "$(<"$tmp_project_target_dir/target/linux-aarch64/project.facts.json")" '"target":"linux-aarch64"'
+
+printf '%s\n' '{"package":"project","manifest_version":1,"version":"0.1.0","weft":"0.1","source_roots":["."],"targets":{"project":{"kind":"binary","source":"project.weft"},"support":{"kind":"library","source":"support.weft"}},"dependencies":{}}' > "$tmp_project_target_dir/weft.pkg"
+set +e
+(cd "$tmp_project_target_dir" && "$WEFT_ABS" build support) > "$tmp_out" 2> "$tmp_err"
+build_library_exit=$?
+set -e
+assert_equals "build_source_library_rejects_executable_interpretation" "$build_library_exit" "2"
+assert_contains "build_source_library_is_actionable" "$(<"$tmp_err")" "is a source library, not an executable"
+
+set +e
+(cd "$tmp_project_target_dir" && "$WEFT_ABS" run missing) > "$tmp_out" 2> "$tmp_err"
+run_missing_target_exit=$?
+set -e
+assert_equals "run_unknown_named_target_exits_usage" "$run_missing_target_exit" "2"
+assert_contains "run_unknown_named_target_is_actionable" "$(<"$tmp_err")" "unknown target 'missing'"
 
 set +e
 "$WEFT" run "$tmp_run_source" unseparated > "$tmp_out" 2> "$tmp_err"
@@ -737,7 +778,7 @@ run_unseparated_exit=$?
 set -e
 assert_equals "run_rejects_unseparated_product_arguments" "$run_unseparated_exit" "2"
 assert_equals "run_unseparated_arguments_write_no_stdout" "$(<"$tmp_out")" ""
-assert_contains "run_unseparated_arguments_print_usage" "$(<"$tmp_err")" "usage: weft run PATH [-- ARG...]"
+assert_contains "run_unseparated_arguments_print_usage" "$(<"$tmp_err")" "usage: weft run [TARGET|PATH] [-- ARG...]"
 
 set +e
 "$WEFT" run "$tmp_run_source.missing" > "$tmp_out" 2> "$tmp_err"
@@ -3414,6 +3455,8 @@ assert_contains "pkg_init_manifest_package" "$pkg_manifest" '"package":"cli_app"
 assert_contains "pkg_init_manifest_schema_version" "$pkg_manifest" '"manifest_version":1'
 assert_contains "pkg_init_manifest_package_version" "$pkg_manifest" '"version":"0.1.0"'
 assert_contains "pkg_init_manifest_weft_version" "$pkg_manifest" '"weft":"0.1"'
+assert_contains "pkg_init_manifest_source_root" "$pkg_manifest" '"source_roots":["."]'
+assert_contains "pkg_init_manifest_binary_target" "$pkg_manifest" '"targets":{"cli_app":{"kind":"binary","source":"cli_app.weft"}}'
 
 printf 'occupied-add-temp\n' > "$tmp_pkg_cli_dir/weft.pkg.weft-tmp-0"
 pkg_add_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg add math deps/math 2>&1)

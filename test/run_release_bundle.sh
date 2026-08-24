@@ -159,12 +159,20 @@ run_weft_in . check app.weft
 run_weft_in . test --jobs 2 test
 run_weft_in . doc deps/math/lib.weft > "$work/project/api.md"
 grep -q 'pub fn add(left: i64, right: i64) -> i64' "$work/project/api.md"
-run_weft_in . build app.weft -o app.one --artifact-facts app.one.facts.json
-run_weft_in . build app.weft -o app.two --artifact-facts app.two.facts.json
+build_output=$(run_weft_in . build)
+if [ "$build_output" != "target/$target/app" ]; then
+  echo "release gate: normal build reported an unexpected artifact path" >&2
+  exit 1
+fi
+cp "$work/project/target/$target/app" "$work/project/app.one"
+cp "$work/project/target/$target/app.facts.json" "$work/project/app.one.facts.json"
+run_weft_in . build >/dev/null
+cp "$work/project/target/$target/app" "$work/project/app.two"
+cp "$work/project/target/$target/app.facts.json" "$work/project/app.two.facts.json"
 cmp "$work/project/app.one" "$work/project/app.two"
 cmp "$work/project/app.one.facts.json" "$work/project/app.two.facts.json"
 run_product
-run_weft_in . run app.weft
+run_weft_in . run
 
 run_weft_in . version --json > "$work/project/version.json"
 run_weft_in . target show "$target" > "$work/project/target.json"
