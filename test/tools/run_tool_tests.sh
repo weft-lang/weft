@@ -3462,7 +3462,7 @@ printf 'occupied-add-temp\n' > "$tmp_pkg_cli_dir/weft.pkg.weft-tmp-0"
 pkg_add_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg add math deps/math 2>&1)
 assert_contains "pkg_add_records_dependency" "$pkg_add_out" "pkg: added dependency"
 pkg_manifest=$(< "$tmp_pkg_cli_dir/weft.pkg")
-assert_contains "pkg_add_manifest_dep" "$pkg_manifest" '"math":"deps/math"'
+assert_contains "pkg_add_manifest_dep" "$pkg_manifest" '"math":{"path":"deps/math"}'
 assert_equals "pkg_add_preserves_occupied_atomic_temp" "$(< "$tmp_pkg_cli_dir/weft.pkg.weft-tmp-0")" "occupied-add-temp"
 if [ -e "$tmp_pkg_cli_dir/weft.pkg.weft-tmp-1" ]; then
   echo "  fail pkg_add_atomic_replace_cleans_selected_temp"
