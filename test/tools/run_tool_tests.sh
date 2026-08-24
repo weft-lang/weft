@@ -711,7 +711,8 @@ assert_contains "elf_linux_panic_selects_write" "$elf_linux_panic_disassembly" $
 assert_contains "elf_linux_panic_selects_exit_group" "$elf_linux_panic_disassembly" $'mov\tx8, #0x5e'
 assert_contains "elf_linux_panic_invokes_linux_svc" "$elf_linux_panic_disassembly" $'svc\t#0'
 assert_contains "elf_linux_panic_uses_aarch64_max_page_alignment" "$elf_linux_panic_headers" "align 2**16"
-assert_contains "elf_linux_panic_maps_compiler_zero_fill_rw" "$elf_linux_panic_headers" "memsz 0x0000000000000010 flags rw-"
+elf_linux_panic_load_count=$(printf "%s\n" "$elf_linux_panic_headers" | awk '/^    LOAD / { count += 1 } END { print count + 0 }')
+assert_equals "elf_linux_panic_elides_unreachable_writable_load" "$elf_linux_panic_load_count" "1"
 
 # Typed console input stays at the ConsoleRead effect surface while the sealed
 # bridge selects Linux read(63). The generated product remains a standalone

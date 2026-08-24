@@ -11,7 +11,9 @@ WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-$WEFT_TEST_RUNA
 WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-1000000}
 PASS=0
 FAIL=0
+SKIP=0
 ERRORS=""
+WEFT_TEST_PLATFORM=${WEFT_TEST_PLATFORM:-$(uname -s)}
 
 now_s() {
   date +%s
@@ -73,6 +75,18 @@ echo ""
 
 for f in test/linked/*.weft; do
   name=$(basename "$f" .weft)
+
+  # Linux standalone artifacts intentionally have no system dynamic library or
+  # GOT. These two tests exercise Darwin's documented libSystem bind contract;
+  # target-neutral semantic write/thread/provenance coverage runs on both.
+  case "$WEFT_TEST_PLATFORM:$name" in
+    Linux:got_basic|Linux:imported_got)
+      echo "  - $name (Darwin system-GOT contract)"
+      SKIP=$((SKIP+1))
+      continue
+      ;;
+  esac
+
   tmpbin=$(mktemp /tmp/weft_linked_XXXXXX)
 
   # Compile straight to the final native-linked executable. No host linker or
@@ -124,7 +138,7 @@ done
 
 echo ""
 echo "=== Linked Summary ==="
-echo "$PASS passed, $FAIL failed"
+echo "$PASS passed, $FAIL failed, $SKIP target-specific skipped"
 if [ -n "$ERRORS" ]; then
   echo ""
   echo "Failures:"
