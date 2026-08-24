@@ -35,8 +35,8 @@ use runtime/buffer.{*}
 use runtime/effects.{*}
 use runtime/memory.{*}
 use runtime/safe_io_standalone.{runtime_standalone_file_read, runtime_standalone_file_read_write, runtime_standalone_file_write, runtime_standalone_package_io}
-use runtime/source_acquire.{SourceAcquire, source_acquire_with_standalone}
-use runtime/string.{runtime_str_from_bytes_copy}
+use runtime/source_acquire.{SourceAcquire, source_acquire_with_sdk, source_acquire_with_standalone}
+use runtime/string.{runtime_str_cstring, runtime_str_from_bytes_copy}
 use runtime/syscall.{*}
 use runtime/terminal.{*}
 use runtime/test_harness.{*}
@@ -48,6 +48,9 @@ use stdlib/diagnostic_type.{*}
 use stdlib/json.{*}
 use stdlib/list.{List, Nil, Cons, list_append, list_cons, list_nil}
 use stdlib/result.{Err, Ok, Result}
+use stdlib/string.{str_concat, str_contains, str_split}
+use stdlib/vector.{vector_get_in_bounds, vector_len}
+use stdlib/vector_type.{Vector}
 
 fn main_alloc_bytes(size: i64) -> i64 {
   alloc_words((size + 7) / 8)
@@ -1603,7 +1606,7 @@ fn main_test_root_plan_assign_group(plans: MainTestRootPlanList, leader: MainTes
   }
 }
 
-fn main_test_root_plan_checked_base(session: ProjectSession, plan: MainTestRootPlan) -> i64 {
+fn main_test_root_plan_checked_base(session: ProjectSession, plan: MainTestRootPlan) -[SourceAcquire]> i64 {
   match plan {
     MainTestReusableRoot(index, path, raw, raw_n, selected, pair_count) -> {
       let path_len = cstr_len(path)
@@ -1620,7 +1623,7 @@ fn main_test_root_plan_checked_base(session: ProjectSession, plan: MainTestRootP
         cpath_can_grant_import_trust(path, path_len)
       )
       project_session_set_source(session, context, runtime_str_from_bytes_copy(raw, raw_n))
-      match project_session_checked_dependency_product(session, context) {
+      match project_session_checked_dependency_product_with_acquire(session, context) {
         ModuleCheckedInstance(fns, tt) -> tt
         InvalidModuleCheckedInstance -> 0
       }
@@ -1636,7 +1639,7 @@ fn main_test_root_plan_pair_count(plan: MainTestRootPlan) -> i64 {
   }
 }
 
-fn main_test_plan_groups(plans: MainTestRootPlanList, all_plans: MainTestRootPlanList, session: ProjectSession, claimed: i64, bases: i64, metrics: i64) -> i64 {
+fn main_test_plan_groups(plans: MainTestRootPlanList, all_plans: MainTestRootPlanList, session: ProjectSession, claimed: i64, bases: i64, metrics: i64) -[SourceAcquire]> i64 {
   match plans {
     MainTestRootPlanNil -> 0
     MainTestRootPlanCons(plan, rest) -> {
@@ -2552,8 +2555,91 @@ fn main_dispatch(argc: i64, argv: i64) -[SourceAcquire]> i64 {
   }
 }
 
+type MainExecutableLocation {
+  MainExecutableLocated(str),
+  MainExecutableUnresolved
+}
+
+type MainSdkLayout {
+  MainBundledSdk(str),
+  MainCheckoutSdk
+}
+
+fn main_path_exists(path: str) -> bool {
+  let stat = alloc_zeroed(sys_stat_scratch_size())
+  sys_stat_follow(runtime_str_cstring(path), stat) >= 0
+}
+
+fn main_path_parent(path: str) -> str {
+  let ptr = __str_ptr(path)
+  let len = __str_len(path)
+  let mut slash = 0 - 1
+  let mut index = 0
+  while index < len {
+    if mem_load8_at(ptr, index) == 47 { slash = index } else { 0 }
+    index = index + 1
+  }
+  if slash < 0 { "" }
+  else { if slash == 0 { "/" }
+  else { runtime_str_from_bytes_copy(ptr, slash) } }
+}
+
+fn main_environment_path(envp: i64) -> str {
+  let mut index = 0
+  let mut path = ""
+  while mem_load64_at(envp, index * 8) != 0 and __str_len(path) == 0 {
+    let entry = mem_load64_at(envp, index * 8)
+    let len = cstr_len(entry)
+    if len >= 5 and src_eq_at(entry, 0, __str_ptr("PATH="), 0, 5) == 1 {
+      path = runtime_str_from_bytes_copy(entry + 5, len - 5)
+    } else { 0 }
+    index = index + 1
+  }
+  path
+}
+
+fn main_find_executable_in_path(name: str, directories: Vector<str>, index: i64) -> MainExecutableLocation {
+  if index >= vector_len<str>(directories) { MainExecutableUnresolved }
+  else {
+    let directory = vector_get_in_bounds<str>(directories, index)
+    let base = if __str_len(directory) == 0 { "." } else { directory }
+    let candidate = str_concat(str_concat(base, "/"), name)
+    if main_path_exists(candidate) { MainExecutableLocated(candidate) }
+    else { main_find_executable_in_path(name, directories, index + 1) }
+  }
+}
+
+fn main_executable_location(argv: i64, envp: i64) -> MainExecutableLocation {
+  let raw = mem_load64_at(argv, 0)
+  let name = runtime_str_from_bytes_copy(raw, cstr_len(raw))
+  if str_contains(name, "/") == 1 { MainExecutableLocated(name) }
+  else {
+    let path = main_environment_path(envp)
+    if __str_len(path) == 0 { MainExecutableUnresolved }
+    else { main_find_executable_in_path(name, str_split(path, ":"), 0) }
+  }
+}
+
+fn main_sdk_layout(argc: i64, argv: i64) -> MainSdkLayout {
+  let envp = argv + (argc + 1) * 8
+  match main_executable_location(argv, envp) {
+    MainExecutableUnresolved -> MainCheckoutSdk
+    MainExecutableLocated(executable) -> {
+      let sdk = str_concat(main_path_parent(executable), "/../lib/weft")
+      let stdlib_marker = str_concat(sdk, "/stdlib/test.weft")
+      let runtime_marker = str_concat(sdk, "/runtime/syscall.weft")
+      if main_path_exists(stdlib_marker) and main_path_exists(runtime_marker) {
+        MainBundledSdk(sdk)
+      } else { MainCheckoutSdk }
+    }
+  }
+}
+
 fn main_dispatch_standalone(argc: i64, argv: i64) -> i64 {
-  source_acquire_with_standalone(() => main_dispatch(argc, argv))
+  match main_sdk_layout(argc, argv) {
+    MainBundledSdk(root) -> source_acquire_with_sdk(root, () => main_dispatch(argc, argv))
+    MainCheckoutSdk -> source_acquire_with_standalone(() => main_dispatch(argc, argv))
+  }
 }
 
 -- Color is presentation-only state. Machine renderers consume the structured
@@ -3146,11 +3232,11 @@ fn main_check_register_path(session: ProjectSession, path: i64) -> i64 {
   }
 }
 
-fn main_check_registered_path(session: ProjectSession, path: i64) -> i64 {
-  run_check_project_result(project_session_check(session, main_check_context(path)))
+fn main_check_registered_path(session: ProjectSession, path: i64) -[SourceAcquire]> i64 {
+  run_check_project_result(project_session_check_with_acquire(session, main_check_context(path)))
 }
 
-fn run_check_path(path: i64) -> i64 {
+fn run_check_path(path: i64) -[SourceAcquire]> i64 {
   let session = project_session_new_with_root_registration(1, main_project_register_root)
   main_check_register_path(session, path)
   main_check_registered_path(session, path)
@@ -3178,7 +3264,7 @@ fn main_check_redirect_stderr(path: i64) -> i64 {
   }
 }
 
-fn main_check_spawn_worker(session: ProjectSession, path: i64, index: i64, owner_pid: i64) -> i64 {
+fn main_check_spawn_worker(session: ProjectSession, path: i64, index: i64, owner_pid: i64) -[SourceAcquire]> i64 {
   let output_path = main_check_output_path(owner_pid, index)
   sys_remove(output_path)
   let fork_result = sys_proc_fork()
@@ -3213,7 +3299,7 @@ fn main_check_replay_result(path: i64, owner_pid: i64, index: i64, result: i64, 
   0
 }
 
-fn main_check_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -> i64 {
+fn main_check_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -[SourceAcquire]> i64 {
   let count = nlist_len(paths)
   let pids = alloc_zeroed(jobs * 8)
   let indexes = alloc_zeroed(jobs * 8)
@@ -3298,7 +3384,7 @@ fn main_check_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -> i64 {
   failures
 }
 
-fn run_check_paths(argc: i64, argv: i64, first_path: i64, jobs: i64) -> i64 {
+fn run_check_paths(argc: i64, argv: i64, first_path: i64, jobs: i64) -[SourceAcquire]> i64 {
   let paths = nlist_new()
   for i in first_path..argc { nlist_add(paths, mem_load64_at(argv, i * 8)) }
   if nlist_len(paths) == 0 {
@@ -4101,7 +4187,7 @@ fn mcp_project_update_source(session: ProjectSession, src: i64, n: i64) -> Proje
 
 fn mcp_project_checked_source(session: ProjectSession, src: i64, n: i64) -[SourceAcquire]> TypedModule {
   let context = mcp_project_update_source(session, src, n)
-  match project_session_check(session, context) {
+  match project_session_check_with_acquire(session, context) {
     ProjectCheckSucceeded(typed, source_n, parse_diagnostics, check_diagnostics) -> typed
     ProjectCheckFailed(typed, source_n, parse_diagnostics, check_diagnostics) -> typed
     -- Fact tools historically query the recovered typed module even when
@@ -4126,7 +4212,7 @@ fn mcp_emit_parse_summary_from_ast(b: i64, ast: AstModule) -> i64 {
 
 fn mcp_emit_parse_summary(b: i64, session: ProjectSession, src: i64, n: i64) -[SourceAcquire]> i64 {
   let context = mcp_project_update_source(session, src, n)
-  match project_session_parse(session, context) {
+  match project_session_parse_with_acquire(session, context) {
     ProjectParseSucceeded(ast, source_n, diagnostics) -> mcp_emit_parse_summary_from_ast(b, ast)
     ProjectParseFailed(ast, source_n, diagnostics) -> mcp_emit_parse_summary_from_ast(b, ast)
     -- Input was installed immediately above. These states signal an internal
@@ -4149,7 +4235,7 @@ fn mcp_emit_check_summary_from_typed(b: i64, typed: TypedModule) -> i64 {
 
 fn mcp_emit_check_summary(b: i64, session: ProjectSession, src: i64, n: i64) -[SourceAcquire]> i64 {
   let context = mcp_project_update_source(session, src, n)
-  match project_session_check(session, context) {
+  match project_session_check_with_acquire(session, context) {
     ProjectCheckSucceeded(typed, source_n, parse_diagnostics, check_diagnostics) -> mcp_emit_check_summary_from_typed(b, typed)
     ProjectCheckFailed(typed, source_n, parse_diagnostics, check_diagnostics) -> mcp_emit_check_summary_from_typed(b, typed)
     -- Parse recovery and session invariant failures retain the historical
@@ -4201,7 +4287,7 @@ fn mcp_emit_ir_summary_legacy(b: i64, src: i64, n: i64) -[SourceAcquire]> i64 {
 
 fn mcp_emit_ir_summary(b: i64, session: ProjectSession, src: i64, n: i64) -[SourceAcquire]> i64 {
   let context = mcp_project_update_source(session, src, n)
-  match project_session_check(session, context) {
+  match project_session_check_with_acquire(session, context) {
     ProjectCheckSucceeded(typed, source_n, parse_diagnostics, check_diagnostics) -> mcp_emit_ir_summary_result(b, typed, 0)
     ProjectCheckFailed(typed, source_n, parse_diagnostics, check_diagnostics) -> mcp_emit_ir_summary_result(b, typed, 1)
     _ -> mcp_emit_ir_summary_legacy(b, src, n)
@@ -4721,9 +4807,9 @@ fn mcp_emit_project_parse_diagnostics_result(b: i64, ast: AstModule, diagnostics
   }
 }
 
-fn mcp_emit_diagnostics(b: i64, session: ProjectSession, src: i64, n: i64) -> i64 {
+fn mcp_emit_diagnostics(b: i64, session: ProjectSession, src: i64, n: i64) -[SourceAcquire]> i64 {
   let context = mcp_project_update_source(session, src, n)
-  match project_session_check(session, context) {
+  match project_session_check_with_acquire(session, context) {
     ProjectCheckSucceeded(typed, source_n, parse_diagnostics, check_diagnostics) -> mcp_emit_project_diagnostics_result(b, typed, parse_diagnostics, check_diagnostics, 0)
     ProjectCheckFailed(typed, source_n, parse_diagnostics, check_diagnostics) -> mcp_emit_project_diagnostics_result(
       b,
@@ -6374,7 +6460,7 @@ fn lsp_state_file_path(st: i64) -> i64 {
 }
 
 fn lsp_check_state_quiet(st: i64, session: ProjectSession) -[SourceAcquire]> TypedModule {
-  match project_session_check(session, lsp_project_selected_context(st)) {
+  match project_session_check_with_acquire(session, lsp_project_selected_context(st)) {
     ProjectCheckSucceeded(typed, source_n, parse_diagnostics, check_diagnostics) -> typed
     ProjectCheckFailed(typed, source_n, parse_diagnostics, check_diagnostics) -> typed
     -- Preserve the historical recovery surface if an incremental query cannot
@@ -6645,8 +6731,8 @@ fn lsp_append_project_diagnostics(st: i64, items: i64, count: i64, diagnostics: 
   0
 }
 
-fn lsp_collect_diagnostics(st: i64, items: i64, count: i64, session: ProjectSession) -> i64 {
-  match project_session_check(session, lsp_project_selected_context(st)) {
+fn lsp_collect_diagnostics(st: i64, items: i64, count: i64, session: ProjectSession) -[SourceAcquire]> i64 {
+  match project_session_check_with_acquire(session, lsp_project_selected_context(st)) {
     ProjectCheckSucceeded(typed, source_n, parse_diagnostics, check_diagnostics) -> {
       lsp_append_project_diagnostics(st, items, count, parse_diagnostics)
       lsp_append_project_diagnostics(st, items, count, check_diagnostics)
@@ -6853,7 +6939,7 @@ fn lsp_emit_formatting(req: i64, n: i64, root: i64, st: i64) -> i64 {
   }
 }
 
-fn lsp_emit_publish_diagnostics(st: i64, session: ProjectSession) -> i64 {
+fn lsp_emit_publish_diagnostics(st: i64, session: ProjectSession) -[SourceAcquire]> i64 {
   let body = buf_new(4096)
   let src = lsp_state_src_ptr(st)
   let n = lsp_state_src_len(st)
@@ -6870,7 +6956,7 @@ fn lsp_emit_publish_diagnostics(st: i64, session: ProjectSession) -> i64 {
   lsp_write_body(body)
 }
 
-fn lsp_emit_graph_diagnostics(st: i64, preferred: i64, session: ProjectSession) -> i64 {
+fn lsp_emit_graph_diagnostics(st: i64, preferred: i64, session: ProjectSession) -[SourceAcquire]> i64 {
   let docs = lsp_state_documents(st)
   for i in 0..nlist_len(docs) {
     let doc = nlist_get(docs, i)
@@ -7199,7 +7285,7 @@ fn lsp_emit_code_action(req: i64, n: i64, root: i64) -> i64 {
   lsp_write_body(body)
 }
 
-fn lsp_handle_open(req: i64, n: i64, root: i64, st: i64, session: ProjectSession) -> i64 {
+fn lsp_handle_open(req: i64, n: i64, root: i64, st: i64, session: ProjectSession) -[SourceAcquire]> i64 {
   let uri_pair = lsp_extract_text_document_string(req, n, root, "uri")
   let text_pair = lsp_extract_text_document_string(req, n, root, "text")
   let version = lsp_extract_text_document_version(req, n, root, 1)
@@ -7207,7 +7293,7 @@ fn lsp_handle_open(req: i64, n: i64, root: i64, st: i64, session: ProjectSession
   lsp_emit_graph_diagnostics(st, lsp_state_find_doc(st, mem_load64_at(uri_pair, 0), mem_load64_at(uri_pair, 8)), session)
 }
 
-fn lsp_handle_change(req: i64, n: i64, root: i64, st: i64, session: ProjectSession) -> i64 {
+fn lsp_handle_change(req: i64, n: i64, root: i64, st: i64, session: ProjectSession) -[SourceAcquire]> i64 {
   let uri_pair = lsp_extract_text_document_string(req, n, root, "uri")
   let uri_ptr = mem_load64_at(uri_pair, 0)
   let uri_n = mem_load64_at(uri_pair, 8)
@@ -7227,7 +7313,7 @@ fn lsp_handle_change(req: i64, n: i64, root: i64, st: i64, session: ProjectSessi
   }
 }
 
-fn lsp_handle_close(req: i64, n: i64, root: i64, st: i64, session: ProjectSession) -> i64 {
+fn lsp_handle_close(req: i64, n: i64, root: i64, st: i64, session: ProjectSession) -[SourceAcquire]> i64 {
   let uri_pair = lsp_extract_text_document_string(req, n, root, "uri")
   let doc = lsp_state_find_doc(st, mem_load64_at(uri_pair, 0), mem_load64_at(uri_pair, 8))
   if doc != 0 {
