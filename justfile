@@ -15,13 +15,13 @@ bootstrap:
     set -e
     echo "=== Bootstrap chain ==="
     echo "Stage 1: ./weft → weft1"
-    ./weft compile compiler/main.weft > /tmp/weft_b1
+    ./weft build compiler/main.weft -o /tmp/weft_b1
     chmod +x /tmp/weft_b1
     echo "Stage 2: weft1 → weft2"
-    /tmp/weft_b1 compile compiler/main.weft > /tmp/weft_b2
+    /tmp/weft_b1 build compiler/main.weft -o /tmp/weft_b2
     chmod +x /tmp/weft_b2
     echo "Stage 3: weft2 → weft3"
-    /tmp/weft_b2 compile compiler/main.weft > /tmp/weft_b3
+    /tmp/weft_b2 build compiler/main.weft -o /tmp/weft_b3
     chmod +x /tmp/weft_b3
     echo "=== Gate check ==="
     if diff <(xxd /tmp/weft_b2) <(xxd /tmp/weft_b3) > /dev/null; then
@@ -57,9 +57,9 @@ counters:
     set -e
     bin=$(mktemp /tmp/weft_counters_XXXXXX)
     trap 'rm -f "$bin"' EXIT
-    ./weft compile compiler/main.weft > "$bin"
+    ./weft build compiler/main.weft -o "$bin"
     chmod +x "$bin"
-    echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"use \"compiler/main.weft\""}}}' | "$bin" mcp
+    echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"use compiler/main.{*}"}}}' | "$bin" mcp
     echo ""
 
 # Build the live compiler with 5a's measurement-only reclamation census, then
@@ -72,7 +72,7 @@ rc-census:
     instrumented=$(mktemp /tmp/weft_rc_census_XXXXXX)
     output=$(mktemp /tmp/weft_rc_census_output_XXXXXX)
     trap 'rm -f "$live" "$instrumented" "$output"' EXIT
-    ./weft compile compiler/main.weft > "$live"
+    ./weft build compiler/main.weft -o "$live"
     chmod +x "$live"
     "$live" compile --rc-census compiler/main.weft > "$instrumented"
     chmod +x "$instrumented"

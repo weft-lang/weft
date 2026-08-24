@@ -144,7 +144,7 @@ ok "formatted_compiler_reports_zero_errors"
 if ! (
   cd "$MIRROR"
   run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" \
-    "$WEFT_ABS" compile compiler/main.weft > weft-formatted-1 2> compiler-1.err
+    "$WEFT_ABS" build compiler/main.weft -o weft-formatted-1 > compiler-1.out 2> compiler-1.err
 ); then
   fail "formatted_compiler_stage_one_builds" "$MIRROR/compiler-1.err"
 fi
@@ -153,7 +153,7 @@ chmod +x "$MIRROR/weft-formatted-1"
 if ! (
   cd "$MIRROR"
   run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" \
-    ./weft-formatted-1 compile compiler/main.weft > weft-formatted-2 2> compiler-2.err
+    ./weft-formatted-1 build compiler/main.weft -o weft-formatted-2 > compiler-2.out 2> compiler-2.err
 ); then
   fail "formatted_compiler_self_compiles" "$MIRROR/compiler-2.err"
 fi
