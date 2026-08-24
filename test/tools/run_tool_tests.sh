@@ -634,6 +634,58 @@ set -e
 assert_equals "doc_extra_arg_exits_usage" "$doc_extra_arg_exit" "2"
 assert_contains "doc_extra_arg_prints_usage" "$(<"$tmp_err")" "usage: weft doc PATH"
 
+version_out=$("$WEFT" --version 2> "$tmp_err")
+assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 2; targets macos-aarch64,linux-aarch64)"
+assert_equals "version_human_stderr_empty" "$(<"$tmp_err")" ""
+version_json=$("$WEFT" version --json 2> "$tmp_err")
+assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":2,"targets":["macos-aarch64","linux-aarch64"]}'
+assert_equals "version_json_stderr_empty" "$(<"$tmp_err")" ""
+
+target_list=$("$WEFT" target list 2> "$tmp_err")
+assert_equals "target_list_is_canonical_and_stable" "$target_list" $'macos-aarch64\nlinux-aarch64'
+assert_equals "target_list_stderr_empty" "$(<"$tmp_err")" ""
+macos_target=$("$WEFT" target show macos-aarch64 2> "$tmp_err")
+assert_equals "target_show_macos_is_exact" "$macos_target" '{"target":"macos-aarch64","host":true,"architecture":"aarch64","binary_format":"mach-o-64","minimum_platform_abi":{"platform":"macos","major":11,"minor":0,"patch":0},"standalone_default":true,"product_linker":"weft-native"}'
+assert_equals "target_show_macos_stderr_empty" "$(<"$tmp_err")" ""
+linux_target=$("$WEFT" target show linux-aarch64 2> "$tmp_err")
+assert_equals "target_show_linux_is_exact" "$linux_target" '{"target":"linux-aarch64","host":false,"architecture":"aarch64","binary_format":"elf64","minimum_platform_abi":{"platform":"linux","abi":"kernel","major":3,"minor":7,"patch":0,"libc":"none","dynamic_loader":"none"},"standalone_default":true,"product_linker":"weft-native"}'
+assert_equals "target_show_linux_stderr_empty" "$(<"$tmp_err")" ""
+default_target=$("$WEFT" target show 2> "$tmp_err")
+assert_equals "target_show_defaults_to_host" "$default_target" "$macos_target"
+assert_equals "target_show_default_stderr_empty" "$(<"$tmp_err")" ""
+
+set +e
+"$WEFT" target show aarch64-linux > "$tmp_out" 2> "$tmp_err"
+invalid_inspection_target_exit=$?
+set -e
+assert_equals "target_show_rejects_alias" "$invalid_inspection_target_exit" "2"
+assert_equals "target_show_alias_writes_no_stdout" "$(<"$tmp_out")" ""
+assert_contains "target_show_alias_reports_canonical_values" "$(<"$tmp_err")" "macos-aarch64 or linux-aarch64"
+
+set +e
+"$WEFT" --version extra > "$tmp_out" 2> "$tmp_err"
+version_extra_exit=$?
+set -e
+assert_equals "version_global_rejects_extra_argument" "$version_extra_exit" "2"
+assert_equals "version_global_extra_writes_no_stdout" "$(<"$tmp_out")" ""
+assert_contains "version_global_extra_prints_usage" "$(<"$tmp_err")" "usage: weft --version"
+
+set +e
+"$WEFT" version --yaml > "$tmp_out" 2> "$tmp_err"
+version_format_exit=$?
+set -e
+assert_equals "version_rejects_unknown_format" "$version_format_exit" "2"
+assert_equals "version_unknown_format_writes_no_stdout" "$(<"$tmp_out")" ""
+assert_contains "version_unknown_format_prints_usage" "$(<"$tmp_err")" "usage: weft version [--json]"
+
+set +e
+"$WEFT" target list extra > "$tmp_out" 2> "$tmp_err"
+target_list_extra_exit=$?
+set -e
+assert_equals "target_list_rejects_extra_argument" "$target_list_extra_exit" "2"
+assert_equals "target_list_extra_writes_no_stdout" "$(<"$tmp_out")" ""
+assert_contains "target_list_extra_prints_usage" "$(<"$tmp_err")" "usage: weft target list"
+
 "$WEFT" compile tools/tree_sitter_grammar.weft > "$tmp_tree_sitter_generator" 2> "$tmp_err"
 chmod +x "$tmp_tree_sitter_generator"
 assert_equals "tree_sitter_generator_build_stderr_empty" "$(<"$tmp_err")" ""
