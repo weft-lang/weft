@@ -121,6 +121,16 @@ run_binary_guarded() {
   run_guarded "$WEFT_TEST_RUN_TIMEOUT" "$WEFT_TEST_RUN_RSS_LIMIT_KB" "$@"
 }
 
+# A product generator is a compiler run, not a product run: it drives the whole
+# checked pipeline over the product's module graph, so its memory is
+# compile-shaped. Guarding it with the product-run limit was a latent flake --
+# the DNS generator reaches ~3.0 GiB compiling the Unicode/IDNA graph reached
+# through DomainName, and even the shutdown generator's ~0.8 GiB left almost no
+# headroom, so whether the gate passed depended on which poll caught the peak.
+run_generator_guarded() {
+  run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$@"
+}
+
 assert_contains() {
   local name="$1"
   local haystack="$2"
@@ -632,9 +642,9 @@ assert_files_equal "tree_sitter_grammar_is_deterministic" "$tmp_tree_sitter_gram
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_aarch64_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_aarch64_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_aarch64_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 elf_file=$(/usr/bin/file -b "$tmp_elf_product")
 assert_contains "elf_linux_aarch64_file_reports_architecture" "$elf_file" "ARM aarch64"
@@ -659,9 +669,9 @@ assert_contains "elf_linux_aarch64_invokes_linux_svc" "$elf_disassembly" $'svc\t
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_pipeline_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_pipeline_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_pipeline_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_pipeline_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 elf_pipeline_file=$(/usr/bin/file -b "$tmp_elf_product")
 assert_contains "elf_linux_pipeline_file_reports_architecture" "$elf_pipeline_file" "ARM aarch64"
@@ -686,9 +696,9 @@ assert_contains "elf_linux_pipeline_selects_exit_group" "$elf_pipeline_disassemb
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_panic_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_panic_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_panic_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_panic_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_panic_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_panic_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -705,9 +715,9 @@ assert_contains "elf_linux_panic_maps_compiler_zero_fill_rw" "$elf_linux_panic_h
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_console_read_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_console_read_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_console_read_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_console_read_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_console_read_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_console_read_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -723,9 +733,9 @@ assert_not_contains "elf_linux_console_read_has_no_dynamic_segment" "$elf_linux_
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_console_write_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_console_write_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_console_write_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_console_write_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_console_write_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_console_write_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -742,9 +752,9 @@ assert_not_contains "elf_linux_console_write_has_no_dynamic_segment" "$elf_linux
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_file_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_file_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_file_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_file_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_file_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_file_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -764,9 +774,9 @@ assert_not_contains "elf_linux_file_has_no_dynamic_segment" "$elf_linux_file_hea
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_streaming_file_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_streaming_file_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_streaming_file_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_streaming_file_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_streaming_file_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_streaming_file_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -789,9 +799,9 @@ assert_not_contains "elf_linux_streaming_file_has_no_dynamic_segment" "$elf_linu
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_directory_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_directory_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_directory_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_directory_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_directory_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_directory_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -815,9 +825,9 @@ assert_not_contains "elf_linux_directory_has_no_dynamic_segment" "$elf_linux_dir
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_time_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_time_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_time_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_time_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_time_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_time_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -834,9 +844,9 @@ assert_not_contains "elf_linux_time_has_no_dynamic_segment" "$elf_linux_time_hea
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_env_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_env_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_env_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_env_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_env_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_env_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -853,9 +863,9 @@ assert_not_contains "elf_linux_env_has_no_dynamic_segment" "$elf_linux_env_heade
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_process_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_process_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_process_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_process_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_process_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_process_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -883,9 +893,9 @@ assert_not_contains "elf_linux_process_has_no_dynamic_segment" "$elf_linux_proce
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_par_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_par_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_par_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_par_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_par_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_par_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -907,9 +917,9 @@ assert_not_contains "elf_linux_par_has_no_dynamic_segment" "$elf_linux_par_heade
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_tcp_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_tcp_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_tcp_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_tcp_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_tcp_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_tcp_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -936,9 +946,9 @@ assert_not_contains "elf_linux_tcp_has_no_dynamic_segment" "$elf_linux_tcp_heade
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_readiness_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_readiness_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_readiness_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_readiness_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_readiness_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_readiness_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -960,9 +970,9 @@ assert_not_contains "elf_linux_readiness_has_no_dynamic_segment" "$elf_linux_rea
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_shutdown_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_shutdown_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_shutdown_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_shutdown_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_shutdown_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_shutdown_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -986,9 +996,9 @@ assert_not_contains "elf_linux_shutdown_has_no_dynamic_segment" "$elf_linux_shut
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_dns_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_dns_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_dns_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_dns_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_dns_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_dns_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -1017,9 +1027,9 @@ assert_contains "elf_linux_dns_opens_cloexec_tcp_socket" "$elf_linux_dns_socket_
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_dns_transport_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_dns_transport_generator_build_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
 assert_equals "elf_linux_dns_transport_generator_run_stderr_empty" "$(<"$tmp_err")" ""
-run_binary_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_dns_transport_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_dns_transport_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
 elf_linux_dns_transport_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
@@ -1671,7 +1681,7 @@ assert_equals "diagnostic_effect_discharge_teaches_parameter_identity_golden" "$
 
 printf '%s\n' 'type Box<T> { Box(T) } trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> Identity for Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(Box<bool>(true)) }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
-assert_equals "diagnostic_trait_conformance_replays_conditional_proof_golden" "$diag_out" $'line 1, col 200: error[E1004]: type `Box<bool>` does not implement `Identity`\n  |\n1 | ...ed<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(Box<bool>(true)) }\n  |                                                                           ^~~~~~~~~ type `Box<bool>` does not implement `Identity`\nline 1, col 113: note: matching impl candidate rejected by its own bound\n  |\n1 | ...T: Marked> Identity for Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bo...\n  |                            ^~~ matching impl candidate rejected by its own bound\nline 1, col 135: note: required by this trait bound\n  |\n1 | ...r Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(...\n  |                            ^~~~~~~~ required by this trait bound\nline 1, col 47: note: trait declared here\n  |\n1 | ... trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> Identity for Box<T> { }...\n  |                            ^~~~~~~~ trait declared here\nline 1, col 6: note: target type declared here\n  |\n1 | type Box<T> { Box(T) } trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> I...\n  |      ^~~ target type declared here\nhelp: a matching `Box<T>` impl candidate exists, but it requires `bool: Marked`; satisfy that nested bound or use another type.\ncheck: 482 functions, 1 errors'
+assert_equals "diagnostic_trait_conformance_replays_conditional_proof_golden" "$diag_out" $'line 1, col 200: error[E1004]: type `Box<bool>` does not implement `Identity`\n  |\n1 | ...ed<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(Box<bool>(true)) }\n  |                                                                           ^~~~~~~~~ type `Box<bool>` does not implement `Identity`\nline 1, col 113: note: matching impl candidate rejected by its own bound\n  |\n1 | ...T: Marked> Identity for Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bo...\n  |                            ^~~ matching impl candidate rejected by its own bound\nline 1, col 135: note: required by this trait bound\n  |\n1 | ...r Box<T> { } fn need<T: Identity>(value: T) -> T { value } fn main() -> Box<bool> { need<Box<bool>>(...\n  |                            ^~~~~~~~ required by this trait bound\nline 1, col 47: note: trait declared here\n  |\n1 | ... trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> Identity for Box<T> { }...\n  |                            ^~~~~~~~ trait declared here\nline 1, col 6: note: target type declared here\n  |\n1 | type Box<T> { Box(T) } trait Marked { } trait Identity { } impl Marked for i64 { } impl<T: Marked> I...\n  |      ^~~ target type declared here\nhelp: a matching `Box<T>` impl candidate exists, but it requires `bool: Marked`; satisfy that nested bound or use another type.\ncheck: 490 functions, 1 errors'
 
 printf '%s\n' 'fn main() -> i64 { let café = 1 café }' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1 || true)
