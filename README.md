@@ -53,10 +53,10 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 **Self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root.
 
-- 4103 runtime test blocks across 334 files, plus 803 negative (must-fail) cases
+- 4116 runtime test blocks across 334 files, plus 803 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
-- Current work: the public-alpha product gate—fast project feedback, complete docs/tooling, safe networking, remote dependency workflow, and release/install UX
+- Current work: the public-alpha product gate—safe networking, dependency capability/trust review, and signed release/install UX
 
 ## Quick Start
 
@@ -115,6 +115,12 @@ host product and its facts to `target/<platform>/<name>` and
 default target. A named target can be selected as `weft build NAME` or
 `weft run NAME -- ARG...`. The `build PATH -o OUTPUT` form above remains the
 explicit low-level artifact path.
+
+Dependencies are typed as live owner-relative paths, exact Git revisions, or
+HTTPS archives with a declared SHA-256. `weft pkg lock`/`fetch` populate an
+immutable content-addressed cache; ordinary project commands are cache-only,
+and `weft pkg fetch --offline` verifies the complete locked graph without
+network authority. Acquisition helpers are not linked into Weft products.
 
 `weft version --json` reports the same compiler, language, manifest, lock,
 native-binding ABI, artifact-facts schema, and supported-target identities as

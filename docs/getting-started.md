@@ -8,9 +8,9 @@ compiler are static kernel-ABI executables. x86-64 is post-alpha.
 This guide describes both the repository toolchain and the extracted SDK shape
 as they exist now. `weft build` is the native final-product path, including
 cross-target selection and artifact facts. Installed-SDK discovery,
-deterministic target archives, and direct `weft run` execution are implemented.
-The remote locked-source cache and public signing/notarization channel have not
-landed yet.
+deterministic target archives, direct `weft run` execution, and immutable
+locked-source acquisition are implemented. The public signing/notarization
+channel has not landed yet.
 
 ## Install a local SDK archive
 
@@ -170,11 +170,11 @@ fn main() -> i64 {
 Use `bytes_to_utf8` or `path_to_utf8` when crossing from arbitrary bytes to
 text; both preserve a typed failure with the invalid byte offset.
 
-## Local path packages
+## Packages and locked sources
 
 Package identity is content-locked and module imports are qualified. With an
 extracted SDK's `bin/` (or the repository root) on `PATH`, start in an empty
-project directory. The current CLI manages local/path dependencies:
+project directory. Local path dependencies remain the shortest first example:
 
 ```bash project
 mkdir -p deps/math
@@ -231,17 +231,44 @@ Cross-building keeps the same layout, for example
 checking, documentation, and whole-program compilation; they do not pretend
 that Weft has frozen a native archive ABI.
 
-That ordering matters: changing any package source after `pkg lock` changes
-its content identity, and the next consuming command rejects the stale lock.
-A hosted registry and full semver solver are not part of the first alpha;
-local locked source dependencies are.
+That ordering matters: changing any path-package source after `pkg lock`
+changes its content identity, and the next consuming command rejects the stale
+lock. Path dependencies are deliberately live and owner-relative; the cache
+never shadows them.
+
+Remote dependencies use an exact typed source rather than a moving version
+range. Git sources require a lowercase 40- or 64-hex object revision. Archive
+sources require an HTTPS URL and the `sha256:` transport digest:
+
+```bash
+weft pkg add parser --git https://example.org/parser.git \
+  --revision 0123456789abcdef0123456789abcdef01234567
+weft pkg add data --archive https://example.org/data.tar \
+  --sha256 sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+weft pkg lock
+weft pkg fetch --offline
+```
+
+`pkg lock` and online `pkg fetch` are the only operations here that may invoke
+the audited Git/HTTPS provider commands. Ordinary `build`, `run`, `check`,
+`test`, `fmt`, and `doc` are cache-only and never start a network process.
+Verified trees live at `.weft/cache/sha256/<tree-digest>`; archive traversal,
+links, special files, duplicate paths, size-limit violations, and byte drift
+are rejected before admission. `pkg update NAME --revision HEX` or
+`pkg update NAME --sha256 sha256:HEX` is the explicit pin-changing operation.
+An offline miss reports `E5011`, cache drift reports `E5012`, and provider or
+transport refusal reports `E5013`. Git and `curl` are acquisition-time helper
+requirements only—not compiler, linker, or deployed-program dependencies.
+
+A hosted registry and full semver solver are not part of the first alpha.
 
 An installed compiler resolves canonical `stdlib/` and `runtime/` imports from
 its own adjacent SDK while project and dependency imports continue through the
 project graph. `test/run_release_bundle.sh` verifies the commands above from an
 actual extracted archive, in a clean temporary project, with only the bundle's
-`bin/` on the compiler PATH. It performs the same exercise in a network-disabled
-Linux/AArch64 container.
+`bin/` on the compiler PATH. It acquires a pinned archive through a deterministic
+local HTTPS-provider fixture, removes that provider and source, then performs
+the offline rebuild in a network-disabled Linux/AArch64 container.
 
 ## Diagnostics, formatting, and API docs
 
@@ -263,9 +290,9 @@ documented/public API census; it never reconstructs signatures from text.
 ## Where the alpha deliberately stops
 
 Before the public-alpha cut, the workboard still requires the complete
-target-local Linux release matrix on CI, safe TLS/HTTP, remote locked-source
-cache/update behavior, normal named-target output UX, the final example-product
-exercise, and release signing/hardening. x86-64, a hosted package registry,
+target-local Linux release matrix on CI, safe TLS/HTTP, capability/trust update
+diffs, the final example-product exercise, and release signing/hardening.
+x86-64, a hosted package registry,
 HTTP/2+ and a forever-stable native ABI are explicitly later.
 The authoritative live status is the repository README and, for contributors,
 `internal/briefs/INDEX.md`.
