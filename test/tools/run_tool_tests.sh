@@ -723,10 +723,15 @@ assert_contains "elf_linux_debug_maps_main_line" "$elf_linux_debug_main" $'DW_AT
 
 # A real AArch64 ELF relocatable member travels through archive framing, typed
 # object parsing, symbol closure, shared graph layout, and Linux finalization.
-# The fixture needs no headers or sysroot and deliberately contains code only;
-# the semantic tests reject allocatable data until that typed slice lands.
+# The fixture needs no headers or sysroot and exercises executable text,
+# initialized data, zero-fill data, and page/low-12 relocation pairs.
 printf '%s\n' \
-  'long weft_linux_archive_value(void) { return 42; }' \
+  'long weft_linux_archive_data = 40;' \
+  'long weft_linux_archive_bss;' \
+  'long weft_linux_archive_value(void) {' \
+  '  weft_linux_archive_bss = 2;' \
+  '  return weft_linux_archive_data + weft_linux_archive_bss;' \
+  '}' \
   > "$tmp_elf_archive_dir/fixture.c"
 /usr/bin/clang \
   --target=aarch64-linux-gnu \
@@ -749,8 +754,12 @@ elf_linux_archive_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm
 assert_contains "elf_linux_archive_product_is_static" "$elf_linux_archive_file" "statically linked"
 assert_not_contains "elf_linux_archive_has_no_interpreter" "$elf_linux_archive_headers" "INTERP off"
 assert_not_contains "elf_linux_archive_has_no_dynamic_segment" "$elf_linux_archive_headers" "DYNAMIC off"
+assert_contains "elf_linux_archive_has_read_write_data_load" "$elf_linux_archive_headers" "flags rw-"
 assert_contains "elf_linux_archive_root_branches_to_member" "$elf_linux_archive_disassembly" $'bl\t0x40100c'
-assert_contains "elf_linux_archive_member_returns_value" "$elf_linux_archive_disassembly" $'mov\tx0, #0x2a'
+assert_contains "elf_linux_archive_member_addresses_data" "$elf_linux_archive_disassembly" $'adrp\tx9, 0x410000'
+assert_contains "elf_linux_archive_member_stores_zero_fill" "$elf_linux_archive_disassembly" $'str\tx8, [x9, #0x8]'
+assert_contains "elf_linux_archive_member_loads_initialized_data" "$elf_linux_archive_disassembly" $'ldr\tx8, [x8]'
+assert_contains "elf_linux_archive_member_combines_values" "$elf_linux_archive_disassembly" $'add\tx0, x8, x9'
 assert_contains "elf_linux_archive_root_preserves_exit_value" "$elf_linux_archive_disassembly" $'mov\tx8, #0x5d'
 
 # Fatal reporting is the first target-neutral runtime capability: its semantic
