@@ -686,6 +686,67 @@ assert_equals "target_list_rejects_extra_argument" "$target_list_extra_exit" "2"
 assert_equals "target_list_extra_writes_no_stdout" "$(<"$tmp_out")" ""
 assert_contains "target_list_extra_prints_usage" "$(<"$tmp_err")" "usage: weft target list"
 
+tmp_run_source="$tmp_scratch_dir/run_exit.weft"
+printf 'fn main() -> i64 { 42 }\n' > "$tmp_run_source"
+set +e
+run_weft_compile_guarded "$WEFT" run "$tmp_run_source" > "$tmp_out" 2> "$tmp_err"
+run_exit=$?
+set -e
+assert_equals "run_forwards_product_exit_status" "$run_exit" "42"
+assert_equals "run_product_stdout_is_inherited" "$(<"$tmp_out")" ""
+assert_equals "run_product_stderr_is_inherited" "$(<"$tmp_err")" ""
+
+tmp_run_args_source="$tmp_scratch_dir/run_args.weft"
+printf '%s\n' \
+  'use runtime/safe_env.{runtime_platform_env}' \
+  'use stdlib/env.{Env}' \
+  '' \
+  'fn inspect_args() -[Env]> i64 {' \
+  '  if Env.arg_count() != 3 { 10 }' \
+  '  else {' \
+  '    match Env.arg(1) {' \
+  '      nil -> 11' \
+  '      first -> if first != "alpha" { 12 } else {' \
+  '        match Env.arg(2) {' \
+  '          nil -> 13' \
+  '          second -> if second == "two words" { 0 } else { 14 }' \
+  '        }' \
+  '      }' \
+  '    }' \
+  '  }' \
+  '}' \
+  '' \
+  'fn main(argc: i64, argv: i64) -> i64 {' \
+  '  runtime_platform_env(argc, argv, inspect_args)' \
+  '}' > "$tmp_run_args_source"
+run_weft_compile_guarded "$WEFT" run "$tmp_run_args_source" -- alpha "two words" > "$tmp_out" 2> "$tmp_err"
+assert_equals "run_forwards_exact_product_arguments_stdout" "$(<"$tmp_out")" ""
+assert_equals "run_forwards_exact_product_arguments_stderr" "$(<"$tmp_err")" ""
+
+set +e
+"$WEFT" run > "$tmp_out" 2> "$tmp_err"
+run_missing_exit=$?
+set -e
+assert_equals "run_requires_source_path" "$run_missing_exit" "2"
+assert_equals "run_missing_path_writes_no_stdout" "$(<"$tmp_out")" ""
+assert_contains "run_missing_path_prints_usage" "$(<"$tmp_err")" "usage: weft run PATH [-- ARG...]"
+
+set +e
+"$WEFT" run "$tmp_run_source" unseparated > "$tmp_out" 2> "$tmp_err"
+run_unseparated_exit=$?
+set -e
+assert_equals "run_rejects_unseparated_product_arguments" "$run_unseparated_exit" "2"
+assert_equals "run_unseparated_arguments_write_no_stdout" "$(<"$tmp_out")" ""
+assert_contains "run_unseparated_arguments_print_usage" "$(<"$tmp_err")" "usage: weft run PATH [-- ARG...]"
+
+set +e
+"$WEFT" run "$tmp_run_source.missing" > "$tmp_out" 2> "$tmp_err"
+run_missing_source_exit=$?
+set -e
+assert_equals "run_missing_source_exits_one" "$run_missing_source_exit" "1"
+assert_equals "run_missing_source_writes_no_stdout" "$(<"$tmp_out")" ""
+assert_contains "run_missing_source_is_actionable" "$(<"$tmp_err")" "run: could not read input file"
+
 "$WEFT" compile tools/tree_sitter_grammar.weft > "$tmp_tree_sitter_generator" 2> "$tmp_err"
 chmod +x "$tmp_tree_sitter_generator"
 assert_equals "tree_sitter_generator_build_stderr_empty" "$(<"$tmp_err")" ""

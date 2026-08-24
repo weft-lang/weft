@@ -164,6 +164,7 @@ run_weft_in . build app.weft -o app.two --artifact-facts app.two.facts.json
 cmp "$work/project/app.one" "$work/project/app.two"
 cmp "$work/project/app.one.facts.json" "$work/project/app.two.facts.json"
 run_product
+run_weft_in . run app.weft
 
 run_weft_in . version --json > "$work/project/version.json"
 run_weft_in . target show "$target" > "$work/project/target.json"
