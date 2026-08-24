@@ -2,14 +2,15 @@
 
 Weft is self-hosted and usable today on macOS with Apple Silicon. The checked-in
 `weft` binary is the compiler; it does not download a second compiler or route
-through C/LLVM. Linux/aarch64 is still an explicit public-alpha gate, and
-x86-64 is post-alpha.
+through C/LLVM. It can build macOS/AArch64 Mach-O or Linux/AArch64 ELF directly;
+Linux release packaging and its final complete-suite gate remain public-alpha
+work, while x86-64 is post-alpha.
 
 This guide describes the repository toolchain as it exists now. In particular,
-the final project-level `weft build`/`weft run` workflow has not landed yet, so
-the current compile command names an input and redirects the artifact. That
-transition is called out here rather than hidden behind commands that do not
-exist.
+`weft build` is the native final-product path, including cross-target selection
+and artifact facts. The higher-level `weft run`, installed-SDK discovery and
+release workflow have not landed yet; that boundary is called out rather than
+hidden behind commands that do not exist.
 
 ## Install the repository toolchain
 
@@ -22,9 +23,9 @@ chmod +x weft
 ./weft check examples/fibonacci.weft
 ```
 
-Repository development additionally uses `just`; linked object tests use the
-macOS command-line linker. Ordinary single-file programs need no separate
-language toolchain.
+Repository development additionally uses `just`; platform linkers compile test
+fixtures and serve as differential oracles only. Ordinary product builds need
+no separate language toolchain or linker.
 
 ## Your first program
 
@@ -47,6 +48,20 @@ chmod +x hello
 
 The process exit code is the value returned by `main`. Compiler diagnostics go
 to stderr; the native artifact goes to stdout.
+
+For a named final product, use the Weft-owned native linker. The same command
+can cross-build standalone Linux/AArch64 ELF from the checked-in macOS compiler:
+
+```bash
+./weft build hello.weft -o hello --artifact-facts hello.facts.json
+./weft build hello.weft -o hello-linux --target linux-aarch64 \
+  --artifact-facts hello-linux.facts.json
+```
+
+`--target` accepts the same canonical identities used by package manifests:
+`macos-aarch64` and `linux-aarch64`. Static products incorporate the Weft code
+and archive members they use. Declared dynamic native libraries remain explicit
+deployment dependencies and are reported as non-standalone in the facts file.
 
 ## Tests
 
@@ -156,8 +171,7 @@ from the directory containing `weft.pkg`:
 ```bash project
 weft pkg lock
 weft check app.weft
-weft compile app.weft > app
-chmod +x app
+weft build app.weft -o app --artifact-facts app.facts.json
 ./app
 ```
 
@@ -191,11 +205,12 @@ documented/public API census; it never reconstructs signatures from text.
 
 ## Where the alpha deliberately stops
 
-Before the public-alpha cut, the workboard still requires the Linux/aarch64
-platform row, safe networking/TLS/HTTP, the final project build/release
-workflow, and release hardening. x86-64, a hosted package registry, HTTP/2+
-and a forever-stable native ABI are explicitly later. The authoritative live
-status is the repository README and, for contributors, `internal/briefs/INDEX.md`.
+Before the public-alpha cut, the workboard still requires the complete
+target-local Linux suite on an adequately sized runner, safe TLS/HTTP, the
+installed project/release workflow, and release hardening. x86-64, a hosted
+package registry, HTTP/2+ and a forever-stable native ABI are explicitly later.
+The authoritative live status is the repository README and, for contributors,
+`internal/briefs/INDEX.md`.
 
 All marked Weft fences in this guide are checked by `run_tests.sh`; runnable
 examples are compiled and executed, and test fences use the real native test

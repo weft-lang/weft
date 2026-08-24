@@ -41,7 +41,7 @@ are compiled and run with the checked-in `./weft` binary.
 
 ## What is Weft?
 
-Weft is a compiled language that combines set-theoretic types, algebraic effects, and deterministic managed memory. The type system tracks what your code *does* — which effects it performs, what types flow through it, where trust boundaries live — and the compiler uses that information to verify correctness and generate efficient native code. No LLVM, no C middleman: the compiler emits aarch64 Mach-O directly, and it compiles itself.
+Weft is a compiled language that combines set-theoretic types, algebraic effects, and deterministic managed memory. The type system tracks what your code *does* — which effects it performs, what types flow through it, where trust boundaries live — and the compiler uses that information to verify correctness and generate efficient native code. No LLVM, no C middleman: the compiler emits AArch64 Mach-O and ELF directly, and it compiles itself.
 
 - **Set-theoretic types** — types are sets. Union (`i64 | str`), intersection (`Display & Eq`), complement via flow narrowing. Subtyping is set inclusion. One algebra for everything.
 - **Algebraic effects** — every side effect is declared in the function's type. `->` is a purity guarantee the compiler enforces. Effects subsume error handling, state, iterators, and parallelism under one mechanism, and handlers decide policy at the call boundary.
@@ -51,9 +51,9 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 ## Status
 
-**Self-hosted.** The compiler is written in Weft, compiles itself to native aarch64 Mach-O (including its own ad-hoc code signature), and the bootstrap gate requires generation two and generation three to be byte-identical. The Zig seed interpreter is archived in git history; `./weft` is the checked-in trust root.
+**Self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root.
 
-- 4097 runtime test blocks across 334 files, plus 803 negative (must-fail) cases
+- 4098 runtime test blocks across 334 files, plus 803 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
 - Current work: the public-alpha product gate—fast project feedback, complete docs/tooling, safe networking, the Linux/aarch64 platform row, and build/release UX
@@ -80,6 +80,10 @@ echo 'fn main() -> i64 { 42 }' > answer.weft
 # Build a final product and emit its versioned link/BOM facts
 ./weft build answer.weft -o answer --artifact-facts answer.facts.json
 
+# Cross-build the same source as standalone Linux/AArch64 ELF
+./weft build answer.weft -o answer-linux --target linux-aarch64 \
+  --artifact-facts answer-linux.facts.json
+
 # Verify self-hosting: the gate is byte-identical generations
 just bootstrap
 
@@ -90,6 +94,11 @@ bash run_tests.sh
 Development products include function/file/line DWARF by default. Add
 `--strip-debug` to `weft build` when the smaller release artifact matters; the
 artifact-facts sidecar reports whether debug information is present.
+Normal products incorporate the Weft runtime and stdlib code they use. A
+standalone macOS artifact depends only on the stable `libSystem` OS ABI; a
+standalone Linux artifact uses the recorded kernel ABI and has no interpreter.
+Manifest-declared dynamic libraries are explicit deployment dependencies and
+make the artifact facts report `standalone: false`.
 
 ## The Ideas
 
