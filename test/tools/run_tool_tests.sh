@@ -695,6 +695,31 @@ assert_contains "elf_linux_pipeline_invokes_linux_svc" "$elf_pipeline_disassembl
 assert_contains "elf_linux_pipeline_compiles_main_result" "$elf_pipeline_disassembly" $'mov\tx8, #0x2a'
 assert_contains "elf_linux_pipeline_selects_exit_group" "$elf_pipeline_disassembly" $'mov\tx8, #0x5e'
 
+# Debug information is the shared typed function/file/line interpretation,
+# carried in non-loaded ELF sections so it changes neither the Linux loader
+# closure nor runtime semantics.
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_debug_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_debug_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_debug_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_debug_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+elf_linux_debug_file=$(/usr/bin/file -b "$tmp_elf_product")
+elf_linux_debug_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --section-headers --private-headers "$tmp_elf_product")
+elf_linux_debug_verify=$(/Library/Developer/CommandLineTools/usr/bin/llvm-dwarfdump --verify "$tmp_elf_product")
+elf_linux_debug_main=$(/Library/Developer/CommandLineTools/usr/bin/llvm-dwarfdump --name main "$tmp_elf_product")
+assert_contains "elf_linux_debug_product_is_static" "$elf_linux_debug_file" "statically linked"
+assert_contains "elf_linux_debug_product_reports_debug_info" "$elf_linux_debug_file" "with debug_info, not stripped"
+assert_contains "elf_linux_debug_has_abbreviations" "$elf_linux_debug_headers" ".debug_abbrev"
+assert_contains "elf_linux_debug_has_compile_unit" "$elf_linux_debug_headers" ".debug_info"
+assert_contains "elf_linux_debug_has_line_program" "$elf_linux_debug_headers" ".debug_line"
+assert_not_contains "elf_linux_debug_has_no_interpreter" "$elf_linux_debug_headers" "INTERP off"
+assert_not_contains "elf_linux_debug_has_no_dynamic_segment" "$elf_linux_debug_headers" "DYNAMIC off"
+assert_contains "elf_linux_debug_dwarf_verifies" "$elf_linux_debug_verify" "No errors."
+assert_contains "elf_linux_debug_names_main" "$elf_linux_debug_main" $'DW_AT_name\t("main")'
+assert_contains "elf_linux_debug_maps_main_line" "$elf_linux_debug_main" $'DW_AT_decl_line\t(2)'
+
 # Fatal reporting is the first target-neutral runtime capability: its semantic
 # write/exit operations lower independently of arbitrary raw syscall numbers.
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_panic_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
