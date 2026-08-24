@@ -721,6 +721,33 @@ assert_contains "elf_linux_debug_dwarf_verifies" "$elf_linux_debug_verify" "No e
 assert_contains "elf_linux_debug_names_main" "$elf_linux_debug_main" $'DW_AT_name\t("main")'
 assert_contains "elf_linux_debug_maps_main_line" "$elf_linux_debug_main" $'DW_AT_decl_line\t(2)'
 
+# Dynamic Linux products retain the same typed link graph and DWARF producer,
+# but name their loader and runtime library closure explicitly. The target-local
+# Debian gate executes these exact bytes against its declared libc deployment
+# leaf; this host-side boundary independently inspects the container contract.
+run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_dynamic_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
+chmod +x "$tmp_elf_generator"
+assert_equals "elf_linux_dynamic_generator_build_stderr_empty" "$(<"$tmp_err")" ""
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product" 2> "$tmp_err"
+assert_equals "elf_linux_dynamic_generator_run_stderr_empty" "$(<"$tmp_err")" ""
+run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
+assert_files_equal "elf_linux_dynamic_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+elf_linux_dynamic_file=$(/usr/bin/file -b "$tmp_elf_product")
+elf_linux_dynamic_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --section-headers --private-headers "$tmp_elf_product")
+elf_linux_dynamic_verify=$(/Library/Developer/CommandLineTools/usr/bin/llvm-dwarfdump --verify "$tmp_elf_product")
+elf_linux_dynamic_main=$(/Library/Developer/CommandLineTools/usr/bin/llvm-dwarfdump --name main "$tmp_elf_product")
+assert_contains "elf_linux_dynamic_product_is_dynamic" "$elf_linux_dynamic_file" "dynamically linked"
+assert_contains "elf_linux_dynamic_product_reports_debug_info" "$elf_linux_dynamic_file" "with debug_info, not stripped"
+assert_contains "elf_linux_dynamic_names_interpreter" "$elf_linux_dynamic_headers" "INTERP off"
+assert_contains "elf_linux_dynamic_has_dynamic_segment" "$elf_linux_dynamic_headers" "DYNAMIC off"
+assert_contains "elf_linux_dynamic_needs_declared_libc" "$elf_linux_dynamic_headers" "NEEDED  libc.so.6"
+assert_contains "elf_linux_dynamic_has_non_executable_stack" "$elf_linux_dynamic_headers" "flags rw-"
+assert_contains "elf_linux_dynamic_has_abbreviations" "$elf_linux_dynamic_headers" ".debug_abbrev"
+assert_contains "elf_linux_dynamic_has_compile_unit" "$elf_linux_dynamic_headers" ".debug_info"
+assert_contains "elf_linux_dynamic_has_line_program" "$elf_linux_dynamic_headers" ".debug_line"
+assert_contains "elf_linux_dynamic_dwarf_verifies" "$elf_linux_dynamic_verify" "No errors."
+assert_contains "elf_linux_dynamic_names_main" "$elf_linux_dynamic_main" $'DW_AT_name\t("main")'
+
 # A real AArch64 ELF relocatable member travels through archive framing, typed
 # object parsing, symbol closure, shared graph layout, and Linux finalization.
 # The fixture needs no headers or sysroot and exercises executable text,
