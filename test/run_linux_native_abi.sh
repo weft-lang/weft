@@ -43,8 +43,8 @@ ln -s "$project_root/stdlib" "$work/stdlib"
 ln -s "$project_root/runtime" "$work/runtime"
 
 (cd "$work" && "$weft_bin" check main.weft)
-(cd "$work" && PATH="$work/no-toolchain" "$weft_bin" build main.weft -o app --artifact-facts app.facts.json)
-(cd "$work" && PATH="$work/no-toolchain" "$weft_bin" build main.weft -o app.second --artifact-facts app.second.facts.json)
+(cd "$work" && PATH="$work/no-toolchain" "$weft_bin" build main.weft -o app --target linux-aarch64 --artifact-facts app.facts.json)
+(cd "$work" && PATH="$work/no-toolchain" "$weft_bin" build main.weft --artifact-facts app.second.facts.json --target linux-aarch64 -o app.second)
 
 cmp "$work/app" "$work/app.second"
 cmp "$work/app.facts.json" "$work/app.second.facts.json"

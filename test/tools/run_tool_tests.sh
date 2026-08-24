@@ -61,7 +61,7 @@ tmp_native_debug_lldb=$(mktemp /tmp/weft_tool_native_debug_lldb_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product_second" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir" "$tmp_elf_archive_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product.facts.json" "$tmp_elf_product_second" "$tmp_elf_product_second.facts.json" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir" "$tmp_elf_archive_dir"' EXIT
 
 now_s() {
   date +%s
@@ -695,6 +695,60 @@ assert_contains "elf_linux_pipeline_selects_anonymous_private_map" "$elf_pipelin
 assert_contains "elf_linux_pipeline_invokes_linux_svc" "$elf_pipeline_disassembly" $'svc\t#0'
 assert_contains "elf_linux_pipeline_compiles_main_result" "$elf_pipeline_disassembly" $'mov\tx8, #0x2a'
 assert_contains "elf_linux_pipeline_selects_exit_group" "$elf_pipeline_disassembly" $'mov\tx8, #0x5e'
+
+# Public target selection drives checking, native lowering, executable format
+# and artifact facts from one typed target. Option order is intentionally not
+# semantic; an unknown spelling fails before committing an output.
+run_weft_compile_guarded "$WEFT" build test/exit42.weft \
+  --artifact-facts "$tmp_elf_product.facts.json" \
+  --target linux-aarch64 \
+  -o "$tmp_elf_product" \
+  2> "$tmp_err"
+assert_equals "build_linux_target_stderr_empty" "$(<"$tmp_err")" ""
+run_weft_compile_guarded "$WEFT" build test/exit42.weft \
+  -o "$tmp_elf_product_second" \
+  --target linux-aarch64 \
+  --artifact-facts "$tmp_elf_product_second.facts.json" \
+  2> "$tmp_err"
+assert_equals "build_linux_target_second_stderr_empty" "$(<"$tmp_err")" ""
+assert_files_equal "build_linux_target_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
+assert_files_equal "build_linux_target_facts_are_deterministic" "$tmp_elf_product.facts.json" "$tmp_elf_product_second.facts.json"
+assert_contains "build_linux_target_emits_static_elf" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
+assert_contains "build_linux_target_facts_name_target" "$(<"$tmp_elf_product.facts.json")" '"target":"linux-aarch64"'
+assert_contains "build_linux_target_facts_claim_kernel_standalone" "$(<"$tmp_elf_product.facts.json")" '"abi":"kernel"'
+
+invalid_target_output="$tmp_scratch_dir/invalid-target"
+set +e
+run_weft_compile_guarded "$WEFT" build test/exit42.weft -o "$invalid_target_output" --target aarch64-linux 2> "$tmp_err"
+invalid_target_exit=$?
+set -e
+assert_equals "build_rejects_unknown_target" "$invalid_target_exit" "2"
+assert_contains "build_unknown_target_reports_canonical_values" "$(<"$tmp_err")" "macos-aarch64|linux-aarch64"
+if [ -e "$invalid_target_output" ]; then
+  echo "  fail build_unknown_target_commits_no_output"
+  exit 1
+else
+  echo "  ok build_unknown_target_commits_no_output"
+fi
+
+cross_target_missing_dir="$tmp_scratch_dir/cross-target-missing"
+mkdir -p "$cross_target_missing_dir"
+printf '%s\n' \
+  '{"package":"cross-target-missing","trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"system","kind":"system","link":"System","search":["toolchain"],"content":"toolchain","optional":false}],"symbols":[{"declaration":"native_abs","symbol":"labs","library":"system","params":["i64"],"result":"i64","optional":false}]}}}}}' \
+  > "$cross_target_missing_dir/weft.pkg"
+printf '%s\n' 'fn main() -> i64 { 0 }' > "$cross_target_missing_dir/main.weft"
+set +e
+(cd "$cross_target_missing_dir" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o app --target linux-aarch64) 2> "$tmp_err"
+cross_target_missing_exit=$?
+set -e
+assert_equals "build_cross_target_missing_manifest_fails" "$cross_target_missing_exit" "1"
+assert_contains "build_cross_target_missing_manifest_names_selected_target" "$(<"$tmp_err")" "compilation target 'linux-aarch64'"
+if [ -e "$cross_target_missing_dir/app" ]; then
+  echo "  fail build_cross_target_missing_manifest_commits_no_output"
+  exit 1
+else
+  echo "  ok build_cross_target_missing_manifest_commits_no_output"
+fi
 
 # Debug information is the shared typed function/file/line interpretation,
 # carried in non-loaded ELF sections so it changes neither the Linux loader
