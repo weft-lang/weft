@@ -53,7 +53,7 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 **Self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root.
 
-- 4100 runtime test blocks across 334 files, plus 803 negative (must-fail) cases
+- 4103 runtime test blocks across 334 files, plus 803 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
 - Current work: the public-alpha product gate—fast project feedback, complete docs/tooling, safe networking, remote dependency workflow, and release/install UX
@@ -80,7 +80,7 @@ echo 'fn main() -> i64 { 42 }' > answer.weft
 # Build the host target, run it directly, and forward its exit status
 ./weft run answer.weft; echo $?   # 42
 
-# Build a final product and emit its versioned link/BOM facts
+# Explicit low-level product path and versioned link/BOM facts
 ./weft build answer.weft -o answer --artifact-facts answer.facts.json
 
 # Cross-build the same source as standalone Linux/AArch64 ELF
@@ -107,6 +107,14 @@ standalone macOS artifact depends only on the stable `libSystem` OS ABI; a
 standalone Linux artifact uses the recorded kernel ABI and has no interpreter.
 Manifest-declared dynamic libraries are explicit deployment dependencies and
 make the artifact facts report `standalone: false`.
+
+Inside a package created by `weft pkg init NAME`, the manifest carries an
+explicit source root and typed binary target. Plain `weft build` writes the
+host product and its facts to `target/<platform>/<name>` and
+`target/<platform>/<name>.facts.json`; `weft run` selects and executes the same
+default target. A named target can be selected as `weft build NAME` or
+`weft run NAME -- ARG...`. The `build PATH -o OUTPUT` form above remains the
+explicit low-level artifact path.
 
 `weft version --json` reports the same compiler, language, manifest, lock,
 native-binding ABI, artifact-facts schema, and supported-target identities as
@@ -234,8 +242,8 @@ The compiler is a Weft program: the IR is a Weft type, passes are effect-annotat
 | Tool | Pipeline | Effect binding |
 |------|----------|----------------|
 | `weft compile` | full pipeline | all effects handled |
-| `weft build` | full native pipeline | typed target/link/fact handlers; no host linker |
-| `weft run` | full host-native pipeline | direct process execution; exact args/status forwarding |
+| `weft build` | full native pipeline | typed project/target/link/fact handlers; deterministic target directory; no host linker |
+| `weft run` | full host-native pipeline | same typed project target; direct process execution; exact args/status forwarding |
 | `weft fmt` | parse only | cannot depend on type info by construction |
 | `weft check` | parse + check | no emission effects |
 | `weft ast` | parse | structure dump |

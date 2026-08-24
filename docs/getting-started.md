@@ -74,8 +74,9 @@ executes it directly with inherited standard streams and environment, forwards
 its exact exit status, and removes its private temporary executable. Product
 arguments follow `--`, for example `weft run hello.weft -- first "two words"`.
 
-For a named final product, use the Weft-owned native linker. The same command
-can cross-build standalone Linux/AArch64 ELF from the checked-in macOS compiler:
+The explicit path form uses the Weft-owned native linker and is useful for
+one-file probes and custom output paths. It can cross-build standalone
+Linux/AArch64 ELF from the checked-in macOS compiler:
 
 ```bash
 weft build hello.weft -o hello --artifact-facts hello.facts.json
@@ -182,6 +183,11 @@ weft pkg init app
 weft pkg add math deps/math
 ```
 
+`pkg init app` records `source_roots: ["."]` and a typed binary target named
+`app` whose source is `app.weft`. The JSON `kind` field is the persistence form
+of the compiler's `binary | library` target variants; it is not an integer tag
+API. Additional target sources must stay beneath one of the declared roots.
+
 Put a public module in `deps/math/lib.weft`:
 
 ```weft file=deps/math/lib.weft
@@ -205,16 +211,25 @@ fn main() -> i64 {
 }
 ```
 
-Lock only after the package source exists, then check, compile, and run
+Lock only after the package source exists, then check, build, and run
 from the directory containing `weft.pkg`:
 
 ```bash project
 weft pkg lock
 weft check app.weft
-weft run app.weft
-weft build app.weft -o app --artifact-facts app.facts.json
-./app
+weft run
+weft build
+./target/macos-aarch64/app
 ```
+
+The normal build prints its deterministic artifact path and writes the
+adjacent `app.facts.json` deployment/provenance report. Use `weft build app`
+or `weft run app -- first "two words"` when naming the target explicitly.
+Cross-building keeps the same layout, for example
+`weft build app --target linux-aarch64` writes
+`target/linux-aarch64/app`. Source-library targets describe package roots for
+checking, documentation, and whole-program compilation; they do not pretend
+that Weft has frozen a native archive ABI.
 
 That ordering matters: changing any package source after `pkg lock` changes
 its content identity, and the next consuming command rejects the stale lock.
