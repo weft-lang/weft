@@ -77,6 +77,9 @@ echo 'fn main() -> i64 { 42 }' > answer.weft
 # Type-check without compiling
 ./weft check answer.weft
 
+# Build the host target, run it directly, and forward its exit status
+./weft run answer.weft; echo $?   # 42
+
 # Build a final product and emit its versioned link/BOM facts
 ./weft build answer.weft -o answer --artifact-facts answer.facts.json
 
@@ -231,6 +234,8 @@ The compiler is a Weft program: the IR is a Weft type, passes are effect-annotat
 | Tool | Pipeline | Effect binding |
 |------|----------|----------------|
 | `weft compile` | full pipeline | all effects handled |
+| `weft build` | full native pipeline | typed target/link/fact handlers; no host linker |
+| `weft run` | full host-native pipeline | direct process execution; exact args/status forwarding |
 | `weft fmt` | parse only | cannot depend on type info by construction |
 | `weft check` | parse + check | no emission effects |
 | `weft ast` | parse | structure dump |

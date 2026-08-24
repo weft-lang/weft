@@ -7,9 +7,9 @@ compiler are static kernel-ABI executables. x86-64 is post-alpha.
 
 This guide describes both the repository toolchain and the extracted SDK shape
 as they exist now. `weft build` is the native final-product path, including
-cross-target selection and artifact facts. Installed-SDK discovery and
-deterministic target archives are implemented. The higher-level `weft run`,
-remote locked-source cache, and public signing/notarization channel have not
+cross-target selection and artifact facts. Installed-SDK discovery,
+deterministic target archives, and direct `weft run` execution are implemented.
+The remote locked-source cache and public signing/notarization channel have not
 landed yet.
 
 ## Install a local SDK archive
@@ -61,13 +61,18 @@ Check it, compile it, and run it:
 
 ```bash
 weft check hello.weft
+weft run hello.weft
 weft compile hello.weft > hello
 chmod +x hello
 ./hello
 ```
 
 The process exit code is the value returned by `main`. Compiler diagnostics go
-to stderr; the native artifact goes to stdout.
+to stderr; the low-level `compile` artifact goes to stdout. `weft run PATH`
+builds the host target through the same checked/native pipeline as `build`,
+executes it directly with inherited standard streams and environment, forwards
+its exact exit status, and removes its private temporary executable. Product
+arguments follow `--`, for example `weft run hello.weft -- first "two words"`.
 
 For a named final product, use the Weft-owned native linker. The same command
 can cross-build standalone Linux/AArch64 ELF from the checked-in macOS compiler:
@@ -206,6 +211,7 @@ from the directory containing `weft.pkg`:
 ```bash project
 weft pkg lock
 weft check app.weft
+weft run app.weft
 weft build app.weft -o app --artifact-facts app.facts.json
 ./app
 ```
@@ -243,7 +249,7 @@ documented/public API census; it never reconstructs signatures from text.
 
 Before the public-alpha cut, the workboard still requires the complete
 target-local Linux release matrix on CI, safe TLS/HTTP, remote locked-source
-cache/update behavior, normal `run`/target output UX, the final example-product
+cache/update behavior, normal named-target output UX, the final example-product
 exercise, and release signing/hardening. x86-64, a hosted package registry,
 HTTP/2+ and a forever-stable native ABI are explicitly later.
 The authoritative live status is the repository README and, for contributors,
