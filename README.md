@@ -53,7 +53,7 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 **Self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root.
 
-- 4098 runtime test blocks across 334 files, plus 803 negative (must-fail) cases
+- 4099 runtime test blocks across 334 files, plus 803 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
 - Current work: the public-alpha product gate—fast project feedback, complete docs/tooling, safe networking, the Linux/aarch64 platform row, and build/release UX
@@ -84,6 +84,11 @@ echo 'fn main() -> i64 { 42 }' > answer.weft
 ./weft build answer.weft -o answer-linux --target linux-aarch64 \
   --artifact-facts answer-linux.facts.json
 
+# Inspect the compiler/schema identity and the exact target contract
+./weft --version
+./weft target list
+./weft target show linux-aarch64
+
 # Verify self-hosting: the gate is byte-identical generations
 just bootstrap
 
@@ -99,6 +104,12 @@ standalone macOS artifact depends only on the stable `libSystem` OS ABI; a
 standalone Linux artifact uses the recorded kernel ABI and has no interpreter.
 Manifest-declared dynamic libraries are explicit deployment dependencies and
 make the artifact facts report `standalone: false`.
+
+`weft version --json` reports the same compiler, language, manifest, lock,
+native-binding ABI, artifact-facts schema, and supported-target identities as
+machine-readable data. These values come from the compatibility facts used by
+the manifest/lock validators and artifact-facts emitter; the banner is not a
+separately maintained version string.
 
 ## The Ideas
 

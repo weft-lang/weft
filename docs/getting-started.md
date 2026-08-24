@@ -63,6 +63,21 @@ can cross-build standalone Linux/AArch64 ELF from the checked-in macOS compiler:
 and archive members they use. Declared dynamic native libraries remain explicit
 deployment dependencies and are reported as non-standalone in the facts file.
 
+Inspect the installed compiler's compatibility and target facts directly:
+
+```bash
+./weft --version
+./weft version --json
+./weft target list
+./weft target show linux-aarch64
+```
+
+The version report includes the compiler and language versions plus the
+manifest, lock, native-binding ABI, and artifact-facts schema versions. `target
+show` reports the binary format, minimum platform ABI, default standalone
+contract, and whether the selected target is the current host. Unknown target
+aliases fail rather than silently selecting a nearby target.
+
 ## Tests
 
 Tests are native Weft programs using the `Test` effect. Save this as
