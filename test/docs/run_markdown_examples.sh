@@ -16,13 +16,16 @@ if [ "$#" -eq 0 ]; then
   set -- README.md
 fi
 
-tmp_src=$(mktemp /tmp/weft_markdown_example_XXXXXX.weft)
+# BSD mktemp only substitutes trailing Xs, so a `_XXXXXX.weft` template yields
+# that literal path on macOS -- name the source inside a randomised directory.
+tmp_src_dir=$(mktemp -d /tmp/weft_markdown_src_XXXXXX)
+tmp_src="$tmp_src_dir/example.weft"
 tmp_bin=$(mktemp /tmp/weft_markdown_example_bin_XXXXXX)
 tmp_linked=$(mktemp /tmp/weft_markdown_example_linked_XXXXXX)
 tmp_err=$(mktemp /tmp/weft_markdown_example_err_XXXXXX)
 tmp_project=$(mktemp -d /tmp/weft_markdown_project_XXXXXX)
 tmp_project_bin=$(mktemp -d /tmp/weft_markdown_tools_XXXXXX)
-trap 'rm -f "$tmp_src" "$tmp_bin" "$tmp_linked" "$tmp_err"; rm -rf "$tmp_project" "$tmp_project_bin"' EXIT
+trap 'rm -f "$tmp_bin" "$tmp_linked" "$tmp_err"; rm -rf "$tmp_src_dir" "$tmp_project" "$tmp_project_bin"' EXIT
 
 WEFT_ABS=$(cd "$(dirname "$WEFT")" && pwd)/$(basename "$WEFT")
 ln -s "$WEFT_ABS" "$tmp_project_bin/weft"

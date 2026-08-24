@@ -21,16 +21,20 @@ tmp_out=$(mktemp /tmp/weft_tool_out_XXXXXX)
 tmp_tool_obj=$(mktemp /tmp/weft_tool_runner_obj_XXXXXX)
 tmp_tool_bin=$(mktemp /tmp/weft_tool_runner_bin_XXXXXX)
 tmp_fake_weft=$(mktemp /tmp/weft_tool_fake_weft_XXXXXX)
-tmp_test_fail_one=$(mktemp /tmp/weft_tool_test_fail_one_XXXXXX.weft)
-tmp_test_fail_two=$(mktemp /tmp/weft_tool_test_fail_two_XXXXXX.weft)
-tmp_test_after=$(mktemp /tmp/weft_tool_test_after_XXXXXX.weft)
-tmp_test_timeout=$(mktemp /tmp/weft_tool_test_timeout_XXXXXX.weft)
-tmp_test_parse_fail=$(mktemp /tmp/weft_tool_a_parse_fail_XXXXXX.weft)
-tmp_test_shared_one=$(mktemp /tmp/weft_tool_shared_one_XXXXXX.weft)
-tmp_test_shared_two=$(mktemp /tmp/weft_tool_shared_two_XXXXXX.weft)
-tmp_check_clean=$(mktemp /tmp/weft_tool_check_clean_XXXXXX.weft)
-tmp_check_fail=$(mktemp /tmp/weft_tool_check_fail_XXXXXX.weft)
-tmp_rc_census_src=$(mktemp /tmp/weft_tool_rc_census_XXXXXX.weft)
+# BSD mktemp only substitutes trailing Xs, so a `_XXXXXX.weft` template yields
+# that literal path on macOS -- no randomisation, and EEXIST once one leaks.
+# Name the .weft sources inside a randomised directory instead.
+tmp_scratch_dir=$(mktemp -d /tmp/weft_tool_scratch_XXXXXX)
+tmp_test_fail_one="$tmp_scratch_dir/test_fail_one.weft"
+tmp_test_fail_two="$tmp_scratch_dir/test_fail_two.weft"
+tmp_test_after="$tmp_scratch_dir/test_after.weft"
+tmp_test_timeout="$tmp_scratch_dir/test_timeout.weft"
+tmp_test_parse_fail="$tmp_scratch_dir/a_parse_fail.weft"
+tmp_test_shared_one="$tmp_scratch_dir/shared_one.weft"
+tmp_test_shared_two="$tmp_scratch_dir/shared_two.weft"
+tmp_check_clean="$tmp_scratch_dir/check_clean.weft"
+tmp_check_fail="$tmp_scratch_dir/check_fail.weft"
+tmp_rc_census_src="$tmp_scratch_dir/rc_census.weft"
 tmp_test_shared_module="_weft_tool_test_shared_$$"
 tmp_test_shared_support="module_fixtures/${tmp_test_shared_module}.weft"
 tmp_test_dir=$(mktemp -d /tmp/weft_tool_test_dir_XXXXXX)
@@ -56,7 +60,7 @@ tmp_native_debug_lldb=$(mktemp /tmp/weft_tool_native_debug_lldb_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_fail_one" "$tmp_test_fail_two" "$tmp_test_after" "$tmp_test_timeout" "$tmp_test_parse_fail" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_shared_support" "$tmp_check_clean" "$tmp_check_fail" "$tmp_rc_census_src" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product_second" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product_second" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir"' EXIT
 
 now_s() {
   date +%s
