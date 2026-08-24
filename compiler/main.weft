@@ -18,7 +18,8 @@ use compiler/module_product.{*}
 use compiler/native_link.{NativeLinkLibrary, native_link_artifact_platform_abi_json, native_link_target_platform_abi}
 use compiler/native_target.{NativeLinkLinuxAarch64, NativeLinkMacosAarch64, NativeLinkTarget, NativeLinkTargetParse, NativeLinkTargetParsed, NativeLinkTargetUnsupported, native_link_supported_targets, native_link_target_host, native_link_target_is_host, native_link_target_name, native_link_target_parse, native_link_target_storage_kind}
 use compiler/package.{*}
-use compiler/package_lock.{pkg_cli_lock}
+use compiler/package_lock.{PackageCacheCorrupt, PackageCacheLockMalformed, PackageCacheMissing, PackageCacheVerified, pkg_cli_fetch_offline, pkg_cli_fetch_online, pkg_cli_lock, pkg_lock_verify_cache}
+use compiler/package_source.{PackageSourceAcquire, package_source_with_process_providers}
 use compiler/pipeline.{*}
 use compiler/parse.{parse_module, parse_use_file}
 use compiler/project_session.{*}
@@ -34,9 +35,10 @@ use runtime/alloc.{*}
 use runtime/buffer.{*}
 use runtime/effects.{*}
 use runtime/memory.{*}
-use runtime/safe_io_standalone.{runtime_standalone_file_read, runtime_standalone_file_read_write, runtime_standalone_file_write, runtime_standalone_package_io}
+use runtime/safe_io_standalone.{runtime_standalone_file_read, runtime_standalone_file_read_write, runtime_standalone_file_write, runtime_standalone_package_io, runtime_standalone_package_mutation_io_with}
+use runtime/safe_process.{runtime_platform_proc}
 use runtime/source_acquire.{SourceAcquire, source_acquire_with_sdk, source_acquire_with_standalone}
-use runtime/string.{runtime_str_cstring, runtime_str_from_bytes_copy}
+use runtime/string.{runtime_int_to_str, runtime_str_cstring, runtime_str_from_bytes_copy}
 use runtime/syscall.{*}
 use runtime/terminal.{*}
 use runtime/test_harness.{*}
@@ -45,6 +47,8 @@ use stdlib/diagnostic_registry.{*}
 use stdlib/semantic_type.{*}
 use stdlib/semantic_type_render.{semantic_effect_set_render, semantic_type_append, semantic_type_append_effect_atom}
 use stdlib/diagnostic_type.{*}
+use stdlib/dir.{DirInspect, DirMutate}
+use stdlib/file.{FileRead, FileWrite}
 use stdlib/json.{*}
 use stdlib/list.{List, Nil, Cons, list_append, list_cons, list_nil}
 use stdlib/result.{Err, Ok, Result}
@@ -2485,9 +2489,44 @@ fn main_pkg_cli_audit() -[SourceAcquire]> i64 {
   }
 }
 
+fn main_pkg_find_provider_in_path(name: str, directories: Vector<str>, index: i64) -> str {
+  if index >= vector_len<str>(directories) { "" }
+  else {
+    let directory = vector_get_in_bounds<str>(directories, index)
+    let base = if __str_len(directory) == 0 { "." } else { directory }
+    let candidate = str_concat(str_concat(base, "/"), name)
+    if main_path_exists(candidate) { candidate }
+    else { main_pkg_find_provider_in_path(name, directories, index + 1) }
+  }
+}
+
+fn main_pkg_provider(name: str, envp: i64) -> str {
+  let path = main_environment_path(envp)
+  if __str_len(path) == 0 { "" }
+  else { main_pkg_find_provider_in_path(name, str_split(path, ":"), 0) }
+}
+
+fn main_pkg_stage_prefix() -> str {
+  str_concat(".weft/staging/pkg-", runtime_int_to_str(sys_proc_id()))
+}
+
+fn main_pkg_with_acquisition(
+  argc: i64,
+  argv: i64,
+  body: () -[PackageSourceAcquire, FileRead, FileWrite, DirInspect, DirMutate]> i64
+) -> i64 {
+  let envp = argv + (argc + 1) * 8
+  let env = main_pkg_provider("env", envp)
+  let git = main_pkg_provider("git", envp)
+  let curl = main_pkg_provider("curl", envp)
+  runtime_platform_proc(argc, argv, () =>
+    package_source_with_process_providers(env, git, curl, () =>
+      runtime_standalone_package_mutation_io_with(body)))
+}
+
 fn run_pkg(argc: i64, argv: i64) -[SourceAcquire]> i64 {
   if argc < 3 {
-    pkg_stderr("usage: weft pkg init [name]\nusage: weft pkg add NAME PATH\nusage: weft pkg lock\nusage: weft pkg exports\nusage: weft pkg audit\n")
+    pkg_stderr("usage: weft pkg init [name]\nusage: weft pkg add NAME PATH\nusage: weft pkg add NAME --git HTTPS_URL --revision HEX\nusage: weft pkg add NAME --archive HTTPS_URL --sha256 sha256:HEX\nusage: weft pkg lock\nusage: weft pkg fetch [--offline]\nusage: weft pkg update NAME (--revision HEX | --sha256 sha256:HEX)\nusage: weft pkg exports\nusage: weft pkg audit\n")
     1
   } else {
     let sub = mem_load64_at(argv, 16)
@@ -2499,16 +2538,47 @@ fn run_pkg(argc: i64, argv: i64) -[SourceAcquire]> i64 {
         runtime_standalone_file_write(() => pkg_cli_init(__str_ptr("app"), __str_len("app")))
       }
     } else { if cstr_eq(sub, "add") == 1 {
-      if argc < 5 {
-        pkg_stderr("usage: weft pkg add NAME PATH\n")
-        1
-      } else {
+      if argc == 5 {
         let name = mem_load64_at(argv, 24)
         let path = mem_load64_at(argv, 32)
         runtime_standalone_file_read_write(() => pkg_cli_add(name, cstr_len(name), path, cstr_len(path)))
-      }
+      } else { if argc == 8 and cstr_eq(mem_load64_at(argv, 32), "--git") == 1 and cstr_eq(mem_load64_at(argv, 48), "--revision") == 1 {
+        let name = mem_load64_at(argv, 24)
+        let url_ptr = mem_load64_at(argv, 40)
+        let pin_ptr = mem_load64_at(argv, 56)
+        let source = PackageGitSource(runtime_str_from_bytes_copy(url_ptr, cstr_len(url_ptr)), runtime_str_from_bytes_copy(pin_ptr, cstr_len(pin_ptr)))
+        runtime_standalone_file_read_write(() => pkg_cli_add_source(name, cstr_len(name), source))
+      } else { if argc == 8 and cstr_eq(mem_load64_at(argv, 32), "--archive") == 1 and cstr_eq(mem_load64_at(argv, 48), "--sha256") == 1 {
+        let name = mem_load64_at(argv, 24)
+        let url_ptr = mem_load64_at(argv, 40)
+        let pin_ptr = mem_load64_at(argv, 56)
+        let source = PackageArchiveSource(runtime_str_from_bytes_copy(url_ptr, cstr_len(url_ptr)), runtime_str_from_bytes_copy(pin_ptr, cstr_len(pin_ptr)))
+        runtime_standalone_file_read_write(() => pkg_cli_add_source(name, cstr_len(name), source))
+      } else {
+        pkg_stderr("usage: weft pkg add NAME PATH\nusage: weft pkg add NAME --git HTTPS_URL --revision HEX\nusage: weft pkg add NAME --archive HTTPS_URL --sha256 sha256:HEX\n")
+        1
+      } } }
     } else { if cstr_eq(sub, "lock") == 1 {
-      runtime_standalone_package_io(() => pkg_cli_lock())
+      main_pkg_with_acquisition(argc, argv, () => pkg_cli_lock(main_pkg_stage_prefix()))
+    } else { if cstr_eq(sub, "fetch") == 1 {
+      if argc == 3 { main_pkg_with_acquisition(argc, argv, () => pkg_cli_fetch_online(main_pkg_stage_prefix())) }
+      else { if argc == 4 and cstr_eq(mem_load64_at(argv, 24), "--offline") == 1 {
+        runtime_standalone_package_io(() => pkg_cli_fetch_offline())
+      } else {
+        pkg_stderr("usage: weft pkg fetch [--offline]\n")
+        1
+      } }
+    } else { if cstr_eq(sub, "update") == 1 {
+      if argc == 6 and (cstr_eq(mem_load64_at(argv, 32), "--revision") == 1 or cstr_eq(mem_load64_at(argv, 32), "--sha256") == 1) {
+        let name = mem_load64_at(argv, 24)
+        let pin = mem_load64_at(argv, 40)
+        let updated = runtime_standalone_file_read_write(() => pkg_cli_update_pin(name, cstr_len(name), pin, cstr_len(pin)))
+        if updated != 0 { updated }
+        else { main_pkg_with_acquisition(argc, argv, () => pkg_cli_lock(main_pkg_stage_prefix())) }
+      } else {
+        pkg_stderr("usage: weft pkg update NAME (--revision HEX | --sha256 sha256:HEX)\n")
+        1
+      }
     } else { if cstr_eq(sub, "exports") == 1 {
       runtime_standalone_file_read(() => pkg_cli_exports())
     } else { if cstr_eq(sub, "audit") == 1 {
@@ -2516,7 +2586,7 @@ fn run_pkg(argc: i64, argv: i64) -[SourceAcquire]> i64 {
     } else {
       pkg_stderr("pkg: unknown command\n")
       1
-    } } } } }
+    } } } } } } }
   }
 }
 
@@ -2730,7 +2800,7 @@ fn run_target(argc: i64, argv: i64) -> i64 {
 
 -- Subcommand dispatch after process-wide presentation options have been
 -- removed. Default (no args or "compile") is the full compilation pipeline.
-fn main_dispatch(argc: i64, argv: i64) -[SourceAcquire]> i64 {
+fn main_dispatch_unchecked(argc: i64, argv: i64) -[SourceAcquire]> i64 {
   if argc > 1 {
     let cmd = mem_load64_at(argv, 8)
     if cstr_eq(cmd, "--version") == 1 {
@@ -2881,6 +2951,46 @@ fn main_dispatch(argc: i64, argv: i64) -[SourceAcquire]> i64 {
     let n = mem_load64_at(input, 8)
     compile(src, n)
   }
+}
+
+fn main_command_uses_package_cache(argc: i64, argv: i64) -> bool {
+  if argc <= 1 { true }
+  else {
+    let command = mem_load64_at(argv, 8)
+    if cstr_eq(command, "--version") == 1 or cstr_eq(command, "version") == 1 or cstr_eq(command, "target") == 1 or cstr_eq(command, "explain") == 1 or cstr_eq(command, "pkg") == 1 { false }
+    else { true }
+  }
+}
+
+fn main_package_cache_preflight() -> i64 {
+  runtime_standalone_package_io(() => match pkg_lock_verify_cache() {
+    PackageCacheVerified -> 0
+    PackageCacheLockMalformed -> {
+      eprint("error[E5005]: package lock is malformed or unsupported\n")
+      1
+    }
+    PackageCacheMissing(name, content) -> {
+      eprint("error[E5011]: locked dependency '")
+      eprint(name)
+      eprint("' is absent from the immutable package cache (")
+      eprint(content)
+      eprint(")\n")
+      1
+    }
+    PackageCacheCorrupt(name, content) -> {
+      eprint("error[E5012]: immutable cache content for dependency '")
+      eprint(name)
+      eprint("' does not match ")
+      eprint(content)
+      eprint("\n")
+      1
+    }
+  })
+}
+
+fn main_dispatch(argc: i64, argv: i64) -[SourceAcquire]> i64 {
+  if main_command_uses_package_cache(argc, argv) and main_package_cache_preflight() != 0 { 1 }
+  else { main_dispatch_unchecked(argc, argv) }
 }
 
 type MainExecutableLocation {

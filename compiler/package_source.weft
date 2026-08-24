@@ -1,0 +1,561 @@
+-- compiler/package_source.weft -- bounded remote package transport and USTAR
+--
+-- Resolution never performs this effect. Explicit package commands install a
+-- production or deterministic-test interpretation, then admit only a checked
+-- immutable source tree to the content-addressed cache.
+
+use compiler/package.{pkg_path_is_safe, pkg_safe_path}
+use compiler/sha256.{sha256}
+use runtime/alloc.{alloc_zeroed}
+use runtime/memory.{mem_load8_at, mem_store8_at}
+use runtime/string.{runtime_int_to_str, runtime_str_from_bytes_copy}
+use stdlib/bytes.{Bytes, bytes_from_vector, bytes_to_utf8, bytes_to_vector}
+use stdlib/dir.{DirDirectory, DirInspect, DirMutate, dir_create, dir_kind_code, dir_list, dir_metadata, dir_remove, dir_rename, dir_symlink_metadata}
+use stdlib/file.{FileRead, FileWrite, file_create_new, file_read_all}
+use stdlib/io_types.{IoAlreadyExists, IoError}
+use stdlib/list.{List, list_append, list_nil}
+use stdlib/path.{Path, path_to_utf8}
+use stdlib/process.{Proc, ProcError, ProcExited, ProcTermination}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/string.{str_byte_at, str_concat, str_contains, str_eq, str_len, str_slice_bytes, str_starts_with}
+use stdlib/vector.{vector_contains, vector_data, vector_get_in_bounds, vector_len, vector_new, vector_push, vector_set}
+use stdlib/vector_type.{Vector}
+
+pub(package) type PackageProviderFailure {
+  PackageProviderUnavailable(str),
+  PackageProviderRejected(str)
+}
+
+pub(package) type PackageProviderResult {
+  PackageProviderSucceeded,
+  PackageProviderFailed(PackageProviderFailure)
+}
+
+pub(package) effect PackageSourceAcquire {
+  fn git_archive(url: str, revision: str, repository: Path, output: Path) -> PackageProviderResult
+  fn https_archive(url: str, output: Path, maximum_bytes: i64) -> PackageProviderResult
+}
+
+pub(package) type PackageArchiveEntry {
+  PackageArchiveDirectory(str),
+  PackageArchiveFile(str, Bytes)
+}
+
+pub(package) type PackageArchiveParse {
+  PackageArchiveParsed(Vector<PackageArchiveEntry>),
+  PackageArchiveInvalid(str)
+}
+
+pub(package) type PackageArchiveText {
+  PackageArchiveTextValue(str),
+  PackageArchiveTextInvalid
+}
+
+pub(package) type PackageSourceStage {
+  PackageSourceStageReady(str),
+  PackageSourceStageUnavailable
+}
+
+pub(package) fn package_source_maximum_archive_bytes() -> i64 { 67108864 }
+pub(package) fn package_source_maximum_entries() -> i64 { 100000 }
+
+pub(package) fn package_provider_completed(result: Result<ProcTermination, ProcError>) -> bool {
+  match result {
+    Ok(ProcExited(code)) -> code == 0
+    _ -> false
+  }
+}
+
+pub(package) fn package_provider_git_args(git: str) -> List<str> {
+  let mut args = list_nil<str>()
+  args = list_append<str>(args, "GIT_CONFIG_NOSYSTEM=1")
+  args = list_append<str>(args, "GIT_CONFIG_GLOBAL=/dev/null")
+  args = list_append<str>(args, "GIT_TERMINAL_PROMPT=0")
+  args = list_append<str>(args, git)
+  args = list_append<str>(args, "--no-pager")
+  args = list_append<str>(args, "--no-optional-locks")
+  args = list_append<str>(args, "--no-advice")
+  args = list_append<str>(args, "-c")
+  args = list_append<str>(args, "credential.interactive=never")
+  args = list_append<str>(args, "-c")
+  args = list_append<str>(args, "core.hooksPath=/dev/null")
+  args
+}
+
+pub(package) fn package_provider_git_init_args(git: str, repository: str) -> List<str> {
+  let mut args = package_provider_git_args(git)
+  args = list_append<str>(args, "init")
+  args = list_append<str>(args, "--quiet")
+  args = list_append<str>(args, "--bare")
+  args = list_append<str>(args, "--template=")
+  args = list_append<str>(args, repository)
+  args
+}
+
+pub(package) fn package_provider_git_fetch_args(git: str, repository: str, url: str, revision: str) -> List<str> {
+  let mut args = package_provider_git_args(git)
+  args = list_append<str>(args, "-C")
+  args = list_append<str>(args, repository)
+  args = list_append<str>(args, "-c")
+  args = list_append<str>(args, "fetch.fsckObjects=true")
+  args = list_append<str>(args, "fetch")
+  args = list_append<str>(args, "--quiet")
+  args = list_append<str>(args, "--no-tags")
+  args = list_append<str>(args, "--no-recurse-submodules")
+  args = list_append<str>(args, "--depth=1")
+  args = list_append<str>(args, "--no-write-fetch-head")
+  args = list_append<str>(args, url)
+  args = list_append<str>(args, revision)
+  args
+}
+
+pub(package) fn package_provider_git_archive_args(git: str, repository: str, revision: str, output: str) -> List<str> {
+  let mut args = package_provider_git_args(git)
+  args = list_append<str>(args, "-C")
+  args = list_append<str>(args, repository)
+  args = list_append<str>(args, "archive")
+  args = list_append<str>(args, "--format=tar")
+  args = list_append<str>(args, str_concat("--output=", output))
+  args = list_append<str>(args, revision)
+  args
+}
+
+pub(package) fn package_provider_git_init(env: str, git: str, repository: str) -[Proc]> bool {
+  package_provider_completed(Proc.run(env, package_provider_git_init_args(git, repository)))
+}
+
+pub(package) fn package_provider_git_fetch(env: str, git: str, repository: str, url: str, revision: str) -[Proc]> bool {
+  package_provider_completed(Proc.run(env, package_provider_git_fetch_args(git, repository, url, revision)))
+}
+
+pub(package) fn package_provider_git_write_archive(env: str, git: str, repository: str, revision: str, output: str) -[Proc]> bool {
+  package_provider_completed(Proc.run(env, package_provider_git_archive_args(git, repository, revision, output)))
+}
+
+pub(package) fn package_provider_curl_args(url: str, output: str, maximum_bytes: i64) -> List<str> {
+  let mut args = list_nil<str>()
+  -- --disable must be the first curl option so ambient .curlrc policy cannot
+  -- weaken protocol, redirect, timeout or output constraints.
+  args = list_append<str>(args, "--disable")
+  args = list_append<str>(args, "--fail")
+  args = list_append<str>(args, "--fail-early")
+  args = list_append<str>(args, "--location")
+  args = list_append<str>(args, "--proto")
+  args = list_append<str>(args, "=https")
+  args = list_append<str>(args, "--proto-redir")
+  args = list_append<str>(args, "=https")
+  args = list_append<str>(args, "--max-redirs")
+  args = list_append<str>(args, "5")
+  args = list_append<str>(args, "--max-filesize")
+  args = list_append<str>(args, runtime_int_to_str(maximum_bytes))
+  args = list_append<str>(args, "--connect-timeout")
+  args = list_append<str>(args, "30")
+  args = list_append<str>(args, "--max-time")
+  args = list_append<str>(args, "300")
+  args = list_append<str>(args, "--silent")
+  args = list_append<str>(args, "--show-error")
+  args = list_append<str>(args, "--output")
+  args = list_append<str>(args, output)
+  args = list_append<str>(args, url)
+  args
+}
+
+pub(package) fn package_provider_git_archive(env: str, git: str, url: str, revision: str, repository: Path, output: Path) -[Proc]> PackageProviderResult {
+  match path_to_utf8(repository) {
+    Err(error) -> PackageProviderFailed(PackageProviderRejected("git staging path is not UTF-8"))
+    Ok(repository_text) -> match path_to_utf8(output) {
+      Err(error) -> PackageProviderFailed(PackageProviderRejected("git archive path is not UTF-8"))
+      Ok(output_text) -> if str_len(env) == 0 {
+        PackageProviderFailed(PackageProviderUnavailable("env"))
+      } else { if str_len(git) == 0 {
+        PackageProviderFailed(PackageProviderUnavailable("git"))
+      } else { if package_provider_git_init(env, git, repository_text) == false {
+        PackageProviderFailed(PackageProviderRejected("git init failed"))
+      } else { if package_provider_git_fetch(env, git, repository_text, url, revision) == false {
+        PackageProviderFailed(PackageProviderRejected("git fetch rejected the exact revision"))
+      } else { if package_provider_git_write_archive(env, git, repository_text, revision, output_text) == false {
+        PackageProviderFailed(PackageProviderRejected("git archive failed"))
+      } else { PackageProviderSucceeded } } } } }
+    }
+  }
+}
+
+pub(package) fn package_provider_https_archive(curl: str, url: str, output: Path, maximum_bytes: i64) -[Proc]> PackageProviderResult {
+  match path_to_utf8(output) {
+    Err(error) -> PackageProviderFailed(PackageProviderRejected("archive staging path is not UTF-8"))
+    Ok(output_text) -> if str_len(curl) == 0 {
+      PackageProviderFailed(PackageProviderUnavailable("curl"))
+    } else {
+      let args = package_provider_curl_args(url, output_text, maximum_bytes)
+      if package_provider_completed(Proc.run(curl, args)) {
+        PackageProviderSucceeded
+      } else { PackageProviderFailed(PackageProviderRejected("HTTPS archive download failed")) }
+    }
+  }
+}
+
+pub(package) fn package_source_with_process_providers<E>(env: str, git: str, curl: str, body: () -[PackageSourceAcquire, E]> i64) -[Proc, E]> i64 {
+  handle body() {
+    PackageSourceAcquire.git_archive(url, revision, repository, output) -> resume(package_provider_git_archive(env, git, url, revision, repository, output))
+    PackageSourceAcquire.https_archive(url, output, maximum_bytes) -> resume(package_provider_https_archive(curl, url, output, maximum_bytes))
+  }
+}
+
+pub(package) fn package_archive_byte(values: Vector<u8>, index: i64) -> i64 {
+  __u8_to_u64(vector_get_in_bounds<u8>(values, index)) |> __u64_to_i64
+}
+
+pub(package) fn package_archive_block_zero(values: Vector<u8>, start: i64) -> bool {
+  let mut index = 0
+  let mut zero = true
+  while index < 512 and zero {
+    if package_archive_byte(values, start + index) != 0 { zero = false } else { index = index + 1 }
+  }
+  zero
+}
+
+pub(package) fn package_archive_field_text(values: Vector<u8>, start: i64, width: i64) -> PackageArchiveText {
+  let field = vector_new<u8>()
+  let mut index = 0
+  let mut done = false
+  while index < width and done == false {
+    let byte = vector_get_in_bounds<u8>(values, start + index)
+    if __u8_to_u64(byte) == 0 { done = true }
+    else {
+      vector_push<u8>(field, byte)
+      index = index + 1
+    }
+  }
+  match bytes_to_utf8(bytes_from_vector(field)) {
+    Err(error) -> PackageArchiveTextInvalid
+    Ok(text) -> PackageArchiveTextValue(text)
+  }
+}
+
+pub(package) fn package_archive_octal(values: Vector<u8>, start: i64, width: i64) -> i64 {
+  let mut index = 0
+  let mut value = 0
+  let mut digits = 0
+  let mut ended = false
+  let mut valid = true
+  while index < width and valid {
+    let byte = package_archive_byte(values, start + index)
+    if byte == 0 or byte == 32 {
+      if digits > 0 { ended = true } else { 0 }
+    } else { if byte >= 48 and byte <= 55 and ended == false {
+      value = value * 8 + byte - 48
+      digits = digits + 1
+    } else { valid = false } }
+    index = index + 1
+  }
+  if valid and digits > 0 { value } else { 0 - 1 }
+}
+
+pub(package) fn package_archive_checksum_valid(values: Vector<u8>, start: i64) -> bool {
+  let recorded = package_archive_octal(values, start + 148, 8)
+  if recorded < 0 { false }
+  else {
+    let mut sum = 0
+    for index in 0..512 {
+      sum = sum + if index >= 148 and index < 156 { 32 } else { package_archive_byte(values, start + index) }
+    }
+    sum == recorded
+  }
+}
+
+pub(package) fn package_archive_path_safe(path: str) -> bool {
+  if str_len(path) == 0 or pkg_path_is_safe(__str_ptr(path), 0, __str_len(path)) == 0 { false }
+  else {
+    let mut index = 0
+    let mut segment = 0
+    let mut safe = true
+    while index <= str_len(path) and safe {
+      if index == str_len(path) or str_byte_at(path, index) == 47 {
+        let len = index - segment
+        let value = str_slice_bytes(path, segment, len)
+        if str_eq(value, ".") == 1 or str_eq(value, ".git") == 1 or str_eq(value, ".weft") == 1 { safe = false }
+        else { segment = index + 1 }
+      } else { 0 }
+      index = index + 1
+    }
+    safe
+  }
+}
+
+pub(package) fn package_archive_entry_path(entry: PackageArchiveEntry) -> str {
+  match entry {
+    PackageArchiveDirectory(path) -> path
+    PackageArchiveFile(path, content) -> path
+  }
+}
+
+pub(package) fn package_archive_entry_is_file(entry: PackageArchiveEntry) -> bool {
+  match entry {
+    PackageArchiveDirectory(path) -> false
+    PackageArchiveFile(path, content) -> true
+  }
+}
+
+pub(package) fn package_archive_path_conflicts(entries: Vector<PackageArchiveEntry>, path: str, is_file: bool) -> bool {
+  let mut index = 0
+  let mut conflict = false
+  while index < vector_len<PackageArchiveEntry>(entries) and conflict == false {
+    let entry = vector_get_in_bounds<PackageArchiveEntry>(entries, index)
+    let existing = package_archive_entry_path(entry)
+    if str_eq(existing, path) == 1 { conflict = true }
+    else {
+      let existing_prefix = str_concat(existing, "/")
+      let path_prefix = str_concat(path, "/")
+      if package_archive_entry_is_file(entry) and str_starts_with(path, existing_prefix) == 1 { conflict = true }
+      else { if is_file and str_starts_with(existing, path_prefix) == 1 { conflict = true }
+      else { index = index + 1 } }
+    }
+  }
+  conflict
+}
+
+pub(package) fn package_archive_content(values: Vector<u8>, start: i64, len: i64) -> Bytes {
+  let content = vector_new<u8>()
+  for index in 0..len { vector_push<u8>(content, vector_get_in_bounds<u8>(values, start + index)) }
+  bytes_from_vector(content)
+}
+
+pub(package) fn package_archive_parse(bytes: Bytes) -> PackageArchiveParse {
+  let values = bytes_to_vector(bytes)
+  let length = vector_len<u8>(values)
+  let entries = vector_new<PackageArchiveEntry>()
+  let mut position = 0
+  let mut zero_blocks = 0
+  let mut failure = ""
+  while position + 512 <= length and zero_blocks < 2 and str_len(failure) == 0 {
+    if package_archive_block_zero(values, position) {
+      zero_blocks = zero_blocks + 1
+      position = position + 512
+    } else {
+      zero_blocks = 0
+      if package_archive_checksum_valid(values, position) == false or
+        package_archive_byte(values, position + 257) != 117 or
+        package_archive_byte(values, position + 258) != 115 or
+        package_archive_byte(values, position + 259) != 116 or
+        package_archive_byte(values, position + 260) != 97 or
+        package_archive_byte(values, position + 261) != 114 or
+        package_archive_byte(values, position + 262) != 0 or
+        package_archive_byte(values, position + 263) != 48 or
+        package_archive_byte(values, position + 264) != 48 {
+        failure = "archive has an invalid USTAR header"
+      } else {
+        let size = package_archive_octal(values, position + 124, 12)
+        let kind = package_archive_byte(values, position + 156)
+        let padded = if size < 0 { 0 } else { (size + 511) / 512 * 512 }
+        if size < 0 or size > package_source_maximum_archive_bytes() or position + 512 + padded > length {
+          failure = "archive entry size is invalid"
+        } else { if kind == 103 {
+          -- Git emits a global PAX comment carrying the commit identity. It
+          -- cannot alter path or type interpretation in this strict subset.
+          position = position + 512 + padded
+        } else { if kind != 0 and kind != 48 and kind != 53 {
+          failure = "archive contains a link, special file, or unsupported extension"
+        } else {
+          match package_archive_field_text(values, position, 100) {
+            PackageArchiveTextInvalid -> { failure = "archive path is not UTF-8" }
+            PackageArchiveTextValue(name) -> {
+              match package_archive_field_text(values, position + 345, 155) {
+                PackageArchiveTextInvalid -> { failure = "archive prefix is not UTF-8" }
+                PackageArchiveTextValue(prefix) -> {
+                  let raw_path = if str_len(prefix) == 0 { name } else { str_concat(prefix, str_concat("/", name)) }
+                  let path = if kind == 53 and str_len(raw_path) > 0 and str_byte_at(raw_path, str_len(raw_path) - 1) == 47 {
+                    str_slice_bytes(raw_path, 0, str_len(raw_path) - 1)
+                  } else { raw_path }
+                  let is_file = kind == 0 or kind == 48
+                  if package_archive_path_safe(path) == false or package_archive_path_conflicts(entries, path, is_file) {
+                    failure = "archive path is unsafe or conflicts with another entry"
+                  } else { if vector_len<PackageArchiveEntry>(entries) >= package_source_maximum_entries() {
+                    failure = "archive contains too many entries"
+                  } else { if is_file {
+                    vector_push<PackageArchiveEntry>(entries, PackageArchiveFile(path, package_archive_content(values, position + 512, size)))
+                  } else { if size != 0 { failure = "archive directory has data" }
+                  else { vector_push<PackageArchiveEntry>(entries, PackageArchiveDirectory(path)) } } } }
+                }
+              }
+            }
+          }
+          position = position + 512 + padded
+        } } }
+      }
+    }
+  }
+  if str_len(failure) > 0 { PackageArchiveInvalid(failure) }
+  else { if zero_blocks < 2 { PackageArchiveInvalid("archive is missing its end marker") }
+  else {
+    let mut trailing = position
+    let mut clean = true
+    while trailing < length and clean {
+      if package_archive_byte(values, trailing) != 0 { clean = false } else { trailing = trailing + 1 }
+    }
+    if clean { PackageArchiveParsed(entries) } else { PackageArchiveInvalid("archive has nonzero trailing data") }
+  } }
+}
+
+pub(package) fn package_source_parent(path: str) -> str {
+  let mut index = 0
+  let mut slash = 0 - 1
+  while index < str_len(path) {
+    if str_byte_at(path, index) == 47 { slash = index } else { 0 }
+    index = index + 1
+  }
+  if slash < 0 { "" } else { str_slice_bytes(path, 0, slash) }
+}
+
+pub(package) fn package_source_ensure_directory(path: str) -[DirInspect, DirMutate]> bool {
+  let mut index = 0
+  let mut ok = true
+  while index <= str_len(path) and ok {
+    if index == str_len(path) or str_byte_at(path, index) == 47 {
+      let prefix = str_slice_bytes(path, 0, index)
+      if str_len(prefix) > 0 {
+        match dir_symlink_metadata(pkg_safe_path(prefix)) {
+          Err(error) -> { ok = false }
+          Ok(metadata) -> if metadata.exists {
+            if dir_kind_code(metadata.kind) != 2 { ok = false } else { 0 }
+          } else { match dir_create(pkg_safe_path(prefix)) {
+            Ok(value) -> 0
+            Err(IoAlreadyExists) -> 0
+            Err(error) -> { ok = false 0 }
+          } }
+        }
+      } else { 0 }
+    } else { 0 }
+    index = index + 1
+  }
+  ok
+}
+
+pub(package) fn package_source_claim_stage(prefix: str, next: Vector<i64>) -[DirInspect, DirMutate]> PackageSourceStage {
+  if package_source_ensure_directory(".weft/staging") == false { PackageSourceStageUnavailable }
+  else {
+    let mut attempt = vector_get_in_bounds<i64>(next, 0)
+    let mut stage = ""
+    let mut claimed = false
+    while attempt < vector_get_in_bounds<i64>(next, 0) + 64 and claimed == false {
+      stage = str_concat(prefix, str_concat("-", runtime_int_to_str(attempt)))
+      match dir_create(pkg_safe_path(stage)) {
+        Ok(value) -> { claimed = true 0 }
+        Err(IoAlreadyExists) -> { attempt = attempt + 1 0 }
+        Err(error) -> { attempt = attempt + 64 0 }
+      }
+    }
+    vector_set<i64>(next, 0, attempt + 1)
+    if claimed { PackageSourceStageReady(stage) } else { PackageSourceStageUnavailable }
+  }
+}
+
+-- Remove only the explicitly owned stage tree. lstat keeps links opaque; the
+-- traversal is iterative and bounded so cleanup cannot escape or recurse
+-- through provider-created structure.
+pub(package) fn package_source_remove_tree(root: str) -[DirInspect, DirMutate]> bool {
+  let pending = vector_new<str>()
+  let visited = vector_new<str>()
+  vector_push<str>(pending, root)
+  let mut index = 0
+  let mut ok = true
+  while index < vector_len<str>(pending) and ok {
+    let path = vector_get_in_bounds<str>(pending, index)
+    match dir_symlink_metadata(pkg_safe_path(path)) {
+      Err(error) -> { ok = false 0 }
+      Ok(metadata) -> if metadata.exists == false {
+        0
+      } else {
+        vector_push<str>(visited, path)
+        if vector_len<str>(visited) > 200000 { ok = false }
+        else { if dir_kind_code(metadata.kind) == 2 {
+          match dir_list(pkg_safe_path(path)) {
+            Err(error) -> { ok = false 0 }
+            Ok(entries) -> {
+              let mut child = 0
+              while child < vector_len<Path>(entries) and ok {
+                match path_to_utf8(vector_get_in_bounds<Path>(entries, child)) {
+                  Err(error) -> { ok = false 0 }
+                  Ok(name) -> if pkg_path_is_safe(__str_ptr(name), 0, __str_len(name)) == 0 or str_contains(name, "/") == 1 {
+                    ok = false
+                  } else {
+                    vector_push<str>(pending, str_concat(path, str_concat("/", name)))
+                  }
+                }
+                child = child + 1
+              }
+              0
+            }
+          }
+        } else { 0 } }
+      }
+    }
+    index = index + 1
+  }
+  let mut remove_index = vector_len<str>(visited) - 1
+  while remove_index >= 0 {
+    match dir_remove(pkg_safe_path(vector_get_in_bounds<str>(visited, remove_index))) {
+      Ok(value) -> 0
+      Err(error) -> { ok = false 0 }
+    }
+    remove_index = remove_index - 1
+  }
+  ok
+}
+
+pub(package) fn package_archive_write_entries(root: str, entries: Vector<PackageArchiveEntry>) -[DirInspect, DirMutate, FileWrite]> bool {
+  let mut index = 0
+  let mut ok = package_source_ensure_directory(root)
+  while index < vector_len<PackageArchiveEntry>(entries) and ok {
+    match vector_get_in_bounds<PackageArchiveEntry>(entries, index) {
+      PackageArchiveDirectory(path) -> { ok = package_source_ensure_directory(str_concat(root, str_concat("/", path))) }
+      PackageArchiveFile(path, content) -> {
+        let destination = str_concat(root, str_concat("/", path))
+        let parent = package_source_parent(destination)
+        if package_source_ensure_directory(parent) == false { ok = false }
+        else { match file_create_new(pkg_safe_path(destination), content) {
+          Ok(count) -> 0
+          Err(error) -> { ok = false 0 }
+        } }
+      }
+    }
+    index = index + 1
+  }
+  ok
+}
+
+pub(package) fn package_source_hex_digit(value: i64) -> i64 {
+  if value < 10 { 48 + value } else { 87 + value }
+}
+
+pub(package) fn package_source_digest(bytes: Bytes) -> str {
+  let values = bytes_to_vector(bytes)
+  let raw = alloc_zeroed(32)
+  sha256(vector_data<u8>(values), vector_len<u8>(values), raw)
+  let text = alloc_zeroed(71)
+  let prefix = "sha256:"
+  for index in 0..7 { mem_store8_at(text, index, str_byte_at(prefix, index)) }
+  for index in 0..32 {
+    let byte = mem_load8_at(raw, index)
+    mem_store8_at(text, 7 + index * 2, package_source_hex_digit(byte / 16))
+    mem_store8_at(text, 8 + index * 2, package_source_hex_digit(byte - byte / 16 * 16))
+  }
+  runtime_str_from_bytes_copy(text, 71)
+}
+
+pub(package) fn package_source_read_archive(path: str) -[FileRead]> Result<Bytes, IoError> {
+  file_read_all(pkg_safe_path(path), __i64_to_usize(package_source_maximum_archive_bytes()))
+}
+
+pub(package) fn package_source_extract_archive(path: str, expected_transport: str, root: str) -[DirInspect, DirMutate, FileRead, FileWrite]> Result<nil, str> {
+  match package_source_read_archive(path) {
+    Err(error) -> Err<nil, str>("archive exceeds the package source limit or cannot be read")
+    Ok(bytes) -> if str_len(expected_transport) > 0 and str_eq(package_source_digest(bytes), expected_transport) == 0 {
+      Err<nil, str>("archive bytes do not match the declared SHA-256")
+    } else { match package_archive_parse(bytes) {
+      PackageArchiveInvalid(message) -> Err<nil, str>(message)
+      PackageArchiveParsed(entries) -> if package_archive_write_entries(root, entries) {
+        Ok<nil, str>(nil)
+      } else { Err<nil, str>("archive tree could not be materialized safely") }
+    } }
+  }
+}
