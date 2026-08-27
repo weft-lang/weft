@@ -1,0 +1,924 @@
+-- stdlib/url.weft — canonical HTTP-family URL values
+--
+-- URL identity is pure typed data. Host names are canonical DomainName values,
+-- numeric hosts retain their address family, and wire components are stored in
+-- deterministic ASCII percent-encoded form. TLS and HTTP handlers consume this
+-- value; they never reinterpret an untyped source string.
+
+use runtime/string.{runtime_str_alloc_uninit, runtime_str_builder_set_byte, runtime_str_ptr}
+use stdlib/bytes.{bytes_from_vector, bytes_to_utf8, utf8_error_offset_or}
+use stdlib/display.{Display}
+use stdlib/eq.{Eq}
+use stdlib/idna.{DomainName, IdnaBidi, IdnaDisallowed, IdnaEmptyLabel, IdnaError, IdnaHyphen, IdnaInvalidPunycode, IdnaInvalidUtf8, IdnaJoinerContext, IdnaLabelTooLong, IdnaLeadingCombiningMark, IdnaNameTooLong, domain_name_parse}
+use stdlib/net_address.{AddressParseEmpty, AddressParseError, AddressParseInvalid, AddressParseLeadingZero, AddressParseMissingPort, AddressParseOutOfRange, AddressParsePartCount, Ipv4Address, Ipv6Address, ipv4_address_parse, ipv6_address_parse}
+use stdlib/num.{num_i64_to_u16_checked, num_i64_to_u8_checked, num_int_cast_value_or, num_u16_to_u64, num_u64_to_i64_checked}
+use stdlib/option.{None, Option, Some, option_none, option_some}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/string.{int_to_str, str_byte_at, str_concat, str_join, str_len, str_slice_bytes, str_split}
+use stdlib/vector.{vector_get, vector_len, vector_new, vector_pop, vector_push}
+
+--- An HTTP-family URL scheme with an exact default port and security policy.
+pub type UrlScheme {
+  --- Cleartext HTTP over TCP.
+  UrlHttp,
+    --- HTTP over validating TLS.
+    UrlHttps,
+    --- A cleartext WebSocket connection.
+    UrlWs,
+    --- A WebSocket connection over validating TLS.
+    UrlWss
+}
+
+--- A URL host whose semantic identity is never an unvalidated string.
+pub type UrlHost {
+  --- A canonical Unicode 17 UTS #46 domain identity.
+  UrlDomain(DomainName),
+    --- An exact IPv4 address.
+    UrlIpv4(Ipv4Address),
+    --- An exact IPv6 address; URL rendering supplies the required brackets.
+    UrlIpv6(Ipv6Address)
+}
+
+--- A typed failure to parse an absolute HTTP-family URL.
+pub type UrlParseError {
+  --- The source omitted a `scheme:` prefix at this byte offset.
+  UrlMissingScheme(i64),
+    --- The source named a scheme outside `http`, `https`, `ws`, and `wss`.
+    UrlUnsupportedScheme(i64),
+    --- The source omitted the `//` authority or its host at this byte offset.
+    UrlMissingAuthority(i64),
+    --- User information is deliberately outside the alpha URL value set.
+    UrlUserInfoNotAllowed(i64),
+    --- Domain, IPv4, bracketed IPv6, or authority syntax failed at this offset.
+    UrlInvalidHost(i64),
+    --- A present port was empty, non-decimal, or outside zero through 65535.
+    UrlInvalidPort(i64),
+    --- A percent escape was truncated or non-hexadecimal at this byte offset.
+    UrlInvalidPercentEncoding(i64),
+    --- An ASCII control byte appeared literally at this byte offset.
+    UrlControlCharacter(i64)
+}
+
+--- A typed failure to decode a percent-encoded text component.
+pub type UrlComponentError {
+  --- A percent escape was truncated or non-hexadecimal at this source offset.
+  UrlComponentInvalidPercent(i64),
+    --- Decoded bytes were not UTF-8 at this decoded-byte offset.
+    UrlComponentInvalidUtf8(i64)
+}
+
+type UrlParts {
+  scheme: UrlScheme,
+    host: UrlHost,
+    port: Option<u16>,
+    path: str,
+    query: Option<str>,
+    fragment: Option<str>
+}
+
+--- A canonical absolute hierarchical HTTP-family URL.
+---
+--- Construction is sealed so paths, queries, fragments, ports and host
+--- identities cannot bypass parsing and normalization.
+pub type Url = opaque UrlParts
+
+fn url_scheme_text(scheme: UrlScheme) -> str {
+  match scheme {
+    UrlHttp -> "http"
+    UrlHttps -> "https"
+    UrlWs -> "ws"
+    UrlWss -> "wss"
+  }
+}
+
+fn url_scheme_default_port_i64(scheme: UrlScheme) -> i64 {
+  match scheme {
+    UrlHttp -> 80
+    UrlHttps -> 443
+    UrlWs -> 80
+    UrlWss -> 443
+  }
+}
+
+fn url_i64_to_u16(value: i64) -> u16 {
+  num_int_cast_value_or<u16>(num_i64_to_u16_checked(value), 0)
+}
+
+fn url_u16_to_i64(value: u16) -> i64 {
+  num_int_cast_value_or<i64>(num_u64_to_i64_checked(num_u16_to_u64(value)), 0)
+}
+
+fn url_i64_to_u8(value: i64) -> u8 {
+  num_int_cast_value_or<u8>(num_i64_to_u8_checked(value), 0)
+}
+
+impl UrlScheme {
+  --- Return the canonical lowercase wire spelling.
+  pub fn text(self) -> str { url_scheme_text(self) }
+
+  --- Return the scheme's default transport port.
+  pub fn default_port(self) -> u16 {
+    url_i64_to_u16(url_scheme_default_port_i64(self))
+  }
+
+  --- Return whether the scheme requires validating TLS.
+  pub fn is_secure(self) -> bool {
+    match self {
+      UrlHttp -> false
+      UrlHttps -> true
+      UrlWs -> false
+      UrlWss -> true
+    }
+  }
+}
+
+impl Eq for UrlScheme {
+  fn eq(self: Self, other: Self) -> bool {
+    match self {
+      UrlHttp -> match other { UrlHttp -> true _ -> false }
+      UrlHttps -> match other { UrlHttps -> true _ -> false }
+      UrlWs -> match other { UrlWs -> true _ -> false }
+      UrlWss -> match other { UrlWss -> true _ -> false }
+    }
+  }
+}
+
+fn url_host_text(host: UrlHost) -> str {
+  match host {
+    UrlDomain(name) -> name.display()
+    UrlIpv4(address) -> address.display()
+    UrlIpv6(address) -> str_concat("[", str_concat(address.display(), "]"))
+  }
+}
+
+fn url_host_tls_identity(host: UrlHost) -> str {
+  match host {
+    UrlDomain(name) -> name.ascii()
+    UrlIpv4(address) -> address.display()
+    UrlIpv6(address) -> address.display()
+  }
+}
+
+impl UrlHost {
+  --- Render canonical ASCII authority text, including IPv6 brackets.
+  pub fn authority_text(self) -> str { url_host_text(self) }
+
+  --- Return canonical unbracketed certificate identity for the TLS backend.
+  pub fn tls_identity(self) -> str { url_host_tls_identity(self) }
+}
+
+impl Display for UrlHost {
+  fn display(self: Self) -> str { url_host_text(self) }
+}
+
+impl Eq for UrlHost {
+  fn eq(self: Self, other: Self) -> bool {
+    match self {
+      UrlDomain(left) -> match other {
+        UrlDomain(right) -> left.eq(right)
+        _ -> false
+      }
+      UrlIpv4(left) -> match other {
+        UrlIpv4(right) -> left.eq(right)
+        _ -> false
+      }
+      UrlIpv6(left) -> match other {
+        UrlIpv6(right) -> left.eq(right)
+        _ -> false
+      }
+    }
+  }
+}
+
+fn url_parts(value: Url) -> UrlParts {
+  match value { Url(parts) -> parts }
+}
+
+impl Url {
+  --- Return the typed scheme.
+  pub fn scheme(self) -> UrlScheme { url_parts(self).scheme }
+
+  --- Return the typed canonical host.
+  pub fn host(self) -> UrlHost { url_parts(self).host }
+
+  --- Return a non-default port override, if present.
+  pub fn port(self) -> Option<u16> { url_parts(self).port }
+
+  --- Return the port selected by the override or scheme default.
+  pub fn effective_port(self) -> u16 {
+    let parts = url_parts(self)
+    match parts.port {
+      Some(port) -> port
+      None -> parts.scheme.default_port()
+    }
+  }
+
+  --- Return the canonical non-empty ASCII path.
+  pub fn path(self) -> str { url_parts(self).path }
+
+  --- Return the canonical ASCII query while preserving absent versus empty.
+  pub fn query(self) -> Option<str> { url_parts(self).query }
+
+  --- Return the canonical ASCII fragment while preserving absent versus empty.
+  pub fn fragment(self) -> Option<str> { url_parts(self).fragment }
+
+  --- Return the host identity passed to certificate verification.
+  pub fn tls_identity(self) -> str { url_parts(self).host.tls_identity() }
+}
+
+impl Eq for Url {
+  fn eq(self: Self, other: Self) -> bool {
+    -- Canonical rendering is injective over UrlParts: absent/present-empty
+    -- query and fragment state carries its delimiter, IPv6 is bracketed, and
+    -- default ports are normalized before construction.
+    url_display(self) == url_display(other)
+  }
+}
+
+fn url_display(value: Url) -> str {
+  let parts = url_parts(value)
+  let authority = match parts.port {
+    Some(port) -> str_concat(parts.host.authority_text(), str_concat(":", int_to_str(url_u16_to_i64(port))))
+    None -> parts.host.authority_text()
+  }
+  let with_path = str_concat(
+    str_concat(parts.scheme.text(), "://"),
+    str_concat(authority, parts.path)
+  )
+  let with_query = match parts.query {
+    Some(query) -> str_concat(with_path, str_concat("?", query))
+    None -> with_path
+  }
+  match parts.fragment {
+    Some(fragment) -> str_concat(with_query, str_concat("#", fragment))
+    None -> with_query
+  }
+}
+
+impl Display for Url {
+  fn display(self: Self) -> str { url_display(self) }
+}
+
+fn url_ascii_lower(byte: i64) -> i64 {
+  if byte >= 65 and byte <= 90 { byte + 32 } else { byte }
+}
+
+fn url_range_ascii_eq(source: str, start: i64, end: i64, expected: str) -> bool {
+  if end - start != str_len(expected) { false }
+  else {
+    let mut index = 0
+    let mut equal = true
+    while equal and start + index < end {
+      if url_ascii_lower(str_byte_at(source, start + index)) != str_byte_at(expected, index) {
+        equal = false
+      } else { index = index + 1 }
+    }
+    equal
+  }
+}
+
+fn url_parse_scheme(source: str, colon: i64) -> Result<UrlScheme, UrlParseError> {
+  if colon <= 0 { result_err<UrlScheme, UrlParseError>(UrlMissingScheme(0)) }
+  else { if url_range_ascii_eq(source, 0, colon, "http") {
+      result_ok<UrlScheme, UrlParseError>(UrlHttp)
+    } else { if url_range_ascii_eq(source, 0, colon, "https") {
+        result_ok<UrlScheme, UrlParseError>(UrlHttps)
+      } else { if url_range_ascii_eq(source, 0, colon, "ws") {
+          result_ok<UrlScheme, UrlParseError>(UrlWs)
+        } else { if url_range_ascii_eq(source, 0, colon, "wss") {
+            result_ok<UrlScheme, UrlParseError>(UrlWss)
+          } else {
+            result_err<UrlScheme, UrlParseError>(UrlUnsupportedScheme(0))
+          } } } } }
+}
+
+fn url_find_byte(source: str, start: i64, end: i64, needle: i64) -> i64 {
+  let mut position = start
+  let mut found = 0 - 1
+  while found < 0 and position < end {
+    if str_byte_at(source, position) == needle { found = position }
+    else { position = position + 1 }
+  }
+  found
+}
+
+fn url_find_authority_end(source: str, start: i64, end: i64) -> i64 {
+  let mut position = start
+  let mut found = end
+  while position < end and found == end {
+    match str_byte_at(source, position) {
+      35 -> { found = position }
+      47 -> { found = position }
+      63 -> { found = position }
+      _ -> { position = position + 1 }
+    }
+  }
+  found
+}
+
+fn url_idna_error_offset(error: IdnaError) -> i64 {
+  match error {
+    IdnaEmptyLabel(offset, label) -> offset
+    IdnaInvalidUtf8(offset, label) -> offset
+    IdnaDisallowed(offset, label) -> offset
+    IdnaHyphen(offset, label) -> offset
+    IdnaInvalidPunycode(offset, label) -> offset
+    IdnaLeadingCombiningMark(offset, label) -> offset
+    IdnaJoinerContext(offset, label) -> offset
+    IdnaBidi(offset, label) -> offset
+    IdnaLabelTooLong(offset, label) -> offset
+    IdnaNameTooLong(offset, label) -> offset
+  }
+}
+
+fn url_address_error_offset(error: AddressParseError) -> i64 {
+  match error {
+    AddressParseEmpty(offset) -> offset
+    AddressParseInvalid(offset) -> offset
+    AddressParseOutOfRange(offset) -> offset
+    AddressParseLeadingZero(offset) -> offset
+    AddressParsePartCount(offset) -> offset
+    AddressParseMissingPort(offset) -> offset
+  }
+}
+
+fn url_range_is_numeric_host(source: str, start: i64, end: i64) -> bool {
+  let mut position = start
+  let mut numeric = true
+  let mut dot = false
+  while numeric and position < end {
+    let byte = str_byte_at(source, position)
+    if byte == 46 { dot = true; position = position + 1 }
+    else { if byte >= 48 and byte <= 57 { position = position + 1 }
+      else { numeric = false } }
+  }
+  numeric and dot
+}
+
+fn url_parse_unbracketed_host(source: str, start: i64, end: i64) -> Result<UrlHost, UrlParseError> {
+  if start >= end {
+    result_err<UrlHost, UrlParseError>(UrlMissingAuthority(start))
+  } else {
+    let text = str_slice_bytes(source, start, end - start)
+    if url_range_is_numeric_host(source, start, end) {
+      match ipv4_address_parse(text) {
+        Ok(address) -> result_ok<UrlHost, UrlParseError>(UrlIpv4(address))
+        Err(error) -> result_err<UrlHost, UrlParseError>(UrlInvalidHost(start + url_address_error_offset(error)))
+      }
+    } else {
+      match domain_name_parse(text) {
+        Ok(name) -> result_ok<UrlHost, UrlParseError>(UrlDomain(name))
+        Err(error) -> result_err<UrlHost, UrlParseError>(UrlInvalidHost(start + url_idna_error_offset(error)))
+      }
+    }
+  }
+}
+
+fn url_parse_port(source: str, start: i64, end: i64) -> Result<u16, UrlParseError> {
+  if start >= end { result_err<u16, UrlParseError>(UrlInvalidPort(start)) }
+  else {
+    let mut position = start
+    let mut value = 0
+    let mut failure: UrlParseError | nil = nil
+    while position < end and failure == nil {
+      let byte = str_byte_at(source, position)
+      if byte < 48 or byte > 57 {
+        failure = UrlInvalidPort(position)
+      } else {
+        let digit = byte - 48
+        if value > (65535 - digit) / 10 {
+          failure = UrlInvalidPort(position)
+        } else {
+          value = value * 10 + digit
+          position = position + 1
+        }
+      }
+    }
+    match failure {
+      error: UrlParseError -> result_err<u16, UrlParseError>(error)
+      nil -> result_ok<u16, UrlParseError>(url_i64_to_u16(value))
+    }
+  }
+}
+
+fn url_normalize_port(scheme: UrlScheme, port: Option<u16>) -> Option<u16> {
+  match port {
+    Some(value) -> {
+      if url_u16_to_i64(value) == url_scheme_default_port_i64(scheme) {
+        option_none<u16>()
+      } else { option_some<u16>(value) }
+    }
+    None -> option_none<u16>()
+  }
+}
+
+fn url_parse_authority(
+  source: str,
+  start: i64,
+  end: i64,
+  scheme: UrlScheme
+) -> Result<(UrlHost, Option<u16>), UrlParseError> {
+  if start >= end {
+    result_err<(UrlHost, Option<u16>), UrlParseError>(UrlMissingAuthority(start))
+  } else {
+    let userinfo = url_find_byte(source, start, end, 64)
+    if userinfo >= 0 {
+      result_err<(UrlHost, Option<u16>), UrlParseError>(UrlUserInfoNotAllowed(userinfo))
+    } else { if str_byte_at(source, start) == 91 {
+        let close = url_find_byte(source, start + 1, end, 93)
+        if close < 0 {
+          result_err<(UrlHost, Option<u16>), UrlParseError>(UrlInvalidHost(end))
+        } else {
+          let zone = url_find_byte(source, start + 1, close, 37)
+          if zone >= 0 {
+            result_err<(UrlHost, Option<u16>), UrlParseError>(UrlInvalidHost(zone))
+          } else {
+            let text = str_slice_bytes(source, start + 1, close - start - 1)
+            match ipv6_address_parse(text) {
+              Err(error) -> result_err<(UrlHost, Option<u16>), UrlParseError>(UrlInvalidHost(start + 1 + url_address_error_offset(error)))
+              Ok(address) -> {
+                if close + 1 == end {
+                  result_ok<(UrlHost, Option<u16>), UrlParseError>((UrlIpv6(address), option_none<u16>()))
+                } else { if str_byte_at(source, close + 1) != 58 {
+                    result_err<(UrlHost, Option<u16>), UrlParseError>(UrlInvalidHost(close + 1))
+                  } else {
+                    match url_parse_port(source, close + 2, end) {
+                      Err(error) -> result_err<(UrlHost, Option<u16>), UrlParseError>(error)
+                      Ok(port) -> result_ok<(UrlHost, Option<u16>), UrlParseError>((UrlIpv6(address), url_normalize_port(scheme, option_some<u16>(port))))
+                    }
+                  } }
+              }
+            }
+          }
+        }
+      } else {
+        let colon = url_find_byte(source, start, end, 58)
+        if colon >= 0 and url_find_byte(source, colon + 1, end, 58) >= 0 {
+          result_err<(UrlHost, Option<u16>), UrlParseError>(UrlInvalidHost(colon))
+        } else {
+          let host_end = if colon < 0 { end } else { colon }
+          match url_parse_unbracketed_host(source, start, host_end) {
+            Err(error) -> result_err<(UrlHost, Option<u16>), UrlParseError>(error)
+            Ok(host) -> {
+              if colon < 0 {
+                result_ok<(UrlHost, Option<u16>), UrlParseError>((host, option_none<u16>()))
+              } else {
+                match url_parse_port(source, colon + 1, end) {
+                  Err(error) -> result_err<(UrlHost, Option<u16>), UrlParseError>(error)
+                  Ok(port) -> result_ok<(UrlHost, Option<u16>), UrlParseError>((host, url_normalize_port(scheme, option_some<u16>(port))))
+                }
+              }
+            }
+          }
+        }
+      } }
+  }
+}
+
+fn url_hex_value(byte: i64) -> i64 {
+  if byte >= 48 and byte <= 57 { byte - 48 }
+  else { if byte >= 65 and byte <= 70 { byte - 55 }
+    else { if byte >= 97 and byte <= 102 { byte - 87 }
+      else { 0 - 1 } } }
+}
+
+fn url_hex_digit(value: i64) -> i64 {
+  if value < 10 { 48 + value } else { 65 + value - 10 }
+}
+
+fn url_is_unreserved(byte: i64) -> bool {
+  (byte >= 65 and byte <= 90) or
+    (byte >= 97 and byte <= 122) or
+    (byte >= 48 and byte <= 57) or
+    byte == 45 or byte == 46 or byte == 95 or byte == 126
+}
+
+fn url_is_subdelimiter(byte: i64) -> bool {
+  byte == 33 or byte == 36 or byte == 38 or byte == 39 or byte == 40 or
+    byte == 41 or byte == 42 or byte == 43 or byte == 44 or byte == 59 or
+    byte == 61
+}
+
+fn url_component_allows(byte: i64, kind: i64) -> bool {
+  url_is_unreserved(byte) or url_is_subdelimiter(byte) or byte == 58 or
+    byte == 64 or (kind >= 1 and byte == 47) or (kind >= 2 and byte == 63)
+}
+
+fn url_write_percent(out: i64, out_len: i64, position: i64, byte: i64) -> i64 {
+  runtime_str_builder_set_byte(out, out_len, position, 37)
+  runtime_str_builder_set_byte(out, out_len, position + 1, url_hex_digit((byte bshr 4) band 15))
+  runtime_str_builder_set_byte(out, out_len, position + 2, url_hex_digit(byte band 15))
+  position + 3
+}
+
+-- kind: 1 = path, 2 = query/fragment. Authority is handled separately.
+fn url_canonical_component(
+  source: str,
+  start: i64,
+  end: i64,
+  kind: i64
+) -> Result<str, UrlParseError> {
+  let mut position = start
+  let mut output_len = 0
+  let mut failure: UrlParseError | nil = nil
+  while position < end and failure == nil {
+    let byte = str_byte_at(source, position)
+    if byte < 32 or byte == 127 {
+      failure = UrlControlCharacter(position)
+    } else { if byte == 37 {
+        if position + 2 >= end {
+          failure = UrlInvalidPercentEncoding(position)
+        } else {
+          let high = url_hex_value(str_byte_at(source, position + 1))
+          let low = url_hex_value(str_byte_at(source, position + 2))
+          if high < 0 or low < 0 {
+            failure = UrlInvalidPercentEncoding(position)
+          } else {
+            let decoded = high * 16 + low
+            output_len = output_len + if url_is_unreserved(decoded) { 1 } else { 3 }
+            position = position + 3
+          }
+        }
+      } else {
+        output_len = output_len + if byte < 128 and url_component_allows(byte, kind) { 1 } else { 3 }
+        position = position + 1
+      } }
+  }
+  match failure {
+    error: UrlParseError -> result_err<str, UrlParseError>(error)
+    nil -> {
+      let output = runtime_str_alloc_uninit(output_len)
+      let out = runtime_str_ptr(output)
+      position = start
+      let mut out_position = 0
+      while position < end {
+        let byte = str_byte_at(source, position)
+        if byte == 37 {
+          let decoded = url_hex_value(str_byte_at(source, position + 1)) * 16 +
+            url_hex_value(str_byte_at(source, position + 2))
+          if url_is_unreserved(decoded) {
+            runtime_str_builder_set_byte(out, output_len, out_position, decoded)
+            out_position = out_position + 1
+          } else {
+            out_position = url_write_percent(out, output_len, out_position, decoded)
+          }
+          position = position + 3
+        } else {
+          if byte < 128 and url_component_allows(byte, kind) {
+            runtime_str_builder_set_byte(out, output_len, out_position, byte)
+            out_position = out_position + 1
+          } else {
+            out_position = url_write_percent(out, output_len, out_position, byte)
+          }
+          position = position + 1
+        }
+      }
+      result_ok<str, UrlParseError>(output)
+    }
+  }
+}
+
+fn url_first_control(source: str) -> i64 {
+  let mut position = 0
+  let mut found = 0 - 1
+  while found < 0 and position < str_len(source) {
+    let byte = str_byte_at(source, position)
+    if byte < 32 or byte == 127 { found = position }
+    else { position = position + 1 }
+  }
+  found
+}
+
+fn url_query_encode_allowed(byte: i64) -> bool {
+  url_is_unreserved(byte)
+}
+
+fn url_form_encode_allowed(byte: i64) -> bool {
+  (byte >= 65 and byte <= 90) or
+    (byte >= 97 and byte <= 122) or
+    (byte >= 48 and byte <= 57) or
+    byte == 42 or byte == 45 or byte == 46 or byte == 95
+}
+
+fn url_encode_text_component(source: str, form: bool) -> str {
+  let mut position = 0
+  let mut output_len = 0
+  while position < str_len(source) {
+    let byte = str_byte_at(source, position)
+    if form and byte == 32 {
+      output_len = output_len + 1
+    } else {
+      let allowed = if form { url_form_encode_allowed(byte) }
+      else { url_query_encode_allowed(byte) }
+      output_len = output_len + if allowed { 1 } else { 3 }
+    }
+    position = position + 1
+  }
+  let output = runtime_str_alloc_uninit(output_len)
+  let out = runtime_str_ptr(output)
+  position = 0
+  let mut out_position = 0
+  while position < str_len(source) {
+    let byte = str_byte_at(source, position)
+    if form and byte == 32 {
+      runtime_str_builder_set_byte(out, output_len, out_position, 43)
+      out_position = out_position + 1
+    } else {
+      let allowed = if form { url_form_encode_allowed(byte) }
+      else { url_query_encode_allowed(byte) }
+      if allowed {
+        runtime_str_builder_set_byte(out, output_len, out_position, byte)
+        out_position = out_position + 1
+      } else {
+        out_position = url_write_percent(out, output_len, out_position, byte)
+      }
+    }
+    position = position + 1
+  }
+  output
+}
+
+fn url_decode_text_component(source: str, form: bool) -> Result<str, UrlComponentError> {
+  let output = vector_new<u8>()
+  let mut position = 0
+  let mut failure: UrlComponentError | nil = nil
+  while position < str_len(source) and failure == nil {
+    let byte = str_byte_at(source, position)
+    if byte == 37 {
+      if position + 2 >= str_len(source) {
+        failure = UrlComponentInvalidPercent(position)
+      } else {
+        let high = url_hex_value(str_byte_at(source, position + 1))
+        let low = url_hex_value(str_byte_at(source, position + 2))
+        if high < 0 or low < 0 {
+          failure = UrlComponentInvalidPercent(position)
+        } else {
+          vector_push<u8>(output, url_i64_to_u8(high * 16 + low))
+          position = position + 3
+        }
+      }
+    } else {
+      let decoded = if form and byte == 43 { 32 } else { byte }
+      vector_push<u8>(output, url_i64_to_u8(decoded))
+      position = position + 1
+    }
+  }
+  match failure {
+    error: UrlComponentError -> result_err<str, UrlComponentError>(error)
+    nil -> match bytes_to_utf8(bytes_from_vector(output)) {
+      Ok(text) -> result_ok<str, UrlComponentError>(text)
+      Err(error) -> result_err<str, UrlComponentError>(UrlComponentInvalidUtf8(utf8_error_offset_or(error, 0)))
+    }
+  }
+}
+
+--- Percent-encode one query key or value under RFC 3986.
+---
+--- Only unreserved bytes remain literal, so structural `&`, `=`, `+`, `/`
+--- and `?` bytes cannot escape a component boundary.
+pub fn url_query_component_encode(text: str) -> str {
+  url_encode_text_component(text, false)
+}
+
+--- Decode one RFC 3986 query component as valid UTF-8.
+---
+--- A literal plus remains plus; HTML form plus-as-space behavior is separate.
+pub fn url_query_component_decode(text: str) -> Result<str, UrlComponentError> {
+  url_decode_text_component(text, false)
+}
+
+--- Encode one `application/x-www-form-urlencoded` key or value.
+---
+--- ASCII space becomes `+`; other bytes outside the form-safe set are
+--- uppercase percent escapes over the input's UTF-8 encoding.
+pub fn url_form_component_encode(text: str) -> str {
+  url_encode_text_component(text, true)
+}
+
+--- Decode one `application/x-www-form-urlencoded` component as valid UTF-8.
+pub fn url_form_component_decode(text: str) -> Result<str, UrlComponentError> {
+  url_decode_text_component(text, true)
+}
+
+--- Parse and canonicalize an absolute HTTP-family URL.
+---
+--- The parser is deliberately RFC 3986-oriented rather than browser-like:
+--- userinfo, IPv6 zones and ambiguous numeric hosts are rejected. Literal
+--- Unicode is accepted in host/path/query/fragment input, then host names use
+--- `DomainName` and other components render as canonical ASCII UTF-8 escapes.
+pub fn url_parse(source: str) -> Result<Url, UrlParseError> {
+  let source_len = str_len(source)
+  let control = url_first_control(source)
+  if control >= 0 {
+    result_err<Url, UrlParseError>(UrlControlCharacter(control))
+  } else {
+    let colon = url_find_byte(source, 0, source_len, 58)
+    if colon < 0 {
+      result_err<Url, UrlParseError>(UrlMissingScheme(0))
+    } else {
+      match url_parse_scheme(source, colon) {
+        Err(error) -> result_err<Url, UrlParseError>(error)
+        Ok(scheme) -> {
+          if colon + 2 >= source_len or str_byte_at(source, colon + 1) != 47 or str_byte_at(source, colon + 2) != 47 {
+            result_err<Url, UrlParseError>(UrlMissingAuthority(colon + 1))
+          } else {
+            let authority_start = colon + 3
+            let authority_end = url_find_authority_end(source, authority_start, source_len)
+            match url_parse_authority(source, authority_start, authority_end, scheme) {
+              Err(error) -> result_err<Url, UrlParseError>(error)
+              Ok(authority) -> match authority {
+                (host, port) -> {
+                  let fragment_mark = url_find_byte(source, authority_end, source_len, 35)
+                  let before_fragment = if fragment_mark < 0 { source_len } else { fragment_mark }
+                  let query_mark = url_find_byte(source, authority_end, before_fragment, 63)
+                  let path_end = if query_mark < 0 { before_fragment } else { query_mark }
+                  let path_result = if authority_end == path_end {
+                    result_ok<str, UrlParseError>("/")
+                  } else {
+                    url_canonical_component(source, authority_end, path_end, 1)
+                  }
+                  match path_result {
+                    Err(error) -> result_err<Url, UrlParseError>(error)
+                    Ok(path) -> {
+                      let query_result = if query_mark < 0 {
+                        result_ok<Option<str>, UrlParseError>(option_none<str>())
+                      } else {
+                        match url_canonical_component(source, query_mark + 1, before_fragment, 2) {
+                          Err(error) -> result_err<Option<str>, UrlParseError>(error)
+                          Ok(query) -> result_ok<Option<str>, UrlParseError>(option_some<str>(query))
+                        }
+                      }
+                      match query_result {
+                        Err(error) -> result_err<Url, UrlParseError>(error)
+                        Ok(query) -> {
+                          let fragment_result = if fragment_mark < 0 {
+                            result_ok<Option<str>, UrlParseError>(option_none<str>())
+                          } else {
+                            match url_canonical_component(source, fragment_mark + 1, source_len, 2) {
+                              Err(error) -> result_err<Option<str>, UrlParseError>(error)
+                              Ok(fragment) -> result_ok<Option<str>, UrlParseError>(option_some<str>(fragment))
+                            }
+                          }
+                          match fragment_result {
+                            Err(error) -> result_err<Url, UrlParseError>(error)
+                            Ok(fragment) -> result_ok<Url, UrlParseError>(Url(UrlParts {
+                              scheme: scheme,
+                                host: host,
+                                port: port,
+                                path: path,
+                                query: query,
+                                fragment: fragment
+                            }))
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn url_reference_scheme_colon(reference: str) -> i64 {
+  let mut position = 0
+  let mut colon = 0 - 1
+  let mut done = false
+  while not done and position < str_len(reference) {
+    match str_byte_at(reference, position) {
+      35 -> { done = true }
+      47 -> { done = true }
+      58 -> { colon = position; done = true }
+      63 -> { done = true }
+      _ -> { position = position + 1 }
+    }
+  }
+  colon
+}
+
+fn url_path_last_slash(path: str) -> i64 {
+  let mut position = str_len(path) - 1
+  let mut found = 0 - 1
+  while found < 0 and position >= 0 {
+    if str_byte_at(path, position) == 47 { found = position }
+    else { position = position - 1 }
+  }
+  found
+}
+
+fn url_remove_dot_segments(path: str) -> str {
+  let source = str_split(path, "/")
+  let output = vector_new<str>()
+  -- Every stored URL path is absolute. Retain one root marker and preserve
+  -- interior/trailing empty segments because repeated slashes are wire data.
+  vector_push<str>(output, "")
+  let mut index = 1
+  while index < vector_len<str>(source) {
+    let segment = vector_get<str>(source, index, "")
+    if segment == "." {
+      if index + 1 == vector_len<str>(source) { vector_push<str>(output, "") } else { 0 }
+    } else { if segment == ".." {
+        if vector_len<str>(output) > 1 {
+          match vector_pop<str>(output) { Some(_) -> 1 None -> 0 }
+        } else { 0 }
+        if index + 1 == vector_len<str>(source) { vector_push<str>(output, "") } else { 0 }
+      } else {
+        vector_push<str>(output, segment)
+      } }
+    index = index + 1
+  }
+  let normalized = str_join(output, "/")
+  if str_len(normalized) == 0 { "/" } else { normalized }
+}
+
+fn url_resolve_path(base_path: str, reference_path: str) -> str {
+  let merged = if str_len(reference_path) > 0 and str_byte_at(reference_path, 0) == 47 {
+    reference_path
+  } else {
+    let slash = url_path_last_slash(base_path)
+    let prefix = if slash < 0 { "/" } else { str_slice_bytes(base_path, 0, slash + 1) }
+    str_concat(prefix, reference_path)
+  }
+  url_remove_dot_segments(merged)
+}
+
+fn url_resolved_value(
+  base: UrlParts,
+  path: str,
+  query: Option<str>,
+  fragment: Option<str>
+) -> Url {
+  Url(UrlParts {
+    scheme: base.scheme,
+      host: base.host,
+      port: base.port,
+      path: path,
+      query: query,
+      fragment: fragment
+  })
+}
+
+--- Resolve one RFC 3986 relative reference against an absolute base URL.
+---
+--- Absolute and network-path references are parsed through the same sealed
+--- constructor. Relative paths are canonicalized, merged, and dot-normalized;
+--- an absent query is inherited only when the reference path is empty.
+pub fn url_resolve(base: Url, reference: str) -> Result<Url, UrlParseError> {
+  let control = url_first_control(reference)
+  if control >= 0 {
+    result_err<Url, UrlParseError>(UrlControlCharacter(control))
+  } else {
+    let scheme_colon = url_reference_scheme_colon(reference)
+    if scheme_colon >= 0 {
+      url_parse(reference)
+    } else { if str_len(reference) >= 2 and str_byte_at(reference, 0) == 47 and str_byte_at(reference, 1) == 47 {
+        url_parse(str_concat(str_concat(base.scheme().text(), ":"), reference))
+      } else {
+        let parts = url_parts(base)
+        let reference_len = str_len(reference)
+        let fragment_mark = url_find_byte(reference, 0, reference_len, 35)
+        let before_fragment = if fragment_mark < 0 { reference_len } else { fragment_mark }
+        let query_mark = url_find_byte(reference, 0, before_fragment, 63)
+        let path_end = if query_mark < 0 { before_fragment } else { query_mark }
+        let path_result = url_canonical_component(reference, 0, path_end, 1)
+        match path_result {
+          Err(error) -> result_err<Url, UrlParseError>(error)
+          Ok(reference_path) -> {
+            let path = if str_len(reference_path) == 0 { parts.path }
+            else { url_resolve_path(parts.path, reference_path) }
+            let query_result = if query_mark >= 0 {
+              match url_canonical_component(reference, query_mark + 1, before_fragment, 2) {
+                Err(error) -> result_err<Option<str>, UrlParseError>(error)
+                Ok(query) -> result_ok<Option<str>, UrlParseError>(option_some<str>(query))
+              }
+            } else { if str_len(reference_path) == 0 {
+                result_ok<Option<str>, UrlParseError>(parts.query)
+              } else {
+                result_ok<Option<str>, UrlParseError>(option_none<str>())
+              } }
+            match query_result {
+              Err(error) -> result_err<Url, UrlParseError>(error)
+              Ok(query) -> {
+                let fragment_result = if fragment_mark < 0 {
+                  result_ok<Option<str>, UrlParseError>(option_none<str>())
+                } else {
+                  match url_canonical_component(reference, fragment_mark + 1, reference_len, 2) {
+                    Err(error) -> result_err<Option<str>, UrlParseError>(error)
+                    Ok(fragment) -> result_ok<Option<str>, UrlParseError>(option_some<str>(fragment))
+                  }
+                }
+                match fragment_result {
+                  Err(error) -> result_err<Url, UrlParseError>(error)
+                  Ok(fragment) -> result_ok<Url, UrlParseError>(url_resolved_value(parts, path, query, fragment))
+                }
+              }
+            }
+          }
+        }
+      } }
+  }
+}
