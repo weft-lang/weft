@@ -256,6 +256,13 @@ Verified trees live at `.weft/cache/sha256/<tree-digest>`; archive traversal,
 links, special files, duplicate paths, size-limit violations, and byte drift
 are rejected before admission. `pkg update NAME --revision HEX` or
 `pkg update NAME --sha256 sha256:HEX` is the explicit pin-changing operation.
+When the dependency is covered by a root trust grant, the ordinary update
+acquires and checks the candidate but reports `E5014` with deterministic
+before/after authority facts, then restores both `weft.pkg` and `weft.lock`.
+After reviewing native libraries, symbols, safe wrapper signatures, and
+effects, rerun that exact command with `--accept-trust-change` to commit the
+candidate. Acceptance refreshes only the grant's exact version/source/content
+identity; it never grants newly declared trusted modules.
 An offline miss reports `E5011`, cache drift reports `E5012`, and provider or
 transport refusal reports `E5013`. Git and `curl` are acquisition-time helper
 requirements only—not compiler, linker, or deployed-program dependencies.
@@ -290,8 +297,8 @@ documented/public API census; it never reconstructs signatures from text.
 ## Where the alpha deliberately stops
 
 Before the public-alpha cut, the workboard still requires the complete
-target-local Linux release matrix on CI, safe TLS/HTTP, capability/trust update
-diffs, the final example-product exercise, and release signing/hardening.
+target-local Linux release matrix on CI, safe TLS/HTTP, the final
+example-product exercise, and release signing/hardening.
 x86-64, a hosted package registry,
 HTTP/2+ and a forever-stable native ABI are explicitly later.
 The authoritative live status is the repository README and, for contributors,

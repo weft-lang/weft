@@ -53,10 +53,10 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 **Self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root.
 
-- 4116 runtime test blocks across 334 files, plus 803 negative (must-fail) cases
+- 4120 runtime test blocks across 334 files, plus 803 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
-- Current work: the public-alpha product gate—safe networking, dependency capability/trust review, and signed release/install UX
+- Current work: the public-alpha product gate—validated TLS/HTTP streaming and signed release/install UX
 
 ## Quick Start
 
@@ -120,7 +120,11 @@ Dependencies are typed as live owner-relative paths, exact Git revisions, or
 HTTPS archives with a declared SHA-256. `weft pkg lock`/`fetch` populate an
 immutable content-addressed cache; ordinary project commands are cache-only,
 and `weft pkg fetch --offline` verifies the complete locked graph without
-network authority. Acquisition helpers are not linked into Weft products.
+network authority. Updating a dependency covered by a root trust grant first
+reports deterministic old/new native-authority and safe-wrapper facts as
+`E5014` and restores the manifest and lock. The same command with
+`--accept-trust-change` accepts the reviewed identity without widening its
+trusted module set. Acquisition helpers are not linked into Weft products.
 
 `weft version --json` reports the same compiler, language, manifest, lock,
 native-binding ABI, artifact-facts schema, and supported-target identities as
