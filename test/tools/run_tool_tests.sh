@@ -4520,7 +4520,7 @@ set +e
 pkg_native_malformed_exit=$?
 set -e
 assert_equals "package_native_malformed_archive_fails_closed" "$pkg_native_malformed_exit" "1"
-assert_contains "package_native_malformed_archive_is_structured" "$(<"$tmp_pkg_trust_dir/native_artifacts/native_malformed.err")" "not a supported aarch64 Mach-O archive"
+assert_contains "package_native_malformed_archive_is_structured" "$(<"$tmp_pkg_trust_dir/native_artifacts/native_malformed.err")" "not a supported aarch64 object archive"
 if [ ! -e "$tmp_pkg_trust_dir/native_artifacts/native_malformed" ]; then
   echo "  ok package_native_malformed_archive_commits_no_output"
 else
