@@ -44,6 +44,7 @@ tmp_pkg_dir=$(mktemp -d /tmp/weft_tool_pkg_XXXXXX)
 tmp_pkg_cli_dir=$(mktemp -d /tmp/weft_tool_pkg_cli_XXXXXX)
 tmp_pkg_lock_dir=$(mktemp -d /tmp/weft_tool_pkg_lock_XXXXXX)
 tmp_pkg_remote_dir=$(mktemp -d /tmp/weft_tool_pkg_remote_XXXXXX)
+tmp_pkg_trusted_update_dir=$(mktemp -d /tmp/weft_tool_pkg_trusted_update_XXXXXX)
 tmp_pkg_trust_dir=$(mktemp -d /tmp/weft_tool_pkg_trust_XXXXXX)
 tmp_pkg_missing_dir=$(mktemp -d /tmp/weft_tool_pkg_missing_XXXXXX)
 tmp_project_target_dir=$(mktemp -d /tmp/weft_tool_project_target_XXXXXX)
@@ -63,7 +64,7 @@ tmp_native_debug_lldb=$(mktemp /tmp/weft_tool_native_debug_lldb_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product.facts.json" "$tmp_elf_product_second" "$tmp_elf_product_second.facts.json" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_remote_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_project_target_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir" "$tmp_elf_archive_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product.facts.json" "$tmp_elf_product_second" "$tmp_elf_product_second.facts.json" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_remote_dir" "$tmp_pkg_trusted_update_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_project_target_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir" "$tmp_elf_archive_dir"' EXIT
 
 now_s() {
   date +%s
@@ -3572,8 +3573,12 @@ pkg_remote_missing=$(cd "$tmp_pkg_remote_dir/app" && "$WEFT_ABS" pkg fetch --off
 assert_contains "pkg_remote_offline_miss_is_structured" "$pkg_remote_missing" "error[E5011]:"
 mv "$remote_cache.saved" "$remote_cache"
 wrong_transport=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+pkg_remote_manifest_before_failed_update=$(< "$tmp_pkg_remote_dir/app/weft.pkg")
+pkg_remote_lock_before_failed_update=$(< "$tmp_pkg_remote_dir/app/weft.lock")
 pkg_remote_bad_update=$(cd "$tmp_pkg_remote_dir/app" && PATH="$tmp_pkg_remote_dir/provider:$PATH" WEFT_FAKE_ARCHIVE="$tmp_pkg_remote_dir/source.tar" "$WEFT_ABS" pkg update remote --sha256 "sha256:$wrong_transport" 2>&1 || true)
 assert_contains "pkg_remote_update_rejects_transport_drift" "$pkg_remote_bad_update" "error[E5013]: package source was rejected: archive bytes do not match the declared SHA-256"
+assert_equals "pkg_remote_failed_update_restores_manifest" "$(< "$tmp_pkg_remote_dir/app/weft.pkg")" "$pkg_remote_manifest_before_failed_update"
+assert_equals "pkg_remote_failed_update_preserves_lock" "$(< "$tmp_pkg_remote_dir/app/weft.lock")" "$pkg_remote_lock_before_failed_update"
 (cd "$tmp_pkg_remote_dir/app" && PATH="$tmp_pkg_remote_dir/provider:$PATH" WEFT_FAKE_ARCHIVE="$tmp_pkg_remote_dir/source.tar" "$WEFT_ABS" pkg update remote --sha256 "sha256:$remote_transport" >/dev/null)
 assert_equals "pkg_remote_update_restores_offline_graph" "$(cd "$tmp_pkg_remote_dir/app" && "$WEFT_ABS" pkg fetch --offline >/dev/null; echo $?)" "0"
 if find "$tmp_pkg_remote_dir/app/.weft/staging" -mindepth 1 -print -quit | grep -q .; then
@@ -3582,6 +3587,80 @@ if find "$tmp_pkg_remote_dir/app/.weft/staging" -mindepth 1 -print -quit | grep 
 else
   echo "  ok pkg_remote_staging_cleanup"
 fi
+
+# Updating code already covered by a root trust grant is a review transaction.
+# The ordinary update computes exact old/new resolved-graph and checker facts,
+# reports E5014, and restores both files. Only the explicit acceptance spelling
+# refreshes the existing grant identity; it never widens the module set.
+mkdir -p "$tmp_pkg_trusted_update_dir/dependency/native" "$tmp_pkg_trusted_update_dir/provider" "$tmp_pkg_trusted_update_dir/app"
+printf '%s\n' \
+  '{"package":"reviewed","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["native/raw"],"native_bindings":{"native/raw":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"system","kind":"system","link":"System","search":["toolchain"],"content":"toolchain","optional":false}],"symbols":[{"declaration":"native_probe","symbol":"getpid","library":"system","params":[],"result":"i32","optional":false}]},"linux-aarch64":{"libraries":[{"id":"system","kind":"system","link":"c","search":["toolchain"],"content":"toolchain","optional":false}],"symbols":[{"declaration":"native_probe","symbol":"getpid","library":"system","params":[],"result":"i32","optional":false}]}}}}}' \
+  > "$tmp_pkg_trusted_update_dir/dependency/weft.pkg"
+printf '%s\n' \
+  'pub fn reviewed_value() -> i64 { 7 }' \
+  > "$tmp_pkg_trusted_update_dir/dependency/native/raw.weft"
+(
+  cd "$tmp_pkg_trusted_update_dir/dependency"
+  git init -q
+  git add weft.pkg native/raw.weft
+  git -c user.name=Weft -c user.email=weft@example.invalid commit -qm v1
+  git archive --format=tar --output="$tmp_pkg_trusted_update_dir/source-v1.tar" HEAD
+  printf '%s\n' \
+    '{"package":"reviewed","manifest_version":1,"version":"2.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["native/raw","native/extra"],"native_bindings":{"native/raw":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"system","kind":"system","link":"System","search":["toolchain"],"content":"toolchain","optional":false}],"symbols":[{"declaration":"native_probe","symbol":"getpid","library":"system","params":[],"result":"i32","optional":false},{"declaration":"native_probe_extra","symbol":"getppid","library":"system","params":[],"result":"i32","optional":false}]},"linux-aarch64":{"libraries":[{"id":"system","kind":"system","link":"c","search":["toolchain"],"content":"toolchain","optional":false}],"symbols":[{"declaration":"native_probe","symbol":"getpid","library":"system","params":[],"result":"i32","optional":false},{"declaration":"native_probe_extra","symbol":"getppid","library":"system","params":[],"result":"i32","optional":false}]}}}}}' \
+    > weft.pkg
+  printf '%s\n' \
+    'pub fn reviewed_value() -> i64 { 7 }' \
+    'pub fn reviewed_extra() -> i64 { 8 }' \
+    > native/raw.weft
+  printf '%s\n' 'pub fn ungranted_value() -> i64 { 99 }' > native/extra.weft
+  git add weft.pkg native/raw.weft native/extra.weft
+  git -c user.name=Weft -c user.email=weft@example.invalid commit -qm v2
+  git archive --format=tar --output="$tmp_pkg_trusted_update_dir/source-v2.tar" HEAD
+)
+trusted_update_v1_transport=$(shasum -a 256 "$tmp_pkg_trusted_update_dir/source-v1.tar" | awk '{print $1}')
+trusted_update_v2_transport=$(shasum -a 256 "$tmp_pkg_trusted_update_dir/source-v2.tar" | awk '{print $1}')
+printf '#!/bin/sh\noutput=""\nwhile [ "$#" -gt 0 ]; do\n  if [ "$1" = "--output" ]; then output="$2"; shift 2; else shift; fi\ndone\ncp "$WEFT_FAKE_ARCHIVE" "$output"\n' > "$tmp_pkg_trusted_update_dir/provider/curl"
+chmod +x "$tmp_pkg_trusted_update_dir/provider/curl"
+printf '%s\n' 'use reviewed/native/raw.{reviewed_value}' 'fn main() -> i64 { reviewed_value() }' > "$tmp_pkg_trusted_update_dir/app/app.weft"
+(cd "$tmp_pkg_trusted_update_dir/app" && "$WEFT_ABS" pkg init app >/dev/null)
+(cd "$tmp_pkg_trusted_update_dir/app" && "$WEFT_ABS" pkg add reviewed --archive https://packages.example.invalid/reviewed.tar --sha256 "sha256:$trusted_update_v1_transport" >/dev/null)
+(cd "$tmp_pkg_trusted_update_dir/app" && PATH="$tmp_pkg_trusted_update_dir/provider:$PATH" WEFT_FAKE_ARCHIVE="$tmp_pkg_trusted_update_dir/source-v1.tar" "$WEFT_ABS" pkg lock >/dev/null)
+trusted_update_v1_content=$(pkg_lock_digest "$(< "$tmp_pkg_trusted_update_dir/app/weft.lock")" reviewed)
+printf '%s\n' \
+  '{"package":"app","manifest_version":1,"version":"0.1.0","weft":"0.1","dependencies":{"reviewed":{"archive":"https://packages.example.invalid/reviewed.tar","sha256":"sha256:'"$trusted_update_v1_transport"'"}},"source_roots":["."],"targets":{"app":{"kind":"binary","source":"app.weft"}},"trust":{"reviewed":{"version":"1.0.0","source":"archive:sha256:'"$trusted_update_v1_transport"':https://packages.example.invalid/reviewed.tar","content":"'"$trusted_update_v1_content"'","modules":["native/raw"]}}}' \
+  > "$tmp_pkg_trusted_update_dir/app/weft.pkg"
+trusted_update_before_audit=$(cd "$tmp_pkg_trusted_update_dir/app" && "$WEFT_ABS" pkg audit 2>&1 || true)
+assert_contains "pkg_trusted_update_old_audit_uses_checker_facts" "$trusted_update_before_audit" '"name":"reviewed_value"'
+trusted_update_manifest_before=$(< "$tmp_pkg_trusted_update_dir/app/weft.pkg")
+trusted_update_lock_before=$(< "$tmp_pkg_trusted_update_dir/app/weft.lock")
+trusted_update_wrong_manifest=${trusted_update_manifest_before//$trusted_update_v1_content/sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}
+printf '%s\n' "$trusted_update_wrong_manifest" > "$tmp_pkg_trusted_update_dir/app/weft.pkg"
+trusted_update_wrong_content_audit=$(cd "$tmp_pkg_trusted_update_dir/app" && "$WEFT_ABS" pkg audit 2>&1 || true)
+assert_contains "pkg_trusted_update_audit_rejects_grant_lock_content_mismatch" "$trusted_update_wrong_content_audit" 'error[E5008]'
+printf '%s\n' "$trusted_update_manifest_before" > "$tmp_pkg_trusted_update_dir/app/weft.pkg"
+trusted_update_review=$(cd "$tmp_pkg_trusted_update_dir/app" && PATH="$tmp_pkg_trusted_update_dir/provider:$PATH" WEFT_FAKE_ARCHIVE="$tmp_pkg_trusted_update_dir/source-v2.tar" "$WEFT_ABS" pkg update reviewed --sha256 "sha256:$trusted_update_v2_transport" 2>&1 || true)
+assert_contains "pkg_trusted_update_requires_explicit_review" "$trusted_update_review" 'error[E5014]: trusted dependency update requires explicit capability review'
+assert_contains "pkg_trusted_update_review_is_structured" "$trusted_update_review" '"decision":"review_required"'
+assert_contains "pkg_trusted_update_detects_capability_change" "$trusted_update_review" '"capabilities_changed":true'
+assert_contains "pkg_trusted_update_review_contains_old_wrapper" "$trusted_update_review" '"name":"reviewed_value"'
+assert_contains "pkg_trusted_update_review_contains_new_wrapper" "$trusted_update_review" '"name":"reviewed_extra"'
+assert_contains "pkg_trusted_update_review_contains_new_native_fact" "$trusted_update_review" '"declaration":"native_probe_extra"'
+assert_equals "pkg_trusted_update_review_restores_manifest" "$(< "$tmp_pkg_trusted_update_dir/app/weft.pkg")" "$trusted_update_manifest_before"
+assert_equals "pkg_trusted_update_review_restores_lock" "$(< "$tmp_pkg_trusted_update_dir/app/weft.lock")" "$trusted_update_lock_before"
+trusted_update_accept=$(cd "$tmp_pkg_trusted_update_dir/app" && PATH="$tmp_pkg_trusted_update_dir/provider:$PATH" WEFT_FAKE_ARCHIVE="$tmp_pkg_trusted_update_dir/source-v2.tar" "$WEFT_ABS" pkg update reviewed --sha256 "sha256:$trusted_update_v2_transport" --accept-trust-change 2>&1 || true)
+assert_contains "pkg_trusted_update_accept_is_explicit" "$trusted_update_accept" '"decision":"accepted"'
+trusted_update_v2_content=$(pkg_lock_digest "$(< "$tmp_pkg_trusted_update_dir/app/weft.lock")" reviewed)
+trusted_update_manifest_after=$(< "$tmp_pkg_trusted_update_dir/app/weft.pkg")
+assert_contains "pkg_trusted_update_commits_new_source_pin" "$trusted_update_manifest_after" '"sha256":"sha256:'"$trusted_update_v2_transport"'"'
+assert_contains "pkg_trusted_update_refreshes_exact_source_grant" "$trusted_update_manifest_after" '"source":"archive:sha256:'"$trusted_update_v2_transport"':https://packages.example.invalid/reviewed.tar"'
+assert_contains "pkg_trusted_update_refreshes_exact_content_grant" "$trusted_update_manifest_after" '"content":"'"$trusted_update_v2_content"'"'
+assert_contains "pkg_trusted_update_preserves_reviewed_module" "$trusted_update_manifest_after" '"modules":["native/raw"]'
+assert_not_contains "pkg_trusted_update_does_not_auto_grant_new_leaf" "$trusted_update_manifest_after" '"modules":["native/raw","native/extra"]'
+trusted_update_after_audit=$(cd "$tmp_pkg_trusted_update_dir/app" && "$WEFT_ABS" pkg audit 2>&1 || true)
+assert_contains "pkg_trusted_update_committed_audit_has_new_wrapper" "$trusted_update_after_audit" '"name":"reviewed_extra"'
+assert_contains "pkg_trusted_update_committed_audit_has_new_native_fact" "$trusted_update_after_audit" '"declaration":"native_probe_extra"'
+trusted_update_check=$(cd "$tmp_pkg_trusted_update_dir/app" && "$WEFT_ABS" check app.weft 2>&1 || true)
+assert_contains "pkg_trusted_update_committed_graph_checks" "$trusted_update_check" '0 errors'
 
 mkdir -p "$tmp_pkg_lock_dir/deps/lib/deps/base" "$tmp_pkg_lock_dir/.weft/cache"
 printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"lib":"deps/lib"}}\n' > "$tmp_pkg_lock_dir/weft.pkg"
