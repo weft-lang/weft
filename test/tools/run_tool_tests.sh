@@ -495,6 +495,7 @@ stdlib_doc_modules=(
   stdlib/json.weft
   stdlib/secure_random.weft stdlib/net_address.weft stdlib/idna.weft
   stdlib/dns.weft stdlib/tcp.weft stdlib/url.weft stdlib/tls.weft
+  stdlib/http.weft
   stdlib/state.weft stdlib/diagnostic_type.weft stdlib/diagnostic.weft
   stdlib/diagnostic_registry.weft stdlib/map.weft stdlib/set.weft
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector_type.weft
@@ -556,6 +557,11 @@ assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public AP
     assert_contains "doc_stdlib_tls_pins_public_surface" "$(<"$tmp_out")" "Public API items: 36. Documented: 36."
     assert_contains "doc_stdlib_tls_client_preserves_authority" "$(<"$tmp_out")" "pub fn tls_client_open(host: UrlHost, trust_roots: Bytes) -[SecureRandom, Time]> Result<owned TlsSession, TlsError>"
     assert_contains "doc_stdlib_tls_server_preserves_authority" "$(<"$tmp_out")" "pub fn tls_server_open(certificate: Bytes, private_key: Bytes) -[SecureRandom]> Result<owned TlsSession, TlsError>"
+  elif [ "$stdlib_doc_name" = "http" ]; then
+    assert_contains "doc_stdlib_http_pins_public_surface" "$(<"$tmp_out")" "Public API items: 112. Documented: 112."
+    assert_contains "doc_stdlib_http_pins_opaque_head" "$(<"$tmp_out")" "pub type HttpRequestHead = opaque"
+    assert_contains "doc_stdlib_http_pins_typed_framing" "$(<"$tmp_out")" "pub type HttpBodyFraming {"
+    assert_contains "doc_stdlib_http_pins_prefix_parser" "$(<"$tmp_out")" "pub fn http_parse_request_head(source: [u8], limits: HttpLimits) -> HttpRequestHeadParse"
   elif [ "$stdlib_doc_name" = "channel" ]; then
     assert_contains "doc_stdlib_channel_pins_public_surface" "$(<"$tmp_out")" "Public API items: 21. Documented: 21."
     assert_contains "doc_stdlib_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"

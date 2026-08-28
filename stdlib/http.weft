@@ -1,0 +1,1695 @@
+-- stdlib/http.weft — pure hardened HTTP/1.1 message semantics
+--
+-- Message parsing is byte-oriented and prefix-based. Callers retain transport
+-- and buffering policy: each parse either needs more bytes, owns a complete
+-- typed head/chunk plus its exact consumed prefix, or returns one typed error.
+-- Request and response users share the same field and framing implementation.
+
+use runtime/string.{runtime_str_from_bytes_copy}
+use stdlib/bytes.{Bytes, bytes_from_slice, bytes_from_str, bytes_from_vector, bytes_get, bytes_len, bytes_to_utf8}
+use stdlib/list.{Cons, List, Nil, list_append, list_len, list_nil, list_nth}
+use stdlib/num.{num_i64_to_u16_checked, num_i64_to_u8_checked, num_int_cast_value_or, num_u16_to_u64, num_u64_to_i64_checked, num_usize_to_u64}
+use stdlib/option.{None, Option, Some, option_none, option_some}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/string.{int_to_str, str_byte_at, str_concat, str_len}
+use stdlib/url.{url_parse}
+use stdlib/vector.{vector_data, vector_get_in_bounds, vector_len, vector_push, vector_with_capacity}
+use stdlib/vector_type.{Vector}
+
+--- The HTTP wire version admitted by the alpha HTTP/1 implementation.
+pub type HttpVersion {
+  --- HTTP/1.0, whose connections close unless explicitly kept alive.
+  Http10,
+    --- HTTP/1.1, whose connections persist unless explicitly closed.
+    Http11
+}
+
+--- A validated extension method token.
+pub type HttpExtensionMethod = opaque str
+
+--- An HTTP method with common semantics represented directly.
+pub type HttpMethod {
+  --- Retrieve a representation.
+  HttpGet,
+    --- Retrieve response metadata without content.
+    HttpHead,
+    --- Submit content for resource-specific processing.
+    HttpPost,
+    --- Replace the state of a resource.
+    HttpPut,
+    --- Remove a resource.
+    HttpDelete,
+    --- Establish a tunnel through a proxy.
+    HttpConnect,
+    --- Retrieve communication options.
+    HttpOptions,
+    --- Apply a partial modification.
+    HttpPatch,
+    --- Trace a request through intermediaries.
+    HttpTrace,
+    --- A validated case-sensitive extension method.
+    HttpExtension(HttpExtensionMethod)
+}
+
+--- A validated request-target preserving exact ASCII wire identity.
+pub type HttpRequestTarget = opaque Bytes
+
+--- A validated canonical lowercase HTTP field name.
+pub type HttpFieldName = opaque str
+
+--- One validated field line, preserving an arbitrary byte value.
+pub type HttpHeader = opaque HttpHeaderParts
+
+--- An immutable duplicate-preserving ordered field section.
+pub type HttpHeaders = opaque HttpHeadersParts
+
+--- A three-digit HTTP status code.
+pub type HttpStatus = opaque u16
+
+--- Whether the current connection can carry another HTTP/1 message.
+pub type HttpConnectionReuse {
+  --- Message framing permits another message on this connection.
+  HttpConnectionPersistent,
+    --- The connection must close after the current message.
+    HttpConnectionClose
+}
+
+--- The exact body boundary derived from the complete field section.
+pub type HttpBodyFraming {
+  --- No message body follows this head.
+  HttpNoBody,
+    --- Exactly this many content bytes follow.
+    HttpContentLength(usize),
+    --- A chunked transfer coding delimits the content.
+    HttpChunked,
+    --- A response ends when its transport closes.
+    HttpUntilConnectionClose,
+    --- A 101 response switches to a different protocol after the head.
+    HttpProtocolSwitch,
+    --- A successful CONNECT response switches to tunnel bytes.
+    HttpConnectTunnel
+}
+
+--- A bounded parser configuration.
+pub type HttpLimits = opaque HttpLimitsParts
+
+--- A precise HTTP/1 parse, framing, or configured-limit failure.
+pub type HttpParseError {
+  --- A request or response start-line was malformed at this byte offset.
+  HttpInvalidStartLine(i64),
+    --- A method token was empty or contained a non-token byte.
+    HttpInvalidMethod(i64),
+    --- A request-target was empty, non-ASCII, contained a control, or used a fragment.
+    HttpInvalidTarget(i64),
+    --- A wire version was not exactly HTTP/1.0 or HTTP/1.1.
+    HttpInvalidVersion(i64),
+    --- A status code or reason phrase was malformed.
+    HttpInvalidStatus(i64),
+    --- A field name was empty, non-token, or separated from its colon.
+    HttpInvalidFieldName(i64),
+    --- A field value contained a forbidden control byte.
+    HttpInvalidFieldValue(i64),
+    --- A bare LF, bare CR, or obsolete folded field line was received.
+    HttpInvalidLineEnding(i64),
+    --- A start-line exceeded its configured byte limit.
+    HttpStartLineTooLong(i64),
+    --- One field line exceeded its configured byte limit.
+    HttpFieldLineTooLong(i64),
+    --- A complete field section exceeded its configured byte limit.
+    HttpHeadersTooLarge(i64),
+    --- A field section exceeded its configured field-count limit.
+    HttpTooManyHeaders(i64),
+    --- An HTTP/1.1 request omitted its required Host field.
+    HttpMissingHost(i64),
+    --- A request supplied Host more than once.
+    HttpDuplicateHost(i64),
+    --- A Host field was empty or syntactically unsafe for routing.
+    HttpInvalidHost(i64),
+    --- Content-Length was empty, non-decimal, overflowing, or inconsistent.
+    HttpInvalidContentLength(i64),
+    --- Transfer-Encoding and Content-Length appeared together.
+    HttpAmbiguousFraming(i64),
+    --- Transfer-Encoding syntax or chunked ordering was invalid.
+    HttpInvalidTransferEncoding(i64),
+    --- A valid transfer coding outside the alpha chunked floor was requested.
+    HttpUnsupportedTransferCoding(i64),
+    --- A status/method combination forbids the supplied body framing.
+    HttpForbiddenBodyFraming(i64),
+    --- A Connection field contained an invalid option list.
+    HttpInvalidConnection(i64),
+    --- A declared body or chunk exceeded the configured byte limit.
+    HttpBodyTooLarge(i64),
+    --- A chunk-size line was empty, non-hexadecimal, or overflowing.
+    HttpInvalidChunkSize(i64),
+    --- A chunk-size line exceeded its configured byte limit.
+    HttpChunkLineTooLong(i64),
+    --- Chunk data was not followed by its mandatory CRLF.
+    HttpInvalidChunkTerminator(i64),
+    --- A trailer section exceeded its byte or field-count limit.
+    HttpTrailersTooLarge(i64),
+    --- A trailer attempted to redefine framing, routing, or connection state.
+    HttpForbiddenTrailer(i64)
+}
+
+--- A validated request head and its derived connection policy.
+pub type HttpRequestHead = opaque HttpRequestHeadParts
+
+--- A validated response head and its derived connection policy.
+pub type HttpResponseHead = opaque HttpResponseHeadParts
+
+--- Prefix parsing of one request head.
+pub type HttpRequestHeadParse {
+  --- The current prefix is valid but incomplete.
+  HttpRequestHeadNeedMore,
+    --- One complete request head, its framing, and exact consumed bytes.
+    HttpRequestHeadReady(HttpRequestHead, HttpBodyFraming, usize),
+    --- The prefix cannot become a valid request head.
+    HttpRequestHeadFailed(HttpParseError)
+}
+
+--- Prefix parsing of one response head.
+pub type HttpResponseHeadParse {
+  --- The current prefix is valid but incomplete.
+  HttpResponseHeadNeedMore,
+    --- One complete response head, its framing, and exact consumed bytes.
+    HttpResponseHeadReady(HttpResponseHead, HttpBodyFraming, usize),
+    --- The prefix cannot become a valid response head.
+    HttpResponseHeadFailed(HttpParseError)
+}
+
+--- One decoded chunked-transfer item.
+pub type HttpChunk {
+  --- One non-empty content fragment.
+  HttpChunkData(Bytes),
+    --- The terminal zero chunk and validated trailer fields.
+    HttpChunkEnd(HttpHeaders)
+}
+
+--- Prefix parsing of one chunked-transfer item.
+pub type HttpChunkParse {
+  --- The current prefix is valid but incomplete.
+  HttpChunkNeedMore,
+    --- One decoded chunk/trailer item and exact consumed bytes.
+    HttpChunkReady(HttpChunk, usize),
+    --- The prefix cannot become a valid chunk item.
+    HttpChunkFailed(HttpParseError)
+}
+
+type HttpHeaderParts {
+  name: HttpFieldName,
+    value: Bytes
+}
+
+type HttpHeadersParts {
+  fields: List<HttpHeader>,
+    wire_bytes: i64
+}
+
+type HttpLimitsParts {
+  start_line_bytes: i64,
+    field_line_bytes: i64,
+    header_bytes: i64,
+    header_count: i64,
+    body_bytes: i64,
+    chunk_line_bytes: i64,
+    trailer_bytes: i64,
+    trailer_count: i64
+}
+
+type HttpRequestHeadParts {
+  method: HttpMethod,
+    target: HttpRequestTarget,
+    version: HttpVersion,
+    headers: HttpHeaders,
+    connection: HttpConnectionReuse
+}
+
+type HttpResponseHeadParts {
+  version: HttpVersion,
+    status: HttpStatus,
+    reason: Bytes,
+    headers: HttpHeaders,
+    connection: HttpConnectionReuse
+}
+
+type HttpLineParse {
+  HttpLineNeedMore,
+    HttpLineReady(i64),
+    HttpLineFailed(HttpParseError)
+}
+
+type HttpHeaderSectionParse {
+  HttpHeaderSectionNeedMore,
+    HttpHeaderSectionReady(HttpHeaders, i64),
+    HttpHeaderSectionFailed(HttpParseError)
+}
+
+type HttpLengthScan {
+  HttpLengthAbsent,
+    HttpLengthValue(i64),
+    HttpLengthFailed(HttpParseError)
+}
+
+type HttpTransferScan {
+  HttpTransferAbsent,
+    HttpTransferChunked,
+    HttpTransferFailed(HttpParseError)
+}
+
+type HttpConnectionScan {
+  HttpConnectionOptions(bool, bool),
+    HttpConnectionOptionsFailed(HttpParseError)
+}
+
+fn http_u8_to_i64(value: u8) -> i64 {
+  num_int_cast_value_or<i64>(num_u64_to_i64_checked(__u8_to_u64(value)), 0)
+}
+
+fn http_i64_to_u8(value: i64) -> u8 {
+  num_int_cast_value_or<u8>(num_i64_to_u8_checked(value), 0)
+}
+
+fn http_i64_to_u16(value: i64) -> u16 {
+  num_int_cast_value_or<u16>(num_i64_to_u16_checked(value), 0)
+}
+
+fn http_usize_to_i64(value: usize) -> i64 {
+  num_int_cast_value_or<i64>(num_u64_to_i64_checked(num_usize_to_u64(value)), 0)
+}
+
+fn http_i64_to_usize(value: i64) -> usize {
+  __i64_to_usize(if value < 0 { 0 } else { value })
+}
+
+fn http_byte(source: [u8], index: i64) -> i64 {
+  http_u8_to_i64(source[http_i64_to_usize(index)])
+}
+
+fn http_bytes_byte(values: Bytes, index: i64) -> i64 {
+  match bytes_get(values, index) {
+    Some(value) -> http_u8_to_i64(value)
+    None -> 0
+  }
+}
+
+fn http_ascii_lower(byte: i64) -> i64 {
+  if byte >= 65 and byte <= 90 { byte + 32 } else { byte }
+}
+
+fn http_is_tchar(byte: i64) -> bool {
+  (byte >= 48 and byte <= 57) or
+    (byte >= 65 and byte <= 90) or
+    (byte >= 97 and byte <= 122) or
+    byte == 33 or byte == 35 or byte == 36 or byte == 37 or byte == 38 or
+    byte == 39 or byte == 42 or byte == 43 or byte == 45 or byte == 46 or
+    byte == 94 or byte == 95 or byte == 96 or byte == 124 or byte == 126
+}
+
+fn http_range_ascii_eq(source: [u8], start: i64, end: i64, expected: str, insensitive: bool) -> bool {
+  if end - start != str_len(expected) { false }
+  else {
+    let mut index = 0
+    let mut equal = true
+    while equal and start + index < end {
+      let actual = http_byte(source, start + index)
+      let wanted = str_byte_at(expected, index)
+      if (if insensitive { http_ascii_lower(actual) } else { actual }) !=
+        (if insensitive { http_ascii_lower(wanted) } else { wanted }) {
+        equal = false
+      } else { index = index + 1 }
+    }
+    equal
+  }
+}
+
+fn http_bytes_ascii_eq(values: Bytes, expected: str, insensitive: bool) -> bool {
+  if bytes_len(values) != str_len(expected) { false }
+  else {
+    let mut index = 0
+    let mut equal = true
+    while equal and index < bytes_len(values) {
+      let actual = http_bytes_byte(values, index)
+      let wanted = str_byte_at(expected, index)
+      if (if insensitive { http_ascii_lower(actual) } else { actual }) !=
+        (if insensitive { http_ascii_lower(wanted) } else { wanted }) {
+        equal = false
+      } else { index = index + 1 }
+    }
+    equal
+  }
+}
+
+fn http_copy_range(source: [u8], start: i64, end: i64) -> Bytes {
+  let out = vector_with_capacity<u8>(if end > start { end - start } else { 0 })
+  let mut index = start
+  while index < end {
+    vector_push<u8>(out, source[http_i64_to_usize(index)])
+    index = index + 1
+  }
+  bytes_from_vector(out)
+}
+
+fn http_range_text(source: [u8], start: i64, end: i64) -> str {
+  let out = vector_with_capacity<u8>(if end > start { end - start } else { 0 })
+  let mut index = start
+  while index < end {
+    vector_push<u8>(out, source[http_i64_to_usize(index)])
+    index = index + 1
+  }
+  runtime_str_from_bytes_copy(vector_data<u8>(out), vector_len<u8>(out))
+}
+
+fn http_range_lower_text(source: [u8], start: i64, end: i64) -> str {
+  let out = vector_with_capacity<u8>(if end > start { end - start } else { 0 })
+  let mut index = start
+  while index < end {
+    vector_push<u8>(out, http_i64_to_u8(http_ascii_lower(http_byte(source, index))))
+    index = index + 1
+  }
+  runtime_str_from_bytes_copy(vector_data<u8>(out), vector_len<u8>(out))
+}
+
+fn http_name_text(name: HttpFieldName) -> str {
+  match name { HttpFieldName(text) -> text }
+}
+
+fn http_extension_text(method: HttpExtensionMethod) -> str {
+  match method { HttpExtensionMethod(text) -> text }
+}
+
+fn http_target_bytes(target: HttpRequestTarget) -> Bytes {
+  match target { HttpRequestTarget(bytes) -> bytes }
+}
+
+fn http_bytes_text(values: Bytes) -> Option<str> {
+  match bytes_to_utf8(values) {
+    Err(error) -> option_none<str>()
+    Ok(text) -> option_some<str>(text)
+  }
+}
+
+fn http_status_i64(status: HttpStatus) -> i64 {
+  match status {
+    HttpStatus(code) -> num_int_cast_value_or<i64>(num_u64_to_i64_checked(num_u16_to_u64(code)), 0)
+  }
+}
+
+fn http_header_parts(header: HttpHeader) -> HttpHeaderParts {
+  match header { HttpHeader(parts) -> parts }
+}
+
+fn http_headers_parts(headers: HttpHeaders) -> HttpHeadersParts {
+  match headers { HttpHeaders(parts) -> parts }
+}
+
+fn http_limits_parts(limits: HttpLimits) -> HttpLimitsParts {
+  match limits { HttpLimits(parts) -> parts }
+}
+
+fn http_request_parts(head: HttpRequestHead) -> HttpRequestHeadParts {
+  match head { HttpRequestHead(parts) -> parts }
+}
+
+fn http_response_parts(head: HttpResponseHead) -> HttpResponseHeadParts {
+  match head { HttpResponseHead(parts) -> parts }
+}
+
+--- Construct parser limits, rejecting non-positive values.
+pub fn http_limits(
+  start_line_bytes: i64,
+  field_line_bytes: i64,
+  header_bytes: i64,
+  header_count: i64,
+  body_bytes: i64,
+  chunk_line_bytes: i64,
+  trailer_bytes: i64,
+  trailer_count: i64
+) -> Result<HttpLimits, HttpParseError> {
+  if start_line_bytes <= 0 { result_err<HttpLimits, HttpParseError>(HttpStartLineTooLong(0)) }
+  else { if field_line_bytes <= 0 { result_err<HttpLimits, HttpParseError>(HttpFieldLineTooLong(0)) }
+    else { if header_bytes <= 0 { result_err<HttpLimits, HttpParseError>(HttpHeadersTooLarge(0)) }
+      else { if header_count <= 0 { result_err<HttpLimits, HttpParseError>(HttpTooManyHeaders(0)) }
+        else { if body_bytes < 0 { result_err<HttpLimits, HttpParseError>(HttpBodyTooLarge(0)) }
+          else { if chunk_line_bytes <= 0 { result_err<HttpLimits, HttpParseError>(HttpChunkLineTooLong(0)) }
+            else { if trailer_bytes <= 0 or trailer_count <= 0 { result_err<HttpLimits, HttpParseError>(HttpTrailersTooLarge(0)) }
+              else { result_ok<HttpLimits, HttpParseError>(HttpLimits(HttpLimitsParts {
+                  start_line_bytes: start_line_bytes,
+                    field_line_bytes: field_line_bytes,
+                    header_bytes: header_bytes,
+                    header_count: header_count,
+                    body_bytes: body_bytes,
+                    chunk_line_bytes: chunk_line_bytes,
+                    trailer_bytes: trailer_bytes,
+                    trailer_count: trailer_count
+                })) } } } } } } }
+}
+
+--- Return the conservative alpha parser limits.
+pub fn http_default_limits() -> HttpLimits {
+  http_limits(8192, 8192, 65536, 100, 16777216, 1024, 16384, 32).unwrap()
+}
+
+--- Return the exact method token.
+pub fn http_method_text(method: HttpMethod) -> str {
+  match method {
+    HttpGet -> "GET"
+    HttpHead -> "HEAD"
+    HttpPost -> "POST"
+    HttpPut -> "PUT"
+    HttpDelete -> "DELETE"
+    HttpConnect -> "CONNECT"
+    HttpOptions -> "OPTIONS"
+    HttpPatch -> "PATCH"
+    HttpTrace -> "TRACE"
+    HttpExtension(extension) -> http_extension_text(extension)
+  }
+}
+
+--- Parse a case-sensitive method token into direct common variants.
+pub fn http_method_parse(source: str) -> Result<HttpMethod, HttpParseError> {
+  if str_len(source) <= 0 { result_err<HttpMethod, HttpParseError>(HttpInvalidMethod(0)) }
+  else {
+    let mut index = 0
+    let mut invalid = 0 - 1
+    while invalid < 0 and index < str_len(source) {
+      if http_is_tchar(str_byte_at(source, index)) { index = index + 1 }
+      else { invalid = index }
+    }
+    if invalid >= 0 { result_err<HttpMethod, HttpParseError>(HttpInvalidMethod(invalid)) }
+    else { if source == "GET" { result_ok<HttpMethod, HttpParseError>(HttpGet) }
+      else { if source == "HEAD" { result_ok<HttpMethod, HttpParseError>(HttpHead) }
+        else { if source == "POST" { result_ok<HttpMethod, HttpParseError>(HttpPost) }
+          else { if source == "PUT" { result_ok<HttpMethod, HttpParseError>(HttpPut) }
+            else { if source == "DELETE" { result_ok<HttpMethod, HttpParseError>(HttpDelete) }
+              else { if source == "CONNECT" { result_ok<HttpMethod, HttpParseError>(HttpConnect) }
+                else { if source == "OPTIONS" { result_ok<HttpMethod, HttpParseError>(HttpOptions) }
+                  else { if source == "PATCH" { result_ok<HttpMethod, HttpParseError>(HttpPatch) }
+                    else { if source == "TRACE" { result_ok<HttpMethod, HttpParseError>(HttpTrace) }
+                      else { result_ok<HttpMethod, HttpParseError>(HttpExtension(HttpExtensionMethod(source))) }
+                    } } } } } } } } }
+  }
+}
+
+--- Parse and seal one request-target.
+pub fn http_request_target_parse(source: str) -> Result<HttpRequestTarget, HttpParseError> {
+  if str_len(source) <= 0 { result_err<HttpRequestTarget, HttpParseError>(HttpInvalidTarget(0)) }
+  else {
+    let mut index = 0
+    let mut invalid = 0 - 1
+    while invalid < 0 and index < str_len(source) {
+      let byte = str_byte_at(source, index)
+      if byte >= 33 and byte <= 126 and byte != 35 { index = index + 1 }
+      else { invalid = index }
+    }
+    if invalid >= 0 { result_err<HttpRequestTarget, HttpParseError>(HttpInvalidTarget(invalid)) }
+    else { result_ok<HttpRequestTarget, HttpParseError>(HttpRequestTarget(bytes_from_str(source))) }
+  }
+}
+
+--- Return the exact request-target bytes.
+pub fn http_request_target_bytes(target: HttpRequestTarget) -> Bytes {
+  http_target_bytes(target)
+}
+
+--- Parse and canonicalize a case-insensitive field name.
+pub fn http_field_name_parse(source: str) -> Result<HttpFieldName, HttpParseError> {
+  if str_len(source) <= 0 { result_err<HttpFieldName, HttpParseError>(HttpInvalidFieldName(0)) }
+  else {
+    let out = vector_with_capacity<u8>(str_len(source))
+    let mut index = 0
+    let mut invalid = 0 - 1
+    while invalid < 0 and index < str_len(source) {
+      let byte = str_byte_at(source, index)
+      if http_is_tchar(byte) {
+        vector_push<u8>(out, http_i64_to_u8(http_ascii_lower(byte)))
+        index = index + 1
+      } else { invalid = index }
+    }
+    if invalid >= 0 { result_err<HttpFieldName, HttpParseError>(HttpInvalidFieldName(invalid)) }
+    else {
+      result_ok<HttpFieldName, HttpParseError>(HttpFieldName(
+        runtime_str_from_bytes_copy(vector_data<u8>(out), vector_len<u8>(out))
+      ))
+    }
+  }
+}
+
+--- Return a field name's canonical lowercase text.
+pub fn http_field_name_text(name: HttpFieldName) -> str { http_name_text(name) }
+
+fn http_header_value_invalid(values: Bytes) -> i64 {
+  let mut index = 0
+  let mut invalid = 0 - 1
+  while invalid < 0 and index < bytes_len(values) {
+    let byte = http_bytes_byte(values, index)
+    if byte == 9 or byte == 32 or (byte >= 33 and byte <= 126) or byte >= 128 {
+      index = index + 1
+    } else { invalid = index }
+  }
+  invalid
+}
+
+--- Construct one field after validating its byte value.
+pub fn http_header(name: HttpFieldName, value: Bytes) -> Result<HttpHeader, HttpParseError> {
+  let invalid = http_header_value_invalid(value)
+  if invalid >= 0 { result_err<HttpHeader, HttpParseError>(HttpInvalidFieldValue(invalid)) }
+  else { result_ok<HttpHeader, HttpParseError>(HttpHeader(HttpHeaderParts { name: name, value: value })) }
+}
+
+--- Return a header's canonical field name.
+pub fn http_header_name(header: HttpHeader) -> HttpFieldName { http_header_parts(header).name }
+
+--- Return a header's exact trimmed field value bytes.
+pub fn http_header_value(header: HttpHeader) -> Bytes { http_header_parts(header).value }
+
+--- Construct an empty field section.
+pub fn http_headers_empty() -> HttpHeaders {
+  HttpHeaders(HttpHeadersParts { fields: list_nil<HttpHeader>(), wire_bytes: 0 })
+}
+
+--- Append one field without combining duplicates or changing order.
+pub fn http_headers_append(headers: HttpHeaders, header: HttpHeader) -> HttpHeaders {
+  let parts = http_headers_parts(headers)
+  let field = http_header_parts(header)
+  let added = str_len(http_name_text(field.name)) + 2 + bytes_len(field.value) + 2
+  HttpHeaders(HttpHeadersParts {
+    fields: list_append<HttpHeader>(parts.fields, header),
+      wire_bytes: parts.wire_bytes + added
+  })
+}
+
+--- Return the number of field lines, including duplicates.
+pub fn http_headers_len(headers: HttpHeaders) -> i64 {
+  list_len<HttpHeader>(http_headers_parts(headers).fields)
+}
+
+--- Return the field at `index`, if present.
+pub fn http_headers_get(headers: HttpHeaders, index: i64) -> Option<HttpHeader> {
+  list_nth<HttpHeader>(http_headers_parts(headers).fields, index)
+}
+
+fn http_validate_headers_limits(headers: HttpHeaders, limits: HttpLimits, trailers: bool) -> Result<nil, HttpParseError> {
+  let fields = http_headers_parts(headers)
+  let configured = http_limits_parts(limits)
+  let count_limit = if trailers { configured.trailer_count } else { configured.header_count }
+  let bytes_limit = if trailers { configured.trailer_bytes } else { configured.header_bytes }
+  if list_len<HttpHeader>(fields.fields) > count_limit {
+    if trailers { result_err<nil, HttpParseError>(HttpTrailersTooLarge(0)) }
+    else { result_err<nil, HttpParseError>(HttpTooManyHeaders(0)) }
+  } else { if fields.wire_bytes + 2 > bytes_limit {
+      if trailers { result_err<nil, HttpParseError>(HttpTrailersTooLarge(0)) }
+      else { result_err<nil, HttpParseError>(HttpHeadersTooLarge(0)) }
+    } else { result_ok<nil, HttpParseError>(nil) } }
+}
+
+--- Construct a validated three-digit status code.
+pub fn http_status(code: i64) -> Result<HttpStatus, HttpParseError> {
+  if code < 100 or code > 999 { result_err<HttpStatus, HttpParseError>(HttpInvalidStatus(0)) }
+  else { result_ok<HttpStatus, HttpParseError>(HttpStatus(http_i64_to_u16(code))) }
+}
+
+--- Return a status as an integer from 100 through 999.
+pub fn http_status_code(status: HttpStatus) -> i64 { http_status_i64(status) }
+
+fn http_find_line(source: [u8], start: i64, limit: i64, limit_error: i64) -> HttpLineParse {
+  let length = http_usize_to_i64(source.len)
+  let mut position = start
+  let mut result = HttpLineNeedMore
+  let mut done = false
+  while not done and position < length {
+    let byte = http_byte(source, position)
+    if position - start > limit {
+      result = if limit_error == 1 { HttpLineFailed(HttpStartLineTooLong(start + limit)) }
+      else { if limit_error == 2 { HttpLineFailed(HttpFieldLineTooLong(start + limit)) }
+        else { HttpLineFailed(HttpChunkLineTooLong(start + limit)) } }
+      done = true
+    } else { if byte == 10 {
+        result = HttpLineFailed(HttpInvalidLineEnding(position))
+        done = true
+      } else { if byte == 13 {
+          if position + 1 >= length {
+            done = true
+          } else { if http_byte(source, position + 1) == 10 {
+              result = HttpLineReady(position)
+              done = true
+            } else {
+              result = HttpLineFailed(HttpInvalidLineEnding(position))
+              done = true
+            } }
+        } else { position = position + 1 } } }
+  }
+  if not done and length - start > limit {
+    if limit_error == 1 { HttpLineFailed(HttpStartLineTooLong(start + limit)) }
+    else { if limit_error == 2 { HttpLineFailed(HttpFieldLineTooLong(start + limit)) }
+      else { HttpLineFailed(HttpChunkLineTooLong(start + limit)) } }
+  } else { result }
+}
+
+fn http_trim_ows_start(source: [u8], start: i64, end: i64) -> i64 {
+  let mut position = start
+  while position < end and (http_byte(source, position) == 32 or http_byte(source, position) == 9) {
+    position = position + 1
+  }
+  position
+}
+
+fn http_trim_ows_end(source: [u8], start: i64, end: i64) -> i64 {
+  let mut position = end
+  while position > start and (http_byte(source, position - 1) == 32 or http_byte(source, position - 1) == 9) {
+    position = position - 1
+  }
+  position
+}
+
+fn http_parse_field_line(source: [u8], start: i64, end: i64) -> Result<HttpHeader, HttpParseError> {
+  if start >= end { result_err<HttpHeader, HttpParseError>(HttpInvalidFieldName(start)) }
+  else { if http_byte(source, start) == 32 or http_byte(source, start) == 9 {
+      result_err<HttpHeader, HttpParseError>(HttpInvalidLineEnding(start))
+    } else {
+      let mut colon = 0 - 1
+      let mut position = start
+      while colon < 0 and position < end {
+        if http_byte(source, position) == 58 { colon = position }
+        else { position = position + 1 }
+      }
+      if colon <= start { result_err<HttpHeader, HttpParseError>(HttpInvalidFieldName(start)) }
+      else {
+        let mut invalid_name = 0 - 1
+        position = start
+        while invalid_name < 0 and position < colon {
+          if http_is_tchar(http_byte(source, position)) { position = position + 1 }
+          else { invalid_name = position }
+        }
+        if invalid_name >= 0 { result_err<HttpHeader, HttpParseError>(HttpInvalidFieldName(invalid_name)) }
+        else {
+          let value_start = http_trim_ows_start(source, colon + 1, end)
+          let value_end = http_trim_ows_end(source, value_start, end)
+          let mut invalid_value = 0 - 1
+          position = value_start
+          while invalid_value < 0 and position < value_end {
+            let byte = http_byte(source, position)
+            if byte == 9 or byte == 32 or (byte >= 33 and byte <= 126) or byte >= 128 {
+              position = position + 1
+            } else { invalid_value = position }
+          }
+          if invalid_value >= 0 { result_err<HttpHeader, HttpParseError>(HttpInvalidFieldValue(invalid_value)) }
+          else {
+            result_ok<HttpHeader, HttpParseError>(HttpHeader(HttpHeaderParts {
+              name: HttpFieldName(http_range_lower_text(source, start, colon)),
+                value: http_copy_range(source, value_start, value_end)
+            }))
+          }
+        }
+      }
+    } }
+}
+
+fn http_parse_header_section(
+  source: [u8],
+  start: i64,
+  line_limit: i64,
+  bytes_limit: i64,
+  count_limit: i64,
+  trailers: bool
+) -> HttpHeaderSectionParse {
+  let mut position = start
+  let mut headers = http_headers_empty()
+  let mut count = 0
+  let mut outcome = HttpHeaderSectionNeedMore
+  let mut done = false
+  while not done {
+    if position - start > bytes_limit {
+      outcome = if trailers { HttpHeaderSectionFailed(HttpTrailersTooLarge(position)) }
+      else { HttpHeaderSectionFailed(HttpHeadersTooLarge(position)) }
+      done = true
+    } else {
+      match http_find_line(source, position, line_limit, 2) {
+        HttpLineNeedMore -> { done = true }
+        HttpLineFailed(error) -> { outcome = HttpHeaderSectionFailed(error); done = true }
+        HttpLineReady(line_end) -> {
+          if line_end == position {
+            let consumed = line_end + 2
+            if consumed - start > bytes_limit {
+              outcome = if trailers { HttpHeaderSectionFailed(HttpTrailersTooLarge(consumed)) }
+              else { HttpHeaderSectionFailed(HttpHeadersTooLarge(consumed)) }
+            } else { outcome = HttpHeaderSectionReady(headers, consumed) }
+            done = true
+          } else { if count >= count_limit {
+              outcome = if trailers { HttpHeaderSectionFailed(HttpTrailersTooLarge(position)) }
+              else { HttpHeaderSectionFailed(HttpTooManyHeaders(position)) }
+              done = true
+            } else {
+              match http_parse_field_line(source, position, line_end) {
+                Err(error) -> { outcome = HttpHeaderSectionFailed(error); done = true }
+                Ok(header) -> {
+                  headers = http_headers_append(headers, header)
+                  count = count + 1
+                  position = line_end + 2
+                }
+              }
+            } }
+        }
+      }
+    }
+  }
+  outcome
+}
+
+fn http_method_from_range(source: [u8], start: i64, end: i64) -> Result<HttpMethod, HttpParseError> {
+  if start >= end { result_err<HttpMethod, HttpParseError>(HttpInvalidMethod(start)) }
+  else {
+    let mut position = start
+    let mut invalid = 0 - 1
+    while invalid < 0 and position < end {
+      if http_is_tchar(http_byte(source, position)) { position = position + 1 }
+      else { invalid = position }
+    }
+    if invalid >= 0 { result_err<HttpMethod, HttpParseError>(HttpInvalidMethod(invalid)) }
+    else { http_method_parse(http_range_text(source, start, end)) }
+  }
+}
+
+fn http_target_from_range(source: [u8], start: i64, end: i64) -> Result<HttpRequestTarget, HttpParseError> {
+  if start >= end { result_err<HttpRequestTarget, HttpParseError>(HttpInvalidTarget(start)) }
+  else {
+    let mut position = start
+    let mut invalid = 0 - 1
+    while invalid < 0 and position < end {
+      let byte = http_byte(source, position)
+      if byte >= 33 and byte <= 126 and byte != 35 { position = position + 1 }
+      else { invalid = position }
+    }
+    if invalid >= 0 { result_err<HttpRequestTarget, HttpParseError>(HttpInvalidTarget(invalid)) }
+    else { result_ok<HttpRequestTarget, HttpParseError>(HttpRequestTarget(http_copy_range(source, start, end))) }
+  }
+}
+
+fn http_version_from_range(source: [u8], start: i64, end: i64) -> Result<HttpVersion, HttpParseError> {
+  if http_range_ascii_eq(source, start, end, "HTTP/1.1", false) {
+    result_ok<HttpVersion, HttpParseError>(Http11)
+  } else { if http_range_ascii_eq(source, start, end, "HTTP/1.0", false) {
+      result_ok<HttpVersion, HttpParseError>(Http10)
+    } else { result_err<HttpVersion, HttpParseError>(HttpInvalidVersion(start)) } }
+}
+
+fn http_parse_request_line(source: [u8], start: i64, end: i64) -> Result<(HttpMethod, HttpRequestTarget, HttpVersion), HttpParseError> {
+  let mut first_space = 0 - 1
+  let mut second_space = 0 - 1
+  let mut position = start
+  while first_space < 0 and position < end {
+    if http_byte(source, position) == 32 { first_space = position }
+    else { position = position + 1 }
+  }
+  position = first_space + 1
+  while first_space >= 0 and second_space < 0 and position < end {
+    if http_byte(source, position) == 32 { second_space = position }
+    else { position = position + 1 }
+  }
+  if first_space <= start or second_space <= first_space + 1 or second_space + 1 >= end {
+    result_err<(HttpMethod, HttpRequestTarget, HttpVersion), HttpParseError>(HttpInvalidStartLine(start))
+  } else {
+    let mut extra_space = false
+    position = second_space + 1
+    while not extra_space and position < end {
+      if http_byte(source, position) == 32 or http_byte(source, position) == 9 { extra_space = true }
+      else { position = position + 1 }
+    }
+    if extra_space { result_err<(HttpMethod, HttpRequestTarget, HttpVersion), HttpParseError>(HttpInvalidStartLine(position)) }
+    else {
+      match http_method_from_range(source, start, first_space) {
+        Err(error) -> result_err<(HttpMethod, HttpRequestTarget, HttpVersion), HttpParseError>(error)
+        Ok(method) -> match http_target_from_range(source, first_space + 1, second_space) {
+          Err(error) -> result_err<(HttpMethod, HttpRequestTarget, HttpVersion), HttpParseError>(error)
+          Ok(target) -> match http_version_from_range(source, second_space + 1, end) {
+            Err(error) -> result_err<(HttpMethod, HttpRequestTarget, HttpVersion), HttpParseError>(error)
+            Ok(version) -> result_ok<(HttpMethod, HttpRequestTarget, HttpVersion), HttpParseError>((method, target, version))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn http_parse_response_line(source: [u8], start: i64, end: i64) -> Result<(HttpVersion, HttpStatus, Bytes), HttpParseError> {
+  if end - start < 13 or http_byte(source, start + 8) != 32 or http_byte(source, start + 12) != 32 {
+    result_err<(HttpVersion, HttpStatus, Bytes), HttpParseError>(HttpInvalidStartLine(start))
+  } else {
+    match http_version_from_range(source, start, start + 8) {
+      Err(error) -> result_err<(HttpVersion, HttpStatus, Bytes), HttpParseError>(error)
+      Ok(version) -> {
+        let a = http_byte(source, start + 9)
+        let b = http_byte(source, start + 10)
+        let c = http_byte(source, start + 11)
+        if a < 48 or a > 57 or b < 48 or b > 57 or c < 48 or c > 57 {
+          result_err<(HttpVersion, HttpStatus, Bytes), HttpParseError>(HttpInvalidStatus(start + 9))
+        } else {
+          let mut invalid = 0 - 1
+          let mut position = start + 13
+          while invalid < 0 and position < end {
+            let byte = http_byte(source, position)
+            if byte == 9 or byte == 32 or (byte >= 33 and byte <= 126) or byte >= 128 {
+              position = position + 1
+            } else { invalid = position }
+          }
+          if invalid >= 0 { result_err<(HttpVersion, HttpStatus, Bytes), HttpParseError>(HttpInvalidStatus(invalid)) }
+          else {
+            let code = (a - 48) * 100 + (b - 48) * 10 + (c - 48)
+            result_ok<(HttpVersion, HttpStatus, Bytes), HttpParseError>((version, HttpStatus(http_i64_to_u16(code)), http_copy_range(source, start + 13, end)))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn http_header_named(header: HttpHeader, expected: str) -> bool {
+  http_name_text(http_header_parts(header).name) == expected
+}
+
+fn http_host_value_valid(value: Bytes) -> bool {
+  if bytes_len(value) <= 0 { false }
+  else {
+    let mut position = 0
+    let mut valid = true
+    while valid and position < bytes_len(value) {
+      let byte = http_bytes_byte(value, position)
+      if byte >= 33 and byte <= 126 and byte != 44 { position = position + 1 }
+      else { valid = false }
+    }
+    if not valid { false }
+    else {
+      match http_bytes_text(value) {
+        None -> false
+        Some(text) -> match url_parse(str_concat("http://", str_concat(text, "/"))) {
+          Err(error) -> false
+          Ok(url) -> true
+        }
+      }
+    }
+  }
+}
+
+fn http_target_matches_method(method: HttpMethod, target: HttpRequestTarget) -> bool {
+  let value = http_target_bytes(target)
+  match http_bytes_text(value) {
+    None -> false
+    Some(text) -> match method {
+      HttpConnect -> http_connect_target_valid(value)
+      HttpOptions -> if text == "*" { true }
+      else { http_target_is_origin_or_absolute(value, text) }
+      _ -> if text == "*" { false }
+      else { http_target_is_origin_or_absolute(value, text) }
+    }
+  }
+}
+
+fn http_connect_target_valid(value: Bytes) -> bool {
+  let length = bytes_len(value)
+  let mut colon = 0 - 1
+  if length > 0 and http_bytes_byte(value, 0) == 91 {
+    let mut close = 1
+    while close < length and http_bytes_byte(value, close) != 93 { close = close + 1 }
+    if close < length and close + 1 < length and http_bytes_byte(value, close + 1) == 58 {
+      colon = close + 1
+    } else { 0 }
+  } else {
+    let mut position = 0
+    while position < length {
+      if http_bytes_byte(value, position) == 58 { colon = position } else { 0 }
+      position = position + 1
+    }
+  }
+  if colon <= 0 or colon + 1 >= length { false }
+  else {
+    let mut position = colon + 1
+    let mut decimal = true
+    while decimal and position < length {
+      let byte = http_bytes_byte(value, position)
+      if byte >= 48 and byte <= 57 { position = position + 1 }
+      else { decimal = false }
+    }
+    decimal and http_host_value_valid(value)
+  }
+}
+
+fn http_target_is_origin_or_absolute(value: Bytes, text: str) -> bool {
+  let candidate = if bytes_len(value) > 0 and http_bytes_byte(value, 0) == 47 {
+    str_concat("http://weft.invalid", text)
+  } else { text }
+  match url_parse(candidate) {
+    Err(error) -> false
+    Ok(url) -> true
+  }
+}
+
+fn http_validate_host(version: HttpVersion, headers: HttpHeaders, offset: i64) -> Result<nil, HttpParseError> {
+  let parts = http_headers_parts(headers)
+  let mut current = parts.fields
+  let mut count = 0
+  let mut valid = true
+  while valid {
+    match current {
+      Nil -> { valid = false }
+      Cons(header, rest) -> {
+        if http_header_named(header, "host") {
+          count = count + 1
+          if not http_host_value_valid(http_header_parts(header).value) { count = 1000000 } else { 0 }
+        } else { 0 }
+        current = rest
+      }
+    }
+  }
+  if count == 1000000 { result_err<nil, HttpParseError>(HttpInvalidHost(offset)) }
+  else { if count > 1 { result_err<nil, HttpParseError>(HttpDuplicateHost(offset)) }
+    else { match version {
+        Http11 -> if count == 0 { result_err<nil, HttpParseError>(HttpMissingHost(offset)) }
+        else { result_ok<nil, HttpParseError>(nil) }
+        Http10 -> result_ok<nil, HttpParseError>(nil)
+      } } }
+}
+
+fn http_parse_decimal_segment(value: Bytes, start: i64, end: i64, limit: i64, offset: i64) -> Result<i64, HttpParseError> {
+  let first = http_bytes_trim_start(value, start, end)
+  let last = http_bytes_trim_end(value, first, end)
+  if first >= last { result_err<i64, HttpParseError>(HttpInvalidContentLength(offset + first)) }
+  else {
+    let mut position = first
+    let mut parsed = 0
+    let mut invalid = 0 - 1
+    while invalid < 0 and position < last {
+      let byte = http_bytes_byte(value, position)
+      if byte < 48 or byte > 57 { invalid = position }
+      else { if parsed > (9223372036854775807 - (byte - 48)) / 10 { invalid = position }
+        else { parsed = parsed * 10 + (byte - 48); position = position + 1 } }
+    }
+    if invalid >= 0 { result_err<i64, HttpParseError>(HttpInvalidContentLength(offset + invalid)) }
+    else { if parsed > limit { result_err<i64, HttpParseError>(HttpBodyTooLarge(offset + first)) }
+      else { result_ok<i64, HttpParseError>(parsed) } }
+  }
+}
+
+fn http_bytes_trim_start(value: Bytes, start: i64, end: i64) -> i64 {
+  let mut position = start
+  while position < end and (http_bytes_byte(value, position) == 32 or http_bytes_byte(value, position) == 9) {
+    position = position + 1
+  }
+  position
+}
+
+fn http_bytes_trim_end(value: Bytes, start: i64, end: i64) -> i64 {
+  let mut position = end
+  while position > start and (http_bytes_byte(value, position - 1) == 32 or http_bytes_byte(value, position - 1) == 9) {
+    position = position - 1
+  }
+  position
+}
+
+fn http_error_absent(value: Option<HttpParseError>) -> bool {
+  match value {
+    None -> true
+    Some(error) -> false
+  }
+}
+
+fn http_scan_content_length(headers: HttpHeaders, limit: i64) -> HttpLengthScan {
+  let mut current = http_headers_parts(headers).fields
+  let mut seen = false
+  let mut expected = 0
+  let mut failed: Option<HttpParseError> = option_none<HttpParseError>()
+  let mut source_offset = 0
+  let mut finished = false
+  while not finished and http_error_absent(failed) {
+    match current {
+      Nil -> { finished = true }
+      Cons(header, rest) -> {
+        if http_header_named(header, "content-length") {
+          let value = http_header_parts(header).value
+          let mut segment_start = 0
+          let mut position = 0
+          let mut done = false
+          while not done and http_error_absent(failed) {
+            if position == bytes_len(value) or http_bytes_byte(value, position) == 44 {
+              match http_parse_decimal_segment(value, segment_start, position, limit, source_offset) {
+                Err(error) -> { failed = option_some<HttpParseError>(error) }
+                Ok(parsed) -> {
+                  if seen and parsed != expected {
+                    failed = option_some<HttpParseError>(HttpInvalidContentLength(source_offset + segment_start))
+                  } else { expected = parsed; seen = true }
+                }
+              }
+              if position == bytes_len(value) { done = true }
+              else { segment_start = position + 1; position = position + 1 }
+            } else { position = position + 1 }
+          }
+          source_offset = source_offset + bytes_len(value) + 1
+        } else { 0 }
+        current = rest
+      }
+    }
+  }
+  match failed {
+    Some(error) -> HttpLengthFailed(error)
+    None -> if seen { HttpLengthValue(expected) } else { HttpLengthAbsent }
+  }
+}
+
+fn http_valid_token_range(value: Bytes, start: i64, end: i64) -> bool {
+  if start >= end { false }
+  else {
+    let mut position = start
+    let mut valid = true
+    while valid and position < end {
+      if http_is_tchar(http_bytes_byte(value, position)) { position = position + 1 }
+      else { valid = false }
+    }
+    valid
+  }
+}
+
+fn http_scan_transfer_encoding(headers: HttpHeaders) -> HttpTransferScan {
+  let mut current = http_headers_parts(headers).fields
+  let mut count = 0
+  let mut chunked_at = 0 - 1
+  let mut unsupported = false
+  let mut error: Option<HttpParseError> = option_none<HttpParseError>()
+  let mut finished = false
+  while not finished and http_error_absent(error) {
+    match current {
+      Nil -> { finished = true }
+      Cons(header, rest) -> {
+        if http_header_named(header, "transfer-encoding") {
+          let value = http_header_parts(header).value
+          let mut start = 0
+          let mut position = 0
+          let mut line_done = false
+          while not line_done and http_error_absent(error) {
+            if position == bytes_len(value) or http_bytes_byte(value, position) == 44 {
+              let first = http_bytes_trim_start(value, start, position)
+              let last = http_bytes_trim_end(value, first, position)
+              if not http_valid_token_range(value, first, last) {
+                error = option_some<HttpParseError>(HttpInvalidTransferEncoding(first))
+              } else {
+                if http_bytes_range_ascii_eq(value, first, last, "chunked") {
+                  if chunked_at >= 0 { error = option_some<HttpParseError>(HttpInvalidTransferEncoding(first)) }
+                  else { chunked_at = count }
+                } else { unsupported = true }
+                count = count + 1
+              }
+              if position == bytes_len(value) { line_done = true }
+              else { start = position + 1; position = position + 1 }
+            } else { position = position + 1 }
+          }
+        } else { 0 }
+        current = rest
+      }
+    }
+  }
+  match error {
+    Some(reason) -> HttpTransferFailed(reason)
+    None -> if count == 0 { HttpTransferAbsent }
+    else { if chunked_at != count - 1 { HttpTransferFailed(HttpInvalidTransferEncoding(0)) }
+      else { if unsupported { HttpTransferFailed(HttpUnsupportedTransferCoding(0)) }
+        else { HttpTransferChunked } } }
+  }
+}
+
+fn http_bytes_range_ascii_eq(value: Bytes, start: i64, end: i64, expected: str) -> bool {
+  if end - start != str_len(expected) { false }
+  else {
+    let mut position = 0
+    let mut equal = true
+    while equal and start + position < end {
+      if http_ascii_lower(http_bytes_byte(value, start + position)) !=
+        http_ascii_lower(str_byte_at(expected, position)) { equal = false }
+      else { position = position + 1 }
+    }
+    equal
+  }
+}
+
+fn http_scan_connection(headers: HttpHeaders, version: HttpVersion) -> HttpConnectionScan {
+  let mut current = http_headers_parts(headers).fields
+  let mut close = false
+  let mut keep_alive = false
+  let mut error: Option<HttpParseError> = option_none<HttpParseError>()
+  let mut finished = false
+  while not finished and http_error_absent(error) {
+    match current {
+      Nil -> { finished = true }
+      Cons(header, rest) -> {
+        if http_header_named(header, "connection") {
+          let value = http_header_parts(header).value
+          let mut start = 0
+          let mut position = 0
+          let mut line_done = false
+          while not line_done and http_error_absent(error) {
+            if position == bytes_len(value) or http_bytes_byte(value, position) == 44 {
+              let first = http_bytes_trim_start(value, start, position)
+              let last = http_bytes_trim_end(value, first, position)
+              if not http_valid_token_range(value, first, last) {
+                error = option_some<HttpParseError>(HttpInvalidConnection(first))
+              } else {
+                if http_bytes_range_ascii_eq(value, first, last, "close") { close = true }
+                else { if http_bytes_range_ascii_eq(value, first, last, "keep-alive") { keep_alive = true }
+                  else { 0 } }
+              }
+              if position == bytes_len(value) { line_done = true }
+              else { start = position + 1; position = position + 1 }
+            } else { position = position + 1 }
+          }
+        } else { 0 }
+        current = rest
+      }
+    }
+  }
+  match error {
+    Some(reason) -> HttpConnectionOptionsFailed(reason)
+    None -> match version {
+      Http11 -> HttpConnectionOptions(not close, close)
+      Http10 -> HttpConnectionOptions(keep_alive and not close, close)
+    }
+  }
+}
+
+fn http_request_framing_for(headers: HttpHeaders, version: HttpVersion, limits: HttpLimits) -> Result<HttpBodyFraming, HttpParseError> {
+  let limit = http_limits_parts(limits).body_bytes
+  match http_scan_content_length(headers, limit) {
+    HttpLengthFailed(error) -> result_err<HttpBodyFraming, HttpParseError>(error)
+    length -> match http_scan_transfer_encoding(headers) {
+      HttpTransferFailed(error) -> result_err<HttpBodyFraming, HttpParseError>(error)
+      transfer -> match transfer {
+        HttpTransferChunked -> match length {
+          HttpLengthValue(count) -> result_err<HttpBodyFraming, HttpParseError>(HttpAmbiguousFraming(0))
+          HttpLengthAbsent -> match version {
+            Http10 -> result_err<HttpBodyFraming, HttpParseError>(HttpInvalidTransferEncoding(0))
+            Http11 -> result_ok<HttpBodyFraming, HttpParseError>(HttpChunked)
+          }
+          HttpLengthFailed(error) -> result_err<HttpBodyFraming, HttpParseError>(error)
+        }
+        HttpTransferAbsent -> match length {
+          HttpLengthValue(count) -> result_ok<HttpBodyFraming, HttpParseError>(HttpContentLength(http_i64_to_usize(count)))
+          HttpLengthAbsent -> result_ok<HttpBodyFraming, HttpParseError>(HttpNoBody)
+          HttpLengthFailed(error) -> result_err<HttpBodyFraming, HttpParseError>(error)
+        }
+        HttpTransferFailed(error) -> result_err<HttpBodyFraming, HttpParseError>(error)
+      }
+    }
+  }
+}
+
+fn http_status_is_informational(code: i64) -> bool { code >= 100 and code <= 199 }
+
+fn http_response_framing_for(
+  request_method: HttpMethod,
+  status: HttpStatus,
+  headers: HttpHeaders,
+  version: HttpVersion,
+  limits: HttpLimits
+) -> Result<HttpBodyFraming, HttpParseError> {
+  let code = http_status_i64(status)
+  let length = http_scan_content_length(headers, http_limits_parts(limits).body_bytes)
+  let transfer = http_scan_transfer_encoding(headers)
+  match length {
+    HttpLengthFailed(error) -> result_err<HttpBodyFraming, HttpParseError>(error)
+    _ -> match transfer {
+      HttpTransferFailed(error) -> result_err<HttpBodyFraming, HttpParseError>(error)
+      _ -> {
+        let has_length = match length { HttpLengthValue(count) -> true _ -> false }
+        let has_transfer = match transfer { HttpTransferChunked -> true _ -> false }
+        if has_length and has_transfer {
+          result_err<HttpBodyFraming, HttpParseError>(HttpAmbiguousFraming(0))
+        } else {
+          if code == 101 {
+            if has_length or has_transfer { result_err<HttpBodyFraming, HttpParseError>(HttpForbiddenBodyFraming(0)) }
+            else { result_ok<HttpBodyFraming, HttpParseError>(HttpProtocolSwitch) }
+          } else {
+            if http_status_is_informational(code) or code == 204 {
+              if has_length or has_transfer { result_err<HttpBodyFraming, HttpParseError>(HttpForbiddenBodyFraming(0)) }
+              else { result_ok<HttpBodyFraming, HttpParseError>(HttpNoBody) }
+            } else {
+              match request_method {
+                HttpConnect -> if code >= 200 and code <= 299 {
+                  if has_length or has_transfer { result_err<HttpBodyFraming, HttpParseError>(HttpForbiddenBodyFraming(0)) }
+                  else { result_ok<HttpBodyFraming, HttpParseError>(HttpConnectTunnel) }
+                } else { http_response_regular_framing(length, transfer, version) }
+                HttpHead -> result_ok<HttpBodyFraming, HttpParseError>(HttpNoBody)
+                _ -> if code == 304 { result_ok<HttpBodyFraming, HttpParseError>(HttpNoBody) }
+                else { http_response_regular_framing(length, transfer, version) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn http_response_regular_framing(length: HttpLengthScan, transfer: HttpTransferScan, version: HttpVersion) -> Result<HttpBodyFraming, HttpParseError> {
+  match transfer {
+    HttpTransferChunked -> match version {
+      Http10 -> result_err<HttpBodyFraming, HttpParseError>(HttpInvalidTransferEncoding(0))
+      Http11 -> result_ok<HttpBodyFraming, HttpParseError>(HttpChunked)
+    }
+    HttpTransferAbsent -> match length {
+      HttpLengthValue(count) -> result_ok<HttpBodyFraming, HttpParseError>(HttpContentLength(http_i64_to_usize(count)))
+      HttpLengthAbsent -> result_ok<HttpBodyFraming, HttpParseError>(HttpUntilConnectionClose)
+      HttpLengthFailed(error) -> result_err<HttpBodyFraming, HttpParseError>(error)
+    }
+    HttpTransferFailed(error) -> result_err<HttpBodyFraming, HttpParseError>(error)
+  }
+}
+
+fn http_connection_reuse(headers: HttpHeaders, version: HttpVersion, framing: HttpBodyFraming) -> Result<HttpConnectionReuse, HttpParseError> {
+  match http_scan_connection(headers, version) {
+    HttpConnectionOptionsFailed(error) -> result_err<HttpConnectionReuse, HttpParseError>(error)
+    HttpConnectionOptions(persistent, close) -> match framing {
+      HttpUntilConnectionClose -> result_ok<HttpConnectionReuse, HttpParseError>(HttpConnectionClose)
+      HttpProtocolSwitch -> result_ok<HttpConnectionReuse, HttpParseError>(HttpConnectionClose)
+      HttpConnectTunnel -> result_ok<HttpConnectionReuse, HttpParseError>(HttpConnectionClose)
+      _ -> if persistent { result_ok<HttpConnectionReuse, HttpParseError>(HttpConnectionPersistent) }
+      else { result_ok<HttpConnectionReuse, HttpParseError>(HttpConnectionClose) }
+    }
+  }
+}
+
+--- Construct one validated request head for parsing, encoding, or mock use.
+pub fn http_request_head_new(
+  method: HttpMethod,
+  target: HttpRequestTarget,
+  version: HttpVersion,
+  headers: HttpHeaders,
+  limits: HttpLimits
+) -> Result<HttpRequestHead, HttpParseError> {
+  if not http_target_matches_method(method, target) {
+    result_err<HttpRequestHead, HttpParseError>(HttpInvalidTarget(0))
+  } else { match http_validate_headers_limits(headers, limits, false) {
+      Err(error) -> result_err<HttpRequestHead, HttpParseError>(error)
+      Ok(done) -> match http_validate_host(version, headers, 0) {
+        Err(error) -> result_err<HttpRequestHead, HttpParseError>(error)
+        Ok(done) -> match http_request_framing_for(headers, version, limits) {
+          Err(error) -> result_err<HttpRequestHead, HttpParseError>(error)
+          Ok(framing) -> match http_connection_reuse(headers, version, framing) {
+            Err(error) -> result_err<HttpRequestHead, HttpParseError>(error)
+            Ok(connection) -> result_ok<HttpRequestHead, HttpParseError>(HttpRequestHead(HttpRequestHeadParts {
+              method: method,
+                target: target,
+                version: version,
+                headers: headers,
+                connection: connection
+            }))
+          }
+        }
+      }
+    } }
+}
+
+--- Construct one validated response head for parsing, encoding, or mock use.
+pub fn http_response_head_new(
+  request_method: HttpMethod,
+  version: HttpVersion,
+  status: HttpStatus,
+  reason: Bytes,
+  headers: HttpHeaders,
+  limits: HttpLimits
+) -> Result<HttpResponseHead, HttpParseError> {
+  let invalid_reason = http_header_value_invalid(reason)
+  if invalid_reason >= 0 { result_err<HttpResponseHead, HttpParseError>(HttpInvalidStatus(invalid_reason)) }
+  else { match http_validate_headers_limits(headers, limits, false) {
+      Err(error) -> result_err<HttpResponseHead, HttpParseError>(error)
+      Ok(done) -> match http_response_framing_for(request_method, status, headers, version, limits) {
+        Err(error) -> result_err<HttpResponseHead, HttpParseError>(error)
+        Ok(framing) -> match http_connection_reuse(headers, version, framing) {
+          Err(error) -> result_err<HttpResponseHead, HttpParseError>(error)
+          Ok(connection) -> result_ok<HttpResponseHead, HttpParseError>(HttpResponseHead(HttpResponseHeadParts {
+            version: version,
+              status: status,
+              reason: reason,
+              headers: headers,
+              connection: connection
+          }))
+        }
+      }
+    } }
+}
+
+--- Parse one request head from a possibly incomplete byte prefix.
+pub fn http_parse_request_head(source: [u8], limits: HttpLimits) -> HttpRequestHeadParse {
+  let configured = http_limits_parts(limits)
+  match http_find_line(source, 0, configured.start_line_bytes, 1) {
+    HttpLineNeedMore -> HttpRequestHeadNeedMore
+    HttpLineFailed(error) -> HttpRequestHeadFailed(error)
+    HttpLineReady(line_end) -> match http_parse_request_line(source, 0, line_end) {
+      Err(error) -> HttpRequestHeadFailed(error)
+      Ok((method, target, version)) -> if not http_target_matches_method(method, target) {
+        HttpRequestHeadFailed(HttpInvalidTarget(0))
+      } else { match http_parse_header_section(
+          source, line_end + 2, configured.field_line_bytes,
+          configured.header_bytes, configured.header_count, false
+        ) {
+          HttpHeaderSectionNeedMore -> HttpRequestHeadNeedMore
+          HttpHeaderSectionFailed(error) -> HttpRequestHeadFailed(error)
+          HttpHeaderSectionReady(headers, consumed) -> match http_validate_host(version, headers, line_end + 2) {
+            Err(error) -> HttpRequestHeadFailed(error)
+            Ok(done) -> match http_request_framing_for(headers, version, limits) {
+              Err(error) -> HttpRequestHeadFailed(error)
+              Ok(framing) -> match http_connection_reuse(headers, version, framing) {
+                Err(error) -> HttpRequestHeadFailed(error)
+                Ok(connection) -> HttpRequestHeadReady(HttpRequestHead(HttpRequestHeadParts {
+                  method: method,
+                    target: target,
+                    version: version,
+                    headers: headers,
+                    connection: connection
+                }), framing, http_i64_to_usize(consumed))
+              }
+            }
+          }
+        } }
+    }
+  }
+}
+
+--- Parse one response head using the initiating request method for body rules.
+pub fn http_parse_response_head(source: [u8], request_method: HttpMethod, limits: HttpLimits) -> HttpResponseHeadParse {
+  let configured = http_limits_parts(limits)
+  match http_find_line(source, 0, configured.start_line_bytes, 1) {
+    HttpLineNeedMore -> HttpResponseHeadNeedMore
+    HttpLineFailed(error) -> HttpResponseHeadFailed(error)
+    HttpLineReady(line_end) -> match http_parse_response_line(source, 0, line_end) {
+      Err(error) -> HttpResponseHeadFailed(error)
+      Ok((version, status, reason)) -> match http_parse_header_section(
+        source, line_end + 2, configured.field_line_bytes,
+        configured.header_bytes, configured.header_count, false
+      ) {
+        HttpHeaderSectionNeedMore -> HttpResponseHeadNeedMore
+        HttpHeaderSectionFailed(error) -> HttpResponseHeadFailed(error)
+        HttpHeaderSectionReady(headers, consumed) -> match http_response_framing_for(
+          request_method, status, headers, version, limits
+        ) {
+          Err(error) -> HttpResponseHeadFailed(error)
+          Ok(framing) -> match http_connection_reuse(headers, version, framing) {
+            Err(error) -> HttpResponseHeadFailed(error)
+            Ok(connection) -> HttpResponseHeadReady(HttpResponseHead(HttpResponseHeadParts {
+              version: version,
+                status: status,
+                reason: reason,
+                headers: headers,
+                connection: connection
+            }), framing, http_i64_to_usize(consumed))
+          }
+        }
+      }
+    }
+  }
+}
+
+--- Return a request head's method.
+pub fn http_request_method(head: HttpRequestHead) -> HttpMethod { http_request_parts(head).method }
+
+--- Return a request head's exact target.
+pub fn http_request_target(head: HttpRequestHead) -> HttpRequestTarget { http_request_parts(head).target }
+
+--- Return a request head's wire version.
+pub fn http_request_version(head: HttpRequestHead) -> HttpVersion { http_request_parts(head).version }
+
+--- Return a request head's immutable ordered fields.
+pub fn http_request_headers(head: HttpRequestHead) -> HttpHeaders { http_request_parts(head).headers }
+
+--- Return a request head's derived connection policy.
+pub fn http_request_connection(head: HttpRequestHead) -> HttpConnectionReuse { http_request_parts(head).connection }
+
+--- Return a response head's wire version.
+pub fn http_response_version(head: HttpResponseHead) -> HttpVersion { http_response_parts(head).version }
+
+--- Return a response head's status.
+pub fn http_response_status(head: HttpResponseHead) -> HttpStatus { http_response_parts(head).status }
+
+--- Return a response head's exact reason-phrase bytes.
+pub fn http_response_reason(head: HttpResponseHead) -> Bytes { http_response_parts(head).reason }
+
+--- Return a response head's immutable ordered fields.
+pub fn http_response_headers(head: HttpResponseHead) -> HttpHeaders { http_response_parts(head).headers }
+
+--- Return a response head's derived connection policy.
+pub fn http_response_connection(head: HttpResponseHead) -> HttpConnectionReuse { http_response_parts(head).connection }
+
+fn http_push_text(output: Vector<u8>, text: str) -> i64 {
+  let mut index = 0
+  while index < str_len(text) {
+    vector_push<u8>(output, http_i64_to_u8(str_byte_at(text, index)))
+    index = index + 1
+  }
+  0
+}
+
+fn http_push_bytes(output: Vector<u8>, values: Bytes) -> i64 {
+  let mut index = 0
+  while index < bytes_len(values) {
+    vector_push<u8>(output, http_i64_to_u8(http_bytes_byte(values, index)))
+    index = index + 1
+  }
+  0
+}
+
+fn http_version_text(version: HttpVersion) -> str {
+  match version {
+    Http10 -> "HTTP/1.0"
+    Http11 -> "HTTP/1.1"
+  }
+}
+
+fn http_encode_headers_into(output: Vector<u8>, headers: HttpHeaders) -> i64 {
+  let mut current = http_headers_parts(headers).fields
+  let mut done = false
+  while not done {
+    match current {
+      Nil -> { done = true }
+      Cons(header, rest) -> {
+        let parts = http_header_parts(header)
+        http_push_text(output, http_name_text(parts.name))
+        http_push_text(output, ": ")
+        http_push_bytes(output, parts.value)
+        http_push_text(output, "\r\n")
+        current = rest
+      }
+    }
+  }
+  http_push_text(output, "\r\n")
+}
+
+--- Encode a validated request head with canonical CRLF and field-name casing.
+pub fn http_encode_request_head(head: HttpRequestHead) -> Bytes {
+  let parts = http_request_parts(head)
+  let output = vector_with_capacity<u8>(http_headers_parts(parts.headers).wire_bytes + 64)
+  http_push_text(output, http_method_text(parts.method))
+  http_push_text(output, " ")
+  http_push_bytes(output, http_target_bytes(parts.target))
+  http_push_text(output, " ")
+  http_push_text(output, http_version_text(parts.version))
+  http_push_text(output, "\r\n")
+  http_encode_headers_into(output, parts.headers)
+  bytes_from_vector(output)
+}
+
+--- Encode a validated response head with canonical CRLF and exact reason bytes.
+pub fn http_encode_response_head(head: HttpResponseHead) -> Bytes {
+  let parts = http_response_parts(head)
+  let output = vector_with_capacity<u8>(http_headers_parts(parts.headers).wire_bytes + bytes_len(parts.reason) + 32)
+  http_push_text(output, http_version_text(parts.version))
+  http_push_text(output, " ")
+  http_push_text(output, int_to_str(http_status_i64(parts.status)))
+  http_push_text(output, " ")
+  http_push_bytes(output, parts.reason)
+  http_push_text(output, "\r\n")
+  http_encode_headers_into(output, parts.headers)
+  bytes_from_vector(output)
+}
+
+fn http_push_hex(output: Vector<u8>, value: i64) -> i64 {
+  if value <= 0 { vector_push<u8>(output, http_i64_to_u8(48)) }
+  else {
+    let mut divisor = 1
+    while divisor <= value / 16 { divisor = divisor * 16 }
+    let mut remaining = value
+    while divisor > 0 {
+      let digit = remaining / divisor
+      let byte = if digit < 10 { 48 + digit } else { 65 + digit - 10 }
+      vector_push<u8>(output, http_i64_to_u8(byte))
+      remaining = remaining - digit * divisor
+      divisor = divisor / 16
+    }
+    0
+  }
+}
+
+--- Encode one non-terminal chunk under the configured body limit.
+pub fn http_encode_chunk(data: Bytes, limits: HttpLimits) -> Result<Bytes, HttpParseError> {
+  if bytes_len(data) <= 0 { result_err<Bytes, HttpParseError>(HttpInvalidChunkSize(0)) }
+  else { if bytes_len(data) > http_limits_parts(limits).body_bytes {
+      result_err<Bytes, HttpParseError>(HttpBodyTooLarge(0))
+    } else {
+      let output = vector_with_capacity<u8>(bytes_len(data) + 32)
+      http_push_hex(output, bytes_len(data))
+      http_push_text(output, "\r\n")
+      http_push_bytes(output, data)
+      http_push_text(output, "\r\n")
+      result_ok<Bytes, HttpParseError>(bytes_from_vector(output))
+    } }
+}
+
+--- Encode the terminal zero chunk and a safe bounded trailer section.
+pub fn http_encode_chunk_end(trailers: HttpHeaders, limits: HttpLimits) -> Result<Bytes, HttpParseError> {
+  if not http_trailers_safe(trailers) { result_err<Bytes, HttpParseError>(HttpForbiddenTrailer(0)) }
+  else { match http_validate_headers_limits(trailers, limits, true) {
+      Err(error) -> result_err<Bytes, HttpParseError>(error)
+      Ok(done) -> {
+        let output = vector_with_capacity<u8>(http_headers_parts(trailers).wire_bytes + 8)
+        http_push_text(output, "0\r\n")
+        http_encode_headers_into(output, trailers)
+        result_ok<Bytes, HttpParseError>(bytes_from_vector(output))
+      }
+    } }
+}
+
+fn http_hex_value(byte: i64) -> i64 {
+  if byte >= 48 and byte <= 57 { byte - 48 }
+  else { if byte >= 65 and byte <= 70 { byte - 65 + 10 }
+    else { if byte >= 97 and byte <= 102 { byte - 97 + 10 }
+      else { 0 - 1 } } }
+}
+
+fn http_skip_chunk_ows(source: [u8], start: i64, end: i64) -> i64 {
+  let mut position = start
+  while position < end and (http_byte(source, position) == 32 or http_byte(source, position) == 9) {
+    position = position + 1
+  }
+  position
+}
+
+fn http_validate_chunk_extensions(source: [u8], start: i64, end: i64) -> bool {
+  let mut position = start
+  let mut valid = true
+  while valid and position < end {
+    position = http_skip_chunk_ows(source, position, end)
+    if position >= end or http_byte(source, position) != 59 { valid = false }
+    else {
+      position = http_skip_chunk_ows(source, position + 1, end)
+      let name_start = position
+      while position < end and http_is_tchar(http_byte(source, position)) { position = position + 1 }
+      if position == name_start { valid = false }
+      else {
+        position = http_skip_chunk_ows(source, position, end)
+        if position < end and http_byte(source, position) == 61 {
+          position = http_skip_chunk_ows(source, position + 1, end)
+          if position >= end { valid = false }
+          else { if http_byte(source, position) == 34 {
+              position = position + 1
+              let mut closed = false
+              while valid and not closed and position < end {
+                let byte = http_byte(source, position)
+                if byte == 34 { closed = true; position = position + 1 }
+                else { if byte == 92 {
+                    if position + 1 >= end { valid = false }
+                    else {
+                      let escaped = http_byte(source, position + 1)
+                      if escaped == 9 or escaped == 32 or (escaped >= 33 and escaped <= 126) or escaped >= 128 {
+                        position = position + 2
+                      } else { valid = false }
+                    }
+                  } else { if byte == 9 or byte == 32 or byte == 33 or
+                      (byte >= 35 and byte <= 91) or (byte >= 93 and byte <= 126) or byte >= 128 {
+                      position = position + 1
+                    } else { valid = false } } }
+              }
+              if not closed { valid = false }
+            } else {
+              let value_start = position
+              while position < end and http_is_tchar(http_byte(source, position)) { position = position + 1 }
+              if position == value_start { valid = false } else { 0 }
+            } }
+          position = http_skip_chunk_ows(source, position, end)
+          if position < end and http_byte(source, position) != 59 { valid = false } else { 0 }
+        } else { 0 }
+      }
+    }
+  }
+  valid
+}
+
+fn http_trailers_safe(headers: HttpHeaders) -> bool {
+  let mut current = http_headers_parts(headers).fields
+  let mut safe = true
+  let mut done = false
+  while not done and safe {
+    match current {
+      Nil -> { done = true }
+      Cons(header, rest) -> {
+        safe = not http_header_named(header, "content-length") and
+          not http_header_named(header, "transfer-encoding") and
+          not http_header_named(header, "host") and
+          not http_header_named(header, "connection") and
+          not http_header_named(header, "trailer") and
+          not http_header_named(header, "upgrade")
+        current = rest
+      }
+    }
+  }
+  safe
+}
+
+--- Parse one chunked-transfer item from a possibly incomplete byte prefix.
+pub fn http_parse_chunk(source: [u8], limits: HttpLimits) -> HttpChunkParse {
+  let configured = http_limits_parts(limits)
+  match http_find_line(source, 0, configured.chunk_line_bytes, 3) {
+    HttpLineNeedMore -> HttpChunkNeedMore
+    HttpLineFailed(error) -> HttpChunkFailed(error)
+    HttpLineReady(line_end) -> {
+      let mut digits_end = 0
+      while digits_end < line_end and http_hex_value(http_byte(source, digits_end)) >= 0 {
+        digits_end = digits_end + 1
+      }
+      if digits_end <= 0 { HttpChunkFailed(HttpInvalidChunkSize(0)) }
+      else {
+        let mut position = 0
+        let mut size = 0
+        let mut invalid = 0 - 1
+        while invalid < 0 and position < digits_end {
+          let digit = http_hex_value(http_byte(source, position))
+          if digit < 0 { invalid = position }
+          else { if size > (9223372036854775807 - digit) / 16 { invalid = position }
+            else { size = size * 16 + digit; position = position + 1 } }
+        }
+        if invalid >= 0 { HttpChunkFailed(HttpInvalidChunkSize(invalid)) }
+        else { if not http_validate_chunk_extensions(source, digits_end, line_end) {
+            HttpChunkFailed(HttpInvalidChunkSize(digits_end))
+          } else { if size > configured.body_bytes { HttpChunkFailed(HttpBodyTooLarge(0)) }
+            else {
+              let data_start = line_end + 2
+              if size == 0 {
+                match http_parse_header_section(
+                  source, data_start, configured.field_line_bytes,
+                  configured.trailer_bytes, configured.trailer_count, true
+                ) {
+                  HttpHeaderSectionNeedMore -> HttpChunkNeedMore
+                  HttpHeaderSectionFailed(error) -> HttpChunkFailed(error)
+                  HttpHeaderSectionReady(trailers, consumed) -> if http_trailers_safe(trailers) {
+                    HttpChunkReady(HttpChunkEnd(trailers), http_i64_to_usize(consumed))
+                  } else { HttpChunkFailed(HttpForbiddenTrailer(data_start)) }
+                }
+              } else {
+                let needed = data_start + size + 2
+                if http_usize_to_i64(source.len) < needed { HttpChunkNeedMore }
+                else { if http_byte(source, data_start + size) != 13 or http_byte(source, data_start + size + 1) != 10 {
+                    HttpChunkFailed(HttpInvalidChunkTerminator(data_start + size))
+                  } else {
+                    HttpChunkReady(
+                      HttpChunkData(http_copy_range(source, data_start, data_start + size)),
+                      http_i64_to_usize(needed)
+                    )
+                  } }
+              }
+            } } }
+      }
+    }
+  }
+}
