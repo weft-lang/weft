@@ -28585,18 +28585,13 @@ pub(package) fn pipeline_ir_native_hclause_infos_uncaptured(infos: i64, nclauses
   ok
 }
 
-pub(package) fn pipeline_ir_native_handler_ctx_uncaptured(ctx: PipelineNativeHandlerCtx) -> PipelineNativeHandlerCtx {
-  match ctx {
-    PipelineNativeHandlerCtxNil -> PipelineNativeHandlerCtxNil
-    PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, is_abortive, rest) -> {
-      let filtered_rest = pipeline_ir_native_handler_ctx_uncaptured(rest)
-      if pipeline_ir_native_hclause_infos_uncaptured(infos, nclauses) == 1 {
-        PipelineNativeHandlerCtxCons(eff_hash, infos, nclauses, ops_ctr, frame_ctr, is_abortive, filtered_rest)
-      } else {
-        filtered_rest
-      }
-    }
-  }
+pub(package) fn pipeline_ir_native_handler_ctx_out_of_line() -> PipelineNativeHandlerCtx {
+  -- Handler clauses and deferred bodies are independent native functions.
+  -- Even a capture-free enclosing handler keeps its ops/frame identities in
+  -- the caller's SSA homes, which have no meaning in the synthetic callee.
+  -- Its dynamic handler/deferred chain is the only valid cross-function
+  -- representation; an effect in out-of-line code must dispatch through it.
+  PipelineNativeHandlerCtxNil
 }
 
 -- ======================================================================
@@ -30700,8 +30695,16 @@ pub(package) fn pipeline_ir_native_emit_deferred_suspend_direct(code: i64, dst: 
   if argc > pipeline_ir_native_deferred_packet_max_args() {
     bu32(code, encode_brk(18))
   } else {
+    -- Packet allocation is a real call barrier. The located handler entry
+    -- may occupy any caller-saved register, so preserve it in the result
+    -- SSA home before allocating just as the dynamic-entry path does.
+    -- Otherwise a larger ownership/cleanup shape can color the entry into
+    -- allocator scratch and leave the packet carrying a small clobber value
+    -- instead of its ops entry.
+    pipeline_ir_native_store_reg_pinned(code, pinned, dst, entry_phys)
     cg_bump_alloc_imm(code, fm, 15, pipeline_ir_native_deferred_packet_size())
-    bu32(code, cg_str(entry_phys, 15, 0))
+    let saved_entry_phys = pipeline_ir_native_load_reg(code, pinned, dst)
+    bu32(code, cg_str(saved_entry_phys, 15, 0))
     emit_mov_imm(code, 9, argc)
     bu32(code, cg_str(9, 15, 8))
     pipeline_ir_native_emit_deferred_packet_cleanup(code, 15, fm)
@@ -31331,7 +31334,7 @@ pub(package) fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBod
       let continuation_segment_value = continuation_token_value + 1
       let continuation_closure_value = continuation_token_value + 2
       let continuation_env_value = continuation_token_value + 3
-      let safe_handlers = pipeline_ir_native_handler_ctx_uncaptured(active_handlers)
+      let safe_handlers = pipeline_ir_native_handler_ctx_out_of_line()
       let base_home_count = pipeline_ir_native_value_home_count_include_evidence(pipeline_ir_native_value_home_count_for_blocks(first_value, blocks), fm)
       let body_home_count = if is_abortive == 1 { pipeline_ir_native_value_home_count_include(base_home_count, abort_frame_value) } else { base_home_count }
       let contextual_home_count = pipeline_ir_native_value_home_count_include_handlers(body_home_count, safe_handlers)
@@ -31618,7 +31621,7 @@ pub(package) fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredH
       -- environment belongs to the prompt's closure-shaped capture owner and
       -- survives until normal fiber completion or continuation drop.
       pipeline_ir_native_emit_deferred_capture_env_release_if_unowned(code, fm, captures, nfree)
-      let safe_handlers = pipeline_ir_native_handler_ctx_uncaptured(active_handlers)
+      let safe_handlers = pipeline_ir_native_handler_ctx_out_of_line()
       let fiber_handlers = PipelineNativeHandlerCtxCons(eff_hash, clause_infos, nclauses, ops_value, 0 - 1, 0, safe_handlers)
       let body_home_count = pipeline_ir_native_value_home_count_include_evidence(pipeline_ir_native_value_home_count_for_blocks(first_value, blocks), fm)
       let saved_home_count = pipeline_ir_native_value_home_count_include(body_home_count, return_save + result_lanes - 1)
@@ -35077,6 +35080,31 @@ pub(package) fn pipeline_ir_native_par_work_worker_hash(descriptor: PipelineParW
   )
 }
 
+-- Materialise an address within the current native image without ADR's ±1 MiB
+-- reach limit. Starting from this instruction's relocation-invariant PC means
+-- the sequence remains valid when an object section is placed at any address;
+-- no page-alignment assumption or host-linker relocation is introduced.
+pub(package) fn pipeline_ir_native_emit_image_address(
+  code: i64,
+  destination: i64,
+  target: i64
+) -> i64 {
+  let site = buf_len(code)
+  let delta = target - site
+  let scratch = if destination == 17 { 16 } else { 17 }
+  bu32(code, encode_adr(destination, 0))
+  if delta == 0 { 0 }
+  else {
+    emit_mov_imm_safe(code, scratch, if delta < 0 { 0 - delta } else { delta })
+    bu32(code, if delta < 0 {
+      encode_sub_reg(destination, destination, scratch)
+    } else {
+      encode_add_reg(destination, destination, scratch)
+    })
+  }
+  site
+}
+
 -- Materialise the per-result-shape worker entry consumed by every Par policy.
 -- x0 is the sealed carrier. The thunk invokes its stored zero-argument closure,
 -- stores each ABI result lane through the descriptor-validating runtime API,
@@ -35149,10 +35177,8 @@ pub(package) fn pipeline_ir_native_emit_par_work_pack(code: i64, dst: i64, type_
     if closure_phys != 15 { bu32(code, encode_add_imm(15, closure_phys, 0)) } else { 0 }
     bu32(code, cg_ldr(2, 15, 0))
     bu32(code, cg_ldr(3, 15, 8))
-    let descriptor_adr = buf_len(code)
-    bu32(code, encode_adr(0, descriptor_entry - descriptor_adr))
-    let worker_adr = buf_len(code)
-    bu32(code, encode_adr(1, worker_entry - worker_adr))
+    pipeline_ir_native_emit_image_address(code, 0, descriptor_entry)
+    pipeline_ir_native_emit_image_address(code, 1, worker_entry)
     if spawn_owned == 1 { cg_emit_call_lit(code, fm, "runtime_spawn_work_new_raw") }
     else { cg_emit_call_lit(code, fm, "runtime_par_work_new_raw") }
     pipeline_ir_native_store_reg_pinned(code, pinned, dst, 0)
@@ -35177,8 +35203,7 @@ pub(package) fn pipeline_ir_native_emit_par_work_take(code: i64, dst: i64, type_
     bu32(code, encode_sub_imm(31, 31, storage_bytes))
     if spawn_owned == 1 { emit_store_spill_offset(code, 15, lane_storage_bytes) } else { 0 }
     bu32(code, encode_add_imm(0, 15, 0))
-    let descriptor_adr = buf_len(code)
-    bu32(code, encode_adr(1, descriptor_entry - descriptor_adr))
+    pipeline_ir_native_emit_image_address(code, 1, descriptor_entry)
     bu32(code, encode_add_imm(2, 31, 0))
     cg_emit_call_lit(code, fm, "runtime_par_work_result_move_to_expected")
     bu32(code, encode_cbnz(0, 8))
@@ -35259,8 +35284,7 @@ pub(package) fn pipeline_ir_native_emit_record_layout_init(code: i64, dst: i64, 
     let descriptor = pipeline_ir_native_ensure_record_layout_descriptor(code, data_size, fields, fm)
     emit_mov_imm_safe(code, 0, data_size)
     emit_mov_imm_safe(code, 1, align)
-    let descriptor_adr = buf_len(code)
-    bu32(code, encode_adr(2, descriptor - descriptor_adr))
+    pipeline_ir_native_emit_image_address(code, 2, descriptor)
     cg_emit_call_lit(code, fm, "rc_default_alloc_described")
     pipeline_ir_native_store_reg_pinned(code, pinned, dst, 0)
     pipeline_ir_native_emit_record_layout_zero_data(code, dst, data_size, pinned)
@@ -38595,12 +38619,13 @@ pub(package) fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: 
       -- call-final shape. Gated off for fns the whole-value naked path
       -- will pin (double-entry hazard), fiber fns (parity with every
       -- other placement pass), handle carriers (clause bodies renumber
-      -- values under their own scratch), and entry-cleanup fns
-      -- (descriptors key on identity homes). Lambda-capturing params
+      -- values under their own scratch), entry-cleanup fns, and dynamically
+      -- instrumented abort-cleanup fns (both need real frame addresses).
+      -- Lambda-capturing params
       -- self-exclude: closure capture reads clear use_gpr_ok and set
       -- use_nonfinal_unsafe at the closure site.
       let param_cleanup_fn = pipeline_ir_native_blocks_entry_params_need_cleanup(blocks, param_count)
-      let naked_candidate = if barrier_cum == 0 and next_value <= 8 and saw_slot_inst == 0 and pipeline_ir_native_f64_slot_home_count(f64_facts) == 0 and pipeline_ir_native_max_block_param_count(blocks, 0) == 0 and param_cleanup_fn == 0 { 1 } else { 0 }
+      let naked_candidate = if barrier_cum == 0 and next_value <= 8 and saw_slot_inst == 0 and pipeline_ir_native_f64_slot_home_count(f64_facts) == 0 and pipeline_ir_native_max_block_param_count(blocks, 0) == 0 and param_cleanup_fn == 0 and fmap_current_abort_cleanup_instrumented(fm) == 0 { 1 } else { 0 }
       -- Lambda-containing functions keep identity bank homes (the
       -- documented closure-emission contract: env materialisation reads
       -- low-id values through direct identity-home helpers beyond the
@@ -39264,11 +39289,13 @@ pub(package) fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: 
           fmap_add_ir_native_leaf_small_fn_pair_count(fm, (leaf_bank + 1) / 2)
           -- Naked-leaf qualification: barrier-free, bank-sized, no slot
           -- instructions (the frame would be unread), no f64 slot homes.
-          -- Block params gate the shuffle-temp hazard path conservatively;
-          -- entry-param cleanup releases are BLs and need x30 saved.
+          -- Block params gate the shuffle-temp hazard path conservatively.
+          -- Entry-param cleanup releases are BLs and need x30 saved; dynamic
+          -- abort-cleanup records occupy the computed frame even when the IR
+          -- itself has no ordinary slots or calls.
           if saw_slot_inst == 0 and pipeline_ir_native_f64_slot_home_count(f64_facts) == 0 {
             if pipeline_ir_native_max_block_param_count(blocks, 0) == 0 {
-              if pipeline_ir_native_blocks_entry_params_need_cleanup(blocks, param_count) == 0 {
+              if pipeline_ir_native_blocks_entry_params_need_cleanup(blocks, param_count) == 0 and fmap_current_abort_cleanup_instrumented(fm) == 0 {
                 -- Realize: every value lives in a caller-saved register
                 -- (value 0 -> x8 because phys 0 is the pinned-map
                 -- sentinel; 1-7 stay in their arrival registers), the
