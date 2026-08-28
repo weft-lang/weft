@@ -102,6 +102,10 @@ check_rejects "unhandled_effect_perform" "test/negative/unhandled_effect_perform
 check_rejects "source_acquire_requires_effect" "test/negative/source_acquire_requires_effect.weft" 'error[E2001]: effect `SourceAcquire` is not available in this context'
 check_rejects "secure_random_effect_unavailable" "test/negative/secure_random_effect_unavailable.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
 check_rejects "secure_random_raw_backend_private" "test/negative/secure_random_raw_backend_private.weft" "module member 'runtime_secure_random_fill_raw' is not visible in this import" 1
+check_rejects "tls_client_open_requires_authority" "test/negative/tls_client_open_requires_authority.weft" 'error[E2001]: effects `SecureRandom, Time` are not available in this context'
+check_rejects "tls_server_open_requires_authority" "test/negative/tls_server_open_requires_authority.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
+check_rejects "tls_raw_backend_private" "test/negative/tls_raw_backend_private.weft" "module member 'tls_mbedtls_handshake' is not visible in this import" 1
+check_rejects "tls_session_use_after_move" "test/negative/tls_session_use_after_move.weft" "type error: owned value used more than once"
 check_rejects "net_address_constructor_private" "test/negative/net_address_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "net_address_projection_private" "test/negative/net_address_projection_private.weft" "type error: opaque projection pattern is private to its declaring module; use an exported accessor"
 check_rejects "idna_domain_constructor_private" "test/negative/idna_domain_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"

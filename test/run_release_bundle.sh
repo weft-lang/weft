@@ -67,6 +67,10 @@ bundle_root="$work/extracted/$bundle_name"
 facts="$bundle_root/share/weft/compiler.facts.json"
 provenance="$bundle_root/share/weft/provenance.json"
 identity="$bundle_root/share/weft/product-identity.json"
+sdk_manifest="$bundle_root/lib/weft/weft.pkg"
+sdk_compiler_module="$bundle_root/lib/weft/compiler/unicode_identifier_data.weft"
+tls_archive="$bundle_root/lib/weft/native/lib/$target/libweft_mbedtls.a"
+tls_notice="$bundle_root/share/weft/mbedtls.md"
 
 grep -q '"target":"'"$target"'"' "$facts"
 grep -q '"standalone":true' "$facts"
@@ -75,6 +79,14 @@ grep -q '"release_schema_version":1' "$provenance"
 grep -q '"target":"'"$target"'"' "$provenance"
 grep -q '"sdk_layout":"lib/weft"' "$provenance"
 grep -q '"compiler_version":"0.1.0"' "$identity"
+grep -q '"name":"Mbed TLS"' "$provenance"
+grep -q '"version":"3.6.7"' "$provenance"
+grep -q '"license":"Apache-2.0"' "$provenance"
+grep -q '"trusted_bindings":\["runtime/tls_mbedtls"\]' "$sdk_manifest"
+test -f "$sdk_compiler_module"
+grep -q 'Copyright The Mbed TLS Contributors' "$tls_notice"
+tls_archive_sha=$(sha256_file "$tls_archive")
+grep -q '"archive_sha256":"'"$tls_archive_sha"'"' "$provenance"
 if grep -Eqi '(clang|/Users/|/home/)' "$facts" "$provenance" "$identity"; then
   echo "release gate: release metadata contains a host tool or checkout path" >&2
   exit 1
@@ -143,6 +155,18 @@ run_product() {
   fi
 }
 
+run_tls_probe() {
+  if [ "$target" = macos-aarch64 ]; then
+    "$work/project/tls-probe"
+  else
+    docker run --rm --network none \
+      -v "$work/project:/work:ro" \
+      -w /work \
+      "$linux_image" \
+      ./tls-probe
+  fi
+}
+
 run_weft_in deps/math pkg init math >/dev/null
 run_weft_in . pkg init app >/dev/null
 
@@ -190,6 +214,40 @@ printf '%s\n' \
   '  Test.assert_eq(add(20, 22), 42)' \
   '}' > "$work/project/test/arithmetic.weft"
 
+printf '%s\n' \
+  'use stdlib/bytes.{Bytes, bytes_from_str}' \
+  'use stdlib/result.{Err, Ok}' \
+  'use stdlib/secure_random.{SecureRandom, SecureRandomError}' \
+  'use stdlib/time.{Time}' \
+  'use stdlib/tls.{TlsTrust, tls_client_open}' \
+  'use stdlib/url.{url_parse}' \
+  '' \
+  'fn open_with_authority() -[SecureRandom, Time]> i64 {' \
+  '  match url_parse("https://localhost/") {' \
+  '    Err(error) -> 1' \
+  '    Ok(url) -> match tls_client_open(url.host(), bytes_from_str("bad")) {' \
+  '      Err(TlsTrust) -> 0' \
+  '      _ -> 2' \
+  '    }' \
+  '  }' \
+  '}' \
+  '' \
+  'fn with_random() -[Time]> i64 {' \
+  '  handle open_with_authority() {' \
+  '    SecureRandom.bytes(count) -> resume(Ok<Bytes, SecureRandomError>(' \
+  '      bytes_from_str("0123456789abcdef0123456789abcdef0123456789abcdef")' \
+  '    ))' \
+  '  }' \
+  '}' \
+  '' \
+  'fn main() -> i64 {' \
+  '  handle with_random() {' \
+  '    Time.now_millis() -> resume(1788134400000)' \
+  '    Time.now_nanos() -> resume(0)' \
+  '    Time.sleep_millis(ms) -> resume(0)' \
+  '  }' \
+  '}' > "$work/project/tls_probe.weft"
+
 run_weft_in . fmt --write .
 run_weft_in . fmt --check .
 run_weft_with_provider_in . pkg lock >/dev/null
@@ -213,6 +271,13 @@ cmp "$work/project/app.one" "$work/project/app.two"
 cmp "$work/project/app.one.facts.json" "$work/project/app.two.facts.json"
 run_product
 run_weft_in . run
+run_weft_in . build tls_probe.weft -o tls-probe --artifact-facts tls-probe.facts.json
+run_tls_probe
+grep -q '"standalone":true' "$work/project/tls-probe.facts.json"
+grep -q '"content":"sha256:'"$tls_archive_sha"'"' "$work/project/tls-probe.facts.json"
+grep -q '"license":"Apache-2.0"' "$work/project/tls-probe.facts.json"
+grep -q '"source":"sdk:bundled"' "$work/project/tls-probe.facts.json"
+grep -q '"module":"runtime/tls_mbedtls"' "$work/project/tls-probe.facts.json"
 
 run_weft_in . version --json > "$work/project/version.json"
 run_weft_in . target show "$target" > "$work/project/target.json"

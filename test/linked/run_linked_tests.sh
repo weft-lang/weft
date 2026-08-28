@@ -87,12 +87,29 @@ for f in test/linked/*.weft; do
       ;;
   esac
 
+  case "$name" in
+    tls_conformance|tls_safe_smoke)
+      tls_target=macos-aarch64
+      if [ "$WEFT_TEST_PLATFORM" = Linux ]; then tls_target=linux-aarch64; fi
+      if [ ! -f "native/lib/$tls_target/libweft_mbedtls.a" ]; then
+        echo "  - $name (generate the pinned $tls_target TLS archive to enable)"
+        SKIP=$((SKIP+1))
+        continue
+      fi
+      ;;
+  esac
+
   tmpbin=$(mktemp /tmp/weft_linked_XXXXXX)
 
   # Compile straight to the final native-linked executable. No host linker or
   # SDK discovery participates in this product gate.
   compile_exit=0
-  run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" test --emit "$f" > "$tmpbin" 2>/dev/null || compile_exit=$?
+  if grep -qE '(^|[[:space:]])fn[[:space:]]+main[[:space:]]*\(' "$f"; then
+    rm -f "$tmpbin"
+    run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" build "$f" -o "$tmpbin" >/dev/null 2>&1 || compile_exit=$?
+  else
+    run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" test --emit "$f" > "$tmpbin" 2>/dev/null || compile_exit=$?
+  fi
   if [ "$compile_exit" -ne 0 ]; then
     if [ "$compile_exit" -eq 124 ]; then
       echo "  ✗ $name (compilation timed out)"

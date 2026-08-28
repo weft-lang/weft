@@ -56,20 +56,6 @@ mkdir -p "$bundle/bin" "$bundle/lib/weft" "$bundle/share/weft"
   --strip-debug)
 chmod 755 "$bundle/bin/weft"
 
-sdk_files="$work/sdk-files"
-git -C "$project_root" ls-files stdlib runtime | LC_ALL=C sort > "$sdk_files"
-while IFS= read -r source; do
-  destination="$bundle/lib/weft/$source"
-  mkdir -p "$(dirname "$destination")"
-  cp "$project_root/$source" "$destination"
-  chmod 644 "$destination"
-done < "$sdk_files"
-
-cp "$project_root/LICENSE-MIT" "$bundle/LICENSE-MIT"
-cp "$project_root/LICENSE-APACHE" "$bundle/LICENSE-APACHE"
-chmod 644 "$bundle/LICENSE-MIT" "$bundle/LICENSE-APACHE"
-printf '%s\n' "$identity_json" > "$bundle/share/weft/product-identity.json"
-
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -78,13 +64,44 @@ sha256_file() {
   fi
 }
 
+sdk_files="$work/sdk-files"
+git -C "$project_root" ls-files --cached --others --exclude-standard -- compiler runtime stdlib | LC_ALL=C sort > "$sdk_files"
+while IFS= read -r source; do
+  destination="$bundle/lib/weft/$source"
+  mkdir -p "$(dirname "$destination")"
+  cp "$project_root/$source" "$destination"
+  chmod 644 "$destination"
+done < "$sdk_files"
+
+native_archive_rel="native/lib/$target/libweft_mbedtls.a"
+native_archive="$project_root/$native_archive_rel"
+if [ ! -f "$native_archive" ]; then
+  echo "release: missing pinned TLS archive: $native_archive_rel" >&2
+  echo "release: build it target-locally with native/mbedtls/build_archive.sh" >&2
+  exit 1
+fi
+native_archive_sha=$(sha256_file "$native_archive")
+if ! grep -qF "\"content\":\"sha256:$native_archive_sha\"" "$project_root/weft.pkg"; then
+  echo "release: TLS archive digest is not declared by weft.pkg for $target" >&2
+  exit 1
+fi
+mkdir -p "$bundle/lib/weft/native/lib/$target"
+cp "$project_root/weft.pkg" "$bundle/lib/weft/weft.pkg"
+cp "$native_archive" "$bundle/lib/weft/$native_archive_rel"
+cp "$project_root/native/mbedtls/README.md" "$bundle/share/weft/mbedtls.md"
+
+cp "$project_root/LICENSE-MIT" "$bundle/LICENSE-MIT"
+cp "$project_root/LICENSE-APACHE" "$bundle/LICENSE-APACHE"
+chmod 644 "$bundle/LICENSE-MIT" "$bundle/LICENSE-APACHE"
+printf '%s\n' "$identity_json" > "$bundle/share/weft/product-identity.json"
+
 compiler_sha=$(sha256_file "$bundle/bin/weft")
 standalone_contract="stable libSystem operating-system ABI"
 if [ "$target" = linux-aarch64 ]; then
   standalone_contract="Linux kernel ABI; no interpreter or runtime library"
 fi
 printf '%s\n' \
-  "{\"release_schema_version\":1,\"target\":\"$target\",\"source_commit\":\"$source_commit\",\"compiler_sha256\":\"$compiler_sha\",\"sdk_layout\":\"lib/weft\",\"standalone_contract\":\"$standalone_contract\",\"product_identity\":$identity_json}" \
+  "{\"release_schema_version\":1,\"target\":\"$target\",\"source_commit\":\"$source_commit\",\"compiler_sha256\":\"$compiler_sha\",\"sdk_layout\":\"lib/weft\",\"standalone_contract\":\"$standalone_contract\",\"native_dependencies\":[{\"name\":\"Mbed TLS\",\"version\":\"3.6.7\",\"source\":\"https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2\",\"source_sha256\":\"a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6\",\"archive_sha256\":\"$native_archive_sha\",\"license\":\"Apache-2.0\"}],\"product_identity\":$identity_json}" \
   > "$bundle/share/weft/provenance.json"
 chmod 644 "$bundle/share/weft/"*.json
 
@@ -97,6 +114,9 @@ directories="$work/directories"
   printf '%s/lib/weft/\n' "$bundle_name"
   printf '%s/share/\n' "$bundle_name"
   printf '%s/share/weft/\n' "$bundle_name"
+  printf '%s/lib/weft/native/\n' "$bundle_name"
+  printf '%s/lib/weft/native/lib/\n' "$bundle_name"
+  printf '%s/lib/weft/native/lib/%s/\n' "$bundle_name" "$target"
   while IFS= read -r source; do
     directory=$(dirname "$source")
     while [ "$directory" != . ]; do
@@ -115,7 +135,10 @@ directories="$work/directories"
   printf '%s/LICENSE-APACHE\n' "$bundle_name"
   printf '%s/LICENSE-MIT\n' "$bundle_name"
   printf '%s/bin/weft\n' "$bundle_name"
+  printf '%s/lib/weft/native/lib/%s/libweft_mbedtls.a\n' "$bundle_name" "$target"
+  printf '%s/lib/weft/weft.pkg\n' "$bundle_name"
   printf '%s/share/weft/compiler.facts.json\n' "$bundle_name"
+  printf '%s/share/weft/mbedtls.md\n' "$bundle_name"
   printf '%s/share/weft/product-identity.json\n' "$bundle_name"
   printf '%s/share/weft/provenance.json\n' "$bundle_name"
   while IFS= read -r source; do

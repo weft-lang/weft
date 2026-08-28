@@ -1,0 +1,258 @@
+-- stdlib/tls.weft — owned callback-free TLS session engine
+--
+-- TLS is a bounded pure state machine once its initial authority has been
+-- supplied. Production construction obtains time and entropy through effects;
+-- tests install deterministic handlers over the same public constructor.
+
+pub use runtime/tls_mbedtls.{TlsSession}
+use runtime/tls_mbedtls.{TlsNativeOpen, TlsNativeOpenFailed, TlsNativeOpened, tls_native_client_open, tls_native_close_step, tls_native_drain, tls_native_feed, tls_native_feed_eof, tls_native_handshake, tls_native_last_count, tls_native_last_detail, tls_native_pending_output, tls_native_read, tls_native_server_open, tls_native_write_start, tls_native_write_step}
+use stdlib/bytes.{Bytes, bytes_from_str, bytes_to_vector}
+use stdlib/result.{Result, result_err, result_ok}
+use stdlib/secure_random.{SecureRandom, SecureRandomError, secure_random_bytes}
+use stdlib/time.{Time}
+use stdlib/url.{UrlHost}
+
+--- A backend-independent TLS failure.
+pub type TlsError {
+  --- The TLS engine could not allocate bounded session state.
+  TlsAllocation,
+    --- A root chain was malformed or the peer did not chain to a trusted root.
+    TlsTrust,
+    --- The peer certificate did not match the canonical URL host identity.
+    TlsIdentity,
+    --- A local certificate chain was malformed.
+    TlsCertificate,
+    --- A local private key was malformed or incompatible.
+    TlsPrivateKey,
+    --- The selected TLS configuration could not be installed.
+    TlsConfiguration,
+    --- Certificate verification failed for a reason not represented below.
+    TlsVerification,
+    --- The peer violated the TLS protocol.
+    TlsProtocol,
+    --- The requested operation is invalid in the session's current state.
+    TlsInvalidState,
+    --- A certificate, key, identity, buffer, or write exceeded its fixed limit.
+    TlsLimitExceeded,
+    --- The peer certificate had expired at the handler-supplied time.
+    TlsCertificateExpired,
+    --- The peer certificate was not yet valid at the handler-supplied time.
+    TlsCertificateNotYetValid,
+    --- The encrypted stream ended without the TLS close protocol completing.
+    TlsTruncated,
+    --- Initial seed material was outside the backend's accepted secure range.
+    TlsRandomSeed,
+    --- The selected `SecureRandom` handler could not supply seed material.
+    TlsSecureRandom(SecureRandomError),
+    --- The selected `Time` handler could not supply a wall-clock value.
+    TlsTimeUnavailable,
+    --- A future adapter returned an unknown stable status and diagnostic detail.
+    TlsBackend(i64, i64)
+}
+
+--- One bounded non-blocking transition of a TLS session.
+pub type TlsStep {
+  --- The requested protocol phase is complete.
+  TlsDone,
+    --- Feed more encrypted peer bytes before retrying.
+    TlsNeedInput,
+    --- Drain pending encrypted bytes before retrying.
+    TlsNeedOutput,
+    --- The peer completed an authenticated TLS close notification.
+    TlsPeerClosed,
+    --- One plaintext write completed with this exact byte count.
+    TlsWrote(usize),
+    --- One plaintext read completed with this exact byte count.
+    TlsRead(usize)
+}
+
+fn tls_native_error(status: i64, detail: i64) -> TlsError {
+  if status == 0 - 1001 { TlsAllocation }
+  else { if status == 0 - 1002 { TlsTrust }
+    else { if status == 0 - 1003 { TlsIdentity }
+      else { if status == 0 - 1004 { TlsCertificate }
+        else { if status == 0 - 1005 { TlsPrivateKey }
+          else { if status == 0 - 1006 { TlsConfiguration }
+            else { if status == 0 - 1007 { TlsVerification }
+              else { if status == 0 - 1008 { TlsProtocol }
+                else { if status == 0 - 1009 { TlsInvalidState }
+                  else { if status == 0 - 1010 { TlsLimitExceeded }
+                    else { if status == 0 - 1011 { TlsCertificateExpired }
+                      else { if status == 0 - 1012 { TlsCertificateNotYetValid }
+                        else { if status == 0 - 1013 { TlsTruncated }
+                          else { if status == 0 - 1014 { TlsRandomSeed }
+                            else { TlsBackend(status, detail) } } } } } } } } } } } } } }
+}
+
+fn tls_open_result(opened: TlsNativeOpen) -> Result<owned TlsSession, TlsError> {
+  match opened {
+    TlsNativeOpened(session) -> result_ok<owned TlsSession, TlsError>(session)
+    TlsNativeOpenFailed(status, detail) -> {
+      result_err<owned TlsSession, TlsError>(tls_native_error(status, detail))
+    }
+  }
+}
+
+fn tls_client_open_seeded(
+  host: UrlHost,
+  trust_roots: Bytes,
+  verification_time_seconds: i64,
+  seed: Bytes
+) -> Result<owned TlsSession, TlsError> {
+  let roots_buffer = bytes_to_vector(trust_roots)
+  let identity_buffer = bytes_to_vector(bytes_from_str(host.tls_identity()))
+  let seed_buffer = bytes_to_vector(seed)
+  tls_native_client_open(
+    roots_buffer[..],
+    identity_buffer[..],
+    seed_buffer[..],
+    verification_time_seconds
+  ) |> tls_open_result()
+}
+
+fn tls_server_open_seeded(
+  certificate: Bytes,
+  private_key: Bytes,
+  seed: Bytes
+) -> Result<owned TlsSession, TlsError> {
+  let certificate_buffer = bytes_to_vector(certificate)
+  let private_key_buffer = bytes_to_vector(private_key)
+  let seed_buffer = bytes_to_vector(seed)
+  tls_native_server_open(
+    certificate_buffer[..],
+    private_key_buffer[..],
+    seed_buffer[..]
+  ) |> tls_open_result()
+}
+
+--- Open a verifying TLS client engine for one canonical URL host.
+---
+--- `trust_roots` is an explicit PEM bundle. Production system-root selection
+--- is a higher-level handler policy; tests use this same API with fixture roots
+--- and deterministic `Time` and `SecureRandom` handlers.
+pub fn tls_client_open(
+  host: UrlHost,
+  trust_roots: Bytes
+) -[SecureRandom, Time]> Result<owned TlsSession, TlsError> {
+  let now_millis = Time.now_millis()
+  if now_millis < 0 {
+    result_err<owned TlsSession, TlsError>(TlsTimeUnavailable)
+  } else {
+    match secure_random_bytes(__i64_to_usize(48)) {
+      Err(error) -> result_err<owned TlsSession, TlsError>(TlsSecureRandom(error))
+      Ok(seed) -> tls_client_open_seeded(host, trust_roots, now_millis / 1000, seed)
+    }
+  }
+}
+
+--- Open a TLS server engine for one local certificate and private key.
+pub fn tls_server_open(
+  certificate: Bytes,
+  private_key: Bytes
+) -[SecureRandom]> Result<owned TlsSession, TlsError> {
+  match secure_random_bytes(__i64_to_usize(48)) {
+    Err(error) -> result_err<owned TlsSession, TlsError>(TlsSecureRandom(error))
+    Ok(seed) -> tls_server_open_seeded(certificate, private_key, seed)
+  }
+}
+
+fn tls_step_result(
+  session: borrow TlsSession,
+  status: i64
+) -> Result<TlsStep, TlsError> {
+  if status < 0 {
+    result_err<TlsStep, TlsError>(
+      tls_native_error(status, tls_native_last_detail(session))
+    )
+  } else {
+    match status {
+      0 -> result_ok<TlsStep, TlsError>(TlsDone)
+      1 -> result_ok<TlsStep, TlsError>(TlsNeedInput)
+      2 -> result_ok<TlsStep, TlsError>(TlsNeedOutput)
+      3 -> result_ok<TlsStep, TlsError>(TlsPeerClosed)
+      4 -> result_ok<TlsStep, TlsError>(TlsWrote(__i64_to_usize(tls_native_last_count(session))))
+      5 -> result_ok<TlsStep, TlsError>(TlsRead(__i64_to_usize(tls_native_last_count(session))))
+      _ -> result_err<TlsStep, TlsError>(TlsBackend(status, tls_native_last_detail(session)))
+    }
+  }
+}
+
+--- Return the encrypted bytes currently waiting to be drained.
+pub fn tls_pending_output(session: borrow TlsSession) -> usize {
+  __i64_to_usize(tls_native_pending_output(session))
+}
+
+--- Feed as many encrypted peer bytes as the bounded input permits.
+pub fn tls_feed(
+  session: borrow mut TlsSession,
+  values: [u8]
+) -> Result<usize, TlsError> {
+  let status = tls_native_feed(session, values)
+  if status < 0 {
+    result_err<usize, TlsError>(tls_native_error(status, tls_native_last_detail(session)))
+  } else {
+    result_ok<usize, TlsError>(__i64_to_usize(status))
+  }
+}
+
+--- Mark the encrypted peer transport as EOF.
+pub fn tls_feed_eof(session: borrow mut TlsSession) -> Result<nil, TlsError> {
+  let status = tls_native_feed_eof(session)
+  if status < 0 {
+    result_err<nil, TlsError>(tls_native_error(status, tls_native_last_detail(session)))
+  } else {
+    result_ok<nil, TlsError>(nil)
+  }
+}
+
+--- Drain pending encrypted bytes into a caller-owned buffer.
+pub fn tls_drain(
+  session: borrow mut TlsSession,
+  buffer: [mut u8]
+) -> Result<usize, TlsError> {
+  let status = tls_native_drain(session, buffer)
+  if status < 0 {
+    result_err<usize, TlsError>(tls_native_error(status, tls_native_last_detail(session)))
+  } else {
+    result_ok<usize, TlsError>(__i64_to_usize(status))
+  }
+}
+
+--- Advance the client or server handshake once.
+pub fn tls_handshake(session: borrow mut TlsSession) -> Result<TlsStep, TlsError> {
+  let status = tls_native_handshake(session)
+  tls_step_result(session, status)
+}
+
+--- Read one bounded plaintext fragment into `buffer`.
+pub fn tls_read(
+  session: borrow mut TlsSession,
+  buffer: [mut u8]
+) -> Result<TlsStep, TlsError> {
+  let status = tls_native_read(session, buffer)
+  tls_step_result(session, status)
+}
+
+--- Start one plaintext write of at most 16 KiB.
+---
+--- If output must be drained, call `tls_write_step` after draining; the
+--- adapter owns the pending plaintext until `TlsWrote` is returned.
+pub fn tls_write_start(
+  session: borrow mut TlsSession,
+  values: [u8]
+) -> Result<TlsStep, TlsError> {
+  let status = tls_native_write_start(session, values)
+  tls_step_result(session, status)
+}
+
+--- Continue a plaintext write that previously needed output progress.
+pub fn tls_write_step(session: borrow mut TlsSession) -> Result<TlsStep, TlsError> {
+  let status = tls_native_write_step(session)
+  tls_step_result(session, status)
+}
+
+--- Advance the authenticated TLS close notification once.
+pub fn tls_close_step(session: borrow mut TlsSession) -> Result<TlsStep, TlsError> {
+  let status = tls_native_close_step(session)
+  tls_step_result(session, status)
+}

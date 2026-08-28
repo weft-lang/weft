@@ -494,7 +494,7 @@ stdlib_doc_modules=(
   stdlib/process.weft
   stdlib/json.weft
   stdlib/secure_random.weft stdlib/net_address.weft stdlib/idna.weft
-  stdlib/dns.weft stdlib/tcp.weft
+  stdlib/dns.weft stdlib/tcp.weft stdlib/url.weft stdlib/tls.weft
   stdlib/state.weft stdlib/diagnostic_type.weft stdlib/diagnostic.weft
   stdlib/diagnostic_registry.weft stdlib/map.weft stdlib/set.weft
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector_type.weft
@@ -548,6 +548,14 @@ assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public AP
     assert_contains "doc_stdlib_tcp_connect_preserves_owned_authority_fact" "$(<"$tmp_out")" "pub fn tcp_connect(address: SocketAddress, options: TcpConnectOptions) -[TcpConnect]> Result<owned TcpStream, TcpError>"
     assert_contains "doc_stdlib_tcp_connect_policy_preserves_authority_fact" "$(<"$tmp_out")" "pub fn tcp_connect_with_policy<T, E>(policy: TcpConnectPolicy, body: () -[TcpConnect, E]> T) -[TcpConnect, E]> T"
     assert_contains "doc_stdlib_tcp_listen_policy_preserves_authority_fact" "$(<"$tmp_out")" "pub fn tcp_listen_with_policy<T, E>(policy: TcpListenPolicy, body: () -[TcpListen, E]> T) -[TcpListen, E]> T"
+  elif [ "$stdlib_doc_name" = "url" ]; then
+    assert_contains "doc_stdlib_url_pins_public_surface" "$(<"$tmp_out")" "Public API items: 41. Documented: 41."
+    assert_contains "doc_stdlib_url_pins_typed_host" "$(<"$tmp_out")" "pub fn host(self: Url) -> UrlHost"
+    assert_contains "doc_stdlib_url_pins_tls_identity" "$(<"$tmp_out")" "pub fn tls_identity(self: Url) -> str"
+  elif [ "$stdlib_doc_name" = "tls" ]; then
+    assert_contains "doc_stdlib_tls_pins_public_surface" "$(<"$tmp_out")" "Public API items: 36. Documented: 36."
+    assert_contains "doc_stdlib_tls_client_preserves_authority" "$(<"$tmp_out")" "pub fn tls_client_open(host: UrlHost, trust_roots: Bytes) -[SecureRandom, Time]> Result<owned TlsSession, TlsError>"
+    assert_contains "doc_stdlib_tls_server_preserves_authority" "$(<"$tmp_out")" "pub fn tls_server_open(certificate: Bytes, private_key: Bytes) -[SecureRandom]> Result<owned TlsSession, TlsError>"
   elif [ "$stdlib_doc_name" = "channel" ]; then
     assert_contains "doc_stdlib_channel_pins_public_surface" "$(<"$tmp_out")" "Public API items: 21. Documented: 21."
     assert_contains "doc_stdlib_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"
