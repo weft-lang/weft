@@ -1,0 +1,551 @@
+-- stdlib/http_endpoint.weft — distinct HTTP client and server authorities
+--
+-- Client authority can establish outbound HTTPS exchanges; server authority
+-- can listen and accept inbound HTTPS exchanges. Both return the same owned
+-- body stream and consume the same pure HTTP message semantics. Established
+-- body I/O is a separate capability from opening either direction.
+
+use stdlib/bytes.{Bytes, bytes_to_vector}
+use stdlib/dns.{DnsAnyFamily, DnsError, DnsResolve, dns_numeric_candidates, dns_resolve}
+use stdlib/drop.{Drop}
+use stdlib/http.{HttpConnectionClose, HttpConnectionPersistent, HttpConnectionReuse, HttpLimits, HttpMethod, HttpParseError, HttpRequestHead, HttpRequestHeadFailed, HttpRequestHeadNeedMore, HttpRequestHeadReady, HttpResponseHead, HttpResponseHeadFailed, HttpResponseHeadNeedMore, HttpResponseHeadReady, http_encode_request_head, http_encode_response_head, http_request_body_framing, http_request_connection, http_response_body_framing, http_response_connection, http_parse_request_head, http_parse_response_head}
+use stdlib/http_stream.{HttpBodyError, HttpBodyIO, HttpBodyStream, HttpConnection, HttpConnectionReceive, HttpConnectionReceiveFailed, HttpConnectionReceived, HttpConnectionPeerClosed, HttpConnectionSnapshot, HttpConnectionSnapshotted, HttpConnectionWrite, HttpConnectionWriteFailed, HttpConnectionWritten, http_body_close_connection_direct, http_body_connection_advance, http_body_connection_receive, http_body_finish_direct, http_body_read_direct, http_body_reader_open, http_body_write_direct, http_body_write_wire, http_body_writer_open, http_connection_disallow_reuse, http_connection_from_tls, http_connection_snapshot}
+use stdlib/net_address.{IpV4, IpV6, SocketAddress}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/secure_random.{SecureRandom}
+use stdlib/tcp.{TcpConnect, TcpConnectOptions, TcpError, TcpListen, TcpListenOptions, TcpListener, TcpListenerIO, TcpListenerReadinessFailed, TcpListenerReady, TcpReadiness, TcpReadinessError, TcpResourceExhausted, TcpStream, TcpStreamIO, tcp_accept, tcp_connect, tcp_connect_options_default, tcp_error_from_platform_status, tcp_listen, tcp_listener_local_address, tcp_wait_acceptable}
+use stdlib/time.{Time}
+use stdlib/tls.{TlsError, TlsSession, tls_client_open, tls_server_open}
+use stdlib/tls_stream.{TlsStream, TlsStreamError, TlsStreamHandshakeFailed, TlsStreamHandshakeReady, tls_stream_handshake}
+use stdlib/url.{Url, UrlDomain, UrlHost, UrlHttp, UrlHttps, UrlIpv4, UrlIpv6, UrlScheme, UrlWs, UrlWss}
+use stdlib/vector.{vector_get_in_bounds, vector_len, vector_with_capacity}
+use stdlib/vector_type.{Vector}
+
+--- A failure while opening or advancing one HTTP exchange.
+pub type HttpExchangeError {
+  --- The selected handler does not implement this URL scheme.
+  HttpExchangeUnsupportedScheme(UrlScheme),
+    --- Canonical host resolution failed.
+    HttpExchangeDns(DnsError),
+    --- No resolved candidate could establish TCP.
+    HttpExchangeTcp(TcpError),
+    --- TCP readiness failed before an inbound accept.
+    HttpExchangeReadiness(TcpReadinessError),
+    --- TLS session construction failed.
+    HttpExchangeTls(TlsError),
+    --- The owned TLS-over-TCP transition failed.
+    HttpExchangeTlsStream(TlsStreamError),
+    --- HTTP head or framing validation failed.
+    HttpExchangeProtocol(HttpParseError),
+    --- Body-stream construction or transport failed.
+    HttpExchangeBody(HttpBodyError),
+    --- The peer closed before a complete HTTP head arrived.
+    HttpExchangeUnexpectedEof
+}
+
+--- An outbound request body ready for incremental writes.
+pub type HttpClientBegin {
+  --- The request head was sent and the body owner is ready.
+  HttpClientRequestReady(owned HttpBodyStream),
+    --- The exchange failed before returning a body owner.
+    HttpClientRequestFailed(HttpExchangeError)
+}
+
+--- A complete response head joined to its inbound body owner.
+pub type HttpClientResponse {
+  --- The response head and bounded body stream are ready.
+  HttpClientResponseReady(HttpResponseHead, owned HttpBodyStream),
+    --- The response failed and consumed the unusable connection.
+    HttpClientResponseFailed(HttpExchangeError)
+}
+
+--- An owned listening endpoint interpreted by `HttpServer`.
+pub type HttpServerListener = opaque owned TcpListener
+
+impl Drop for HttpServerListener {
+  fn drop(self) -[TcpListenerIO]> i64 {
+    match self { HttpServerListener(listener) -> listener.drop() }
+  }
+}
+
+--- Completion of one inbound listener creation.
+pub type HttpServerListen {
+  --- The server listener and its actual bound numeric endpoint are ready.
+  --- The address is especially useful when binding an ephemeral port.
+  HttpServerListening(owned HttpServerListener, SocketAddress),
+    --- The listener could not be created.
+    HttpServerListenFailed(HttpExchangeError)
+}
+
+--- One accepted request while preserving the listener owner.
+pub type HttpServerAccept {
+  --- The listener, validated request head, and request body owner.
+  HttpServerRequestReady(owned HttpServerListener, HttpRequestHead, owned HttpBodyStream),
+    --- Accept or protocol setup failed and returned the listener.
+    HttpServerAcceptFailed(owned HttpServerListener, HttpExchangeError)
+}
+
+--- An outbound response body ready for incremental writes.
+pub type HttpServerRespond {
+  --- The response head was sent and the body owner is ready.
+  HttpServerResponseReady(owned HttpBodyStream),
+    --- The response failed and consumed the unusable connection.
+    HttpServerResponseFailed(HttpExchangeError)
+}
+
+--- Authority to establish and advance outbound HTTP client exchanges.
+pub effect HttpClient {
+  --- Connect, authenticate, send one request head, and return its body writer.
+  fn begin(url: Url, request: HttpRequestHead, limits: HttpLimits) -> HttpClientBegin
+  --- Read and validate the response head after the request body completes.
+  fn response(
+    connection: owned HttpConnection,
+    request_method: HttpMethod,
+    limits: HttpLimits
+  ) -> HttpClientResponse
+}
+
+--- Authority to listen for and advance inbound HTTP server exchanges.
+pub effect HttpServer {
+  --- Bind one server listener.
+  fn listen(address: SocketAddress, options: TcpListenOptions) -> HttpServerListen
+  --- Accept, authenticate, and parse one request head.
+  fn accept(listener: owned HttpServerListener, limits: HttpLimits) -> HttpServerAccept
+  --- Send one validated response head and return its body writer.
+  fn respond(
+    connection: owned HttpConnection,
+    response: HttpResponseHead,
+    limits: HttpLimits
+  ) -> HttpServerRespond
+}
+
+fn http_endpoint_listener(listener: owned TcpListener) -[TcpListenerIO]> owned HttpServerListener {
+  HttpServerListener(listener)
+}
+
+fn http_endpoint_drop_connection(connection: owned HttpConnection) -[TcpStreamIO]> i64 {
+  connection.drop()
+}
+
+fn http_endpoint_drop_stream(stream: owned TlsStream) -[TcpStreamIO]> i64 {
+  stream.drop()
+}
+
+fn http_endpoint_client_candidates(
+  url: Url
+) -[DnsResolve]> Result<Vector<SocketAddress>, DnsError> {
+  let port = url.effective_port()
+  match url.host() {
+    UrlDomain(name) -> dns_resolve(name, port, DnsAnyFamily)
+    UrlIpv4(address) -> dns_numeric_candidates(IpV4(address), port, DnsAnyFamily)
+    UrlIpv6(address) -> dns_numeric_candidates(IpV6(address), port, DnsAnyFamily)
+  }
+}
+
+fn http_endpoint_connect_candidates(
+  candidates: Vector<SocketAddress>,
+  options: TcpConnectOptions
+) -[TcpConnect]> Result<owned TcpStream, HttpExchangeError> {
+  let mut index = 0
+  let mut last = TcpResourceExhausted
+  while index < vector_len<SocketAddress>(candidates) {
+    match tcp_connect(vector_get_in_bounds<SocketAddress>(candidates, index), options) {
+      Ok(stream) -> return result_ok<owned TcpStream, HttpExchangeError>(stream)
+      Err(error) -> { last = error }
+    }
+    index = index + 1
+  }
+  result_err<owned TcpStream, HttpExchangeError>(HttpExchangeTcp(last))
+}
+
+fn http_endpoint_handshake(
+  transport: owned TcpStream,
+  session: owned TlsSession
+) -[TcpReadiness, TcpStreamIO]> Result<owned TlsStream, HttpExchangeError> {
+  match tls_stream_handshake(transport, session) {
+    TlsStreamHandshakeReady(stream) -> result_ok<owned TlsStream, HttpExchangeError>(stream)
+    TlsStreamHandshakeFailed(stream, error) -> {
+      http_endpoint_drop_stream(stream)
+      result_err<owned TlsStream, HttpExchangeError>(HttpExchangeTlsStream(error))
+    }
+  }
+}
+
+fn http_endpoint_apply_reuse(
+  connection: owned HttpConnection,
+  reuse: HttpConnectionReuse
+) -[TcpStreamIO]> owned HttpConnection {
+  match reuse {
+    HttpConnectionPersistent -> connection
+    HttpConnectionClose -> http_connection_disallow_reuse(connection)
+  }
+}
+
+type HttpRequestConnectionHead {
+  HttpRequestConnectionReady(owned HttpConnection, HttpRequestHead),
+    HttpRequestConnectionFailed(HttpExchangeError)
+}
+
+type HttpResponseConnectionHead {
+  HttpResponseConnectionReady(owned HttpConnection, HttpResponseHead),
+    HttpResponseConnectionFailed(HttpExchangeError)
+}
+
+fn http_endpoint_request_head(
+  connection: owned HttpConnection,
+  limits: HttpLimits
+) -[TcpReadiness, TcpStreamIO]> HttpRequestConnectionHead {
+  let mut current: owned HttpConnection = connection
+  loop {
+    match http_connection_snapshot(current) {
+      HttpConnectionSnapshotted(returned, bytes) -> {
+        let source = bytes_to_vector(bytes)
+        match http_parse_request_head(source[..], limits) {
+          HttpRequestHeadFailed(error) -> {
+            http_endpoint_drop_connection(returned)
+            break (HttpRequestConnectionFailed(HttpExchangeProtocol(error)))
+          }
+          HttpRequestHeadReady(head, framing, consumed) -> {
+            let advanced = http_body_connection_advance(returned, __u64_to_i64(__usize_to_u64(consumed)))
+            break (HttpRequestConnectionReady(
+              http_endpoint_apply_reuse(advanced, http_request_connection(head)),
+              head
+            ))
+          }
+          HttpRequestHeadNeedMore -> match http_body_connection_receive(returned, 16384) {
+            HttpConnectionReceived(connection) -> { current = connection }
+            HttpConnectionPeerClosed(connection) -> {
+              http_endpoint_drop_connection(connection)
+              break (HttpRequestConnectionFailed(HttpExchangeUnexpectedEof))
+            }
+            HttpConnectionReceiveFailed(connection, error) -> {
+              http_endpoint_drop_connection(connection)
+              break (HttpRequestConnectionFailed(HttpExchangeBody(error)))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn http_endpoint_response_head(
+  connection: owned HttpConnection,
+  request_method: HttpMethod,
+  limits: HttpLimits
+) -[TcpReadiness, TcpStreamIO]> HttpResponseConnectionHead {
+  let mut current: owned HttpConnection = connection
+  loop {
+    match http_connection_snapshot(current) {
+      HttpConnectionSnapshotted(returned, bytes) -> {
+        let source = bytes_to_vector(bytes)
+        match http_parse_response_head(source[..], request_method, limits) {
+          HttpResponseHeadFailed(error) -> {
+            http_endpoint_drop_connection(returned)
+            break (HttpResponseConnectionFailed(HttpExchangeProtocol(error)))
+          }
+          HttpResponseHeadReady(head, framing, consumed) -> {
+            let advanced = http_body_connection_advance(returned, __u64_to_i64(__usize_to_u64(consumed)))
+            break (HttpResponseConnectionReady(
+              http_endpoint_apply_reuse(advanced, http_response_connection(head)),
+              head
+            ))
+          }
+          HttpResponseHeadNeedMore -> match http_body_connection_receive(returned, 16384) {
+            HttpConnectionReceived(connection) -> { current = connection }
+            HttpConnectionPeerClosed(connection) -> {
+              http_endpoint_drop_connection(connection)
+              break (HttpResponseConnectionFailed(HttpExchangeUnexpectedEof))
+            }
+            HttpConnectionReceiveFailed(connection, error) -> {
+              http_endpoint_drop_connection(connection)
+              break (HttpResponseConnectionFailed(HttpExchangeBody(error)))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn http_client_begin_tls(
+  trust_roots: Bytes,
+  url: Url,
+  request: HttpRequestHead,
+  limits: HttpLimits
+) -[DnsResolve, SecureRandom, TcpConnect, TcpReadiness, TcpStreamIO, Time]> HttpClientBegin {
+  match url.scheme() {
+    UrlHttps -> match http_endpoint_client_candidates(url) {
+      Err(error) -> HttpClientRequestFailed(HttpExchangeDns(error))
+      Ok(candidates) -> match http_endpoint_connect_candidates(candidates, tcp_connect_options_default()) {
+        Err(error) -> HttpClientRequestFailed(error)
+        Ok(transport) -> match tls_client_open(url.host(), trust_roots) {
+          Err(error) -> HttpClientRequestFailed(HttpExchangeTls(error))
+          Ok(session) -> match http_endpoint_handshake(transport, session) {
+            Err(error) -> HttpClientRequestFailed(error)
+            Ok(stream) -> {
+              let connection = http_connection_from_tls(
+                stream,
+                vector_with_capacity<u8>(0),
+                0,
+                http_request_connection(request)
+              )
+              match http_body_write_wire(connection, http_encode_request_head(request)) {
+                HttpConnectionWriteFailed(failed, error) -> {
+                  http_endpoint_drop_connection(failed)
+                  HttpClientRequestFailed(HttpExchangeBody(error))
+                }
+                HttpConnectionWritten(ready) -> match http_body_writer_open(
+                  ready,
+                  http_request_body_framing(request),
+                  limits,
+                  false
+                ) {
+                  Err(error) -> HttpClientRequestFailed(HttpExchangeBody(error))
+                  Ok(body) -> HttpClientRequestReady(body)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    scheme -> HttpClientRequestFailed(HttpExchangeUnsupportedScheme(scheme))
+  }
+}
+
+fn http_client_response_tls(
+  connection: owned HttpConnection,
+  request_method: HttpMethod,
+  limits: HttpLimits
+) -[TcpReadiness, TcpStreamIO]> HttpClientResponse {
+  match http_endpoint_response_head(connection, request_method, limits) {
+    HttpResponseConnectionFailed(error) -> HttpClientResponseFailed(error)
+    HttpResponseConnectionReady(ready, head) -> match http_body_reader_open(
+      ready,
+      http_response_body_framing(head),
+      limits,
+      false
+    ) {
+      Err(error) -> HttpClientResponseFailed(HttpExchangeBody(error))
+      Ok(body) -> HttpClientResponseReady(head, body)
+    }
+  }
+}
+
+fn http_server_listen_tls(
+  address: SocketAddress,
+  options: TcpListenOptions
+) -[TcpListen, TcpListenerIO]> HttpServerListen {
+  match tcp_listen(address, options) {
+    Err(error) -> HttpServerListenFailed(HttpExchangeTcp(error))
+    Ok(listener) -> match tcp_listener_local_address(listener) {
+      Err(error) -> {
+        let dropped = listener.drop()
+        HttpServerListenFailed(HttpExchangeTcp(error))
+      }
+      Ok(bound) -> HttpServerListening(http_endpoint_listener(listener), bound)
+    }
+  }
+}
+
+fn http_server_accept_tls(
+  certificate: Bytes,
+  private_key: Bytes,
+  listener: owned HttpServerListener,
+  limits: HttpLimits
+) -[SecureRandom, TcpListenerIO, TcpReadiness, TcpStreamIO]> HttpServerAccept {
+  match listener {
+    HttpServerListener(raw_listener) -> match tcp_wait_acceptable(raw_listener) {
+      TcpListenerReadinessFailed(returned, error) -> HttpServerAcceptFailed(
+        http_endpoint_listener(returned),
+        HttpExchangeReadiness(error)
+      )
+      TcpListenerReady(returned) -> {
+        let mut ready: owned TcpListener = returned
+        match tcp_accept(ready) {
+          Err(error) -> HttpServerAcceptFailed(
+            http_endpoint_listener(ready),
+            HttpExchangeTcp(error)
+          )
+          Ok(transport) -> match tls_server_open(certificate, private_key) {
+            Err(error) -> HttpServerAcceptFailed(
+              http_endpoint_listener(ready),
+              HttpExchangeTls(error)
+            )
+            Ok(session) -> match http_endpoint_handshake(transport, session) {
+              Err(error) -> HttpServerAcceptFailed(http_endpoint_listener(ready), error)
+              Ok(stream) -> {
+                let connection = http_connection_from_tls(
+                  stream,
+                  vector_with_capacity<u8>(0),
+                  0,
+                  HttpConnectionPersistent
+                )
+                match http_endpoint_request_head(connection, limits) {
+                  HttpRequestConnectionFailed(error) -> HttpServerAcceptFailed(
+                    http_endpoint_listener(ready),
+                    error
+                  )
+                  HttpRequestConnectionReady(request_connection, head) -> match http_body_reader_open(
+                    request_connection,
+                    http_request_body_framing(head),
+                    limits,
+                    false
+                  ) {
+                    Err(error) -> HttpServerAcceptFailed(
+                      http_endpoint_listener(ready),
+                      HttpExchangeBody(error)
+                    )
+                    Ok(body) -> HttpServerRequestReady(http_endpoint_listener(ready), head, body)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn http_server_respond_tls(
+  connection: owned HttpConnection,
+  response: HttpResponseHead,
+  limits: HttpLimits
+) -[TcpReadiness, TcpStreamIO]> HttpServerRespond {
+  let selected = http_endpoint_apply_reuse(connection, http_response_connection(response))
+  match http_body_write_wire(selected, http_encode_response_head(response)) {
+    HttpConnectionWriteFailed(failed, error) -> {
+      http_endpoint_drop_connection(failed)
+      HttpServerResponseFailed(HttpExchangeBody(error))
+    }
+    HttpConnectionWritten(ready) -> match http_body_writer_open(
+      ready,
+      http_response_body_framing(response),
+      limits,
+      false
+    ) {
+      Err(error) -> HttpServerResponseFailed(HttpExchangeBody(error))
+      Ok(body) -> HttpServerResponseReady(body)
+    }
+  }
+}
+
+--- Begin one request through the installed outbound client policy.
+pub fn http_client_begin(
+  url: Url,
+  request: HttpRequestHead,
+  limits: HttpLimits
+) -[HttpClient]> HttpClientBegin {
+  HttpClient.begin(url, request, limits)
+}
+
+--- Read the response head after finishing the request body.
+pub fn http_client_response(
+  connection: owned HttpConnection,
+  request_method: HttpMethod,
+  limits: HttpLimits
+) -[HttpClient, TcpStreamIO]> HttpClientResponse {
+  HttpClient.response(connection, request_method, limits)
+}
+
+--- Create one listener through the installed inbound server policy.
+pub fn http_server_listen(
+  address: SocketAddress,
+  options: TcpListenOptions
+) -[HttpServer]> HttpServerListen {
+  HttpServer.listen(address, options)
+}
+
+--- Accept and parse one request while returning the listener owner.
+pub fn http_server_accept(
+  listener: owned HttpServerListener,
+  limits: HttpLimits
+) -[HttpServer, TcpListenerIO]> HttpServerAccept {
+  HttpServer.accept(listener, limits)
+}
+
+--- Close and consume an HTTP server listener.
+pub fn http_server_listener_close(
+  listener: owned HttpServerListener
+) -[TcpListenerIO]> Result<nil, TcpError> {
+  let status = listener.drop()
+  if status == 0 { result_ok<nil, TcpError>(nil) }
+  else { result_err<nil, TcpError>(tcp_error_from_platform_status(status)) }
+}
+
+--- Send one response head and return its body writer.
+pub fn http_server_respond(
+  connection: owned HttpConnection,
+  response: HttpResponseHead,
+  limits: HttpLimits
+) -[HttpServer, TcpStreamIO]> HttpServerRespond {
+  HttpServer.respond(connection, response, limits)
+}
+
+--- Interpret `HttpClient` and `HttpBodyIO` through validating outbound TLS.
+pub fn http_client_with_tls<T, E>(
+  trust_roots: Bytes,
+  body: () -[HttpClient, HttpBodyIO, TcpStreamIO, E]> T
+) -[DnsResolve, SecureRandom, TcpConnect, TcpReadiness, TcpStreamIO, Time, E]> T {
+  handle {
+    handle body() {
+      HttpClient.begin(url, request, limits) -> resume(http_client_begin_tls(trust_roots, url, request, limits))
+      HttpClient.response(connection, request_method, limits) -> resume(http_client_response_tls(connection, request_method, limits))
+    }
+  } {
+    HttpBodyIO.read(stream, limit) -> resume(http_body_read_direct(stream, limit))
+    HttpBodyIO.write(stream, data) -> resume(http_body_write_direct(stream, data))
+    HttpBodyIO.finish(stream, trailers) -> resume(http_body_finish_direct(stream, trailers))
+    HttpBodyIO.close(connection) -> resume(http_body_close_connection_direct(connection))
+  }
+}
+
+--- Interpret `HttpServer` and `HttpBodyIO` through validating inbound TLS.
+pub fn http_server_with_tls<T, E>(
+  certificate: Bytes,
+  private_key: Bytes,
+  body: () -[HttpServer, HttpBodyIO, TcpListenerIO, TcpStreamIO, E]> T
+) -[SecureRandom, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO, E]> T {
+  handle {
+    handle body() {
+      HttpServer.listen(address, options) -> resume(http_server_listen_tls(address, options))
+      HttpServer.accept(listener, limits) -> resume(http_server_accept_tls(certificate, private_key, listener, limits))
+      HttpServer.respond(connection, response, limits) -> resume(http_server_respond_tls(connection, response, limits))
+    }
+  } {
+    HttpBodyIO.read(stream, limit) -> resume(http_body_read_direct(stream, limit))
+    HttpBodyIO.write(stream, data) -> resume(http_body_write_direct(stream, data))
+    HttpBodyIO.finish(stream, trailers) -> resume(http_body_finish_direct(stream, trailers))
+    HttpBodyIO.close(connection) -> resume(http_body_close_connection_direct(connection))
+  }
+}
+
+--- Interpret both endpoint authorities and established body I/O through TLS.
+--- Client and server remain distinct effects inside `body`; this combined
+--- scope is for processes that deliberately possess both capabilities.
+pub fn http_with_tls<T, E>(
+  trust_roots: Bytes,
+  certificate: Bytes,
+  private_key: Bytes,
+  body: () -[HttpClient, HttpServer, HttpBodyIO, TcpListenerIO, TcpStreamIO, E]> T
+) -[DnsResolve, SecureRandom, TcpConnect, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO, Time, E]> T {
+  handle {
+    handle {
+      handle body() {
+        HttpClient.begin(url, request, limits) -> resume(http_client_begin_tls(trust_roots, url, request, limits))
+        HttpClient.response(connection, request_method, limits) -> resume(http_client_response_tls(connection, request_method, limits))
+      }
+    } {
+      HttpServer.listen(address, options) -> resume(http_server_listen_tls(address, options))
+      HttpServer.accept(listener, limits) -> resume(http_server_accept_tls(certificate, private_key, listener, limits))
+      HttpServer.respond(connection, response, limits) -> resume(http_server_respond_tls(connection, response, limits))
+    }
+  } {
+    HttpBodyIO.read(stream, limit) -> resume(http_body_read_direct(stream, limit))
+    HttpBodyIO.write(stream, data) -> resume(http_body_write_direct(stream, data))
+    HttpBodyIO.finish(stream, trailers) -> resume(http_body_finish_direct(stream, trailers))
+    HttpBodyIO.close(connection) -> resume(http_body_close_connection_direct(connection))
+  }
+}

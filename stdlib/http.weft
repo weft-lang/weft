@@ -195,6 +195,23 @@ pub type HttpChunkParse {
     HttpChunkFailed(HttpParseError)
 }
 
+--- Prefix parsing of one chunk-size line without buffering its content.
+---
+--- A data outcome reports the exact content length and the bytes consumed by
+--- the size line. The caller can then stream that content incrementally and
+--- validate its trailing CRLF. A terminal outcome includes the validated
+--- trailer section because trailers are part of the zero-chunk boundary.
+pub type HttpChunkHeadParse {
+  --- The current prefix is valid but does not contain a complete boundary.
+  HttpChunkHeadNeedMore,
+    --- One non-terminal chunk begins after `consumed` bytes.
+    HttpChunkHeadData(usize, usize),
+    --- The terminal zero chunk and trailers consume this exact prefix.
+    HttpChunkHeadEnd(HttpHeaders, usize),
+    --- The prefix cannot become a valid chunk boundary.
+    HttpChunkHeadFailed(HttpParseError)
+}
+
 type HttpHeaderParts {
   name: HttpFieldName,
     value: Bytes
@@ -221,6 +238,7 @@ type HttpRequestHeadParts {
     target: HttpRequestTarget,
     version: HttpVersion,
     headers: HttpHeaders,
+    framing: HttpBodyFraming,
     connection: HttpConnectionReuse
 }
 
@@ -229,6 +247,7 @@ type HttpResponseHeadParts {
     status: HttpStatus,
     reason: Bytes,
     headers: HttpHeaders,
+    framing: HttpBodyFraming,
     connection: HttpConnectionReuse
 }
 
@@ -447,6 +466,11 @@ pub fn http_limits(
 --- Return the conservative alpha parser limits.
 pub fn http_default_limits() -> HttpLimits {
   http_limits(8192, 8192, 65536, 100, 16777216, 1024, 16384, 32).unwrap()
+}
+
+--- Return the configured cumulative body-byte limit.
+pub fn http_limits_body_bytes(limits: HttpLimits) -> usize {
+  http_i64_to_usize(http_limits_parts(limits).body_bytes)
 }
 
 --- Return the exact method token.
@@ -1295,6 +1319,7 @@ pub fn http_request_head_new(
                 target: target,
                 version: version,
                 headers: headers,
+                framing: framing,
                 connection: connection
             }))
           }
@@ -1325,6 +1350,7 @@ pub fn http_response_head_new(
               status: status,
               reason: reason,
               headers: headers,
+              framing: framing,
               connection: connection
           }))
         }
@@ -1359,6 +1385,7 @@ pub fn http_parse_request_head(source: [u8], limits: HttpLimits) -> HttpRequestH
                     target: target,
                     version: version,
                     headers: headers,
+                    framing: framing,
                     connection: connection
                 }), framing, http_i64_to_usize(consumed))
               }
@@ -1394,6 +1421,7 @@ pub fn http_parse_response_head(source: [u8], request_method: HttpMethod, limits
                 status: status,
                 reason: reason,
                 headers: headers,
+                framing: framing,
                 connection: connection
             }), framing, http_i64_to_usize(consumed))
           }
@@ -1415,6 +1443,11 @@ pub fn http_request_version(head: HttpRequestHead) -> HttpVersion { http_request
 --- Return a request head's immutable ordered fields.
 pub fn http_request_headers(head: HttpRequestHead) -> HttpHeaders { http_request_parts(head).headers }
 
+--- Return the body framing derived while validating this request head.
+pub fn http_request_body_framing(head: HttpRequestHead) -> HttpBodyFraming {
+  http_request_parts(head).framing
+}
+
 --- Return a request head's derived connection policy.
 pub fn http_request_connection(head: HttpRequestHead) -> HttpConnectionReuse { http_request_parts(head).connection }
 
@@ -1429,6 +1462,11 @@ pub fn http_response_reason(head: HttpResponseHead) -> Bytes { http_response_par
 
 --- Return a response head's immutable ordered fields.
 pub fn http_response_headers(head: HttpResponseHead) -> HttpHeaders { http_response_parts(head).headers }
+
+--- Return the body framing derived while validating this response head.
+pub fn http_response_body_framing(head: HttpResponseHead) -> HttpBodyFraming {
+  http_response_parts(head).framing
+}
 
 --- Return a response head's derived connection policy.
 pub fn http_response_connection(head: HttpResponseHead) -> HttpConnectionReuse { http_response_parts(head).connection }
@@ -1637,18 +1675,18 @@ fn http_trailers_safe(headers: HttpHeaders) -> bool {
   safe
 }
 
---- Parse one chunked-transfer item from a possibly incomplete byte prefix.
-pub fn http_parse_chunk(source: [u8], limits: HttpLimits) -> HttpChunkParse {
+--- Parse one chunk-size boundary without requiring its content bytes.
+pub fn http_parse_chunk_head(source: [u8], limits: HttpLimits) -> HttpChunkHeadParse {
   let configured = http_limits_parts(limits)
   match http_find_line(source, 0, configured.chunk_line_bytes, 3) {
-    HttpLineNeedMore -> HttpChunkNeedMore
-    HttpLineFailed(error) -> HttpChunkFailed(error)
+    HttpLineNeedMore -> HttpChunkHeadNeedMore
+    HttpLineFailed(error) -> HttpChunkHeadFailed(error)
     HttpLineReady(line_end) -> {
       let mut digits_end = 0
       while digits_end < line_end and http_hex_value(http_byte(source, digits_end)) >= 0 {
         digits_end = digits_end + 1
       }
-      if digits_end <= 0 { HttpChunkFailed(HttpInvalidChunkSize(0)) }
+      if digits_end <= 0 { HttpChunkHeadFailed(HttpInvalidChunkSize(0)) }
       else {
         let mut position = 0
         let mut size = 0
@@ -1659,10 +1697,10 @@ pub fn http_parse_chunk(source: [u8], limits: HttpLimits) -> HttpChunkParse {
           else { if size > (9223372036854775807 - digit) / 16 { invalid = position }
             else { size = size * 16 + digit; position = position + 1 } }
         }
-        if invalid >= 0 { HttpChunkFailed(HttpInvalidChunkSize(invalid)) }
+        if invalid >= 0 { HttpChunkHeadFailed(HttpInvalidChunkSize(invalid)) }
         else { if not http_validate_chunk_extensions(source, digits_end, line_end) {
-            HttpChunkFailed(HttpInvalidChunkSize(digits_end))
-          } else { if size > configured.body_bytes { HttpChunkFailed(HttpBodyTooLarge(0)) }
+            HttpChunkHeadFailed(HttpInvalidChunkSize(digits_end))
+          } else { if size > configured.body_bytes { HttpChunkHeadFailed(HttpBodyTooLarge(0)) }
             else {
               let data_start = line_end + 2
               if size == 0 {
@@ -1670,26 +1708,41 @@ pub fn http_parse_chunk(source: [u8], limits: HttpLimits) -> HttpChunkParse {
                   source, data_start, configured.field_line_bytes,
                   configured.trailer_bytes, configured.trailer_count, true
                 ) {
-                  HttpHeaderSectionNeedMore -> HttpChunkNeedMore
-                  HttpHeaderSectionFailed(error) -> HttpChunkFailed(error)
+                  HttpHeaderSectionNeedMore -> HttpChunkHeadNeedMore
+                  HttpHeaderSectionFailed(error) -> HttpChunkHeadFailed(error)
                   HttpHeaderSectionReady(trailers, consumed) -> if http_trailers_safe(trailers) {
-                    HttpChunkReady(HttpChunkEnd(trailers), http_i64_to_usize(consumed))
-                  } else { HttpChunkFailed(HttpForbiddenTrailer(data_start)) }
+                    HttpChunkHeadEnd(trailers, http_i64_to_usize(consumed))
+                  } else { HttpChunkHeadFailed(HttpForbiddenTrailer(data_start)) }
                 }
               } else {
-                let needed = data_start + size + 2
-                if http_usize_to_i64(source.len) < needed { HttpChunkNeedMore }
-                else { if http_byte(source, data_start + size) != 13 or http_byte(source, data_start + size + 1) != 10 {
-                    HttpChunkFailed(HttpInvalidChunkTerminator(data_start + size))
-                  } else {
-                    HttpChunkReady(
-                      HttpChunkData(http_copy_range(source, data_start, data_start + size)),
-                      http_i64_to_usize(needed)
-                    )
-                  } }
+                HttpChunkHeadData(http_i64_to_usize(size), http_i64_to_usize(data_start))
               }
             } } }
       }
+    }
+  }
+}
+
+--- Parse one chunked-transfer item from a possibly incomplete byte prefix.
+pub fn http_parse_chunk(source: [u8], limits: HttpLimits) -> HttpChunkParse {
+  match http_parse_chunk_head(source, limits) {
+    HttpChunkHeadNeedMore -> HttpChunkNeedMore
+    HttpChunkHeadFailed(error) -> HttpChunkFailed(error)
+    HttpChunkHeadEnd(trailers, consumed) -> HttpChunkReady(HttpChunkEnd(trailers), consumed)
+    HttpChunkHeadData(size, consumed) -> {
+      let data_start = http_usize_to_i64(consumed)
+      let count = http_usize_to_i64(size)
+      let needed = data_start + count + 2
+      if http_usize_to_i64(source.len) < needed { HttpChunkNeedMore }
+      else { if http_byte(source, data_start + count) != 13 or
+          http_byte(source, data_start + count + 1) != 10 {
+          HttpChunkFailed(HttpInvalidChunkTerminator(data_start + count))
+        } else {
+          HttpChunkReady(
+            HttpChunkData(http_copy_range(source, data_start, data_start + count)),
+            http_i64_to_usize(needed)
+          )
+        } }
     }
   }
 }

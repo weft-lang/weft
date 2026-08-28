@@ -1,0 +1,969 @@
+-- stdlib/http_stream.weft — owned bounded HTTP/1 body transport
+--
+-- A body stream owns the live TLS connection until its framing boundary is
+-- proven. Fixed-length and chunked completion can return a reusable
+-- connection; close-delimited and explicit-close messages consume it. Chunk
+-- data is delivered incrementally, so a large wire chunk is never hidden in
+-- a whole-body buffer.
+
+use stdlib/bytes.{Bytes, bytes_empty, bytes_from_slice, bytes_from_vector, bytes_get, bytes_is_empty, bytes_len, bytes_to_vector}
+use stdlib/drop.{Drop}
+use stdlib/http.{HttpBodyFraming, HttpBodyTooLarge, HttpChunkHeadData, HttpChunkHeadEnd, HttpChunkHeadFailed, HttpChunkHeadNeedMore, HttpChunked, HttpConnectTunnel, HttpConnectionClose, HttpConnectionPersistent, HttpConnectionReuse, HttpContentLength, HttpForbiddenTrailer, HttpHeaders, HttpInvalidChunkTerminator, HttpLimits, HttpNoBody, HttpParseError, HttpProtocolSwitch, HttpUntilConnectionClose, http_encode_chunk, http_encode_chunk_end, http_headers_empty, http_headers_len, http_limits_body_bytes, http_parse_chunk_head}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/tcp.{TcpReadiness, TcpStreamIO}
+use stdlib/tls_stream.{TlsStream, TlsStreamError, TlsStreamInvalidProgress, TlsStreamRead, TlsStreamReadClosed, TlsStreamReadData, TlsStreamReadFailed, TlsStreamWrite, TlsStreamWriteFailed, TlsStreamWrote, tls_stream_close, tls_stream_read, tls_stream_write}
+use stdlib/vector.{vector_get_in_bounds, vector_len, vector_push, vector_with_capacity}
+use stdlib/vector_type.{Vector}
+
+--- A bounded body operation failure.
+pub type HttpBodyError {
+  --- The TLS transport failed while preserving the body owner.
+  HttpBodyTransport(TlsStreamError),
+    --- The HTTP framing parser rejected the wire prefix.
+    HttpBodyProtocol(HttpParseError),
+    --- A caller requested an empty or overlarge plaintext fragment.
+    HttpBodyFragmentLimit(usize),
+    --- The peer closed before a fixed or chunked body boundary was complete.
+    HttpBodyUnexpectedEof(usize),
+    --- A write would exceed the exact declared Content-Length.
+    HttpBodyWriteOverflow(usize, usize),
+    --- A fixed-length writer was finished with bytes still outstanding.
+    HttpBodyWriteIncomplete(usize),
+    --- The operation does not apply to this stream direction.
+    HttpBodyWrongDirection,
+    --- HTTP/1 switching and tunnel framing require their later protocol owner.
+    HttpBodyUnsupportedUpgrade(HttpBodyFraming)
+}
+
+--- One established HTTP/1 TLS connection between message boundaries.
+---
+--- A connection is returned only after the body framing boundary is proven.
+--- Dropping it closes the underlying TLS/TCP resource exactly once.
+pub type HttpConnection = opaque(owned TlsStream, Vector<u8>, i64, bool)
+
+type HttpBodyState {
+  HttpBodyReadNone,
+    HttpBodyReadFixed(i64),
+    HttpBodyReadChunkHead(i64),
+    HttpBodyReadChunkData(i64, i64),
+    HttpBodyReadChunkTerminator(i64),
+    HttpBodyReadUntilClose(i64),
+    HttpBodyWriteNone,
+    HttpBodyWriteFixed(i64),
+    HttpBodyWriteChunked(i64),
+    HttpBodyWriteUntilClose(i64)
+}
+
+--- One owned request or response body while its wire boundary is active.
+---
+--- Every operation moves the stream and returns its unique successor. Drop
+--- closes an incomplete message rather than returning a reusable connection.
+pub type HttpBodyStream = opaque(owned HttpConnection, HttpBodyState, HttpLimits, bool)
+
+--- One bounded read outcome.
+pub type HttpBodyReadOutcome {
+  --- A non-empty content fragment arrived with the successor stream.
+  HttpBodyReadData(owned HttpBodyStream, Bytes),
+    --- The body ended and the connection is safe for another HTTP message.
+    HttpBodyReadEnd(owned HttpConnection, HttpHeaders),
+    --- The body ended on a connection that was then consumed and closed.
+    HttpBodyReadEndClosed(HttpHeaders),
+    --- Reading failed without fabricating or losing the stream owner.
+    HttpBodyReadFailed(owned HttpBodyStream, HttpBodyError),
+    --- Body bytes completed, but authenticated connection close failed.
+    HttpBodyReadCloseFailed(HttpBodyError)
+}
+
+--- One bounded write outcome.
+pub type HttpBodyWriteOutcome {
+  --- The complete input fragment was accepted with the successor stream.
+  HttpBodyWrote(owned HttpBodyStream, usize),
+    --- Writing failed without fabricating or losing the stream owner.
+    HttpBodyWriteFailed(owned HttpBodyStream, HttpBodyError)
+}
+
+--- Completion of one outbound body.
+pub type HttpBodyFinishOutcome {
+  --- The exact body boundary was written and the connection remains usable.
+  HttpBodyFinished(owned HttpConnection),
+    --- The exact body boundary was written and the connection was then closed.
+    HttpBodyFinishedClosed,
+    --- Completion failed while returning the stream for explicit policy.
+    HttpBodyFinishFailed(owned HttpBodyStream, HttpBodyError),
+    --- The boundary completed, but authenticated connection close failed.
+    HttpBodyFinishCloseFailed(HttpBodyError)
+}
+
+--- Transport interpretation for owned body operations.
+---
+--- Production installs this through `http_body_with_tls`; future mock/replay
+--- handlers consume the same typed stream transitions without network access.
+pub effect HttpBodyIO {
+  --- Read one bounded content fragment or terminal body boundary.
+  fn read(stream: owned HttpBodyStream, limit: usize) -> HttpBodyReadOutcome
+  --- Write one bounded content fragment.
+  fn write(stream: owned HttpBodyStream, data: Bytes) -> HttpBodyWriteOutcome
+  --- Finish an outbound body, supplying trailers only for chunked framing.
+  fn finish(stream: owned HttpBodyStream, trailers: HttpHeaders) -> HttpBodyFinishOutcome
+  --- Close and consume an idle connection.
+  fn close(connection: owned HttpConnection) -> Result<nil, HttpBodyError>
+}
+
+fn http_body_usize_to_i64(value: usize) -> i64 {
+  __u64_to_i64(__usize_to_u64(value))
+}
+
+fn http_body_i64_to_usize(value: i64) -> usize {
+  __i64_to_usize(if value < 0 { 0 } else { value })
+}
+
+fn http_body_fragment_limit() -> i64 { 16384 }
+
+fn http_connection_wrap(
+  transport: owned TlsStream,
+  buffered: Vector<u8>,
+  offset: i64,
+  reusable: bool
+) -[TcpStreamIO]> owned HttpConnection {
+  HttpConnection((transport, buffered, offset, reusable))
+}
+
+pub (package) fn http_connection_from_tls(
+  transport: owned TlsStream,
+  buffered: Vector<u8>,
+  offset: i64,
+  reuse: HttpConnectionReuse
+) -[TcpStreamIO]> owned HttpConnection {
+  http_connection_wrap(
+    transport,
+    buffered,
+    offset,
+    match reuse { HttpConnectionPersistent -> true HttpConnectionClose -> false }
+  )
+}
+
+impl Drop for HttpConnection {
+  fn drop(self) -[TcpStreamIO]> i64 {
+    match self {
+      HttpConnection((transport, buffered, offset, reusable)) -> transport.drop()
+    }
+  }
+}
+
+fn http_body_stream_wrap(
+  connection: owned HttpConnection,
+  state: HttpBodyState,
+  limits: HttpLimits,
+  close_at_end: bool
+) -[TcpStreamIO]> owned HttpBodyStream {
+  HttpBodyStream((connection, state, limits, close_at_end))
+}
+
+impl Drop for HttpBodyStream {
+  fn drop(self) -[TcpStreamIO]> i64 {
+    match self {
+      HttpBodyStream((connection, state, limits, close_at_end)) -> connection.drop()
+    }
+  }
+}
+
+fn http_body_limit_i64(limits: HttpLimits) -> i64 {
+  http_body_usize_to_i64(http_limits_body_bytes(limits))
+}
+
+pub (package) fn http_body_buffer_available(connection: borrow HttpConnection) -> i64 {
+  match connection {
+    HttpConnection((transport, buffered, offset, reusable)) -> vector_len<u8>(buffered) - offset
+  }
+}
+
+fn http_body_buffer_byte(connection: borrow HttpConnection, relative: i64) -> i64 {
+  match connection {
+    HttpConnection((transport, buffered, offset, reusable)) -> __u64_to_i64(__u8_to_u64(vector_get_in_bounds<u8>(buffered, offset + relative)))
+  }
+}
+
+pub (package) fn http_body_buffer_copy(connection: borrow HttpConnection, count: i64) -> Bytes {
+  match connection {
+    HttpConnection((transport, buffered, offset, reusable)) -> {
+      let out = vector_with_capacity<u8>(count)
+      for index in 0..count {
+        vector_push<u8>(out, vector_get_in_bounds<u8>(buffered, offset + index))
+      }
+      bytes_from_vector(out)
+    }
+  }
+}
+
+pub (package) fn http_body_buffered_bytes(connection: borrow HttpConnection) -> Bytes {
+  match connection {
+    HttpConnection((transport, buffered, offset, reusable)) -> {
+      let count = vector_len<u8>(buffered) - offset
+      let out = vector_with_capacity<u8>(if count > 0 { count } else { 0 })
+      for index in 0..count {
+        vector_push<u8>(out, vector_get_in_bounds<u8>(buffered, offset + index))
+      }
+      bytes_from_vector(out)
+    }
+  }
+}
+
+pub (package) type HttpConnectionSnapshot {
+  HttpConnectionSnapshotted(owned HttpConnection, Bytes)
+}
+
+pub (package) fn http_connection_snapshot(
+  connection: owned HttpConnection
+) -[TcpStreamIO]> HttpConnectionSnapshot {
+  match connection {
+    HttpConnection((transport, buffered, offset, reusable)) -> {
+      let count = vector_len<u8>(buffered) - offset
+      let out = vector_with_capacity<u8>(if count > 0 { count } else { 0 })
+      for index in 0..count {
+        vector_push<u8>(out, vector_get_in_bounds<u8>(buffered, offset + index))
+      }
+      HttpConnectionSnapshotted(
+        http_connection_wrap(transport, buffered, offset, reusable),
+        bytes_from_vector(out)
+      )
+    }
+  }
+}
+
+pub (package) fn http_body_connection_advance(
+  connection: owned HttpConnection,
+  count: i64
+) -[TcpStreamIO]> owned HttpConnection {
+  match connection {
+    HttpConnection((transport, buffered, offset, reusable)) -> http_connection_wrap(
+      transport,
+      buffered,
+      offset + count,
+      reusable
+    )
+  }
+}
+
+fn http_body_connection_take(
+  connection: owned HttpConnection,
+  count: i64
+) -[TcpStreamIO]> (owned HttpConnection, Bytes) {
+  let data = http_body_buffer_copy(connection, count)
+  (http_body_connection_advance(connection, count), data)
+}
+
+fn http_body_connection_append(
+  connection: owned HttpConnection,
+  data: Bytes
+) -[TcpStreamIO]> owned HttpConnection {
+  match connection {
+    HttpConnection((transport, buffered, offset, reusable)) -> {
+      let values = bytes_to_vector(data)
+      let remaining = vector_len<u8>(buffered) - offset
+      let compact = vector_with_capacity<u8>(remaining + vector_len<u8>(values))
+      for index in 0..remaining {
+        vector_push<u8>(compact, vector_get_in_bounds<u8>(buffered, offset + index))
+      }
+      for index in 0..vector_len<u8>(values) {
+        vector_push<u8>(compact, vector_get_in_bounds<u8>(values, index))
+      }
+      http_connection_wrap(transport, compact, 0, reusable)
+    }
+  }
+}
+
+fn http_body_connection_compact(
+  connection: owned HttpConnection
+) -[TcpStreamIO]> owned HttpConnection {
+  match connection {
+    HttpConnection((transport, buffered, offset, reusable)) -> {
+      let count = vector_len<u8>(buffered) - offset
+      let compact = vector_with_capacity<u8>(if count > 0 { count } else { 0 })
+      for index in 0..count {
+        vector_push<u8>(compact, vector_get_in_bounds<u8>(buffered, offset + index))
+      }
+      http_connection_wrap(transport, compact, 0, reusable)
+    }
+  }
+}
+
+fn http_body_connection_can_reuse(connection: borrow HttpConnection) -> bool {
+  match connection { HttpConnection((transport, buffered, offset, reusable)) -> reusable }
+}
+
+pub (package) fn http_connection_disallow_reuse(
+  connection: owned HttpConnection
+) -[TcpStreamIO]> owned HttpConnection {
+  match connection {
+    HttpConnection((transport, buffered, offset, reusable)) -> http_connection_wrap(
+      transport,
+      buffered,
+      offset,
+      false
+    )
+  }
+}
+
+pub (package) fn http_body_reader_open(
+  connection: owned HttpConnection,
+  framing: HttpBodyFraming,
+  limits: HttpLimits,
+  close_at_end: bool
+) -[TcpStreamIO]> Result<owned HttpBodyStream, HttpBodyError> {
+  match framing {
+    HttpNoBody -> result_ok<owned HttpBodyStream, HttpBodyError>(
+      http_body_stream_wrap(connection, HttpBodyReadNone, limits, close_at_end)
+    )
+    HttpContentLength(count) -> result_ok<owned HttpBodyStream, HttpBodyError>(
+      http_body_stream_wrap(
+      connection,
+      HttpBodyReadFixed(http_body_usize_to_i64(count)),
+      limits,
+      close_at_end
+    )
+    )
+    HttpChunked -> result_ok<owned HttpBodyStream, HttpBodyError>(
+      http_body_stream_wrap(connection, HttpBodyReadChunkHead(0), limits, close_at_end)
+    )
+    HttpUntilConnectionClose -> result_ok<owned HttpBodyStream, HttpBodyError>(
+      http_body_stream_wrap(connection, HttpBodyReadUntilClose(0), limits, true)
+    )
+    HttpProtocolSwitch -> result_err<owned HttpBodyStream, HttpBodyError>(
+      HttpBodyUnsupportedUpgrade(HttpProtocolSwitch)
+    )
+    HttpConnectTunnel -> result_err<owned HttpBodyStream, HttpBodyError>(
+      HttpBodyUnsupportedUpgrade(HttpConnectTunnel)
+    )
+  }
+}
+
+pub (package) fn http_body_writer_open(
+  connection: owned HttpConnection,
+  framing: HttpBodyFraming,
+  limits: HttpLimits,
+  close_at_end: bool
+) -[TcpStreamIO]> Result<owned HttpBodyStream, HttpBodyError> {
+  match framing {
+    HttpNoBody -> result_ok<owned HttpBodyStream, HttpBodyError>(
+      http_body_stream_wrap(connection, HttpBodyWriteNone, limits, close_at_end)
+    )
+    HttpContentLength(count) -> result_ok<owned HttpBodyStream, HttpBodyError>(
+      http_body_stream_wrap(
+      connection,
+      HttpBodyWriteFixed(http_body_usize_to_i64(count)),
+      limits,
+      close_at_end
+    )
+    )
+    HttpChunked -> result_ok<owned HttpBodyStream, HttpBodyError>(
+      http_body_stream_wrap(connection, HttpBodyWriteChunked(0), limits, close_at_end)
+    )
+    HttpUntilConnectionClose -> result_ok<owned HttpBodyStream, HttpBodyError>(
+      http_body_stream_wrap(connection, HttpBodyWriteUntilClose(0), limits, true)
+    )
+    framing -> result_err<owned HttpBodyStream, HttpBodyError>(HttpBodyUnsupportedUpgrade(framing))
+  }
+}
+
+pub (package) type HttpConnectionReceive {
+  HttpConnectionReceived(owned HttpConnection),
+    HttpConnectionPeerClosed(owned HttpConnection),
+    HttpConnectionReceiveFailed(owned HttpConnection, HttpBodyError)
+}
+
+pub (package) fn http_body_connection_receive(
+  connection: owned HttpConnection,
+  limit: i64
+) -[TcpReadiness, TcpStreamIO]> HttpConnectionReceive {
+  match connection {
+    HttpConnection((transport, buffered, offset, reusable)) -> match tls_stream_read(transport, http_body_i64_to_usize(limit)) {
+      TlsStreamReadData(transport, data) -> HttpConnectionReceived(
+        http_body_connection_append(
+        http_connection_wrap(transport, buffered, offset, reusable),
+        data
+      )
+      )
+      TlsStreamReadClosed(transport) -> HttpConnectionPeerClosed(
+        http_connection_wrap(transport, buffered, offset, false)
+      )
+      TlsStreamReadFailed(transport, error) -> HttpConnectionReceiveFailed(
+        http_connection_wrap(transport, buffered, offset, false),
+        HttpBodyTransport(error)
+      )
+    }
+  }
+}
+
+pub (package) fn http_body_close_connection_direct(
+  connection: owned HttpConnection
+) -[TcpReadiness, TcpStreamIO]> Result<nil, HttpBodyError> {
+  match connection {
+    HttpConnection((transport, buffered, offset, reusable)) -> match tls_stream_close(transport) {
+      Err(error) -> result_err<nil, HttpBodyError>(HttpBodyTransport(error))
+      Ok(done) -> result_ok<nil, HttpBodyError>(nil)
+    }
+  }
+}
+
+fn http_body_complete_read(
+  connection: owned HttpConnection,
+  trailers: HttpHeaders,
+  close_at_end: bool
+) -[TcpReadiness, TcpStreamIO]> HttpBodyReadOutcome {
+  let close = close_at_end or not http_body_connection_can_reuse(connection)
+  if close {
+    match http_body_close_connection_direct(connection) {
+      Err(error) -> HttpBodyReadCloseFailed(error)
+      Ok(done) -> HttpBodyReadEndClosed(trailers)
+    }
+  } else {
+    HttpBodyReadEnd(http_body_connection_compact(connection), trailers)
+  }
+}
+
+pub (package) fn http_body_read_direct(
+  stream: owned HttpBodyStream,
+  limit: usize
+) -[TcpReadiness, TcpStreamIO]> HttpBodyReadOutcome {
+  let requested = http_body_usize_to_i64(limit)
+  if requested <= 0 or requested > http_body_fragment_limit() {
+    HttpBodyReadFailed(stream, HttpBodyFragmentLimit(limit))
+  } else {
+    let mut current: owned HttpBodyStream = stream
+    loop {
+      match current {
+        HttpBodyStream((connection, state, limits, close_at_end)) -> match state {
+          HttpBodyReadNone -> break (http_body_complete_read(
+            connection,
+            http_headers_empty(),
+            close_at_end
+          ))
+          HttpBodyReadFixed(remaining) -> {
+            if remaining == 0 {
+              break (http_body_complete_read(
+                connection,
+                http_headers_empty(),
+                close_at_end
+              ))
+            } else {
+              let available = http_body_buffer_available(connection)
+              if available > 0 {
+                let count = if available < requested { available } else { requested }
+                let take = if count < remaining { count } else { remaining }
+                let (connection, data) = http_body_connection_take(connection, take)
+                break (HttpBodyReadData(
+                  http_body_stream_wrap(
+                  connection,
+                  HttpBodyReadFixed(remaining - take),
+                  limits,
+                  close_at_end
+                ),
+                  data
+                ))
+              } else {
+                match http_body_connection_receive(
+                  connection,
+                  if remaining < requested { remaining } else { requested }
+                ) {
+                  HttpConnectionReceived(connection) -> {
+                    current = http_body_stream_wrap(
+                      connection,
+                      HttpBodyReadFixed(remaining),
+                      limits,
+                      close_at_end
+                    )
+                  }
+                  HttpConnectionPeerClosed(connection) -> break (HttpBodyReadFailed(
+                    http_body_stream_wrap(
+                    connection,
+                    HttpBodyReadFixed(remaining),
+                    limits,
+                    true
+                  ),
+                    HttpBodyUnexpectedEof(http_body_i64_to_usize(remaining))
+                  ))
+                  HttpConnectionReceiveFailed(connection, error) -> break (HttpBodyReadFailed(
+                    http_body_stream_wrap(
+                    connection,
+                    HttpBodyReadFixed(remaining),
+                    limits,
+                    true
+                  ),
+                    error
+                  ))
+                }
+              }
+            }
+          }
+          HttpBodyReadChunkHead(total) -> {
+            match connection {
+              HttpConnection((transport, buffered, offset, reusable)) -> {
+                let source_owner = vector_with_capacity<u8>(vector_len<u8>(buffered) - offset)
+                for index in offset..vector_len<u8>(buffered) {
+                  vector_push<u8>(source_owner, vector_get_in_bounds<u8>(buffered, index))
+                }
+                let parsed = http_parse_chunk_head(source_owner[..], limits)
+                let connection = http_connection_wrap(
+                  transport,
+                  buffered,
+                  offset,
+                  reusable
+                )
+                match parsed {
+                  HttpChunkHeadFailed(error) -> break (HttpBodyReadFailed(
+                    http_body_stream_wrap(connection, HttpBodyReadChunkHead(total), limits, true),
+                    HttpBodyProtocol(error)
+                  ))
+                  HttpChunkHeadEnd(trailers, consumed) -> {
+                    let advanced = http_body_connection_advance(connection, http_body_usize_to_i64(consumed))
+                    break (http_body_complete_read(advanced, trailers, close_at_end))
+                  }
+                  HttpChunkHeadData(size, consumed) -> {
+                    let count = http_body_usize_to_i64(size)
+                    if total > http_body_limit_i64(limits) - count {
+                      break (HttpBodyReadFailed(
+                        http_body_stream_wrap(connection, HttpBodyReadChunkHead(total), limits, true),
+                        HttpBodyProtocol(HttpBodyTooLarge(total))
+                      ))
+                    } else {
+                      current = http_body_stream_wrap(
+                        http_body_connection_advance(connection, http_body_usize_to_i64(consumed)),
+                        HttpBodyReadChunkData(count, total),
+                        limits,
+                        close_at_end
+                      )
+                    }
+                  }
+                  HttpChunkHeadNeedMore -> match http_body_connection_receive(
+                    connection,
+                    http_body_fragment_limit()
+                  ) {
+                    HttpConnectionReceived(received) -> {
+                      current = http_body_stream_wrap(
+                        received,
+                        HttpBodyReadChunkHead(total),
+                        limits,
+                        close_at_end
+                      )
+                    }
+                    HttpConnectionPeerClosed(received) -> break (HttpBodyReadFailed(
+                      http_body_stream_wrap(received, HttpBodyReadChunkHead(total), limits, true),
+                      HttpBodyUnexpectedEof(http_body_i64_to_usize(1))
+                    ))
+                    HttpConnectionReceiveFailed(received, error) -> break (HttpBodyReadFailed(
+                      http_body_stream_wrap(received, HttpBodyReadChunkHead(total), limits, true),
+                      error
+                    ))
+                  }
+                }
+              }
+            }
+          }
+          HttpBodyReadChunkData(remaining, total) -> {
+            if remaining == 0 {
+              current = http_body_stream_wrap(
+                connection,
+                HttpBodyReadChunkTerminator(total),
+                limits,
+                close_at_end
+              )
+            } else {
+              let available = http_body_buffer_available(connection)
+              if available > 0 {
+                let count = if available < requested { available } else { requested }
+                let take = if count < remaining { count } else { remaining }
+                let (connection, data) = http_body_connection_take(connection, take)
+                break (HttpBodyReadData(
+                  http_body_stream_wrap(
+                  connection,
+                  HttpBodyReadChunkData(remaining - take, total + take),
+                  limits,
+                  close_at_end
+                ),
+                  data
+                ))
+              } else {
+                match http_body_connection_receive(
+                  connection,
+                  if remaining < requested { remaining } else { requested }
+                ) {
+                  HttpConnectionReceived(connection) -> {
+                    current = http_body_stream_wrap(
+                      connection,
+                      HttpBodyReadChunkData(remaining, total),
+                      limits,
+                      close_at_end
+                    )
+                  }
+                  HttpConnectionPeerClosed(connection) -> break (HttpBodyReadFailed(
+                    http_body_stream_wrap(connection, HttpBodyReadChunkData(remaining, total), limits, true),
+                    HttpBodyUnexpectedEof(http_body_i64_to_usize(remaining))
+                  ))
+                  HttpConnectionReceiveFailed(connection, error) -> break (HttpBodyReadFailed(
+                    http_body_stream_wrap(connection, HttpBodyReadChunkData(remaining, total), limits, true),
+                    error
+                  ))
+                }
+              }
+            }
+          }
+          HttpBodyReadChunkTerminator(total) -> {
+            let available = http_body_buffer_available(connection)
+            if available >= 2 {
+              if http_body_buffer_byte(connection, 0) != 13 or
+                http_body_buffer_byte(connection, 1) != 10 {
+                break (HttpBodyReadFailed(
+                  http_body_stream_wrap(connection, HttpBodyReadChunkTerminator(total), limits, true),
+                  HttpBodyProtocol(HttpInvalidChunkTerminator(total))
+                ))
+              } else {
+                current = http_body_stream_wrap(
+                  http_body_connection_advance(connection, 2),
+                  HttpBodyReadChunkHead(total),
+                  limits,
+                  close_at_end
+                )
+              }
+            } else {
+              match http_body_connection_receive(connection, http_body_fragment_limit()) {
+                HttpConnectionReceived(connection) -> {
+                  current = http_body_stream_wrap(
+                    connection,
+                    HttpBodyReadChunkTerminator(total),
+                    limits,
+                    close_at_end
+                  )
+                }
+                HttpConnectionPeerClosed(connection) -> break (HttpBodyReadFailed(
+                  http_body_stream_wrap(connection, HttpBodyReadChunkTerminator(total), limits, true),
+                  HttpBodyUnexpectedEof(http_body_i64_to_usize(2 - available))
+                ))
+                HttpConnectionReceiveFailed(connection, error) -> break (HttpBodyReadFailed(
+                  http_body_stream_wrap(connection, HttpBodyReadChunkTerminator(total), limits, true),
+                  error
+                ))
+              }
+            }
+          }
+          HttpBodyReadUntilClose(total) -> {
+            let available = http_body_buffer_available(connection)
+            if available > 0 {
+              let count = if available < requested { available } else { requested }
+              if total > http_body_limit_i64(limits) - count {
+                break (HttpBodyReadFailed(
+                  http_body_stream_wrap(connection, HttpBodyReadUntilClose(total), limits, true),
+                  HttpBodyProtocol(HttpBodyTooLarge(total))
+                ))
+              } else {
+                let (connection, data) = http_body_connection_take(connection, count)
+                break (HttpBodyReadData(
+                  http_body_stream_wrap(connection, HttpBodyReadUntilClose(total + count), limits, true),
+                  data
+                ))
+              }
+            } else {
+              match http_body_connection_receive(connection, requested) {
+                HttpConnectionReceived(connection) -> {
+                  current = http_body_stream_wrap(
+                    connection,
+                    HttpBodyReadUntilClose(total),
+                    limits,
+                    true
+                  )
+                }
+                HttpConnectionPeerClosed(connection) -> break (http_body_complete_read(
+                  connection,
+                  http_headers_empty(),
+                  true
+                ))
+                HttpConnectionReceiveFailed(connection, error) -> break (HttpBodyReadFailed(
+                  http_body_stream_wrap(connection, HttpBodyReadUntilClose(total), limits, true),
+                  error
+                ))
+              }
+            }
+          }
+          _ -> break (HttpBodyReadFailed(
+            http_body_stream_wrap(connection, state, limits, close_at_end),
+            HttpBodyWrongDirection
+          ))
+        }
+      }
+    }
+  }
+}
+
+fn http_body_bytes_suffix(values: Bytes, offset: i64, count: i64) -> Bytes {
+  let source = bytes_to_vector(values)
+  bytes_from_slice(source[http_body_i64_to_usize(offset)..http_body_i64_to_usize(offset + count)])
+}
+
+pub (package) type HttpConnectionWrite {
+  HttpConnectionWritten(owned HttpConnection),
+    HttpConnectionWriteFailed(owned HttpConnection, HttpBodyError)
+}
+
+pub (package) fn http_body_write_wire(
+  connection: owned HttpConnection,
+  wire: Bytes
+) -[TcpReadiness, TcpStreamIO]> HttpConnectionWrite {
+  let total = bytes_len(wire)
+  let mut position = 0
+  let mut current: owned HttpConnection = connection
+  loop {
+    if position >= total { break (HttpConnectionWritten(current)) }
+    else {
+      let count = if total - position < http_body_fragment_limit() {
+        total - position
+      } else {
+        http_body_fragment_limit()
+      }
+      let fragment = http_body_bytes_suffix(wire, position, count)
+      match current {
+        HttpConnection((transport, buffered, offset, reusable)) -> match tls_stream_write(transport, fragment) {
+          TlsStreamWriteFailed(returned, error) -> break (HttpConnectionWriteFailed(
+            http_connection_wrap(returned, buffered, offset, false),
+            HttpBodyTransport(error)
+          ))
+          TlsStreamWrote(transport, wrote) -> {
+            let progress = http_body_usize_to_i64(wrote)
+            if progress <= 0 or progress > count {
+              break (HttpConnectionWriteFailed(
+                http_connection_wrap(transport, buffered, offset, false),
+                HttpBodyTransport(TlsStreamInvalidProgress)
+              ))
+            } else {
+              current = http_connection_wrap(
+                transport,
+                buffered,
+                offset,
+                reusable
+              )
+              position = position + progress
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+pub (package) fn http_body_write_direct(
+  stream: owned HttpBodyStream,
+  data: Bytes
+) -[TcpReadiness, TcpStreamIO]> HttpBodyWriteOutcome {
+  let count = bytes_len(data)
+  if count < 0 or count > http_body_fragment_limit() {
+    HttpBodyWriteFailed(stream, HttpBodyFragmentLimit(http_body_i64_to_usize(if count < 0 { 0 } else { count })))
+  } else { if count == 0 {
+      HttpBodyWrote(stream, http_body_i64_to_usize(0))
+    } else {
+      match stream {
+        HttpBodyStream((connection, state, limits, close_at_end)) -> match state {
+          HttpBodyWriteNone -> HttpBodyWriteFailed(
+            http_body_stream_wrap(connection, state, limits, close_at_end),
+            HttpBodyWriteOverflow(http_body_i64_to_usize(0), http_body_i64_to_usize(count))
+          )
+          HttpBodyWriteFixed(remaining) -> if count > remaining {
+            HttpBodyWriteFailed(
+              http_body_stream_wrap(connection, state, limits, close_at_end),
+              HttpBodyWriteOverflow(http_body_i64_to_usize(remaining), http_body_i64_to_usize(count))
+            )
+          } else { match http_body_write_wire(connection, data) {
+              HttpConnectionWriteFailed(failed, error) -> HttpBodyWriteFailed(
+                http_body_stream_wrap(
+                failed,
+                state,
+                limits,
+                true
+              ),
+                error
+              )
+              HttpConnectionWritten(connection) -> HttpBodyWrote(
+                http_body_stream_wrap(
+                connection,
+                HttpBodyWriteFixed(remaining - count),
+                limits,
+                close_at_end
+              ),
+                http_body_i64_to_usize(count)
+              )
+            } }
+          HttpBodyWriteUntilClose(total) -> if total > http_body_limit_i64(limits) - count {
+            HttpBodyWriteFailed(
+              http_body_stream_wrap(connection, state, limits, close_at_end),
+              HttpBodyProtocol(HttpBodyTooLarge(total))
+            )
+          } else { match http_body_write_wire(connection, data) {
+              HttpConnectionWriteFailed(failed, error) -> HttpBodyWriteFailed(
+                http_body_stream_wrap(failed, state, limits, true),
+                error
+              )
+              HttpConnectionWritten(connection) -> HttpBodyWrote(
+                http_body_stream_wrap(
+                connection,
+                HttpBodyWriteUntilClose(total + count),
+                limits,
+                true
+              ),
+                http_body_i64_to_usize(count)
+              )
+            } }
+          HttpBodyWriteChunked(total) -> if total > http_body_limit_i64(limits) - count {
+            HttpBodyWriteFailed(
+              http_body_stream_wrap(connection, state, limits, close_at_end),
+              HttpBodyProtocol(HttpBodyTooLarge(total))
+            )
+          } else { match http_encode_chunk(data, limits) {
+              Err(error) -> HttpBodyWriteFailed(
+                http_body_stream_wrap(connection, state, limits, close_at_end),
+                HttpBodyProtocol(error)
+              )
+              Ok(wire) -> match http_body_write_wire(connection, wire) {
+                HttpConnectionWriteFailed(failed, error) -> HttpBodyWriteFailed(
+                  http_body_stream_wrap(
+                  failed,
+                  state,
+                  limits,
+                  true
+                ),
+                  error
+                )
+                HttpConnectionWritten(connection) -> HttpBodyWrote(
+                  http_body_stream_wrap(
+                  connection,
+                  HttpBodyWriteChunked(total + count),
+                  limits,
+                  close_at_end
+                ),
+                  http_body_i64_to_usize(count)
+                )
+              }
+            } }
+          _ -> HttpBodyWriteFailed(
+            http_body_stream_wrap(connection, state, limits, close_at_end),
+            HttpBodyWrongDirection
+          )
+        }
+      }
+    } }
+}
+
+fn http_body_complete_write(
+  connection: owned HttpConnection,
+  close_at_end: bool
+) -[TcpReadiness, TcpStreamIO]> HttpBodyFinishOutcome {
+  let close = close_at_end or not http_body_connection_can_reuse(connection)
+  if close {
+    match http_body_close_connection_direct(connection) {
+      Err(error) -> HttpBodyFinishCloseFailed(error)
+      Ok(done) -> HttpBodyFinishedClosed
+    }
+  } else {
+    HttpBodyFinished(http_body_connection_compact(connection))
+  }
+}
+
+pub (package) fn http_body_finish_direct(
+  stream: owned HttpBodyStream,
+  trailers: HttpHeaders
+) -[TcpReadiness, TcpStreamIO]> HttpBodyFinishOutcome {
+  match stream {
+    HttpBodyStream((connection, state, limits, close_at_end)) -> match state {
+      HttpBodyWriteNone -> if http_headers_len(trailers) != 0 {
+        HttpBodyFinishFailed(
+          http_body_stream_wrap(connection, state, limits, close_at_end),
+          HttpBodyProtocol(HttpForbiddenTrailer(0))
+        )
+      } else {
+        http_body_complete_write(connection, close_at_end)
+      }
+      HttpBodyWriteFixed(remaining) -> if remaining != 0 {
+        HttpBodyFinishFailed(
+          http_body_stream_wrap(connection, state, limits, close_at_end),
+          HttpBodyWriteIncomplete(http_body_i64_to_usize(remaining))
+        )
+      } else { if http_headers_len(trailers) != 0 {
+          HttpBodyFinishFailed(
+            http_body_stream_wrap(connection, state, limits, close_at_end),
+            HttpBodyProtocol(HttpForbiddenTrailer(0))
+          )
+        } else {
+          http_body_complete_write(connection, close_at_end)
+        } }
+      HttpBodyWriteChunked(total) -> match http_encode_chunk_end(trailers, limits) {
+        Err(error) -> HttpBodyFinishFailed(
+          http_body_stream_wrap(connection, state, limits, close_at_end),
+          HttpBodyProtocol(error)
+        )
+        Ok(wire) -> match http_body_write_wire(connection, wire) {
+          HttpConnectionWriteFailed(failed, error) -> HttpBodyFinishFailed(
+            http_body_stream_wrap(
+            failed,
+            state,
+            limits,
+            true
+          ),
+            error
+          )
+          HttpConnectionWritten(connection) -> http_body_complete_write(connection, close_at_end)
+        }
+      }
+      HttpBodyWriteUntilClose(total) -> if http_headers_len(trailers) != 0 {
+        HttpBodyFinishFailed(
+          http_body_stream_wrap(connection, state, limits, true),
+          HttpBodyProtocol(HttpForbiddenTrailer(0))
+        )
+      } else {
+        http_body_complete_write(connection, true)
+      }
+      _ -> HttpBodyFinishFailed(
+        http_body_stream_wrap(connection, state, limits, close_at_end),
+        HttpBodyWrongDirection
+      )
+    }
+  }
+}
+
+--- Read one non-empty body fragment of at most 16 KiB.
+pub fn http_body_read(
+  stream: owned HttpBodyStream,
+  limit: usize
+) -[HttpBodyIO, TcpStreamIO]> HttpBodyReadOutcome {
+  HttpBodyIO.read(stream, limit)
+}
+
+--- Write one body fragment of at most 16 KiB.
+pub fn http_body_write(
+  stream: owned HttpBodyStream,
+  data: Bytes
+) -[HttpBodyIO, TcpStreamIO]> HttpBodyWriteOutcome {
+  HttpBodyIO.write(stream, data)
+}
+
+--- Finish an outbound body with an optional chunked trailer section.
+pub fn http_body_finish(
+  stream: owned HttpBodyStream,
+  trailers: HttpHeaders
+) -[HttpBodyIO, TcpStreamIO]> HttpBodyFinishOutcome {
+  HttpBodyIO.finish(stream, trailers)
+}
+
+--- Close and consume an idle HTTP connection.
+pub fn http_connection_close(
+  connection: owned HttpConnection
+) -[HttpBodyIO, TcpStreamIO]> Result<nil, HttpBodyError> {
+  HttpBodyIO.close(connection)
+}
+
+--- Interpret owned body operations through the validating TLS transport.
+pub fn http_body_with_tls<T, E>(
+  body: () -[HttpBodyIO, E]> T
+) -[TcpReadiness, TcpStreamIO, E]> T {
+  handle body() {
+    HttpBodyIO.read(stream, limit) -> resume(http_body_read_direct(stream, limit))
+    HttpBodyIO.write(stream, data) -> resume(http_body_write_direct(stream, data))
+    HttpBodyIO.finish(stream, trailers) -> resume(http_body_finish_direct(stream, trailers))
+    HttpBodyIO.close(connection) -> resume(http_body_close_connection_direct(connection))
+  }
+}

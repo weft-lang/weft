@@ -495,7 +495,7 @@ stdlib_doc_modules=(
   stdlib/json.weft
   stdlib/secure_random.weft stdlib/net_address.weft stdlib/idna.weft
   stdlib/dns.weft stdlib/tcp.weft stdlib/url.weft stdlib/tls.weft
-  stdlib/http.weft
+  stdlib/http.weft stdlib/http_stream.weft stdlib/http_endpoint.weft
   stdlib/state.weft stdlib/diagnostic_type.weft stdlib/diagnostic.weft
   stdlib/diagnostic_registry.weft stdlib/map.weft stdlib/set.weft
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector_type.weft
@@ -558,10 +558,21 @@ assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public AP
     assert_contains "doc_stdlib_tls_client_preserves_authority" "$(<"$tmp_out")" "pub fn tls_client_open(host: UrlHost, trust_roots: Bytes) -[SecureRandom, Time]> Result<owned TlsSession, TlsError>"
     assert_contains "doc_stdlib_tls_server_preserves_authority" "$(<"$tmp_out")" "pub fn tls_server_open(certificate: Bytes, private_key: Bytes) -[SecureRandom]> Result<owned TlsSession, TlsError>"
   elif [ "$stdlib_doc_name" = "http" ]; then
-    assert_contains "doc_stdlib_http_pins_public_surface" "$(<"$tmp_out")" "Public API items: 112. Documented: 112."
+    assert_contains "doc_stdlib_http_pins_public_surface" "$(<"$tmp_out")" "Public API items: 121. Documented: 121."
     assert_contains "doc_stdlib_http_pins_opaque_head" "$(<"$tmp_out")" "pub type HttpRequestHead = opaque"
     assert_contains "doc_stdlib_http_pins_typed_framing" "$(<"$tmp_out")" "pub type HttpBodyFraming {"
     assert_contains "doc_stdlib_http_pins_prefix_parser" "$(<"$tmp_out")" "pub fn http_parse_request_head(source: [u8], limits: HttpLimits) -> HttpRequestHeadParse"
+  elif [ "$stdlib_doc_name" = "http_stream" ]; then
+    assert_contains "doc_stdlib_http_stream_pins_public_surface" "$(<"$tmp_out")" "Public API items: 35. Documented: 35."
+    assert_contains "doc_stdlib_http_stream_pins_owned_body" "$(<"$tmp_out")" "pub type HttpBodyStream = opaque"
+    assert_contains "doc_stdlib_http_stream_pins_body_authority" "$(<"$tmp_out")" "pub effect HttpBodyIO {"
+    assert_contains "doc_stdlib_http_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn http_body_read(stream: owned HttpBodyStream, limit: usize) -[HttpBodyIO, TcpStreamIO]> HttpBodyReadOutcome"
+  elif [ "$stdlib_doc_name" = "http_endpoint" ]; then
+    assert_contains "doc_stdlib_http_endpoint_pins_public_surface" "$(<"$tmp_out")" "Public API items: 42. Documented: 42."
+    assert_contains "doc_stdlib_http_endpoint_pins_client_authority" "$(<"$tmp_out")" "pub effect HttpClient {"
+    assert_contains "doc_stdlib_http_endpoint_pins_server_authority" "$(<"$tmp_out")" "pub effect HttpServer {"
+    assert_contains "doc_stdlib_http_endpoint_pins_client_handler" "$(<"$tmp_out")" "pub fn http_client_with_tls<T, E>(trust_roots: Bytes, body: () -[HttpClient, HttpBodyIO, TcpStreamIO, E]> T) -[DnsResolve, SecureRandom, TcpConnect, TcpReadiness, TcpStreamIO, Time, E]> T"
+    assert_contains "doc_stdlib_http_endpoint_pins_server_handler" "$(<"$tmp_out")" "pub fn http_server_with_tls<T, E>(certificate: Bytes, private_key: Bytes, body: () -[HttpServer, HttpBodyIO, TcpListenerIO, TcpStreamIO, E]> T) -[SecureRandom, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO, E]> T"
   elif [ "$stdlib_doc_name" = "channel" ]; then
     assert_contains "doc_stdlib_channel_pins_public_surface" "$(<"$tmp_out")" "Public API items: 21. Documented: 21."
     assert_contains "doc_stdlib_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"
