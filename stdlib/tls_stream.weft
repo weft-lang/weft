@@ -1,0 +1,644 @@
+-- stdlib/tls_stream.weft — owned TLS over readiness-driven TCP
+--
+-- The callback-free TLS engine and TCP resource travel as one finite owned
+-- aggregate. A readiness wait moves only the TCP owner; the TLS owner and all
+-- ordinary buffers remain continuation-owned values, and no borrow crosses a
+-- suspension boundary.
+
+use stdlib/bytes.{Bytes, bytes_empty, bytes_from_slice, bytes_is_empty, bytes_len, bytes_to_vector}
+use stdlib/drop.{Drop}
+use stdlib/io_types.{IoEndOfFile, IoReadBytes, IoWroteBytes}
+use stdlib/num.{num_int_cast_value_or, num_u64_to_i64_checked, num_usize_to_u64}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/tcp.{TcpError, TcpInterrupted, TcpReadinessError, TcpStream, TcpStreamIO, TcpStreamReadinessFailed, TcpStreamReady, TcpWouldBlock, tcp_read, tcp_stream_close, tcp_wait_readable, tcp_wait_writable, tcp_write}
+use stdlib/tls.{TlsDone, TlsError, TlsNeedInput, TlsNeedOutput, TlsPeerClosed, TlsRead, TlsSession, TlsStep, TlsWrote, tls_close_step, tls_drain, tls_feed, tls_feed_eof, tls_handshake, tls_pending_output, tls_read, tls_write_start, tls_write_step}
+use stdlib/vector.{vector_push, vector_with_capacity}
+use stdlib/vector_type.{Vector}
+
+--- A failure while driving one owned TLS-over-TCP stream.
+pub type TlsStreamError {
+  --- The established TCP transport failed.
+  TlsStreamTcp(TcpError),
+  --- Registration or observation of TCP readiness failed.
+  TlsStreamReadiness(TcpReadinessError),
+  --- The TLS engine rejected a protocol transition.
+  TlsStreamTls(TlsError),
+  --- A plaintext operation exceeded the bounded 16 KiB record interface.
+  TlsStreamPlaintextLimit(usize),
+  --- A backend reported zero or out-of-range progress.
+  TlsStreamInvalidProgress,
+  --- The TLS engine produced a step that is impossible for this operation.
+  TlsStreamUnexpectedStep(TlsStep)
+}
+
+type TlsStreamParts {
+  transport: owned TcpStream,
+  session: owned TlsSession
+}
+
+--- One opaque owned TLS session joined to its established TCP transport.
+---
+--- Dropping a stream releases TLS state first and then closes TCP. Use
+--- `tls_stream_close` when an authenticated close notification is required.
+pub type TlsStream = opaque TlsStreamParts
+
+--- Ownership-preserving completion of the TLS handshake.
+pub type TlsStreamHandshake {
+  --- The handshake completed and returned the usable stream owner.
+  TlsStreamHandshakeReady(owned TlsStream),
+  --- The handshake failed and returned the stream owner for explicit policy.
+  TlsStreamHandshakeFailed(owned TlsStream, TlsStreamError)
+}
+
+--- One bounded plaintext read from an owned TLS stream.
+pub type TlsStreamRead {
+  --- Authenticated plaintext arrived with the stream owner.
+  TlsStreamReadData(owned TlsStream, Bytes),
+  --- The peer sent an authenticated TLS close notification.
+  TlsStreamReadClosed(owned TlsStream),
+  --- The read failed and returned the stream owner for explicit policy.
+  TlsStreamReadFailed(owned TlsStream, TlsStreamError)
+}
+
+--- Completion of one bounded plaintext write.
+pub type TlsStreamWrite {
+  --- The TLS engine accepted this exact count and returned the stream owner.
+  TlsStreamWrote(owned TlsStream, usize),
+  --- The write failed and returned the stream owner for explicit policy.
+  TlsStreamWriteFailed(owned TlsStream, TlsStreamError)
+}
+
+type TlsStreamProgress {
+  TlsStreamProgressReady(owned TlsStream),
+  TlsStreamProgressFailed(owned TlsStream, TlsStreamError)
+}
+
+type TlsStreamStepResult {
+  TlsStreamStepReady(owned TlsStream, TlsStep),
+  TlsStreamStepFailed(owned TlsStream, TlsStreamError)
+}
+
+type TlsStreamReadStepResult {
+  TlsStreamReadStepReady(owned TlsStream, TlsStep, Bytes),
+  TlsStreamReadStepFailed(owned TlsStream, TlsStreamError)
+}
+
+type TlsStreamWritePhase {
+  TlsStreamWriteStart,
+  TlsStreamWriteContinue
+}
+
+type TlsStreamCloseReason {
+  TlsStreamCloseClean,
+  TlsStreamCloseFailure(TlsStreamError)
+}
+
+type TlsStreamFlushMode {
+  TlsStreamFlushAvailable,
+  TlsStreamFlushRequired
+}
+
+fn tls_stream_encrypted_chunk_size() -> i64 { 32768 }
+
+fn tls_stream_plaintext_limit() -> i64 { 16384 }
+
+fn tls_stream_usize_to_i64(value: usize) -> i64 {
+  num_int_cast_value_or<i64>(num_u64_to_i64_checked(num_usize_to_u64(value)), 0 - 1)
+}
+
+fn tls_stream_scratch(size: i64) -> Vector<u8> {
+  let values = vector_with_capacity<u8>(size)
+  for index in 0..size { vector_push<u8>(values, __i64_to_u8(0)) }
+  values
+}
+
+fn tls_stream_wrap(
+  transport: owned TcpStream,
+  session: owned TlsSession
+) -[TcpStreamIO]> owned TlsStream {
+  TlsStream(TlsStreamParts { transport: transport, session: session })
+}
+
+impl Drop for TlsStream {
+  fn drop(self) -[TcpStreamIO]> i64 {
+    match self {
+      TlsStream(parts) -> {
+        let { transport, session } = parts
+        let session_status = session.drop()
+        let transport_status = transport.drop()
+        if transport_status != 0 { transport_status } else { session_status }
+      }
+    }
+  }
+}
+
+fn tls_stream_write_ciphertext(
+  stream: owned TlsStream,
+  values: Vector<u8>,
+  offset: i64,
+  count: i64
+) -[TcpReadiness, TcpStreamIO]> TlsStreamProgress {
+  let mut current: owned TlsStream = stream
+  let mut position = offset
+  loop {
+    if position >= count {
+      break(TlsStreamProgressReady(current))
+    } else {
+      match current {
+        TlsStream(parts) -> {
+          let { transport: initial_transport, session } = parts
+          match tcp_wait_writable(initial_transport) {
+          TcpStreamReadinessFailed(returned, error) -> break(TlsStreamProgressFailed(
+            tls_stream_wrap(returned, session),
+            TlsStreamReadiness(error)
+          ))
+          TcpStreamReady(returned) -> {
+            let mut transport: owned TcpStream = returned
+            let view: [u8] = values[__i64_to_usize(position)..__i64_to_usize(count)]
+            match tcp_write(transport, view) {
+              Err(TcpInterrupted) -> { current = tls_stream_wrap(transport, session) }
+              Err(TcpWouldBlock) -> { current = tls_stream_wrap(transport, session) }
+              Err(error) -> break(TlsStreamProgressFailed(
+                tls_stream_wrap(transport, session),
+                TlsStreamTcp(error)
+              ))
+              Ok(IoWroteBytes(wrote)) -> {
+                let progress = tls_stream_usize_to_i64(wrote)
+                if progress <= 0 or progress > count - position {
+                  break(TlsStreamProgressFailed(
+                    tls_stream_wrap(transport, session),
+                    TlsStreamInvalidProgress
+                  ))
+                } else {
+                  current = tls_stream_wrap(transport, session)
+                  position = position + progress
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    }
+  }
+  }
+}
+
+fn tls_stream_flush(
+  stream: owned TlsStream,
+  mode: TlsStreamFlushMode
+) -[TcpReadiness, TcpStreamIO]> TlsStreamProgress {
+  let mut current: owned TlsStream = stream
+  let mut first = true
+  loop {
+    match current {
+      TlsStream(parts) -> {
+        let { transport, session: initial_session } = parts
+        let mut session: owned TlsSession = initial_session
+        let pending = tls_stream_usize_to_i64(tls_pending_output(session))
+        if pending < 0 {
+          break(TlsStreamProgressFailed(
+            tls_stream_wrap(transport, session),
+            TlsStreamInvalidProgress
+          ))
+        } else { if pending == 0 {
+          let returned = tls_stream_wrap(transport, session)
+          if first {
+            match mode {
+              TlsStreamFlushAvailable -> break(TlsStreamProgressReady(returned))
+              TlsStreamFlushRequired -> break(TlsStreamProgressFailed(
+                returned,
+                TlsStreamInvalidProgress
+              ))
+            }
+          } else {
+            break(TlsStreamProgressReady(returned))
+          }
+        } else {
+          let request = if pending < tls_stream_encrypted_chunk_size() {
+            pending
+          } else {
+            tls_stream_encrypted_chunk_size()
+          }
+          let scratch = tls_stream_scratch(request)
+          match tls_drain(session, scratch[..__i64_to_usize(request)]) {
+            Err(error) -> break(TlsStreamProgressFailed(
+              tls_stream_wrap(transport, session),
+              TlsStreamTls(error)
+            ))
+            Ok(drained) -> {
+              let count = tls_stream_usize_to_i64(drained)
+              if count <= 0 or count > request {
+                break(TlsStreamProgressFailed(
+                  tls_stream_wrap(transport, session),
+                  TlsStreamInvalidProgress
+                ))
+              } else {
+                match tls_stream_write_ciphertext(
+                  tls_stream_wrap(transport, session),
+                  scratch,
+                  0,
+                  count
+                ) {
+                  TlsStreamProgressFailed(returned, error) -> break(TlsStreamProgressFailed(returned, error))
+                  TlsStreamProgressReady(returned) -> {
+                    current = returned
+                    first = false
+                  }
+                }
+              }
+            }
+          }
+        } }
+      }
+    }
+  }
+}
+
+fn tls_stream_receive_ciphertext(
+  stream: owned TlsStream
+) -[TcpReadiness, TcpStreamIO]> TlsStreamProgress {
+  let mut current: owned TlsStream = stream
+  loop {
+    match current {
+      TlsStream(parts) -> {
+        let { transport: initial_transport, session: initial_session } = parts
+        match tcp_wait_readable(initial_transport) {
+          TcpStreamReadinessFailed(returned, error) -> break(TlsStreamProgressFailed(
+            tls_stream_wrap(returned, initial_session),
+            TlsStreamReadiness(error)
+          ))
+          TcpStreamReady(returned) -> {
+            let mut transport: owned TcpStream = returned
+            let mut session: owned TlsSession = initial_session
+            let request = tls_stream_encrypted_chunk_size()
+            let scratch = tls_stream_scratch(request)
+            match tcp_read(transport, scratch[..]) {
+              Err(TcpInterrupted) -> { current = tls_stream_wrap(transport, session) }
+              Err(TcpWouldBlock) -> { current = tls_stream_wrap(transport, session) }
+              Err(error) -> break(TlsStreamProgressFailed(
+                tls_stream_wrap(transport, session),
+                TlsStreamTcp(error)
+              ))
+              Ok(IoEndOfFile) -> match tls_feed_eof(session) {
+                Err(error) -> break(TlsStreamProgressFailed(
+                  tls_stream_wrap(transport, session),
+                  TlsStreamTls(error)
+                ))
+                Ok(done) -> break(TlsStreamProgressReady(tls_stream_wrap(transport, session)))
+              }
+              Ok(IoReadBytes(read)) -> {
+                let count = tls_stream_usize_to_i64(read)
+                if count <= 0 or count > request {
+                  break(TlsStreamProgressFailed(
+                    tls_stream_wrap(transport, session),
+                    TlsStreamInvalidProgress
+                  ))
+                } else {
+                  match tls_feed(session, scratch[..read]) {
+                    Err(error) -> break(TlsStreamProgressFailed(
+                      tls_stream_wrap(transport, session),
+                      TlsStreamTls(error)
+                    ))
+                    Ok(accepted) -> {
+                      if accepted != read {
+                        break(TlsStreamProgressFailed(
+                          tls_stream_wrap(transport, session),
+                          TlsStreamInvalidProgress
+                        ))
+                      } else {
+                        break(TlsStreamProgressReady(tls_stream_wrap(transport, session)))
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn tls_stream_handshake_step(stream: owned TlsStream) -[TcpStreamIO]> TlsStreamStepResult {
+  match stream {
+    TlsStream(parts) -> {
+      let { transport, session: initial_session } = parts
+      let mut session: owned TlsSession = initial_session
+      match tls_handshake(session) {
+        Err(error) -> TlsStreamStepFailed(
+          tls_stream_wrap(transport, session),
+          TlsStreamTls(error)
+        )
+        Ok(step) -> TlsStreamStepReady(tls_stream_wrap(transport, session), step)
+      }
+    }
+  }
+}
+
+fn tls_stream_handshake_drive(
+  stream: owned TlsStream
+) -[TcpReadiness, TcpStreamIO]> TlsStreamHandshake {
+  let mut current: owned TlsStream = stream
+  loop {
+    match tls_stream_handshake_step(current) {
+      TlsStreamStepFailed(returned, error) -> {
+        break(TlsStreamHandshakeFailed(returned, error))
+      }
+      TlsStreamStepReady(returned, TlsDone) -> match tls_stream_flush(returned, TlsStreamFlushAvailable) {
+        TlsStreamProgressFailed(failed, error) -> break(TlsStreamHandshakeFailed(failed, error))
+        TlsStreamProgressReady(ready) -> break(TlsStreamHandshakeReady(ready))
+      }
+      TlsStreamStepReady(returned, TlsNeedOutput) -> match tls_stream_flush(returned, TlsStreamFlushRequired) {
+        TlsStreamProgressFailed(failed, error) -> break(TlsStreamHandshakeFailed(failed, error))
+        TlsStreamProgressReady(ready) -> { current = ready }
+      }
+      TlsStreamStepReady(returned, TlsNeedInput) -> match tls_stream_flush(returned, TlsStreamFlushAvailable) {
+        TlsStreamProgressFailed(failed, error) -> break(TlsStreamHandshakeFailed(failed, error))
+        TlsStreamProgressReady(flushed) -> match tls_stream_receive_ciphertext(flushed) {
+          TlsStreamProgressFailed(failed, error) -> break(TlsStreamHandshakeFailed(failed, error))
+          TlsStreamProgressReady(ready) -> { current = ready }
+        }
+      }
+      TlsStreamStepReady(returned, TlsPeerClosed) -> {
+        break(TlsStreamHandshakeFailed(returned, TlsStreamUnexpectedStep(TlsPeerClosed)))
+      }
+      TlsStreamStepReady(returned, step) -> {
+        break(TlsStreamHandshakeFailed(returned, TlsStreamUnexpectedStep(step)))
+      }
+    }
+  }
+}
+
+--- Join an established TCP owner and configured TLS session, then complete
+--- the non-blocking handshake through readiness. Every outcome returns the
+--- aggregate owner; ignoring it performs deterministic cleanup.
+pub fn tls_stream_handshake(
+  transport: owned TcpStream,
+  session: owned TlsSession
+) -[TcpReadiness, TcpStreamIO]> TlsStreamHandshake {
+  tls_stream_handshake_drive(tls_stream_wrap(transport, session))
+}
+
+fn tls_stream_read_step(
+  stream: owned TlsStream,
+  limit: i64
+) -[TcpStreamIO]> TlsStreamReadStepResult {
+  match stream {
+    TlsStream(parts) -> {
+      let { transport, session: initial_session } = parts
+      let mut session: owned TlsSession = initial_session
+      let scratch = tls_stream_scratch(limit)
+      match tls_read(session, scratch[..]) {
+        Err(error) -> TlsStreamReadStepFailed(
+          tls_stream_wrap(transport, session),
+          TlsStreamTls(error)
+        )
+        Ok(TlsRead(read)) -> {
+          let count = tls_stream_usize_to_i64(read)
+          if count <= 0 or count > limit {
+            TlsStreamReadStepFailed(
+              tls_stream_wrap(transport, session),
+              TlsStreamInvalidProgress
+            )
+          } else {
+            TlsStreamReadStepReady(
+              tls_stream_wrap(transport, session),
+              TlsRead(read),
+              bytes_from_slice(scratch[..read])
+            )
+          }
+        }
+        Ok(step) -> TlsStreamReadStepReady(
+          tls_stream_wrap(transport, session),
+          step,
+          bytes_empty()
+        )
+      }
+    }
+  }
+}
+
+fn tls_stream_read_drive(
+  stream: owned TlsStream,
+  limit: i64
+) -[TcpReadiness, TcpStreamIO]> TlsStreamRead {
+  let mut current: owned TlsStream = stream
+  loop {
+    match tls_stream_read_step(current, limit) {
+      TlsStreamReadStepFailed(returned, error) -> break(TlsStreamReadFailed(returned, error))
+      TlsStreamReadStepReady(returned, TlsRead(count), data) -> {
+        break(TlsStreamReadData(returned, data))
+      }
+      TlsStreamReadStepReady(returned, TlsPeerClosed, data) -> {
+        break(TlsStreamReadClosed(returned))
+      }
+      TlsStreamReadStepReady(returned, TlsNeedOutput, data) -> match tls_stream_flush(returned, TlsStreamFlushRequired) {
+        TlsStreamProgressFailed(failed, error) -> break(TlsStreamReadFailed(failed, error))
+        TlsStreamProgressReady(ready) -> { current = ready }
+      }
+      TlsStreamReadStepReady(returned, TlsNeedInput, data) -> match tls_stream_flush(returned, TlsStreamFlushAvailable) {
+        TlsStreamProgressFailed(failed, error) -> break(TlsStreamReadFailed(failed, error))
+        TlsStreamProgressReady(flushed) -> match tls_stream_receive_ciphertext(flushed) {
+          TlsStreamProgressFailed(failed, error) -> break(TlsStreamReadFailed(failed, error))
+          TlsStreamProgressReady(ready) -> { current = ready }
+        }
+      }
+      TlsStreamReadStepReady(returned, step, data) -> {
+        break(TlsStreamReadFailed(returned, TlsStreamUnexpectedStep(step)))
+      }
+    }
+  }
+}
+
+--- Read one authenticated plaintext fragment of at most `limit` bytes.
+---
+--- `limit` must be in `1..=16384`. The operation preserves the stream owner
+--- in data, authenticated-close and failure outcomes.
+pub fn tls_stream_read(
+  stream: owned TlsStream,
+  limit: usize
+) -[TcpReadiness, TcpStreamIO]> TlsStreamRead {
+  let raw_limit = tls_stream_usize_to_i64(limit)
+  if raw_limit <= 0 or raw_limit > tls_stream_plaintext_limit() {
+    TlsStreamReadFailed(stream, TlsStreamPlaintextLimit(limit))
+  } else {
+    tls_stream_read_drive(stream, raw_limit)
+  }
+}
+
+fn tls_stream_write_once(
+  stream: owned TlsStream,
+  values: Vector<u8>,
+  phase: TlsStreamWritePhase
+) -[TcpStreamIO]> TlsStreamStepResult {
+  match stream {
+    TlsStream(parts) -> {
+      let { transport, session: initial_session } = parts
+      let mut session: owned TlsSession = initial_session
+      let stepped = match phase {
+        TlsStreamWriteStart -> tls_write_start(session, values[..])
+        TlsStreamWriteContinue -> tls_write_step(session)
+      }
+      match stepped {
+        Err(error) -> TlsStreamStepFailed(
+          tls_stream_wrap(transport, session),
+          TlsStreamTls(error)
+        )
+        Ok(step) -> TlsStreamStepReady(tls_stream_wrap(transport, session), step)
+      }
+    }
+  }
+}
+
+fn tls_stream_write_drive(
+  stream: owned TlsStream,
+  values: Vector<u8>,
+  phase: TlsStreamWritePhase
+) -[TcpReadiness, TcpStreamIO]> TlsStreamWrite {
+  let mut current: owned TlsStream = stream
+  let mut current_phase = phase
+  loop {
+    match tls_stream_write_once(current, values, current_phase) {
+      TlsStreamStepFailed(returned, error) -> break(TlsStreamWriteFailed(returned, error))
+      TlsStreamStepReady(returned, TlsWrote(count)) -> match tls_stream_flush(returned, TlsStreamFlushAvailable) {
+        TlsStreamProgressFailed(failed, error) -> break(TlsStreamWriteFailed(failed, error))
+        TlsStreamProgressReady(ready) -> break(TlsStreamWrote(ready, count))
+      }
+      TlsStreamStepReady(returned, TlsNeedOutput) -> match tls_stream_flush(returned, TlsStreamFlushRequired) {
+        TlsStreamProgressFailed(failed, error) -> break(TlsStreamWriteFailed(failed, error))
+        TlsStreamProgressReady(ready) -> {
+          current = ready
+          current_phase = TlsStreamWriteContinue
+        }
+      }
+      TlsStreamStepReady(returned, TlsNeedInput) -> match tls_stream_flush(returned, TlsStreamFlushAvailable) {
+        TlsStreamProgressFailed(failed, error) -> break(TlsStreamWriteFailed(failed, error))
+        TlsStreamProgressReady(flushed) -> match tls_stream_receive_ciphertext(flushed) {
+          TlsStreamProgressFailed(failed, error) -> break(TlsStreamWriteFailed(failed, error))
+          TlsStreamProgressReady(ready) -> {
+            current = ready
+            current_phase = TlsStreamWriteContinue
+          }
+        }
+      }
+      TlsStreamStepReady(returned, step) -> {
+        break(TlsStreamWriteFailed(returned, TlsStreamUnexpectedStep(step)))
+      }
+    }
+  }
+}
+
+--- Write one plaintext fragment of at most 16 KiB and flush its ciphertext.
+---
+--- Empty input is an exact no-op. A positive completion reports the count
+--- accepted by TLS; callers retain any suffix not included in that count.
+pub fn tls_stream_write(
+  stream: owned TlsStream,
+  values: Bytes
+) -[TcpReadiness, TcpStreamIO]> TlsStreamWrite {
+  let count = bytes_len(values)
+  if count < 0 or count > tls_stream_plaintext_limit() {
+    TlsStreamWriteFailed(stream, TlsStreamPlaintextLimit(__i64_to_usize(if count < 0 { 0 } else { count })))
+  } else { if bytes_is_empty(values) {
+    TlsStreamWrote(stream, __i64_to_usize(0))
+  } else {
+    tls_stream_write_drive(
+      stream,
+      bytes_to_vector(values),
+      TlsStreamWriteStart
+    )
+  } }
+}
+
+fn tls_stream_close_finish(
+  stream: owned TlsStream,
+  reason: TlsStreamCloseReason
+) -[TcpStreamIO]> Result<nil, TlsStreamError> {
+  match stream {
+    TlsStream(parts) -> {
+      let { transport, session } = parts
+      let session_status = session.drop()
+      let closed = tcp_stream_close(transport)
+      match reason {
+        TlsStreamCloseFailure(error) -> result_err<nil, TlsStreamError>(error)
+        TlsStreamCloseClean -> match closed {
+          Err(error) -> result_err<nil, TlsStreamError>(TlsStreamTcp(error))
+          Ok(done) -> {
+            if session_status == 0 {
+              result_ok<nil, TlsStreamError>(nil)
+            } else {
+              result_err<nil, TlsStreamError>(TlsStreamInvalidProgress)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn tls_stream_close_step_owned(stream: owned TlsStream) -[TcpStreamIO]> TlsStreamStepResult {
+  match stream {
+    TlsStream(parts) -> {
+      let { transport, session: initial_session } = parts
+      let mut session: owned TlsSession = initial_session
+      match tls_close_step(session) {
+        Err(error) -> TlsStreamStepFailed(
+          tls_stream_wrap(transport, session),
+          TlsStreamTls(error)
+        )
+        Ok(step) -> TlsStreamStepReady(tls_stream_wrap(transport, session), step)
+      }
+    }
+  }
+}
+
+fn tls_stream_close_drive(
+  stream: owned TlsStream
+) -[TcpReadiness, TcpStreamIO]> Result<nil, TlsStreamError> {
+  let mut current: owned TlsStream = stream
+  loop {
+    match tls_stream_close_step_owned(current) {
+      TlsStreamStepFailed(returned, error) -> {
+        break(tls_stream_close_finish(returned, TlsStreamCloseFailure(error)))
+      }
+      TlsStreamStepReady(returned, TlsDone) -> match tls_stream_flush(returned, TlsStreamFlushAvailable) {
+        TlsStreamProgressFailed(failed, error) -> {
+          break(tls_stream_close_finish(failed, TlsStreamCloseFailure(error)))
+        }
+        TlsStreamProgressReady(ready) -> {
+          break(tls_stream_close_finish(ready, TlsStreamCloseClean))
+        }
+      }
+      TlsStreamStepReady(returned, TlsNeedOutput) -> match tls_stream_flush(returned, TlsStreamFlushRequired) {
+        TlsStreamProgressFailed(failed, error) -> {
+          break(tls_stream_close_finish(failed, TlsStreamCloseFailure(error)))
+        }
+        TlsStreamProgressReady(ready) -> { current = ready }
+      }
+      TlsStreamStepReady(returned, TlsNeedInput) -> match tls_stream_flush(returned, TlsStreamFlushAvailable) {
+        TlsStreamProgressFailed(failed, error) -> break(tls_stream_close_finish(failed, TlsStreamCloseFailure(error)))
+        TlsStreamProgressReady(flushed) -> match tls_stream_receive_ciphertext(flushed) {
+          TlsStreamProgressFailed(failed, error) -> break(tls_stream_close_finish(failed, TlsStreamCloseFailure(error)))
+          TlsStreamProgressReady(ready) -> { current = ready }
+        }
+      }
+      TlsStreamStepReady(returned, step) -> {
+        break(tls_stream_close_finish(
+          returned,
+          TlsStreamCloseFailure(TlsStreamUnexpectedStep(step))
+        ))
+      }
+    }
+  }
+}
+
+--- Send an authenticated TLS close notification, flush it, close TCP and
+--- consume the stream owner. Cleanup still occurs when either close phase
+--- reports failure.
+pub fn tls_stream_close(
+  stream: owned TlsStream
+) -[TcpReadiness, TcpStreamIO]> Result<nil, TlsStreamError> {
+  tls_stream_close_drive(stream)
+}
