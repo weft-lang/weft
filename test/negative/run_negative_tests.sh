@@ -865,6 +865,7 @@ check_rejects "borrow_shared_to_exclusive" "test/negative/borrow_shared_to_exclu
 check_rejects "borrow_actual_type_mismatch" "test/negative/borrow_actual_type_mismatch.weft" 'error[E1002]: borrowed argument type mismatch: expected `BorrowExpectedToken`, found `BorrowActualToken`'
 check_rejects "borrow_conflicting_call" "test/negative/borrow_conflicting_call.weft" "type error: conflicting resource borrows in one call"
 check_rejects "borrow_escape_to_owned" "test/negative/borrow_escape_to_owned.weft" 'error[E1002]: argument type mismatch: expected `owned BorrowEscapeToken`, found `borrow BorrowEscapeToken`'
+check_rejects "borrow_pattern_extract_owned" "test/negative/borrow_pattern_extract_owned.weft" 'error[E1002]: return value type mismatch: expected `owned BorrowPatternToken`, found `borrow BorrowPatternToken`'
 check_rejects "borrow_mut_method_immutable_owner" "test/negative/borrow_mut_method_immutable_owner.weft" "type error: exclusive resource borrow requires a mutable owner binding"
 check_rejects "borrow_effect_conflicting_perform" "test/negative/borrow_effect_conflicting_perform.weft" "type error: conflicting resource borrows in one call" 1
 check_rejects "borrow_effect_deferred_continuation" "test/negative/borrow_effect_deferred_continuation.weft" "type error: borrowed effect parameter cannot enter a deferred continuation" 1
