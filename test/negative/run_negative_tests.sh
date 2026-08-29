@@ -297,6 +297,8 @@ check_rejects "vector_sort_effectful_comparator" "test/negative/vector_sort_effe
 check_rejects "vector_filter_effectful_predicate" "test/negative/vector_filter_effectful_predicate.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> bool`, found `(i64) -[FilterNoise]> bool`'
 check_rejects "vector_concat_type_mismatch" "test/negative/vector_concat_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `Vector<i64>`, found `Vector<str>`'
 check_rejects "generic_function_ref_unresolved" "test/negative/generic_function_ref_unresolved.weft" "type error: cannot infer generic function reference"
+check_rejects "generic_call_unresolved" "test/negative/generic_call_unresolved.weft" "type error: cannot infer generic call type arguments; write explicit type arguments"
+check_rejects "generic_qualified_call_unresolved" "test/negative/generic_qualified_call_unresolved.weft" "type error: cannot infer generic call type arguments; write explicit type arguments"
 check_rejects "map_wrong_key_type" "test/negative/map_wrong_key_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "map_wrong_value_type" "test/negative/map_wrong_value_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "map_key_requires_hash" "test/negative/map_key_requires_hash.weft" "error[E1004]:"
