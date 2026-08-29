@@ -1,0 +1,483 @@
+-- stdlib/http_transport.weft — transport-polymorphic owned HTTP byte sessions
+--
+-- HTTP framing is generic over one concrete transport-state type. Production
+-- carries an inline owned TLS stream; deterministic replay carries an ordinary
+-- bounded transcript. Parameterized effects retain that exact interpretation
+-- in the capability set, so cleanup never needs a dynamic tag, registry, box,
+-- or authority that the selected state cannot use.
+
+use stdlib/bytes.{Bytes, bytes_from_slice, bytes_get, bytes_len, bytes_to_vector}
+use stdlib/drop.{Drop}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/tcp.{TcpReadiness, TcpStreamIO}
+use stdlib/tls_stream.{TlsStream, TlsStreamError, TlsStreamReadClosed, TlsStreamReadData, TlsStreamReadFailed, TlsStreamWriteFailed, TlsStreamWrote, tls_stream_close, tls_stream_read, tls_stream_write}
+use stdlib/vector.{vector_get_in_bounds, vector_set}
+use stdlib/vector_type.{Vector}
+
+type HttpReplayTransportParts {
+  input: Bytes,
+  input_offset: i64,
+  input_end: i64,
+  expected_output: Bytes,
+  output_offset: i64,
+  read_fragment: i64,
+  write_fragment: i64,
+  read_timeout_at: i64,
+  write_timeout_at: i64,
+  status: HttpReplayTransportStatus,
+  probe: Vector<i64>
+}
+
+type HttpReplayTransportStatus {
+  HttpReplayTransportHealthy,
+    HttpReplayTransportFaulted
+}
+
+--- The sealed state identity selected by deterministic replay.
+---
+--- Construct replay through `stdlib/http_replay`; only the replay handler can
+--- inspect or advance the transcript and its exact cleanup/probe state.
+pub type HttpReplayTransportState = opaque HttpReplayTransportParts
+
+--- A failure while advancing one established HTTP byte transport.
+pub type HttpTransportError {
+  --- The production TLS-over-TCP interpretation failed.
+  HttpTransportTls(TlsStreamError),
+    --- A transport claimed success without advancing a non-empty operation.
+    HttpTransportInvalidProgress,
+    --- A deterministic replay reached its configured read suspension point.
+    HttpTransportReadTimeout(usize),
+    --- A deterministic replay reached its configured write suspension point.
+    HttpTransportWriteTimeout(usize),
+    --- Outbound replay bytes differed at this absolute byte offset.
+    HttpTransportWriteMismatch(usize),
+    --- Outbound replay produced bytes beyond the expected transcript.
+    HttpTransportUnexpectedWrite(usize),
+    --- Closing replay left this many expected outbound bytes unwritten.
+    HttpTransportWriteIncomplete(usize),
+    --- One single-session replay fixture was asked to begin twice.
+    HttpTransportReplayConsumed
+}
+
+--- One opaque single-owner HTTP byte transport with exact interpretation `S`.
+---
+--- Every operation moves the owner and returns its unique successor, except
+--- close/release which consume it exactly once. The representation remains
+--- inline: `S` is not boxed or erased.
+pub type HttpTransport<S> = opaque S
+
+--- One bounded transport read outcome.
+pub type HttpTransportRead<S> {
+  --- Non-empty plaintext arrived with the successor owner.
+  HttpTransportReadData(owned HttpTransport<S>, Bytes),
+    --- The peer or replay transcript reached its exact input boundary.
+    HttpTransportReadClosed(owned HttpTransport<S>),
+    --- Reading failed without losing or fabricating the transport owner.
+    HttpTransportReadFailed(owned HttpTransport<S>, HttpTransportError)
+}
+
+--- One bounded transport write outcome.
+pub type HttpTransportWrite<S> {
+  --- This exact non-zero byte count was accepted with the successor owner.
+  HttpTransportWrote(owned HttpTransport<S>, usize),
+    --- Writing failed without losing or fabricating the transport owner.
+    HttpTransportWriteFailed(owned HttpTransport<S>, HttpTransportError)
+}
+
+--- Authority to advance or release HTTP transport state `S`.
+---
+--- Production and replay are distinct effect atoms. Generic HTTP framing can
+--- preserve either atom without learning its representation or capabilities.
+pub effect HttpTransportIO<S> {
+  --- Read at most `limit` plaintext bytes.
+  fn read(transport: owned HttpTransport<S>, limit: usize) -> HttpTransportRead<S>
+  --- Write a bounded plaintext fragment.
+  fn write(transport: owned HttpTransport<S>, data: Bytes) -> HttpTransportWrite<S>
+  --- Perform the interpretation's graceful close and consume the owner.
+  fn close(transport: owned HttpTransport<S>) -> Result<nil, HttpTransportError>
+}
+
+--- Authority to release one abandoned HTTP transport state `S`.
+---
+--- Keeping release separate lets an I/O handler return successor owners while
+--- the enclosing release handler remains available for their exact Drop.
+pub effect HttpTransportRelease<S> {
+  --- Release the owner without requiring graceful protocol completion.
+  fn release(transport: HttpTransport<S>) -> i64
+}
+
+impl<S> Drop for HttpTransport<S> {
+  fn drop(self: HttpTransport<S>) -[HttpTransportRelease<S>]> i64 {
+    HttpTransportRelease<S>.release(self)
+  }
+}
+
+fn http_transport_i64_to_usize(value: i64) -> usize {
+  __i64_to_usize(if value < 0 { 0 } else { value })
+}
+
+fn http_transport_usize_to_i64(value: usize) -> i64 {
+  __u64_to_i64(__usize_to_u64(value))
+}
+
+fn http_transport_min_i64(value: i64, limit: i64) -> i64 {
+  if limit < value { limit } else { value }
+}
+
+fn http_transport_tls_wrap(
+  stream: owned TlsStream
+) -[HttpTransportRelease<TlsStream>, TcpStreamIO]> owned HttpTransport<TlsStream> {
+  HttpTransport<TlsStream>(stream)
+}
+
+pub(package) fn http_transport_from_tls(
+  stream: owned TlsStream
+) -[HttpTransportRelease<TlsStream>, TcpStreamIO]> owned HttpTransport<TlsStream> {
+  http_transport_tls_wrap(stream)
+}
+
+fn http_transport_replay_wrap(
+  state: HttpReplayTransportState
+) -[HttpTransportRelease<HttpReplayTransportState>]> owned HttpTransport<HttpReplayTransportState> {
+  HttpTransport<HttpReplayTransportState>(state)
+}
+
+fn http_transport_replay_faulted(state: HttpReplayTransportParts) -> HttpReplayTransportState {
+  HttpReplayTransportState(HttpReplayTransportParts {
+    input: state.input,
+    input_offset: state.input_offset,
+    input_end: state.input_end,
+    expected_output: state.expected_output,
+    output_offset: state.output_offset,
+    read_fragment: state.read_fragment,
+    write_fragment: state.write_fragment,
+    read_timeout_at: state.read_timeout_at,
+    write_timeout_at: state.write_timeout_at,
+    status: HttpReplayTransportFaulted,
+    probe: state.probe
+  })
+}
+
+pub(package) fn http_transport_from_replay(
+  input: Bytes,
+  input_end: i64,
+  expected_output: Bytes,
+  read_fragment: i64,
+  write_fragment: i64,
+  read_timeout_at: i64,
+  write_timeout_at: i64,
+  probe: Vector<i64>
+) -[HttpTransportRelease<HttpReplayTransportState>]> owned HttpTransport<HttpReplayTransportState> {
+  http_transport_replay_wrap(HttpReplayTransportState(HttpReplayTransportParts {
+    input: input,
+    input_offset: 0,
+    input_end: input_end,
+    expected_output: expected_output,
+    output_offset: 0,
+    read_fragment: read_fragment,
+    write_fragment: write_fragment,
+    read_timeout_at: read_timeout_at,
+    write_timeout_at: write_timeout_at,
+    status: HttpReplayTransportHealthy,
+    probe: probe
+  }))
+}
+
+fn http_transport_probe_add(probe: Vector<i64>, slot: i64, amount: i64) -> nil {
+  vector_set<i64>(probe, slot, vector_get_in_bounds<i64>(probe, slot) + amount)
+  nil
+}
+
+pub(package) fn http_transport_read<S>(
+  transport: owned HttpTransport<S>,
+  limit: usize
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> HttpTransportRead<S> {
+  HttpTransportIO<S>.read(transport, limit)
+}
+
+pub(package) fn http_transport_write<S>(
+  transport: owned HttpTransport<S>,
+  data: Bytes
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> HttpTransportWrite<S> {
+  HttpTransportIO<S>.write(transport, data)
+}
+
+pub(package) fn http_transport_close<S>(
+  transport: owned HttpTransport<S>
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> Result<nil, HttpTransportError> {
+  HttpTransportIO<S>.close(transport)
+}
+
+pub(package) fn http_transport_tls_read_direct(
+  transport: owned HttpTransport<TlsStream>,
+  limit: usize
+) -[HttpTransportRelease<TlsStream>, TcpReadiness, TcpStreamIO]> HttpTransportRead<TlsStream> {
+  match transport {
+    HttpTransport(stream) -> match tls_stream_read(stream, limit) {
+      TlsStreamReadData(returned, data) -> HttpTransportReadData<TlsStream>(
+        http_transport_tls_wrap(returned),
+        data
+      )
+      TlsStreamReadClosed(returned) -> HttpTransportReadClosed<TlsStream>(
+        http_transport_tls_wrap(returned)
+      )
+      TlsStreamReadFailed(returned, error) -> HttpTransportReadFailed<TlsStream>(
+        http_transport_tls_wrap(returned),
+        HttpTransportTls(error)
+      )
+    }
+  }
+}
+
+pub(package) fn http_transport_tls_write_direct(
+  transport: owned HttpTransport<TlsStream>,
+  data: Bytes
+) -[HttpTransportRelease<TlsStream>, TcpReadiness, TcpStreamIO]> HttpTransportWrite<TlsStream> {
+  match transport {
+    HttpTransport(stream) -> match tls_stream_write(stream, data) {
+      TlsStreamWrote(returned, wrote) -> HttpTransportWrote<TlsStream>(
+        http_transport_tls_wrap(returned),
+        wrote
+      )
+      TlsStreamWriteFailed(returned, error) -> HttpTransportWriteFailed<TlsStream>(
+        http_transport_tls_wrap(returned),
+        HttpTransportTls(error)
+      )
+    }
+  }
+}
+
+pub(package) fn http_transport_tls_close_direct(
+  transport: owned HttpTransport<TlsStream>
+) -[HttpTransportRelease<TlsStream>, TcpReadiness, TcpStreamIO]> Result<nil, HttpTransportError> {
+  match transport {
+    HttpTransport(stream) -> match tls_stream_close(stream) {
+      Err(error) -> result_err<nil, HttpTransportError>(HttpTransportTls(error))
+      Ok(done) -> result_ok<nil, HttpTransportError>(nil)
+    }
+  }
+}
+
+pub(package) fn http_transport_tls_release_direct(
+  transport: HttpTransport<TlsStream>
+) -[TcpStreamIO]> i64 {
+  match transport {
+    HttpTransport(stream) -> stream.drop()
+  }
+}
+
+--- Interpret production HTTP transport state through TLS over TCP.
+pub fn http_transport_with_tls<T, E>(
+  body: () -[HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, E]> T
+) -[TcpReadiness, TcpStreamIO, E]> T {
+  handle {
+    handle body() {
+      HttpTransportIO<TlsStream>.read(transport, limit) ->
+        resume(http_transport_tls_read_direct(transport, limit))
+      HttpTransportIO<TlsStream>.write(transport, data) ->
+        resume(http_transport_tls_write_direct(transport, data))
+      HttpTransportIO<TlsStream>.close(transport) ->
+        resume(http_transport_tls_close_direct(transport))
+    }
+  } {
+    HttpTransportRelease<TlsStream>.release(transport) ->
+      resume(http_transport_tls_release_direct(transport))
+  }
+}
+
+fn http_transport_replay_read_direct(
+  transport: owned HttpTransport<HttpReplayTransportState>,
+  limit: usize
+) -[HttpTransportRelease<HttpReplayTransportState>]> HttpTransportRead<HttpReplayTransportState> {
+  match transport {
+    HttpTransport(wrapped) -> match wrapped {
+      HttpReplayTransportState(state) -> {
+      let requested = http_transport_usize_to_i64(limit)
+      if state.read_timeout_at >= 0 and state.input_offset >= state.read_timeout_at {
+        http_transport_probe_add(state.probe, 6, 1)
+        HttpTransportReadFailed<HttpReplayTransportState>(
+          http_transport_replay_wrap(http_transport_replay_faulted(state)),
+          HttpTransportReadTimeout(http_transport_i64_to_usize(state.input_offset))
+        )
+      } else { if state.input_offset >= state.input_end {
+          http_transport_probe_add(state.probe, 0, 1)
+          HttpTransportReadClosed<HttpReplayTransportState>(http_transport_replay_wrap(HttpReplayTransportState(state)))
+        } else {
+          let before_timeout = if state.read_timeout_at >= 0 {
+            state.read_timeout_at - state.input_offset
+          } else {
+            state.input_end - state.input_offset
+          }
+          let available = state.input_end - state.input_offset
+          let count = if requested < available { requested } else { available }
+            |> http_transport_min_i64(state.read_fragment)
+            |> http_transport_min_i64(before_timeout)
+          if count <= 0 {
+            http_transport_probe_add(state.probe, 6, 1)
+            HttpTransportReadFailed<HttpReplayTransportState>(
+              http_transport_replay_wrap(http_transport_replay_faulted(state)),
+              HttpTransportReadTimeout(http_transport_i64_to_usize(state.input_offset))
+            )
+          } else {
+            let source = bytes_to_vector(state.input)
+            let data = bytes_from_slice(source[http_transport_i64_to_usize(state.input_offset)..http_transport_i64_to_usize(state.input_offset + count)])
+            http_transport_probe_add(state.probe, 0, 1)
+            http_transport_probe_add(state.probe, 1, count)
+            HttpTransportReadData<HttpReplayTransportState>(
+              http_transport_replay_wrap(HttpReplayTransportState(HttpReplayTransportParts {
+                input: state.input,
+                input_offset: state.input_offset + count,
+                input_end: state.input_end,
+                expected_output: state.expected_output,
+                output_offset: state.output_offset,
+                read_fragment: state.read_fragment,
+                write_fragment: state.write_fragment,
+                read_timeout_at: state.read_timeout_at,
+                write_timeout_at: state.write_timeout_at,
+                status: state.status,
+                probe: state.probe
+              })),
+              data
+            )
+          }
+        } }
+      }
+    }
+  }
+}
+
+fn http_transport_replay_write_direct(
+  transport: owned HttpTransport<HttpReplayTransportState>,
+  data: Bytes
+) -[HttpTransportRelease<HttpReplayTransportState>]> HttpTransportWrite<HttpReplayTransportState> {
+  match transport {
+    HttpTransport(wrapped) -> match wrapped {
+      HttpReplayTransportState(state) -> {
+      if state.write_timeout_at >= 0 and state.output_offset >= state.write_timeout_at {
+        http_transport_probe_add(state.probe, 6, 1)
+        HttpTransportWriteFailed<HttpReplayTransportState>(
+          http_transport_replay_wrap(http_transport_replay_faulted(state)),
+          HttpTransportWriteTimeout(http_transport_i64_to_usize(state.output_offset))
+        )
+      } else {
+        let offered = bytes_len(data)
+        let expected = bytes_len(state.expected_output)
+        let before_timeout = if state.write_timeout_at >= 0 {
+          state.write_timeout_at - state.output_offset
+        } else {
+          offered
+        }
+        let count = if state.write_fragment < offered { state.write_fragment } else { offered }
+          |> http_transport_min_i64(before_timeout)
+        if count <= 0 {
+          http_transport_probe_add(state.probe, 6, 1)
+          HttpTransportWriteFailed<HttpReplayTransportState>(
+            http_transport_replay_wrap(http_transport_replay_faulted(state)),
+            HttpTransportWriteTimeout(http_transport_i64_to_usize(state.output_offset))
+          )
+        } else { if state.output_offset + count > expected {
+            http_transport_probe_add(state.probe, 6, 1)
+            HttpTransportWriteFailed<HttpReplayTransportState>(
+              http_transport_replay_wrap(http_transport_replay_faulted(state)),
+              HttpTransportUnexpectedWrite(http_transport_i64_to_usize(expected))
+            )
+          } else {
+            let mut mismatch = 0 - 1
+            let mut index = 0
+            while index < count {
+              if bytes_get(data, index).unwrap() != bytes_get(state.expected_output, state.output_offset + index).unwrap() and mismatch < 0 {
+                mismatch = state.output_offset + index
+              } else { 0 }
+              index = index + 1
+            }
+            if mismatch >= 0 {
+              http_transport_probe_add(state.probe, 6, 1)
+              HttpTransportWriteFailed<HttpReplayTransportState>(
+                http_transport_replay_wrap(http_transport_replay_faulted(state)),
+                HttpTransportWriteMismatch(http_transport_i64_to_usize(mismatch))
+              )
+            } else {
+              http_transport_probe_add(state.probe, 2, 1)
+              http_transport_probe_add(state.probe, 3, count)
+              HttpTransportWrote<HttpReplayTransportState>(
+                http_transport_replay_wrap(HttpReplayTransportState(HttpReplayTransportParts {
+                  input: state.input,
+                  input_offset: state.input_offset,
+                  input_end: state.input_end,
+                  expected_output: state.expected_output,
+                  output_offset: state.output_offset + count,
+                  read_fragment: state.read_fragment,
+                  write_fragment: state.write_fragment,
+                  read_timeout_at: state.read_timeout_at,
+                  write_timeout_at: state.write_timeout_at,
+                  status: state.status,
+                  probe: state.probe
+                })),
+                http_transport_i64_to_usize(count)
+              )
+            }
+          } }
+      }
+      }
+    }
+  }
+}
+
+fn http_transport_replay_close_direct(
+  transport: owned HttpTransport<HttpReplayTransportState>
+) -[HttpTransportRelease<HttpReplayTransportState>]> Result<nil, HttpTransportError> {
+  match transport {
+    HttpTransport(wrapped) -> match wrapped {
+      HttpReplayTransportState(state) -> {
+      http_transport_probe_add(state.probe, 4, 1)
+      let remaining = bytes_len(state.expected_output) - state.output_offset
+      if remaining == 0 {
+        result_ok<nil, HttpTransportError>(nil)
+      } else {
+        http_transport_probe_add(state.probe, 6, 1)
+        result_err<nil, HttpTransportError>(
+          HttpTransportWriteIncomplete(http_transport_i64_to_usize(remaining))
+        )
+      }
+      }
+    }
+  }
+}
+
+fn http_transport_replay_release_direct(
+  transport: HttpTransport<HttpReplayTransportState>
+) -> i64 {
+  match transport {
+    HttpTransport(wrapped) -> match wrapped {
+      HttpReplayTransportState(state) -> {
+      http_transport_probe_add(state.probe, 5, 1)
+      match state.status {
+        HttpReplayTransportFaulted -> 0
+        HttpReplayTransportHealthy -> if bytes_len(state.expected_output) == state.output_offset { 0 }
+        else {
+          http_transport_probe_add(state.probe, 6, 1)
+          0 - 1
+        }
+      }
+      }
+    }
+  }
+}
+
+pub(package) fn http_transport_with_replay<T, E>(
+  body: () -[HttpTransportIO<HttpReplayTransportState>, HttpTransportRelease<HttpReplayTransportState>, E]> T
+) -[E]> T {
+  handle {
+    handle body() {
+      HttpTransportIO<HttpReplayTransportState>.read(transport, limit) ->
+        resume(http_transport_replay_read_direct(transport, limit))
+      HttpTransportIO<HttpReplayTransportState>.write(transport, data) ->
+        resume(http_transport_replay_write_direct(transport, data))
+      HttpTransportIO<HttpReplayTransportState>.close(transport) ->
+        resume(http_transport_replay_close_direct(transport))
+    }
+  } {
+    HttpTransportRelease<HttpReplayTransportState>.release(transport) ->
+      resume(http_transport_replay_release_direct(transport))
+  }
+}

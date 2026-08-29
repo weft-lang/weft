@@ -1,0 +1,231 @@
+-- stdlib/http_replay.weft — deterministic authority-free HTTP transcripts
+--
+-- Replay interprets the same parameterized HttpClient, HttpBodyIO, connection,
+-- body and pool contracts as production TLS. Only the transport state and its
+-- handlers differ. No DNS, socket, readiness, clock or random authority is
+-- present inside the replay scope.
+
+use stdlib/bytes.{Bytes, bytes_len}
+use stdlib/http.{HttpConnectionPersistent, HttpLimits, HttpMethod, HttpRequestHead}
+use stdlib/http_endpoint.{HttpClient, HttpClientRequestFailed, HttpClientResponse, HttpExchangeBody, HttpExchangeUnsupportedScheme, HttpClientBegin, http_client_response_transport, http_client_reuse_transport}
+use stdlib/http_stream.{HttpBodyIO, HttpBodyTransport, HttpConnectionClientOrigin, http_body_cancel_direct, http_body_close_connection_direct, http_body_finish_direct, http_body_read_direct, http_body_write_direct, http_connection_from_transport}
+use stdlib/http_transport.{HttpReplayTransportState, HttpTransportIO, HttpTransportRelease, HttpTransportReplayConsumed, http_transport_from_replay, http_transport_with_replay}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/url.{Url, UrlHttps}
+use stdlib/vector.{vector_get_in_bounds, vector_push, vector_set, vector_with_capacity}
+use stdlib/vector_type.{Vector}
+
+--- Read-side fault placement for one replay transcript.
+pub type HttpReplayReadFault {
+  --- Deliver the complete configured input without an injected timeout.
+  HttpReplayReadComplete,
+    --- Fail reads once this absolute input byte offset is reached.
+    HttpReplayReadTimeoutAt(usize)
+}
+
+--- Write-side fault placement for one replay transcript.
+pub type HttpReplayWriteFault {
+  --- Accept the complete expected output without an injected timeout.
+  HttpReplayWriteComplete,
+    --- Fail writes once this absolute output byte offset is reached.
+    HttpReplayWriteTimeoutAt(usize)
+}
+
+--- An invalid bounded replay configuration.
+pub type HttpReplayConfigError {
+  --- A read fragment must contain between one and 16 KiB.
+  HttpReplayReadFragmentLimit(usize),
+    --- A write fragment must contain between one and 16 KiB.
+    HttpReplayWriteFragmentLimit(usize)
+}
+
+type HttpReplayFixtureParts {
+  input: Bytes,
+    expected_output: Bytes,
+    read_fragment: i64,
+    write_fragment: i64,
+    read_timeout_at: i64,
+    write_timeout_at: i64,
+    probe: Vector<i64>
+}
+
+--- One immutable, single-session HTTP transcript and its shared probe.
+---
+--- The input may deliberately be truncated or malformed. Those are protocol
+--- observations, not invalid fixture construction, and therefore flow through
+--- the ordinary HTTP body/head error types.
+pub type HttpReplayFixture = opaque HttpReplayFixtureParts
+
+--- Exact observations made by one replay session.
+pub type HttpReplayStats {
+  --- Number of bounded transport reads, including terminal EOF reads.
+  read_calls: i64,
+    --- Number of input bytes delivered.
+    read_bytes: i64,
+    --- Number of accepted bounded transport writes.
+    write_calls: i64,
+    --- Number of output bytes accepted.
+    write_bytes: i64,
+    --- Number of graceful close operations.
+    closes: i64,
+    --- Number of abandoned-owner releases.
+    releases: i64,
+    --- Number of transport failures observed or found during cleanup.
+    errors: i64,
+    --- Number of accepted initial client begins.
+    begins: i64,
+    --- Number of rejected attempts to reuse a consumed fixture as a new session.
+    repeated_begins: i64
+}
+
+fn http_replay_usize_to_i64(value: usize) -> i64 {
+  __u64_to_i64(__usize_to_u64(value))
+}
+
+fn http_replay_fragment_valid(value: usize) -> bool {
+  let count = http_replay_usize_to_i64(value)
+  count > 0 and count <= 16384
+}
+
+fn http_replay_read_timeout(fault: HttpReplayReadFault) -> i64 {
+  match fault {
+    HttpReplayReadComplete -> 0 - 1
+    HttpReplayReadTimeoutAt(offset) -> http_replay_usize_to_i64(offset)
+  }
+}
+
+fn http_replay_write_timeout(fault: HttpReplayWriteFault) -> i64 {
+  match fault {
+    HttpReplayWriteComplete -> 0 - 1
+    HttpReplayWriteTimeoutAt(offset) -> http_replay_usize_to_i64(offset)
+  }
+}
+
+fn http_replay_probe_new() -> Vector<i64> {
+  let probe = vector_with_capacity<i64>(9)
+  for index in 0..9 { vector_push<i64>(probe, 0) }
+  probe
+}
+
+fn http_replay_probe_add(probe: Vector<i64>, slot: i64, amount: i64) -> nil {
+  vector_set<i64>(probe, slot, vector_get_in_bounds<i64>(probe, slot) + amount)
+  nil
+}
+
+--- Construct a bounded single-session replay fixture.
+pub fn http_replay_fixture(
+  input: Bytes,
+  expected_output: Bytes,
+  read_fragment: usize,
+  write_fragment: usize,
+  read_fault: HttpReplayReadFault,
+  write_fault: HttpReplayWriteFault
+) -> Result<HttpReplayFixture, HttpReplayConfigError> {
+  if not http_replay_fragment_valid(read_fragment) {
+    result_err<HttpReplayFixture, HttpReplayConfigError>(
+      HttpReplayReadFragmentLimit(read_fragment)
+    )
+  } else { if not http_replay_fragment_valid(write_fragment) {
+      result_err<HttpReplayFixture, HttpReplayConfigError>(
+        HttpReplayWriteFragmentLimit(write_fragment)
+      )
+    } else {
+      result_ok<HttpReplayFixture, HttpReplayConfigError>(HttpReplayFixture(HttpReplayFixtureParts {
+        input: input,
+          expected_output: expected_output,
+          read_fragment: http_replay_usize_to_i64(read_fragment),
+          write_fragment: http_replay_usize_to_i64(write_fragment),
+          read_timeout_at: http_replay_read_timeout(read_fault),
+          write_timeout_at: http_replay_write_timeout(write_fault),
+          probe: http_replay_probe_new()
+      }))
+    } }
+}
+
+--- Snapshot the exact transport and session observations made so far.
+pub fn http_replay_stats(fixture: HttpReplayFixture) -> HttpReplayStats {
+  match fixture {
+    HttpReplayFixture(parts) -> HttpReplayStats {
+      read_calls: vector_get_in_bounds<i64>(parts.probe, 0),
+        read_bytes: vector_get_in_bounds<i64>(parts.probe, 1),
+        write_calls: vector_get_in_bounds<i64>(parts.probe, 2),
+        write_bytes: vector_get_in_bounds<i64>(parts.probe, 3),
+        closes: vector_get_in_bounds<i64>(parts.probe, 4),
+        releases: vector_get_in_bounds<i64>(parts.probe, 5),
+        errors: vector_get_in_bounds<i64>(parts.probe, 6),
+        begins: vector_get_in_bounds<i64>(parts.probe, 7),
+        repeated_begins: vector_get_in_bounds<i64>(parts.probe, 8)
+    }
+  }
+}
+
+fn http_replay_client_begin(
+  fixture: HttpReplayFixtureParts,
+  url: Url,
+  request: HttpRequestHead,
+  limits: HttpLimits
+) -[HttpTransportIO<HttpReplayTransportState>, HttpTransportRelease<HttpReplayTransportState>]> HttpClientBegin<HttpReplayTransportState> {
+  match url.scheme() {
+    UrlHttps -> if vector_get_in_bounds<i64>(fixture.probe, 7) != 0 {
+      http_replay_probe_add(fixture.probe, 8, 1)
+      HttpClientRequestFailed(HttpExchangeBody(HttpBodyTransport(HttpTransportReplayConsumed)))
+    } else {
+      http_replay_probe_add(fixture.probe, 7, 1)
+      let transport = http_transport_from_replay(
+        fixture.input,
+        bytes_len(fixture.input),
+        fixture.expected_output,
+        fixture.read_fragment,
+        fixture.write_fragment,
+        fixture.read_timeout_at,
+        fixture.write_timeout_at,
+        fixture.probe
+      )
+      let connection = http_connection_from_transport<HttpReplayTransportState>(
+        transport,
+        vector_with_capacity<u8>(0),
+        0,
+        HttpConnectionPersistent,
+        HttpConnectionClientOrigin(url.origin())
+      )
+      http_client_reuse_transport<HttpReplayTransportState>(url, connection, request, limits)
+    }
+    scheme -> HttpClientRequestFailed(HttpExchangeUnsupportedScheme(scheme))
+  }
+}
+
+--- Interpret client and body operations against one deterministic transcript.
+---
+--- The scope requires no network, readiness, time, random or process
+--- authority. Returned HTTP owners must be completed, closed or dropped before
+--- the scope exits; their exact release remains installed around all handlers.
+pub fn http_client_with_replay<T, E>(
+  fixture: HttpReplayFixture,
+  body: () -[HttpClient<HttpReplayTransportState>, HttpBodyIO<HttpReplayTransportState>, HttpTransportRelease<HttpReplayTransportState>, E]> T
+) -[E]> T {
+  match fixture {
+    HttpReplayFixture(parts) -> http_transport_with_replay<T, E>(() => {
+      handle {
+        handle body() {
+          HttpClient<HttpReplayTransportState>.begin(url, request, limits) ->
+            resume(http_replay_client_begin(parts, url, request, limits))
+          HttpClient<HttpReplayTransportState>.reuse(url, connection, request, limits) ->
+            resume(http_client_reuse_transport<HttpReplayTransportState>(url, connection, request, limits))
+          HttpClient<HttpReplayTransportState>.response(connection, request_method, limits) ->
+            resume(http_client_response_transport<HttpReplayTransportState>(connection, request_method, limits))
+        }
+      } {
+        HttpBodyIO<HttpReplayTransportState>.read(stream, limit) ->
+          resume(http_body_read_direct<HttpReplayTransportState>(stream, limit))
+        HttpBodyIO<HttpReplayTransportState>.write(stream, data) ->
+          resume(http_body_write_direct<HttpReplayTransportState>(stream, data))
+        HttpBodyIO<HttpReplayTransportState>.finish(stream, trailers) ->
+          resume(http_body_finish_direct<HttpReplayTransportState>(stream, trailers))
+        HttpBodyIO<HttpReplayTransportState>.cancel(stream) ->
+          resume(http_body_cancel_direct<HttpReplayTransportState>(stream))
+        HttpBodyIO<HttpReplayTransportState>.close(connection) ->
+          resume(http_body_close_connection_direct<HttpReplayTransportState>(connection))
+      }
+    })
+  }
+}

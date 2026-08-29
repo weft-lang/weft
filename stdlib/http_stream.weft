@@ -9,9 +9,10 @@
 use stdlib/bytes.{Bytes, bytes_empty, bytes_from_slice, bytes_from_vector, bytes_get, bytes_is_empty, bytes_len, bytes_to_vector}
 use stdlib/drop.{Drop}
 use stdlib/http.{HttpBodyFraming, HttpBodyTooLarge, HttpChunkHeadData, HttpChunkHeadEnd, HttpChunkHeadFailed, HttpChunkHeadNeedMore, HttpChunked, HttpConnectTunnel, HttpConnectionClose, HttpConnectionPersistent, HttpConnectionReuse, HttpContentLength, HttpForbiddenTrailer, HttpHeaders, HttpInvalidChunkTerminator, HttpLimits, HttpNoBody, HttpParseError, HttpProtocolSwitch, HttpUntilConnectionClose, http_encode_chunk, http_encode_chunk_end, http_headers_empty, http_headers_len, http_limits_body_bytes, http_parse_chunk_head}
+use stdlib/http_transport.{HttpTransport, HttpTransportError, HttpTransportIO, HttpTransportInvalidProgress, HttpTransportReadClosed, HttpTransportReadData, HttpTransportReadFailed, HttpTransportRelease, HttpTransportWriteFailed, HttpTransportWrote, http_transport_close, http_transport_from_tls, http_transport_read, http_transport_with_tls, http_transport_write}
 use stdlib/result.{Err, Ok, Result, result_err, result_ok}
 use stdlib/tcp.{TcpReadiness, TcpStreamIO}
-use stdlib/tls_stream.{TlsStream, TlsStreamError, TlsStreamInvalidProgress, TlsStreamRead, TlsStreamReadClosed, TlsStreamReadData, TlsStreamReadFailed, TlsStreamWrite, TlsStreamWriteFailed, TlsStreamWrote, tls_stream_close, tls_stream_read, tls_stream_write}
+use stdlib/tls_stream.{TlsStream}
 use stdlib/url.{UrlOrigin}
 use stdlib/vector.{vector_get_in_bounds, vector_len, vector_push, vector_with_capacity}
 use stdlib/vector_type.{Vector}
@@ -19,7 +20,7 @@ use stdlib/vector_type.{Vector}
 --- A bounded body operation failure.
 pub type HttpBodyError {
   --- The TLS transport failed while preserving the body owner.
-  HttpBodyTransport(TlsStreamError),
+  HttpBodyTransport(HttpTransportError),
     --- The HTTP framing parser rejected the wire prefix.
     HttpBodyProtocol(HttpParseError),
     --- A caller requested an empty or overlarge plaintext fragment.
@@ -40,7 +41,7 @@ pub type HttpBodyError {
 ---
 --- A connection is returned only after the body framing boundary is proven.
 --- Dropping it closes the underlying TLS/TCP resource exactly once.
-pub type HttpConnection = opaque(owned TlsStream, Vector<u8>, i64, bool, HttpConnectionIdentity)
+pub type HttpConnection<S> = opaque(owned HttpTransport<S>, Vector<u8>, i64, bool, HttpConnectionIdentity)
 
 --- The authority identity retained by an established HTTP connection.
 ---
@@ -69,38 +70,38 @@ type HttpBodyState {
 ---
 --- Every operation moves the stream and returns its unique successor. Drop
 --- closes an incomplete message rather than returning a reusable connection.
-pub type HttpBodyStream = opaque(owned HttpConnection, HttpBodyState, HttpLimits, bool)
+pub type HttpBodyStream<S> = opaque(owned HttpConnection<S>, HttpBodyState, HttpLimits, bool)
 
 --- One bounded read outcome.
-pub type HttpBodyReadOutcome {
+pub type HttpBodyReadOutcome<S> {
   --- A non-empty content fragment arrived with the successor stream.
-  HttpBodyReadData(owned HttpBodyStream, Bytes),
+  HttpBodyReadData(owned HttpBodyStream<S>, Bytes),
     --- The body ended and the connection is safe for another HTTP message.
-    HttpBodyReadEnd(owned HttpConnection, HttpHeaders),
+    HttpBodyReadEnd(owned HttpConnection<S>, HttpHeaders),
     --- The body ended on a connection that was then consumed and closed.
     HttpBodyReadEndClosed(HttpHeaders),
     --- Reading failed without fabricating or losing the stream owner.
-    HttpBodyReadFailed(owned HttpBodyStream, HttpBodyError),
+    HttpBodyReadFailed(owned HttpBodyStream<S>, HttpBodyError),
     --- Body bytes completed, but authenticated connection close failed.
     HttpBodyReadCloseFailed(HttpBodyError)
 }
 
 --- One bounded write outcome.
-pub type HttpBodyWriteOutcome {
+pub type HttpBodyWriteOutcome<S> {
   --- The complete input fragment was accepted with the successor stream.
-  HttpBodyWrote(owned HttpBodyStream, usize),
+  HttpBodyWrote(owned HttpBodyStream<S>, usize),
     --- Writing failed without fabricating or losing the stream owner.
-    HttpBodyWriteFailed(owned HttpBodyStream, HttpBodyError)
+    HttpBodyWriteFailed(owned HttpBodyStream<S>, HttpBodyError)
 }
 
 --- Completion of one outbound body.
-pub type HttpBodyFinishOutcome {
+pub type HttpBodyFinishOutcome<S> {
   --- The exact body boundary was written and the connection remains usable.
-  HttpBodyFinished(owned HttpConnection),
+  HttpBodyFinished(owned HttpConnection<S>),
     --- The exact body boundary was written and the connection was then closed.
     HttpBodyFinishedClosed,
     --- Completion failed while returning the stream for explicit policy.
-    HttpBodyFinishFailed(owned HttpBodyStream, HttpBodyError),
+    HttpBodyFinishFailed(owned HttpBodyStream<S>, HttpBodyError),
     --- The boundary completed, but authenticated connection close failed.
     HttpBodyFinishCloseFailed(HttpBodyError)
 }
@@ -109,17 +110,17 @@ pub type HttpBodyFinishOutcome {
 ---
 --- Production installs this through `http_body_with_tls`; future mock/replay
 --- handlers consume the same typed stream transitions without network access.
-pub effect HttpBodyIO {
+pub effect HttpBodyIO<S> {
   --- Read one bounded content fragment or terminal body boundary.
-  fn read(stream: owned HttpBodyStream, limit: usize) -> HttpBodyReadOutcome
+  fn read(stream: owned HttpBodyStream<S>, limit: usize) -> HttpBodyReadOutcome<S>
   --- Write one bounded content fragment.
-  fn write(stream: owned HttpBodyStream, data: Bytes) -> HttpBodyWriteOutcome
+  fn write(stream: owned HttpBodyStream<S>, data: Bytes) -> HttpBodyWriteOutcome<S>
   --- Finish an outbound body, supplying trailers only for chunked framing.
-  fn finish(stream: owned HttpBodyStream, trailers: HttpHeaders) -> HttpBodyFinishOutcome
+  fn finish(stream: owned HttpBodyStream<S>, trailers: HttpHeaders) -> HttpBodyFinishOutcome<S>
   --- Cancel an active body and close its underlying connection.
-  fn cancel(stream: owned HttpBodyStream) -> Result<nil, HttpBodyError>
+  fn cancel(stream: owned HttpBodyStream<S>) -> Result<nil, HttpBodyError>
   --- Close and consume an idle connection.
-  fn close(connection: owned HttpConnection) -> Result<nil, HttpBodyError>
+  fn close(connection: owned HttpConnection<S>) -> Result<nil, HttpBodyError>
 }
 
 fn http_body_usize_to_i64(value: usize) -> i64 {
@@ -132,14 +133,14 @@ fn http_body_i64_to_usize(value: i64) -> usize {
 
 fn http_body_fragment_limit() -> i64 { 16384 }
 
-fn http_connection_wrap(
-  transport: owned TlsStream,
+fn http_connection_wrap<S>(
+  transport: owned HttpTransport<S>,
   buffered: Vector<u8>,
   offset: i64,
   reusable: bool,
   identity: HttpConnectionIdentity
-) -[TcpStreamIO]> owned HttpConnection {
-  HttpConnection((transport, buffered, offset, reusable, identity))
+) -[HttpTransportRelease<S>]> owned HttpConnection<S> {
+  HttpConnection<S>((transport, buffered, offset, reusable, identity))
 }
 
 pub (package) fn http_connection_from_tls(
@@ -148,8 +149,24 @@ pub (package) fn http_connection_from_tls(
   offset: i64,
   reuse: HttpConnectionReuse,
   identity: HttpConnectionIdentity
-) -[TcpStreamIO]> owned HttpConnection {
-  http_connection_wrap(
+) -[HttpTransportRelease<TlsStream>, TcpStreamIO]> owned HttpConnection<TlsStream> {
+  http_connection_wrap<TlsStream>(
+    http_transport_from_tls(transport),
+    buffered,
+    offset,
+    match reuse { HttpConnectionPersistent -> true HttpConnectionClose -> false },
+    identity
+  )
+}
+
+pub(package) fn http_connection_from_transport<S>(
+  transport: owned HttpTransport<S>,
+  buffered: Vector<u8>,
+  offset: i64,
+  reuse: HttpConnectionReuse,
+  identity: HttpConnectionIdentity
+) -[HttpTransportRelease<S>]> owned HttpConnection<S> {
+  http_connection_wrap<S>(
     transport,
     buffered,
     offset,
@@ -158,25 +175,25 @@ pub (package) fn http_connection_from_tls(
   )
 }
 
-impl Drop for HttpConnection {
-  fn drop(self) -[TcpStreamIO]> i64 {
+impl<S> Drop for HttpConnection<S> {
+  fn drop(self: HttpConnection<S>) -[HttpTransportRelease<S>]> i64 {
     match self {
       HttpConnection((transport, buffered, offset, reusable, identity)) -> transport.drop()
     }
   }
 }
 
-fn http_body_stream_wrap(
-  connection: owned HttpConnection,
+fn http_body_stream_wrap<S>(
+  connection: owned HttpConnection<S>,
   state: HttpBodyState,
   limits: HttpLimits,
   close_at_end: bool
-) -[TcpStreamIO]> owned HttpBodyStream {
-  HttpBodyStream((connection, state, limits, close_at_end))
+) -[HttpTransportRelease<S>]> owned HttpBodyStream<S> {
+  HttpBodyStream<S>((connection, state, limits, close_at_end))
 }
 
-impl Drop for HttpBodyStream {
-  fn drop(self) -[TcpStreamIO]> i64 {
+impl<S> Drop for HttpBodyStream<S> {
+  fn drop(self: HttpBodyStream<S>) -[HttpTransportRelease<S>]> i64 {
     match self {
       HttpBodyStream((connection, state, limits, close_at_end)) -> connection.drop()
     }
@@ -187,19 +204,19 @@ fn http_body_limit_i64(limits: HttpLimits) -> i64 {
   http_body_usize_to_i64(http_limits_body_bytes(limits))
 }
 
-pub (package) fn http_body_buffer_available(connection: borrow HttpConnection) -> i64 {
+pub(package) fn http_body_buffer_available<S>(connection: borrow HttpConnection<S>) -> i64 {
   match connection {
     HttpConnection((transport, buffered, offset, reusable, identity)) -> vector_len<u8>(buffered) - offset
   }
 }
 
-fn http_body_buffer_byte(connection: borrow HttpConnection, relative: i64) -> i64 {
+fn http_body_buffer_byte<S>(connection: borrow HttpConnection<S>, relative: i64) -> i64 {
   match connection {
     HttpConnection((transport, buffered, offset, reusable, identity)) -> __u64_to_i64(__u8_to_u64(vector_get_in_bounds<u8>(buffered, offset + relative)))
   }
 }
 
-pub (package) fn http_body_buffer_copy(connection: borrow HttpConnection, count: i64) -> Bytes {
+pub(package) fn http_body_buffer_copy<S>(connection: borrow HttpConnection<S>, count: i64) -> Bytes {
   match connection {
     HttpConnection((transport, buffered, offset, reusable, identity)) -> {
       let out = vector_with_capacity<u8>(count)
@@ -211,7 +228,7 @@ pub (package) fn http_body_buffer_copy(connection: borrow HttpConnection, count:
   }
 }
 
-pub (package) fn http_body_buffered_bytes(connection: borrow HttpConnection) -> Bytes {
+pub(package) fn http_body_buffered_bytes<S>(connection: borrow HttpConnection<S>) -> Bytes {
   match connection {
     HttpConnection((transport, buffered, offset, reusable, identity)) -> {
       let count = vector_len<u8>(buffered) - offset
@@ -224,13 +241,13 @@ pub (package) fn http_body_buffered_bytes(connection: borrow HttpConnection) -> 
   }
 }
 
-pub (package) type HttpConnectionSnapshot {
-  HttpConnectionSnapshotted(owned HttpConnection, Bytes)
+pub(package) type HttpConnectionSnapshot<S> {
+  HttpConnectionSnapshotted(owned HttpConnection<S>, Bytes)
 }
 
-pub (package) fn http_connection_snapshot(
-  connection: owned HttpConnection
-) -[TcpStreamIO]> HttpConnectionSnapshot {
+pub(package) fn http_connection_snapshot<S>(
+  connection: owned HttpConnection<S>
+) -[HttpTransportRelease<S>]> HttpConnectionSnapshot<S> {
   match connection {
     HttpConnection((transport, buffered, offset, reusable, identity)) -> {
       let count = vector_len<u8>(buffered) - offset
@@ -239,19 +256,19 @@ pub (package) fn http_connection_snapshot(
         vector_push<u8>(out, vector_get_in_bounds<u8>(buffered, offset + index))
       }
       HttpConnectionSnapshotted(
-        http_connection_wrap(transport, buffered, offset, reusable, identity),
+        http_connection_wrap<S>(transport, buffered, offset, reusable, identity),
         bytes_from_vector(out)
       )
     }
   }
 }
 
-pub (package) fn http_body_connection_advance(
-  connection: owned HttpConnection,
+pub(package) fn http_body_connection_advance<S>(
+  connection: owned HttpConnection<S>,
   count: i64
-) -[TcpStreamIO]> owned HttpConnection {
+) -[HttpTransportRelease<S>]> owned HttpConnection<S> {
   match connection {
-    HttpConnection((transport, buffered, offset, reusable, identity)) -> http_connection_wrap(
+    HttpConnection((transport, buffered, offset, reusable, identity)) -> http_connection_wrap<S>(
       transport,
       buffered,
       offset + count,
@@ -261,18 +278,18 @@ pub (package) fn http_body_connection_advance(
   }
 }
 
-fn http_body_connection_take(
-  connection: owned HttpConnection,
+fn http_body_connection_take<S>(
+  connection: owned HttpConnection<S>,
   count: i64
-) -[TcpStreamIO]> (owned HttpConnection, Bytes) {
+) -[HttpTransportRelease<S>]> (owned HttpConnection<S>, Bytes) {
   let data = http_body_buffer_copy(connection, count)
   (http_body_connection_advance(connection, count), data)
 }
 
-fn http_body_connection_append(
-  connection: owned HttpConnection,
+fn http_body_connection_append<S>(
+  connection: owned HttpConnection<S>,
   data: Bytes
-) -[TcpStreamIO]> owned HttpConnection {
+) -[HttpTransportRelease<S>]> owned HttpConnection<S> {
   match connection {
     HttpConnection((transport, buffered, offset, reusable, identity)) -> {
       let values = bytes_to_vector(data)
@@ -284,14 +301,14 @@ fn http_body_connection_append(
       for index in 0..vector_len<u8>(values) {
         vector_push<u8>(compact, vector_get_in_bounds<u8>(values, index))
       }
-      http_connection_wrap(transport, compact, 0, reusable, identity)
+      http_connection_wrap<S>(transport, compact, 0, reusable, identity)
     }
   }
 }
 
-fn http_body_connection_compact(
-  connection: owned HttpConnection
-) -[TcpStreamIO]> owned HttpConnection {
+fn http_body_connection_compact<S>(
+  connection: owned HttpConnection<S>
+) -[HttpTransportRelease<S>]> owned HttpConnection<S> {
   match connection {
     HttpConnection((transport, buffered, offset, reusable, identity)) -> {
       let count = vector_len<u8>(buffered) - offset
@@ -299,17 +316,17 @@ fn http_body_connection_compact(
       for index in 0..count {
         vector_push<u8>(compact, vector_get_in_bounds<u8>(buffered, offset + index))
       }
-      http_connection_wrap(transport, compact, 0, reusable, identity)
+      http_connection_wrap<S>(transport, compact, 0, reusable, identity)
     }
   }
 }
 
-fn http_body_connection_can_reuse(connection: borrow HttpConnection) -> bool {
+fn http_body_connection_can_reuse<S>(connection: borrow HttpConnection<S>) -> bool {
   match connection { HttpConnection((transport, buffered, offset, reusable, identity)) -> reusable }
 }
 
-pub (package) fn http_connection_matches_origin(
-  connection: borrow HttpConnection,
+pub(package) fn http_connection_matches_origin<S>(
+  connection: borrow HttpConnection<S>,
   origin: UrlOrigin
 ) -> bool {
   match connection {
@@ -320,11 +337,11 @@ pub (package) fn http_connection_matches_origin(
   }
 }
 
-pub (package) fn http_connection_is_reusable(connection: borrow HttpConnection) -> bool {
+pub(package) fn http_connection_is_reusable<S>(connection: borrow HttpConnection<S>) -> bool {
   http_body_connection_can_reuse(connection)
 }
 
-pub (package) fn http_connection_has_client_origin(connection: borrow HttpConnection) -> bool {
+pub(package) fn http_connection_has_client_origin<S>(connection: borrow HttpConnection<S>) -> bool {
   match connection {
     HttpConnection((transport, buffered, offset, reusable, identity)) -> match identity {
       HttpConnectionClientOrigin(origin) -> true
@@ -333,11 +350,11 @@ pub (package) fn http_connection_has_client_origin(connection: borrow HttpConnec
   }
 }
 
-pub (package) fn http_connection_disallow_reuse(
-  connection: owned HttpConnection
-) -[TcpStreamIO]> owned HttpConnection {
+pub(package) fn http_connection_disallow_reuse<S>(
+  connection: owned HttpConnection<S>
+) -[HttpTransportRelease<S>]> owned HttpConnection<S> {
   match connection {
-    HttpConnection((transport, buffered, offset, reusable, identity)) -> http_connection_wrap(
+    HttpConnection((transport, buffered, offset, reusable, identity)) -> http_connection_wrap<S>(
       transport,
       buffered,
       offset,
@@ -347,121 +364,121 @@ pub (package) fn http_connection_disallow_reuse(
   }
 }
 
-pub (package) fn http_body_reader_open(
-  connection: owned HttpConnection,
+pub(package) fn http_body_reader_open<S>(
+  connection: owned HttpConnection<S>,
   framing: HttpBodyFraming,
   limits: HttpLimits,
   close_at_end: bool
-) -[TcpStreamIO]> Result<owned HttpBodyStream, HttpBodyError> {
+) -[HttpTransportRelease<S>]> Result<owned HttpBodyStream<S>, HttpBodyError> {
   match framing {
-    HttpNoBody -> result_ok<owned HttpBodyStream, HttpBodyError>(
-      http_body_stream_wrap(connection, HttpBodyReadNone, limits, close_at_end)
+    HttpNoBody -> result_ok<owned HttpBodyStream<S>, HttpBodyError>(
+      http_body_stream_wrap<S>(connection, HttpBodyReadNone, limits, close_at_end)
     )
-    HttpContentLength(count) -> result_ok<owned HttpBodyStream, HttpBodyError>(
-      http_body_stream_wrap(
+    HttpContentLength(count) -> result_ok<owned HttpBodyStream<S>, HttpBodyError>(
+      http_body_stream_wrap<S>(
       connection,
       HttpBodyReadFixed(http_body_usize_to_i64(count)),
       limits,
       close_at_end
     )
     )
-    HttpChunked -> result_ok<owned HttpBodyStream, HttpBodyError>(
-      http_body_stream_wrap(connection, HttpBodyReadChunkHead(0), limits, close_at_end)
+    HttpChunked -> result_ok<owned HttpBodyStream<S>, HttpBodyError>(
+      http_body_stream_wrap<S>(connection, HttpBodyReadChunkHead(0), limits, close_at_end)
     )
-    HttpUntilConnectionClose -> result_ok<owned HttpBodyStream, HttpBodyError>(
-      http_body_stream_wrap(connection, HttpBodyReadUntilClose(0), limits, true)
+    HttpUntilConnectionClose -> result_ok<owned HttpBodyStream<S>, HttpBodyError>(
+      http_body_stream_wrap<S>(connection, HttpBodyReadUntilClose(0), limits, true)
     )
-    HttpProtocolSwitch -> result_err<owned HttpBodyStream, HttpBodyError>(
+    HttpProtocolSwitch -> result_err<owned HttpBodyStream<S>, HttpBodyError>(
       HttpBodyUnsupportedUpgrade(HttpProtocolSwitch)
     )
-    HttpConnectTunnel -> result_err<owned HttpBodyStream, HttpBodyError>(
+    HttpConnectTunnel -> result_err<owned HttpBodyStream<S>, HttpBodyError>(
       HttpBodyUnsupportedUpgrade(HttpConnectTunnel)
     )
   }
 }
 
-pub (package) fn http_body_writer_open(
-  connection: owned HttpConnection,
+pub(package) fn http_body_writer_open<S>(
+  connection: owned HttpConnection<S>,
   framing: HttpBodyFraming,
   limits: HttpLimits,
   close_at_end: bool
-) -[TcpStreamIO]> Result<owned HttpBodyStream, HttpBodyError> {
+) -[HttpTransportRelease<S>]> Result<owned HttpBodyStream<S>, HttpBodyError> {
   match framing {
-    HttpNoBody -> result_ok<owned HttpBodyStream, HttpBodyError>(
-      http_body_stream_wrap(connection, HttpBodyWriteNone, limits, close_at_end)
+    HttpNoBody -> result_ok<owned HttpBodyStream<S>, HttpBodyError>(
+      http_body_stream_wrap<S>(connection, HttpBodyWriteNone, limits, close_at_end)
     )
-    HttpContentLength(count) -> result_ok<owned HttpBodyStream, HttpBodyError>(
-      http_body_stream_wrap(
+    HttpContentLength(count) -> result_ok<owned HttpBodyStream<S>, HttpBodyError>(
+      http_body_stream_wrap<S>(
       connection,
       HttpBodyWriteFixed(http_body_usize_to_i64(count)),
       limits,
       close_at_end
     )
     )
-    HttpChunked -> result_ok<owned HttpBodyStream, HttpBodyError>(
-      http_body_stream_wrap(connection, HttpBodyWriteChunked(0), limits, close_at_end)
+    HttpChunked -> result_ok<owned HttpBodyStream<S>, HttpBodyError>(
+      http_body_stream_wrap<S>(connection, HttpBodyWriteChunked(0), limits, close_at_end)
     )
-    HttpUntilConnectionClose -> result_ok<owned HttpBodyStream, HttpBodyError>(
-      http_body_stream_wrap(connection, HttpBodyWriteUntilClose(0), limits, true)
+    HttpUntilConnectionClose -> result_ok<owned HttpBodyStream<S>, HttpBodyError>(
+      http_body_stream_wrap<S>(connection, HttpBodyWriteUntilClose(0), limits, true)
     )
-    framing -> result_err<owned HttpBodyStream, HttpBodyError>(HttpBodyUnsupportedUpgrade(framing))
+    framing -> result_err<owned HttpBodyStream<S>, HttpBodyError>(HttpBodyUnsupportedUpgrade(framing))
   }
 }
 
-pub (package) type HttpConnectionReceive {
-  HttpConnectionReceived(owned HttpConnection),
-    HttpConnectionPeerClosed(owned HttpConnection),
-    HttpConnectionReceiveFailed(owned HttpConnection, HttpBodyError)
+pub(package) type HttpConnectionReceive<S> {
+  HttpConnectionReceived(owned HttpConnection<S>),
+    HttpConnectionPeerClosed(owned HttpConnection<S>),
+    HttpConnectionReceiveFailed(owned HttpConnection<S>, HttpBodyError)
 }
 
-pub (package) fn http_body_connection_receive(
-  connection: owned HttpConnection,
+pub(package) fn http_body_connection_receive<S>(
+  connection: owned HttpConnection<S>,
   limit: i64
-) -[TcpReadiness, TcpStreamIO]> HttpConnectionReceive {
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> HttpConnectionReceive<S> {
   match connection {
-    HttpConnection((transport, buffered, offset, reusable, identity)) -> match tls_stream_read(transport, http_body_i64_to_usize(limit)) {
-      TlsStreamReadData(transport, data) -> HttpConnectionReceived(
-        http_body_connection_append(
-        http_connection_wrap(transport, buffered, offset, reusable, identity),
+    HttpConnection((transport, buffered, offset, reusable, identity)) -> match http_transport_read<S>(transport, http_body_i64_to_usize(limit)) {
+      HttpTransportReadData(transport, data) -> HttpConnectionReceived(
+        http_body_connection_append<S>(
+        http_connection_wrap<S>(transport, buffered, offset, reusable, identity),
         data
       )
       )
-      TlsStreamReadClosed(transport) -> HttpConnectionPeerClosed(
-        http_connection_wrap(transport, buffered, offset, false, identity)
+      HttpTransportReadClosed(transport) -> HttpConnectionPeerClosed(
+        http_connection_wrap<S>(transport, buffered, offset, false, identity)
       )
-      TlsStreamReadFailed(transport, error) -> HttpConnectionReceiveFailed(
-        http_connection_wrap(transport, buffered, offset, false, identity),
+      HttpTransportReadFailed(transport, error) -> HttpConnectionReceiveFailed(
+        http_connection_wrap<S>(transport, buffered, offset, false, identity),
         HttpBodyTransport(error)
       )
     }
   }
 }
 
-pub (package) fn http_body_close_connection_direct(
-  connection: owned HttpConnection
-) -[TcpReadiness, TcpStreamIO]> Result<nil, HttpBodyError> {
+pub(package) fn http_body_close_connection_direct<S>(
+  connection: owned HttpConnection<S>
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> Result<nil, HttpBodyError> {
   match connection {
-    HttpConnection((transport, buffered, offset, reusable, identity)) -> match tls_stream_close(transport) {
+    HttpConnection((transport, buffered, offset, reusable, identity)) -> match http_transport_close<S>(transport) {
       Err(error) -> result_err<nil, HttpBodyError>(HttpBodyTransport(error))
       Ok(done) -> result_ok<nil, HttpBodyError>(nil)
     }
   }
 }
 
-pub (package) fn http_body_cancel_direct(
-  stream: owned HttpBodyStream
-) -[TcpReadiness, TcpStreamIO]> Result<nil, HttpBodyError> {
+pub(package) fn http_body_cancel_direct<S>(
+  stream: owned HttpBodyStream<S>
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> Result<nil, HttpBodyError> {
   match stream {
     HttpBodyStream((connection, state, limits, close_at_end)) ->
       http_body_close_connection_direct(connection)
   }
 }
 
-fn http_body_complete_read(
-  connection: owned HttpConnection,
+fn http_body_complete_read<S>(
+  connection: owned HttpConnection<S>,
   trailers: HttpHeaders,
   close_at_end: bool
-) -[TcpReadiness, TcpStreamIO]> HttpBodyReadOutcome {
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> HttpBodyReadOutcome<S> {
   let close = close_at_end or not http_body_connection_can_reuse(connection)
   if close {
     match http_body_close_connection_direct(connection) {
@@ -473,15 +490,15 @@ fn http_body_complete_read(
   }
 }
 
-pub (package) fn http_body_read_direct(
-  stream: owned HttpBodyStream,
+pub(package) fn http_body_read_direct<S>(
+  stream: owned HttpBodyStream<S>,
   limit: usize
-) -[TcpReadiness, TcpStreamIO]> HttpBodyReadOutcome {
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> HttpBodyReadOutcome<S> {
   let requested = http_body_usize_to_i64(limit)
   if requested <= 0 or requested > http_body_fragment_limit() {
     HttpBodyReadFailed(stream, HttpBodyFragmentLimit(limit))
   } else {
-    let mut current: owned HttpBodyStream = stream
+    let mut current: owned HttpBodyStream<S> = stream
     loop {
       match current {
         HttpBodyStream((connection, state, limits, close_at_end)) -> match state {
@@ -751,18 +768,18 @@ fn http_body_bytes_suffix(values: Bytes, offset: i64, count: i64) -> Bytes {
   bytes_from_slice(source[http_body_i64_to_usize(offset)..http_body_i64_to_usize(offset + count)])
 }
 
-pub (package) type HttpConnectionWrite {
-  HttpConnectionWritten(owned HttpConnection),
-    HttpConnectionWriteFailed(owned HttpConnection, HttpBodyError)
+pub(package) type HttpConnectionWrite<S> {
+  HttpConnectionWritten(owned HttpConnection<S>),
+    HttpConnectionWriteFailed(owned HttpConnection<S>, HttpBodyError)
 }
 
-pub (package) fn http_body_write_wire(
-  connection: owned HttpConnection,
+pub(package) fn http_body_write_wire<S>(
+  connection: owned HttpConnection<S>,
   wire: Bytes
-) -[TcpReadiness, TcpStreamIO]> HttpConnectionWrite {
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> HttpConnectionWrite<S> {
   let total = bytes_len(wire)
   let mut position = 0
-  let mut current: owned HttpConnection = connection
+  let mut current: owned HttpConnection<S> = connection
   loop {
     if position >= total { break (HttpConnectionWritten(current)) }
     else {
@@ -773,20 +790,20 @@ pub (package) fn http_body_write_wire(
       }
       let fragment = http_body_bytes_suffix(wire, position, count)
       match current {
-        HttpConnection((transport, buffered, offset, reusable, identity)) -> match tls_stream_write(transport, fragment) {
-          TlsStreamWriteFailed(returned, error) -> break (HttpConnectionWriteFailed(
-            http_connection_wrap(returned, buffered, offset, false, identity),
+        HttpConnection((transport, buffered, offset, reusable, identity)) -> match http_transport_write<S>(transport, fragment) {
+          HttpTransportWriteFailed(returned, error) -> break (HttpConnectionWriteFailed(
+            http_connection_wrap<S>(returned, buffered, offset, false, identity),
             HttpBodyTransport(error)
           ))
-          TlsStreamWrote(transport, wrote) -> {
+          HttpTransportWrote(transport, wrote) -> {
             let progress = http_body_usize_to_i64(wrote)
             if progress <= 0 or progress > count {
               break (HttpConnectionWriteFailed(
-                http_connection_wrap(transport, buffered, offset, false, identity),
-                HttpBodyTransport(TlsStreamInvalidProgress)
+                http_connection_wrap<S>(transport, buffered, offset, false, identity),
+                HttpBodyTransport(HttpTransportInvalidProgress)
               ))
             } else {
-              current = http_connection_wrap(
+              current = http_connection_wrap<S>(
                 transport,
                 buffered,
                 offset,
@@ -802,10 +819,10 @@ pub (package) fn http_body_write_wire(
   }
 }
 
-pub (package) fn http_body_write_direct(
-  stream: owned HttpBodyStream,
+pub(package) fn http_body_write_direct<S>(
+  stream: owned HttpBodyStream<S>,
   data: Bytes
-) -[TcpReadiness, TcpStreamIO]> HttpBodyWriteOutcome {
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> HttpBodyWriteOutcome<S> {
   let count = bytes_len(data)
   if count < 0 or count > http_body_fragment_limit() {
     HttpBodyWriteFailed(stream, HttpBodyFragmentLimit(http_body_i64_to_usize(if count < 0 { 0 } else { count })))
@@ -903,10 +920,10 @@ pub (package) fn http_body_write_direct(
     } }
 }
 
-fn http_body_complete_write(
-  connection: owned HttpConnection,
+fn http_body_complete_write<S>(
+  connection: owned HttpConnection<S>,
   close_at_end: bool
-) -[TcpReadiness, TcpStreamIO]> HttpBodyFinishOutcome {
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> HttpBodyFinishOutcome<S> {
   let close = close_at_end or not http_body_connection_can_reuse(connection)
   if close {
     match http_body_close_connection_direct(connection) {
@@ -918,10 +935,10 @@ fn http_body_complete_write(
   }
 }
 
-pub (package) fn http_body_finish_direct(
-  stream: owned HttpBodyStream,
+pub(package) fn http_body_finish_direct<S>(
+  stream: owned HttpBodyStream<S>,
   trailers: HttpHeaders
-) -[TcpReadiness, TcpStreamIO]> HttpBodyFinishOutcome {
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> HttpBodyFinishOutcome<S> {
   match stream {
     HttpBodyStream((connection, state, limits, close_at_end)) -> match state {
       HttpBodyWriteNone -> if http_headers_len(trailers) != 0 {
@@ -980,52 +997,59 @@ pub (package) fn http_body_finish_direct(
 }
 
 --- Read one non-empty body fragment of at most 16 KiB.
-pub fn http_body_read(
-  stream: owned HttpBodyStream,
+pub fn http_body_read<S>(
+  stream: owned HttpBodyStream<S>,
   limit: usize
-) -[HttpBodyIO, TcpStreamIO]> HttpBodyReadOutcome {
-  HttpBodyIO.read(stream, limit)
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpBodyReadOutcome<S> {
+  HttpBodyIO<S>.read(stream, limit)
 }
 
 --- Write one body fragment of at most 16 KiB.
-pub fn http_body_write(
-  stream: owned HttpBodyStream,
+pub fn http_body_write<S>(
+  stream: owned HttpBodyStream<S>,
   data: Bytes
-) -[HttpBodyIO, TcpStreamIO]> HttpBodyWriteOutcome {
-  HttpBodyIO.write(stream, data)
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpBodyWriteOutcome<S> {
+  HttpBodyIO<S>.write(stream, data)
 }
 
 --- Finish an outbound body with an optional chunked trailer section.
-pub fn http_body_finish(
-  stream: owned HttpBodyStream,
+pub fn http_body_finish<S>(
+  stream: owned HttpBodyStream<S>,
   trailers: HttpHeaders
-) -[HttpBodyIO, TcpStreamIO]> HttpBodyFinishOutcome {
-  HttpBodyIO.finish(stream, trailers)
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpBodyFinishOutcome<S> {
+  HttpBodyIO<S>.finish(stream, trailers)
 }
 
 --- Cancel an active body and deterministically close its connection.
-pub fn http_body_cancel(
-  stream: owned HttpBodyStream
-) -[HttpBodyIO, TcpStreamIO]> Result<nil, HttpBodyError> {
-  HttpBodyIO.cancel(stream)
+pub fn http_body_cancel<S>(
+  stream: owned HttpBodyStream<S>
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> Result<nil, HttpBodyError> {
+  HttpBodyIO<S>.cancel(stream)
 }
 
 --- Close and consume an idle HTTP connection.
-pub fn http_connection_close(
-  connection: owned HttpConnection
-) -[HttpBodyIO, TcpStreamIO]> Result<nil, HttpBodyError> {
-  HttpBodyIO.close(connection)
+pub fn http_connection_close<S>(
+  connection: owned HttpConnection<S>
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> Result<nil, HttpBodyError> {
+  HttpBodyIO<S>.close(connection)
+}
+
+--- Interpret owned body operations through transport state `S`.
+pub fn http_body_with_transport<S, T, E>(
+  body: () -[HttpBodyIO<S>, HttpTransportRelease<S>, E]> T
+) -[HttpTransportIO<S>, HttpTransportRelease<S>, E]> T {
+  handle body() {
+    HttpBodyIO<S>.read(stream, limit) -> resume(http_body_read_direct<S>(stream, limit))
+    HttpBodyIO<S>.write(stream, data) -> resume(http_body_write_direct<S>(stream, data))
+    HttpBodyIO<S>.finish(stream, trailers) -> resume(http_body_finish_direct<S>(stream, trailers))
+    HttpBodyIO<S>.cancel(stream) -> resume(http_body_cancel_direct<S>(stream))
+    HttpBodyIO<S>.close(connection) -> resume(http_body_close_connection_direct<S>(connection))
+  }
 }
 
 --- Interpret owned body operations through the validating TLS transport.
 pub fn http_body_with_tls<T, E>(
-  body: () -[HttpBodyIO, E]> T
+  body: () -[HttpBodyIO<TlsStream>, HttpTransportRelease<TlsStream>, E]> T
 ) -[TcpReadiness, TcpStreamIO, E]> T {
-  handle body() {
-    HttpBodyIO.read(stream, limit) -> resume(http_body_read_direct(stream, limit))
-    HttpBodyIO.write(stream, data) -> resume(http_body_write_direct(stream, data))
-    HttpBodyIO.finish(stream, trailers) -> resume(http_body_finish_direct(stream, trailers))
-    HttpBodyIO.cancel(stream) -> resume(http_body_cancel_direct(stream))
-    HttpBodyIO.close(connection) -> resume(http_body_close_connection_direct(connection))
-  }
+  http_transport_with_tls<T, E>(() => http_body_with_transport<TlsStream, T, E>(body))
 }
