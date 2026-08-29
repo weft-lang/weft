@@ -1,0 +1,483 @@
+-- stdlib/http_client.weft — HTTP client redirect and idle-connection policy
+--
+-- The pool owns only message-boundary connections. Every connection carries
+-- its authenticated URL origin internally; checkout never trusts a caller-
+-- supplied check-in key. Redirects are a pure state machine over immutable
+-- history and direct method-rewrite alternatives, so streaming bodies are
+-- never silently replayed.
+
+use stdlib/bytes.{InvalidUtf8, bytes_to_utf8}
+use stdlib/drop.{Drop}
+use stdlib/eq.{Eq}
+use stdlib/http.{HttpGet, HttpHead, HttpHeader, HttpHeaders, HttpLimits, HttpMethod, HttpPost, HttpRequestHead, HttpResponseHead, http_field_name_text, http_header_name, http_header_value, http_headers_get, http_headers_len, http_response_headers, http_response_status, http_status_code}
+use stdlib/http_endpoint.{HttpClient, HttpClientBegin, HttpClientRequestFailed, HttpClientRequestReady, HttpExchangeError, http_client_begin, http_client_reuse}
+use stdlib/http_stream.{HttpBodyStream, HttpConnection, http_connection_has_client_origin, http_connection_is_reusable, http_connection_matches_origin}
+use stdlib/option.{None, Some}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/string.{str_find}
+use stdlib/tcp.{TcpStreamIO}
+use stdlib/url.{Url, UrlOrigin, UrlParseError, url_resolve, url_same_request_target, url_with_fragment}
+use stdlib/vector.{persistent_vector_get, persistent_vector_len, persistent_vector_new, persistent_vector_push}
+use stdlib/vector_type.{PersistentVector}
+
+--- A rejected idle-pool capacity.
+pub type HttpPoolConfigError {
+  --- The requested capacity was negative.
+  HttpPoolNegativeCapacity(i64),
+    --- The requested capacity exceeds the alpha pool's opaque bound.
+    HttpPoolCapacityTooLarge(i64, i64)
+}
+
+type HttpPoolState {
+  HttpPoolEmpty,
+    HttpPoolOne(owned HttpConnection),
+    HttpPoolTwo(owned HttpConnection, owned HttpConnection),
+    HttpPoolThree(owned HttpConnection, owned HttpConnection, owned HttpConnection),
+    HttpPoolFour(owned HttpConnection, owned HttpConnection, owned HttpConnection, owned HttpConnection)
+}
+
+--- A bounded owner of authenticated idle HTTP/1 connections.
+---
+--- The finite internal representation is deliberately opaque. The current
+--- alpha bound avoids pretending arbitrary containers can safely hold linear
+--- resources before the memory model supports that shape.
+pub type HttpConnectionPool = opaque(HttpPoolState, i64)
+
+--- Checkout either transfers one same-origin connection or proves a miss.
+pub type HttpPoolCheckout {
+  --- A matching connection and the remaining pool owner.
+  HttpPoolHit(owned HttpConnectionPool, owned HttpConnection),
+    --- No matching connection; the pool owner is returned unchanged.
+    HttpPoolMiss(owned HttpConnectionPool)
+}
+
+--- Returning a connection either retains it or gives its owner back exactly.
+pub type HttpPoolRelease {
+  --- The connection is now owned by the returned pool.
+  HttpPoolStored(owned HttpConnectionPool),
+    --- The bounded pool refused the connection and returns both owners.
+    HttpPoolAtCapacity(owned HttpConnectionPool, owned HttpConnection),
+    --- A close-marked connection cannot become idle and is returned.
+    HttpPoolConnectionNotReusable(owned HttpConnectionPool, owned HttpConnection),
+    --- A server-side connection cannot enter a client pool and is returned.
+    HttpPoolForeignConnection(owned HttpConnectionPool, owned HttpConnection)
+}
+
+--- A request begun while preserving the successor pool owner.
+pub type HttpPooledClientBegin {
+  --- The successor pool and outbound request-body owner are ready.
+  HttpPooledRequestReady(owned HttpConnectionPool, owned HttpBodyStream),
+    --- Beginning the request failed while preserving the pool owner.
+    HttpPooledRequestFailed(owned HttpConnectionPool, HttpExchangeError)
+}
+
+fn http_pool_max_idle_i64() -> i64 { 4 }
+
+--- Return the maximum idle capacity supported by this alpha implementation.
+pub fn http_pool_max_idle() -> i64 { http_pool_max_idle_i64() }
+
+--- Construct an empty bounded idle pool.
+pub fn http_connection_pool(
+  capacity: i64
+) -> Result<owned HttpConnectionPool, HttpPoolConfigError> {
+  if capacity < 0 {
+    result_err<owned HttpConnectionPool, HttpPoolConfigError>(HttpPoolNegativeCapacity(capacity))
+  } else { if capacity > http_pool_max_idle_i64() {
+      result_err<owned HttpConnectionPool, HttpPoolConfigError>(
+        HttpPoolCapacityTooLarge(capacity, http_pool_max_idle_i64())
+      )
+    } else {
+      result_ok<owned HttpConnectionPool, HttpPoolConfigError>(
+        HttpConnectionPool((HttpPoolEmpty, capacity))
+      )
+    } }
+}
+
+fn http_pool_drop_connection(connection: owned HttpConnection) -[TcpStreamIO]> i64 {
+  connection.drop()
+}
+
+impl Drop for HttpConnectionPool {
+  fn drop(self) -[TcpStreamIO]> i64 {
+    match self {
+      HttpConnectionPool((state, capacity)) -> match state {
+        HttpPoolEmpty -> 0
+        HttpPoolOne(first) -> http_pool_drop_connection(first)
+        HttpPoolTwo(first, second) -> {
+          let left = http_pool_drop_connection(first)
+          let right = http_pool_drop_connection(second)
+          if left != 0 { left } else { right }
+        }
+        HttpPoolThree(first, second, third) -> {
+          let left = http_pool_drop_connection(first)
+          let middle = http_pool_drop_connection(second)
+          let right = http_pool_drop_connection(third)
+          if left != 0 { left } else { if middle != 0 { middle } else { right } }
+        }
+        HttpPoolFour(first, second, third, fourth) -> {
+          let one = http_pool_drop_connection(first)
+          let two = http_pool_drop_connection(second)
+          let three = http_pool_drop_connection(third)
+          let four = http_pool_drop_connection(fourth)
+          if one != 0 { one }
+          else { if two != 0 { two } else { if three != 0 { three } else { four } } }
+        }
+      }
+    }
+  }
+}
+
+fn http_pool_wrap(
+  state: HttpPoolState,
+  capacity: i64
+) -> owned HttpConnectionPool {
+  HttpConnectionPool((state, capacity))
+}
+
+--- Return the number of currently idle connections.
+pub fn http_pool_len(pool: borrow HttpConnectionPool) -> i64 {
+  match pool {
+    HttpConnectionPool((state, capacity)) -> match state {
+      HttpPoolEmpty -> 0
+      HttpPoolOne(first) -> 1
+      HttpPoolTwo(first, second) -> 2
+      HttpPoolThree(first, second, third) -> 3
+      HttpPoolFour(first, second, third, fourth) -> 4
+    }
+  }
+}
+
+fn http_pool_connection_matches(connection: borrow HttpConnection, origin: UrlOrigin) -> bool {
+  http_connection_matches_origin(connection, origin)
+}
+
+--- Check out the first idle connection whose retained origin matches `url`.
+pub fn http_pool_checkout(
+  pool: owned HttpConnectionPool,
+  url: Url
+) -[TcpStreamIO]> HttpPoolCheckout {
+  let origin = url.origin()
+  match pool {
+    HttpConnectionPool((state, capacity)) -> match state {
+      HttpPoolEmpty -> HttpPoolMiss(http_pool_wrap(HttpPoolEmpty, capacity))
+      HttpPoolOne(first) -> if http_pool_connection_matches(first, origin) {
+        HttpPoolHit(http_pool_wrap(HttpPoolEmpty, capacity), first)
+      } else {
+        HttpPoolMiss(http_pool_wrap(HttpPoolOne(first), capacity))
+      }
+      HttpPoolTwo(first, second) -> if http_pool_connection_matches(first, origin) {
+        HttpPoolHit(http_pool_wrap(HttpPoolOne(second), capacity), first)
+      } else { if http_pool_connection_matches(second, origin) {
+          HttpPoolHit(http_pool_wrap(HttpPoolOne(first), capacity), second)
+        } else {
+          HttpPoolMiss(http_pool_wrap(HttpPoolTwo(first, second), capacity))
+        } }
+      HttpPoolThree(first, second, third) -> if http_pool_connection_matches(first, origin) {
+        HttpPoolHit(http_pool_wrap(HttpPoolTwo(second, third), capacity), first)
+      } else { if http_pool_connection_matches(second, origin) {
+          HttpPoolHit(http_pool_wrap(HttpPoolTwo(first, third), capacity), second)
+        } else { if http_pool_connection_matches(third, origin) {
+            HttpPoolHit(http_pool_wrap(HttpPoolTwo(first, second), capacity), third)
+          } else {
+            HttpPoolMiss(http_pool_wrap(HttpPoolThree(first, second, third), capacity))
+          } } }
+      HttpPoolFour(first, second, third, fourth) -> if http_pool_connection_matches(first, origin) {
+        HttpPoolHit(http_pool_wrap(HttpPoolThree(second, third, fourth), capacity), first)
+      } else { if http_pool_connection_matches(second, origin) {
+          HttpPoolHit(http_pool_wrap(HttpPoolThree(first, third, fourth), capacity), second)
+        } else { if http_pool_connection_matches(third, origin) {
+            HttpPoolHit(http_pool_wrap(HttpPoolThree(first, second, fourth), capacity), third)
+          } else { if http_pool_connection_matches(fourth, origin) {
+              HttpPoolHit(http_pool_wrap(HttpPoolThree(first, second, third), capacity), fourth)
+            } else {
+              HttpPoolMiss(http_pool_wrap(HttpPoolFour(first, second, third, fourth), capacity))
+            } } } }
+    }
+  }
+}
+
+--- Return one idle connection to the pool without losing ownership on refusal.
+pub fn http_pool_release(
+  pool: owned HttpConnectionPool,
+  connection: owned HttpConnection
+) -[TcpStreamIO]> HttpPoolRelease {
+  if not http_connection_has_client_origin(connection) {
+    HttpPoolForeignConnection(pool, connection)
+  } else { if not http_connection_is_reusable(connection) {
+      HttpPoolConnectionNotReusable(pool, connection)
+    } else { match pool {
+      HttpConnectionPool((state, capacity)) -> match state {
+        HttpPoolEmpty -> if capacity >= 1 {
+          HttpPoolStored(http_pool_wrap(HttpPoolOne(connection), capacity))
+        } else {
+          HttpPoolAtCapacity(http_pool_wrap(HttpPoolEmpty, capacity), connection)
+        }
+        HttpPoolOne(first) -> if capacity >= 2 {
+          HttpPoolStored(http_pool_wrap(HttpPoolTwo(first, connection), capacity))
+        } else {
+          HttpPoolAtCapacity(http_pool_wrap(HttpPoolOne(first), capacity), connection)
+        }
+        HttpPoolTwo(first, second) -> if capacity >= 3 {
+          HttpPoolStored(http_pool_wrap(HttpPoolThree(first, second, connection), capacity))
+        } else {
+          HttpPoolAtCapacity(http_pool_wrap(HttpPoolTwo(first, second), capacity), connection)
+        }
+        HttpPoolThree(first, second, third) -> if capacity >= 4 {
+          HttpPoolStored(http_pool_wrap(HttpPoolFour(first, second, third, connection), capacity))
+        } else {
+          HttpPoolAtCapacity(http_pool_wrap(HttpPoolThree(first, second, third), capacity), connection)
+        }
+        HttpPoolFour(first, second, third, fourth) -> HttpPoolAtCapacity(
+          http_pool_wrap(HttpPoolFour(first, second, third, fourth), capacity),
+          connection
+        )
+      }
+    } }
+  }
+}
+
+--- Begin a request through pool policy, preserving the successor pool owner.
+pub fn http_client_pool_begin(
+  pool: owned HttpConnectionPool,
+  url: Url,
+  request: HttpRequestHead,
+  limits: HttpLimits
+) -[HttpClient, TcpStreamIO]> HttpPooledClientBegin {
+  match http_pool_checkout(pool, url) {
+    HttpPoolMiss(returned) -> match http_client_begin(url, request, limits) {
+      HttpClientRequestFailed(error) -> HttpPooledRequestFailed(returned, error)
+      HttpClientRequestReady(body) -> HttpPooledRequestReady(returned, body)
+    }
+    HttpPoolHit(returned, connection) -> match http_client_reuse(url, connection, request, limits) {
+      HttpClientRequestFailed(error) -> HttpPooledRequestFailed(returned, error)
+      HttpClientRequestReady(body) -> HttpPooledRequestReady(returned, body)
+    }
+  }
+}
+
+--- Whether redirects may cross an authenticated origin boundary.
+pub type HttpRedirectScope {
+  --- Follow only targets with the current URL's canonical origin.
+  HttpRedirectSameOrigin,
+    --- Permit an explicit cross-origin redirect step.
+    HttpRedirectAnyOrigin
+}
+
+--- Method compatibility for 301 and 302 responses.
+pub type HttpRedirectMethodPolicy {
+  --- Preserve the initiating method and require explicit body replay.
+  HttpRedirectStrictMethod,
+    --- Rewrite POST to GET as common user-agent clients do.
+    HttpRedirectBrowserMethod
+}
+
+type HttpRedirectPolicyParts {
+  max_hops: i64,
+    scope: HttpRedirectScope,
+    method: HttpRedirectMethodPolicy
+}
+
+--- Bounded redirect policy with explicit origin and method behavior.
+pub type HttpRedirectPolicy = opaque HttpRedirectPolicyParts
+
+--- A redirect policy or response could not produce one safe next step.
+pub type HttpRedirectError {
+  --- The configured hop limit was negative.
+  HttpRedirectInvalidLimit(i64),
+    --- Following another response would exceed the configured hop limit.
+    HttpRedirectLimitExceeded(i64),
+    --- The target has already appeared as an HTTP request target.
+    HttpRedirectLoop(Url),
+    --- More than one Location field made the target ambiguous.
+    HttpRedirectMultipleLocations(i64),
+    --- The Location field was not valid UTF-8 at the reported byte offset.
+    HttpRedirectLocationUtf8(i64),
+    --- The Location reference could not be resolved as a canonical URL.
+    HttpRedirectLocationUrl(UrlParseError),
+    --- Policy rejected a redirect between the reported origins.
+    HttpRedirectCrossOrigin(UrlOrigin, UrlOrigin)
+}
+
+--- Immutable redirect history used for loop and hop-limit checks.
+pub type HttpRedirectHistory = opaque PersistentVector<Url>
+
+--- The semantic next step after inspecting one response head.
+pub type HttpRedirectStep {
+  --- The response is not a followable redirect; retain it as the result.
+  HttpRedirectStop(HttpRedirectHistory),
+    --- Follow with GET and no replay of the initiating request body.
+    HttpRedirectFollowGet(HttpRedirectHistory, Url),
+  --- Follow only by replaying the same method and request body semantics.
+    HttpRedirectFollowReplay(HttpRedirectHistory, Url, HttpMethod),
+    --- Redirect interpretation failed without performing a request.
+    HttpRedirectFailed(HttpRedirectError)
+}
+
+--- Construct redirect policy. Limits count followed hops, not responses seen.
+pub fn http_redirect_policy(
+  max_hops: i64,
+  scope: HttpRedirectScope,
+  method: HttpRedirectMethodPolicy
+) -> Result<HttpRedirectPolicy, HttpRedirectError> {
+  if max_hops < 0 {
+    result_err<HttpRedirectPolicy, HttpRedirectError>(HttpRedirectInvalidLimit(max_hops))
+  } else {
+    result_ok<HttpRedirectPolicy, HttpRedirectError>(HttpRedirectPolicy(HttpRedirectPolicyParts {
+      max_hops: max_hops,
+        scope: scope,
+        method: method
+    }))
+  }
+}
+
+--- Construct history containing the initiating URL.
+pub fn http_redirect_history(initial: Url) -> HttpRedirectHistory {
+  HttpRedirectHistory(persistent_vector_push<Url>(persistent_vector_new<Url>(), initial))
+}
+
+--- Return the number of URLs seen, including the initiating URL.
+pub fn http_redirect_history_len(history: HttpRedirectHistory) -> i64 {
+  match history { HttpRedirectHistory(urls) -> persistent_vector_len<Url>(urls) }
+}
+
+fn http_redirect_is_status(code: i64) -> bool {
+  code == 301 or code == 302 or code == 303 or code == 307 or code == 308
+}
+
+type HttpRedirectLocation {
+  HttpRedirectLocationAbsent,
+    HttpRedirectLocationText(str),
+    HttpRedirectLocationFailed(HttpRedirectError)
+}
+
+fn http_redirect_location(headers: HttpHeaders) -> HttpRedirectLocation {
+  let mut index = 0
+  let mut count = 0
+  let mut location = ""
+  let mut invalid = 0 - 1
+  while index < http_headers_len(headers) and invalid < 0 {
+    match http_headers_get(headers, index) {
+      None -> 0
+      Some(header) -> if http_field_name_text(http_header_name(header)) == "location" {
+        count = count + 1
+        match bytes_to_utf8(http_header_value(header)) {
+          Err(InvalidUtf8(offset)) -> { invalid = offset }
+          Ok(text) -> { location = text }
+        }
+      } else { 0 }
+    }
+    index = index + 1
+  }
+  if invalid >= 0 { HttpRedirectLocationFailed(HttpRedirectLocationUtf8(invalid)) }
+  else { if count == 0 { HttpRedirectLocationAbsent }
+    else { if count == 1 { HttpRedirectLocationText(location) }
+      else { HttpRedirectLocationFailed(HttpRedirectMultipleLocations(count)) } } }
+}
+
+fn http_redirect_history_contains(history: HttpRedirectHistory, target: Url) -> bool {
+  match history {
+    HttpRedirectHistory(urls) -> {
+      let mut index = 0
+      let mut found = false
+      while index < persistent_vector_len<Url>(urls) and not found {
+        if url_same_request_target(
+          persistent_vector_get<Url>(urls, index, target),
+          target
+        ) { found = true }
+        else { index = index + 1 }
+      }
+      found
+    }
+  }
+}
+
+fn http_redirect_history_push(history: HttpRedirectHistory, target: Url) -> HttpRedirectHistory {
+  match history {
+    HttpRedirectHistory(urls) -> HttpRedirectHistory(persistent_vector_push<Url>(urls, target))
+  }
+}
+
+fn http_redirect_rewrites_get(
+  code: i64,
+  request_method: HttpMethod,
+  policy: HttpRedirectMethodPolicy
+) -> bool {
+  if code == 303 {
+    match request_method { HttpHead -> false _ -> true }
+  } else { if code == 301 or code == 302 {
+      match policy {
+        HttpRedirectStrictMethod -> false
+        HttpRedirectBrowserMethod -> match request_method { HttpPost -> true _ -> false }
+      }
+    } else { false } }
+}
+
+fn http_redirect_follow(
+  history: HttpRedirectHistory,
+  current: Url,
+  target: Url,
+  request_method: HttpMethod,
+  code: i64,
+  policy: HttpRedirectPolicyParts
+) -> HttpRedirectStep {
+  let followed = http_redirect_history_len(history) - 1
+  if followed >= policy.max_hops {
+    HttpRedirectFailed(HttpRedirectLimitExceeded(policy.max_hops))
+  } else { if http_redirect_history_contains(history, target) {
+      HttpRedirectFailed(HttpRedirectLoop(target))
+    } else { if match policy.scope {
+        HttpRedirectSameOrigin -> not current.origin().eq(target.origin())
+        HttpRedirectAnyOrigin -> false
+      } {
+        HttpRedirectFailed(HttpRedirectCrossOrigin(current.origin(), target.origin()))
+      } else {
+        let next = http_redirect_history_push(history, target)
+        if http_redirect_rewrites_get(code, request_method, policy.method) {
+          HttpRedirectFollowGet(next, target)
+        } else {
+          HttpRedirectFollowReplay(next, target, request_method)
+        }
+      } } }
+}
+
+--- Interpret one response head under redirect policy without performing I/O.
+---
+--- `FollowReplay` is intentionally distinct from `FollowGet`: callers with a
+--- streaming request body must provide a replayable source before continuing.
+--- Cross-origin following never carries headers here, so credential policy
+--- remains an explicit request-rebuild decision rather than an accidental copy.
+pub fn http_redirect_step(
+  history: HttpRedirectHistory,
+  current: Url,
+  request_method: HttpMethod,
+  response: HttpResponseHead,
+  policy: HttpRedirectPolicy
+) -> HttpRedirectStep {
+  let code = http_status_code(http_response_status(response))
+  if not http_redirect_is_status(code) {
+    HttpRedirectStop(history)
+  } else { match http_redirect_location(http_response_headers(response)) {
+      HttpRedirectLocationAbsent -> HttpRedirectStop(history)
+      HttpRedirectLocationFailed(error) -> HttpRedirectFailed(error)
+      HttpRedirectLocationText(location) -> match url_resolve(current, location) {
+        Err(error) -> HttpRedirectFailed(HttpRedirectLocationUrl(error))
+        Ok(resolved) -> match policy {
+          HttpRedirectPolicy(parts) -> {
+            let target = if str_find(location, "#") < 0 {
+              url_with_fragment(resolved, current.fragment())
+            } else {
+              resolved
+            }
+            http_redirect_follow(
+              history,
+              current,
+              target,
+              request_method,
+              code,
+              parts
+            )
+          }
+        }
+      }
+    } }
+}

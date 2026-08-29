@@ -7,9 +7,10 @@ use stdlib/channel.{Channel, ChannelDrained, ChannelReceive, ChannelReceived, Ch
 use stdlib/dns.{DnsResolve, dns_numeric_candidates}
 use stdlib/drop.{Drop}
 use stdlib/fail.{Fail}
-use stdlib/http.{Http11, HttpForbiddenTrailer, HttpGet, HttpHeader, HttpHeaders, HttpPost, http_default_limits, http_field_name_parse, http_header, http_headers_append, http_headers_empty, http_headers_len, http_method_text, http_request_head_new, http_request_method, http_request_target, http_request_target_bytes, http_request_target_parse, http_response_head_new, http_response_status, http_status, http_status_code}
-use stdlib/http_endpoint.{HttpClient, HttpClientRequestFailed, HttpClientRequestReady, HttpClientResponseFailed, HttpClientResponseReady, HttpServer, HttpServerAcceptFailed, HttpServerListenFailed, HttpServerListening, HttpServerRequestReady, HttpServerResponseFailed, HttpServerResponseReady, http_client_begin, http_client_response, http_client_with_tls, http_server_accept, http_server_listen, http_server_listener_close, http_server_respond, http_server_with_tls}
-use stdlib/http_stream.{HttpBodyFinishCloseFailed, HttpBodyFinishFailed, HttpBodyFinishOutcome, HttpBodyFinished, HttpBodyFinishedClosed, HttpBodyFragmentLimit, HttpBodyIO, HttpBodyProtocol, HttpBodyReadCloseFailed, HttpBodyReadData, HttpBodyReadEnd, HttpBodyReadEndClosed, HttpBodyReadFailed, HttpBodyStream, HttpBodyWriteFailed, HttpBodyWriteIncomplete, HttpBodyWriteOverflow, HttpBodyWrongDirection, HttpBodyWrote, HttpConnection, http_body_finish, http_body_read, http_body_write, http_connection_close}
+use stdlib/http.{Http11, HttpChunkLineTooLong, HttpForbiddenTrailer, HttpGet, HttpHeader, HttpHeaders, HttpInvalidChunkSize, HttpInvalidChunkTerminator, HttpPost, HttpRequestHead, HttpTrailersTooLarge, http_default_limits, http_field_name_parse, http_header, http_headers_append, http_headers_empty, http_headers_len, http_method_text, http_request_head_new, http_request_method, http_request_target, http_request_target_bytes, http_request_target_parse, http_response_head_new, http_response_status, http_status, http_status_code}
+use stdlib/http_client.{HttpConnectionPool, HttpPoolAtCapacity, HttpPoolConnectionNotReusable, HttpPoolForeignConnection, HttpPoolHit, HttpPoolMiss, HttpPoolStored, HttpPooledClientBegin, HttpPooledRequestFailed, HttpPooledRequestReady, http_client_pool_begin, http_connection_pool, http_pool_checkout, http_pool_len, http_pool_release}
+use stdlib/http_endpoint.{HttpClient, HttpClientRequestFailed, HttpClientRequestReady, HttpClientResponseFailed, HttpClientResponseReady, HttpExchangeConnectionNotReusable, HttpExchangeConnectionOrigin, HttpServer, HttpServerAcceptFailed, HttpServerListenFailed, HttpServerListening, HttpServerPersistentRequestFailed, HttpServerPersistentRequestReady, HttpServerRequestReady, HttpServerResponseFailed, HttpServerResponseReady, http_client_response, http_client_reuse, http_client_with_tls, http_server_accept, http_server_listen, http_server_listener_close, http_server_request, http_server_respond, http_server_with_tls}
+use stdlib/http_stream.{HttpBodyFinishCloseFailed, HttpBodyFinishFailed, HttpBodyFinishOutcome, HttpBodyFinished, HttpBodyFinishedClosed, HttpBodyFragmentLimit, HttpBodyIO, HttpBodyProtocol, HttpBodyReadCloseFailed, HttpBodyReadData, HttpBodyReadEnd, HttpBodyReadEndClosed, HttpBodyReadFailed, HttpBodyStream, HttpBodyTransport, HttpBodyUnexpectedEof, HttpBodyUnsupportedUpgrade, HttpBodyWriteFailed, HttpBodyWriteIncomplete, HttpBodyWriteOverflow, HttpBodyWrongDirection, HttpBodyWrote, HttpConnection, http_body_finish, http_body_read, http_body_write, http_connection_close}
 use stdlib/net_address.{IpV4, SocketAddress, SocketV4, SocketV6, ipv4_address}
 use stdlib/num.{num_u16_to_u64}
 use stdlib/result.{Err, Ok, Result, result_err, result_ok}
@@ -18,6 +19,7 @@ use stdlib/spawn as spawn
 use stdlib/string.{int_to_str, str_concat}
 use stdlib/tcp.{TcpConnect, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO, tcp_listen_options}
 use stdlib/time.{Time}
+use stdlib/tls_stream.{TlsStreamError, TlsStreamInvalidProgress, TlsStreamPlaintextLimit, TlsStreamReadiness, TlsStreamTcp, TlsStreamTls, TlsStreamUnexpectedStep}
 use stdlib/url.{UrlDomain, url_parse}
 use stdlib/vector.{vector_get_in_bounds, vector_len, vector_push, vector_with_capacity}
 use stdlib/vector_type.{Vector}
@@ -25,7 +27,22 @@ use test/linked_support/tls_fixtures.{tls_fixture_ca, tls_fixture_server_certifi
 
 type HttpLinkedBody {
   HttpLinkedBodyReady(owned HttpConnection, Bytes, HttpHeaders),
-    HttpLinkedBodyFailed
+    HttpLinkedBodyFailed(i64)
+}
+
+type HttpLinkedExchange {
+  HttpLinkedExchangeReady(owned HttpConnectionPool, owned HttpConnection)
+}
+
+fn http_linked_transport_failure_kind(error: TlsStreamError) -> i64 {
+  match error {
+    TlsStreamTcp(error) -> 30
+    TlsStreamReadiness(error) -> 31
+    TlsStreamTls(error) -> 32
+    TlsStreamPlaintextLimit(limit) -> 33
+    TlsStreamInvalidProgress -> 34
+    TlsStreamUnexpectedStep(step) -> 35
+  }
 }
 
 fn http_linked_header(name: str, value: str) -> HttpHeader {
@@ -60,12 +77,52 @@ fn http_linked_collect(
         bytes_from_vector(output),
         trailers
       ))
-      HttpBodyReadEndClosed(trailers) -> break (HttpLinkedBodyFailed)
+      HttpBodyReadEndClosed(trailers) -> break (HttpLinkedBodyFailed(1))
+      HttpBodyReadFailed(returned, HttpBodyWrongDirection) -> {
+        let dropped = returned.drop()
+        break (HttpLinkedBodyFailed(2))
+      }
+      HttpBodyReadFailed(returned, HttpBodyTransport(error)) -> {
+        let dropped = returned.drop()
+        break (HttpLinkedBodyFailed(http_linked_transport_failure_kind(error)))
+      }
+      HttpBodyReadFailed(returned, HttpBodyFragmentLimit(limit)) -> {
+        let dropped = returned.drop()
+        break (HttpLinkedBodyFailed(4))
+      }
+      HttpBodyReadFailed(returned, HttpBodyUnexpectedEof(remaining)) -> {
+        let dropped = returned.drop()
+        break (HttpLinkedBodyFailed(5))
+      }
+      HttpBodyReadFailed(returned, HttpBodyProtocol(HttpInvalidChunkSize(offset))) -> {
+        let dropped = returned.drop()
+        break (HttpLinkedBodyFailed(10))
+      }
+      HttpBodyReadFailed(returned, HttpBodyProtocol(HttpChunkLineTooLong(offset))) -> {
+        let dropped = returned.drop()
+        break (HttpLinkedBodyFailed(11))
+      }
+      HttpBodyReadFailed(returned, HttpBodyProtocol(HttpInvalidChunkTerminator(offset))) -> {
+        let dropped = returned.drop()
+        break (HttpLinkedBodyFailed(12))
+      }
+      HttpBodyReadFailed(returned, HttpBodyProtocol(HttpTrailersTooLarge(offset))) -> {
+        let dropped = returned.drop()
+        break (HttpLinkedBodyFailed(13))
+      }
+      HttpBodyReadFailed(returned, HttpBodyProtocol(HttpForbiddenTrailer(offset))) -> {
+        let dropped = returned.drop()
+        break (HttpLinkedBodyFailed(14))
+      }
+      HttpBodyReadFailed(returned, HttpBodyProtocol(error)) -> {
+        let dropped = returned.drop()
+        break (HttpLinkedBodyFailed(15))
+      }
       HttpBodyReadFailed(returned, error) -> {
         let dropped = returned.drop()
-        break (HttpLinkedBodyFailed)
+        break (HttpLinkedBodyFailed(6))
       }
-      HttpBodyReadCloseFailed(error) -> break (HttpLinkedBodyFailed)
+      HttpBodyReadCloseFailed(error) -> break (HttpLinkedBodyFailed(7))
     }
   }
 }
@@ -223,15 +280,47 @@ fn http_linked_require_finish(
   stream: owned HttpBodyStream,
   trailers: HttpHeaders,
   code: i64
-) -[HttpBodyIO, TcpStreamIO]> Result<owned HttpConnection, i64> {
+) -[HttpBodyIO, TcpStreamIO, Fail<i64>]> owned HttpConnection {
   match http_body_finish(stream, trailers) {
-    HttpBodyFinished(connection) -> result_ok<owned HttpConnection, i64>(connection)
-    HttpBodyFinishedClosed -> result_err<owned HttpConnection, i64>(code)
-    HttpBodyFinishFailed(returned, error) -> {
+    HttpBodyFinished(connection) -> connection
+    HttpBodyFinishedClosed -> result_err<owned HttpConnection, i64>(code + 10)?
+    HttpBodyFinishFailed(returned, HttpBodyWrongDirection) -> {
       let dropped = returned.drop()
-      result_err<owned HttpConnection, i64>(code)
+      result_err<owned HttpConnection, i64>(code + 1)?
     }
-    HttpBodyFinishCloseFailed(error) -> result_err<owned HttpConnection, i64>(code)
+    HttpBodyFinishFailed(returned, HttpBodyWriteIncomplete(remaining)) -> {
+      let dropped = returned.drop()
+      result_err<owned HttpConnection, i64>(code + 2)?
+    }
+    HttpBodyFinishFailed(returned, HttpBodyProtocol(HttpForbiddenTrailer(offset))) -> {
+      let dropped = returned.drop()
+      result_err<owned HttpConnection, i64>(code + 3)?
+    }
+    HttpBodyFinishFailed(returned, HttpBodyTransport(error)) -> {
+      let dropped = returned.drop()
+      result_err<owned HttpConnection, i64>(code + 4)?
+    }
+    HttpBodyFinishFailed(returned, HttpBodyFragmentLimit(limit)) -> {
+      let dropped = returned.drop()
+      result_err<owned HttpConnection, i64>(code + 5)?
+    }
+    HttpBodyFinishFailed(returned, HttpBodyUnexpectedEof(remaining)) -> {
+      let dropped = returned.drop()
+      result_err<owned HttpConnection, i64>(code + 6)?
+    }
+    HttpBodyFinishFailed(returned, HttpBodyWriteOverflow(remaining, attempted)) -> {
+      let dropped = returned.drop()
+      result_err<owned HttpConnection, i64>(code + 7)?
+    }
+    HttpBodyFinishFailed(returned, HttpBodyUnsupportedUpgrade(framing)) -> {
+      let dropped = returned.drop()
+      result_err<owned HttpConnection, i64>(code + 8)?
+    }
+    HttpBodyFinishFailed(returned, HttpBodyProtocol(error)) -> {
+      let dropped = returned.drop()
+      result_err<owned HttpConnection, i64>(code + 9)?
+    }
+    HttpBodyFinishCloseFailed(error) -> result_err<owned HttpConnection, i64>(code + 11)?
   }
 }
 
@@ -252,16 +341,79 @@ fn http_linked_port(address: SocketAddress) -> u16 {
   }
 }
 
-fn http_linked_url(port: u16) -> str {
+fn http_linked_url(port: u16, path: str) -> str {
   str_concat(
     "https://localhost:",
-    str_concat(int_to_str(__u64_to_i64(num_u16_to_u64(port))), "/stream")
+    str_concat(int_to_str(__u64_to_i64(num_u16_to_u64(port))), path)
   )
 }
 
-fn http_linked_client(
-  port: u16
-) -[HttpClient, HttpBodyIO, TcpStreamIO, Fail<i64>]> i64 {
+fn http_linked_client_started(
+  begun: HttpPooledClientBegin,
+  failure_base: i64
+) -[HttpClient, HttpBodyIO, TcpStreamIO, Fail<i64>]> HttpLinkedExchange {
+  let limits = http_default_limits()
+  match begun {
+    HttpPooledRequestFailed(pool, HttpExchangeConnectionOrigin) -> {
+      let dropped = pool.drop()
+      result_err<HttpLinkedExchange, i64>(failure_base + 1)?
+    }
+    HttpPooledRequestFailed(pool, HttpExchangeConnectionNotReusable) -> {
+      let dropped = pool.drop()
+      result_err<HttpLinkedExchange, i64>(failure_base + 2)?
+    }
+    HttpPooledRequestFailed(pool, error) -> {
+      let dropped = pool.drop()
+      result_err<HttpLinkedExchange, i64>(failure_base + 3)?
+    }
+    HttpPooledRequestReady(pool, body) -> {
+      let ready: owned HttpBodyStream = http_linked_fixed_writer_preflight(body)
+      let wrote: owned HttpBodyStream = http_linked_require_write(
+        ready,
+        bytes_from_str("hello"),
+        failure_base + 1
+      )?
+      let connection: owned HttpConnection = http_linked_require_finish(
+        wrote,
+        http_headers_empty(),
+        failure_base + 2
+      )
+      match http_client_response(connection, HttpPost, limits) {
+        HttpClientResponseFailed(error) -> {
+          let dropped = pool.drop()
+          result_err<HttpLinkedExchange, i64>(failure_base + 3)?
+        }
+        HttpClientResponseReady(head, response_body) -> match http_linked_collect(
+          http_linked_reader_preflight(response_body)
+        ) {
+          HttpLinkedBodyFailed(kind) -> {
+            let dropped = pool.drop()
+            result_err<HttpLinkedExchange, i64>(failure_base + 4 + kind)?
+          }
+          HttpLinkedBodyReady(done, bytes, trailers) -> {
+            let matches = http_status_code(http_response_status(head)) == 200 and
+              bytes_equal(bytes, bytes_from_str("world!")) and
+              http_headers_len(trailers) == 1
+            if not matches {
+              let closed = http_linked_close(done, failure_base + 5)?
+              let dropped = pool.drop()
+              result_err<HttpLinkedExchange, i64>(failure_base + 5)?
+            } else {
+              HttpLinkedExchangeReady(pool, done)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn http_linked_client_exchange(
+  pool: owned HttpConnectionPool,
+  port: u16,
+  path: str,
+  failure_base: i64
+) -[HttpClient, HttpBodyIO, TcpStreamIO, Fail<i64>]> HttpLinkedExchange {
   let limits = http_default_limits()
   let authority = str_concat("localhost:", int_to_str(__u64_to_i64(num_u16_to_u64(port))))
   let headers = http_headers_append(
@@ -270,30 +422,140 @@ fn http_linked_client(
   )
   let request = http_request_head_new(
     HttpPost,
-    http_request_target_parse("/stream").unwrap(),
+    http_request_target_parse(path).unwrap(),
     Http11,
     headers,
     limits
   ).unwrap()
-  let url = url_parse(http_linked_url(port)).unwrap()
-  match http_client_begin(url, request, limits) {
-    HttpClientRequestFailed(error) -> Fail<i64>.fail(31)
-    HttpClientRequestReady(body) -> {
-      let ready: owned HttpBodyStream = http_linked_fixed_writer_preflight(body)
-      let wrote: owned HttpBodyStream = http_linked_require_write(ready, bytes_from_str("hello"), 32)?
-      let connection: owned HttpConnection = http_linked_require_finish(wrote, http_headers_empty(), 33)?
-      match http_client_response(connection, HttpPost, limits) {
-        HttpClientResponseFailed(error) -> Fail<i64>.fail(34)
-        HttpClientResponseReady(head, response_body) -> match http_linked_collect(http_linked_reader_preflight(response_body)) {
-          HttpLinkedBodyFailed -> Fail<i64>.fail(35)
-          HttpLinkedBodyReady(done, bytes, trailers) -> {
-            let matches = http_status_code(http_response_status(head)) == 200 and
-              bytes_equal(bytes, bytes_from_str("world!")) and
-              http_headers_len(trailers) == 1
-            let closed = http_linked_close(done, 36)?
-            if matches { 1 } else { 0 }
+  let url = url_parse(http_linked_url(port, path)).unwrap()
+  http_linked_client_started(
+    http_client_pool_begin(pool, url, request, limits),
+    failure_base
+  )
+}
+
+fn http_linked_client_reuse_exchange(
+  pool: owned HttpConnectionPool,
+  connection: owned HttpConnection,
+  port: u16,
+  path: str,
+  failure_base: i64
+) -[HttpClient, HttpBodyIO, TcpStreamIO, Fail<i64>]> HttpLinkedExchange {
+  let limits = http_default_limits()
+  let authority = str_concat("localhost:", int_to_str(__u64_to_i64(num_u16_to_u64(port))))
+  let headers = http_headers_append(
+    http_linked_headers("Host", authority),
+    http_linked_header("Content-Length", "5")
+  )
+  let request = http_request_head_new(
+    HttpPost,
+    http_request_target_parse(path).unwrap(),
+    Http11,
+    headers,
+    limits
+  ).unwrap()
+  let url = url_parse(http_linked_url(port, path)).unwrap()
+  let begun = match http_client_reuse(url, connection, request, limits) {
+    HttpClientRequestFailed(error) -> HttpPooledRequestFailed(pool, error)
+    HttpClientRequestReady(body) -> HttpPooledRequestReady(pool, body)
+  }
+  http_linked_client_started(begun, failure_base)
+}
+
+fn http_linked_client(
+  port: u16
+) -[HttpClient, HttpBodyIO, TcpStreamIO, Fail<i64>]> i64 {
+  let zero: owned HttpConnectionPool = http_connection_pool(0).unwrap()
+  let first = http_linked_client_exchange(zero, port, "/stream", 31)
+  match first {
+    HttpLinkedExchangeReady(empty, connection) -> match http_pool_release(empty, connection) {
+      HttpPoolAtCapacity(returned_empty, rejected) -> {
+        if http_pool_len(returned_empty) != 0 {
+          let closed = http_linked_close(rejected, 61)?
+          let dropped = returned_empty.drop()
+          Fail<i64>.fail(61)
+        } else {
+          let dropped = returned_empty.drop()
+          let one: owned HttpConnectionPool = http_connection_pool(1).unwrap()
+          match http_linked_client_reuse_exchange(one, rejected, port, "/again", 71) {
+            HttpLinkedExchangeReady(empty_one, second_connection) -> match http_pool_release(
+              empty_one, second_connection
+            ) {
+              HttpPoolStored(stored) -> match http_pool_checkout(
+                stored,
+                url_parse("https://other.example/not-this-origin").unwrap()
+              ) {
+                HttpPoolHit(returned, unexpected) -> {
+                  let closed = http_linked_close(unexpected, 81)?
+                  let dropped = returned.drop()
+                  Fail<i64>.fail(81)
+                }
+                HttpPoolMiss(preserved) -> {
+                  if http_pool_len(preserved) != 1 {
+                    let dropped = preserved.drop()
+                    Fail<i64>.fail(82)
+                  } else { match http_linked_client_exchange(
+                      preserved, port, "/final", 91
+                    ) {
+                      HttpLinkedExchangeReady(checked_out, third_connection) -> match http_pool_release(
+                        checked_out, third_connection
+                      ) {
+                        HttpPoolStored(final_pool) -> {
+                          let retained = http_pool_len(final_pool)
+                          let dropped = final_pool.drop()
+                          if retained == 1 and dropped == 0 { 1 } else { 83 }
+                        }
+                        HttpPoolAtCapacity(returned, unexpected) -> {
+                          let closed = http_linked_close(unexpected, 84)?
+                          let dropped = returned.drop()
+                          Fail<i64>.fail(84)
+                        }
+                        HttpPoolConnectionNotReusable(returned, unexpected) -> {
+                          let closed = http_linked_close(unexpected, 85)?
+                          let dropped = returned.drop()
+                          Fail<i64>.fail(85)
+                        }
+                        HttpPoolForeignConnection(returned, unexpected) -> {
+                          let closed = http_linked_close(unexpected, 86)?
+                          let dropped = returned.drop()
+                          Fail<i64>.fail(86)
+                        }
+                      }
+                    } }
+                }
+              }
+              HttpPoolAtCapacity(returned, unexpected) -> {
+                let closed = http_linked_close(unexpected, 87)?
+                let dropped = returned.drop()
+                Fail<i64>.fail(87)
+              }
+              HttpPoolConnectionNotReusable(returned, unexpected) -> {
+                let closed = http_linked_close(unexpected, 88)?
+                let dropped = returned.drop()
+                Fail<i64>.fail(88)
+              }
+              HttpPoolForeignConnection(returned, unexpected) -> {
+                let closed = http_linked_close(unexpected, 89)?
+                let dropped = returned.drop()
+                Fail<i64>.fail(89)
+              }
+            }
           }
         }
+      }
+      HttpPoolStored(returned) -> {
+        let dropped = returned.drop()
+        Fail<i64>.fail(62)
+      }
+      HttpPoolConnectionNotReusable(returned, rejected) -> {
+        let closed = http_linked_close(rejected, 63)?
+        let dropped = returned.drop()
+        Fail<i64>.fail(63)
+      }
+      HttpPoolForeignConnection(returned, rejected) -> {
+        let closed = http_linked_close(rejected, 64)?
+        let dropped = returned.drop()
+        Fail<i64>.fail(64)
       }
     }
   }
@@ -312,7 +574,7 @@ fn http_linked_client_tls(
 
 fn http_linked_server_response(
   connection: owned HttpConnection
-) -[HttpServer, HttpBodyIO, TcpStreamIO, Fail<i64>]> i64 {
+) -[HttpServer, HttpBodyIO, TcpStreamIO, Fail<i64>]> owned HttpConnection {
   let limits = http_default_limits()
   let response = http_response_head_new(
     HttpPost,
@@ -326,13 +588,84 @@ fn http_linked_server_response(
     HttpServerResponseFailed(error) -> Fail<i64>.fail(41)
     HttpServerResponseReady(body) -> {
       let ready: owned HttpBodyStream = http_linked_chunk_writer_preflight(body)
-      let first: owned HttpBodyStream = http_linked_require_write(ready, bytes_from_str("world"), 42)?
-      let second: owned HttpBodyStream = http_linked_require_write(first, bytes_from_str("!"), 43)?
+      let first: owned HttpBodyStream = http_linked_require_write(
+        ready,
+        bytes_from_str("world"),
+        42
+      )?
+      let second: owned HttpBodyStream = http_linked_require_write(
+        first,
+        bytes_from_str("!"),
+        43
+      )?
       let finishable: owned HttpBodyStream = http_linked_chunk_finish_preflight(second)
-      let trailers = http_linked_headers("X-Checksum", "yes")
-      let done: owned HttpConnection = http_linked_require_finish(finishable, trailers, 44)?
-      http_linked_close(done, 45)?
+      http_linked_require_finish(
+        finishable,
+        http_linked_headers("X-Checksum", "yes"),
+        44
+      )
     }
+  }
+}
+
+fn http_linked_server_request_body(
+  head: HttpRequestHead,
+  body: owned HttpBodyStream,
+  expected_path: str,
+  failure_base: i64
+) -[HttpBodyIO, TcpStreamIO, Fail<i64>]> owned HttpConnection {
+  match http_linked_collect(body) {
+    HttpLinkedBodyFailed(kind) -> result_err<owned HttpConnection, i64>(failure_base + kind)?
+    HttpLinkedBodyReady(connection, bytes, trailers) -> {
+      let matches = http_method_text(http_request_method(head)) == "POST" and
+        bytes_equal(http_request_target_bytes(http_request_target(head)), bytes_from_str(expected_path)) and
+        bytes_equal(bytes, bytes_from_str("hello")) and
+        http_headers_len(trailers) == 0
+      if matches { connection }
+      else {
+        let closed = http_linked_close(connection, failure_base + 20)?
+        result_err<owned HttpConnection, i64>(failure_base + 20)?
+      }
+    }
+  }
+}
+
+fn http_linked_require_server_pool_rejection(
+  connection: owned HttpConnection
+) -[HttpBodyIO, TcpStreamIO, Fail<i64>]> owned HttpConnection {
+  let pool: owned HttpConnectionPool = http_connection_pool(1).unwrap()
+  match http_pool_release(pool, connection) {
+    HttpPoolForeignConnection(returned, rejected) -> {
+      let dropped = returned.drop()
+      rejected
+    }
+    HttpPoolStored(returned) -> {
+      let dropped = returned.drop()
+      result_err<owned HttpConnection, i64>(121)?
+    }
+    HttpPoolAtCapacity(returned, rejected) -> {
+      let closed = http_linked_close(rejected, 122)?
+      let dropped = returned.drop()
+      result_err<owned HttpConnection, i64>(122)?
+    }
+    HttpPoolConnectionNotReusable(returned, rejected) -> {
+      let closed = http_linked_close(rejected, 123)?
+      let dropped = returned.drop()
+      result_err<owned HttpConnection, i64>(123)?
+    }
+  }
+}
+
+fn http_linked_server_next_request(
+  connection: owned HttpConnection,
+  expected_path: str,
+  failure_base: i64
+) -[HttpServer, HttpBodyIO, TcpStreamIO, Fail<i64>]> owned HttpConnection {
+  match http_server_request(connection, http_default_limits()) {
+    HttpServerPersistentRequestFailed(error) -> Fail<i64>.fail(failure_base)
+    HttpServerPersistentRequestReady(head, body) -> http_linked_server_request_body(
+      head, body, expected_path, failure_base + 1
+    )
   }
 }
 
@@ -360,17 +693,35 @@ fn http_linked_server(
               Err(error) -> Fail<i64>.fail(54)
               Ok(done) -> 0
             }
-            match http_linked_collect(request_body) {
-              HttpLinkedBodyFailed -> Fail<i64>.fail(55)
+            let first: owned HttpConnection = match http_linked_collect(request_body) {
+              HttpLinkedBodyFailed(kind) -> result_err<owned HttpConnection, i64>(131 + kind)?
               HttpLinkedBodyReady(connection, bytes, trailers) -> {
-                let request_matches = http_method_text(http_request_method(head)) == "POST" and
+                let matches = http_method_text(http_request_method(head)) == "POST" and
                   bytes_equal(http_request_target_bytes(http_request_target(head)), bytes_from_str("/stream")) and
                   bytes_equal(bytes, bytes_from_str("hello")) and
                   http_headers_len(trailers) == 0
-                http_linked_server_response(connection)
-                if request_matches { 1 } else { 56 }
+                if matches { connection }
+                else {
+                  let closed = http_linked_close(connection, 150)?
+                  result_err<owned HttpConnection, i64>(150)?
+                }
               }
             }
+            let checked: owned HttpConnection = http_linked_require_server_pool_rejection(first)
+            let after_first: owned HttpConnection = http_linked_server_response(checked)
+            let after_first_checked: owned HttpConnection = http_linked_require_server_pool_rejection(
+              after_first
+            )
+            let second: owned HttpConnection = http_linked_server_next_request(
+              after_first_checked, "/again", 151
+            )
+            let after_second: owned HttpConnection = http_linked_server_response(second)
+            let third: owned HttpConnection = http_linked_server_next_request(
+              after_second, "/final", 171
+            )
+            let done: owned HttpConnection = http_linked_server_response(third)
+            let closed = http_linked_close(done, 191)?
+            1
           }
         }
       }

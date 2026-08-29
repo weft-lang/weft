@@ -9,7 +9,7 @@ use stdlib/bytes.{Bytes, bytes_to_vector}
 use stdlib/dns.{DnsAnyFamily, DnsError, DnsResolve, dns_numeric_candidates, dns_resolve}
 use stdlib/drop.{Drop}
 use stdlib/http.{HttpConnectionClose, HttpConnectionPersistent, HttpConnectionReuse, HttpLimits, HttpMethod, HttpParseError, HttpRequestHead, HttpRequestHeadFailed, HttpRequestHeadNeedMore, HttpRequestHeadReady, HttpResponseHead, HttpResponseHeadFailed, HttpResponseHeadNeedMore, HttpResponseHeadReady, http_encode_request_head, http_encode_response_head, http_request_body_framing, http_request_connection, http_response_body_framing, http_response_connection, http_parse_request_head, http_parse_response_head}
-use stdlib/http_stream.{HttpBodyError, HttpBodyIO, HttpBodyStream, HttpConnection, HttpConnectionReceive, HttpConnectionReceiveFailed, HttpConnectionReceived, HttpConnectionPeerClosed, HttpConnectionSnapshot, HttpConnectionSnapshotted, HttpConnectionWrite, HttpConnectionWriteFailed, HttpConnectionWritten, http_body_close_connection_direct, http_body_connection_advance, http_body_connection_receive, http_body_finish_direct, http_body_read_direct, http_body_reader_open, http_body_write_direct, http_body_write_wire, http_body_writer_open, http_connection_disallow_reuse, http_connection_from_tls, http_connection_snapshot}
+use stdlib/http_stream.{HttpBodyError, HttpBodyIO, HttpBodyStream, HttpConnection, HttpConnectionClientOrigin, HttpConnectionReceive, HttpConnectionReceiveFailed, HttpConnectionReceived, HttpConnectionPeerClosed, HttpConnectionServerPeer, HttpConnectionSnapshot, HttpConnectionSnapshotted, HttpConnectionWrite, HttpConnectionWriteFailed, HttpConnectionWritten, http_body_close_connection_direct, http_body_connection_advance, http_body_connection_receive, http_body_finish_direct, http_body_read_direct, http_body_reader_open, http_body_write_direct, http_body_write_wire, http_body_writer_open, http_connection_disallow_reuse, http_connection_from_tls, http_connection_has_client_origin, http_connection_is_reusable, http_connection_matches_origin, http_connection_snapshot}
 use stdlib/net_address.{IpV4, IpV6, SocketAddress}
 use stdlib/result.{Err, Ok, Result, result_err, result_ok}
 use stdlib/secure_random.{SecureRandom}
@@ -40,7 +40,11 @@ pub type HttpExchangeError {
     --- Body-stream construction or transport failed.
     HttpExchangeBody(HttpBodyError),
     --- The peer closed before a complete HTTP head arrived.
-    HttpExchangeUnexpectedEof
+    HttpExchangeUnexpectedEof,
+    --- A reusable connection did not belong to the requested URL origin.
+    HttpExchangeConnectionOrigin,
+    --- A connection marked for closure was offered for another request.
+    HttpExchangeConnectionNotReusable
 }
 
 --- An outbound request body ready for incremental writes.
@@ -85,6 +89,14 @@ pub type HttpServerAccept {
     HttpServerAcceptFailed(owned HttpServerListener, HttpExchangeError)
 }
 
+--- One subsequent request on an established persistent server connection.
+pub type HttpServerRequest {
+  --- The validated request head and its inbound body owner.
+  HttpServerPersistentRequestReady(HttpRequestHead, owned HttpBodyStream),
+    --- The persistent connection was consumed after setup or parsing failed.
+    HttpServerPersistentRequestFailed(HttpExchangeError)
+}
+
 --- An outbound response body ready for incremental writes.
 pub type HttpServerRespond {
   --- The response head was sent and the body owner is ready.
@@ -97,6 +109,13 @@ pub type HttpServerRespond {
 pub effect HttpClient {
   --- Connect, authenticate, send one request head, and return its body writer.
   fn begin(url: Url, request: HttpRequestHead, limits: HttpLimits) -> HttpClientBegin
+  --- Send a request over a returned idle connection of the same origin.
+  fn reuse(
+    url: Url,
+    connection: owned HttpConnection,
+    request: HttpRequestHead,
+    limits: HttpLimits
+  ) -> HttpClientBegin
   --- Read and validate the response head after the request body completes.
   fn response(
     connection: owned HttpConnection,
@@ -111,6 +130,8 @@ pub effect HttpServer {
   fn listen(address: SocketAddress, options: TcpListenOptions) -> HttpServerListen
   --- Accept, authenticate, and parse one request head.
   fn accept(listener: owned HttpServerListener, limits: HttpLimits) -> HttpServerAccept
+  --- Parse the next request on a returned persistent server connection.
+  fn request(connection: owned HttpConnection, limits: HttpLimits) -> HttpServerRequest
   --- Send one validated response head and return its body writer.
   fn respond(
     connection: owned HttpConnection,
@@ -288,23 +309,10 @@ fn http_client_begin_tls(
                 stream,
                 vector_with_capacity<u8>(0),
                 0,
-                http_request_connection(request)
+                HttpConnectionPersistent,
+                HttpConnectionClientOrigin(url.origin())
               )
-              match http_body_write_wire(connection, http_encode_request_head(request)) {
-                HttpConnectionWriteFailed(failed, error) -> {
-                  http_endpoint_drop_connection(failed)
-                  HttpClientRequestFailed(HttpExchangeBody(error))
-                }
-                HttpConnectionWritten(ready) -> match http_body_writer_open(
-                  ready,
-                  http_request_body_framing(request),
-                  limits,
-                  false
-                ) {
-                  Err(error) -> HttpClientRequestFailed(HttpExchangeBody(error))
-                  Ok(body) -> HttpClientRequestReady(body)
-                }
-              }
+              http_client_reuse_tls(url, connection, request, limits)
             }
           }
         }
@@ -312,6 +320,38 @@ fn http_client_begin_tls(
     }
     scheme -> HttpClientRequestFailed(HttpExchangeUnsupportedScheme(scheme))
   }
+}
+
+fn http_client_reuse_tls(
+  url: Url,
+  connection: owned HttpConnection,
+  request: HttpRequestHead,
+  limits: HttpLimits
+) -[TcpReadiness, TcpStreamIO]> HttpClientBegin {
+  if not http_connection_matches_origin(connection, url.origin()) {
+    http_endpoint_drop_connection(connection)
+    HttpClientRequestFailed(HttpExchangeConnectionOrigin)
+  } else { if not http_connection_is_reusable(connection) {
+      http_endpoint_drop_connection(connection)
+      HttpClientRequestFailed(HttpExchangeConnectionNotReusable)
+    } else {
+      let selected = http_endpoint_apply_reuse(connection, http_request_connection(request))
+      match http_body_write_wire(selected, http_encode_request_head(request)) {
+        HttpConnectionWriteFailed(failed, error) -> {
+          http_endpoint_drop_connection(failed)
+          HttpClientRequestFailed(HttpExchangeBody(error))
+        }
+        HttpConnectionWritten(ready) -> match http_body_writer_open(
+          ready,
+          http_request_body_framing(request),
+          limits,
+          false
+        ) {
+          Err(error) -> HttpClientRequestFailed(HttpExchangeBody(error))
+          Ok(body) -> HttpClientRequestReady(body)
+        }
+      }
+    } }
 }
 
 fn http_client_response_tls(
@@ -380,7 +420,8 @@ fn http_server_accept_tls(
                   stream,
                   vector_with_capacity<u8>(0),
                   0,
-                  HttpConnectionPersistent
+                  HttpConnectionPersistent,
+                  HttpConnectionServerPeer
                 )
                 match http_endpoint_request_head(connection, limits) {
                   HttpRequestConnectionFailed(error) -> HttpServerAcceptFailed(
@@ -407,6 +448,30 @@ fn http_server_accept_tls(
       }
     }
   }
+}
+
+fn http_server_request_tls(
+  connection: owned HttpConnection,
+  limits: HttpLimits
+) -[TcpReadiness, TcpStreamIO]> HttpServerRequest {
+  if http_connection_has_client_origin(connection) {
+    http_endpoint_drop_connection(connection)
+    HttpServerPersistentRequestFailed(HttpExchangeConnectionOrigin)
+  } else { if not http_connection_is_reusable(connection) {
+      http_endpoint_drop_connection(connection)
+      HttpServerPersistentRequestFailed(HttpExchangeConnectionNotReusable)
+    } else { match http_endpoint_request_head(connection, limits) {
+    HttpRequestConnectionFailed(error) -> HttpServerPersistentRequestFailed(error)
+    HttpRequestConnectionReady(request_connection, head) -> match http_body_reader_open(
+      request_connection,
+      http_request_body_framing(head),
+      limits,
+      false
+    ) {
+      Err(error) -> HttpServerPersistentRequestFailed(HttpExchangeBody(error))
+      Ok(body) -> HttpServerPersistentRequestReady(head, body)
+    }
+  } } }
 }
 
 fn http_server_respond_tls(
@@ -441,6 +506,20 @@ pub fn http_client_begin(
   HttpClient.begin(url, request, limits)
 }
 
+--- Begin one request on a returned idle connection through client policy.
+---
+--- Production validates the connection's retained origin and reuse fact before
+--- any wire write. Pool implementations should call this operation rather than
+--- treating a caller-supplied key as proof of connection identity.
+pub fn http_client_reuse(
+  url: Url,
+  connection: owned HttpConnection,
+  request: HttpRequestHead,
+  limits: HttpLimits
+) -[HttpClient, TcpStreamIO]> HttpClientBegin {
+  HttpClient.reuse(url, connection, request, limits)
+}
+
 --- Read the response head after finishing the request body.
 pub fn http_client_response(
   connection: owned HttpConnection,
@@ -464,6 +543,14 @@ pub fn http_server_accept(
   limits: HttpLimits
 ) -[HttpServer, TcpListenerIO]> HttpServerAccept {
   HttpServer.accept(listener, limits)
+}
+
+--- Read the next request from a returned persistent server connection.
+pub fn http_server_request(
+  connection: owned HttpConnection,
+  limits: HttpLimits
+) -[HttpServer, TcpStreamIO]> HttpServerRequest {
+  HttpServer.request(connection, limits)
 }
 
 --- Close and consume an HTTP server listener.
@@ -492,6 +579,7 @@ pub fn http_client_with_tls<T, E>(
   handle {
     handle body() {
       HttpClient.begin(url, request, limits) -> resume(http_client_begin_tls(trust_roots, url, request, limits))
+      HttpClient.reuse(url, connection, request, limits) -> resume(http_client_reuse_tls(url, connection, request, limits))
       HttpClient.response(connection, request_method, limits) -> resume(http_client_response_tls(connection, request_method, limits))
     }
   } {
@@ -512,6 +600,7 @@ pub fn http_server_with_tls<T, E>(
     handle body() {
       HttpServer.listen(address, options) -> resume(http_server_listen_tls(address, options))
       HttpServer.accept(listener, limits) -> resume(http_server_accept_tls(certificate, private_key, listener, limits))
+      HttpServer.request(connection, limits) -> resume(http_server_request_tls(connection, limits))
       HttpServer.respond(connection, response, limits) -> resume(http_server_respond_tls(connection, response, limits))
     }
   } {
@@ -535,11 +624,13 @@ pub fn http_with_tls<T, E>(
     handle {
       handle body() {
         HttpClient.begin(url, request, limits) -> resume(http_client_begin_tls(trust_roots, url, request, limits))
+        HttpClient.reuse(url, connection, request, limits) -> resume(http_client_reuse_tls(url, connection, request, limits))
         HttpClient.response(connection, request_method, limits) -> resume(http_client_response_tls(connection, request_method, limits))
       }
     } {
       HttpServer.listen(address, options) -> resume(http_server_listen_tls(address, options))
       HttpServer.accept(listener, limits) -> resume(http_server_accept_tls(certificate, private_key, listener, limits))
+      HttpServer.request(connection, limits) -> resume(http_server_request_tls(connection, limits))
       HttpServer.respond(connection, response, limits) -> resume(http_server_respond_tls(connection, response, limits))
     }
   } {
