@@ -1,0 +1,1418 @@
+-- stdlib/websocket.weft — pure bounded RFC 6455 frame semantics
+--
+-- Header parsing and payload delivery are separate prefix state machines. A
+-- caller can therefore stream a large frame through bounded HTTP/TLS reads
+-- without retaining its whole payload. Client masking is capability-scoped:
+-- only SecureRandom can produce an outbound client frame's fresh key.
+
+use stdlib/bytes.{Bytes, bytes_concat, bytes_copy_range, bytes_empty, bytes_from_str, bytes_get, bytes_len, bytes_push, bytes_to_utf8, utf8_error_offset_or}
+use stdlib/http.{Http11, HttpGet, HttpHeader, HttpHeaders, HttpNoBody, HttpProtocolSwitch, HttpRequestHead, HttpResponseHead, http_field_name_parse, http_field_name_text, http_header, http_header_name, http_header_value, http_headers_append, http_headers_empty, http_headers_get, http_headers_len, http_request_body_framing, http_request_headers, http_request_method, http_request_version, http_response_body_framing, http_response_headers, http_response_status, http_response_version, http_status_code}
+use stdlib/num.{num_i64_to_u8_checked, num_int_cast_value_or, num_u64_to_i64_checked}
+use stdlib/option.{None, Option, Some, option_none, option_some}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/secure_random.{SecureRandom, SecureRandomError, secure_random_bytes}
+use stdlib/string.{str_concat, str_is_utf8, str_len}
+use stdlib/vector.{vector_get_in_bounds, vector_new, vector_push, vector_set}
+
+--- The local endpoint role, which fixes inbound and outbound masking policy.
+pub type WebSocketRole {
+  --- A client receives unmasked frames and sends freshly masked frames.
+  WebSocketClient,
+    --- A server receives masked frames and sends unmasked frames.
+    WebSocketServer
+}
+
+--- One opcode admitted by the RFC 6455 alpha frame floor.
+pub type WebSocketOpcode {
+  --- A continuation fragment for the current text or binary message.
+  WebSocketContinuation,
+    --- The first or only fragment of a UTF-8 text message.
+    WebSocketText,
+    --- The first or only fragment of a binary message.
+    WebSocketBinary,
+    --- The close-handshake control frame.
+    WebSocketClose,
+    --- A ping control frame requiring a matching pong payload.
+    WebSocketPing,
+    --- A pong control frame.
+    WebSocketPong
+}
+
+--- Bounded frame and reassembled-message byte limits.
+pub type WebSocketLimits = opaque WebSocketLimitsParts
+
+--- A precise WebSocket framing, control, or entropy failure.
+pub type WebSocketError {
+  --- A frame limit was not positive.
+  WebSocketInvalidFrameLimit(i64),
+    --- A message limit was not positive or was smaller than the frame limit.
+    WebSocketInvalidMessageLimit(i64),
+    --- An RSV bit was set without a negotiated extension.
+    WebSocketReservedBits(i64),
+    --- An unassigned opcode was received.
+    WebSocketReservedOpcode(i64),
+    --- A server received an unmasked client frame.
+    WebSocketMaskRequired,
+    --- A client received a masked server frame.
+    WebSocketMaskForbidden,
+    --- An extended payload length used a shorter noncanonical encoding.
+    WebSocketNoncanonicalLength(i64),
+    --- A 64-bit payload length set its forbidden high bit.
+    WebSocketInvalidLength(i64),
+    --- A frame exceeded the configured byte limit.
+    WebSocketFrameTooLarge(i64),
+    --- A control frame cleared FIN.
+    WebSocketFragmentedControl,
+    --- A control payload exceeded 125 bytes.
+    WebSocketControlTooLarge(i64),
+    --- Control decoding was requested for a data opcode.
+    WebSocketExpectedControl,
+    --- A close payload contained exactly one byte.
+    WebSocketInvalidClosePayload,
+    --- A close payload used a code forbidden on the wire.
+    WebSocketInvalidCloseCode(i64),
+    --- A close reason was not canonical UTF-8.
+    WebSocketInvalidCloseReason(i64),
+    --- A close reason left too little room for its two-byte status.
+    WebSocketCloseReasonTooLong(i64),
+    --- A continuation arrived without an unfinished data message.
+    WebSocketContinuationWithoutMessage,
+    --- A new data message arrived before the prior fragmented message ended.
+    WebSocketInterleavedMessage,
+    --- Reassembled data exceeded the configured message limit.
+    WebSocketMessageTooLarge(i64),
+    --- A payload chunk did not agree with its validated frame length.
+    WebSocketPayloadLengthMismatch(i64, i64),
+    --- A text message contained malformed or truncated UTF-8 at this offset.
+    WebSocketInvalidText(i64),
+    --- Data arrived after the peer's close frame.
+    WebSocketDataAfterClose,
+    --- Fresh client masking-key generation failed.
+    WebSocketRandom(SecureRandomError)
+}
+
+--- One validated frame header without its streamed payload bytes.
+pub type WebSocketFrameHeader = opaque WebSocketFrameHeaderParts
+
+--- Prefix parsing of one WebSocket frame header.
+pub type WebSocketFrameParse {
+  --- The current prefix is valid but lacks a complete header.
+  WebSocketFrameNeedMore,
+    --- One complete header and its exact consumed byte count.
+    WebSocketFrameReady(WebSocketFrameHeader, usize),
+    --- The prefix cannot begin a valid frame for this local role.
+    WebSocketFrameFailed(WebSocketError)
+}
+
+--- A streaming payload decoder derived from one validated header.
+pub type WebSocketPayloadDecoder = opaque WebSocketPayloadParts
+
+--- One bounded payload transition with masking removed when required.
+pub type WebSocketPayloadRead {
+  --- A non-empty payload chunk and successor decoder.
+  WebSocketPayloadChunk(WebSocketPayloadDecoder, Bytes, usize),
+    --- The final, possibly empty payload chunk.
+    WebSocketPayloadEnd(Bytes, usize),
+    --- A non-empty frame needs another transport fragment.
+    WebSocketPayloadNeedInput(WebSocketPayloadDecoder)
+}
+
+--- A decoded control frame with its semantic close alternative.
+pub type WebSocketControl {
+  --- Begin or acknowledge the closing handshake.
+  WebSocketControlClose(WebSocketCloseValue),
+    --- A ping payload that must be reproduced in its pong.
+    WebSocketControlPing(Bytes),
+    --- One received pong payload.
+    WebSocketControlPong(Bytes)
+}
+
+--- The close status and reason carried on the wire.
+pub type WebSocketCloseValue {
+  --- No status code was supplied.
+  WebSocketCloseWithoutStatus,
+    --- A validated status code and UTF-8 diagnostic reason.
+    WebSocketCloseWithStatus(i64, str)
+}
+
+--- A precise HTTP upgrade negotiation failure.
+pub type WebSocketHandshakeError {
+  --- A client handshake could not obtain its 16-byte nonce.
+  WebSocketHandshakeRandom(SecureRandomError),
+    --- The request method was not GET.
+    WebSocketHandshakeMethod,
+    --- The HTTP wire version was not 1.1.
+    WebSocketHandshakeHttpVersion,
+    --- The request or response did not switch protocols.
+    WebSocketHandshakeStatus,
+    --- Upgrade was absent, duplicated, or did not select WebSocket.
+    WebSocketHandshakeUpgrade,
+    --- Connection did not contain the Upgrade token.
+    WebSocketHandshakeConnection,
+    --- Sec-WebSocket-Key was absent, duplicated, or not canonical 16-byte base64.
+    WebSocketHandshakeKey,
+    --- Sec-WebSocket-Version was absent, duplicated, or not 13.
+    WebSocketHandshakeVersion,
+    --- Sec-WebSocket-Accept was absent, duplicated, or did not match the nonce.
+    WebSocketHandshakeAccept,
+    --- The server selected an extension the client did not offer or install.
+    WebSocketHandshakeExtensions,
+    --- The server selected a subprotocol the client did not offer.
+    WebSocketHandshakeProtocol,
+    --- An upgrade request carried HTTP body framing.
+    WebSocketHandshakeBody
+}
+
+--- Client nonce and expected server proof for one upgrade attempt.
+pub type WebSocketClientUpgrade = opaque WebSocketClientUpgradeParts
+
+--- Pure sent/received state for the bidirectional close handshake.
+pub type WebSocketCloseHandshake = opaque i64
+
+--- One close-handshake action derived from a send or receive transition.
+pub type WebSocketCloseTransition {
+  --- A local close was sent first; await the peer's close.
+  WebSocketCloseAwaitPeer(WebSocketCloseHandshake),
+    --- A peer close arrived first and must be echoed with the same payload.
+    WebSocketCloseEcho(WebSocketCloseHandshake, WebSocketCloseValue),
+    --- Both directions have now carried a close frame.
+    WebSocketCloseComplete(WebSocketCloseHandshake),
+    --- This direction had already closed; no second wire frame is needed.
+    WebSocketCloseDuplicate(WebSocketCloseHandshake)
+}
+
+--- The semantic kind of a data message payload.
+pub type WebSocketMessageKind {
+  --- UTF-8 text, validated across every fragment boundary.
+  WebSocketTextMessage,
+    --- Uninterpreted binary bytes.
+    WebSocketBinaryMessage
+}
+
+--- Whether one frame carries data or an interleaved control payload.
+pub type WebSocketMessageContent {
+  --- A text-message payload segment.
+  WebSocketTextContent,
+    --- A binary-message payload segment.
+    WebSocketBinaryContent,
+    --- A close, ping, or pong payload outside message reassembly.
+    WebSocketControlContent
+}
+
+--- Which side of the close handshake governs a data-frame transition.
+pub type WebSocketMessageFlow {
+  --- Receiving data is forbidden after the peer has sent close.
+  WebSocketReceiveMessages,
+    --- Sending data is forbidden after the local endpoint has sent close.
+    WebSocketSendMessages
+}
+
+--- Immutable sequencing and UTF-8 state between complete frames.
+pub type WebSocketMessageState = opaque WebSocketMessageStateParts
+
+--- One validated frame while its already-unmasked payload is consumed.
+pub type WebSocketMessageFrame = opaque WebSocketMessageFrameParts
+
+--- A direct payload-boundary input from the streaming frame decoder.
+pub type WebSocketMessageInput {
+  --- A nonterminal, non-empty payload chunk.
+  WebSocketMessageChunk(Bytes),
+    --- The final, possibly empty payload chunk.
+    WebSocketMessageEnd(Bytes)
+}
+
+--- One message-validation transition.
+pub type WebSocketMessageRead {
+  --- More payload remains in this frame.
+  WebSocketMessageMore(WebSocketMessageFrame),
+    --- The frame ended and produced the successor sequencing state.
+    WebSocketMessageDone(WebSocketMessageState),
+    --- The payload or message sequence is invalid.
+    WebSocketMessageFailed(WebSocketError)
+}
+
+type WebSocketLimitsParts {
+  frame_bytes: i64,
+    message_bytes: i64
+}
+
+type WebSocketClientUpgradeParts {
+  key: str,
+    accept: str
+}
+
+type WebSocketHeaderScan {
+  count: i64,
+    value: Bytes
+}
+
+type WebSocketMask = opaque Bytes
+
+type WebSocketMasking {
+  WebSocketUnmasked,
+    WebSocketMasked(WebSocketMask)
+}
+
+type WebSocketFrameHeaderParts {
+  final: bool,
+    opcode: WebSocketOpcode,
+    payload_bytes: i64,
+    masking: WebSocketMasking
+}
+
+type WebSocketPayloadParts {
+  masking: WebSocketMasking,
+    position: i64,
+    remaining: i64
+}
+
+-- Modes are private representation: 0 idle, 1 text, 2 binary.
+-- Flags: bit 0 current frame is text; bit 1 ends its data message;
+-- bit 2 is a close frame;
+-- bit 4 marks a data rather than control frame.
+type WebSocketMessageStateParts {
+  mode: i64,
+    message_bytes: i64,
+    utf8_needed: i64,
+    utf8_bounds: i64,
+    text_position: i64
+}
+
+type WebSocketMessageFrameParts {
+  mode: i64,
+    message_bytes: i64,
+    remaining: i64,
+    flags: i64,
+    utf8_needed: i64,
+    utf8_bounds: i64,
+    text_position: i64
+}
+
+fn websocket_u8_to_i64(value: u8) -> i64 {
+  num_int_cast_value_or<i64>(num_u64_to_i64_checked(__u8_to_u64(value)), 0)
+}
+
+fn websocket_i64_to_u8(value: i64) -> u8 {
+  num_int_cast_value_or<u8>(num_i64_to_u8_checked(value), 0)
+}
+
+fn websocket_i64_to_usize(value: i64) -> usize {
+  __i64_to_usize(if value < 0 { 0 } else { value })
+}
+
+fn websocket_byte(values: Bytes, index: i64) -> i64 {
+  match bytes_get(values, index) {
+    Some(value) -> websocket_u8_to_i64(value)
+    None -> 0
+  }
+}
+
+fn websocket_u32(value: i64) -> i64 { value band 4294967295 }
+
+fn websocket_rotl32(value: i64, bits: i64) -> i64 {
+  websocket_u32((websocket_u32(value) bshl bits) bor (websocket_u32(value) bshr (32 - bits)))
+}
+
+fn websocket_sha1(values: Bytes) -> Bytes {
+  let original_bytes = bytes_len(values)
+  let mut padded = bytes_push(values, websocket_i64_to_u8(128))
+  while (bytes_len(padded) - bytes_len(padded) / 64 * 64) != 56 {
+    padded = bytes_push(padded, websocket_i64_to_u8(0))
+  }
+  let bit_length = original_bytes * 8
+  for shift in [56, 48, 40, 32, 24, 16, 8, 0] {
+    padded = bytes_push(padded, websocket_i64_to_u8((bit_length bshr shift) band 255))
+  }
+  let words = vector_new<i64>()
+  for index in 0..80 { vector_push<i64>(words, 0) }
+  let mut h0 = 1732584193
+  let mut h1 = 4023233417
+  let mut h2 = 2562383102
+  let mut h3 = 271733878
+  let mut h4 = 3285377520
+  let mut block = 0
+  while block < bytes_len(padded) {
+    for index in 0..16 {
+      let start = block + index * 4
+      vector_set<i64>(words, index,
+        websocket_byte(padded, start) * 16777216 +
+        websocket_byte(padded, start + 1) * 65536 +
+        websocket_byte(padded, start + 2) * 256 +
+        websocket_byte(padded, start + 3)
+      )
+    }
+    for index in 16..80 {
+      vector_set<i64>(words, index, websocket_rotl32(
+        vector_get_in_bounds<i64>(words, index - 3) bxor
+        vector_get_in_bounds<i64>(words, index - 8) bxor
+        vector_get_in_bounds<i64>(words, index - 14) bxor
+        vector_get_in_bounds<i64>(words, index - 16),
+        1
+      ))
+    }
+    let mut a = h0
+    let mut b = h1
+    let mut c = h2
+    let mut d = h3
+    let mut e = h4
+    for index in 0..80 {
+      let f = if index < 20 { (b band c) bor ((b bxor 4294967295) band d) }
+      else { if index < 40 { b bxor c bxor d }
+        else { if index < 60 { (b band c) bor (b band d) bor (c band d) }
+          else { b bxor c bxor d } } }
+      let k = if index < 20 { 1518500249 }
+      else { if index < 40 { 1859775393 }
+        else { if index < 60 { 2400959708 }
+          else { 3395469782 } } }
+      let next = websocket_u32(
+        websocket_rotl32(a, 5) + websocket_u32(f) + e + k + vector_get_in_bounds<i64>(words, index)
+      )
+      e = d
+      d = c
+      c = websocket_rotl32(b, 30)
+      b = a
+      a = next
+    }
+    h0 = websocket_u32(h0 + a)
+    h1 = websocket_u32(h1 + b)
+    h2 = websocket_u32(h2 + c)
+    h3 = websocket_u32(h3 + d)
+    h4 = websocket_u32(h4 + e)
+    block = block + 64
+  }
+  let mut digest = bytes_empty()
+  for word in [h0, h1, h2, h3, h4] {
+    for shift in [24, 16, 8, 0] {
+      digest = bytes_push(digest, websocket_i64_to_u8((word bshr shift) band 255))
+    }
+  }
+  digest
+}
+
+fn websocket_base64_byte(value: i64) -> u8 {
+  websocket_i64_to_u8(if value < 26 { 65 + value }
+  else { if value < 52 { 97 + value - 26 }
+    else { if value < 62 { 48 + value - 52 }
+      else { if value == 62 { 43 } else { 47 } } } })
+}
+
+fn websocket_base64_encode(values: Bytes) -> str {
+  let mut out = bytes_empty()
+  let mut index = 0
+  while index < bytes_len(values) {
+    let available = bytes_len(values) - index
+    let first = websocket_byte(values, index)
+    let second = if available > 1 { websocket_byte(values, index + 1) } else { 0 }
+    let third = if available > 2 { websocket_byte(values, index + 2) } else { 0 }
+    out = bytes_push(out, websocket_base64_byte(first bshr 2))
+    out = bytes_push(out, websocket_base64_byte(((first band 3) bshl 4) bor (second bshr 4)))
+    out = bytes_push(out, if available > 1 {
+      websocket_base64_byte(((second band 15) bshl 2) bor (third bshr 6))
+    } else { websocket_i64_to_u8(61) })
+    out = bytes_push(out, if available > 2 {
+      websocket_base64_byte(third band 63)
+    } else { websocket_i64_to_u8(61) })
+    index = index + 3
+  }
+  match bytes_to_utf8(out) {
+    Ok(text) -> text
+    Err(error) -> ""
+  }
+}
+
+fn websocket_base64_value(byte: i64) -> i64 {
+  if byte >= 65 and byte <= 90 { byte - 65 }
+  else { if byte >= 97 and byte <= 122 { byte - 97 + 26 }
+    else { if byte >= 48 and byte <= 57 { byte - 48 + 52 }
+      else { if byte == 43 { 62 }
+        else { if byte == 47 { 63 } else { 0 - 1 } } } } }
+}
+
+fn websocket_base64_16_valid(value: Bytes) -> bool {
+  if bytes_len(value) != 24 or websocket_byte(value, 22) != 61 or websocket_byte(value, 23) != 61 {
+    false
+  } else {
+    let mut index = 0
+    let mut valid = true
+    while valid and index < 22 {
+      let decoded = websocket_base64_value(websocket_byte(value, index))
+      if decoded < 0 { valid = false }
+      else { if index == 21 and (decoded band 15) != 0 { valid = false }
+        else { index = index + 1 } }
+    }
+    valid
+  }
+}
+
+fn websocket_ascii_lower(byte: i64) -> i64 {
+  if byte >= 65 and byte <= 90 { byte + 32 } else { byte }
+}
+
+fn websocket_range_ascii_equal(values: Bytes, start: i64, end: i64, expected: str) -> bool {
+  let reference = bytes_from_str(expected)
+  if end - start != bytes_len(reference) { false }
+  else {
+    let mut index = 0
+    let mut equal = true
+    while equal and index < bytes_len(reference) {
+      if websocket_ascii_lower(websocket_byte(values, start + index)) !=
+        websocket_ascii_lower(websocket_byte(reference, index)) {
+        equal = false
+      } else { index = index + 1 }
+    }
+    equal
+  }
+}
+
+fn websocket_value_single_token(values: Bytes, expected: str) -> bool {
+  let mut start = 0
+  let mut end = bytes_len(values)
+  while start < end and (websocket_byte(values, start) == 32 or websocket_byte(values, start) == 9) {
+    start = start + 1
+  }
+  while end > start and (websocket_byte(values, end - 1) == 32 or websocket_byte(values, end - 1) == 9) {
+    end = end - 1
+  }
+  websocket_range_ascii_equal(values, start, end, expected)
+}
+
+fn websocket_value_has_token(values: Bytes, expected: str) -> bool {
+  let mut position = 0
+  let mut found = false
+  while not found and position < bytes_len(values) {
+    while position < bytes_len(values) and
+      (websocket_byte(values, position) == 32 or websocket_byte(values, position) == 9 or
+      websocket_byte(values, position) == 44) {
+      position = position + 1
+    }
+    let start = position
+    while position < bytes_len(values) and websocket_byte(values, position) != 44 {
+      position = position + 1
+    }
+    let mut end = position
+    while end > start and (websocket_byte(values, end - 1) == 32 or websocket_byte(values, end - 1) == 9) {
+      end = end - 1
+    }
+    if websocket_range_ascii_equal(values, start, end, expected) { found = true }
+  }
+  found
+}
+
+fn websocket_header_scan(headers: HttpHeaders, name: str) -> WebSocketHeaderScan {
+  let mut count = 0
+  let mut value = bytes_empty()
+  for index in 0..http_headers_len(headers) {
+    match http_headers_get(headers, index) {
+      None -> 0
+      Some(header) -> if http_field_name_text(http_header_name(header)) == name {
+        count = count + 1
+        value = http_header_value(header)
+        0
+      } else { 0 }
+    }
+  }
+  WebSocketHeaderScan { count: count, value: value }
+}
+
+fn websocket_headers_have_token(headers: HttpHeaders, name: str, token: str) -> bool {
+  let mut found = false
+  let mut index = 0
+  while not found and index < http_headers_len(headers) {
+    match http_headers_get(headers, index) {
+      None -> { index = index + 1 }
+      Some(header) -> {
+        if http_field_name_text(http_header_name(header)) == name and
+          websocket_value_has_token(http_header_value(header), token) {
+          found = true
+        } else { index = index + 1 }
+      }
+    }
+  }
+  found
+}
+
+fn websocket_value_exact(values: Bytes, expected: str) -> bool {
+  match bytes_to_utf8(values) {
+    Ok(text) -> text == expected
+    Err(error) -> false
+  }
+}
+
+fn websocket_headers_append(headers: HttpHeaders, name: str, value: str) -> HttpHeaders {
+  http_headers_append(
+    headers,
+    http_header(http_field_name_parse(name).unwrap(), bytes_from_str(value)).unwrap()
+  )
+}
+
+fn websocket_accept(key: str) -> str {
+  websocket_base64_encode(websocket_sha1(bytes_from_str(
+    str_concat(key, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+  )))
+}
+
+fn websocket_limits_parts(limits: WebSocketLimits) -> WebSocketLimitsParts {
+  match limits { WebSocketLimits(parts) -> parts }
+}
+
+fn websocket_header_parts(header: WebSocketFrameHeader) -> WebSocketFrameHeaderParts {
+  match header { WebSocketFrameHeader(parts) -> parts }
+}
+
+fn websocket_mask_bytes(mask: WebSocketMask) -> Bytes {
+  match mask { WebSocketMask(bytes) -> bytes }
+}
+
+fn websocket_opcode_value(opcode: WebSocketOpcode) -> i64 {
+  match opcode {
+    WebSocketContinuation -> 0
+    WebSocketText -> 1
+    WebSocketBinary -> 2
+    WebSocketClose -> 8
+    WebSocketPing -> 9
+    WebSocketPong -> 10
+  }
+}
+
+fn websocket_opcode_parse(value: i64) -> Result<WebSocketOpcode, WebSocketError> {
+  match value {
+    0 -> result_ok<WebSocketOpcode, WebSocketError>(WebSocketContinuation)
+    1 -> result_ok<WebSocketOpcode, WebSocketError>(WebSocketText)
+    2 -> result_ok<WebSocketOpcode, WebSocketError>(WebSocketBinary)
+    8 -> result_ok<WebSocketOpcode, WebSocketError>(WebSocketClose)
+    9 -> result_ok<WebSocketOpcode, WebSocketError>(WebSocketPing)
+    10 -> result_ok<WebSocketOpcode, WebSocketError>(WebSocketPong)
+    other -> result_err<WebSocketOpcode, WebSocketError>(WebSocketReservedOpcode(other))
+  }
+}
+
+fn websocket_opcode_is_control(opcode: WebSocketOpcode) -> bool {
+  match opcode {
+    WebSocketClose -> true
+    WebSocketPing -> true
+    WebSocketPong -> true
+    _ -> false
+  }
+}
+
+fn websocket_mask_policy(role: WebSocketRole, masked: bool) -> Result<nil, WebSocketError> {
+  match role {
+    WebSocketClient -> if masked {
+      result_err<nil, WebSocketError>(WebSocketMaskForbidden)
+    } else { result_ok<nil, WebSocketError>(nil) }
+    WebSocketServer -> if masked {
+      result_ok<nil, WebSocketError>(nil)
+    } else { result_err<nil, WebSocketError>(WebSocketMaskRequired) }
+  }
+}
+
+fn websocket_length16(source: Bytes, start: i64) -> i64 {
+  websocket_byte(source, start) * 256 + websocket_byte(source, start + 1)
+}
+
+fn websocket_length64(source: Bytes, start: i64) -> i64 {
+  let mut value = 0
+  for index in 0..8 {
+    value = value * 256 + websocket_byte(source, start + index)
+  }
+  value
+}
+
+fn websocket_mask_at(masking: WebSocketMasking, position: i64) -> i64 {
+  match masking {
+    WebSocketUnmasked -> 0
+    WebSocketMasked(mask) -> websocket_byte(
+      websocket_mask_bytes(mask),
+      position - position / 4 * 4
+    )
+  }
+}
+
+fn websocket_unmask(masking: WebSocketMasking, position: i64, values: Bytes) -> Bytes {
+  match masking {
+    WebSocketUnmasked -> values
+    WebSocketMasked(mask) -> {
+      let mut out = bytes_empty()
+      for index in 0..bytes_len(values) {
+        out = bytes_push(out, websocket_i64_to_u8(
+          websocket_byte(values, index) bxor websocket_mask_at(WebSocketMasked(mask), position + index)
+        ))
+      }
+      out
+    }
+  }
+}
+
+fn websocket_validate_frame(
+  final: bool,
+  opcode: WebSocketOpcode,
+  payload_bytes: i64,
+  limits: WebSocketLimits
+) -> Result<nil, WebSocketError> {
+  if payload_bytes < 0 {
+    result_err<nil, WebSocketError>(WebSocketInvalidLength(payload_bytes))
+  } else { if payload_bytes > websocket_limits_parts(limits).frame_bytes {
+      result_err<nil, WebSocketError>(WebSocketFrameTooLarge(payload_bytes))
+    } else { if websocket_opcode_is_control(opcode) and not final {
+        result_err<nil, WebSocketError>(WebSocketFragmentedControl)
+      } else { if websocket_opcode_is_control(opcode) and payload_bytes > 125 {
+          result_err<nil, WebSocketError>(WebSocketControlTooLarge(payload_bytes))
+        } else { result_ok<nil, WebSocketError>(nil) } } } }
+}
+
+fn websocket_frame_header(
+  final: bool,
+  opcode: WebSocketOpcode,
+  payload_bytes: i64,
+  masking: WebSocketMasking
+) -> WebSocketFrameHeader {
+  WebSocketFrameHeader(WebSocketFrameHeaderParts {
+    final: final,
+      opcode: opcode,
+      payload_bytes: payload_bytes,
+      masking: masking
+  })
+}
+
+--- Construct limits, requiring a positive frame bound within the message bound.
+pub fn websocket_limits(
+  frame_bytes: i64,
+  message_bytes: i64
+) -> Result<WebSocketLimits, WebSocketError> {
+  if frame_bytes <= 0 {
+    result_err<WebSocketLimits, WebSocketError>(WebSocketInvalidFrameLimit(frame_bytes))
+  } else { if message_bytes <= 0 or message_bytes < frame_bytes {
+      result_err<WebSocketLimits, WebSocketError>(WebSocketInvalidMessageLimit(message_bytes))
+    } else { result_ok<WebSocketLimits, WebSocketError>(WebSocketLimits(WebSocketLimitsParts {
+        frame_bytes: frame_bytes,
+          message_bytes: message_bytes
+      })) } }
+}
+
+--- Return 16 MiB frame and 64 MiB reassembled-message defaults.
+pub fn websocket_default_limits() -> WebSocketLimits {
+  match websocket_limits(16777216, 67108864) {
+    Ok(limits) -> limits
+    Err(error) -> WebSocketLimits(WebSocketLimitsParts {
+      frame_bytes: 16777216,
+        message_bytes: 67108864
+    })
+  }
+}
+
+--- Begin one client upgrade with a fresh canonical 16-byte nonce.
+pub fn websocket_client_upgrade() -[SecureRandom]> Result<WebSocketClientUpgrade, WebSocketHandshakeError> {
+  match secure_random_bytes(websocket_i64_to_usize(16)) {
+    Err(error) -> result_err<WebSocketClientUpgrade, WebSocketHandshakeError>(
+      WebSocketHandshakeRandom(error)
+    )
+    Ok(nonce) -> {
+      let key = websocket_base64_encode(nonce)
+      result_ok<WebSocketClientUpgrade, WebSocketHandshakeError>(
+        WebSocketClientUpgrade(WebSocketClientUpgradeParts {
+        key: key,
+          accept: websocket_accept(key)
+      })
+      )
+    }
+  }
+}
+
+--- Derive the four protocol fields to append to a client GET request.
+---
+--- The caller remains responsible for the ordinary Host field and request
+--- target. Extensions and subprotocols are deliberately absent at this floor.
+pub fn websocket_client_upgrade_headers(upgrade: WebSocketClientUpgrade) -> HttpHeaders {
+  match upgrade {
+    WebSocketClientUpgrade(parts) -> http_headers_empty()
+      |> websocket_headers_append("upgrade", "websocket")
+      |> websocket_headers_append("connection", "Upgrade")
+      |> websocket_headers_append("sec-websocket-key", parts.key)
+      |> websocket_headers_append("sec-websocket-version", "13")
+  }
+}
+
+--- Validate a server's 101 response against the originating client nonce.
+pub fn websocket_client_validate_upgrade(
+  upgrade: WebSocketClientUpgrade,
+  response: HttpResponseHead
+) -> Result<nil, WebSocketHandshakeError> {
+  let parts = match upgrade { WebSocketClientUpgrade(value) -> value }
+  match http_response_version(response) {
+    Http11 -> nil
+    _ -> return result_err<nil, WebSocketHandshakeError>(WebSocketHandshakeHttpVersion)
+  }
+  if http_status_code(http_response_status(response)) != 101 {
+    result_err<nil, WebSocketHandshakeError>(WebSocketHandshakeStatus)
+  } else { match http_response_body_framing(response) {
+      HttpProtocolSwitch -> {
+        let headers = http_response_headers(response)
+        let upgrade_header = websocket_header_scan(headers, "upgrade")
+        let accept_header = websocket_header_scan(headers, "sec-websocket-accept")
+        let extensions = websocket_header_scan(headers, "sec-websocket-extensions")
+        let protocol = websocket_header_scan(headers, "sec-websocket-protocol")
+        if upgrade_header.count != 1 or not websocket_value_single_token(upgrade_header.value, "websocket") {
+          result_err<nil, WebSocketHandshakeError>(WebSocketHandshakeUpgrade)
+        } else { if not websocket_headers_have_token(headers, "connection", "upgrade") {
+            result_err<nil, WebSocketHandshakeError>(WebSocketHandshakeConnection)
+          } else { if accept_header.count != 1 or not websocket_value_exact(accept_header.value, parts.accept) {
+              result_err<nil, WebSocketHandshakeError>(WebSocketHandshakeAccept)
+            } else { if extensions.count != 0 {
+                result_err<nil, WebSocketHandshakeError>(WebSocketHandshakeExtensions)
+              } else { if protocol.count != 0 {
+                  result_err<nil, WebSocketHandshakeError>(WebSocketHandshakeProtocol)
+                } else { result_ok<nil, WebSocketHandshakeError>(nil) } } } } }
+      }
+      _ -> result_err<nil, WebSocketHandshakeError>(WebSocketHandshakeStatus)
+    } }
+}
+
+--- Validate a server-side GET upgrade and derive its exact 101 fields.
+---
+--- The alpha floor installs neither extension nor subprotocol negotiation.
+--- Offers are safely declined by omission; selection requires a future
+--- explicit policy and grammar rather than being inferred from raw strings.
+pub fn websocket_server_upgrade(
+  request: HttpRequestHead
+) -> Result<HttpHeaders, WebSocketHandshakeError> {
+  match http_request_method(request) {
+    HttpGet -> nil
+    _ -> return result_err<HttpHeaders, WebSocketHandshakeError>(WebSocketHandshakeMethod)
+  }
+  match http_request_version(request) {
+    Http11 -> nil
+    _ -> return result_err<HttpHeaders, WebSocketHandshakeError>(WebSocketHandshakeHttpVersion)
+  }
+  match http_request_body_framing(request) {
+    HttpNoBody -> nil
+    _ -> return result_err<HttpHeaders, WebSocketHandshakeError>(WebSocketHandshakeBody)
+  }
+  let headers = http_request_headers(request)
+  let upgrade_header = websocket_header_scan(headers, "upgrade")
+  let key = websocket_header_scan(headers, "sec-websocket-key")
+  let version = websocket_header_scan(headers, "sec-websocket-version")
+  if upgrade_header.count != 1 or not websocket_value_single_token(upgrade_header.value, "websocket") {
+    result_err<HttpHeaders, WebSocketHandshakeError>(WebSocketHandshakeUpgrade)
+  } else { if not websocket_headers_have_token(headers, "connection", "upgrade") {
+      result_err<HttpHeaders, WebSocketHandshakeError>(WebSocketHandshakeConnection)
+    } else { if key.count != 1 or not websocket_base64_16_valid(key.value) {
+        result_err<HttpHeaders, WebSocketHandshakeError>(WebSocketHandshakeKey)
+      } else { if version.count != 1 or not websocket_value_exact(version.value, "13") {
+          result_err<HttpHeaders, WebSocketHandshakeError>(WebSocketHandshakeVersion)
+        } else {
+          let accept = websocket_accept(bytes_to_utf8(key.value).unwrap())
+          result_ok<HttpHeaders, WebSocketHandshakeError>(
+            http_headers_empty()
+            |> websocket_headers_append("upgrade", "websocket")
+            |> websocket_headers_append("connection", "Upgrade")
+            |> websocket_headers_append("sec-websocket-accept", accept)
+          )
+        } } } }
+}
+
+--- Parse one complete frame header without buffering payload bytes.
+pub fn websocket_parse_frame_header(
+  source: Bytes,
+  role: WebSocketRole,
+  limits: WebSocketLimits
+) -> WebSocketFrameParse {
+  if bytes_len(source) < 2 { WebSocketFrameNeedMore }
+  else {
+    let first = websocket_byte(source, 0)
+    let second = websocket_byte(source, 1)
+    let reserved = first band 112
+    let final = (first band 128) != 0
+    let masked = (second band 128) != 0
+    if reserved != 0 { WebSocketFrameFailed(WebSocketReservedBits(reserved)) }
+    else { match websocket_opcode_parse(first band 15) {
+        Err(error) -> WebSocketFrameFailed(error)
+        Ok(opcode) -> match websocket_mask_policy(role, masked) {
+          Err(error) -> WebSocketFrameFailed(error)
+          Ok(done) -> {
+            let marker = second band 127
+            let extended = if marker < 126 { 0 } else { if marker == 126 { 2 } else { 8 } }
+            if bytes_len(source) < 2 + extended { WebSocketFrameNeedMore }
+            else {
+              if marker == 127 and websocket_byte(source, 2) >= 128 {
+                WebSocketFrameFailed(WebSocketInvalidLength(websocket_byte(source, 2)))
+              } else {
+                let payload_bytes = if marker < 126 { marker }
+                else { if marker == 126 { websocket_length16(source, 2) }
+                  else { websocket_length64(source, 2) } }
+                if marker == 126 and payload_bytes < 126 {
+                  WebSocketFrameFailed(WebSocketNoncanonicalLength(payload_bytes))
+                } else { if marker == 127 and payload_bytes <= 65535 {
+                    WebSocketFrameFailed(WebSocketNoncanonicalLength(payload_bytes))
+                  } else { match websocket_validate_frame(final, opcode, payload_bytes, limits) {
+                      Err(error) -> WebSocketFrameFailed(error)
+                      Ok(valid) -> {
+                        let mask_start = 2 + extended
+                        let header_bytes = mask_start + (if masked { 4 } else { 0 })
+                        if bytes_len(source) < header_bytes { WebSocketFrameNeedMore }
+                        else {
+                          let masking = if masked {
+                            WebSocketMasked(WebSocketMask(bytes_copy_range(source, mask_start, mask_start + 4)))
+                          } else { WebSocketUnmasked }
+                          WebSocketFrameReady(
+                            websocket_frame_header(final, opcode, payload_bytes, masking),
+                            websocket_i64_to_usize(header_bytes)
+                          )
+                        }
+                      }
+                    } } } }
+            }
+          }
+        }
+      }
+    } }
+}
+}
+
+--- Return whether this header is the final fragment.
+pub fn websocket_frame_is_final(header: WebSocketFrameHeader) -> bool {
+  websocket_header_parts(header).final
+}
+
+--- Return the header's direct typed opcode.
+pub fn websocket_frame_opcode(header: WebSocketFrameHeader) -> WebSocketOpcode {
+  websocket_header_parts(header).opcode
+}
+
+--- Return the exact payload byte count.
+pub fn websocket_frame_payload_bytes(header: WebSocketFrameHeader) -> i64 {
+  websocket_header_parts(header).payload_bytes
+}
+
+--- Return whether masking will be removed during payload delivery.
+pub fn websocket_frame_is_masked(header: WebSocketFrameHeader) -> bool {
+  match websocket_header_parts(header).masking {
+    WebSocketUnmasked -> false
+    WebSocketMasked(mask) -> true
+  }
+}
+
+--- Start streaming the payload described by a validated frame header.
+pub fn websocket_payload_decoder(header: WebSocketFrameHeader) -> WebSocketPayloadDecoder {
+  let parts = websocket_header_parts(header)
+  WebSocketPayloadDecoder(WebSocketPayloadParts {
+    masking: parts.masking,
+      position: 0,
+      remaining: parts.payload_bytes
+  })
+}
+
+--- Consume at most the remaining payload prefix and remove masking in place.
+---
+--- The caller retains any unconsumed transport suffix. Empty input needs more
+--- only for a non-empty frame; an empty frame completes with an empty chunk.
+pub fn websocket_payload_read(
+  decoder: WebSocketPayloadDecoder,
+  source: Bytes
+) -> WebSocketPayloadRead {
+  match decoder {
+    WebSocketPayloadDecoder(parts) -> if parts.remaining == 0 {
+      WebSocketPayloadEnd(bytes_empty(), websocket_i64_to_usize(0))
+    } else { if bytes_len(source) == 0 {
+        WebSocketPayloadNeedInput(decoder)
+      } else {
+        let count = if bytes_len(source) < parts.remaining { bytes_len(source) } else { parts.remaining }
+        let chunk = websocket_unmask(
+          parts.masking,
+          parts.position,
+          bytes_copy_range(source, 0, count)
+        )
+        if count == parts.remaining {
+          WebSocketPayloadEnd(chunk, websocket_i64_to_usize(count))
+        } else {
+          WebSocketPayloadChunk(
+            WebSocketPayloadDecoder(WebSocketPayloadParts {
+            masking: parts.masking,
+              position: parts.position + count,
+              remaining: parts.remaining - count
+          }),
+            chunk,
+            websocket_i64_to_usize(count)
+          )
+        }
+      } }
+  }
+}
+
+fn websocket_message_state_parts(state: WebSocketMessageState) -> WebSocketMessageStateParts {
+  match state { WebSocketMessageState(parts) -> parts }
+}
+
+fn websocket_message_frame_parts(frame: WebSocketMessageFrame) -> WebSocketMessageFrameParts {
+  match frame { WebSocketMessageFrame(parts) -> parts }
+}
+
+fn websocket_utf8_bounds(lower: i64, upper: i64, initial: i64) -> i64 {
+  lower + upper * 256 + initial * 65536
+}
+
+fn websocket_utf8_lower(bounds: i64) -> i64 { bounds band 255 }
+
+fn websocket_utf8_upper(bounds: i64) -> i64 { (bounds bshr 8) band 255 }
+
+fn websocket_utf8_initial(bounds: i64) -> i64 { (bounds bshr 16) band 255 }
+
+fn websocket_message_add_bytes(current: i64, added: i64, limit: i64) -> Result<i64, WebSocketError> {
+  if added < 0 or current < 0 or current > limit or added > limit - current {
+    result_err<i64, WebSocketError>(WebSocketMessageTooLarge(limit))
+  } else { result_ok<i64, WebSocketError>(current + added) }
+}
+
+fn websocket_message_frame(
+  header: WebSocketFrameHeaderParts,
+  mode: i64,
+  message_bytes: i64,
+  flags: i64,
+  utf8_needed: i64,
+  utf8_bounds: i64,
+  text_position: i64
+) -> WebSocketMessageFrame {
+  WebSocketMessageFrame(WebSocketMessageFrameParts {
+    mode: mode,
+      message_bytes: message_bytes,
+      remaining: header.payload_bytes,
+      flags: flags,
+      utf8_needed: utf8_needed,
+      utf8_bounds: utf8_bounds,
+      text_position: text_position
+  })
+}
+
+--- Construct the idle inbound message state.
+pub fn websocket_message_state() -> WebSocketMessageState {
+  WebSocketMessageState(WebSocketMessageStateParts {
+    mode: 0,
+      message_bytes: 0,
+      utf8_needed: 0,
+      utf8_bounds: 0,
+      text_position: 0
+  })
+}
+
+--- Return the unfinished message kind, if one exists between frames.
+pub fn websocket_message_pending(state: WebSocketMessageState) -> Option<WebSocketMessageKind> {
+  match websocket_message_state_parts(state).mode {
+    1 -> option_some<WebSocketMessageKind>(WebSocketTextMessage)
+    2 -> option_some<WebSocketMessageKind>(WebSocketBinaryMessage)
+    _ -> option_none<WebSocketMessageKind>()
+  }
+}
+
+--- Validate one header against message fragmentation and size state.
+---
+--- Payload bytes are then supplied incrementally with `websocket_message_read`.
+--- Control frames preserve an unfinished data message and may interrupt it.
+pub fn websocket_message_begin(
+  state: WebSocketMessageState,
+  handshake: WebSocketCloseHandshake,
+  flow: WebSocketMessageFlow,
+  header: WebSocketFrameHeader,
+  limits: WebSocketLimits
+) -> Result<WebSocketMessageFrame, WebSocketError> {
+  let current = websocket_message_state_parts(state)
+  let frame = websocket_header_parts(header)
+  let ending = if frame.final { 2 } else { 0 }
+  let closed = match flow {
+    WebSocketReceiveMessages -> websocket_close_was_received(handshake)
+    WebSocketSendMessages -> websocket_close_was_sent(handshake)
+  }
+  match websocket_validate_frame(frame.final, frame.opcode, frame.payload_bytes, limits) {
+    Err(error) -> return result_err<WebSocketMessageFrame, WebSocketError>(error)
+    Ok(valid) -> nil
+  }
+  match frame.opcode {
+    WebSocketClose -> result_ok<WebSocketMessageFrame, WebSocketError>(websocket_message_frame(
+      frame, current.mode, current.message_bytes, 4,
+      current.utf8_needed, current.utf8_bounds, current.text_position
+    ))
+    WebSocketPing -> result_ok<WebSocketMessageFrame, WebSocketError>(websocket_message_frame(
+      frame, current.mode, current.message_bytes, 0,
+      current.utf8_needed, current.utf8_bounds, current.text_position
+    ))
+    WebSocketPong -> result_ok<WebSocketMessageFrame, WebSocketError>(websocket_message_frame(
+      frame, current.mode, current.message_bytes, 0,
+      current.utf8_needed, current.utf8_bounds, current.text_position
+    ))
+    WebSocketContinuation -> if closed {
+      result_err<WebSocketMessageFrame, WebSocketError>(WebSocketDataAfterClose)
+    } else { if current.mode == 0 {
+        result_err<WebSocketMessageFrame, WebSocketError>(WebSocketContinuationWithoutMessage)
+      } else { match websocket_message_add_bytes(
+          current.message_bytes, frame.payload_bytes, websocket_limits_parts(limits).message_bytes
+        ) {
+          Err(error) -> result_err<WebSocketMessageFrame, WebSocketError>(error)
+          Ok(total) -> result_ok<WebSocketMessageFrame, WebSocketError>(websocket_message_frame(
+            frame,
+            if frame.final { 0 } else { current.mode },
+            if frame.final { 0 } else { total },
+            16 + ending + (if current.mode == 1 { 1 } else { 0 }),
+            current.utf8_needed,
+            current.utf8_bounds,
+            current.text_position
+          ))
+        } } }
+    WebSocketText -> if closed {
+      result_err<WebSocketMessageFrame, WebSocketError>(WebSocketDataAfterClose)
+    } else { if current.mode != 0 {
+        result_err<WebSocketMessageFrame, WebSocketError>(WebSocketInterleavedMessage)
+      } else { match websocket_message_add_bytes(
+          0, frame.payload_bytes, websocket_limits_parts(limits).message_bytes
+        ) {
+          Err(error) -> result_err<WebSocketMessageFrame, WebSocketError>(error)
+          Ok(total) -> result_ok<WebSocketMessageFrame, WebSocketError>(websocket_message_frame(
+            frame,
+            if frame.final { 0 } else { 1 },
+            if frame.final { 0 } else { total },
+            16 + 1 + ending,
+            0,
+            0,
+            0
+          ))
+        } } }
+    WebSocketBinary -> if closed {
+      result_err<WebSocketMessageFrame, WebSocketError>(WebSocketDataAfterClose)
+    } else { if current.mode != 0 {
+        result_err<WebSocketMessageFrame, WebSocketError>(WebSocketInterleavedMessage)
+      } else { match websocket_message_add_bytes(
+          0, frame.payload_bytes, websocket_limits_parts(limits).message_bytes
+        ) {
+          Err(error) -> result_err<WebSocketMessageFrame, WebSocketError>(error)
+          Ok(total) -> result_ok<WebSocketMessageFrame, WebSocketError>(websocket_message_frame(
+            frame,
+            if frame.final { 0 } else { 2 },
+            if frame.final { 0 } else { total },
+            16 + ending,
+            0,
+            0,
+            0
+          ))
+        } } }
+  }
+}
+
+--- Return the semantic payload kind carried by this frame.
+pub fn websocket_message_content(frame: WebSocketMessageFrame) -> WebSocketMessageContent {
+  let flags = websocket_message_frame_parts(frame).flags
+  if (flags band 16) == 0 { WebSocketControlContent }
+  else { if (flags band 1) != 0 { WebSocketTextContent }
+    else { WebSocketBinaryContent } }
+}
+
+fn websocket_message_failure(actual: i64, expected: i64) -> WebSocketMessageRead {
+  WebSocketMessageFailed(WebSocketPayloadLengthMismatch(actual, expected))
+}
+
+--- Validate one already-unmasked payload transition without retaining it.
+---
+--- Text validation crosses both transport chunks and WebSocket fragments.
+--- `Chunk` must be non-empty and shorter than the remaining frame payload;
+--- `End` must contain exactly the remaining bytes.
+pub fn websocket_message_read(
+  decoder: WebSocketMessageFrame,
+  input: WebSocketMessageInput
+) -> WebSocketMessageRead {
+  let frame = websocket_message_frame_parts(decoder)
+  let values = match input {
+    WebSocketMessageChunk(chunk) -> chunk
+    WebSocketMessageEnd(chunk) -> chunk
+  }
+  let terminal = match input {
+    WebSocketMessageChunk(chunk) -> false
+    WebSocketMessageEnd(chunk) -> true
+  }
+  let count = bytes_len(values)
+  if terminal and count != frame.remaining {
+    websocket_message_failure(count, frame.remaining)
+  } else { if not terminal and (count <= 0 or count >= frame.remaining) {
+      websocket_message_failure(count, frame.remaining)
+    } else {
+      let mut needed = frame.utf8_needed
+      let mut bounds = frame.utf8_bounds
+      let mut position = frame.text_position
+      if (frame.flags band 1) != 0 {
+        for index in 0..count {
+          let byte = websocket_byte(values, index)
+          if needed == 0 {
+            if byte <= 127 { 0 }
+            else { if byte >= 194 and byte <= 223 {
+                needed = 1
+                bounds = websocket_utf8_bounds(128, 191, 1)
+              } else { if byte == 224 {
+                  needed = 2
+                  bounds = websocket_utf8_bounds(160, 191, 2)
+                } else { if (byte >= 225 and byte <= 236) or (byte >= 238 and byte <= 239) {
+                    needed = 2
+                    bounds = websocket_utf8_bounds(128, 191, 2)
+                  } else { if byte == 237 {
+                      needed = 2
+                      bounds = websocket_utf8_bounds(128, 159, 2)
+                    } else { if byte == 240 {
+                        needed = 3
+                        bounds = websocket_utf8_bounds(144, 191, 3)
+                      } else { if byte >= 241 and byte <= 243 {
+                          needed = 3
+                          bounds = websocket_utf8_bounds(128, 191, 3)
+                        } else { if byte == 244 {
+                            needed = 3
+                            bounds = websocket_utf8_bounds(128, 143, 3)
+                          } else {
+                            return WebSocketMessageFailed(WebSocketInvalidText(position))
+                          } } } } } } } }
+          } else {
+            if byte < websocket_utf8_lower(bounds) or byte > websocket_utf8_upper(bounds) {
+              return WebSocketMessageFailed(WebSocketInvalidText(position))
+            }
+            needed = needed - 1
+            if needed == 0 { bounds = 0 }
+            else {
+              bounds = websocket_utf8_bounds(128, 191, websocket_utf8_initial(bounds))
+            }
+          }
+          position = position + 1
+        }
+      }
+      if terminal {
+        if (frame.flags band 1) != 0 and (frame.flags band 2) != 0 and needed != 0 {
+          let start = position - 1 - websocket_utf8_initial(bounds) + needed
+          WebSocketMessageFailed(WebSocketInvalidText(start))
+        } else {
+          let idle = frame.mode == 0
+          WebSocketMessageDone(WebSocketMessageState(WebSocketMessageStateParts {
+            mode: frame.mode,
+              message_bytes: frame.message_bytes,
+              utf8_needed: if idle { 0 } else { needed },
+              utf8_bounds: if idle { 0 } else { bounds },
+              text_position: if idle { 0 } else { position }
+          }))
+        }
+      } else {
+        WebSocketMessageMore(WebSocketMessageFrame(WebSocketMessageFrameParts {
+          mode: frame.mode,
+            message_bytes: frame.message_bytes,
+            remaining: frame.remaining - count,
+            flags: frame.flags,
+            utf8_needed: needed,
+            utf8_bounds: bounds,
+            text_position: position
+        }))
+      }
+    } }
+}
+
+fn websocket_close_code_valid(code: i64) -> bool {
+  (code >= 1000 and code <= 1014 and code != 1004 and code != 1005 and code != 1006) or
+    (code >= 3000 and code <= 4999)
+}
+
+--- Decode one complete control payload after frame-level validation.
+pub fn websocket_decode_control(
+  opcode: WebSocketOpcode,
+  payload: Bytes
+) -> Result<WebSocketControl, WebSocketError> {
+  if bytes_len(payload) > 125 {
+    result_err<WebSocketControl, WebSocketError>(WebSocketControlTooLarge(bytes_len(payload)))
+  } else { match opcode {
+      WebSocketPing -> result_ok<WebSocketControl, WebSocketError>(WebSocketControlPing(payload))
+      WebSocketPong -> result_ok<WebSocketControl, WebSocketError>(WebSocketControlPong(payload))
+      WebSocketClose -> if bytes_len(payload) == 0 {
+        result_ok<WebSocketControl, WebSocketError>(WebSocketControlClose(WebSocketCloseWithoutStatus))
+      } else { if bytes_len(payload) == 1 {
+          result_err<WebSocketControl, WebSocketError>(WebSocketInvalidClosePayload)
+        } else {
+          let code = websocket_length16(payload, 0)
+          if not websocket_close_code_valid(code) {
+            result_err<WebSocketControl, WebSocketError>(WebSocketInvalidCloseCode(code))
+          } else {
+            let reason_bytes = bytes_copy_range(payload, 2, bytes_len(payload))
+            match bytes_to_utf8(reason_bytes) {
+              Err(error) -> result_err<WebSocketControl, WebSocketError>(
+                WebSocketInvalidCloseReason(2 + utf8_error_offset_or(error, 0))
+              )
+              Ok(reason) -> result_ok<WebSocketControl, WebSocketError>(
+                WebSocketControlClose(WebSocketCloseWithStatus(code, reason))
+              )
+            }
+          }
+        } }
+      _ -> result_err<WebSocketControl, WebSocketError>(WebSocketExpectedControl)
+    } }
+}
+
+--- Construct a sendable close value with a registered/application status.
+pub fn websocket_close(code: i64, reason: str) -> Result<WebSocketCloseValue, WebSocketError> {
+  if not websocket_close_code_valid(code) {
+    result_err<WebSocketCloseValue, WebSocketError>(WebSocketInvalidCloseCode(code))
+  } else { if str_is_utf8(reason) == 0 {
+      result_err<WebSocketCloseValue, WebSocketError>(WebSocketInvalidCloseReason(0))
+    } else { if str_len(reason) > 123 {
+        result_err<WebSocketCloseValue, WebSocketError>(WebSocketCloseReasonTooLong(str_len(reason)))
+      } else {
+        result_ok<WebSocketCloseValue, WebSocketError>(WebSocketCloseWithStatus(code, reason))
+      } } }
+}
+
+--- Construct an open close-handshake state.
+pub fn websocket_close_handshake() -> WebSocketCloseHandshake {
+  WebSocketCloseHandshake(0)
+}
+
+--- Record a locally sent close and derive whether to await or finish.
+pub fn websocket_close_on_send(state: WebSocketCloseHandshake) -> WebSocketCloseTransition {
+  match state {
+    WebSocketCloseHandshake(flags) -> if (flags band 1) != 0 {
+      WebSocketCloseDuplicate(state)
+    } else {
+      let next = WebSocketCloseHandshake(flags bor 1)
+      if (flags band 2) != 0 { WebSocketCloseComplete(next) }
+      else { WebSocketCloseAwaitPeer(next) }
+    }
+  }
+}
+
+--- Record a peer close, requiring an exact echo only when not already sent.
+pub fn websocket_close_on_receive(
+  state: WebSocketCloseHandshake,
+  close: WebSocketCloseValue
+) -> WebSocketCloseTransition {
+  match state {
+    WebSocketCloseHandshake(flags) -> if (flags band 2) != 0 {
+      WebSocketCloseDuplicate(state)
+    } else {
+      let next = WebSocketCloseHandshake(flags bor 2)
+      if (flags band 1) != 0 { WebSocketCloseComplete(next) }
+      else { WebSocketCloseEcho(next, close) }
+    }
+  }
+}
+
+--- Return whether a local close has been sent.
+pub fn websocket_close_was_sent(state: WebSocketCloseHandshake) -> bool {
+  match state { WebSocketCloseHandshake(flags) -> (flags band 1) != 0 }
+}
+
+--- Return whether a peer close has been received.
+pub fn websocket_close_was_received(state: WebSocketCloseHandshake) -> bool {
+  match state { WebSocketCloseHandshake(flags) -> (flags band 2) != 0 }
+}
+
+--- Return whether both close directions are complete.
+pub fn websocket_close_is_complete(state: WebSocketCloseHandshake) -> bool {
+  match state { WebSocketCloseHandshake(flags) -> (flags band 3) == 3 }
+}
+
+fn websocket_close_payload(close: WebSocketCloseValue) -> Bytes {
+  match close {
+    WebSocketCloseWithoutStatus -> bytes_empty()
+    WebSocketCloseWithStatus(code, reason) -> {
+      let mut out = bytes_empty()
+      out = bytes_push(out, websocket_i64_to_u8((code bshr 8) band 255))
+      out = bytes_push(out, websocket_i64_to_u8(code band 255))
+      bytes_concat(out, bytes_from_str(reason))
+    }
+  }
+}
+
+fn websocket_append_length(out: Bytes, payload_bytes: i64, masked: bool) -> Bytes {
+  let mask_bit = if masked { 128 } else { 0 }
+  let mut result = out
+  if payload_bytes <= 125 {
+    result = bytes_push(result, websocket_i64_to_u8(mask_bit + payload_bytes))
+  } else { if payload_bytes <= 65535 {
+      result = bytes_push(result, websocket_i64_to_u8(mask_bit + 126))
+      result = bytes_push(result, websocket_i64_to_u8((payload_bytes bshr 8) band 255))
+      result = bytes_push(result, websocket_i64_to_u8(payload_bytes band 255))
+    } else {
+      result = bytes_push(result, websocket_i64_to_u8(mask_bit + 127))
+      for shift in [56, 48, 40, 32, 24, 16, 8, 0] {
+        result = bytes_push(result, websocket_i64_to_u8((payload_bytes bshr shift) band 255))
+      }
+    } }
+  result
+}
+
+fn websocket_encode(
+  final: bool,
+  opcode: WebSocketOpcode,
+  payload: Bytes,
+  masking: WebSocketMasking,
+  limits: WebSocketLimits
+) -> Result<Bytes, WebSocketError> {
+  match websocket_validate_frame(final, opcode, bytes_len(payload), limits) {
+    Err(error) -> result_err<Bytes, WebSocketError>(error)
+    Ok(done) -> {
+      match opcode {
+        WebSocketClose -> match websocket_decode_control(opcode, payload) {
+          Err(error) -> return result_err<Bytes, WebSocketError>(error)
+          Ok(control) -> nil
+        }
+        _ -> nil
+      }
+      let masked = match masking { WebSocketUnmasked -> false WebSocketMasked(mask) -> true }
+      let mut out = bytes_empty()
+      out = bytes_push(out, websocket_i64_to_u8(
+        (if final { 128 } else { 0 }) + websocket_opcode_value(opcode)
+      ))
+      out = websocket_append_length(out, bytes_len(payload), masked)
+      match masking {
+        WebSocketUnmasked -> result_ok<Bytes, WebSocketError>(bytes_concat(out, payload))
+        WebSocketMasked(mask) -> {
+          let key = websocket_mask_bytes(mask)
+          out = bytes_concat(out, key)
+          result_ok<Bytes, WebSocketError>(bytes_concat(
+            out,
+            websocket_unmask(WebSocketMasked(mask), 0, payload)
+          ))
+        }
+      }
+    }
+  }
+}
+
+--- Encode one unmasked server frame after all per-frame validations.
+pub fn websocket_encode_server_frame(
+  final: bool,
+  opcode: WebSocketOpcode,
+  payload: Bytes,
+  limits: WebSocketLimits
+) -> Result<Bytes, WebSocketError> {
+  websocket_encode(final, opcode, payload, WebSocketUnmasked, limits)
+}
+
+--- Encode one client frame with a fresh unpredictable four-byte mask.
+pub fn websocket_encode_client_frame(
+  final: bool,
+  opcode: WebSocketOpcode,
+  payload: Bytes,
+  limits: WebSocketLimits
+) -[SecureRandom]> Result<Bytes, WebSocketError> {
+  match secure_random_bytes(websocket_i64_to_usize(4)) {
+    Err(error) -> result_err<Bytes, WebSocketError>(WebSocketRandom(error))
+    Ok(mask) -> websocket_encode(
+      final,
+      opcode,
+      payload,
+      WebSocketMasked(WebSocketMask(mask)),
+      limits
+    )
+  }
+}
+
+--- Encode a validated close value for an unmasked server endpoint.
+pub fn websocket_encode_server_close(
+  close: WebSocketCloseValue,
+  limits: WebSocketLimits
+) -> Result<Bytes, WebSocketError> {
+  websocket_encode_server_frame(true, WebSocketClose, websocket_close_payload(close), limits)
+}
+
+--- Encode a validated close value with a fresh client mask.
+pub fn websocket_encode_client_close(
+  close: WebSocketCloseValue,
+  limits: WebSocketLimits
+) -[SecureRandom]> Result<Bytes, WebSocketError> {
+  websocket_encode_client_frame(true, WebSocketClose, websocket_close_payload(close), limits)
+}

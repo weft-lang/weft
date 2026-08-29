@@ -118,6 +118,7 @@ check_rejects "idna_domain_projection_private" "test/negative/idna_domain_projec
 check_rejects "url_constructor_private" "test/negative/url_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "http_target_constructor_private" "test/negative/http_target_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "sse_decoder_constructor_private" "test/negative/sse_decoder_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "websocket_message_state_constructor_private" "test/negative/websocket_message_state_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "dns_resolve_requires_effect" "test/negative/dns_resolve_requires_effect.weft" 'error[E2001]: effect `DnsResolve` is not available in this context'
 check_rejects "dns_policy_requires_authority" "test/negative/dns_policy_requires_authority.weft" 'error[E2001]: effect `DnsResolve` is not available in this context'
 check_rejects "dns_raw_backend_private" "test/negative/dns_raw_backend_private.weft" "module member 'runtime_dns_getaddrinfo' is not visible in this import" 1

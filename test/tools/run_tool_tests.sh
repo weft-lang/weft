@@ -496,7 +496,7 @@ stdlib_doc_modules=(
   stdlib/secure_random.weft stdlib/net_address.weft stdlib/idna.weft
   stdlib/dns.weft stdlib/tcp.weft stdlib/url.weft stdlib/tls.weft
   stdlib/http.weft stdlib/http_stream.weft stdlib/http_endpoint.weft
-  stdlib/http_client.weft stdlib/sse.weft
+  stdlib/http_client.weft stdlib/sse.weft stdlib/websocket.weft
   stdlib/state.weft stdlib/diagnostic_type.weft stdlib/diagnostic.weft
   stdlib/diagnostic_registry.weft stdlib/map.weft stdlib/set.weft
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector_type.weft
@@ -584,6 +584,15 @@ assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public AP
     assert_contains "doc_stdlib_sse_pins_public_surface" "$(<"$tmp_out")" "Public API items: 37. Documented: 37."
     assert_contains "doc_stdlib_sse_pins_bounded_decoder" "$(<"$tmp_out")" "pub type SseDecoder = opaque"
     assert_contains "doc_stdlib_sse_pins_incremental_transition" "$(<"$tmp_out")" "pub fn sse_decode(decoder: SseDecoder, input: SseInput) -> SseDecode"
+  elif [ "$stdlib_doc_name" = "websocket" ]; then
+    assert_contains "doc_stdlib_websocket_pins_public_surface" "$(<"$tmp_out")" "Public API items: 121. Documented: 121."
+    assert_contains "doc_stdlib_websocket_pins_typed_handshake" "$(<"$tmp_out")" "pub fn websocket_server_upgrade(request: HttpRequestHead) -> Result<HttpHeaders, WebSocketHandshakeError>"
+    assert_contains "doc_stdlib_websocket_pins_bounded_payload" "$(<"$tmp_out")" "pub type WebSocketPayloadDecoder = opaque"
+    assert_contains "doc_stdlib_websocket_pins_typed_opcode" "$(<"$tmp_out")" "pub fn websocket_frame_opcode(header: WebSocketFrameHeader) -> WebSocketOpcode"
+    assert_contains "doc_stdlib_websocket_pins_close_aware_message_begin" "$(<"$tmp_out")" "pub fn websocket_message_begin(state: WebSocketMessageState, handshake: WebSocketCloseHandshake, flow: WebSocketMessageFlow, header: WebSocketFrameHeader, limits: WebSocketLimits) -> Result<WebSocketMessageFrame, WebSocketError>"
+    assert_contains "doc_stdlib_websocket_pins_message_transition" "$(<"$tmp_out")" "pub fn websocket_message_read(decoder: WebSocketMessageFrame, input: WebSocketMessageInput) -> WebSocketMessageRead"
+    assert_contains "doc_stdlib_websocket_pins_random_mask" "$(<"$tmp_out")" "pub fn websocket_encode_client_frame(final: bool, opcode: WebSocketOpcode, payload: Bytes, limits: WebSocketLimits) -[SecureRandom]> Result<Bytes, WebSocketError>"
+    assert_contains "doc_stdlib_websocket_pins_close_race" "$(<"$tmp_out")" "pub fn websocket_close_on_receive(state: WebSocketCloseHandshake, close: WebSocketCloseValue) -> WebSocketCloseTransition"
   elif [ "$stdlib_doc_name" = "channel" ]; then
     assert_contains "doc_stdlib_channel_pins_public_surface" "$(<"$tmp_out")" "Public API items: 21. Documented: 21."
     assert_contains "doc_stdlib_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"
