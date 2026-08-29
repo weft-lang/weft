@@ -1,0 +1,530 @@
+-- stdlib/sse.weft — bounded incremental Server-Sent Events semantics
+--
+-- The decoder is a pure state machine over immutable byte fragments. It
+-- retains only one bounded unfinished line and one bounded unfinished event;
+-- callers retain transport, scheduling, cancellation, and backpressure
+-- policy. Each transition consumes an exact input prefix and emits at most one
+-- semantic event, so a slow consumer never causes hidden queue growth.
+
+use stdlib/bytes.{Bytes, bytes_concat, bytes_copy_range, bytes_empty, bytes_from_str, bytes_get, bytes_is_empty, bytes_len, bytes_push, bytes_to_utf8, utf8_error_offset_or}
+use stdlib/num.{num_i64_to_u8_checked, num_int_cast_value_or, num_u64_to_i64_checked}
+use stdlib/option.{None, Option, Some, option_none, option_some}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/string.{int_to_str, str_byte_at, str_concat, str_is_utf8, str_len, str_slice_bytes}
+
+--- Bounded storage limits for one unfinished SSE line and event payload.
+pub type SseLimits = opaque SseLimitsParts
+
+--- A precise SSE configuration, decoding, or encoding failure.
+pub type SseError {
+  --- A line limit was not positive.
+  SseInvalidLineLimit(i64),
+    --- An event-data limit was not positive.
+    SseInvalidEventLimit(i64),
+    --- An unfinished line exceeded its configured byte limit.
+    SseLineTooLong(i64),
+    --- One logical event exceeded its configured data-byte limit.
+    SseEventTooLarge(i64),
+    --- Strict stream decoding found invalid UTF-8 at this absolute byte offset.
+    SseInvalidUtf8(i64),
+    --- An outbound event type contained CR, LF, or invalid UTF-8.
+    SseInvalidEventType,
+    --- An outbound event ID contained NUL, CR, LF, or invalid UTF-8.
+    SseInvalidEventId,
+    --- Outbound event data contained CR or invalid UTF-8.
+    SseInvalidEventData,
+    --- An outbound comment contained CR, LF, or invalid UTF-8.
+    SseInvalidComment,
+    --- A reconnect delay was negative.
+    SseInvalidRetry(i64)
+}
+
+--- One semantic event after field folding and multiline-data joining.
+pub type SseEvent = opaque SseEventParts
+
+--- Reconnection metadata accumulated independently of event delivery.
+pub type SseReconnect = opaque SseReconnectParts
+
+--- An open incremental decoder with bounded persistent state.
+pub type SseDecoder = opaque SseDecoderParts
+
+--- The next input boundary presented to the pure decoder.
+pub type SseInput {
+  --- One arbitrary, possibly empty and fragmented byte sequence.
+  SseInputBytes(Bytes),
+    --- The transport ended; an event lacking its final blank line is discarded.
+    SseInputEnd
+}
+
+--- One incremental SSE transition.
+pub type SseDecode {
+  --- One event and successor decoder, with the exact consumed input prefix.
+  SseEventReady(SseDecoder, SseEvent, usize),
+    --- No event is ready; all reported input was consumed into bounded state.
+    SseNeedInput(SseDecoder, usize),
+    --- The stream ended cleanly with its final reconnection metadata.
+    SseEnd(SseReconnect),
+    --- The stream cannot be decoded under the configured strict limits.
+    SseDecodeFailed(SseError, usize)
+}
+
+type SseLimitsParts {
+  line_bytes: i64,
+    event_bytes: i64
+}
+
+type SseEventParts {
+  event_type: str,
+    data: str,
+    last_event_id: str
+}
+
+type SseReconnectParts {
+  last_event_id: str,
+    retry_millis: Option<i64>
+}
+
+type SseSemanticState {
+  data: Bytes,
+    event_type: Bytes,
+    last_event_id: Bytes,
+    retry_millis: Option<i64>,
+    first_line: bool
+}
+
+type SseDecoderParts {
+  limits: SseLimits,
+    semantic: SseSemanticState,
+    line: Bytes,
+    skip_lf: bool,
+    offset: i64
+}
+
+type SseLineTransition {
+  SseLineContinue(SseSemanticState),
+    SseLineEmit(SseSemanticState, SseEvent),
+    SseLineFailed(SseError)
+}
+
+fn sse_u8_to_i64(value: u8) -> i64 {
+  num_int_cast_value_or<i64>(num_u64_to_i64_checked(__u8_to_u64(value)), 0)
+}
+
+fn sse_i64_to_u8(value: i64) -> u8 {
+  num_int_cast_value_or<u8>(num_i64_to_u8_checked(value), 0)
+}
+
+fn sse_i64_to_usize(value: i64) -> usize {
+  __i64_to_usize(if value < 0 { 0 } else { value })
+}
+
+fn sse_byte(values: Bytes, index: i64) -> i64 {
+  match bytes_get(values, index) {
+    Some(value) -> sse_u8_to_i64(value)
+    None -> 0
+  }
+}
+
+fn sse_limits_parts(limits: SseLimits) -> SseLimitsParts {
+  match limits { SseLimits(parts) -> parts }
+}
+
+fn sse_event_parts(event: SseEvent) -> SseEventParts {
+  match event { SseEvent(parts) -> parts }
+}
+
+fn sse_reconnect_parts(reconnect: SseReconnect) -> SseReconnectParts {
+  match reconnect { SseReconnect(parts) -> parts }
+}
+
+fn sse_decoder_parts(decoder: SseDecoder) -> SseDecoderParts {
+  match decoder { SseDecoder(parts) -> parts }
+}
+
+fn sse_semantic_empty() -> SseSemanticState {
+  SseSemanticState {
+    data: bytes_empty(),
+    event_type: bytes_empty(),
+    last_event_id: bytes_empty(),
+    retry_millis: option_none<i64>(),
+    first_line: true
+  }
+}
+
+fn sse_reconnect_from_semantic(semantic: SseSemanticState) -> SseReconnect {
+  SseReconnect(SseReconnectParts {
+    last_event_id: sse_bytes_text(semantic.last_event_id),
+    retry_millis: semantic.retry_millis
+  })
+}
+
+fn sse_decoder_from_parts(parts: SseDecoderParts) -> SseDecoder {
+  SseDecoder(parts)
+}
+
+fn sse_bytes_text(values: Bytes) -> str {
+  match bytes_to_utf8(values) {
+    Ok(text) -> text
+    Err(error) -> ""
+  }
+}
+
+fn sse_bytes_ascii_eq(values: Bytes, start: i64, end: i64, expected: str) -> bool {
+  if end - start != str_len(expected) { false }
+  else {
+    let mut index = 0
+    let mut equal = true
+    while equal and start + index < end {
+      if sse_byte(values, start + index) != str_byte_at(expected, index) {
+        equal = false
+      } else { index = index + 1 }
+    }
+    equal
+  }
+}
+
+fn sse_bytes_contains(values: Bytes, start: i64, end: i64, needle: i64) -> bool {
+  let mut found = false
+  let mut index = start
+  while not found and index < end {
+    if sse_byte(values, index) == needle { found = true }
+    else { index = index + 1 }
+  }
+  found
+}
+
+fn sse_retry_value(values: Bytes, start: i64, end: i64) -> Option<i64> {
+  if start >= end { option_none<i64>() }
+  else {
+    let mut value = 0
+    let mut index = start
+    let mut valid = true
+    while valid and index < end {
+      let byte = sse_byte(values, index)
+      if byte < 48 or byte > 57 or value > (9223372036854775807 - (byte - 48)) / 10 {
+        valid = false
+      } else {
+        value = value * 10 + (byte - 48)
+        index = index + 1
+      }
+    }
+    if valid { option_some<i64>(value) } else { option_none<i64>() }
+  }
+}
+
+fn sse_first_line_prefix(line: Bytes, first: bool) -> i64 {
+  if first and bytes_len(line) >= 3 and
+    sse_byte(line, 0) == 239 and sse_byte(line, 1) == 187 and sse_byte(line, 2) == 191 {
+    3
+  } else { 0 }
+}
+
+fn sse_first_line(line: Bytes, prefix: i64) -> Bytes {
+  if prefix == 0 { line }
+  else { bytes_copy_range(line, prefix, bytes_len(line)) }
+}
+
+fn sse_event_from_semantic(semantic: SseSemanticState) -> SseEvent {
+  let data_len = bytes_len(semantic.data)
+  SseEvent(SseEventParts {
+    event_type: if bytes_is_empty(semantic.event_type) { "message" } else { sse_bytes_text(semantic.event_type) },
+    data: sse_bytes_text(bytes_copy_range(semantic.data, 0, data_len - 1)),
+    last_event_id: sse_bytes_text(semantic.last_event_id)
+  })
+}
+
+fn sse_process_line(
+  semantic: SseSemanticState,
+  raw_line: Bytes,
+  limits: SseLimits,
+  line_offset: i64
+) -> SseLineTransition {
+  let wire_prefix = sse_first_line_prefix(raw_line, semantic.first_line)
+  let line = sse_first_line(raw_line, wire_prefix)
+  let line_len = bytes_len(line)
+  match bytes_to_utf8(line) {
+    Err(error) -> SseLineFailed(SseInvalidUtf8(
+      line_offset + wire_prefix + utf8_error_offset_or(error, 0)
+    ))
+    Ok(text) -> {
+      let base = SseSemanticState {
+        data: semantic.data,
+        event_type: semantic.event_type,
+        last_event_id: semantic.last_event_id,
+        retry_millis: semantic.retry_millis,
+        first_line: false
+      }
+      if line_len == 0 {
+        if bytes_is_empty(base.data) {
+          SseLineContinue(SseSemanticState {
+            data: bytes_empty(),
+            event_type: bytes_empty(),
+            last_event_id: base.last_event_id,
+            retry_millis: base.retry_millis,
+            first_line: false
+          })
+        } else {
+          let event = sse_event_from_semantic(base)
+          SseLineEmit(SseSemanticState {
+            data: bytes_empty(),
+            event_type: bytes_empty(),
+            last_event_id: base.last_event_id,
+            retry_millis: base.retry_millis,
+            first_line: false
+          }, event)
+        }
+      } else { if sse_byte(line, 0) == 58 {
+        SseLineContinue(base)
+      } else {
+        let mut colon = 0 - 1
+        let mut index = 0
+        while colon < 0 and index < line_len {
+          if sse_byte(line, index) == 58 { colon = index }
+          else { index = index + 1 }
+        }
+        let field_end = if colon < 0 { line_len } else { colon }
+        let value_start = if colon < 0 { line_len }
+          else { if colon + 1 < line_len and sse_byte(line, colon + 1) == 32 { colon + 2 } else { colon + 1 } }
+        if sse_bytes_ascii_eq(line, 0, field_end, "data") {
+          let value_len = line_len - value_start
+          let max_event = sse_limits_parts(limits).event_bytes
+          -- `base.data` already contains the separator after every prior data
+          -- field. The final separator appended below is removed at dispatch,
+          -- so it is bounded storage but not part of the semantic data limit.
+          if bytes_len(base.data) + value_len > max_event {
+            SseLineFailed(SseEventTooLarge(line_offset + wire_prefix + value_start))
+          } else {
+            let with_value = bytes_concat(base.data, bytes_copy_range(line, value_start, line_len))
+            SseLineContinue(SseSemanticState {
+              data: bytes_push(with_value, sse_i64_to_u8(10)),
+              event_type: base.event_type,
+              last_event_id: base.last_event_id,
+              retry_millis: base.retry_millis,
+              first_line: false
+            })
+          }
+        } else { if sse_bytes_ascii_eq(line, 0, field_end, "event") {
+          SseLineContinue(SseSemanticState {
+            data: base.data,
+            event_type: bytes_copy_range(line, value_start, line_len),
+            last_event_id: base.last_event_id,
+            retry_millis: base.retry_millis,
+            first_line: false
+          })
+        } else { if sse_bytes_ascii_eq(line, 0, field_end, "id") {
+          if sse_bytes_contains(line, value_start, line_len, 0) { SseLineContinue(base) }
+          else { SseLineContinue(SseSemanticState {
+            data: base.data,
+            event_type: base.event_type,
+            last_event_id: bytes_copy_range(line, value_start, line_len),
+            retry_millis: base.retry_millis,
+            first_line: false
+          }) }
+        } else { if sse_bytes_ascii_eq(line, 0, field_end, "retry") {
+          match sse_retry_value(line, value_start, line_len) {
+            None -> SseLineContinue(base)
+            Some(delay) -> SseLineContinue(SseSemanticState {
+              data: base.data,
+              event_type: base.event_type,
+              last_event_id: base.last_event_id,
+              retry_millis: option_some<i64>(delay),
+              first_line: false
+            })
+          }
+        } else { SseLineContinue(base) } } } }
+      } }
+    }
+  }
+}
+
+fn sse_decoder_result(
+  limits: SseLimits,
+  semantic: SseSemanticState,
+  line: Bytes,
+  skip_lf: bool,
+  offset: i64
+) -> SseDecoder {
+  sse_decoder_from_parts(SseDecoderParts {
+    limits: limits,
+    semantic: semantic,
+    line: line,
+    skip_lf: skip_lf,
+    offset: offset
+  })
+}
+
+--- Construct limits, rejecting non-positive byte bounds.
+pub fn sse_limits(line_bytes: i64, event_bytes: i64) -> Result<SseLimits, SseError> {
+  if line_bytes <= 0 { result_err<SseLimits, SseError>(SseInvalidLineLimit(line_bytes)) }
+  else { if event_bytes <= 0 { result_err<SseLimits, SseError>(SseInvalidEventLimit(event_bytes)) }
+    else { result_ok<SseLimits, SseError>(SseLimits(SseLimitsParts {
+      line_bytes: line_bytes,
+      event_bytes: event_bytes
+    })) } }
+}
+
+--- Return conservative defaults: 16 KiB per line and 1 MiB per event.
+pub fn sse_default_limits() -> SseLimits {
+  match sse_limits(16384, 1048576) {
+    Ok(limits) -> limits
+    Err(error) -> SseLimits(SseLimitsParts { line_bytes: 16384, event_bytes: 1048576 })
+  }
+}
+
+--- Start a decoder with empty event and reconnection state.
+pub fn sse_decoder(limits: SseLimits) -> SseDecoder {
+  sse_decoder_result(limits, sse_semantic_empty(), bytes_empty(), false, 0)
+}
+
+--- Return the decoder's current reconnection metadata.
+pub fn sse_decoder_reconnect(decoder: SseDecoder) -> SseReconnect {
+  sse_reconnect_from_semantic(sse_decoder_parts(decoder).semantic)
+}
+
+--- Decode one event, input exhaustion, clean end, or precise failure.
+---
+--- Byte input emits at most one event and reports the exact consumed prefix.
+--- Feed any unconsumed suffix into the returned decoder. `SseInputEnd`
+--- discards an event that lacks its required final blank line.
+pub fn sse_decode(decoder: SseDecoder, input: SseInput) -> SseDecode {
+  let initial = sse_decoder_parts(decoder)
+  match input {
+    SseInputEnd -> SseEnd(sse_reconnect_from_semantic(initial.semantic))
+    SseInputBytes(bytes) -> {
+      let mut semantic = initial.semantic
+      let mut line = initial.line
+      let mut skip_lf = initial.skip_lf
+      let mut offset = initial.offset
+      let mut consumed = 0
+      let total = bytes_len(bytes)
+      while consumed < total {
+        let byte = sse_byte(bytes, consumed)
+        if skip_lf {
+          skip_lf = false
+          if byte == 10 {
+            consumed = consumed + 1
+            offset = offset + 1
+          }
+        } else { if byte == 10 or byte == 13 {
+          let boundary_offset = offset - bytes_len(line)
+          consumed = consumed + 1
+          offset = offset + 1
+          skip_lf = byte == 13
+          match sse_process_line(semantic, line, initial.limits, boundary_offset) {
+            SseLineFailed(error) -> return SseDecodeFailed(error, sse_i64_to_usize(consumed))
+            SseLineContinue(next) -> {
+              semantic = next
+              line = bytes_empty()
+            }
+            SseLineEmit(next, event) -> return SseEventReady(
+              sse_decoder_result(initial.limits, next, bytes_empty(), skip_lf, offset),
+              event,
+              sse_i64_to_usize(consumed)
+            )
+          }
+        } else {
+          if bytes_len(line) >= sse_limits_parts(initial.limits).line_bytes {
+            return SseDecodeFailed(SseLineTooLong(offset), sse_i64_to_usize(consumed))
+          }
+          line = bytes_push(line, sse_i64_to_u8(byte))
+          consumed = consumed + 1
+          offset = offset + 1
+        } }
+      }
+      SseNeedInput(
+        sse_decoder_result(initial.limits, semantic, line, skip_lf, offset),
+        sse_i64_to_usize(consumed)
+      )
+    }
+  }
+}
+
+--- Construct one outbound semantic event after validating line invariants.
+pub fn sse_event(event_type: str, data: str, last_event_id: str) -> Result<SseEvent, SseError> {
+  if str_is_utf8(event_type) == 0 or sse_str_contains_line_break(event_type) {
+    result_err<SseEvent, SseError>(SseInvalidEventType)
+  } else { if str_is_utf8(last_event_id) == 0 or sse_str_contains_line_break(last_event_id) or
+    sse_str_contains_byte(last_event_id, 0) {
+    result_err<SseEvent, SseError>(SseInvalidEventId)
+  } else { if str_is_utf8(data) == 0 or sse_str_contains_byte(data, 13) {
+    result_err<SseEvent, SseError>(SseInvalidEventData)
+  } else {
+    result_ok<SseEvent, SseError>(SseEvent(SseEventParts {
+      event_type: if str_len(event_type) == 0 { "message" } else { event_type },
+      data: data,
+      last_event_id: last_event_id
+    }))
+  } } }
+}
+
+fn sse_str_contains_byte(text: str, wanted: i64) -> bool {
+  let mut found = false
+  let mut index = 0
+  while not found and index < str_len(text) {
+    if str_byte_at(text, index) == wanted { found = true }
+    else { index = index + 1 }
+  }
+  found
+}
+
+fn sse_str_contains_line_break(text: str) -> bool {
+  sse_str_contains_byte(text, 10) or sse_str_contains_byte(text, 13)
+}
+
+fn sse_encode_field(name: str, value: str) -> Bytes {
+  bytes_from_str(str_concat(name, str_concat(":", str_concat(value, "\n"))))
+}
+
+--- Encode one event using canonical LF field lines and a final blank line.
+pub fn sse_encode_event(event: SseEvent) -> Bytes {
+  let parts = sse_event_parts(event)
+  let mut out = bytes_empty()
+  if parts.event_type != "message" {
+    out = bytes_concat(out, sse_encode_field("event", parts.event_type))
+  }
+  out = bytes_concat(out, sse_encode_field("id", parts.last_event_id))
+  let mut start = 0
+  let mut index = 0
+  while index <= str_len(parts.data) {
+    if index == str_len(parts.data) or str_byte_at(parts.data, index) == 10 {
+      out = bytes_concat(out, sse_encode_field("data", str_slice_bytes(parts.data, start, index - start)))
+      start = index + 1
+    }
+    index = index + 1
+  }
+  bytes_push(out, sse_i64_to_u8(10))
+}
+
+--- Encode one comment line, rejecting embedded line boundaries.
+pub fn sse_encode_comment(comment: str) -> Result<Bytes, SseError> {
+  if str_is_utf8(comment) == 0 or sse_str_contains_line_break(comment) {
+    result_err<Bytes, SseError>(SseInvalidComment)
+  } else {
+    result_ok<Bytes, SseError>(bytes_from_str(str_concat(":", str_concat(comment, "\n"))))
+  }
+}
+
+--- Encode a non-negative reconnect delay control field.
+pub fn sse_encode_retry(millis: i64) -> Result<Bytes, SseError> {
+  if millis < 0 { result_err<Bytes, SseError>(SseInvalidRetry(millis)) }
+  else { result_ok<Bytes, SseError>(sse_encode_field("retry", int_to_str(millis))) }
+}
+
+--- Return the event type, defaulting to `message` during decoding/construction.
+pub fn sse_event_type(event: SseEvent) -> str { sse_event_parts(event).event_type }
+
+--- Return the event's multiline data joined with LF separators.
+pub fn sse_event_data(event: SseEvent) -> str { sse_event_parts(event).data }
+
+--- Return the effective last-event ID, empty when no reconnect header applies.
+pub fn sse_event_last_event_id(event: SseEvent) -> str { sse_event_parts(event).last_event_id }
+
+--- Return the effective last-event ID, empty when no reconnect header applies.
+pub fn sse_reconnect_last_event_id(reconnect: SseReconnect) -> str {
+  sse_reconnect_parts(reconnect).last_event_id
+}
+
+--- Return the most recent valid reconnect delay, if the stream supplied one.
+pub fn sse_reconnect_retry_millis(reconnect: SseReconnect) -> Option<i64> {
+  sse_reconnect_parts(reconnect).retry_millis
+}

@@ -496,7 +496,7 @@ stdlib_doc_modules=(
   stdlib/secure_random.weft stdlib/net_address.weft stdlib/idna.weft
   stdlib/dns.weft stdlib/tcp.weft stdlib/url.weft stdlib/tls.weft
   stdlib/http.weft stdlib/http_stream.weft stdlib/http_endpoint.weft
-  stdlib/http_client.weft
+  stdlib/http_client.weft stdlib/sse.weft
   stdlib/state.weft stdlib/diagnostic_type.weft stdlib/diagnostic.weft
   stdlib/diagnostic_registry.weft stdlib/map.weft stdlib/set.weft
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector_type.weft
@@ -565,10 +565,11 @@ assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public AP
     assert_contains "doc_stdlib_http_pins_typed_framing" "$(<"$tmp_out")" "pub type HttpBodyFraming {"
     assert_contains "doc_stdlib_http_pins_prefix_parser" "$(<"$tmp_out")" "pub fn http_parse_request_head(source: [u8], limits: HttpLimits) -> HttpRequestHeadParse"
   elif [ "$stdlib_doc_name" = "http_stream" ]; then
-    assert_contains "doc_stdlib_http_stream_pins_public_surface" "$(<"$tmp_out")" "Public API items: 35. Documented: 35."
+    assert_contains "doc_stdlib_http_stream_pins_public_surface" "$(<"$tmp_out")" "Public API items: 37. Documented: 37."
     assert_contains "doc_stdlib_http_stream_pins_owned_body" "$(<"$tmp_out")" "pub type HttpBodyStream = opaque"
     assert_contains "doc_stdlib_http_stream_pins_body_authority" "$(<"$tmp_out")" "pub effect HttpBodyIO {"
     assert_contains "doc_stdlib_http_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn http_body_read(stream: owned HttpBodyStream, limit: usize) -[HttpBodyIO, TcpStreamIO]> HttpBodyReadOutcome"
+    assert_contains "doc_stdlib_http_stream_pins_explicit_cancel" "$(<"$tmp_out")" "pub fn http_body_cancel(stream: owned HttpBodyStream) -[HttpBodyIO, TcpStreamIO]> Result<nil, HttpBodyError>"
   elif [ "$stdlib_doc_name" = "http_endpoint" ]; then
     assert_contains "doc_stdlib_http_endpoint_pins_public_surface" "$(<"$tmp_out")" "Public API items: 51. Documented: 51."
     assert_contains "doc_stdlib_http_endpoint_pins_client_authority" "$(<"$tmp_out")" "pub effect HttpClient {"
@@ -579,6 +580,10 @@ assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public AP
     assert_contains "doc_stdlib_http_client_pins_public_surface" "$(<"$tmp_out")" "Public API items: 46. Documented: 46."
     assert_contains "doc_stdlib_http_client_pins_owned_pool" "$(<"$tmp_out")" "pub type HttpConnectionPool = opaque"
     assert_contains "doc_stdlib_http_client_pins_redirect_step" "$(<"$tmp_out")" "pub fn http_redirect_step(history: HttpRedirectHistory, current: Url, request_method: HttpMethod, response: HttpResponseHead, policy: HttpRedirectPolicy) -> HttpRedirectStep"
+  elif [ "$stdlib_doc_name" = "sse" ]; then
+    assert_contains "doc_stdlib_sse_pins_public_surface" "$(<"$tmp_out")" "Public API items: 37. Documented: 37."
+    assert_contains "doc_stdlib_sse_pins_bounded_decoder" "$(<"$tmp_out")" "pub type SseDecoder = opaque"
+    assert_contains "doc_stdlib_sse_pins_incremental_transition" "$(<"$tmp_out")" "pub fn sse_decode(decoder: SseDecoder, input: SseInput) -> SseDecode"
   elif [ "$stdlib_doc_name" = "channel" ]; then
     assert_contains "doc_stdlib_channel_pins_public_surface" "$(<"$tmp_out")" "Public API items: 21. Documented: 21."
     assert_contains "doc_stdlib_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"

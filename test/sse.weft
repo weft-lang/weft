@@ -1,0 +1,312 @@
+use stdlib/bytes.{Bytes, bytes_from_slice, bytes_from_str, bytes_len, bytes_slice, bytes_to_utf8, bytes_to_vector}
+use stdlib/option.{None, Option, Some}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/sse.{*}
+use stdlib/vector.{vector_get_in_bounds, vector_len, vector_push, vector_with_capacity}
+
+fn sse_test_text(bytes: Bytes) -> str {
+  match bytes_to_utf8(bytes) {
+    Ok(text) -> text
+    Err(error) -> "<invalid>"
+  }
+}
+
+fn sse_test_retry_or(reconnect: SseReconnect, default: i64) -> i64 {
+  match sse_reconnect_retry_millis(reconnect) {
+    Some(value) -> value
+    None -> default
+  }
+}
+
+fn sse_test_usize(value: usize) -> i64 {
+  __u64_to_i64(__usize_to_u64(value))
+}
+
+test "SSE limit construction distinguishes invalid bounds" {
+  match sse_limits(0, 8) {
+    Err(SseInvalidLineLimit(value)) -> Test.assert_eq(value, 0)
+    _ -> Test.assert_true(false)
+  }
+  match sse_limits(8, 0) {
+    Err(SseInvalidEventLimit(value)) -> Test.assert_eq(value, 0)
+    _ -> Test.assert_true(false)
+  }
+  match sse_limits(8, 16) {
+    Ok(limits) -> match sse_decode(sse_decoder(limits), SseInputBytes(bytes_from_str(""))) {
+      SseNeedInput(next, consumed) -> Test.assert_eq(sse_test_usize(consumed), 0)
+      _ -> Test.assert_true(false)
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "SSE folds multiline data and preserves typed event metadata" {
+  let decoder = sse_decoder(sse_default_limits())
+  let source = bytes_from_str("event: notice\nid: 42\ndata: first\ndata:second\n\n")
+  match sse_decode(decoder, SseInputBytes(source)) {
+    SseEventReady(next, event, consumed) -> {
+      Test.assert_eq(sse_test_usize(consumed), bytes_len(source))
+      Test.assert_str_eq(sse_event_type(event), "notice")
+      Test.assert_str_eq(sse_event_data(event), "first\nsecond")
+      Test.assert_str_eq(sse_event_last_event_id(event), "42")
+      Test.assert_str_eq(sse_reconnect_last_event_id(sse_decoder_reconnect(next)), "42")
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "SSE accepts LF CRLF and CR across fragment boundaries" {
+  let decoder = sse_decoder(sse_default_limits())
+  let after_data = match sse_decode(decoder, SseInputBytes(bytes_from_str("data:one\r"))) {
+    SseNeedInput(next, consumed) -> {
+      Test.assert_eq(sse_test_usize(consumed), 9)
+      next
+    }
+    _ -> decoder
+  }
+  let after_event = match sse_decode(after_data, SseInputBytes(bytes_from_str("\n\r"))) {
+    SseEventReady(next, event, consumed) -> {
+      Test.assert_eq(sse_test_usize(consumed), 2)
+      Test.assert_str_eq(sse_event_data(event), "one")
+      next
+    }
+    _ -> after_data
+  }
+  match sse_decode(after_event, SseInputBytes(bytes_from_str("\ndata:two\n\n"))) {
+    SseEventReady(next, event, consumed) -> {
+      Test.assert_eq(sse_test_usize(consumed), 11)
+      Test.assert_str_eq(sse_event_data(event), "two")
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "SSE tolerates a fragmented BOM and fragmented Unicode scalars" {
+  let source = bytes_from_str("﻿data: Melbourne λ 🧶\n\n")
+  let mut decoder = sse_decoder(sse_default_limits())
+  let mut observed = ""
+  let mut events = 0
+  let mut index = 0
+  while index < bytes_len(source) {
+    let fragment = bytes_slice(source, __i64_to_usize(index), __i64_to_usize(index + 1)).unwrap()
+    match sse_decode(decoder, SseInputBytes(fragment)) {
+      SseNeedInput(next, consumed) -> {
+        Test.assert_eq(sse_test_usize(consumed), 1)
+        decoder = next
+        0
+      }
+      SseEventReady(next, event, consumed) -> {
+        Test.assert_eq(sse_test_usize(consumed), 1)
+        observed = sse_event_data(event)
+        events = events + 1
+        decoder = next
+        0
+      }
+      _ -> Test.assert_true(false)
+    }
+    index = index + 1
+  }
+  Test.assert_eq(events, 1)
+  Test.assert_str_eq(observed, "Melbourne λ 🧶")
+}
+
+test "SSE comments unknown fields and empty blocks never become events" {
+  let source = bytes_from_str(": keepalive\nunknown:value\nevent:lost\n\n")
+  match sse_decode(sse_decoder(sse_default_limits()), SseInputBytes(source)) {
+    SseNeedInput(next, consumed) -> {
+      Test.assert_eq(sse_test_usize(consumed), bytes_len(source))
+      Test.assert_str_eq(sse_reconnect_last_event_id(sse_decoder_reconnect(next)), "")
+      match sse_decode(next, SseInputBytes(bytes_from_str("data:visible\n\n"))) {
+        SseEventReady(after, event, rest) -> {
+          Test.assert_str_eq(sse_event_type(event), "message")
+          Test.assert_str_eq(sse_event_data(event), "visible")
+        }
+        _ -> Test.assert_true(false)
+      }
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "SSE reconnect controls persist reset and ignore invalid values" {
+  let first = bytes_from_str("retry:1500\nid:alpha\ndata:x\n\n")
+  let decoder = sse_decoder(sse_default_limits())
+  let after_first = match sse_decode(decoder, SseInputBytes(first)) {
+    SseEventReady(next, event, consumed) -> {
+      Test.assert_str_eq(sse_event_last_event_id(event), "alpha")
+      Test.assert_eq(sse_test_retry_or(sse_decoder_reconnect(next), 0 - 1), 1500)
+      next
+    }
+    _ -> decoder
+  }
+  let second = bytes_from_str("retry:12x\nid:\ndata:y\n\n")
+  match sse_decode(after_first, SseInputBytes(second)) {
+    SseEventReady(next, event, consumed) -> {
+      Test.assert_str_eq(sse_event_last_event_id(event), "")
+      let reconnect = sse_decoder_reconnect(next)
+      Test.assert_str_eq(sse_reconnect_last_event_id(reconnect), "")
+      Test.assert_eq(sse_test_retry_or(reconnect, 0 - 1), 1500)
+      let overflow = bytes_from_str("retry:9223372036854775808\n\n")
+      match sse_decode(next, SseInputBytes(overflow)) {
+        SseNeedInput(after, rest) ->
+          Test.assert_eq(sse_test_retry_or(sse_decoder_reconnect(after), 0 - 1), 1500)
+        _ -> Test.assert_true(false)
+      }
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "SSE ignores NUL event IDs without disturbing the prior ID" {
+  let first = bytes_from_str("id:good\ndata:first\n\n")
+  let decoder = sse_decoder(sse_default_limits())
+  let next = match sse_decode(decoder, SseInputBytes(first)) {
+    SseEventReady(after, event, consumed) -> after
+    _ -> decoder
+  }
+  let raw = vector_with_capacity<u8>(22)
+  let prefix = bytes_to_vector(bytes_from_str("id:bad"))
+  for index in 0..vector_len<u8>(prefix) {
+    vector_push<u8>(raw, vector_get_in_bounds<u8>(prefix, index))
+  }
+  vector_push<u8>(raw, __i64_to_u8(0))
+  let suffix = bytes_to_vector(bytes_from_str("id\ndata:second\n\n"))
+  for index in 0..vector_len<u8>(suffix) {
+    vector_push<u8>(raw, vector_get_in_bounds<u8>(suffix, index))
+  }
+  match sse_decode(next, SseInputBytes(bytes_from_slice(raw[..]))) {
+    SseEventReady(after, event, consumed) -> {
+      Test.assert_str_eq(sse_event_last_event_id(event), "good")
+      Test.assert_str_eq(sse_reconnect_last_event_id(sse_decoder_reconnect(after)), "good")
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "SSE emits at most one event and leaves the suffix with the caller" {
+  let source = bytes_from_str("data:one\n\ndata:two\n\n")
+  match sse_decode(sse_decoder(sse_default_limits()), SseInputBytes(source)) {
+    SseEventReady(next, first, consumed) -> {
+      Test.assert_str_eq(sse_event_data(first), "one")
+      Test.assert_true(consumed < __i64_to_usize(bytes_len(source)))
+      let suffix = bytes_slice(source, consumed, __i64_to_usize(bytes_len(source))).unwrap()
+      match sse_decode(next, SseInputBytes(suffix)) {
+        SseEventReady(after, second, rest_consumed) -> {
+          Test.assert_str_eq(sse_event_data(second), "two")
+          Test.assert_eq(sse_test_usize(rest_consumed), bytes_len(suffix))
+        }
+        _ -> Test.assert_true(false)
+      }
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "SSE EOF discards an event without its final blank line" {
+  let decoder = sse_decoder(sse_default_limits())
+  let next = match sse_decode(decoder, SseInputBytes(bytes_from_str("id:7\nretry:25\ndata:lost\n"))) {
+    SseNeedInput(after, consumed) -> after
+    _ -> decoder
+  }
+  match sse_decode(next, SseInputEnd) {
+    SseEnd(reconnect) -> {
+      Test.assert_str_eq(sse_reconnect_last_event_id(reconnect), "7")
+      Test.assert_eq(sse_test_retry_or(reconnect, 0 - 1), 25)
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "SSE enforces line event and strict UTF8 bounds at exact offsets" {
+  match sse_decode(sse_decoder(sse_limits(3, 20).unwrap()), SseInputBytes(bytes_from_str("abcd"))) {
+    SseDecodeFailed(SseLineTooLong(offset), consumed) -> {
+      Test.assert_eq(offset, 3)
+      Test.assert_eq(sse_test_usize(consumed), 3)
+    }
+    _ -> Test.assert_true(false)
+  }
+  match sse_decode(sse_decoder(sse_limits(20, 3).unwrap()), SseInputBytes(bytes_from_str("data:abcd\n"))) {
+    SseDecodeFailed(SseEventTooLarge(offset), consumed) -> Test.assert_eq(offset, 5)
+    _ -> Test.assert_true(false)
+  }
+  match sse_decode(sse_decoder(sse_limits(20, 3).unwrap()), SseInputBytes(bytes_from_str("data:abc\n\n"))) {
+    SseEventReady(next, event, consumed) -> Test.assert_str_eq(sse_event_data(event), "abc")
+    _ -> Test.assert_true(false)
+  }
+  let invalid: [u8; 8] = [
+    __i64_to_u8(58), __i64_to_u8(32), __i64_to_u8(255), __i64_to_u8(10),
+    __i64_to_u8(100), __i64_to_u8(97), __i64_to_u8(10), __i64_to_u8(10)
+  ]
+  match sse_decode(sse_decoder(sse_default_limits()), SseInputBytes(bytes_from_slice(invalid[..]))) {
+    SseDecodeFailed(SseInvalidUtf8(offset), consumed) -> Test.assert_eq(offset, 2)
+    _ -> Test.assert_true(false)
+  }
+  let invalid_after_bom: [u8; 5] = [
+    __i64_to_u8(239), __i64_to_u8(187), __i64_to_u8(191), __i64_to_u8(255), __i64_to_u8(10)
+  ]
+  match sse_decode(sse_decoder(sse_default_limits()), SseInputBytes(bytes_from_slice(invalid_after_bom[..]))) {
+    SseDecodeFailed(SseInvalidUtf8(offset), consumed) -> Test.assert_eq(offset, 3)
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "SSE canonical encoding roundtrips events comments and retry" {
+  let event = sse_event("notice", "one\ntwo", "42").unwrap()
+  let wire = sse_encode_event(event)
+  Test.assert_str_eq(sse_test_text(wire), "event:notice\nid:42\ndata:one\ndata:two\n\n")
+  match sse_decode(sse_decoder(sse_default_limits()), SseInputBytes(wire)) {
+    SseEventReady(next, decoded, consumed) -> {
+      Test.assert_str_eq(sse_event_type(decoded), "notice")
+      Test.assert_str_eq(sse_event_data(decoded), "one\ntwo")
+      Test.assert_str_eq(sse_event_last_event_id(decoded), "42")
+    }
+    _ -> Test.assert_true(false)
+  }
+  Test.assert_str_eq(sse_test_text(sse_encode_comment("keepalive").unwrap()), ":keepalive\n")
+  Test.assert_str_eq(sse_test_text(sse_encode_retry(250).unwrap()), "retry:250\n")
+  let empty = sse_encode_event(sse_event("", "", "").unwrap())
+  Test.assert_str_eq(sse_test_text(empty), "id:\ndata:\n\n")
+  match sse_decode(sse_decoder(sse_default_limits()), SseInputBytes(empty)) {
+    SseEventReady(next, decoded, consumed) -> {
+      Test.assert_str_eq(sse_event_type(decoded), "message")
+      Test.assert_str_eq(sse_event_data(decoded), "")
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "SSE encoding validates each wire-sensitive value" {
+  match sse_event("bad\nname", "ok", "") {
+    Err(SseInvalidEventType) -> Test.assert_true(true)
+    _ -> Test.assert_true(false)
+  }
+  match sse_event("message", "ok", "bad\nid") {
+    Err(SseInvalidEventId) -> Test.assert_true(true)
+    _ -> Test.assert_true(false)
+  }
+  match sse_event("message", "bad\rdata", "") {
+    Err(SseInvalidEventData) -> Test.assert_true(true)
+    _ -> Test.assert_true(false)
+  }
+  match sse_encode_comment("bad\ncomment") {
+    Err(SseInvalidComment) -> Test.assert_true(true)
+    _ -> Test.assert_true(false)
+  }
+  match sse_encode_retry(0 - 1) {
+    Err(SseInvalidRetry(value)) -> Test.assert_eq(value, 0 - 1)
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "Bytes slicing is exact and rejects every invalid bound shape" {
+  let values = bytes_from_str("abcdef")
+  Test.assert_str_eq(sse_test_text(bytes_slice(values, __i64_to_usize(1), __i64_to_usize(4)).unwrap()), "bcd")
+  match bytes_slice(values, __i64_to_usize(4), __i64_to_usize(3)) {
+    None -> Test.assert_true(true)
+    Some(other) -> Test.assert_true(false)
+  }
+  match bytes_slice(values, __i64_to_usize(0), __i64_to_usize(7)) {
+    None -> Test.assert_true(true)
+    Some(other) -> Test.assert_true(false)
+  }
+}
