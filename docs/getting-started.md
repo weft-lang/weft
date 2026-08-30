@@ -5,6 +5,11 @@ binary is the macOS compiler; it does not download a second compiler or route
 through C/LLVM. It emits Mach-O or ELF directly, and the Linux product and
 compiler are static kernel-ABI executables. x86-64 is post-alpha.
 
+The repository is still pre-alpha. This guide describes implemented and tested
+behavior, not a compatibility or long-term-support promise; the source,
+package, fact-schema, and versioned native-binding contracts may change before
+the public-alpha gate closes.
+
 This guide describes both the repository toolchain and the extracted SDK shape
 as they exist now. `weft build` is the native final-product path, including
 cross-target selection and artifact facts. Installed-SDK discovery,
@@ -378,9 +383,10 @@ documented/public API census; it never reconstructs signatures from text.
 ## Where the alpha deliberately stops
 
 Before the public-alpha cut, the workboard still requires the complete
-target-local Linux release matrix on adequate hardware, platform diagnostics,
-release-key governance, and release hardening. Paid Apple notarization is not
-an alpha gate.
+target-local Linux suite on adequate hardware, release-key/security/support
+governance, hostile-input hardening, and the final two-target outside-user
+exercise. Native-binding platform diagnostics are complete. Paid Apple
+notarization is not an alpha gate.
 x86-64, a hosted package registry,
 HTTP/2+ and a forever-stable native ABI are explicitly later.
 The authoritative live status is the repository README and, for contributors,
