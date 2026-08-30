@@ -21,13 +21,29 @@ void weft_tls_free(void *pointer)
 
 #define WEFT_LINUX_SYS_MUNMAP 215
 #define WEFT_LINUX_SYS_MMAP 222
+#define WEFT_LINUX_SYS_MPROTECT 226
+#define WEFT_LINUX_PROT_NONE 0
 #define WEFT_LINUX_PROT_READ_WRITE 3
 #define WEFT_LINUX_MAP_PRIVATE_ANONYMOUS 0x22
+#define WEFT_LINUX_PAGE_SIZE 4096u
 
+#if defined(WEFT_TLS_PLATFORM_DIAGNOSTICS)
+typedef struct weft_tls_allocation_header {
+    uint64_t magic;
+    uintptr_t mapping_base;
+    size_t mapping_size;
+    size_t requested_size;
+    size_t aligned_size;
+} weft_tls_allocation_header;
+
+#define WEFT_TLS_ALLOCATION_MAGIC UINT64_C(0x57454654544c5344)
+#define WEFT_TLS_REDZONE_BYTE 0xa5u
+#else
 typedef struct weft_tls_allocation_header {
     size_t mapping_size;
     size_t requested_size;
 } weft_tls_allocation_header;
+#endif
 
 static long weft_linux_syscall2(long number, long first, long second)
 {
@@ -37,6 +53,26 @@ static long weft_linux_syscall2(long number, long first, long second)
     __asm__ volatile("svc 0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory");
     return x0;
 }
+
+#if defined(WEFT_TLS_PLATFORM_DIAGNOSTICS)
+static long weft_linux_syscall3(
+    long number,
+    long first,
+    long second,
+    long third)
+{
+    register long x0 __asm__("x0") = first;
+    register long x1 __asm__("x1") = second;
+    register long x2 __asm__("x2") = third;
+    register long x8 __asm__("x8") = number;
+    __asm__ volatile(
+        "svc 0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x8)
+        : "memory");
+    return x0;
+}
+#endif
 
 static long weft_linux_syscall6(
     long number,
@@ -64,6 +100,78 @@ static long weft_linux_syscall6(
 
 void *weft_tls_calloc(size_t count, size_t size)
 {
+#if defined(WEFT_TLS_PLATFORM_DIAGNOSTICS)
+    size_t requested;
+    size_t aligned_size;
+    size_t writable_size;
+    size_t mapping_size;
+    long raw;
+    unsigned char *mapping;
+    unsigned char *trailing_guard;
+    unsigned char *bytes;
+    weft_tls_allocation_header *header;
+    size_t index;
+
+    if (size != 0 && count > ((size_t) -1) / size) {
+        return NULL;
+    }
+    requested = count * size;
+    if (requested > ((size_t) -1) - 15u) {
+        return NULL;
+    }
+    aligned_size = (requested + 15u) & ~((size_t) 15u);
+    if (aligned_size > ((size_t) -1) - sizeof(*header) -
+                           (WEFT_LINUX_PAGE_SIZE - 1u)) {
+        return NULL;
+    }
+    writable_size = (sizeof(*header) + aligned_size +
+                     WEFT_LINUX_PAGE_SIZE - 1u) &
+                    ~((size_t) WEFT_LINUX_PAGE_SIZE - 1u);
+    if (writable_size > ((size_t) -1) - (2u * WEFT_LINUX_PAGE_SIZE)) {
+        return NULL;
+    }
+    mapping_size = writable_size + (2u * WEFT_LINUX_PAGE_SIZE);
+    raw = weft_linux_syscall6(
+        WEFT_LINUX_SYS_MMAP,
+        0,
+        (long) mapping_size,
+        WEFT_LINUX_PROT_READ_WRITE,
+        WEFT_LINUX_MAP_PRIVATE_ANONYMOUS,
+        -1,
+        0);
+    if (raw < 0 && raw >= -4095) {
+        return NULL;
+    }
+    mapping = (unsigned char *) (uintptr_t) raw;
+    if (weft_linux_syscall3(
+            WEFT_LINUX_SYS_MPROTECT,
+            (long) (uintptr_t) mapping,
+            WEFT_LINUX_PAGE_SIZE,
+            WEFT_LINUX_PROT_NONE) != 0 ||
+        weft_linux_syscall3(
+            WEFT_LINUX_SYS_MPROTECT,
+            (long) (uintptr_t) (mapping + WEFT_LINUX_PAGE_SIZE + writable_size),
+            WEFT_LINUX_PAGE_SIZE,
+            WEFT_LINUX_PROT_NONE) != 0) {
+        (void) weft_linux_syscall2(
+            WEFT_LINUX_SYS_MUNMAP,
+            (long) (uintptr_t) mapping,
+            (long) mapping_size);
+        return NULL;
+    }
+    trailing_guard = mapping + WEFT_LINUX_PAGE_SIZE + writable_size;
+    bytes = trailing_guard - aligned_size;
+    header = (weft_tls_allocation_header *) (bytes - sizeof(*header));
+    header->magic = WEFT_TLS_ALLOCATION_MAGIC;
+    header->mapping_base = (uintptr_t) mapping;
+    header->mapping_size = mapping_size;
+    header->requested_size = requested;
+    header->aligned_size = aligned_size;
+    for (index = requested; index < aligned_size; index += 1) {
+        bytes[index] = WEFT_TLS_REDZONE_BYTE;
+    }
+    return bytes;
+#else
     size_t requested;
     size_t total;
     size_t mapping_size;
@@ -103,10 +211,40 @@ void *weft_tls_calloc(size_t count, size_t size)
         bytes[index] = 0;
     }
     return bytes;
+#endif
 }
 
 void weft_tls_free(void *pointer)
 {
+#if defined(WEFT_TLS_PLATFORM_DIAGNOSTICS)
+    unsigned char *bytes;
+    weft_tls_allocation_header *header;
+    uintptr_t mapping_base;
+    size_t mapping_size;
+    size_t index;
+
+    if (pointer == NULL) {
+        return;
+    }
+    bytes = (unsigned char *) pointer;
+    header = (weft_tls_allocation_header *) (bytes - sizeof(*header));
+    if (header->magic != WEFT_TLS_ALLOCATION_MAGIC ||
+        header->aligned_size < header->requested_size) {
+        __builtin_trap();
+    }
+    for (index = header->requested_size; index < header->aligned_size; index += 1) {
+        if (bytes[index] != WEFT_TLS_REDZONE_BYTE) {
+            __builtin_trap();
+        }
+    }
+    mapping_base = header->mapping_base;
+    mapping_size = header->mapping_size;
+    header->magic = 0;
+    (void) weft_linux_syscall2(
+        WEFT_LINUX_SYS_MUNMAP,
+        (long) mapping_base,
+        (long) mapping_size);
+#else
     weft_tls_allocation_header *header;
     if (pointer == NULL) {
         return;
@@ -116,7 +254,16 @@ void weft_tls_free(void *pointer)
         WEFT_LINUX_SYS_MUNMAP,
         (long) (uintptr_t) header,
         (long) header->mapping_size);
+#endif
 }
+
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(WEFT_TLS_PLATFORM_DIAGNOSTICS)
+int weft_tls_platform_diagnostics_enabled(void)
+{
+    return 1;
+}
+#endif
 
 #else
 #error "Weft's Mbed TLS platform supports only macOS/AArch64 and Linux/AArch64"

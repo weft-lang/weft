@@ -85,6 +85,17 @@ case "$target" in
     ;;
 esac
 all_flags="$common_flags $target_flags"
+case "${WEFT_MBEDTLS_PLATFORM_DIAGNOSTICS:-0}" in
+  0) ;;
+  1)
+    all_flags="$all_flags -DWEFT_TLS_PLATFORM_DIAGNOSTICS=1"
+    echo "mbedtls: enabling target-local guard-page diagnostics" >&2
+    ;;
+  *)
+    echo "mbedtls: WEFT_MBEDTLS_PLATFORM_DIAGNOSTICS must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 
 build_dir="$work/build"
 cmake \

@@ -11,6 +11,24 @@ The required archive digest is
 builds only on the matching AArch64 target host. The release pipeline runs the
 build twice and requires byte-identical archives.
 
+The target-local native-binding diagnostic gate exercises both the owned
+handle/scoped-byte fixture and the real TLS handshake/read/write/close path:
+
+```sh
+# macOS/AArch64: runs the pinned archive under Guard Malloc with guard pages
+# alternated before and after allocations.
+just native-binding-diagnostics
+
+# Linux/AArch64: rebuilds a diagnostic-only archive from the same pinned source
+# with protected edge pages, checked alignment redzones, and unmap-on-free.
+just native-binding-diagnostics /path/to/mbedtls-3.6.7.tar.bz2
+```
+
+The Linux mode sets `WEFT_MBEDTLS_PLATFORM_DIAGNOSTICS=1` only for that
+temporary build and verifies a diagnostic marker before executing it. A normal
+build remains the release input and must still reproduce the content digest
+above exactly.
+
 The adapter deliberately exposes no foreign callback through the Weft ABI.
 Mbed TLS calls four fixed archive-internal functions for bounded memory I/O,
 per-session HMAC-DRBG output and explicit certificate time verification. Weft

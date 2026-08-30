@@ -81,3 +81,10 @@ rc-census:
 # Run benchmarks and record results
 bench:
     bash bench.sh
+
+# Exercise the real manifest-trusted fixture and Mbed TLS backend under the
+# target's allocation diagnostics. Linux rebuilds the pinned source archive
+# with protected guard pages; macOS uses the checked-in release archive under
+# Guard Malloc. Pass the official Mbed TLS tar path on Linux.
+native-binding-diagnostics source_archive="":
+    WEFT_MBEDTLS_SOURCE_ARCHIVE="{{source_archive}}" bash test/run_native_binding_diagnostics.sh
