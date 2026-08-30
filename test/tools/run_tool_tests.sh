@@ -496,7 +496,9 @@ stdlib_doc_modules=(
   stdlib/secure_random.weft stdlib/net_address.weft stdlib/idna.weft
   stdlib/dns.weft stdlib/tcp.weft stdlib/url.weft stdlib/tls.weft
   stdlib/http.weft stdlib/http_stream.weft stdlib/http_endpoint.weft
-  stdlib/http_client.weft stdlib/sse.weft stdlib/websocket.weft
+  stdlib/http_json.weft
+  stdlib/http_client.weft stdlib/sse.weft stdlib/sse_stream.weft
+  stdlib/websocket.weft stdlib/websocket_stream.weft
   stdlib/state.weft stdlib/diagnostic_type.weft stdlib/diagnostic.weft
   stdlib/diagnostic_registry.weft stdlib/map.weft stdlib/set.weft
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector_type.weft
@@ -571,11 +573,16 @@ assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public AP
     assert_contains "doc_stdlib_http_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn http_body_read<S>(stream: owned HttpBodyStream<S>, limit: usize) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpBodyReadOutcome<S>"
     assert_contains "doc_stdlib_http_stream_pins_explicit_cancel" "$(<"$tmp_out")" "pub fn http_body_cancel<S>(stream: owned HttpBodyStream<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> Result<nil, HttpBodyError>"
   elif [ "$stdlib_doc_name" = "http_endpoint" ]; then
-    assert_contains "doc_stdlib_http_endpoint_pins_public_surface" "$(<"$tmp_out")" "Public API items: 51. Documented: 51."
+    assert_contains "doc_stdlib_http_endpoint_pins_public_surface" "$(<"$tmp_out")" "Public API items: 62. Documented: 62."
     assert_contains "doc_stdlib_http_endpoint_pins_client_authority" "$(<"$tmp_out")" "pub effect HttpClient<S> {"
     assert_contains "doc_stdlib_http_endpoint_pins_server_authority" "$(<"$tmp_out")" "pub effect HttpServer {"
-    assert_contains "doc_stdlib_http_endpoint_pins_client_handler" "$(<"$tmp_out")" "pub fn http_client_with_tls<T, E>(trust_roots: Bytes, body: () -[HttpClient<TlsStream>, HttpBodyIO<TlsStream>, HttpTransportRelease<TlsStream>, E]> T) -[DnsResolve, SecureRandom, TcpConnect, TcpReadiness, TcpStreamIO, Time, E]> T"
-    assert_contains "doc_stdlib_http_endpoint_pins_server_handler" "$(<"$tmp_out")" "pub fn http_server_with_tls<T, E>(certificate: Bytes, private_key: Bytes, body: () -[HttpServer, HttpBodyIO<TlsStream>, HttpTransportRelease<TlsStream>, TcpListenerIO, E]> T) -[SecureRandom, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO, E]> T"
+    assert_contains "doc_stdlib_http_endpoint_pins_client_handler" "$(<"$tmp_out")" "pub fn http_client_with_tls<T, E>(trust_roots: Bytes, body: () -[HttpClient<TlsStream>, HttpBodyIO<TlsStream>, HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, E]> T) -[DnsResolve, SecureRandom, TcpConnect, TcpReadiness, TcpStreamIO, Time, E]> T"
+    assert_contains "doc_stdlib_http_endpoint_pins_server_handler" "$(<"$tmp_out")" "pub fn http_server_with_tls<T, E>(certificate: Bytes, private_key: Bytes, body: () -[HttpServer, HttpBodyIO<TlsStream>, HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, TcpListenerIO, E]> T) -[SecureRandom, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO, E]> T"
+  elif [ "$stdlib_doc_name" = "http_json" ]; then
+    assert_contains "doc_stdlib_http_json_pins_public_surface" "$(<"$tmp_out")" "Public API items: 31. Documented: 31."
+    assert_contains "doc_stdlib_http_json_pins_owned_reader" "$(<"$tmp_out")" "pub type HttpJsonReader<S> = opaque"
+    assert_contains "doc_stdlib_http_json_pins_bounded_read" "$(<"$tmp_out")" "pub fn http_json_read<S>(reader: owned HttpJsonReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpJsonReadOutcome<S>"
+    assert_contains "doc_stdlib_http_json_pins_semantic_write" "$(<"$tmp_out")" "pub fn http_json_write<S>(body: owned HttpBodyStream<S>, value: Json) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpJsonWriteOutcome<S>"
   elif [ "$stdlib_doc_name" = "http_client" ]; then
     assert_contains "doc_stdlib_http_client_pins_public_surface" "$(<"$tmp_out")" "Public API items: 46. Documented: 46."
     assert_contains "doc_stdlib_http_client_pins_owned_pool" "$(<"$tmp_out")" "pub type HttpConnectionPool<S> = opaque"
@@ -584,8 +591,12 @@ assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public AP
     assert_contains "doc_stdlib_sse_pins_public_surface" "$(<"$tmp_out")" "Public API items: 37. Documented: 37."
     assert_contains "doc_stdlib_sse_pins_bounded_decoder" "$(<"$tmp_out")" "pub type SseDecoder = opaque"
     assert_contains "doc_stdlib_sse_pins_incremental_transition" "$(<"$tmp_out")" "pub fn sse_decode(decoder: SseDecoder, input: SseInput) -> SseDecode"
+  elif [ "$stdlib_doc_name" = "sse_stream" ]; then
+    assert_contains "doc_stdlib_sse_stream_pins_public_surface" "$(<"$tmp_out")" "Public API items: 25. Documented: 25."
+    assert_contains "doc_stdlib_sse_stream_pins_owned_reader" "$(<"$tmp_out")" "pub type SseReader<S> = opaque"
+    assert_contains "doc_stdlib_sse_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn sse_reader_next<S>(reader: owned SseReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseReadOutcome<S>"
   elif [ "$stdlib_doc_name" = "websocket" ]; then
-    assert_contains "doc_stdlib_websocket_pins_public_surface" "$(<"$tmp_out")" "Public API items: 121. Documented: 121."
+    assert_contains "doc_stdlib_websocket_pins_public_surface" "$(<"$tmp_out")" "Public API items: 123. Documented: 123."
     assert_contains "doc_stdlib_websocket_pins_typed_handshake" "$(<"$tmp_out")" "pub fn websocket_server_upgrade(request: HttpRequestHead) -> Result<HttpHeaders, WebSocketHandshakeError>"
     assert_contains "doc_stdlib_websocket_pins_bounded_payload" "$(<"$tmp_out")" "pub type WebSocketPayloadDecoder = opaque"
     assert_contains "doc_stdlib_websocket_pins_typed_opcode" "$(<"$tmp_out")" "pub fn websocket_frame_opcode(header: WebSocketFrameHeader) -> WebSocketOpcode"
@@ -593,6 +604,10 @@ assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public AP
     assert_contains "doc_stdlib_websocket_pins_message_transition" "$(<"$tmp_out")" "pub fn websocket_message_read(decoder: WebSocketMessageFrame, input: WebSocketMessageInput) -> WebSocketMessageRead"
     assert_contains "doc_stdlib_websocket_pins_random_mask" "$(<"$tmp_out")" "pub fn websocket_encode_client_frame(final: bool, opcode: WebSocketOpcode, payload: Bytes, limits: WebSocketLimits) -[SecureRandom]> Result<Bytes, WebSocketError>"
     assert_contains "doc_stdlib_websocket_pins_close_race" "$(<"$tmp_out")" "pub fn websocket_close_on_receive(state: WebSocketCloseHandshake, close: WebSocketCloseValue) -> WebSocketCloseTransition"
+  elif [ "$stdlib_doc_name" = "websocket_stream" ]; then
+    assert_contains "doc_stdlib_websocket_stream_pins_public_surface" "$(<"$tmp_out")" "Public API items: 38. Documented: 38."
+    assert_contains "doc_stdlib_websocket_stream_pins_owned_session" "$(<"$tmp_out")" "pub type WebSocketStream<S> = opaque"
+    assert_contains "doc_stdlib_websocket_stream_pins_bounded_payload" "$(<"$tmp_out")" "pub fn websocket_frame_read<S>(frame: owned WebSocketFrameStream<S>, limit: usize) -[HttpTransportIO<S>, HttpTransportRelease<S>]> WebSocketPayloadOutcome<S>"
   elif [ "$stdlib_doc_name" = "channel" ]; then
     assert_contains "doc_stdlib_channel_pins_public_surface" "$(<"$tmp_out")" "Public API items: 21. Documented: 21."
     assert_contains "doc_stdlib_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"

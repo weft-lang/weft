@@ -108,6 +108,7 @@ check_rejects "http_client_cannot_listen" "test/negative/http_client_cannot_list
 check_rejects "http_server_cannot_connect" "test/negative/http_server_cannot_connect.weft" 'error[E2001]: effect `HttpClient<TlsStream>` is not available in this context'
 check_rejects "http_server_cannot_reuse_client_connection" "test/negative/http_server_cannot_reuse_client_connection.weft" 'error[E2001]: effect `HttpClient<TlsStream>` is not available in this context'
 check_rejects "http_client_cannot_read_server_connection" "test/negative/http_client_cannot_read_server_connection.weft" 'error[E2001]: effect `HttpServer` is not available in this context'
+check_rejects "http_json_reader_constructor_private" "test/negative/http_json_reader_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "tls_raw_backend_private" "test/negative/tls_raw_backend_private.weft" "module member 'tls_mbedtls_handshake' is not visible in this import" 1
 check_rejects "tls_session_use_after_move" "test/negative/tls_session_use_after_move.weft" "type error: owned value used more than once"
 check_rejects "tls_stream_constructor_private" "test/negative/tls_stream_constructor_private.weft" "opaque constructor is private to its declaring module"
@@ -118,7 +119,10 @@ check_rejects "idna_domain_projection_private" "test/negative/idna_domain_projec
 check_rejects "url_constructor_private" "test/negative/url_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "http_target_constructor_private" "test/negative/http_target_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "sse_decoder_constructor_private" "test/negative/sse_decoder_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "sse_reader_constructor_private" "test/negative/sse_reader_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "websocket_message_state_constructor_private" "test/negative/websocket_message_state_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "websocket_stream_constructor_private" "test/negative/websocket_stream_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "websocket_client_write_requires_random" "test/negative/websocket_client_write_requires_random.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
 check_rejects "dns_resolve_requires_effect" "test/negative/dns_resolve_requires_effect.weft" 'error[E2001]: effect `DnsResolve` is not available in this context'
 check_rejects "dns_policy_requires_authority" "test/negative/dns_policy_requires_authority.weft" 'error[E2001]: effect `DnsResolve` is not available in this context'
 check_rejects "dns_raw_backend_private" "test/negative/dns_raw_backend_private.weft" "module member 'runtime_dns_getaddrinfo' is not visible in this import" 1

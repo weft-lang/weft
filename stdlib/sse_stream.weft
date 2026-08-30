@@ -1,0 +1,257 @@
+-- stdlib/sse_stream.weft — owned SSE interpretation over bounded HTTP bodies
+--
+-- The reader joins the pure incremental SSE decoder to one exact HTTP body
+-- owner. It retains only the decoder's bounded state and one unconsumed HTTP
+-- fragment; delivery remains one event at a time. The writer emits validated
+-- semantic values without exposing a second transport vocabulary.
+
+use stdlib/bytes.{Bytes, bytes_copy_range, bytes_empty, bytes_is_empty, bytes_len}
+use stdlib/drop.{Drop}
+use stdlib/http.{HttpHeaders}
+use stdlib/http_stream.{HttpBodyError, HttpBodyFinishOutcome, HttpBodyIO, HttpBodyReadCloseFailed, HttpBodyReadData, HttpBodyReadEnd, HttpBodyReadEndClosed, HttpBodyReadFailed, HttpBodyStream, HttpBodyWriteFailed, HttpBodyWrote, HttpConnection, http_body_cancel, http_body_finish, http_body_read, http_body_write}
+use stdlib/http_transport.{HttpTransportRelease}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/sse.{SseDecodeFailed, SseDecoder, SseEnd, SseError, SseEvent, SseEventReady, SseInputBytes, SseInputEnd, SseLimits, SseNeedInput, SseReconnect, sse_decode, sse_decoder, sse_decoder_reconnect, sse_encode_comment, sse_encode_event, sse_encode_retry}
+
+type SseReaderState {
+  decoder: SseDecoder,
+    pending: Bytes
+}
+
+--- One owned inbound event stream over an exact HTTP transport state.
+---
+--- Dropping an unfinished reader closes its body owner exactly once. Use
+--- `sse_reader_cancel` when authenticated close failure must be observed.
+pub type SseReader<S> = opaque(owned HttpBodyStream<S>, SseReaderState)
+
+--- One owned outbound event stream over an exact HTTP transport state.
+pub type SseWriter<S> = opaque owned HttpBodyStream<S>
+
+--- A terminal SSE semantic failure after the HTTP body owner is recovered.
+pub type SseStreamError {
+  --- The bounded pure decoder rejected the wire stream.
+  SseStreamDecode(SseError),
+    --- The decoder reported end while byte input was still present.
+    SseStreamUnexpectedDecoderEnd
+}
+
+--- One demand-driven inbound SSE transition.
+pub type SseReadOutcome<S> {
+  --- One event arrived with the successor reader owner.
+  SseStreamEvent(owned SseReader<S>, SseEvent),
+    --- HTTP framing and SSE decoding ended with a reusable connection.
+    SseStreamEnd(owned HttpConnection<S>, SseReconnect, HttpHeaders),
+    --- HTTP framing and SSE decoding ended after consuming the connection.
+    SseStreamEndClosed(SseReconnect, HttpHeaders),
+    --- Body I/O failed and returned a reader that may be retried or cancelled.
+    SseStreamReadFailed(owned SseReader<S>, HttpBodyError),
+    --- SSE semantics failed and returned the raw body solely for explicit policy.
+    SseStreamStopped(owned HttpBodyStream<S>, SseStreamError),
+    --- The final body boundary was decoded but authenticated close failed.
+    SseStreamCloseFailed(SseReconnect, HttpBodyError)
+}
+
+--- One outbound semantic-value transition.
+pub type SseWriteOutcome<S> {
+  --- The complete semantic value was written with the successor writer.
+  SseStreamWritten(owned SseWriter<S>),
+    --- Validation failed before any wire byte was offered.
+    SseStreamWriteRejected(owned SseWriter<S>, SseError),
+    --- Body I/O failed after zero or more wire bytes and returned the raw body.
+    SseStreamWriteStopped(owned HttpBodyStream<S>, HttpBodyError)
+}
+
+fn sse_stream_i64_to_usize(value: i64) -> usize {
+  __i64_to_usize(if value < 0 { 0 } else { value })
+}
+
+fn sse_stream_fragment_limit() -> i64 { 16384 }
+
+fn sse_reader_wrap<S>(
+  body: owned HttpBodyStream<S>,
+  decoder: SseDecoder,
+  pending: Bytes
+) -[HttpTransportRelease<S>]> owned SseReader<S> {
+  SseReader<S>((body, SseReaderState { decoder: decoder, pending: pending }))
+}
+
+fn sse_writer_wrap<S>(
+  body: owned HttpBodyStream<S>
+) -[HttpTransportRelease<S>]> owned SseWriter<S> {
+  SseWriter<S>(body)
+}
+
+impl<S> Drop for SseReader<S> {
+  fn drop(self: SseReader<S>) -[HttpTransportRelease<S>]> i64 {
+    match self { SseReader((body, state)) -> body.drop() }
+  }
+}
+
+impl<S> Drop for SseWriter<S> {
+  fn drop(self: SseWriter<S>) -[HttpTransportRelease<S>]> i64 {
+    match self { SseWriter(body) -> body.drop() }
+  }
+}
+
+--- Join an inbound HTTP body to a fresh bounded SSE decoder.
+pub fn sse_reader<S>(
+  body: owned HttpBodyStream<S>,
+  limits: SseLimits
+) -[HttpTransportRelease<S>]> owned SseReader<S> {
+  sse_reader_wrap<S>(body, sse_decoder(limits), bytes_empty())
+}
+
+--- Join an outbound HTTP body to the SSE writer vocabulary.
+pub fn sse_writer<S>(
+  body: owned HttpBodyStream<S>
+) -[HttpTransportRelease<S>]> owned SseWriter<S> {
+  sse_writer_wrap<S>(body)
+}
+
+--- Pull at most one semantic event while preserving exact backpressure.
+pub fn sse_reader_next<S>(
+  reader: owned SseReader<S>
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseReadOutcome<S> {
+  let mut current: owned SseReader<S> = reader
+  loop {
+    match current {
+      SseReader((body, state)) -> {
+        let { decoder, pending } = state
+        if bytes_is_empty(pending) {
+          match http_body_read<S>(body, sse_stream_i64_to_usize(sse_stream_fragment_limit())) {
+            HttpBodyReadData(returned, data) -> {
+              current = sse_reader_wrap<S>(returned, decoder, data)
+            }
+            HttpBodyReadEnd(connection, trailers) -> match sse_decode(decoder, SseInputEnd) {
+              SseEnd(reconnect) -> break (SseStreamEnd<S>(connection, reconnect, trailers))
+              _ -> break (SseStreamEnd<S>(connection, sse_decoder_reconnect(decoder), trailers))
+            }
+            HttpBodyReadEndClosed(trailers) -> match sse_decode(decoder, SseInputEnd) {
+              SseEnd(reconnect) -> break (SseStreamEndClosed(reconnect, trailers))
+              _ -> break (SseStreamEndClosed(sse_decoder_reconnect(decoder), trailers))
+            }
+            HttpBodyReadFailed(returned, error) -> break (SseStreamReadFailed<S>(
+              sse_reader_wrap<S>(returned, decoder, bytes_empty()),
+              error
+            ))
+            HttpBodyReadCloseFailed(error) -> break (SseStreamCloseFailed(
+              sse_decoder_reconnect(decoder),
+              error
+            ))
+          }
+        } else {
+          match sse_decode(decoder, SseInputBytes(pending)) {
+            SseEventReady(next, event, consumed) -> {
+              let first = __u64_to_i64(__usize_to_u64(consumed))
+              let rest = bytes_copy_range(pending, first, bytes_len(pending))
+              break (SseStreamEvent<S>(sse_reader_wrap<S>(body, next, rest), event))
+            }
+            SseNeedInput(next, consumed) -> {
+              let first = __u64_to_i64(__usize_to_u64(consumed))
+              current = sse_reader_wrap<S>(
+                body,
+                next,
+                bytes_copy_range(pending, first, bytes_len(pending))
+              )
+            }
+            SseDecodeFailed(error, consumed) -> break (SseStreamStopped<S>(
+              body,
+              SseStreamDecode(error)
+            ))
+            SseEnd(reconnect) -> break (SseStreamStopped<S>(
+              body,
+              SseStreamUnexpectedDecoderEnd
+            ))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn sse_writer_write_bytes<S>(
+  writer: owned SseWriter<S>,
+  wire: Bytes
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseWriteOutcome<S> {
+  match writer {
+    SseWriter(body) -> {
+      let total = bytes_len(wire)
+      let mut position = 0
+      let mut current: owned HttpBodyStream<S> = body
+      loop {
+        if position >= total {
+          break (SseStreamWritten<S>(sse_writer_wrap<S>(current)))
+        } else {
+          let count = if total - position < sse_stream_fragment_limit() {
+            total - position
+          } else {
+            sse_stream_fragment_limit()
+          }
+          let fragment = bytes_copy_range(wire, position, position + count)
+          match http_body_write<S>(current, fragment) {
+            HttpBodyWrote(returned, wrote) -> {
+              current = returned
+              position = position + __u64_to_i64(__usize_to_u64(wrote))
+            }
+            HttpBodyWriteFailed(returned, error) -> break (SseStreamWriteStopped<S>(
+              returned,
+              error
+            ))
+          }
+        }
+      }
+    }
+  }
+}
+
+--- Write one already-validated semantic event in bounded HTTP fragments.
+pub fn sse_writer_write_event<S>(
+  writer: owned SseWriter<S>,
+  event: SseEvent
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseWriteOutcome<S> {
+  sse_writer_write_bytes<S>(writer, sse_encode_event(event))
+}
+
+--- Validate and write one SSE comment control line.
+pub fn sse_writer_write_comment<S>(
+  writer: owned SseWriter<S>,
+  comment: str
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseWriteOutcome<S> {
+  match sse_encode_comment(comment) {
+    Err(error) -> SseStreamWriteRejected<S>(writer, error)
+    Ok(wire) -> sse_writer_write_bytes<S>(writer, wire)
+  }
+}
+
+--- Validate and write one reconnect-delay control line.
+pub fn sse_writer_write_retry<S>(
+  writer: owned SseWriter<S>,
+  millis: i64
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseWriteOutcome<S> {
+  match sse_encode_retry(millis) {
+    Err(error) -> SseStreamWriteRejected<S>(writer, error)
+    Ok(wire) -> sse_writer_write_bytes<S>(writer, wire)
+  }
+}
+
+--- Finish the underlying HTTP body with its framing-appropriate trailers.
+pub fn sse_writer_finish<S>(
+  writer: owned SseWriter<S>,
+  trailers: HttpHeaders
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpBodyFinishOutcome<S> {
+  match writer { SseWriter(body) -> http_body_finish<S>(body, trailers) }
+}
+
+--- Cancel an inbound SSE reader and observe authenticated close failure.
+pub fn sse_reader_cancel<S>(
+  reader: owned SseReader<S>
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> Result<nil, HttpBodyError> {
+  match reader { SseReader((body, state)) -> http_body_cancel<S>(body) }
+}
+
+--- Cancel an outbound SSE writer and observe authenticated close failure.
+pub fn sse_writer_cancel<S>(
+  writer: owned SseWriter<S>
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> Result<nil, HttpBodyError> {
+  match writer { SseWriter(body) -> http_body_cancel<S>(body) }
+}

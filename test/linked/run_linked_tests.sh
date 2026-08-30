@@ -88,7 +88,7 @@ for f in test/linked/*.weft; do
   esac
 
   case "$name" in
-    http_stream_conformance|tls_conformance|tls_safe_smoke|tls_stream_conformance)
+    http_stream_conformance|tls_conformance|tls_safe_smoke|tls_stream_conformance|web_stream_product)
       tls_target=macos-aarch64
       if [ "$WEFT_TEST_PLATFORM" = Linux ]; then tls_target=linux-aarch64; fi
       if [ ! -f "native/lib/$tls_target/libweft_mbedtls.a" ]; then

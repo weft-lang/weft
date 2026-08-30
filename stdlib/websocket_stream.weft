@@ -1,0 +1,634 @@
+-- stdlib/websocket_stream.weft — owned bounded WebSocket transport
+--
+-- HTTP upgrade proof, frame-prefix parsing, streamed payload delivery, message
+-- validation and close state are joined around one exact raw HTTP connection.
+-- Data payloads are never accumulated; control payloads are bounded by the
+-- RFC's 125-byte limit and are returned as semantic control values.
+
+use stdlib/bytes.{Bytes, bytes_concat, bytes_copy_range, bytes_empty, bytes_is_empty, bytes_len}
+use stdlib/drop.{Drop}
+use stdlib/http.{HttpHeaders, HttpRequestHead, HttpResponseHead}
+use stdlib/http_stream.{HttpBodyError, HttpConnection, HttpConnectionPeerClosed, HttpConnectionReceiveFailed, HttpConnectionReceived, HttpConnectionSnapshotted, HttpConnectionWriteFailed, HttpConnectionWritten, http_body_buffer_available, http_body_buffered_bytes, http_body_close_connection_direct, http_body_connection_advance, http_body_connection_receive, http_body_write_wire, http_connection_snapshot}
+use stdlib/http_transport.{HttpTransportIO, HttpTransportRelease}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/secure_random.{SecureRandom}
+use stdlib/websocket.{WebSocketBinaryContent, WebSocketClient, WebSocketClientUpgrade, WebSocketClose, WebSocketCloseAwaitPeer, WebSocketCloseComplete, WebSocketCloseDuplicate, WebSocketCloseEcho, WebSocketCloseHandshake, WebSocketCloseValue, WebSocketControl, WebSocketControlClose, WebSocketControlContent, WebSocketError, WebSocketFrameFailed, WebSocketFrameHeader, WebSocketFrameNeedMore, WebSocketFrameReady, WebSocketHandshakeError, WebSocketLimits, WebSocketMessageChunk, WebSocketMessageContent, WebSocketMessageDone, WebSocketMessageEnd, WebSocketMessageFailed, WebSocketMessageFrame, WebSocketMessageMore, WebSocketMessageState, WebSocketOpcode, WebSocketPayloadChunk, WebSocketPayloadDecoder, WebSocketPayloadEnd, WebSocketPayloadLengthMismatch, WebSocketPayloadNeedInput, WebSocketReceiveMessages, WebSocketRole, WebSocketServer, WebSocketTextContent, websocket_client_validate_upgrade, websocket_close_handshake, websocket_close_on_receive, websocket_close_on_send, websocket_close_payload, websocket_decode_control, websocket_encode_client_frame, websocket_encode_server_frame, websocket_frame_opcode, websocket_message_begin, websocket_message_content, websocket_message_read, websocket_message_state, websocket_message_write, websocket_parse_frame_header, websocket_payload_decoder, websocket_payload_read, websocket_payload_remaining, websocket_server_upgrade}
+
+type WebSocketStreamState {
+  role: WebSocketRole,
+    limits: WebSocketLimits,
+    receive_state: WebSocketMessageState,
+    send_state: WebSocketMessageState,
+    handshake: WebSocketCloseHandshake
+}
+
+type WebSocketFrameState {
+  role: WebSocketRole,
+    limits: WebSocketLimits,
+    send_state: WebSocketMessageState,
+    handshake: WebSocketCloseHandshake,
+    opcode: WebSocketOpcode,
+    content: WebSocketMessageContent,
+    payload: WebSocketPayloadDecoder,
+    message: WebSocketMessageFrame,
+    control: Bytes
+}
+
+--- A server-side WebSocket request proof and its exact switching headers.
+pub type WebSocketServerAccept = opaque HttpHeaders
+
+--- One WebSocket session between frame boundaries.
+pub type WebSocketStream<S> = opaque(owned HttpConnection<S>, WebSocketStreamState)
+
+--- One WebSocket frame while its payload is delivered incrementally.
+pub type WebSocketFrameStream<S> = opaque(owned HttpConnection<S>, WebSocketFrameState)
+
+--- A WebSocket transport, framing, or API-state failure.
+pub type WebSocketStreamError {
+  --- The pure WebSocket semantic layer rejected the frame or message.
+  WebSocketStreamProtocol(WebSocketError),
+    --- The peer closed the transport between WebSocket frame boundaries.
+    WebSocketStreamUnexpectedEof,
+    --- A payload pull limit was empty or exceeded the 16 KiB transport bound.
+    WebSocketStreamFragmentLimit(usize),
+    --- A direction-specific writer was used for the other endpoint role.
+    WebSocketStreamWrongRole(WebSocketRole)
+}
+
+--- Validation of an HTTP upgrade into a WebSocket owner.
+pub type WebSocketOpenOutcome<S> {
+  --- Upgrade validation succeeded and returned the WebSocket owner.
+  WebSocketStreamOpen(owned WebSocketStream<S>),
+    --- Validation failed before consuming the returned raw connection.
+    WebSocketStreamOpenFailed(owned HttpConnection<S>, WebSocketHandshakeError)
+}
+
+--- Discovery of the next bounded frame payload owner.
+pub type WebSocketFrameOutcome<S> {
+  --- A validated header and message kind are ready for payload pulls.
+  WebSocketStreamFrame(owned WebSocketFrameStream<S>, WebSocketFrameHeader, WebSocketMessageContent),
+    --- Transport I/O failed while preserving the between-frame owner.
+    WebSocketStreamFrameReadFailed(owned WebSocketStream<S>, HttpBodyError),
+    --- Protocol state became terminal and returned the raw connection.
+    WebSocketStreamFrameStopped(owned HttpConnection<S>, WebSocketStreamError)
+}
+
+--- One bounded payload transition for an active frame.
+pub type WebSocketPayloadOutcome<S> {
+  --- A nonterminal data payload chunk arrived with the active frame owner.
+  WebSocketStreamPayload(owned WebSocketFrameStream<S>, Bytes),
+    --- A data frame ended and returned the between-frame stream owner.
+    WebSocketStreamPayloadEnd(owned WebSocketStream<S>, Bytes),
+    --- A bounded control frame ended as one semantic control value.
+    WebSocketStreamControl(owned WebSocketStream<S>, WebSocketControl),
+    --- Transport I/O failed while preserving the active frame owner.
+    WebSocketStreamPayloadReadFailed(owned WebSocketFrameStream<S>, HttpBodyError),
+    --- A pull was rejected before I/O and preserved the active frame owner.
+    WebSocketStreamPayloadRejected(owned WebSocketFrameStream<S>, WebSocketStreamError),
+    --- Protocol state became terminal and returned the raw connection.
+    WebSocketStreamPayloadStopped(owned HttpConnection<S>, WebSocketStreamError)
+}
+
+--- One complete outbound frame transition.
+pub type WebSocketWriteOutcome<S> {
+  --- The frame was written and returned the successor stream owner.
+  WebSocketStreamWrote(owned WebSocketStream<S>),
+    --- Validation failed before I/O and preserved the stream owner.
+    WebSocketStreamWriteRejected(owned WebSocketStream<S>, WebSocketStreamError),
+    --- Transport I/O failed and returned the raw connection for close policy.
+    WebSocketStreamWriteStopped(owned HttpConnection<S>, HttpBodyError)
+}
+
+fn websocket_stream_i64_to_usize(value: i64) -> usize {
+  __i64_to_usize(if value < 0 { 0 } else { value })
+}
+
+fn websocket_stream_usize_to_i64(value: usize) -> i64 {
+  __u64_to_i64(__usize_to_u64(value))
+}
+
+fn websocket_stream_fragment_limit() -> i64 { 16384 }
+
+fn websocket_stream_role_matches(actual: WebSocketRole, expected: WebSocketRole) -> bool {
+  match actual {
+    WebSocketClient -> match expected { WebSocketClient -> true WebSocketServer -> false }
+    WebSocketServer -> match expected { WebSocketClient -> false WebSocketServer -> true }
+  }
+}
+
+fn websocket_stream_content_is_control(content: WebSocketMessageContent) -> bool {
+  match content {
+    WebSocketControlContent -> true
+    WebSocketTextContent -> false
+    WebSocketBinaryContent -> false
+  }
+}
+
+fn websocket_stream_wrap<S>(
+  connection: owned HttpConnection<S>,
+  role: WebSocketRole,
+  limits: WebSocketLimits,
+  receive_state: WebSocketMessageState,
+  send_state: WebSocketMessageState,
+  handshake: WebSocketCloseHandshake
+) -[HttpTransportRelease<S>]> owned WebSocketStream<S> {
+  WebSocketStream<S>((connection, WebSocketStreamState {
+    role: role,
+      limits: limits,
+      receive_state: receive_state,
+      send_state: send_state,
+      handshake: handshake
+  }))
+}
+
+fn websocket_frame_wrap<S>(
+  connection: owned HttpConnection<S>,
+  state: WebSocketFrameState
+) -[HttpTransportRelease<S>]> owned WebSocketFrameStream<S> {
+  WebSocketFrameStream<S>((connection, state))
+}
+
+fn websocket_stream_limits<S>(stream: borrow WebSocketStream<S>) -> WebSocketLimits {
+  match stream { WebSocketStream((connection, state)) -> state.limits }
+}
+
+impl<S> Drop for WebSocketStream<S> {
+  fn drop(self: WebSocketStream<S>) -[HttpTransportRelease<S>]> i64 {
+    match self { WebSocketStream((connection, state)) -> connection.drop() }
+  }
+}
+
+impl<S> Drop for WebSocketFrameStream<S> {
+  fn drop(self: WebSocketFrameStream<S>) -[HttpTransportRelease<S>]> i64 {
+    match self { WebSocketFrameStream((connection, state)) -> connection.drop() }
+  }
+}
+
+--- Validate a server-side upgrade request and retain its exact 101 headers.
+pub fn websocket_server_accept(
+  request: HttpRequestHead
+) -> Result<WebSocketServerAccept, WebSocketHandshakeError> {
+  match websocket_server_upgrade(request) {
+    Err(error) -> result_err<WebSocketServerAccept, WebSocketHandshakeError>(error)
+    Ok(headers) -> result_ok<WebSocketServerAccept, WebSocketHandshakeError>(
+      WebSocketServerAccept(headers)
+    )
+  }
+}
+
+--- Return the exact switching headers derived by server request validation.
+pub fn websocket_server_accept_headers(accept: WebSocketServerAccept) -> HttpHeaders {
+  match accept { WebSocketServerAccept(headers) -> headers }
+}
+
+--- Validate a client 101 response and construct its raw WebSocket stream.
+pub fn websocket_client_stream<S>(
+  connection: owned HttpConnection<S>,
+  upgrade: WebSocketClientUpgrade,
+  response: HttpResponseHead,
+  limits: WebSocketLimits
+) -[HttpTransportRelease<S>]> WebSocketOpenOutcome<S> {
+  match websocket_client_validate_upgrade(upgrade, response) {
+    Err(error) -> WebSocketStreamOpenFailed<S>(connection, error)
+    Ok(done) -> WebSocketStreamOpen<S>(websocket_stream_wrap<S>(
+      connection,
+      WebSocketClient,
+      limits,
+      websocket_message_state(),
+      websocket_message_state(),
+      websocket_close_handshake()
+    ))
+  }
+}
+
+--- Consume a validated server request proof and construct its WebSocket stream.
+pub fn websocket_server_stream<S>(
+  connection: owned HttpConnection<S>,
+  accept: WebSocketServerAccept,
+  limits: WebSocketLimits
+) -[HttpTransportRelease<S>]> owned WebSocketStream<S> {
+  match accept {
+    WebSocketServerAccept(headers) -> websocket_stream_wrap<S>(
+      connection,
+      WebSocketServer,
+      limits,
+      websocket_message_state(),
+      websocket_message_state(),
+      websocket_close_handshake()
+    )
+  }
+}
+
+--- Parse the next frame header without consuming or buffering its payload.
+pub fn websocket_stream_next<S>(
+  stream: owned WebSocketStream<S>
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> WebSocketFrameOutcome<S> {
+  let mut current: owned WebSocketStream<S> = stream
+  loop {
+    match current {
+      WebSocketStream((connection, state)) -> {
+        let { role, limits, receive_state, send_state, handshake } = state
+        match http_connection_snapshot(connection) {
+          HttpConnectionSnapshotted(returned, source) -> match websocket_parse_frame_header(
+            source,
+            role,
+            limits
+          ) {
+            WebSocketFrameFailed(error) -> break (WebSocketStreamFrameStopped<S>(
+              returned,
+              WebSocketStreamProtocol(error)
+            ))
+            WebSocketFrameNeedMore -> match http_body_connection_receive(
+              returned,
+              websocket_stream_fragment_limit()
+            ) {
+              HttpConnectionReceived(received) -> {
+                current = websocket_stream_wrap<S>(
+                  received, role, limits, receive_state, send_state, handshake
+                )
+              }
+              HttpConnectionPeerClosed(closed) -> break (WebSocketStreamFrameStopped<S>(
+                closed,
+                WebSocketStreamUnexpectedEof
+              ))
+              HttpConnectionReceiveFailed(failed, error) -> break (WebSocketStreamFrameReadFailed<S>(
+                websocket_stream_wrap<S>(
+                  failed, role, limits, receive_state, send_state, handshake
+                ),
+                error
+              ))
+            }
+            WebSocketFrameReady(header, consumed) -> match websocket_message_begin(
+              receive_state,
+              handshake,
+              WebSocketReceiveMessages,
+              header,
+              limits
+            ) {
+              Err(error) -> break (WebSocketStreamFrameStopped<S>(
+                returned,
+                WebSocketStreamProtocol(error)
+              ))
+              Ok(message) -> {
+                let content = websocket_message_content(message)
+                let frame_state = WebSocketFrameState {
+                  role: role,
+                    limits: limits,
+                    send_state: send_state,
+                    handshake: handshake,
+                    opcode: websocket_frame_opcode(header),
+                    content: content,
+                    payload: websocket_payload_decoder(header),
+                    message: message,
+                    control: bytes_empty()
+                }
+                break (WebSocketStreamFrame<S>(
+                  websocket_frame_wrap<S>(
+                    http_body_connection_advance(
+                      returned,
+                      websocket_stream_usize_to_i64(consumed)
+                    ),
+                    frame_state
+                  ),
+                  header,
+                  content
+                ))
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn websocket_stream_handshake_after_receive(
+  handshake: WebSocketCloseHandshake,
+  control: WebSocketControl
+) -> WebSocketCloseHandshake {
+  match control {
+    WebSocketControlClose(close) -> match websocket_close_on_receive(handshake, close) {
+      WebSocketCloseEcho(next, value) -> next
+      WebSocketCloseComplete(next) -> next
+      WebSocketCloseDuplicate(next) -> next
+      WebSocketCloseAwaitPeer(next) -> next
+    }
+    _ -> handshake
+  }
+}
+
+fn websocket_stream_handshake_after_send(
+  handshake: WebSocketCloseHandshake,
+  opcode: WebSocketOpcode
+) -> WebSocketCloseHandshake {
+  match opcode {
+    WebSocketClose -> match websocket_close_on_send(handshake) {
+      WebSocketCloseAwaitPeer(next) -> next
+      WebSocketCloseComplete(next) -> next
+      WebSocketCloseDuplicate(next) -> next
+      WebSocketCloseEcho(next, value) -> next
+    }
+    _ -> handshake
+  }
+}
+
+--- Pull one bounded data chunk or one complete bounded control frame.
+pub fn websocket_frame_read<S>(
+  frame: owned WebSocketFrameStream<S>,
+  limit: usize
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> WebSocketPayloadOutcome<S> {
+  let requested = websocket_stream_usize_to_i64(limit)
+  if requested <= 0 or requested > websocket_stream_fragment_limit() {
+    WebSocketStreamPayloadRejected<S>(frame, WebSocketStreamFragmentLimit(limit))
+  } else {
+    let mut current: owned WebSocketFrameStream<S> = frame
+    loop {
+      match current {
+        WebSocketFrameStream((connection, state)) -> {
+          let { role, limits, send_state, handshake, opcode, content, payload, message, control } = state
+          let available = http_body_buffer_available(connection)
+          if available <= 0 and websocket_payload_remaining(payload) > 0 {
+            match http_body_connection_receive(connection, requested) {
+              HttpConnectionReceived(received) -> {
+                current = websocket_frame_wrap<S>(received, state)
+              }
+              HttpConnectionPeerClosed(closed) -> break (WebSocketStreamPayloadStopped<S>(
+                closed,
+                WebSocketStreamUnexpectedEof
+              ))
+              HttpConnectionReceiveFailed(failed, error) -> break (WebSocketStreamPayloadReadFailed<S>(
+                websocket_frame_wrap<S>(failed, state),
+                error
+              ))
+            }
+          } else {
+            let count = if available < requested { available } else { requested }
+            let source = bytes_copy_range(http_body_buffered_bytes(connection), 0, count)
+            match websocket_payload_read(payload, source) {
+              WebSocketPayloadNeedInput(next) -> {
+                current = websocket_frame_wrap<S>(connection, WebSocketFrameState {
+                  role: role, limits: limits, send_state: send_state, handshake: handshake,
+                  opcode: opcode, content: content, payload: next, message: message, control: control
+                })
+              }
+              WebSocketPayloadChunk(next, data, consumed) -> {
+                let advanced = http_body_connection_advance(
+                  connection,
+                  websocket_stream_usize_to_i64(consumed)
+                )
+                match websocket_message_read(message, WebSocketMessageChunk(data)) {
+                  WebSocketMessageFailed(error) -> break (WebSocketStreamPayloadStopped<S>(
+                    advanced,
+                    WebSocketStreamProtocol(error)
+                  ))
+                  WebSocketMessageDone(receive_state) -> break (WebSocketStreamPayloadStopped<S>(
+                    advanced,
+                    WebSocketStreamProtocol(WebSocketPayloadLengthMismatch(
+                      bytes_len(data),
+                      bytes_len(data) + 1
+                    ))
+                  ))
+                  WebSocketMessageMore(next_message) -> if websocket_stream_content_is_control(content) {
+                    current = websocket_frame_wrap<S>(advanced, WebSocketFrameState {
+                      role: role, limits: limits, send_state: send_state, handshake: handshake,
+                      opcode: opcode, content: content, payload: next, message: next_message,
+                      control: bytes_concat(control, data)
+                    })
+                  } else {
+                    break (WebSocketStreamPayload<S>(
+                      websocket_frame_wrap<S>(advanced, WebSocketFrameState {
+                        role: role, limits: limits, send_state: send_state, handshake: handshake,
+                        opcode: opcode, content: content, payload: next, message: next_message,
+                        control: control
+                      }),
+                      data
+                    ))
+                  }
+                }
+              }
+              WebSocketPayloadEnd(data, consumed) -> {
+                let advanced = http_body_connection_advance(
+                  connection,
+                  websocket_stream_usize_to_i64(consumed)
+                )
+                match websocket_message_read(message, WebSocketMessageEnd(data)) {
+                  WebSocketMessageFailed(error) -> break (WebSocketStreamPayloadStopped<S>(
+                    advanced,
+                    WebSocketStreamProtocol(error)
+                  ))
+                  WebSocketMessageMore(next_message) -> break (WebSocketStreamPayloadStopped<S>(
+                    advanced,
+                    WebSocketStreamProtocol(WebSocketPayloadLengthMismatch(
+                      bytes_len(data),
+                      bytes_len(data)
+                    ))
+                  ))
+                  WebSocketMessageDone(receive_state) -> if websocket_stream_content_is_control(content) {
+                    match websocket_decode_control(opcode, bytes_concat(control, data)) {
+                      Err(error) -> break (WebSocketStreamPayloadStopped<S>(
+                        advanced,
+                        WebSocketStreamProtocol(error)
+                      ))
+                      Ok(decoded) -> break (WebSocketStreamControl<S>(
+                        websocket_stream_wrap<S>(
+                          advanced,
+                          role,
+                          limits,
+                          receive_state,
+                          send_state,
+                          websocket_stream_handshake_after_receive(handshake, decoded)
+                        ),
+                        decoded
+                      ))
+                    }
+                  } else {
+                    break (WebSocketStreamPayloadEnd<S>(
+                      websocket_stream_wrap<S>(
+                        advanced, role, limits, receive_state, send_state, handshake
+                      ),
+                      data
+                    ))
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn websocket_stream_write_encoded<S>(
+  stream: owned WebSocketStream<S>,
+  final: bool,
+  opcode: WebSocketOpcode,
+  payload: Bytes,
+  expected: WebSocketRole,
+  encoded: Result<Bytes, WebSocketError>
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> WebSocketWriteOutcome<S> {
+  match stream {
+    WebSocketStream((connection, state)) -> {
+      let { role, limits, receive_state, send_state, handshake } = state
+      if not websocket_stream_role_matches(role, expected) {
+        WebSocketStreamWriteRejected<S>(
+          websocket_stream_wrap<S>(
+            connection, role, limits, receive_state, send_state, handshake
+          ),
+          WebSocketStreamWrongRole(role)
+        )
+      } else { match websocket_message_write(
+          send_state, handshake, final, opcode, payload, limits
+        ) {
+          Err(error) -> WebSocketStreamWriteRejected<S>(
+            websocket_stream_wrap<S>(
+              connection, role, limits, receive_state, send_state, handshake
+            ),
+            WebSocketStreamProtocol(error)
+          )
+          Ok(next_send) -> {
+            match encoded {
+              Err(error) -> WebSocketStreamWriteRejected<S>(
+                websocket_stream_wrap<S>(
+                  connection, role, limits, receive_state, send_state, handshake
+                ),
+                WebSocketStreamProtocol(error)
+              )
+              Ok(wire) -> match http_body_write_wire(connection, wire) {
+                HttpConnectionWriteFailed(failed, error) -> WebSocketStreamWriteStopped<S>(
+                  failed,
+                  error
+                )
+                HttpConnectionWritten(returned) -> WebSocketStreamWrote<S>(
+                  websocket_stream_wrap<S>(
+                    returned,
+                    role,
+                    limits,
+                    receive_state,
+                    next_send,
+                    websocket_stream_handshake_after_send(handshake, opcode)
+                  )
+                )
+              }
+            }
+          }
+        } }
+    }
+  }
+}
+
+--- Validate, mask and write one complete client frame.
+pub fn websocket_client_write_frame<S>(
+  stream: owned WebSocketStream<S>,
+  final: bool,
+  opcode: WebSocketOpcode,
+  payload: Bytes
+) -[HttpTransportIO<S>, HttpTransportRelease<S>, SecureRandom]> WebSocketWriteOutcome<S> {
+  match stream {
+    WebSocketStream((connection, state)) -> {
+      let { role, limits, receive_state, send_state, handshake } = state
+      if not websocket_stream_role_matches(role, WebSocketClient) {
+        WebSocketStreamWriteRejected<S>(
+          websocket_stream_wrap<S>(
+            connection, role, limits, receive_state, send_state, handshake
+          ),
+          WebSocketStreamWrongRole(role)
+        )
+      } else { match websocket_message_write(
+          send_state, handshake, final, opcode, payload, limits
+        ) {
+          Err(error) -> WebSocketStreamWriteRejected<S>(
+            websocket_stream_wrap<S>(
+              connection, role, limits, receive_state, send_state, handshake
+            ),
+            WebSocketStreamProtocol(error)
+          )
+          Ok(next_send) -> match websocket_encode_client_frame(
+            final, opcode, payload, limits
+          ) {
+            Err(error) -> WebSocketStreamWriteRejected<S>(
+              websocket_stream_wrap<S>(
+                connection, role, limits, receive_state, send_state, handshake
+              ),
+              WebSocketStreamProtocol(error)
+            )
+            Ok(wire) -> match http_body_write_wire(connection, wire) {
+              HttpConnectionWriteFailed(failed, error) -> WebSocketStreamWriteStopped<S>(
+                failed,
+                error
+              )
+              HttpConnectionWritten(returned) -> WebSocketStreamWrote<S>(
+                websocket_stream_wrap<S>(
+                  returned,
+                  role,
+                  limits,
+                  receive_state,
+                  next_send,
+                  websocket_stream_handshake_after_send(handshake, opcode)
+                )
+              )
+            }
+          }
+        } }
+    }
+  }
+}
+
+--- Validate and write one complete unmasked server frame.
+pub fn websocket_server_write_frame<S>(
+  stream: owned WebSocketStream<S>,
+  final: bool,
+  opcode: WebSocketOpcode,
+  payload: Bytes
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> WebSocketWriteOutcome<S> {
+  let limits = websocket_stream_limits(stream)
+  let encoded = websocket_encode_server_frame(final, opcode, payload, limits)
+  websocket_stream_write_encoded<S>(
+    stream,
+    final,
+    opcode,
+    payload,
+    WebSocketServer,
+    encoded
+  )
+}
+
+--- Validate, mask and write one semantic client close frame.
+pub fn websocket_client_write_close<S>(
+  stream: owned WebSocketStream<S>,
+  close: WebSocketCloseValue
+) -[HttpTransportIO<S>, HttpTransportRelease<S>, SecureRandom]> WebSocketWriteOutcome<S> {
+  websocket_client_write_frame<S>(
+    stream,
+    true,
+    WebSocketClose,
+    websocket_close_payload(close)
+  )
+}
+
+--- Validate and write one semantic unmasked server close frame.
+pub fn websocket_server_write_close<S>(
+  stream: owned WebSocketStream<S>,
+  close: WebSocketCloseValue
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> WebSocketWriteOutcome<S> {
+  websocket_server_write_frame<S>(
+    stream,
+    true,
+    WebSocketClose,
+    websocket_close_payload(close)
+  )
+}
+
+--- Gracefully close and consume the underlying authenticated transport.
+pub fn websocket_stream_close<S>(
+  stream: owned WebSocketStream<S>
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> Result<nil, HttpBodyError> {
+  match stream { WebSocketStream((connection, state)) -> http_body_close_connection_direct(connection) }
+}
+
+--- Gracefully close and consume an active-frame transport.
+pub fn websocket_frame_close<S>(
+  frame: owned WebSocketFrameStream<S>
+) -[HttpTransportIO<S>, HttpTransportRelease<S>]> Result<nil, HttpBodyError> {
+  match frame { WebSocketFrameStream((connection, state)) -> http_body_close_connection_direct(connection) }
+}

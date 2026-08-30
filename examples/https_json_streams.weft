@@ -1,0 +1,746 @@
+-- examples/https_json_streams.weft — safe local HTTPS JSON and stream product
+--
+-- This module is ordinary application code: it imports only public stdlib
+-- capabilities. The linked product supplies local certificate material and
+-- platform interpretations separately.
+
+use stdlib/bytes.{Bytes, bytes_equal, bytes_from_str, bytes_from_vector, bytes_len, bytes_to_vector}
+use stdlib/channel.{Channel, ChannelDrained, ChannelReceive, ChannelReceived, ChannelSendAccepted, ChannelSendClosed, channel_capacity, channel_receive, channel_send}
+use stdlib/dns.{DnsResolve, dns_numeric_candidates}
+use stdlib/drop.{Drop}
+use stdlib/fail.{Fail}
+use stdlib/http.{Http11, HttpGet, HttpHeader, HttpHeaders, HttpMethod, HttpPost, HttpRequestHead, HttpResponseHead, http_default_limits, http_field_name_parse, http_header, http_headers_append, http_headers_empty, http_headers_len, http_method_text, http_request_head_new, http_request_method, http_request_target, http_request_target_bytes, http_request_target_parse, http_response_head_new, http_response_status, http_status, http_status_code}
+use stdlib/http_endpoint.{HttpClient, HttpClientRequestFailed, HttpClientRequestReady, HttpClientResponseFailed, HttpClientResponseReady, HttpClientUpgradeFailed, HttpClientUpgradeReady, HttpServer, HttpServerAcceptFailed, HttpServerListenFailed, HttpServerListening, HttpServerPersistentRequestFailed, HttpServerPersistentRequestReady, HttpServerRequestReady, HttpServerResponseFailed, HttpServerResponseReady, HttpServerUpgradeFailed, HttpServerUpgradeReady, http_client_begin, http_client_response, http_client_reuse, http_client_upgrade, http_client_with_tls, http_server_accept, http_server_listen, http_server_listener_close, http_server_request, http_server_respond, http_server_upgrade, http_server_with_tls}
+use stdlib/http_json.{HttpJsonBodyStopped, HttpJsonCloseFailed, HttpJsonReadFailed, HttpJsonReaderReady, HttpJsonReaderRejected, HttpJsonReady, HttpJsonReadyClosed, HttpJsonStopped, HttpJsonStoppedClosed, HttpJsonWriteRejected, HttpJsonWriteStopped, HttpJsonWritten, http_json_document_trailers, http_json_document_value, http_json_read, http_json_reader, http_json_write}
+use stdlib/http_stream.{HttpBodyFinishCloseFailed, HttpBodyFinishFailed, HttpBodyFinished, HttpBodyFinishedClosed, HttpBodyIO, HttpBodyReadCloseFailed, HttpBodyReadData, HttpBodyReadEnd, HttpBodyReadEndClosed, HttpBodyReadFailed, HttpBodyStream, HttpBodyWriteFailed, HttpBodyWrote, HttpConnection, http_body_finish, http_body_read, http_body_write, http_connection_close}
+use stdlib/http_transport.{HttpTransportIO, HttpTransportRelease}
+use stdlib/json.{Json, json_string, json_string_value, json_stringify}
+use stdlib/net_address.{IpV4, SocketAddress, SocketV4, SocketV6, ipv4_address}
+use stdlib/num.{num_u16_to_u64}
+use stdlib/result.{Err, Ok, Result, result_err, result_ok}
+use stdlib/secure_random.{SecureRandom}
+use stdlib/spawn as spawn
+use stdlib/sse.{sse_default_limits, sse_event, sse_event_data}
+use stdlib/sse_stream.{SseStreamEnd, SseStreamEndClosed, SseStreamEvent, SseStreamReadFailed, SseStreamStopped, SseStreamWriteRejected, SseStreamWriteStopped, SseStreamWritten, sse_reader, sse_reader_next, sse_writer, sse_writer_finish, sse_writer_write_event}
+use stdlib/string.{int_to_str, str_concat}
+use stdlib/tcp.{TcpConnect, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO, tcp_listen_options}
+use stdlib/time.{Time}
+use stdlib/tls_stream.{TlsStream}
+use stdlib/url.{url_parse}
+use stdlib/vector.{vector_get_in_bounds, vector_len, vector_push, vector_with_capacity}
+use stdlib/vector_type.{Vector}
+use stdlib/websocket.{WebSocketClientUpgrade, WebSocketClose, WebSocketControlClose, WebSocketControlContent, WebSocketText, WebSocketTextContent, websocket_client_upgrade, websocket_client_upgrade_headers, websocket_close, websocket_default_limits}
+use stdlib/websocket_stream.{WebSocketStreamControl, WebSocketStreamFrame, WebSocketStreamFrameReadFailed, WebSocketStreamFrameStopped, WebSocketStreamOpen, WebSocketStreamOpenFailed, WebSocketStreamPayload, WebSocketStreamPayloadEnd, WebSocketStreamPayloadReadFailed, WebSocketStreamPayloadRejected, WebSocketStreamPayloadStopped, WebSocketStreamWriteRejected, WebSocketStreamWriteStopped, WebSocketStreamWrote, WebSocketFrameStream, WebSocketServerAccept, WebSocketStream, websocket_client_stream, websocket_client_write_close, websocket_client_write_frame, websocket_frame_read, websocket_server_accept, websocket_server_accept_headers, websocket_server_stream, websocket_server_write_close, websocket_server_write_frame, websocket_stream_close, websocket_stream_next}
+
+type HttpsExampleBody {
+  HttpsExampleBodyReady(owned HttpConnection<TlsStream>, Bytes, HttpHeaders),
+    HttpsExampleBodyFailed(i64)
+}
+
+type HttpsExampleFrame {
+  HttpsExampleFrameReady(owned WebSocketStream<TlsStream>, Bytes),
+    HttpsExampleFrameFailed(i64)
+}
+
+fn https_example_header(name: str, value: str) -> HttpHeader {
+  http_header(http_field_name_parse(name).unwrap(), bytes_from_str(value)).unwrap()
+}
+
+fn https_example_headers(name: str, value: str) -> HttpHeaders {
+  http_headers_append(http_headers_empty(), https_example_header(name, value))
+}
+
+fn https_example_append(output: Vector<u8>, data: Bytes) -> nil {
+  let values = bytes_to_vector(data)
+  for index in 0..vector_len<u8>(values) {
+    vector_push<u8>(output, vector_get_in_bounds<u8>(values, index))
+  }
+}
+
+fn https_example_collect(
+  stream: owned HttpBodyStream<TlsStream>
+) -[HttpBodyIO<TlsStream>, HttpTransportRelease<TlsStream>]> HttpsExampleBody {
+  let output = vector_with_capacity<u8>(32)
+  let mut current: owned HttpBodyStream<TlsStream> = stream
+  loop {
+    match http_body_read(current, __i64_to_usize(3)) {
+      HttpBodyReadData(returned, data) -> {
+        https_example_append(output, data)
+        current = returned
+      }
+      HttpBodyReadEnd(connection, trailers) -> break (HttpsExampleBodyReady(
+        connection,
+        bytes_from_vector(output),
+        trailers
+      ))
+      HttpBodyReadEndClosed(trailers) -> break (HttpsExampleBodyFailed(1))
+      HttpBodyReadFailed(returned, error) -> {
+        let dropped = returned.drop()
+        break (HttpsExampleBodyFailed(2))
+      }
+      HttpBodyReadCloseFailed(error) -> break (HttpsExampleBodyFailed(3))
+    }
+  }
+}
+
+fn https_example_write(
+  stream: owned HttpBodyStream<TlsStream>,
+  data: Bytes,
+  code: i64
+) -[HttpBodyIO<TlsStream>, HttpTransportRelease<TlsStream>, Fail<i64>]> owned HttpBodyStream<TlsStream> {
+  match http_body_write(stream, data) {
+    HttpBodyWrote(returned, count) -> if __u64_to_i64(__usize_to_u64(count)) == bytes_len(data) {
+      returned
+    } else {
+      let dropped = returned.drop()
+      result_err<owned HttpBodyStream<TlsStream>, i64>(code)?
+    }
+    HttpBodyWriteFailed(returned, error) -> {
+      let dropped = returned.drop()
+      result_err<owned HttpBodyStream<TlsStream>, i64>(code)?
+    }
+  }
+}
+
+fn https_example_finish(
+  stream: owned HttpBodyStream<TlsStream>,
+  code: i64
+) -[HttpBodyIO<TlsStream>, HttpTransportRelease<TlsStream>, Fail<i64>]> owned HttpConnection<TlsStream> {
+  match http_body_finish(stream, http_headers_empty()) {
+    HttpBodyFinished(connection) -> connection
+    HttpBodyFinishedClosed -> result_err<owned HttpConnection<TlsStream>, i64>(code)?
+    HttpBodyFinishFailed(returned, error) -> {
+      let dropped = returned.drop()
+      result_err<owned HttpConnection<TlsStream>, i64>(code)?
+    }
+    HttpBodyFinishCloseFailed(error) -> result_err<owned HttpConnection<TlsStream>, i64>(code)?
+  }
+}
+
+fn https_example_close(
+  connection: owned HttpConnection<TlsStream>,
+  code: i64
+) -[HttpBodyIO<TlsStream>, HttpTransportRelease<TlsStream>, Fail<i64>]> nil {
+  match http_connection_close(connection) {
+    Ok(done) -> nil
+    Err(error) -> Fail<i64>.fail(code)
+  }
+}
+
+fn https_example_port(address: SocketAddress) -> u16 {
+  match address {
+    SocketV4(host, port) -> port
+    SocketV6(host, port, scope) -> port
+  }
+}
+
+fn https_example_url(port: u16, path: str) -> str {
+  str_concat(
+    "https://localhost:",
+    str_concat(int_to_str(__u64_to_i64(num_u16_to_u64(port))), path)
+  )
+}
+
+fn https_example_authority(port: u16) -> str {
+  str_concat("localhost:", int_to_str(__u64_to_i64(num_u16_to_u64(port))))
+}
+
+fn https_example_request(
+  method: HttpMethod,
+  path: str,
+  port: u16,
+  content_length: str
+) -> HttpRequestHead {
+  let headers = http_headers_append(
+    https_example_headers("Host", https_example_authority(port)),
+    https_example_header("Content-Length", content_length)
+  )
+  http_request_head_new(
+    method,
+    http_request_target_parse(path).unwrap(),
+    Http11,
+    headers,
+    http_default_limits()
+  ).unwrap()
+}
+
+fn https_example_json_request(port: u16, content_length: str) -> HttpRequestHead {
+  let headers = http_headers_append(
+    http_headers_append(
+      https_example_headers("Host", https_example_authority(port)),
+      https_example_header("Content-Length", content_length)
+    ),
+    https_example_header("Content-Type", "application/json")
+  )
+  http_request_head_new(
+    HttpPost,
+    http_request_target_parse("/json").unwrap(),
+    Http11,
+    headers,
+    http_default_limits()
+  ).unwrap()
+}
+
+fn https_example_validate_request(
+  head: HttpRequestHead,
+  method: str,
+  path: str
+) -> bool {
+  http_method_text(http_request_method(head)) == method and
+    bytes_equal(http_request_target_bytes(http_request_target(head)), bytes_from_str(path))
+}
+
+fn https_example_client_json(
+  port: u16
+) -[HttpClient<TlsStream>, HttpBodyIO<TlsStream>, HttpTransportRelease<TlsStream>, Fail<i64>]> owned HttpConnection<TlsStream> {
+  let value = json_string("hello Ω")
+  let document = json_stringify(value)
+  let request = https_example_json_request(port, int_to_str(bytes_len(bytes_from_str(document))))
+  match http_client_begin<TlsStream>(
+    url_parse(https_example_url(port, "/json")).unwrap(),
+    request,
+    http_default_limits()
+  ) {
+    HttpClientRequestFailed(error) -> result_err<owned HttpConnection<TlsStream>, i64>(10)?
+    HttpClientRequestReady(body) -> match http_json_write(body, value) {
+      HttpJsonWriteRejected(returned, error) -> {
+        let dropped = returned.drop()
+        result_err<owned HttpConnection<TlsStream>, i64>(11)?
+      }
+      HttpJsonWriteStopped(returned, error) -> {
+        let dropped = returned.drop()
+        result_err<owned HttpConnection<TlsStream>, i64>(11)?
+      }
+      HttpJsonWritten(wrote) -> {
+        let connection = https_example_finish(wrote, 12)
+      match http_client_response(connection, HttpPost, http_default_limits()) {
+        HttpClientResponseFailed(error) -> result_err<owned HttpConnection<TlsStream>, i64>(13)?
+        HttpClientResponseReady(head, response_body) -> match http_json_reader(response_body, 4096) {
+          HttpJsonReaderReady(reader) -> match http_json_read(reader) {
+            HttpJsonReady(returned, document) -> if http_status_code(
+              http_response_status(head)
+            ) == 200 and http_headers_len(http_json_document_trailers(document)) == 0 and
+              json_string_value(http_json_document_value(document), "") == "echo hello Ω" {
+              returned
+            } else {
+              https_example_close(returned, 19)
+              result_err<owned HttpConnection<TlsStream>, i64>(19)?
+            }
+            _ -> result_err<owned HttpConnection<TlsStream>, i64>(18)?
+          }
+          _ -> result_err<owned HttpConnection<TlsStream>, i64>(17)?
+        }
+      }
+      }
+    }
+  }
+}
+
+fn https_example_client_sse(
+  connection: owned HttpConnection<TlsStream>,
+  port: u16
+) -[HttpClient<TlsStream>, HttpBodyIO<TlsStream>, HttpTransportRelease<TlsStream>, Fail<i64>]> owned HttpConnection<TlsStream> {
+  let request = https_example_request(HttpGet, "/events", port, "0")
+  match http_client_reuse(
+    url_parse(https_example_url(port, "/events")).unwrap(),
+    connection,
+    request,
+    http_default_limits()
+  ) {
+    HttpClientRequestFailed(error) -> result_err<owned HttpConnection<TlsStream>, i64>(20)?
+    HttpClientRequestReady(body) -> {
+      let ready = https_example_finish(body, 21)
+      match http_client_response(ready, HttpGet, http_default_limits()) {
+        HttpClientResponseFailed(error) -> result_err<owned HttpConnection<TlsStream>, i64>(22)?
+        HttpClientResponseReady(head, response_body) -> match sse_reader_next(
+          sse_reader(response_body, sse_default_limits())
+        ) {
+          SseStreamEvent(reader, event) -> if sse_event_data(event) != "stream Ω" {
+            let dropped = reader.drop()
+            result_err<owned HttpConnection<TlsStream>, i64>(23)?
+          } else { match sse_reader_next(reader) {
+              SseStreamEnd(returned, reconnect, trailers) -> if http_headers_len(trailers) == 0 {
+                returned
+              } else {
+                https_example_close(returned, 24)
+                result_err<owned HttpConnection<TlsStream>, i64>(24)?
+              }
+              _ -> result_err<owned HttpConnection<TlsStream>, i64>(25)?
+            } }
+          SseStreamEnd(returned, reconnect, trailers) -> {
+            https_example_close(returned, 26)
+            result_err<owned HttpConnection<TlsStream>, i64>(26)?
+          }
+          _ -> result_err<owned HttpConnection<TlsStream>, i64>(27)?
+        }
+      }
+    }
+  }
+}
+
+fn https_example_upgrade_request(
+  port: u16,
+  upgrade: WebSocketClientUpgrade
+) -> HttpRequestHead {
+  let headers = http_headers_append(
+    websocket_client_upgrade_headers(upgrade),
+    https_example_header("Host", https_example_authority(port))
+  )
+  http_request_head_new(
+    HttpGet,
+    http_request_target_parse("/echo").unwrap(),
+    Http11,
+    headers,
+    http_default_limits()
+  ).unwrap()
+}
+
+fn https_example_frame_data(
+  frame: owned WebSocketFrameStream<TlsStream>
+) -[HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>]> HttpsExampleFrame {
+  let output = vector_with_capacity<u8>(16)
+  let mut current: owned WebSocketFrameStream<TlsStream> = frame
+  loop {
+    match websocket_frame_read(current, __i64_to_usize(3)) {
+      WebSocketStreamPayload(returned, data) -> {
+        https_example_append(output, data)
+        current = returned
+      }
+      WebSocketStreamPayloadEnd(stream, data) -> {
+        https_example_append(output, data)
+        break (HttpsExampleFrameReady(stream, bytes_from_vector(output)))
+      }
+      WebSocketStreamControl(stream, control) -> {
+        let dropped = stream.drop()
+        break (HttpsExampleFrameFailed(1))
+      }
+      WebSocketStreamPayloadReadFailed(returned, error) -> {
+        let dropped = returned.drop()
+        break (HttpsExampleFrameFailed(2))
+      }
+      WebSocketStreamPayloadRejected(returned, error) -> {
+        let dropped = returned.drop()
+        break (HttpsExampleFrameFailed(3))
+      }
+      WebSocketStreamPayloadStopped(returned, error) -> {
+        let dropped = returned.drop()
+        break (HttpsExampleFrameFailed(4))
+      }
+    }
+  }
+}
+
+fn https_example_client_websocket(
+  connection: owned HttpConnection<TlsStream>,
+  port: u16
+) -[HttpClient<TlsStream>, HttpBodyIO<TlsStream>, HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, SecureRandom, Fail<i64>]> nil {
+  let upgrade = websocket_client_upgrade().unwrap()
+  match http_client_reuse(
+    url_parse(https_example_url(port, "/echo")).unwrap(),
+    connection,
+    https_example_upgrade_request(port, upgrade),
+    http_default_limits()
+  ) {
+    HttpClientRequestFailed(error) -> Fail<i64>.fail(30)
+    HttpClientRequestReady(body) -> {
+      let ready = https_example_finish(body, 31)
+      match http_client_upgrade(ready, HttpGet, http_default_limits()) {
+        HttpClientUpgradeFailed(error) -> Fail<i64>.fail(32)
+        HttpClientUpgradeReady(response, raw) -> match websocket_client_stream(
+          raw,
+          upgrade,
+          response,
+          websocket_default_limits()
+        ) {
+          WebSocketStreamOpenFailed(returned, error) -> {
+            let dropped = returned.drop()
+            Fail<i64>.fail(33)
+          }
+          WebSocketStreamOpen(stream) -> match websocket_client_write_frame(
+            stream,
+            true,
+            WebSocketText,
+            bytes_from_str("echo Ω")
+          ) {
+            WebSocketStreamWriteRejected(returned, error) -> {
+              let dropped = returned.drop()
+              Fail<i64>.fail(34)
+            }
+            WebSocketStreamWriteStopped(returned, error) -> {
+              let dropped = returned.drop()
+              Fail<i64>.fail(35)
+            }
+            WebSocketStreamWrote(waiting) -> match websocket_stream_next(waiting) {
+              WebSocketStreamFrameReadFailed(returned, error) -> {
+                let dropped = returned.drop()
+                Fail<i64>.fail(36)
+              }
+              WebSocketStreamFrameStopped(returned, error) -> {
+                let dropped = returned.drop()
+                Fail<i64>.fail(37)
+              }
+              WebSocketStreamFrame(frame, header, WebSocketTextContent) -> match https_example_frame_data(frame) {
+                HttpsExampleFrameFailed(code) -> Fail<i64>.fail(38 + code)
+                HttpsExampleFrameReady(returned, payload) -> if not bytes_equal(
+                  payload,
+                  bytes_from_str("echo Ω")
+                ) {
+                  let dropped = returned.drop()
+                  Fail<i64>.fail(43)
+                } else { match websocket_client_write_close(
+                    returned,
+                    websocket_close(1000, "done").unwrap()
+                  ) {
+                    WebSocketStreamWriteRejected(rejected, error) -> {
+                      let dropped = rejected.drop()
+                      Fail<i64>.fail(44)
+                    }
+                    WebSocketStreamWriteStopped(stopped, error) -> {
+                      let dropped = stopped.drop()
+                      Fail<i64>.fail(45)
+                    }
+                    WebSocketStreamWrote(closing) -> match websocket_stream_next(closing) {
+                      WebSocketStreamFrame(frame, header, WebSocketControlContent) -> match websocket_frame_read(
+                        frame,
+                        __i64_to_usize(16)
+                      ) {
+                        WebSocketStreamControl(done, WebSocketControlClose(close)) -> match websocket_stream_close(done) {
+                          Ok(closed) -> nil
+                          Err(error) -> Fail<i64>.fail(46)
+                        }
+                        _ -> Fail<i64>.fail(47)
+                      }
+                      _ -> Fail<i64>.fail(48)
+                    }
+                  } }
+              }
+              _ -> Fail<i64>.fail(49)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+}
+
+fn https_example_client(
+  port: u16
+) -[HttpClient<TlsStream>, HttpBodyIO<TlsStream>, HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, SecureRandom, Fail<i64>]> i64 {
+  let after_json = https_example_client_json(port)
+  let after_sse = https_example_client_sse(after_json, port)
+  https_example_client_websocket(after_sse, port)
+  1
+}
+
+fn https_example_server_json(
+  head: HttpRequestHead,
+  body: owned HttpBodyStream<TlsStream>
+) -[HttpServer, HttpBodyIO<TlsStream>, HttpTransportRelease<TlsStream>, Fail<i64>]> owned HttpConnection<TlsStream> {
+  if not https_example_validate_request(head, "POST", "/json") {
+    let dropped = body.drop()
+    result_err<owned HttpConnection<TlsStream>, i64>(60)?
+  } else { match http_json_reader(body, 4096) {
+    HttpJsonReaderRejected(returned, error) -> {
+      let dropped = returned.drop()
+      result_err<owned HttpConnection<TlsStream>, i64>(61)?
+    }
+    HttpJsonReaderReady(reader) -> match http_json_read(reader) {
+      HttpJsonReadFailed(returned, error) -> {
+        let dropped = returned.drop()
+        result_err<owned HttpConnection<TlsStream>, i64>(62)?
+      }
+      HttpJsonBodyStopped(returned, error) -> {
+        let dropped = returned.drop()
+        result_err<owned HttpConnection<TlsStream>, i64>(63)?
+      }
+      HttpJsonReadyClosed(document) -> result_err<owned HttpConnection<TlsStream>, i64>(64)?
+      HttpJsonStoppedClosed(failure) -> result_err<owned HttpConnection<TlsStream>, i64>(64)?
+      HttpJsonCloseFailed(error) -> result_err<owned HttpConnection<TlsStream>, i64>(64)?
+      HttpJsonStopped(connection, failure) -> {
+        https_example_close(connection, 64)
+        result_err<owned HttpConnection<TlsStream>, i64>(64)?
+      }
+      HttpJsonReady(connection, document) -> {
+        let request = json_string_value(http_json_document_value(document), "")
+        if http_headers_len(http_json_document_trailers(document)) != 0 or request != "hello Ω" {
+          https_example_close(connection, 65)
+          result_err<owned HttpConnection<TlsStream>, i64>(65)?
+        } else {
+          let headers = http_headers_append(
+            https_example_headers("Transfer-Encoding", "chunked"),
+            https_example_header("Content-Type", "application/json")
+          )
+          let response = http_response_head_new(
+            HttpPost,
+            Http11,
+            http_status(200).unwrap(),
+            bytes_from_str("OK"),
+            headers,
+            http_default_limits()
+          ).unwrap()
+          match http_server_respond(connection, response, http_default_limits()) {
+            HttpServerResponseFailed(error) -> result_err<owned HttpConnection<TlsStream>, i64>(66)?
+            HttpServerResponseReady(response_body) -> match http_json_write(
+              response_body,
+              json_string(str_concat("echo ", request))
+            ) {
+              HttpJsonWriteRejected(returned, error) -> {
+                let dropped = returned.drop()
+                result_err<owned HttpConnection<TlsStream>, i64>(67)?
+              }
+              HttpJsonWriteStopped(returned, error) -> {
+                let dropped = returned.drop()
+                result_err<owned HttpConnection<TlsStream>, i64>(68)?
+              }
+              HttpJsonWritten(wrote) -> https_example_finish(wrote, 69)
+            }
+          }
+        }
+      }
+    }
+  } }
+}
+
+fn https_example_server_sse(
+  connection: owned HttpConnection<TlsStream>
+) -[HttpServer, HttpBodyIO<TlsStream>, HttpTransportRelease<TlsStream>, Fail<i64>]> owned HttpConnection<TlsStream> {
+  match http_server_request(connection, http_default_limits()) {
+    HttpServerPersistentRequestFailed(error) -> result_err<owned HttpConnection<TlsStream>, i64>(70)?
+    HttpServerPersistentRequestReady(head, body) -> match https_example_collect(body) {
+      HttpsExampleBodyFailed(code) -> result_err<owned HttpConnection<TlsStream>, i64>(71 + code)?
+      HttpsExampleBodyReady(returned, bytes, trailers) -> if not https_example_validate_request(
+        head,
+        "GET",
+        "/events"
+      ) or bytes_len(bytes) != 0 {
+        https_example_close(returned, 75)
+        result_err<owned HttpConnection<TlsStream>, i64>(75)?
+      } else {
+        let headers = http_headers_append(
+          https_example_headers("Transfer-Encoding", "chunked"),
+          https_example_header("Content-Type", "text/event-stream")
+        )
+        let response = http_response_head_new(
+          HttpGet,
+          Http11,
+          http_status(200).unwrap(),
+          bytes_from_str("OK"),
+          headers,
+          http_default_limits()
+        ).unwrap()
+        match http_server_respond(returned, response, http_default_limits()) {
+          HttpServerResponseFailed(error) -> result_err<owned HttpConnection<TlsStream>, i64>(76)?
+          HttpServerResponseReady(response_body) -> match sse_writer_write_event(
+            sse_writer(response_body),
+            sse_event("message", "stream Ω", "1").unwrap()
+          ) {
+            SseStreamWriteRejected(rejected, error) -> {
+              let dropped = rejected.drop()
+              result_err<owned HttpConnection<TlsStream>, i64>(77)?
+            }
+            SseStreamWriteStopped(stopped, error) -> {
+              let dropped = stopped.drop()
+              result_err<owned HttpConnection<TlsStream>, i64>(78)?
+            }
+            SseStreamWritten(writer) -> match sse_writer_finish(writer, http_headers_empty()) {
+              HttpBodyFinished(done) -> done
+              HttpBodyFinishedClosed -> result_err<owned HttpConnection<TlsStream>, i64>(79)?
+              HttpBodyFinishFailed(failed, error) -> {
+                let dropped = failed.drop()
+                result_err<owned HttpConnection<TlsStream>, i64>(80)?
+              }
+              HttpBodyFinishCloseFailed(error) -> result_err<owned HttpConnection<TlsStream>, i64>(81)?
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn https_example_server_websocket(
+  connection: owned HttpConnection<TlsStream>
+) -[HttpServer, HttpBodyIO<TlsStream>, HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, Fail<i64>]> nil {
+  match http_server_request(connection, http_default_limits()) {
+    HttpServerPersistentRequestFailed(error) -> Fail<i64>.fail(90)
+    HttpServerPersistentRequestReady(head, body) -> match https_example_collect(body) {
+      HttpsExampleBodyFailed(code) -> Fail<i64>.fail(91 + code)
+      HttpsExampleBodyReady(returned, bytes, trailers) -> if bytes_len(bytes) != 0 or
+        not https_example_validate_request(head, "GET", "/echo") {
+        https_example_close(returned, 95)
+        Fail<i64>.fail(95)
+      } else { match websocket_server_accept(head) {
+          Err(error) -> {
+            https_example_close(returned, 96)
+            Fail<i64>.fail(96)
+          }
+          Ok(accept) -> {
+            let response = http_response_head_new(
+              HttpGet,
+              Http11,
+              http_status(101).unwrap(),
+              bytes_from_str("Switching Protocols"),
+              websocket_server_accept_headers(accept),
+              http_default_limits()
+            ).unwrap()
+            match http_server_upgrade(returned, response) {
+              HttpServerUpgradeFailed(error) -> Fail<i64>.fail(97)
+              HttpServerUpgradeReady(raw) -> {
+                let stream = websocket_server_stream(raw, accept, websocket_default_limits())
+                match websocket_stream_next(stream) {
+                  WebSocketStreamFrameReadFailed(failed, error) -> {
+                    let dropped = failed.drop()
+                    Fail<i64>.fail(98)
+                  }
+                  WebSocketStreamFrameStopped(stopped, error) -> {
+                    let dropped = stopped.drop()
+                    Fail<i64>.fail(99)
+                  }
+                  WebSocketStreamFrame(frame, header, WebSocketTextContent) -> match https_example_frame_data(frame) {
+                    HttpsExampleFrameFailed(code) -> Fail<i64>.fail(100 + code)
+                    HttpsExampleFrameReady(echo, payload) -> match websocket_server_write_frame(
+                      echo,
+                      true,
+                      WebSocketText,
+                      payload
+                    ) {
+                      WebSocketStreamWriteRejected(rejected, error) -> {
+                        let dropped = rejected.drop()
+                        Fail<i64>.fail(105)
+                      }
+                      WebSocketStreamWriteStopped(stopped, error) -> {
+                        let dropped = stopped.drop()
+                        Fail<i64>.fail(106)
+                      }
+                      WebSocketStreamWrote(waiting) -> match websocket_stream_next(waiting) {
+                        WebSocketStreamFrame(close_frame, close_header, WebSocketControlContent) -> match websocket_frame_read(
+                          close_frame,
+                          __i64_to_usize(16)
+                        ) {
+                          WebSocketStreamControl(closing, WebSocketControlClose(close)) -> match websocket_server_write_close(
+                            closing,
+                            close
+                          ) {
+                            WebSocketStreamWriteRejected(rejected, error) -> {
+                              let dropped = rejected.drop()
+                              Fail<i64>.fail(107)
+                            }
+                            WebSocketStreamWriteStopped(stopped, error) -> {
+                              let dropped = stopped.drop()
+                              Fail<i64>.fail(108)
+                            }
+                            WebSocketStreamWrote(done) -> match websocket_stream_close(done) {
+                              Ok(closed) -> nil
+                              Err(error) -> Fail<i64>.fail(109)
+                            }
+                          }
+                          _ -> Fail<i64>.fail(110)
+                        }
+                        _ -> Fail<i64>.fail(111)
+                      }
+                    }
+                    }
+                    _ -> Fail<i64>.fail(112)
+                  }
+                }
+              }
+            }
+          }
+        } }
+    }
+  }
+}
+
+fn https_example_server(
+) -[Channel<SocketAddress>, HttpServer, HttpBodyIO<TlsStream>, HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, TcpListenerIO, Fail<i64>]> i64 {
+  match http_server_listen(
+    SocketV4(ipv4_address(127, 0, 0, 1), 0),
+    tcp_listen_options(__i64_to_usize(8))
+  ) {
+    HttpServerListenFailed(error) -> Fail<i64>.fail(120)
+    HttpServerListening(listener, address) -> match channel_send<SocketAddress>(address) {
+      ChannelSendClosed(returned) -> {
+        let closed = http_server_listener_close(listener)
+        Fail<i64>.fail(121)
+      }
+      ChannelSendAccepted -> match http_server_accept(listener, http_default_limits()) {
+        HttpServerAcceptFailed(returned, error) -> {
+          let closed = http_server_listener_close(returned)
+          Fail<i64>.fail(122)
+        }
+        HttpServerRequestReady(returned, head, body) -> {
+          match http_server_listener_close(returned) {
+            Err(error) -> Fail<i64>.fail(123)
+            Ok(done) -> nil
+          }
+          let after_json = https_example_server_json(head, body)
+          let after_sse = https_example_server_sse(after_json)
+          https_example_server_websocket(after_sse)
+          1
+        }
+      }
+    }
+  }
+}
+
+fn https_example_server_tls(
+  certificate: Bytes,
+  private_key: Bytes
+) -[Channel<SocketAddress>, SecureRandom, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO]> i64 {
+  handle http_server_with_tls(certificate, private_key, https_example_server) {
+    Fail<i64>.fail(code) -> code
+  }
+}
+
+fn https_example_client_tls(
+  trust_roots: Bytes,
+  port: u16
+) -[DnsResolve, SecureRandom, TcpConnect, TcpReadiness, TcpStreamIO, Time]> i64 {
+  handle http_client_with_tls(trust_roots, () => https_example_client(port)) {
+    Fail<i64>.fail(code) -> code
+  }
+}
+
+fn https_example_client_task(
+  trust_roots: Bytes
+) -[Channel<SocketAddress>, SecureRandom, TcpConnect, TcpReadiness, TcpStreamIO, Time]> i64 {
+  match channel_receive<SocketAddress>() {
+    ChannelDrained -> 130
+    ChannelReceived(address) -> handle https_example_client_tls(
+      trust_roots,
+      https_example_port(address)
+    ) {
+      DnsResolve.resolve(host, port, family) -> resume(dns_numeric_candidates(
+        IpV4(ipv4_address(127, 0, 0, 1)),
+        port,
+        family
+      ))
+    }
+  }
+}
+
+fn https_example_concurrent(
+  trust_roots: Bytes,
+  certificate: Bytes,
+  private_key: Bytes
+) -[Channel<SocketAddress>, SecureRandom, TcpConnect, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO, Time, spawn.Spawn]> i64 {
+  let server = spawn.spawn(() => https_example_server_tls(certificate, private_key))
+  let client = spawn.spawn(() => https_example_client_task(trust_roots))
+  let server_status = spawn.join(server)
+  let client_status = spawn.join(client)
+  if server_status == 1 and client_status == 1 { 0 }
+  else { if server_status != 1 { server_status } else { client_status } }
+}
+
+--- Run the local authenticated JSON, SSE and WebSocket product exercise.
+pub fn https_json_streams_run(
+  trust_roots: Bytes,
+  certificate: Bytes,
+  private_key: Bytes
+) -[SecureRandom, TcpConnect, TcpListen, TcpListenerIO, TcpStreamIO]> i64 {
+  spawn.with_event_loop_channel(
+    channel_capacity<SocketAddress>(__i64_to_usize(1)).unwrap(),
+    () => https_example_concurrent(trust_roots, certificate, private_key)
+  )
+}

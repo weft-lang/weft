@@ -53,10 +53,10 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 **Self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root.
 
-- 4259 runtime test blocks across 342 files, plus 819 negative (must-fail) cases
+- 4277 runtime test blocks across 345 files, plus 823 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
-- Current work: the public-alpha product gate—validated TLS/HTTP streaming and signed release/install UX
+- Current work: the public-alpha release close—two-target install/release UX, signing, platform diagnostics, and hardening
 
 ## Quick Start
 

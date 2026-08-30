@@ -1,0 +1,264 @@
+-- stdlib/http_json.weft — bounded JSON documents over owned HTTP bodies
+--
+-- JSON is one complete semantic document, so this adapter explicitly buffers
+-- up to a caller-selected bound. HTTP framing, transport retry and connection
+-- ownership remain visible in the result variants.
+
+use stdlib/bytes.{Bytes, Utf8Error, bytes_concat, bytes_copy_range, bytes_empty, bytes_from_str, bytes_len, bytes_to_utf8}
+use stdlib/drop.{Drop}
+use stdlib/http.{HttpHeaders}
+use stdlib/http_stream.{HttpBodyError, HttpBodyIO, HttpBodyReadCloseFailed, HttpBodyReadData, HttpBodyReadEnd, HttpBodyReadEndClosed, HttpBodyReadFailed, HttpBodyStream, HttpBodyWriteFailed, HttpBodyWrote, HttpConnection, http_body_read, http_body_write}
+use stdlib/http_transport.{HttpTransportRelease}
+use stdlib/json.{Json, JsonStringifyErr, JsonStringifyOk, json_parse, json_result_ok, json_result_pos, json_result_value, json_stringify_checked}
+use stdlib/result.{Err, Ok}
+
+type HttpJsonReaderState {
+  limit: i64,
+    data: Bytes
+}
+
+type HttpJsonDocumentParts {
+  value: Json,
+    trailers: HttpHeaders
+}
+
+type HttpJsonFailureParts {
+  error: HttpJsonError,
+    trailers: HttpHeaders
+}
+
+--- One bounded JSON document reader over an exact HTTP body owner.
+pub type HttpJsonReader<S> = opaque(owned HttpBodyStream<S>, HttpJsonReaderState)
+
+--- One parsed JSON value joined to its exact HTTP trailers.
+pub type HttpJsonDocument = opaque HttpJsonDocumentParts
+
+--- One terminal JSON semantic failure joined to its exact HTTP trailers.
+pub type HttpJsonFailure = opaque HttpJsonFailureParts
+
+--- A JSON document policy or semantic failure.
+pub type HttpJsonError {
+  --- The selected whole-document byte limit was not positive.
+  HttpJsonInvalidLimit(i64),
+    --- The document exceeded the selected whole-document byte limit.
+    HttpJsonTooLarge(i64),
+    --- The complete HTTP body was not valid UTF-8.
+    HttpJsonInvalidUtf8(Utf8Error),
+    --- The complete UTF-8 body was not one JSON document.
+    HttpJsonInvalidDocument(i64),
+    --- The value contained a non-finite number forbidden by JSON.
+    HttpJsonNonFiniteNumber
+}
+
+--- Validation of a whole-document bound before JSON reading begins.
+pub type HttpJsonReaderOpen<S> {
+  --- The body owner and positive bound formed a JSON reader.
+  HttpJsonReaderReady(owned HttpJsonReader<S>),
+    --- The bound was rejected without consuming the HTTP body owner.
+    HttpJsonReaderRejected(owned HttpBodyStream<S>, HttpJsonError)
+}
+
+--- Completion, retry or semantic failure of one bounded JSON read.
+pub type HttpJsonReadOutcome<S> {
+  --- A document and trailers completed with a reusable connection.
+  HttpJsonReady(owned HttpConnection<S>, HttpJsonDocument),
+    --- A document and trailers completed after consuming the connection.
+    HttpJsonReadyClosed(HttpJsonDocument),
+    --- Transport I/O failed and preserved the reader and accumulated prefix.
+    HttpJsonReadFailed(owned HttpJsonReader<S>, HttpBodyError),
+    --- A bound failed before framing completed and returned the raw body.
+    HttpJsonBodyStopped(owned HttpBodyStream<S>, HttpJsonError),
+    --- JSON semantics failed after framing completed and preserved the connection.
+    HttpJsonStopped(owned HttpConnection<S>, HttpJsonFailure),
+    --- JSON semantics failed after framing consumed the connection.
+    HttpJsonStoppedClosed(HttpJsonFailure),
+    --- Authenticated close failed after the body boundary.
+    HttpJsonCloseFailed(HttpBodyError)
+}
+
+--- Completion or rejection of one complete JSON body write.
+pub type HttpJsonWriteOutcome<S> {
+  --- The complete JSON document was written and returned the body owner.
+  HttpJsonWritten(owned HttpBodyStream<S>),
+    --- JSON validation failed before any body byte was offered.
+    HttpJsonWriteRejected(owned HttpBodyStream<S>, HttpJsonError),
+    --- Body I/O failed after zero or more bytes and returned the raw body.
+    HttpJsonWriteStopped(owned HttpBodyStream<S>, HttpBodyError)
+}
+
+fn http_json_fragment_limit() -> i64 { 16384 }
+
+fn http_json_i64_to_usize(value: i64) -> usize {
+  __i64_to_usize(if value < 0 { 0 } else { value })
+}
+
+fn http_json_wrap<S>(
+  body: owned HttpBodyStream<S>,
+  limit: i64,
+  data: Bytes
+) -[HttpTransportRelease<S>]> owned HttpJsonReader<S> {
+  HttpJsonReader<S>((body, HttpJsonReaderState { limit: limit, data: data }))
+}
+
+fn http_json_document(value: Json, trailers: HttpHeaders) -> HttpJsonDocument {
+  HttpJsonDocument(HttpJsonDocumentParts { value: value, trailers: trailers })
+}
+
+fn http_json_failure(error: HttpJsonError, trailers: HttpHeaders) -> HttpJsonFailure {
+  HttpJsonFailure(HttpJsonFailureParts { error: error, trailers: trailers })
+}
+
+impl<S> Drop for HttpJsonReader<S> {
+  fn drop(self: HttpJsonReader<S>) -[HttpTransportRelease<S>]> i64 {
+    match self { HttpJsonReader((body, state)) -> body.drop() }
+  }
+}
+
+--- Join an HTTP body to a positive whole-document JSON byte bound.
+pub fn http_json_reader<S>(
+  body: owned HttpBodyStream<S>,
+  limit: i64
+) -[HttpTransportRelease<S>]> HttpJsonReaderOpen<S> {
+  if limit <= 0 {
+    HttpJsonReaderRejected<S>(body, HttpJsonInvalidLimit(limit))
+  } else {
+    HttpJsonReaderReady<S>(http_json_wrap<S>(body, limit, bytes_empty()))
+  }
+}
+
+--- Return the parsed value from a completed JSON document.
+pub fn http_json_document_value(document: HttpJsonDocument) -> Json {
+  match document { HttpJsonDocument(parts) -> parts.value }
+}
+
+--- Return the exact HTTP trailers from a completed JSON document.
+pub fn http_json_document_trailers(document: HttpJsonDocument) -> HttpHeaders {
+  match document { HttpJsonDocument(parts) -> parts.trailers }
+}
+
+--- Return the semantic error from a completed failed JSON document.
+pub fn http_json_failure_error(failure: HttpJsonFailure) -> HttpJsonError {
+  match failure { HttpJsonFailure(parts) -> parts.error }
+}
+
+--- Return the exact HTTP trailers from a completed failed JSON document.
+pub fn http_json_failure_trailers(failure: HttpJsonFailure) -> HttpHeaders {
+  match failure { HttpJsonFailure(parts) -> parts.trailers }
+}
+
+fn http_json_parse_open<S>(
+  connection: owned HttpConnection<S>,
+  data: Bytes,
+  trailers: HttpHeaders
+) -[HttpTransportRelease<S>]> HttpJsonReadOutcome<S> {
+  match bytes_to_utf8(data) {
+    Err(error) -> HttpJsonStopped<S>(connection, http_json_failure(HttpJsonInvalidUtf8(error), trailers))
+    Ok(text) -> {
+      let parsed = json_parse(text)
+      if json_result_ok(parsed) == 1 {
+        HttpJsonReady<S>(connection, http_json_document(json_result_value(parsed), trailers))
+      } else {
+        HttpJsonStopped<S>(connection, http_json_failure(
+          HttpJsonInvalidDocument(json_result_pos(parsed)),
+          trailers
+        ))
+      }
+    }
+  }
+}
+
+fn http_json_parse_closed<S>(data: Bytes, trailers: HttpHeaders) -> HttpJsonReadOutcome<S> {
+  match bytes_to_utf8(data) {
+    Err(error) -> HttpJsonStoppedClosed<S>(http_json_failure(HttpJsonInvalidUtf8(error), trailers))
+    Ok(text) -> {
+      let parsed = json_parse(text)
+      if json_result_ok(parsed) == 1 {
+        HttpJsonReadyClosed<S>(http_json_document(json_result_value(parsed), trailers))
+      } else {
+        HttpJsonStoppedClosed<S>(http_json_failure(
+          HttpJsonInvalidDocument(json_result_pos(parsed)),
+          trailers
+        ))
+      }
+    }
+  }
+}
+
+--- Read and parse one complete JSON document within its explicit byte bound.
+pub fn http_json_read<S>(
+  reader: owned HttpJsonReader<S>
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpJsonReadOutcome<S> {
+  let mut current: owned HttpJsonReader<S> = reader
+  loop {
+    match current {
+      HttpJsonReader((body, state)) -> {
+        let { limit, data } = state
+        let remaining = limit - bytes_len(data)
+        let requested = if remaining + 1 < http_json_fragment_limit() {
+          remaining + 1
+        } else {
+          http_json_fragment_limit()
+        }
+        match http_body_read<S>(body, http_json_i64_to_usize(requested)) {
+          HttpBodyReadData(returned, fragment) -> {
+            let next = bytes_concat(data, fragment)
+            if bytes_len(next) > limit {
+              break (HttpJsonBodyStopped<S>(returned, HttpJsonTooLarge(bytes_len(next))))
+            } else {
+              current = http_json_wrap<S>(returned, limit, next)
+            }
+          }
+          HttpBodyReadEnd(connection, trailers) -> break (http_json_parse_open<S>(
+            connection,
+            data,
+            trailers
+          ))
+          HttpBodyReadEndClosed(trailers) -> break (http_json_parse_closed<S>(data, trailers))
+          HttpBodyReadFailed(returned, error) -> break (HttpJsonReadFailed<S>(
+            http_json_wrap<S>(returned, limit, data),
+            error
+          ))
+          HttpBodyReadCloseFailed(error) -> break (HttpJsonCloseFailed<S>(error))
+        }
+      }
+    }
+  }
+}
+
+fn http_json_write_bytes<S>(
+  body: owned HttpBodyStream<S>,
+  wire: Bytes
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpJsonWriteOutcome<S> {
+  let total = bytes_len(wire)
+  let mut position = 0
+  let mut current: owned HttpBodyStream<S> = body
+  loop {
+    if position >= total {
+      break (HttpJsonWritten<S>(current))
+    } else {
+      let count = if total - position < http_json_fragment_limit() {
+        total - position
+      } else {
+        http_json_fragment_limit()
+      }
+      match http_body_write<S>(current, bytes_copy_range(wire, position, position + count)) {
+        HttpBodyWrote(returned, wrote) -> {
+          current = returned
+          position = position + __u64_to_i64(__usize_to_u64(wrote))
+        }
+        HttpBodyWriteFailed(returned, error) -> break (HttpJsonWriteStopped<S>(returned, error))
+      }
+    }
+  }
+}
+
+--- Validate and write one complete JSON document in bounded body fragments.
+pub fn http_json_write<S>(
+  body: owned HttpBodyStream<S>,
+  value: Json
+) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpJsonWriteOutcome<S> {
+  match json_stringify_checked(value) {
+    JsonStringifyErr -> HttpJsonWriteRejected<S>(body, HttpJsonNonFiniteNumber)
+    JsonStringifyOk(text) -> http_json_write_bytes<S>(body, bytes_from_str(text))
+  }
+}
