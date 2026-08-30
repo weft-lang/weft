@@ -21,12 +21,13 @@ WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-120}
 WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-120}
 # This is a per-process runaway-regression stop, not a memory scheduler or a
 # worker-count throttle. Whole-compiler test workers inherit a large
-# copy-on-write project image and legitimately report up to ~8.65 million KiB
-# max RSS; that figure cannot be summed across the fork tree without double
-# counting shared pages. The repaired structural-layout leak crossed 47 GiB
-# in one worker and left abandoned trees above 94 GiB. Keep generous headroom
-# above the bounded baseline while still terminating that failure mode live.
-WEFT_TEST_RUNAWAY_RSS_LIMIT_KB=${WEFT_TEST_RUNAWAY_RSS_LIMIT_KB:-16000000}
+# copy-on-write project image and legitimately report up to ~18.7 million KiB
+# max RSS on target-local Linux; that figure cannot be summed across the fork
+# tree without double counting shared pages. The repaired structural-layout
+# leak crossed 47 GiB in one worker and left abandoned trees above 94 GiB. Keep
+# generous headroom above the measured two-target baseline while still
+# terminating that failure mode live.
+WEFT_TEST_RUNAWAY_RSS_LIMIT_KB=${WEFT_TEST_RUNAWAY_RSS_LIMIT_KB:-24000000}
 WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB}
 WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB}
 WEFT_TEST_SHOW_TIMINGS=${WEFT_TEST_SHOW_TIMINGS:-1}

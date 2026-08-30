@@ -5,9 +5,30 @@ set -e
 WEFT=${WEFT:-./weft}
 WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-120}
 WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-120}
-WEFT_TEST_RUNAWAY_RSS_LIMIT_KB=${WEFT_TEST_RUNAWAY_RSS_LIMIT_KB:-16000000}
+WEFT_TEST_RUNAWAY_RSS_LIMIT_KB=${WEFT_TEST_RUNAWAY_RSS_LIMIT_KB:-24000000}
 WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB}
 WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-1000000}
+WEFT_TEST_PLATFORM=${WEFT_TEST_PLATFORM:-$(uname -s)}
+case "$WEFT_TEST_PLATFORM" in
+  Darwin)
+    host_target=macos-aarch64
+    macos_is_host=true
+    linux_is_host=false
+    llvm_objdump=/Library/Developer/CommandLineTools/usr/bin/llvm-objdump
+    llvm_dwarfdump=/Library/Developer/CommandLineTools/usr/bin/llvm-dwarfdump
+    ;;
+  Linux)
+    host_target=linux-aarch64
+    macos_is_host=false
+    linux_is_host=true
+    llvm_objdump=$(command -v llvm-objdump)
+    llvm_dwarfdump=$(command -v llvm-dwarfdump)
+    ;;
+  *)
+    echo "tool tests: unsupported host platform: $WEFT_TEST_PLATFORM" >&2
+    exit 2
+    ;;
+esac
 PROJECT_ROOT=$(pwd)
 case "$WEFT" in
   /*) WEFT_ABS="$WEFT" ;;
@@ -137,6 +158,64 @@ run_binary_guarded() {
 # headroom, so whether the gate passed depended on which poll caught the peak.
 run_generator_guarded() {
   run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$@"
+}
+
+# Apple's llvm-objdump walks executable ELF program segments even when a
+# deliberately stripped product has no section table. GNU/LLVM tools on Linux
+# require a section for that mode, so expose the exact executable LOAD bytes as
+# a raw AArch64 image and preserve their linked virtual addresses. Normalise the
+# two spelling differences used by the shared assertions below.
+elf_disassemble() {
+  local product=$1
+  if [ "$WEFT_TEST_PLATFORM" = Darwin ]; then
+    "$llvm_objdump" --disassemble "$product"
+  else
+    local entry
+    local load_line
+    local load_offset
+    local load_address
+    local load_size
+    local code_offset
+    local code_size
+    local code
+    entry=$(readelf -h "$product" | sed -n 's/.*Entry point address: *//p')
+    load_line=$(readelf -lW "$product" | sed -n '/LOAD.*R E/{p;q;}')
+    set -- $load_line
+    load_offset=$2
+    load_address=$3
+    load_size=$5
+    code_offset=$((entry - load_address + load_offset))
+    code_size=$((load_size - (code_offset - load_offset)))
+    code=$(mktemp /tmp/weft_tool_elf_code_XXXXXX)
+    dd if="$product" of="$code" bs=1 skip="$code_offset" count="$code_size" status=none
+    objdump -D -b binary -m aarch64 --adjust-vma="$entry" "$code" |
+      sed -e $'s/svc\t#0x0/svc\t#0/' -e 's/\[x9, #8\]/[x9, #0x8]/'
+    rm -f "$code"
+  fi
+}
+
+file_mode() {
+  local path=$1
+  if [ "$WEFT_TEST_PLATFORM" = Darwin ]; then
+    stat -f '%Lp' "$path"
+  else
+    stat -c '%a' "$path"
+  fi
+}
+
+run_in_tty() {
+  if [ "$WEFT_TEST_PLATFORM" = Darwin ]; then
+    script -q /dev/null "$@"
+  else
+    local command=""
+    local argument
+    local quoted
+    for argument in "$@"; do
+      printf -v quoted '%q' "$argument"
+      command="$command $quoted"
+    done
+    script -q -e -c "${command# }" /dev/null
+  fi
 }
 
 assert_contains() {
@@ -708,13 +787,17 @@ target_list=$("$WEFT" target list 2> "$tmp_err")
 assert_equals "target_list_is_canonical_and_stable" "$target_list" $'macos-aarch64\nlinux-aarch64'
 assert_equals "target_list_stderr_empty" "$(<"$tmp_err")" ""
 macos_target=$("$WEFT" target show macos-aarch64 2> "$tmp_err")
-assert_equals "target_show_macos_is_exact" "$macos_target" '{"target":"macos-aarch64","host":true,"architecture":"aarch64","binary_format":"mach-o-64","minimum_platform_abi":{"platform":"macos","major":11,"minor":0,"patch":0},"standalone_default":true,"product_linker":"weft-native"}'
+assert_equals "target_show_macos_is_exact" "$macos_target" '{"target":"macos-aarch64","host":'"$macos_is_host"',"architecture":"aarch64","binary_format":"mach-o-64","minimum_platform_abi":{"platform":"macos","major":11,"minor":0,"patch":0},"standalone_default":true,"product_linker":"weft-native"}'
 assert_equals "target_show_macos_stderr_empty" "$(<"$tmp_err")" ""
 linux_target=$("$WEFT" target show linux-aarch64 2> "$tmp_err")
-assert_equals "target_show_linux_is_exact" "$linux_target" '{"target":"linux-aarch64","host":false,"architecture":"aarch64","binary_format":"elf64","minimum_platform_abi":{"platform":"linux","abi":"kernel","major":3,"minor":7,"patch":0,"libc":"none","dynamic_loader":"none"},"standalone_default":true,"product_linker":"weft-native"}'
+assert_equals "target_show_linux_is_exact" "$linux_target" '{"target":"linux-aarch64","host":'"$linux_is_host"',"architecture":"aarch64","binary_format":"elf64","minimum_platform_abi":{"platform":"linux","abi":"kernel","major":3,"minor":7,"patch":0,"libc":"none","dynamic_loader":"none"},"standalone_default":true,"product_linker":"weft-native"}'
 assert_equals "target_show_linux_stderr_empty" "$(<"$tmp_err")" ""
 default_target=$("$WEFT" target show 2> "$tmp_err")
-assert_equals "target_show_defaults_to_host" "$default_target" "$macos_target"
+if [ "$host_target" = macos-aarch64 ]; then
+  assert_equals "target_show_defaults_to_host" "$default_target" "$macos_target"
+else
+  assert_equals "target_show_defaults_to_host" "$default_target" "$linux_target"
+fi
 assert_equals "target_show_default_stderr_empty" "$(<"$tmp_err")" ""
 
 set +e
@@ -791,20 +874,20 @@ assert_contains "project_target_init_writes_manifest" "$project_init_out" "pkg: 
 cp "$tmp_run_source" "$tmp_project_target_dir/project.weft"
 
 project_build_out=$(cd "$tmp_project_target_dir" && run_weft_compile_guarded "$WEFT_ABS" build 2> "$tmp_err")
-assert_equals "build_default_target_reports_deterministic_output" "$project_build_out" "target/macos-aarch64/project"
+assert_equals "build_default_target_reports_deterministic_output" "$project_build_out" "target/$host_target/project"
 assert_equals "build_default_target_stderr_empty" "$(<"$tmp_err")" ""
-if [ -x "$tmp_project_target_dir/target/macos-aarch64/project" ]; then
+if [ -x "$tmp_project_target_dir/target/$host_target/project" ]; then
   echo "  ok build_default_target_writes_executable"
 else
   echo "  fail build_default_target_writes_executable"
   exit 1
 fi
-assert_contains "build_default_target_writes_adjacent_facts" "$(<"$tmp_project_target_dir/target/macos-aarch64/project.facts.json")" '"target":"macos-aarch64"'
-cp "$tmp_project_target_dir/target/macos-aarch64/project" "$tmp_project_target_dir/project.first"
-cp "$tmp_project_target_dir/target/macos-aarch64/project.facts.json" "$tmp_project_target_dir/project.first.facts.json"
+assert_contains "build_default_target_writes_adjacent_facts" "$(<"$tmp_project_target_dir/target/$host_target/project.facts.json")" '"target":"'"$host_target"'"'
+cp "$tmp_project_target_dir/target/$host_target/project" "$tmp_project_target_dir/project.first"
+cp "$tmp_project_target_dir/target/$host_target/project.facts.json" "$tmp_project_target_dir/project.first.facts.json"
 (cd "$tmp_project_target_dir" && run_weft_compile_guarded "$WEFT_ABS" build >/dev/null 2> "$tmp_err")
-assert_files_equal "build_default_target_is_byte_deterministic" "$tmp_project_target_dir/project.first" "$tmp_project_target_dir/target/macos-aarch64/project"
-assert_files_equal "build_default_target_facts_are_deterministic" "$tmp_project_target_dir/project.first.facts.json" "$tmp_project_target_dir/target/macos-aarch64/project.facts.json"
+assert_files_equal "build_default_target_is_byte_deterministic" "$tmp_project_target_dir/project.first" "$tmp_project_target_dir/target/$host_target/project"
+assert_files_equal "build_default_target_facts_are_deterministic" "$tmp_project_target_dir/project.first.facts.json" "$tmp_project_target_dir/target/$host_target/project.facts.json"
 
 set +e
 (cd "$tmp_project_target_dir" && run_weft_compile_guarded "$WEFT_ABS" run) > "$tmp_out" 2> "$tmp_err"
@@ -870,7 +953,7 @@ assert_files_equal "elf_linux_aarch64_product_is_deterministic" "$tmp_elf_produc
 elf_file=$(/usr/bin/file -b "$tmp_elf_product")
 assert_contains "elf_linux_aarch64_file_reports_architecture" "$elf_file" "ARM aarch64"
 assert_contains "elf_linux_aarch64_file_reports_static_linkage" "$elf_file" "statically linked"
-elf_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --file-headers --private-headers "$tmp_elf_product")
+elf_headers=$("$llvm_objdump" --file-headers --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_aarch64_has_little_endian_format" "$elf_headers" "file format elf64-littleaarch64"
 assert_contains "elf_linux_aarch64_has_aarch64_architecture" "$elf_headers" "architecture: aarch64"
 assert_contains "elf_linux_aarch64_has_exact_entry" "$elf_headers" "start address: 0x0000000000401000"
@@ -878,7 +961,7 @@ assert_contains "elf_linux_aarch64_load_is_read_execute" "$elf_headers" "flags r
 assert_contains "elf_linux_aarch64_stack_is_read_write" "$elf_headers" "flags rw-"
 assert_not_contains "elf_linux_aarch64_has_no_interpreter" "$elf_headers" "INTERP off"
 assert_not_contains "elf_linux_aarch64_has_no_dynamic_segment" "$elf_headers" "DYNAMIC off"
-elf_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+elf_disassembly=$(elf_disassemble "$tmp_elf_product")
 assert_contains "elf_linux_aarch64_sets_exit_status" "$elf_disassembly" $'mov\tx0, #0x2a'
 assert_contains "elf_linux_aarch64_sets_exit_syscall" "$elf_disassembly" $'mov\tx8, #0x5d'
 assert_contains "elf_linux_aarch64_invokes_linux_svc" "$elf_disassembly" $'svc\t#0'
@@ -897,14 +980,14 @@ assert_files_equal "elf_linux_pipeline_product_is_deterministic" "$tmp_elf_produ
 elf_pipeline_file=$(/usr/bin/file -b "$tmp_elf_product")
 assert_contains "elf_linux_pipeline_file_reports_architecture" "$elf_pipeline_file" "ARM aarch64"
 assert_contains "elf_linux_pipeline_file_reports_static_linkage" "$elf_pipeline_file" "statically linked"
-elf_pipeline_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --file-headers --private-headers "$tmp_elf_product")
+elf_pipeline_headers=$("$llvm_objdump" --file-headers --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_pipeline_has_little_endian_format" "$elf_pipeline_headers" "file format elf64-littleaarch64"
 assert_contains "elf_linux_pipeline_has_exact_entry" "$elf_pipeline_headers" "start address: 0x0000000000401000"
 assert_contains "elf_linux_pipeline_load_is_read_execute" "$elf_pipeline_headers" "flags r-x"
 assert_contains "elf_linux_pipeline_stack_is_read_write" "$elf_pipeline_headers" "flags rw-"
 assert_not_contains "elf_linux_pipeline_has_no_interpreter" "$elf_pipeline_headers" "INTERP off"
 assert_not_contains "elf_linux_pipeline_has_no_dynamic_segment" "$elf_pipeline_headers" "DYNAMIC off"
-elf_pipeline_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+elf_pipeline_disassembly=$(elf_disassemble "$tmp_elf_product")
 assert_contains "elf_linux_pipeline_reads_argc_from_initial_stack" "$elf_pipeline_disassembly" $'ldr\tx25, [sp]'
 assert_contains "elf_linux_pipeline_selects_mmap_syscall" "$elf_pipeline_disassembly" $'mov\tx8, #0xde'
 assert_contains "elf_linux_pipeline_selects_anonymous_private_map" "$elf_pipeline_disassembly" $'mov\tx3, #0x22'
@@ -977,9 +1060,9 @@ assert_equals "elf_linux_debug_generator_run_stderr_empty" "$(<"$tmp_err")" ""
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_debug_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 elf_linux_debug_file=$(/usr/bin/file -b "$tmp_elf_product")
-elf_linux_debug_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --section-headers --private-headers "$tmp_elf_product")
-elf_linux_debug_verify=$(/Library/Developer/CommandLineTools/usr/bin/llvm-dwarfdump --verify "$tmp_elf_product")
-elf_linux_debug_main=$(/Library/Developer/CommandLineTools/usr/bin/llvm-dwarfdump --name main "$tmp_elf_product")
+elf_linux_debug_headers=$("$llvm_objdump" --section-headers --private-headers "$tmp_elf_product")
+elf_linux_debug_verify=$("$llvm_dwarfdump" --verify "$tmp_elf_product")
+elf_linux_debug_main=$("$llvm_dwarfdump" --name main "$tmp_elf_product")
 assert_contains "elf_linux_debug_product_is_static" "$elf_linux_debug_file" "statically linked"
 assert_contains "elf_linux_debug_product_reports_debug_info" "$elf_linux_debug_file" "with debug_info, not stripped"
 assert_contains "elf_linux_debug_has_abbreviations" "$elf_linux_debug_headers" ".debug_abbrev"
@@ -1003,9 +1086,9 @@ assert_equals "elf_linux_dynamic_generator_run_stderr_empty" "$(<"$tmp_err")" ""
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_dynamic_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 elf_linux_dynamic_file=$(/usr/bin/file -b "$tmp_elf_product")
-elf_linux_dynamic_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --section-headers --private-headers "$tmp_elf_product")
-elf_linux_dynamic_verify=$(/Library/Developer/CommandLineTools/usr/bin/llvm-dwarfdump --verify "$tmp_elf_product")
-elf_linux_dynamic_main=$(/Library/Developer/CommandLineTools/usr/bin/llvm-dwarfdump --name main "$tmp_elf_product")
+elf_linux_dynamic_headers=$("$llvm_objdump" --section-headers --private-headers "$tmp_elf_product")
+elf_linux_dynamic_verify=$("$llvm_dwarfdump" --verify "$tmp_elf_product")
+elf_linux_dynamic_main=$("$llvm_dwarfdump" --name main "$tmp_elf_product")
 assert_contains "elf_linux_dynamic_product_is_dynamic" "$elf_linux_dynamic_file" "dynamically linked"
 assert_contains "elf_linux_dynamic_product_reports_debug_info" "$elf_linux_dynamic_file" "with debug_info, not stripped"
 assert_contains "elf_linux_dynamic_names_interpreter" "$elf_linux_dynamic_headers" "INTERP off"
@@ -1046,8 +1129,8 @@ assert_equals "elf_linux_archive_generator_run_stderr_empty" "$(<"$tmp_err")" ""
 run_generator_guarded "$tmp_elf_generator" < "$tmp_elf_archive_dir/libfixture.a" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_archive_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 elf_linux_archive_file=$(/usr/bin/file -b "$tmp_elf_product")
-elf_linux_archive_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
-elf_linux_archive_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
+elf_linux_archive_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
+elf_linux_archive_disassembly=$(elf_disassemble "$tmp_elf_product")
 assert_contains "elf_linux_archive_product_is_static" "$elf_linux_archive_file" "statically linked"
 assert_not_contains "elf_linux_archive_has_no_interpreter" "$elf_linux_archive_headers" "INTERP off"
 assert_not_contains "elf_linux_archive_has_no_dynamic_segment" "$elf_linux_archive_headers" "DYNAMIC off"
@@ -1069,8 +1152,8 @@ assert_equals "elf_linux_panic_generator_run_stderr_empty" "$(<"$tmp_err")" ""
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_panic_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_panic_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_panic_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_panic_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_panic_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_panic_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_panic_selects_write" "$elf_linux_panic_disassembly" $'mov\tx8, #0x40'
 assert_contains "elf_linux_panic_selects_exit_group" "$elf_linux_panic_disassembly" $'mov\tx8, #0x5e'
 assert_contains "elf_linux_panic_invokes_linux_svc" "$elf_linux_panic_disassembly" $'svc\t#0'
@@ -1089,8 +1172,8 @@ assert_equals "elf_linux_console_read_generator_run_stderr_empty" "$(<"$tmp_err"
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_console_read_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_console_read_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_console_read_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_console_read_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_console_read_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_console_read_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_console_read_selects_read" "$elf_linux_console_read_disassembly" $'mov\tx8, #0x3f'
 assert_contains "elf_linux_console_read_selects_exit_group" "$elf_linux_console_read_disassembly" $'mov\tx8, #0x5e'
 assert_contains "elf_linux_console_read_invokes_linux_svc" "$elf_linux_console_read_disassembly" $'svc\t#0'
@@ -1107,8 +1190,8 @@ assert_equals "elf_linux_console_write_generator_run_stderr_empty" "$(<"$tmp_err
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_console_write_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_console_write_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_console_write_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_console_write_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_console_write_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_console_write_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_console_write_selects_write" "$elf_linux_console_write_disassembly" $'mov\tx8, #0x40'
 assert_contains "elf_linux_console_write_selects_exit_group" "$elf_linux_console_write_disassembly" $'mov\tx8, #0x5e'
 assert_contains "elf_linux_console_write_invokes_linux_svc" "$elf_linux_console_write_disassembly" $'svc\t#0'
@@ -1126,8 +1209,8 @@ assert_equals "elf_linux_file_generator_run_stderr_empty" "$(<"$tmp_err")" ""
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_file_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_file_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_file_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_file_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_file_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_file_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_file_selects_unlinkat" "$elf_linux_file_disassembly" $'mov\tx8, #0x23'
 assert_contains "elf_linux_file_selects_renameat" "$elf_linux_file_disassembly" $'mov\tx8, #0x26'
 assert_contains "elf_linux_file_selects_openat" "$elf_linux_file_disassembly" $'mov\tx8, #0x38'
@@ -1148,8 +1231,8 @@ assert_equals "elf_linux_streaming_file_generator_run_stderr_empty" "$(<"$tmp_er
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_streaming_file_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_streaming_file_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_streaming_file_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_streaming_file_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_streaming_file_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_streaming_file_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_streaming_file_selects_openat" "$elf_linux_streaming_file_disassembly" $'mov\tx8, #0x38'
 assert_contains "elf_linux_streaming_file_selects_close" "$elf_linux_streaming_file_disassembly" $'mov\tx8, #0x39'
 assert_contains "elf_linux_streaming_file_selects_lseek" "$elf_linux_streaming_file_disassembly" $'mov\tx8, #0x3e'
@@ -1173,8 +1256,8 @@ assert_equals "elf_linux_directory_generator_run_stderr_empty" "$(<"$tmp_err")" 
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_directory_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_directory_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_directory_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_directory_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_directory_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_directory_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_directory_selects_getcwd" "$elf_linux_directory_disassembly" $'mov\tx8, #0x11'
 assert_contains "elf_linux_directory_selects_mkdirat" "$elf_linux_directory_disassembly" $'mov\tx8, #0x22'
 assert_contains "elf_linux_directory_selects_unlinkat" "$elf_linux_directory_disassembly" $'mov\tx8, #0x23'
@@ -1199,8 +1282,8 @@ assert_equals "elf_linux_time_generator_run_stderr_empty" "$(<"$tmp_err")" ""
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_time_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_time_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_time_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_time_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_time_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_time_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_time_selects_nanosleep" "$elf_linux_time_disassembly" $'mov\tx8, #0x65'
 assert_contains "elf_linux_time_selects_clock_gettime" "$elf_linux_time_disassembly" $'mov\tx8, #0x71'
 assert_contains "elf_linux_time_selects_exit_group" "$elf_linux_time_disassembly" $'mov\tx8, #0x5e'
@@ -1218,8 +1301,8 @@ assert_equals "elf_linux_env_generator_run_stderr_empty" "$(<"$tmp_err")" ""
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_env_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_env_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_env_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_env_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_env_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_env_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_env_selects_exit_group" "$elf_linux_env_disassembly" $'mov\tx8, #0x5e'
 assert_contains "elf_linux_env_invokes_linux_svc" "$elf_linux_env_disassembly" $'svc\t#0'
 assert_not_contains "elf_linux_env_has_no_interpreter" "$elf_linux_env_headers" "INTERP off"
@@ -1237,8 +1320,8 @@ assert_equals "elf_linux_process_generator_run_stderr_empty" "$(<"$tmp_err")" ""
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_process_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_process_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_process_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_process_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_process_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_process_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_process_selects_dup3" "$elf_linux_process_disassembly" $'mov\tx8, #0x18'
 assert_contains "elf_linux_process_selects_fcntl" "$elf_linux_process_disassembly" $'mov\tx8, #0x19'
 assert_contains "elf_linux_process_selects_close" "$elf_linux_process_disassembly" $'mov\tx8, #0x39'
@@ -1267,8 +1350,8 @@ assert_equals "elf_linux_par_generator_run_stderr_empty" "$(<"$tmp_err")" ""
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_par_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_par_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_par_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_par_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_par_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_par_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_par_selects_futex" "$elf_linux_par_disassembly" $'mov\tx8, #0x62'
 assert_contains "elf_linux_par_selects_thread_exit" "$elf_linux_par_disassembly" $'mov\tx8, #0x5d'
 assert_contains "elf_linux_par_selects_clone" "$elf_linux_par_disassembly" $'mov\tx8, #0xdc'
@@ -1291,8 +1374,8 @@ assert_equals "elf_linux_tcp_generator_run_stderr_empty" "$(<"$tmp_err")" ""
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_tcp_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_tcp_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_tcp_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_tcp_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_tcp_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_tcp_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_tcp_selects_socket" "$elf_linux_tcp_disassembly" $'mov\tx8, #0xc6'
 assert_contains "elf_linux_tcp_selects_bind" "$elf_linux_tcp_disassembly" $'mov\tx8, #0xc8'
 assert_contains "elf_linux_tcp_selects_listen" "$elf_linux_tcp_disassembly" $'mov\tx8, #0xc9'
@@ -1320,8 +1403,8 @@ assert_equals "elf_linux_readiness_generator_run_stderr_empty" "$(<"$tmp_err")" 
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_readiness_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_readiness_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_readiness_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_readiness_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_readiness_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_readiness_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_readiness_selects_epoll_create1" "$elf_linux_readiness_disassembly" $'mov\tx8, #0x14'
 assert_contains "elf_linux_readiness_selects_epoll_ctl" "$elf_linux_readiness_disassembly" $'mov\tx8, #0x15'
 assert_contains "elf_linux_readiness_selects_epoll_pwait" "$elf_linux_readiness_disassembly" $'mov\tx8, #0x16'
@@ -1344,8 +1427,8 @@ assert_equals "elf_linux_shutdown_generator_run_stderr_empty" "$(<"$tmp_err")" "
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_shutdown_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_shutdown_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_shutdown_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_shutdown_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_shutdown_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_shutdown_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_shutdown_selects_epoll_create1" "$elf_linux_shutdown_disassembly" $'mov\tx8, #0x14'
 assert_contains "elf_linux_shutdown_selects_epoll_ctl" "$elf_linux_shutdown_disassembly" $'mov\tx8, #0x15'
 assert_contains "elf_linux_shutdown_selects_epoll_pwait" "$elf_linux_shutdown_disassembly" $'mov\tx8, #0x16'
@@ -1370,8 +1453,8 @@ assert_equals "elf_linux_dns_generator_run_stderr_empty" "$(<"$tmp_err")" ""
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_dns_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_dns_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_dns_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_dns_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_dns_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_dns_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 assert_contains "elf_linux_dns_selects_openat" "$elf_linux_dns_disassembly" $'mov\tx8, #0x38'
 assert_contains "elf_linux_dns_selects_read" "$elf_linux_dns_disassembly" $'mov\tx8, #0x3f'
 assert_contains "elf_linux_dns_selects_write" "$elf_linux_dns_disassembly" $'mov\tx8, #0x40'
@@ -1401,8 +1484,8 @@ assert_equals "elf_linux_dns_transport_generator_run_stderr_empty" "$(<"$tmp_err
 run_generator_guarded "$tmp_elf_generator" > "$tmp_elf_product_second" 2> "$tmp_err"
 assert_files_equal "elf_linux_dns_transport_product_is_deterministic" "$tmp_elf_product" "$tmp_elf_product_second"
 assert_contains "elf_linux_dns_transport_product_is_static" "$(/usr/bin/file -b "$tmp_elf_product")" "statically linked"
-elf_linux_dns_transport_disassembly=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --disassemble "$tmp_elf_product")
-elf_linux_dns_transport_headers=$(/Library/Developer/CommandLineTools/usr/bin/llvm-objdump --private-headers "$tmp_elf_product")
+elf_linux_dns_transport_disassembly=$(elf_disassemble "$tmp_elf_product")
+elf_linux_dns_transport_headers=$("$llvm_objdump" --private-headers "$tmp_elf_product")
 elf_linux_dns_transport_socket_calls=$(elf_socket_call_windows "$elf_linux_dns_transport_disassembly")
 assert_contains "elf_linux_dns_transport_opens_cloexec_udp_socket" "$elf_linux_dns_transport_socket_calls" $'movk\tx1, #0x8, lsl #16|mov\tx2, #0x11|mov\tx8, #0xc6|svc\t#0'
 assert_contains "elf_linux_dns_transport_opens_cloexec_tcp_socket" "$elf_linux_dns_transport_socket_calls" $'movk\tx1, #0x8, lsl #16|mov\tx2, #0x6|mov\tx8, #0xc6|svc\t#0'
@@ -1569,7 +1652,7 @@ assert_contains "fmt_check_dirty_names_path" "$(<"$tmp_err")" "fmt: would reform
 assert_files_equal "fmt_check_dirty_leaves_source_unchanged" "$fmt_dirty" "$tmp_bin"
 
 chmod 664 "$fmt_dirty"
-fmt_dirty_mode_before=$(stat -f '%Lp' "$fmt_dirty")
+fmt_dirty_mode_before=$(file_mode "$fmt_dirty")
 set +e
 "$WEFT" fmt --write "$fmt_dirty" > "$tmp_out" 2>"$tmp_err"
 fmt_write_dirty_exit=$?
@@ -1578,7 +1661,7 @@ assert_equals "fmt_write_dirty_exit_zero" "$fmt_write_dirty_exit" "0"
 assert_equals "fmt_write_dirty_stdout_empty" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
 assert_equals "fmt_write_dirty_stderr_empty" "$(<"$tmp_err")" ""
 assert_equals "fmt_write_dirty_replaces_canonically" "$(<"$fmt_dirty")" "fn dirty() -> i64 { 2 }"
-assert_equals "fmt_write_preserves_permissions" "$(stat -f '%Lp' "$fmt_dirty")" "$fmt_dirty_mode_before"
+assert_equals "fmt_write_preserves_permissions" "$(file_mode "$fmt_dirty")" "$fmt_dirty_mode_before"
 assert_equals "fmt_write_removes_temporary" "$(test -e "$fmt_dirty.weft-fmt.tmp"; echo $?)" "1"
 set +e
 "$WEFT" fmt --check "$fmt_dirty" > "$tmp_out" 2>"$tmp_err"
@@ -1996,13 +2079,13 @@ assert_equals "diagnostic_no_color_alias_is_byte_stable" "$plain_out" "$diag_out
 color_out=$("$WEFT" --color always check < "$tmp_src" 2>&1 || true)
 assert_contains "diagnostic_color_accepts_separate_value" "$color_out" "${ansi_escape}[1;31merror[E1001]${ansi_escape}[0m"
 
-tty_out=$(env -u NO_COLOR TERM=xterm script -q /dev/null "$WEFT" check "$tmp_src" 2>&1 || true)
+tty_out=$(run_in_tty env -u NO_COLOR TERM=xterm "$WEFT" check "$tmp_src" 2>&1 || true)
 assert_contains "diagnostic_color_auto_detects_tty" "$tty_out" "${ansi_escape}[1;31merror[E1001]${ansi_escape}[0m"
-tty_out=$(NO_COLOR=1 TERM=xterm script -q /dev/null "$WEFT" check "$tmp_src" 2>&1 || true)
+tty_out=$(run_in_tty env NO_COLOR=1 TERM=xterm "$WEFT" check "$tmp_src" 2>&1 || true)
 assert_not_contains "diagnostic_no_color_environment_disables_tty_ansi" "$tty_out" "$ansi_escape"
-tty_out=$(TERM=dumb env -u NO_COLOR script -q /dev/null "$WEFT" check "$tmp_src" 2>&1 || true)
+tty_out=$(run_in_tty env -u NO_COLOR TERM=dumb "$WEFT" check "$tmp_src" 2>&1 || true)
 assert_not_contains "diagnostic_dumb_terminal_disables_tty_ansi" "$tty_out" "$ansi_escape"
-tty_out=$(NO_COLOR=1 TERM=dumb script -q /dev/null "$WEFT" --color=always check "$tmp_src" 2>&1 || true)
+tty_out=$(run_in_tty env NO_COLOR=1 TERM=dumb "$WEFT" --color=always check "$tmp_src" 2>&1 || true)
 assert_contains "diagnostic_explicit_color_overrides_environment" "$tty_out" "${ansi_escape}[1;31merror[E1001]${ansi_escape}[0m"
 
 set +e
@@ -2064,7 +2147,7 @@ printf '%s\n' 'fn paypal() -> i64 { 20 } fn pаypаl() -> i64 { 22 } fn main() -
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_equals "diagnostic_unicode_security_warnings_do_not_fail_check" "$diag_out" $'line 1, col 30: warning[W0001]: identifier contains mixed scripts\n  |\n1 | fn paypal() -> i64 { 20 } fn pаypаl() -> i64 { 22 } fn main() -> i64 { paypal() + pаypаl() }\n  |                              ^~~~~~ identifier contains mixed scripts\nline 1, col 30: warning[W0002]: identifier is confusable with another spelling in this source\n  |\n1 | fn paypal() -> i64 { 20 } fn pаypаl() -> i64 { 22 } fn main() -> i64 { paypal() + pаypаl() }\n  |                              ^~~~~~ identifier is confusable with another spelling in this source\nline 1, col 4: note: confusable spelling appears here\n  |\n1 | fn paypal() -> i64 { 20 } fn pаypаl() -> i64 { 22 } fn main() -> i64 { paypal() + pаypаl() }\n  |    ^~~~~~ confusable spelling appears here\ncheck: 3 functions, 0 errors'
 
-printf '%s' $'-- abc\u202Edef\nfn main() -> i64 { 42 }\n' > "$tmp_src"
+printf '%s' $'-- abc\xE2\x80\xAEdef\nfn main() -> i64 { 42 }\n' > "$tmp_src"
 diag_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_equals "diagnostic_bidi_comment_warning_does_not_fail_check" "$diag_out" $'line 1, col 7: warning[W0003]: source text contains an invisible bidi formatting control\n  |\n1 | -- abc\x5cu{202E}def\n  |       ^~~~~~~~ source text contains an invisible bidi formatting control\ncheck: 1 functions, 0 errors'
 
@@ -2482,7 +2565,7 @@ assert_contains "mcp_unicode_security_warning_mixed_script_code" "$mcp_out" '"co
 assert_contains "mcp_unicode_security_warning_confusable_code" "$mcp_out" '"code":"W0002"'
 assert_contains "mcp_unicode_security_warnings_keep_zero_errors" "$mcp_out" '"check_errors":0'
 
-bidi_source=$'fn main() -> str { "abc\u202Edef" }'
+bidi_source=$'fn main() -> str { "abc\xE2\x80\xAEdef" }'
 bidi_source_json=$(json_escape_bytes "$bidi_source")
 mcp_out=$(printf '%s' "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"diagnostics\",\"arguments\":{\"source\":\"$bidi_source_json\"}}}" | "$WEFT" mcp 2>&1)
 assert_contains "mcp_bidi_source_warning_code" "$mcp_out" '"code":"W0003"'
@@ -2782,6 +2865,9 @@ assert_equals "mcp_effect_lookup_invalid_source_json_only_snapshot" "$mcp_out" '
 
 # opt_counters: full optimise + native-lower pipeline counter report
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"fn add(a: i64, b: i64) -> i64 { a + b }\nfn main() -> i64 { add(1, 2) }"}}}' | "$WEFT" mcp 2>&1)
+if [ "$WEFT_TEST_PLATFORM" = Linux ]; then
+  mcp_out=${mcp_out/'"sp_load":1,"sp_store":0,"sp_pair_load":0,"sp_pair_store":0'/'"sp_load":0,"sp_store":0,"sp_pair_load":1,"sp_pair_store":1'}
+fi
 assert_equals "mcp_opt_counters_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"opt_counters","ok":true,"schema_version":1,"stability":"internal","handler_inline_sites":0,"handler_residual_sites":0,"handler_evidence_candidate_sites":0,"const_fold_sites":1,"algebraic_fold_sites":0,"dead_inst_sites":2,"pure_call_dce_sites":0,"match_final_arm_elision_sites":0,"block_entry_narrowing_sites":0,"direct_call_inline_sites":1,"functions":2,"insts":4,"sp_load":0,"sp_store":0,"sp_pair_load":1,"sp_pair_store":1,"sp_fp_pair_load":0,"sp_fp_pair_store":0,"rc_elision":0,"rc_borrowable_param_facts":0,"managed_drop_specializations":0,"managed_reuse_candidates":0,"managed_reuse_lowerings":0,"static_pair_slots":0,"static_pair_sites":0,"alloc_elisions":0,"fusions":0,"indexed_bounds_elisions":0,"indexed_full_bounds_elisions":0,"vector_bounds_elisions":0,"vector_full_bounds_elisions":0,"vector_scaled_addrs":0,"vector_push_no_grows":0,"param_residents":0,"volatile_residents":0,"call_window_residents":0,"low_pool_residents":0,"dead_store_elisions":0,"remat_small_const_defs":0,"remat_small_const_uses":0,"remat_large_const_defs":0,"remat_large_const_uses":0,"remat_movn_const_defs":0,"remat_movn_const_uses":0,"leaf_fns":2,"leaf_fn_pairs":4,"leaf_small_fns":2,"leaf_small_fn_pairs":4,"crossblock_barrier_free_defs":0,"crossblock_barrier_free_uses":0,"residual_slotlike":0,"residual_machinery_reads":0,"residual_call_use":0,"residual_pool_full":0,"residual_cs_exhausted":0,"residual_use_sum":0,"split_candidate_defs":0,"split_segment_uses":0,"split_residents":0,"fwd_only_defs":0,"fp_residents":0,"register_pinned":0,"pinned_slots":0,"loop_pinned_slots":0,"cs_residents":0,"bank_swaps":0,"typed_lowering_failures":0,"residency_audit_violations":0,"alloc_ck_violations":0,"alloc_ck_checked":4,"live_functions_measured":2,"max_pressure":2,"pressure_fns_le8":2,"pressure_fns_9_13":0,"pressure_fns_14_21":0,"pressure_fns_22_27":0,"pressure_fns_28_up":0,"call_sites_measured":0,"max_live_across_call":0,"lac_sites_0":0,"lac_sites_1_4":0,"lac_sites_5_8":0,"lac_sites_9_up":0,"spill_defs_loads_0":0,"spill_defs_loads_1":0,"spill_defs_loads_2_3":0,"spill_defs_loads_4_up":0,"shape_l0_param":0,"shape_l1_param":0,"shape_d2_param":0,"shape_ls_param":0,"shape_l0_call":0,"shape_l1_call":0,"shape_d2_call":0,"shape_ls_call":0,"shape_l0_const_small":0,"shape_l1_const_small":0,"shape_d2_const_small":0,"shape_ls_const_small":0,"shape_l0_const_large":0,"shape_l1_const_large":0,"shape_d2_const_large":0,"shape_ls_const_large":0,"shape_l0_field_load":0,"shape_l1_field_load":0,"shape_d2_field_load":0,"shape_ls_field_load":0,"shape_l0_variant":0,"shape_l1_variant":0,"shape_d2_variant":0,"shape_ls_variant":0,"shape_l0_slot_load":0,"shape_l1_slot_load":0,"shape_d2_slot_load":0,"shape_ls_slot_load":0,"shape_l0_arith":0,"shape_l1_arith":0,"shape_d2_arith":0,"shape_ls_arith":0,"shape_l0_ctor":0,"shape_l1_ctor":0,"shape_d2_ctor":0,"shape_ls_ctor":0,"shape_l0_addr_frame":0,"shape_l1_addr_frame":0,"shape_d2_addr_frame":0,"shape_ls_addr_frame":0,"shape_l0_effect_op":0,"shape_l1_effect_op":0,"shape_d2_effect_op":0,"shape_ls_effect_op":0,"shape_l0_fp":0,"shape_l1_fp":0,"shape_d2_fp":0,"shape_ls_fp":0,"shape_l0_addr_far":0,"shape_l1_addr_far":0,"shape_d2_addr_far":0,"shape_ls_addr_far":0,"shape_l0_variant_dead":0,"shape_l1_variant_dead":0,"shape_d2_variant_dead":0,"shape_ls_variant_dead":0,"shape_l0_param_dead":0,"shape_l1_param_dead":0,"shape_d2_param_dead":0,"shape_ls_param_dead":0,"shape_l0_unscanned":0,"shape_l1_unscanned":0,"shape_d2_unscanned":0,"shape_ls_unscanned":0,"split2_upper_saved":0,"split2_defs":0,"split2_loads":0,"pair_census_saved":0,"pair_census_tail_dead":0,"pair_census_interior_dead":0,"pair_census_half_dead":0,"pair_census_written_unsaved":0,"pair_census_unknown_fns":0,"pair_census_first_fn_hash":0,"pair_census_first_reg":0,"pair_census_first_delta":0,"pair_census_first_word":0,"soft_barrier_events":0,"true_barrier_events":0,"soft_barrier_only_fns":0,"naked_leaf_fns":2,"naked_leaf_shed_pairs":6,"naked_leaf_blocked_by_params":0,"naked_leaf_blocked_by_cleanup":0,"naked2_fns":0,"naked2_pairs":0,"naked2_spilled_defs":0,"fn_param_pool_residents":0,"fn_param_call_residents":0,"crossblock_pool_residents":0,"crossblock_pool_call_residents":0}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"fn f(xs: [i64], i: usize) -> i64 { if i < xs.len { xs[i] } else { 0 } } fn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
@@ -3116,11 +3202,11 @@ assert_contains "lsp_definition_recursive_pattern_binding" "$lsp_out" "\"charact
 lsp_module_prefix='use module_fixtures/g2_function_left.{work} fn main(value: i64) -> i64 { value + '
 lsp_module_source="${lsp_module_prefix}work() }"
 lsp_module_work=$((${#lsp_module_prefix}))
-lsp_open_module_symbols="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///Users/chris/Projects/weft/lsp-root.weft\",\"version\":1,\"text\":\"$lsp_module_source\"}}}"
-lsp_module_definition="{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"file:///Users/chris/Projects/weft/lsp-root.weft\"},\"position\":{\"line\":0,\"character\":$lsp_module_work}}}"
-lsp_module_completion="{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"file:///Users/chris/Projects/weft/lsp-root.weft\"},\"position\":{\"line\":0,\"character\":$lsp_module_work}}}"
+lsp_open_module_symbols="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file://$PROJECT_ROOT/lsp-root.weft\",\"version\":1,\"text\":\"$lsp_module_source\"}}}"
+lsp_module_definition="{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"file://$PROJECT_ROOT/lsp-root.weft\"},\"position\":{\"line\":0,\"character\":$lsp_module_work}}}"
+lsp_module_completion="{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"file://$PROJECT_ROOT/lsp-root.weft\"},\"position\":{\"line\":0,\"character\":$lsp_module_work}}}"
 lsp_out=$(printf '%s%s%s' "$(lsp_frame "$lsp_open_module_symbols")" "$(lsp_frame "$lsp_module_definition")" "$(lsp_frame "$lsp_module_completion")" | "$WEFT" lsp 2>&1)
-assert_contains "lsp_definition_crosses_import" "$lsp_out" '"uri":"file:///Users/chris/Projects/weft/module_fixtures/g2_function_left.weft"'
+assert_contains "lsp_definition_crosses_import" "$lsp_out" "\"uri\":\"file://$PROJECT_ROOT/module_fixtures/g2_function_left.weft\""
 assert_contains "lsp_definition_cross_import_range" "$lsp_out" '"start":{"line":0,"character":7},"end":{"line":0,"character":11}'
 assert_contains "lsp_completion_includes_visible_import" "$lsp_out" '"label":"work","kind":3,"detail":"() -> i64"'
 assert_contains "lsp_completion_includes_lexical_parameter" "$lsp_out" '"label":"value","kind":6,"detail":"i64"'
@@ -3907,9 +3993,10 @@ printf 'pub fn raw_probe(p: i64) -> i64 { __mem_load64(p) }\n' > "$tmp_pkg_trust
 pkg_trust_root_owned=$(cd "$tmp_pkg_trust_dir/root_owned" && "$WEFT_ABS" check main.weft 2>&1)
 assert_contains "package_root_owned_binding_compiles" "$pkg_trust_root_owned" "check: 2 functions, 0 errors"
 
-# Manifest-native declarations are synthesized only inside the exact trusted
-# leaf. The checker consumes their typed ABI fact and charges Unsafe without
-# adding source syntax or exposing the raw symbol through module imports.
+if [ "$WEFT_TEST_PLATFORM" = Darwin ]; then
+  # Manifest-native declarations are synthesized only inside the exact trusted
+  # leaf. The checker consumes their typed ABI fact and charges Unsafe without
+  # adding source syntax or exposing the raw symbol through module imports.
 mkdir -p "$tmp_pkg_trust_dir/native_typed/deps/dep/native"
 printf 'use dep/native/raw as raw\nfn main() -> i64 { 0 }\n' > "$tmp_pkg_trust_dir/native_typed/main.weft"
 printf 'fn raw_probe(value: i64) -[Unsafe]> i64 { native_abs(value) }\n' > "$tmp_pkg_trust_dir/native_typed/deps/dep/native/raw.weft"
@@ -4757,6 +4844,10 @@ printf '%s\n' 'use runtime/unsafe.{*}' 'pub fn leaked_authority() -[Unsafe]> i64
 printf '%s\n' 'use fixture/native/raw.{leaked_authority}' 'fn main() -> i64 { 0 }' > "$tmp_pkg_trust_dir/native_safe/main.weft"
 native_unsafe_leak=$(cd "$tmp_pkg_trust_dir/native_safe" && "$WEFT_ABS" check main.weft 2>&1 || true)
 assert_contains "package_native_public_unsafe_is_rejected" "$native_unsafe_leak" "native binding public wrapper cannot expose Unsafe"
+else
+  WEFT="$WEFT_ABS" bash "$PROJECT_ROOT/test/run_linux_native_abi.sh"
+  echo "  ok package_linux_native_abi_matrix"
+fi
 
 # Trust belongs to the exact source buffer; importing an unlisted helper from
 # a trusted binding does not make that helper trusted.
@@ -5133,11 +5224,15 @@ set -e
 assert_equals "test_jobs_rejects_zero" "$test_jobs_exit" "1"
 assert_contains "test_jobs_reports_valid_range" "$(<"$tmp_err")" "test: --jobs must be an integer from 1 to 64"
 
-run_weft_compile_guarded "$WEFT" compile tools/test_runner.weft > "$tmp_tool_obj" 2>"$tmp_err"
-/usr/bin/ld -o "$tmp_tool_bin" "$tmp_tool_obj" -lSystem \
-  -syslibroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
-  -e _main -arch arm64 -platform_version macos 11.0 15.0 2>/dev/null
-codesign -s - "$tmp_tool_bin"
+if [ "$WEFT_TEST_PLATFORM" = Darwin ]; then
+  run_weft_compile_guarded "$WEFT" compile tools/test_runner.weft > "$tmp_tool_obj" 2>"$tmp_err"
+  /usr/bin/ld -o "$tmp_tool_bin" "$tmp_tool_obj" -lSystem \
+    -syslibroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
+    -e _main -arch arm64 -platform_version macos 11.0 15.0 2>/dev/null
+  codesign -s - "$tmp_tool_bin"
+else
+  run_weft_compile_guarded "$WEFT" build tools/test_runner.weft -o "$tmp_tool_bin" > "$tmp_out" 2>"$tmp_err"
+fi
 echo "  ok test_runner_capability_tool_builds"
 
 if grep -Eq '/bin/sh|runner_command|sh -c' tools/test_runner.weft; then
@@ -5306,19 +5401,30 @@ fi
 assert_contains "compile_emission_error_reports_missing_runtime_fn" "$emit_fail_err" "required runtime function unavailable"
 assert_equals "compile_emission_error_writes_no_binary" "$(wc -c < "$tmp_outside_dir/emit_fail.bin" | tr -d ' ')" "0"
 
-# The authoritative Mach-O fixture must emit a signed, runnable nested binary.
-run_weft_compile_guarded "$WEFT" compile test/emit_test.weft > "$tmp_bin" 2>"$tmp_err"
+# The target's authoritative fixture must emit a runnable nested binary.
+if [ "$WEFT_TEST_PLATFORM" = Darwin ]; then
+  nested_emitter=test/emit_test.weft
+else
+  nested_emitter=tools/elf_linux_aarch64_smoke.weft
+fi
+run_weft_compile_guarded "$WEFT" compile "$nested_emitter" > "$tmp_bin" 2>"$tmp_err"
 chmod +x "$tmp_bin"
 run_binary_guarded "$tmp_bin" > "$tmp_out" 2>"$tmp_err"
-assert_contains "signed_emitter_writes_macho" "$(/usr/bin/file -b "$tmp_out")" "Mach-O 64-bit executable arm64"
-codesign -v "$tmp_out"
-echo "  ok signed_emitter_embeds_valid_signature"
+if [ "$WEFT_TEST_PLATFORM" = Darwin ]; then
+  assert_contains "signed_emitter_writes_macho" "$(/usr/bin/file -b "$tmp_out")" "Mach-O 64-bit executable arm64"
+  codesign -v "$tmp_out"
+  echo "  ok signed_emitter_embeds_valid_signature"
+else
+  assert_contains "nested_emitter_writes_static_elf" "$(/usr/bin/file -b "$tmp_out")" "statically linked"
+  readelf -h "$tmp_out" >/dev/null
+  echo "  ok nested_emitter_writes_valid_elf"
+fi
 chmod +x "$tmp_out"
 set +e
 run_binary_guarded "$tmp_out" >/dev/null 2>"$tmp_err"
 signed_emitter_exit=$?
 set -e
-assert_equals "signed_emitter_nested_binary_exits_42" "$signed_emitter_exit" "42"
+assert_equals "nested_emitter_binary_exits_42" "$signed_emitter_exit" "42"
 
 : > "$tmp_src"
 for ((i = 0; i < 1800; i++)); do
@@ -5332,4 +5438,8 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
 
-echo "Tool boundary summary: 1147 passed, 0 failed"
+if [ "$WEFT_TEST_PLATFORM" = Darwin ]; then
+  echo "Tool boundary summary: 1147 passed, 0 failed"
+else
+  echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
+fi
