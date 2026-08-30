@@ -63,7 +63,9 @@ if LC_ALL=C grep -aF "$project_root" "$archive_one" >/dev/null; then
 fi
 
 tar -xf "$archive_one" -C "$work/extracted"
-bundle_root="$work/extracted/$bundle_name"
+mkdir -p "$work/installed"
+mv "$work/extracted/$bundle_name" "$work/installed/$bundle_name"
+bundle_root="$work/installed/$bundle_name"
 facts="$bundle_root/share/weft/compiler.facts.json"
 provenance="$bundle_root/share/weft/provenance.json"
 identity="$bundle_root/share/weft/product-identity.json"
@@ -75,7 +77,7 @@ tls_notice="$bundle_root/share/weft/mbedtls.md"
 grep -q '"target":"'"$target"'"' "$facts"
 grep -q '"standalone":true' "$facts"
 grep -q '"debug_information":{"kind":"absent"}' "$facts"
-grep -q '"release_schema_version":1' "$provenance"
+grep -q '"release_schema_version":2' "$provenance"
 grep -q '"target":"'"$target"'"' "$provenance"
 grep -q '"sdk_layout":"lib/weft"' "$provenance"
 grep -q '"compiler_version":"0.1.0"' "$identity"
@@ -95,9 +97,12 @@ fi
 case "$target" in
   macos-aarch64)
     file "$bundle_root/bin/weft" | grep -q 'Mach-O 64-bit executable arm64'
+    codesign --verify --strict --verbose=2 "$bundle_root/bin/weft"
+    grep -q '"code_signing":{"kind":"adhoc"' "$provenance"
     ;;
   linux-aarch64)
     file "$bundle_root/bin/weft" | grep -q 'ELF 64-bit LSB executable, ARM aarch64.*statically linked'
+    grep -q '"code_signing":{"kind":"none"}' "$provenance"
     if ! command -v docker >/dev/null 2>&1; then
       echo "release gate: docker is required to execute the Linux/AArch64 archive" >&2
       exit 2
@@ -291,4 +296,10 @@ if LC_ALL=C grep -aF "$project_root" "$work/project/app.one" "$work/project/app.
   exit 1
 fi
 
-echo "release bundle gate: pass ($target, deterministic archive, extracted SDK, locked remote/offline workflow)"
+rm -rf "$bundle_root"
+if [ -e "$bundle_root" ]; then
+  echo "release gate: uninstall left the installed SDK behind" >&2
+  exit 1
+fi
+
+echo "release bundle gate: pass ($target, deterministic archive, install/uninstall, locked remote/offline workflow)"

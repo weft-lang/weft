@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 # Build one relocatable, target-specific Weft SDK archive and checksum.
+#
+# Ordinary invocations produce the byte-reproducible probe artifact used by
+# the repository gate.  WEFT_RELEASE_PUBLISH=1 selects the credentialed
+# release payload: the checkout must be exactly clean and a macOS payload must
+# be signed with a Developer ID identity before its archive digest is fixed.
 set -euo pipefail
 
 usage() {
@@ -20,12 +25,38 @@ esac
 
 project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 weft_bin=${WEFT:-"$project_root/weft"}
+publish=${WEFT_RELEASE_PUBLISH:-0}
+macos_signing_identity=${WEFT_MACOS_SIGNING_IDENTITY:-}
+case "$publish" in
+  0|1) ;;
+  *)
+    echo "release: WEFT_RELEASE_PUBLISH must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+if [ -n "$macos_signing_identity" ] && ! [[ "$macos_signing_identity" =~ ^[[:xdigit:]]{40}$ ]]; then
+  echo "release: WEFT_MACOS_SIGNING_IDENTITY must be a 40-hex certificate identity" >&2
+  exit 2
+fi
+if [ "$target" = linux-aarch64 ] && [ -n "$macos_signing_identity" ]; then
+  echo "release: a macOS signing identity cannot be applied to a Linux payload" >&2
+  exit 2
+fi
+if [ "$publish" = 1 ] && [ "$target" = macos-aarch64 ] && [ -z "$macos_signing_identity" ]; then
+  echo "release: publishing macos-aarch64 requires WEFT_MACOS_SIGNING_IDENTITY" >&2
+  exit 1
+fi
 case "$weft_bin" in
   /*) ;;
   *) weft_bin=$(CDPATH= cd -- "$(dirname "$weft_bin")" && pwd -P)/$(basename "$weft_bin") ;;
 esac
 
-if [ "${WEFT_RELEASE_ALLOW_DIRTY:-0}" != 1 ]; then
+if [ "$publish" = 1 ]; then
+  if [ -n "$(git -C "$project_root" status --porcelain=v1 --untracked-files=all)" ]; then
+    echo "release: a publishable payload requires an exactly clean checkout" >&2
+    exit 1
+  fi
+elif [ "${WEFT_RELEASE_ALLOW_DIRTY:-0}" != 1 ]; then
   if ! git -C "$project_root" diff --quiet --ignore-submodules -- ||
      ! git -C "$project_root" diff --cached --quiet --ignore-submodules --; then
     echo "release: tracked source is dirty; commit it or set WEFT_RELEASE_ALLOW_DIRTY=1 for a non-publishable probe" >&2
@@ -65,7 +96,11 @@ sha256_file() {
 }
 
 sdk_files="$work/sdk-files"
-git -C "$project_root" ls-files --cached --others --exclude-standard -- compiler runtime stdlib | LC_ALL=C sort > "$sdk_files"
+if [ "$publish" = 1 ]; then
+  git -C "$project_root" ls-files --cached -- compiler runtime stdlib | LC_ALL=C sort > "$sdk_files"
+else
+  git -C "$project_root" ls-files --cached --others --exclude-standard -- compiler runtime stdlib | LC_ALL=C sort > "$sdk_files"
+fi
 while IFS= read -r source; do
   destination="$bundle/lib/weft/$source"
   mkdir -p "$(dirname "$destination")"
@@ -95,13 +130,55 @@ cp "$project_root/LICENSE-APACHE" "$bundle/LICENSE-APACHE"
 chmod 644 "$bundle/LICENSE-MIT" "$bundle/LICENSE-APACHE"
 printf '%s\n' "$identity_json" > "$bundle/share/weft/product-identity.json"
 
+code_signing_json='{"kind":"none"}'
+if [ "$target" = macos-aarch64 ]; then
+  signature_details="$work/compiler-signature.txt"
+  if [ -n "$macos_signing_identity" ]; then
+    codesign --force --sign "$macos_signing_identity" --options runtime --timestamp "$bundle/bin/weft"
+    if ! codesign --verify --strict --verbose=2 "$bundle/bin/weft"; then
+      echo "release: Developer ID verification failed after signing" >&2
+      exit 1
+    fi
+    codesign --display --verbose=4 "$bundle/bin/weft" > /dev/null 2> "$signature_details"
+    signature_kind=developer-id
+  else
+    if ! codesign --verify --strict --verbose=2 "$bundle/bin/weft"; then
+      echo "release: deterministic ad-hoc compiler signature is invalid" >&2
+      exit 1
+    fi
+    codesign --display --verbose=4 "$bundle/bin/weft" > /dev/null 2> "$signature_details"
+    signature_kind=adhoc
+  fi
+
+  signature_identifier=$(sed -n 's/^Identifier=//p' "$signature_details" | head -1)
+  signature_cdhash=$(sed -n 's/^CDHash=//p' "$signature_details" | head -1)
+  if ! [[ "$signature_identifier" =~ ^[A-Za-z0-9._-]+$ ]] ||
+     ! [[ "$signature_cdhash" =~ ^[[:xdigit:]]{40}$ ]]; then
+    echo "release: signed compiler identity is malformed" >&2
+    exit 1
+  fi
+
+  if [ "$signature_kind" = developer-id ]; then
+    signature_authority=$(sed -n 's/^Authority=//p' "$signature_details" | head -1)
+    signature_team=$(sed -n 's/^TeamIdentifier=//p' "$signature_details" | head -1)
+    if [[ "$signature_authority" != 'Developer ID Application: '* ]] ||
+       ! [[ "$signature_team" =~ ^[A-Za-z0-9]+$ ]]; then
+      echo "release: selected certificate is not a Developer ID Application identity" >&2
+      exit 1
+    fi
+    code_signing_json="{\"kind\":\"developer-id\",\"identifier\":\"$signature_identifier\",\"team_id\":\"$signature_team\",\"cdhash\":\"$signature_cdhash\",\"hardened_runtime\":true,\"timestamped\":true}"
+  else
+    code_signing_json="{\"kind\":\"adhoc\",\"identifier\":\"$signature_identifier\",\"cdhash\":\"$signature_cdhash\",\"publishable\":false}"
+  fi
+fi
+
 compiler_sha=$(sha256_file "$bundle/bin/weft")
 standalone_contract="stable libSystem operating-system ABI"
 if [ "$target" = linux-aarch64 ]; then
   standalone_contract="Linux kernel ABI; no interpreter or runtime library"
 fi
 printf '%s\n' \
-  "{\"release_schema_version\":1,\"target\":\"$target\",\"source_commit\":\"$source_commit\",\"compiler_sha256\":\"$compiler_sha\",\"sdk_layout\":\"lib/weft\",\"standalone_contract\":\"$standalone_contract\",\"native_dependencies\":[{\"name\":\"Mbed TLS\",\"version\":\"3.6.7\",\"source\":\"https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2\",\"source_sha256\":\"a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6\",\"archive_sha256\":\"$native_archive_sha\",\"license\":\"Apache-2.0\"}],\"product_identity\":$identity_json}" \
+  "{\"release_schema_version\":2,\"target\":\"$target\",\"source_commit\":\"$source_commit\",\"compiler_sha256\":\"$compiler_sha\",\"sdk_layout\":\"lib/weft\",\"standalone_contract\":\"$standalone_contract\",\"code_signing\":$code_signing_json,\"native_dependencies\":[{\"name\":\"Mbed TLS\",\"version\":\"3.6.7\",\"source\":\"https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2\",\"source_sha256\":\"a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6\",\"archive_sha256\":\"$native_archive_sha\",\"license\":\"Apache-2.0\"}],\"product_identity\":$identity_json}" \
   > "$bundle/share/weft/provenance.json"
 chmod 644 "$bundle/share/weft/"*.json
 
@@ -169,6 +246,13 @@ fi
 mkdir -p "$output_dir"
 output_dir=$(CDPATH= cd -- "$output_dir" && pwd -P)
 output_archive="$output_dir/$bundle_name.tar"
+if [ "$publish" = 1 ] &&
+   { [ -e "$output_archive" ] || [ -e "$output_archive.sha256" ] ||
+     [ -e "$output_archive.release" ] || [ -e "$output_archive.release.sig" ] ||
+     [ -e "$output_archive.notarization.json" ]; }; then
+  echo "release: refusing to overwrite an existing published artifact" >&2
+  exit 1
+fi
 cp "$archive" "$output_archive"
 archive_sha=$(sha256_file "$output_archive")
 printf '%s  %s\n' "$archive_sha" "$bundle_name.tar" > "$output_archive.sha256"

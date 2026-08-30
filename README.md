@@ -134,7 +134,8 @@ separately maintained version string.
 
 Target-specific SDK archives are built without a host linker and include the
 compiler, its `stdlib/` and `runtime/` sources, compatibility facts, provenance,
-licenses, and a checksum:
+licenses, and a checksum. This command produces the byte-reproducible local
+probe used by the repository gate:
 
 ```bash
 tools/build_release_bundle.sh macos-aarch64 dist
@@ -147,9 +148,26 @@ weft --version
 Use `linux-aarch64` and `sha256sum -c` on Linux. Keep the extracted `bin/` and
 `lib/weft/` tree together: the compiler discovers its SDK relative to its own
 executable, with no checkout path or environment override. Removing that one
-directory uninstalls it. The archive bytes and clean extracted project flow are
-tested on both targets; signing/notarization of the eventual macOS download
-channel remains a public-alpha release step.
+directory uninstalls it. The archive bytes and clean install, project, offline
+rebuild, and uninstall flow are tested on both targets.
+
+Published artifacts use a separate fail-closed ceremony. Every target carries
+a signed `*.tar.release` manifest binding the archive digest, size, source
+commit, target, and platform-authenticity facts. Verify it using the project's
+allowed-signers file obtained through a separately trusted channel:
+
+```bash
+tools/verify_release_bundle.sh \
+  dist/weft-0.1.0-macos-aarch64.tar \
+  /path/to/weft-allowed-signers weft-release
+```
+
+`tools/publish_release_bundle.sh` creates those sidecars. Linux uses the
+detached release signature; macOS additionally requires a timestamped
+Developer ID signature, accepted Apple notarization, and a successful
+Gatekeeper assessment of the exact compiler in the archive. Private signing
+keys and Apple credentials are never accepted from a manifest or committed to
+the SDK.
 
 ## The Ideas
 

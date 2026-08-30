@@ -9,8 +9,10 @@ This guide describes both the repository toolchain and the extracted SDK shape
 as they exist now. `weft build` is the native final-product path, including
 cross-target selection and artifact facts. Installed-SDK discovery,
 deterministic target archives, direct `weft run` execution, and immutable
-locked-source acquisition are implemented. The public signing/notarization
-channel has not landed yet.
+locked-source acquisition are implemented. The release command now enforces
+detached artifact signatures and the complete Developer ID/notarization path;
+the production keys and Apple identity remain release-owner authority, never
+repository data.
 
 ## Install a local SDK archive
 
@@ -31,6 +33,59 @@ Preserve the extracted layout: `bin/weft` locates canonical `stdlib/` and
 that directory to a user-owned location and putting its `bin/` on `PATH`;
 uninstallation removes that directory and its PATH entry. No unrelated files
 are mutated.
+
+The checksum detects accidental corruption; a public download is authenticated
+by its signed release manifest. Obtain the project's OpenSSH allowed-signers
+file through a separately trusted project channel, then verify before
+extracting:
+
+```bash
+tools/verify_release_bundle.sh \
+  weft-0.1.0-macos-aarch64.tar \
+  /path/to/weft-allowed-signers weft-release
+```
+
+The verifier authenticates `*.tar.release.sig` in the `weft-release` signature
+namespace before trusting the manifest, then checks its archive name, target,
+SHA-256, byte length, source commit, platform-signing facts, safe member paths,
+unique members, and absence of links or special files. A macOS manifest is
+accepted only when it names a Developer ID code-directory hash and matching
+accepted notarization result. A Linux manifest must explicitly state that
+platform code signing and notarization do not apply; its detached manifest
+signature is still mandatory.
+
+## Release-owner ceremony
+
+Release signing is intentionally distinct from deterministic local bundle
+construction. The OpenSSH private key path, its public allowed-signers policy,
+and signer principal are explicit release-owner inputs:
+
+```bash
+WEFT_RELEASE_SIGNING_KEY=/secure/weft-release-ed25519 \
+WEFT_RELEASE_SIGNER=weft-release \
+WEFT_RELEASE_ALLOWED_SIGNERS=/secure/weft-allowed-signers \
+tools/publish_release_bundle.sh linux-aarch64 dist
+```
+
+The macOS ceremony additionally selects a 40-hex Developer ID certificate
+identity and an existing `notarytool` Keychain profile:
+
+```bash
+WEFT_RELEASE_SIGNING_KEY=/secure/weft-release-ed25519 \
+WEFT_RELEASE_SIGNER=weft-release \
+WEFT_RELEASE_ALLOWED_SIGNERS=/secure/weft-allowed-signers \
+WEFT_MACOS_SIGNING_IDENTITY=0123456789abcdef0123456789abcdef01234567 \
+WEFT_NOTARY_KEYCHAIN_PROFILE=weft-release \
+tools/publish_release_bundle.sh macos-aarch64 dist
+```
+
+Publish mode refuses a dirty checkout, untracked SDK input, missing authority,
+malformed identities, contradictory target-signing facts, or any pre-existing
+output it could overwrite. It signs the exact Mach-O before fixing the archive
+digest, submits a temporary ZIP containing that same code directory, requires
+an `Accepted` notarization response, and exercises `spctl` against the accepted
+compiler. The distributed set is the `.tar`, `.tar.sha256`, `.tar.release`,
+`.tar.release.sig`, and—on macOS—`.tar.notarization.json`.
 
 The repository trust root remains a valid contributor setup. On an
 Apple-Silicon Mac, clone the repository and verify it directly:
@@ -272,10 +327,13 @@ A hosted registry and full semver solver are not part of the first alpha.
 An installed compiler resolves canonical `stdlib/` and `runtime/` imports from
 its own adjacent SDK while project and dependency imports continue through the
 project graph. `test/run_release_bundle.sh` verifies the commands above from an
-actual extracted archive, in a clean temporary project, with only the bundle's
-`bin/` on the compiler PATH. It acquires a pinned archive through a deterministic
-local HTTPS-provider fixture, removes that provider and source, then performs
-the offline rebuild in a network-disabled Linux/AArch64 container.
+actual archive moved into a clean installation root, with only the installed
+bundle's `bin/` on the compiler PATH. It acquires a pinned archive through a
+deterministic local HTTPS-provider fixture, removes that provider and source,
+performs the offline rebuild in a network-disabled Linux/AArch64 container,
+and removes the exact installed SDK at the end. `test/run_release_signing.sh`
+pins signature trust, tamper refusal, platform-fact consistency, archive safety,
+and missing-authority failures without containing any production credential.
 
 ## Diagnostics, formatting, and API docs
 
@@ -297,8 +355,8 @@ documented/public API census; it never reconstructs signatures from text.
 ## Where the alpha deliberately stops
 
 Before the public-alpha cut, the workboard still requires the complete
-target-local Linux release matrix on CI, safe TLS/HTTP, the final
-example-product exercise, and release signing/hardening.
+target-local Linux release matrix on adequate hardware, the credentialed
+two-target release ceremony, platform diagnostics, and release hardening.
 x86-64, a hosted package registry,
 HTTP/2+ and a forever-stable native ABI are explicitly later.
 The authoritative live status is the repository README and, for contributors,

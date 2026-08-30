@@ -365,6 +365,16 @@ else
 fi
 
 echo ""
+echo "=== Release Signing Tests ==="
+if bash test/run_release_signing.sh; then
+  PASS=$((PASS+1))
+else
+  echo "  ✗ release signing tests failed"
+  FAIL=$((FAIL+1))
+  ERRORS="$ERRORS\n  release signing tests failed"
+fi
+
+echo ""
 echo "=== Formatter Dogfood ==="
 if bash test/tools/run_formatter_dogfood.sh; then
   PASS=$((PASS+1))
