@@ -9,10 +9,11 @@ This guide describes both the repository toolchain and the extracted SDK shape
 as they exist now. `weft build` is the native final-product path, including
 cross-target selection and artifact facts. Installed-SDK discovery,
 deterministic target archives, direct `weft run` execution, and immutable
-locked-source acquisition are implemented. The release command now enforces
-detached artifact signatures and the complete Developer ID/notarization path;
-the production keys and Apple identity remain release-owner authority, never
-repository data.
+locked-source acquisition are implemented. The release command enforces
+detached project signatures on every public artifact. The default macOS
+community channel is free and explicit; optional Developer ID/notarization is
+a separate distribution channel. Private keys remain release-owner authority,
+never repository data.
 
 ## Install a local SDK archive
 
@@ -48,11 +49,13 @@ tools/verify_release_bundle.sh \
 The verifier authenticates `*.tar.release.sig` in the `weft-release` signature
 namespace before trusting the manifest, then checks its archive name, target,
 SHA-256, byte length, source commit, platform-signing facts, safe member paths,
-unique members, and absence of links or special files. A macOS manifest is
-accepted only when it names a Developer ID code-directory hash and matching
-accepted notarization result. A Linux manifest must explicitly state that
-platform code signing and notarization do not apply; its detached manifest
-signature is still mandatory.
+unique members, and absence of links or special files. A macOS manifest must
+name exactly one supported channel: the community channel binds the embedded
+ad-hoc code-directory hash and states that notarization was not requested; the
+optional notarized channel binds a Developer ID code-directory hash and the
+matching accepted notarization result. A Linux manifest must explicitly state
+that platform code signing and notarization do not apply. The detached project
+signature is mandatory in every case.
 
 ## Release-owner ceremony
 
@@ -67,13 +70,31 @@ WEFT_RELEASE_ALLOWED_SIGNERS=/secure/weft-allowed-signers \
 tools/publish_release_bundle.sh linux-aarch64 dist
 ```
 
-The macOS ceremony additionally selects a 40-hex Developer ID certificate
-identity and an existing `notarytool` Keychain profile:
+The default macOS community ceremony needs no Apple account or paid identity:
 
 ```bash
 WEFT_RELEASE_SIGNING_KEY=/secure/weft-release-ed25519 \
 WEFT_RELEASE_SIGNER=weft-release \
 WEFT_RELEASE_ALLOWED_SIGNERS=/secure/weft-allowed-signers \
+tools/publish_release_bundle.sh macos-aarch64 dist
+```
+
+It authenticates the archive with the project key and records the compiler's
+deterministic ad-hoc Mach-O code-directory hash. The first time a downloaded
+compiler is run, Gatekeeper may block the unidentified developer. After that
+launch attempt, open **System Settings → Privacy & Security**, choose **Open
+Anyway** for `weft`, authenticate, and run the command again. This is a
+one-time approval for that compiler; it does not weaken Gatekeeper globally.
+
+If a future release owner chooses the paid Apple channel, select it explicitly
+with a 40-hex Developer ID certificate identity and an existing `notarytool`
+Keychain profile:
+
+```bash
+WEFT_RELEASE_SIGNING_KEY=/secure/weft-release-ed25519 \
+WEFT_RELEASE_SIGNER=weft-release \
+WEFT_RELEASE_ALLOWED_SIGNERS=/secure/weft-allowed-signers \
+WEFT_MACOS_DISTRIBUTION=notarized \
 WEFT_MACOS_SIGNING_IDENTITY=0123456789abcdef0123456789abcdef01234567 \
 WEFT_NOTARY_KEYCHAIN_PROFILE=weft-release \
 tools/publish_release_bundle.sh macos-aarch64 dist
@@ -81,11 +102,13 @@ tools/publish_release_bundle.sh macos-aarch64 dist
 
 Publish mode refuses a dirty checkout, untracked SDK input, missing authority,
 malformed identities, contradictory target-signing facts, or any pre-existing
-output it could overwrite. It signs the exact Mach-O before fixing the archive
-digest, submits a temporary ZIP containing that same code directory, requires
-an `Accepted` notarization response, and exercises `spctl` against the accepted
-compiler. The distributed set is the `.tar`, `.tar.sha256`, `.tar.release`,
-`.tar.release.sig`, and—on macOS—`.tar.notarization.json`.
+output it could overwrite. Community publishing verifies the exact ad-hoc
+Mach-O signature before fixing the archive digest. Notarized publishing signs
+that exact Mach-O before hashing, submits a temporary ZIP containing the same
+code directory, requires an `Accepted` response, and exercises `spctl`. Every
+release distributes `.tar`, `.tar.sha256`, `.tar.release`, and
+`.tar.release.sig`; only the notarized macOS channel adds
+`.tar.notarization.json`.
 
 The repository trust root remains a valid contributor setup. On an
 Apple-Silicon Mac, clone the repository and verify it directly:
@@ -355,8 +378,9 @@ documented/public API census; it never reconstructs signatures from text.
 ## Where the alpha deliberately stops
 
 Before the public-alpha cut, the workboard still requires the complete
-target-local Linux release matrix on adequate hardware, the credentialed
-two-target release ceremony, platform diagnostics, and release hardening.
+target-local Linux release matrix on adequate hardware, platform diagnostics,
+release-key governance, and release hardening. Paid Apple notarization is not
+an alpha gate.
 x86-64, a hosted package registry,
 HTTP/2+ and a forever-stable native ABI are explicitly later.
 The authoritative live status is the repository README and, for contributors,

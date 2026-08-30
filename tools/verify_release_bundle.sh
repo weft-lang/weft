@@ -114,26 +114,36 @@ fi
 case "$target" in
   macos-aarch64)
     if [[ "$code_signing" =~ ^developer-id:([A-Za-z0-9]+):([[:xdigit:]]{40})$ ]]; then
+      macos_distribution=notarized
       signed_team=${BASH_REMATCH[1]}
       signed_cdhash=${BASH_REMATCH[2]}
+      if ! [[ "$notarization" =~ ^accepted:[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+        echo "release verification: notarized macOS release lacks an accepted notarization identity" >&2
+        exit 1
+      fi
+      notary_id=${notarization#accepted:}
+      notary_result="$archive.notarization.json"
+      if [ ! -f "$notary_result" ] ||
+         ! grep -Eq '"status"[[:space:]]*:[[:space:]]*"Accepted"' "$notary_result" ||
+         ! grep -Eq '"id"[[:space:]]*:[[:space:]]*"'"$notary_id"'"' "$notary_result"; then
+        echo "release verification: notarization result does not match the signed manifest" >&2
+        exit 1
+      fi
+    elif [[ "$code_signing" =~ ^adhoc:([[:xdigit:]]{40})$ ]]; then
+      macos_distribution=community
+      signed_cdhash=${BASH_REMATCH[1]}
+      if [ "$notarization" != not-requested ] ||
+         [ -e "$archive.notarization.json" ]; then
+        echo "release verification: community macOS release contains contradictory notarization facts" >&2
+        exit 1
+      fi
     else
-      echo "release verification: macOS release lacks Developer ID or accepted notarization identity" >&2
-      exit 1
-    fi
-    if ! [[ "$notarization" =~ ^accepted:[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
-      echo "release verification: macOS release lacks Developer ID or accepted notarization identity" >&2
-      exit 1
-    fi
-    notary_id=${notarization#accepted:}
-    notary_result="$archive.notarization.json"
-    if [ ! -f "$notary_result" ] ||
-       ! grep -Eq '"status"[[:space:]]*:[[:space:]]*"Accepted"' "$notary_result" ||
-       ! grep -Eq '"id"[[:space:]]*:[[:space:]]*"'"$notary_id"'"' "$notary_result"; then
-      echo "release verification: notarization result does not match the signed manifest" >&2
+      echo "release verification: macOS release has an unsupported signing identity" >&2
       exit 1
     fi
     ;;
   linux-aarch64)
+    macos_distribution=not-applicable
     if [ "$code_signing" != none ] || [ "$notarization" != not-applicable ]; then
       echo "release verification: Linux release contains contradictory platform-signing facts" >&2
       exit 1
@@ -183,11 +193,20 @@ if [ "$target" = macos-aarch64 ]; then
   actual_authority=$(sed -n 's/^Authority=//p' "$signature_details" | head -1)
   actual_team=$(sed -n 's/^TeamIdentifier=//p' "$signature_details" | head -1)
   actual_cdhash=$(sed -n 's/^CDHash=//p' "$signature_details" | head -1)
-  if [[ "$actual_authority" != 'Developer ID Application: '* ]] ||
-     [ "$actual_team" != "$signed_team" ] || [ "$actual_cdhash" != "$signed_cdhash" ]; then
-    echo "release verification: embedded Developer ID does not match the signed manifest" >&2
-    exit 1
+  if [ "$macos_distribution" = community ]; then
+    actual_kind=$(sed -n 's/^Signature=//p' "$signature_details" | head -1)
+    if [ "$actual_kind" != adhoc ] || [ -n "$actual_authority" ] ||
+       [ "$actual_cdhash" != "$signed_cdhash" ]; then
+      echo "release verification: embedded ad-hoc signature does not match the signed manifest" >&2
+      exit 1
+    fi
+  else
+    if [[ "$actual_authority" != 'Developer ID Application: '* ]] ||
+       [ "$actual_team" != "$signed_team" ] || [ "$actual_cdhash" != "$signed_cdhash" ]; then
+      echo "release verification: embedded Developer ID does not match the signed manifest" >&2
+      exit 1
+    fi
   fi
 fi
 
-echo "release verification: pass ($target, signer $signer)"
+echo "release verification: pass ($target, signer $signer, $macos_distribution)"

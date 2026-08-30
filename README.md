@@ -162,12 +162,14 @@ tools/verify_release_bundle.sh \
   /path/to/weft-allowed-signers weft-release
 ```
 
-`tools/publish_release_bundle.sh` creates those sidecars. Linux uses the
-detached release signature; macOS additionally requires a timestamped
-Developer ID signature, accepted Apple notarization, and a successful
-Gatekeeper assessment of the exact compiler in the archive. Private signing
-keys and Apple credentials are never accepted from a manifest or committed to
-the SDK.
+`tools/publish_release_bundle.sh` creates those sidecars. Linux and the default
+macOS community channel are authenticated by the same project signature. The
+macOS compiler retains its deterministic ad-hoc code signature, so Gatekeeper
+may require one launch attempt followed by **System Settings → Privacy &
+Security → Open Anyway**. Developer ID and notarization are an optional
+`WEFT_MACOS_DISTRIBUTION=notarized` channel, not an alpha or source-build
+requirement. Private project keys and optional Apple credentials are never
+accepted from a manifest or committed to the SDK.
 
 ## The Ideas
 

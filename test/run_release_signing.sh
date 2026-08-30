@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Fast release-ceremony contract tests. Production keys and Apple credentials
-# are never fixtures; an ephemeral Ed25519 key proves the detached-signature
-# boundary while the publish commands fail closed when real authority is absent.
+# Fast release-ceremony contract tests. Production keys and optional Apple
+# credentials are never fixtures; an ephemeral Ed25519 key proves the project
+# signature boundary while every distribution channel remains explicit.
 set -euo pipefail
 
 project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
@@ -116,10 +116,30 @@ if command -v codesign >/dev/null 2>&1; then
     "bytes $mac_bytes" \
     'signer weft-release' \
     'source-commit 0000000000000000000000000000000000000000' \
+    "code-signing adhoc:$mac_cdhash" \
+    'notarization not-requested' > "$mac_archive.release"
+  printf '%s  %s\n' "$mac_sha" weft-0.1.0-macos-aarch64.tar > "$mac_archive.sha256"
+  WEFT_RELEASE_SIGNING_KEY="$work/key" \
+    "$project_root/tools/sign_release_manifest.sh" "$mac_archive.release" >/dev/null
+  "$project_root/tools/verify_release_bundle.sh" \
+    "$mac_archive" "$work/allowed_signers" weft-release >/dev/null
+
+  printf '%s\n' '{"id":"00000000-0000-0000-0000-000000000000","status":"Accepted"}' > "$mac_archive.notarization.json"
+  expect_failure "contradictory community notarization" \
+    "$project_root/tools/verify_release_bundle.sh" \
+    "$mac_archive" "$work/allowed_signers" weft-release
+
+  rm "$mac_archive.release.sig"
+  printf '%s\n' \
+    'schema weft-release-manifest-v1' \
+    'target macos-aarch64' \
+    'artifact weft-0.1.0-macos-aarch64.tar' \
+    "sha256 $mac_sha" \
+    "bytes $mac_bytes" \
+    'signer weft-release' \
+    'source-commit 0000000000000000000000000000000000000000' \
     "code-signing developer-id:TESTTEAM:$mac_cdhash" \
     'notarization accepted:00000000-0000-0000-0000-000000000000' > "$mac_archive.release"
-  printf '%s  %s\n' "$mac_sha" weft-0.1.0-macos-aarch64.tar > "$mac_archive.sha256"
-  printf '%s\n' '{"id":"00000000-0000-0000-0000-000000000000","status":"Accepted"}' > "$mac_archive.notarization.json"
   WEFT_RELEASE_SIGNING_KEY="$work/key" \
     "$project_root/tools/sign_release_manifest.sh" "$mac_archive.release" >/dev/null
   expect_failure "claimed Developer ID" "$project_root/tools/verify_release_bundle.sh" \
@@ -133,7 +153,13 @@ expect_failure "publish authority" env \
   "$project_root/tools/publish_release_bundle.sh" linux-aarch64 "$work/publish"
 expect_failure "Developer ID authority" env \
   WEFT_RELEASE_PUBLISH=1 \
+  WEFT_MACOS_DISTRIBUTION=notarized \
   -u WEFT_MACOS_SIGNING_IDENTITY \
   "$project_root/tools/build_release_bundle.sh" macos-aarch64 "$work/publish"
+expect_failure "community Apple authority" env \
+  WEFT_RELEASE_PUBLISH=1 \
+  WEFT_MACOS_DISTRIBUTION=community \
+  WEFT_MACOS_SIGNING_IDENTITY=0123456789abcdef0123456789abcdef01234567 \
+  "$project_root/tools/build_release_bundle.sh" macos-aarch64 "$work/publish"
 
-echo "release signing tests: pass (trusted manifest, tamper/refusal, platform facts, safe archive)"
+echo "release signing tests: pass (trusted manifest, community macOS, platform facts, safe archive)"

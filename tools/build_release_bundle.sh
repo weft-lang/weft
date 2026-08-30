@@ -2,9 +2,9 @@
 # Build one relocatable, target-specific Weft SDK archive and checksum.
 #
 # Ordinary invocations produce the byte-reproducible probe artifact used by
-# the repository gate.  WEFT_RELEASE_PUBLISH=1 selects the credentialed
-# release payload: the checkout must be exactly clean and a macOS payload must
-# be signed with a Developer ID identity before its archive digest is fixed.
+# the repository gate. WEFT_RELEASE_PUBLISH=1 selects an authenticated public
+# payload from an exactly clean tree. macOS defaults to the project-signed
+# `community` channel; the optional `notarized` channel adds Developer ID.
 set -euo pipefail
 
 usage() {
@@ -27,6 +27,7 @@ project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 weft_bin=${WEFT:-"$project_root/weft"}
 publish=${WEFT_RELEASE_PUBLISH:-0}
 macos_signing_identity=${WEFT_MACOS_SIGNING_IDENTITY:-}
+macos_distribution=${WEFT_MACOS_DISTRIBUTION:-community}
 case "$publish" in
   0|1) ;;
   *)
@@ -38,13 +39,36 @@ if [ -n "$macos_signing_identity" ] && ! [[ "$macos_signing_identity" =~ ^[[:xdi
   echo "release: WEFT_MACOS_SIGNING_IDENTITY must be a 40-hex certificate identity" >&2
   exit 2
 fi
-if [ "$target" = linux-aarch64 ] && [ -n "$macos_signing_identity" ]; then
-  echo "release: a macOS signing identity cannot be applied to a Linux payload" >&2
+release_channel=probe
+if [ "$target" = macos-aarch64 ]; then
+  case "$macos_distribution" in
+    community|notarized) ;;
+    *)
+      echo "release: WEFT_MACOS_DISTRIBUTION must be community or notarized" >&2
+      exit 2
+      ;;
+  esac
+  if [ "$publish" = 0 ] &&
+     { [ -n "${WEFT_MACOS_DISTRIBUTION+x}" ] || [ -n "$macos_signing_identity" ]; }; then
+    echo "release: macOS distribution settings are only valid for publish mode" >&2
+    exit 2
+  fi
+  if [ "$publish" = 1 ]; then
+    release_channel=$macos_distribution
+    if [ "$macos_distribution" = notarized ] && [ -z "$macos_signing_identity" ]; then
+      echo "release: notarized macOS publishing requires WEFT_MACOS_SIGNING_IDENTITY" >&2
+      exit 1
+    fi
+    if [ "$macos_distribution" = community ] && [ -n "$macos_signing_identity" ]; then
+      echo "release: community macOS publishing cannot silently consume a Developer ID identity" >&2
+      exit 2
+    fi
+  fi
+elif [ -n "${WEFT_MACOS_DISTRIBUTION+x}" ] || [ -n "$macos_signing_identity" ]; then
+  echo "release: macOS distribution settings cannot be applied to a Linux payload" >&2
   exit 2
-fi
-if [ "$publish" = 1 ] && [ "$target" = macos-aarch64 ] && [ -z "$macos_signing_identity" ]; then
-  echo "release: publishing macos-aarch64 requires WEFT_MACOS_SIGNING_IDENTITY" >&2
-  exit 1
+elif [ "$publish" = 1 ]; then
+  release_channel=community
 fi
 case "$weft_bin" in
   /*) ;;
@@ -168,7 +192,7 @@ if [ "$target" = macos-aarch64 ]; then
     fi
     code_signing_json="{\"kind\":\"developer-id\",\"identifier\":\"$signature_identifier\",\"team_id\":\"$signature_team\",\"cdhash\":\"$signature_cdhash\",\"hardened_runtime\":true,\"timestamped\":true}"
   else
-    code_signing_json="{\"kind\":\"adhoc\",\"identifier\":\"$signature_identifier\",\"cdhash\":\"$signature_cdhash\",\"publishable\":false}"
+    code_signing_json="{\"kind\":\"adhoc\",\"identifier\":\"$signature_identifier\",\"cdhash\":\"$signature_cdhash\",\"gatekeeper\":\"unidentified-developer\"}"
   fi
 fi
 
@@ -178,7 +202,7 @@ if [ "$target" = linux-aarch64 ]; then
   standalone_contract="Linux kernel ABI; no interpreter or runtime library"
 fi
 printf '%s\n' \
-  "{\"release_schema_version\":2,\"target\":\"$target\",\"source_commit\":\"$source_commit\",\"compiler_sha256\":\"$compiler_sha\",\"sdk_layout\":\"lib/weft\",\"standalone_contract\":\"$standalone_contract\",\"code_signing\":$code_signing_json,\"native_dependencies\":[{\"name\":\"Mbed TLS\",\"version\":\"3.6.7\",\"source\":\"https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2\",\"source_sha256\":\"a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6\",\"archive_sha256\":\"$native_archive_sha\",\"license\":\"Apache-2.0\"}],\"product_identity\":$identity_json}" \
+  "{\"release_schema_version\":2,\"release_channel\":\"$release_channel\",\"target\":\"$target\",\"source_commit\":\"$source_commit\",\"compiler_sha256\":\"$compiler_sha\",\"sdk_layout\":\"lib/weft\",\"standalone_contract\":\"$standalone_contract\",\"code_signing\":$code_signing_json,\"native_dependencies\":[{\"name\":\"Mbed TLS\",\"version\":\"3.6.7\",\"source\":\"https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2\",\"source_sha256\":\"a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6\",\"archive_sha256\":\"$native_archive_sha\",\"license\":\"Apache-2.0\"}],\"product_identity\":$identity_json}" \
   > "$bundle/share/weft/provenance.json"
 chmod 644 "$bundle/share/weft/"*.json
 
