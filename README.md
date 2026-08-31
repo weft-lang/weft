@@ -53,7 +53,7 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 **Pre-alpha and self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root. Until the public-alpha gate closes, source, package, fact-schema, and versioned native-binding contracts may change without compatibility support.
 
-- 4277 runtime test blocks across 345 files, plus 823 negative (must-fail) cases
+- 4278 runtime test blocks across 345 files, plus 823 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
 - Current release gates: the complete target-local Linux suite on adequate hardware, hardening/governance, final status/support documentation, and the two-target outside-user exercise. Install/release UX, project signing, free community macOS distribution, and native-binding platform diagnostics are complete
@@ -256,13 +256,17 @@ Small algorithm kernels with sibling Weft, Go, and Rust implementations (same al
 | sorted_lookup | 38.5 ms | 17.6 ms | 8.1 ms | 160 KB | 397 ms |
 
 Read this table as a dated lowering/codegen snapshot, not a language scorecard.
-The current compiler-throughput result is not yet acceptable as a release
-baseline: three quiet self-compiles took 30.47–31.76 seconds wall time. Versioned
-phase metrics report 26.60 seconds for 13,034 emitted functions, compared with
-18.23 seconds for 10,938 functions in the 2026-08-21 tree on the same machine.
-The disproportionate cost is in optimization and native emission, so the
-difference is tracked as a performance regression rather than excused as corpus
-growth.
+The same repository audit initially found a real compiler-throughput regression:
+three quiet self-compiles took 30.47–31.76 seconds. Executable function-graph
+closure was rescanning every relocation for every candidate function on every
+fixpoint pass. Indexing relocation demands at their producer removed that
+quadratic path. Three quiet fixed-point self-compiles now take 22.51–23.22
+seconds (median 23.04); median phase time is 22.88 seconds, including 12.23
+seconds optimizing and 6.05 seconds emitting 13,035 functions. On identical
+2026-08-21 source, ten alternating pairs put the fixed compiler at 17.91 seconds
+versus 18.80 seconds for the historical compiler (4.60% faster). All six
+algorithm products remain byte-identical across the change and their paired
+runtime verdicts are flat.
 
 Reproduce the algorithm snapshot with `bash bench_compare.sh`; its timestamped
 JSONL output is local measurement data and is ignored by Git. For compiler
