@@ -228,7 +228,7 @@ def generate_property_source(
         constants.append(
             f"pub(package) fn unicode_incb_{name.lower()}() -> i64 {{ {index} }}"
         )
-    return f'''-- stdlib/unicode_segmentation_data.weft -- GENERATED; DO NOT EDIT
+    return f'''-- stdlib/unicode/data/segmentation.weft -- GENERATED; DO NOT EDIT
 -- Unicode {UNICODE_VERSION} UAX #29 break properties.
 -- GraphemeBreakProperty SHA-256: {INPUTS['grapheme_property'][1]}
 -- WordBreakProperty SHA-256: {INPUTS['word_property'][1]}
@@ -354,7 +354,7 @@ def generate_test_source(
 -- Generator: tools/generate_unicode_segmentation_data.py
 
 use runtime/memory.{{mem_load8_at}}
-use stdlib/unicode_segmentation_data.{{unicode_segmentation_hex}}
+use stdlib/unicode/data/segmentation.{{unicode_segmentation_hex}}
 
 pub(package) type UnicodeSegmentationTestCase {{
   UnicodeSegmentationTestCase(i64, i64, i64)
@@ -401,7 +401,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=pathlib.Path("stdlib/unicode_segmentation_data.weft"),
+        default=pathlib.Path("stdlib/unicode/data/segmentation.weft"),
     )
     parser.add_argument(
         "--test-output",

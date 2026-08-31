@@ -14,7 +14,7 @@ use stdlib/dns.{DnsAnyFamily, dns_numeric_candidates}
 use stdlib/net_address.{IpV4, SocketAddress, ipv4_address}
 use stdlib/result.{Err, Ok}
 use stdlib/vector.{vector_len}
-use stdlib/vector_type.{Vector}
+use stdlib/vector/handles.{Vector}
 
 fn main() -> i64 {
   match dns_numeric_candidates(
@@ -45,7 +45,7 @@ use stdlib/net_address.{SocketAddress}
 use stdlib/result.{Result}
 use stdlib/tcp.{TcpConnect, TcpConnectPolicyAllowOnly, TcpConnectOptions, TcpError, TcpListen, TcpListenOptions, TcpListenPolicyAllowOnly, TcpListener, TcpStream, tcp_connect, tcp_connect_with_policy, tcp_listen, tcp_listen_with_policy}
 use stdlib/vector.{vector_new, vector_push}
-use stdlib/vector_type.{Vector}
+use stdlib/vector/handles.{Vector}
 
 fn resolve_allowed(host: DomainName) -[DnsResolve]> Result<Vector<SocketAddress>, DnsError> {
   let targets = vector_new<DnsPolicyTarget>()
@@ -125,10 +125,10 @@ independent locale conversion or hostname normalization.
 
 The public HTTP layers separate outbound `HttpClient` from inbound
 `HttpServer` authority. Pure `stdlib/http` values and parsers share one
-framing truth with production and replay handlers; `stdlib/http_endpoint`
+framing truth with production and replay handlers; `stdlib/http/endpoint`
 owns client/server transport, pooling, redirects, upgrades, and connection
-reuse. `stdlib/http_json`, `stdlib/sse_stream`, and
-`stdlib/websocket_stream` join bounded semantic adapters to an exact owned
+reuse. `stdlib/http/json`, `stdlib/sse/stream`, and
+`stdlib/websocket/stream` join bounded semantic adapters to an exact owned
 body or upgraded connection. Their transitions return the owner on completion,
 retry, cancellation, and typed failure, so streaming does not hide whole-body
 buffering or resource loss.

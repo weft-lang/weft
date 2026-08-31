@@ -747,7 +747,7 @@ def generate_compatibility_source(
     maximum_expansion = maximum_decomposition_expansion(
         canonical_decompositions, compatibility_decompositions, True
     )
-    return f'''-- stdlib/unicode_compatibility_data.weft -- GENERATED; DO NOT EDIT
+    return f'''-- stdlib/unicode/data/compatibility.weft -- GENERATED; DO NOT EDIT
 -- Unicode {UNICODE_VERSION} compatibility-decomposition substrate.
 -- UnicodeData SHA-256: {INPUTS['unicode_data'][1]}
 -- DerivedNormalizationProps SHA-256: {INPUTS['derived_normalization'][1]}
@@ -803,7 +803,7 @@ def main() -> int:
     parser.add_argument(
         "--compatibility-output",
         type=pathlib.Path,
-        default=pathlib.Path("stdlib/unicode_compatibility_data.weft"),
+        default=pathlib.Path("stdlib/unicode/data/compatibility.weft"),
     )
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()

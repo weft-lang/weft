@@ -231,7 +231,7 @@ Application code just writes `T`. The compiler classifies storage (stack, inline
 use stdlib/fail.{Fail}
 use stdlib/file.{file_close, file_open_read}
 use stdlib/io.{FileHandle, IO}
-use stdlib/io_types.{IoError}
+use stdlib/io/types.{IoError}
 use stdlib/path.{Path}
 use stdlib/result.{Result}
 

@@ -246,7 +246,7 @@ def generate_source(
         [1]
         + [len(target) for values in (upper, lower, title, folding) for _, target in values]
     )
-    return f'''-- stdlib/unicode_case_data.weft -- GENERATED; DO NOT EDIT
+    return f'''-- stdlib/unicode/data/case.weft -- GENERATED; DO NOT EDIT
 -- Unicode {UNICODE_VERSION} default full case mappings and case folding.
 -- UnicodeData SHA-256: {INPUTS['unicode_data'][1]}
 -- SpecialCasing SHA-256: {INPUTS['special_casing'][1]}
@@ -317,7 +317,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=pathlib.Path("stdlib/unicode_case_data.weft"),
+        default=pathlib.Path("stdlib/unicode/data/case.weft"),
     )
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()

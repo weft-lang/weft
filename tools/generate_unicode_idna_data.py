@@ -353,7 +353,7 @@ def generate_data_source(
         f"pub(package) fn unicode_idna_joining_{name.lower()}() -> i64 {{ {index} }}"
         for index, name in enumerate(JOINING_NAMES)
     )
-    return f'''-- stdlib/unicode_idna_data.weft -- GENERATED; DO NOT EDIT
+    return f'''-- stdlib/unicode/data/idna.weft -- GENERATED; DO NOT EDIT
 -- Unicode {UNICODE_VERSION} UTS #46 revision {UTS46_REVISION} nontransitional data.
 -- IdnaMappingTable SHA-256: {INPUTS["mapping"][1]}
 -- DerivedBidiClass SHA-256: {INPUTS["bidi"][1]}
@@ -498,7 +498,7 @@ def generate_test_source(
 
 use runtime/memory.{{mem_load8_at, mem_store8_at}}
 use runtime/string.{{runtime_str_alloc_uninit, runtime_str_ptr}}
-use stdlib/unicode_idna_data.{{unicode_idna_hex}}
+use stdlib/unicode/data/idna.{{unicode_idna_hex}}
 
 pub(package) type UnicodeIdnaTestCase {{
   UnicodeIdnaTestCase(i64, i64, i64)
@@ -576,7 +576,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=pathlib.Path("stdlib/unicode_idna_data.weft"),
+        default=pathlib.Path("stdlib/unicode/data/idna.weft"),
     )
     parser.add_argument(
         "--test-output",

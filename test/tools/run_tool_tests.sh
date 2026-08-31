@@ -567,23 +567,23 @@ stdlib_doc_modules=(
   stdlib/assert.weft stdlib/default.weft stdlib/display.weft stdlib/drop.weft
   stdlib/eq.weft stdlib/hash.weft stdlib/ord.weft stdlib/panic.weft
   stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft
-  stdlib/maybe.weft stdlib/bytes.weft stdlib/path.weft stdlib/io_types.weft
+  stdlib/maybe.weft stdlib/bytes.weft stdlib/path.weft stdlib/io/types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft stdlib/env.weft
   stdlib/process.weft
   stdlib/json.weft
   stdlib/secure_random.weft stdlib/net_address.weft stdlib/idna.weft
   stdlib/dns.weft stdlib/tcp.weft stdlib/url.weft stdlib/tls.weft
-  stdlib/http.weft stdlib/http_stream.weft stdlib/http_endpoint.weft
-  stdlib/http_json.weft
-  stdlib/http_client.weft stdlib/sse.weft stdlib/sse_stream.weft
-  stdlib/websocket.weft stdlib/websocket_stream.weft
-  stdlib/state.weft stdlib/diagnostic_type.weft stdlib/diagnostic.weft
-  stdlib/diagnostic_registry.weft stdlib/map.weft stdlib/set.weft
-  stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector_type.weft
+  stdlib/http.weft stdlib/http/stream.weft stdlib/http/endpoint.weft
+  stdlib/http/json.weft
+  stdlib/http/client.weft stdlib/sse.weft stdlib/sse/stream.weft
+  stdlib/websocket.weft stdlib/websocket/stream.weft
+  stdlib/state.weft stdlib/diagnostic/schema.weft stdlib/diagnostic.weft
+  stdlib/diagnostic/registry.weft stdlib/map.weft stdlib/set.weft
+  stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector/handles.weft
   stdlib/vector.weft stdlib/generator.weft stdlib/iter.weft
-  stdlib/semantic_type.weft stdlib/semantic_type_render.weft
-  stdlib/f64_table.weft stdlib/num.weft stdlib/io_helpers.weft
+  stdlib/semantic_type.weft stdlib/semantic_type/render.weft
+  stdlib/f64_table.weft stdlib/num.weft stdlib/io/helpers.weft
   stdlib/utf8.weft stdlib/string.weft
   stdlib/io.weft stdlib/par.weft stdlib/cancellation.weft
   stdlib/shutdown.weft stdlib/channel.weft stdlib/spawn.weft
@@ -713,15 +713,15 @@ done
 internal_stdlib_modules=(
   continuation
   prelude
-  test_report
+  test/report
   thread
-  unicode_case_data
-  unicode_compatibility_data
-  unicode_idna_data
-  unicode_property_data
-  unicode_security
-  unicode_segmentation
-  unicode_segmentation_data
+  unicode/data/case
+  unicode/data/compatibility
+  unicode/data/idna
+  unicode/data/property
+  unicode/security
+  unicode/segmentation
+  unicode/data/segmentation
   unsafe
 )
 for internal_stdlib_module in "${internal_stdlib_modules[@]}"; do
@@ -4951,7 +4951,7 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_harness_emits_passing_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
 echo "  ok test_harness_binds_runtime_after_synthesis"
 
-printf 'use stdlib/diagnostic_type.{Diagnose} use stdlib/vector.{*} fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) let va = vector_new<i64>() let vb = vector_new<i64>() vector_push<i64>(va, 7) vector_push<i64>(vb, 7) Test.assert_i64_vector_eq(va, vb) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
+printf 'use stdlib/diagnostic/schema.{Diagnose} use stdlib/vector.{*} fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) let va = vector_new<i64>() let vb = vector_new<i64>() vector_push<i64>(va, 7) vector_push<i64>(vb, 7) Test.assert_i64_vector_eq(va, vb) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_supports_assertion_helpers" "$tmp_err" "unknown effect operation"
 chmod +x "$tmp_bin"
@@ -5354,7 +5354,7 @@ assert_test_failure_contains "test_snapshot_mismatch_reports_diagnostic" 'test "
 assert_test_failure_contains "test_property_failure_reports_diagnostic" 'test "fail_property" { Test.forall_i64_range(0, 4, x => x < 2) }' 1 "test assertion failed: forall_i64_range"
 assert_test_failure_contains "test_property_failure_reports_counterexample" 'test "fail_property" { Test.forall_i64_range(0, 4, x => x < 2) }' 1 "  counterexample: 2"
 assert_test_failure_contains "test_property_empty_range_reports_exhaustion" 'test "empty_property" { Test.forall_i64_range(3, 3, x => true) }' 1 "test assertion failed: forall_i64_range_empty"
-assert_test_exit_code "test_effect_fixtures_pass" 'use stdlib/diagnostic_type.{Diagnose} fn tool_fail8() -[Fail<i64>]> i64 { Fail.fail(8) } test "fixtures" { Test.assert_eq(Test.with_state_i64(2, () => { TestState.put(TestState.get() + 1) TestState.get() }), 3) Test.assert_eq(Test.expect_fail_i64(8, () => tool_fail8()), 8) Test.assert_eq(Test.with_io_i64(() => IO.open_append("path")), 103) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.note("ok", 0)), 3) }' 0
+assert_test_exit_code "test_effect_fixtures_pass" 'use stdlib/diagnostic/schema.{Diagnose} fn tool_fail8() -[Fail<i64>]> i64 { Fail.fail(8) } test "fixtures" { Test.assert_eq(Test.with_state_i64(2, () => { TestState.put(TestState.get() + 1) TestState.get() }), 3) Test.assert_eq(Test.expect_fail_i64(8, () => tool_fail8()), 8) Test.assert_eq(Test.with_io_i64(() => IO.open_append("path")), 103) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.note("ok", 0)), 3) }' 0
 assert_test_failure_contains "test_fixture_missing_fail_reports_diagnostic" 'test "missing_fail" { Test.expect_fail_i64(1, () => 0) }' 1 "test assertion failed: expect_fail_missing"
 assert_test_failure_contains "test_fixture_wrong_fail_reports_diagnostic" 'fn tool_fail2() -[Fail<i64>]> i64 { Fail.fail(2) } test "wrong_fail" { Test.expect_fail_i64(1, () => tool_fail2()) }' 1 "test assertion failed: expect_fail_i64"
 assert_test_failure_contains "test_fixture_wrong_fail_reports_expected" 'fn tool_fail2() -[Fail<i64>]> i64 { Fail.fail(2) } test "wrong_fail" { Test.expect_fail_i64(1, () => tool_fail2()) }' 1 "  expected: 1"

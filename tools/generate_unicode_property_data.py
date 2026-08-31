@@ -240,7 +240,7 @@ def generate_source(
         f"pub(package) fn unicode_property_{name.lower()}_bit() -> i64 {{ {1 << index} }}"
         for index, name in enumerate(BINARY_PROPERTIES)
     )
-    return f'''-- stdlib/unicode_property_data.weft -- GENERATED; DO NOT EDIT
+    return f'''-- stdlib/unicode/data/property.weft -- GENERATED; DO NOT EDIT
 -- Unicode {UNICODE_VERSION} general-category, script and binary properties.
 -- UnicodeData SHA-256: {INPUTS['unicode_data'][1]}
 -- Scripts SHA-256: {INPUTS['scripts'][1]}
@@ -310,7 +310,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=pathlib.Path("stdlib/unicode_property_data.weft"),
+        default=pathlib.Path("stdlib/unicode/data/property.weft"),
     )
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
