@@ -28,8 +28,7 @@ The workload set covers integer-heavy and float-heavy kernels:
   conversion
 - `nbody`: five-body solar-system update loop with `f64` state and `sqrt`
 - `sorted_lookup`: sorted_map build plus binary-search lookups through an
-  indirect comparator (ordered-collection lookup path; 2q churn canary)
+  indirect comparator (an ordered-collection churn canary)
 
-Further float-heavy published benchmarks such as `spectral-norm` need the
-next numeric-stdlib slices, especially broader math surfaces and typed float
-storage/array ergonomics.
+Further float-heavy published benchmarks such as `spectral-norm` need broader
+math surfaces and better typed float storage and array ergonomics.

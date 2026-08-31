@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """bench_verdict.py — paired A/B benchmark verdicts for Weft builds.
 
-Enforces the roadmap §3.2 measurement discipline by tooling: only
+Enforces the repository's measurement discipline by tooling: only
 same-session, interleaved, paired measurements are decision-grade. Given two
 compiler binaries (A = baseline, B = candidate), runs each workload as
 alternating AB/BA pairs and emits a verdict per workload:
@@ -209,7 +209,7 @@ TEST_RUNNER_SET = ["test/basics.weft"]
 
 class TestRunnerRun(Workload):
     """tools/test_runner.weft uses `use` imports, so weft emits a Mach-O
-    object that must be linked against libSystem (the 3h linked-object flow)."""
+    object that must be linked against libSystem (the linked-object flow)."""
 
     def __init__(self):
         super().__init__("test_runner")

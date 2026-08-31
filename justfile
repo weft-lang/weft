@@ -78,9 +78,9 @@ rc-census:
     chmod +x "$instrumented"
     "$instrumented" compile compiler/main.weft > "$output"
 
-# Run benchmarks and record results
+# Run the current algorithm comparison without mutating the source tree.
 bench:
-    bash bench.sh
+    BENCH_COMPARE_RECORD=0 bash bench_compare.sh
 
 # Exercise the real manifest-trusted fixture and Mbed TLS backend under the
 # target's allocation diagnostics. Linux rebuilds the pinned source archive

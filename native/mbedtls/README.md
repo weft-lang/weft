@@ -36,8 +36,8 @@ retains TCP, `SecureRandom`, `Time`, cancellation and buffer ownership.
 
 The current profile is TLS 1.2 only. Mbed TLS 3.6's TLS 1.3 path requires PSA's
 process-global random generator; enabling that would violate Weft's
-per-session capability boundary. TLS 1.3 therefore remains an explicit 3z
-design obligation rather than silently weakening randomness ownership.
+per-session capability boundary. TLS 1.3 therefore remains an explicit design
+obligation rather than silently weakening randomness ownership.
 
 Generated archives belong in `native/lib/` for source-tree product tests and
 in the target SDK bundle for release. They are content-addressed product

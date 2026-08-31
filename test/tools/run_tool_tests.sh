@@ -969,7 +969,7 @@ assert_contains "elf_linux_aarch64_invokes_linux_svc" "$elf_disassembly" $'svc\t
 # The real target path must lower ordinary Weft source through the shared
 # NativeModule -> LinkPlan -> LinkGraph pipeline, not only package a hand-built
 # instruction fixture. It remains Darwin-hosted here; Linux execution is the
-# target-local product gate in brief 1e.
+# Linux target-local product gate.
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_pipeline_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_pipeline_generator_build_stderr_empty" "$(<"$tmp_err")" ""
@@ -1163,7 +1163,7 @@ assert_equals "elf_linux_panic_elides_unreachable_writable_load" "$elf_linux_pan
 
 # Typed console input stays at the ConsoleRead effect surface while the sealed
 # bridge selects Linux read(63). The generated product remains a standalone
-# static image; target-local execution is covered by brief 1e's Docker gate.
+# static image; target-local execution is covered by Linux target-local Docker gate.
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_console_read_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_console_read_generator_build_stderr_empty" "$(<"$tmp_err")" ""
@@ -1341,7 +1341,7 @@ assert_not_contains "elf_linux_process_has_no_dynamic_segment" "$elf_linux_proce
 # Par remains a typed, deterministic effect while its Linux production handler
 # creates guarded kernel threads and synchronizes them without libc. The
 # generated program exercises a bounded four-worker pool, skewed joins, and a
-# promoted managed capture; target-local execution is brief 1e's Docker gate.
+# promoted managed capture; target-local execution is Linux target-local Docker gate.
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_par_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_par_generator_build_stderr_empty" "$(<"$tmp_err")" ""
@@ -1394,7 +1394,7 @@ assert_not_contains "elf_linux_tcp_has_no_dynamic_segment" "$elf_linux_tcp_heade
 
 # Spawn and Time remain ordinary typed effects around target-neutral TCP
 # readiness. The product's only readiness substrate is the static Linux epoll
-# ABI; target-local execution is brief 1e's Docker gate.
+# ABI; target-local execution is Linux target-local Docker gate.
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_readiness_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_readiness_generator_build_stderr_empty" "$(<"$tmp_err")" ""

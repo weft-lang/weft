@@ -244,26 +244,30 @@ fn open_and_close(path: Path) -[IO, Fail<IoError>]> Result<nil, IoError> {
 
 ## Benchmarks
 
-Small algorithm kernels with sibling Weft, Go, and Rust implementations (same algorithm, same data sizes, checksum-verified). Every Weft program is written against the public surface — bounds-checked stdlib vectors, managed memory — not runtime internals. Rust is built `-C opt-level=3 -C target-cpu=native`, Go with its default toolchain. Minimum of 7 runs after warmup, Apple M-series, 2026-08-03, repo commit `d7d6813`:
+Small algorithm kernels with sibling Weft, Go, and Rust implementations (same algorithm, same data sizes, checksum-verified). Every Weft program is written against the public surface — bounds-checked stdlib vectors, managed memory — not runtime internals. Rust is built `-C opt-level=3 -C target-cpu=native`, Go with its default toolchain. Minimum of 11 runs after two warmups, Apple M-series, 2026-08-31, repo commit `aa16159`:
 
 | workload | Weft | Go | Rust | Weft binary | Weft build |
 |---|---|---|---|---|---|
-| vector_sort | 3.9 ms | 4.0 ms | 3.9 ms | 144 KB | 184 ms |
-| graph_reach | 6.5 ms | 5.1 ms | 3.8 ms | 144 KB | 184 ms |
-| nbody | 8.9 ms | 5.7 ms | 5.4 ms | 144 KB | 204 ms |
-| sieve | 26.5 ms | 14.6 ms | 10.0 ms | 144 KB | 177 ms |
-| mandelbrot | 29.5 ms | 15.7 ms | 16.2 ms | 192 KB | 258 ms |
-| sorted_lookup | 69.1 ms | 28.4 ms | 13.4 ms | 192 KB | 256 ms |
+| vector_sort | 2.8 ms | 2.4 ms | 1.7 ms | 160 KB | 316 ms |
+| graph_reach | 5.1 ms | 3.5 ms | 3.1 ms | 160 KB | 306 ms |
+| nbody | 5.6 ms | 3.9 ms | 3.8 ms | 160 KB | 346 ms |
+| sieve | 18.4 ms | 9.5 ms | 6.1 ms | 144 KB | 297 ms |
+| mandelbrot | 17.4 ms | 9.6 ms | 9.7 ms | 144 KB | 470 ms |
+| sorted_lookup | 38.5 ms | 17.6 ms | 8.1 ms | 160 KB | 397 ms |
 
-Read this table as a dated lowering/codegen snapshot, not a current performance
-claim. The language and compiler corpus changed substantially after August 3;
-quiet-machine same-source checks now put self-compilation around 17–18 seconds,
-with the absolute regression/restoration work owned by the active fast-project-
-feedback brief. The formal performance baseline is intentionally reset and will
-be republished by the 3r measurement pass after the public API stops reshaping
-the corpus.
+Read this table as a dated lowering/codegen snapshot, not a language scorecard.
+The current compiler-throughput result is not yet acceptable as a release
+baseline: three quiet self-compiles took 30.47–31.76 seconds wall time. Versioned
+phase metrics report 26.60 seconds for 13,034 emitted functions, compared with
+18.23 seconds for 10,938 functions in the 2026-08-21 tree on the same machine.
+The disproportionate cost is in optimization and native emission, so the
+difference is tracked as a performance regression rather than excused as corpus
+growth.
 
-Reproduce with `bash bench_compare.sh` (records JSONL with commit + timestamps). These are lowering/codegen tracking benchmarks, not a language scorecard; the most representative single number is the self-compile.
+Reproduce the algorithm snapshot with `bash bench_compare.sh`; its timestamped
+JSONL output is local measurement data and is ignored by Git. For compiler
+changes, use `bench_verdict.py` for same-session interleaved A/B measurements.
+The most representative single number remains self-compilation.
 
 ## Architecture
 

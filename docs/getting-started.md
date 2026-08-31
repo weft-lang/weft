@@ -382,15 +382,14 @@ documented/public API census; it never reconstructs signatures from text.
 
 ## Where the alpha deliberately stops
 
-Before the public-alpha cut, the workboard still requires the complete
+Before the public-alpha cut, the remaining release gates are the complete
 target-local Linux suite on adequate hardware, release-key/security/support
 governance, hostile-input hardening, and the final two-target outside-user
 exercise. Native-binding platform diagnostics are complete. Paid Apple
 notarization is not an alpha gate.
 x86-64, a hosted package registry,
 HTTP/2+ and a forever-stable native ABI are explicitly later.
-The authoritative live status is the repository README and, for contributors,
-`internal/briefs/INDEX.md`.
+The authoritative public status is the repository README.
 
 All marked Weft fences in this guide are checked by `run_tests.sh`; runnable
 examples are compiled and executed, and test fences use the real native test

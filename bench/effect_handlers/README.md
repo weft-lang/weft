@@ -22,21 +22,21 @@ runner treats a wrong result as a failure.
 ## Deviations
 
 - **countdown**: the OCaml reference counts down by self-tail-call; Weft
-  has no TCO yet (roadmap A5) so the loop is a `while`. The measured
+  has no tail-call optimization yet, so the loop is a `while`. The measured
   work — 200M get/put pairs through the handler — is identical.
 - **handler_sieve**: pinned at n=20000. The sieve recursion keeps one
   native frame per candidate and overflows the 64MB stack between
   n=20000 and n=30000. Raise to the spec 60000 when frames shrink or
-  self-tail-calls stop consuming stack (A5).
+  self-tail-calls stop consuming stack.
 
 ## Not portable — recorded, not skipped silently
 
-- **resume_nontail**: requires resuming the continuation in NON-tail
+- **resume_nontail**: requires resuming the continuation in non-tail
   position (`let y = k(0) in ...`). Weft's checker rejects non-tail
   continuation calls by design ("continuation call must be tail
-  position"). Revisit if Tier-5 grows non-tail resumption.
+  position"). Revisit if deferred continuations grow non-tail resumption.
 - **nqueens, triples, tree_explore**: require multi-shot continuations
   (resuming the same continuation more than once for backtracking /
-  nondeterminism). Weft's continuations are one-shot by design — see
-  roadmap B1.8 for the evidence-backed rationale (constant-time
-  capture/resume, no stack copying, plain-RC soundness).
+  nondeterminism). Weft's continuations are one-shot by design: that preserves
+  constant-time capture/resume, avoids stack copying, and keeps ordinary
+  managed-reference ownership sound.
