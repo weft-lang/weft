@@ -2,6 +2,77 @@
 # Tool boundary tests: parse-only, check-only, and AST tool paths.
 set -e
 
+if [ -z "${WEFT_TOOL_SHARD:-}" ]; then
+  tool_shards=(core elf_core elf_io elf_system elf_network frontend packages tests)
+  tool_schedule=(elf_network elf_io tests elf_system elf_core frontend packages core)
+  tool_jobs=${WEFT_TOOL_JOBS:-4}
+  case "$tool_jobs" in
+    ''|*[!0-9]*)
+      echo "tool tests: WEFT_TOOL_JOBS must be a positive integer" >&2
+      exit 2
+      ;;
+  esac
+  if [ "$tool_jobs" -lt 1 ]; then
+    echo "tool tests: WEFT_TOOL_JOBS must be a positive integer" >&2
+    exit 2
+  fi
+
+  tool_result_dir=$(mktemp -d /tmp/weft_tool_shards_XXXXXX)
+  trap 'rm -rf "$tool_result_dir"' EXIT
+  tool_started=$(date +%s)
+  tool_next=0
+  tool_running=0
+  tool_failed=0
+  tool_pids=()
+
+  while [ "$tool_next" -lt "${#tool_schedule[@]}" ] || [ "$tool_running" -gt 0 ]; do
+    while [ "$tool_next" -lt "${#tool_schedule[@]}" ] && [ "$tool_running" -lt "$tool_jobs" ]; do
+      tool_shard=${tool_schedule[$tool_next]}
+      WEFT_TOOL_SHARD="$tool_shard" bash "$0" > "$tool_result_dir/$tool_shard.log" 2>&1 &
+      tool_pids[$tool_next]=$!
+      tool_next=$((tool_next + 1))
+      tool_running=$((tool_running + 1))
+    done
+
+    tool_progress=0
+    for tool_index in "${!tool_pids[@]}"; do
+      tool_pid=${tool_pids[$tool_index]}
+      if [ -z "$tool_pid" ]; then continue; fi
+      tool_stat=$(ps -o stat= -p "$tool_pid" 2>/dev/null | tr -d ' ')
+      if ! kill -0 "$tool_pid" 2>/dev/null || [[ "$tool_stat" == Z* ]]; then
+        if ! wait "$tool_pid"; then tool_failed=1; fi
+        tool_pids[$tool_index]=""
+        tool_running=$((tool_running - 1))
+        tool_progress=1
+      fi
+    done
+    if [ "$tool_running" -gt 0 ] && [ "$tool_progress" -eq 0 ]; then sleep 0.1; fi
+  done
+
+  for tool_shard in "${tool_shards[@]}"; do
+    /bin/cat "$tool_result_dir/$tool_shard.log"
+  done
+  if [ "$tool_failed" -ne 0 ]; then exit 1; fi
+
+  tool_elapsed=$(($(date +%s) - tool_started))
+  echo "Tool boundary timing: ${tool_elapsed}s wall, ${tool_jobs} shard jobs"
+  if [ "${WEFT_TEST_PLATFORM:-$(uname -s)}" = Darwin ]; then
+    echo "Tool boundary summary: 1147 passed, 0 failed"
+  else
+    echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
+  fi
+  exit 0
+fi
+
+case "$WEFT_TOOL_SHARD" in
+  core|elf_core|elf_io|elf_system|elf_network|frontend|packages|tests) ;;
+  *)
+    echo "tool tests: unknown shard: $WEFT_TOOL_SHARD" >&2
+    exit 2
+    ;;
+esac
+tool_shard_started=$(date +%s)
+
 WEFT=${WEFT:-./weft}
 WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-120}
 WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-120}
@@ -492,6 +563,7 @@ write_huge_padding() {
   printf '\n' >> "$file"
 }
 
+if [ "$WEFT_TOOL_SHARD" = core ]; then
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 
 set +e
@@ -942,7 +1014,9 @@ assert_contains "tree_sitter_grammar_marks_generated_source" "$(<"$tmp_tree_sitt
 assert_contains "tree_sitter_grammar_has_source_file" "$(<"$tmp_tree_sitter_grammar")" 'source_file: $ => repeat(choice($._declaration, $.stray_closing_brace))'
 "$tmp_tree_sitter_generator" > "$tmp_tree_sitter_grammar_second" 2> "$tmp_err"
 assert_files_equal "tree_sitter_grammar_is_deterministic" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second"
+fi
 
+if [ "$WEFT_TOOL_SHARD" = elf_core ]; then
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_aarch64_generator_build_stderr_empty" "$(<"$tmp_err")" ""
@@ -1160,7 +1234,9 @@ assert_contains "elf_linux_panic_invokes_linux_svc" "$elf_linux_panic_disassembl
 assert_contains "elf_linux_panic_uses_aarch64_max_page_alignment" "$elf_linux_panic_headers" "align 2**16"
 elf_linux_panic_load_count=$(printf "%s\n" "$elf_linux_panic_headers" | awk '/^    LOAD / { count += 1 } END { print count + 0 }')
 assert_equals "elf_linux_panic_elides_unreachable_writable_load" "$elf_linux_panic_load_count" "1"
+fi
 
+if [ "$WEFT_TOOL_SHARD" = elf_io ]; then
 # Typed console input stays at the ConsoleRead effect surface while the sealed
 # bridge selects Linux read(63). The generated product remains a standalone
 # static image; target-local execution is covered by Linux target-local Docker gate.
@@ -1270,7 +1346,9 @@ assert_contains "elf_linux_directory_selects_exit_group" "$elf_linux_directory_d
 assert_contains "elf_linux_directory_invokes_linux_svc" "$elf_linux_directory_disassembly" $'svc\t#0'
 assert_not_contains "elf_linux_directory_has_no_interpreter" "$elf_linux_directory_headers" "INTERP off"
 assert_not_contains "elf_linux_directory_has_no_dynamic_segment" "$elf_linux_directory_headers" "DYNAMIC off"
+fi
 
+if [ "$WEFT_TOOL_SHARD" = elf_system ]; then
 # The Time product retains a mockable typed effect in application code. Its
 # production handler selects Linux clock_gettime/nanosleep only at the sealed
 # backend boundary, with no libc or dynamic-loader dependency in the product.
@@ -1362,7 +1440,9 @@ assert_contains "elf_linux_par_selects_exit_group" "$elf_linux_par_disassembly" 
 assert_contains "elf_linux_par_invokes_linux_svc" "$elf_linux_par_disassembly" $'svc\t#0'
 assert_not_contains "elf_linux_par_has_no_interpreter" "$elf_linux_par_headers" "INTERP off"
 assert_not_contains "elf_linux_par_has_no_dynamic_segment" "$elf_linux_par_headers" "DYNAMIC off"
+fi
 
+if [ "$WEFT_TOOL_SHARD" = elf_network ]; then
 # The TCP product is ordinary application code over split typed authorities
 # and opaque owned resources. The target runtime owns sockaddr/option layout
 # and lowers directly to the static Linux socket ABI without libc.
@@ -1493,7 +1573,9 @@ assert_contains "elf_linux_dns_transport_selects_getrandom" "$elf_linux_dns_tran
 assert_contains "elf_linux_dns_transport_invokes_linux_svc" "$elf_linux_dns_transport_disassembly" $'svc\t#0'
 assert_not_contains "elf_linux_dns_transport_has_no_interpreter" "$elf_linux_dns_transport_headers" "INTERP off"
 assert_not_contains "elf_linux_dns_transport_has_no_dynamic_segment" "$elf_linux_dns_transport_headers" "DYNAMIC off"
+fi
 
+if [ "$WEFT_TOOL_SHARD" = frontend ]; then
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
 assert_contains "fmt_parse_only" "$fmt_out" "fn main() -> i64 { 42 }"
@@ -3486,7 +3568,9 @@ run_weft_compile_guarded "$WEFT" < "$tmp_src" > "$tmp_bin" 2>/dev/null
 chmod +x "$tmp_bin"
 run_binary_guarded "$tmp_bin"
 echo "  ok compile_reads_huge_stdin_offsets"
+fi
 
+if [ "$WEFT_TOOL_SHARD" = packages ]; then
 mkdir -p "$tmp_pkg_dir/deps/math"
 printf '{"package":"app","dependencies":{"math":"deps/math"}}\n' > "$tmp_pkg_dir/weft.pkg"
 printf 'pub fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
@@ -4934,7 +5018,9 @@ assert_contains "package_l7_stable_fact_and_diagnostic_cross_boundary" "$pkg_l7_
 printf 'use compiler/ir.{typed_ir_version}\nfn main() -> i64 { typed_ir_version() }\n' > "$tmp_pkg_trust_dir/l7/main.weft"
 pkg_l7_unstable=$(cd "$tmp_pkg_trust_dir/l7" && "$WEFT_ABS" check main.weft 2>&1 || true)
 assert_contains "package_l7_unstable_ir_stays_inside_owner" "$pkg_l7_unstable" "error[E4004]: module member 'typed_ir_version' is not visible in this import"
+fi
 
+if [ "$WEFT_TOOL_SHARD" = tests ]; then
 printf 'fn helper() -> i64 { 42 }\nfn main() -> i64 { helper() }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" symbols "$tmp_src" > "$tmp_out" 2> "$tmp_err"
 symbols_out=$(<"$tmp_out")
@@ -5437,9 +5523,7 @@ chmod +x "$tmp_bin"
 run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_large_harness_emits_lossless_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1800 0 1800"
 echo "  ok test_builds_large_harness"
-
-if [ "$WEFT_TEST_PLATFORM" = Darwin ]; then
-  echo "Tool boundary summary: 1147 passed, 0 failed"
-else
-  echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
 fi
+
+tool_shard_elapsed=$(($(date +%s) - tool_shard_started))
+echo "Tool shard $WEFT_TOOL_SHARD passed in ${tool_shard_elapsed}s"

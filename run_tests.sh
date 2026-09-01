@@ -31,9 +31,22 @@ WEFT_TEST_RUNAWAY_RSS_LIMIT_KB=${WEFT_TEST_RUNAWAY_RSS_LIMIT_KB:-24000000}
 WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB}
 WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB}
 WEFT_TEST_SHOW_TIMINGS=${WEFT_TEST_SHOW_TIMINGS:-1}
-# Parallelism remains CPU-selected unless the caller explicitly chooses a
-# width. The runaway stop observes workers; it never admits or delays them.
-WEFT_TEST_JOBS=${WEFT_TEST_JOBS:-$(default_test_jobs)}
+WEFT_HOST_JOBS=$(default_test_jobs)
+WEFT_TOOL_JOBS=${WEFT_TOOL_JOBS:-4}
+case "$WEFT_TOOL_JOBS" in
+  ''|*[!0-9]*) echo "WEFT_TOOL_JOBS must be a positive integer" >&2; exit 2 ;;
+esac
+if [ "$WEFT_TOOL_JOBS" -lt 1 ]; then
+  echo "WEFT_TOOL_JOBS must be a positive integer" >&2
+  exit 2
+fi
+# The runtime planner and independent tool shards run concurrently. Reserve
+# the tool width from the host-selected total unless the caller explicitly
+# chooses a planner width; the runaway stop remains observational only.
+if [ -z "${WEFT_TEST_JOBS:-}" ]; then
+  WEFT_TEST_JOBS=$((WEFT_HOST_JOBS - WEFT_TOOL_JOBS))
+  if [ "$WEFT_TEST_JOBS" -lt 1 ]; then WEFT_TEST_JOBS=1; fi
+fi
 PASS=0
 FAIL=0
 ERRORS=""
@@ -49,6 +62,7 @@ export WEFT_TEST_RUNAWAY_RSS_LIMIT_KB
 export WEFT_TEST_COMPILE_RSS_LIMIT_KB
 export WEFT_TEST_RUN_RSS_LIMIT_KB
 export WEFT_TEST_SHOW_TIMINGS
+export WEFT_TOOL_JOBS
 
 now_s() {
   date +%s
@@ -154,12 +168,17 @@ run_tree_process_rss_guarded() {
   local pid=$!
   local interrupted=0
   local polls=0
+  local previous_int
+  local previous_term
+  previous_int=$(trap -p INT)
+  previous_term=$(trap -p TERM)
   trap 'interrupted=1' INT TERM
 
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$interrupted" -eq 1 ]; then
       terminate_process_tree "$pid"
-      trap - INT TERM
+      if [ -n "$previous_int" ]; then eval "$previous_int"; else trap - INT; fi
+      if [ -n "$previous_term" ]; then eval "$previous_term"; else trap - TERM; fi
       return 130
     fi
 
@@ -189,7 +208,8 @@ run_tree_process_rss_guarded() {
     if [ -n "$offender" ]; then
       echo "planner runaway RSS stop: pid ${offender%% *} used ${offender##* } KB (per-process limit ${rss_limit_kb} KB)" >&2
       terminate_process_tree "$pid"
-      trap - INT TERM
+      if [ -n "$previous_int" ]; then eval "$previous_int"; else trap - INT; fi
+      if [ -n "$previous_term" ]; then eval "$previous_term"; else trap - TERM; fi
       return 125
     fi
 
@@ -199,10 +219,124 @@ run_tree_process_rss_guarded() {
 
   local status=0
   wait "$pid" || status=$?
-  trap - INT TERM
+  if [ -n "$previous_int" ]; then eval "$previous_int"; else trap - INT; fi
+  if [ -n "$previous_term" ]; then eval "$previous_term"; else trap - TERM; fi
   return "$status"
 }
 
+run_timed_phase() {
+  local label="$1"
+  shift
+  local started
+  local status=0
+  started=$(now_s)
+  "$@" || status=$?
+  echo "$label timing: $(($(now_s) - started))s wall"
+  return "$status"
+}
+
+run_markdown_phase() {
+  bash test/docs/run_markdown_examples.sh README.md docs/getting-started.md docs/networking.md &&
+    bash test/docs/check_readme_facts.sh
+}
+
+run_bootstrap_phase() {
+  local started
+  local tmpw1
+  local tmpw2
+  local tmpw3
+  local bootstrap_ok=1
+  started=$(now_s)
+  tmpw1=$(mktemp /tmp/weft_test_XXXXXX)
+  tmpw2=$(mktemp /tmp/weft_test_XXXXXX)
+  tmpw3=$(mktemp /tmp/weft_test_XXXXXX)
+
+  if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" build compiler/main.weft -o "$tmpw1" > /dev/null 2>&1; then
+    chmod +x "$tmpw1"
+  else
+    bootstrap_ok=0
+    echo "  ✗ bootstrap stage 1 failed"
+  fi
+  if [ "$bootstrap_ok" -eq 1 ]; then
+    if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$tmpw1" build compiler/main.weft -o "$tmpw2" > /dev/null 2>&1; then
+      chmod +x "$tmpw2"
+    else
+      bootstrap_ok=0
+      echo "  ✗ bootstrap stage 2 failed"
+    fi
+  fi
+  if [ "$bootstrap_ok" -eq 1 ]; then
+    if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$tmpw2" build compiler/main.weft -o "$tmpw3" > /dev/null 2>&1; then
+      chmod +x "$tmpw3"
+    else
+      bootstrap_ok=0
+      echo "  ✗ bootstrap stage 3 failed"
+    fi
+  fi
+  if [ "$bootstrap_ok" -eq 1 ] && diff <(xxd "$tmpw2") <(xxd "$tmpw3") > /dev/null 2>&1; then
+    echo "  ✓ weft2 == weft3 (byte-identical)"
+  else
+    bootstrap_ok=0
+    echo "  ✗ bootstrap gate failed"
+  fi
+  rm -f "$tmpw1" "$tmpw2" "$tmpw3"
+  echo "Bootstrap timing: $(($(now_s) - started))s wall"
+  [ "$bootstrap_ok" -eq 1 ]
+}
+
+collect_phase() {
+  local label="$1"
+  local pid="$2"
+  local log="$3"
+  local status=0
+  wait "$pid" || status=$?
+  /bin/cat "$log"
+  if [ "$status" -eq 0 ]; then
+    PASS=$((PASS+1))
+  else
+    echo "  ✗ $label failed"
+    FAIL=$((FAIL+1))
+    ERRORS="$ERRORS\n  $label failed"
+  fi
+}
+
+RESULTS_DIR=""
+TOOL_PHASE_PID=""
+BOOTSTRAP_PHASE_PID=""
+LINKED_PHASE_PID=""
+CHECKER_PHASE_PID=""
+SIGNING_PHASE_PID=""
+FORMATTER_PHASE_PID=""
+MARKDOWN_PHASE_PID=""
+NEGATIVE_PHASE_PID=""
+
+cleanup_suite() {
+  local status=$?
+  local phase_pid
+  trap - EXIT INT TERM
+  for phase_pid in \
+    "$TOOL_PHASE_PID" \
+    "$BOOTSTRAP_PHASE_PID" \
+    "$LINKED_PHASE_PID" \
+    "$CHECKER_PHASE_PID" \
+    "$SIGNING_PHASE_PID" \
+    "$FORMATTER_PHASE_PID" \
+    "$MARKDOWN_PHASE_PID" \
+    "$NEGATIVE_PHASE_PID"; do
+    if [ -n "$phase_pid" ] && kill -0 "$phase_pid" 2>/dev/null; then
+      terminate_process_tree "$phase_pid"
+    fi
+  done
+  if [ -n "$RESULTS_DIR" ] && [ -d "$RESULTS_DIR" ]; then
+    rm -rf "$RESULTS_DIR"
+  fi
+  exit "$status"
+}
+
+trap cleanup_suite EXIT
+trap 'exit 130' INT TERM
+
+SUITE_STARTED=$(now_s)
 echo "=== Weft Test Suite ==="
 echo "runtime compile timeout: ${WEFT_TEST_COMPILE_TIMEOUT}s"
 echo "runtime run timeout: ${WEFT_TEST_RUN_TIMEOUT}s"
@@ -210,11 +344,15 @@ echo "runtime per-worker compile RSS result limit: ${WEFT_TEST_COMPILE_RSS_LIMIT
 echo "runtime per-worker run RSS result limit: ${WEFT_TEST_RUN_RSS_LIMIT_KB} KB"
 echo "live per-process runaway RSS stop: ${WEFT_TEST_RUNAWAY_RSS_LIMIT_KB} KB"
 echo "runtime jobs: ${WEFT_TEST_JOBS}"
+echo "tool shard jobs: ${WEFT_TOOL_JOBS}"
 echo ""
 
 RESULTS_DIR=$(mktemp -d /tmp/weft_suite_XXXXXX)
 PLANNER_ERR="$RESULTS_DIR/planner.err"
 PLANNER_OUT="$RESULTS_DIR/planner.out"
+TOOL_PHASE_LOG="$RESULTS_DIR/tool.log"
+(echo ""; echo "=== Tool Boundary Tests ==="; run_timed_phase "Tool boundary" bash test/tools/run_tool_tests.sh) > "$TOOL_PHASE_LOG" 2>&1 &
+TOOL_PHASE_PID=$!
 RUNTIME_TEST_FILES=()
 RUNTIME_TEST_BLOCKS=0
 
@@ -240,6 +378,7 @@ runtime_count=${#RUNTIME_TEST_FILES[@]}
 if [ "$runtime_count" -gt 0 ]; then
   planner_exit=0
   run_tree_process_rss_guarded "$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB" env WEFT_TEST_METRICS=1 "$WEFT" test --jobs "$WEFT_TEST_JOBS" "${RUNTIME_TEST_FILES[@]}" > "$PLANNER_OUT" 2> "$PLANNER_ERR" || planner_exit=$?
+  if [ "$planner_exit" -eq 130 ]; then exit 130; fi
   planner_failures=0
   for f in "${RUNTIME_TEST_FILES[@]}"; do
     pass_report=$(grep -F "  pass: $f (" "$PLANNER_ERR" | tail -1 || true)
@@ -295,115 +434,48 @@ if [ "$runtime_count" -gt 0 ]; then
   fi
 fi
 
+BOOTSTRAP_PHASE_LOG="$RESULTS_DIR/bootstrap.log"
+LINKED_PHASE_LOG="$RESULTS_DIR/linked.log"
+CHECKER_PHASE_LOG="$RESULTS_DIR/checker.log"
+SIGNING_PHASE_LOG="$RESULTS_DIR/signing.log"
+FORMATTER_PHASE_LOG="$RESULTS_DIR/formatter.log"
+MARKDOWN_PHASE_LOG="$RESULTS_DIR/markdown.log"
+NEGATIVE_PHASE_LOG="$RESULTS_DIR/negative.log"
+
+(echo ""; echo "=== Bootstrap Gate ==="; run_bootstrap_phase) > "$BOOTSTRAP_PHASE_LOG" 2>&1 &
+BOOTSTRAP_PHASE_PID=$!
+(echo ""; echo "=== Linked Tests ==="; run_timed_phase "Linked tests" bash test/linked/run_linked_tests.sh) > "$LINKED_PHASE_LOG" 2>&1 &
+LINKED_PHASE_PID=$!
+(echo ""; echo "=== Checker Tests ==="; run_timed_phase "Checker tests" bash test/checker/run_checker_tests.sh) > "$CHECKER_PHASE_LOG" 2>&1 &
+CHECKER_PHASE_PID=$!
+(echo ""; echo "=== Release Signing Tests ==="; run_timed_phase "Release signing" bash test/run_release_signing.sh) > "$SIGNING_PHASE_LOG" 2>&1 &
+SIGNING_PHASE_PID=$!
+(echo ""; echo "=== Formatter Dogfood ==="; run_timed_phase "Formatter dogfood" bash test/tools/run_formatter_dogfood.sh) > "$FORMATTER_PHASE_LOG" 2>&1 &
+FORMATTER_PHASE_PID=$!
+(echo ""; echo "=== Markdown Examples ==="; run_timed_phase "Markdown examples" run_markdown_phase) > "$MARKDOWN_PHASE_LOG" 2>&1 &
+MARKDOWN_PHASE_PID=$!
+(echo ""; echo "=== Negative Tests ==="; run_timed_phase "Negative tests" bash test/negative/run_negative_tests.sh) > "$NEGATIVE_PHASE_LOG" 2>&1 &
+NEGATIVE_PHASE_PID=$!
+
+collect_phase "bootstrap gate" "$BOOTSTRAP_PHASE_PID" "$BOOTSTRAP_PHASE_LOG"
+BOOTSTRAP_PHASE_PID=""
+collect_phase "linked tests" "$LINKED_PHASE_PID" "$LINKED_PHASE_LOG"
+LINKED_PHASE_PID=""
+collect_phase "checker tests" "$CHECKER_PHASE_PID" "$CHECKER_PHASE_LOG"
+CHECKER_PHASE_PID=""
+collect_phase "tool boundary tests" "$TOOL_PHASE_PID" "$TOOL_PHASE_LOG"
+TOOL_PHASE_PID=""
+collect_phase "release signing tests" "$SIGNING_PHASE_PID" "$SIGNING_PHASE_LOG"
+SIGNING_PHASE_PID=""
+collect_phase "formatter dogfood" "$FORMATTER_PHASE_PID" "$FORMATTER_PHASE_LOG"
+FORMATTER_PHASE_PID=""
+collect_phase "markdown examples" "$MARKDOWN_PHASE_PID" "$MARKDOWN_PHASE_LOG"
+MARKDOWN_PHASE_PID=""
+collect_phase "negative tests" "$NEGATIVE_PHASE_PID" "$NEGATIVE_PHASE_LOG"
+NEGATIVE_PHASE_PID=""
+
 rm -rf "$RESULTS_DIR"
-
-echo ""
-echo "=== Bootstrap Gate ==="
-# Quick 3-stage bootstrap check
-tmpw1=$(mktemp /tmp/weft_test_XXXXXX)
-tmpw2=$(mktemp /tmp/weft_test_XXXXXX)
-tmpw3=$(mktemp /tmp/weft_test_XXXXXX)
-bootstrap_ok=1
-if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" build compiler/main.weft -o "$tmpw1" > /dev/null 2>&1; then
-  chmod +x "$tmpw1"
-else
-  bootstrap_ok=0
-  echo "  ✗ bootstrap stage 1 failed"
-fi
-if [ $bootstrap_ok -eq 1 ]; then
-  if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$tmpw1" build compiler/main.weft -o "$tmpw2" > /dev/null 2>&1; then
-    chmod +x "$tmpw2"
-  else
-    bootstrap_ok=0
-    echo "  ✗ bootstrap stage 2 failed"
-  fi
-fi
-if [ $bootstrap_ok -eq 1 ]; then
-  if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$tmpw2" build compiler/main.weft -o "$tmpw3" > /dev/null 2>&1; then
-    chmod +x "$tmpw3"
-  else
-    bootstrap_ok=0
-    echo "  ✗ bootstrap stage 3 failed"
-  fi
-fi
-if [ $bootstrap_ok -eq 1 ] && diff <(xxd "$tmpw2") <(xxd "$tmpw3") > /dev/null 2>&1; then
-  echo "  ✓ weft2 == weft3 (byte-identical)"
-  PASS=$((PASS+1))
-else
-  echo "  ✗ bootstrap gate failed"
-  FAIL=$((FAIL+1))
-fi
-rm -f "$tmpw1" "$tmpw2" "$tmpw3"
-
-echo ""
-echo "=== Linked Tests ==="
-if bash test/linked/run_linked_tests.sh; then
-  PASS=$((PASS+1))
-else
-  echo "  ✗ linked tests failed"
-  FAIL=$((FAIL+1))
-  ERRORS="$ERRORS\n  linked tests failed"
-fi
-
-echo ""
-echo "=== Checker Tests ==="
-if bash test/checker/run_checker_tests.sh; then
-  PASS=$((PASS+1))
-else
-  echo "  ✗ checker tests failed"
-  FAIL=$((FAIL+1))
-  ERRORS="$ERRORS\n  checker tests failed"
-fi
-
-echo ""
-echo "=== Tool Boundary Tests ==="
-if bash test/tools/run_tool_tests.sh; then
-  PASS=$((PASS+1))
-else
-  echo "  ✗ tool boundary tests failed"
-  FAIL=$((FAIL+1))
-  ERRORS="$ERRORS\n  tool boundary tests failed"
-fi
-
-echo ""
-echo "=== Release Signing Tests ==="
-if bash test/run_release_signing.sh; then
-  PASS=$((PASS+1))
-else
-  echo "  ✗ release signing tests failed"
-  FAIL=$((FAIL+1))
-  ERRORS="$ERRORS\n  release signing tests failed"
-fi
-
-echo ""
-echo "=== Formatter Dogfood ==="
-if bash test/tools/run_formatter_dogfood.sh; then
-  PASS=$((PASS+1))
-else
-  echo "  ✗ formatter dogfood failed"
-  FAIL=$((FAIL+1))
-  ERRORS="$ERRORS\n  formatter dogfood failed"
-fi
-
-echo ""
-echo "=== Markdown Examples ==="
-if bash test/docs/run_markdown_examples.sh README.md docs/getting-started.md docs/networking.md && bash test/docs/check_readme_facts.sh; then
-  PASS=$((PASS+1))
-else
-  echo "  ✗ markdown examples failed"
-  FAIL=$((FAIL+1))
-  ERRORS="$ERRORS\n  markdown examples failed"
-fi
-
-echo ""
-echo "=== Negative Tests ==="
-if bash test/negative/run_negative_tests.sh; then
-  PASS=$((PASS+1))
-else
-  echo "  ✗ negative tests failed"
-  FAIL=$((FAIL+1))
-  ERRORS="$ERRORS\n  negative tests failed"
-fi
+RESULTS_DIR=""
 
 echo ""
 echo "=== Summary ==="
@@ -411,6 +483,7 @@ echo "$PASS suite groups passed, $FAIL failed"
 echo "Runtime tests: $RUNTIME_FILES files, $RUNTIME_TESTS test blocks"
 echo "Runtime compile time: ${RUNTIME_COMPILE_SECONDS}s (cpu-summed; planner worker width ${WEFT_TEST_JOBS})"
 echo "Runtime execution time: ${RUNTIME_RUN_SECONDS}s (cpu-summed)"
+echo "Complete wall time: $(($(now_s) - SUITE_STARTED))s"
 if [ -n "$ERRORS" ]; then
   echo ""
   echo "Failures:"
