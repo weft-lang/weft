@@ -5203,7 +5203,7 @@ set +e
 export WEFT_TEST_PLAN_TRACE=1
 export WEFT_TEST_METRICS=1
 export WEFT_TEST_OPTIMISED_PRODUCTS=1
-run_weft_compile_guarded "$WEFT" test --jobs 1 "$tmp_test_shared_one" "$tmp_test_shared_two" > "$tmp_out" 2>"$tmp_err"
+run_weft_compile_guarded "$WEFT" test --jobs 2 "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_after" > "$tmp_out" 2>"$tmp_err"
 test_checked_dependency_exit=$?
 unset WEFT_TEST_PLAN_TRACE
 unset WEFT_TEST_METRICS
@@ -5211,11 +5211,12 @@ unset WEFT_TEST_OPTIMISED_PRODUCTS
 set -e
 assert_equals "test_batch_checked_dependency_exit_zero" "$test_checked_dependency_exit" "0"
 assert_contains "test_batch_checked_dependency_admits_exact_group" "$(<"$tmp_err")" "test plan: shared checked dependency groups=1 roots=2"
-assert_contains "test_batch_checked_dependency_runs_both_roots" "$(<"$tmp_err")" "2 passed, 0 failed"
+assert_contains "test_batch_checked_dependency_runs_all_roots" "$(<"$tmp_err")" "3 passed, 0 failed"
 assert_not_contains_file "test_batch_checked_dependency_has_no_missing_method" "$tmp_err" "missing method implementation"
 checked_dependency_metrics=$(grep '^WEFT_TEST_METRICS ' "$tmp_err")
 read -r dependency_metric_tag dependency_metric_version dependency_metric_roots dependency_metric_measured dependency_metric_wall dependency_metric_discovery dependency_metric_planning dependency_metric_compile dependency_metric_link dependency_metric_run dependency_metric_user dependency_metric_system dependency_metric_peak dependency_metric_groups dependency_metric_shared_roots dependency_metric_reused_pairs dependency_metric_hits dependency_metric_misses dependency_metric_executions dependency_metric_optimised_groups dependency_metric_optimised_roots dependency_metric_reused_optimised_functions dependency_metric_extra <<< "$checked_dependency_metrics"
 assert_equals "test_batch_checked_dependency_metrics_schema" "$dependency_metric_tag:$dependency_metric_version:$dependency_metric_extra" "WEFT_TEST_METRICS:3:"
+assert_equals "test_batch_checked_dependency_metrics_roots" "$dependency_metric_roots:$dependency_metric_measured" "3:3"
 assert_equals "test_batch_checked_dependency_metrics_group" "$dependency_metric_groups:$dependency_metric_shared_roots" "1:2"
 assert_equals "test_batch_checked_dependency_metrics_optimised_group" "$dependency_metric_optimised_groups:$dependency_metric_optimised_roots" "1:2"
 if [[ "$dependency_metric_reused_pairs" =~ ^[0-9]+$ ]] && [[ "$dependency_metric_hits" =~ ^[0-9]+$ ]] && [[ "$dependency_metric_misses" =~ ^[0-9]+$ ]] && [[ "$dependency_metric_executions" =~ ^[0-9]+$ ]] && [[ "$dependency_metric_reused_optimised_functions" =~ ^[0-9]+$ ]] && [ "$dependency_metric_reused_pairs" -ge 32 ] && [ "$dependency_metric_hits" -gt 0 ] && [ "$dependency_metric_misses" -gt 0 ] && [ "$dependency_metric_executions" -gt 0 ] && [ "$dependency_metric_reused_optimised_functions" -gt 0 ]; then
