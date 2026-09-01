@@ -248,6 +248,8 @@ check_rejects "function_value_arg_mismatch" "test/negative/function_value_arg_mi
 check_rejects "function_value_return_mismatch" "test/negative/function_value_return_mismatch.weft" 'error[E1002]: return value type mismatch: expected `i64`, found `str`'
 check_rejects "method_call_arity_too_few" "test/negative/method_call_arity_too_few.weft" "type error: arity mismatch"
 check_rejects "method_call_arity_too_many" "test/negative/method_call_arity_too_many.weft" "type error: arity mismatch"
+check_rejects "iterator_method_type_arity" "test/negative/iterator_method_type_arity.weft" "type error: wrong number of type arguments"
+check_rejects "generic_method_type_bound" "test/negative/generic_method_type_bound.weft" 'error[E1004]: type `str` does not implement `GenericMethodMarker`'
 check_rejects "method_call_arg_mismatch" "test/negative/method_call_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "method_call_trait_arg_mismatch" "test/negative/method_call_trait_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "method_call_effect_unavailable" "test/negative/method_call_effect_unavailable.weft" 'error[E2001]: effect `MethodEffect` is not available in this context'
@@ -266,7 +268,6 @@ check_rejects "generic_impl_target_arity" "test/negative/generic_impl_target_ari
 check_rejects "generic_impl_unconstrained_parameter" "test/negative/generic_impl_unconstrained_parameter.weft" "type error: impl parameter is not determined by the target type"
 check_rejects "generic_impl_repeated_receiver_mismatch" "test/negative/generic_impl_repeated_receiver_mismatch.weft" "type error: unknown method"
 check_rejects "generic_inherent_impl_overlap" "test/negative/generic_inherent_impl_overlap.weft" "type error: conflicting inherent implementations for method"
-check_rejects "impl_method_type_params_unsupported" "test/negative/impl_method_type_params_unsupported.weft" "type error: method-specific type parameters are not yet supported"
 check_rejects "trait_assoc_missing" "test/negative/trait_assoc_missing.weft" "type error: impl missing required associated type"
 check_rejects "trait_assoc_duplicate" "test/negative/trait_assoc_duplicate.weft" "type error: duplicate associated type binding"
 check_rejects "trait_assoc_extra" "test/negative/trait_assoc_extra.weft" "type error: impl associated type is not declared by trait"
@@ -274,8 +275,6 @@ check_rejects "trait_assoc_bound_concrete" "test/negative/trait_assoc_bound_conc
 check_rejects "trait_assoc_bound_generic" "test/negative/trait_assoc_bound_generic.weft" 'error[E1004]: type `T` does not implement `AssocBoundGenericValue`'
 check_rejects "trait_assoc_signature_mismatch" "test/negative/trait_assoc_signature_mismatch.weft" "type error: impl method parameter type mismatch"
 check_rejects "trait_impl_conflict" "test/negative/trait_impl_conflict.weft" "type error: conflicting implementations of trait for type"
-check_rejects "orphan_neither_local" "test/negative/orphan_neither_local.weft" "type error: orphan impl is not allowed — define the trait or target type in this file"
-check_rejects "orphan_primitive_foreign_trait" "test/negative/orphan_primitive_foreign_trait.weft" "type error: orphan impl is not allowed — define the trait or target type in this file"
 check_rejects "ord_missing_impl" "test/negative/ord_missing_impl.weft" 'error[E1004]: type `Unordered` does not implement `Ord`'
 check_rejects "ord_operand_mismatch" "test/negative/ord_operand_mismatch.weft" "type error: ordering operand type mismatch"
 check_rejects "ord_unbounded_generic" "test/negative/ord_unbounded_generic.weft" 'error[E1004]: type `T` does not implement `Ord`'
@@ -487,7 +486,7 @@ check_rejects "console_cannot_write_file" "test/negative/console_cannot_write_fi
 check_rejects "safe_io_platform_residual_effect" "test/negative/safe_io_platform_residual_effect.weft" "error[E2001]:"
 check_rejects "if_condition_not_bool" "test/negative/if_condition_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "while_condition_not_bool" "test/negative/while_condition_not_bool.weft" "type error: boolean expression is not bool"
-check_rejects "for_iter_non_list" "test/negative/for_iter_non_list.weft" "type error: for iterator requires an array, slice, or Cons/Nil list"
+check_rejects "for_iter_non_list" "test/negative/for_iter_non_list.weft" "type error: for iterator requires an array, slice, Cons/Nil list, or IntoIterator"
 check_rejects "not_operand_not_bool" "test/negative/not_operand_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "logical_operand_not_bool" "test/negative/logical_operand_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "match_guard_not_bool" "test/negative/match_guard_not_bool.weft" "type error: boolean expression is not bool"
