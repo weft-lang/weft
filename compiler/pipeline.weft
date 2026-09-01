@@ -993,7 +993,14 @@ pub(package) fn pipeline_rc_site_census_handler_clauses(clauses: IrHandlerClause
 
 pub(package) fn pipeline_rc_site_census_deferred_body(body: IrDeferredHandlerBody, census: i64) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_rc_site_census_blocks(blocks, census)
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+      pipeline_rc_site_census_blocks(blocks, census)
+      match completion {
+        IrDeferredCompletionBodyNone -> 0
+        IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> pipeline_rc_site_census_blocks(completion_blocks, census)
+        IrDeferredCompletionBodyInvalid(reason) -> 0
+      }
+    }
     IrDeferredHandlerBodyInvalid(reason) -> 0
   }
 }
@@ -12125,11 +12132,15 @@ pub(package) fn pipeline_lower_handler_clauses_typed(clauses: HandlerClauseList,
   }
 }
 
-pub(package) fn pipeline_lower_deferred_handler_body_typed(body: Expr, clauses: HandlerClauseList, lowered_clauses: PipelineLoweredHandlerClauses, fn_params: i64, outer_locals: PipelineValueEnv, module: PipelineLowerModule) -> IrDeferredHandlerBody {
+pub(package) fn pipeline_lower_deferred_handler_body_typed(body: Expr, clauses: HandlerClauseList, hret: HandleReturn, lowered_clauses: PipelineLoweredHandlerClauses, fn_params: i64, outer_locals: PipelineValueEnv, module: PipelineLowerModule) -> IrDeferredHandlerBody {
   let src = pipeline_lower_module_src(module)
   let available = pipeline_lambda_capture_env_with_params(fn_params, outer_locals, src)
   let captures = nlist_new()
   pipeline_lambda_capture_expr(body, scope_new(), available, src, captures)
+  match hret {
+    NoHandleReturn -> 0
+    HandleReturnClause(rns, rnl, rb) -> pipeline_lambda_capture_expr(rb, scope_push(scope_new(), rns, rnl, 0), available, src, captures)
+  }
   let capture_lanes = pipeline_capture_value_lane_count(captures)
   let ops_value = capture_lanes
   let first_value = capture_lanes + 1
@@ -12147,13 +12158,74 @@ pub(package) fn pipeline_lower_deferred_handler_body_typed(body: Expr, clauses: 
   let body_module = pipeline_lower_module_with_handlers(module, body_handlers)
   let body_locals = pipeline_deferred_body_lowering_locals(captures)
   let lower_ctx = pipeline_handler_lower_ctx_from_module(0, body_locals, body_module)
-  let result_ty = pipeline_return_expr_type_node_typed(body, fn_params, outer_locals, module)
-  let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
-  let lowered = pipeline_lower_expr_typed_hclause_blocks(body, first_value, lower_ctx, result_ty, 0)
-  if pipeline_lowered_blocks_is_valid(lowered) == 0 {
-    IrDeferredHandlerBodyInvalid(1)
-  } else {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, pipeline_lowered_blocks_blocks(lowered))
+  let body_ty = pipeline_return_expr_type_node_typed(body, fn_params, outer_locals, module)
+  let result_ty = pipeline_handle_result_type_node_typed(body, hret, fn_params, outer_locals, module)
+  match hret {
+    NoHandleReturn -> {
+      let lowered = pipeline_lower_expr_typed_hclause_blocks(body, first_value, lower_ctx, body_ty, 0)
+      if pipeline_lowered_blocks_is_valid(lowered) == 0 {
+        IrDeferredHandlerBodyInvalid(1)
+      } else {
+        IrDeferredHandlerBody(captures, ops_value, pipeline_type_value_lane_count_or_one(body_ty), first_value, pipeline_lowered_blocks_blocks(lowered), IrDeferredCompletionBodyNone)
+      }
+    }
+    HandleReturnClause(rns, rnl, rb) -> {
+      let body_lowered = pipeline_lower_expr_typed_hclause_blocks(body, first_value, lower_ctx, body_ty, 0)
+      if pipeline_lowered_blocks_is_valid(body_lowered) == 0 {
+        IrDeferredHandlerBodyInvalid(2)
+      } else {
+        let body_lanes = pipeline_type_value_lane_count_or_one(body_ty)
+        let capture_lanes = pipeline_capture_value_lane_count(captures)
+        let completion_input = body_lanes + capture_lanes
+        let completion_first_value = completion_input + body_lanes
+        let completion_capture_locals = pipeline_handler_capture_locals(captures, 0, body_lanes, pipeline_value_env_empty())
+        let completion_locals = pipeline_value_env_push_float_typed_node(
+          completion_capture_locals,
+          rns,
+          rnl,
+          completion_input,
+          pipeline_type_node_prim_id_or(body_ty, 0),
+          if body_ty == 0 { 0 } else { type_hash_of(body_ty) },
+          body_ty
+        )
+        -- The transform is an out-of-line part of the synthetic fiber. Force
+        -- dynamic dispatch after the explicit prompt mask rather than
+        -- retaining the handled body's lexical direct-handler context.
+        let completion_module = pipeline_lower_module_with_handlers(module, PipelineHandlerInlineCtxNil)
+        let completion_ctx = pipeline_handler_lower_ctx_from_module(0, completion_locals, completion_module)
+        let completion_lowered = pipeline_lower_expr_typed_hclause_blocks(rb, completion_first_value, completion_ctx, result_ty, 0)
+        if pipeline_lowered_blocks_is_valid(completion_lowered) == 0 {
+          IrDeferredHandlerBodyInvalid(3)
+        } else {
+          let completion_params = nlist_new()
+          nlist_add(completion_params, node_new(2, rns, rnl, body_ty, 0))
+          let managed_input_drops = pipeline_managed_param_release_insts_at_with_borrow_mask(
+            completion_params,
+            0,
+            1,
+            completion_input,
+            pipeline_lowered_blocks_next_value(completion_lowered),
+            0,
+            pipeline_lower_module_tt(module)
+          )
+          let linear_input_drops = pipeline_linear_param_drop_insts_at_typed(completion_params, 0, 1, rb, src, pipeline_lower_module_tt(module), completion_input)
+          let completion_dropped = pipeline_ir_block_list_append_return_drops(
+            pipeline_lowered_blocks_blocks(completion_lowered),
+            ir_inst_list_append(managed_input_drops, linear_input_drops)
+          )
+          -- Cleanup calls may clobber x1-x7 after the generic return lowering
+          -- staged wide lanes. Restage the typed result bank after those calls.
+          let completion_restaged = pipeline_ir_block_list_append_return_lanes(completion_dropped, result_ty)
+          let completion_blocks = pipeline_ir_block_list_prepend_entry_insts(
+            completion_restaged,
+            0,
+            ir_inst_list_prepend(ir_inst_bind_typed_i64(rns, rnl, completion_input, body_ty), ir_inst_list_empty())
+          )
+          let completion = IrDeferredCompletionBody(body_lanes, pipeline_type_value_lane_count_or_one(result_ty), completion_first_value, completion_blocks)
+          IrDeferredHandlerBody(captures, ops_value, body_lanes, first_value, pipeline_lowered_blocks_blocks(body_lowered), completion)
+        }
+      }
+    }
   }
 }
 
@@ -12168,23 +12240,19 @@ pub(package) fn pipeline_lower_handle_typed_to_target_blocks(body_expr: Expr, cl
     let lowered_clauses = pipeline_lower_handler_clauses_typed(clauses, params, locals, module, handle_result_ty)
     let clause_bodies = pipeline_lowered_handler_clauses_bodies(lowered_clauses)
     if pipeline_handler_clause_list_has_continuation_handler_typed(clauses) == 1 {
-      if pipeline_handle_return_is_present(hret) == 1 {
-        pipeline_lowered_blocks_invalid(start_block, next_value)
-      } else {
-      let body_ty = pipeline_return_expr_type_node_typed(body_expr, params, locals, module)
-      let result_lanes = pipeline_type_value_lane_count_or_one(body_ty)
+      let result_ty = handle_result_ty
+      let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
       let dst = next_value
       let scratch_base = dst + result_lanes
-      let lowered_body = pipeline_lower_deferred_handler_body_typed(body_expr, clauses, lowered_clauses, params, locals, module)
+      let lowered_body = pipeline_lower_deferred_handler_body_typed(body_expr, clauses, hret, lowered_clauses, params, locals, module)
       let eff_hash = pipeline_handler_clause_dispatch_key_typed(src, handler_clause_list_nth(clauses, 0), pipeline_lower_module_subst(module))
       let insts = ir_inst_list_append(
         ir_inst_list_prepend(ir_inst_deferred_handle_i64(dst, src, lowered_body, clause_bodies, nclauses, eff_hash, scratch_base), ir_inst_list_empty()),
-        pipeline_ir_call_result_lane_insts(dst, body_ty)
+        pipeline_ir_call_result_lane_insts(dst, result_ty)
       )
       let args = pipeline_ir_value_lane_ids(dst, 0, result_lanes)
       let block = ir_block_new_term(start_block, insts, ir_term_jump_args(target_block, args))
       pipeline_lowered_blocks(next_block, scratch_base + pipeline_ir_native_deferred_handle_scratch_count(), ir_block_list_prepend(block, ir_block_list_empty()), 1)
-      }
     } else {
     let eff_hash = pipeline_handler_clause_dispatch_key_typed(src, handler_clause_list_nth(clauses, 0), pipeline_lower_module_subst(module))
     let next_handlers = pipeline_handler_inline_ctx_push_typed_src_safe(
@@ -25949,7 +26017,7 @@ pub(package) fn pipeline_lower_handle_node_typed_sidecar_handler_opt(body_node: 
     if pipeline_handler_clause_list_has_continuation_handler_typed(clauses) == 1 {
       let result_lanes = pipeline_type_value_lane_count_or_one(handle_result_ty)
       let scratch_base = next_value + result_lanes
-      let lowered_body = pipeline_lower_deferred_handler_body_typed(expr_from_node(body_node), clauses, lowered_clauses, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
+      let lowered_body = pipeline_lower_deferred_handler_body_typed(expr_from_node(body_node), clauses, NoHandleReturn, lowered_clauses, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
       let eff_hash = pipeline_handler_clause_dispatch_key_typed(src, handler_clause_list_nth(clauses, 0), pipeline_handler_lower_ctx_subst(lower_ctx))
       let inst = ir_inst_deferred_handle_i64(next_value, src, lowered_body, clause_bodies, nclauses, eff_hash, scratch_base)
       let insts = ir_inst_list_append(ir_inst_list_prepend(inst, ir_inst_list_empty()), pipeline_ir_call_result_lane_insts(next_value, handle_result_ty))
@@ -26663,8 +26731,14 @@ pub(package) fn pipeline_collect_generic_specs_ir_handler_clauses(clauses: IrHan
 
 pub(package) fn pipeline_collect_generic_specs_ir_deferred_body(body: IrDeferredHandlerBody, templates: i64, all_fns: i64, tt: i64, src: i64) -> IrFunctionList {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> {
-      pipeline_collect_generic_specs_ir_blocks(blocks, templates, all_fns, tt, src)
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+      let body_specs = pipeline_collect_generic_specs_ir_blocks(blocks, templates, all_fns, tt, src)
+      let completion_specs = match completion {
+        IrDeferredCompletionBodyNone -> ir_function_list_empty()
+        IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> pipeline_collect_generic_specs_ir_blocks(completion_blocks, templates, all_fns, tt, src)
+        IrDeferredCompletionBodyInvalid(reason) -> ir_function_list_empty()
+      }
+      pipeline_ir_function_list_append(body_specs, completion_specs)
     }
     IrDeferredHandlerBodyInvalid(reason) -> ir_function_list_empty()
   }
@@ -32324,6 +32398,24 @@ pub(package) fn pipeline_ir_native_emit_hclause_loads(code: i64, nparams: i64, f
   0
 }
 
+pub(package) fn pipeline_ir_native_emit_completion_loads(code: i64, nparams: i64, nfree: i64) -> i64 {
+  let mut bi = 0
+  while bi < nfree {
+    let value_id = nparams + bi
+    let dst = reg_phys(value_id)
+    bu32(code, cg_ldr(dst, 0, 8 + bi * 16))
+    if value_id >= 8 { emit_store_reg(code, value_id, dst) } else { 0 }
+    bi = bi + 1
+  }
+  let mut pi = 0
+  while pi < nparams {
+    let value_id = nparams + nfree + pi
+    emit_store_counter_from_phys(code, value_id, pi + 1)
+    pi = pi + 1
+  }
+  0
+}
+
 pub(package) fn pipeline_ir_native_emit_lambda_loads(code: i64, nparams: i64, nfree: i64) -> i64 {
   let mut bi = 0
   while bi < nfree {
@@ -32398,6 +32490,10 @@ pub(package) fn pipeline_ir_native_deferred_packet_arg_offset() -> i64 { 32 }
 pub(package) fn pipeline_ir_native_deferred_packet_size() -> i64 { pipeline_ir_native_deferred_packet_arg_offset() + 7 * 8 }
 -- Four fixed temporaries plus the complete x0-x7 result bank.
 pub(package) fn pipeline_ir_native_deferred_handle_scratch_count() -> i64 { 12 }
+
+-- The final reserved prompt word carries an optional compiler-owned typed
+-- normal-completion entry. It is not part of the runtime's public protocol.
+pub(package) fn pipeline_ir_native_deferred_prompt_completion_offset() -> i64 { 232 }
 
 pub(package) fn pipeline_ir_native_emit_deferred_packet_zero_args(code: i64, packet_phys: i64, index: i64) -> i64 {
   if index >= pipeline_ir_native_deferred_packet_max_args() { 0 }
@@ -32644,14 +32740,33 @@ pub(package) fn pipeline_ir_native_hclause_continuation_closure_entry(code: i64,
   bu32(code, encode_add_imm(0, 21, 0))
   pipeline_ir_native_load_phys_lanes(code, 19, 104, 1, resume_lanes)
   cg_emit_call_lit(code, fm, "fiber_resume")
-  pipeline_ir_native_store_phys_lanes(code, 19, 104, 0, result_lanes)
+  -- Preserve the complete native result bank until the prompt tells us
+  -- whether these are raw body-completion lanes or another suspension packet.
+  pipeline_ir_native_store_phys_lanes(code, 19, 104, 0, 8)
   bu32(code, encode_add_imm(23, 0, 0))
   cg_emit_call_lit(code, fm, "fiber_is_done")
   bu32(code, encode_cmp(0, 31))
   let suspended_pos = buf_len(code)
   bu32(code, 0)
-  pipeline_ir_native_load_phys_lanes(code, 19, 104, 0, result_lanes)
+  bu32(code, cg_ldr(17, 21, pipeline_ir_native_deferred_prompt_completion_offset()))
+  let no_completion_pos = buf_len(code)
+  bu32(code, 0)
+  -- The raw fiber is complete. Run its transform on this resumer stack with
+  -- the completed prompt masked, so an effect in the transform reaches the
+  -- enclosing dynamic handler rather than suspending the finished fiber.
+  pipeline_ir_native_emit_deferred_pop_runtime_state(code)
+  bu32(code, cg_ldr(16, 21, fiber_prompt_capture_owner_offset()))
+  bu32(code, cg_ldr(0, 16, 8))
+  pipeline_ir_native_load_phys_lanes(code, 19, 104, 1, 8)
+  bu32(code, cg_ldr(17, 21, pipeline_ir_native_deferred_prompt_completion_offset()))
+  bu32(code, encode_blr(17))
+  pipeline_ir_native_store_phys_lanes(code, 19, 104, 0, result_lanes)
+  pipeline_ir_native_emit_deferred_capture_owner_release_from_prompt(code, fm, 21)
   let done_from_fiber_pos = buf_len(code)
+  bu32(code, 0)
+  let no_completion = buf_len(code)
+  cg_patch_cbz(code, no_completion_pos, 17, no_completion)
+  let done_without_completion_pos = buf_len(code)
   bu32(code, 0)
   let suspended = buf_len(code)
   cg_patch_b_cond(code, suspended_pos, 0, suspended)
@@ -32659,6 +32774,7 @@ pub(package) fn pipeline_ir_native_hclause_continuation_closure_entry(code: i64,
   pipeline_ir_native_store_phys_lanes(code, 19, 104, 0, result_lanes)
   let restore = buf_len(code)
   cg_patch_b(code, done_from_fiber_pos, restore)
+  cg_patch_b(code, done_without_completion_pos, restore)
   pipeline_ir_native_restore_deferred_runtime_state_from_reg(code, 26)
   pipeline_ir_native_load_phys_lanes(code, 19, 104, 0, result_lanes)
   let finish = buf_len(code)
@@ -32670,7 +32786,11 @@ pub(package) fn pipeline_ir_native_hclause_continuation_closure_entry(code: i64,
 }
 
 pub(package) fn pipeline_ir_native_hclause_continuation_env_size(resume_lanes: i64, result_lanes: i64) -> i64 {
-  104 + pipeline_ir_max_i64(resume_lanes, result_lanes) * 8
+  -- The driver preserves the full x0-x7 raw fiber-result bank before it can
+  -- distinguish normal completion from another suspension packet. A return
+  -- transform may then narrow or widen that bank independently of the final
+  -- handler result shape.
+  104 + pipeline_ir_max_i64(8, pipeline_ir_max_i64(resume_lanes, result_lanes)) * 8
 }
 
 pub(package) fn pipeline_ir_native_emit_hclause_continuation_closure(code: i64, fm: i64, token_ctr: i64, closure_ctr: i64, env_ctr: i64, has_continuation: i64, resume_lanes: i64, result_lanes: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
@@ -33066,7 +33186,7 @@ pub(package) fn pipeline_ir_native_emit_hclause_continuation_lowered(code: i64, 
   }
 }
 
-pub(package) fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBody, code: i64, src: i64, fm: i64, active_handlers: PipelineNativeHandlerCtx, fns: i64) -> i64 {
+pub(package) fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBody, code: i64, src: i64, fm: i64, active_handlers: PipelineNativeHandlerCtx, fns: i64, completion_env: i64) -> i64 {
   match body {
     IrHandlerClauseBodyInvalid(reason) -> pipeline_ir_native_emit_hclause_body_trap(code, fm)
     IrHandlerClauseBody(op_hash, nparams, captures, has_continuation, is_abortive, result_cleanup_kind, transferred_param_value_fact, resume_lanes, result_lanes, first_value, blocks) -> {
@@ -33129,7 +33249,11 @@ pub(package) fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBod
         if is_abortive == 1 { pipeline_ir_native_store_reg(code, pinned, abort_frame_value, 9) } else { 0 }
         if cleanup_frame_value >= 0 { pipeline_ir_native_store_reg(code, pinned, cleanup_frame_value, 9) } else { 0 }
       } else { 0 }
-      pipeline_ir_native_emit_hclause_loads(code, nparams, captures, nfree)
+      if completion_env == 1 {
+        pipeline_ir_native_emit_completion_loads(code, nparams, nfree)
+      } else {
+        pipeline_ir_native_emit_hclause_loads(code, nparams, captures, nfree)
+      }
       -- Boundary capture uses scratch registers, so it must follow incoming
       -- clause-parameter/capture materialisation under Weft's wide register
       -- ABI.
@@ -33245,7 +33369,7 @@ pub(package) fn pipeline_type_find_any_field_index(tt: i64, src: i64, field_ns: 
 }
 
 pub(package) fn pipeline_ir_native_emit_hclause_body(body: IrHandlerClauseBody, code: i64, src: i64, fm: i64, active_handlers: PipelineNativeHandlerCtx, fns: i64) -> i64 {
-  pipeline_ir_native_emit_hclause_body_ir(body, code, src, fm, active_handlers, fns)
+  pipeline_ir_native_emit_hclause_body_ir(body, code, src, fm, active_handlers, fns, 0)
 }
 
 pub(package) fn pipeline_ir_native_hclause_env_from_captures(code: i64, fm: i64, ops_ctr: i64, ci: i64, captures: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
@@ -33321,8 +33445,22 @@ pub(package) fn pipeline_ir_native_emit_deferred_capture_owner_release(code: i64
   0
 }
 
-pub(package) fn pipeline_ir_native_emit_deferred_capture_owner_new(code: i64, fm: i64, prompt_ctr: i64, env_ctr: i64, captures: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
-  if pipeline_ir_native_deferred_managed_capture_count(captures) > 0 {
+pub(package) fn pipeline_ir_native_emit_deferred_capture_owner_release_from_prompt(code: i64, fm: i64, prompt_reg: i64) -> i64 {
+  let no_prompt_pos = buf_len(code)
+  bu32(code, 0)
+  bu32(code, cg_ldr(0, prompt_reg, fiber_prompt_capture_owner_offset()))
+  bu32(code, cg_str(31, prompt_reg, fiber_prompt_capture_owner_offset()))
+  let no_owner_pos = buf_len(code)
+  bu32(code, 0)
+  cg_emit_call_lit(code, fm, "closure_default_release")
+  let done = buf_len(code)
+  cg_patch_cbz(code, no_prompt_pos, prompt_reg, done)
+  cg_patch_cbz(code, no_owner_pos, 0, done)
+  0
+}
+
+pub(package) fn pipeline_ir_native_emit_deferred_capture_owner_new(code: i64, fm: i64, prompt_ctr: i64, env_ctr: i64, captures: i64, force_owner: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if force_owner == 1 or pipeline_ir_native_deferred_managed_capture_count(captures) > 0 {
     cg_emit_rc_default_alloc_nozero_lit(code, fm, continuation_cleanup_kind_closure(), 16, 8)
     emit_mov_imm(code, 9, 0)
     bu32(code, cg_str(9, 0, 0))
@@ -33350,10 +33488,49 @@ pub(package) fn pipeline_ir_native_emit_deferred_capture_owner_release_if_owned(
   0
 }
 
+pub(package) fn pipeline_ir_deferred_completion_is_present(completion: IrDeferredCompletionBody) -> i64 {
+  match completion {
+    IrDeferredCompletionBodyNone -> 0
+    IrDeferredCompletionBody(input_lanes, output_lanes, first_value, blocks) -> 1
+    IrDeferredCompletionBodyInvalid(reason) -> 0
+  }
+}
+
+pub(package) fn pipeline_ir_deferred_completion_result_lanes(completion: IrDeferredCompletionBody, body_lanes: i64) -> i64 {
+  match completion {
+    IrDeferredCompletionBodyNone -> body_lanes
+    IrDeferredCompletionBody(input_lanes, output_lanes, first_value, blocks) -> output_lanes
+    IrDeferredCompletionBodyInvalid(reason) -> body_lanes
+  }
+}
+
+pub(package) fn pipeline_ir_native_emit_deferred_completion_function(completion: IrDeferredCompletionBody, captures: i64, code: i64, src: i64, fm: i64, active_handlers: PipelineNativeHandlerCtx, fns: i64) -> i64 {
+  match completion {
+    IrDeferredCompletionBodyNone -> pipeline_hclause_info_new(0, captures, pipeline_capture_value_lane_count(captures))
+    IrDeferredCompletionBodyInvalid(reason) -> pipeline_ir_native_emit_hclause_body_trap(code, fm)
+    IrDeferredCompletionBody(input_lanes, output_lanes, first_value, blocks) -> {
+      let synthetic = IrHandlerClauseBody(
+        0,
+        input_lanes,
+        captures,
+        0,
+        0,
+        continuation_cleanup_kind_none(),
+        0,
+        0,
+        output_lanes,
+        first_value,
+        blocks
+      )
+      pipeline_ir_native_emit_hclause_body_ir(synthetic, code, src, fm, active_handlers, fns, 1)
+    }
+  }
+}
+
 pub(package) fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredHandlerBody, eff_hash: i64, nclauses: i64, clause_infos: i64, code: i64, src: i64, fm: i64, active_handlers: PipelineNativeHandlerCtx, fns: i64) -> i64 {
   match body {
     IrDeferredHandlerBodyInvalid(reason) -> pipeline_ir_native_emit_hclause_body_trap(code, fm)
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> {
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
       let nfree = pipeline_capture_value_lane_count(captures)
       let skip_pos = buf_len(code)
       bu32(code, 0)
@@ -33402,7 +33579,9 @@ pub(package) fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredH
       -- An all-unmanaged environment dies after the prologue loads. A managed
       -- environment belongs to the prompt's closure-shaped capture owner and
       -- survives until normal fiber completion or continuation drop.
-      pipeline_ir_native_emit_deferred_capture_env_release_if_unowned(code, fm, captures, nfree)
+      if pipeline_ir_deferred_completion_is_present(completion) == 0 {
+        pipeline_ir_native_emit_deferred_capture_env_release_if_unowned(code, fm, captures, nfree)
+      } else { 0 }
       let safe_handlers = pipeline_ir_native_handler_ctx_out_of_line()
       let fiber_handlers = PipelineNativeHandlerCtxCons(eff_hash, clause_infos, nclauses, ops_value, 0 - 1, 0, safe_handlers)
       let body_home_count = pipeline_ir_native_value_home_count_include_evidence(pipeline_ir_native_value_home_count_for_blocks(first_value, blocks), fm)
@@ -33420,7 +33599,9 @@ pub(package) fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredH
       for lane in 0..result_lanes {
         pipeline_ir_native_store_reg(code, pinned, return_save + lane, lane)
       }
-      pipeline_ir_native_emit_deferred_capture_owner_release_if_owned(code, fm, captures)
+      if pipeline_ir_deferred_completion_is_present(completion) == 0 {
+        pipeline_ir_native_emit_deferred_capture_owner_release_if_owned(code, fm, captures)
+      } else { 0 }
       for lane in 0..result_lanes {
         let saved_result = emit_load_reg(code, return_save + lane)
         bu32(code, encode_add_imm(lane, saved_result, 0))
@@ -33520,16 +33701,30 @@ pub(package) fn pipeline_ir_native_emit_deferred_handle(code: i64, dst: i64, src
     let info = pipeline_ir_native_emit_hclause_body(ir_handler_clause_body_list_nth(clauses, ci), code, src, fm, handlers, fns)
     pipeline_word_array_set(clause_infos, ci, info)
   }
+  let completion_info = match body {
+    IrDeferredHandlerBody(captures, ops_value, body_lanes, first_value, blocks, completion) -> pipeline_ir_native_emit_deferred_completion_function(completion, captures, code, src, fm, handlers, fns)
+    IrDeferredHandlerBodyInvalid(reason) -> pipeline_hclause_info_new(0, 0, 0)
+  }
   let body_info = pipeline_ir_native_emit_deferred_body_function(body, eff_hash, nclauses, clause_infos, code, src, fm, handlers, fns)
   let ops_ctr = scratch_base
   let env_ctr = ops_ctr + 1
   let segment_ctr = ops_ctr + 2
   let prompt_ctr = ops_ctr + 3
   let result_ctr = ops_ctr + 4
-  let result_lanes = match body {
-    IrDeferredHandlerBody(captures, ops_value, lanes, first_value, blocks) -> lanes
+  let body_result_lanes = match body {
+    IrDeferredHandlerBody(captures, ops_value, lanes, first_value, blocks, completion) -> lanes
     IrDeferredHandlerBodyInvalid(reason) -> 1
   }
+  let completion = match body {
+    IrDeferredHandlerBody(captures, ops_value, lanes, first_value, blocks, body_completion) -> body_completion
+    IrDeferredHandlerBodyInvalid(reason) -> IrDeferredCompletionBodyNone
+  }
+  let has_completion = pipeline_ir_deferred_completion_is_present(completion)
+  let result_lanes = pipeline_ir_deferred_completion_result_lanes(completion, body_result_lanes)
+  -- Once trampoline returns done, the segment home is dead; reuse it for the
+  -- saved dynamic scope so handlers without a transform retain their exact
+  -- established frame layout.
+  let scope_ctr = segment_ctr
   pipeline_ir_native_emit_deferred_push_runtime_state(code, fm)
   cg_bump_alloc_imm(code, fm, 16, nclauses * handler_ops_entry_size())
   pipeline_ir_native_store_reg(code, pinned, ops_ctr, 16)
@@ -33548,7 +33743,13 @@ pub(package) fn pipeline_ir_native_emit_deferred_handle(code: i64, dst: i64, src
   let cleanup_prompt_phys = pipeline_ir_native_load_reg_temp(code, pinned, prompt_ctr, 16)
   bu32(code, encode_add_imm(0, cleanup_prompt_phys, 0))
   cg_emit_call_lit(code, fm, "fiber_prompt_enable_cleanup")
-  pipeline_ir_native_emit_deferred_capture_owner_new(code, fm, prompt_ctr, env_ctr, pipeline_hclause_info_free_vars(body_info), pinned)
+  pipeline_ir_native_emit_deferred_capture_owner_new(code, fm, prompt_ctr, env_ctr, pipeline_hclause_info_free_vars(body_info), has_completion, pinned)
+  if has_completion == 1 {
+    let completion_adr = buf_len(code)
+    bu32(code, encode_adr(17, pipeline_hclause_info_clause_start(completion_info) - completion_adr))
+    let completion_prompt_phys = pipeline_ir_native_load_reg_temp(code, pinned, prompt_ctr, 16)
+    bu32(code, cg_str(17, completion_prompt_phys, pipeline_ir_native_deferred_prompt_completion_offset()))
+  } else { 0 }
   let prompt_phys = pipeline_ir_native_load_reg_temp(code, pinned, prompt_ctr, 16)
   bu32(code, cg_str(prompt_phys, 28, runtime_state_deferred_prompt_offset()))
   let ops_phys = pipeline_ir_native_load_reg_temp(code, pinned, ops_ctr, 17)
@@ -33563,16 +33764,37 @@ pub(package) fn pipeline_ir_native_emit_deferred_handle(code: i64, dst: i64, src
   let env_phys = pipeline_ir_native_load_reg_temp(code, pinned, env_ctr, 17)
   bu32(code, encode_add_imm(2, env_phys, 0))
   cg_emit_call_lit(code, fm, "fiber_trampoline")
-  for lane in 0..result_lanes {
+  for lane in 0..body_result_lanes {
     pipeline_ir_native_store_reg(code, pinned, result_ctr + lane, lane)
   }
   cg_emit_call_lit(code, fm, "fiber_is_done")
   bu32(code, encode_cmp(0, 31))
   let suspended_pos = buf_len(code)
   bu32(code, 0)
-  for lane in 0..result_lanes {
-    let done_result_phys = pipeline_ir_native_load_reg(code, pinned, result_ctr + lane)
-    pipeline_ir_native_store_reg_pinned(code, pinned, dst + lane, done_result_phys)
+  if has_completion == 1 {
+    pipeline_ir_native_save_deferred_runtime_state_to_reg(code, fm, 17)
+    pipeline_ir_native_store_reg(code, pinned, scope_ctr, 17)
+    pipeline_ir_native_emit_deferred_pop_runtime_state(code)
+    let completion_env = pipeline_ir_native_load_reg_temp(code, pinned, env_ctr, 16)
+    bu32(code, encode_add_imm(0, completion_env, 0))
+    for lane in 0..body_result_lanes {
+      let input_phys = pipeline_ir_native_load_reg(code, pinned, result_ctr + lane)
+      if input_phys != lane + 1 { bu32(code, encode_add_imm(lane + 1, input_phys, 0)) } else { 0 }
+    }
+    let completion_adr = buf_len(code)
+    bu32(code, encode_adr(17, pipeline_hclause_info_clause_start(completion_info) - completion_adr))
+    bu32(code, encode_blr(17))
+    for lane in 0..result_lanes {
+      pipeline_ir_native_store_reg_pinned(code, pinned, dst + lane, lane)
+    }
+    let saved_scope_phys = pipeline_ir_native_load_reg_temp(code, pinned, scope_ctr, 17)
+    pipeline_ir_native_restore_deferred_runtime_state_from_reg(code, saved_scope_phys)
+    pipeline_ir_native_emit_deferred_capture_owner_release_from_prompt(code, fm, pipeline_ir_native_load_reg_temp(code, pinned, prompt_ctr, 16))
+  } else {
+    for lane in 0..result_lanes {
+      let done_result_phys = pipeline_ir_native_load_reg(code, pinned, result_ctr + lane)
+      pipeline_ir_native_store_reg_pinned(code, pinned, dst + lane, done_result_phys)
+    }
   }
   let done_jump_pos = buf_len(code)
   bu32(code, 0)
@@ -42256,7 +42478,14 @@ pub(package) fn pipeline_ir_lambda_evidence_register_handler_clauses(clauses: Ir
 
 pub(package) fn pipeline_ir_lambda_evidence_register_deferred_body(body: IrDeferredHandlerBody, fm: i64) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_lambda_evidence_register_blocks(blocks, fm)
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+      pipeline_ir_lambda_evidence_register_blocks(blocks, fm)
+      match completion {
+        IrDeferredCompletionBodyNone -> 0
+        IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> pipeline_ir_lambda_evidence_register_blocks(completion_blocks, fm)
+        IrDeferredCompletionBodyInvalid(reason) -> 0
+      }
+    }
     IrDeferredHandlerBodyInvalid(reason) -> 0
   }
 }
@@ -42736,7 +42965,14 @@ pub(package) fn pipeline_ir_materialise_managed_stake_handler_clauses(clauses: I
 
 pub(package) fn pipeline_ir_materialise_managed_stake_deferred_body_with_census(body: IrDeferredHandlerBody, census: i64) -> IrDeferredHandlerBody {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, pipeline_ir_materialise_managed_stake_blocks_with_census(blocks, census))
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+      let rewritten_completion = match completion {
+        IrDeferredCompletionBodyNone -> completion
+        IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, pipeline_ir_materialise_managed_stake_blocks_with_census(completion_blocks, census))
+        IrDeferredCompletionBodyInvalid(reason) -> completion
+      }
+      IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, pipeline_ir_materialise_managed_stake_blocks_with_census(blocks, census), rewritten_completion)
+    }
     IrDeferredHandlerBodyInvalid(reason) -> body
   }
 }
@@ -44087,10 +44323,10 @@ pub(package) fn pipeline_ir_rewrite_handler_clause_capture_uses(clauses: IrHandl
 
 pub(package) fn pipeline_ir_rewrite_deferred_body_capture_uses(body: IrDeferredHandlerBody, aliases: PipelineIrAliasEnv) -> IrDeferredHandlerBody {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> {
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
       let rewritten_captures = pipeline_ir_rewrite_lambda_capture_uses(captures, aliases)
       if rewritten_captures == captures { body }
-      else { IrDeferredHandlerBody(rewritten_captures, ops_value, result_lanes, first_value, blocks) }
+      else { IrDeferredHandlerBody(rewritten_captures, ops_value, result_lanes, first_value, blocks, completion) }
     }
     IrDeferredHandlerBodyInvalid(reason) -> body
   }
@@ -44264,7 +44500,7 @@ pub(package) fn pipeline_ir_max_handler_clause_captures(clauses: IrHandlerClause
 
 pub(package) fn pipeline_ir_max_deferred_body_captures(body: IrDeferredHandlerBody, current: i64) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_max_lambda_captures(captures, current)
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> pipeline_ir_max_lambda_captures(captures, current)
     IrDeferredHandlerBodyInvalid(reason) -> current
   }
 }
@@ -44506,7 +44742,7 @@ pub(package) fn pipeline_ir_live_add_clause_captures(set: i64, clauses: IrHandle
 
 pub(package) fn pipeline_ir_live_add_deferred_captures(set: i64, body: IrDeferredHandlerBody, count: i64) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_live_add_captures(set, captures, count)
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> pipeline_ir_live_add_captures(set, captures, count)
     IrDeferredHandlerBodyInvalid(reason) -> count
   }
 }
@@ -50921,7 +51157,14 @@ pub(package) fn pipeline_ir_borrow_pass_handler_clauses(clauses: IrHandlerClause
 
 pub(package) fn pipeline_ir_borrow_pass_deferred_body(body: IrDeferredHandlerBody, pass: PipelineIrBorrowValuePass, facts: PipelineIrSemanticFactList) -> PipelineIrBorrowValuePass {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_borrow_pass_blocks_once(blocks, pass, facts)
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+      let body_pass = pipeline_ir_borrow_pass_blocks_once(blocks, pass, facts)
+      match completion {
+        IrDeferredCompletionBodyNone -> body_pass
+        IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> pipeline_ir_borrow_pass_blocks_once(completion_blocks, body_pass, facts)
+        IrDeferredCompletionBodyInvalid(reason) -> body_pass
+      }
+    }
     IrDeferredHandlerBodyInvalid(reason) -> pass
   }
 }
@@ -51191,7 +51434,14 @@ pub(package) fn pipeline_ir_borrow_handler_clauses_have_values(clauses: IrHandle
 
 pub(package) fn pipeline_ir_borrow_deferred_body_has_values(body: IrDeferredHandlerBody) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_borrow_blocks_have_values(blocks)
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+      if pipeline_ir_borrow_blocks_have_values(blocks) == 1 { 1 }
+      else { match completion {
+        IrDeferredCompletionBodyNone -> 0
+        IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> pipeline_ir_borrow_blocks_have_values(completion_blocks)
+        IrDeferredCompletionBodyInvalid(reason) -> 0
+      } }
+    }
     IrDeferredHandlerBodyInvalid(reason) -> 0
   }
 }
@@ -51461,7 +51711,14 @@ pub(package) fn pipeline_ir_borrow_values_complete_handler_clauses(clauses: IrHa
 
 pub(package) fn pipeline_ir_borrow_values_complete_deferred_body(body: IrDeferredHandlerBody, values: IrBorrowValueFactList) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_borrow_values_complete_blocks(blocks, pipeline_ir_borrow_block_param_map(blocks), values)
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+      if pipeline_ir_borrow_values_complete_blocks(blocks, pipeline_ir_borrow_block_param_map(blocks), values) != 1 { 0 }
+      else { match completion {
+        IrDeferredCompletionBodyNone -> 1
+        IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> pipeline_ir_borrow_values_complete_blocks(completion_blocks, pipeline_ir_borrow_block_param_map(completion_blocks), values)
+        IrDeferredCompletionBodyInvalid(reason) -> 1
+      } }
+    }
     IrDeferredHandlerBodyInvalid(reason) -> 1
   }
 }
@@ -54672,7 +54929,7 @@ pub(package) fn pipeline_ir_live_set_add_handler_clause_captures(clauses: IrHand
 
 pub(package) fn pipeline_ir_live_set_add_deferred_body_captures(body: IrDeferredHandlerBody, live: PipelineIrLiveSet) -> PipelineIrLiveSet {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_live_set_add_lambda_captures(captures, live)
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> pipeline_ir_live_set_add_lambda_captures(captures, live)
     IrDeferredHandlerBodyInvalid(reason) -> live
   }
 }
@@ -57502,7 +57759,7 @@ pub(package) fn pipeline_ir_handler_clause_capture_payload_in_range(clauses: IrH
 
 pub(package) fn pipeline_ir_deferred_body_capture_payload_in_range(body: IrDeferredHandlerBody, lower: i64, upper: i64) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_capture_payload_in_range(captures, lower, upper)
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> pipeline_ir_capture_payload_in_range(captures, lower, upper)
     IrDeferredHandlerBodyInvalid(reason) -> 0
   }
 }
@@ -59225,7 +59482,14 @@ pub(package) fn pipeline_ir_hoisted_fns_handler_clauses(clauses: IrHandlerClause
 
 pub(package) fn pipeline_ir_hoisted_fns_deferred_body(body: IrDeferredHandlerBody, acc: IrFunctionList) -> IrFunctionList {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_hoisted_fns_blocks(blocks, acc)
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+      let body_fns = pipeline_ir_hoisted_fns_blocks(blocks, acc)
+      match completion {
+        IrDeferredCompletionBodyNone -> body_fns
+        IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> pipeline_ir_hoisted_fns_blocks(completion_blocks, body_fns)
+        IrDeferredCompletionBodyInvalid(reason) -> body_fns
+      }
+    }
     IrDeferredHandlerBodyInvalid(reason) -> acc
   }
 }
@@ -59302,7 +59566,14 @@ pub(package) fn pipeline_ir_lambda_semantic_facts_handler_clauses(clauses: IrHan
 
 pub(package) fn pipeline_ir_lambda_semantic_facts_deferred_body(body: IrDeferredHandlerBody, facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> pipeline_ir_lambda_semantic_facts_blocks(blocks, facts)
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+      let body_facts = pipeline_ir_lambda_semantic_facts_blocks(blocks, facts)
+      match completion {
+        IrDeferredCompletionBodyNone -> body_facts
+        IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> pipeline_ir_lambda_semantic_facts_blocks(completion_blocks, body_facts)
+        IrDeferredCompletionBodyInvalid(reason) -> body_facts
+      }
+    }
     IrDeferredHandlerBodyInvalid(reason) -> facts
   }
 }
@@ -60651,7 +60922,14 @@ pub(package) fn pipeline_ir_reuse_handler_clauses(clauses: IrHandlerClauseBodyLi
 
 pub(package) fn pipeline_ir_reuse_deferred_body(body: IrDeferredHandlerBody) -> IrDeferredHandlerBody {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks) -> IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, pipeline_ir_reuse_blocks(blocks))
+    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+      let rewritten_completion = match completion {
+        IrDeferredCompletionBodyNone -> completion
+        IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, pipeline_ir_reuse_blocks(completion_blocks))
+        IrDeferredCompletionBodyInvalid(reason) -> completion
+      }
+      IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, pipeline_ir_reuse_blocks(blocks), rewritten_completion)
+    }
     IrDeferredHandlerBodyInvalid(reason) -> body
   }
 }
