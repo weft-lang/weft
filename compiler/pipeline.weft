@@ -993,7 +993,7 @@ pub(package) fn pipeline_rc_site_census_handler_clauses(clauses: IrHandlerClause
 
 pub(package) fn pipeline_rc_site_census_deferred_body(body: IrDeferredHandlerBody, census: i64) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> {
       pipeline_rc_site_census_blocks(blocks, census)
       match completion {
         IrDeferredCompletionBodyNone -> 0
@@ -2800,6 +2800,16 @@ pub(package) fn pipeline_lower_module_with_subst(module: PipelineLowerModule, su
   }
 }
 
+-- Retarget only definition-owned lookup facts while preserving the caller's
+-- installed-handler, parallel-scope, function-table, and inlining contexts.
+-- Named handler clauses are checked and lowered in their defining module;
+-- their handled body remains in the installing caller module.
+pub(package) fn pipeline_lower_module_retarget(module: PipelineLowerModule, src: i64, subst: i64) -> PipelineLowerModule {
+  match module {
+    PipelineLowerModule(old_src, tt, fns, handlers, old_subst, par_ctx, inline_depth) -> PipelineLowerModule(src, tt, fns, handlers, subst, par_ctx, inline_depth)
+  }
+}
+
 pub(package) fn pipeline_lower_module_src(module: PipelineLowerModule) -> i64 {
   match module {
     PipelineLowerModule(src, tt, fns, handlers, subst, par_ctx, inline_depth) -> src
@@ -4533,6 +4543,7 @@ pub(package) fn pipeline_return_expr_type_node_typed(expr: Expr, params: i64, lo
       pipeline_return_expr_type_node_typed(inner, params, locals, module)
     )
     Handle(body, clauses, hret) -> pipeline_handle_result_type_node_typed(body, hret, params, locals, module)
+    WithHandler(config, body, fact, source_site) -> pipeline_return_expr_type_node_typed(body, params, locals, module)
     If(cond, then_expr, else_expr) -> {
       let then_ty = pipeline_return_expr_type_node_typed(then_expr, params, locals, module)
       let else_ty = pipeline_return_expr_type_node_typed(else_expr, params, locals, module)
@@ -6506,6 +6517,7 @@ pub(package) fn pipeline_expr_needs_cfg(expr: i64) -> i64 {
       pipeline_call_args_have_cfg(args_node, nlist_len(args_node), 0)
     }
     33 -> 1
+    64 -> 1
     36 -> {
       let call_node = node_f2(expr)
       let args = if node_tag(call_node) == 32 { node_f4(call_node) } else { node_f3(call_node) }
@@ -6590,6 +6602,7 @@ pub(package) fn pipeline_expr_needs_cfg_typed(expr: Expr) -> i64 {
       if pipeline_expr_needs_cfg_typed(lhs) == 1 { 1 } else { pipeline_expr_list_needs_cfg_typed(args) }
     }
     Handle(body, clauses, hret) -> 1
+    WithHandler(config, body, fact, source_site) -> 1
     Resume(value) -> pipeline_expr_needs_cfg_typed(value)
     GenericCall(type_args, inner_call) -> pipeline_expr_needs_cfg_typed(inner_call)
     MethodCall(recv, method_hash, args, type_hash) -> {
@@ -6749,6 +6762,10 @@ pub(package) fn pipeline_expr_needs_par_scope_cfg_typed(expr: Expr, src: i64) ->
         NoHandleReturn -> 0
         HandleReturnClause(rns, rnl, rb) -> pipeline_expr_needs_par_scope_cfg_typed(rb, src)
       } } }
+    }
+    WithHandler(config, body, fact, source_site) -> {
+      if pipeline_expr_list_needs_par_scope_cfg_typed(handler_configuration_args(config), src) == 1 { 1 }
+      else { pipeline_expr_needs_par_scope_cfg_typed(body, src) }
     }
     Resume(value) -> pipeline_expr_needs_par_scope_cfg_typed(value, src)
     MethodCall(recv, method_hash, args, type_hash) -> {
@@ -11545,6 +11562,7 @@ pub(package) fn pipeline_lower_expr_typed_to_target_blocks_reserved(expr: Expr, 
     Assign(ns, nl, value) -> pipeline_lower_assign_typed_to_target_blocks(ns, nl, value, params, locals, module, next_value, start_block, next_block, target_block)
     Block(first, rest) -> pipeline_lower_block_typed_to_target_blocks(first, rest, params, locals, module, next_value, start_block, next_block, target_block)
     Handle(body, clauses, hret) -> pipeline_lower_handle_typed_to_target_blocks(body, clauses, hret, params, locals, module, next_value, start_block, next_block, target_block)
+    WithHandler(config, body, fact, source_site) -> pipeline_lower_named_handler_typed_to_target_blocks(config, body, fact, params, locals, module, next_value, start_block, next_block, target_block)
     Resume(value) -> pipeline_lower_expr_typed_to_target_blocks_reserved(value, params, locals, module, next_value, start_block, next_block, target_block)
     LetTyped(inner, ann_type) -> pipeline_lower_let_typed_annotation_to_target_blocks(inner, ann_type, target_ctx)
     _ -> pipeline_lower_straight_expr_typed_to_target_blocks(expr, params, locals, module, next_value, start_block, next_block, target_block)
@@ -12132,8 +12150,222 @@ pub(package) fn pipeline_lower_handler_clauses_typed(clauses: HandlerClauseList,
   }
 }
 
-pub(package) fn pipeline_lower_deferred_handler_body_typed(body: Expr, clauses: HandlerClauseList, hret: HandleReturn, lowered_clauses: PipelineLoweredHandlerClauses, fn_params: i64, outer_locals: PipelineValueEnv, module: PipelineLowerModule) -> IrDeferredHandlerBody {
+pub(package) fn pipeline_named_handler_constructor_locals(params: i64, values: IrValueList, index: i64, subst: i64, locals: PipelineValueEnv) -> PipelineValueEnv {
+  if params == 0 or index >= nlist_len(params) {
+    locals
+  } else {
+    let param = nlist_get(params, index)
+    let raw_ty = node_f3(param)
+    let ty = if raw_ty == 0 or subst == 0 { raw_ty } else { ty_subst(raw_ty, subst) }
+    let next_locals = pipeline_value_env_push_float_typed_node(
+      locals,
+      node_f1(param),
+      node_f2(param),
+      ir_value_list_nth_or(values, index, 0 - 1),
+      pipeline_type_node_prim_id_or(ty, 0),
+      if ty == 0 { 0 } else { type_hash_of(ty) },
+      ty
+    )
+    pipeline_named_handler_constructor_locals(params, values, index + 1, subst, next_locals)
+  }
+}
+
+pub(package) fn pipeline_named_handler_constructor_bind_insts(params: i64, values: IrValueList, index: i64, subst: i64) -> IrInstList {
+  if params == 0 or index >= nlist_len(params) {
+    ir_inst_list_empty()
+  } else {
+    let param = nlist_get(params, index)
+    let raw_ty = node_f3(param)
+    let ty = if raw_ty == 0 or subst == 0 { raw_ty } else { ty_subst(raw_ty, subst) }
+    ir_inst_list_prepend(
+      ir_inst_bind_typed_i64(node_f1(param), node_f2(param), ir_value_list_nth_or(values, index, 0 - 1), ty),
+      pipeline_named_handler_constructor_bind_insts(params, values, index + 1, subst)
+    )
+  }
+}
+
+pub(package) fn pipeline_handler_install_clauses(fact: HandlerInstallFact) -> HandlerClauseList {
+  match fact {
+    ResolvedHandlerInstallFact(target_module, implementation, install_subst, atom) -> {
+      let raw = typeck_handler_implementation_raw(implementation)
+      handler_clause_list_from_nodes(typeck_handler_implementation_clauses(raw), 0, typeck_handler_implementation_clause_count(raw))
+    }
+    UnknownHandlerInstallFact -> HandlerClauseListNil
+  }
+}
+
+pub(package) fn pipeline_handler_install_source_or(fact: HandlerInstallFact, fallback: i64) -> i64 {
+  match fact {
+    ResolvedHandlerInstallFact(target_module, implementation, install_subst, atom) -> module_fact_entry_source(target_module)
+    UnknownHandlerInstallFact -> fallback
+  }
+}
+
+pub(package) fn pipeline_handler_install_is_resolved(fact: HandlerInstallFact) -> i64 {
+  match fact {
+    ResolvedHandlerInstallFact(target_module, implementation, install_subst, atom) -> 1
+    UnknownHandlerInstallFact -> 0
+  }
+}
+
+pub(package) fn pipeline_named_handler_constructor_release_insts(params: i64, values: IrValueList, index: i64, subst: i64, tt: i64, next_value: i64) -> IrInstList {
+  if params == 0 or index >= nlist_len(params) {
+    ir_inst_list_empty()
+  } else {
+    let param = nlist_get(params, index)
+    let raw_ty = node_f3(param)
+    let ty = if raw_ty == 0 or subst == 0 { raw_ty } else { ty_subst(raw_ty, subst) }
+    let value = ir_value_list_nth_or(values, index, 0 - 1)
+    let managed = if ty != 0 and ty_value_has_release_lane(ty) == 1 {
+      pipeline_managed_release_inst_list_with_origin(value, ty, next_value, ir_managed_stake_origin_cleanup())
+    } else { ir_inst_list_empty() }
+    let after_managed = next_value + ir_inst_list_len(managed)
+    let linear = pipeline_linear_cleanup_inst_list(value, pipeline_linear_cleanup_plan(tt, ty))
+    let after_linear = after_managed + ir_inst_list_len(linear)
+    ir_inst_list_append(
+      managed,
+      ir_inst_list_append(
+        linear,
+        pipeline_named_handler_constructor_release_insts(params, values, index + 1, subst, tt, after_linear)
+      )
+    )
+  }
+}
+
+-- Lower one resolved module installation directly from checker facts. The
+-- configuration arguments belong to the caller expression, while the
+-- constructor bindings and clauses belong to the implementation module.
+pub(package) fn pipeline_lower_named_handler_expr_typed_sidecar(config: HandlerConfiguration, body_expr: Expr, fact: HandlerInstallFact, next_value: i64, lower_ctx: PipelineHandlerLowerCtx) -> IrLoweredExpr {
+  match config {
+    UnknownHandlerConfiguration -> ir_lowered_expr_invalid(next_value)
+    HandlerConfiguration(config_ns, config_nl, type_args, args) -> {
+      match fact {
+        UnknownHandlerInstallFact -> ir_lowered_expr_invalid(next_value)
+        ResolvedHandlerInstallFact(target_module, implementation, install_subst, atom) -> {
+          let raw = typeck_handler_implementation_raw(implementation)
+          let params = typeck_handler_implementation_params(raw)
+          let clause_nodes = typeck_handler_implementation_clauses(raw)
+          let nclauses = typeck_handler_implementation_clause_count(raw)
+          if target_module == 0 or raw == 0 or nclauses <= 0 {
+            ir_lowered_expr_invalid(next_value)
+          } else {
+            let caller_module = pipeline_handler_lower_ctx_module(lower_ctx)
+            let lowered_args = pipeline_lower_typed_handler_opt_args_expected(args, 0, next_value, lower_ctx, params, 0, install_subst)
+            if pipeline_lowered_args_is_valid(lowered_args) == 0 {
+              ir_lowered_expr_invalid(next_value)
+            } else {
+              let impl_src = module_fact_entry_source(target_module)
+              let impl_locals = pipeline_named_handler_constructor_locals(params, pipeline_lowered_args_values(lowered_args), 0, install_subst, pipeline_value_env_empty())
+              let impl_module = pipeline_lower_module_retarget(caller_module, impl_src, install_subst)
+              let clauses = handler_clause_list_from_nodes(clause_nodes, 0, nclauses)
+              let handle_result_ty = pipeline_return_expr_type_node_typed(
+                body_expr,
+                pipeline_handler_lower_ctx_params(lower_ctx),
+                pipeline_handler_lower_ctx_locals(lower_ctx),
+                caller_module
+              )
+              let lowered_clauses = pipeline_lower_handler_clauses_typed(clauses, 0, impl_locals, impl_module, handle_result_ty)
+              if pipeline_lowered_handler_clauses_valid(lowered_clauses) == 0 or pipeline_handler_clause_list_has_continuation_handler_typed(clauses) == 1 {
+                ir_lowered_expr_invalid(next_value)
+              } else {
+                let clause_bodies = pipeline_lowered_handler_clauses_bodies(lowered_clauses)
+                let eff_hash = pipeline_handler_clause_dispatch_key_typed(impl_src, handler_clause_list_nth(clauses, 0), install_subst)
+                let next_handlers = pipeline_handler_inline_ctx_push_typed_src_safe(
+                  pipeline_handler_lower_ctx_handlers(lower_ctx),
+                  eff_hash,
+                  clauses,
+                  nclauses,
+                  impl_src,
+                  1,
+                  pipeline_lowered_handler_clauses_out_of_line_safe(lowered_clauses)
+                )
+                let body_module = pipeline_lower_module_with_handlers(caller_module, next_handlers)
+                let body_ctx = pipeline_handler_lower_ctx_from_module(
+                  pipeline_handler_lower_ctx_params(lower_ctx),
+                  pipeline_handler_lower_ctx_locals(lower_ctx),
+                  body_module
+                )
+                let body_start = pipeline_lowered_args_next_value(lowered_args)
+                let call_inline = pipeline_lower_handle_body_call_inline_nodes(expr_to_node(body_expr), eff_hash, next_handlers, body_ctx, body_start)
+                let lowered_body = if ir_lowered_expr_is_valid(call_inline) == 1 { call_inline }
+                  else { pipeline_lower_expr_typed_sidecar_handler_ctx(body_expr, body_start, body_ctx) }
+                if ir_lowered_expr_is_valid(lowered_body) == 0 {
+                  ir_lowered_expr_invalid(next_value)
+                } else {
+                  let constructor_binds = pipeline_named_handler_constructor_bind_insts(params, pipeline_lowered_args_values(lowered_args), 0, install_subst)
+                  let constructor_releases = pipeline_named_handler_constructor_release_insts(
+                    params,
+                    pipeline_lowered_args_values(lowered_args),
+                    0,
+                    install_subst,
+                    pipeline_handler_lower_ctx_tt(lower_ctx),
+                    ir_lowered_expr_next_value(lowered_body)
+                  )
+                  let body_insts = if pipeline_ir_insts_handle_frame_free(ir_lowered_expr_insts(lowered_body)) == 1 {
+                    ir_inst_list_append(constructor_binds, ir_inst_list_append(ir_lowered_expr_insts(lowered_body), constructor_releases))
+                  } else {
+                    let marker = ir_inst_list_prepend(IrHandleI64(0 - 1, impl_src, eff_hash, clause_bodies, nclauses, 0 - 1), ir_inst_list_empty())
+                    let pop = ir_inst_list_prepend(ir_inst_handler_pop_i64(0 - 1), ir_inst_list_empty())
+                    ir_inst_list_append(marker, ir_inst_list_append(constructor_binds, ir_inst_list_append(ir_lowered_expr_insts(lowered_body), ir_inst_list_append(pop, constructor_releases))))
+                  }
+                  ir_lowered_expr(
+                    ir_lowered_expr_value(lowered_body),
+                    ir_lowered_expr_next_value(lowered_body) + ir_inst_list_len(constructor_releases),
+                    ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), body_insts)
+                  )
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_lower_named_handler_typed_to_target_blocks(config: HandlerConfiguration, body_expr: Expr, fact: HandlerInstallFact, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
+  match config {
+    UnknownHandlerConfiguration -> pipeline_lowered_blocks_invalid(start_block, next_value)
+    HandlerConfiguration(config_ns, config_nl, type_args, args) -> {
+      match fact {
+        UnknownHandlerInstallFact -> pipeline_lowered_blocks_invalid(start_block, next_value)
+        ResolvedHandlerInstallFact(target_module, implementation, install_subst, atom) -> pipeline_lower_named_handler_resolved_typed_to_target_blocks(
+          args,
+          body_expr,
+          target_module,
+          implementation,
+          install_subst,
+          params,
+          locals,
+          module,
+          next_value,
+          start_block,
+          next_block,
+          target_block
+        )
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_named_handler_constructor_prompt_captures(params: i64, values: IrValueList, index: i64, subst: i64, captures: i64) -> i64 {
+  if params == 0 or index >= nlist_len(params) { 0 }
+  else {
+    let param = nlist_get(params, index)
+    let raw_ty = node_f3(param)
+    let ty = if raw_ty == 0 or subst == 0 { raw_ty } else { ty_subst(raw_ty, subst) }
+    if ty != 0 and ty_value_has_release_lane(ty) == 1 {
+      -- Empty source names make these owner-only captures unreachable from
+      -- the installing body while preserving its ordinary capture offsets.
+      nlist_add(captures, pipeline_lambda_capture_entry(0, 0, ir_value_list_nth_or(values, index, 0 - 1), ty))
+    } else { 0 }
+    pipeline_named_handler_constructor_prompt_captures(params, values, index + 1, subst, captures)
+  }
+}
+
+pub(package) fn pipeline_lower_deferred_handler_body_sources_typed(body: Expr, clauses: HandlerClauseList, hret: HandleReturn, lowered_clauses: PipelineLoweredHandlerClauses, fn_params: i64, outer_locals: PipelineValueEnv, module: PipelineLowerModule, clause_module: PipelineLowerModule, constructor_params: i64, constructor_values: IrValueList, constructor_subst: i64) -> IrDeferredHandlerBody {
   let src = pipeline_lower_module_src(module)
+  let clause_src = pipeline_lower_module_src(clause_module)
   let available = pipeline_lambda_capture_env_with_params(fn_params, outer_locals, src)
   let captures = nlist_new()
   pipeline_lambda_capture_expr(body, scope_new(), available, src, captures)
@@ -12141,17 +12373,18 @@ pub(package) fn pipeline_lower_deferred_handler_body_typed(body: Expr, clauses: 
     NoHandleReturn -> 0
     HandleReturnClause(rns, rnl, rb) -> pipeline_lambda_capture_expr(rb, scope_push(scope_new(), rns, rnl, 0), available, src, captures)
   }
+  pipeline_named_handler_constructor_prompt_captures(constructor_params, constructor_values, 0, constructor_subst, captures)
   let capture_lanes = pipeline_capture_value_lane_count(captures)
   let ops_value = capture_lanes
   let first_value = capture_lanes + 1
-  let eff_hash = pipeline_handler_clause_dispatch_key_typed(src, handler_clause_list_nth(clauses, 0), pipeline_lower_module_subst(module))
+  let eff_hash = pipeline_handler_clause_dispatch_key_typed(clause_src, handler_clause_list_nth(clauses, 0), pipeline_lower_module_subst(clause_module))
   let safe_outer = pipeline_handler_inline_ctx_out_of_line_safe(pipeline_lower_module_handlers(module))
   let body_handlers = pipeline_handler_inline_ctx_push_typed_src_safe(
     safe_outer,
     eff_hash,
     clauses,
     handler_clause_list_len(clauses),
-    src,
+    clause_src,
     0,
     pipeline_lowered_handler_clauses_out_of_line_safe(lowered_clauses)
   )
@@ -12166,7 +12399,7 @@ pub(package) fn pipeline_lower_deferred_handler_body_typed(body: Expr, clauses: 
       if pipeline_lowered_blocks_is_valid(lowered) == 0 {
         IrDeferredHandlerBodyInvalid(1)
       } else {
-        IrDeferredHandlerBody(captures, ops_value, pipeline_type_value_lane_count_or_one(body_ty), first_value, pipeline_lowered_blocks_blocks(lowered), IrDeferredCompletionBodyNone)
+        IrDeferredHandlerBody(src, captures, ops_value, pipeline_type_value_lane_count_or_one(body_ty), first_value, pipeline_lowered_blocks_blocks(lowered), IrDeferredCompletionBodyNone)
       }
     }
     HandleReturnClause(rns, rnl, rb) -> {
@@ -12222,7 +12455,175 @@ pub(package) fn pipeline_lower_deferred_handler_body_typed(body: Expr, clauses: 
             ir_inst_list_prepend(ir_inst_bind_typed_i64(rns, rnl, completion_input, body_ty), ir_inst_list_empty())
           )
           let completion = IrDeferredCompletionBody(body_lanes, pipeline_type_value_lane_count_or_one(result_ty), completion_first_value, completion_blocks)
-          IrDeferredHandlerBody(captures, ops_value, body_lanes, first_value, pipeline_lowered_blocks_blocks(body_lowered), completion)
+          IrDeferredHandlerBody(src, captures, ops_value, body_lanes, first_value, pipeline_lowered_blocks_blocks(body_lowered), completion)
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_lower_deferred_handler_body_typed(body: Expr, clauses: HandlerClauseList, hret: HandleReturn, lowered_clauses: PipelineLoweredHandlerClauses, fn_params: i64, outer_locals: PipelineValueEnv, module: PipelineLowerModule) -> IrDeferredHandlerBody {
+  pipeline_lower_deferred_handler_body_sources_typed(body, clauses, hret, lowered_clauses, fn_params, outer_locals, module, module, 0, ir_value_list_empty(), 0)
+}
+
+pub(package) fn pipeline_lower_named_handler_resolved_typed_to_target_blocks(args_exprs: ExprList, body_expr: Expr, target_module: i64, implementation: i64, install_subst: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
+  let raw = typeck_handler_implementation_raw(implementation)
+  let constructor_params = typeck_handler_implementation_params(raw)
+  let clause_nodes = typeck_handler_implementation_clauses(raw)
+  let nclauses = typeck_handler_implementation_clause_count(raw)
+  if target_module == 0 or raw == 0 or nclauses <= 0 {
+    pipeline_lowered_blocks_invalid(start_block, next_value)
+  } else {
+    let arg_count = expr_list_len(args_exprs)
+    let install_block = next_block
+    let first_arg_block = pipeline_lower_operation_child_start_block(install_block, arg_count)
+    let lowered_args = pipeline_lower_call_arg_blocks_typed(
+      args_exprs,
+      arg_count,
+      params,
+      locals,
+      module,
+      install_block,
+      constructor_params,
+      0,
+      install_subst,
+      0,
+      0,
+      next_value,
+      first_arg_block,
+      ir_value_list_empty()
+    )
+    if pipeline_lowered_call_blocks_is_valid(lowered_args) == 0 {
+      pipeline_lowered_blocks_invalid(start_block, next_value)
+    } else {
+      let entry = ir_block_new_term(start_block, ir_inst_list_empty(), ir_term_jump(first_arg_block))
+      if pipeline_lowered_call_blocks_falls_through(lowered_args) == 0 {
+        pipeline_lowered_blocks_control(
+          pipeline_lowered_call_blocks_next_block(lowered_args),
+          pipeline_lowered_call_blocks_next_value(lowered_args),
+          ir_block_list_prepend(entry, pipeline_lowered_call_blocks_blocks(lowered_args)),
+          1,
+          0
+        )
+      } else {
+        let constructor_values = pipeline_lowered_call_blocks_values(lowered_args)
+        let body_next_value = pipeline_lowered_call_blocks_next_value(lowered_args)
+        let impl_src = module_fact_entry_source(target_module)
+        let impl_locals = pipeline_named_handler_constructor_locals(constructor_params, constructor_values, 0, install_subst, pipeline_value_env_empty())
+        let impl_module = pipeline_lower_module_retarget(module, impl_src, install_subst)
+        let clauses = handler_clause_list_from_nodes(clause_nodes, 0, nclauses)
+        let result_ty = pipeline_return_expr_type_node_typed(body_expr, params, locals, module)
+        let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
+        let lowered_clauses = pipeline_lower_handler_clauses_typed(clauses, 0, impl_locals, impl_module, result_ty)
+        if pipeline_lowered_handler_clauses_valid(lowered_clauses) == 0 {
+          pipeline_lowered_blocks_invalid(start_block, next_value)
+        } else {
+          let clause_bodies = pipeline_lowered_handler_clauses_bodies(lowered_clauses)
+          let eff_hash = pipeline_handler_clause_dispatch_key_typed(impl_src, handler_clause_list_nth(clauses, 0), install_subst)
+          let constructor_binds = pipeline_named_handler_constructor_bind_insts(constructor_params, constructor_values, 0, install_subst)
+          if pipeline_handler_clause_list_has_continuation_handler_typed(clauses) == 1 {
+            let dst = body_next_value
+            let scratch_base = dst + result_lanes
+            let deferred_body = pipeline_lower_deferred_handler_body_sources_typed(body_expr, clauses, NoHandleReturn, lowered_clauses, params, locals, module, impl_module, constructor_params, constructor_values, install_subst)
+            let handle_insts = ir_inst_list_append(
+              constructor_binds,
+              ir_inst_list_append(
+                ir_inst_list_prepend(ir_inst_deferred_handle_i64(dst, impl_src, deferred_body, clause_bodies, nclauses, eff_hash, scratch_base), ir_inst_list_empty()),
+                pipeline_ir_call_result_lane_insts(dst, result_ty)
+              )
+            )
+            let release_base = scratch_base + pipeline_ir_native_deferred_handle_scratch_count()
+            let constructor_releases = pipeline_named_handler_constructor_release_insts(constructor_params, constructor_values, 0, install_subst, pipeline_lower_module_tt(module), release_base)
+            let install = ir_block_new_term(
+              install_block,
+              ir_inst_list_append(handle_insts, constructor_releases),
+              ir_term_jump_args(target_block, pipeline_ir_value_lane_ids(dst, 0, result_lanes))
+            )
+            let blocks = ir_block_list_prepend(
+              entry,
+              ir_block_list_append(pipeline_lowered_call_blocks_blocks(lowered_args), ir_block_list_prepend(install, ir_block_list_empty()))
+            )
+            pipeline_lowered_blocks(pipeline_lowered_call_blocks_next_block(lowered_args), release_base + ir_inst_list_len(constructor_releases), blocks, 1)
+          } else {
+            let next_handlers = pipeline_handler_inline_ctx_push_typed_src_safe(
+              pipeline_lower_module_handlers(module),
+              eff_hash,
+              clauses,
+              nclauses,
+              impl_src,
+              1,
+              pipeline_lowered_handler_clauses_out_of_line_safe(lowered_clauses)
+            )
+            let body_module = pipeline_lower_module_with_handlers(module, next_handlers)
+            let has_abortive = handler_clause_list_has_abortive(clauses)
+            if pipeline_expr_needs_lowering_cfg_typed(body_expr, pipeline_lower_module_src(module)) == 1 or has_abortive == 1 {
+              let pop_block = pipeline_lowered_call_blocks_next_block(lowered_args)
+              let abort_block = if has_abortive == 1 { pop_block + 1 } else { 0 - 1 }
+              let body_start = if has_abortive == 1 { pop_block + 2 } else { pop_block + 1 }
+              let body_next_block = if has_abortive == 1 { pop_block + 3 } else { pop_block + 2 }
+              let body_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(body_expr, params, locals, body_module, body_next_value, body_start, body_next_block, pop_block)
+              if pipeline_lowered_blocks_is_valid(body_blocks) == 0 or pipeline_lowered_blocks_falls_through(body_blocks) == 0 {
+                pipeline_lowered_blocks_invalid(start_block, next_value)
+              } else {
+                let body_value = pipeline_lowered_blocks_next_value(body_blocks)
+                let abort_value = body_value + result_lanes
+                let release_base = body_value + result_lanes + has_abortive * result_lanes
+                let constructor_releases = pipeline_named_handler_constructor_release_insts(constructor_params, constructor_values, 0, install_subst, pipeline_lower_module_tt(module), release_base)
+                let abort_release_base = release_base + ir_inst_list_len(constructor_releases)
+                let abort_constructor_releases = if has_abortive == 1 {
+                  pipeline_named_handler_constructor_release_insts(constructor_params, constructor_values, 0, install_subst, pipeline_lower_module_tt(module), abort_release_base)
+                } else { ir_inst_list_empty() }
+                let marker = ir_inst_list_prepend(IrHandleI64(0 - 1, impl_src, eff_hash, clause_bodies, nclauses, abort_block), constructor_binds)
+                let install = ir_block_new_term(install_block, marker, ir_term_jump(body_start))
+                let pop_insts = ir_inst_list_append(ir_inst_list_prepend(ir_inst_handler_pop_i64(0 - 1), ir_inst_list_empty()), constructor_releases)
+                let pop_args = pipeline_ir_value_lane_ids(body_value, 0, result_lanes)
+                let pop = ir_block_new_params(pop_block, pop_args, pop_insts, ir_term_jump_args(target_block, pop_args))
+                let abort_tail = if has_abortive == 1 {
+                  let abort_insts = ir_inst_list_append(
+                    ir_inst_list_prepend(ir_inst_abort_landing_i64(abort_value), ir_inst_list_empty()),
+                    ir_inst_list_append(pipeline_ir_call_result_lane_insts(abort_value, result_ty), abort_constructor_releases)
+                  )
+                  let abort_args = pipeline_ir_value_lane_ids(abort_value, 0, result_lanes)
+                  ir_block_list_prepend(ir_block_new_term(abort_block, abort_insts, ir_term_jump_args(target_block, abort_args)), ir_block_list_empty())
+                } else { ir_block_list_empty() }
+                let blocks = ir_block_list_prepend(
+                  entry,
+                  ir_block_list_append(
+                    pipeline_lowered_call_blocks_blocks(lowered_args),
+                    ir_block_list_prepend(install, ir_block_list_append(pipeline_lowered_blocks_blocks(body_blocks), ir_block_list_prepend(pop, abort_tail)))
+                  )
+                )
+                pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(body_blocks), abort_release_base + ir_inst_list_len(abort_constructor_releases), blocks, 1)
+              }
+            } else {
+              let body_ctx = pipeline_handler_lower_ctx_from_module(params, locals, body_module)
+              let call_inline = pipeline_lower_handle_body_call_inline_nodes(expr_to_node(body_expr), eff_hash, next_handlers, body_ctx, body_next_value)
+              let lowered_body = if ir_lowered_expr_is_valid(call_inline) == 1 { call_inline }
+                else { pipeline_lower_expr_typed_sidecar_handler_ctx(body_expr, body_next_value, body_ctx) }
+              if ir_lowered_expr_is_valid(lowered_body) == 0 {
+                pipeline_lowered_blocks_invalid(start_block, next_value)
+              } else {
+                let constructor_releases = pipeline_named_handler_constructor_release_insts(constructor_params, constructor_values, 0, install_subst, pipeline_lower_module_tt(module), ir_lowered_expr_next_value(lowered_body))
+                let handle_insts = if pipeline_ir_insts_handle_frame_free(ir_lowered_expr_insts(lowered_body)) == 1 {
+                  ir_inst_list_append(constructor_binds, ir_inst_list_append(ir_lowered_expr_insts(lowered_body), constructor_releases))
+                } else {
+                  let marker = ir_inst_list_prepend(IrHandleI64(0 - 1, impl_src, eff_hash, clause_bodies, nclauses, 0 - 1), ir_inst_list_empty())
+                  let pop = ir_inst_list_prepend(ir_inst_handler_pop_i64(0 - 1), ir_inst_list_empty())
+                  ir_inst_list_append(marker, ir_inst_list_append(constructor_binds, ir_inst_list_append(ir_lowered_expr_insts(lowered_body), ir_inst_list_append(pop, constructor_releases))))
+                }
+                let install = ir_block_new_term(
+                  install_block,
+                  handle_insts,
+                  ir_term_jump_args(target_block, pipeline_ir_value_lane_ids(ir_lowered_expr_value(lowered_body), 0, result_lanes))
+                )
+                let blocks = ir_block_list_prepend(
+                  entry,
+                  ir_block_list_append(pipeline_lowered_call_blocks_blocks(lowered_args), ir_block_list_prepend(install, ir_block_list_empty()))
+                )
+                pipeline_lowered_blocks(pipeline_lowered_call_blocks_next_block(lowered_args), ir_lowered_expr_next_value(lowered_body) + ir_inst_list_len(constructor_releases), blocks, 1)
+              }
+            }
+          }
         }
       }
     }
@@ -12489,6 +12890,18 @@ pub(package) fn pipeline_lower_expr_to_target_blocks_reserved(expr: i64, params:
       }
     }
     33 -> pipeline_lower_handle_to_target_blocks(expr, params, locals, module, next_value, start_block, next_block, target_block)
+    64 -> pipeline_lower_named_handler_typed_to_target_blocks(
+      handler_configuration_from_node(node_f1(expr)),
+      expr_from_node(node_f2(expr)),
+      handler_install_fact_from_node(node_f3(expr)),
+      params,
+      locals,
+      module,
+      next_value,
+      start_block,
+      next_block,
+      target_block
+    )
     36 -> {
       if pipeline_expr_needs_cfg(expr) == 1 {
         let inner = node_f2(expr)
@@ -17374,6 +17787,10 @@ pub(package) fn pipeline_lambda_capture_expr(expr: Expr, local_scope: i64, local
         HandleReturnClause(rns, rnl, rb) -> pipeline_lambda_capture_expr(rb, local_scope, locals, src, captures)
       }
     }
+    WithHandler(config, body, fact, source_site) -> {
+      pipeline_lambda_capture_expr_list(handler_configuration_args(config), local_scope, locals, src, captures)
+      pipeline_lambda_capture_expr(body, local_scope, locals, src, captures)
+    }
     Resume(value) -> pipeline_lambda_capture_expr(value, local_scope, locals, src, captures)
     MethodCall(recv, method_hash, args, type_hash) -> {
       pipeline_lambda_capture_expr(recv, local_scope, locals, src, captures)
@@ -18490,6 +18907,7 @@ pub(package) fn pipeline_expr_uses_function_value_typed(expr: Expr, src: i64, fn
     }
     Perform(lhs, op_ns, op_nl, args) -> pipeline_expr_uses_function_value_typed(lhs, src, fnhashes, locals) or pipeline_expr_list_uses_function_value_typed(args, src, fnhashes, locals)
     Handle(body, clauses, hret) -> pipeline_expr_uses_function_value_typed(body, src, fnhashes, locals) or pipeline_handle_clauses_use_function_value_typed(clauses, src, fnhashes, locals) or (match hret { NoHandleReturn -> false HandleReturnClause(rns, rnl, rb) -> pipeline_expr_uses_function_value_typed(rb, src, fnhashes, locals) })
+    WithHandler(config, body, fact, source_site) -> pipeline_expr_list_uses_function_value_typed(handler_configuration_args(config), src, fnhashes, locals) or pipeline_expr_uses_function_value_typed(body, src, fnhashes, locals)
     Resume(value) -> pipeline_expr_uses_function_value_typed(value, src, fnhashes, locals)
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_expr_uses_function_value_typed(recv, src, fnhashes, locals) or pipeline_expr_list_uses_function_value_typed(args, src, fnhashes, locals)
     Try(inner, effect_atom) -> pipeline_expr_uses_function_value_typed(inner, src, fnhashes, locals)
@@ -18609,6 +19027,7 @@ pub(package) fn pipeline_expr_needs_rc_runtime(node: i64, src: i64) -> bool {
       29 -> true
       32 -> pipeline_expr_needs_rc_runtime(node_f1(node), src) or pipeline_expr_list_needs_rc_runtime(node_f4(node), nlist_len(node_f4(node)), src)
       33 -> true
+      64 -> true
       35 -> pipeline_expr_needs_rc_runtime(node_f1(node), src)
       36 -> pipeline_type_list_contains_rc(node_f1(node)) or pipeline_type_list_contains_closure(node_f1(node)) or pipeline_type_list_contains_weak(node_f1(node)) or pipeline_expr_needs_rc_runtime(node_f2(node), src)
       37 -> pipeline_ty_needs_rc_runtime(node_f2(node)) or pipeline_expr_needs_rc_runtime(node_f1(node), src)
@@ -18720,6 +19139,7 @@ pub(package) fn pipeline_expr_needs_rc_runtime_typed(expr: Expr, src: i64, tt: i
     Lambda(params, body, source_site) -> true
     Perform(lhs, op_ns, op_nl, args) -> pipeline_expr_needs_rc_runtime_typed(lhs, src, tt) or pipeline_expr_list_needs_rc_runtime_typed(args, src, tt)
     Handle(body, clauses, hret) -> true
+    WithHandler(config, body, fact, source_site) -> true
     Resume(value) -> pipeline_expr_needs_rc_runtime_typed(value, src, tt)
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_expr_needs_rc_runtime_typed(recv, src, tt) or pipeline_expr_list_needs_rc_runtime_typed(args, src, tt)
     Try(inner, effect_atom) -> pipeline_expr_needs_rc_runtime_typed(inner, src, tt)
@@ -18964,6 +19384,7 @@ pub(package) fn pipeline_expr_needs_effects_runtime_typed(expr: Expr, src: i64) 
       _ -> true
     }
     Handle(body, clauses, hret) -> true
+    WithHandler(config, body, fact, source_site) -> true
     Resume(value) -> pipeline_expr_needs_effects_runtime_typed(value, src)
     MethodCall(recv, method_hash, args, type_hash) -> if pipeline_expr_needs_effects_runtime_typed(recv, src) { true } else { pipeline_expr_list_needs_effects_runtime_typed(args, src) }
     Try(inner, effect_atom) -> true
@@ -19079,6 +19500,7 @@ pub(package) fn pipeline_expr_needs_index_runtime_typed(expr: Expr) -> bool {
     Lambda(params, body, source_site) -> pipeline_expr_needs_index_runtime_typed(body)
     Perform(lhs, op_ns, op_nl, args) -> pipeline_expr_needs_index_runtime_typed(lhs) or pipeline_expr_list_needs_index_runtime_typed(args)
     Handle(body, clauses, hret) -> pipeline_expr_needs_index_runtime_typed(body) or pipeline_handler_clauses_need_index_runtime_typed(clauses) or pipeline_handle_return_needs_index_runtime_typed(hret)
+    WithHandler(config, body, fact, source_site) -> pipeline_expr_list_needs_index_runtime_typed(handler_configuration_args(config)) or pipeline_expr_needs_index_runtime_typed(body)
     Resume(value) -> pipeline_expr_needs_index_runtime_typed(value)
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_expr_needs_index_runtime_typed(recv) or pipeline_expr_list_needs_index_runtime_typed(args)
     Try(inner, effect_atom) -> pipeline_expr_needs_index_runtime_typed(inner)
@@ -20948,6 +21370,7 @@ pub(package) fn pipeline_expr_float_prim_typed(expr: Expr, params: i64, locals: 
     Lambda(params, body, source_site) -> 0
     Perform(lhs, op_ns, op_nl, args) -> 0
     Handle(body, clauses, hret) -> 0
+    WithHandler(config, body, fact, source_site) -> 0
     Resume(value) -> 0
     MethodCall(recv, method_hash, args, type_hash) -> 0
     Try(inner, effect_atom) -> 0
@@ -21853,6 +22276,7 @@ pub(package) fn pipeline_expr_refs_name_typed(expr: Expr, src: i64, ns: i64, nl:
     }
     Perform(lhs, op_ns, op_nl, args) -> pipeline_expr_refs_name_typed(lhs, src, ns, nl) or pipeline_expr_list_refs_name_typed(args, src, ns, nl)
     Handle(body, clauses, hret) -> pipeline_expr_refs_name_typed(body, src, ns, nl) or pipeline_handler_clauses_refs_name_typed(clauses, src, ns, nl) or (match hret { NoHandleReturn -> false HandleReturnClause(rns, rnl, rb) -> pipeline_expr_refs_name_typed(rb, src, ns, nl) })
+    WithHandler(config, body, fact, source_site) -> pipeline_expr_list_refs_name_typed(handler_configuration_args(config), src, ns, nl) or pipeline_expr_refs_name_typed(body, src, ns, nl)
     Resume(value) -> pipeline_expr_refs_name_typed(value, src, ns, nl)
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_expr_refs_name_typed(recv, src, ns, nl) or pipeline_expr_list_refs_name_typed(args, src, ns, nl)
     Try(inner, effect_atom) -> pipeline_expr_refs_name_typed(inner, src, ns, nl)
@@ -22004,6 +22428,7 @@ pub(package) fn pipeline_expr_result_is_borrowed_with_ctx_typed(expr: Expr, src:
         HandleReturnClause(rns, rnl, rb) -> pipeline_expr_result_is_borrowed_with_ctx_typed(rb, src, fns, subst, tt)
       }
     }
+    WithHandler(config, body, fact, source_site) -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt)
     _ -> 0
   }
 }
@@ -22049,6 +22474,7 @@ pub(package) fn pipeline_array_expr_result_is_borrowed_typed(expr: Expr, src: i6
         HandleReturnClause(rns, rnl, rb) -> pipeline_array_expr_result_is_borrowed_typed(rb, src, fns, subst, tt)
       }
     }
+    WithHandler(config, body, fact, source_site) -> pipeline_array_expr_result_is_borrowed_typed(body, src, fns, subst, tt)
     _ -> 0
   }
 }
@@ -22127,6 +22553,7 @@ pub(package) fn pipeline_expr_result_is_any_param_borrow_typed(expr: Expr, param
         HandleReturnClause(rns, rnl, rb) -> pipeline_expr_result_is_any_param_borrow_typed(rb, params, src)
       }
     }
+    WithHandler(config, body, fact, source_site) -> pipeline_expr_result_is_any_param_borrow_typed(body, params, src)
     _ -> 0
   }
 }
@@ -22208,6 +22635,7 @@ pub(package) fn pipeline_expr_node_final_returns_binding(node: i64, src: i64, ns
       }
       37 -> pipeline_expr_node_final_returns_binding(node_f1(stripped), src, ns, nl)
       52 -> pipeline_expr_node_final_returns_binding(node_f2(stripped), src, ns, nl)
+      64 -> pipeline_expr_node_final_returns_binding(node_f2(stripped), src, ns, nl)
       _ -> 0
     }
   }
@@ -22318,6 +22746,7 @@ pub(package) fn pipeline_expr_typed_address_of_binding(expr: Expr, src: i64, ns:
     }
     Perform(lhs, op_ns, op_nl, args) -> pipeline_expr_typed_address_of_binding(lhs, src, ns, nl) or pipeline_expr_list_address_of_binding_typed(args, src, ns, nl)
     Handle(body, clauses, hret) -> pipeline_expr_typed_address_of_binding(body, src, ns, nl) or pipeline_handler_clauses_address_of_binding_typed(clauses, src, ns, nl) or (match hret { NoHandleReturn -> false HandleReturnClause(rns, rnl, rb) -> pipeline_expr_typed_address_of_binding(rb, src, ns, nl) })
+    WithHandler(config, body, fact, source_site) -> pipeline_expr_list_address_of_binding_typed(handler_configuration_args(config), src, ns, nl) or pipeline_expr_typed_address_of_binding(body, src, ns, nl)
     Resume(value) -> pipeline_expr_typed_address_of_binding(value, src, ns, nl)
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_expr_typed_address_of_binding(recv, src, ns, nl) or pipeline_expr_list_address_of_binding_typed(args, src, ns, nl)
     Try(inner, effect_atom) -> pipeline_expr_typed_address_of_binding(inner, src, ns, nl)
@@ -22417,6 +22846,57 @@ pub(package) fn pipeline_lower_perform_expr_typed_sidecar_handler_opt(lhs_expr: 
   pipeline_lower_perform_expr_typed_sidecar_handler_opt_keyed(lhs_expr, lhs_expr, op_ns, op_nl, args_exprs, next_value, lower_ctx, dispatch_key)
 }
 
+pub(package) fn pipeline_lower_resolved_effect_perform_expr_typed_sidecar(signature_ref: Expr, op_ns: i64, op_nl: i64, args_exprs: ExprList, next_value: i64, lower_ctx: PipelineHandlerLowerCtx, dispatch_key: i64) -> IrLoweredExpr {
+  let params = pipeline_handler_lower_ctx_params(lower_ctx)
+  let locals = pipeline_handler_lower_ctx_locals(lower_ctx)
+  let src = pipeline_handler_lower_ctx_src(lower_ctx)
+  let tt = pipeline_handler_lower_ctx_tt(lower_ctx)
+  let subst = pipeline_handler_lower_ctx_subst(lower_ctx)
+  let expected_params = pipeline_effect_op_params_nodes_typed(tt, src, signature_ref, op_ns, op_nl, subst)
+  let return_ty = pipeline_effect_op_return_type_typed(tt, src, signature_ref, op_ns, op_nl, subst)
+  let result_lanes = pipeline_type_value_lane_count_or_one(return_ty)
+  let args = pipeline_lower_typed_handler_opt_args_expected(args_exprs, 0, next_value, lower_ctx, expected_params, 0, 0)
+  if pipeline_lowered_args_is_valid(args) == 0 {
+    ir_lowered_expr_invalid(next_value)
+  } else {
+    let dst = pipeline_lowered_args_next_value(args)
+    let logical_args = pipeline_lowered_args_values(args)
+    let abi_args = pipeline_call_abi_args(logical_args, expected_params, 0, 0, 0, 0)
+    let op_hash = effect_name_hash(src, op_ns, op_nl)
+    let found = pipeline_handler_inline_ctx_find_match(pipeline_handler_lower_ctx_handlers(lower_ctx), src, dispatch_key, op_hash)
+    let tail_inline = pipeline_handler_inline_try_tail_resume(pipeline_handler_lower_ctx_handlers(lower_ctx), found, logical_args, tt, pipeline_handler_lower_ctx_fns(lower_ctx), dst)
+    if ir_lowered_expr_is_valid(tail_inline) == 1 {
+      ir_lowered_expr(
+        ir_lowered_expr_value(tail_inline),
+        ir_lowered_expr_next_value(tail_inline),
+        ir_inst_list_append(pipeline_lowered_args_insts(args), ir_lowered_expr_insts(tail_inline))
+      )
+    } else {
+      let op_inst = if pipeline_handler_inline_match_found(found) == 1 {
+        ir_inst_handler_direct_i64(
+          dst,
+          dispatch_key,
+          op_hash,
+          pipeline_handler_inline_match_depth_or(found, 0 - 1),
+          pipeline_handler_inline_match_clause_index_or(found, 0 - 1),
+          abi_args
+        )
+      } else {
+        ir_inst_perform_i64(dst, dispatch_key, op_hash, abi_args)
+      }
+      let transfers = pipeline_effect_linear_transfer_insts_typed(
+        args_exprs, expected_params, 0, 0, abi_args,
+        params, locals, pipeline_handler_lower_ctx_module(lower_ctx)
+      )
+      let perform = ir_inst_list_append(
+        transfers,
+        ir_inst_list_append(ir_inst_list_prepend(op_inst, ir_inst_list_empty()), pipeline_ir_call_result_lane_insts(dst, return_ty))
+      )
+      ir_lowered_expr(dst, dst + result_lanes, ir_inst_list_append(pipeline_lowered_args_insts(args), perform))
+    }
+  }
+}
+
 pub(package) fn pipeline_lower_perform_expr_typed_sidecar_handler_opt_keyed(lhs_expr: Expr, signature_ref: Expr, op_ns: i64, op_nl: i64, args_exprs: ExprList, next_value: i64, lower_ctx: PipelineHandlerLowerCtx, dispatch_key: i64) -> IrLoweredExpr {
   let params = pipeline_handler_lower_ctx_params(lower_ctx)
   let locals = pipeline_handler_lower_ctx_locals(lower_ctx)
@@ -22425,9 +22905,22 @@ pub(package) fn pipeline_lower_perform_expr_typed_sidecar_handler_opt_keyed(lhs_
   let ctx = pipeline_handler_lower_ctx_handlers(lower_ctx)
   match lhs_expr {
     FieldAccess(base, field_ns, field_nl, fact) -> {
-      let declaration = field_access_fact_declaration(fact)
-      if declaration == 0 { ir_lowered_expr_invalid(next_value) }
-      else { pipeline_lower_decl_call_typed(declaration, args_exprs, next_value, lower_ctx) }
+      match fact {
+        ResolvedEffectAccessFact(decl, type_args) -> pipeline_lower_resolved_effect_perform_expr_typed_sidecar(signature_ref, op_ns, op_nl, args_exprs, next_value, lower_ctx, dispatch_key)
+        ResolvedDeclarationAccessFact(decl) -> {
+          if decl != 0 and module_decl_fact_namespace(decl) == module_decl_namespace_effect() {
+            pipeline_lower_resolved_effect_perform_expr_typed_sidecar(signature_ref, op_ns, op_nl, args_exprs, next_value, lower_ctx, dispatch_key)
+          } else {
+            if decl == 0 { ir_lowered_expr_invalid(next_value) }
+            else { pipeline_lower_decl_call_typed(decl, args_exprs, next_value, lower_ctx) }
+          }
+        }
+        _ -> {
+          let declaration = field_access_fact_declaration(fact)
+          if declaration == 0 { ir_lowered_expr_invalid(next_value) }
+          else { pipeline_lower_decl_call_typed(declaration, args_exprs, next_value, lower_ctx) }
+        }
+      }
     }
     Ident(eff_ns, eff_nl) -> {
       let subst = pipeline_handler_lower_ctx_subst(lower_ctx)
@@ -26127,6 +26620,14 @@ pub(package) fn pipeline_lower_expr_node_typed_sidecar_handler_raw(expr: i64, ne
       pipeline_lower_perform_node_typed_sidecar_handler_opt(node_f1(stripped), node_f2(stripped), node_f3(stripped), node_f4(stripped), nlist_len(node_f4(stripped)), next_value, lower_ctx)
     } else { if tag == 33 {
       pipeline_lower_handle_node_typed_sidecar_handler_opt(node_f1(stripped), node_f2(stripped), node_f3(stripped), next_value, lower_ctx)
+    } else { if tag == 64 {
+      pipeline_lower_named_handler_expr_typed_sidecar(
+        handler_configuration_from_node(node_f1(stripped)),
+        expr_from_node(node_f2(stripped)),
+        handler_install_fact_from_node(node_f3(stripped)),
+        next_value,
+        lower_ctx
+      )
     } else { if tag == 35 {
       pipeline_lower_expr_node_typed_sidecar_handler_ctx(node_f1(stripped), next_value, lower_ctx)
     } else { if tag == 36 {
@@ -26147,7 +26648,7 @@ pub(package) fn pipeline_lower_expr_node_typed_sidecar_handler_raw(expr: i64, ne
       pipeline_lower_ptr_assign_node_typed_sidecar_handler_opt(node_f1(stripped), node_f2(stripped), next_value, lower_ctx)
     } else {
       ir_lowered_expr_invalid(next_value)
-    } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } }
+    } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } }
     }
   }
 }
@@ -26214,6 +26715,7 @@ pub(package) fn pipeline_lower_expr_typed_sidecar_handler_ctx(expr: Expr, next_v
     ArrayLiteral(elements, resolved_ty, span) -> pipeline_lower_array_literal_expr_typed_sidecar_handler_opt(elements, resolved_ty, next_value, lower_ctx)
     Perform(lhs, op_ns, op_nl, args) -> pipeline_lower_perform_expr_typed_sidecar_handler_opt(lhs, op_ns, op_nl, args, next_value, lower_ctx)
     Handle(body, clauses, hret) -> pipeline_lower_handle_expr_typed_sidecar_handler_opt(body, clauses, hret, next_value, lower_ctx)
+    WithHandler(config, body, fact, source_site) -> pipeline_lower_named_handler_expr_typed_sidecar(config, body, fact, next_value, lower_ctx)
     Resume(value) -> pipeline_lower_expr_typed_sidecar_handler_ctx(value, next_value, lower_ctx)
     GenericCall(type_args, inner_call) -> pipeline_lower_generic_call_expr_typed_sidecar_handler_opt(type_args, inner_call, next_value, lower_ctx)
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_lower_method_call_expr_typed_sidecar_handler_opt(recv, method_hash, args, type_hash, next_value, lower_ctx)
@@ -26731,11 +27233,11 @@ pub(package) fn pipeline_collect_generic_specs_ir_handler_clauses(clauses: IrHan
 
 pub(package) fn pipeline_collect_generic_specs_ir_deferred_body(body: IrDeferredHandlerBody, templates: i64, all_fns: i64, tt: i64, src: i64) -> IrFunctionList {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
-      let body_specs = pipeline_collect_generic_specs_ir_blocks(blocks, templates, all_fns, tt, src)
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+      let body_specs = pipeline_collect_generic_specs_ir_blocks(blocks, templates, all_fns, tt, body_src)
       let completion_specs = match completion {
         IrDeferredCompletionBodyNone -> ir_function_list_empty()
-        IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> pipeline_collect_generic_specs_ir_blocks(completion_blocks, templates, all_fns, tt, src)
+        IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> pipeline_collect_generic_specs_ir_blocks(completion_blocks, templates, all_fns, tt, body_src)
         IrDeferredCompletionBodyInvalid(reason) -> ir_function_list_empty()
       }
       pipeline_ir_function_list_append(body_specs, completion_specs)
@@ -28370,6 +28872,7 @@ pub(package) fn pipeline_expr_has_continuation_handler_typed(expr: Expr) -> bool
     Lambda(params, body, source_site) -> pipeline_expr_has_continuation_handler_typed(body)
     Perform(lhs, op_ns, op_nl, args) -> pipeline_expr_has_continuation_handler_typed(lhs) or pipeline_expr_list_has_continuation_handler_typed(args)
     Handle(body, clauses, hret) -> pipeline_expr_has_continuation_handler_typed(body) or pipeline_handler_clause_list_has_continuation_handler_typed(clauses) or (match hret { NoHandleReturn -> false HandleReturnClause(rns, rnl, rb) -> pipeline_expr_has_continuation_handler_typed(rb) })
+    WithHandler(config, body, fact, source_site) -> pipeline_expr_list_has_continuation_handler_typed(handler_configuration_args(config)) or pipeline_expr_has_continuation_handler_typed(body) or pipeline_handler_clause_list_has_continuation_handler_typed(pipeline_handler_install_clauses(fact))
     Resume(value) -> pipeline_expr_has_continuation_handler_typed(value)
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_expr_has_continuation_handler_typed(recv) or pipeline_expr_list_has_continuation_handler_typed(args)
     Try(inner, effect_atom) -> pipeline_expr_has_continuation_handler_typed(inner)
@@ -28481,6 +28984,7 @@ pub(package) fn pipeline_expr_has_non_native_scalar_typed(expr: Expr) -> bool {
     Lambda(params, body, source_site) -> pipeline_expr_has_non_native_scalar_typed(body)
     Perform(lhs, op_ns, op_nl, args) -> pipeline_expr_has_non_native_scalar_typed(lhs) or pipeline_expr_list_has_non_native_scalar_typed(args)
     Handle(body, clauses, hret) -> pipeline_expr_has_non_native_scalar_typed(body) or pipeline_handler_clause_list_has_non_native_scalar_typed(clauses) or (match hret { NoHandleReturn -> false HandleReturnClause(rns, rnl, rb) -> pipeline_expr_has_non_native_scalar_typed(rb) })
+    WithHandler(config, body, fact, source_site) -> pipeline_expr_list_has_non_native_scalar_typed(handler_configuration_args(config)) or pipeline_expr_has_non_native_scalar_typed(body) or pipeline_handler_clause_list_has_non_native_scalar_typed(pipeline_handler_install_clauses(fact))
     Resume(value) -> pipeline_expr_has_non_native_scalar_typed(value)
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_expr_has_non_native_scalar_typed(recv) or pipeline_expr_list_has_non_native_scalar_typed(args)
     Try(inner, effect_atom) -> pipeline_expr_has_non_native_scalar_typed(inner)
@@ -28574,6 +29078,7 @@ pub(package) fn pipeline_expr_has_match_typed(expr: Expr) -> bool {
     Lambda(params, body, source_site) -> pipeline_expr_has_match_typed(body)
     Perform(lhs, op_ns, op_nl, args) -> pipeline_expr_has_match_typed(lhs) or pipeline_expr_list_has_match_typed(args)
     Handle(body, clauses, hret) -> pipeline_expr_has_match_typed(body) or pipeline_handler_clause_list_has_match_typed(clauses) or (match hret { NoHandleReturn -> false HandleReturnClause(rns, rnl, rb) -> pipeline_expr_has_match_typed(rb) })
+    WithHandler(config, body, fact, source_site) -> pipeline_expr_list_has_match_typed(handler_configuration_args(config)) or pipeline_expr_has_match_typed(body) or pipeline_handler_clause_list_has_match_typed(pipeline_handler_install_clauses(fact))
     Resume(value) -> pipeline_expr_has_match_typed(value)
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_expr_has_match_typed(recv) or pipeline_expr_list_has_match_typed(args)
     Try(inner, effect_atom) -> pipeline_expr_has_match_typed(inner)
@@ -28671,6 +29176,7 @@ pub(package) fn pipeline_expr_has_raw_intrinsic_typed(expr: Expr, src: i64) -> b
     Lambda(params, body, source_site) -> pipeline_expr_has_raw_intrinsic_typed(body, src)
     Perform(lhs, op_ns, op_nl, args) -> pipeline_expr_has_raw_intrinsic_typed(lhs, src) or pipeline_expr_list_has_raw_intrinsic_typed(args, src)
     Handle(body, clauses, hret) -> pipeline_expr_has_raw_intrinsic_typed(body, src) or pipeline_handler_clause_list_has_raw_intrinsic_typed(clauses, src) or (match hret { NoHandleReturn -> false HandleReturnClause(rns, rnl, rb) -> pipeline_expr_has_raw_intrinsic_typed(rb, src) })
+    WithHandler(config, body, fact, source_site) -> pipeline_expr_list_has_raw_intrinsic_typed(handler_configuration_args(config), src) or pipeline_expr_has_raw_intrinsic_typed(body, src) or pipeline_handler_clause_list_has_raw_intrinsic_typed(pipeline_handler_install_clauses(fact), pipeline_handler_install_source_or(fact, src))
     Resume(value) -> pipeline_expr_has_raw_intrinsic_typed(value, src)
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_expr_has_raw_intrinsic_typed(recv, src) or pipeline_expr_list_has_raw_intrinsic_typed(args, src)
     Try(inner, effect_atom) -> pipeline_expr_has_raw_intrinsic_typed(inner, src)
@@ -33031,6 +33537,10 @@ pub(package) fn pipeline_typed_find_free_vars_expr(expr: Expr, local_scope: i64,
         HandleReturnClause(rns, rnl, rb) -> pipeline_typed_find_free_vars_expr(rb, local_scope, enclosing_scope, src, free_vars)
       }
     }
+    WithHandler(config, body, fact, source_site) -> {
+      pipeline_typed_find_free_vars_expr_list(handler_configuration_args(config), local_scope, enclosing_scope, src, free_vars)
+      pipeline_typed_find_free_vars_expr(body, local_scope, enclosing_scope, src, free_vars)
+    }
     Resume(value) -> pipeline_typed_find_free_vars_expr(value, local_scope, enclosing_scope, src, free_vars)
     MethodCall(recv, method_hash, args, type_hash) -> {
       pipeline_typed_find_free_vars_expr(recv, local_scope, enclosing_scope, src, free_vars)
@@ -33530,7 +34040,7 @@ pub(package) fn pipeline_ir_native_emit_deferred_completion_function(completion:
 pub(package) fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredHandlerBody, eff_hash: i64, nclauses: i64, clause_infos: i64, code: i64, src: i64, fm: i64, active_handlers: PipelineNativeHandlerCtx, fns: i64) -> i64 {
   match body {
     IrDeferredHandlerBodyInvalid(reason) -> pipeline_ir_native_emit_hclause_body_trap(code, fm)
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> {
       let nfree = pipeline_capture_value_lane_count(captures)
       let skip_pos = buf_len(code)
       bu32(code, 0)
@@ -33592,7 +34102,7 @@ pub(package) fn pipeline_ir_native_emit_deferred_body_function(body: IrDeferredH
       pipeline_ir_native_store_reg(code, pinned, ops_value, 17)
       let temp_base = return_save + result_lanes
       let abort_adr_patches = nlist_new()
-      let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, scope_new(), src, fm, fiber_handlers, fns, f64_facts, vector_data_facts, abort_adr_patches, pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
+      let state = pipeline_ir_native_emit_blocks(blocks, blocks, code, scope_new(), body_src, fm, fiber_handlers, fns, f64_facts, vector_data_facts, abort_adr_patches, pipeline_ir_native_cfg_state(pipeline_ir_native_label_map_empty(), 0, pinned, temp_base))
       let labels = pipeline_ir_native_label_map_add(pipeline_ir_native_cfg_state_labels(state), pipeline_ir_native_epilogue_label(), buf_len(code))
       pipeline_ir_native_patch_all(code, labels, pipeline_ir_native_cfg_state_patches(state))
       pipeline_ir_native_patch_abort_adrs(code, labels, abort_adr_patches)
@@ -33702,7 +34212,7 @@ pub(package) fn pipeline_ir_native_emit_deferred_handle(code: i64, dst: i64, src
     pipeline_word_array_set(clause_infos, ci, info)
   }
   let completion_info = match body {
-    IrDeferredHandlerBody(captures, ops_value, body_lanes, first_value, blocks, completion) -> pipeline_ir_native_emit_deferred_completion_function(completion, captures, code, src, fm, handlers, fns)
+    IrDeferredHandlerBody(body_src, captures, ops_value, body_lanes, first_value, blocks, completion) -> pipeline_ir_native_emit_deferred_completion_function(completion, captures, code, body_src, fm, handlers, fns)
     IrDeferredHandlerBodyInvalid(reason) -> pipeline_hclause_info_new(0, 0, 0)
   }
   let body_info = pipeline_ir_native_emit_deferred_body_function(body, eff_hash, nclauses, clause_infos, code, src, fm, handlers, fns)
@@ -33712,11 +34222,11 @@ pub(package) fn pipeline_ir_native_emit_deferred_handle(code: i64, dst: i64, src
   let prompt_ctr = ops_ctr + 3
   let result_ctr = ops_ctr + 4
   let body_result_lanes = match body {
-    IrDeferredHandlerBody(captures, ops_value, lanes, first_value, blocks, completion) -> lanes
+    IrDeferredHandlerBody(body_src, captures, ops_value, lanes, first_value, blocks, completion) -> lanes
     IrDeferredHandlerBodyInvalid(reason) -> 1
   }
   let completion = match body {
-    IrDeferredHandlerBody(captures, ops_value, lanes, first_value, blocks, body_completion) -> body_completion
+    IrDeferredHandlerBody(body_src, captures, ops_value, lanes, first_value, blocks, body_completion) -> body_completion
     IrDeferredHandlerBodyInvalid(reason) -> IrDeferredCompletionBodyNone
   }
   let has_completion = pipeline_ir_deferred_completion_is_present(completion)
@@ -42478,7 +42988,7 @@ pub(package) fn pipeline_ir_lambda_evidence_register_handler_clauses(clauses: Ir
 
 pub(package) fn pipeline_ir_lambda_evidence_register_deferred_body(body: IrDeferredHandlerBody, fm: i64) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> {
       pipeline_ir_lambda_evidence_register_blocks(blocks, fm)
       match completion {
         IrDeferredCompletionBodyNone -> 0
@@ -42965,13 +43475,13 @@ pub(package) fn pipeline_ir_materialise_managed_stake_handler_clauses(clauses: I
 
 pub(package) fn pipeline_ir_materialise_managed_stake_deferred_body_with_census(body: IrDeferredHandlerBody, census: i64) -> IrDeferredHandlerBody {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> {
       let rewritten_completion = match completion {
         IrDeferredCompletionBodyNone -> completion
         IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, pipeline_ir_materialise_managed_stake_blocks_with_census(completion_blocks, census))
         IrDeferredCompletionBodyInvalid(reason) -> completion
       }
-      IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, pipeline_ir_materialise_managed_stake_blocks_with_census(blocks, census), rewritten_completion)
+      IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, pipeline_ir_materialise_managed_stake_blocks_with_census(blocks, census), rewritten_completion)
     }
     IrDeferredHandlerBodyInvalid(reason) -> body
   }
@@ -44323,10 +44833,10 @@ pub(package) fn pipeline_ir_rewrite_handler_clause_capture_uses(clauses: IrHandl
 
 pub(package) fn pipeline_ir_rewrite_deferred_body_capture_uses(body: IrDeferredHandlerBody, aliases: PipelineIrAliasEnv) -> IrDeferredHandlerBody {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> {
       let rewritten_captures = pipeline_ir_rewrite_lambda_capture_uses(captures, aliases)
       if rewritten_captures == captures { body }
-      else { IrDeferredHandlerBody(rewritten_captures, ops_value, result_lanes, first_value, blocks, completion) }
+      else { IrDeferredHandlerBody(body_src, rewritten_captures, ops_value, result_lanes, first_value, blocks, completion) }
     }
     IrDeferredHandlerBodyInvalid(reason) -> body
   }
@@ -44500,7 +45010,7 @@ pub(package) fn pipeline_ir_max_handler_clause_captures(clauses: IrHandlerClause
 
 pub(package) fn pipeline_ir_max_deferred_body_captures(body: IrDeferredHandlerBody, current: i64) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> pipeline_ir_max_lambda_captures(captures, current)
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> pipeline_ir_max_lambda_captures(captures, current)
     IrDeferredHandlerBodyInvalid(reason) -> current
   }
 }
@@ -44742,7 +45252,7 @@ pub(package) fn pipeline_ir_live_add_clause_captures(set: i64, clauses: IrHandle
 
 pub(package) fn pipeline_ir_live_add_deferred_captures(set: i64, body: IrDeferredHandlerBody, count: i64) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> pipeline_ir_live_add_captures(set, captures, count)
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> pipeline_ir_live_add_captures(set, captures, count)
     IrDeferredHandlerBodyInvalid(reason) -> count
   }
 }
@@ -50084,6 +50594,19 @@ pub(package) fn pipeline_ir_typed_effect_handler_clauses_flags(clauses: HandlerC
   }
 }
 
+pub(package) fn pipeline_ir_typed_effect_named_handler_flags(config: HandlerConfiguration, body: Expr, fact: HandlerInstallFact, src: i64, fn_flags: i64) -> i64 {
+  let args = pipeline_ir_typed_effect_expr_list_flags(handler_configuration_args(config), src, fn_flags)
+  let body_flags = pipeline_ir_typed_effect_expr_flags(body, src, fn_flags)
+  let implementation = if pipeline_handler_install_is_resolved(fact) == 1 {
+    pipeline_ir_typed_effect_handler_clauses_flags(
+      pipeline_handler_install_clauses(fact),
+      pipeline_handler_install_source_or(fact, src),
+      fn_flags
+    )
+  } else { 2 }
+  pipeline_ir_effect_flags_merge(args, pipeline_ir_effect_flags_merge(body_flags, implementation))
+}
+
 pub(package) fn pipeline_ir_typed_effect_named_call_flags(ns: i64, nl: i64, args: ExprList, src: i64, fn_flags: i64) -> i64 {
   let pure_intrinsic = intrinsic_pure_effect_call_name(src, ns, nl)
   let direct_flags = intrinsic_semantic_effect_flags(src, ns, nl)
@@ -50162,6 +50685,7 @@ pub(package) fn pipeline_ir_typed_effect_expr_flags(expr: Expr, src: i64, fn_fla
       _ -> pipeline_ir_effect_flags_merge(4, pipeline_ir_effect_flags_merge(pipeline_ir_typed_effect_expr_flags(lhs, src, fn_flags), pipeline_ir_typed_effect_expr_list_flags(args, src, fn_flags)))
     }
     Handle(body, clauses, hret) -> pipeline_ir_effect_flags_merge(pipeline_ir_typed_effect_expr_flags(body, src, fn_flags), pipeline_ir_effect_flags_merge(pipeline_ir_typed_effect_handler_clauses_flags(clauses, src, fn_flags), match hret { NoHandleReturn -> 0 HandleReturnClause(rns, rnl, rb) -> pipeline_ir_typed_effect_expr_flags(rb, src, fn_flags) }))
+    WithHandler(config, body, fact, source_site) -> pipeline_ir_typed_effect_named_handler_flags(config, body, fact, src, fn_flags)
     Resume(value) -> pipeline_ir_typed_effect_expr_flags(value, src, fn_flags)
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_ir_effect_flags_merge(2, pipeline_ir_effect_flags_merge(pipeline_ir_typed_effect_expr_flags(recv, src, fn_flags), pipeline_ir_typed_effect_expr_list_flags(args, src, fn_flags)))
     Try(inner, effect_atom) -> pipeline_ir_effect_flags_merge(4, pipeline_ir_typed_effect_expr_flags(inner, src, fn_flags))
@@ -50234,6 +50758,18 @@ pub(package) fn pipeline_ir_typed_direct_effect_handler_clauses_scan(clauses: Ha
   }
 }
 
+pub(package) fn pipeline_ir_typed_direct_effect_named_handler_scan(config: HandlerConfiguration, body: Expr, fact: HandlerInstallFact, src: i64) -> i64 {
+  let args = pipeline_ir_typed_direct_effect_expr_list_scan(handler_configuration_args(config), src)
+  let body_scan = pipeline_ir_typed_direct_effect_expr_scan(body, src)
+  let implementation = if pipeline_handler_install_is_resolved(fact) == 1 {
+    pipeline_ir_typed_direct_effect_handler_clauses_scan(
+      pipeline_handler_install_clauses(fact),
+      pipeline_handler_install_source_or(fact, src)
+    )
+  } else { pipeline_ir_effect_scan_flag(2) }
+  pipeline_ir_effect_scan_merge(args, pipeline_ir_effect_scan_merge(body_scan, implementation))
+}
+
 pub(package) fn pipeline_ir_typed_direct_effect_named_call_scan(ns: i64, nl: i64, args: ExprList, src: i64) -> i64 {
   let pure_intrinsic = intrinsic_pure_effect_call_name(src, ns, nl)
   let direct_flags = intrinsic_semantic_effect_flags(src, ns, nl)
@@ -50293,6 +50829,7 @@ pub(package) fn pipeline_ir_typed_direct_effect_expr_scan(expr: Expr, src: i64) 
     Lambda(params, body, source_site) -> pipeline_ir_typed_direct_effect_expr_scan(body, src)
     Perform(lhs, op_ns, op_nl, args) -> pipeline_ir_effect_scan_merge(pipeline_ir_effect_scan_flag(4), pipeline_ir_effect_scan_merge(pipeline_ir_typed_direct_effect_expr_scan(lhs, src), pipeline_ir_typed_direct_effect_expr_list_scan(args, src)))
     Handle(body, clauses, hret) -> pipeline_ir_effect_scan_merge(pipeline_ir_typed_direct_effect_expr_scan(body, src), pipeline_ir_effect_scan_merge(pipeline_ir_typed_direct_effect_handler_clauses_scan(clauses, src), match hret { NoHandleReturn -> 0 HandleReturnClause(rns, rnl, rb) -> pipeline_ir_typed_direct_effect_expr_scan(rb, src) }))
+    WithHandler(config, body, fact, source_site) -> pipeline_ir_typed_direct_effect_named_handler_scan(config, body, fact, src)
     Resume(value) -> pipeline_ir_typed_direct_effect_expr_scan(value, src)
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_ir_effect_scan_merge(pipeline_ir_effect_scan_flag(2), pipeline_ir_effect_scan_merge(pipeline_ir_typed_direct_effect_expr_scan(recv, src), pipeline_ir_typed_direct_effect_expr_list_scan(args, src)))
     Try(inner, effect_atom) -> pipeline_ir_effect_scan_merge(pipeline_ir_effect_scan_flag(4), pipeline_ir_typed_direct_effect_expr_scan(inner, src))
@@ -50355,6 +50892,19 @@ pub(package) fn pipeline_ir_typed_direct_effect_handler_clauses_collect(clauses:
     HandlerClauseListNil -> 0
     HandlerClauseListCons(clause, rest) -> pipeline_ir_effect_flags_merge(pipeline_ir_typed_direct_effect_handler_clause_collect(clause, src, callees), pipeline_ir_typed_direct_effect_handler_clauses_collect(rest, src, callees))
   }
+}
+
+pub(package) fn pipeline_ir_typed_direct_effect_named_handler_collect(config: HandlerConfiguration, body: Expr, fact: HandlerInstallFact, src: i64, callees: i64) -> i64 {
+  let args = pipeline_ir_typed_direct_effect_expr_list_collect(handler_configuration_args(config), src, callees)
+  let body_flags = pipeline_ir_typed_direct_effect_expr_collect(body, src, callees)
+  let implementation = if pipeline_handler_install_is_resolved(fact) == 1 {
+    pipeline_ir_typed_direct_effect_handler_clauses_collect(
+      pipeline_handler_install_clauses(fact),
+      pipeline_handler_install_source_or(fact, src),
+      callees
+    )
+  } else { 2 }
+  pipeline_ir_effect_flags_merge(args, pipeline_ir_effect_flags_merge(body_flags, implementation))
 }
 
 pub(package) fn pipeline_ir_typed_direct_effect_named_call_collect(ns: i64, nl: i64, args: ExprList, src: i64, callees: i64) -> i64 {
@@ -50434,6 +50984,7 @@ pub(package) fn pipeline_ir_typed_direct_effect_expr_collect(expr: Expr, src: i6
       _ -> pipeline_ir_effect_flags_merge(4, pipeline_ir_effect_flags_merge(pipeline_ir_typed_direct_effect_expr_collect(lhs, src, callees), pipeline_ir_typed_direct_effect_expr_list_collect(args, src, callees)))
     }
     Handle(body, clauses, hret) -> pipeline_ir_effect_flags_merge(pipeline_ir_typed_direct_effect_expr_collect(body, src, callees), pipeline_ir_effect_flags_merge(pipeline_ir_typed_direct_effect_handler_clauses_collect(clauses, src, callees), match hret { NoHandleReturn -> 0 HandleReturnClause(rns, rnl, rb) -> pipeline_ir_typed_direct_effect_expr_collect(rb, src, callees) }))
+    WithHandler(config, body, fact, source_site) -> pipeline_ir_typed_direct_effect_named_handler_collect(config, body, fact, src, callees)
     Resume(value) -> pipeline_ir_typed_direct_effect_expr_collect(value, src, callees)
     MethodCall(recv, method_hash, args, type_hash) -> pipeline_ir_effect_flags_merge(2, pipeline_ir_effect_flags_merge(pipeline_ir_typed_direct_effect_expr_collect(recv, src, callees), pipeline_ir_typed_direct_effect_expr_list_collect(args, src, callees)))
     Try(inner, effect_atom) -> pipeline_ir_effect_flags_merge(4, pipeline_ir_typed_direct_effect_expr_collect(inner, src, callees))
@@ -50820,6 +51371,7 @@ pub(package) fn pipeline_ir_borrow_expr_summary(expr: Expr, params: i64, env: Pi
         HandleReturnClause(rns, rnl, rb) -> pipeline_ir_borrow_expr_summary(rb, params, pipeline_ir_borrow_env_push(env, rns, rnl, body_summary), src, fns, tt, visiting)
       }
     }
+    WithHandler(config, body, fact, source_site) -> pipeline_ir_borrow_expr_summary(body, params, env, src, fns, tt, visiting)
     _ -> ir_borrow_summary_unknown()
   }
 }
@@ -51157,7 +51709,7 @@ pub(package) fn pipeline_ir_borrow_pass_handler_clauses(clauses: IrHandlerClause
 
 pub(package) fn pipeline_ir_borrow_pass_deferred_body(body: IrDeferredHandlerBody, pass: PipelineIrBorrowValuePass, facts: PipelineIrSemanticFactList) -> PipelineIrBorrowValuePass {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> {
       let body_pass = pipeline_ir_borrow_pass_blocks_once(blocks, pass, facts)
       match completion {
         IrDeferredCompletionBodyNone -> body_pass
@@ -51434,7 +51986,7 @@ pub(package) fn pipeline_ir_borrow_handler_clauses_have_values(clauses: IrHandle
 
 pub(package) fn pipeline_ir_borrow_deferred_body_has_values(body: IrDeferredHandlerBody) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> {
       if pipeline_ir_borrow_blocks_have_values(blocks) == 1 { 1 }
       else { match completion {
         IrDeferredCompletionBodyNone -> 0
@@ -51711,7 +52263,7 @@ pub(package) fn pipeline_ir_borrow_values_complete_handler_clauses(clauses: IrHa
 
 pub(package) fn pipeline_ir_borrow_values_complete_deferred_body(body: IrDeferredHandlerBody, values: IrBorrowValueFactList) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> {
       if pipeline_ir_borrow_values_complete_blocks(blocks, pipeline_ir_borrow_block_param_map(blocks), values) != 1 { 0 }
       else { match completion {
         IrDeferredCompletionBodyNone -> 1
@@ -54929,7 +55481,7 @@ pub(package) fn pipeline_ir_live_set_add_handler_clause_captures(clauses: IrHand
 
 pub(package) fn pipeline_ir_live_set_add_deferred_body_captures(body: IrDeferredHandlerBody, live: PipelineIrLiveSet) -> PipelineIrLiveSet {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> pipeline_ir_live_set_add_lambda_captures(captures, live)
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> pipeline_ir_live_set_add_lambda_captures(captures, live)
     IrDeferredHandlerBodyInvalid(reason) -> live
   }
 }
@@ -57759,7 +58311,7 @@ pub(package) fn pipeline_ir_handler_clause_capture_payload_in_range(clauses: IrH
 
 pub(package) fn pipeline_ir_deferred_body_capture_payload_in_range(body: IrDeferredHandlerBody, lower: i64, upper: i64) -> i64 {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> pipeline_ir_capture_payload_in_range(captures, lower, upper)
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> pipeline_ir_capture_payload_in_range(captures, lower, upper)
     IrDeferredHandlerBodyInvalid(reason) -> 0
   }
 }
@@ -59482,7 +60034,7 @@ pub(package) fn pipeline_ir_hoisted_fns_handler_clauses(clauses: IrHandlerClause
 
 pub(package) fn pipeline_ir_hoisted_fns_deferred_body(body: IrDeferredHandlerBody, acc: IrFunctionList) -> IrFunctionList {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> {
       let body_fns = pipeline_ir_hoisted_fns_blocks(blocks, acc)
       match completion {
         IrDeferredCompletionBodyNone -> body_fns
@@ -59566,7 +60118,7 @@ pub(package) fn pipeline_ir_lambda_semantic_facts_handler_clauses(clauses: IrHan
 
 pub(package) fn pipeline_ir_lambda_semantic_facts_deferred_body(body: IrDeferredHandlerBody, facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> {
       let body_facts = pipeline_ir_lambda_semantic_facts_blocks(blocks, facts)
       match completion {
         IrDeferredCompletionBodyNone -> body_facts
@@ -60922,13 +61474,13 @@ pub(package) fn pipeline_ir_reuse_handler_clauses(clauses: IrHandlerClauseBodyLi
 
 pub(package) fn pipeline_ir_reuse_deferred_body(body: IrDeferredHandlerBody) -> IrDeferredHandlerBody {
   match body {
-    IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, blocks, completion) -> {
+    IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, blocks, completion) -> {
       let rewritten_completion = match completion {
         IrDeferredCompletionBodyNone -> completion
         IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, completion_blocks) -> IrDeferredCompletionBody(input_lanes, output_lanes, completion_first_value, pipeline_ir_reuse_blocks(completion_blocks))
         IrDeferredCompletionBodyInvalid(reason) -> completion
       }
-      IrDeferredHandlerBody(captures, ops_value, result_lanes, first_value, pipeline_ir_reuse_blocks(blocks), rewritten_completion)
+      IrDeferredHandlerBody(body_src, captures, ops_value, result_lanes, first_value, pipeline_ir_reuse_blocks(blocks), rewritten_completion)
     }
     IrDeferredHandlerBodyInvalid(reason) -> body
   }
