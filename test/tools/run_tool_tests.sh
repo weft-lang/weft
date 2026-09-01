@@ -5093,6 +5093,16 @@ assert_contains "test_legacy_expected_exit_reports_pass" "$(<"$tmp_err")" "  pas
 assert_contains "test_legacy_expected_exit_supplies_eof_stdin" "$(<"$tmp_err")" "2 passed, 0 failed"
 assert_contains "test_legacy_mixed_root_preserves_structured_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
 
+run_weft_compile_guarded "$WEFT" test --jobs 1 test/arith.weft test/vector_slicing.weft > "$tmp_out" 2> "$tmp_err"
+arith_schedule_line=$(grep -nF "  pass: test/arith.weft (" "$tmp_err" | cut -d: -f1)
+vector_schedule_line=$(grep -nF "  pass: test/vector_slicing.weft (" "$tmp_err" | cut -d: -f1)
+if [ "$vector_schedule_line" -lt "$arith_schedule_line" ]; then
+  echo "  ok test_batch_schedules_largest_dependency_closure_first"
+else
+  echo "  fail test_batch_schedules_largest_dependency_closure_first"
+  exit 1
+fi
+
 printf '%s\n' '-- Expected exit code: 41' 'fn main() -> i64 { 42 }' > "$tmp_test_shared_one"
 set +e
 run_weft_compile_guarded "$WEFT" test --jobs 1 "$tmp_test_shared_one" > "$tmp_out" 2> "$tmp_err"
