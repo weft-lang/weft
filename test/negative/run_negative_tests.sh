@@ -693,6 +693,16 @@ check_rejects "handler_clause_resume_capture_nested_lambda" "test/negative/handl
 check_rejects "handler_clause_duplicate" "test/negative/handler_clause_duplicate.weft" "type error: duplicate handler clause"
 check_rejects "handler_clause_missing_direct" "test/negative/handler_clause_missing_direct.weft" "type error: missing handler clause"
 check_rejects "handler_clause_missing_branch" "test/negative/handler_clause_missing_branch.weft" "type error: missing handler clause"
+check_rejects "module_handler_missing_operation" "test/negative/module_handler_missing_operation.weft" "type error: handler implementation is missing an effect operation"
+check_rejects "module_handler_extra_operation" "test/negative/module_handler_extra_operation.weft" "type error: unknown effect operation in handler implementation"
+check_rejects "module_handler_wrong_signature" "test/negative/module_handler_wrong_signature.weft" 'error[E1002]: handler parameter type mismatch: expected `i64`, found `str`'
+check_rejects "module_handler_private" "test/negative/module_handler_private.weft" "type error: handler implementation is not visible from this module"
+check_rejects "module_handler_effect_argument_mismatch" "test/negative/module_handler_effect_argument_mismatch.weft" "type error: handler implementation clause effect mismatch"
+check_rejects "module_handler_duplicate_default" "test/negative/module_handler_duplicate_default.weft" "type error: duplicate module default for exact effect atom"
+check_rejects "module_handler_escape" "test/negative/module_handler_escape.weft" "error[E1001]: unknown identifier 'basic_handler'"
+check_rejects "module_handler_member_call_ambiguity" "test/negative/module_handler_member_call_ambiguity.weft" "expected '{' after handler configuration"
+check_rejects "module_handler_generic_arity" "test/negative/module_handler_generic_arity.weft" "type error: wrong number of handler type arguments"
+check_rejects "module_handler_constructor_type" "test/negative/module_handler_constructor_type.weft" 'error[E1002]: handler constructor argument type mismatch: expected `RuntimeRcProbe`, found `i64`'
 check_rejects "resume_outside_handler" "test/negative/resume_outside_handler.weft" "type error: resume outside handler clause"
 check_rejects "resume_outside_handler_lambda" "test/negative/resume_outside_handler_lambda.weft" "type error: resume outside handler clause"
 check_rejects "generic_type_payload_mismatch" "test/negative/generic_type_payload_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
