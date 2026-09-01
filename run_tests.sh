@@ -32,7 +32,7 @@ WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-$WEFT_TEST_RUNA
 WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB}
 WEFT_TEST_SHOW_TIMINGS=${WEFT_TEST_SHOW_TIMINGS:-1}
 WEFT_HOST_JOBS=$(default_test_jobs)
-WEFT_TOOL_JOBS=${WEFT_TOOL_JOBS:-4}
+WEFT_TOOL_JOBS=${WEFT_TOOL_JOBS:-3}
 case "$WEFT_TOOL_JOBS" in
   ''|*[!0-9]*) echo "WEFT_TOOL_JOBS must be a positive integer" >&2; exit 2 ;;
 esac
@@ -40,11 +40,12 @@ if [ "$WEFT_TOOL_JOBS" -lt 1 ]; then
   echo "WEFT_TOOL_JOBS must be a positive integer" >&2
   exit 2
 fi
-# The runtime planner and independent tool shards run concurrently. Reserve
-# the tool width from the host-selected total unless the caller explicitly
-# chooses a planner width; the runaway stop remains observational only.
+# The runtime planner, independent tool shards, and one sequential auxiliary
+# gate lane run concurrently. Reserve all of them from the host-selected total
+# unless the caller explicitly chooses a planner width; the runaway stop
+# remains observational only.
 if [ -z "${WEFT_TEST_JOBS:-}" ]; then
-  WEFT_TEST_JOBS=$((WEFT_HOST_JOBS - WEFT_TOOL_JOBS))
+  WEFT_TEST_JOBS=$((WEFT_HOST_JOBS - WEFT_TOOL_JOBS - 1))
   if [ "$WEFT_TEST_JOBS" -lt 1 ]; then WEFT_TEST_JOBS=1; fi
 fi
 PASS=0
@@ -241,12 +242,10 @@ run_markdown_phase() {
 }
 
 run_bootstrap_phase() {
-  local started
   local tmpw1
   local tmpw2
   local tmpw3
   local bootstrap_ok=1
-  started=$(now_s)
   tmpw1=$(mktemp /tmp/weft_test_XXXXXX)
   tmpw2=$(mktemp /tmp/weft_test_XXXXXX)
   tmpw3=$(mktemp /tmp/weft_test_XXXXXX)
@@ -280,8 +279,28 @@ run_bootstrap_phase() {
     echo "  ✗ bootstrap gate failed"
   fi
   rm -f "$tmpw1" "$tmpw2" "$tmpw3"
-  echo "Bootstrap timing: $(($(now_s) - started))s wall"
   [ "$bootstrap_ok" -eq 1 ]
+}
+
+run_recorded_phase() {
+  local header="$1"
+  local timing_label="$2"
+  local log="$3"
+  local status_file="$4"
+  shift 4
+  local status=0
+  (echo ""; echo "=== $header ==="; run_timed_phase "$timing_label" "$@") > "$log" 2>&1 || status=$?
+  printf '%s\n' "$status" > "$status_file"
+}
+
+run_auxiliary_phases() {
+  run_recorded_phase "Bootstrap Gate" "Bootstrap" "$BOOTSTRAP_PHASE_LOG" "$BOOTSTRAP_PHASE_STATUS" run_bootstrap_phase
+  run_recorded_phase "Linked Tests" "Linked tests" "$LINKED_PHASE_LOG" "$LINKED_PHASE_STATUS" bash test/linked/run_linked_tests.sh
+  run_recorded_phase "Formatter Dogfood" "Formatter dogfood" "$FORMATTER_PHASE_LOG" "$FORMATTER_PHASE_STATUS" bash test/tools/run_formatter_dogfood.sh
+  run_recorded_phase "Checker Tests" "Checker tests" "$CHECKER_PHASE_LOG" "$CHECKER_PHASE_STATUS" bash test/checker/run_checker_tests.sh
+  run_recorded_phase "Markdown Examples" "Markdown examples" "$MARKDOWN_PHASE_LOG" "$MARKDOWN_PHASE_STATUS" run_markdown_phase
+  run_recorded_phase "Negative Tests" "Negative tests" "$NEGATIVE_PHASE_LOG" "$NEGATIVE_PHASE_STATUS" bash test/negative/run_negative_tests.sh
+  run_recorded_phase "Release Signing Tests" "Release signing" "$SIGNING_PHASE_LOG" "$SIGNING_PHASE_STATUS" bash test/run_release_signing.sh
 }
 
 collect_phase() {
@@ -300,15 +319,32 @@ collect_phase() {
   fi
 }
 
+collect_recorded_phase() {
+  local label="$1"
+  local status_file="$2"
+  local log="$3"
+  local status=1
+  if [ -r "$status_file" ]; then
+    read -r status < "$status_file" || status=1
+  fi
+  if [ -r "$log" ]; then
+    /bin/cat "$log"
+  else
+    echo "  ✗ $label produced no phase log"
+    status=1
+  fi
+  if [[ "$status" =~ ^[0-9]+$ ]] && [ "$status" -eq 0 ]; then
+    PASS=$((PASS+1))
+  else
+    echo "  ✗ $label failed"
+    FAIL=$((FAIL+1))
+    ERRORS="$ERRORS\n  $label failed"
+  fi
+}
+
 RESULTS_DIR=""
 TOOL_PHASE_PID=""
-BOOTSTRAP_PHASE_PID=""
-LINKED_PHASE_PID=""
-CHECKER_PHASE_PID=""
-SIGNING_PHASE_PID=""
-FORMATTER_PHASE_PID=""
-MARKDOWN_PHASE_PID=""
-NEGATIVE_PHASE_PID=""
+AUXILIARY_PHASE_PID=""
 
 cleanup_suite() {
   local status=$?
@@ -316,13 +352,7 @@ cleanup_suite() {
   trap - EXIT INT TERM
   for phase_pid in \
     "$TOOL_PHASE_PID" \
-    "$BOOTSTRAP_PHASE_PID" \
-    "$LINKED_PHASE_PID" \
-    "$CHECKER_PHASE_PID" \
-    "$SIGNING_PHASE_PID" \
-    "$FORMATTER_PHASE_PID" \
-    "$MARKDOWN_PHASE_PID" \
-    "$NEGATIVE_PHASE_PID"; do
+    "$AUXILIARY_PHASE_PID"; do
     if [ -n "$phase_pid" ] && kill -0 "$phase_pid" 2>/dev/null; then
       terminate_process_tree "$phase_pid"
     fi
@@ -351,8 +381,24 @@ RESULTS_DIR=$(mktemp -d /tmp/weft_suite_XXXXXX)
 PLANNER_ERR="$RESULTS_DIR/planner.err"
 PLANNER_OUT="$RESULTS_DIR/planner.out"
 TOOL_PHASE_LOG="$RESULTS_DIR/tool.log"
+BOOTSTRAP_PHASE_LOG="$RESULTS_DIR/bootstrap.log"
+LINKED_PHASE_LOG="$RESULTS_DIR/linked.log"
+CHECKER_PHASE_LOG="$RESULTS_DIR/checker.log"
+SIGNING_PHASE_LOG="$RESULTS_DIR/signing.log"
+FORMATTER_PHASE_LOG="$RESULTS_DIR/formatter.log"
+MARKDOWN_PHASE_LOG="$RESULTS_DIR/markdown.log"
+NEGATIVE_PHASE_LOG="$RESULTS_DIR/negative.log"
+BOOTSTRAP_PHASE_STATUS="$RESULTS_DIR/bootstrap.status"
+LINKED_PHASE_STATUS="$RESULTS_DIR/linked.status"
+CHECKER_PHASE_STATUS="$RESULTS_DIR/checker.status"
+SIGNING_PHASE_STATUS="$RESULTS_DIR/signing.status"
+FORMATTER_PHASE_STATUS="$RESULTS_DIR/formatter.status"
+MARKDOWN_PHASE_STATUS="$RESULTS_DIR/markdown.status"
+NEGATIVE_PHASE_STATUS="$RESULTS_DIR/negative.status"
 (echo ""; echo "=== Tool Boundary Tests ==="; run_timed_phase "Tool boundary" bash test/tools/run_tool_tests.sh) > "$TOOL_PHASE_LOG" 2>&1 &
 TOOL_PHASE_PID=$!
+run_auxiliary_phases &
+AUXILIARY_PHASE_PID=$!
 RUNTIME_TEST_FILES=()
 RUNTIME_TEST_BLOCKS=0
 
@@ -434,45 +480,22 @@ if [ "$runtime_count" -gt 0 ]; then
   fi
 fi
 
-BOOTSTRAP_PHASE_LOG="$RESULTS_DIR/bootstrap.log"
-LINKED_PHASE_LOG="$RESULTS_DIR/linked.log"
-CHECKER_PHASE_LOG="$RESULTS_DIR/checker.log"
-SIGNING_PHASE_LOG="$RESULTS_DIR/signing.log"
-FORMATTER_PHASE_LOG="$RESULTS_DIR/formatter.log"
-MARKDOWN_PHASE_LOG="$RESULTS_DIR/markdown.log"
-NEGATIVE_PHASE_LOG="$RESULTS_DIR/negative.log"
+auxiliary_status=0
+wait "$AUXILIARY_PHASE_PID" || auxiliary_status=$?
+AUXILIARY_PHASE_PID=""
+if [ "$auxiliary_status" -ne 0 ]; then
+  echo "  ✗ auxiliary gate coordinator failed"
+fi
 
-(echo ""; echo "=== Bootstrap Gate ==="; run_bootstrap_phase) > "$BOOTSTRAP_PHASE_LOG" 2>&1 &
-BOOTSTRAP_PHASE_PID=$!
-(echo ""; echo "=== Linked Tests ==="; run_timed_phase "Linked tests" bash test/linked/run_linked_tests.sh) > "$LINKED_PHASE_LOG" 2>&1 &
-LINKED_PHASE_PID=$!
-(echo ""; echo "=== Checker Tests ==="; run_timed_phase "Checker tests" bash test/checker/run_checker_tests.sh) > "$CHECKER_PHASE_LOG" 2>&1 &
-CHECKER_PHASE_PID=$!
-(echo ""; echo "=== Release Signing Tests ==="; run_timed_phase "Release signing" bash test/run_release_signing.sh) > "$SIGNING_PHASE_LOG" 2>&1 &
-SIGNING_PHASE_PID=$!
-(echo ""; echo "=== Formatter Dogfood ==="; run_timed_phase "Formatter dogfood" bash test/tools/run_formatter_dogfood.sh) > "$FORMATTER_PHASE_LOG" 2>&1 &
-FORMATTER_PHASE_PID=$!
-(echo ""; echo "=== Markdown Examples ==="; run_timed_phase "Markdown examples" run_markdown_phase) > "$MARKDOWN_PHASE_LOG" 2>&1 &
-MARKDOWN_PHASE_PID=$!
-(echo ""; echo "=== Negative Tests ==="; run_timed_phase "Negative tests" bash test/negative/run_negative_tests.sh) > "$NEGATIVE_PHASE_LOG" 2>&1 &
-NEGATIVE_PHASE_PID=$!
-
-collect_phase "bootstrap gate" "$BOOTSTRAP_PHASE_PID" "$BOOTSTRAP_PHASE_LOG"
-BOOTSTRAP_PHASE_PID=""
-collect_phase "linked tests" "$LINKED_PHASE_PID" "$LINKED_PHASE_LOG"
-LINKED_PHASE_PID=""
-collect_phase "checker tests" "$CHECKER_PHASE_PID" "$CHECKER_PHASE_LOG"
-CHECKER_PHASE_PID=""
+collect_recorded_phase "bootstrap gate" "$BOOTSTRAP_PHASE_STATUS" "$BOOTSTRAP_PHASE_LOG"
+collect_recorded_phase "linked tests" "$LINKED_PHASE_STATUS" "$LINKED_PHASE_LOG"
+collect_recorded_phase "checker tests" "$CHECKER_PHASE_STATUS" "$CHECKER_PHASE_LOG"
 collect_phase "tool boundary tests" "$TOOL_PHASE_PID" "$TOOL_PHASE_LOG"
 TOOL_PHASE_PID=""
-collect_phase "release signing tests" "$SIGNING_PHASE_PID" "$SIGNING_PHASE_LOG"
-SIGNING_PHASE_PID=""
-collect_phase "formatter dogfood" "$FORMATTER_PHASE_PID" "$FORMATTER_PHASE_LOG"
-FORMATTER_PHASE_PID=""
-collect_phase "markdown examples" "$MARKDOWN_PHASE_PID" "$MARKDOWN_PHASE_LOG"
-MARKDOWN_PHASE_PID=""
-collect_phase "negative tests" "$NEGATIVE_PHASE_PID" "$NEGATIVE_PHASE_LOG"
-NEGATIVE_PHASE_PID=""
+collect_recorded_phase "release signing tests" "$SIGNING_PHASE_STATUS" "$SIGNING_PHASE_LOG"
+collect_recorded_phase "formatter dogfood" "$FORMATTER_PHASE_STATUS" "$FORMATTER_PHASE_LOG"
+collect_recorded_phase "markdown examples" "$MARKDOWN_PHASE_STATUS" "$MARKDOWN_PHASE_LOG"
+collect_recorded_phase "negative tests" "$NEGATIVE_PHASE_STATUS" "$NEGATIVE_PHASE_LOG"
 
 rm -rf "$RESULTS_DIR"
 RESULTS_DIR=""
