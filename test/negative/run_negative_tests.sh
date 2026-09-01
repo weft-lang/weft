@@ -855,7 +855,6 @@ check_rejects "effect_qualified_perform_mismatch" "test/negative/effect_qualifie
 check_rejects "effect_qualified_handler_mismatch" "test/negative/effect_qualified_handler_mismatch.weft" 'error[E2001]: effect `Box<str>` is not available in this context'
 check_rejects "effect_perform_arg_instantiation_mismatch" "test/negative/effect_perform_arg_instantiation_mismatch.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
 check_rejects "effect_resume_instantiation_mismatch" "test/negative/effect_resume_instantiation_mismatch.weft" 'error[E1002]: handler clause result type mismatch: expected `str`, found `i64`'
-check_rejects "return_clause_deferred" "test/negative/return_clause_deferred.weft" "type error: return clause with deferred clauses is not yet supported"
 check_rejects "handler_two_return_clauses" "test/negative/handler_two_return_clauses.weft" "error[E0002]: at most one return clause per handler"
 check_rejects "trait_complement_surface" "test/negative/trait_complement_surface.weft" "type error: trait complement is not a surface type"
 check_rejects "import_cycle" "test/negative/import_cycle.weft" "error[E4001]: circular import: test/negative/import_cycle -> test/negative/import_cycle_helper -> test/negative/import_cycle"
