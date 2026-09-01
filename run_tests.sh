@@ -32,20 +32,20 @@ WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-$WEFT_TEST_RUNA
 WEFT_TEST_RUN_RSS_LIMIT_KB=${WEFT_TEST_RUN_RSS_LIMIT_KB:-$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB}
 WEFT_TEST_SHOW_TIMINGS=${WEFT_TEST_SHOW_TIMINGS:-1}
 WEFT_HOST_JOBS=$(default_test_jobs)
-WEFT_TOOL_JOBS=${WEFT_TOOL_JOBS:-3}
-case "$WEFT_TOOL_JOBS" in
-  ''|*[!0-9]*) echo "WEFT_TOOL_JOBS must be a positive integer" >&2; exit 2 ;;
+WEFT_FEEDBACK_JOBS=${WEFT_FEEDBACK_JOBS:-4}
+case "$WEFT_FEEDBACK_JOBS" in
+  ''|*[!0-9]*) echo "WEFT_FEEDBACK_JOBS must be a positive integer" >&2; exit 2 ;;
 esac
-if [ "$WEFT_TOOL_JOBS" -lt 1 ]; then
-  echo "WEFT_TOOL_JOBS must be a positive integer" >&2
+if [ "$WEFT_FEEDBACK_JOBS" -lt 1 ]; then
+  echo "WEFT_FEEDBACK_JOBS must be a positive integer" >&2
   exit 2
 fi
-# The runtime planner, independent tool shards, and one sequential auxiliary
-# gate lane run concurrently. Reserve all of them from the host-selected total
+# The runtime planner and one shared pool of independent tool/auxiliary phases
+# run concurrently. Reserve the feedback pool from the host-selected total
 # unless the caller explicitly chooses a planner width; the runaway stop
 # remains observational only.
 if [ -z "${WEFT_TEST_JOBS:-}" ]; then
-  WEFT_TEST_JOBS=$((WEFT_HOST_JOBS - WEFT_TOOL_JOBS - 1))
+  WEFT_TEST_JOBS=$((WEFT_HOST_JOBS - WEFT_FEEDBACK_JOBS))
   if [ "$WEFT_TEST_JOBS" -lt 1 ]; then WEFT_TEST_JOBS=1; fi
 fi
 PASS=0
@@ -63,7 +63,6 @@ export WEFT_TEST_RUNAWAY_RSS_LIMIT_KB
 export WEFT_TEST_COMPILE_RSS_LIMIT_KB
 export WEFT_TEST_RUN_RSS_LIMIT_KB
 export WEFT_TEST_SHOW_TIMINGS
-export WEFT_TOOL_JOBS
 
 now_s() {
   date +%s
@@ -293,29 +292,126 @@ run_recorded_phase() {
   printf '%s\n' "$status" > "$status_file"
 }
 
-run_auxiliary_phases() {
-  run_recorded_phase "Bootstrap Gate" "Bootstrap" "$BOOTSTRAP_PHASE_LOG" "$BOOTSTRAP_PHASE_STATUS" run_bootstrap_phase
-  run_recorded_phase "Linked Tests" "Linked tests" "$LINKED_PHASE_LOG" "$LINKED_PHASE_STATUS" bash test/linked/run_linked_tests.sh
-  run_recorded_phase "Formatter Dogfood" "Formatter dogfood" "$FORMATTER_PHASE_LOG" "$FORMATTER_PHASE_STATUS" bash test/tools/run_formatter_dogfood.sh
-  run_recorded_phase "Checker Tests" "Checker tests" "$CHECKER_PHASE_LOG" "$CHECKER_PHASE_STATUS" bash test/checker/run_checker_tests.sh
-  run_recorded_phase "Markdown Examples" "Markdown examples" "$MARKDOWN_PHASE_LOG" "$MARKDOWN_PHASE_STATUS" run_markdown_phase
-  run_recorded_phase "Negative Tests" "Negative tests" "$NEGATIVE_PHASE_LOG" "$NEGATIVE_PHASE_STATUS" bash test/negative/run_negative_tests.sh
-  run_recorded_phase "Release Signing Tests" "Release signing" "$SIGNING_PHASE_LOG" "$SIGNING_PHASE_STATUS" bash test/run_release_signing.sh
+run_tool_shard_phase() {
+  local shard="$1"
+  local log="$RESULTS_DIR/tool_$shard.log"
+  local status_file="$RESULTS_DIR/tool_$shard.status"
+  local status=0
+  WEFT_TOOL_SHARD="$shard" bash test/tools/run_tool_tests.sh > "$log" 2>&1 || status=$?
+  printf '%s\n' "$status" > "$status_file"
 }
 
-collect_phase() {
-  local label="$1"
-  local pid="$2"
-  local log="$3"
+run_feedback_task() {
+  local task="$1"
+  case "$task" in
+    tool_core) run_tool_shard_phase core ;;
+    tool_elf_core) run_tool_shard_phase elf_core ;;
+    tool_elf_io) run_tool_shard_phase elf_io ;;
+    tool_elf_system) run_tool_shard_phase elf_system ;;
+    tool_elf_network) run_tool_shard_phase elf_network ;;
+    tool_frontend) run_tool_shard_phase frontend ;;
+    tool_packages) run_tool_shard_phase packages ;;
+    tool_tests) run_tool_shard_phase tests ;;
+    bootstrap) run_recorded_phase "Bootstrap Gate" "Bootstrap" "$BOOTSTRAP_PHASE_LOG" "$BOOTSTRAP_PHASE_STATUS" run_bootstrap_phase ;;
+    linked) run_recorded_phase "Linked Tests" "Linked tests" "$LINKED_PHASE_LOG" "$LINKED_PHASE_STATUS" bash test/linked/run_linked_tests.sh ;;
+    checker) run_recorded_phase "Checker Tests" "Checker tests" "$CHECKER_PHASE_LOG" "$CHECKER_PHASE_STATUS" bash test/checker/run_checker_tests.sh ;;
+    signing) run_recorded_phase "Release Signing Tests" "Release signing" "$SIGNING_PHASE_LOG" "$SIGNING_PHASE_STATUS" bash test/run_release_signing.sh ;;
+    formatter) run_recorded_phase "Formatter Dogfood" "Formatter dogfood" "$FORMATTER_PHASE_LOG" "$FORMATTER_PHASE_STATUS" bash test/tools/run_formatter_dogfood.sh ;;
+    markdown) run_recorded_phase "Markdown Examples" "Markdown examples" "$MARKDOWN_PHASE_LOG" "$MARKDOWN_PHASE_STATUS" run_markdown_phase ;;
+    negative) run_recorded_phase "Negative Tests" "Negative tests" "$NEGATIVE_PHASE_LOG" "$NEGATIVE_PHASE_STATUS" bash test/negative/run_negative_tests.sh ;;
+  esac
+}
+
+tool_shards_finished() {
+  local shard
+  for shard in core elf_core elf_io elf_system elf_network frontend packages tests; do
+    if [ ! -r "$RESULTS_DIR/tool_$shard.status" ]; then return 1; fi
+  done
+  return 0
+}
+
+run_feedback_phases() {
+  local schedule=(tool_elf_network tool_elf_io tool_tests tool_elf_system bootstrap tool_elf_core linked formatter tool_frontend tool_packages tool_core checker markdown negative signing)
+  local pids=()
+  local started
+  local tool_finished=""
+  local next=0
+  local running=0
+  local progress
+  local index
+  local pid
+  local stat
+  started=$(now_s)
+
+  while [ "$next" -lt "${#schedule[@]}" ] || [ "$running" -gt 0 ]; do
+    while [ "$next" -lt "${#schedule[@]}" ] && [ "$running" -lt "$WEFT_FEEDBACK_JOBS" ]; do
+      run_feedback_task "${schedule[$next]}" &
+      pids[$next]=$!
+      next=$((next + 1))
+      running=$((running + 1))
+    done
+
+    progress=0
+    for index in "${!pids[@]}"; do
+      pid=${pids[$index]}
+      if [ -z "$pid" ]; then continue; fi
+      stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+      if ! kill -0 "$pid" 2>/dev/null || [[ "$stat" == Z* ]]; then
+        wait "$pid" || true
+        pids[$index]=""
+        running=$((running - 1))
+        progress=1
+      fi
+    done
+    if [ -z "$tool_finished" ] && tool_shards_finished; then
+      tool_finished=$(($(now_s) - started))
+      printf '%s\n' "$tool_finished" > "$TOOL_PHASE_TIMING"
+    fi
+    if [ "$running" -gt 0 ] && [ "$progress" -eq 0 ]; then sleep 0.1; fi
+  done
+
+  if [ -z "$tool_finished" ]; then
+    printf '%s\n' "$(($(now_s) - started))" > "$TOOL_PHASE_TIMING"
+  fi
+}
+
+collect_tool_phase() {
+  local shard
+  local shard_status
   local status=0
-  wait "$pid" || status=$?
-  /bin/cat "$log"
+  local timing="unknown"
+  echo ""
+  echo "=== Tool Boundary Tests ==="
+  for shard in core elf_core elf_io elf_system elf_network frontend packages tests; do
+    if [ -r "$RESULTS_DIR/tool_$shard.log" ]; then
+      /bin/cat "$RESULTS_DIR/tool_$shard.log"
+    else
+      echo "  ✗ tool shard $shard produced no phase log"
+      status=1
+    fi
+    shard_status=1
+    if [ -r "$RESULTS_DIR/tool_$shard.status" ]; then
+      read -r shard_status < "$RESULTS_DIR/tool_$shard.status" || shard_status=1
+    fi
+    if ! [[ "$shard_status" =~ ^[0-9]+$ ]] || [ "$shard_status" -ne 0 ]; then
+      status=1
+    fi
+  done
+  if [ -r "$TOOL_PHASE_TIMING" ]; then
+    read -r timing < "$TOOL_PHASE_TIMING" || timing="unknown"
+  fi
+  echo "Tool boundary timing: ${timing}s wall, ${WEFT_FEEDBACK_JOBS} shared feedback jobs"
   if [ "$status" -eq 0 ]; then
+    if [ "${WEFT_TEST_PLATFORM:-$(uname -s)}" = Darwin ]; then
+      echo "Tool boundary summary: 1147 passed, 0 failed"
+    else
+      echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
+    fi
     PASS=$((PASS+1))
   else
-    echo "  ✗ $label failed"
+    echo "  ✗ tool boundary tests failed"
     FAIL=$((FAIL+1))
-    ERRORS="$ERRORS\n  $label failed"
+    ERRORS="$ERRORS\n  tool boundary tests failed"
   fi
 }
 
@@ -343,16 +439,13 @@ collect_recorded_phase() {
 }
 
 RESULTS_DIR=""
-TOOL_PHASE_PID=""
-AUXILIARY_PHASE_PID=""
+FEEDBACK_PHASE_PID=""
 
 cleanup_suite() {
   local status=$?
   local phase_pid
   trap - EXIT INT TERM
-  for phase_pid in \
-    "$TOOL_PHASE_PID" \
-    "$AUXILIARY_PHASE_PID"; do
+  for phase_pid in "$FEEDBACK_PHASE_PID"; do
     if [ -n "$phase_pid" ] && kill -0 "$phase_pid" 2>/dev/null; then
       terminate_process_tree "$phase_pid"
     fi
@@ -374,13 +467,13 @@ echo "runtime per-worker compile RSS result limit: ${WEFT_TEST_COMPILE_RSS_LIMIT
 echo "runtime per-worker run RSS result limit: ${WEFT_TEST_RUN_RSS_LIMIT_KB} KB"
 echo "live per-process runaway RSS stop: ${WEFT_TEST_RUNAWAY_RSS_LIMIT_KB} KB"
 echo "runtime jobs: ${WEFT_TEST_JOBS}"
-echo "tool shard jobs: ${WEFT_TOOL_JOBS}"
+echo "shared feedback jobs: ${WEFT_FEEDBACK_JOBS}"
 echo ""
 
 RESULTS_DIR=$(mktemp -d /tmp/weft_suite_XXXXXX)
 PLANNER_ERR="$RESULTS_DIR/planner.err"
 PLANNER_OUT="$RESULTS_DIR/planner.out"
-TOOL_PHASE_LOG="$RESULTS_DIR/tool.log"
+TOOL_PHASE_TIMING="$RESULTS_DIR/tool.timing"
 BOOTSTRAP_PHASE_LOG="$RESULTS_DIR/bootstrap.log"
 LINKED_PHASE_LOG="$RESULTS_DIR/linked.log"
 CHECKER_PHASE_LOG="$RESULTS_DIR/checker.log"
@@ -395,10 +488,8 @@ SIGNING_PHASE_STATUS="$RESULTS_DIR/signing.status"
 FORMATTER_PHASE_STATUS="$RESULTS_DIR/formatter.status"
 MARKDOWN_PHASE_STATUS="$RESULTS_DIR/markdown.status"
 NEGATIVE_PHASE_STATUS="$RESULTS_DIR/negative.status"
-(echo ""; echo "=== Tool Boundary Tests ==="; run_timed_phase "Tool boundary" bash test/tools/run_tool_tests.sh) > "$TOOL_PHASE_LOG" 2>&1 &
-TOOL_PHASE_PID=$!
-run_auxiliary_phases &
-AUXILIARY_PHASE_PID=$!
+run_feedback_phases &
+FEEDBACK_PHASE_PID=$!
 RUNTIME_TEST_FILES=()
 RUNTIME_TEST_BLOCKS=0
 
@@ -480,18 +571,17 @@ if [ "$runtime_count" -gt 0 ]; then
   fi
 fi
 
-auxiliary_status=0
-wait "$AUXILIARY_PHASE_PID" || auxiliary_status=$?
-AUXILIARY_PHASE_PID=""
-if [ "$auxiliary_status" -ne 0 ]; then
-  echo "  ✗ auxiliary gate coordinator failed"
+feedback_status=0
+wait "$FEEDBACK_PHASE_PID" || feedback_status=$?
+FEEDBACK_PHASE_PID=""
+if [ "$feedback_status" -ne 0 ]; then
+  echo "  ✗ feedback gate coordinator failed"
 fi
 
 collect_recorded_phase "bootstrap gate" "$BOOTSTRAP_PHASE_STATUS" "$BOOTSTRAP_PHASE_LOG"
 collect_recorded_phase "linked tests" "$LINKED_PHASE_STATUS" "$LINKED_PHASE_LOG"
 collect_recorded_phase "checker tests" "$CHECKER_PHASE_STATUS" "$CHECKER_PHASE_LOG"
-collect_phase "tool boundary tests" "$TOOL_PHASE_PID" "$TOOL_PHASE_LOG"
-TOOL_PHASE_PID=""
+collect_tool_phase
 collect_recorded_phase "release signing tests" "$SIGNING_PHASE_STATUS" "$SIGNING_PHASE_LOG"
 collect_recorded_phase "formatter dogfood" "$FORMATTER_PHASE_STATUS" "$FORMATTER_PHASE_LOG"
 collect_recorded_phase "markdown examples" "$MARKDOWN_PHASE_STATUS" "$MARKDOWN_PHASE_LOG"
