@@ -537,13 +537,13 @@ if [ "$runtime_count" -gt 0 ]; then
   RUNTIME_TESTS=$((RUNTIME_TESTS + RUNTIME_TEST_BLOCKS))
 
   metrics_line=$(grep '^WEFT_TEST_METRICS ' "$PLANNER_ERR" | tail -1 || true)
-  read -r metrics_marker metrics_version metrics_roots metrics_measured metrics_wall metrics_discovery metrics_planning metrics_compile metrics_link metrics_run metrics_user metrics_system metrics_peak metrics_shared_groups metrics_shared_roots metrics_reused_pairs metrics_query_hits metrics_query_misses metrics_query_executions metrics_extra <<< "$metrics_line"
+  read -r metrics_marker metrics_version metrics_roots metrics_measured metrics_wall metrics_discovery metrics_planning metrics_compile metrics_link metrics_run metrics_user metrics_system metrics_peak metrics_shared_groups metrics_shared_roots metrics_reused_pairs metrics_query_hits metrics_query_misses metrics_query_executions metrics_optimised_groups metrics_optimised_roots metrics_reused_optimised_functions metrics_extra <<< "$metrics_line"
   metrics_valid=1
-  if [ "$metrics_marker" != "WEFT_TEST_METRICS" ] || [ "$metrics_version" != "2" ] || [ -n "${metrics_extra:-}" ]; then
+  if [ "$metrics_marker" != "WEFT_TEST_METRICS" ] || [ "$metrics_version" != "3" ] || [ -n "${metrics_extra:-}" ]; then
     metrics_valid=0
-  elif ! [[ "$metrics_roots" =~ ^[0-9]+$ && "$metrics_measured" =~ ^[0-9]+$ && "$metrics_wall" =~ ^[0-9]+$ && "$metrics_discovery" =~ ^[0-9]+$ && "$metrics_planning" =~ ^[0-9]+$ && "$metrics_compile" =~ ^[0-9]+$ && "$metrics_link" =~ ^[0-9]+$ && "$metrics_run" =~ ^[0-9]+$ && "$metrics_user" =~ ^[0-9]+$ && "$metrics_system" =~ ^[0-9]+$ && "$metrics_peak" =~ ^[0-9]+$ && "$metrics_shared_groups" =~ ^[0-9]+$ && "$metrics_shared_roots" =~ ^[0-9]+$ && "$metrics_reused_pairs" =~ ^[0-9]+$ && "$metrics_query_hits" =~ ^[0-9]+$ && "$metrics_query_misses" =~ ^[0-9]+$ && "$metrics_query_executions" =~ ^[0-9]+$ ]]; then
+  elif ! [[ "$metrics_roots" =~ ^[0-9]+$ && "$metrics_measured" =~ ^[0-9]+$ && "$metrics_wall" =~ ^[0-9]+$ && "$metrics_discovery" =~ ^[0-9]+$ && "$metrics_planning" =~ ^[0-9]+$ && "$metrics_compile" =~ ^[0-9]+$ && "$metrics_link" =~ ^[0-9]+$ && "$metrics_run" =~ ^[0-9]+$ && "$metrics_user" =~ ^[0-9]+$ && "$metrics_system" =~ ^[0-9]+$ && "$metrics_peak" =~ ^[0-9]+$ && "$metrics_shared_groups" =~ ^[0-9]+$ && "$metrics_shared_roots" =~ ^[0-9]+$ && "$metrics_reused_pairs" =~ ^[0-9]+$ && "$metrics_query_hits" =~ ^[0-9]+$ && "$metrics_query_misses" =~ ^[0-9]+$ && "$metrics_query_executions" =~ ^[0-9]+$ && "$metrics_optimised_groups" =~ ^[0-9]+$ && "$metrics_optimised_roots" =~ ^[0-9]+$ && "$metrics_reused_optimised_functions" =~ ^[0-9]+$ ]]; then
     metrics_valid=0
-  elif [ "$metrics_roots" -ne "$runtime_count" ] || [ "$metrics_measured" -gt "$metrics_roots" ] || [ "$metrics_shared_groups" -gt "$metrics_shared_roots" ] || [ "$metrics_shared_roots" -gt "$metrics_roots" ]; then
+  elif [ "$metrics_roots" -ne "$runtime_count" ] || [ "$metrics_measured" -gt "$metrics_roots" ] || [ "$metrics_shared_groups" -gt "$metrics_shared_roots" ] || [ "$metrics_shared_roots" -gt "$metrics_roots" ] || [ "$metrics_optimised_groups" -gt "$metrics_optimised_roots" ] || [ "$metrics_optimised_roots" -gt "$metrics_shared_roots" ]; then
     metrics_valid=0
   elif [ "$planner_failures" -eq 0 ] && [ "$metrics_measured" -ne "$runtime_count" ]; then
     metrics_valid=0
