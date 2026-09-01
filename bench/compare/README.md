@@ -29,6 +29,9 @@ The workload set covers integer-heavy and float-heavy kernels:
 - `nbody`: five-body solar-system update loop with `f64` state and `sqrt`
 - `sorted_lookup`: sorted_map build plus binary-search lookups through an
   indirect comparator (an ordered-collection churn canary)
+- `iterator_pipeline_direct`: direct-loop control over the iterator workload
+- `iterator_pipeline`: lazy range-map-filter-take-fold through each language's
+  iterator or pull-closure surface (a fusion and abstraction-erasure canary)
 
 Further float-heavy published benchmarks such as `spectral-norm` need broader
 math surfaces and better typed float storage and array ergonomics.
