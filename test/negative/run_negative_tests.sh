@@ -59,6 +59,7 @@ check_rejects() {
 }
 
 check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -[Log]> i64`'
+check_rejects "par_prefixed_surface_retired" "test/negative/par_prefixed_surface_retired.weft" "error[E4002]:" 5
 check_rejects "deep_release_mask_overflow_record" "test/negative/deep_release_mask_overflow_record.weft" "type error: aggregate field may require release beyond 16-word mask"
 check_rejects "deep_release_mask_overflow_variant_closure" "test/negative/deep_release_mask_overflow_variant_closure.weft" "type error: aggregate field may require release beyond 16-word mask"
 check_rejects "deep_release_mask_overflow_variant_array" "test/negative/deep_release_mask_overflow_variant_array.weft" "type error: aggregate field may require release beyond 16-word mask"
