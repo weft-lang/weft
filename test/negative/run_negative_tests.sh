@@ -638,6 +638,7 @@ check_rejects "ord_compare_retired" "test/negative/ord_compare_retired.weft" "un
 check_rejects "num_trait_forwarders_retired" "test/negative/num_trait_forwarders_retired.weft" "unknown module member" 9
 check_rejects "num_value_functions_retired" "test/negative/num_value_functions_retired.weft" "unknown module member" 8
 check_rejects "num_parse_functions_retired" "test/negative/num_parse_functions_retired.weft" "unknown module member" 6
+check_rejects "mini_sql_grammar_retired" "test/negative/mini_sql_grammar_retired.weft" "unknown module member" 1
 check_rejects "f64_table_prefixed_surface_retired" "test/negative/f64_table_prefixed_surface_retired.weft" "in import" 4
 check_rejects "f64_table_constructor_private" "test/negative/f64_table_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "intrinsic_f64_sqrt_arg_mismatch" "test/negative/intrinsic_f64_sqrt_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
