@@ -263,6 +263,7 @@ check_rejects "unsafe_process_run_command_requires_effect" "test/negative/unsafe
 check_rejects "process_platform_wrappers_retired" "test/negative/process_platform_wrappers_retired.weft" "error[E4002]: unknown module member 'runtime_platform_proc' in import" 3
 check_rejects "env_platform_wrappers_retired" "test/negative/env_platform_wrappers_retired.weft" "error[E4002]: unknown module member 'runtime_platform_env' in import" 2
 check_rejects "tcp_platform_wrapper_retired" "test/negative/tcp_platform_wrapper_retired.weft" "error[E4002]: unknown module member 'runtime_platform_tcp' in import" 1
+check_rejects "file_stream_platform_wrappers_retired" "test/negative/file_stream_platform_wrappers_retired.weft" "error[E4002]: unknown module member 'runtime_platform_file_stream' in import" 2
 check_rejects "unsafe_method_call_requires_effect" "test/negative/unsafe_method_call_requires_effect.weft" "error[E2001]:"
 check_rejects "unsafe_lambda_to_pure_fn" "test/negative/unsafe_lambda_to_pure_fn.weft" "error[E2001]:"
 check_rejects "non_unsafe_handler_raw_call" "test/negative/non_unsafe_handler_raw_call.weft" "error[E2001]:"
