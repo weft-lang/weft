@@ -117,6 +117,7 @@ check_rejects "url_constructor_private" "test/negative/url_constructor_private.w
 check_rejects "url_prefixed_parse_removed" "test/negative/url_prefixed_parse_removed.weft" "error[E4002]: unknown module member 'url_parse' in import" 1
 check_rejects "http_target_constructor_private" "test/negative/http_target_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "sse_decoder_constructor_private" "test/negative/sse_decoder_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "sse_prefixed_limits_removed" "test/negative/sse_prefixed_limits_removed.weft" "error[E4002]: unknown module member 'sse_limits' in import" 1
 check_rejects "sse_reader_constructor_private" "test/negative/sse_reader_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "websocket_message_state_constructor_private" "test/negative/websocket_message_state_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "websocket_stream_constructor_private" "test/negative/websocket_stream_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
