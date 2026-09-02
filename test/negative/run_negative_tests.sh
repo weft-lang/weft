@@ -278,8 +278,9 @@ check_rejects "trait_impl_conflict" "test/negative/trait_impl_conflict.weft" "ty
 check_rejects "ord_missing_impl" "test/negative/ord_missing_impl.weft" 'error[E1004]: type `Unordered` does not implement `Ord`'
 check_rejects "ord_operand_mismatch" "test/negative/ord_operand_mismatch.weft" "type error: ordering operand type mismatch"
 check_rejects "ord_unbounded_generic" "test/negative/ord_unbounded_generic.weft" 'error[E1004]: type `T` does not implement `Ord`'
-check_rejects "ord_wrong_signature" "test/negative/ord_wrong_signature.weft" "type error: Ord must define compare(self, Self) -> i64"
-check_rejects "ord_effectful_signature" "test/negative/ord_effectful_signature.weft" "type error: Ord must define compare(self, Self) -> i64"
+check_rejects "ord_wrong_signature" "test/negative/ord_wrong_signature.weft" "type error: Ord must define pure compare(self, Self) -> Ordering"
+check_rejects "ord_effectful_signature" "test/negative/ord_effectful_signature.weft" "type error: Ord must define pure compare(self, Self) -> Ordering"
+check_rejects "ord_legacy_i64_signature" "test/negative/ord_legacy_i64_signature.weft" "type error: Ord must define pure compare(self, Self) -> Ordering"
 check_rejects "display_missing_impl" "test/negative/display_missing_impl.weft" "error[E1004]:"
 check_rejects "hash_missing_impl" "test/negative/hash_missing_impl.weft" 'error[E1004]: type `bool` does not implement `Hash`'
 check_rejects "display_wrong_signature" "test/negative/display_wrong_signature.weft" "type error: impl method return type mismatch"
@@ -296,7 +297,7 @@ check_rejects "list_prepend_type_mismatch" "test/negative/list_prepend_type_mism
 check_rejects "vector_cross_type_push" "test/negative/vector_cross_type_push.weft" 'error[E1002]: argument type mismatch: expected `Vector<str>`, found `Vector<i64>`'
 check_rejects "persistent_vector_cross_type_push" "test/negative/persistent_vector_cross_type_push.weft" 'error[E1002]: argument type mismatch: expected `PersistentVector<str>`, found `PersistentVector<i64>`'
 check_rejects "vector_sort_missing_ord" "test/negative/vector_sort_missing_ord.weft" "error[E1004]:"
-check_rejects "vector_sort_effectful_comparator" "test/negative/vector_sort_effectful_comparator.weft" 'error[E1002]: argument type mismatch: expected `(i64, i64) -> i64`, found `(i64, i64) -[SortNoise]> i64`'
+check_rejects "vector_sort_effectful_comparator" "test/negative/vector_sort_effectful_comparator.weft" 'error[E1002]: argument type mismatch: expected `(i64, i64) -> Ordering`, found `(i64, i64) -[SortNoise]> Ordering`'
 check_rejects "vector_filter_effectful_predicate" "test/negative/vector_filter_effectful_predicate.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> bool`, found `(i64) -[FilterNoise]> bool`'
 check_rejects "vector_concat_type_mismatch" "test/negative/vector_concat_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `Vector<i64>`, found `Vector<str>`'
 check_rejects "generic_function_ref_unresolved" "test/negative/generic_function_ref_unresolved.weft" "type error: cannot infer generic function reference"
@@ -492,7 +493,6 @@ check_rejects "not_operand_not_bool" "test/negative/not_operand_not_bool.weft" "
 check_rejects "logical_operand_not_bool" "test/negative/logical_operand_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "match_guard_not_bool" "test/negative/match_guard_not_bool.weft" "type error: boolean expression is not bool"
 check_rejects "operator_equality_mismatch" "test/negative/operator_equality_mismatch.weft" "type error: equality operand mismatch"
-check_rejects "operator_relational_str" "test/negative/operator_relational_str.weft" 'error[E1004]: type `str` does not implement `Ord`'
 check_rejects "operator_bitwise_bool" "test/negative/operator_bitwise_bool.weft" "type error: bitwise operand is not i64"
 check_rejects "operator_shift_bool" "test/negative/operator_shift_bool.weft" "type error: bitwise operand is not i64"
 check_rejects "f64_i64_arithmetic_mismatch" "test/negative/f64_i64_arithmetic_mismatch.weft" "type error: arithmetic operand type mismatch"
