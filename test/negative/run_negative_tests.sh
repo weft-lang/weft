@@ -552,6 +552,7 @@ check_rejects "json_bool_requires_bool" "test/negative/json_bool_requires_bool.w
 check_rejects "io_helper_effect_unavailable" "test/negative/io_helper_effect_unavailable.weft" "error[E2001]:"
 check_rejects "file_prefixed_read_removed" "test/negative/file_prefixed_read_removed.weft" "error[E4002]: unknown module member 'file_read_all' in import" 1
 check_rejects "file_read_cannot_write" "test/negative/file_read_cannot_write.weft" "error[E2001]:"
+check_rejects "file_platform_wrappers_retired" "test/negative/file_platform_wrappers_retired.weft" "error[E4002]: unknown module member 'runtime_platform_file_read' in import" 4
 check_rejects "dir_inspect_cannot_mutate" "test/negative/dir_inspect_cannot_mutate.weft" "error[E2001]:"
 check_rejects "dir_prefixed_list_removed" "test/negative/dir_prefixed_list_removed.weft" "error[E4002]: unknown module member 'dir_list' in import" 1
 check_rejects "console_cannot_write_file" "test/negative/console_cannot_write_file.weft" "error[E2001]:"
