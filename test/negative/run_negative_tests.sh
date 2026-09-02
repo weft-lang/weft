@@ -617,7 +617,7 @@ check_rejects "num_u32_to_f64_arg_mismatch" "test/negative/num_u32_to_f64_arg_mi
 check_rejects "intrinsic_u64_to_f64_arg_mismatch" "test/negative/intrinsic_u64_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u64`, found `i64`'
 check_rejects "num_to_i64_exact_wrong_receiver" "test/negative/num_to_i64_exact_wrong_receiver.weft" "type error: unknown method"
 check_rejects "num_parse_f64_default_mismatch" "test/negative/num_parse_f64_default_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `str`'
-check_rejects "num_parse_float_lane_mismatch" "test/negative/num_parse_float_lane_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `Result<f64, NumParseError>`, found `Result<f32, NumParseError>`'
+check_rejects "num_parse_float_lane_mismatch" "test/negative/num_parse_float_lane_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `Result<f64, num.NumParseError>`, found `Result<f32, num.NumParseError>`'
 check_rejects "intrinsic_f64_to_i64_arg_mismatch" "test/negative/intrinsic_f64_to_i64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
 check_rejects "num_f32_to_f64_arg_mismatch" "test/negative/num_f32_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f32`, found `f64`'
 check_rejects "num_f64_to_f32_round_arg_mismatch" "test/negative/num_f64_to_f32_round_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
@@ -637,6 +637,7 @@ check_rejects "effect_interpreters_retired" "test/negative/effect_interpreters_r
 check_rejects "ord_compare_retired" "test/negative/ord_compare_retired.weft" "unknown module member" 1
 check_rejects "num_trait_forwarders_retired" "test/negative/num_trait_forwarders_retired.weft" "unknown module member" 9
 check_rejects "num_value_functions_retired" "test/negative/num_value_functions_retired.weft" "unknown module member" 8
+check_rejects "num_parse_functions_retired" "test/negative/num_parse_functions_retired.weft" "unknown module member" 6
 check_rejects "f64_table_prefixed_surface_retired" "test/negative/f64_table_prefixed_surface_retired.weft" "in import" 4
 check_rejects "f64_table_constructor_private" "test/negative/f64_table_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "intrinsic_f64_sqrt_arg_mismatch" "test/negative/intrinsic_f64_sqrt_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
