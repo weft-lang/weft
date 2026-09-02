@@ -277,6 +277,9 @@ check_rejects "trait_assoc_constraint_conditional_impl" "test/negative/trait_ass
 check_rejects "trait_assoc_constraint_missing_type" "test/negative/trait_assoc_constraint_missing_type.weft" "error[E0002]: expected type after associated-type '='"
 check_rejects "trait_impl_conflict" "test/negative/trait_impl_conflict.weft" "type error: conflicting implementations of trait for type"
 check_rejects "ord_missing_impl" "test/negative/ord_missing_impl.weft" 'error[E1004]: type `Unordered` does not implement `Ord`'
+check_rejects "sorted_map_key_missing_ord" "test/negative/sorted_map_key_missing_ord.weft" 'error[E1004]: type `UnorderedKey` does not implement `Ord`'
+check_rejects "sorted_map_constructor_private" "test/negative/sorted_map_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "sorted_set_constructor_private" "test/negative/sorted_set_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "ord_operand_mismatch" "test/negative/ord_operand_mismatch.weft" "type error: ordering operand type mismatch"
 check_rejects "ord_unbounded_generic" "test/negative/ord_unbounded_generic.weft" 'error[E1004]: type `T` does not implement `Ord`'
 check_rejects "ord_wrong_signature" "test/negative/ord_wrong_signature.weft" "type error: Ord must define pure compare(self, Self) -> Ordering"
