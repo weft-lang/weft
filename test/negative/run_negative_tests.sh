@@ -82,6 +82,8 @@ check_rejects "spawn_task_channel_scope_escape" "test/negative/spawn_task_channe
 check_rejects "spawn_task_shutdown_scope_escape" "test/negative/spawn_task_shutdown_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
 check_rejects "spawn_task_channel_shutdown_scope_escape" "test/negative/spawn_task_channel_shutdown_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
 check_rejects "channel_non_sendable_element" "test/negative/channel_non_sendable_element.weft" 'does not implement `Sendable`'
+check_rejects "channel_non_sendable_signature" "test/negative/channel_non_sendable_signature.weft" 'does not implement `Sendable`' 1
+check_rejects "channel_non_sendable_handler" "test/negative/channel_non_sendable_handler.weft" 'does not implement `Sendable`' 1
 check_rejects "spawn_task_double_join" "test/negative/spawn_task_double_join.weft" "type error: unique value used more than once"
 check_rejects "spawn_task_constructor_private" "test/negative/spawn_task_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "cancellation_request_requires_effect" "test/negative/cancellation_request_requires_effect.weft" 'error[E2001]: effect `Cancellation` is not available in this context'
@@ -633,6 +635,7 @@ check_rejects "utf8_prefixed_surface_retired" "test/negative/utf8_prefixed_surfa
 check_rejects "unicode_prefixed_surface_retired" "test/negative/unicode_prefixed_surface_retired.weft" "unknown module member" 56
 check_rejects "iterator_free_functions_retired" "test/negative/iterator_free_functions_retired.weft" "unknown module member" 10
 check_rejects "generator_functions_retired" "test/negative/generator_functions_retired.weft" "unknown module member" 8
+check_rejects "channel_functions_retired" "test/negative/channel_functions_retired.weft" "unknown module member" 4
 check_rejects "state_surface_retired" "test/negative/state_surface_retired.weft" "unknown module member" 4
 check_rejects "effect_interpreters_retired" "test/negative/effect_interpreters_retired.weft" "unknown module member" 2
 check_rejects "ord_compare_retired" "test/negative/ord_compare_retired.weft" "unknown module member" 1
