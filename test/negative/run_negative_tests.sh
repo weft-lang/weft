@@ -475,6 +475,9 @@ check_rejects "env_arg_requires_missing_case" "test/negative/env_arg_requires_mi
 check_rejects "env_var_requires_effect" "test/negative/env_var_requires_effect.weft" "error[E2001]:"
 check_rejects "env_raw_getenv_requires_trusted" "test/negative/env_raw_getenv_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "time_now_nanos_requires_effect" "test/negative/time_now_nanos_requires_effect.weft" "error[E2001]:"
+check_rejects "time_date_surface_retired" "test/negative/time_date_surface_retired.weft" "unknown module member" 14
+check_rejects "time_date_constructor_private" "test/negative/time_date_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "time_weekday_is_not_integer" "test/negative/time_weekday_is_not_integer.weft" 'return value type mismatch: expected `i64`, found `time.Weekday`'
 check_rejects "time_platform_wrappers_retired" "test/negative/time_platform_wrappers_retired.weft" "error[E4002]: unknown module member 'runtime_platform_time' in import" 2
 check_rejects "time_sleep_requires_effect" "test/negative/time_sleep_requires_effect.weft" "error[E2001]:"
 check_rejects "time_raw_clock_requires_trusted" "test/negative/time_raw_clock_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
