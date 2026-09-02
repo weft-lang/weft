@@ -169,6 +169,8 @@ check_rejects "tcp_connect_policy_requires_authority" "test/negative/tcp_connect
 check_rejects "tcp_policy_authorities_are_distinct" "test/negative/tcp_policy_authorities_are_distinct.weft" 'error[E1002]:'
 check_rejects "tcp_prefixed_surface_retired" "test/negative/tcp_prefixed_surface_retired.weft" "error[E4002]: unknown module member 'tcp_accept' in import" 17
 check_rejects "tcp_policy_wrappers_retired" "test/negative/tcp_policy_wrappers_retired.weft" "error[E4002]: unknown module member 'TcpConnectPolicy' in import" 6
+check_rejects "tls_prefixed_surface_retired" "test/negative/tls_prefixed_surface_retired.weft" "error[E4002]: unknown module member 'tls_client_open' in import" 11
+check_rejects "tls_stream_prefixed_surface_retired" "test/negative/tls_stream_prefixed_surface_retired.weft" "error[E4002]: unknown module member 'tls_stream_close' in import" 4
 check_rejects "tcp_listener_constructor_is_private" "test/negative/tcp_listener_constructor_is_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "tcp_listener_projection_is_private" "test/negative/tcp_listener_projection_is_private.weft" "type error: opaque projection pattern is private to its declaring module; use an exported accessor"
 check_rejects "tcp_stream_constructor_is_private" "test/negative/tcp_stream_constructor_is_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"

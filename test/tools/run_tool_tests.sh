@@ -711,9 +711,9 @@ assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public AP
     assert_contains "doc_stdlib_url_pins_tls_identity" "$(<"$tmp_out")" "pub fn tls_identity(self: Url) -> str"
     assert_contains "doc_stdlib_url_pins_origin" "$(<"$tmp_out")" "pub fn origin(self: Url) -> UrlOrigin"
   elif [ "$stdlib_doc_name" = "tls" ]; then
-    assert_contains "doc_stdlib_tls_pins_public_surface" "$(<"$tmp_out")" "Public API items: 36. Documented: 36."
-    assert_contains "doc_stdlib_tls_client_preserves_authority" "$(<"$tmp_out")" "pub fn tls_client_open(host: UrlHost, trust_roots: Bytes) -[SecureRandom, Time]> Result<owned TlsSession, TlsError>"
-    assert_contains "doc_stdlib_tls_server_preserves_authority" "$(<"$tmp_out")" "pub fn tls_server_open(certificate: Bytes, private_key: Bytes) -[SecureRandom]> Result<owned TlsSession, TlsError>"
+    assert_contains "doc_stdlib_tls_pins_public_surface" "$(<"$tmp_out")" "Public API items: 27. Documented: 27."
+    assert_contains "doc_stdlib_tls_client_preserves_authority" "$(<"$tmp_out")" "pub fn client(host: UrlHost, trust_roots: bytes.Bytes) -[SecureRandom, Time]> Result<owned TlsSession, TlsError>"
+    assert_contains "doc_stdlib_tls_server_preserves_authority" "$(<"$tmp_out")" "pub fn server(certificate: bytes.Bytes, private_key: bytes.Bytes) -[SecureRandom]> Result<owned TlsSession, TlsError>"
   elif [ "$stdlib_doc_name" = "http" ]; then
     assert_contains "doc_stdlib_http_pins_public_surface" "$(<"$tmp_out")" "Public API items: 121. Documented: 121."
     assert_contains "doc_stdlib_http_pins_opaque_head" "$(<"$tmp_out")" "pub type HttpRequestHead = opaque"

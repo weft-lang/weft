@@ -221,17 +221,19 @@ printf '%s\n' \
   '}' > "$work/project/test/arithmetic.weft"
 
 printf '%s\n' \
-  'use stdlib/bytes.{Bytes, bytes_from_str}' \
+  'use stdlib/bytes as bytes' \
+  'use stdlib/bytes.{Bytes}' \
   'use stdlib/result.{Err, Ok}' \
   'use stdlib/secure_random.{SecureRandom, SecureRandomError}' \
   'use stdlib/time.{Time}' \
-  'use stdlib/tls.{TlsTrust, tls_client_open}' \
-  'use stdlib/url.{url_parse}' \
+  'use stdlib/tls as tls' \
+  'use stdlib/tls.{TlsTrust}' \
+  'use stdlib/url as url' \
   '' \
   'fn open_with_authority() -[SecureRandom, Time]> i64 {' \
-  '  match url_parse("https://localhost/") {' \
+  '  match url.parse("https://localhost/") {' \
   '    Err(error) -> 1' \
-  '    Ok(url) -> match tls_client_open(url.host(), bytes_from_str("bad")) {' \
+  '    Ok(url) -> match tls.client(url.host(), bytes.from_str("bad")) {' \
   '      Err(TlsTrust) -> 0' \
   '      _ -> 2' \
   '    }' \
@@ -241,7 +243,7 @@ printf '%s\n' \
   'fn with_random() -[Time]> i64 {' \
   '  handle open_with_authority() {' \
   '    SecureRandom.bytes(count) -> resume(Ok<Bytes, SecureRandomError>(' \
-  '      bytes_from_str("0123456789abcdef0123456789abcdef0123456789abcdef")' \
+  '      bytes.from_str("0123456789abcdef0123456789abcdef0123456789abcdef")' \
   '    ))' \
   '  }' \
   '}' \
