@@ -375,6 +375,8 @@ check_rejects "unknown_function_in_import" "test/negative/unknown_function_in_im
 check_rejects "module_plain_import_does_not_leak_value" "test/negative/module_plain_import_does_not_leak_value.weft" "error[E1001]: unknown function 'work'"
 check_rejects "prelude_excludes_option_helpers" "test/negative/prelude_excludes_option_helpers.weft" "error[E1001]: unknown function 'option_some'"
 check_rejects "result_helper_removed" "test/negative/result_helper_removed.weft" "error[E1001]: unknown function 'result_ok'"
+check_rejects "option_prefixed_map_removed" "test/negative/option_prefixed_map_removed.weft" "error[E4002]: unknown module member 'option_map' in import" 1
+check_rejects "result_prefixed_map_removed" "test/negative/result_prefixed_map_removed.weft" "error[E4002]: unknown module member 'result_map' in import" 1
 check_rejects "prelude_methods_require_explicit_import" "test/negative/prelude_methods_require_explicit_import.weft" "type error: unknown method"
 check_rejects "quoted_import_removed" "test/negative/quoted_import_removed.weft" "error[E0002]: expected path-form module after 'use'"
 check_rejects "extern_keyword_removed" "test/negative/extern_keyword_removed.weft" "error[E0002]: unexpected token at module level"
