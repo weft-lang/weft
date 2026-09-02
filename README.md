@@ -7,7 +7,6 @@ A compiled, general-purpose language with set-theoretic types, algebraic effects
 ```weft run
 use runtime/console_write as terminal
 use stdlib/console.{println}
-use stdlib/display.{Display}
 
 default handler terminal()
 
