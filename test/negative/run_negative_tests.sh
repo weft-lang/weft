@@ -534,7 +534,7 @@ check_rejects "math_sqrt_f32_arg_mismatch" "test/negative/math_sqrt_f32_arg_mism
 check_rejects "intrinsic_f64_sqrt_arg_mismatch" "test/negative/intrinsic_f64_sqrt_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
 check_rejects "intrinsic_f32_sqrt_arg_mismatch" "test/negative/intrinsic_f32_sqrt_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f32`, found `i64`'
 check_rejects "num_i64_to_i8_checked_arg_mismatch" "test/negative/num_i64_to_i8_checked_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `f64`'
-check_rejects "num_int_cast_value_or_default_mismatch" "test/negative/num_int_cast_value_or_default_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i8`, found `str`'
+check_rejects "num_checked_cast_default_mismatch" "test/negative/num_checked_cast_default_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i8`, found `str`'
 check_rejects "intrinsic_i64_to_i8_arg_mismatch" "test/negative/intrinsic_i64_to_i8_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `u64`'
 check_rejects "intrinsic_u16_to_u64_arg_mismatch" "test/negative/intrinsic_u16_to_u64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u16`, found `f64`'
 check_rejects "num_trait_bool_not_numeric" "test/negative/num_trait_bool_not_numeric.weft" "error[E1004]:"
