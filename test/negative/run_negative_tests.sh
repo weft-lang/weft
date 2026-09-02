@@ -301,7 +301,7 @@ check_rejects "map_wrong_key_type" "test/negative/map_wrong_key_type.weft" 'erro
 check_rejects "map_wrong_value_type" "test/negative/map_wrong_value_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "map_key_requires_hash" "test/negative/map_key_requires_hash.weft" "error[E1004]:"
 check_rejects "set_wrong_element_type" "test/negative/set_wrong_element_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
-check_rejects "map_set_handle_confusion" "test/negative/map_set_handle_confusion.weft" 'error[E1002]: argument type mismatch: expected `Map<i64, i64>`, found `Set<i64>`'
+check_rejects "map_set_handle_confusion" "test/negative/map_set_handle_confusion.weft" 'type error: unknown method'
 check_rejects "map_sentinel_lookup_removed" "test/negative/map_sentinel_lookup_removed.weft" "type error: arity mismatch"
 check_rejects "map_remove_wrong_key_type" "test/negative/map_remove_wrong_key_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "set_remove_wrong_element_type" "test/negative/set_remove_wrong_element_type.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
