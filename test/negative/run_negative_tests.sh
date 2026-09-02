@@ -293,7 +293,7 @@ check_rejects "function_value_arg_mismatch" "test/negative/function_value_arg_mi
 check_rejects "function_value_return_mismatch" "test/negative/function_value_return_mismatch.weft" 'error[E1002]: return value type mismatch: expected `i64`, found `str`'
 check_rejects "method_call_arity_too_few" "test/negative/method_call_arity_too_few.weft" "type error: arity mismatch"
 check_rejects "method_call_arity_too_many" "test/negative/method_call_arity_too_many.weft" "type error: arity mismatch"
-check_rejects "iterator_method_type_arity" "test/negative/iterator_method_type_arity.weft" "type error: wrong number of type arguments"
+check_rejects "iterator_combinator_type_arity" "test/negative/iterator_combinator_type_arity.weft" "type error: wrong number of type arguments"
 check_rejects "generic_method_type_bound" "test/negative/generic_method_type_bound.weft" 'error[E1004]: type `str` does not implement `GenericMethodMarker`'
 check_rejects "method_call_arg_mismatch" "test/negative/method_call_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "method_call_trait_arg_mismatch" "test/negative/method_call_trait_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
@@ -631,6 +631,7 @@ check_rejects "math_prefixed_surface_retired" "test/negative/math_prefixed_surfa
 check_rejects "math_scalar_functions_retired" "test/negative/math_scalar_functions_retired.weft" "unknown module member" 16
 check_rejects "utf8_prefixed_surface_retired" "test/negative/utf8_prefixed_surface_retired.weft" "unknown module member" 7
 check_rejects "unicode_prefixed_surface_retired" "test/negative/unicode_prefixed_surface_retired.weft" "unknown module member" 56
+check_rejects "iterator_free_functions_retired" "test/negative/iterator_free_functions_retired.weft" "unknown module member" 10
 check_rejects "f64_table_prefixed_surface_retired" "test/negative/f64_table_prefixed_surface_retired.weft" "in import" 4
 check_rejects "f64_table_constructor_private" "test/negative/f64_table_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "intrinsic_f64_sqrt_arg_mismatch" "test/negative/intrinsic_f64_sqrt_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
