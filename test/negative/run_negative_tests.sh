@@ -625,9 +625,10 @@ check_rejects "num_i32_to_f32_round_arg_mismatch" "test/negative/num_i32_to_f32_
 check_rejects "intrinsic_f32_to_f64_arg_mismatch" "test/negative/intrinsic_f32_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f32`, found `f64`'
 check_rejects "intrinsic_f64_to_f32_arg_mismatch" "test/negative/intrinsic_f64_to_f32_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
 check_rejects "intrinsic_i16_to_f32_arg_mismatch" "test/negative/intrinsic_i16_to_f32_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i16`, found `u16`'
-check_rejects "math_sqrt_f64_arg_mismatch" "test/negative/math_sqrt_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
-check_rejects "math_sqrt_f32_arg_mismatch" "test/negative/math_sqrt_f32_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f32`, found `i64`'
+check_rejects "math_sqrt_f64_arg_mismatch" "test/negative/math_sqrt_f64_arg_mismatch.weft" "type error: unknown method"
+check_rejects "math_sqrt_f32_arg_mismatch" "test/negative/math_sqrt_f32_arg_mismatch.weft" "type error: unknown method"
 check_rejects "math_prefixed_surface_retired" "test/negative/math_prefixed_surface_retired.weft" "error[E4002]: unknown module member 'math_abs_f32' in import" 22
+check_rejects "math_scalar_functions_retired" "test/negative/math_scalar_functions_retired.weft" "unknown module member" 16
 check_rejects "f64_table_prefixed_surface_retired" "test/negative/f64_table_prefixed_surface_retired.weft" "in import" 4
 check_rejects "f64_table_constructor_private" "test/negative/f64_table_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "intrinsic_f64_sqrt_arg_mismatch" "test/negative/intrinsic_f64_sqrt_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
