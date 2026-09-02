@@ -95,6 +95,9 @@ check_rejects "generator_generic_yield_unhandled" "test/negative/generator_gener
 check_rejects "unhandled_effect_perform" "test/negative/unhandled_effect_perform.weft" 'error[E2001]: effect `State` is not available in this context'
 check_rejects "source_acquire_requires_effect" "test/negative/source_acquire_requires_effect.weft" 'error[E2001]: effect `SourceAcquire` is not available in this context'
 check_rejects "secure_random_effect_unavailable" "test/negative/secure_random_effect_unavailable.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
+check_rejects "secure_random_prefixed_function_retired" "test/negative/secure_random_prefixed_function_retired.weft" "error[E4002]: unknown module member 'secure_random_bytes' in import" 1
+check_rejects "secure_random_wrapper_retired" "test/negative/secure_random_wrapper_retired.weft" "error[E4002]: unknown module member 'secure_random_with_deterministic' in import" 1
+check_rejects "secure_random_platform_wrapper_retired" "test/negative/secure_random_platform_wrapper_retired.weft" "error[E4002]: unknown module member 'runtime_platform_secure_random' in import" 1
 check_rejects "secure_random_raw_backend_private" "test/negative/secure_random_raw_backend_private.weft" "module member 'runtime_secure_random_fill_raw' is not visible in this import" 1
 check_rejects "tls_client_open_requires_authority" "test/negative/tls_client_open_requires_authority.weft" 'error[E2001]: effects `SecureRandom, Time` are not available in this context'
 check_rejects "tls_server_open_requires_authority" "test/negative/tls_server_open_requires_authority.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
