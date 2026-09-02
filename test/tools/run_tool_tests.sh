@@ -918,7 +918,7 @@ assert_equals "run_product_stderr_is_inherited" "$(<"$tmp_err")" ""
 
 tmp_run_args_source="$tmp_scratch_dir/run_args.weft"
 printf '%s\n' \
-  'use runtime/safe_env.{runtime_platform_env}' \
+  'use runtime/env as env_handler' \
   'use stdlib/env.{Env}' \
   '' \
   'fn inspect_args() -[Env]> i64 {' \
@@ -937,7 +937,7 @@ printf '%s\n' \
   '}' \
   '' \
   'fn main(argc: i64, argv: i64) -> i64 {' \
-  '  runtime_platform_env(argc, argv, inspect_args)' \
+  '  with env_handler(argc, argv) { inspect_args() }' \
   '}' > "$tmp_run_args_source"
 run_weft_compile_guarded "$WEFT" run "$tmp_run_args_source" -- alpha "two words" > "$tmp_out" 2> "$tmp_err"
 assert_equals "run_forwards_exact_product_arguments_stdout" "$(<"$tmp_out")" ""
