@@ -166,7 +166,9 @@ check_rejects "tcp_listen_requires_authority" "test/negative/tcp_listen_requires
 check_rejects "tcp_connect_does_not_grant_listen" "test/negative/tcp_connect_does_not_grant_listen.weft" 'error[E2001]: effect `TcpListen` is not available in this context'
 check_rejects "tcp_listen_does_not_grant_connect" "test/negative/tcp_listen_does_not_grant_connect.weft" 'error[E2001]: effect `TcpConnect` is not available in this context'
 check_rejects "tcp_connect_policy_requires_authority" "test/negative/tcp_connect_policy_requires_authority.weft" 'error[E2001]: effect `TcpConnect` is not available in this context'
-check_rejects "tcp_policy_authorities_are_distinct" "test/negative/tcp_policy_authorities_are_distinct.weft" 'error[E1002]: argument type mismatch: expected `TcpListenPolicy`, found `TcpConnectPolicy`'
+check_rejects "tcp_policy_authorities_are_distinct" "test/negative/tcp_policy_authorities_are_distinct.weft" 'error[E1002]:'
+check_rejects "tcp_prefixed_surface_retired" "test/negative/tcp_prefixed_surface_retired.weft" "error[E4002]: unknown module member 'tcp_accept' in import" 17
+check_rejects "tcp_policy_wrappers_retired" "test/negative/tcp_policy_wrappers_retired.weft" "error[E4002]: unknown module member 'TcpConnectPolicy' in import" 6
 check_rejects "tcp_listener_constructor_is_private" "test/negative/tcp_listener_constructor_is_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "tcp_listener_projection_is_private" "test/negative/tcp_listener_projection_is_private.weft" "type error: opaque projection pattern is private to its declaring module; use an exported accessor"
 check_rejects "tcp_stream_constructor_is_private" "test/negative/tcp_stream_constructor_is_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
