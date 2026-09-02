@@ -7749,6 +7749,11 @@ pub(package) fn pipeline_expr_owned_rvalue_temp_typed(expr: Expr, src: i64, tt: 
     RecordInit(type_ns, type_nl, fields) -> 1
     RecordUpdate(base, fields, fact) -> 1
     ArrayLiteral(elements, resolved_ty, span) -> 1
+    If(cond, then_expr, else_expr) -> {
+      if pipeline_expr_owned_rvalue_temp_typed(then_expr, src, tt) == 1 {
+        pipeline_expr_owned_rvalue_temp_typed(else_expr, src, tt)
+      } else { 0 }
+    }
     IndexedGet(base, index, element_ty, fixed_len) -> 1
     IndexedSet(base, index, value, fact) -> 0
     IndexedSlice(base, start, end, fact) -> 0
@@ -7839,6 +7844,39 @@ pub(package) fn pipeline_managed_temp_release_arg_kind(expr_kind: i64, is_rvalue
       cg_managed_drop_kind_for_ty(pipeline_expected_arg_type_node(expected_params, expected_types, index, mask_offset, expected_subst))
     } else { continuation_cleanup_kind_none() }
   }
+}
+
+-- A method receiver is callee parameter zero, but it is lowered separately
+-- from the explicit argument list. When that parameter is borrow-classified,
+-- a managed rvalue receiver remains caller-owned and must be released after
+-- the call just like an rvalue passed to any other borrowed parameter.
+pub(package) fn pipeline_managed_method_receiver_temp_release(value: i64, receiver_ty: i64, result_ty: i64, expr_kind: i64, is_rvalue_temp: i64, next_value: i64, borrowed_mask: i64) -> PipelineLoweredArgs {
+  let drop_kind = if expr_kind != continuation_cleanup_kind_none() { expr_kind }
+    else { if is_rvalue_temp == 1 { cg_managed_drop_kind_for_ty(receiver_ty) } else { continuation_cleanup_kind_none() } }
+  -- A managed result owns an independent stake before receiver cleanup. Keep
+  -- non-managed results conservative: trusted transitional methods can still
+  -- return raw interior handles encoded as i64, whose provenance is not yet a
+  -- typed result fact and therefore cannot outlive an eagerly freed receiver.
+  let result_owns_alias = if result_ty != 0 { ty_value_has_release_lane(result_ty) } else { 0 }
+  let needs_release = if result_owns_alias == 1 and (drop_kind != continuation_cleanup_kind_none() or (is_rvalue_temp == 1 and ty_value_has_release_lane(receiver_ty) == 1)) { 1 } else { 0 }
+  let release_insts = if needs_release == 1 and value >= 0 and cg_mask_has(borrowed_mask, 0) == 1 {
+    pipeline_managed_temp_release_inst_list(value, receiver_ty, drop_kind, next_value)
+  } else { ir_inst_list_empty() }
+  pipeline_lowered_args(ir_value_list_empty(), next_value + ir_inst_list_len(release_insts), release_insts, 1)
+}
+
+pub(package) fn pipeline_managed_method_receiver_temp_release_typed(expr: Expr, value: i64, receiver_ty: i64, result_ty: i64, next_value: i64, borrowed_mask: i64, src: i64, fns: i64, subst: i64, tt: i64) -> PipelineLoweredArgs {
+  let expr_kind = pipeline_expr_owned_temp_drop_kind_typed(expr)
+  let is_rvalue_temp = if pipeline_expr_owned_rvalue_temp_typed(expr, src, tt) == 1 { 1 }
+    else { pipeline_expr_owned_array_value_typed(expr, receiver_ty, src, fns, subst, tt) }
+  pipeline_managed_method_receiver_temp_release(value, receiver_ty, result_ty, expr_kind, is_rvalue_temp, next_value, borrowed_mask)
+}
+
+pub(package) fn pipeline_managed_method_receiver_temp_release_node(expr: i64, value: i64, receiver_ty: i64, result_ty: i64, next_value: i64, borrowed_mask: i64, src: i64, fns: i64, subst: i64, tt: i64) -> PipelineLoweredArgs {
+  let expr_kind = pipeline_expr_node_owned_temp_drop_kind_typed(expr)
+  let is_rvalue_temp = if pipeline_expr_node_owned_rvalue_temp_typed(expr, src, tt) == 1 { 1 }
+    else { pipeline_expr_node_owned_array_value_typed(expr, receiver_ty, src, fns, subst, tt) }
+  pipeline_managed_method_receiver_temp_release(value, receiver_ty, result_ty, expr_kind, is_rvalue_temp, next_value, borrowed_mask)
 }
 
 pub(package) fn pipeline_managed_lambda_temp_release_args_masked_typed(args: ExprList, values: IrValueList, index: i64, next_value: i64, borrowed_mask: i64, mask_offset: i64, expected_params: i64, expected_types: i64, expected_subst: i64, src: i64, tt: i64) -> PipelineLoweredArgs {
@@ -10568,7 +10606,8 @@ pub(package) fn pipeline_lower_method_call_typed_after_receiver(recv_expr: Expr,
   let tt = pipeline_lower_module_tt(module)
   let subst = pipeline_lower_module_subst(module)
   let method_params = pipeline_method_ref_params(tt, method_ref, method_hash, subst)
-  let receiver_lanes = pipeline_method_ref_receiver_lanes(tt, method_ref, method_hash, subst)
+  let receiver_ty = pipeline_method_ref_receiver_type(tt, method_ref, method_hash, subst)
+  let receiver_lanes = pipeline_type_value_lane_count_or_one(receiver_ty)
   let result_ty = pipeline_method_ref_result_type(tt, method_ref, method_hash, subst)
   let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
   let borrowed_mask = pipeline_method_ref_borrowable_param_mask(pipeline_lower_module_fns(module), tt, method_ref, method_hash, subst)
@@ -10591,8 +10630,9 @@ pub(package) fn pipeline_lower_method_call_typed_after_receiver(recv_expr: Expr,
       )
       let receiver_transfer = pipeline_method_receiver_linear_transfer_insts_typed(recv_expr, recv_value, method_params, params, locals, module)
       let call_inst = ir_inst_list_append(receiver_transfer, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(call_dst, result_ty)))
-      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + result_lanes, borrowed_mask, 1, method_params, 0, 0, pipeline_lower_module_src(module), pipeline_lower_module_tt(module))
-      let call_insts = ir_inst_list_append(call_inst, pipeline_lowered_args_insts(cleanup))
+      let receiver_cleanup = pipeline_managed_method_receiver_temp_release_typed(recv_expr, recv_value, receiver_ty, result_ty, call_dst + result_lanes, borrowed_mask, src, pipeline_lower_module_fns(module), subst, tt)
+      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, pipeline_lowered_args_next_value(receiver_cleanup), borrowed_mask, 1, method_params, 0, 0, src, tt)
+      let call_insts = ir_inst_list_append(call_inst, ir_inst_list_append(pipeline_lowered_args_insts(receiver_cleanup), pipeline_lowered_args_insts(cleanup)))
       let call_args = pipeline_ir_value_lane_ids(call_dst, 0, result_lanes)
       let call = ir_block_new_term(call_block, call_insts, ir_term_jump_args(target_block, call_args))
       let receiver_params = pipeline_ir_value_lane_ids(recv_value, 0, receiver_lanes)
@@ -10613,6 +10653,7 @@ pub(package) fn pipeline_lower_method_call_typed_after_straight_receiver(recv_ex
   let tt = pipeline_lower_module_tt(module)
   let subst = pipeline_lower_module_subst(module)
   let method_params = pipeline_method_ref_params(tt, method_ref, method_hash, subst)
+  let receiver_ty = pipeline_method_ref_receiver_type(tt, method_ref, method_hash, subst)
   let result_ty = pipeline_method_ref_result_type(tt, method_ref, method_hash, subst)
   let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
   let borrowed_mask = pipeline_method_ref_borrowable_param_mask(pipeline_lower_module_fns(module), tt, method_ref, method_hash, subst)
@@ -10633,9 +10674,10 @@ pub(package) fn pipeline_lower_method_call_typed_after_straight_receiver(recv_ex
       )
       let receiver_transfer = pipeline_method_receiver_linear_transfer_insts_typed(recv_expr, recv_value, method_params, params, locals, module)
       let call_inst = ir_inst_list_append(receiver_transfer, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(call_dst, result_ty)))
-      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + result_lanes, borrowed_mask, 1, method_params, 0, 0, pipeline_lower_module_src(module), pipeline_lower_module_tt(module))
+      let receiver_cleanup = pipeline_managed_method_receiver_temp_release_typed(recv_expr, recv_value, receiver_ty, result_ty, call_dst + result_lanes, borrowed_mask, src, pipeline_lower_module_fns(module), subst, tt)
+      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, pipeline_lowered_args_next_value(receiver_cleanup), borrowed_mask, 1, method_params, 0, 0, src, tt)
       let call_args = pipeline_ir_value_lane_ids(call_dst, 0, result_lanes)
-      let call = ir_block_new_term(call_block, ir_inst_list_append(call_inst, pipeline_lowered_args_insts(cleanup)), ir_term_jump_args(target_block, call_args))
+      let call = ir_block_new_term(call_block, ir_inst_list_append(call_inst, ir_inst_list_append(pipeline_lowered_args_insts(receiver_cleanup), pipeline_lowered_args_insts(cleanup))), ir_term_jump_args(target_block, call_args))
       let blocks = ir_block_list_prepend(entry, ir_block_list_append(pipeline_lowered_call_blocks_blocks(lowered_args), ir_block_list_prepend(call, ir_block_list_empty())))
       pipeline_lowered_blocks(pipeline_lowered_call_blocks_next_block(lowered_args), pipeline_lowered_args_next_value(cleanup), blocks, 1)
     }
@@ -15495,6 +15537,7 @@ pub(package) fn pipeline_lower_method_args_cfg_to_target_blocks(method_ctx: Pipe
       let base_ctx = pipeline_call_arg_ctx_with_fns(args_node, arg_count, params, locals, src, tt, call_block, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module))
       let subst = pipeline_lower_module_subst(module)
       let method_params = pipeline_method_ref_params(tt, node_f4(expr), node_f2(expr), subst)
+      let receiver_ty = pipeline_method_ref_receiver_type(tt, node_f4(expr), node_f2(expr), subst)
       let result_ty = pipeline_method_ref_result_type(tt, node_f4(expr), node_f2(expr), subst)
       let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
       let borrowed_mask = pipeline_method_ref_borrowable_param_mask(pipeline_lower_module_fns(module), tt, node_f4(expr), node_f2(expr), subst)
@@ -15519,9 +15562,10 @@ pub(package) fn pipeline_lower_method_args_cfg_to_target_blocks(method_ctx: Pipe
           )
           let receiver_transfer = pipeline_method_receiver_linear_transfer_insts_node(node_f1(expr), receiver_value, method_params, pipeline_handler_lower_ctx_from_module(params, locals, module))
           let call_inst = ir_inst_list_append(receiver_transfer, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(call_dst, result_ty)))
-          let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args_node, arg_count, pipeline_lowered_call_blocks_values(lowered_args), 0, call_dst + result_lanes, borrowed_mask, 1, method_params, 0, 0, src, tt)
+          let receiver_cleanup = pipeline_managed_method_receiver_temp_release_node(node_f1(expr), receiver_value, receiver_ty, result_ty, call_dst + result_lanes, borrowed_mask, src, pipeline_lower_module_fns(module), subst, tt)
+          let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args_node, arg_count, pipeline_lowered_call_blocks_values(lowered_args), 0, pipeline_lowered_args_next_value(receiver_cleanup), borrowed_mask, 1, method_params, 0, 0, src, tt)
           let call_args = pipeline_ir_value_lane_ids(call_dst, 0, result_lanes)
-          let call = ir_block_new_term(call_block, ir_inst_list_append(call_inst, pipeline_lowered_args_insts(cleanup)), ir_term_jump_args(target_block, call_args))
+          let call = ir_block_new_term(call_block, ir_inst_list_append(call_inst, ir_inst_list_append(pipeline_lowered_args_insts(receiver_cleanup), pipeline_lowered_args_insts(cleanup))), ir_term_jump_args(target_block, call_args))
           let blocks = ir_block_list_prepend(
             entry,
             ir_block_list_append(pipeline_lowered_call_blocks_blocks(lowered_args), ir_block_list_prepend(call, ir_block_list_empty()))
@@ -15543,7 +15587,8 @@ pub(package) fn pipeline_lower_method_call_after_cfg_receiver(expr: i64, receive
   let nargs = nlist_len(args_node)
   let args_need_cfg = pipeline_call_args_have_cfg(args_node, nargs, 0)
   let subst = pipeline_lower_module_subst(module)
-  let receiver_lanes = pipeline_method_ref_receiver_lanes(tt, node_f4(expr), node_f2(expr), subst)
+  let receiver_ty = pipeline_method_ref_receiver_type(tt, node_f4(expr), node_f2(expr), subst)
+  let receiver_lanes = pipeline_type_value_lane_count_or_one(receiver_ty)
   let result_ty = pipeline_method_ref_result_type(tt, node_f4(expr), node_f2(expr), subst)
   let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
   if args_need_cfg == 1 {
@@ -15585,8 +15630,9 @@ pub(package) fn pipeline_lower_method_call_after_cfg_receiver(expr: i64, receive
       )
       let receiver_transfer = pipeline_method_receiver_linear_transfer_insts_node(node_f1(expr), receiver_value, method_params, lower_ctx)
       let call_inst = ir_inst_list_append(receiver_transfer, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(call_dst, result_ty)))
-      let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args_node, nargs, pipeline_lowered_args_values(args), 0, call_dst + result_lanes, borrowed_mask, 1, method_params, 0, 0, src, tt)
-      let insts = ir_inst_list_append(pipeline_lowered_args_insts(args), ir_inst_list_append(call_inst, pipeline_lowered_args_insts(cleanup)))
+      let receiver_cleanup = pipeline_managed_method_receiver_temp_release_node(node_f1(expr), receiver_value, receiver_ty, result_ty, call_dst + result_lanes, borrowed_mask, src, pipeline_lower_module_fns(module), subst, tt)
+      let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args_node, nargs, pipeline_lowered_args_values(args), 0, pipeline_lowered_args_next_value(receiver_cleanup), borrowed_mask, 1, method_params, 0, 0, src, tt)
+      let insts = ir_inst_list_append(pipeline_lowered_args_insts(args), ir_inst_list_append(call_inst, ir_inst_list_append(pipeline_lowered_args_insts(receiver_cleanup), pipeline_lowered_args_insts(cleanup))))
       let call_args = pipeline_ir_value_lane_ids(call_dst, 0, result_lanes)
       let receiver_params = pipeline_ir_value_lane_ids(receiver_value, 0, receiver_lanes)
       let receiver_merge = ir_block_new_params(next_block, receiver_params, insts, ir_term_jump_args(target_block, call_args))
@@ -23389,6 +23435,7 @@ pub(package) fn pipeline_lower_method_call_expr_typed_sidecar_handler_opt(recv_e
   let receiver = pipeline_lower_expr_typed_sidecar_handler_ctx(recv_expr, next_value, lower_ctx)
   if ir_lowered_expr_is_valid(receiver) == 1 {
     let method_params = pipeline_method_ref_params(tt, method_ref, method_hash, subst)
+    let receiver_ty = pipeline_method_ref_receiver_type(tt, method_ref, method_hash, subst)
     let result_ty = pipeline_method_ref_result_type(tt, method_ref, method_hash, subst)
     let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
     let borrowed_mask = pipeline_method_ref_borrowable_param_mask(pipeline_handler_lower_ctx_fns(lower_ctx), tt, method_ref, method_hash, subst)
@@ -23401,8 +23448,9 @@ pub(package) fn pipeline_lower_method_call_expr_typed_sidecar_handler_opt(recv_e
       )
       let receiver_transfer = pipeline_method_receiver_linear_transfer_insts_typed(recv_expr, ir_lowered_expr_value(receiver), method_params, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
       let call = ir_inst_list_append(receiver_transfer, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(dst, result_ty)))
-      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_args_values(args), 0, dst + result_lanes, borrowed_mask, 1, method_params, 0, 0, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
-      let insts = ir_inst_list_append(ir_lowered_expr_insts(receiver), ir_inst_list_append(pipeline_lowered_args_insts(args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup))))
+      let receiver_cleanup = pipeline_managed_method_receiver_temp_release_typed(recv_expr, ir_lowered_expr_value(receiver), receiver_ty, result_ty, dst + result_lanes, borrowed_mask, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, tt)
+      let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_args_values(args), 0, pipeline_lowered_args_next_value(receiver_cleanup), borrowed_mask, 1, method_params, 0, 0, src, tt)
+      let insts = ir_inst_list_append(ir_lowered_expr_insts(receiver), ir_inst_list_append(pipeline_lowered_args_insts(args), ir_inst_list_append(call, ir_inst_list_append(pipeline_lowered_args_insts(receiver_cleanup), pipeline_lowered_args_insts(cleanup)))))
       ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), insts)
     } else {
       ir_lowered_expr_invalid(next_value)
@@ -25972,6 +26020,7 @@ pub(package) fn pipeline_lower_method_call_node_typed_sidecar_handler_opt(recv_n
   let receiver = pipeline_lower_expr_node_typed_sidecar_handler_ctx(recv_node, next_value, lower_ctx)
   if ir_lowered_expr_is_valid(receiver) == 1 {
     let method_params = pipeline_method_ref_params(tt, method_ref, method_hash, subst)
+    let receiver_ty = pipeline_method_ref_receiver_type(tt, method_ref, method_hash, subst)
     let result_ty = pipeline_method_ref_result_type(tt, method_ref, method_hash, subst)
     let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
     let borrowed_mask = pipeline_method_ref_borrowable_param_mask(pipeline_handler_lower_ctx_fns(lower_ctx), tt, method_ref, method_hash, subst)
@@ -25984,8 +26033,9 @@ pub(package) fn pipeline_lower_method_call_node_typed_sidecar_handler_opt(recv_n
       )
       let receiver_transfer = pipeline_method_receiver_linear_transfer_insts_node(recv_node, ir_lowered_expr_value(receiver), method_params, lower_ctx)
       let call = ir_inst_list_append(receiver_transfer, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(dst, result_ty)))
-      let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, dst + result_lanes, borrowed_mask, 1, method_params, 0, 0, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
-      ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(ir_lowered_expr_insts(receiver), ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup)))))
+      let receiver_cleanup = pipeline_managed_method_receiver_temp_release_node(recv_node, ir_lowered_expr_value(receiver), receiver_ty, result_ty, dst + result_lanes, borrowed_mask, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_fns(lower_ctx), subst, tt)
+      let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, pipeline_lowered_args_next_value(receiver_cleanup), borrowed_mask, 1, method_params, 0, 0, pipeline_handler_lower_ctx_src(lower_ctx), tt)
+      ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(ir_lowered_expr_insts(receiver), ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_inst_list_append(call, ir_inst_list_append(pipeline_lowered_args_insts(receiver_cleanup), pipeline_lowered_args_insts(cleanup))))))
     } else {
       ir_lowered_expr_invalid(next_value)
     }
