@@ -117,6 +117,8 @@ check_rejects "url_constructor_private" "test/negative/url_constructor_private.w
 check_rejects "url_prefixed_parse_removed" "test/negative/url_prefixed_parse_removed.weft" "error[E4002]: unknown module member 'url_parse' in import" 1
 check_rejects "http_target_constructor_private" "test/negative/http_target_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "http_prefixed_limits_removed" "test/negative/http_prefixed_limits_removed.weft" "error[E4002]: unknown module member 'http_default_limits' in import" 1
+check_rejects "http_body_prefixed_read_removed" "test/negative/http_body_prefixed_read_removed.weft" "error[E4002]: unknown module member 'http_body_read' in import" 1
+check_rejects "http_client_prefixed_begin_removed" "test/negative/http_client_prefixed_begin_removed.weft" "error[E4002]: unknown module member 'http_client_begin' in import" 1
 check_rejects "sse_decoder_constructor_private" "test/negative/sse_decoder_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "sse_prefixed_limits_removed" "test/negative/sse_prefixed_limits_removed.weft" "error[E4002]: unknown module member 'sse_limits' in import" 1
 check_rejects "sse_reader_constructor_private" "test/negative/sse_reader_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
