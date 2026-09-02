@@ -121,6 +121,8 @@ check_rejects "sse_prefixed_limits_removed" "test/negative/sse_prefixed_limits_r
 check_rejects "sse_reader_constructor_private" "test/negative/sse_reader_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "websocket_message_state_constructor_private" "test/negative/websocket_message_state_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "websocket_stream_constructor_private" "test/negative/websocket_stream_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "websocket_prefixed_limits_removed" "test/negative/websocket_prefixed_limits_removed.weft" "error[E4002]: unknown module member 'websocket_limits' in import" 1
+check_rejects "websocket_stream_prefixed_client_removed" "test/negative/websocket_stream_prefixed_client_removed.weft" "error[E4002]: unknown module member 'websocket_client_stream' in import" 1
 check_rejects "websocket_client_write_requires_random" "test/negative/websocket_client_write_requires_random.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
 check_rejects "dns_resolve_requires_effect" "test/negative/dns_resolve_requires_effect.weft" 'error[E2001]: effect `DnsResolve` is not available in this context'
 check_rejects "dns_policy_requires_authority" "test/negative/dns_policy_requires_authority.weft" 'error[E2001]: effect `DnsResolve` is not available in this context'
