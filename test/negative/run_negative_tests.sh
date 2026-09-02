@@ -637,6 +637,8 @@ check_rejects "iterator_free_functions_retired" "test/negative/iterator_free_fun
 check_rejects "generator_functions_retired" "test/negative/generator_functions_retired.weft" "unknown module member" 8
 check_rejects "channel_functions_retired" "test/negative/channel_functions_retired.weft" "unknown module member" 4
 check_rejects "collection_constructors_retired" "test/negative/collection_constructors_retired.weft" "unknown module member" 4
+check_rejects "map_iterator_helper_retired" "test/negative/map_iterator_helper_retired.weft" "module member" 1
+check_rejects "vector_constructors_retired" "test/negative/vector_constructors_retired.weft" "module member" 4
 check_rejects "state_surface_retired" "test/negative/state_surface_retired.weft" "unknown module member" 4
 check_rejects "effect_interpreters_retired" "test/negative/effect_interpreters_retired.weft" "unknown module member" 2
 check_rejects "ord_compare_retired" "test/negative/ord_compare_retired.weft" "unknown module member" 1

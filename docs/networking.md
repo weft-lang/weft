@@ -10,19 +10,19 @@ Addresses are typed values. Numeric candidates are pure and do not need DNS
 authority:
 
 ```weft run
-use stdlib/dns.{DnsAnyFamily, dns_numeric_candidates}
-use stdlib/net_address.{IpV4, SocketAddress, ipv4_address}
+use stdlib/dns as dns
+use stdlib/dns.{DnsAnyFamily}
+use stdlib/net_address as net
+use stdlib/net_address.{IpV4}
 use stdlib/result.{Err, Ok}
-use stdlib/vector.{vector_len}
-use stdlib/vector/handles.{Vector}
 
 fn main() -> i64 {
-  match dns_numeric_candidates(
-    IpV4(ipv4_address(127, 0, 0, 1)),
+  match dns.numeric_candidates(
+    IpV4(net.ipv4(127, 0, 0, 1)),
     443,
     DnsAnyFamily
   ) {
-    Ok(candidates) -> if vector_len<SocketAddress>(candidates) == 1 { 0 } else { 1 }
+    Ok(candidates) -> if candidates.len() == 1 { 0 } else { 1 }
     Err(error) -> 2
   }
 }
@@ -39,45 +39,48 @@ denied requests return `DnsPolicyDenied` or `TcpPolicyDenied` without reaching
 the platform handler.
 
 ```weft check
-use stdlib/dns.{DnsAnyFamily, DnsError, DnsPolicyAllowOnly, DnsPolicyTarget, DnsResolve, dns_resolve, dns_with_policy}
+use stdlib/dns as dns
+use stdlib/dns.{DnsAnyFamily, DnsError, DnsResolve}
+use stdlib/dns/policy as dns_policy
+use stdlib/dns/policy.{Target}
 use stdlib/idna.{DomainName}
 use stdlib/net_address.{SocketAddress}
 use stdlib/result.{Result}
-use stdlib/tcp.{TcpConnect, TcpConnectPolicyAllowOnly, TcpConnectOptions, TcpError, TcpListen, TcpListenOptions, TcpListenPolicyAllowOnly, TcpListener, TcpStream, tcp_connect, tcp_connect_with_policy, tcp_listen, tcp_listen_with_policy}
-use stdlib/vector.{vector_new, vector_push}
-use stdlib/vector/handles.{Vector}
+use stdlib/tcp as tcp
+use stdlib/tcp.{TcpConnect, TcpConnectOptions, TcpError, TcpListen, TcpListenOptions, TcpListener, TcpStream}
+use stdlib/tcp/connect_policy as connect_policy
+use stdlib/tcp/listen_policy as listen_policy
+use stdlib/vector as vector
+use stdlib/vector.{Vector}
 
 fn resolve_allowed(host: DomainName) -[DnsResolve]> Result<Vector<SocketAddress>, DnsError> {
-  let targets = vector_new<DnsPolicyTarget>()
-  vector_push<DnsPolicyTarget>(targets, DnsPolicyTarget(host, 443))
-  dns_with_policy(
-    DnsPolicyAllowOnly(targets),
-    () => dns_resolve(host, 443, DnsAnyFamily)
-  )
+  let targets = vector.new<Target>()
+  targets.push(dns_policy.Target(host, 443))
+  with dns_policy(dns_policy.allow_only(targets)) {
+    dns.resolve(host, 443, DnsAnyFamily)
+  }
 }
 
 fn connect_allowed(
   address: SocketAddress,
   options: TcpConnectOptions
 ) -[TcpConnect]> Result<owned TcpStream, TcpError> {
-  let addresses = vector_new<SocketAddress>()
-  vector_push<SocketAddress>(addresses, address)
-  tcp_connect_with_policy(
-    TcpConnectPolicyAllowOnly(addresses),
-    () => tcp_connect(address, options)
-  )
+  let addresses = vector.new<SocketAddress>()
+  addresses.push(address)
+  with connect_policy(connect_policy.allow_only(addresses)) {
+    tcp.connect(address, options)
+  }
 }
 
 fn listen_allowed(
   address: SocketAddress,
   options: TcpListenOptions
 ) -[TcpListen]> Result<owned TcpListener, TcpError> {
-  let addresses = vector_new<SocketAddress>()
-  vector_push<SocketAddress>(addresses, address)
-  tcp_listen_with_policy(
-    TcpListenPolicyAllowOnly(addresses),
-    () => tcp_listen(address, options)
-  )
+  let addresses = vector.new<SocketAddress>()
+  addresses.push(address)
+  with listen_policy(listen_policy.allow_only(addresses)) {
+    tcp.listen(address, options)
+  }
 }
 
 fn main() -> i64 { 0 }
