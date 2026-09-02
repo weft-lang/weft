@@ -567,6 +567,8 @@ check_rejects "path_prefixed_constructor_removed" "test/negative/path_prefixed_c
 check_rejects "string_find_is_option" "test/negative/string_find_is_option.weft" 'return value type mismatch: expected `i64`, found `Option<i64>`'
 check_rejects "json_bool_requires_bool" "test/negative/json_bool_requires_bool.weft" 'argument type mismatch: expected `bool`, found `i64`'
 check_rejects "io_helper_effect_unavailable" "test/negative/io_helper_effect_unavailable.weft" "error[E2001]:"
+check_rejects "io_helpers_module_retired" "test/negative/io_helpers_module_retired.weft" "error[E1001]: unknown function 'io_read_all_with'" 1
+check_rejects "io_transfer_functions_retired" "test/negative/io_transfer_functions_retired.weft" "unknown module member" 3
 check_rejects "io_progress_mirrors_retired" "test/negative/io_progress_mirrors_retired.weft" "unknown module member" 3
 check_rejects "io_error_mirrors_retired" "test/negative/io_error_mirrors_retired.weft" "unknown module member" 5
 check_rejects "file_prefixed_read_removed" "test/negative/file_prefixed_read_removed.weft" "error[E4002]: unknown module member 'file_read_all' in import" 1
