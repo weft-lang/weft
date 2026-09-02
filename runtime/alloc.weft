@@ -393,12 +393,90 @@ pub(package) fn heap_contains_range(heap: i64, ptr: i64, size: i64) -> i64 {
   }
 }
 
+pub(package) fn heap_alloc_overflow_unlocked(heap: i64, need: i64, align: i64) -> i64 {
+  -- Overflow reuse is BEST-FIT: LIFO insertion puts the largest
+  -- recently-freed block at the head, and first-fit shreds it into
+  -- fragments for smaller requests. Exact-bin misses do not enter
+  -- this scan until the current arena is exhausted.
+  let mut prev = 0
+  let mut cur = heap_free_head(heap)
+  let mut best = 0
+  let mut best_prev = 0
+  let mut best_size = 0
+  while cur != 0 {
+    let next = heap_free_node_next(cur)
+    let available = heap_free_node_size(cur)
+    if available >= need and alloc_is_aligned(cur, align) {
+      let rem = available - need
+      if rem == 0 or rem >= heap_min_block_size() {
+        if best == 0 or available < best_size {
+          best = cur
+          best_prev = prev
+          best_size = available
+        } else { 0 }
+      } else { 0 }
+    } else { 0 }
+    prev = cur
+    cur = next
+  }
+  if best == 0 { 0 }
+  else {
+    let rem = best_size - need
+    let next = heap_free_node_next(best)
+    let replacement = if rem == 0 { next }
+    else {
+      let split = best + need
+      __mem_store64(split + 8, rem)
+      if rem <= heap_bin_limit() {
+        let cell = heap_bin_cell(heap, rem)
+        __mem_store64(split, __mem_load64(cell))
+        __mem_store64(cell, split)
+        next
+      } else {
+        __mem_store64(split, next)
+        split
+      }
+    }
+    if best_prev == 0 { __mem_store64(heap + 8, replacement) }
+    else { __mem_store64(best_prev, replacement) }
+    best
+  }
+}
+
+pub(package) fn heap_grow_unlocked(heap: i64, need: i64, align: i64) -> i64 {
+  -- Blocks in superseded arenas stay valid and freeable. Growth only
+  -- abandons the old arena's unused tail.
+  let old_arena = heap_arena(heap)
+  let old_cap = arena_capacity(old_arena)
+  let doubled = if old_cap * 2 > need * 2 { old_cap * 2 } else { need * 2 }
+  let grown = arena_new(doubled)
+  if grown == 0 {
+    sys_write(2, __str_ptr("weft: managed heap exhausted and arena growth failed\n"), __str_len("weft: managed heap exhausted and arena growth failed\n"))
+    sys_exit(70)
+    0
+  } else {
+    arena_set_previous(grown, old_arena)
+    __mem_store64(heap, grown)
+    -- If this is the DEFAULT rc heap, refresh the cached arena
+    -- bounds the retain/release magic guard reads (runtime state
+    -- offsets 8 = heap cell, 96/104 = bounds; rc.weft owns the
+    -- offset names but cannot be imported from here).
+    let st = alloc_runtime_state_ptr()
+    if __mem_load64(st + 8) == heap {
+      __mem_store64(st + 96, arena_base(grown))
+      __mem_store64(st + 104, arena_base(grown) + arena_capacity(grown))
+    } else { 0 }
+    arena_alloc(grown, need, align)
+  }
+}
+
 pub(package) fn heap_alloc_unlocked(heap: i64, size: i64, align: i64) -> i64 {
   if heap == 0 { 0 }
   else { if size < 0 { 0 }
   else {
     let need = heap_normalized_size(size)
-    let binned = if need <= heap_bin_limit() and align <= 8 {
+    let exact_size = need <= heap_bin_limit() and align <= 8
+    let binned = if exact_size {
       let cell = heap_bin_cell(heap, need)
       let head = __mem_load64(cell)
       if head != 0 {
@@ -408,83 +486,22 @@ pub(package) fn heap_alloc_unlocked(heap: i64, size: i64, align: i64) -> i64 {
     } else { 0 }
     if binned != 0 { binned }
     else {
-    -- Overflow list scan is BEST-FIT: LIFO insertion puts the largest
-    -- recently-freed block at the head, and first-fit shreds it into
-    -- fragments for small requests, forcing arena bumps when the big
-    -- request comes back around (doubling growth ladders hit this
-    -- systematically). The list is short — bins absorb everything
-    -- <= 256 bytes — so the full scan is cheap.
-    let mut prev = 0
-    let mut cur = heap_free_head(heap)
-    let mut best = 0
-    let mut best_prev = 0
-    let mut best_size = 0
-    while cur != 0 {
-      let next = heap_free_node_next(cur)
-      let available = heap_free_node_size(cur)
-      if available >= need and alloc_is_aligned(cur, align) {
-        let rem = available - need
-        if rem == 0 or rem >= heap_min_block_size() {
-          if best == 0 or available < best_size {
-            best = cur
-            best_prev = prev
-            best_size = available
-          } else { 0 }
-        } else { 0 }
-      } else { 0 }
-      prev = cur
-      cur = next
-    }
-    let result = if best != 0 {
-      let rem = best_size - need
-      let next = heap_free_node_next(best)
-      let replacement = if rem == 0 { next } else {
-        let split = best + need
-        __mem_store64(split, next)
-        __mem_store64(split + 8, rem)
-        split
-      }
-      if best_prev == 0 {
-        __mem_store64(heap + 8, replacement)
-      } else {
-        __mem_store64(best_prev, replacement)
-      }
-      best
-    } else { 0 }
-    if result != 0 { result } else {
-      let direct = arena_alloc(heap_arena(heap), need, align)
-      if direct != 0 { direct }
+      -- A small exact-bin miss is a bump allocation while space
+      -- remains. Scanning the unrelated large-block list here made
+      -- ordinary compiler allocation O(number of overflow nodes).
+      let early_direct = if exact_size { arena_alloc(heap_arena(heap), need, align) }
+        else { 0 }
+      if early_direct != 0 { early_direct }
       else {
-        -- Arena exhausted: chain a larger arena. Blocks in the old
-        -- arena stay valid and freeable (the free list is
-        -- address-based), so growth converts hard exhaustion into a
-        -- bounded leak of the old arena's unused tail. If the OS
-        -- refuses the new mapping, abort with a diagnostic — a null
-        -- return here becomes a store through zero in safe code.
-        let old_arena = heap_arena(heap)
-        let old_cap = arena_capacity(old_arena)
-        let doubled = if old_cap * 2 > need * 2 { old_cap * 2 } else { need * 2 }
-        let grown = arena_new(doubled)
-        if grown == 0 {
-          sys_write(2, __str_ptr("weft: managed heap exhausted and arena growth failed\n"), __str_len("weft: managed heap exhausted and arena growth failed\n"))
-          sys_exit(70)
-          0
-        } else {
-          arena_set_previous(grown, old_arena)
-          __mem_store64(heap, grown)
-          -- If this is the DEFAULT rc heap, refresh the cached arena
-          -- bounds the retain/release magic guard reads (runtime state
-          -- offsets 8 = heap cell, 96/104 = bounds; rc.weft owns the
-          -- offset names but cannot be imported from here).
-          let st = alloc_runtime_state_ptr()
-          if __mem_load64(st + 8) == heap {
-            __mem_store64(st + 96, arena_base(grown))
-            __mem_store64(st + 104, arena_base(grown) + arena_capacity(grown))
-          } else { 0 }
-          arena_alloc(grown, need, align)
+        let recycled = heap_alloc_overflow_unlocked(heap, need, align)
+        if recycled != 0 { recycled }
+        else {
+          let late_direct = if exact_size { 0 }
+            else { arena_alloc(heap_arena(heap), need, align) }
+          if late_direct != 0 { late_direct }
+          else { heap_grow_unlocked(heap, need, align) }
         }
       }
-    }
     }
   } }
 }
