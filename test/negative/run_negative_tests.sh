@@ -854,9 +854,10 @@ check_rejects "anonymous_record_expr_arg_mismatch" "test/negative/anonymous_reco
 check_rejects "anonymous_record_expr_missing_field" "test/negative/anonymous_record_expr_missing_field.weft" 'error[E1002]: argument type mismatch: expected `{x: i64, y: i64}`, found `{x: i64}`'
 check_rejects "structural_complement_rejects_field" "test/negative/structural_complement_rejects_field.weft" 'error[E1002]: argument type mismatch: expected `{..} & ~{email: any, ..}`, found `{email: str}`'
 check_rejects "diagnostic_report_wrong_type" "test/negative/diagnostic_report_wrong_type.weft" 'error[E1002]: argument type mismatch: expected `Diagnostic`, found `str`'
-check_rejects "diagnostic_constructor_wrong_location" "test/negative/diagnostic_constructor_wrong_location.weft" 'error[E1002]: argument type mismatch: expected `schema.DiagnosticLocation`, found `i64`'
+check_rejects "diagnostic_constructor_wrong_location" "test/negative/diagnostic_constructor_wrong_location.weft" 'error[E1002]: argument type mismatch: expected `DiagnosticLocation`, found `i64`'
 check_rejects "semantic_render_functions_retired" "test/negative/semantic_render_functions_retired.weft" "unknown module member" 3
 check_rejects "diagnostic_value_accessors_retired" "test/negative/diagnostic_value_accessors_retired.weft" "unknown module member" 20
+check_rejects "diagnostic_helper_mirrors_retired" "test/negative/diagnostic_helper_mirrors_retired.weft" "unknown module member" 6
 check_rejects "tuple_expr_arg_mismatch" "test/negative/tuple_expr_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `(i64, str)`, found `(i64, i64)`'
 check_rejects "tuple_expr_singleton_requires_comma" "test/negative/tuple_expr_singleton_requires_comma.weft" 'error[E1002]: argument type mismatch: expected `(i64,)`, found `i64`'
 check_rejects "record_pattern_duplicate_field" "test/negative/record_pattern_duplicate_field.weft" "type error: duplicate record pattern field"
