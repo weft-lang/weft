@@ -855,6 +855,7 @@ check_rejects "anonymous_record_expr_missing_field" "test/negative/anonymous_rec
 check_rejects "structural_complement_rejects_field" "test/negative/structural_complement_rejects_field.weft" 'error[E1002]: argument type mismatch: expected `{..} & ~{email: any, ..}`, found `{email: str}`'
 check_rejects "diagnostic_report_wrong_type" "test/negative/diagnostic_report_wrong_type.weft" 'error[E1002]: argument type mismatch: expected `Diagnostic`, found `str`'
 check_rejects "diagnostic_constructor_wrong_location" "test/negative/diagnostic_constructor_wrong_location.weft" 'error[E1002]: argument type mismatch: expected `schema.DiagnosticLocation`, found `i64`'
+check_rejects "semantic_render_functions_retired" "test/negative/semantic_render_functions_retired.weft" "unknown module member" 3
 check_rejects "tuple_expr_arg_mismatch" "test/negative/tuple_expr_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `(i64, str)`, found `(i64, i64)`'
 check_rejects "tuple_expr_singleton_requires_comma" "test/negative/tuple_expr_singleton_requires_comma.weft" 'error[E1002]: argument type mismatch: expected `(i64,)`, found `i64`'
 check_rejects "record_pattern_duplicate_field" "test/negative/record_pattern_duplicate_field.weft" "type error: duplicate record pattern field"
