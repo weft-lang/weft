@@ -466,6 +466,7 @@ check_rejects "env_arg_requires_missing_case" "test/negative/env_arg_requires_mi
 check_rejects "env_var_requires_effect" "test/negative/env_var_requires_effect.weft" "error[E2001]:"
 check_rejects "env_raw_getenv_requires_trusted" "test/negative/env_raw_getenv_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "time_now_nanos_requires_effect" "test/negative/time_now_nanos_requires_effect.weft" "error[E2001]:"
+check_rejects "time_platform_wrappers_retired" "test/negative/time_platform_wrappers_retired.weft" "error[E4002]: unknown module member 'runtime_platform_time' in import" 2
 check_rejects "time_sleep_requires_effect" "test/negative/time_sleep_requires_effect.weft" "error[E2001]:"
 check_rejects "time_raw_clock_requires_trusted" "test/negative/time_raw_clock_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "time_raw_sleep_requires_trusted" "test/negative/time_raw_sleep_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
