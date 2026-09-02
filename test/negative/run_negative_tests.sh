@@ -298,7 +298,7 @@ check_rejects "instance_method_type_call" "test/negative/instance_method_type_ca
 check_rejects "option_unwrap_or_type_mismatch" "test/negative/option_unwrap_or_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
 check_rejects "result_unwrap_or_type_mismatch" "test/negative/result_unwrap_or_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
 check_rejects "list_prepend_type_mismatch" "test/negative/list_prepend_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
-check_rejects "vector_cross_type_push" "test/negative/vector_cross_type_push.weft" 'error[E1002]: argument type mismatch: expected `Vector<str>`, found `Vector<i64>`'
+check_rejects "vector_cross_type_push" "test/negative/vector_cross_type_push.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "persistent_vector_cross_type_push" "test/negative/persistent_vector_cross_type_push.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "vector_sort_missing_ord" "test/negative/vector_sort_missing_ord.weft" "error[E1004]:"
 check_rejects "vector_sort_effectful_comparator" "test/negative/vector_sort_effectful_comparator.weft" 'error[E1002]: argument type mismatch: expected `(i64, i64) -> Ordering`, found `(i64, i64) -[SortNoise]> Ordering`'
