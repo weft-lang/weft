@@ -110,6 +110,8 @@ check_rejects "http_json_prefixed_document_value_removed" "test/negative/http_js
 check_rejects "http_json_prefixed_document_trailers_removed" "test/negative/http_json_prefixed_document_trailers_removed.weft" "error[E4002]: unknown module member 'http_json_document_trailers' in import" 1
 check_rejects "http_json_prefixed_failure_error_removed" "test/negative/http_json_prefixed_failure_error_removed.weft" "error[E4002]: unknown module member 'http_json_failure_error' in import" 1
 check_rejects "http_json_prefixed_failure_trailers_removed" "test/negative/http_json_prefixed_failure_trailers_removed.weft" "error[E4002]: unknown module member 'http_json_failure_trailers' in import" 1
+check_rejects "http_replay_prefixed_fixture_removed" "test/negative/http_replay_prefixed_fixture_removed.weft" "error[E4002]: unknown module member 'http_replay_fixture' in import" 1
+check_rejects "http_replay_prefixed_stats_removed" "test/negative/http_replay_prefixed_stats_removed.weft" "error[E4002]: unknown module member 'http_replay_stats' in import" 1
 check_rejects "tls_raw_backend_private" "test/negative/tls_raw_backend_private.weft" "module member 'tls_mbedtls_handshake' is not visible in this import" 1
 check_rejects "tls_session_use_after_move" "test/negative/tls_session_use_after_move.weft" "type error: owned value used more than once"
 check_rejects "tls_stream_constructor_private" "test/negative/tls_stream_constructor_private.weft" "opaque constructor is private to its declaring module"
