@@ -491,6 +491,7 @@ check_rejects "path_prefixed_constructor_removed" "test/negative/path_prefixed_c
 check_rejects "io_helper_effect_unavailable" "test/negative/io_helper_effect_unavailable.weft" "error[E2001]:"
 check_rejects "file_read_cannot_write" "test/negative/file_read_cannot_write.weft" "error[E2001]:"
 check_rejects "dir_inspect_cannot_mutate" "test/negative/dir_inspect_cannot_mutate.weft" "error[E2001]:"
+check_rejects "dir_prefixed_list_removed" "test/negative/dir_prefixed_list_removed.weft" "error[E4002]: unknown module member 'dir_list' in import" 1
 check_rejects "console_cannot_write_file" "test/negative/console_cannot_write_file.weft" "error[E2001]:"
 check_rejects "safe_io_platform_residual_effect" "test/negative/safe_io_platform_residual_effect.weft" "error[E2001]:"
 check_rejects "if_condition_not_bool" "test/negative/if_condition_not_bool.weft" "type error: boolean expression is not bool"
