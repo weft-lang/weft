@@ -485,6 +485,7 @@ check_rejects "file_handle_record_fabrication" "test/negative/file_handle_record
 check_rejects "file_handle_field_private" "test/negative/file_handle_field_private.weft" "type error: unknown field"
 check_rejects "file_handle_raw_factory_private" "test/negative/file_handle_raw_factory_private.weft" "module member 'io_file_from_fd' is not visible in this import"
 check_rejects "bytes_constructor_private" "test/negative/bytes_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "bytes_prefixed_constructor_removed" "test/negative/bytes_prefixed_constructor_removed.weft" "error[E4002]: unknown module member 'bytes_from_str' in import" 1
 check_rejects "path_constructor_private" "test/negative/path_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "io_helper_effect_unavailable" "test/negative/io_helper_effect_unavailable.weft" "error[E2001]:"
 check_rejects "file_read_cannot_write" "test/negative/file_read_cannot_write.weft" "error[E2001]:"
