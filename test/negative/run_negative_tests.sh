@@ -521,7 +521,7 @@ check_rejects "num_u32_to_f64_arg_mismatch" "test/negative/num_u32_to_f64_arg_mi
 check_rejects "intrinsic_u64_to_f64_arg_mismatch" "test/negative/intrinsic_u64_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u64`, found `i64`'
 check_rejects "num_f64_to_i64_exact_arg_mismatch" "test/negative/num_f64_to_i64_exact_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
 check_rejects "num_parse_f64_default_mismatch" "test/negative/num_parse_f64_default_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `str`'
-check_rejects "num_parse_float_lane_mismatch" "test/negative/num_parse_float_lane_mismatch.weft" 'error[E1002]: argument type mismatch: expected `NumParseF64`, found `NumParseF32`'
+check_rejects "num_parse_float_lane_mismatch" "test/negative/num_parse_float_lane_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `Result<f64, NumParseError>`, found `Result<f32, NumParseError>`'
 check_rejects "intrinsic_f64_to_i64_arg_mismatch" "test/negative/intrinsic_f64_to_i64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
 check_rejects "num_f32_to_f64_arg_mismatch" "test/negative/num_f32_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f32`, found `f64`'
 check_rejects "num_f64_to_f32_round_arg_mismatch" "test/negative/num_f64_to_f32_round_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
