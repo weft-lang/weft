@@ -87,11 +87,11 @@ check_rejects "spawn_task_constructor_private" "test/negative/spawn_task_constru
 check_rejects "cancellation_request_requires_effect" "test/negative/cancellation_request_requires_effect.weft" 'error[E2001]: effect `Cancellation` is not available in this context'
 check_rejects "cancellation_checkpoint_requires_effect" "test/negative/cancellation_checkpoint_requires_effect.weft" 'error[E2001]: effects `Cancellation, Fail<cancellation.CancellationReason>` are not available in this context'
 check_rejects "cancellation_deadline_requires_time" "test/negative/cancellation_deadline_requires_time.weft" 'error[E2001]: effect `Time` is not available in this context'
-check_rejects "generator_generic_new_non_literal_producer" "test/negative/generator_generic_new_non_literal_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
-check_rejects "generator_generic_new_function_with_arg" "test/negative/generator_generic_new_function_with_arg.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
-check_rejects "generator_generic_new_mutable_closure_producer" "test/negative/generator_generic_new_mutable_closure_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
-check_rejects "generator_generic_new_return_type_mismatch" "test/negative/generator_generic_new_return_type_mismatch.weft" 'error[E1002]: lambda return value type mismatch: expected `i64`, found `str`'
-check_rejects "generator_generic_yield_unhandled" "test/negative/generator_generic_yield_unhandled.weft" "error[E2001]:"
+check_rejects "generator_start_non_literal_producer" "test/negative/generator_start_non_literal_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
+check_rejects "generator_start_function_with_arg" "test/negative/generator_start_function_with_arg.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
+check_rejects "generator_start_mutable_closure_producer" "test/negative/generator_start_mutable_closure_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
+check_rejects "generator_start_return_type_mismatch" "test/negative/generator_start_return_type_mismatch.weft" 'error[E1002]: lambda return value type mismatch: expected `i64`, found `str`'
+check_rejects "generator_yield_unhandled" "test/negative/generator_yield_unhandled.weft" "error[E2001]:"
 check_rejects "unhandled_effect_perform" "test/negative/unhandled_effect_perform.weft" 'error[E2001]: effect `State` is not available in this context'
 check_rejects "source_acquire_requires_effect" "test/negative/source_acquire_requires_effect.weft" 'error[E2001]: effect `SourceAcquire` is not available in this context'
 check_rejects "secure_random_effect_unavailable" "test/negative/secure_random_effect_unavailable.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
@@ -632,6 +632,7 @@ check_rejects "math_scalar_functions_retired" "test/negative/math_scalar_functio
 check_rejects "utf8_prefixed_surface_retired" "test/negative/utf8_prefixed_surface_retired.weft" "unknown module member" 7
 check_rejects "unicode_prefixed_surface_retired" "test/negative/unicode_prefixed_surface_retired.weft" "unknown module member" 56
 check_rejects "iterator_free_functions_retired" "test/negative/iterator_free_functions_retired.weft" "unknown module member" 10
+check_rejects "generator_functions_retired" "test/negative/generator_functions_retired.weft" "unknown module member" 8
 check_rejects "state_surface_retired" "test/negative/state_surface_retired.weft" "unknown module member" 4
 check_rejects "effect_interpreters_retired" "test/negative/effect_interpreters_retired.weft" "unknown module member" 2
 check_rejects "ord_compare_retired" "test/negative/ord_compare_retired.weft" "unknown module member" 1

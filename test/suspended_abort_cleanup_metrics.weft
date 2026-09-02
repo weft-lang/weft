@@ -6,6 +6,7 @@ use compiler/macho.{*}
 use compiler/object.{*}
 use compiler/ir.{*}
 use compiler/grammar.{*}
+use compiler/module.{module_decl_fact_find, module_decl_fact_native_key_or, module_decl_namespace_value}
 use compiler/pipeline.{*}
 use compiler/lib.{*}
 use compiler/type_registry.{*}
@@ -237,9 +238,12 @@ fn suspended_cleanup_metric_abort_owned_facts(ir: IrModule, fns: i64, fn_name: s
 -- Snapshot one already-compiled embedded specimen as [summary, fact...,
 -- missing-home bitset]. Fact assertions are intentionally dense, but repeated
 -- full pipeline runs would make this semantic pin dominate suite latency.
-fn suspended_cleanup_metric_snapshot(ir: IrModule, fns: i64, fn_name: str) -> i64 {
+fn suspended_cleanup_metric_snapshot(ir: IrModule, fns: i64, tt: i64, fn_name: str, source: i64) -> i64 {
   let out = nlist_new()
-  let wanted = str_hash(__str_ptr(fn_name), 0, __str_len(fn_name))
+  let name_hash = str_hash(__str_ptr(fn_name), 0, __str_len(fn_name))
+  let declaration = if source == 0 { 0 }
+    else { module_decl_fact_find(tt, source, module_decl_namespace_value(), __str_ptr(fn_name), 0, __str_len(fn_name)) }
+  let wanted = module_decl_fact_native_key_or(declaration, name_hash)
   match pipeline_ir_function_list_find_hash(pipeline_ir_functions(ir), wanted) {
     IrFunctionNil -> { nlist_add(out, 0 - 1) nlist_add(out, 0 - 1) }
     IrFunctionCons(fn_ir, rest) -> match fn_ir {
@@ -420,18 +424,21 @@ fn main() -> i64 { run(runtime_rc_probe_new(17)) }
 "
   let typed = pipeline_check_source_with_origin_standalone(__str_ptr(src), __str_len(src), 1, 0)
   let fns = match typed { TypedModule(entries, source, tt) -> entries }
+  let tt = match typed { TypedModule(entries, source, table) -> table }
   let ir = pipeline_optimise_typed_ir(typed, pipeline_lower_ir(typed))
-  let snapshot = suspended_cleanup_metric_snapshot(ir, fns, "f")
+  let snapshot = suspended_cleanup_metric_snapshot(ir, fns, tt, "f", __str_ptr(src))
   -- One closure object and one explicit retain stake. The borrowed PtrLoad
   -- feeding that retain is not a third acquisition.
   Test.assert_eq(nlist_get(snapshot, 0), 20110)
   Test.assert_eq(nlist_get(snapshot, 1), 1001021)
   Test.assert_eq(nlist_get(snapshot, 2), 17014011)
   Test.assert_eq(nlist_get(snapshot, 3), 0)
-  let run_snapshot = suspended_cleanup_metric_snapshot(ir, fns, "run")
-  Test.assert_eq(nlist_get(run_snapshot, 0), 10100)
-  Test.assert_eq(nlist_get(run_snapshot, 1), 1000011)
-  Test.assert_eq(nlist_get(run_snapshot, 2), 0)
+  -- `run` is inlined into `main`; select the root declaration by its native
+  -- identity because stdlib modules also define functions named `main`/`run`.
+  let main_snapshot = suspended_cleanup_metric_snapshot(ir, fns, tt, "main", __str_ptr(src))
+  Test.assert_eq(nlist_get(main_snapshot, 0), 10100)
+  Test.assert_eq(nlist_get(main_snapshot, 1), 1001011)
+  Test.assert_eq(nlist_get(main_snapshot, 2), 0)
 }
 
 test "defer_cleanup_fact_survives_optimisation" {
@@ -446,15 +453,16 @@ fn main() -> i64 { run(runtime_rc_probe_new(17)) }
 "
   let typed = pipeline_check_source_with_origin_standalone(__str_ptr(src), __str_len(src), 1, 0)
   let fns = match typed { TypedModule(entries, source, tt) -> entries }
+  let tt = match typed { TypedModule(entries, source, table) -> table }
   let ir = pipeline_optimise_typed_ir(typed, pipeline_lower_ir(typed))
-  let defer_snapshot = suspended_cleanup_metric_snapshot(ir, fns, "f")
+  let defer_snapshot = suspended_cleanup_metric_snapshot(ir, fns, tt, "f", __str_ptr(src))
   Test.assert_eq(nlist_get(defer_snapshot, 0), 20010)
   Test.assert_eq(nlist_get(defer_snapshot, 3), 0)
   let pre_promotion = pipeline_optimise_typed_ir_pre_promotion(typed, pipeline_lower_ir(typed))
   Test.assert_eq(suspended_cleanup_metric_defer_calls(pre_promotion, "f"), 1)
   let semantic_facts = pipeline_ir_semantic_facts_from_fns(fns, 0)
   Test.assert_eq(pipeline_ir_semantic_fact_lookup_pure(semantic_facts, pipeline_runtime_defer_abort_cleanup_hash()), 0)
-  let runtime_snapshot = suspended_cleanup_metric_snapshot(ir, fns, "runtime_generator_state_drop")
+  let runtime_snapshot = suspended_cleanup_metric_snapshot(ir, fns, tt, "runtime_generator_state_drop", 0)
   Test.assert_eq(nlist_get(runtime_snapshot, 0), 20200)
   Test.assert_eq(nlist_get(runtime_snapshot, 1), 11011011)
   Test.assert_eq(nlist_get(runtime_snapshot, 2), 23023011)
@@ -463,17 +471,17 @@ fn main() -> i64 { run(runtime_rc_probe_new(17)) }
 
 test "ignored_managed_results_keep_abort_cleanup_homes" {
   let src = "use runtime/rc_implicit_test.{*}
-use stdlib/generator.{*}
+use stdlib/generator as generator
 effect E { fn stop(value: i64) -> i64 }
 fn f(payload: RuntimeRcProbe) -[E]> i64 {
   let producer = () => {
-    generator_yield<i64>(7)
+    generator.yield<i64>(7)
     payload
   }
-  let g = generator_new<i64, RuntimeRcProbe>(producer)
-  defer generator_drop<i64, RuntimeRcProbe>(g)
-  generator_next<i64, RuntimeRcProbe>(g)
-  generator_next<i64, RuntimeRcProbe>(g)
+  let g = generator.start<i64, RuntimeRcProbe>(producer)
+  defer g.close()
+  g.next()
+  g.next()
   E.stop(42) + 1000
 }
 fn run(payload: RuntimeRcProbe) -> i64 { handle f(payload) { E.stop(value) -> value } }
@@ -481,9 +489,10 @@ fn main() -> i64 { run(runtime_rc_probe_new(23)) }
 "
   let typed = pipeline_check_source_with_origin_standalone(__str_ptr(src), __str_len(src), 1, 0)
   let fns = match typed { TypedModule(entries, source, tt) -> entries }
+  let tt = match typed { TypedModule(entries, source, table) -> table }
   let ir = pipeline_optimise_typed_ir(typed, pipeline_lower_ir(typed))
-  let snapshot = suspended_cleanup_metric_snapshot(ir, fns, "f")
-  Test.assert_eq(nlist_get(snapshot, 0), 70330)
+  let snapshot = suspended_cleanup_metric_snapshot(ir, fns, tt, "f", __str_ptr(src))
+  Test.assert_eq(nlist_get(snapshot, 0), 90530)
   Test.assert_eq(nlist_get(snapshot, 1), 1001021)
   -- Generic RC transport of a closure still requires closure teardown at
   -- count zero so its captured environment is walked.
@@ -491,9 +500,13 @@ fn main() -> i64 { run(runtime_rc_probe_new(23)) }
   Test.assert_eq(nlist_get(snapshot, 3), 4004011)
   Test.assert_eq(nlist_get(snapshot, 4), 5005021)
   Test.assert_eq(nlist_get(snapshot, 5), 5005091)
-  Test.assert_eq(nlist_get(snapshot, 6), 7007011)
+  Test.assert_eq(nlist_get(snapshot, 6), 7004011)
   Test.assert_eq(nlist_get(snapshot, 7), 8008011)
-  Test.assert_eq(nlist_get(snapshot, 8), 0)
+  -- Receiver-method transport contributes one balanced managed stake per
+  -- ignored `next` call; both remain homed across the later abort edge.
+  Test.assert_eq(nlist_get(snapshot, 8), 9004011)
+  Test.assert_eq(nlist_get(snapshot, 9), 10010011)
+  Test.assert_eq(nlist_get(snapshot, 10), 0)
 }
 
 test "ignored_managed_result_cleanup_use_has_a_positional_interval" {
