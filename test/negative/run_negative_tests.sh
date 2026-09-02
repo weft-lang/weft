@@ -109,6 +109,8 @@ check_rejects "tls_stream_constructor_private" "test/negative/tls_stream_constru
 check_rejects "net_address_constructor_private" "test/negative/net_address_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "net_address_projection_private" "test/negative/net_address_projection_private.weft" "type error: opaque projection pattern is private to its declaring module; use an exported accessor"
 check_rejects "net_prefixed_parser_removed" "test/negative/net_prefixed_parser_removed.weft" "error[E4002]: unknown module member 'socket_address_parse' in import" 1
+check_rejects "dns_prefixed_resolve_removed" "test/negative/dns_prefixed_resolve_removed.weft" "error[E4002]: unknown module member 'dns_resolve' in import" 1
+check_rejects "idna_prefixed_parse_removed" "test/negative/idna_prefixed_parse_removed.weft" "error[E4002]: unknown module member 'domain_name_parse' in import" 1
 check_rejects "idna_domain_constructor_private" "test/negative/idna_domain_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "idna_domain_projection_private" "test/negative/idna_domain_projection_private.weft" "type error: opaque projection pattern is private to its declaring module; use an exported accessor"
 check_rejects "url_constructor_private" "test/negative/url_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
