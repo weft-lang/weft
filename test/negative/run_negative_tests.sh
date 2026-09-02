@@ -634,6 +634,7 @@ check_rejects "unicode_prefixed_surface_retired" "test/negative/unicode_prefixed
 check_rejects "iterator_free_functions_retired" "test/negative/iterator_free_functions_retired.weft" "unknown module member" 10
 check_rejects "state_surface_retired" "test/negative/state_surface_retired.weft" "unknown module member" 4
 check_rejects "effect_interpreters_retired" "test/negative/effect_interpreters_retired.weft" "unknown module member" 2
+check_rejects "ord_compare_retired" "test/negative/ord_compare_retired.weft" "unknown module member" 1
 check_rejects "f64_table_prefixed_surface_retired" "test/negative/f64_table_prefixed_surface_retired.weft" "in import" 4
 check_rejects "f64_table_constructor_private" "test/negative/f64_table_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "intrinsic_f64_sqrt_arg_mismatch" "test/negative/intrinsic_f64_sqrt_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
