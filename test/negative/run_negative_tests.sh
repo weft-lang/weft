@@ -236,6 +236,8 @@ check_rejects "iter_fold_effectful_callback" "test/negative/iter_fold_effectful_
 check_rejects "iter_map_collect_effectful_callback" "test/negative/iter_map_collect_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_map_effectful_callback" "test/negative/iter_map_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_filter_effectful_callback" "test/negative/iter_filter_effectful_callback.weft" "error[E2001]:"
+check_rejects "iterator_collect_item_mismatch" "test/negative/iterator_collect_item_mismatch.weft" "type error: associated type constraint mismatch"
+check_rejects "iterator_collect_missing_impl" "test/negative/iterator_collect_missing_impl.weft" 'error[E1004]: type `NotACollection` does not implement `Collect`'
 check_rejects "effectful_lambda_to_pure_effect_op" "test/negative/effectful_lambda_to_pure_effect_op.weft" "error[E2001]:"
 check_rejects "function_value_effect_unavailable" "test/negative/function_value_effect_unavailable.weft" "error[E2001]:"
 check_rejects "function_value_arg_mismatch" "test/negative/function_value_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
