@@ -268,6 +268,11 @@ check_rejects "trait_assoc_extra" "test/negative/trait_assoc_extra.weft" "type e
 check_rejects "trait_assoc_bound_concrete" "test/negative/trait_assoc_bound_concrete.weft" 'error[E1004]: type `str` does not implement `AssocBoundConcreteValue`'
 check_rejects "trait_assoc_bound_generic" "test/negative/trait_assoc_bound_generic.weft" 'error[E1004]: type `T` does not implement `AssocBoundGenericValue`'
 check_rejects "trait_assoc_signature_mismatch" "test/negative/trait_assoc_signature_mismatch.weft" "type error: impl method parameter type mismatch"
+check_rejects "trait_assoc_constraint_mismatch" "test/negative/trait_assoc_constraint_mismatch.weft" "type error: associated type constraint mismatch"
+check_rejects "trait_assoc_constraint_unknown" "test/negative/trait_assoc_constraint_unknown.weft" "type error: unknown associated type in trait constraint"
+check_rejects "trait_assoc_constraint_duplicate" "test/negative/trait_assoc_constraint_duplicate.weft" "type error: duplicate associated type constraint"
+check_rejects "trait_assoc_constraint_conditional_impl" "test/negative/trait_assoc_constraint_conditional_impl.weft" 'error[E1004]: type `ConditionalWrapper<ConditionalText>` does not implement `ConditionalEvidence`'
+check_rejects "trait_assoc_constraint_missing_type" "test/negative/trait_assoc_constraint_missing_type.weft" "error[E0002]: expected type after associated-type '='"
 check_rejects "trait_impl_conflict" "test/negative/trait_impl_conflict.weft" "type error: conflicting implementations of trait for type"
 check_rejects "ord_missing_impl" "test/negative/ord_missing_impl.weft" 'error[E1004]: type `Unordered` does not implement `Ord`'
 check_rejects "ord_operand_mismatch" "test/negative/ord_operand_mismatch.weft" "type error: ordering operand type mismatch"
