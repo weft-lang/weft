@@ -60,7 +60,7 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 **Pre-alpha and self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root. Until the public-alpha gate closes, source, package, fact-schema, and versioned native-binding contracts may change without compatibility support.
 
-- 4326 runtime test blocks across 349 files, plus 831 negative (must-fail) cases
+- 4361 runtime test blocks across 354 files, plus 940 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
 - Current release gates: the complete target-local Linux suite on adequate hardware, hardening/governance, final status/support documentation, and the two-target outside-user exercise. Install/release UX, project signing, free community macOS distribution, and native-binding platform diagnostics are complete
@@ -236,16 +236,17 @@ Application code just writes `T`. The compiler classifies storage (stack, inline
 
 ```weft check
 use stdlib/fail.{Fail}
-use stdlib/file.{file_close, file_open_read}
-use stdlib/io.{FileHandle, IO}
+use stdlib/file as file
+use stdlib/file.{FileHandle}
+use stdlib/io.{IO}
 use stdlib/io/types.{IoError}
 use stdlib/path.{Path}
 use stdlib/result.{Result}
 
 -- owned resource: one owner, explicit consuming close
 fn open_and_close(path: Path) -[IO, Fail<IoError>]> Result<nil, IoError> {
-  let file: owned FileHandle = file_open_read(path)
-  file_close(file)
+  let stream: owned FileHandle = file.open_read(path)
+  stream.close()
 }
 ```
 
