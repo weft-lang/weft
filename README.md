@@ -5,36 +5,44 @@ A compiled, general-purpose language with set-theoretic types, algebraic effects
 **Every type is a set. Every side effect is in the signature.**
 
 ```weft run
-use runtime/safe_io.{runtime_platform_console_write}
-use stdlib/console.{ConsoleWrite, console_print_text}
-use stdlib/result.{Err, Ok}
-use stdlib/string.{str_concat}
+use runtime/console_write as terminal
+use stdlib/console.{println}
+use stdlib/display.{Display}
+
+default handler terminal()
+
+trait Greeting {
+  fn greeting(self) -> str
+}
+
+impl Greeting for str {
+  fn greeting(self: str) -> str { "hello, {self}!" }
+}
 
 effect Greet {
-  fn greet(name: str) -> nil
+  fn say(message: str) -> nil
 }
 
-fn hello() -[Greet]> nil {
-  Greet.greet("world")
+fn welcome<T: Greeting>(guest: T) -[Greet]> nil {
+  Greet.say(guest.greeting())
 }
 
-fn run() -[ConsoleWrite]> i64 {
-  handle hello() {
-    Greet.greet(name) -> {
-      match console_print_text(str_concat(str_concat("hello ", name), "\n")) {
-        Ok(count) -> 0
-        Err(error) -> 0
-      }
+fn main() -> nil {
+  handle welcome<str>("world") {
+    Greet.say(message) -> {
+      println(message)
       resume(nil)
     }
   }
-  0
-}
-
-fn main() -> i64 {
-  runtime_platform_console_write(run)
 }
 ```
+
+The trait is pure, `Greet` describes the program's intent, and its handler
+chooses terminal output as the interpretation. `default handler terminal()`
+installs the production `ConsoleWrite` implementation for the module. Normal
+`nil` completion means exit status 0. `println` is the terminal-on-write-error
+convenience; `try_println` preserves `Result<usize, IoError>` when recovery is
+part of the program. No runtime callback or ignored error is hiding here.
 
 Every Weft example in this README is checked by the suite; complete programs
 are compiled and run with the checked-in `./weft` binary.

@@ -2111,6 +2111,7 @@ assert_program_failure_contains "checked_slice_order_panic" "test/array_slice_or
 assert_program_failure_contains "checked_slice_upper_panic" "test/array_slice_upper_oob_exit.weft" "101" "weft: panic: index out of bounds"
 assert_program_failure_contains "result_unwrap_panic" "test/result_unwrap_exit.weft" "101" "weft: panic: Result.unwrap called on Err"
 assert_program_failure_contains "result_expect_panic" "test/result_expect_exit.weft" "101" "weft: panic: required result failed"
+assert_program_failure_contains "console_output_panic" "test/console_output_exit.weft" "101" "weft: panic: console output failed"
 assert_program_failure_contains "option_unwrap_panic" "test/option_unwrap_exit.weft" "101" "weft: panic: Option.unwrap called on None"
 assert_program_failure_contains "option_expect_panic" "test/option_expect_exit.weft" "101" "weft: panic: required option missing"
 
