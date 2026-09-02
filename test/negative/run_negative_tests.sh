@@ -260,6 +260,7 @@ check_rejects "unsafe_int_to_ptr_addr_mismatch" "test/negative/unsafe_int_to_ptr
 check_rejects "unsafe_transmute_arity_mismatch" "test/negative/unsafe_transmute_arity_mismatch.weft" "type error: arity mismatch"
 check_rejects "unsafe_runtime_state_wrapper_requires_effect" "test/negative/unsafe_runtime_state_wrapper_requires_effect.weft" "error[E2001]:"
 check_rejects "unsafe_process_run_command_requires_effect" "test/negative/unsafe_process_run_command_requires_effect.weft" "error[E2001]:"
+check_rejects "process_platform_wrappers_retired" "test/negative/process_platform_wrappers_retired.weft" "error[E4002]: unknown module member 'runtime_platform_proc' in import" 3
 check_rejects "unsafe_method_call_requires_effect" "test/negative/unsafe_method_call_requires_effect.weft" "error[E2001]:"
 check_rejects "unsafe_lambda_to_pure_fn" "test/negative/unsafe_lambda_to_pure_fn.weft" "error[E2001]:"
 check_rejects "non_unsafe_handler_raw_call" "test/negative/non_unsafe_handler_raw_call.weft" "error[E2001]:"
