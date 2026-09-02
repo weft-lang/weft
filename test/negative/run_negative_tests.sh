@@ -613,17 +613,14 @@ check_rejects "u8_i8_arithmetic_mismatch" "test/negative/u8_i8_arithmetic_mismat
 check_rejects "u32_i32_comparison_mismatch" "test/negative/u32_i32_comparison_mismatch.weft" "type error: comparison operand type mismatch"
 check_rejects "usize_i64_assignment_mismatch" "test/negative/usize_i64_assignment_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `usize`, found `i64`'
 check_rejects "u8_call_i64_arg_mismatch" "test/negative/u8_call_i64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u8`, found `i64`'
-check_rejects "num_i64_to_f64_arg_mismatch" "test/negative/num_i64_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `f64`'
 check_rejects "intrinsic_i64_to_f64_arg_mismatch" "test/negative/intrinsic_i64_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `f64`'
-check_rejects "num_u32_to_f64_arg_mismatch" "test/negative/num_u32_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u32`, found `i32`'
 check_rejects "intrinsic_u64_to_f64_arg_mismatch" "test/negative/intrinsic_u64_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u64`, found `i64`'
 check_rejects "num_to_i64_exact_wrong_receiver" "test/negative/num_to_i64_exact_wrong_receiver.weft" "type error: unknown method"
 check_rejects "num_parse_f64_default_mismatch" "test/negative/num_parse_f64_default_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `str`'
 check_rejects "num_parse_float_lane_mismatch" "test/negative/num_parse_float_lane_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `Result<f64, num.NumParseError>`, found `Result<f32, num.NumParseError>`'
 check_rejects "intrinsic_f64_to_i64_arg_mismatch" "test/negative/intrinsic_f64_to_i64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
 check_rejects "num_to_f64_receiver_mismatch" "test/negative/num_to_f64_receiver_mismatch.weft" "unknown method"
-check_rejects "num_f64_to_f32_round_arg_mismatch" "test/negative/num_f64_to_f32_round_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
-check_rejects "num_i32_to_f32_round_arg_mismatch" "test/negative/num_i32_to_f32_round_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i32`, found `u32`'
+check_rejects "num_to_f32_round_receiver_mismatch" "test/negative/num_to_f32_round_receiver_mismatch.weft" "unknown method"
 check_rejects "intrinsic_f32_to_f64_arg_mismatch" "test/negative/intrinsic_f32_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f32`, found `f64`'
 check_rejects "intrinsic_f64_to_f32_arg_mismatch" "test/negative/intrinsic_f64_to_f32_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
 check_rejects "intrinsic_i16_to_f32_arg_mismatch" "test/negative/intrinsic_i16_to_f32_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i16`, found `u16`'
@@ -643,7 +640,7 @@ check_rejects "state_surface_retired" "test/negative/state_surface_retired.weft"
 check_rejects "effect_interpreters_retired" "test/negative/effect_interpreters_retired.weft" "unknown module member" 2
 check_rejects "ord_compare_retired" "test/negative/ord_compare_retired.weft" "unknown module member" 1
 check_rejects "num_trait_forwarders_retired" "test/negative/num_trait_forwarders_retired.weft" "unknown module member" 9
-check_rejects "num_value_functions_retired" "test/negative/num_value_functions_retired.weft" "unknown module member" 17
+check_rejects "num_value_functions_retired" "test/negative/num_value_functions_retired.weft" "unknown module member" 38
 check_rejects "num_parse_functions_retired" "test/negative/num_parse_functions_retired.weft" "unknown module member" 6
 check_rejects "mini_sql_grammar_retired" "test/negative/mini_sql_grammar_retired.weft" "unknown module member" 1
 check_rejects "f64_table_prefixed_surface_retired" "test/negative/f64_table_prefixed_surface_retired.weft" "in import" 4
