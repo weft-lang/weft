@@ -103,6 +103,13 @@ check_rejects "http_server_cannot_connect" "test/negative/http_server_cannot_con
 check_rejects "http_server_cannot_reuse_client_connection" "test/negative/http_server_cannot_reuse_client_connection.weft" 'error[E2001]: effect `HttpClient<TlsStream>` is not available in this context'
 check_rejects "http_client_cannot_read_server_connection" "test/negative/http_client_cannot_read_server_connection.weft" 'error[E2001]: effect `HttpServer` is not available in this context'
 check_rejects "http_json_reader_constructor_private" "test/negative/http_json_reader_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "http_json_prefixed_reader_removed" "test/negative/http_json_prefixed_reader_removed.weft" "error[E4002]: unknown module member 'http_json_reader' in import" 1
+check_rejects "http_json_prefixed_read_removed" "test/negative/http_json_prefixed_read_removed.weft" "error[E4002]: unknown module member 'http_json_read' in import" 1
+check_rejects "http_json_prefixed_write_removed" "test/negative/http_json_prefixed_write_removed.weft" "error[E4002]: unknown module member 'http_json_write' in import" 1
+check_rejects "http_json_prefixed_document_value_removed" "test/negative/http_json_prefixed_document_value_removed.weft" "error[E4002]: unknown module member 'http_json_document_value' in import" 1
+check_rejects "http_json_prefixed_document_trailers_removed" "test/negative/http_json_prefixed_document_trailers_removed.weft" "error[E4002]: unknown module member 'http_json_document_trailers' in import" 1
+check_rejects "http_json_prefixed_failure_error_removed" "test/negative/http_json_prefixed_failure_error_removed.weft" "error[E4002]: unknown module member 'http_json_failure_error' in import" 1
+check_rejects "http_json_prefixed_failure_trailers_removed" "test/negative/http_json_prefixed_failure_trailers_removed.weft" "error[E4002]: unknown module member 'http_json_failure_trailers' in import" 1
 check_rejects "tls_raw_backend_private" "test/negative/tls_raw_backend_private.weft" "module member 'tls_mbedtls_handshake' is not visible in this import" 1
 check_rejects "tls_session_use_after_move" "test/negative/tls_session_use_after_move.weft" "type error: owned value used more than once"
 check_rejects "tls_stream_constructor_private" "test/negative/tls_stream_constructor_private.weft" "opaque constructor is private to its declaring module"
