@@ -377,6 +377,23 @@ check_rejects "prelude_excludes_option_helpers" "test/negative/prelude_excludes_
 check_rejects "result_helper_removed" "test/negative/result_helper_removed.weft" "error[E1001]: unknown function 'result_ok'"
 check_rejects "option_prefixed_map_removed" "test/negative/option_prefixed_map_removed.weft" "error[E4002]: unknown module member 'option_map' in import" 1
 check_rejects "result_prefixed_map_removed" "test/negative/result_prefixed_map_removed.weft" "error[E4002]: unknown module member 'result_map' in import" 1
+check_rejects "list_nil_removed" "test/negative/list_nil_removed.weft" "error[E4002]: unknown module member 'list_nil' in import" 1
+check_rejects "list_cons_removed" "test/negative/list_cons_removed.weft" "error[E4002]: unknown module member 'list_cons' in import" 1
+check_rejects "list_fold_removed" "test/negative/list_fold_removed.weft" "error[E4002]: unknown module member 'list_fold' in import" 1
+check_rejects "list_empty_removed" "test/negative/list_empty_removed.weft" "error[E4002]: unknown module member 'list_empty' in import" 1
+check_rejects "list_first_or_removed" "test/negative/list_first_or_removed.weft" "error[E4002]: unknown module member 'list_first_or' in import" 1
+check_rejects "list_rest_or_nil_removed" "test/negative/list_rest_or_nil_removed.weft" "error[E4002]: unknown module member 'list_rest_or_nil' in import" 1
+check_rejects "list_len_removed" "test/negative/list_len_removed.weft" "error[E4002]: unknown module member 'list_len' in import" 1
+check_rejects "list_nth_removed" "test/negative/list_nth_removed.weft" "error[E4002]: unknown module member 'list_nth' in import" 1
+check_rejects "list_map_removed" "test/negative/list_map_removed.weft" "error[E4002]: unknown module member 'list_map' in import" 1
+check_rejects "list_reverse_removed" "test/negative/list_reverse_removed.weft" "error[E4002]: unknown module member 'list_reverse' in import" 1
+check_rejects "list_concat_removed" "test/negative/list_concat_removed.weft" "error[E4002]: unknown module member 'list_concat' in import" 1
+check_rejects "list_append_removed" "test/negative/list_append_removed.weft" "error[E4002]: unknown module member 'list_append' in import" 1
+check_rejects "list_filter_removed" "test/negative/list_filter_removed.weft" "error[E4002]: unknown module member 'list_filter' in import" 1
+check_rejects "list_range_removed" "test/negative/list_range_removed.weft" "error[E4002]: unknown module member 'list_range' in import" 1
+check_rejects "list_map_fold_i64_removed" "test/negative/list_map_fold_i64_removed.weft" "error[E4002]: unknown module member 'list_map_fold_i64' in import" 1
+check_rejects "list_filter_fold_i64_removed" "test/negative/list_filter_fold_i64_removed.weft" "error[E4002]: unknown module member 'list_filter_fold_i64' in import" 1
+check_rejects "list_map_filter_fold_i64_removed" "test/negative/list_map_filter_fold_i64_removed.weft" "error[E4002]: unknown module member 'list_map_filter_fold_i64' in import" 1
 check_rejects "prelude_methods_require_explicit_import" "test/negative/prelude_methods_require_explicit_import.weft" "type error: unknown method"
 check_rejects "quoted_import_removed" "test/negative/quoted_import_removed.weft" "error[E0002]: expected path-form module after 'use'"
 check_rejects "extern_keyword_removed" "test/negative/extern_keyword_removed.weft" "error[E0002]: unexpected token at module level"
