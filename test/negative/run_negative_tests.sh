@@ -492,6 +492,7 @@ check_rejects "bytes_prefixed_constructor_removed" "test/negative/bytes_prefixed
 check_rejects "path_constructor_private" "test/negative/path_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "path_prefixed_constructor_removed" "test/negative/path_prefixed_constructor_removed.weft" "error[E4002]: unknown module member 'path_from_utf8' in import" 1
 check_rejects "string_find_is_option" "test/negative/string_find_is_option.weft" 'return value type mismatch: expected `i64`, found `Option<i64>`'
+check_rejects "json_bool_requires_bool" "test/negative/json_bool_requires_bool.weft" 'argument type mismatch: expected `bool`, found `i64`'
 check_rejects "io_helper_effect_unavailable" "test/negative/io_helper_effect_unavailable.weft" "error[E2001]:"
 check_rejects "file_prefixed_read_removed" "test/negative/file_prefixed_read_removed.weft" "error[E4002]: unknown module member 'file_read_all' in import" 1
 check_rejects "file_read_cannot_write" "test/negative/file_read_cannot_write.weft" "error[E2001]:"
