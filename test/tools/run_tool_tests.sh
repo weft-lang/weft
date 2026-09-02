@@ -646,7 +646,8 @@ stdlib_doc_modules=(
   stdlib/json.weft
   stdlib/secure_random.weft stdlib/secure_random/deterministic.weft
   stdlib/net_address.weft stdlib/idna.weft
-  stdlib/dns.weft stdlib/tcp.weft stdlib/url.weft stdlib/tls.weft
+  stdlib/dns.weft stdlib/dns/fake.weft stdlib/dns/policy.weft
+  stdlib/tcp.weft stdlib/url.weft stdlib/tls.weft
   stdlib/http.weft stdlib/http/stream.weft stdlib/http/endpoint.weft
   stdlib/http/json.weft
   stdlib/http/client.weft stdlib/sse.weft stdlib/sse/stream.weft

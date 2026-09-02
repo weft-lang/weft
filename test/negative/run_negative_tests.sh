@@ -152,6 +152,13 @@ check_rejects "websocket_stream_prefixed_client_removed" "test/negative/websocke
 check_rejects "websocket_client_write_requires_random" "test/negative/websocket_client_write_requires_random.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
 check_rejects "dns_resolve_requires_effect" "test/negative/dns_resolve_requires_effect.weft" 'error[E2001]: effect `DnsResolve` is not available in this context'
 check_rejects "dns_policy_requires_authority" "test/negative/dns_policy_requires_authority.weft" 'error[E2001]: effect `DnsResolve` is not available in this context'
+check_rejects "dns_policy_wrapper_retired" "test/negative/dns_policy_wrapper_retired.weft" "error[E4002]: unknown module member 'dns_with_policy' in import" 1
+check_rejects "dns_fake_wrapper_retired" "test/negative/dns_fake_wrapper_retired.weft" "error[E4002]: unknown module member 'dns_with_fake' in import" 1
+check_rejects "dns_policy_types_relocated" "test/negative/dns_policy_types_relocated.weft" "error[E4002]: unknown module member 'DnsPolicy' in import" 3
+check_rejects "dns_fake_types_relocated" "test/negative/dns_fake_types_relocated.weft" "error[E4002]: unknown module member 'DnsFakeAddresses' in import" 3
+check_rejects "dns_policy_constructor_private" "test/negative/dns_policy_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "dns_fake_resolver_constructor_private" "test/negative/dns_fake_resolver_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "dns_platform_wrapper_retired" "test/negative/dns_platform_wrapper_retired.weft" "error[E4002]: unknown module member 'runtime_platform_dns' in import" 1
 check_rejects "dns_raw_backend_private" "test/negative/dns_raw_backend_private.weft" "module member 'runtime_dns_getaddrinfo' is not visible in this import" 1
 check_rejects "dns_raw_getaddrinfo_requires_trusted" "test/negative/dns_raw_getaddrinfo_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "tcp_connect_requires_authority" "test/negative/tcp_connect_requires_authority.weft" 'error[E2001]: effect `TcpConnect` is not available in this context'
