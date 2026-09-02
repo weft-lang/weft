@@ -112,6 +112,16 @@ check_rejects "http_json_prefixed_failure_error_removed" "test/negative/http_jso
 check_rejects "http_json_prefixed_failure_trailers_removed" "test/negative/http_json_prefixed_failure_trailers_removed.weft" "error[E4002]: unknown module member 'http_json_failure_trailers' in import" 1
 check_rejects "http_replay_prefixed_fixture_removed" "test/negative/http_replay_prefixed_fixture_removed.weft" "error[E4002]: unknown module member 'http_replay_fixture' in import" 1
 check_rejects "http_replay_prefixed_stats_removed" "test/negative/http_replay_prefixed_stats_removed.weft" "error[E4002]: unknown module member 'http_replay_stats' in import" 1
+check_rejects "http_client_prefixed_pool_limit_removed" "test/negative/http_client_prefixed_pool_limit_removed.weft" "error[E4002]: unknown module member 'http_pool_max_idle' in import" 1
+check_rejects "http_client_prefixed_pool_removed" "test/negative/http_client_prefixed_pool_removed.weft" "error[E4002]: unknown module member 'http_connection_pool' in import" 1
+check_rejects "http_client_prefixed_pool_len_removed" "test/negative/http_client_prefixed_pool_len_removed.weft" "error[E4002]: unknown module member 'http_pool_len' in import" 1
+check_rejects "http_client_prefixed_pool_checkout_removed" "test/negative/http_client_prefixed_pool_checkout_removed.weft" "error[E4002]: unknown module member 'http_pool_checkout' in import" 1
+check_rejects "http_client_prefixed_pool_release_removed" "test/negative/http_client_prefixed_pool_release_removed.weft" "error[E4002]: unknown module member 'http_pool_release' in import" 1
+check_rejects "http_client_prefixed_pool_begin_removed" "test/negative/http_client_prefixed_pool_begin_removed.weft" "error[E4002]: unknown module member 'http_client_pool_begin' in import" 1
+check_rejects "http_client_prefixed_redirect_policy_removed" "test/negative/http_client_prefixed_redirect_policy_removed.weft" "error[E4002]: unknown module member 'http_redirect_policy' in import" 1
+check_rejects "http_client_prefixed_redirect_history_removed" "test/negative/http_client_prefixed_redirect_history_removed.weft" "error[E4002]: unknown module member 'http_redirect_history' in import" 1
+check_rejects "http_client_prefixed_redirect_history_len_removed" "test/negative/http_client_prefixed_redirect_history_len_removed.weft" "error[E4002]: unknown module member 'http_redirect_history_len' in import" 1
+check_rejects "http_client_prefixed_redirect_step_removed" "test/negative/http_client_prefixed_redirect_step_removed.weft" "error[E4002]: unknown module member 'http_redirect_step' in import" 1
 check_rejects "tls_raw_backend_private" "test/negative/tls_raw_backend_private.weft" "module member 'tls_mbedtls_handshake' is not visible in this import" 1
 check_rejects "tls_session_use_after_move" "test/negative/tls_session_use_after_move.weft" "type error: owned value used more than once"
 check_rejects "tls_stream_constructor_private" "test/negative/tls_stream_constructor_private.weft" "opaque constructor is private to its declaring module"
