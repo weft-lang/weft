@@ -298,6 +298,8 @@ check_rejects "iter_filter_effectful_callback" "test/negative/iter_filter_effect
 check_rejects "iter_take_negative_limit" "test/negative/iter_take_negative_limit.weft" 'error[E1002]: integer literal does not fit expected type `usize`'
 check_rejects "iterator_collect_item_mismatch" "test/negative/iterator_collect_item_mismatch.weft" "type error: associated type constraint mismatch"
 check_rejects "iterator_collect_missing_impl" "test/negative/iterator_collect_missing_impl.weft" 'error[E1004]: type `NotACollection` does not implement `Collect`'
+check_rejects "iterator_collect_empty_seed_retired" "test/negative/iterator_collect_empty_seed_retired.weft" "type error: unknown method"
+check_rejects "iterator_collect_builder_retired" "test/negative/iterator_collect_builder_retired.weft" "type error: unknown method"
 check_rejects "iterator_constructor_private" "test/negative/iterator_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "iterator_next_requires_mutable" "test/negative/iterator_next_requires_mutable.weft" "type error: exclusive resource borrow requires a mutable owner binding"
 check_rejects "iterator_use_after_close" "test/negative/iterator_use_after_close.weft" "type error: owned value used more than once"

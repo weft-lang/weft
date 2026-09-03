@@ -657,7 +657,7 @@ stdlib_doc_modules=(
   stdlib/diagnostic/registry.weft stdlib/map.weft stdlib/set.weft
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector/handles.weft
   stdlib/vector.weft stdlib/generator.weft stdlib/iter.weft
-  stdlib/iter/protocol.weft stdlib/iter/core.weft stdlib/iter/collect.weft
+  stdlib/iter/protocol.weft stdlib/iter/core.weft
   stdlib/semantic_type.weft stdlib/semantic_type/render.weft
   stdlib/f64_table.weft stdlib/num.weft stdlib/io/transfer.weft
   stdlib/utf8.weft
@@ -690,7 +690,10 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "iter/protocol" ]; then
     assert_contains "doc_stdlib_iter_protocol_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
     assert_contains "doc_stdlib_iter_protocol_pins_opaque_state" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
-    assert_contains "doc_stdlib_iter_protocol_pins_owned_source" "$(<"$tmp_out")" "source: owned Iterator<Self.Item>"
+    assert_contains "doc_stdlib_iter_protocol_pins_direct_collection" "$(<"$tmp_out")" "fn from_iter(source: owned Iterator<Self.Item>) -> Self"
+    assert_contains "doc_stdlib_iter_protocol_pins_consuming_collect" "$(<"$tmp_out")" "fn collect<T, C: Collect & {type Item = T}>(self: owned Iterator<T>) -> C"
+    assert_not_contains "doc_stdlib_iter_protocol_retires_empty_seed" "$(<"$tmp_out")" "fn empty"
+    assert_not_contains "doc_stdlib_iter_protocol_retires_builder_method" "$(<"$tmp_out")" "fn collect_from"
   elif [ "$stdlib_doc_name" = "iter/core" ]; then
     assert_contains "doc_stdlib_iter_core_pins_public_surface" "$(<"$tmp_out")" "Public API items: 7. Documented: 7."
     assert_contains "doc_stdlib_iter_core_pins_owned_adapter" "$(<"$tmp_out")" "fn map<T, U>(it: owned Iterator<T>"
