@@ -657,6 +657,7 @@ stdlib_doc_modules=(
   stdlib/diagnostic/registry.weft stdlib/map.weft stdlib/set.weft
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector/handles.weft
   stdlib/vector.weft stdlib/generator.weft stdlib/iter.weft
+  stdlib/iter/protocol.weft stdlib/iter/core.weft stdlib/iter/collect.weft
   stdlib/semantic_type.weft stdlib/semantic_type/render.weft
   stdlib/f64_table.weft stdlib/num.weft stdlib/io/transfer.weft
   stdlib/utf8.weft
@@ -681,7 +682,16 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     exit 1
   fi
   # These audited facades must not regrow legacy runtime mechanics.
-  if [ "$stdlib_doc_name" = "utf8" ]; then
+  if [ "$stdlib_doc_name" = "generator" ]; then
+    assert_contains "doc_stdlib_generator_pins_public_surface" "$(<"$tmp_out")" "Public API items: 10. Documented: 10."
+    assert_contains "doc_stdlib_generator_pins_opaque_state" "$(<"$tmp_out")" "pub type Generator<T, R> = opaque"
+    assert_not_contains "doc_stdlib_generator_hides_raw_yield" "$(<"$tmp_out")" "@deferred fn yield(value: i64) -> i64"
+  elif [ "$stdlib_doc_name" = "iter/protocol" ]; then
+    assert_contains "doc_stdlib_iter_protocol_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
+    assert_contains "doc_stdlib_iter_protocol_pins_opaque_state" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
+  elif [ "$stdlib_doc_name" = "iter/core" ]; then
+    assert_contains "doc_stdlib_iter_core_pins_public_surface" "$(<"$tmp_out")" "Public API items: 7. Documented: 7."
+  elif [ "$stdlib_doc_name" = "utf8" ]; then
     assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
   elif [ "$stdlib_doc_name" = "io/transfer" ]; then
     assert_contains "doc_stdlib_io_transfer_pins_public_surface" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
