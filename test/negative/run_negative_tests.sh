@@ -99,6 +99,8 @@ check_rejects "generator_start_mutable_closure_producer" "test/negative/generato
 check_rejects "generator_start_return_type_mismatch" "test/negative/generator_start_return_type_mismatch.weft" 'error[E1002]: lambda return value type mismatch: expected `i64`, found `str`'
 check_rejects "generator_yield_unhandled" "test/negative/generator_yield_unhandled.weft" "error[E2001]:"
 check_rejects "generator_constructor_private" "test/negative/generator_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "generator_use_after_close" "test/negative/generator_use_after_close.weft" "type error: owned value used more than once"
+check_rejects "generator_next_requires_mutable" "test/negative/generator_next_requires_mutable.weft" "type error: exclusive resource borrow requires a mutable owner binding"
 check_rejects "unhandled_effect_perform" "test/negative/unhandled_effect_perform.weft" 'error[E2001]: effect `State` is not available in this context'
 check_rejects "source_acquire_requires_effect" "test/negative/source_acquire_requires_effect.weft" 'error[E2001]: effect `SourceAcquire` is not available in this context'
 check_rejects "secure_random_effect_unavailable" "test/negative/secure_random_effect_unavailable.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
