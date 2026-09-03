@@ -100,7 +100,7 @@ check_rejects "generator_start_return_type_mismatch" "test/negative/generator_st
 check_rejects "generator_yield_unhandled" "test/negative/generator_yield_unhandled.weft" "error[E2001]:"
 check_rejects "generator_constructor_private" "test/negative/generator_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "generator_use_after_close" "test/negative/generator_use_after_close.weft" "type error: owned value used more than once"
-check_rejects "generator_next_requires_mutable" "test/negative/generator_next_requires_mutable.weft" "type error: exclusive resource borrow requires a mutable owner binding"
+check_rejects "generator_next_requires_mutable" "test/negative/generator_next_requires_mutable.weft" "type error: exclusive borrow requires a mutable owner binding"
 check_rejects "generator_send_retired" "test/negative/generator_send_retired.weft" "type error: unknown method"
 check_rejects "unhandled_effect_perform" "test/negative/unhandled_effect_perform.weft" 'error[E2001]: effect `State` is not available in this context'
 check_rejects "source_acquire_requires_effect" "test/negative/source_acquire_requires_effect.weft" 'error[E2001]: effect `SourceAcquire` is not available in this context'
@@ -301,7 +301,7 @@ check_rejects "iterator_collect_missing_impl" "test/negative/iterator_collect_mi
 check_rejects "iterator_collect_empty_seed_retired" "test/negative/iterator_collect_empty_seed_retired.weft" "type error: unknown method"
 check_rejects "iterator_collect_builder_retired" "test/negative/iterator_collect_builder_retired.weft" "type error: unknown method"
 check_rejects "iterator_constructor_private" "test/negative/iterator_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
-check_rejects "iterator_next_requires_mutable" "test/negative/iterator_next_requires_mutable.weft" "type error: exclusive resource borrow requires a mutable owner binding"
+check_rejects "iterator_next_requires_mutable" "test/negative/iterator_next_requires_mutable.weft" "type error: exclusive borrow requires a mutable owner binding"
 check_rejects "iterator_use_after_close" "test/negative/iterator_use_after_close.weft" "type error: owned value used more than once"
 check_rejects "iterator_use_after_adapter" "test/negative/iterator_use_after_adapter.weft" "type error: owned value used more than once"
 check_rejects "effectful_lambda_to_pure_effect_op" "test/negative/effectful_lambda_to_pure_effect_op.weft" "error[E2001]:"
@@ -714,6 +714,10 @@ check_rejects "unique_let_used_twice" "test/negative/unique_let_used_twice.weft"
 check_rejects "unique_closure_capture" "test/negative/unique_closure_capture.weft" "type error: unique value cannot be captured by closure"
 check_rejects "unique_contextual_lambda_param_used_twice" "test/negative/unique_contextual_lambda_param_used_twice.weft" "type error: unique value used more than once"
 check_rejects "unique_par_fork_use_after_move" "test/negative/unique_par_fork_use_after_move.weft" "type error: unique value used more than once"
+check_rejects "unique_managed_alias_argument" "test/negative/unique_managed_alias_argument.weft" "requires proven unique ownership"
+check_rejects "unique_managed_alias_method" "test/negative/unique_managed_alias_method.weft" "requires proven unique ownership"
+check_rejects "unique_borrow_mut_immutable_owner" "test/negative/unique_borrow_mut_immutable_owner.weft" "type error: exclusive borrow requires a mutable owner binding"
+check_rejects "unique_borrow_after_move" "test/negative/unique_borrow_after_move.weft" "type error: unique value used more than once"
 check_rejects "owned_param_used_twice" "test/negative/owned_param_used_twice.weft" "type error: owned value used more than once"
 check_rejects "owned_let_used_twice" "test/negative/owned_let_used_twice.weft" "type error: owned value used more than once"
 check_rejects "owned_borrow_after_move" "test/negative/owned_borrow_after_move.weft" "type error: owned value used more than once"
@@ -1006,16 +1010,16 @@ check_rejects "rigid_tail_concrete_call" "test/negative/rigid_tail_concrete_call
 check_rejects "borrow_return_position" "test/negative/borrow_return_position.weft" "type error: borrow is only valid on callable parameters"
 check_rejects "borrow_local_position" "test/negative/borrow_local_position.weft" "type error: borrow is only valid on callable parameters"
 check_rejects "borrow_field_position" "test/negative/borrow_field_position.weft" "type error: borrow is only valid on callable parameters"
-check_rejects "borrow_non_resource" "test/negative/borrow_non_resource.weft" "type error: borrow requires an owned resource type"
+check_rejects "borrow_non_resource" "test/negative/borrow_non_resource.weft" "type error: borrow requires a named linear owner binding"
 check_rejects "borrow_nested_ownership" "test/negative/borrow_nested_ownership.weft" "type error: borrow cannot wrap another ownership qualifier"
-check_rejects "borrow_temporary_actual" "test/negative/borrow_temporary_actual.weft" "type error: resource borrow requires a named owned binding"
-check_rejects "borrow_mut_immutable_owner" "test/negative/borrow_mut_immutable_owner.weft" "type error: exclusive resource borrow requires a mutable owner binding"
+check_rejects "borrow_temporary_actual" "test/negative/borrow_temporary_actual.weft" "type error: borrow requires a named linear owner binding"
+check_rejects "borrow_mut_immutable_owner" "test/negative/borrow_mut_immutable_owner.weft" "type error: exclusive borrow requires a mutable owner binding"
 check_rejects "borrow_shared_to_exclusive" "test/negative/borrow_shared_to_exclusive.weft" "type error: shared resource borrow cannot be forwarded as exclusive"
 check_rejects "borrow_actual_type_mismatch" "test/negative/borrow_actual_type_mismatch.weft" 'error[E1002]: borrowed argument type mismatch: expected `BorrowExpectedToken`, found `BorrowActualToken`'
 check_rejects "borrow_conflicting_call" "test/negative/borrow_conflicting_call.weft" "type error: conflicting resource borrows in one call"
 check_rejects "borrow_escape_to_owned" "test/negative/borrow_escape_to_owned.weft" 'error[E1002]: argument type mismatch: expected `owned BorrowEscapeToken`, found `borrow BorrowEscapeToken`'
 check_rejects "borrow_pattern_extract_owned" "test/negative/borrow_pattern_extract_owned.weft" 'error[E1002]: return value type mismatch: expected `owned BorrowPatternToken`, found `borrow BorrowPatternToken`'
-check_rejects "borrow_mut_method_immutable_owner" "test/negative/borrow_mut_method_immutable_owner.weft" "type error: exclusive resource borrow requires a mutable owner binding"
+check_rejects "borrow_mut_method_immutable_owner" "test/negative/borrow_mut_method_immutable_owner.weft" "type error: exclusive borrow requires a mutable owner binding"
 check_rejects "borrow_effect_conflicting_perform" "test/negative/borrow_effect_conflicting_perform.weft" "type error: conflicting resource borrows in one call" 1
 check_rejects "borrow_effect_deferred_continuation" "test/negative/borrow_effect_deferred_continuation.weft" "type error: borrowed effect parameter cannot enter a deferred continuation" 1
 check_rejects "borrow_closure_capture" "test/negative/borrow_closure_capture.weft" "type error: borrowed resource cannot be captured by closure" 1
