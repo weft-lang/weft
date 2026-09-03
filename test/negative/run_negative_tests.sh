@@ -319,6 +319,7 @@ check_rejects "trait_impl_missing_method" "test/negative/trait_impl_missing_meth
 check_rejects "trait_impl_arity_mismatch" "test/negative/trait_impl_arity_mismatch.weft" "type error: impl method arity mismatch"
 check_rejects "trait_impl_param_mismatch" "test/negative/trait_impl_param_mismatch.weft" "type error: impl method parameter type mismatch"
 check_rejects "trait_self_impl_param_mismatch" "test/negative/trait_self_impl_param_mismatch.weft" "type error: impl method parameter type mismatch"
+check_rejects "trait_impl_receiver_kind_mismatch" "test/negative/trait_impl_receiver_kind_mismatch.weft" "type error: impl method receiver kind mismatch"
 check_rejects "trait_impl_return_mismatch" "test/negative/trait_impl_return_mismatch.weft" "type error: impl method return type mismatch"
 check_rejects "trait_impl_effect_mismatch" "test/negative/trait_impl_effect_mismatch.weft" "type error: impl method effect mismatch"
 check_rejects "generic_impl_overlap_conflict" "test/negative/generic_impl_overlap_conflict.weft" "type error: conflicting implementations of trait for type"
