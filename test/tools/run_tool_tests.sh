@@ -57,7 +57,7 @@ if [ -z "${WEFT_TOOL_SHARD:-}" ]; then
   tool_elapsed=$(($(date +%s) - tool_started))
   echo "Tool boundary timing: ${tool_elapsed}s wall, ${tool_jobs} shard jobs"
   if [ "${WEFT_TEST_PLATFORM:-$(uname -s)}" = Darwin ]; then
-    echo "Tool boundary summary: 1147 passed, 0 failed"
+    echo "Tool boundary summary: 1150 passed, 0 failed"
   else
     echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
   fi
@@ -139,6 +139,7 @@ tmp_pkg_remote_dir=$(mktemp -d /tmp/weft_tool_pkg_remote_XXXXXX)
 tmp_pkg_trusted_update_dir=$(mktemp -d /tmp/weft_tool_pkg_trusted_update_XXXXXX)
 tmp_pkg_trust_dir=$(mktemp -d /tmp/weft_tool_pkg_trust_XXXXXX)
 tmp_pkg_missing_dir=$(mktemp -d /tmp/weft_tool_pkg_missing_XXXXXX)
+tmp_sdk_layout_dir=$(mktemp -d /tmp/weft_tool_sdk_layout_XXXXXX)
 tmp_project_target_dir=$(mktemp -d /tmp/weft_tool_project_target_XXXXXX)
 tmp_outside_dir=$(mktemp -d /tmp/weft_tool_outside_XXXXXX)
 tmp_lsp_stream_dir=$(mktemp -d /tmp/weft_tool_lsp_stream_XXXXXX)
@@ -156,7 +157,7 @@ tmp_native_debug_lldb=$(mktemp /tmp/weft_tool_native_debug_lldb_XXXXXX)
 tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
-trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product.facts.json" "$tmp_elf_product_second" "$tmp_elf_product_second.facts.json" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_remote_dir" "$tmp_pkg_trusted_update_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_project_target_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir" "$tmp_elf_archive_dir"' EXIT
+trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product.facts.json" "$tmp_elf_product_second" "$tmp_elf_product_second.facts.json" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_remote_dir" "$tmp_pkg_trusted_update_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_sdk_layout_dir" "$tmp_project_target_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir" "$tmp_elf_archive_dir"' EXIT
 
 now_s() {
   date +%s
@@ -3605,6 +3606,21 @@ assert_contains "package_package_member_stays_inside_dependency" "$package_visib
 printf 'use math/visibility.{private_value}\nfn main() -> i64 { private_value() }\n' > "$tmp_pkg_dir/app.weft"
 package_private_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
 assert_contains "package_private_member_stays_inside_dependency_module" "$package_private_out" "error[E4004]: module member 'private_value' is not visible in this import"
+
+printf 'pub effect Scheduler { pub(package) fn submit(raw: i64) -> i64, fn observe(value: i64) -> i64 }\n' > "$tmp_pkg_dir/deps/math/effects.weft"
+printf 'use math/effects as effects\nfn illicit() -[effects.Scheduler]> i64 { effects.Scheduler.submit(0) }\nfn main() -> i64 { 0 }\n' > "$tmp_pkg_dir/app.weft"
+package_effect_operation_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
+assert_contains "package_effect_operation_stays_inside_dependency" "$package_effect_operation_out" "type error: effect operation is not visible from this module"
+
+mkdir -p "$tmp_sdk_layout_dir/bin" "$tmp_sdk_layout_dir/lib" "$tmp_sdk_layout_dir/app"
+cp "$WEFT_ABS" "$tmp_sdk_layout_dir/bin/weft"
+chmod +x "$tmp_sdk_layout_dir/bin/weft"
+ln -s "$PROJECT_ROOT" "$tmp_sdk_layout_dir/lib/weft"
+printf '{"package":"task-api-consumer","manifest_version":1,"version":"0.1.0","weft":"0.1","dependencies":{}}\n' > "$tmp_sdk_layout_dir/app/weft.pkg"
+printf 'use stdlib/task as task\nfn illicit() -[task.TaskScope]> i64 { let child = task.TaskScope.submit(0) child + task.TaskScope.join(0) }\nfn main() -> i64 { 0 }\n' > "$tmp_sdk_layout_dir/app/main.weft"
+installed_task_scope_out=$(cd "$tmp_sdk_layout_dir/app" && "$tmp_sdk_layout_dir/bin/weft" check main.weft 2>&1 || true)
+assert_contains "installed_task_scope_hides_scheduler_operations" "$installed_task_scope_out" "type error: effect operation is not visible from this module"
+assert_contains "installed_task_scope_rejects_both_scheduler_operations" "$installed_task_scope_out" "2 errors"
 
 mkdir -p "$tmp_pkg_dir/deps/lib/deps/base" "$tmp_pkg_dir/deps/mirror"
 printf '{"package":"app","dependencies":{"lib":"deps/lib","mirror":"deps/mirror"}}\n' > "$tmp_pkg_dir/weft.pkg"
