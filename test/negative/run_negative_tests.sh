@@ -302,6 +302,8 @@ check_rejects "iter_map_effectful_callback" "test/negative/iter_map_effectful_ca
 check_rejects "iter_filter_effectful_callback" "test/negative/iter_filter_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_filter_map_effectful_callback" "test/negative/iter_filter_map_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_filter_map_source_use_after_adapter" "test/negative/iter_filter_map_source_use_after_adapter.weft" "type error: owned value used more than once"
+check_rejects "iter_each_effect_unavailable" "test/negative/iter_each_effect_unavailable.weft" "error[E2001]:"
+check_rejects "iter_each_callback_result_mismatch" "test/negative/iter_each_callback_result_mismatch.weft" 'lambda return value type mismatch: expected `nil`, found `i64`'
 check_rejects "iter_take_negative_limit" "test/negative/iter_take_negative_limit.weft" 'error[E1002]: integer literal does not fit expected type `usize`'
 check_rejects "iter_nth_negative_index" "test/negative/iter_nth_negative_index.weft" 'error[E1002]: integer literal does not fit expected type `usize`'
 check_rejects "iter_take_while_effectful_callback" "test/negative/iter_take_while_effectful_callback.weft" "error[E2001]:"

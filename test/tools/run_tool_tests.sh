@@ -695,7 +695,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_not_contains "doc_stdlib_iter_protocol_retires_empty_seed" "$(<"$tmp_out")" "fn empty"
     assert_not_contains "doc_stdlib_iter_protocol_retires_builder_method" "$(<"$tmp_out")" "fn collect_from"
   elif [ "$stdlib_doc_name" = "iter/core" ]; then
-    assert_contains "doc_stdlib_iter_core_pins_public_surface" "$(<"$tmp_out")" "Public API items: 24. Documented: 24."
+    assert_contains "doc_stdlib_iter_core_pins_public_surface" "$(<"$tmp_out")" "Public API items: 25. Documented: 25."
     assert_contains "doc_stdlib_iter_core_pins_owned_adapter" "$(<"$tmp_out")" "fn map<T, U>(it: owned Iterator<T>"
     assert_contains "doc_stdlib_iter_core_discards_any_generator_completion" "$(<"$tmp_out")" "fn from_generator<T, R>(g: owned generator.Generator<T, R>)"
     assert_contains "doc_stdlib_iter_core_uses_semantic_take_limit" "$(<"$tmp_out")" "fn take<T>(it: owned Iterator<T>, limit: usize)"
@@ -717,6 +717,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_iter_core_pins_enumerate" "$(<"$tmp_out")" "fn enumerate<T>(it: owned Iterator<T>) -> owned Iterator<(usize, T)>"
     assert_contains "doc_stdlib_iter_core_pins_heterogeneous_zip" "$(<"$tmp_out")" "fn zip<T, U>(left: owned Iterator<T>, right: owned Iterator<U>) -> owned Iterator<(T, U)>"
     assert_contains "doc_stdlib_iter_core_pins_filter_map" "$(<"$tmp_out")" "fn filter_map<T, U>(it: owned Iterator<T>, f: (T) -> Option<U>) -> owned Iterator<U>"
+    assert_contains "doc_stdlib_iter_core_pins_effectful_each" "$(<"$tmp_out")" "fn each<T, E>(it: owned Iterator<T>, f: (T) -[E]> nil) -[E]> nil"
   elif [ "$stdlib_doc_name" = "utf8" ]; then
     assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
   elif [ "$stdlib_doc_name" = "io/transfer" ]; then
