@@ -683,9 +683,10 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   fi
   # These audited facades must not regrow legacy runtime mechanics.
   if [ "$stdlib_doc_name" = "generator" ]; then
-    assert_contains "doc_stdlib_generator_pins_public_surface" "$(<"$tmp_out")" "Public API items: 10. Documented: 10."
+    assert_contains "doc_stdlib_generator_pins_public_surface" "$(<"$tmp_out")" "Public API items: 9. Documented: 9."
     assert_contains "doc_stdlib_generator_pins_opaque_state" "$(<"$tmp_out")" "pub type Generator<T, R> = opaque"
     assert_not_contains "doc_stdlib_generator_hides_raw_yield" "$(<"$tmp_out")" "@deferred fn yield(value: i64) -> i64"
+    assert_not_contains "doc_stdlib_generator_hides_untyped_send" "$(<"$tmp_out")" "fn send"
   elif [ "$stdlib_doc_name" = "iter/protocol" ]; then
     assert_contains "doc_stdlib_iter_protocol_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
     assert_contains "doc_stdlib_iter_protocol_pins_opaque_state" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
