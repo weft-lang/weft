@@ -734,6 +734,12 @@ check_rejects "unique_managed_alias_argument" "test/negative/unique_managed_alia
 check_rejects "unique_managed_alias_method" "test/negative/unique_managed_alias_method.weft" "requires proven unique ownership"
 check_rejects "unique_borrow_mut_immutable_owner" "test/negative/unique_borrow_mut_immutable_owner.weft" "type error: exclusive borrow requires a mutable owner binding"
 check_rejects "unique_borrow_after_move" "test/negative/unique_borrow_after_move.weft" "type error: unique value used more than once"
+check_rejects "ownership_qualified_impl_plain_use" "test/negative/ownership_qualified_impl_plain_use.weft" 'does not implement `QualifiedPlainUse`'
+check_rejects "ownership_qualified_impl_receiver_mismatch" "test/negative/ownership_qualified_impl_receiver_mismatch.weft" "type error: impl method parameter type mismatch"
+check_rejects "ownership_qualified_impl_erasure_overlap" "test/negative/ownership_qualified_impl_erasure_overlap.weft" "type error: conflicting implementations of trait for type"
+check_rejects "ownership_qualified_impl_borrow" "test/negative/ownership_qualified_impl_borrow.weft" "type error: impl target must be a nominal or primitive type"
+check_rejects "ownership_qualified_impl_primitive" "test/negative/ownership_qualified_impl_primitive.weft" "type error: impl target must be a nominal or primitive type"
+check_rejects "ownership_qualified_impl_duplicate" "test/negative/ownership_qualified_impl_duplicate.weft" "type error: conflicting implementations of trait for type"
 check_rejects "owned_param_used_twice" "test/negative/owned_param_used_twice.weft" "type error: owned value used more than once"
 check_rejects "owned_let_used_twice" "test/negative/owned_let_used_twice.weft" "type error: owned value used more than once"
 check_rejects "owned_borrow_after_move" "test/negative/owned_borrow_after_move.weft" "type error: owned value used more than once"
