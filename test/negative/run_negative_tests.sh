@@ -98,6 +98,7 @@ check_rejects "generator_start_function_with_arg" "test/negative/generator_start
 check_rejects "generator_start_mutable_closure_producer" "test/negative/generator_start_mutable_closure_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_start_return_type_mismatch" "test/negative/generator_start_return_type_mismatch.weft" 'error[E1002]: lambda return value type mismatch: expected `i64`, found `str`'
 check_rejects "generator_yield_unhandled" "test/negative/generator_yield_unhandled.weft" "error[E2001]:"
+check_rejects "generator_constructor_private" "test/negative/generator_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "unhandled_effect_perform" "test/negative/unhandled_effect_perform.weft" 'error[E2001]: effect `State` is not available in this context'
 check_rejects "source_acquire_requires_effect" "test/negative/source_acquire_requires_effect.weft" 'error[E2001]: effect `SourceAcquire` is not available in this context'
 check_rejects "secure_random_effect_unavailable" "test/negative/secure_random_effect_unavailable.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
@@ -293,6 +294,7 @@ check_rejects "iter_map_effectful_callback" "test/negative/iter_map_effectful_ca
 check_rejects "iter_filter_effectful_callback" "test/negative/iter_filter_effectful_callback.weft" "error[E2001]:"
 check_rejects "iterator_collect_item_mismatch" "test/negative/iterator_collect_item_mismatch.weft" "type error: associated type constraint mismatch"
 check_rejects "iterator_collect_missing_impl" "test/negative/iterator_collect_missing_impl.weft" 'error[E1004]: type `NotACollection` does not implement `Collect`'
+check_rejects "iterator_constructor_private" "test/negative/iterator_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "effectful_lambda_to_pure_effect_op" "test/negative/effectful_lambda_to_pure_effect_op.weft" "error[E2001]:"
 check_rejects "function_value_effect_unavailable" "test/negative/function_value_effect_unavailable.weft" "error[E2001]:"
 check_rejects "function_value_arg_mismatch" "test/negative/function_value_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
