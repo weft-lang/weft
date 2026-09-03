@@ -76,12 +76,12 @@ check_rejects "generic_par_task_forged" "test/negative/generic_par_task_forged.w
 check_rejects "task_spawn_requires_effect" "test/negative/task_spawn_requires_effect.weft" 'error[E2001]: effect `TaskScope` is not available in this context'
 check_rejects "task_child_effect_requires_contract" "test/negative/task_child_effect_requires_contract.weft" 'error[E2001]: effect `SpawnChildNoise` is not available in this context'
 check_rejects "task_non_sendable_result" "test/negative/task_non_sendable_result.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
-check_rejects "task_non_sendable_capture" "test/negative/task_non_sendable_capture.weft" "type error: task closure is not Sendable across structured Spawn"
-check_rejects "task_scope_escape" "test/negative/task_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
-check_rejects "task_event_loop_scope_escape" "test/negative/task_event_loop_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
-check_rejects "task_channel_scope_escape" "test/negative/task_channel_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
-check_rejects "task_shutdown_scope_escape" "test/negative/task_shutdown_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
-check_rejects "task_channel_shutdown_scope_escape" "test/negative/task_channel_shutdown_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
+check_rejects "task_non_sendable_capture" "test/negative/task_non_sendable_capture.weft" "type error: task closure is not Sendable across a structured task boundary"
+check_rejects "task_scope_escape" "test/negative/task_scope_escape.weft" "type error: Task cannot escape its structured task scope"
+check_rejects "task_event_loop_scope_escape" "test/negative/task_event_loop_scope_escape.weft" "type error: Task cannot escape its structured task scope"
+check_rejects "task_channel_scope_escape" "test/negative/task_channel_scope_escape.weft" "type error: Task cannot escape its structured task scope"
+check_rejects "task_shutdown_scope_escape" "test/negative/task_shutdown_scope_escape.weft" "type error: Task cannot escape its structured task scope"
+check_rejects "task_channel_shutdown_scope_escape" "test/negative/task_channel_shutdown_scope_escape.weft" "type error: Task cannot escape its structured task scope"
 check_rejects "channel_non_sendable_element" "test/negative/channel_non_sendable_element.weft" 'does not implement `Sendable`'
 check_rejects "channel_non_sendable_signature" "test/negative/channel_non_sendable_signature.weft" 'does not implement `Sendable`' 1
 check_rejects "channel_non_sendable_handler" "test/negative/channel_non_sendable_handler.weft" 'does not implement `Sendable`' 1
