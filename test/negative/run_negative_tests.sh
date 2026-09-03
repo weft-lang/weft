@@ -314,8 +314,10 @@ check_rejects "iter_chain_duplicate_source" "test/negative/iter_chain_duplicate_
 check_rejects "iter_zip_duplicate_source" "test/negative/iter_zip_duplicate_source.weft" "type error: owned value used more than once"
 check_rejects "iterator_collect_item_mismatch" "test/negative/iterator_collect_item_mismatch.weft" "type error: associated type constraint mismatch"
 check_rejects "iterator_collect_missing_impl" "test/negative/iterator_collect_missing_impl.weft" 'error[E1004]: type `NotACollection` does not implement `Collect`'
+check_rejects "iterator_collect_missing_output" "test/negative/iterator_collect_missing_output.weft" "type error: impl missing required associated type"
 check_rejects "iterator_collect_empty_seed_retired" "test/negative/iterator_collect_empty_seed_retired.weft" "type error: unknown method"
 check_rejects "iterator_collect_builder_retired" "test/negative/iterator_collect_builder_retired.weft" "type error: unknown method"
+check_rejects "iterator_plain_into_iterator" "test/negative/iterator_plain_into_iterator.weft" 'type `Iterator<i64>` does not implement `IntoIterator`'
 check_rejects "iterator_constructor_private" "test/negative/iterator_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "iterator_next_requires_mutable" "test/negative/iterator_next_requires_mutable.weft" "type error: exclusive borrow requires a mutable owner binding"
 check_rejects "iterator_use_after_close" "test/negative/iterator_use_after_close.weft" "type error: owned value used more than once"

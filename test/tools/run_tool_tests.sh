@@ -688,10 +688,12 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_not_contains "doc_stdlib_generator_hides_raw_yield" "$(<"$tmp_out")" "@deferred fn yield(value: i64) -> i64"
     assert_not_contains "doc_stdlib_generator_hides_untyped_send" "$(<"$tmp_out")" "fn send"
   elif [ "$stdlib_doc_name" = "iter/protocol" ]; then
-    assert_contains "doc_stdlib_iter_protocol_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
+    assert_contains "doc_stdlib_iter_protocol_pins_public_surface" "$(<"$tmp_out")" "Public API items: 9. Documented: 9."
     assert_contains "doc_stdlib_iter_protocol_pins_opaque_state" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
-    assert_contains "doc_stdlib_iter_protocol_pins_direct_collection" "$(<"$tmp_out")" "fn from_iter(source: owned Iterator<Self.Item>) -> Self"
-    assert_contains "doc_stdlib_iter_protocol_pins_consuming_collect" "$(<"$tmp_out")" "fn collect<T, C: Collect & {type Item = T}>(self: owned Iterator<T>) -> C"
+    assert_contains "doc_stdlib_iter_protocol_pins_owned_identity" "$(<"$tmp_out")" 'impl<T> IntoIterator for owned Iterator<T>'
+    assert_contains "doc_stdlib_iter_protocol_pins_collection_output" "$(<"$tmp_out")" "type Output"
+    assert_contains "doc_stdlib_iter_protocol_pins_direct_collection" "$(<"$tmp_out")" "fn from_iter(source: owned Iterator<Self.Item>) -> Self.Output"
+    assert_contains "doc_stdlib_iter_protocol_pins_consuming_collect" "$(<"$tmp_out")" "fn collect<T, C: Collect & {type Item = T}>(self: owned Iterator<T>) -> C.Output"
     assert_not_contains "doc_stdlib_iter_protocol_retires_empty_seed" "$(<"$tmp_out")" "fn empty"
     assert_not_contains "doc_stdlib_iter_protocol_retires_builder_method" "$(<"$tmp_out")" "fn collect_from"
   elif [ "$stdlib_doc_name" = "iter/core" ]; then
