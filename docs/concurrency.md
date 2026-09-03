@@ -35,10 +35,40 @@ fn main() -> i64 {
 
 Effects remain the function's real capability contract. `TaskScope` does not
 create an `async fn` kind, and `Task<T>` is not a `Future<T>`: there is no
-public poll/wake protocol and no async colouring. A task that waits for time,
-TCP readiness, or channel capacity suspends its one-shot continuation inside
-the chosen handler; callers keep using the ordinary `Time`, `TcpReadiness`, or
-`Channel<T>` effects.
+public poll/wake protocol and no async colouring. A task that waits for a
+duration, TCP readiness, or channel capacity suspends its one-shot continuation
+inside the chosen handler; callers keep using the ordinary `Sleep`,
+`TcpReadiness`, or `Channel<T>` effects. Deadlines read
+`time/monotonic.MonotonicClock`, so wall-clock adjustment cannot move them.
+Certificate validation and other civil-time work use the independent
+`time/wall.WallClock` authority; possessing an event-loop scheduler does not
+grant it.
+
+Suspension therefore does not change a function kind. The event-loop handler
+interprets `Sleep` at the boundary, while the child remains an ordinary
+effectful function:
+
+```weft
+use stdlib/result.{Err, Ok}
+use stdlib/task as task
+use stdlib/time as time
+use stdlib/time/sleep as sleep
+use stdlib/time/sleep.{Sleep}
+
+fn delayed_answer() -[Sleep]> i64 {
+  match sleep.wait(time.milliseconds(10)) {
+    Ok(nil) -> 42
+    Err(error) -> 0
+  }
+}
+
+fn main() -> i64 {
+  task.with_event_loop(() => {
+    let child = task.spawn(delayed_answer)
+    if child.join() == 42 { 0 } else { 1 }
+  })
+}
+```
 
 The standard handlers deliberately share one semantic contract:
 

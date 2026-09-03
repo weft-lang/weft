@@ -92,7 +92,7 @@ check_rejects "task_flat_cancellation_module_retired" "test/negative/task_flat_c
 check_rejects "task_flat_shutdown_module_retired" "test/negative/task_flat_shutdown_module_retired.weft" "error[E1001]: unknown identifier 'ShutdownInterrupt'" 1
 check_rejects "task_cancellation_request_requires_effect" "test/negative/task_cancellation_request_requires_effect.weft" 'error[E2001]: effect `Cancellation` is not available in this context'
 check_rejects "task_cancellation_checkpoint_requires_effect" "test/negative/task_cancellation_checkpoint_requires_effect.weft" 'error[E2001]: effects `Cancellation, Fail<cancellation.CancellationReason>` are not available in this context'
-check_rejects "task_cancellation_deadline_requires_time" "test/negative/task_cancellation_deadline_requires_time.weft" 'error[E2001]: effect `Time` is not available in this context'
+check_rejects "task_cancellation_deadline_requires_monotonic_clock" "test/negative/task_cancellation_deadline_requires_monotonic_clock.weft" 'error[E2001]: effect `MonotonicClock` is not available in this context'
 check_rejects "generator_start_non_literal_producer" "test/negative/generator_start_non_literal_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_start_function_with_arg" "test/negative/generator_start_function_with_arg.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_start_mutable_closure_producer" "test/negative/generator_start_mutable_closure_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
@@ -109,7 +109,7 @@ check_rejects "secure_random_prefixed_function_retired" "test/negative/secure_ra
 check_rejects "secure_random_wrapper_retired" "test/negative/secure_random_wrapper_retired.weft" "error[E4002]: unknown module member 'secure_random_with_deterministic' in import" 1
 check_rejects "secure_random_platform_wrapper_retired" "test/negative/secure_random_platform_wrapper_retired.weft" "error[E4002]: unknown module member 'runtime_platform_secure_random' in import" 1
 check_rejects "secure_random_raw_backend_private" "test/negative/secure_random_raw_backend_private.weft" "module member 'runtime_secure_random_fill_raw' is not visible in this import" 1
-check_rejects "tls_client_open_requires_authority" "test/negative/tls_client_open_requires_authority.weft" 'error[E2001]: effects `SecureRandom, Time` are not available in this context'
+check_rejects "tls_client_open_requires_authority" "test/negative/tls_client_open_requires_authority.weft" 'error[E2001]: effects `SecureRandom, WallClock` are not available in this context'
 check_rejects "tls_server_open_requires_authority" "test/negative/tls_server_open_requires_authority.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
 check_rejects "http_client_cannot_listen" "test/negative/http_client_cannot_listen.weft" 'error[E2001]: effect `HttpServer` is not available in this context'
 check_rejects "http_server_cannot_connect" "test/negative/http_server_cannot_connect.weft" 'error[E2001]: effect `HttpClient<TlsStream>` is not available in this context'
@@ -514,15 +514,17 @@ check_rejects "env_arg_requires_effect" "test/negative/env_arg_requires_effect.w
 check_rejects "env_arg_requires_missing_case" "test/negative/env_arg_requires_missing_case.weft" 'type annotation type mismatch: expected `str`, found `str | nil`'
 check_rejects "env_var_requires_effect" "test/negative/env_var_requires_effect.weft" "error[E2001]:"
 check_rejects "env_raw_getenv_requires_trusted" "test/negative/env_raw_getenv_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
-check_rejects "time_now_nanos_requires_effect" "test/negative/time_now_nanos_requires_effect.weft" "error[E2001]:"
+check_rejects "time_monotonic_now_requires_effect" "test/negative/time_monotonic_now_requires_effect.weft" "error[E2001]:"
+check_rejects "time_flat_family_retired" "test/negative/time_flat_family_retired.weft" "unknown module member" 16
 check_rejects "time_date_surface_retired" "test/negative/time_date_surface_retired.weft" "unknown module member" 14
 check_rejects "time_date_constructor_private" "test/negative/time_date_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
-check_rejects "time_weekday_is_not_integer" "test/negative/time_weekday_is_not_integer.weft" 'return value type mismatch: expected `i64`, found `time.Weekday`'
+check_rejects "time_weekday_is_not_integer" "test/negative/time_weekday_is_not_integer.weft" 'return value type mismatch: expected `i64`, found `calendar.Weekday`'
 check_rejects "time_value_surface_retired" "test/negative/time_value_surface_retired.weft" "unknown module member" 22
 check_rejects "time_duration_constructor_private" "test/negative/time_duration_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "time_instant_constructor_private" "test/negative/time_instant_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "time_timestamp_constructor_private" "test/negative/time_timestamp_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "time_platform_wrappers_retired" "test/negative/time_platform_wrappers_retired.weft" "error[E4002]: unknown module member 'runtime_platform_time' in import" 2
-check_rejects "time_sleep_requires_effect" "test/negative/time_sleep_requires_effect.weft" "error[E2001]:"
+check_rejects "time_sleep_wait_requires_effect" "test/negative/time_sleep_wait_requires_effect.weft" "error[E2001]:"
 check_rejects "time_raw_clock_requires_trusted" "test/negative/time_raw_clock_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "time_raw_sleep_requires_trusted" "test/negative/time_raw_sleep_requires_trusted.weft" "type error: Unsafe is sealed to trusted runtime/platform code"
 check_rejects "dir_list_requires_effect" "test/negative/dir_list_requires_effect.weft" "error[E2001]:"

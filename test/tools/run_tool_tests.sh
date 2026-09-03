@@ -654,7 +654,9 @@ stdlib_doc_modules=(
   stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft
   stdlib/maybe.weft stdlib/bytes.weft stdlib/path.weft stdlib/io/types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
-  stdlib/test.weft stdlib/math.weft stdlib/time.weft stdlib/env.weft
+  stdlib/test.weft stdlib/math.weft stdlib/time.weft
+  stdlib/time/monotonic.weft stdlib/time/wall.weft
+  stdlib/time/sleep.weft stdlib/time/calendar.weft stdlib/env.weft
   stdlib/process.weft
   stdlib/json.weft
   stdlib/secure_random.weft stdlib/secure_random/deterministic.weft
@@ -742,6 +744,21 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_iter_pins_source_normalization" "$(<"$tmp_out")" "fn map<S: IntoIterator, U>(input: S, f: (S.Item) -> U)"
   elif [ "$stdlib_doc_name" = "utf8" ]; then
     assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
+  elif [ "$stdlib_doc_name" = "time" ]; then
+    assert_contains "doc_stdlib_time_pins_duration_only" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
+    assert_not_contains "doc_stdlib_time_has_no_combined_capability" "$(<"$tmp_out")" "pub effect Time"
+  elif [ "$stdlib_doc_name" = "time/monotonic" ]; then
+    assert_contains "doc_stdlib_time_monotonic_pins_surface" "$(<"$tmp_out")" "Public API items: 9. Documented: 9."
+    assert_contains "doc_stdlib_time_monotonic_pins_typed_read" "$(<"$tmp_out")" "pub fn now() -[MonotonicClock]> Instant"
+  elif [ "$stdlib_doc_name" = "time/wall" ]; then
+    assert_contains "doc_stdlib_time_wall_pins_surface" "$(<"$tmp_out")" "Public API items: 11. Documented: 11."
+    assert_contains "doc_stdlib_time_wall_pins_typed_failure" "$(<"$tmp_out")" "pub fn now() -[WallClock]> Result<Timestamp, WallClockError>"
+  elif [ "$stdlib_doc_name" = "time/sleep" ]; then
+    assert_contains "doc_stdlib_time_sleep_pins_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
+    assert_contains "doc_stdlib_time_sleep_pins_duration" "$(<"$tmp_out")" "pub fn wait(duration: Duration) -[Sleep]> Result<nil, SleepError>"
+  elif [ "$stdlib_doc_name" = "time/calendar" ]; then
+    assert_contains "doc_stdlib_time_calendar_pins_surface" "$(<"$tmp_out")" "Public API items: 20. Documented: 20."
+    assert_contains "doc_stdlib_time_calendar_pins_date" "$(<"$tmp_out")" "pub type Date = opaque"
   elif [ "$stdlib_doc_name" = "io/transfer" ]; then
     assert_contains "doc_stdlib_io_transfer_pins_public_surface" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
   elif [ "$stdlib_doc_name" = "env" ]; then
@@ -751,6 +768,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_process_pins_public_surface" "$(<"$tmp_out")" "Public API items: 18. Documented: 18."
     assert_contains "doc_stdlib_process_pins_typed_run" "$(<"$tmp_out")" "fn run(path: str, args: List<str>) -> Result<ProcTermination, ProcError>"
     assert_contains "doc_stdlib_process_pins_opaque_owner" "$(<"$tmp_out")" "pub type ProcHandle = opaque"
+    assert_contains "doc_stdlib_process_pins_typed_deadline" "$(<"$tmp_out")" "fn wait_until(resource: ProcHandle, deadline: Instant) -> ProcOutput"
   elif [ "$stdlib_doc_name" = "net_address" ]; then
     assert_contains "doc_stdlib_net_address_pins_public_surface" "$(<"$tmp_out")" "Public API items: 23. Documented: 23."
   elif [ "$stdlib_doc_name" = "idna" ]; then
@@ -771,7 +789,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_tls_pins_public_surface" "$(<"$tmp_out")" "Public API items: 37. Documented: 37."
     assert_contains "doc_stdlib_tls_pins_session_facade" "$(<"$tmp_out")" "pub type TlsSession = opaque"
     assert_contains "doc_stdlib_tls_pins_session_method" "$(<"$tmp_out")" "pub fn handshake(self: borrow mut TlsSession) -> Result<TlsStep, TlsError>"
-    assert_contains "doc_stdlib_tls_client_preserves_authority" "$(<"$tmp_out")" "pub fn client(host: UrlHost, trust_roots: Bytes) -[SecureRandom, Time]> Result<owned TlsSession, TlsError>"
+    assert_contains "doc_stdlib_tls_client_preserves_authority" "$(<"$tmp_out")" "pub fn client(host: UrlHost, trust_roots: Bytes) -[SecureRandom, WallClock]> Result<owned TlsSession, TlsError>"
     assert_contains "doc_stdlib_tls_server_preserves_authority" "$(<"$tmp_out")" "pub fn server(certificate: Bytes, private_key: Bytes) -[SecureRandom]> Result<owned TlsSession, TlsError>"
   elif [ "$stdlib_doc_name" = "http" ]; then
     assert_contains "doc_stdlib_http_pins_public_surface" "$(<"$tmp_out")" "Public API items: 121. Documented: 121."
@@ -788,7 +806,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_http_endpoint_pins_public_surface" "$(<"$tmp_out")" "Public API items: 53. Documented: 53."
     assert_contains "doc_stdlib_http_endpoint_pins_client_authority" "$(<"$tmp_out")" "pub effect HttpClient<S> {"
     assert_contains "doc_stdlib_http_endpoint_pins_server_authority" "$(<"$tmp_out")" "pub effect HttpServer {"
-    assert_contains "doc_stdlib_http_endpoint_pins_client_handler" "$(<"$tmp_out")" "pub fn http_client_with_tls<T, E>(trust_roots: Bytes, body: () -[HttpClient<TlsStream>, HttpBodyIO<TlsStream>, HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, E]> T) -[DnsResolve, SecureRandom, TcpConnect, TcpReadiness, TcpStreamIO, Time, E]> T"
+    assert_contains "doc_stdlib_http_endpoint_pins_client_handler" "$(<"$tmp_out")" "pub fn http_client_with_tls<T, E>(trust_roots: Bytes, body: () -[HttpClient<TlsStream>, HttpBodyIO<TlsStream>, HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, E]> T) -[DnsResolve, SecureRandom, TcpConnect, TcpReadiness, TcpStreamIO, WallClock, E]> T"
     assert_contains "doc_stdlib_http_endpoint_pins_server_handler" "$(<"$tmp_out")" "pub fn http_server_with_tls<T, E>(certificate: Bytes, private_key: Bytes, body: () -[HttpServer, HttpBodyIO<TlsStream>, HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, TcpListenerIO, E]> T) -[SecureRandom, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO, E]> T"
   elif [ "$stdlib_doc_name" = "http_json" ]; then
     assert_contains "doc_stdlib_http_json_pins_public_surface" "$(<"$tmp_out")" "Public API items: 30. Documented: 30."
@@ -833,9 +851,9 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "task" ]; then
     assert_contains "doc_stdlib_task_pins_public_surface" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
     assert_contains "doc_stdlib_task_pins_consuming_join" "$(<"$tmp_out")" "pub fn join<T>(self: unique Task<T>) -[TaskScope]> T"
-    assert_contains "doc_stdlib_task_pins_channel_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel<C: Sendable, T, E>(capacity: ChannelCapacity<C>, body: () -[TaskScope, Time, TcpReadiness, Channel<C>, E]> T) -[E]> T"
-    assert_contains "doc_stdlib_task_pins_shutdown_handler" "$(<"$tmp_out")" "pub fn with_event_loop_shutdown<T, E>(body: () -[TaskScope, Time, TcpReadiness, Cancellation, Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T>"
-    assert_contains "doc_stdlib_task_pins_channel_shutdown_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel_shutdown<C: Sendable, T, E>(capacity: ChannelCapacity<C>, body: () -[TaskScope, Time, TcpReadiness, Channel<C>, Cancellation, Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T>"
+    assert_contains "doc_stdlib_task_pins_channel_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel<C: Sendable, T, E>(capacity: ChannelCapacity<C>, body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Channel<C>, E]> T) -[E]> T"
+    assert_contains "doc_stdlib_task_pins_shutdown_handler" "$(<"$tmp_out")" "pub fn with_event_loop_shutdown<T, E>(body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Cancellation, Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T>"
+    assert_contains "doc_stdlib_task_pins_channel_shutdown_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel_shutdown<C: Sendable, T, E>(capacity: ChannelCapacity<C>, body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Channel<C>, Cancellation, Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T>"
   elif [ "$stdlib_doc_name" = "task/cancellation" ]; then
     assert_contains "doc_stdlib_task_cancellation_pins_public_surface" "$(<"$tmp_out")" "Public API items: 20. Documented: 20."
   elif [ "$stdlib_doc_name" = "task/shutdown" ]; then
@@ -1417,8 +1435,8 @@ assert_not_contains "elf_linux_directory_has_no_dynamic_segment" "$elf_linux_dir
 fi
 
 if [ "$WEFT_TOOL_SHARD" = elf_system ]; then
-# The Time product retains a mockable typed effect in application code. Its
-# production handler selects Linux clock_gettime/nanosleep only at the sealed
+# Wall-clock, monotonic-clock, and sleep effects remain independently mockable.
+# Their production composition selects Linux clock_gettime/nanosleep at the sealed
 # backend boundary, with no libc or dynamic-loader dependency in the product.
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_time_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
@@ -1540,7 +1558,7 @@ assert_contains "elf_linux_tcp_invokes_linux_svc" "$elf_linux_tcp_disassembly" $
 assert_not_contains "elf_linux_tcp_has_no_interpreter" "$elf_linux_tcp_headers" "INTERP off"
 assert_not_contains "elf_linux_tcp_has_no_dynamic_segment" "$elf_linux_tcp_headers" "DYNAMIC off"
 
-# TaskScope and Time remain ordinary typed effects around target-neutral TCP
+# TaskScope, monotonic time, and sleep remain ordinary typed effects around TCP
 # readiness. The product's only readiness substrate is the static Linux epoll
 # ABI; target-local execution is Linux target-local Docker gate.
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_readiness_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"

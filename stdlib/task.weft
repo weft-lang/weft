@@ -3,7 +3,7 @@
 use runtime/spawn_task.{*}
 use runtime/net_poller.{NetPollCancel, NetPollDeadline, NetPollError, NetPollEvent, NetPollInterest, NetPollRegistration, NetPollTerminationSignal, NetPollWait, NetPoller, NetPollAlreadyResolved, NetPollCancelled, NetPollEventReady, NetPollForMillis, NetPollForever, NetPollImmediate, NetPollInterrupt, NetPollInterrupted, NetPollInvalidEvent, NetPollInvalidRegistration, NetPollLimit, NetPollPlatform, NetPollReady, NetPollReadyError, NetPollReadable, NetPollTerminate, NetPollTermination, NetPollTimedOut, NetPollWritable, net_poll_registration_same, net_poller_adopt_listener, net_poller_adopt_stream, net_poller_cancel, net_poller_enable_shutdown, net_poller_open, net_poller_register, net_poller_wait}
 use runtime/panic.{runtime_trap}
-use runtime/time.{runtime_platform_now_millis, runtime_platform_now_nanos, runtime_platform_sleep_millis}
+use runtime/time.{runtime_platform_now_nanos, runtime_platform_sleep_millis}
 use stdlib/task/cancellation.{Cancellation, CancellationOutcome, with_deadline, with_scope}
 use stdlib/task/cancellation.{CancellationReason, CancellationShutdown, request}
 use stdlib/task/channel.{Channel, ChannelAlreadyClosed, ChannelCapacity, ChannelClose, ChannelClosedNow, ChannelDrained, ChannelReceive, ChannelReceived, ChannelSend, ChannelSendAccepted, ChannelSendClosed, ChannelState, channel_capacity_value, channel_state_cleanup, channel_state_close, channel_state_disabled, channel_state_is_closed, channel_state_is_empty, channel_state_is_full, channel_state_new, channel_state_offer, channel_state_take}
@@ -13,7 +13,10 @@ use stdlib/option.{None, Some}
 use stdlib/result.{Err, Ok, Result}
 use stdlib/task/shutdown.{ShutdownInterrupt, ShutdownSignal, ShutdownTerminate}
 use stdlib/tcp.{TcpListener, TcpListenerReadiness, TcpListenerReadinessFailed, TcpListenerReady, TcpReadiness, TcpReadinessError, TcpReadinessInterrupted, TcpReadinessInvalidated, TcpReadinessPlatform, TcpReadinessResourceExhausted, TcpStream, TcpStreamReadiness, TcpStreamReadinessFailed, TcpStreamReady}
-use stdlib/time.{Instant, Time}
+use stdlib/time/monotonic as monotonic
+use stdlib/time/monotonic.{Instant, MonotonicClock}
+use stdlib/time/sleep as sleep
+use stdlib/time/sleep.{InvalidSleepDuration, Sleep, SleepDurationOutOfRange, SleepError, SleepUnavailable}
 use stdlib/vector as vector
 use stdlib/vector.{vector_get_in_bounds, vector_pop, vector_push, vector_remove_at}
 use stdlib/vector/handles.{Vector}
@@ -46,7 +49,7 @@ pub effect TaskScope {
 }
 
 -- One internal suspension atom keeps public capabilities tail-resumptive and
--- makes the scheduler—not Time or TaskScope—the sole owner of stored one-shot
+-- makes the scheduler—not time effects or TaskScope—the sole owner of stored one-shot
 -- continuations. The private variant keeps every suspension reason explicit
 -- while still lowering each nullary case to a scalar tag.
 type EventLoopSuspendMode {
@@ -465,34 +468,46 @@ fn event_loop_run_task<C: Sendable, E>(
     handle {
       handle {
         handle {
-          handle runtime_spawn_task_run<TaskScope | Time | TcpReadiness | Channel<C> | E>(task) {
-            TaskScope.submit(work) -> {
-              let child = runtime_spawn_scope_track(scope, work)
-              if child == 0 { runtime_trap(47, 0) } else { nil }
-              resume(EventLoopSuspend.suspend(task, Runnable, child))
+          handle {
+            handle runtime_spawn_task_run<TaskScope | MonotonicClock | Sleep | TcpReadiness | Channel<C> | E>(task) {
+              TaskScope.submit(work) -> {
+                let child = runtime_spawn_scope_track(scope, work)
+                if child == 0 { runtime_trap(47, 0) } else { nil }
+                resume(EventLoopSuspend.suspend(task, Runnable, child))
+              }
+              TaskScope.join(target) -> {
+                if runtime_spawn_task_state(target) == runtime_spawn_task_complete() {
+                  resume(runtime_spawn_task_join(target))
+                } else {
+                  resume(EventLoopSuspend.suspend(task, Joining, target))
+                }
+              }
             }
-            TaskScope.join(target) -> {
-              if runtime_spawn_task_state(target) == runtime_spawn_task_complete() {
-                resume(runtime_spawn_task_join(target))
+          } {
+            MonotonicClock.now() -> {
+              let now = runtime_platform_now_nanos()
+              if now < 0 {
+                runtime_trap(47, 0)
               } else {
-                resume(EventLoopSuspend.suspend(task, Joining, target))
+                resume(monotonic.nanoseconds(now))
               }
             }
           }
         } {
-          Time.now_millis() -> resume(runtime_platform_now_millis())
-          Time.now_nanos() -> resume(runtime_platform_now_nanos())
-          Time.sleep_millis(ms) -> {
-            match ms {
-              millis if millis < 0 -> resume(0 - 1)
-              0 -> resume(0)
+          Sleep.wait(duration) -> {
+            match duration.milliseconds() {
+              millis if millis < 0 -> resume(Err<nil, SleepError>(InvalidSleepDuration))
+              0 -> resume(Ok<nil, SleepError>(nil))
               millis -> {
                 let now = runtime_platform_now_nanos()
                 match now {
-                  instant if instant < 0 -> resume(0 - 1)
-                  instant if millis > 9223372036854 -> resume(0 - 1)
-                  instant if instant > 9223372036854775807 - millis * 1000000 -> resume(0 - 1)
-                  instant -> resume(EventLoopSuspend.suspend(task, Sleeping, instant + millis * 1000000))
+                  instant if instant < 0 -> resume(Err<nil, SleepError>(SleepUnavailable))
+                  instant if millis > 9223372036854 -> resume(Err<nil, SleepError>(SleepDurationOutOfRange))
+                  instant if instant > 9223372036854775807 - millis * 1000000 -> resume(Err<nil, SleepError>(SleepDurationOutOfRange))
+                  instant -> {
+                    let status = EventLoopSuspend.suspend(task, Sleeping, instant + millis * 1000000)
+                    resume(sleep.result_from_platform_status(status))
+                  }
                 }
               }
             }
@@ -604,18 +619,19 @@ fn event_loop_run_task<C: Sendable, E>(
 
 --- Run a single-threaded production event loop over stored continuations.
 ---
---- TaskScope, Time, TCP readiness and bounded channels keep their ordinary effect
+--- TaskScope, monotonic time, sleep, TCP readiness and bounded channels keep
+--- their ordinary effect
 --- signatures. Waiting tasks yield their one-shot continuation; the executor
 --- blocks in the platform only when no accepted task is runnable, and the
 --- structured scope drains every task before returning.
 fn event_loop_execute<C: Sendable, T, E>(
   channel: ChannelState<C>,
-  body: () -[TaskScope, Time, TcpReadiness, Channel<C>, E]> T,
+  body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Channel<C>, E]> T,
   scope: i64,
   registrations: Vector<EventLoopRegistration>,
   shutdown_enabled: i64
 ) -[EventLoopPoll, EventLoopShutdown, E]> T {
-  let work = runtime_spawn_work_pack<T, TaskScope | Time | TcpReadiness | Channel<C> | E>(body)
+  let work = runtime_spawn_work_pack<T, TaskScope | MonotonicClock | Sleep | TcpReadiness | Channel<C> | E>(body)
   let root = runtime_spawn_scope_track(scope, work)
   if root == 0 { runtime_trap(47, 0) } else { nil }
   event_loop_drive<C, E>(channel, scope, registrations, shutdown_enabled)
@@ -625,7 +641,7 @@ fn event_loop_execute<C: Sendable, T, E>(
 fn event_loop_with_poller<C: Sendable, T, E>(
   poller: borrow mut NetPoller,
   channel: ChannelState<C>,
-  body: () -[TaskScope, Time, TcpReadiness, Channel<C>, E]> T,
+  body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Channel<C>, E]> T,
   shutdown_enabled: i64
 ) -[EventLoopShutdown, E]> T {
   let scope = runtime_spawn_scope_new()
@@ -660,7 +676,7 @@ fn event_loop_with_poller<C: Sendable, T, E>(
 --- Timer and TCP-readiness waits suspend without blocking runnable tasks. The
 --- structured scope drains every accepted task before returning.
 pub fn with_event_loop<T, E>(
-  body: () -[TaskScope, Time, TcpReadiness, E]> T
+  body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, E]> T
 ) -[E]> T {
   let channel = channel_state_disabled<EventLoopNoChannel>()
   match net_poller_open() {
@@ -681,7 +697,7 @@ pub fn with_event_loop<T, E>(
 --- publication signatures.
 pub fn with_event_loop_channel<C: Sendable, T, E>(
   capacity: ChannelCapacity<C>,
-  body: () -[TaskScope, Time, TcpReadiness, Channel<C>, E]> T
+  body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Channel<C>, E]> T
 ) -[E]> T {
   let channel = channel_state_new<C>(channel_capacity_value<C>(capacity))
   defer channel_state_cleanup<C>(channel)
@@ -698,7 +714,7 @@ pub fn with_event_loop_channel<C: Sendable, T, E>(
 
 fn event_loop_shutdown_with_channel<C: Sendable, T, E>(
   channel: ChannelState<C>,
-  body: () -[TaskScope, Time, TcpReadiness, Channel<C>, Cancellation, Fail<CancellationReason>, E]> T
+  body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Channel<C>, Cancellation, Fail<CancellationReason>, E]> T
 ) -[Cancellation, Fail<CancellationReason>, E]> T {
   defer channel_state_cleanup<C>(channel)
   match net_poller_open() {
@@ -732,7 +748,7 @@ fn event_loop_shutdown_with_channel<C: Sendable, T, E>(
 --- becomes an exact `CancellationShutdown` reason; abort then runs structured
 --- LIFO cleanup before process dispositions are restored.
 pub fn with_event_loop_shutdown<T, E>(
-  body: () -[TaskScope, Time, TcpReadiness, Cancellation, Fail<CancellationReason>, E]> T
+  body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Cancellation, Fail<CancellationReason>, E]> T
 ) -[E]> CancellationOutcome<T> {
   let channel = channel_state_disabled<EventLoopNoChannel>()
   with_scope<T, E>(() => event_loop_shutdown_with_channel<
@@ -749,7 +765,7 @@ pub fn with_event_loop_shutdown<T, E>(
 --- exactly once while the fixed-capacity buffer remains bounded.
 pub fn with_event_loop_channel_shutdown<C: Sendable, T, E>(
   capacity: ChannelCapacity<C>,
-  body: () -[TaskScope, Time, TcpReadiness, Channel<C>, Cancellation, Fail<CancellationReason>, E]> T
+  body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Channel<C>, Cancellation, Fail<CancellationReason>, E]> T
 ) -[E]> CancellationOutcome<T> {
   let channel = channel_state_new<C>(channel_capacity_value<C>(capacity))
   with_scope<T, E>(() => event_loop_shutdown_with_channel<C, T, E>(channel, body))
@@ -766,8 +782,8 @@ pub fn with_sequential_cancellation<T, E>(body: () -[TaskScope, Cancellation, Fa
 
 --- Run a deterministic sequential task scope with a cooperative deadline.
 ---
---- Time is consulted only at cancellation checkpoints; no polling, sleeping,
---- or busy-wait fallback is introduced by the sequential policy.
-pub fn with_sequential_deadline<T, E>(deadline: Instant, body: () -[TaskScope, Cancellation, Fail<CancellationReason>, E]> T) -[Time, E]> CancellationOutcome<T> {
+--- Monotonic time is consulted only at cancellation checkpoints; no polling,
+--- sleeping, or busy-wait fallback is introduced by the sequential policy.
+pub fn with_sequential_deadline<T, E>(deadline: Instant, body: () -[TaskScope, Cancellation, Fail<CancellationReason>, E]> T) -[MonotonicClock, E]> CancellationOutcome<T> {
   with_deadline<T, E>(deadline, () => with_sequential<T, Cancellation | Fail<CancellationReason> | E>(body))
 }

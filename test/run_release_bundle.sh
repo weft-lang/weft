@@ -225,12 +225,13 @@ printf '%s\n' \
   'use stdlib/bytes.{Bytes}' \
   'use stdlib/result.{Err, Ok}' \
   'use stdlib/secure_random.{SecureRandom, SecureRandomError}' \
-  'use stdlib/time.{Time}' \
+  'use stdlib/time/wall as wall' \
+  'use stdlib/time/wall.{Timestamp, WallClock, WallClockError}' \
   'use stdlib/tls as tls' \
   'use stdlib/tls.{TlsTrust}' \
   'use stdlib/url as url' \
   '' \
-  'fn open_with_authority() -[SecureRandom, Time]> i64 {' \
+  'fn open_with_authority() -[SecureRandom, WallClock]> i64 {' \
   '  match url.parse("https://localhost/") {' \
   '    Err(error) -> 1' \
   '    Ok(url) -> match tls.client(url.host(), bytes.from_str("bad")) {' \
@@ -240,7 +241,7 @@ printf '%s\n' \
   '  }' \
   '}' \
   '' \
-  'fn with_random() -[Time]> i64 {' \
+  'fn with_random() -[WallClock]> i64 {' \
   '  handle open_with_authority() {' \
   '    SecureRandom.bytes(count) -> resume(Ok<Bytes, SecureRandomError>(' \
   '      bytes.from_str("0123456789abcdef0123456789abcdef0123456789abcdef")' \
@@ -250,9 +251,9 @@ printf '%s\n' \
   '' \
   'fn main() -> i64 {' \
   '  handle with_random() {' \
-  '    Time.now_millis() -> resume(1788134400000)' \
-  '    Time.now_nanos() -> resume(0)' \
-  '    Time.sleep_millis(ms) -> resume(0)' \
+  '    WallClock.now() -> resume(Ok<Timestamp, WallClockError>(' \
+  '      wall.milliseconds_since_unix_epoch(1788134400000)' \
+  '    ))' \
   '  }' \
   '}' > "$work/project/tls_probe.weft"
 
