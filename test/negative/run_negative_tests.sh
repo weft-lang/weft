@@ -68,7 +68,7 @@ check_rejects "deep_release_mask_overflow_generic" "test/negative/deep_release_m
 check_rejects "par_map_scoped_effectful" "test/negative/par_map_scoped_effectful.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -[Log]> i64`'
 check_rejects "par_pool_submit_effectful" "test/negative/par_pool_submit_effectful.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -[Log]> i64`'
 check_rejects "par_prepared_submit_public" "test/negative/par_prepared_submit_public.weft" "type error: prepared Par submission is compiler-internal"
-check_rejects "generic_par_task_double_await" "test/negative/generic_par_task_double_await.weft" "type error: unique value used more than once"
+check_rejects "generic_par_task_double_join" "test/negative/generic_par_task_double_join.weft" "type error: unique value used more than once"
 check_rejects "generic_par_task_non_sendable_result" "test/negative/generic_par_task_non_sendable_result.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
 check_rejects "generic_par_task_non_sendable_capture" "test/negative/generic_par_task_non_sendable_capture.weft" "type error: closure capture is not Sendable across scoped Par"
 check_rejects "generic_par_task_type_mismatch" "test/negative/generic_par_task_type_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `unique par.ParTask<str>`, found `unique par.ParTask<i64>`'
@@ -701,7 +701,7 @@ check_rejects "unique_param_used_twice" "test/negative/unique_param_used_twice.w
 check_rejects "unique_let_used_twice" "test/negative/unique_let_used_twice.weft" "type error: unique value used more than once"
 check_rejects "unique_closure_capture" "test/negative/unique_closure_capture.weft" "type error: unique value cannot be captured by closure"
 check_rejects "unique_contextual_lambda_param_used_twice" "test/negative/unique_contextual_lambda_param_used_twice.weft" "type error: unique value used more than once"
-check_rejects "unique_par_spawn_use_after_move" "test/negative/unique_par_spawn_use_after_move.weft" "type error: unique value used more than once"
+check_rejects "unique_par_fork_use_after_move" "test/negative/unique_par_fork_use_after_move.weft" "type error: unique value used more than once"
 check_rejects "owned_param_used_twice" "test/negative/owned_param_used_twice.weft" "type error: owned value used more than once"
 check_rejects "owned_let_used_twice" "test/negative/owned_let_used_twice.weft" "type error: owned value used more than once"
 check_rejects "owned_borrow_after_move" "test/negative/owned_borrow_after_move.weft" "type error: owned value used more than once"
@@ -745,9 +745,9 @@ check_rejects "region_scoped_deferred_continuation_outer_region" "test/negative/
 check_rejects "region_scoped_deferred_continuation_body_region" "test/negative/region_scoped_deferred_continuation_body_region.weft" "type error: region value cannot escape scoped arena"
 check_rejects "region_scoped_deferred_continuation_function_boundary" "test/negative/region_scoped_deferred_continuation_function_boundary.weft" "type error: region value cannot escape scoped arena"
 check_rejects "region_scoped_deferred_continuation_store_outer" "test/negative/region_scoped_deferred_continuation_store_outer.weft" "type error: region value cannot escape scoped arena"
-check_rejects "region_scoped_par_spawn_lambda_capture" "test/negative/region_scoped_par_spawn_lambda_capture.weft" "type error: region value cannot escape scoped arena"
-check_rejects "region_scoped_par_spawn_region_arg" "test/negative/region_scoped_par_spawn_region_arg.weft" "type error: region value cannot escape scoped arena"
-check_rejects "region_scoped_par_spawn_branch_lambda_capture" "test/negative/region_scoped_par_spawn_branch_lambda_capture.weft" "type error: region value cannot escape scoped arena"
+check_rejects "region_scoped_par_fork_lambda_capture" "test/negative/region_scoped_par_fork_lambda_capture.weft" "type error: region value cannot escape scoped arena"
+check_rejects "region_scoped_par_fork_region_arg" "test/negative/region_scoped_par_fork_region_arg.weft" "type error: region value cannot escape scoped arena"
+check_rejects "region_scoped_par_fork_branch_lambda_capture" "test/negative/region_scoped_par_fork_branch_lambda_capture.weft" "type error: region value cannot escape scoped arena"
 check_rejects "region_scoped_generator_escape" "test/negative/region_scoped_generator_escape.weft" "type error: region value cannot escape scoped arena"
 check_rejects "region_scoped_iterator_escape" "test/negative/region_scoped_iterator_escape.weft" "type error: region value cannot escape scoped arena"
 check_rejects "lambda_capture_mut_binding" "test/negative/lambda_capture_mut_binding.weft" "type error: cannot capture mut binding"
@@ -1007,7 +1007,7 @@ check_rejects "borrow_mut_method_immutable_owner" "test/negative/borrow_mut_meth
 check_rejects "borrow_effect_conflicting_perform" "test/negative/borrow_effect_conflicting_perform.weft" "type error: conflicting resource borrows in one call" 1
 check_rejects "borrow_effect_deferred_continuation" "test/negative/borrow_effect_deferred_continuation.weft" "type error: borrowed effect parameter cannot enter a deferred continuation" 1
 check_rejects "borrow_closure_capture" "test/negative/borrow_closure_capture.weft" "type error: borrowed resource cannot be captured by closure" 1
-check_rejects "borrow_par_spawn_capture" "test/negative/borrow_par_spawn_capture.weft" "type error: borrowed resource cannot be captured by closure" 1
+check_rejects "borrow_par_fork_capture" "test/negative/borrow_par_fork_capture.weft" "type error: borrowed resource cannot be captured by closure" 1
 
 if [ "$CENSUS_ONLY" -eq 1 ]; then
   echo "$JOB_N"
