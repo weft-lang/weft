@@ -113,6 +113,10 @@ same TCP surface. Its related capabilities live together under
 deadlines, `task/shutdown` names portable shutdown signals, and `task/channel`
 provides bounded typed channels with backpressure.
 
+See [Concurrency in Weft](concurrency.md) for the distinction between
+deterministic `Par` work and effectful `TaskScope` scheduling, including the
+shared structured-lifetime rules and handler choices.
+
 ## HTTPS, HTTP, and web streams
 
 The alpha web floor is validating TLS 1.2 plus hardened HTTP/1.1. The current
