@@ -309,7 +309,7 @@ check_rejects "iter_nth_negative_index" "test/negative/iter_nth_negative_index.w
 check_rejects "iter_take_while_effectful_callback" "test/negative/iter_take_while_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_skip_while_effectful_callback" "test/negative/iter_skip_while_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_skip_negative_count" "test/negative/iter_skip_negative_count.weft" 'error[E1002]: integer literal does not fit expected type `usize`'
-check_rejects "iter_chain_item_mismatch" "test/negative/iter_chain_item_mismatch.weft" 'error[E1002]: argument type mismatch: expected `owned Iterator<i64>`, found `owned Iterator<str>`'
+check_rejects "iter_chain_item_mismatch" "test/negative/iter_chain_item_mismatch.weft" "type error: associated type constraint mismatch"
 check_rejects "iter_chain_duplicate_source" "test/negative/iter_chain_duplicate_source.weft" "type error: owned value used more than once"
 check_rejects "iter_zip_duplicate_source" "test/negative/iter_zip_duplicate_source.weft" "type error: owned value used more than once"
 check_rejects "iterator_collect_item_mismatch" "test/negative/iterator_collect_item_mismatch.weft" "type error: associated type constraint mismatch"
@@ -389,6 +389,7 @@ check_rejects "vector_sort_missing_ord" "test/negative/vector_sort_missing_ord.w
 check_rejects "vector_sort_effectful_comparator" "test/negative/vector_sort_effectful_comparator.weft" 'error[E1002]: argument type mismatch: expected `(i64, i64) -> Ordering`, found `(i64, i64) -[SortNoise]> Ordering`'
 check_rejects "vector_into_iter_requires_owned" "test/negative/vector_into_iter_requires_owned.weft" "type error: for iterator requires an array, slice, Cons/Nil list, or IntoIterator"
 check_rejects "vector_use_after_into_iter" "test/negative/vector_use_after_into_iter.weft" "type error: owned value used more than once"
+check_rejects "iter_vector_source_use_after_normalization" "test/negative/iter_vector_source_use_after_normalization.weft" "type error: owned value used more than once"
 check_rejects "vector_filter_effectful_predicate" "test/negative/vector_filter_effectful_predicate.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> bool`, found `(i64) -[FilterNoise]> bool`'
 check_rejects "vector_concat_type_mismatch" "test/negative/vector_concat_type_mismatch.weft" 'error[E1002]: borrowed argument type mismatch: expected `Vector<i64>`, found `Vector<str>`'
 check_rejects "generic_function_ref_unresolved" "test/negative/generic_function_ref_unresolved.weft" "type error: cannot infer generic function reference"
