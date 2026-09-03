@@ -634,10 +634,22 @@ doc_stdlib_out=$(<"$tmp_out")
 assert_contains "doc_stdlib_facade_constituent_names_api" "$doc_stdlib_out" '# API: `stdlib/result.weft`'
 assert_contains "doc_stdlib_facade_constituent_renders_checked_variant" "$doc_stdlib_out" $'pub type Result<T, E> {\n  Ok(T),\n  Err(E)\n}'
 
+set +e
+"$WEFT" doc test/module_fixtures/inherent_extension_facade.weft > "$tmp_out" 2> "$tmp_err"
+doc_inherent_facade_exit=$?
+set -e
+assert_equals "doc_inherent_facade_exits_zero" "$doc_inherent_facade_exit" "0"
+assert_equals "doc_inherent_facade_stderr_empty" "$(<"$tmp_err")" ""
+doc_inherent_facade_out=$(<"$tmp_out")
+assert_contains "doc_inherent_facade_counts_complete_surface" "$doc_inherent_facade_out" "Public API items: 8. Documented: 8."
+assert_contains "doc_inherent_facade_renders_first_same_named_method" "$doc_inherent_facade_out" "pub fn value(self: FirstValue) -> i64"
+assert_contains "doc_inherent_facade_renders_second_same_named_method" "$doc_inherent_facade_out" "pub fn value(self: SecondValue) -> i64"
+assert_not_contains "doc_inherent_facade_hides_private_method" "$doc_inherent_facade_out" "hidden"
+
 # Every module in the frozen stdlib reference island must remain complete;
 # adding an exported member without adjacent `---` prose fails immediately.
 stdlib_doc_modules=(
-  stdlib/assert.weft stdlib/default.weft stdlib/display.weft stdlib/drop.weft
+  stdlib/prelude.weft stdlib/assert.weft stdlib/default.weft stdlib/display.weft stdlib/drop.weft
   stdlib/eq.weft stdlib/hash.weft stdlib/ord.weft stdlib/panic.weft
   stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft
   stdlib/maybe.weft stdlib/bytes.weft stdlib/path.weft stdlib/io/types.weft
@@ -682,13 +694,17 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     exit 1
   fi
   # These audited facades must not regrow legacy runtime mechanics.
-  if [ "$stdlib_doc_name" = "generator" ]; then
+  if [ "$stdlib_doc_name" = "prelude" ]; then
+    assert_contains "doc_stdlib_prelude_pins_public_surface" "$(<"$tmp_out")" "Public API items: 55. Documented: 55."
+    assert_contains "doc_stdlib_prelude_pins_iterator_identity" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
+    assert_contains "doc_stdlib_prelude_pins_failure_effect" "$(<"$tmp_out")" "pub effect Fail<E>"
+  elif [ "$stdlib_doc_name" = "generator" ]; then
     assert_contains "doc_stdlib_generator_pins_public_surface" "$(<"$tmp_out")" "Public API items: 9. Documented: 9."
     assert_contains "doc_stdlib_generator_pins_opaque_state" "$(<"$tmp_out")" "pub type Generator<T, R> = opaque"
     assert_not_contains "doc_stdlib_generator_hides_raw_yield" "$(<"$tmp_out")" "@deferred fn yield(value: i64) -> i64"
     assert_not_contains "doc_stdlib_generator_hides_untyped_send" "$(<"$tmp_out")" "fn send"
   elif [ "$stdlib_doc_name" = "iter/protocol" ]; then
-    assert_contains "doc_stdlib_iter_protocol_pins_public_surface" "$(<"$tmp_out")" "Public API items: 9. Documented: 9."
+    assert_contains "doc_stdlib_iter_protocol_pins_public_surface" "$(<"$tmp_out")" "Public API items: 11. Documented: 11."
     assert_contains "doc_stdlib_iter_protocol_pins_opaque_state" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
     assert_contains "doc_stdlib_iter_protocol_pins_owned_identity" "$(<"$tmp_out")" 'impl<T> IntoIterator for owned Iterator<T>'
     assert_contains "doc_stdlib_iter_protocol_pins_collection_output" "$(<"$tmp_out")" "type Output"
@@ -699,7 +715,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "iter/core" ]; then
     assert_contains "doc_stdlib_iter_core_pins_public_surface" "$(<"$tmp_out")" "Public API items: 25. Documented: 25."
     assert_contains "doc_stdlib_iter_core_pins_source_adapter" "$(<"$tmp_out")" "fn map<S: IntoIterator, U>(input: S, f: (S.Item) -> U)"
-    assert_contains "doc_stdlib_iter_core_discards_any_generator_completion" "$(<"$tmp_out")" "fn from_generator<T, R>(g: owned generator.Generator<T, R>)"
+    assert_contains "doc_stdlib_iter_core_discards_any_generator_completion" "$(<"$tmp_out")" "fn from_generator<T, R>(g: owned Generator<T, R>)"
     assert_contains "doc_stdlib_iter_core_uses_semantic_take_limit" "$(<"$tmp_out")" "fn take<S: IntoIterator>(input: S, limit: usize)"
     assert_contains "doc_stdlib_iter_core_uses_semantic_count" "$(<"$tmp_out")" "fn count<S: IntoIterator>(input: S) -> usize"
     assert_contains "doc_stdlib_iter_core_pins_first" "$(<"$tmp_out")" "fn first<S: IntoIterator>(input: S) -> Option<S.Item>"
@@ -720,6 +736,10 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_iter_core_pins_heterogeneous_zip" "$(<"$tmp_out")" "fn zip<L: IntoIterator, R: IntoIterator>(left: L, right: R) -> owned Iterator<(L.Item, R.Item)>"
     assert_contains "doc_stdlib_iter_core_pins_filter_map" "$(<"$tmp_out")" "fn filter_map<S: IntoIterator, U>(input: S, f: (S.Item) -> Option<U>)"
     assert_contains "doc_stdlib_iter_core_pins_effectful_each" "$(<"$tmp_out")" "fn each<S: IntoIterator, E>(input: S, f: (S.Item) -[E]> nil) -[E]> nil"
+  elif [ "$stdlib_doc_name" = "iter" ]; then
+    assert_contains "doc_stdlib_iter_pins_public_surface" "$(<"$tmp_out")" "Public API items: 36. Documented: 36."
+    assert_contains "doc_stdlib_iter_pins_owned_iterator" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
+    assert_contains "doc_stdlib_iter_pins_source_normalization" "$(<"$tmp_out")" "fn map<S: IntoIterator, U>(input: S, f: (S.Item) -> U)"
   elif [ "$stdlib_doc_name" = "utf8" ]; then
     assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
   elif [ "$stdlib_doc_name" = "io/transfer" ]; then
@@ -748,9 +768,11 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_url_pins_tls_identity" "$(<"$tmp_out")" "pub fn tls_identity(self: Url) -> str"
     assert_contains "doc_stdlib_url_pins_origin" "$(<"$tmp_out")" "pub fn origin(self: Url) -> UrlOrigin"
   elif [ "$stdlib_doc_name" = "tls" ]; then
-    assert_contains "doc_stdlib_tls_pins_public_surface" "$(<"$tmp_out")" "Public API items: 27. Documented: 27."
-    assert_contains "doc_stdlib_tls_client_preserves_authority" "$(<"$tmp_out")" "pub fn client(host: UrlHost, trust_roots: bytes.Bytes) -[SecureRandom, Time]> Result<owned TlsSession, TlsError>"
-    assert_contains "doc_stdlib_tls_server_preserves_authority" "$(<"$tmp_out")" "pub fn server(certificate: bytes.Bytes, private_key: bytes.Bytes) -[SecureRandom]> Result<owned TlsSession, TlsError>"
+    assert_contains "doc_stdlib_tls_pins_public_surface" "$(<"$tmp_out")" "Public API items: 37. Documented: 37."
+    assert_contains "doc_stdlib_tls_pins_session_facade" "$(<"$tmp_out")" "pub type TlsSession = opaque"
+    assert_contains "doc_stdlib_tls_pins_session_method" "$(<"$tmp_out")" "pub fn handshake(self: borrow mut TlsSession) -> Result<TlsStep, TlsError>"
+    assert_contains "doc_stdlib_tls_client_preserves_authority" "$(<"$tmp_out")" "pub fn client(host: UrlHost, trust_roots: Bytes) -[SecureRandom, Time]> Result<owned TlsSession, TlsError>"
+    assert_contains "doc_stdlib_tls_server_preserves_authority" "$(<"$tmp_out")" "pub fn server(certificate: Bytes, private_key: Bytes) -[SecureRandom]> Result<owned TlsSession, TlsError>"
   elif [ "$stdlib_doc_name" = "http" ]; then
     assert_contains "doc_stdlib_http_pins_public_surface" "$(<"$tmp_out")" "Public API items: 121. Documented: 121."
     assert_contains "doc_stdlib_http_pins_opaque_head" "$(<"$tmp_out")" "pub type HttpRequestHead = opaque"
@@ -766,8 +788,8 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_http_endpoint_pins_public_surface" "$(<"$tmp_out")" "Public API items: 53. Documented: 53."
     assert_contains "doc_stdlib_http_endpoint_pins_client_authority" "$(<"$tmp_out")" "pub effect HttpClient<S> {"
     assert_contains "doc_stdlib_http_endpoint_pins_server_authority" "$(<"$tmp_out")" "pub effect HttpServer {"
-    assert_contains "doc_stdlib_http_endpoint_pins_client_handler" "$(<"$tmp_out")" "pub fn http_client_with_tls<T, E>(trust_roots: Bytes, body: () -[HttpClient<tls_stream.TlsStream>, HttpBodyIO<tls_stream.TlsStream>, HttpTransportIO<tls_stream.TlsStream>, HttpTransportRelease<tls_stream.TlsStream>, E]> T) -[DnsResolve, SecureRandom, TcpConnect, TcpReadiness, TcpStreamIO, Time, E]> T"
-    assert_contains "doc_stdlib_http_endpoint_pins_server_handler" "$(<"$tmp_out")" "pub fn http_server_with_tls<T, E>(certificate: Bytes, private_key: Bytes, body: () -[HttpServer, HttpBodyIO<tls_stream.TlsStream>, HttpTransportIO<tls_stream.TlsStream>, HttpTransportRelease<tls_stream.TlsStream>, TcpListenerIO, E]> T) -[SecureRandom, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO, E]> T"
+    assert_contains "doc_stdlib_http_endpoint_pins_client_handler" "$(<"$tmp_out")" "pub fn http_client_with_tls<T, E>(trust_roots: Bytes, body: () -[HttpClient<TlsStream>, HttpBodyIO<TlsStream>, HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, E]> T) -[DnsResolve, SecureRandom, TcpConnect, TcpReadiness, TcpStreamIO, Time, E]> T"
+    assert_contains "doc_stdlib_http_endpoint_pins_server_handler" "$(<"$tmp_out")" "pub fn http_server_with_tls<T, E>(certificate: Bytes, private_key: Bytes, body: () -[HttpServer, HttpBodyIO<TlsStream>, HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, TcpListenerIO, E]> T) -[SecureRandom, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO, E]> T"
   elif [ "$stdlib_doc_name" = "http_json" ]; then
     assert_contains "doc_stdlib_http_json_pins_public_surface" "$(<"$tmp_out")" "Public API items: 30. Documented: 30."
     assert_contains "doc_stdlib_http_json_pins_owned_reader" "$(<"$tmp_out")" "pub type HttpJsonReader<S> = opaque"
@@ -776,7 +798,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "http_client" ]; then
     assert_contains "doc_stdlib_http_client_pins_public_surface" "$(<"$tmp_out")" "Public API items: 46. Documented: 46."
     assert_contains "doc_stdlib_http_client_pins_owned_pool" "$(<"$tmp_out")" "pub type HttpConnectionPool<S> = opaque"
-    assert_contains "doc_stdlib_http_client_pins_redirect_step" "$(<"$tmp_out")" "pub fn step(history: HttpRedirectHistory, current: url.Url, request_method: http.HttpMethod, response: http.HttpResponseHead, policy: HttpRedirectPolicy) -> HttpRedirectStep"
+    assert_contains "doc_stdlib_http_client_pins_redirect_step" "$(<"$tmp_out")" "pub fn step(history: HttpRedirectHistory, current: Url, request_method: HttpMethod, response: HttpResponseHead, policy: HttpRedirectPolicy) -> HttpRedirectStep"
   elif [ "$stdlib_doc_name" = "sse" ]; then
     assert_contains "doc_stdlib_sse_pins_public_surface" "$(<"$tmp_out")" "Public API items: 37. Documented: 37."
     assert_contains "doc_stdlib_sse_pins_bounded_decoder" "$(<"$tmp_out")" "pub type SseDecoder = opaque"
@@ -787,12 +809,12 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_sse_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn next<S>(self: owned SseReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseReadOutcome<S>"
   elif [ "$stdlib_doc_name" = "websocket" ]; then
     assert_contains "doc_stdlib_websocket_pins_public_surface" "$(<"$tmp_out")" "Public API items: 124. Documented: 124."
-    assert_contains "doc_stdlib_websocket_pins_typed_handshake" "$(<"$tmp_out")" "pub fn server_upgrade(request: http.HttpRequestHead) -> Result<http.HttpHeaders, WebSocketHandshakeError>"
+    assert_contains "doc_stdlib_websocket_pins_typed_handshake" "$(<"$tmp_out")" "pub fn server_upgrade(request: HttpRequestHead) -> Result<HttpHeaders, WebSocketHandshakeError>"
     assert_contains "doc_stdlib_websocket_pins_bounded_payload" "$(<"$tmp_out")" "pub type WebSocketPayloadDecoder = opaque"
     assert_contains "doc_stdlib_websocket_pins_typed_opcode" "$(<"$tmp_out")" "pub fn opcode(self: WebSocketFrameHeader) -> WebSocketOpcode"
     assert_contains "doc_stdlib_websocket_pins_close_aware_message_begin" "$(<"$tmp_out")" "pub fn begin(self: WebSocketMessageState, handshake: WebSocketCloseHandshake, flow: WebSocketMessageFlow, header: WebSocketFrameHeader, limits: WebSocketLimits) -> Result<WebSocketMessageFrame, WebSocketError>"
     assert_contains "doc_stdlib_websocket_pins_message_transition" "$(<"$tmp_out")" "pub fn read(self: WebSocketMessageFrame, input: WebSocketMessageInput) -> WebSocketMessageRead"
-    assert_contains "doc_stdlib_websocket_pins_random_mask" "$(<"$tmp_out")" "pub fn encode_client_frame(final: bool, opcode: WebSocketOpcode, payload: bytes.Bytes, limits: WebSocketLimits) -[SecureRandom]> Result<bytes.Bytes, WebSocketError>"
+    assert_contains "doc_stdlib_websocket_pins_random_mask" "$(<"$tmp_out")" "pub fn encode_client_frame(final: bool, opcode: WebSocketOpcode, payload: Bytes, limits: WebSocketLimits) -[SecureRandom]> Result<Bytes, WebSocketError>"
     assert_contains "doc_stdlib_websocket_pins_close_race" "$(<"$tmp_out")" "pub fn on_receive(self: WebSocketCloseHandshake, close: WebSocketCloseValue) -> WebSocketCloseTransition"
   elif [ "$stdlib_doc_name" = "websocket_stream" ]; then
     assert_contains "doc_stdlib_websocket_stream_pins_public_surface" "$(<"$tmp_out")" "Public API items: 38. Documented: 38."
@@ -802,6 +824,12 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_task_channel_pins_public_surface" "$(<"$tmp_out")" "Public API items: 18. Documented: 18."
     assert_contains "doc_stdlib_task_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"
     assert_contains "doc_stdlib_task_channel_pins_bounded_send" "$(<"$tmp_out")" "fn send(value: T) -> ChannelSend<T>"
+  elif [ "$stdlib_doc_name" = "vector" ]; then
+    assert_contains "doc_stdlib_vector_pins_public_surface" "$(<"$tmp_out")" "Public API items: 39. Documented: 39."
+    assert_contains "doc_stdlib_vector_pins_mutable_type" "$(<"$tmp_out")" "pub type Vector<T>"
+    assert_contains "doc_stdlib_vector_pins_persistent_type" "$(<"$tmp_out")" "pub type PersistentVector<T>"
+    assert_contains "doc_stdlib_vector_pins_mutable_len" "$(<"$tmp_out")" "pub fn len<T>(self: borrow Vector<T>) -> i64"
+    assert_contains "doc_stdlib_vector_pins_persistent_len" "$(<"$tmp_out")" "pub fn len<T>(self: PersistentVector<T>) -> i64"
   elif [ "$stdlib_doc_name" = "task" ]; then
     assert_contains "doc_stdlib_task_pins_public_surface" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
     assert_contains "doc_stdlib_task_pins_consuming_join" "$(<"$tmp_out")" "pub fn join<T>(self: unique Task<T>) -[TaskScope]> T"
@@ -824,7 +852,6 @@ done
 # tripwire: none can silently sprout an undocumented alpha contract.
 internal_stdlib_modules=(
   continuation
-  prelude
   string
   test/report
   thread

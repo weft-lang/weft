@@ -71,7 +71,7 @@ check_rejects "par_prepared_submit_public" "test/negative/par_prepared_submit_pu
 check_rejects "generic_par_task_double_join" "test/negative/generic_par_task_double_join.weft" "type error: unique value used more than once"
 check_rejects "generic_par_task_non_sendable_result" "test/negative/generic_par_task_non_sendable_result.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
 check_rejects "generic_par_task_non_sendable_capture" "test/negative/generic_par_task_non_sendable_capture.weft" "type error: closure capture is not Sendable across scoped Par"
-check_rejects "generic_par_task_type_mismatch" "test/negative/generic_par_task_type_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `unique par.ParTask<str>`, found `unique par.ParTask<i64>`'
+check_rejects "generic_par_task_type_mismatch" "test/negative/generic_par_task_type_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `unique ParTask<str>`, found `unique ParTask<i64>`'
 check_rejects "generic_par_task_forged" "test/negative/generic_par_task_forged.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "task_spawn_requires_effect" "test/negative/task_spawn_requires_effect.weft" 'error[E2001]: effect `TaskScope` is not available in this context'
 check_rejects "task_child_effect_requires_contract" "test/negative/task_child_effect_requires_contract.weft" 'error[E2001]: effect `SpawnChildNoise` is not available in this context'
@@ -466,6 +466,7 @@ check_rejects "module_qualified_pattern_unknown" "test/negative/module_qualified
 check_rejects "module_qualified_pattern_private" "test/negative/module_qualified_pattern_private.weft" "error[E4004]: module member 'left.Hidden' is not visible"
 check_rejects "module_qualified_pattern_identity_mismatch" "test/negative/module_qualified_pattern_identity_mismatch.weft" "type error: constructor pattern does not match scrutinee"
 check_rejects "module_inherent_method_private" "test/negative/module_inherent_method_private.weft" "type error: method is not visible"
+check_rejects "module_inherent_extension_private" "test/negative/module_inherent_extension_private.weft" "type error: method is not visible"
 check_rejects "module_inherent_method_unknown" "test/negative/module_inherent_method_unknown.weft" "type error: unknown method"
 check_rejects "module_associated_method_private" "test/negative/module_associated_method_private.weft" "type error: method is not visible"
 check_rejects "module_associated_method_unknown" "test/negative/module_associated_method_unknown.weft" "type error: unknown method"
@@ -656,7 +657,7 @@ check_rejects "intrinsic_i64_to_f64_arg_mismatch" "test/negative/intrinsic_i64_t
 check_rejects "intrinsic_u64_to_f64_arg_mismatch" "test/negative/intrinsic_u64_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u64`, found `i64`'
 check_rejects "num_to_i64_exact_wrong_receiver" "test/negative/num_to_i64_exact_wrong_receiver.weft" "type error: unknown method"
 check_rejects "num_parse_f64_default_mismatch" "test/negative/num_parse_f64_default_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `str`'
-check_rejects "num_parse_float_lane_mismatch" "test/negative/num_parse_float_lane_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `Result<f64, num.NumParseError>`, found `Result<f32, num.NumParseError>`'
+check_rejects "num_parse_float_lane_mismatch" "test/negative/num_parse_float_lane_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `Result<f64, NumParseError>`, found `Result<f32, NumParseError>`'
 check_rejects "intrinsic_f64_to_i64_arg_mismatch" "test/negative/intrinsic_f64_to_i64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
 check_rejects "num_to_f64_receiver_mismatch" "test/negative/num_to_f64_receiver_mismatch.weft" "unknown method"
 check_rejects "num_to_f32_round_receiver_mismatch" "test/negative/num_to_f32_round_receiver_mismatch.weft" "unknown method"
