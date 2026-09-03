@@ -75,7 +75,7 @@ check_rejects "generic_par_task_type_mismatch" "test/negative/generic_par_task_t
 check_rejects "generic_par_task_forged" "test/negative/generic_par_task_forged.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "task_spawn_requires_effect" "test/negative/task_spawn_requires_effect.weft" 'error[E2001]: effect `TaskScope` is not available in this context'
 check_rejects "task_child_effect_requires_contract" "test/negative/task_child_effect_requires_contract.weft" 'error[E2001]: effect `SpawnChildNoise` is not available in this context'
-check_rejects "task_non_sendable_result" "test/negative/task_non_sendable_result.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
+check_rejects "task_non_sendable_result" "test/negative/task_non_sendable_result.weft" 'error[E1004]: type `owned Vector<i64>` does not implement `Sendable`'
 check_rejects "task_non_sendable_capture" "test/negative/task_non_sendable_capture.weft" "type error: task closure is not Sendable across a structured task boundary"
 check_rejects "task_scope_escape" "test/negative/task_scope_escape.weft" "type error: Task cannot escape its structured task scope"
 check_rejects "task_event_loop_scope_escape" "test/negative/task_event_loop_scope_escape.weft" "type error: Task cannot escape its structured task scope"
@@ -387,8 +387,10 @@ check_rejects "vector_cross_type_push" "test/negative/vector_cross_type_push.wef
 check_rejects "persistent_vector_cross_type_push" "test/negative/persistent_vector_cross_type_push.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "vector_sort_missing_ord" "test/negative/vector_sort_missing_ord.weft" "error[E1004]:"
 check_rejects "vector_sort_effectful_comparator" "test/negative/vector_sort_effectful_comparator.weft" 'error[E1002]: argument type mismatch: expected `(i64, i64) -> Ordering`, found `(i64, i64) -[SortNoise]> Ordering`'
+check_rejects "vector_into_iter_requires_owned" "test/negative/vector_into_iter_requires_owned.weft" "type error: for iterator requires an array, slice, Cons/Nil list, or IntoIterator"
+check_rejects "vector_use_after_into_iter" "test/negative/vector_use_after_into_iter.weft" "type error: owned value used more than once"
 check_rejects "vector_filter_effectful_predicate" "test/negative/vector_filter_effectful_predicate.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> bool`, found `(i64) -[FilterNoise]> bool`'
-check_rejects "vector_concat_type_mismatch" "test/negative/vector_concat_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `Vector<i64>`, found `Vector<str>`'
+check_rejects "vector_concat_type_mismatch" "test/negative/vector_concat_type_mismatch.weft" 'error[E1002]: borrowed argument type mismatch: expected `Vector<i64>`, found `Vector<str>`'
 check_rejects "generic_function_ref_unresolved" "test/negative/generic_function_ref_unresolved.weft" "type error: cannot infer generic function reference"
 check_rejects "generic_call_unresolved" "test/negative/generic_call_unresolved.weft" "type error: cannot infer generic call type arguments; write explicit type arguments"
 check_rejects "generic_qualified_call_unresolved" "test/negative/generic_qualified_call_unresolved.weft" "type error: cannot infer generic call type arguments; write explicit type arguments"
@@ -987,7 +989,7 @@ check_rejects "sendable_bound_mutable_vector" "test/negative/sendable_bound_muta
 check_rejects "sendable_bound_nested_mutable" "test/negative/sendable_bound_nested_mutable.weft" 'error[E1004]: type `SendableEnvelope<Vector<i64>>` does not implement `Sendable`'
 check_rejects "sendable_bound_function_requires_value" "test/negative/sendable_bound_function_requires_value.weft" 'error[E1004]: type `(i64) -> i64` does not implement `Sendable`'
 check_rejects "sendable_bound_slice_requires_scope" "test/negative/sendable_bound_slice_requires_scope.weft" 'error[E1004]: type `[i64]` does not implement `Sendable`'
-check_rejects "sendable_par_worker_mutable_state_capture" "test/negative/sendable_par_worker_mutable_state_capture.weft" "type error: closure capture is not Sendable across scoped Par"
+check_rejects "sendable_par_worker_dynamic_capture" "test/negative/sendable_par_worker_dynamic_capture.weft" "type error: closure capture is not Sendable across scoped Par"
 check_rejects "sendable_reserved_trait" "test/negative/sendable_reserved_trait.weft" "type error: Sendable is reserved as a sealed structural predicate"
 check_rejects "sendable_sealed_impl" "test/negative/sendable_sealed_impl.weft" "type error: Sendable is a sealed structural predicate and cannot be implemented"
 check_rejects "slice_par_permission_does_not_leak" "test/negative/slice_par_permission_does_not_leak.weft" "type error: slice borrow cannot be captured by an escaping closure"
