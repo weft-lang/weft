@@ -107,9 +107,11 @@ The runtime uses package-internal one-shot readiness: kqueue on macOS and epoll
 on Linux. Registrations carry resource identity, interest, generation, and a
 process-lifetime poller epoch, so descriptor or mapping reuse cannot make stale
 readiness current. This is scheduler mechanism, not a second public async API:
-the structured `Spawn` handler suspends ordinary effectful functions over the
-same TCP surface, with typed cancellation, deadlines, shutdown signals, and
-bounded channels.
+the structured task handler suspends ordinary effectful functions over the
+same TCP surface. Its related capabilities live together under
+`stdlib/task/`: `task/cancellation` provides cooperative cancellation and
+deadlines, `task/shutdown` names portable shutdown signals, and `task/channel`
+provides bounded typed channels with backpressure.
 
 ## HTTPS, HTTP, and web streams
 

@@ -73,23 +73,26 @@ check_rejects "generic_par_task_non_sendable_result" "test/negative/generic_par_
 check_rejects "generic_par_task_non_sendable_capture" "test/negative/generic_par_task_non_sendable_capture.weft" "type error: closure capture is not Sendable across scoped Par"
 check_rejects "generic_par_task_type_mismatch" "test/negative/generic_par_task_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `unique ParTask<str>`, found `unique ParTask<i64>`'
 check_rejects "generic_par_task_forged" "test/negative/generic_par_task_forged.weft" "type error: ParTask is a sealed runtime token and cannot be constructed"
-check_rejects "spawn_requires_effect" "test/negative/spawn_requires_effect.weft" 'error[E2001]: effect `Spawn` is not available in this context'
-check_rejects "spawn_child_effect_requires_contract" "test/negative/spawn_child_effect_requires_contract.weft" 'error[E2001]: effect `SpawnChildNoise` is not available in this context'
-check_rejects "spawn_non_sendable_result" "test/negative/spawn_non_sendable_result.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
-check_rejects "spawn_non_sendable_capture" "test/negative/spawn_non_sendable_capture.weft" "type error: task closure is not Sendable across structured Spawn"
-check_rejects "spawn_task_scope_escape" "test/negative/spawn_task_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
-check_rejects "spawn_task_event_loop_scope_escape" "test/negative/spawn_task_event_loop_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
-check_rejects "spawn_task_channel_scope_escape" "test/negative/spawn_task_channel_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
-check_rejects "spawn_task_shutdown_scope_escape" "test/negative/spawn_task_shutdown_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
-check_rejects "spawn_task_channel_shutdown_scope_escape" "test/negative/spawn_task_channel_shutdown_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
+check_rejects "task_spawn_requires_effect" "test/negative/task_spawn_requires_effect.weft" 'error[E2001]: effect `TaskScope` is not available in this context'
+check_rejects "task_child_effect_requires_contract" "test/negative/task_child_effect_requires_contract.weft" 'error[E2001]: effect `SpawnChildNoise` is not available in this context'
+check_rejects "task_non_sendable_result" "test/negative/task_non_sendable_result.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
+check_rejects "task_non_sendable_capture" "test/negative/task_non_sendable_capture.weft" "type error: task closure is not Sendable across structured Spawn"
+check_rejects "task_scope_escape" "test/negative/task_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
+check_rejects "task_event_loop_scope_escape" "test/negative/task_event_loop_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
+check_rejects "task_channel_scope_escape" "test/negative/task_channel_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
+check_rejects "task_shutdown_scope_escape" "test/negative/task_shutdown_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
+check_rejects "task_channel_shutdown_scope_escape" "test/negative/task_channel_shutdown_scope_escape.weft" "type error: SpawnTask cannot escape its structured Spawn scope"
 check_rejects "channel_non_sendable_element" "test/negative/channel_non_sendable_element.weft" 'does not implement `Sendable`'
 check_rejects "channel_non_sendable_signature" "test/negative/channel_non_sendable_signature.weft" 'does not implement `Sendable`' 1
 check_rejects "channel_non_sendable_handler" "test/negative/channel_non_sendable_handler.weft" 'does not implement `Sendable`' 1
-check_rejects "spawn_task_double_join" "test/negative/spawn_task_double_join.weft" "type error: unique value used more than once"
-check_rejects "spawn_task_constructor_private" "test/negative/spawn_task_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
-check_rejects "cancellation_request_requires_effect" "test/negative/cancellation_request_requires_effect.weft" 'error[E2001]: effect `Cancellation` is not available in this context'
-check_rejects "cancellation_checkpoint_requires_effect" "test/negative/cancellation_checkpoint_requires_effect.weft" 'error[E2001]: effects `Cancellation, Fail<cancellation.CancellationReason>` are not available in this context'
-check_rejects "cancellation_deadline_requires_time" "test/negative/cancellation_deadline_requires_time.weft" 'error[E2001]: effect `Time` is not available in this context'
+check_rejects "task_double_join" "test/negative/task_double_join.weft" "type error: unique value used more than once"
+check_rejects "task_constructor_private" "test/negative/task_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "task_flat_channel_module_retired" "test/negative/task_flat_channel_module_retired.weft" "error[E1001]: unknown function 'capacity'" 1
+check_rejects "task_flat_cancellation_module_retired" "test/negative/task_flat_cancellation_module_retired.weft" "error[E1001]: unknown function 'state'" 1
+check_rejects "task_flat_shutdown_module_retired" "test/negative/task_flat_shutdown_module_retired.weft" "error[E1001]: unknown identifier 'ShutdownInterrupt'" 1
+check_rejects "task_cancellation_request_requires_effect" "test/negative/task_cancellation_request_requires_effect.weft" 'error[E2001]: effect `Cancellation` is not available in this context'
+check_rejects "task_cancellation_checkpoint_requires_effect" "test/negative/task_cancellation_checkpoint_requires_effect.weft" 'error[E2001]: effects `Cancellation, Fail<cancellation.CancellationReason>` are not available in this context'
+check_rejects "task_cancellation_deadline_requires_time" "test/negative/task_cancellation_deadline_requires_time.weft" 'error[E2001]: effect `Time` is not available in this context'
 check_rejects "generator_start_non_literal_producer" "test/negative/generator_start_non_literal_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_start_function_with_arg" "test/negative/generator_start_function_with_arg.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"
 check_rejects "generator_start_mutable_closure_producer" "test/negative/generator_start_mutable_closure_producer.weft" "type error: generator producer must be literal zero-arg lambda, known zero-arg function, or known zero-arg closure"

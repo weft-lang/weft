@@ -657,10 +657,10 @@ stdlib_doc_modules=(
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector/handles.weft
   stdlib/vector.weft stdlib/generator.weft stdlib/iter.weft
   stdlib/semantic_type.weft stdlib/semantic_type/render.weft
-  stdlib/f64_table.weft stdlib/num.weft stdlib/io/helpers.weft
-  stdlib/utf8.weft stdlib/string.weft
-  stdlib/io.weft stdlib/par.weft stdlib/cancellation.weft
-  stdlib/shutdown.weft stdlib/channel.weft stdlib/spawn.weft
+  stdlib/f64_table.weft stdlib/num.weft stdlib/io/transfer.weft
+  stdlib/utf8.weft
+  stdlib/io.weft stdlib/par.weft stdlib/task/cancellation.weft
+  stdlib/task/shutdown.weft stdlib/task/channel.weft stdlib/task.weft
 )
 for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   stdlib_doc_name=${stdlib_doc_module#stdlib/}
@@ -681,9 +681,9 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   fi
   # These audited facades must not regrow legacy runtime mechanics.
   if [ "$stdlib_doc_name" = "utf8" ]; then
-    assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
-  elif [ "$stdlib_doc_name" = "io_helpers" ]; then
-    assert_contains "doc_stdlib_io_helpers_pins_public_surface" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
+    assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
+  elif [ "$stdlib_doc_name" = "io/transfer" ]; then
+    assert_contains "doc_stdlib_io_transfer_pins_public_surface" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
   elif [ "$stdlib_doc_name" = "env" ]; then
     assert_contains "doc_stdlib_env_pins_public_surface" "$(<"$tmp_out")" "Public API items: 4. Documented: 4."
     assert_contains "doc_stdlib_env_pins_optional_argument" "$(<"$tmp_out")" "fn arg(index: i64) -> str | nil"
@@ -691,20 +691,17 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_process_pins_public_surface" "$(<"$tmp_out")" "Public API items: 18. Documented: 18."
     assert_contains "doc_stdlib_process_pins_typed_run" "$(<"$tmp_out")" "fn run(path: str, args: List<str>) -> Result<ProcTermination, ProcError>"
     assert_contains "doc_stdlib_process_pins_opaque_owner" "$(<"$tmp_out")" "pub type ProcHandle = opaque"
-  elif [ "$stdlib_doc_name" = "string" ]; then
-    assert_contains "doc_stdlib_string_pins_public_surface" "$(<"$tmp_out")" "Public API items: 17. Documented: 17."
   elif [ "$stdlib_doc_name" = "net_address" ]; then
     assert_contains "doc_stdlib_net_address_pins_public_surface" "$(<"$tmp_out")" "Public API items: 23. Documented: 23."
   elif [ "$stdlib_doc_name" = "idna" ]; then
     assert_contains "doc_stdlib_idna_pins_public_surface" "$(<"$tmp_out")" "Public API items: 15. Documented: 15."
   elif [ "$stdlib_doc_name" = "dns" ]; then
-    assert_contains "doc_stdlib_dns_pins_public_surface" "$(<"$tmp_out")" "Public API items: 25. Documented: 25."
-    assert_contains "doc_stdlib_dns_policy_preserves_authority_fact" "$(<"$tmp_out")" "pub fn dns_with_policy<T, E>(policy: DnsPolicy, body: () -[DnsResolve, E]> T) -[DnsResolve, E]> T"
+    assert_contains "doc_stdlib_dns_pins_public_surface" "$(<"$tmp_out")" "Public API items: 16. Documented: 16."
+    assert_contains "doc_stdlib_dns_resolve_preserves_authority_fact" "$(<"$tmp_out")" "pub fn resolve(host: DomainName, port: u16, family: DnsFamily) -[DnsResolve]> Result<Vector<SocketAddress>, DnsError>"
   elif [ "$stdlib_doc_name" = "tcp" ]; then
-assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public API items: 83. Documented: 83."
-    assert_contains "doc_stdlib_tcp_connect_preserves_owned_authority_fact" "$(<"$tmp_out")" "pub fn tcp_connect(address: SocketAddress, options: TcpConnectOptions) -[TcpConnect]> Result<owned TcpStream, TcpError>"
-    assert_contains "doc_stdlib_tcp_connect_policy_preserves_authority_fact" "$(<"$tmp_out")" "pub fn tcp_connect_with_policy<T, E>(policy: TcpConnectPolicy, body: () -[TcpConnect, E]> T) -[TcpConnect, E]> T"
-    assert_contains "doc_stdlib_tcp_listen_policy_preserves_authority_fact" "$(<"$tmp_out")" "pub fn tcp_listen_with_policy<T, E>(policy: TcpListenPolicy, body: () -[TcpListen, E]> T) -[TcpListen, E]> T"
+    assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public API items: 77. Documented: 77."
+    assert_contains "doc_stdlib_tcp_connect_preserves_owned_authority_fact" "$(<"$tmp_out")" "pub fn connect(address: SocketAddress, options: TcpConnectOptions) -[TcpConnect]> Result<owned TcpStream, TcpError>"
+    assert_contains "doc_stdlib_tcp_listen_preserves_owned_authority_fact" "$(<"$tmp_out")" "pub fn listen(address: SocketAddress, options: TcpListenOptions) -[TcpListen]> Result<owned TcpListener, TcpError>"
   elif [ "$stdlib_doc_name" = "url" ]; then
     assert_contains "doc_stdlib_url_pins_public_surface" "$(<"$tmp_out")" "Public API items: 46. Documented: 46."
     assert_contains "doc_stdlib_url_pins_typed_host" "$(<"$tmp_out")" "pub fn host(self: Url) -> UrlHost"
@@ -718,62 +715,62 @@ assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public AP
     assert_contains "doc_stdlib_http_pins_public_surface" "$(<"$tmp_out")" "Public API items: 121. Documented: 121."
     assert_contains "doc_stdlib_http_pins_opaque_head" "$(<"$tmp_out")" "pub type HttpRequestHead = opaque"
     assert_contains "doc_stdlib_http_pins_typed_framing" "$(<"$tmp_out")" "pub type HttpBodyFraming {"
-    assert_contains "doc_stdlib_http_pins_prefix_parser" "$(<"$tmp_out")" "pub fn http_parse_request_head(source: [u8], limits: HttpLimits) -> HttpRequestHeadParse"
+    assert_contains "doc_stdlib_http_pins_prefix_parser" "$(<"$tmp_out")" "pub fn parse_request_head(source: [u8], limits: HttpLimits) -> HttpRequestHeadParse"
   elif [ "$stdlib_doc_name" = "http_stream" ]; then
     assert_contains "doc_stdlib_http_stream_pins_public_surface" "$(<"$tmp_out")" "Public API items: 38. Documented: 38."
     assert_contains "doc_stdlib_http_stream_pins_owned_body" "$(<"$tmp_out")" "pub type HttpBodyStream<S> = opaque"
     assert_contains "doc_stdlib_http_stream_pins_body_authority" "$(<"$tmp_out")" "pub effect HttpBodyIO<S> {"
-    assert_contains "doc_stdlib_http_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn http_body_read<S>(stream: owned HttpBodyStream<S>, limit: usize) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpBodyReadOutcome<S>"
-    assert_contains "doc_stdlib_http_stream_pins_explicit_cancel" "$(<"$tmp_out")" "pub fn http_body_cancel<S>(stream: owned HttpBodyStream<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> Result<nil, HttpBodyError>"
+    assert_contains "doc_stdlib_http_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn read<S>(self: owned HttpBodyStream<S>, limit: usize) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpBodyReadOutcome<S>"
+    assert_contains "doc_stdlib_http_stream_pins_explicit_cancel" "$(<"$tmp_out")" "pub fn cancel<S>(self: owned HttpBodyStream<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> Result<nil, HttpBodyError>"
   elif [ "$stdlib_doc_name" = "http_endpoint" ]; then
-    assert_contains "doc_stdlib_http_endpoint_pins_public_surface" "$(<"$tmp_out")" "Public API items: 62. Documented: 62."
+    assert_contains "doc_stdlib_http_endpoint_pins_public_surface" "$(<"$tmp_out")" "Public API items: 53. Documented: 53."
     assert_contains "doc_stdlib_http_endpoint_pins_client_authority" "$(<"$tmp_out")" "pub effect HttpClient<S> {"
     assert_contains "doc_stdlib_http_endpoint_pins_server_authority" "$(<"$tmp_out")" "pub effect HttpServer {"
-    assert_contains "doc_stdlib_http_endpoint_pins_client_handler" "$(<"$tmp_out")" "pub fn http_client_with_tls<T, E>(trust_roots: Bytes, body: () -[HttpClient<TlsStream>, HttpBodyIO<TlsStream>, HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, E]> T) -[DnsResolve, SecureRandom, TcpConnect, TcpReadiness, TcpStreamIO, Time, E]> T"
-    assert_contains "doc_stdlib_http_endpoint_pins_server_handler" "$(<"$tmp_out")" "pub fn http_server_with_tls<T, E>(certificate: Bytes, private_key: Bytes, body: () -[HttpServer, HttpBodyIO<TlsStream>, HttpTransportIO<TlsStream>, HttpTransportRelease<TlsStream>, TcpListenerIO, E]> T) -[SecureRandom, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO, E]> T"
+    assert_contains "doc_stdlib_http_endpoint_pins_client_handler" "$(<"$tmp_out")" "pub fn http_client_with_tls<T, E>(trust_roots: Bytes, body: () -[HttpClient<tls_stream.TlsStream>, HttpBodyIO<tls_stream.TlsStream>, HttpTransportIO<tls_stream.TlsStream>, HttpTransportRelease<tls_stream.TlsStream>, E]> T) -[DnsResolve, SecureRandom, TcpConnect, TcpReadiness, TcpStreamIO, Time, E]> T"
+    assert_contains "doc_stdlib_http_endpoint_pins_server_handler" "$(<"$tmp_out")" "pub fn http_server_with_tls<T, E>(certificate: Bytes, private_key: Bytes, body: () -[HttpServer, HttpBodyIO<tls_stream.TlsStream>, HttpTransportIO<tls_stream.TlsStream>, HttpTransportRelease<tls_stream.TlsStream>, TcpListenerIO, E]> T) -[SecureRandom, TcpListen, TcpListenerIO, TcpReadiness, TcpStreamIO, E]> T"
   elif [ "$stdlib_doc_name" = "http_json" ]; then
-    assert_contains "doc_stdlib_http_json_pins_public_surface" "$(<"$tmp_out")" "Public API items: 31. Documented: 31."
+    assert_contains "doc_stdlib_http_json_pins_public_surface" "$(<"$tmp_out")" "Public API items: 30. Documented: 30."
     assert_contains "doc_stdlib_http_json_pins_owned_reader" "$(<"$tmp_out")" "pub type HttpJsonReader<S> = opaque"
-    assert_contains "doc_stdlib_http_json_pins_bounded_read" "$(<"$tmp_out")" "pub fn http_json_read<S>(reader: owned HttpJsonReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpJsonReadOutcome<S>"
-    assert_contains "doc_stdlib_http_json_pins_semantic_write" "$(<"$tmp_out")" "pub fn http_json_write<S>(body: owned HttpBodyStream<S>, value: Json) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpJsonWriteOutcome<S>"
+    assert_contains "doc_stdlib_http_json_pins_bounded_read" "$(<"$tmp_out")" "pub fn read<S>(self: owned HttpJsonReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpJsonReadOutcome<S>"
+    assert_contains "doc_stdlib_http_json_pins_semantic_write" "$(<"$tmp_out")" "pub type HttpJsonWriteOutcome<S> {"
   elif [ "$stdlib_doc_name" = "http_client" ]; then
     assert_contains "doc_stdlib_http_client_pins_public_surface" "$(<"$tmp_out")" "Public API items: 46. Documented: 46."
     assert_contains "doc_stdlib_http_client_pins_owned_pool" "$(<"$tmp_out")" "pub type HttpConnectionPool<S> = opaque"
-    assert_contains "doc_stdlib_http_client_pins_redirect_step" "$(<"$tmp_out")" "pub fn http_redirect_step(history: HttpRedirectHistory, current: Url, request_method: HttpMethod, response: HttpResponseHead, policy: HttpRedirectPolicy) -> HttpRedirectStep"
+    assert_contains "doc_stdlib_http_client_pins_redirect_step" "$(<"$tmp_out")" "pub fn step(history: HttpRedirectHistory, current: url.Url, request_method: http.HttpMethod, response: http.HttpResponseHead, policy: HttpRedirectPolicy) -> HttpRedirectStep"
   elif [ "$stdlib_doc_name" = "sse" ]; then
     assert_contains "doc_stdlib_sse_pins_public_surface" "$(<"$tmp_out")" "Public API items: 37. Documented: 37."
     assert_contains "doc_stdlib_sse_pins_bounded_decoder" "$(<"$tmp_out")" "pub type SseDecoder = opaque"
-    assert_contains "doc_stdlib_sse_pins_incremental_transition" "$(<"$tmp_out")" "pub fn sse_decode(decoder: SseDecoder, input: SseInput) -> SseDecode"
+    assert_contains "doc_stdlib_sse_pins_incremental_transition" "$(<"$tmp_out")" "pub fn decode(self: SseDecoder, input: SseInput) -> SseDecode"
   elif [ "$stdlib_doc_name" = "sse_stream" ]; then
     assert_contains "doc_stdlib_sse_stream_pins_public_surface" "$(<"$tmp_out")" "Public API items: 25. Documented: 25."
     assert_contains "doc_stdlib_sse_stream_pins_owned_reader" "$(<"$tmp_out")" "pub type SseReader<S> = opaque"
-    assert_contains "doc_stdlib_sse_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn sse_reader_next<S>(reader: owned SseReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseReadOutcome<S>"
+    assert_contains "doc_stdlib_sse_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn next<S>(self: owned SseReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseReadOutcome<S>"
   elif [ "$stdlib_doc_name" = "websocket" ]; then
-    assert_contains "doc_stdlib_websocket_pins_public_surface" "$(<"$tmp_out")" "Public API items: 123. Documented: 123."
-    assert_contains "doc_stdlib_websocket_pins_typed_handshake" "$(<"$tmp_out")" "pub fn websocket_server_upgrade(request: HttpRequestHead) -> Result<HttpHeaders, WebSocketHandshakeError>"
+    assert_contains "doc_stdlib_websocket_pins_public_surface" "$(<"$tmp_out")" "Public API items: 124. Documented: 124."
+    assert_contains "doc_stdlib_websocket_pins_typed_handshake" "$(<"$tmp_out")" "pub fn server_upgrade(request: http.HttpRequestHead) -> Result<http.HttpHeaders, WebSocketHandshakeError>"
     assert_contains "doc_stdlib_websocket_pins_bounded_payload" "$(<"$tmp_out")" "pub type WebSocketPayloadDecoder = opaque"
-    assert_contains "doc_stdlib_websocket_pins_typed_opcode" "$(<"$tmp_out")" "pub fn websocket_frame_opcode(header: WebSocketFrameHeader) -> WebSocketOpcode"
-    assert_contains "doc_stdlib_websocket_pins_close_aware_message_begin" "$(<"$tmp_out")" "pub fn websocket_message_begin(state: WebSocketMessageState, handshake: WebSocketCloseHandshake, flow: WebSocketMessageFlow, header: WebSocketFrameHeader, limits: WebSocketLimits) -> Result<WebSocketMessageFrame, WebSocketError>"
-    assert_contains "doc_stdlib_websocket_pins_message_transition" "$(<"$tmp_out")" "pub fn websocket_message_read(decoder: WebSocketMessageFrame, input: WebSocketMessageInput) -> WebSocketMessageRead"
-    assert_contains "doc_stdlib_websocket_pins_random_mask" "$(<"$tmp_out")" "pub fn websocket_encode_client_frame(final: bool, opcode: WebSocketOpcode, payload: Bytes, limits: WebSocketLimits) -[SecureRandom]> Result<Bytes, WebSocketError>"
-    assert_contains "doc_stdlib_websocket_pins_close_race" "$(<"$tmp_out")" "pub fn websocket_close_on_receive(state: WebSocketCloseHandshake, close: WebSocketCloseValue) -> WebSocketCloseTransition"
+    assert_contains "doc_stdlib_websocket_pins_typed_opcode" "$(<"$tmp_out")" "pub fn opcode(self: WebSocketFrameHeader) -> WebSocketOpcode"
+    assert_contains "doc_stdlib_websocket_pins_close_aware_message_begin" "$(<"$tmp_out")" "pub fn begin(self: WebSocketMessageState, handshake: WebSocketCloseHandshake, flow: WebSocketMessageFlow, header: WebSocketFrameHeader, limits: WebSocketLimits) -> Result<WebSocketMessageFrame, WebSocketError>"
+    assert_contains "doc_stdlib_websocket_pins_message_transition" "$(<"$tmp_out")" "pub fn read(self: WebSocketMessageFrame, input: WebSocketMessageInput) -> WebSocketMessageRead"
+    assert_contains "doc_stdlib_websocket_pins_random_mask" "$(<"$tmp_out")" "pub fn encode_client_frame(final: bool, opcode: WebSocketOpcode, payload: bytes.Bytes, limits: WebSocketLimits) -[SecureRandom]> Result<bytes.Bytes, WebSocketError>"
+    assert_contains "doc_stdlib_websocket_pins_close_race" "$(<"$tmp_out")" "pub fn on_receive(self: WebSocketCloseHandshake, close: WebSocketCloseValue) -> WebSocketCloseTransition"
   elif [ "$stdlib_doc_name" = "websocket_stream" ]; then
     assert_contains "doc_stdlib_websocket_stream_pins_public_surface" "$(<"$tmp_out")" "Public API items: 38. Documented: 38."
     assert_contains "doc_stdlib_websocket_stream_pins_owned_session" "$(<"$tmp_out")" "pub type WebSocketStream<S> = opaque"
-    assert_contains "doc_stdlib_websocket_stream_pins_bounded_payload" "$(<"$tmp_out")" "pub fn websocket_frame_read<S>(frame: owned WebSocketFrameStream<S>, limit: usize) -[HttpTransportIO<S>, HttpTransportRelease<S>]> WebSocketPayloadOutcome<S>"
-  elif [ "$stdlib_doc_name" = "channel" ]; then
-    assert_contains "doc_stdlib_channel_pins_public_surface" "$(<"$tmp_out")" "Public API items: 21. Documented: 21."
-    assert_contains "doc_stdlib_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"
-    assert_contains "doc_stdlib_channel_pins_bounded_send" "$(<"$tmp_out")" "pub fn channel_send<T: Sendable>(value: T) -[Channel<T>]> ChannelSend<T>"
-  elif [ "$stdlib_doc_name" = "spawn" ]; then
-    assert_contains "doc_stdlib_spawn_pins_public_surface" "$(<"$tmp_out")" "Public API items: 13. Documented: 13."
-    assert_contains "doc_stdlib_spawn_pins_channel_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel<C: Sendable, T, E>(capacity: ChannelCapacity<C>, body: () -[Spawn, Time, TcpReadiness, Channel<C>, E]> T) -[E]> T"
-    assert_contains "doc_stdlib_spawn_pins_shutdown_handler" "$(<"$tmp_out")" "pub fn with_event_loop_shutdown<T, E>(body: () -[Spawn, Time, TcpReadiness, Cancellation, Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T>"
-    assert_contains "doc_stdlib_spawn_pins_channel_shutdown_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel_shutdown<C: Sendable, T, E>(capacity: ChannelCapacity<C>, body: () -[Spawn, Time, TcpReadiness, Channel<C>, Cancellation, Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T>"
-  elif [ "$stdlib_doc_name" = "cancellation" ]; then
-    assert_contains "doc_stdlib_cancellation_pins_public_surface" "$(<"$tmp_out")" "Public API items: 20. Documented: 20."
-  elif [ "$stdlib_doc_name" = "shutdown" ]; then
-    assert_contains "doc_stdlib_shutdown_pins_public_surface" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
+    assert_contains "doc_stdlib_websocket_stream_pins_bounded_payload" "$(<"$tmp_out")" "pub fn read<S>(self: owned WebSocketFrameStream<S>, limit: usize) -[HttpTransportIO<S>, HttpTransportRelease<S>]> WebSocketPayloadOutcome<S>"
+  elif [ "$stdlib_doc_name" = "task/channel" ]; then
+    assert_contains "doc_stdlib_task_channel_pins_public_surface" "$(<"$tmp_out")" "Public API items: 18. Documented: 18."
+    assert_contains "doc_stdlib_task_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"
+    assert_contains "doc_stdlib_task_channel_pins_bounded_send" "$(<"$tmp_out")" "fn send(value: T) -> ChannelSend<T>"
+  elif [ "$stdlib_doc_name" = "task" ]; then
+    assert_contains "doc_stdlib_task_pins_public_surface" "$(<"$tmp_out")" "Public API items: 13. Documented: 13."
+    assert_contains "doc_stdlib_task_pins_channel_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel<C: Sendable, T, E>(capacity: ChannelCapacity<C>, body: () -[TaskScope, Time, TcpReadiness, Channel<C>, E]> T) -[E]> T"
+    assert_contains "doc_stdlib_task_pins_shutdown_handler" "$(<"$tmp_out")" "pub fn with_event_loop_shutdown<T, E>(body: () -[TaskScope, Time, TcpReadiness, Cancellation, Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T>"
+    assert_contains "doc_stdlib_task_pins_channel_shutdown_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel_shutdown<C: Sendable, T, E>(capacity: ChannelCapacity<C>, body: () -[TaskScope, Time, TcpReadiness, Channel<C>, Cancellation, Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T>"
+  elif [ "$stdlib_doc_name" = "task/cancellation" ]; then
+    assert_contains "doc_stdlib_task_cancellation_pins_public_surface" "$(<"$tmp_out")" "Public API items: 20. Documented: 20."
+  elif [ "$stdlib_doc_name" = "task/shutdown" ]; then
+    assert_contains "doc_stdlib_task_shutdown_pins_public_surface" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
   elif [ "$stdlib_doc_name" = "io" ]; then
     assert_contains "doc_stdlib_io_pins_public_surface" "$(<"$tmp_out")" "Public API items: 13. Documented: 13."
   elif [ "$stdlib_doc_name" = "par" ]; then
@@ -787,6 +784,7 @@ done
 internal_stdlib_modules=(
   continuation
   prelude
+  string
   test/report
   thread
   unicode/data/case
@@ -1474,7 +1472,7 @@ assert_contains "elf_linux_tcp_invokes_linux_svc" "$elf_linux_tcp_disassembly" $
 assert_not_contains "elf_linux_tcp_has_no_interpreter" "$elf_linux_tcp_headers" "INTERP off"
 assert_not_contains "elf_linux_tcp_has_no_dynamic_segment" "$elf_linux_tcp_headers" "DYNAMIC off"
 
-# Spawn and Time remain ordinary typed effects around target-neutral TCP
+# TaskScope and Time remain ordinary typed effects around target-neutral TCP
 # readiness. The product's only readiness substrate is the static Linux epoll
 # ABI; target-local execution is Linux target-local Docker gate.
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_readiness_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
