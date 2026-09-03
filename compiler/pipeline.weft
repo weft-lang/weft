@@ -2180,6 +2180,12 @@ pub(package) fn pipeline_native_static_pair_site_count(native: NativeModule) -> 
   }
 }
 
+pub(package) fn pipeline_native_static_literal_slot_count(native: NativeModule) -> i64 {
+  match native {
+    NativeModule(code, fm, functions) -> fmap_static_literal_slot_count(fm)
+  }
+}
+
 pub(package) fn pipeline_native_alloc_elision_count(native: NativeModule) -> i64 {
   match native {
     NativeModule(code, fm, functions) -> fmap_alloc_elision_count(fm)
@@ -31785,7 +31791,8 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst,
         )
       } else { 0 }
     }
-    IrStringLit(dst, start, len) -> pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_direct_kind())
+    -- Literal descriptors and bytes live in static program-image storage.
+    IrStringLit(dst, start, len) -> 0
     IrStringConcatI64(dst, left, right) -> pipeline_ir_abort_cleanup_add_acquisition_fact(facts, dst, dst, pipeline_rc_default_release_hash(), pipeline_ir_abort_cleanup_direct_kind())
     IrClosureI64(dst, fn_value, captures, evidence) -> {
       -- The closure backing environment is released after any scheduled
@@ -36631,7 +36638,7 @@ pub(package) fn pipeline_ir_native_emit_function_ref(code: i64, dst: i64, callee
   -- path. The ADD low bits are final for executables (the data page is
   -- 4KB-aligned) and overwritten by ld for objects.
   let adrp_pos = buf_len(code)
-  fmap_add_static_pair_patch(fm, adrp_pos, slot_off)
+  fmap_add_static_value_patch(fm, adrp_pos, slot_off)
   bu32(code, encode_adrp(17, 0))
   bu32(code, encode_add_imm(17, 17, slot_off - slot_off / 4096 * 4096))
   bu32(code, cg_ldr(9, 17, 0))
@@ -37710,33 +37717,25 @@ pub(package) fn pipeline_ir_native_emit_structural_split(code: i64, value: i64, 
   }
 }
 
--- STRB's unsigned imm12 tops out at 4095, and beyond it the offset
--- term used to overflow into the opcode bits (the encoder now traps
--- instead). Literal bytes store through a rolling base in x14 that
--- advances 4096 per chunk — two ADDs of 2048, since ADD's imm12 has
--- the same 4095 cap — so the STRB offset stays in range for any
--- literal length. x14 is dead between the data alloc and the header
--- stores in emit_string_lit.
-pub(package) fn pipeline_ir_native_emit_string_bytes(code: i64, src: i64, start: i64, len: i64) -> i64 {
-  bu32(code, encode_add_imm(14, 16, 0))
-  for i in 0..len {
-    if i > 0 and i - i / 4096 * 4096 == 0 {
-      bu32(code, encode_add_imm(14, 14, 2048))
-      bu32(code, encode_add_imm(14, 14, 2048))
-    } else { 0 }
-    let byte = mem_load8(src + start + i)
-    bu32(code, encode_movz(17, byte, 0))
-    bu32(code, cg_strb(17, 14, i - i / 4096 * 4096))
-  }
-  0
-}
-
 pub(package) fn pipeline_ir_native_emit_string_lit(code: i64, dst: i64, start: i64, len: i64, src: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
-  let aligned_len = (len + 7) / 8 * 8
-  cg_bump_alloc_imm(code, fm, 16, aligned_len)
-  pipeline_ir_native_emit_string_bytes(code, src, start, len)
-  bu32(code, encode_add_imm(15, 16, 0))
-  cg_bump_alloc_imm(code, fm, 17, 16)
+  -- A literal is immutable program data, not a runtime allocation. Its bytes
+  -- stay inline in the native image and its stable (pointer, length)
+  -- descriptor occupies a dedicated zero-fill static-value slot. Every
+  -- evaluation writes the same two words before returning the slot; the
+  -- idempotent stores make concurrent evaluation observationally identical.
+  let skip = buf_len(code)
+  bu32(code, 0)
+  let data = buf_len(code)
+  for i in 0..len { bu8(code, mem_load8(src + start + i)) }
+  while (buf_len(code) band 3) != 0 { bu8(code, 0) }
+  cg_patch_b(code, skip, buf_len(code))
+
+  pipeline_ir_native_emit_image_address(code, 15, data)
+  let slot_off = fmap_static_literal_slot_reserve(fm)
+  let adrp_pos = buf_len(code)
+  fmap_add_static_value_patch(fm, adrp_pos, slot_off)
+  bu32(code, encode_adrp(17, 0))
+  bu32(code, encode_add_imm(17, 17, slot_off - slot_off / 4096 * 4096))
   bu32(code, cg_str(15, 17, 0))
   emit_mov_imm_safe(code, 16, len)
   bu32(code, cg_str(16, 17, 8))
@@ -41306,8 +41305,9 @@ pub(package) fn pipeline_ir_native_resident_def_shape(inst: IrInst, fpd: i64) ->
           IrAddressOfSlotI64(dst, slot) -> 9
           IrFunctionRefI64(dst, fhash) -> 12
           IrGenericFunctionRefI64(dst, fhash, type_args) -> 12
-          -- A string literal ALLOCATES (bytes copy + (ptr,len) pair) —
-          -- it is a constructor with identity, never an address remat.
+          -- A string literal materialises the address of its stable static
+          -- descriptor. It remains an address-bearing value rather than an
+          -- arithmetic rematerialisation candidate.
           IrStringLit(dst, start, len) -> 8
           IrPerformI64(dst, eff, op_hash, args) -> 10
           IrHandlerDirectI64(dst, h1, h2, h3, h4, args) -> 10
@@ -44604,32 +44604,32 @@ pub(package) fn pipeline_emit_native_macho_object(format: BinaryFormat, code: i6
   BinaryObject(o, binary_format_kind(format))
 }
 
--- Resolve static closure-pair ADRP sites against the executable's
--- zero-fill __DATA page at ts. Both the code section (vm 16384 + pos)
+-- Resolve static-value ADRP sites against the executable's zero-fill __DATA
+-- page at ts. Both the code section (vm 16384 + pos)
 -- and the data page (vm ts) sit at 4KB-aligned bases, so the page delta
 -- is exact in file-offset terms and the ADD low bits emitted at the
 -- site are already final.
-pub(package) fn pipeline_apply_static_pair_patches(code: i64, fm: i64) -> i64 {
-  let n = fmap_static_pair_patch_count(fm)
+pub(package) fn pipeline_apply_static_value_patches(code: i64, fm: i64) -> i64 {
+  let n = fmap_static_value_patch_count(fm)
   let ts = page_round(16384 + buf_len(code))
   for i in 0..n {
-    let pos = fmap_static_pair_patch_code_pos(fm, i)
-    let slot_off = fmap_static_pair_patch_slot_off(fm, i)
+    let pos = fmap_static_value_patch_code_pos(fm, i)
+    let slot_off = fmap_static_value_patch_slot_off(fm, i)
     let delta_pages = (ts + slot_off) / 4096 - (16384 + pos) / 4096
     bytes_set_u32(code, pos, encode_adrp(17, delta_pages))
   }
   n
 }
 
-pub(package) fn pipeline_static_pair_data_size(fm: i64) -> i64 {
-  let need = fmap_static_pair_slot_count(fm) * 16
+pub(package) fn pipeline_static_value_data_size(fm: i64) -> i64 {
+  let need = fmap_static_value_slot_count(fm) * 16
   if need > 16384 { page_round(need) } else { 16384 }
 }
 
 pub(package) fn pipeline_emit_native_macho_executable(format: BinaryFormat, code: i64, fm: i64) -> BinaryObject {
   pipeline_native_provenance_patch_executable(code, fm)
-  pipeline_apply_static_pair_patches(code, fm)
-  let o = emit_macho(code, 0, pipeline_static_pair_data_size(fm))
+  pipeline_apply_static_value_patches(code, fm)
+  let o = emit_macho(code, 0, pipeline_static_value_data_size(fm))
   BinaryObject(o, binary_format_kind(format))
 }
 
@@ -64163,7 +64163,7 @@ pub(package) fn pipeline_native_link_plan(native: NativeModule, debug_mode: Pipe
       native_link_plan_libraries_from_fmap(fm, fmap_native_target(fm)),
       native_link_plan_imports_from_fmap(fm),
       native_link_plan_relocations_from_fmap(fm),
-      fmap_static_pair_slot_count(fm),
+      fmap_static_value_slot_count(fm),
       pipeline_native_link_debug_information(native, debug_mode),
       pipeline_native_link_trust_grants(fm)
     )
