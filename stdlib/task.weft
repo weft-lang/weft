@@ -47,10 +47,19 @@ pub effect TaskScope {
 
 -- One internal suspension atom keeps public capabilities tail-resumptive and
 -- makes the scheduler—not Time or TaskScope—the sole owner of stored one-shot
--- continuations. Modes are sealed below: runnable value, task join, timer,
--- readiness, channel send and channel receive.
+-- continuations. The private variant keeps every suspension reason explicit
+-- while still lowering each nullary case to a scalar tag.
+type EventLoopSuspendMode {
+  Runnable,
+    Joining,
+    Sleeping,
+    Polling,
+    ChannelSending,
+    ChannelReceiving
+}
+
 effect EventLoopSuspend {
-  @deferred fn suspend(task: i64, mode: i64, value: i64) -> i64
+  @deferred fn suspend(task: i64, mode: EventLoopSuspendMode, value: i64) -> i64
 }
 
 -- The poller and all registration identities remain behind this private,
@@ -91,10 +100,12 @@ fn event_loop_poll_error_status(error: NetPollError) -> i64 {
 }
 
 fn event_loop_readiness_error(status: i64) -> TcpReadinessError {
-  if status == 0 - 1 { TcpReadinessInterrupted }
-  else { if status == 0 - 2 { TcpReadinessResourceExhausted }
-    else { if status == 0 - 3 { TcpReadinessInvalidated }
-      else { TcpReadinessPlatform(0 - status - 1000) } } }
+  match status {
+    code if code == 0 - 1 -> TcpReadinessInterrupted
+    code if code == 0 - 2 -> TcpReadinessResourceExhausted
+    code if code == 0 - 3 -> TcpReadinessInvalidated
+    code -> TcpReadinessPlatform(0 - code - 1000)
+  }
 }
 
 fn event_loop_shutdown_signal(signal: NetPollTerminationSignal) -> ShutdownSignal {
@@ -189,7 +200,7 @@ fn event_loop_channel_send<T: Sendable>(
   value: T
 ) -[EventLoopSuspend]> ChannelSend<T> {
   while not channel_state_is_closed<T>(state) and channel_state_is_full<T>(state) {
-    EventLoopSuspend.suspend(task, 4, 0)
+    EventLoopSuspend.suspend(task, ChannelSending, 0)
   }
   if channel_state_is_closed<T>(state) { ChannelSendClosed<T>(value) }
   else {
@@ -205,7 +216,7 @@ fn event_loop_channel_receive<T: Sendable>(
   task: i64
 ) -[EventLoopSuspend]> ChannelReceive<T> {
   while not channel_state_is_closed<T>(state) and channel_state_is_empty<T>(state) {
-    EventLoopSuspend.suspend(task, 5, 0)
+    EventLoopSuspend.suspend(task, ChannelReceiving, 0)
   }
   match channel_state_take<T>(state) {
     Some(value) -> {
@@ -288,13 +299,13 @@ fn sequential_channel_run_task<C: Sendable, E>(
         TaskScope.submit(work) -> {
           let child = runtime_spawn_scope_track(scope, work)
           if child == 0 { runtime_trap(47, 0) } else { nil }
-          resume(EventLoopSuspend.suspend(task, 0, child))
+          resume(EventLoopSuspend.suspend(task, Runnable, child))
         }
         TaskScope.join(target) -> {
           if runtime_spawn_task_state(target) == runtime_spawn_task_complete() {
             resume(runtime_spawn_task_join(target))
           } else {
-            resume(EventLoopSuspend.suspend(task, 1, target))
+            resume(EventLoopSuspend.suspend(task, Joining, target))
           }
         }
       }
@@ -308,19 +319,26 @@ fn sequential_channel_run_task<C: Sendable, E>(
       if current != task { runtime_trap(47, 0) } else { nil }
       let cell = continuation_cell_from_ptr(runtime_spawn_task_continuation_cell(task))
       if continuation_cell_store_i64(cell, k) != 1 { runtime_trap(47, 0) } else { nil }
-      if mode == 0 {
-        if runtime_spawn_task_suspend_runnable(task, value) != 1 { runtime_trap(47, 0) } else { 0 }
-      } else { if mode == 1 {
+      match mode {
+        Runnable -> {
+          if runtime_spawn_task_suspend_runnable(task, value) != 1 { runtime_trap(47, 0) } else { 0 }
+        }
+        Joining -> {
           if runtime_spawn_task_wait_for(task, value) != 1 { runtime_trap(47, 0) } else { 0 }
-        } else { if mode == 4 {
-            if runtime_spawn_task_suspend_channel(task, runtime_spawn_task_channel_sending()) != 1 {
-              runtime_trap(47, 0)
-            } else { 0 }
-          } else { if mode == 5 {
-              if runtime_spawn_task_suspend_channel(task, runtime_spawn_task_channel_receiving()) != 1 {
-                runtime_trap(47, 0)
-              } else { 0 }
-            } else { runtime_trap(47, 0) } } } }
+        }
+        Sleeping -> runtime_trap(47, 0)
+        Polling -> runtime_trap(47, 0)
+        ChannelSending -> {
+          if runtime_spawn_task_suspend_channel(task, runtime_spawn_task_channel_sending()) != 1 {
+            runtime_trap(47, 0)
+          } else { 0 }
+        }
+        ChannelReceiving -> {
+          if runtime_spawn_task_suspend_channel(task, runtime_spawn_task_channel_receiving()) != 1 {
+            runtime_trap(47, 0)
+          } else { 0 }
+        }
+      }
     }
   }
   runtime_spawn_task_wake_waiter(task)
@@ -393,9 +411,11 @@ fn event_loop_drive<C: Sendable, E>(
     } else {
       let delay = runtime_spawn_scope_next_sleep_millis(scope, now)
       if registrations.len() > 0 or shutdown_enabled == 1 {
-        let deadline = if delay < 0 { NetPollForever }
-        else { if delay == 0 { NetPollImmediate }
-          else { NetPollForMillis(__i64_to_usize(delay)) } }
+        let deadline = match delay {
+          millis if millis < 0 -> NetPollForever
+          0 -> NetPollImmediate
+          millis -> NetPollForMillis(__i64_to_usize(millis))
+        }
         match EventLoopPoll.wait(deadline) {
           Ok(wait) -> match wait {
             NetPollTimedOut -> { 0 }
@@ -448,13 +468,13 @@ fn event_loop_run_task<C: Sendable, E>(
             TaskScope.submit(work) -> {
               let child = runtime_spawn_scope_track(scope, work)
               if child == 0 { runtime_trap(47, 0) } else { nil }
-              resume(EventLoopSuspend.suspend(task, 0, child))
+              resume(EventLoopSuspend.suspend(task, Runnable, child))
             }
             TaskScope.join(target) -> {
               if runtime_spawn_task_state(target) == runtime_spawn_task_complete() {
                 resume(runtime_spawn_task_join(target))
               } else {
-                resume(EventLoopSuspend.suspend(task, 1, target))
+                resume(EventLoopSuspend.suspend(task, Joining, target))
               }
             }
           }
@@ -462,18 +482,19 @@ fn event_loop_run_task<C: Sendable, E>(
           Time.now_millis() -> resume(runtime_platform_now_millis())
           Time.now_nanos() -> resume(runtime_platform_now_nanos())
           Time.sleep_millis(ms) -> {
-            if ms < 0 {
-              resume(0 - 1)
-            } else { if ms == 0 {
-                resume(0)
-              } else {
+            match ms {
+              millis if millis < 0 -> resume(0 - 1)
+              0 -> resume(0)
+              millis -> {
                 let now = runtime_platform_now_nanos()
-                if now < 0 or ms > 9223372036854 or now > 9223372036854775807 - ms * 1000000 {
-                  resume(0 - 1)
-                } else {
-                  resume(EventLoopSuspend.suspend(task, 2, now + ms * 1000000))
+                match now {
+                  instant if instant < 0 -> resume(0 - 1)
+                  instant if millis > 9223372036854 -> resume(0 - 1)
+                  instant if instant > 9223372036854775807 - millis * 1000000 -> resume(0 - 1)
+                  instant -> resume(EventLoopSuspend.suspend(task, Sleeping, instant + millis * 1000000))
                 }
-              } }
+              }
+            }
           }
         }
       } {
@@ -485,7 +506,7 @@ fn event_loop_run_task<C: Sendable, E>(
                 let cancelled = EventLoopPoll.cancel(registration)
                 resume(TcpStreamReadinessFailed(stream, TcpReadinessResourceExhausted))
               } else {
-                let status = EventLoopSuspend.suspend(task, 3, 0)
+                let status = EventLoopSuspend.suspend(task, Polling, 0)
                 if status == 0 {
                   resume(TcpStreamReady(stream))
                 } else {
@@ -503,7 +524,7 @@ fn event_loop_run_task<C: Sendable, E>(
                 let cancelled = EventLoopPoll.cancel(registration)
                 resume(TcpStreamReadinessFailed(stream, TcpReadinessResourceExhausted))
               } else {
-                let status = EventLoopSuspend.suspend(task, 3, 0)
+                let status = EventLoopSuspend.suspend(task, Polling, 0)
                 if status == 0 {
                   resume(TcpStreamReady(stream))
                 } else {
@@ -521,7 +542,7 @@ fn event_loop_run_task<C: Sendable, E>(
                 let cancelled = EventLoopPoll.cancel(registration)
                 resume(TcpListenerReadinessFailed(listener, TcpReadinessResourceExhausted))
               } else {
-                let status = EventLoopSuspend.suspend(task, 3, 0)
+                let status = EventLoopSuspend.suspend(task, Polling, 0)
                 if status == 0 {
                   resume(TcpListenerReady(listener))
                 } else {
@@ -542,33 +563,38 @@ fn event_loop_run_task<C: Sendable, E>(
       if current != task { runtime_trap(47, 0) } else { nil }
       let cell = continuation_cell_from_ptr(runtime_spawn_task_continuation_cell(task))
       if continuation_cell_store_i64(cell, k) != 1 { runtime_trap(47, 0) } else { nil }
-      if mode == 0 {
-        if runtime_spawn_task_suspend_runnable(task, value) != 1 {
-          runtime_trap(47, 0)
-        } else { 0 }
-      } else { if mode == 1 {
+      match mode {
+        Runnable -> {
+          if runtime_spawn_task_suspend_runnable(task, value) != 1 {
+            runtime_trap(47, 0)
+          } else { 0 }
+        }
+        Joining -> {
           if runtime_spawn_task_wait_for(task, value) != 1 {
             runtime_trap(47, 0)
           } else { 0 }
-        } else { if mode == 2 {
-            if runtime_spawn_task_suspend_sleeping(task, value) != 1 {
-              runtime_trap(47, 0)
-            } else { 0 }
-          } else { if mode == 3 {
-              if runtime_spawn_task_suspend_polling(task) != 1 {
-                runtime_trap(47, 0)
-              } else { 0 }
-            } else { if mode == 4 {
-                if runtime_spawn_task_suspend_channel(task, runtime_spawn_task_channel_sending()) != 1 {
-                  runtime_trap(47, 0)
-                } else { 0 }
-              } else { if mode == 5 {
-                  if runtime_spawn_task_suspend_channel(task, runtime_spawn_task_channel_receiving()) != 1 {
-                    runtime_trap(47, 0)
-                  } else { 0 }
-                } else {
-                  runtime_trap(47, 0)
-                } } } } } }
+        }
+        Sleeping -> {
+          if runtime_spawn_task_suspend_sleeping(task, value) != 1 {
+            runtime_trap(47, 0)
+          } else { 0 }
+        }
+        Polling -> {
+          if runtime_spawn_task_suspend_polling(task) != 1 {
+            runtime_trap(47, 0)
+          } else { 0 }
+        }
+        ChannelSending -> {
+          if runtime_spawn_task_suspend_channel(task, runtime_spawn_task_channel_sending()) != 1 {
+            runtime_trap(47, 0)
+          } else { 0 }
+        }
+        ChannelReceiving -> {
+          if runtime_spawn_task_suspend_channel(task, runtime_spawn_task_channel_receiving()) != 1 {
+            runtime_trap(47, 0)
+          } else { 0 }
+        }
+      }
     }
   }
   runtime_spawn_task_wake_waiter(task)
