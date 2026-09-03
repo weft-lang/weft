@@ -292,10 +292,16 @@ check_rejects "fusion_effectful_map_callback" "test/negative/fusion_effectful_ma
 check_rejects "fusion_effectful_filter_callback" "test/negative/fusion_effectful_filter_callback.weft" "error[E2001]:"
 check_rejects "fusion_alloc_effect_callback" "test/negative/fusion_alloc_effect_callback.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -[Alloc]> i64`'
 check_rejects "iter_fold_effectful_callback" "test/negative/iter_fold_effectful_callback.weft" "error[E2001]:"
+check_rejects "iter_find_effectful_callback" "test/negative/iter_find_effectful_callback.weft" "error[E2001]:"
+check_rejects "iter_find_map_effectful_callback" "test/negative/iter_find_map_effectful_callback.weft" "error[E2001]:"
+check_rejects "iter_any_effectful_callback" "test/negative/iter_any_effectful_callback.weft" "error[E2001]:"
+check_rejects "iter_all_effectful_callback" "test/negative/iter_all_effectful_callback.weft" "error[E2001]:"
+check_rejects "iter_reduce_effectful_callback" "test/negative/iter_reduce_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_map_collect_effectful_callback" "test/negative/iter_map_collect_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_map_effectful_callback" "test/negative/iter_map_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_filter_effectful_callback" "test/negative/iter_filter_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_take_negative_limit" "test/negative/iter_take_negative_limit.weft" 'error[E1002]: integer literal does not fit expected type `usize`'
+check_rejects "iter_nth_negative_index" "test/negative/iter_nth_negative_index.weft" 'error[E1002]: integer literal does not fit expected type `usize`'
 check_rejects "iterator_collect_item_mismatch" "test/negative/iterator_collect_item_mismatch.weft" "type error: associated type constraint mismatch"
 check_rejects "iterator_collect_missing_impl" "test/negative/iterator_collect_missing_impl.weft" 'error[E1004]: type `NotACollection` does not implement `Collect`'
 check_rejects "iterator_collect_empty_seed_retired" "test/negative/iterator_collect_empty_seed_retired.weft" "type error: unknown method"

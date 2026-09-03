@@ -695,11 +695,19 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_not_contains "doc_stdlib_iter_protocol_retires_empty_seed" "$(<"$tmp_out")" "fn empty"
     assert_not_contains "doc_stdlib_iter_protocol_retires_builder_method" "$(<"$tmp_out")" "fn collect_from"
   elif [ "$stdlib_doc_name" = "iter/core" ]; then
-    assert_contains "doc_stdlib_iter_core_pins_public_surface" "$(<"$tmp_out")" "Public API items: 7. Documented: 7."
+    assert_contains "doc_stdlib_iter_core_pins_public_surface" "$(<"$tmp_out")" "Public API items: 15. Documented: 15."
     assert_contains "doc_stdlib_iter_core_pins_owned_adapter" "$(<"$tmp_out")" "fn map<T, U>(it: owned Iterator<T>"
     assert_contains "doc_stdlib_iter_core_discards_any_generator_completion" "$(<"$tmp_out")" "fn from_generator<T, R>(g: owned generator.Generator<T, R>)"
     assert_contains "doc_stdlib_iter_core_uses_semantic_take_limit" "$(<"$tmp_out")" "fn take<T>(it: owned Iterator<T>, limit: usize)"
     assert_contains "doc_stdlib_iter_core_uses_semantic_count" "$(<"$tmp_out")" "fn count<T>(it: owned Iterator<T>) -> usize"
+    assert_contains "doc_stdlib_iter_core_pins_first" "$(<"$tmp_out")" "fn first<T>(it: owned Iterator<T>) -> Option<T>"
+    assert_contains "doc_stdlib_iter_core_pins_last" "$(<"$tmp_out")" "fn last<T>(it: owned Iterator<T>) -> Option<T>"
+    assert_contains "doc_stdlib_iter_core_pins_nth" "$(<"$tmp_out")" "fn nth<T>(it: owned Iterator<T>, index: usize) -> Option<T>"
+    assert_contains "doc_stdlib_iter_core_pins_find" "$(<"$tmp_out")" "fn find<T>(it: owned Iterator<T>, pred: (T) -> bool) -> Option<T>"
+    assert_contains "doc_stdlib_iter_core_pins_find_map" "$(<"$tmp_out")" "fn find_map<T, U>(it: owned Iterator<T>, f: (T) -> Option<U>) -> Option<U>"
+    assert_contains "doc_stdlib_iter_core_pins_any" "$(<"$tmp_out")" "fn any<T>(it: owned Iterator<T>, pred: (T) -> bool) -> bool"
+    assert_contains "doc_stdlib_iter_core_pins_all" "$(<"$tmp_out")" "fn all<T>(it: owned Iterator<T>, pred: (T) -> bool) -> bool"
+    assert_contains "doc_stdlib_iter_core_pins_empty_aware_reduce" "$(<"$tmp_out")" "fn reduce<T>(it: owned Iterator<T>, f: (T, T) -> T) -> Option<T>"
   elif [ "$stdlib_doc_name" = "utf8" ]; then
     assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
   elif [ "$stdlib_doc_name" = "io/transfer" ]; then
