@@ -298,6 +298,9 @@ check_rejects "iter_filter_effectful_callback" "test/negative/iter_filter_effect
 check_rejects "iterator_collect_item_mismatch" "test/negative/iterator_collect_item_mismatch.weft" "type error: associated type constraint mismatch"
 check_rejects "iterator_collect_missing_impl" "test/negative/iterator_collect_missing_impl.weft" 'error[E1004]: type `NotACollection` does not implement `Collect`'
 check_rejects "iterator_constructor_private" "test/negative/iterator_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "iterator_next_requires_mutable" "test/negative/iterator_next_requires_mutable.weft" "type error: exclusive resource borrow requires a mutable owner binding"
+check_rejects "iterator_use_after_close" "test/negative/iterator_use_after_close.weft" "type error: owned value used more than once"
+check_rejects "iterator_use_after_adapter" "test/negative/iterator_use_after_adapter.weft" "type error: owned value used more than once"
 check_rejects "effectful_lambda_to_pure_effect_op" "test/negative/effectful_lambda_to_pure_effect_op.weft" "error[E2001]:"
 check_rejects "function_value_effect_unavailable" "test/negative/function_value_effect_unavailable.weft" "error[E2001]:"
 check_rejects "function_value_arg_mismatch" "test/negative/function_value_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'

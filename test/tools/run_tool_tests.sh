@@ -690,8 +690,10 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "iter/protocol" ]; then
     assert_contains "doc_stdlib_iter_protocol_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
     assert_contains "doc_stdlib_iter_protocol_pins_opaque_state" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
+    assert_contains "doc_stdlib_iter_protocol_pins_owned_source" "$(<"$tmp_out")" "source: owned Iterator<Self.Item>"
   elif [ "$stdlib_doc_name" = "iter/core" ]; then
     assert_contains "doc_stdlib_iter_core_pins_public_surface" "$(<"$tmp_out")" "Public API items: 7. Documented: 7."
+    assert_contains "doc_stdlib_iter_core_pins_owned_adapter" "$(<"$tmp_out")" "fn map<T, U>(it: owned Iterator<T>"
   elif [ "$stdlib_doc_name" = "utf8" ]; then
     assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
   elif [ "$stdlib_doc_name" = "io/transfer" ]; then
