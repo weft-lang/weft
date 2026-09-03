@@ -7,7 +7,7 @@ There is no detached task hidden behind either API.
 
 | Need | Namespace | Callback | Observation |
 |---|---|---|---|
-| CPU/data parallelism | `stdlib/par` | Pure `() -> T` | `par.fork` then `par.join` |
+| CPU/data parallelism | `stdlib/par` | Pure `() -> T` | `par.fork` then `handle.join()` |
 | Task scheduling and readiness | `stdlib/task` | Effectful `() -[TaskScope, E]> T` | `task.spawn` then `child.join()` |
 | Bounded task communication | `stdlib/task/channel` | `Channel<T>` operations | Typed send/receive/close outcomes |
 | Cooperative cancellation | `stdlib/task/cancellation` | Explicit checkpoints | Typed completion or reason |
@@ -58,7 +58,7 @@ without changing either function into an async function.
 ## Deterministic parallelism
 
 `Par` is narrower and intentionally stronger. `par.fork` accepts only a pure,
-`Sendable` computation. A pool may reorder execution, while `par.join` and
+`Sendable` computation. A pool may reorder execution, while `handle.join()` and
 `par.map` preserve deterministic observation order:
 
 ```weft
@@ -67,7 +67,7 @@ use stdlib/par as par
 fn total() -[par.Par]> i64 {
   let left = par.fork(() => 20)
   let right = par.fork(() => 22)
-  par.join(left) + par.join(right)
+  left.join() + right.join()
 }
 ```
 

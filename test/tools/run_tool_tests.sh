@@ -764,7 +764,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_task_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"
     assert_contains "doc_stdlib_task_channel_pins_bounded_send" "$(<"$tmp_out")" "fn send(value: T) -> ChannelSend<T>"
   elif [ "$stdlib_doc_name" = "task" ]; then
-    assert_contains "doc_stdlib_task_pins_public_surface" "$(<"$tmp_out")" "Public API items: 14. Documented: 14."
+    assert_contains "doc_stdlib_task_pins_public_surface" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
     assert_contains "doc_stdlib_task_pins_consuming_join" "$(<"$tmp_out")" "pub fn join<T>(self: unique Task<T>) -[TaskScope]> T"
     assert_contains "doc_stdlib_task_pins_channel_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel<C: Sendable, T, E>(capacity: ChannelCapacity<C>, body: () -[TaskScope, Time, TcpReadiness, Channel<C>, E]> T) -[E]> T"
     assert_contains "doc_stdlib_task_pins_shutdown_handler" "$(<"$tmp_out")" "pub fn with_event_loop_shutdown<T, E>(body: () -[TaskScope, Time, TcpReadiness, Cancellation, Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T>"
@@ -776,7 +776,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "io" ]; then
     assert_contains "doc_stdlib_io_pins_public_surface" "$(<"$tmp_out")" "Public API items: 13. Documented: 13."
   elif [ "$stdlib_doc_name" = "par" ]; then
-    assert_contains "doc_stdlib_par_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
+    assert_contains "doc_stdlib_par_pins_public_surface" "$(<"$tmp_out")" "Public API items: 7. Documented: 7."
   fi
 done
 

@@ -71,8 +71,8 @@ check_rejects "par_prepared_submit_public" "test/negative/par_prepared_submit_pu
 check_rejects "generic_par_task_double_await" "test/negative/generic_par_task_double_await.weft" "type error: unique value used more than once"
 check_rejects "generic_par_task_non_sendable_result" "test/negative/generic_par_task_non_sendable_result.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
 check_rejects "generic_par_task_non_sendable_capture" "test/negative/generic_par_task_non_sendable_capture.weft" "type error: closure capture is not Sendable across scoped Par"
-check_rejects "generic_par_task_type_mismatch" "test/negative/generic_par_task_type_mismatch.weft" 'error[E1002]: argument type mismatch: expected `unique ParTask<str>`, found `unique ParTask<i64>`'
-check_rejects "generic_par_task_forged" "test/negative/generic_par_task_forged.weft" "type error: ParTask is a sealed runtime token and cannot be constructed"
+check_rejects "generic_par_task_type_mismatch" "test/negative/generic_par_task_type_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `unique par.ParTask<str>`, found `unique par.ParTask<i64>`'
+check_rejects "generic_par_task_forged" "test/negative/generic_par_task_forged.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "task_spawn_requires_effect" "test/negative/task_spawn_requires_effect.weft" 'error[E2001]: effect `TaskScope` is not available in this context'
 check_rejects "task_child_effect_requires_contract" "test/negative/task_child_effect_requires_contract.weft" 'error[E2001]: effect `SpawnChildNoise` is not available in this context'
 check_rejects "task_non_sendable_result" "test/negative/task_non_sendable_result.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
