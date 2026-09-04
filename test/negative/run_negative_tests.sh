@@ -315,7 +315,7 @@ check_rejects "iter_scan_state_mismatch" "test/negative/iter_scan_state_mismatch
 check_rejects "iter_each_effect_unavailable" "test/negative/iter_each_effect_unavailable.weft" "error[E2001]:"
 check_rejects "iter_each_callback_result_mismatch" "test/negative/iter_each_callback_result_mismatch.weft" 'lambda return value type mismatch: expected `nil`, found `i64`'
 check_rejects "iter_each_chunk_effect_unavailable" "test/negative/iter_each_chunk_effect_unavailable.weft" "error[E2001]:"
-check_rejects "iter_each_chunk_callback_result_mismatch" "test/negative/iter_each_chunk_callback_result_mismatch.weft" 'lambda return value type mismatch: expected `nil`, found `i64`'
+check_rejects "iter_each_chunk_callback_result_mismatch" "test/negative/iter_each_chunk_callback_result_mismatch.weft" 'lambda return value type mismatch: expected `nil`, found `usize`'
 check_rejects "iter_each_window_effect_unavailable" "test/negative/iter_each_window_effect_unavailable.weft" "error[E2001]:"
 check_rejects "iter_each_window_callback_result_mismatch" "test/negative/iter_each_window_callback_result_mismatch.weft" 'lambda return value type mismatch: expected `nil`, found `usize`'
 check_rejects "iter_each_window_effect_escape" "test/negative/iter_each_window_effect_escape.weft" "slice borrow"
@@ -619,6 +619,11 @@ check_rejects "file_handle_raw_factory_private" "test/negative/file_handle_raw_f
 check_rejects "bytes_constructor_private" "test/negative/bytes_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "bytes_prefixed_constructor_removed" "test/negative/bytes_prefixed_constructor_removed.weft" "error[E4002]: unknown module member 'bytes_from_str' in import" 1
 check_rejects "bytes_get_requires_usize" "test/negative/bytes_get_requires_usize.weft" "argument type mismatch: expected \`usize\`, found \`i64\`"
+check_rejects "vector_with_capacity_requires_usize" "test/negative/vector_with_capacity_requires_usize.weft" "argument type mismatch: expected \`usize\`, found \`i64\`"
+check_rejects "vector_get_requires_usize" "test/negative/vector_get_requires_usize.weft" "argument type mismatch: expected \`usize\`, found \`i64\`"
+check_rejects "vector_push_is_a_command" "test/negative/vector_push_is_a_command.weft" "return value type mismatch: expected \`bool\`, found \`nil\`"
+check_rejects "vector_set_returns_replaced_value" "test/negative/vector_set_returns_replaced_value.weft" "return value type mismatch: expected \`bool\`, found \`Result<i64, vector.IndexError>\`"
+check_rejects "vector_slice_requires_checked_result" "test/negative/vector_slice_requires_checked_result.weft" "return value type mismatch: expected \`owned Vector<i64>\`, found \`Option<owned Vector<i64>>\`"
 check_rejects "bytes_migration_len_retired" "test/negative/bytes_migration_len_retired.weft" "unknown method"
 check_rejects "bytes_migration_get_retired" "test/negative/bytes_migration_get_retired.weft" "unknown method"
 check_rejects "path_constructor_private" "test/negative/path_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"

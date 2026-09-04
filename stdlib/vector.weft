@@ -13,10 +13,11 @@ use stdlib/generator.{*}
 use stdlib/drop.{Drop}
 use stdlib/iter/core.{from_generator, iter_from_vector_word, iter_next, iter_remaining_lower}
 use stdlib/iter/protocol.{Collect, IntoIterator, Iterator}
-use stdlib/num/scalar.{num_scalar_i64_to_usize, num_scalar_usize_checked_mul, num_scalar_usize_to_i64}
+use stdlib/num/scalar.{num_scalar_i64_to_usize, num_scalar_usize_checked_add, num_scalar_usize_checked_mul, num_scalar_usize_to_i64}
 use stdlib/option.{*}
 use stdlib/ord.{*}
 use stdlib/panic.{panic}
+use stdlib/result.{Err, Ok, Result}
 pub use stdlib/vector/handles.{PersistentVector, Vector}
 
 -- Vector and persistent-vector handles are declared in vector/handles.weft so
@@ -60,6 +61,27 @@ pub(package) type VectorGrowth {
   VectorGrowthReady,
   VectorGrowthResize(i64, i64, i64),
   VectorGrowthUnrepresentable
+}
+
+--- A vector allocation or growth request cannot fit its storage domain.
+pub type StorageCapacityError {
+  --- The requested element count cannot be represented for this element type.
+  CapacityUnrepresentable(usize),
+  --- Adding the requested capacity to the current length overflowed `usize`.
+  CapacityAdditionOverflow(usize, usize)
+}
+
+--- A mutable vector operation addressed an element outside the current value.
+pub type IndexError {
+  --- The requested index and the vector length at the failed operation.
+  IndexOutOfBounds(usize, usize)
+}
+
+fn vector_count_from_storage(count: i64) -> usize {
+  match num_scalar_i64_to_usize(count) {
+    Some(value) -> value
+    None -> panic("Vector count invariant violated")
+  }
 }
 
 pub(package) fn vector_storage_size(count: usize, elem_size: i64) -> VectorStorageSize {
@@ -123,23 +145,38 @@ pub(package) fn vector_normalize_capacity(capacity: i64) -> i64 {
 
 --- Construct an empty mutable vector.
 pub fn new<T>() -> owned Vector<T> {
-  with_capacity<T>(0)
+  let zero: usize = 0
+  with_capacity<T>(zero)
 }
 
 --- Construct an empty mutable vector with at least `capacity` slots.
---- Negative capacities are treated as zero.
-pub fn with_capacity<T>(capacity: i64) -> owned Vector<T> {
-  let cap = vector_normalize_capacity(capacity)
+--- Panic when the requested count cannot fit this vector's storage.
+pub fn with_capacity<T>(capacity: usize) -> owned Vector<T> {
   let elem_size = vector_element_size_of<T>()
   let elem_mode = vector_element_mode_of<T>()
-  match vector_storage_size_i64(cap, elem_size) {
-    VectorStorageUnrepresentable -> panic("Vector capacity cannot fit its storage representation")
+  match vector_storage_size(capacity, elem_size) {
+    VectorStorageUnrepresentable -> panic("Vector capacity is too large")
     VectorStorageSized(checked_capacity, bytes) -> vector_storage_new<T>(checked_capacity, bytes, elem_size, elem_mode, vector_element_leaf_count_of<T>(), vector_element_leaf_stride_of<T>(), vector_element_leaf_kind_of<T>())
   }
 }
 
+--- Try to construct an empty mutable vector with at least `capacity` slots.
+--- Default-allocator exhaustion remains process-terminal; this result reports
+--- only an element count that cannot fit the platform storage representation.
+pub fn try_with_capacity<T>(capacity: usize) -> Result<owned Vector<T>, StorageCapacityError> {
+  let elem_size = vector_element_size_of<T>()
+  let elem_mode = vector_element_mode_of<T>()
+  match vector_storage_size(capacity, elem_size) {
+    VectorStorageUnrepresentable -> Err<owned Vector<T>, StorageCapacityError>(CapacityUnrepresentable(capacity))
+    VectorStorageSized(checked_capacity, bytes) -> Ok<owned Vector<T>, StorageCapacityError>(
+      vector_storage_new<T>(checked_capacity, bytes, elem_size, elem_mode, vector_element_leaf_count_of<T>(), vector_element_leaf_stride_of<T>(), vector_element_leaf_kind_of<T>())
+    )
+  }
+}
+
 pub(package) fn migration_with_capacity_i64<T>(capacity: i64) -> owned Vector<T> {
-  with_capacity<T>(capacity)
+  let cap = vector_normalize_capacity(capacity)
+  with_capacity<T>(vector_count_from_storage(cap))
 }
 
 --- Return the number of initialized elements.
@@ -176,7 +213,7 @@ impl<T> Collect for Vector<T> {
   fn from_iter(source: owned Iterator<T>) -> owned Vector<T> {
     let capacity = iter_remaining_lower<T>(source)
     let mut values = source
-    let mut result = with_capacity<T>(capacity)
+    let mut result = with_capacity<T>(vector_count_from_storage(capacity))
     let mut done = false
     while not done {
       match iter_next<T>(values) {
@@ -283,6 +320,18 @@ pub(package) fn vector_reserve_borrowed<T>(vec: borrow mut Vector<T>, needed: i6
   vector_reserve_word<T>(vector_storage_handle_word<T>(vec), needed)
 }
 
+fn vector_try_reserve_additional<T>(vec: borrow mut Vector<T>, additional: usize) -> Result<nil, StorageCapacityError> {
+  let length = vector_count_from_storage(vector_len<T>(vec))
+  match num_scalar_usize_checked_add(length, additional) {
+    None -> Err<nil, StorageCapacityError>(CapacityAdditionOverflow(length, additional))
+    Some(needed) -> if vector_reserve_word_usize<T>(vector_storage_handle_word<T>(vec), needed) {
+      Ok<nil, StorageCapacityError>(nil)
+    } else {
+      Err<nil, StorageCapacityError>(CapacityUnrepresentable(needed))
+    }
+  }
+}
+
 --- Ensure capacity for internal vector-backed state that has already sealed
 --- its mutation authority behind another opaque abstraction.
 pub(package) fn vector_reserve<T>(vec: borrow Vector<T>, needed: i64) -> bool {
@@ -386,6 +435,27 @@ pub(package) fn vector_set_borrowed<T>(vec: borrow mut Vector<T>, index: i64, va
 
 pub(package) fn vector_set<T>(vec: borrow Vector<T>, index: i64, value: T) -> bool {
   vector_set_word<T>(vector_storage_handle_word<T>(vec), index, value)
+}
+
+fn vector_replace<T>(vec: borrow mut Vector<T>, index: usize, value: T) -> Result<T, IndexError> {
+  let length = vector_count_from_storage(vector_len<T>(vec))
+  if index >= length {
+    Err<T, IndexError>(IndexOutOfBounds(index, length))
+  } else { match num_scalar_usize_to_i64(index) {
+    None -> Err<T, IndexError>(IndexOutOfBounds(index, length))
+    Some(storage_index) -> {
+      let word = vector_storage_handle_word<T>(vec)
+      let data = vector_storage_word_data(word)
+      let elem_size = vector_storage_word_element_size(word)
+      let elem_mode = vector_storage_word_element_mode(word)
+      let address = data + storage_index * elem_size
+      let previous = vector_storage_load_value_in_bounds<T>(address, elem_size, elem_mode)
+      let result = Ok<T, IndexError>(previous)
+      vector_storage_release_element(address, elem_mode, vector_storage_word_element_leaf_count(word), vector_storage_word_element_leaf_stride(word), vector_storage_word_element_leaf_kind(word))
+      vector_store_value<T>(address, elem_size, elem_mode, value)
+      result
+    }
+  } }
 }
 
 pub(package) fn vector_pop_word<T>(word: i64) -> Option<T> {
@@ -512,7 +582,7 @@ pub fn to_array<T, A>(vec: borrow Vector<T>) -> Option<A> {
 --- Transform elements into a new vector in source order.
 pub(package) fn vector_map<T, U>(vec: borrow Vector<T>, f: (T) -> U) -> owned Vector<U> {
   let len = vector_len<T>(vec)
-  let mut result = with_capacity<U>(len)
+  let mut result = with_capacity<U>(vector_count_from_storage(len))
   let data = vector_data<T>(vec)
   let elem_size = vector_element_size<T>(vec)
   let elem_mode = vector_element_mode<T>(vec)
@@ -522,24 +592,25 @@ pub(package) fn vector_map<T, U>(vec: borrow Vector<T>, f: (T) -> U) -> owned Ve
   result
 }
 
--- Copy the clamped half-open range [start, end). Negative starts clamp to
--- zero, oversized ends clamp to the vector length, and inverted ranges are
--- empty. The source vector is unchanged.
---- Copy the clamped half-open range `[start, end)` into a new vector.
---- Negative bounds clamp to zero, oversized bounds clamp to length, and
---- inverted ranges are empty.
-pub(package) fn vector_slice<T>(vec: borrow Vector<T>, start: i64, end: i64) -> owned Vector<T> {
-  let len = vector_len<T>(vec)
-  let from = if start < 0 { 0 } else { if start > len { len } else { start } }
-  let to = if end < 0 { 0 } else { if end > len { len } else { end } }
-  let count = if to <= from { 0 } else { to - from }
-  let mut result = with_capacity<T>(count)
-  let mut i = from
-  while i < to {
-    vector_push_borrowed<T>(result, vector_get_in_bounds<T>(vec, i))
-    i = i + 1
-  }
-  result
+fn vector_slice_checked<T>(vec: borrow Vector<T>, start: usize, end: usize) -> Option<owned Vector<T>> {
+  let length = vector_count_from_storage(vector_len<T>(vec))
+  if start > end or end > length {
+    None<owned Vector<T>>()
+  } else { match num_scalar_usize_to_i64(start) {
+    None -> None<owned Vector<T>>()
+    Some(first) -> match num_scalar_usize_to_i64(end) {
+      None -> None<owned Vector<T>>()
+      Some(last) -> {
+        let mut result = with_capacity<T>(end - start)
+        let mut index = first
+        while index < last {
+          vector_push_borrowed<T>(result, vector_get_in_bounds<T>(vec, index))
+          index = index + 1
+        }
+        Some<owned Vector<T>>(result)
+      }
+    }
+  } }
 }
 
 -- Insert while preserving order. `index == len` appends; indices outside
@@ -598,7 +669,13 @@ pub(package) fn vector_remove_at<T>(vec: borrow Vector<T>, index: i64) -> Option
 pub(package) fn vector_concat<T>(left: borrow Vector<T>, right: borrow Vector<T>) -> owned Vector<T> {
   let left_len = vector_len<T>(left)
   let right_len = vector_len<T>(right)
-  let mut result = with_capacity<T>(left_len + right_len)
+  let left_count = vector_count_from_storage(left_len)
+  let right_count = vector_count_from_storage(right_len)
+  let total = match num_scalar_usize_checked_add(left_count, right_count) {
+    Some(count) -> count
+    None -> panic("Vector concatenation capacity overflowed")
+  }
+  let mut result = with_capacity<T>(total)
   for i in 0..left_len {
     vector_push_borrowed<T>(result, vector_get_in_bounds<T>(left, i))
   }
@@ -626,7 +703,7 @@ pub(package) fn vector_reverse<T>(vec: owned Vector<T>) -> owned Vector<T> {
 --- Copy elements accepted by a pure predicate into a new vector.
 pub(package) fn vector_filter<T>(vec: borrow Vector<T>, predicate: (T) -> bool) -> owned Vector<T> {
   let len = vector_len<T>(vec)
-  let mut result = with_capacity<T>(len)
+  let mut result = with_capacity<T>(vector_count_from_storage(len))
   for i in 0..len {
     let value = vector_get_in_bounds<T>(vec, i)
     if predicate(value) {
@@ -695,7 +772,7 @@ pub(package) fn vector_contains<T: Ord>(vec: borrow Vector<T>, needle: T) -> boo
 --- Non-adjacent duplicates remain.
 pub(package) fn vector_dedup_by<T>(vec: borrow Vector<T>, same: (T, T) -> bool) -> owned Vector<T> {
   let len = vector_len<T>(vec)
-  let mut result = with_capacity<T>(len)
+  let mut result = with_capacity<T>(vector_count_from_storage(len))
   for i in 0..len {
     let value = vector_get_in_bounds<T>(vec, i)
     let keep = if vector_is_empty<T>(result) { true }
@@ -714,7 +791,7 @@ pub(package) fn vector_dedup<T: Ord>(vec: borrow Vector<T>) -> owned Vector<T> {
 --- Return an empty vector when `end <= start`.
 pub fn range(start: i64, end: i64) -> owned Vector<i64> {
   let size = if end <= start { 0 } else { end - start }
-  let mut result = with_capacity<i64>(size)
+  let mut result = with_capacity<i64>(vector_count_from_storage(size))
   for i in start..end {
     vector_push_borrowed<i64>(result, i)
   }
@@ -994,18 +1071,21 @@ impl<T> PersistentVector<T> {
   }
 
   --- Return the number of elements.
-  pub fn len(self) -> i64 {
-    persistent_vector_len<T>(self)
+  pub fn len(self) -> usize {
+    vector_count_from_storage(persistent_vector_len<T>(self))
   }
 
   --- Return whether this vector has no elements.
   pub fn is_empty(self) -> bool {
-    self.len() == 0
+    persistent_vector_len<T>(self) == 0
   }
 
   --- Return the element at `index` when it is in bounds.
-  pub fn get(self, index: i64) -> Option<T> {
-    persistent_vector_get_option<T>(self, index)
+  pub fn get(self, index: usize) -> Option<T> {
+    match num_scalar_usize_to_i64(index) {
+      Some(storage_index) -> persistent_vector_get_option<T>(self, storage_index)
+      None -> None<T>()
+    }
   }
 
   --- Return a version with `value` appended, leaving this version unchanged.
@@ -1014,11 +1094,14 @@ impl<T> PersistentVector<T> {
   }
 
   --- Return an updated version when `index` is in bounds.
-  pub fn set(self, index: i64, value: T) -> Option<PersistentVector<T>> {
-    if persistent_vector_in_bounds<T>(self, index) {
-      Some<PersistentVector<T>>(persistent_vector_set<T>(self, index, value))
-    } else {
-      None<PersistentVector<T>>()
+  pub fn set(self, index: usize, value: T) -> Option<PersistentVector<T>> {
+    match num_scalar_usize_to_i64(index) {
+      Some(storage_index) -> if persistent_vector_in_bounds<T>(self, storage_index) {
+        Some<PersistentVector<T>>(persistent_vector_set<T>(self, storage_index, value))
+      } else {
+        None<PersistentVector<T>>()
+      }
+      None -> None<PersistentVector<T>>()
     }
   }
 }
@@ -1185,13 +1268,13 @@ impl<T> Vector<T> {
   }
 
   --- Return the number of initialized elements.
-  pub fn len(self: borrow Self) -> i64 {
-    vector_len<T>(self)
+  pub fn len(self: borrow Self) -> usize {
+    vector_count_from_storage(vector_len<T>(self))
   }
 
   --- Return the number of elements the current allocation can hold.
-  pub fn capacity(self: borrow Self) -> i64 {
-    vector_capacity<T>(self)
+  pub fn capacity(self: borrow Self) -> usize {
+    vector_count_from_storage(vector_capacity<T>(self))
   }
 
   --- Return whether this vector has no elements.
@@ -1199,29 +1282,57 @@ impl<T> Vector<T> {
     vector_is_empty<T>(self)
   }
 
-  --- Ensure capacity for at least `needed` total elements.
-  pub fn reserve(self: borrow mut Self, needed: i64) -> bool {
-    vector_reserve_borrowed<T>(self, needed)
+  --- Reserve room for at least `additional` elements beyond the current length.
+  --- Panic when the resulting count cannot fit this vector's storage.
+  pub fn reserve(self: borrow mut Self, additional: usize) -> nil {
+    match vector_try_reserve_additional<T>(self, additional) {
+      Ok(_) -> nil
+      Err(_) -> panic("Vector capacity is too large")
+    }
   }
 
-  --- Append an element in place, returning whether storage was available.
-  pub fn push(self: borrow mut Self, value: T) -> bool {
-    vector_push_borrowed<T>(self, value)
+  --- Try to reserve room for at least `additional` elements beyond the current
+  --- length. Default-allocator exhaustion remains process-terminal.
+  pub fn try_reserve(self: borrow mut Self, additional: usize) -> Result<nil, StorageCapacityError> {
+    vector_try_reserve_additional<T>(self, additional)
+  }
+
+  --- Append an element in place.
+  pub fn push(self: borrow mut Self, value: T) -> nil {
+    if vector_push_borrowed<T>(self, value) { nil }
+    else { panic("Vector capacity is too large") }
   }
 
   --- Return the element at `index` when it is in bounds.
-  pub fn get(self: borrow Self, index: i64) -> Option<T> {
-    vector_get_option<T>(self, index)
+  pub fn get(self: borrow Self, index: usize) -> Option<T> {
+    match num_scalar_usize_to_i64(index) {
+      Some(storage_index) -> vector_get_option<T>(self, storage_index)
+      None -> None<T>()
+    }
   }
 
-  --- Replace an element in place, returning whether the index was in bounds.
-  pub fn set(self: borrow mut Self, index: i64, value: T) -> bool {
-    vector_set_borrowed<T>(self, index, value)
+  --- Replace and return an element, or report the requested index and length.
+  pub fn set(self: borrow mut Self, index: usize, value: T) -> Result<T, IndexError> {
+    vector_replace<T>(self, index, value)
   }
 
-  --- Exchange two in-bounds elements in place.
-  pub fn swap(self: borrow mut Self, left: i64, right: i64) -> bool {
-    vector_swap_borrowed<T>(self, left, right)
+  --- Exchange two elements, reporting the first invalid index in source order.
+  pub fn swap(self: borrow mut Self, left: usize, right: usize) -> Result<nil, IndexError> {
+    let length = vector_count_from_storage(vector_len<T>(self))
+    if left >= length {
+      Err<nil, IndexError>(IndexOutOfBounds(left, length))
+    } else { if right >= length {
+      Err<nil, IndexError>(IndexOutOfBounds(right, length))
+    } else { match num_scalar_usize_to_i64(left) {
+      None -> Err<nil, IndexError>(IndexOutOfBounds(left, length))
+      Some(storage_left) -> match num_scalar_usize_to_i64(right) {
+        None -> Err<nil, IndexError>(IndexOutOfBounds(right, length))
+        Some(storage_right) -> {
+          vector_swap_borrowed<T>(self, storage_left, storage_right)
+          Ok<nil, IndexError>(nil)
+        }
+      }
+    } } }
   }
 
   --- Remove and return the last element, or `None` when empty.
@@ -1244,19 +1355,32 @@ impl<T> Vector<T> {
     vector_map<T, U>(self, f)
   }
 
-  --- Copy the clamped half-open range `[start, end)` into a new vector.
-  pub fn slice(self: borrow Self, start: i64, end: i64) -> owned Vector<T> {
-    vector_slice<T>(self, start, end)
+  --- Copy the checked half-open range `[start, end)` into a new vector.
+  pub fn slice(self: borrow Self, start: usize, end: usize) -> Option<owned Vector<T>> {
+    vector_slice_checked<T>(self, start, end)
   }
 
   --- Insert in place while preserving order; `index == len` appends.
-  pub fn insert(self: borrow mut Self, index: i64, value: T) -> bool {
-    vector_insert_at_borrowed<T>(self, index, value)
+  pub fn insert(self: borrow mut Self, index: usize, value: T) -> Result<nil, IndexError> {
+    let length = vector_count_from_storage(vector_len<T>(self))
+    if index > length {
+      Err<nil, IndexError>(IndexOutOfBounds(index, length))
+    } else { match num_scalar_usize_to_i64(index) {
+      None -> Err<nil, IndexError>(IndexOutOfBounds(index, length))
+      Some(storage_index) -> if vector_insert_at_borrowed<T>(self, storage_index, value) {
+        Ok<nil, IndexError>(nil)
+      } else {
+        panic("Vector capacity is too large")
+      }
+    } }
   }
 
   --- Remove and return an element while preserving order.
-  pub fn remove(self: borrow mut Self, index: i64) -> Option<T> {
-    vector_remove_at_borrowed<T>(self, index)
+  pub fn remove(self: borrow mut Self, index: usize) -> Option<T> {
+    match num_scalar_usize_to_i64(index) {
+      Some(storage_index) -> vector_remove_at_borrowed<T>(self, storage_index)
+      None -> None<T>()
+    }
   }
 
   --- Copy this vector followed by `other` into a new vector.
