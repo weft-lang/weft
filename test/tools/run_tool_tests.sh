@@ -864,7 +864,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_task_channel_pins_capacity" "$(<"$tmp_out")" "pub type Capacity = opaque"
     assert_contains "doc_stdlib_task_channel_pins_capacity_validation" "$(<"$tmp_out")" "pub fn capacity(value: usize) -> Result<Capacity, CapacityError>"
     assert_contains "doc_stdlib_task_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"
-    assert_contains "doc_stdlib_task_channel_pins_bounded_send" "$(<"$tmp_out")" "fn send(value: T) -> ChannelSend<T>"
+    assert_contains "doc_stdlib_task_channel_pins_bounded_send" "$(<"$tmp_out")" "fn send(value: T) -> SendResult<T>"
   elif [ "$stdlib_doc_name" = "vector" ]; then
     assert_contains "doc_stdlib_vector_pins_public_surface" "$(<"$tmp_out")" "Public API items: 39. Documented: 39."
     assert_contains "doc_stdlib_vector_pins_mutable_type" "$(<"$tmp_out")" "pub type Vector<T>"
