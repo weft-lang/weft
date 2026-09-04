@@ -652,7 +652,7 @@ stdlib_doc_modules=(
   stdlib/prelude.weft stdlib/assert.weft stdlib/default.weft stdlib/display.weft stdlib/drop.weft
   stdlib/eq.weft stdlib/hash.weft stdlib/ord.weft stdlib/panic.weft
   stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft
-  stdlib/maybe.weft stdlib/bytes.weft stdlib/path.weft stdlib/io/types.weft
+  stdlib/maybe.weft stdlib/bytes.weft stdlib/string.weft stdlib/path.weft stdlib/io/types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft
   stdlib/time/monotonic.weft stdlib/time/wall.weft
@@ -871,6 +871,16 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_vector_pins_persistent_type" "$(<"$tmp_out")" "pub type PersistentVector<T>"
     assert_contains "doc_stdlib_vector_pins_mutable_len" "$(<"$tmp_out")" "pub fn len<T>(self: borrow Vector<T>) -> i64"
     assert_contains "doc_stdlib_vector_pins_persistent_len" "$(<"$tmp_out")" "pub fn len<T>(self: PersistentVector<T>) -> i64"
+  elif [ "$stdlib_doc_name" = "num" ]; then
+    assert_contains "doc_stdlib_num_pins_public_surface" "$(<"$tmp_out")" "Public API items: 35. Documented: 35."
+    assert_contains "doc_stdlib_num_pins_checked_add" "$(<"$tmp_out")" "pub fn checked_add(self: usize, other: usize) -> Option<usize>"
+    assert_contains "doc_stdlib_num_pins_checked_sub" "$(<"$tmp_out")" "pub fn checked_sub(self: usize, other: usize) -> Option<usize>"
+    assert_contains "doc_stdlib_num_pins_checked_mul" "$(<"$tmp_out")" "pub fn checked_mul(self: usize, other: usize) -> Option<usize>"
+  elif [ "$stdlib_doc_name" = "string" ]; then
+    assert_contains "doc_stdlib_string_pins_public_surface" "$(<"$tmp_out")" "Public API items: 18. Documented: 18."
+    assert_contains "doc_stdlib_string_pins_byte_length" "$(<"$tmp_out")" "pub fn len(self: str) -> i64"
+    assert_contains "doc_stdlib_string_pins_optional_find" "$(<"$tmp_out")" "pub fn find(self: str, needle: str) -> Option<i64>"
+    assert_contains "doc_stdlib_string_pins_scalar_count" "$(<"$tmp_out")" "pub fn scalar_count(self: str) -> i64"
   elif [ "$stdlib_doc_name" = "task" ]; then
     assert_contains "doc_stdlib_task_pins_public_surface" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
     assert_contains "doc_stdlib_task_pins_consuming_join" "$(<"$tmp_out")" "pub fn join<T>(self: unique Task<T>) -[TaskScope]> T"
@@ -893,7 +903,6 @@ done
 # tripwire: none can silently sprout an undocumented alpha contract.
 internal_stdlib_modules=(
   continuation
-  string
   test/report
   thread
   unicode/data/case
