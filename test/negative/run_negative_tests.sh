@@ -316,6 +316,10 @@ check_rejects "iter_each_effect_unavailable" "test/negative/iter_each_effect_una
 check_rejects "iter_each_callback_result_mismatch" "test/negative/iter_each_callback_result_mismatch.weft" 'lambda return value type mismatch: expected `nil`, found `i64`'
 check_rejects "iter_each_chunk_effect_unavailable" "test/negative/iter_each_chunk_effect_unavailable.weft" "error[E2001]:"
 check_rejects "iter_each_chunk_callback_result_mismatch" "test/negative/iter_each_chunk_callback_result_mismatch.weft" 'lambda return value type mismatch: expected `nil`, found `i64`'
+check_rejects "iter_each_window_effect_unavailable" "test/negative/iter_each_window_effect_unavailable.weft" "error[E2001]:"
+check_rejects "iter_each_window_callback_result_mismatch" "test/negative/iter_each_window_callback_result_mismatch.weft" 'lambda return value type mismatch: expected `nil`, found `usize`'
+check_rejects "iter_each_window_effect_escape" "test/negative/iter_each_window_effect_escape.weft" "slice borrow"
+check_rejects "iter_each_window_task_capture" "test/negative/iter_each_window_task_capture.weft" "borrowed resource cannot be captured by closure"
 check_rejects "iter_take_negative_limit" "test/negative/iter_take_negative_limit.weft" 'error[E1002]: integer literal does not fit expected type `usize`'
 check_rejects "iter_nth_negative_index" "test/negative/iter_nth_negative_index.weft" 'error[E1002]: integer literal does not fit expected type `usize`'
 check_rejects "iter_take_while_effectful_callback" "test/negative/iter_take_while_effectful_callback.weft" "error[E2001]:"
@@ -1052,9 +1056,11 @@ check_rejects "rigid_tail_concrete_call" "test/negative/rigid_tail_concrete_call
 check_rejects "borrow_return_position" "test/negative/borrow_return_position.weft" "type error: borrow is only valid on callable parameters"
 check_rejects "borrow_local_position" "test/negative/borrow_local_position.weft" "type error: borrow is only valid on callable parameters"
 check_rejects "borrow_field_position" "test/negative/borrow_field_position.weft" "type error: borrow is only valid on callable parameters"
-check_rejects "borrow_non_resource" "test/negative/borrow_non_resource.weft" "type error: borrow requires a named linear owner binding"
+check_rejects "borrow_non_resource" "test/negative/borrow_non_resource.weft" "type error: borrow requires a named owner or slice-view binding"
 check_rejects "borrow_nested_ownership" "test/negative/borrow_nested_ownership.weft" "type error: borrow cannot wrap another ownership qualifier"
 check_rejects "borrow_temporary_actual" "test/negative/borrow_temporary_actual.weft" "type error: borrow requires a named linear owner binding"
+check_rejects "borrow_slice_temporary_actual" "test/negative/borrow_slice_temporary_actual.weft" "type error: borrow requires a named linear owner binding"
+check_rejects "borrow_mutable_slice_view" "test/negative/borrow_mutable_slice_view.weft" "type error: scoped slice reborrows must be immutable"
 check_rejects "borrow_ordinary_managed_temporary" "test/negative/borrow_ordinary_managed_temporary.weft" "type error: borrow requires a named linear owner binding"
 check_rejects "borrow_mut_immutable_owner" "test/negative/borrow_mut_immutable_owner.weft" "type error: exclusive borrow requires a mutable owner binding"
 check_rejects "borrow_mut_ordinary_managed" "test/negative/borrow_mut_ordinary_managed.weft" "type error: exclusive borrow requires a unique or owned mutable binding"

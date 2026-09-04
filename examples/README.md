@@ -6,8 +6,8 @@ Start with programs that show the language rather than its benchmark harnesses:
   effect, a named production handler, interpolation, and ordinary terminal
   output.
 - [`iterator_pipeline.weft`](iterator_pipeline.weft) — a lazy iterator chain
-  that specializes to a scalar loop, plus an ownership-safe short-circuit
-  search returning `Option`.
+  that specializes to a scalar loop, an ownership-safe short-circuit search,
+  and zero-copy scoped windows whose callback effects remain explicit.
 - [`error_pipeline.weft`](error_pipeline.weft) — typed error variants,
   `Fail<E>`, `?`, and recovery chosen by a handler.
 - [`structured_tasks.weft`](structured_tasks.weft) — effectful scoped tasks,
