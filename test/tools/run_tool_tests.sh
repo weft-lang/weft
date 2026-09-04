@@ -865,6 +865,10 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_task_channel_pins_capacity_validation" "$(<"$tmp_out")" "pub fn capacity(value: usize) -> Result<Capacity, CapacityError>"
     assert_contains "doc_stdlib_task_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"
     assert_contains "doc_stdlib_task_channel_pins_bounded_send" "$(<"$tmp_out")" "fn send(value: T) -> SendResult<T>"
+  elif [ "$stdlib_doc_name" = "list" ]; then
+    assert_contains "doc_stdlib_list_pins_public_surface" "$(<"$tmp_out")" "Public API items: 16. Documented: 16."
+    assert_contains "doc_stdlib_list_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len<T>(self: List<T>) -> usize"
+    assert_contains "doc_stdlib_list_pins_unsigned_index" "$(<"$tmp_out")" "pub fn get<T>(self: List<T>, index: usize) -> Option<T>"
   elif [ "$stdlib_doc_name" = "bytes" ]; then
     assert_contains "doc_stdlib_bytes_pins_public_surface" "$(<"$tmp_out")" "Public API items: 14. Documented: 14."
     assert_contains "doc_stdlib_bytes_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len(self: Bytes) -> usize"

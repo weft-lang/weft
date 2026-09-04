@@ -623,6 +623,7 @@ check_rejects "file_handle_raw_factory_private" "test/negative/file_handle_raw_f
 check_rejects "bytes_constructor_private" "test/negative/bytes_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "bytes_prefixed_constructor_removed" "test/negative/bytes_prefixed_constructor_removed.weft" "error[E4002]: unknown module member 'bytes_from_str' in import" 1
 check_rejects "bytes_get_requires_usize" "test/negative/bytes_get_requires_usize.weft" "argument type mismatch: expected \`usize\`, found \`i64\`"
+check_rejects "list_get_requires_usize" "test/negative/list_get_requires_usize.weft" "argument type mismatch: expected \`usize\`, found \`i64\`"
 check_rejects "vector_with_capacity_requires_usize" "test/negative/vector_with_capacity_requires_usize.weft" "argument type mismatch: expected \`usize\`, found \`i64\`"
 check_rejects "vector_get_requires_usize" "test/negative/vector_get_requires_usize.weft" "argument type mismatch: expected \`usize\`, found \`i64\`"
 check_rejects "vector_push_is_a_command" "test/negative/vector_push_is_a_command.weft" "return value type mismatch: expected \`bool\`, found \`nil\`"
@@ -684,6 +685,7 @@ check_rejects "u64_pattern_literal_out_of_range" "test/negative/u64_pattern_lite
 check_rejects "u8_i8_arithmetic_mismatch" "test/negative/u8_i8_arithmetic_mismatch.weft" "type error: arithmetic operand type mismatch"
 check_rejects "u32_i32_comparison_mismatch" "test/negative/u32_i32_comparison_mismatch.weft" "type error: comparison operand type mismatch"
 check_rejects "usize_i64_assignment_mismatch" "test/negative/usize_i64_assignment_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `usize`, found `i64`'
+check_rejects "list_len_is_usize" "test/negative/list_len_is_usize.weft" 'error[E1002]: type annotation type mismatch: expected `i64`, found `usize`'
 check_rejects "map_len_is_usize" "test/negative/map_len_is_usize.weft" 'error[E1002]: type annotation type mismatch: expected `i64`, found `usize`'
 check_rejects "set_len_is_usize" "test/negative/set_len_is_usize.weft" 'error[E1002]: type annotation type mismatch: expected `i64`, found `usize`'
 check_rejects "sorted_map_len_is_usize" "test/negative/sorted_map_len_is_usize.weft" 'error[E1002]: type annotation type mismatch: expected `i64`, found `usize`'
