@@ -691,6 +691,7 @@ check_rejects "unicode_prefixed_surface_retired" "test/negative/unicode_prefixed
 check_rejects "iterator_free_functions_retired" "test/negative/iterator_free_functions_retired.weft" "unknown module member" 10
 check_rejects "generator_functions_retired" "test/negative/generator_functions_retired.weft" "unknown module member" 8
 check_rejects "channel_functions_retired" "test/negative/channel_functions_retired.weft" "unknown module member" 4
+check_rejects "task_channel_capacity_type_retired" "test/negative/task_channel_capacity_type_retired.weft" "error[E4002]: unknown module member 'ChannelCapacity' in import"
 check_rejects "collection_constructors_retired" "test/negative/collection_constructors_retired.weft" "unknown module member" 4
 check_rejects "map_iterator_helper_retired" "test/negative/map_iterator_helper_retired.weft" "module member" 1
 check_rejects "vector_constructors_retired" "test/negative/vector_constructors_retired.weft" "module member" 4

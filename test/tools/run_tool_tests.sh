@@ -861,6 +861,8 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_websocket_stream_pins_bounded_payload" "$(<"$tmp_out")" "pub fn read<S>(self: owned WebSocketFrameStream<S>, limit: usize) -[HttpTransportIO<S>, HttpTransportRelease<S>]> WebSocketPayloadOutcome<S>"
   elif [ "$stdlib_doc_name" = "task/channel" ]; then
     assert_contains "doc_stdlib_task_channel_pins_public_surface" "$(<"$tmp_out")" "Public API items: 18. Documented: 18."
+    assert_contains "doc_stdlib_task_channel_pins_capacity" "$(<"$tmp_out")" "pub type Capacity = opaque"
+    assert_contains "doc_stdlib_task_channel_pins_capacity_validation" "$(<"$tmp_out")" "pub fn capacity(value: usize) -> Result<Capacity, CapacityError>"
     assert_contains "doc_stdlib_task_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"
     assert_contains "doc_stdlib_task_channel_pins_bounded_send" "$(<"$tmp_out")" "fn send(value: T) -> ChannelSend<T>"
   elif [ "$stdlib_doc_name" = "vector" ]; then
@@ -872,9 +874,9 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "task" ]; then
     assert_contains "doc_stdlib_task_pins_public_surface" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
     assert_contains "doc_stdlib_task_pins_consuming_join" "$(<"$tmp_out")" "pub fn join<T>(self: unique Task<T>) -[TaskScope]> T"
-    assert_contains "doc_stdlib_task_pins_channel_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel<C: Sendable, T, E>(capacity: ChannelCapacity<C>, body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Channel<C>, E]> T) -[E]> T"
+    assert_contains "doc_stdlib_task_pins_channel_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel<C: Sendable, T, E>(capacity: Capacity, body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Channel<C>, E]> T) -[E]> T"
     assert_contains "doc_stdlib_task_pins_shutdown_handler" "$(<"$tmp_out")" "pub fn with_event_loop_shutdown<T, E>(body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Cancellation, Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T>"
-    assert_contains "doc_stdlib_task_pins_channel_shutdown_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel_shutdown<C: Sendable, T, E>(capacity: ChannelCapacity<C>, body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Channel<C>, Cancellation, Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T>"
+    assert_contains "doc_stdlib_task_pins_channel_shutdown_handler" "$(<"$tmp_out")" "pub fn with_event_loop_channel_shutdown<C: Sendable, T, E>(capacity: Capacity, body: () -[TaskScope, MonotonicClock, Sleep, TcpReadiness, Channel<C>, Cancellation, Fail<CancellationReason>, E]> T) -[E]> CancellationOutcome<T>"
   elif [ "$stdlib_doc_name" = "task/cancellation" ]; then
     assert_contains "doc_stdlib_task_cancellation_pins_public_surface" "$(<"$tmp_out")" "Public API items: 20. Documented: 20."
   elif [ "$stdlib_doc_name" = "task/shutdown" ]; then
