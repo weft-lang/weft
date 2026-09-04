@@ -55010,7 +55010,7 @@ pub(package) fn pipeline_ir_spec_facts_extend(functions: IrFunctionList, templat
   }
 }
 
-pub(package) fn pipeline_ir_multi_inline_inst_supported(inst: IrInst, self_hash: i64, structural: i64) -> i64 {
+pub(package) fn pipeline_ir_multi_inline_inst_supported(inst: IrInst, self_hash: i64, structural: i64, direct_retain_return: i64) -> i64 {
   match inst {
     IrConstI64(dst, value) -> 1
     IrNilI64(dst) -> 1
@@ -55047,7 +55047,15 @@ pub(package) fn pipeline_ir_multi_inline_inst_supported(inst: IrInst, self_hash:
     IrLoweringFailureI64(reason) -> 1
     -- A self-call would re-expose a candidate site on every splice and
     -- burn the whole growth budget on one recursive body.
-    IrCallI64(dst, callee_hash, args) -> if callee_hash == self_hash { 0 } else { 1 }
+    -- A trusted source-level retain is a real ownership acquisition but not
+    -- an IrManagedStakeI64: only lowering may manufacture that instruction.
+    -- A direct retain-return fact proves the retained word itself crosses the
+    -- boundary. Other helpers may package it behind an owned contract, whose
+    -- exact transfer the splicer cannot yet synthesize.
+    IrCallI64(dst, callee_hash, args) -> {
+      if callee_hash == self_hash or
+        (direct_retain_return == 0 and pipeline_ir_abort_cleanup_is_managed_retain_hash(callee_hash) == 1) { 0 } else { 1 }
+    }
     IrManagedStakeI64(dst, value, cleanup_kind, delta, origin) -> 1
     IrGenericCallI64(dst, callee_hash, type_args, args) -> {
       if mono_spec_hash(callee_hash, type_expr_list_to_nodes(type_args)) == self_hash { 0 } else { 1 }
@@ -55059,11 +55067,13 @@ pub(package) fn pipeline_ir_multi_inline_inst_supported(inst: IrInst, self_hash:
   }
 }
 
-pub(package) fn pipeline_ir_multi_inline_insts_ok(insts: IrInstList, self_hash: i64, structural: i64) -> i64 {
+pub(package) fn pipeline_ir_multi_inline_insts_ok(insts: IrInstList, self_hash: i64, structural: i64, direct_retain_return: i64) -> i64 {
   match insts {
     IrInstNil -> 1
     IrInstCons(inst, rest) -> {
-      if pipeline_ir_multi_inline_inst_supported(inst, self_hash, structural) == 1 { pipeline_ir_multi_inline_insts_ok(rest, self_hash, structural) } else { 0 }
+      if pipeline_ir_multi_inline_inst_supported(inst, self_hash, structural, direct_retain_return) == 1 {
+        pipeline_ir_multi_inline_insts_ok(rest, self_hash, structural, direct_retain_return)
+      } else { 0 }
     }
   }
 }
@@ -55078,14 +55088,14 @@ pub(package) fn pipeline_ir_multi_inline_term_ok(term: IrTerminator) -> i64 {
   }
 }
 
-pub(package) fn pipeline_ir_multi_inline_blocks_ok(blocks: IrBlockList, self_hash: i64, structural: i64) -> i64 {
+pub(package) fn pipeline_ir_multi_inline_blocks_ok(blocks: IrBlockList, self_hash: i64, structural: i64, direct_retain_return: i64) -> i64 {
   match blocks {
     IrBlockListNil -> 1
     IrBlockListCons(block, rest) -> {
       match block {
         IrBlock(id, params, insts, term) -> {
-          if pipeline_ir_multi_inline_insts_ok(insts, self_hash, structural) == 1 and pipeline_ir_multi_inline_term_ok(term) == 1 {
-            pipeline_ir_multi_inline_blocks_ok(rest, self_hash, structural)
+          if pipeline_ir_multi_inline_insts_ok(insts, self_hash, structural, direct_retain_return) == 1 and pipeline_ir_multi_inline_term_ok(term) == 1 {
+            pipeline_ir_multi_inline_blocks_ok(rest, self_hash, structural, direct_retain_return)
           } else { 0 }
         }
       }
@@ -55110,6 +55120,8 @@ pub(package) fn pipeline_ir_multi_inline_eligible(f: IrFunction, facts: Pipeline
       let nblocks = ir_block_list_len(blocks)
       let dense_table_role = pipeline_ir_semantic_fact_lookup_dense_table_role(facts, hash)
       let structural = if dense_table_role == cg_semantic_dense_table_role_none() { 0 } else { 1 }
+      let fact = pipeline_ir_semantic_fact_find(facts, hash)
+      let direct_retain_return = cg_semantic_fact_direct_retain_return(fact)
       let block_cap = if structural == 1 { 12 } else { pipeline_ir_multi_inline_blocks_cap() }
       -- Storage operations and indexed-address proof modes are semantic fact
       -- producers/consumers. Keep them intact until the local rewrite pass has
@@ -55133,7 +55145,6 @@ pub(package) fn pipeline_ir_multi_inline_eligible(f: IrFunction, facts: Pipeline
       -- publish an explicit SSA alias.
       else {
         let return_value = pipeline_ir_multi_single_return_value(blocks)
-        let fact = pipeline_ir_semantic_fact_find(facts, hash)
         if pipeline_ir_multi_return_count(blocks) == 1 and return_value >= 0 and return_value < param_count and ir_value_shape_is_single_gpr(cg_semantic_fact_return_shape(fact)) != 1 { 0 }
       -- Single-block candidates are admitted. The historic exclusion
       -- (sorted_map put wrote search flags as entry keys) was not a
@@ -55143,7 +55154,7 @@ pub(package) fn pipeline_ir_multi_inline_eligible(f: IrFunction, facts: Pipeline
       -- the split site, see
       -- pipeline_ir_native_generic_call_constant_intrinsic.
         else { if pipeline_ir_multi_inline_entry_params_empty(blocks) == 0 { 0 }
-        else { pipeline_ir_multi_inline_blocks_ok(blocks, hash, structural) } }
+        else { pipeline_ir_multi_inline_blocks_ok(blocks, hash, structural, direct_retain_return) } }
       } } } } }
     }
   }
@@ -61732,6 +61743,53 @@ pub(package) fn pipeline_ir_fresh_return_enrich(functions: IrFunctionList, facts
   facts
 }
 
+-- A direct retain-return helper is the one source-level retain shape whose
+-- call boundary may dissolve without inventing a new ownership transfer: the
+-- retain result itself is the function result. Keep this as a semantic fact
+-- so every inliner consumes one proof instead of recognising helper names.
+pub(package) fn pipeline_ir_direct_retain_return_counts(insts: IrInstList, return_value: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let one = match inst {
+        IrCallI64(dst, callee_hash, args) -> {
+          if pipeline_ir_abort_cleanup_is_managed_retain_hash(callee_hash) == 1 {
+            2 + (if dst == return_value { 1 } else { 0 })
+          } else { 0 }
+        }
+        _ -> 0
+      }
+      one + pipeline_ir_direct_retain_return_counts(rest, return_value)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_direct_retain_return_function_proves(function: IrFunction) -> i64 {
+  match function {
+    IrFunction(hash, param_count, blocks, src) -> match blocks {
+      IrBlockListCons(IrBlock(id, params, insts, IrTermReturn(return_value)), IrBlockListNil) -> {
+        if pipeline_ir_direct_retain_return_counts(insts, return_value) == 3 { 1 } else { 0 }
+      }
+      _ -> 0
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_direct_retain_return_enrich(functions: IrFunctionList, facts: PipelineIrSemanticFactList) -> PipelineIrSemanticFactList {
+  match functions {
+    IrFunctionNil -> facts
+    IrFunctionCons(function, rest) -> match function {
+      IrFunction(hash, param_count, blocks, src) -> {
+        let fact = pipeline_ir_semantic_fact_find(facts, hash)
+        if fact != 0 and pipeline_ir_direct_retain_return_function_proves(function) == 1 {
+          cg_semantic_fact_set_direct_retain_return(fact, 1)
+        } else { 0 }
+        pipeline_ir_direct_retain_return_enrich(rest, facts)
+      }
+    }
+  }
+}
+
 -- Small-variant scalar replacement -------------------------------
 --
 -- A fresh variant with one unmanaged payload is two scalar facts wrapped in
@@ -64846,7 +64904,8 @@ pub(package) fn pipeline_typed_optimisation_prefix(typed: TypedModule, ir: IrMod
       let functions = pipeline_ir_identity_specialisations_functions(identities)
       let semantic_facts = pipeline_ir_identity_facts_extend(pipeline_ir_identity_specialisations_requests(identities), lambda_facts)
       let fused_functions = pipeline_ir_traversal_fuse_functions(functions, semantic_facts)
-      PipelineTypedOptimisationPrefix(fused_functions, pipeline_ir_fresh_return_enrich(fused_functions, semantic_facts))
+      let retain_facts = pipeline_ir_direct_retain_return_enrich(fused_functions, semantic_facts)
+      PipelineTypedOptimisationPrefix(fused_functions, pipeline_ir_fresh_return_enrich(fused_functions, retain_facts))
     }
   }
 }
