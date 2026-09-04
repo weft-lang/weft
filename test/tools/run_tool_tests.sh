@@ -922,6 +922,7 @@ internal_stdlib_modules=(
   unicode/security
   unicode/segmentation
   unicode/data/segmentation
+  num/scalar
   unsafe
 )
 for internal_stdlib_module in "${internal_stdlib_modules[@]}"; do
