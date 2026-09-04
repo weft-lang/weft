@@ -2779,6 +2779,7 @@ assert_contains "mcp_diagnostic_wire_carries_exact_effect_set" "$mcp_out" "$wire
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"trait BoundNeed { fn val(self: i64) -> i64 } fn use_bound<T: BoundNeed>(x: T) -> i64 { x.val() } fn bad() -> i64 { use_bound<i64>(1) }"}}}' | "$WEFT" mcp 2>&1)
 assert_contains "mcp_diagnostic_wire_carries_bool_field" "$mcp_out" '{"kind":"bool","name":"impl_allowed_here","value":true}'
+assert_contains "mcp_diagnostic_wire_carries_u64_field" "$mcp_out" '{"kind":"u64","name":"candidate_impl_count","value":0}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn broken() -> i64 { 1"}}}' | "$WEFT" mcp 2>&1)
 assert_contains "mcp_diagnostic_wire_carries_machine_applicability" "$mcp_out" '"applicability":"machine-applicable"'
@@ -3333,6 +3334,7 @@ assert_contains "lsp_trait_conformance_stable_code" "$lsp_out" '"code":"E1004"'
 assert_contains "lsp_trait_conformance_exact_identity" "$lsp_out" 'type `i64` does not implement `BoundNeed`'
 assert_contains "lsp_trait_conformance_precise_type_argument_range" "$lsp_out" '"start":{"line":0,"character":125},"end":{"line":0,"character":128}'
 assert_contains "lsp_diagnostic_wire_carries_bool_field" "$lsp_out" '{"kind":"bool","name":"impl_allowed_here","value":true}'
+assert_contains "lsp_diagnostic_wire_carries_u64_field" "$lsp_out" '{"kind":"u64","name":"candidate_impl_count","value":0}'
 
 lsp_open_module_cycle='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///module-cycle.weft","version":1,"text":"use test/negative/import_cycle_direct fn main() -> i64 { 0 }"}}}'
 lsp_out=$(lsp_frame "$lsp_open_module_cycle" | "$WEFT" lsp 2>&1)
