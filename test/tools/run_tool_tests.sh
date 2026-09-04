@@ -752,6 +752,9 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_iter_pins_public_surface" "$(<"$tmp_out")" "Public API items: 48. Documented: 48."
     assert_contains "doc_stdlib_iter_pins_owned_iterator" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
     assert_contains "doc_stdlib_iter_pins_source_normalization" "$(<"$tmp_out")" "fn map<S: IntoIterator, U>(input: S, f: (S.Item) -> U)"
+  elif [ "$stdlib_doc_name" = "test" ]; then
+    assert_contains "doc_stdlib_test_pins_public_surface" "$(<"$tmp_out")" "Public API items: 38. Documented: 38."
+    assert_contains "doc_stdlib_test_pins_unsigned_equality" "$(<"$tmp_out")" "fn assert_eq_usize(got: usize, expected: usize) -> i64"
   elif [ "$stdlib_doc_name" = "utf8" ]; then
     assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
   elif [ "$stdlib_doc_name" = "time" ]; then
@@ -5200,9 +5203,20 @@ printf 'fn helper() -> i64 { 42 }\nfn main() -> i64 { helper() }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" symbols "$tmp_src" > "$tmp_out" 2> "$tmp_err"
 symbols_out=$(<"$tmp_out")
 symbols_lines=$(wc -l < "$tmp_out" | tr -d ' ')
-assert_equals "symbols_emits_one_fact_per_native_function" "$symbols_lines" "2"
+if [ "$symbols_lines" -gt 2 ]; then
+  echo "  ok symbols_covers_linked_native_closure"
+else
+  echo "  fail symbols_covers_linked_native_closure"
+  echo "    expected more than the two root functions, got $symbols_lines"
+  exit 1
+fi
 assert_contains "symbols_uses_checked_main_name" "$symbols_out" " main"
 assert_contains "symbols_uses_checked_helper_name" "$symbols_out" " helper"
+assert_contains "symbols_includes_linked_runtime_provenance" "$symbols_out" " runtime_panic"
+symbols_main_lines=$(grep -c ' main$' "$tmp_out")
+symbols_helper_lines=$(grep -c ' helper$' "$tmp_out")
+assert_equals "symbols_emits_main_once" "$symbols_main_lines" "1"
+assert_equals "symbols_emits_helper_once" "$symbols_helper_lines" "1"
 
 printf 'test "plain" { Test.assert_eq(1, 1) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
@@ -5212,7 +5226,7 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_harness_emits_passing_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
 echo "  ok test_harness_binds_runtime_after_synthesis"
 
-printf 'use stdlib/diagnostic/schema.{Diagnose} use stdlib/vector.{*} fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) let va = vector_new<i64>() let vb = vector_new<i64>() vector_push<i64>(va, 7) vector_push<i64>(vb, 7) Test.assert_i64_vector_eq(va, vb) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
+printf 'use stdlib/diagnostic/schema.{Diagnose} use stdlib/vector as vector use stdlib/vector.{*} fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) let max_usize: usize = 18446744073709551615 Test.assert_eq_usize(0, 0) Test.assert_eq_usize(max_usize, max_usize) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) let mut va = vector.new<i64>() let mut vb = vector.new<i64>() va.push(7) vb.push(7) Test.assert_i64_vector_eq(va, vb) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_supports_assertion_helpers" "$tmp_err" "unknown effect operation"
 chmod +x "$tmp_bin"
@@ -5612,6 +5626,9 @@ assert_test_failure_contains "test_assert_eq_f64_failure_reports_diagnostic" 'te
 assert_test_failure_contains "test_assert_eq_f64_failure_reports_expected" 'test "fail_eq_f64" { Test.assert_eq_f64(1.25, 2.5) }' 1 "  expected: 2.5"
 assert_test_failure_contains "test_assert_eq_f64_failure_reports_actual" 'test "fail_eq_f64" { Test.assert_eq_f64(1.25, 2.5) }' 1 "  actual:   1.25"
 assert_test_failure_contains "test_assert_eq_f64_nan_fails" 'test "fail_eq_f64_nan" { Test.assert_eq_f64(0.0 / 0.0, 0.0 / 0.0) }' 1 "test assertion failed: assert_eq_f64"
+assert_test_failure_contains "test_assert_eq_usize_failure_reports_diagnostic" 'test "fail_eq_usize" { let max: usize = 18446744073709551615 Test.assert_eq_usize(max, 0) }' 1 "test assertion failed: assert_eq_usize"
+assert_test_failure_contains "test_assert_eq_usize_failure_reports_expected" 'test "fail_eq_usize" { let max: usize = 18446744073709551615 Test.assert_eq_usize(max, 0) }' 1 "  expected: 0"
+assert_test_failure_contains "test_assert_eq_usize_preserves_full_width_actual" 'test "fail_eq_usize" { let max: usize = 18446744073709551615 Test.assert_eq_usize(max, 0) }' 1 "  actual:   18446744073709551615"
 assert_test_failure_contains "test_assert_near_f64_outside_epsilon_fails" 'test "fail_near_f64" { Test.assert_near_f64(1.0, 1.5, 0.25) }' 1 "test assertion failed: assert_near_f64"
 assert_test_failure_contains "test_assert_near_f64_reports_epsilon" 'test "fail_near_f64" { Test.assert_near_f64(1.0, 1.5, 0.25) }' 1 "  epsilon:  0.25"
 assert_test_failure_contains "test_assert_near_f64_negative_epsilon_fails" 'test "fail_near_f64_epsilon" { Test.assert_near_f64(1.0, 1.0, 0.0 - 0.1) }' 1 "test assertion failed: assert_near_f64"
@@ -5630,7 +5647,7 @@ assert_test_failure_contains "test_string_diff_reports_expected" 'test "string_d
 assert_test_failure_contains "test_string_diff_reports_actual" 'test "string_diff" { Test.assert_str_eq("a\nsnow", "a\nrain") }' 1 '    + actual   "a\nsnow"'
 assert_test_failure_contains "test_string_ne_reports_equal_value" 'test "string_ne" { Test.assert_str_ne("same\n", "same\n") }' 1 '  value was unexpectedly equal: "same\n"'
 
-vector_diff_source='use stdlib/vector.{*} test "vector_diff" { let actual = vector_new<i64>() vector_push<i64>(actual, 1) vector_push<i64>(actual, 2) vector_push<i64>(actual, 3) vector_push<i64>(actual, 4) let expected = vector_new<i64>() vector_push<i64>(expected, 1) vector_push<i64>(expected, 9) vector_push<i64>(expected, 3) Test.assert_i64_vector_eq(actual, expected) }'
+vector_diff_source='use stdlib/vector as vector use stdlib/vector.{*} test "vector_diff" { let mut actual = vector.new<i64>() actual.push(1) actual.push(2) actual.push(3) actual.push(4) let mut expected = vector.new<i64>() expected.push(1) expected.push(9) expected.push(3) Test.assert_i64_vector_eq(actual, expected) }'
 assert_test_failure_contains "test_vector_diff_reports_header" "$vector_diff_source" 1 "test assertion failed: assert_i64_vector_eq"
 assert_test_failure_contains "test_vector_diff_reports_index_and_lengths" "$vector_diff_source" 1 "  collection diff at index 1 (expected length 3, actual length 4):"
 assert_test_failure_contains "test_vector_diff_reports_expected" "$vector_diff_source" 1 "    - expected [1, 9, 3]"
@@ -5638,8 +5655,9 @@ assert_test_failure_contains "test_vector_diff_reports_actual" "$vector_diff_sou
 assert_test_compile_rejects "test_assert_true_rejects_i64" 'test "bad_bool" { Test.assert_true(2) }' 'error[E1002]: argument type mismatch: expected `bool`, found `i64`'
 assert_test_compile_rejects "test_assert_str_eq_rejects_i64" 'test "bad_str" { Test.assert_str_eq(1, "one") }' 'error[E1002]: argument type mismatch: expected `str`, found `i64`'
 assert_test_compile_rejects "test_assert_eq_f64_rejects_i64" 'test "bad_f64" { Test.assert_eq_f64(1, 1.0) }' 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
+assert_test_compile_rejects "test_assert_eq_usize_rejects_i64" 'test "bad_usize" { let value: i64 = 1 Test.assert_eq_usize(value, 1) }' 'error[E1002]: argument type mismatch: expected `usize`, found `i64`'
 assert_test_compile_rejects "test_assert_near_f64_rejects_i64_epsilon" 'test "bad_f64_epsilon" { Test.assert_near_f64(1.0, 1.0, 1) }' 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
-assert_test_compile_rejects "test_assert_i64_vector_rejects_wrong_element_type" 'use stdlib/vector.{*} test "bad_vector" { let a = vector_new<str>() let b = vector_new<str>() Test.assert_i64_vector_eq(a, b) }' 'error[E1002]: argument type mismatch: expected `Vector<i64>`, found `Vector<str>`'
+assert_test_compile_rejects "test_assert_i64_vector_rejects_wrong_element_type" 'use stdlib/vector as vector use stdlib/vector.{*} test "bad_vector" { let a = vector.new<str>() let b = vector.new<str>() Test.assert_i64_vector_eq(a, b) }' 'error[E1002]: argument type mismatch: expected `Vector<i64>`, found `owned Vector<str>`'
 assert_test_compile_rejects "test_property_rejects_i64_predicate" 'test "bad_property" { Test.forall_i64_range(0, 1, x => x + 1) }' 'error[E1002]: lambda return value type mismatch: expected `bool`, found `i64`'
 assert_test_compile_rejects "test_property_rejects_effectful_predicate" $'effect Log { fn hit() -> i64 }\ntest "bad_property_effect" { Test.forall_i64_range(0, 1, x => Log.hit() == x) }' "error[E2001]:"
 assert_test_compile_rejects "test_fixture_rejects_unhandled_state" 'test "bad_state" { TestState.get() }' "error[E2001]:"
