@@ -308,6 +308,7 @@ check_rejects "iter_filter_map_effectful_callback" "test/negative/iter_filter_ma
 check_rejects "iter_filter_map_source_use_after_adapter" "test/negative/iter_filter_map_source_use_after_adapter.weft" "type error: owned value used more than once"
 check_rejects "iter_flat_map_effectful_callback" "test/negative/iter_flat_map_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_flat_map_non_iterable" "test/negative/iter_flat_map_non_iterable.weft" 'does not implement `IntoIterator`'
+check_rejects "iter_flatten_non_iterable_item" "test/negative/iter_flatten_non_iterable_item.weft" 'does not implement `IntoIterator`'
 check_rejects "iter_flat_map_source_use_after_adapter" "test/negative/iter_flat_map_source_use_after_adapter.weft" "type error: owned value used more than once"
 check_rejects "iter_scan_state_mismatch" "test/negative/iter_scan_state_mismatch.weft" "lambda return value type mismatch"
 check_rejects "iter_each_effect_unavailable" "test/negative/iter_each_effect_unavailable.weft" "error[E2001]:"

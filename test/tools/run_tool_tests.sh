@@ -715,7 +715,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_not_contains "doc_stdlib_iter_protocol_retires_empty_seed" "$(<"$tmp_out")" "fn empty"
     assert_not_contains "doc_stdlib_iter_protocol_retires_builder_method" "$(<"$tmp_out")" "fn collect_from"
   elif [ "$stdlib_doc_name" = "iter/core" ]; then
-    assert_contains "doc_stdlib_iter_core_pins_public_surface" "$(<"$tmp_out")" "Public API items: 30. Documented: 30."
+    assert_contains "doc_stdlib_iter_core_pins_public_surface" "$(<"$tmp_out")" "Public API items: 31. Documented: 31."
     assert_contains "doc_stdlib_iter_core_pins_source_adapter" "$(<"$tmp_out")" "fn map<S: IntoIterator, U>(input: S, f: (S.Item) -> U)"
     assert_contains "doc_stdlib_iter_core_discards_any_generator_completion" "$(<"$tmp_out")" "fn from_generator<T, R>(g: owned Generator<T, R>)"
     assert_contains "doc_stdlib_iter_core_uses_semantic_take_limit" "$(<"$tmp_out")" "fn take<S: IntoIterator>(input: S, limit: usize)"
@@ -740,9 +740,10 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_iter_core_pins_enumerate" "$(<"$tmp_out")" "fn enumerate<S: IntoIterator>(input: S) -> owned Iterator<(usize, S.Item)>"
     assert_contains "doc_stdlib_iter_core_pins_heterogeneous_zip" "$(<"$tmp_out")" "fn zip<L: IntoIterator, R: IntoIterator>(left: L, right: R) -> owned Iterator<(L.Item, R.Item)>"
     assert_contains "doc_stdlib_iter_core_pins_filter_map" "$(<"$tmp_out")" "fn filter_map<S: IntoIterator, U>(input: S, f: (S.Item) -> Option<U>)"
+    assert_contains "doc_stdlib_iter_core_pins_flatten" "$(<"$tmp_out")" "fn flatten<Inner: IntoIterator, S: IntoIterator & {type Item = Inner}>(input: S) -> owned Iterator<Inner.Item>"
     assert_contains "doc_stdlib_iter_core_pins_effectful_each" "$(<"$tmp_out")" "fn each<S: IntoIterator, E>(input: S, f: (S.Item) -[E]> nil) -[E]> nil"
   elif [ "$stdlib_doc_name" = "iter" ]; then
-    assert_contains "doc_stdlib_iter_pins_public_surface" "$(<"$tmp_out")" "Public API items: 41. Documented: 41."
+    assert_contains "doc_stdlib_iter_pins_public_surface" "$(<"$tmp_out")" "Public API items: 42. Documented: 42."
     assert_contains "doc_stdlib_iter_pins_owned_iterator" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
     assert_contains "doc_stdlib_iter_pins_source_normalization" "$(<"$tmp_out")" "fn map<S: IntoIterator, U>(input: S, f: (S.Item) -> U)"
   elif [ "$stdlib_doc_name" = "utf8" ]; then
