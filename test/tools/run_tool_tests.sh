@@ -671,7 +671,7 @@ stdlib_doc_modules=(
   stdlib/diagnostic/registry.weft stdlib/map.weft stdlib/set.weft
   stdlib/sorted_map.weft stdlib/sorted_set.weft stdlib/vector/handles.weft
   stdlib/vector.weft stdlib/generator.weft stdlib/iter.weft
-  stdlib/iter/protocol.weft stdlib/iter/core.weft
+  stdlib/iter/protocol.weft stdlib/iter/core.weft stdlib/iter/materialize.weft
   stdlib/semantic_type.weft stdlib/semantic_type/render.weft
   stdlib/f64_table.weft stdlib/num.weft stdlib/io/transfer.weft
   stdlib/utf8.weft
@@ -742,8 +742,11 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_iter_core_pins_filter_map" "$(<"$tmp_out")" "fn filter_map<S: IntoIterator, U>(input: S, f: (S.Item) -> Option<U>)"
     assert_contains "doc_stdlib_iter_core_pins_flatten" "$(<"$tmp_out")" "fn flatten<Inner: IntoIterator, S: IntoIterator & {type Item = Inner}>(input: S) -> owned Iterator<Inner.Item>"
     assert_contains "doc_stdlib_iter_core_pins_effectful_each" "$(<"$tmp_out")" "fn each<S: IntoIterator, E>(input: S, f: (S.Item) -[E]> nil) -[E]> nil"
+  elif [ "$stdlib_doc_name" = "iter/materialize" ]; then
+    assert_contains "doc_stdlib_iter_materialize_pins_public_surface" "$(<"$tmp_out")" "Public API items: 1. Documented: 1."
+    assert_contains "doc_stdlib_iter_materialize_pins_owned_partition" "$(<"$tmp_out")" "fn partition<S: IntoIterator>(input: S, pred: (S.Item) -> bool) -> (owned Vector<S.Item>, owned Vector<S.Item>)"
   elif [ "$stdlib_doc_name" = "iter" ]; then
-    assert_contains "doc_stdlib_iter_pins_public_surface" "$(<"$tmp_out")" "Public API items: 42. Documented: 42."
+    assert_contains "doc_stdlib_iter_pins_public_surface" "$(<"$tmp_out")" "Public API items: 43. Documented: 43."
     assert_contains "doc_stdlib_iter_pins_owned_iterator" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
     assert_contains "doc_stdlib_iter_pins_source_normalization" "$(<"$tmp_out")" "fn map<S: IntoIterator, U>(input: S, f: (S.Item) -> U)"
   elif [ "$stdlib_doc_name" = "utf8" ]; then

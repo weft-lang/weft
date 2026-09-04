@@ -295,6 +295,7 @@ check_rejects "fusion_alloc_effect_callback" "test/negative/fusion_alloc_effect_
 check_rejects "iter_fold_effectful_callback" "test/negative/iter_fold_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_find_effectful_callback" "test/negative/iter_find_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_position_effectful_callback" "test/negative/iter_position_effectful_callback.weft" "error[E2001]:"
+check_rejects "iter_partition_effectful_callback" "test/negative/iter_partition_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_find_map_effectful_callback" "test/negative/iter_find_map_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_any_effectful_callback" "test/negative/iter_any_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_all_effectful_callback" "test/negative/iter_all_effectful_callback.weft" "error[E2001]:"
