@@ -708,6 +708,7 @@ check_rejects "f64_table_constructor_private" "test/negative/f64_table_construct
 check_rejects "intrinsic_f64_sqrt_arg_mismatch" "test/negative/intrinsic_f64_sqrt_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f64`, found `i64`'
 check_rejects "intrinsic_f32_sqrt_arg_mismatch" "test/negative/intrinsic_f32_sqrt_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `f32`, found `i64`'
 check_rejects "num_checked_cast_receiver_mismatch" "test/negative/num_checked_cast_receiver_mismatch.weft" "unknown method"
+check_rejects "num_checked_usize_arithmetic_wrong_receiver" "test/negative/num_checked_usize_arithmetic_wrong_receiver.weft" "unknown method"
 check_rejects "num_checked_cast_default_mismatch" "test/negative/num_checked_cast_default_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i8`, found `str`'
 check_rejects "intrinsic_i64_to_i8_arg_mismatch" "test/negative/intrinsic_i64_to_i8_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `u64`'
 check_rejects "intrinsic_u16_to_u64_arg_mismatch" "test/negative/intrinsic_u16_to_u64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u16`, found `f64`'
