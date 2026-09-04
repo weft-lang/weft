@@ -1,9 +1,11 @@
 -- Ownership-transfer facts at generic calls and iterator loop exits.
 
+use compiler/codegen.{cg_semantic_fact_consuming_param_mask, mono_spec_hash}
 use compiler/ir.{*}
 use compiler/lib.{*}
 use compiler/pipeline.{*}
 use compiler/type_registry.{*}
+use compiler/types.{ty_i64}
 
 fn owned_call_slot_mode_insts(insts: IrInstList, wanted_mode: i64) -> i64 {
   match insts {
@@ -45,6 +47,103 @@ fn owned_call_slot_mode_functions(functions: IrFunctionList, wanted_mode: i64) -
   }
 }
 
+fn owned_call_transport_retains_insts(insts: IrInstList) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let here = match inst {
+        IrManagedStakeI64(dst, value, kind, delta, origin) -> {
+          if delta == 1 and origin == ir_managed_stake_origin_call_transport() { 1 } else { 0 }
+        }
+        _ -> 0
+      }
+      here + owned_call_transport_retains_insts(rest)
+    }
+  }
+}
+
+fn owned_call_transport_retains_blocks(blocks: IrBlockList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(IrBlock(id, params, insts, term), rest) ->
+      owned_call_transport_retains_insts(insts) + owned_call_transport_retains_blocks(rest)
+  }
+}
+
+fn owned_call_raw_retains_insts(insts: IrInstList) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let here = match inst {
+        IrCallI64(dst, callee, args) -> if callee == pipeline_rc_default_retain_hash() { 1 } else { 0 }
+        _ -> 0
+      }
+      here + owned_call_raw_retains_insts(rest)
+    }
+  }
+}
+
+fn owned_call_raw_retains_blocks(blocks: IrBlockList) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(IrBlock(id, params, insts, term), rest) ->
+      owned_call_raw_retains_insts(insts) + owned_call_raw_retains_blocks(rest)
+  }
+}
+
+fn owned_call_transport_retains(ir: IrModule, fn_name: str) -> i64 {
+  let wanted = str_hash(__str_ptr(fn_name), 0, __str_len(fn_name))
+  match pipeline_ir_function_list_find_hash(pipeline_ir_functions(ir), wanted) {
+    IrFunctionNil -> 0 - 1
+    IrFunctionCons(fn_ir, rest) -> owned_call_transport_retains_blocks(
+      pipeline_ir_function_blocks(fn_ir)
+    )
+  }
+}
+
+fn owned_call_generic_transfer_summary(functions: IrFunctionList, wanted: i64) -> i64 {
+  match pipeline_ir_function_list_find_hash(functions, wanted) {
+    IrFunctionNil -> 0 - 1
+    IrFunctionCons(fn_ir, rest) -> {
+      let blocks = pipeline_ir_function_blocks(fn_ir)
+      owned_call_slot_mode_blocks(blocks, 3) * 100 +
+        owned_call_transport_retains_blocks(blocks) * 10 +
+        owned_call_raw_retains_blocks(blocks)
+    }
+  }
+}
+
+fn owned_call_identity_clone_for(requests: i64, base_hash: i64) -> i64 {
+  let mut clone = 0
+  let mut i = 0
+  while i < nlist_len(requests) and clone == 0 {
+    let request = nlist_get(requests, i)
+    if node_f1(request) == base_hash { clone = node_f2(request) } else { i = i + 1 }
+  }
+  clone
+}
+
+fn owned_call_identity_specialisations(
+  typed: TypedModule,
+  ir: IrModule
+) -> PipelineIrIdentitySpecialisations {
+  match typed {
+    TypedModule(fns, src, tt) -> {
+      let base = pipeline_ir_functions(ir)
+      let templates = pipeline_generic_template_pairs(fns)
+      let source_specs = pipeline_collect_generic_specs_fns(fns, tt, src)
+      let ir_specs = pipeline_collect_generic_specs_ir_functions(base, templates, fns, tt)
+      let direct = pipeline_ir_function_list_dedup(
+        pipeline_ir_function_list_append(source_specs, ir_specs)
+      )
+      let generic = pipeline_collect_generic_specs_closure(direct, templates, fns, tt)
+      pipeline_ir_identity_specialise(
+        pipeline_ir_hoisted_lambda_fns_extend(pipeline_ir_function_list_append(base, generic))
+      )
+    }
+  }
+}
+
 test "qualified generic calls carry owned argument transfer facts" {
   let src = "use stdlib/drop.{*}
 use stdlib/iter.{*}
@@ -64,6 +163,74 @@ fn main() -> i64 { 0 }
   Test.assert_eq(owned_call_slot_mode(ir, "explicit_call", 3), 1)
   Test.assert_eq(owned_call_slot_mode(ir, "inferred_call", 3), 1)
   Test.assert_eq(owned_call_slot_mode(ir, "qualified_call", 3), 1)
+}
+
+test "owned indirect arguments move without a redundant managed retain" {
+  let src = "use stdlib/vector.{*}
+use stdlib/vector as vector
+fn consume(values: owned Vector<i64>) -> nil { nil }
+fn invoke(values: owned Vector<i64>, f: (owned Vector<i64>) -> nil) -> nil {
+  f(values)
+}
+fn invoke_generic<T>(values: owned Vector<T>, f: (owned Vector<T>) -> nil) -> nil {
+  f(values)
+}
+fn owned_transfer_start(values: owned Vector<i64>) -> nil {
+  invoke_generic<i64>(values, consume)
+}
+fn main() -> nil { owned_transfer_start(vector.new<i64>()) }
+"
+  let typed = pipeline_check_source_with_origin_standalone(__str_ptr(src), __str_len(src), 1, 0)
+  let ir = pipeline_lower_ir(typed)
+  Test.assert_eq(owned_call_slot_mode(ir, "invoke", 3), 1)
+  Test.assert_eq(owned_call_transport_retains(ir, "invoke"), 0)
+  Test.assert_eq(owned_call_slot_mode(ir, "owned_transfer_start", 3), 1)
+  Test.assert_eq(owned_call_transport_retains(ir, "owned_transfer_start"), 0)
+  let args = nlist_new()
+  nlist_add(args, ty_i64())
+  let generic_hash = mono_spec_hash(
+    str_hash(__str_ptr("invoke_generic"), 0, __str_len("invoke_generic")),
+    args
+  )
+  let prefix = pipeline_typed_optimisation_prefix(typed, ir)
+  let prefix_facts = pipeline_typed_optimisation_prefix_facts(prefix)
+  let consume_hash = str_hash(__str_ptr("consume"), 0, __str_len("consume"))
+  Test.assert_eq(
+    cg_semantic_fact_consuming_param_mask(
+      pipeline_ir_semantic_fact_find(prefix_facts, consume_hash)
+    ),
+    1
+  )
+  Test.assert_eq(
+    cg_semantic_fact_consuming_param_mask(
+      pipeline_ir_semantic_fact_find(prefix_facts, generic_hash)
+    ) band 1,
+    1
+  )
+  Test.assert_eq(
+    pipeline_ir_inst_is_dead_pure_candidate(
+      ir_inst_call_i64(1, consume_hash, ir_value_list_empty()),
+      prefix_facts
+    ),
+    0
+  )
+  let identities = owned_call_identity_specialisations(typed, ir)
+  let functions = pipeline_ir_identity_specialisations_functions(identities)
+  let clone_hash = owned_call_identity_clone_for(
+    pipeline_ir_identity_specialisations_requests(identities),
+    generic_hash
+  )
+  Test.assert_eq(owned_call_generic_transfer_summary(functions, generic_hash), 100)
+  Test.assert_eq(owned_call_generic_transfer_summary(functions, clone_hash), 100)
+  let optimised_module = pipeline_optimise_typed_ir(typed, ir)
+  let optimised = pipeline_ir_functions(optimised_module)
+  Test.assert_eq(owned_call_generic_transfer_summary(optimised, clone_hash), 100)
+  Test.assert_eq(
+    cg_semantic_fact_consuming_param_mask(
+      pipeline_ir_semantic_fact_find(pipeline_ir_semantic_facts(optimised_module), clone_hash)
+    ) band 1,
+    1
+  )
 }
 
 test "destructuring for exits preserve the iterator drop obligation" {
