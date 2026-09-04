@@ -619,6 +619,8 @@ check_rejects "file_handle_raw_factory_private" "test/negative/file_handle_raw_f
 check_rejects "bytes_constructor_private" "test/negative/bytes_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "bytes_prefixed_constructor_removed" "test/negative/bytes_prefixed_constructor_removed.weft" "error[E4002]: unknown module member 'bytes_from_str' in import" 1
 check_rejects "bytes_get_requires_usize" "test/negative/bytes_get_requires_usize.weft" "argument type mismatch: expected \`usize\`, found \`i64\`"
+check_rejects "bytes_migration_len_retired" "test/negative/bytes_migration_len_retired.weft" "unknown method"
+check_rejects "bytes_migration_get_retired" "test/negative/bytes_migration_get_retired.weft" "unknown method"
 check_rejects "path_constructor_private" "test/negative/path_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "path_prefixed_constructor_removed" "test/negative/path_prefixed_constructor_removed.weft" "error[E4002]: unknown module member 'path_from_utf8' in import" 1
 check_rejects "string_find_is_option" "test/negative/string_find_is_option.weft" 'return value type mismatch: expected `i64`, found `Option<i64>`'
