@@ -743,10 +743,12 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_iter_core_pins_flatten" "$(<"$tmp_out")" "fn flatten<Inner: IntoIterator, S: IntoIterator & {type Item = Inner}>(input: S) -> owned Iterator<Inner.Item>"
     assert_contains "doc_stdlib_iter_core_pins_effectful_each" "$(<"$tmp_out")" "fn each<S: IntoIterator, E>(input: S, f: (S.Item) -[E]> nil) -[E]> nil"
   elif [ "$stdlib_doc_name" = "iter/materialize" ]; then
-    assert_contains "doc_stdlib_iter_materialize_pins_public_surface" "$(<"$tmp_out")" "Public API items: 1. Documented: 1."
+    assert_contains "doc_stdlib_iter_materialize_pins_public_surface" "$(<"$tmp_out")" "Public API items: 5. Documented: 5."
     assert_contains "doc_stdlib_iter_materialize_pins_owned_partition" "$(<"$tmp_out")" "fn partition<S: IntoIterator>(input: S, pred: (S.Item) -> bool) -> (owned Vector<S.Item>, owned Vector<S.Item>)"
+    assert_contains "doc_stdlib_iter_materialize_pins_typed_chunk_failure" "$(<"$tmp_out")" "pub type ChunkError"
+    assert_contains "doc_stdlib_iter_materialize_pins_effectful_owned_chunks" "$(<"$tmp_out")" "fn each_chunk<S: IntoIterator, E>(input: S, size: usize, f: (owned Vector<S.Item>) -[E]> nil) -[E]> Result<nil, ChunkError>"
   elif [ "$stdlib_doc_name" = "iter" ]; then
-    assert_contains "doc_stdlib_iter_pins_public_surface" "$(<"$tmp_out")" "Public API items: 43. Documented: 43."
+    assert_contains "doc_stdlib_iter_pins_public_surface" "$(<"$tmp_out")" "Public API items: 47. Documented: 47."
     assert_contains "doc_stdlib_iter_pins_owned_iterator" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
     assert_contains "doc_stdlib_iter_pins_source_normalization" "$(<"$tmp_out")" "fn map<S: IntoIterator, U>(input: S, f: (S.Item) -> U)"
   elif [ "$stdlib_doc_name" = "utf8" ]; then
