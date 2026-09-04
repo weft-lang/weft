@@ -875,6 +875,18 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_path_pins_public_surface" "$(<"$tmp_out")" "Public API items: 13. Documented: 13."
     assert_contains "doc_stdlib_path_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len(self: Path) -> usize"
     assert_contains "doc_stdlib_path_pins_unsigned_offsets" "$(<"$tmp_out")" "PathContainsNul(usize)"
+  elif [ "$stdlib_doc_name" = "map" ]; then
+    assert_contains "doc_stdlib_map_pins_public_surface" "$(<"$tmp_out")" "Public API items: 11. Documented: 11."
+    assert_contains "doc_stdlib_map_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len<K, V>(self: Map<K, V>) -> usize"
+  elif [ "$stdlib_doc_name" = "set" ]; then
+    assert_contains "doc_stdlib_set_pins_public_surface" "$(<"$tmp_out")" "Public API items: 9. Documented: 9."
+    assert_contains "doc_stdlib_set_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len<T>(self: Set<T>) -> usize"
+  elif [ "$stdlib_doc_name" = "sorted_map" ]; then
+    assert_contains "doc_stdlib_sorted_map_pins_public_surface" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
+    assert_contains "doc_stdlib_sorted_map_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len<K, V>(self: SortedMap<K, V>) -> usize"
+  elif [ "$stdlib_doc_name" = "sorted_set" ]; then
+    assert_contains "doc_stdlib_sorted_set_pins_public_surface" "$(<"$tmp_out")" "Public API items: 11. Documented: 11."
+    assert_contains "doc_stdlib_sorted_set_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len<T>(self: SortedSet<T>) -> usize"
   elif [ "$stdlib_doc_name" = "vector" ]; then
     assert_contains "doc_stdlib_vector_pins_public_surface" "$(<"$tmp_out")" "Public API items: 46. Documented: 46."
     assert_contains "doc_stdlib_vector_pins_mutable_type" "$(<"$tmp_out")" "pub type Vector<T>"

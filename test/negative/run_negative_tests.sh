@@ -684,6 +684,10 @@ check_rejects "u64_pattern_literal_out_of_range" "test/negative/u64_pattern_lite
 check_rejects "u8_i8_arithmetic_mismatch" "test/negative/u8_i8_arithmetic_mismatch.weft" "type error: arithmetic operand type mismatch"
 check_rejects "u32_i32_comparison_mismatch" "test/negative/u32_i32_comparison_mismatch.weft" "type error: comparison operand type mismatch"
 check_rejects "usize_i64_assignment_mismatch" "test/negative/usize_i64_assignment_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `usize`, found `i64`'
+check_rejects "map_len_is_usize" "test/negative/map_len_is_usize.weft" 'error[E1002]: type annotation type mismatch: expected `i64`, found `usize`'
+check_rejects "set_len_is_usize" "test/negative/set_len_is_usize.weft" 'error[E1002]: type annotation type mismatch: expected `i64`, found `usize`'
+check_rejects "sorted_map_len_is_usize" "test/negative/sorted_map_len_is_usize.weft" 'error[E1002]: type annotation type mismatch: expected `i64`, found `usize`'
+check_rejects "sorted_set_len_is_usize" "test/negative/sorted_set_len_is_usize.weft" 'error[E1002]: type annotation type mismatch: expected `i64`, found `usize`'
 check_rejects "u8_call_i64_arg_mismatch" "test/negative/u8_call_i64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u8`, found `i64`'
 check_rejects "intrinsic_i64_to_f64_arg_mismatch" "test/negative/intrinsic_i64_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `f64`'
 check_rejects "intrinsic_u64_to_f64_arg_mismatch" "test/negative/intrinsic_u64_to_f64_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `u64`, found `i64`'
