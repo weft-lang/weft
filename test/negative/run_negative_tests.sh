@@ -624,6 +624,8 @@ check_rejects "vector_get_requires_usize" "test/negative/vector_get_requires_usi
 check_rejects "vector_push_is_a_command" "test/negative/vector_push_is_a_command.weft" "return value type mismatch: expected \`bool\`, found \`nil\`"
 check_rejects "vector_set_returns_replaced_value" "test/negative/vector_set_returns_replaced_value.weft" "return value type mismatch: expected \`bool\`, found \`Result<i64, vector.IndexError>\`"
 check_rejects "vector_slice_requires_checked_result" "test/negative/vector_slice_requires_checked_result.weft" "return value type mismatch: expected \`owned Vector<i64>\`, found \`Option<owned Vector<i64>>\`"
+check_rejects "vector_migration_capacity_bridge_retired" "test/negative/vector_migration_capacity_bridge_retired.weft" "unknown module member 'vector.migration_with_capacity_i64'"
+check_rejects "vector_migration_len_bridge_retired" "test/negative/vector_migration_len_bridge_retired.weft" "type error: unknown method"
 check_rejects "bytes_migration_len_retired" "test/negative/bytes_migration_len_retired.weft" "unknown method"
 check_rejects "bytes_migration_get_retired" "test/negative/bytes_migration_get_retired.weft" "unknown method"
 check_rejects "path_constructor_private" "test/negative/path_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
