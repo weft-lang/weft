@@ -299,6 +299,8 @@ check_rejects "iter_find_map_effectful_callback" "test/negative/iter_find_map_ef
 check_rejects "iter_any_effectful_callback" "test/negative/iter_any_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_all_effectful_callback" "test/negative/iter_all_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_reduce_effectful_callback" "test/negative/iter_reduce_effectful_callback.weft" "error[E2001]:"
+check_rejects "iter_min_unordered" "test/negative/iter_min_unordered.weft" 'does not implement `Ord`'
+check_rejects "iter_max_unordered" "test/negative/iter_max_unordered.weft" 'does not implement `Ord`'
 check_rejects "iter_map_collect_effectful_callback" "test/negative/iter_map_collect_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_map_effectful_callback" "test/negative/iter_map_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_filter_effectful_callback" "test/negative/iter_filter_effectful_callback.weft" "error[E2001]:"
