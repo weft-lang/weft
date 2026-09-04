@@ -658,7 +658,7 @@ stdlib_doc_modules=(
   stdlib/time/monotonic.weft stdlib/time/wall.weft
   stdlib/time/sleep.weft stdlib/time/calendar.weft stdlib/env.weft
   stdlib/process.weft
-  stdlib/json.weft
+  stdlib/json.weft stdlib/random.weft
   stdlib/secure_random.weft stdlib/secure_random/deterministic.weft
   stdlib/net_address.weft stdlib/idna.weft
   stdlib/dns.weft stdlib/dns/fake.weft stdlib/dns/policy.weft
@@ -755,6 +755,14 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "test" ]; then
     assert_contains "doc_stdlib_test_pins_public_surface" "$(<"$tmp_out")" "Public API items: 38. Documented: 38."
     assert_contains "doc_stdlib_test_pins_unsigned_equality" "$(<"$tmp_out")" "fn assert_eq_usize(got: usize, expected: usize) -> i64"
+  elif [ "$stdlib_doc_name" = "random" ]; then
+    assert_contains "doc_stdlib_random_pins_public_surface" "$(<"$tmp_out")" "Public API items: 15. Documented: 15."
+    assert_contains "doc_stdlib_random_pins_opaque_seed" "$(<"$tmp_out")" "pub type Seed = opaque"
+    assert_contains "doc_stdlib_random_pins_opaque_state" "$(<"$tmp_out")" "pub type State = opaque"
+    assert_contains "doc_stdlib_random_pins_versioned_algorithm" "$(<"$tmp_out")" "SplitMix64V1"
+    assert_contains "doc_stdlib_random_pins_scalar_step" "$(<"$tmp_out")" "fn next_u64(self: State) -> (State, u64)"
+    assert_contains "doc_stdlib_random_pins_validated_bound" "$(<"$tmp_out")" "fn bound(upper: usize) -> Result<Bound, BoundError>"
+    assert_contains "doc_stdlib_random_pins_unbiased_step" "$(<"$tmp_out")" "fn next_below(self: State, bound: Bound) -> (State, usize)"
   elif [ "$stdlib_doc_name" = "utf8" ]; then
     assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
   elif [ "$stdlib_doc_name" = "time" ]; then

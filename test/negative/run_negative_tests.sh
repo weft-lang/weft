@@ -109,6 +109,10 @@ check_rejects "secure_random_prefixed_function_retired" "test/negative/secure_ra
 check_rejects "secure_random_wrapper_retired" "test/negative/secure_random_wrapper_retired.weft" "error[E4002]: unknown module member 'secure_random_with_deterministic' in import" 1
 check_rejects "secure_random_platform_wrapper_retired" "test/negative/secure_random_platform_wrapper_retired.weft" "error[E4002]: unknown module member 'runtime_platform_secure_random' in import" 1
 check_rejects "secure_random_raw_backend_private" "test/negative/secure_random_raw_backend_private.weft" "module member 'runtime_secure_random_fill_raw' is not visible in this import" 1
+check_rejects "random_seed_constructor_private" "test/negative/random_seed_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "random_state_constructor_private" "test/negative/random_state_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "random_bound_constructor_private" "test/negative/random_bound_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "random_next_below_requires_bound" "test/negative/random_next_below_requires_bound.weft" 'error[E1002]: argument type mismatch: expected `Bound`, found `usize`'
 check_rejects "tls_client_open_requires_authority" "test/negative/tls_client_open_requires_authority.weft" 'error[E2001]: effects `SecureRandom, WallClock` are not available in this context'
 check_rejects "tls_server_open_requires_authority" "test/negative/tls_server_open_requires_authority.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
 check_rejects "http_client_cannot_listen" "test/negative/http_client_cannot_listen.weft" 'error[E2001]: effect `HttpServer` is not available in this context'
