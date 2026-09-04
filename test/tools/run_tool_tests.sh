@@ -3094,6 +3094,13 @@ assert_contains "mcp_opt_counters_indexed_bounds_total" "$mcp_out" '"indexed_bou
 assert_contains "mcp_opt_counters_indexed_bounds_full" "$mcp_out" '"indexed_full_bounds_elisions":1'
 assert_contains "mcp_opt_counters_indexed_bounds_not_vector" "$mcp_out" '"vector_bounds_elisions":0'
 
+# IrStore is intentionally not an SSA definition, but a low mutable slot still
+# writes its canonical x19-x26 bank home. The prologue census must consume the
+# dedicated slot-write fact or the omitted pair corrupts a caller register.
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"use stdlib/drop.{*} type SlotResult<T> { SlotOk(T), SlotErr } impl<T> SlotResult<T> { fn expect(self, default: T) -> T { match self { SlotOk(value) -> value SlotErr -> default } } } type SlotToken = opaque i64 impl Drop for SlotToken { fn drop(self: i64) -> i64 { 0 } } impl SlotToken { fn touch(self: borrow mut SlotToken) -> nil { nil } } fn checked(value: i64) -> SlotResult<i64> { SlotOk<i64>(value) } fn worker(size: i64) -> owned SlotToken { let capacity = checked(size).expect(0) let mut value: owned SlotToken = SlotToken(capacity) for index in 0..size { value.touch() } value } fn main() -> i64 { let work: (i64) -> owned SlotToken = worker work(8).drop() }"}}}' | "$WEFT" mcp 2>&1)
+assert_contains "mcp_opt_counters_low_mutable_slot_saved" "$mcp_out" '"pair_census_written_unsaved":0'
+assert_contains "mcp_opt_counters_low_mutable_slot_audit_clean" "$mcp_out" '"residency_audit_violations":0'
+
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"fn main() -> i64 { nope() }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_opt_counters_check_error_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"opt_counters","ok":false,"reason":"check errors"}}'
 
