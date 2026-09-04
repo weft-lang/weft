@@ -693,9 +693,10 @@ pub(package) type PipelineIrNativeValueHomeFacts {
 }
 
 pub(package) type PipelineNativeEmitCtx {
-  -- The final field is a mutable list of handle-abort ADR patches owned by
-  -- the current CFG emission. Nested clause functions get their own list.
-  PipelineNativeEmitCtx(i64, PipelineNativeHandlerCtx, PipelineIrNativeValueHomeFacts, PipelineIrNativeF64Facts, i64, PipelineIrNativeFpEnv, PipelineIrNativeVectorDataFacts, i64)
+  -- The final fields are the mutable handle-abort ADR patch list and the
+  -- destination of an immediately pending typed direct managed transfer.
+  -- Nested clause functions get their own patch list and pending state.
+  PipelineNativeEmitCtx(i64, PipelineNativeHandlerCtx, PipelineIrNativeValueHomeFacts, PipelineIrNativeF64Facts, i64, PipelineIrNativeFpEnv, PipelineIrNativeVectorDataFacts, i64, i64)
 }
 
 pub(package) type PipelineIrNativeTermEmitInfo {
@@ -6424,6 +6425,49 @@ pub(package) fn pipeline_effect_linear_transfer_insts_node(
   }
 }
 
+-- Effect dispatch is an owned ABI boundary just like a function call. The
+-- selected handler owns every by-value managed lane as soon as the operation
+-- is performed, including an owned rvalue whose producing continuation may
+-- later be dropped. Preserve that transfer explicitly so suspended cleanup
+-- cannot release the caller's former stake after the handler has received it.
+-- A negative callee sentinel is disjoint from direct and indirect calls while
+-- the nonnegative destination and lane still bind the marker to the exact
+-- immediately following perform instruction.
+pub(package) fn pipeline_effect_managed_transfer_hash() -> i64 {
+  0 - 1
+}
+
+-- Lowering-owned direct transfers survive semantic call rewrites such as
+-- generic, callback-identity, and consuming specialisation. Their checked
+-- parameter lane and immediately following destination/value association are
+-- stable; a dedicated sentinel avoids pretending the pre-rewrite callee hash
+-- remains the semantic authority after those transformations.
+pub(package) fn pipeline_direct_managed_transfer_hash() -> i64 {
+  0 - 2
+}
+
+pub(package) fn pipeline_effect_managed_transfer_lane_insts(expected_ty: i64, lane: i64, lanes: i64, arg_word: i64, args: IrValueList, perform_dst: i64) -> IrInstList {
+  if lane >= lanes { ir_inst_list_empty() }
+  else {
+    let rest = pipeline_effect_managed_transfer_lane_insts(expected_ty, lane + 1, lanes, arg_word, args, perform_dst)
+    let cleanup_kind = pipeline_type_value_lane_release_kind(expected_ty, lane)
+    let value = pipeline_ir_value_list_get_or(args, arg_word + lane, 0 - 1)
+    if cleanup_kind == continuation_cleanup_kind_none() or value < 0 { rest }
+    else { ir_inst_list_prepend(IrManagedTransferI64(perform_dst, pipeline_effect_managed_transfer_hash(), value, arg_word + lane, cleanup_kind), rest) }
+  }
+}
+
+pub(package) fn pipeline_effect_managed_transfer_insts(expected_params: i64, index: i64, arg_word: i64, args: IrValueList, perform_dst: i64) -> IrInstList {
+  if expected_params == 0 or index >= nlist_len(expected_params) { ir_inst_list_empty() }
+  else {
+    let expected_ty = node_f3(nlist_get(expected_params, index))
+    let lanes = pipeline_type_value_lane_count_or_one(expected_ty)
+    let current = pipeline_effect_managed_transfer_lane_insts(expected_ty, 0, lanes, arg_word, args, perform_dst)
+    let rest = pipeline_effect_managed_transfer_insts(expected_params, index + 1, arg_word + lanes, args, perform_dst)
+    ir_inst_list_append(current, rest)
+  }
+}
+
 -- Function values erase the concrete callee hash, but their checked function
 -- type still gives every physical parameter lane and cleanup kind. Record the
 -- ABI-entry ownership transfer explicitly so abort/cancellation cleanup can
@@ -6451,6 +6495,78 @@ pub(package) fn pipeline_indirect_managed_transfer_insts(expected_types: i64, ex
     let current = pipeline_indirect_managed_transfer_lane_insts(expected_ty, 0, lanes, arg_word, args, call_dst)
     let rest = pipeline_indirect_managed_transfer_insts(expected_types, expected_subst, index + 1, arg_word + lanes, args, call_dst)
     ir_inst_list_append(current, rest)
+  }
+}
+
+-- Direct calls retain their typed parameter contract only while lowering.
+-- Preserve each by-value managed ABI lane in IR before generic
+-- monomorphisation replaces the source callable identity with a specialised
+-- hash. Native emission can then implement the exact two-phase transfer:
+-- keep the caller's stake armed while the callee may abort, and retire it
+-- only after a normal return.
+pub(package) fn pipeline_direct_managed_transfer_call_dst_or(call: IrInst, default: i64) -> i64 {
+  match call {
+    IrCallI64(dst, callee_hash, args) -> dst
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> dst
+    IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> dst
+    _ -> default
+  }
+}
+
+pub(package) fn pipeline_direct_managed_transfer_call_hash(call: IrInst) -> i64 {
+  match call {
+    IrCallI64(dst, callee_hash, args) -> callee_hash
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> mono_spec_hash(callee_hash, type_expr_list_to_nodes(type_args))
+    IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> pipeline_ir_method_patch_key(type_hash, method_hash)
+    _ -> 0
+  }
+}
+
+pub(package) fn pipeline_direct_managed_transfer_call_args(call: IrInst) -> IrValueList {
+  match call {
+    IrCallI64(dst, callee_hash, args) -> args
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> args
+    IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> ir_value_list_prepend(receiver, args)
+    _ -> ir_value_list_empty()
+  }
+}
+
+pub(package) fn pipeline_direct_managed_transfer_lane_insts(expected_ty: i64, lane: i64, lanes: i64, arg_word: i64, args: IrValueList, call_dst: i64) -> IrInstList {
+  if lane >= lanes { ir_inst_list_empty() }
+  else {
+    let rest = pipeline_direct_managed_transfer_lane_insts(expected_ty, lane + 1, lanes, arg_word, args, call_dst)
+    let cleanup_kind = pipeline_type_value_lane_release_kind(expected_ty, lane)
+    let value = pipeline_ir_value_list_get_or(args, arg_word + lane, 0 - 1)
+    if cleanup_kind == continuation_cleanup_kind_none() or value < 0 { rest }
+    else { ir_inst_list_prepend(IrManagedTransferI64(call_dst, pipeline_direct_managed_transfer_hash(), value, arg_word + lane, cleanup_kind), rest) }
+  }
+}
+
+pub(package) fn pipeline_direct_managed_transfer_param_insts(expected_params: i64, expected_subst: i64, borrowed_mask: i64, index: i64, arg_word: i64, args: IrValueList, call_dst: i64, tt: i64) -> IrInstList {
+  if expected_params == 0 or index >= nlist_len(expected_params) { ir_inst_list_empty() }
+  else {
+    let raw_ty = node_f3(nlist_get(expected_params, index))
+    let expected_ty = if expected_subst == 0 { raw_ty } else { ty_subst(raw_ty, expected_subst) }
+    let lanes = pipeline_type_value_lane_count_or_one(expected_ty)
+    let current = if cg_mask_has(borrowed_mask, index) == 0 and
+      not ty_is_borrow(expected_ty) and
+      pipeline_linear_cleanup_plan(tt, expected_ty) == 0 {
+      pipeline_direct_managed_transfer_lane_insts(expected_ty, 0, lanes, arg_word, args, call_dst)
+    } else { ir_inst_list_empty() }
+    let rest = pipeline_direct_managed_transfer_param_insts(expected_params, expected_subst, borrowed_mask, index + 1, arg_word + lanes, args, call_dst, tt)
+    ir_inst_list_append(current, rest)
+  }
+}
+
+pub(package) fn pipeline_direct_managed_transfer_insts(expected_params: i64, expected_subst: i64, borrowed_mask: i64, call: IrInst, tt: i64) -> IrInstList {
+  let call_dst = pipeline_direct_managed_transfer_call_dst_or(call, 0 - 1)
+  let callee_hash = pipeline_direct_managed_transfer_call_hash(call)
+  if call_dst < 0 or callee_hash == 0 { ir_inst_list_empty() }
+  else {
+    pipeline_direct_managed_transfer_param_insts(
+      expected_params, expected_subst, borrowed_mask, 0, 0,
+      pipeline_direct_managed_transfer_call_args(call), call_dst, tt
+    )
   }
 }
 
@@ -8730,12 +8846,17 @@ pub(package) fn pipeline_lower_par_map_generic_typed_to_target_blocks(type_args:
             PipelineParLowerPthread(pool_slot, work_scope_slot) -> ir_value_list_append(abi_args, ir_value_list_prepend(pool_load, ir_value_list_empty()))
             _ -> abi_args
           }
+          let call_inst = IrGenericCallI64(call_dst, target_hash, type_args, call_values)
+          let managed_transfers = pipeline_direct_managed_transfer_insts(
+            expected_params, expected_subst, borrowed_mask, call_inst,
+            pipeline_lower_module_tt(module)
+          )
           let call_insts = match policy {
             PipelineParLowerPthread(pool_slot, work_scope_slot) -> ir_inst_list_prepend(
               ir_inst_load_i64(pool_load, pool_slot),
-              ir_inst_list_prepend(IrGenericCallI64(call_dst, target_hash, type_args, call_values), ir_inst_list_empty())
+              ir_inst_list_append(managed_transfers, ir_inst_list_prepend(call_inst, ir_inst_list_empty()))
             )
-            _ -> ir_inst_list_prepend(IrGenericCallI64(call_dst, target_hash, type_args, call_values), ir_inst_list_empty())
+            _ -> ir_inst_list_append(managed_transfers, ir_inst_list_prepend(call_inst, ir_inst_list_empty()))
           }
           let call = ir_block_new_term(call_block, call_insts, ir_term_jump_args(target_block, ir_value_list_prepend(call_dst, ir_value_list_empty())))
           let blocks = ir_block_list_prepend(entry, ir_block_list_append(pipeline_lowered_call_blocks_blocks(lowered_args), ir_block_list_prepend(call, ir_block_list_empty())))
@@ -9228,13 +9349,15 @@ pub(package) fn pipeline_lower_call_typed_to_target_blocks(ns: i64, nl: i64, arg
               args_expr, expected_params, 0, 0, abi_args, params, locals, module
             )
           } else { ir_inst_list_empty() } }
-          let managed_transfers = match resolved_call {
-            IrIndirectCallI64(actual_dst, callee, actual_args, indirect_result_ty) -> pipeline_indirect_managed_transfer_insts(
-              expected_types, if variant_payloads != 0 { variant_subst } else { subst },
-              0, 0, actual_args, actual_dst
-            )
-            _ -> ir_inst_list_empty()
-          }
+        let managed_transfers = match resolved_call {
+          IrIndirectCallI64(actual_dst, callee, actual_args, indirect_result_ty) -> pipeline_indirect_managed_transfer_insts(
+            expected_types, if variant_payloads != 0 { variant_subst } else { subst },
+            0, 0, actual_args, actual_dst
+          )
+          _ -> pipeline_direct_managed_transfer_insts(
+            expected_params, subst, borrowed_mask, resolved_call, tt
+          )
+        }
           let result_lanes = if result_ty != 0 { pipeline_type_value_lane_count_or_one(result_ty) } else { 1 }
           let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_expr, logical_args, 0, call_dst + result_lanes, borrowed_mask, 0, expected_params, expected_types, variant_subst, src, tt)
           let call_and_cleanup = ir_inst_list_append(
@@ -10895,13 +11018,18 @@ pub(package) fn pipeline_lower_decl_generic_call_typed_to_target_blocks(decl: i6
         let logical_args = pipeline_lowered_call_blocks_values(lowered_args)
         let abi_args = pipeline_call_abi_args(logical_args, expected_params, 0, expected_subst, 0, 0)
         let result_ty = pipeline_function_return_type_with_subst(node_f1(pair), expected_subst, pipeline_lower_module_tt(module))
-        let call_head = ir_inst_list_prepend(IrGenericCallI64(dst, pipeline_fn_pair_key(pair), call_type_args, abi_args), pipeline_ir_call_result_lane_insts(dst, result_ty))
+        let call_inst = IrGenericCallI64(dst, pipeline_fn_pair_key(pair), call_type_args, abi_args)
+        let call_head = ir_inst_list_prepend(call_inst, pipeline_ir_call_result_lane_insts(dst, result_ty))
         let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
         let linear_transfers = pipeline_effect_linear_transfer_insts_typed(
           args_exprs, expected_params, 0, 0, abi_args, params, locals, module
         )
+        let managed_transfers = pipeline_direct_managed_transfer_insts(
+          expected_params, expected_subst, borrowed_mask, call_inst,
+          pipeline_lower_module_tt(module)
+        )
         let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, logical_args, 0, dst + result_lanes, borrowed_mask, 0, expected_params, 0, expected_subst, pipeline_lower_module_src(module), pipeline_lower_module_tt(module))
-        let call = ir_block_new_term(call_block, ir_inst_list_append(linear_transfers, ir_inst_list_append(call_head, pipeline_lowered_args_insts(cleanup))), ir_term_jump_args(target_block, pipeline_ir_value_lane_ids(dst, 0, result_lanes)))
+        let call = ir_block_new_term(call_block, ir_inst_list_append(linear_transfers, ir_inst_list_append(managed_transfers, ir_inst_list_append(call_head, pipeline_lowered_args_insts(cleanup)))), ir_term_jump_args(target_block, pipeline_ir_value_lane_ids(dst, 0, result_lanes)))
         let blocks = ir_block_list_prepend(entry, ir_block_list_append(pipeline_lowered_call_blocks_blocks(lowered_args), ir_block_list_prepend(call, ir_block_list_empty())))
         pipeline_lowered_blocks(pipeline_lowered_call_blocks_next_block(lowered_args), pipeline_lowered_args_next_value(cleanup), blocks, 1)
       }
@@ -11061,13 +11189,14 @@ pub(package) fn pipeline_lower_method_call_typed_after_receiver(recv_expr: Expr,
       pipeline_lowered_blocks_control(pipeline_lowered_call_blocks_next_block(lowered_args), pipeline_lowered_call_blocks_next_value(lowered_args), blocks, 1, 0)
     } else {
       let call_dst = pipeline_lowered_call_blocks_next_value(lowered_args)
-      let call_head = ir_inst_list_prepend(
-        pipeline_method_call_inst(call_dst, method_ref, method_hash, recv_value, pipeline_lowered_call_blocks_values(lowered_args), subst, tt),
-        ir_inst_list_empty()
-      )
+      let method_call = pipeline_method_call_inst(call_dst, method_ref, method_hash, recv_value, pipeline_lowered_call_blocks_values(lowered_args), subst, tt)
+      let call_head = ir_inst_list_prepend(method_call, ir_inst_list_empty())
       let receiver_transfer = if associated { ir_inst_list_empty() }
         else { pipeline_method_receiver_linear_transfer_insts_typed(recv_expr, recv_value, method_params, params, locals, module) }
-      let call_inst = ir_inst_list_append(receiver_transfer, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(call_dst, result_ty)))
+      let managed_transfers = pipeline_direct_managed_transfer_insts(
+        method_params, 0, borrowed_mask, method_call, tt
+      )
+      let call_inst = ir_inst_list_append(receiver_transfer, ir_inst_list_append(managed_transfers, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(call_dst, result_ty))))
       let receiver_cleanup = if associated { pipeline_lowered_args(ir_value_list_empty(), call_dst + result_lanes, ir_inst_list_empty(), 1) }
         else { pipeline_managed_method_receiver_temp_release_typed(recv_expr, recv_value, receiver_ty, result_ty, call_dst + result_lanes, borrowed_mask, src, pipeline_lower_module_fns(module), subst, tt) }
       let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, pipeline_lowered_args_next_value(receiver_cleanup), borrowed_mask, param_offset, method_params, 0, 0, src, tt)
@@ -11111,13 +11240,14 @@ pub(package) fn pipeline_lower_method_call_typed_after_straight_receiver(recv_ex
       pipeline_lowered_blocks_control(pipeline_lowered_call_blocks_next_block(lowered_args), pipeline_lowered_call_blocks_next_value(lowered_args), blocks, 1, 0)
     } else {
       let call_dst = pipeline_lowered_call_blocks_next_value(lowered_args)
-      let call_head = ir_inst_list_prepend(
-        pipeline_method_call_inst(call_dst, method_ref, method_hash, recv_value, pipeline_lowered_call_blocks_values(lowered_args), subst, tt),
-        ir_inst_list_empty()
-      )
+      let method_call = pipeline_method_call_inst(call_dst, method_ref, method_hash, recv_value, pipeline_lowered_call_blocks_values(lowered_args), subst, tt)
+      let call_head = ir_inst_list_prepend(method_call, ir_inst_list_empty())
       let receiver_transfer = if associated { ir_inst_list_empty() }
         else { pipeline_method_receiver_linear_transfer_insts_typed(recv_expr, recv_value, method_params, params, locals, module) }
-      let call_inst = ir_inst_list_append(receiver_transfer, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(call_dst, result_ty)))
+      let managed_transfers = pipeline_direct_managed_transfer_insts(
+        method_params, 0, borrowed_mask, method_call, tt
+      )
+      let call_inst = ir_inst_list_append(receiver_transfer, ir_inst_list_append(managed_transfers, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(call_dst, result_ty))))
       let receiver_cleanup = if associated { pipeline_lowered_args(ir_value_list_empty(), call_dst + result_lanes, ir_inst_list_empty(), 1) }
         else { pipeline_managed_method_receiver_temp_release_typed(recv_expr, recv_value, receiver_ty, result_ty, call_dst + result_lanes, borrowed_mask, src, pipeline_lower_module_fns(module), subst, tt) }
       let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_call_blocks_values(lowered_args), 0, pipeline_lowered_args_next_value(receiver_cleanup), borrowed_mask, param_offset, method_params, 0, 0, src, tt)
@@ -11339,9 +11469,12 @@ pub(package) fn pipeline_lower_perform_typed_to_target_blocks_keyed(lhs_expr: Ex
               args_exprs, expected_params, 0, 0, abi_args,
               params, locals, module
             )
+            let managed_transfers = pipeline_effect_managed_transfer_insts(
+              expected_params, 0, 0, abi_args, dst
+            )
             let perform_insts = ir_inst_list_append(
               transfers,
-              ir_inst_list_prepend(op_inst, result_insts)
+              ir_inst_list_append(managed_transfers, ir_inst_list_prepend(op_inst, result_insts))
             )
             let perform_args = pipeline_ir_value_lane_ids(dst, 0, result_lanes)
             let perform_block_node = ir_block_new_term(call_block, perform_insts, ir_term_jump_args(target_block, perform_args))
@@ -15839,13 +15972,15 @@ pub(package) fn pipeline_lower_call_to_target_blocks(expr: i64, params: i64, loc
             args_exprs, expected_params, 0, 0, abi_args, params, locals, module
           )
         } else { ir_inst_list_empty() } }
-        let managed_transfers = match resolved_call {
-          IrIndirectCallI64(actual_dst, callee, actual_args, indirect_result_ty) -> pipeline_indirect_managed_transfer_insts(
-            expected_types, if variant_payloads != 0 { variant_subst } else { subst },
-            0, 0, actual_args, actual_dst
-          )
-          _ -> ir_inst_list_empty()
-        }
+          let managed_transfers = match resolved_call {
+            IrIndirectCallI64(actual_dst, callee, actual_args, indirect_result_ty) -> pipeline_indirect_managed_transfer_insts(
+              expected_types, if variant_payloads != 0 { variant_subst } else { subst },
+              0, 0, actual_args, actual_dst
+            )
+            _ -> pipeline_direct_managed_transfer_insts(
+              expected_params, subst, borrowed_mask, resolved_call, tt
+            )
+          }
         let result_lanes = if result_ty != 0 { pipeline_type_value_lane_count_or_one(result_ty) } else { 1 }
         let call_result_lanes = if result_ty != 0 { pipeline_ir_call_result_lane_insts(call_dst, result_ty) } else { ir_inst_list_empty() }
         let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, logical_args, 0, call_dst + result_lanes, borrowed_mask, 0, expected_params, expected_types, variant_subst, pipeline_lower_module_src(module), pipeline_lower_module_tt(module))
@@ -16042,13 +16177,14 @@ pub(package) fn pipeline_lower_method_args_cfg_to_target_blocks(method_ctx: Pipe
           )
         } else {
           let call_dst = pipeline_lowered_call_blocks_next_value(lowered_args)
-          let call_head = ir_inst_list_prepend(
-            pipeline_method_call_inst(call_dst, node_f4(expr), node_f2(expr), receiver_value, pipeline_lowered_call_blocks_values(lowered_args), subst, tt),
-            ir_inst_list_empty()
-          )
+          let method_call = pipeline_method_call_inst(call_dst, node_f4(expr), node_f2(expr), receiver_value, pipeline_lowered_call_blocks_values(lowered_args), subst, tt)
+          let call_head = ir_inst_list_prepend(method_call, ir_inst_list_empty())
           let receiver_transfer = if associated { ir_inst_list_empty() }
             else { pipeline_method_receiver_linear_transfer_insts_node(node_f1(expr), receiver_value, method_params, pipeline_handler_lower_ctx_from_module(params, locals, module)) }
-          let call_inst = ir_inst_list_append(receiver_transfer, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(call_dst, result_ty)))
+          let managed_transfers = pipeline_direct_managed_transfer_insts(
+            method_params, 0, borrowed_mask, method_call, tt
+          )
+          let call_inst = ir_inst_list_append(receiver_transfer, ir_inst_list_append(managed_transfers, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(call_dst, result_ty))))
           let receiver_cleanup = if associated { pipeline_lowered_args(ir_value_list_empty(), call_dst + result_lanes, ir_inst_list_empty(), 1) }
             else { pipeline_managed_method_receiver_temp_release_node(node_f1(expr), receiver_value, receiver_ty, result_ty, call_dst + result_lanes, borrowed_mask, src, pipeline_lower_module_fns(module), subst, tt) }
           let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args_node, arg_count, pipeline_lowered_call_blocks_values(lowered_args), 0, pipeline_lowered_args_next_value(receiver_cleanup), borrowed_mask, param_offset, method_params, 0, 0, src, tt)
@@ -16116,13 +16252,14 @@ pub(package) fn pipeline_lower_method_call_after_cfg_receiver(expr: i64, receive
     let args = pipeline_lower_typed_method_handler_opt_args_expected(expr_list_from_nodes(args_node, 0, nargs), 0, pipeline_lowered_args_next_value(receiver_retain), lower_ctx, method_params, 0, borrowed_mask, param_offset)
     if pipeline_lowered_args_is_valid(args) == 1 {
       let call_dst = pipeline_lowered_args_next_value(args)
-      let call_head = ir_inst_list_prepend(
-        pipeline_method_call_inst(call_dst, node_f4(expr), node_f2(expr), receiver_value, pipeline_lowered_args_values(args), subst, tt),
-        ir_inst_list_empty()
-      )
+      let method_call = pipeline_method_call_inst(call_dst, node_f4(expr), node_f2(expr), receiver_value, pipeline_lowered_args_values(args), subst, tt)
+      let call_head = ir_inst_list_prepend(method_call, ir_inst_list_empty())
       let receiver_transfer = if associated { ir_inst_list_empty() }
         else { pipeline_method_receiver_linear_transfer_insts_node(node_f1(expr), receiver_value, method_params, lower_ctx) }
-      let call_inst = ir_inst_list_append(receiver_transfer, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(call_dst, result_ty)))
+      let managed_transfers = pipeline_direct_managed_transfer_insts(
+        method_params, 0, borrowed_mask, method_call, tt
+      )
+      let call_inst = ir_inst_list_append(receiver_transfer, ir_inst_list_append(managed_transfers, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(call_dst, result_ty))))
       let receiver_cleanup = if associated { pipeline_lowered_args(ir_value_list_empty(), call_dst + result_lanes, ir_inst_list_empty(), 1) }
         else { pipeline_managed_method_receiver_temp_release_node(node_f1(expr), receiver_value, receiver_ty, result_ty, call_dst + result_lanes, borrowed_mask, src, pipeline_lower_module_fns(module), subst, tt) }
       let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args_node, nargs, pipeline_lowered_args_values(args), 0, pipeline_lowered_args_next_value(receiver_cleanup), borrowed_mask, param_offset, method_params, 0, 0, src, tt)
@@ -21894,7 +22031,10 @@ pub(package) fn pipeline_lower_call_expr_typed_sidecar_handler_opt(ns: i64, nl: 
           expected_types, if variant_payloads != 0 { variant_subst } else { subst },
           0, 0, actual_args, actual_dst
         )
-        _ -> ir_inst_list_empty()
+        _ -> pipeline_direct_managed_transfer_insts(
+          expected_params, subst, borrowed_mask, resolved_call,
+          pipeline_handler_lower_ctx_tt(lower_ctx)
+        )
       }
       let result_lanes = if result_ty != 0 { pipeline_type_value_lane_count_or_one(result_ty) } else { 1 }
       let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_expr, logical_args, 0, dst + result_lanes, borrowed_mask, 0, expected_params, expected_types, variant_subst, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
@@ -23525,9 +23665,12 @@ pub(package) fn pipeline_lower_resolved_effect_perform_expr_typed_sidecar(signat
         args_exprs, expected_params, 0, 0, abi_args,
         params, locals, pipeline_handler_lower_ctx_module(lower_ctx)
       )
+      let managed_transfers = pipeline_effect_managed_transfer_insts(
+        expected_params, 0, 0, abi_args, dst
+      )
       let perform = ir_inst_list_append(
         transfers,
-        ir_inst_list_append(ir_inst_list_prepend(op_inst, ir_inst_list_empty()), pipeline_ir_call_result_lane_insts(dst, return_ty))
+        ir_inst_list_append(managed_transfers, ir_inst_list_append(ir_inst_list_prepend(op_inst, ir_inst_list_empty()), pipeline_ir_call_result_lane_insts(dst, return_ty)))
       )
       ir_lowered_expr(dst, dst + result_lanes, ir_inst_list_append(pipeline_lowered_args_insts(args), perform))
     }
@@ -23789,7 +23932,8 @@ pub(package) fn pipeline_lower_decl_generic_call_typed(decl: i64, type_args: Typ
       let dst = pipeline_lowered_args_next_value(lowered_args)
       let logical_args = pipeline_lowered_args_values(lowered_args)
       let abi_args = pipeline_call_abi_args(logical_args, expected_params, 0, expected_subst, 0, 0)
-      let call_head = ir_inst_list_prepend(IrGenericCallI64(dst, pipeline_fn_pair_key(pair), call_type_args, abi_args), ir_inst_list_empty())
+      let call_inst = IrGenericCallI64(dst, pipeline_fn_pair_key(pair), call_type_args, abi_args)
+      let call_head = ir_inst_list_prepend(call_inst, ir_inst_list_empty())
       let result_ty = pipeline_function_return_type_with_subst(node_f1(pair), expected_subst, pipeline_handler_lower_ctx_tt(lower_ctx))
       let call = ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(dst, result_ty))
       let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
@@ -23803,8 +23947,12 @@ pub(package) fn pipeline_lower_decl_generic_call_typed(decl: i64, type_args: Typ
         pipeline_handler_lower_ctx_locals(lower_ctx),
         pipeline_handler_lower_ctx_module(lower_ctx)
       )
+      let managed_transfers = pipeline_direct_managed_transfer_insts(
+        expected_params, expected_subst, borrowed_mask, call_inst,
+        pipeline_handler_lower_ctx_tt(lower_ctx)
+      )
       let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, logical_args, 0, dst + result_lanes, borrowed_mask, 0, expected_params, 0, expected_subst, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
-      ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_inst_list_append(linear_transfers, ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup)))))
+      ir_lowered_expr(dst, pipeline_lowered_args_next_value(cleanup), ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), ir_inst_list_append(linear_transfers, ir_inst_list_append(managed_transfers, ir_inst_list_append(call, pipeline_lowered_args_insts(cleanup))))))
     }
   } }
 }
@@ -23951,13 +24099,14 @@ pub(package) fn pipeline_lower_method_call_expr_typed_sidecar_handler_opt(recv_e
     let args = pipeline_lower_typed_method_handler_opt_args_expected(args_exprs, 0, pipeline_lowered_args_next_value(receiver_retain), lower_ctx, method_params, 0, borrowed_mask, param_offset)
     if pipeline_lowered_args_is_valid(args) == 1 {
       let dst = pipeline_lowered_args_next_value(args)
-      let call_head = ir_inst_list_prepend(
-        pipeline_method_call_inst(dst, method_ref, method_hash, ir_lowered_expr_value(receiver), pipeline_lowered_args_values(args), subst, tt),
-        ir_inst_list_empty()
-      )
+      let method_call = pipeline_method_call_inst(dst, method_ref, method_hash, ir_lowered_expr_value(receiver), pipeline_lowered_args_values(args), subst, tt)
+      let call_head = ir_inst_list_prepend(method_call, ir_inst_list_empty())
       let receiver_transfer = if associated { ir_inst_list_empty() }
         else { pipeline_method_receiver_linear_transfer_insts_typed(recv_expr, ir_lowered_expr_value(receiver), method_params, params, locals, pipeline_handler_lower_ctx_module(lower_ctx)) }
-      let call = ir_inst_list_append(receiver_transfer, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(dst, result_ty)))
+      let managed_transfers = pipeline_direct_managed_transfer_insts(
+        method_params, 0, borrowed_mask, method_call, tt
+      )
+      let call = ir_inst_list_append(receiver_transfer, ir_inst_list_append(managed_transfers, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(dst, result_ty))))
       let receiver_cleanup = if associated { pipeline_lowered_args(ir_value_list_empty(), dst + result_lanes, ir_inst_list_empty(), 1) }
         else { pipeline_managed_method_receiver_temp_release_typed(recv_expr, ir_lowered_expr_value(receiver), receiver_ty, result_ty, dst + result_lanes, borrowed_mask, src, pipeline_handler_lower_ctx_fns(lower_ctx), subst, tt) }
       let cleanup = pipeline_managed_lambda_temp_release_args_masked_typed(args_exprs, pipeline_lowered_args_values(args), 0, pipeline_lowered_args_next_value(receiver_cleanup), borrowed_mask, param_offset, method_params, 0, 0, src, tt)
@@ -26295,7 +26444,10 @@ pub(package) fn pipeline_lower_call_node_typed_sidecar_handler_opt(ns: i64, nl: 
           expected_types, if variant_payloads != 0 { variant_subst } else { subst },
           0, 0, actual_args, actual_dst
         )
-        _ -> ir_inst_list_empty()
+        _ -> pipeline_direct_managed_transfer_insts(
+          expected_params, subst, borrowed_mask, resolved_call,
+          pipeline_handler_lower_ctx_tt(lower_ctx)
+        )
       }
       let result_lanes = if result_ty != 0 { pipeline_type_value_lane_count_or_one(result_ty) } else { 1 }
       let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, logical_args, 0, dst + result_lanes, borrowed_mask, 0, expected_params, expected_types, variant_subst, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_tt(lower_ctx))
@@ -26557,13 +26709,14 @@ pub(package) fn pipeline_lower_method_call_node_typed_sidecar_handler_opt(recv_n
     let lowered_args = pipeline_lower_node_handler_opt_args_expected_offset_borrow_mask(args, arg_count, 0, pipeline_lowered_args_next_value(receiver_retain), lower_ctx, method_params, 0, 0, param_offset, borrowed_mask)
     if pipeline_lowered_args_is_valid(lowered_args) == 1 {
       let dst = pipeline_lowered_args_next_value(lowered_args)
-      let call_head = ir_inst_list_prepend(
-        pipeline_method_call_inst(dst, method_ref, method_hash, ir_lowered_expr_value(receiver), pipeline_lowered_args_values(lowered_args), subst, tt),
-        ir_inst_list_empty()
-      )
+      let method_call = pipeline_method_call_inst(dst, method_ref, method_hash, ir_lowered_expr_value(receiver), pipeline_lowered_args_values(lowered_args), subst, tt)
+      let call_head = ir_inst_list_prepend(method_call, ir_inst_list_empty())
       let receiver_transfer = if associated { ir_inst_list_empty() }
         else { pipeline_method_receiver_linear_transfer_insts_node(recv_node, ir_lowered_expr_value(receiver), method_params, lower_ctx) }
-      let call = ir_inst_list_append(receiver_transfer, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(dst, result_ty)))
+      let managed_transfers = pipeline_direct_managed_transfer_insts(
+        method_params, 0, borrowed_mask, method_call, tt
+      )
+      let call = ir_inst_list_append(receiver_transfer, ir_inst_list_append(managed_transfers, ir_inst_list_append(call_head, pipeline_ir_call_result_lane_insts(dst, result_ty))))
       let receiver_cleanup = if associated { pipeline_lowered_args(ir_value_list_empty(), dst + result_lanes, ir_inst_list_empty(), 1) }
         else { pipeline_managed_method_receiver_temp_release_node(recv_node, ir_lowered_expr_value(receiver), receiver_ty, result_ty, dst + result_lanes, borrowed_mask, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_fns(lower_ctx), subst, tt) }
       let cleanup = pipeline_managed_lambda_temp_release_arg_nodes_masked(args, arg_count, pipeline_lowered_args_values(lowered_args), 0, pipeline_lowered_args_next_value(receiver_cleanup), borrowed_mask, param_offset, method_params, 0, 0, pipeline_handler_lower_ctx_src(lower_ctx), tt)
@@ -27126,9 +27279,12 @@ pub(package) fn pipeline_lower_perform_node_typed_sidecar_handler_opt(lhs_node: 
         let transfers = pipeline_effect_linear_transfer_insts_node(
           args, arg_count, expected_params, 0, 0, abi_args, lower_ctx
         )
+        let managed_transfers = pipeline_effect_managed_transfer_insts(
+          expected_params, 0, 0, abi_args, dst
+        )
         let perform = ir_inst_list_append(
           transfers,
-          ir_inst_list_append(ir_inst_list_prepend(op_inst, ir_inst_list_empty()), pipeline_ir_call_result_lane_insts(dst, return_ty))
+          ir_inst_list_append(managed_transfers, ir_inst_list_append(ir_inst_list_prepend(op_inst, ir_inst_list_empty()), pipeline_ir_call_result_lane_insts(dst, return_ty)))
         )
         let insts = ir_inst_list_append(pipeline_lowered_args_insts(lowered_args), perform)
         ir_lowered_expr(dst, dst + result_lanes, insts)
@@ -31545,6 +31701,18 @@ pub(package) fn pipeline_ir_abort_cleanup_origin_indirect_transfer_pending() -> 
   ir_managed_stake_origin_count()
 }
 
+-- A direct call's pending state is keyed by its SSA destination. Keeping this
+-- outside the stable nonnegative origin domain lets the post-call commit retire
+-- exactly this call's transports without reloading caller-clobbered arguments
+-- or touching an obligation prepared for another boundary.
+pub(package) fn pipeline_ir_abort_cleanup_origin_direct_transfer_pending(call_dst: i64) -> i64 {
+  0 - 2 - call_dst
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_origin_is_direct_transfer_pending(origin: i64) -> i64 {
+  if origin <= 0 - 2 { 1 } else { 0 }
+}
+
 pub(package) fn pipeline_ir_abort_cleanup_add_acquisition_fact_with_origin(facts: i64, site: i64, value: i64, action: i64, kind: i64, origin: i64) -> i64 {
   if site == 0 - 1 or value < 0 or action == 0 or pipeline_ir_abort_cleanup_acquisition_fact_exists(facts, site, value, action, kind) == 1 { 0 }
   else {
@@ -32834,7 +33002,9 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_disarm_action(code: i64, value: i
 -- boundary.
 pub(package) fn pipeline_ir_abort_cleanup_emit_mark_action_origin(code: i64, value: i64, action: i64, origin: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
   if value < 0 or action == 0 or
-    (ir_managed_stake_origin_is_valid(origin) == 0 and origin != pipeline_ir_abort_cleanup_origin_indirect_transfer_pending()) { 0 }
+    (ir_managed_stake_origin_is_valid(origin) == 0 and
+      origin != pipeline_ir_abort_cleanup_origin_indirect_transfer_pending() and
+      pipeline_ir_abort_cleanup_origin_is_direct_transfer_pending(origin) == 0) { 0 }
   else {
     let value_phys = pipeline_ir_native_load_reg(code, pinned, value)
     emit_store_spill_offset(code, value_phys, pipeline_ir_abort_cleanup_expected_value_offset(fmap_current_abort_cleanup_base(fm)))
@@ -32860,15 +33030,24 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_mark_action_origin(code: i64, val
     emit_load_spill_offset(code, 16, pipeline_ir_abort_cleanup_expected_action_offset(fmap_current_abort_cleanup_base(fm)))
     bu32(code, cg_ldr(17, 15, handler_abort_cleanup_record_action_offset()))
     bu32(code, encode_cmp(17, 16))
+    let advance_action = buf_len(code)
+    bu32(code, 0)
+    bu32(code, cg_ldr(17, 15, handler_abort_cleanup_record_origin_offset()))
+    emit_mov_imm_safe(code, 16, origin)
+    bu32(code, encode_cmp(17, 16))
+    let advance_origin = buf_len(code)
+    bu32(code, 0)
     let found = buf_len(code)
     bu32(code, 0)
     let advance = buf_len(code)
     cg_patch_b_cond(code, advance_value, 1, advance)
+    cg_patch_b_cond(code, advance_action, 1, advance)
+    cg_patch_b_cond(code, advance_origin, 0, advance)
     bu32(code, cg_ldr(15, 15, handler_abort_cleanup_record_prev_offset()))
     let scan_back = buf_len(code)
     bu32(code, encode_b(scan - scan_back))
     let mark = buf_len(code)
-    cg_patch_b_cond(code, found, 0, mark)
+    cg_patch_b(code, found, mark)
     emit_mov_imm_safe(code, 17, origin)
     bu32(code, cg_str(17, 15, handler_abort_cleanup_record_origin_offset()))
     let done = buf_len(code)
@@ -32878,10 +33057,10 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_mark_action_origin(code: i64, val
   }
 }
 
--- A returned indirect call commits every retain-elided transfer prepared in
--- this frame. Splicing happens only after successful return; suspension or
--- abort before that point leaves each original obligation armed.
-pub(package) fn pipeline_ir_abort_cleanup_emit_commit_pending_indirect_transfers(code: i64, fm: i64) -> i64 {
+-- A returned call commits every transfer carrying its exact pending origin.
+-- Splicing happens only after successful return; suspension or abort before
+-- that point leaves each original obligation armed.
+pub(package) fn pipeline_ir_abort_cleanup_emit_commit_pending_transfers(code: i64, origin: i64, fm: i64) -> i64 {
   bu32(code, cg_ldr(15, 28, runtime_state_abort_cleanup_active_offset()))
   let inactive = buf_len(code)
   bu32(code, 0)
@@ -32897,7 +33076,7 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_commit_pending_indirect_transfers
   let done_boundary = buf_len(code)
   bu32(code, 0)
   bu32(code, cg_ldr(17, 15, handler_abort_cleanup_record_origin_offset()))
-  emit_mov_imm_safe(code, 16, pipeline_ir_abort_cleanup_origin_indirect_transfer_pending())
+  emit_mov_imm_safe(code, 16, origin)
   bu32(code, encode_cmp(17, 16))
   let advance_origin = buf_len(code)
   bu32(code, 0)
@@ -32918,6 +33097,12 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_commit_pending_indirect_transfers
   cg_patch_b_cond(code, done_empty, 0, done)
   cg_patch_b_cond(code, done_boundary, 0, done)
   cg_patch_cbz(code, inactive, 15, done)
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_emit_commit_pending_indirect_transfers(code: i64, fm: i64) -> i64 {
+  pipeline_ir_abort_cleanup_emit_commit_pending_transfers(
+    code, pipeline_ir_abort_cleanup_origin_indirect_transfer_pending(), fm
+  )
 }
 
 -- Retains which could not be elided are already labelled call-transport by
@@ -33167,6 +33352,15 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_effect_transfer(code: i64, value:
 }
 
 pub(package) fn pipeline_ir_abort_cleanup_emit_rewrap_acquire(code: i64, value: i64, plan: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  -- A zero-cost opaque constructor can wrap a representation whose surface
+  -- type carries no linear plan even though its defining runtime call
+  -- acquired a tracked resource (for example an RC-backed runtime state
+  -- returned as i64). Transfer that exact producer record before arming the
+  -- wrapper. Matching the acquisition site, rather than runtime value bits,
+  -- preserves distinct stakes whose pointers happen to compare equal.
+  pipeline_ir_abort_cleanup_emit_source_site_acquisitions_from(
+    code, fmap_current_abort_cleanup_facts(fm), value, 0, fm
+  )
   let fact = pipeline_ir_abort_cleanup_find_acquisition_value_action_kind(
     fmap_current_abort_cleanup_facts(fm),
     value,
@@ -33178,6 +33372,31 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_rewrap_acquire(code: i64, value: 
     bu32(code, encode_brk(67))
   } else {
     pipeline_ir_abort_cleanup_emit_register_fact(code, fact, value, fm, pinned)
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_emit_source_site_acquisitions_from(
+  code: i64,
+  facts: i64,
+  value: i64,
+  index: i64,
+  fm: i64
+) -> i64 {
+  if facts == 0 or index >= nlist_len(facts) { 0 }
+  else {
+    let fact = nlist_get(facts, index)
+    let kind = node_f3(fact)
+    let source = if node_tag(fact) == value and node_f1(fact) == value and
+      (kind == pipeline_ir_abort_cleanup_direct_kind() or
+        kind == pipeline_ir_abort_cleanup_owned_kind() or
+        kind == pipeline_ir_abort_cleanup_structural_kind() or
+        kind == pipeline_ir_abort_cleanup_array_kind()) {
+      pipeline_ir_abort_cleanup_emit_disarm_transferred_fact(code, fact, fm)
+      1
+    } else { 0 }
+    source + pipeline_ir_abort_cleanup_emit_source_site_acquisitions_from(
+      code, facts, value, index + 1, fm
+    )
   }
 }
 
@@ -33269,8 +33488,18 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_rebind_structural_slot(code: i64,
   if source_fact != 0 {
     pipeline_ir_abort_cleanup_emit_disarm_transferred_fact(code, source_fact, fm)
   } else { 0 }
+  let representation_source = if source_fact == 0 and plan_kind == 1 {
+    -- Mutable initialization stores a zero-cost opaque wrapper in its slot
+    -- before this marker. When inlining exposes the raw producer, `value`
+    -- still names that producer's acquisition site even though its i64
+    -- representation has no linear type plan. Consume the exact fact before
+    -- the slot becomes the canonical owned identity.
+    pipeline_ir_abort_cleanup_emit_source_site_acquisitions_from(
+      code, facts, value, 0, fm
+    )
+  } else { 0 }
   let flow_aliases = pipeline_ir_abort_cleanup_emit_rebind_flow_aliases_from(code, facts, value, action, 0, fm)
-  if source_fact == 0 and flow_aliases == 0 {
+  if source_fact == 0 and representation_source == 0 and flow_aliases == 0 {
     if plan_kind != 1 {
     -- Optimisation may independently alias flattened lanes, so `value + n`
     -- is not a reliable identity after the store sequence. The slot lanes are
@@ -33620,6 +33849,12 @@ pub(package) fn pipeline_ir_abort_cleanup_emit_commit_method_call(code: i64, typ
     ir_value_list_prepend(receiver, args),
     fm,
     pinned
+  )
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_emit_commit_pending_direct_call(code: i64, call_dst: i64, fm: i64) -> i64 {
+  pipeline_ir_abort_cleanup_emit_commit_pending_transfers(
+    code, pipeline_ir_abort_cleanup_origin_direct_transfer_pending(call_dst), fm
   )
 }
 
@@ -39098,43 +39333,43 @@ pub(package) fn pipeline_ir_native_pop_one(code: i64, facts: PipelineIrNativeVal
 
 pub(package) fn pipeline_ir_native_emit_ctx_scope(ctx: PipelineNativeEmitCtx) -> i64 {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> scope
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches, pending_direct_dst) -> scope
   }
 }
 
 pub(package) fn pipeline_ir_native_emit_ctx_handlers(ctx: PipelineNativeEmitCtx) -> PipelineNativeHandlerCtx {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> handlers
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches, pending_direct_dst) -> handlers
   }
 }
 
 pub(package) fn pipeline_ir_native_emit_ctx_pinned(ctx: PipelineNativeEmitCtx) -> PipelineIrNativeValueHomeFacts {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> pinned
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches, pending_direct_dst) -> pinned
   }
 }
 
 pub(package) fn pipeline_ir_native_emit_ctx_f64_facts(ctx: PipelineNativeEmitCtx) -> PipelineIrNativeF64Facts {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> f64_facts
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches, pending_direct_dst) -> f64_facts
   }
 }
 
 pub(package) fn pipeline_ir_native_emit_ctx_fns(ctx: PipelineNativeEmitCtx) -> i64 {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> fns
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches, pending_direct_dst) -> fns
   }
 }
 
 pub(package) fn pipeline_ir_native_emit_ctx_fp_env(ctx: PipelineNativeEmitCtx) -> PipelineIrNativeFpEnv {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> fp_env
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches, pending_direct_dst) -> fp_env
   }
 }
 
 pub(package) fn pipeline_ir_native_emit_ctx_with_fp_env(ctx: PipelineNativeEmitCtx, fp_env: PipelineIrNativeFpEnv) -> PipelineNativeEmitCtx {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, old_fp_env, vector_data_facts, adr_patches) -> PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches)
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, old_fp_env, vector_data_facts, adr_patches, pending_direct_dst) -> PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches, pending_direct_dst)
   }
 }
 
@@ -39144,13 +39379,25 @@ pub(package) fn pipeline_ir_native_emit_ctx_clear_fp(ctx: PipelineNativeEmitCtx)
 
 pub(package) fn pipeline_ir_native_emit_ctx_vector_data_facts(ctx: PipelineNativeEmitCtx) -> PipelineIrNativeVectorDataFacts {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> vector_data_facts
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches, pending_direct_dst) -> vector_data_facts
   }
 }
 
 pub(package) fn pipeline_ir_native_emit_ctx_adr_patches(ctx: PipelineNativeEmitCtx) -> i64 {
   match ctx {
-    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches) -> adr_patches
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches, pending_direct_dst) -> adr_patches
+  }
+}
+
+pub(package) fn pipeline_ir_native_emit_ctx_pending_direct_dst(ctx: PipelineNativeEmitCtx) -> i64 {
+  match ctx {
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches, pending_direct_dst) -> pending_direct_dst
+  }
+}
+
+pub(package) fn pipeline_ir_native_emit_ctx_with_pending_direct_dst(ctx: PipelineNativeEmitCtx, pending_direct_dst: i64) -> PipelineNativeEmitCtx {
+  match ctx {
+    PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches, old_pending_direct_dst) -> PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, fp_env, vector_data_facts, adr_patches, pending_direct_dst)
   }
 }
 
@@ -39298,8 +39545,12 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
       -- the replacement obligations before its body can perform an effect.
       pipeline_ir_abort_cleanup_emit_commit_call(code, callee_hash, 0, args, fns, fm, pinned)
       pipeline_ir_native_emit_call(code, dst, callee_hash, args, fm, pinned)
+      let pending_direct = pipeline_ir_native_emit_ctx_pending_direct_dst(ctx) == dst
+      if pending_direct and fmap_current_abort_cleanup_instrumented(fm) == 1 {
+        pipeline_ir_abort_cleanup_emit_commit_pending_direct_call(code, dst, fm)
+      } else { 0 }
       pipeline_ir_native_record_indexed_call_elision(fm, callee_hash)
-      ctx
+      if pending_direct { pipeline_ir_native_emit_ctx_with_pending_direct_dst(ctx, 0 - 1) } else { ctx }
     }
     IrManagedStakeI64(dst, value, cleanup_kind, delta, origin) -> {
       let base_hash = if delta == 1 {
@@ -39321,7 +39572,12 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
     }
     IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> {
       let release_hash = pipeline_managed_release_hash_for_kind(cleanup_kind)
-      if call_dst == 0 - 1 and callee_hash == 0 and value >= 0 and arg_lane == 0 - 1 and release_hash != 0 {
+      if call_dst >= 0 and callee_hash == pipeline_effect_managed_transfer_hash() and value >= 0 and arg_lane >= 0 and release_hash != 0 {
+        -- Effect dispatch has taken this exact transported stake. The selected
+        -- handler arms its parameter obligation before it can suspend or
+        -- abort, so the caller continuation must no longer own the record.
+        pipeline_ir_abort_cleanup_emit_disarm_direct(code, value, release_hash, fm, pinned)
+      } else { if call_dst == 0 - 1 and callee_hash == 0 and value >= 0 and arg_lane == 0 - 1 and release_hash != 0 {
         -- The retained stake is now reachable through the aggregate owner.
         -- Commit only its newest standalone cleanup record; aggregate deep
         -- cleanup owns the eventual release.
@@ -39343,12 +39599,23 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
         fmap_inc_emit_error_count(fm)
         bu32(code, encode_brk(65))
       } else {
-        -- The callee now owns the caller's original stake. No RC call is
-        -- emitted, but an active abort-cleanup shadow record must be disarmed
-        -- at the transfer point so a later abort cannot release it twice.
-        pipeline_ir_abort_cleanup_emit_disarm_direct(code, value, release_hash, fm, pinned)
-      } } }
-      ctx
+        -- Keep the transported stake armed while the direct callee may abort.
+        -- Its normal return commits this destination-keyed record; an abort
+        -- instead unwinds it as part of the caller continuation.
+        pipeline_ir_abort_cleanup_emit_mark_action_origin(
+          code,
+          value,
+          release_hash,
+          pipeline_ir_abort_cleanup_origin_direct_transfer_pending(call_dst),
+          fm,
+          pinned
+        )
+      } } } }
+      if call_dst >= 0 and callee_hash != 0 and
+        callee_hash != pipeline_effect_managed_transfer_hash() and
+        value >= 0 and arg_lane >= 0 and release_hash != 0 {
+        pipeline_ir_native_emit_ctx_with_pending_direct_dst(ctx, call_dst)
+      } else { ctx }
     }
     IrCallResultLaneI64(dst, lane) -> {
       pipeline_ir_native_emit_call_result_lane(code, dst, ir_call_result_lane_physical(lane), pinned)
@@ -39365,9 +39632,14 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
       ctx
     }
     IrGenericCallI64(dst, callee_hash, type_args, args) -> {
-      pipeline_ir_abort_cleanup_emit_commit_call(code, callee_hash, type_expr_list_to_nodes(type_args), args, fns, fm, pinned)
+      let concrete_type_args = type_expr_list_to_nodes(type_args)
+      pipeline_ir_abort_cleanup_emit_commit_call(code, callee_hash, concrete_type_args, args, fns, fm, pinned)
       pipeline_ir_native_emit_generic_call(code, dst, callee_hash, type_args, args, fm, pinned)
-      ctx
+      let pending_direct = pipeline_ir_native_emit_ctx_pending_direct_dst(ctx) == dst
+      if pending_direct and fmap_current_abort_cleanup_instrumented(fm) == 1 {
+        pipeline_ir_abort_cleanup_emit_commit_pending_direct_call(code, dst, fm)
+      } else { 0 }
+      if pending_direct { pipeline_ir_native_emit_ctx_with_pending_direct_dst(ctx, 0 - 1) } else { ctx }
     }
     IrVectorGetI64(dst, vec, index, fallback, check_mode) -> {
       pipeline_ir_native_emit_vector_get_i64(code, dst, vec, index, fallback, check_mode, fm, pinned, pipeline_ir_native_emit_ctx_vector_data_facts(ctx))
@@ -39384,7 +39656,11 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
       -- disarmed before user destructor code can itself abort.
       pipeline_ir_abort_cleanup_emit_commit_method_call(code, type_hash, method_hash, receiver, args, fns, fm, pinned)
       pipeline_ir_native_emit_method_call(code, dst, type_hash, method_hash, receiver, args, fm, pinned)
-      ctx
+      let pending_direct = pipeline_ir_native_emit_ctx_pending_direct_dst(ctx) == dst
+      if pending_direct and fmap_current_abort_cleanup_instrumented(fm) == 1 {
+        pipeline_ir_abort_cleanup_emit_commit_pending_direct_call(code, dst, fm)
+      } else { 0 }
+      if pending_direct { pipeline_ir_native_emit_ctx_with_pending_direct_dst(ctx, 0 - 1) } else { ctx }
     }
     IrOwnedDropI64(value, type_hash) -> {
       let uninitialized = pipeline_ir_abort_cleanup_emit_slot_alias_guard(code, value, fm)
@@ -39554,17 +39830,17 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
       pipeline_ir_abort_cleanup_emit_bind_transfer(code, value, ns, ty, fm, pinned)
       pipeline_ir_abort_cleanup_emit_prepare_site(code, bind_site, fm, pinned)
       pipeline_ir_abort_cleanup_emit_register_site(code, bind_site, fm, pinned)
-      PipelineNativeEmitCtx(scope_push_typed(scope, ns, nl, pipeline_ir_native_value_home_lookup(pinned, value), ty), handlers, pinned, pipeline_ir_native_emit_ctx_f64_facts(ctx), fns, pipeline_ir_native_emit_ctx_fp_env(ctx), pipeline_ir_native_emit_ctx_vector_data_facts(ctx), pipeline_ir_native_emit_ctx_adr_patches(ctx))
+      PipelineNativeEmitCtx(scope_push_typed(scope, ns, nl, pipeline_ir_native_value_home_lookup(pinned, value), ty), handlers, pinned, pipeline_ir_native_emit_ctx_f64_facts(ctx), fns, pipeline_ir_native_emit_ctx_fp_env(ctx), pipeline_ir_native_emit_ctx_vector_data_facts(ctx), pipeline_ir_native_emit_ctx_adr_patches(ctx), pipeline_ir_native_emit_ctx_pending_direct_dst(ctx))
     }
     IrHandleI64(dst, handle_src, effect_hash, clauses, nclauses, abort_block) -> {
       let next_handlers = pipeline_ir_native_emit_handle(code, handle_src, fm, effect_hash, clauses, nclauses, abort_block, ctx)
-      PipelineNativeEmitCtx(scope, next_handlers, pinned, pipeline_ir_native_emit_ctx_f64_facts(ctx), fns, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_emit_ctx_vector_data_facts(ctx), pipeline_ir_native_emit_ctx_adr_patches(ctx))
+      PipelineNativeEmitCtx(scope, next_handlers, pinned, pipeline_ir_native_emit_ctx_f64_facts(ctx), fns, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_emit_ctx_vector_data_facts(ctx), pipeline_ir_native_emit_ctx_adr_patches(ctx), pipeline_ir_native_emit_ctx_pending_direct_dst(ctx))
     }
     IrDeferredHandleI64(dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base) -> {
       pipeline_ir_native_emit_deferred_handle(code, dst, handle_src, body, clauses, nclauses, effect_hash, scratch_base, fm, ctx)
       ctx
     }
-    IrHandlerPopI64(frame) -> PipelineNativeEmitCtx(scope, pipeline_ir_native_pop_one(code, pinned, handlers), pinned, pipeline_ir_native_emit_ctx_f64_facts(ctx), fns, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_emit_ctx_vector_data_facts(ctx), pipeline_ir_native_emit_ctx_adr_patches(ctx))
+    IrHandlerPopI64(frame) -> PipelineNativeEmitCtx(scope, pipeline_ir_native_pop_one(code, pinned, handlers), pinned, pipeline_ir_native_emit_ctx_f64_facts(ctx), fns, pipeline_ir_native_fp_env_empty(), pipeline_ir_native_emit_ctx_vector_data_facts(ctx), pipeline_ir_native_emit_ctx_adr_patches(ctx), pipeline_ir_native_emit_ctx_pending_direct_dst(ctx))
     IrAbortLandingI64(dst) -> {
       pipeline_ir_native_store_reg_pinned(code, pinned, dst, 0)
       ctx
@@ -40011,7 +40287,7 @@ pub(package) fn pipeline_ir_native_emit_blocks(blocks: IrBlockList, all_blocks: 
           -- the previous block flips home before this block's reads.
           pipeline_ir_native_split_flip_actives(fm, pinned)
           let branch_cmp_info = pipeline_ir_native_direct_branch_cmp_info_for_term(insts, term)
-          let ctx = pipeline_ir_native_emit_inst_list_for_term(insts, code, src, fm, PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, pipeline_ir_native_fp_env_empty(), vector_data_facts, adr_patches), branch_cmp_info)
+          let ctx = pipeline_ir_native_emit_inst_list_for_term(insts, code, src, fm, PipelineNativeEmitCtx(scope, handlers, pinned, f64_facts, fns, pipeline_ir_native_fp_env_empty(), vector_data_facts, adr_patches, 0 - 1), branch_cmp_info)
           let next_handlers_ctx = pipeline_ir_native_emit_ctx_handlers(ctx)
           let branch_return = match rest {
             IrBlockListNil -> 0
@@ -40041,7 +40317,7 @@ pub(package) fn pipeline_ir_native_emit_block(block: IrBlock, code: i64, scope: 
       let f64_facts = pipeline_ir_native_f64_facts_assign_slot_homes(single, pipeline_ir_native_f64_facts_for_blocks(single))
       let vector_data_facts = pipeline_ir_native_vector_data_facts_assign_home(pipeline_ir_native_vector_data_facts_for_blocks(single))
       let adr_patches = nlist_new()
-      let ctx = pipeline_ir_native_emit_inst_list_for_term(insts, code, src, fm, PipelineNativeEmitCtx(scope, PipelineNativeHandlerCtxNil, pinned, f64_facts, 0, pipeline_ir_native_fp_env_empty(), vector_data_facts, adr_patches), branch_cmp_info)
+      let ctx = pipeline_ir_native_emit_inst_list_for_term(insts, code, src, fm, PipelineNativeEmitCtx(scope, PipelineNativeHandlerCtxNil, pinned, f64_facts, 0, pipeline_ir_native_fp_env_empty(), vector_data_facts, adr_patches, 0 - 1), branch_cmp_info)
       pipeline_ir_native_emit_term_cfg(
         term,
         single,
@@ -44365,12 +44641,50 @@ pub(package) fn pipeline_ir_managed_transfer_matches_call(marker: IrInst, call: 
           _ -> 0
         }
       }
+      else { if callee_hash == pipeline_direct_managed_transfer_hash() {
+        let actual_dst = pipeline_direct_managed_transfer_call_dst_or(call, 0 - 1)
+        let actual_hash = pipeline_direct_managed_transfer_call_hash(call)
+        let actual_value = pipeline_ir_value_list_get_or(pipeline_direct_managed_transfer_call_args(call), arg_lane, 0 - 1)
+        if actual_dst == call_dst and actual_hash != 0 and actual_value == value { 1 } else { 0 }
+      }
       else {
-        let actual_dst = pipeline_ir_ownership_transfer_call_dst_or(call, 0 - 1)
-        let actual_hash = pipeline_ir_ownership_transfer_call_hash(call)
-        let actual_value = pipeline_ir_value_list_get_or(pipeline_ir_ownership_transfer_call_args(call), arg_lane, 0 - 1)
+        let actual_dst = pipeline_direct_managed_transfer_call_dst_or(call, 0 - 1)
+        let actual_hash = pipeline_direct_managed_transfer_call_hash(call)
+        let actual_value = pipeline_ir_value_list_get_or(pipeline_direct_managed_transfer_call_args(call), arg_lane, 0 - 1)
         if actual_dst == call_dst and actual_hash == callee_hash and actual_value == value { 1 } else { 0 }
-      } }
+      } } }
+    }
+    _ -> 0
+  }
+}
+
+pub(package) fn pipeline_ir_managed_transfer_is_effect_dispatch(marker: IrInst) -> i64 {
+  match marker {
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> {
+      if call_dst >= 0 and callee_hash == pipeline_effect_managed_transfer_hash() and value >= 0 and arg_lane >= 0 and
+        pipeline_managed_release_hash_for_kind(cleanup_kind) != 0 { 1 } else { 0 }
+    }
+    _ -> 0
+  }
+}
+
+pub(package) fn pipeline_ir_managed_transfer_matches_effect_dispatch(marker: IrInst, boundary: IrInst) -> i64 {
+  match marker {
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> {
+      if pipeline_ir_managed_transfer_is_effect_dispatch(marker) == 0 { 0 }
+      else {
+        match boundary {
+          IrPerformI64(actual_dst, effect_hash, op_hash, actual_args) -> {
+            let actual_value = pipeline_ir_value_list_get_or(actual_args, arg_lane, 0 - 1)
+            if actual_dst == call_dst and actual_value == value { 1 } else { 0 }
+          }
+          IrHandlerDirectI64(actual_dst, effect_hash, op_hash, handler_depth, clause_index, actual_args) -> {
+            let actual_value = pipeline_ir_value_list_get_or(actual_args, arg_lane, 0 - 1)
+            if actual_dst == call_dst and actual_value == value { 1 } else { 0 }
+          }
+          _ -> 0
+        }
+      }
     }
     _ -> 0
   }
@@ -44402,18 +44716,50 @@ pub(package) fn pipeline_ir_managed_transfer_run_has_duplicate(marker: IrInst, i
   }
 }
 
+-- Equal managed values may legitimately occupy two effect lanes: argument
+-- lowering retains a separate transported stake for each borrowed source.
+-- Only duplicate lane facts are malformed; each valid marker consumes the
+-- newest matching stake independently at dispatch.
+pub(package) fn pipeline_ir_managed_effect_transfer_run_has_duplicate_lane(marker: IrInst, insts: IrInstList) -> i64 {
+  match marker {
+    IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> match insts {
+      IrInstCons(inst, rest) -> match inst {
+        IrManagedTransferI64(next_dst, next_hash, next_value, next_lane, next_kind) -> {
+          if next_dst == call_dst and next_hash == callee_hash and next_lane == arg_lane { 1 }
+          else { pipeline_ir_managed_effect_transfer_run_has_duplicate_lane(marker, rest) }
+        }
+        _ -> 0
+      }
+      IrInstNil -> 0
+    }
+    _ -> 1
+  }
+}
+
 pub(package) fn pipeline_ir_materialise_managed_stake_insts_with_census(insts: IrInstList, census: i64) -> IrInstList {
   match insts {
     IrInstNil -> IrInstNil
     IrInstCons(inst, rest) -> match inst {
       IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, cleanup_kind) -> {
         let call = pipeline_ir_managed_transfer_following_call(rest)
-        if pipeline_ir_managed_transfer_is_aggregate_commit(inst) == 1 or
+        if callee_hash == pipeline_direct_managed_transfer_hash() {
+          -- Call-specialisation and fusion passes may erase the boundary this
+          -- typed lowering fact described. Keep the fact only while its exact
+          -- destination/value/lane association survives; otherwise the
+          -- transformed call graph owns the resulting transport semantics.
+          if pipeline_ir_managed_transfer_matches_call(inst, call) == 1 and
+            pipeline_ir_managed_effect_transfer_run_has_duplicate_lane(inst, rest) == 0 {
+            IrInstCons(inst, pipeline_ir_materialise_managed_stake_insts_with_census(rest, census))
+          } else {
+            pipeline_ir_materialise_managed_stake_insts_with_census(rest, census)
+          }
+        } else { if pipeline_ir_managed_transfer_is_aggregate_commit(inst) == 1 or
+          (pipeline_ir_managed_transfer_matches_effect_dispatch(inst, call) == 1 and pipeline_ir_managed_effect_transfer_run_has_duplicate_lane(inst, rest) == 0) or
           (pipeline_ir_managed_transfer_matches_call(inst, call) == 1 and pipeline_ir_managed_transfer_run_has_duplicate(inst, rest) == 0) {
           IrInstCons(inst, pipeline_ir_materialise_managed_stake_insts_with_census(rest, census))
         } else {
           IrInstCons(IrLoweringFailureI64(65), pipeline_ir_materialise_managed_stake_insts_with_census(rest, census))
-        }
+        } }
       }
       _ -> IrInstCons(pipeline_ir_materialise_managed_stake_inst_with_census(inst, census), pipeline_ir_materialise_managed_stake_insts_with_census(rest, census))
     }
@@ -62593,7 +62939,17 @@ pub(package) fn pipeline_ir_ownership_transfer_candidate(insts: IrInstList, term
   else {
     match insts {
       IrInstNil -> 0
-      IrInstCons(inst, rest) -> {
+      IrInstCons(inst, rest) -> match inst {
+        IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, marker_kind) -> {
+          if callee_hash == pipeline_direct_managed_transfer_hash() and value == source and marker_kind == cleanup_kind {
+            pipeline_ir_ownership_transfer_candidate(rest, term, retain_dst, source, cleanup_kind, facts, functions)
+          } else {
+            let uses = pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty())
+            if pipeline_ir_live_set_contains(uses, source) == 1 { 0 }
+            else { pipeline_ir_ownership_transfer_candidate(rest, term, retain_dst, source, cleanup_kind, facts, functions) }
+          }
+        }
+        _ -> {
         let info = pipeline_ir_ownership_transfer_call_info(inst, source, cleanup_kind, facts, functions)
         if info != 0 {
           if pipeline_ir_ownership_transfer_after_is_exact(rest, term, source, cleanup_kind) == 1 { info } else { 0 }
@@ -62601,6 +62957,7 @@ pub(package) fn pipeline_ir_ownership_transfer_candidate(insts: IrInstList, term
           let uses = pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty())
           if pipeline_ir_live_set_contains(uses, source) == 1 { 0 }
           else { pipeline_ir_ownership_transfer_candidate(rest, term, retain_dst, source, cleanup_kind, facts, functions) }
+        }
         }
       }
     }
@@ -62623,7 +62980,15 @@ pub(package) fn pipeline_ir_ownership_transfer_remove_release(insts: IrInstList,
 pub(package) fn pipeline_ir_ownership_transfer_rewrite_rest(insts: IrInstList, source: i64, cleanup_kind: i64, info: i64) -> IrInstList {
   match insts {
     IrInstNil -> IrInstNil
-    IrInstCons(inst, rest) -> {
+    IrInstCons(inst, rest) -> match inst {
+      IrManagedTransferI64(call_dst, callee_hash, value, arg_lane, marker_kind) -> {
+        if callee_hash == pipeline_direct_managed_transfer_hash() and value == source and marker_kind == cleanup_kind {
+          pipeline_ir_ownership_transfer_rewrite_rest(rest, source, cleanup_kind, info)
+        } else {
+          IrInstCons(inst, pipeline_ir_ownership_transfer_rewrite_rest(rest, source, cleanup_kind, info))
+        }
+      }
+      _ -> {
       let call_dst = pipeline_ir_ownership_transfer_call_dst_or(inst, 0 - 1)
       let call_hash = pipeline_ir_ownership_transfer_call_hash(inst)
       if call_dst == node_f1(info) and call_hash == node_f2(info) and pipeline_ir_ownership_transfer_arg_lane(pipeline_ir_ownership_transfer_call_args(inst), source) == node_f3(info) {
@@ -62631,6 +62996,7 @@ pub(package) fn pipeline_ir_ownership_transfer_rewrite_rest(insts: IrInstList, s
         IrInstCons(marker, IrInstCons(inst, pipeline_ir_ownership_transfer_remove_release(rest, source, cleanup_kind)))
       } else {
         IrInstCons(inst, pipeline_ir_ownership_transfer_rewrite_rest(rest, source, cleanup_kind, info))
+      }
       }
     }
   }
