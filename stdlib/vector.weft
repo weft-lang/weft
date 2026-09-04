@@ -15,6 +15,7 @@ use stdlib/iter/core.{from_generator, iter_from_vector_word, iter_next, iter_rem
 use stdlib/iter/protocol.{Collect, IntoIterator, Iterator}
 use stdlib/option.{*}
 use stdlib/ord.{*}
+use stdlib/panic.{panic}
 pub use stdlib/vector/handles.{PersistentVector, Vector}
 
 -- Vector and persistent-vector handles are declared in vector/handles.weft so
@@ -44,6 +45,92 @@ pub(package) fn vector_element_leaf_stride_of<T>() -> i64 { 0 }
 
 pub(package) fn vector_element_leaf_kind_of<T>() -> i64 { 0 }
 
+-- A checked proof that a public count and element layout fit the private
+-- signed storage representation. Keeping both values together prevents raw
+-- storage code from repeating or weakening the multiplication check.
+pub(package) type VectorStorageSize {
+  VectorStorageSized(i64, i64),
+  VectorStorageUnrepresentable
+}
+
+-- Growth either needs no mutation, carries exact old/new byte counts for one
+-- resize, or rejects the request before touching storage.
+pub(package) type VectorGrowth {
+  VectorGrowthReady,
+  VectorGrowthResize(i64, i64, i64),
+  VectorGrowthUnrepresentable
+}
+
+pub(package) fn vector_count_to_i64(count: usize) -> Option<i64> {
+  if count > 9223372036854775807 { None<i64>() }
+  else { Some<i64>(__u64_to_i64(__usize_to_u64(count))) }
+}
+
+pub(package) fn vector_i64_to_count(count: i64) -> Option<usize> {
+  if count < 0 { None<usize>() }
+  else { Some<usize>(__i64_to_usize(count)) }
+}
+
+pub(package) fn vector_count_double(count: usize) -> Option<usize> {
+  if count > 9223372036854775807 { None<usize>() }
+  else { Some<usize>(count * 2) }
+}
+
+pub(package) fn vector_storage_size(count: usize, elem_size: i64) -> VectorStorageSize {
+  match vector_count_to_i64(count) {
+    None -> VectorStorageUnrepresentable
+    Some(capacity) -> match elem_size {
+      size if size < 0 -> VectorStorageUnrepresentable
+      0 -> VectorStorageSized(capacity, 0)
+      size if capacity > 9223372036854775807 / size -> VectorStorageUnrepresentable
+      size -> VectorStorageSized(capacity, capacity * size)
+    }
+  }
+}
+
+pub(package) fn vector_storage_size_i64(count: i64, elem_size: i64) -> VectorStorageSize {
+  match vector_i64_to_count(count) {
+    None -> VectorStorageUnrepresentable
+    Some(unsigned) -> vector_storage_size(unsigned, elem_size)
+  }
+}
+
+pub(package) fn vector_growth(current: i64, needed: usize, elem_size: i64) -> VectorGrowth {
+  match vector_i64_to_count(current) {
+    None -> VectorGrowthUnrepresentable
+    Some(current_count) -> match vector_storage_size(current_count, elem_size) {
+      VectorStorageUnrepresentable -> VectorGrowthUnrepresentable
+      VectorStorageSized(_, current_bytes) -> if needed <= current_count {
+        VectorGrowthReady
+      } else {
+        let one: usize = 1
+        let mut candidate: usize = if current_count == 0 { one } else { current_count }
+        let mut exact = false
+        while candidate < needed and not exact {
+          match vector_count_double(candidate) {
+            Some(doubled) -> { candidate = doubled }
+            None -> {
+              candidate = needed
+              exact = true
+            }
+          }
+        }
+        match vector_storage_size(candidate, elem_size) {
+          VectorStorageUnrepresentable -> if candidate == needed {
+            VectorGrowthUnrepresentable
+          } else { match vector_storage_size(needed, elem_size) {
+            VectorStorageUnrepresentable -> VectorGrowthUnrepresentable
+            VectorStorageSized(next_capacity, next_bytes) ->
+              VectorGrowthResize(next_capacity, current_bytes, next_bytes)
+          } }
+          VectorStorageSized(next_capacity, next_bytes) ->
+            VectorGrowthResize(next_capacity, current_bytes, next_bytes)
+        }
+      }
+    }
+  }
+}
+
 pub(package) fn vector_normalize_capacity(capacity: i64) -> i64 {
   if capacity < 0 { 0 } else { capacity }
 }
@@ -59,7 +146,10 @@ pub fn with_capacity<T>(capacity: i64) -> owned Vector<T> {
   let cap = vector_normalize_capacity(capacity)
   let elem_size = vector_element_size_of<T>()
   let elem_mode = vector_element_mode_of<T>()
-  vector_storage_new<T>(cap, elem_size, elem_mode, vector_element_leaf_count_of<T>(), vector_element_leaf_stride_of<T>(), vector_element_leaf_kind_of<T>())
+  match vector_storage_size_i64(cap, elem_size) {
+    VectorStorageUnrepresentable -> panic("Vector capacity cannot fit its storage representation")
+    VectorStorageSized(checked_capacity, bytes) -> vector_storage_new<T>(checked_capacity, bytes, elem_size, elem_mode, vector_element_leaf_count_of<T>(), vector_element_leaf_stride_of<T>(), vector_element_leaf_kind_of<T>())
+  }
 }
 
 --- Return the number of initialized elements.
@@ -144,7 +234,10 @@ pub(package) fn vector_element_leaf_kind<T>(vec: borrow Vector<T>) -> i64 {
 }
 
 pub(package) fn vector_capacity_bytes<T>(vec: borrow Vector<T>) -> i64 {
-  vector_capacity<T>(vec) * vector_element_size<T>(vec)
+  match vector_storage_size_i64(vector_capacity<T>(vec), vector_element_size<T>(vec)) {
+    VectorStorageSized(_, bytes) -> bytes
+    VectorStorageUnrepresentable -> panic("Vector storage invariant violated")
+  }
 }
 
 --- Return whether the vector has no elements.
@@ -152,38 +245,47 @@ pub(package) fn vector_is_empty<T>(vec: borrow Vector<T>) -> bool {
   vector_len<T>(vec) == 0
 }
 
-pub(package) fn vector_next_capacity(current: i64, needed: i64) -> i64 {
-  let mut cap = if current <= 0 { 1 } else { current * 2 }
-  while cap < needed {
-    cap = cap * 2
-  }
-  cap
-}
-
-pub(package) fn vector_reserve_word<T>(word: i64, needed: i64) -> bool {
+pub(package) fn vector_reserve_word_usize<T>(word: i64, needed: usize) -> bool {
   if word == 0 { false }
   else {
     let cap = vector_storage_word_capacity(word)
-    if needed <= cap { true }
-    else {
-      let len = vector_storage_word_len(word)
-      let old_data = vector_storage_word_data(word)
-      let elem_size = vector_storage_word_element_size(word)
-      let new_cap = vector_next_capacity(cap, needed)
-      let new_data = vector_storage_alloc_bytes(new_cap * elem_size)
-      if old_data != 0 and new_data != 0 { mem_copy(new_data, old_data, len * elem_size) } else { 0 }
-      -- Growth abandons the old buffer; element stakes moved with the
-      -- copy, so the raw bytes go straight back to the heap. Keep the
-      -- old buffer if the new allocation failed — it is still live.
-      if elem_size == 0 {
-        vector_storage_word_set_data_capacity(word, 0, new_cap)
-        true
-      } else { if new_data != 0 {
-        vector_storage_free_bytes(old_data, cap * elem_size)
-        vector_storage_word_set_data_capacity(word, new_data, new_cap)
-        true
-      } else { false } }
+    let elem_size = vector_storage_word_element_size(word)
+    match vector_growth(cap, needed, elem_size) {
+      VectorGrowthReady -> true
+      VectorGrowthUnrepresentable -> false
+      VectorGrowthResize(new_cap, old_bytes, new_bytes) -> {
+        let len = vector_storage_word_len(word)
+        match vector_storage_size_i64(len, elem_size) {
+          VectorStorageUnrepresentable -> false
+          VectorStorageSized(_, copy_bytes) -> if len > cap or copy_bytes > old_bytes {
+            false
+          } else {
+            let old_data = vector_storage_word_data(word)
+            let new_data = vector_storage_alloc_bytes(new_bytes)
+            if old_data != 0 and new_data != 0 { mem_copy(new_data, old_data, copy_bytes) } else { 0 }
+            -- Growth abandons the old buffer; element stakes moved with the
+            -- copy, so the raw bytes go straight back to the heap. Valid
+            -- positive allocations on the default heap are process-terminal
+            -- on exhaustion, while zero-sized elements need no allocation.
+            if new_bytes == 0 {
+              vector_storage_word_set_data_capacity(word, 0, new_cap)
+              true
+            } else { if new_data != 0 {
+              vector_storage_free_bytes(old_data, old_bytes)
+              vector_storage_word_set_data_capacity(word, new_data, new_cap)
+              true
+            } else { false } }
+          }
+        }
+      }
     }
+  }
+}
+
+pub(package) fn vector_reserve_word<T>(word: i64, needed: i64) -> bool {
+  match vector_i64_to_count(needed) {
+    None -> false
+    Some(count) -> vector_reserve_word_usize<T>(word, count)
   }
 }
 
