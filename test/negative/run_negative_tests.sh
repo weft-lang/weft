@@ -624,6 +624,8 @@ check_rejects "bytes_constructor_private" "test/negative/bytes_constructor_priva
 check_rejects "bytes_prefixed_constructor_removed" "test/negative/bytes_prefixed_constructor_removed.weft" "error[E4002]: unknown module member 'bytes_from_str' in import" 1
 check_rejects "bytes_get_requires_usize" "test/negative/bytes_get_requires_usize.weft" "argument type mismatch: expected \`usize\`, found \`i64\`"
 check_rejects "list_get_requires_usize" "test/negative/list_get_requires_usize.weft" "argument type mismatch: expected \`usize\`, found \`i64\`"
+check_rejects "list_migration_len_bridge_retired" "test/negative/list_migration_len_bridge_retired.weft" "type error: unknown method"
+check_rejects "list_migration_get_bridge_retired" "test/negative/list_migration_get_bridge_retired.weft" "type error: unknown method"
 check_rejects "vector_with_capacity_requires_usize" "test/negative/vector_with_capacity_requires_usize.weft" "argument type mismatch: expected \`usize\`, found \`i64\`"
 check_rejects "vector_get_requires_usize" "test/negative/vector_get_requires_usize.weft" "argument type mismatch: expected \`usize\`, found \`i64\`"
 check_rejects "vector_push_is_a_command" "test/negative/vector_push_is_a_command.weft" "return value type mismatch: expected \`bool\`, found \`nil\`"
