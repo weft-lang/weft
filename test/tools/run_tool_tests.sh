@@ -865,6 +865,16 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_task_channel_pins_capacity_validation" "$(<"$tmp_out")" "pub fn capacity(value: usize) -> Result<Capacity, CapacityError>"
     assert_contains "doc_stdlib_task_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"
     assert_contains "doc_stdlib_task_channel_pins_bounded_send" "$(<"$tmp_out")" "fn send(value: T) -> SendResult<T>"
+  elif [ "$stdlib_doc_name" = "bytes" ]; then
+    assert_contains "doc_stdlib_bytes_pins_public_surface" "$(<"$tmp_out")" "Public API items: 14. Documented: 14."
+    assert_contains "doc_stdlib_bytes_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len(self: Bytes) -> usize"
+    assert_contains "doc_stdlib_bytes_pins_unsigned_index" "$(<"$tmp_out")" "pub fn get(self: Bytes, index: usize) -> Option<u8>"
+    assert_contains "doc_stdlib_bytes_pins_unsigned_search" "$(<"$tmp_out")" "pub fn find(self: Bytes, needle: u8) -> Option<usize>"
+    assert_contains "doc_stdlib_bytes_pins_unsigned_utf8_offset" "$(<"$tmp_out")" "InvalidUtf8(usize)"
+  elif [ "$stdlib_doc_name" = "path" ]; then
+    assert_contains "doc_stdlib_path_pins_public_surface" "$(<"$tmp_out")" "Public API items: 13. Documented: 13."
+    assert_contains "doc_stdlib_path_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len(self: Path) -> usize"
+    assert_contains "doc_stdlib_path_pins_unsigned_offsets" "$(<"$tmp_out")" "PathContainsNul(usize)"
   elif [ "$stdlib_doc_name" = "vector" ]; then
     assert_contains "doc_stdlib_vector_pins_public_surface" "$(<"$tmp_out")" "Public API items: 39. Documented: 39."
     assert_contains "doc_stdlib_vector_pins_mutable_type" "$(<"$tmp_out")" "pub type Vector<T>"
