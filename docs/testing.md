@@ -114,10 +114,13 @@ There is deliberately no generator operation which may retry forever.
 ## Scalar and collection domains
 
 `u8` through `u64`, `usize`, `i8` through `i64`, and `isize` cover their full
-value sets. `unicode_scalar` maps around the surrogate interval, so every draw
-is valid and the distribution does not depend on rejection. `either`,
-`one_of`, and checked `frequency` preserve alternatives as typed generator
-values.
+value sets. `f32` and `f64` likewise cover every bit pattern, including signed
+zeros, subnormals, infinities, and NaN payloads. `finite_f32` and `finite_f64`
+uniformly map a contiguous choice domain around the two non-finite exponent
+bands; they never reject or bias the remaining patterns. `unicode_scalar` maps
+around the surrogate interval, so every draw is valid and the distribution
+does not depend on rejection. `either`, `one_of`, and checked `frequency`
+preserve alternatives as typed generator values.
 
 Collection lengths are validated inclusive domains. The campaign size caps
 their maximum while preserving an explicit minimum:

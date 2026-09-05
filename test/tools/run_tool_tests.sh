@@ -57,7 +57,7 @@ if [ -z "${WEFT_TOOL_SHARD:-}" ]; then
   tool_elapsed=$(($(date +%s) - tool_started))
   echo "Tool boundary timing: ${tool_elapsed}s wall, ${tool_jobs} shard jobs"
   if [ "${WEFT_TEST_PLATFORM:-$(uname -s)}" = Darwin ]; then
-    echo "Tool boundary summary: 1205 passed, 0 failed"
+    echo "Tool boundary summary: 1207 passed, 0 failed"
   else
     echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
   fi
@@ -760,13 +760,15 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_test_pins_structured_report" "$(<"$tmp_out")" "fn report(diagnostic: Diagnostic) -> i64"
     assert_contains "doc_stdlib_test_pins_unsigned_equality" "$(<"$tmp_out")" "fn assert_eq_usize(got: usize, expected: usize) -> i64"
   elif [ "$stdlib_doc_name" = "test/property" ]; then
-    assert_contains "doc_stdlib_test_property_pins_public_surface" "$(<"$tmp_out")" "Public API items: 105. Documented: 105."
+    assert_contains "doc_stdlib_test_property_pins_public_surface" "$(<"$tmp_out")" "Public API items: 109. Documented: 109."
     assert_contains "doc_stdlib_test_property_pins_opaque_generator" "$(<"$tmp_out")" "pub type Gen<T> = opaque"
     assert_contains "doc_stdlib_test_property_pins_choice_effect" "$(<"$tmp_out")" "pub effect Draw"
     assert_contains "doc_stdlib_test_property_pins_replay_limits" "$(<"$tmp_out")" "pub type Limits = opaque"
     assert_contains "doc_stdlib_test_property_pins_linear_refinement" "$(<"$tmp_out")" "pub fn filter_map<T, U>(generator: Gen<T>, max_attempts: usize, select: (T) -> Option<U>) -> Gen<U>"
     assert_contains "doc_stdlib_test_property_pins_custom_interpretation" "$(<"$tmp_out")" 'pub fn sample<T>(generator: Gen<T>, limits: Limits) -[Draw]> SampleResult<T>'
     assert_contains "doc_stdlib_test_property_pins_full_width" "$(<"$tmp_out")" "pub fn u64() -> Gen<u64>"
+    assert_contains "doc_stdlib_test_property_pins_all_float_bits" "$(<"$tmp_out")" "pub fn f64() -> Gen<f64>"
+    assert_contains "doc_stdlib_test_property_pins_finite_float_bits" "$(<"$tmp_out")" "pub fn finite_f64() -> Gen<f64>"
     assert_contains "doc_stdlib_test_property_pins_unicode_scalar" "$(<"$tmp_out")" "pub fn unicode_scalar() -> Gen<i64>"
     assert_contains "doc_stdlib_test_property_pins_unicode_string" "$(<"$tmp_out")" "pub fn str(lengths: LengthRange) -> Gen<str>"
     assert_contains "doc_stdlib_test_property_pins_checked_frequency" "$(<"$tmp_out")" "pub fn frequency<T>(alternatives: List<(usize, Gen<T>)>) -> Result<Gen<T>, FrequencyError>"
@@ -774,7 +776,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_test_property_preserves_runner_effect" "$(<"$tmp_out")" 'pub fn run<T, E>(config: Config, generator: Gen<T>, property: (T) -[E]> bool) -[E]> CheckResult'
     assert_contains "doc_stdlib_test_property_preserves_adapter_effect" "$(<"$tmp_out")" 'pub fn check<T, E>(config: Config, generator: Gen<T>, property: (T) -[E]> bool) -[Test, E]> nil'
   elif [ "$stdlib_doc_name" = "test/property/protocol" ]; then
-    assert_contains "doc_stdlib_test_property_protocol_pins_public_surface" "$(<"$tmp_out")" "Public API items: 74. Documented: 74."
+    assert_contains "doc_stdlib_test_property_protocol_pins_public_surface" "$(<"$tmp_out")" "Public API items: 78. Documented: 78."
     assert_contains "doc_stdlib_test_property_protocol_pins_choice_bound" "$(<"$tmp_out")" "pub type ChoiceBound = opaque"
     assert_contains "doc_stdlib_test_property_protocol_pins_choice_log" "$(<"$tmp_out")" "pub type ChoiceLog = opaque"
   elif [ "$stdlib_doc_name" = "test/property/random" ]; then
