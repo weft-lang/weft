@@ -8484,6 +8484,7 @@ pub(package) fn pipeline_expr_owned_rvalue_temp_typed(expr: Expr, src: i64, tt: 
       }
     }
     MethodCall(recv, method_hash, args, type_hash) -> 1
+    Try(inner, effect_atom) -> 1
     RecordInit(type_ns, type_nl, fields) -> 1
     RecordUpdate(base, fields, fact) -> 1
     ArrayLiteral(elements, resolved_ty, span) -> 1
@@ -9763,6 +9764,40 @@ pub(package) fn pipeline_try_insts(
   } }
 }
 
+-- A copyable Result owns its managed payload. Projection alone borrows that
+-- payload, while the expression-result contract of `?` transfers an owned
+-- value. Establish the payload stake before releasing a temporary parent.
+-- A named parent retains its separate owner and supports repeated extraction.
+-- Linear propagation already detaches its payload through the structural plan.
+pub(package) fn pipeline_lower_try_success(try_inst: IrInst, dst: i64, value: i64, inner_expr: Expr, inner_ty: i64, module: PipelineLowerModule) -> IrLoweredExpr {
+  let lanes = pipeline_try_success_lane_count(inner_ty)
+  let projected = pipeline_try_insts(try_inst, dst, value, lanes)
+  match try_inst {
+    IrTryLinearI64(linear_dst, linear_value, effect_key, parent_plan, ok_plan, error_plan) -> {
+      ir_lowered_expr(dst, pipeline_try_inst_next_value(try_inst, dst), projected)
+    }
+    _ -> {
+      let retain_start = dst + lanes
+      let retained = pipeline_managed_retain_inst_list_with_origin(
+        dst, pipeline_try_success_type(inner_ty), retain_start,
+        ir_managed_stake_origin_result_transfer()
+      )
+      let release_start = retain_start + ir_inst_list_len(retained)
+      let parent_borrowed = pipeline_expr_result_is_borrowed_for_ty_typed(
+        inner_expr, inner_ty, pipeline_lower_module_src(module),
+        pipeline_lower_module_fns(module), pipeline_lower_module_subst(module),
+        pipeline_lower_module_tt(module)
+      )
+      let released = if parent_borrowed == 1 { ir_inst_list_empty() }
+        else { pipeline_managed_release_inst_list_with_origin(
+          value, inner_ty, release_start, ir_managed_stake_origin_result_transfer()
+        ) }
+      ir_lowered_expr(dst, release_start + ir_inst_list_len(released),
+        ir_inst_list_append(projected, ir_inst_list_append(retained, released)))
+    }
+  }
+}
+
 pub(package) fn pipeline_lower_try_typed_to_target_blocks(inner_expr: Expr, effect_atom: i64, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
   let merge_block = next_block
   let value_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(inner_expr, params, locals, module, next_value, start_block, next_block + 1, merge_block)
@@ -9778,12 +9813,12 @@ pub(package) fn pipeline_lower_try_typed_to_target_blocks(inner_expr: Expr, effe
       let inner_ty = pipeline_return_expr_type_node_typed(inner_expr, params, locals, module)
       let try_inst = pipeline_try_inst_for_type(dst, value, effect_key, inner_ty, pipeline_lower_module_tt(module))
       let result_lanes = pipeline_try_success_lane_count(inner_ty)
-      let insts = pipeline_try_insts(try_inst, dst, value, result_lanes)
+      let success = pipeline_lower_try_success(try_inst, dst, value, inner_expr, inner_ty, module)
+      let insts = ir_lowered_expr_insts(success)
       let result_args = pipeline_ir_value_lane_ids(dst, 0, result_lanes)
       let merge = ir_block_new_params(merge_block, params_list, insts, ir_term_jump_args(target_block, result_args))
       let blocks = ir_block_list_append(pipeline_lowered_blocks_blocks(value_blocks), ir_block_list_prepend(merge, ir_block_list_empty()))
-      let after_try = if ir_inst_tag(try_inst) == 54 { pipeline_try_inst_next_value(try_inst, dst) }
-        else { dst + result_lanes }
+      let after_try = ir_lowered_expr_next_value(success)
       pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(value_blocks), after_try, blocks, 1)
     }
   } else {
@@ -16038,15 +16073,14 @@ pub(package) fn pipeline_lower_try_to_target_blocks(expr: i64, params: i64, loca
         let try_value_inst = pipeline_try_inst_for_type(dst, value, effect_key, inner_ty, pipeline_lower_module_tt(module))
         let result_lanes = pipeline_try_success_lane_count(inner_ty)
         let result_args = pipeline_ir_value_lane_ids(dst, 0, result_lanes)
-        let try_insts = pipeline_try_insts(try_value_inst, dst, value, result_lanes)
+        let success = pipeline_lower_try_success(try_value_inst, dst, value, expr_from_node(value_expr), inner_ty, module)
+        let try_insts = ir_lowered_expr_insts(success)
         let merge = ir_block_new_params(value_merge_block, value_params, try_insts, ir_term_jump_args(target_block, result_args))
         let blocks = ir_block_list_append(
           pipeline_lowered_blocks_blocks(value_blocks),
           ir_block_list_prepend(merge, ir_block_list_empty())
         )
-        let after_try = if ir_inst_tag(try_value_inst) == 54 {
-          pipeline_try_inst_next_value(try_value_inst, dst)
-        } else { dst + result_lanes }
+        let after_try = ir_lowered_expr_next_value(success)
         pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(value_blocks), after_try, blocks, 1)
       }
     } else {
@@ -25751,14 +25785,12 @@ pub(package) fn pipeline_lower_try_expr_typed_sidecar_handler_opt(inner_expr: Ex
     let effect_key = pipeline_effect_atom_dispatch_key(effect_atom, subst, effect_fail_head_hash())
     let inner_ty = pipeline_return_expr_type_node_typed(inner_expr, params, locals, pipeline_handler_lower_ctx_module(lower_ctx))
     let try_value_inst = pipeline_try_inst_for_type(dst, ir_lowered_expr_value(value), effect_key, inner_ty, tt)
-    let result_lanes = pipeline_try_success_lane_count(inner_ty)
-    let try_insts = pipeline_try_insts(
-      try_value_inst, dst, ir_lowered_expr_value(value), result_lanes
+    let success = pipeline_lower_try_success(
+      try_value_inst, dst, ir_lowered_expr_value(value), inner_expr, inner_ty,
+      pipeline_handler_lower_ctx_module(lower_ctx)
     )
-    let after_try = if ir_inst_tag(try_value_inst) == 54 {
-      pipeline_try_inst_next_value(try_value_inst, dst)
-    } else { dst + result_lanes }
-    ir_lowered_expr(dst, after_try, ir_inst_list_append(ir_lowered_expr_insts(value), try_insts))
+    ir_lowered_expr(dst, ir_lowered_expr_next_value(success),
+      ir_inst_list_append(ir_lowered_expr_insts(value), ir_lowered_expr_insts(success)))
   } else {
     ir_lowered_expr_invalid(next_value)
   }
@@ -27562,14 +27594,12 @@ pub(package) fn pipeline_lower_try_node_typed_sidecar_handler_opt(inner_node: i6
     let effect_key = pipeline_effect_atom_dispatch_key(effect_atom, pipeline_handler_lower_ctx_subst(lower_ctx), effect_fail_head_hash())
     let inner_ty = pipeline_return_expr_type_node_from_node(inner_node, pipeline_handler_lower_ctx_params(lower_ctx), pipeline_handler_lower_ctx_locals(lower_ctx), pipeline_handler_lower_ctx_module(lower_ctx))
     let try_value_inst = pipeline_try_inst_for_type(dst, ir_lowered_expr_value(value), effect_key, inner_ty, pipeline_handler_lower_ctx_tt(lower_ctx))
-    let result_lanes = pipeline_try_success_lane_count(inner_ty)
-    let try_insts = pipeline_try_insts(
-      try_value_inst, dst, ir_lowered_expr_value(value), result_lanes
+    let success = pipeline_lower_try_success(
+      try_value_inst, dst, ir_lowered_expr_value(value), expr_from_node(inner_node), inner_ty,
+      pipeline_handler_lower_ctx_module(lower_ctx)
     )
-    let after_try = if ir_inst_tag(try_value_inst) == 54 {
-      pipeline_try_inst_next_value(try_value_inst, dst)
-    } else { dst + result_lanes }
-    ir_lowered_expr(dst, after_try, ir_inst_list_append(ir_lowered_expr_insts(value), try_insts))
+    ir_lowered_expr(dst, ir_lowered_expr_next_value(success),
+      ir_inst_list_append(ir_lowered_expr_insts(value), ir_lowered_expr_insts(success)))
   } else {
     ir_lowered_expr_invalid(next_value)
   }
