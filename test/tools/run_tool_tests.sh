@@ -57,7 +57,7 @@ if [ -z "${WEFT_TOOL_SHARD:-}" ]; then
   tool_elapsed=$(($(date +%s) - tool_started))
   echo "Tool boundary timing: ${tool_elapsed}s wall, ${tool_jobs} shard jobs"
   if [ "${WEFT_TEST_PLATFORM:-$(uname -s)}" = Darwin ]; then
-    echo "Tool boundary summary: 1216 passed, 0 failed"
+    echo "Tool boundary summary: 1223 passed, 0 failed"
   else
     echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
   fi
@@ -652,7 +652,7 @@ stdlib_doc_modules=(
   stdlib/prelude.weft stdlib/assert.weft stdlib/default.weft stdlib/display.weft stdlib/drop.weft
   stdlib/eq.weft stdlib/hash.weft stdlib/ord.weft stdlib/panic.weft
   stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft
-  stdlib/maybe.weft stdlib/bytes.weft stdlib/string.weft stdlib/path.weft stdlib/io/types.weft
+  stdlib/maybe.weft stdlib/bytes.weft stdlib/string.weft stdlib/string/builder.weft stdlib/path.weft stdlib/io/types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft
   stdlib/time/monotonic.weft stdlib/time/wall.weft
@@ -759,6 +759,11 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_test_pins_public_surface" "$(<"$tmp_out")" "Public API items: 39. Documented: 39."
     assert_contains "doc_stdlib_test_pins_structured_report" "$(<"$tmp_out")" "fn report(diagnostic: Diagnostic) -> i64"
     assert_contains "doc_stdlib_test_pins_unsigned_equality" "$(<"$tmp_out")" "fn assert_eq_usize(got: usize, expected: usize) -> i64"
+  elif [ "$stdlib_doc_name" = "string/builder" ]; then
+    assert_contains "doc_stdlib_string_builder_pins_public_surface" "$(<"$tmp_out")" "Public API items: 7. Documented: 7."
+    assert_contains "doc_stdlib_string_builder_pins_owned_constructor" "$(<"$tmp_out")" "pub fn new() -> owned Builder"
+    assert_contains "doc_stdlib_string_builder_pins_mutable_append" "$(<"$tmp_out")" "pub fn append(self: borrow mut Builder, text: str) -> nil"
+    assert_contains "doc_stdlib_string_builder_pins_consuming_finish" "$(<"$tmp_out")" "pub fn finish(self: owned Builder) -> str"
   elif [ "$stdlib_doc_name" = "json" ]; then
     assert_contains "doc_stdlib_json_pins_public_surface" "$(<"$tmp_out")" "Public API items: 27. Documented: 27."
     assert_contains "doc_stdlib_json_pins_unsigned_index" "$(<"$tmp_out")" "pub fn at(self: Json, index: usize) -> Option<Json>"
