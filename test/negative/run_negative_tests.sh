@@ -655,6 +655,7 @@ check_rejects "path_constructor_private" "test/negative/path_constructor_private
 check_rejects "path_prefixed_constructor_removed" "test/negative/path_prefixed_constructor_removed.weft" "error[E4002]: unknown module member 'path_from_utf8' in import" 1
 check_rejects "string_find_is_option" "test/negative/string_find_is_option.weft" 'return value type mismatch: expected `i64`, found `Option<i64>`'
 check_rejects "json_bool_requires_bool" "test/negative/json_bool_requires_bool.weft" 'argument type mismatch: expected `bool`, found `i64`'
+check_rejects "json_at_requires_usize" "test/negative/json_at_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`'
 check_rejects "io_helper_effect_unavailable" "test/negative/io_helper_effect_unavailable.weft" "error[E2001]:"
 check_rejects "io_helpers_module_retired" "test/negative/io_helpers_module_retired.weft" "error[E1001]: unknown function 'io_read_all_with'" 1
 check_rejects "io_transfer_functions_retired" "test/negative/io_transfer_functions_retired.weft" "unknown module member" 3

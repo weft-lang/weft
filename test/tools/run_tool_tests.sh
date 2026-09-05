@@ -57,7 +57,7 @@ if [ -z "${WEFT_TOOL_SHARD:-}" ]; then
   tool_elapsed=$(($(date +%s) - tool_started))
   echo "Tool boundary timing: ${tool_elapsed}s wall, ${tool_jobs} shard jobs"
   if [ "${WEFT_TEST_PLATFORM:-$(uname -s)}" = Darwin ]; then
-    echo "Tool boundary summary: 1213 passed, 0 failed"
+    echo "Tool boundary summary: 1216 passed, 0 failed"
   else
     echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
   fi
@@ -759,6 +759,10 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_test_pins_public_surface" "$(<"$tmp_out")" "Public API items: 39. Documented: 39."
     assert_contains "doc_stdlib_test_pins_structured_report" "$(<"$tmp_out")" "fn report(diagnostic: Diagnostic) -> i64"
     assert_contains "doc_stdlib_test_pins_unsigned_equality" "$(<"$tmp_out")" "fn assert_eq_usize(got: usize, expected: usize) -> i64"
+  elif [ "$stdlib_doc_name" = "json" ]; then
+    assert_contains "doc_stdlib_json_pins_public_surface" "$(<"$tmp_out")" "Public API items: 27. Documented: 27."
+    assert_contains "doc_stdlib_json_pins_unsigned_index" "$(<"$tmp_out")" "pub fn at(self: Json, index: usize) -> Option<Json>"
+    assert_contains "doc_stdlib_json_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len(self: Json) -> Option<usize>"
   elif [ "$stdlib_doc_name" = "test/property" ]; then
     assert_contains "doc_stdlib_test_property_pins_public_surface" "$(<"$tmp_out")" "Public API items: 109. Documented: 109."
     assert_contains "doc_stdlib_test_property_pins_opaque_generator" "$(<"$tmp_out")" "pub type Gen<T> = opaque"
