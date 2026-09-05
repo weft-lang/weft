@@ -1,0 +1,204 @@
+use stdlib/string.{*}
+use runtime/rc_implicit_test.{*}
+use runtime/rc.{closure_default_promote, rc_is_promoted}
+
+effect TraversalAbort {
+  fn stop() -> never
+}
+
+type TraversalExit { Exhaust, Break, Return, Abort }
+
+fn selected_text() -> (i64, str) {
+  let values = [(1, "unused".concat("!")), (2, "selected".concat("!"))]
+  values[1]
+}
+
+fn replace_generic<T>(initial: T, replacement: T) -> T {
+  let mut values = [initial, initial]
+  values[1] = replacement
+  values[1]
+}
+
+fn traverse_probes(probe: RuntimeRcProbe, exit: TraversalExit) -[TraversalAbort]> i64 {
+  let mut total = 0
+  for (value, (text, index)) in [
+    (probe, ("first".concat("!"), 1)),
+    (probe, ("second".concat("!"), 2)),
+    (probe, ("third".concat("!"), 3))
+  ] {
+    if text.len() > 0 { total = total + runtime_rc_probe_load(value) + index }
+    match exit {
+      Exhaust -> nil
+      Break -> break
+      Return -> return total
+      Abort -> TraversalAbort.stop()
+    }
+  }
+  total
+}
+
+fn run_traversal(probe: RuntimeRcProbe, exit: TraversalExit) -> i64 {
+  handle traverse_probes(probe, exit) {
+    TraversalAbort.stop() -> 0
+  }
+}
+
+fn abort_during_construction(probe: RuntimeRcProbe) -[TraversalAbort]> i64 {
+  let values = [(1, probe), (2, probe), { TraversalAbort.stop() (3, probe) }]
+  values.len
+  0
+}
+
+fn replace_probes(probe: RuntimeRcProbe) -> i64 {
+  let mut values = [(1, probe), (2, probe)]
+  let snapshot = values
+  values[0] = (3, probe)
+  values[1] = values[1]
+  let (old, _) = snapshot[0]
+  let (first, _) = values[0]
+  let (second, _) = values[1]
+  old * 100 + first * 10 + second
+}
+
+fn mixed_fields(probe: RuntimeRcProbe, reference: weak RuntimeRcProbe) -> i64 {
+  let reader = () => runtime_rc_probe_load(probe)
+  let mut values = [(reference, reader, probe), (reference, reader, probe)]
+  values[0] = values[1]
+  let mut total = 0
+  for (_, read, strong) in values {
+    total = total + read() + runtime_rc_probe_load(strong)
+  }
+  total
+}
+
+fn captured_values(first: RuntimeRcProbe, second: RuntimeRcProbe) -> () -> [(i64, RuntimeRcProbe); 2] {
+  let values = [(1, first), (2, second)]
+  () => values
+}
+
+test "tuple array traversal preserves strings and observation order" {
+  let mut total = 0
+  let mut order = ""
+  for (len, value) in [(0, "a"), (55, "b"), (56, "c"), (63, "d"), (64, "e"), (65, "f"), (1000000, "g")] {
+    total = total + len
+    order = order.concat(value)
+    Test.assert_eq_usize(value.len(), 1)
+  }
+  Test.assert_eq(total, 1000303)
+  Test.assert_str_eq(order, "abcdefg")
+}
+
+test "tuple array indexed results outlive their source" {
+  let (index, text) = selected_text()
+  Test.assert_eq(index, 2)
+  Test.assert_str_eq(text, "selected!")
+}
+
+test "tuple arrays and slices share one structural element layout" {
+  let values = [("first", 1), ("second", 2), ("third", 3)]
+  let mut total = 0
+  let mut order = ""
+  for (text, index) in values[1..] {
+    total = total + index
+    order = order.concat(text)
+  }
+  Test.assert_eq(total, 5)
+  Test.assert_str_eq(order, "secondthird")
+  let empty: [(str, i64); 0] = []
+  let mut visits = 0
+  for (_, _) in empty { visits = visits + 1 }
+  Test.assert_eq(visits, 0)
+}
+
+test "mutable tuple indexing replaces only the selected element" {
+  let mut values = [("old".concat("!"), 1), ("kept".concat("!"), 2)]
+  values[0] = ("new".concat("!"), 3)
+  let (first, index) = values[0]
+  let (second, _) = values[1]
+  Test.assert_str_eq(first, "new!")
+  Test.assert_eq(index, 3)
+  Test.assert_str_eq(second, "kept!")
+}
+
+test "mutable tuple slice overwrites use the same field layout" {
+  let mut values = [("first".concat("!"), 1), ("second".concat("!"), 2)]
+  let writable: [mut (str, i64)] = values[..]
+  writable[1] = ("replacement".concat("!"), 3)
+  let (text, index) = writable[1]
+  let (first, _) = writable[0]
+  Test.assert_str_eq(text, "replacement!")
+  Test.assert_eq(index, 3)
+  Test.assert_str_eq(first, "first!")
+}
+
+test "generic array replacement specializes the complete tuple layout" {
+  let (index, text) = replace_generic((1, "old".concat("!")), (2, "new".concat("!")))
+  Test.assert_eq(index, 2)
+  Test.assert_str_eq(text, "new!")
+}
+
+test "nested tuple traversal releases every managed field on each exit" {
+  let probe = runtime_rc_probe_new(10)
+  Test.assert_eq(run_traversal(probe, Exhaust), 36)
+  Test.assert_eq(run_traversal(probe, Break), 11)
+  Test.assert_eq(run_traversal(probe, Return), 11)
+  Test.assert_eq(run_traversal(probe, Abort), 0)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "partially initialized tuple arrays release only acquired fields" {
+  let probe = runtime_rc_probe_new(42)
+  let result = handle abort_during_construction(probe) {
+    TraversalAbort.stop() -> 7
+  }
+  Test.assert_eq(result, 7)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "tuple array traversal is heap flat after warmup" {
+  let probe = runtime_rc_probe_new(10)
+  for exit in [Exhaust, Break, Return, Abort] {
+    for _ in 0..50 { run_traversal(probe, exit) }
+    let before = runtime_rc_test_heap_arena_offset()
+    for _ in 0..200 { run_traversal(probe, exit) }
+    Test.assert_eq(runtime_rc_test_heap_arena_offset() - before, 0)
+    Test.assert_eq(runtime_rc_probe_count(probe), 1)
+  }
+}
+
+test "tuple replacement preserves aliases and releases copied stakes" {
+  let probe = runtime_rc_probe_new(10)
+  Test.assert_eq(replace_probes(probe), 132)
+  for _ in 0..50 { replace_probes(probe) }
+  let before = runtime_rc_test_heap_arena_offset()
+  for _ in 0..200 { replace_probes(probe) }
+  Test.assert_eq(runtime_rc_test_heap_arena_offset() - before, 0)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "tuple arrays copy and release strong closure and weak fields" {
+  let probe = runtime_rc_probe_new(10)
+  let reference = weak_ref(probe)
+  Test.assert_eq(mixed_fields(probe, reference), 40)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+  Test.assert_eq(runtime_rc_probe_weak_count(probe), 1)
+  for _ in 0..50 { mixed_fields(probe, reference) }
+  let before = runtime_rc_test_heap_arena_offset()
+  for _ in 0..200 { mixed_fields(probe, reference) }
+  Test.assert_eq(runtime_rc_test_heap_arena_offset() - before, 0)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+  Test.assert_eq(runtime_rc_probe_weak_count(probe), 1)
+}
+
+test "tuple array promotion reaches managed fields beyond the first element" {
+  let first = runtime_rc_probe_new(7)
+  let second = runtime_rc_probe_new(42)
+  let reader = captured_values(first, second)
+  Test.assert_eq(rc_is_promoted(runtime_rc_probe_word(first)), 0)
+  Test.assert_eq(rc_is_promoted(runtime_rc_probe_word(second)), 0)
+  closure_default_promote(reader)
+  Test.assert_eq(rc_is_promoted(runtime_rc_probe_word(first)), 1)
+  Test.assert_eq(rc_is_promoted(runtime_rc_probe_word(second)), 1)
+  let (_, value) = reader()[1]
+  Test.assert_eq(runtime_rc_probe_load(value), 42)
+}
