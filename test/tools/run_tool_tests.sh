@@ -580,6 +580,13 @@ assert_contains "explain_known_code_teaches_cause" "$explain_out" "What happened
 assert_contains "explain_known_code_teaches_fix" "$explain_out" "How to fix:"
 assert_contains "explain_known_code_includes_example" "$explain_out" "Example:"
 
+for sdk_code in E5015 E5016 E5017; do
+  "$WEFT" explain "$sdk_code" > "$tmp_out" 2> "$tmp_err"
+  assert_equals "explain_sdk_${sdk_code}_stderr_empty" "$(<"$tmp_err")" ""
+  assert_contains "explain_sdk_${sdk_code}_heading" "$(<"$tmp_out")" "$sdk_code [link]"
+  assert_contains "explain_sdk_${sdk_code}_repair" "$(<"$tmp_out")" "How to fix:"
+done
+
 set +e
 "$WEFT" explain E9999 > "$tmp_out" 2> "$tmp_err"
 explain_unknown_exit=$?
@@ -3847,7 +3854,8 @@ installed_task_scope_out=$(cd "$tmp_sdk_layout_dir/app" && "$tmp_sdk_layout_dir/
 assert_contains "installed_task_scope_hides_scheduler_operations" "$installed_task_scope_out" "type error: effect operation is not visible from this module"
 assert_contains "installed_task_scope_rejects_both_scheduler_operations" "$installed_task_scope_out" "2 errors"
 installed_sdk_identity=$(cd "$tmp_sdk_layout_dir/app" && "$tmp_sdk_layout_dir/bin/weft" version --json)
-assert_contains "installed_compiler_reports_embedded_sdk" "$installed_sdk_identity" '"sdk":{"kind":"embedded","digest":"sha256:'
+assert_contains "installed_compiler_reports_embedded_sdk" "$installed_sdk_identity" '"sdk":{"kind":"embedded","archive_version":1,"digest":"sha256:'
+WEFT="$WEFT_ABS" bash "$PROJECT_ROOT/test/run_sdk_acquisition.sh"
 
 mkdir -p "$tmp_pkg_dir/deps/lib/deps/base" "$tmp_pkg_dir/deps/mirror"
 printf '{"package":"app","dependencies":{"lib":"deps/lib","mirror":"deps/mirror"}}\n' > "$tmp_pkg_dir/weft.pkg"

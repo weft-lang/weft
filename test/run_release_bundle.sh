@@ -76,13 +76,14 @@ grep -q '"target":"'"$target"'"' "$facts"
 grep -q '"standalone":true' "$facts"
 grep -q '"debug_information":{"kind":"absent"}' "$facts"
 grep -q '"artifact_facts_version":3' "$facts"
-grep -q '"sdk":{"kind":"embedded","digest":"sha256:' "$facts"
+grep -q '"sdk":{"kind":"embedded","archive_version":1,"digest":"sha256:' "$facts"
 grep -q '"release_schema_version":3' "$provenance"
 grep -q '"release_channel":"probe"' "$provenance"
 grep -q '"target":"'"$target"'"' "$provenance"
 grep -q '"sdk_layout":"embedded"' "$provenance"
+grep -q '"sdk_archive_version":1' "$provenance"
 grep -q '"compiler_version":"0.1.0"' "$identity"
-grep -q '"sdk":{"kind":"embedded","digest":"sha256:' "$identity"
+grep -q '"sdk":{"kind":"embedded","archive_version":1,"digest":"sha256:' "$identity"
 grep -q '"name":"Mbed TLS"' "$provenance"
 grep -q '"version":"3.6.7"' "$provenance"
 grep -q '"license":"Apache-2.0"' "$provenance"
@@ -94,7 +95,7 @@ fi
 grep -q 'Copyright The Mbed TLS Contributors' "$tls_notice"
 tls_archive_sha=$(sha256_file "$tls_archive")
 grep -q '"archive_sha256":"'"$tls_archive_sha"'"' "$provenance"
-sdk_digest=$(sed -n 's/.*"sdk":{"kind":"embedded","digest":"\([^"]*\)"}.*/\1/p' "$facts" | head -1)
+sdk_digest=$(sed -n 's/.*"sdk":{"kind":"embedded","archive_version":1,"digest":"\([^"]*\)"}.*/\1/p' "$facts" | head -1)
 grep -q '"sdk_digest":"'"$sdk_digest"'"' "$provenance"
 grep -q '"digest":"'"$sdk_digest"'"' "$identity"
 if grep -Eqi '(clang|/Users/|/home/)' "$facts" "$provenance" "$identity"; then
@@ -189,7 +190,7 @@ for marker in stdlib/test.weft runtime/syscall.weft compiler/unicode_identifier_
 done
 cp "$project_root/examples/hello.weft" "$work/project/shadow/hello.weft"
 run_weft_in shadow version --json > "$work/project/shadow/version.json"
-grep -q '"sdk":{"kind":"embedded","digest":"'"$sdk_digest"'"}' "$work/project/shadow/version.json"
+grep -q '"sdk":{"kind":"embedded","archive_version":1,"digest":"'"$sdk_digest"'"}' "$work/project/shadow/version.json"
 run_weft_in shadow build hello.weft -o hello --artifact-facts hello.facts.json
 hello_output=$(run_weft_in shadow run hello.weft)
 test "$hello_output" = 'Hello, world!'
@@ -319,7 +320,7 @@ grep -q '"module":"runtime/tls_mbedtls"' "$work/project/tls-probe.facts.json"
 run_weft_in . version --json > "$work/project/version.json"
 run_weft_in . target show "$target" > "$work/project/target.json"
 grep -q '"compiler_version":"0.1.0"' "$work/project/version.json"
-grep -q '"sdk":{"kind":"embedded","digest":"'"$sdk_digest"'"}' "$work/project/version.json"
+grep -q '"sdk":{"kind":"embedded","archive_version":1,"digest":"'"$sdk_digest"'"}' "$work/project/version.json"
 grep -q '"target":"'"$target"'"' "$work/project/target.json"
 grep -q '"host":true' "$work/project/target.json"
 grep -q '"standalone":true' "$work/project/app.one.facts.json"

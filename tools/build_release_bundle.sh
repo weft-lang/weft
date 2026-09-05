@@ -137,9 +137,15 @@ cp "$project_root/native/mbedtls/README.md" "$bundle/share/weft/mbedtls.md"
 cp "$project_root/LICENSE-MIT" "$bundle/LICENSE-MIT"
 cp "$project_root/LICENSE-APACHE" "$bundle/LICENSE-APACHE"
 chmod 644 "$bundle/LICENSE-MIT" "$bundle/LICENSE-APACHE"
-sdk_digest=$(sed -n 's/.*"sdk":{"kind":"embedded","digest":"\([^"]*\)"}.*/\1/p' "$bundle/share/weft/compiler.facts.json" | head -1)
+sdk_identity=$(sed -n 's/.*"sdk":\({"kind":"embedded"[^}]*}\).*/\1/p' "$bundle/share/weft/compiler.facts.json" | head -1)
+sdk_digest=$(printf '%s\n' "$sdk_identity" | sed -n 's/.*"digest":"\([^"]*\)".*/\1/p')
+sdk_archive_version=$(printf '%s\n' "$sdk_identity" | sed -n 's/.*"archive_version":\([0-9]*\).*/\1/p')
 if ! [[ "$sdk_digest" =~ ^sha256:[[:xdigit:]]{64}$ ]]; then
   echo "release: compiler artifact facts do not name an embedded SDK digest" >&2
+  exit 1
+fi
+if ! [[ "$sdk_archive_version" =~ ^[1-9][0-9]*$ ]]; then
+  echo "release: compiler artifact facts do not name an SDK archive version" >&2
   exit 1
 fi
 identity_without_sdk=${identity_json%,\"sdk\":*}
@@ -147,7 +153,7 @@ if [ "$identity_without_sdk" = "$identity_json" ]; then
   echo "release: compiler identity does not expose SDK provenance" >&2
   exit 1
 fi
-release_identity_json="$identity_without_sdk,\"sdk\":{\"kind\":\"embedded\",\"digest\":\"$sdk_digest\"}}"
+release_identity_json="$identity_without_sdk,\"sdk\":$sdk_identity}"
 printf '%s\n' "$release_identity_json" > "$bundle/share/weft/product-identity.json"
 
 code_signing_json='{"kind":"none"}'
@@ -198,7 +204,7 @@ if [ "$target" = linux-aarch64 ]; then
   standalone_contract="Linux kernel ABI; no interpreter or runtime library"
 fi
 printf '%s\n' \
-  "{\"release_schema_version\":3,\"release_channel\":\"$release_channel\",\"target\":\"$target\",\"source_commit\":\"$source_commit\",\"compiler_sha256\":\"$compiler_sha\",\"sdk_layout\":\"embedded\",\"sdk_digest\":\"$sdk_digest\",\"standalone_contract\":\"$standalone_contract\",\"code_signing\":$code_signing_json,\"native_dependencies\":[{\"name\":\"Mbed TLS\",\"version\":\"3.6.7\",\"source\":\"https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2\",\"source_sha256\":\"a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6\",\"archive_sha256\":\"$native_archive_sha\",\"license\":\"Apache-2.0\"}],\"product_identity\":$release_identity_json}" \
+  "{\"release_schema_version\":3,\"release_channel\":\"$release_channel\",\"target\":\"$target\",\"source_commit\":\"$source_commit\",\"compiler_sha256\":\"$compiler_sha\",\"sdk_layout\":\"embedded\",\"sdk_digest\":\"$sdk_digest\",\"sdk_archive_version\":$sdk_archive_version,\"standalone_contract\":\"$standalone_contract\",\"code_signing\":$code_signing_json,\"native_dependencies\":[{\"name\":\"Mbed TLS\",\"version\":\"3.6.7\",\"source\":\"https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2\",\"source_sha256\":\"a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6\",\"archive_sha256\":\"$native_archive_sha\",\"license\":\"Apache-2.0\"}],\"product_identity\":$release_identity_json}" \
   > "$bundle/share/weft/provenance.json"
 chmod 644 "$bundle/share/weft/"*.json
 

@@ -1,5 +1,7 @@
 use runtime/memory.{mem_copy, mem_load8_at, mem_load64_at, mem_store64_at}
-use runtime/source_acquire.{CheckoutSdk, EmbeddedSdk, NoSdk, SourceAcquire, source_acquire_with_archive, source_acquire_with_checkout, source_acquire_with_standalone}
+use runtime/source_acquire.{CheckoutSdk, EmbeddedSdk, NoSdk, SdkSourcePresent, SdkSourceMissing, SdkSourceInvalidPath, SourceAcquire, source_acquire_with_archive, source_acquire_with_checkout, source_acquire_with_standalone}
+use runtime/sdk_archive.{SdkArchive, sdk_archive_validate, sdk_archive_digest}
+use runtime/sha256.{sha256, sha256_with_zeroed_range}
 use stdlib/num
 use stdlib/result.{Result}
 use stdlib/vector as vector
@@ -34,7 +36,47 @@ fn source_acquire_archive_fixture() -> owned Vector<u8> {
   mem_store64_at(bytes, header_size + 24, __str_len(source))
   mem_copy(bytes + path_offset, __str_ptr(path), __str_len(path))
   mem_copy(bytes + source_offset, __str_ptr(source), __str_len(source))
+  sha256(bytes, total, bytes + 64)
   archive
+}
+
+fn source_acquire_validated(archive: borrow Vector<u8>) -> SdkArchive {
+  sdk_archive_validate(vector_data<u8>(archive), archive.len().to_u64().to_i64_checked().expect("fixture length fits i64")).expect("fixture validates")
+}
+
+test "SDK handlers share missing and noncanonical path semantics" {
+  let archive = source_acquire_archive_fixture()
+  let validated = source_acquire_validated(archive)
+  for path in ["", "/stdlib/string.weft", "stdlib/../weft.pkg", "stdlib//string.weft", "stdlib/./string.weft"] {
+    let request = () => SourceAcquire.load_sdk(__str_ptr(path), __str_len(path))
+    Test.assert_true(source_acquire_with_archive(validated, request) == SdkSourceInvalidPath)
+    Test.assert_true(source_acquire_with_checkout(".", request) == SdkSourceInvalidPath)
+    Test.assert_true(source_acquire_with_standalone(request) == SdkSourceInvalidPath)
+  }
+  let missing = "stdlib/definitely_missing_sdk_module.weft"
+  let request = () => SourceAcquire.load_sdk(__str_ptr(missing), __str_len(missing))
+  Test.assert_true(source_acquire_with_archive(validated, request) == SdkSourceMissing)
+  Test.assert_true(source_acquire_with_checkout(".", request) == SdkSourceMissing)
+  Test.assert_true(source_acquire_with_standalone(request) == SdkSourceMissing)
+}
+
+test "an empty SDK entry is present rather than missing" {
+  let archive = source_acquire_archive_fixture()
+  let bytes = vector_data<u8>(archive)
+  let data_offset = mem_load64_at(bytes, 96 + 16)
+  mem_store64_at(bytes, 96 + 24, 0)
+  mem_store64_at(bytes, 32, data_offset)
+  sha256_with_zeroed_range(bytes, data_offset, 64, 32, bytes + 64)
+  let validated = sdk_archive_validate(bytes, data_offset).expect("empty entry validates")
+  let path = "stdlib/string.weft"
+  match source_acquire_with_archive(validated, () => SourceAcquire.load_sdk(__str_ptr(path), __str_len(path))) {
+    SdkSourcePresent(data, len) -> {
+      Test.assert_eq(data, bytes + data_offset)
+      Test.assert_eq(len, 0)
+    }
+    SdkSourceMissing -> Test.assert_true(false)
+    SdkSourceInvalidPath -> Test.assert_true(false)
+  }
 }
 
 fn source_acquire_residual_probe() -[SourceAcquire, SourceAcquireResidual]> i64 {
@@ -104,11 +146,10 @@ test "source acquisition publishes typed SDK origins" {
 
   let archive = source_acquire_archive_fixture()
   match source_acquire_with_archive(
-    vector_data<u8>(archive),
-    archive.len().to_u64().to_i64_checked().expect("fixture length fits i64"),
+    source_acquire_validated(archive),
     () => SourceAcquire.sdk_origin()
   ) {
-    EmbeddedSdk(digest) -> Test.assert_str_eq(digest, "sha256:0000000000000000000000000000000000000000000000000000000000000000")
+    EmbeddedSdk(digest) -> Test.assert_str_eq(digest, sdk_archive_digest(source_acquire_validated(archive)))
     CheckoutSdk(root) -> Test.assert_true(false)
     NoSdk -> Test.assert_true(false)
   }
@@ -119,21 +160,25 @@ test "embedded SDK acquisition returns archive storage without copying" {
   let bytes = vector_data<u8>(archive)
   let path = "stdlib/string.weft"
   let loaded = source_acquire_with_archive(
-    bytes,
-    archive.len().to_u64().to_i64_checked().expect("fixture length fits i64"),
+    source_acquire_validated(archive),
     () => SourceAcquire.load_sdk(__str_ptr(path), __str_len(path))
   )
 
-  Test.assert_eq(mem_load64_at(loaded, 0), bytes + 96 + 32 + __str_len(path))
-  Test.assert_eq(mem_load64_at(loaded, 8), __str_len("pub fn embedded_marker() -> i64 { 73 }"))
+  match loaded {
+    SdkSourcePresent(data, len) -> {
+      Test.assert_eq(data, bytes + 96 + 32 + __str_len(path))
+      Test.assert_eq(len, __str_len("pub fn embedded_marker() -> i64 { 73 }"))
+    }
+    SdkSourceMissing -> Test.assert_true(false)
+    SdkSourceInvalidPath -> Test.assert_true(false)
+  }
 }
 
 test "embedded SDK acquisition preserves project filesystem loading" {
   let archive = source_acquire_archive_fixture()
   let project_path = "test/source_acquire.weft"
   let loaded = source_acquire_with_archive(
-    vector_data<u8>(archive),
-    archive.len().to_u64().to_i64_checked().expect("fixture length fits i64"),
+    source_acquire_validated(archive),
     () => SourceAcquire.load(
     __str_ptr(project_path),
     __str_len(project_path),
@@ -152,20 +197,24 @@ test "checkout SDK acquisition redirects only explicit SDK requests" {
     __str_ptr(sdk_path),
     __str_len(sdk_path)
   ))
-  Test.assert_eq(if mem_load64_at(installed, 8) > 100 { 1 } else { 0 }, 1)
+  match installed {
+    SdkSourcePresent(data, len) -> Test.assert_true(len > 100)
+    SdkSourceMissing -> Test.assert_true(false)
+    SdkSourceInvalidPath -> Test.assert_true(false)
+  }
 
   let missing = source_acquire_with_checkout("test/fixtures/source-acquire-definitely-missing", () => SourceAcquire.load_sdk(
     __str_ptr(sdk_path),
     __str_len(sdk_path)
   ))
-  Test.assert_eq(mem_load64_at(missing, 8), 0)
+  Test.assert_true(missing == SdkSourceMissing)
 
   let compiler_path = "compiler/lib.weft"
   let compiler = source_acquire_with_checkout("test/fixtures/source-acquire-definitely-missing", () => SourceAcquire.load_sdk(
     __str_ptr(compiler_path),
     __str_len(compiler_path)
   ))
-  Test.assert_eq(mem_load64_at(compiler, 8), 0)
+  Test.assert_true(compiler == SdkSourceMissing)
 
   let project_path = "test/source_acquire.weft"
   let project = source_acquire_with_checkout("test/fixtures/source-acquire-definitely-missing", () => SourceAcquire.load(
@@ -182,8 +231,7 @@ test "SDK handlers do not reinterpret physical package paths as SDK authority" {
   let archive = source_acquire_archive_fixture()
   let path = "compiler/lib.weft"
   let embedded = source_acquire_with_archive(
-    vector_data<u8>(archive),
-    archive.len().to_u64().to_i64_checked().expect("fixture length fits i64"),
+    source_acquire_validated(archive),
     () => SourceAcquire.load(__str_ptr(path), __str_len(path), __str_ptr("lib"), __str_len("lib"), 91)
   )
   let checkout = source_acquire_with_checkout(

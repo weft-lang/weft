@@ -1,7 +1,9 @@
-use runtime/memory.{mem_copy, mem_load8_at, mem_store64_at, mem_store8_at}
-use runtime/sdk_archive.{SdkArchiveFound, SdkArchiveLookup, SdkArchiveMalformed, SdkArchiveMissing, sdk_archive_digest, sdk_archive_lookup}
+use runtime/memory.{mem_copy, mem_load8_at, mem_load64_at, mem_store64_at, mem_store8_at}
+use runtime/sdk_archive.{*}
+use runtime/sha256.{sha256, sha256_with_zeroed_range}
+use runtime/alloc.{alloc_bump_mark}
 use stdlib/num
-use stdlib/result.{Result}
+use stdlib/result.{Err, Ok, Result}
 use stdlib/vector as vector
 use stdlib/vector.{vector_data}
 use stdlib/vector/handles.{Vector}
@@ -43,66 +45,185 @@ fn sdk_archive_fixture() -> owned Vector<u8> {
   mem_copy(bytes + console_source_offset, __str_ptr(console_source), __str_len(console_source))
   mem_copy(bytes + string_path_offset, __str_ptr(string_path), __str_len(string_path))
   mem_copy(bytes + string_source_offset, __str_ptr(string_source), __str_len(string_source))
+  sha256(bytes, total, bytes + 64)
   archive
 }
 
-test "SDK archive lookup finds exact canonical entries" {
-  let archive = sdk_archive_fixture()
-  let path = "stdlib/string.weft"
-  match sdk_archive_lookup(vector_data<u8>(archive), archive.len().to_u64().to_i64_checked().expect("fixture length fits i64"), __str_ptr(path), __str_len(path)) {
-    SdkArchiveFound(source, len) -> {
-      Test.assert_eq(len, __str_len("pub fn empty() -> str { \"\" }"))
-      Test.assert_eq(mem_load8_at(source, 0), 112)
+fn sdk_fixture_len(archive: borrow Vector<u8>) -> i64 {
+  archive.len().to_u64().to_i64_checked().expect("fixture length fits i64")
+}
+
+fn sdk_fixture_view(archive: borrow Vector<u8>) -> SdkArchive {
+  sdk_archive_validate(vector_data<u8>(archive), sdk_fixture_len(archive)).expect("fixture validates")
+}
+
+fn sdk_assert_rejected(bytes: i64, len: i64, expected: SdkArchiveError) -[Test]> i64 {
+  match sdk_archive_validate(bytes, len) {
+    Err(error) -> match error {
+      SdkArchiveTruncated -> Test.assert_true(expected == SdkArchiveTruncated)
+      SdkArchiveBadMagic -> Test.assert_true(expected == SdkArchiveBadMagic)
+      SdkArchiveInvalidLayout -> Test.assert_true(expected == SdkArchiveInvalidLayout)
+      SdkArchiveDigestMismatch -> Test.assert_true(expected == SdkArchiveDigestMismatch)
+      SdkArchiveUnsupportedVersion(version) -> match expected {
+        SdkArchiveUnsupportedVersion(wanted) -> Test.assert_eq(version, wanted)
+        _ -> Test.assert_true(false)
+      }
+      SdkArchiveInvalidEntry(index) -> match expected {
+        SdkArchiveInvalidEntry(wanted) -> Test.assert_eq(index, wanted)
+        _ -> Test.assert_true(false)
+      }
     }
-    SdkArchiveMissing -> Test.assert_true(false)
-    SdkArchiveMalformed -> Test.assert_true(false)
+    Ok(validated) -> Test.assert_true(false)
   }
 }
 
-test "SDK archive lookup distinguishes a missing canonical path" {
+test "validated SDK lookup finds both canonical entries without copying" {
   let archive = sdk_archive_fixture()
-  let path = "stdlib/option.weft"
-  match sdk_archive_lookup(vector_data<u8>(archive), archive.len().to_u64().to_i64_checked().expect("fixture length fits i64"), __str_ptr(path), __str_len(path)) {
-    SdkArchiveFound(source, len) -> Test.assert_true(false)
-    SdkArchiveMissing -> Test.assert_true(true)
-    SdkArchiveMalformed -> Test.assert_true(false)
+  let validated = sdk_fixture_view(archive)
+  for path in ["stdlib/console.weft", "stdlib/string.weft"] {
+    match sdk_archive_lookup(validated, __str_ptr(path), __str_len(path)) {
+      SdkArchiveFound(source, len) -> {
+        Test.assert_true(source >= vector_data<u8>(archive) + 160)
+        Test.assert_true(source + len <= vector_data<u8>(archive) + sdk_fixture_len(archive))
+        Test.assert_eq(mem_load8_at(source, 0), 112)
+      }
+      SdkArchiveMissing -> Test.assert_true(false)
+      SdkArchiveInvalidPath -> Test.assert_true(false)
+    }
   }
 }
 
-test "SDK archive lookup rejects non-canonical requests" {
+test "validated SDK lookup distinguishes missing and invalid paths" {
   let archive = sdk_archive_fixture()
-  let path = "stdlib/../runtime/memory.weft"
-  match sdk_archive_lookup(vector_data<u8>(archive), archive.len().to_u64().to_i64_checked().expect("fixture length fits i64"), __str_ptr(path), __str_len(path)) {
-    SdkArchiveFound(source, len) -> Test.assert_true(false)
-    SdkArchiveMissing -> Test.assert_true(false)
-    SdkArchiveMalformed -> Test.assert_true(true)
+  let validated = sdk_fixture_view(archive)
+  let missing = "stdlib/option.weft"
+  Test.assert_true(sdk_archive_lookup(validated, __str_ptr(missing), __str_len(missing)) == SdkArchiveMissing)
+  for path in ["", "/", "/stdlib/string.weft", "stdlib/", "stdlib//string.weft", ".", "..", "stdlib/./string.weft", "stdlib/../string.weft"] {
+    Test.assert_true(sdk_archive_lookup(validated, __str_ptr(path), __str_len(path)) == SdkArchiveInvalidPath)
   }
+  Test.assert_true(sdk_archive_lookup(validated, 0, 7) == SdkArchiveInvalidPath)
 }
 
-test "SDK archive lookup rejects corrupt headers and bounds" {
+test "SDK validation rejects every header failure with a typed reason" {
   let archive = sdk_archive_fixture()
   let bytes = vector_data<u8>(archive)
-  let archive_len = archive.len().to_u64().to_i64_checked().expect("fixture length fits i64")
-  let path = "stdlib/string.weft"
+  let len = sdk_fixture_len(archive)
+  sdk_assert_rejected(0, len, SdkArchiveTruncated)
+  sdk_assert_rejected(bytes, -1, SdkArchiveTruncated)
+  for prefix in 0..96 { sdk_assert_rejected(bytes, prefix, SdkArchiveTruncated) }
   mem_store8_at(bytes, 0, 0)
-  match sdk_archive_lookup(bytes, archive_len, __str_ptr(path), __str_len(path)) {
-    SdkArchiveFound(source, len) -> Test.assert_true(false)
-    SdkArchiveMissing -> Test.assert_true(false)
-    SdkArchiveMalformed -> Test.assert_true(true)
-  }
+  sdk_assert_rejected(bytes, len, SdkArchiveBadMagic)
   mem_store8_at(bytes, 0, 87)
-  mem_store64_at(bytes, 96 + 24, archive_len + 1)
-  match sdk_archive_lookup(bytes, archive_len, __str_ptr(path), __str_len(path)) {
-    SdkArchiveFound(source, len) -> Test.assert_true(false)
-    SdkArchiveMissing -> Test.assert_true(false)
-    SdkArchiveMalformed -> Test.assert_true(true)
+  mem_store64_at(bytes, 8, 2)
+  sdk_assert_rejected(bytes, len, SdkArchiveUnsupportedVersion(2))
+  mem_store64_at(bytes, 8, 1)
+  for offset in [16, 24, 32, 40, 48, 56] {
+    let original = match offset { 16 -> 2 24 -> 32 32 -> len 40 -> 96 _ -> 0 }
+    for value in [-1, 9223372036854775807] {
+      mem_store64_at(bytes, offset, value)
+      sdk_assert_rejected(bytes, len, SdkArchiveInvalidLayout)
+    }
+    mem_store64_at(bytes, offset, original)
   }
 }
 
-test "SDK archive digest renders the versioned full-width identity" {
+test "SDK validation rejects gaps overlap bounds and noncanonical ordering" {
   let archive = sdk_archive_fixture()
-  Test.assert_str_eq(
-    sdk_archive_digest(vector_data<u8>(archive), archive.len().to_u64().to_i64_checked().expect("fixture length fits i64")),
-    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-  )
+  let bytes = vector_data<u8>(archive)
+  let len = sdk_fixture_len(archive)
+  for entry_index in 0..2 {
+    for field in 0..4 {
+      let offset = 96 + entry_index * 32 + field * 8
+      let original = mem_load64_at(bytes, offset)
+      for value in [-1, 0, 9223372036854775807] {
+        mem_store64_at(bytes, offset, value)
+        let expected = match (entry_index, field, value) {
+          (0, 3, 0) -> SdkArchiveInvalidEntry(1)
+          (1, 3, 0) -> SdkArchiveInvalidLayout
+          _ -> SdkArchiveInvalidEntry(entry_index)
+        }
+        sdk_assert_rejected(bytes, len, expected)
+      }
+      mem_store64_at(bytes, offset, original)
+    }
+  }
+  let first_path = mem_load64_at(bytes, 96)
+  mem_store8_at(bytes, first_path, 47)
+  sdk_assert_rejected(bytes, len, SdkArchiveInvalidEntry(0))
+  mem_store8_at(bytes, first_path, 0)
+  sdk_assert_rejected(bytes, len, SdkArchiveInvalidEntry(0))
+  mem_store8_at(bytes, first_path, 115)
+  let second_path = mem_load64_at(bytes, 128)
+  mem_store8_at(bytes, second_path, 97)
+  sdk_assert_rejected(bytes, len, SdkArchiveInvalidEntry(1))
+  -- Keep the layout contiguous while making the second key a true duplicate.
+  let first_len = mem_load64_at(bytes, 96 + 8)
+  mem_copy(bytes + second_path, bytes + first_path, first_len)
+  mem_store64_at(bytes, 128 + 8, first_len)
+  mem_store64_at(bytes, 128 + 16, second_path + first_len)
+  mem_store64_at(bytes, 128 + 24, len - second_path - first_len)
+  sdk_assert_rejected(bytes, len, SdkArchiveInvalidEntry(1))
+}
+
+test "SDK validation authenticates payload and digest without modifying storage" {
+  let archive = sdk_archive_fixture()
+  let bytes = vector_data<u8>(archive)
+  let len = sdk_fixture_len(archive)
+  let original = mem_load8_at(bytes, len - 1)
+  mem_store8_at(bytes, len - 1, original bxor 1)
+  sdk_assert_rejected(bytes, len, SdkArchiveDigestMismatch)
+  mem_store8_at(bytes, len - 1, original)
+  let digest_byte = mem_load8_at(bytes, 64)
+  mem_store8_at(bytes, 64, digest_byte bxor 1)
+  sdk_assert_rejected(bytes, len, SdkArchiveDigestMismatch)
+  Test.assert_eq(mem_load8_at(bytes, 64), digest_byte bxor 1)
+  mem_store8_at(bytes, 64, digest_byte)
+  let validated = sdk_fixture_view(archive)
+  Test.assert_eq(__str_len(sdk_archive_digest(validated)), 71)
+}
+
+test "every single byte mutation is rejected and the original still validates" {
+  let archive = sdk_archive_fixture()
+  let bytes = vector_data<u8>(archive)
+  let len = sdk_fixture_len(archive)
+  for index in 0..len {
+    let original = mem_load8_at(bytes, index)
+    mem_store8_at(bytes, index, original bxor 1)
+    match sdk_archive_validate(bytes, len) {
+      Err(error) -> Test.assert_true(true)
+      Ok(validated) -> Test.assert_true(false)
+    }
+    mem_store8_at(bytes, index, original)
+  }
+  let validated = sdk_fixture_view(archive)
+  Test.assert_eq(__str_len(sdk_archive_digest(validated)), 71)
+}
+
+test "an empty authenticated archive is valid but contains no entries" {
+  let archive = sdk_archive_fixture()
+  let bytes = vector_data<u8>(archive)
+  mem_store64_at(bytes, 16, 0)
+  mem_store64_at(bytes, 32, 96)
+  sha256_with_zeroed_range(bytes, 96, 64, 32, bytes + 64)
+  let validated = sdk_archive_validate(bytes, 96).expect("empty archive validates")
+  let path = "weft.pkg"
+  Test.assert_true(sdk_archive_lookup(validated, __str_ptr(path), __str_len(path)) == SdkArchiveMissing)
+}
+
+test "repeated SDK lookups do not allocate validation scratch or copy payloads" {
+  let archive = sdk_archive_fixture()
+  let validated = sdk_fixture_view(archive)
+  let path = "stdlib/string.weft"
+  let before = alloc_bump_mark()
+  let mut found = 0
+  for index in 0..1000 {
+    match sdk_archive_lookup(validated, __str_ptr(path), __str_len(path)) {
+      SdkArchiveFound(data, len) -> { found = found + 1 0 }
+      SdkArchiveMissing -> 0
+      SdkArchiveInvalidPath -> 0
+    }
+  }
+  let after = alloc_bump_mark()
+  Test.assert_eq(found, 1000)
+  Test.assert_eq(after - before, 0)
 }

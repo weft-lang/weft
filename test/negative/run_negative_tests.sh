@@ -87,9 +87,9 @@ check_rejects "channel_non_sendable_signature" "test/negative/channel_non_sendab
 check_rejects "channel_non_sendable_handler" "test/negative/channel_non_sendable_handler.weft" 'does not implement `Sendable`' 1
 check_rejects "task_double_join" "test/negative/task_double_join.weft" "type error: unique value used more than once"
 check_rejects "task_constructor_private" "test/negative/task_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
-check_rejects "task_flat_channel_module_retired" "test/negative/task_flat_channel_module_retired.weft" "error[E1001]: unknown function 'capacity'" 1
-check_rejects "task_flat_cancellation_module_retired" "test/negative/task_flat_cancellation_module_retired.weft" "error[E1001]: unknown function 'state'" 1
-check_rejects "task_flat_shutdown_module_retired" "test/negative/task_flat_shutdown_module_retired.weft" "error[E1001]: unknown identifier 'ShutdownInterrupt'" 1
+check_rejects "task_flat_channel_module_retired" "test/negative/task_flat_channel_module_retired.weft" "stdlib/channel.weft: error[E5016]" 1
+check_rejects "task_flat_cancellation_module_retired" "test/negative/task_flat_cancellation_module_retired.weft" "stdlib/cancellation.weft: error[E5016]" 1
+check_rejects "task_flat_shutdown_module_retired" "test/negative/task_flat_shutdown_module_retired.weft" "stdlib/shutdown.weft: error[E5016]" 1
 check_rejects "task_cancellation_request_requires_effect" "test/negative/task_cancellation_request_requires_effect.weft" 'error[E2001]: effect `Cancellation` is not available in this context'
 check_rejects "task_cancellation_checkpoint_requires_effect" "test/negative/task_cancellation_checkpoint_requires_effect.weft" 'error[E2001]: effects `Cancellation, Fail<cancellation.CancellationReason>` are not available in this context'
 check_rejects "task_cancellation_deadline_requires_monotonic_clock" "test/negative/task_cancellation_deadline_requires_monotonic_clock.weft" 'error[E2001]: effect `MonotonicClock` is not available in this context'
@@ -295,7 +295,7 @@ check_rejects "process_platform_wrappers_retired" "test/negative/process_platfor
 check_rejects "env_platform_wrappers_retired" "test/negative/env_platform_wrappers_retired.weft" "error[E4002]: unknown module member 'runtime_platform_env' in import" 2
 check_rejects "tcp_platform_wrapper_retired" "test/negative/tcp_platform_wrapper_retired.weft" "error[E4002]: unknown module member 'runtime_platform_tcp' in import" 1
 check_rejects "file_stream_platform_wrappers_retired" "test/negative/file_stream_platform_wrappers_retired.weft" "error[E4002]: unknown module member 'runtime_platform_file_stream' in import" 2
-check_rejects "safe_io_facade_retired" "test/negative/safe_io_facade_retired.weft" "error[E1001]: unknown function 'runtime_platform_safe_io'" 1
+check_rejects "safe_io_facade_retired" "test/negative/safe_io_facade_retired.weft" "runtime/safe_io.weft: error[E5016]" 1
 check_rejects "unsafe_method_call_requires_effect" "test/negative/unsafe_method_call_requires_effect.weft" "error[E2001]:"
 check_rejects "unsafe_lambda_to_pure_fn" "test/negative/unsafe_lambda_to_pure_fn.weft" "error[E2001]:"
 check_rejects "non_unsafe_handler_raw_call" "test/negative/non_unsafe_handler_raw_call.weft" "error[E2001]:"
@@ -667,7 +667,7 @@ check_rejects "string_vector_join_method_removed" "test/negative/string_vector_j
 check_rejects "json_bool_requires_bool" "test/negative/json_bool_requires_bool.weft" 'argument type mismatch: expected `bool`, found `i64`'
 check_rejects "json_at_requires_usize" "test/negative/json_at_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`'
 check_rejects "io_helper_effect_unavailable" "test/negative/io_helper_effect_unavailable.weft" "error[E2001]:"
-check_rejects "io_helpers_module_retired" "test/negative/io_helpers_module_retired.weft" "error[E1001]: unknown function 'io_read_all_with'" 1
+check_rejects "io_helpers_module_retired" "test/negative/io_helpers_module_retired.weft" "stdlib/io/helpers.weft: error[E5016]" 1
 check_rejects "io_transfer_functions_retired" "test/negative/io_transfer_functions_retired.weft" "unknown module member" 3
 check_rejects "io_progress_mirrors_retired" "test/negative/io_progress_mirrors_retired.weft" "unknown module member" 3
 check_rejects "io_error_mirrors_retired" "test/negative/io_error_mirrors_retired.weft" "unknown module member" 5
