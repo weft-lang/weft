@@ -14,7 +14,6 @@ case "$WEFT" in
   *) WEFT_ABS="$(pwd)/$WEFT" ;;
 esac
 
-SOURCE_ROOT=$(pwd)
 MIRROR=$(mktemp -d /tmp/weft_formatter_dogfood_XXXXXX)
 trap 'rm -rf "$MIRROR"' EXIT
 
@@ -91,11 +90,16 @@ run_guarded() {
 echo "=== Formatter Dogfood ==="
 echo ""
 
-cp -R compiler runtime stdlib tools test "$MIRROR/"
+# Keep every generation in the same complete SDK. A compiler outside this
+# checkout selects its embedded SDK, which would silently mix unformatted
+# imports with the mirror and make the bootstrap comparison meaningless.
+cp -R compiler runtime stdlib tools test module_fixtures native "$MIRROR/"
+cp weft.pkg "$MIRROR/"
+cp "$WEFT_ABS" "$MIRROR/weft-bootstrap"
 
 if (
   cd "$MIRROR"
-  "$WEFT_ABS" fmt --write compiler runtime stdlib tools test/*.weft \
+  ./weft-bootstrap fmt --write compiler runtime stdlib tools test/*.weft \
     test/linked/tool_platform.weft > fmt-write.out 2> fmt-write.err
 ); then
   ok "formatter_rewrites_repository_mirror"
@@ -111,7 +115,7 @@ fi
 
 if (
   cd "$MIRROR"
-  "$WEFT_ABS" fmt --check compiler runtime stdlib tools test/*.weft \
+  ./weft-bootstrap fmt --check compiler runtime stdlib tools test/*.weft \
     test/linked/tool_platform.weft > fmt-check.out 2> fmt-check.err
 ); then
   ok "formatter_repository_mirror_is_idempotent"
@@ -128,7 +132,7 @@ fi
 if (
   cd "$MIRROR"
   run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" \
-    "$WEFT_ABS" check compiler/main.weft > compiler-check.out 2> compiler-check.err
+    ./weft-bootstrap check compiler/main.weft > compiler-check.out 2> compiler-check.err
 ); then
   ok "formatted_compiler_typechecks"
 else
@@ -144,7 +148,7 @@ ok "formatted_compiler_reports_zero_errors"
 if ! (
   cd "$MIRROR"
   run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" \
-    "$WEFT_ABS" build compiler/main.weft -o weft-formatted-1 > compiler-1.out 2> compiler-1.err
+    ./weft-bootstrap build compiler/main.weft -o weft-formatted-1 --embed-sdk . > compiler-1.out 2> compiler-1.err
 ); then
   fail "formatted_compiler_stage_one_builds" "$MIRROR/compiler-1.err"
 fi
@@ -153,26 +157,34 @@ chmod +x "$MIRROR/weft-formatted-1"
 if ! (
   cd "$MIRROR"
   run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" \
-    ./weft-formatted-1 build compiler/main.weft -o weft-formatted-2 > compiler-2.out 2> compiler-2.err
+    ./weft-formatted-1 build compiler/main.weft -o weft-formatted-2 --embed-sdk . > compiler-2.out 2> compiler-2.err
 ); then
   fail "formatted_compiler_self_compiles" "$MIRROR/compiler-2.err"
 fi
 
-if cmp -s "$MIRROR/weft-formatted-1" "$MIRROR/weft-formatted-2"; then
+if ! (
+  cd "$MIRROR"
+  run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" \
+    ./weft-formatted-2 build compiler/main.weft -o weft-formatted-3 --embed-sdk . > compiler-3.out 2> compiler-3.err
+); then
+  fail "formatted_compiler_third_generation_builds" "$MIRROR/compiler-3.err"
+fi
+
+if cmp -s "$MIRROR/weft-formatted-2" "$MIRROR/weft-formatted-3"; then
   ok "formatted_compiler_gate_is_byte_identical"
 else
   fail "formatted_compiler_gate_is_byte_identical" ""
 fi
 
 if ! run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" \
-  "$WEFT_ABS" compile "$SOURCE_ROOT/test/e2e_pipeline.weft" \
+  "$WEFT_ABS" compile test/e2e_pipeline.weft \
   > "$MIRROR/direct-original" 2> "$MIRROR/direct-original.err"; then
   fail "formatter_direct_original_compiles" "$MIRROR/direct-original.err"
 fi
 if ! (
   cd "$MIRROR"
   run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" \
-    "$WEFT_ABS" compile test/e2e_pipeline.weft \
+    ./weft-formatted-2 compile test/e2e_pipeline.weft \
     > direct-formatted 2> direct-formatted.err
 ); then
   fail "formatter_direct_formatted_compiles" "$MIRROR/direct-formatted.err"
@@ -198,14 +210,14 @@ else
 fi
 
 if ! run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" \
-  "$WEFT_ABS" test --emit "$SOURCE_ROOT/test/linked/tool_platform.weft" \
+  "$WEFT_ABS" test --emit test/linked/tool_platform.weft \
   > "$MIRROR/linked-original" 2> "$MIRROR/linked-original.err"; then
   fail "formatter_linked_original_compiles" "$MIRROR/linked-original.err"
 fi
 if ! (
   cd "$MIRROR"
   run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" \
-    "$WEFT_ABS" test --emit test/linked/tool_platform.weft \
+    ./weft-formatted-2 test --emit test/linked/tool_platform.weft \
     > linked-formatted 2> linked-formatted.err
 ); then
   fail "formatter_linked_formatted_compiles" "$MIRROR/linked-formatted.err"
