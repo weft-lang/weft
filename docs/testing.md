@@ -142,6 +142,24 @@ The mutable Vector generator returns `Gen<owned Vector<T>>`; ownership is not
 erased merely to fit a common collection interface. Immutable Bytes, List, and
 PersistentVector generators retain their ordinary value semantics.
 
+Domain generators stay below the property namespace instead of adding testing
+operations to production modules. JSON provides separate leaf and recursive
+domains:
+
+```weft
+use stdlib/test/property/json as json_prop
+
+let leaf = json_prop.scalar()
+let document = json_prop.value()
+```
+
+`json_prop.value()` generates only serializable values: floats come from the
+finite IEEE domain and strings are canonical Unicode. The active size is a
+structural-node budget. Arrays and objects divide that budget among their
+children, which bounds a generated tree to at most `size + 1` nodes rather
+than allowing exponential fan-out. Object order and duplicate keys remain
+part of the generated value.
+
 ## Alternate interpretations
 
 `prop.sample(generator, limits) -[Draw]> SampleResult<T>` leaves the `Draw`
