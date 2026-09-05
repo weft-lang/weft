@@ -57,7 +57,7 @@ if [ -z "${WEFT_TOOL_SHARD:-}" ]; then
   tool_elapsed=$(($(date +%s) - tool_started))
   echo "Tool boundary timing: ${tool_elapsed}s wall, ${tool_jobs} shard jobs"
   if [ "${WEFT_TEST_PLATFORM:-$(uname -s)}" = Darwin ]; then
-    echo "Tool boundary summary: 1199 passed, 0 failed"
+    echo "Tool boundary summary: 1205 passed, 0 failed"
   else
     echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
   fi
@@ -661,6 +661,7 @@ stdlib_doc_modules=(
   stdlib/json.weft stdlib/random.weft
   stdlib/test/property.weft stdlib/test/property/protocol.weft
   stdlib/test/property/random.weft stdlib/test/property/replay.weft
+  stdlib/test/property/enumerate.weft
   stdlib/secure_random.weft stdlib/secure_random/deterministic.weft
   stdlib/net_address.weft stdlib/idna.weft
   stdlib/dns.weft stdlib/dns/fake.weft stdlib/dns/policy.weft
@@ -783,6 +784,10 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_test_property_replay_pins_public_surface" "$(<"$tmp_out")" "Public API items: 7. Documented: 7."
     assert_contains "doc_stdlib_test_property_replay_pins_exact_failure" "$(<"$tmp_out")" "ChoiceBoundChanged(usize, ChoiceBound, ChoiceBound)"
     assert_contains "doc_stdlib_test_property_replay_pins_typed_result" "$(<"$tmp_out")" "fn run<T>(generator: Gen<T>, limits: Limits, choices: ChoiceLog) -> Result<T, Failure>"
+  elif [ "$stdlib_doc_name" = "test/property/enumerate" ]; then
+    assert_contains "doc_stdlib_test_property_enumerate_pins_public_surface" "$(<"$tmp_out")" "Public API items: 13. Documented: 13."
+    assert_contains "doc_stdlib_test_property_enumerate_pins_explicit_budget" "$(<"$tmp_out")" "pub type Budget = opaque"
+    assert_contains "doc_stdlib_test_property_enumerate_preserves_visitor_effect" "$(<"$tmp_out")" 'pub fn run<T, E>(generator: Gen<T>, limits: Limits, enumeration_budget: Budget, visit: (T) -[E]> Visit) -[E]> Outcome'
   elif [ "$stdlib_doc_name" = "random" ]; then
     assert_contains "doc_stdlib_random_pins_public_surface" "$(<"$tmp_out")" "Public API items: 16. Documented: 16."
     assert_contains "doc_stdlib_random_pins_opaque_seed" "$(<"$tmp_out")" "pub type Seed = opaque"

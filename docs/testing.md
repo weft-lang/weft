@@ -54,6 +54,38 @@ Replay checks the complete program. It distinguishes an exhausted choice log,
 a changed bound, unused choices, discard exhaustion, and a generator contract
 violation rather than silently adjusting stale data.
 
+## Bounded exhaustive enumeration
+
+`stdlib/test/property/enumerate` re-executes the same generator from the start
+for each choice program. It does not capture a continuation or construct a
+second generator tree. Both the total path count and the choices permitted in
+one path are explicit bounds:
+
+```weft
+use stdlib/test/property/enumerate as enumerate
+use stdlib/test/property/enumerate.{VisitNext, VisitStop}
+
+fn stop_at_true_false(value: (bool, bool)) -> enumerate.Visit {
+  match value {
+    (true, false) -> VisitStop
+    _ -> VisitNext
+  }
+}
+
+let pairs = prop.pair(prop.boolean(), prop.boolean())
+let outcome = enumerate.run(
+  pairs,
+  prop.limits(2, 0),
+  enumerate.budget(4, 2),
+  stop_at_true_false
+)
+```
+
+Enumeration visits choice programs in stable lexicographic order. A visitor
+consumes each generated value exactly once and returns `VisitNext` or
+`VisitStop`; a stop outcome carries the exact replay log. Rejected generator
+paths spend the total path budget but do not call the visitor.
+
 ## Refinement without hidden copying
 
 The bounded refinement primitive is `filter_map`, not an unbounded `filter`.
