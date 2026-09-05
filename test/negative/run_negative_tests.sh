@@ -653,7 +653,13 @@ check_rejects "bytes_migration_len_retired" "test/negative/bytes_migration_len_r
 check_rejects "bytes_migration_get_retired" "test/negative/bytes_migration_get_retired.weft" "unknown method"
 check_rejects "path_constructor_private" "test/negative/path_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "path_prefixed_constructor_removed" "test/negative/path_prefixed_constructor_removed.weft" "error[E4002]: unknown module member 'path_from_utf8' in import" 1
-check_rejects "string_find_is_option" "test/negative/string_find_is_option.weft" 'return value type mismatch: expected `i64`, found `Option<i64>`'
+check_rejects "string_len_is_usize" "test/negative/string_len_is_usize.weft" 'return value type mismatch: expected `i64`, found `usize`'
+check_rejects "string_find_is_option" "test/negative/string_find_is_option.weft" 'return value type mismatch: expected `i64`, found `Option<usize>`'
+check_rejects "string_find_from_requires_usize" "test/negative/string_find_from_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`'
+check_rejects "string_repeat_requires_usize" "test/negative/string_repeat_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`'
+check_rejects "string_pad_width_requires_usize" "test/negative/string_pad_width_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`'
+check_rejects "string_scalar_count_is_usize" "test/negative/string_scalar_count_is_usize.weft" 'return value type mismatch: expected `i64`, found `usize`'
+check_rejects "string_scalar_boundary_requires_usize" "test/negative/string_scalar_boundary_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`'
 check_rejects "string_builder_constructor_private" "test/negative/string_builder_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "string_builder_append_requires_mutable" "test/negative/string_builder_append_requires_mutable.weft" "type error: exclusive borrow requires a mutable owner binding"
 check_rejects "string_builder_use_after_finish" "test/negative/string_builder_use_after_finish.weft" "type error: owned value used more than once"

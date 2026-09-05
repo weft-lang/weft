@@ -972,9 +972,14 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_num_pins_checked_mul" "$(<"$tmp_out")" "pub fn checked_mul(self: usize, other: usize) -> Option<usize>"
   elif [ "$stdlib_doc_name" = "string" ]; then
     assert_contains "doc_stdlib_string_pins_public_surface" "$(<"$tmp_out")" "Public API items: 19. Documented: 19."
-    assert_contains "doc_stdlib_string_pins_byte_length" "$(<"$tmp_out")" "pub fn len(self: str) -> i64"
-    assert_contains "doc_stdlib_string_pins_optional_find" "$(<"$tmp_out")" "pub fn find(self: str, needle: str) -> Option<i64>"
-    assert_contains "doc_stdlib_string_pins_scalar_count" "$(<"$tmp_out")" "pub fn scalar_count(self: str) -> i64"
+    assert_contains "doc_stdlib_string_pins_byte_length" "$(<"$tmp_out")" "pub fn len(self: str) -> usize"
+    assert_contains "doc_stdlib_string_pins_optional_find" "$(<"$tmp_out")" "pub fn find(self: str, needle: str) -> Option<usize>"
+    assert_contains "doc_stdlib_string_pins_optional_find_from" "$(<"$tmp_out")" "pub fn find_from(self: str, needle: str, start: usize) -> Option<usize>"
+    assert_contains "doc_stdlib_string_pins_repeat_count" "$(<"$tmp_out")" "pub fn repeat(self: str, count: usize) -> str"
+    assert_contains "doc_stdlib_string_pins_pad_start_width" "$(<"$tmp_out")" "pub fn pad_start(self: str, width: usize, fill: str) -> str"
+    assert_contains "doc_stdlib_string_pins_pad_end_width" "$(<"$tmp_out")" "pub fn pad_end(self: str, width: usize, fill: str) -> str"
+    assert_contains "doc_stdlib_string_pins_scalar_count" "$(<"$tmp_out")" "pub fn scalar_count(self: str) -> usize"
+    assert_contains "doc_stdlib_string_pins_scalar_boundary" "$(<"$tmp_out")" "pub fn is_scalar_boundary(self: str, pos: usize) -> bool"
     assert_contains "doc_stdlib_string_pins_namespaced_join" "$(<"$tmp_out")" "pub fn join(parts: borrow Vector<str>, separator: str) -> str"
   elif [ "$stdlib_doc_name" = "task" ]; then
     assert_contains "doc_stdlib_task_pins_public_surface" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
