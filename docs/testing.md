@@ -92,10 +92,16 @@ their maximum while preserving an explicit minimum:
 
 ```weft
 let small = prop.lengths(0, 32).expect("ordered finite lengths")
+let labels = prop.str(small)
 let packets = prop.bytes(small)
 let counters = prop.vector(prop.i64(), small)
 let snapshots = prop.persistent_vector(prop.boolean(), small)
 ```
+
+`prop.str` measures the length domain in Unicode scalars and always returns
+canonical UTF-8. It generates scalar values directly—surrogates are not part
+of the domain—then encodes the finite traversal once instead of repeatedly
+concatenating temporary one-scalar strings.
 
 The mutable Vector generator returns `Gen<owned Vector<T>>`; ownership is not
 erased merely to fit a common collection interface. Immutable Bytes, List, and
