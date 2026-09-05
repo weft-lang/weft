@@ -10,9 +10,9 @@ behavior, not a compatibility or long-term-support promise; the source,
 package, fact-schema, and versioned native-binding contracts may change before
 the public-alpha gate closes.
 
-This guide describes both the repository toolchain and the extracted SDK shape
-as they exist now. `weft build` is the native final-product path, including
-cross-target selection and artifact facts. Installed-SDK discovery,
+This guide describes both the repository toolchain and the extracted compiler
+shape as they exist now. `weft build` is the native final-product path, including
+cross-target selection and artifact facts. Embedded-SDK acquisition,
 deterministic target archives, direct `weft run` execution, and immutable
 locked-source acquisition are implemented. The release command enforces
 detached project signatures on every public artifact. The default macOS
@@ -20,7 +20,7 @@ community channel is free and explicit; optional Developer ID/notarization is
 a separate distribution channel. Private keys remain release-owner authority,
 never repository data.
 
-## Install a local SDK archive
+## Install a local compiler archive
 
 From a checkout, build and verify the target-specific archive:
 
@@ -34,11 +34,11 @@ weft --version
 ```
 
 For Linux/AArch64, select `linux-aarch64` and verify with `sha256sum -c`.
-Preserve the extracted layout: `bin/weft` locates canonical `stdlib/` and
-`runtime/` modules under the adjacent `lib/weft/` SDK. Installation is moving
-that directory to a user-owned location and putting its `bin/` on `PATH`;
-uninstallation removes that directory and its PATH entry. No unrelated files
-are mutated.
+`bin/weft` contains its complete matching SDK: canonical `stdlib/`, `runtime/`,
+and compiler modules, the SDK manifest, and both target-native archives. The
+binary can be copied to any user-owned location and put on `PATH`; it does not
+need the archive's metadata directory or a checkout at runtime. Uninstallation
+removes that binary and its PATH entry. No unrelated files are mutated.
 
 The checksum detects accidental corruption; a public download is authenticated
 by its signed release manifest. Obtain the project's OpenSSH allowed-signers
@@ -182,10 +182,13 @@ weft target show linux-aarch64
 ```
 
 The version report includes the compiler and language versions plus the
-manifest, lock, native-binding ABI, and artifact-facts schema versions. `target
-show` reports the binary format, minimum platform ABI, default standalone
-contract, and whether the selected target is the current host. Unknown target
-aliases fail rather than silently selecting a nearby target.
+manifest, lock, native-binding ABI, artifact-facts schema, and SDK identity. An
+installed compiler names the SHA-256 of the embedded SDK it will use; when
+invoked from its own development checkout it names that checkout, so editing the
+stdlib remains an immediate compiler-development loop. `target show` reports
+the binary format, minimum platform ABI, default standalone contract, and
+whether the selected target is the current host. Unknown target aliases fail
+rather than silently selecting a nearby target.
 
 ## Tests
 
@@ -256,7 +259,7 @@ text; both preserve a typed failure with the invalid byte offset.
 ## Packages and locked sources
 
 Package identity is content-locked and module imports are qualified. With an
-extracted SDK's `bin/` (or the repository root) on `PATH`, start in an empty
+installed `weft` binary (or the repository root) on `PATH`, start in an empty
 project directory. Local path dependencies remain the shortest first example:
 
 ```bash project
@@ -352,14 +355,15 @@ requirements only—not compiler, linker, or deployed-program dependencies.
 
 A hosted registry and full semver solver are not part of the first alpha.
 
-An installed compiler resolves canonical `stdlib/` and `runtime/` imports from
-its own adjacent SDK while project and dependency imports continue through the
-project graph. `test/run_release_bundle.sh` verifies the commands above from an
-actual archive moved into a clean installation root, with only the installed
-bundle's `bin/` on the compiler PATH. It acquires a pinned archive through a
+An installed compiler resolves canonical `stdlib/` and `runtime/` imports and
+SDK-native archives from its own embedded, digested payload while project and
+dependency imports continue through the project graph.
+`test/run_release_bundle.sh` verifies the commands above from an actual archive
+moved into a clean installation root, with only the single installed compiler
+binary on the compiler PATH. It acquires a pinned archive through a
 deterministic local HTTPS-provider fixture, removes that provider and source,
 performs the offline rebuild in a network-disabled Linux/AArch64 container,
-and removes the exact installed SDK at the end. `test/run_release_signing.sh`
+and removes the exact installed compiler at the end. `test/run_release_signing.sh`
 pins signature trust, tamper refusal, platform-fact consistency, archive safety,
 and missing-authority failures without containing any production credential.
 

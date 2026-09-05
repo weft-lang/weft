@@ -69,27 +69,34 @@ bundle_root="$work/installed/$bundle_name"
 facts="$bundle_root/share/weft/compiler.facts.json"
 provenance="$bundle_root/share/weft/provenance.json"
 identity="$bundle_root/share/weft/product-identity.json"
-sdk_manifest="$bundle_root/lib/weft/weft.pkg"
-sdk_compiler_module="$bundle_root/lib/weft/compiler/unicode_identifier_data.weft"
-tls_archive="$bundle_root/lib/weft/native/lib/$target/libweft_mbedtls.a"
 tls_notice="$bundle_root/share/weft/mbedtls.md"
+tls_archive="$project_root/native/lib/$target/libweft_mbedtls.a"
 
 grep -q '"target":"'"$target"'"' "$facts"
 grep -q '"standalone":true' "$facts"
 grep -q '"debug_information":{"kind":"absent"}' "$facts"
-grep -q '"release_schema_version":2' "$provenance"
+grep -q '"artifact_facts_version":3' "$facts"
+grep -q '"sdk":{"kind":"embedded","digest":"sha256:' "$facts"
+grep -q '"release_schema_version":3' "$provenance"
 grep -q '"release_channel":"probe"' "$provenance"
 grep -q '"target":"'"$target"'"' "$provenance"
-grep -q '"sdk_layout":"lib/weft"' "$provenance"
+grep -q '"sdk_layout":"embedded"' "$provenance"
 grep -q '"compiler_version":"0.1.0"' "$identity"
+grep -q '"sdk":{"kind":"embedded","digest":"sha256:' "$identity"
 grep -q '"name":"Mbed TLS"' "$provenance"
 grep -q '"version":"3.6.7"' "$provenance"
 grep -q '"license":"Apache-2.0"' "$provenance"
-grep -q '"trusted_bindings":\["runtime/tls_mbedtls"\]' "$sdk_manifest"
-test -f "$sdk_compiler_module"
+test ! -e "$bundle_root/lib"
+if grep -Eq '/(compiler|runtime|stdlib)/.*\.weft$' "$work/archive-entries"; then
+  echo "release gate: binary-only archive contains loose SDK source" >&2
+  exit 1
+fi
 grep -q 'Copyright The Mbed TLS Contributors' "$tls_notice"
 tls_archive_sha=$(sha256_file "$tls_archive")
 grep -q '"archive_sha256":"'"$tls_archive_sha"'"' "$provenance"
+sdk_digest=$(sed -n 's/.*"sdk":{"kind":"embedded","digest":"\([^"]*\)"}.*/\1/p' "$facts" | head -1)
+grep -q '"sdk_digest":"'"$sdk_digest"'"' "$provenance"
+grep -q '"digest":"'"$sdk_digest"'"' "$identity"
 if grep -Eqi '(clang|/Users/|/home/)' "$facts" "$provenance" "$identity"; then
   echo "release gate: release metadata contains a host tool or checkout path" >&2
   exit 1
@@ -172,6 +179,27 @@ run_tls_probe() {
       ./tls-probe
   fi
 }
+
+# The README must work from an unrelated directory even if the project has
+# every checkout marker. SDK selection belongs to the installed compiler.
+mkdir -p "$work/project/shadow/stdlib" "$work/project/shadow/runtime" "$work/project/shadow/compiler"
+printf '%s\n' '{"package":"weft","version":"0.1.0","weft":"0.1","dependencies":{}}' > "$work/project/shadow/weft.pkg"
+for marker in stdlib/test.weft runtime/syscall.weft compiler/unicode_identifier_data.weft stdlib/console.weft; do
+  printf '%s\n' 'this source must never be loaded' > "$work/project/shadow/$marker"
+done
+cp "$project_root/examples/hello.weft" "$work/project/shadow/hello.weft"
+run_weft_in shadow version --json > "$work/project/shadow/version.json"
+grep -q '"sdk":{"kind":"embedded","digest":"'"$sdk_digest"'"}' "$work/project/shadow/version.json"
+run_weft_in shadow build hello.weft -o hello --artifact-facts hello.facts.json
+hello_output=$(run_weft_in shadow run hello.weft)
+test "$hello_output" = 'Hello, world!'
+grep -q '"sdk":{"kind":"absent"}' "$work/project/shadow/hello.facts.json"
+if LC_ALL=C grep -aF 'WEFTSDK1' "$work/project/shadow/hello" >/dev/null; then
+  echo "release gate: ordinary application contains the compiler SDK payload" >&2
+  exit 1
+fi
+# Keep the deliberately malformed shadow sources out of the formatter probe.
+mv "$work/project/shadow" "$work/shadow-verified"
 
 run_weft_in deps/math pkg init math >/dev/null
 run_weft_in . pkg init app >/dev/null
@@ -285,12 +313,13 @@ run_tls_probe
 grep -q '"standalone":true' "$work/project/tls-probe.facts.json"
 grep -q '"content":"sha256:'"$tls_archive_sha"'"' "$work/project/tls-probe.facts.json"
 grep -q '"license":"Apache-2.0"' "$work/project/tls-probe.facts.json"
-grep -q '"source":"sdk:bundled"' "$work/project/tls-probe.facts.json"
+grep -q '"source":"sdk:embedded"' "$work/project/tls-probe.facts.json"
 grep -q '"module":"runtime/tls_mbedtls"' "$work/project/tls-probe.facts.json"
 
 run_weft_in . version --json > "$work/project/version.json"
 run_weft_in . target show "$target" > "$work/project/target.json"
 grep -q '"compiler_version":"0.1.0"' "$work/project/version.json"
+grep -q '"sdk":{"kind":"embedded","digest":"'"$sdk_digest"'"}' "$work/project/version.json"
 grep -q '"target":"'"$target"'"' "$work/project/target.json"
 grep -q '"host":true' "$work/project/target.json"
 grep -q '"standalone":true' "$work/project/app.one.facts.json"
@@ -306,4 +335,4 @@ if [ -e "$bundle_root" ]; then
   exit 1
 fi
 
-echo "release bundle gate: pass ($target, deterministic archive, install/uninstall, locked remote/offline workflow)"
+echo "release bundle gate: pass ($target, deterministic binary-only archive, install/uninstall, locked remote/offline workflow)"

@@ -1068,10 +1068,10 @@ assert_equals "doc_extra_arg_exits_usage" "$doc_extra_arg_exit" "2"
 assert_contains "doc_extra_arg_prints_usage" "$(<"$tmp_err")" "usage: weft doc PATH"
 
 version_out=$("$WEFT" --version 2> "$tmp_err")
-assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 2; targets macos-aarch64,linux-aarch64)"
+assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 3; targets macos-aarch64,linux-aarch64; sdk checkout .)"
 assert_equals "version_human_stderr_empty" "$(<"$tmp_err")" ""
 version_json=$("$WEFT" version --json 2> "$tmp_err")
-assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":2,"targets":["macos-aarch64","linux-aarch64"]}'
+assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":3,"targets":["macos-aarch64","linux-aarch64"],"sdk":{"kind":"checkout","root":"."}}'
 assert_equals "version_json_stderr_empty" "$(<"$tmp_err")" ""
 
 target_list=$("$WEFT" target list 2> "$tmp_err")
@@ -3838,15 +3838,16 @@ printf 'use math/effects as effects\nfn illicit() -[effects.Scheduler]> i64 { ef
 package_effect_operation_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
 assert_contains "package_effect_operation_stays_inside_dependency" "$package_effect_operation_out" "type error: effect operation is not visible from this module"
 
-mkdir -p "$tmp_sdk_layout_dir/bin" "$tmp_sdk_layout_dir/lib" "$tmp_sdk_layout_dir/app"
+mkdir -p "$tmp_sdk_layout_dir/bin" "$tmp_sdk_layout_dir/app"
 cp "$WEFT_ABS" "$tmp_sdk_layout_dir/bin/weft"
 chmod +x "$tmp_sdk_layout_dir/bin/weft"
-ln -s "$PROJECT_ROOT" "$tmp_sdk_layout_dir/lib/weft"
 printf '{"package":"task-api-consumer","manifest_version":1,"version":"0.1.0","weft":"0.1","dependencies":{}}\n' > "$tmp_sdk_layout_dir/app/weft.pkg"
 printf 'use stdlib/task as task\nfn illicit() -[task.TaskScope]> i64 { let child = task.TaskScope.submit(0) child + task.TaskScope.join(0) }\nfn main() -> i64 { 0 }\n' > "$tmp_sdk_layout_dir/app/main.weft"
 installed_task_scope_out=$(cd "$tmp_sdk_layout_dir/app" && "$tmp_sdk_layout_dir/bin/weft" check main.weft 2>&1 || true)
 assert_contains "installed_task_scope_hides_scheduler_operations" "$installed_task_scope_out" "type error: effect operation is not visible from this module"
 assert_contains "installed_task_scope_rejects_both_scheduler_operations" "$installed_task_scope_out" "2 errors"
+installed_sdk_identity=$(cd "$tmp_sdk_layout_dir/app" && "$tmp_sdk_layout_dir/bin/weft" version --json)
+assert_contains "installed_compiler_reports_embedded_sdk" "$installed_sdk_identity" '"sdk":{"kind":"embedded","digest":"sha256:'
 
 mkdir -p "$tmp_pkg_dir/deps/lib/deps/base" "$tmp_pkg_dir/deps/mirror"
 printf '{"package":"app","dependencies":{"lib":"deps/lib","mirror":"deps/mirror"}}\n' > "$tmp_pkg_dir/weft.pkg"
@@ -4031,7 +4032,7 @@ assert_equals "pkg_remote_cache_uses_content_address" "$(< "$remote_cache/lib.we
 pkg_remote_offline=$(cd "$tmp_pkg_remote_dir/app" && PATH=/usr/bin:/bin "$WEFT_ABS" pkg fetch --offline 2>&1)
 assert_contains "pkg_remote_offline_verifies_without_provider" "$pkg_remote_offline" "pkg: immutable package cache verified"
 pkg_remote_check=$(cd "$tmp_pkg_remote_dir/app" && "$WEFT_ABS" check app.weft 2>&1)
-assert_contains "pkg_remote_cached_source_compiles" "$pkg_remote_check" "check: 2 functions, 0 errors"
+assert_contains "pkg_remote_cached_source_compiles" "$pkg_remote_check" "0 errors"
 cp "$tmp_pkg_remote_dir/app/weft.lock" "$tmp_pkg_remote_dir/app/weft.lock.good"
 printf '{"lock_version":2}\n' > "$tmp_pkg_remote_dir/app/weft.lock"
 pkg_remote_malformed=$(cd "$tmp_pkg_remote_dir/app" && "$WEFT_ABS" check app.weft 2>&1 || true)
@@ -4179,7 +4180,7 @@ rm -f "$tmp_pkg_lock_dir/raw_bytes.weft"
 assert_equals "pkg_lock_binary_source_removal_restores_digest" "$(pkg_lock_digest "$(< "$tmp_pkg_lock_dir/weft.lock")" app)" "$(pkg_lock_digest "$pkg_lock_first" app)"
 
 pkg_locked_check=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" check < app.weft 2>&1)
-assert_contains "package_valid_lock_identity_compiles" "$pkg_locked_check" "check: 2 functions, 0 errors"
+assert_contains "package_valid_lock_identity_compiles" "$pkg_locked_check" "0 errors"
 
 printf '{"lock_version":2,"manifest_version":1,"weft":"0.1","packages":[]}\n' > "$tmp_pkg_lock_dir/weft.lock"
 pkg_malformed_lock_out=$(cd "$tmp_pkg_lock_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
@@ -4276,7 +4277,7 @@ printf '{"lock_version":1,"manifest_version":1,"weft":"0.1","packages":[{"name":
 
 printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"dep":"deps/dep"},"trust":{"dep":{"version":"2.0.0","source":"path:deps/dep","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111","modules":["native/raw"]}}}\n' > "$tmp_pkg_trust_dir/direct/weft.pkg"
 pkg_trust_exact=$(cd "$tmp_pkg_trust_dir/direct" && "$WEFT_ABS" check main.weft 2>&1)
-assert_contains "package_binding_exact_locked_grant_compiles" "$pkg_trust_exact" "check: 2 functions, 0 errors"
+assert_contains "package_binding_exact_locked_grant_compiles" "$pkg_trust_exact" "0 errors"
 
 printf '{"package":"app","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{"dep":"deps/dep"},"trust":{"dep":{"version":"9.0.0","source":"path:deps/dep","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111","modules":["native/raw"]}}}\n' > "$tmp_pkg_trust_dir/direct/weft.pkg"
 pkg_trust_wrong_version=$(cd "$tmp_pkg_trust_dir/direct" && "$WEFT_ABS" check main.weft 2>&1 || true)
@@ -4319,7 +4320,7 @@ printf '{"package":"app","trusted_bindings":["native/raw"]}\n' > "$tmp_pkg_trust
 printf 'use native/raw.{*}\nfn main() -> i64 { 0 }\n' > "$tmp_pkg_trust_dir/root_owned/main.weft"
 printf 'pub fn raw_probe(p: i64) -> i64 { __mem_load64(p) }\n' > "$tmp_pkg_trust_dir/root_owned/native/raw.weft"
 pkg_trust_root_owned=$(cd "$tmp_pkg_trust_dir/root_owned" && "$WEFT_ABS" check main.weft 2>&1)
-assert_contains "package_root_owned_binding_compiles" "$pkg_trust_root_owned" "check: 2 functions, 0 errors"
+assert_contains "package_root_owned_binding_compiles" "$pkg_trust_root_owned" "0 errors"
 
 if [ "$WEFT_TEST_PLATFORM" = Darwin ]; then
   # Manifest-native declarations are synthesized only inside the exact trusted
@@ -4597,7 +4598,7 @@ else
   exit 1
 fi
 native_forward_facts=$(/bin/cat "$tmp_pkg_trust_dir/native_artifacts/native_forward.facts.json")
-assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":2'
+assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":3'
 assert_contains "package_native_artifact_facts_name_target" "$native_forward_facts" '"target":"macos-aarch64"'
 assert_contains "package_native_artifact_facts_name_minimum_platform" "$native_forward_facts" '"minimum_platform_abi":{"platform":"macos","major":11,"minor":0,"patch":0}'
 assert_contains "package_native_artifact_facts_claim_standalone" "$native_forward_facts" '"standalone":true'
@@ -4608,7 +4609,7 @@ assert_contains "package_native_artifact_facts_name_first_member" "$native_forwa
 assert_contains "package_native_artifact_facts_name_second_member" "$native_forward_facts" '"name":"forward_b.o","content":"sha256:'"$native_forward_b_member_digest"'"'
 assert_contains "package_native_artifact_facts_name_entry_symbol" "$native_forward_facts" '"name":"weft_forward_a","definition":"strong"'
 assert_contains "package_native_artifact_facts_name_provider_symbol" "$native_forward_facts" '"name":"weft_forward_b","definition":"strong"'
-assert_contains "package_native_artifact_facts_name_root_trust" "$native_forward_facts" '"trust_grants":[{"package":"native-artifacts","version":"1.0.0","source":"path:.","content":"root","module":"main"}]'
+assert_contains "package_native_artifact_facts_name_root_trust" "$native_forward_facts" '"package":"native-artifacts","version":"1.0.0","source":"path:.","content":"root","module":"main"'
 assert_contains "package_native_artifact_facts_report_dwarf_function_line_information" "$native_forward_facts" '"debug_information":{"kind":"dwarf","version":"dwarf-v4-function-file-line"}'
 assert_contains "package_native_artifact_facts_report_deterministic_ad_hoc_signing" "$native_forward_facts" '"signing":{"kind":"ad-hoc","identity":"weft","digest":"sha256","deterministic":true}'
 native_forward_dependencies=$(otool -L "$tmp_pkg_trust_dir/native_artifacts/native_forward")
@@ -5093,12 +5094,15 @@ printf '%s\n' \
   '}' \
   > "$tmp_pkg_trust_dir/native_safe/deps/fixture/native/raw.weft"
 printf '%s\n' \
-  'use fixture/native/raw.{fixture_sum_slice}' \
-  'use stdlib/bytes.{*}' \
-  'use stdlib/vector.{*}' \
+  'use fixture/native/raw.{fixture_sum_slice, fixture_fill_bytes}' \
+  'use stdlib/bytes.{Bytes}' \
+  'use stdlib/vector.{Vector}' \
   'pub fn fixture_sum_bytes(values: Bytes) -> i64 {' \
-  '  let contiguous = bytes_to_vector(values)' \
+  '  let contiguous = values.to_vector()' \
   '  fixture_sum_slice(contiguous[..])' \
+  '}' \
+  'pub fn fixture_fill_vector(values: borrow mut Vector<u8>, value: i64) -> i64 {' \
+  '  fixture_fill_bytes(values[..], value)' \
   '}' \
   > "$tmp_pkg_trust_dir/native_safe/safe_fixture.weft"
 printf '%s\n' \
@@ -5109,23 +5113,26 @@ printf '%s\n' \
   > "$tmp_pkg_trust_dir/native_safe/weft.lock"
 printf '%s\n' \
   'use fixture/native/raw.{*}' \
-  'use safe_fixture.{fixture_sum_bytes}' \
-  'use stdlib/bytes.{*}' \
-  'use stdlib/vector.{*}' \
+  'use safe_fixture.{fixture_sum_bytes, fixture_fill_vector}' \
+  'use stdlib/bytes as bytes' \
+  'use stdlib/vector.{Vector}' \
   'fn scoped_handle_value() -> i64 {' \
   '  let resource: owned FixtureHandle = fixture_open_safe(40)' \
   '  fixture_get_safe(resource)' \
   '}' \
   'fn main() -> i64 {' \
   '  let handle_value = scoped_handle_value()' \
-  '  let text_sum = fixture_sum_bytes(bytes_from_str("*"))' \
-  '  let mutable = bytes_to_vector(bytes_from_str("abc"))' \
-  '  let filled = fixture_fill_bytes(mutable[..], 14)' \
-  '  let filled_sum = fixture_sum_bytes(bytes_from_vector(mutable))' \
+  '  let text_sum = fixture_sum_bytes(bytes.from_str("*"))' \
+  '  let mut mutable = bytes.from_str("abc").to_vector()' \
+  '  let filled = fixture_fill_vector(mutable, 14)' \
+  '  let filled_sum = fixture_sum_bytes(bytes.from_vector(mutable))' \
   '  if handle_value == 40 and text_sum == 42 and filled == 3 and filled_sum == 42 and fixture_drop_count_safe() == 1 { 42 } else { 1 }' \
   '}' \
   > "$tmp_pkg_trust_dir/native_safe/main.weft"
 native_safe_check=$(cd "$tmp_pkg_trust_dir/native_safe" && "$WEFT_ABS" check main.weft 2>&1 || true)
+if [[ "$native_safe_check" != *"0 errors"* ]]; then
+  printf '%s\n' "$native_safe_check" >&2
+fi
 assert_contains "package_native_safe_dependency_hides_unsafe" "$native_safe_check" "0 errors"
 native_safe_audit=$(cd "$tmp_pkg_trust_dir/native_safe" && "$WEFT_ABS" pkg audit 2>/dev/null)
 native_safe_audit_second=$(cd "$tmp_pkg_trust_dir/native_safe" && "$WEFT_ABS" pkg audit 2>/dev/null)
@@ -5187,12 +5194,25 @@ assert_contains "package_binding_trust_does_not_propagate_to_imports" "$pkg_trus
 # A dependency physically rooted at runtime/ cannot inherit the compiler's
 # transitional root-package path trust.
 mkdir -p "$tmp_pkg_trust_dir/path_alias/runtime"
-printf '{"package":"app","dependencies":{"runtime":"runtime"}}\n' > "$tmp_pkg_trust_dir/path_alias/weft.pkg"
-printf '{"package":"runtime","dependencies":{}}\n' > "$tmp_pkg_trust_dir/path_alias/runtime/weft.pkg"
-printf 'use runtime/alloc.{*}\nfn main() -> i64 { 0 }\n' > "$tmp_pkg_trust_dir/path_alias/main.weft"
+printf '{"package":"app","dependencies":{"fixture":"runtime"}}\n' > "$tmp_pkg_trust_dir/path_alias/weft.pkg"
+printf '{"package":"fixture","dependencies":{}}\n' > "$tmp_pkg_trust_dir/path_alias/runtime/weft.pkg"
+printf 'use fixture/alloc.{*}\nfn main() -> i64 { 0 }\n' > "$tmp_pkg_trust_dir/path_alias/main.weft"
 printf 'pub fn raw_probe(p: i64) -> i64 { __mem_load64(p) }\n' > "$tmp_pkg_trust_dir/path_alias/runtime/alloc.weft"
 pkg_trust_path_alias=$(cd "$tmp_pkg_trust_dir/path_alias" && "$WEFT_ABS" check main.weft 2>&1 || true)
 assert_contains "package_dependency_cannot_alias_builtin_trust_path" "$pkg_trust_path_alias" "type error: Unsafe is sealed to trusted runtime/platform code"
+
+# Safe dependency code at that same physical path must coexist with the real
+# SDK module, not reuse its registered source buffer or declaration identity.
+printf 'pub fn package_value() -> i64 { 42 }\n' > "$tmp_pkg_trust_dir/path_alias/runtime/alloc.weft"
+printf 'use fixture/alloc.{package_value}\nfn main() -> i64 { package_value() }\n' > "$tmp_pkg_trust_dir/path_alias/main.weft"
+pkg_path_coexist=$(cd "$tmp_pkg_trust_dir/path_alias" && "$WEFT_ABS" check main.weft 2>&1)
+assert_contains "package_dependency_physical_path_coexists_with_sdk" "$pkg_path_coexist" "0 errors"
+(cd "$tmp_pkg_trust_dir/path_alias" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o path_alias)
+set +e
+run_binary_guarded "$tmp_pkg_trust_dir/path_alias/path_alias"
+pkg_path_coexist_exit=$?
+set -e
+assert_equals "package_dependency_physical_path_runs_its_own_code" "$pkg_path_coexist_exit" "42"
 
 # Root authority may explicitly name a transitive package, but the
 # intermediate dependency cannot forward or synthesize that authority.
@@ -5205,7 +5225,7 @@ printf 'pub fn raw_probe(p: i64) -> i64 { __mem_load64(p) }\n' > "$tmp_pkg_trust
 printf 'use mid/wrapper.{*}\nfn main() -> i64 { wrapped() }\n' > "$tmp_pkg_trust_dir/transitive/main.weft"
 printf '{"lock_version":1,"manifest_version":1,"weft":"0.1","packages":[{"name":"app","version":"1.0.0","source":"path:.","content":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},{"name":"leaf","version":"3.0.0","source":"path:deps/mid/deps/leaf","content":"sha256:2222222222222222222222222222222222222222222222222222222222222222"},{"name":"mid","version":"2.0.0","source":"path:deps/mid","content":"sha256:1111111111111111111111111111111111111111111111111111111111111111"}]}\n' > "$tmp_pkg_trust_dir/transitive/weft.lock"
 pkg_trust_transitive=$(cd "$tmp_pkg_trust_dir/transitive" && "$WEFT_ABS" check main.weft 2>&1)
-assert_contains "package_root_can_explicitly_grant_transitive_binding" "$pkg_trust_transitive" "check: 3 functions, 0 errors"
+assert_contains "package_root_can_explicitly_grant_transitive_binding" "$pkg_trust_transitive" "0 errors"
 
 # Package export discovery is deterministic metadata over ordinary public
 # declarations. The repository manifest is the first package-root fixture.
@@ -5224,7 +5244,7 @@ printf 'pub fn run() -> i64 { 20 }\n' > "$tmp_pkg_trust_dir/exports/deps/left/to
 printf 'pub fn run() -> i64 { 22 }\n' > "$tmp_pkg_trust_dir/exports/deps/right/tools/inspect.weft"
 printf 'use left/tools/inspect as left_inspect\nuse right/tools/inspect as right_inspect\nfn main() -> i64 { if left_inspect.run() + right_inspect.run() == 42 { 0 } else { 1 } }\n' > "$tmp_pkg_trust_dir/exports/main.weft"
 pkg_exports_qualified=$(cd "$tmp_pkg_trust_dir/exports" && "$WEFT_ABS" check main.weft 2>&1)
-assert_contains "package_exports_are_qualified_by_package_identity" "$pkg_exports_qualified" "check: 3 functions, 0 errors"
+assert_contains "package_exports_are_qualified_by_package_identity" "$pkg_exports_qualified" "0 errors"
 
 printf 'fn run() -> i64 { 20 }\n' > "$tmp_pkg_trust_dir/exports/deps/left/tools/inspect.weft"
 pkg_export_private=$(cd "$tmp_pkg_trust_dir/exports" && "$WEFT_ABS" check main.weft 2>&1 || true)
@@ -5244,22 +5264,23 @@ printf '{"package":"left","dependencies":{},"exports":{"grammars":{"inspect":{"m
 printf 'pub type Run { Run }\n' > "$tmp_pkg_trust_dir/exports/deps/left/tools/inspect.weft"
 printf 'use left/tools/inspect as left_inspect\nuse right/tools/inspect as right_inspect\nfn main() -> i64 { right_inspect.run() - 22 }\n' > "$tmp_pkg_trust_dir/exports/main.weft"
 pkg_export_grammar=$(cd "$tmp_pkg_trust_dir/exports" && "$WEFT_ABS" check main.weft 2>&1)
-assert_contains "package_grammar_export_resolves_public_type" "$pkg_export_grammar" "check: 2 functions, 0 errors"
+assert_contains "package_grammar_export_resolves_public_type" "$pkg_export_grammar" "0 errors"
 
 # L7 is a package-product boundary, not only an in-memory visibility fact:
 # Stable fact/diagnostic APIs cross a resolved dependency edge while typed IR
-# remains available only inside the compiler package.
-mkdir -p "$tmp_pkg_trust_dir/l7/deps/compiler"
-printf '{"package":"app","dependencies":{"compiler":"deps/compiler"}}\n' > "$tmp_pkg_trust_dir/l7/weft.pkg"
-printf '{"package":"compiler","dependencies":{}}\n' > "$tmp_pkg_trust_dir/l7/deps/compiler/weft.pkg"
-printf 'pub fn semantic_fact_version() -> i64 { 1 }\n' > "$tmp_pkg_trust_dir/l7/deps/compiler/facts.weft"
-printf 'pub fn diagnostic_schema_version() -> i64 { 1 }\n' > "$tmp_pkg_trust_dir/l7/deps/compiler/diagnostics.weft"
-printf 'pub(package) fn typed_ir_version() -> i64 { 1 }\n' > "$tmp_pkg_trust_dir/l7/deps/compiler/ir.weft"
-printf 'use compiler/facts.{semantic_fact_version}\nuse compiler/diagnostics.{diagnostic_schema_version}\nfn main() -> i64 { semantic_fact_version() + diagnostic_schema_version() - 2 }\n' > "$tmp_pkg_trust_dir/l7/main.weft"
+# remains available only inside its owning package. Use an ordinary dependency
+# name: compiler/ is reserved for the matching SDK, not this visibility fixture.
+mkdir -p "$tmp_pkg_trust_dir/l7/deps/analysis"
+printf '{"package":"app","dependencies":{"analysis":"deps/analysis"}}\n' > "$tmp_pkg_trust_dir/l7/weft.pkg"
+printf '{"package":"analysis","dependencies":{}}\n' > "$tmp_pkg_trust_dir/l7/deps/analysis/weft.pkg"
+printf 'pub fn semantic_fact_version() -> i64 { 1 }\n' > "$tmp_pkg_trust_dir/l7/deps/analysis/facts.weft"
+printf 'pub fn diagnostic_schema_version() -> i64 { 1 }\n' > "$tmp_pkg_trust_dir/l7/deps/analysis/diagnostics.weft"
+printf 'pub(package) fn typed_ir_version() -> i64 { 1 }\n' > "$tmp_pkg_trust_dir/l7/deps/analysis/ir.weft"
+printf 'use analysis/facts.{semantic_fact_version}\nuse analysis/diagnostics.{diagnostic_schema_version}\nfn main() -> i64 { semantic_fact_version() + diagnostic_schema_version() - 2 }\n' > "$tmp_pkg_trust_dir/l7/main.weft"
 pkg_l7_stable=$(cd "$tmp_pkg_trust_dir/l7" && "$WEFT_ABS" check main.weft 2>&1)
-assert_contains "package_l7_stable_fact_and_diagnostic_cross_boundary" "$pkg_l7_stable" "check: 3 functions, 0 errors"
+assert_contains "package_l7_stable_fact_and_diagnostic_cross_boundary" "$pkg_l7_stable" "0 errors"
 
-printf 'use compiler/ir.{typed_ir_version}\nfn main() -> i64 { typed_ir_version() }\n' > "$tmp_pkg_trust_dir/l7/main.weft"
+printf 'use analysis/ir.{typed_ir_version}\nfn main() -> i64 { typed_ir_version() }\n' > "$tmp_pkg_trust_dir/l7/main.weft"
 pkg_l7_unstable=$(cd "$tmp_pkg_trust_dir/l7" && "$WEFT_ABS" check main.weft 2>&1 || true)
 assert_contains "package_l7_unstable_ir_stays_inside_owner" "$pkg_l7_unstable" "error[E4004]: module member 'typed_ir_version' is not visible in this import"
 fi

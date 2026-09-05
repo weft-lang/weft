@@ -249,14 +249,14 @@ run_bootstrap_phase() {
   tmpw2=$(mktemp /tmp/weft_test_XXXXXX)
   tmpw3=$(mktemp /tmp/weft_test_XXXXXX)
 
-  if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" build compiler/main.weft -o "$tmpw1" > /dev/null 2>&1; then
+  if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" build compiler/main.weft -o "$tmpw1" --embed-sdk . > /dev/null 2>&1; then
     chmod +x "$tmpw1"
   else
     bootstrap_ok=0
     echo "  ✗ bootstrap stage 1 failed"
   fi
   if [ "$bootstrap_ok" -eq 1 ]; then
-    if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$tmpw1" build compiler/main.weft -o "$tmpw2" > /dev/null 2>&1; then
+    if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$tmpw1" build compiler/main.weft -o "$tmpw2" --embed-sdk . > /dev/null 2>&1; then
       chmod +x "$tmpw2"
     else
       bootstrap_ok=0
@@ -264,7 +264,7 @@ run_bootstrap_phase() {
     fi
   fi
   if [ "$bootstrap_ok" -eq 1 ]; then
-    if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$tmpw2" build compiler/main.weft -o "$tmpw3" > /dev/null 2>&1; then
+    if run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$tmpw2" build compiler/main.weft -o "$tmpw3" --embed-sdk . > /dev/null 2>&1; then
       chmod +x "$tmpw3"
     else
       bootstrap_ok=0

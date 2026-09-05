@@ -65,7 +65,8 @@ covered in [Concurrency in Weft](docs/concurrency.md).
 Deterministic generation, shrinking, and replay are introduced in
 [Property testing in Weft](docs/testing.md).
 
-**Prerequisites:** macOS on Apple Silicon. No toolchain — the checked-in binary is the compiler.
+**Prerequisites:** macOS on Apple Silicon. No toolchain or separate SDK — the
+checked-in binary contains the compiler and its matching standard library.
 
 ```bash
 # Compile and run a program (the compiler emits a signed executable)
@@ -126,15 +127,19 @@ reports deterministic old/new native-authority and safe-wrapper facts as
 trusted module set. Acquisition helpers are not linked into Weft products.
 
 `weft version --json` reports the same compiler, language, manifest, lock,
-native-binding ABI, artifact-facts schema, and supported-target identities as
-machine-readable data. These values come from the compatibility facts used by
-the manifest/lock validators and artifact-facts emitter; the banner is not a
+native-binding ABI, artifact-facts schema, supported-target identities, and SDK
+origin as machine-readable data. An installed compiler reports its embedded
+SDK's SHA-256; a compiler invoked from its own development checkout reports
+that checkout explicitly. These values come from the compatibility facts used
+by the manifest/lock validators and artifact-facts emitter; the banner is not a
 separately maintained version string.
 
-Target-specific SDK archives are built without a host linker and include the
-compiler, its `stdlib/` and `runtime/` sources, compatibility facts, provenance,
-licenses, and a checksum. This command produces the byte-reproducible local
-probe used by the repository gate:
+Target-specific release archives are built without a host linker. `bin/weft`
+embeds the complete version-matched SDK—compiler modules, `stdlib/`, `runtime/`,
+the SDK manifest, and both target-native archives—as one deterministic indexed
+payload. The remaining files are audit metadata, notices, licenses, and a
+checksum. This command produces the byte-reproducible local probe used by the
+repository gate:
 
 ```bash
 tools/build_release_bundle.sh macos-aarch64 dist
@@ -144,11 +149,13 @@ export PATH="$PWD/weft-0.1.0-macos-aarch64/bin:$PATH"
 weft --version
 ```
 
-Use `linux-aarch64` and `sha256sum -c` on Linux. Keep the extracted `bin/` and
-`lib/weft/` tree together: the compiler discovers its SDK relative to its own
-executable, with no checkout path or environment override. Removing that one
-directory uninstalls it. The archive bytes and clean install, project, offline
-rebuild, and uninstall flow are tested on both targets.
+Use `linux-aarch64` and `sha256sum -c` on Linux. `bin/weft` is independently
+movable: canonical stdlib/runtime imports and pinned native libraries resolve
+from the binary in any working directory, with no adjacent SDK tree, checkout
+path, or environment override. Removing that binary uninstalls the tool; the
+archive's `share/weft/` files are retained only for external inspection. The
+archive bytes and binary-only clean install, project, offline rebuild, and
+uninstall flow are tested on both targets.
 
 Published artifacts use a separate fail-closed ceremony. Every target carries
 a signed `*.tar.release` manifest binding the archive digest, size, source
