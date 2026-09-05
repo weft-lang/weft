@@ -7882,11 +7882,10 @@ pub(package) fn pipeline_array_literal_leaf_kind(tt: i64, array_ty: i64) -> i64 
 }
 
 -- The flat array cleanup tuple (count, stride, kind) cannot describe managed
--- lanes nested at structural-record field offsets. A one-element carrier is
--- instead an ordinary descriptor-backed aggregate. This is the representation
--- used by generator transport: it preserves every semantic lane while sharing
--- the same retain, release, promotion, and abort-cleanup authority as described
--- records elsewhere in the pipeline.
+-- lanes nested at structural-record field offsets. Describe one element and
+-- carry repetition as a typed layout fact. Arrays and generator transport then
+-- share retain, release, promotion, and abort-cleanup authority with described
+-- records, without expanding metadata for every element.
 pub(package) fn pipeline_structural_array_descriptor_lane_fields(ty: i64, byte_offset: i64, zero_value: i64, lane: i64, tail: IrRecordLayoutFieldList) -> IrRecordLayoutFieldList {
   if lane < 0 { tail }
   else {
@@ -7943,13 +7942,14 @@ pub(package) fn pipeline_structural_array_descriptor_fields(array_ty: i64, zero_
 }
 
 pub(package) fn pipeline_array_literal_uses_structural_descriptor(tt: i64, array_ty: i64, element_count: i64) -> i64 {
-  if not ty_is_array(array_ty) or ty_array_length(array_ty) != 1 or element_count != 1 or not ty_is_record(ty_array_inner(array_ty)) { 0 }
+  if not ty_is_array(array_ty) or ty_array_length(array_ty) != element_count or element_count <= 0 or not ty_is_record(ty_array_inner(array_ty)) { 0 }
+  else { if element_count != 1 and pipeline_type_managed_release_lane_count(ty_array_inner(array_ty)) == 0 { 0 }
   else {
     let byte_size = cg_layout_array_size(tt, array_ty)
-    let align = cg_layout_array_align(tt, array_ty)
+    let stride = cg_layout_array_stride(tt, array_ty)
     let fields = pipeline_structural_array_descriptor_fields(array_ty, 0, tt)
-    pipeline_record_layout_fields_are_valid(byte_size, align, fields)
-  }
+    pipeline_array_layout_is_valid(byte_size, IrArrayLayout(element_count, stride, fields))
+  } }
 }
 
 pub(package) fn pipeline_array_literal_layout_is_valid(tt: i64, array_ty: i64, element_count: i64) -> i64 {
@@ -7997,7 +7997,7 @@ pub(package) fn pipeline_lower_array_literal_storage(array_ty: i64, element_coun
               ir_inst_list_prepend(
                 ir_inst_call_i64(storage, pipeline_rc_array_storage_new_hash(), pipeline_ir_array_storage_new_args(byte_size_value, align_value, leaf_count_value, leaf_stride_value, leaf_kind_value)),
                 ir_inst_list_prepend(
-                  ir_inst_array_storage_describe_i64(storage, byte_size, fields),
+                  ir_inst_array_storage_describe_i64(storage, byte_size, IrArrayLayout(element_count, cg_layout_array_stride(tt, array_ty), fields)),
                   ir_inst_list_prepend(
                     ir_inst_call_i64(data, pipeline_rc_array_storage_data_hash(), ir_value_list_prepend(storage, ir_value_list_empty())),
                     ir_inst_list_empty()
@@ -8046,6 +8046,17 @@ pub(package) fn pipeline_lower_array_literal_storage(array_ty: i64, element_coun
       )
     )
     ir_lowered_expr(storage, data + 1, insts)
+  } }
+}
+
+pub(package) fn pipeline_array_copy_inst_for_type(dst_data: i64, src_data: i64, array_ty: i64, tt: i64) -> IrInst {
+  let size = cg_layout_array_size(tt, array_ty)
+  let count = ty_array_length(array_ty)
+  if pipeline_array_literal_layout_is_valid(tt, array_ty, count) == 0 { IrLoweringFailureI64(2) }
+  else { if pipeline_array_literal_uses_structural_descriptor(tt, array_ty, count) == 1 {
+    IrArrayCopyLayoutI64(dst_data, src_data, size, IrArrayLayout(count, cg_layout_array_stride(tt, array_ty), pipeline_structural_array_descriptor_fields(array_ty, 0, tt)))
+  } else {
+    IrArrayCopyI64(dst_data, src_data, size, cg_layout_array_leaf_count(array_ty), pipeline_array_literal_leaf_stride(tt, array_ty), pipeline_array_literal_leaf_kind(tt, array_ty))
   } }
 }
 
@@ -25427,7 +25438,33 @@ pub(package) fn pipeline_lower_indexed_array_overwrite(value_expr: Expr, element
 pub(package) fn pipeline_lower_indexed_overwrite(value_expr: Expr, element_ty: i64, address: i64, value: i64, next_value: i64, lower_ctx: PipelineHandlerLowerCtx) -> IrLoweredExpr {
   if ty_is_array(element_ty) { pipeline_lower_indexed_array_overwrite(value_expr, element_ty, address, value, next_value, lower_ctx) }
   else { if ty_is_slice(element_ty) { pipeline_lower_indexed_slice_overwrite(address, value, next_value) }
-  else { pipeline_lower_indexed_scalar_overwrite(value_expr, element_ty, address, value, next_value, lower_ctx) } }
+  else { if ty_is_record(element_ty) { pipeline_lower_indexed_structural_overwrite(value_expr, element_ty, address, value, next_value, lower_ctx) }
+  else { pipeline_lower_indexed_scalar_overwrite(value_expr, element_ty, address, value, next_value, lower_ctx) } } }
+}
+
+pub(package) fn pipeline_lower_indexed_structural_overwrite(value_expr: Expr, element_ty: i64, address: i64, value: i64, next_value: i64, lower_ctx: PipelineHandlerLowerCtx) -> IrLoweredExpr {
+  let tt = pipeline_handler_lower_ctx_tt(lower_ctx)
+  let lanes = pipeline_type_value_lane_count_or_one(element_ty)
+  let old = pipeline_lower_indexed_structural_load_value(address, next_value, 0, element_ty, next_value + lanes, tt)
+  if pipeline_lowered_args_is_valid(old) == 0 { ir_lowered_expr_invalid(next_value) }
+  else {
+    -- Acquire the replacement before releasing old leaves: self-assignment
+    -- and shared fields must remain alive throughout the overwrite.
+    let retain = pipeline_managed_retain_inst_list_with_origin(value, element_ty, pipeline_lowered_args_next_value(old), ir_managed_stake_origin_aggregate())
+    let after_retain = pipeline_lowered_args_next_value(old) + ir_inst_list_len(retain)
+    let stored = pipeline_lower_indexed_structural_store_value(address, value, 0, element_ty, after_retain, tt)
+    if pipeline_lowered_args_is_valid(stored) == 0 { ir_lowered_expr_invalid(next_value) }
+    else {
+      let release_old = pipeline_managed_release_inst_list_with_origin(next_value, element_ty, pipeline_lowered_args_next_value(stored), ir_managed_stake_origin_aggregate())
+      let after_old = pipeline_lowered_args_next_value(stored) + ir_inst_list_len(release_old)
+      let borrowed = pipeline_expr_result_is_borrowed_for_ty_typed(value_expr, element_ty, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_fns(lower_ctx), pipeline_handler_lower_ctx_subst(lower_ctx), tt)
+      let release_new = if borrowed == 0 { pipeline_managed_release_inst_list_with_origin(value, element_ty, after_old, ir_managed_stake_origin_aggregate()) } else { ir_inst_list_empty() }
+      let result = after_old + ir_inst_list_len(release_new)
+      let commit = pipeline_managed_aggregate_commit_inst_list(value, element_ty, 0, lanes)
+      let insts = ir_inst_list_append(pipeline_lowered_args_insts(old), ir_inst_list_append(retain, ir_inst_list_append(pipeline_lowered_args_insts(stored), ir_inst_list_append(commit, ir_inst_list_append(release_old, ir_inst_list_append(release_new, ir_inst_list_prepend(ir_inst_const_i64(result, 0), ir_inst_list_empty())))))))
+      ir_lowered_expr(result, result + 1, insts)
+    }
+  }
 }
 
 pub(package) fn pipeline_lower_indexed_set_after_values_typed(base_expr: Expr, index_expr: Expr, value_expr: Expr, fact: i64, base_value: i64, index_value: i64, value: i64, next_value: i64, lower_ctx: PipelineHandlerLowerCtx) -> IrLoweredExpr {
@@ -25451,14 +25488,9 @@ pub(package) fn pipeline_lower_indexed_set_after_values_typed(base_expr: Expr, i
       cursor = ir_lowered_expr_next_value(storage)
       let old_data = cursor
       cursor = cursor + 1
-      let total_size = cg_layout_storage_size(tt, base_ty)
-      let leaf_count = cg_layout_array_leaf_count(base_ty)
-      let leaf_stride = pipeline_array_literal_leaf_stride(tt, base_ty)
-      let leaf_kind = pipeline_array_literal_leaf_kind(tt, base_ty)
-      if pipeline_array_copy_plan_is_valid(total_size, leaf_count, leaf_stride, leaf_kind) == 0 { return ir_lowered_expr_invalid(next_value) }
       let copy = ir_inst_list_prepend(
         ir_inst_call_i64(old_data, pipeline_rc_array_storage_data_hash(), ir_value_list_prepend(base_value, ir_value_list_empty())),
-        ir_inst_list_prepend(ir_inst_array_copy_i64(data, old_data, total_size, leaf_count, leaf_stride, leaf_kind), ir_inst_list_empty())
+        ir_inst_list_prepend(pipeline_array_copy_inst_for_type(data, old_data, base_ty, tt), ir_inst_list_empty())
       )
       prefix = ir_inst_list_append(ir_lowered_expr_insts(storage), copy)
     } else { 0 }
@@ -31030,6 +31062,7 @@ pub(package) fn pipeline_ir_native_f64_gpr_pass_inst(inst: IrInst, f64_slots: i6
     }
     IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> pipeline_ir_native_mark_structural_drop_values(value, parent_plan, gpr_values)
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_native_int_list_add_unique(gpr_values, dst_data) + pipeline_ir_native_int_list_add_unique(gpr_values, src_data)
+    IrArrayCopyLayoutI64(dst_data, src_data, byte_size, layout) -> pipeline_ir_native_int_list_add_unique(gpr_values, dst_data) + pipeline_ir_native_int_list_add_unique(gpr_values, src_data)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_native_int_list_add_unique(gpr_values, data)
     IrVariantInitI64(dst, tag_hash, args, field_mask) -> pipeline_ir_native_mark_value_list(args, gpr_values)
     IrVariantTagI64(dst, value) -> pipeline_ir_native_int_list_add_unique(gpr_values, value)
@@ -38021,6 +38054,43 @@ pub(package) fn pipeline_ir_native_emit_array_leaf_release(code: i64, leaf_kind:
   } else { 0 } } }
 }
 
+pub(package) fn pipeline_ir_native_emit_array_layout_retain_fields(code: i64, fields: IrRecordLayoutFieldList, count: i64, stride: i64, fm: i64) -> i64 {
+  match fields {
+    IrRecordLayoutFieldNil -> 0
+    IrRecordLayoutFieldWord(field_hash, offset, value, kind, rest) -> {
+      if kind != continuation_cleanup_kind_none() {
+        let target = pipeline_ir_native_ensure_array_copy_retain_glue(code, count, stride, kind, fm)
+        emit_load_spill_offset(code, 0, 0)
+        emit_mov_imm_safe(code, 16, offset)
+        bu32(code, encode_add_reg(0, 0, 16))
+        let call = buf_len(code)
+        bu32(code, encode_bl(target - call))
+      } else { 0 }
+      pipeline_ir_native_emit_array_layout_retain_fields(code, rest, count, stride, fm)
+    }
+    IrRecordLayoutFieldArray(field_hash, offset, data, size, count, stride, kind, rest) -> 0
+  }
+}
+
+pub(package) fn pipeline_ir_native_emit_array_copy_layout(code: i64, dst_data: i64, src_data: i64, size: i64, layout: IrArrayLayout, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if pipeline_array_layout_is_valid(size, layout) == 0 {
+    fmap_inc_emit_error_count(fm)
+    bu32(code, encode_brk(30))
+  } else {
+    -- One byte copy, followed by a counted retain run for each managed field.
+    -- Native code and static metadata depend on element shape, not length.
+    pipeline_ir_native_emit_array_copy(code, dst_data, src_data, size, 0, 0, continuation_cleanup_kind_none(), fm, pinned)
+    let dst_phys = pipeline_ir_native_load_reg(code, pinned, dst_data)
+    if dst_phys == 0 { 0 } else { bu32(code, encode_add_imm(0, dst_phys, 0)) }
+    bu32(code, encode_sub_imm(31, 31, 16))
+    emit_store_spill_offset(code, 0, 0)
+    match layout {
+      IrArrayLayout(count, stride, fields) -> pipeline_ir_native_emit_array_layout_retain_fields(code, fields, count, stride, fm)
+    }
+    bu32(code, encode_add_imm(31, 31, 16))
+  }
+}
+
 -- Materialise one plan-specific out-of-line helper in the native code stream.
 -- It takes the array data pointer in x0 and walks leaves in source order. A
 -- branch skips the helper during ordinary fallthrough; both normal ArrayDrop
@@ -38822,11 +38892,56 @@ pub(package) fn pipeline_ir_native_ensure_record_layout_descriptor(code: i64, da
   }
 }
 
-pub(package) fn pipeline_ir_native_emit_array_storage_describe(code: i64, storage: i64, data_size: i64, fields: IrRecordLayoutFieldList, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
-  if pipeline_record_layout_fields_are_valid(data_size, 8, fields) == 0 {
+-- Only word leaves occur in a structural element. Validate their disjoint
+-- offsets inside one stride before repeating them; overlapping bounding spans
+-- of different strided runs do not imply overlapping managed words.
+pub(package) fn pipeline_array_layout_word_fields_are_valid(fields: IrRecordLayoutFieldList, stride: i64, minimum_offset: i64) -> i64 {
+  match fields {
+    IrRecordLayoutFieldNil -> 1
+    IrRecordLayoutFieldWord(field_hash, byte_offset, value, managed_kind, rest) -> {
+      if byte_offset < minimum_offset or byte_offset > stride - 8 or (byte_offset band 7) != 0 or pipeline_record_layout_managed_kind_is_valid(managed_kind) == 0 { 0 }
+      else { pipeline_array_layout_word_fields_are_valid(rest, stride, byte_offset + 8) }
+    }
+    IrRecordLayoutFieldArray(field_hash, byte_offset, data, byte_size, leaf_count, leaf_stride, leaf_kind, rest) -> 0
+  }
+}
+
+pub(package) fn pipeline_array_layout_is_valid(data_size: i64, layout: IrArrayLayout) -> i64 {
+  match layout {
+    IrArrayLayout(count, stride, fields) -> {
+      if count <= 0 or stride <= 0 or (stride band 7) != 0 or data_size <= 0 or data_size > 2147483639 { 0 }
+      else { if cg_layout_checked_mul_nonnegative(count, stride) != data_size { 0 }
+      else { if pipeline_record_layout_descriptor_entry_count(fields) > 4096 { 0 }
+      else { pipeline_array_layout_word_fields_are_valid(fields, stride, 0) } } }
+    }
+  }
+}
+
+pub(package) fn pipeline_array_layout_descriptor_fields(fields: IrRecordLayoutFieldList, count: i64, stride: i64) -> IrRecordLayoutFieldList {
+  match fields {
+    IrRecordLayoutFieldNil -> fields
+    IrRecordLayoutFieldWord(field_hash, byte_offset, value, managed_kind, rest) -> {
+      let tail = pipeline_array_layout_descriptor_fields(rest, count, stride)
+      if managed_kind == continuation_cleanup_kind_none() { tail }
+      else { if count == 1 {
+        ir_record_layout_field_list_prepend_word(field_hash, byte_offset, 0, managed_kind, tail)
+      } else {
+        let extent = (count - 1) * stride + 8
+        ir_record_layout_field_list_prepend_array(field_hash, byte_offset, 0, extent, count, stride, managed_kind, tail)
+      } }
+    }
+    IrRecordLayoutFieldArray(field_hash, byte_offset, data, byte_size, leaf_count, leaf_stride, leaf_kind, rest) -> ir_record_layout_field_list_empty()
+  }
+}
+
+pub(package) fn pipeline_ir_native_emit_array_storage_describe(code: i64, storage: i64, data_size: i64, layout: IrArrayLayout, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
+  if pipeline_array_layout_is_valid(data_size, layout) == 0 {
     fmap_inc_emit_error_count(fm)
     bu32(code, encode_brk(68))
   } else {
+    let fields = match layout {
+      IrArrayLayout(count, stride, element_fields) -> pipeline_array_layout_descriptor_fields(element_fields, count, stride)
+    }
     let descriptor = pipeline_ir_native_ensure_record_layout_descriptor(code, data_size, fields, fm)
     let storage_phys = pipeline_ir_native_load_reg(code, pinned, storage)
     if storage_phys == 14 { 0 } else { bu32(code, encode_add_imm(14, storage_phys, 0)) }
@@ -39915,6 +40030,10 @@ pub(package) fn pipeline_ir_native_emit_inst_dispatch(inst: IrInst, code: i64, s
       pipeline_ir_native_emit_array_copy(code, dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind, fm, pinned)
       ctx
     }
+    IrArrayCopyLayoutI64(dst_data, src_data, byte_size, layout) -> {
+      pipeline_ir_native_emit_array_copy_layout(code, dst_data, src_data, byte_size, layout, fm, pinned)
+      ctx
+    }
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> {
       pipeline_ir_abort_cleanup_emit_disarm_array(code, data, leaf_count, leaf_stride, leaf_kind, fm, pinned)
       pipeline_ir_native_emit_array_drop(code, data, leaf_count, leaf_stride, leaf_kind, fm, pinned)
@@ -40089,6 +40208,7 @@ pub(package) fn pipeline_ir_native_inst_preserves_fp_env(inst: IrInst) -> i64 {
     IrStructuralSlotI64(value, slot, plan, mode) -> if mode == 2 { 0 } else { 1 }
     IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> 0
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> 0
+    IrArrayCopyLayoutI64(dst_data, src_data, byte_size, layout) -> 0
     IrRecordLayoutArrayLoadI64(dst_data, base, record_data_size, byte_offset, byte_size, leaf_count, leaf_stride, leaf_kind) -> 0
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 0
     IrStringConcatI64(dst, left, right) -> 0
@@ -41102,6 +41222,7 @@ pub(package) fn pipeline_ir_native_inst_clobbers_pinned(inst: IrInst) -> i64 {
     IrStructuralDropI64(value, plan) -> 1
     IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> 1
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> 1
+    IrArrayCopyLayoutI64(dst_data, src_data, byte_size, layout) -> 1
     IrRecordLayoutArrayLoadI64(dst_data, base, record_data_size, byte_offset, byte_size, leaf_count, leaf_stride, leaf_kind) -> 1
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 1
     IrHandlerDirectI64(dst, effect_hash, op_hash, handler_depth, clause_index, args) -> 1
@@ -41719,6 +41840,7 @@ pub(package) fn pipeline_ir_native_resident_inst_fp_cs_simple(inst: IrInst, tt: 
       IrStructuralDropI64(value, plan) -> 1
       IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> 1
       IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> 1
+      IrArrayCopyLayoutI64(dst_data, src_data, byte_size, layout) -> 1
       IrRecordLayoutArrayLoadI64(dst_data, base, record_data_size, byte_offset, byte_size, leaf_count, leaf_stride, leaf_kind) -> 1
       IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 1
       IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> 1
@@ -46383,6 +46505,7 @@ pub(package) fn pipeline_ir_rewrite_inst_uses(inst: IrInst, aliases: PipelineIrA
     IrArrayStorageI64(dst, byte_size, align) -> inst
     IrArrayStorageDescribeI64(storage, byte_size, fields) -> IrArrayStorageDescribeI64(pipeline_ir_alias_env_lookup_or(aliases, storage), byte_size, fields)
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> IrArrayCopyI64(pipeline_ir_alias_env_lookup_or(aliases, dst_data), pipeline_ir_alias_env_lookup_or(aliases, src_data), byte_size, leaf_count, leaf_stride, leaf_kind)
+    IrArrayCopyLayoutI64(dst_data, src_data, byte_size, layout) -> IrArrayCopyLayoutI64(pipeline_ir_alias_env_lookup_or(aliases, dst_data), pipeline_ir_alias_env_lookup_or(aliases, src_data), byte_size, layout)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> IrArrayDropI64(pipeline_ir_alias_env_lookup_or(aliases, data), leaf_count, leaf_stride, leaf_kind)
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> IrVariantInitI64(dst, tag_hash, pipeline_ir_rewrite_value_list(payloads, aliases), field_mask)
     IrVariantTagI64(dst, base) -> IrVariantTagI64(dst, pipeline_ir_alias_env_lookup_or(aliases, base))
@@ -46532,6 +46655,7 @@ pub(package) fn pipeline_ir_max_inst_value(inst: IrInst, current: i64) -> i64 {
     IrArrayStorageI64(dst, byte_size, align) -> pipeline_ir_max_i64(current, dst)
     IrArrayStorageDescribeI64(storage, byte_size, fields) -> pipeline_ir_max_i64(current, storage)
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst_data), src_data)
+    IrArrayCopyLayoutI64(dst_data, src_data, byte_size, layout) -> pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst_data), src_data)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_max_i64(current, data)
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> pipeline_ir_max_value_list(payloads, pipeline_ir_max_i64(current, dst))
     IrVariantTagI64(dst, base) -> pipeline_ir_max_i64(pipeline_ir_max_i64(current, dst), base)
@@ -46758,6 +46882,7 @@ pub(package) fn pipeline_ir_live_inst_def(inst: IrInst) -> i64 {
     IrArrayStorageI64(dst, byte_size, align) -> dst
     IrArrayStorageDescribeI64(storage, byte_size, fields) -> 0 - 1
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> 0 - 1
+    IrArrayCopyLayoutI64(dst_data, src_data, byte_size, layout) -> 0 - 1
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 0 - 1
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> dst
     IrVariantTagI64(dst, base) -> dst
@@ -46793,6 +46918,7 @@ pub(package) fn pipeline_ir_live_inst_is_call(inst: IrInst) -> i64 {
     IrStructuralDropI64(value, plan) -> 1
     IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> 1
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_array_drop_plan_is_active(leaf_count, leaf_stride, leaf_kind)
+    IrArrayCopyLayoutI64(dst_data, src_data, byte_size, layout) -> 1
     IrRecordLayoutArrayLoadI64(dst_data, base, record_data_size, byte_offset, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_array_drop_plan_is_active(leaf_count, leaf_stride, leaf_kind)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> 1
     _ -> 0
@@ -46848,6 +46974,7 @@ pub(package) fn pipeline_ir_live_add_inst_uses(set: i64, inst: IrInst, count: i6
     IrArrayStorageI64(dst, byte_size, align) -> count
     IrArrayStorageDescribeI64(storage, byte_size, fields) -> pipeline_ir_live_add(set, storage, count)
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_live_add(set, src_data, pipeline_ir_live_add(set, dst_data, count))
+    IrArrayCopyLayoutI64(dst_data, src_data, byte_size, layout) -> pipeline_ir_live_add(set, src_data, pipeline_ir_live_add(set, dst_data, count))
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_live_add(set, data, count)
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> pipeline_ir_live_add_value_list(set, payloads, count)
     IrVariantTagI64(dst, base) -> pipeline_ir_live_add(set, base, count)
@@ -57259,6 +57386,7 @@ pub(package) fn pipeline_ir_inst_def_or(inst: IrInst, default: i64) -> i64 {
     IrArrayStorageI64(dst, byte_size, align) -> dst
     IrArrayStorageDescribeI64(storage, byte_size, fields) -> default
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> default
+    IrArrayCopyLayoutI64(dst_data, src_data, byte_size, layout) -> default
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> default
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> dst
     IrVariantTagI64(dst, base) -> dst
@@ -57377,6 +57505,7 @@ pub(package) fn pipeline_ir_live_set_add_inst_uses(inst: IrInst, live: PipelineI
     IrArrayStorageI64(dst, byte_size, align) -> live
     IrArrayStorageDescribeI64(storage, byte_size, fields) -> pipeline_ir_live_set_add(live, storage)
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_live_set_add(pipeline_ir_live_set_add(live, dst_data), src_data)
+    IrArrayCopyLayoutI64(dst_data, src_data, byte_size, layout) -> pipeline_ir_live_set_add(pipeline_ir_live_set_add(live, dst_data), src_data)
     IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> pipeline_ir_live_set_add(live, data)
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> pipeline_ir_live_set_add_values(live, payloads)
     IrVariantTagI64(dst, base) -> pipeline_ir_live_set_add(live, base)
@@ -60200,6 +60329,10 @@ pub(package) fn pipeline_mem2reg_mark_inst_uses_dense(inst: IrInst, declared: i6
     IrStructuralDropI64(value, plan) -> pipeline_mem2reg_mark_structural_drop(value, plan, declared, disq, next_value)
     IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> pipeline_mem2reg_mark_structural_drop(value, parent_plan, declared, disq, next_value)
     IrArrayCopyI64(dst_data, src_data, byte_size, leaf_count, leaf_stride, leaf_kind) -> {
+      pipeline_mem2reg_mark_use(dst_data, declared, disq, next_value)
+      pipeline_mem2reg_mark_use(src_data, declared, disq, next_value)
+    }
+    IrArrayCopyLayoutI64(dst_data, src_data, byte_size, layout) -> {
       pipeline_mem2reg_mark_use(dst_data, declared, disq, next_value)
       pipeline_mem2reg_mark_use(src_data, declared, disq, next_value)
     }
