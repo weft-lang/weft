@@ -38,6 +38,8 @@ bootstrap:
     fi
 
 # Deliberate trust-root refresh: run the gate, then install weft2 as ./weft.
+# SDK source changes also need this refresh before the binary is distributed.
+# Keep the binary/snapshot refresh separate from stdlib source/API commits.
 # rm-first (never overwrite in place) for the macOS signature cache.
 update-root: bootstrap
     #!/usr/bin/env bash

@@ -185,7 +185,11 @@ The version report includes the compiler and language versions plus the
 manifest, lock, native-binding ABI, artifact-facts schema, and SDK identity. An
 installed compiler names the SHA-256 of the embedded SDK it will use; when
 invoked from its own development checkout it names that checkout, so editing the
-stdlib remains an immediate compiler-development loop. `target show` reports
+stdlib remains an immediate compiler-development loop. Before distributing a
+compiler after SDK source changes, run `just update-root` to rebuild and verify
+the embedded snapshot. Keep that binary refresh separate from the source/API
+commit. A copied binary always uses its own snapshot, not subsequent edits to
+the checkout. `target show` reports
 the binary format, minimum platform ABI, default standalone contract, and
 whether the selected target is the current host. Unknown target aliases fail
 rather than silently selecting a nearby target.
