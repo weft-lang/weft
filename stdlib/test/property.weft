@@ -1,0 +1,448 @@
+-- stdlib/test/property.weft -- deterministic property campaigns
+
+use stdlib/diagnostic/registry
+use stdlib/diagnostic/schema.{Diagnostic, DiagnosticClassTest, DiagnosticFieldCons, DiagnosticFieldList, DiagnosticFieldNil, DiagnosticFieldText, DiagnosticFieldU64, DiagnosticLocationNone, DiagnosticRelatedLocationNil, DiagnosticSeverityError}
+use stdlib/num
+use stdlib/option.{None, Some}
+use stdlib/random.{Algorithm, Seed}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/test.{Test}
+use stdlib/test/property/protocol.{ChoiceLog, DrawContractFailure, Gen, Limits, Sampled, SampleExhausted, SampleHandlerContractViolated, choice_log_remove_range, choice_log_set_selected, sample}
+use stdlib/test/property/random as random_handler
+use stdlib/test/property/replay as replay_handler
+
+pub use stdlib/test/property/protocol.{AlternativeError, Arbitrary, BoundError, Choice, ChoiceBound, ChoiceLog, Draw, DrawContractFailure, EmptyChoiceDomain, EmptyRange, Gen, Limits, NoAlternatives, RangeError, SampleResult, ChoiceOutOfRange, Sampled, SampleExhausted, SampleHandlerContractViolated, bind, boolean, constant, filter_map, gen, i64_range, limits, map, one_of, option, pair, resize, result, sample, sized, usize_below, usize_range}
+
+--- Invalid deterministic campaign configuration.
+pub type ConfigError {
+  --- A campaign must execute at least one case.
+  ZeroCases
+}
+
+--- A validated deterministic campaign configuration.
+pub type Config = opaque ConfigData
+
+type ConfigData {
+  seed: Seed,
+  cases: usize,
+  limits: Limits,
+  shrinks: usize
+}
+
+--- Summary of a campaign which checked every configured case.
+pub type CampaignSummary = opaque CampaignSummaryData
+
+type CampaignSummaryData {
+  seed: Seed,
+  cases: usize
+}
+
+--- A minimal reproducible description of a falsifying execution.
+pub type Counterexample = opaque CounterexampleData
+
+type CounterexampleData {
+  seed: Seed,
+  algorithm: Algorithm,
+  limits: Limits,
+  choices: ChoiceLog,
+  case_index: usize,
+  shrink_count: usize
+}
+
+--- A bounded generator could not produce another specimen.
+pub type GenerationFailure {
+  --- Constrained generation reached the configured discard limit.
+  DiscardLimitReached(usize)
+}
+
+--- The exhaustive outcome of a deterministic property campaign.
+pub type CheckResult {
+  --- Every configured case satisfied the property.
+  Passed(CampaignSummary),
+  --- A generated case falsified the property.
+  Falsified(Counterexample),
+  --- Bounded constrained generation exhausted its budget.
+  GenerationExhausted(GenerationFailure),
+  --- A `Draw` interpreter returned a value outside its promised domain.
+  HandlerContractViolated(DrawContractFailure)
+}
+
+fn campaign_passed(seed: Seed, cases: usize) -> CheckResult {
+  Passed(CampaignSummary(CampaignSummaryData { seed: seed, cases: cases }))
+}
+
+type ShrinkResult {
+  ShrinkResult(ChoiceLog, usize)
+}
+
+fn campaign_falsified(
+  seed: Seed,
+  algorithm: Algorithm,
+  limits: Limits,
+  choices: ChoiceLog,
+  case_index: usize,
+  shrink_count: usize
+) -> CheckResult {
+  Falsified(Counterexample(CounterexampleData {
+    seed: seed,
+    algorithm: algorithm,
+    limits: limits,
+    choices: choices,
+    case_index: case_index,
+    shrink_count: shrink_count
+  }))
+}
+
+fn replay_falsifies<T, E>(
+  generator: Gen<T>,
+  limits: Limits,
+  choices: ChoiceLog,
+  property: (T) -[E]> bool
+) -[E]> bool {
+  match replay_handler.run<T>(generator, limits, choices) {
+    Ok(value) -> not property(value)
+    Err(_) -> false
+  }
+}
+
+fn shrink_deletions<T, E>(
+  generator: Gen<T>,
+  limits: Limits,
+  initial: ChoiceLog,
+  budget: usize,
+  property: (T) -[E]> bool
+) -[E]> ShrinkResult {
+  let one: usize = 1
+  let mut current = initial
+  let mut attempts: usize = 0
+  let mut chunk = current.len() / 2
+  if chunk == 0 and current.len() > 0 { chunk = one } else { nil }
+  while chunk > 0 and attempts < budget {
+    let mut start: usize = 0
+    let mut accepted = false
+    while start < current.len() and attempts < budget and not accepted {
+      let remaining = current.len() - start
+      let count = if chunk < remaining { chunk } else { remaining }
+      let candidate = choice_log_remove_range(current, start, count)
+      attempts = attempts + one
+      if replay_falsifies<T, E>(generator, limits, candidate, property) {
+        current = candidate
+        accepted = true
+      } else {
+        start = start + count
+      }
+    }
+    if accepted {
+      if current.len() == 0 {
+        chunk = 0
+      } else { if chunk > current.len() {
+        chunk = current.len()
+      } else { nil } }
+    } else { if chunk == one {
+      chunk = 0
+    } else {
+      chunk = (chunk + one) / 2
+    } }
+  }
+  ShrinkResult(current, attempts)
+}
+
+fn shrink_values<T, E>(
+  generator: Gen<T>,
+  limits: Limits,
+  initial: ChoiceLog,
+  initial_attempts: usize,
+  budget: usize,
+  property: (T) -[E]> bool
+) -[E]> ShrinkResult {
+  let zero: usize = 0
+  let one: usize = 1
+  let mut current = initial
+  let mut attempts = initial_attempts
+  let mut changed = true
+  while changed and attempts < budget {
+    changed = false
+    let mut index: usize = 0
+    while index < current.len() and attempts < budget {
+      let selected = match current.get(index) {
+        Some(choice) -> choice.selected()
+        None -> zero
+      }
+      let mut candidate_value = zero
+      let mut accepted = false
+      while candidate_value < selected and attempts < budget and not accepted {
+        match choice_log_set_selected(current, index, candidate_value) {
+          Some(candidate) -> {
+            attempts = attempts + one
+            if replay_falsifies<T, E>(generator, limits, candidate, property) {
+              current = candidate
+              accepted = true
+              changed = true
+            } else { nil }
+          }
+          None -> nil
+        }
+        candidate_value = candidate_value + one
+      }
+      index = index + one
+    }
+  }
+  ShrinkResult(current, attempts)
+}
+
+fn shrink<T, E>(
+  generator: Gen<T>,
+  limits: Limits,
+  initial: ChoiceLog,
+  budget: usize,
+  property: (T) -[E]> bool
+) -[E]> ShrinkResult {
+  match shrink_deletions<T, E>(generator, limits, initial, budget, property) {
+    ShrinkResult(after_deletions, attempts) ->
+      shrink_values<T, E>(generator, limits, after_deletions, attempts, budget, property)
+  }
+}
+
+--- Validate explicit campaign budgets.
+pub fn config(
+  seed: Seed,
+  cases: usize,
+  size: usize,
+  discards: usize,
+  shrinks: usize
+) -> Result<Config, ConfigError> {
+  if cases == 0 {
+    Err<Config, ConfigError>(ZeroCases)
+  } else {
+    Ok<Config, ConfigError>(Config(ConfigData {
+      seed: seed,
+      cases: cases,
+      limits: limits(size, discards),
+      shrinks: shrinks
+    }))
+  }
+}
+
+--- Construct the ordinary fast deterministic campaign configuration.
+pub fn smoke(seed: Seed) -> Config {
+  Config(ConfigData { seed: seed, cases: 100, limits: limits(100, 1000), shrinks: 1000 })
+}
+
+--- Run a deterministic random campaign without performing `Test`.
+--- Unrelated effects performed by `property` remain explicit and unhandled.
+pub fn run<T, E>(
+  config: Config,
+  generator: Gen<T>,
+  property: (T) -[E]> bool
+) -[E]> CheckResult {
+  let cases = config.cases()
+  let seed = config.seed()
+  let generation_limits = config.limits()
+  let session = random_handler.session(seed)
+  let zero: usize = 0
+  for case_index in zero..cases {
+    random_handler.begin_case(session)
+    let generated = with random_handler(session) { sample<T>(generator, generation_limits) }
+    match generated {
+      SampleHandlerContractViolated(failure) -> return HandlerContractViolated(failure)
+      SampleExhausted(attempts) -> return GenerationExhausted(DiscardLimitReached(attempts))
+      Sampled(value) -> if not property(value) {
+          let initial = random_handler.choices(session)
+          match shrink<T, E>(generator, generation_limits, initial, config.shrinks(), property) {
+            ShrinkResult(final_choices, shrink_count) -> return campaign_falsified(
+              seed,
+              random_handler.algorithm(session),
+              generation_limits,
+              final_choices,
+              case_index,
+              shrink_count
+            )
+          }
+        } else { nil }
+    }
+  }
+  campaign_passed(seed, cases)
+}
+
+fn counterexample_choice_fields(choices: ChoiceLog, index: usize) -> DiagnosticFieldList {
+  match choices.get(index) {
+    None -> DiagnosticFieldNil
+    Some(choice) -> DiagnosticFieldCons(
+      DiagnosticFieldU64("choice_ordinal", index.to_u64()),
+      DiagnosticFieldCons(
+        DiagnosticFieldU64("choice_bound", choice.bound().exclusive_upper().to_u64()),
+        DiagnosticFieldCons(
+          DiagnosticFieldU64("chosen_value", choice.selected().to_u64()),
+          counterexample_choice_fields(choices, index + 1)
+        )
+      )
+    )
+  }
+}
+
+fn counterexample_fields(counterexample: Counterexample) -> DiagnosticFieldList {
+  DiagnosticFieldCons(
+    DiagnosticFieldU64("seed", counterexample.seed().value()),
+    DiagnosticFieldCons(
+      DiagnosticFieldText("algorithm", counterexample.algorithm().name()),
+      DiagnosticFieldCons(
+        DiagnosticFieldU64("size", counterexample.limits().size().to_u64()),
+        DiagnosticFieldCons(
+          DiagnosticFieldU64("discard_limit", counterexample.limits().discards().to_u64()),
+          DiagnosticFieldCons(
+            DiagnosticFieldU64("case_index", counterexample.case_index().to_u64()),
+            DiagnosticFieldCons(
+              DiagnosticFieldU64("executed_cases", counterexample.executed_cases().to_u64()),
+              DiagnosticFieldCons(
+                DiagnosticFieldU64("shrink_attempts", counterexample.shrink_count().to_u64()),
+                DiagnosticFieldCons(
+                  DiagnosticFieldU64("choice_count", counterexample.choices().len().to_u64()),
+                  counterexample_choice_fields(counterexample.choices(), 0)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+}
+
+fn falsified_diagnostic(counterexample: Counterexample) -> Diagnostic {
+  Diagnostic(
+    DiagnosticSeverityError,
+    DiagnosticClassTest,
+    registry.property_falsified(),
+    "property falsified",
+    DiagnosticLocationNone,
+    DiagnosticRelatedLocationNil,
+    counterexample_fields(counterexample)
+  )
+}
+
+fn exhausted_diagnostic(failure: GenerationFailure) -> Diagnostic {
+  match failure {
+    DiscardLimitReached(attempts) -> Diagnostic(
+      DiagnosticSeverityError,
+      DiagnosticClassTest,
+      registry.property_generation_exhausted(),
+      "property generation exhausted its discard budget",
+      DiagnosticLocationNone,
+      DiagnosticRelatedLocationNil,
+      DiagnosticFieldCons(DiagnosticFieldU64("discard_attempts", attempts.to_u64()), DiagnosticFieldNil)
+    )
+  }
+}
+
+fn handler_contract_diagnostic(failure: DrawContractFailure) -> Diagnostic {
+  match failure {
+    ChoiceOutOfRange(selected, bound) -> Diagnostic(
+      DiagnosticSeverityError,
+      DiagnosticClassTest,
+      registry.property_draw_contract(),
+      "Draw handler returned a choice outside its promised domain",
+      DiagnosticLocationNone,
+      DiagnosticRelatedLocationNil,
+      DiagnosticFieldCons(
+        DiagnosticFieldU64("chosen_value", selected.to_u64()),
+        DiagnosticFieldCons(DiagnosticFieldU64("choice_bound", bound.exclusive_upper().to_u64()), DiagnosticFieldNil)
+      )
+    )
+  }
+}
+
+--- Run a deterministic campaign and report any final failure through `Test`.
+--- Unrelated effects performed by `property` remain explicit and unhandled.
+pub fn check<T, E>(
+  config: Config,
+  generator: Gen<T>,
+  property: (T) -[E]> bool
+) -[Test, E]> nil {
+  match run<T, E>(config, generator, property) {
+    Passed(summary) -> nil
+    Falsified(counterexample) -> { Test.report(falsified_diagnostic(counterexample)) nil }
+    GenerationExhausted(failure) -> { Test.report(exhausted_diagnostic(failure)) nil }
+    HandlerContractViolated(failure) -> { Test.report(handler_contract_diagnostic(failure)) nil }
+  }
+}
+
+impl Config {
+  --- Return the exact seed recorded for replay.
+  pub fn seed(self) -> Seed {
+    match self { Config(data) -> data.seed }
+  }
+
+  --- Return the number of cases to execute.
+  pub fn cases(self) -> usize {
+    match self { Config(data) -> data.cases }
+  }
+
+  --- Return the structural generator size budget.
+  pub fn size(self) -> usize {
+    self.limits().size()
+  }
+
+  --- Return the maximum number of discarded attempts.
+  pub fn discards(self) -> usize {
+    self.limits().discards()
+  }
+
+  --- Return the exact structural limits used by each generated case.
+  pub fn limits(self) -> Limits {
+    match self { Config(data) -> data.limits }
+  }
+
+  --- Return the maximum number of shrink attempts.
+  pub fn shrinks(self) -> usize {
+    match self { Config(data) -> data.shrinks }
+  }
+}
+
+impl CampaignSummary {
+  --- Return the campaign seed.
+  pub fn seed(self) -> Seed {
+    match self { CampaignSummary(data) -> data.seed }
+  }
+
+  --- Return the number of checked cases.
+  pub fn cases(self) -> usize {
+    match self { CampaignSummary(data) -> data.cases }
+  }
+}
+
+impl Counterexample {
+  --- Return the campaign seed.
+  pub fn seed(self) -> Seed {
+    match self { Counterexample(data) -> data.seed }
+  }
+
+  --- Return the deterministic random algorithm used for discovery.
+  pub fn algorithm(self) -> Algorithm {
+    match self { Counterexample(data) -> data.algorithm }
+  }
+
+  --- Return the structural limits required for exact replay.
+  pub fn limits(self) -> Limits {
+    match self { Counterexample(data) -> data.limits }
+  }
+
+  --- Return the exact choice program for replay.
+  pub fn choices(self) -> ChoiceLog {
+    match self { Counterexample(data) -> data.choices }
+  }
+
+  --- Return the zero-based case which falsified the property.
+  pub fn case_index(self) -> usize {
+    match self { Counterexample(data) -> data.case_index }
+  }
+
+  --- Return the number of campaign cases executed through this failure.
+  pub fn executed_cases(self) -> usize {
+    match self { Counterexample(data) -> data.case_index + 1 }
+  }
+
+  --- Return the number of completed shrink attempts.
+  pub fn shrink_count(self) -> usize {
+    match self { Counterexample(data) -> data.shrink_count }
+  }
+}

@@ -1,0 +1,89 @@
+# Property testing in Weft
+
+Weft property tests are ordinary typed computations interpreted through one
+bounded-choice effect. A fixed seed finds failures reproducibly; an exact
+choice log replays them independently of the random algorithm; shrinking
+re-executes the same generator and property without cloning the generated
+value or using multi-shot continuations.
+
+The API lives under `stdlib/test/property`. Deterministic pseudo-random values
+live separately in `stdlib/random`; they are not cryptographic randomness and
+do not introduce process-global state.
+
+```weft
+use stdlib/random as random
+use stdlib/result.{*}
+use stdlib/test/property as prop
+
+fn in_range(value: usize) -> bool {
+  value < 1000
+}
+
+test "generated identifiers stay in range" {
+  let configured = prop.config(random.seed(42), 100, 16, 1000, 1000)
+  let config = configured.expect("a property campaign needs at least one case")
+  let identifiers = prop.usize_below(1000).expect("the identifier domain is nonempty")
+
+  prop.check(config, identifiers, in_range)
+}
+```
+
+`config` makes every campaign budget explicit: cases, structural size,
+discarded specimens, and shrinking. `prop.check` reports a structured `Test`
+diagnostic. `prop.run` returns the exhaustive `Passed`, `Falsified`,
+`GenerationExhausted`, or `HandlerContractViolated` variants for a custom
+runner.
+
+## Exact replay
+
+A counterexample carries the size and discard limits as well as its minimized
+choice program. Replay therefore does not depend on whatever pseudo-random
+algorithm a later release uses.
+
+```weft
+use stdlib/test/property/replay as replay
+
+let replayed = replay.run(
+  generator,
+  counterexample.limits(),
+  counterexample.choices()
+)
+```
+
+Replay checks the complete program. It distinguishes an exhausted choice log,
+a changed bound, unused choices, discard exhaustion, and a generator contract
+violation rather than silently adjusting stale data.
+
+## Refinement without hidden copying
+
+The bounded refinement primitive is `filter_map`, not an unbounded `filter`.
+Its callback consumes one generated value and returns `Some` with the accepted
+value or `None` to discard it. This shape is safe for linearly owned values and
+can change the result type while narrowing:
+
+```weft
+use stdlib/option.{None, Option, Some}
+
+fn even_half(value: usize) -> Option<usize> {
+  if value % 2 == 0 {
+    Some<usize>(value / 2)
+  } else {
+    None<usize>()
+  }
+}
+
+let source = prop.usize_below(100).expect("nonempty domain")
+let even_halves = prop.filter_map(source, 20, even_half)
+```
+
+Both the local attempt count and the campaign discard limit are hard bounds.
+There is deliberately no generator operation which may retry forever.
+
+## Alternate interpretations
+
+`prop.sample(generator, limits) -[Draw]> SampleResult<T>` leaves the `Draw`
+effect explicit. The standard random and replay modules interpret the same
+generator semantics; custom deterministic handlers can enumerate or inject
+choices without gaining access to `Gen<T>`'s closure representation or the
+mutable campaign worklists. Every returned choice is checked against its
+opaque nonempty `ChoiceBound` before it can select a value.

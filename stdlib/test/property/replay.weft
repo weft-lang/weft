@@ -1,0 +1,125 @@
+-- stdlib/test/property/replay.weft -- exact ChoiceLog interpretation
+
+use stdlib/option.{None, Option, Some}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/test/property/protocol.{ChoiceBound, ChoiceLog, Draw, DrawContractFailure, Gen, Limits, Sampled, SampleExhausted, SampleHandlerContractViolated, sample}
+use stdlib/vector as vector
+use stdlib/vector.{vector_get_in_bounds, vector_push, vector_set}
+use stdlib/vector/handles.{Vector}
+
+--- The exact reason a recorded choice program could not be replayed.
+pub type Failure {
+  --- The generator requested another choice after the log ended.
+  ChoiceProgramExhausted(usize, ChoiceBound),
+  --- The generator requested a different domain at this choice position.
+  ChoiceBoundChanged(usize, ChoiceBound, ChoiceBound),
+  --- The generator completed without consuming the remaining choices.
+  UnusedChoices(usize),
+  --- The replayed generator rejected every value within its finite budget.
+  DiscardLimitReached(usize),
+  --- The generator itself observed an invalid `Draw` result.
+  GeneratorContractViolated(DrawContractFailure)
+}
+
+type ReplayState {
+  ReplayReady,
+  ReplayInvalid(Failure)
+}
+
+type ReplayCursor {
+  ReplayCursor(ChoiceLog, usize, ReplayState)
+}
+
+-- Mutable handler-local cursor for one exact replay.
+type ReplaySession = opaque Vector<ReplayCursor>
+
+fn session_slot(session: ReplaySession) -> Vector<ReplayCursor> {
+  match session { ReplaySession(slot) -> slot }
+}
+
+fn session_value(session: ReplaySession) -> ReplayCursor {
+  let slot = session_slot(session)
+  vector_get_in_bounds<ReplayCursor>(slot, 0)
+}
+
+fn session_set(session: ReplaySession, value: ReplayCursor) -> nil {
+  let slot = session_slot(session)
+  vector_set<ReplayCursor>(slot, 0, value)
+  nil
+}
+
+fn session(choices: ChoiceLog) -> ReplaySession {
+  let slot = vector.with_capacity<ReplayCursor>(1)
+  vector_push<ReplayCursor>(slot, ReplayCursor(choices, 0, ReplayReady))
+  ReplaySession(slot)
+}
+
+fn session_failure(session: ReplaySession) -> Option<Failure> {
+  match session_value(session) {
+    ReplayCursor(_, _, status) -> match status {
+      ReplayReady -> None<Failure>()
+      ReplayInvalid(failure) -> Some<Failure>(failure)
+    }
+  }
+}
+
+fn session_remaining(session: ReplaySession) -> usize {
+  match session_value(session) {
+    ReplayCursor(choices, index, _) -> choices.len() - index
+  }
+}
+
+fn choose(session: ReplaySession, requested: ChoiceBound) -> usize {
+  match session_value(session) {
+    ReplayCursor(choices, index, status) -> match status {
+      ReplayInvalid(failure) -> requested.exclusive_upper()
+      ReplayReady -> match choices.get(index) {
+        None -> {
+          session_set(session, ReplayCursor(
+            choices,
+            index,
+            ReplayInvalid(ChoiceProgramExhausted(index, requested))
+          ))
+          requested.exclusive_upper()
+        }
+        Some(choice) -> if choice.bound().exclusive_upper() != requested.exclusive_upper() {
+          session_set(session, ReplayCursor(
+            choices,
+            index,
+            ReplayInvalid(ChoiceBoundChanged(index, choice.bound(), requested))
+          ))
+          requested.exclusive_upper()
+        } else {
+          session_set(session, ReplayCursor(choices, index + 1, ReplayReady))
+          choice.selected()
+        }
+      }
+    }
+  }
+}
+
+--- Regenerate one value from an exact choice program.
+---
+--- Replay is independent of the random algorithm. The complete log must be
+--- consumed and every recorded domain must equal the generator's request.
+pub fn run<T>(generator: Gen<T>, limits: Limits, choices: ChoiceLog) -> Result<T, Failure> {
+  let active = session(choices)
+  let generated = handle sample<T>(generator, limits) {
+      Draw.choose(requested) -> resume(choose(active, requested))
+  }
+  match session_failure(active) {
+    Some(failure) -> Err<T, Failure>(failure)
+    None -> match generated {
+      SampleHandlerContractViolated(failure) -> Err<T, Failure>(GeneratorContractViolated(failure))
+      SampleExhausted(attempts) -> Err<T, Failure>(DiscardLimitReached(attempts))
+      Sampled(value) -> {
+          let remaining = session_remaining(active)
+          if remaining == 0 {
+            Ok<T, Failure>(value)
+          } else {
+            Err<T, Failure>(UnusedChoices(remaining))
+          }
+      }
+    }
+  }
+}

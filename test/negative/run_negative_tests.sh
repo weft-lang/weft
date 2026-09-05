@@ -113,6 +113,16 @@ check_rejects "random_seed_constructor_private" "test/negative/random_seed_const
 check_rejects "random_state_constructor_private" "test/negative/random_state_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "random_bound_constructor_private" "test/negative/random_bound_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "random_next_below_requires_bound" "test/negative/random_next_below_requires_bound.weft" 'error[E1002]: argument type mismatch: expected `Bound`, found `usize`'
+check_rejects "property_choice_bound_constructor_private" "test/negative/property_choice_bound_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "property_choice_constructor_private" "test/negative/property_choice_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "property_choice_log_constructor_private" "test/negative/property_choice_log_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "property_gen_constructor_private" "test/negative/property_gen_constructor_private.weft" "error[E1001]: unknown function 'Gen'"
+check_rejects "property_limits_constructor_private" "test/negative/property_limits_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "property_config_constructor_private" "test/negative/property_config_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "property_counterexample_constructor_private" "test/negative/property_counterexample_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "property_campaign_summary_constructor_private" "test/negative/property_campaign_summary_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "property_random_session_constructor_private" "test/negative/property_random_session_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "property_generation_mechanics_private" "test/negative/property_generation_mechanics_private.weft" "module member 'Generation' is not visible in this import" 1
 check_rejects "tls_client_open_requires_authority" "test/negative/tls_client_open_requires_authority.weft" 'error[E2001]: effects `SecureRandom, WallClock` are not available in this context'
 check_rejects "tls_server_open_requires_authority" "test/negative/tls_server_open_requires_authority.weft" 'error[E2001]: effect `SecureRandom` is not available in this context'
 check_rejects "http_client_cannot_listen" "test/negative/http_client_cannot_listen.weft" 'error[E2001]: effect `HttpServer` is not available in this context'

@@ -57,7 +57,7 @@ if [ -z "${WEFT_TOOL_SHARD:-}" ]; then
   tool_elapsed=$(($(date +%s) - tool_started))
   echo "Tool boundary timing: ${tool_elapsed}s wall, ${tool_jobs} shard jobs"
   if [ "${WEFT_TEST_PLATFORM:-$(uname -s)}" = Darwin ]; then
-    echo "Tool boundary summary: 1150 passed, 0 failed"
+    echo "Tool boundary summary: 1192 passed, 0 failed"
   else
     echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
   fi
@@ -659,6 +659,8 @@ stdlib_doc_modules=(
   stdlib/time/sleep.weft stdlib/time/calendar.weft stdlib/env.weft
   stdlib/process.weft
   stdlib/json.weft stdlib/random.weft
+  stdlib/test/property.weft stdlib/test/property/protocol.weft
+  stdlib/test/property/random.weft stdlib/test/property/replay.weft
   stdlib/secure_random.weft stdlib/secure_random/deterministic.weft
   stdlib/net_address.weft stdlib/idna.weft
   stdlib/dns.weft stdlib/dns/fake.weft stdlib/dns/policy.weft
@@ -753,10 +755,31 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_iter_pins_owned_iterator" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
     assert_contains "doc_stdlib_iter_pins_source_normalization" "$(<"$tmp_out")" "fn map<S: IntoIterator, U>(input: S, f: (S.Item) -> U)"
   elif [ "$stdlib_doc_name" = "test" ]; then
-    assert_contains "doc_stdlib_test_pins_public_surface" "$(<"$tmp_out")" "Public API items: 38. Documented: 38."
+    assert_contains "doc_stdlib_test_pins_public_surface" "$(<"$tmp_out")" "Public API items: 39. Documented: 39."
+    assert_contains "doc_stdlib_test_pins_structured_report" "$(<"$tmp_out")" "fn report(diagnostic: Diagnostic) -> i64"
     assert_contains "doc_stdlib_test_pins_unsigned_equality" "$(<"$tmp_out")" "fn assert_eq_usize(got: usize, expected: usize) -> i64"
+  elif [ "$stdlib_doc_name" = "test/property" ]; then
+    assert_contains "doc_stdlib_test_property_pins_public_surface" "$(<"$tmp_out")" "Public API items: 76. Documented: 76."
+    assert_contains "doc_stdlib_test_property_pins_opaque_generator" "$(<"$tmp_out")" "pub type Gen<T> = opaque"
+    assert_contains "doc_stdlib_test_property_pins_choice_effect" "$(<"$tmp_out")" "pub effect Draw"
+    assert_contains "doc_stdlib_test_property_pins_replay_limits" "$(<"$tmp_out")" "pub type Limits = opaque"
+    assert_contains "doc_stdlib_test_property_pins_linear_refinement" "$(<"$tmp_out")" "pub fn filter_map<T, U>(generator: Gen<T>, max_attempts: usize, select: (T) -> Option<U>) -> Gen<U>"
+    assert_contains "doc_stdlib_test_property_pins_custom_interpretation" "$(<"$tmp_out")" 'pub fn sample<T>(generator: Gen<T>, limits: Limits) -[Draw]> SampleResult<T>'
+    assert_contains "doc_stdlib_test_property_preserves_runner_effect" "$(<"$tmp_out")" 'pub fn run<T, E>(config: Config, generator: Gen<T>, property: (T) -[E]> bool) -[E]> CheckResult'
+    assert_contains "doc_stdlib_test_property_preserves_adapter_effect" "$(<"$tmp_out")" 'pub fn check<T, E>(config: Config, generator: Gen<T>, property: (T) -[E]> bool) -[Test, E]> nil'
+  elif [ "$stdlib_doc_name" = "test/property/protocol" ]; then
+    assert_contains "doc_stdlib_test_property_protocol_pins_public_surface" "$(<"$tmp_out")" "Public API items: 45. Documented: 45."
+    assert_contains "doc_stdlib_test_property_protocol_pins_choice_bound" "$(<"$tmp_out")" "pub type ChoiceBound = opaque"
+    assert_contains "doc_stdlib_test_property_protocol_pins_choice_log" "$(<"$tmp_out")" "pub type ChoiceLog = opaque"
+  elif [ "$stdlib_doc_name" = "test/property/random" ]; then
+    assert_contains "doc_stdlib_test_property_random_pins_public_surface" "$(<"$tmp_out")" "Public API items: 4. Documented: 4."
+    assert_contains "doc_stdlib_test_property_random_hides_mutable_state" "$(<"$tmp_out")" "pub type Session = opaque"
+  elif [ "$stdlib_doc_name" = "test/property/replay" ]; then
+    assert_contains "doc_stdlib_test_property_replay_pins_public_surface" "$(<"$tmp_out")" "Public API items: 7. Documented: 7."
+    assert_contains "doc_stdlib_test_property_replay_pins_exact_failure" "$(<"$tmp_out")" "ChoiceBoundChanged(usize, ChoiceBound, ChoiceBound)"
+    assert_contains "doc_stdlib_test_property_replay_pins_typed_result" "$(<"$tmp_out")" "fn run<T>(generator: Gen<T>, limits: Limits, choices: ChoiceLog) -> Result<T, Failure>"
   elif [ "$stdlib_doc_name" = "random" ]; then
-    assert_contains "doc_stdlib_random_pins_public_surface" "$(<"$tmp_out")" "Public API items: 15. Documented: 15."
+    assert_contains "doc_stdlib_random_pins_public_surface" "$(<"$tmp_out")" "Public API items: 16. Documented: 16."
     assert_contains "doc_stdlib_random_pins_opaque_seed" "$(<"$tmp_out")" "pub type Seed = opaque"
     assert_contains "doc_stdlib_random_pins_opaque_state" "$(<"$tmp_out")" "pub type State = opaque"
     assert_contains "doc_stdlib_random_pins_versioned_algorithm" "$(<"$tmp_out")" "SplitMix64V1"
@@ -5632,6 +5655,34 @@ assert_contains "test_named_failures_reports_last_actual" "$test_named_failures_
 assert_not_contains "test_named_failures_omits_passing_name" "$test_named_failures_err" "test failure: passing middle"
 
 assert_test_failure_contains "test_assertion_failure_reports_diagnostic" 'test "fail_eq_diag" { Test.assert_eq(1, 2) }' 1 "test assertion failed: assert_eq"
+assert_test_failure_contains "test_structured_report_preserves_code" 'use stdlib/diagnostic/schema.{*} test "structured" { Test.report(Diagnostic(DiagnosticSeverityError, DiagnosticClassTest, DiagnosticCodeAssigned("E9000"), "structured failure", DiagnosticLocationNone, DiagnosticRelatedLocationNil, DiagnosticFieldCons(DiagnosticFieldU64("seed", 18446744073709551615), DiagnosticFieldNil))) }' 1 "test diagnostic [E9000]: structured failure"
+assert_test_failure_contains "test_structured_report_preserves_unsigned_fields" 'use stdlib/diagnostic/schema.{*} test "structured" { Test.report(Diagnostic(DiagnosticSeverityError, DiagnosticClassTest, DiagnosticCodeAssigned("E9000"), "structured failure", DiagnosticLocationNone, DiagnosticRelatedLocationNil, DiagnosticFieldCons(DiagnosticFieldU64("seed", 18446744073709551615), DiagnosticFieldNil))) }' 1 "  seed: 18446744073709551615"
+printf '%s\n' 'use stdlib/random as random use stdlib/test/property as prop test "falsified" { prop.check(prop.smoke(random.seed(42)), prop.constant<i64>(42), value => false) }' > "$tmp_src"
+run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+chmod +x "$tmp_bin"
+set +e
+run_binary_guarded "$tmp_bin" >/dev/null 2>"$tmp_err"
+test_structured_property_exit=$?
+set -e
+assert_equals "test_structured_property_returns_failure" "$test_structured_property_exit" "1"
+test_structured_property_err=$(<"$tmp_err")
+assert_contains "test_structured_property_preserves_code" "$test_structured_property_err" "test diagnostic [E9001]: property falsified"
+assert_contains "test_structured_property_preserves_seed" "$test_structured_property_err" "  seed: 42"
+assert_contains "test_structured_property_preserves_algorithm" "$test_structured_property_err" '  algorithm: "splitmix64-v1"'
+assert_contains "test_structured_property_preserves_size" "$test_structured_property_err" "  size: 100"
+assert_contains "test_structured_property_preserves_discard_limit" "$test_structured_property_err" "  discard_limit: 1000"
+assert_contains "test_structured_property_preserves_choice_count" "$test_structured_property_err" "  choice_count: 0"
+printf '%s\n' 'use stdlib/option.{None} use stdlib/random as random use stdlib/result.{*} use stdlib/test/property as prop test "exhausted" { let generator = prop.filter_map<i64, i64>(prop.constant<i64>(42), 1, value => None<i64>()) let config = prop.config(random.seed(7), 1, 4, 0, 0).expect("positive case budget") prop.check(config, generator, value => true) }' > "$tmp_src"
+run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+chmod +x "$tmp_bin"
+set +e
+run_binary_guarded "$tmp_bin" >/dev/null 2>"$tmp_err"
+test_structured_property_exhausted_exit=$?
+set -e
+assert_equals "test_structured_property_exhaustion_returns_failure" "$test_structured_property_exhausted_exit" "1"
+test_structured_property_exhausted_err=$(<"$tmp_err")
+assert_contains "test_structured_property_exhaustion_preserves_code" "$test_structured_property_exhausted_err" "test diagnostic [E9002]: property generation exhausted its discard budget"
+assert_contains "test_structured_property_exhaustion_preserves_attempts" "$test_structured_property_exhausted_err" "  discard_attempts: 1"
 assert_test_failure_contains "test_assert_eq_f64_failure_reports_diagnostic" 'test "fail_eq_f64" { Test.assert_eq_f64(1.0, 2.0) }' 1 "test assertion failed: assert_eq_f64"
 assert_test_failure_contains "test_assert_eq_f64_failure_reports_expected" 'test "fail_eq_f64" { Test.assert_eq_f64(1.25, 2.5) }' 1 "  expected: 2.5"
 assert_test_failure_contains "test_assert_eq_f64_failure_reports_actual" 'test "fail_eq_f64" { Test.assert_eq_f64(1.25, 2.5) }' 1 "  actual:   1.25"
