@@ -657,6 +657,7 @@ check_rejects "string_find_is_option" "test/negative/string_find_is_option.weft"
 check_rejects "string_builder_constructor_private" "test/negative/string_builder_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "string_builder_append_requires_mutable" "test/negative/string_builder_append_requires_mutable.weft" "type error: exclusive borrow requires a mutable owner binding"
 check_rejects "string_builder_use_after_finish" "test/negative/string_builder_use_after_finish.weft" "type error: owned value used more than once"
+check_rejects "string_vector_join_method_removed" "test/negative/string_vector_join_method_removed.weft" "type error: unknown method"
 check_rejects "json_bool_requires_bool" "test/negative/json_bool_requires_bool.weft" 'argument type mismatch: expected `bool`, found `i64`'
 check_rejects "json_at_requires_usize" "test/negative/json_at_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`'
 check_rejects "io_helper_effect_unavailable" "test/negative/io_helper_effect_unavailable.weft" "error[E2001]:"

@@ -57,7 +57,7 @@ if [ -z "${WEFT_TOOL_SHARD:-}" ]; then
   tool_elapsed=$(($(date +%s) - tool_started))
   echo "Tool boundary timing: ${tool_elapsed}s wall, ${tool_jobs} shard jobs"
   if [ "${WEFT_TEST_PLATFORM:-$(uname -s)}" = Darwin ]; then
-    echo "Tool boundary summary: 1223 passed, 0 failed"
+    echo "Tool boundary summary: 1224 passed, 0 failed"
   else
     echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
   fi
@@ -953,7 +953,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_sorted_set_pins_public_surface" "$(<"$tmp_out")" "Public API items: 11. Documented: 11."
     assert_contains "doc_stdlib_sorted_set_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len<T>(self: SortedSet<T>) -> usize"
   elif [ "$stdlib_doc_name" = "vector" ]; then
-    assert_contains "doc_stdlib_vector_pins_public_surface" "$(<"$tmp_out")" "Public API items: 46. Documented: 46."
+    assert_contains "doc_stdlib_vector_pins_public_surface" "$(<"$tmp_out")" "Public API items: 45. Documented: 45."
     assert_contains "doc_stdlib_vector_pins_mutable_type" "$(<"$tmp_out")" "pub type Vector<T>"
     assert_contains "doc_stdlib_vector_pins_persistent_type" "$(<"$tmp_out")" "pub type PersistentVector<T>"
     assert_contains "doc_stdlib_vector_pins_mutable_len" "$(<"$tmp_out")" "pub fn len<T>(self: borrow Vector<T>) -> usize"
@@ -971,10 +971,11 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_num_pins_checked_sub" "$(<"$tmp_out")" "pub fn checked_sub(self: usize, other: usize) -> Option<usize>"
     assert_contains "doc_stdlib_num_pins_checked_mul" "$(<"$tmp_out")" "pub fn checked_mul(self: usize, other: usize) -> Option<usize>"
   elif [ "$stdlib_doc_name" = "string" ]; then
-    assert_contains "doc_stdlib_string_pins_public_surface" "$(<"$tmp_out")" "Public API items: 18. Documented: 18."
+    assert_contains "doc_stdlib_string_pins_public_surface" "$(<"$tmp_out")" "Public API items: 19. Documented: 19."
     assert_contains "doc_stdlib_string_pins_byte_length" "$(<"$tmp_out")" "pub fn len(self: str) -> i64"
     assert_contains "doc_stdlib_string_pins_optional_find" "$(<"$tmp_out")" "pub fn find(self: str, needle: str) -> Option<i64>"
     assert_contains "doc_stdlib_string_pins_scalar_count" "$(<"$tmp_out")" "pub fn scalar_count(self: str) -> i64"
+    assert_contains "doc_stdlib_string_pins_namespaced_join" "$(<"$tmp_out")" "pub fn join(parts: borrow Vector<str>, separator: str) -> str"
   elif [ "$stdlib_doc_name" = "task" ]; then
     assert_contains "doc_stdlib_task_pins_public_surface" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
     assert_contains "doc_stdlib_task_pins_consuming_join" "$(<"$tmp_out")" "pub fn join<T>(self: unique Task<T>) -[TaskScope]> T"
