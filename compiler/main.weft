@@ -27,6 +27,7 @@ use compiler/project_session.{*}
 use compiler/product_identity.{WeftProductIdentity, weft_compiler_version, weft_product_identity, weft_product_identity_json_render}
 use compiler/source_trust.{*}
 use compiler/semantic_fact.{*}
+use compiler/sdk_embed.{SdkArchiveBuild, SdkArchiveBuildFailed, SdkArchiveBuilt, sdk_embed_build}
 use compiler/source_position.{*}
 use compiler/test_prepare.{*}
 use compiler/typecheck_effect.{TypeCheck}
@@ -516,7 +517,33 @@ fn main_build_write_product_result(product: PipelineNativeProduct, output_path: 
   }
 }
 
-fn main_build_path(path: i64, output_path: i64, facts_path: i64, debug_mode: PipelineNativeDebugMode, target: NativeLinkTarget, envp: i64) -[SourceAcquire]> i64 {
+type MainSdkEmbedMode {
+  MainSdkEmbedDisabled,
+  MainSdkEmbedRoot(str)
+}
+
+fn main_build_native_with_sdk(native: NativeModule, mode: MainSdkEmbedMode) -> MainNativePreparation {
+  match mode {
+    MainSdkEmbedDisabled -> MainNativePrepared(native)
+    MainSdkEmbedRoot(root) -> match sdk_embed_build(root) {
+      SdkArchiveBuildFailed(message) -> {
+        eprint("build: could not construct embedded SDK: ")
+        eprint(message)
+        eprint("\n")
+        MainNativePreparationFailed(1)
+      }
+      SdkArchiveBuilt(archive, digest, count) -> {
+        let embedded = pipeline_native_attach_sdk_archive(native, archive)
+        if pipeline_native_embedded_sdk_archive_size(embedded) == 0 {
+          eprint("build: could not attach embedded SDK\n")
+          MainNativePreparationFailed(1)
+        } else { MainNativePrepared(embedded) }
+      }
+    }
+  }
+}
+
+fn main_build_path(path: i64, output_path: i64, facts_path: i64, debug_mode: PipelineNativeDebugMode, target: NativeLinkTarget, envp: i64, sdk_embed: MainSdkEmbedMode) -[SourceAcquire]> i64 {
   let len = cstr_len(path)
   let file = read_cpath_file(path, len)
   let src = mem_load64_at(file, 0)
@@ -527,7 +554,10 @@ fn main_build_path(path: i64, output_path: i64, facts_path: i64, debug_mode: Pip
   } else {
     match main_prepare_native_for_target_with_path_and_origin_and_grant(src, n, path, len, cpath_is_trusted_source(path, len), cpath_is_strict_source(path, len), cpath_can_grant_import_trust(path, len), target) {
       MainNativePreparationFailed(status) -> status
-      MainNativePrepared(native) -> main_build_write_product_result(pipeline_checked_native_product(native, src, debug_mode), output_path, facts_path, target)
+      MainNativePrepared(native) -> match main_build_native_with_sdk(native, sdk_embed) {
+        MainNativePreparationFailed(status) -> status
+        MainNativePrepared(ready) -> main_build_write_product_result(pipeline_checked_native_product(ready, src, debug_mode), output_path, facts_path, target)
+      }
     }
   }
 }
@@ -543,7 +573,7 @@ type MainBuildInput {
 }
 
 type MainBuildOptions {
-  MainBuildOptionsReady(MainBuildInput, i64, i64, PipelineNativeDebugMode, NativeLinkTarget),
+  MainBuildOptionsReady(MainBuildInput, i64, i64, PipelineNativeDebugMode, NativeLinkTarget, MainSdkEmbedMode),
   MainBuildOptionsInvalid
 }
 
@@ -557,6 +587,8 @@ fn main_build_options(argc: i64, argv: i64) -> MainBuildOptions {
   let mut saw_facts = false
   let mut saw_strip = false
   let mut saw_target = false
+  let mut sdk_embed = MainSdkEmbedDisabled
+  let mut saw_sdk_embed = false
   let mut valid = true
   let mut index = 2
   while index < argc and valid {
@@ -594,23 +626,31 @@ fn main_build_options(argc: i64, argv: i64) -> MainBuildOptions {
           NativeLinkTargetUnsupported -> { valid = false }
         }
       }
+    } else { if cstr_eq(option, "--embed-sdk") == 1 {
+      if saw_sdk_embed or index + 1 >= argc { valid = false }
+      else {
+        let root = mem_load64_at(argv, (index + 1) * 8)
+        sdk_embed = MainSdkEmbedRoot(runtime_str_from_bytes_copy(root, cstr_len(root)))
+        saw_sdk_embed = true
+        index = index + 2
+      }
     } else {
       if main_cstr_starts_with(option, "-") == 1 or positional != 0 { valid = false }
       else {
         positional = option
         index = index + 1
       }
-    } } } }
+    } } } } }
   }
   if valid == false { MainBuildOptionsInvalid }
   else { if saw_output {
     if positional == 0 { MainBuildOptionsInvalid }
-    else { MainBuildOptionsReady(MainBuildPath(positional), output_path, facts_path, debug_mode, target) }
+    else { MainBuildOptionsReady(MainBuildPath(positional), output_path, facts_path, debug_mode, target, sdk_embed) }
   } else {
-    if saw_facts { MainBuildOptionsInvalid }
+    if saw_facts or saw_sdk_embed { MainBuildOptionsInvalid }
     else {
       let selected = if positional == 0 { "" } else { runtime_str_from_bytes_copy(positional, cstr_len(positional)) }
-      MainBuildOptionsReady(MainBuildTarget(selected), 0, 0, debug_mode, target)
+      MainBuildOptionsReady(MainBuildTarget(selected), 0, 0, debug_mode, target, MainSdkEmbedDisabled)
     }
   } }
 }
@@ -703,7 +743,8 @@ fn main_build_named(name: str, debug_mode: PipelineNativeDebugMode, target: Nati
           runtime_str_cstring(facts),
           debug_mode,
           target,
-          envp
+          envp,
+          MainSdkEmbedDisabled
         )
         if status == 0 {
           oprint(output)
@@ -3239,14 +3280,15 @@ fn main_dispatch_unchecked(argc: i64, argv: i64) -[SourceAcquire]> i64 {
     }
     else { if cstr_eq(cmd, "build") == 1 {
       match main_build_options(argc, argv) {
-        MainBuildOptionsReady(input, output_path, facts_path, debug_mode, target) -> match input {
+        MainBuildOptionsReady(input, output_path, facts_path, debug_mode, target, sdk_embed) -> match input {
           MainBuildPath(path) -> main_build_path(
             path,
             output_path,
             facts_path,
             debug_mode,
             target,
-            argv + (argc + 1) * 8
+            argv + (argc + 1) * 8,
+            sdk_embed
           )
           MainBuildTarget(name) -> main_build_named(
             name,
@@ -3257,7 +3299,7 @@ fn main_dispatch_unchecked(argc: i64, argv: i64) -[SourceAcquire]> i64 {
         }
         MainBuildOptionsInvalid -> {
           eprint("usage: weft build [TARGET] [--target macos-aarch64|linux-aarch64] [--strip-debug]\n")
-          eprint("       weft build PATH -o OUTPUT [--target macos-aarch64|linux-aarch64] [--artifact-facts PATH] [--strip-debug]\n")
+          eprint("       weft build PATH -o OUTPUT [--target macos-aarch64|linux-aarch64] [--artifact-facts PATH] [--strip-debug] [--embed-sdk ROOT]\n")
           2
         }
       }

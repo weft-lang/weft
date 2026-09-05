@@ -1,0 +1,328 @@
+-- compiler/sdk_embed.weft — deterministic complete-SDK archive construction
+--
+-- This is a compiler build input producer, not a user-visible packaging API.
+-- It admits only regular files below the three canonical source roots plus the
+-- manifest and both pinned alpha-target native archives.
+
+use compiler/lib.{nlist_add, nlist_get, nlist_len, nlist_new}
+use compiler/sha256.{sha256}
+use runtime/alloc.{alloc_zeroed}
+use runtime/memory.{mem_copy, mem_load8_at, mem_load64_at, mem_store8_at, mem_store64_at}
+use runtime/sdk_archive.{sdk_archive_entry_size, sdk_archive_header_size, sdk_archive_version}
+use runtime/string.{runtime_str_cstring, runtime_str_from_bytes_copy}
+use runtime/syscall.{sys_close, sys_dir_entry_name, sys_dir_entry_record_len, sys_dir_open, sys_dir_read, sys_open_read, sys_read, sys_stat_mode, sys_stat_nofollow, sys_stat_scratch_size, sys_stat_size}
+use stdlib/num
+use stdlib/result.{Result}
+use stdlib/vector as vector
+use stdlib/vector.{vector_data}
+use stdlib/vector/handles.{Vector}
+
+pub(package) type SdkArchiveBuild {
+  SdkArchiveBuilt(owned Vector<u8>, str, i64),
+  SdkArchiveBuildFailed(str)
+}
+
+fn sdk_embed_cpath_len(path: i64) -> i64 {
+  let mut len = 0
+  while mem_load8_at(path, len) != 0 { len = len + 1 }
+  len
+}
+
+fn sdk_embed_cpath_compare(left: i64, right: i64) -> i64 {
+  let left_len = sdk_embed_cpath_len(left)
+  let right_len = sdk_embed_cpath_len(right)
+  let common = if left_len < right_len { left_len } else { right_len }
+  let mut index = 0
+  let mut order = 0
+  while index < common and order == 0 {
+    let a = mem_load8_at(left, index)
+    let b = mem_load8_at(right, index)
+    if a < b { order = 0 - 1 }
+    else { if a > b { order = 1 } else { index = index + 1 } }
+  }
+  if order != 0 { order }
+  else { if left_len < right_len { 0 - 1 } else { if left_len > right_len { 1 } else { 0 } } }
+}
+
+fn sdk_embed_paths_add_sorted(paths: i64, path: i64) -> bool {
+  let count = nlist_len(paths)
+  let mut insertion = count
+  let mut duplicate = false
+  let mut index = 0
+  while index < count and insertion == count and duplicate == false {
+    let order = sdk_embed_cpath_compare(path, nlist_get(paths, index))
+    if order == 0 { duplicate = true }
+    else { if order < 0 { insertion = index } else { index = index + 1 } }
+  }
+  if duplicate { false }
+  else {
+    nlist_add(paths, path)
+    let storage = mem_load64_at(paths, 0)
+    let mut move = count
+    while move > insertion {
+      mem_store64_at(storage, move * 8, mem_load64_at(storage, (move - 1) * 8))
+      move = move - 1
+    }
+    mem_store64_at(storage, insertion * 8, path)
+    true
+  }
+}
+
+fn sdk_embed_copy_cpath(source: i64, len: i64) -> i64 {
+  let result = alloc_zeroed(len + 1)
+  mem_copy(result, source, len)
+  result
+}
+
+fn sdk_embed_join_relative(prefix: i64, name: i64, name_len: i64) -> i64 {
+  let prefix_len = sdk_embed_cpath_len(prefix)
+  let separator = if prefix_len == 0 { 0 } else { 1 }
+  let result = alloc_zeroed(prefix_len + separator + name_len + 1)
+  if prefix_len > 0 { mem_copy(result, prefix, prefix_len) } else { 0 }
+  if separator == 1 { mem_store8_at(result, prefix_len, 47) } else { 0 }
+  mem_copy(result + prefix_len + separator, name, name_len)
+  result
+}
+
+fn sdk_embed_physical_path(root: str, relative: i64) -> i64 {
+  let relative_len = sdk_embed_cpath_len(relative)
+  let root_len = __str_len(root)
+  let separator = if root_len > 0 and mem_load8_at(__str_ptr(root), root_len - 1) == 47 { 0 } else { 1 }
+  let result = alloc_zeroed(root_len + separator + relative_len + 1)
+  mem_copy(result, __str_ptr(root), root_len)
+  if separator == 1 { mem_store8_at(result, root_len, 47) } else { 0 }
+  mem_copy(result + root_len + separator, relative, relative_len)
+  result
+}
+
+fn sdk_embed_name_is_dot(name: i64, len: i64) -> bool {
+  (len == 1 and mem_load8_at(name, 0) == 46) or
+    (len == 2 and mem_load8_at(name, 0) == 46 and mem_load8_at(name, 1) == 46)
+}
+
+fn sdk_embed_name_is_weft(name: i64, len: i64) -> bool {
+  len >= 5 and
+    mem_load8_at(name, len - 5) == 46 and
+    mem_load8_at(name, len - 4) == 119 and
+    mem_load8_at(name, len - 3) == 101 and
+    mem_load8_at(name, len - 2) == 102 and
+    mem_load8_at(name, len - 1) == 116
+}
+
+fn sdk_embed_directory_name_len(entry: i64, record_len: i64) -> i64 {
+  let name = sys_dir_entry_name(entry)
+  let maximum = record_len - (name - entry)
+  let mut len = 0
+  while len < maximum and mem_load8_at(name, len) != 0 { len = len + 1 }
+  if maximum > 0 and len < maximum { len } else { 0 - 1 }
+}
+
+fn sdk_embed_path_kind(path: i64) -> i64 {
+  let stat = alloc_zeroed(sys_stat_scratch_size())
+  if sys_stat_nofollow(path, stat) < 0 { 0 }
+  else {
+    match sys_stat_mode(stat) band 61440 {
+      16384 -> 1
+      32768 -> 2
+      40960 -> 3
+      _ -> 4
+    }
+  }
+}
+
+fn sdk_embed_collect_directory(root: str, relative: i64, paths: i64) -> str {
+  let physical = sdk_embed_physical_path(root, relative)
+  if sdk_embed_path_kind(physical) != 1 { "SDK source root is missing or is not a directory" }
+  else {
+    let fd = sys_dir_open(physical)
+    if fd < 0 { "SDK source directory cannot be opened" }
+    else {
+      let bytes = alloc_zeroed(16384)
+      let cursor = alloc_zeroed(8)
+      let mut done = false
+      let mut failure = ""
+      while done == false and __str_len(failure) == 0 {
+        let count = sys_dir_read(fd, bytes, 16384, cursor)
+        if count == 0 { done = true }
+        else { if count < 0 { failure = "SDK source directory cannot be read" }
+        else {
+          let mut offset = 0
+          while offset < count and __str_len(failure) == 0 {
+            let entry = bytes + offset
+            let record_len = sys_dir_entry_record_len(entry)
+            let name_len = sdk_embed_directory_name_len(entry, record_len)
+            if record_len <= 0 or offset + record_len > count or name_len < 0 {
+              failure = "SDK source directory contains a malformed entry"
+            } else {
+              let name = sys_dir_entry_name(entry)
+              if sdk_embed_name_is_dot(name, name_len) == false {
+                let child = sdk_embed_join_relative(relative, name, name_len)
+                let kind = sdk_embed_path_kind(sdk_embed_physical_path(root, child))
+                match kind {
+                  1 -> { failure = sdk_embed_collect_directory(root, child, paths) }
+                  2 -> if sdk_embed_name_is_weft(name, name_len) {
+                    if sdk_embed_paths_add_sorted(paths, child) { 0 }
+                    else { failure = "SDK source archive contains a duplicate path" }
+                  } else { 0 }
+                  3 -> { failure = "SDK source roots cannot contain symbolic links" }
+                  _ -> nil
+                }
+              } else { 0 }
+              offset = offset + record_len
+            }
+          }
+        } }
+      }
+      sys_close(fd)
+      failure
+    }
+  }
+}
+
+fn sdk_embed_add_required_file(root: str, path: str, paths: i64) -> str {
+  let cpath = runtime_str_cstring(path)
+  if sdk_embed_path_kind(sdk_embed_physical_path(root, cpath)) != 2 {
+    "required SDK archive input is missing or is not a regular file"
+  } else { if sdk_embed_paths_add_sorted(paths, sdk_embed_copy_cpath(cpath, __str_len(path))) {
+    ""
+  } else { "SDK source archive contains a duplicate path" } }
+}
+
+fn sdk_embed_collect_paths(root: str, paths: i64) -> str {
+  let compiler_failure = sdk_embed_collect_directory(root, runtime_str_cstring("compiler"), paths)
+  if __str_len(compiler_failure) > 0 { compiler_failure }
+  else {
+    let runtime_failure = sdk_embed_collect_directory(root, runtime_str_cstring("runtime"), paths)
+    if __str_len(runtime_failure) > 0 { runtime_failure }
+    else {
+      let stdlib_failure = sdk_embed_collect_directory(root, runtime_str_cstring("stdlib"), paths)
+      if __str_len(stdlib_failure) > 0 { stdlib_failure }
+      else {
+        let manifest_failure = sdk_embed_add_required_file(root, "weft.pkg", paths)
+        if __str_len(manifest_failure) > 0 { manifest_failure }
+        else {
+          let macos_failure = sdk_embed_add_required_file(root, "native/lib/macos-aarch64/libweft_mbedtls.a", paths)
+          if __str_len(macos_failure) > 0 { macos_failure }
+          else { sdk_embed_add_required_file(root, "native/lib/linux-aarch64/libweft_mbedtls.a", paths) }
+        }
+      }
+    }
+  }
+}
+
+fn sdk_embed_inspect_entries(root: str, paths: i64, entries: i64) -> str {
+  let mut index = 0
+  let mut failure = ""
+  while index < nlist_len(paths) and __str_len(failure) == 0 {
+    let path = nlist_get(paths, index)
+    let path_len = sdk_embed_cpath_len(path)
+    let stat = alloc_zeroed(sys_stat_scratch_size())
+    let stat_status = sys_stat_nofollow(sdk_embed_physical_path(root, path), stat)
+    let file_len = if stat_status < 0 { 0 } else { sys_stat_size(stat) }
+    if file_len <= 0 { failure = "SDK archive input cannot be read or is empty" }
+    else {
+      nlist_add(entries, alloc_zeroed(24))
+      let stored = nlist_get(entries, nlist_len(entries) - 1)
+      mem_store64_at(stored, 0, path)
+      mem_store64_at(stored, 8, path_len)
+      mem_store64_at(stored, 16, file_len)
+      index = index + 1
+    }
+  }
+  failure
+}
+
+fn sdk_embed_total_size(entries: i64) -> i64 {
+  let mut total = sdk_archive_header_size() + nlist_len(entries) * sdk_archive_entry_size()
+  for index in 0..nlist_len(entries) {
+    let entry = nlist_get(entries, index)
+    total = total + mem_load64_at(entry, 8) + mem_load64_at(entry, 16)
+  }
+  total
+}
+
+fn sdk_embed_hex_digit(value: i64) -> i64 {
+  if value < 10 { 48 + value } else { 87 + value }
+}
+
+fn sdk_embed_digest_text(digest: i64) -> str {
+  let text = alloc_zeroed(71)
+  mem_copy(text, __str_ptr("sha256:"), 7)
+  for index in 0..32 {
+    let byte = mem_load8_at(digest, index)
+    mem_store8_at(text, 7 + index * 2, sdk_embed_hex_digit(byte / 16))
+    mem_store8_at(text, 8 + index * 2, sdk_embed_hex_digit(byte - byte / 16 * 16))
+  }
+  runtime_str_from_bytes_copy(text, 71)
+}
+
+fn sdk_embed_read_exact(root: str, path: i64, destination: i64, expected: i64) -> bool {
+  let fd = sys_open_read(sdk_embed_physical_path(root, path))
+  if fd < 0 { false }
+  else {
+    let mut offset = 0
+    let mut valid = true
+    while offset < expected and valid {
+      let count = sys_read(fd, destination + offset, expected - offset)
+      if count <= 0 { valid = false } else { offset = offset + count }
+    }
+    sys_close(fd)
+    valid and offset == expected
+  }
+}
+
+fn sdk_embed_write_archive(root: str, entries: i64) -> SdkArchiveBuild {
+  let count = nlist_len(entries)
+  let total = sdk_embed_total_size(entries)
+  let mut archive = vector.with_capacity<u8>(total.to_usize_checked().expect("SDK archive size fits usize"))
+  for index in 0..total { archive.push(0) }
+  let bytes = vector_data<u8>(archive)
+  mem_copy(bytes, __str_ptr("WEFTSDK1"), 8)
+  mem_store64_at(bytes, 8, sdk_archive_version())
+  mem_store64_at(bytes, 16, count)
+  mem_store64_at(bytes, 24, sdk_archive_entry_size())
+  mem_store64_at(bytes, 32, total)
+  mem_store64_at(bytes, 40, sdk_archive_header_size())
+
+  let mut content_offset = sdk_archive_header_size() + count * sdk_archive_entry_size()
+  let mut failure = ""
+  for index in 0..count {
+    let source = nlist_get(entries, index)
+    let target = bytes + sdk_archive_header_size() + index * sdk_archive_entry_size()
+    let path_len = mem_load64_at(source, 8)
+    let data_len = mem_load64_at(source, 16)
+    mem_store64_at(target, 0, content_offset)
+    mem_store64_at(target, 8, path_len)
+    mem_copy(bytes + content_offset, mem_load64_at(source, 0), path_len)
+    content_offset = content_offset + path_len
+    mem_store64_at(target, 16, content_offset)
+    mem_store64_at(target, 24, data_len)
+    if __str_len(failure) == 0 and sdk_embed_read_exact(root, mem_load64_at(source, 0), bytes + content_offset, data_len) == false {
+      failure = "SDK archive input changed or became unreadable during construction"
+    } else { 0 }
+    content_offset = content_offset + data_len
+  }
+
+  if __str_len(failure) > 0 { SdkArchiveBuildFailed(failure) }
+  else {
+    let digest = alloc_zeroed(32)
+    sha256(bytes, total, digest)
+    mem_copy(bytes + 64, digest, 32)
+    SdkArchiveBuilt(archive, sdk_embed_digest_text(digest), count)
+  }
+}
+
+pub(package) fn sdk_embed_build(root: str) -> SdkArchiveBuild {
+  if __str_len(root) == 0 { SdkArchiveBuildFailed("SDK archive root cannot be empty") }
+  else {
+    let paths = nlist_new()
+    let path_failure = sdk_embed_collect_paths(root, paths)
+    if __str_len(path_failure) > 0 { SdkArchiveBuildFailed(path_failure) }
+    else {
+      let entries = nlist_new()
+      let inspect_failure = sdk_embed_inspect_entries(root, paths, entries)
+      if __str_len(inspect_failure) > 0 { SdkArchiveBuildFailed(inspect_failure) }
+      else { sdk_embed_write_archive(root, entries) }
+    }
+  }
+}
