@@ -118,6 +118,7 @@ check_rejects "property_choice_constructor_private" "test/negative/property_choi
 check_rejects "property_choice_log_constructor_private" "test/negative/property_choice_log_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "property_gen_constructor_private" "test/negative/property_gen_constructor_private.weft" "error[E1001]: unknown function 'Gen'"
 check_rejects "property_limits_constructor_private" "test/negative/property_limits_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
+check_rejects "property_length_range_constructor_private" "test/negative/property_length_range_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "property_config_constructor_private" "test/negative/property_config_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "property_counterexample_constructor_private" "test/negative/property_counterexample_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "property_campaign_summary_constructor_private" "test/negative/property_campaign_summary_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"

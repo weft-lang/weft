@@ -79,6 +79,28 @@ let even_halves = prop.filter_map(source, 20, even_half)
 Both the local attempt count and the campaign discard limit are hard bounds.
 There is deliberately no generator operation which may retry forever.
 
+## Scalar and collection domains
+
+`u8` through `u64`, `usize`, `i8` through `i64`, and `isize` cover their full
+value sets. `unicode_scalar` maps around the surrogate interval, so every draw
+is valid and the distribution does not depend on rejection. `either`,
+`one_of`, and checked `frequency` preserve alternatives as typed generator
+values.
+
+Collection lengths are validated inclusive domains. The campaign size caps
+their maximum while preserving an explicit minimum:
+
+```weft
+let small = prop.lengths(0, 32).expect("ordered finite lengths")
+let packets = prop.bytes(small)
+let counters = prop.vector(prop.i64(), small)
+let snapshots = prop.persistent_vector(prop.boolean(), small)
+```
+
+The mutable Vector generator returns `Gen<owned Vector<T>>`; ownership is not
+erased merely to fit a common collection interface. Immutable Bytes, List, and
+PersistentVector generators retain their ordinary value semantics.
+
 ## Alternate interpretations
 
 `prop.sample(generator, limits) -[Draw]> SampleResult<T>` leaves the `Draw`
