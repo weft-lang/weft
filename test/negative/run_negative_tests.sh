@@ -826,6 +826,8 @@ check_rejects "ownership_qualified_impl_duplicate" "test/negative/ownership_qual
 check_rejects "owned_param_used_twice" "test/negative/owned_param_used_twice.weft" "type error: owned value used more than once"
 check_rejects "owned_let_used_twice" "test/negative/owned_let_used_twice.weft" "type error: owned value used more than once"
 check_rejects "owned_borrow_after_move" "test/negative/owned_borrow_after_move.weft" "type error: owned value used more than once"
+check_rejects "owned_vector_slice_after_move" "test/negative/owned_vector_slice_after_move.weft" "type error: owned value used more than once"
+check_rejects "owned_vector_move_with_live_slice" "test/negative/owned_vector_move_with_live_slice.weft" "type error: Vector mutation or reallocation conflicts with a live slice borrow"
 check_rejects "linear_pattern_binding_used_twice" "test/negative/linear_pattern_binding_used_twice.weft" "type error: owned value used more than once"
 check_rejects "linear_pattern_guard_consumes_binding" "test/negative/linear_pattern_guard_consumes_binding.weft" "type error: linear pattern binding cannot be consumed in a match guard"
 check_rejects "linear_try_result_used_after_move" "test/negative/linear_try_result_used_after_move.weft" "type error: linear aggregate value used more than once"
