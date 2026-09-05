@@ -362,6 +362,19 @@ A hosted registry and full semver solver are not part of the first alpha.
 An installed compiler resolves canonical `stdlib/` and `runtime/` imports and
 SDK-native archives from its own embedded, digested payload while project and
 dependency imports continue through the project graph.
+The compiler validates the archive layout and whole-payload SHA-256 once,
+then borrows module bytes directly from the verified image. `weft version
+--json`, compiler artifact facts, and release provenance report the same SDK
+archive version and digest. This integrity check is not a substitute for
+verifying the release signature.
+
+`E5015` means the embedded SDK is corrupt or incompatible: reinstall the
+matching compiler binary. `E5016` names an unavailable canonical SDK path:
+check the import spelling and namespace first. `E5017` identifies a malformed
+or incompatible SDK `weft.pkg`, rather than a problem in the application's
+manifest. Contributors using a live checkout should repair its SDK sources
+or manifest; installed users should replace the compiler as one unit.
+
 `test/run_release_bundle.sh` verifies the commands above from an actual archive
 moved into a clean installation root, with only the single installed compiler
 binary on the compiler PATH. It acquires a pinned archive through a
