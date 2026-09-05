@@ -15,8 +15,11 @@ use stdlib/unicode/data/property.{*}
 use stdlib/unicode/security.{unicode_security_are_confusable, unicode_security_is_mixed_script, unicode_security_skeleton}
 use stdlib/unicode/segmentation.{unicode_grapheme_break_at_scalars, unicode_segmentation_decode, unicode_segmentation_scalar_index_at_offset, unicode_sentence_break_at_scalars, unicode_word_break_at_scalars}
 use stdlib/option.{None, Option, Some}
+use stdlib/num/scalar.{num_scalar_i64_to_usize}
+use stdlib/panic.{panic}
 use stdlib/utf8 as utf8
-use stdlib/utf8.{Utf8Decoded, Utf8Malformed, utf8_encode_scalar_into, utf8_scalar_encoded_len}
+use runtime/utf8.{Utf8StorageScalar, Utf8StorageMalformed, utf8_storage_decode}
+use stdlib/utf8.{utf8_encode_scalar_into, utf8_scalar_encoded_len}
 
 --- Return the pinned Unicode data version used by every algorithm.
 pub fn version() -> str {
@@ -243,9 +246,9 @@ pub(package) fn unicode_case_decode_scalars(text: str, scalars: i64) -> i64 {
   let mut pos = 0
   let mut valid = 1
   while pos < n and valid == 1 {
-    match utf8.decode_next(text, pos) {
-      Utf8Malformed(offset) -> { valid = 0 }
-      Utf8Decoded(next, scalar) -> {
+    match utf8_storage_decode(runtime_str_ptr(text), n, pos) {
+      Utf8StorageMalformed(offset) -> { valid = 0 }
+      Utf8StorageScalar(next, scalar) -> {
         mem_store64_at(scalars, count * 8, scalar)
         count = count + 1
         pos = next
@@ -441,169 +444,82 @@ fn unicode_caseless_equal_impl(a: str, b: str) -> bool {
   }
 }
 
---- Return whether a byte offset is an extended grapheme-cluster boundary.
-fn unicode_is_grapheme_boundary_impl(text: str, byte_offset: i64) -> bool {
+-- Boundary policy is a scalar tag, not a callback or a second decoded buffer.
+-- Every public boundary family shares bounds, decoding, and scratch lifetime.
+type UnicodeBoundaryKind {
+  GraphemeBoundary,
+  WordBoundary,
+  SentenceBoundary
+}
+
+fn unicode_break_at(kind: UnicodeBoundaryKind, scalars: i64, count: i64, index: i64) -> bool {
+  match kind {
+    GraphemeBoundary -> unicode_grapheme_break_at_scalars(scalars, count, index) == 1
+    WordBoundary -> unicode_word_break_at_scalars(scalars, count, index) == 1
+    SentenceBoundary -> unicode_sentence_break_at_scalars(scalars, count, index) == 1
+  }
+}
+
+fn unicode_finite_count(value: i64) -> usize {
+  if value < 0 { panic("String UTF-8 invariant violated") }
+  else { __i64_to_usize(value) }
+}
+
+fn unicode_is_boundary_impl(text: str, byte_offset: usize, kind: UnicodeBoundaryKind) -> bool {
   let n = runtime_str_len(text)
-  if byte_offset < 0 or byte_offset > n { false }
+  if byte_offset > __i64_to_usize(n) { false }
   else {
+    let offset = __u64_to_i64(__usize_to_u64(byte_offset))
     let mark = alloc_bump_mark()
     let scalars = alloc_words(n + 1)
     let offsets = alloc_words(n + 2)
     let count = unicode_segmentation_decode(text, scalars, offsets)
-    let index = if count < 0 { 0 - 1 } else { unicode_segmentation_scalar_index_at_offset(offsets, count, byte_offset) }
-    let result = index >= 0 and unicode_grapheme_break_at_scalars(scalars, count, index) == 1
+    let index = if count < 0 { -1 } else { unicode_segmentation_scalar_index_at_offset(offsets, count, offset) }
+    let result = index >= 0 and unicode_break_at(kind, scalars, count, index)
     alloc_bump_restore_same_segment(mark)
     result
   }
 }
 
--- Return the first extended grapheme boundary strictly after `byte_offset`.
--- The end offset is stable at end-of-text; invalid UTF-8 or a non-scalar input
--- offset returns -1.
---- Return the next extended grapheme boundary byte offset, or `-1` if invalid.
-fn unicode_next_grapheme_boundary_impl(text: str, byte_offset: i64) -> i64 {
+-- End-of-text is a stable boundary. Any other valid scalar offset advances
+-- strictly; an out-of-range or mid-scalar offset has no next boundary.
+fn unicode_next_boundary_impl(text: str, byte_offset: usize, kind: UnicodeBoundaryKind) -> Option<usize> {
   let n = runtime_str_len(text)
-  if byte_offset < 0 or byte_offset > n { 0 - 1 }
+  if byte_offset > __i64_to_usize(n) { None<usize>() }
   else {
+    let offset = __u64_to_i64(__usize_to_u64(byte_offset))
     let mark = alloc_bump_mark()
     let scalars = alloc_words(n + 1)
     let offsets = alloc_words(n + 2)
     let count = unicode_segmentation_decode(text, scalars, offsets)
-    let index = if count < 0 { 0 - 1 } else { unicode_segmentation_scalar_index_at_offset(offsets, count, byte_offset) }
+    let index = if count < 0 { -1 } else { unicode_segmentation_scalar_index_at_offset(offsets, count, offset) }
     let mut next = index + 1
-    while index >= 0 and next <= count and unicode_grapheme_break_at_scalars(scalars, count, next) == 0 { next = next + 1 }
-    let result = if index < 0 { 0 - 1 }
-      else { if index == count { n }
-      else { mem_load64_at(offsets, next * 8) } }
+    while index >= 0 and next <= count and not unicode_break_at(kind, scalars, count, next) {
+      next = next + 1
+    }
+    let result = match index {
+      invalid if invalid < 0 -> -1
+      last if last == count -> n
+      _ -> mem_load64_at(offsets, next * 8)
+    }
     alloc_bump_restore_same_segment(mark)
-    result
+    num_scalar_i64_to_usize(result)
   }
 }
 
---- Count extended grapheme clusters, or return `-1` for invalid text.
-fn unicode_grapheme_count_impl(text: str) -> i64 {
+fn unicode_segment_count_impl(text: str, kind: UnicodeBoundaryKind) -> usize {
   let n = runtime_str_len(text)
   let mark = alloc_bump_mark()
   let scalars = alloc_words(n + 1)
   let offsets = alloc_words(n + 2)
   let scalar_count = unicode_segmentation_decode(text, scalars, offsets)
   let mut count = 0
-  let mut i = 1
-  while scalar_count >= 0 and i <= scalar_count {
-    if unicode_grapheme_break_at_scalars(scalars, scalar_count, i) == 1 { count = count + 1 } else { 0 }
-    i = i + 1
+  for index in 1..(scalar_count + 1) {
+    if unicode_break_at(kind, scalars, scalar_count, index) { count = count + 1 } else { nil }
   }
-  let result = if scalar_count < 0 { 0 - 1 } else { count }
+  let result = if scalar_count < 0 { -1 } else { count }
   alloc_bump_restore_same_segment(mark)
-  result
-}
-
---- Return whether a byte offset is a default UAX #29 word boundary.
-fn unicode_is_word_boundary_impl(text: str, byte_offset: i64) -> bool {
-  let n = runtime_str_len(text)
-  if byte_offset < 0 or byte_offset > n { false }
-  else {
-    let mark = alloc_bump_mark()
-    let scalars = alloc_words(n + 1)
-    let offsets = alloc_words(n + 2)
-    let count = unicode_segmentation_decode(text, scalars, offsets)
-    let index = if count < 0 { 0 - 1 } else { unicode_segmentation_scalar_index_at_offset(offsets, count, byte_offset) }
-    let result = index >= 0 and unicode_word_break_at_scalars(scalars, count, index) == 1
-    alloc_bump_restore_same_segment(mark)
-    result
-  }
-}
-
---- Return the next default word-boundary byte offset, or `-1` if invalid.
-fn unicode_next_word_boundary_impl(text: str, byte_offset: i64) -> i64 {
-  let n = runtime_str_len(text)
-  if byte_offset < 0 or byte_offset > n { 0 - 1 }
-  else {
-    let mark = alloc_bump_mark()
-    let scalars = alloc_words(n + 1)
-    let offsets = alloc_words(n + 2)
-    let count = unicode_segmentation_decode(text, scalars, offsets)
-    let index = if count < 0 { 0 - 1 } else { unicode_segmentation_scalar_index_at_offset(offsets, count, byte_offset) }
-    let mut next = index + 1
-    while index >= 0 and next <= count and unicode_word_break_at_scalars(scalars, count, next) == 0 { next = next + 1 }
-    let result = if index < 0 { 0 - 1 }
-      else { if index == count { n }
-      else { mem_load64_at(offsets, next * 8) } }
-    alloc_bump_restore_same_segment(mark)
-    result
-  }
-}
-
---- Count default UAX #29 word segments, or return `-1` for invalid text.
-fn unicode_word_segment_count_impl(text: str) -> i64 {
-  let n = runtime_str_len(text)
-  let mark = alloc_bump_mark()
-  let scalars = alloc_words(n + 1)
-  let offsets = alloc_words(n + 2)
-  let scalar_count = unicode_segmentation_decode(text, scalars, offsets)
-  let mut count = 0
-  let mut i = 1
-  while scalar_count >= 0 and i <= scalar_count {
-    if unicode_word_break_at_scalars(scalars, scalar_count, i) == 1 { count = count + 1 } else { 0 }
-    i = i + 1
-  }
-  let result = if scalar_count < 0 { 0 - 1 } else { count }
-  alloc_bump_restore_same_segment(mark)
-  result
-}
-
---- Return whether a byte offset is a default UAX #29 sentence boundary.
-fn unicode_is_sentence_boundary_impl(text: str, byte_offset: i64) -> bool {
-  let n = runtime_str_len(text)
-  if byte_offset < 0 or byte_offset > n { false }
-  else {
-    let mark = alloc_bump_mark()
-    let scalars = alloc_words(n + 1)
-    let offsets = alloc_words(n + 2)
-    let count = unicode_segmentation_decode(text, scalars, offsets)
-    let index = if count < 0 { 0 - 1 } else { unicode_segmentation_scalar_index_at_offset(offsets, count, byte_offset) }
-    let result = index >= 0 and unicode_sentence_break_at_scalars(scalars, count, index) == 1
-    alloc_bump_restore_same_segment(mark)
-    result
-  }
-}
-
---- Return the next default sentence-boundary byte offset, or `-1` if invalid.
-fn unicode_next_sentence_boundary_impl(text: str, byte_offset: i64) -> i64 {
-  let n = runtime_str_len(text)
-  if byte_offset < 0 or byte_offset > n { 0 - 1 }
-  else {
-    let mark = alloc_bump_mark()
-    let scalars = alloc_words(n + 1)
-    let offsets = alloc_words(n + 2)
-    let count = unicode_segmentation_decode(text, scalars, offsets)
-    let index = if count < 0 { 0 - 1 } else { unicode_segmentation_scalar_index_at_offset(offsets, count, byte_offset) }
-    let mut next = index + 1
-    while index >= 0 and next <= count and unicode_sentence_break_at_scalars(scalars, count, next) == 0 { next = next + 1 }
-    let result = if index < 0 { 0 - 1 }
-      else { if index == count { n }
-      else { mem_load64_at(offsets, next * 8) } }
-    alloc_bump_restore_same_segment(mark)
-    result
-  }
-}
-
---- Count default UAX #29 sentence segments, or return `-1` for invalid text.
-fn unicode_sentence_segment_count_impl(text: str) -> i64 {
-  let n = runtime_str_len(text)
-  let mark = alloc_bump_mark()
-  let scalars = alloc_words(n + 1)
-  let offsets = alloc_words(n + 2)
-  let scalar_count = unicode_segmentation_decode(text, scalars, offsets)
-  let mut count = 0
-  let mut i = 1
-  while scalar_count >= 0 and i <= scalar_count {
-    if unicode_sentence_break_at_scalars(scalars, scalar_count, i) == 1 { count = count + 1 } else { 0 }
-    i = i + 1
-  }
-  let result = if scalar_count < 0 { 0 - 1 } else { count }
-  alloc_bump_restore_same_segment(mark)
-  result
+  unicode_finite_count(result)
 }
 
 --- Return whether every byte in valid text is ASCII.
@@ -630,9 +546,9 @@ pub(package) fn unicode_normalize_impl(text: str, compatibility: i64, compose: i
     let mut pos = 0
     let mut valid = 1
     while pos < n and valid == 1 {
-      match utf8.decode_next(text, pos) {
-        Utf8Malformed(offset) -> { valid = 0 }
-        Utf8Decoded(next, scalar) -> {
+      match utf8_storage_decode(runtime_str_ptr(text), n, pos) {
+        Utf8StorageMalformed(offset) -> { valid = 0 }
+        Utf8StorageScalar(next, scalar) -> {
           count = if compatibility == 1 {
             unicode_compatibility_decompose_into(scalar, decomposed, count)
           } else {
@@ -715,10 +631,6 @@ fn unicode_is_normalized_nfkd_impl(text: str) -> bool {
   runtime_str_eq(text, unicode_normalize_nfkd_impl(text)) == 1
 }
 
-fn unicode_boundary_offset(offset: i64) -> Option<i64> {
-  if offset < 0 { None<i64>() } else { Some<i64>(offset) }
-}
-
 impl str {
   --- Apply locale-neutral full uppercase mapping.
   pub fn to_uppercase(self: str) -> str { unicode_to_uppercase_impl(self) }
@@ -736,43 +648,46 @@ impl str {
   pub fn caseless_eq(self: str, other: str) -> bool { unicode_caseless_equal_impl(self, other) }
 
   --- Return whether `byte_offset` is an extended grapheme-cluster boundary.
-  pub fn is_grapheme_boundary(self: str, byte_offset: i64) -> bool {
-    unicode_is_grapheme_boundary_impl(self, byte_offset)
+  pub fn is_grapheme_boundary(self: str, byte_offset: usize) -> bool {
+    unicode_is_boundary_impl(self, byte_offset, GraphemeBoundary)
   }
 
   --- Return the next extended grapheme boundary after `byte_offset`.
-  pub fn next_grapheme_boundary(self: str, byte_offset: i64) -> Option<i64> {
-    unicode_boundary_offset(unicode_next_grapheme_boundary_impl(self, byte_offset))
+  --- End-of-text stays at end; out-of-range and mid-scalar offsets return `None`.
+  pub fn next_grapheme_boundary(self: str, byte_offset: usize) -> Option<usize> {
+    unicode_next_boundary_impl(self, byte_offset, GraphemeBoundary)
   }
 
   --- Count extended grapheme clusters.
-  pub fn grapheme_count(self: str) -> i64 { unicode_grapheme_count_impl(self) }
+  pub fn grapheme_count(self: str) -> usize { unicode_segment_count_impl(self, GraphemeBoundary) }
 
   --- Return whether `byte_offset` is a default UAX #29 word boundary.
-  pub fn is_word_boundary(self: str, byte_offset: i64) -> bool {
-    unicode_is_word_boundary_impl(self, byte_offset)
+  pub fn is_word_boundary(self: str, byte_offset: usize) -> bool {
+    unicode_is_boundary_impl(self, byte_offset, WordBoundary)
   }
 
   --- Return the next default word boundary after `byte_offset`.
-  pub fn next_word_boundary(self: str, byte_offset: i64) -> Option<i64> {
-    unicode_boundary_offset(unicode_next_word_boundary_impl(self, byte_offset))
+  --- End-of-text stays at end; out-of-range and mid-scalar offsets return `None`.
+  pub fn next_word_boundary(self: str, byte_offset: usize) -> Option<usize> {
+    unicode_next_boundary_impl(self, byte_offset, WordBoundary)
   }
 
   --- Count default UAX #29 word segments.
-  pub fn word_segment_count(self: str) -> i64 { unicode_word_segment_count_impl(self) }
+  pub fn word_segment_count(self: str) -> usize { unicode_segment_count_impl(self, WordBoundary) }
 
   --- Return whether `byte_offset` is a default UAX #29 sentence boundary.
-  pub fn is_sentence_boundary(self: str, byte_offset: i64) -> bool {
-    unicode_is_sentence_boundary_impl(self, byte_offset)
+  pub fn is_sentence_boundary(self: str, byte_offset: usize) -> bool {
+    unicode_is_boundary_impl(self, byte_offset, SentenceBoundary)
   }
 
   --- Return the next default sentence boundary after `byte_offset`.
-  pub fn next_sentence_boundary(self: str, byte_offset: i64) -> Option<i64> {
-    unicode_boundary_offset(unicode_next_sentence_boundary_impl(self, byte_offset))
+  --- End-of-text stays at end; out-of-range and mid-scalar offsets return `None`.
+  pub fn next_sentence_boundary(self: str, byte_offset: usize) -> Option<usize> {
+    unicode_next_boundary_impl(self, byte_offset, SentenceBoundary)
   }
 
   --- Count default UAX #29 sentence segments.
-  pub fn sentence_segment_count(self: str) -> i64 { unicode_sentence_segment_count_impl(self) }
+  pub fn sentence_segment_count(self: str) -> usize { unicode_segment_count_impl(self, SentenceBoundary) }
 
   --- Return whether every byte is ASCII.
   pub fn is_ascii(self: str) -> bool { unicode_text_is_ascii_impl(self) }

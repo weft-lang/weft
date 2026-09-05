@@ -54,7 +54,7 @@ use stdlib/vector as vector
 use stdlib/vector.{Vector}
 
 fn resolve_allowed(host: DomainName) -[DnsResolve]> Result<Vector<SocketAddress>, DnsError> {
-  let targets = vector.new<Target>()
+  let mut targets = vector.new<Target>()
   targets.push(dns_policy.Target(host, 443))
   with dns_policy(dns_policy.allow_only(targets)) {
     dns.resolve(host, 443, DnsAnyFamily)
@@ -65,7 +65,7 @@ fn connect_allowed(
   address: SocketAddress,
   options: TcpConnectOptions
 ) -[TcpConnect]> Result<owned TcpStream, TcpError> {
-  let addresses = vector.new<SocketAddress>()
+  let mut addresses = vector.new<SocketAddress>()
   addresses.push(address)
   with connect_policy(connect_policy.allow_only(addresses)) {
     tcp.connect(address, options)
@@ -76,7 +76,7 @@ fn listen_allowed(
   address: SocketAddress,
   options: TcpListenOptions
 ) -[TcpListen]> Result<owned TcpListener, TcpError> {
-  let addresses = vector.new<SocketAddress>()
+  let mut addresses = vector.new<SocketAddress>()
   addresses.push(address)
   with listen_policy(listen_policy.allow_only(addresses)) {
     tcp.listen(address, options)

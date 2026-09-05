@@ -822,6 +822,22 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 11. Documented: 11."
     assert_contains "doc_stdlib_utf8_pins_typed_encode_failure" "$(<"$tmp_out")" "InvalidScalar(usize, i64)"
     assert_contains "doc_stdlib_utf8_pins_scalar_traversal" "$(<"$tmp_out")" "fn from_scalars<S: IntoIterator & {type Item = i64}>(scalars: S) -> Result<str, Utf8EncodeError>"
+    assert_contains "doc_stdlib_utf8_pins_finite_decoded_offset" "$(<"$tmp_out")" "Utf8Decoded(usize, i64)"
+    assert_contains "doc_stdlib_utf8_pins_finite_malformed_offset" "$(<"$tmp_out")" "Utf8Malformed(usize)"
+    assert_contains "doc_stdlib_utf8_pins_finite_decode_argument" "$(<"$tmp_out")" "fn decode_next(s: str, pos: usize) -> Utf8Decode"
+    assert_contains "doc_stdlib_utf8_pins_finite_width" "$(<"$tmp_out")" "fn encoded_len(scalar: i64) -> Option<usize>"
+    assert_not_contains "doc_stdlib_utf8_hides_storage_decoder" "$(<"$tmp_out")" "utf8_storage_decode"
+    assert_not_contains "doc_stdlib_utf8_hides_result_builder" "$(<"$tmp_out")" "Utf8ResultBuilder"
+    assert_not_contains "doc_stdlib_utf8_hides_storage_result_trait" "$(<"$tmp_out")" "Utf8StorageResult"
+  elif [ "$stdlib_doc_name" = "unicode" ]; then
+    assert_contains "doc_stdlib_unicode_pins_public_surface" "$(<"$tmp_out")" "Public API items: 56. Documented: 56."
+    for boundary in grapheme word sentence; do
+      assert_contains "doc_stdlib_unicode_${boundary}_finite_predicate" "$(<"$tmp_out")" "fn is_${boundary}_boundary(self: str, byte_offset: usize) -> bool"
+      assert_contains "doc_stdlib_unicode_${boundary}_finite_next" "$(<"$tmp_out")" "fn next_${boundary}_boundary(self: str, byte_offset: usize) -> Option<usize>"
+    done
+    for counter in grapheme_count word_segment_count sentence_segment_count; do
+      assert_contains "doc_stdlib_unicode_${counter}_finite_result" "$(<"$tmp_out")" "fn ${counter}(self: str) -> usize"
+    done
   elif [ "$stdlib_doc_name" = "time" ]; then
     assert_contains "doc_stdlib_time_pins_duration_only" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
     assert_not_contains "doc_stdlib_time_has_no_combined_capability" "$(<"$tmp_out")" "pub effect Time"

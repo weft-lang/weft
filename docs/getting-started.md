@@ -249,15 +249,26 @@ payloads and native paths preserve native bytes. Unicode algorithms are pinned
 to Unicode 17.0.0 and are deterministic across hosts:
 
 ```weft run
-use stdlib/unicode.{unicode_grapheme_count, unicode_normalize_nfc}
+use stdlib/string
+use stdlib/unicode
 
 fn main() -> i64 {
-  let composed = unicode_normalize_nfc("é")
-  if unicode_grapheme_count(composed) == 1 { 0 } else { 1 }
+  let composed = "é".normalize_nfc()
+  if composed.len() == 2 and composed.scalar_count() == 1 and composed.grapheme_count() == 1 { 0 } else { 1 }
 }
 ```
 
-Use `bytes_to_utf8` or `path_to_utf8` when crossing from arbitrary bytes to
+Lengths, counts, and byte offsets use `usize`. `str.len()` counts UTF-8 bytes;
+`scalar_count()` counts Unicode scalars; `grapheme_count()` counts extended
+grapheme clusters. Unicode boundary methods and `utf8.decode_next` take byte
+offsets, not scalar ordinals. A next-boundary query stays at the end of text;
+decoding at the end fails because no scalar begins there.
+
+Boundary queries currently decode the whole string on each call. Use the
+counting methods when only a count is needed; repeatedly asking for the next
+boundary rescans the text.
+
+Use `bytes.to_utf8()` or `path.to_utf8()` when crossing from arbitrary bytes to
 text; both preserve a typed failure with the invalid byte offset.
 
 ## Packages and locked sources

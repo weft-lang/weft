@@ -660,6 +660,11 @@ check_rejects "string_repeat_requires_usize" "test/negative/string_repeat_requir
 check_rejects "string_pad_width_requires_usize" "test/negative/string_pad_width_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`'
 check_rejects "string_scalar_count_is_usize" "test/negative/string_scalar_count_is_usize.weft" 'return value type mismatch: expected `i64`, found `usize`'
 check_rejects "string_scalar_boundary_requires_usize" "test/negative/string_scalar_boundary_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`'
+check_rejects "utf8_decode_requires_usize" "test/negative/utf8_decode_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
+check_rejects "utf8_results_are_finite" "test/negative/utf8_results_are_finite.weft" 'return value type mismatch: expected `Option<i64>`, found `Option<usize>`' 2
+check_rejects "utf8_result_builder_private" "test/negative/utf8_result_builder_private.weft" 'unknown method' 1
+check_rejects "unicode_boundaries_require_usize" "test/negative/unicode_boundaries_require_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 6
+check_rejects "unicode_counts_are_usize" "test/negative/unicode_counts_are_usize.weft" 'return value type mismatch: expected `i64`, found `usize`' 6
 check_rejects "string_builder_constructor_private" "test/negative/string_builder_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "string_builder_append_requires_mutable" "test/negative/string_builder_append_requires_mutable.weft" "type error: exclusive borrow requires a mutable owner binding"
 check_rejects "string_builder_use_after_finish" "test/negative/string_builder_use_after_finish.weft" "type error: owned value used more than once"
