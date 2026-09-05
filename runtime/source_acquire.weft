@@ -8,8 +8,9 @@
 use runtime/alloc.{alloc_words, alloc_zeroed}
 use runtime/buffer.{bscopy, bu8, buf_len, buf_new, buf_take_data}
 use runtime/memory.{mem_copy, mem_load8_at, mem_load64_at, mem_store8_at, mem_store64_at}
-use runtime/sdk_archive.{EmbeddedSdkArchive, EmbeddedSdkArchiveAbsent, EmbeddedSdkArchivePresent, SdkArchiveFound, SdkArchiveLookup, SdkArchiveMalformed, SdkArchiveMissing, sdk_archive_digest, sdk_archive_embedded, sdk_archive_lookup}
+use runtime/sdk_archive.{EmbeddedSdkArchiveAbsent, EmbeddedSdkArchivePresent, EmbeddedSdkArchiveRejected, SdkArchive, SdkArchiveError, SdkArchiveFound, SdkArchiveInvalidPath, SdkArchiveMissing, sdk_archive_digest, sdk_archive_embedded, sdk_archive_lookup, sdk_archive_path_is_canonical}
 use runtime/syscall.{sys_close, sys_open_read, sys_read}
+use stdlib/result.{Err, Ok, Result}
 
 pub(package) type SdkOrigin {
   EmbeddedSdk(str),
@@ -17,10 +18,16 @@ pub(package) type SdkOrigin {
   NoSdk
 }
 
+pub(package) type SdkSource {
+  SdkSourcePresent(i64, i64),
+  SdkSourceMissing,
+  SdkSourceInvalidPath
+}
+
 pub(package) effect SourceAcquire {
   -- Typed semantic origin selected for canonical SDK modules and assets.
   fn sdk_origin() -> SdkOrigin
-  fn load_sdk(path: i64, path_len: i64) -> i64
+  fn load_sdk(path: i64, path_len: i64) -> SdkSource
   fn load(
     physical_path: i64,
     physical_len: i64,
@@ -68,12 +75,23 @@ fn source_acquire_load_file(path: i64, path_len: i64) -> i64 {
   result
 }
 
+fn source_acquire_sdk_file(path: i64, path_len: i64) -> SdkSource {
+  let file = source_acquire_load_file(path, path_len)
+  let data = mem_load64_at(file, 0)
+  if data == 0 { SdkSourceMissing }
+  else { SdkSourcePresent(data, mem_load64_at(file, 8)) }
+}
+
 pub(package) fn source_acquire_with_standalone<T, E>(
   body: () -[SourceAcquire, E]> T
 ) -[E]> T {
   handle body() {
     SourceAcquire.sdk_origin() -> resume(NoSdk)
-    SourceAcquire.load_sdk(path, path_len) -> resume(source_acquire_load_file(path, path_len))
+    SourceAcquire.load_sdk(path, path_len) -> {
+      let source = if sdk_archive_path_is_canonical(path, path_len) { source_acquire_sdk_file(path, path_len) }
+        else { SdkSourceInvalidPath }
+      resume(source)
+    }
     SourceAcquire.load(physical_path, physical_len, logical_path, logical_len, package_id) ->
       resume(source_acquire_load_file(physical_path, physical_len))
   }
@@ -104,42 +122,33 @@ pub(package) fn source_acquire_with_checkout<T, E>(
   handle body() {
     SourceAcquire.sdk_origin() -> resume(CheckoutSdk(sdk_root))
     SourceAcquire.load_sdk(path, path_len) -> {
-      let installed = source_acquire_sdk_physical_path(sdk_root, path, path_len)
-      resume(source_acquire_load_file(mem_load64_at(installed, 0), mem_load64_at(installed, 8)))
+      let source = if sdk_archive_path_is_canonical(path, path_len) {
+        let installed = source_acquire_sdk_physical_path(sdk_root, path, path_len)
+        source_acquire_sdk_file(mem_load64_at(installed, 0), mem_load64_at(installed, 8))
+      } else { SdkSourceInvalidPath }
+      resume(source)
     }
     SourceAcquire.load(physical_path, physical_len, logical_path, logical_len, package_id) ->
       resume(source_acquire_load_file(physical_path, physical_len))
   }
 }
 
-fn source_acquire_archive_result(archive: i64, archive_len: i64, path: i64, path_len: i64) -> i64 {
-  let result = alloc_words(2)
-  match sdk_archive_lookup(archive, archive_len, path, path_len) {
-    SdkArchiveFound(data, len) -> {
-      mem_store64_at(result, 0, data)
-      mem_store64_at(result, 8, len)
-    }
-    SdkArchiveMissing -> {
-      mem_store64_at(result, 0, 0)
-      mem_store64_at(result, 8, 0)
-    }
-    SdkArchiveMalformed -> {
-      mem_store64_at(result, 0, 0)
-      mem_store64_at(result, 8, 0)
-    }
+fn source_acquire_archive_result(archive: SdkArchive, path: i64, path_len: i64) -> SdkSource {
+  match sdk_archive_lookup(archive, path, path_len) {
+    SdkArchiveFound(data, len) -> SdkSourcePresent(data, len)
+    SdkArchiveMissing -> SdkSourceMissing
+    SdkArchiveInvalidPath -> SdkSourceInvalidPath
   }
-  result
 }
 
 pub(package) fn source_acquire_with_archive<T, E>(
-  archive: i64,
-  archive_len: i64,
+  archive: SdkArchive,
   body: () -[SourceAcquire, E]> T
 ) -[E]> T {
-  let digest = sdk_archive_digest(archive, archive_len)
+  let digest = sdk_archive_digest(archive)
   handle body() {
-    SourceAcquire.sdk_origin() -> resume(if __str_len(digest) == 0 { NoSdk } else { EmbeddedSdk(digest) })
-    SourceAcquire.load_sdk(path, path_len) -> resume(source_acquire_archive_result(archive, archive_len, path, path_len))
+    SourceAcquire.sdk_origin() -> resume(EmbeddedSdk(digest))
+    SourceAcquire.load_sdk(path, path_len) -> resume(source_acquire_archive_result(archive, path, path_len))
     SourceAcquire.load(physical_path, physical_len, logical_path, logical_len, package_id) ->
       resume(source_acquire_load_file(physical_path, physical_len))
   }
@@ -147,9 +156,10 @@ pub(package) fn source_acquire_with_archive<T, E>(
 
 pub(package) fn source_acquire_with_embedded<T, E>(
   body: () -[SourceAcquire, E]> T
-) -[E]> T {
+) -[E]> Result<T, SdkArchiveError> {
   match sdk_archive_embedded() {
-    EmbeddedSdkArchivePresent(archive, archive_len, digest) -> source_acquire_with_archive<T, E>(archive, archive_len, body)
-    EmbeddedSdkArchiveAbsent -> source_acquire_with_standalone<T, E>(body)
+    EmbeddedSdkArchivePresent(archive) -> Ok<T, SdkArchiveError>(source_acquire_with_archive<T, E>(archive, body))
+    EmbeddedSdkArchiveAbsent -> Ok<T, SdkArchiveError>(source_acquire_with_standalone<T, E>(body))
+    EmbeddedSdkArchiveRejected(error) -> Err<T, SdkArchiveError>(error)
   }
 }
