@@ -678,6 +678,8 @@ check_rejects "dir_inspect_cannot_mutate" "test/negative/dir_inspect_cannot_muta
 check_rejects "dir_platform_wrappers_retired" "test/negative/dir_platform_wrappers_retired.weft" "error[E4002]: unknown module member 'runtime_platform_dir_inspect' in import" 4
 check_rejects "dir_prefixed_list_removed" "test/negative/dir_prefixed_list_removed.weft" "error[E4002]: unknown module member 'dir_list' in import" 1
 check_rejects "console_cannot_write_file" "test/negative/console_cannot_write_file.weft" "error[E2001]:"
+check_rejects "console_runtime_input_handler_private" "test/negative/console_runtime_input_handler_private.weft" "type error: module does not export a handler implementation"
+check_rejects "console_runtime_output_handler_private" "test/negative/console_runtime_output_handler_private.weft" "type error: module does not export a handler implementation"
 check_rejects "console_platform_wrappers_retired" "test/negative/console_platform_wrappers_retired.weft" "error[E4002]: unknown module member 'runtime_platform_console_read' in import" 4
 check_rejects "safe_io_platform_residual_effect" "test/negative/safe_io_platform_residual_effect.weft" "error[E2001]:"
 check_rejects "if_condition_not_bool" "test/negative/if_condition_not_bool.weft" "type error: boolean expression is not bool"

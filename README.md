@@ -5,43 +5,31 @@ A compiled, general-purpose language with set-theoretic types, algebraic effects
 **Every type is a set. Every side effect is in the signature.**
 
 ```weft run
-use runtime/console_write as terminal
-use stdlib/console.{println}
+use stdlib/console as console
+use stdlib/console/terminal as terminal
 
-default handler terminal()
-
-trait Greeting {
-  fn greeting(self) -> str
+effect Audience {
+  fn name() -> str
 }
 
-impl Greeting for str {
-  fn greeting(self: str) -> str { "hello, {self}!" }
-}
-
-effect Greet {
-  fn say(message: str) -> nil
-}
-
-fn welcome<T: Greeting>(guest: T) -[Greet]> nil {
-  Greet.say(guest.greeting())
+fn welcome() -[Audience]> str {
+  "Hello, ".concat(Audience.name()).concat("!")
 }
 
 fn main() -> nil {
-  handle welcome<str>("world") {
-    Greet.say(message) -> {
-      println(message)
-      resume(nil)
+  with terminal() {
+    handle console.println(welcome()) {
+      Audience.name() -> resume("world")
     }
   }
 }
 ```
 
-The trait is pure, `Greet` describes the program's intent, and its handler
-chooses terminal output as the interpretation. `default handler terminal()`
-installs the production `ConsoleWrite` implementation for the module. Normal
-`nil` completion means exit status 0. `println` is the terminal-on-write-error
-convenience; `try_println` preserves `Result<usize, IoError>` when recovery is
-part of the program. No runtime callback or ignored error is hiding here.
+`welcome` says exactly what it needs: an interpretation of `Audience`. The
+handler supplies `"world"`; changing the handler changes the interpretation,
+not the function. The separately namespaced terminal handler discharges
+`ConsoleWrite`, and normal `nil` completion means exit status 0. No runtime
+callback or implicit process-wide effect handler is hiding here.
 
 Every Weft example in this README is checked by the suite; complete programs
 are compiled and run with the checked-in `./weft` binary.
@@ -60,7 +48,7 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 **Pre-alpha and self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root. Until the public-alpha gate closes, source, package, fact-schema, and versioned native-binding contracts may change without compatibility support.
 
-- 4,614 runtime test blocks, plus 1,062 negative (must-fail) cases
+- 4528 runtime test blocks across 367 files, plus 1070 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
 - Current release gates: the complete target-local Linux suite on adequate hardware, hardening/governance, final status/support documentation, and the two-target outside-user exercise. Install/release UX, project signing, free community macOS distribution, and native-binding platform diagnostics are complete
