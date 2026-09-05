@@ -57,7 +57,7 @@ if [ -z "${WEFT_TOOL_SHARD:-}" ]; then
   tool_elapsed=$(($(date +%s) - tool_started))
   echo "Tool boundary timing: ${tool_elapsed}s wall, ${tool_jobs} shard jobs"
   if [ "${WEFT_TEST_PLATFORM:-$(uname -s)}" = Darwin ]; then
-    echo "Tool boundary summary: 1196 passed, 0 failed"
+    echo "Tool boundary summary: 1198 passed, 0 failed"
   else
     echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
   fi
@@ -791,7 +791,9 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_random_pins_validated_bound" "$(<"$tmp_out")" "fn bound(upper: usize) -> Result<Bound, BoundError>"
     assert_contains "doc_stdlib_random_pins_unbiased_step" "$(<"$tmp_out")" "fn next_below(self: State, bound: Bound) -> (State, usize)"
   elif [ "$stdlib_doc_name" = "utf8" ]; then
-    assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
+    assert_contains "doc_stdlib_utf8_pins_public_surface" "$(<"$tmp_out")" "Public API items: 11. Documented: 11."
+    assert_contains "doc_stdlib_utf8_pins_typed_encode_failure" "$(<"$tmp_out")" "InvalidScalar(usize, i64)"
+    assert_contains "doc_stdlib_utf8_pins_scalar_traversal" "$(<"$tmp_out")" "fn from_scalars<S: IntoIterator & {type Item = i64}>(scalars: S) -> Result<str, Utf8EncodeError>"
   elif [ "$stdlib_doc_name" = "time" ]; then
     assert_contains "doc_stdlib_time_pins_duration_only" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
     assert_not_contains "doc_stdlib_time_has_no_combined_capability" "$(<"$tmp_out")" "pub effect Time"
