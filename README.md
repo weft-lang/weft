@@ -4,32 +4,36 @@ A compiled, general-purpose language with set-theoretic types, algebraic effects
 
 **Every type is a set. Every side effect is in the signature.**
 
-```weft run
-use stdlib/console as console
-use stdlib/console/terminal as terminal
+Run a file-writing program entirely in memory:
 
-effect Audience {
-  fn name() -> str
+```weft test
+use stdlib/file as file
+use stdlib/file.{FileWrite}
+use stdlib/io/types.{IoError}
+use stdlib/path as path
+use stdlib/result.{Result, Ok}
+use stdlib/test.{Test}
+
+fn publish() -[FileWrite]> usize {
+  let page = path.from_utf8("index.html").expect("valid path")
+  file.write_text(page, "<h1>Hello, world!</h1>").expect("write failed")
 }
 
-fn welcome() -[Audience]> str {
-  "Hello, ".concat(Audience.name()).concat("!")
-}
-
-fn main() -> nil {
-  with terminal() {
-    handle console.println(welcome()) {
-      Audience.name() -> resume("world")
+test "preview the page without touching disk" {
+  let written = handle publish() {
+    FileWrite.write_all(destination, contents, mode) -> {
+      Test.assert_str_eq(contents.to_utf8().expect("UTF-8 page"), "<h1>Hello, world!</h1>")
+      resume(Ok<usize, IoError>(contents.len()))
     }
   }
+  Test.assert_eq_usize(written, 22)
 }
 ```
 
-`welcome` says exactly what it needs: an interpretation of `Audience`. The
-handler supplies `"world"`; changing the handler changes the interpretation,
-not the function. The separately namespaced terminal handler discharges
-`ConsoleWrite`, and normal `nil` completion means exit status 0. No runtime
-callback or implicit process-wide effect handler is hiding here.
+The handler intercepts writes even inside the standard library, checks the
+contents, and resumes `publish`. The compiler checks that `FileWrite` is its
+only required capability. Tests, previews, and real filesystem writes can all
+run the same application code with different handlers.
 
 Every Weft example in this README is checked by the suite; complete programs
 are compiled and run with the checked-in `./weft` binary.
@@ -48,7 +52,7 @@ Weft is a compiled language that combines set-theoretic types, algebraic effects
 
 **Pre-alpha and self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root. Until the public-alpha gate closes, source, package, fact-schema, and versioned native-binding contracts may change without compatibility support.
 
-- 4621 runtime test blocks across 379 files, plus 1077 negative (must-fail) cases
+- 4662 runtime test blocks across 383 files, plus 1080 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
 - Current release gates: the complete target-local Linux suite on adequate hardware, hardening/governance, final status/support documentation, and the two-target outside-user exercise. Install/release UX, project signing, free community macOS distribution, and native-binding platform diagnostics are complete
