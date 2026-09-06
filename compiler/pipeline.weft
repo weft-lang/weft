@@ -66450,28 +66450,70 @@ pub(package) fn pipeline_ir_storage_version_root(value: i64, parents: Map<i64, i
   current
 }
 
-pub(package) fn pipeline_ir_storage_block_versions(insts: IrInstList, block: i64, ordinal: i64, current: i64, next: i64, reads: List<PipelineIrStorageReadVersion>) -> PipelineIrStorageBlockVersions {
+-- Callers select observations; storage transitions have one canonical producer.
+pub(package) type PipelineIrStorageVersionDemand { PipelineIrStorageReadsOnly, PipelineIrStorageReadsAndVectorAccesses }
+pub(package) type PipelineIrStorageAccessVersion { PipelineIrStorageAccessVersion(i64, i64, i64, i64, i64) }
+pub(package) type PipelineIrStorageTimelineBlock {
+  PipelineIrStorageTimelineBlock(i64, i64, List<PipelineIrStorageReadVersion>, List<PipelineIrStorageAccessVersion>)
+}
+pub(package) type PipelineIrStorageTimeline {
+  PipelineIrStorageTimeline(Map<i64, i64>, List<PipelineIrStorageReadVersion>, List<PipelineIrStorageAccessVersion>)
+}
+
+pub(package) fn pipeline_ir_storage_timeline_block(insts: IrInstList, block: i64, ordinal: i64, current: i64, next: i64,
+  reads: List<PipelineIrStorageReadVersion>, accesses: List<PipelineIrStorageAccessVersion>,
+  demand: PipelineIrStorageVersionDemand) -> PipelineIrStorageTimelineBlock {
   match insts {
-    IrInstNil -> PipelineIrStorageBlockVersions(current, next, reads)
-    IrInstCons(inst, rest) -> match pipeline_ir_storage_observation(inst) {
-      PipelineIrObservedStorageRead(read) -> pipeline_ir_storage_block_versions(rest, block, ordinal + 1, current, next,
-        Cons(PipelineIrStorageReadVersion(read, block, ordinal, current), reads))
-      PipelineIrStorageMayChange -> pipeline_ir_storage_block_versions(rest, block, ordinal + 1, next, next + 1, reads)
-      _ -> pipeline_ir_storage_block_versions(rest, block, ordinal + 1, current, next, reads)
+    IrInstNil -> PipelineIrStorageTimelineBlock(current, next, reads, accesses)
+    IrInstCons(inst, rest) -> {
+      let observed_accesses = match demand {
+        PipelineIrStorageReadsOnly -> accesses
+        PipelineIrStorageReadsAndVectorAccesses -> match inst {
+          IrVectorGetI64(dst, vec, index, _, mode) if dst >= 0 and (mode band 7) != 7 ->
+            Cons(PipelineIrStorageAccessVersion(dst, vec, index, block, current), accesses)
+          IrVectorSetI64(dst, vec, index, _, mode) if dst >= 0 and (mode band 7) != 7 ->
+            Cons(PipelineIrStorageAccessVersion(dst, vec, index, block, current), accesses)
+          _ -> accesses
+        }
+      }
+      match pipeline_ir_storage_observation(inst) {
+        PipelineIrObservedStorageRead(read) -> pipeline_ir_storage_timeline_block(rest, block, ordinal + 1, current, next,
+          Cons(PipelineIrStorageReadVersion(read, block, ordinal, current), reads), observed_accesses, demand)
+        PipelineIrStorageMayChange -> pipeline_ir_storage_timeline_block(rest, block, ordinal + 1, next, next + 1,
+          reads, observed_accesses, demand)
+        PipelineIrStoragePreserved -> pipeline_ir_storage_timeline_block(rest, block, ordinal + 1, current, next,
+          reads, observed_accesses, demand)
+      }
     }
   }
 }
 
-pub(package) fn pipeline_ir_storage_version_build(blocks: IrBlockList, entry: i64, next: i64, outputs: Map<i64, i64>, reads: List<PipelineIrStorageReadVersion>) -> PipelineIrStorageVersionBuild {
+pub(package) fn pipeline_ir_storage_block_versions(insts: IrInstList, block: i64, ordinal: i64, current: i64, next: i64,
+  reads: List<PipelineIrStorageReadVersion>) -> PipelineIrStorageBlockVersions {
+  match pipeline_ir_storage_timeline_block(insts, block, ordinal, current, next, reads, Nil<PipelineIrStorageAccessVersion>(), PipelineIrStorageReadsOnly) {
+    PipelineIrStorageTimelineBlock(output, following, observed, _) -> PipelineIrStorageBlockVersions(output, following, observed)
+  }
+}
+
+pub(package) fn pipeline_ir_storage_timeline_build(blocks: IrBlockList, entry: i64, next: i64,
+  outputs: Map<i64, i64>, reads: List<PipelineIrStorageReadVersion>, accesses: List<PipelineIrStorageAccessVersion>,
+  demand: PipelineIrStorageVersionDemand) -> PipelineIrStorageTimeline {
   match blocks {
-    IrBlockListNil -> PipelineIrStorageVersionBuild(outputs, reads)
+    IrBlockListNil -> PipelineIrStorageTimeline(outputs, reads, accesses)
     IrBlockListCons(IrBlock(id, _, insts, _), rest) -> {
       let initial = if id == entry { 0 } else { id + 1 }
-      match pipeline_ir_storage_block_versions(insts, id, 0, initial, next, reads) {
-        PipelineIrStorageBlockVersions(output, following, observed) ->
-          pipeline_ir_storage_version_build(rest, entry, following, outputs.insert(id, output), observed)
+      match pipeline_ir_storage_timeline_block(insts, id, 0, initial, next, reads, accesses, demand) {
+        PipelineIrStorageTimelineBlock(output, following, observed, accessed) ->
+          pipeline_ir_storage_timeline_build(rest, entry, following, outputs.insert(id, output), observed, accessed, demand)
       }
     }
+  }
+}
+
+pub(package) fn pipeline_ir_storage_version_build(blocks: IrBlockList, entry: i64, next: i64,
+  outputs: Map<i64, i64>, reads: List<PipelineIrStorageReadVersion>) -> PipelineIrStorageVersionBuild {
+  match pipeline_ir_storage_timeline_build(blocks, entry, next, outputs, reads, Nil<PipelineIrStorageAccessVersion>(), PipelineIrStorageReadsOnly) {
+    PipelineIrStorageTimeline(out, observed, _) -> PipelineIrStorageVersionBuild(out, observed)
   }
 }
 
@@ -67332,6 +67374,280 @@ pub(package) fn pipeline_ir_prepare_checked_calls(functions: IrFunctionList, fac
   }
 }
 
+-- Dynamic row bounds use the same signed predicate regions and storage versions
+-- as scalar simplification. For L = length(v), R >= 0, C >= 0, C < W and
+-- R < L / W imply W > 0 and R*W+C <= (L/W)*W-1 <= L-1. Every intermediate
+-- fits in signed i64. The vector and storage version must match the length
+-- observation. A write consumes its input version before creating a new one.
+-- Facts retain their immutable source CFG; the consumer changes check bits only.
+pub(package) type PipelineIrRowRangeQuotient { PipelineIrRowRangeQuotient(i64, i64, i64, i64) }
+pub(package) type PipelineIrRowRangeIndex { PipelineIrRowRangeIndex(i64, i64, i64) }
+pub(package) type PipelineIrRowRangeFacts { PipelineIrRowRangeFacts(IrBlockList, Map<i64, bool>) }
+pub(package) type PipelineIrRowRangeContext {
+  constants: PipelineIrConstEnv,
+  definitions: Map<i64, IrInst>,
+  regions: Map<i64, List<PipelineIrScalarRegionOutcome>>,
+  doms: i64,
+  words: i64,
+  zero: i64,
+  parents: Map<i64, i64>
+}
+
+pub(package) fn pipeline_ir_row_range_demand(blocks: IrBlockList) -> bool {
+  let mut access = false
+  let mut divide = false
+  let mut current = blocks
+  let mut walking = true
+  while walking {
+    match current {
+      IrBlockListNil -> { walking = false }
+      IrBlockListCons(IrBlock(_, _, insts, _), rest) -> {
+        let mut instructions = insts
+        let mut scanning = true
+        while scanning {
+          match instructions {
+            IrInstNil -> { scanning = false }
+            IrInstCons(inst, tail) -> {
+              match inst {
+                IrVectorGetI64(_, _, _, _, mode) if (mode band 7) != 7 -> { access = true }
+                IrVectorSetI64(_, _, _, _, mode) if (mode band 7) != 7 -> { access = true }
+                IrBinaryI64(_, IrDiv, _, _) -> { divide = true }
+                _ -> nil
+              }
+              instructions = tail
+            }
+          }
+        }
+        current = rest
+      }
+    }
+  }
+  access and divide
+}
+
+pub(package) fn pipeline_ir_row_range_definitions(blocks: IrBlockList, index: Map<i64, IrInst>) -> Map<i64, IrInst> {
+  match blocks {
+    IrBlockListNil -> index
+    IrBlockListCons(IrBlock(_, _, insts, _), rest) -> {
+      let mut definitions = index
+      let mut instructions = insts
+      let mut walking = true
+      while walking {
+        match instructions {
+          IrInstNil -> { walking = false }
+          IrInstCons(inst, tail) -> {
+            let dst = pipeline_ir_inst_def_or(inst, 0 - 1)
+            if dst >= 0 { definitions = definitions.insert(dst, inst) } else { nil }
+            instructions = tail
+          }
+        }
+      }
+      pipeline_ir_row_range_definitions(rest, definitions)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_row_range_quotients(definitions: Map<i64, IrInst>, reads: List<PipelineIrStorageReadVersion>,
+  parents: Map<i64, i64>, len_hash: i64) -> List<PipelineIrRowRangeQuotient> {
+  let lengths = reads.fold<Map<i64, PipelineIrRowRangeQuotient>>(map.new<i64, PipelineIrRowRangeQuotient>(),
+    (index: Map<i64, PipelineIrRowRangeQuotient>, read: PipelineIrStorageReadVersion) => match read {
+      PipelineIrStorageReadVersion(IrCallI64(dst, hash, IrValueCons(vec, IrValueNil)), _, _, version) if hash == len_hash ->
+        index.insert(dst, PipelineIrRowRangeQuotient(vec, dst, 0 - 1, pipeline_ir_storage_version_root(version, parents)))
+      _ -> index
+    })
+  definitions.fold<List<PipelineIrRowRangeQuotient>>(Nil<PipelineIrRowRangeQuotient>(),
+    (result: List<PipelineIrRowRangeQuotient>, dst: i64, inst: IrInst) => match inst {
+      IrBinaryI64(_, IrDiv, length, width) -> match lengths.get(length) {
+        Some(PipelineIrRowRangeQuotient(vec, _, _, version)) -> Cons(PipelineIrRowRangeQuotient(vec, dst, width, version), result)
+        None -> result
+      }
+      _ -> result
+    })
+}
+
+pub(package) fn pipeline_ir_row_range_product(value: i64, column: i64, definitions: Map<i64, IrInst>) -> List<PipelineIrRowRangeIndex> {
+  match definitions.get(value) {
+    Some(IrBinaryI64(_, IrMul, left, right)) ->
+      Cons(PipelineIrRowRangeIndex(left, right, column), Cons(PipelineIrRowRangeIndex(right, left, column), Nil<PipelineIrRowRangeIndex>()))
+    _ -> Nil<PipelineIrRowRangeIndex>()
+  }
+}
+
+pub(package) fn pipeline_ir_row_range_indices(value: i64, context: PipelineIrRowRangeContext) -> List<PipelineIrRowRangeIndex> {
+  match context.definitions.get(value) {
+    Some(IrBinaryI64(_, IrAdd, left, right)) ->
+      pipeline_ir_row_range_product(left, right, context.definitions).concat(pipeline_ir_row_range_product(right, left, context.definitions))
+    Some(IrBinaryI64(_, IrMul, left, right)) if context.zero >= 0 ->
+      Cons(PipelineIrRowRangeIndex(left, right, context.zero), Cons(PipelineIrRowRangeIndex(right, left, context.zero), Nil<PipelineIrRowRangeIndex>()))
+    _ -> Nil<PipelineIrRowRangeIndex>()
+  }
+}
+
+pub(package) fn pipeline_ir_row_range_known_less(left: i64, right: i64, wanted: bool, block: i64, context: PipelineIrRowRangeContext) -> bool {
+  let a = pipeline_ir_const_env_lookup(context.constants, left)
+  let b = pipeline_ir_const_env_lookup(context.constants, right)
+  if pipeline_ir_const_lookup_valid(a) == 1 and pipeline_ir_const_lookup_valid(b) == 1 {
+    (pipeline_ir_const_lookup_value(a) < pipeline_ir_const_lookup_value(b)) == wanted
+  } else {
+    let predicate = PipelineIrScalarPredicate(PipelineIrScalarLess, left, right, true)
+    let bucket = match context.regions.get(pipeline_ir_scalar_predicate_hash(predicate, context.constants)) {
+      Some(found) -> found
+      None -> Nil<PipelineIrScalarRegionOutcome>()
+    }
+    match pipeline_ir_scalar_known_outcome(predicate, block, bucket, context.constants, context.doms, context.words) {
+      Some(truth) -> truth == wanted
+      None -> false
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_row_range_nonnegative(value: i64, block: i64, context: PipelineIrRowRangeContext) -> bool {
+  let found = pipeline_ir_const_env_lookup(context.constants, value)
+  if pipeline_ir_const_lookup_valid(found) == 1 { pipeline_ir_const_lookup_value(found) >= 0 }
+  else { context.zero >= 0 and pipeline_ir_row_range_known_less(value, context.zero, false, block, context) }
+}
+
+pub(package) fn pipeline_ir_row_range_proves_index(index: PipelineIrRowRangeIndex, vec: i64, version: i64, block: i64,
+  quotients: List<PipelineIrRowRangeQuotient>, context: PipelineIrRowRangeContext) -> bool {
+  match index {
+    PipelineIrRowRangeIndex(row, width, column) -> {
+      if not pipeline_ir_row_range_nonnegative(row, block, context) or not pipeline_ir_row_range_nonnegative(column, block, context) or
+        not pipeline_ir_row_range_known_less(column, width, true, block, context) { false } else {
+        let mut current = quotients
+        let mut proven = false
+        let mut walking = true
+        while walking {
+          match current {
+            Nil -> { walking = false }
+            Cons(PipelineIrRowRangeQuotient(source, quotient, stride, state), rest) -> {
+              if source == vec and state == version and pipeline_ir_scalar_operands_equal(width, stride, context.constants) and
+                pipeline_ir_row_range_known_less(row, quotient, true, block, context) {
+                proven = true
+                walking = false
+              } else { current = rest }
+            }
+          }
+        }
+        proven
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_row_range_proves_access(access: PipelineIrStorageAccessVersion, quotients: List<PipelineIrRowRangeQuotient>, context: PipelineIrRowRangeContext) -> bool {
+  match access {
+    PipelineIrStorageAccessVersion(_, vec, index, block, state) -> {
+      let version = pipeline_ir_storage_version_root(state, context.parents)
+      let mut candidates = pipeline_ir_row_range_indices(index, context)
+      let mut proven = false
+      let mut walking = true
+      while walking {
+        match candidates {
+          Nil -> { walking = false }
+          Cons(candidate, tail) -> {
+            if pipeline_ir_row_range_proves_index(candidate, vec, version, block, quotients, context) {
+              proven = true
+              walking = false
+            } else { candidates = tail }
+          }
+        }
+      }
+      proven
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_row_range_facts(blocks: IrBlockList) -> PipelineIrRowRangeFacts {
+  let maximum = if pipeline_ir_row_range_demand(blocks) { pipeline_ir_native_resident_max_block_id(blocks) } else { 0 - 1 }
+  if maximum < 0 or maximum > 511 or pipeline_ir_flow_function_has_nested_control(blocks) or ir_block_list_inst_count(blocks) > 4096 {
+    PipelineIrRowRangeFacts(blocks, map.new<i64, bool>())
+  } else {
+    let entry = match blocks { IrBlockListCons(IrBlock(id, _, _, _), _) -> id, _ -> 0 - 1 }
+    let definitions = pipeline_ir_row_range_definitions(blocks, map.new<i64, IrInst>())
+    let constants = pipeline_ir_const_env_from_block_list(blocks, pipeline_ir_const_env_empty())
+    let zero = definitions.fold<i64>(0 - 1, (found: i64, value: i64, inst: IrInst) =>
+      if found >= 0 { found } else { match inst { IrConstI64(_, 0) -> value, _ -> found } })
+    match pipeline_ir_storage_timeline_build(blocks, entry, maximum + 2, map.new<i64, i64>(),
+      Nil<PipelineIrStorageReadVersion>(), Nil<PipelineIrStorageAccessVersion>(), PipelineIrStorageReadsAndVectorAccesses) {
+      PipelineIrStorageTimeline(outputs, reads, accesses) -> {
+        let parents = pipeline_ir_storage_version_parents(blocks, entry, pipeline_ir_flow_predecessor_index(blocks, map.new<i64, List<i64>>()), outputs)
+        let quotients = pipeline_ir_row_range_quotients(definitions, reads, parents, pipeline_ir_vector_len_hash())
+        let predicates = pipeline_ir_scalar_predicate_definitions(blocks, map.new<i64, PipelineIrScalarPredicate>())
+        let context = PipelineIrRowRangeContext {
+          constants: constants,
+          definitions: definitions,
+          regions: pipeline_ir_scalar_outcome_regions(blocks, entry, pipeline_ir_block_pred_counts(blocks), predicates, constants,
+            map.new<i64, List<PipelineIrScalarRegionOutcome>>()),
+          doms: pipeline_ir_dominators(blocks, maximum),
+          words: pipeline_ir_dominators_words(maximum),
+          zero: zero,
+          parents: parents
+        }
+        let proven = accesses.fold<Map<i64, bool>>(map.new<i64, bool>(),
+          (result: Map<i64, bool>, access: PipelineIrStorageAccessVersion) => {
+            if pipeline_ir_row_range_proves_access(access, quotients, context) {
+              match access { PipelineIrStorageAccessVersion(dst, _, _, _, _) -> result.insert(dst, true) }
+            } else { result }
+          })
+        PipelineIrRowRangeFacts(blocks, proven)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_row_range_apply_insts(insts: IrInstList, proven: Map<i64, bool>) -> IrInstList {
+  match insts {
+    IrInstNil -> IrInstNil
+    IrInstCons(inst, rest) -> {
+      let next = match inst {
+        IrVectorGetI64(dst, vec, index, fallback, mode) if proven.contains_key(dst) -> IrVectorGetI64(dst, vec, index, fallback, mode bor 7)
+        IrVectorSetI64(dst, vec, index, value, mode) if proven.contains_key(dst) -> IrVectorSetI64(dst, vec, index, value, mode bor 7)
+        _ -> inst
+      }
+      IrInstCons(next, pipeline_ir_row_range_apply_insts(rest, proven))
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_row_range_apply_blocks(blocks: IrBlockList, proven: Map<i64, bool>) -> IrBlockList {
+  match blocks {
+    IrBlockListNil -> IrBlockListNil
+    IrBlockListCons(IrBlock(id, params, insts, term), rest) ->
+      IrBlockListCons(IrBlock(id, params, pipeline_ir_row_range_apply_insts(insts, proven), term), pipeline_ir_row_range_apply_blocks(rest, proven))
+  }
+}
+
+pub(package) fn pipeline_ir_row_range_apply(facts: PipelineIrRowRangeFacts) -> IrBlockList {
+  match facts {
+    PipelineIrRowRangeFacts(blocks, proven) ->
+      if proven.len() == 0 { blocks } else { pipeline_ir_row_range_apply_blocks(blocks, proven) }
+  }
+}
+
+pub(package) fn pipeline_ir_row_range_functions(functions: IrFunctionList, tt: i64) -> IrFunctionList {
+  match functions {
+    IrFunctionNil -> IrFunctionNil
+    IrFunctionCons(IrFunction(hash, params, blocks, source), rest) -> {
+      -- Ineligible functions retain their original graph without creating
+      -- scratch state or walking captures to prove an unchanged result safe.
+      if not pipeline_ir_row_range_demand(blocks) {
+        IrFunctionCons(IrFunction(hash, params, blocks, source), pipeline_ir_row_range_functions(rest, tt))
+      } else {
+      let mark = alloc_bump_mark()
+      let checkpoint = ttable_linear_layout_cache_checkpoint(tt)
+      let rewritten = pipeline_ir_row_range_apply(pipeline_ir_row_range_facts(blocks))
+      let head = IrFunctionCons(IrFunction(hash, params, rewritten, source), IrFunctionNil)
+      let end = alloc_bump_mark()
+      if pipeline_ir_function_list_capture_payload_in_range(head, mark, end) == 0 {
+        ttable_linear_layout_cache_restore(tt, checkpoint)
+        alloc_bump_restore_same_segment(mark)
+      } else { 0 }
+      pipeline_ir_function_list_append(head, pipeline_ir_row_range_functions(rest, tt))
+      }
+    }
+  }
+}
+
 pub(package) fn pipeline_finish_typed_optimisation(
   typed: TypedModule,
   canonical_functions: IrFunctionList,
@@ -67366,7 +67682,8 @@ pub(package) fn pipeline_finish_typed_optimisation(
       let transferred_functions = if promote == 1 {
         pipeline_ir_ownership_transfer_functions(consuming_functions, consuming_functions, consuming_facts)
       } else { consuming_functions }
-      let final_functions = if promote == 1 { pipeline_ir_reuse_functions(transferred_functions) } else { transferred_functions }
+      let reused_functions = if promote == 1 { pipeline_ir_reuse_functions(transferred_functions) } else { transferred_functions }
+      let final_functions = if promote == 1 { pipeline_ir_row_range_functions(reused_functions, tt) } else { reused_functions }
       OptimisedIrModule(
         final_functions,
         0,
