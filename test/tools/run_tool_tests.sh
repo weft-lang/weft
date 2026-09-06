@@ -56,11 +56,7 @@ if [ -z "${WEFT_TOOL_SHARD:-}" ]; then
 
   tool_elapsed=$(($(date +%s) - tool_started))
   echo "Tool boundary timing: ${tool_elapsed}s wall, ${tool_jobs} shard jobs"
-  if [ "${WEFT_TEST_PLATFORM:-$(uname -s)}" = Darwin ]; then
-    echo "Tool boundary summary: 1224 passed, 0 failed"
-  else
-    echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
-  fi
+  echo "Tool boundary summary: ${#tool_shards[@]} shards passed, 0 failed"
   exit 0
 fi
 
@@ -1490,7 +1486,11 @@ assert_contains "elf_linux_panic_selects_exit_group" "$elf_linux_panic_disassemb
 assert_contains "elf_linux_panic_invokes_linux_svc" "$elf_linux_panic_disassembly" $'svc\t#0'
 assert_contains "elf_linux_panic_uses_aarch64_max_page_alignment" "$elf_linux_panic_headers" "align 2**16"
 elf_linux_panic_load_count=$(printf "%s\n" "$elf_linux_panic_headers" | awk '/^    LOAD / { count += 1 } END { print count + 0 }')
-assert_equals "elf_linux_panic_elides_unreachable_writable_load" "$elf_linux_panic_load_count" "1"
+# Literal bytes remain in executable image data; their stable two-word
+# descriptors occupy zero-fill static storage instead of allocating on panic.
+assert_equals "elf_linux_panic_has_text_and_literal_descriptor_loads" "$elf_linux_panic_load_count" "2"
+elf_linux_panic_writable_load=$(printf "%s\n" "$elf_linux_panic_headers" | awk '/^    LOAD / { in_load = 1; next } in_load { if ($NF == "rw-") print; in_load = 0 }')
+assert_contains "elf_linux_panic_literal_descriptors_use_zero_fill" "$elf_linux_panic_writable_load" "filesz 0x0000000000000000"
 fi
 
 if [ "$WEFT_TOOL_SHARD" = elf_io ]; then

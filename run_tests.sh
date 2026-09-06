@@ -236,7 +236,7 @@ run_timed_phase() {
 }
 
 run_markdown_phase() {
-  bash test/docs/run_markdown_examples.sh README.md docs/getting-started.md docs/networking.md &&
+  bash test/docs/run_markdown_examples.sh README.md docs/getting-started.md docs/networking.md docs/concurrency.md docs/testing.md &&
     bash test/docs/check_readme_facts.sh
 }
 
@@ -402,11 +402,7 @@ collect_tool_phase() {
   fi
   echo "Tool boundary timing: ${timing}s wall, ${WEFT_FEEDBACK_JOBS} shared feedback jobs"
   if [ "$status" -eq 0 ]; then
-    if [ "${WEFT_TEST_PLATFORM:-$(uname -s)}" = Darwin ]; then
-      echo "Tool boundary summary: 1147 passed, 0 failed"
-    else
-      echo "Tool boundary summary: host-applicable linux-aarch64 matrix passed"
-    fi
+    echo "Tool boundary summary: 8 shards passed, 0 failed"
     PASS=$((PASS+1))
   else
     echo "  ✗ tool boundary tests failed"
