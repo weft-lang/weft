@@ -1,0 +1,126 @@
+use compiler/pipeline.{*}
+use compiler/ir.{*}
+use stdlib/list.{Cons, Nil}
+use stdlib/test.{Test}
+
+fn domain_is_whole(domain: PipelineIrStorageDomain) -> bool {
+  match domain { PipelineIrWholeStorage -> true, PipelineIrObjectStorage -> false }
+}
+
+fn domain_read(dst: i64) -> IrInst { IrFieldLoadI64(dst, 0, 77, 0) }
+fn domain_write() -> IrInst { IrVectorSetI64(4, 1, 2, 2, 0) }
+
+test "scalar element writes have a distinct storage footprint" {
+  Test.assert_true(match pipeline_ir_storage_observation(domain_write()) {
+    PipelineIrVectorElementWrite -> true
+    _ -> false
+  })
+  Test.assert_true(match pipeline_ir_storage_observation(IrPtrStoreI64(4, 1, 2, IrStorageWord64)) {
+    PipelineIrStorageMayChange -> true
+    _ -> false
+  })
+  Test.assert_true(match pipeline_ir_storage_observation(IrVectorGetI64(4, 1, 2, 2, 0)) {
+    PipelineIrStoragePreserved -> true
+    _ -> false
+  })
+}
+
+test "facts retain their domain and element accesses observe the incoming version" {
+  let insts = IrInstCons(domain_read(3), IrInstCons(domain_write(),
+    IrInstCons(domain_read(5), IrInstCons(IrVectorGetI64(6, 1, 2, 2, 0), IrInstNil))))
+  for domain in [PipelineIrWholeStorage, PipelineIrObjectStorage] {
+    match pipeline_ir_storage_timeline_block(insts, 7, 0, 5, 100,
+      Nil<PipelineIrStorageReadVersion>(), Nil<PipelineIrStorageAccessVersion>(), PipelineIrStorageReadsAndVectorAccesses, domain) {
+      PipelineIrStorageTimelineBlock(reported, output, next, reads, accesses) -> {
+        let after = if domain_is_whole(domain) { 100 } else { 5 }
+        Test.assert_true(domain_is_whole(reported) == domain_is_whole(domain))
+        Test.assert_eq(output, after)
+        Test.assert_eq(next, if domain_is_whole(domain) { 101 } else { 100 })
+        Test.assert_true(match reads {
+          Cons(PipelineIrStorageReadVersion(_, 7, 2, second), Cons(PipelineIrStorageReadVersion(_, 7, 0, first), Nil)) ->
+            first == 5 and second == after
+          _ -> false
+        })
+        Test.assert_true(match accesses {
+          Cons(PipelineIrStorageAccessVersion(6, 1, 2, 7, second), Cons(PipelineIrStorageAccessVersion(4, 1, 2, 7, first), Nil)) ->
+            first == 5 and second == after
+          _ -> false
+        })
+      }
+    }
+  }
+}
+
+fn check_object_recipe(first: IrInst, second: IrInst, write: IrInst) -[Test]> nil {
+  let blocks = IrBlockListCons(IrBlock(0, IrValueNil,
+    IrInstCons(first, IrInstCons(write, IrInstCons(second, IrInstNil))), IrTermReturn(5)), IrBlockListNil)
+  Test.assert_eq(pipeline_ir_verify_function(IrFunction(12345, 3, blocks, 0)), 0)
+  let facts = pipeline_ir_storage_read_reuse_facts(blocks)
+  Test.assert_eq(pipeline_ir_storage_read_reuse_count(facts), 1)
+  let result = pipeline_ir_flow_apply_storage_read_reuse(facts)
+  Test.assert_eq(pipeline_ir_verify_function(IrFunction(12345, 3, result, 0)), 0)
+  Test.assert_true(match result {
+    IrBlockListCons(IrBlock(_, _, IrInstCons(_, IrInstCons(IrVectorSetI64(4, _, _, _, _), IrInstNil)), IrTermReturn(3)), IrBlockListNil) -> true
+    _ -> false
+  })
+  nil
+}
+
+test "element writes preserve existing aggregate fields tags payloads and vector headers" {
+  check_object_recipe(domain_read(3), domain_read(5), domain_write())
+  check_object_recipe(IrRecordLayoutWordLoadI64(3, 0, 24, 77, 8), IrRecordLayoutWordLoadI64(5, 0, 24, 77, 8), domain_write())
+  check_object_recipe(IrVariantTagI64(3, 0), IrVariantTagI64(5, 0), domain_write())
+  check_object_recipe(IrVariantPayloadI64(3, 0, 1), IrVariantPayloadI64(5, 0, 1), domain_write())
+  let args = IrValueCons(1, IrValueNil)
+  check_object_recipe(IrCallI64(3, pipeline_ir_vector_len_hash(), args), IrCallI64(5, pipeline_ir_vector_len_hash(), args), domain_write())
+}
+
+test "object stability never turns changed element loads into equal values" {
+  let blocks = IrBlockListCons(IrBlock(0, IrValueNil,
+    IrInstCons(IrVectorGetI64(3, 1, 2, 2, 0), IrInstCons(domain_write(),
+    IrInstCons(IrVectorGetI64(5, 1, 2, 2, 0), IrInstCons(IrBinaryI64(6, IrSub, 5, 3), IrInstNil)))), IrTermReturn(6)), IrBlockListNil)
+  let facts = pipeline_ir_storage_read_reuse_facts(blocks)
+  Test.assert_eq(pipeline_ir_storage_read_reuse_count(facts), 0)
+  let result = pipeline_ir_flow_apply_storage_read_reuse(facts)
+  Test.assert_eq(ir_block_list_inst_count(result), 4)
+  Test.assert_eq(pipeline_ir_verify_function(IrFunction(12345, 3, result, 0)), 0)
+}
+
+test "raw writes unknown calls effects and lifetime changes still invalidate object facts" {
+  for barrier in [IrPtrStoreI64(6, 0, 2, IrStorageWord64), IrCallI64(6, 123, IrValueNil),
+    IrPerformI64(6, 123, 456, IrValueNil), IrOwnedDropI64(0, 123), IrManagedStakeI64(6, 0, 1, 0 - 1, 1)] {
+    let blocks = IrBlockListCons(IrBlock(0, IrValueNil,
+      IrInstCons(domain_read(3), IrInstCons(domain_write(), IrInstCons(barrier, IrInstCons(domain_read(5), IrInstNil)))),
+      IrTermReturn(5)), IrBlockListNil)
+    Test.assert_eq(pipeline_ir_storage_read_reuse_count(pipeline_ir_storage_read_reuse_facts(blocks)), 0)
+  }
+}
+
+test "object versions cross element-write joins and backedges but not unknown writes" {
+  for unknown in [false, true] {
+    let write = if unknown { IrCallI64(4, 123, IrValueNil) } else { domain_write() }
+    let diamond = IrBlockListCons(IrBlock(0, IrValueNil, IrInstCons(domain_read(3), IrInstNil), IrTermBranch(2, 1, 2)),
+      IrBlockListCons(IrBlock(1, IrValueNil, IrInstCons(write, IrInstNil), IrTermJump(3, IrValueNil)),
+      IrBlockListCons(IrBlock(2, IrValueNil, IrInstNil, IrTermJump(3, IrValueNil)),
+      IrBlockListCons(IrBlock(3, IrValueNil, IrInstCons(domain_read(5), IrInstNil), IrTermReturn(5)), IrBlockListNil))))
+    let cycle = IrBlockListCons(IrBlock(0, IrValueNil, IrInstCons(domain_read(3), IrInstNil), IrTermJump(1, IrValueNil)),
+      IrBlockListCons(IrBlock(1, IrValueNil, IrInstCons(domain_read(5), IrInstNil), IrTermBranch(2, 2, 3)),
+      IrBlockListCons(IrBlock(2, IrValueNil, IrInstCons(write, IrInstNil), IrTermJump(1, IrValueNil)),
+      IrBlockListCons(IrBlock(3, IrValueNil, IrInstNil, IrTermReturn(5)), IrBlockListNil))))
+    for blocks in [diamond, cycle] {
+      Test.assert_eq(pipeline_ir_verify_function(IrFunction(12345, 3, blocks, 0)), 0)
+      let facts = pipeline_ir_storage_read_reuse_facts(blocks)
+      Test.assert_eq(pipeline_ir_storage_read_reuse_count(facts), if unknown { 0 } else { 1 })
+      Test.assert_eq(pipeline_ir_verify_function(IrFunction(12345, 3, pipeline_ir_flow_apply_storage_read_reuse(facts), 0)), 0)
+    }
+  }
+}
+
+test "a newly loaded aggregate cannot inherit field facts from the previous element" {
+  let blocks = IrBlockListCons(IrBlock(0, IrValueNil,
+    IrInstCons(IrVectorGetI64(3, 1, 2, 2, 0), IrInstCons(IrFieldLoadI64(6, 3, 77, 0),
+    IrInstCons(domain_write(), IrInstCons(IrVectorGetI64(5, 1, 2, 2, 0),
+    IrInstCons(IrFieldLoadI64(7, 5, 77, 0), IrInstNil))))), IrTermReturn(7)), IrBlockListNil)
+  Test.assert_eq(pipeline_ir_verify_function(IrFunction(12345, 3, blocks, 0)), 0)
+  Test.assert_eq(pipeline_ir_storage_read_reuse_count(pipeline_ir_storage_read_reuse_facts(blocks)), 0)
+}
