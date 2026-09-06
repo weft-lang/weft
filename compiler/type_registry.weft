@@ -11,7 +11,7 @@ pub(package) fn type_registry_alloc_bytes(size: i64) -> i64 {
 }
 
 pub(package) fn ttable_new() -> i64 {
-  let h = type_registry_alloc_bytes(248)
+  let h = type_registry_alloc_bytes(256)
   let d = type_registry_alloc_bytes(6400)
   mem_store64_at(h, 0, d)
   mem_store64_at(h + 8, 0, 0)
@@ -104,6 +104,10 @@ pub(package) fn ttable_new() -> i64 {
   -- The indices belong to this registry; declaration facts remain immutable
   -- and may be shared by independently instantiated checked products.
   mem_store64_at(h + 240, 0, node_new(0, alloc_zeroed(1024 * 8), alloc_zeroed(1024 * 8), 0, 0))
+  -- Exact local declaration index (h+248): count, buckets, capacity. This
+  -- projection grows with declarations, not symbol uses, and belongs to the
+  -- registry even when immutable facts come from a checked module product.
+  mem_store64_at(h + 248, 0, node_new(0, 0, alloc_zeroed(1024 * 8), 1024, 0))
   h
 }
 
@@ -398,6 +402,89 @@ pub(package) fn semantic_symbol_kind_match_arm() -> i64 { 11 }
 pub(package) fn semantic_symbol_kind_constant() -> i64 { 12 }
 pub(package) fn ttable_semantic_symbol_facts(tt: i64) -> i64 { mem_load64_at(tt + 168, 0) }
 
+pub(package) fn ttable_semantic_binding_bucket(src: i64, start: i64, len: i64, capacity: i64) -> i64 {
+  ((src / 8) + start * 31 + len) band (capacity - 1)
+}
+
+pub(package) fn ttable_semantic_binding_index_grow(index: i64) -> i64 {
+  let old_buckets = node_f2(index)
+  let old_capacity = node_f3(index)
+  let capacity = old_capacity * 2
+  let buckets = alloc_zeroed(capacity * 8)
+  for i in 0..old_capacity {
+    let mut entry = mem_load64_at(old_buckets + i * 8, 0)
+    while entry != 0 {
+      let next = node_f4(entry)
+      let fact = node_f1(entry)
+      let bucket = ttable_semantic_binding_bucket(semantic_symbol_fact_use_source(fact), semantic_symbol_fact_use_start(fact), semantic_symbol_fact_use_len(fact), capacity)
+      mem_store64_at(entry, 32, mem_load64_at(buckets + bucket * 8, 0))
+      mem_store64_at(buckets + bucket * 8, 0, entry)
+      entry = next
+    }
+  }
+  mem_store64_at(index, 16, buckets)
+  mem_store64_at(index, 24, capacity)
+  index
+}
+
+-- Publish through one producer for both checker discoveries and imported
+-- checked products. Point queries retain all occurrence/refinement facts;
+-- lowering's exact declaration query has its own indexed projection.
+pub(package) fn ttable_publish_semantic_symbol_fact(tt: i64, fact: i64) -> i64 {
+  nlist_add(ttable_semantic_symbol_facts(tt), fact)
+  let src = semantic_symbol_fact_use_source(fact)
+  let start = semantic_symbol_fact_use_start(fact)
+  let len = semantic_symbol_fact_use_len(fact)
+  if semantic_symbol_fact_kind(fact) == semantic_symbol_kind_local() and len > 0 and
+    semantic_symbol_fact_definition_source(fact) == src and
+    semantic_symbol_fact_definition_start(fact) == start and
+    semantic_symbol_fact_definition_len(fact) == len {
+    let index = mem_load64_at(tt + 248, 0)
+    let buckets = node_f2(index)
+    let bucket = ttable_semantic_binding_bucket(src, start, len, node_f3(index))
+    let head = mem_load64_at(buckets + bucket * 8, 0)
+    let mut entry = head
+    let mut existing = 0
+    while entry != 0 and existing == 0 {
+      let previous = node_f1(entry)
+      if semantic_symbol_fact_use_source(previous) == src and
+        semantic_symbol_fact_use_start(previous) == start and
+        semantic_symbol_fact_use_len(previous) == len {
+        existing = entry
+      } else { entry = node_f4(entry) }
+    }
+    if existing != 0 {
+      -- Rechecking under a refined environment replaces only this registry's
+      -- projection; the shared immutable fact remains untouched.
+      mem_store64_at(existing, 8, fact)
+    } else {
+      mem_store64_at(buckets + bucket * 8, 0, node_new(0, fact, 0, 0, head))
+      mem_store64_at(index, 8, node_f1(index) + 1)
+      if node_f1(index) > node_f3(index) { ttable_semantic_binding_index_grow(index) } else { index }
+    }
+  } else { 0 }
+  fact
+}
+
+pub(package) fn ttable_find_semantic_binding_fact(tt: i64, src: i64, start: i64, len: i64) -> i64 {
+  if tt == 0 or len <= 0 { 0 }
+  else {
+    let index = mem_load64_at(tt + 248, 0)
+    let bucket = ttable_semantic_binding_bucket(src, start, len, node_f3(index))
+    let mut entry = mem_load64_at(node_f2(index) + bucket * 8, 0)
+    let mut found = 0
+    while entry != 0 and found == 0 {
+      let fact = node_f1(entry)
+      if semantic_symbol_fact_use_source(fact) == src and
+        semantic_symbol_fact_use_start(fact) == start and
+        semantic_symbol_fact_use_len(fact) == len {
+        found = fact
+      } else { entry = node_f4(entry) }
+    }
+    found
+  }
+}
+
 -- Match-arm context is checker-owned producer data. Stable consumers receive
 -- the projected narrowed/residual types and guard bit, never this allocation.
 pub(package) fn semantic_match_arm_context(residual: i64, guarded: i64) -> i64 {
@@ -417,10 +504,8 @@ pub(package) fn semantic_match_arm_context_guarded(context: i64) -> i64 { mem_lo
 -- effect atom for effect-use facts, match-arm residual/guard data for match
 -- facts, and is zero for ordinary symbols.
 pub(package) fn ttable_add_semantic_symbol_fact(tt: i64, use_src: i64, use_start: i64, use_len: i64, def_src: i64, def_start: i64, def_len: i64, ty: i64, tparams: i64, kind: i64, env: i64, context: i64) -> i64 {
-  let facts = ttable_semantic_symbol_facts(tt)
-  -- Append is deliberately O(1). A few checker analyses revisit the same
-  -- source occurrence under a refined environment; queries walk newest-first
-  -- so the last (most precise) fact wins without making compilation quadratic.
+  -- A few checker analyses revisit an occurrence under a refined environment;
+  -- publication preserves newest-wins semantics in both query projections.
   let entry = type_registry_alloc_bytes(88)
   mem_store64_at(entry, 0, use_src)
   mem_store64_at(entry + 8, 0, use_start)
@@ -433,8 +518,7 @@ pub(package) fn ttable_add_semantic_symbol_fact(tt: i64, use_src: i64, use_start
   mem_store64_at(entry + 64, 0, kind)
   mem_store64_at(entry + 72, 0, env)
   mem_store64_at(entry + 80, 0, context)
-  nlist_add(facts, entry)
-  entry
+  ttable_publish_semantic_symbol_fact(tt, entry)
 }
 
 pub(package) fn ttable_find_semantic_symbol_fact(tt: i64, src: i64, offset: i64) -> i64 {
