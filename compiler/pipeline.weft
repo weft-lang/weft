@@ -42162,12 +42162,13 @@ pub(package) fn pipeline_ir_native_resident_record_use(u: i64, gpos: i64, block_
   } else { 0 }
 }
 
-pub(package) fn pipeline_ir_native_resident_record_use_set(uses: PipelineIrLiveSet, gpos: i64, block_id: i64, simple: i64, fp_allowed: i64, cs_safe: i64, call_safe: i64, fwd_use: i64, pre_barrier: i64, next_value: i64, arrays: i64, w: i64, call_arity: i64) -> i64 {
+pub(package) fn pipeline_ir_native_resident_record_use_set(uses: PipelineIrLiveSet, gpos: i64, block_id: i64, simple: i64, fp_reads: PipelineIrNativeFpReadPolicy, cs_safe: i64, call_safe: i64, fwd_use: i64, pre_barrier: i64, next_value: i64, arrays: i64, w: i64, call_arity: i64) -> i64 {
   match uses {
     PipelineIrLiveSetNil -> 0
     PipelineIrLiveSetCons(u, rest) -> {
+      let fp_allowed = pipeline_ir_native_fp_read_allowed(fp_reads, u)
       pipeline_ir_native_resident_record_use(u, gpos, block_id, simple, fp_allowed, cs_safe, call_safe, fwd_use, pre_barrier, next_value, arrays, w, call_arity)
-      pipeline_ir_native_resident_record_use_set(rest, gpos, block_id, simple, fp_allowed, cs_safe, call_safe, fwd_use, pre_barrier, next_value, arrays, w, call_arity)
+      pipeline_ir_native_resident_record_use_set(rest, gpos, block_id, simple, fp_reads, cs_safe, call_safe, fwd_use, pre_barrier, next_value, arrays, w, call_arity)
     }
     PipelineIrLiveSetBits(array, words, count) -> 0
   }
@@ -42206,9 +42207,8 @@ pub(package) fn pipeline_ir_native_resident_add_evidence_uses(inst: IrInst, uses
   }
 }
 
--- F64 arithmetic FloatBinary defs may join the FP pool d2-d7; any-op F64
--- FloatBinary operands and stores into fact-homed f64 slots are the only
--- allowed FP-resident reads (both flow through emit_f64_to).
+-- A definition may use the FP pool only when every operand use has an
+-- emitter that can read that register class.
 pub(package) fn pipeline_ir_native_resident_inst_fp_def(inst: IrInst, f64_facts: PipelineIrNativeF64Facts) -> i64 {
   match inst {
     IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> {
@@ -42223,23 +42223,40 @@ pub(package) fn pipeline_ir_native_resident_inst_fp_def(inst: IrInst, f64_facts:
       } else { 0 }
     }
     IrLoadI64(dst, slot) -> if pipeline_ir_native_f64_slot_home_lookup(f64_facts, slot) >= 0 { 1 } else { 0 }
-    -- Type discipline makes unconditional vector-get FP defs sound: the
-    -- candidate only becomes FP-resident if every use is an F64 site, and
-    -- an i64 element value cannot reach one without a conversion call.
+    -- Vector reads transport payload bits. Their uses, including integer
+    -- address and index uses, determine whether an FP home is legal.
     IrVectorGetI64(dst, vec, index, fallback, check_mode) -> 1
     _ -> 0
   }
 }
 
-pub(package) fn pipeline_ir_native_resident_inst_fp_use_allowed(inst: IrInst, f64_facts: PipelineIrNativeF64Facts) -> i64 {
+pub(package) type PipelineIrNativeFpReadPolicy {
+  PipelineIrNativeFpReadsNone
+  PipelineIrNativeFpReadsAll
+  PipelineIrNativeFpReadsValue(i64)
+}
+
+pub(package) fn pipeline_ir_native_fp_read_allowed(policy: PipelineIrNativeFpReadPolicy, value: i64) -> i64 {
+  match policy {
+    PipelineIrNativeFpReadsNone -> 0
+    PipelineIrNativeFpReadsAll -> 1
+    PipelineIrNativeFpReadsValue(allowed) -> if value == allowed { 1 } else { 0 }
+  }
+}
+
+pub(package) fn pipeline_ir_native_resident_inst_fp_reads(inst: IrInst, f64_facts: PipelineIrNativeF64Facts) -> PipelineIrNativeFpReadPolicy {
   match inst {
-    IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> if prim == PRIM_F64() { 1 } else { 0 }
-    IrStoreI64(slot, value) -> if pipeline_ir_native_f64_slot_home_lookup(f64_facts, slot) >= 0 { 1 } else { 0 }
-    IrBindI64(ns, nl, value, ty) -> 1
-    -- The set's vec/index operands are typed i64/pointer and can never be
-    -- FP defs, so allowing the whole instruction only admits the value.
-    IrVectorSetI64(dst, vec, index, value, check_mode) -> 1
-    _ -> 0
+    IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> if prim == PRIM_F64() { PipelineIrNativeFpReadsAll } else { PipelineIrNativeFpReadsNone }
+    IrStoreI64(slot, value) -> if pipeline_ir_native_f64_slot_home_lookup(f64_facts, slot) >= 0 { PipelineIrNativeFpReadsAll } else { PipelineIrNativeFpReadsNone }
+    IrBindI64(ns, nl, value, ty) -> PipelineIrNativeFpReadsAll
+    IrVectorSetI64(dst, vec, index, value, check_mode) -> {
+      -- Payload bits may be stored directly from an FP register. Address
+      -- and index reads use GPR emitters, even when a word-valued vector
+      -- read produced them. Any shared identity must satisfy both uses.
+      if value == vec or value == index { PipelineIrNativeFpReadsNone }
+      else { PipelineIrNativeFpReadsValue(value) }
+    }
+    _ -> PipelineIrNativeFpReadsNone
   }
 }
 
@@ -42500,9 +42517,9 @@ pub(package) fn pipeline_ir_native_pinned_has_cs_fp(pinned: i64) -> i64 {
 -- that no foreign write lands inside the tenant's window. No-op unless
 -- pipeline_cg_ir_only_function armed the audit for this function.
 -- Tuple: (phys, window lo gpos, window hi gpos, legal-writer gpos list).
--- Instruction tenants have no writer list (their def instruction owns the
--- only legal write, and the window starts after it); block-param tenants
--- carry the gpos of every predecessor jump whose edge moves feed them.
+-- An ordinary definition window starts after its legal write. Expanded
+-- windows name the actual definition explicitly; block parameters name
+-- every predecessor jump whose edge moves feed them.
 pub(package) fn pipeline_ir_native_audit_note_range(fm: i64, value: i64, phys: i64, dp: i64, lu: i64) -> i64 {
   let ranges = fmap_audit_ranges(fm)
   if ranges != 0 {
@@ -42732,6 +42749,70 @@ pub(package) fn pipeline_ir_abort_cleanup_record_native_uses(facts: i64, site: i
       i = i + 1
     }
     0
+  }
+}
+
+pub(package) type PipelineIrNativeFpCrossWindow {
+  PipelineIrNativeFpCrossExcluded
+  PipelineIrNativeFpCrossWindow(i64, i64)
+}
+
+-- Consume the established residency census only for a demanded FP value.
+-- Edge-written, redefined and addressable values have additional writers;
+-- their lifetime cannot be represented by this single-definition window.
+pub(package) fn pipeline_ir_native_fp_cross_window(
+  value: i64, arrays: i64, param_entry: i64, param_writer_count: i64,
+  pinned: i64, f64_facts: PipelineIrNativeF64Facts,
+  backedges: i64, block_entry_gpos: i64, block_count: i64
+) -> PipelineIrNativeFpCrossWindow {
+  if nlist_get(nlist_get(arrays, 9), value) != 1 or
+    nlist_get(nlist_get(arrays, 6), value) != 1 {
+    PipelineIrNativeFpCrossExcluded
+  } else {
+    let def_pos = nlist_get(nlist_get(arrays, 0), value)
+    let last_use = nlist_get(nlist_get(arrays, 3), value)
+    if def_pos < 0 or last_use <= def_pos or
+      nlist_get(nlist_get(arrays, 4), value) != 0 or
+      nlist_get(nlist_get(arrays, 29), value) != 0 or
+      nlist_get(param_writer_count, value) != 0 or
+      nlist_get(param_entry, value) >= 0 or
+      nlist_get(nlist_get(arrays, 7), value) != 1 or
+      nlist_get(nlist_get(arrays, 8), value) != 0 or
+      nlist_get(nlist_get(arrays, 11), value) != 0 or
+      nlist_get(nlist_get(arrays, 12), value) != 0 or
+      pipeline_ir_native_pinned_slot_lookup(pinned, value) != 0 or
+      pipeline_ir_native_f64_slot_home_lookup(f64_facts, value) >= 0 {
+      PipelineIrNativeFpCrossExcluded
+    } else {
+      let window = pipeline_ir_native_cs_round_window(backedges, block_entry_gpos, block_count, def_pos, last_use)
+      PipelineIrNativeFpCrossWindow(node_f1(window), node_f2(window))
+    }
+  }
+}
+
+-- Loop rounding can move the window before the definition. Audit the full
+-- occupied range while naming only that definition as its legal writer.
+pub(package) fn pipeline_ir_native_audit_note_definition_window(fm: i64, value: i64, phys: i64, definition: i64, lo: i64, hi: i64) -> i64 {
+  if fmap_audit_ranges(fm) == 0 { 0 }
+  else { if lo == definition {
+    pipeline_ir_native_audit_note_range(fm, value, phys, lo, hi)
+  } else {
+    let writers = nlist_new()
+    nlist_add(writers, definition)
+    pipeline_ir_native_audit_note_param_range(fm, phys, lo, hi, writers)
+  } }
+}
+
+-- Prefix counts include the instruction at their position. A cross-block
+-- window includes its rounded first instruction, which may execute again
+-- through a backedge, so compare against the preceding prefix.
+pub(package) fn pipeline_ir_native_fp_cross_window_preserved(window: PipelineIrNativeFpCrossWindow, barriers: i64) -> bool {
+  match window {
+    PipelineIrNativeFpCrossExcluded -> false
+    PipelineIrNativeFpCrossWindow(lo, hi) -> {
+      let before = if lo == 0 { 0 } else { nlist_get(barriers, lo - 1) }
+      nlist_get(barriers, hi) == before
+    }
   }
 }
 
@@ -42965,7 +43046,7 @@ pub(package) fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: 
                         if ld >= 0 and ld < next_value { pipeline_ir_native_resident_dense_set(swap_excluded, ld, 1) } else { 0 }
                         if ld >= 0 and ld + 1 < next_value { pipeline_ir_native_resident_dense_set(swap_excluded, ld + 1, 1) } else { 0 }
                       } else { 0 }
-                      let fp_allowed = pipeline_ir_native_resident_inst_fp_use_allowed(inst, f64_facts)
+                      let fp_reads = pipeline_ir_native_resident_inst_fp_reads(inst, f64_facts)
                       let cs_safe = if simple == 1 { 1 } else { pipeline_ir_native_resident_inst_cs_use_safe(inst) }
                       -- Staged-register count of a call shape:
                       -- move_call_args writes x0..arity-1 (method calls
@@ -42984,7 +43065,7 @@ pub(package) fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: 
                         pipeline_ir_live_set_add_inst_uses(inst, pipeline_ir_live_set_empty()),
                         fm
                       )
-                      pipeline_ir_native_resident_record_use_set(uses, gpos, block_id, simple, fp_allowed, cs_safe, call_safe, fwd_use, barrier_pre, next_value, arrays, block_w, call_arity)
+                      pipeline_ir_native_resident_record_use_set(uses, gpos, block_id, simple, fp_reads, cs_safe, call_safe, fwd_use, barrier_pre, next_value, arrays, block_w, call_arity)
                       gpos = gpos + 1
                       cur = tail
                     }
@@ -42994,7 +43075,7 @@ pub(package) fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: 
                 nlist_add(barrier_fp_at, barrier_fp_cum)
                 nlist_add(barrier_fp_cs_at, barrier_fp_cs_cum)
                 let term_uses = pipeline_ir_native_resident_term_uses(term)
-                pipeline_ir_native_resident_record_use_set(term_uses, gpos, block_id, 1, 0, 1, 0, 0, barrier_cum, next_value, arrays, block_w, 0)
+                pipeline_ir_native_resident_record_use_set(term_uses, gpos, block_id, 1, PipelineIrNativeFpReadsNone, 1, 0, 0, barrier_cum, next_value, arrays, block_w, 0)
                 match term {
                   IrTermJump(jt2, ja2) -> { nlist_add(backedge_terms, node_new(0, jt2, gpos, 0, 0)) 0 }
                   IrTermBranch(bc2, bt2, be2) -> {
@@ -43293,12 +43374,20 @@ pub(package) fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: 
         let fnp_call_eligible = if fnp_eligible == 0 and fnp_base_ok == 1 and nlist_get(use_nonfinal_unsafe, v) == 0 and nlist_get(use_last_kind, v) == 1 and fnp_hi_ext == nlist_get(last_use, v) {
           if nlist_get(use_last_pre_barrier, v) == 0 { 1 } else { 0 }
         } else { 0 }
-        let fp_eligible = if base_ok == 1 and nlist_get(fp_def, v) == 1 and nlist_get(use_fp_ok, v) == 1 {
-          if nlist_get(barrier_fp_at, nlist_get(last_use, v)) == nlist_get(barrier_fp_at, dp) { 1 } else { 0 }
-        } else { 0 }
-        let fp_cs_eligible = if cs_pool > 0 and base_ok == 1 and nlist_get(fp_def, v) == 1 and nlist_get(use_fp_ok, v) == 1 {
-          if nlist_get(barrier_fp_cs_at, nlist_get(last_use, v)) == nlist_get(barrier_fp_cs_at, dp) { 1 } else { 0 }
-        } else { 0 }
+        let fp_candidate = nlist_get(fp_def, v) == 1 and nlist_get(use_fp_ok, v) == 1
+        let fp_cross_window = if fp_candidate and base_ok == 0 {
+          pipeline_ir_native_fp_cross_window(v, arrays, param_entry, param_writer_count, pinned, f64_facts, backedge_terms, block_entry_gpos, entry_gpos_size)
+        } else { PipelineIrNativeFpCrossExcluded }
+        let fp_lo = match fp_cross_window { PipelineIrNativeFpCrossExcluded -> dp, PipelineIrNativeFpCrossWindow(lo, _) -> lo }
+        let fp_hi = match fp_cross_window { PipelineIrNativeFpCrossExcluded -> nlist_get(last_use, v), PipelineIrNativeFpCrossWindow(_, hi) -> hi }
+        let fp_eligible = if not fp_candidate { false }
+        else { if base_ok == 1 {
+          nlist_get(barrier_fp_at, fp_hi) == nlist_get(barrier_fp_at, dp)
+        } else { pipeline_ir_native_fp_cross_window_preserved(fp_cross_window, barrier_fp_at) } }
+        let fp_cs_eligible = if not fp_candidate or cs_pool <= 0 { false }
+        else { if base_ok == 1 {
+          nlist_get(barrier_fp_cs_at, fp_hi) == nlist_get(barrier_fp_cs_at, dp)
+        } else { pipeline_ir_native_fp_cross_window_preserved(fp_cross_window, barrier_fp_cs_at) } }
         if eligible == 1 {
           let lu = nlist_get(last_use, v)
           let mut pr = 0
@@ -43318,27 +43407,27 @@ pub(package) fn pipeline_ir_native_volatile_residents(param_count: i64, blocks: 
         } else {
           let lu = nlist_get(last_use, v)
           let mut placed = 0
-          if fp_eligible == 1 {
+          if fp_eligible {
             let mut r = 0
             while r < 6 and placed == 0 {
-              if dp > nlist_get(fp_busy, r) {
+              if fp_lo > nlist_get(fp_busy, r) {
                 pinned = pipeline_ir_native_pinned_slot_new(v, 1002 + r, pipeline_ir_native_pinned_slot_kind_resident(), pinned)
-                pipeline_ir_native_resident_dense_set(fp_busy, r, lu)
+                pipeline_ir_native_resident_dense_set(fp_busy, r, fp_hi)
                 fp_assigned = fp_assigned + 1
                 placed = 1
-                pipeline_ir_native_audit_note_range(fm, v, 1002 + r, dp, lu)
+                pipeline_ir_native_audit_note_definition_window(fm, v, 1002 + r, dp, fp_lo, fp_hi)
               } else { r = r + 1 }
             }
           } else { 0 }
-          if placed == 0 and fp_cs_eligible == 1 {
+          if placed == 0 and fp_cs_eligible {
             let mut r = 0
             while r < cs_pool and placed == 0 {
-              if dp > nlist_get(cs_busy, r) {
+              if fp_lo > nlist_get(cs_busy, r) {
                 pinned = pipeline_ir_native_pinned_slot_new(v, 1000 + cs_base + r, pipeline_ir_native_pinned_slot_kind_resident(), pinned)
-                pipeline_ir_native_resident_dense_set(cs_busy, r, lu)
+                pipeline_ir_native_resident_dense_set(cs_busy, r, fp_hi)
                 fp_assigned = fp_assigned + 1
                 placed = 1
-                pipeline_ir_native_audit_note_range(fm, v, 1000 + cs_base + r, dp, lu)
+                pipeline_ir_native_audit_note_definition_window(fm, v, 1000 + cs_base + r, dp, fp_lo, fp_hi)
               } else { r = r + 1 }
             }
           } else { 0 }
@@ -44233,9 +44322,9 @@ pub(package) fn pipeline_ir_native_audit_exclusion_at(exclusions: i64, pos: i64)
   result
 }
 
--- A byte position sits inside a legal writer's terminator window when some
--- writer gpos g satisfies offsets[g] <= pos < offsets[g+1]. Edge moves that
--- feed a block-param tenant live exactly there.
+-- A byte position sits inside a legal writer's instruction or terminator
+-- window when offsets[g] <= pos < offsets[g+1]. A definition or the edge
+-- moves feeding a block parameter may own that write.
 pub(package) fn pipeline_ir_native_audit_in_writer_window(writers: i64, offsets: i64, pos: i64) -> i64 {
   let mut result = 0
   if writers != 0 {
