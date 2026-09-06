@@ -1,7 +1,11 @@
 # Concurrency in Weft
 
-Weft separates deterministic parallel computation from effectful task
-scheduling. Both are structured: their handler owns every child, waits for
+Concurrency policy lives at the call boundary. Tests can run children in a
+deterministic order; an event-loop handler can run other children while one
+waits for a timer or socket, using the same task functions.
+
+Weft separates pure parallel computation from effectful task scheduling.
+Both are structured: their handler owns every child, waits for
 accepted work during normal return or abort, and destroys unobserved results.
 There is no detached task hidden behind either API.
 
@@ -19,7 +23,7 @@ There is no detached task hidden behind either API.
 The enclosing `TaskScope` owns the child. Consuming `join` returns an ordinary
 `T`:
 
-```weft
+```weft run
 use stdlib/task as task
 
 fn total() -[task.TaskScope]> i64 {
@@ -48,7 +52,7 @@ Suspension therefore does not change a function kind. The event-loop handler
 interprets `Sleep` at the boundary, while the child remains an ordinary
 effectful function:
 
-```weft
+```weft run
 use stdlib/result.{Err, Ok}
 use stdlib/task as task
 use stdlib/time as time
@@ -91,7 +95,7 @@ without changing either function into an async function.
 `Sendable` computation. A pool may reorder execution, while `handle.join()` and
 `par.map` preserve deterministic observation order:
 
-```weft
+```weft check
 use stdlib/par as par
 
 fn total() -[par.Par]> i64 {
@@ -104,3 +108,6 @@ fn total() -[par.Par]> i64 {
 Use `Par` when purity permits checked parallel execution. Use `TaskScope` when
 children perform effects or suspend on readiness. `Task<T>` represents scoped
 computation plus its result; it is not an actor identity or a send capability.
+
+All Weft examples in this guide are checked by the suite. Complete programs
+are also compiled and run.

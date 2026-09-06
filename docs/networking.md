@@ -1,6 +1,7 @@
 # Networking in Weft
 
-Weft splits network authority instead of exposing one ambient `Net` capability.
+You can give a request handler an existing stream without giving it authority
+to open another connection. Network capabilities are separate:
 `DnsResolve` resolves a canonical name, `TcpConnect` opens outbound streams,
 `TcpListen` opens inbound listeners, and the established-resource effects
 operate only on resources already owned by the caller. Possessing a
@@ -38,6 +39,8 @@ Allowed requests delegate to the enclosing resolver/connector/listener, while
 denied requests return `DnsPolicyDenied` or `TcpPolicyDenied` without reaching
 the platform handler.
 
+Pass the configured allowlist separately from the requested destination:
+
 ```weft check
 use stdlib/dns as dns
 use stdlib/dns.{DnsAnyFamily, DnsError, DnsResolve}
@@ -50,34 +53,29 @@ use stdlib/tcp as tcp
 use stdlib/tcp.{TcpConnect, TcpConnectOptions, TcpError, TcpListen, TcpListenOptions, TcpListener, TcpStream}
 use stdlib/tcp/connect_policy as connect_policy
 use stdlib/tcp/listen_policy as listen_policy
-use stdlib/vector as vector
 use stdlib/vector.{Vector}
 
-fn resolve_allowed(host: DomainName) -[DnsResolve]> Result<Vector<SocketAddress>, DnsError> {
-  let mut targets = vector.new<Target>()
-  targets.push(dns_policy.Target(host, 443))
+fn resolve_allowed(targets: Vector<Target>, host: DomainName) -[DnsResolve]> Result<Vector<SocketAddress>, DnsError> {
   with dns_policy(dns_policy.allow_only(targets)) {
     dns.resolve(host, 443, DnsAnyFamily)
   }
 }
 
 fn connect_allowed(
+  addresses: Vector<SocketAddress>,
   address: SocketAddress,
   options: TcpConnectOptions
 ) -[TcpConnect]> Result<owned TcpStream, TcpError> {
-  let mut addresses = vector.new<SocketAddress>()
-  addresses.push(address)
   with connect_policy(connect_policy.allow_only(addresses)) {
     tcp.connect(address, options)
   }
 }
 
 fn listen_allowed(
+  addresses: Vector<SocketAddress>,
   address: SocketAddress,
   options: TcpListenOptions
 ) -[TcpListen]> Result<owned TcpListener, TcpError> {
-  let mut addresses = vector.new<SocketAddress>()
-  addresses.push(address)
   with listen_policy(listen_policy.allow_only(addresses)) {
     tcp.listen(address, options)
   }

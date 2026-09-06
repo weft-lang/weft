@@ -1,142 +1,40 @@
 # Getting started with Weft
 
-Weft is self-hosted on macOS/AArch64 and Linux/AArch64. The checked-in `weft`
-binary is the macOS compiler; it does not download a second compiler or route
-through C/LLVM. It emits Mach-O or ELF directly, and the Linux product and
-compiler are static kernel-ABI executables. x86-64 is post-alpha.
+Weft makes a function's required capabilities part of its type. Handlers let
+you run the same code with real files, deterministic test data, or a different
+scheduling policy. This guide starts with a native program, then adds tests,
+effects, Unicode text, and a local package.
 
-The repository is still pre-alpha. This guide describes implemented and tested
-behavior, not a compatibility or long-term-support promise; the source,
-package, fact-schema, and versioned native-binding contracts may change before
-the public-alpha gate closes.
+Weft is pre-alpha. macOS/AArch64 and Linux/AArch64 are implemented; source and
+package contracts may change before the public-alpha release. See the
+[README status](../README.md#status) for the current release gates.
 
-This guide describes both the repository toolchain and the extracted compiler
-shape as they exist now. `weft build` is the native final-product path, including
-cross-target selection and artifact facts. Embedded-SDK acquisition,
-deterministic target archives, direct `weft run` execution, and immutable
-locked-source acquisition are implemented. The release command enforces
-detached project signatures on every public artifact. The default macOS
-community channel is free and explicit; optional Developer ID/notarization is
-a separate distribution channel. Private keys remain release-owner authority,
-never repository data.
+## Use the compiler
 
-## Install a local compiler archive
-
-From a checkout, build and verify the target-specific archive:
+On an Apple-Silicon Mac, start in this repository's root:
 
 ```bash
-mkdir -p dist
-tools/build_release_bundle.sh macos-aarch64 dist
-(cd dist && shasum -a 256 -c weft-0.1.0-macos-aarch64.tar.sha256)
-tar -xf dist/weft-0.1.0-macos-aarch64.tar
-export PATH="$PWD/weft-0.1.0-macos-aarch64/bin:$PATH"
-weft --version
-```
-
-For Linux/AArch64, select `linux-aarch64` and verify with `sha256sum -c`.
-`bin/weft` contains its complete matching SDK: canonical `stdlib/`, `runtime/`,
-and compiler modules, the SDK manifest, and both target-native archives. The
-binary can be copied to any user-owned location and put on `PATH`; it does not
-need the archive's metadata directory or a checkout at runtime. Uninstallation
-removes that binary and its PATH entry. No unrelated files are mutated.
-
-The checksum detects accidental corruption; a public download is authenticated
-by its signed release manifest. Obtain the project's OpenSSH allowed-signers
-file through a separately trusted project channel, then verify before
-extracting:
-
-```bash
-tools/verify_release_bundle.sh \
-  weft-0.1.0-macos-aarch64.tar \
-  /path/to/weft-allowed-signers weft-release
-```
-
-The verifier authenticates `*.tar.release.sig` in the `weft-release` signature
-namespace before trusting the manifest, then checks its archive name, target,
-SHA-256, byte length, source commit, platform-signing facts, safe member paths,
-unique members, and absence of links or special files. A macOS manifest must
-name exactly one supported channel: the community channel binds the embedded
-ad-hoc code-directory hash and states that notarization was not requested; the
-optional notarized channel binds a Developer ID code-directory hash and the
-matching accepted notarization result. A Linux manifest must explicitly state
-that platform code signing and notarization do not apply. The detached project
-signature is mandatory in every case.
-
-## Release-owner ceremony
-
-Release signing is intentionally distinct from deterministic local bundle
-construction. The OpenSSH private key path, its public allowed-signers policy,
-and signer principal are explicit release-owner inputs:
-
-```bash
-WEFT_RELEASE_SIGNING_KEY=/secure/weft-release-ed25519 \
-WEFT_RELEASE_SIGNER=weft-release \
-WEFT_RELEASE_ALLOWED_SIGNERS=/secure/weft-allowed-signers \
-tools/publish_release_bundle.sh linux-aarch64 dist
-```
-
-The default macOS community ceremony needs no Apple account or paid identity:
-
-```bash
-WEFT_RELEASE_SIGNING_KEY=/secure/weft-release-ed25519 \
-WEFT_RELEASE_SIGNER=weft-release \
-WEFT_RELEASE_ALLOWED_SIGNERS=/secure/weft-allowed-signers \
-tools/publish_release_bundle.sh macos-aarch64 dist
-```
-
-It authenticates the archive with the project key and records the compiler's
-deterministic ad-hoc Mach-O code-directory hash. The first time a downloaded
-compiler is run, Gatekeeper may block the unidentified developer. After that
-launch attempt, open **System Settings → Privacy & Security**, choose **Open
-Anyway** for `weft`, authenticate, and run the command again. This is a
-one-time approval for that compiler; it does not weaken Gatekeeper globally.
-
-If a future release owner chooses the paid Apple channel, select it explicitly
-with a 40-hex Developer ID certificate identity and an existing `notarytool`
-Keychain profile:
-
-```bash
-WEFT_RELEASE_SIGNING_KEY=/secure/weft-release-ed25519 \
-WEFT_RELEASE_SIGNER=weft-release \
-WEFT_RELEASE_ALLOWED_SIGNERS=/secure/weft-allowed-signers \
-WEFT_MACOS_DISTRIBUTION=notarized \
-WEFT_MACOS_SIGNING_IDENTITY=0123456789abcdef0123456789abcdef01234567 \
-WEFT_NOTARY_KEYCHAIN_PROFILE=weft-release \
-tools/publish_release_bundle.sh macos-aarch64 dist
-```
-
-Publish mode refuses a dirty checkout, untracked SDK input, missing authority,
-malformed identities, contradictory target-signing facts, or any pre-existing
-output it could overwrite. Community publishing verifies the exact ad-hoc
-Mach-O signature before fixing the archive digest. Notarized publishing signs
-that exact Mach-O before hashing, submits a temporary ZIP containing the same
-code directory, requires an `Accepted` response, and exercises `spctl`. Every
-release distributes `.tar`, `.tar.sha256`, `.tar.release`, and
-`.tar.release.sig`; only the notarized macOS channel adds
-`.tar.notarization.json`.
-
-The repository trust root remains a valid contributor setup. On an
-Apple-Silicon Mac, clone the repository and verify it directly:
-
-```bash
-git clone <repository-url> weft
-cd weft
-chmod +x weft
-./weft check examples/fibonacci.weft
+./weft --version
 export PATH="$PWD:$PATH"
 ```
 
-Repository development additionally uses `just`; platform linkers compile test
-fixtures and serve as differential oracles only. Ordinary product builds need
-no separate language toolchain or linker.
+The checked-in binary includes its matching standard library and needs no
+separate compiler, SDK, or host linker to build ordinary programs. For a
+portable compiler archive, Linux/AArch64 installation, or signed downloads,
+see [Installing and distributing Weft](distribution.md).
 
 ## Your first program
 
 Save this as `hello.weft`:
 
 ```weft run
-fn main() -> i64 {
-  0
+use stdlib/console as console
+use stdlib/console/terminal as terminal
+
+fn main() -> nil {
+  with terminal() {
+    console.println("Hello, Weft!")
+  }
 }
 ```
 
@@ -145,13 +43,13 @@ Check it, compile it, and run it:
 ```bash
 weft check hello.weft
 weft run hello.weft
-weft compile hello.weft > hello
-chmod +x hello
+weft build hello.weft -o hello
 ./hello
 ```
 
-The process exit code is the value returned by `main`. Compiler diagnostics go
-to stderr; the low-level `compile` artifact goes to stdout. `weft run PATH`
+The terminal handler supplies console access. Returning `nil` from `main`
+means success; an `i64` return value sets the process exit code. Diagnostics go
+to stderr. `weft run PATH`
 builds the host target through the same checked/native pipeline as `build`,
 executes it directly with inherited standard streams and environment, forwards
 its exact exit status, and removes its private temporary executable. Product
@@ -284,10 +182,9 @@ weft pkg init app
 weft pkg add math deps/math
 ```
 
-`pkg init app` records `source_roots: ["."]` and a typed binary target named
-`app` whose source is `app.weft`. The JSON `kind` field is the persistence form
-of the compiler's `binary | library` target variants; it is not an integer tag
-API. Additional target sources must stay beneath one of the declared roots.
+`pkg init app` creates `app.weft` and records it as the default binary target
+in `weft.pkg`. Additional target sources must stay beneath one of the
+manifest's declared source roots.
 
 Put a public module in `deps/math/lib.weft`:
 
@@ -318,9 +215,8 @@ from the directory containing `weft.pkg`:
 ```bash project
 weft pkg lock
 weft check app.weft
-weft run
 weft build
-./target/macos-aarch64/app
+weft run
 ```
 
 The normal build prints its deterministic artifact path and writes the

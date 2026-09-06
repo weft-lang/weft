@@ -1,30 +1,38 @@
 # Property testing in Weft
 
-Weft property tests are ordinary typed computations interpreted through one
-bounded-choice effect. A fixed seed finds failures reproducibly; an exact
-choice log replays them independently of the random algorithm; shrinking
-re-executes the same generator and property without cloning the generated
-value or using multi-shot continuations.
+Property tests check a rule across generated inputs. In Weft, the same
+generator supports seeded campaigns, shrinking, exact replay, and bounded
+exhaustive search. A failure records the choices needed to regenerate its
+input, including when that input owns resources and cannot be copied.
 
 The API lives under `stdlib/test/property`. Deterministic pseudo-random values
 live separately in `stdlib/random`; they are not cryptographic randomness and
 do not introduce process-global state.
 
-```weft
+For example, a percentage clamp should stay in range and be idempotent:
+
+```weft test
 use stdlib/random as random
-use stdlib/result.{*}
+use stdlib/result.{Result}
 use stdlib/test/property as prop
 
-fn in_range(value: usize) -> bool {
-  value < 1000
+fn clamp_percent(value: i64) -> i64 {
+  match value {
+    n if n < 0 -> 0
+    n if n > 100 -> 100
+    n -> n
+  }
 }
 
-test "generated identifiers stay in range" {
+fn clamp_laws(value: i64) -> bool {
+  let clamped = clamp_percent(value)
+  clamped >= 0 and clamped <= 100 and clamp_percent(clamped) == clamped
+}
+
+test "clamping is bounded and idempotent" {
   let configured = prop.config(random.seed(42), 100, 16, 1000, 1000)
   let config = configured.expect("a property campaign needs at least one case")
-  let identifiers = prop.usize_below(1000).expect("the identifier domain is nonempty")
-
-  prop.check(config, identifiers, in_range)
+  prop.check(config, prop.i64(), clamp_laws)
 }
 ```
 
@@ -40,14 +48,15 @@ A counterexample carries the size and discard limits as well as its minimized
 choice program. Replay therefore does not depend on whatever pseudo-random
 algorithm a later release uses.
 
-```weft
+```weft check
+use stdlib/result.{Result}
+use stdlib/test/property.{Counterexample, Gen}
 use stdlib/test/property/replay as replay
+use stdlib/test/property/replay.{Failure}
 
-let replayed = replay.run(
-  generator,
-  counterexample.limits(),
-  counterexample.choices()
-)
+fn replay_case<T>(generator: Gen<T>, counterexample: Counterexample) -> Result<T, Failure> {
+  replay.run(generator, counterexample.limits(), counterexample.choices())
+}
 ```
 
 Replay checks the complete program. It distinguishes an exhausted choice log,
@@ -61,24 +70,32 @@ for each choice program. It does not capture a continuation or construct a
 second generator tree. Both the total path count and the choices permitted in
 one path are explicit bounds:
 
-```weft
+```weft test
+use stdlib/test.{Test}
+use stdlib/test/property as prop
 use stdlib/test/property/enumerate as enumerate
-use stdlib/test/property/enumerate.{VisitNext, VisitStop}
+use stdlib/test/property/enumerate.{EnumerationStopped, Visit, VisitNext, VisitStop}
 
-fn stop_at_true_false(value: (bool, bool)) -> enumerate.Visit {
+fn stop_at_true_false(value: (bool, bool)) -> Visit {
   match value {
     (true, false) -> VisitStop
     _ -> VisitNext
   }
 }
 
-let pairs = prop.pair(prop.boolean(), prop.boolean())
-let outcome = enumerate.run(
-  pairs,
-  prop.limits(2, 0),
-  enumerate.budget(4, 2),
-  stop_at_true_false
-)
+test "find a particular pair in the complete boolean domain" {
+  let pairs = prop.pair(prop.boolean(), prop.boolean())
+  let outcome = enumerate.run(
+    pairs, prop.limits(2, 0), enumerate.budget(4, 2), stop_at_true_false
+  )
+  match outcome {
+    EnumerationStopped(paths, values, choices) -> {
+      Test.assert_eq_usize(paths, 3)
+      Test.assert_eq_usize(values, 3)
+    }
+    _ -> Test.assert_true(false)
+  }
+}
 ```
 
 Enumeration visits choice programs in stable lexicographic order. A visitor
@@ -93,8 +110,11 @@ Its callback consumes one generated value and returns `Some` with the accepted
 value or `None` to discard it. This shape is safe for linearly owned values and
 can change the result type while narrowing:
 
-```weft
+```weft check
 use stdlib/option.{None, Option, Some}
+use stdlib/result.{Result}
+use stdlib/test/property as prop
+use stdlib/test/property.{Gen}
 
 fn even_half(value: usize) -> Option<usize> {
   if value % 2 == 0 {
@@ -104,8 +124,10 @@ fn even_half(value: usize) -> Option<usize> {
   }
 }
 
-let source = prop.usize_below(100).expect("nonempty domain")
-let even_halves = prop.filter_map(source, 20, even_half)
+fn even_halves() -> Gen<usize> {
+  let source = prop.usize_below(100).expect("nonempty domain")
+  prop.filter_map(source, 20, even_half)
+}
 ```
 
 Both the local attempt count and the campaign discard limit are hard bounds.
@@ -125,12 +147,18 @@ preserve alternatives as typed generator values.
 Collection lengths are validated inclusive domains. The campaign size caps
 their maximum while preserving an explicit minimum:
 
-```weft
-let small = prop.lengths(0, 32).expect("ordered finite lengths")
-let labels = prop.str(small)
-let packets = prop.bytes(small)
-let counters = prop.vector(prop.i64(), small)
-let snapshots = prop.persistent_vector(prop.boolean(), small)
+```weft check
+use stdlib/result.{Result}
+use stdlib/test/property as prop
+
+fn collection_generators() -> nil {
+  let small = prop.lengths(0, 32).expect("ordered finite lengths")
+  let labels = prop.str(small)
+  let packets = prop.bytes(small)
+  let counters = prop.vector(prop.i64(), small)
+  let snapshots = prop.persistent_vector(prop.boolean(), small)
+  nil
+}
 ```
 
 `prop.str` measures the length domain in Unicode scalars and always returns
@@ -146,11 +174,14 @@ Domain generators stay below the property namespace instead of adding testing
 operations to production modules. JSON provides separate leaf and recursive
 domains:
 
-```weft
+```weft check
 use stdlib/test/property/json as json_prop
 
-let leaf = json_prop.scalar()
-let document = json_prop.value()
+fn json_generators() -> nil {
+  let leaf = json_prop.scalar()
+  let document = json_prop.value()
+  nil
+}
 ```
 
 `json_prop.value()` generates only serializable values: floats come from the
@@ -168,3 +199,6 @@ generator semantics; custom deterministic handlers can enumerate or inject
 choices without gaining access to `Gen<T>`'s closure representation or the
 mutable campaign worklists. Every returned choice is checked against its
 opaque nonempty `ChoiceBound` before it can select a value.
+
+All Weft examples in this guide are checked by the suite. Test examples are
+also compiled and run through the native test harness.
