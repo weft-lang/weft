@@ -179,24 +179,24 @@ Small algorithm kernels have sibling Weft, Go, and Rust implementations with
 the same algorithms, data sizes, and checked results. The Weft programs use
 public collection APIs, including checked slices and optional lookups.
 Minimum elapsed time from 21 runs after two warmups, Apple M4 Max,
-2026-09-06, benchmark sources `42f915db` and compiler `73e3d43a`:
+2026-09-06, benchmark sources `42f915db` and compiler `8dc916aa`:
 
 | Workload | Weft | Go | Rust |
 |---|---:|---:|---:|
-| vector_sort | 3.32 ms | 2.02 ms | 1.78 ms |
-| graph_reach | 10.84 ms | 2.79 ms | 2.48 ms |
-| nbody | 11.98 ms | 3.37 ms | 3.34 ms |
-| sieve | 27.34 ms | 9.25 ms | 5.50 ms |
-| mandelbrot | 16.53 ms | 8.97 ms | 9.32 ms |
-| sorted_lookup | 49.42 ms | 16.54 ms | 7.59 ms |
-| iterator_pipeline_direct | 1.48 ms | 2.18 ms | 1.91 ms |
-| iterator_pipeline | 1.79 ms | 2.22 ms | 1.78 ms |
+| vector_sort | 3.19 ms | 2.05 ms | 1.83 ms |
+| graph_reach | 11.67 ms | 2.92 ms | 2.40 ms |
+| nbody | 12.18 ms | 3.30 ms | 3.20 ms |
+| sieve | 28.14 ms | 8.90 ms | 5.66 ms |
+| mandelbrot | 16.53 ms | 8.84 ms | 9.27 ms |
+| sorted_lookup | 44.07 ms | 17.05 ms | 7.60 ms |
+| iterator_pipeline_direct | 1.48 ms | 2.17 ms | 1.89 ms |
+| iterator_pipeline | 1.90 ms | 2.17 ms | 1.80 ms |
 
 Rust uses `-C opt-level=3 -C codegen-units=1 -C target-cpu=native`; Go uses
 its default build settings. These are small, process-level measurements;
 startup noise matters especially for the shortest workloads.
 
-Self-compilation at this checkpoint: **29.09 seconds** (median).
+Self-compilation at this checkpoint: **29.14 seconds** (median).
 
 Reproduce the table with
 `BENCH_COMPARE_RUNS=21 BENCH_COMPARE_WARMUPS=2 bash bench_compare.sh`.
