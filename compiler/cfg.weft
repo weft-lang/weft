@@ -1,0 +1,315 @@
+-- Shared control-flow facts over local block identities. The analysis builds
+-- its own dense storage index; source and IR identities remain unchanged.
+
+use compiler/ir.{*}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/map as map
+use stdlib/map.{Map}
+use stdlib/option.{None, Option, Some}
+use stdlib/result.{Result}
+use stdlib/vector as vector
+use stdlib/vector.{Vector}
+
+pub(package) type IrCfgCycles {
+  IrCfgInvalid,
+  IrCfgCycles(Map<i64, bool>)
+}
+
+fn cfg_add_edge(from: usize, target: i64, ids: Map<i64, usize>,
+  successors: [mut List<usize>], self_edges: [mut bool]) -> bool {
+  match ids.get(target) {
+    None -> false
+    Some(to) -> {
+      successors[from] = Cons<usize>(to, successors[from])
+      if from == to { self_edges[from] = true } else { nil }
+      true
+    }
+  }
+}
+
+-- A handler's abort edge is part of its enclosing CFG. Clause bodies have
+-- independent block identities and are analysed separately by their owner.
+fn cfg_add_abort_edges(from: usize, insts: IrInstList, ids: Map<i64, usize>,
+  successors: [mut List<usize>], self_edges: [mut bool]) -> bool {
+  let mut cur = insts
+  let mut valid = true
+  let mut walking = true
+  while walking {
+    match cur {
+      IrInstNil -> { walking = false }
+      IrInstCons(inst, rest) -> {
+        match inst {
+          IrHandleI64(dst, src, effect, clauses, count, abort) if abort >= 0 -> {
+            if not cfg_add_edge(from, abort, ids, successors[..], self_edges[..]) { valid = false } else { nil }
+          }
+          _ -> nil
+        }
+        cur = rest
+      }
+    }
+  }
+  valid
+}
+
+-- A cycle must contain an edge that does not advance in layout order. This
+-- cheap proof closes acyclic forward CFGs without running component discovery;
+-- a backward edge merely requires analysis and does not prove a cycle.
+fn cfg_has_nonforward_edge(successors: [List<usize>]) -> bool {
+  let mut from: usize = 0
+  let mut found = false
+  while from < successors.len and not found {
+    let mut edges = successors[from]
+    let mut walking = true
+    while walking and not found {
+      match edges {
+        Nil -> { walking = false }
+        Cons(to, rest) -> { found = to <= from edges = rest }
+      }
+    }
+    from = from + 1
+  }
+  found
+}
+
+-- Iterative Tarjan traversal. Each active vertex owns a cursor into its
+-- remaining edges. Returning from a child updates the parent's low link;
+-- an edge to a vertex still on the component stack uses its discovery number.
+-- Edges and vertices are visited a bounded number of times, without a reverse
+-- graph, one heap frame per traversal step, or native-stack recursion.
+pub(package) fn ir_cfg_cycles(blocks: IrBlockList) -> IrCfgCycles {
+  let mut ids = map.new<i64, usize>()
+  let mut names = vector.new<i64>()
+  let mut successors = vector.new<List<usize>>()
+  let mut self_edges = vector.new<bool>()
+  let mut numbers = vector.new<Option<usize>>()
+  let mut low = vector.new<usize>()
+  let mut active = vector.new<bool>()
+  let mut valid = true
+  let mut cur = blocks
+  let mut walking = true
+  while walking {
+    match cur {
+      IrBlockListNil -> { walking = false }
+      IrBlockListCons(IrBlock(id, params, insts, term), rest) -> {
+        if id < 0 or ids.contains_key(id) { valid = false } else { nil }
+        ids = ids.insert(id, names.len())
+        names.push(id)
+        successors.push(Nil<usize>())
+        self_edges.push(false)
+        numbers.push(None<usize>())
+        low.push(0)
+        active.push(false)
+        cur = rest
+      }
+    }
+  }
+  if not valid { IrCfgInvalid } else {
+    -- Population is complete. Borrow fixed views for graph construction and
+    -- traversal; checked indexing states the internal index invariant directly
+    -- and the mutable views prevent resizing their owners while in use.
+    let edges_view: [mut List<usize>] = successors[..]
+    let self_view: [mut bool] = self_edges[..]
+    cur = blocks
+    walking = true
+    let mut vertex: usize = 0
+    while walking {
+      match cur {
+        IrBlockListNil -> { walking = false }
+        IrBlockListCons(IrBlock(id, params, insts, term), rest) -> {
+          let edges_valid = match term {
+            IrTermJump(target, args) -> cfg_add_edge(vertex, target, ids, edges_view[..], self_view[..])
+            IrTermBranch(cond, yes, no) -> {
+              let left = cfg_add_edge(vertex, yes, ids, edges_view[..], self_view[..])
+              let right = cfg_add_edge(vertex, no, ids, edges_view[..], self_view[..])
+              left and right
+            }
+            IrTermNone -> false
+            IrTermReturn(value) -> true
+            IrTermUnreachable -> true
+          }
+          let aborts_valid = cfg_add_abort_edges(vertex, insts, ids, edges_view[..], self_view[..])
+          if not edges_valid or not aborts_valid { valid = false } else { nil }
+          vertex = vertex + 1
+          cur = rest
+        }
+      }
+    }
+    if not valid { IrCfgInvalid }
+    else { if not cfg_has_nonforward_edge(edges_view[..]) { IrCfgCycles(map.new<i64, bool>()) } else {
+      let names_view = names[..]
+      let numbers_view: [mut Option<usize>] = numbers[..]
+      let low_view: [mut usize] = low[..]
+      let active_view: [mut bool] = active[..]
+      let mut path = vector.new<usize>()
+      let mut component = vector.new<usize>()
+      let mut cycles = map.new<i64, bool>()
+      let mut next_number: usize = 0
+      let mut start: usize = 0
+      while start < names_view.len {
+        match numbers_view[start] {
+          Some(_) -> nil
+          None -> {
+            numbers_view[start] = Some(next_number)
+            low_view[start] = next_number
+            next_number = next_number + 1
+            active_view[start] = true
+            component.push(start)
+            path.push(start)
+            while path.len() > 0 {
+              let current = path.get(path.len() - 1).unwrap()
+              match edges_view[current] {
+                  Cons(next, rest) -> {
+                    edges_view[current] = rest
+                    match numbers_view[next] {
+                      None -> {
+                        numbers_view[next] = Some(next_number)
+                        low_view[next] = next_number
+                        next_number = next_number + 1
+                        active_view[next] = true
+                        component.push(next)
+                        path.push(next)
+                      }
+                      Some(number) -> if active_view[next] and number < low_view[current] {
+                        low_view[current] = number
+                        nil
+                      } else { nil }
+                    }
+                  }
+                  Nil -> {
+                    path.pop()
+                    let current_low = low_view[current]
+                    if current_low == numbers_view[current].unwrap() {
+                      let mut member = component.pop().unwrap()
+                      let cyclic = member != current or self_view[current]
+                      let mut collecting = true
+                      while collecting {
+                        active_view[member] = false
+                        if cyclic { cycles = cycles.insert(names_view[member], true) } else { nil }
+                        if member == current { collecting = false }
+                        else { member = component.pop().unwrap() }
+                      }
+                    } else { nil }
+                    if path.len() > 0 {
+                      let parent = path.get(path.len() - 1).unwrap()
+                      if current_low < low_view[parent] { low_view[parent] = current_low } else { nil }
+                    } else { nil }
+                    nil
+                  }
+              }
+            }
+          }
+        }
+        start = start + 1
+      }
+      IrCfgCycles(cycles)
+    } }
+  }
+}
+
+pub(package) fn ir_cfg_block_is_cyclic(facts: IrCfgCycles, block: i64) -> bool {
+  match facts {
+    IrCfgInvalid -> false
+    IrCfgCycles(cycles) -> cycles.contains_key(block)
+  }
+}
+
+-- A block identity is local to its CFG. Deleted and inlined blocks can leave
+-- sparse identities; analysis budgets must measure the remaining graph rather
+-- than the largest historic identifier. No value, edge argument, instruction,
+-- source provenance or nested handler CFG changes during renumbering.
+pub(package) type IrCfgRenumbering {
+  IrCfgIdentity,
+  IrCfgRenumberingInvalid,
+  IrCfgDense(Map<i64, i64>)
+}
+
+fn cfg_block_identity_map(blocks: IrBlockList) -> IrCfgRenumbering {
+  let mut ids = map.new<i64, i64>()
+  let mut cur = blocks
+  let mut count = 0
+  let mut unchanged = true
+  let mut valid = true
+  let mut walking = true
+  while walking {
+    match cur {
+      IrBlockListNil -> { walking = false }
+      IrBlockListCons(IrBlock(id, params, insts, term), rest) -> {
+        if id < 0 or ids.contains_key(id) { valid = false } else { nil }
+        if id != count { unchanged = false } else { nil }
+        ids = ids.insert(id, count)
+        count = count + 1
+        cur = rest
+      }
+    }
+  }
+  if not valid { IrCfgRenumberingInvalid }
+  else { if unchanged { IrCfgIdentity } else { IrCfgDense(ids) } }
+}
+
+fn cfg_inst_targets_present(insts: IrInstList, ids: Map<i64, i64>) -> bool {
+  match insts {
+    IrInstNil -> true
+    IrInstCons(inst, rest) -> {
+      let valid = match inst {
+        IrHandleI64(dst, src, effect_hash, clauses, count, abort_block) -> abort_block < 0 or ids.contains_key(abort_block)
+        _ -> true
+      }
+      valid and cfg_inst_targets_present(rest, ids)
+    }
+  }
+}
+
+fn cfg_block_targets_present(blocks: IrBlockList, ids: Map<i64, i64>) -> bool {
+  match blocks {
+    IrBlockListNil -> true
+    IrBlockListCons(IrBlock(id, params, insts, term), rest) -> {
+      let valid = match term {
+        IrTermJump(target, args) -> ids.contains_key(target)
+        IrTermBranch(cond, yes, no) -> ids.contains_key(yes) and ids.contains_key(no)
+        IrTermNone -> false
+        _ -> true
+      }
+      valid and cfg_inst_targets_present(insts, ids) and cfg_block_targets_present(rest, ids)
+    }
+  }
+}
+
+fn cfg_block_identity(ids: Map<i64, i64>, id: i64) -> i64 {
+  match ids.get(id) { Some(value) -> value, None -> id }
+}
+
+fn cfg_insts_renumber(insts: IrInstList, ids: Map<i64, i64>) -> IrInstList {
+  match insts {
+    IrInstNil -> IrInstNil
+    IrInstCons(inst, rest) -> {
+      let rewritten = match inst {
+        IrHandleI64(dst, src, effect_hash, clauses, count, abort_block) -> if abort_block >= 0 {
+          IrHandleI64(dst, src, effect_hash, clauses, count, cfg_block_identity(ids, abort_block))
+        } else { inst }
+        _ -> inst
+      }
+      IrInstCons(rewritten, cfg_insts_renumber(rest, ids))
+    }
+  }
+}
+
+fn cfg_blocks_renumber(blocks: IrBlockList, ids: Map<i64, i64>) -> IrBlockList {
+  match blocks {
+    IrBlockListNil -> IrBlockListNil
+    IrBlockListCons(IrBlock(id, params, insts, term), rest) -> {
+      let target = match term {
+        IrTermJump(destination, args) -> IrTermJump(cfg_block_identity(ids, destination), args)
+        IrTermBranch(cond, yes, no) -> IrTermBranch(cond, cfg_block_identity(ids, yes), cfg_block_identity(ids, no))
+        _ -> term
+      }
+      IrBlockListCons(IrBlock(cfg_block_identity(ids, id), params, cfg_insts_renumber(insts, ids), target), cfg_blocks_renumber(rest, ids))
+    }
+  }
+}
+
+pub(package) fn ir_cfg_compact_blocks(blocks: IrBlockList) -> IrBlockList {
+  match cfg_block_identity_map(blocks) {
+    IrCfgDense(ids) -> if cfg_block_targets_present(blocks, ids) { cfg_blocks_renumber(blocks, ids) } else { blocks }
+    _ -> blocks
+  }
+}

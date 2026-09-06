@@ -5,6 +5,7 @@ use compiler/effect_ref.{*}
 use compiler/encode.{*}
 use compiler/elf_link.{*}
 use compiler/ir.{*}
+use compiler/cfg.{IrCfgCycles, ir_cfg_cycles, ir_cfg_compact_blocks}
 use compiler/grammar.{*}
 use compiler/lib.{*}
 use compiler/macho.{*}
@@ -55553,7 +55554,16 @@ pub(package) fn pipeline_ir_spec_facts_extend(functions: IrFunctionList, templat
   }
 }
 
+pub(package) type PipelineIrInlineStage {
+  PipelineIrInlineEarly,
+  PipelineIrInlineAfterLayout
+}
+
 pub(package) fn pipeline_ir_multi_inline_inst_supported(inst: IrInst, self_hash: i64, structural: i64, direct_retain_return: i64) -> i64 {
+  pipeline_ir_multi_inline_inst_supported_at(inst, self_hash, structural, direct_retain_return, PipelineIrInlineEarly)
+}
+
+pub(package) fn pipeline_ir_multi_inline_inst_supported_at(inst: IrInst, self_hash: i64, structural: i64, direct_retain_return: i64, stage: PipelineIrInlineStage) -> i64 {
   match inst {
     IrStringLit(dst, literal_src, start, len) -> 1
     IrConstI64(dst, value) -> 1
@@ -55570,15 +55580,21 @@ pub(package) fn pipeline_ir_multi_inline_inst_supported(inst: IrInst, self_hash:
     IrSlotI64(slot) -> 1
     IrLoadI64(dst, slot) -> 1
     IrStoreI64(slot, value) -> 1
-    -- Variant construction and resolved record reads are admitted only for
-    -- declaration-role-gated structural methods. Their exact bodies carry
-    -- the complete payload ownership protocol; unrelated candidates remain
-    -- fenced regardless of instruction shape.
+    -- Allocating constructors require a structural declaration role and its
+    -- complete ownership protocol. Resolved field reads can also travel in a
+    -- scalar accessor after layout specialization. Cloning a read preserves
+    -- its evaluation point; it grants no authority to hoist or reuse it.
     IrVariantInitI64(dst, tag_hash, payloads, field_mask) -> if ir_variant_allocates(payloads) { structural } else { 1 }
     IrVariantTagI64(dst, value) -> 1
     IrVariantPayloadI64(dst, value, index) -> 1
-    IrRecordLayoutWordLoadI64(dst, base, record_data_size, field_hash, byte_offset) -> structural
-    IrFieldLoadI64(dst, base, field_hash, field_index) -> structural
+    IrRecordLayoutWordLoadI64(dst, base, record_data_size, field_hash, byte_offset) -> match stage {
+      PipelineIrInlineEarly -> structural
+      PipelineIrInlineAfterLayout -> 1
+    }
+    IrFieldLoadI64(dst, base, field_hash, field_index) -> match stage {
+      PipelineIrInlineEarly -> structural
+      PipelineIrInlineAfterLayout -> 1
+    }
     -- Typed vector accesses are already semantic IR facts: cloning their
     -- operands and preserved proof mode is strictly more faithful than
     -- forcing a tiny accessor wrapper to survive as a hot call boundary.
@@ -55611,12 +55627,38 @@ pub(package) fn pipeline_ir_multi_inline_inst_supported(inst: IrInst, self_hash:
   }
 }
 
-pub(package) fn pipeline_ir_multi_inline_insts_ok(insts: IrInstList, self_hash: i64, structural: i64, direct_retain_return: i64) -> i64 {
+pub(package) fn pipeline_ir_multi_inline_projection_insts(insts: IrInstList) -> bool {
+  match insts {
+    IrInstNil -> false
+    IrInstCons(inst, rest) -> match inst {
+      IrFieldLoadI64(_, _, _, _) -> true
+      IrRecordLayoutWordLoadI64(_, _, _, _, _) -> true
+      _ -> pipeline_ir_multi_inline_projection_insts(rest)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_multi_inline_projection_blocks(blocks: IrBlockList) -> bool {
+  match blocks {
+    IrBlockListNil -> false
+    IrBlockListCons(IrBlock(_, _, insts, _), rest) ->
+      pipeline_ir_multi_inline_projection_insts(insts) or pipeline_ir_multi_inline_projection_blocks(rest)
+  }
+}
+
+pub(package) fn pipeline_ir_multi_inline_stage_demands_blocks(stage: PipelineIrInlineStage, blocks: IrBlockList) -> bool {
+  match stage {
+    PipelineIrInlineEarly -> true
+    PipelineIrInlineAfterLayout -> pipeline_ir_multi_inline_projection_blocks(blocks)
+  }
+}
+
+pub(package) fn pipeline_ir_multi_inline_insts_ok(insts: IrInstList, self_hash: i64, structural: i64, direct_retain_return: i64, stage: PipelineIrInlineStage) -> i64 {
   match insts {
     IrInstNil -> 1
     IrInstCons(inst, rest) -> {
-      if pipeline_ir_multi_inline_inst_supported(inst, self_hash, structural, direct_retain_return) == 1 {
-        pipeline_ir_multi_inline_insts_ok(rest, self_hash, structural, direct_retain_return)
+      if pipeline_ir_multi_inline_inst_supported_at(inst, self_hash, structural, direct_retain_return, stage) == 1 {
+        pipeline_ir_multi_inline_insts_ok(rest, self_hash, structural, direct_retain_return, stage)
       } else { 0 }
     }
   }
@@ -55632,14 +55674,14 @@ pub(package) fn pipeline_ir_multi_inline_term_ok(term: IrTerminator) -> i64 {
   }
 }
 
-pub(package) fn pipeline_ir_multi_inline_blocks_ok(blocks: IrBlockList, self_hash: i64, structural: i64, direct_retain_return: i64) -> i64 {
+pub(package) fn pipeline_ir_multi_inline_blocks_ok(blocks: IrBlockList, self_hash: i64, structural: i64, direct_retain_return: i64, stage: PipelineIrInlineStage) -> i64 {
   match blocks {
     IrBlockListNil -> 1
     IrBlockListCons(block, rest) -> {
       match block {
         IrBlock(id, params, insts, term) -> {
-          if pipeline_ir_multi_inline_insts_ok(insts, self_hash, structural, direct_retain_return) == 1 and pipeline_ir_multi_inline_term_ok(term) == 1 {
-            pipeline_ir_multi_inline_blocks_ok(rest, self_hash, structural, direct_retain_return)
+          if pipeline_ir_multi_inline_insts_ok(insts, self_hash, structural, direct_retain_return, stage) == 1 and pipeline_ir_multi_inline_term_ok(term) == 1 {
+            pipeline_ir_multi_inline_blocks_ok(rest, self_hash, structural, direct_retain_return, stage)
           } else { 0 }
         }
       }
@@ -55658,7 +55700,7 @@ pub(package) fn pipeline_ir_multi_inline_entry_params_empty(blocks: IrBlockList)
   }
 }
 
-pub(package) fn pipeline_ir_multi_inline_eligible(f: IrFunction, facts: PipelineIrSemanticFactList, index_hash: i64, index_lower_hash: i64, index_upper_hash: i64, index_full_hash: i64, slice_hashes: i64) -> i64 {
+pub(package) fn pipeline_ir_multi_inline_eligible(f: IrFunction, facts: PipelineIrSemanticFactList, index_hash: i64, index_lower_hash: i64, index_upper_hash: i64, index_full_hash: i64, slice_hashes: i64, stage: PipelineIrInlineStage) -> i64 {
   match f {
     IrFunction(hash, param_count, blocks, src) -> {
       let nblocks = ir_block_list_len(blocks)
@@ -55675,6 +55717,7 @@ pub(package) fn pipeline_ir_multi_inline_eligible(f: IrFunction, facts: Pipeline
       if hash == pipeline_runtime_defer_abort_cleanup_hash() or hash == pipeline_ir_vector_len_hash() or dense_table_role == cg_semantic_dense_table_role_storage_rows() or dense_table_role == cg_semantic_dense_table_role_storage_get() or dense_table_role == cg_semantic_dense_table_role_storage_set() or hash == index_hash or hash == index_lower_hash or hash == index_upper_hash or hash == index_full_hash or pipeline_hash_list_contains(slice_hashes, hash) == 1 { 0 }
       else { if nblocks < 1 or nblocks > block_cap { 0 }
       else { if ir_block_list_inst_count(blocks) > pipeline_ir_multi_inline_insts_cap() { 0 }
+      else { if not pipeline_ir_multi_inline_stage_demands_blocks(stage, blocks) { 0 }
       -- Managed params and managed returns are admissible: lowered
       -- bodies embed their whole ownership protocol (transfer retains,
       -- borrow-masked or owned param releases, return transfers), so a
@@ -55702,20 +55745,20 @@ pub(package) fn pipeline_ir_multi_inline_eligible(f: IrFunction, facts: Pipeline
       -- the split site, see
       -- pipeline_ir_native_generic_call_constant_intrinsic.
         else { if pipeline_ir_multi_inline_entry_params_empty(blocks) == 0 { 0 }
-        else { pipeline_ir_multi_inline_blocks_ok(blocks, hash, structural, direct_retain_return) } }
-      } } } } }
+        else { pipeline_ir_multi_inline_blocks_ok(blocks, hash, structural, direct_retain_return, stage) } }
+      } } } } } }
     }
   }
 }
 
-pub(package) fn pipeline_ir_multi_inline_candidates_walk_with_index_hashes(functions: IrFunctionList, facts: PipelineIrSemanticFactList, index_hash: i64, index_lower_hash: i64, index_upper_hash: i64, index_full_hash: i64, slice_hashes: i64) -> PipelineIrInlineCandidateList {
+pub(package) fn pipeline_ir_multi_inline_candidates_walk_with_index_hashes(functions: IrFunctionList, facts: PipelineIrSemanticFactList, index_hash: i64, index_lower_hash: i64, index_upper_hash: i64, index_full_hash: i64, slice_hashes: i64, stage: PipelineIrInlineStage) -> PipelineIrInlineCandidateList {
   match functions {
     IrFunctionNil -> PipelineIrInlineCandidateNil
     IrFunctionCons(f, rest) -> {
-      let tail = pipeline_ir_multi_inline_candidates_walk_with_index_hashes(rest, facts, index_hash, index_lower_hash, index_upper_hash, index_full_hash, slice_hashes)
+      let tail = pipeline_ir_multi_inline_candidates_walk_with_index_hashes(rest, facts, index_hash, index_lower_hash, index_upper_hash, index_full_hash, slice_hashes, stage)
       match f {
         IrFunction(hash, param_count, blocks, src) -> {
-          if pipeline_ir_multi_inline_eligible(f, facts, index_hash, index_lower_hash, index_upper_hash, index_full_hash, slice_hashes) == 1 {
+          if pipeline_ir_multi_inline_eligible(f, facts, index_hash, index_lower_hash, index_upper_hash, index_full_hash, slice_hashes, stage) == 1 {
             pipeline_ir_inline_candidate_prepend(hash, f, tail)
           } else {
             tail
@@ -55727,6 +55770,10 @@ pub(package) fn pipeline_ir_multi_inline_candidates_walk_with_index_hashes(funct
 }
 
 pub(package) fn pipeline_ir_multi_inline_candidates_walk(functions: IrFunctionList, facts: PipelineIrSemanticFactList) -> PipelineIrInlineCandidateList {
+  pipeline_ir_multi_inline_candidates_at(functions, facts, PipelineIrInlineEarly)
+}
+
+pub(package) fn pipeline_ir_multi_inline_candidates_at(functions: IrFunctionList, facts: PipelineIrSemanticFactList, stage: PipelineIrInlineStage) -> PipelineIrInlineCandidateList {
   -- Hash string literals once per candidate census. Recomputing them in
   -- the per-function eligibility predicate retained 832 bytes of bump state
   -- per function and violated the optimiser's marginal-scratch contract.
@@ -55737,7 +55784,8 @@ pub(package) fn pipeline_ir_multi_inline_candidates_walk(functions: IrFunctionLi
     pipeline_runtime_index_address_lower_proven_hash(),
     pipeline_runtime_index_address_upper_proven_hash(),
     pipeline_runtime_index_address_full_proven_hash(),
-    pipeline_runtime_slice_address_hashes()
+    pipeline_runtime_slice_address_hashes(),
+    stage
   )
 }
 
@@ -56087,57 +56135,62 @@ pub(package) type PipelineIrMultiSplit {
   PipelineIrMultiSplit(i64, IrInstList, i64, i64, IrValueList, IrInstList)
 }
 
+pub(package) type PipelineIrInlineSite {
+  PipelineIrNoInlineSite,
+  PipelineIrInlineSite(i64, i64, IrValueList)
+}
+
+pub(package) fn pipeline_ir_multi_inline_candidate_site(dst: i64, callee: i64, args: IrValueList, candidates: PipelineIrInlineCandidateList, self_hash: i64) -> PipelineIrInlineSite {
+  if callee == self_hash { PipelineIrNoInlineSite } else {
+    match pipeline_ir_inline_candidate_lookup(candidates, callee) {
+      IrFunctionNil -> PipelineIrNoInlineSite
+      IrFunctionCons(function, rest) -> PipelineIrInlineSite(dst, callee, args)
+    }
+  }
+}
+
+-- Resolve callable identity once for both demand gating and the splice.
+-- Generic sites intercepted by native layout emission remain opaque: their
+-- collected generic body is not the operation that will execute.
+pub(package) fn pipeline_ir_multi_inline_site(inst: IrInst, candidates: PipelineIrInlineCandidateList, self_hash: i64, tt: i64) -> PipelineIrInlineSite {
+  match inst {
+    IrCallI64(dst, callee_hash, args) -> pipeline_ir_multi_inline_candidate_site(dst, callee_hash, args, candidates, self_hash)
+    IrGenericCallI64(dst, callee_hash, type_args, args) -> {
+      if pipeline_ir_native_generic_call_emission_intercepted(callee_hash, type_args, args, tt) == 0 {
+        pipeline_ir_multi_inline_candidate_site(dst, mono_spec_hash(callee_hash, type_expr_list_to_nodes(type_args)), args, candidates, self_hash)
+      } else { PipelineIrNoInlineSite }
+    }
+    IrMethodCallI64(dst, type_hash, method_hash, receiver, args) ->
+      pipeline_ir_multi_inline_candidate_site(dst, pipeline_ir_method_patch_key(type_hash, method_hash), IrValueCons(receiver, args), candidates, self_hash)
+    _ -> PipelineIrNoInlineSite
+  }
+}
+
+pub(package) fn pipeline_ir_multi_inline_insts_demand(insts: IrInstList, candidates: PipelineIrInlineCandidateList, self_hash: i64, tt: i64) -> bool {
+  match insts {
+    IrInstNil -> false
+    IrInstCons(inst, rest) -> match pipeline_ir_multi_inline_site(inst, candidates, self_hash, tt) {
+      PipelineIrInlineSite(dst, callee, args) -> true
+      PipelineIrNoInlineSite -> pipeline_ir_multi_inline_insts_demand(rest, candidates, self_hash, tt)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_multi_inline_blocks_demand(blocks: IrBlockList, candidates: PipelineIrInlineCandidateList, self_hash: i64, tt: i64) -> bool {
+  match blocks {
+    IrBlockListNil -> false
+    IrBlockListCons(IrBlock(id, params, insts, term), rest) ->
+      pipeline_ir_multi_inline_insts_demand(insts, candidates, self_hash, tt) or
+        pipeline_ir_multi_inline_blocks_demand(rest, candidates, self_hash, tt)
+  }
+}
+
 pub(package) fn pipeline_ir_multi_split_insts(insts: IrInstList, candidates: PipelineIrInlineCandidateList, self_hash: i64, prefix: IrInstList, tt: i64) -> PipelineIrMultiSplit {
   match insts {
     IrInstNil -> PipelineIrMultiSplit(0, prefix, 0, 0, IrValueNil, IrInstNil)
-    IrInstCons(inst, rest) -> {
-      match inst {
-        IrCallI64(dst, callee_hash, args) -> {
-          if callee_hash != self_hash {
-            match pipeline_ir_inline_candidate_lookup(candidates, callee_hash) {
-              IrFunctionNil -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix), tt)
-              IrFunctionCons(cf, crest) -> PipelineIrMultiSplit(1, prefix, dst, callee_hash, args, rest)
-            }
-          } else {
-            pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix), tt)
-          }
-        }
-        -- Generic call sites resolve to their specialisation's hash: the
-        -- collected spec IrFunction is the candidate body. Emission-
-        -- intercepted sites are opaque: the backend substitutes per-spec
-        -- constants (element size/mode) or byte-accurate inline-record
-        -- code — splicing the collected spec body there wires in the
-        -- placeholder/word-generic semantics instead (the 1-block
-        -- miswire: element mode 0 on managed vectors; word loads on
-        -- packed inline records).
-        IrGenericCallI64(dst, callee_hash, type_args, args) -> {
-          let spec_hash = mono_spec_hash(callee_hash, type_expr_list_to_nodes(type_args))
-          if spec_hash != self_hash and pipeline_ir_native_generic_call_emission_intercepted(callee_hash, type_args, args, tt) == 0 {
-            match pipeline_ir_inline_candidate_lookup(candidates, spec_hash) {
-              IrFunctionNil -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix), tt)
-              IrFunctionCons(cf, crest) -> PipelineIrMultiSplit(1, prefix, dst, spec_hash, args, rest)
-            }
-          } else {
-            pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix), tt)
-          }
-        }
-        -- A resolved inherent method call already carries its exact native
-        -- owner and method identity. Rebuild the ordinary ABI argument list
-        -- from the receiver's first lane plus the stored tail and splice the
-        -- same declaration-keyed candidate as a direct call.
-        IrMethodCallI64(dst, type_hash, method_hash, receiver, args) -> {
-          let callee_hash = pipeline_ir_method_patch_key(type_hash, method_hash)
-          if callee_hash != self_hash {
-            match pipeline_ir_inline_candidate_lookup(candidates, callee_hash) {
-              IrFunctionNil -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix), tt)
-              IrFunctionCons(cf, crest) -> PipelineIrMultiSplit(1, prefix, dst, callee_hash, IrValueCons(receiver, args), rest)
-            }
-          } else {
-            pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix), tt)
-          }
-        }
-        _ -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix), tt)
-      }
+    IrInstCons(inst, rest) -> match pipeline_ir_multi_inline_site(inst, candidates, self_hash, tt) {
+      PipelineIrInlineSite(dst, callee, args) -> PipelineIrMultiSplit(1, prefix, dst, callee, args, rest)
+      PipelineIrNoInlineSite -> pipeline_ir_multi_split_insts(rest, candidates, self_hash, IrInstCons(inst, prefix), tt)
     }
   }
 }
@@ -56176,71 +56229,13 @@ pub(package) fn pipeline_ir_block_list_max_id(blocks: IrBlockList, current: i64)
 -- by a splice inherit the residency of the site they came from.
 -- ----------------------------------------------------------------------
 
-pub(package) fn pipeline_ir_multi_loop_cap() -> i64 { 128 }
-
-pub(package) fn pipeline_ir_multi_succ_push(stack: i64, target: i64, visited: i64, n: i64) -> i64 {
-  if target >= 0 and target < n and nlist_get(visited, target) == 0 {
-    nlist_add(stack, target)
-    pipeline_ir_native_resident_dense_set(visited, target, 1)
-  } else { 0 }
-}
-
--- Marks every block on a cycle: BFS from each block's successors; the
--- block is resident when the walk returns to it.
-pub(package) fn pipeline_ir_multi_loop_resident_env(blocks: IrBlockList) -> PipelineIrInlineValueEnv {
-  let max_id = pipeline_ir_block_list_max_id(blocks, 0 - 1)
-  if max_id < 0 or max_id + 1 > pipeline_ir_multi_loop_cap() { PipelineIrInlineValueEnvNil }
-  else {
-    let n = max_id + 1
-    -- successor table: two slots per block (jump/branch targets)
-    let succ_a = pipeline_ir_native_resident_dense_new(n, 0 - 1)
-    let succ_b = pipeline_ir_native_resident_dense_new(n, 0 - 1)
-    let mut cur = blocks
-    let mut walking = 1
-    while walking == 1 {
-      match cur {
-        IrBlockListNil -> { walking = 0 }
-        IrBlockListCons(block, rest) -> {
-          match block {
-            IrBlock(id, params, insts, term) -> {
-              if id >= 0 and id < n {
-                match term {
-                  IrTermJump(target, args) -> pipeline_ir_native_resident_dense_set(succ_a, id, target)
-                  IrTermBranch(cond, then_block, else_block) -> {
-                    pipeline_ir_native_resident_dense_set(succ_a, id, then_block)
-                    pipeline_ir_native_resident_dense_set(succ_b, id, else_block)
-                  }
-                  _ -> 0
-                }
-              } else { 0 }
-            }
-          }
-          cur = rest
-        }
-      }
-    }
-    let mut env = PipelineIrInlineValueEnvNil
-    let mut s = 0
-    while s < n {
-      -- BFS from s's successors; resident when s is reached again
-      let visited = pipeline_ir_native_resident_dense_new(n, 0)
-      let stack = nlist_new()
-      pipeline_ir_multi_succ_push(stack, nlist_get(succ_a, s), visited, n)
-      pipeline_ir_multi_succ_push(stack, nlist_get(succ_b, s), visited, n)
-      let mut hit = 0
-      while nlist_len(stack) > 0 and hit == 0 {
-        let top = nlist_get(stack, nlist_len(stack) - 1)
-        nlist_set_len(stack, nlist_len(stack) - 1)
-        if top == s { hit = 1 }
-        else {
-          pipeline_ir_multi_succ_push(stack, nlist_get(succ_a, top), visited, n)
-          pipeline_ir_multi_succ_push(stack, nlist_get(succ_b, top), visited, n)
-        }
-      }
-      if hit == 1 { env = pipeline_ir_inline_value_env_bind(env, s, 1) } else { 0 }
-      s = s + 1
-    }
-    env
+-- Shared cycle facts use dense analysis positions independent of block IDs.
+-- Demand is checked before this producer, so functions without an eligible
+-- call do not pay for graph construction.
+pub(package) fn pipeline_ir_multi_loop_resident_env(blocks: IrBlockList) -> Map<i64, bool> {
+  match ir_cfg_cycles(blocks) {
+    IrCfgCycles(members) -> members
+    IrCfgInvalid -> map.new<i64, bool>()
   }
 }
 
@@ -56386,94 +56381,77 @@ pub(package) fn pipeline_ir_dense_table_call_blocks(blocks: IrBlockList, facts: 
   }
 }
 
--- One sweep: rewrite the first block containing a candidate call.
--- gate_all = 1 splices every block (small hosts); otherwise only blocks
--- present in the residency env split.
-pub(package) fn pipeline_ir_multi_inline_sweep(blocks: IrBlockList, candidates: PipelineIrInlineCandidateList, self_hash: i64, next_value: i64, next_block: i64, gate_all: i64, resident: PipelineIrInlineValueEnv, tt: i64) -> PipelineIrMultiPassResult {
-  match blocks {
-    IrBlockListNil -> PipelineIrMultiPassResult(0, IrBlockListNil, next_value, next_block)
-    IrBlockListCons(block, rest) -> {
-      let hot = match block {
-        IrBlock(id, params, insts, term) -> {
-          if gate_all == 1 { 1 } else { pipeline_ir_inline_value_env_lookup_or(resident, id, 0) }
-        }
-      }
-      let split = if hot == 1 {
-        match block {
-          IrBlock(id, params, insts, term) -> pipeline_ir_multi_split_insts(insts, candidates, self_hash, IrInstNil, tt)
-        }
-      } else {
-        PipelineIrMultiSplit(0, IrInstNil, 0, 0, IrValueNil, IrInstNil)
-      }
-      if pipeline_ir_multi_split_found(split) == 1 {
-        let spliced = pipeline_ir_multi_splice_block(block, split, candidates, next_value, next_block)
-        if pipeline_ir_multi_pass_changed(spliced) == 1 {
-          PipelineIrMultiPassResult(
-            1,
-            ir_block_list_append(pipeline_ir_multi_pass_blocks(spliced), rest),
-            pipeline_ir_multi_pass_next_value(spliced),
-            pipeline_ir_multi_pass_next_block(spliced)
-          )
-        } else {
-          let tail = pipeline_ir_multi_inline_sweep(rest, candidates, self_hash, next_value, next_block, gate_all, resident, tt)
-          PipelineIrMultiPassResult(
-            pipeline_ir_multi_pass_changed(tail),
-            IrBlockListCons(block, pipeline_ir_multi_pass_blocks(tail)),
-            pipeline_ir_multi_pass_next_value(tail),
-            pipeline_ir_multi_pass_next_block(tail)
-          )
-        }
-      } else {
-        let tail = pipeline_ir_multi_inline_sweep(rest, candidates, self_hash, next_value, next_block, gate_all, resident, tt)
-        PipelineIrMultiPassResult(
-          pipeline_ir_multi_pass_changed(tail),
-          IrBlockListCons(block, pipeline_ir_multi_pass_blocks(tail)),
-          pipeline_ir_multi_pass_next_value(tail),
-          pipeline_ir_multi_pass_next_block(tail)
-        )
-      }
-    }
+-- Scan each original prefix once. Candidates and call-site interpretation are
+-- fixed throughout the pass, so a prefix containing no eligible call cannot
+-- gain one when a later block is spliced. Newly exposed callee blocks and the
+-- continuation enter the same worklist in their original execution order.
+pub(package) fn pipeline_ir_multi_inline_function_blocks(self_hash: i64, param_count: i64, blocks: IrBlockList, candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, tt: i64) -> PipelineIrMultiPassResult {
+  pipeline_ir_multi_inline_function_blocks_at(self_hash, param_count, blocks, candidates, facts, tt, PipelineIrInlineEarly)
+}
+
+pub(package) fn pipeline_ir_multi_inline_host_deferred(stage: PipelineIrInlineStage, blocks: IrBlockList) -> bool {
+  match stage {
+    -- Bound intermediate CFG growth before representation specialization.
+    -- This is an expansion budget over actual blocks, never missing loop
+    -- information inferred from the largest historic block identity.
+    PipelineIrInlineEarly -> ir_block_list_len(blocks) > 128
+    PipelineIrInlineAfterLayout -> false
   }
 }
 
--- Function-level driver: splice until no candidate calls remain or the
--- site cap bounds growth (mutual-recursion backstop). Returns via the
--- pass-result shape: changed carries the site count.
-pub(package) fn pipeline_ir_multi_inline_function_blocks(self_hash: i64, param_count: i64, blocks: IrBlockList, candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, tt: i64) -> PipelineIrMultiPassResult {
+pub(package) fn pipeline_ir_multi_inline_function_blocks_at(self_hash: i64, param_count: i64, blocks: IrBlockList, candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, tt: i64, stage: PipelineIrInlineStage) -> PipelineIrMultiPassResult {
   match candidates {
     PipelineIrInlineCandidateNil -> PipelineIrMultiPassResult(0, blocks, pipeline_ir_function_next_value(param_count, blocks), pipeline_ir_block_list_max_id(blocks, 0) + 1)
-    PipelineIrInlineCandidateNode(chash, cf, clower, chigher) -> {
-      -- Small hosts splice everywhere (cheap, and wrapper bodies must
-      -- still swallow their branchy callees to become candidates);
-      -- larger hosts splice only loop-resident sites. Blocks a splice
-      -- creates inherit the (resident) site's eligibility.
+    PipelineIrInlineCandidateNode(chash, cf, clower, chigher) -> if pipeline_ir_multi_inline_host_deferred(stage, blocks) or not pipeline_ir_multi_inline_blocks_demand(blocks, candidates, self_hash, tt) {
+      PipelineIrMultiPassResult(0, blocks, pipeline_ir_function_next_value(param_count, blocks), pipeline_ir_block_list_max_id(blocks, 0) + 1)
+    } else {
       let has_dense_table_call = pipeline_ir_dense_table_call_blocks(blocks, facts)
-      let gate_all = if ir_block_list_len(blocks) <= pipeline_ir_multi_inline_blocks_cap() or has_dense_table_call == 1 { 1 } else { 0 }
+      let all_blocks = ir_block_list_len(blocks) <= pipeline_ir_multi_inline_blocks_cap() or has_dense_table_call == 1
       let site_cap = if has_dense_table_call == 1 { pipeline_ir_multi_inline_dense_table_site_cap() } else { pipeline_ir_multi_inline_site_cap() }
-      let mut resident = if gate_all == 1 { PipelineIrInlineValueEnvNil } else { pipeline_ir_multi_loop_resident_env(blocks) }
-      let mut current = blocks
+      -- This is an eligibility map, not a claim that every block created by
+      -- inlining lies on a cycle. New blocks inherit the eligible call site's
+      -- policy even when a callee contains a cold exit.
+      let eligible = if all_blocks { map.new<i64, bool>() } else { pipeline_ir_multi_loop_resident_env(blocks) }
+      let mut remaining = blocks
+      let mut completed = IrBlockListNil
       let mut next_value = pipeline_ir_function_next_value(param_count, blocks)
-      let mut next_block = pipeline_ir_block_list_max_id(blocks, 0) + 1
+      -- Fresh block identities form a disjoint monotonic range. Every member
+      -- was created by an eligible splice, so no per-clone map update is needed.
+      let first_new_block = pipeline_ir_block_list_max_id(blocks, 0) + 1
+      let mut next_block = first_new_block
       let mut sites = 0
-      let mut go = 1
-      while go == 1 and sites < site_cap {
-        let swept = pipeline_ir_multi_inline_sweep(current, candidates, self_hash, next_value, next_block, gate_all, resident, tt)
-        if pipeline_ir_multi_pass_changed(swept) == 1 {
-          current = pipeline_ir_multi_pass_blocks(swept)
-          next_value = pipeline_ir_multi_pass_next_value(swept)
-          let new_next_block = pipeline_ir_multi_pass_next_block(swept)
-          let mut nb = next_block
-          while nb < new_next_block {
-            resident = pipeline_ir_inline_value_env_bind(resident, nb, 1)
-            nb = nb + 1
+      let mut walking = true
+      while walking and sites < site_cap {
+        match remaining {
+          IrBlockListNil -> { walking = false }
+          IrBlockListCons(block, rest) -> {
+            let split = match block {
+              IrBlock(id, params, insts, term) -> if all_blocks or id >= first_new_block or eligible.contains_key(id) {
+                pipeline_ir_multi_split_insts(insts, candidates, self_hash, IrInstNil, tt)
+              } else { PipelineIrMultiSplit(0, IrInstNil, 0, 0, IrValueNil, IrInstNil) }
+            }
+            let spliced = if pipeline_ir_multi_split_found(split) == 1 {
+              pipeline_ir_multi_splice_block(block, split, candidates, next_value, next_block)
+            } else { PipelineIrMultiPassResult(0, IrBlockListNil, next_value, next_block) }
+            if pipeline_ir_multi_pass_changed(spliced) == 1 {
+              match pipeline_ir_multi_pass_blocks(spliced) {
+                IrBlockListCons(prefix, expanded) -> {
+                  completed = IrBlockListCons(prefix, completed)
+                  remaining = ir_block_list_append(expanded, rest)
+                  next_value = pipeline_ir_multi_pass_next_value(spliced)
+                  next_block = pipeline_ir_multi_pass_next_block(spliced)
+                  sites = sites + 1
+                }
+                IrBlockListNil -> { completed = IrBlockListCons(block, completed) remaining = rest }
+              }
+            } else { completed = IrBlockListCons(block, completed) remaining = rest }
           }
-          next_block = new_next_block
-          sites = sites + 1
-        } else {
-          go = 0
         }
       }
-      PipelineIrMultiPassResult(sites, current, next_value, next_block)
+      let result = if sites == 0 { blocks } else {
+        ir_block_list_append(pipeline_mem2reg_reverse_blocks(completed, IrBlockListNil), remaining)
+      }
+      PipelineIrMultiPassResult(sites, result, next_value, next_block)
     }
   }
 }
@@ -65757,6 +65735,63 @@ pub(package) fn pipeline_optimised_functions_with_dependency_product(
   }
 }
 
+-- Representation specialization can expose a small scalar accessor after the
+-- ordinary candidate censuses. Revisit only projection calls, before deriving
+-- final borrow/transfer/reuse facts. No additional read equivalence is assumed.
+pub(package) fn pipeline_ir_inline_after_layout_function(f: IrFunction, candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, pure: i64, tt: i64) -> PipelineOptimisedFunctions {
+  match f {
+    IrFunction(hash, params, blocks, src) -> {
+      -- An unchanged late function needs neither a fresh SSA range nor a
+      -- reconstructed maximum block identity. Keep that work behind demand.
+      if not pipeline_ir_multi_inline_blocks_demand(blocks, candidates, hash, tt) {
+        pipeline_optimised_functions(IrFunctionCons(f, IrFunctionNil), 0, 0, 0, 0, 0, 0)
+      } else {
+      let multi = pipeline_ir_multi_inline_function_blocks_at(hash, params, blocks, candidates, facts, tt, PipelineIrInlineAfterLayout)
+      let sites = pipeline_ir_multi_pass_changed(multi)
+      if sites == 0 { pipeline_optimised_functions(IrFunctionCons(f, IrFunctionNil), 0, 0, 0, 0, 0, 0) }
+      else {
+        let expanded = ir_cfg_compact_blocks(pipeline_ir_multi_pass_blocks(multi))
+        let count = ir_block_list_len(expanded)
+        let ctx = pipeline_ir_optimise_context5(facts, PipelineIrInlineCandidateNil, pure, params, pipeline_ir_value_def_table(expanded, params))
+        let folded = pipeline_ir_cfg_fold_fixpoint(expanded, ctx, pipeline_ir_multi_pass_next_value(multi), count + 2, count,
+          ir_block_list_inst_count(expanded), ir_block_list_count_tag(expanded, 2), ir_block_list_count_term_tag(expanded, 3))
+        let compact = ir_cfg_compact_blocks(pipeline_optimised_blocks_blocks(folded))
+        let promoted = pipeline_mem2reg_retighten_function(pipeline_mem2reg_function(IrFunction(hash, params, compact, src)), facts, pure)
+        pipeline_optimised_functions(IrFunctionCons(promoted, IrFunctionNil),
+          pipeline_optimised_blocks_const_fold_sites(folded), pipeline_optimised_blocks_algebraic_fold_sites(folded), 0, 0,
+          pipeline_optimised_blocks_block_entry_narrowing_sites(folded), sites)
+      }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_inline_after_layout_functions(functions: IrFunctionList, candidates: PipelineIrInlineCandidateList, facts: PipelineIrSemanticFactList, pure: i64, tt: i64) -> PipelineOptimisedFunctions {
+  match functions {
+    IrFunctionNil -> pipeline_optimised_functions(IrFunctionNil, 0, 0, 0, 0, 0, 0)
+    IrFunctionCons(f, rest) -> {
+      let mark = alloc_bump_mark()
+      let checkpoint = ttable_linear_layout_cache_checkpoint(tt)
+      let head = pipeline_ir_inline_after_layout_function(f, candidates, facts, pure, tt)
+      let end = alloc_bump_mark()
+      -- As in the main fold, rewritten closure captures are output payloads;
+      -- preserve their allocation window rather than treating them as scratch.
+      if pipeline_optimised_functions_direct_call_inline_sites(head) == 0 or
+        pipeline_ir_function_list_capture_payload_in_range(pipeline_optimised_functions_functions(head), mark, end) == 0 {
+        ttable_linear_layout_cache_restore(tt, checkpoint)
+        alloc_bump_restore_same_segment(mark)
+      } else { 0 }
+      let tail = pipeline_ir_inline_after_layout_functions(rest, candidates, facts, pure, tt)
+      pipeline_optimised_functions(
+        pipeline_ir_function_list_append(pipeline_optimised_functions_functions(head), pipeline_optimised_functions_functions(tail)),
+        pipeline_optimised_functions_const_fold_sites(head) + pipeline_optimised_functions_const_fold_sites(tail),
+        pipeline_optimised_functions_algebraic_fold_sites(head) + pipeline_optimised_functions_algebraic_fold_sites(tail), 0, 0,
+        pipeline_optimised_functions_block_entry_narrowing_sites(head) + pipeline_optimised_functions_block_entry_narrowing_sites(tail),
+        pipeline_optimised_functions_direct_call_inline_sites(head) + pipeline_optimised_functions_direct_call_inline_sites(tail))
+    }
+  }
+}
+
 pub(package) fn pipeline_finish_typed_optimisation(
   typed: TypedModule,
   canonical_functions: IrFunctionList,
@@ -65772,10 +65807,16 @@ pub(package) fn pipeline_finish_typed_optimisation(
       } else { PipelineIrSmallVariantSpecialisations(promoted_functions, facts, 0) }
       let scalarised_functions = pipeline_ir_small_variant_specialisations_functions(small_variants)
       let scalarised_facts = pipeline_ir_small_variant_specialisations_facts(small_variants)
-      let final_semantic_facts = pipeline_ir_semantic_borrow_values_enrich_functions(scalarised_facts, scalarised_functions, fns, tt)
+      let accessors = if promote == 1 {
+        pipeline_ir_inline_after_layout_functions(scalarised_functions,
+          pipeline_ir_multi_inline_candidates_at(scalarised_functions, scalarised_facts, PipelineIrInlineAfterLayout),
+          scalarised_facts, pipeline_ir_pure_callee_tree(scalarised_facts), tt)
+      } else { pipeline_optimised_functions(scalarised_functions, 0, 0, 0, 0, 0, 0) }
+      let accessor_functions = pipeline_optimised_functions_functions(accessors)
+      let final_semantic_facts = pipeline_ir_semantic_borrow_values_enrich_functions(scalarised_facts, accessor_functions, fns, tt)
       let consuming = if promote == 1 {
-        pipeline_ir_consuming_specialise(scalarised_functions, canonical_functions, final_semantic_facts, fns, src, tt)
-      } else { PipelineIrConsumingSpecialisations(scalarised_functions, final_semantic_facts, 0) }
+        pipeline_ir_consuming_specialise(accessor_functions, canonical_functions, final_semantic_facts, fns, src, tt)
+      } else { PipelineIrConsumingSpecialisations(accessor_functions, final_semantic_facts, 0) }
       let consuming_functions = pipeline_ir_consuming_specialisations_functions(consuming)
       let consuming_facts = pipeline_ir_consuming_specialisations_facts(consuming)
       let transferred_functions = if promote == 1 {
@@ -65787,14 +65828,14 @@ pub(package) fn pipeline_finish_typed_optimisation(
         0,
         0,
         0,
-        pipeline_optimised_functions_const_fold_sites(opt),
-        pipeline_optimised_functions_algebraic_fold_sites(opt),
+        pipeline_optimised_functions_const_fold_sites(opt) + pipeline_optimised_functions_const_fold_sites(accessors),
+        pipeline_optimised_functions_algebraic_fold_sites(opt) + pipeline_optimised_functions_algebraic_fold_sites(accessors),
         pipeline_optimised_functions_dead_inst_sites(opt),
         consuming_facts,
         pipeline_optimised_functions_pure_call_dce_sites(opt),
         0,
-        pipeline_optimised_functions_block_entry_narrowing_sites(opt),
-        pipeline_optimised_functions_direct_call_inline_sites(opt)
+        pipeline_optimised_functions_block_entry_narrowing_sites(opt) + pipeline_optimised_functions_block_entry_narrowing_sites(accessors),
+        pipeline_optimised_functions_direct_call_inline_sites(opt) + pipeline_optimised_functions_direct_call_inline_sites(accessors)
       )
     }
   }
