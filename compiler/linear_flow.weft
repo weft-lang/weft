@@ -1,0 +1,261 @@
+-- Ownership provenance through SSA joins. These facts describe whether a
+-- value contains one particular linear owner; copied fields are observations.
+-- Materialised predicates use ordinary block arguments and boolean operations.
+use compiler/ir.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/map as map
+use stdlib/map.{Map}
+use stdlib/option.{Option, Some, None}
+
+pub(package) type IrLinearOrigin {
+  IrLinearOriginAbsent
+  IrLinearOriginParameter(i64, i64)
+  IrLinearOriginConstruction(IrValueList)
+}
+
+pub(package) type IrLinearOriginEdge { predecessor: i64, flag: i64 }
+pub(package) type IrLinearOriginPhi { block: i64, flag: i64, edges: List<IrLinearOriginEdge> }
+pub(package) type IrLinearOriginBuild {
+  value: i64,
+  next_value: i64,
+  memo: Map<i64, i64>,
+  phis: List<IrLinearOriginPhi>,
+  definitions: Map<i64, IrInstList>
+}
+pub(package) type IrLinearOriginIncoming { build: IrLinearOriginBuild, edges: List<IrLinearOriginEdge> }
+
+pub(package) fn ir_linear_origin_index(values: IrValueList, wanted: i64, index: i64) -> i64 {
+  match values {
+    IrValueNil -> 0 - 1
+    IrValueCons(value, rest) -> if value == wanted { index } else { ir_linear_origin_index(rest, wanted, index + 1) }
+  }
+}
+
+pub(package) fn ir_linear_origin_at(values: IrValueList, index: i64) -> i64 {
+  match values {
+    IrValueNil -> 0 - 1
+    IrValueCons(value, rest) -> if index == 0 { value } else { ir_linear_origin_at(rest, index - 1) }
+  }
+}
+
+pub(package) fn ir_linear_origin_record_values(fields: IrRecordFieldList) -> IrValueList {
+  match fields {
+    IrRecordFieldNil -> IrValueNil
+    IrRecordFieldCons(_, _, value, rest) -> IrValueCons(value, ir_linear_origin_record_values(rest))
+  }
+}
+
+pub(package) fn ir_linear_origin_layout_values(fields: IrRecordLayoutFieldList) -> IrValueList {
+  match fields {
+    IrRecordLayoutFieldNil -> IrValueNil
+    IrRecordLayoutFieldWord(_, _, value, _, rest) -> IrValueCons(value, ir_linear_origin_layout_values(rest))
+    IrRecordLayoutFieldArray(_, _, _, _, _, _, _, rest) -> ir_linear_origin_layout_values(rest)
+  }
+}
+
+pub(package) fn ir_linear_origin_constructor_value(inst: IrInst) -> i64 {
+  match inst {
+    IrVariantInitI64(dst, _, _, _) -> dst
+    IrRecordInitI64(dst, _, _) -> dst
+    IrRecordLayoutInitI64(dst, _, _, _, _) -> dst
+    IrResumeI64(dst, _) -> dst
+    IrReuseInitI64(_, constructor) -> ir_linear_origin_constructor_value(constructor)
+    _ -> 0 - 1
+  }
+}
+
+pub(package) fn ir_linear_origin_constructor_inputs(inst: IrInst) -> IrValueList {
+  match inst {
+    IrVariantInitI64(_, _, values, _) -> values
+    IrRecordInitI64(_, _, fields) -> ir_linear_origin_record_values(fields)
+    IrRecordLayoutInitI64(_, _, _, _, fields) -> ir_linear_origin_layout_values(fields)
+    IrResumeI64(_, value) -> IrValueCons(value, IrValueNil)
+    IrReuseInitI64(_, constructor) -> ir_linear_origin_constructor_inputs(constructor)
+    _ -> IrValueNil
+  }
+}
+
+pub(package) fn ir_linear_origin_insts(insts: IrInstList, value: i64) -> IrLinearOrigin {
+  match insts {
+    IrInstNil -> IrLinearOriginAbsent
+    IrInstCons(inst, rest) -> if ir_linear_origin_constructor_value(inst) == value {
+      IrLinearOriginConstruction(ir_linear_origin_constructor_inputs(inst))
+    } else { ir_linear_origin_insts(rest, value) }
+  }
+}
+
+pub(package) fn ir_linear_origin(blocks: IrBlockList, value: i64) -> IrLinearOrigin {
+  match blocks {
+    IrBlockListNil -> IrLinearOriginAbsent
+    IrBlockListCons(IrBlock(id, params, insts, _), rest) -> {
+      let index = ir_linear_origin_index(params, value, 0)
+      if index >= 0 { IrLinearOriginParameter(id, index) }
+      else { match ir_linear_origin_insts(insts, value) {
+        IrLinearOriginAbsent -> ir_linear_origin(rest, value)
+        origin -> origin
+      } }
+    }
+  }
+}
+
+pub(package) fn ir_linear_origin_values_may_transfer(values: IrValueList, blocks: IrBlockList, source: i64, visited: IrValueList) -> bool {
+  match values {
+    IrValueNil -> false
+    IrValueCons(value, rest) -> ir_linear_origin_may_transfer(blocks, value, source, visited) or
+      ir_linear_origin_values_may_transfer(rest, blocks, source, visited)
+  }
+}
+
+pub(package) fn ir_linear_origin_incoming_may_transfer(current: IrBlockList, blocks: IrBlockList, target: i64, index: i64, source: i64, visited: IrValueList) -> bool {
+  match current {
+    IrBlockListNil -> false
+    IrBlockListCons(IrBlock(_, _, _, term), rest) -> {
+      let incoming = match term {
+        IrTermJump(dest, args) if dest == target -> ir_linear_origin_may_transfer(blocks, ir_linear_origin_at(args, index), source, visited)
+        _ -> false
+      }
+      incoming or ir_linear_origin_incoming_may_transfer(rest, blocks, target, index, source, visited)
+    }
+  }
+}
+
+pub(package) fn ir_linear_origin_may_transfer(blocks: IrBlockList, value: i64, source: i64, visited: IrValueList) -> bool {
+  if value == source { true }
+  else { if value < 0 or ir_linear_origin_index(visited, value, 0) >= 0 { false }
+  else {
+    let next = IrValueCons(value, visited)
+    match ir_linear_origin(blocks, value) {
+      IrLinearOriginAbsent -> false
+      IrLinearOriginConstruction(values) -> ir_linear_origin_values_may_transfer(values, blocks, source, next)
+      IrLinearOriginParameter(target, index) -> ir_linear_origin_incoming_may_transfer(blocks, blocks, target, index, source, next)
+    }
+  } }
+}
+
+pub(package) fn ir_linear_origin_build(next_value: i64) -> IrLinearOriginBuild {
+  IrLinearOriginBuild { value: next_value, next_value: next_value + 2, memo: map.new<i64, i64>(), phis: Nil<IrLinearOriginPhi>(), definitions: map.new<i64, IrInstList>() }
+}
+
+pub(package) fn ir_linear_origin_build_value(build: IrLinearOriginBuild, value: i64) -> IrLinearOriginBuild {
+  IrLinearOriginBuild { value: value, next_value: build.next_value, memo: build.memo, phis: build.phis, definitions: build.definitions }
+}
+
+pub(package) fn ir_linear_origin_request(blocks: IrBlockList, source: i64, value: i64, zero: i64, build: IrLinearOriginBuild) -> IrLinearOriginBuild {
+  if value == source { ir_linear_origin_build_value(build, zero + 1) }
+  else { match build.memo.get(value) {
+    Some(flag) -> ir_linear_origin_build_value(build, flag)
+    None -> match ir_linear_origin(blocks, value) {
+      IrLinearOriginAbsent -> IrLinearOriginBuild { value: zero, next_value: build.next_value, memo: build.memo.insert(value, zero), phis: build.phis, definitions: build.definitions }
+      origin -> {
+        -- Reserve before recursion: loop-carried origins refer to this same
+        -- boolean parameter instead of recursively expanding a cycle.
+        let flag = build.next_value
+        let reserved = IrLinearOriginBuild { value: flag, next_value: flag + 1, memo: build.memo.insert(value, flag), phis: build.phis, definitions: build.definitions }
+        match origin {
+          IrLinearOriginParameter(target, index) -> {
+            let incoming = ir_linear_origin_request_incoming(blocks, blocks, target, index, source, zero, reserved)
+            let next = incoming.build
+            IrLinearOriginBuild { value: flag, next_value: next.next_value, memo: next.memo,
+              phis: Cons(IrLinearOriginPhi { block: target, flag: flag, edges: incoming.edges }, next.phis), definitions: next.definitions }
+          }
+          IrLinearOriginConstruction(values) -> {
+            let joined = ir_linear_origin_request_values(values, blocks, source, zero, value, ir_linear_origin_build_value(reserved, zero))
+            let copy = IrInstCons(ir_inst_binary_i64(flag, IrOr, joined.value, zero), IrInstNil)
+            let prefix = joined.definitions.get(value).unwrap_or(IrInstNil)
+            IrLinearOriginBuild { value: flag, next_value: joined.next_value, memo: joined.memo, phis: joined.phis,
+              definitions: joined.definitions.insert(value, ir_inst_list_append(prefix, copy)) }
+          }
+          IrLinearOriginAbsent -> reserved
+        }
+      }
+    }
+  } }
+}
+
+pub(package) fn ir_linear_origin_request_incoming(current: IrBlockList, blocks: IrBlockList, target: i64, index: i64, source: i64, zero: i64, build: IrLinearOriginBuild) -> IrLinearOriginIncoming {
+  match current {
+    IrBlockListNil -> IrLinearOriginIncoming { build: build, edges: Nil<IrLinearOriginEdge>() }
+    IrBlockListCons(IrBlock(id, _, _, term), rest) -> match term {
+      IrTermJump(dest, args) if dest == target -> {
+        let next = ir_linear_origin_request(blocks, source, ir_linear_origin_at(args, index), zero, build)
+        let tail = ir_linear_origin_request_incoming(rest, blocks, target, index, source, zero, next)
+        IrLinearOriginIncoming { build: tail.build, edges: Cons(IrLinearOriginEdge { predecessor: id, flag: next.value }, tail.edges) }
+      }
+      _ -> ir_linear_origin_request_incoming(rest, blocks, target, index, source, zero, build)
+    }
+  }
+}
+
+pub(package) fn ir_linear_origin_request_values(values: IrValueList, blocks: IrBlockList, source: i64, zero: i64, producer: i64, build: IrLinearOriginBuild) -> IrLinearOriginBuild {
+  match values {
+    IrValueNil -> build
+    IrValueCons(value, rest) -> {
+      let left = build.value
+      let next = ir_linear_origin_request(blocks, source, value, zero, build)
+      let joined = if left == zero { ir_linear_origin_build_value(next, next.value) }
+        else { if next.value == zero or next.value == left { ir_linear_origin_build_value(next, left) }
+        else {
+          let dst = next.next_value
+          let prefix = next.definitions.get(producer).unwrap_or(IrInstNil)
+          let inst = IrInstCons(ir_inst_binary_i64(dst, IrOr, left, next.value), IrInstNil)
+          IrLinearOriginBuild { value: dst, next_value: dst + 1, memo: next.memo, phis: next.phis,
+            definitions: next.definitions.insert(producer, ir_inst_list_append(prefix, inst)) }
+        } }
+      ir_linear_origin_request_values(rest, blocks, source, zero, producer, joined)
+    }
+  }
+}
+
+pub(package) fn ir_linear_origin_phi_params(phis: List<IrLinearOriginPhi>, target: i64) -> IrValueList {
+  match phis {
+    Nil -> IrValueNil
+    Cons(phi, rest) -> {
+      let tail = ir_linear_origin_phi_params(rest, target)
+      if phi.block == target { IrValueCons(phi.flag, tail) } else { tail }
+    }
+  }
+}
+
+pub(package) fn ir_linear_origin_edge_flag(edges: List<IrLinearOriginEdge>, predecessor: i64, zero: i64) -> i64 {
+  match edges {
+    Nil -> zero
+    Cons(edge, rest) -> if edge.predecessor == predecessor { edge.flag } else { ir_linear_origin_edge_flag(rest, predecessor, zero) }
+  }
+}
+
+pub(package) fn ir_linear_origin_phi_args(phis: List<IrLinearOriginPhi>, target: i64, predecessor: i64, zero: i64) -> IrValueList {
+  match phis {
+    Nil -> IrValueNil
+    Cons(phi, rest) -> {
+      let tail = ir_linear_origin_phi_args(rest, target, predecessor, zero)
+      if phi.block == target { IrValueCons(ir_linear_origin_edge_flag(phi.edges, predecessor, zero), tail) } else { tail }
+    }
+  }
+}
+
+pub(package) fn ir_linear_origin_materialise_insts(insts: IrInstList, definitions: Map<i64, IrInstList>) -> IrInstList {
+  match insts {
+    IrInstNil -> IrInstNil
+    IrInstCons(inst, rest) -> {
+      let extra = definitions.get(ir_linear_origin_constructor_value(inst)).unwrap_or(IrInstNil)
+      IrInstCons(inst, ir_inst_list_append(extra, ir_linear_origin_materialise_insts(rest, definitions)))
+    }
+  }
+}
+
+pub(package) fn ir_linear_origin_materialise(blocks: IrBlockList, build: IrLinearOriginBuild, zero: i64) -> IrBlockList {
+  match blocks {
+    IrBlockListNil -> IrBlockListNil
+    IrBlockListCons(IrBlock(id, params, insts, term), rest) -> {
+      let next_params = ir_value_list_append(params, ir_linear_origin_phi_params(build.phis, id))
+      let next_term = match term {
+        IrTermJump(target, args) -> IrTermJump(target, ir_value_list_append(args, ir_linear_origin_phi_args(build.phis, target, id, zero)))
+        _ -> term
+      }
+      let body = ir_linear_origin_materialise_insts(insts, build.definitions)
+      let exit_predicate = build.definitions.get(0 - 2 - id).unwrap_or(IrInstNil)
+      IrBlockListCons(IrBlock(id, next_params, ir_inst_list_append(body, exit_predicate), next_term),
+        ir_linear_origin_materialise(rest, build, zero))
+    }
+  }
+}
