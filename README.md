@@ -196,19 +196,7 @@ Rust uses `-C opt-level=3 -C codegen-units=1 -C target-cpu=native`; Go uses
 its default build settings. These are small, process-level measurements;
 startup noise matters especially for the shortest workloads.
 
-The checked APIs expose substantial optimization gaps. N-body still creates
-8.5 million temporary optional results. Propagating existing borrow facts
-through method calls removed 12.25 million retain/release pairs and made it
-25.6% faster in 21 same-source alternating pairs, while preserving exact
-cleanup. Erasing the remaining result allocations requires richer variant
-representation facts. Earlier tables used different API shapes, including
-package-private helpers, and cannot isolate compiler-version changes.
-
-Current self-compilation takes **27.34 seconds** median. Ten alternating pairs
-on identical current source put the earlier compiler at 27.40 seconds: a flat
-result after fixing a repeated declaration-fact scan that had caused a 32.6%
-regression. The current complete-SDK bootstrap is byte-identical across
-generations two and three.
+Self-compilation at this checkpoint: **27.34 seconds** (median).
 
 Reproduce the table with
 `BENCH_COMPARE_RUNS=21 BENCH_COMPARE_WARMUPS=2 bash bench_compare.sh`.
