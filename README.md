@@ -52,7 +52,7 @@ The compiler emits AArch64 Mach-O and ELF directly and is written in Weft. The l
 
 **Pre-alpha and self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root. Until the public-alpha gate closes, source, package, fact-schema, and versioned native-binding contracts may change without compatibility support.
 
-- 4851 runtime test blocks across 414 files, plus 1080 negative (must-fail) cases
+- 4864 runtime test blocks across 416 files, plus 1080 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
 - Current release gates: the complete target-local Linux suite on adequate hardware, hardening/governance, final status/support documentation, and the two-target outside-user exercise. Install/release UX, project signing, free community macOS distribution, and native-binding platform diagnostics are complete
@@ -179,24 +179,24 @@ Small algorithm kernels have sibling Weft, Go, and Rust implementations with
 the same algorithms, data sizes, and checked results. The Weft programs use
 public collection APIs, including checked slices and optional lookups.
 Minimum elapsed time from 21 runs after two warmups, Apple M4 Max,
-2026-09-07, benchmark sources `42f915db` and compiler `8be6e42e`:
+2026-09-07, benchmark sources `42f915db` and compiler `3ced30de`:
 
 | Workload | Weft | Go | Rust |
 |---|---:|---:|---:|
-| vector_sort | 3.40 ms | 2.06 ms | 1.82 ms |
-| graph_reach | 10.89 ms | 2.85 ms | 2.42 ms |
-| nbody | 12.10 ms | 3.28 ms | 3.18 ms |
-| sieve | 27.47 ms | 8.86 ms | 5.93 ms |
-| mandelbrot | 16.63 ms | 8.93 ms | 9.32 ms |
-| sorted_lookup | 40.93 ms | 16.72 ms | 7.58 ms |
-| iterator_pipeline_direct | 1.49 ms | 2.03 ms | 1.85 ms |
-| iterator_pipeline | 1.79 ms | 2.09 ms | 1.76 ms |
+| vector_sort | 3.27 ms | 2.07 ms | 1.84 ms |
+| graph_reach | 11.37 ms | 2.76 ms | 2.46 ms |
+| nbody | 9.91 ms | 3.16 ms | 3.15 ms |
+| sieve | 28.43 ms | 9.04 ms | 5.59 ms |
+| mandelbrot | 16.65 ms | 8.79 ms | 9.41 ms |
+| sorted_lookup | 42.35 ms | 17.18 ms | 7.59 ms |
+| iterator_pipeline_direct | 1.42 ms | 2.15 ms | 1.92 ms |
+| iterator_pipeline | 1.90 ms | 2.18 ms | 1.67 ms |
 
 Rust uses `-C opt-level=3 -C codegen-units=1 -C target-cpu=native`; Go uses
 its default build settings. These are small, process-level measurements;
 startup noise matters especially for the shortest workloads.
 
-Self-compilation at this checkpoint: **29.39 seconds** (median).
+Self-compilation at this checkpoint: **29.45 seconds** (median).
 
 Reproduce the table with
 `BENCH_COMPARE_RUNS=21 BENCH_COMPARE_WARMUPS=2 bash bench_compare.sh`.
