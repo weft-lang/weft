@@ -2,8 +2,6 @@
 
 A compiled, general-purpose language with set-theoretic types, algebraic effects, and deterministic managed memory.
 
-**Every type is a set. Every side effect is in the signature.**
-
 Run a file-writing program entirely in memory:
 
 ```weft test
@@ -40,152 +38,68 @@ are compiled and run with the checked-in `./weft` binary.
 
 ## What is Weft?
 
-Weft is a compiled language that combines set-theoretic types, algebraic effects, and deterministic managed memory. The type system tracks what your code *does* — which effects it performs, what types flow through it, where trust boundaries live — and the compiler uses that information to verify correctness and generate efficient native code. No LLVM, no C middleman: the compiler emits AArch64 Mach-O and ELF directly, and it compiles itself.
+Weft brings checked capabilities, replaceable I/O, and predictable resource cleanup into one language. A function's signature tells you what it needs. Handlers supply those capabilities for production, tests, or simulation. Types describe the values that can reach each branch, and owned resources are cleaned up on normal return and handled failure.
 
-- **Set-theoretic types** — types are sets. Union (`i64 | str`), intersection (`Display & Eq`), complement via flow narrowing. Subtyping is set inclusion. One algebra for everything.
-- **Algebraic effects** — every side effect is declared in the function's type. `->` is a purity guarantee the compiler enforces. Effects subsume error handling, state, iterators, and parallelism under one mechanism, and handlers decide policy at the call boundary.
-- **Deterministic managed memory** — heap values that escape use deterministic reference counting, inserted and aggressively elided by the compiler. Ordinary source writes `T`, never `rc T`. No tracing GC, no pauses. `weak` breaks cycles; `owned` gives single-owner move semantics with ordered `Drop` for resources; the `Alloc` effect lets a handler choose the allocation strategy (arenas, pools) for a whole call tree.
-- **A sealed trusted ring** — raw pointers, syscalls, and FFI live behind the `Unsafe` effect, which is sealed inside the runtime/platform modules. Ordinary code cannot perform or handle it; safety comes from the effect system, not a borrow checker. The trust boundary is visible, auditable, and small.
+The compiler emits AArch64 Mach-O and ELF directly and is written in Weft. The language is still pre-alpha; it is ready for experiments and feedback, with compatibility changes expected before the public-alpha release.
+
+- **Set-theoretic types** — types are sets. Union (`i64 | str`), intersection (`Display & Eq`), complement via flow narrowing. Subtyping is set inclusion.
+- **Algebraic effects** — functions declare the capabilities they use; `->` declares an empty effect set. Handlers choose how operations run. The same mechanism supports error handling, state, generators, and parallel scheduling.
+- **Deterministic managed memory** — heap values that escape use reference counting, inserted and elided where proven by the compiler. Ordinary source writes `T`. There is no tracing garbage collector; releasing a value can still run cleanup work. `weak` breaks cycles; `owned` gives single-owner move semantics with ordered `Drop` for resources; the `Alloc` effect lets a handler choose an allocation strategy for a call tree.
+- **A sealed trusted ring** — raw pointers, syscalls, and FFI live behind the `Unsafe` effect. Ordinary code cannot perform or handle it. Capability, ownership, and borrow checking work together to enforce that boundary. Runtime/platform code and explicitly declared native binding modules form the trusted code.
 - **Immutable by default** — `let` is immutable, `mut` is opt-in, and nil-guard narrowing only applies to immutable bindings.
 
 ## Status
 
 **Pre-alpha and self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root. Until the public-alpha gate closes, source, package, fact-schema, and versioned native-binding contracts may change without compatibility support.
 
-- 4662 runtime test blocks across 383 files, plus 1080 negative (must-fail) cases
+- 4686 runtime test blocks across 386 files, plus 1080 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
 - Current release gates: the complete target-local Linux suite on adequate hardware, hardening/governance, final status/support documentation, and the two-target outside-user exercise. Install/release UX, project signing, free community macOS distribution, and native-binding platform diagnostics are complete
 
 ## Quick Start
 
-For the complete checked first-project path, including tests, effects, Unicode,
-local packages, diagnostics, and the current alpha boundary, see
-[Getting started with Weft](docs/getting-started.md). The split network
-capabilities, value policies, owned sockets, and readiness contract are covered
-in [Networking in Weft](docs/networking.md). The distinction between checked
-parallelism, effectful task scheduling, bounded channels, and cancellation is
-covered in [Concurrency in Weft](docs/concurrency.md).
-Deterministic generation, shrinking, and replay are introduced in
-[Property testing in Weft](docs/testing.md).
-
-**Prerequisites:** macOS on Apple Silicon. No toolchain or separate SDK — the
-checked-in binary contains the compiler and its matching standard library.
+On an Apple-Silicon Mac, the checked-in compiler includes its matching SDK.
+From this repository's root:
 
 ```bash
-# Compile and run a program (the compiler emits a signed executable)
+# Check and run one source file.
 echo 'fn main() -> i64 { 42 }' > answer.weft
-./weft compile answer.weft > answer && chmod +x answer
-./answer; echo $?   # 42
-
-# Type-check without compiling
 ./weft check answer.weft
-
-# Build the host target, run it directly, and forward its exit status
 ./weft run answer.weft; echo $?   # 42
 
-# Explicit low-level product path and versioned link/BOM facts
+# Keep a native executable and its deployment facts.
 ./weft build answer.weft -o answer --artifact-facts answer.facts.json
 
-# Cross-build the same source as standalone Linux/AArch64 ELF
-./weft build answer.weft -o answer-linux --target linux-aarch64 \
-  --artifact-facts answer-linux.facts.json
+# Cross-build standalone Linux/AArch64 ELF from the same source.
+./weft build answer.weft -o answer-linux --target linux-aarch64
 
-# Inspect the compiler/schema identity and the exact target contract
+# Inspect the compiler and its target contract.
 ./weft --version
-./weft target list
 ./weft target show linux-aarch64
-
-# Verify self-hosting: the gate is byte-identical generations
-just bootstrap
-
-# Run the full test suite (parallel; duration is host-dependent)
-bash run_tests.sh
 ```
 
-Development products include function/file/line DWARF by default. Add
-`--strip-debug` to `weft build` when the smaller release artifact matters; the
-artifact-facts sidecar reports whether debug information is present.
-Normal products incorporate the Weft runtime and stdlib code they use. A
-standalone macOS artifact depends only on the stable `libSystem` OS ABI; a
-standalone Linux artifact uses the recorded kernel ABI and has no interpreter.
-Manifest-declared dynamic libraries are explicit deployment dependencies and
-make the artifact facts report `standalone: false`.
+Ordinary applications incorporate the Weft runtime and library code they use.
+macOS artifacts use the operating system's `libSystem`; default Linux artifacts
+use the kernel ABI. Declared native dynamic libraries remain explicit
+deployment dependencies. Users do not install a separate Weft runtime.
 
-Inside a package created by `weft pkg init NAME`, the manifest carries an
-explicit source root and typed binary target. Plain `weft build` writes the
-host product and its facts to `target/<platform>/<name>` and
-`target/<platform>/<name>.facts.json`; `weft run` selects and executes the same
-default target. A named target can be selected as `weft build NAME` or
-`weft run NAME -- ARG...`. The `build PATH -o OUTPUT` form above remains the
-explicit low-level artifact path.
+The public guides cover:
 
-Dependencies are typed as live owner-relative paths, exact Git revisions, or
-HTTPS archives with a declared SHA-256. `weft pkg lock`/`fetch` populate an
-immutable content-addressed cache; ordinary project commands are cache-only,
-and `weft pkg fetch --offline` verifies the complete locked graph without
-network authority. Updating a dependency covered by a root trust grant first
-reports deterministic old/new native-authority and safe-wrapper facts as
-`E5014` and restores the manifest and lock. The same command with
-`--accept-trust-change` accepts the reviewed identity without widening its
-trusted module set. Acquisition helpers are not linked into Weft products.
+- [Getting started](docs/getting-started.md): programs, tests, effects, Unicode, and packages.
+- [Networking](docs/networking.md): narrow authority, owned connections, and bounded web streams.
+- [Concurrency](docs/concurrency.md): deterministic parallel work, effectful tasks, and cancellation.
+- [Property testing](docs/testing.md): generated cases, shrinking, and exact replay.
+- [Installation and distribution](docs/distribution.md): compiler archives, verification, and release signing.
 
-`weft version --json` reports the same compiler, language, manifest, lock,
-native-binding ABI, artifact-facts schema, supported-target identities, and SDK
-origin as machine-readable data. An installed compiler reports its embedded
-SDK's SHA-256; a compiler invoked from its own development checkout reports
-that checkout explicitly. These values come from the compatibility facts used
-by the manifest/lock validators and artifact-facts emitter; the banner is not a
-separately maintained version string.
-
-Target-specific release archives are built without a host linker. `bin/weft`
-embeds the complete version-matched SDK—compiler modules, `stdlib/`, `runtime/`,
-the SDK manifest, and both target-native archives—as one deterministic indexed
-payload. The remaining files are audit metadata, notices, licenses, and a
-checksum. This command produces the byte-reproducible local probe used by the
-repository gate:
-
-```bash
-tools/build_release_bundle.sh macos-aarch64 dist
-(cd dist && shasum -a 256 -c weft-0.1.0-macos-aarch64.tar.sha256)
-tar -xf dist/weft-0.1.0-macos-aarch64.tar
-export PATH="$PWD/weft-0.1.0-macos-aarch64/bin:$PATH"
-weft --version
-```
-
-Use `linux-aarch64` and `sha256sum -c` on Linux. `bin/weft` is independently
-movable: canonical stdlib/runtime imports and pinned native libraries resolve
-from the binary in any working directory, with no adjacent SDK tree, checkout
-path, or environment override. Removing that binary uninstalls the tool; the
-archive's `share/weft/` files are retained only for external inspection. The
-archive bytes and binary-only clean install, project, offline rebuild, and
-uninstall flow are tested on both targets.
-
-Published artifacts use a separate fail-closed ceremony. Every target carries
-a signed `*.tar.release` manifest binding the archive digest, size, source
-commit, target, and platform-authenticity facts. Verify it using the project's
-allowed-signers file obtained through a separately trusted channel:
-
-```bash
-tools/verify_release_bundle.sh \
-  dist/weft-0.1.0-macos-aarch64.tar \
-  /path/to/weft-allowed-signers weft-release
-```
-
-`tools/publish_release_bundle.sh` creates those sidecars. Linux and the default
-macOS community channel are authenticated by the same project signature. The
-macOS compiler retains its deterministic ad-hoc code signature, so Gatekeeper
-may require one launch attempt followed by **System Settings → Privacy &
-Security → Open Anyway**. Developer ID and notarization are an optional
-`WEFT_MACOS_DISTRIBUTION=notarized` channel, not an alpha or source-build
-requirement. Private project keys and optional Apple credentials are never
-accepted from a manifest or committed to the SDK.
+Contributors can run `bash run_tests.sh` for the complete suite and
+`just bootstrap` for the compiler's three-generation byte-identity gate.
 
 ## The Ideas
 
 ### Effects make policy pluggable
 
-The function says *what* it needs; the handler at the boundary decides *how* — and not resuming is an early exit, which is how error handling falls out for free:
+A handler can choose how to recover from a failure without changing the function that reports it:
 
 ```weft run
 use stdlib/fail.{Fail}
@@ -203,28 +117,32 @@ fn main() -> i64 {
 -- exits 99
 ```
 
-The same mechanism handles allocation strategy — a handler can serve `Alloc.alloc(size, align)` from an arena for a whole call tree — state, iteration, and fork/join parallelism (`Par`), which preserves deterministic observation order by default.
+Returning without `resume` leaves the handled computation and runs its cleanup. Other handlers use the same mechanism to select allocation strategies, interpret state, or schedule pure parallel work while preserving deterministic observation order.
 
 ### Types are sets, and control flow narrows them
 
-```weft run
-type Shape { Circle(i64), Square(i64) }
+Missing configuration and an explicit decision to stop remain distinct:
 
-fn area3(input: Shape | nil) -> i64 {
+```weft run
+type RetryPolicy { Retry(usize), Stop }
+
+fn attempts(input: RetryPolicy | nil) -> usize {
+  let no_attempts: usize = 0
+  let default_attempts: usize = 3
   match input {
-    s: Shape -> match s { Circle(r) -> r * 3, Square(w) -> w * 4 }
-    nil      -> 0 - 1
+    policy: RetryPolicy -> match policy { Retry(count) -> count, Stop -> no_attempts }
+    nil -> default_attempts
   }
 }
 
 fn main() -> i64 {
-  if area3(Circle(5)) == 15 {
-    if area3(nil) == 0 - 1 { 0 } else { 2 }
-  } else { 1 }
+  if attempts(Retry(5)) == 5 and attempts(Stop) == 0 and attempts(nil) == 3 { 0 } else { 1 }
 }
 ```
 
-After `s: Shape`, the binding is `Shape` — the union has been narrowed by set difference, and exhaustiveness is checked as residual-set emptiness. The same narrowing works in guard position: after `if x != nil`, an `x: str | nil` binding is `str`. `T?` is sugar for `T | nil`. Typed arms require a runtime-discriminable union (nil-sentinel or variant family) — untagged unions like `i64 | str` carry no invisible boxing, and the diagnostic suggests a variant type instead.
+Inside the typed arm, `policy` is a `RetryPolicy`; the compiler checks that the matches cover every remaining case. The same narrowing works after `if x != nil` for an immutable `x: str | nil`. `T?` is shorthand for `T | nil`.
+
+Runtime matching needs a distinguishable representation, such as a variant or a nil sentinel. An untagged union such as `i64 | str` cannot be distinguished this way; use a variant when a runtime tag is needed.
 
 ### Memory: four layers, one visible boundary
 
@@ -235,7 +153,9 @@ After `s: Shape`, the binding is `Shape` — the union has been narrowed by set 
 | Resource | `owned T` | single owner, move semantics, ordered `Drop` |
 | Trusted runtime | sealed `-[Unsafe]> T` | raw pointers, syscalls, FFI — runtime/platform modules only |
 
-Application code just writes `T`. The compiler classifies storage (stack, inline, managed, region) and inserts retain/release, then elides them where lifetimes provably nest — ownership operations are a first-class optimizer target, not a fixed tax. `weak` breaks reference cycles. Values that cross a thread boundary are atomically promoted at that boundary — there is no separate `arc` type. And `Unsafe` is not an escape hatch you opt into: it is sealed inside the runtime, so an ordinary module *cannot* fabricate a pointer, and you can audit the entire trusted ring.
+Most application data uses ordinary `T`. The compiler selects its storage and manages reference lifetimes. Thread-crossing values use atomic managed references where needed, under checked `Sendable` constraints.
+
+An `owned` resource has one owner. Moving it transfers the cleanup obligation; normal return and handled failure run `Drop`. Explicit close is useful when the caller needs to inspect the close result:
 
 ```weft check
 use stdlib/fail.{Fail}
@@ -255,34 +175,45 @@ fn open_and_close(path: Path) -[IO, Fail<IoError>]> Result<nil, IoError> {
 
 ## Benchmarks
 
-Small algorithm kernels with sibling Weft, Go, and Rust implementations (same algorithm, same data sizes, checksum-verified). Every Weft program is written against the public surface — bounds-checked stdlib vectors, managed memory — not runtime internals. Rust is built `-C opt-level=3 -C target-cpu=native`, Go with its default toolchain. Minimum of 11 runs after two warmups, Apple M-series, 2026-08-31, repo commit `aa16159`:
+Small algorithm kernels have sibling Weft, Go, and Rust implementations with
+the same algorithms, data sizes, and checked results. The Weft programs use
+public collection APIs, including checked slices and optional lookups.
+Minimum elapsed time from 21 runs after two warmups, Apple M4 Max,
+2026-09-06, source checkpoint `cc81e922` and compiler `26f8fe87`:
 
-| workload | Weft | Go | Rust | Weft binary | Weft build |
-|---|---|---|---|---|---|
-| vector_sort | 2.8 ms | 2.4 ms | 1.7 ms | 160 KB | 316 ms |
-| graph_reach | 5.1 ms | 3.5 ms | 3.1 ms | 160 KB | 306 ms |
-| nbody | 5.6 ms | 3.9 ms | 3.8 ms | 160 KB | 346 ms |
-| sieve | 18.4 ms | 9.5 ms | 6.1 ms | 144 KB | 297 ms |
-| mandelbrot | 17.4 ms | 9.6 ms | 9.7 ms | 144 KB | 470 ms |
-| sorted_lookup | 38.5 ms | 17.6 ms | 8.1 ms | 160 KB | 397 ms |
+| Workload | Weft | Go | Rust |
+|---|---:|---:|---:|
+| vector_sort | 3.38 ms | 2.13 ms | 1.88 ms |
+| graph_reach | 23.46 ms | 2.99 ms | 2.53 ms |
+| nbody | 224.20 ms | 3.42 ms | 3.38 ms |
+| sieve | 85.01 ms | 9.30 ms | 5.81 ms |
+| mandelbrot | 17.39 ms | 9.63 ms | 9.59 ms |
+| sorted_lookup | 72.40 ms | 17.89 ms | 7.94 ms |
+| iterator_pipeline_direct | 1.57 ms | 2.08 ms | 1.82 ms |
+| iterator_pipeline | 1.92 ms | 2.21 ms | 1.80 ms |
 
-Read this table as a dated lowering/codegen snapshot, not a language scorecard.
-The same repository audit initially found a real compiler-throughput regression:
-three quiet self-compiles took 30.47–31.76 seconds. Executable function-graph
-closure was rescanning every relocation for every candidate function on every
-fixpoint pass. Indexing relocation demands at their producer removed that
-quadratic path. Three quiet fixed-point self-compiles now take 22.51–23.22
-seconds (median 23.04); median phase time is 22.88 seconds, including 12.23
-seconds optimizing and 6.05 seconds emitting 13,035 functions. On identical
-2026-08-21 source, ten alternating pairs put the fixed compiler at 17.91 seconds
-versus 18.80 seconds for the historical compiler (4.60% faster). All six
-algorithm products remain byte-identical across the change and their paired
-runtime verdicts are flat.
+Rust uses `-C opt-level=3 -C codegen-units=1 -C target-cpu=native`; Go uses
+its default build settings. These are small, process-level measurements;
+startup noise matters especially for the shortest workloads.
 
-Reproduce the algorithm snapshot with `bash bench_compare.sh`; its timestamped
-JSONL output is local measurement data and is ignored by Git. For compiler
-changes, use `bench_verdict.py` for same-session interleaved A/B measurements.
-The most representative single number remains self-compilation.
+The checked APIs expose substantial optimization gaps. N-body still creates
+8.5 million temporary optional results. Propagating existing borrow facts
+through method calls removed 12.25 million retain/release pairs and made it
+25.6% faster in 21 same-source alternating pairs, while preserving exact
+cleanup. Erasing the remaining result allocations requires richer variant
+representation facts. Earlier tables used different API shapes, including
+package-private helpers, and cannot isolate compiler-version changes.
+
+Current self-compilation takes **27.34 seconds** median. Ten alternating pairs
+on identical current source put the earlier compiler at 27.40 seconds: a flat
+result after fixing a repeated declaration-fact scan that had caused a 32.6%
+regression. The current complete-SDK bootstrap is byte-identical across
+generations two and three.
+
+Reproduce the table with
+`BENCH_COMPARE_RUNS=21 BENCH_COMPARE_WARMUPS=2 bash bench_compare.sh`.
+The [benchmark guide](bench/compare/README.md) explains same-source compiler
+comparisons, toolchain records, and measurement discipline.
 
 ## Architecture
 
