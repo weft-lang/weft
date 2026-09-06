@@ -35,6 +35,7 @@ use stdlib/bytes.{Bytes}
 use stdlib/list.{Cons, List, Nil}
 use stdlib/map as map
 use stdlib/map.{Map}
+use stdlib/option.{Option, Some, None}
 use stdlib/string.{str_eq}
 use stdlib/vector.{vector_data, vector_len}
 use stdlib/vector/handles.{Vector}
@@ -60387,11 +60388,7 @@ pub(package) fn pipeline_optimise_ir_function(f: IrFunction, inline_candidates: 
         }
       }
       let final_folded_blocks = pipeline_optimised_blocks_blocks(post_folded)
-      let normalised = pipeline_ir_normalise_branch_targets(final_folded_blocks)
-      let normalised_blocks = pipeline_ir_normalised_blocks_blocks(normalised)
-      let live = pipeline_ir_function_live_fixpoint(normalised_blocks, pipeline_ir_live_set_dense(pipeline_optimised_blocks_next_value(post_folded) + 1), facts)
-      let trimmed_blocks = pipeline_ir_trim_block_param_list(normalised_blocks, normalised_blocks, live)
-      let dce = pipeline_dce_sweep_ir_block_list(trimmed_blocks, live, facts)
+      let dce = pipeline_ir_storage_finish_blocks(final_folded_blocks, pipeline_optimised_blocks_next_value(post_folded), facts)
       pipeline_optimised_functions(
         ir_function_list_prepend(ir_function_new_blocks_src(hash, params, pipeline_optimised_blocks_blocks(dce), src), ir_function_list_empty()),
         pipeline_optimised_blocks_const_fold_sites(folded) + pipeline_optimised_blocks_const_fold_sites(post_folded),
@@ -65969,6 +65966,783 @@ pub(package) fn pipeline_optimised_functions_with_dependency_product(
   }
 }
 
+-- Scoped conditional routing and storage observation facts. Facts retain
+-- the immutable graph they describe; every rewrite rebuilds its successors,
+-- memory versions and dominance before final ownership enrichment.
+
+pub(package) type PipelineIrParameterRoute { PipelineIrRouteUnused, PipelineIrRouteThen, PipelineIrRouteElse, PipelineIrRouteConflict }
+pub(package) type PipelineIrConditionalMergeShape {
+  PipelineIrConditionalMergeShape(i64, IrValueList, IrInstList, i64, i64, i64, IrValueList)
+}
+pub(package) type PipelineIrConditionalMergeRouting {
+  PipelineIrConditionalMergeRouting(i64, i64, i64, IrValueList, IrValueList, Map<i64, IrTerminator>)
+}
+
+pub(package) fn pipeline_ir_flow_integer_equality(inst: IrInst) -> bool {
+  let full_word = match inst { IrBinaryI64(_, _, _, _) -> true, _ -> false }
+  full_word and match ir_comparison_fact(inst) {
+    IrComparison(_, op, _, _, domain) -> {
+      let integer = match domain {
+        IrComparisonSigned -> true
+        IrComparisonUnsigned -> true
+        IrComparisonF32 -> false
+        IrComparisonF64 -> false
+      }
+      integer and match op { IrEq -> true, IrNe -> true, _ -> false }
+    }
+    IrNotComparison -> false
+  }
+}
+
+pub(package) fn pipeline_ir_flow_dispatch_definitions(insts: IrInstList) -> Option<IrValueList> {
+  match insts {
+    IrInstNil -> Some(IrValueNil)
+    IrInstCons(inst, rest) -> {
+      let accepted = match inst {
+        IrConstI64(_, _) -> true
+        IrNilI64(_) -> true
+        _ -> pipeline_ir_flow_integer_equality(inst)
+      }
+      if not accepted { None<IrValueList>() } else {
+        match pipeline_ir_flow_dispatch_definitions(rest) {
+          Some(values) -> Some(IrValueCons(pipeline_ir_inst_def_or(inst, 0 - 1), values))
+          None -> None<IrValueList>()
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_conditional_merge_shape(block: IrBlock) -> Option<PipelineIrConditionalMergeShape> {
+  match block {
+    IrBlock(id, params, insts, IrTermBranch(cond, yes, no)) if yes != no and id != yes and id != no -> {
+      match params {
+        IrValueNil -> None<PipelineIrConditionalMergeShape>()
+        _ -> match pipeline_ir_flow_dispatch_definitions(insts) {
+          Some(definitions) -> Some(PipelineIrConditionalMergeShape(id, params, insts, cond, yes, no, definitions))
+          None -> None<PipelineIrConditionalMergeShape>()
+        }
+      }
+    }
+    _ -> None<PipelineIrConditionalMergeShape>()
+  }
+}
+
+pub(package) fn pipeline_ir_flow_merge_shapes(blocks: IrBlockList) -> List<PipelineIrConditionalMergeShape> {
+  match blocks {
+    IrBlockListNil -> Nil<PipelineIrConditionalMergeShape>()
+    IrBlockListCons(block, rest) -> match pipeline_ir_flow_conditional_merge_shape(block) {
+      Some(shape) -> Cons(shape, pipeline_ir_flow_merge_shapes(rest))
+      None -> pipeline_ir_flow_merge_shapes(rest)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_inst_list_uses(insts: IrInstList, uses: PipelineIrLiveSet) -> PipelineIrLiveSet {
+  match insts {
+    IrInstNil -> uses
+    IrInstCons(inst, rest) -> pipeline_ir_flow_inst_list_uses(rest, pipeline_ir_live_set_add_inst_uses(inst, uses))
+  }
+}
+
+pub(package) fn pipeline_ir_flow_block_use_index(blocks: IrBlockList, uses: Map<i64, PipelineIrLiveSet>) -> Map<i64, PipelineIrLiveSet> {
+  match blocks {
+    IrBlockListNil -> uses
+    IrBlockListCons(IrBlock(id, _, insts, term), rest) -> pipeline_ir_flow_block_use_index(rest,
+      uses.insert(id, pipeline_ir_flow_inst_list_uses(insts, pipeline_ir_native_resident_term_uses(term))))
+  }
+}
+
+pub(package) fn pipeline_ir_flow_uses_any(uses: PipelineIrLiveSet, values: IrValueList) -> bool {
+  match values {
+    IrValueNil -> false
+    IrValueCons(value, rest) -> pipeline_ir_live_set_contains(uses, value) == 1 or pipeline_ir_flow_uses_any(uses, rest)
+  }
+}
+
+pub(package) fn pipeline_ir_flow_join_route(previous: PipelineIrParameterRoute, next: PipelineIrParameterRoute) -> PipelineIrParameterRoute {
+  match previous {
+    PipelineIrRouteUnused -> next
+    PipelineIrRouteThen -> match next { PipelineIrRouteUnused -> previous, PipelineIrRouteThen -> previous, _ -> PipelineIrRouteConflict }
+    PipelineIrRouteElse -> match next { PipelineIrRouteUnused -> previous, PipelineIrRouteElse -> previous, _ -> PipelineIrRouteConflict }
+    PipelineIrRouteConflict -> PipelineIrRouteConflict
+  }
+}
+
+pub(package) fn pipeline_ir_flow_parameter_uses(params: IrValueList, uses: PipelineIrLiveSet, region: PipelineIrParameterRoute, routes: Map<i64, PipelineIrParameterRoute>) -> Map<i64, PipelineIrParameterRoute> {
+  match params {
+    IrValueNil -> routes
+    IrValueCons(param, rest) -> {
+      let next = if pipeline_ir_live_set_contains(uses, param) == 1 {
+        let previous = match routes.get(param) { Some(found) -> found, None -> PipelineIrRouteUnused }
+        routes.insert(param, pipeline_ir_flow_join_route(previous, region))
+      } else { routes }
+      pipeline_ir_flow_parameter_uses(rest, uses, region, next)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_parameter_regions(blocks: IrBlockList, shape: PipelineIrConditionalMergeShape, uses: Map<i64, PipelineIrLiveSet>, doms: i64, words: i64, routes: Map<i64, PipelineIrParameterRoute>) -> Option<Map<i64, PipelineIrParameterRoute>> {
+  match shape {
+    PipelineIrConditionalMergeShape(merge, params, _, _, yes, no, definitions) -> match blocks {
+      IrBlockListNil -> Some(routes)
+      IrBlockListCons(IrBlock(id, _, _, _), rest) -> {
+        if id == merge { pipeline_ir_flow_parameter_regions(rest, shape, uses, doms, words, routes) } else {
+          let used = match uses.get(id) { Some(found) -> found, None -> pipeline_ir_live_set_empty() }
+          if pipeline_ir_flow_uses_any(used, definitions) { None<Map<i64, PipelineIrParameterRoute>>() } else {
+            let in_yes = pipeline_ir_dominators_bit_get(doms, words, id, yes) == 1
+            let in_no = pipeline_ir_dominators_bit_get(doms, words, id, no) == 1
+            let region = if in_yes and not in_no { PipelineIrRouteThen }
+              else { if in_no and not in_yes { PipelineIrRouteElse } else { PipelineIrRouteConflict } }
+            pipeline_ir_flow_parameter_regions(rest, shape, uses, doms, words, pipeline_ir_flow_parameter_uses(params, used, region, routes))
+          }
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_routes_valid(params: IrValueList, routes: Map<i64, PipelineIrParameterRoute>) -> bool {
+  match params {
+    IrValueNil -> true
+    IrValueCons(param, rest) -> match routes.get(param) {
+      Some(PipelineIrRouteConflict) -> false
+      _ -> pipeline_ir_flow_routes_valid(rest, routes)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_selected_route(route: PipelineIrParameterRoute, yes: bool) -> bool {
+  match route {
+    PipelineIrRouteThen -> yes
+    PipelineIrRouteElse -> not yes
+    PipelineIrRouteUnused -> false
+    PipelineIrRouteConflict -> false
+  }
+}
+
+pub(package) fn pipeline_ir_flow_project_arguments(params: IrValueList, args: IrValueList, routes: Map<i64, PipelineIrParameterRoute>, yes: bool) -> IrValueList {
+  match params {
+    IrValueNil -> IrValueNil
+    IrValueCons(param, rest) -> match args {
+      IrValueNil -> IrValueNil
+      IrValueCons(arg, tail) -> {
+        let route = match routes.get(param) { Some(found) -> found, None -> PipelineIrRouteUnused }
+        let others = pipeline_ir_flow_project_arguments(rest, tail, routes, yes)
+        if pipeline_ir_flow_selected_route(route, yes) { IrValueCons(arg, others) } else { others }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_lookup_constant(value: i64, local: Map<i64, i64>, global: PipelineIrConstEnv) -> Option<i64> {
+  match local.get(value) {
+    Some(found) -> Some(found)
+    None -> {
+      let found = pipeline_ir_const_env_lookup(global, value)
+      if pipeline_ir_const_lookup_valid(found) == 1 { Some(pipeline_ir_const_lookup_value(found)) } else { None<i64>() }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_bind_arguments(params: IrValueList, args: IrValueList, global: PipelineIrConstEnv, local: Map<i64, i64>) -> Map<i64, i64> {
+  match params {
+    IrValueNil -> local
+    IrValueCons(param, rest) -> match args {
+      IrValueNil -> local
+      IrValueCons(arg, tail) -> {
+        let found = pipeline_ir_const_env_lookup(global, arg)
+        let next = if pipeline_ir_const_lookup_valid(found) == 1 {
+          local.insert(param, pipeline_ir_const_lookup_value(found))
+        } else { local }
+        pipeline_ir_flow_bind_arguments(rest, tail, global, next)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_evaluate_dispatch(insts: IrInstList, global: PipelineIrConstEnv, local: Map<i64, i64>) -> Map<i64, i64> {
+  match insts {
+    IrInstNil -> local
+    IrInstCons(inst, rest) -> {
+      let next = match inst {
+        IrConstI64(dst, value) -> local.insert(dst, value)
+        IrNilI64(dst) -> local.insert(dst, 0)
+        _ -> match ir_comparison_fact(inst) {
+          IrComparison(dst, op, lhs, rhs, _) -> match pipeline_ir_flow_lookup_constant(lhs, local, global) {
+            Some(left) -> match pipeline_ir_flow_lookup_constant(rhs, local, global) {
+              Some(right) -> {
+                let truth = match op { IrEq -> left == right, IrNe -> left != right, _ -> false }
+                local.insert(dst, if truth { 1 } else { 0 })
+              }
+              None -> local
+            }
+            None -> local
+          }
+          IrNotComparison -> local
+        }
+      }
+      pipeline_ir_flow_evaluate_dispatch(rest, global, next)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_apply_routing(facts: List<PipelineIrConditionalMergeRouting>, block: IrBlock) -> Option<IrBlock> {
+  match facts {
+    Nil -> Some(block)
+    Cons(PipelineIrConditionalMergeRouting(merge, yes, no, then_params, else_params, incoming), rest) -> match block {
+      IrBlock(id, params, insts, term) -> {
+        if id == merge { None<IrBlock>() } else {
+          let next_params = if id == yes { then_params } else { if id == no { else_params } else { params } }
+          let next_term = match incoming.get(id) { Some(target) -> target, None -> term }
+          pipeline_ir_flow_apply_routing(rest, IrBlock(id, next_params, insts, next_term))
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_route_blocks(blocks: IrBlockList, facts: List<PipelineIrConditionalMergeRouting>) -> IrBlockList {
+  match blocks {
+    IrBlockListNil -> IrBlockListNil
+    IrBlockListCons(block, rest) -> match pipeline_ir_flow_apply_routing(facts, block) {
+      Some(routed) -> IrBlockListCons(routed, pipeline_ir_flow_route_blocks(rest, facts))
+      None -> pipeline_ir_flow_route_blocks(rest, facts)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_function_has_nested_control(blocks: IrBlockList) -> bool {
+  match blocks {
+    IrBlockListNil -> false
+    IrBlockListCons(IrBlock(_, _, insts, _), rest) -> {
+      let mut current = insts
+      let mut walking = true
+      let mut found = false
+      while walking {
+        match current {
+          IrInstNil -> { walking = false }
+          IrInstCons(inst, tail) -> {
+            match inst {
+              IrHandleI64(_, _, _, _, _, _) -> { found = true }
+              IrDeferredHandleI64(_, _, _, _, _, _, _) -> { found = true }
+              _ -> nil
+            }
+            current = tail
+          }
+        }
+      }
+      found or pipeline_ir_flow_function_has_nested_control(rest)
+    }
+  }
+}
+
+
+-- Facts own the exact immutable CFG they describe. Consumers cannot supply
+-- a different graph after aliases, control flow or value definitions change.
+pub(package) type PipelineIrResolvedConditionalEdge { PipelineIrResolvedConditionalEdge(i64, IrValueList) }
+pub(package) type PipelineIrResolvedConditionalMerge { PipelineIrResolvedConditionalMerge(PipelineIrConditionalMergeShape, Map<i64, PipelineIrResolvedConditionalEdge>) }
+pub(package) type PipelineIrConditionalRoutingFacts {
+  PipelineIrConditionalRoutingUnchanged(IrBlockList),
+  PipelineIrConditionalRoutingReady(IrBlockList, List<PipelineIrConditionalMergeRouting>)
+}
+
+pub(package) fn pipeline_ir_flow_resolve_incoming_edges(blocks: IrBlockList, shape: PipelineIrConditionalMergeShape, global: PipelineIrConstEnv, edges: Map<i64, PipelineIrResolvedConditionalEdge>) -> Option<Map<i64, PipelineIrResolvedConditionalEdge>> {
+  match shape {
+    PipelineIrConditionalMergeShape(merge, params, insts, cond, yes, no, _) -> match blocks {
+      IrBlockListNil -> Some(edges)
+      IrBlockListCons(IrBlock(id, _, _, term), rest) -> match term {
+        IrTermJump(target, args) if target == merge -> {
+          if id == merge or ir_value_list_len(args) != ir_value_list_len(params) { None<Map<i64, PipelineIrResolvedConditionalEdge>>() } else {
+            let local = pipeline_ir_flow_bind_arguments(params, args, global, map.new<i64, i64>())
+            match pipeline_ir_flow_lookup_constant(cond, pipeline_ir_flow_evaluate_dispatch(insts, global, local), global) {
+              Some(value) -> pipeline_ir_flow_resolve_incoming_edges(rest, shape, global,
+                edges.insert(id, PipelineIrResolvedConditionalEdge(if value != 0 { yes } else { no }, args)))
+              None -> None<Map<i64, PipelineIrResolvedConditionalEdge>>()
+            }
+          }
+        }
+        _ -> pipeline_ir_flow_resolve_incoming_edges(rest, shape, global, edges)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_resolved_merge(shape: PipelineIrConditionalMergeShape, blocks: IrBlockList, pred_counts: i64, constants: PipelineIrConstEnv, entry: i64) -> Option<PipelineIrResolvedConditionalMerge> {
+  match shape {
+    PipelineIrConditionalMergeShape(merge, _, _, _, yes, no, _) -> {
+      if merge == entry or yes == entry or no == entry or
+        pipeline_ir_block_pred_count_get(pred_counts, yes) != 1 or
+        pipeline_ir_block_pred_count_get(pred_counts, no) != 1 or
+        pipeline_ir_block_has_params(blocks, yes) == 1 or pipeline_ir_block_has_params(blocks, no) == 1 {
+        None<PipelineIrResolvedConditionalMerge>()
+      } else {
+        match pipeline_ir_flow_resolve_incoming_edges(blocks, shape, constants, map.new<i64, PipelineIrResolvedConditionalEdge>()) {
+          Some(edges) if compiler_signed_count(edges.len()) == pipeline_ir_block_pred_count_get(pred_counts, merge) and edges.len() > 0 ->
+            Some(PipelineIrResolvedConditionalMerge(shape, edges))
+          _ -> None<PipelineIrResolvedConditionalMerge>()
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_resolved_merges(shapes: List<PipelineIrConditionalMergeShape>, blocks: IrBlockList, pred_counts: i64, constants: PipelineIrConstEnv, entry: i64) -> List<PipelineIrResolvedConditionalMerge> {
+  match shapes {
+    Nil -> Nil<PipelineIrResolvedConditionalMerge>()
+    Cons(shape, rest) -> {
+      let tail = pipeline_ir_flow_resolved_merges(rest, blocks, pred_counts, constants, entry)
+      match pipeline_ir_flow_resolved_merge(shape, blocks, pred_counts, constants, entry) {
+        Some(resolved) -> Cons(resolved, tail)
+        None -> tail
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_routing_fact(resolved: PipelineIrResolvedConditionalMerge, blocks: IrBlockList, uses: Map<i64, PipelineIrLiveSet>, doms: i64, words: i64) -> Option<PipelineIrConditionalMergeRouting> {
+  match resolved {
+    PipelineIrResolvedConditionalMerge(shape, edges) -> match shape {
+      PipelineIrConditionalMergeShape(merge, params, _, _, yes, no, _) -> {
+        if pipeline_ir_value_list_feeds_multi_lane_capture(params, blocks) == 1 { None<PipelineIrConditionalMergeRouting>() } else {
+          match pipeline_ir_flow_parameter_regions(blocks, shape, uses, doms, words, map.new<i64, PipelineIrParameterRoute>()) {
+            Some(regions) if pipeline_ir_flow_routes_valid(params, regions) -> {
+              let projected = edges.fold<Map<i64, IrTerminator>>(map.new<i64, IrTerminator>(),
+                (result: Map<i64, IrTerminator>, source: i64, edge: PipelineIrResolvedConditionalEdge) => match edge {
+                  PipelineIrResolvedConditionalEdge(target, args) -> result.insert(source,
+                    IrTermJump(target, pipeline_ir_flow_project_arguments(params, args, regions, target == yes)))
+                })
+              Some(PipelineIrConditionalMergeRouting(merge, yes, no, pipeline_ir_flow_project_arguments(params, params, regions, true),
+                pipeline_ir_flow_project_arguments(params, params, regions, false), projected))
+            }
+            _ -> None<PipelineIrConditionalMergeRouting>()
+          }
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_routing_facts(resolved: List<PipelineIrResolvedConditionalMerge>, blocks: IrBlockList, uses: Map<i64, PipelineIrLiveSet>, doms: i64, words: i64) -> List<PipelineIrConditionalMergeRouting> {
+  match resolved {
+    Nil -> Nil<PipelineIrConditionalMergeRouting>()
+    Cons(candidate, rest) -> {
+      let tail = pipeline_ir_flow_routing_facts(rest, blocks, uses, doms, words)
+      match pipeline_ir_flow_routing_fact(candidate, blocks, uses, doms, words) {
+        Some(fact) -> Cons(fact, tail)
+        None -> tail
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_conditional_routing_facts(blocks: IrBlockList) -> PipelineIrConditionalRoutingFacts {
+  -- Inspect only small dispatch bodies before paying for whole-function facts.
+  let shapes = pipeline_ir_flow_merge_shapes(blocks)
+  match shapes {
+    Nil -> PipelineIrConditionalRoutingUnchanged(blocks)
+    _ -> {
+      let maximum = pipeline_ir_native_resident_max_block_id(blocks)
+      if maximum < 0 or maximum > 511 or ir_block_list_len(blocks) > 512 or pipeline_ir_flow_function_has_nested_control(blocks) {
+        PipelineIrConditionalRoutingUnchanged(blocks)
+      } else {
+        let entry = match blocks { IrBlockListCons(IrBlock(id, _, _, _), _) -> id, _ -> 0 - 1 }
+        let resolved = pipeline_ir_flow_resolved_merges(shapes, blocks, pipeline_ir_block_pred_counts(blocks),
+          pipeline_ir_const_env_from_block_list(blocks, pipeline_ir_const_env_empty()), entry)
+        match resolved {
+          Nil -> PipelineIrConditionalRoutingUnchanged(blocks)
+          _ -> {
+            let facts = pipeline_ir_flow_routing_facts(resolved, blocks, pipeline_ir_flow_block_use_index(blocks, map.new<i64, PipelineIrLiveSet>()),
+              pipeline_ir_dominators(blocks, maximum), pipeline_ir_dominators_words(maximum))
+            match facts {
+              Nil -> PipelineIrConditionalRoutingUnchanged(blocks)
+              _ -> PipelineIrConditionalRoutingReady(blocks, facts)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_apply_conditional_routing(facts: PipelineIrConditionalRoutingFacts) -> IrBlockList {
+  match facts {
+    PipelineIrConditionalRoutingUnchanged(blocks) -> blocks
+    PipelineIrConditionalRoutingReady(blocks, routes) -> pipeline_ir_flow_route_blocks(blocks, routes)
+  }
+}
+
+pub(package) fn pipeline_ir_flow_conditional_routing_changed(facts: PipelineIrConditionalRoutingFacts) -> bool {
+  match facts { PipelineIrConditionalRoutingUnchanged(_) -> false, PipelineIrConditionalRoutingReady(_, _) -> true }
+}
+
+pub(package) fn pipeline_ir_flow_predecessor_add(preds: Map<i64, List<i64>>, from: i64, to: i64) -> Map<i64, List<i64>> {
+  let previous = match preds.get(to) { Some(values) -> values, None -> Nil<i64>() }
+  preds.insert(to, Cons(from, previous))
+}
+
+pub(package) fn pipeline_ir_flow_predecessor_index(blocks: IrBlockList, preds: Map<i64, List<i64>>) -> Map<i64, List<i64>> {
+  match blocks {
+    IrBlockListNil -> preds
+    IrBlockListCons(IrBlock(id, _, _, term), rest) -> {
+      let next = match term {
+        IrTermJump(target, _) -> pipeline_ir_flow_predecessor_add(preds, id, target)
+        IrTermBranch(_, yes, no) -> pipeline_ir_flow_predecessor_add(pipeline_ir_flow_predecessor_add(preds, id, yes), id, no)
+        _ -> preds
+      }
+      pipeline_ir_flow_predecessor_index(rest, next)
+    }
+  }
+}
+
+
+-- Conservative whole-storage versions. Every unclassified instruction
+-- creates a distinct version; only trivial merge equivalences are derived.
+pub(package) type PipelineIrStorageReadVersion { PipelineIrStorageReadVersion(IrInst, i64, i64, i64) }
+pub(package) type PipelineIrStorageBlockVersions { PipelineIrStorageBlockVersions(i64, i64, List<PipelineIrStorageReadVersion>) }
+pub(package) type PipelineIrStorageVersionBuild { PipelineIrStorageVersionBuild(Map<i64, i64>, List<PipelineIrStorageReadVersion>) }
+
+pub(package) fn pipeline_ir_storage_version_root(value: i64, parents: Map<i64, i64>) -> i64 {
+  let mut current = value
+  let mut walking = true
+  while walking {
+    match parents.get(current) {
+      Some(parent) -> { current = parent }
+      None -> { walking = false }
+    }
+  }
+  current
+}
+
+pub(package) fn pipeline_ir_storage_block_versions(insts: IrInstList, block: i64, ordinal: i64, current: i64, next: i64, reads: List<PipelineIrStorageReadVersion>) -> PipelineIrStorageBlockVersions {
+  match insts {
+    IrInstNil -> PipelineIrStorageBlockVersions(current, next, reads)
+    IrInstCons(inst, rest) -> match pipeline_ir_storage_observation(inst) {
+      PipelineIrObservedStorageRead(read) -> pipeline_ir_storage_block_versions(rest, block, ordinal + 1, current, next,
+        Cons(PipelineIrStorageReadVersion(read, block, ordinal, current), reads))
+      PipelineIrStorageMayChange -> pipeline_ir_storage_block_versions(rest, block, ordinal + 1, next, next + 1, reads)
+      _ -> pipeline_ir_storage_block_versions(rest, block, ordinal + 1, current, next, reads)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_storage_version_build(blocks: IrBlockList, entry: i64, next: i64, outputs: Map<i64, i64>, reads: List<PipelineIrStorageReadVersion>) -> PipelineIrStorageVersionBuild {
+  match blocks {
+    IrBlockListNil -> PipelineIrStorageVersionBuild(outputs, reads)
+    IrBlockListCons(IrBlock(id, _, insts, _), rest) -> {
+      let initial = if id == entry { 0 } else { id + 1 }
+      match pipeline_ir_storage_block_versions(insts, id, 0, initial, next, reads) {
+        PipelineIrStorageBlockVersions(output, following, observed) ->
+          pipeline_ir_storage_version_build(rest, entry, following, outputs.insert(id, output), observed)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_storage_trivial_merge(incoming: List<i64>, outputs: Map<i64, i64>, parents: Map<i64, i64>, own: i64, selected: Option<i64>) -> Option<i64> {
+  match incoming {
+    Nil -> selected
+    Cons(pred, rest) -> match outputs.get(pred) {
+      None -> None<i64>()
+      Some(output) -> {
+        let root = pipeline_ir_storage_version_root(output, parents)
+        if root == own { pipeline_ir_storage_trivial_merge(rest, outputs, parents, own, selected) } else {
+          match selected {
+            Some(previous) if previous != root -> None<i64>()
+            _ -> pipeline_ir_storage_trivial_merge(rest, outputs, parents, own, Some(root))
+          }
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_storage_version_parents(blocks: IrBlockList, entry: i64, preds: Map<i64, List<i64>>, outputs: Map<i64, i64>) -> Map<i64, i64> {
+  let mut parents = map.new<i64, i64>()
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut current = blocks
+    let mut walking = true
+    while walking {
+      match current {
+        IrBlockListNil -> { walking = false }
+        IrBlockListCons(IrBlock(id, _, _, _), rest) -> {
+          let own = id + 1
+          if id != entry and not parents.contains_key(own) {
+            let incoming = match preds.get(id) { Some(found) -> found, None -> Nil<i64>() }
+            match pipeline_ir_storage_trivial_merge(incoming, outputs, parents, own, None<i64>()) {
+              Some(version) -> { parents = parents.insert(own, version) changed = true }
+              None -> nil
+            }
+          } else { nil }
+          current = rest
+        }
+      }
+    }
+  }
+  parents
+}
+
+pub(package) fn pipeline_ir_storage_read_buckets(reads: List<PipelineIrStorageReadVersion>, parents: Map<i64, i64>, buckets: Map<i64, List<PipelineIrStorageReadVersion>>) -> Map<i64, List<PipelineIrStorageReadVersion>> {
+  match reads {
+    Nil -> buckets
+    Cons(PipelineIrStorageReadVersion(inst, block, ordinal, version), rest) -> {
+      let root = pipeline_ir_storage_version_root(version, parents)
+      let key = pipeline_ir_storage_read_hash(inst) * 33 + root
+      let previous = match buckets.get(key) { Some(found) -> found, None -> Nil<PipelineIrStorageReadVersion>() }
+      pipeline_ir_storage_read_buckets(rest, parents,
+        buckets.insert(key, Cons(PipelineIrStorageReadVersion(inst, block, ordinal, root), previous)))
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_storage_read_prior(read: PipelineIrStorageReadVersion, candidates: List<PipelineIrStorageReadVersion>, doms: i64, words: i64) -> Option<i64> {
+  match read {
+    PipelineIrStorageReadVersion(inst, block, ordinal, version) -> match candidates {
+      Nil -> None<i64>()
+      Cons(PipelineIrStorageReadVersion(prior, origin, position, state), rest) -> {
+        let before = if origin == block { position < ordinal } else {
+          pipeline_ir_dominators_bit_get(doms, words, block, origin) == 1 and
+            pipeline_ir_dominators_bit_get(doms, words, origin, block) == 0
+        }
+        if before and pipeline_ir_inst_def_or(prior, 0 - 1) >= 0 and state == version and pipeline_ir_storage_reads_equal(inst, prior) {
+          Some(pipeline_ir_inst_def_or(prior, 0 - 1))
+        } else { pipeline_ir_storage_read_prior(read, rest, doms, words) }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_storage_read_aliases(reads: List<PipelineIrStorageReadVersion>, blocks: IrBlockList, parents: Map<i64, i64>, buckets: Map<i64, List<PipelineIrStorageReadVersion>>, doms: i64, words: i64, aliases: Map<i64, i64>) -> Map<i64, i64> {
+  match reads {
+    Nil -> aliases
+    Cons(PipelineIrStorageReadVersion(inst, block, ordinal, version), rest) -> {
+      let root = pipeline_ir_storage_version_root(version, parents)
+      let key = pipeline_ir_storage_read_hash(inst) * 33 + root
+      let bucket = match buckets.get(key) { Some(found) -> found, None -> Nil<PipelineIrStorageReadVersion>() }
+      let destination = pipeline_ir_inst_def_or(inst, 0 - 1)
+      let next = match pipeline_ir_storage_read_prior(PipelineIrStorageReadVersion(inst, block, ordinal, root), bucket, doms, words) {
+        Some(source) if destination >= 0 and source >= 0 and pipeline_ir_value_list_feeds_multi_lane_capture(IrValueCons(destination, IrValueNil), blocks) == 0 ->
+          aliases.insert(destination, source)
+        _ -> aliases
+      }
+      pipeline_ir_storage_read_aliases(rest, blocks, parents, buckets, doms, words, next)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_storage_remove_reused_insts(insts: IrInstList, aliases: Map<i64, i64>) -> IrInstList {
+  match insts {
+    IrInstNil -> IrInstNil
+    IrInstCons(inst, rest) -> {
+      let tail = pipeline_ir_storage_remove_reused_insts(rest, aliases)
+      let destination = pipeline_ir_inst_def_or(inst, 0 - 1)
+      if destination >= 0 and aliases.contains_key(destination) { tail } else { IrInstCons(inst, tail) }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_storage_rewrite_blocks(blocks: IrBlockList, aliases: Map<i64, i64>, flattened: PipelineIrAliasEnv) -> IrBlockList {
+  match blocks {
+    IrBlockListNil -> IrBlockListNil
+    IrBlockListCons(IrBlock(id, params, insts, term), rest) -> IrBlockListCons(
+      IrBlock(id, params, pipeline_ir_rewrite_inst_list_uses(pipeline_ir_storage_remove_reused_insts(insts, aliases), flattened),
+        pipeline_ir_rewrite_term(term, flattened)), pipeline_ir_storage_rewrite_blocks(rest, aliases, flattened))
+  }
+}
+
+
+-- A storage-preservation fact is stronger than a pure effect signature.
+-- Unknown calls, writes, ownership and effect operations remain barriers.
+pub(package) type PipelineIrStorageObservation { PipelineIrObservedStorageRead(IrInst), PipelineIrStoragePreserved, PipelineIrStorageMayChange }
+pub(package) type PipelineIrStorageReadReuseFacts {
+  PipelineIrStorageReadReuseUnchanged(IrBlockList),
+  PipelineIrStorageReadReuseReady(IrBlockList, Map<i64, i64>)
+}
+
+pub(package) fn pipeline_ir_storage_observation(inst: IrInst) -> PipelineIrStorageObservation {
+  match inst {
+    IrFieldLoadI64(_, _, _, _) -> PipelineIrObservedStorageRead(inst)
+    IrRecordLayoutWordLoadI64(_, _, _, _, _) -> PipelineIrObservedStorageRead(inst)
+    IrVariantTagI64(_, _) -> PipelineIrObservedStorageRead(inst)
+    IrVariantPayloadI64(_, _, _) -> PipelineIrObservedStorageRead(inst)
+    IrCallI64(_, hash, IrValueCons(_, IrValueNil)) if hash == pipeline_ir_vector_len_hash() -> PipelineIrObservedStorageRead(inst)
+    IrBinaryI64(_, IrBinaryUnknown, _, _) -> PipelineIrStorageMayChange
+    IrBinaryI64(_, _, _, _) -> PipelineIrStoragePreserved
+    IrUnaryI64(_, IrNot, _) -> PipelineIrStoragePreserved
+    IrConstI64(_, _) -> PipelineIrStoragePreserved
+    IrNilI64(_) -> PipelineIrStoragePreserved
+    IrFloatBinaryI64(_, _, _, _, _) -> PipelineIrStoragePreserved
+    IrVectorGetI64(_, _, _, _, _) -> PipelineIrStoragePreserved
+    IrPtrLoadI64(_, _, _) -> PipelineIrStoragePreserved
+    IrLoadI64(_, _) -> PipelineIrStoragePreserved
+    IrBindI64(_, _, _, _) -> PipelineIrStoragePreserved
+    IrCallResultLaneI64(_, _) -> PipelineIrStoragePreserved
+    IrReturnLaneI64(_, _) -> PipelineIrStoragePreserved
+    _ -> PipelineIrStorageMayChange
+  }
+}
+
+pub(package) fn pipeline_ir_storage_read_hash(inst: IrInst) -> i64 {
+  match inst {
+    IrFieldLoadI64(_, base, field, index) -> ((base * 33 + field) * 33 + index) * 33 + 1
+    IrRecordLayoutWordLoadI64(_, base, size, field, offset) -> (((base * 33 + size) * 33 + field) * 33 + offset) * 33 + 2
+    IrVariantTagI64(_, base) -> base * 33 + 3
+    IrVariantPayloadI64(_, base, index) -> (base * 33 + index) * 33 + 4
+    IrCallI64(_, hash, IrValueCons(base, IrValueNil)) -> (base * 33 + hash) * 33 + 5
+    _ -> 0
+  }
+}
+
+pub(package) fn pipeline_ir_storage_reads_equal(left: IrInst, right: IrInst) -> bool {
+  match left {
+    IrFieldLoadI64(_, base, field, index) -> match right {
+      IrFieldLoadI64(_, other_base, other_field, other_index) -> base == other_base and field == other_field and index == other_index
+      _ -> false
+    }
+    IrRecordLayoutWordLoadI64(_, base, size, field, offset) -> match right {
+      IrRecordLayoutWordLoadI64(_, other_base, other_size, other_field, other_offset) ->
+        base == other_base and size == other_size and field == other_field and offset == other_offset
+      _ -> false
+    }
+    IrVariantTagI64(_, base) -> match right { IrVariantTagI64(_, other) -> base == other, _ -> false }
+    IrVariantPayloadI64(_, base, index) -> match right {
+      IrVariantPayloadI64(_, other, other_index) -> base == other and index == other_index
+      _ -> false
+    }
+    IrCallI64(_, hash, IrValueCons(base, IrValueNil)) -> match right {
+      IrCallI64(_, other_hash, IrValueCons(other_base, IrValueNil)) -> hash == other_hash and base == other_base
+      _ -> false
+    }
+    _ -> false
+  }
+}
+
+pub(package) fn pipeline_ir_storage_read_reuse_facts(blocks: IrBlockList) -> PipelineIrStorageReadReuseFacts {
+  let maximum = pipeline_ir_native_resident_max_block_id(blocks)
+  if maximum < 0 or maximum > 511 or pipeline_ir_flow_function_has_nested_control(blocks) { PipelineIrStorageReadReuseUnchanged(blocks) } else {
+    let entry = match blocks { IrBlockListCons(IrBlock(id, _, _, _), _) -> id, _ -> 0 - 1 }
+    match pipeline_ir_storage_version_build(blocks, entry, maximum + 2, map.new<i64, i64>(), Nil<PipelineIrStorageReadVersion>()) {
+      PipelineIrStorageVersionBuild(outputs, reads) -> match reads {
+        Nil -> PipelineIrStorageReadReuseUnchanged(blocks)
+        _ -> {
+          let parents = pipeline_ir_storage_version_parents(blocks, entry, pipeline_ir_flow_predecessor_index(blocks, map.new<i64, List<i64>>()), outputs)
+          let buckets = pipeline_ir_storage_read_buckets(reads, parents, map.new<i64, List<PipelineIrStorageReadVersion>>())
+          let repeated = buckets.fold<bool>(false, (found: bool, key: i64, bucket: List<PipelineIrStorageReadVersion>) =>
+            found or match bucket { Cons(_, Cons(_, _)) -> true, _ -> false })
+          if not repeated { PipelineIrStorageReadReuseUnchanged(blocks) } else {
+            let aliases = pipeline_ir_storage_read_aliases(reads, blocks, parents, buckets,
+              pipeline_ir_dominators(blocks, maximum), pipeline_ir_dominators_words(maximum), map.new<i64, i64>())
+            if aliases.len() == 0 { PipelineIrStorageReadReuseUnchanged(blocks) }
+            else { PipelineIrStorageReadReuseReady(blocks, aliases) }
+          }
+        }
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_flow_apply_storage_read_reuse(facts: PipelineIrStorageReadReuseFacts) -> IrBlockList {
+  match facts {
+    PipelineIrStorageReadReuseUnchanged(blocks) -> blocks
+    PipelineIrStorageReadReuseReady(blocks, aliases) -> {
+      -- Publish direct representatives: the generic SSA operand rewriter
+      -- must not have to resolve an arbitrarily long chain of removed reads.
+      let flattened = aliases.fold<PipelineIrAliasEnv>(pipeline_ir_alias_env_empty(),
+        (result: PipelineIrAliasEnv, destination: i64, source: i64) =>
+          pipeline_ir_alias_env_bind(result, destination, pipeline_ir_storage_version_root(source, aliases)))
+      pipeline_ir_storage_rewrite_blocks(blocks, aliases, flattened)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_storage_read_reuse_count(facts: PipelineIrStorageReadReuseFacts) -> i64 {
+  match facts { PipelineIrStorageReadReuseUnchanged(_) -> 0, PipelineIrStorageReadReuseReady(_, aliases) -> compiler_signed_count(aliases.len()) }
+}
+
+-- Canonical final cleanup is also required after layout-driven rewrites.
+pub(package) fn pipeline_ir_storage_finish_blocks(blocks: IrBlockList, next_value: i64, facts: PipelineIrSemanticFactList) -> PipelineOptimisedBlocks {
+  let normalized = pipeline_ir_normalised_blocks_blocks(pipeline_ir_normalise_branch_targets(blocks))
+  let live = pipeline_ir_function_live_fixpoint(normalized, pipeline_ir_live_set_dense(next_value + 1), facts)
+  let trimmed = pipeline_ir_trim_block_param_list(normalized, normalized, live)
+  pipeline_dce_sweep_ir_block_list(trimmed, live, facts)
+}
+
+pub(package) fn pipeline_ir_storage_finish_function(function: IrFunction, facts: PipelineIrSemanticFactList) -> PipelineOptimisedFunctions {
+  match function {
+    IrFunction(hash, params, blocks, source) -> {
+      let finished = pipeline_ir_storage_finish_blocks(blocks, pipeline_ir_function_next_value(params, blocks), facts)
+      pipeline_optimised_functions(IrFunctionCons(IrFunction(hash, params, pipeline_optimised_blocks_blocks(finished), source), IrFunctionNil),
+        0, 0, pipeline_optimised_blocks_dead_inst_sites(finished), pipeline_optimised_blocks_pure_call_dce_sites(finished), 0, 0)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_storage_simplify_function(function: IrFunction, facts: PipelineIrSemanticFactList, pure: i64) -> PipelineOptimisedFunctions {
+  match function {
+    IrFunction(hash, params, blocks, source) -> {
+      let initial = pipeline_ir_flow_conditional_routing_facts(blocks)
+      if not pipeline_ir_flow_conditional_routing_changed(initial) { pipeline_optimised_functions(IrFunctionCons(function, IrFunctionNil), 0, 0, 0, 0, 0, 0) } else {
+        let mut current = blocks
+        let mut routing = initial
+        let mut remaining = ir_block_list_len(blocks) + ir_block_list_inst_count(blocks) + 1
+        let mut constants = 0
+        let mut algebraic = 0
+        let mut dead = 0
+        let mut pure_dce = 0
+        let mut narrowing = 0
+        while remaining > 0 {
+          let routed = pipeline_ir_flow_apply_conditional_routing(routing)
+          let reads = pipeline_ir_storage_read_reuse_facts(routed)
+          let reused = pipeline_ir_storage_read_reuse_count(reads)
+          if not pipeline_ir_flow_conditional_routing_changed(routing) and reused == 0 { remaining = 0 } else {
+            let rewritten = pipeline_ir_flow_apply_storage_read_reuse(reads)
+            let next_value = pipeline_ir_function_next_value(params, rewritten)
+            let count = ir_block_list_len(rewritten)
+            let context = pipeline_ir_optimise_context5(facts, PipelineIrInlineCandidateNil, pure, params, pipeline_ir_value_def_table(rewritten, params))
+            let folded = pipeline_ir_cfg_fold_fixpoint(rewritten, context, next_value, count + 2, count,
+              ir_block_list_inst_count(rewritten), ir_block_list_count_tag(rewritten, 2), ir_block_list_count_term_tag(rewritten, 3))
+            let cleaned = pipeline_ir_storage_finish_blocks(pipeline_optimised_blocks_blocks(folded), pipeline_optimised_blocks_next_value(folded), facts)
+            current = pipeline_optimised_blocks_blocks(cleaned)
+            constants = constants + pipeline_optimised_blocks_const_fold_sites(folded)
+            algebraic = algebraic + pipeline_optimised_blocks_algebraic_fold_sites(folded)
+            dead = dead + reused + pipeline_optimised_blocks_dead_inst_sites(cleaned)
+            pure_dce = pure_dce + pipeline_optimised_blocks_pure_call_dce_sites(cleaned)
+            narrowing = narrowing + pipeline_optimised_blocks_block_entry_narrowing_sites(folded)
+            remaining = remaining - 1
+            if remaining > 0 { routing = pipeline_ir_flow_conditional_routing_facts(current) } else { nil }
+          }
+        }
+        pipeline_optimised_functions(IrFunctionCons(IrFunction(hash, params, current, source), IrFunctionNil), constants, algebraic, dead, pure_dce, narrowing, 0)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_storage_simplify_functions(functions: IrFunctionList, facts: PipelineIrSemanticFactList, pure: i64, tt: i64) -> PipelineOptimisedFunctions {
+  match functions {
+    IrFunctionNil -> pipeline_optimised_functions(IrFunctionNil, 0, 0, 0, 0, 0, 0)
+    IrFunctionCons(function, rest) -> {
+      let mark = alloc_bump_mark()
+      let checkpoint = ttable_linear_layout_cache_checkpoint(tt)
+      let head = pipeline_ir_storage_simplify_function(function, facts, pure)
+      let end = alloc_bump_mark()
+      if pipeline_ir_function_list_capture_payload_in_range(pipeline_optimised_functions_functions(head), mark, end) == 0 {
+        ttable_linear_layout_cache_restore(tt, checkpoint)
+        alloc_bump_restore_same_segment(mark)
+      } else { 0 }
+      let tail = pipeline_ir_storage_simplify_functions(rest, facts, pure, tt)
+      pipeline_optimised_functions(pipeline_ir_function_list_append(pipeline_optimised_functions_functions(head), pipeline_optimised_functions_functions(tail)),
+        pipeline_optimised_functions_const_fold_sites(head) + pipeline_optimised_functions_const_fold_sites(tail),
+        pipeline_optimised_functions_algebraic_fold_sites(head) + pipeline_optimised_functions_algebraic_fold_sites(tail),
+        pipeline_optimised_functions_dead_inst_sites(head) + pipeline_optimised_functions_dead_inst_sites(tail),
+        pipeline_optimised_functions_pure_call_dce_sites(head) + pipeline_optimised_functions_pure_call_dce_sites(tail),
+        pipeline_optimised_functions_block_entry_narrowing_sites(head) + pipeline_optimised_functions_block_entry_narrowing_sites(tail), 0)
+    }
+  }
+}
+
 -- Representation specialization can expose a small scalar accessor after the
 -- ordinary candidate censuses. Revisit only projection calls, before deriving
 -- final borrow/transfer/reuse facts. No additional read equivalence is assumed.
@@ -65991,8 +66765,10 @@ pub(package) fn pipeline_ir_inline_after_layout_function(f: IrFunction, candidat
           ir_block_list_inst_count(expanded), ir_block_list_count_tag(expanded, 2), ir_block_list_count_term_tag(expanded, 3))
         let compact = ir_cfg_compact_blocks(pipeline_optimised_blocks_blocks(folded))
         let promoted = pipeline_mem2reg_retighten_function(pipeline_mem2reg_function(IrFunction(hash, params, compact, src)), facts, pure)
-        pipeline_optimised_functions(IrFunctionCons(promoted, IrFunctionNil),
-          pipeline_optimised_blocks_const_fold_sites(folded), pipeline_optimised_blocks_algebraic_fold_sites(folded), 0, 0,
+        let cleaned = pipeline_ir_storage_finish_function(promoted, facts)
+        pipeline_optimised_functions(pipeline_optimised_functions_functions(cleaned),
+          pipeline_optimised_blocks_const_fold_sites(folded), pipeline_optimised_blocks_algebraic_fold_sites(folded),
+          pipeline_optimised_functions_dead_inst_sites(cleaned), pipeline_optimised_functions_pure_call_dce_sites(cleaned),
           pipeline_optimised_blocks_block_entry_narrowing_sites(folded), sites)
       }
       }
@@ -66019,7 +66795,9 @@ pub(package) fn pipeline_ir_inline_after_layout_functions(functions: IrFunctionL
       pipeline_optimised_functions(
         pipeline_ir_function_list_append(pipeline_optimised_functions_functions(head), pipeline_optimised_functions_functions(tail)),
         pipeline_optimised_functions_const_fold_sites(head) + pipeline_optimised_functions_const_fold_sites(tail),
-        pipeline_optimised_functions_algebraic_fold_sites(head) + pipeline_optimised_functions_algebraic_fold_sites(tail), 0, 0,
+        pipeline_optimised_functions_algebraic_fold_sites(head) + pipeline_optimised_functions_algebraic_fold_sites(tail),
+        pipeline_optimised_functions_dead_inst_sites(head) + pipeline_optimised_functions_dead_inst_sites(tail),
+        pipeline_optimised_functions_pure_call_dce_sites(head) + pipeline_optimised_functions_pure_call_dce_sites(tail),
         pipeline_optimised_functions_block_entry_narrowing_sites(head) + pipeline_optimised_functions_block_entry_narrowing_sites(tail),
         pipeline_optimised_functions_direct_call_inline_sites(head) + pipeline_optimised_functions_direct_call_inline_sites(tail))
     }
@@ -66047,10 +66825,14 @@ pub(package) fn pipeline_finish_typed_optimisation(
           scalarised_facts, pipeline_ir_pure_callee_tree(scalarised_facts), tt)
       } else { pipeline_optimised_functions(scalarised_functions, 0, 0, 0, 0, 0, 0) }
       let accessor_functions = pipeline_optimised_functions_functions(accessors)
-      let final_semantic_facts = pipeline_ir_semantic_borrow_values_enrich_functions(scalarised_facts, accessor_functions, fns, tt)
+      let storage = if promote == 1 {
+        pipeline_ir_storage_simplify_functions(accessor_functions, scalarised_facts, pipeline_ir_pure_callee_tree(scalarised_facts), tt)
+      } else { pipeline_optimised_functions(accessor_functions, 0, 0, 0, 0, 0, 0) }
+      let storage_functions = pipeline_optimised_functions_functions(storage)
+      let final_semantic_facts = pipeline_ir_semantic_borrow_values_enrich_functions(scalarised_facts, storage_functions, fns, tt)
       let consuming = if promote == 1 {
-        pipeline_ir_consuming_specialise(accessor_functions, canonical_functions, final_semantic_facts, fns, src, tt)
-      } else { PipelineIrConsumingSpecialisations(accessor_functions, final_semantic_facts, 0) }
+        pipeline_ir_consuming_specialise(storage_functions, canonical_functions, final_semantic_facts, fns, src, tt)
+      } else { PipelineIrConsumingSpecialisations(storage_functions, final_semantic_facts, 0) }
       let consuming_functions = pipeline_ir_consuming_specialisations_functions(consuming)
       let consuming_facts = pipeline_ir_consuming_specialisations_facts(consuming)
       let transferred_functions = if promote == 1 {
@@ -66062,13 +66844,13 @@ pub(package) fn pipeline_finish_typed_optimisation(
         0,
         0,
         0,
-        pipeline_optimised_functions_const_fold_sites(opt) + pipeline_optimised_functions_const_fold_sites(accessors),
-        pipeline_optimised_functions_algebraic_fold_sites(opt) + pipeline_optimised_functions_algebraic_fold_sites(accessors),
-        pipeline_optimised_functions_dead_inst_sites(opt),
+        pipeline_optimised_functions_const_fold_sites(opt) + pipeline_optimised_functions_const_fold_sites(accessors) + pipeline_optimised_functions_const_fold_sites(storage),
+        pipeline_optimised_functions_algebraic_fold_sites(opt) + pipeline_optimised_functions_algebraic_fold_sites(accessors) + pipeline_optimised_functions_algebraic_fold_sites(storage),
+        pipeline_optimised_functions_dead_inst_sites(opt) + pipeline_optimised_functions_dead_inst_sites(accessors) + pipeline_optimised_functions_dead_inst_sites(storage),
         consuming_facts,
-        pipeline_optimised_functions_pure_call_dce_sites(opt),
+        pipeline_optimised_functions_pure_call_dce_sites(opt) + pipeline_optimised_functions_pure_call_dce_sites(accessors) + pipeline_optimised_functions_pure_call_dce_sites(storage),
         0,
-        pipeline_optimised_functions_block_entry_narrowing_sites(opt) + pipeline_optimised_functions_block_entry_narrowing_sites(accessors),
+        pipeline_optimised_functions_block_entry_narrowing_sites(opt) + pipeline_optimised_functions_block_entry_narrowing_sites(accessors) + pipeline_optimised_functions_block_entry_narrowing_sites(storage),
         pipeline_optimised_functions_direct_call_inline_sites(opt) + pipeline_optimised_functions_direct_call_inline_sites(accessors)
       )
     }
