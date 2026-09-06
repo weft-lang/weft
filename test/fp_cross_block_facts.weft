@@ -1,0 +1,176 @@
+use compiler/ir.{*}
+use compiler/pipeline.{*}
+use compiler/codegen.{*}
+use compiler/encode.{*}
+use runtime/buffer.{*}
+use compiler/lib.{*}
+use compiler/types.{*}
+use stdlib/test.{Test}
+
+fn fp_cross_branches(extra: IrInstList) -> IrBlockList {
+  IrBlockListCons(IrBlock(0, IrValueNil,
+    IrInstCons(IrFloatBinaryI64(3, PRIM_F64(), IrMul, 0, 1), extra), IrTermBranch(2, 1, 2)),
+    IrBlockListCons(IrBlock(1, IrValueNil,
+      IrInstCons(IrFloatBinaryI64(6, PRIM_F64(), IrAdd, 3, 0), IrInstNil), IrTermReturn(6)),
+      IrBlockListCons(IrBlock(2, IrValueNil,
+        IrInstCons(IrFloatBinaryI64(7, PRIM_F64(), IrSub, 3, 1), IrInstNil), IrTermReturn(7)), IrBlockListNil)))
+}
+
+fn fp_cross_homes(blocks: IrBlockList, pins: i64) -> i64 {
+  let f64_facts = pipeline_ir_native_f64_facts_assign_slot_homes(blocks, pipeline_ir_native_f64_facts_for_blocks(blocks))
+  let vector_facts = pipeline_ir_native_vector_data_facts_assign_home(pipeline_ir_native_vector_data_facts_for_blocks(blocks))
+  pipeline_ir_native_volatile_residents(3, blocks, pins, fmap_new(), f64_facts, vector_facts)
+}
+
+fn fp_cross_value_home(extra: IrInstList) -> i64 {
+  pipeline_ir_native_pinned_slot_lookup(fp_cross_homes(fp_cross_branches(extra), 0), 3)
+}
+
+test "a floating definition shared by two branches can occupy a volatile FP register" {
+  let blocks = fp_cross_branches(IrInstNil)
+  Test.assert_eq(pipeline_ir_verify_function(IrFunction(12345, 3, blocks, 0)), 0)
+  let home = fp_cross_value_home(IrInstNil)
+  Test.assert_true(home >= 1002 and home < 1008)
+}
+
+test "a floating branch lifetime across an ordinary call uses a preserved FP register" {
+  let extra = IrInstCons(IrCallI64(4, 12345, IrValueNil), IrInstNil)
+  let home = fp_cross_value_home(extra)
+  Test.assert_true(home >= 1008 and home <= 1015)
+}
+
+test "suspension and effect dispatch exclude crossing floating residency" {
+  for barrier in [
+    IrCallI64(4, pipeline_ir_native_intrinsic_fiber_suspend_hash(), IrValueCons(0, IrValueNil)),
+    IrPerformI64(4, 123, 456, IrValueNil)
+  ] {
+    let home = fp_cross_value_home(IrInstCons(barrier, IrInstNil))
+    Test.assert_false(home >= 1002 and home <= 1015)
+  }
+}
+
+test "mixed ABI reads redefinitions and addressable storage retain their ordinary representation" {
+  for observation in [
+    IrCallI64(4, 12345, IrValueCons(3, IrValueNil)),
+    IrBinaryI64(4, IrBxor, 3, 2),
+    IrFloatBinaryI64(3, PRIM_F64(), IrAdd, 0, 1),
+    IrAddressOfSlotI64(4, 3),
+    IrStoreI64(3, 0)
+  ] {
+    let home = fp_cross_value_home(IrInstCons(observation, IrInstNil))
+    Test.assert_false(home >= 1002 and home <= 1015)
+  }
+}
+
+test "an existing value home cannot be replaced by floating branch residency" {
+  let pins = pipeline_ir_native_pinned_slot_new(3, 19, pipeline_ir_native_pinned_slot_kind_resident(), 0)
+  let homes = fp_cross_homes(fp_cross_branches(IrInstNil), pins)
+  Test.assert_eq(pipeline_ir_native_pinned_slot_lookup(homes, 3), 19)
+}
+
+test "floating layout lifetimes include both directions of nested backedges" {
+  let entries = nlist_new()
+  for entry in [0, 2, 5] { nlist_add(entries, entry) }
+  let edges = nlist_new()
+  nlist_add(edges, node_new(0, 2, 8, 0, 0))
+  nlist_add(edges, node_new(0, 1, 11, 0, 0))
+  for (lo, hi, expected_lo, expected_hi) in [(3, 6, 3, 8), (6, 12, 2, 12), (1, 6, 1, 11), (12, 15, 12, 15)] {
+    let window = pipeline_ir_native_cs_round_window(edges, entries, 3, lo, hi)
+    Test.assert_eq(node_f1(window), expected_lo)
+    Test.assert_eq(node_f2(window), expected_hi)
+  }
+}
+
+fn fp_cross_pressure_blocks() -> IrBlockList {
+  let mut definitions = IrInstNil
+  let mut left = IrInstNil
+  let mut right = IrInstNil
+  let mut previous_left = 0
+  let mut previous_right = 1
+  for i in 0..20 {
+    definitions = ir_inst_list_append(definitions, IrInstCons(IrFloatBinaryI64(3 + i, PRIM_F64(), IrAdd, 0, 1), IrInstNil))
+    left = ir_inst_list_append(left, IrInstCons(IrFloatBinaryI64(30 + i, PRIM_F64(), IrAdd, previous_left, 3 + i), IrInstNil))
+    right = ir_inst_list_append(right, IrInstCons(IrFloatBinaryI64(60 + i, PRIM_F64(), IrSub, previous_right, 3 + i), IrInstNil))
+    previous_left = 30 + i
+    previous_right = 60 + i
+  }
+  IrBlockListCons(IrBlock(0, IrValueNil, definitions, IrTermBranch(2, 1, 2)),
+    IrBlockListCons(IrBlock(1, IrValueNil, left, IrTermReturn(previous_left)),
+      IrBlockListCons(IrBlock(2, IrValueNil, right, IrTermReturn(previous_right)), IrBlockListNil)))
+}
+
+test "overlapping branch lifetimes exhaust FP capacity without sharing a live register" {
+  let blocks = fp_cross_pressure_blocks()
+  Test.assert_eq(pipeline_ir_verify_function(IrFunction(12345, 3, blocks, 0)), 0)
+  let homes = fp_cross_homes(blocks, 0)
+  let mut assigned = 0
+  for value in 3..23 {
+    let home = pipeline_ir_native_pinned_slot_lookup(homes, value)
+    if home >= 1002 and home <= 1015 {
+      assigned = assigned + 1
+      for other in (value + 1)..23 {
+        Test.assert_true(pipeline_ir_native_pinned_slot_lookup(homes, other) != home)
+      }
+    } else { nil }
+  }
+  Test.assert_true(assigned > 0 and assigned <= 14)
+}
+
+fn fp_cross_vector_operands(vec: i64, index: i64, value: i64) -> IrBlockList {
+  IrBlockListCons(IrBlock(0, IrValueNil,
+    IrInstCons(IrVectorGetI64(3, 0, 1, 1, 0), IrInstNil), IrTermBranch(2, 1, 2)),
+    IrBlockListCons(IrBlock(1, IrValueNil,
+      IrInstCons(IrVectorSetI64(4, vec, index, value, 0), IrInstNil), IrTermReturn(4)),
+      IrBlockListCons(IrBlock(2, IrValueNil,
+        IrInstCons(IrVectorSetI64(5, vec, index, value, 0), IrInstNil), IrTermReturn(5)), IrBlockListNil)))
+}
+
+test "vector storage permits FP payload reads but keeps addresses indexes and mixed identities in GPRs" {
+  for (vec, index, value, payload_only) in [(3, 1, 1, false), (0, 3, 1, false), (0, 1, 3, true), (0, 3, 3, false)] {
+    let blocks = fp_cross_vector_operands(vec, index, value)
+    Test.assert_eq(pipeline_ir_verify_function(IrFunction(12345, 3, blocks, 0)), 0)
+    let home = pipeline_ir_native_pinned_slot_lookup(fp_cross_homes(blocks, 0), 3)
+    Test.assert_true((home >= 1002 and home <= 1015) == payload_only)
+  }
+}
+
+fn fp_cross_audit_definition(competing: i64, phys: i64) -> i64 {
+  let fm = fmap_new()
+  let code = buf_new(32)
+  let offsets = nlist_new()
+  for position in 0..4 {
+    nlist_add(offsets, position * 4)
+    bu32(code, if position == 2 or position == competing {
+      encode_fmov_d_from_x(phys - 1000, 0)
+    } else { encode_movz(0, 0, 0) })
+  }
+  nlist_add(offsets, 16)
+  fmap_set_audit_ranges(fm, nlist_new())
+  fmap_set_audit_offsets(fm, offsets)
+  fmap_set_audit_nested(fm, nlist_new())
+  fmap_set_audit_expected_gpos(fm, 4)
+  pipeline_ir_native_audit_note_definition_window(fm, 3, phys, 2, 0, 3)
+  pipeline_ir_native_residency_audit_function(code, fm, 12345)
+  fmap_audit_violation_count(fm) + fmap_audit_cs_violation_count(fm) + fmap_audit_skew_count(fm)
+}
+
+test "loop-expanded FP windows audit their complete lifetime and only exempt the actual definition" {
+  for phys in [1002, 1008, 1015] {
+    Test.assert_eq(fp_cross_audit_definition(0 - 1, phys), 0)
+    for competing in [0, 1, 3] {
+      Test.assert_eq(fp_cross_audit_definition(competing, phys), 1)
+    }
+  }
+}
+
+test "cross-block preservation includes the first and last instruction of the occupied window" {
+  for position in 0..3 {
+    let barriers = nlist_new()
+    for i in 0..3 { nlist_add(barriers, if i >= position { 1 } else { 0 }) }
+    Test.assert_false(pipeline_ir_native_fp_cross_window_preserved(PipelineIrNativeFpCrossWindow(0, 2), barriers))
+  }
+  let barriers = nlist_new()
+  for i in 0..3 { nlist_add(barriers, 1) }
+  Test.assert_true(pipeline_ir_native_fp_cross_window_preserved(PipelineIrNativeFpCrossWindow(1, 2), barriers))
+  Test.assert_false(pipeline_ir_native_fp_cross_window_preserved(PipelineIrNativeFpCrossExcluded, 0))
+}
