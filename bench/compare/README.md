@@ -51,3 +51,11 @@ Run timing experiments without concurrent builds or tests. Record the compiler
 hash, source revision, warmups, sample count, and whether numbers are minima
 or medians. Use the RC census and compiler phase metrics to locate costs before
 selecting an optimization; allocation counts do not measure elapsed time.
+
+The comparative harness records the compiler SHA-256, host architecture, and
+Go/Rust versions alongside every sample. The paired harness records both
+compiler hashes and includes the direct and fused iterator workloads. Its
+`--null` control repeats the same compiler path, preserving SDK selection.
+Both harnesses wait directly for process exit; timeout polling would distort
+the shortest runtimes. A statistical warning on byte-identical products is
+evidence to check the measurement environment before changing the compiler.

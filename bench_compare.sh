@@ -160,6 +160,7 @@ require_cmd python3
 require_cmd go
 require_cmd rustc
 
+COMPILER_SHA256=$(python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$WEFT")
 mkdir -p "$(dirname "$OUT")"
 
 CASES="sieve vector_sort graph_reach mandelbrot nbody sorted_lookup iterator_pipeline_direct iterator_pipeline"
@@ -192,7 +193,10 @@ for case in $CASES; do
   echo ""
 done
 
-RESULT="{\"sha\": \"${SHA}\", \"ts\": \"${TS}\", \"runs\": ${RUNS}, \"warmups\": ${WARMUPS}, \"cases\": {${RESULTS}}}"
+HOST_JSON=$(json_escape "$(uname -sm)")
+GO_VERSION_JSON=$(json_escape "$(go version)")
+RUST_VERSION_JSON=$(json_escape "$(rustc --version)")
+RESULT="{\"sha\": \"${SHA}\", \"compiler_sha256\": \"${COMPILER_SHA256}\", \"host\": \"${HOST_JSON}\", \"go_version\": \"${GO_VERSION_JSON}\", \"rust_version\": \"${RUST_VERSION_JSON}\", \"ts\": \"${TS}\", \"runs\": ${RUNS}, \"warmups\": ${WARMUPS}, \"cases\": {${RESULTS}}}"
 if [ "$RECORD" != "0" ]; then
   echo "$RESULT" >> "$OUT"
   echo "recorded: $OUT"

@@ -18,12 +18,11 @@ Workloads:
               then run the two binaries in interleaved pairs (run time).
   self_compile  time `<compiler> compile compiler/main.weft` itself, paired.
   check_tree  time `<compiler> check compiler/main.weft` (imports pull in the
-              full tree — 6.4k functions), paired.
+              full tree), paired.
   fmt_tree    time `<compiler> fmt <file>` summed over every compiler source
               (parse-only per file), paired (front-end throughput; §3.12(a)).
-  test_runner  compile tools/test_runner.weft with each compiler (linked-object
-              flow: weft emits a .o, ld links against libSystem), then time the
-              runner binary driving a small fixed test set. The spawned
+  test_runner  build tools/test_runner.weft with each compiler's native linker,
+              then time the runner binary driving a small fixed test set. The spawned
               compiler is pinned to the baseline ./weft on BOTH sides so the
               paired delta isolates the runner binary's own code.
   mcp_roundtrip  time `<compiler> mcp` answering a check_summary request over
@@ -37,6 +36,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -47,7 +47,8 @@ import sys
 import tempfile
 import time
 
-ZOO_CASES = ["sieve", "vector_sort", "graph_reach", "mandelbrot", "nbody", "sorted_lookup"]
+ZOO_CASES = ["sieve", "vector_sort", "graph_reach", "mandelbrot", "nbody", "sorted_lookup",
+             "iterator_pipeline_direct", "iterator_pipeline"]
 TOOL_WORKLOADS = ["self_compile", "check_tree", "fmt_tree", "test_runner", "mcp_roundtrip"]
 # §3.12(a): the real-program workloads are pinned into the default paired
 # set so optimizer tuning stops being fit to the integer zoo alone.
@@ -86,17 +87,23 @@ def sign_test_p(n_pos, n_neg):
     return min(1.0, 2.0 * tail)
 
 
-def run_timed(cmd, stdin_path=None, timeout=600):
+def compiler_sha256(path):
+    with open(path, "rb") as source:
+        return hashlib.sha256(source.read()).hexdigest()
+
+
+def run_timed(cmd, stdin_path=None):
     """Run cmd from the repo root, return elapsed ms. Nonzero exit is a hard failure."""
     stdin_f = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
     try:
         start = time.perf_counter_ns()
+        # A timed POSIX wait polls with backoff, quantizing short samples.
+        # Block until process exit, as the comparative harness does.
         result = subprocess.run(
             cmd,
             stdin=stdin_f,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=timeout,
             cwd=REPO,
         )
         elapsed_ms = (time.perf_counter_ns() - start) / 1e6
@@ -208,28 +215,20 @@ TEST_RUNNER_SET = ["test/basics.weft"]
 
 
 class TestRunnerRun(Workload):
-    """tools/test_runner.weft uses `use` imports, so weft emits a Mach-O
-    object that must be linked against libSystem (the linked-object flow)."""
+    """Measure the native test runner with the spawned compiler held fixed."""
 
     def __init__(self):
         super().__init__("test_runner")
         self.bins = {}
 
     def prepare(self, a, b, tmp):
-        src = os.path.join(REPO, "tools", "test_runner.weft")
-        sdk = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True,
-                             text=True).stdout.strip()
         for side, compiler in (("a", a), ("b", b)):
-            obj = os.path.join(tmp, f"test_runner_{side}.o")
             out = os.path.join(tmp, f"test_runner_{side}")
-            compile_with(compiler, src, obj)
-            link = subprocess.run(
-                ["/usr/bin/ld", "-o", out, obj, "-lSystem", "-syslibroot", sdk,
-                 "-e", "_main", "-arch", "arm64",
-                 "-platform_version", "macos", "11.0", "15.0"],
-                capture_output=True)
-            if link.returncode != 0:
-                fail(f"linking test_runner ({side}) failed: {link.stderr.decode()[:200]}")
+            build = subprocess.run(
+                [compiler, "build", "tools/test_runner.weft", "-o", out],
+                capture_output=True, cwd=REPO)
+            if build.returncode != 0:
+                fail(f"building test_runner ({side}) failed: {build.stderr.decode()[:200]}")
             self.bins[side] = out
         for side in ("a", "b"):
             self.sample(side)  # warmup
@@ -289,21 +288,6 @@ class SelfCompile(CompilerCmd):
     def __init__(self):
         super().__init__("self_compile", ["compile", "compiler/main.weft"])
 
-    def sample(self, side):
-        # discard the emitted binary; time the compile itself
-        compiler = self.compilers[side]
-        start = time.perf_counter_ns()
-        result = subprocess.run(
-            [compiler, "compile", "compiler/main.weft"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            cwd=REPO,
-        )
-        elapsed_ms = (time.perf_counter_ns() - start) / 1e6
-        if result.returncode != 0:
-            fail(f"{compiler} self-compile failed")
-        return elapsed_ms
-
 
 def measure_workload(wl, a, b, tmp, pairs, floor=FLAT_FLOOR_PCT):
     wl.prepare(a, b, tmp)
@@ -351,7 +335,7 @@ def main():
     ap.add_argument("--a", default=os.path.join(REPO, "weft"), help="baseline compiler binary (default ./weft)")
     ap.add_argument("--b", help="candidate compiler binary")
     ap.add_argument("--null", action="store_true",
-                    help="null calibration: run A against a copy of A; any non-flat "
+                    help="null calibration: run A against itself; any non-flat "
                          "verdict here is your environment's bias floor, not an effect")
     ap.add_argument("--floor", type=float, default=FLAT_FLOOR_PCT,
                     help=f"flat floor in %% (default {FLAT_FLOOR_PCT})")
@@ -385,10 +369,10 @@ def main():
     results = []
     try:
         if args.null:
-            b = os.path.join(tmp, "weft_null_copy")
-            shutil.copy2(a, b)
-            os.chmod(b, 0o755)
-        b_label = "copy-of-A (null)" if args.null else args.b
+            # Moving a compiler can switch checkout SDK resolution to its
+            # embedded SDK. Reuse the same path to hold source identity fixed.
+            b = a
+        b_label = "repeat-A (null)" if args.null else args.b
         print(f"=== bench_verdict ({sha}) A={args.a} B={b_label} pairs={args.pairs} floor={args.floor}% ===")
         for name in names:
             wl = make_workload(name)
@@ -406,6 +390,8 @@ def main():
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "a": args.a,
         "b": "null" if args.null else args.b,
+        "a_sha256": compiler_sha256(a),
+        "b_sha256": compiler_sha256(b),
         "pairs": args.pairs,
         "floor_pct": args.floor,
         "label": args.label,
