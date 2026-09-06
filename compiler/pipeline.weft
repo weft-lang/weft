@@ -598,6 +598,14 @@ pub(package) type PipelineIrValueUseFacts {
   PipelineIrValueUseFacts(PipelineIrLiveSet, PipelineIrLiveSet)
 }
 
+-- The sealed storage ABI publishes a complete bounds proof before native
+-- preparation may erase its call boundary. Keep the source length in the
+-- fact even though the resulting address arithmetic no longer reads it.
+pub(package) type PipelineIrIndexedAddressFact {
+  PipelineIrIndexedAddressProven(i64, i64, i64, i64),
+  PipelineIrIndexedAddressUnproved
+}
+
 -- Local scalar-replacement representation fact. `candidates` is the monotone closure of
 -- one-word, unmanaged variant constructors through exact SSA transport;
 -- `unsafe_values` is the connected subset with an escaping/opaque use. The
@@ -44894,13 +44902,126 @@ pub(package) fn pipeline_rc_census_emit_reuse_success(code: i64, fm: i64, hash: 
   }
 }
 
-pub(package) fn pipeline_cg_ir_only_function(irf: IrFunction, code: i64, fm: i64, facts: PipelineIrSemanticFactList, fns: i64) -> i64 {
+pub(package) fn pipeline_ir_indexed_address_fact(inst: IrInst, full_hash: i64) -> PipelineIrIndexedAddressFact {
+  match inst {
+    IrCallI64(_, hash, IrValueCons(data, IrValueCons(len, IrValueCons(index, IrValueCons(stride, IrValueNil))))) if hash == full_hash ->
+      PipelineIrIndexedAddressProven(data, len, index, stride)
+    _ -> PipelineIrIndexedAddressUnproved
+  }
+}
+
+pub(package) fn pipeline_ir_indexed_address_facts(blocks: IrBlockList, full_hash: i64) -> Map<i64, PipelineIrIndexedAddressFact> {
+  let mut result = map.new<i64, PipelineIrIndexedAddressFact>()
+  let mut current = blocks
+  let mut walking = true
+  while walking {
+    match current {
+      IrBlockListNil -> { walking = false }
+      IrBlockListCons(IrBlock(_, _, insts, _), rest) -> {
+        let mut instructions = insts
+        let mut scanning = true
+        while scanning {
+          match instructions {
+            IrInstNil -> { scanning = false }
+            IrInstCons(inst, tail) -> {
+              match inst {
+                IrCallI64(dst, _, _) -> {
+                  let fact = pipeline_ir_indexed_address_fact(inst, full_hash)
+                  match fact {
+                    PipelineIrIndexedAddressUnproved -> nil
+                    PipelineIrIndexedAddressProven(_, _, _, _) -> { result = result.insert(dst, fact) }
+                  }
+                }
+                _ -> nil
+              }
+              instructions = tail
+            }
+          }
+        }
+        current = rest
+      }
+    }
+  }
+  result
+}
+
+-- Final call lowering consumes facts; it neither discovers a bound nor
+-- moves an access. Each source SSA destination and every surrounding
+-- instruction remains in place. Native liveness, placement and cleanup
+-- facts are subsequently built from this prepared function.
+pub(package) fn pipeline_ir_prepare_indexed_addresses(irf: IrFunction, addresses: Map<i64, PipelineIrIndexedAddressFact>) -> IrFunction {
+  if addresses.len() == 0 { irf } else {
+    match irf {
+      IrFunction(hash, params, blocks, src) -> {
+        let mut fresh = pipeline_ir_function_next_value(params, blocks)
+        let mut current = blocks
+        let mut result = IrBlockListNil
+        let mut walking = true
+        while walking {
+          match current {
+            IrBlockListNil -> { walking = false }
+            IrBlockListCons(IrBlock(id, block_params, insts, term), rest) -> {
+              let mut body = IrInstNil
+              let mut instructions = insts
+              let mut scanning = true
+              while scanning {
+                match instructions {
+                  IrInstNil -> { scanning = false }
+                  IrInstCons(inst, tail) -> {
+                    let address = match inst {
+                      IrCallI64(dst, _, _) -> match addresses.get(dst) {
+                        Some(fact) -> fact
+                        None -> PipelineIrIndexedAddressUnproved
+                      }
+                      _ -> PipelineIrIndexedAddressUnproved
+                    }
+                    match address {
+                      PipelineIrIndexedAddressProven(data, _, index, stride) -> {
+                        let dst = pipeline_ir_inst_def_or(inst, 0 - 1)
+                        -- Wrapping multiplication followed by the helper's
+                        -- bit-preserving unsigned-to-signed reinterpretation
+                        -- has exactly this word result, including full-width
+                        -- inputs. No signed comparison replaces its proof.
+                        body = IrInstCons(IrBinaryI64(fresh, IrMul, index, stride), body)
+                        body = IrInstCons(IrBinaryI64(dst, IrAdd, data, fresh), body)
+                        fresh = fresh + 1
+                      }
+                      PipelineIrIndexedAddressUnproved -> { body = IrInstCons(inst, body) }
+                    }
+                    instructions = tail
+                  }
+                }
+              }
+              result = IrBlockListCons(IrBlock(id, block_params, pipeline_ir_inst_list_reverse_onto(body, IrInstNil), term), result)
+              current = rest
+            }
+          }
+        }
+        IrFunction(hash, params, pipeline_mem2reg_reverse_blocks(result, IrBlockListNil), src)
+      }
+    }
+  }
+}
+
+pub(package) fn pipeline_cg_ir_only_function(original: IrFunction, code: i64, fm: i64, facts: PipelineIrSemanticFactList, fns: i64, full_index_hash: i64) -> i64 {
+  let addresses = match original {
+    IrFunction(_, _, blocks, _) -> pipeline_ir_indexed_address_facts(blocks, full_index_hash)
+  }
+  let irf = pipeline_ir_prepare_indexed_addresses(original, addresses)
   match irf {
     IrFunction(hash, param_count, blocks, src) -> {
       if mono_cache_lookup(fmap_mono_cache(fm), hash) > 1 {
         0
       } else {
         fmap_inc_ir_native_candidate_count(fm)
+        -- Count discharged storage checks only for emitted functions. Calls
+        -- left in the prepared IR retain their ordinary emission counters.
+        let mut address_count = addresses.len()
+        while address_count > 0 {
+          fmap_inc_indexed_bounds_elision_count(fm)
+          fmap_inc_indexed_full_bounds_elision_count(fm)
+          address_count = address_count - 1
+        }
         let fn_off = buf_len(code)
         mono_cache_add(fmap_mono_cache(fm), hash, fn_off)
         pipeline_cg_ir_only_update_method_map_for_hash(fns, hash, fn_off, fm)
@@ -45040,7 +45161,7 @@ pub(package) fn pipeline_hash_nlist_contains(list: i64, hash: i64) -> i64 {
   found
 }
 
-pub(package) fn pipeline_cg_ir_only_functions_pass(functions: IrFunctionList, code: i64, fm: i64, facts: PipelineIrSemanticFactList, fns: i64, entry_hash: i64, trap_hash: i64, close_reachable: i64) -> i64 {
+pub(package) fn pipeline_cg_ir_only_functions_pass(functions: IrFunctionList, code: i64, fm: i64, facts: PipelineIrSemanticFactList, fns: i64, entry_hash: i64, trap_hash: i64, close_reachable: i64, full_index_hash: i64) -> i64 {
   match functions {
     IrFunctionNil -> 0
     IrFunctionCons(irf, rest) -> {
@@ -45052,9 +45173,9 @@ pub(package) fn pipeline_cg_ir_only_functions_pass(functions: IrFunctionList, co
       let emitted = if mono_cache_lookup(fmap_mono_cache(fm), hash) > 1 or demanded == 0 {
         0
       } else {
-        pipeline_cg_ir_only_function(irf, code, fm, facts, fns)
+        pipeline_cg_ir_only_function(irf, code, fm, facts, fns, full_index_hash)
       }
-      emitted + pipeline_cg_ir_only_functions_pass(rest, code, fm, facts, fns, entry_hash, trap_hash, close_reachable)
+      emitted + pipeline_cg_ir_only_functions_pass(rest, code, fm, facts, fns, entry_hash, trap_hash, close_reachable, full_index_hash)
     }
     _ -> 0
   }
@@ -45082,12 +45203,12 @@ pub(package) fn pipeline_cg_ir_only_functions_predeclare(functions: IrFunctionLi
   }
 }
 
-pub(package) fn pipeline_cg_ir_only_functions_fixpoint(functions: IrFunctionList, code: i64, fm: i64, facts: PipelineIrSemanticFactList, fns: i64, entry_hash: i64, trap_hash: i64, close_reachable: i64, emitted_total: i64) -> i64 {
-  let emitted = pipeline_cg_ir_only_functions_pass(functions, code, fm, facts, fns, entry_hash, trap_hash, close_reachable)
+pub(package) fn pipeline_cg_ir_only_functions_fixpoint(functions: IrFunctionList, code: i64, fm: i64, facts: PipelineIrSemanticFactList, fns: i64, entry_hash: i64, trap_hash: i64, close_reachable: i64, emitted_total: i64, full_index_hash: i64) -> i64 {
+  let emitted = pipeline_cg_ir_only_functions_pass(functions, code, fm, facts, fns, entry_hash, trap_hash, close_reachable, full_index_hash)
   if emitted <= 0 {
     emitted_total
   } else {
-    pipeline_cg_ir_only_functions_fixpoint(functions, code, fm, facts, fns, entry_hash, trap_hash, close_reachable, emitted_total + emitted)
+    pipeline_cg_ir_only_functions_fixpoint(functions, code, fm, facts, fns, entry_hash, trap_hash, close_reachable, emitted_total + emitted, full_index_hash)
   }
 }
 
@@ -45099,7 +45220,7 @@ pub(package) fn pipeline_cg_ir_only_functions(functions: IrFunctionList, code: i
     IrFunctionCons(entry, rest) -> 1
   } }
   pipeline_cg_ir_only_functions_predeclare(functions, fm)
-  pipeline_cg_ir_only_functions_fixpoint(functions, code, fm, facts, fns, entry_hash, trap_hash, close_reachable, 0)
+  pipeline_cg_ir_only_functions_fixpoint(functions, code, fm, facts, fns, entry_hash, trap_hash, close_reachable, 0, pipeline_runtime_index_address_full_proven_hash())
 }
 
 pub(package) fn pipeline_cg_module_with_ir(fns: i64, ir_functions: IrFunctionList, code: i64, fm: i64, facts: PipelineIrSemanticFactList, close_executable: i64) -> i64 {
