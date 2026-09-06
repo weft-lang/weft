@@ -20,12 +20,10 @@ fi
 # that literal path on macOS -- name the source inside a randomised directory.
 tmp_src_dir=$(mktemp -d /tmp/weft_markdown_src_XXXXXX)
 tmp_src="$tmp_src_dir/example.weft"
-tmp_bin=$(mktemp /tmp/weft_markdown_example_bin_XXXXXX)
-tmp_linked=$(mktemp /tmp/weft_markdown_example_linked_XXXXXX)
 tmp_err=$(mktemp /tmp/weft_markdown_example_err_XXXXXX)
 tmp_project=$(mktemp -d /tmp/weft_markdown_project_XXXXXX)
 tmp_project_bin=$(mktemp -d /tmp/weft_markdown_tools_XXXXXX)
-trap 'rm -f "$tmp_bin" "$tmp_linked" "$tmp_err"; rm -rf "$tmp_src_dir" "$tmp_project" "$tmp_project_bin"' EXIT
+trap 'rm -f "$tmp_err"; rm -rf "$tmp_src_dir" "$tmp_project" "$tmp_project_bin"' EXIT
 
 WEFT_ABS=$(cd "$(dirname "$WEFT")" && pwd)/$(basename "$WEFT")
 ln -s "$WEFT_ABS" "$tmp_project_bin/weft"
@@ -70,6 +68,10 @@ run_example() {
       exit 1
     fi
   else
+    # Each product needs a fresh inode: macOS may retain signature state
+    # for an executed file even after a later compile overwrites its bytes.
+    local tmp_bin="$tmp_src_dir/example_$passed.bin"
+    local tmp_linked="$tmp_src_dir/example_$passed.linked"
     set +e
     if [ "$mode" = "test" ]; then
       "$WEFT" test --emit "$tmp_src" > "$tmp_bin" 2> "$tmp_err"

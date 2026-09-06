@@ -236,6 +236,7 @@ run_timed_phase() {
 }
 
 run_markdown_phase() {
+  python3 test/docs/test_markdown_runner.py &&
   bash test/docs/run_markdown_examples.sh README.md docs/getting-started.md docs/networking.md docs/concurrency.md docs/testing.md &&
     bash test/docs/check_readme_facts.sh
 }
