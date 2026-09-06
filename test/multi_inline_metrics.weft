@@ -20,12 +20,101 @@ use compiler/types.{*}
 use runtime/alloc.{*}
 use runtime/memory.{*}
 
+test "loop inlining follows sparse CFG cycles beyond the old analysis budget" {
+  let callee = IrFunction(770077, 1,
+    IrBlockListCons(IrBlock(0, IrValueNil, IrInstNil, IrTermBranch(0, 1, 2)),
+    IrBlockListCons(IrBlock(1, IrValueNil, IrInstCons(IrConstI64(1, 10), IrInstNil), IrTermReturn(1)),
+    IrBlockListCons(IrBlock(2, IrValueNil, IrInstCons(IrConstI64(2, 20), IrInstNil), IrTermReturn(2)), IrBlockListNil))), 0)
+  let candidates = pipeline_ir_inline_candidate_prepend(770077, callee, PipelineIrInlineCandidateNil)
+  let mut blocks = IrBlockListCons(IrBlock(20000, IrValueNil, IrInstNil, IrTermReturn(0)), IrBlockListNil)
+  let mut id = 20
+  while id > 0 {
+    blocks = IrBlockListCons(IrBlock(id, IrValueNil, IrInstNil, IrTermReturn(0)), blocks)
+    id = id - 1
+  }
+  blocks = IrBlockListCons(IrBlock(10000, IrValueNil,
+    IrInstCons(IrCallI64(2, 770077, IrValueCons(0, IrValueNil)), IrInstNil), IrTermBranch(0, 10000, 20000)), blocks)
+  blocks = IrBlockListCons(IrBlock(0, IrValueNil,
+    IrInstCons(IrCallI64(1, 770077, IrValueCons(0, IrValueNil)), IrInstNil), IrTermJump(10000, IrValueNil)), blocks)
+  let result = pipeline_ir_multi_inline_function_blocks(123, 1, blocks, candidates, PipelineIrSemanticFactNil, 0)
+  Test.assert_eq(pipeline_ir_multi_pass_changed(result), 1)
+  Test.assert_eq(mi_count_calls_blocks(pipeline_ir_multi_pass_blocks(result), 770077), 1)
+  Test.assert_eq(pipeline_ir_verify_function(IrFunction(123, 1, pipeline_ir_multi_pass_blocks(result), 0)), 0)
+}
+
+test "inlining visits newly exposed calls in order and preserves the unprocessed suffix" {
+  let leaf = IrFunction(770079, 1, IrBlockListCons(IrBlock(0, IrValueNil,
+    IrInstCons(IrConstI64(1, 7), IrInstNil), IrTermReturn(1)), IrBlockListNil), 0)
+  let wrapper = IrFunction(770078, 1, IrBlockListCons(IrBlock(0, IrValueNil,
+    IrInstCons(IrCallI64(1, 770079, IrValueCons(0, IrValueNil)), IrInstNil), IrTermReturn(1)), IrBlockListNil), 0)
+  let candidates = pipeline_ir_inline_candidate_prepend(770078, wrapper,
+    pipeline_ir_inline_candidate_prepend(770079, leaf, PipelineIrInlineCandidateNil))
+  let mut calls = IrInstNil
+  let mut value = 40
+  while value > 0 {
+    calls = IrInstCons(IrCallI64(value, 770078, IrValueCons(0, IrValueNil)), calls)
+    value = value - 1
+  }
+  let blocks = IrBlockListCons(IrBlock(0, IrValueNil, calls, IrTermReturn(40)), IrBlockListNil)
+  let result = pipeline_ir_multi_inline_function_blocks(124, 1, blocks, candidates, PipelineIrSemanticFactNil, 0)
+  Test.assert_eq(pipeline_ir_multi_pass_changed(result), 32)
+  Test.assert_eq(mi_count_calls_blocks(pipeline_ir_multi_pass_blocks(result), 770078), 24)
+  Test.assert_eq(mi_count_calls_blocks(pipeline_ir_multi_pass_blocks(result), 770079), 0)
+  Test.assert_eq(pipeline_ir_verify_function(IrFunction(124, 1, pipeline_ir_multi_pass_blocks(result), 0)), 0)
+}
+
 fn mi_optimised(src_str: str) -> IrModule {
   let src = __str_ptr(src_str)
   let n = __str_len(src_str)
   let typed = probe_check_source_with_origin(src, n, 1, 0)
   let ir = pipeline_lower_ir(typed)
   pipeline_optimise_typed_ir(typed, ir)
+}
+
+test "late projection transport preserves the existing ownership admission rules" {
+  let read = IrFieldLoadI64(2, 0, 123, 0)
+  let packed = IrRecordLayoutWordLoadI64(2, 0, 8, 123, 0)
+  Test.assert_eq(pipeline_ir_multi_inline_inst_supported_at(read, 71, 0, 0, PipelineIrInlineEarly), 0)
+  Test.assert_eq(pipeline_ir_multi_inline_inst_supported_at(read, 71, 0, 0, PipelineIrInlineAfterLayout), 1)
+  Test.assert_eq(pipeline_ir_multi_inline_inst_supported_at(packed, 71, 0, 0, PipelineIrInlineAfterLayout), 1)
+  let allocating = IrVariantInitI64(2, 88, IrValueCons(0, IrValueNil), 1)
+  Test.assert_eq(pipeline_ir_multi_inline_inst_supported_at(allocating, 71, 0, 0, PipelineIrInlineAfterLayout), 0)
+  Test.assert_eq(pipeline_ir_multi_inline_inst_supported_at(allocating, 71, 1, 0, PipelineIrInlineAfterLayout), 1)
+  let retain = IrCallI64(2, pipeline_ir_native_hash_name("rc_default_retain"), IrValueCons(0, IrValueNil))
+  Test.assert_eq(pipeline_ir_multi_inline_inst_supported_at(retain, 71, 0, 0, PipelineIrInlineAfterLayout), 0)
+  Test.assert_eq(pipeline_ir_multi_inline_inst_supported_at(retain, 71, 0, 1, PipelineIrInlineAfterLayout), 1)
+  Test.assert_eq(pipeline_ir_multi_inline_inst_supported_at(IrCallI64(2, 71, IrValueCons(0, IrValueNil)), 71, 0, 1, PipelineIrInlineAfterLayout), 0)
+}
+
+test "conditional record accessors inline through the shared late transport policy" {
+  let src = "type Row { value: i64, valid: bool }
+fn read_row(row: Row) -> i64 { if row.valid { row.value } else { 0 } }
+fn total_rows(row: Row, count: i64) -> i64 {
+  let mut total = 0
+  let mut i = 0
+  while i < count { total = total + read_row(row) i = i + 1 }
+  total
+}
+fn main() -> i64 { total_rows(Row { value: 42, valid: true }, 3) - 126 }"
+  let ir = mi_optimised(src)
+  Test.assert_eq(mi_calls_in(pipeline_ir_functions(ir), mi_hash("total_rows"), mi_hash("read_row")), 0)
+  Test.assert_eq(pipeline_ir_verify_module(ir), 0)
+}
+
+test "checked table projections inline after optional result specialization" {
+  let src = "use stdlib/f64_table as table use stdlib/f64_table.{ F64Table }
+use stdlib/option.{ Option }
+fn first_column(rows: F64Table, row: i64) -> f64 { rows.get(row, 0).unwrap() }
+fn total_rows(rows: F64Table, count: i64) -> f64 {
+  let mut total = 0.0
+  let mut i = 0
+  while i < count { total = total + first_column(rows, i) i = i + 1 }
+  total
+}
+fn main() -> i64 { let rows = table.zeros(3, 1).unwrap() if total_rows(rows, 3) == 0.0 { 0 } else { 1 } }"
+  let ir = mi_optimised(src)
+  Test.assert_eq(mi_calls_in(pipeline_ir_functions(ir), mi_hash("total_rows"), mi_hash("first_column")), 0)
+  Test.assert_eq(pipeline_ir_verify_module(ir), 0)
 }
 
 fn mi_count_calls_insts(insts: IrInstList, target_hash: i64) -> i64 {

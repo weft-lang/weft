@@ -576,6 +576,20 @@ write_huge_padding() {
 }
 
 if [ "$WEFT_TOOL_SHARD" = core ]; then
+native_stack_generator="$tmp_scratch_dir/native_stack_generator"
+native_stack_product="$tmp_scratch_dir/native_stack_product"
+run_weft_compile_guarded "$WEFT" compile tools/native_stack_smoke.weft > "$native_stack_generator" 2> "$tmp_err"
+chmod +x "$native_stack_generator"
+run_generator_guarded "$native_stack_generator" > "$native_stack_product" 2> "$tmp_err"
+chmod +x "$native_stack_product"
+set +e
+run_binary_guarded "$native_stack_product" > "$tmp_out" 2> "$tmp_err"
+large_stack_exit=$?
+set -e
+assert_equals "large_stack_preserves_live_operands" "$large_stack_exit" "0"
+assert_equals "large_stack_stdout_empty" "$(<"$tmp_out")" ""
+assert_equals "large_stack_stderr_empty" "$(<"$tmp_err")" ""
+
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 
 set +e
@@ -2300,7 +2314,26 @@ set -e
 assert_equals "compile_metrics_extra_path_exits_usage" "$compile_metrics_extra_exit" "2"
 assert_contains "compile_metrics_extra_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics] PATH"
 
-printf 'type CensusBox { value: i64 } type CensusOuter { inner: CensusBox } fn census_observe(box: CensusBox) -> i64 { box.value } fn census_consume(box: CensusBox) -> i64 { let outer = CensusOuter { inner: box } outer.inner.value } fn main() -> i64 { let box = CensusBox { value: 42 } let left = census_observe(box) let right = census_consume(box) if left == right { 42 } else { 0 } }\n' > "$tmp_rc_census_src"
+# Non-tail recursion preserves an inferred borrowed call boundary when projection
+# accessors inline. The census must observe executed transfers, not require
+# an optimizer to retain an otherwise removable wrapper.
+cat > "$tmp_rc_census_src" <<'WEFT_CENSUS'
+type CensusBox { value: i64 }
+type CensusOuter { inner: CensusBox }
+fn census_observe(box: CensusBox, remaining: i64) -> i64 {
+  if remaining > 0 { census_observe(box, remaining - 1) + 1 } else { box.value }
+}
+fn census_consume(box: CensusBox) -> i64 {
+  let outer = CensusOuter { inner: box }
+  outer.inner.value
+}
+fn main() -> i64 {
+  let box = CensusBox { value: 42 }
+  let left = census_observe(box, 2) - 2
+  let right = census_consume(box)
+  if left == right { 42 } else { 0 }
+}
+WEFT_CENSUS
 set +e
 run_weft_compile_guarded "$WEFT" compile --rc-census "$tmp_rc_census_src" > "$tmp_out" 2> "$tmp_err"
 compile_rc_census_exit=$?
