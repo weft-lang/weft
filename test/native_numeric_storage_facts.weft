@@ -1,0 +1,125 @@
+use compiler/pipeline.{*}
+use compiler/ir.{*}
+use stdlib/list.{Nil, Cons}
+use stdlib/test.{Test}
+
+fn numeric_storage_hashes() -> [i64; 10] {
+  [pipeline_ir_native_hash_name("__i64_to_u8"),
+   pipeline_ir_native_hash_name("__i64_to_f64"), pipeline_ir_native_hash_name("__u64_to_f64"),
+   pipeline_ir_native_hash_name("__i64_to_f32"), pipeline_ir_native_hash_name("__u64_to_f32"),
+   pipeline_ir_native_intrinsic_f64_to_i64_trunc_hash(), pipeline_ir_native_intrinsic_f32_to_f64_hash(),
+   pipeline_ir_native_intrinsic_f64_to_f32_hash(), pipeline_ir_native_intrinsic_f64_sqrt_hash(),
+   pipeline_ir_native_intrinsic_f32_sqrt_hash()]
+}
+
+fn numeric_storage_call(hash: i64) -> IrInst { IrCallI64(4, hash, IrValueCons(1, IrValueNil)) }
+fn numeric_storage_read(dst: i64) -> IrInst { IrFieldLoadI64(dst, 0, 77, 0) }
+
+test "every numeric operation preserves storage only with its exact call arity" {
+  for hash in numeric_storage_hashes() {
+    Test.assert_true(pipeline_ir_native_numeric_preserves_storage(pipeline_ir_native_numeric_operation(hash)))
+    Test.assert_true(match pipeline_ir_storage_observation(numeric_storage_call(hash)) {
+      PipelineIrStoragePreserved -> true
+      _ -> false
+    })
+    for args in [IrValueNil, IrValueCons(1, IrValueCons(2, IrValueNil))] {
+      Test.assert_true(match pipeline_ir_storage_observation(IrCallI64(4, hash, args)) {
+        PipelineIrStorageMayChange -> true
+        _ -> false
+      })
+    }
+    Test.assert_true(match pipeline_ir_storage_observation(IrGenericCallI64(4, hash, TypeExprListNil, IrValueCons(1, IrValueNil))) {
+      PipelineIrStorageMayChange -> true
+      _ -> false
+    })
+  }
+}
+
+test "address memory allocation synchronization and ordinary calls remain opaque" {
+  for hash in [pipeline_ir_native_intrinsic_transmute_hash(), pipeline_ir_native_intrinsic_int_to_ptr_hash(),
+    pipeline_ir_native_intrinsic_raw_offset_hash(), pipeline_ir_native_intrinsic_mem_load64_hash(),
+    pipeline_ir_native_intrinsic_mem_store64_hash(), pipeline_ir_native_intrinsic_bump_alloc_hash(),
+    pipeline_ir_native_intrinsic_atomic_lock64_hash(), pipeline_ir_native_intrinsic_runtime_state_hash(),
+    pipeline_ir_native_intrinsic_call_i64_hash(), pipeline_ir_native_hash_name("sqrt"), 12345] {
+    Test.assert_false(pipeline_ir_native_numeric_preserves_storage(pipeline_ir_native_numeric_operation(hash)))
+    Test.assert_true(match pipeline_ir_storage_observation(numeric_storage_call(hash)) {
+      PipelineIrStorageMayChange -> true
+      _ -> false
+    })
+  }
+}
+
+test "numeric calls remain in place when surrounding object reads are reused" {
+  for hash in numeric_storage_hashes() {
+    let blocks = IrBlockListCons(IrBlock(0, IrValueNil,
+      IrInstCons(numeric_storage_read(3), IrInstCons(numeric_storage_call(hash),
+      IrInstCons(numeric_storage_read(5), IrInstNil))), IrTermReturn(5)), IrBlockListNil)
+    let facts = pipeline_ir_storage_read_reuse_facts(blocks)
+    Test.assert_eq(pipeline_ir_storage_read_reuse_count(facts), 1)
+    let result = pipeline_ir_flow_apply_storage_read_reuse(facts)
+    Test.assert_eq(pipeline_ir_verify_function(IrFunction(12345, 3, result, 0)), 0)
+    Test.assert_true(match result {
+      IrBlockListCons(IrBlock(_, _, IrInstCons(_, IrInstCons(IrCallI64(4, actual, IrValueCons(1, IrValueNil)), IrInstNil)), IrTermReturn(3)), IrBlockListNil) -> actual == hash
+      _ -> false
+    })
+  }
+}
+
+test "numeric computations preserve both whole and object observation versions" {
+  for domain in [PipelineIrWholeStorage, PipelineIrObjectStorage] {
+    for hash in numeric_storage_hashes() {
+      let insts = IrInstCons(numeric_storage_read(3), IrInstCons(numeric_storage_call(hash), IrInstCons(numeric_storage_read(5), IrInstNil)))
+      match pipeline_ir_storage_timeline_block(insts, 7, 0, 5, 100,
+        Nil<PipelineIrStorageReadVersion>(), Nil<PipelineIrStorageAccessVersion>(), PipelineIrStorageReadsOnly, domain) {
+        PipelineIrStorageTimelineBlock(_, output, next, reads, _) -> {
+          Test.assert_eq(output, 5)
+          Test.assert_eq(next, 100)
+          Test.assert_true(match reads {
+            Cons(PipelineIrStorageReadVersion(_, 7, 2, 5), Cons(PipelineIrStorageReadVersion(_, 7, 0, 5), Nil)) -> true
+            _ -> false
+          })
+        }
+      }
+    }
+  }
+}
+
+test "numeric computations never equate changed vector element values" {
+  let blocks = IrBlockListCons(IrBlock(0, IrValueNil,
+    IrInstCons(IrVectorGetI64(3, 0, 1, 2, 0), IrInstCons(numeric_storage_call(pipeline_ir_native_intrinsic_f64_sqrt_hash()),
+    IrInstCons(IrVectorSetI64(5, 0, 1, 2, 0), IrInstCons(IrVectorGetI64(6, 0, 1, 2, 0), IrInstNil)))),
+    IrTermReturn(6)), IrBlockListNil)
+  let facts = pipeline_ir_storage_read_reuse_facts(blocks)
+  Test.assert_eq(pipeline_ir_storage_read_reuse_count(facts), 0)
+  Test.assert_eq(ir_block_list_inst_count(pipeline_ir_flow_apply_storage_read_reuse(facts)), 4)
+}
+
+test "numeric facts do not cross argument effects raw writes or lifetime changes" {
+  for barrier in [IrPerformI64(6, 123, 456, IrValueNil), IrPtrStoreI64(6, 0, 2, IrStorageWord64),
+    IrOwnedDropI64(0, 123), IrManagedStakeI64(6, 0, 1, 0 - 1, 1), IrCallI64(6, 123, IrValueNil)] {
+    let blocks = IrBlockListCons(IrBlock(0, IrValueNil,
+      IrInstCons(numeric_storage_read(3), IrInstCons(barrier,
+      IrInstCons(numeric_storage_call(pipeline_ir_native_intrinsic_f64_sqrt_hash()), IrInstCons(numeric_storage_read(5), IrInstNil)))),
+      IrTermReturn(5)), IrBlockListNil)
+    Test.assert_eq(pipeline_ir_storage_read_reuse_count(pipeline_ir_storage_read_reuse_facts(blocks)), 0)
+  }
+}
+
+test "numeric computations preserve observations through joins and loop backedges" {
+  for hash in [pipeline_ir_native_intrinsic_f64_sqrt_hash(), 12345] {
+    let call = numeric_storage_call(hash)
+    let diamond = IrBlockListCons(IrBlock(0, IrValueNil, IrInstCons(numeric_storage_read(3), IrInstNil), IrTermBranch(2, 1, 2)),
+      IrBlockListCons(IrBlock(1, IrValueNil, IrInstCons(call, IrInstNil), IrTermJump(3, IrValueNil)),
+      IrBlockListCons(IrBlock(2, IrValueNil, IrInstNil, IrTermJump(3, IrValueNil)),
+      IrBlockListCons(IrBlock(3, IrValueNil, IrInstCons(numeric_storage_read(5), IrInstNil), IrTermReturn(5)), IrBlockListNil))))
+    let cycle = IrBlockListCons(IrBlock(0, IrValueNil, IrInstCons(numeric_storage_read(3), IrInstNil), IrTermJump(1, IrValueNil)),
+      IrBlockListCons(IrBlock(1, IrValueNil, IrInstCons(numeric_storage_read(5), IrInstNil), IrTermBranch(2, 2, 3)),
+      IrBlockListCons(IrBlock(2, IrValueNil, IrInstCons(call, IrInstNil), IrTermJump(1, IrValueNil)),
+      IrBlockListCons(IrBlock(3, IrValueNil, IrInstNil, IrTermReturn(5)), IrBlockListNil))))
+    for blocks in [diamond, cycle] {
+      let facts = pipeline_ir_storage_read_reuse_facts(blocks)
+      Test.assert_eq(pipeline_ir_storage_read_reuse_count(facts), if hash == 12345 { 0 } else { 1 })
+      Test.assert_eq(pipeline_ir_verify_function(IrFunction(12345, 3, pipeline_ir_flow_apply_storage_read_reuse(facts), 0)), 0)
+    }
+  }
+}
