@@ -26,8 +26,8 @@ The workload set covers integer-heavy and float-heavy kernels:
 - `graph_reach`: adjacency-matrix reachability with vector queues
 - `mandelbrot`: `f64` escape-count loops with explicit `i64` to `f64`
   conversion
-- `nbody`: five-body solar-system update loop using the shape-checked
-  `F64Table` API, optional lookup results, and `sqrt`
+- `nbody`: five-body solar-system update loop over named `Body` records,
+  fixed arrays, checked slices, record updates, and `sqrt`
 - `sorted_lookup`: sorted-map construction and optional lookups through its
   comparator (an ordered-collection churn canary)
 - `iterator_pipeline_direct`: direct-loop control over the iterator workload
@@ -35,8 +35,17 @@ The workload set covers integer-heavy and float-heavy kernels:
   iterator or pull-closure surface (a fusion and abstraction-erasure canary)
 
 Every workload checks its result; a nonzero exit invalidates its timing. The
-Weft kernels use public collection APIs. Keep algorithms, data sizes, and
-checksums aligned with the Go and Rust siblings when changing those APIs.
+Weft kernels use ordinary language features and public collection APIs. Keep
+data representations, algorithms, data sizes, and checksums aligned with the
+Go and Rust siblings. The n-body implementations all store position, velocity,
+and mass in body records, advance five bodies for 50,000 steps with `dt = 0.01`,
+and check the same final energy within `1e-9`.
+
+`../diagnostic/nbody_table.weft` retains the earlier table representation as a
+separate compiler diagnostic. It is excluded from the comparative workload set
+and published n-body results. Compiler improvements must benefit the canonical
+record implementation; changing its representation to bypass a language cost
+does not establish comparative performance recovery.
 
 For compiler comparisons, keep both compiler binaries beside the checkout's
 `weft` so they load the same SDK source. A detached compiler uses its embedded

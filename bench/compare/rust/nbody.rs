@@ -77,7 +77,7 @@ fn nbody_final_energy(steps: i64) -> f64 {
 fn main() {
     let expected = -0.16907807060863048;
     let got = nbody_final_energy(50000);
-    if (got - expected).abs() >= 0.000000001 {
+    if !((got - expected).abs() < 0.000000001) {
         panic!("{}", got);
     }
 }
