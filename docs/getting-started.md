@@ -371,6 +371,27 @@ fn teaching_text(index: usize) -> Option<str> {
 }
 ```
 
+Diagnostic values and their methods are available together from
+`stdlib/diagnostic`. A source range carries half-open UTF-8 byte offsets as
+`usize`; absence is `DiagnosticLocationNone`. Match that alternative directly
+when a tool needs the range. Related locations, text edits and diagnostic fields
+use `len() -> usize`.
+
+```weft check
+use stdlib/diagnostic.{DiagnosticLocation, DiagnosticLocationNone, DiagnosticSourceRange}
+use stdlib/option.{None, Option, Some}
+
+fn byte_range(location: DiagnosticLocation) -> Option<(usize, usize)> {
+  match location {
+    DiagnosticLocationNone -> None
+    DiagnosticSourceRange(source, start, end) -> Some((start, end))
+  }
+}
+```
+
+`stdlib/diagnostic/schema` remains the declaration-only entry point for
+analysis tools that need the diagnostic contract without helper implementations.
+
 
 Diagnostics have stable append-only codes, source provenance, related
 locations, and actionable help. `--color auto|always|never` is a process-wide

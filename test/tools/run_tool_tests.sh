@@ -1017,6 +1017,16 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_sse_stream_pins_public_surface" "$(<"$tmp_out")" "Public API items: 25. Documented: 25."
     assert_contains "doc_stdlib_sse_stream_pins_owned_reader" "$(<"$tmp_out")" "pub type SseReader<S> = opaque"
     assert_contains "doc_stdlib_sse_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn next<S>(self: owned SseReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseReadOutcome<S>"
+  elif [ "$stdlib_doc_name" = "diagnostic" ]; then
+    assert_contains "doc_stdlib_diagnostic_public_facade" "$(<"$tmp_out")" "Public API items: 81. Documented: 81."
+    assert_contains "doc_stdlib_diagnostic_finite_related_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticRelatedLocationList) -> usize"
+    assert_contains "doc_stdlib_diagnostic_finite_edit_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticTextEditList) -> usize"
+    assert_contains "doc_stdlib_diagnostic_finite_field_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticFieldList) -> usize"
+    assert_contains "doc_stdlib_diagnostic_finite_suggestion_count" "$(<"$tmp_out")" "pub fn suggestion_count(self: DiagnosticFieldList) -> usize"
+    assert_contains "doc_stdlib_diagnostic_finite_range" "$(<"$tmp_out")" "DiagnosticSourceRange(DiagnosticSource, usize, usize)"
+  elif [ "$stdlib_doc_name" = "diagnostic/schema" ]; then
+    assert_contains "doc_stdlib_diagnostic_schema_public_surface" "$(<"$tmp_out")" "Public API items: 62. Documented: 62."
+    assert_contains "doc_stdlib_diagnostic_schema_finite_range" "$(<"$tmp_out")" "DiagnosticSourceRange(DiagnosticSource, usize, usize)"
   elif [ "$stdlib_doc_name" = "diagnostic/registry" ]; then
     assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 45. Documented: 45."
     assert_contains "doc_stdlib_diagnostic_registry_length" "$(<"$tmp_out")" "pub fn len() -> usize"
@@ -2657,6 +2667,11 @@ run_weft_compile_guarded "$WEFT" compile test/fixtures/diagnostic_frame_probe.we
 chmod +x "$tmp_bin"
 diag_out=$(run_binary_guarded "$tmp_bin" 2>&1)
 assert_equals "diagnostic_multiline_range_clips_middle_lines" "$diag_out" $'probe.weft: line 1, col 3: error: range crosses the omitted middle\n  |\n1 | zero\n  |   ^~\n2 | one two\n  | ^~~~~~~\n... | ...\n6 | six seven\n  | ^~~~~~~~~\n7 | eight\n  | ^~~ range crosses the omitted middle'
+
+run_weft_compile_guarded "$WEFT" compile test/fixtures/diagnostic_finite_range_probe.weft > "$tmp_bin" 2>"$tmp_err"
+chmod +x "$tmp_bin"
+diag_out=$(run_binary_guarded "$tmp_bin" 2>&1)
+assert_equals "diagnostic_full_width_ranges_clip_to_known_source" "$diag_out" $'finite.weft: line 2, col 2: note: offsets exceed the acquired source\n  |\n2 | b\n  |  ^ offsets exceed the acquired source\nfinite.weft: line 2, col 2: note: offsets exceed the acquired source\n  |\n2 | b\n  |  ^ offsets exceed the acquired source'
 
 mcp_out=$(printf '%s' '{ "jsonrpc" : "2.0", "id" : 1, "method" : "tools/list" }' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_tools_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"schema_version":1,"tools":[{"name":"parse_summary","stability":"internal"},{"name":"check_summary","stability":"internal"},{"name":"ir_summary","stability":"internal"},{"name":"type_lookup","stability":"stable"},{"name":"effect_lookup","stability":"stable"},{"name":"diagnostics","stability":"stable"},{"name":"grammar_parse","stability":"internal"},{"name":"grammar_check","stability":"internal"},{"name":"grammar_diagnostics","stability":"stable"},{"name":"opt_counters","stability":"internal"},{"name":"fact_at_position","stability":"stable"},{"name":"visible_bindings","stability":"stable"},{"name":"conformance_at_position","stability":"stable"},{"name":"format_source","stability":"stable"}]}}'
