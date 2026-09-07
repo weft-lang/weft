@@ -2366,10 +2366,10 @@ compile_rc_census_binary_exit=$?
 set -e
 assert_equals "compile_rc_census_binary_preserves_exit" "$compile_rc_census_binary_exit" "42"
 rc_dynamic_line=$(grep '^WEFT_RC_CENSUS ' "$tmp_err")
-read -r rc_dynamic_tag rc_dynamic_version rc_dynamic_alloc rc_dynamic_retain rc_dynamic_release rc_dynamic_child rc_dynamic_promoted_retain rc_dynamic_promoted_release rc_dynamic_closure_retain rc_dynamic_closure_release rc_dynamic_closure_promoted_release rc_dynamic_weak_retain rc_dynamic_weak_release rc_dynamic_weak_load rc_dynamic_region_alloc rc_dynamic_promotions rc_dynamic_call_owned rc_dynamic_call_borrowed rc_dynamic_reuse_attempts rc_dynamic_reuse_allocs rc_dynamic_reuse_hits rc_dynamic_managed_retain rc_dynamic_managed_release rc_dynamic_origin_unknown_retain rc_dynamic_origin_unknown_release rc_dynamic_origin_result_retain rc_dynamic_origin_result_release rc_dynamic_origin_call_retain rc_dynamic_origin_call_release rc_dynamic_origin_binding_retain rc_dynamic_origin_binding_release rc_dynamic_origin_aggregate_retain rc_dynamic_origin_aggregate_release rc_dynamic_origin_arm_retain rc_dynamic_origin_arm_release rc_dynamic_origin_discard_retain rc_dynamic_origin_discard_release rc_dynamic_origin_cleanup_retain rc_dynamic_origin_cleanup_release rc_dynamic_origin_control_retain rc_dynamic_origin_control_release rc_dynamic_extra <<< "$rc_dynamic_line"
-assert_equals "compile_rc_census_dynamic_schema_version" "$rc_dynamic_tag:$rc_dynamic_version" "WEFT_RC_CENSUS:5"
+read -r rc_dynamic_tag rc_dynamic_version rc_dynamic_alloc rc_dynamic_retain rc_dynamic_release rc_dynamic_child rc_dynamic_promoted_retain rc_dynamic_promoted_release rc_dynamic_closure_retain rc_dynamic_closure_release rc_dynamic_closure_promoted_release rc_dynamic_weak_retain rc_dynamic_weak_release rc_dynamic_weak_load rc_dynamic_region_alloc rc_dynamic_promotions rc_dynamic_call_owned rc_dynamic_call_borrowed rc_dynamic_reuse_attempts rc_dynamic_reuse_allocs rc_dynamic_reuse_hits rc_dynamic_managed_retain rc_dynamic_managed_release rc_dynamic_origin_unknown_retain rc_dynamic_origin_unknown_release rc_dynamic_origin_result_retain rc_dynamic_origin_result_release rc_dynamic_origin_call_retain rc_dynamic_origin_call_release rc_dynamic_origin_binding_retain rc_dynamic_origin_binding_release rc_dynamic_origin_aggregate_retain rc_dynamic_origin_aggregate_release rc_dynamic_origin_arm_retain rc_dynamic_origin_arm_release rc_dynamic_origin_discard_retain rc_dynamic_origin_discard_release rc_dynamic_origin_cleanup_retain rc_dynamic_origin_cleanup_release rc_dynamic_origin_control_retain rc_dynamic_origin_control_release rc_dynamic_array_mutations rc_dynamic_array_detachments rc_dynamic_array_owners rc_dynamic_array_backing rc_dynamic_extra <<< "$rc_dynamic_line"
+assert_equals "compile_rc_census_dynamic_schema_version" "$rc_dynamic_tag:$rc_dynamic_version" "WEFT_RC_CENSUS:6"
 assert_equals "compile_rc_census_dynamic_schema_has_exact_fields" "$rc_dynamic_extra" ""
-if [[ "$rc_dynamic_alloc" =~ ^[0-9]+$ && "$rc_dynamic_retain" =~ ^[0-9]+$ && "$rc_dynamic_release" =~ ^[0-9]+$ && "$rc_dynamic_child" =~ ^[0-9]+$ && "$rc_dynamic_promoted_retain" =~ ^[0-9]+$ && "$rc_dynamic_promoted_release" =~ ^[0-9]+$ && "$rc_dynamic_closure_retain" =~ ^[0-9]+$ && "$rc_dynamic_closure_release" =~ ^[0-9]+$ && "$rc_dynamic_closure_promoted_release" =~ ^[0-9]+$ && "$rc_dynamic_weak_retain" =~ ^[0-9]+$ && "$rc_dynamic_weak_release" =~ ^[0-9]+$ && "$rc_dynamic_weak_load" =~ ^[0-9]+$ && "$rc_dynamic_region_alloc" =~ ^[0-9]+$ && "$rc_dynamic_promotions" =~ ^[0-9]+$ && "$rc_dynamic_call_owned" =~ ^[0-9]+$ && "$rc_dynamic_call_borrowed" =~ ^[0-9]+$ && "$rc_dynamic_reuse_attempts" =~ ^[0-9]+$ && "$rc_dynamic_reuse_allocs" =~ ^[0-9]+$ && "$rc_dynamic_reuse_hits" =~ ^[0-9]+$ && "$rc_dynamic_managed_retain" =~ ^[0-9]+$ && "$rc_dynamic_managed_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_unknown_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_unknown_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_result_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_result_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_call_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_call_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_binding_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_binding_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_aggregate_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_aggregate_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_arm_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_arm_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_discard_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_discard_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_cleanup_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_cleanup_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_control_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_control_release" =~ ^[0-9]+$ ]]; then
+if [[ "$rc_dynamic_alloc" =~ ^[0-9]+$ && "$rc_dynamic_retain" =~ ^[0-9]+$ && "$rc_dynamic_release" =~ ^[0-9]+$ && "$rc_dynamic_child" =~ ^[0-9]+$ && "$rc_dynamic_promoted_retain" =~ ^[0-9]+$ && "$rc_dynamic_promoted_release" =~ ^[0-9]+$ && "$rc_dynamic_closure_retain" =~ ^[0-9]+$ && "$rc_dynamic_closure_release" =~ ^[0-9]+$ && "$rc_dynamic_closure_promoted_release" =~ ^[0-9]+$ && "$rc_dynamic_weak_retain" =~ ^[0-9]+$ && "$rc_dynamic_weak_release" =~ ^[0-9]+$ && "$rc_dynamic_weak_load" =~ ^[0-9]+$ && "$rc_dynamic_region_alloc" =~ ^[0-9]+$ && "$rc_dynamic_promotions" =~ ^[0-9]+$ && "$rc_dynamic_call_owned" =~ ^[0-9]+$ && "$rc_dynamic_call_borrowed" =~ ^[0-9]+$ && "$rc_dynamic_reuse_attempts" =~ ^[0-9]+$ && "$rc_dynamic_reuse_allocs" =~ ^[0-9]+$ && "$rc_dynamic_reuse_hits" =~ ^[0-9]+$ && "$rc_dynamic_managed_retain" =~ ^[0-9]+$ && "$rc_dynamic_managed_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_unknown_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_unknown_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_result_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_result_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_call_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_call_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_binding_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_binding_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_aggregate_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_aggregate_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_arm_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_arm_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_discard_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_discard_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_cleanup_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_cleanup_release" =~ ^[0-9]+$ && "$rc_dynamic_origin_control_retain" =~ ^[0-9]+$ && "$rc_dynamic_origin_control_release" =~ ^[0-9]+$ && "$rc_dynamic_array_mutations" =~ ^[0-9]+$ && "$rc_dynamic_array_detachments" =~ ^[0-9]+$ && "$rc_dynamic_array_owners" =~ ^[0-9]+$ && "$rc_dynamic_array_backing" =~ ^[0-9]+$ ]]; then
   rc_dynamic_origin_retain_sum=$((rc_dynamic_origin_unknown_retain + rc_dynamic_origin_result_retain + rc_dynamic_origin_call_retain + rc_dynamic_origin_binding_retain + rc_dynamic_origin_aggregate_retain + rc_dynamic_origin_arm_retain + rc_dynamic_origin_discard_retain + rc_dynamic_origin_cleanup_retain + rc_dynamic_origin_control_retain))
   rc_dynamic_origin_release_sum=$((rc_dynamic_origin_unknown_release + rc_dynamic_origin_result_release + rc_dynamic_origin_call_release + rc_dynamic_origin_binding_release + rc_dynamic_origin_aggregate_release + rc_dynamic_origin_arm_release + rc_dynamic_origin_discard_release + rc_dynamic_origin_cleanup_release + rc_dynamic_origin_control_release))
 else
@@ -2385,6 +2385,31 @@ else
 fi
 assert_contains "compile_rc_census_dynamic_human_names_events" "$(<"$tmp_err")" "rc census: default_alloc="
 assert_contains "compile_rc_census_dynamic_human_names_origins" "$(<"$tmp_err")" "origin_call_transport_retain="
+
+cat > "$tmp_rc_census_src" <<'WEFT_ARRAY_CENSUS'
+fn increment(values: [mut i64]) -> nil {
+  let first: usize = 0
+  for index in first..values.len { values[index] = values[index] + 1 }
+}
+fn main() -> i64 {
+  let mut values = [1, 2]
+  increment(values[..])
+  let snapshot = values
+  increment(values[..])
+  values[0] = 10
+  let mut empty: [i64; 0] = []
+  increment(empty[..])
+  if values[0] == 10 and values[1] == 4 and snapshot[0] == 2 { 0 } else { 1 }
+}
+WEFT_ARRAY_CENSUS
+"$WEFT" compile --rc-census "$tmp_rc_census_src" > "$tmp_out" 2> "$tmp_err"
+chmod +x "$tmp_out"
+run_binary_guarded "$tmp_out" > /dev/null 2> "$tmp_err"
+read -r -a rc_array_fields <<< "$(grep '^WEFT_RC_CENSUS ' "$tmp_err")"
+assert_equals "array_census_completed_mutations" "${rc_array_fields[41]}" "4"
+assert_equals "array_census_detachments" "${rc_array_fields[42]}" "1"
+assert_equals "array_census_owner_allocations" "${rc_array_fields[43]}" "3"
+assert_equals "array_census_backing_allocations" "${rc_array_fields[44]}" "2"
 
 set +e
 "$WEFT" compile --rc-census > "$tmp_out" 2> "$tmp_err"
