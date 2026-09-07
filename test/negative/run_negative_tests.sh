@@ -62,6 +62,10 @@ check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" 'error[
 check_rejects "constructor_callback_argument" "test/negative/constructor_callback_argument.weft" 'error[E1002]: argument type mismatch' 1
 check_rejects "constructor_callback_result" "test/negative/constructor_callback_result.weft" 'error[E1002]: argument type mismatch' 1
 check_rejects "constructor_callback_arity" "test/negative/constructor_callback_arity.weft" 'error[E1002]: argument type mismatch' 1
+check_rejects "return_annotated_finite_as_signed" "test/negative/return_annotated_finite_as_signed.weft" 'return value type mismatch: expected `i64`, found `usize`' 1
+check_rejects "return_annotated_union_as_initializer" "test/negative/return_annotated_union_as_initializer.weft" 'return value type mismatch' 1
+check_rejects "return_shadowing_initializer_type" "test/negative/return_shadowing_initializer_type.weft" 'return value type mismatch: expected `usize`, found `i64`' 1
+check_rejects "return_annotated_initializer_mismatch" "test/negative/return_annotated_initializer_mismatch.weft" 'type annotation type mismatch: expected `usize`, found `str`' 1
 check_rejects "par_prefixed_surface_retired" "test/negative/par_prefixed_surface_retired.weft" "error[E4002]:" 5
 check_rejects "deep_release_mask_overflow_record" "test/negative/deep_release_mask_overflow_record.weft" "type error: aggregate field may require release beyond 16-word mask"
 check_rejects "deep_release_mask_overflow_variant_closure" "test/negative/deep_release_mask_overflow_variant_closure.weft" "type error: aggregate field may require release beyond 16-word mask"
