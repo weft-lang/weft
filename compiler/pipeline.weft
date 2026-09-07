@@ -29,6 +29,7 @@ use runtime/alloc.{*}
 use runtime/buffer.{*}
 use runtime/effects.{*}
 use runtime/memory.{*}
+use runtime/rc.{rc_array_storage_data_offset}
 use runtime/sdk_archive.{sdk_archive_validate}
 use runtime/source_acquire.{SourceAcquire, source_acquire_with_standalone}
 use runtime/syscall.{*}
@@ -1102,7 +1103,9 @@ pub(package) fn pipeline_ir_native_fresh_managed_alloc_hash(hash: i64) -> i64 {
   if hash == pipeline_ir_native_hash_name("rc_default_alloc") or
      hash == pipeline_ir_native_hash_name("rc_default_alloc_masked") or
      hash == pipeline_ir_native_hash_name("rc_default_alloc_described") or
-     hash == pipeline_ir_native_hash_name("rc_default_alloc_finalized") { 1 }
+     hash == pipeline_ir_native_hash_name("rc_default_alloc_finalized") or
+     hash == pipeline_ir_native_hash_name("rc_array_storage_new") or
+     hash == pipeline_ir_native_hash_name("rc_array_storage_new_from_data") { 1 }
   else { 0 }
 }
 
@@ -25548,6 +25551,50 @@ pub(package) fn pipeline_indexed_slice_base_lane_count(fact: i64, subst: i64) ->
 -- Construct a non-owning (data, len) pair from checker-produced storage and
 -- mutability facts. The runtime call remains an explicit semantic seam so the
 -- borrow pass can rebase provenance after optimisation.
+pub(package) type PipelineArrayMutationPlan {
+  PipelineArrayMutationUnavailable,
+  PipelineArrayMutation(i64, i64, i64)
+}
+
+pub(package) fn pipeline_array_mutation_plan(base: Expr, array_ty: i64, length: i64, ctx: PipelineHandlerLowerCtx) -> PipelineArrayMutationPlan {
+  let tt = pipeline_handler_lower_ctx_tt(ctx)
+  if pipeline_array_literal_layout_is_valid(tt, array_ty, length) == 0 { PipelineArrayMutationUnavailable }
+  else {
+    match base {
+      Ident(ns, nl) -> {
+        let slot = pipeline_value_env_lookup(pipeline_handler_lower_ctx_locals(ctx), pipeline_handler_lower_ctx_src(ctx), ns, nl)
+        if slot < 0 { PipelineArrayMutationUnavailable }
+        else { PipelineArrayMutation(slot, cg_layout_array_size(tt, array_ty), cg_layout_array_align(tt, array_ty)) }
+      }
+      _ -> PipelineArrayMutationUnavailable
+    }
+  }
+}
+
+pub(package) fn pipeline_rc_array_storage_prepare_mutation_hash() -> i64 {
+  str_hash(__str_ptr("rc_array_storage_prepare_mutation"), 0, __str_len("rc_array_storage_prepare_mutation"))
+}
+
+pub(package) fn pipeline_lower_array_mutation_storage(plan: PipelineArrayMutationPlan, previous: i64, next_value: i64) -> IrLoweredExpr {
+  match plan {
+    PipelineArrayMutationUnavailable -> ir_lowered_expr_invalid(next_value)
+    PipelineArrayMutation(slot, byte_size, align) -> {
+      let size_value = next_value
+      let align_value = size_value + 1
+      let owner = size_value + 2
+      let data = size_value + 3
+      let args = IrValueCons(previous, IrValueCons(size_value, IrValueCons(align_value, IrValueNil)))
+      let insts = IrInstCons(IrConstI64(size_value, byte_size),
+        IrInstCons(IrConstI64(align_value, align),
+        IrInstCons(IrCallI64(owner, pipeline_rc_array_storage_prepare_mutation_hash(), args),
+        IrInstCons(IrStoreI64(slot, owner),
+        IrInstCons(IrManagedSlotI64(0 - 1, owner, slot, continuation_cleanup_kind_rc(), IrManagedSlotRebind(previous)),
+        IrInstCons(IrCallI64(data, pipeline_rc_array_storage_data_hash(), IrValueCons(owner, IrValueNil)), IrInstNil))))))
+      ir_lowered_expr(owner, data + 1, insts)
+    }
+  }
+}
+
 pub(package) fn pipeline_lower_indexed_slice_after_values_typed(base_expr: Expr, start_expr: Expr, end_expr: Expr, fact: i64, base_value: i64, start_value: i64, end_value: i64, next_value: i64, lower_ctx: PipelineHandlerLowerCtx) -> IrLoweredExpr {
   let tt = pipeline_handler_lower_ctx_tt(lower_ctx)
   let subst = pipeline_handler_lower_ctx_subst(lower_ctx)
@@ -25577,34 +25624,23 @@ pub(package) fn pipeline_lower_indexed_slice_after_values_typed(base_expr: Expr,
       cursor = cursor + 2
     } else { if fixed_len >= 0 {
       if mutable == 1 {
-        let storage = pipeline_lower_array_literal_storage(base_ty, fixed_len, cursor, tt)
+        let old_data = cursor
+        let checked_len = cursor + 1
+        let checked_stride = cursor + 2
+        let checked_address = cursor + 3
+        let checked_end = if pipeline_expr_is_nil_lit(end_expr) == 1 { checked_len } else { end_value }
+        let validation = IrInstCons(IrCallI64(old_data, pipeline_rc_array_storage_data_hash(), IrValueCons(base_value, IrValueNil)),
+          IrInstCons(IrConstI64(checked_len, fixed_len),
+          IrInstCons(IrConstI64(checked_stride, stride),
+          IrInstCons(IrCallI64(checked_address, pipeline_runtime_mut_slice_address_hash(),
+            pipeline_slice_address_args(base_value, old_data, checked_len, start_value, checked_end, checked_stride)), IrInstNil))))
+        let plan = pipeline_array_mutation_plan(base_expr, base_ty, fixed_len, lower_ctx)
+        let storage = pipeline_lower_array_mutation_storage(plan, base_value, cursor + 4)
         if ir_lowered_expr_is_valid(storage) == 0 { return ir_lowered_expr_invalid(next_value) }
         owner = ir_lowered_expr_value(storage)
         data = ir_lowered_expr_next_value(storage) - 1
         cursor = ir_lowered_expr_next_value(storage)
-        let old_data = cursor
-        cursor = cursor + 1
-        match base_expr {
-          Ident(ns, nl) -> {
-            let slot = pipeline_value_env_lookup(pipeline_handler_lower_ctx_locals(lower_ctx), pipeline_handler_lower_ctx_src(lower_ctx), ns, nl)
-            if slot < 0 { return ir_lowered_expr_invalid(next_value) }
-            insts = ir_inst_list_append(
-              ir_lowered_expr_insts(storage),
-              ir_inst_list_prepend(
-                ir_inst_call_i64(old_data, pipeline_rc_array_storage_data_hash(), ir_value_list_prepend(base_value, ir_value_list_empty())),
-                ir_inst_list_prepend(
-                  pipeline_array_copy_inst_for_type(data, old_data, base_ty, tt),
-                  ir_inst_list_prepend(
-                    ir_inst_store_i64(slot, owner),
-                    ir_inst_list_prepend(pipeline_managed_release_inst_with_origin(cursor, base_value, continuation_cleanup_kind_rc(), ir_managed_stake_origin_aggregate()), ir_inst_list_empty())
-                  )
-                )
-              )
-            )
-            cursor = cursor + 1
-          }
-          _ -> return ir_lowered_expr_invalid(next_value)
-        }
+        insts = ir_inst_list_append(validation, ir_lowered_expr_insts(storage))
       } else {
         data = cursor
         insts = ir_inst_list_prepend(ir_inst_call_i64(data, pipeline_rc_array_storage_data_hash(), ir_value_list_prepend(base_value, ir_value_list_empty())), ir_inst_list_empty())
@@ -26185,6 +26221,8 @@ pub(package) fn pipeline_lower_indexed_scalar_overwrite(value_expr: Expr, elemen
     insts = ir_inst_list_append(insts, IrInstCons(IrPtrStoreI64(cursor, address, value, storage), IrInstNil))
     cursor = cursor + 1
     if release_hash != 0 {
+      insts = ir_inst_list_append(insts,
+        IrInstCons(pipeline_managed_aggregate_commit_inst(value, drop_kind), IrInstNil))
       insts = ir_inst_list_append(insts, ir_inst_list_prepend(pipeline_managed_release_inst_with_origin(cursor, old_value, drop_kind, ir_managed_stake_origin_aggregate()), ir_inst_list_empty()))
       cursor = cursor + 1
       let borrowed = pipeline_expr_result_is_borrowed_for_ty_typed(value_expr, element_ty, pipeline_handler_lower_ctx_src(lower_ctx), pipeline_handler_lower_ctx_fns(lower_ctx), pipeline_handler_lower_ctx_subst(lower_ctx), tt)
@@ -26290,20 +26328,22 @@ pub(package) fn pipeline_lower_indexed_set_after_values_typed(base_expr: Expr, i
     let mut prefix = ir_inst_list_empty()
     let mut cursor = next_value
     let mut data = base_value
-    let mut active_storage = base_value
     if fixed_len >= 0 {
-      let storage = pipeline_lower_array_literal_storage(base_ty, fixed_len, cursor, tt)
+      let old_data = cursor
+      let checked_len = cursor + 1
+      let checked_stride = cursor + 2
+      let checked_address = cursor + 3
+      let validation = IrInstCons(IrCallI64(old_data, pipeline_rc_array_storage_data_hash(), IrValueCons(base_value, IrValueNil)),
+        IrInstCons(IrConstI64(checked_len, fixed_len),
+        IrInstCons(IrConstI64(checked_stride, stride),
+        IrInstCons(IrCallI64(checked_address, pipeline_runtime_index_address_hash(),
+          pipeline_index_address_args(old_data, checked_len, index_value, checked_stride)), IrInstNil))))
+      let plan = pipeline_array_mutation_plan(base_expr, base_ty, fixed_len, lower_ctx)
+      let storage = pipeline_lower_array_mutation_storage(plan, base_value, cursor + 4)
       if ir_lowered_expr_is_valid(storage) == 0 { return ir_lowered_expr_invalid(next_value) }
-      active_storage = ir_lowered_expr_value(storage)
       data = ir_lowered_expr_next_value(storage) - 1
       cursor = ir_lowered_expr_next_value(storage)
-      let old_data = cursor
-      cursor = cursor + 1
-      let copy = ir_inst_list_prepend(
-        ir_inst_call_i64(old_data, pipeline_rc_array_storage_data_hash(), ir_value_list_prepend(base_value, ir_value_list_empty())),
-        ir_inst_list_prepend(pipeline_array_copy_inst_for_type(data, old_data, base_ty, tt), ir_inst_list_empty())
-      )
-      prefix = ir_inst_list_append(ir_lowered_expr_insts(storage), copy)
+      prefix = ir_inst_list_append(validation, ir_lowered_expr_insts(storage))
     } else { 0 }
     let len_value = if fixed_len < 0 { base_value + 1 } else { cursor }
     if fixed_len >= 0 {
@@ -26320,23 +26360,8 @@ pub(package) fn pipeline_lower_indexed_set_after_values_typed(base_expr: Expr, i
     let overwritten = pipeline_lower_indexed_overwrite(value_expr, element_ty, address, value, cursor, lower_ctx)
     if ir_lowered_expr_is_valid(overwritten) == 0 { overwritten }
     else {
-      let mut post = ir_inst_list_empty()
-      let mut after = ir_lowered_expr_next_value(overwritten)
-      if fixed_len >= 0 {
-        match base_expr {
-          Ident(ns, nl) -> {
-            let slot = pipeline_value_env_lookup(pipeline_handler_lower_ctx_locals(lower_ctx), pipeline_handler_lower_ctx_src(lower_ctx), ns, nl)
-            if slot < 0 { return ir_lowered_expr_invalid(next_value) }
-            post = ir_inst_list_prepend(
-              ir_inst_store_i64(slot, active_storage),
-              ir_inst_list_prepend(IrManagedSlotI64(after, active_storage, slot, continuation_cleanup_kind_rc(), IrManagedSlotReplace(base_value)), ir_inst_list_empty())
-            )
-            after = after + 1
-          }
-          _ -> return ir_lowered_expr_invalid(next_value)
-        }
-      } else { 0 }
-      ir_lowered_expr(ir_lowered_expr_value(overwritten), after, ir_inst_list_append(prefix, ir_inst_list_append(ir_lowered_expr_insts(overwritten), post)))
+      ir_lowered_expr(ir_lowered_expr_value(overwritten), ir_lowered_expr_next_value(overwritten),
+        ir_inst_list_append(prefix, ir_lowered_expr_insts(overwritten)))
     }
   }
 }
@@ -33084,7 +33109,9 @@ pub(package) fn pipeline_ir_abort_cleanup_structural_plan_for_site(fm: i64, site
 }
 
 pub(package) fn pipeline_ir_abort_cleanup_call_result_lane_release_hash(callee_hash: i64, fns: i64, lane: i64) -> i64 {
-  if lane == 0 and (callee_hash == pipeline_ir_abort_cleanup_rc_alloc_hash() or callee_hash == pipeline_rc_array_storage_new_hash() or callee_hash == pipeline_rc_default_weak_load_hash()) {
+  -- Trusted allocation leaves return machine words. Use their shared result
+  -- contract even when inlining removes a typed or storage-constructor wrapper.
+  if lane == 0 and (pipeline_ir_native_fresh_managed_alloc_hash(callee_hash) == 1 or callee_hash == pipeline_rc_default_weak_load_hash()) {
     pipeline_rc_default_release_hash()
   } else {
     pipeline_managed_release_hash_for_kind(
@@ -33558,6 +33585,7 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_slot_alias_inst_list(insts: Ir
           IrManagedSlotObserve -> pipeline_ir_abort_cleanup_add_managed_slot_alias(facts, value, slot, kind)
           IrManagedSlotRelease -> pipeline_ir_abort_cleanup_add_managed_slot_alias(facts, value, slot, kind)
           IrManagedSlotReplace(previous) -> pipeline_ir_abort_cleanup_add_managed_slot_alias(facts, previous, slot, kind)
+          IrManagedSlotRebind(previous) -> pipeline_ir_abort_cleanup_add_managed_slot_alias(facts, previous, slot, kind)
           IrManagedSlotAcquire -> 0
         }
         IrStructuralSlotI64(value, slot, plan, mode) -> {
@@ -39592,6 +39620,16 @@ pub(package) fn pipeline_ir_native_emit_structural_split(code: i64, value: i64, 
   }
 }
 
+pub(package) fn pipeline_ir_native_record_static_data_interval(fm: i64, start: i64, end: i64) -> i64 {
+  let exclusions = fmap_audit_nested(fm)
+  if exclusions != 0 and end > start {
+    -- Data and alignment padding share the text image but are skipped by an
+    -- emitted branch. Publish their exact extent to every native auditor.
+    nlist_add(exclusions, node_new(1, start, end, 0, 0))
+    0
+  } else { 0 }
+}
+
 pub(package) fn pipeline_ir_native_emit_string_lit(code: i64, dst: i64, start: i64, len: i64, src: i64, fm: i64, pinned: PipelineIrNativeValueHomeFacts) -> i64 {
   -- A literal is immutable program data, not a runtime allocation. Its bytes
   -- stay inline in the native image and its stable (pointer, length)
@@ -39604,14 +39642,7 @@ pub(package) fn pipeline_ir_native_emit_string_lit(code: i64, dst: i64, start: i
   for i in 0..len { bu8(code, mem_load8(src + start + i)) }
   while (buf_len(code) band 3) != 0 { bu8(code, 0) }
   let data_end = buf_len(code)
-  let audit_exclusions = fmap_audit_nested(fm)
-  if audit_exclusions != 0 and data_end > data {
-    -- Static bytes share the text image but are skipped by the branch above;
-    -- they are neither instructions nor a nested call boundary. Preserve the
-    -- exact interval so the residency auditor never decodes data as AArch64.
-    nlist_add(audit_exclusions, node_new(1, data, data_end, 0, 0))
-    0
-  } else { 0 }
+  pipeline_ir_native_record_static_data_interval(fm, data, data_end)
   cg_patch_b(code, skip, buf_len(code))
 
   pipeline_ir_native_emit_image_address(code, 15, data)
@@ -39983,6 +40014,7 @@ pub(package) fn pipeline_ir_native_ensure_record_layout_descriptor(code: i64, da
     bu64(code, data_size)
     bu64(code, pipeline_record_layout_descriptor_entry_count(fields))
     pipeline_ir_native_emit_record_layout_descriptor_fields(code, fields)
+    pipeline_ir_native_record_static_data_interval(fm, skip + 4, buf_len(code))
     cg_patch_b(code, skip, buf_len(code))
     descriptor
   }
@@ -40102,6 +40134,7 @@ pub(package) fn pipeline_ir_native_ensure_par_work_descriptor(code: i64, descrip
       bu64(code, pipeline_par_work_descriptor_storage_size(descriptor))
       bu64(code, pipeline_par_work_descriptor_storage_align(descriptor))
       pipeline_ir_native_emit_par_work_descriptor_entries(code, descriptor)
+      pipeline_ir_native_record_static_data_interval(fm, skip + 4, buf_len(code))
       cg_patch_b(code, skip, buf_len(code))
       emitted
     }
@@ -40965,6 +40998,15 @@ pub(package) fn pipeline_ir_native_emit_managed_slot(code: i64, dst: i64, value:
             pipeline_ir_abort_cleanup_emit_disarm_transferred_fact(code, fact, fm)
             pipeline_ir_native_emit_managed_slot_release(code, dst, value, kind,
               ir_managed_stake_origin_cleanup(), fm, pinned)
+          }
+          IrManagedSlotRebind(previous) -> {
+            -- Mutation preparation transports this binding's one obligation.
+            -- Its result may be the same owner; there is no temporary stake
+            -- to disarm or previous stake to release again at this commit.
+            pipeline_ir_abort_cleanup_emit_sp_address(code, 17,
+              pipeline_ir_abort_cleanup_record_offset(fmap_current_abort_cleanup_base(fm), fact))
+            let current = pipeline_ir_native_load_reg(code, pinned, value)
+            bu32(code, cg_str(current, 17, handler_abort_cleanup_record_value_offset()))
           }
           IrManagedSlotObserve -> 0
         }
@@ -46117,6 +46159,36 @@ pub(package) fn pipeline_rc_census_emit_reuse_success(code: i64, fm: i64, hash: 
   }
 }
 
+pub(package) fn pipeline_rc_census_emit_array_result(code: i64, fm: i64, hash: i64) -> i64 {
+  if fmap_rc_census_mode(fm) == 0 { 0 }
+  else {
+    let event = match hash {
+      h if h == pipeline_ir_native_hash_name("rc_array_storage_prepare_mutation") -> 39
+      h if h == pipeline_ir_native_hash_name("rc_array_storage_copy_for_mutation") -> 40
+      h if h == pipeline_ir_native_hash_name("rc_array_storage_new_from_data") -> 41
+      _ -> 0 - 1
+    }
+    if event < 0 { 0 }
+    else {
+      -- Observe successful results at the shared return, preserving x0.
+      -- Owners and backing are separate allocations; empty arrays have only
+      -- an owner. These counts do not change ordinary program emission.
+      let failed = buf_len(code)
+      bu32(code, 0)
+      pipeline_rc_census_emit_event_amount(code, fm, event, 1)
+      if event == 41 {
+        bu32(code, cg_ldr(15, 0, rc_array_storage_data_offset()))
+        let empty = buf_len(code)
+        bu32(code, 0)
+        pipeline_rc_census_emit_event_amount(code, fm, 42, 1)
+        cg_patch_cbz(code, empty, 15, buf_len(code))
+      } else { 0 }
+      cg_patch_cbz(code, failed, 0, buf_len(code))
+      1
+    }
+  }
+}
+
 pub(package) fn pipeline_ir_indexed_address_fact(inst: IrInst, full_hash: i64) -> PipelineIrIndexedAddressFact {
   match inst {
     IrCallI64(_, hash, IrValueCons(data, IrValueCons(len, IrValueCons(index, IrValueCons(stride, IrValueNil))))) if hash == full_hash ->
@@ -46352,6 +46424,7 @@ pub(package) fn pipeline_cg_ir_only_function(original: IrFunction, code: i64, fm
         } else { 0 }
         pipeline_ir_abort_cleanup_emit_function_exit(code, fm)
         pipeline_rc_census_emit_reuse_success(code, fm, hash)
+        pipeline_rc_census_emit_array_result(code, fm, hash)
         emit_epilogue_current(code, fm)
         pipeline_native_layout_fact_record(fm, fn_off, buf_len(code), hash, if fmap_current_naked_leaf(fm) == 1 { 0 } else { 1 })
         fmap_set_current_split_map(fm, 0)
@@ -48103,6 +48176,7 @@ pub(package) fn pipeline_ir_rewrite_inst_uses(inst: IrInst, aliases: PipelineIrA
     IrManagedSlotI64(dst, value, slot, kind, action) -> {
       let rewritten = match action {
         IrManagedSlotReplace(previous) -> IrManagedSlotReplace(pipeline_ir_alias_env_lookup_or(aliases, previous))
+        IrManagedSlotRebind(previous) -> IrManagedSlotRebind(pipeline_ir_alias_env_lookup_or(aliases, previous))
         _ -> action
       }
       IrManagedSlotI64(dst, pipeline_ir_alias_env_lookup_or(aliases, value), slot, kind, rewritten)
