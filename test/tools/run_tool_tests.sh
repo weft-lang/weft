@@ -590,6 +590,13 @@ assert_equals "large_stack_preserves_live_operands" "$large_stack_exit" "0"
 assert_equals "large_stack_stdout_empty" "$(<"$tmp_out")" ""
 assert_equals "large_stack_stderr_empty" "$(<"$tmp_err")" ""
 
+integer_diagnostic_product="$tmp_scratch_dir/integer_diagnostic_product"
+run_weft_compile_guarded "$WEFT" compile tools/integer_diagnostic_smoke.weft > "$integer_diagnostic_product" 2> "$tmp_err"
+chmod +x "$integer_diagnostic_product"
+run_binary_guarded "$integer_diagnostic_product" > "$tmp_out" 2> "$tmp_err"
+assert_equals "integer_diagnostic_stdout_empty" "$(<"$tmp_out")" ""
+assert_equals "integer_diagnostic_signed_boundaries" "$(<"$tmp_err")" $'-9223372036854775808\n-9223372036854775807\n-10\n-1\n0\n1\n10\n9223372036854775807'
+
 printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
 
 set +e
