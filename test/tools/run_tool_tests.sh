@@ -546,7 +546,7 @@ assert_program_failure_contains() {
   local expected_stderr="$4"
   local exit_code
   local err
-  run_weft_compile_guarded "$WEFT" compile "$source_path" > "$tmp_bin" 2>"$tmp_err"
+  run_weft_compile_guarded "$WEFT" build "$source_path" -o "$tmp_bin" > "$tmp_out" 2>"$tmp_err"
   chmod +x "$tmp_bin"
   set +e
   run_binary_guarded "$tmp_bin" >/dev/null 2>"$tmp_err"
@@ -2522,6 +2522,18 @@ compile_rc_census_extra_exit=$?
 set -e
 assert_equals "compile_rc_census_extra_path_exits_usage" "$compile_rc_census_extra_exit" "2"
 assert_contains "compile_rc_census_extra_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics|--rc-census] PATH"
+
+assert_program_failure_contains "runtime_bump_rounding_overflow_exit" "test/runtime_bump_rounding_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
+assert_program_failure_contains "runtime_bump_size_overflow_exit" "test/runtime_bump_size_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
+assert_program_failure_contains "runtime_bump_words_overflow_exit" "test/runtime_bump_words_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
+assert_program_failure_contains "runtime_heap_alignment_overflow_exit" "test/runtime_heap_alignment_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
+assert_program_failure_contains "runtime_heap_cursor_overflow_exit" "test/runtime_heap_cursor_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
+assert_program_failure_contains "runtime_heap_mapping_exhaustion_exit" "test/runtime_heap_mapping_exhaustion_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
+assert_program_failure_contains "runtime_heap_size_overflow_exit" "test/runtime_heap_size_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
+assert_program_failure_contains "runtime_heap_words_overflow_exit" "test/runtime_heap_words_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
+assert_program_failure_contains "runtime_pool_words_overflow_exit" "test/runtime_pool_words_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
+assert_program_failure_contains "runtime_queue_words_overflow_exit" "test/runtime_queue_words_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
+assert_program_failure_contains "runtime_region_size_overflow_exit" "test/runtime_region_size_overflow_exit.weft" "70" "weft: persistent collection region growth failed"
 
 assert_program_failure_contains "panic_boundary" "test/panic_exit.weft" "101" "weft: panic: direct panic boundary"
 assert_program_failure_contains "checked_index_bounds_panic" "test/array_index_oob_exit.weft" "101" "weft: panic: index out of bounds"
