@@ -704,6 +704,10 @@ check_rejects "f64_i64_comparison_mismatch" "test/negative/f64_i64_comparison_mi
 check_rejects "f64_bitwise" "test/negative/f64_bitwise.weft" "type error: bitwise operand is not i64"
 check_rejects "f64_modulo" "test/negative/f64_modulo.weft" "type error: arithmetic operand is not i64"
 check_rejects "f32_f64_arithmetic_mismatch" "test/negative/f32_f64_arithmetic_mismatch.weft" "type error: arithmetic operand type mismatch"
+check_rejects "negation_string" "test/negative/negation_string.weft" 'error[E1002]: numeric negation type mismatch:'
+check_rejects "negation_float_width" "test/negative/negation_float_width.weft" 'error[E1002]:'
+check_rejects "negation_unhandled_effect" "test/negative/negation_unhandled_effect.weft" 'error[E2001]:'
+check_rejects "negation_owned_use_after_move" "test/negative/negation_owned_use_after_move.weft" 'type error: owned value used more than once'
 check_rejects "f32_i64_arithmetic_mismatch" "test/negative/f32_i64_arithmetic_mismatch.weft" "type error: arithmetic operand type mismatch"
 check_rejects "f32_f64_comparison_mismatch" "test/negative/f32_f64_comparison_mismatch.weft" "type error: comparison operand type mismatch"
 check_rejects "f32_f64_assignment_mismatch" "test/negative/f32_f64_assignment_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `f64`, found `f32`'
