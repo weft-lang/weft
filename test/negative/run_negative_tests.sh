@@ -70,6 +70,16 @@ check_rejects "method_inference_undetermined" "test/negative/method_inference_un
 check_rejects "method_inference_callback_effect" "test/negative/method_inference_callback_effect.weft" 'argument type mismatch: expected `(i64) -> i64`, found `(i64) -[InferenceCheckRead]> i64`' 1
 check_rejects "method_inference_effect_unavailable" "test/negative/method_inference_effect_unavailable.weft" 'error[E2001]: effect `InferenceCheckRead` is not available in this context' 1
 check_rejects "method_inference_owned_reuse" "test/negative/method_inference_owned_reuse.weft" 'type error: owned value used more than once' 1
+check_rejects "http_limits_require_usize" "test/negative/http_limits_require_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 8
+check_rejects "http_parse_errors_require_usize" "test/negative/http_parse_errors_require_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 27
+check_rejects "http_parse_positions_are_usize" "test/negative/http_parse_positions_are_usize.weft" 'return value type mismatch: expected `i64`, found `usize`' 1
+check_rejects "http_pool_capacity_requires_usize" "test/negative/http_pool_capacity_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
+check_rejects "http_redirect_hops_require_usize" "test/negative/http_redirect_hops_require_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
+check_rejects "http_policy_counts_are_usize" "test/negative/http_policy_counts_are_usize.weft" 'return value type mismatch: expected `i64`, found `usize`' 3
+check_rejects "http_json_bound_requires_usize" "test/negative/http_json_bound_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
+check_rejects "http_json_bounds_are_usize" "test/negative/http_json_bounds_are_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 2
+check_rejects "http_replay_statistics_are_usize" "test/negative/http_replay_statistics_are_usize.weft" 'return value type mismatch: expected `i64`, found `usize`' 9
+check_rejects "http_signed_policy_errors_removed" "test/negative/http_signed_policy_errors_removed.weft" 'unknown module member' 2
 check_rejects "http_headers_get_requires_usize" "test/negative/http_headers_get_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
 check_rejects "http_headers_len_is_usize" "test/negative/http_headers_len_is_usize.weft" 'type annotation type mismatch: expected `i64`, found `usize`' 1
 check_rejects "num_prefix_requires_usize" "test/negative/num_prefix_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 3

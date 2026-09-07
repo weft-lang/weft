@@ -161,7 +161,35 @@ bodies, trailers, and connection reuse; JSON callers choose a whole-document
 bound; SSE defaults to 16 KiB per unfinished line and 1 MiB per event;
 WebSocket defaults to 16 MiB per frame and 64 MiB per reassembled message while
 payload delivery remains fragment-bounded. Applications can select stricter
-limits and must match the typed rejection variants.
+limits and must match the typed rejection variants. HTTP byte budgets, parse
+positions, pool capacities, redirect hop counts, JSON bounds, and replay
+statistics use `usize`. Structural HTTP limits must be positive; a zero body
+budget allows only empty bodies. Redirect policy accepts every finite hop
+budget, including zero, so constructing it is infallible. Pool construction
+still checks its supported capacity, and JSON readers reject a zero bound
+while returning the original body owner.
+
+A valid Content-Length above a configured body budget produces
+`HttpBodyTooLarge`; a decimal value outside `usize` produces
+`HttpInvalidContentLength`. Large declared lengths remain counts throughout
+streaming, even when a truncated body reports more remaining bytes than fit
+in a signed integer.
+
+```weft check
+use stdlib/http as http
+use stdlib/http.{HttpLimits, HttpParseError}
+use stdlib/http/client as client
+use stdlib/http/client.{HttpRedirectPolicy, HttpRedirectSameOrigin, HttpRedirectStrictMethod}
+use stdlib/result.{Result}
+
+fn body_budget(bytes: usize) -> Result<HttpLimits, HttpParseError> {
+  http.limits(8192, 8192, 65536, 100, bytes, 1024, 16384, 32)
+}
+
+fn redirect_budget(hops: usize) -> HttpRedirectPolicy {
+  client.redirect_policy(hops, HttpRedirectSameOrigin, HttpRedirectStrictMethod)
+}
+```
 
 The checked [HTTPS JSON/SSE/WebSocket example](../examples/https_json_streams.weft)
 runs a local validating client and server through JSON exchange, chunked SSE,
