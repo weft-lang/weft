@@ -86,11 +86,11 @@ check_accepts() {
     ERRORS="$ERRORS\n  $name: checker exceeded ${WEFT_TEST_COMPILE_RSS_LIMIT_KB} KB RSS"
     return
   fi
-  if echo "$out" | grep -q "type error:"; then
-    echo "  FAIL $name (unexpected type error)"
+  if [ "$status" -ne 0 ]; then
+    echo "  FAIL $name (checker exited $status)"
     echo "$out" | sed 's/^/    /'
     FAIL=$((FAIL+1))
-    ERRORS="$ERRORS\n  $name: unexpected type error"
+    ERRORS="$ERRORS\n  $name: checker exited $status"
   else
     echo "  ok $name"
     PASS=$((PASS+1))
