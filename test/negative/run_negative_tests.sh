@@ -62,6 +62,17 @@ check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" 'error[
 check_rejects "constructor_callback_argument" "test/negative/constructor_callback_argument.weft" 'error[E1002]: argument type mismatch' 1
 check_rejects "constructor_callback_result" "test/negative/constructor_callback_result.weft" 'error[E1002]: argument type mismatch' 1
 check_rejects "constructor_callback_arity" "test/negative/constructor_callback_arity.weft" 'error[E1002]: argument type mismatch' 1
+check_rejects "callback_context_associated_annotation_conflict" "test/negative/callback_context_associated_annotation_conflict.weft" 'error[E1002]: lambda parameter type mismatch: expected `Entry`, found `str`'
+check_rejects "callback_context_annotation_conflict" "test/negative/callback_context_annotation_conflict.weft" 'lambda parameter type mismatch: expected `CallbackEntry`, found `i64`' 1
+check_rejects "callback_context_explicit_result_conflict" "test/negative/callback_context_explicit_result_conflict.weft" 'lambda return value type mismatch: expected `i64`, found `str`' 1
+check_rejects "callback_context_pure_effect" "test/negative/callback_context_pure_effect.weft" 'error[E2001]: effect `CallbackLog` is not available in this context' 1
+check_rejects "callback_context_any_parameter_body" "test/negative/callback_context_any_parameter_body.weft" 'unknown identifier '"'"'missing_callback_body_name'"'"'' 1
+check_rejects "callback_context_any_function_body" "test/negative/callback_context_any_function_body.weft" 'unknown identifier '"'"'missing_callback_body_name'"'"'' 1
+check_rejects "callback_context_let_binding_stays_standalone" "test/negative/callback_context_let_binding_stays_standalone.weft" 'argument type mismatch: expected `(CallbackEntry) -> i64`, found `(i64) -> i64`' 1
+check_rejects "callback_context_template_output_requires_explicit" "test/negative/callback_context_template_output_requires_explicit.weft" 'type error: wrong number of type arguments' 3
+check_rejects "callback_context_missing_method_body" "test/negative/callback_context_missing_method_body.weft" 'unknown identifier '"'"'missing_callback_body_name'"'"'' 2
+check_rejects "callback_context_extra_argument_body" "test/negative/callback_context_extra_argument_body.weft" 'unknown identifier '"'"'missing_callback_body_name'"'"'' 2
+check_rejects "callback_context_unique_used_twice" "test/negative/callback_context_unique_used_twice.weft" 'type error: unique value used more than once' 1
 check_rejects "method_inference_bound" "test/negative/method_inference_bound.weft" 'error[E1004]: type `str` does not implement `InferenceCheckMarker`' 1
 check_rejects "method_inference_conflict" "test/negative/method_inference_conflict.weft" 'argument type mismatch: expected `i64`, found `str`' 1
 check_rejects "method_inference_partial_explicit" "test/negative/method_inference_partial_explicit.weft" 'type error: wrong number of type arguments' 2

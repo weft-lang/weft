@@ -4687,7 +4687,11 @@ pub(package) fn synth_record_update(node: i64, env: i64, ft: i64, src: i64, tt: 
   if fact != 0 { node_f1(fact) }
   else {
     let base_ty = synth(node_f1(node), env, ft, src, tt)
-    if not ty_is_record(base_ty) or ty_record_open(base_ty) == 1 { ty_any() }
+    -- Nominal updates preserve their base type before field validation has
+    -- published layout facts. Callback inference consumes this same type
+    -- producer without requiring an earlier standalone body check.
+    if base_ty != 0 and ty_tag(base_ty) == 9 { base_ty }
+    else { if not ty_is_record(base_ty) or ty_record_open(base_ty) == 1 { ty_any() }
     else {
       let updates = node_f2(node)
       let update_count = node_f3(node)
@@ -4712,7 +4716,7 @@ pub(package) fn synth_record_update(node: i64, env: i64, ft: i64, src: i64, tt: 
         } else { 0 }
       }
       ty_record(result_fields, 0)
-    }
+    } }
   }
 }
 
@@ -5636,6 +5640,87 @@ pub(package) fn infer_generic_ref_from_expected(node: i64, target_ty: i64, env: 
   }
 }
 
+-- Known argument/receiver types may determine a callback's inputs before its
+-- result determines the remaining generic arguments. Publish those input
+-- types on the same parameter nodes used by contextual checking and lowering.
+-- Retain bound owners while resolving associated input types; unsolved callee
+-- variables never become a guessed callback parameter type.
+pub(package) fn generic_prepare_lambda_inputs(arg: i64, pattern: i64, tparams: i64, subst: i64, tt: i64) -> bool {
+  if node_tag(arg) != 29 or pattern == 0 or ty_tag(pattern) != 6 { false }
+  else {
+    let params = node_f1(arg)
+    let expected_params = ty_f1(pattern)
+    let count = node_f3(arg)
+    if count != nlist_len(expected_params) { false }
+    else {
+      let mut ready = true
+      for i in 0..count {
+        if node_f3(nlist_get(params, i)) == 0 {
+          let expected = nlist_get(expected_params, i)
+          for ti in 0..nlist_len(tparams) {
+            let variable = node_f3(nlist_get(tparams, ti))
+            if subst_lookup(subst, variable) == 0 and impl_target_mentions_var(expected, variable) { ready = false } else { 0 }
+          }
+          let actual = typeck_subst_resolve_associated_type(expected, tparams, subst, tt)
+          if actual == 0 or type_is_unknown_or_any(actual) { ready = false } else { 0 }
+        } else { 0 }
+      }
+      if ready {
+        for i in 0..count {
+          let param = nlist_get(params, i)
+          if node_f3(param) == 0 {
+            mem_store64_at(param, 24, typeck_subst_resolve_associated_type(nlist_get(expected_params, i), tparams, subst, tt))
+          } else { 0 }
+        }
+      } else { 0 }
+      ready
+    }
+  }
+}
+
+pub(package) fn generic_infer_argument(pattern: i64, arg: i64, subst: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
+  let actual = synth(arg, env, ft, src, tt)
+  let projected = if ty_is_record(pattern) and ty_tag(actual) == 9 { typeck_named_record_projection(tt, actual) } else { 0 }
+  ty_infer_solve(pattern, if projected != 0 { projected } else { actual }, subst)
+}
+
+-- Value arguments solve first, irrespective of source order. Each ready
+-- callback may unlock another callback or associated bound; each is consumed
+-- once. Remaining standalone lambda defaults keep their existing inference
+-- behavior when no argument can supply an input context.
+pub(package) fn generic_infer_arguments(params: i64, args: i64, count: i64, offset: i64, tparams: i64, subst: i64, env: i64, ft: i64, src: i64, tt: i64) -> i64 {
+  let pending = nlist_new()
+  for i in 0..count {
+    let arg = nlist_get(args, i)
+    let pattern = node_f3(nlist_get(params, i + offset))
+    let deferred = pattern != 0 and node_tag(arg) == 29 and ty_tag(pattern) == 6
+    nlist_add(pending, if deferred { 1 } else { 0 })
+    if not deferred and pattern != 0 { generic_infer_argument(pattern, arg, subst, env, ft, src, tt) } else { 0 }
+  }
+  let mut progress = true
+  while progress {
+    progress = false
+    generic_infer_solve_associated_bounds(tparams, subst, tt)
+    for i in 0..count {
+      if nlist_get(pending, i) == 1 {
+        let pattern = node_f3(nlist_get(params, i + offset))
+        let arg = nlist_get(args, i)
+        if generic_prepare_lambda_inputs(arg, pattern, tparams, subst, tt) {
+          generic_infer_argument(pattern, arg, subst, env, ft, src, tt)
+          nlist_set(pending, i, 0)
+          progress = true
+        } else { 0 }
+      } else { 0 }
+    }
+  }
+  for i in 0..count {
+    if nlist_get(pending, i) == 1 {
+      generic_infer_argument(node_f3(nlist_get(params, i + offset)), nlist_get(args, i), subst, env, ft, src, tt)
+    } else { 0 }
+  }
+  0
+}
+
 -- Argument-driven inference for a bare tag-4 call to a generic callee.
 -- Returns the substituted return type after rewriting the node, or 0
 -- when inference does not apply or does not fully solve.
@@ -5654,15 +5739,7 @@ pub(package) fn synth_call_infer_generic(node: i64, env: i64, ft: i64, src: i64,
       else { if nlist_len(params) != nargs { 0 }
       else {
         let s = subst_new()
-        for i in 0..nargs {
-          let pty = node_f3(nlist_get(params, i))
-          if pty != 0 {
-            let actual_ty = synth(nlist_get(args, i), env, ft, src, tt)
-            let projected = if ty_is_record(pty) and ty_tag(actual_ty) == 9 { typeck_named_record_projection(tt, actual_ty) } else { 0 }
-            let inference_ty = if projected != 0 { projected } else { actual_ty }
-            ty_infer_solve(pty, inference_ty, s)
-          } else { 0 }
-        }
+        generic_infer_arguments(params, args, nargs, 0, tparams, s, env, ft, src, tt)
         generic_infer_solve_associated_bounds(tparams, s, tt)
         -- A conflicting later argument must not erase facts solved by an
         -- earlier one. If every type parameter has a witness, retain that
@@ -5699,15 +5776,7 @@ pub(package) fn synth_qualified_call_infer_generic(node: i64, entry: i64, env: i
   if tparams == 0 or params == 0 or nargs == 0 or nlist_len(params) != nargs { 0 }
   else {
     let s = subst_new()
-    for i in 0..nargs {
-      let pty = node_f3(nlist_get(params, i))
-      if pty != 0 {
-        let actual_ty = synth(nlist_get(args, i), env, ft, src, tt)
-        let projected = if ty_is_record(pty) and ty_tag(actual_ty) == 9 { typeck_named_record_projection(tt, actual_ty) } else { 0 }
-        let inference_ty = if projected != 0 { projected } else { actual_ty }
-        ty_infer_solve(pty, inference_ty, s)
-      } else { 0 }
-    }
+    generic_infer_arguments(params, args, nargs, 0, tparams, s, env, ft, src, tt)
     generic_infer_solve_associated_bounds(tparams, s, tt)
     let targs = generic_infer_solved_targs(tparams, s)
     if targs == 0 { 0 }
@@ -8645,7 +8714,8 @@ pub(package) fn check_lambda_standalone(lambda: i64, env: i64, ft: i64, src: i64
   shape_errors + check_closure_mut_captures(body, params, nparams, env, src) +
     unique_errors +
     checked_errors +
-    check_return_values(body, lambda_env, ft, src, body_ty, tt)
+    check_return_values(body, lambda_env, ft, src, body_ty, tt) +
+    check_sendability_scoped_par_lambda(lambda, env, ft, src, tt)
 }
 
 -- borrow parameters: a successful borrow-parameter check annotates the identifier use with
@@ -8746,7 +8816,13 @@ pub(package) fn check_borrow_call_conflicts(args: i64, nargs: i64, src: i64, pos
 }
 
 pub(package) fn check_arg_against_param_mode_at(arg: i64, param_ty: i64, env: i64, ft: i64, src: i64, tt: i64, pos: i64, allow_direct_continuation_i64: i64, expected_origin: DiagnosticLocation) -[Conformance, Diagnose]> i64 {
-  if param_ty == 0 { 0 }
+  -- A non-callable supertype such as any provides no callback signature, but
+  -- it must not suppress validation of a function value's own body.
+  let callable_context = if param_ty == 0 { false } else { ty_tag(param_ty) == 6 }
+  let standalone_errors = if node_tag(arg) == 29 and not callable_context {
+    check_lambda_standalone(arg, env, ft, src, tt)
+  } else { 0 }
+  standalone_errors + if param_ty == 0 { 0 }
   else { if ty_is_borrow(param_ty) { check_arg_against_borrow_param(arg, param_ty, env, src, pos, expected_origin, tt) }
   else {
     prepare_expr_contextual(arg, param_ty, env, ft, src, tt)
@@ -10842,6 +10918,7 @@ pub(package) fn check_method_call(node: i64, env: i64, ft: i64, src: i64, caller
       } else { 0 } }
     } else { 0 }
     for i in 0..nargs {
+      let arg = nlist_get(args, i)
       if i < expected {
         let param = nlist_get(params, i + has_receiver)
         let raw_param_ty = node_f3(param)
@@ -10850,18 +10927,23 @@ pub(package) fn check_method_call(node: i64, env: i64, ft: i64, src: i64, caller
           subst_add(self_subst, 0 - 1, recv_ty)
           typeck_resolve_bound_associated_type(ty_subst(raw_param_ty, self_subst), tt)
         } else { raw_param_ty }
-        if param_ty != 0 {
-          let method_src = if method_decl == 0 { src } else { module_decl_fact_source(method_decl) }
-          let origin = if method_decl == 0 {
-            typeck_source_location(src, expr_diag_pos(recv), expr_diag_len(recv))
-          } else { typeck_source_location(method_src, node_f1(param), node_f2(param)) }
-          errors = errors + check_arg_against_param_at(nlist_get(args, i), param_ty, env, ft, src, tt, expr_diag_pos(recv), origin)
-        } else { errors = errors }
-      } else { errors = errors }
+        let method_src = if method_decl == 0 { src } else { module_decl_fact_source(method_decl) }
+        let origin = if method_decl == 0 {
+          typeck_source_location(src, expr_diag_pos(recv), expr_diag_len(recv))
+        } else { typeck_source_location(method_src, node_f1(param), node_f2(param)) }
+        errors = errors + check_arg_against_param_at(arg, param_ty, env, ft, src, tt, expr_diag_pos(recv), origin)
+      } else { if node_tag(arg) == 29 {
+        errors = errors + check_lambda_standalone(arg, env, ft, src, tt)
+      } else { 0 } }
     }
     if associated { errors = errors }
     else { errors = errors + check_borrow_call_conflicts_with_receiver(args, nargs, recv, src, expr_diag_pos(recv)) }
-  } else { if type_arg_errors != 0 { errors }
+  } else {
+    for i in 0..nargs {
+      let arg = nlist_get(args, i)
+      if node_tag(arg) == 29 { errors = errors + check_lambda_standalone(arg, env, ft, src, tt) } else { 0 }
+    }
+    if type_arg_errors != 0 { errors }
   else {
     let recv_ty = synth(recv, env, ft, src, tt)
     if type_is_unknown_or_any(recv_ty) { errors = errors }
@@ -12640,14 +12722,7 @@ pub(package) fn infer_method_call_type_args(node: i64, env: i64, ft: i64, src: i
       else {
         let s = method_resolution_call_subst(resolution, method_ref)
         subst_add(s, 0 - 1, receiver_ty)
-        for i in 0..nargs {
-          let pty = node_f3(nlist_get(params, i + receiver_count))
-          if pty != 0 {
-            let actual_ty = synth(nlist_get(args, i), env, ft, src, tt)
-            let projected = if ty_is_record(pty) and ty_tag(actual_ty) == 9 { typeck_named_record_projection(tt, actual_ty) } else { 0 }
-            ty_infer_solve(pty, if projected != 0 { projected } else { actual_ty }, s)
-          } else { 0 }
-        }
+        generic_infer_arguments(params, args, nargs, receiver_count, tparams, s, env, ft, src, tt)
         generic_infer_solve_associated_bounds(tparams, s, tt)
         let type_args = generic_infer_solved_targs(tparams, s)
         if type_args == 0 { 0 }
@@ -16276,7 +16351,7 @@ pub(package) fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i
       }
       errors
     }
-    29 -> check_lambda_standalone(node, env, ft, src, tt) + check_sendability_scoped_par_lambda(node, env, ft, src, tt)
+    29 -> check_lambda_standalone(node, env, ft, src, tt)
     32 -> {
       -- Perform/dot-call: resolve method calls (synth mutates tag 32 → 41)
       -- and explicit indexed conversions (tag 32 → 36), then recurse into
@@ -16370,12 +16445,14 @@ pub(package) fn check_expr(node: i64, env: i64, ft: i64, src: i64, caller_eff: i
       } } }
     }
     41 -> {
-      -- Already-resolved method call: recurse into receiver and args.
+      -- Ordinary arguments publish their facts before call checking; the
+      -- resolved signature supplies lambda context before body checking.
       errors = errors + check_expr(node_f1(node), env, ft, src, caller_eff, tt)
       let ma = node_f3(node)
       let mn = nlist_len(ma)
       for mai in 0..mn {
-        errors = errors + check_expr(nlist_get(ma, mai), env, ft, src, caller_eff, tt)
+        let arg = nlist_get(ma, mai)
+        if node_tag(arg) != 29 { errors = errors + check_expr(arg, env, ft, src, caller_eff, tt) } else { 0 }
       }
       errors = errors + check_method_call(node, env, ft, src, caller_eff, tt)
       errors = errors + check_native_result_abi_ty(src, expr_diag_pos(node), synth_resolved_method_call(node, tt))
