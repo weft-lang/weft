@@ -72,6 +72,14 @@ check_rejects "method_inference_effect_unavailable" "test/negative/method_infere
 check_rejects "method_inference_owned_reuse" "test/negative/method_inference_owned_reuse.weft" 'type error: owned value used more than once' 1
 check_rejects "http_headers_get_requires_usize" "test/negative/http_headers_get_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
 check_rejects "http_headers_len_is_usize" "test/negative/http_headers_len_is_usize.weft" 'type annotation type mismatch: expected `i64`, found `usize`' 1
+check_rejects "num_prefix_requires_usize" "test/negative/num_prefix_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 3
+check_rejects "num_prefix_returns_usize" "test/negative/num_prefix_returns_usize.weft" 'type annotation type mismatch: expected `Result<(i64, i64), NumParseError>`, found `Result<(i64, usize), NumParseError>`' 3
+check_rejects "num_error_requires_usize" "test/negative/num_error_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 5
+check_rejects "num_error_offset_is_usize" "test/negative/num_error_offset_is_usize.weft" 'return value type mismatch: expected `i64`, found `usize`' 1
+check_rejects "json_error_requires_usize" "test/negative/json_error_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
+check_rejects "json_error_offset_is_usize" "test/negative/json_error_offset_is_usize.weft" 'return value type mismatch: expected `i64`, found `usize`' 1
+check_rejects "http_json_error_requires_usize" "test/negative/http_json_error_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
+check_rejects "http_json_error_offset_is_usize" "test/negative/http_json_error_offset_is_usize.weft" 'return value type mismatch: expected `i64`, found `usize`' 1
 check_rejects "http_headers_iterator_use_after_close" "test/negative/http_headers_iterator_use_after_close.weft" 'type error: owned value used more than once' 1
 check_rejects "return_annotated_finite_as_signed" "test/negative/return_annotated_finite_as_signed.weft" 'return value type mismatch: expected `i64`, found `usize`' 1
 check_rejects "return_annotated_union_as_initializer" "test/negative/return_annotated_union_as_initializer.weft" 'return value type mismatch' 1

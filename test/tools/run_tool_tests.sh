@@ -807,6 +807,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_json_pins_public_surface" "$(<"$tmp_out")" "Public API items: 27. Documented: 27."
     assert_contains "doc_stdlib_json_pins_unsigned_index" "$(<"$tmp_out")" "pub fn at(self: Json, index: usize) -> Option<Json>"
     assert_contains "doc_stdlib_json_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len(self: Json) -> Option<usize>"
+    assert_contains "doc_stdlib_json_pins_unsigned_error_position" "$(<"$tmp_out")" "JsonInvalidSyntax(usize)"
   elif [ "$stdlib_doc_name" = "test/property" ]; then
     assert_contains "doc_stdlib_test_property_pins_public_surface" "$(<"$tmp_out")" "Public API items: 109. Documented: 109."
     assert_contains "doc_stdlib_test_property_pins_opaque_generator" "$(<"$tmp_out")" "pub type Gen<T> = opaque"
@@ -955,6 +956,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_http_json_pins_owned_reader" "$(<"$tmp_out")" "pub type HttpJsonReader<S> = opaque"
     assert_contains "doc_stdlib_http_json_pins_bounded_read" "$(<"$tmp_out")" "pub fn read<S>(self: owned HttpJsonReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> HttpJsonReadOutcome<S>"
     assert_contains "doc_stdlib_http_json_pins_semantic_write" "$(<"$tmp_out")" "pub type HttpJsonWriteOutcome<S> {"
+    assert_contains "doc_stdlib_http_json_pins_document_position" "$(<"$tmp_out")" "HttpJsonInvalidDocument(usize)"
   elif [ "$stdlib_doc_name" = "http/client" ]; then
     assert_contains "doc_stdlib_http_client_pins_public_surface" "$(<"$tmp_out")" "Public API items: 46. Documented: 46."
     assert_contains "doc_stdlib_http_client_pins_owned_pool" "$(<"$tmp_out")" "pub type HttpConnectionPool<S> = opaque"
@@ -1030,6 +1032,14 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_num_pins_checked_add" "$(<"$tmp_out")" "pub fn checked_add(self: usize, other: usize) -> Option<usize>"
     assert_contains "doc_stdlib_num_pins_checked_sub" "$(<"$tmp_out")" "pub fn checked_sub(self: usize, other: usize) -> Option<usize>"
     assert_contains "doc_stdlib_num_pins_checked_mul" "$(<"$tmp_out")" "pub fn checked_mul(self: usize, other: usize) -> Option<usize>"
+    assert_contains "doc_stdlib_num_pins_integer_prefix_offsets" "$(<"$tmp_out")" "pub fn parse_i64_prefix(s: str, pos: usize) -> Result<(i64, usize), NumParseError>"
+    assert_contains "doc_stdlib_num_pins_double_prefix_offsets" "$(<"$tmp_out")" "pub fn parse_f64_prefix(source: str, pos: usize) -> Result<(f64, usize), NumParseError>"
+    assert_contains "doc_stdlib_num_pins_single_prefix_offsets" "$(<"$tmp_out")" "pub fn parse_f32_prefix(source: str, pos: usize) -> Result<(f32, usize), NumParseError>"
+    for num_parse_error in Empty Invalid Overflow Underflow Trailing; do
+      assert_contains "doc_stdlib_num_pins_${num_parse_error}_position" "$(<"$tmp_out")" "NumParse${num_parse_error}(usize)"
+    done
+    assert_not_contains "doc_stdlib_num_hides_float_scanner" "$(<"$tmp_out")" "NumFloatScan"
+    assert_not_contains "doc_stdlib_num_hides_offset_conversion" "$(<"$tmp_out")" "num_parse_offset_from_storage"
   elif [ "$stdlib_doc_name" = "string" ]; then
     assert_contains "doc_stdlib_string_pins_public_surface" "$(<"$tmp_out")" "Public API items: 19. Documented: 19."
     assert_contains "doc_stdlib_string_pins_byte_length" "$(<"$tmp_out")" "pub fn len(self: str) -> usize"

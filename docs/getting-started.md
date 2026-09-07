@@ -169,6 +169,30 @@ boundary rescans the text.
 Use `bytes.to_utf8()` or `path.to_utf8()` when crossing from arbitrary bytes to
 text; both preserve a typed failure with the invalid byte offset.
 
+Numeric prefix parsers use the same byte offsets. A successful parse returns
+the value and the first unconsumed offset, ready for the next parser. Errors
+carry a `usize` position; starting at or beyond the end preserves the requested
+position in `NumParseEmpty`.
+
+```weft run
+use stdlib/num as num
+use stdlib/result.{Ok, Err}
+use stdlib/option.{Option}
+use stdlib/string
+
+fn main() -> i64 {
+  let source = "Ω42-1.5"
+  let start = source.find("42").expect("number follows the Unicode prefix")
+  match num.parse_i64_prefix(source, start) {
+    Ok((integer, next)) -> match num.parse_f64_prefix(source, next) {
+      Ok((fraction, end)) -> if integer == 42 and fraction == -1.5 and end == source.len() { 0 } else { 1 }
+      Err(_) -> 2
+    }
+    Err(_) -> 3
+  }
+}
+```
+
 ## Collection methods and traversal
 
 Collection methods infer their type arguments from values and typed callbacks.
