@@ -62,6 +62,9 @@ check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" 'error[
 check_rejects "constructor_callback_argument" "test/negative/constructor_callback_argument.weft" 'error[E1002]: argument type mismatch' 1
 check_rejects "constructor_callback_result" "test/negative/constructor_callback_result.weft" 'error[E1002]: argument type mismatch' 1
 check_rejects "constructor_callback_arity" "test/negative/constructor_callback_arity.weft" 'error[E1002]: argument type mismatch' 1
+check_rejects "http_headers_get_requires_usize" "test/negative/http_headers_get_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
+check_rejects "http_headers_len_is_usize" "test/negative/http_headers_len_is_usize.weft" 'type annotation type mismatch: expected `i64`, found `usize`' 1
+check_rejects "http_headers_iterator_use_after_close" "test/negative/http_headers_iterator_use_after_close.weft" 'type error: owned value used more than once' 1
 check_rejects "return_annotated_finite_as_signed" "test/negative/return_annotated_finite_as_signed.weft" 'return value type mismatch: expected `i64`, found `usize`' 1
 check_rejects "return_annotated_union_as_initializer" "test/negative/return_annotated_union_as_initializer.weft" 'return value type mismatch' 1
 check_rejects "return_shadowing_initializer_type" "test/negative/return_shadowing_initializer_type.weft" 'return value type mismatch: expected `usize`, found `i64`' 1

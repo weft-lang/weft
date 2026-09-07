@@ -918,7 +918,12 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_tls_client_preserves_authority" "$(<"$tmp_out")" "pub fn client(host: UrlHost, trust_roots: Bytes) -[SecureRandom, WallClock]> Result<owned TlsSession, TlsError>"
     assert_contains "doc_stdlib_tls_server_preserves_authority" "$(<"$tmp_out")" "pub fn server(certificate: Bytes, private_key: Bytes) -[SecureRandom]> Result<owned TlsSession, TlsError>"
   elif [ "$stdlib_doc_name" = "http" ]; then
-    assert_contains "doc_stdlib_http_pins_public_surface" "$(<"$tmp_out")" "Public API items: 121. Documented: 121."
+    assert_contains "doc_stdlib_http_pins_public_surface" "$(<"$tmp_out")" "Public API items: 122. Documented: 122."
+    assert_contains "doc_stdlib_http_pins_finite_header_count" "$(<"$tmp_out")" "pub fn len(self: HttpHeaders) -> usize"
+    assert_contains "doc_stdlib_http_pins_empty_headers" "$(<"$tmp_out")" "pub fn is_empty(self: HttpHeaders) -> bool"
+    assert_contains "doc_stdlib_http_pins_finite_header_lookup" "$(<"$tmp_out")" "pub fn get(self: HttpHeaders, index: usize) -> Option<HttpHeader>"
+    assert_contains "doc_stdlib_http_pins_header_iteration" "$(<"$tmp_out")" "impl IntoIterator for HttpHeaders"
+    assert_not_contains "doc_stdlib_http_hides_header_storage" "$(<"$tmp_out")" "HttpHeadersParts"
     assert_contains "doc_stdlib_http_pins_opaque_head" "$(<"$tmp_out")" "pub type HttpRequestHead = opaque"
     assert_contains "doc_stdlib_http_pins_typed_framing" "$(<"$tmp_out")" "pub type HttpBodyFraming {"
     assert_contains "doc_stdlib_http_pins_prefix_parser" "$(<"$tmp_out")" "pub fn parse_request_head(source: [u8], limits: HttpLimits) -> HttpRequestHeadParse"

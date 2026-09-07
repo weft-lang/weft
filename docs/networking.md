@@ -140,6 +140,22 @@ body or upgraded connection. Their transitions return the owner on completion,
 retry, cancellation, and typed failure, so streaming does not hide whole-body
 buffering or resource loss.
 
+Headers preserve wire order and repeated fields. They support the same `for`
+loops and iterator pipelines as other collections. Counts and indices use
+`usize`; `get` returns `None` for an out-of-range position. Filtering preserves
+separate `Set-Cookie` fields:
+
+```weft check
+use stdlib/http.{HttpHeaders, HttpHeader}
+use stdlib/iter as iter
+
+fn cookie_count(headers: HttpHeaders) -> usize {
+  headers
+    |> iter.filter((field: HttpHeader) => field.name().text() == "set-cookie")
+    |> iter.count()
+}
+```
+
 Every layer has explicit limits. HTTP bounds start lines, fields, headers,
 bodies, trailers, and connection reuse; JSON callers choose a whole-document
 bound; SSE defaults to 16 KiB per unfinished line and 1 MiB per event;
