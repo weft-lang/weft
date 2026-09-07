@@ -62,6 +62,14 @@ check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" 'error[
 check_rejects "constructor_callback_argument" "test/negative/constructor_callback_argument.weft" 'error[E1002]: argument type mismatch' 1
 check_rejects "constructor_callback_result" "test/negative/constructor_callback_result.weft" 'error[E1002]: argument type mismatch' 1
 check_rejects "constructor_callback_arity" "test/negative/constructor_callback_arity.weft" 'error[E1002]: argument type mismatch' 1
+check_rejects "method_inference_bound" "test/negative/method_inference_bound.weft" 'error[E1004]: type `str` does not implement `InferenceCheckMarker`' 1
+check_rejects "method_inference_conflict" "test/negative/method_inference_conflict.weft" 'argument type mismatch: expected `i64`, found `str`' 1
+check_rejects "method_inference_partial_explicit" "test/negative/method_inference_partial_explicit.weft" 'type error: wrong number of type arguments' 2
+check_rejects "method_inference_extra_explicit" "test/negative/method_inference_extra_explicit.weft" 'type error: wrong number of type arguments' 1
+check_rejects "method_inference_undetermined" "test/negative/method_inference_undetermined.weft" 'type error: wrong number of type arguments' 1
+check_rejects "method_inference_callback_effect" "test/negative/method_inference_callback_effect.weft" 'argument type mismatch: expected `(i64) -> i64`, found `(i64) -[InferenceCheckRead]> i64`' 1
+check_rejects "method_inference_effect_unavailable" "test/negative/method_inference_effect_unavailable.weft" 'error[E2001]: effect `InferenceCheckRead` is not available in this context' 1
+check_rejects "method_inference_owned_reuse" "test/negative/method_inference_owned_reuse.weft" 'type error: owned value used more than once' 1
 check_rejects "http_headers_get_requires_usize" "test/negative/http_headers_get_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
 check_rejects "http_headers_len_is_usize" "test/negative/http_headers_len_is_usize.weft" 'type annotation type mismatch: expected `i64`, found `usize`' 1
 check_rejects "http_headers_iterator_use_after_close" "test/negative/http_headers_iterator_use_after_close.weft" 'type error: owned value used more than once' 1
