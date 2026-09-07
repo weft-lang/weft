@@ -535,6 +535,9 @@ check_rejects "module_qualified_constructor_private" "test/negative/module_quali
 check_rejects "module_qualified_constructor_argument" "test/negative/module_qualified_constructor_argument.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "module_qualified_pattern_unknown" "test/negative/module_qualified_pattern_unknown.weft" "error[E4002]: unknown module member 'left.Missing'"
 check_rejects "module_qualified_pattern_private" "test/negative/module_qualified_pattern_private.weft" "error[E4004]: module member 'left.Hidden' is not visible"
+check_rejects "nominal_pattern_foreign_owner" "test/negative/nominal_pattern_foreign_owner.weft" "type error: constructor pattern does not match scrutinee"
+check_rejects "nominal_pattern_foreign_arity" "test/negative/nominal_pattern_foreign_arity.weft" "type error: constructor pattern arity mismatch"
+check_rejects "nominal_pattern_foreign_payload" "test/negative/nominal_pattern_foreign_payload.weft" "type error: literal pattern does not match scrutinee"
 check_rejects "module_qualified_pattern_identity_mismatch" "test/negative/module_qualified_pattern_identity_mismatch.weft" "type error: constructor pattern does not match scrutinee"
 check_rejects "module_qualified_type_unknown" "test/negative/module_qualified_type_unknown.weft" "error[E4002]: unknown module member 'left.MissingType'"
 check_rejects "module_qualified_type_private" "test/negative/module_qualified_type_private.weft" "error[E4004]: module member 'left.HiddenChoice' is not visible"
