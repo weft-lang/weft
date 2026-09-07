@@ -13392,7 +13392,11 @@ pub(package) fn pipeline_lower_handler_clause_body_typed(clause: HandlerClause, 
         let transferred_param_value_fact = if returned_param_mask != 0 {
           param_lanes + capture_lanes + pipeline_param_value_index_at(typed_params, returned_param_index) + 1
         } else { 0 }
-        IrHandlerClauseBody(op_hash, param_lanes, captures, has_continuation, completion, pipeline_type_value_lane_cleanup_mask(result_ty), transferred_param_value_fact, pipeline_type_value_lane_count_or_one(resume_ty), pipeline_type_value_lane_count_or_one(result_ty), first_value, bound_blocks)
+        -- Linear results carry their entire cleanup plan across the boundary,
+        -- including managed backing/fields. They require no extra RC stake.
+        let result_mask = if has_continuation == 0 and abortive == 1 and pipeline_linear_cleanup_plan(pipeline_lower_module_tt(module), result_ty) != 0 { 0 }
+          else { pipeline_type_value_lane_cleanup_mask(result_ty) }
+        IrHandlerClauseBody(op_hash, param_lanes, captures, has_continuation, completion, result_mask, transferred_param_value_fact, pipeline_type_value_lane_count_or_one(resume_ty), pipeline_type_value_lane_count_or_one(result_ty), first_value, bound_blocks)
       }
     }
     UnknownHandlerClause(tag) -> IrHandlerClauseBodyInvalid(5)
@@ -14075,12 +14079,18 @@ pub(package) fn pipeline_lower_handle_typed_to_target_blocks(body_expr: Expr, cl
           match hret {
             NoHandleReturn -> {
               let pop_args = pipeline_ir_value_lane_ids(body_value, 0, body_lanes)
-              let pop = ir_block_new_params(pop_block, pop_params, pop_insts, ir_term_jump_args(target_block, pop_args))
+              let normalization = if has_abortive == 1 and pipeline_linear_cleanup_plan(tt, body_ty) == 0 {
+                pipeline_managed_borrow_retain_arg_typed_with_origin(body_expr, body_value, body_ty,
+                  body_value + body_lanes + has_abortive * abort_lanes, src, pipeline_lower_module_fns(module),
+                  pipeline_lower_module_subst(module), tt, ir_managed_stake_origin_arm_normalization())
+              } else { pipeline_lowered_args(ir_value_list_empty(), body_value + body_lanes + has_abortive * abort_lanes, IrInstNil, 1) }
+              let pop = ir_block_new_params(pop_block, pop_params,
+                ir_inst_list_append(pop_insts, pipeline_lowered_args_insts(normalization)), ir_term_jump_args(target_block, pop_args))
               let blocks = ir_block_list_prepend(
                 entry,
                 ir_block_list_append(pipeline_lowered_blocks_blocks(body_blocks), ir_block_list_prepend(pop, abort_tail))
               )
-              pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(body_blocks), body_value + body_lanes + has_abortive * abort_lanes, blocks, 1)
+              pipeline_lowered_blocks(pipeline_lowered_blocks_next_block(body_blocks), pipeline_lowered_args_next_value(normalization), blocks, 1)
             }
             HandleReturnClause(rns, rnl, rb) -> {
               -- Kernel §7.3: transform the completion value. Runs OUTSIDE the
@@ -14090,7 +14100,14 @@ pub(package) fn pipeline_lower_handle_typed_to_target_blocks(body_expr: Expr, cl
               -- separately with the complete transformed result shape.
               let ret_start = pipeline_lowered_blocks_next_block(body_blocks)
               let ret_locals = pipeline_value_env_push_float_typed_node(locals, rns, rnl, body_value, pipeline_type_node_prim_id_or(body_ty, 0), if body_ty == 0 { 0 } else { type_hash_of(body_ty) }, body_ty)
-              let ret_blocks = pipeline_lower_expr_typed_to_target_blocks_reserved(rb, params, ret_locals, module, body_value + body_lanes + has_abortive * abort_lanes, ret_start, ret_start + 1, target_block)
+              let retain_result = if has_abortive == 1 and pipeline_linear_cleanup_plan(tt, handle_result_ty) == 0 {
+                pipeline_managed_arm_needs_retain(pipeline_expr_result_is_borrowed_for_ty_typed(rb,
+                  handle_result_ty, src, pipeline_lower_module_fns(module), pipeline_lower_module_subst(module), tt), handle_result_ty)
+              } else { 0 }
+              let retain_block = if retain_result == 1 { ret_start + 1 } else { target_block }
+              let raw_ret = pipeline_lower_expr_typed_to_target_blocks_reserved(rb, params, ret_locals, module,
+                body_value + body_lanes + has_abortive * abort_lanes, ret_start, ret_start + 1 + retain_result, retain_block)
+              let ret_blocks = pipeline_managed_arm_retain_append(raw_ret, retain_result, handle_result_ty, retain_block, target_block)
               if pipeline_lowered_blocks_is_valid(ret_blocks) == 1 {
                 let pop = ir_block_new_params(pop_block, pop_params, pop_insts, ir_term_jump(ret_start))
                 let blocks = ir_block_list_prepend(
@@ -18272,7 +18289,18 @@ pub(package) fn pipeline_ir_handler_clause_exit_blocks(blocks: IrBlockList, clea
         let drops = if releases_locally { ir_inst_list_append(prefix, ir_inst_list_append(owned_drops, managed)) } else { IrInstNil }
         let exit_insts = match term {
           IrTermHandlerResume(value) -> ir_inst_list_append(drops, pipeline_ir_return_lane_insts(value, resume_ty))
-          IrTermReturn(value) -> ir_inst_list_append(drops, pipeline_ir_return_lane_insts(value, result_ty))
+          IrTermReturn(value) -> {
+            -- An immediate abort walks acquisitions made inside this clause
+            -- as well as the abandoned computation. The returned linear value
+            -- crosses that boundary by transfer, never by an extra RC stake.
+            -- Publish the same typed transfer fact used by effect arguments
+            -- so the unwind consumes only owners that remain in the scope.
+            let result_plan = pipeline_linear_cleanup_plan(tt, result_ty)
+            let transfer = if deferred == 0 and result_plan != 0 {
+              ir_inst_list_prepend(ir_inst_linear_effect_transfer_i64(value, result_plan), IrInstNil)
+            } else { IrInstNil }
+            ir_inst_list_append(drops, ir_inst_list_append(transfer, pipeline_ir_return_lane_insts(value, result_ty)))
+          }
           _ -> IrInstNil
         }
         IrBlockListCons(IrBlock(id, params, ir_inst_list_append(insts, exit_insts), term),
@@ -21703,21 +21731,11 @@ pub(package) fn pipeline_handler_inline_ctx_entry_at(ctx: PipelineHandlerInlineC
   }
 }
 
--- Handler clause and deferred-body functions are emitted out of line.
--- Only enclosing handlers whose operation functions need no lexical
--- captures have the same addressable handler-depth shape there.
+-- Out-of-line clauses and deferred bodies cannot address the caller's SSA
+-- handler-frame homes, even when its clauses capture no values. Their
+-- enclosing effects use the dynamic chain, matching native context setup.
 pub(package) fn pipeline_handler_inline_ctx_out_of_line_safe(ctx: PipelineHandlerInlineCtx) -> PipelineHandlerInlineCtx {
-  match ctx {
-    PipelineHandlerInlineCtxNil -> PipelineHandlerInlineCtxNil
-    PipelineHandlerInlineCtxCons(eff_hash, clauses, nclauses, clause_src, direct, evidence, out_of_line_safe, rest) -> {
-      let safe_rest = pipeline_handler_inline_ctx_out_of_line_safe(rest)
-      if out_of_line_safe == 1 {
-        PipelineHandlerInlineCtxCons(eff_hash, clauses, nclauses, clause_src, direct, evidence, out_of_line_safe, safe_rest)
-      } else {
-        safe_rest
-      }
-    }
-  }
+  PipelineHandlerInlineCtxNil
 }
 
 -- Tail-resumptive clause inlining: a clause of exactly `op(args) -> resume(expr)`
@@ -24293,10 +24311,14 @@ pub(package) fn pipeline_expr_result_is_borrowed_with_ctx_typed(expr: Expr, src:
     Defer(cleanup, body, source_site) -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt)
     Resume(value) -> pipeline_expr_result_is_borrowed_with_ctx_typed(value, src, fns, subst, tt)
     Handle(body, clauses, hret) -> {
-      match hret {
+      -- Abort and deferred completion return owned transport stakes. Their
+      -- normal edge is normalized before merging with those outcomes.
+      if handler_clause_list_has_abortive(clauses) == 1 or
+        pipeline_handler_clause_list_has_continuation_handler_typed(clauses) == 1 { 0 }
+      else { match hret {
         NoHandleReturn -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt)
         HandleReturnClause(rns, rnl, rb) -> pipeline_expr_result_is_borrowed_with_ctx_typed(rb, src, fns, subst, tt)
-      }
+      } }
     }
     WithHandler(config, body, fact, source_site) -> pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt)
     _ -> 0
@@ -24339,10 +24361,14 @@ pub(package) fn pipeline_array_expr_result_is_borrowed_typed(expr: Expr, src: i6
     Defer(cleanup, body, source_site) -> pipeline_array_expr_result_is_borrowed_typed(body, src, fns, subst, tt)
     Resume(value) -> pipeline_array_expr_result_is_borrowed_typed(value, src, fns, subst, tt)
     Handle(body, clauses, hret) -> {
-      match hret {
+      -- Abort and deferred completion return owned transport stakes. Their
+      -- normal edge is normalized before merging with those outcomes.
+      if handler_clause_list_has_abortive(clauses) == 1 or
+        pipeline_handler_clause_list_has_continuation_handler_typed(clauses) == 1 { 0 }
+      else { match hret {
         NoHandleReturn -> pipeline_array_expr_result_is_borrowed_typed(body, src, fns, subst, tt)
         HandleReturnClause(rns, rnl, rb) -> pipeline_array_expr_result_is_borrowed_typed(rb, src, fns, subst, tt)
-      }
+      } }
     }
     WithHandler(config, body, fact, source_site) -> pipeline_array_expr_result_is_borrowed_typed(body, src, fns, subst, tt)
     _ -> 0
@@ -24350,8 +24376,12 @@ pub(package) fn pipeline_array_expr_result_is_borrowed_typed(expr: Expr, src: i6
 }
 
 pub(package) fn pipeline_expr_result_is_borrowed_for_ty_typed(expr: Expr, ty: i64, src: i64, fns: i64, subst: i64, tt: i64) -> i64 {
-  if ty_is_array(ty) { pipeline_array_expr_result_is_borrowed_typed(expr, src, fns, subst, tt) }
-  else { pipeline_expr_result_is_borrowed_with_ctx_typed(expr, src, fns, subst, tt) }
+  -- A checked linear value moves as a whole, including a managed aggregate's
+  -- backing storage. Retaining a named aggregate here creates a second owner
+  -- that its unique resource cleanup can never consume.
+  if pipeline_linear_cleanup_plan(tt, ty) != 0 { 0 }
+  else { if ty_is_array(ty) { pipeline_array_expr_result_is_borrowed_typed(expr, src, fns, subst, tt) }
+  else { pipeline_expr_result_is_borrowed_with_ctx_typed(expr, src, fns, subst, tt) } }
 }
 
 pub(package) fn pipeline_expr_node_result_is_borrowed_with_ctx_typed(expr: i64, src: i64, fns: i64, subst: i64, tt: i64) -> i64 {
@@ -32904,6 +32934,52 @@ pub(package) fn pipeline_ir_abort_cleanup_add_linear_action_fact(facts: i64, val
   } else { pipeline_ir_abort_cleanup_add_structural_action_fact(facts, value, plan) }
 }
 
+-- A transfer's checked layout also describes the values entering its merge.
+-- Carry that plan back along SSA identity edges before acquisition discovery,
+-- so a returned constructor commits its children to one structural owner.
+-- This produces ownership facts; native emission consumes them unchanged.
+pub(package) fn pipeline_ir_abort_cleanup_transfer_actions_insts(insts: IrInstList, blocks: IrBlockList, value: i64, plan: i64, actions: i64, visited: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      match inst {
+        IrResumeI64(dst, source) -> if dst == value {
+          pipeline_ir_abort_cleanup_transfer_actions(blocks, source, plan, actions, visited)
+        } else { 0 }
+        _ -> 0
+      }
+      pipeline_ir_abort_cleanup_transfer_actions_insts(rest, blocks, value, plan, actions, visited)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_transfer_actions_blocks(current: IrBlockList, blocks: IrBlockList, value: i64, plan: i64, actions: i64, visited: i64, location: i64) -> i64 {
+  match current {
+    IrBlockListNil -> 0
+    IrBlockListCons(IrBlock(id, params, insts, term), rest) -> {
+      pipeline_ir_abort_cleanup_transfer_actions_insts(insts, blocks, value, plan, actions, visited)
+      match term {
+        IrTermJump(target, args) -> if location != 0 and target == node_f1(location) {
+          pipeline_ir_abort_cleanup_transfer_actions(blocks,
+            pipeline_ir_value_list_get_or(args, node_f2(location), 0 - 1), plan, actions, visited)
+        } else { 0 }
+        _ -> 0
+      }
+      pipeline_ir_abort_cleanup_transfer_actions_blocks(rest, blocks, value, plan, actions, visited, location)
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_abort_cleanup_transfer_actions(blocks: IrBlockList, value: i64, plan: i64, actions: i64, visited: i64) -> i64 {
+  if value < 0 or plan == 0 or pipeline_hash_nlist_contains(visited, value) == 1 { 0 }
+  else {
+    nlist_add(visited, value)
+    pipeline_ir_abort_cleanup_add_linear_action_fact(actions, value, plan)
+    pipeline_ir_abort_cleanup_transfer_actions_blocks(blocks, blocks, value, plan, actions, visited,
+      pipeline_ir_abort_cleanup_block_param_location(blocks, value))
+  }
+}
+
 pub(package) fn pipeline_ir_abort_cleanup_collect_inst_list(insts: IrInstList, all_blocks: IrBlockList, facts: i64, owners: i64) -> i64 {
   match insts {
     IrInstNil -> 0
@@ -32931,6 +33007,9 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_inst_list(insts: IrInstList, a
           pipeline_ir_abort_cleanup_add_action_fact(facts, value, pipeline_managed_release_hash_for_kind(cleanup_kind), pipeline_ir_abort_cleanup_direct_kind())
         }
         IrOwnedDropI64(value, type_hash) -> pipeline_ir_abort_cleanup_add_action_fact(facts, value, type_hash, pipeline_ir_abort_cleanup_owned_kind())
+        IrStructuralSlotI64(value, slot, plan, mode) -> if mode == 3 {
+          pipeline_ir_abort_cleanup_transfer_actions(all_blocks, value, plan, facts, nlist_new())
+        } else { 0 }
         IrStructuralDropI64(value, plan) -> pipeline_ir_abort_cleanup_add_linear_action_fact(facts, value, plan)
         IrStructuralSplitI64(value, parent_plan, residual_plan, release_backing) -> pipeline_ir_abort_cleanup_add_linear_action_fact(facts, value, parent_plan)
         IrTryLinearI64(dst, value, effect_key, parent_plan, ok_plan, error_plan) -> pipeline_ir_abort_cleanup_add_linear_action_fact(facts, value, parent_plan)
@@ -33144,7 +33223,14 @@ pub(package) fn pipeline_ir_abort_cleanup_call_result_lane_release_hash(callee_h
 pub(package) fn pipeline_ir_abort_cleanup_generic_ret_type(callee_hash: i64, type_args: TypeExprList, fns: i64) -> i64 {
   let pair = pipeline_fns_lookup_callable_pair_by_hash(fns, callee_hash)
   if pair == 0 { 0 }
-  else { cg_generic_subst_ret(node_f1(pair), type_expr_list_to_nodes(type_args)) }
+  else {
+    let fn_wrap = node_f1(pair)
+    let subst = cg_build_subst(fn_tparams(fn_wrap), type_expr_list_to_nodes(type_args))
+    -- Cleanup must use the same concrete result as typed call lowering.
+    -- Plain substitution leaves associated projections in generic Drop
+    -- arguments and would give a call and its binding different owners.
+    pipeline_function_return_type_with_subst(fn_wrap, subst, pipeline_fns_context_ttable(fns))
+  }
 }
 
 pub(package) fn pipeline_ir_abort_cleanup_inst_list_has_retain_for_value(insts: IrInstList, value: i64, release: i64) -> i64 {
@@ -33310,7 +33396,10 @@ pub(package) fn pipeline_ir_abort_cleanup_collect_acquisition_inst(inst: IrInst,
       pipeline_structural_drop_plan_storage_mode(structural_plan) == 2 and typeck_linear_layout_plan_words(structural_plan) > 1 { 0 }
     else { pipeline_ir_abort_cleanup_add_acquisition_fact(facts, site, site, structural_action, pipeline_ir_abort_cleanup_structural_kind()) }
   } else { if owned != 0 {
-    if (pipeline_ir_abort_cleanup_blocks_have_owned_bind(all_blocks, site, node_f2(owned)) == 0 or
+    -- An identity forwards the predecessor's linear obligation. Its checked
+    -- transfer action describes that owner without acquiring another one.
+    let acquires = match inst { IrResumeI64(dst, source) -> 0 _ -> 1 }
+    if acquires == 1 and (pipeline_ir_abort_cleanup_blocks_have_owned_bind(all_blocks, site, node_f2(owned)) == 0 or
       pipeline_ir_abort_cleanup_blocks_rebind_structural_slot(all_blocks, site) == 1) and
       pipeline_ir_abort_cleanup_blocks_have_linear_slot_alias_value(all_blocks, site) == 0 {
       pipeline_ir_abort_cleanup_add_acquisition_fact(facts, site, site, node_f2(owned), pipeline_ir_abort_cleanup_owned_kind())
@@ -36139,6 +36228,10 @@ pub(package) fn pipeline_ir_native_emit_hclause_body_ir(body: IrHandlerClauseBod
       if has_continuation == 1 {
         pipeline_ir_native_emit_hclause_continuation_lowered(code, fm, nparams, captures, continuation_token_value, continuation_segment_value, has_continuation)
         pipeline_ir_native_emit_hclause_continuation_closure(code, fm, continuation_token_value, continuation_closure_value, continuation_env_value, has_continuation, resume_lanes, result_lanes, pinned)
+        -- The continuation captures the suspended prompt before the clause
+        -- masks it. Clause effects run in the caller context; resuming k
+        -- reinstalls the captured context only while its fiber runs.
+        pipeline_ir_native_emit_deferred_pop_runtime_state(code)
       } else { 0 }
       let temp_base = body_max_next + 8
       let abort_adr_patches = nlist_new()
@@ -36733,6 +36826,22 @@ pub(package) fn pipeline_ir_native_prepare_handle(code: i64, src: i64, fm: i64, 
   }
 }
 
+-- Every aborting clause has the checked handle result width. Keep the maximum
+-- explicit here so frame storage follows those facts even for mixed clauses.
+pub(package) fn pipeline_ir_handler_abort_result_lanes(clauses: IrHandlerClauseBodyList) -> i64 {
+  match clauses {
+    IrHandlerClauseBodyNil -> 0
+    IrHandlerClauseBodyCons(body, rest) -> {
+      let lanes = match body {
+        IrHandlerClauseBody(op, params, captures, deferred, completion, cleanup, transfer, resume_lanes, result_lanes, first_value, blocks) ->
+          if handler_completion_may_abort(completion) { result_lanes } else { 0 }
+        IrHandlerClauseBodyInvalid(reason) -> 0
+      }
+      pipeline_ir_max_i64(lanes, pipeline_ir_handler_abort_result_lanes(rest))
+    }
+  }
+}
+
 pub(package) fn pipeline_ir_native_emit_prepared_handle(code: i64, fm: i64, clauses: IrHandlerClauseBodyList, abort_block: i64, emit_ctx: PipelineNativeEmitCtx, prepared: PipelineNativeHandlerCtx) -> PipelineNativeHandlerCtx {
   let pinned = pipeline_ir_native_emit_ctx_pinned(emit_ctx)
   match prepared {
@@ -36741,7 +36850,7 @@ pub(package) fn pipeline_ir_native_emit_prepared_handle(code: i64, fm: i64, clau
       cg_bump_alloc_imm(code, fm, 16, nclauses * handler_ops_entry_size())
       pipeline_ir_native_store_reg(code, pinned, ops_ctr, 16)
       pipeline_ir_native_hfill_ops(clauses, nclauses, clause_infos, code, fm, ops_ctr, pinned)
-      let adr_pos = cg_hbuild_frame_maybe_abort(code, fm, eff_hash, nclauses, ops_ctr, if abort_block >= 0 { 1 } else { 0 })
+      let adr_pos = cg_hbuild_frame_with_abort_result_lanes(code, fm, eff_hash, nclauses, ops_ctr, if abort_block >= 0 { 1 } else { 0 }, pipeline_ir_handler_abort_result_lanes(clauses))
       if adr_pos > 0 {
         nlist_add(pipeline_ir_native_emit_ctx_adr_patches(emit_ctx), node_new(0, adr_pos, abort_block, 0, 0))
       } else { 0 }
@@ -39297,9 +39406,7 @@ pub(package) fn pipeline_structural_drop_glue_hash(plan: i64) -> i64 {
 }
 
 pub(package) fn pipeline_structural_drop_plan_value_words(plan: i64) -> i64 {
-  let kind = typeck_linear_layout_plan_kind(plan)
-  if kind == 4 or kind == 5 { 1 }
-  else { typeck_linear_layout_plan_words(plan) }
+  typeck_linear_layout_plan_value_words(plan)
 }
 
 -- Native root storage: 1 one scalar resource word, 2 flattened SSA words,
