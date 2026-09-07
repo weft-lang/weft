@@ -169,6 +169,35 @@ boundary rescans the text.
 Use `bytes.to_utf8()` or `path.to_utf8()` when crossing from arbitrary bytes to
 text; both preserve a typed failure with the invalid byte offset.
 
+## Collection methods and traversal
+
+Collection methods infer their type arguments from values and typed callbacks.
+For example, a map fold can build another map without repeating the accumulator
+type at the call. Use the `iter` namespace for lazy transformation pipelines:
+
+```weft run
+use stdlib/map as map
+use stdlib/map.{Map}
+use stdlib/iter as iter
+
+fn main() -> i64 {
+  let flags = map.new<i64, bool>().insert(7, true).insert(11, false)
+  let enabled = flags.fold(map.new<i64, bool>(),
+    (result: Map<i64, bool>, key: i64, value: bool) => {
+      if value { result.insert(key, value) } else { result }
+    })
+  let count = flags.keys()
+    |> iter.filter((key: i64) => key > 0)
+    |> iter.count()
+  if enabled.len() == 1 and enabled.contains_key(7) and count == 2 { 0 } else { 1 }
+}
+```
+
+Map iteration and folding use unspecified hash-trie order. A fold's callback
+is pure; iterator consumers that accept effectful callbacks declare those
+effects. Each lazy pipeline owns its iterator state and releases it when
+traversal finishes or exits early.
+
 ## Packages and locked sources
 
 Package identity is content-locked and module imports are qualified. With an
