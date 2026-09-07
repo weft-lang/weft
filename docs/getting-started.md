@@ -359,15 +359,15 @@ weft doc deps/math/lib.weft
 The same diagnostic catalogue is available as structured library data. Each
 entry keeps its code, class, summary and teaching explanation together.
 Append positions and the catalogue length use `usize`; a position outside
-that catalogue returns `None`.
+that catalogue returns `None`. The known entry type supplies the callback
+parameter type, and its field access determines the mapped result type.
 
 ```weft check
 use stdlib/diagnostic/registry as registry
-use stdlib/diagnostic/registry.{DiagnosticRegistryEntry}
 use stdlib/option.{Option}
 
 fn teaching_text(index: usize) -> Option<str> {
-  registry.get(index).map((entry: DiagnosticRegistryEntry) => entry.explanation)
+  registry.get(index).map(entry => entry.explanation)
 }
 ```
 
