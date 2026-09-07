@@ -356,6 +356,22 @@ weft fmt --write app.weft
 weft doc deps/math/lib.weft
 ```
 
+The same diagnostic catalogue is available as structured library data. Each
+entry keeps its code, class, summary and teaching explanation together.
+Append positions and the catalogue length use `usize`; a position outside
+that catalogue returns `None`.
+
+```weft check
+use stdlib/diagnostic/registry as registry
+use stdlib/diagnostic/registry.{DiagnosticRegistryEntry}
+use stdlib/option.{Option}
+
+fn teaching_text(index: usize) -> Option<str> {
+  registry.get(index).map((entry: DiagnosticRegistryEntry) => entry.explanation)
+}
+```
+
+
 Diagnostics have stable append-only codes, source provenance, related
 locations, and actionable help. `--color auto|always|never` is a process-wide
 presentation option. `weft doc` renders checked signatures and reports the

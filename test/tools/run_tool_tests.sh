@@ -1017,6 +1017,14 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_sse_stream_pins_public_surface" "$(<"$tmp_out")" "Public API items: 25. Documented: 25."
     assert_contains "doc_stdlib_sse_stream_pins_owned_reader" "$(<"$tmp_out")" "pub type SseReader<S> = opaque"
     assert_contains "doc_stdlib_sse_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn next<S>(self: owned SseReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseReadOutcome<S>"
+  elif [ "$stdlib_doc_name" = "diagnostic/registry" ]; then
+    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 45. Documented: 45."
+    assert_contains "doc_stdlib_diagnostic_registry_length" "$(<"$tmp_out")" "pub fn len() -> usize"
+    assert_contains "doc_stdlib_diagnostic_registry_lookup" "$(<"$tmp_out")" "pub fn get(index: usize) -> Option<DiagnosticRegistryEntry>"
+    assert_contains "doc_stdlib_diagnostic_registry_code" "$(<"$tmp_out")" "code: DiagnosticCode"
+    assert_contains "doc_stdlib_diagnostic_registry_class" "$(<"$tmp_out")" "class: DiagnosticClass"
+    assert_contains "doc_stdlib_diagnostic_registry_summary" "$(<"$tmp_out")" "summary: str"
+    assert_contains "doc_stdlib_diagnostic_registry_explanation" "$(<"$tmp_out")" "explanation: str"
   elif [ "$stdlib_doc_name" = "websocket" ]; then
     assert_contains "doc_stdlib_websocket_pins_public_surface" "$(<"$tmp_out")" "Public API items: 124. Documented: 124."
     assert_contains "doc_stdlib_websocket_pins_typed_handshake" "$(<"$tmp_out")" "pub fn server_upgrade(request: HttpRequestHead) -> Result<HttpHeaders, WebSocketHandshakeError>"

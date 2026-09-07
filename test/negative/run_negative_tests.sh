@@ -1031,6 +1031,9 @@ check_rejects "diagnostic_constructor_wrong_location" "test/negative/diagnostic_
 check_rejects "semantic_render_functions_retired" "test/negative/semantic_render_functions_retired.weft" "unknown module member" 3
 check_rejects "diagnostic_value_accessors_retired" "test/negative/diagnostic_value_accessors_retired.weft" "unknown module member" 20
 check_rejects "diagnostic_helper_mirrors_retired" "test/negative/diagnostic_helper_mirrors_retired.weft" "unknown module member" 6
+check_rejects "diagnostic_registry_index_requires_usize" "test/negative/diagnostic_registry_index_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
+check_rejects "diagnostic_registry_length_is_usize" "test/negative/diagnostic_registry_length_is_usize.weft" 'return value type mismatch: expected `i64`, found `usize`' 1
+check_rejects "diagnostic_registry_sentinel_lookups_removed" "test/negative/diagnostic_registry_sentinel_lookups_removed.weft" 'error[E4002]: unknown module member' 4
 check_rejects "diagnostic_registry_prefixes_retired" "test/negative/diagnostic_registry_prefixes_retired.weft" "unknown module member" 36
 check_rejects "tuple_expr_arg_mismatch" "test/negative/tuple_expr_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `(i64, str)`, found `(i64, i64)`'
 check_rejects "tuple_expr_singleton_requires_comma" "test/negative/tuple_expr_singleton_requires_comma.weft" 'error[E1002]: argument type mismatch: expected `(i64,)`, found `i64`'
