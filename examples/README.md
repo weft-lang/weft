@@ -8,7 +8,7 @@ Start with programs that show the language rather than its benchmark harnesses:
   that specializes to a scalar loop, an ownership-safe short-circuit search,
   and zero-copy scoped windows whose callback effects remain explicit.
 - [`error_pipeline.weft`](error_pipeline.weft) — typed error variants,
-  `Fail<E>`, `?`, and recovery chosen by a handler.
+  `Fail<E>`, and recovery chosen by a handler.
 - [`structured_tasks.weft`](structured_tasks.weft) — effectful scoped tasks,
   consuming `join`, and capacity-one channel backpressure under a deterministic
   scheduler.
@@ -39,3 +39,9 @@ syscalls and pointer-shaped runtime implementation details do not belong here.
 `bash run_tests.sh` checks every source example and executes each program,
 verifying its exit status and output. The HTTPS module is also exercised by
 the linked web-stream product with local certificates and platform handlers.
+
+Bracket literals such as `[5, 3, 8]` create fixed arrays. `quicksort.weft`
+constructs a persistent `List` with `list.from_slice(input[..])`; the borrowed
+view preserves the input order, and the resulting list owns its values.
+`vector_algorithms.weft` uses the corresponding explicit array-view conversion
+into mutable contiguous storage.
