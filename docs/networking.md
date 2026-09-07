@@ -169,6 +169,15 @@ budget, including zero, so constructing it is infallible. Pool construction
 still checks its supported capacity, and JSON readers reject a zero bound
 while returning the original body owner.
 
+WebSocket frame and message limits, payload counts, remaining bytes, and byte
+positions also use `usize`. A frame limit must be positive, and the message
+limit must be at least as large. The wire protocol independently restricts a
+payload length to 63 bits: `WebSocketInvalidLength` reports the complete
+unsigned field when its high bit is set. Text validation preserves the exact
+message offset through transport fragments, continuation frames, and
+interleaved control frames. A truncated scalar reports its lead-byte offset;
+a malformed continuation reports the offending byte.
+
 A valid Content-Length above a configured body budget produces
 `HttpBodyTooLarge`; a decimal value outside `usize` produces
 `HttpInvalidContentLength`. Large declared lengths remain counts throughout
