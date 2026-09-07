@@ -377,6 +377,11 @@ Diagnostic values and their methods are available together from
 when a tool needs the range. Related locations, text edits and diagnostic fields
 use `len() -> usize`.
 
+Codes have two explicit alternatives: `DiagnosticCodeAssigned(text)` and
+`DiagnosticCodeUnassigned`. Match them to read assigned text. Their `Eq`
+conformance compares the alternative and exact text, so an unassigned code
+remains different from an assigned empty string.
+
 ```weft check
 use stdlib/diagnostic.{DiagnosticLocation, DiagnosticLocationNone, DiagnosticSourceRange}
 use stdlib/option.{None, Option, Some}

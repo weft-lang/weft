@@ -1043,6 +1043,7 @@ check_rejects "structural_complement_rejects_field" "test/negative/structural_co
 check_rejects "diagnostic_report_wrong_type" "test/negative/diagnostic_report_wrong_type.weft" 'error[E1002]: argument type mismatch: expected `Diagnostic`, found `str`'
 check_rejects "diagnostic_constructor_wrong_location" "test/negative/diagnostic_constructor_wrong_location.weft" 'error[E1002]: argument type mismatch: expected `DiagnosticLocation`, found `i64`'
 check_rejects "semantic_render_functions_retired" "test/negative/semantic_render_functions_retired.weft" "unknown module member" 3
+check_rejects "diagnostic_code_sentinel_methods" "test/negative/diagnostic_code_sentinel_methods.weft" "type error: unknown method"
 check_rejects "diagnostic_value_accessors_retired" "test/negative/diagnostic_value_accessors_retired.weft" "unknown module member" 20
 check_rejects "diagnostic_helper_mirrors_retired" "test/negative/diagnostic_helper_mirrors_retired.weft" "unknown module member" 6
 check_rejects "diagnostic_registry_index_requires_usize" "test/negative/diagnostic_registry_index_requires_usize.weft" 'argument type mismatch: expected `usize`, found `i64`' 1

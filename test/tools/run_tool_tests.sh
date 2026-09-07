@@ -1018,7 +1018,8 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_sse_stream_pins_owned_reader" "$(<"$tmp_out")" "pub type SseReader<S> = opaque"
     assert_contains "doc_stdlib_sse_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn next<S>(self: owned SseReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseReadOutcome<S>"
   elif [ "$stdlib_doc_name" = "diagnostic" ]; then
-    assert_contains "doc_stdlib_diagnostic_public_facade" "$(<"$tmp_out")" "Public API items: 81. Documented: 81."
+    assert_contains "doc_stdlib_diagnostic_public_facade" "$(<"$tmp_out")" "Public API items: 79. Documented: 79."
+    assert_contains "doc_stdlib_diagnostic_code_equality" "$(<"$tmp_out")" "impl Eq for DiagnosticCode"
     assert_contains "doc_stdlib_diagnostic_finite_related_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticRelatedLocationList) -> usize"
     assert_contains "doc_stdlib_diagnostic_finite_edit_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticTextEditList) -> usize"
     assert_contains "doc_stdlib_diagnostic_finite_field_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticFieldList) -> usize"
@@ -5969,6 +5970,8 @@ assert_contains "test_named_failures_reports_last_actual" "$test_named_failures_
 assert_not_contains "test_named_failures_omits_passing_name" "$test_named_failures_err" "test failure: passing middle"
 
 assert_test_failure_contains "test_assertion_failure_reports_diagnostic" 'test "fail_eq_diag" { Test.assert_eq(1, 2) }' 1 "test assertion failed: assert_eq"
+assert_test_failure_contains "test_structured_report_preserves_unassigned" 'use stdlib/diagnostic/schema.{*} test "structured" { Test.report(Diagnostic(DiagnosticSeverityError, DiagnosticClassTest, DiagnosticCodeUnassigned, "structured failure", DiagnosticLocationNone, DiagnosticRelatedLocationNil, DiagnosticFieldNil)) }' 1 "test diagnostic: structured failure"
+assert_test_failure_contains "test_structured_report_preserves_empty_assigned" 'use stdlib/diagnostic/schema.{*} test "structured" { Test.report(Diagnostic(DiagnosticSeverityError, DiagnosticClassTest, DiagnosticCodeAssigned(""), "structured failure", DiagnosticLocationNone, DiagnosticRelatedLocationNil, DiagnosticFieldNil)) }' 1 "test diagnostic []: structured failure"
 assert_test_failure_contains "test_structured_report_preserves_code" 'use stdlib/diagnostic/schema.{*} test "structured" { Test.report(Diagnostic(DiagnosticSeverityError, DiagnosticClassTest, DiagnosticCodeAssigned("E9000"), "structured failure", DiagnosticLocationNone, DiagnosticRelatedLocationNil, DiagnosticFieldCons(DiagnosticFieldU64("seed", 18446744073709551615), DiagnosticFieldNil))) }' 1 "test diagnostic [E9000]: structured failure"
 assert_test_failure_contains "test_structured_report_preserves_unsigned_fields" 'use stdlib/diagnostic/schema.{*} test "structured" { Test.report(Diagnostic(DiagnosticSeverityError, DiagnosticClassTest, DiagnosticCodeAssigned("E9000"), "structured failure", DiagnosticLocationNone, DiagnosticRelatedLocationNil, DiagnosticFieldCons(DiagnosticFieldU64("seed", 18446744073709551615), DiagnosticFieldNil))) }' 1 "  seed: 18446744073709551615"
 printf '%s\n' 'use stdlib/random as random use stdlib/test/property as prop test "falsified" { prop.check(prop.smoke(random.seed(42)), prop.constant<i64>(42), value => false) }' > "$tmp_src"
