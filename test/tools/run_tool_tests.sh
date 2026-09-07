@@ -5710,13 +5710,21 @@ assert_equals "test_jobs_rejects_zero" "$test_jobs_exit" "1"
 assert_contains "test_jobs_reports_valid_range" "$(<"$tmp_err")" "test: --jobs must be an integer from 1 to 64"
 
 if [ "$WEFT_TEST_PLATFORM" = Darwin ]; then
-  run_weft_compile_guarded "$WEFT" compile tools/test_runner.weft > "$tmp_tool_obj" 2>"$tmp_err"
+  if ! run_weft_compile_guarded "$WEFT" compile tools/test_runner.weft > "$tmp_tool_obj" 2>"$tmp_err"; then
+    echo "  fail test_runner_capability_tool_builds"
+    cat "$tmp_err"
+    exit 1
+  fi
   /usr/bin/ld -o "$tmp_tool_bin" "$tmp_tool_obj" -lSystem \
     -syslibroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
     -e _main -arch arm64 -platform_version macos 11.0 15.0 2>/dev/null
   codesign -s - "$tmp_tool_bin"
 else
-  run_weft_compile_guarded "$WEFT" build tools/test_runner.weft -o "$tmp_tool_bin" > "$tmp_out" 2>"$tmp_err"
+  if ! run_weft_compile_guarded "$WEFT" build tools/test_runner.weft -o "$tmp_tool_bin" > "$tmp_out" 2>"$tmp_err"; then
+    echo "  fail test_runner_capability_tool_builds"
+    cat "$tmp_err"
+    exit 1
+  fi
 fi
 echo "  ok test_runner_capability_tool_builds"
 
@@ -5766,6 +5774,42 @@ test_tool_protocol_exit=$?
 set -e
 assert_equals "test_runner_capability_tool_rejects_missing_result" "$test_tool_protocol_exit" "1"
 assert_contains "test_runner_capability_tool_reports_protocol_failure" "$(<"$tmp_err")" "invalid test-result protocol"
+
+assert_runner_protocol() {
+  local name="$1" payload="$2" compiler_status="$3" expected_status="$4" expected_message="$5"
+  # These fixed protocol fixtures contain no shell quotes. Preserve their exact
+  # final byte so a missing newline exercises the parser's end boundary.
+  printf "#!/bin/sh\nprintf '%%s' '%s' >&2\nexit %s\n" "$payload" "$compiler_status" > "$tmp_fake_weft"
+  chmod +x "$tmp_fake_weft"
+  set +e
+  run_binary_guarded "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_dir/a_pass.weft" > "$tmp_out" 2>"$tmp_err"
+  local actual_status=$?
+  set -e
+  assert_equals "test_runner_protocol_${name}_status" "$actual_status" "$expected_status"
+  assert_contains "test_runner_protocol_${name}_message" "$(<"$tmp_err")" "$expected_message"
+}
+
+assert_runner_protocol empty_counts $'WEFT_TEST_RESULT 1 0 0 0\n' 0 0 "1 passed, 0 failed"
+assert_runner_protocol maximum_count $'WEFT_TEST_RESULT 1 9223372036854775807 0 9223372036854775807\n' 0 0 "1 passed, 0 failed"
+assert_runner_protocol unicode_prefix $'Ω診断\nWEFT_TEST_RESULT 1 1 0 1\n' 0 0 "1 passed, 0 failed"
+assert_runner_protocol final_result_wins $'WEFT_TEST_RESULT 1 0 1 1\nΩ\nWEFT_TEST_RESULT 1 1 0 1\n' 0 0 "1 passed, 0 failed"
+assert_runner_protocol final_invalid_wins $'WEFT_TEST_RESULT 1 1 0 1\nWEFT_TEST_RESULT 1 ' 0 1 "invalid test-result protocol"
+assert_runner_protocol truncated_passed 'WEFT_TEST_RESULT 1 1' 0 1 "invalid test-result protocol"
+assert_runner_protocol truncated_failed 'WEFT_TEST_RESULT 1 1 0' 0 1 "invalid test-result protocol"
+assert_runner_protocol truncated_total 'WEFT_TEST_RESULT 1 1 0 1' 0 1 "invalid test-result protocol"
+assert_runner_protocol invalid_passed $'WEFT_TEST_RESULT 1 x 0 1\n' 0 1 "invalid test-result protocol"
+assert_runner_protocol invalid_failed $'WEFT_TEST_RESULT 1 1 x 1\n' 0 1 "invalid test-result protocol"
+assert_runner_protocol invalid_total $'WEFT_TEST_RESULT 1 1 0 x\n' 0 1 "invalid test-result protocol"
+assert_runner_protocol wrong_first_separator $'WEFT_TEST_RESULT 1 1\t0 1\n' 0 1 "invalid test-result protocol"
+assert_runner_protocol wrong_second_separator $'WEFT_TEST_RESULT 1 1 0Ω1\n' 0 1 "invalid test-result protocol"
+assert_runner_protocol wrong_final_separator $'WEFT_TEST_RESULT 1 1 0 1\r\n' 0 1 "invalid test-result protocol"
+assert_runner_protocol negative_passed $'WEFT_TEST_RESULT 1 -1 2 1\n' 0 1 "invalid test-result protocol"
+assert_runner_protocol negative_failed $'WEFT_TEST_RESULT 1 2 -1 1\n' 0 1 "invalid test-result protocol"
+assert_runner_protocol negative_total $'WEFT_TEST_RESULT 1 0 0 -1\n' 0 1 "invalid test-result protocol"
+assert_runner_protocol inconsistent_counts $'WEFT_TEST_RESULT 1 1 1 1\n' 0 1 "invalid test-result protocol"
+assert_runner_protocol overflowing_sum $'WEFT_TEST_RESULT 1 9223372036854775807 9223372036854775807 9223372036854775807\n' 0 1 "invalid test-result protocol"
+assert_runner_protocol overflowing_number $'WEFT_TEST_RESULT 1 9223372036854775808 0 9223372036854775808\n' 0 1 "invalid test-result protocol"
+assert_runner_protocol mismatched_exit $'WEFT_TEST_RESULT 1 1 0 1\n' 1 1 "invalid test-result protocol"
 
 printf 'test "raw" { let p = __bump_alloc(8) Test.assert_eq(p, p) }\n' > "$tmp_src"
 test_path_raw_out=$(run_weft_compile_guarded "$WEFT" test "$tmp_src" > "$tmp_bin" 2>"$tmp_err" || true; cat "$tmp_err")
