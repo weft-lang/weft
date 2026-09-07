@@ -177,26 +177,27 @@ fn open_and_close(path: Path) -[IO, Fail<IoError>]> Result<nil, IoError> {
 
 Small algorithm kernels have sibling Weft, Go, and Rust implementations with
 the same algorithms, data sizes, and checked results. The Weft programs use
-public collection APIs, including checked slices and optional lookups.
+ordinary language features and public collection APIs, including checked
+slices and optional lookups. All three n-body implementations use body records.
 Minimum elapsed time from 21 runs after two warmups, Apple M4 Max,
-2026-09-07, benchmark sources `42f915db` and compiler `c9e466a4`:
+2026-09-07, benchmark sources `7e2dfc81` and compiler `54ffeabc`:
 
 | Workload | Weft | Go | Rust |
 |---|---:|---:|---:|
-| vector_sort | 3.12 ms | 2.07 ms | 1.77 ms |
-| graph_reach | 8.18 ms | 2.81 ms | 2.38 ms |
-| nbody | 5.25 ms | 3.26 ms | 3.40 ms |
-| sieve | 21.74 ms | 8.92 ms | 5.55 ms |
-| mandelbrot | 16.57 ms | 8.80 ms | 9.33 ms |
-| sorted_lookup | 32.96 ms | 17.36 ms | 7.58 ms |
-| iterator_pipeline_direct | 1.52 ms | 2.08 ms | 1.86 ms |
-| iterator_pipeline | 1.70 ms | 2.12 ms | 1.75 ms |
+| vector_sort | 3.10 ms | 2.05 ms | 1.78 ms |
+| graph_reach | 8.26 ms | 2.81 ms | 2.25 ms |
+| nbody | 15.08 ms | 3.54 ms | 3.22 ms |
+| sieve | 21.59 ms | 9.38 ms | 5.66 ms |
+| mandelbrot | 16.89 ms | 9.22 ms | 9.43 ms |
+| sorted_lookup | 32.80 ms | 17.71 ms | 7.80 ms |
+| iterator_pipeline_direct | 1.54 ms | 2.16 ms | 2.03 ms |
+| iterator_pipeline | 1.78 ms | 2.15 ms | 1.72 ms |
 
 Rust uses `-C opt-level=3 -C codegen-units=1 -C target-cpu=native`; Go uses
 its default build settings. These are small, process-level measurements;
 startup noise matters especially for the shortest workloads.
 
-Self-compilation at this checkpoint: **29.13 seconds** (median).
+Self-compilation at this checkpoint: **30.63 seconds** (median).
 
 Reproduce the table with
 `BENCH_COMPARE_RUNS=21 BENCH_COMPARE_WARMUPS=2 bash bench_compare.sh`.
