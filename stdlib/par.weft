@@ -105,6 +105,7 @@ pub (package) fn par_map_task_slots_take<T>(slots: i64, index: usize) -> unique 
 pub fn map<T: Sendable, U: Sendable>(_ items: [T], with f: (T) -> U) -[Par]> Vector<U> {
   let count = items.len
   let slots = runtime_par_map_slots_new(count)
+  defer runtime_par_map_slots_destroy(slots, count)
   let mut submitting: usize = 0
   for item in items {
     par_map_task_slots_put<U>(slots, submitting, fork<U>(() => f(item)))
@@ -156,8 +157,10 @@ pub (package) fn par_pthread_spawn_result(f: (i64) -> i64, arg: i64) -> ParRunti
   closure_default_promote(f)
   rc_default_promote_maybe(arg)
   let created = runtime_par_pthread_spawn(f, arg)
-  if runtime_par_pair_status(created) == 0 { ParOk(runtime_par_pair_value(created)) }
-  else { ParErr(runtime_par_pair_status(created)) }
+  let status = runtime_par_pair_status(created)
+  let value = runtime_par_pair_value(created)
+  runtime_par_pair_destroy(created)
+  if status == 0 { ParOk(value) } else { ParErr(status) }
 }
 
 pub (package) fn par_pthread_await_result(h: i64) -> ParRuntimeResult {
@@ -168,12 +171,13 @@ pub (package) fn par_pthread_await_result(h: i64) -> ParRuntimeResult {
       ParErr(par_error_already_observed())
     } else {
       let joined = runtime_par_pthread_join_handle(h)
-      if runtime_par_pair_status(joined) == 0 {
+      let status = runtime_par_pair_status(joined)
+      let value = runtime_par_pair_value(joined)
+      runtime_par_pair_destroy(joined)
+      if status == 0 {
         runtime_par_pthread_handle_mark_joined(h)
-        ParOk(runtime_par_pair_value(joined))
-      } else {
-        ParErr(runtime_par_pair_status(joined))
-      }
+        ParOk(value)
+      } else { ParErr(status) }
     }
   }
 }
@@ -186,8 +190,10 @@ pub (package) fn par_pthread_spawn_unsafe_result(f: (i64) -[Unsafe]> i64, arg: i
   closure_default_promote(f)
   rc_default_promote_maybe(arg)
   let created = runtime_par_pthread_spawn_unsafe(f, arg)
-  if runtime_par_pair_status(created) == 0 { ParOk(runtime_par_pair_value(created)) }
-  else { ParErr(runtime_par_pair_status(created)) }
+  let status = runtime_par_pair_status(created)
+  let value = runtime_par_pair_value(created)
+  runtime_par_pair_destroy(created)
+  if status == 0 { ParOk(value) } else { ParErr(status) }
 }
 
 pub (package) fn par_pthread_spawn_unsafe(f: (i64) -[Unsafe]> i64, arg: i64) -> i64 {
@@ -752,7 +758,10 @@ pub (package) fn par_pthread_pool_map(items: List<i64>, f: (i64) -> i64, request
 
     let mut awaiting = 0
     while awaiting < spawned {
-      par_pthread_await(runtime_par_word_array_get(handles, awaiting))
+      match par_pthread_await_result(runtime_par_word_array_get(handles, awaiting)) {
+        ParOk(value) -> 0
+        ParErr(error) -> panic("parallel worker join failed")
+      }
       awaiting = awaiting + 1
     }
 
@@ -761,15 +770,9 @@ pub (package) fn par_pthread_pool_map(items: List<i64>, f: (i64) -> i64, request
     } else {
       items.map<i64>(f)
     }
-    runtime_par_pool_task_scope_cleanup(state)
-    par_queue_destroy(queue)
-    par_pthread_cond_destroy(par_pool_control_cond(state))
-    par_pthread_mutex_destroy(par_pool_control_mutex(state))
-    let mut destroying = 0
-    while destroying < worker_count {
-      par_deque_destroy(runtime_par_word_array_get(local_queues, destroying))
-      destroying = destroying + 1
-    }
+    par_pthread_pool_destroy(state)
+    runtime_par_word_array_destroy(item_array, count)
+    runtime_par_word_array_destroy(task_array, count)
     result
   }
 }
@@ -778,7 +781,10 @@ pub (package) fn par_pthread_pool_start_worker_count(requested_workers: i64) -> 
   if requested_workers <= 0 { 1 } else { requested_workers }
 }
 
-pub (package) fn par_pthread_pool_start_result(requested_workers: i64, task_capacity: i64) -> ParRuntimeResult {
+-- The scope owns preparation and rollback for either platform startup or a
+-- deterministic creation policy. The callback reports the native creation
+-- result; failure after any prefix joins that prefix before reclaiming it.
+pub (package) fn par_pthread_pool_start_using(requested_workers: i64, task_capacity: i64, spawn_worker: ((i64) -[Unsafe]> i64, i64) -> ParRuntimeResult) -> ParRuntimeResult {
   let worker_count = par_pthread_pool_start_worker_count(requested_workers)
   let capacity = if task_capacity <= 0 { worker_count } else { task_capacity }
   let queue = par_queue_new(capacity)
@@ -801,7 +807,7 @@ pub (package) fn par_pthread_pool_start_result(requested_workers: i64, task_capa
   let mut spawn_error = 0
   while spawning < worker_count {
     if spawn_error == 0 {
-      let spawned_worker = par_pthread_spawn_unsafe_result(par_pool_persistent_worker, runtime_par_word_array_get(workers, spawning))
+      let spawned_worker = spawn_worker(par_pool_persistent_worker, runtime_par_word_array_get(workers, spawning))
       match spawned_worker {
         ParOk(h) -> {
           runtime_par_word_array_set(handles, spawning, h)
@@ -826,20 +832,19 @@ pub (package) fn par_pthread_pool_start_result(requested_workers: i64, task_capa
     par_pool_request_shutdown(state)
     let mut awaiting = 0
     while awaiting < spawned {
-      par_pthread_await(runtime_par_word_array_get(handles, awaiting))
+      match par_pthread_await_result(runtime_par_word_array_get(handles, awaiting)) {
+        ParOk(value) -> 0
+        ParErr(error) -> panic("parallel worker join failed")
+      }
       awaiting = awaiting + 1
     }
-    runtime_par_pool_task_scope_cleanup(state)
-    let mut destroying = 0
-    while destroying < worker_count {
-      par_deque_destroy(runtime_par_word_array_get(local_queues, destroying))
-      destroying = destroying + 1
-    }
-    par_queue_destroy(queue)
-    par_pthread_cond_destroy(par_pool_control_cond(state))
-    par_pthread_mutex_destroy(par_pool_control_mutex(state))
+    par_pthread_pool_destroy(state)
     ParErr(spawn_error)
   }
+}
+
+pub (package) fn par_pthread_pool_start_result(requested_workers: i64, task_capacity: i64) -> ParRuntimeResult {
+  par_pthread_pool_start_using(requested_workers, task_capacity, par_pthread_spawn_unsafe_result)
 }
 
 pub (package) fn par_pthread_pool_start(requested_workers: i64, task_capacity: i64) -> i64 {
@@ -909,7 +914,10 @@ pub (package) fn par_pthread_pool_stop_and_join(pool: i64) -> i64 {
     let spawned = runtime_par_pool_spawned_count(pool)
     let mut awaiting = 0
     while awaiting < spawned {
-      par_pthread_await(runtime_par_word_array_get(handles, awaiting))
+      match par_pthread_await_result(runtime_par_word_array_get(handles, awaiting)) {
+        ParOk(value) -> 0
+        ParErr(error) -> panic("parallel worker join failed")
+      }
       awaiting = awaiting + 1
     }
     0
@@ -923,14 +931,25 @@ pub (package) fn par_pthread_pool_destroy(pool: i64) -> i64 {
     runtime_par_pool_task_scope_cleanup(pool)
     par_queue_destroy(par_pool_queue(pool))
     let local_queues = runtime_par_pool_local_queues(pool)
+    let workers = par_pool_workers(pool)
+    let handles = runtime_par_pool_handles(pool)
     let worker_count = par_pool_worker_count_value(pool)
+    let spawned = runtime_par_pool_spawned_count(pool)
+    for joined in 0..spawned {
+      runtime_par_pthread_handle_destroy(runtime_par_word_array_get(handles, joined))
+    }
     let mut destroying = 0
     while destroying < worker_count {
       par_deque_destroy(runtime_par_word_array_get(local_queues, destroying))
+      runtime_par_worker_destroy(runtime_par_word_array_get(workers, destroying))
       destroying = destroying + 1
     }
+    runtime_par_word_array_destroy(local_queues, worker_count)
+    runtime_par_word_array_destroy(workers, worker_count)
+    runtime_par_word_array_destroy(handles, worker_count)
     par_pthread_cond_destroy(par_pool_control_cond(pool))
     par_pthread_mutex_destroy(par_pool_control_mutex(pool))
+    runtime_par_pool_state_destroy(pool)
     0
   }
 }
@@ -993,6 +1012,7 @@ pub (package) fn par_pthread_pool_map_or_sequential(items: List<i64>, f: (i64) -
 pub (package) fn par_map_carriers<T: Sendable, U: Sendable>(items: [T], f: (T) -> U, pool: i64, pthread: i64) -> Vector<U> {
   let count = items.len
   let slots = runtime_par_map_slots_new(count)
+  defer runtime_par_map_slots_destroy(slots, count)
   let works = runtime_par_work_scope_new()
   defer runtime_par_work_scope_cleanup(works)
 

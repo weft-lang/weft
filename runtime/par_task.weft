@@ -114,11 +114,11 @@ pub(package) fn runtime_par_work_new_raw(descriptor: i64, entry_ptr: i64, fn_ptr
   let size = runtime_par_work_size_for_descriptor(descriptor)
   if size == 0 or entry_ptr == 0 or fn_ptr == 0 { 0 }
   else {
-    let work = alloc_zeroed(size)
+    let work = heap_alloc_zeroed(rc_default_heap(), size, 8)
     __mem_store64(work + runtime_par_work_descriptor_offset(), descriptor)
     __mem_store64(work + runtime_par_work_entry_ptr_offset(), entry_ptr)
     __mem_store64(work + runtime_par_work_fn_ptr_offset(), fn_ptr)
-    __mem_store64(work + runtime_par_work_env_ptr_offset(), closure_env_bump_clone_raw(env_ptr))
+    __mem_store64(work + runtime_par_work_env_ptr_offset(), closure_env_heap_clone_raw(env_ptr))
     work
   }
 }
@@ -326,7 +326,7 @@ pub(package) fn runtime_par_work_release_closure(work: i64) -> i64 {
     let env_ptr = __mem_load64(work + runtime_par_work_env_ptr_offset())
     if fn_ptr == 0 and env_ptr == 0 { 0 }
     else {
-      closure_env_release_captures_raw(env_ptr)
+      closure_env_heap_release_raw(env_ptr)
       __mem_store64(work + runtime_par_work_fn_ptr_offset(), 0)
       __mem_store64(work + runtime_par_work_env_ptr_offset(), 0)
       1
@@ -336,7 +336,7 @@ pub(package) fn runtime_par_work_release_closure(work: i64) -> i64 {
 
 -- Thread crossing promotes the exact compiler-proved Sendable capture graph
 -- held by the carrier's private environment clone. The environment itself is
--- immutable bump storage; only its managed leaves require atomic promotion.
+-- uniquely owned heap storage; its managed leaves require atomic promotion.
 pub(package) fn runtime_par_work_promote_closure(work: i64) -> i64 {
   if work == 0 { 0 }
   else { closure_env_promote_captures_raw(__mem_load64(work + runtime_par_work_env_ptr_offset())) }
@@ -365,8 +365,9 @@ pub(package) fn runtime_par_work_run(work: i64) -> i64 {
 }
 
 -- Handler scopes own carriers independently of the public move-only
--- observation right. Await moves the result out; cleanup destroys only a
--- still-initialized result and is therefore idempotent for observed work.
+-- observation right. Await moves the result out; terminal scope cleanup
+-- destroys still-initialized results and reclaims every carrier exactly once.
+-- A scope and its observation words are invalid after that cleanup.
 pub(package) fn runtime_par_work_scope_head_offset() -> i64 { 0 }
 pub(package) fn runtime_par_work_scope_size() -> i64 { 8 }
 pub(package) fn runtime_par_work_scope_node_work_offset() -> i64 { 0 }
@@ -374,7 +375,7 @@ pub(package) fn runtime_par_work_scope_node_next_offset() -> i64 { 8 }
 pub(package) fn runtime_par_work_scope_node_size() -> i64 { 16 }
 
 pub(package) fn runtime_par_work_scope_new() -> i64 {
-  let scope = alloc_bump(runtime_par_work_scope_size())
+  let scope = heap_alloc(rc_default_heap(), runtime_par_work_scope_size(), 8)
   __mem_store64(scope + runtime_par_work_scope_head_offset(), 0)
   scope
 }
@@ -382,7 +383,7 @@ pub(package) fn runtime_par_work_scope_new() -> i64 {
 pub(package) fn runtime_par_work_scope_track(scope: i64, work: i64) -> i64 {
   if scope == 0 or work == 0 { work }
   else {
-    let node = alloc_bump(runtime_par_work_scope_node_size())
+    let node = heap_alloc(rc_default_heap(), runtime_par_work_scope_node_size(), 8)
     __mem_store64(node + runtime_par_work_scope_node_work_offset(), work)
     __mem_store64(node + runtime_par_work_scope_node_next_offset(), __mem_load64(scope + runtime_par_work_scope_head_offset()))
     __mem_store64(scope + runtime_par_work_scope_head_offset(), node)
@@ -406,10 +407,15 @@ pub(package) fn runtime_par_work_scope_cleanup(scope: i64) -> i64 {
   else {
     let mut node = __mem_load64(scope + runtime_par_work_scope_head_offset())
     while node != 0 {
-      runtime_par_work_discard(__mem_load64(node + runtime_par_work_scope_node_work_offset()))
-      node = __mem_load64(node + runtime_par_work_scope_node_next_offset())
+      let work = __mem_load64(node + runtime_par_work_scope_node_work_offset())
+      let next = __mem_load64(node + runtime_par_work_scope_node_next_offset())
+      let size = runtime_par_work_size_for_descriptor(runtime_par_work_descriptor(work))
+      runtime_par_work_discard(work)
+      heap_free(rc_default_heap(), work, size)
+      heap_free(rc_default_heap(), node, runtime_par_work_scope_node_size())
+      node = next
     }
-    __mem_store64(scope + runtime_par_work_scope_head_offset(), 0)
+    heap_free(rc_default_heap(), scope, runtime_par_work_scope_size())
     0
   }
 }
@@ -423,11 +429,9 @@ pub(package) fn runtime_par_task_done_offset() -> i64 { 32 }
 pub(package) fn runtime_par_task_observed_offset() -> i64 { 40 }
 pub(package) fn runtime_par_task_size() -> i64 { 48 }
 
--- A Par handler scope owns every task handle it returns until that handle is
--- observed. Registry nodes are runtime-internal bookkeeping; cleanup is
--- idempotent and releases only task environments that await did not already
--- consume. The Sendable owned task carrier replaces the raw handle representation,
--- but this ownership boundary survives unchanged.
+-- A pool owns its scheduling envelopes until all workers have joined.
+-- Await consumes the environment once; terminal scope cleanup reclaims the
+-- envelopes and registry, releasing any remaining environments first.
 pub(package) fn runtime_par_task_scope_head_offset() -> i64 { 0 }
 pub(package) fn runtime_par_task_scope_size() -> i64 { 8 }
 pub(package) fn runtime_par_task_scope_node_task_offset() -> i64 { 0 }
@@ -435,7 +439,7 @@ pub(package) fn runtime_par_task_scope_node_next_offset() -> i64 { 8 }
 pub(package) fn runtime_par_task_scope_node_size() -> i64 { 16 }
 
 pub(package) fn runtime_par_task_scope_new() -> i64 {
-  let scope = alloc_bump(runtime_par_task_scope_size())
+  let scope = heap_alloc(rc_default_heap(), runtime_par_task_scope_size(), 8)
   __mem_store64(scope + runtime_par_task_scope_head_offset(), 0)
   scope
 }
@@ -443,7 +447,7 @@ pub(package) fn runtime_par_task_scope_new() -> i64 {
 pub(package) fn runtime_par_task_scope_track(scope: i64, task: i64) -> i64 {
   if scope == 0 or task == 0 { task }
   else {
-    let node = alloc_bump(runtime_par_task_scope_node_size())
+    let node = heap_alloc(rc_default_heap(), runtime_par_task_scope_node_size(), 8)
     __mem_store64(node + runtime_par_task_scope_node_task_offset(), task)
     __mem_store64(node + runtime_par_task_scope_node_next_offset(), __mem_load64(scope + runtime_par_task_scope_head_offset()))
     __mem_store64(scope + runtime_par_task_scope_head_offset(), node)
@@ -459,9 +463,9 @@ pub(package) fn runtime_par_task_closure_word(f: (i64) -> i64) -> i64 {
 
 pub(package) fn runtime_par_task_new(f: (i64) -> i64, arg: i64) -> i64 {
   let closure = runtime_par_task_closure_word(f)
-  let task = alloc_bump(runtime_par_task_size())
+  let task = heap_alloc(rc_default_heap(), runtime_par_task_size(), 8)
   __mem_store64(task + runtime_par_task_fn_ptr_offset(), __mem_load64(closure))
-  __mem_store64(task + runtime_par_task_env_ptr_offset(), closure_env_bump_clone_raw(__mem_load64(closure + 8)))
+  __mem_store64(task + runtime_par_task_env_ptr_offset(), closure_env_heap_clone_raw(__mem_load64(closure + 8)))
   __mem_store64(task + runtime_par_task_arg_offset(), arg)
   __mem_store64(task + runtime_par_task_result_offset(), 0)
   __mem_store64(task + runtime_par_task_done_offset(), 0)
@@ -499,7 +503,7 @@ pub(package) fn runtime_par_task_run(task: i64) -> i64 {
 }
 
 pub(package) fn runtime_par_task_release_for_await(task: i64) -> i64 {
-  closure_env_release_captures_raw(__mem_load64(task + runtime_par_task_env_ptr_offset()))
+  closure_env_heap_release_raw(__mem_load64(task + runtime_par_task_env_ptr_offset()))
   __mem_store64(task + runtime_par_task_fn_ptr_offset(), 0)
   __mem_store64(task + runtime_par_task_env_ptr_offset(), 0)
   __mem_store64(task + runtime_par_task_observed_offset(), 1)
@@ -507,7 +511,7 @@ pub(package) fn runtime_par_task_release_for_await(task: i64) -> i64 {
 }
 
 pub(package) fn runtime_par_task_discard_unobserved(task: i64) -> i64 {
-  closure_env_release_captures_raw(__mem_load64(task + runtime_par_task_env_ptr_offset()))
+  closure_env_heap_release_raw(__mem_load64(task + runtime_par_task_env_ptr_offset()))
   __mem_store64(task + runtime_par_task_fn_ptr_offset(), 0)
   __mem_store64(task + runtime_par_task_env_ptr_offset(), 0)
   0
@@ -522,9 +526,12 @@ pub(package) fn runtime_par_task_scope_cleanup(scope: i64) -> i64 {
       if task != 0 and runtime_par_task_observed(task) == 0 {
         runtime_par_task_discard_unobserved(task)
       } else { 0 }
-      node = __mem_load64(node + runtime_par_task_scope_node_next_offset())
+      let next = __mem_load64(node + runtime_par_task_scope_node_next_offset())
+      heap_free(rc_default_heap(), task, runtime_par_task_size())
+      heap_free(rc_default_heap(), node, runtime_par_task_scope_node_size())
+      node = next
     }
-    __mem_store64(scope + runtime_par_task_scope_head_offset(), 0)
+    heap_free(rc_default_heap(), scope, runtime_par_task_scope_size())
     0
   }
 }
