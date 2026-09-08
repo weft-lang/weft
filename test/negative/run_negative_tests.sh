@@ -107,6 +107,12 @@ check_rejects "return_annotated_union_as_initializer" "test/negative/return_anno
 check_rejects "return_shadowing_initializer_type" "test/negative/return_shadowing_initializer_type.weft" 'return value type mismatch: expected `usize`, found `i64`' 1
 check_rejects "return_annotated_initializer_mismatch" "test/negative/return_annotated_initializer_mismatch.weft" 'type annotation type mismatch: expected `usize`, found `str`' 1
 check_rejects "par_prefixed_surface_retired" "test/negative/par_prefixed_surface_retired.weft" "error[E4002]:" 5
+check_rejects "par_pool_config_signed_workers" "test/negative/par_pool_config_signed_workers.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
+check_rejects "par_pool_config_signed_capacity" "test/negative/par_pool_config_signed_capacity.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
+check_rejects "par_pool_config_forged" "test/negative/par_pool_config_forged.weft" 'opaque constructor is private to its declaring module; use an exported factory' 2
+check_rejects "par_pool_legacy_counts" "test/negative/par_pool_legacy_counts.weft" 'cannot infer generic call type arguments' 2
+check_rejects "par_scope_result_annotation" "test/negative/par_scope_result_annotation.weft" 'type annotation type mismatch: expected `i64`, found `str`' 1
+check_rejects "par_scope_owned_result_after_move" "test/negative/par_scope_owned_result_after_move.weft" 'owned value used more than once' 1
 check_rejects "deep_release_mask_overflow_record" "test/negative/deep_release_mask_overflow_record.weft" "type error: aggregate field may require release beyond 16-word mask"
 check_rejects "deep_release_mask_overflow_variant_closure" "test/negative/deep_release_mask_overflow_variant_closure.weft" "type error: aggregate field may require release beyond 16-word mask"
 check_rejects "deep_release_mask_overflow_variant_array" "test/negative/deep_release_mask_overflow_variant_array.weft" "type error: aggregate field may require release beyond 16-word mask"

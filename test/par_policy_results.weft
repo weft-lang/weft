@@ -1,0 +1,237 @@
+use runtime/rc_implicit_test.{runtime_rc_probe_new, runtime_rc_probe_count, runtime_rc_probe_load}
+use stdlib/drop.{Drop}
+use runtime/defer_order_test.{OwnedDropToken, owned_drop_token_new, defer_order_log_new, defer_order_log_read}
+use stdlib/par as par
+use stdlib/result
+use stdlib/par.{Par}
+use stdlib/vector as vector
+use stdlib/vector.{Vector}
+use stdlib/string
+use stdlib/option
+use stdlib/result.{Result, Err, Ok}
+use stdlib/par.{PoolConfig, PoolConfigError, NoWorkers, NoTaskCapacity, WorkerCountTooLarge, TaskCapacityTooLarge}
+
+type Answer { text: str, count: usize, ratio: f64 }
+
+test "parallel policies preserve inferred ordinary results" {
+  let sequential = par.with_sequential(() => {
+    let task = par.fork(() => "we".concat("ft"))
+    Answer { text: task.join(), count: 18446744073709551615, ratio: 41.5 }
+  })
+  let pooled = par.with_pool(par.pool_config(2, 4).unwrap(), () => {
+    let task = par.fork(() => "we".concat("ft"))
+    Answer { text: task.join(), count: 18446744073709551615, ratio: 41.5 }
+  })
+  Test.assert_str_eq(sequential.text, "weft")
+  Test.assert_str_eq(pooled.text, "weft")
+  Test.assert_true(sequential.count == pooled.count)
+  Test.assert_true(sequential.ratio == pooled.ratio)
+  Test.assert_true(par.with_sequential(() => 41.5) == 41.5)
+  Test.assert_true(par.with_pool(par.pool_config(1, 1).unwrap(), () => 41.5) == 41.5)
+  let done: nil = par.with_sequential(() => nil)
+  let pooled_done: nil = par.with_pool(par.pool_config(1, 1).unwrap(), () => nil)
+}
+
+fn owned_result() -[Par]> owned Vector<str> {
+  let task = par.fork(() => "task".repeat(4))
+  let mut output = vector.new<str>()
+  output.push(task.join())
+  output
+}
+
+test "parallel scope results retain exclusive resource ownership" {
+  let mut sequential = par.with_sequential(owned_result)
+  let mut pooled = par.with_pool(par.pool_config(2, 4).unwrap(), owned_result)
+  sequential.push("more")
+  pooled.push("more")
+  Test.assert_true(sequential.len() == 2)
+  Test.assert_true(pooled.len() == 2)
+  Test.assert_str_eq(sequential.get(0).unwrap(), "tasktasktasktask")
+  Test.assert_str_eq(pooled.get(0).unwrap(), "tasktasktasktask")
+}
+
+test "pool configuration validates finite storage before creating runtime state" {
+  let max_words: usize = 1152921504606846975
+  let full_width: usize = 18446744073709551615
+  let accepted = Ok<nil, PoolConfigError>(nil)
+  let no_workers = Err<nil, PoolConfigError>(NoWorkers)
+  let no_capacity = Err<nil, PoolConfigError>(NoTaskCapacity)
+  let large_workers = Err<nil, PoolConfigError>(WorkerCountTooLarge)
+  let large_capacity = Err<nil, PoolConfigError>(TaskCapacityTooLarge)
+  let cases: [(usize, usize, Result<nil, PoolConfigError>); 13] = [
+    (0, 0, no_workers), (0, 1, no_workers), (1, 0, no_capacity),
+    (1, 1, accepted), (3, 8, accepted), (max_words, 1, accepted),
+    (1, max_words, accepted), (max_words, max_words, accepted),
+    (max_words + 1, 1, large_workers), (1, max_words + 1, large_capacity),
+    (full_width, 1, large_workers), (1, full_width, large_capacity),
+    (full_width, full_width, large_workers)
+  ]
+  for (workers, capacity, expected) in cases {
+    let matches = match (par.pool_config(workers, capacity), expected) {
+      (Ok(_), Ok(_)) -> true
+      (Err(NoWorkers), Err(NoWorkers)) -> true
+      (Err(NoTaskCapacity), Err(NoTaskCapacity)) -> true
+      (Err(WorkerCountTooLarge), Err(WorkerCountTooLarge)) -> true
+      (Err(TaskCapacityTooLarge), Err(TaskCapacityTooLarge)) -> true
+      _ -> false
+    }
+    Test.assert_true(matches)
+  }
+}
+
+test "validated pool configuration retains scoped slice borrowing and scalar lowering" {
+  let source = [10, 20, 30]
+  let borrowed = source[..]
+  let result = par.with_pool(par.pool_config(2, 4).unwrap(), () => {
+    let inputs: [usize; 3] = [0, 1, 2]
+    let mapped = par.map(inputs[..], value => borrowed[value] + 1)
+    mapped.get(0).unwrap() + mapped.get(1).unwrap() + mapped.get(2).unwrap()
+  })
+  Test.assert_eq(result, 63)
+}
+
+effect PoolSuffix {
+  fn suffix() -> str
+}
+
+fn residual_result() -[Par, PoolSuffix]> str {
+  let task = par.fork(() => "we")
+  task.join().concat(PoolSuffix.suffix())
+}
+
+test "generic scope results preserve unrelated effects under both policies" {
+  let sequential = handle par.with_sequential(residual_result) {
+    PoolSuffix.suffix() -> resume("ft")
+  }
+  let pooled = handle par.with_pool(par.pool_config(2, 4).unwrap(), residual_result) {
+    PoolSuffix.suffix() -> resume("ft")
+  }
+  Test.assert_str_eq(sequential, "weft")
+  Test.assert_str_eq(pooled, "weft")
+}
+
+test "returned resources drop only when their caller consumes them" {
+  let log = defer_order_log_new()
+  let sequential = par.with_sequential(() => owned_drop_token_new(log))
+  Test.assert_eq(defer_order_log_read(log), 0)
+  sequential.drop()
+  Test.assert_eq(defer_order_log_read(log), 2)
+  let pooled = par.with_pool(par.pool_config(2, 4).unwrap(), () => owned_drop_token_new(log))
+  Test.assert_eq(defer_order_log_read(log), 2)
+  pooled.drop()
+  Test.assert_eq(defer_order_log_read(log), 22)
+}
+
+effect StopPoolResource {
+  fn stop() -> nil
+}
+
+effect PausePoolResource {
+  @deferred fn pause() -> i64
+}
+
+test "generic scope abort drops its pending resource and preserves the handler result" {
+  let pending_log = defer_order_log_new()
+  let returned_log = defer_order_log_new()
+  let returned: owned OwnedDropToken = handle par.with_pool(par.pool_config(2, 4).unwrap(), () => {
+    let pending = owned_drop_token_new(pending_log)
+    StopPoolResource.stop()
+    pending
+  }) {
+    StopPoolResource.stop() -> owned_drop_token_new(returned_log)
+  }
+  Test.assert_eq(defer_order_log_read(pending_log), 2)
+  Test.assert_eq(defer_order_log_read(returned_log), 0)
+  returned.drop()
+  Test.assert_eq(defer_order_log_read(returned_log), 2)
+}
+
+test "dropping a generic scope continuation destroys pending resources exactly once" {
+  let pending_log = defer_order_log_new()
+  let returned_log = defer_order_log_new()
+  let returned: owned OwnedDropToken = handle par.with_pool(par.pool_config(2, 4).unwrap(), () => {
+    let pending = owned_drop_token_new(pending_log)
+    PausePoolResource.pause()
+    pending
+  }) {
+    PausePoolResource.pause() with k -> owned_drop_token_new(returned_log)
+  }
+  Test.assert_eq(defer_order_log_read(pending_log), 2)
+  Test.assert_eq(defer_order_log_read(returned_log), 0)
+  returned.drop()
+  Test.assert_eq(defer_order_log_read(returned_log), 2)
+}
+
+
+test "resuming a generic scope continuation transfers its resource to the caller" {
+  let sequential_log = defer_order_log_new()
+  let sequential = handle par.with_sequential(() => {
+    let resource = owned_drop_token_new(sequential_log)
+    PausePoolResource.pause()
+    resource
+  }) {
+    PausePoolResource.pause() with k -> k(42)
+  }
+  Test.assert_eq(defer_order_log_read(sequential_log), 0)
+  sequential.drop()
+  Test.assert_eq(defer_order_log_read(sequential_log), 2)
+  let pooled_log = defer_order_log_new()
+  let pooled = handle par.with_pool(par.pool_config(2, 4).unwrap(), () => {
+    let resource = owned_drop_token_new(pooled_log)
+    PausePoolResource.pause()
+    resource
+  }) {
+    PausePoolResource.pause() with k -> k(42)
+  }
+  Test.assert_eq(defer_order_log_read(pooled_log), 0)
+  pooled.drop()
+  Test.assert_eq(defer_order_log_read(pooled_log), 2)
+}
+
+fn retained_text_producer() -[Par]> () -> str {
+  let task = par.fork(() => "we".concat("ft"))
+  let text = task.join()
+  () => text.repeat(2)
+}
+
+test "closures returned from a scope retain their captured worker result" {
+  let sequential = par.with_sequential(retained_text_producer)
+  let pooled = par.with_pool(par.pool_config(2, 4).unwrap(), retained_text_producer)
+  Test.assert_str_eq(sequential(), "weftweft")
+  Test.assert_str_eq(pooled(), "weftweft")
+  Test.assert_str_eq(sequential(), pooled())
+}
+
+
+test "generic scope results hold exactly one managed stake after callback cleanup" {
+  let value = runtime_rc_probe_new(42)
+  Test.assert_eq(runtime_rc_probe_count(value), 1)
+  for iteration in 0..32 {
+    {
+      let returned = par.with_sequential(() => value)
+      Test.assert_eq(runtime_rc_probe_load(returned), 42)
+      Test.assert_eq(runtime_rc_probe_count(value), 2)
+    }
+    Test.assert_eq(runtime_rc_probe_count(value), 1)
+    {
+      let returned = par.with_pool(par.pool_config(1, 1).unwrap(), () => value)
+      Test.assert_eq(runtime_rc_probe_load(returned), 42)
+      Test.assert_eq(runtime_rc_probe_count(value), 2)
+    }
+    Test.assert_eq(runtime_rc_probe_count(value), 1)
+  }
+}
+
+
+test "validated configurations can be reused through both conditional setup paths" {
+  let small = par.pool_config(1, 1).unwrap()
+  let larger = par.pool_config(3, 8).unwrap()
+  for iteration in 0..16 {
+    let result = par.with_pool(if iteration % 2 == 0 { small } else { larger }, () => {
+      let first = par.fork(() => 20)
+      let second = par.fork(() => 22)
+      first.join() + second.join()
+    })
+    Test.assert_eq(result, 42)
+  }
+}

@@ -1,13 +1,13 @@
 -- stdlib/par.weft -- Structured concurrency via algebraic effects
 --
 -- Par is an effect for parallel execution. The effect DECLARATION is here.
--- Handlers install the runtime policy. The default linked-test policy below
--- uses pthread helpers, while later runtime work can replace it with a worker
--- pool without changing the Par effect surface.
+-- Handlers install sequential or bounded worker-pool policy over the same
+-- typed work contract. Each scope owns its tasks through join and cleanup.
 --
 -- Usage:
 --
 --   use stdlib/par as par
+--   use stdlib/result
 --   use stdlib/par.{Par}
 --
 --   fn my_computation() -[Par]> i64 {
@@ -17,12 +17,13 @@
 --   }
 --
 --   fn main() -> i64 {
---     par.with_pool(2, 8, my_computation)
+--     par.with_pool(par.pool_config(2, 8).unwrap(), my_computation)
 --   }
 
 use stdlib/list.{*}
 use stdlib/num/scalar.{num_scalar_usize_to_i64}
 use stdlib/option.{None, Some}
+use stdlib/result.{Result, Ok, Err}
 use stdlib/panic.{panic}
 use stdlib/vector as vector
 use stdlib/vector.{Vector}
@@ -32,6 +33,45 @@ use runtime/par_queue.{*}
 use runtime/par_sync.{*}
 use runtime/par_task.{*}
 use runtime/rc.{*}
+
+--- A validated nonzero worker count and per-queue task capacity.
+--- Construction checks word-array size arithmetic without reserving storage.
+pub type PoolConfig = opaque (i64, i64)
+
+--- A pool configuration whose counts cannot represent runtime word arrays.
+pub type PoolConfigError {
+  --- A pool must have at least one worker.
+  NoWorkers,
+  --- A submission queue must have at least one slot.
+  NoTaskCapacity,
+  --- The worker count exceeds the runtime word-array domain.
+  WorkerCountTooLarge,
+  --- The task capacity exceeds the runtime word-array domain.
+  TaskCapacityTooLarge
+}
+
+--- Validate finite pool sizes without starting threads or allocating queues.
+--- Zero sizes are rejected; callers select their execution policy explicitly.
+pub fn pool_config(workers: usize, task_capacity: usize) -> Result<PoolConfig, PoolConfigError> {
+  let max_words = 1152921504606846975
+  match num_scalar_usize_to_i64(workers) {
+    None -> Err<PoolConfig, PoolConfigError>(WorkerCountTooLarge)
+    Some(0) -> Err<PoolConfig, PoolConfigError>(NoWorkers)
+    Some(count) if count > max_words -> Err<PoolConfig, PoolConfigError>(WorkerCountTooLarge)
+    Some(count) -> match num_scalar_usize_to_i64(task_capacity) {
+      None -> Err<PoolConfig, PoolConfigError>(TaskCapacityTooLarge)
+      Some(0) -> Err<PoolConfig, PoolConfigError>(NoTaskCapacity)
+      Some(capacity) if capacity > max_words -> Err<PoolConfig, PoolConfigError>(TaskCapacityTooLarge)
+      Some(capacity) -> Ok<PoolConfig, PoolConfigError>(PoolConfig((count, capacity)))
+    }
+  }
+}
+
+pub(package) fn par_pthread_pool_start_config(config: PoolConfig) -> i64 {
+  match config {
+    PoolConfig((workers, capacity)) -> par_pthread_pool_start(workers, capacity)
+  }
+}
 
 pub (package) type ParRuntimeResult {
   ParOk(i64),
@@ -963,11 +1003,11 @@ pub (package) fn par_pthread_pool_shutdown(pool: i64) -> i64 {
   }
 }
 
---- Run an `i64`-returning `Par` scope sequentially and discharge `Par`.
+--- Run a `Par` scope sequentially, preserving its result and residual effects.
 ---
 --- Every submitted task is completed before the scope returns or aborts;
 --- unobserved results and task carriers are still destroyed in order.
-pub fn with_sequential<E>(body: () -[Par, E]> i64) -[E]> i64 {
+pub fn with_sequential<T, E>(body: () -[Par, E]> T) -[E]> T {
   let works = runtime_par_work_scope_new()
   defer runtime_par_work_scope_cleanup(works)
   handle body() {
@@ -975,16 +1015,19 @@ pub fn with_sequential<E>(body: () -[Par, E]> i64) -[E]> i64 {
   }
 }
 
---- Run an `i64`-returning `Par` scope on a bounded pthread worker pool.
+--- Run a `Par` scope with a validated bounded worker-pool configuration.
 ---
---- `requested_workers` selects the worker count and `task_capacity` sizes the
---- submission queues. Pool startup failure falls back to sequential policy;
---- queue saturation executes accepted work inline without changing results.
---- Normal return and abort both stop, join, and clean up every scoped task.
-pub fn with_pool<E>(requested_workers: i64, task_capacity: i64, body: () -[Par, E]> i64) -[E]> i64 {
-  let pool = par_pthread_pool_start(requested_workers, task_capacity)
+--- Preserve the body's result type and residual effects. Only forked work
+--- crosses threads; returning the scope's result needs no `Sendable` bound.
+--- Thread creation failure falls back to sequential policy; queue saturation
+--- runs accepted work inline while observation remains deterministic.
+--- Return, abort, and continuation drop join all workers and reclaim scoped
+--- storage after destroying unobserved results. Managed and owned results
+--- keep their independent lifetimes after the scope returns.
+pub fn with_pool<T, E>(config: PoolConfig, body: () -[Par, E]> T) -[E]> T {
+  let pool = par_pthread_pool_start_config(config)
   if pool == 0 {
-    with_sequential(body)
+    with_sequential<T, E>(body)
   } else {
     let works = runtime_par_work_scope_new()
     -- LIFO cleanup follows the task-lifetime contract: stop/join, carrier results, envelopes.

@@ -95,15 +95,40 @@ without changing either function into an async function.
 `Sendable` computation. A pool may reorder execution, while `handle.join()` and
 `par.map` preserve deterministic observation order:
 
-```weft check
+```weft run
 use stdlib/par as par
+use stdlib/result.{Ok, Err}
 
 fn total() -[par.Par]> i64 {
   let left = par.fork(() => 20)
   let right = par.fork(() => 22)
   left.join() + right.join()
 }
+
+fn main() -> i64 {
+  let config = match par.pool_config(2, 8) {
+    Ok(value) -> value
+    Err(error) -> return 1
+  }
+  let sequential = par.with_sequential(total)
+  let parallel = par.with_pool(config, total)
+  if sequential == 42 and parallel == 42 { 0 } else { 1 }
+}
 ```
+
+`pool_config` takes `usize` counts and validates them without starting
+threads. Match `NoWorkers`, `NoTaskCapacity`, `WorkerCountTooLarge`, or
+`TaskCapacityTooLarge` when reporting invalid configuration. A valid
+configuration checks word-array size arithmetic; it does not reserve
+physical resources. Allocation exhaustion is process-terminal, as for other
+default managed storage. Thread creation failure selects sequential execution.
+
+Both policies preserve the scope body's result type and residual effects.
+Results may be managed values or owned resources; the scope result stays on
+its caller's thread and needs no `Sendable` bound. Before returning, aborting,
+or dropping a suspended continuation, the scope joins workers, destroys
+unobserved task results, and reclaims pool storage. Returned results keep their
+independent lifetimes.
 
 Use `Par` when purity permits checked parallel execution. Use `TaskScope` when
 children perform effects or suspend on readiness. `Task<T>` represents scoped

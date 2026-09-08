@@ -1146,7 +1146,10 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "io" ]; then
     assert_contains "doc_stdlib_io_pins_public_surface" "$(<"$tmp_out")" "Public API items: 13. Documented: 13."
   elif [ "$stdlib_doc_name" = "par" ]; then
-    assert_contains "doc_stdlib_par_pins_public_surface" "$(<"$tmp_out")" "Public API items: 7. Documented: 7."
+    assert_contains "doc_stdlib_par_pins_public_surface" "$(<"$tmp_out")" "Public API items: 14. Documented: 14."
+    assert_contains "doc_stdlib_par_pins_validated_configuration" "$(<"$tmp_out")" "pub fn pool_config(workers: usize, task_capacity: usize) -> Result<PoolConfig, PoolConfigError>"
+    assert_contains "doc_stdlib_par_pins_generic_sequential_result" "$(<"$tmp_out")" "pub fn with_sequential<T, E>(body: () -[Par, E]> T) -[E]> T"
+    assert_contains "doc_stdlib_par_pins_generic_pool_result" "$(<"$tmp_out")" "pub fn with_pool<T, E>(config: PoolConfig, body: () -[Par, E]> T) -[E]> T"
   fi
 done
 
@@ -2534,6 +2537,10 @@ assert_program_failure_contains "runtime_heap_words_overflow_exit" "test/runtime
 assert_program_failure_contains "runtime_pool_words_overflow_exit" "test/runtime_pool_words_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
 assert_program_failure_contains "runtime_queue_words_overflow_exit" "test/runtime_queue_words_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
 assert_program_failure_contains "runtime_region_size_overflow_exit" "test/runtime_region_size_overflow_exit.weft" "70" "weft: persistent collection region growth failed"
+
+assert_program_failure_contains "par_pool_workers_exhaustion" "test/par_pool_workers_exhaustion_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
+assert_program_failure_contains "par_pool_conditional_capacity_exhaustion" "test/par_pool_conditional_capacity_exhaustion_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
+assert_program_failure_contains "par_pool_capacity_exhaustion" "test/par_pool_capacity_exhaustion_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
 
 assert_program_failure_contains "panic_boundary" "test/panic_exit.weft" "101" "weft: panic: direct panic boundary"
 assert_program_failure_contains "checked_index_bounds_panic" "test/array_index_oob_exit.weft" "101" "weft: panic: index out of bounds"
