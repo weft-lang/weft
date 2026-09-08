@@ -142,6 +142,40 @@ The handler clause does not call `resume`, so control aborts to the handler.
 Continuations are one-shot; deferred resumption uses the explicit `with k`
 form.
 
+## Equality
+
+`==` and `!=` use value equality. Numbers, booleans, nil and text have built-in
+comparisons; nominal records and variants declare their relation with `Eq`
+from `stdlib/eq`.
+Generic comparisons carry a `T: Eq` bound. `!=` negates the same comparison.
+
+```weft run
+use stdlib/eq.{Eq}
+
+type Point { x: i64, y: i64 }
+
+impl Eq for Point {
+  fn eq(self, other: Self) -> bool {
+    self.x == other.x and self.y == other.y
+  }
+}
+
+fn main() -> i64 {
+  if Point { x: 1, y: 2 } == Point { x: 1, y: 2 } { 0 } else { 1 }
+}
+```
+
+`Option`, `Result`, `List` and `PersistentVector` compare their contents when
+their payload types implement `Eq`. Floating-point equality follows IEEE rules:
+NaNs are unequal, and positive and negative zero compare equal. Automatic
+structural equality for tuples, anonymous records, arrays and slices is not
+implemented; compare their components or use a nominal wrapper with `Eq`.
+
+`T?` is an untagged union with `nil`. Nil tests require a representation that
+distinguishes every non-nil value from nil: `str?` supports this, while `i64?`
+cannot distinguish zero from nil. Use `Option<i64>` when that distinction is
+needed. A nullable type does not automatically gain its payload's `Eq` impl.
+
 ## Text and bytes
 
 `str` is valid UTF-8 text. `Bytes` is the immutable binary type for arbitrary

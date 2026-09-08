@@ -688,7 +688,7 @@ check_rejects "pattern_nested_unknown_constructor" "test/negative/pattern_nested
 check_rejects "pattern_nested_constructor_wrong_payload" "test/negative/pattern_nested_constructor_wrong_payload.weft" "type error: constructor pattern does not match scrutinee"
 check_rejects "pattern_nested_constructor_arity" "test/negative/pattern_nested_constructor_arity.weft" "type error: constructor pattern arity mismatch"
 check_rejects "pattern_nested_literal_mismatch" "test/negative/pattern_nested_literal_mismatch.weft" "type error: literal pattern does not match scrutinee"
-check_rejects "pattern_nested_typed_nondiscriminable" "test/negative/pattern_nested_typed_nondiscriminable.weft" "type error: typed match arm needs a runtime-discriminable union"
+check_rejects "pattern_nested_typed_nondiscriminable" "test/negative/pattern_nested_typed_nondiscriminable.weft" "error[E1006]"
 check_rejects "pattern_nested_non_exhaustive" "test/negative/pattern_nested_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `Wrap(Right)` is not covered'
 check_rejects "pattern_nested_malformed" "test/negative/pattern_nested_malformed.weft" "error[E0002]: expected ',' or ')' after constructor pattern payload"
 check_rejects "pattern_nested_unclosed" "test/negative/pattern_nested_unclosed.weft" "error[E0002]: expected ')' after constructor pattern"
@@ -1069,7 +1069,7 @@ check_rejects "generic_ctor_conflicting_args" "test/negative/generic_ctor_confli
 check_rejects "qualified_ctor_call" "test/negative/qualified_ctor_call.weft" "type error: qualified constructor syntax is not supported"
 check_rejects "qualified_ctor_nullary" "test/negative/qualified_ctor_nullary.weft" "type error: qualified constructor syntax is not supported"
 check_rejects "interp_display_missing_impl" "test/negative/interp_display_missing_impl.weft" "implement Display for the interpolated type"
-check_rejects "typed_match_untagged_union" "test/negative/typed_match_untagged_union.weft" "type error: typed match arm needs a runtime-discriminable union"
+check_rejects "typed_match_untagged_union" "test/negative/typed_match_untagged_union.weft" "error[E1006]"
 check_rejects "typed_match_non_exhaustive" "test/negative/typed_match_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `nil` is not covered'
 check_rejects "typed_match_foreign_annotation" "test/negative/typed_match_foreign_annotation.weft" "type error: typed match arm annotation is not part of the scrutinee type"
 check_rejects "typed_match_nil_never" "test/negative/typed_match_nil_never.weft" "type error: nil match arm on a scrutinee that is never nil"
@@ -1115,7 +1115,7 @@ check_rejects "tuple_pattern_record_mismatch" "test/negative/tuple_pattern_recor
 check_rejects "tuple_pattern_arity_mismatch" "test/negative/tuple_pattern_arity_mismatch.weft" "type error: tuple pattern arity mismatch"
 check_rejects "record_pattern_malformed" "test/negative/record_pattern_malformed.weft" "error[E0002]: expected ',' or '}' after record pattern field"
 check_rejects "tuple_pattern_malformed" "test/negative/tuple_pattern_malformed.weft" "error[E0002]: expected ')' after grouped pattern"
-check_rejects "record_pattern_nested_untagged_union" "test/negative/record_pattern_nested_untagged_union.weft" "type error: typed match arm needs a runtime-discriminable union"
+check_rejects "record_pattern_nested_untagged_union" "test/negative/record_pattern_nested_untagged_union.weft" "error[E1006]"
 check_rejects "record_pattern_literal_mismatch" "test/negative/record_pattern_literal_mismatch.weft" "type error: literal pattern does not match scrutinee"
 check_rejects "pattern_matrix_tuple_non_exhaustive" "test/negative/pattern_matrix_tuple_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `(MatrixTupleOne, MatrixTupleOne)` is not covered'
 check_rejects "pattern_matrix_record_non_exhaustive" "test/negative/pattern_matrix_record_non_exhaustive.weft" 'error[E1003]: non-exhaustive match: value `{item: nil}` is not covered'
@@ -1255,6 +1255,30 @@ check_rejects "borrow_effect_conflicting_perform" "test/negative/borrow_effect_c
 check_rejects "borrow_effect_deferred_continuation" "test/negative/borrow_effect_deferred_continuation.weft" "type error: borrowed effect parameter cannot enter a deferred continuation" 1
 check_rejects "borrow_closure_capture" "test/negative/borrow_closure_capture.weft" "type error: borrowed resource cannot be captured by closure" 1
 check_rejects "borrow_par_fork_capture" "test/negative/borrow_par_fork_capture.weft" "type error: borrowed resource cannot be captured by closure" 1
+
+check_rejects equality_record_without_impl test/negative/equality_record_without_impl.weft "error[E1004]" 1
+check_rejects equality_variant_without_impl test/negative/equality_variant_without_impl.weft "error[E1004]" 1
+check_rejects equality_tuple_without_impl test/negative/equality_tuple_without_impl.weft "error[E1004]" 1
+check_rejects equality_structural_record_without_impl test/negative/equality_structural_record_without_impl.weft "error[E1004]" 1
+check_rejects equality_array_without_impl test/negative/equality_array_without_impl.weft "error[E1004]" 1
+check_rejects equality_slice_without_impl test/negative/equality_slice_without_impl.weft "error[E1004]" 1
+check_rejects equality_function_without_impl test/negative/equality_function_without_impl.weft "error[E1004]" 1
+check_rejects equality_generic_missing_bound test/negative/equality_generic_missing_bound.weft "error[E1004]" 1
+check_rejects equality_untagged_union test/negative/equality_untagged_union.weft "error[E1004]" 1
+check_rejects equality_foreign_trait test/negative/equality_foreign_trait.weft "error[E1004]" 1
+check_rejects equality_foreign_bound test/negative/equality_foreign_bound.weft "error[E1004]" 1
+check_rejects equality_option_missing_bound test/negative/equality_option_missing_bound.weft "error[E1004]" 1
+check_rejects equality_result_missing_ok_bound test/negative/equality_result_missing_ok_bound.weft "error[E1004]" 1
+check_rejects equality_result_missing_error_bound test/negative/equality_result_missing_error_bound.weft "error[E1004]" 1
+check_rejects equality_list_missing_bound test/negative/equality_list_missing_bound.weft "error[E1004]" 1
+check_rejects equality_persistent_vector_missing_bound test/negative/equality_persistent_vector_missing_bound.weft "error[E1004]" 1
+check_rejects nil_comparison_nullable_integer test/negative/nil_comparison_nullable_integer.weft "error[E1006]" 1
+check_rejects nil_comparison_nullable_bool test/negative/nil_comparison_nullable_bool.weft "error[E1006]" 1
+check_rejects nil_comparison_nullable_float test/negative/nil_comparison_nullable_float.weft "error[E1006]" 1
+check_rejects nil_comparison_nullable_tuple test/negative/nil_comparison_nullable_tuple.weft "error[E1006]" 1
+check_rejects nil_comparison_nullable_opaque_scalar test/negative/nil_comparison_nullable_opaque_scalar.weft "error[E1006]" 1
+check_rejects nil_pattern_nullable_scalar test/negative/nil_pattern_nullable_scalar.weft "error[E1006]" 1
+check_rejects nil_typed_pattern_nullable_scalar test/negative/nil_typed_pattern_nullable_scalar.weft "error[E1006]" 1
 
 if [ "$CENSUS_ONLY" -eq 1 ]; then
   echo "$JOB_N"
