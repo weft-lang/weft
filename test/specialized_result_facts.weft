@@ -1,0 +1,135 @@
+use compiler/pipeline.{*}
+use compiler/ir.{*}
+use compiler/lib.{*}
+use compiler/typeck.{*}
+use compiler/type_registry.{str_hash}
+use compiler/types.{*}
+use compiler/codegen.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option.{Option}
+
+fn result_fact_function(ir: IrModule, name: str) -> IrFunction {
+  match pipeline_ir_function_list_find_hash(pipeline_ir_functions(ir), str_hash(__str_ptr(name), 0, __str_len(name))) {
+    IrFunctionCons(found, _) -> found
+    _ -> IrFunction(0, 0, IrBlockListNil, 0)
+  }
+}
+
+fn result_fact_calls(insts: IrInstList) -> List<IrInst> {
+  match insts {
+    IrInstNil -> Nil<IrInst>()
+    IrInstCons(inst, rest) -> match inst {
+      IrCallI64(_, _, _) -> Cons(inst, result_fact_calls(rest))
+      IrGenericCallI64(_, _, _, _) -> Cons(inst, result_fact_calls(rest))
+      IrMethodCallI64(_, _, _, _, _) -> Cons(inst, result_fact_calls(rest))
+      _ -> result_fact_calls(rest)
+    }
+  }
+}
+
+fn result_fact_block_calls(blocks: IrBlockList) -> List<IrInst> {
+  match blocks {
+    IrBlockListNil -> Nil<IrInst>()
+    IrBlockListCons(IrBlock(_, _, insts, _), rest) -> result_fact_calls(insts).concat(result_fact_block_calls(rest))
+  }
+}
+
+fn result_fact_acquired(facts: i64, value: i64, action: i64) -> bool {
+  pipeline_ir_abort_cleanup_find_acquisition_value_action_kind(facts, value, action, pipeline_ir_abort_cleanup_direct_kind()) != 0
+}
+
+fn result_fact_source() -> str { "effect Pause { @deferred fn stop() -> nil }\nfn observe(value: str) -[Pause]> str { value }\nfn make<E>(name: str, transform: (str) -[E]> str) -[E]> (str, str, i64) {\n  (transform(name), transform(name), 42)\n}\nfn retained(name: str) -[Pause]> (str, str, i64) {\n  let value = make(name, observe)\n  Pause.stop()\n  value\n}\nfn main() -> i64 { 0 }\n" }
+
+test "callback specialization preserves the concrete result contract without a source declaration" {
+  let source = result_fact_source()
+  let typed = pipeline_check_source_with_origin_standalone(__str_ptr(source), __str_len(source), 1, 0)
+  match typed { TypedModule(fns, _, tt) -> {
+      let ir = pipeline_optimise_typed_ir(typed, pipeline_lower_ir(typed))
+      let function = result_fact_function(ir, "retained")
+      let calls = result_fact_block_calls(pipeline_ir_function_blocks(function))
+      Test.assert_eq_usize(calls.len(), 1)
+      match calls.first().unwrap() {
+        IrCallI64(dst, hash, args) -> {
+          Test.assert_eq(pipeline_fns_lookup_ret_type_node_by_hash(fns, hash, 0), 0)
+          let contracts = pipeline_ir_native_call_contract_facts(pipeline_ir_semantic_facts(ir))
+          let fact = pipeline_ir_native_call_contract_fact_find(contracts, hash)
+          let ty = cg_semantic_fact_return_type(fact)
+          Test.assert_true(ty != 0)
+          Test.assert_eq(pipeline_type_value_lane_count_or_one(ty), 3)
+          Test.assert_eq(pipeline_type_value_lane_release_kind(ty, 0), 1)
+          Test.assert_eq(pipeline_type_value_lane_release_kind(ty, 1), 1)
+          Test.assert_eq(pipeline_type_value_lane_release_kind(ty, 2), 0)
+          let owners = pipeline_ir_abort_cleanup_facts_for_blocks_with_call_contracts(pipeline_ir_function_blocks(function), fns, tt, contracts)
+          Test.assert_true(result_fact_acquired(owners, dst, pipeline_rc_default_release_hash()))
+          Test.assert_true(result_fact_acquired(owners, dst + 1, pipeline_rc_default_release_hash()))
+          Test.assert_false(result_fact_acquired(owners, dst + 2, pipeline_rc_default_release_hash()))
+        }
+        _ -> Test.assert_true(false)
+      }
+    } }
+}
+
+fn result_fact_transfers(insts: IrInstList, call_dst: i64) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> {
+      let count = match inst {
+        IrManagedTransferI64(dst, hash, _, _, _) -> if dst == call_dst and hash == pipeline_direct_managed_transfer_hash() { 1 } else { 0 }
+        _ -> 0
+      }
+      count + result_fact_transfers(rest, call_dst)
+    }
+  }
+}
+
+fn result_fact_block_transfers(blocks: IrBlockList, call_dst: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(IrBlock(_, _, insts, _), rest) -> result_fact_transfers(insts, call_dst) + result_fact_block_transfers(rest, call_dst)
+  }
+}
+
+test "generic callback arguments preserve typed transfers through identity specialization" {
+  let source = result_fact_source()
+  let typed = pipeline_check_source_with_origin_standalone(__str_ptr(source), __str_len(source), 1, 0)
+  let lowered = pipeline_lower_ir(typed)
+  for ir in [lowered, pipeline_optimise_typed_ir(typed, lowered)] {
+    let blocks = pipeline_ir_function_blocks(result_fact_function(ir, "retained"))
+    let calls = result_fact_block_calls(blocks)
+    Test.assert_eq_usize(calls.len(), 1)
+    let dst = pipeline_direct_managed_transfer_call_dst_or(calls.first().unwrap(), - 1)
+    Test.assert_eq(result_fact_block_transfers(blocks, dst), 2)
+  }
+}
+
+test "native pair specialization replaces the original managed result contract" {
+  let params = nlist_new()
+  let managed = cg_semantic_fact_new_with_effect_summary(0, cg_semantic_effect_summary_new(1, 0, 0, 0), params, ty_str(), 0, 0)
+  let native = pipeline_ir_small_variant_clone_fact(managed)
+  let ty = cg_semantic_fact_return_type(native)
+  Test.assert_eq(pipeline_type_value_lane_count_or_one(ty), 2)
+  Test.assert_eq(pipeline_type_value_lane_release_kind(ty, 0), 0)
+  Test.assert_eq(pipeline_type_value_lane_release_kind(ty, 1), 0)
+  Test.assert_true(ty_eq(cg_semantic_fact_return_type(managed), ty_str()) == 1)
+}
+
+test "inlined associated factories retain cleanup for their returned method product" {
+  let source = "use stdlib/list.{ List, Cons, Nil }\neffect ResultPause { @deferred fn pause() -> nil }\nfn observe_number(value: i64) -[ResultPause]> i64 { value }\ntrait ResultMaker {\n  type Product\n  fn make(self) -> Self.Product\n}\ntype NameMaker { name: str }\nimpl ResultMaker for NameMaker {\n  type Product = List<str>\n  fn make(self) -> List<str> { Cons(self.name, Nil<str>()) }\n}\nfn associated_factory<M: ResultMaker, E>(maker: M, transform: (i64) -[E]> i64) -[E]> M.Product {\n  transform(42)\n  maker.make()\n}\nfn retained(name: str) -[ResultPause]> List<str> {\n  let result = associated_factory(NameMaker { name: name }, observe_number)\n  ResultPause.pause()\n  result\n}\nfn discard_associated(name: str) -> nil {\n  handle retained(name) { ResultPause.pause() with k -> Nil<str>() }\n  nil\n}\n\nfn main() -> i64 { 0 }\n"
+  let typed = pipeline_check_source_with_origin_standalone(__str_ptr(source), __str_len(source), 1, 0)
+  match typed { TypedModule(fns, _, tt) -> {
+      let ir = pipeline_optimise_typed_ir(typed, pipeline_lower_ir(typed))
+      let blocks = pipeline_ir_function_blocks(result_fact_function(ir, "retained"))
+      let calls = result_fact_block_calls(blocks)
+      Test.assert_eq_usize(calls.len(), 1)
+      let contracts = pipeline_ir_native_call_contract_facts(pipeline_ir_semantic_facts(ir))
+      let owners = pipeline_ir_abort_cleanup_facts_for_blocks_with_call_contracts(blocks, fns, tt, contracts)
+      match calls.first().unwrap() {
+        IrMethodCallI64(dst, type_hash, method_hash, _, _) -> {
+          let ty = pipeline_ir_abort_cleanup_call_ret_type(pipeline_ir_method_patch_key(type_hash, method_hash), fns, contracts)
+          Test.assert_eq(pipeline_type_value_lane_release_kind(ty, 0), 1)
+          Test.assert_true(result_fact_acquired(owners, dst, pipeline_rc_default_release_hash()))
+        }
+        _ -> Test.assert_true(false)
+      }
+    } }
+}
