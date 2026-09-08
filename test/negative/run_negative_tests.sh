@@ -58,6 +58,17 @@ check_rejects() {
   JOB_N=$((JOB_N+1))
 }
 
+check_rejects pattern_unsupported_constructor_string test/negative/pattern_unsupported_constructor_string.weft 'error[E0002]: unsupported pattern syntax' 1
+check_rejects pattern_unsupported_constructor_float test/negative/pattern_unsupported_constructor_float.weft 'error[E0002]: unsupported pattern syntax' 1
+check_rejects pattern_unsupported_constructor_keyword test/negative/pattern_unsupported_constructor_keyword.weft 'error[E0002]: unsupported pattern syntax' 1
+check_rejects pattern_unsupported_constructor_nested test/negative/pattern_unsupported_constructor_nested.weft 'error[E0002]: unsupported pattern syntax' 1
+check_rejects pattern_unsupported_tuple_string test/negative/pattern_unsupported_tuple_string.weft 'error[E0002]: unsupported pattern syntax' 1
+check_rejects pattern_unsupported_tuple_later_float test/negative/pattern_unsupported_tuple_later_float.weft 'error[E0002]: unsupported pattern syntax' 1
+check_rejects pattern_unsupported_record_string test/negative/pattern_unsupported_record_string.weft 'error[E0002]: unsupported pattern syntax' 1
+check_rejects pattern_unsupported_let_tuple_string test/negative/pattern_unsupported_let_tuple_string.weft 'error[E0002]: unsupported pattern syntax' 1
+check_rejects pattern_unsupported_for_tuple_string test/negative/pattern_unsupported_for_tuple_string.weft 'error[E0002]: unsupported pattern syntax' 1
+check_rejects pattern_unsupported_if_let_string test/negative/pattern_unsupported_if_let_string.weft 'error[E0002]: unsupported pattern syntax' 1
+
 check_rejects 'else_alternative_value' 'test/negative/else_alternative_value.weft' 'expected '"'"'{'"'"' or '"'"'if'"'"' after '"'"'else'"'"'' 1
 check_rejects 'else_chain_missing_body' 'test/negative/else_chain_missing_body.weft' 'expected '"'"'{'"'"' after if condition' 1
 check_rejects 'else_chain_missing_equals' 'test/negative/else_chain_missing_equals.weft' 'expected '"'"'='"'"' after if-let pattern' 1
