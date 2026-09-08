@@ -131,7 +131,8 @@ for f in test/linked/*.weft; do
   # Run and check exit code (0 = pass). Fresh linked binaries can spend more
   # than 10s in cold macOS ad-hoc signature verification on first launch.
   exit_code=0
-  run_guarded "$WEFT_TEST_RUN_TIMEOUT" "$WEFT_TEST_RUN_RSS_LIMIT_KB" "$tmpbin" >/dev/null 2>/dev/null || exit_code=$?
+  run_output=$(mktemp /tmp/weft_linked_output_XXXXXX)
+  run_guarded "$WEFT_TEST_RUN_TIMEOUT" "$WEFT_TEST_RUN_RSS_LIMIT_KB" "$tmpbin" >"$run_output" 2>&1 || exit_code=$?
 
   if [ $exit_code -eq 0 ]; then
     echo "  ✓ $name"
@@ -147,10 +148,11 @@ for f in test/linked/*.weft; do
       echo "  ✗ $name (exit $exit_code)"
       ERRORS="$ERRORS\n  $name: exit $exit_code"
     fi
+    cat "$run_output"
     FAIL=$((FAIL+1))
   fi
 
-  rm -f "$tmpbin"
+  rm -f "$run_output" "$tmpbin"
 done
 
 echo ""
