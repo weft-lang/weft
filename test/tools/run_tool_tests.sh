@@ -3061,6 +3061,28 @@ assert_contains "mcp_diagnostics_large_response_items" "$mcp_out" '"items":[{"se
 # The stable wire value is the producer-owned Diagnostic, not a reconstruction
 # from its message. Cover every field family through real parser/checker
 # producers and retain a few fragments for the LSP parity assertions below.
+entry_missing_status=0
+printf '%s' 'type App { App } impl App { fn main(self) -> i64 { 0 } }' | "$WEFT" > "$tmp_bin" 2> "$tmp_out" || entry_missing_status=$?
+assert_equals "method_main_does_not_supply_program_entry" "$entry_missing_status" "1"
+assert_equals "missing_entry_emits_no_artifact" "$(wc -c < "$tmp_bin" | tr -d ' ')" "0"
+
+entry_source='effect EntryRead { fn get() -> i64 } fn main() -[EntryRead]> i64 { EntryRead.get() }'
+entry_check_status=0
+entry_check_out=$(printf '%s' "$entry_source" | "$WEFT" check 2>&1) || entry_check_status=$?
+assert_equals "entry_unhandled_check_exit" "$entry_check_status" "1"
+assert_contains "entry_unhandled_check_code" "$entry_check_out" 'error[E2001]: entry point `main` requires unhandled effects `EntryRead`'
+assert_contains "entry_unhandled_check_teaches_handler_boundary" "$entry_check_out" 'native startup supplies no effect handlers; make main pure and install the required handlers inside its body'
+assert_not_contains "entry_unhandled_check_does_not_suggest_effect_annotation" "$entry_check_out" 'add `-['
+entry_compile_status=0
+printf '%s' "$entry_source" | "$WEFT" > "$tmp_bin" 2> "$tmp_out" || entry_compile_status=$?
+assert_equals "entry_unhandled_compile_exit" "$entry_compile_status" "1"
+assert_equals "entry_unhandled_compile_emits_no_artifact" "$(wc -c < "$tmp_bin" | tr -d ' ')" "0"
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"effect EntryRead { fn get() -> i64 } fn main() -[EntryRead]> i64 { EntryRead.get() }"}}}' | "$WEFT" mcp 2>&1)
+assert_contains "mcp_entry_unhandled_stable_code" "$mcp_out" '"code":"E2001"'
+assert_contains "mcp_entry_unhandled_context" "$mcp_out" '"name":"context","value":"program entry point"'
+assert_contains "mcp_entry_unhandled_exact_capability" "$mcp_out" '"name":"EntryRead","arguments":[]'
+assert_contains "mcp_entry_unhandled_repair" "$mcp_out" 'make main pure and install the required handlers inside its body'
+
 wire_type_expected='{"kind":"type","name":"expected_type","value":{"kind":"primitive","name":"i64"}}'
 wire_type_found='{"kind":"type","name":"found_type","value":{"kind":"primitive","name":"str"}}'
 wire_effect_atom='{"kind":"effect_atom","name":"missing_effect","value":{"name":"Box","arguments":[{"kind":"primitive","name":"str"}]}}'
@@ -4600,7 +4622,9 @@ assert_contains "package_native_binding_rejects_target_substitution" "$pkg_nativ
 mkdir -p "$tmp_pkg_trust_dir/native_linked"
 printf '%s\n' '{"package":"native-smoke","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"system","kind":"system","link":"System","search":["toolchain"],"content":"toolchain","optional":false}],"symbols":[{"declaration":"native_abs","symbol":"labs","library":"system","params":["i64"],"result":"i64","optional":false},{"declaration":"native_fabs","symbol":"fabs","library":"system","params":["f64"],"result":"f64","optional":false},{"declaration":"native_roundf","symbol":"roundf","library":"system","params":["f32"],"result":"f32","optional":false},{"declaration":"native_ldexp","symbol":"ldexp","library":"system","params":["f64","i32"],"result":"f64","optional":false},{"declaration":"native_jn","symbol":"jn","library":"system","params":["i32","f64"],"result":"f64","optional":false},{"declaration":"native_unused","symbol":"weft_symbol_intentionally_absent","library":"system","params":[],"result":"nil","optional":true}]}}}}}' > "$tmp_pkg_trust_dir/native_linked/weft.pkg"
 printf '%s\n' \
-  'fn main() -[Unsafe]> i64 {' \
+  'use runtime/unsafe.{Unsafe}' \
+  'fn main() -> i64 {' \
+  '  handle {' \
   '  let rounded32: f32 = native_roundf(41.6)' \
   '  let checked64 = __f64_to_i64_trunc(native_fabs(0.0 - 42.75))' \
   '  let fp_then_gpr = __f64_to_i64_trunc(native_ldexp(10.5, 2))' \
@@ -4612,6 +4636,7 @@ printf '%s\n' \
   '      } else { 2 }' \
   '    } else { 3 }' \
   '  } else { 1 }' \
+  '  } { Unsafe.transmute(value) -> resume(__transmute(value)) }' \
   '}' > "$tmp_pkg_trust_dir/native_linked/main.weft"
 (cd "$tmp_pkg_trust_dir/native_linked" && run_weft_compile_guarded "$WEFT_ABS" compile main.weft) > "$tmp_pkg_trust_dir/native_linked/native.o"
 (cd "$tmp_pkg_trust_dir/native_linked" && run_weft_compile_guarded "$WEFT_ABS" compile main.weft) > "$tmp_pkg_trust_dir/native_linked/native_second.o"
@@ -4673,7 +4698,7 @@ native_dynamic_digest=${native_dynamic_digest_line%% *}
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"dynamic","kind":"dynamic","link":"weft_fixture_dynamic","search":["native/dynamic"],"content":"sha256:'"$native_dynamic_digest"'","optional":false}],"symbols":[{"declaration":"native_dynamic_value","symbol":"weft_dynamic_value","library":"dynamic","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_dynamic_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_dynamic_value() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_dynamic_only)
 codesign --verify "$tmp_pkg_trust_dir/native_artifacts/native_dynamic_only"
 native_dynamic_only_dependencies=$(otool -L "$tmp_pkg_trust_dir/native_artifacts/native_dynamic_only")
@@ -4761,7 +4786,7 @@ native_transitive_owner_digest=${native_transitive_owner_digest_line%% *}
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"owner","kind":"dynamic","link":"weft_transitive_owner","search":["native/dynamic_closure"],"content":"sha256:'"$native_transitive_owner_digest"'","optional":false}],"symbols":[{"declaration":"native_transitive_value","symbol":"weft_transitive_owner","library":"owner","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_transitive_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_transitive_value() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 set +e
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_transitive_undeclared) \
   > "$tmp_pkg_trust_dir/native_artifacts/native_transitive_undeclared.stdout" \
@@ -4798,7 +4823,7 @@ assert_equals "package_native_dynamic_transitive_closure_links_and_runs" "$pkg_n
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_fixture","search":["native/archive_first","native/archive_second"],"content":"sha256:'"$native_archive_digest"'","optional":false},{"id":"dynamic","kind":"dynamic","link":"weft_fixture_dynamic","search":["native/dynamic"],"content":"sha256:'"$native_dynamic_digest"'","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_archive_value","library":"archive","params":[],"result":"i64","optional":false},{"declaration":"native_dynamic_value","symbol":"weft_dynamic_value","library":"dynamic","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_archive_value() + native_dynamic_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_archive_value() + native_dynamic_value() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_artifacts)
 codesign --verify "$tmp_pkg_trust_dir/native_artifacts/native_artifacts"
 native_artifact_dependencies=$(otool -L "$tmp_pkg_trust_dir/native_artifacts/native_artifacts")
@@ -4833,7 +4858,7 @@ native_forward_digest=${native_forward_digest_line%% *}
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_forward","search":["native/archive_closure"],"content":"sha256:'"$native_forward_digest"'","license":"MIT","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_forward_a","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_archive_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_archive_value() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_forward --artifact-facts native_forward.facts.json)
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_forward_second)
 if cmp -s "$tmp_pkg_trust_dir/native_artifacts/native_forward" "$tmp_pkg_trust_dir/native_artifacts/native_forward_second"; then
@@ -4878,7 +4903,7 @@ assert_contains "package_native_artifact_names_main_subprogram" "$native_forward
 assert_contains "package_native_artifact_maps_main_source_attribute" "$native_forward_main_debug" "DW_AT_decl_file"
 assert_contains "package_native_artifact_maps_main_source" "$native_forward_main_debug" "main.weft"
 assert_contains "package_native_artifact_maps_main_line" "$native_forward_main_debug" "DW_AT_decl_line"
-assert_contains "package_native_artifact_maps_main_line_one" "$native_forward_main_debug" "(1)"
+assert_contains "package_native_artifact_maps_main_line_two" "$native_forward_main_debug" "(2)"
 /bin/cp "$tmp_pkg_trust_dir/native_artifacts/native_forward" "$tmp_native_debug_bin"
 chmod +x "$tmp_native_debug_bin"
 set +e
@@ -4895,7 +4920,7 @@ if [ "$native_forward_lldb_exit" -ne 0 ]; then
   printf '%s\n' "$native_forward_lldb" >&2
 fi
 assert_equals "package_native_artifact_lldb_session_exits_cleanly" "$native_forward_lldb_exit" "0"
-assert_contains "package_native_artifact_lldb_resolves_main" "$native_forward_lldb" "main at main.weft:1:4"
+assert_contains "package_native_artifact_lldb_resolves_main" "$native_forward_lldb" "main at main.weft:2:4"
 assert_contains "package_native_artifact_lldb_stops_in_main" "$native_forward_lldb" "stop reason = breakpoint"
 assert_contains "package_native_artifact_lldb_walks_caller_frame" "$native_forward_lldb" "frame #1:"
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_forward_stripped --artifact-facts native_forward_stripped.facts.json --strip-debug)
@@ -4951,7 +4976,7 @@ native_cycle_digest=${native_cycle_digest_line%% *}
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_cycle","search":["native/archive_closure"],"content":"sha256:'"$native_cycle_digest"'","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_cycle_a","library":"archive","params":["i64"],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_archive_value(1) }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_archive_value(1) } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_cycle)
 set +e
 run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_cycle"
@@ -4986,7 +5011,7 @@ native_relocation_matrix_digest=${native_relocation_matrix_digest_line%% *}
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_relocation_matrix","search":["native/archive_relocation_matrix"],"content":"sha256:'"$native_relocation_matrix_digest"'","optional":false}],"symbols":[{"declaration":"native_relocation_matrix","symbol":"weft_matrix_entry","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_relocation_matrix() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_relocation_matrix() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_relocation_matrix)
 set +e
 run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_relocation_matrix"
@@ -5008,7 +5033,7 @@ native_weak_only_digest=${native_weak_only_digest_line%% *}
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_weak_only","search":["native/archive_strength"],"content":"sha256:'"$native_weak_only_digest"'","optional":false}],"symbols":[{"declaration":"native_weak_only","symbol":"weft_weak_only","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_weak_only() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_weak_only() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_weak_only)
 set +e
 run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_weak_only"
@@ -5034,7 +5059,7 @@ native_strength_digest=${native_strength_digest_line%% *}
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_strength","search":["native/archive_strength"],"content":"sha256:'"$native_strength_digest"'","optional":false}],"symbols":[{"declaration":"native_choice","symbol":"weft_choice","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_choice() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_choice() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_strength)
 set +e
 run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_strength"
@@ -5045,7 +5070,7 @@ assert_equals "package_native_archive_strong_definition_beats_earlier_weak" "$pk
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_strength","search":["native/archive_strength"],"content":"sha256:'"$native_strength_digest"'","optional":false}],"symbols":[{"declaration":"native_weak_anchor","symbol":"weft_weak_anchor","library":"archive","params":[],"result":"i64","optional":false},{"declaration":"native_strong_anchor","symbol":"weft_strong_anchor","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_weak_anchor() + native_strong_anchor() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_weak_anchor() + native_strong_anchor() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_strength_selected)
 set +e
 run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_strength_selected"
@@ -5074,7 +5099,7 @@ native_common_digest=${native_common_digest_line%% *}
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_common","search":["native/archive_strength"],"content":"sha256:'"$native_common_digest"'","optional":false}],"symbols":[{"declaration":"native_common_set","symbol":"weft_common_set","library":"archive","params":["i64"],"result":"i64","optional":false},{"declaration":"native_common_get","symbol":"weft_common_get","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_common_set(42) native_common_get() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_common_set(42) native_common_get() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_common)
 set +e
 run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_common"
@@ -5100,7 +5125,7 @@ native_common_override_digest=${native_common_override_digest_line%% *}
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_common_override","search":["native/archive_strength"],"content":"sha256:'"$native_common_override_digest"'","optional":false}],"symbols":[{"declaration":"native_common_read","symbol":"weft_common_read","library":"archive","params":[],"result":"i64","optional":false},{"declaration":"native_strong_read","symbol":"weft_strong_read","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_common_read() + native_strong_read() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_common_read() + native_strong_read() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_common_override)
 set +e
 run_binary_guarded "$tmp_pkg_trust_dir/native_artifacts/native_common_override"
@@ -5137,7 +5162,7 @@ native_multi_digest=${native_multi_digest_line%% *}
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_sections","search":["native/archive_sections"],"content":"sha256:'"$native_multi_digest"'","optional":false}],"symbols":[{"declaration":"native_multi_section_value","symbol":"weft_multi_section_value","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_multi_section_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_multi_section_value() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_multi_section)
 native_multi_output_sections=$(otool -l "$tmp_pkg_trust_dir/native_artifacts/native_multi_section")
 assert_contains "package_native_archive_output_preserves_64k_alignment" "$native_multi_output_sections" "align 2^16 (65536)"
@@ -5171,7 +5196,7 @@ native_bad_reloc_digest=${native_bad_reloc_digest_line%% *}
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_bad_reloc","search":["native/archive_relocations"],"content":"sha256:'"$native_bad_reloc_digest"'","optional":false}],"symbols":[{"declaration":"native_bad_reloc","symbol":"weft_bad_reloc","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_bad_reloc() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_bad_reloc() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 set +e
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_bad_reloc) \
   > "$tmp_pkg_trust_dir/native_artifacts/native_bad_reloc.stdout" \
@@ -5205,7 +5230,7 @@ native_duplicate_digest=${native_duplicate_digest_line%% *}
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_duplicate","search":["native/archive_strength"],"content":"sha256:'"$native_duplicate_digest"'","optional":false}],"symbols":[{"declaration":"native_pick_a","symbol":"weft_pick_a","library":"archive","params":[],"result":"i64","optional":false},{"declaration":"native_pick_b","symbol":"weft_pick_b","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_pick_a() + native_pick_b() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_pick_a() + native_pick_b() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 set +e
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_duplicate) \
   > "$tmp_pkg_trust_dir/native_artifacts/native_duplicate.stdout" \
@@ -5233,7 +5258,7 @@ native_malformed_digest=${native_malformed_digest_line%% *}
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_malformed","search":["native/archive_closure"],"content":"sha256:'"$native_malformed_digest"'","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_missing","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_archive_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_archive_value() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 set +e
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" build main.weft -o native_malformed) \
   > "$tmp_pkg_trust_dir/native_artifacts/native_malformed.stdout" \
@@ -5252,7 +5277,7 @@ fi
 printf '%s\n' \
   '{"package":"native-artifacts","manifest_version":1,"version":"1.0.0","weft":"0.1","dependencies":{},"trusted_bindings":["main"],"native_bindings":{"main":{"abi_version":1,"targets":{"macos-aarch64":{"libraries":[{"id":"archive","kind":"archive","link":"weft_fixture","search":["native/archive_first","native/archive_second"],"content":"sha256:0000000000000000000000000000000000000000000000000000000000000000","optional":false}],"symbols":[{"declaration":"native_archive_value","symbol":"weft_archive_value","library":"archive","params":[],"result":"i64","optional":false}]}}}}}' \
   > "$tmp_pkg_trust_dir/native_artifacts/weft.pkg"
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_archive_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_archive_value() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 set +e
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" compile main.weft) > "$tmp_pkg_trust_dir/native_artifacts/mismatched.o" 2> "$tmp_pkg_trust_dir/native_artifacts/mismatched.err"
 pkg_native_mismatch_exit=$?
@@ -5274,7 +5299,7 @@ printf '%s\n' 'fn main() -> i64 { 0 }' > "$tmp_pkg_trust_dir/native_artifacts/ma
 optional_uncalled_symbols=$(nm -u "$tmp_pkg_trust_dir/native_artifacts/optional_uncalled.o")
 assert_not_contains "package_native_uncalled_optional_library_is_omitted" "$optional_uncalled_symbols" "_weft_optional_value"
 
-printf '%s\n' 'fn main() -[Unsafe]> i64 { native_optional_value() }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
+printf '%s\n' 'use runtime/unsafe.{Unsafe}' 'fn main() -> i64 { handle { native_optional_value() } { Unsafe.transmute(value) -> resume(__transmute(value)) } }' > "$tmp_pkg_trust_dir/native_artifacts/main.weft"
 set +e
 (cd "$tmp_pkg_trust_dir/native_artifacts" && run_weft_compile_guarded "$WEFT_ABS" compile main.weft) > "$tmp_pkg_trust_dir/native_artifacts/optional_called.o" 2> "$tmp_pkg_trust_dir/native_artifacts/optional_called.err"
 pkg_native_optional_called_exit=$?

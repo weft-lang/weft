@@ -49,7 +49,9 @@ weft build hello.weft -o hello
 
 The terminal handler supplies console access. Returning `nil` from `main`
 means success; an `i64` return value sets the process exit code. Diagnostics go
-to stderr. `weft run PATH`
+to stderr. The program's `main` must be pure: install its required handlers
+inside the body or through module defaults. Declaring an effect on `main`
+does not supply a handler at native startup. `weft run PATH`
 builds the host target through the same checked/native pipeline as `build`,
 executes it directly with inherited standard streams and environment, forwards
 its exact exit status, and removes its private temporary executable. Product

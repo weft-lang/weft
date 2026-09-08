@@ -58,6 +58,11 @@ check_rejects() {
   JOB_N=$((JOB_N+1))
 }
 
+check_rejects "entry_unhandled_effect" "test/negative/entry_unhandled_effect.weft" 'entry point `main` requires unhandled effects' 1
+check_rejects "entry_unhandled_effect_unused" "test/negative/entry_unhandled_effect_unused.weft" 'entry point `main` requires unhandled effects' 1
+check_rejects "entry_unhandled_effect_open_tail" "test/negative/entry_unhandled_effect_open_tail.weft" 'entry point `main` requires unhandled effects' 1
+check_rejects "entry_unhandled_effect_unannotated" "test/negative/entry_unhandled_effect_unannotated.weft" 'effect `EntryRead` is not available in this context' 1
+check_rejects "entry_unhandled_effect_parameterized" "test/negative/entry_unhandled_effect_parameterized.weft" 'entry point `main` requires unhandled effects' 1
 check_rejects "import_missing_path" "test/negative/import_missing_path.weft" "expected path-form module after 'use'"
 check_rejects "import_dangling_selection_dot" "test/negative/import_dangling_selection_dot.weft" "expected '{' after '.' in import selection"
 check_rejects "import_unclosed_selection" "test/negative/import_unclosed_selection.weft" "expected '}' after import selection"
