@@ -58,6 +58,11 @@ check_rejects() {
   JOB_N=$((JOB_N+1))
 }
 
+check_rejects grammar_parse_requires_diagnose test/negative/grammar_parse_requires_diagnose.weft 'error[E2001]:' 1
+check_rejects grammar_impl_extra_effect test/negative/grammar_impl_extra_effect.weft 'impl method effect mismatch' 1
+check_rejects grammar_result_wrong_syntax test/negative/grammar_result_wrong_syntax.weft 'error[E1002]:' 1
+check_rejects grammar_raw_source_requires_trust test/negative/grammar_raw_source_requires_trust.weft 'Unsafe is sealed to trusted runtime/platform code' 1
+
 check_rejects module_stray_brace test/negative/module_stray_brace.weft 'error[E0002]: expected a module declaration' 1
 check_rejects module_stray_paren test/negative/module_stray_paren.weft 'error[E0002]: expected a module declaration' 1
 check_rejects module_stray_bracket test/negative/module_stray_bracket.weft 'error[E0002]: expected a module declaration' 1

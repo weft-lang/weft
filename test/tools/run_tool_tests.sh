@@ -707,7 +707,7 @@ stdlib_doc_modules=(
   stdlib/prelude.weft stdlib/assert.weft stdlib/default.weft stdlib/display.weft stdlib/drop.weft
   stdlib/eq.weft stdlib/hash.weft stdlib/ord.weft stdlib/panic.weft
   stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft
-  stdlib/maybe.weft stdlib/bytes.weft stdlib/source.weft stdlib/string.weft stdlib/string/builder.weft stdlib/path.weft stdlib/io/types.weft
+  stdlib/maybe.weft stdlib/bytes.weft stdlib/source.weft stdlib/grammar.weft stdlib/string.weft stdlib/string/builder.weft stdlib/path.weft stdlib/io/types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft
   stdlib/time/monotonic.weft stdlib/time/wall.weft
@@ -1033,8 +1033,15 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_sse_stream_pins_public_surface" "$(<"$tmp_out")" "Public API items: 25. Documented: 25."
     assert_contains "doc_stdlib_sse_stream_pins_owned_reader" "$(<"$tmp_out")" "pub type SseReader<S> = opaque"
     assert_contains "doc_stdlib_sse_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn next<S>(self: owned SseReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseReadOutcome<S>"
+  elif [ "$stdlib_doc_name" = "grammar" ]; then
+    assert_contains "doc_stdlib_grammar_public_contract" "$(<"$tmp_out")" "Public API items: 7. Documented: 7."
+    assert_contains "doc_stdlib_grammar_associated_syntax" "$(<"$tmp_out")" "type Syntax"
+    assert_contains "doc_stdlib_grammar_retained_source_and_effect" "$(<"$tmp_out")" "fn parse(self: Self, source: Span) -[Diagnose]> ParseResult<Self.Syntax>"
+    assert_contains "doc_stdlib_grammar_recovery" "$(<"$tmp_out")" "Recovered(T)"
+    assert_contains "doc_stdlib_grammar_rejection" "$(<"$tmp_out")" "Rejected"
   elif [ "$stdlib_doc_name" = "diagnostic" ]; then
-    assert_contains "doc_stdlib_diagnostic_public_facade" "$(<"$tmp_out")" "Public API items: 79. Documented: 79."
+    assert_contains "doc_stdlib_diagnostic_public_facade" "$(<"$tmp_out")" "Public API items: 80. Documented: 80."
+    assert_contains "doc_stdlib_diagnostic_location_transform_effects" "$(<"$tmp_out")" "pub fn map_locations<E>(self: Diagnostic, transform: (DiagnosticLocation) -[E]> DiagnosticLocation) -[E]> Diagnostic"
     assert_contains "doc_stdlib_diagnostic_code_equality" "$(<"$tmp_out")" "impl stdlib/eq.Eq for DiagnosticCode"
     assert_contains "doc_stdlib_diagnostic_finite_related_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticRelatedLocationList) -> usize"
     assert_contains "doc_stdlib_diagnostic_finite_edit_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticTextEditList) -> usize"

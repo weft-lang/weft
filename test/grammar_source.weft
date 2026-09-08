@@ -1,0 +1,170 @@
+use compiler/grammar_source.{WeftParser, ParsedWeftSource}
+use compiler/type_registry.{ttable_new}
+use compiler/lib.{nlist_len}
+use runtime/rc.{rc_count}
+use stdlib/grammar.{Grammar, ParseResult, Parsed, Recovered, Rejected}
+use stdlib/source.{Source, Span}
+use stdlib/diagnostic.{*}
+use stdlib/diagnostic/schema.{*}
+use stdlib/option.{Option}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/state as state
+use stdlib/utf8
+use stdlib/string.{str_concat}
+
+fn parse_fragment<G: Grammar>(grammar: G, span: Span) -[Diagnose]> ParseResult<G.Syntax> {
+  grammar.parse(span)
+}
+
+fn collect_fragment(span: Span) -> (ParseResult<ParsedWeftSource>, List<Diagnostic>) {
+  state.run(Nil<Diagnostic>(), () => handle parse_fragment(WeftParser { table: ttable_new() }, span) {
+    Diagnose.report(diagnostic) -> {
+      state.modify((items: List<Diagnostic>) => Cons(diagnostic, items))
+      resume(0)
+    }
+    Diagnose.error(message, location) -> resume(0)
+    Diagnose.warn(message, location) -> resume(0)
+    Diagnose.note(message, location) -> resume(0)
+  })
+}
+
+test "retained grammar source excludes surrounding host text" {
+  let source = Source { text: "é BEGIN fn value() -> i64 { 42 } END", identity: DiagnosticSourceNamed("host.weft") }
+  let fragment = source.span(9, 33).unwrap()
+  let (result, diagnostics) = collect_fragment(fragment)
+  Test.assert_eq_usize(diagnostics.len(), 0)
+  Test.assert_true(match result {
+    Parsed(syntax) -> syntax.source.start() == 9 and nlist_len(syntax.declarations.functions) == 1
+    _ -> false
+  })
+}
+
+test "fragment recovery retains the original diagnostic source and byte offsets" {
+  let source = Source { text: "é BEGIN } fn value() -> i64 { 42 } END", identity: DiagnosticSourceNamed("host.weft") }
+  let fragment = source.span(9, 35).unwrap()
+  let (result, diagnostics) = collect_fragment(fragment)
+  Test.assert_eq_usize(diagnostics.len(), 1)
+  Test.assert_true(match result { Recovered(syntax) -> nlist_len(syntax.declarations.functions) == 1, _ -> false })
+  Test.assert_true(match diagnostics.first().unwrap().primary() {
+    DiagnosticSourceRange(DiagnosticSourceNamed(name), start, end) -> name == "host.weft" and start == 9 and end == 10
+    _ -> false
+  })
+}
+
+test "fragment diagnostics ignore host comments while retaining fragment trivia warnings" {
+  let control = utf8.from_scalar(0x202E).unwrap()
+  let outside_text = "-- " |> str_concat(control) |> str_concat(" HOST\nfn value() -> i64 { 42 }")
+  let outside = Source { text: outside_text, identity: DiagnosticSourceNamed("host.weft") }
+  let (result, diagnostics) = collect_fragment(outside.span(12, outside.text.len()).unwrap())
+  Test.assert_eq_usize(diagnostics.len(), 0)
+  Test.assert_true(match result { Parsed(_) -> true, _ -> false })
+  let inside_text = "HOST -- " |> str_concat(control) |> str_concat(" FRAGMENT\nfn value() -> i64 { 42 }")
+  let inside = Source { text: inside_text, identity: DiagnosticSourceNamed("host.weft") }
+  let (accepted, warnings) = collect_fragment(inside.span(5, inside.text.len()).unwrap())
+  Test.assert_eq_usize(warnings.len(), 1)
+  Test.assert_true(match accepted { Parsed(_) -> true, _ -> false })
+  Test.assert_true(match warnings.first().unwrap().primary() {
+    DiagnosticSourceRange(DiagnosticSourceNamed(name), start, end) -> name == "host.weft" and start == 8 and end == 11
+    _ -> false
+  })
+}
+
+test "a partial UTF8 source range is rejected with its original byte location" {
+  let source = Source { text: "é fn value() -> i64 { 42 }", identity: DiagnosticSourceNamed("unicode.weft") }
+  for bounds in [(0, 1), (1, 2)] {
+    let fragment = source.span(__i64_to_usize(bounds.0), __i64_to_usize(bounds.1)).unwrap()
+    let (result, diagnostics) = collect_fragment(fragment)
+    Test.assert_true(match result { Rejected -> true, _ -> false })
+    Test.assert_eq_usize(diagnostics.len(), 1)
+    Test.assert_true(diagnostics.first().unwrap().code().eq(DiagnosticCodeAssigned("E0001")))
+    Test.assert_true(match diagnostics.first().unwrap().primary() {
+      DiagnosticSourceRange(DiagnosticSourceNamed(name), start, end) -> name == "unicode.weft" and start == __i64_to_usize(bounds.0) and end == __i64_to_usize(bounds.1)
+      _ -> false
+    })
+  }
+}
+
+test "fragment missing delimiter diagnostics retain related locations and edit positions" {
+  let source = Source { text: "HOST fn value() -> i64 { 42 END", identity: DiagnosticSourceNamed("outer.weft") }
+  let (result, diagnostics) = collect_fragment(source.span(5, 26).unwrap())
+  Test.assert_true(match result { Recovered(_) -> true, _ -> false })
+  Test.assert_eq_usize(diagnostics.len(), 1)
+  let diagnostic = diagnostics.first().unwrap()
+  Test.assert_true(match diagnostic.primary() {
+    DiagnosticSourceRange(DiagnosticSourceNamed(name), start, end) -> name == "outer.weft" and start == 26 and end == 26
+    _ -> false
+  })
+  Test.assert_true(match diagnostic.related() {
+    DiagnosticRelatedLocationCons(DiagnosticRelatedLocation(label, DiagnosticSourceRange(DiagnosticSourceNamed(name), start, end)), DiagnosticRelatedLocationNil) ->
+      label == "construct opened here" and name == "outer.weft" and start == 23 and end == 24
+    _ -> false
+  })
+  let mut fields = diagnostic.fields()
+  let mut edits = 0
+  loop {
+    match fields {
+      DiagnosticFieldNil -> break
+        DiagnosticFieldCons(field, rest) -> {
+        match field {
+          DiagnosticFieldSuggestion(DiagnosticSuggestion(_, applicability, replacements)) -> {
+            Test.assert_true(match applicability { DiagnosticSuggestionMachineApplicable -> true, _ -> false })
+            Test.assert_true(match replacements {
+              DiagnosticTextEditCons(DiagnosticTextEdit(DiagnosticSourceRange(DiagnosticSourceNamed(name), start, end), text), DiagnosticTextEditNil) ->
+                name == "outer.weft" and start == 26 and end == 26 and text == "}"
+              _ -> false
+            })
+            edits = edits + 1
+          }
+          _ -> nil
+        }
+        fields = rest
+      }
+    }
+  }
+  Test.assert_eq(edits, 1)
+}
+
+fn retained_grammar_product() -> ParseResult<ParsedWeftSource> {
+  let source = Source { text: "fn value() -> str { ".concat("\"retained\" }"), identity: DiagnosticSourceNamed("owned".concat(".weft")) }
+  let (result, _) = collect_fragment(source.all())
+  result
+}
+
+test "a grammar product keeps its source alive after the parsing call returns" {
+  let result = retained_grammar_product()
+  for _ in 0..64 {
+    let other = "other source".repeat(32)
+    Test.assert_eq_usize(other.len(), 384)
+    Test.assert_true(match result {
+      Parsed(syntax) -> syntax.source.text().unwrap() == "fn value() -> str { \"retained\" }" and nlist_len(syntax.declarations.functions) == 1
+      _ -> false
+    })
+  }
+}
+
+effect AbandonGrammar { fn abandon() -> nil }
+
+effect SuspendGrammar { @deferred fn suspend() -> nil }
+
+fn hold_grammar_source(text: str, mode: i64) -[Test, AbandonGrammar, SuspendGrammar]> nil {
+  let source = Source { text: text, identity: DiagnosticSourceNamed("owned.weft") }
+  let (result, diagnostics) = collect_fragment(source.all())
+  Test.assert_eq_usize(diagnostics.len(), 0)
+  if mode == 1 { AbandonGrammar.abandon() }
+  if mode == 2 { SuspendGrammar.suspend() }
+  Test.assert_true(match result { Parsed(syntax) -> syntax.source.text().unwrap() == text, _ -> false })
+  nil
+}
+
+test "grammar source ownership balances normal abort and continuation-drop exits" {
+  let text = "fn value() -> i64 { ".concat("42 }")
+  Test.assert_eq(rc_count(__str_ptr(text) - 16), 1)
+  for _ in 0..16 {
+    for mode in [0, 1, 2] {
+      handle {
+        handle hold_grammar_source(text, mode) { AbandonGrammar.abandon() -> nil }
+      } { SuspendGrammar.suspend() with k -> nil }
+      Test.assert_eq(rc_count(__str_ptr(text) - 16), 1)
+    }
+  }
+}

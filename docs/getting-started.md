@@ -448,6 +448,60 @@ and removes the exact installed compiler at the end. `test/run_release_signing.s
 pins signature trust, tamper refusal, platform-fact consistency, archive safety,
 and missing-authority failures without containing any production credential.
 
+## Retained source and grammar modules
+
+`stdlib/source` pairs immutable text with a diagnostic identity. A `Span`
+retains that source and a checked half-open byte range. `subspan()` takes
+relative offsets while `location()` keeps the original source identity and
+absolute byte offsets. `text()` returns `None` when a range splits a UTF-8
+scalar; byte ranges remain useful for diagnosing that input.
+
+A grammar implements `stdlib/grammar.Grammar` and chooses its associated
+`Syntax` type. Its caller supplies the source and handles `Diagnose`; parsing
+has no source-loading authority. The result distinguishes complete syntax
+(`Parsed`), retained partial syntax after errors (`Recovered`), and input that
+could not produce syntax (`Rejected`). Warnings may accompany `Parsed`.
+Checking and execution are subsequent operations over the grammar's syntax.
+
+```weft check
+use stdlib/grammar.{Grammar, ParseResult, Parsed, Rejected}
+use stdlib/source.{Span}
+use stdlib/diagnostic.{*}
+use stdlib/option.{Option, Some, None}
+
+type SwitchGrammar { SwitchGrammar }
+type SwitchSyntax { source: Span, enabled: bool }
+
+impl Grammar for SwitchGrammar {
+  type Syntax = SwitchSyntax
+
+  fn parse(self, source: Span) -[Diagnose]> ParseResult<SwitchSyntax> {
+    let enabled = match source.text() {
+      Some(text) -> if text == "on" { Some(true) }
+        else if text == "off" { Some(false) }
+        else { None<bool>() }
+      None -> None<bool>()
+    }
+    match enabled {
+      Some(value) -> Parsed(SwitchSyntax { source: source, enabled: value })
+      None -> {
+        Diagnose.report(uncoded(DiagnosticSeverityError, DiagnosticClassParse,
+          "expected on or off", source.location()))
+        Rejected<SwitchSyntax>()
+      }
+    }
+  }
+}
+
+fn parse_fragment<G: Grammar>(grammar: G, source: Span) -[Diagnose]> ParseResult<G.Syntax> {
+  grammar.parse(source)
+}
+```
+
+The formatter consumes this same parse contract for Weft source. Its current
+Weft syntax storage is compiler-private; the reusable contract does not require
+other grammars to use Weft tokens or its AST representation.
+
 ## Diagnostics, formatting, and API docs
 
 Useful feedback commands are:
@@ -497,6 +551,13 @@ fn byte_range(location: DiagnosticLocation) -> Option<(usize, usize)> {
   }
 }
 ```
+
+`diagnostic.map_locations(transform)` translates every location while preserving
+severity, code, message and other fields. It visits the primary location,
+related locations, then field locations and suggestion edits in their stored
+order, including absent locations. Effects from the transform remain explicit
+in the caller's signature. This supports embedded-source diagnostics without
+losing related spans or suggested edits.
 
 `stdlib/diagnostic/schema` remains the declaration-only entry point for
 analysis tools that need the diagnostic contract without helper implementations.
