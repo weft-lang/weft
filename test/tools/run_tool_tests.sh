@@ -2324,6 +2324,24 @@ assert_contains "check_parse_and_typecheck" "$check_out" "functions, 0 errors"
 check_path_out=$("$WEFT" check "$tmp_src" 2>&1)
 assert_equals "check_path_parse_and_typecheck" "$check_path_out" "$check_out"
 
+printf '%s\n' 'fn main() -> i64 { let pair = ((value: i64) => value + 10, 0); (pair.0)(1) }' > "$tmp_src"
+ast_out=$("$WEFT" ast "$tmp_src" 2>&1)
+assert_contains "ast_retains_expression_application" "$ast_out" "Apply"
+"$WEFT" fmt "$tmp_src" > "$tmp_out" 2> "$tmp_err"
+assert_equals "fmt_application_stderr_empty" "$(<"$tmp_err")" ""
+assert_contains "fmt_preserves_projection_call" "$(<"$tmp_out")" "(pair.0)(1)"
+"$WEFT" fmt < "$tmp_out" > "$tmp_import" 2> "$tmp_err"
+assert_files_equal "fmt_application_is_idempotent" "$tmp_out" "$tmp_import"
+"$WEFT" compile "$tmp_out" > "$tmp_bin" 2> "$tmp_err"
+chmod +x "$tmp_bin"
+set +e
+"$tmp_bin" > "$tmp_out" 2> "$tmp_err"
+application_exit=$?
+set -e
+assert_equals "formatted_application_calls_selected_function" "$application_exit" "11"
+assert_equals "formatted_application_runtime_stderr_empty" "$(<"$tmp_err")" ""
+printf 'fn main() -> i64 { 42 }\n' > "$tmp_src"
+
 printf 'fn clean() -> i64 { 42 }\n' > "$tmp_check_clean"
 printf 'fn first_bad() -> i64 { missing_first }\n' > "$tmp_check_fail"
 tmp_check_spaced="$tmp_check_dir/check spaced.weft"
@@ -2857,6 +2875,12 @@ assert_equals "mcp_conformance_at_position_requires_trait" "$mcp_out" '{"jsonrpc
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -> i64 { 42 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_clean_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":0,"functions":1,"check_errors":0,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn main() -> i64 { (1)(2) }"}}}' | "$WEFT" mcp 2>&1)
+assert_contains "mcp_application_has_stable_type_code" "$mcp_out" '"code":"E1002"'
+assert_contains "mcp_application_retains_reason" "$mcp_out" '"name":"reason","value":"non_callable"'
+assert_contains "mcp_application_retains_call_site" "$mcp_out" '"span":22,"end_span":23'
+assert_contains "mcp_application_retains_callable_type" "$mcp_out" '"name":"expected_type","value":{"kind":"function"'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"test \"x\" { 0 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_test_block_clean_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":0,"functions":1,"check_errors":0,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[]}}'

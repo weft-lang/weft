@@ -1,0 +1,274 @@
+use runtime/rc_implicit_test.{*}
+use runtime/defer_order_test.{OwnedAbortToken, defer_order_log_new, defer_order_log_read, defer_order_log_write, owned_abort_token_new}
+
+effect ApplicationSuspend { @deferred fn get() -> i64 }
+
+effect ApplicationInspect { fn get(value: i64) -> i64 }
+
+effect ApplicationSuspendInspect { @deferred fn get(value: i64) -> i64 }
+
+fn captured_probe(probe: RuntimeRcProbe) -> (i64) -> i64 {
+  value => runtime_rc_probe_load(probe) + value
+}
+
+fn captured_abort(probe: RuntimeRcProbe) -> (i64) -[Fail<i64>]> i64 {
+  value => { runtime_rc_probe_load(probe); Fail<i64>.fail(value) }
+}
+
+fn application_churn(probe: RuntimeRcProbe, count: i64) -> i64 {
+  let mut result = 0
+  for index in 0..count { result = result + captured_probe(probe)(1) }
+  result
+}
+
+fn application_return_in_argument(probe: RuntimeRcProbe) -> i64 {
+  captured_probe(probe)({ return 42 })
+}
+
+test "temporary callees release captured owners after ordinary calls" {
+  let probe = runtime_rc_probe_new(41)
+  Test.assert_eq(application_churn(probe, 100), 4200)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "temporary callee reclamation remains bounded under repeated calls" {
+  let probe = runtime_rc_probe_new(41)
+  application_churn(probe, 200)
+  let before = runtime_rc_test_heap_arena_offset()
+  Test.assert_eq(application_churn(probe, 10000), 420000)
+  let after = runtime_rc_test_heap_arena_offset()
+  Test.assert_eq(after - before, 0)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "an aborting argument drops the selected callee" {
+  let probe = runtime_rc_probe_new(41)
+  let result = handle captured_probe(probe)(Fail<i64>.fail(42)) { Fail.fail(value) -> value }
+  Test.assert_eq(result, 42)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "a return in an argument drops the selected callee" {
+  let probe = runtime_rc_probe_new(41)
+  Test.assert_eq(application_return_in_argument(probe), 42)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "an aborting application drops its callee environment" {
+  let probe = runtime_rc_probe_new(41)
+  let result = handle captured_abort(probe)(42) { Fail.fail(value) -> value }
+  Test.assert_eq(result, 42)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "a suspended argument retains its callee until the continuation resumes" {
+  let probe = runtime_rc_probe_new(40)
+  let result = handle captured_probe(probe)(ApplicationSuspend.get()) {
+    ApplicationSuspend.get() with k -> {
+      let result = k(1)
+      result + 1
+    }
+  }
+  Test.assert_eq(result, 42)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "dropping an argument continuation drops the selected callee" {
+  let probe = runtime_rc_probe_new(40)
+  let result = handle captured_probe(probe)(ApplicationSuspend.get()) {
+    ApplicationSuspend.get() with k -> 42
+  }
+  Test.assert_eq(result, 42)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+fn consume_function(f: (i64) -> i64, value: i64) -> i64 { f(value) }
+
+fn named_call_return_in_argument(probe: RuntimeRcProbe) -> i64 {
+  consume_function(captured_probe(probe), { return 42 })
+}
+
+fn conditional_argument_return(probe: RuntimeRcProbe, early: bool) -> i64 {
+  captured_probe(probe)(if early { return 42 } else { 1 })
+}
+
+test "ordinary calls also release earlier temporary arguments on return" {
+  let probe = runtime_rc_probe_new(41)
+  Test.assert_eq(named_call_return_in_argument(probe), 42)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "argument branches distinguish returning from completing the call" {
+  let probe = runtime_rc_probe_new(41)
+  Test.assert_eq(conditional_argument_return(probe, true), 42)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+  Test.assert_eq(conditional_argument_return(probe, false), 42)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+fn token_operation(token: owned OwnedAbortToken, value: i64) -> i64 { value }
+
+fn owned_argument_early_return(log: i64) -> i64 {
+  let pair = (token_operation, 0)
+  (pair.0)(owned_abort_token_new(log, 4), { return 42 })
+}
+
+test "returning before an application drops an earlier owned argument" {
+  let log = defer_order_log_new()
+  Test.assert_eq(owned_argument_early_return(log), 42)
+  Test.assert_eq(defer_order_log_read(log), 4)
+}
+
+test "a break in an argument releases the selected callee" {
+  let probe = runtime_rc_probe_new(41)
+  let result = loop { captured_probe(probe)({ break (42) }) }
+  Test.assert_eq(result, 42)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "ordinary calls release earlier arguments on loop exits" {
+  let probe = runtime_rc_probe_new(41)
+  let result = loop { consume_function(captured_probe(probe), { break (42) }) }
+  Test.assert_eq(result, 42)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "continuing from an argument releases each selected callee" {
+  let probe = runtime_rc_probe_new(41)
+  let mut index = 0
+  while index < 10 {
+    index = index + 1
+    captured_probe(probe)({ continue })
+  }
+  Test.assert_eq(index, 10)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "a nested argument loop keeps the outer callee alive" {
+  let probe = runtime_rc_probe_new(41)
+  let result = captured_probe(probe)({
+    let value: i64 = loop { break (1) }
+    Test.assert_eq(runtime_rc_probe_count(probe), 2)
+    value
+  })
+  Test.assert_eq(result, 42)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "owned arguments and argument locals drop on break" {
+  let log = defer_order_log_new()
+  let pair = (token_operation, 0)
+  let result = loop {
+    (pair.0)(owned_abort_token_new(log, 4), {
+      let local = owned_abort_token_new(log, 7)
+      break (42)
+    })
+  }
+  Test.assert_eq(result, 42)
+  Test.assert_eq(defer_order_log_read(log), 74)
+}
+
+test "conditional argument exits preserve both ownership paths" {
+  let probe = runtime_rc_probe_new(41)
+  let mut index = 0
+  let result = loop {
+    index = index + 1
+    captured_probe(probe)(if index == 3 { break (42) } else { 1 })
+  }
+  Test.assert_eq(result, 42)
+  Test.assert_eq(index, 3)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "argument defers run before earlier owned arguments are dropped" {
+  let log = defer_order_log_new()
+  let pair = (token_operation, 0)
+  let result = loop {
+    (pair.0)(owned_abort_token_new(log, 4), {
+      defer defer_order_log_write(log, 7)
+      break (42)
+    })
+  }
+  Test.assert_eq(result, 42)
+  Test.assert_eq(defer_order_log_read(log), 74)
+}
+
+test "mutable argument locals release their final value on loop exit" {
+  let probe = runtime_rc_probe_new(41)
+  let result = loop {
+    captured_probe(probe)({
+      let mut local = captured_probe(probe)
+      local = captured_probe(probe)
+      break (42)
+    })
+  }
+  Test.assert_eq(result, 42)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "an argument defer precedes local Drop on an early loop exit" {
+  let log = defer_order_log_new()
+  let pair = (token_operation, 0)
+  let result = loop {
+    (pair.0)(owned_abort_token_new(log, 4), {
+      defer defer_order_log_write(log, 7)
+      let local: owned OwnedAbortToken = owned_abort_token_new(log, 8)
+      break (42)
+    })
+  }
+  Test.assert_eq(result, 42)
+  Test.assert_eq(defer_order_log_read(log), 784)
+}
+
+test "application transfers an owned argument to the callee exactly once" {
+  let log = defer_order_log_new()
+  let pair = (token_operation, 0)
+  Test.assert_eq((pair.0)(owned_abort_token_new(log, 4), 42), 42)
+  Test.assert_eq(defer_order_log_read(log), 4)
+}
+
+effect ApplicationResume { fn get() -> i64 }
+
+test "resuming from an argument releases the selected callee" {
+  let probe = runtime_rc_probe_new(41)
+  let result = handle ApplicationResume.get() {
+    ApplicationResume.get() -> captured_probe(probe)(resume(42))
+  }
+  Test.assert_eq(result, 42)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "a handler inside an argument loop preserves its live locals" {
+  let probe = runtime_rc_probe_new(41)
+  for index in 0..4 {
+    let result = handle captured_probe(probe)(ApplicationInspect.get(index)) {
+      ApplicationInspect.get(value) -> {
+        let local = captured_probe(probe)
+        let selected = if value == 0 { 1 } else { 2 }
+        resume(local(selected))
+      }
+    }
+    Test.assert_eq(result, if index == 0 { 83 } else { 84 })
+    Test.assert_eq(runtime_rc_probe_count(probe), 1)
+  }
+}
+
+test "deferred bodies and return transforms preserve locals inside loops" {
+  let probe = runtime_rc_probe_new(41)
+  for index in 0..4 {
+    let result = handle {
+      let local = captured_probe(probe)
+      let selected = if index == 0 { 1 } else { 2 }
+      local(ApplicationSuspendInspect.get(selected))
+    } {
+      ApplicationSuspendInspect.get(value) with k -> k(value)
+      return value -> {
+        let local = captured_probe(probe)
+        let selected = if value == 42 { 1 } else { 2 }
+        local(selected)
+      }
+    }
+    Test.assert_eq(result, if index == 0 { 42 } else { 43 })
+    Test.assert_eq(runtime_rc_probe_count(probe), 1)
+  }
+}

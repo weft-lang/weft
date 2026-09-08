@@ -1023,6 +1023,18 @@ check_rejects "module_handler_escape" "test/negative/module_handler_escape.weft"
 check_rejects "module_handler_member_call_ambiguity" "test/negative/module_handler_member_call_ambiguity.weft" "expected '{' after handler configuration"
 check_rejects "module_handler_generic_arity" "test/negative/module_handler_generic_arity.weft" "type error: wrong number of handler type arguments"
 check_rejects "module_handler_constructor_type" "test/negative/module_handler_constructor_type.weft" 'error[E1002]: handler constructor argument type mismatch: expected `RuntimeRcProbe`, found `i64`'
+check_rejects application_non_callable test/negative/application_non_callable.weft 'error[E1002]: value is not callable: expected callable type `(any) -> any`, found `i64`' 1
+check_rejects application_field_non_callable test/negative/application_field_non_callable.weft 'error[E1002]: value is not callable: expected callable type `(any) -> any`, found `i64`' 1
+check_rejects application_wrong_arity test/negative/application_wrong_arity.weft 'type error: arity mismatch' 1
+check_rejects application_extra_argument test/negative/application_extra_argument.weft 'type error: arity mismatch' 1
+check_rejects application_wrong_argument test/negative/application_wrong_argument.weft 'error[E1002]: argument type mismatch: expected `i64`, found `str`' 1
+check_rejects application_unknown_callee test/negative/application_unknown_callee.weft "error[E1001]: unknown identifier 'missing'" 1
+check_rejects application_unhandled_effect test/negative/application_unhandled_effect.weft 'error[E2001]: effect `Read` is not available in this context' 1
+check_rejects application_unhandled_callee_effect test/negative/application_unhandled_callee_effect.weft 'error[E2001]: effect `Read` is not available in this context' 1
+check_rejects application_captured_mutable test/negative/application_captured_mutable.weft 'type error: cannot capture mut binding' 1
+check_rejects application_resume_twice test/negative/application_resume_twice.weft 'error[E2002]: handler clause uses `resume` more than once along a source branch' 1
+check_rejects application_resume_outside test/negative/application_resume_outside.weft 'type error: resume outside handler clause' 1
+check_rejects application_resume_capture test/negative/application_resume_capture.weft 'type error: cannot capture resume' 1
 check_rejects "resume_twice" "test/negative/resume_twice.weft" 'error[E2002]: handler clause uses `resume` more than once along a source branch' 1
 check_rejects "resume_branch_then_again" "test/negative/resume_branch_then_again.weft" 'error[E2002]: handler clause uses `resume` more than once along a source branch' 1
 check_rejects "resume_match_then_again" "test/negative/resume_match_then_again.weft" 'error[E2002]: handler clause uses `resume` more than once along a source branch' 1
