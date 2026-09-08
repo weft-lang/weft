@@ -5814,6 +5814,32 @@ else
   exit 1
 fi
 
+# A partially shared batch preserves results across admission decisions. A
+# worker wave can check a smaller dependency group without retaining its graph
+# in the owning planner for the lifetime of unrelated tests.
+for batch_jobs in 1 2 3 64; do
+  set +e
+  env WEFT_TEST_PLAN_TRACE=1 "$WEFT" test --jobs "$batch_jobs" "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_after" > "$tmp_out" 2>"$tmp_err"
+  batch_wave_exit=$?
+  set -e
+  assert_equals "test_batch_worker_wave_${batch_jobs}_exit_zero" "$batch_wave_exit" "0"
+  assert_contains "test_batch_worker_wave_${batch_jobs}_preserves_all_results" "$(<"$tmp_err")" "3 passed, 0 failed"
+  if [ "$batch_jobs" -le 2 ]; then
+    assert_contains "test_batch_worker_wave_${batch_jobs}_shares_reused_graph" "$(<"$tmp_err")" "test plan: shared checked dependency groups=1 roots=2"
+  else
+    assert_contains "test_batch_worker_wave_${batch_jobs}_uses_private_worker_graphs" "$(<"$tmp_err")" "test plan: shared checked dependency groups=0 roots=0"
+  fi
+done
+
+set +e
+env WEFT_TEST_PLAN_TRACE=1 WEFT_TEST_OPTIMISED_PRODUCTS=1 "$WEFT" test --jobs 64 "$tmp_test_shared_one" "$tmp_test_shared_two" "$tmp_test_after" > "$tmp_out" 2>"$tmp_err"
+batch_forced_product_exit=$?
+set -e
+assert_equals "test_batch_forced_product_preserves_exit" "$batch_forced_product_exit" "0"
+assert_contains "test_batch_forced_product_preserves_results" "$(<"$tmp_err")" "3 passed, 0 failed"
+assert_contains "test_batch_forced_product_overrides_admission" "$(<"$tmp_err")" "test plan: shared checked dependency groups=1 roots=2"
+assert_contains "test_batch_forced_product_retains_optimisation" "$(<"$tmp_err")" "optimised_product=1"
+
 printf 'trait BatchLocal { fn get(self: BatchBox) -> i64 } type BatchBox { value: i64 } impl BatchLocal for BatchBox { fn get(self: BatchBox) -> i64 { self.value } } test "isolated one" { Test.assert_eq(BatchBox { value: 41 }.get(), 41) }\n' > "$tmp_test_shared_one"
 printf 'trait BatchLocal { fn get(self: BatchBox) -> i64 } type BatchBox { value: i64 } impl BatchLocal for BatchBox { fn get(self: BatchBox) -> i64 { self.value } } test "isolated two" { Test.assert_eq(BatchBox { value: 42 }.get(), 42) }\n' > "$tmp_test_shared_two"
 set +e
