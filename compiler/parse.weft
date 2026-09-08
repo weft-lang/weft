@@ -4,6 +4,8 @@
 use compiler/diagnostic_location.{diagnostic_location_from_offsets}
 use compiler/lex.{*}
 use compiler/import_syntax.{*}
+use compiler/declaration_syntax.{*}
+use compiler/ir.{TypeNameRange, type_expr_from_node, expr_from_node, type_entry_from_ptr}
 use stdlib/list.{Cons, List, Nil}
 use compiler/lib.{*}
 use compiler/types.{*}
@@ -3013,10 +3015,8 @@ pub(package) fn parse_type_param_lists_concat(outer: i64, inner: i64) -> i64 {
 }
 
 -- Parse optional bound after type param: `: TraitName` or `: Trait1 & Trait2`
--- Returns pack(bound, pos_after_bound)
--- bound = 0 (no bound), or trait_hash (single), or nlist of hashes (multiple)
--- Returns pack(bounds_list, pos) where bounds_list is an nlist of trait hashes,
--- or 0 if no bound. Always returns an nlist for consistency (even for single bounds).
+-- Returns pack(bounds_list, pos), with complete trait atoms and occurrence
+-- locations. An absent bound has no list; a single bound still uses a list.
 pub(package) fn parse_trait_bound_atom(toks: i64, src: i64, pos: i64) -> i64 {
   if tok_tag(toks, pos) != 2 { pack(0, pos) }
   else {
@@ -4370,7 +4370,7 @@ pub(package) fn parse_module_syntax_local(toks: i64, src: i64, tt: i64) -[Diagno
   let invalid = parse_first_source_error(toks)
   if invalid >= 0 {
     parse_source_error(toks, src, invalid)
-    ParsedModuleSyntax { functions: nlist_new(), imports: Nil<ImportDeclaration>() }
+    ParsedModuleSyntax { functions: nlist_new(), imports: Nil<ImportDeclaration>(), declarations: Nil<SourceDeclaration>() }
   } else { parse_module_valid_inner(toks, src, tt, parse_no_source_loader, 0) }
 }
 
@@ -4420,6 +4420,10 @@ pub(package) fn parse_handler_implementation_effect_ref(toks: i64, src: i64, pos
 -- The checker replaces the module entry's pointer with a resolved fact rather
 -- than mutating this parse product, which keeps shared module products safe.
 pub(package) fn parse_handler_implementation_decl(toks: i64, src: i64, pos: i64, tt: i64, visibility: i64) -[Diagnose]> i64 {
+  parse_handler_implementation_syntax(toks, src, pos, tt, visibility).next
+}
+
+fn parse_handler_implementation_syntax(toks: i64, src: i64, pos: i64, tt: i64, visibility: i64) -[Diagnose]> DeclarationParse {
   let tparams_r = if tok_tag(toks, pos) == 4 and tok_v1(toks, pos) == 7 {
     parse_type_params(toks, src, pos + 1)
   } else { pack(0, pos) }
@@ -4451,13 +4455,14 @@ pub(package) fn parse_handler_implementation_decl(toks: i64, src: i64, pos: i64,
     parse_syntax_error(toks, src, after_params, "error: module handler implementations cannot transform normal return", "handler implementation", "continue_declaration")
   } else { 0 }
   let module_entry = module_fact_register_source(tt, src, 0, 0, 0)
+  let metadata = node_new(0, tparams, nlist_len(clauses), visibility, tok_span(toks, if pos > 0 { pos - 1 } else { pos }))
+  let handler_node = node_new(1, effect_ref, params, clauses, metadata)
   if module_fact_entry_handler_implementation(module_entry) != 0 {
     parse_syntax_error(toks, src, pos, "error: a module may declare only one handler implementation", "handler implementation", "continue_declaration")
   } else {
-    let metadata = node_new(0, tparams, nlist_len(clauses), visibility, tok_span(toks, if pos > 0 { pos - 1 } else { pos }))
-    module_fact_set_handler_implementation(module_entry, node_new(1, effect_ref, params, clauses, metadata))
+    module_fact_set_handler_implementation(module_entry, handler_node)
   }
-  end
+  DeclarationParse { syntax: module_handler_syntax_from_node(handler_node), next: end }
 }
 
 pub(package) fn parse_handler_config_arg_count(config: i64) -> i64 {
@@ -4483,11 +4488,45 @@ pub(package) fn parse_default_handler_decl(toks: i64, src: i64, pos: i64, tt: i6
   unpack_pos(config_r)
 }
 
+fn parse_source_declaration(toks: i64, start_pos: i64, next_pos: i64, visibility: i64, errors_before: i64, syntax: DeclarationSyntax) -> SourceDeclaration {
+  let start = tok_span(toks, start_pos)
+  let last_pos = if next_pos > start_pos { next_pos - 1 } else { start_pos }
+  let safe_last = if last_pos < tok_count(toks) { last_pos } else { tok_count(toks) - 1 }
+  let end = tok_end(toks, safe_last)
+  let invalid = match syntax { InvalidDefinition -> true, _ -> false }
+  SourceDeclaration {
+    syntax: syntax,
+    visibility: module_visibility_from_code(visibility),
+    range: TypeNameRange { start: start, length: if end > start { end - start } else { 0 } },
+    validity: if invalid or tok_parse_error_count(toks) > errors_before { RecoveredDeclaration } else { ParsedDeclaration }
+  }
+}
+
+fn parse_recent_type_definition(tt: i64, previous_count: i64) -> DeclarationSyntax {
+  if ttable_entry_count(tt) > previous_count { TypeDefinition(type_entry_from_ptr(ttable_entry_at(tt, ttable_entry_count(tt) - 1))) }
+  else { InvalidDefinition }
+}
+
+fn parse_recent_default_definition(tt: i64, src: i64) -> DeclarationSyntax {
+  let module_entry = module_fact_find_source(tt, src)
+  if module_entry == 0 { InvalidDefinition }
+  else {
+    let defaults = module_fact_entry_default_handlers(module_entry)
+    if nlist_len(defaults) == 0 { InvalidDefinition }
+    else { DefaultHandlerDefinition(expr_from_node(node_f1(nlist_get(defaults, nlist_len(defaults) - 1)))) }
+  }
+}
+
 fn parse_module_valid_inner<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, i64, i64, i64) -[E]> i64, load_imports: i64) -[Diagnose, E]> ParsedModuleSyntax {
+  parse_module_contents<E>(toks, src, tt, loader, load_imports, nlist_new(), EntrySource)
+}
+
+fn parse_module_contents<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, i64, i64, i64) -[E]> i64, load_imports: i64, fns: i64, role: ModuleParseRole) -[Diagnose, E]> ParsedModuleSyntax {
   parse_diagnose_identifier_security(toks, src)
   parse_diagnose_bidi_source(toks, src)
-  let fns = nlist_new()
+  let is_entry = match role { EntrySource -> true, DependencySource -> false }
   let mut imports: List<ImportDeclaration> = Nil
+  let mut declarations: List<SourceDeclaration> = Nil
   -- A path-aware root participates in the same logical-identity load graph as
   -- its imports. Without this entry, A -> B -> A reread A into a second source
   -- buffer before noticing B's back-edge.
@@ -4499,7 +4538,7 @@ fn parse_module_valid_inner<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, 
   -- binding leaf. Imports already pass through this producer in parse_use;
   -- establish the identical trust, target and synthetic-declaration facts for
   -- the root before parsing its declarations.
-  if root_module != 0 and module_fact_entry_anonymous(root_module) == 0 {
+  if is_entry and root_module != 0 and module_fact_entry_anonymous(root_module) == 0 {
     let root_path = module_fact_entry_path_ptr(root_module)
     let root_len = module_fact_entry_path_len(root_module)
     let root_package = module_fact_entry_package(root_module)
@@ -4515,7 +4554,7 @@ fn parse_module_valid_inner<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, 
       } else { 0 } }
     } else { 0 }
   } else { 0 }
-  if load_imports == 1 and root_module != 0 and module_fact_entry_anonymous(root_module) == 0 {
+  if is_entry and load_imports == 1 and root_module != 0 and module_fact_entry_anonymous(root_module) == 0 {
     let root_path = module_fact_entry_path_ptr(root_module)
     let root_len = module_fact_entry_path_len(root_module)
     let root_package = module_fact_entry_package(root_module)
@@ -4538,6 +4577,10 @@ fn parse_module_valid_inner<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, 
     let tag = tok_tag(toks, p)
     if tag == 7 { done = 1 }
     else { if tag == 3 {
+      let declaration_start = p
+      let errors_before = tok_parse_error_count(toks)
+      let types_before = ttable_entry_count(tt)
+      let mut syntax: DeclarationSyntax = InvalidDefinition
       let visibility_info = parse_decl_visibility(toks, src, p)
       let visibility = node_f1(visibility_info)
       let decl_p = node_f2(visibility_info)
@@ -4563,10 +4606,22 @@ fn parse_module_valid_inner<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, 
           module_decl_fact_bind_function_pair(decl, pair)
           module_fact_cache_function_pair(tt, src, pair)
           nlist_add(fns, pair)
+          syntax = FunctionDefinition(function_syntax_from_node(fn_wrap))
           p = new_p
         }
       } else { if kw == 37 {
         p = parse_const_decl(toks, src, decl_p + 1, tt, visibility)
+        let name_start = tok_v1(toks, decl_p + 1)
+        let name_len = tok_v2(toks, decl_p + 1)
+        let declaration = module_decl_fact_find(tt, src, module_decl_namespace_value(), src, name_start, name_len)
+        let fact = if declaration == 0 { 0 } else { module_decl_fact_constant_fact(declaration) }
+        if fact != 0 {
+          syntax = ConstantDefinition(ConstantSyntax {
+            name: TypeNameRange { start: name_start, length: name_len },
+            declared_type: type_expr_from_node(module_constant_fact_declared_type(fact)),
+            initializer: expr_from_node(module_constant_fact_initializer(fact))
+          })
+        } else { 0 }
       } else { if kw == 9 {
         let old_p = decl_p
         module_decl_fact_register(tt, src, 0, module_decl_namespace_type(), tok_v1(toks, decl_p + 1), tok_v2(toks, decl_p + 1), visibility)
@@ -4577,32 +4632,37 @@ fn parse_module_valid_inner<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, 
         } else {
           p = new_p
         }
+        syntax = parse_recent_type_definition(tt, types_before)
       } else { if kw == 23 {
         -- effect declaration
         module_decl_fact_register(tt, src, 0, module_decl_namespace_effect(), tok_v1(toks, decl_p + 1), tok_v2(toks, decl_p + 1), visibility)
         p = parse_effect_decl(toks, src, decl_p + 1, tt)
+        syntax = parse_recent_type_definition(tt, types_before)
       } else { if kw == 26 {
         -- trait declaration
         module_decl_fact_register(tt, src, 0, module_decl_namespace_trait(), tok_v1(toks, decl_p + 1), tok_v2(toks, decl_p + 1), visibility)
         p = parse_trait_decl(toks, src, decl_p + 1, tt)
+        syntax = parse_recent_type_definition(tt, types_before)
       } else { if kw == 27 {
         -- impl block
         if has_visibility == 1 {
           parse_syntax_error(toks, src, p, "error: visibility belongs on inherent methods, not an impl block", "impl declaration", "continue_impl")
         } else { 0 }
         p = parse_impl_decl(toks, src, decl_p + 1, tt, fns)
+        syntax = parse_recent_type_definition(tt, types_before)
       } else { if kw == 19 {
         match parse_use_surface(toks, src, decl_p + 1) {
           ImportInvalid(next) -> { p = next }
-          ImportParsed(syntax, next) -> {
+          ImportParsed(import_syntax, next) -> {
+            syntax = ImportDefinition(import_syntax)
             imports = Cons(ImportDeclaration {
-              syntax: syntax,
+              syntax: import_syntax,
               visibility: module_visibility_from_code(visibility),
               start: __i64_to_usize(tok_span(toks, p)),
               end: __i64_to_usize(tok_end(toks, next - 1))
             }, imports)
             p = if load_imports == 1 {
-              parse_import_with_loader<E>(syntax, next, tok_span(toks, decl_p + 1), src, fns, tt, visibility, loader)
+              parse_import_with_loader<E>(import_syntax, next, tok_span(toks, decl_p + 1), src, fns, tt, visibility, loader)
             } else { next }
           }
         }
@@ -4611,17 +4671,34 @@ fn parse_module_valid_inner<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, 
         if has_visibility == 1 {
           parse_syntax_error(toks, src, p, "error: test declarations cannot have visibility", "test declaration", "continue_test")
         } else { 0 }
-        p = parse_test_decl(toks, src, decl_p + 1, fns)
+        let tests = nlist_new()
+        p = parse_test_decl(toks, src, decl_p + 1, tests)
+        if nlist_len(tests) > 0 {
+          let pair = nlist_get(tests, 0)
+          if is_entry { nlist_add(fns, pair) } else { 0 }
+          let node = node_f1(pair)
+          syntax = TestDefinition(TestSyntax {
+            name: TypeNameRange { start: node_f1(node), length: node_f2(node) },
+            body: expr_from_node(node_f3(node))
+          })
+        } else { 0 }
       } else { if kw == 38 {
-        p = parse_handler_implementation_decl(toks, src, decl_p + 1, tt, visibility)
+        let parsed = parse_handler_implementation_syntax(toks, src, decl_p + 1, tt, visibility)
+        p = parsed.next
+        syntax = parsed.syntax
       } else { if kw == 39 {
         p = parse_default_handler_decl(toks, src, decl_p + 1, tt, has_visibility)
+        syntax = parse_recent_default_definition(tt, src)
       } else {
         p = decl_p + 1
       } } } } } } } } } } }
+      declarations = Cons(parse_source_declaration(toks, declaration_start, p, visibility, errors_before, syntax), declarations)
     } else { if tag == 2 and src_eq(src, tok_v1(toks, p), tok_v2(toks, p), "default") == 1 {
+      let declaration_start = p
+      let errors_before = tok_parse_error_count(toks)
       tok_set_syntax_role(toks, p, tok_syntax_role_top_level_decl())
       p = parse_default_handler_decl(toks, src, p + 1, tt, 0)
+      declarations = Cons(parse_source_declaration(toks, declaration_start, p, module_visibility_private(), errors_before, parse_recent_default_definition(tt, src)), declarations)
     } else {
       -- Unexpected token at module level: skip to next declaration
       if tag != 5 and tok_last_parse_error_pos(toks) != p {
@@ -4631,8 +4708,8 @@ fn parse_module_valid_inner<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, 
     } } }
   }
   if root_pushed == 1 { loading_stack_pop(loading) } else { 0 }
-  if load_imports == 1 { parse_diagnose_module_cycle(tt, src) } else { 0 }
-  ParsedModuleSyntax { functions: fns, imports: imports.reverse() }
+  if is_entry and load_imports == 1 { parse_diagnose_module_cycle(tt, src) } else { 0 }
+  ParsedModuleSyntax { functions: fns, imports: imports.reverse(), declarations: declarations.reverse() }
 }
 
 pub(package) fn is_file_loaded(loaded: i64, src: i64, ns: i64, nl: i64, package_id: i64) -> bool {
@@ -5177,76 +5254,9 @@ pub(package) fn parse_use_module(toks: i64, src: i64, fns: i64, tt: i64) -[Diagn
 }
 
 pub(package) fn parse_use_module_with_loader<E>(toks: i64, src: i64, fns: i64, tt: i64, loader: (i64, i64, i64, i64, i64) -[E]> i64) -[Diagnose, E]> i64 {
-  let mut p = 0
-  let mut done = 0
-  while done == 0 {
-    let tag = tok_tag(toks, p)
-    if tag == 7 { done = 1 }
-    else { if tag == 3 {
-      let visibility_info = parse_decl_visibility(toks, src, p)
-      let visibility = node_f1(visibility_info)
-      let decl_p = node_f2(visibility_info)
-      let has_visibility = node_f3(visibility_info)
-      let kw = if tok_tag(toks, decl_p) == 2 and src_eq(src, tok_v1(toks, decl_p), tok_v2(toks, decl_p), "default") == 1 { 39 } else { tok_v1(toks, decl_p) }
-      tok_set_syntax_role(toks, p, if kw == 19 { tok_syntax_role_top_level_import() } else { tok_syntax_role_top_level_decl() })
-      let requires_name = kw == 1 or kw == 9 or kw == 23 or kw == 26 or kw == 37
-      if requires_name and tok_tag(toks, decl_p + 1) != 2 {
-        parse_syntax_error(toks, src, decl_p + 1, "error: expected declaration name after keyword", "imported module declaration", "resume_at_declaration")
-        p = sync_to_decl(toks, decl_p + 1)
-      } else { if kw == 1 {
-        let old_p = decl_p
-        let r = parse_fn(toks, src, decl_p + 1)
-        let new_p = unpack_pos(r)
-        if new_p <= old_p {
-          parse_syntax_error(toks, src, decl_p + 1, "error: malformed function declaration", "imported module", "resume_at_declaration")
-          p = sync_to_decl(toks, decl_p + 1)
-        } else {
-          let fn_wrap = unpack_node(r)
-          let decl = parse_register_function_decl(tt, src, fn_wrap, visibility)
-          let pair = node_new(decl, fn_wrap, src, 0, 0)
-          module_decl_fact_bind_function_pair(decl, pair)
-          module_fact_cache_function_pair(tt, src, pair)
-          nlist_add(fns, pair)
-          p = new_p
-        }
-      } else { if kw == 37 {
-        p = parse_const_decl(toks, src, decl_p + 1, tt, visibility)
-      } else { if kw == 9 {
-        let old_p = decl_p
-        module_decl_fact_register(tt, src, 0, module_decl_namespace_type(), tok_v1(toks, decl_p + 1), tok_v2(toks, decl_p + 1), visibility)
-        let new_p = parse_type_decl(toks, src, decl_p + 1, tt)
-        if new_p <= old_p {
-          parse_syntax_error(toks, src, decl_p + 1, "error: malformed type declaration", "imported module", "resume_at_declaration")
-          p = sync_to_decl(toks, decl_p + 1)
-        } else {
-          p = new_p
-        }
-      } else { if kw == 23 {
-        -- effect declaration in imported module
-        module_decl_fact_register(tt, src, 0, module_decl_namespace_effect(), tok_v1(toks, decl_p + 1), tok_v2(toks, decl_p + 1), visibility)
-        p = parse_effect_decl(toks, src, decl_p + 1, tt)
-      } else { if kw == 26 {
-        -- trait declaration in imported module
-        module_decl_fact_register(tt, src, 0, module_decl_namespace_trait(), tok_v1(toks, decl_p + 1), tok_v2(toks, decl_p + 1), visibility)
-        p = parse_trait_decl(toks, src, decl_p + 1, tt)
-      } else { if kw == 27 {
-        -- impl block in imported module
-        if has_visibility == 1 {
-          parse_syntax_error(toks, src, p, "error: visibility belongs on inherent methods, not an impl block", "impl declaration", "continue_impl")
-        } else { 0 }
-        p = parse_impl_decl(toks, src, decl_p + 1, tt, fns)
-      } else { if kw == 19 {
-        p = parse_use_with_loader<E>(toks, src, decl_p + 1, fns, tt, visibility, loader)
-      } else { if kw == 38 {
-        p = parse_handler_implementation_decl(toks, src, decl_p + 1, tt, visibility)
-      } else { if kw == 39 {
-        p = parse_default_handler_decl(toks, src, decl_p + 1, tt, has_visibility)
-      } else { p = decl_p + 1 } } } } } } } } } }
-    } else { if tag == 2 and src_eq(src, tok_v1(toks, p), tok_v2(toks, p), "default") == 1 {
-      tok_set_syntax_role(toks, p, tok_syntax_role_top_level_decl())
-      p = parse_default_handler_decl(toks, src, p + 1, tt, 0)
-    } else { p = p + 1 } } }
-  }
+  let invalid = parse_first_source_error(toks)
+  if invalid >= 0 { parse_source_error(toks, src, invalid) }
+  else { parse_module_contents<E>(toks, src, tt, loader, 1, fns, DependencySource) }
   0
 }
 

@@ -1,0 +1,192 @@
+use compiler/ir.{*}
+use compiler/lex.{lex}
+use compiler/lib.{*}
+use compiler/parse.{parse_module_syntax_local}
+use compiler/type_registry.{*}
+use compiler/types.{*}
+use compiler/module.{module_decl_fact_find, module_decl_namespace_trait}
+use runtime/types_storage.{types_storage_type_list_locations}
+use runtime/memory.{mem_store64_at}
+use stdlib/diagnostic/schema.{Diagnose}
+use stdlib/option.{Option}
+
+fn declaration_transport_parse(source: str) -[Test]> (i64, i64) {
+  let table = ttable_new()
+  let tokens = lex(__str_ptr(source), __str_len(source))
+  let parsed = handle parse_module_syntax_local(tokens, __str_ptr(source), table) {
+    Diagnose.report(diagnostic) -> { Test.assert_true(false) resume(0) }
+    Diagnose.error(message, location) -> { Test.assert_true(false) resume(0) }
+    Diagnose.warn(message, location) -> { Test.assert_true(false) resume(0) }
+    Diagnose.note(message, location) -> resume(0)
+  }
+  (parsed.functions, table)
+}
+
+fn declaration_transport_text(source: str, range: TypeNameRange) -> str {
+  source.slice(__i64_to_usize(range.start), __i64_to_usize(range.start + range.length)).unwrap()
+}
+
+test "generic bounds retain qualified types and occurrence locations" {
+  let source = "-- 🧶\nfn select<T: api.Show & api.Match>(value: T) -> T { value }"
+  let (functions, table) = declaration_transport_parse(source)
+  let wrapper = node_f1(nlist_get(functions, 0))
+  let parameter = type_param_from_node(nlist_get(node_f4(wrapper), 0))
+  Test.assert_true(match parameter {
+    TypeParam(start, len, identity, TypeParamBoundListCons(QualifiedTraitTypeExpr(first_module, first_name), first_location,
+      TypeParamBoundListCons(QualifiedTraitTypeExpr(second_module, second_name), second_location, TypeParamBoundListNil))) -> {
+      Test.assert_str_eq(declaration_transport_text(source, first_module), "api")
+      Test.assert_str_eq(declaration_transport_text(source, first_name), "Show")
+      Test.assert_str_eq(declaration_transport_text(source, second_name), "Match")
+      match (first_location, second_location) {
+        (first: TypeNameRange, second: TypeNameRange) ->
+          declaration_transport_text(source, first) == "api.Show" and declaration_transport_text(source, second) == "api.Match"
+        _ -> false
+      }
+    }
+    _ -> false
+  })
+  let restored = type_param_to_node(parameter)
+  let bounds = node_f4(restored)
+  let locations = types_storage_type_list_locations(bounds)
+  Test.assert_eq(nlist_len(bounds), 2)
+  Test.assert_eq(nlist_len(locations), 2)
+  Test.assert_eq(ty_tag(nlist_get(bounds, 0)), 28)
+  Test.assert_str_eq(declaration_transport_text(source, TypeNameRange { start: node_f1(nlist_get(locations, 0)), length: node_f2(nlist_get(locations, 0)) }), "api.Show")
+}
+
+test "associated type declarations retain all bounds" {
+  let source = "trait Cursor { type Item: api.Show & api.Match\nfn next(self) -> Item }"
+  let (functions, table) = declaration_transport_parse(source)
+  let entry = type_entry_from_ptr(ttable_entry_at(table, 0))
+  Test.assert_true(match entry {
+    TypeTraitEntry(name, params, TypeTraitMemberListCons(TypeTraitAssocType(start, len, bounds), rest)) -> {
+      Test.assert_eq(type_param_bound_list_len(bounds), 2)
+      Test.assert_true(match bounds {
+        TypeParamBoundListCons(QualifiedTraitTypeExpr(module, member), location, _) -> declaration_transport_text(source, member) == "Show"
+        _ -> false
+      })
+      true
+    }
+    _ -> false
+  })
+  Test.assert_eq(type_entry_tree_unknown_count(entry), 0)
+}
+
+test "opaque declaration transport retains representation and generic bounds" {
+  let source = "type Secret<T: api.Show> = opaque (T, str)"
+  let (functions, table) = declaration_transport_parse(source)
+  let entry = type_entry_from_ptr(ttable_entry_at(table, 0))
+  Test.assert_true(match entry {
+    TypeOpaqueEntry(name, params, RecordTypeExpr(fields, ExactTypeFields, PositionalTypeFields)) ->
+      type_param_list_len(params) == 1 and type_expr_list_len(fields) == 2 and type_param_list_nth_bound_count_or(params, 0, -1) == 1
+    _ -> false
+  })
+}
+
+test "implementation transport retains target method generics and associated type location" {
+  let source = "impl<T: api.Show> Box<T> { fn cast<U: api.Match>(self, value: U) -> U { value }\ntype Item = [i64; 3] }"
+  let (functions, table) = declaration_transport_parse(source)
+  let entry = type_entry_from_ptr(ttable_entry_at(table, 0))
+  Test.assert_true(match entry {
+    TypeImplEntry(name, params, TypeImplMemberListCons(method, TypeImplMemberListCons(binding, TypeImplMemberListNil)), target) -> {
+      Test.assert_eq(type_param_list_len(params), 1)
+      Test.assert_true(match target.protocol { InherentTypeImpl -> true, _ -> false })
+      Test.assert_true(match target.target {
+        NamedTypeExpr(_, _, TypeExprListCons(VariableTypeExpr(_), TypeExprListNil), SourceTypeOrigin(range)) -> declaration_transport_text(source, range) == "Box"
+        _ -> false
+      })
+      let restored_method = type_impl_member_to_node(method)
+      let restored_params = node_f4(restored_method)
+      Test.assert_true(restored_params != 0)
+      Test.assert_true(match method {
+        TypeImplMethod(_, _, _, _, _, _, method_params) ->
+          type_param_list_len(method_params) == 2 and type_param_list_nth_bound_count_or(method_params, 0, -1) == 1 and type_param_list_nth_bound_count_or(method_params, 1, -1) == 1
+        _ -> false
+      })
+      let restored_binding = type_impl_member_to_node(binding)
+      Test.assert_true(ty_eq(node_f3(restored_binding), ty_array(ty_i64(), 3)))
+      Test.assert_true(match binding {
+        TypeImplAssocType(_, _, _, location: TypeNameRange) -> declaration_transport_text(source, location) == "[i64; 3]"
+        _ -> false
+      })
+      let restored_target = type_impl_target_to_node(target, params)
+      Test.assert_true(ty_eq(node_f3(restored_target), type_expr_to_node(target.target)))
+      true
+    }
+    _ -> false
+  })
+}
+
+test "qualified implementation syntax keeps both trait names" {
+  let source = "impl api.Show for i64 {}"
+  let (functions, table) = declaration_transport_parse(source)
+  Test.assert_true(match type_entry_from_ptr(ttable_entry_at(table, 0)) {
+    TypeImplEntry(_, params, _, target) -> match target.protocol {
+      QualifiedTypeImpl(head, module, member) -> {
+        Test.assert_str_eq(declaration_transport_text(source, module), "api")
+        Test.assert_str_eq(declaration_transport_text(source, member), "Show")
+        let restored = type_impl_target_to_node(target, params)
+        let reference = node_f4(restored)
+        Test.assert_eq(node_tag(reference), 61)
+        Test.assert_eq(node_f1(reference), module.start)
+        Test.assert_eq(node_f4(reference), member.length)
+        true
+      }
+      _ -> false
+    }
+    _ -> false
+  })
+}
+
+test "typed bounds are independent of the parser storage they came from" {
+  let bounds = nlist_new()
+  let original = ty_trait(211)
+  nlist_add(bounds, original)
+  let typed = type_param_from_node(node_new(2, 0, 1, 5, bounds))
+  mem_store64_at(original, 8, 223)
+  Test.assert_eq(type_param_bound_hash_or(typed, 0, -1), 211)
+  Test.assert_eq(ty_f1(nlist_get(node_f4(type_param_to_node(typed)), 0)), 211)
+  Test.assert_eq(type_param_tree_raw_bridge_slot_count(typed), 0)
+  let absent = type_param_to_node(TypeParam(0, 1, 5, TypeParamBoundListNil))
+  Test.assert_eq(node_f4(absent), 0)
+  Test.assert_eq(types_storage_type_list_locations(node_f4(type_param_to_node(typed))), 0)
+  Test.assert_eq(type_param_to_node(MissingTypeParam), 0)
+  Test.assert_eq(type_param_tree_unknown_count(TypeParam(0, 1, 5, TypeParamBoundListCons(UnknownTypeExpr(999), nil, TypeParamBoundListNil))), 1)
+}
+
+test "implementation transport distinguishes unqualified and resolved trait identity" {
+  let source = "trait Show {}\nimpl Show for i64 {}"
+  let (functions, table) = declaration_transport_parse(source)
+  let declaration = module_decl_fact_find(table, __str_ptr(source), module_decl_namespace_trait(), __str_ptr("Show"), 0, 4)
+  Test.assert_true(declaration != 0)
+  let entry = type_entry_from_ptr(ttable_entry_at(table, 1))
+  Test.assert_true(match entry {
+    TypeImplEntry(_, params, _, target) -> match target.protocol {
+      NamedTypeImpl(head) -> {
+        let unresolved = type_impl_target_to_node(target, params)
+        Test.assert_true(head != 0)
+        Test.assert_eq(node_f4(unresolved), 0)
+        let resolved = type_impl_target_from_node(node_new(0, head, 0, ty_i64(), declaration))
+        Test.assert_true(match resolved.protocol { ResolvedTypeImpl(name, identity) -> name == head and identity == declaration, _ -> false })
+        Test.assert_eq(node_f4(type_impl_target_to_node(resolved, TypeParamListNil)), declaration)
+        true
+      }
+      _ -> false
+    }
+    _ -> false
+  })
+  Test.assert_eq(type_impl_target_tree_unknown_count(type_impl_target_from_node(0)), 1)
+}
+
+test "typed declaration bounds retain long ordered lists and unknown children" {
+  let raw = nlist_new()
+  for i in 0..128 { nlist_add(raw, ty_trait(1000 + i)) }
+  let typed = type_param_bound_list_from_raw(raw)
+  let restored = type_param_bound_list_to_nodes(typed)
+  Test.assert_eq(nlist_len(restored), 128)
+  for i in 0..128 { Test.assert_eq(ty_f1(nlist_get(restored, i)), 1000 + i) }
+  Test.assert_eq(type_param_bound_list_tree_unknown_count(typed), 0)
+  let nested = TypeParamBoundListCons(ConstraintTypeExpr(TraitTypeExpr(7), TypeExprListCons(AssociatedBindingTypeExpr(11, UnknownTypeExpr(999), TypeNameRange { start: 0, length: 4 }), TypeExprListNil)), nil, TypeParamBoundListNil)
+  Test.assert_eq(type_param_bound_list_tree_unknown_count(nested), 1)
+  Test.assert_eq(type_impl_member_to_node(MissingTypeImplMember), 0)
+}
