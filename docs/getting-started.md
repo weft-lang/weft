@@ -142,6 +142,28 @@ The handler clause does not call `resume`, so control aborts to the handler.
 Continuations are one-shot; deferred resumption uses the explicit `with k`
 form.
 
+## Naming types
+
+Use an alias when a type expression deserves a name:
+
+```weft
+type Value = i64 | str
+type Pair<T> = (T, T)
+type Callback<E> = () -[E]> Value
+
+fn identity(value: Value) -> Value { value }
+```
+
+An alias denotes exactly its target type. `identity(42)` and `identity("text")`
+need no conversion. Generic aliases check their arguments and declared bounds,
+and callback aliases preserve the declared effects. Imported names inside an
+alias resolve where the alias was defined.
+
+Aliases have no constructors or extra runtime tags. They retain the target's
+ownership and cleanup rules. Use an opaque type for a distinct identity, or a
+variant when runtime matching requires a tag. Recursive aliases are rejected;
+recursive records and variants keep their existing rules.
+
 ## Equality
 
 `==` and `!=` use value equality. Numbers, booleans, nil and text have built-in

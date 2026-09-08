@@ -1,0 +1,217 @@
+use compiler/pipeline.{AstModule, TypedModule, pipeline_parse_source_standalone, pipeline_check_loaded, pipeline_check_source_standalone}
+use compiler/type_registry.{*}
+use compiler/typeck.{ftypes_entry_return_type}
+use compiler/semantic_fact.{*}
+use compiler/semantic_type_projection.{semantic_type_fact_from_checker}
+use compiler/types.{*}
+use compiler/ir.{*}
+use compiler/lex.{lex}
+use compiler/parse.{parse_module_syntax_local}
+use stdlib/diagnostic/schema.{Diagnose}
+use compiler/lib.{node_f1, node_f2, nlist_get, nlist_len}
+use compiler/module_product.{ModuleParseInstance, InvalidModuleParseInstance, module_parse_product_instantiate, ModuleCheckedInstance, InvalidModuleCheckedInstance, module_checked_product_instantiate}
+use stdlib/semantic_type.{*}
+use stdlib/semantic_type/render
+use stdlib/string.{str_concat}
+
+fn assert_alias_function_name(tt: i64, src: i64, name: str, expected: str) -[Test]> nil {
+  match semantic_fact_query_function(tt, src, name) {
+    SemanticFactEnvelope(SemanticFactSchemaV1, SemanticFactFound(SemanticFactFunction(SemanticFunction(_, _, result, _, _, _, _, _)))) ->
+      Test.assert_str_eq(result.render(), expected)
+    _ -> Test.assert_true(false)
+  }
+  nil
+}
+
+fn assert_alias_function_effects(tt: i64, src: i64, name: str, expected: str) -[Test]> nil {
+  match semantic_fact_query_function(tt, src, name) {
+    SemanticFactEnvelope(SemanticFactSchemaV1, SemanticFactFound(SemanticFactFunction(SemanticFunction(_, _, _, effects, _, _, _, _)))) ->
+      Test.assert_str_eq(effects.render(), expected)
+    _ -> Test.assert_true(false)
+  }
+  nil
+}
+
+test "effect facts use visible exact names and qualify unavailable spellings" {
+  let source = "use test/module_fixtures/alias_effect_left."
+    |> str_concat("{")
+    |> str_concat("Read as Reader")
+    |> str_concat("} use test/module_fixtures/alias_effect_right as right effect Read { fn read() -> i64 } fn local() -[Read]> i64 { 1 } fn imported() -[Reader]> i64 { 2 } fn qualified() -[right.Read]> i64 { 3 }")
+  match pipeline_check_source_standalone(__str_ptr(source), __str_len(source)) {
+    TypedModule(_, src, tt) -> {
+      assert_alias_function_effects(tt, src, "local", "Read")
+      assert_alias_function_effects(tt, src, "imported", "Reader")
+      assert_alias_function_effects(tt, src, "qualified", "test/module_fixtures/alias_effect_right.Read")
+    }
+  }
+}
+
+test "alias declarations expose their underlying semantic target" {
+  let source = "pub type Value = i64 | str pub fn accept(value: Value) -> Value { value }"
+  match pipeline_check_source_standalone(__str_ptr(source), __str_len(source)) {
+    TypedModule(fns, src, tt) -> {
+      match semantic_fact_query_type(tt, src, "Value") {
+        SemanticFactEnvelope(SemanticFactSchemaV1, SemanticFactFound(SemanticFactTypeDeclaration(SemanticTypeDeclaration(name, SemanticTypeDeclarationAlias(target), _, count)))) -> {
+          Test.assert_str_eq(name, "Value")
+          Test.assert_str_eq(target.render(), "i64 | str")
+          Test.assert_eq(count, 0)
+        }
+        _ -> Test.assert_true(false)
+      }
+      assert_alias_function_name(tt, src, "accept", "Value")
+      let entry = semantic_fact_resolve_function_entry(tt, src, "accept")
+      let ty = ftypes_entry_return_type(entry)
+      Test.assert_eq(ty_tag(ty), 3)
+      Test.assert_true(ty_eq(ty, ty_union(ty_i64(), ty_str())))
+    }
+  }
+}
+
+test "aliases erase to ordinary primitive and structural layouts" {
+  let source = "type Id = i64 type Pair<T> = (T, T) fn id(value: Id) -> Id { value } fn pair<T>(value: Pair<T>) -> Pair<T> { value }"
+  match pipeline_check_source_standalone(__str_ptr(source), __str_len(source)) {
+    TypedModule(fns, src, tt) -> {
+      assert_alias_function_name(tt, src, "id", "Id")
+      assert_alias_function_name(tt, src, "pair", "Pair<T>")
+      let id = ftypes_entry_return_type(semantic_fact_resolve_function_entry(tt, src, "id"))
+      let pair = ftypes_entry_return_type(semantic_fact_resolve_function_entry(tt, src, "pair"))
+      Test.assert_true(ty_eq(id, ty_i64()))
+      Test.assert_eq(ty_tag(pair), 7)
+      let subst = subst_new()
+      subst_add(subst, 0, ty_i64())
+      let concrete = ttable_substitute_type(tt, pair, subst)
+      Test.assert_eq(ty_value_storage_word_count(concrete), 2)
+      Test.assert_str_eq(semantic_type_fact_from_checker(concrete, tt, src).render(), "Pair<i64>")
+    }
+  }
+}
+
+test "checked products retain written names in independent registry projections" {
+  let source = "pub type Count = i64 pub fn count(value: Count) -> Count { value }"
+  match pipeline_check_source_standalone(__str_ptr(source), __str_len(source)) {
+    TypedModule(fns, src, tt) -> {
+      ttable_mark_checked_module_products(tt, fns)
+      let first = module_checked_product_instantiate(tt, src, fns)
+      let second = module_checked_product_instantiate(tt, src, fns)
+      match first {
+        ModuleCheckedInstance(_, copied) -> {
+          assert_alias_function_name(copied, src, "count", "Count")
+          Test.assert_true(ttable_type_use_names(copied) != ttable_type_use_names(tt))
+        }
+        InvalidModuleCheckedInstance -> Test.assert_true(false)
+      }
+      match second {
+        ModuleCheckedInstance(_, copied) -> { assert_alias_function_name(copied, src, "count", "Count") 0 }
+        InvalidModuleCheckedInstance -> Test.assert_true(false)
+      }
+      assert_alias_function_name(tt, src, "count", "Count")
+    }
+  }
+}
+
+test "scratch restoration discards names attached to temporary substituted types" {
+  let source = "type Pair<T> = (T, T) fn pair<T>(value: Pair<T>) -> Pair<T> { value }"
+  match pipeline_check_source_standalone(__str_ptr(source), __str_len(source)) {
+    TypedModule(fns, src, tt) -> {
+      let raw = ftypes_entry_return_type(semantic_fact_resolve_function_entry(tt, src, "pair"))
+      let subst = subst_new()
+      subst_add(subst, 0, ty_i64())
+      let saved = ttable_scratch_facts_checkpoint(tt)
+      let temporary = ttable_substitute_type(tt, raw, subst)
+      Test.assert_true(type_use_names_find(ttable_type_use_names(tt), temporary) != 0)
+      ttable_scratch_facts_restore(tt, saved)
+      Test.assert_eq(type_use_names_find(ttable_type_use_names(tt), temporary), 0)
+      Test.assert_true(type_use_names_find(ttable_type_use_names(tt), raw) != 0)
+    }
+  }
+}
+
+fn assert_parsed_alias_product(instance: ModuleParseInstance, source: i64) -[Test]> nil {
+  match instance {
+    InvalidModuleParseInstance -> { Test.assert_true(false) nil }
+    ModuleParseInstance(fns, tt) -> {
+      let errors = handle pipeline_check_loaded(fns, source, tt) {
+        Diagnose.report(diagnostic) -> { Test.assert_true(false) resume(0) }
+        Diagnose.error(message, span) -> { Test.assert_true(false) resume(0) }
+        Diagnose.warn(message, span) -> { Test.assert_true(false) resume(0) }
+        Diagnose.note(message, span) -> resume(0)
+      }
+      Test.assert_eq(errors, 0)
+      assert_alias_function_name(tt, source, "identity", "Id")
+    }
+  }
+}
+
+test "independent parsed products preserve alias names while checking" {
+  let source = "type Id = i64 fn identity(value: Id) -> Id { value }"
+  match pipeline_parse_source_standalone(__str_ptr(source), __str_len(source)) {
+    AstModule(fns, src, tt) -> {
+      let first = module_parse_product_instantiate(tt, src, fns)
+      let second = module_parse_product_instantiate(tt, src, fns)
+      assert_parsed_alias_product(first, src)
+      assert_parsed_alias_product(second, src)
+      -- The cached source graph also remains usable after both clients.
+      assert_parsed_alias_product(module_parse_product_instantiate(tt, src, fns), src)
+    }
+  }
+}
+
+test "parsed products isolate alias annotations in declarations and effectful bodies" {
+  let source = "type Id = i64 type Box<T> { value: T } type Choice { Empty, Chosen(Id) } type Token = opaque Id effect Read { fn read() -> Id } trait Show { fn show(self) -> Id } const answer: Id = 42 fn identity(value: Id) -> Id { let local: Id = value local } fn read() -[Read]> Id { Read.read() }"
+  let table = ttable_new()
+  let tokens = lex(__str_ptr(source), __str_len(source))
+  let parsed = handle parse_module_syntax_local(tokens, __str_ptr(source), table) {
+    Diagnose.report(diagnostic) -> { Test.assert_true(false) resume(0) }
+    Diagnose.error(message, span) -> { Test.assert_true(false) resume(0) }
+    Diagnose.warn(message, span) -> { Test.assert_true(false) resume(0) }
+    Diagnose.note(message, span) -> resume(0)
+  }
+  match AstModule(parsed.functions, __str_ptr(source), table) {
+    AstModule(fns, src, tt) -> {
+      let first = module_parse_product_instantiate(tt, src, fns)
+      let second = module_parse_product_instantiate(tt, src, fns)
+      assert_parsed_alias_product(first, src)
+      assert_parsed_alias_product(second, src)
+      assert_parsed_alias_product(module_parse_product_instantiate(tt, src, fns), src)
+      match type_entry_from_ptr(ttable_entry_at(tt, 2)) {
+        TypeVariantEntry(_, _, TypeVariantListCons(_, TypeVariantListCons(TypeVariant(_, _, 1, TypeExprListCons(NamedTypeExpr(_, _, _, SourceTypeOrigin(_)), TypeExprListNil)), TypeVariantListNil))) -> Test.assert_true(true)
+        _ -> Test.assert_true(false)
+      }
+      match type_entry_from_ptr(ttable_entry_at(tt, 4)) {
+        TypeEffectEntry(_, _, TypeEffectOpListCons(TypeEffectOp(_, _, _, NamedTypeExpr(_, _, _, SourceTypeOrigin(_))), TypeEffectOpListNil)) -> Test.assert_true(true)
+        _ -> Test.assert_true(false)
+      }
+    }
+  }
+}
+
+test "parsed products preserve injected runtime modules with their functions" {
+  let source = "type Id = i64 effect Read { fn read() -> Id } fn identity(value: Id) -> Id { value } fn read() -[Read]> Id { Read.read() }"
+  match pipeline_parse_source_standalone(__str_ptr(source), __str_len(source)) {
+    AstModule(fns, src, tt) -> {
+      let copied = module_parse_product_instantiate(tt, src, fns)
+      match copied {
+        ModuleParseInstance(copied_fns, _) -> Test.assert_eq(nlist_len(copied_fns), nlist_len(fns))
+        InvalidModuleParseInstance -> Test.assert_true(false)
+      }
+      assert_parsed_alias_product(copied, src)
+      assert_parsed_alias_product(module_parse_product_instantiate(tt, src, fns), src)
+    }
+  }
+}
+
+test "checked products retain injected runtime modules with their functions" {
+  let source = "type Id = i64 effect Read { fn read() -> Id } fn read() -[Read]> Id { Read.read() }"
+  match pipeline_check_source_standalone(__str_ptr(source), __str_len(source)) {
+    TypedModule(fns, src, tt) -> {
+      ttable_mark_checked_module_products(tt, fns)
+      match module_checked_product_instantiate(tt, src, fns) {
+        ModuleCheckedInstance(copied_fns, copied_tt) -> {
+          Test.assert_eq(nlist_len(copied_fns), nlist_len(fns))
+          assert_alias_function_name(copied_tt, src, "read", "Id")
+        }
+        InvalidModuleCheckedInstance -> { Test.assert_true(false) nil }
+      }
+    }
+  }
+}

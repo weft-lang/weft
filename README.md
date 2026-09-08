@@ -52,7 +52,7 @@ The compiler emits AArch64 Mach-O and ELF directly and is written in Weft. The l
 
 **Pre-alpha and self-hosted.** The compiler is written in Weft and bootstraps byte-identically on macOS/AArch64 and Linux/AArch64. Mach-O products carry their own deterministic ad-hoc signature; standalone Linux products are static kernel-ABI ELF. The Zig seed interpreter is archived in git history; `./weft` is the checked-in macOS trust root. Until the public-alpha gate closes, source, package, fact-schema, and versioned native-binding contracts may change without compatibility support.
 
-- 5579 runtime test blocks across 506 files, plus 1219 negative (must-fail) cases
+- 5632 runtime test blocks across 512 files, plus 1258 negative (must-fail) cases
 - Tools as handler configurations over one pipeline: compile/check/test, the lossless formatter, checked API docs, diagnostic explanations, LSP, and JSON-RPC MCP
 - Threads via the `Par` effect (pthreads), object-file emission, effect-aware optimizer with an emission-replay allocation checker
 - Current release gates: the complete target-local Linux suite on adequate hardware, hardening/governance, final status/support documentation, and the two-target outside-user exercise. Install/release UX, project signing, free community macOS distribution, and native-binding platform diagnostics are complete
@@ -141,6 +141,17 @@ fn main() -> i64 {
 ```
 
 Inside the typed arm, `policy` is a `RetryPolicy`; the compiler checks that the matches cover every remaining case. The same narrowing works after `if x != nil` for an immutable `x: str | nil`. `T?` is shorthand for `T | nil`.
+
+Transparent aliases name an existing type without a wrapper or conversion:
+
+```weft
+type Value = i64 | str
+type Pair<T> = (T, T)
+type Callback<E> = () -[E]> Value
+```
+
+Aliases preserve the target's bounds, effects, ownership and representation.
+They introduce no constructors; use `opaque` when a distinct type identity is needed.
 
 Runtime matching needs a distinguishable representation, such as a variant or a nil sentinel. An untagged union such as `i64 | str` cannot be distinguished this way; use a variant when a runtime tag is needed.
 

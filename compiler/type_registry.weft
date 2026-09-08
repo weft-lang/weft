@@ -11,7 +11,7 @@ pub(package) fn type_registry_alloc_bytes(size: i64) -> i64 {
 }
 
 pub(package) fn ttable_new() -> i64 {
-  let h = type_registry_alloc_bytes(264)
+  let h = type_registry_alloc_bytes(272)
   let d = type_registry_alloc_bytes(6400)
   mem_store64_at(h, 0, d)
   mem_store64_at(h + 8, 0, 0)
@@ -112,6 +112,9 @@ pub(package) fn ttable_new() -> i64 {
   -- Zero selects the ordinary root source. This is invocation-local: reusable
   -- module products do not inherit another program's entry selection.
   mem_store64_at(h + 256, 0, 0)
+  -- Written alias occurrences and their bound obligations are source facts,
+  -- separate from the expanded semantic types consumed by native lowering.
+  mem_store64_at(h + 264, 0, 0)
   h
 }
 
@@ -175,7 +178,8 @@ pub(package) fn ttable_type_hash_index_find(tt: i64, hash: i64, kind: i64) -> i6
       if node_f1(current) == hash and (kind < 0 or node_tag(current) == kind) {
         -- Entries are prepended; retaining the last match preserves the
         -- registry's historical first-declaration lookup order.
-        found_index = node_f2(current)
+        let index = node_f2(current)
+        if mem_load64_at(ttable_entry_at(tt, index), 56) == hash { found_index = index } else { 0 }
       } else { 0 }
       current = node_f4(current)
     }
@@ -217,19 +221,61 @@ pub(package) fn ttable_linear_layout_cache_buckets(tt: i64) -> i64 {
 -- only the persistent bucket heads lets those facts memoize within the pass;
 -- restoring the heads before the bump rollback unlinks exactly the scratch
 -- entries without throwing away facts established during checking/lowering.
-pub(package) fn ttable_linear_layout_cache_checkpoint(tt: i64) -> i64 {
-  if tt == 0 { 0 }
+pub(package) type TypeUseNameCheckpoint {
+  MissingTypeUseNameCheckpoint,
+  SavedTypeUseNames(i64, i64)
+}
+
+pub(package) fn ttable_type_use_names_checkpoint(tt: i64) -> TypeUseNameCheckpoint {
+  let names = ttable_type_use_names(tt)
+  if names == 0 { MissingTypeUseNameCheckpoint }
   else {
-    let bytes = ttable_linear_layout_cache_bucket_count() * 8
-    let checkpoint = alloc_words(ttable_linear_layout_cache_bucket_count())
-    mem_copy(checkpoint, ttable_linear_layout_cache_buckets(tt), bytes)
-    checkpoint
+    let copy = alloc_words(256)
+    mem_copy(copy, node_f1(names), 256 * 8)
+    SavedTypeUseNames(names, copy)
   }
 }
 
-pub(package) fn ttable_linear_layout_cache_restore(tt: i64, checkpoint: i64) -> i64 {
-  if tt == 0 or checkpoint == 0 { 0 }
-  else { mem_copy(ttable_linear_layout_cache_buckets(tt), checkpoint, ttable_linear_layout_cache_bucket_count() * 8) 0 }
+pub(package) fn ttable_type_use_names_restore(tt: i64, checkpoint: TypeUseNameCheckpoint) -> nil {
+  if tt != 0 { match checkpoint {
+    MissingTypeUseNameCheckpoint -> mem_store64_at(tt, 264, 0)
+    SavedTypeUseNames(names, copy) -> {
+      mem_store64_at(tt, 264, names)
+      mem_copy(node_f1(names), copy, 256 * 8)
+    }
+  } } else { 0 }
+  nil
+}
+
+pub(package) type RegistryFactCheckpoint {
+  MissingRegistryFactCheckpoint,
+  SavedRegistryFacts(i64, i64, TypeUseNameCheckpoint)
+}
+
+pub(package) fn ttable_scratch_facts_checkpoint(tt: i64) -> RegistryFactCheckpoint {
+  if tt == 0 { MissingRegistryFactCheckpoint }
+  else {
+    let layout = mem_load64_at(tt, 208)
+    let copy = if layout == 0 { 0 } else {
+      let snapshot = alloc_words(ttable_linear_layout_cache_bucket_count())
+      mem_copy(snapshot, layout, ttable_linear_layout_cache_bucket_count() * 8)
+      snapshot
+    }
+    SavedRegistryFacts(layout, copy, ttable_type_use_names_checkpoint(tt))
+  }
+}
+
+pub(package) fn ttable_scratch_facts_restore(tt: i64, checkpoint: RegistryFactCheckpoint) -> i64 {
+  if tt == 0 { 0 }
+  else { match checkpoint {
+    MissingRegistryFactCheckpoint -> 0
+    SavedRegistryFacts(layout, copy, names) -> {
+      mem_store64_at(tt, 208, layout)
+      if layout != 0 { mem_copy(layout, copy, ttable_linear_layout_cache_bucket_count() * 8) } else { 0 }
+      ttable_type_use_names_restore(tt, names)
+      0
+    }
+  } }
 }
 
 -- Cache entry: registry version in tag, semantic hash/type/fact in f1..f3,
@@ -718,8 +764,8 @@ pub(package) fn ttable_copy_source_policy(source_tt: i64, dest_tt: i64, src: i64
   0
 }
 -- Entry layout: [ns(8), nl(8), kind(8), nfields(8), items(8), tparams(8), src(8), hash(8)] = 64 bytes.
--- Kinds: 0 record, 1 variant, 2 effect, 3 trait, 4 impl, 5 opaque
--- value type. For kind 5, nfields is zero and items is the representation type.
+-- Kinds: 0 record, 1 variant, 2 effect, 3 trait, 4 impl, 5 opaque,
+-- 6 transparent alias. For kinds 5/6, nfields is zero and items is the target.
 -- src stored per entry for cross-file name resolution
 pub(package) fn ttable_add(tt: i64, src: i64, ns: i64, nl: i64, kind: i64, nfields: i64, fields: i64, tparams: i64) -> i64 {
   let n = mem_load64_at(tt + 8, 0)
@@ -744,7 +790,7 @@ pub(package) fn ttable_add(tt: i64, src: i64, ns: i64, nl: i64, kind: i64, nfiel
   let name_hash = if kind == 3 { effect_name_hash(src, ns, nl) } else { type_name_hash(src, ns, nl) }
   mem_store64_at(d + n * 64 + 56, 0, name_hash)
   ttable_type_hash_index_add(tt, name_hash, kind, n)
-  if kind == 0 or kind == 1 or kind == 5 {
+  if kind == 0 or kind == 1 or kind == 5 or kind == 6 {
     ttable_type_decl_index_add(
       tt,
       module_decl_fact_find(tt, src, module_decl_namespace_type(), src, ns, nl),
@@ -776,7 +822,7 @@ pub(package) fn ttable_lookup(tt: i64, src: i64, ns: i64, nl: i64) -> i64 {
 }
 
 pub(package) fn ttable_kind_matches_decl_namespace(kind: i64, namespace: i64) -> i64 {
-  if namespace == module_decl_namespace_type() { if kind == 0 or kind == 1 or kind == 5 { 1 } else { 0 } }
+  if namespace == module_decl_namespace_type() { if kind == 0 or kind == 1 or kind == 5 or kind == 6 { 1 } else { 0 } }
   else { if namespace == module_decl_namespace_effect() { if kind == 2 { 1 } else { 0 } }
   else { if namespace == module_decl_namespace_trait() { if kind == 3 { 1 } else { 0 } }
   else { 0 } } }
@@ -1018,4 +1064,35 @@ pub(package) fn type_name_hash(src: i64, ns: i64, nl: i64) -> i64 {
   else { if src_eq(src, ns, nl, "usize") == 1 { 0 - 14 }
   else { if src_eq(src, ns, nl, "f32") == 1 { 0 - 15 }
   else { effect_name_hash(src, ns, nl) } } } } } } } } } } } } } } }
+}
+
+pub(package) fn ttable_type_use_names(tt: i64) -> i64 {
+  if tt == 0 { 0 } else { mem_load64_at(tt, 264) }
+}
+
+pub(package) fn ttable_ensure_type_use_names(tt: i64) -> i64 {
+  let existing = ttable_type_use_names(tt)
+  if existing != 0 { existing }
+  else {
+    let names = type_use_names_new()
+    mem_store64_at(tt, 264, names)
+    names
+  }
+}
+
+pub(package) fn ttable_substitute_type(tt: i64, ty: i64, subst: i64) -> i64 {
+  let previous = subst_type_use_names(subst)
+  subst_set_type_use_names(subst, ttable_type_use_names(tt))
+  let result = ty_subst(ty, subst)
+  subst_set_type_use_names(subst, previous)
+  result
+}
+
+pub(package) fn ttable_set_impl_target_hash(tt: i64, index: i64, target_hash: i64) -> nil {
+  let entry = ttable_entry_at(tt, index)
+  if ttable_entry_kind(entry) == 4 and mem_load64_at(entry, 56) != target_hash {
+    mem_store64_at(entry, 56, target_hash)
+    ttable_type_hash_index_add(tt, target_hash, 4, index)
+  } else { 0 }
+  nil
 }

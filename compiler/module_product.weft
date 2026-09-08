@@ -3,14 +3,17 @@
 -- A project parse table may contain products for many roots. It is never a
 -- checker environment: this module copies exactly one root's import closure
 -- into a fresh table, remapping every mutable module/declaration/function-pair
--- identity while retaining immutable source bytes, syntax, and package data.
+-- identity and checker-mutable syntax while retaining source bytes and package
+-- data. Checked products below preserve their already-resolved identities.
 
 use compiler/lib.{*}
+use compiler/ir.{*}
 use compiler/module.{*}
 use compiler/package.{pkg_table_clone_resolution_state}
 use compiler/parse.{mark_file_loaded}
 use compiler/typeck.{*}
 use compiler/type_registry.{*}
+use compiler/types.{type_use_names_add}
 use runtime/alloc.{*}
 use runtime/memory.{*}
 
@@ -93,6 +96,18 @@ pub(package) fn module_product_collect_closure(source_tt: i64, module_entry: i64
   }
 }
 
+-- The root's function product also names compiler-injected runtime modules.
+-- Those are dependencies even though they do not grant source-level imports.
+-- Carry their registries and authority policies with their function bodies.
+fn module_product_collect_root_closure(source_tt: i64, root: i64, functions: i64) -> i64 {
+  let selected = module_product_collect_closure(source_tt, root, nlist_new())
+  for i in 0..nlist_len(functions) {
+    let source = node_f2(nlist_get(functions, i))
+    module_product_collect_closure(source_tt, module_fact_find_source(source_tt, source), selected)
+  }
+  selected
+}
+
 -- Collect the exact dependency forest below one root without selecting the
 -- root itself. A scheduler can intersect or group these immutable identities,
 -- then instantiate only a closure-closed forest into a checker universe.
@@ -121,13 +136,11 @@ pub(package) fn module_product_selection_is_closed(source_tt: i64, selected: i64
   closed
 }
 
--- Impl entries retain method/type payloads that can carry declaration-derived
--- native dispatch identity. The parsed-product copier remaps registries and
--- function pairs, but deliberately does not mutate the producer's shared AST
--- and type graphs. Until those payloads are deep-cloned and every embedded
--- DeclId is remapped, presenting such a product as a fresh checker universe
--- can check cleanly and later emit a missing-method trap. Checked products do
--- not need this fence because they preserve producer identities exactly.
+-- Impl entries can carry declaration-derived native dispatch identities in
+-- addition to syntax. Copying their syntax does not remap those native keys
+-- or embedded DeclIds. Until that identity transport is complete, a fresh
+-- checker universe could check cleanly and later emit a missing-method trap.
+-- Checked products preserve producer identities exactly and need no fence.
 pub(package) fn module_parse_product_selection_is_identity_complete(source_tt: i64, selected: i64) -> i64 {
   let mut complete = 1
   let mut i = 0
@@ -166,13 +179,24 @@ pub(package) fn module_product_clone_modules(source_tt: i64, dest_tt: i64, selec
       mark_file_loaded(mem_load64_at(dest_tt, 24), module_fact_entry_path_ptr(old_module), 0, module_fact_entry_path_len(old_module), package_id)
     } else { 0 }
     ttable_copy_source_policy(source_tt, dest_tt, src)
-    -- Handler declaration syntax is immutable and source-relative. Parsed
-    -- products may share it exactly like function/type syntax; checking
-    -- publishes a fresh resolved fact on the destination module entry.
-    module_fact_set_handler_implementation(new_module, module_fact_entry_handler_implementation(old_module))
+    let old_handler = module_fact_entry_handler_implementation(old_module)
+    if old_handler != 0 {
+      let metadata = node_f4(old_handler)
+      let clauses = node_f3(old_handler) |> handler_clause_list_from_nodes(0, node_f2(metadata)) |> handler_clause_list_to_nodes()
+      let copied_metadata = node_new(0,
+        node_f1(metadata) |> type_param_list_from_type_param_nodes() |> type_param_list_to_nodes(),
+        node_f2(metadata), node_f3(metadata), node_f4(metadata))
+      module_fact_set_handler_implementation(new_module, node_new(1,
+        node_f1(old_handler) |> expr_from_node() |> expr_to_node(),
+        node_f2(old_handler) |> param_list_from_param_nodes() |> param_list_to_nodes(),
+        clauses, copied_metadata))
+    } else { 0 }
     let old_defaults = module_fact_entry_default_handlers(old_module)
     for default_index in 0..nlist_len(old_defaults) {
-      module_fact_add_default_handler(new_module, nlist_get(old_defaults, default_index))
+      let old_default = nlist_get(old_defaults, default_index)
+      module_fact_add_default_handler(new_module, node_new(1,
+        node_f1(old_default) |> expr_from_node() |> expr_to_node(),
+        node_f2(old_default), node_f3(old_default), node_f4(old_default)))
     }
     module_product_map_put(module_map, old_module, new_module)
   }
@@ -193,6 +217,91 @@ pub(package) fn module_product_clone_types(source_tt: i64, dest_tt: i64, selecte
         ttable_entry_items(entry),
         ttable_entry_tparams(entry)
       )
+    } else { 0 }
+  }
+  dest_tt
+}
+
+-- These arrays are the private storage adapter for the typed declaration
+-- values. Copy nested types too: checking resolves annotations in place.
+fn module_product_record_fields(fields: TypeRecordFieldList) -> i64 {
+  let data = alloc_zeroed(type_record_field_list_len(fields) * 24)
+  let mut remaining = fields
+  let mut index = 0
+  let mut done = false
+  while not done {
+    match remaining {
+      TypeRecordFieldListNil -> { done = true }
+      TypeRecordFieldListCons(field, rest) -> {
+        match field {
+          TypeRecordField(start, length, ty) -> {
+            mem_store64_at(data, index * 24, start)
+            mem_store64_at(data, index * 24 + 8, length)
+            mem_store64_at(data, index * 24 + 16, type_expr_to_node(ty))
+          }
+          MissingTypeRecordField -> 0
+        }
+        index = index + 1
+        remaining = rest
+      }
+    }
+  }
+  data
+}
+
+fn module_product_variants(variants: TypeVariantList, source: i64) -> i64 {
+  let data = alloc_zeroed(type_variant_list_len(variants) * 40)
+  let mut remaining = variants
+  let mut index = 0
+  let mut done = false
+  while not done {
+    match remaining {
+      TypeVariantListNil -> { done = true }
+      TypeVariantListCons(variant, rest) -> {
+        match variant {
+          TypeVariant(start, length, count, payloads) -> {
+            mem_store64_at(data, index * 40, start)
+            mem_store64_at(data, index * 40 + 8, length)
+            mem_store64_at(data, index * 40 + 16, str_hash(source, start, length))
+            mem_store64_at(data, index * 40 + 24, count)
+            mem_store64_at(data, index * 40 + 32, type_expr_list_to_nodes(payloads))
+          }
+          MissingTypeVariant -> 0
+        }
+        index = index + 1
+        remaining = rest
+      }
+    }
+  }
+  data
+}
+
+fn module_product_type_payload(entry: TypeEntry) -> i64 {
+  match entry {
+    TypeRecordEntry(_, _, fields) -> module_product_record_fields(fields)
+    TypeVariantEntry(name, _, variants) -> module_product_variants(variants, type_entry_source_from_info_or(name, 0))
+    TypeEffectEntry(_, _, ops) -> type_effect_op_list_to_nodes(ops)
+    TypeTraitEntry(_, _, members) -> type_trait_member_list_to_nodes(members)
+    TypeImplEntry(_, _, members, _) -> type_impl_member_list_to_nodes(members)
+    TypeOpaqueEntry(_, _, representation) -> type_expr_to_node(representation)
+    TypeAliasEntry(_, _, target) -> type_expr_to_node(target)
+    MissingTypeEntry -> 0
+  }
+}
+
+fn module_parse_product_clone_types(source_tt: i64, dest_tt: i64, selected: i64) -> i64 {
+  for i in 0..ttable_entry_count(source_tt) {
+    let original = ttable_entry_at(source_tt, i)
+    if module_product_selected_source(selected, ttable_entry_source(original)) == 1 {
+      let entry = type_entry_from_ptr(original)
+      let params = type_entry_type_params(entry)
+      let copied_params = match entry {
+        TypeImplEntry(_, _, _, target) -> type_impl_target_to_node(target, params)
+        _ -> type_param_list_to_nodes(params)
+      }
+      ttable_add(dest_tt, type_entry_source_or(entry, 0), type_entry_name_start_or(entry, 0),
+        type_entry_name_len_or(entry, 0), type_entry_kind_or(entry, -1),
+        type_entry_item_count_or(entry, 0), module_product_type_payload(entry), copied_params)
     } else { 0 }
   }
   dest_tt
@@ -225,8 +334,8 @@ pub(package) fn module_product_clone_decl(source_tt: i64, dest_tt: i64, old_decl
           new_decl,
           node_new(
             0,
-            module_constant_fact_declared_type(old_constant),
-            module_constant_fact_initializer(old_constant),
+            module_constant_fact_declared_type(old_constant) |> type_expr_from_node() |> type_expr_to_node(),
+            module_constant_fact_initializer(old_constant) |> expr_from_node() |> expr_to_node(),
             module_constant_fact_state(old_constant),
             module_constant_fact_value(old_constant)
           )
@@ -278,7 +387,8 @@ pub(package) fn module_product_clone_pairs(source_tt: i64, dest_tt: i64, selecte
       let old_pair = nlist_get(pairs, pair_index)
       let new_decl = module_product_map_find(decl_map, node_tag(old_pair))
       if new_decl != 0 {
-        let new_pair = node_new(new_decl, node_f1(old_pair), node_f2(old_pair), node_f3(old_pair), node_f4(old_pair))
+        let copied_syntax = node_f1(old_pair) |> decl_from_node() |> decl_to_node()
+        let new_pair = node_new(new_decl, copied_syntax, node_f2(old_pair), node_f3(old_pair), node_f4(old_pair))
         module_decl_fact_bind_function_pair(new_decl, new_pair)
         module_fact_cache_function_pair(dest_tt, module_fact_entry_source(old_module), new_pair)
         module_product_map_put(pair_map, old_pair, new_pair)
@@ -293,9 +403,12 @@ pub(package) fn module_product_root_pairs(root_fns: i64, pair_map: i64) -> i64 {
   for i in 0..nlist_len(root_fns) {
     let old_pair = nlist_get(root_fns, i)
     let new_pair = module_product_map_find(pair_map, old_pair)
-    -- Test declarations have no declaration fact and remain immutable syntax
-    -- pairs until the root-local harness creates ordinary wrapper functions.
-    nlist_add(result, if new_pair == 0 { old_pair } else { new_pair })
+    -- Tests have no declaration identity, but their annotations and bodies
+    -- still belong to this checker's independently mutable syntax graph.
+    nlist_add(result, if new_pair == 0 {
+      node_new(node_tag(old_pair), node_f1(old_pair) |> decl_from_node() |> decl_to_node(),
+        node_f2(old_pair), node_f3(old_pair), node_f4(old_pair))
+    } else { new_pair })
   }
   result
 }
@@ -324,14 +437,14 @@ pub(package) fn module_parse_product_instantiate(source_tt: i64, root_src: i64, 
   let root_module = module_fact_find_source(source_tt, root_src)
   if root_module == 0 { InvalidModuleParseInstance }
   else {
-    let selected = module_product_collect_closure(source_tt, root_module, nlist_new())
+    let selected = module_product_collect_root_closure(source_tt, root_module, root_fns)
     if module_parse_product_selection_is_identity_complete(source_tt, selected) == 0 { InvalidModuleParseInstance }
     else {
       let dest_tt = ttable_new()
       pkg_table_clone_resolution_state(source_tt, dest_tt)
       let module_map = module_product_map_new(nlist_len(selected))
       module_product_clone_modules(source_tt, dest_tt, selected, module_map)
-      module_product_clone_types(source_tt, dest_tt, selected)
+      module_parse_product_clone_types(source_tt, dest_tt, selected)
       let decl_map = module_product_map_new(module_fact_decl_count(source_tt))
       module_product_clone_declarations(source_tt, dest_tt, selected, module_map, decl_map)
       module_product_clone_imports(source_tt, dest_tt, selected, module_map)
@@ -349,7 +462,7 @@ pub(package) fn module_parse_product_instantiate_selected(source_tt: i64, select
     pkg_table_clone_resolution_state(source_tt, dest_tt)
     let module_map = module_product_map_new(nlist_len(selected))
     module_product_clone_modules(source_tt, dest_tt, selected, module_map)
-    module_product_clone_types(source_tt, dest_tt, selected)
+    module_parse_product_clone_types(source_tt, dest_tt, selected)
     let decl_map = module_product_map_new(module_fact_decl_count(source_tt))
     module_product_clone_declarations(source_tt, dest_tt, selected, module_map, decl_map)
     module_product_clone_imports(source_tt, dest_tt, selected, module_map)
@@ -502,6 +615,20 @@ pub(package) fn module_checked_product_share_semantic_facts(source_tt: i64, dest
       ttable_publish_semantic_symbol_fact(dest_tt, fact)
     } else { 0 }
   }
+  let names = ttable_type_use_names(source_tt)
+  if names != 0 {
+    let dest_names = ttable_ensure_type_use_names(dest_tt)
+    for bucket in 0..256 {
+      let mut current = mem_load64_at(node_f1(names), bucket * 8)
+      while current != 0 {
+        let fact = node_f2(current)
+        if module_product_selected_source(selected, node_f2(fact)) == 1 {
+          type_use_names_add(dest_names, node_f1(current), fact)
+        } else { 0 }
+        current = node_f3(current)
+      }
+    }
+  } else { 0 }
   dest_tt
 }
 
@@ -520,7 +647,7 @@ pub(package) fn module_checked_product_instantiate(source_tt: i64, root_src: i64
   let root_module = module_fact_find_source(source_tt, root_src)
   if root_module == 0 { InvalidModuleCheckedInstance }
   else {
-    let selected = module_product_collect_closure(source_tt, root_module, nlist_new())
+    let selected = module_product_collect_root_closure(source_tt, root_module, root_fns)
     if module_checked_product_is_complete(source_tt, selected) == 0 { InvalidModuleCheckedInstance }
     else {
       let dest_tt = ttable_new()
