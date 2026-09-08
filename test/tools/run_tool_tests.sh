@@ -2326,6 +2326,16 @@ assert_equals "compile_parse_failure_no_binary" "$(wc -c < "$tmp_out" | tr -d ' 
 assert_contains "compile_parse_failure_diagnostic" "$(<"$tmp_err")" "error[E0002]: unexpected token at module level"
 assert_contains "compile_parse_failure_summary" "$(<"$tmp_err")" "compile: parse failed with 1 errors"
 
+for try_operand_case in try_integer try_nominal_lookalike; do
+  set +e
+  run_weft_compile_guarded "$WEFT" compile "test/negative/$try_operand_case.weft" > "$tmp_out" 2> "$tmp_err"
+  try_operand_exit=$?
+  set -e
+  assert_equals "compile_${try_operand_case}_fails_before_emission" "$try_operand_exit" "1"
+  assert_equals "compile_${try_operand_case}_has_no_artifact" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+  assert_contains "compile_${try_operand_case}_reports_contract" "$(<"$tmp_err")" "error[E1002]: ? requires stdlib Result<T, E>"
+done
+
 printf '%s\n' 'extern fn placeholder(n: i64) -> i64 { n }' 'test "recovered body must not run" { Test.assert_eq(1, 1) }' > "$tmp_src"
 set +e
 "$WEFT" test < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
@@ -3333,6 +3343,11 @@ assert_equals "mcp_diagnostics_generic_type_arg_count_snapshot" "$mcp_out" '{"js
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"fn bad() -> i64 { for x in 42 { 0 } 0 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_for_iter_non_list_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: for iterator requires an array, slice, Cons/Nil list, or IntoIterator","span":22,"line":1,"col":23,"scalar_col":23,"utf16_col":23}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"-- 🧶\nfn bad() -> i64 { (42, 7)? }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals_without_diagnostic_payload "mcp_try_operand_contract_and_operator_range" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":1,"functions":1,"check_errors":1,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"? requires stdlib Result<T, E>, found `(i64, i64)`","code":"E1002","span":33,"line":2,"col":26,"scalar_col":26,"utf16_col":26,"end_span":34,"end_line":2,"end_col":27,"end_scalar_col":27,"end_utf16_col":27}]}}'
+assert_contains "mcp_try_operand_typed_reason" "$mcp_out" '"name":"reason","value":"non_result"'
+assert_contains "mcp_try_operand_expected_type" "$mcp_out" '"kind":"named","name":"Result","arguments":[{"kind":"top"},{"kind":"top"}]'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"use runtime/unsafe.{Unsafe} fn bad() -[Unsafe]> i64 { __got_nope() }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_diagnostics_unknown_got_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"diagnostics","ok":true,"schema_version":1,"stability":"stable","phase":"parse+check","diagnostics":3,"functions":1,"check_errors":3,"position_units":{"span":"utf-8-byte-offset","line_base":1,"col":"utf-8-byte-column","scalar_col":"unicode-scalar-column","utf16_col":"utf-16-code-unit-column"},"items":[{"severity":"error","message":"type error: unknown GOT symbol","span":54,"line":1,"col":55,"scalar_col":55,"utf16_col":55},{"severity":"error","message":"type error: unknown GOT symbol","span":54,"line":1,"col":55,"scalar_col":55,"utf16_col":55},{"severity":"error","message":"type error: Unsafe is sealed to trusted runtime/platform code","span":54,"line":1,"col":55,"scalar_col":55,"utf16_col":55}]}}'

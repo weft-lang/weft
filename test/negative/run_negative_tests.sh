@@ -386,6 +386,16 @@ check_rejects "non_unsafe_handler_raw_call" "test/negative/non_unsafe_handler_ra
 check_rejects "unhandled_effect_in_while" "test/negative/unhandled_effect_in_while.weft" "error[E2001]:"
 check_rejects "unhandled_effect_in_defer" "test/negative/unhandled_effect_in_defer.weft" "error[E2001]:"
 check_rejects "unhandled_try_effect" "test/negative/unhandled_try_effect.weft" 'error[E2001]: effect `Fail<i64>` is not available in this context'
+check_rejects "try_integer" "test/negative/try_integer.weft" 'error[E1002]: ? requires stdlib Result<T, E>' 1
+check_rejects "try_string" "test/negative/try_string.weft" 'error[E1002]: ? requires stdlib Result<T, E>' 1
+check_rejects "try_tuple" "test/negative/try_tuple.weft" 'error[E1002]: ? requires stdlib Result<T, E>' 1
+check_rejects "try_option" "test/negative/try_option.weft" 'error[E1002]: ? requires stdlib Result<T, E>' 1
+check_rejects "try_record" "test/negative/try_record.weft" 'error[E1002]: ? requires stdlib Result<T, E>' 1
+check_rejects "try_nominal_lookalike" "test/negative/try_nominal_lookalike.weft" 'error[E1002]: ? requires stdlib Result<T, E>' 1
+check_rejects "try_opaque_wrapper" "test/negative/try_opaque_wrapper.weft" 'error[E1002]: ? requires stdlib Result<T, E>' 1
+check_rejects "try_unconstrained_type" "test/negative/try_unconstrained_type.weft" 'error[E1002]: ? requires stdlib Result<T, E>' 1
+check_rejects "try_any" "test/negative/try_any.weft" 'error[E1002]: ? requires stdlib Result<T, E>' 1
+check_rejects "try_local_fail_non_result" "test/negative/try_local_fail_non_result.weft" 'error[E1002]: ? requires stdlib Result<T, E>' 1
 check_rejects "unhandled_optional_chain_effect" "test/negative/unhandled_optional_chain_effect.weft" "error[E2001]:"
 check_rejects "effect_perform_arg_mismatch" "test/negative/effect_perform_arg_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'
 check_rejects "effectful_lambda_to_pure_fn" "test/negative/effectful_lambda_to_pure_fn.weft" "error[E2001]:"
