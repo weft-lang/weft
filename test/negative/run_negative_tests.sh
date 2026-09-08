@@ -58,6 +58,15 @@ check_rejects() {
   JOB_N=$((JOB_N+1))
 }
 
+check_rejects 'else_alternative_value' 'test/negative/else_alternative_value.weft' 'expected '"'"'{'"'"' or '"'"'if'"'"' after '"'"'else'"'"'' 1
+check_rejects 'else_chain_missing_body' 'test/negative/else_chain_missing_body.weft' 'expected '"'"'{'"'"' after if condition' 1
+check_rejects 'else_chain_missing_equals' 'test/negative/else_chain_missing_equals.weft' 'expected '"'"'='"'"' after if-let pattern' 1
+check_rejects 'else_chain_missing_pattern' 'test/negative/else_chain_missing_pattern.weft' 'expected pattern after '"'"'if let'"'"'' 1
+check_rejects 'else_chain_condition_type' 'test/negative/else_chain_condition_type.weft' 'boolean expression is not bool' 1
+check_rejects 'else_chain_pattern_scope' 'test/negative/else_chain_pattern_scope.weft' 'unknown identifier '"'"'value'"'"'' 2
+check_rejects 'else_chain_missing_final_else' 'test/negative/else_chain_missing_final_else.weft' 'return value type mismatch: expected `i64`, found `nil`' 1
+check_rejects 'else_chain_statement_annotation' 'test/negative/else_chain_statement_annotation.weft' 'type annotation type mismatch: expected `i64`, found `nil`' 1
+check_rejects 'else_chain_unhandled_effect' 'test/negative/else_chain_unhandled_effect.weft' 'effect `Read` is not available in this context' 1
 check_rejects "field_access_variant_unknown" "test/negative/field_access_variant_unknown.weft" "unknown field" 1
 check_rejects "field_access_variant_constructor" "test/negative/field_access_variant_constructor.weft" "unknown field" 1
 check_rejects "field_access_generic_variant" "test/negative/field_access_generic_variant.weft" "unknown field" 1

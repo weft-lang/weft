@@ -142,6 +142,29 @@ The handler clause does not call `resume`, so control aborts to the handler.
 Continuations are one-shot; deferred resumption uses the explicit `with k`
 form.
 
+## Conditional chains
+
+Use `else if` to test alternatives in order. Pattern conditions can appear in
+that same chain; their bindings belong to the selected branch.
+
+```weft
+fn classify(value: Option<i64>) -> i64 {
+  if let Some(number) = value {
+    if number < 0 { -1 } else if number == 0 { 0 } else { 1 }
+  } else {
+    2
+  }
+}
+
+fn main() -> i64 {
+  if classify(Some<i64>(-7)) == -1 and classify(None<i64>()) == 2 { 0 } else { 1 }
+}
+```
+
+A chain with a final `else` returns its selected branch's value. Without a
+final `else`, the entire chain is a statement: it discards any selected value
+and returns `nil`. Resource values discarded this way are dropped normally.
+
 ## Naming types
 
 Use an alias when a type expression deserves a name:
