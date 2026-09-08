@@ -1,0 +1,193 @@
+-- Module recovery rejects ignored syntax and keeps declaration provenance.
+
+use compiler/declaration_syntax.{*}
+use compiler/ir.{TypeNameRange}
+use compiler/lex.{lex}
+use compiler/lib.{nlist_len}
+use compiler/parse.{parse_module_syntax_local}
+use compiler/type_registry.{ttable_new}
+use stdlib/diagnostic.{*}
+use stdlib/diagnostic/schema.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option.{Option}
+use stdlib/string.{str_concat}
+use stdlib/state as state
+
+fn recovery_parse(source: str) -> (ParsedModuleSyntax, List<Diagnostic>) {
+  let tokens = lex(__str_ptr(source), __str_len(source))
+  state.run(Nil<Diagnostic>(), () => handle parse_module_syntax_local(tokens, __str_ptr(source), ttable_new()) {
+    Diagnose.report(diagnostic) -> {
+      state.modify((items: List<Diagnostic>) => Cons(diagnostic, items))
+      resume(0)
+    }
+    Diagnose.error(message, location) -> resume(0)
+    Diagnose.warn(message, location) -> resume(0)
+    Diagnose.note(message, location) -> resume(0)
+  })
+}
+
+fn recovery_text(source: str, range: TypeNameRange) -> str {
+  source.slice(__i64_to_usize(range.start), __i64_to_usize(range.start + range.length)).unwrap()
+}
+
+test "module punctuation cannot disappear before a following declaration" {
+  for token in ["}", ")", "]", ",", ":", "=", ".", "|", "&", "~", "?", "@", "->", "=>", "-[", "]>"] {
+    let source = "-- é🧶\n" |> str_concat(token) |> str_concat("\nfn retained() -> i64 { 42 }")
+    let (parsed, diagnostics) = recovery_parse(source)
+    Test.assert_eq_usize(diagnostics.len(), 1)
+    let diagnostic = diagnostics.first().unwrap()
+    Test.assert_true(diagnostic.code().eq(DiagnosticCodeAssigned("E0002")))
+    Test.assert_str_eq(diagnostic.message(), "expected a module declaration")
+    match diagnostic.primary() {
+      DiagnosticSourceRange(DiagnosticSourceBuffer(identity), start, end) -> {
+        Test.assert_eq(identity, __str_ptr(source))
+        Test.assert_eq_usize(start, 10)
+        -- The effect close is two lexer tokens: a bracket and greater-than.
+        if token == "]>" { Test.assert_eq_usize(end, 11) }
+        else { Test.assert_eq_usize(end, 10 + token.len()) }
+      }
+      _ -> Test.assert_true(false)
+    }
+    Test.assert_eq_usize(parsed.declarations.len(), 2)
+    let invalid = parsed.declarations.first().unwrap()
+    Test.assert_true(match invalid.syntax { InvalidDefinition -> true, _ -> false })
+    Test.assert_true(match invalid.validity { RecoveredDeclaration -> true, _ -> false })
+    let retained = parsed.declarations.get(1).unwrap()
+    Test.assert_true(match retained.validity { ParsedDeclaration -> true, _ -> false })
+    Test.assert_str_eq(recovery_text(source, retained.range), "fn retained() -> i64 { 42 }")
+    Test.assert_eq(nlist_len(parsed.functions), 1)
+  }
+}
+
+test "unsupported module keywords cannot turn into successful empty declarations" {
+  for prefix in ["let", "if", "else", "match", "while", "for", "in", "loop", "break", "continue", "return", "resume", "defer", "as", "package", "pub else", "pub pub"] {
+    let source = prefix.concat("\nfn retained() -> i64 { 42 }")
+    let (parsed, diagnostics) = recovery_parse(source)
+    Test.assert_eq_usize(diagnostics.len(), 1)
+    Test.assert_eq_usize(parsed.declarations.len(), 2)
+    Test.assert_true(match parsed.declarations.first().unwrap().validity { RecoveredDeclaration -> true, _ -> false })
+    Test.assert_true(match parsed.declarations.get(1).unwrap().validity { ParsedDeclaration -> true, _ -> false })
+    Test.assert_eq(nlist_len(parsed.functions), 1)
+  }
+}
+
+test "invalid module bodies do not promote their nested functions" {
+  for prefix in [
+    "{ fn hidden() -> i64 { 13 } }",
+    "(fn hidden() -> i64 { 13 })",
+    "[fn hidden() -> i64 { 13 }]",
+    "let value = { fn hidden() -> i64 { 13 } }",
+    "if true { fn hidden() -> i64 { 13 } } else { fn hidden_too() -> i64 { 14 } }"
+  ] {
+    let source = prefix.concat("\nfn retained() -> i64 { 42 }")
+    let (parsed, diagnostics) = recovery_parse(source)
+    Test.assert_eq_usize(diagnostics.len(), 1)
+    Test.assert_eq(nlist_len(parsed.functions), 1)
+    Test.assert_eq_usize(parsed.declarations.len(), 2)
+    let retained = parsed.declarations.get(1).unwrap()
+    Test.assert_str_eq(recovery_text(source, retained.range), "fn retained() -> i64 { 42 }")
+  }
+}
+
+test "module recovery retains contextual defaults and visibility prefixes" {
+  for boundary in ["default handler configured()", "pub fn retained() -> i64 { 42 }", "pub(package) type Name = str"] {
+    let source = ")\n".concat(boundary)
+    let (parsed, diagnostics) = recovery_parse(source)
+    Test.assert_eq_usize(diagnostics.len(), 1)
+    Test.assert_eq_usize(parsed.declarations.len(), 2)
+    let retained = parsed.declarations.get(1).unwrap()
+    Test.assert_true(match retained.validity { ParsedDeclaration -> true, _ -> false })
+    Test.assert_str_eq(recovery_text(source, retained.range), boundary)
+  }
+}
+
+test "empty modules and repeated declaration separators remain valid" {
+  for source in ["", "-- é🧶\n", "; ;\n;", "; fn first() -> i64 { 1 }; ; fn second() -> i64 { 2 }; ;"] {
+    let (_, diagnostics) = recovery_parse(source)
+    Test.assert_eq_usize(diagnostics.len(), 0)
+  }
+}
+
+test "unexpected module syntax at end of input is an explicit recovered declaration" {
+  for suffix in ["}", ")", "]", "let", "else", "pub", "pub(package)", "pub pub", "{}", "()", "[]"] {
+    let source = "fn retained() -> i64 { 42 }\n".concat(suffix)
+    let (parsed, diagnostics) = recovery_parse(source)
+    Test.assert_eq_usize(diagnostics.len(), 1)
+    Test.assert_eq_usize(parsed.declarations.len(), 2)
+    Test.assert_true(match parsed.declarations.get(1).unwrap().validity { RecoveredDeclaration -> true, _ -> false })
+    Test.assert_eq(nlist_len(parsed.functions), 1)
+  }
+}
+
+
+test "malformed impl members retain later methods without exposing their nested bodies" {
+  let source = "type Box { value: i64 } impl Box { fn (self) -> i64 { if true { 13 } else { 14 } } pub fn kept(self) -> i64 { 42 } } fn retained() -> i64 { 7 }"
+  let (parsed, diagnostics) = recovery_parse(source)
+  Test.assert_eq_usize(diagnostics.len(), 1)
+  Test.assert_str_eq(diagnostics.first().unwrap().message(), "expected method name after 'fn'")
+  Test.assert_eq_usize(parsed.declarations.len(), 3)
+  Test.assert_true(match parsed.declarations.get(1).unwrap().validity { RecoveredDeclaration -> true, _ -> false })
+  Test.assert_eq(nlist_len(parsed.functions), 2)
+  let retained = parsed.declarations.get(2).unwrap()
+  Test.assert_true(match retained.validity { ParsedDeclaration -> true, _ -> false })
+  Test.assert_str_eq(recovery_text(source, retained.range), "fn retained() -> i64 { 7 }")
+}
+
+
+test "deep invalid groups and repeated recovery preserve bounded declaration order" {
+  let mut prefix = ""
+  let mut suffix = ""
+  for _ in 0..128 {
+    prefix = prefix.concat("{([")
+    suffix = suffix.concat("])}")
+  }
+  let source = prefix |> str_concat("fn hidden() -> i64 { 13 }") |> str_concat(suffix) |> str_concat("fn retained() -> i64 { 42 }")
+  let (parsed, diagnostics) = recovery_parse(source)
+  Test.assert_eq_usize(diagnostics.len(), 1)
+  Test.assert_eq_usize(parsed.declarations.len(), 2)
+  Test.assert_eq(nlist_len(parsed.functions), 1)
+  let mut repeated = ""
+  for _ in 0..32 { repeated = repeated.concat("} fn retained() -> i64 { 42 }\n") }
+  let (many, failures) = recovery_parse(repeated)
+  Test.assert_eq_usize(failures.len(), 32)
+  Test.assert_eq_usize(many.declarations.len(), 64)
+  Test.assert_eq(nlist_len(many.functions), 32)
+}
+
+
+test "multiline tuple and function types consume their closing parenthesis" {
+  for definition in [
+    "type Pair = (i64,\nstr\n)",
+    "type Wrapped = opaque(\ni64,\nstr\n)",
+    "type Grouped = (\ni64\n)",
+    "type Single = (\ni64,\n)",
+    "type Callback = (\ni64,\nstr\n) -> i64",
+    "type Nested = (\n(i64,\nstr\n),\n(bool\n)\n)"
+  ] {
+    let source = definition.concat("\nfn retained() -> i64 { 42 }")
+    let (parsed, diagnostics) = recovery_parse(source)
+    Test.assert_eq_usize(diagnostics.len(), 0)
+    Test.assert_eq_usize(parsed.declarations.len(), 2)
+    Test.assert_str_eq(recovery_text(source, parsed.declarations.first().unwrap().range), definition)
+    Test.assert_eq(nlist_len(parsed.functions), 1)
+  }
+}
+
+type RecoveryPair = (
+  i64,
+  str
+)
+
+type RecoveryCallback = (
+  i64,
+  i64
+) -> i64
+
+fn recovery_apply(callback: RecoveryCallback, pair: RecoveryPair) -> i64 {
+  if pair.1 == "é" { callback(pair.0, 2) } else { 0 }
+}
+
+test "multiline type products preserve tuple and callback behavior" {
+  let pair: RecoveryPair = (40, "é")
+  Test.assert_eq(recovery_apply((left: i64, right: i64) => left + right, pair), 42)
+}

@@ -58,6 +58,24 @@ check_rejects() {
   JOB_N=$((JOB_N+1))
 }
 
+check_rejects module_stray_brace test/negative/module_stray_brace.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_stray_paren test/negative/module_stray_paren.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_stray_bracket test/negative/module_stray_bracket.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_stray_comma test/negative/module_stray_comma.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_stray_colon test/negative/module_stray_colon.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_stray_equals test/negative/module_stray_equals.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_empty_block test/negative/module_empty_block.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_empty_parens test/negative/module_empty_parens.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_empty_brackets test/negative/module_empty_brackets.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_bare_let test/negative/module_bare_let.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_bare_else test/negative/module_bare_else.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_bare_return test/negative/module_bare_return.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_trailing_visibility test/negative/module_trailing_visibility.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_trailing_package_visibility test/negative/module_trailing_package_visibility.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_repeated_visibility test/negative/module_repeated_visibility.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_keyword_body test/negative/module_keyword_body.weft 'error[E0002]: expected a module declaration' 1
+check_rejects module_imported_stray test/negative/module_imported_stray.weft 'error[E0002]: expected a module declaration' 1
+
 check_rejects pattern_boolean_i8 test/negative/pattern_boolean_i8.weft 'error[E1002]:' 1
 check_rejects pattern_boolean_i16 test/negative/pattern_boolean_i16.weft 'error[E1002]:' 1
 check_rejects pattern_boolean_i32 test/negative/pattern_boolean_i32.weft 'error[E1002]:' 1
@@ -658,7 +676,7 @@ check_rejects "list_filter_fold_i64_removed" "test/negative/list_filter_fold_i64
 check_rejects "list_map_filter_fold_i64_removed" "test/negative/list_map_filter_fold_i64_removed.weft" "error[E4002]: unknown module member 'list_map_filter_fold_i64' in import" 1
 check_rejects "prelude_methods_require_explicit_import" "test/negative/prelude_methods_require_explicit_import.weft" "type error: unknown method"
 check_rejects "quoted_import_removed" "test/negative/quoted_import_removed.weft" "error[E0002]: expected path-form module after 'use'"
-check_rejects "extern_keyword_removed" "test/negative/extern_keyword_removed.weft" "error[E0002]: unexpected token at module level"
+check_rejects "extern_keyword_removed" "test/negative/extern_keyword_removed.weft" "error[E0002]: expected a module declaration"
 check_rejects "module_qualified_function_unknown" "test/negative/module_qualified_function_unknown.weft" "error[E4002]: unknown module member 'left.missing'"
 check_rejects "module_qualified_function_private" "test/negative/module_qualified_function_private.weft" "error[E4004]: module member 'left.hidden' is not visible"
 check_rejects "module_qualified_function_arity" "test/negative/module_qualified_function_arity.weft" "type error: arity mismatch"

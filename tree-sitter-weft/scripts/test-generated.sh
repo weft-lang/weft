@@ -23,9 +23,9 @@ if [ ! -x "$tree_sitter" ]; then
 fi
 
 case "$mode" in
-  all|grammar|corpus|queries) ;;
+  all|grammar|corpus|queries|rejections) ;;
   *)
-    echo "usage: $0 [all|grammar|corpus|queries]" >&2
+    echo "usage: $0 [all|grammar|corpus|queries|rejections]" >&2
     exit 2
     ;;
 esac
@@ -105,4 +105,30 @@ if [ "$mode" = all ] || [ "$mode" = queries ]; then
   grep -q -- '- local.reference' "$locals_output"
   grep -q -- 'local.definition.*text: `initial`' "$locals_output"
   grep -q -- 'local.reference.*text: `initial`' "$locals_output"
+fi
+
+if [ "$mode" = all ] || [ "$mode" = rejections ]; then
+  # Both parsers must reject unsupported module syntax. These fixtures carry
+  # no checker-only rejection and must never yield formatted source.
+  for fixture in module_stray_brace module_stray_paren module_stray_bracket \
+    module_stray_comma module_stray_colon module_stray_equals \
+    module_empty_block module_empty_parens module_empty_brackets \
+    module_bare_let module_bare_else module_bare_return \
+    module_trailing_visibility module_trailing_package_visibility \
+    module_repeated_visibility module_keyword_body; do
+    source="$repo_root/test/negative/$fixture.weft"
+    if "$tree_sitter" parse --lib-path "$parser" --lang-name weft --quiet \
+      "$source" > "$work_dir/rejection.txt" 2>&1; then
+      echo "tree-sitter-weft: accepted invalid syntax in $fixture" >&2
+      exit 1
+    fi
+    grep -Eq 'ERROR|MISSING' "$work_dir/rejection.txt"
+    if (cd "$repo_root" && "$weft" fmt "$source") \
+      > "$work_dir/formatted.weft" 2> "$work_dir/diagnostic.txt"; then
+      echo "weft: accepted invalid syntax in $fixture" >&2
+      exit 1
+    fi
+    test ! -s "$work_dir/formatted.weft"
+    grep -Fq 'error[E0002]' "$work_dir/diagnostic.txt"
+  done
 fi
