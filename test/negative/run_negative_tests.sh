@@ -58,6 +58,18 @@ check_rejects() {
   JOB_N=$((JOB_N+1))
 }
 
+check_rejects pattern_boolean_i8 test/negative/pattern_boolean_i8.weft 'error[E1002]:' 1
+check_rejects pattern_boolean_i16 test/negative/pattern_boolean_i16.weft 'error[E1002]:' 1
+check_rejects pattern_boolean_i32 test/negative/pattern_boolean_i32.weft 'error[E1002]:' 1
+check_rejects pattern_boolean_isize test/negative/pattern_boolean_isize.weft 'error[E1002]:' 1
+check_rejects pattern_boolean_u8 test/negative/pattern_boolean_u8.weft 'error[E1002]:' 1
+check_rejects pattern_boolean_u16 test/negative/pattern_boolean_u16.weft 'error[E1002]:' 1
+check_rejects pattern_boolean_u32 test/negative/pattern_boolean_u32.weft 'error[E1002]:' 1
+check_rejects pattern_boolean_u64 test/negative/pattern_boolean_u64.weft 'error[E1002]:' 1
+check_rejects pattern_boolean_usize test/negative/pattern_boolean_usize.weft 'error[E1002]:' 1
+check_rejects pattern_boolean_str test/negative/pattern_boolean_str.weft 'error[E1002]:' 1
+check_rejects pattern_boolean_f64 test/negative/pattern_boolean_f64.weft 'error[E1002]:' 1
+
 check_rejects pattern_unsupported_constructor_string test/negative/pattern_unsupported_constructor_string.weft 'error[E0002]: unsupported pattern syntax' 1
 check_rejects pattern_unsupported_constructor_float test/negative/pattern_unsupported_constructor_float.weft 'error[E0002]: unsupported pattern syntax' 1
 check_rejects pattern_unsupported_constructor_keyword test/negative/pattern_unsupported_constructor_keyword.weft 'error[E0002]: unsupported pattern syntax' 1
@@ -68,6 +80,52 @@ check_rejects pattern_unsupported_record_string test/negative/pattern_unsupporte
 check_rejects pattern_unsupported_let_tuple_string test/negative/pattern_unsupported_let_tuple_string.weft 'error[E0002]: unsupported pattern syntax' 1
 check_rejects pattern_unsupported_for_tuple_string test/negative/pattern_unsupported_for_tuple_string.weft 'error[E0002]: unsupported pattern syntax' 1
 check_rejects pattern_unsupported_if_let_string test/negative/pattern_unsupported_if_let_string.weft 'error[E0002]: unsupported pattern syntax' 1
+
+check_rejects numeric_hex_prefix test/negative/numeric_hex_prefix.weft 'error[E0002]: numeric literal requires digits' 1
+check_rejects numeric_binary_prefix test/negative/numeric_binary_prefix.weft 'error[E0002]: numeric literal requires digits' 1
+check_rejects numeric_hex_no_digits test/negative/numeric_hex_no_digits.weft 'error[E0002]: numeric literal requires digits' 1
+check_rejects numeric_binary_no_digits test/negative/numeric_binary_no_digits.weft 'error[E0002]: numeric literal requires digits' 1
+check_rejects numeric_exponent_missing test/negative/numeric_exponent_missing.weft 'error[E0002]: numeric literal requires digits' 1
+check_rejects numeric_exponent_sign_missing test/negative/numeric_exponent_sign_missing.weft 'error[E0002]: numeric literal requires digits' 1
+check_rejects numeric_binary_digit test/negative/numeric_binary_digit.weft 'error[E0002]: digit is not valid in this numeric literal' 1
+check_rejects numeric_hex_digit test/negative/numeric_hex_digit.weft 'error[E0002]: digit is not valid in this numeric literal' 1
+check_rejects numeric_decimal_suffix test/negative/numeric_decimal_suffix.weft 'error[E0002]: digit is not valid in this numeric literal' 1
+check_rejects numeric_unicode_suffix test/negative/numeric_unicode_suffix.weft 'error[E0002]: digit is not valid in this numeric literal' 1
+check_rejects numeric_uppercase_prefix test/negative/numeric_uppercase_prefix.weft 'error[E0002]: digit is not valid in this numeric literal' 1
+check_rejects numeric_trailing_separator test/negative/numeric_trailing_separator.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_double_separator test/negative/numeric_double_separator.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_hex_prefix_separator test/negative/numeric_hex_prefix_separator.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_binary_prefix_separator test/negative/numeric_binary_prefix_separator.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_hex_double_separator test/negative/numeric_hex_double_separator.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_binary_double_separator test/negative/numeric_binary_double_separator.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_fraction_trailing_separator test/negative/numeric_fraction_trailing_separator.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_fraction_double_separator test/negative/numeric_fraction_double_separator.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_exponent_separator test/negative/numeric_exponent_separator.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_exponent_sign_separator test/negative/numeric_exponent_sign_separator.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_exponent_trailing_separator test/negative/numeric_exponent_trailing_separator.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_separator_before_exponent test/negative/numeric_separator_before_exponent.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_separator_before_dot test/negative/numeric_separator_before_dot.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_i8_overflow test/negative/numeric_i8_overflow.weft 'error[E1002]: integer literal does not fit expected type `i8`' 1
+check_rejects numeric_i8_negative_overflow test/negative/numeric_i8_negative_overflow.weft 'error[E1002]: integer literal does not fit expected type `i8`' 1
+check_rejects numeric_i16_overflow test/negative/numeric_i16_overflow.weft 'error[E1002]: integer literal does not fit expected type `i16`' 1
+check_rejects numeric_i32_overflow test/negative/numeric_i32_overflow.weft 'error[E1002]: integer literal does not fit expected type `i32`' 1
+check_rejects numeric_i64_overflow test/negative/numeric_i64_overflow.weft 'error[E1002]: integer literal does not fit expected type `i64`' 1
+check_rejects numeric_u8_overflow test/negative/numeric_u8_overflow.weft 'error[E1002]: integer literal does not fit expected type `u8`' 1
+check_rejects numeric_u16_overflow test/negative/numeric_u16_overflow.weft 'error[E1002]: integer literal does not fit expected type `u16`' 1
+check_rejects numeric_u32_overflow test/negative/numeric_u32_overflow.weft 'error[E1002]: integer literal does not fit expected type `u32`' 1
+check_rejects numeric_u64_overflow test/negative/numeric_u64_overflow.weft 'error[E1002]: integer literal does not fit expected type `u64`' 1
+check_rejects numeric_usize_overflow test/negative/numeric_usize_overflow.weft 'error[E1002]: integer literal does not fit expected type `usize`' 1
+check_rejects numeric_u64_negative test/negative/numeric_u64_negative.weft 'error[E1002]: integer literal does not fit expected type `u64`' 1
+check_rejects numeric_untyped_overflow test/negative/numeric_untyped_overflow.weft 'type error: integer literal out of range' 1
+check_rejects numeric_binary_u64_overflow test/negative/numeric_binary_u64_overflow.weft 'error[E1002]: integer literal does not fit expected type `u64`' 1
+check_rejects numeric_pattern_overflow test/negative/numeric_pattern_overflow.weft 'type error: literal pattern does not match scrutinee' 1
+check_rejects numeric_pattern_duplicate test/negative/numeric_pattern_duplicate.weft 'type error: unreachable match arm' 1
+check_rejects numeric_tuple_radix test/negative/numeric_tuple_radix.weft 'error[E0002]: digit is not valid in this numeric literal' 1
+check_rejects numeric_tuple_separator test/negative/numeric_tuple_separator.weft 'error[E0002]: digit separators must occur singly between digits' 1
+check_rejects numeric_tuple_overflow test/negative/numeric_tuple_overflow.weft 'error[E0002]: tuple position exceeds the supported range' 1
+check_rejects numeric_vector_length_overflow test/negative/numeric_vector_length_overflow.weft 'error[E0002]: to_array length exceeds the supported range' 1
+check_rejects numeric_vector_hex_length_overflow test/negative/numeric_vector_hex_length_overflow.weft 'error[E0002]: to_array length exceeds the supported range' 1
+check_rejects numeric_vector_binary_length_overflow test/negative/numeric_vector_binary_length_overflow.weft 'error[E0002]: to_array length exceeds the supported range' 1
 
 check_rejects 'else_alternative_value' 'test/negative/else_alternative_value.weft' 'expected '"'"'{'"'"' or '"'"'if'"'"' after '"'"'else'"'"'' 1
 check_rejects 'else_chain_missing_body' 'test/negative/else_chain_missing_body.weft' 'expected '"'"'{'"'"' after if condition' 1

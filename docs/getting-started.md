@@ -165,6 +165,29 @@ A chain with a final `else` returns its selected branch's value. Without a
 final `else`, the entire chain is a statement: it discards any selected value
 and returns `nil`. Resource values discarded this way are dropped normally.
 
+## Numeric literals
+
+Write integers in decimal, hexadecimal (`0x`) or binary (`0b`). A single
+underscore can separate digits; hexadecimal digits may use either case.
+Separators also work within a decimal float's fractional and exponent digits.
+
+```weft test
+test "numeric spellings preserve their values" {
+  let mask: u64 = 0xFFFF_FFFF_FFFF_FFFF
+  let flags = 0b1010_0101
+  let scale: f64 = 1_2.5_0e+0_1
+  Test.assert_true(mask == 18446744073709551615)
+  Test.assert_eq(flags, 165)
+  Test.assert_eq(1_000_000, 1000000)
+  Test.assert_eq_f64(scale, 125.0)
+}
+```
+
+The surrounding type determines an integer literal's width; without a type
+context it defaults to `i64`. Out-of-range literals are rejected. Prefixes are
+lowercase, and separators belong between digits: `0x_FF`, `1__000` and `1e+_2`
+are invalid. Tuple positions use plain decimal labels, such as `pair.0`.
+
 ## Naming types
 
 Use an alias when a type expression deserves a name:
