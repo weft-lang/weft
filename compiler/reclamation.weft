@@ -1,0 +1,155 @@
+-- Resource cleanup is an observation even when the public effect set is empty.
+-- Derive call dependencies from lowered IR, where implicit drops are explicit.
+
+use compiler/ir.{*}
+use compiler/codegen.{mono_spec_hash}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/map as map
+use stdlib/map.{Map}
+
+type ReclamationSummary {
+  local: bool,
+  callees: List<i64>,
+}
+
+fn reclamation_clauses(clauses: IrHandlerClauseBodyList, summary: ReclamationSummary) -> ReclamationSummary {
+  match clauses {
+    IrHandlerClauseBodyNil -> summary
+    IrHandlerClauseBodyCons(clause, rest) -> {
+      let next = match clause {
+        IrHandlerClauseBody(_, _, _, _, _, _, _, _, _, _, blocks) -> reclamation_blocks(blocks, summary)
+        IrHandlerClauseBodyInvalid(_) -> ReclamationSummary { local: true, callees: summary.callees }
+      }
+      reclamation_clauses(rest, next)
+    }
+  }
+}
+
+fn reclamation_deferred(body: IrDeferredHandlerBody, summary: ReclamationSummary) -> ReclamationSummary {
+  match body {
+    IrDeferredHandlerBody(_, _, _, _, _, blocks, completion) -> {
+      let next = reclamation_blocks(blocks, summary)
+      match completion {
+        IrDeferredCompletionBodyNone -> next
+        IrDeferredCompletionBody(_, _, _, blocks) -> reclamation_blocks(blocks, next)
+        IrDeferredCompletionBodyInvalid(_) -> ReclamationSummary { local: true, callees: next.callees }
+      }
+    }
+    IrDeferredHandlerBodyInvalid(_) -> ReclamationSummary { local: true, callees: summary.callees }
+  }
+}
+
+fn reclamation_inst(inst: IrInst, summary: ReclamationSummary) -> ReclamationSummary {
+  match inst {
+    IrCallI64(_, callee, _) -> ReclamationSummary { local: summary.local, callees: Cons(callee, summary.callees) }
+    IrGenericCallI64(_, callee, types, _) -> ReclamationSummary {
+      local: summary.local,
+      callees: Cons(mono_spec_hash(callee, type_expr_list_to_nodes(types)), summary.callees),
+    }
+    IrHandleI64(_, _, _, clauses, _, _) -> reclamation_clauses(clauses, summary)
+    IrDeferredHandleI64(_, _, body, clauses, _, _, _) -> reclamation_deferred(body, reclamation_clauses(clauses, summary))
+    IrOwnedDropI64(_, _) -> ReclamationSummary { local: true, callees: summary.callees }
+    IrStructuralDropI64(_, _) -> ReclamationSummary { local: true, callees: summary.callees }
+    IrStructuralSlotI64(_, _, _, mode) -> ReclamationSummary { local: summary.local or mode == 4, callees: summary.callees }
+    IrStructuralSplitI64(_, _, residual, _) -> ReclamationSummary { local: summary.local or residual != 0, callees: summary.callees }
+    IrTryLinearI64(_, _, _, _, _, _) -> ReclamationSummary { local: true, callees: summary.callees }
+    IrArrayDropI64(_, _, _, _) -> ReclamationSummary { local: true, callees: summary.callees }
+    -- Dynamic dispatch can execute a resource-owning body. A later identity
+    -- specialization may replace it with a direct, inspectable dependency.
+    IrIndirectCallI64(_, _, _, _) -> ReclamationSummary { local: true, callees: summary.callees }
+    IrMethodCallI64(_, _, _, _, _) -> ReclamationSummary { local: true, callees: summary.callees }
+    IrLoweringFailureI64(_) -> ReclamationSummary { local: true, callees: summary.callees }
+    _ -> summary
+  }
+}
+
+fn reclamation_insts(insts: IrInstList, summary: ReclamationSummary) -> ReclamationSummary {
+  let mut current = insts
+  let mut result = summary
+  let mut walking = true
+  while walking {
+    match current {
+      IrInstNil -> { walking = false }
+      IrInstCons(inst, rest) -> {
+        result = reclamation_inst(inst, result)
+        current = rest
+      }
+    }
+  }
+  result
+}
+
+fn reclamation_blocks(blocks: IrBlockList, summary: ReclamationSummary) -> ReclamationSummary {
+  let mut current = blocks
+  let mut result = summary
+  let mut walking = true
+  while walking {
+    match current {
+      IrBlockListNil -> { walking = false }
+      IrBlockListCons(IrBlock(_, _, insts, _), rest) -> {
+        result = reclamation_insts(insts, result)
+        current = rest
+      }
+    }
+  }
+  result
+}
+
+fn reclamation_reverse_edges(callees: List<i64>, caller: i64, edges: Map<i64, List<i64>>) -> Map<i64, List<i64>> {
+  let mut current = callees
+  let mut result = edges
+  let mut walking = true
+  while walking {
+    match current {
+      Nil -> { walking = false }
+      Cons(callee, rest) -> {
+        let callers = result.get(callee).unwrap_or(Nil<i64>())
+        result = result.insert(callee, Cons(caller, callers))
+        current = rest
+      }
+    }
+  }
+  result
+}
+
+-- The worklist visits each marked function once, including recursive call
+-- components. Function order and duplicate call edges cannot change the set.
+pub(package) fn reclamation_facts(functions: IrFunctionList) -> Map<i64, bool> {
+  let mut current = functions
+  let mut callers = map.new<i64, List<i64>>()
+  let mut pending = Nil<i64>()
+  let mut walking = true
+  while walking {
+    match current {
+      IrFunctionNil -> { walking = false }
+      IrFunctionCons(IrFunction(hash, _, blocks, _), rest) -> {
+        let summary = reclamation_blocks(blocks, ReclamationSummary { local: false, callees: Nil<i64>() })
+        callers = reclamation_reverse_edges(summary.callees, hash, callers)
+        if summary.local { pending = Cons(hash, pending) }
+        current = rest
+      }
+    }
+  }
+  let mut observed = map.new<i64, bool>()
+  walking = true
+  while walking {
+    match pending {
+      Nil -> { walking = false }
+      Cons(hash, rest) -> {
+        pending = rest
+        if not observed.contains_key(hash) {
+          observed = observed.insert(hash, true)
+          let mut parents = callers.get(hash).unwrap_or(Nil<i64>())
+          let mut adding = true
+          while adding {
+            match parents {
+              Nil -> { adding = false }
+              Cons(parent, tail) -> { pending = Cons(parent, pending); parents = tail }
+            }
+          }
+        }
+      }
+    }
+  }
+  observed
+}
