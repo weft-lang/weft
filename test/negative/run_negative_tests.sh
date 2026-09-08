@@ -58,6 +58,10 @@ check_rejects() {
   JOB_N=$((JOB_N+1))
 }
 
+check_rejects "import_missing_path" "test/negative/import_missing_path.weft" "expected path-form module after 'use'"
+check_rejects "import_dangling_selection_dot" "test/negative/import_dangling_selection_dot.weft" "expected '{' after '.' in import selection"
+check_rejects "import_unclosed_selection" "test/negative/import_unclosed_selection.weft" "expected '}' after import selection"
+check_rejects "import_missing_path_segment" "test/negative/import_missing_path_segment.weft" "expected module path segment after '/'"
 check_rejects "source_span_forged" "test/negative/source_span_forged.weft" 'opaque constructor is private to its declaring module; use an exported factory'
 check_rejects "source_span_signed_bounds" "test/negative/source_span_signed_bounds.weft" 'argument type mismatch: expected `usize`, found `i64`'
 check_rejects "source_subspan_signed_bounds" "test/negative/source_subspan_signed_bounds.weft" 'argument type mismatch: expected `usize`, found `i64`'

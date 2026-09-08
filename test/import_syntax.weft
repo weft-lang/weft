@@ -1,0 +1,183 @@
+use compiler/import_syntax.{*}
+use compiler/lex.{lex}
+use compiler/lib.{nlist_len}
+use compiler/module.{PrivateVisibility, PackageVisibility, PublicVisibility, module_fact_import_count}
+use compiler/parse.{parse_module_syntax_local}
+use compiler/type_registry.{ttable_new}
+use runtime/buffer.{buf_new, buf_ptr, buf_len, bstr, bu8}
+use runtime/string.{runtime_str_from_bytes_copy}
+use runtime/rc.{rc_count}
+use stdlib/diagnostic/schema.{Diagnose, DiagnosticSourceNamed}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/option.{Option}
+use stdlib/source.{Source}
+use stdlib/string
+use stdlib/state as state
+use stdlib/diagnostic
+use stdlib/diagnostic/schema.{DiagnosticSeverityError}
+
+fn import_syntax_parse(source: str) -> (ParsedModuleSyntax, i64) {
+  let tokens = lex(__str_ptr(source), __str_len(source))
+  state.run(0, () => handle parse_module_syntax_local(tokens, __str_ptr(source), ttable_new()) {
+    Diagnose.report(diagnostic) -> {
+      match diagnostic.severity() {
+        DiagnosticSeverityError -> { state.modify((count: i64) => count + 1) nil }
+        _ -> nil
+      }
+      resume(0)
+    }
+    Diagnose.error(message, span) -> { state.modify((count: i64) => count + 1) resume(0) }
+    Diagnose.warn(message, span) -> resume(0)
+    Diagnose.note(message, span) -> resume(0)
+  })
+}
+
+fn import_syntax_name(source: str, name: ImportName) -> str {
+  source.slice(name.start, name.start + name.length).unwrap()
+}
+
+fn import_syntax_selection_source(items: str) -> str {
+  let out = buf_new(64)
+  bstr(out, "use app/data.")
+  bu8(out, 123)
+  bstr(out, items)
+  bu8(out, 125)
+  runtime_str_from_bytes_copy(buf_ptr(out), buf_len(out))
+}
+
+test "local import syntax preserves module aliases and all visibility variants" {
+  let source = "use app/one\npub use app/two as other\npub(package) use app/three\n"
+  let (parsed, errors) = import_syntax_parse(source)
+  Test.assert_eq(errors, 0)
+  Test.assert_true(parsed.imports.len() == 3)
+  let first = parsed.imports.get(0).unwrap()
+  let second = parsed.imports.get(1).unwrap()
+  let third = parsed.imports.get(2).unwrap()
+  Test.assert_true(match first.visibility { PrivateVisibility -> true _ -> false })
+  Test.assert_true(match second.visibility { PublicVisibility -> true _ -> false })
+  Test.assert_true(match third.visibility { PackageVisibility -> true _ -> false })
+  Test.assert_true(first.syntax.module_path == "app/one")
+  Test.assert_true(second.syntax.module_path == "app/two")
+  Test.assert_true(third.syntax.module_path == "app/three")
+  Test.assert_true(match first.syntax.binding {
+    ImportModule(name) -> import_syntax_name(source, name) == "one"
+    _ -> false
+  })
+  Test.assert_true(match second.syntax.binding {
+    ImportModule(name) -> import_syntax_name(source, name) == "other"
+    _ -> false
+  })
+  Test.assert_str_eq(source.slice(second.start, second.end).unwrap(), "pub use app/two as other")
+}
+
+test "import selections retain symbols renames wildcards duplicates and source order" {
+  let source = import_syntax_selection_source("Alpha, Beta as Renamed, *, Alpha")
+  let (parsed, errors) = import_syntax_parse(source)
+  Test.assert_eq(errors, 0)
+  let syntax = parsed.imports.first().unwrap().syntax
+  Test.assert_true(match syntax.binding {
+    ImportSymbols(Cons(ImportSymbol(first), Cons(ImportRenamedSymbol(second, alias), Cons(ImportWildcard, Cons(ImportSymbol(last), Nil))))) ->
+      import_syntax_name(source, first) == "Alpha" and
+      import_syntax_name(source, second) == "Beta" and
+      import_syntax_name(source, alias) == "Renamed" and
+      import_syntax_name(source, last) == "Alpha" and last.start > first.start
+    _ -> false
+  })
+  let (empty, empty_errors) = import_syntax_parse(import_syntax_selection_source(""))
+  Test.assert_eq(empty_errors, 0)
+  Test.assert_true(match empty.imports.first().unwrap().syntax.binding {
+    ImportSymbols(Nil) -> true
+    _ -> false
+  })
+}
+
+test "import name ranges use UTF-8 bytes through keyword and Unicode path segments" {
+  let source = "-- é🧶\nuse compiler/module as модуль\nuse app/δ as λ\n"
+  let (parsed, errors) = import_syntax_parse(source)
+  Test.assert_eq(errors, 0)
+  Test.assert_true(parsed.imports.len() == 2)
+  let retained = Source { text: source, identity: DiagnosticSourceNamed("imports.weft") }
+  for declaration in parsed.imports {
+    Test.assert_true(declaration.start >= 10)
+    Test.assert_true(match declaration.syntax.binding {
+      ImportModule(name) -> {
+        let selected = retained.span(name.start, name.start + name.length).unwrap()
+        selected.text().unwrap() == if declaration.syntax.module_path == "compiler/module" { "модуль" } else { "λ" }
+      }
+      _ -> false
+    })
+  }
+}
+
+test "local parsing preserves missing imports without acquiring or resolving sources" {
+  let source = "use unavailable/first\n-- use ignored/comment\nuse unavailable/second\nfn answer() -> i64 { 42 }"
+  let tokens = lex(__str_ptr(source), __str_len(source))
+  let table = ttable_new()
+  let parsed = handle parse_module_syntax_local(tokens, __str_ptr(source), table) {
+    Diagnose.report(diagnostic) -> resume(0)
+    Diagnose.error(message, span) -> resume(0)
+    Diagnose.warn(message, span) -> resume(0)
+    Diagnose.note(message, span) -> resume(0)
+  }
+  Test.assert_true(parsed.imports.len() == 2)
+  Test.assert_eq(nlist_len(parsed.functions), 1)
+  Test.assert_eq(module_fact_import_count(table), 0)
+}
+
+test "malformed imports diagnose and preserve later declarations" {
+  let cases = ["use /absolute", "use app//data", "use app/data as", "use", "use app/data.", "use app/"]
+  for prefix in cases {
+    let (parsed, errors) = import_syntax_parse(prefix.concat("\nfn recovered() -> i64 { 1 }"))
+    Test.assert_true(errors > 0)
+    Test.assert_eq(nlist_len(parsed.functions), 1)
+  }
+  for prefix in ["use app/data.{", "use app/data.{ Value,"] {
+    let (parsed, errors) = import_syntax_parse(prefix.concat("\nfn recovered() -> i64 { 1 }"))
+    Test.assert_true(errors > 0)
+    Test.assert_eq(nlist_len(parsed.functions), 1)
+  }
+  for selection in ["Value as", "?", "Value Other"] {
+    let (parsed, errors) = import_syntax_parse(import_syntax_selection_source(selection).concat("\nfn recovered() -> i64 { 1 }"))
+    Test.assert_true(errors > 0)
+    Test.assert_eq(nlist_len(parsed.functions), 1)
+  }
+}
+
+test "long import selection lists remain ordered and complete" {
+  let source = import_syntax_selection_source("Item, ".repeat(512))
+  let (parsed, errors) = import_syntax_parse(source)
+  Test.assert_eq(errors, 0)
+  Test.assert_true(match parsed.imports.first().unwrap().syntax.binding {
+    ImportSymbols(items) -> {
+      let mut previous: usize = 0
+      let mut valid = items.len() == 512
+      for item in items {
+        match item {
+          ImportSymbol(name) -> {
+            valid = valid and name.start > previous and import_syntax_name(source, name) == "Item"
+            previous = name.start
+          }
+          _ -> { valid = false }
+        }
+      }
+      valid
+    }
+    _ -> false
+  })
+}
+
+fn import_syntax_retained_path() -> str {
+  let source = "use app/".concat("schema")
+  let (parsed, errors) = import_syntax_parse(source)
+  parsed.imports.first().unwrap().syntax.module_path
+}
+
+test "parsed module paths own their spelling after source and parser values are dropped" {
+  let path = import_syntax_retained_path()
+  for step in 0..64 {
+    let temporary = "unrelated".repeat(128)
+    Test.assert_true(temporary.len() == 1152)
+    Test.assert_str_eq(path, "app/schema")
+    Test.assert_eq(rc_count(__str_ptr(path) - 16), 1)
+  }
+}

@@ -3,6 +3,8 @@
 
 use compiler/diagnostic_location.{diagnostic_location_from_offsets}
 use compiler/lex.{*}
+use compiler/import_syntax.{*}
+use stdlib/list.{Cons, List, Nil}
 use compiler/lib.{*}
 use compiler/types.{*}
 use compiler/diagnose.{*}
@@ -4361,10 +4363,14 @@ pub(package) fn parse_module_with_loader<E>(toks: i64, src: i64, tt: i64, loader
 -- are not resolved or loaded. Test preparation uses this boundary to inspect
 -- the original root without recursively ingesting every dependency twice.
 pub(package) fn parse_module_local(toks: i64, src: i64, tt: i64) -[Diagnose]> i64 {
+  parse_module_syntax_local(toks, src, tt).functions
+}
+
+pub(package) fn parse_module_syntax_local(toks: i64, src: i64, tt: i64) -[Diagnose]> ParsedModuleSyntax {
   let invalid = parse_first_source_error(toks)
   if invalid >= 0 {
     parse_source_error(toks, src, invalid)
-    nlist_new()
+    ParsedModuleSyntax { functions: nlist_new(), imports: Nil<ImportDeclaration>() }
   } else { parse_module_valid_inner(toks, src, tt, parse_no_source_loader, 0) }
 }
 
@@ -4374,7 +4380,7 @@ pub(package) fn parse_module_valid(toks: i64, src: i64, tt: i64) -[Diagnose, Sou
 }
 
 pub(package) fn parse_module_valid_with_loader<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, i64, i64, i64) -[E]> i64) -[Diagnose, E]> i64 {
-  parse_module_valid_inner<E>(toks, src, tt, loader, 1)
+  parse_module_valid_inner<E>(toks, src, tt, loader, 1).functions
 }
 
 -- Parse the exact effect reference in an `implements` header. The shape is
@@ -4477,10 +4483,11 @@ pub(package) fn parse_default_handler_decl(toks: i64, src: i64, pos: i64, tt: i6
   unpack_pos(config_r)
 }
 
-fn parse_module_valid_inner<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, i64, i64, i64) -[E]> i64, load_imports: i64) -[Diagnose, E]> i64 {
+fn parse_module_valid_inner<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, i64, i64, i64) -[E]> i64, load_imports: i64) -[Diagnose, E]> ParsedModuleSyntax {
   parse_diagnose_identifier_security(toks, src)
   parse_diagnose_bidi_source(toks, src)
   let fns = nlist_new()
+  let mut imports: List<ImportDeclaration> = Nil
   -- A path-aware root participates in the same logical-identity load graph as
   -- its imports. Without this entry, A -> B -> A reread A into a second source
   -- buffer before noticing B's back-edge.
@@ -4585,10 +4592,19 @@ fn parse_module_valid_inner<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, 
         } else { 0 }
         p = parse_impl_decl(toks, src, decl_p + 1, tt, fns)
       } else { if kw == 19 {
-        p = if load_imports == 1 {
-          parse_use_with_loader<E>(toks, src, decl_p + 1, fns, tt, visibility, loader)
-        } else {
-          node_f3(parse_use_surface(toks, src, decl_p + 1))
+        match parse_use_surface(toks, src, decl_p + 1) {
+          ImportInvalid(next) -> { p = next }
+          ImportParsed(syntax, next) -> {
+            imports = Cons(ImportDeclaration {
+              syntax: syntax,
+              visibility: module_visibility_from_code(visibility),
+              start: __i64_to_usize(tok_span(toks, p)),
+              end: __i64_to_usize(tok_end(toks, next - 1))
+            }, imports)
+            p = if load_imports == 1 {
+              parse_import_with_loader<E>(syntax, next, tok_span(toks, decl_p + 1), src, fns, tt, visibility, loader)
+            } else { next }
+          }
         }
       } else { if kw == 32 {
         -- test "name" { body }
@@ -4616,7 +4632,7 @@ fn parse_module_valid_inner<E>(toks: i64, src: i64, tt: i64, loader: (i64, i64, 
   }
   if root_pushed == 1 { loading_stack_pop(loading) } else { 0 }
   if load_imports == 1 { parse_diagnose_module_cycle(tt, src) } else { 0 }
-  fns
+  ParsedModuleSyntax { functions: fns, imports: imports.reverse() }
 }
 
 pub(package) fn is_file_loaded(loaded: i64, src: i64, ns: i64, nl: i64, package_id: i64) -> bool {
@@ -4700,123 +4716,162 @@ pub(package) fn mark_trusted_import_source(tt: i64, path_ptr: i64, path_len: i64
   }
 }
 
--- Selection entry: absolute source name ptr/len plus absolute alias ptr/len.
--- A wildcard is represented by name_len=-1. The final resolver consumes this
--- fact through the module graph.
-pub(package) fn parse_use_selections(toks: i64, src: i64, pos: i64) -[Diagnose]> i64 {
-  let selections = nlist_new()
+-- Source-relative name ranges remain syntax until the host resolves them.
+pub(package) fn parse_import_name(toks: i64, pos: i64) -> ImportName {
+  ImportName { start: __i64_to_usize(tok_span(toks, pos)), length: __i64_to_usize(tok_identifier_spelling_len(toks, pos)) }
+}
+
+pub(package) fn parse_use_selections(toks: i64, src: i64, pos: i64) -[Diagnose]> ImportSelectionsParse {
   if tok_tag(toks, pos) == 5 and tok_v1(toks, pos) == 8 and tok_tag(toks, pos + 1) == 5 and tok_v1(toks, pos + 1) == 3 {
     tok_set_syntax_role(toks, pos + 1, tok_syntax_role_import_selection())
+    let mut selections: List<ImportSelection> = Nil
     let mut p = pos + 2
-    let mut done = 0
-    while done == 0 {
-      if tok_tag(toks, p) == 5 and tok_v1(toks, p) == 4 {
+    let mut done = false
+    while not done {
+      if tok_tag(toks, p) == 7 or is_decl_start(toks, p) == 1 {
+        parse_syntax_error(toks, src, p, "error: expected '}' after import selection", "import selection", "resume_at_declaration")
+        done = true
+      } else { if tok_tag(toks, p) == 5 and tok_v1(toks, p) == 4 {
         tok_set_syntax_role(toks, p, tok_syntax_role_import_selection())
         p = p + 1
-        done = 1
+        done = true
       } else { if tok_tag(toks, p) == 4 and tok_v1(toks, p) == 3 {
         tok_set_syntax_role(toks, p, tok_syntax_role_import_selection())
-        nlist_add(selections, node_new(0, 0, 0 - 1, 0, 0))
+        selections = Cons(ImportWildcard, selections)
         p = p + 1
       } else { if tok_tag(toks, p) == 2 {
-        let name_ptr = src + tok_v1(toks, p)
-        let name_len = tok_v2(toks, p)
-        let mut alias_ptr = 0
-        let mut alias_len = 0
+        let name = parse_import_name(toks, p)
+        let mut selection = ImportSymbol(name)
         p = p + 1
         if tok_tag(toks, p) == 3 and tok_v1(toks, p) == 35 {
           if tok_tag(toks, p + 1) == 2 {
-            alias_ptr = src + tok_v1(toks, p + 1)
-            alias_len = tok_v2(toks, p + 1)
+            selection = ImportRenamedSymbol(name, parse_import_name(toks, p + 1))
             p = p + 2
           } else {
             parse_syntax_error(toks, src, p, "error: expected import alias after 'as'", "import selection", "continue_selection")
             p = p + 1
           }
         } else { 0 }
-        nlist_add(selections, node_new(0, name_ptr, name_len, alias_ptr, alias_len))
+        selections = Cons(selection, selections)
       } else {
         parse_syntax_error(toks, src, p, "error: expected imported name or '*' in selection", "import selection", "continue_selection")
         p = p + 1
-      } } }
-      if done == 0 {
+      } } } }
+      if not done {
         if tok_tag(toks, p) == 5 and tok_v1(toks, p) == 5 { p = p + 1 }
         else { if tok_tag(toks, p) == 5 and tok_v1(toks, p) == 4 { 0 }
         else {
           parse_syntax_error(toks, src, p, "error: expected ',' or '}' in import selection", "import selection", "stop_selection")
-          done = 1
+          done = true
         } }
       } else { 0 }
     }
-    node_new(0, selections, p, 1, 1)
+    ParsedImportSelections(selections.reverse(), p)
+  } else { if tok_tag(toks, pos) == 5 and tok_v1(toks, pos) == 8 {
+    parse_syntax_error(toks, src, pos + 1, "error: expected '{' after '.' in import selection", "import selection", "stop_selection")
+    NoImportSelections(pos + 1)
   } else {
-    node_new(0, selections, pos, 0, 1)
-  }
+    NoImportSelections(pos)
+  } }
 }
 
--- Surface result: physical resolver path ptr/len, end token, and metadata
--- node(selections, alias ptr, alias len, reserved).
 pub(package) fn parse_use_path_segment_len(toks: i64, src: i64, pos: i64) -> i64 {
   tok_identifier_spelling_len(toks, pos)
 }
 
-pub(package) fn parse_use_surface(toks: i64, src: i64, pos: i64) -[Diagnose]> i64 {
-  if parse_use_path_segment_len(toks, src, pos) > 0 {
+-- A declaration on the next line is a recovery boundary for a missing
+-- import path. Keyword spellings remain valid within ordinary module paths.
+pub(package) fn parse_use_starts_following_declaration(toks: i64, src: i64, pos: i64) -> bool {
+  if pos <= 0 or is_decl_start(toks, pos) == 0 { false }
+  else {
+    let mut offset = tok_end(toks, pos - 1)
+    let end = tok_span(toks, pos)
+    let mut newline = false
+    while offset < end and not newline {
+      let byte = mem_load8_at(src, offset)
+      newline = byte == 10 or byte == 13
+      offset = offset + 1
+    }
+    newline
+  }
+}
+
+pub(package) fn parse_use_surface(toks: i64, src: i64, pos: i64) -[Diagnose]> ImportParse {
+  if parse_use_path_segment_len(toks, src, pos) > 0 and not parse_use_starts_following_declaration(toks, src, pos) {
     let path = buf_new(64)
     let mut p = pos
-    let mut final_alias_ptr = 0
-    let mut final_alias_len = 0
-    let mut path_done = 0
-    while path_done == 0 {
+    let mut final_name = parse_import_name(toks, pos)
+    let mut path_done = false
+    while not path_done {
       let seg_len = parse_use_path_segment_len(toks, src, p)
       if seg_len == 0 {
         parse_syntax_error(toks, src, p, "error: expected module path segment", "import path", "stop_import")
-        path_done = 1
+        path_done = true
       } else {
         let seg_start = tok_span(toks, p)
         bscopy(path, src + seg_start, seg_len, 0)
-        final_alias_ptr = src + seg_start
-        final_alias_len = seg_len
+        final_name = parse_import_name(toks, p)
         p = p + 1
         if tok_tag(toks, p) == 4 and tok_v1(toks, p) == 4 {
           tok_set_syntax_role(toks, p, tok_syntax_role_module_path())
           bu8(path, 47)
           p = p + 1
-          if parse_use_path_segment_len(toks, src, p) == 0 {
+          if parse_use_path_segment_len(toks, src, p) == 0 or parse_use_starts_following_declaration(toks, src, p) {
             parse_syntax_error(toks, src, p, "error: expected module path segment after '/'", "import path", "stop_import")
-            path_done = 1
+            path_done = true
           } else { 0 }
-        } else { path_done = 1 }
+        } else { path_done = true }
       }
     }
-    bscopy(path, __str_ptr(".weft"), 5, 0)
-    let selection_info = parse_use_selections(toks, src, p)
-    let selections = node_f1(selection_info)
-    let has_selections = node_f3(selection_info)
-    p = node_f2(selection_info)
-    let mut alias_ptr = if has_selections == 1 { 0 } else { final_alias_ptr }
-    let mut alias_len = if has_selections == 1 { 0 } else { final_alias_len }
-    if has_selections == 0 and tok_tag(toks, p) == 3 and tok_v1(toks, p) == 35 {
-      if tok_tag(toks, p + 1) == 2 {
-        alias_ptr = src + tok_v1(toks, p + 1)
-        alias_len = tok_v2(toks, p + 1)
-        p = p + 2
-      } else {
-        parse_syntax_error(toks, src, p, "error: expected module alias after 'as'", "import alias", "continue_import")
-        p = p + 1
+    let module_path = runtime_str_from_bytes_copy(buf_ptr(path), buf_len(path))
+    match parse_use_selections(toks, src, p) {
+      ParsedImportSelections(selections, next) -> ImportParsed(ImportSyntax {
+        module_path: module_path,
+        binding: ImportSymbols(selections)
+      }, next)
+      NoImportSelections(next) -> {
+        p = next
+        let mut alias = final_name
+        if tok_tag(toks, p) == 3 and tok_v1(toks, p) == 35 {
+          if tok_tag(toks, p + 1) == 2 {
+            alias = parse_import_name(toks, p + 1)
+            p = p + 2
+          } else {
+            parse_syntax_error(toks, src, p, "error: expected module alias after 'as'", "import alias", "continue_import")
+            p = p + 1
+          }
+        } else { 0 }
+        ImportParsed(ImportSyntax { module_path: module_path, binding: ImportModule(alias) }, p)
       }
-    } else { 0 }
-    let path_len = buf_len(path)
-    node_new(0, buf_take_data(path), path_len, p, node_new(0, selections, alias_ptr, alias_len, 0))
+    }
   } else {
     parse_syntax_error(toks, src, pos, "error: expected path-form module after 'use'", "import path", "stop_import")
-    node_new(0, 0, 0, pos + 1, node_new(0, nlist_new(), 0, 0, 0))
+    ImportInvalid(if is_decl_start(toks, pos) == 1 { pos } else { pos + 1 })
   }
 }
 
-pub(package) fn parse_use_register_fact(tt: i64, importer_src: i64, target_module: i64, surface: i64, visibility: i64, source_offset: i64) -> i64 {
-  let info = node_f4(surface)
-  module_import_fact_register_at(tt, importer_src, target_module, node_f1(info), node_f2(info), node_f3(info), visibility, 0, source_offset)
+-- The module graph still uses source pointers and a wildcard length sentinel.
+-- Encode those only here, after parsing typed syntax. Delete this adapter when
+-- graph import bindings consume ImportBinding directly.
+pub(package) fn parse_use_register_fact(tt: i64, importer_src: i64, target_module: i64, syntax: ImportSyntax, visibility: i64, source_offset: i64) -> i64 {
+  let selections = nlist_new()
+  match syntax.binding {
+    ImportModule(alias) -> module_import_fact_register_at(tt, importer_src, target_module, selections,
+      importer_src + __u64_to_i64(__usize_to_u64(alias.start)), __u64_to_i64(__usize_to_u64(alias.length)), visibility, 0, source_offset)
+    ImportSymbols(items) -> {
+      for item in items {
+        match item {
+          ImportWildcard -> nlist_add(selections, node_new(0, 0, 0 - 1, 0, 0))
+          ImportSymbol(name) -> nlist_add(selections, node_new(0,
+            importer_src + __u64_to_i64(__usize_to_u64(name.start)), __u64_to_i64(__usize_to_u64(name.length)), 0, 0))
+          ImportRenamedSymbol(name, alias) -> nlist_add(selections, node_new(0,
+            importer_src + __u64_to_i64(__usize_to_u64(name.start)), __u64_to_i64(__usize_to_u64(name.length)),
+            importer_src + __u64_to_i64(__usize_to_u64(alias.start)), __u64_to_i64(__usize_to_u64(alias.length))))
+        }
+      }
+      module_import_fact_register_at(tt, importer_src, target_module, selections, 0, 0, visibility, 0, source_offset)
+    }
+  }
 }
 
 -- The source registry is the shared compiler/tool overlay seam. A path-aware
@@ -4879,12 +4934,20 @@ pub(package) fn parse_register_native_binding_decls(tt: i64, source_entry: i64) 
 }
 
 pub(package) fn parse_use_with_loader<E>(toks: i64, src: i64, pos: i64, fns: i64, tt: i64, visibility: i64, loader: (i64, i64, i64, i64, i64) -[E]> i64) -[Diagnose, E]> i64 {
-  let surface = parse_use_surface(toks, src, pos)
-  let path_ptr = node_f1(surface)
-  let path_len = node_f2(surface)
-  let end_pos = node_f3(surface)
-  if path_ptr == 0 or path_len == 0 { end_pos }
-  else {
+  match parse_use_surface(toks, src, pos) {
+    ImportInvalid(next) -> next
+    ImportParsed(syntax, next) -> parse_import_with_loader<E>(syntax, next, tok_span(toks, pos), src, fns, tt, visibility, loader)
+  }
+}
+
+pub(package) fn parse_import_with_loader<E>(syntax: ImportSyntax, end_pos: i64, source_offset: i64, src: i64, fns: i64, tt: i64, visibility: i64, loader: (i64, i64, i64, i64, i64) -[E]> i64) -[Diagnose, E]> i64 {
+  -- Resolver paths can be retained by the legacy module graph. Copy into its
+  -- compilation arena; a managed syntax string must never become an unowned
+  -- graph pointer. This copy disappears with the typed graph-path migration.
+  let path_len = __str_len(syntax.module_path) + 5
+  let path_ptr = alloc_zeroed(path_len)
+  mem_copy(path_ptr, __str_ptr(syntax.module_path), path_len - 5)
+  mem_copy(path_ptr + path_len - 5, __str_ptr(".weft"), 5)
   let importer_module = module_fact_find_source(tt, src)
   let importer_package = if importer_module == 0 { 0 } else { module_fact_entry_package(importer_module) }
   let resolved = pkg_resolve_default_import(tt, importer_package, path_ptr, path_len)
@@ -4898,17 +4961,17 @@ pub(package) fn parse_use_with_loader<E>(toks: i64, src: i64, pos: i64, fns: i64
     else { pkg_binding_module_trust_state(tt, resolved_package, resolved_logical_ptr, resolved_module_len) }
   let loaded = mem_load64_at(tt, 24)
   if pkg_resolve_status(resolved) < 0 {
-    package_diagnose_resolve_failure(pkg_resolve_status(resolved), src, path_ptr, path_len, tok_span(toks, pos))
+    package_diagnose_resolve_failure(pkg_resolve_status(resolved), src, path_ptr, path_len, source_offset)
     end_pos
   } else { if binding_trust < 0 {
-    package_diagnose_binding_trust_failure(tt, resolved_package, src, resolved_logical_ptr, resolved_module_len, tok_span(toks, pos))
+    package_diagnose_binding_trust_failure(tt, resolved_package, src, resolved_logical_ptr, resolved_module_len, source_offset)
     end_pos
   } else { if is_file_loaded(loaded, resolved_logical_ptr, 0, resolved_module_len, resolved_package) {
     -- Logical identity deduplicates diamonds and terminates back-edges. The
     -- producer-owned graph audit below distinguishes the two semantically.
     let target_module = module_fact_find_path(tt, resolved_logical_ptr, resolved_logical_len, resolved_package)
     if target_module != 0 {
-      parse_use_register_fact(tt, src, target_module, surface, visibility, tok_span(toks, pos))
+      parse_use_register_fact(tt, src, target_module, syntax, visibility, source_offset)
       module_fact_append_function_closure(tt, fns, target_module)
     } else { 0 }
     end_pos
@@ -4930,14 +4993,14 @@ pub(package) fn parse_use_with_loader<E>(toks: i64, src: i64, pos: i64, fns: i64
         pkg_native_binding_source_register(tt, file_buf, resolved_package, resolved_logical_ptr, resolved_module_len)
       } else { 0 }
       if native_source < 0 {
-        package_diagnose_native_target_missing(tt, src, resolved_logical_ptr, resolved_module_len, tok_span(toks, pos))
+        package_diagnose_native_target_missing(tt, src, resolved_logical_ptr, resolved_module_len, source_offset)
       } else { 0 }
       ttable_register_source_in_package(tt, file_buf, file_len, resolved_ptr, resolved_len, resolved_package)
       let target_module = module_fact_find_source(tt, file_buf)
       -- Source provenance keeps the physical resolver path; semantic module
       -- identity is the canonical path-form spelling from the import.
       module_fact_upgrade_named(target_module, resolved_logical_ptr, resolved_logical_len, resolved_package)
-      parse_use_register_fact(tt, src, target_module, surface, visibility, tok_span(toks, pos))
+      parse_use_register_fact(tt, src, target_module, syntax, visibility, source_offset)
       let file_toks = lex(file_buf, file_len)
       parse_use_module_with_loader<E>(file_toks, file_buf, fns, tt, loader)
       if native_source > 0 { parse_register_native_binding_decls(tt, native_source) } else { 0 }
@@ -4945,7 +5008,6 @@ pub(package) fn parse_use_with_loader<E>(toks: i64, src: i64, pos: i64, fns: i64
     loading_stack_pop(loading)
     end_pos
   } } }
-  }
 }
 
 pub(package) fn parse_use_file(fns: i64, tt: i64, path_str: str) -[Diagnose, SourceAcquire]> i64 {
