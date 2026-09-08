@@ -132,7 +132,13 @@ check_rejects "par_prefixed_surface_retired" "test/negative/par_prefixed_surface
 check_rejects "par_pool_config_signed_workers" "test/negative/par_pool_config_signed_workers.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
 check_rejects "par_pool_config_signed_capacity" "test/negative/par_pool_config_signed_capacity.weft" 'argument type mismatch: expected `usize`, found `i64`' 1
 check_rejects "par_pool_config_forged" "test/negative/par_pool_config_forged.weft" 'opaque constructor is private to its declaring module; use an exported factory' 2
-check_rejects "par_pool_legacy_counts" "test/negative/par_pool_legacy_counts.weft" 'cannot infer generic call type arguments' 2
+check_rejects "par_pool_legacy_counts" "test/negative/par_pool_legacy_counts.weft" 'arity mismatch' 1
+check_rejects "generic_call_extra_argument" "test/negative/generic_call_extra_argument.weft" 'arity mismatch' 1
+check_rejects "generic_call_missing_argument" "test/negative/generic_call_missing_argument.weft" 'arity mismatch' 1
+check_rejects "generic_call_explicit_wrong_arity" "test/negative/generic_call_explicit_wrong_arity.weft" 'arity mismatch' 1
+check_rejects "qualified_call_wrong_arity" "test/negative/qualified_call_wrong_arity.weft" 'arity mismatch' 1
+check_rejects "qualified_generic_call_wrong_arity" "test/negative/qualified_generic_call_wrong_arity.weft" 'arity mismatch' 1
+check_rejects "wrong_arity_preserves_argument_errors" "test/negative/wrong_arity_preserves_argument_errors.weft" 'arity mismatch' 2
 check_rejects "par_scope_result_annotation" "test/negative/par_scope_result_annotation.weft" 'type annotation type mismatch: expected `i64`, found `str`' 1
 check_rejects "par_scope_owned_result_after_move" "test/negative/par_scope_owned_result_after_move.weft" 'owned value used more than once' 1
 check_rejects "deep_release_mask_overflow_record" "test/negative/deep_release_mask_overflow_record.weft" "type error: aggregate field may require release beyond 16-word mask"
