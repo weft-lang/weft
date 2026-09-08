@@ -951,7 +951,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_http_pins_finite_header_count" "$(<"$tmp_out")" "pub fn len(self: HttpHeaders) -> usize"
     assert_contains "doc_stdlib_http_pins_empty_headers" "$(<"$tmp_out")" "pub fn is_empty(self: HttpHeaders) -> bool"
     assert_contains "doc_stdlib_http_pins_finite_header_lookup" "$(<"$tmp_out")" "pub fn get(self: HttpHeaders, index: usize) -> Option<HttpHeader>"
-    assert_contains "doc_stdlib_http_pins_header_iteration" "$(<"$tmp_out")" "impl IntoIterator for HttpHeaders"
+    assert_contains "doc_stdlib_http_pins_header_iteration" "$(<"$tmp_out")" "impl stdlib/iter/protocol.IntoIterator for HttpHeaders"
     assert_not_contains "doc_stdlib_http_hides_header_storage" "$(<"$tmp_out")" "HttpHeadersParts"
     assert_contains "doc_stdlib_http_pins_opaque_head" "$(<"$tmp_out")" "pub type HttpRequestHead = opaque"
     assert_contains "doc_stdlib_http_pins_typed_framing" "$(<"$tmp_out")" "pub type HttpBodyFraming {"
@@ -1019,7 +1019,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_sse_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn next<S>(self: owned SseReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseReadOutcome<S>"
   elif [ "$stdlib_doc_name" = "diagnostic" ]; then
     assert_contains "doc_stdlib_diagnostic_public_facade" "$(<"$tmp_out")" "Public API items: 79. Documented: 79."
-    assert_contains "doc_stdlib_diagnostic_code_equality" "$(<"$tmp_out")" "impl Eq for DiagnosticCode"
+    assert_contains "doc_stdlib_diagnostic_code_equality" "$(<"$tmp_out")" "impl stdlib/eq.Eq for DiagnosticCode"
     assert_contains "doc_stdlib_diagnostic_finite_related_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticRelatedLocationList) -> usize"
     assert_contains "doc_stdlib_diagnostic_finite_edit_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticTextEditList) -> usize"
     assert_contains "doc_stdlib_diagnostic_finite_field_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticFieldList) -> usize"

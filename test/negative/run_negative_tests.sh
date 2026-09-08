@@ -89,7 +89,7 @@ check_rejects "callback_context_template_output_requires_explicit" "test/negativ
 check_rejects "callback_context_missing_method_body" "test/negative/callback_context_missing_method_body.weft" 'unknown identifier '"'"'missing_callback_body_name'"'"'' 2
 check_rejects "callback_context_extra_argument_body" "test/negative/callback_context_extra_argument_body.weft" 'unknown identifier '"'"'missing_callback_body_name'"'"'' 2
 check_rejects "callback_context_unique_used_twice" "test/negative/callback_context_unique_used_twice.weft" 'type error: unique value used more than once' 1
-check_rejects "method_inference_bound" "test/negative/method_inference_bound.weft" 'error[E1004]: type `str` does not implement `InferenceCheckMarker`' 1
+check_rejects "method_inference_bound" "test/negative/method_inference_bound.weft" 'error[E1004]: type `str` does not implement `test/negative_support/method_inference_support.InferenceCheckMarker`' 1
 check_rejects "method_inference_conflict" "test/negative/method_inference_conflict.weft" 'argument type mismatch: expected `i64`, found `str`' 1
 check_rejects "method_inference_partial_explicit" "test/negative/method_inference_partial_explicit.weft" 'type error: wrong number of type arguments' 2
 check_rejects "method_inference_extra_explicit" "test/negative/method_inference_extra_explicit.weft" 'type error: wrong number of type arguments' 1
@@ -388,8 +388,8 @@ check_rejects "iter_find_map_effectful_callback" "test/negative/iter_find_map_ef
 check_rejects "iter_any_effectful_callback" "test/negative/iter_any_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_all_effectful_callback" "test/negative/iter_all_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_reduce_effectful_callback" "test/negative/iter_reduce_effectful_callback.weft" "error[E2001]:"
-check_rejects "iter_min_unordered" "test/negative/iter_min_unordered.weft" 'does not implement `Ord`'
-check_rejects "iter_max_unordered" "test/negative/iter_max_unordered.weft" 'does not implement `Ord`'
+check_rejects "iter_min_unordered" "test/negative/iter_min_unordered.weft" 'does not implement `stdlib/ord.Ord`'
+check_rejects "iter_max_unordered" "test/negative/iter_max_unordered.weft" 'does not implement `stdlib/ord.Ord`'
 check_rejects "iter_map_collect_effectful_callback" "test/negative/iter_map_collect_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_map_effectful_callback" "test/negative/iter_map_effectful_callback.weft" "error[E2001]:"
 check_rejects "iter_filter_effectful_callback" "test/negative/iter_filter_effectful_callback.weft" "error[E2001]:"
@@ -466,7 +466,7 @@ check_rejects "trait_assoc_constraint_conditional_impl" "test/negative/trait_ass
 check_rejects "trait_assoc_constraint_missing_type" "test/negative/trait_assoc_constraint_missing_type.weft" "error[E0002]: expected type after associated-type '='"
 check_rejects "trait_impl_conflict" "test/negative/trait_impl_conflict.weft" "type error: conflicting implementations of trait for type"
 check_rejects "ord_missing_impl" "test/negative/ord_missing_impl.weft" 'error[E1004]: type `Unordered` does not implement `Ord`'
-check_rejects "sorted_map_key_missing_ord" "test/negative/sorted_map_key_missing_ord.weft" 'error[E1004]: type `UnorderedKey` does not implement `Ord`'
+check_rejects "sorted_map_key_missing_ord" "test/negative/sorted_map_key_missing_ord.weft" 'error[E1004]: type `UnorderedKey` does not implement `stdlib/ord.Ord`'
 check_rejects "sorted_map_constructor_private" "test/negative/sorted_map_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "sorted_set_constructor_private" "test/negative/sorted_set_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
 check_rejects "ord_operand_mismatch" "test/negative/ord_operand_mismatch.weft" "type error: ordering operand type mismatch"
