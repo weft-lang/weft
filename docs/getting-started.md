@@ -498,9 +498,11 @@ fn parse_fragment<G: Grammar>(grammar: G, source: Span) -[Diagnose]> ParseResult
 }
 ```
 
-The formatter consumes this same parse contract for Weft source. Its current
-Weft syntax storage is compiler-private; the reusable contract does not require
-other grammars to use Weft tokens or its AST representation.
+The formatter and project compiler consume this same parse contract for Weft
+source. Project compilation loads imports from the parsed declarations in a
+separate host step. The current Weft syntax storage is compiler-private; the
+reusable contract does not require other grammars to use Weft tokens or its AST
+representation.
 
 ## Diagnostics, formatting, and API docs
 

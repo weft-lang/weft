@@ -1,0 +1,125 @@
+use compiler/grammar_host.{parse_registered_source_with_loader}
+use compiler/grammar_source.{WeftParser}
+use compiler/lib.{nlist_len}
+use compiler/module.{module_fact_import_count}
+use compiler/type_registry.{ttable_new}
+use runtime/alloc.{alloc_words}
+use runtime/memory.{mem_store64_at}
+use runtime/string.{runtime_str_from_bytes_copy}
+use stdlib/grammar.{Grammar, Parsed}
+use stdlib/source.{Source}
+use stdlib/diagnostic.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option.{Option}
+use stdlib/state as state
+use stdlib/state.{State}
+
+effect ObserveLoad { fn request(path: str) -> nil }
+
+fn empty_source(physical: i64, physical_len: i64, logical: i64, logical_len: i64, package_id: i64) -[ObserveLoad]> i64 {
+  ObserveLoad.request(runtime_str_from_bytes_copy(logical, logical_len))
+  let result = alloc_words(2)
+  mem_store64_at(result, 0, alloc_words(1))
+  mem_store64_at(result, 8, 0)
+  result
+}
+
+type HostObservations { requests: List<str>, diagnostics: List<Diagnostic> }
+
+fn collect_host(source: Source, table: i64) -> (i64, HostObservations) {
+  let initial = HostObservations { requests: Nil<str>(), diagnostics: Nil<Diagnostic>() }
+  state.run(initial, () => handle {
+    handle parse_registered_source_with_loader(source, table, empty_source) {
+      Diagnose.report(diagnostic) -> {
+        let observed = State<HostObservations>.get()
+        State<HostObservations>.put(HostObservations { requests: observed.requests, diagnostics: Cons(diagnostic, observed.diagnostics) })
+        resume(0)
+      }
+      Diagnose.error(message, position) -> resume(0)
+      Diagnose.warn(message, position) -> resume(0)
+      Diagnose.note(message, position) -> resume(0)
+    }
+  } {
+    ObserveLoad.request(path) -> {
+      let observed = State<HostObservations>.get()
+      State<HostObservations>.put(HostObservations { requests: Cons(path, observed.requests), diagnostics: observed.diagnostics })
+      resume(nil)
+    }
+  })
+}
+
+test "host source acquisition follows parsed imports in declaration order" {
+  let source = Source { text: "use missing/first\nfn value() -> i64 { 42 }\nuse missing/second\n", identity: DiagnosticSourceNamed("host.weft") }
+  let table = ttable_new()
+  let (functions, observed) = collect_host(source, table)
+  Test.assert_eq(nlist_len(functions), 1)
+  Test.assert_eq_usize(observed.diagnostics.len(), 0)
+  let requests = observed.requests.reverse()
+  Test.assert_eq_usize(requests.len(), 2)
+  Test.assert_eq(module_fact_import_count(table), 2)
+  Test.assert_str_eq(requests.get(0).unwrap(), "missing/first")
+  Test.assert_str_eq(requests.get(1).unwrap(), "missing/second")
+}
+
+test "a rejected local source never requests its apparent imports" {
+  let source = Source { text: "use missing/first\n0x\n", identity: DiagnosticSourceNamed("broken.weft") }
+  let table = ttable_new()
+  let (functions, observed) = collect_host(source, table)
+  Test.assert_eq(nlist_len(functions), 0)
+  Test.assert_eq_usize(observed.requests.len(), 0)
+  Test.assert_eq_usize(observed.diagnostics.len(), 1)
+}
+
+test "recoverable local errors preserve source identity and valid import declarations" {
+  let source = Source { text: "}\nuse missing/first\nfn value() -> i64 { 42 }\n", identity: DiagnosticSourceNamed("recovered.weft") }
+  let table = ttable_new()
+  let (functions, observed) = collect_host(source, table)
+  Test.assert_eq(nlist_len(functions), 1)
+  Test.assert_eq_usize(observed.requests.len(), 1)
+  Test.assert_eq_usize(observed.diagnostics.len(), 1)
+  Test.assert_true(match observed.diagnostics.first().unwrap().primary() {
+    DiagnosticSourceRange(DiagnosticSourceNamed(name), start, end) -> name == "recovered.weft" and start == 0 and end == 1
+    _ -> false
+  })
+}
+
+test "local grammar parsing retains imports without requesting host services" {
+  let source = Source { text: "use missing/first\nfn value() -> i64 { 42 }", identity: DiagnosticSourceNamed("local.weft") }
+  let result = handle WeftParser { table: ttable_new() }.parse(source.all()) {
+    Diagnose.report(diagnostic) -> resume(0)
+    Diagnose.error(message, position) -> resume(0)
+    Diagnose.warn(message, position) -> resume(0)
+    Diagnose.note(message, position) -> resume(0)
+  }
+  Test.assert_true(match result {
+    Parsed(syntax) -> syntax.declarations.imports.len() == 1 and nlist_len(syntax.declarations.functions) == 1
+    _ -> false
+  })
+}
+
+test "host loader diagnostics retain the root source identity" {
+  let source = Source { text: "use missing", identity: DiagnosticSourceNamed("named-host.weft") }
+  let diagnostic = uncoded(DiagnosticSeverityError, DiagnosticClassParse, "missing source",
+    DiagnosticSourceRange(DiagnosticSourceBuffer(__str_ptr(source.text)), 4, 11))
+  let loader: (i64, i64, i64, i64, i64) -[Diagnose]> i64 = (physical, physical_len, logical, logical_len, package_id) => {
+    Diagnose.report(diagnostic)
+    let missing = alloc_words(2)
+    mem_store64_at(missing, 0, 0)
+    mem_store64_at(missing, 8, 0)
+    missing
+  }
+  let (_, reports) = state.run(Nil<Diagnostic>(), () => handle parse_registered_source_with_loader(source, ttable_new(), loader) {
+    Diagnose.report(report) -> {
+      state.modify((items: List<Diagnostic>) => Cons(report, items))
+      resume(0)
+    }
+    Diagnose.error(message, position) -> resume(0)
+    Diagnose.warn(message, position) -> resume(0)
+    Diagnose.note(message, position) -> resume(0)
+  })
+  Test.assert_eq_usize(reports.len(), 1)
+  Test.assert_true(match reports.first().unwrap().primary() {
+    DiagnosticSourceRange(DiagnosticSourceNamed(name), start, end) -> name == "named-host.weft" and start == 4 and end == 11
+    _ -> false
+  })
+}

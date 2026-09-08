@@ -15,7 +15,7 @@ use compiler/module.{*}
 use compiler/package.{*}
 use compiler/sdk_source.{sdk_source_load_module}
 use compiler/package_diagnostics.{package_diagnose_binding_trust_failure, package_diagnose_native_target_missing, package_diagnose_resolve_failure}
-use compiler/source_trust.{*}
+use compiler/source_registration.{*}
 use compiler/source_position.{source_position_utf8_scalar, source_position_utf8_width}
 use compiler/type_registry.{*}
 use runtime/alloc.{*}
@@ -4572,43 +4572,8 @@ fn parse_module_contents<E>(toks: i64, src: i64, tt: i64, loader: SourceLoader<E
   let is_entry = match role { EntrySource -> true, DependencySource -> false }
   let mut imports: List<ImportDeclaration> = Nil
   let mut declarations: List<SourceDeclaration> = Nil
-  -- A path-aware root participates in the same logical-identity load graph as
-  -- its imports. Without this entry, A -> B -> A reread A into a second source
-  -- buffer before noticing B's back-edge.
-  let root_module = module_fact_find_source(tt, src)
-  let loaded = mem_load64_at(tt, 24)
-  let loading = mem_load64_at(tt, 96)
-  let mut root_pushed = 0
-  -- A path-aware compilation root may itself be the package's trusted native
-  -- binding leaf. Imports already pass through this producer in parse_use;
-  -- establish the identical trust, target and synthetic-declaration facts for
-  -- the root before parsing its declarations.
-  if is_entry and root_module != 0 and module_fact_entry_anonymous(root_module) == 0 {
-    let root_path = module_fact_entry_path_ptr(root_module)
-    let root_len = module_fact_entry_path_len(root_module)
-    let root_package = module_fact_entry_package(root_module)
-    let binding_trust = pkg_binding_module_trust_state(tt, root_package, root_path, root_len)
-    if binding_trust == 1 {
-      ttable_mark_trusted_source(tt, src)
-      let existing_native = ttable_native_binding_source_find(tt, src)
-      let native_source = pkg_native_binding_source_register(tt, src, root_package, root_path, root_len)
-      if native_source < 0 {
-        package_diagnose_native_target_missing(tt, src, root_path, root_len, 0)
-      } else { if native_source > 0 and existing_native == 0 {
-        parse_register_native_binding_decls(tt, native_source)
-      } else { 0 } }
-    } else { 0 }
-  } else { 0 }
-  if is_entry and load_imports == 1 and root_module != 0 and module_fact_entry_anonymous(root_module) == 0 {
-    let root_path = module_fact_entry_path_ptr(root_module)
-    let root_len = module_fact_entry_path_len(root_module)
-    let root_package = module_fact_entry_package(root_module)
-    if is_file_loaded(loaded, root_path, 0, root_len, root_package) == false {
-      mark_file_loaded(loaded, root_path, 0, root_len, root_package)
-      loading_stack_push(loading, root_path, root_len, root_package)
-      root_pushed = 1
-    } else { 0 }
-  } else { 0 }
+  if is_entry and load_imports == 1 { source_register_root_native_binding(tt, src) }
+  let root_pushed = if is_entry and load_imports == 1 { source_enter_root_load(tt, src) } else { false }
   -- The loop terminates on the EOF token (tag 7), but a sub-parser that
   -- consumes past EOF would leave p pointing beyond the buffer, and the
   -- token accessors are raw loads: the walk then reads unmapped memory
@@ -4701,6 +4666,7 @@ fn parse_module_contents<E>(toks: i64, src: i64, tt: i64, loader: SourceLoader<E
             syntax = ImportDefinition(import_syntax)
             imports = Cons(ImportDeclaration {
               syntax: import_syntax,
+              module_start: __i64_to_usize(tok_span(toks, decl_p + 1)),
               visibility: module_visibility_from_code(visibility),
               start: __i64_to_usize(tok_span(toks, p)),
               end: __i64_to_usize(tok_end(toks, next - 1))
@@ -4759,90 +4725,9 @@ fn parse_module_contents<E>(toks: i64, src: i64, tt: i64, loader: SourceLoader<E
       }
     } } }
   }
-  if root_pushed == 1 { loading_stack_pop(loading) } else { 0 }
+  source_leave_root_load(tt, root_pushed)
   if is_entry and load_imports == 1 { parse_diagnose_module_cycle(tt, src) } else { 0 }
   ParsedModuleSyntax { functions: fns, imports: imports.reverse(), declarations: declarations.reverse() }
-}
-
-pub(package) fn is_file_loaded(loaded: i64, src: i64, ns: i64, nl: i64, package_id: i64) -> bool {
-  let mut i = 0
-  let mut found = false
-  while i < nlist_len(loaded) {
-    let entry = nlist_get(loaded, i)
-    let e_ptr = mem_load64_at(entry, 0)
-    let e_len = mem_load64_at(entry, 8)
-    if e_len == nl and mem_load64_at(entry, 16) == package_id {
-      if src_eq_at(src, ns, e_ptr, 0, nl) == 1 {
-        found = true
-        i = nlist_len(loaded)
-      } else { i = i + 1 }
-    } else { i = i + 1 }
-  }
-  found
-}
-
-pub(package) fn mark_file_loaded(loaded: i64, src: i64, ns: i64, nl: i64, package_id: i64) -> i64 {
-  let entry = alloc_words(3)
-  mem_store64_at(entry, 0, src + ns)
-  mem_store64_at(entry, 8, nl)
-  mem_store64_at(entry, 16, package_id)
-  nlist_add(loaded, entry)
-}
-
--- set-theoretic surface: import-cycle detection over the ttable h+96 in-progress stack.
--- Loading is strictly nested (single-threaded recursive descent), so pop
--- invalidates the most recent live entry (len := -1) rather than shrinking.
-pub(package) fn loading_stack_push(stack: i64, ptr: i64, len: i64, package_id: i64) -> i64 {
-  let entry = alloc_words(3)
-  mem_store64_at(entry, 0, ptr)
-  mem_store64_at(entry, 8, len)
-  mem_store64_at(entry, 16, package_id)
-  nlist_add(stack, entry)
-}
-
-pub(package) fn loading_stack_pop(stack: i64) -> i64 {
-  let mut i = nlist_len(stack) - 1
-  let mut done = 0
-  while done == 0 {
-    if i < 0 { done = 1 }
-    else {
-      let entry = nlist_get(stack, i)
-      if mem_load64_at(entry, 8) >= 0 {
-        mem_store64_at(entry, 8, 0 - 1)
-        done = 1
-      } else { i = i - 1 }
-    }
-  }
-  0
-}
-
-pub(package) fn loading_stack_contains(stack: i64, src: i64, ns: i64, nl: i64, package_id: i64) -> bool {
-  let mut i = 0
-  let mut found = false
-  while i < nlist_len(stack) {
-    let entry = nlist_get(stack, i)
-    let e_ptr = mem_load64_at(entry, 0)
-    let e_len = mem_load64_at(entry, 8)
-    if e_len == nl and mem_load64_at(entry, 16) == package_id {
-      if src_eq_at(src, ns, e_ptr, 0, nl) == 1 {
-        found = true
-        i = nlist_len(stack)
-      } else { i = i + 1 }
-    } else { i = i + 1 }
-  }
-  found
-}
-
-pub(package) fn mark_trusted_import_source(tt: i64, path_ptr: i64, path_len: i64, file_buf: i64) -> i64 {
-  if file_buf == 0 { 0 }
-  else {
-    if source_trust_path_is_trusted_import(path_ptr, path_len) == 1 {
-      ttable_mark_trusted_source(tt, file_buf)
-    } else { 0 }
-    if source_trust_path_can_grant_import_trust(path_ptr, path_len) == 1 {
-      ttable_mark_source_trust_grant_source(tt, file_buf)
-    } else { 0 }
-  }
 }
 
 -- Source-relative name ranges remain syntax until the host resolves them.
@@ -5049,23 +4934,6 @@ pub(package) fn parse_use(toks: i64, src: i64, pos: i64, fns: i64, tt: i64, visi
   parse_use_with_loader(toks, src, pos, fns, tt, visibility, parse_source_loader_for_table(tt))
 }
 
-pub(package) fn parse_register_native_binding_decls(tt: i64, source_entry: i64) -> i64 {
-  let src = ttable_native_binding_source_source(source_entry)
-  let symbols = pkg_native_target_symbols(ttable_native_binding_source_target(source_entry))
-  for i in 0..nlist_len(symbols) {
-    let symbol = nlist_get(symbols, i)
-    let decl = module_decl_fact_register_synthetic_private(
-      tt,
-      src,
-      module_decl_namespace_value(),
-      pkg_native_symbol_declaration_ptr(symbol),
-      pkg_native_symbol_declaration_len(symbol)
-    )
-    ttable_native_binding_source_add_decl(source_entry, symbol, decl)
-  }
-  nlist_len(symbols)
-}
-
 pub(package) fn parse_use_with_loader<E>(toks: i64, src: i64, pos: i64, fns: i64, tt: i64, visibility: i64, loader: SourceLoader<E>) -[Diagnose, E]> i64 {
   match parse_use_surface(toks, src, pos) {
     ImportInvalid(next) -> next
@@ -5115,7 +4983,7 @@ pub(package) fn parse_import_with_loader<E>(syntax: ImportSyntax, end_pos: i64, 
     let file_r = parse_read_registered_or_load<E>(tt, resolved_ptr, resolved_len, resolved_logical_ptr, resolved_module_len, resolved_package, loader)
     let file_buf = mem_load64_at(file_r, 0)
     let file_len = mem_load64_at(file_r, 8)
-    if file_len > 0 {
+    if file_buf != 0 and file_len >= 0 {
       -- The transitional built-in path TCB belongs only to the root package.
       -- A dependency cannot acquire it by aliasing its path onto runtime/.
       if resolved_package == 0 or pkg_identity_is_sdk(tt, resolved_package) == 1 {
@@ -5136,7 +5004,7 @@ pub(package) fn parse_import_with_loader<E>(syntax: ImportSyntax, end_pos: i64, 
       parse_use_register_fact(tt, src, target_module, syntax, visibility, source_offset)
       let file_toks = lex(file_buf, file_len)
       parse_use_module_with_loader<E>(file_toks, file_buf, fns, tt, loader)
-      if native_source > 0 { parse_register_native_binding_decls(tt, native_source) } else { 0 }
+      if native_source > 0 { source_register_native_binding_declarations(tt, native_source) } else { 0 }
     } else { 0 }
     loading_stack_pop(loading)
     end_pos
@@ -5166,7 +5034,7 @@ pub(package) fn parse_use_file_with_loader<E>(fns: i64, tt: i64, path_str: str, 
     let file_r = parse_read_registered_or_load<E>(tt, path_ptr, path_len, path_ptr, logical_len, package_id, loader)
     let file_buf = mem_load64_at(file_r, 0)
     let file_len = mem_load64_at(file_r, 8)
-    if file_len > 0 {
+    if file_buf != 0 and file_len >= 0 {
       mark_trusted_import_source(tt, path_ptr, path_len, file_buf)
       ttable_register_source_in_package(tt, file_buf, file_len, path_ptr, path_len, package_id)
       let file_toks = lex(file_buf, file_len)

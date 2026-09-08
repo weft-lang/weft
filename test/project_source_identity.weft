@@ -1,0 +1,128 @@
+use compiler/project_session.{*}
+use compiler/incremental.{*}
+use compiler/pipeline.{TypedModule}
+use compiler/module.{*}
+use compiler/type_registry.{ttable_find_source_buffer_entry}
+use runtime/rc.{rc_count}
+use runtime/memory.{mem_load64_at}
+use runtime/string.{runtime_str_from_bytes_copy}
+use stdlib/diagnostic.{*}
+
+type IdentityFixture { session: ProjectSession, root: ProjectQueryContext, left: ProjectQueryContext, right: ProjectQueryContext }
+
+fn identity_context(identity: str, path: str) -> ProjectQueryContext {
+  project_query_context_with_overlay_set(1, identity, path, project_source_origin_overlay(), 0, 1, "shared-bytes")
+}
+
+fn shared_sources(content: str, program: str) -> IdentityFixture {
+  let session = project_session_new(1)
+  let root = identity_context("root", "shared_source_root.weft")
+  let left = identity_context("left", "module_fixtures/shared_source_left".concat(".weft"))
+  let right = identity_context("right", "module_fixtures/shared_source_right".concat(".weft"))
+  project_session_set_source(session, root, program)
+  project_session_set_source(session, left, content)
+  project_session_set_source(session, right, content)
+  let overlays = project_overlay_set_new()
+  project_overlay_set_add(overlays, root)
+  project_overlay_set_add(overlays, left)
+  project_overlay_set_add(overlays, right)
+  project_session_set_overlay_set(session, root, overlays)
+  IdentityFixture { session: session, root: root, left: left, right: right }
+}
+
+fn answer_program() -> str {
+  "use module_fixtures/shared_source_left as left\nuse module_fixtures/shared_source_right as right\nfn main() -> i64 { left.answer() + right.answer() }"
+}
+
+fn succeeded(result: ProjectCheckResult) -> bool {
+  match result { ProjectCheckSucceeded(_, _, _, _) -> true, _ -> false }
+}
+
+fn named_module_source(result: ProjectCheckResult, path: str) -> i64 {
+  match result {
+    ProjectCheckSucceeded(TypedModule(_, _, table), _, _, _) -> {
+      for index in 0..module_fact_module_count(table) {
+        let entry = module_fact_module_at(table, index)
+        if runtime_str_from_bytes_copy(module_fact_entry_path_ptr(entry), module_fact_entry_path_len(entry)) == path {
+          return module_fact_entry_source(entry)
+        }
+      }
+      0
+    }
+    _ -> 0
+  }
+}
+
+test "different overlay modules can share an immutable source value" {
+  let fixture = shared_sources("pub fn answer() -> i64 { 42 }", answer_program())
+  let result = project_session_check(fixture.session, fixture.root)
+  Test.assert_true(succeeded(result))
+  let left = named_module_source(result, "module_fixtures/shared_source_left")
+  let right = named_module_source(result, "module_fixtures/shared_source_right")
+  Test.assert_true(left != 0 and right != 0 and left != right)
+}
+
+test "distinct empty overlays remain present modules" {
+  let program = "use module_fixtures/shared_source_left as left\nuse module_fixtures/shared_source_right as right\nfn main() -> i64 { 0 }"
+  let fixture = shared_sources("", program)
+  let result = project_session_check(fixture.session, fixture.root)
+  Test.assert_true(succeeded(result))
+  let left = named_module_source(result, "module_fixtures/shared_source_left")
+  let right = named_module_source(result, "module_fixtures/shared_source_right")
+  Test.assert_true(left != 0 and right != 0 and left != right)
+}
+
+test "equal text updates preserve cached identity and changed modules invalidate their consumers" {
+  let content = "pub fn answer() -> i64 { 42 }"
+  let fixture = shared_sources(content, answer_program())
+  Test.assert_true(succeeded(project_session_check(fixture.session, fixture.root)))
+  Test.assert_true(match project_session_set_source(fixture.session, fixture.right, content) {
+    IncrementalInputUnchanged(_) -> true
+    _ -> false
+  })
+  Test.assert_true(succeeded(project_session_check(fixture.session, fixture.root)))
+  Test.assert_eq(project_session_parse_execution_count(fixture.session, fixture.root), 1)
+  project_session_set_source(fixture.session, fixture.left, "pub fn answer() -> i64 { 99 }")
+  Test.assert_true(succeeded(project_session_check(fixture.session, fixture.root)))
+  Test.assert_eq(project_session_parse_execution_count(fixture.session, fixture.root), 2)
+}
+
+test "identical nominal declarations in different source identities remain distinct types" {
+  let program = "use module_fixtures/shared_source_left as left\nuse module_fixtures/shared_source_right as right\nfn mismatch(value: left.Tag) -> right.Tag { value }\nfn main() -> i64 { 0 }"
+  let fixture = shared_sources("pub type Tag { Tag }", program)
+  match project_session_check(fixture.session, fixture.root) {
+    ProjectCheckFailed(_, _, parse_diagnostics, check_diagnostics) -> {
+      Test.assert_eq(project_diagnostics_error_count(parse_diagnostics), 0)
+      Test.assert_eq(project_diagnostics_error_count(check_diagnostics), 1)
+      Test.assert_true(project_diagnostics_get(check_diagnostics, 0).code().eq(DiagnosticCodeAssigned("E1002")))
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+fn escaped_project_result() -> ProjectCheckResult {
+  let fixture = shared_sources("pub fn answer() -> i64 { 42 }", answer_program())
+  project_session_check(fixture.session, fixture.root)
+}
+
+test "a checked project result retains overlay bytes and paths after its session ends" {
+  let result = escaped_project_result()
+  Test.assert_true(succeeded(result))
+  let source = named_module_source(result, "module_fixtures/shared_source_left")
+  Test.assert_true(source != 0)
+  Test.assert_eq(rc_count(source - 16), 1)
+  let expected_source = "pub fn answer() -> i64 { 42 }"
+  for _ in 0..64 {
+    let other = "discard".repeat(4)
+    Test.assert_eq_usize(other.len(), 28)
+    Test.assert_str_eq(runtime_str_from_bytes_copy(source, __str_len(expected_source)), expected_source)
+  }
+  match result {
+    ProjectCheckSucceeded(TypedModule(_, _, table), _, _, _) -> {
+      let entry = ttable_find_source_buffer_entry(table, source)
+      let path = runtime_str_from_bytes_copy(mem_load64_at(entry + 16, 0), mem_load64_at(entry + 24, 0))
+      Test.assert_str_eq(path, "module_fixtures/shared_source_left.weft")
+    }
+    _ -> Test.assert_true(false)
+  }
+}
