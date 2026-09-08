@@ -6,6 +6,7 @@
 (for_expression) @local.scope
 (match_arm) @local.scope
 (handler_clause) @local.scope
+(handler_implementation) @local.scope
 
 (parameter name: (identifier) @local.definition)
 (handler_parameter name: (identifier) @local.definition)

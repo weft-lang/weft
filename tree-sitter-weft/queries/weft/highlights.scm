@@ -7,7 +7,7 @@
 [ "while" "for" "in" "loop" ] @keyword.repeat
 [ "return" "break" "resume" ] @keyword.return
 (continue_expression) @keyword.return
-"handle" @keyword
+[ "handle" "implements" "default" "handler" ] @keyword
 
 (integer) @number
 (float) @number.float
@@ -36,6 +36,8 @@
 (call_expression function: (identifier) @function.call)
 (call_expression
   function: (field_expression field: (identifier) @function.method))
+(handler_configuration module: (identifier) @module)
+(type_parameter name: (identifier) @type)
 (handler_clause operation: (identifier) @function.method)
 
 (parameter name: (identifier) @variable.parameter)

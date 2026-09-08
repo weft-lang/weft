@@ -52,16 +52,17 @@ if [ "$mode" = all ] || [ "$mode" = grammar ]; then
 fi
 
 if [ "$mode" = all ] || [ "$mode" = corpus ]; then
-  "$tree_sitter" parse \
+  # Include nested source modules and runnable examples. Negative fixtures are
+  # intentionally outside this acceptance corpus. NUL framing preserves paths.
+  {
+    find "$repo_root/compiler" "$repo_root/stdlib" "$repo_root/runtime" \
+      "$repo_root/tools" "$repo_root/examples" -type f -name '*.weft' -print0
+    printf '%s\0' "$repo_root"/test/*.weft
+  } | xargs -0 "$tree_sitter" parse \
     --lib-path "$parser" \
     --lang-name weft \
     --quiet \
-    --stat \
-    "$repo_root"/compiler/*.weft \
-    "$repo_root"/stdlib/*.weft \
-    "$repo_root"/runtime/*.weft \
-    "$repo_root"/tools/*.weft \
-    "$repo_root"/test/*.weft
+    --stat
 fi
 
 if [ "$mode" = all ] || [ "$mode" = queries ]; then
@@ -74,7 +75,13 @@ if [ "$mode" = all ] || [ "$mode" = queries ]; then
     'fn query_read(input: QueryBox) -> i64 {' \
     '  let local = input' \
     '  local.value' \
-    '}' > "$query_source"
+    '}' \
+    'effect Cell<T> { fn get() -> T }' \
+    'pub implements<T> Cell<T>(initial: T) {' \
+    '  Cell<T>.get() -> resume(initial)' \
+    '}' \
+    'default handler defaults()' \
+    'fn query_handler() -> i64 { with state<i64>(42) { Cell<i64>.get() } }' > "$query_source"
 
   "$tree_sitter" query \
     --lib-path "$parser" \
@@ -84,6 +91,9 @@ if [ "$mode" = all ] || [ "$mode" = queries ]; then
   test -s "$highlight_output"
   grep -q -- '- keyword' "$highlight_output"
   grep -q -- '- function' "$highlight_output"
+  grep -q -- 'keyword.*text: `implements`' "$highlight_output"
+  grep -q -- 'keyword.*text: `default`' "$highlight_output"
+  grep -q -- 'module.*text: `state`' "$highlight_output"
 
   "$tree_sitter" query \
     --lib-path "$parser" \
@@ -93,4 +103,6 @@ if [ "$mode" = all ] || [ "$mode" = queries ]; then
   test -s "$locals_output"
   grep -q -- '- local.definition' "$locals_output"
   grep -q -- '- local.reference' "$locals_output"
+  grep -q -- 'local.definition.*text: `initial`' "$locals_output"
+  grep -q -- 'local.reference.*text: `initial`' "$locals_output"
 fi
