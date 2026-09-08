@@ -1029,7 +1029,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_diagnostic_schema_public_surface" "$(<"$tmp_out")" "Public API items: 62. Documented: 62."
     assert_contains "doc_stdlib_diagnostic_schema_finite_range" "$(<"$tmp_out")" "DiagnosticSourceRange(DiagnosticSource, usize, usize)"
   elif [ "$stdlib_doc_name" = "diagnostic/registry" ]; then
-    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 45. Documented: 45."
+    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 46. Documented: 46."
     assert_contains "doc_stdlib_diagnostic_registry_length" "$(<"$tmp_out")" "pub fn len() -> usize"
     assert_contains "doc_stdlib_diagnostic_registry_lookup" "$(<"$tmp_out")" "pub fn get(index: usize) -> Option<DiagnosticRegistryEntry>"
     assert_contains "doc_stdlib_diagnostic_registry_code" "$(<"$tmp_out")" "code: DiagnosticCode"
@@ -3082,6 +3082,24 @@ assert_contains "mcp_entry_unhandled_stable_code" "$mcp_out" '"code":"E2001"'
 assert_contains "mcp_entry_unhandled_context" "$mcp_out" '"name":"context","value":"program entry point"'
 assert_contains "mcp_entry_unhandled_exact_capability" "$mcp_out" '"name":"EntryRead","arguments":[]'
 assert_contains "mcp_entry_unhandled_repair" "$mcp_out" 'make main pure and install the required handlers inside its body'
+
+resume_source='effect Pick { fn get() -> i64 } fn main() -> i64 { handle Pick.get() { Pick.get() -> { resume(1); resume(2) } } }'
+resume_check_status=0
+resume_check_out=$(printf '%s' "$resume_source" | "$WEFT" check 2>&1) || resume_check_status=$?
+assert_equals "resume_reuse_check_exit" "$resume_check_status" "1"
+assert_contains "resume_reuse_check_code" "$resume_check_out" 'error[E2002]: handler clause uses `resume` more than once along a source branch'
+resume_compile_status=0
+printf '%s' "$resume_source" | "$WEFT" > "$tmp_bin" 2> "$tmp_out" || resume_compile_status=$?
+assert_equals "resume_reuse_compile_exit" "$resume_compile_status" "1"
+assert_equals "resume_reuse_compile_emits_no_artifact" "$(wc -c < "$tmp_bin" | tr -d ' ')" "0"
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"effect Pick { fn get() -> i64 } fn main() -> i64 { handle Pick.get() { Pick.get() -> { resume(1); resume(2) } } }"}}}' | "$WEFT" mcp 2>&1)
+assert_contains "mcp_resume_reuse_stable_code" "$mcp_out" '"code":"E2002"'
+assert_contains "mcp_resume_reuse_context" "$mcp_out" '"name":"context","value":"handler clause"'
+assert_contains "mcp_resume_reuse_continuation" "$mcp_out" '"name":"continuation","value":"resume"'
+assert_contains "mcp_resume_reuse_repair" "$mcp_out" 'choose one resume, or put alternative resumes in mutually exclusive branches'
+resume_explain_out=$("$WEFT" explain E2002 2>&1)
+assert_contains "explain_resume_reuse_meaning" "$resume_explain_out" 'handler continuation is used more than once'
+assert_contains "explain_resume_reuse_example" "$resume_explain_out" 'if condition { resume(1) } else { resume(2) }'
 
 wire_type_expected='{"kind":"type","name":"expected_type","value":{"kind":"primitive","name":"i64"}}'
 wire_type_found='{"kind":"type","name":"found_type","value":{"kind":"primitive","name":"str"}}'

@@ -1023,6 +1023,19 @@ check_rejects "module_handler_escape" "test/negative/module_handler_escape.weft"
 check_rejects "module_handler_member_call_ambiguity" "test/negative/module_handler_member_call_ambiguity.weft" "expected '{' after handler configuration"
 check_rejects "module_handler_generic_arity" "test/negative/module_handler_generic_arity.weft" "type error: wrong number of handler type arguments"
 check_rejects "module_handler_constructor_type" "test/negative/module_handler_constructor_type.weft" 'error[E1002]: handler constructor argument type mismatch: expected `RuntimeRcProbe`, found `i64`'
+check_rejects "resume_twice" "test/negative/resume_twice.weft" 'error[E2002]: handler clause uses `resume` more than once along a source branch' 1
+check_rejects "resume_branch_then_again" "test/negative/resume_branch_then_again.weft" 'error[E2002]: handler clause uses `resume` more than once along a source branch' 1
+check_rejects "resume_match_then_again" "test/negative/resume_match_then_again.weft" 'error[E2002]: handler clause uses `resume` more than once along a source branch' 1
+check_rejects "resume_inside_resume" "test/negative/resume_inside_resume.weft" 'error[E2002]: handler clause uses `resume` more than once along a source branch' 1
+check_rejects "resume_loop_twice" "test/negative/resume_loop_twice.weft" 'error[E2002]: handler clause uses `resume` more than once along a source branch' 1
+check_rejects "resume_named_handler_twice" "test/negative/resume_named_handler_twice.weft" 'error[E2002]: handler clause uses `resume` more than once along a source branch' 1
+check_rejects "resume_normal_return_twice" "test/negative/resume_normal_return_twice.weft" 'error[E2002]: handler clause uses `resume` more than once along a source branch' 1
+check_rejects "resume_normal_return_outside" "test/negative/resume_normal_return_outside.weft" 'type error: resume outside handler clause' 1
+check_rejects "resume_named_handler_outside" "test/negative/resume_named_handler_outside.weft" 'type error: resume outside handler clause' 1
+check_rejects "resume_named_handler_capture" "test/negative/resume_named_handler_capture.weft" 'type error: cannot capture resume' 1
+check_rejects "resume_normal_return_capture" "test/negative/resume_normal_return_capture.weft" 'type error: cannot capture resume' 1
+check_rejects "resume_deferred_normal_return" "test/negative/resume_deferred_normal_return.weft" "type error: use continuation binding instead of resume" 1
+check_rejects "resume_deferred_named_handler" "test/negative/resume_deferred_named_handler.weft" "type error: use continuation binding instead of resume" 1
 check_rejects "resume_outside_handler" "test/negative/resume_outside_handler.weft" "type error: resume outside handler clause"
 check_rejects "resume_outside_handler_lambda" "test/negative/resume_outside_handler_lambda.weft" "type error: resume outside handler clause"
 check_rejects "generic_type_payload_mismatch" "test/negative/generic_type_payload_mismatch.weft" 'error[E1002]: argument type mismatch: expected `i64`, found `str`'

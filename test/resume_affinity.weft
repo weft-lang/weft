@@ -1,0 +1,147 @@
+use compiler/ir.{UnknownExpr}
+use compiler/resume_usage.{resume_usage, NoResumeUse, UnknownResumeUse}
+use compiler/grammar.{*}
+use compiler/lib.{*}
+use compiler/parse.{parse_module}
+use compiler/pipeline.{pipeline_check_loaded}
+use compiler/type_registry.{ttable_new}
+use runtime/source_acquire.{source_acquire_with_standalone}
+use stdlib/diagnostic.{*}
+use stdlib/diagnostic/schema.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/state as state
+use stdlib/state.{State}
+use stdlib/string.{str_concat}
+
+-- Diagnostics remain structured values throughout this test interpretation.
+type ResumeReports { reports: List<Diagnostic>, legacy: i64 }
+
+fn check_resume_source(source: str) -> (i64, ResumeReports) {
+  state.run(ResumeReports { reports: Nil<Diagnostic>(), legacy: 0 }, () => {
+    source_acquire_with_standalone(() => handle {
+      let src = __str_ptr(source)
+      let tt = ttable_new()
+      let grammar = weft_grammar()
+      let fns = parse_module(grammar.lex(src, __str_len(source)), src, tt)
+      pipeline_check_loaded(fns, src, tt)
+    } {
+      Diagnose.report(diagnostic) -> {
+        let current = State<ResumeReports>.get()
+        State<ResumeReports>.put(ResumeReports { reports: Cons(diagnostic, current.reports), legacy: current.legacy })
+        resume(0)
+      }
+      Diagnose.error(message, span) -> {
+        let current = State<ResumeReports>.get()
+        State<ResumeReports>.put(ResumeReports { reports: current.reports, legacy: current.legacy + 1 })
+        resume(0)
+      }
+      Diagnose.warn(message, span) -> resume(0)
+      Diagnose.note(message, span) -> resume(0)
+    })
+  })
+}
+
+fn resume_clause_source(body: str) -> str {
+  "effect E { fn get() -> i64 } fn main() -> i64 { handle E.get() { E.get() -> { "
+    |> str_concat(body)
+    |> str_concat(" } } }")
+}
+
+fn assert_resume_accepted(source: str) -[Test]> nil {
+  let result = check_resume_source(source)
+  Test.assert_eq(result.0, 0)
+  Test.assert_eq(result.1.legacy, 0)
+  match result.1.reports {
+    Nil -> 0
+    Cons(diagnostic, rest) -> Test.assert_true(false)
+  }
+  nil
+}
+
+fn assert_resume_rejected(source: str) -[Test]> nil {
+  let result = check_resume_source(source)
+  Test.assert_eq(result.0, 1)
+  Test.assert_eq(result.1.legacy, 0)
+  match result.1.reports {
+    Cons(diagnostic, Nil) -> {
+      let code = diagnostic.code()
+      Test.assert_true(code.eq(DiagnosticCodeAssigned("E2002")))
+      Test.assert_str_eq(diagnostic.message(), "handler clause uses `resume` more than once along a source branch")
+      match diagnostic.primary() {
+        DiagnosticSourceRange(DiagnosticSourceBuffer(buffer), start, end) -> {
+          Test.assert_eq(buffer, __str_ptr(source))
+          Test.assert_true(end > start)
+        }
+        _ -> Test.assert_true(false)
+      }
+      match diagnostic.fields() {
+        DiagnosticFieldCons(DiagnosticFieldText(context_key, context),
+          DiagnosticFieldCons(DiagnosticFieldText(continuation_key, continuation),
+            DiagnosticFieldCons(DiagnosticFieldSuggestion(DiagnosticSuggestion(message, DiagnosticSuggestionMaybeIncorrect, DiagnosticTextEditNil)), DiagnosticFieldNil))) -> {
+          Test.assert_str_eq(context_key, "context")
+          Test.assert_str_eq(context, "handler clause")
+          Test.assert_str_eq(continuation_key, "continuation")
+          Test.assert_str_eq(continuation, "resume")
+          Test.assert_str_eq(message, "choose one resume, or put alternative resumes in mutually exclusive branches")
+        }
+        _ -> Test.assert_true(false)
+      }
+    }
+    _ -> Test.assert_true(false)
+  }
+  nil
+}
+
+test "one implicit continuation may be resumed or abandoned" {
+  assert_resume_accepted(resume_clause_source("resume(42)"))
+  assert_resume_accepted(resume_clause_source("42"))
+}
+
+test "alternative branches may each resume the same implicit continuation once" {
+  assert_resume_accepted(resume_clause_source("if true { resume(1) } else { resume(2) }"))
+  assert_resume_accepted(resume_clause_source("match 1 { 0 -> resume(1) 1 -> resume(2) _ -> resume(3) }"))
+  assert_resume_accepted(resume_clause_source("if true { resume(1) } else { 2 }"))
+}
+
+test "a dead second resume is still a source use of the continuation" {
+  assert_resume_rejected(resume_clause_source("resume(1); resume(2)"))
+  assert_resume_rejected(resume_clause_source("let first = resume(1); resume(2)"))
+}
+
+test "sequences after branching consume the same continuation permission" {
+  assert_resume_rejected(resume_clause_source("if true { resume(1) } else { resume(2) }; resume(3)"))
+  assert_resume_rejected(resume_clause_source("match 1 { 0 -> resume(1) _ -> resume(2) }; resume(3)"))
+  assert_resume_rejected(resume_clause_source("if true { resume(1); resume(2) } else { resume(3) }"))
+}
+
+test "a resume operand cannot consume its own continuation" {
+  assert_resume_rejected(resume_clause_source("resume(resume(1))"))
+}
+
+test "nested operation clauses receive independent continuations" {
+  assert_resume_accepted("effect E { fn get() -> i64 } effect F { fn get() -> i64 } fn main() -> i64 { handle E.get() { E.get() -> { let value = handle F.get() { F.get() -> resume(41) } resume(value + 1) } } }")
+  assert_resume_rejected("effect E { fn get() -> i64 } effect F { fn get() -> i64 } fn main() -> i64 { handle E.get() { E.get() -> { let value = handle F.get() { F.get() -> { resume(1); resume(2) } } resume(value) } } }")
+}
+
+test "nested handled bodies still use the enclosing continuation" {
+  assert_resume_rejected("effect E { fn get() -> i64 } effect F { fn get() -> i64 } fn main() -> i64 { handle E.get() { E.get() -> { handle { resume(1); resume(2) } { F.get() -> resume(3) } } } }")
+}
+
+test "normal-return transforms retain the enclosing continuation scope" {
+  assert_resume_rejected("effect E { fn get() -> i64 } effect F { fn get() -> i64 } fn main() -> i64 { handle E.get() { E.get() -> { handle F.get() { F.get() -> resume(1) return value -> { resume(value); resume(value) } } } } }")
+}
+
+test "named handler bodies do not supply a new implicit continuation" {
+  assert_resume_rejected("use test/module_fixtures/module_handler_basic as basic effect E { fn get() -> i64 } fn main() -> i64 { handle E.get() { E.get() -> with basic() { resume(1); resume(2) } } }")
+}
+
+test "one tail resume inside a loop exits the clause" {
+  assert_resume_accepted(resume_clause_source("loop { resume(42) }"))
+  assert_resume_accepted(resume_clause_source("while true { resume(42) } 0"))
+  assert_resume_rejected(resume_clause_source("loop { resume(1); resume(2) }"))
+}
+
+test "unknown syntax cannot establish a one-shot use proof" {
+  Test.assert_true(match resume_usage(UnknownExpr(999)) { UnknownResumeUse -> true _ -> false })
+  Test.assert_true(match resume_usage(UnknownExpr(0)) { NoResumeUse -> true _ -> false })
+}
