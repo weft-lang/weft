@@ -691,7 +691,7 @@ stdlib_doc_modules=(
   stdlib/prelude.weft stdlib/assert.weft stdlib/default.weft stdlib/display.weft stdlib/drop.weft
   stdlib/eq.weft stdlib/hash.weft stdlib/ord.weft stdlib/panic.weft
   stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft
-  stdlib/maybe.weft stdlib/bytes.weft stdlib/string.weft stdlib/string/builder.weft stdlib/path.weft stdlib/io/types.weft
+  stdlib/maybe.weft stdlib/bytes.weft stdlib/source.weft stdlib/string.weft stdlib/string/builder.weft stdlib/path.weft stdlib/io/types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft
   stdlib/time/monotonic.weft stdlib/time/wall.weft
@@ -1122,8 +1122,16 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     done
     assert_not_contains "doc_stdlib_num_hides_float_scanner" "$(<"$tmp_out")" "NumFloatScan"
     assert_not_contains "doc_stdlib_num_hides_offset_conversion" "$(<"$tmp_out")" "num_parse_offset_from_storage"
+  elif [ "$stdlib_doc_name" = "source" ]; then
+    assert_contains "doc_stdlib_source_pins_public_surface" "$(<"$tmp_out")" "Public API items: 15. Documented: 15."
+    assert_contains "doc_stdlib_source_hides_range_constructor" "$(<"$tmp_out")" "pub type Span = opaque"
+    assert_contains "doc_stdlib_source_pins_checked_bounds" "$(<"$tmp_out")" "pub fn span(self: Source, start: usize, end: usize) -> Option<Span>"
+    assert_contains "doc_stdlib_source_pins_relative_bounds" "$(<"$tmp_out")" "pub fn subspan(self: Span, start: usize, end: usize) -> Option<Span>"
+    assert_contains "doc_stdlib_source_pins_shared_location" "$(<"$tmp_out")" "pub fn location(self: Span) -> DiagnosticLocation"
   elif [ "$stdlib_doc_name" = "string" ]; then
-    assert_contains "doc_stdlib_string_pins_public_surface" "$(<"$tmp_out")" "Public API items: 19. Documented: 19."
+    assert_contains "doc_stdlib_string_pins_byte_access" "$(<"$tmp_out")" "pub fn byte_at(self: str, index: usize) -> Option<u8>"
+    assert_contains "doc_stdlib_string_pins_checked_slice" "$(<"$tmp_out")" "pub fn slice(self: str, start: usize, end: usize) -> Option<str>"
+    assert_contains "doc_stdlib_string_pins_public_surface" "$(<"$tmp_out")" "Public API items: 21. Documented: 21."
     assert_contains "doc_stdlib_string_pins_byte_length" "$(<"$tmp_out")" "pub fn len(self: str) -> usize"
     assert_contains "doc_stdlib_string_pins_optional_find" "$(<"$tmp_out")" "pub fn find(self: str, needle: str) -> Option<usize>"
     assert_contains "doc_stdlib_string_pins_optional_find_from" "$(<"$tmp_out")" "pub fn find_from(self: str, needle: str, start: usize) -> Option<usize>"

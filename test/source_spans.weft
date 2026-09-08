@@ -1,0 +1,137 @@
+use stdlib/diagnostic/schema.{DiagnosticSourceUnknown, DiagnosticSourceBuffer, DiagnosticSourceNamed, DiagnosticSourceRange}
+use stdlib/option.{Option, Some, None}
+use stdlib/source.{Source, Span}
+use stdlib/string
+use runtime/rc.{rc_count}
+
+test "source spans retain all diagnostic identity variants" {
+  for identity in [DiagnosticSourceUnknown, DiagnosticSourceBuffer(42), DiagnosticSourceNamed("query.weft")] {
+    let source = Source { text: "select name", identity: identity }
+    let span = source.span(7, 11).unwrap()
+    Test.assert_true(span.start() == 7 and span.end() == 11 and span.len() == 4)
+    Test.assert_str_eq(span.text().unwrap(), "name")
+    let matches = match (span.location(), identity) {
+      (DiagnosticSourceRange(DiagnosticSourceUnknown, 7, 11), DiagnosticSourceUnknown) -> true
+      (DiagnosticSourceRange(DiagnosticSourceBuffer(42), 7, 11), DiagnosticSourceBuffer(42)) -> true
+      (DiagnosticSourceRange(DiagnosticSourceNamed(name), 7, 11), DiagnosticSourceNamed(expected)) -> name == expected
+      _ -> false
+    }
+    Test.assert_true(matches)
+  }
+}
+
+test "empty spans represent source positions including end of input" {
+  let empty = Source { text: "", identity: DiagnosticSourceUnknown }
+  Test.assert_true(empty.all().is_empty())
+  Test.assert_str_eq(empty.all().text().unwrap(), "")
+  Test.assert_true(empty.all().byte_at(0).is_none())
+  Test.assert_true(empty.span(0, 1).is_none())
+  let source = Source { text: "weft", identity: DiagnosticSourceNamed("end.weft") }
+  for position in 0..5 {
+    let offset: usize = __i64_to_usize(position)
+    let span = source.span(offset, offset).unwrap()
+    Test.assert_true(span.is_empty() and span.start() == offset and span.end() == offset)
+    Test.assert_str_eq(span.text().unwrap(), "")
+    Test.assert_true(span.subspan(0, 0).unwrap().start() == offset)
+    Test.assert_true(span.subspan(0, 1).is_none())
+  }
+}
+
+test "nested fragments keep original byte locations after Unicode and line breaks" {
+  let source = Source { text: "é\nquery select name tail", identity: DiagnosticSourceNamed("host.weft") }
+  let embedded = source.span(9, 20).unwrap()
+  let name = embedded.subspan(7, 11).unwrap()
+  Test.assert_str_eq(embedded.text().unwrap(), "select name")
+  Test.assert_str_eq(name.text().unwrap(), "name")
+  Test.assert_true(name.start() == 16 and name.end() == 20)
+  Test.assert_str_eq(name.source().text, source.text)
+  Test.assert_true(match name.location() {
+    DiagnosticSourceRange(DiagnosticSourceNamed("host.weft"), 16, 20) -> true
+    _ -> false
+  })
+  Test.assert_true(name.subspan(1, 3).unwrap().start() == 17)
+}
+
+test "source and fragment bounds reject full-width offsets without wrapping" {
+  let source = Source { text: "prefix weft suffix", identity: DiagnosticSourceUnknown }
+  let fragment = source.span(7, 11).unwrap()
+  let cases: [(usize, usize); 7] = [
+    (1, 0), (5, 5), (0, 5), (0, 9223372036854775807),
+    (0, 9223372036854775808), (0, 18446744073709551615),
+    (18446744073709551615, 18446744073709551615)
+  ]
+  for (start, end) in cases { Test.assert_true(fragment.subspan(start, end).is_none()) }
+  Test.assert_true(source.span(0, 18446744073709551615).is_none())
+  Test.assert_true(source.span(18446744073709551615, 0).is_none())
+  Test.assert_true(fragment.byte_at(4).is_none())
+  Test.assert_true(fragment.byte_at(18446744073709551615).is_none())
+}
+
+test "diagnostic byte ranges can inspect a partial scalar without constructing invalid text" {
+  let source = Source { text: "é", identity: DiagnosticSourceUnknown }
+  let head = source.span(0, 1).unwrap()
+  let tail = source.span(1, 2).unwrap()
+  Test.assert_true(head.text().is_none() and tail.text().is_none())
+  Test.assert_true(head.byte_at(0).unwrap() == 195)
+  Test.assert_true(tail.byte_at(0).unwrap() == 169)
+  Test.assert_true(tail.byte_at(1).is_none())
+}
+
+fn retained_source_fragment() -> Span {
+  let source = Source { text: "prefix ".concat("weft suffix"), identity: DiagnosticSourceNamed("saved".concat(".weft")) }
+  source.span(7, 11).unwrap()
+}
+
+test "a returned span owns the source after the parser binding ends" {
+  let span = retained_source_fragment()
+  for iteration in 0..64 {
+    let temporary = "other source".repeat(32)
+    Test.assert_true(temporary.len() == 384)
+    Test.assert_str_eq(span.text().unwrap(), "weft")
+    Test.assert_str_eq(span.source().text, "prefix weft suffix")
+    Test.assert_true(match span.location() {
+      DiagnosticSourceRange(DiagnosticSourceNamed(name), 7, 11) -> name == "saved.weft"
+      _ -> false
+    })
+  }
+}
+
+effect AbandonSource { fn abandon() -> nil }
+effect SuspendSource { @deferred fn suspend() -> nil }
+
+fn source_span_stake(text: str, mode: i64) -[Test, AbandonSource, SuspendSource]> nil {
+  let source = Source { text: text, identity: DiagnosticSourceUnknown }
+  let span = source.all().subspan(1, 4).unwrap()
+  if mode == 1 { AbandonSource.abandon() }
+  if mode == 2 { SuspendSource.suspend() }
+  Test.assert_str_eq(span.text().unwrap(), "eft")
+  nil
+}
+
+test "source ranges release retained text after normal abort and continuation-drop exits" {
+  let text = "we".concat("ft")
+  Test.assert_eq(rc_count(__str_ptr(text) - 16), 1)
+  for iteration in 0..32 {
+    for mode in [0, 1, 2] {
+      handle {
+        handle source_span_stake(text, mode) {
+          AbandonSource.abandon() -> nil
+        }
+      } {
+        SuspendSource.suspend() with k -> nil
+      }
+      Test.assert_eq(rc_count(__str_ptr(text) - 16), 1)
+    }
+  }
+}
+
+test "deep fragment selection preserves source ownership without copying each fragment" {
+  let source = Source { text: "x".repeat(4096), identity: DiagnosticSourceNamed("large.weft") }
+  let mut span = source.all()
+  for step in 0..1024 {
+    span = span.subspan(1, span.len() - 1).unwrap()
+  }
+  Test.assert_true(span.start() == 1024 and span.end() == 3072 and span.len() == 2048)
+  Test.assert_str_eq(span.text().unwrap(), "x".repeat(2048))
+  Test.assert_true(__str_ptr(span.source().text) == __str_ptr(source.text))
+}

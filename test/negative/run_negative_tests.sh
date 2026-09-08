@@ -58,6 +58,13 @@ check_rejects() {
   JOB_N=$((JOB_N+1))
 }
 
+check_rejects "source_span_forged" "test/negative/source_span_forged.weft" 'opaque constructor is private to its declaring module; use an exported factory'
+check_rejects "source_span_signed_bounds" "test/negative/source_span_signed_bounds.weft" 'argument type mismatch: expected `usize`, found `i64`'
+check_rejects "source_subspan_signed_bounds" "test/negative/source_subspan_signed_bounds.weft" 'argument type mismatch: expected `usize`, found `i64`'
+check_rejects "source_span_signed_index" "test/negative/source_span_signed_index.weft" 'argument type mismatch: expected `usize`, found `i64`'
+check_rejects "string_slice_signed_bounds" "test/negative/string_slice_signed_bounds.weft" 'argument type mismatch: expected `usize`, found `i64`'
+check_rejects "string_byte_signed_index" "test/negative/string_byte_signed_index.weft" 'argument type mismatch: expected `usize`, found `i64`'
+
 check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -[Log]> i64`'
 check_rejects "constructor_callback_argument" "test/negative/constructor_callback_argument.weft" 'error[E1002]: argument type mismatch' 1
 check_rejects "constructor_callback_result" "test/negative/constructor_callback_result.weft" 'error[E1002]: argument type mismatch' 1
