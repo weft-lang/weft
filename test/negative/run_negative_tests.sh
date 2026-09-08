@@ -58,6 +58,12 @@ check_rejects() {
   JOB_N=$((JOB_N+1))
 }
 
+check_rejects "field_access_variant_unknown" "test/negative/field_access_variant_unknown.weft" "unknown field" 1
+check_rejects "field_access_variant_constructor" "test/negative/field_access_variant_constructor.weft" "unknown field" 1
+check_rejects "field_access_generic_variant" "test/negative/field_access_generic_variant.weft" "unknown field" 1
+check_rejects "field_access_enum_unknown" "test/negative/field_access_enum_unknown.weft" "unknown field" 1
+check_rejects "field_access_enum_constructor" "test/negative/field_access_enum_constructor.weft" "unknown field" 1
+check_rejects "field_access_generic_impl" "test/negative/field_access_generic_impl.weft" "unknown field" 2
 check_rejects "entry_unhandled_effect" "test/negative/entry_unhandled_effect.weft" 'entry point `main` requires unhandled effects' 1
 check_rejects "entry_unhandled_effect_unused" "test/negative/entry_unhandled_effect_unused.weft" 'entry point `main` requires unhandled effects' 1
 check_rejects "entry_unhandled_effect_open_tail" "test/negative/entry_unhandled_effect_open_tail.weft" 'entry point `main` requires unhandled effects' 1
