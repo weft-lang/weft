@@ -1,0 +1,146 @@
+-- Deterministic reference execution for checked einsum contraction plans.
+
+use stdlib/grammar/einsum/plan.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option.{Option, Some, None}
+use stdlib/panic.{panic}
+use stdlib/result.{Result, Ok, Err}
+use stdlib/tensor as tensor
+use stdlib/tensor.{Tensor, TensorDimensions, TensorShape}
+
+--- Dense `f64` tensors supplied in checked operand order.
+pub type EinsumInputs = List<Tensor<f64>>
+
+--- A finite mismatch between a checked plan and execution inputs.
+pub type EinsumExecutionError<I> {
+  --- The plan expects the first operand count but execution received the second.
+  EinsumInputCountMismatch(usize, usize),
+  --- The tensor at this checked operand position has a different shape.
+  EinsumInputShapeMismatch(EinsumPlanOperand<I>, TensorShape)
+}
+
+--- Result of deterministic reference execution for one checked plan.
+pub type EinsumExecutionResult<I> = Result<Tensor<f64>, EinsumExecutionError<I>>
+
+fn einsum_dimensions_same(left: TensorDimensions, right: TensorDimensions) -> bool {
+  match (left, right) {
+    (Nil, Nil) -> true
+    (Cons(a, ar), Cons(b, br)) -> a == b and einsum_dimensions_same(ar, br)
+    _ -> false
+  }
+}
+
+fn einsum_shapes_same(left: TensorShape, right: TensorShape) -> bool {
+  einsum_dimensions_same(left.dimensions(), right.dimensions())
+}
+
+fn einsum_validate_inputs<I>(operands: EinsumPlanOperands<I>, inputs: EinsumInputs) -> Option<EinsumExecutionError<I>> {
+  match (operands, inputs) {
+    (Nil, Nil) -> None<EinsumExecutionError<I>>()
+    (Cons(operand, operand_rest), Cons(input, input_rest)) -> {
+      if einsum_shapes_same(operand.shape, input.shape()) {
+        einsum_validate_inputs(operand_rest, input_rest)
+      } else {
+        Some<EinsumExecutionError<I>>(EinsumInputShapeMismatch<I>(operand, input.shape()))
+      }
+    }
+    _ -> None<EinsumExecutionError<I>>()
+  }
+}
+
+fn einsum_axis_product(axes: EinsumPlanAxes) -> usize {
+  let one: usize = 1
+  match axes {
+    Nil -> one
+    Cons(axis, rest) -> axis.dimension * einsum_axis_product(rest)
+  }
+}
+
+fn einsum_axis_coordinate(flat: usize, axes: EinsumPlanAxes, position: usize) -> Option<usize> {
+  match axes {
+    Nil -> None<usize>()
+    Cons(axis, rest) -> if axis.position == position {
+      let trailing = einsum_axis_product(rest)
+      if axis.dimension == 0 or trailing == 0 { None<usize>() }
+      else { Some<usize>((flat / trailing) % axis.dimension) }
+    } else { einsum_axis_coordinate(flat, rest, position) }
+  }
+}
+
+fn einsum_coordinate(output_flat: usize, output_axes: EinsumPlanAxes, reduction_flat: usize, reduction_axes: EinsumPlanAxes, position: usize) -> usize {
+  match einsum_axis_coordinate(output_flat, output_axes, position) {
+    Some(value) -> value
+    None -> match einsum_axis_coordinate(reduction_flat, reduction_axes, position) {
+      Some(value) -> value
+      None -> panic("checked einsum axis is absent from output and reduction coordinates")
+    }
+  }
+}
+
+fn einsum_operand_offset(bindings: EinsumAxisBindings, output_flat: usize, output_axes: EinsumPlanAxes, reduction_flat: usize, reduction_axes: EinsumPlanAxes, accumulated: usize) -> usize {
+  match bindings {
+    Nil -> accumulated
+    Cons(binding, rest) -> einsum_operand_offset(
+      rest,
+      output_flat,
+      output_axes,
+      reduction_flat,
+      reduction_axes,
+      accumulated * binding.axis.dimension + einsum_coordinate(
+        output_flat,
+        output_axes,
+        reduction_flat,
+        reduction_axes,
+        binding.axis.position
+      )
+    )
+  }
+}
+
+fn einsum_term<I>(operands: EinsumPlanOperands<I>, inputs: EinsumInputs, output_flat: usize, output_axes: EinsumPlanAxes, reduction_flat: usize, reduction_axes: EinsumPlanAxes, product: f64) -> f64 {
+  match (operands, inputs) {
+    (Nil, Nil) -> product
+    (Cons(operand, operand_rest), Cons(input, input_rest)) -> {
+      let offset = einsum_operand_offset(operand.axes, output_flat, output_axes, reduction_flat, reduction_axes, 0)
+      let value = match input.get_flat(offset) {
+        Some(element) -> element
+        None -> return panic("checked einsum operand offset is outside its validated tensor")
+      }
+      einsum_term<I>(operand_rest, input_rest, output_flat, output_axes, reduction_flat, reduction_axes, product * value)
+    }
+    _ -> panic("checked einsum operand and input counts diverged after validation")
+  }
+}
+
+--- Execute a checked contraction in exact lexicographic reduction order.
+--- No floating-point reassociation is performed.
+pub fn run<I>(plan: EinsumPlan<I>, inputs: EinsumInputs) -> EinsumExecutionResult<I> {
+  let operands = plan.operands()
+  if operands.len() != inputs.len() {
+    return Err<Tensor<f64>, EinsumExecutionError<I>>(EinsumInputCountMismatch<I>(operands.len(), inputs.len()))
+  } else { nil }
+  match einsum_validate_inputs(operands, inputs) {
+    Some(error) -> Err<Tensor<f64>, EinsumExecutionError<I>>(error)
+    None -> {
+      let output_axes = plan.output_axes()
+      let reduction_axes = plan.reduction_axes()
+      let output_shape = plan.output_shape()
+      let reduction_count = plan.reduction_shape().len()
+      let output = tensor.filled<f64>(output_shape, 0.0)
+      let mut output_flat: usize = 0
+      while output_flat < output.len() {
+        let mut sum = 0.0
+        let mut reduction_flat: usize = 0
+        while reduction_flat < reduction_count {
+          sum = sum + einsum_term<I>(operands, inputs, output_flat, output_axes, reduction_flat, reduction_axes, 1.0)
+          reduction_flat = reduction_flat + 1
+        }
+        if not output.set_flat(output_flat, sum) {
+          return panic("checked einsum output position is outside its result tensor")
+        } else { nil }
+        output_flat = output_flat + 1
+      }
+      Ok<Tensor<f64>, EinsumExecutionError<I>>(output)
+    }
+  }
+}

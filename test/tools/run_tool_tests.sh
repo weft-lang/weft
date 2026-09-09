@@ -709,6 +709,7 @@ stdlib_doc_modules=(
   stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft
   stdlib/maybe.weft stdlib/bytes.weft stdlib/source.weft stdlib/typecheck.weft stdlib/grammar.weft
   stdlib/grammar/sql.weft stdlib/grammar/sql/syntax.weft stdlib/grammar/sql/plan.weft stdlib/grammar/sql/check.weft stdlib/grammar/sql/execute.weft
+  stdlib/grammar/einsum.weft stdlib/grammar/einsum/syntax.weft stdlib/grammar/einsum/plan.weft stdlib/grammar/einsum/check.weft stdlib/grammar/einsum/execute.weft
   stdlib/string.weft stdlib/string/builder.weft stdlib/path.weft stdlib/io/types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft
@@ -1066,6 +1067,28 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_grammar_sql_execute_checked_input" "$(<"$tmp_out")" "pub fn input<I>(source: SqlPlanSource<I>, rows: SqlInputRows) -> SqlInputSource<I>"
     assert_contains "doc_stdlib_grammar_sql_execute_result" "$(<"$tmp_out")" "pub type SqlExecutionResult<I> = Result<SqlExecution, SqlExecutionError<I>>"
     assert_contains "doc_stdlib_grammar_sql_execute_run" "$(<"$tmp_out")" "pub fn run<I>(plan: SqlPlan<I>, inputs: SqlInputs<I>) -> SqlExecutionResult<I>"
+  elif [ "$stdlib_doc_name" = "grammar/einsum" ]; then
+    assert_contains "doc_stdlib_grammar_einsum_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
+    assert_contains "doc_stdlib_grammar_einsum_parser" "$(<"$tmp_out")" "pub fn grammar() -> EinsumGrammar"
+    assert_contains "doc_stdlib_grammar_einsum_implementation" "$(<"$tmp_out")" "impl stdlib/grammar.Grammar for EinsumGrammar"
+  elif [ "$stdlib_doc_name" = "grammar/einsum/syntax" ]; then
+    assert_contains "doc_stdlib_grammar_einsum_syntax_public_contract" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
+    assert_contains "doc_stdlib_grammar_einsum_syntax_axes" "$(<"$tmp_out")" "pub type EinsumAxes = List<EinsumAxis>"
+    assert_contains "doc_stdlib_grammar_einsum_syntax_root" "$(<"$tmp_out")" "pub type EinsumSyntax {"
+  elif [ "$stdlib_doc_name" = "grammar/einsum/plan" ]; then
+    assert_contains "doc_stdlib_grammar_einsum_plan_public_contract" "$(<"$tmp_out")" "Public API items: 31. Documented: 31."
+    assert_contains "doc_stdlib_grammar_einsum_plan_named_specs" "$(<"$tmp_out")" "pub type EinsumOperandSpecs<I> = List<EinsumOperandSpec<I>>"
+    assert_contains "doc_stdlib_grammar_einsum_plan_reduction" "$(<"$tmp_out")" "pub type EinsumReductionSemantics {"
+    assert_contains "doc_stdlib_grammar_einsum_plan_root" "$(<"$tmp_out")" "pub type EinsumPlan<I> = opaque"
+  elif [ "$stdlib_doc_name" = "grammar/einsum/check" ]; then
+    assert_contains "doc_stdlib_grammar_einsum_check_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
+    assert_contains "doc_stdlib_grammar_einsum_check_constructor" "$(<"$tmp_out")" "pub fn checker<I>(operands: EinsumOperandSpecs<I>) -> EinsumChecker<I>"
+    assert_contains "doc_stdlib_grammar_einsum_checked_contract" "$(<"$tmp_out")" "impl<I> stdlib/grammar.CheckedGrammar for EinsumChecker<I>"
+  elif [ "$stdlib_doc_name" = "grammar/einsum/execute" ]; then
+    assert_contains "doc_stdlib_grammar_einsum_execute_public_contract" "$(<"$tmp_out")" "Public API items: 6. Documented: 6."
+    assert_contains "doc_stdlib_grammar_einsum_execute_inputs" "$(<"$tmp_out")" "pub type EinsumInputs = List<Tensor<f64>>"
+    assert_contains "doc_stdlib_grammar_einsum_execute_result" "$(<"$tmp_out")" "pub type EinsumExecutionResult<I> = Result<Tensor<f64>, EinsumExecutionError<I>>"
+    assert_contains "doc_stdlib_grammar_einsum_execute_run" "$(<"$tmp_out")" "pub fn run<I>(plan: EinsumPlan<I>, inputs: EinsumInputs) -> EinsumExecutionResult<I>"
   elif [ "$stdlib_doc_name" = "typecheck" ]; then
     assert_contains "doc_stdlib_typecheck_public_contract" "$(<"$tmp_out")" "Public API items: 29. Documented: 29."
     assert_contains "doc_stdlib_typecheck_structured_resolution" "$(<"$tmp_out")" "fn resolve(request: TypeName<I>) -> Result<ResolvedType<I>, TypeQueryError>"
