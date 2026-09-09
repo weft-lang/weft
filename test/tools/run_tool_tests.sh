@@ -1061,6 +1061,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "comptime/file_observer" ]; then
     assert_contains "doc_stdlib_comptime_observer_public_contract" "$(<"$tmp_out")" "Public API items: 4. Documented: 4."
     assert_contains "doc_stdlib_comptime_observer_named_state" "$(<"$tmp_out")" "pub type FileObserver {"
+    assert_contains "doc_stdlib_comptime_observer_named_fields" "$(<"$tmp_out")" "values: Vector<ComptimeFileObservation>"
     assert_contains "doc_stdlib_comptime_observer_snapshot" "$(<"$tmp_out")" "pub fn observations(observer: FileObserver) -> ComptimeFileObservations"
   elif [ "$stdlib_doc_name" = "grammar/sql" ]; then
     assert_contains "doc_stdlib_grammar_sql_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
