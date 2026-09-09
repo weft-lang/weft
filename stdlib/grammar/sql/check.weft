@@ -5,6 +5,7 @@ use stdlib/diagnostic/schema.{Diagnose, DiagnosticClassType, DiagnosticSeverityE
 use stdlib/grammar.{CheckedGrammar, CheckResult, Checked, CheckRejected}
 use stdlib/grammar/sql/syntax.{*}
 use stdlib/grammar/sql/plan.{*}
+use stdlib/list as list
 use stdlib/list.{List, Cons, Nil}
 use stdlib/option.{Option, Some, None}
 use stdlib/result.{Result, Ok, Err}
@@ -54,6 +55,10 @@ type SqlColumnLookup<I> {
   SqlColumnQueryFailed
 }
 
+type SqlResolvedSourceField<I> {
+  SqlResolvedSourceField(usize, ResolvedType<I>)
+}
+
 fn sql_check_error(span: Span, message: str) -[Diagnose]> nil {
   Diagnose.report(diagnostic.uncoded(DiagnosticSeverityError, DiagnosticClassType, message, span.location()))
   nil
@@ -94,7 +99,7 @@ fn sql_semantic_type_is_nullable(value: SemanticTypeFact) -> bool {
   }
 }
 
-fn sql_field_sequence_has_nullable<I>(fields: List<ResolvedField<I>>) -> bool {
+fn sql_field_sequence_has_nullable<I>(fields: SqlPlanFields<I>) -> bool {
   match fields {
     Nil -> false
     Cons(field, rest) -> sql_semantic_type_is_nullable(field.value.description) or sql_field_sequence_has_nullable(rest)
@@ -125,7 +130,8 @@ fn sql_resolve_source<I>(source: SqlSource, position: usize, fallback: Span) -[T
             position: position,
             table: table,
             alias: source.alias,
-            row: row
+            row: row,
+            fields: fields
           })
         }
       }
@@ -133,16 +139,19 @@ fn sql_resolve_source<I>(source: SqlSource, position: usize, fallback: Span) -[T
   }
 }
 
-fn sql_resolve_sources<I>(syntax: SqlSyntax) -[TypeCheck<I>, Diagnose]> Option<List<SqlPlanSource<I>>> {
+fn sql_resolve_sources<I>(syntax: SqlSyntax) -[TypeCheck<I>, Diagnose]> Option<SqlPlanSources<I>> {
   let primary = sql_resolve_source<I>(syntax.query.source, 0, syntax.span)
-  let mut sources: List<SqlPlanSource<I>> = match primary {
-    SqlSourceChecked(source) -> Cons(source, Nil<SqlPlanSource<I>>())
-    SqlSourceRejected -> return None<List<SqlPlanSource<I>>>()
+  let mut sources: SqlPlanSources<I> = match primary {
+    SqlSourceChecked(source) -> {
+      let first = [source]
+      list.from_slice(first[..])
+    }
+    SqlSourceRejected -> return None<SqlPlanSources<I>>()
   }
   let mut position: usize = 1
   for join in syntax.query.joins {
     match sql_resolve_source<I>(join.source, position, syntax.span) {
-      SqlSourceRejected -> return None<List<SqlPlanSource<I>>>()
+      SqlSourceRejected -> return None<SqlPlanSources<I>>()
       SqlSourceChecked(source) -> { sources = Cons(source, sources); nil }
     }
     position = position + 1
@@ -154,7 +163,7 @@ fn sql_source_qualifier<I>(source: SqlPlanSource<I>) -> str {
   match source.alias { Some(alias) -> alias.text, None -> source.table.text }
 }
 
-fn sql_find_qualified_source<I>(sources: List<SqlPlanSource<I>>, qualifier: SqlIdentifier) -> Option<SqlPlanSource<I>> {
+fn sql_find_qualified_source<I>(sources: SqlPlanSources<I>, qualifier: SqlIdentifier) -> Option<SqlPlanSource<I>> {
   match sources {
     Nil -> None<SqlPlanSource<I>>()
     Cons(source, rest) -> if sql_source_qualifier(source) == qualifier.text { Some(source) }
@@ -162,46 +171,54 @@ fn sql_find_qualified_source<I>(sources: List<SqlPlanSource<I>>, qualifier: SqlI
   }
 }
 
-fn sql_lookup_qualified_column<I>(sources: List<SqlPlanSource<I>>, qualifier: SqlIdentifier, field: SqlIdentifier) -[TypeCheck<I>, Diagnose]> SqlColumnLookup<I> {
+fn sql_find_source_field<I>(fields: SqlPlanFields<I>, name: str, position: usize) -> Option<SqlResolvedSourceField<I>> {
+  match fields {
+    Nil -> None<SqlResolvedSourceField<I>>()
+    Cons(field, rest) -> match field.selector {
+      NamedTypeField(candidate) -> if candidate == name { Some(SqlResolvedSourceField(position, field.value)) }
+        else { sql_find_source_field(rest, name, position + 1) }
+      _ -> sql_find_source_field(rest, name, position + 1)
+    }
+  }
+}
+
+fn sql_lookup_qualified_column<I>(sources: SqlPlanSources<I>, qualifier: SqlIdentifier, field: SqlIdentifier) -[Diagnose]> SqlColumnLookup<I> {
   match sql_find_qualified_source(sources, qualifier) {
     None -> {
       sql_check_error(qualifier.span, "unknown SQL table qualifier")
       SqlColumnMissing<I>()
     }
-    Some(source) -> match TypeCheck<I>.field(source.row.identity, NamedTypeField(field.text)) {
-      Ok(value) -> if sql_semantic_type_is_nullable(value.description) {
+    Some(source) -> match sql_find_source_field(source.fields, field.text, 0) {
+      Some(SqlResolvedSourceField(position, value)) -> if sql_semantic_type_is_nullable(value.description) {
         sql_check_error(field.span, "nullable SQL columns require three-valued null semantics")
         SqlColumnQueryFailed<I>()
-      } else { SqlColumnFound(SqlColumnBinding { source: source, field: field, value: value }) }
-      Err(TypeFieldNotFound) -> {
+      } else { SqlColumnFound(SqlColumnBinding { source: source, field: field, position: position, value: value }) }
+      None -> {
         sql_check_error(field.span, "unknown SQL column")
         SqlColumnMissing<I>()
       }
-      Err(_) -> {
-        sql_check_error(field.span, "SQL host field query failed")
-        SqlColumnQueryFailed<I>()
-      }
     }
   }
 }
 
-fn sql_lookup_unqualified_column_inner<I>(sources: List<SqlPlanSource<I>>, field: SqlIdentifier, found: Option<SqlColumnBinding<I>>, count: i64) -[TypeCheck<I>]> (Option<SqlColumnBinding<I>>, i64, bool) {
+fn sql_lookup_unqualified_column_inner<I>(sources: SqlPlanSources<I>, field: SqlIdentifier, found: Option<SqlColumnBinding<I>>, count: i64) -> (Option<SqlColumnBinding<I>>, i64) {
   match sources {
-    Nil -> (found, count, false)
-    Cons(source, rest) -> match TypeCheck<I>.field(source.row.identity, NamedTypeField(field.text)) {
-      Ok(value) -> sql_lookup_unqualified_column_inner(rest, field, Some(SqlColumnBinding { source: source, field: field, value: value }), count + 1)
-      Err(TypeFieldNotFound) -> sql_lookup_unqualified_column_inner(rest, field, found, count)
-      Err(_) -> (found, count, true)
+    Nil -> (found, count)
+    Cons(source, rest) -> match sql_find_source_field(source.fields, field.text, 0) {
+      Some(SqlResolvedSourceField(position, value)) -> sql_lookup_unqualified_column_inner(
+        rest,
+        field,
+        Some(SqlColumnBinding { source: source, field: field, position: position, value: value }),
+        count + 1
+      )
+      None -> sql_lookup_unqualified_column_inner(rest, field, found, count)
     }
   }
 }
 
-fn sql_lookup_unqualified_column<I>(sources: List<SqlPlanSource<I>>, field: SqlIdentifier) -[TypeCheck<I>, Diagnose]> SqlColumnLookup<I> {
-  let (found, count, failed) = sql_lookup_unqualified_column_inner(sources, field, None<SqlColumnBinding<I>>(), 0)
-  if failed {
-    sql_check_error(field.span, "SQL host field query failed")
-    SqlColumnQueryFailed<I>()
-  } else { if count == 0 { SqlColumnMissing<I>() }
+fn sql_lookup_unqualified_column<I>(sources: SqlPlanSources<I>, field: SqlIdentifier) -[Diagnose]> SqlColumnLookup<I> {
+  let (found, count) = sql_lookup_unqualified_column_inner(sources, field, None<SqlColumnBinding<I>>(), 0)
+  if count == 0 { SqlColumnMissing<I>() }
   else { if count > 1 {
     sql_check_error(field.span, "ambiguous SQL column")
     SqlColumnAmbiguous<I>()
@@ -213,10 +230,10 @@ fn sql_lookup_unqualified_column<I>(sources: List<SqlPlanSource<I>>, field: SqlI
       } else { SqlColumnFound(binding) }
       None -> SqlColumnMissing<I>()
     }
-  } } }
+  } }
 }
 
-fn sql_projection_alias_count<I>(projections: List<SqlPlanProjection<I>>, name: str) -> i64 {
+fn sql_projection_alias_count<I>(projections: SqlPlanProjections<I>, name: str) -> i64 {
   match projections {
     Nil -> 0
     Cons(projection, rest) -> (match projection.alias { Some(alias) -> if alias.text == name { 1 } else { 0 }, None -> 0 }) +
@@ -224,7 +241,7 @@ fn sql_projection_alias_count<I>(projections: List<SqlPlanProjection<I>>, name: 
   }
 }
 
-fn sql_projection_alias_expression<I>(projections: List<SqlPlanProjection<I>>, name: str) -> Option<SqlPlanExpression<I>> {
+fn sql_projection_alias_expression<I>(projections: SqlPlanProjections<I>, name: str) -> Option<SqlPlanExpression<I>> {
   match projections {
     Nil -> None<SqlPlanExpression<I>>()
     Cons(projection, rest) -> match projection.alias {
@@ -276,7 +293,7 @@ fn sql_expression_span(expression: SqlExpression, fallback: Span) -> Span {
   }
 }
 
-fn sql_check_column<I>(field: SqlIdentifier, sources: List<SqlPlanSource<I>>, aliases: List<SqlPlanProjection<I>>, allow_aliases: bool) -[TypeCheck<I>, Diagnose]> SqlExpressionCheck<I> {
+fn sql_check_column<I>(field: SqlIdentifier, sources: SqlPlanSources<I>, aliases: SqlPlanProjections<I>, allow_aliases: bool) -[Diagnose]> SqlExpressionCheck<I> {
   match sql_lookup_unqualified_column(sources, field) {
     SqlColumnFound(binding) -> SqlExpressionChecked(SqlPlanColumn(binding))
     SqlColumnAmbiguous -> SqlExpressionRejected<I>()
@@ -302,7 +319,7 @@ fn sql_check_column<I>(field: SqlIdentifier, sources: List<SqlPlanSource<I>>, al
   }
 }
 
-fn sql_check_expression<I>(expression: SqlExpression, sources: List<SqlPlanSource<I>>, aliases: List<SqlPlanProjection<I>>, primitives: SqlPrimitiveTypes<I>, allow_aliases: bool, fallback: Span) -[TypeCheck<I>, Diagnose]> SqlExpressionCheck<I> {
+fn sql_check_expression<I>(expression: SqlExpression, sources: SqlPlanSources<I>, aliases: SqlPlanProjections<I>, primitives: SqlPrimitiveTypes<I>, allow_aliases: bool, fallback: Span) -[TypeCheck<I>, Diagnose]> SqlExpressionCheck<I> {
   match expression {
     SqlColumn(field) -> sql_check_column(field, sources, aliases, allow_aliases)
     SqlQualifiedColumn(qualifier, field) -> match sql_lookup_qualified_column(sources, qualifier, field) {
@@ -487,7 +504,7 @@ fn sql_plan_expression_same<I>(left: SqlPlanExpression<I>, right: SqlPlanExpress
   }
 }
 
-fn sql_plan_matches_group<I>(expression: SqlPlanExpression<I>, groups: List<SqlPlanExpression<I>>) -> bool {
+fn sql_plan_matches_group<I>(expression: SqlPlanExpression<I>, groups: SqlPlanExpressions<I>) -> bool {
   match groups {
     Nil -> false
     Cons(group, rest) -> sql_plan_expression_same(expression, group) or sql_plan_matches_group(expression, rest)
@@ -510,14 +527,14 @@ fn sql_plan_matches_projection<I>(expression: SqlPlanExpression<I>, selection: S
   }
 }
 
-fn sql_distinct_order_is_projected<I>(selection: SqlPlanSelection<I>, order: List<SqlPlanOrder<I>>) -> bool {
+fn sql_distinct_order_is_projected<I>(selection: SqlPlanSelection<I>, order: SqlPlanOrders<I>) -> bool {
   for item in order {
     if not sql_plan_matches_projection(item.expression, selection) { return false } else { nil }
   }
   true
 }
 
-fn sql_plan_grouped_ok<I>(expression: SqlPlanExpression<I>, groups: List<SqlPlanExpression<I>>) -> bool {
+fn sql_plan_grouped_ok<I>(expression: SqlPlanExpression<I>, groups: SqlPlanExpressions<I>) -> bool {
   if sql_plan_matches_group(expression, groups) { true }
   else {
     match expression {
@@ -531,22 +548,22 @@ fn sql_plan_grouped_ok<I>(expression: SqlPlanExpression<I>, groups: List<SqlPlan
   }
 }
 
-fn sql_check_expression_list<I>(values: List<SqlExpression>, sources: List<SqlPlanSource<I>>, aliases: List<SqlPlanProjection<I>>, primitives: SqlPrimitiveTypes<I>, allow_aliases: bool, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<List<SqlPlanExpression<I>>> {
-  let mut result: List<SqlPlanExpression<I>> = Nil<SqlPlanExpression<I>>()
+fn sql_check_expression_list<I>(values: SqlExpressions, sources: SqlPlanSources<I>, aliases: SqlPlanProjections<I>, primitives: SqlPrimitiveTypes<I>, allow_aliases: bool, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<SqlPlanExpressions<I>> {
+  let mut result: SqlPlanExpressions<I> = Nil<SqlPlanExpression<I>>()
   for value in values {
     match sql_check_expression(value, sources, aliases, primitives, allow_aliases, fallback) {
-      SqlExpressionRejected -> return None<List<SqlPlanExpression<I>>>()
+      SqlExpressionRejected -> return None<SqlPlanExpressions<I>>()
       SqlExpressionChecked(checked) -> { result = Cons(checked, result); nil }
     }
   }
   Some(result.reverse())
 }
 
-fn sql_check_projections<I>(selection: SqlSelection, sources: List<SqlPlanSource<I>>, primitives: SqlPrimitiveTypes<I>, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<SqlPlanSelection<I>> {
+fn sql_check_projections<I>(selection: SqlSelection, sources: SqlPlanSources<I>, primitives: SqlPrimitiveTypes<I>, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<SqlPlanSelection<I>> {
   match selection {
     SqlSelectAll -> match sources { Cons(primary, rest) -> Some(SqlPlanSelectAll(primary)), Nil -> None<SqlPlanSelection<I>>() }
     SqlSelect(items) -> {
-      let mut result: List<SqlPlanProjection<I>> = Nil<SqlPlanProjection<I>>()
+      let mut result: SqlPlanProjections<I> = Nil<SqlPlanProjection<I>>()
       for item in items {
         match sql_check_expression(item.expression, sources, Nil<SqlPlanProjection<I>>(), primitives, false, fallback) {
           SqlExpressionRejected -> return None<SqlPlanSelection<I>>()
@@ -561,11 +578,11 @@ fn sql_check_projections<I>(selection: SqlSelection, sources: List<SqlPlanSource
   }
 }
 
-fn sql_plan_projections<I>(selection: SqlPlanSelection<I>) -> List<SqlPlanProjection<I>> {
+fn sql_plan_projections<I>(selection: SqlPlanSelection<I>) -> SqlPlanProjections<I> {
   match selection { SqlPlanSelect(items) -> items, SqlPlanSelectAll(source) -> Nil<SqlPlanProjection<I>>() }
 }
 
-fn sql_check_optional_expression<I>(value: Option<SqlExpression>, sources: List<SqlPlanSource<I>>, aliases: List<SqlPlanProjection<I>>, primitives: SqlPrimitiveTypes<I>, allow_aliases: bool, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<Option<SqlPlanExpression<I>>> {
+fn sql_check_optional_expression<I>(value: Option<SqlExpression>, sources: SqlPlanSources<I>, aliases: SqlPlanProjections<I>, primitives: SqlPrimitiveTypes<I>, allow_aliases: bool, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<Option<SqlPlanExpression<I>>> {
   match value {
     None -> Some(None<SqlPlanExpression<I>>())
     Some(expression) -> match sql_check_expression(expression, sources, aliases, primitives, allow_aliases, fallback) {
@@ -587,23 +604,23 @@ fn sql_require_boolean_predicate<I>(value: Option<SqlPlanExpression<I>>, primiti
   }
 }
 
-fn sql_plan_projection_has_aggregate<I>(items: List<SqlPlanProjection<I>>) -> bool {
+fn sql_plan_projection_has_aggregate<I>(items: SqlPlanProjections<I>) -> bool {
   match items { Nil -> false, Cons(item, rest) -> sql_plan_has_aggregate(item.expression) or sql_plan_projection_has_aggregate(rest) }
 }
 
-fn sql_plan_expression_list_has_aggregate<I>(items: List<SqlPlanExpression<I>>) -> bool {
+fn sql_plan_expression_list_has_aggregate<I>(items: SqlPlanExpressions<I>) -> bool {
   match items { Nil -> false, Cons(item, rest) -> sql_plan_has_aggregate(item) or sql_plan_expression_list_has_aggregate(rest) }
 }
 
-fn sql_plan_order_has_aggregate<I>(items: List<SqlPlanOrder<I>>) -> bool {
+fn sql_plan_order_has_aggregate<I>(items: SqlPlanOrders<I>) -> bool {
   match items { Nil -> false, Cons(item, rest) -> sql_plan_has_aggregate(item.expression) or sql_plan_order_has_aggregate(rest) }
 }
 
-fn sql_check_orders<I>(items: List<SqlOrder>, sources: List<SqlPlanSource<I>>, aliases: List<SqlPlanProjection<I>>, primitives: SqlPrimitiveTypes<I>, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<List<SqlPlanOrder<I>>> {
-  let mut result: List<SqlPlanOrder<I>> = Nil<SqlPlanOrder<I>>()
+fn sql_check_orders<I>(items: SqlOrders, sources: SqlPlanSources<I>, aliases: SqlPlanProjections<I>, primitives: SqlPrimitiveTypes<I>, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<SqlPlanOrders<I>> {
+  let mut result: SqlPlanOrders<I> = Nil<SqlPlanOrder<I>>()
   for item in items {
     match sql_check_expression(item.expression, sources, aliases, primitives, true, fallback) {
-      SqlExpressionRejected -> return None<List<SqlPlanOrder<I>>>()
+      SqlExpressionRejected -> return None<SqlPlanOrders<I>>()
       SqlExpressionChecked(expression) -> {
         result = Cons(SqlPlanOrder { expression: expression, direction: item.direction }, result)
         nil
@@ -613,28 +630,31 @@ fn sql_check_orders<I>(items: List<SqlOrder>, sources: List<SqlPlanSource<I>>, a
   Some(result.reverse())
 }
 
-fn sql_check_joins<I>(items: List<SqlJoinClause>, sources: List<SqlPlanSource<I>>, primitives: SqlPrimitiveTypes<I>, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<List<SqlPlanJoin<I>>> {
-  let mut result: List<SqlPlanJoin<I>> = Nil<SqlPlanJoin<I>>()
-  let mut available_sources: List<SqlPlanSource<I>> = match sources {
-    Cons(primary, rest) -> Cons(primary, Nil<SqlPlanSource<I>>())
+fn sql_check_joins<I>(items: SqlJoins, sources: SqlPlanSources<I>, primitives: SqlPrimitiveTypes<I>, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<SqlPlanJoins<I>> {
+  let mut result: SqlPlanJoins<I> = Nil<SqlPlanJoin<I>>()
+  let mut available_sources: SqlPlanSources<I> = match sources {
+    Cons(primary, rest) -> {
+      let first = [primary]
+      list.from_slice(first[..])
+    }
     Nil -> Nil<SqlPlanSource<I>>()
   }
   let mut remaining_sources = match sources { Cons(primary, rest) -> rest, Nil -> Nil<SqlPlanSource<I>>() }
   for item in items {
     let source = match remaining_sources {
       Cons(current, rest) -> { remaining_sources = rest; current }
-      Nil -> return None<List<SqlPlanJoin<I>>>()
+      Nil -> return None<SqlPlanJoins<I>>()
     }
     available_sources = available_sources.append(source)
     if sql_expression_has_aggregate(item.predicate) {
       sql_check_error(sql_expression_span(item.predicate, fallback), "aggregates are not allowed in SQL join predicates")
-      return None<List<SqlPlanJoin<I>>>()
+      return None<SqlPlanJoins<I>>()
     } else { nil }
     match sql_check_expression(item.predicate, available_sources, Nil<SqlPlanProjection<I>>(), primitives, false, fallback) {
-      SqlExpressionRejected -> return None<List<SqlPlanJoin<I>>>()
+      SqlExpressionRejected -> return None<SqlPlanJoins<I>>()
       SqlExpressionChecked(predicate) -> if sql_require_type(sql_plan_expression_type(predicate), sql_boolean_type(primitives), sql_expression_span(item.predicate, fallback), "SQL join predicate must be boolean") {
         result = Cons(SqlPlanJoin { source: source, predicate: predicate }, result)
-      } else { return None<List<SqlPlanJoin<I>>>() }
+      } else { return None<SqlPlanJoins<I>>() }
     }
   }
   Some(result.reverse())
@@ -654,7 +674,7 @@ fn sql_output_shape<I>(selection: SqlPlanSelection<I>) -> SqlOutputShape {
   match selection {
     SqlPlanSelectAll(source) -> SqlOutputSource(source.row.description)
     SqlPlanSelect(items) -> {
-      let mut fields: List<SqlOutputField> = Nil<SqlOutputField>()
+      let mut fields: SqlOutputFields = Nil<SqlOutputField>()
       for item in items {
         fields = Cons(SqlOutputField {
           name: sql_output_name(item),
@@ -666,7 +686,7 @@ fn sql_output_shape<I>(selection: SqlPlanSelection<I>) -> SqlOutputShape {
   }
 }
 
-fn sql_check_group_rules<I>(selection: SqlPlanSelection<I>, groups: List<SqlPlanExpression<I>>, having: Option<SqlPlanExpression<I>>, order: List<SqlPlanOrder<I>>, fallback: Span) -[Diagnose]> bool {
+fn sql_check_group_rules<I>(selection: SqlPlanSelection<I>, groups: SqlPlanExpressions<I>, having: Option<SqlPlanExpression<I>>, order: SqlPlanOrders<I>, fallback: Span) -[Diagnose]> bool {
   let projections = sql_plan_projections(selection)
   let grouped = not groups.is_empty() or sql_plan_projection_has_aggregate(projections) or
     (match having { Some(value) -> sql_plan_has_aggregate(value), None -> false }) or sql_plan_order_has_aggregate(order)
@@ -794,7 +814,7 @@ fn sql_check_plan<I>(syntax: SqlSyntax) -[TypeCheck<I>, Diagnose]> CheckResult<S
     Cons(source, rest) -> source
     Nil -> return CheckRejected<SqlPlan<I>>()
   }
-  Checked(SqlPlan {
+  Checked(checked_plan(SqlPlanParts {
     distinct: syntax.query.distinct,
     source: primary,
     joins: joins,
@@ -807,7 +827,7 @@ fn sql_check_plan<I>(syntax: SqlSyntax) -[TypeCheck<I>, Diagnose]> CheckResult<S
     offset: offset,
     output: sql_output_shape(selection),
     nulls: SqlNullsRejected
-  })
+  }))
 }
 
 impl<I> CheckedGrammar for SqlChecker<I> {

@@ -1,0 +1,756 @@
+-- Pure reference execution for checked first-party SQL plans.
+
+use stdlib/grammar/sql/plan.{*}
+use stdlib/grammar/sql/syntax.{*}
+use stdlib/fail as fail
+use stdlib/fail.{Fail}
+use stdlib/list as list
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option.{Option, Some, None}
+use stdlib/ord.{Ordering, Less, Equal, Greater, Ord}
+use stdlib/panic.{panic}
+use stdlib/result.{Result, Ok, Err}
+use stdlib/semantic_type.{SemanticTypeFact, SemanticTypePrimitive}
+use stdlib/source.{Span}
+use stdlib/typecheck.{ResolvedField}
+
+--- A non-null scalar value supported by the deterministic SQL reference interpreter.
+pub type SqlValue {
+  --- A signed 64-bit integer value.
+  SqlIntegerValue(i64),
+  --- An immutable UTF-8 string value.
+  SqlStringValue(str),
+  --- A boolean value.
+  SqlBooleanValue(bool)
+}
+
+--- Ordered scalar values in one SQL row.
+pub type SqlValues = List<SqlValue>
+
+--- One input row whose values follow the source's declared field order.
+pub type SqlInputRow {
+  --- Values corresponding one-for-one with `SqlPlanSource.fields`.
+  values: SqlValues
+}
+
+--- One deterministic in-memory relation.
+pub type SqlInputRows = List<SqlInputRow>
+
+--- Ordered rows supplied for one source position in a checked plan.
+pub type SqlInputSource<I> {
+  --- The checked source this relation satisfies.
+  source: SqlPlanSource<I>,
+  --- Rows in deterministic observation order.
+  rows: SqlInputRows
+}
+
+--- Relations supplied to one checked plan.
+pub type SqlInputs<I> = List<SqlInputSource<I>>
+
+--- Bind ordered rows to a checked source without repeating its position manually.
+pub fn input<I>(source: SqlPlanSource<I>, rows: SqlInputRows) -> SqlInputSource<I> {
+  SqlInputSource { source: source, rows: rows }
+}
+
+--- One row produced by reference execution.
+pub type SqlOutputRow {
+  --- The primary input row preserved by `SELECT *`.
+  SqlOutputSourceRow(SqlInputRow),
+  --- Values from an explicit projection, in projection order.
+  SqlOutputRecordRow(SqlValues)
+}
+
+--- Deterministically ordered rows produced by reference execution.
+pub type SqlOutputRows = List<SqlOutputRow>
+
+--- A deterministic SQL result paired with the checked output description.
+pub type SqlExecution {
+  --- Stable output shape produced by the checker.
+  output: SqlOutputShape,
+  --- Result rows after filtering, grouping, ordering, distinctness and paging.
+  rows: SqlOutputRows
+}
+
+--- The query-level paging operation that rejected a negative value.
+pub type SqlPageKind {
+  --- The checked `LIMIT` expression.
+  SqlLimitPage,
+  --- The checked `OFFSET` expression.
+  SqlOffsetPage
+}
+
+--- A finite failure from reference execution or malformed semantic input.
+pub type SqlExecutionError<I> {
+  --- No input relation was supplied for a checked source.
+  SqlInputSourceMissing(SqlPlanSource<I>),
+  --- More than one input relation was supplied for a checked source.
+  SqlInputSourceRepeated(SqlPlanSource<I>),
+  --- An input relation names a position absent from the checked plan.
+  SqlInputSourceUnexpected(usize),
+  --- A row at the given position has expected and actual field counts that differ.
+  SqlInputRowWidth(SqlPlanSource<I>, usize, usize, usize),
+  --- A row value disagrees with the checked field at the given row and field positions.
+  SqlInputValueType(SqlPlanSource<I>, usize, usize, SemanticTypeFact, SqlValue),
+  --- Integer division used a zero divisor at the retained expression span.
+  SqlDivisionByZero(Span),
+  --- A non-count aggregate received no input under null-rejecting semantics.
+  SqlAggregateEmpty(SqlAggregateKind, Span),
+  --- A query-level paging expression produced a negative value.
+  SqlPagingNegative(SqlPageKind, i64)
+}
+
+--- Pure execution result for a checked plan and in-memory relations.
+pub type SqlExecutionResult<I> = Result<SqlExecution, SqlExecutionError<I>>
+
+type SqlBoundRow {
+  SqlBoundRow(usize, SqlInputRow)
+}
+
+type SqlBoundRows = List<SqlBoundRow>
+
+type SqlJoinedRow {
+  SqlJoinedRow(SqlBoundRows)
+}
+
+type SqlJoinedRows = List<SqlJoinedRow>
+
+type SqlGroupBucket {
+  SqlGroupBucket(SqlValues, SqlJoinedRows)
+}
+
+type SqlGroupBuckets = List<SqlGroupBucket>
+
+type SqlProjectedEntry {
+  SqlProjectedEntry(SqlOutputRow, SqlValues)
+}
+
+type SqlProjectedEntries = List<SqlProjectedEntry>
+
+fn sql_checked_expression_span<I>(expression: SqlPlanExpression<I>) -> Span {
+  match expression {
+    SqlPlanColumn(binding) -> binding.field.span
+    SqlPlanIntegerLiteral(value, ty, span) -> span
+    SqlPlanStringLiteral(value, ty, span) -> span
+    SqlPlanBooleanLiteral(value, ty, span) -> span
+    SqlPlanScalarExpression(op, left, right, ty) -> sql_checked_expression_span(left)
+    SqlPlanComparisonExpression(op, left, right, ty) -> sql_checked_expression_span(left)
+    SqlPlanLogicalExpression(op, left, right, ty) -> sql_checked_expression_span(left)
+    SqlPlanAggregateExpression(kind, argument, ty, span) -> span
+  }
+}
+
+fn sql_value_matches(description: SemanticTypeFact, value: SqlValue) -> bool {
+  match (description, value) {
+    (SemanticTypePrimitive(name), SqlIntegerValue(_)) -> name == "i64"
+    (SemanticTypePrimitive(name), SqlStringValue(_)) -> name == "str"
+    (SemanticTypePrimitive(name), SqlBooleanValue(_)) -> name == "bool"
+    _ -> false
+  }
+}
+
+fn sql_plan_sources<I>(plan: SqlPlan<I>) -> SqlPlanSources<I> {
+  let first = [plan.source()]
+  let mut sources = list.from_slice(first[..])
+  for join in plan.joins() { sources = sources.append(join.source) }
+  sources
+}
+
+fn sql_source_position_present<I>(sources: SqlPlanSources<I>, position: usize) -> bool {
+  match sources {
+    Nil -> false
+    Cons(source, rest) -> source.position == position or sql_source_position_present(rest, position)
+  }
+}
+
+fn sql_validate_input_positions<I>(sources: SqlPlanSources<I>, inputs: SqlInputs<I>) -> Result<nil, SqlExecutionError<I>> {
+  for supplied in inputs {
+    if not sql_source_position_present(sources, supplied.source.position) {
+      return Err<nil, SqlExecutionError<I>>(SqlInputSourceUnexpected<I>(supplied.source.position))
+    } else { nil }
+  }
+  Ok<nil, SqlExecutionError<I>>(nil)
+}
+
+fn sql_input_rows<I>(source: SqlPlanSource<I>, inputs: SqlInputs<I>) -> Result<SqlInputRows, SqlExecutionError<I>> {
+  let mut found: Option<SqlInputRows> = None<SqlInputRows>()
+  let mut count = 0
+  for supplied in inputs {
+    if supplied.source.position == source.position {
+      found = Some(supplied.rows)
+      count = count + 1
+    } else { nil }
+  }
+  if count == 0 { Err<SqlInputRows, SqlExecutionError<I>>(SqlInputSourceMissing(source)) }
+  else { if count > 1 { Err<SqlInputRows, SqlExecutionError<I>>(SqlInputSourceRepeated(source)) }
+  else { match found {
+    Some(rows) -> Ok<SqlInputRows, SqlExecutionError<I>>(rows)
+    None -> Err<SqlInputRows, SqlExecutionError<I>>(SqlInputSourceMissing(source))
+  } } }
+}
+
+fn sql_validate_row_values<I>(source: SqlPlanSource<I>, fields: SqlPlanFields<I>, values: SqlValues, row_position: usize, field_position: usize) -> Result<nil, SqlExecutionError<I>> {
+  match (fields, values) {
+    (Nil, Nil) -> Ok<nil, SqlExecutionError<I>>(nil)
+    (Cons(field, field_rest), Cons(value, value_rest)) -> if sql_value_matches(field.value.description, value) {
+      sql_validate_row_values(source, field_rest, value_rest, row_position, field_position + 1)
+    } else {
+      Err<nil, SqlExecutionError<I>>(SqlInputValueType(source, row_position, field_position, field.value.description, value))
+    }
+    _ -> Err<nil, SqlExecutionError<I>>(SqlInputRowWidth(source, row_position, source.fields.len(), field_position + values.len()))
+  }
+}
+
+fn sql_validate_source_rows<I>(source: SqlPlanSource<I>, rows: SqlInputRows) -[Fail<SqlExecutionError<I>>]> nil {
+  let mut row_position: usize = 0
+  for row in rows {
+    sql_validate_row_values(source, source.fields, row.values, row_position, 0)?
+    row_position = row_position + 1
+  }
+  nil
+}
+
+fn sql_validate_inputs<I>(plan: SqlPlan<I>, inputs: SqlInputs<I>) -[Fail<SqlExecutionError<I>>]> nil {
+  let sources = sql_plan_sources(plan)
+  sql_validate_input_positions(sources, inputs)?
+  for source in sources {
+    let rows = sql_input_rows(source, inputs)?
+    sql_validate_source_rows(source, rows)
+  }
+  nil
+}
+
+fn sql_find_bound_row(rows: SqlBoundRows, position: usize) -> Option<SqlInputRow> {
+  match rows {
+    Nil -> None<SqlInputRow>()
+    Cons(SqlBoundRow(candidate, row), rest) -> if candidate == position { Some(row) }
+      else { sql_find_bound_row(rest, position) }
+  }
+}
+
+fn sql_read_column<I>(binding: SqlColumnBinding<I>, row: Option<SqlJoinedRow>) -> SqlValue {
+  match row {
+    None -> panic("SQL checked-plan column has no row")
+    Some(SqlJoinedRow(rows)) -> match sql_find_bound_row(rows, binding.source.position) {
+      None -> panic("SQL checked-plan column source is absent")
+      Some(input) -> match input.values.get(binding.position) {
+        None -> panic("SQL checked-plan column position is absent")
+        Some(value) -> if sql_value_matches(binding.value.description, value) {
+          value
+        } else { panic("SQL input validation and checked column type disagree") }
+      }
+    }
+  }
+}
+
+fn sql_expect_integer(value: SqlValue) -> i64 {
+  match value {
+    SqlIntegerValue(integer) -> integer
+    other -> panic("SQL checked expression did not produce an integer")
+  }
+}
+
+fn sql_expect_string(value: SqlValue) -> str {
+  match value {
+    SqlStringValue(text) -> text
+    other -> panic("SQL checked expression did not produce a string")
+  }
+}
+
+fn sql_expect_boolean(value: SqlValue) -> bool {
+  match value {
+    SqlBooleanValue(boolean) -> boolean
+    other -> panic("SQL checked expression did not produce a boolean")
+  }
+}
+
+fn sql_values_equal(left: SqlValue, right: SqlValue) -> bool {
+  match (left, right) {
+    (SqlIntegerValue(a), SqlIntegerValue(b)) -> a == b
+    (SqlStringValue(a), SqlStringValue(b)) -> a == b
+    (SqlBooleanValue(a), SqlBooleanValue(b)) -> a == b
+    _ -> panic("SQL checked comparison operand types disagree")
+  }
+}
+
+fn sql_values_same(left: SqlValue, right: SqlValue) -> bool {
+  match (left, right) {
+    (SqlIntegerValue(a), SqlIntegerValue(b)) -> a == b
+    (SqlStringValue(a), SqlStringValue(b)) -> a == b
+    (SqlBooleanValue(a), SqlBooleanValue(b)) -> a == b
+    _ -> false
+  }
+}
+
+fn sql_values_compare(left: SqlValue, right: SqlValue) -> Ordering {
+  match (left, right) {
+    (SqlIntegerValue(a), SqlIntegerValue(b)) -> a.compare(b)
+    (SqlStringValue(a), SqlStringValue(b)) -> a.compare(b)
+    (SqlBooleanValue(false), SqlBooleanValue(true)) -> Less
+    (SqlBooleanValue(true), SqlBooleanValue(false)) -> Greater
+    (SqlBooleanValue(_), SqlBooleanValue(_)) -> Equal
+    _ -> panic("SQL checked ordering operand types disagree")
+  }
+}
+
+fn sql_count_rows(rows: SqlJoinedRows) -> i64 {
+  let mut count = 0
+  for row in rows { count = count + 1 }
+  count
+}
+
+fn sql_eval_expression<I>(expression: SqlPlanExpression<I>, row: Option<SqlJoinedRow>, group: SqlJoinedRows) -[Fail<SqlExecutionError<I>>]> SqlValue {
+  match expression {
+    SqlPlanColumn(binding) -> sql_read_column(binding, row)
+    SqlPlanIntegerLiteral(value, ty, span) -> SqlIntegerValue(value)
+    SqlPlanStringLiteral(value, ty, span) -> SqlStringValue(value)
+    SqlPlanBooleanLiteral(value, ty, span) -> SqlBooleanValue(value)
+    SqlPlanScalarExpression(op, left, right, ty) -> match op {
+      SqlConcat -> {
+        let left_value = sql_expect_string(sql_eval_expression(left, row, group))
+        let right_value = sql_expect_string(sql_eval_expression(right, row, group))
+        SqlStringValue(left_value.concat(right_value))
+      }
+      _ -> {
+        let left_value = sql_expect_integer(sql_eval_expression(left, row, group))
+        let right_value = sql_expect_integer(sql_eval_expression(right, row, group))
+        match op {
+          SqlAdd -> SqlIntegerValue(left_value + right_value)
+          SqlSubtract -> SqlIntegerValue(left_value - right_value)
+          SqlMultiply -> SqlIntegerValue(left_value * right_value)
+          SqlDivide -> if right_value == 0 {
+            Fail<SqlExecutionError<I>>.fail(SqlDivisionByZero(sql_checked_expression_span(right)))
+          } else { SqlIntegerValue(left_value / right_value) }
+          SqlConcat -> panic("SQL checked concatenation reached integer evaluation")
+        }
+      }
+    }
+    SqlPlanComparisonExpression(op, left, right, ty) -> {
+      let left_value = sql_eval_expression(left, row, group)
+      let right_value = sql_eval_expression(right, row, group)
+      match op {
+        SqlEqual -> SqlBooleanValue(sql_values_equal(left_value, right_value))
+        SqlNotEqual -> SqlBooleanValue(not sql_values_equal(left_value, right_value))
+        _ -> {
+          let left_integer = sql_expect_integer(left_value)
+          let right_integer = sql_expect_integer(right_value)
+          let answer = match op {
+            SqlLess -> left_integer < right_integer
+            SqlLessEqual -> left_integer <= right_integer
+            SqlGreater -> left_integer > right_integer
+            SqlGreaterEqual -> left_integer >= right_integer
+            _ -> false
+          }
+          SqlBooleanValue(answer)
+        }
+      }
+    }
+    SqlPlanLogicalExpression(op, left, right, ty) -> {
+      let left_value = sql_expect_boolean(sql_eval_expression(left, row, group))
+      match op {
+        SqlAnd -> if not left_value { SqlBooleanValue(false) }
+          else { SqlBooleanValue(sql_expect_boolean(sql_eval_expression(right, row, group))) }
+        SqlOr -> if left_value { SqlBooleanValue(true) }
+          else { SqlBooleanValue(sql_expect_boolean(sql_eval_expression(right, row, group))) }
+      }
+    }
+    SqlPlanAggregateExpression(kind, argument, ty, span) -> sql_eval_aggregate(kind, argument, group, span)
+  }
+}
+
+fn sql_eval_aggregate<I>(kind: SqlAggregateKind, argument: Option<SqlPlanExpression<I>>, group: SqlJoinedRows, span: Span) -[Fail<SqlExecutionError<I>>]> SqlValue {
+  match kind {
+    SqlCount -> match argument {
+      None -> SqlIntegerValue(sql_count_rows(group))
+      Some(expression) -> {
+        let mut count = 0
+        for row in group {
+          sql_eval_expression(expression, Some(row), Nil<SqlJoinedRow>())
+          count = count + 1
+        }
+        SqlIntegerValue(count)
+      }
+    }
+    SqlSum -> match argument {
+      None -> Fail<SqlExecutionError<I>>.fail(SqlAggregateEmpty(kind, span))
+      Some(expression) -> {
+        let mut total = 0
+        let mut seen = false
+        for row in group {
+          total = total + sql_expect_integer(sql_eval_expression(expression, Some(row), Nil<SqlJoinedRow>()))
+          seen = true
+        }
+        if seen { SqlIntegerValue(total) }
+        else { Fail<SqlExecutionError<I>>.fail(SqlAggregateEmpty(kind, span)) }
+      }
+    }
+    _ -> match argument {
+      None -> Fail<SqlExecutionError<I>>.fail(SqlAggregateEmpty(kind, span))
+      Some(expression) -> {
+        let mut selected: Option<SqlValue> = None<SqlValue>()
+        for row in group {
+          let candidate = sql_eval_expression(expression, Some(row), Nil<SqlJoinedRow>())
+          selected = match selected {
+            None -> Some(candidate)
+            Some(current) -> {
+              let ordering = sql_values_compare(candidate, current)
+              let replace = match kind {
+                SqlMin -> match ordering { Less -> true, _ -> false }
+                SqlMax -> match ordering { Greater -> true, _ -> false }
+                _ -> false
+              }
+              if replace { Some(candidate) } else { Some(current) }
+            }
+          }
+        }
+        match selected {
+          Some(value) -> value
+          None -> Fail<SqlExecutionError<I>>.fail(SqlAggregateEmpty(kind, span))
+        }
+      }
+    }
+  }
+}
+
+fn sql_base_rows<I>(source: SqlPlanSource<I>, inputs: SqlInputs<I>) -[Fail<SqlExecutionError<I>>]> SqlJoinedRows {
+  let rows = sql_input_rows(source, inputs)?
+  let mut result = Nil<SqlJoinedRow>()
+  for row in rows {
+    result = Cons(SqlJoinedRow(Cons(SqlBoundRow(source.position, row), Nil<SqlBoundRow>())), result)
+  }
+  result.reverse()
+}
+
+fn sql_apply_join<I>(current: SqlJoinedRows, join: SqlPlanJoin<I>, inputs: SqlInputs<I>) -[Fail<SqlExecutionError<I>>]> SqlJoinedRows {
+  let joined_rows = sql_input_rows(join.source, inputs)?
+  let mut result = Nil<SqlJoinedRow>()
+  for existing in current {
+    for joined in joined_rows {
+      let combined = match existing {
+        SqlJoinedRow(rows) -> SqlJoinedRow(rows.append(SqlBoundRow(join.source.position, joined)))
+      }
+      let accepted = sql_expect_boolean(sql_eval_expression(join.predicate, Some(combined), Nil<SqlJoinedRow>()))
+      if accepted { result = Cons(combined, result) } else { nil }
+    }
+  }
+  result.reverse()
+}
+
+fn sql_apply_joins<I>(rows: SqlJoinedRows, joins: SqlPlanJoins<I>, inputs: SqlInputs<I>) -[Fail<SqlExecutionError<I>>]> SqlJoinedRows {
+  let mut result = rows
+  for join in joins { result = sql_apply_join(result, join, inputs) }
+  result
+}
+
+fn sql_apply_predicate<I>(rows: SqlJoinedRows, predicate: Option<SqlPlanExpression<I>>) -[Fail<SqlExecutionError<I>>]> SqlJoinedRows {
+  match predicate {
+    None -> rows
+    Some(expression) -> {
+      let mut result = Nil<SqlJoinedRow>()
+      for row in rows {
+        if sql_expect_boolean(sql_eval_expression(expression, Some(row), Nil<SqlJoinedRow>())) {
+          result = Cons(row, result)
+        } else { nil }
+      }
+      result.reverse()
+    }
+  }
+}
+
+fn sql_expression_has_aggregate<I>(expression: SqlPlanExpression<I>) -> bool {
+  match expression {
+    SqlPlanScalarExpression(op, left, right, ty) -> sql_expression_has_aggregate(left) or sql_expression_has_aggregate(right)
+    SqlPlanComparisonExpression(op, left, right, ty) -> sql_expression_has_aggregate(left) or sql_expression_has_aggregate(right)
+    SqlPlanLogicalExpression(op, left, right, ty) -> sql_expression_has_aggregate(left) or sql_expression_has_aggregate(right)
+    SqlPlanAggregateExpression(kind, argument, ty, span) -> true
+    _ -> false
+  }
+}
+
+fn sql_selection_has_aggregate<I>(selection: SqlPlanSelection<I>) -> bool {
+  match selection {
+    SqlPlanSelectAll(source) -> false
+    SqlPlanSelect(items) -> {
+      let mut found = false
+      for item in items {
+        if sql_expression_has_aggregate(item.expression) { found = true } else { nil }
+      }
+      found
+    }
+  }
+}
+
+fn sql_order_has_aggregate<I>(items: SqlPlanOrders<I>) -> bool {
+  let mut found = false
+  for item in items {
+    if sql_expression_has_aggregate(item.expression) { found = true } else { nil }
+  }
+  found
+}
+
+fn sql_plan_is_grouped<I>(plan: SqlPlan<I>) -> bool {
+  not plan.groups().is_empty() or sql_selection_has_aggregate(plan.selection()) or
+    (match plan.having() { Some(expression) -> sql_expression_has_aggregate(expression), None -> false }) or
+    sql_order_has_aggregate(plan.order())
+}
+
+fn sql_eval_expression_list<I>(expressions: SqlPlanExpressions<I>, row: Option<SqlJoinedRow>, group: SqlJoinedRows) -[Fail<SqlExecutionError<I>>]> SqlValues {
+  let mut result = Nil<SqlValue>()
+  for expression in expressions { result = Cons(sql_eval_expression(expression, row, group), result) }
+  result.reverse()
+}
+
+fn sql_value_lists_same(left: SqlValues, right: SqlValues) -> bool {
+  match (left, right) {
+    (Nil, Nil) -> true
+    (Cons(a, ar), Cons(b, br)) -> sql_values_same(a, b) and sql_value_lists_same(ar, br)
+    _ -> false
+  }
+}
+
+fn sql_add_group_row(buckets: SqlGroupBuckets, keys: SqlValues, row: SqlJoinedRow) -> SqlGroupBuckets {
+  match buckets {
+    Nil -> Cons(SqlGroupBucket(keys, Cons(row, Nil<SqlJoinedRow>())), Nil<SqlGroupBucket>())
+    Cons(SqlGroupBucket(existing_keys, rows), rest) -> if sql_value_lists_same(existing_keys, keys) {
+      Cons(SqlGroupBucket(existing_keys, rows.append(row)), rest)
+    } else {
+      Cons(SqlGroupBucket(existing_keys, rows), sql_add_group_row(rest, keys, row))
+    }
+  }
+}
+
+fn sql_group_rows<I>(plan: SqlPlan<I>, rows: SqlJoinedRows) -[Fail<SqlExecutionError<I>>]> SqlGroupBuckets {
+  if not sql_plan_is_grouped(plan) {
+    let mut buckets = Nil<SqlGroupBucket>()
+    for row in rows { buckets = Cons(SqlGroupBucket(Nil<SqlValue>(), Cons(row, Nil<SqlJoinedRow>())), buckets) }
+    buckets.reverse()
+  } else { if plan.groups().is_empty() {
+    Cons(SqlGroupBucket(Nil<SqlValue>(), rows), Nil<SqlGroupBucket>())
+  } else {
+    let mut buckets = Nil<SqlGroupBucket>()
+    for row in rows {
+      let keys = sql_eval_expression_list(plan.groups(), Some(row), Nil<SqlJoinedRow>())
+      buckets = sql_add_group_row(buckets, keys, row)
+    }
+    buckets
+  } }
+}
+
+fn sql_group_representative(rows: SqlJoinedRows) -> Option<SqlJoinedRow> {
+  match rows { Nil -> None<SqlJoinedRow>(), Cons(row, rest) -> Some(row) }
+}
+
+fn sql_apply_having<I>(buckets: SqlGroupBuckets, having: Option<SqlPlanExpression<I>>) -[Fail<SqlExecutionError<I>>]> SqlGroupBuckets {
+  match having {
+    None -> buckets
+    Some(expression) -> {
+      let mut result = Nil<SqlGroupBucket>()
+      for bucket in buckets {
+        match bucket {
+          SqlGroupBucket(keys, rows) -> if sql_expect_boolean(sql_eval_expression(expression, sql_group_representative(rows), rows)) {
+            result = Cons(bucket, result)
+          } else { nil }
+        }
+      }
+      result.reverse()
+    }
+  }
+}
+
+fn sql_primary_input_row<I>(source: SqlPlanSource<I>, row: Option<SqlJoinedRow>) -> SqlInputRow {
+  match row {
+    None -> panic("SQL checked star projection has no row")
+    Some(SqlJoinedRow(rows)) -> match sql_find_bound_row(rows, source.position) {
+      Some(input) -> input
+      None -> panic("SQL checked star projection source is absent")
+    }
+  }
+}
+
+fn sql_project_selection<I>(selection: SqlPlanSelection<I>, row: Option<SqlJoinedRow>, group: SqlJoinedRows) -[Fail<SqlExecutionError<I>>]> SqlOutputRow {
+  match selection {
+    SqlPlanSelectAll(source) -> SqlOutputSourceRow(sql_primary_input_row(source, row))
+    SqlPlanSelect(items) -> {
+      let mut values = Nil<SqlValue>()
+      for item in items { values = Cons(sql_eval_expression(item.expression, row, group), values) }
+      SqlOutputRecordRow(values.reverse())
+    }
+  }
+}
+
+fn sql_project_buckets<I>(plan: SqlPlan<I>, buckets: SqlGroupBuckets) -[Fail<SqlExecutionError<I>>]> SqlProjectedEntries {
+  let mut result = Nil<SqlProjectedEntry>()
+  for bucket in buckets {
+    match bucket {
+      SqlGroupBucket(keys, rows) -> {
+        let representative = sql_group_representative(rows)
+        let output = sql_project_selection(plan.selection(), representative, rows)
+        let mut order_values = Nil<SqlValue>()
+        for ordering in plan.order() {
+          order_values = Cons(sql_eval_expression(ordering.expression, representative, rows), order_values)
+        }
+        result = Cons(SqlProjectedEntry(output, order_values.reverse()), result)
+      }
+    }
+  }
+  result.reverse()
+}
+
+fn sql_input_fields_same(left: SqlValues, right: SqlValues) -> bool {
+  sql_value_lists_same(left, right)
+}
+
+fn sql_output_rows_same(left: SqlOutputRow, right: SqlOutputRow) -> bool {
+  match (left, right) {
+    (SqlOutputSourceRow(a), SqlOutputSourceRow(b)) -> sql_input_fields_same(a.values, b.values)
+    (SqlOutputRecordRow(a), SqlOutputRecordRow(b)) -> sql_value_lists_same(a, b)
+    _ -> false
+  }
+}
+
+fn sql_projected_contains(rows: SqlProjectedEntries, candidate: SqlOutputRow) -> bool {
+  match rows {
+    Nil -> false
+    Cons(SqlProjectedEntry(row, order), rest) -> sql_output_rows_same(row, candidate) or sql_projected_contains(rest, candidate)
+  }
+}
+
+fn sql_apply_distinct(rows: SqlProjectedEntries, distinct: bool) -> SqlProjectedEntries {
+  if not distinct { rows }
+  else {
+    let mut result = Nil<SqlProjectedEntry>()
+    for entry in rows {
+      match entry {
+        SqlProjectedEntry(row, order) -> if not sql_projected_contains(result, row) {
+          result = result.append(entry)
+        } else { nil }
+      }
+    }
+    result
+  }
+}
+
+fn sql_reverse_ordering(value: Ordering) -> Ordering {
+  match value { Less -> Greater, Equal -> Equal, Greater -> Less }
+}
+
+fn sql_compare_order_keys<I>(order: SqlPlanOrders<I>, left: SqlValues, right: SqlValues) -> Ordering {
+  match (order, left, right) {
+    (Nil, Nil, Nil) -> Equal
+    (Cons(item, order_rest), Cons(a, left_rest), Cons(b, right_rest)) -> {
+      let compared = sql_values_compare(a, b)
+      let directed = match item.direction { SqlAscending -> compared, SqlDescending -> sql_reverse_ordering(compared) }
+      match directed {
+        Equal -> sql_compare_order_keys(order_rest, left_rest, right_rest)
+        other -> other
+      }
+    }
+    _ -> panic("SQL checked ordering keys and values disagree")
+  }
+}
+
+fn sql_insert_ordered<I>(entry: SqlProjectedEntry, rows: SqlProjectedEntries, order: SqlPlanOrders<I>) -[Fail<SqlExecutionError<I>>]> SqlProjectedEntries {
+  match rows {
+    Nil -> Cons(entry, Nil<SqlProjectedEntry>())
+    Cons(head, rest) -> match (entry, head) {
+      (SqlProjectedEntry(entry_row, entry_keys), SqlProjectedEntry(head_row, head_keys)) -> {
+        let compared = sql_compare_order_keys(order, entry_keys, head_keys)
+        match compared {
+          Less -> Cons(entry, rows)
+          _ -> Cons(head, sql_insert_ordered(entry, rest, order))
+        }
+      }
+    }
+  }
+}
+
+fn sql_sort_projected<I>(rows: SqlProjectedEntries, order: SqlPlanOrders<I>) -[Fail<SqlExecutionError<I>>]> SqlProjectedEntries {
+  if order.is_empty() { rows }
+  else {
+    let mut result = Nil<SqlProjectedEntry>()
+    for row in rows { result = sql_insert_ordered(row, result, order) }
+    result
+  }
+}
+
+fn sql_paging_value<I>(expression: Option<SqlPlanExpression<I>>, kind: SqlPageKind) -[Fail<SqlExecutionError<I>>]> Option<i64> {
+  match expression {
+    None -> None<i64>()
+    Some(value) -> {
+      let count = sql_expect_integer(sql_eval_expression(value, None<SqlJoinedRow>(), Nil<SqlJoinedRow>()))
+      if count < 0 { Fail<SqlExecutionError<I>>.fail(SqlPagingNegative(kind, count)) }
+      else { Some(count) }
+    }
+  }
+}
+
+fn sql_drop_projected(rows: SqlProjectedEntries, count: i64) -> SqlProjectedEntries {
+  let mut result = rows
+  let mut remaining = count
+  while remaining > 0 {
+    match result {
+      Nil -> { remaining = 0 }
+      Cons(head, rest) -> { result = rest; remaining = remaining - 1 }
+    }
+  }
+  result
+}
+
+fn sql_take_projected(rows: SqlProjectedEntries, count: i64) -> SqlProjectedEntries {
+  let mut result = Nil<SqlProjectedEntry>()
+  let mut current = rows
+  let mut remaining = count
+  while remaining > 0 {
+    match current {
+      Nil -> { remaining = 0 }
+      Cons(head, rest) -> {
+        result = Cons(head, result)
+        current = rest
+        remaining = remaining - 1
+      }
+    }
+  }
+  result.reverse()
+}
+
+fn sql_apply_paging<I>(rows: SqlProjectedEntries, limit: Option<SqlPlanExpression<I>>, offset: Option<SqlPlanExpression<I>>) -[Fail<SqlExecutionError<I>>]> SqlProjectedEntries {
+  let offset_count = sql_paging_value(offset, SqlOffsetPage)
+  let limit_count = sql_paging_value(limit, SqlLimitPage)
+  let after_offset = match offset_count { Some(count) -> sql_drop_projected(rows, count), None -> rows }
+  match limit_count {
+    Some(count) -> sql_take_projected(after_offset, count)
+    None -> after_offset
+  }
+}
+
+fn sql_projected_rows(entries: SqlProjectedEntries) -> SqlOutputRows {
+  let mut result = Nil<SqlOutputRow>()
+  for entry in entries {
+    match entry { SqlProjectedEntry(row, order) -> { result = Cons(row, result) } }
+  }
+  result.reverse()
+}
+
+fn sql_run<I>(plan: SqlPlan<I>, inputs: SqlInputs<I>) -[Fail<SqlExecutionError<I>>]> SqlExecution {
+  sql_validate_inputs(plan, inputs)
+  let primary = sql_base_rows(plan.source(), inputs)
+  let joined = sql_apply_joins(primary, plan.joins(), inputs)
+  let filtered = sql_apply_predicate(joined, plan.predicate())
+  let grouped = sql_group_rows(plan, filtered)
+  let accepted = sql_apply_having(grouped, plan.having())
+  let projected = sql_project_buckets(plan, accepted)
+  let distinct = sql_apply_distinct(projected, plan.is_distinct())
+  let ordered = sql_sort_projected(distinct, plan.order())
+  let paged = sql_apply_paging(ordered, plan.limit(), plan.offset())
+  SqlExecution { output: plan.output(), rows: sql_projected_rows(paged) }
+}
+
+--- Execute a checked plan over ordered in-memory relations without effects.
+---
+--- Input rows are validated against the ordered fields retained in the plan.
+--- Inner joins, predicates, grouping, aggregates, stable ordering, distinctness
+--- and paging all preserve deterministic observation order. Under the plan's
+--- null-rejecting policy, `count` over an empty group is zero while `sum`,
+--- `min`, and `max` return `SqlAggregateEmpty` rather than inventing null.
+pub fn run<I>(plan: SqlPlan<I>, inputs: SqlInputs<I>) -> SqlExecutionResult<I> {
+  fail.run<SqlExecution, SqlExecutionError<I>>(() => sql_run(plan, inputs))
+}
