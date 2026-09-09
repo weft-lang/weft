@@ -4,6 +4,23 @@ default: test
 test:
     bash run_tests.sh
 
+# Test the converged candidate without installing it as the trust root.
+# Repository-private fixtures require checkout SDK selection, which depends on
+# the executable being invoked from the checkout rather than from /tmp.
+test-candidate: bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    candidate=$(mktemp "$PWD/.weft-test-candidate-XXXXXX")
+    trap 'rm -f "$candidate"' EXIT
+    cp /tmp/weft_b2 "$candidate"
+    chmod +x "$candidate"
+    identity=$("$candidate" version --json)
+    if [[ "$identity" != *'"sdk":{"kind":"checkout"'* ]]; then
+        echo "candidate test gate: expected checkout SDK selection: $identity" >&2
+        exit 1
+    fi
+    WEFT="$candidate" bash run_tests.sh
+
 # Type-check the compiler tree (no codegen)
 check:
     ./weft check compiler/main.weft
