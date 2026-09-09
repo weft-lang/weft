@@ -708,6 +708,7 @@ stdlib_doc_modules=(
   stdlib/eq.weft stdlib/hash.weft stdlib/ord.weft stdlib/panic.weft
   stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft
   stdlib/maybe.weft stdlib/bytes.weft stdlib/source.weft stdlib/typecheck.weft stdlib/grammar.weft stdlib/lower.weft
+  stdlib/comptime.weft stdlib/comptime/types.weft stdlib/comptime/file_observer.weft
   stdlib/grammar/sql.weft stdlib/grammar/sql/syntax.weft stdlib/grammar/sql/plan.weft stdlib/grammar/sql/check.weft stdlib/grammar/sql/execute.weft
   stdlib/grammar/einsum.weft stdlib/grammar/einsum/syntax.weft stdlib/grammar/einsum/plan.weft stdlib/grammar/einsum/check.weft stdlib/grammar/einsum/execute.weft
   stdlib/string.weft stdlib/string/builder.weft stdlib/path.weft stdlib/io/types.weft
@@ -1048,6 +1049,18 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_lower_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
     assert_contains "doc_stdlib_lower_generic_capability" "$(<"$tmp_out")" "pub effect Lower<S, P> {"
     assert_contains "doc_stdlib_lower_request" "$(<"$tmp_out")" "pub fn lower<S, P>(source: S) -[Lower<S, P>]> P"
+  elif [ "$stdlib_doc_name" = "comptime" ]; then
+    assert_contains "doc_stdlib_comptime_public_contract" "$(<"$tmp_out")" "Public API items: 9. Documented: 9."
+    assert_contains "doc_stdlib_comptime_named_evaluation" "$(<"$tmp_out")" "pub type ComptimeEvaluation<T> {"
+    assert_contains "doc_stdlib_comptime_named_observation" "$(<"$tmp_out")" "pub type ComptimeFileObservation {"
+    assert_contains "doc_stdlib_comptime_file_effect" "$(<"$tmp_out")" "pub fn observe_file_reads<T, E>(body: () -[FileRead, E]> T) -[FileRead, E]> ComptimeEvaluation<T>"
+  elif [ "$stdlib_doc_name" = "comptime/types" ]; then
+    assert_contains "doc_stdlib_comptime_types_public_contract" "$(<"$tmp_out")" "Public API items: 8. Documented: 8."
+    assert_contains "doc_stdlib_comptime_types_outcome" "$(<"$tmp_out")" "outcome: Result<Bytes, IoError>"
+  elif [ "$stdlib_doc_name" = "comptime/file_observer" ]; then
+    assert_contains "doc_stdlib_comptime_observer_public_contract" "$(<"$tmp_out")" "Public API items: 4. Documented: 4."
+    assert_contains "doc_stdlib_comptime_observer_named_state" "$(<"$tmp_out")" "pub type FileObserver {"
+    assert_contains "doc_stdlib_comptime_observer_snapshot" "$(<"$tmp_out")" "pub fn observations(observer: FileObserver) -> ComptimeFileObservations"
   elif [ "$stdlib_doc_name" = "grammar/sql" ]; then
     assert_contains "doc_stdlib_grammar_sql_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
     assert_contains "doc_stdlib_grammar_sql_parser" "$(<"$tmp_out")" "pub fn grammar() -> SqlGrammar"
