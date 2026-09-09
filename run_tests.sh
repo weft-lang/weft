@@ -243,6 +243,7 @@ run_markdown_phase() {
 }
 
 run_bootstrap_phase() {
+  python3 test/test_bootstrap_sdk.py || return 1
   local tmpw1
   local tmpw2
   local tmpw3
@@ -272,6 +273,9 @@ run_bootstrap_phase() {
       bootstrap_ok=0
       echo "  ✗ bootstrap stage 3 failed"
     fi
+  fi
+  if [ "$bootstrap_ok" -eq 1 ] && ! bash tools/verify_bootstrap_sdk.sh "$tmpw1" "$tmpw2" "$tmpw3"; then
+    bootstrap_ok=0
   fi
   if [ "$bootstrap_ok" -eq 1 ] && diff <(xxd "$tmpw2") <(xxd "$tmpw3") > /dev/null 2>&1; then
     echo "  ✓ weft2 == weft3 (byte-identical)"

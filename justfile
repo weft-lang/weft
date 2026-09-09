@@ -24,6 +24,7 @@ bootstrap:
     /tmp/weft_b2 build compiler/main.weft -o /tmp/weft_b3 --embed-sdk .
     chmod +x /tmp/weft_b3
     echo "=== Gate check ==="
+    bash tools/verify_bootstrap_sdk.sh /tmp/weft_b1 /tmp/weft_b2 /tmp/weft_b3
     if diff <(xxd /tmp/weft_b2) <(xxd /tmp/weft_b3) > /dev/null; then
         echo "✓ weft2 == weft3 (byte-identical)"
         if cmp -s /tmp/weft_b2 ./weft; then
@@ -59,7 +60,7 @@ counters:
     set -e
     bin=$(mktemp /tmp/weft_counters_XXXXXX)
     trap 'rm -f "$bin"' EXIT
-    ./weft build compiler/main.weft -o "$bin"
+    ./weft build compiler/main.weft -o "$bin" --embed-sdk .
     chmod +x "$bin"
     echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"use compiler/main.{*}"}}}' | "$bin" mcp
     echo ""
@@ -74,7 +75,7 @@ rc-census:
     instrumented=$(mktemp /tmp/weft_rc_census_XXXXXX)
     output=$(mktemp /tmp/weft_rc_census_output_XXXXXX)
     trap 'rm -f "$live" "$instrumented" "$output"' EXIT
-    ./weft build compiler/main.weft -o "$live"
+    ./weft build compiler/main.weft -o "$live" --embed-sdk .
     chmod +x "$live"
     "$live" compile --rc-census compiler/main.weft > "$instrumented"
     chmod +x "$instrumented"
