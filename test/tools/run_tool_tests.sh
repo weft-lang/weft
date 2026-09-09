@@ -1350,7 +1350,7 @@ assert_equals "doc_extra_arg_exits_usage" "$doc_extra_arg_exit" "2"
 assert_contains "doc_extra_arg_prints_usage" "$(<"$tmp_err")" "usage: weft doc PATH"
 
 version_out=$("$WEFT" --version 2> "$tmp_err")
-assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 3; targets macos-aarch64,linux-aarch64; sdk checkout .)"
+assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 4; targets macos-aarch64,linux-aarch64; sdk checkout .)"
 assert_equals "version_human_stderr_empty" "$(<"$tmp_err")" ""
 version_json=$("$WEFT" version --json 2> "$tmp_err")
 assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":4,"targets":["macos-aarch64","linux-aarch64"],"sdk":{"kind":"checkout","root":"."}}'
