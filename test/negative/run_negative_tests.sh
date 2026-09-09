@@ -62,6 +62,8 @@ check_rejects grammar_parse_requires_diagnose test/negative/grammar_parse_requir
 check_rejects grammar_impl_extra_effect test/negative/grammar_impl_extra_effect.weft 'impl method effect mismatch' 1
 check_rejects grammar_result_wrong_syntax test/negative/grammar_result_wrong_syntax.weft 'error[E1002]:' 1
 check_rejects grammar_raw_source_requires_trust test/negative/grammar_raw_source_requires_trust.weft 'Unsafe is sealed to trusted runtime/platform code' 1
+check_rejects checked_grammar_impl_effect_identity test/negative/checked_grammar_impl_effect_identity.weft 'impl method effect mismatch' 1
+check_rejects checked_grammar_requires_host_effect test/negative/checked_grammar_requires_host_effect.weft 'error[E2001]: effect `TypeCheck<G.Identity>` is not available in this context' 1
 
 check_rejects module_stray_brace test/negative/module_stray_brace.weft 'error[E0002]: expected a module declaration' 1
 check_rejects module_stray_paren test/negative/module_stray_paren.weft 'error[E0002]: expected a module declaration' 1
@@ -844,6 +846,20 @@ check_rejects "alias_fixed_effect_unhandled" "test/negative/alias_fixed_effect_u
 check_rejects "alias_trait_complement" "test/negative/alias_trait_complement.weft" "trait complement is not a surface type"
 check_rejects "alias_qualified_trait_complement" "test/negative/alias_qualified_trait_complement.weft" "trait complement is not a surface type"
 check_rejects "alias_no_constructor" "test/negative/alias_no_constructor.weft" "unknown function 'Count'"
+check_rejects "record_explicit_payload_mismatch" "test/negative/record_explicit_payload_mismatch.weft" "error[E1002]"
+check_rejects "record_inferred_payload_conflict" "test/negative/record_inferred_payload_conflict.weft" "error[E1002]"
+check_rejects "record_missing_type_argument" "test/negative/record_missing_type_argument.weft" "error[E1008]: record constructor expects 2 type arguments, found 1"
+check_rejects "record_excess_type_arguments" "test/negative/record_excess_type_arguments.weft" "error[E1008]: record constructor expects 1 type arguments, found 2"
+check_rejects "record_nongeneric_type_arguments" "test/negative/record_nongeneric_type_arguments.weft" "error[E1008]: record constructor expects 0 type arguments, found 1"
+check_rejects "record_unresolved_phantom_argument" "test/negative/record_unresolved_phantom_argument.weft" "error[E1008]: record constructor cannot infer all 1 type arguments"
+check_rejects "record_generic_missing_field" "test/negative/record_generic_missing_field.weft" "missing record field"
+check_rejects "record_generic_unknown_field" "test/negative/record_generic_unknown_field.weft" "unknown record field"
+check_rejects "record_generic_duplicate_field" "test/negative/record_generic_duplicate_field.weft" "duplicate record field"
+check_rejects "record_generic_unsatisfied_bound" "test/negative/record_generic_unsatisfied_bound.weft" "error[E1004]"
+check_rejects "record_inferred_unsatisfied_bound" "test/negative/record_inferred_unsatisfied_bound.weft" "error[E1004]"
+check_rejects "record_explicit_context_mismatch" "test/negative/record_explicit_context_mismatch.weft" "error[E1002]"
+check_rejects "record_generic_alias_constructor" "test/negative/record_generic_alias_constructor.weft" "not a record type"
+check_rejects "record_generic_opaque_constructor" "test/negative/record_generic_opaque_constructor.weft" "not a record type"
 check_rejects "alias_no_record_constructor" "test/negative/alias_no_record_constructor.weft" "type error"
 check_rejects "alias_opaque_no_conversion" "test/negative/alias_opaque_no_conversion.weft" "error[E1002]"
 check_rejects "alias_imported_opaque_no_constructor" "test/negative/alias_imported_opaque_no_constructor.weft" "opaque"
@@ -1369,6 +1385,11 @@ check_rejects "slice_reassign_borrow" "test/negative/slice_reassign_borrow.weft"
 check_rejects "effect_type_args_arity" "test/negative/effect_type_args_arity.weft" "type error: effect type argument count mismatch"
 check_rejects "effect_generic_bare_use" "test/negative/effect_generic_bare_use.weft" "type error: effect type argument count mismatch"
 check_rejects "effect_type_args_wrong_count" "test/negative/effect_type_args_wrong_count.weft" "type error: effect type argument count mismatch"
+check_rejects "callback_generic_call_residual_effect" "test/negative/callback_generic_call_residual_effect.weft" 'error[E2001]: effect `Compare<i64>` is not available in this context'
+check_rejects "callback_generic_method_residual_effect" "test/negative/callback_generic_method_residual_effect.weft" 'error[E2001]: effect `Compare<i64>` is not available in this context'
+check_rejects "callback_generic_call_requires_effect" "test/negative/callback_generic_call_requires_effect.weft" 'error[E2001]: effect `Compare<str>` is not available in this context'
+check_rejects "callback_generic_call_payload_mismatch" "test/negative/callback_generic_call_payload_mismatch.weft" 'error[E1002]'
+check_rejects "callback_typed_reference_residual_effect" "test/negative/callback_typed_reference_residual_effect.weft" 'error[E2001]: effect `Compare<i64>` is not available in this context'
 check_rejects "effect_instantiation_mismatch" "test/negative/effect_instantiation_mismatch.weft" 'error[E2001]: effect `Box<str>` is not available in this context'
 check_rejects "effect_try_instantiation_mismatch" "test/negative/effect_try_instantiation_mismatch.weft" "error[E2001]:"
 check_rejects "effect_unqualified_perform_ambiguous" "test/negative/effect_unqualified_perform_ambiguous.weft" "type error: ambiguous effect atom; qualify the operation"

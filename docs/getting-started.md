@@ -210,6 +210,36 @@ ownership and cleanup rules. Use an opaque type for a distinct identity, or a
 variant when runtime matching requires a tag. Recursive aliases are rejected;
 recursive records and variants keep their existing rules.
 
+## Constructing generic records
+
+Record constructors infer their type arguments from fields or an expected
+record type. Write the arguments explicitly when the choice matters:
+
+```weft
+type Packet<T> { value: T, sequence: i64 }
+type Marker<T> { sequence: i64 }
+
+fn packet<T>(value: T) -> Packet<T> {
+  Packet { value: value, sequence: 1 }
+}
+
+test "generic records infer and preserve their argument types" {
+  let inferred = packet(42)
+  let explicit = Packet<str> { value: "ready", sequence: 2 }
+  let marker: Marker<str> = Marker { sequence: 3 }
+  Test.assert_eq(inferred.value, 42)
+  Test.assert_str_eq(explicit.value, "ready")
+  Test.assert_eq(marker.sequence, 3)
+}
+```
+
+Qualified constructors use the same syntax: `messages.Packet<str> { ... }`.
+Fields can be written in any order. The compiler checks every field against
+the applied record type, including trait bounds and ownership requirements.
+A parameter absent from the fields needs explicit arguments or an expected
+type, as `Marker<str>` does here. `E1008` identifies incomplete or incorrectly
+counted record arguments.
+
 ## Equality
 
 `==` and `!=` use value equality. Numbers, booleans, nil and text have built-in

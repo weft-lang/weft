@@ -1,0 +1,262 @@
+use compiler/host_type_checking as host_types
+use compiler/host_type_checking.{HostTypeIdentity}
+use compiler/parse.{parse_module_local}
+use compiler/lex.{lex}
+use compiler/pipeline.{pipeline_check_loaded_declarations}
+use compiler/type_registry.{ttable_new, ttable_register_source}
+use stdlib/typecheck.{*}
+use stdlib/semantic_type.{*}
+use stdlib/diagnostic.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option.{Option, Some, None}
+use stdlib/result.{Result, Ok, Err}
+use stdlib/state as state
+use stdlib/grammar.{ParseResult, Parsed, Recovered, Rejected, CheckResult, Checked, CheckRejected}
+use stdlib/grammar/sql/plan.{SqlOutputShape, SqlOutputRecord}
+use stdlib/source.{Source}
+use compiler/grammar_registry.{*}
+
+fn host_discard_diagnostics<R, E>(body: () -[Diagnose, E]> R) -[E]> R {
+  handle body() {
+    Diagnose.report(diagnostic) -> resume(0)
+    Diagnose.error(message, position) -> resume(0)
+    Diagnose.warn(message, position) -> resume(0)
+    Diagnose.note(message, position) -> resume(0)
+  }
+}
+
+fn host_query_table(source: str) -> (i64, i64) {
+  let table = ttable_new()
+  let buffer = __str_ptr(source)
+  ttable_register_source(table, buffer, __str_len(source), 0, 0)
+  let (_, errors) = state.run(0, () => handle {
+    let functions = parse_module_local(lex(buffer, __str_len(source)), buffer, table)
+    pipeline_check_loaded_declarations(functions, buffer, table)
+  } {
+    Diagnose.report(diagnostic) -> {
+      match diagnostic.severity() {
+        DiagnosticSeverityError -> { state.modify((count: i64) => count + 1); nil }
+        _ -> nil
+      }
+      resume(0)
+    }
+    Diagnose.error(message, position) -> { state.modify((count: i64) => count + 1); resume(0) }
+    Diagnose.warn(message, position) -> resume(0)
+    Diagnose.note(message, position) -> resume(0)
+  })
+  (table, errors)
+}
+
+fn host_type_name<I>(name: str) -> TypeName<I> {
+  TypeName { qualifier: None<str>(), name: name, arguments: Nil<I>() }
+}
+
+fn host_resolve<I>(name: str) -[TypeCheck<I>]> Result<ResolvedType<I>, TypeQueryError> {
+  TypeCheck<I>.resolve(host_type_name<I>(name))
+}
+
+fn host_description_is_primitive(description: SemanticTypeFact, expected: str) -> bool {
+  match description {
+    SemanticTypePrimitive(name) -> name == expected
+    _ -> false
+  }
+}
+
+test "compiler host queries expose structured primitive and nominal facts" {
+  let source = "type Row { value: i64 }"
+  let (table, errors) = host_query_table(source)
+  Test.assert_eq(errors, 0)
+  host_types.run(table, __str_ptr(source), () => {
+    match host_resolve<HostTypeIdentity>("i64") {
+      Ok(integer) -> Test.assert_true(host_description_is_primitive(integer.description, "i64"))
+      Err(_) -> Test.assert_true(false)
+    }
+    match host_resolve<HostTypeIdentity>("Row") {
+      Ok(row) -> Test.assert_true(match row.description {
+        SemanticTypeNamed(name, SemanticTypeFactListNil) -> name == "Row"
+        _ -> false
+      })
+      Err(_) -> Test.assert_true(false)
+    }
+    0
+  })
+}
+
+test "compiler host queries substitute generic record fields" {
+  let source = "type Box<T> { value: T }"
+  let (table, errors) = host_query_table(source)
+  Test.assert_eq(errors, 0)
+  host_types.run(table, __str_ptr(source), () => {
+    match host_resolve<HostTypeIdentity>("str") {
+      Err(_) -> Test.assert_true(false)
+      Ok(text) -> {
+        let request = TypeName {
+          qualifier: None<str>(),
+          name: "Box",
+          arguments: Cons(text.identity, Nil<HostTypeIdentity>())
+        }
+        match TypeCheck<HostTypeIdentity>.resolve(request) {
+          Err(_) -> Test.assert_true(false)
+          Ok(box) -> match TypeCheck<HostTypeIdentity>.field(box.identity, NamedTypeField("value")) {
+            Ok(value) -> Test.assert_true(host_description_is_primitive(value.description, "str"))
+            Err(_) -> Test.assert_true(false)
+          }
+        }
+      }
+    }
+    0
+  })
+}
+
+test "compiler host queries inspect aliases and tuple positions" {
+  let source = "type Row = { value: i64 } type Pair = (i64, str)"
+  let (table, errors) = host_query_table(source)
+  Test.assert_eq(errors, 0)
+  host_types.run(table, __str_ptr(source), () => {
+    match host_resolve<HostTypeIdentity>("Row") {
+      Ok(row) -> match TypeCheck<HostTypeIdentity>.field(row.identity, NamedTypeField("value")) {
+        Ok(value) -> Test.assert_true(host_description_is_primitive(value.description, "i64"))
+        Err(_) -> Test.assert_true(false)
+      }
+      Err(_) -> Test.assert_true(false)
+    }
+    match host_resolve<HostTypeIdentity>("Pair") {
+      Ok(pair) -> match TypeCheck<HostTypeIdentity>.field(pair.identity, PositionalTypeField(1)) {
+        Ok(value) -> Test.assert_true(host_description_is_primitive(value.description, "str"))
+        Err(_) -> Test.assert_true(false)
+      }
+      Err(_) -> Test.assert_true(false)
+    }
+    0
+  })
+}
+
+test "compiler host queries enumerate named and positional fields in source order" {
+  let source = "type Row { second: str, first: i64 } type Pair = (i64, str)"
+  let (table, errors) = host_query_table(source)
+  Test.assert_eq(errors, 0)
+  host_types.run(table, __str_ptr(source), () => {
+    let row = host_resolve<HostTypeIdentity>("Row").unwrap()
+    Test.assert_true(match TypeCheck<HostTypeIdentity>.fields(row.identity) {
+      Ok(Cons(second, Cons(first, Nil))) ->
+        match second.selector { NamedTypeField(name) -> name == "second", _ -> false } and
+        match first.selector { NamedTypeField(name) -> name == "first", _ -> false } and
+        host_description_is_primitive(second.value.description, "str") and
+        host_description_is_primitive(first.value.description, "i64")
+      _ -> false
+    })
+    let pair = host_resolve<HostTypeIdentity>("Pair").unwrap()
+    Test.assert_true(match TypeCheck<HostTypeIdentity>.fields(pair.identity) {
+      Ok(Cons(left, Cons(right, Nil))) ->
+        match left.selector { PositionalTypeField(position) -> position == 0, _ -> false } and
+        match right.selector { PositionalTypeField(position) -> position == 1, _ -> false } and
+        host_description_is_primitive(left.value.description, "i64") and
+        host_description_is_primitive(right.value.description, "str")
+      _ -> false
+    })
+    0
+  })
+}
+
+test "compiler host subtype answers distinguish false from query failure" {
+  let source = "fn value() -> i64 { 0 }"
+  let (table, errors) = host_query_table(source)
+  Test.assert_eq(errors, 0)
+  host_types.run(table, __str_ptr(source), () => {
+    let integer = host_resolve<HostTypeIdentity>("i64").unwrap()
+    let top = host_resolve<HostTypeIdentity>("any").unwrap()
+    let text = host_resolve<HostTypeIdentity>("str").unwrap()
+    Test.assert_true(match TypeCheck<HostTypeIdentity>.subtype(integer.identity, top.identity) { Ok(answer) -> answer, _ -> false })
+    Test.assert_true(match TypeCheck<HostTypeIdentity>.subtype(integer.identity, text.identity) { Ok(answer) -> not answer, _ -> false })
+    0
+  })
+}
+
+test "compiler host queries return typed lookup failures" {
+  let source = "type Box<T> { value: T }"
+  let (table, errors) = host_query_table(source)
+  Test.assert_eq(errors, 0)
+  host_types.run(table, __str_ptr(source), () => {
+    Test.assert_true(match host_resolve<HostTypeIdentity>("Missing") { Err(TypeNotFound) -> true, _ -> false })
+    let box = host_resolve<HostTypeIdentity>("Box")
+    Test.assert_true(match box { Err(TypeArgumentCount(expected, actual)) -> expected == 1 and actual == 0, _ -> false })
+    let integer = host_resolve<HostTypeIdentity>("i64").unwrap()
+    Test.assert_true(match TypeCheck<HostTypeIdentity>.field(integer.identity, NamedTypeField("missing")) { Err(TypeFieldNotFound) -> true, _ -> false })
+    0
+  })
+}
+
+test "compiler host rejects identities from another handler scope" {
+  let source = "type Row { value: i64 }"
+  let (table, errors) = host_query_table(source)
+  Test.assert_eq(errors, 0)
+  let foreign = host_types.run(table, __str_ptr(source), () => host_resolve<HostTypeIdentity>("Row").unwrap().identity)
+  host_types.run(table, __str_ptr(source), () => {
+    Test.assert_true(match TypeCheck<HostTypeIdentity>.field(foreign, NamedTypeField("value")) {
+      Err(ForeignTypeIdentity) -> true
+      _ -> false
+    })
+    0
+  })
+}
+
+fn retained_host_description() -> SemanticTypeFact {
+  let source = "type RetainedRow { value: i64 }".concat("")
+  let (table, errors) = host_query_table(source)
+  host_types.run(table, __str_ptr(source), () => host_resolve<HostTypeIdentity>("RetainedRow").unwrap().description)
+}
+
+test "resolved descriptions outlive their checker handler" {
+  let description = retained_host_description()
+  Test.assert_true(match description {
+    SemanticTypeNamed(name, SemanticTypeFactListNil) -> name == "RetainedRow"
+    _ -> false
+  })
+}
+
+test "compiler host reports rejected generic constraints as structured data" {
+  let source = "trait Comparable { fn compare(self, other: Self) -> bool } type Row { value: i64 } type OnlyComparable<T: Comparable> { value: T }"
+  let (table, errors) = host_query_table(source)
+  Test.assert_eq(errors, 0)
+  host_types.run(table, __str_ptr(source), () => {
+    let row = host_resolve<HostTypeIdentity>("Row").unwrap()
+    let request = TypeName {
+      qualifier: None<str>(),
+      name: "OnlyComparable",
+      arguments: Cons(row.identity, Nil<HostTypeIdentity>())
+    }
+    Test.assert_true(match TypeCheck<HostTypeIdentity>.resolve(request) {
+      Err(TypeArgumentsRejected(Cons(TypeArgumentTraitRequired(position, actual, required), Nil))) ->
+        position == 0 and
+        match actual { SemanticTypeNamed(name, _) -> name == "Row", _ -> false } and
+        match required { SemanticTypeQualifiedTrait(_, name) -> name == "Comparable", SemanticTypeTrait(name) -> name == "Comparable", _ -> false }
+      _ -> false
+    })
+    0
+  })
+}
+
+test "first-party SQL registry checks a typed plan against the real compiler host" {
+  let host_source = "type invoices { total: i64, memo: str, paid: bool }"
+  let (table, errors) = host_query_table(host_source)
+  Test.assert_eq(errors, 0)
+  let query_source = Source { text: "select memo from invoices where paid order by total", identity: DiagnosticSourceNamed("invoice.sql") }
+  let parsed = host_discard_diagnostics(() => grammar_module_parse_syntax(grammar_module_mini_sql(), query_source.all()))
+  match parsed {
+    Parsed(syntax) -> {
+      let result = host_discard_diagnostics(() => host_types.run(table, __str_ptr(host_source), () =>
+        grammar_module_check_plan<HostTypeIdentity>(grammar_module_mini_sql(), syntax)
+      ))
+      Test.assert_true(match result {
+        Checked(GrammarModuleSqlPlan(plan)) -> match plan.output {
+          SqlOutputRecord(Cons(field, Nil)) ->
+            match field.name { Some(name) -> name == "memo", None -> false } and
+            match field.value { SemanticTypePrimitive(name) -> name == "str", _ -> false }
+          _ -> false
+        }
+        CheckRejected -> false
+      })
+    }
+    _ -> Test.assert_true(false)
+  }
+}

@@ -1,9 +1,6 @@
 -- stdlib/grammar/sql.weft -- the first-party embedded SQL grammar module
---
--- This is intentionally not full SQL. It is the first non-Weft Grammar
--- implementation: SELECT projections FROM table with an optional WHERE.
 
-use compiler/grammar.{*}
+use compiler/grammar as compiler_grammar
 use compiler/diagnose.{*}
 use compiler/lib.{*}
 use compiler/parse.{*}
@@ -11,11 +8,33 @@ use compiler/typecheck_effect.{*}
 use compiler/types.{*}
 use runtime/alloc.{*}
 use runtime/memory.{*}
-use stdlib/diagnostic/schema.{Diagnose}
+use stdlib/diagnostic as diagnostic
+use stdlib/diagnostic/schema.{*}
+use stdlib/grammar as public_grammar
+use stdlib/grammar.{Parsed, Recovered, Rejected}
+use stdlib/grammar/sql/syntax.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/num
+use stdlib/option.{Option, Some, None}
+use stdlib/result
+use stdlib/source.{Source, Span}
+use stdlib/state as state
+use stdlib/state.{State}
 
-pub type SqlGrammar { SqlGrammar }
+--- The first-party SQL parser producing retained, grammar-owned syntax.
+pub type SqlGrammar {
+  --- Construct the stateless SQL parser value.
+  SqlGrammar
+}
 
+--- Construct the first-party SQL parser.
 pub fn grammar() -> SqlGrammar { SqlGrammar() }
+
+-- Transitional raw parser/checker value for compiler-owned compatibility
+-- tests and registry adapters. It is not part of the public grammar surface.
+pub(package) type LegacySqlGrammar { LegacySqlGrammar }
+
+pub(package) fn legacy_grammar() -> LegacySqlGrammar { LegacySqlGrammar() }
 
 pub(package) fn mini_sql_query_tag() -> i64 { 701 }
 pub(package) fn mini_sql_ident_tag() -> i64 { 702 }
@@ -3145,7 +3164,236 @@ pub(package) fn mini_sql_check_ast_host(query: i64, src: i64, tt: i64) -[TypeChe
   mini_sql_check_ast_host_at(query, src, tt, 0)
 }
 
-impl Grammar for SqlGrammar {
+fn sql_syntax_range(root: Span, start: i64, length: i64) -> Span {
+  let first = start.to_usize_checked().unwrap_or(0)
+  let width = length.to_usize_checked().unwrap_or(0)
+  match root.subspan(first, first + width) {
+    Some(span) -> span
+    None -> root.subspan(0, 0).unwrap()
+  }
+}
+
+fn sql_syntax_identifier(root: Span, node: i64) -> SqlIdentifier {
+  let span = sql_syntax_range(root, mini_sql_ident_start(node), mini_sql_ident_len(node))
+  SqlIdentifier { text: span.text().unwrap_or(""), span: span }
+}
+
+fn sql_syntax_optional_identifier(root: Span, node: i64) -> Option<SqlIdentifier> {
+  if node == 0 { None<SqlIdentifier>() }
+  else { Some(sql_syntax_identifier(root, node)) }
+}
+
+fn sql_syntax_scalar_operator(op: i64) -> SqlScalarOperator {
+  match op {
+    1 -> SqlAdd
+    2 -> SqlSubtract
+    3 -> SqlMultiply
+    4 -> SqlDivide
+    _ -> SqlConcat
+  }
+}
+
+fn sql_syntax_comparison_operator(op: i64) -> SqlComparisonOperator {
+  match op {
+    1 -> SqlEqual
+    2 -> SqlNotEqual
+    3 -> SqlLess
+    4 -> SqlLessEqual
+    5 -> SqlGreater
+    _ -> SqlGreaterEqual
+  }
+}
+
+fn sql_syntax_logical_operator(op: i64) -> SqlLogicalOperator {
+  if op == mini_sql_logic_and() { SqlAnd } else { SqlOr }
+}
+
+fn sql_syntax_aggregate_kind(kind: i64) -> SqlAggregateKind {
+  match kind {
+    1 -> SqlCount
+    2 -> SqlSum
+    3 -> SqlMin
+    _ -> SqlMax
+  }
+}
+
+fn sql_syntax_aggregate_name_len(kind: i64) -> i64 {
+  if kind == mini_sql_agg_count() { 5 } else { 3 }
+}
+
+fn sql_syntax_expression(root: Span, node: i64) -> SqlExpression {
+  if node == 0 { SqlInvalidExpression(sql_syntax_range(root, 0, 0)) }
+  else {
+    match node_tag(node) {
+      702 -> SqlColumn(sql_syntax_identifier(root, node))
+      703 -> SqlComparisonExpression(
+        sql_syntax_comparison_operator(node_f3(node)),
+        sql_syntax_expression(root, node_f1(node)),
+        sql_syntax_expression(root, node_f2(node))
+      )
+      704 -> {
+        let span = sql_syntax_range(root, node_f1(node), node_f2(node))
+        match node_f3(node) {
+          1 -> SqlIntegerLiteral(node_f4(node), span)
+          2 -> SqlStringLiteral(span.text().unwrap_or(""), span)
+          _ -> SqlBooleanLiteral(node_f4(node) != 0, span)
+        }
+      }
+      706 -> SqlLogicalExpression(
+        sql_syntax_logical_operator(node_f3(node)),
+        sql_syntax_expression(root, node_f1(node)),
+        sql_syntax_expression(root, node_f2(node))
+      )
+      708 -> SqlScalarExpression(
+        sql_syntax_scalar_operator(node_f3(node)),
+        sql_syntax_expression(root, node_f1(node)),
+        sql_syntax_expression(root, node_f2(node))
+      )
+      712 -> {
+        let kind = mini_sql_agg_kind(node)
+        let argument = if mini_sql_agg_star(node) == 1 { None<SqlExpression>() }
+          else { Some(sql_syntax_expression(root, mini_sql_agg_arg(node))) }
+        SqlAggregateExpression(
+          sql_syntax_aggregate_kind(kind),
+          argument,
+          sql_syntax_range(root, mini_sql_agg_start(node), sql_syntax_aggregate_name_len(kind))
+        )
+      }
+      714 -> SqlQualifiedColumn(
+        sql_syntax_identifier(root, mini_sql_qualified_ref_qualifier(node)),
+        sql_syntax_identifier(root, mini_sql_qualified_ref_field(node))
+      )
+      _ -> SqlInvalidExpression(sql_syntax_range(root, 0, 0))
+    }
+  }
+}
+
+fn sql_syntax_expression_list(root: Span, nodes: i64) -> List<SqlExpression> {
+  let mut result: List<SqlExpression> = Nil<SqlExpression>()
+  if nodes != 0 {
+    for i in 0..nlist_len(nodes) {
+      result = Cons(sql_syntax_expression(root, nlist_get(nodes, i)), result)
+    }
+  } else { nil }
+  result.reverse()
+}
+
+fn sql_syntax_projection(root: Span, item: i64) -> SqlProjection {
+  SqlProjection {
+    expression: sql_syntax_expression(root, mini_sql_select_item_expr(item)),
+    alias: sql_syntax_optional_identifier(root, mini_sql_select_item_alias(item))
+  }
+}
+
+fn sql_syntax_selection(root: Span, query: i64) -> SqlSelection {
+  if mini_sql_query_star(query) == 1 { SqlSelectAll }
+  else {
+    let mut projections: List<SqlProjection> = Nil<SqlProjection>()
+    for i in 0..mini_sql_query_column_count(query) {
+      projections = Cons(sql_syntax_projection(root, mini_sql_query_select_item(query, i)), projections)
+    }
+    SqlSelect(projections.reverse())
+  }
+}
+
+fn sql_syntax_source(root: Span, table: i64, alias: i64) -> SqlSource {
+  SqlSource {
+    table: sql_syntax_optional_identifier(root, table),
+    alias: sql_syntax_optional_identifier(root, alias)
+  }
+}
+
+fn sql_syntax_joins(root: Span, query: i64) -> List<SqlJoinClause> {
+  let mut joins: List<SqlJoinClause> = Nil<SqlJoinClause>()
+  for i in 0..mini_sql_query_join_count(query) {
+    let join = mini_sql_query_join(query, i)
+    joins = Cons(SqlJoinClause {
+      source: sql_syntax_source(root, mini_sql_join_table_node(join), mini_sql_join_table_alias(join)),
+      predicate: sql_syntax_expression(root, mini_sql_join_on_node(join))
+    }, joins)
+  }
+  joins.reverse()
+}
+
+fn sql_syntax_order(root: Span, query: i64) -> List<SqlOrder> {
+  let mut items: List<SqlOrder> = Nil<SqlOrder>()
+  let mut i = mini_sql_query_order_count(query)
+  while i > 0 {
+    i = i - 1
+    let item = mini_sql_query_order_item(query, i)
+    let expression = sql_syntax_expression(root, mini_sql_order_item_expr(item))
+    let direction = if mini_sql_order_item_dir(item) == mini_sql_order_desc() { SqlDescending } else { SqlAscending }
+    items = Cons(SqlOrder {
+      expression: expression,
+      direction: direction
+    }, items)
+  }
+  items
+}
+
+fn sql_syntax_optional_expression(root: Span, node: i64) -> Option<SqlExpression> {
+  if node == 0 { None<SqlExpression>() } else { Some(sql_syntax_expression(root, node)) }
+}
+
+fn sql_syntax_query(root: Span, query: i64) -> SqlQuery {
+  SqlQuery {
+    distinct: mini_sql_query_distinct(query) == 1,
+    selection: sql_syntax_selection(root, query),
+    source: sql_syntax_source(root, mini_sql_query_table_node(query), mini_sql_query_table_alias(query)),
+    joins: sql_syntax_joins(root, query),
+    predicate: sql_syntax_optional_expression(root, if query == 0 { 0 } else { node_f3(query) }),
+    groups: sql_syntax_expression_list(root, mini_sql_query_group_items(query)),
+    having: sql_syntax_optional_expression(root, mini_sql_query_having_node(query)),
+    order: sql_syntax_order(root, query),
+    limit: sql_syntax_optional_expression(root, mini_sql_query_limit_expr(query)),
+    offset: sql_syntax_optional_expression(root, mini_sql_query_offset_expr(query))
+  }
+}
+
+fn sql_parse_report(root: Span, severity: DiagnosticSeverity, message: str, position: i64) -[Diagnose]> nil {
+  let source = root.source()
+  let limit = __str_len(source.text)
+  let bounded = if position < 0 { 0 } else { if position > limit { limit } else { position } }
+  let start = bounded.to_usize_checked().unwrap()
+  let end = if bounded < limit { (bounded + 1).to_usize_checked().unwrap() } else { start }
+  Diagnose.report(diagnostic.uncoded(severity, DiagnosticClassGrammar, message, DiagnosticSourceRange(source.identity, start, end)))
+  nil
+}
+
+impl public_grammar.Grammar for SqlGrammar {
+  type Syntax = SqlSyntax
+
+  fn parse(self, source: Span) -[Diagnose]> public_grammar.ParseResult<SqlSyntax> {
+    let root = source.source()
+    let first = source.start().to_u64().to_i64_checked().unwrap()
+    let length = source.len().to_u64().to_i64_checked().unwrap()
+    let (query, failed) = state.run(false, () => handle mini_sql_parse_source_at(__str_ptr(root.text) + first, length, 0, first) {
+      Diagnose.report(item) -> {
+        match item.severity() { DiagnosticSeverityError -> State.put(true), _ -> nil }
+        Diagnose.report(item)
+        resume(0)
+      }
+      Diagnose.error(message, position) -> {
+        State.put(true)
+        sql_parse_report(source, DiagnosticSeverityError, message, position)
+        resume(0)
+      }
+      Diagnose.warn(message, position) -> {
+        sql_parse_report(source, DiagnosticSeverityWarning, message, position)
+        resume(0)
+      }
+      Diagnose.note(message, position) -> {
+        sql_parse_report(source, DiagnosticSeverityNote, message, position)
+        resume(0)
+      }
+    })
+    let syntax = SqlSyntax { query: sql_syntax_query(source, query), span: source }
+    if query == 0 { Rejected<SqlSyntax>() }
+    else { if failed { Recovered(syntax) } else { Parsed(syntax) } }
+  }
+}
+
+impl compiler_grammar.Grammar for LegacySqlGrammar {
   fn lex(self: i64, source: i64, source_len: i64) -> i64 {
     mini_sql_tokens_new(source_len)
   }
@@ -3159,7 +3407,7 @@ impl Grammar for SqlGrammar {
   }
 }
 
-impl TypedGrammar for SqlGrammar {
+impl compiler_grammar.TypedGrammar for LegacySqlGrammar {
   fn check(self: i64, fns: i64, source: i64, tt: i64) -[TypeCheck, Diagnose]> i64 {
     mini_sql_check_ast_host(fns, source, tt)
   }

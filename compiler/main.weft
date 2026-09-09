@@ -12,6 +12,7 @@ use compiler/formatter.{*}
 use compiler/typeck.{*}
 use compiler/grammar.{*}
 use compiler/grammar_registry.{*}
+use compiler/host_type_checking as host_types
 use compiler/incremental.{*}
 use compiler/ir.{*}
 use compiler/lib.{*}
@@ -57,6 +58,8 @@ use stdlib/json.{*}
 use stdlib/list.{List, Nil, Cons}
 use stdlib/result.{Err, Ok, Result}
 use stdlib/option.{Option}
+use stdlib/source.{Source}
+use stdlib/grammar.{ParseResult, Parsed, Recovered, Rejected, CheckResult, Checked, CheckRejected}
 use stdlib/string.{str_concat, str_contains, str_eq, str_split}
 use stdlib/vector as vector
 use stdlib/vector.{vector_get_in_bounds, vector_len, vector_push, vector_set}
@@ -5739,6 +5742,16 @@ fn mcp_parse_grammar_module_quiet(module_id: i64, src: i64, n: i64, tt: i64) -> 
   }
 }
 
+fn mcp_parse_grammar_module_syntax_quiet(module_id: i64, src: i64, n: i64) -> ParseResult<GrammarModuleSyntax> {
+  let source = Source { text: runtime_str_from_bytes_copy(src, n), identity: DiagnosticSourceBuffer(src) }
+  handle grammar_module_parse_syntax(module_id, source.all()) {
+    Diagnose.report(diagnostic) -> resume(0)
+    Diagnose.error(msg, span) -> resume(0)
+    Diagnose.warn(msg, span) -> resume(0)
+    Diagnose.note(msg, span) -> resume(0)
+  }
+}
+
 fn mcp_check_grammar_module_quiet(module_id: i64, ast: i64, src: i64, tt: i64) -> i64 {
   handle grammar_module_check_catalog(module_id, ast, src, tt) {
     Diagnose.report(diagnostic) -> resume(0)
@@ -5782,6 +5795,27 @@ fn mcp_check_grammar_module_host_quiet(module_id: i64, ast: i64, src: i64, host_
   }
 }
 
+fn mcp_check_grammar_module_host_plan_quiet(module_id: i64, syntax: GrammarModuleSyntax, host_src: i64, host_n: i64) -[SourceAcquire]> i64 {
+  let host_tt = mcp_host_type_table_quiet(host_src, host_n)
+  let errors = main_alloc_bytes(8)
+  mem_store64_at(errors, 0, 0)
+  handle host_types.run(host_tt, host_src, () =>
+    grammar_module_check_plan<host_types.HostTypeIdentity>(module_id, syntax)
+  ) {
+    Diagnose.report(report) -> {
+      match report.severity() {
+        DiagnosticSeverityError -> mem_store64_at(errors, 0, mem_load64_at(errors, 0) + 1)
+        _ -> 0
+      }
+      resume(0)
+    }
+    Diagnose.error(msg, span) -> { mem_store64_at(errors, 0, mem_load64_at(errors, 0) + 1); resume(0) }
+    Diagnose.warn(msg, span) -> resume(0)
+    Diagnose.note(msg, span) -> resume(0)
+  }
+  mem_load64_at(errors, 0)
+}
+
 fn mcp_emit_grammar_module_table(b: i64, module_id: i64, src: i64, ast: i64) -> i64 {
   let table = grammar_module_table_node(module_id, ast)
   if table == 0 {
@@ -5809,12 +5843,41 @@ fn mcp_emit_grammar_module_summary_fields(b: i64, module_id: i64, src: i64, ast:
   mcp_write_i(b, grammar_module_has_where(module_id, ast))
 }
 
+fn mcp_emit_grammar_module_syntax_summary_fields(b: i64, module_id: i64, syntax: GrammarModuleSyntax) -> i64 {
+  mcp_write(b, ",\"grammar\":\"")
+  mcp_write(b, grammar_module_name(module_id))
+  mcp_write(b, "\",\"root_tag\":")
+  mcp_write_i(b, grammar_module_syntax_root_tag(module_id, syntax))
+  mcp_write(b, ",\"columns\":")
+  mcp_write_i(b, grammar_module_syntax_column_count(module_id, syntax))
+  mcp_write(b, ",\"star\":")
+  mcp_write_i(b, grammar_module_syntax_star(module_id, syntax))
+  if grammar_module_syntax_distinct(module_id, syntax) == 1 {
+    mcp_write(b, ",\"distinct\":1")
+  } else { 0 }
+  mcp_write(b, ",\"table\":")
+  match grammar_module_syntax_table(module_id, syntax) {
+    Some(table) -> mcp_write_json_str(b, table)
+    None -> mcp_write(b, "null")
+  }
+  mcp_write(b, ",\"where\":")
+  mcp_write_i(b, grammar_module_syntax_has_where(module_id, syntax))
+}
+
 fn mcp_emit_grammar_parse(b: i64, src: i64, n: i64, module_id: i64) -> i64 {
-  let tt = ttable_new()
-  let ast = mcp_parse_grammar_module_quiet(module_id, src, n, tt)
-  mcp_begin_result(b, "grammar_parse")
-  mcp_emit_grammar_module_summary_fields(b, module_id, src, ast)
-  mcp_end_result(b)
+  match mcp_parse_grammar_module_syntax_quiet(module_id, src, n) {
+    Parsed(syntax) -> {
+      mcp_begin_result(b, "grammar_parse")
+      mcp_emit_grammar_module_syntax_summary_fields(b, module_id, syntax)
+      mcp_end_result(b)
+    }
+    Recovered(syntax) -> {
+      mcp_begin_result(b, "grammar_parse")
+      mcp_emit_grammar_module_syntax_summary_fields(b, module_id, syntax)
+      mcp_end_result(b)
+    }
+    Rejected -> mcp_emit_error(b, 0 - 32602, "grammar rejected source")
+  }
 }
 
 fn mcp_emit_grammar_check(b: i64, src: i64, n: i64, module_id: i64) -> i64 {
@@ -5829,14 +5892,23 @@ fn mcp_emit_grammar_check(b: i64, src: i64, n: i64, module_id: i64) -> i64 {
 }
 
 fn mcp_emit_grammar_check_with_host(b: i64, src: i64, n: i64, module_id: i64, host_src: i64, host_n: i64) -[SourceAcquire]> i64 {
-  let tt = ttable_new()
-  let ast = mcp_parse_grammar_module_quiet(module_id, src, n, tt)
-  let check_errors = mcp_check_grammar_module_host_quiet(module_id, ast, src, host_src, host_n)
-  mcp_begin_result(b, "grammar_check")
-  mcp_emit_grammar_module_summary_fields(b, module_id, src, ast)
-  mcp_write(b, ",\"check_errors\":")
-  mcp_write_i(b, check_errors)
-  mcp_end_result(b)
+  match mcp_parse_grammar_module_syntax_quiet(module_id, src, n) {
+    Parsed(syntax) -> {
+      let check_errors = mcp_check_grammar_module_host_plan_quiet(module_id, syntax, host_src, host_n)
+      mcp_begin_result(b, "grammar_check")
+      mcp_emit_grammar_module_syntax_summary_fields(b, module_id, syntax)
+      mcp_write(b, ",\"check_errors\":")
+      mcp_write_i(b, check_errors)
+      mcp_end_result(b)
+    }
+    Recovered(syntax) -> {
+      mcp_begin_result(b, "grammar_check")
+      mcp_emit_grammar_module_syntax_summary_fields(b, module_id, syntax)
+      mcp_write(b, ",\"check_errors\":0")
+      mcp_end_result(b)
+    }
+    Rejected -> mcp_emit_error(b, 0 - 32602, "grammar rejected source")
+  }
 }
 
 fn mcp_emit_grammar_diagnostics(b: i64, src: i64, n: i64, module_id: i64, host_src: i64, host_n: i64) -[SourceAcquire]> i64 {
@@ -8687,7 +8759,7 @@ fn test_assertions_mask_expr(expr: Expr, src: i64) -> i64 {
     IndexedGet(base, index, element_ty, fixed_len) -> test_mask_merge(test_assertions_mask_expr(base, src), test_assertions_mask_expr(index, src))
     IndexedSlice(base, start, end, fact) -> test_mask_merge(test_assertions_mask_expr(base, src), test_mask_merge(test_assertions_mask_expr(start, src), test_assertions_mask_expr(end, src)))
     IndexedSet(base, index, value, fact) -> test_mask_merge(test_assertions_mask_expr(base, src), test_mask_merge(test_assertions_mask_expr(index, src), test_assertions_mask_expr(value, src)))
-    RecordInit(type_ns, type_nl, fields) -> test_assertions_mask_record_fields(fields, src)
+    RecordInit(type_ns, type_nl, fields, constructor_type) -> test_assertions_mask_record_fields(fields, src)
     RecordUpdate(base, fields, fact) -> test_mask_merge(test_assertions_mask_expr(base, src), test_assertions_mask_record_fields(fields, src))
     ArrayLiteral(elements, resolved_ty, span) -> test_assertions_mask_expr_list(elements, src)
     Match(scrutinee, arms) -> test_mask_merge(test_assertions_mask_expr(scrutinee, src), test_assertions_mask_match_arms(arms, src))

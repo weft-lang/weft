@@ -1,0 +1,768 @@
+-- Host-independent SQL checking into a typed relational plan.
+
+use stdlib/diagnostic as diagnostic
+use stdlib/diagnostic/schema.{Diagnose, DiagnosticClassType, DiagnosticSeverityError}
+use stdlib/grammar.{CheckedGrammar, CheckResult, Checked, CheckRejected}
+use stdlib/grammar/sql/syntax.{*}
+use stdlib/grammar/sql/plan.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option.{Option, Some, None}
+use stdlib/result.{Result, Ok, Err}
+use stdlib/semantic_type.{*}
+use stdlib/source.{Span}
+use stdlib/typecheck.{*}
+
+--- A reusable SQL checker interpreted by the installed host type handler.
+pub type SqlChecker<I> {
+  --- Construct a stateless checker for identity domain `I`.
+  SqlChecker
+}
+
+--- Construct an SQL checker for one host identity domain.
+pub fn checker<I>() -> SqlChecker<I> { SqlChecker<I>() }
+
+type SqlPrimitiveTypes<I> {
+  SqlPrimitiveTypes(ResolvedType<I>, ResolvedType<I>, ResolvedType<I>)
+}
+
+fn sql_integer_type<I>(primitives: SqlPrimitiveTypes<I>) -> ResolvedType<I> {
+  match primitives { SqlPrimitiveTypes(integer, text, boolean) -> integer }
+}
+
+fn sql_text_type<I>(primitives: SqlPrimitiveTypes<I>) -> ResolvedType<I> {
+  match primitives { SqlPrimitiveTypes(integer, text, boolean) -> text }
+}
+
+fn sql_boolean_type<I>(primitives: SqlPrimitiveTypes<I>) -> ResolvedType<I> {
+  match primitives { SqlPrimitiveTypes(integer, text, boolean) -> boolean }
+}
+
+type SqlExpressionCheck<I> {
+  SqlExpressionChecked(SqlPlanExpression<I>),
+  SqlExpressionRejected
+}
+
+type SqlSourceCheck<I> {
+  SqlSourceChecked(SqlPlanSource<I>),
+  SqlSourceRejected
+}
+
+type SqlColumnLookup<I> {
+  SqlColumnMissing,
+  SqlColumnFound(SqlColumnBinding<I>),
+  SqlColumnAmbiguous,
+  SqlColumnQueryFailed
+}
+
+fn sql_check_error(span: Span, message: str) -[Diagnose]> nil {
+  Diagnose.report(diagnostic.uncoded(DiagnosticSeverityError, DiagnosticClassType, message, span.location()))
+  nil
+}
+
+fn sql_type_name<I>(name: str) -> TypeName<I> {
+  TypeName { qualifier: None<str>(), name: name, arguments: Nil<I>() }
+}
+
+fn sql_resolve_primitive<I>(name: str, span: Span) -[TypeCheck<I>, Diagnose]> Option<ResolvedType<I>> {
+  match TypeCheck<I>.resolve(sql_type_name<I>(name)) {
+    Ok(value) -> Some(value)
+    Err(_) -> {
+      sql_check_error(span, "SQL host does not expose required primitive type")
+      None<ResolvedType<I>>()
+    }
+  }
+}
+
+fn sql_primitive_types<I>(span: Span) -[TypeCheck<I>, Diagnose]> Option<SqlPrimitiveTypes<I>> {
+  let integer = sql_resolve_primitive<I>("i64", span)
+  let text = sql_resolve_primitive<I>("str", span)
+  let boolean = sql_resolve_primitive<I>("bool", span)
+  match (integer, text, boolean) {
+    (Some(i), Some(s), Some(b)) -> Some(SqlPrimitiveTypes(i, s, b))
+    _ -> None<SqlPrimitiveTypes<I>>()
+  }
+}
+
+fn sql_semantic_type_is_nil(value: SemanticTypeFact) -> bool {
+  match value { SemanticTypePrimitive(name) -> name == "nil", _ -> false }
+}
+
+fn sql_semantic_type_is_nullable(value: SemanticTypeFact) -> bool {
+  match value {
+    SemanticTypeUnion(left, right) -> sql_semantic_type_is_nullable(left) or sql_semantic_type_is_nullable(right)
+    other -> sql_semantic_type_is_nil(other)
+  }
+}
+
+fn sql_field_sequence_has_nullable<I>(fields: List<ResolvedField<I>>) -> bool {
+  match fields {
+    Nil -> false
+    Cons(field, rest) -> sql_semantic_type_is_nullable(field.value.description) or sql_field_sequence_has_nullable(rest)
+  }
+}
+
+fn sql_resolve_source<I>(source: SqlSource, position: usize, fallback: Span) -[TypeCheck<I>, Diagnose]> SqlSourceCheck<I> {
+  match source.table {
+    None -> {
+      sql_check_error(fallback, "SQL query requires a table source")
+      SqlSourceRejected<I>()
+    }
+    Some(table) -> match TypeCheck<I>.resolve(sql_type_name<I>(table.text)) {
+      Err(_) -> {
+        sql_check_error(table.span, "SQL table type is not visible in the host scope")
+        SqlSourceRejected<I>()
+      }
+      Ok(row) -> match TypeCheck<I>.fields(row.identity) {
+        Err(_) -> {
+          sql_check_error(table.span, "SQL table type must expose an ordered record shape")
+          SqlSourceRejected<I>()
+        }
+        Ok(fields) -> if sql_field_sequence_has_nullable(fields) {
+          sql_check_error(table.span, "nullable SQL inputs require three-valued null semantics")
+          SqlSourceRejected<I>()
+        } else {
+          SqlSourceChecked(SqlPlanSource {
+            position: position,
+            table: table,
+            alias: source.alias,
+            row: row
+          })
+        }
+      }
+    }
+  }
+}
+
+fn sql_resolve_sources<I>(syntax: SqlSyntax) -[TypeCheck<I>, Diagnose]> Option<List<SqlPlanSource<I>>> {
+  let primary = sql_resolve_source<I>(syntax.query.source, 0, syntax.span)
+  let mut sources: List<SqlPlanSource<I>> = match primary {
+    SqlSourceChecked(source) -> Cons(source, Nil<SqlPlanSource<I>>())
+    SqlSourceRejected -> return None<List<SqlPlanSource<I>>>()
+  }
+  let mut position: usize = 1
+  for join in syntax.query.joins {
+    match sql_resolve_source<I>(join.source, position, syntax.span) {
+      SqlSourceRejected -> return None<List<SqlPlanSource<I>>>()
+      SqlSourceChecked(source) -> { sources = Cons(source, sources); nil }
+    }
+    position = position + 1
+  }
+  Some(sources.reverse())
+}
+
+fn sql_source_qualifier<I>(source: SqlPlanSource<I>) -> str {
+  match source.alias { Some(alias) -> alias.text, None -> source.table.text }
+}
+
+fn sql_find_qualified_source<I>(sources: List<SqlPlanSource<I>>, qualifier: SqlIdentifier) -> Option<SqlPlanSource<I>> {
+  match sources {
+    Nil -> None<SqlPlanSource<I>>()
+    Cons(source, rest) -> if sql_source_qualifier(source) == qualifier.text { Some(source) }
+      else { sql_find_qualified_source(rest, qualifier) }
+  }
+}
+
+fn sql_lookup_qualified_column<I>(sources: List<SqlPlanSource<I>>, qualifier: SqlIdentifier, field: SqlIdentifier) -[TypeCheck<I>, Diagnose]> SqlColumnLookup<I> {
+  match sql_find_qualified_source(sources, qualifier) {
+    None -> {
+      sql_check_error(qualifier.span, "unknown SQL table qualifier")
+      SqlColumnMissing<I>()
+    }
+    Some(source) -> match TypeCheck<I>.field(source.row.identity, NamedTypeField(field.text)) {
+      Ok(value) -> if sql_semantic_type_is_nullable(value.description) {
+        sql_check_error(field.span, "nullable SQL columns require three-valued null semantics")
+        SqlColumnQueryFailed<I>()
+      } else { SqlColumnFound(SqlColumnBinding { source: source, field: field, value: value }) }
+      Err(TypeFieldNotFound) -> {
+        sql_check_error(field.span, "unknown SQL column")
+        SqlColumnMissing<I>()
+      }
+      Err(_) -> {
+        sql_check_error(field.span, "SQL host field query failed")
+        SqlColumnQueryFailed<I>()
+      }
+    }
+  }
+}
+
+fn sql_lookup_unqualified_column_inner<I>(sources: List<SqlPlanSource<I>>, field: SqlIdentifier, found: Option<SqlColumnBinding<I>>, count: i64) -[TypeCheck<I>]> (Option<SqlColumnBinding<I>>, i64, bool) {
+  match sources {
+    Nil -> (found, count, false)
+    Cons(source, rest) -> match TypeCheck<I>.field(source.row.identity, NamedTypeField(field.text)) {
+      Ok(value) -> sql_lookup_unqualified_column_inner(rest, field, Some(SqlColumnBinding { source: source, field: field, value: value }), count + 1)
+      Err(TypeFieldNotFound) -> sql_lookup_unqualified_column_inner(rest, field, found, count)
+      Err(_) -> (found, count, true)
+    }
+  }
+}
+
+fn sql_lookup_unqualified_column<I>(sources: List<SqlPlanSource<I>>, field: SqlIdentifier) -[TypeCheck<I>, Diagnose]> SqlColumnLookup<I> {
+  let (found, count, failed) = sql_lookup_unqualified_column_inner(sources, field, None<SqlColumnBinding<I>>(), 0)
+  if failed {
+    sql_check_error(field.span, "SQL host field query failed")
+    SqlColumnQueryFailed<I>()
+  } else { if count == 0 { SqlColumnMissing<I>() }
+  else { if count > 1 {
+    sql_check_error(field.span, "ambiguous SQL column")
+    SqlColumnAmbiguous<I>()
+  } else {
+    match found {
+      Some(binding) -> if sql_semantic_type_is_nullable(binding.value.description) {
+        sql_check_error(field.span, "nullable SQL columns require three-valued null semantics")
+        SqlColumnQueryFailed<I>()
+      } else { SqlColumnFound(binding) }
+      None -> SqlColumnMissing<I>()
+    }
+  } } }
+}
+
+fn sql_projection_alias_count<I>(projections: List<SqlPlanProjection<I>>, name: str) -> i64 {
+  match projections {
+    Nil -> 0
+    Cons(projection, rest) -> (match projection.alias { Some(alias) -> if alias.text == name { 1 } else { 0 }, None -> 0 }) +
+      sql_projection_alias_count(rest, name)
+  }
+}
+
+fn sql_projection_alias_expression<I>(projections: List<SqlPlanProjection<I>>, name: str) -> Option<SqlPlanExpression<I>> {
+  match projections {
+    Nil -> None<SqlPlanExpression<I>>()
+    Cons(projection, rest) -> match projection.alias {
+      Some(alias) -> if alias.text == name { Some(projection.expression) }
+        else { sql_projection_alias_expression(rest, name) }
+      None -> sql_projection_alias_expression(rest, name)
+    }
+  }
+}
+
+fn sql_plan_expression_type<I>(expression: SqlPlanExpression<I>) -> ResolvedType<I> {
+  match expression {
+    SqlPlanColumn(binding) -> binding.value
+    SqlPlanIntegerLiteral(value, ty, span) -> ty
+    SqlPlanStringLiteral(value, ty, span) -> ty
+    SqlPlanBooleanLiteral(value, ty, span) -> ty
+    SqlPlanScalarExpression(op, left, right, ty) -> ty
+    SqlPlanComparisonExpression(op, left, right, ty) -> ty
+    SqlPlanLogicalExpression(op, left, right, ty) -> ty
+    SqlPlanAggregateExpression(kind, argument, ty, span) -> ty
+  }
+}
+
+fn sql_same_type<I>(left: ResolvedType<I>, right: ResolvedType<I>) -[TypeCheck<I>]> bool {
+  match TypeCheck<I>.subtype(left.identity, right.identity) {
+    Err(_) -> false
+    Ok(forward) -> if not forward { false }
+      else { match TypeCheck<I>.subtype(right.identity, left.identity) { Ok(reverse) -> reverse, Err(_) -> false } }
+  }
+}
+
+fn sql_require_type<I>(actual: ResolvedType<I>, expected: ResolvedType<I>, span: Span, message: str) -[TypeCheck<I>, Diagnose]> bool {
+  if sql_same_type(actual, expected) { true }
+  else { sql_check_error(span, message); false }
+}
+
+fn sql_expression_span(expression: SqlExpression, fallback: Span) -> Span {
+  match expression {
+    SqlColumn(name) -> name.span
+    SqlQualifiedColumn(qualifier, field) -> qualifier.span
+    SqlIntegerLiteral(value, span) -> span
+    SqlStringLiteral(value, span) -> span
+    SqlBooleanLiteral(value, span) -> span
+    SqlScalarExpression(op, left, right) -> sql_expression_span(left, fallback)
+    SqlComparisonExpression(op, left, right) -> sql_expression_span(left, fallback)
+    SqlLogicalExpression(op, left, right) -> sql_expression_span(left, fallback)
+    SqlAggregateExpression(kind, argument, span) -> span
+    SqlInvalidExpression(span) -> span
+  }
+}
+
+fn sql_check_column<I>(field: SqlIdentifier, sources: List<SqlPlanSource<I>>, aliases: List<SqlPlanProjection<I>>, allow_aliases: bool) -[TypeCheck<I>, Diagnose]> SqlExpressionCheck<I> {
+  match sql_lookup_unqualified_column(sources, field) {
+    SqlColumnFound(binding) -> SqlExpressionChecked(SqlPlanColumn(binding))
+    SqlColumnAmbiguous -> SqlExpressionRejected<I>()
+    SqlColumnQueryFailed -> SqlExpressionRejected<I>()
+    SqlColumnMissing -> if allow_aliases {
+      let count = sql_projection_alias_count(aliases, field.text)
+      if count == 1 {
+        match sql_projection_alias_expression(aliases, field.text) {
+          Some(expression) -> SqlExpressionChecked(expression)
+          None -> SqlExpressionRejected<I>()
+        }
+      } else { if count > 1 {
+        sql_check_error(field.span, "ambiguous SQL projection alias")
+        SqlExpressionRejected<I>()
+      } else {
+        sql_check_error(field.span, "unknown SQL column")
+        SqlExpressionRejected<I>()
+      } }
+    } else {
+      sql_check_error(field.span, "unknown SQL column")
+      SqlExpressionRejected<I>()
+    }
+  }
+}
+
+fn sql_check_expression<I>(expression: SqlExpression, sources: List<SqlPlanSource<I>>, aliases: List<SqlPlanProjection<I>>, primitives: SqlPrimitiveTypes<I>, allow_aliases: bool, fallback: Span) -[TypeCheck<I>, Diagnose]> SqlExpressionCheck<I> {
+  match expression {
+    SqlColumn(field) -> sql_check_column(field, sources, aliases, allow_aliases)
+    SqlQualifiedColumn(qualifier, field) -> match sql_lookup_qualified_column(sources, qualifier, field) {
+      SqlColumnFound(binding) -> SqlExpressionChecked(SqlPlanColumn(binding))
+      _ -> SqlExpressionRejected<I>()
+    }
+    SqlIntegerLiteral(value, span) -> SqlExpressionChecked(SqlPlanIntegerLiteral(value, sql_integer_type(primitives), span))
+    SqlStringLiteral(value, span) -> SqlExpressionChecked(SqlPlanStringLiteral(value, sql_text_type(primitives), span))
+    SqlBooleanLiteral(value, span) -> SqlExpressionChecked(SqlPlanBooleanLiteral(value, sql_boolean_type(primitives), span))
+    SqlScalarExpression(op, left, right) -> {
+      let checked_left = sql_check_expression(left, sources, aliases, primitives, allow_aliases, fallback)
+      let checked_right = sql_check_expression(right, sources, aliases, primitives, allow_aliases, fallback)
+      match (checked_left, checked_right) {
+        (SqlExpressionChecked(l), SqlExpressionChecked(r)) -> {
+          let expected = match op { SqlConcat -> sql_text_type(primitives), _ -> sql_integer_type(primitives) }
+          let message = match op { SqlConcat -> "SQL concatenation requires string operands", _ -> "SQL arithmetic requires integer operands" }
+          let left_ok = sql_require_type(sql_plan_expression_type(l), expected, sql_expression_span(left, fallback), message)
+          let right_ok = sql_require_type(sql_plan_expression_type(r), expected, sql_expression_span(right, fallback), message)
+          if left_ok and right_ok { SqlExpressionChecked(SqlPlanScalarExpression(op, l, r, expected)) }
+          else { SqlExpressionRejected<I>() }
+        }
+        _ -> SqlExpressionRejected<I>()
+      }
+    }
+    SqlComparisonExpression(op, left, right) -> {
+      let checked_left = sql_check_expression(left, sources, aliases, primitives, allow_aliases, fallback)
+      let checked_right = sql_check_expression(right, sources, aliases, primitives, allow_aliases, fallback)
+      match (checked_left, checked_right) {
+        (SqlExpressionChecked(l), SqlExpressionChecked(r)) -> {
+          let left_type = sql_plan_expression_type(l)
+          let right_type = sql_plan_expression_type(r)
+          let equality = match op { SqlEqual -> true, SqlNotEqual -> true, _ -> false }
+          let valid = if equality {
+            if sql_same_type(left_type, right_type) { true }
+            else { sql_check_error(sql_expression_span(right, fallback), "SQL comparison operands have different types"); false }
+          } else {
+            let left_ok = sql_require_type(left_type, sql_integer_type(primitives), sql_expression_span(left, fallback), "SQL relational comparison requires integer operands")
+            let right_ok = sql_require_type(right_type, sql_integer_type(primitives), sql_expression_span(right, fallback), "SQL relational comparison requires integer operands")
+            left_ok and right_ok
+          }
+          if valid { SqlExpressionChecked(SqlPlanComparisonExpression(op, l, r, sql_boolean_type(primitives))) }
+          else { SqlExpressionRejected<I>() }
+        }
+        _ -> SqlExpressionRejected<I>()
+      }
+    }
+    SqlLogicalExpression(op, left, right) -> {
+      let checked_left = sql_check_expression(left, sources, aliases, primitives, allow_aliases, fallback)
+      let checked_right = sql_check_expression(right, sources, aliases, primitives, allow_aliases, fallback)
+      match (checked_left, checked_right) {
+        (SqlExpressionChecked(l), SqlExpressionChecked(r)) -> {
+          let left_ok = sql_require_type(sql_plan_expression_type(l), sql_boolean_type(primitives), sql_expression_span(left, fallback), "SQL logical operands must be boolean")
+          let right_ok = sql_require_type(sql_plan_expression_type(r), sql_boolean_type(primitives), sql_expression_span(right, fallback), "SQL logical operands must be boolean")
+          if left_ok and right_ok { SqlExpressionChecked(SqlPlanLogicalExpression(op, l, r, sql_boolean_type(primitives))) }
+          else { SqlExpressionRejected<I>() }
+        }
+        _ -> SqlExpressionRejected<I>()
+      }
+    }
+    SqlAggregateExpression(kind, argument, span) -> match argument {
+      None -> match kind {
+        SqlCount -> SqlExpressionChecked(SqlPlanAggregateExpression(kind, None<SqlPlanExpression<I>>(), sql_integer_type(primitives), span))
+        _ -> { sql_check_error(span, "only count accepts aggregate star"); SqlExpressionRejected<I>() }
+      }
+      Some(value) -> if sql_expression_has_aggregate(value) {
+        sql_check_error(sql_expression_span(value, fallback), "nested SQL aggregates are not supported")
+        SqlExpressionRejected<I>()
+      } else {
+        match sql_check_expression(value, sources, aliases, primitives, allow_aliases, fallback) {
+          SqlExpressionRejected -> SqlExpressionRejected<I>()
+          SqlExpressionChecked(checked) -> {
+            let checked_type = sql_plan_expression_type(checked)
+            match kind {
+              SqlCount -> SqlExpressionChecked(SqlPlanAggregateExpression(kind, Some(checked), sql_integer_type(primitives), span))
+              SqlSum -> if sql_require_type(checked_type, sql_integer_type(primitives), sql_expression_span(value, fallback), "SQL sum requires integer input") {
+                SqlExpressionChecked(SqlPlanAggregateExpression(kind, Some(checked), sql_integer_type(primitives), span))
+              } else { SqlExpressionRejected<I>() }
+              _ -> SqlExpressionChecked(SqlPlanAggregateExpression(kind, Some(checked), checked_type, span))
+            }
+          }
+        }
+      }
+    }
+    SqlInvalidExpression(span) -> {
+      sql_check_error(span, "recovered SQL syntax cannot be checked")
+      SqlExpressionRejected<I>()
+    }
+  }
+}
+
+fn sql_expression_has_aggregate(expression: SqlExpression) -> bool {
+  match expression {
+    SqlScalarExpression(op, left, right) -> sql_expression_has_aggregate(left) or sql_expression_has_aggregate(right)
+    SqlComparisonExpression(op, left, right) -> sql_expression_has_aggregate(left) or sql_expression_has_aggregate(right)
+    SqlLogicalExpression(op, left, right) -> sql_expression_has_aggregate(left) or sql_expression_has_aggregate(right)
+    SqlAggregateExpression(kind, argument, span) -> true
+    _ -> false
+  }
+}
+
+fn sql_plan_has_aggregate<I>(expression: SqlPlanExpression<I>) -> bool {
+  match expression {
+    SqlPlanScalarExpression(op, left, right, ty) -> sql_plan_has_aggregate(left) or sql_plan_has_aggregate(right)
+    SqlPlanComparisonExpression(op, left, right, ty) -> sql_plan_has_aggregate(left) or sql_plan_has_aggregate(right)
+    SqlPlanLogicalExpression(op, left, right, ty) -> sql_plan_has_aggregate(left) or sql_plan_has_aggregate(right)
+    SqlPlanAggregateExpression(kind, argument, ty, span) -> true
+    _ -> false
+  }
+}
+
+fn sql_scalar_operator_same(left: SqlScalarOperator, right: SqlScalarOperator) -> bool {
+  match (left, right) {
+    (SqlAdd, SqlAdd) -> true
+    (SqlSubtract, SqlSubtract) -> true
+    (SqlMultiply, SqlMultiply) -> true
+    (SqlDivide, SqlDivide) -> true
+    (SqlConcat, SqlConcat) -> true
+    _ -> false
+  }
+}
+
+fn sql_comparison_operator_same(left: SqlComparisonOperator, right: SqlComparisonOperator) -> bool {
+  match (left, right) {
+    (SqlEqual, SqlEqual) -> true
+    (SqlNotEqual, SqlNotEqual) -> true
+    (SqlLess, SqlLess) -> true
+    (SqlLessEqual, SqlLessEqual) -> true
+    (SqlGreater, SqlGreater) -> true
+    (SqlGreaterEqual, SqlGreaterEqual) -> true
+    _ -> false
+  }
+}
+
+fn sql_logical_operator_same(left: SqlLogicalOperator, right: SqlLogicalOperator) -> bool {
+  match (left, right) { (SqlAnd, SqlAnd) -> true, (SqlOr, SqlOr) -> true, _ -> false }
+}
+
+fn sql_aggregate_kind_same(left: SqlAggregateKind, right: SqlAggregateKind) -> bool {
+  match (left, right) {
+    (SqlCount, SqlCount) -> true
+    (SqlSum, SqlSum) -> true
+    (SqlMin, SqlMin) -> true
+    (SqlMax, SqlMax) -> true
+    _ -> false
+  }
+}
+
+fn sql_plan_expression_same<I>(left: SqlPlanExpression<I>, right: SqlPlanExpression<I>) -> bool {
+  match (left, right) {
+    (SqlPlanColumn(a), SqlPlanColumn(b)) -> a.source.position == b.source.position and a.field.text == b.field.text
+    (SqlPlanIntegerLiteral(a, at, asp), SqlPlanIntegerLiteral(b, bt, bsp)) -> a == b
+    (SqlPlanStringLiteral(a, at, asp), SqlPlanStringLiteral(b, bt, bsp)) -> a == b
+    (SqlPlanBooleanLiteral(a, at, asp), SqlPlanBooleanLiteral(b, bt, bsp)) -> a == b
+    (SqlPlanScalarExpression(aop, al, ar, at), SqlPlanScalarExpression(bop, bl, br, bt)) ->
+      sql_scalar_operator_same(aop, bop) and sql_plan_expression_same(al, bl) and sql_plan_expression_same(ar, br)
+    (SqlPlanComparisonExpression(aop, al, ar, at), SqlPlanComparisonExpression(bop, bl, br, bt)) ->
+      sql_comparison_operator_same(aop, bop) and sql_plan_expression_same(al, bl) and sql_plan_expression_same(ar, br)
+    (SqlPlanLogicalExpression(aop, al, ar, at), SqlPlanLogicalExpression(bop, bl, br, bt)) ->
+      sql_logical_operator_same(aop, bop) and sql_plan_expression_same(al, bl) and sql_plan_expression_same(ar, br)
+    (SqlPlanAggregateExpression(ak, aa, at, asp), SqlPlanAggregateExpression(bk, ba, bt, bsp)) ->
+      sql_aggregate_kind_same(ak, bk) and match (aa, ba) {
+        (None, None) -> true
+        (Some(av), Some(bv)) -> sql_plan_expression_same(av, bv)
+        _ -> false
+      }
+    _ -> false
+  }
+}
+
+fn sql_plan_matches_group<I>(expression: SqlPlanExpression<I>, groups: List<SqlPlanExpression<I>>) -> bool {
+  match groups {
+    Nil -> false
+    Cons(group, rest) -> sql_plan_expression_same(expression, group) or sql_plan_matches_group(expression, rest)
+  }
+}
+
+fn sql_plan_grouped_ok<I>(expression: SqlPlanExpression<I>, groups: List<SqlPlanExpression<I>>) -> bool {
+  if sql_plan_matches_group(expression, groups) { true }
+  else {
+    match expression {
+      SqlPlanColumn(binding) -> false
+      SqlPlanScalarExpression(op, left, right, ty) -> sql_plan_grouped_ok(left, groups) and sql_plan_grouped_ok(right, groups)
+      SqlPlanComparisonExpression(op, left, right, ty) -> sql_plan_grouped_ok(left, groups) and sql_plan_grouped_ok(right, groups)
+      SqlPlanLogicalExpression(op, left, right, ty) -> sql_plan_grouped_ok(left, groups) and sql_plan_grouped_ok(right, groups)
+      SqlPlanAggregateExpression(kind, argument, ty, span) -> true
+      _ -> true
+    }
+  }
+}
+
+fn sql_check_expression_list<I>(values: List<SqlExpression>, sources: List<SqlPlanSource<I>>, aliases: List<SqlPlanProjection<I>>, primitives: SqlPrimitiveTypes<I>, allow_aliases: bool, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<List<SqlPlanExpression<I>>> {
+  let mut result: List<SqlPlanExpression<I>> = Nil<SqlPlanExpression<I>>()
+  for value in values {
+    match sql_check_expression(value, sources, aliases, primitives, allow_aliases, fallback) {
+      SqlExpressionRejected -> return None<List<SqlPlanExpression<I>>>()
+      SqlExpressionChecked(checked) -> { result = Cons(checked, result); nil }
+    }
+  }
+  Some(result.reverse())
+}
+
+fn sql_check_projections<I>(selection: SqlSelection, sources: List<SqlPlanSource<I>>, primitives: SqlPrimitiveTypes<I>, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<SqlPlanSelection<I>> {
+  match selection {
+    SqlSelectAll -> match sources { Cons(primary, rest) -> Some(SqlPlanSelectAll(primary)), Nil -> None<SqlPlanSelection<I>>() }
+    SqlSelect(items) -> {
+      let mut result: List<SqlPlanProjection<I>> = Nil<SqlPlanProjection<I>>()
+      for item in items {
+        match sql_check_expression(item.expression, sources, Nil<SqlPlanProjection<I>>(), primitives, false, fallback) {
+          SqlExpressionRejected -> return None<SqlPlanSelection<I>>()
+          SqlExpressionChecked(expression) -> {
+            result = Cons(SqlPlanProjection { expression: expression, alias: item.alias }, result)
+            nil
+          }
+        }
+      }
+      Some(SqlPlanSelect(result.reverse()))
+    }
+  }
+}
+
+fn sql_plan_projections<I>(selection: SqlPlanSelection<I>) -> List<SqlPlanProjection<I>> {
+  match selection { SqlPlanSelect(items) -> items, SqlPlanSelectAll(source) -> Nil<SqlPlanProjection<I>>() }
+}
+
+fn sql_check_optional_expression<I>(value: Option<SqlExpression>, sources: List<SqlPlanSource<I>>, aliases: List<SqlPlanProjection<I>>, primitives: SqlPrimitiveTypes<I>, allow_aliases: bool, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<Option<SqlPlanExpression<I>>> {
+  match value {
+    None -> Some(None<SqlPlanExpression<I>>())
+    Some(expression) -> match sql_check_expression(expression, sources, aliases, primitives, allow_aliases, fallback) {
+      SqlExpressionRejected -> None<Option<SqlPlanExpression<I>>>()
+      SqlExpressionChecked(checked) -> Some(Some(checked))
+    }
+  }
+}
+
+fn sql_require_boolean_predicate<I>(value: Option<SqlPlanExpression<I>>, primitives: SqlPrimitiveTypes<I>, source: Option<SqlExpression>, fallback: Span, message: str) -[TypeCheck<I>, Diagnose]> bool {
+  match value {
+    None -> true
+    Some(expression) -> sql_require_type(
+      sql_plan_expression_type(expression),
+      sql_boolean_type(primitives),
+      match source { Some(original) -> sql_expression_span(original, fallback), None -> fallback },
+      message
+    )
+  }
+}
+
+fn sql_plan_projection_has_aggregate<I>(items: List<SqlPlanProjection<I>>) -> bool {
+  match items { Nil -> false, Cons(item, rest) -> sql_plan_has_aggregate(item.expression) or sql_plan_projection_has_aggregate(rest) }
+}
+
+fn sql_plan_expression_list_has_aggregate<I>(items: List<SqlPlanExpression<I>>) -> bool {
+  match items { Nil -> false, Cons(item, rest) -> sql_plan_has_aggregate(item) or sql_plan_expression_list_has_aggregate(rest) }
+}
+
+fn sql_plan_order_has_aggregate<I>(items: List<SqlPlanOrder<I>>) -> bool {
+  match items { Nil -> false, Cons(item, rest) -> sql_plan_has_aggregate(item.expression) or sql_plan_order_has_aggregate(rest) }
+}
+
+fn sql_check_orders<I>(items: List<SqlOrder>, sources: List<SqlPlanSource<I>>, aliases: List<SqlPlanProjection<I>>, primitives: SqlPrimitiveTypes<I>, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<List<SqlPlanOrder<I>>> {
+  let mut result: List<SqlPlanOrder<I>> = Nil<SqlPlanOrder<I>>()
+  for item in items {
+    match sql_check_expression(item.expression, sources, aliases, primitives, true, fallback) {
+      SqlExpressionRejected -> return None<List<SqlPlanOrder<I>>>()
+      SqlExpressionChecked(expression) -> {
+        result = Cons(SqlPlanOrder { expression: expression, direction: item.direction }, result)
+        nil
+      }
+    }
+  }
+  Some(result.reverse())
+}
+
+fn sql_check_joins<I>(items: List<SqlJoinClause>, sources: List<SqlPlanSource<I>>, primitives: SqlPrimitiveTypes<I>, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<List<SqlPlanJoin<I>>> {
+  let mut result: List<SqlPlanJoin<I>> = Nil<SqlPlanJoin<I>>()
+  let mut remaining_sources = match sources { Cons(primary, rest) -> rest, Nil -> Nil<SqlPlanSource<I>>() }
+  for item in items {
+    let source = match remaining_sources {
+      Cons(current, rest) -> { remaining_sources = rest; current }
+      Nil -> return None<List<SqlPlanJoin<I>>>()
+    }
+    if sql_expression_has_aggregate(item.predicate) {
+      sql_check_error(sql_expression_span(item.predicate, fallback), "aggregates are not allowed in SQL join predicates")
+      return None<List<SqlPlanJoin<I>>>()
+    } else { nil }
+    match sql_check_expression(item.predicate, sources, Nil<SqlPlanProjection<I>>(), primitives, false, fallback) {
+      SqlExpressionRejected -> return None<List<SqlPlanJoin<I>>>()
+      SqlExpressionChecked(predicate) -> if sql_require_type(sql_plan_expression_type(predicate), sql_boolean_type(primitives), sql_expression_span(item.predicate, fallback), "SQL join predicate must be boolean") {
+        result = Cons(SqlPlanJoin { source: source, predicate: predicate }, result)
+      } else { return None<List<SqlPlanJoin<I>>>() }
+    }
+  }
+  Some(result.reverse())
+}
+
+fn sql_output_name<I>(projection: SqlPlanProjection<I>) -> Option<str> {
+  match projection.alias {
+    Some(alias) -> Some(alias.text)
+    None -> match projection.expression {
+      SqlPlanColumn(binding) -> Some(binding.field.text)
+      _ -> None<str>()
+    }
+  }
+}
+
+fn sql_output_shape<I>(selection: SqlPlanSelection<I>) -> SqlOutputShape {
+  match selection {
+    SqlPlanSelectAll(source) -> SqlOutputSource(source.row.description)
+    SqlPlanSelect(items) -> {
+      let mut fields: List<SqlOutputField> = Nil<SqlOutputField>()
+      for item in items {
+        fields = Cons(SqlOutputField {
+          name: sql_output_name(item),
+          value: sql_plan_expression_type(item.expression).description
+        }, fields)
+      }
+      SqlOutputRecord(fields.reverse())
+    }
+  }
+}
+
+fn sql_check_group_rules<I>(selection: SqlPlanSelection<I>, groups: List<SqlPlanExpression<I>>, having: Option<SqlPlanExpression<I>>, order: List<SqlPlanOrder<I>>, fallback: Span) -[Diagnose]> bool {
+  let projections = sql_plan_projections(selection)
+  let grouped = not groups.is_empty() or sql_plan_projection_has_aggregate(projections) or
+    (match having { Some(value) -> sql_plan_has_aggregate(value), None -> false }) or sql_plan_order_has_aggregate(order)
+  if not grouped { true }
+  else {
+    match selection {
+      SqlPlanSelectAll(source) -> { sql_check_error(fallback, "grouped SQL queries cannot select star"); return false }
+      SqlPlanSelect(items) -> for item in items {
+        if not sql_plan_grouped_ok(item.expression, groups) {
+          sql_check_error(fallback, "non-aggregate SQL projection must appear in GROUP BY")
+          return false
+        } else { nil }
+      }
+    }
+    match having {
+      Some(value) -> if not sql_plan_grouped_ok(value, groups) {
+        sql_check_error(fallback, "non-aggregate SQL HAVING expression must appear in GROUP BY")
+        return false
+      } else { nil }
+      None -> nil
+    }
+    for item in order {
+      if not sql_plan_grouped_ok(item.expression, groups) {
+        sql_check_error(fallback, "non-aggregate SQL ordering expression must appear in GROUP BY")
+        return false
+      } else { nil }
+    }
+    true
+  }
+}
+
+fn sql_check_plan<I>(syntax: SqlSyntax) -[TypeCheck<I>, Diagnose]> CheckResult<SqlPlan<I>> {
+  let primitives = match sql_primitive_types<I>(syntax.span) {
+    None -> return CheckRejected<SqlPlan<I>>()
+    Some(value) -> value
+  }
+  let sources = match sql_resolve_sources<I>(syntax) {
+    None -> return CheckRejected<SqlPlan<I>>()
+    Some(value) -> value
+  }
+  let selection = match sql_check_projections(syntax.query.selection, sources, primitives, syntax.span) {
+    None -> return CheckRejected<SqlPlan<I>>()
+    Some(value) -> value
+  }
+  let projections = sql_plan_projections(selection)
+  let joins = match sql_check_joins(syntax.query.joins, sources, primitives, syntax.span) {
+    None -> return CheckRejected<SqlPlan<I>>()
+    Some(value) -> value
+  }
+  if match syntax.query.predicate { Some(value) -> sql_expression_has_aggregate(value), None -> false } {
+    sql_check_error(syntax.span, "aggregates are not allowed in SQL WHERE predicates")
+    return CheckRejected<SqlPlan<I>>()
+  } else { nil }
+  let predicate = match sql_check_optional_expression(syntax.query.predicate, sources, Nil<SqlPlanProjection<I>>(), primitives, false, syntax.span) {
+    None -> return CheckRejected<SqlPlan<I>>()
+    Some(value) -> value
+  }
+  if not sql_require_boolean_predicate(predicate, primitives, syntax.query.predicate, syntax.span, "SQL WHERE predicate must be boolean") {
+    return CheckRejected<SqlPlan<I>>()
+  } else { nil }
+  for group in syntax.query.groups {
+    if sql_expression_has_aggregate(group) {
+      sql_check_error(sql_expression_span(group, syntax.span), "aggregates are not allowed in SQL GROUP BY")
+      return CheckRejected<SqlPlan<I>>()
+    } else { nil }
+  }
+  let groups = match sql_check_expression_list(syntax.query.groups, sources, Nil<SqlPlanProjection<I>>(), primitives, false, syntax.span) {
+    None -> return CheckRejected<SqlPlan<I>>()
+    Some(value) -> value
+  }
+  let having = match sql_check_optional_expression(syntax.query.having, sources, projections, primitives, true, syntax.span) {
+    None -> return CheckRejected<SqlPlan<I>>()
+    Some(value) -> value
+  }
+  if not sql_require_boolean_predicate(having, primitives, syntax.query.having, syntax.span, "SQL HAVING predicate must be boolean") {
+    return CheckRejected<SqlPlan<I>>()
+  } else { nil }
+  let order = match sql_check_orders(syntax.query.order, sources, projections, primitives, syntax.span) {
+    None -> return CheckRejected<SqlPlan<I>>()
+    Some(value) -> value
+  }
+  let limit = match sql_check_optional_expression(syntax.query.limit, sources, Nil<SqlPlanProjection<I>>(), primitives, false, syntax.span) {
+    None -> return CheckRejected<SqlPlan<I>>()
+    Some(value) -> value
+  }
+  let offset = match sql_check_optional_expression(syntax.query.offset, sources, Nil<SqlPlanProjection<I>>(), primitives, false, syntax.span) {
+    None -> return CheckRejected<SqlPlan<I>>()
+    Some(value) -> value
+  }
+  for original in [syntax.query.limit, syntax.query.offset] {
+    match original {
+      Some(value) -> if sql_expression_has_aggregate(value) {
+        sql_check_error(sql_expression_span(value, syntax.span), "aggregates are not allowed in SQL paging expressions")
+        return CheckRejected<SqlPlan<I>>()
+      } else { nil }
+      None -> nil
+    }
+  }
+  match limit {
+    Some(value) -> if not sql_require_type(sql_plan_expression_type(value), sql_integer_type(primitives), syntax.span, "SQL limit must be an integer") {
+      return CheckRejected<SqlPlan<I>>()
+    } else { nil }
+    None -> nil
+  }
+  match offset {
+    Some(value) -> if not sql_require_type(sql_plan_expression_type(value), sql_integer_type(primitives), syntax.span, "SQL offset must be an integer") {
+      return CheckRejected<SqlPlan<I>>()
+    } else { nil }
+    None -> nil
+  }
+  if not sql_check_group_rules(selection, groups, having, order, syntax.span) {
+    return CheckRejected<SqlPlan<I>>()
+  } else { nil }
+  let primary = match sources {
+    Cons(source, rest) -> source
+    Nil -> return CheckRejected<SqlPlan<I>>()
+  }
+  Checked(SqlPlan {
+    distinct: syntax.query.distinct,
+    source: primary,
+    joins: joins,
+    selection: selection,
+    predicate: predicate,
+    groups: groups,
+    having: having,
+    order: order,
+    limit: limit,
+    offset: offset,
+    output: sql_output_shape(selection),
+    nulls: SqlNullsRejected
+  })
+}
+
+impl<I> CheckedGrammar for SqlChecker<I> {
+  type Syntax = SqlSyntax
+  type Checked = SqlPlan<I>
+  type Identity = I
+
+  fn check(self, syntax: SqlSyntax) -[TypeCheck<I>, Diagnose]> CheckResult<SqlPlan<I>> {
+    sql_check_plan<I>(syntax)
+  }
+}

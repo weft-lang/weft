@@ -707,7 +707,9 @@ stdlib_doc_modules=(
   stdlib/prelude.weft stdlib/assert.weft stdlib/default.weft stdlib/display.weft stdlib/drop.weft
   stdlib/eq.weft stdlib/hash.weft stdlib/ord.weft stdlib/panic.weft
   stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft
-  stdlib/maybe.weft stdlib/bytes.weft stdlib/source.weft stdlib/grammar.weft stdlib/string.weft stdlib/string/builder.weft stdlib/path.weft stdlib/io/types.weft
+  stdlib/maybe.weft stdlib/bytes.weft stdlib/source.weft stdlib/typecheck.weft stdlib/grammar.weft
+  stdlib/grammar/sql.weft stdlib/grammar/sql/syntax.weft stdlib/grammar/sql/plan.weft stdlib/grammar/sql/check.weft
+  stdlib/string.weft stdlib/string/builder.weft stdlib/path.weft stdlib/io/types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft
   stdlib/time/monotonic.weft stdlib/time/wall.weft
@@ -1034,11 +1036,35 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_sse_stream_pins_owned_reader" "$(<"$tmp_out")" "pub type SseReader<S> = opaque"
     assert_contains "doc_stdlib_sse_stream_pins_bounded_read" "$(<"$tmp_out")" "pub fn next<S>(self: owned SseReader<S>) -[HttpBodyIO<S>, HttpTransportRelease<S>]> SseReadOutcome<S>"
   elif [ "$stdlib_doc_name" = "grammar" ]; then
-    assert_contains "doc_stdlib_grammar_public_contract" "$(<"$tmp_out")" "Public API items: 7. Documented: 7."
+    assert_contains "doc_stdlib_grammar_public_contract" "$(<"$tmp_out")" "Public API items: 15. Documented: 15."
     assert_contains "doc_stdlib_grammar_associated_syntax" "$(<"$tmp_out")" "type Syntax"
     assert_contains "doc_stdlib_grammar_retained_source_and_effect" "$(<"$tmp_out")" "fn parse(self: Self, source: Span) -[Diagnose]> ParseResult<Self.Syntax>"
     assert_contains "doc_stdlib_grammar_recovery" "$(<"$tmp_out")" "Recovered(T)"
     assert_contains "doc_stdlib_grammar_rejection" "$(<"$tmp_out")" "Rejected"
+    assert_contains "doc_stdlib_grammar_checked_contract" "$(<"$tmp_out")" "fn check(self: Self, syntax: Self.Syntax) -[TypeCheck<Self.Identity>, Diagnose]> CheckResult<Self.Checked>"
+    assert_contains "doc_stdlib_grammar_checked_rejection" "$(<"$tmp_out")" "CheckRejected"
+  elif [ "$stdlib_doc_name" = "grammar/sql" ]; then
+    assert_contains "doc_stdlib_grammar_sql_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
+    assert_contains "doc_stdlib_grammar_sql_parser" "$(<"$tmp_out")" "pub fn grammar() -> SqlGrammar"
+    assert_contains "doc_stdlib_grammar_sql_implementation" "$(<"$tmp_out")" "impl stdlib/grammar.Grammar for SqlGrammar"
+  elif [ "$stdlib_doc_name" = "grammar/sql/syntax" ]; then
+    assert_contains "doc_stdlib_grammar_sql_syntax_public_contract" "$(<"$tmp_out")" "Public API items: 67. Documented: 67."
+    assert_contains "doc_stdlib_grammar_sql_syntax_expression" "$(<"$tmp_out")" "pub type SqlExpression {"
+    assert_contains "doc_stdlib_grammar_sql_syntax_query" "$(<"$tmp_out")" "pub type SqlQuery {"
+  elif [ "$stdlib_doc_name" = "grammar/sql/plan" ]; then
+    assert_contains "doc_stdlib_grammar_sql_plan_public_contract" "$(<"$tmp_out")" "Public API items: 51. Documented: 51."
+    assert_contains "doc_stdlib_grammar_sql_plan_expression" "$(<"$tmp_out")" "pub type SqlPlanExpression<I> {"
+    assert_contains "doc_stdlib_grammar_sql_plan_root" "$(<"$tmp_out")" "pub type SqlPlan<I> {"
+  elif [ "$stdlib_doc_name" = "grammar/sql/check" ]; then
+    assert_contains "doc_stdlib_grammar_sql_check_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
+    assert_contains "doc_stdlib_grammar_sql_check_constructor" "$(<"$tmp_out")" "pub fn checker<I>() -> SqlChecker<I>"
+    assert_contains "doc_stdlib_grammar_sql_checked_contract" "$(<"$tmp_out")" "impl<I> stdlib/grammar.CheckedGrammar for SqlChecker<I>"
+  elif [ "$stdlib_doc_name" = "typecheck" ]; then
+    assert_contains "doc_stdlib_typecheck_public_contract" "$(<"$tmp_out")" "Public API items: 29. Documented: 29."
+    assert_contains "doc_stdlib_typecheck_structured_resolution" "$(<"$tmp_out")" "fn resolve(request: TypeName<I>) -> Result<ResolvedType<I>, TypeQueryError>"
+    assert_contains "doc_stdlib_typecheck_ordered_fields" "$(<"$tmp_out")" "fn fields(base: I) -> Result<List<ResolvedField<I>>, TypeQueryError>"
+    assert_contains "doc_stdlib_typecheck_scoped_identity" "$(<"$tmp_out")" "ForeignTypeIdentity"
+    assert_contains "doc_stdlib_typecheck_structured_constraints" "$(<"$tmp_out")" "TypeArgumentTraitRequired(usize, SemanticTypeFact, SemanticTypeFact)"
   elif [ "$stdlib_doc_name" = "diagnostic" ]; then
     assert_contains "doc_stdlib_diagnostic_public_facade" "$(<"$tmp_out")" "Public API items: 80. Documented: 80."
     assert_contains "doc_stdlib_diagnostic_location_transform_effects" "$(<"$tmp_out")" "pub fn map_locations<E>(self: Diagnostic, transform: (DiagnosticLocation) -[E]> DiagnosticLocation) -[E]> Diagnostic"
@@ -1052,7 +1078,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_diagnostic_schema_public_surface" "$(<"$tmp_out")" "Public API items: 62. Documented: 62."
     assert_contains "doc_stdlib_diagnostic_schema_finite_range" "$(<"$tmp_out")" "DiagnosticSourceRange(DiagnosticSource, usize, usize)"
   elif [ "$stdlib_doc_name" = "diagnostic/registry" ]; then
-    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 48. Documented: 48."
+    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 49. Documented: 49."
     assert_contains "doc_stdlib_diagnostic_registry_length" "$(<"$tmp_out")" "pub fn len() -> usize"
     assert_contains "doc_stdlib_diagnostic_registry_lookup" "$(<"$tmp_out")" "pub fn get(index: usize) -> Option<DiagnosticRegistryEntry>"
     assert_contains "doc_stdlib_diagnostic_registry_code" "$(<"$tmp_out")" "code: DiagnosticCode"
@@ -5595,7 +5621,7 @@ assert_contains "package_root_can_explicitly_grant_transitive_binding" "$pkg_tru
 # Package export discovery is deterministic metadata over ordinary public
 # declarations. The repository manifest is the first package-root fixture.
 pkg_exports_out=$("$WEFT" pkg exports 2>&1)
-assert_contains "pkg_exports_reports_first_party_sql_grammar" "$pkg_exports_out" '"sql":{"module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"validate_only"}'
+assert_contains "pkg_exports_reports_first_party_sql_grammar" "$pkg_exports_out" '"sql":{"module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"typed_plan"}'
 assert_contains "pkg_exports_reports_ast_tool" "$pkg_exports_out" '"ast":{"module":"tools/ast","declaration":"main"}'
 assert_contains "pkg_exports_reports_check_tool" "$pkg_exports_out" '"check":{"module":"tools/check","declaration":"main"}'
 assert_contains "pkg_exports_reports_fmt_tool" "$pkg_exports_out" '"fmt":{"module":"tools/fmt","declaration":"main"}'
