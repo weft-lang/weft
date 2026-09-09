@@ -9,11 +9,14 @@ use stdlib/dir as dir
 use stdlib/file as file
 use stdlib/grammar.{ParseResult, Parsed, Recovered, Rejected, Checked, CheckRejected}
 use stdlib/list.{Cons, Nil}
+use stdlib/option
 use stdlib/path as path
 use stdlib/path.{Path}
 use stdlib/panic.{panic}
 use stdlib/result.{Result, Ok, Err}
 use stdlib/source.{Source}
+use stdlib/tensor
+use stdlib/tensor.{TensorShape}
 
 fn grammar_comptime_path(text: str) -> Path {
   path.from_utf8(text).unwrap()
@@ -34,9 +37,9 @@ fn grammar_comptime_parse(module: GrammarModule, text: str) -> GrammarModuleSynt
   }
 }
 
-fn grammar_comptime_check(text: str, schema: Path) -> Result<GrammarComptimeCheck, GrammarComptimeError> {
-  let syntax = grammar_comptime_parse(GrammarModuleSql, text)
-  handle grammar_module_check_file_context(syntax, schema, 4096) {
+fn grammar_comptime_check(module: GrammarModule, text: str, context: Path) -> Result<GrammarComptimeCheck, GrammarComptimeError> {
+  let syntax = grammar_comptime_parse(module, text)
+  handle grammar_module_check_file_context(syntax, context, 4096) {
     Diagnose.report(diagnostic) -> resume(0)
     Diagnose.error(message, position) -> resume(0)
     Diagnose.warn(message, position) -> resume(0)
@@ -62,12 +65,12 @@ fn grammar_comptime_remove(schema: Path) -> nil {
 
 test "grammar registry checks SQL with a compile-time schema value" {
   let schema = grammar_comptime_path("test/fixtures/comptime_sql_schema_v1.json")
-  match grammar_comptime_check("select id, name from users", schema) {
+  match grammar_comptime_check(GrammarModuleSql, "select id, name from users", schema) {
     Err(_) -> Test.assert_true(false)
     Ok(checked) -> {
       Test.assert_true(match checked.result {
         Checked(GrammarComptimeSqlPlan(_)) -> true
-        CheckRejected -> false
+        _ -> false
       })
       match checked.inputs {
         Cons(input, Nil) -> {
@@ -87,13 +90,13 @@ test "changed schema content invalidates the same registry check" {
   let after = "{\"schema_version\":1,\"tables\":{\"users\":{\"id\":\"i64\"}}}"
   grammar_comptime_remove(schema)
   Test.assert_true(grammar_comptime_write(schema, before))
-  let before_check = grammar_comptime_check("select active from users", schema)
+  let before_check = grammar_comptime_check(GrammarModuleSql, "select active from users", schema)
   Test.assert_true(grammar_comptime_write(schema, after))
-  let after_check = grammar_comptime_check("select active from users", schema)
+  let after_check = grammar_comptime_check(GrammarModuleSql, "select active from users", schema)
   match (before_check, after_check) {
     (Ok(first), Ok(second)) -> {
-      Test.assert_true(match first.result { Checked(GrammarComptimeSqlPlan(_)) -> true, CheckRejected -> false })
-      Test.assert_true(match second.result { Checked(GrammarComptimeSqlPlan(_)) -> false, CheckRejected -> true })
+      Test.assert_true(match first.result { Checked(GrammarComptimeSqlPlan(_)) -> true, _ -> false })
+      Test.assert_true(match second.result { CheckRejected -> true, _ -> false })
       match (first.inputs, second.inputs) {
         (Cons(first_input, Nil), Cons(second_input, Nil)) -> {
           Test.assert_true(first_input.path.eq(second_input.path))
@@ -111,7 +114,7 @@ test "invalid SQL schema retains the observed compile-time input" {
   let schema = grammar_comptime_path("/tmp/weft_grammar_comptime_invalid_6f84.json")
   grammar_comptime_remove(schema)
   Test.assert_true(grammar_comptime_write(schema, "{}"))
-  match grammar_comptime_check("select id from users", schema) {
+  match grammar_comptime_check(GrammarModuleSql, "select id from users", schema) {
     Err(GrammarComptimeSqlSchemaRejected(_, Cons(input, Nil))) -> {
       Test.assert_true(input.path.eq(schema))
       Test.assert_eq_usize(input.size, 2)
@@ -124,22 +127,69 @@ test "invalid SQL schema retains the observed compile-time input" {
 test "failed schema read remains a typed registry context error" {
   let missing = grammar_comptime_path("/tmp/weft_grammar_comptime_missing_6f84.json")
   grammar_comptime_remove(missing)
-  match grammar_comptime_check("select id from users", missing) {
+  match grammar_comptime_check(GrammarModuleSql, "select id from users", missing) {
     Err(GrammarComptimeInputFailed(ComptimeArtifactReadFailed(actual, _))) -> Test.assert_true(actual.eq(missing))
     _ -> Test.assert_true(false)
   }
 }
 
-test "a grammar without file context support is rejected before reading" {
-  let syntax = grammar_comptime_parse(GrammarModuleEinsum, "ij,jk->ik")
-  let missing = grammar_comptime_path("/tmp/weft_grammar_comptime_unused_6f84.json")
-  match handle grammar_module_check_file_context(syntax, missing, 4096) {
-    Diagnose.report(diagnostic) -> resume(0)
-    Diagnose.error(message, position) -> resume(0)
-    Diagnose.warn(message, position) -> resume(0)
-    Diagnose.note(message, position) -> resume(0)
-  } {
-    Err(GrammarComptimeContextUnsupported) -> Test.assert_true(true)
+test "grammar registry checks einsum with compile-time operand shapes" {
+  let context = grammar_comptime_path("test/fixtures/comptime_einsum_context_v1.json")
+  match grammar_comptime_check(GrammarModuleEinsum, "ij,jk->ik", context) {
+    Err(_) -> Test.assert_true(false)
+    Ok(checked) -> {
+      match checked.result {
+        Checked(GrammarComptimeEinsumPlan(plan)) -> {
+          Test.assert_eq_usize(plan.output_shape().dimension(0).unwrap(), 2)
+          Test.assert_eq_usize(plan.output_shape().dimension(1).unwrap(), 4)
+          Test.assert_eq_usize(plan.reduction_shape().dimension(0).unwrap(), 3)
+        }
+        CheckRejected -> Test.assert_true(false)
+        _ -> Test.assert_true(false)
+      }
+      match checked.inputs {
+        Cons(input, Nil) -> {
+          Test.assert_true(input.path.eq(context))
+          Test.assert_eq_usize(input.size, 63)
+          Test.assert_str_eq(input.content, "sha256:68c37c7276391ae22886f7d9c952c276338a7d60ebedeec5ff712cdd88c56f5a")
+        }
+        _ -> Test.assert_true(false)
+      }
+    }
+  }
+}
+
+test "invalid einsum context retains its observed compile-time input" {
+  let context = grammar_comptime_path("/tmp/weft_grammar_comptime_invalid_einsum_6f84.json")
+  grammar_comptime_remove(context)
+  Test.assert_true(grammar_comptime_write(context, "{}"))
+  match grammar_comptime_check(GrammarModuleEinsum, "ij,jk->ik", context) {
+    Err(GrammarComptimeEinsumContextRejected(_, Cons(input, Nil))) -> {
+      Test.assert_true(input.path.eq(context))
+      Test.assert_eq_usize(input.size, 2)
+    }
     _ -> Test.assert_true(false)
   }
+  grammar_comptime_remove(context)
+}
+
+test "checked einsum rejection retains its valid compile-time context" {
+  let context = grammar_comptime_path("/tmp/weft_grammar_comptime_mismatch_einsum_6f84.json")
+  let source = "{\"context_version\":1,\"element\":\"f64\",\"operands\":[[2,3],[5,4]]}"
+  grammar_comptime_remove(context)
+  Test.assert_true(grammar_comptime_write(context, source))
+  match grammar_comptime_check(GrammarModuleEinsum, "ij,jk->ik", context) {
+    Err(_) -> Test.assert_true(false)
+    Ok(checked) -> {
+      Test.assert_true(match checked.result { CheckRejected -> true, _ -> false })
+      match checked.inputs {
+        Cons(input, Nil) -> {
+          Test.assert_true(input.path.eq(context))
+          Test.assert_eq_usize(input.size, source.len())
+        }
+        _ -> Test.assert_true(false)
+      }
+    }
+  }
+  grammar_comptime_remove(context)
 }

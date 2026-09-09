@@ -712,6 +712,7 @@ stdlib_doc_modules=(
   stdlib/grammar/sql.weft stdlib/grammar/sql/syntax.weft stdlib/grammar/sql/plan.weft stdlib/grammar/sql/check.weft stdlib/grammar/sql/execute.weft
   stdlib/grammar/sql/schema.weft stdlib/grammar/sql/schema_typecheck.weft
   stdlib/grammar/einsum.weft stdlib/grammar/einsum/syntax.weft stdlib/grammar/einsum/plan.weft stdlib/grammar/einsum/check.weft stdlib/grammar/einsum/execute.weft
+  stdlib/grammar/einsum/context.weft stdlib/grammar/einsum/context_typecheck.weft
   stdlib/string.weft stdlib/string/builder.weft stdlib/path.weft stdlib/io/types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft
@@ -1063,6 +1064,15 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_comptime_observer_named_state" "$(<"$tmp_out")" "pub type FileObserver {"
     assert_contains "doc_stdlib_comptime_observer_named_fields" "$(<"$tmp_out")" "values: Vector<ComptimeFileObservation>"
     assert_contains "doc_stdlib_comptime_observer_snapshot" "$(<"$tmp_out")" "pub fn observations(observer: FileObserver) -> ComptimeFileObservations"
+  elif [ "$stdlib_doc_name" = "grammar/einsum/context" ]; then
+    assert_contains "doc_einsum_context_public_contract" "$(<"$tmp_out")" "Public API items: 20. Documented: 20."
+    assert_contains "doc_einsum_context_named_value" "$(<"$tmp_out")" "pub type EinsumContext {"
+    assert_contains "doc_einsum_context_named_shapes" "$(<"$tmp_out")" "pub type EinsumOperandShapes = List<TensorShape>"
+    assert_contains "doc_einsum_context_file_effect" "$(<"$tmp_out")" "pub fn load(path: Path, limit: usize) -[FileRead]> Result<EinsumContext, EinsumContextError>"
+  elif [ "$stdlib_doc_name" = "grammar/einsum/context_typecheck" ]; then
+    assert_contains "doc_einsum_context_typecheck_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
+    assert_contains "doc_einsum_context_typecheck_identity" "$(<"$tmp_out")" "pub type EinsumContextIdentity {"
+    assert_contains "doc_einsum_context_typecheck_specs" "$(<"$tmp_out")" "pub fn operand_specs(context: EinsumContext) -> EinsumOperandSpecs<EinsumContextIdentity>"
   elif [ "$stdlib_doc_name" = "grammar/sql" ]; then
     assert_contains "doc_stdlib_grammar_sql_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
     assert_contains "doc_stdlib_grammar_sql_parser" "$(<"$tmp_out")" "pub fn grammar() -> SqlGrammar"
@@ -3062,8 +3072,8 @@ assert_equals "mcp_grammar_check_rejects_ambiguous_context" "$mcp_out" '{"jsonrp
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select id from users","context_file":"test/fixtures/comptime_sql_schema_v1.json","context_limit":0}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_check_rejects_nonpositive_context_limit" "$mcp_out" '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid context limit"}}'
 
-mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"einsum","source":"ij,jk->ik","context_file":"test/fixtures/comptime_sql_schema_v1.json"}}}' | "$WEFT" mcp 2>&1)
-assert_equals "mcp_grammar_check_unsupported_comptime_context_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":false,"schema_version":1,"stability":"internal","grammar":"einsum","root_tag":0,"columns":0,"star":0,"table":null,"where":0,"check_errors":0,"context_error":"context_unsupported","compile_time_inputs":[]}}'
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"einsum","source":"ij,jk->ik","context_file":"test/fixtures/comptime_einsum_context_v1.json"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_check_einsum_comptime_context_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":true,"schema_version":1,"stability":"internal","grammar":"einsum","root_tag":0,"columns":0,"star":0,"table":null,"where":0,"check_errors":0,"compile_time_inputs":[{"path_bytes":[116,101,115,116,47,102,105,120,116,117,114,101,115,47,99,111,109,112,116,105,109,101,95,101,105,110,115,117,109,95,99,111,110,116,101,120,116,95,118,49,46,106,115,111,110],"limit":"1048576","size":"63","content":"sha256:68c37c7276391ae22886f7d9c952c276338a7d60ebedeec5ff712cdd88c56f5a"}]}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select id from users","context_file":"/dev/null","context_limit":32}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_check_rejected_comptime_context_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":false,"schema_version":1,"stability":"internal","grammar":"mini_sql","root_tag":701,"columns":1,"star":0,"table":"users","where":0,"check_errors":0,"context_error":"context_rejected","compile_time_inputs":[{"path_bytes":[47,100,101,118,47,110,117,108,108],"limit":"32","size":"0","content":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}]}}'
@@ -5710,6 +5720,7 @@ assert_contains "package_root_can_explicitly_grant_transitive_binding" "$pkg_tru
 # declarations. The repository manifest is the first package-root fixture.
 pkg_exports_out=$("$WEFT" pkg exports 2>&1)
 assert_contains "pkg_exports_reports_first_party_sql_grammar" "$pkg_exports_out" '"sql":{"module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"runtime"}'
+assert_contains "pkg_exports_reports_first_party_einsum_grammar" "$pkg_exports_out" '"einsum":{"module":"stdlib/grammar/einsum","declaration":"EinsumGrammar","execution":"runtime"}'
 assert_contains "pkg_exports_reports_ast_tool" "$pkg_exports_out" '"ast":{"module":"tools/ast","declaration":"main"}'
 assert_contains "pkg_exports_reports_check_tool" "$pkg_exports_out" '"check":{"module":"tools/check","declaration":"main"}'
 assert_contains "pkg_exports_reports_fmt_tool" "$pkg_exports_out" '"fmt":{"module":"tools/fmt","declaration":"main"}'

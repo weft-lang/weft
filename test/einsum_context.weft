@@ -1,0 +1,158 @@
+use stdlib/diagnostic/schema.{Diagnose, DiagnosticSeverityError, DiagnosticSourceNamed}
+use stdlib/grammar.{Grammar, CheckedGrammar, Parsed, Checked, CheckRejected}
+use stdlib/grammar/einsum as einsum
+use stdlib/grammar/einsum/check as einsum_check
+use stdlib/grammar/einsum/context as context
+use stdlib/grammar/einsum/context.{*}
+use stdlib/grammar/einsum/context_typecheck as context_typecheck
+use stdlib/grammar/einsum/context_typecheck.{EinsumContextIdentity, EinsumContextF64Identity}
+use stdlib/grammar/einsum/plan.{EinsumPlan}
+use stdlib/file.{FileRead}
+use stdlib/io/types.{IoError, IoNotFound}
+use stdlib/list.{Cons, Nil}
+use stdlib/option
+use stdlib/path as path
+use stdlib/result
+use stdlib/result.{Ok, Err}
+use stdlib/source.{Source}
+use stdlib/state as state
+use stdlib/tensor
+use stdlib/tensor.{TensorShape}
+
+fn einsum_context_valid() -> EinsumContext {
+  context.parse("{\"context_version\":1,\"element\":\"f64\",\"operands\":[[2,3],[3,4]]}").unwrap()
+}
+
+test "einsum context retains checked element and ordered operand shapes" {
+  let checked = einsum_context_valid()
+  Test.assert_true(match checked.element { EinsumContextF64 -> true })
+  match checked.operands {
+    Cons(left, Cons(right, Nil)) -> {
+      Test.assert_eq_usize(left.rank(), 2)
+      Test.assert_eq_usize(left.dimension(0).unwrap(), 2)
+      Test.assert_eq_usize(left.dimension(1).unwrap(), 3)
+      Test.assert_eq_usize(left.len(), 6)
+      Test.assert_eq_usize(right.dimension(0).unwrap(), 3)
+      Test.assert_eq_usize(right.dimension(1).unwrap(), 4)
+      Test.assert_eq_usize(right.len(), 12)
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "einsum context supports scalar and empty tensor shapes" {
+  match context.parse("{\"context_version\":1,\"element\":\"f64\",\"operands\":[[],[2,0,4]]}") {
+    Err(_) -> Test.assert_true(false)
+    Ok(checked) -> match checked.operands {
+      Cons(scalar, Cons(empty, Nil)) -> {
+        Test.assert_eq_usize(scalar.rank(), 0)
+        Test.assert_eq_usize(scalar.len(), 1)
+        Test.assert_eq_usize(empty.rank(), 3)
+        Test.assert_eq_usize(empty.len(), 0)
+      }
+      _ -> Test.assert_true(false)
+    }
+  }
+}
+
+test "einsum context rejects malformed document and root shapes" {
+  Test.assert_true(match context.parse("{") { Err(EinsumContextJsonInvalid(_)) -> true, _ -> false })
+  Test.assert_true(match context.parse("[]") { Err(EinsumContextRootObjectRequired) -> true, _ -> false })
+  Test.assert_true(match context.parse("{\"element\":\"f64\",\"operands\":[[1]]}") {
+    Err(EinsumContextRootMemberRequired(name)) -> name == "context_version"
+    _ -> false
+  })
+  Test.assert_true(match context.parse("{\"context_version\":1,\"operands\":[[1]]}") {
+    Err(EinsumContextRootMemberRequired(name)) -> name == "element"
+    _ -> false
+  })
+  Test.assert_true(match context.parse("{\"context_version\":1,\"element\":\"f64\"}") {
+    Err(EinsumContextRootMemberRequired(name)) -> name == "operands"
+    _ -> false
+  })
+  Test.assert_true(match context.parse("{\"context_version\":1,\"context_version\":1,\"element\":\"f64\",\"operands\":[[1]]}") {
+    Err(EinsumContextRootMemberRequired(name)) -> name == "context_version"
+    _ -> false
+  })
+}
+
+test "einsum context rejects unsupported version element and operand collection" {
+  Test.assert_true(match context.parse("{\"context_version\":2,\"element\":\"f64\",\"operands\":[[1]]}") {
+    Err(EinsumContextVersionUnsupported) -> true
+    _ -> false
+  })
+  Test.assert_true(match context.parse("{\"context_version\":1,\"element\":\"f32\",\"operands\":[[1]]}") {
+    Err(EinsumContextElementUnsupported) -> true
+    _ -> false
+  })
+  Test.assert_true(match context.parse("{\"context_version\":1,\"element\":\"f64\",\"operands\":{}}") {
+    Err(EinsumContextOperandsArrayRequired) -> true
+    _ -> false
+  })
+  Test.assert_true(match context.parse("{\"context_version\":1,\"element\":\"f64\",\"operands\":[]}") {
+    Err(EinsumContextOperandsEmpty) -> true
+    _ -> false
+  })
+}
+
+test "einsum context rejects malformed and overflowing operand shapes" {
+  Test.assert_true(match context.parse("{\"context_version\":1,\"element\":\"f64\",\"operands\":[[1],2]}") {
+    Err(EinsumContextShapeArrayRequired(position)) -> position == 1
+    _ -> false
+  })
+  Test.assert_true(match context.parse("{\"context_version\":1,\"element\":\"f64\",\"operands\":[[2,-1]]}") {
+    Err(EinsumContextDimensionInvalid(operand, dimension)) -> operand == 0 and dimension == 1
+    _ -> false
+  })
+  Test.assert_true(match context.parse("{\"context_version\":1,\"element\":\"f64\",\"operands\":[[2,\"3\"]]}") {
+    Err(EinsumContextDimensionInvalid(operand, dimension)) -> operand == 0 and dimension == 1
+    _ -> false
+  })
+  Test.assert_true(match context.parse("{\"context_version\":1,\"element\":\"f64\",\"operands\":[[4294967296,4294967296]]}") {
+    Err(EinsumContextShapeInvalid(position, _)) -> position == 0
+    _ -> false
+  })
+}
+
+test "einsum context loading retains typed file failures" {
+  let input = path.from_utf8("shape/missing.json").unwrap()
+  let loaded = handle context.load(input, 128) {
+    FileRead.read_all(actual, limit) -> resume(Err<Bytes, IoError>(IoNotFound))
+  }
+  Test.assert_true(match loaded {
+    Err(EinsumContextReadFailed(_)) -> true
+    _ -> false
+  })
+}
+
+test "einsum context supplies typed operand specifications to its checker" {
+  let checked_context = einsum_context_valid()
+  let source = Source { text: "ij,jk->ik", identity: DiagnosticSourceNamed("context.einsum") }
+  let outcome = state.run(0, () => handle with context_typecheck(checked_context) {
+    match einsum.grammar().parse(source.all()) {
+      Parsed(syntax) -> einsum_check.checker(context_typecheck.operand_specs(checked_context)).check(syntax)
+      _ -> CheckRejected<EinsumPlan<EinsumContextIdentity>>()
+    }
+  } {
+    Diagnose.report(diagnostic) -> {
+      match diagnostic.severity() {
+        DiagnosticSeverityError -> { state.modify((count: i64) => count + 1); nil }
+        _ -> nil
+      }
+      resume(0)
+    }
+    Diagnose.error(message, position) -> { state.modify((count: i64) => count + 1); resume(0) }
+    Diagnose.warn(message, position) -> resume(0)
+    Diagnose.note(message, position) -> resume(0)
+  })
+  Test.assert_eq(outcome.1, 0)
+  match outcome.0 {
+    Checked(plan) -> {
+      Test.assert_true(match plan.element().identity { EinsumContextF64Identity -> true })
+      Test.assert_eq_usize(plan.output_shape().dimension(0).unwrap(), 2)
+      Test.assert_eq_usize(plan.output_shape().dimension(1).unwrap(), 4)
+    }
+    CheckRejected -> Test.assert_true(false)
+  }
+}
+use stdlib/bytes.{Bytes}
