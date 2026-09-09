@@ -733,7 +733,7 @@ stdlib_doc_modules=(
   stdlib/vector.weft stdlib/generator.weft stdlib/iter.weft
   stdlib/iter/protocol.weft stdlib/iter/core.weft stdlib/iter/materialize.weft
   stdlib/semantic_type.weft stdlib/semantic_type/render.weft
-  stdlib/f64_table.weft stdlib/num.weft stdlib/io/transfer.weft
+  stdlib/f64_table.weft stdlib/tensor.weft stdlib/num.weft stdlib/io/transfer.weft
   stdlib/utf8.weft
   stdlib/io.weft stdlib/par.weft stdlib/task/cancellation.weft
   stdlib/task/shutdown.weft stdlib/task/channel.weft stdlib/task.weft
@@ -1125,6 +1125,12 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_task_channel_pins_capacity_validation" "$(<"$tmp_out")" "pub fn capacity(value: usize) -> Result<Capacity, CapacityError>"
     assert_contains "doc_stdlib_task_channel_pins_sendable_effect" "$(<"$tmp_out")" "pub effect Channel<T: Sendable>"
     assert_contains "doc_stdlib_task_channel_pins_bounded_send" "$(<"$tmp_out")" "fn send(value: T) -> SendResult<T>"
+  elif [ "$stdlib_doc_name" = "tensor" ]; then
+    assert_contains "doc_stdlib_tensor_pins_public_surface" "$(<"$tmp_out")" "Public API items: 26. Documented: 26."
+    assert_contains "doc_stdlib_tensor_pins_named_dimensions" "$(<"$tmp_out")" "pub type TensorDimensions = List<usize>"
+    assert_contains "doc_stdlib_tensor_pins_checked_shape" "$(<"$tmp_out")" "pub type TensorShape = opaque"
+    assert_contains "doc_stdlib_tensor_pins_generic_value" "$(<"$tmp_out")" "pub type Tensor<T> = opaque"
+    assert_contains "doc_stdlib_tensor_pins_slice_construction" "$(<"$tmp_out")" "pub fn from_slice<T>(tensor_shape: TensorShape, values: [T]) -> Result<Tensor<T>, TensorDataError>"
   elif [ "$stdlib_doc_name" = "list" ]; then
     assert_contains "doc_stdlib_list_pins_public_surface" "$(<"$tmp_out")" "Public API items: 17. Documented: 17."
     assert_contains "doc_stdlib_list_pins_slice_construction" "$(<"$tmp_out")" "pub fn from_slice<T>(values: [T]) -> List<T>"
