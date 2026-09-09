@@ -3053,6 +3053,24 @@ assert_equals "mcp_grammar_check_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select nope from users"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_check_unknown_column_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":true,"schema_version":1,"stability":"internal","grammar":"mini_sql","root_tag":701,"columns":1,"star":0,"table":"users","where":0,"check_errors":1}}'
 
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select id, name from users","context_file":"test/fixtures/comptime_sql_schema_v1.json","context_limit":4096}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_check_comptime_context_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":true,"schema_version":1,"stability":"internal","grammar":"mini_sql","root_tag":701,"columns":2,"star":0,"table":"users","where":0,"check_errors":0,"compile_time_inputs":[{"path_bytes":[116,101,115,116,47,102,105,120,116,117,114,101,115,47,99,111,109,112,116,105,109,101,95,115,113,108,95,115,99,104,101,109,97,95,118,49,46,106,115,111,110],"limit":"4096","size":"66","content":"sha256:02155a1e74b7084163e7a7f32ba6418e480b4d192c9ea940ba2e113239cedb1a"}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select id from users","context_file":"test/fixtures/comptime_sql_schema_v1.json","host_source":"type users { id: i64 }"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_check_rejects_ambiguous_context" "$mcp_out" '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"host_source and context_file are mutually exclusive"}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select id from users","context_file":"test/fixtures/comptime_sql_schema_v1.json","context_limit":0}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_check_rejects_nonpositive_context_limit" "$mcp_out" '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid context limit"}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"einsum","source":"ij,jk->ik","context_file":"test/fixtures/comptime_sql_schema_v1.json"}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_check_unsupported_comptime_context_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":false,"schema_version":1,"stability":"internal","grammar":"einsum","root_tag":0,"columns":0,"star":0,"table":null,"where":0,"check_errors":0,"context_error":"context_unsupported","compile_time_inputs":[]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select id from users","context_file":"/dev/null","context_limit":32}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_check_rejected_comptime_context_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":false,"schema_version":1,"stability":"internal","grammar":"mini_sql","root_tag":701,"columns":1,"star":0,"table":"users","where":0,"check_errors":0,"context_error":"context_rejected","compile_time_inputs":[{"path_bytes":[47,100,101,118,47,110,117,108,108],"limit":"32","size":"0","content":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}]}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select id from users","context_file":"/tmp/weft_mcp_context_file_does_not_exist_7e41.json","context_limit":32}}}' | "$WEFT" mcp 2>&1)
+assert_equals "mcp_grammar_check_failed_comptime_input_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":false,"schema_version":1,"stability":"internal","grammar":"mini_sql","root_tag":701,"columns":1,"star":0,"table":"users","where":0,"check_errors":0,"context_error":"input_failed","compile_time_inputs":[]}}'
+
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_check","arguments":{"grammar":"mini_sql","source":"select memo from invoices where memo = '\''paid'\''","host_source":"type invoices { total: i64, memo: str }\nfn main() -> i64 { 0 }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_grammar_check_host_source_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"grammar_check","ok":true,"schema_version":1,"stability":"internal","grammar":"mini_sql","root_tag":701,"columns":1,"star":0,"table":"invoices","where":1,"check_errors":0}}'
 

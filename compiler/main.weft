@@ -11,6 +11,7 @@ use compiler/effect_ref.{*}
 use compiler/formatter.{*}
 use compiler/typeck.{*}
 use compiler/grammar.{*}
+use compiler/grammar_comptime.{GrammarComptimeCheck, GrammarComptimeError, grammar_comptime_error_inputs, grammar_comptime_error_name, grammar_module_check_file_context}
 use compiler/grammar_registry.{*}
 use compiler/host_type_checking as host_types
 use compiler/incremental.{*}
@@ -18,7 +19,7 @@ use compiler/ir.{*}
 use compiler/lib.{*}
 use compiler/module.{*}
 use compiler/module_product.{*}
-use compiler/native_link.{NativeArtifactSdk, NativeArtifactSdkAbsent, NativeArtifactSdkEmbedded, NativeLinkLibrary, native_link_artifact_platform_abi_json, native_link_target_platform_abi}
+use compiler/native_link.{NativeArtifactSdk, NativeArtifactSdkAbsent, NativeArtifactSdkEmbedded, NativeLinkLibrary, native_link_artifact_compile_time_inputs_json, native_link_artifact_platform_abi_json, native_link_target_platform_abi}
 use compiler/native_target.{NativeLinkLinuxAarch64, NativeLinkMacosAarch64, NativeLinkTarget, NativeLinkTargetParse, NativeLinkTargetParsed, NativeLinkTargetUnsupported, native_link_supported_targets, native_link_target_host, native_link_target_is_host, native_link_target_name, native_link_target_parse, native_link_target_storage_kind}
 use compiler/package.{*}
 use compiler/package_lock.{PackageCacheCorrupt, PackageCacheLockMalformed, PackageCacheMissing, PackageCacheVerified, PackageLockQuiet, pkg_cli_fetch_offline, pkg_cli_fetch_online, pkg_cli_lock, pkg_cli_lock_with_notice, pkg_lock_load_safe, pkg_lock_verify_project_cache}
@@ -56,9 +57,13 @@ use stdlib/dir.{DirInspect, DirMutate}
 use stdlib/file.{FileRead, FileWrite}
 use stdlib/json.{*}
 use stdlib/list.{List, Nil, Cons}
+use stdlib/path as path
+use stdlib/path.{Path}
 use stdlib/result.{Err, Ok, Result}
-use stdlib/option.{Option}
+use stdlib/option.{Option, Some, None}
 use stdlib/source.{Source}
+use stdlib/state as state
+use stdlib/state.{State}
 use stdlib/grammar.{ParseResult, Parsed, Recovered, Rejected, CheckResult, Checked, CheckRejected}
 use stdlib/string.{str_concat, str_contains, str_eq, str_split}
 use stdlib/vector as vector
@@ -4936,6 +4941,10 @@ fn mcp_extract_host_source(src: i64, n: i64, root: i64) -> i64 {
   mcp_extract_argument_string(src, n, root, "host_source")
 }
 
+fn mcp_extract_context_file(src: i64, n: i64, root: i64) -> i64 {
+  mcp_extract_argument_string(src, n, root, "context_file")
+}
+
 fn mcp_extract_argument_int(src: i64, n: i64, root: i64, key_name: str, default: i64) -> i64 {
   let params = mcp_json_object_field_start(src, n, root, "params")
   let args = mcp_json_object_field_start(src, n, params, "arguments")
@@ -5911,6 +5920,80 @@ fn mcp_emit_grammar_check_with_host(b: i64, src: i64, n: i64, module_id: i64, ho
   }
 }
 
+-- The transport carries the semantic result and its emitted-diagnostic count
+-- together rather than mirroring either as integer mode fields.
+type McpGrammarComptimeCheck {
+  outcome: Result<GrammarComptimeCheck, GrammarComptimeError>,
+  errors: i64
+}
+
+fn mcp_grammar_comptime_check(syntax: GrammarModuleSyntax, context_path: Path, limit: usize) -> McpGrammarComptimeCheck {
+  let (outcome, errors) = state.run(0, () => handle grammar_module_check_file_context(syntax, context_path, limit) {
+    Diagnose.report(diagnostic) -> {
+      match diagnostic.severity() {
+        DiagnosticSeverityError -> State.put(State.get() + 1)
+        _ -> nil
+      }
+      resume(0)
+    }
+    Diagnose.error(message, position) -> { State.put(State.get() + 1); resume(0) }
+    Diagnose.warn(message, position) -> resume(0)
+    Diagnose.note(message, position) -> resume(0)
+  })
+  McpGrammarComptimeCheck { outcome: outcome, errors: errors }
+}
+
+fn mcp_emit_grammar_compile_time_inputs(b: i64, checked: GrammarComptimeCheck) -> i64 {
+  mcp_write(b, ",\"compile_time_inputs\":")
+  mcp_write(b, json_stringify(native_link_artifact_compile_time_inputs_json(checked.inputs)).expect("compile-time inputs contain only finite JSON"))
+}
+
+fn mcp_emit_grammar_comptime_error_inputs(b: i64, error: GrammarComptimeError) -> i64 {
+  mcp_write(b, ",\"compile_time_inputs\":")
+  match grammar_comptime_error_inputs(error) {
+    Some(inputs) -> mcp_write(b, json_stringify(native_link_artifact_compile_time_inputs_json(inputs)).expect("compile-time inputs contain only finite JSON"))
+    None -> mcp_write(b, "[]")
+  }
+}
+
+fn mcp_emit_grammar_check_with_file_context(b: i64, src: i64, n: i64, module_id: i64, context_src: i64, context_n: i64, limit: usize) -> i64 {
+  match path.from_utf8(runtime_str_from_bytes_copy(context_src, context_n)) {
+    Err(_) -> mcp_emit_error(b, 0 - 32602, "invalid context file")
+    Ok(context_path) -> match mcp_parse_grammar_module_syntax_quiet(module_id, src, n) {
+      Parsed(syntax) -> {
+        let checked = mcp_grammar_comptime_check(syntax, context_path, limit)
+        match checked.outcome {
+          Ok(result) -> {
+            mcp_begin_result(b, "grammar_check")
+            mcp_emit_grammar_module_syntax_summary_fields(b, module_id, syntax)
+            mcp_write(b, ",\"check_errors\":")
+            mcp_write_i(b, checked.errors)
+            mcp_emit_grammar_compile_time_inputs(b, result)
+            mcp_end_result(b)
+          }
+          Err(error) -> {
+            mcp_write(b, "{\"tool\":\"grammar_check\",\"ok\":false,\"schema_version\":1,\"stability\":\"internal\"")
+            mcp_emit_grammar_module_syntax_summary_fields(b, module_id, syntax)
+            mcp_write(b, ",\"check_errors\":")
+            mcp_write_i(b, checked.errors)
+            mcp_write(b, ",\"context_error\":")
+            mcp_write_json_str(b, grammar_comptime_error_name(error))
+            mcp_emit_grammar_comptime_error_inputs(b, error)
+            mcp_end_result(b)
+          }
+        }
+      }
+      Recovered(syntax) -> {
+        mcp_begin_result(b, "grammar_check")
+        mcp_emit_grammar_module_syntax_summary_fields(b, module_id, syntax)
+        mcp_write(b, ",\"check_errors\":0,\"compile_time_inputs\":[]")
+        mcp_end_result(b)
+      }
+      Rejected -> mcp_emit_error(b, 0 - 32602, "grammar rejected source")
+    }
+  }
+}
+
 fn mcp_emit_grammar_diagnostics(b: i64, src: i64, n: i64, module_id: i64, host_src: i64, host_n: i64) -[SourceAcquire]> i64 {
   let tt = ttable_new()
   let items = buf_new(65536)
@@ -5963,8 +6046,11 @@ fn mcp_emit_grammar_diagnostics(b: i64, src: i64, n: i64, module_id: i64, host_s
 fn mcp_dispatch_grammar_tool(b: i64, req: i64, n: i64, root: i64, src: i64, src_n: i64, tool_id: i64) -[SourceAcquire]> i64 {
   let grammar_pair = mcp_extract_grammar_name(req, n, root)
   let host_pair = mcp_extract_host_source(req, n, root)
+  let context_pair = mcp_extract_context_file(req, n, root)
   let host_src = mem_load64_at(host_pair, 0)
   let host_n = mem_load64_at(host_pair, 8)
+  let context_src = mem_load64_at(context_pair, 0)
+  let context_n = mem_load64_at(context_pair, 8)
   let grammar_ptr = mem_load64_at(grammar_pair, 0)
   let grammar_n = mem_load64_at(grammar_pair, 8)
   if grammar_ptr == 0 {
@@ -5977,8 +6063,17 @@ fn mcp_dispatch_grammar_tool(b: i64, req: i64, n: i64, root: i64, src: i64, src_
       match tool_id {
         7 -> mcp_emit_grammar_parse(b, src, src_n, module_id)
         8 -> {
-          if host_src == 0 { mcp_emit_grammar_check(b, src, src_n, module_id) }
-          else { mcp_emit_grammar_check_with_host(b, src, src_n, module_id, host_src, host_n) }
+          if host_src != 0 and context_src != 0 {
+            mcp_emit_error(b, 0 - 32602, "host_source and context_file are mutually exclusive")
+          } else { if context_src != 0 {
+            let context_limit = mcp_extract_argument_int(req, n, root, "context_limit", 1048576)
+            if context_limit <= 0 { mcp_emit_error(b, 0 - 32602, "invalid context limit") }
+            else { mcp_emit_grammar_check_with_file_context(b, src, src_n, module_id, context_src, context_n, context_limit.to_usize_checked().expect("positive i64 context limit fits usize")) }
+          } else { if host_src != 0 {
+            mcp_emit_grammar_check_with_host(b, src, src_n, module_id, host_src, host_n)
+          } else {
+            mcp_emit_grammar_check(b, src, src_n, module_id)
+          } } }
         }
         9 -> mcp_emit_grammar_diagnostics(b, src, src_n, module_id, host_src, host_n)
         _ -> mcp_emit_error(b, 0 - 32601, "unknown tool")
@@ -7154,7 +7249,7 @@ fn mcp_serve_tools_list_payload(b: i64) -> i64 {
   bstr(b, "{\"name\":\"effect_lookup\",\"x-weft-stability\":\"stable\",\"description\":\"Look up a checker-produced effect declaration and operation-signature fact by visible name.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"source\":{\"type\":\"string\",\"description\":\"Weft source text\"},\"name\":{\"type\":\"string\",\"description\":\"Visible effect name\"}},\"required\":[\"source\",\"name\"]}},")
   bstr(b, "{\"name\":\"diagnostics\",\"x-weft-stability\":\"stable\",\"description\":\"Parse and type-check Weft source; report all diagnostics with line and column.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"source\":{\"type\":\"string\",\"description\":\"Weft source text\"}},\"required\":[\"source\"]}},")
   bstr(b, "{\"name\":\"grammar_parse\",\"x-weft-stability\":\"internal\",\"description\":\"Parse source with an embedded grammar module (e.g. mini_sql).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"grammar\":{\"type\":\"string\",\"description\":\"Grammar module name\"},\"source\":{\"type\":\"string\",\"description\":\"Source text in the embedded language\"}},\"required\":[\"grammar\",\"source\"]}},")
-  bstr(b, "{\"name\":\"grammar_check\",\"x-weft-stability\":\"internal\",\"description\":\"Parse and check source with an embedded grammar module, optionally against host Weft types.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"grammar\":{\"type\":\"string\",\"description\":\"Grammar module name\"},\"source\":{\"type\":\"string\",\"description\":\"Source text in the embedded language\"},\"host_source\":{\"type\":\"string\",\"description\":\"Optional host Weft source providing table types\"}},\"required\":[\"grammar\",\"source\"]}},")
+  bstr(b, "{\"name\":\"grammar_check\",\"x-weft-stability\":\"internal\",\"description\":\"Parse and check source with an embedded grammar module, optionally against host Weft types or a compile-time context file.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"grammar\":{\"type\":\"string\",\"description\":\"Grammar module name\"},\"source\":{\"type\":\"string\",\"description\":\"Source text in the embedded language\"},\"host_source\":{\"type\":\"string\",\"description\":\"Optional host Weft source providing table types\"},\"context_file\":{\"type\":\"string\",\"description\":\"Optional file consumed by the grammar as bounded compile-time context\"},\"context_limit\":{\"type\":\"integer\",\"minimum\":1,\"description\":\"Optional maximum context bytes\"}},\"required\":[\"grammar\",\"source\"]}},")
   bstr(b, "{\"name\":\"grammar_diagnostics\",\"x-weft-stability\":\"stable\",\"description\":\"Report embedded-grammar diagnostics with line and column, optionally against host Weft types.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"grammar\":{\"type\":\"string\",\"description\":\"Grammar module name\"},\"source\":{\"type\":\"string\",\"description\":\"Source text in the embedded language\"},\"host_source\":{\"type\":\"string\",\"description\":\"Optional host Weft source providing table types\"}},\"required\":[\"grammar\",\"source\"]}},")
   bstr(b, "{\"name\":\"opt_counters\",\"x-weft-stability\":\"internal\",\"description\":\"Compile Weft source through the optimiser and report per-pass site counters and native emission counters.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"source\":{\"type\":\"string\",\"description\":\"Weft source text\"}},\"required\":[\"source\"]}},")
   bstr(b, "{\"name\":\"fact_at_position\",\"x-weft-stability\":\"stable\",\"description\":\"Return the checker-produced semantic fact at a UTF-8 byte offset.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"source\":{\"type\":\"string\",\"description\":\"Weft source text\"},\"offset\":{\"type\":\"integer\",\"minimum\":0,\"description\":\"UTF-8 byte offset\"}},\"required\":[\"source\",\"offset\"]}},")
