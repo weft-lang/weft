@@ -66,6 +66,7 @@ check_rejects checked_grammar_impl_effect_identity test/negative/checked_grammar
 check_rejects checked_grammar_requires_host_effect test/negative/checked_grammar_requires_host_effect.weft 'error[E2001]: effect `TypeCheck<G.Identity>` is not available in this context' 1
 check_rejects lower_requires_handler test/negative/lower_requires_handler.weft 'error[E2001]: effect `Lower<i64, i64>` is not available in this context' 1
 check_rejects comptime_observation_requires_file_read test/negative/comptime_observation_requires_file_read.weft 'error[E2001]: effect `FileRead` is not available in this context' 1
+check_rejects comptime_evaluator_rejects_residual_effect test/negative/comptime_evaluator_rejects_residual_effect.weft 'error[E2001]: effect `OtherAuthority` is not available in this context' 1
 
 check_rejects module_stray_brace test/negative/module_stray_brace.weft 'error[E0002]: expected a module declaration' 1
 check_rejects module_stray_paren test/negative/module_stray_paren.weft 'error[E0002]: expected a module declaration' 1
