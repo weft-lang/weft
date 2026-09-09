@@ -1352,7 +1352,7 @@ version_out=$("$WEFT" --version 2> "$tmp_err")
 assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 3; targets macos-aarch64,linux-aarch64; sdk checkout .)"
 assert_equals "version_human_stderr_empty" "$(<"$tmp_err")" ""
 version_json=$("$WEFT" version --json 2> "$tmp_err")
-assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":3,"targets":["macos-aarch64","linux-aarch64"],"sdk":{"kind":"checkout","root":"."}}'
+assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":4,"targets":["macos-aarch64","linux-aarch64"],"sdk":{"kind":"checkout","root":"."}}'
 assert_equals "version_json_stderr_empty" "$(<"$tmp_err")" ""
 
 target_list=$("$WEFT" target list 2> "$tmp_err")
@@ -5058,7 +5058,7 @@ else
   exit 1
 fi
 native_forward_facts=$(/bin/cat "$tmp_pkg_trust_dir/native_artifacts/native_forward.facts.json")
-assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":3'
+assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":4'
 assert_contains "package_native_artifact_facts_name_target" "$native_forward_facts" '"target":"macos-aarch64"'
 assert_contains "package_native_artifact_facts_name_minimum_platform" "$native_forward_facts" '"minimum_platform_abi":{"platform":"macos","major":11,"minor":0,"patch":0}'
 assert_contains "package_native_artifact_facts_claim_standalone" "$native_forward_facts" '"standalone":true'
