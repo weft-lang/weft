@@ -413,6 +413,21 @@ fn sql_plan_has_aggregate<I>(expression: SqlPlanExpression<I>) -> bool {
   }
 }
 
+fn sql_plan_expression_is_constant<I>(expression: SqlPlanExpression<I>) -> bool {
+  match expression {
+    SqlPlanIntegerLiteral(value, ty, span) -> true
+    SqlPlanStringLiteral(value, ty, span) -> true
+    SqlPlanBooleanLiteral(value, ty, span) -> true
+    SqlPlanScalarExpression(op, left, right, ty) ->
+      sql_plan_expression_is_constant(left) and sql_plan_expression_is_constant(right)
+    SqlPlanComparisonExpression(op, left, right, ty) ->
+      sql_plan_expression_is_constant(left) and sql_plan_expression_is_constant(right)
+    SqlPlanLogicalExpression(op, left, right, ty) ->
+      sql_plan_expression_is_constant(left) and sql_plan_expression_is_constant(right)
+    _ -> false
+  }
+}
+
 fn sql_scalar_operator_same(left: SqlScalarOperator, right: SqlScalarOperator) -> bool {
   match (left, right) {
     (SqlAdd, SqlAdd) -> true
@@ -477,6 +492,29 @@ fn sql_plan_matches_group<I>(expression: SqlPlanExpression<I>, groups: List<SqlP
     Nil -> false
     Cons(group, rest) -> sql_plan_expression_same(expression, group) or sql_plan_matches_group(expression, rest)
   }
+}
+
+fn sql_plan_matches_projection<I>(expression: SqlPlanExpression<I>, selection: SqlPlanSelection<I>) -> bool {
+  match selection {
+    SqlPlanSelectAll(source) -> match expression {
+      SqlPlanColumn(binding) -> binding.source.position == source.position
+      _ -> false
+    }
+    SqlPlanSelect(items) -> {
+      let mut found = false
+      for item in items {
+        if sql_plan_expression_same(expression, item.expression) { found = true } else { nil }
+      }
+      found
+    }
+  }
+}
+
+fn sql_distinct_order_is_projected<I>(selection: SqlPlanSelection<I>, order: List<SqlPlanOrder<I>>) -> bool {
+  for item in order {
+    if not sql_plan_matches_projection(item.expression, selection) { return false } else { nil }
+  }
+  true
 }
 
 fn sql_plan_grouped_ok<I>(expression: SqlPlanExpression<I>, groups: List<SqlPlanExpression<I>>) -> bool {
@@ -577,17 +615,22 @@ fn sql_check_orders<I>(items: List<SqlOrder>, sources: List<SqlPlanSource<I>>, a
 
 fn sql_check_joins<I>(items: List<SqlJoinClause>, sources: List<SqlPlanSource<I>>, primitives: SqlPrimitiveTypes<I>, fallback: Span) -[TypeCheck<I>, Diagnose]> Option<List<SqlPlanJoin<I>>> {
   let mut result: List<SqlPlanJoin<I>> = Nil<SqlPlanJoin<I>>()
+  let mut available_sources: List<SqlPlanSource<I>> = match sources {
+    Cons(primary, rest) -> Cons(primary, Nil<SqlPlanSource<I>>())
+    Nil -> Nil<SqlPlanSource<I>>()
+  }
   let mut remaining_sources = match sources { Cons(primary, rest) -> rest, Nil -> Nil<SqlPlanSource<I>>() }
   for item in items {
     let source = match remaining_sources {
       Cons(current, rest) -> { remaining_sources = rest; current }
       Nil -> return None<List<SqlPlanJoin<I>>>()
     }
+    available_sources = available_sources.append(source)
     if sql_expression_has_aggregate(item.predicate) {
       sql_check_error(sql_expression_span(item.predicate, fallback), "aggregates are not allowed in SQL join predicates")
       return None<List<SqlPlanJoin<I>>>()
     } else { nil }
-    match sql_check_expression(item.predicate, sources, Nil<SqlPlanProjection<I>>(), primitives, false, fallback) {
+    match sql_check_expression(item.predicate, available_sources, Nil<SqlPlanProjection<I>>(), primitives, false, fallback) {
       SqlExpressionRejected -> return None<List<SqlPlanJoin<I>>>()
       SqlExpressionChecked(predicate) -> if sql_require_type(sql_plan_expression_type(predicate), sql_boolean_type(primitives), sql_expression_span(item.predicate, fallback), "SQL join predicate must be boolean") {
         result = Cons(SqlPlanJoin { source: source, predicate: predicate }, result)
@@ -705,6 +748,10 @@ fn sql_check_plan<I>(syntax: SqlSyntax) -[TypeCheck<I>, Diagnose]> CheckResult<S
     None -> return CheckRejected<SqlPlan<I>>()
     Some(value) -> value
   }
+  if syntax.query.distinct and not sql_distinct_order_is_projected(selection, order) {
+    sql_check_error(syntax.span, "SQL DISTINCT ordering expressions must be selected")
+    return CheckRejected<SqlPlan<I>>()
+  } else { nil }
   let limit = match sql_check_optional_expression(syntax.query.limit, sources, Nil<SqlPlanProjection<I>>(), primitives, false, syntax.span) {
     None -> return CheckRejected<SqlPlan<I>>()
     Some(value) -> value
@@ -725,13 +772,19 @@ fn sql_check_plan<I>(syntax: SqlSyntax) -[TypeCheck<I>, Diagnose]> CheckResult<S
   match limit {
     Some(value) -> if not sql_require_type(sql_plan_expression_type(value), sql_integer_type(primitives), syntax.span, "SQL limit must be an integer") {
       return CheckRejected<SqlPlan<I>>()
-    } else { nil }
+    } else { if not sql_plan_expression_is_constant(value) {
+      sql_check_error(syntax.span, "SQL limit must not depend on a source row")
+      return CheckRejected<SqlPlan<I>>()
+    } else { nil } }
     None -> nil
   }
   match offset {
     Some(value) -> if not sql_require_type(sql_plan_expression_type(value), sql_integer_type(primitives), syntax.span, "SQL offset must be an integer") {
       return CheckRejected<SqlPlan<I>>()
-    } else { nil }
+    } else { if not sql_plan_expression_is_constant(value) {
+      sql_check_error(syntax.span, "SQL offset must not depend on a source row")
+      return CheckRejected<SqlPlan<I>>()
+    } else { nil } }
     None -> nil
   }
   if not sql_check_group_rules(selection, groups, having, order, syntax.span) {
