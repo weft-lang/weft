@@ -710,6 +710,7 @@ stdlib_doc_modules=(
   stdlib/maybe.weft stdlib/bytes.weft stdlib/source.weft stdlib/typecheck.weft stdlib/grammar.weft stdlib/lower.weft
   stdlib/comptime.weft stdlib/comptime/types.weft stdlib/comptime/file_observer.weft
   stdlib/grammar/sql.weft stdlib/grammar/sql/syntax.weft stdlib/grammar/sql/plan.weft stdlib/grammar/sql/check.weft stdlib/grammar/sql/execute.weft
+  stdlib/grammar/sql/schema.weft stdlib/grammar/sql/schema_typecheck.weft
   stdlib/grammar/einsum.weft stdlib/grammar/einsum/syntax.weft stdlib/grammar/einsum/plan.weft stdlib/grammar/einsum/check.weft stdlib/grammar/einsum/execute.weft
   stdlib/string.weft stdlib/string/builder.weft stdlib/path.weft stdlib/io/types.weft
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
@@ -1087,6 +1088,15 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_grammar_sql_execute_lower" "$(<"$tmp_out")" "pub fn lower<I>(plan: SqlPlan<I>, inputs: SqlInputs<I>) -[Lower<SqlExecutionRequest<I>, SqlExecutionResult<I>>]> SqlExecutionResult<I>"
     assert_contains "doc_stdlib_grammar_sql_execute_reference_handler" "$(<"$tmp_out")" "pub fn with_reference<I, T, E>(body: () -[Lower<SqlExecutionRequest<I>, SqlExecutionResult<I>>, E]> T) -[E]> T"
     assert_contains "doc_stdlib_grammar_sql_execute_run" "$(<"$tmp_out")" "pub fn run<I>(plan: SqlPlan<I>, inputs: SqlInputs<I>) -> SqlExecutionResult<I>"
+  elif [ "$stdlib_doc_name" = "grammar/sql/schema" ]; then
+    assert_contains "doc_stdlib_grammar_sql_schema_public_contract" "$(<"$tmp_out")" "Public API items: 30. Documented: 30."
+    assert_contains "doc_stdlib_grammar_sql_schema_named_root" "$(<"$tmp_out")" "pub type SqlSchema {"
+    assert_contains "doc_stdlib_grammar_sql_schema_named_fields" "$(<"$tmp_out")" "pub type SqlSchemaFields = List<SqlSchemaField>"
+    assert_contains "doc_stdlib_grammar_sql_schema_file_authority" "$(<"$tmp_out")" "pub fn load(path: Path, limit: usize) -[FileRead]> Result<SqlSchema, SqlSchemaError>"
+  elif [ "$stdlib_doc_name" = "grammar/sql/schema_typecheck" ]; then
+    assert_contains "doc_stdlib_grammar_sql_schema_typecheck_public_contract" "$(<"$tmp_out")" "Public API items: 5. Documented: 5."
+    assert_contains "doc_stdlib_grammar_sql_schema_typecheck_named_identity" "$(<"$tmp_out")" "pub type SqlSchemaIdentity {"
+    assert_contains "doc_stdlib_grammar_sql_schema_typecheck_table_identity" "$(<"$tmp_out")" "SqlSchemaTableIdentity(SqlSchemaTable)"
   elif [ "$stdlib_doc_name" = "grammar/einsum" ]; then
     assert_contains "doc_stdlib_grammar_einsum_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
     assert_contains "doc_stdlib_grammar_einsum_parser" "$(<"$tmp_out")" "pub fn grammar() -> EinsumGrammar"
