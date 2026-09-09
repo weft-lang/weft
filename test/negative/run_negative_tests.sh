@@ -64,6 +64,7 @@ check_rejects grammar_result_wrong_syntax test/negative/grammar_result_wrong_syn
 check_rejects grammar_raw_source_requires_trust test/negative/grammar_raw_source_requires_trust.weft 'Unsafe is sealed to trusted runtime/platform code' 1
 check_rejects checked_grammar_impl_effect_identity test/negative/checked_grammar_impl_effect_identity.weft 'impl method effect mismatch' 1
 check_rejects checked_grammar_requires_host_effect test/negative/checked_grammar_requires_host_effect.weft 'error[E2001]: effect `TypeCheck<G.Identity>` is not available in this context' 1
+check_rejects lower_requires_handler test/negative/lower_requires_handler.weft 'error[E2001]: effect `Lower<i64, i64>` is not available in this context' 1
 
 check_rejects module_stray_brace test/negative/module_stray_brace.weft 'error[E0002]: expected a module declaration' 1
 check_rejects module_stray_paren test/negative/module_stray_paren.weft 'error[E0002]: expected a module declaration' 1

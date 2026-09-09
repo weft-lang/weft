@@ -707,7 +707,7 @@ stdlib_doc_modules=(
   stdlib/prelude.weft stdlib/assert.weft stdlib/default.weft stdlib/display.weft stdlib/drop.weft
   stdlib/eq.weft stdlib/hash.weft stdlib/ord.weft stdlib/panic.weft
   stdlib/list.weft stdlib/option.weft stdlib/result.weft stdlib/fail.weft
-  stdlib/maybe.weft stdlib/bytes.weft stdlib/source.weft stdlib/typecheck.weft stdlib/grammar.weft
+  stdlib/maybe.weft stdlib/bytes.weft stdlib/source.weft stdlib/typecheck.weft stdlib/grammar.weft stdlib/lower.weft
   stdlib/grammar/sql.weft stdlib/grammar/sql/syntax.weft stdlib/grammar/sql/plan.weft stdlib/grammar/sql/check.weft stdlib/grammar/sql/execute.weft
   stdlib/grammar/einsum.weft stdlib/grammar/einsum/syntax.weft stdlib/grammar/einsum/plan.weft stdlib/grammar/einsum/check.weft stdlib/grammar/einsum/execute.weft
   stdlib/string.weft stdlib/string/builder.weft stdlib/path.weft stdlib/io/types.weft
@@ -1044,6 +1044,10 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_grammar_rejection" "$(<"$tmp_out")" "Rejected"
     assert_contains "doc_stdlib_grammar_checked_contract" "$(<"$tmp_out")" "fn check(self: Self, syntax: Self.Syntax) -[TypeCheck<Self.Identity>, Diagnose]> CheckResult<Self.Checked>"
     assert_contains "doc_stdlib_grammar_checked_rejection" "$(<"$tmp_out")" "CheckRejected"
+  elif [ "$stdlib_doc_name" = "lower" ]; then
+    assert_contains "doc_stdlib_lower_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
+    assert_contains "doc_stdlib_lower_generic_capability" "$(<"$tmp_out")" "pub effect Lower<S, P> {"
+    assert_contains "doc_stdlib_lower_request" "$(<"$tmp_out")" "pub fn lower<S, P>(source: S) -[Lower<S, P>]> P"
   elif [ "$stdlib_doc_name" = "grammar/sql" ]; then
     assert_contains "doc_stdlib_grammar_sql_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
     assert_contains "doc_stdlib_grammar_sql_parser" "$(<"$tmp_out")" "pub fn grammar() -> SqlGrammar"
@@ -1063,9 +1067,12 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_grammar_sql_check_constructor" "$(<"$tmp_out")" "pub fn checker<I>() -> SqlChecker<I>"
     assert_contains "doc_stdlib_grammar_sql_checked_contract" "$(<"$tmp_out")" "impl<I> stdlib/grammar.CheckedGrammar for SqlChecker<I>"
   elif [ "$stdlib_doc_name" = "grammar/sql/execute" ]; then
-    assert_contains "doc_stdlib_grammar_sql_execute_public_contract" "$(<"$tmp_out")" "Public API items: 34. Documented: 34."
+    assert_contains "doc_stdlib_grammar_sql_execute_public_contract" "$(<"$tmp_out")" "Public API items: 39. Documented: 39."
     assert_contains "doc_stdlib_grammar_sql_execute_checked_input" "$(<"$tmp_out")" "pub fn input<I>(source: SqlPlanSource<I>, rows: SqlInputRows) -> SqlInputSource<I>"
     assert_contains "doc_stdlib_grammar_sql_execute_result" "$(<"$tmp_out")" "pub type SqlExecutionResult<I> = Result<SqlExecution, SqlExecutionError<I>>"
+    assert_contains "doc_stdlib_grammar_sql_execute_request" "$(<"$tmp_out")" "pub type SqlExecutionRequest<I> {"
+    assert_contains "doc_stdlib_grammar_sql_execute_lower" "$(<"$tmp_out")" "pub fn lower<I>(plan: SqlPlan<I>, inputs: SqlInputs<I>) -[Lower<SqlExecutionRequest<I>, SqlExecutionResult<I>>]> SqlExecutionResult<I>"
+    assert_contains "doc_stdlib_grammar_sql_execute_reference_handler" "$(<"$tmp_out")" "pub fn with_reference<I, T, E>(body: () -[Lower<SqlExecutionRequest<I>, SqlExecutionResult<I>>, E]> T) -[E]> T"
     assert_contains "doc_stdlib_grammar_sql_execute_run" "$(<"$tmp_out")" "pub fn run<I>(plan: SqlPlan<I>, inputs: SqlInputs<I>) -> SqlExecutionResult<I>"
   elif [ "$stdlib_doc_name" = "grammar/einsum" ]; then
     assert_contains "doc_stdlib_grammar_einsum_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
@@ -1085,9 +1092,12 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_grammar_einsum_check_constructor" "$(<"$tmp_out")" "pub fn checker<I>(operands: EinsumOperandSpecs<I>) -> EinsumChecker<I>"
     assert_contains "doc_stdlib_grammar_einsum_checked_contract" "$(<"$tmp_out")" "impl<I> stdlib/grammar.CheckedGrammar for EinsumChecker<I>"
   elif [ "$stdlib_doc_name" = "grammar/einsum/execute" ]; then
-    assert_contains "doc_stdlib_grammar_einsum_execute_public_contract" "$(<"$tmp_out")" "Public API items: 6. Documented: 6."
+    assert_contains "doc_stdlib_grammar_einsum_execute_public_contract" "$(<"$tmp_out")" "Public API items: 11. Documented: 11."
     assert_contains "doc_stdlib_grammar_einsum_execute_inputs" "$(<"$tmp_out")" "pub type EinsumInputs = List<Tensor<f64>>"
     assert_contains "doc_stdlib_grammar_einsum_execute_result" "$(<"$tmp_out")" "pub type EinsumExecutionResult<I> = Result<Tensor<f64>, EinsumExecutionError<I>>"
+    assert_contains "doc_stdlib_grammar_einsum_execute_request" "$(<"$tmp_out")" "pub type EinsumExecutionRequest<I> {"
+    assert_contains "doc_stdlib_grammar_einsum_execute_lower" "$(<"$tmp_out")" "pub fn lower<I>(plan: EinsumPlan<I>, inputs: EinsumInputs) -[Lower<EinsumExecutionRequest<I>, EinsumExecutionResult<I>>]> EinsumExecutionResult<I>"
+    assert_contains "doc_stdlib_grammar_einsum_execute_reference_handler" "$(<"$tmp_out")" "pub fn with_reference<I, T, E>(body: () -[Lower<EinsumExecutionRequest<I>, EinsumExecutionResult<I>>, E]> T) -[E]> T"
     assert_contains "doc_stdlib_grammar_einsum_execute_run" "$(<"$tmp_out")" "pub fn run<I>(plan: EinsumPlan<I>, inputs: EinsumInputs) -> EinsumExecutionResult<I>"
   elif [ "$stdlib_doc_name" = "typecheck" ]; then
     assert_contains "doc_stdlib_typecheck_public_contract" "$(<"$tmp_out")" "Public API items: 29. Documented: 29."
