@@ -1,4 +1,7 @@
-use compiler/grammar_host.{parse_module, parse_use_file, parse_registered_source_with_loader, parse_source_loader_for_table}
+use compiler/grammar_host.{parse_module, parse_module_with_loader, parse_use_file, parse_use_file_with_loader, parse_registered_source_with_loader, parse_source_loader_for_table, parse_source_loader_with_owners, CompilerSourceLoader}
+use compiler/source_input.{SourceRequest}
+use compiler/source_owners.{SourceOwners}
+use compiler/source_loading.{source_loader_owners}
 -- Weft compiler — Layer 1
 -- Compiles Weft source with arithmetic, control flow, functions to aarch64 Mach-O
 -- Usage: ./weft < compiler/main.weft > output && chmod +x output
@@ -171,8 +174,8 @@ fn main_check_source_with_path_and_origin_and_grant(src: i64, n: i64, path_ptr: 
   let ast = pipeline_parse_module(grammar, src, n, tt)
   match ast {
     AstModule(fns, ast_src, ast_tt, owners) -> {
-      pipeline_bind_runtime_preludes(fns, ast_src, ast_tt)
-      pipeline_check_module(ast)
+      let acquired = pipeline_bind_runtime_preludes(fns, ast_src, ast_tt)
+      pipeline_check_module(AstModule(fns, ast_src, ast_tt, source_owners.combined(owners, acquired)))
     }
   }
 }
@@ -220,13 +223,12 @@ fn main_parse_native_source(src: i64, n: i64, path_ptr: i64, path_len: i64, trus
   let content = runtime_str_from_bytes_copy(src, n)
   let root_src = __str_ptr(content)
   let source = Source { text: content, identity: DiagnosticSourceBuffer(root_src) }
-  let owners = source_owners.with_text(source_owners.new(), content)
   let tt = ttable_new()
   ttable_set_native_compilation_target(tt, native_link_target_storage_kind(target))
   main_mark_root_origin_with_grant(tt, root_src, trusted, strict, can_grant_trust)
   main_register_source_path(tt, root_src, n, path_ptr, path_len)
   let loader = parse_source_loader_for_table(tt)
-  let (fns, parse_error_count) = main_report_diagnostics(tt, root_src,
+  let (parsed, parse_error_count) = main_report_diagnostics(tt, root_src,
     () => parse_registered_source_with_loader(source, tt, loader))
   if parse_error_count != 0 {
     eprint("compile: parse failed with ")
@@ -234,14 +236,14 @@ fn main_parse_native_source(src: i64, n: i64, path_ptr: i64, path_len: i64, trus
     eprint(" errors\n")
     MainSourceParseFailed(1)
   } else {
-    MainSourceParsed(AstModule(fns, root_src, tt, owners), source)
+    MainSourceParsed(AstModule(parsed.functions, root_src, tt, parsed.owners), source)
   }
 }
 
 fn main_check_native_program(ast: AstModule, support: NativeRuntimeSupport) -[SourceAcquire]> CheckResult<TypedModule> {
   match ast {
     AstModule(fns, src, tt, owners) -> {
-      let loader = parse_source_loader_for_table(tt)
+      let loader = parse_source_loader_with_owners(tt, owners)
       let (checked, error_count) = main_report_diagnostics(tt, src,
         () => check_weft_native_program_with_support_and_loader(ast, support, loader))
       match checked {
@@ -1187,13 +1189,13 @@ type MainTestWorkerMetric {
 -- A worker prepares and compiles one root against its private fork snapshot.
 -- The parent snapshot contains only immutable universal support modules.
 type MainTestPreparation {
-  MainTestPrepared(i64, i64, i64, i64, i64), -- fns, src, tt, wrapper bank, trusted
+  MainTestPrepared(i64, i64, i64, i64, i64, SourceOwners), -- fns, src, tt, wrapper bank, trusted, source backing
   MainTestPreparationComplete(i64),           -- terminal status, already diagnosed
 }
 
 type MainTestRootPlan {
   -- index, path, source, source length, exact dependency entries, pair count
-  MainTestReusableRoot(i64, i64, i64, i64, i64, i64),
+  MainTestReusableRoot(i64, i64, i64, i64, i64, i64, SourceOwners),
   MainTestUnplannedRoot(i64, i64),
 }
 
@@ -1802,10 +1804,13 @@ fn main_test_root_timeout_millis(envp: i64) -> i64 {
   main_test_compile_timeout_millis(envp) + main_test_run_timeout_millis(envp)
 }
 
-fn main_test_prewarm_file(tt: i64, fns: i64, path: str) -[SourceAcquire]> i64 {
+fn main_test_prewarm_file(tt: i64, fns: i64, path: str, loader: CompilerSourceLoader) -[SourceAcquire]> i64 {
   let errors = alloc_words(1)
   mem_store64_at(errors, 0, 0)
-  handle parse_use_file(fns, tt, path) {
+  handle {
+    pkg_install_sdk_for_table(tt, SourceAcquire.sdk_origin())
+    parse_use_file_with_loader(fns, tt, path, loader)
+  } {
     Diagnose.report(diagnostic) -> {
       if diagnose_report_severity_tag(diagnostic) == 1 {
         mem_store64_at(errors, 0, mem_load64_at(errors, 0) + 1)
@@ -1819,10 +1824,10 @@ fn main_test_prewarm_file(tt: i64, fns: i64, path: str) -[SourceAcquire]> i64 {
   mem_load64_at(errors, 0)
 }
 
-fn main_test_check_project_base(fns: i64, src: i64, tt: i64) -[SourceAcquire]> i64 {
+fn main_test_check_project_base(fns: i64, src: i64, tt: i64, loader: CompilerSourceLoader) -[SourceAcquire]> i64 {
   let errors = alloc_words(1)
   mem_store64_at(errors, 0, 0)
-  let checker_errors = handle pipeline_check(fns, src, tt) {
+  let checker_errors = handle pipeline_check_with_loader(fns, src, tt, loader) {
     Diagnose.report(diagnostic) -> {
       if diagnose_report_severity_tag(diagnostic) == 1 {
         mem_store64_at(errors, 0, mem_load64_at(errors, 0) + 1)
@@ -1836,32 +1841,33 @@ fn main_test_check_project_base(fns: i64, src: i64, tt: i64) -[SourceAcquire]> i
   checker_errors + mem_load64_at(errors, 0)
 }
 
-fn main_test_project_base() -[SourceAcquire]> i64 {
+fn main_test_project_base() -[SourceAcquire]> (i64, SourceOwners) {
   let tt = ttable_new()
+  let loader = parse_source_loader_for_table(tt)
   let fns = nlist_new()
   let mut errors = 0
   -- Every generated test root imports Test, and every harness imports these
   -- five support modules. Parse them once before forking; module entries cache
   -- their function closures, while each child retains a root-local checker
   -- table snapshot and all subsequent mutations remain process-private.
-  errors = errors + main_test_prewarm_file(tt, fns, "stdlib/test.weft")
-  errors = errors + main_test_prewarm_file(tt, fns, "runtime/syscall.weft")
-  errors = errors + main_test_prewarm_file(tt, fns, "runtime/alloc.weft")
-  errors = errors + main_test_prewarm_file(tt, fns, "runtime/rc.weft")
-  errors = errors + main_test_prewarm_file(tt, fns, "stdlib/string.weft")
-  errors = errors + main_test_prewarm_file(tt, fns, "stdlib/test/report.weft")
+  errors = errors + main_test_prewarm_file(tt, fns, "stdlib/test.weft", loader)
+  errors = errors + main_test_prewarm_file(tt, fns, "runtime/syscall.weft", loader)
+  errors = errors + main_test_prewarm_file(tt, fns, "runtime/alloc.weft", loader)
+  errors = errors + main_test_prewarm_file(tt, fns, "runtime/rc.weft", loader)
+  errors = errors + main_test_prewarm_file(tt, fns, "stdlib/string.weft", loader)
+  errors = errors + main_test_prewarm_file(tt, fns, "stdlib/test/report.weft", loader)
   let sdk_package = ttable_sdk_package_id(tt)
   let test_package = if sdk_package > 0 { sdk_package } else { 0 }
   let test_module = module_fact_find_path(tt, __str_ptr("stdlib/test.weft"), __str_len("stdlib/test.weft"), test_package)
   if errors == 0 and test_module != 0 {
-    errors = errors + main_test_check_project_base(fns, module_fact_entry_source(test_module), tt)
+    errors = errors + main_test_check_project_base(fns, module_fact_entry_source(test_module), tt, loader)
   } else { if test_module == 0 { errors = errors + 1 } else { 0 } }
   -- Missing/corrupt support must retain the canonical per-root diagnostic.
   -- Discard the partial cache and let each child take the normal load path.
   if errors == 0 {
     ttable_mark_checked_module_products(tt, fns)
-    tt
-  } else { ttable_new() }
+    (tt, source_loader_owners(loader))
+  } else { (ttable_new(), source_owners.new()) }
 }
 
 fn main_test_dependency_selection_is_named(selected: i64) -> i64 {
@@ -1882,7 +1888,7 @@ fn main_test_dependency_pair_count(selected: i64) -> i64 {
   count
 }
 
-fn main_test_discover_root(tt: i64, path: i64, index: i64) -[SourceAcquire]> MainTestRootPlan {
+fn main_test_discover_root(tt: i64, path: i64, index: i64, loader: CompilerSourceLoader) -[SourceAcquire]> MainTestRootPlan {
   let path_len = cstr_len(path)
   let file = read_cpath_file(path, path_len)
   let raw = mem_load64_at(file, 0)
@@ -1903,7 +1909,7 @@ fn main_test_discover_root(tt: i64, path: i64, index: i64) -[SourceAcquire]> Mai
     -- Discovery needs the exact imported-module closure it may later share.
     -- Grammar.parse is intentionally root-local; use the source-acquiring
     -- module parser for this whole-graph planning query.
-    let fns = handle parse_module(grammar.lex(raw, raw_n), raw, tt) {
+    let fns = handle parse_module_with_loader(grammar.lex(raw, raw_n), raw, tt, loader) {
       Diagnose.report(diagnostic) -> {
         if diagnose_report_severity_tag(diagnostic) == 1 {
           mem_store64_at(errors, 0, mem_load64_at(errors, 0) + 1)
@@ -1922,7 +1928,7 @@ fn main_test_discover_root(tt: i64, path: i64, index: i64) -[SourceAcquire]> Mai
       if nlist_len(selected) == 0 or main_test_dependency_selection_is_named(selected) == 0 {
         MainTestUnplannedRoot(index, path)
       } else {
-        MainTestReusableRoot(index, path, raw, raw_n, selected, main_test_dependency_pair_count(selected))
+        MainTestReusableRoot(index, path, raw, raw_n, selected, main_test_dependency_pair_count(selected), source_loader_owners(loader))
       }
     }
   }
@@ -1930,9 +1936,10 @@ fn main_test_discover_root(tt: i64, path: i64, index: i64) -[SourceAcquire]> Mai
 
 fn main_test_discover_roots(paths: i64) -[SourceAcquire]> MainTestRootPlanList {
   let tt = ttable_new()
+  let loader = parse_source_loader_for_table(tt)
   let mut plans = MainTestRootPlanNil
   for i in 0..nlist_len(paths) {
-    plans = MainTestRootPlanCons(main_test_discover_root(tt, nlist_get(paths, i), i), plans)
+    plans = MainTestRootPlanCons(main_test_discover_root(tt, nlist_get(paths, i), i, loader), plans)
   }
   plans
 }
@@ -1962,15 +1969,15 @@ fn main_test_dependency_selections_equal(left: i64, right: i64) -> i64 {
 
 fn main_test_root_plan_index(plan: MainTestRootPlan) -> i64 {
   match plan {
-    MainTestReusableRoot(index, path, raw, raw_n, selected, pair_count) -> index
+    MainTestReusableRoot(index, path, raw, raw_n, selected, pair_count, plan_owners) -> index
     MainTestUnplannedRoot(index, path) -> index
   }
 }
 
 fn main_test_root_plans_equal(left: MainTestRootPlan, right: MainTestRootPlan) -> i64 {
   match left {
-    MainTestReusableRoot(left_index, left_path, left_raw, left_n, left_selected, left_pairs) -> match right {
-      MainTestReusableRoot(right_index, right_path, right_raw, right_n, right_selected, right_pairs) -> main_test_dependency_selections_equal(left_selected, right_selected)
+    MainTestReusableRoot(left_index, left_path, left_raw, left_n, left_selected, left_pairs, plan_owners) -> match right {
+      MainTestReusableRoot(right_index, right_path, right_raw, right_n, right_selected, right_pairs, plan_owners) -> main_test_dependency_selections_equal(left_selected, right_selected)
       MainTestUnplannedRoot(right_index, right_path) -> 0
     }
     MainTestUnplannedRoot(left_index, left_path) -> 0
@@ -2013,7 +2020,7 @@ fn main_test_root_plan_assign_group(
 
 fn main_test_root_plan_checked_base(session: ProjectSession, plan: MainTestRootPlan, optimise: i64) -[SourceAcquire]> MainTestCheckedBase {
   match plan {
-    MainTestReusableRoot(index, path, raw, raw_n, selected, pair_count) -> {
+    MainTestReusableRoot(index, path, raw, raw_n, selected, pair_count, plan_owners) -> {
       let path_len = cstr_len(path)
       let source_path = runtime_str_from_bytes_copy(path, path_len)
       let context = project_query_context_with_trust(
@@ -2044,7 +2051,7 @@ fn main_test_root_plan_checked_base(session: ProjectSession, plan: MainTestRootP
 
 fn main_test_root_plan_pair_count(plan: MainTestRootPlan) -> i64 {
   match plan {
-    MainTestReusableRoot(index, path, raw, raw_n, selected, pair_count) -> pair_count
+    MainTestReusableRoot(index, path, raw, raw_n, selected, pair_count, plan_owners) -> pair_count
     MainTestUnplannedRoot(index, path) -> 0
   }
 }
@@ -2265,32 +2272,33 @@ fn main_test_run_legacy_source(path: i64, path_len: i64, src: i64, n: i64, tt: i
     )
     main_register_source_path(tt, src, n, path, path_len)
     match pipeline_parse_with_error_count(grammar, src, n, tt) {
-      PipelineParseResult(fns, parse_errors) -> {
+      PipelineParseResult(fns, parse_errors, parse_owners) -> {
         if parse_errors != 0 {
           eprint("test: legacy main parse failed with ")
           eprint_i(parse_errors)
           eprint(" errors\n")
           1
         } else {
-          pipeline_bind_native_runtime_preludes(fns, src, tt)
-          let errors = if nlist_len(ttable_checked_module_pairs(tt)) > 0 {
+          let runtime_owners = pipeline_bind_native_runtime_preludes(fns, src, tt)
+          let checked = if nlist_len(ttable_checked_module_pairs(tt)) > 0 {
             handle pipeline_check_extending_checked(fns, src, tt) {
               Diagnose.report(diagnostic) -> { pipeline_diagnose_render_report(tt, diagnostic) resume(0) }
               Diagnose.error(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
               Diagnose.warn(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
               Diagnose.note(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
             }
-          } else { pipeline_check_fns_error_count(fns, src, tt) }
-          if errors != 0 {
+          } else { pipeline_check_fns_report(fns, src, tt) }
+          if checked.errors != 0 {
             eprint("test: legacy main type check failed with ")
-            eprint_i(errors)
+            eprint_i(checked.errors)
             eprint(" errors\n")
             1
           } else { if main_fns_have_root_main(fns, src) != 1 {
             eprint("test: legacy expected-exit source is missing main\n")
             1
           } else {
-            let binary = pipeline_emit_native_with_debug_mode(TypedModule(fns, src, tt, source_owners.new()), main_test_native_debug_mode())
+            let owners = source_owners.combined(parse_owners, source_owners.combined(runtime_owners, checked.owners))
+            let binary = pipeline_emit_native_with_debug_mode(TypedModule(fns, src, tt, owners), main_test_native_debug_mode())
             if metrics != 0 { mem_store64_at(metrics, 8, main_test_now_millis()) } else { 0 }
             main_test_run_binary_with_expectation(binary, envp, index, metrics, expected_exit)
           } }
@@ -2431,7 +2439,7 @@ fn main_test_run_paths_parallel(paths: i64, envp: i64, jobs: i64, metrics: i64) 
       let path = nlist_get(paths, next)
       let start = main_test_now_millis()
       let planned_base = mem_load64_at(project_bases, next * 8)
-      let worker_base = if planned_base == 0 { project_base } else { planned_base }
+      let worker_base = if planned_base == 0 { project_base.0 } else { planned_base }
       let worker_product = vector_get_in_bounds<PipelineOptimisedDependencyProduct>(project_products, next)
       sys_remove(main_test_metric_path(owner_pid, next))
       let pid = main_test_spawn_worker(path, worker_base, worker_product, envp, next, owner_pid)
@@ -2641,11 +2649,11 @@ fn main_pkg_native_wrapper_facts_for_manifest(source: str, manifest: i64) -[Sour
   main_mark_root_origin_with_grant(tt, __str_ptr(source), 0, 1, 0)
   main_register_source_path(tt, __str_ptr(source), __str_len(source), __str_ptr(path), __str_len(path))
   match pipeline_parse_with_error_count(grammar, __str_ptr(source), __str_len(source), tt) {
-    PipelineParseResult(fns, parse_errors) -> {
+    PipelineParseResult(fns, parse_errors, parse_owners) -> {
       if parse_errors != 0 { Err("pkg: native audit import graph did not parse") }
       else {
-        let check_errors = pipeline_check_fns_error_count(fns, __str_ptr(source), tt)
-        if check_errors != 0 { Err("pkg: native audit import graph did not check") }
+        let check_errors = pipeline_check_fns_report(fns, __str_ptr(source), tt)
+        if check_errors.errors != 0 { Err("pkg: native audit import graph did not check") }
         else { Ok(main_pkg_native_wrapper_facts_from_table(tt)) }
       }
     }
@@ -3091,21 +3099,21 @@ fn run_doc_path(path: i64) -[SourceAcquire]> i64 {
     main_mark_root_origin_with_grant(tt, src, cpath_is_trusted_source(path, path_len), cpath_is_strict_source(path, path_len), cpath_can_grant_import_trust(path, path_len))
     main_register_source_path(tt, src, n, path, path_len)
     match pipeline_parse_with_error_count(grammar, src, n, tt) {
-      PipelineParseResult(fns, parse_errors) -> {
+      PipelineParseResult(fns, parse_errors, parse_owners) -> {
         if parse_errors != 0 {
           eprint("doc: parse failed with ")
           eprint_i(parse_errors)
           eprint(" errors\n")
           1
         } else {
-          let check_errors = pipeline_check_fns_error_count(fns, src, tt)
-          if check_errors != 0 {
+          let check_errors = pipeline_check_fns_report(fns, src, tt)
+          if check_errors.errors != 0 {
             eprint("doc: type check failed with ")
-            eprint_i(check_errors)
+            eprint_i(check_errors.errors)
             eprint(" errors\n")
             1
           } else {
-            oprint(docgen_render_module(TypedModule(fns, src, tt, source_owners.new()), runtime_str_from_bytes_copy(path, path_len)))
+            oprint(docgen_render_module(TypedModule(fns, src, tt, source_owners.combined(parse_owners, check_errors.owners)), runtime_str_from_bytes_copy(path, path_len)))
             0
           }
         }
@@ -4067,7 +4075,7 @@ fn run_check_source_with_path(raw: i64, raw_n: i64, path_ptr: i64, path_len: i64
   main_mark_root_origin_with_grant(probe_tt, raw, trusted, strict, can_grant_trust)
   main_register_source_path(probe_tt, raw, raw_n, path_ptr, path_len)
   match pipeline_parse_with_error_count(grammar, raw, raw_n, probe_tt) {
-    PipelineParseResult(probe_fns, parse_errors) -> {
+    PipelineParseResult(probe_fns, parse_errors, parse_owners) -> {
       if parse_errors != 0 {
         run_check_report(nlist_len(probe_fns), parse_errors)
       } else { if fns_have_tests(probe_fns) == 1 {
@@ -4078,15 +4086,16 @@ fn run_check_source_with_path(raw: i64, raw_n: i64, path_ptr: i64, path_len: i64
         let tt = ttable_new()
         main_mark_root_origin_with_grant(tt, src, trusted, strict, can_grant_trust)
         main_register_source_path(tt, src, n, path_ptr, path_len)
-        let fns = pipeline_parse(grammar, src, n, tt)
+        let fns_loaded = pipeline_parse(grammar, src, n, tt)
+        let fns = fns_loaded.functions
         let regular = check_wrap_test_blocks(fns, name_bank_start, tt)
-        pipeline_bind_runtime_preludes(regular, src, tt)
-        let errors = pipeline_check_fns_error_count(regular, src, tt)
-        run_check_report(nlist_len(regular), errors)
+        let runtime_owners = pipeline_bind_runtime_preludes(regular, src, tt)
+        let errors = pipeline_check_fns_report(regular, src, tt)
+        run_check_report(nlist_len(regular), errors.errors)
       } else {
-        pipeline_bind_runtime_preludes(probe_fns, raw, probe_tt)
-        let errors = pipeline_check_fns_error_count(probe_fns, raw, probe_tt)
-        run_check_report(nlist_len(probe_fns), errors)
+        let runtime_owners = pipeline_bind_runtime_preludes(probe_fns, raw, probe_tt)
+        let errors = pipeline_check_fns_report(probe_fns, raw, probe_tt)
+        run_check_report(nlist_len(probe_fns), errors.errors)
       } }
     }
   }
@@ -4404,7 +4413,7 @@ fn run_ast_source(src: i64, n: i64, trusted: i64) -> i64 {
   let tt = ttable_new()
   pipeline_mark_root_origin(tt, src, trusted, pipeline_strict_for_trust(trusted))
   let parsed = pipeline_parse_local_with_error_count(weft_grammar(), src, n, tt)
-  let fns = match parsed { PipelineParseResult(parsed_fns, errors) -> parsed_fns }
+  let fns = match parsed { PipelineParseResult(parsed_fns, errors, parse_owners) -> parsed_fns }
   let nfns = nlist_len(fns)
   eprint("--- AST: ")
   eprint_i(nfns)
@@ -5022,7 +5031,8 @@ fn mcp_parse_source_quiet(src: i64, n: i64) -[SourceAcquire]> AstModule {
   }
 }
 
-fn mcp_register_source_overlays(tt: i64, overlays: i64, root_src: i64, root_path_ptr: i64, root_path_len: i64, workspace_ptr: i64, workspace_len: i64) -> i64 {
+fn mcp_register_source_overlays(tt: i64, overlays: i64, root_src: i64, root_path_ptr: i64, root_path_len: i64, workspace_ptr: i64, workspace_len: i64) -> SourceOwners {
+  let mut owners = source_owners.new()
   if overlays != 0 {
     for i in 0..nlist_len(overlays) {
       let doc = nlist_get(overlays, i)
@@ -5038,12 +5048,17 @@ fn mcp_register_source_overlays(tt: i64, overlays: i64, root_src: i64, root_path
           let under_workspace = workspace_len > 0 and path_len > workspace_len and src_eq_at(path_ptr, 0, workspace_ptr, 0, workspace_len) == 1 and
             (workspace_len == 1 or mem_load8_at(path_ptr, workspace_len) == 47)
           let relative_start = if under_workspace { if workspace_len == 1 { 1 } else { workspace_len + 1 } } else { 0 }
-          ttable_register_source(tt, doc_src, doc_len, path_ptr + relative_start, path_len - relative_start)
+          let path = runtime_str_from_bytes_copy(path_ptr + relative_start, path_len - relative_start)
+          let content = runtime_str_from_bytes_copy(doc_src, doc_len)
+          let request = SourceRequest { physical_path: path, logical_path: path, package_id: 0 }
+          let source = Source { text: content, identity: DiagnosticSourceBuffer(__str_ptr(content)) }
+          owners = source_owners.with_source(owners, request, source)
+          ttable_register_source(tt, __str_ptr(content), __str_len(content), __str_ptr(path), __str_len(path))
         } else { 0 }
       } else { 0 }
     }
   } else { 0 }
-  0
+  owners
 }
 
 fn mcp_check_source_quiet_inner_with_path_and_overlays(src: i64, n: i64, path_ptr: i64, path_len: i64, overlays: i64, workspace_ptr: i64, workspace_len: i64) -[Diagnose, SourceAcquire]> TypedModule {
@@ -5051,8 +5066,9 @@ fn mcp_check_source_quiet_inner_with_path_and_overlays(src: i64, n: i64, path_pt
   let probe_tt = ttable_new()
   main_mark_root_origin_with_grant(probe_tt, src, 0, 1, 0)
   main_register_source_path(probe_tt, src, n, path_ptr, path_len)
-  mcp_register_source_overlays(probe_tt, overlays, src, path_ptr, path_len, workspace_ptr, workspace_len)
-  let probe_fns = pipeline_parse(grammar, src, n, probe_tt)
+  let probe_owners = mcp_register_source_overlays(probe_tt, overlays, src, path_ptr, path_len, workspace_ptr, workspace_len)
+  let probe_parsed = pipeline_parse_with_source_owners(grammar, src, n, probe_tt, probe_owners)
+  let (probe_fns, probe_loaded_owners) = match probe_parsed { PipelineParseResult(fns, _, owners) -> (fns, owners) }
   if fns_have_tests(probe_fns) == 1 {
     let prefixed = test_source_with_prefix_and_wrappers(src, n, fns_test_count(probe_fns))
     let test_src = node_f1(prefixed)
@@ -5061,14 +5077,15 @@ fn mcp_check_source_quiet_inner_with_path_and_overlays(src: i64, n: i64, path_pt
     let tt = ttable_new()
     main_mark_root_origin_with_grant(tt, test_src, 0, 1, 0)
     main_register_source_path(tt, test_src, test_n, path_ptr, path_len)
-    mcp_register_source_overlays(tt, overlays, src, path_ptr, path_len, workspace_ptr, workspace_len)
-    let fns = pipeline_parse(grammar, test_src, test_n, tt)
+    let overlay_owners = mcp_register_source_overlays(tt, overlays, src, path_ptr, path_len, workspace_ptr, workspace_len)
+    let parsed = pipeline_parse_with_source_owners(grammar, test_src, test_n, tt, overlay_owners)
+    let (fns, parsed_owners) = match parsed { PipelineParseResult(fns, _, owners) -> (fns, owners) }
     let regular = check_wrap_test_blocks(fns, name_bank_start, tt)
-    pipeline_bind_runtime_preludes(regular, test_src, tt)
-    pipeline_check_fns_with_diagnostics(regular, test_src, tt)
+    let runtime_owners = pipeline_bind_runtime_preludes(regular, test_src, tt)
+    pipeline_check_fns_with_source_owners(regular, test_src, tt, source_owners.combined(parsed_owners, runtime_owners))
   } else {
-    pipeline_bind_runtime_preludes(probe_fns, src, probe_tt)
-    pipeline_check_fns_with_diagnostics(probe_fns, src, probe_tt)
+    let runtime_owners = pipeline_bind_runtime_preludes(probe_fns, src, probe_tt)
+    pipeline_check_fns_with_source_owners(probe_fns, src, probe_tt, source_owners.combined(probe_loaded_owners, runtime_owners))
   }
 }
 
@@ -5184,10 +5201,12 @@ fn mcp_emit_ir_summary_legacy(b: i64, src: i64, n: i64) -[SourceAcquire]> i64 {
   let grammar = weft_grammar()
   let probe_tt = ttable_new()
   main_mark_root_origin_with_grant(probe_tt, src, 0, 1, 0)
-  let probe_fns = pipeline_parse(grammar, src, n, probe_tt)
+  let probe_fns_loaded = pipeline_parse(grammar, src, n, probe_tt)
+  let probe_fns = probe_fns_loaded.functions
   let mut check_src = src
   let mut check_tt = probe_tt
   let mut check_fns = probe_fns
+  let mut check_owners = probe_fns_loaded.owners
   if fns_have_tests(probe_fns) == 1 {
     let prefixed = test_source_with_prefix_and_wrappers(src, n, fns_test_count(probe_fns))
     check_src = node_f1(prefixed)
@@ -5195,8 +5214,10 @@ fn mcp_emit_ir_summary_legacy(b: i64, src: i64, n: i64) -[SourceAcquire]> i64 {
     let name_bank_start = test_source_wrapper_bank_start(prefixed)
     check_tt = ttable_new()
     main_mark_root_origin_with_grant(check_tt, check_src, 0, 1, 0)
-    let fns = pipeline_parse(grammar, check_src, test_n, check_tt)
+    let fns_loaded = pipeline_parse(grammar, check_src, test_n, check_tt)
+    let fns = fns_loaded.functions
     check_fns = check_wrap_test_blocks(fns, name_bank_start, check_tt)
+    check_owners = fns_loaded.owners
   } else { 0 }
   let check_errors = handle pipeline_check_loaded(check_fns, check_src, check_tt) {
     Diagnose.report(diagnostic) -> resume(0)
@@ -5205,7 +5226,7 @@ fn mcp_emit_ir_summary_legacy(b: i64, src: i64, n: i64) -[SourceAcquire]> i64 {
     Diagnose.note(msg, span) -> resume(0)
   }
   -- The loaded checker above already checked; wrap the triple, don't re-check.
-  mcp_emit_ir_summary_result(b, TypedModule(check_fns, check_src, check_tt, source_owners.new()), check_errors)
+  mcp_emit_ir_summary_result(b, TypedModule(check_fns, check_src, check_tt, check_owners), check_errors)
 }
 
 fn mcp_emit_ir_summary(b: i64, session: ProjectSession, src: i64, n: i64) -[SourceAcquire]> i64 {
@@ -5242,10 +5263,12 @@ fn mcp_emit_opt_counters(b: i64, src: i64, n: i64) -[SourceAcquire]> i64 {
   let grammar = weft_grammar()
   let probe_tt = ttable_new()
   main_mark_root_origin_with_grant(probe_tt, src, 0, 1, 0)
-  let probe_fns = pipeline_parse(grammar, src, n, probe_tt)
+  let probe_fns_loaded = pipeline_parse(grammar, src, n, probe_tt)
+  let probe_fns = probe_fns_loaded.functions
   let mut check_src = src
   let mut check_tt = probe_tt
   let mut check_fns = probe_fns
+  let mut check_owners = probe_fns_loaded.owners
   if fns_have_tests(probe_fns) == 1 {
     let prefixed = test_source_with_prefix_and_wrappers(src, n, fns_test_count(probe_fns))
     check_src = node_f1(prefixed)
@@ -5253,13 +5276,15 @@ fn mcp_emit_opt_counters(b: i64, src: i64, n: i64) -[SourceAcquire]> i64 {
     let name_bank_start = test_source_wrapper_bank_start(prefixed)
     check_tt = ttable_new()
     main_mark_root_origin_with_grant(check_tt, check_src, 0, 1, 0)
-    let fns = pipeline_parse(grammar, check_src, test_n, check_tt)
+    let fns_loaded = pipeline_parse(grammar, check_src, test_n, check_tt)
+    let fns = fns_loaded.functions
     check_fns = check_wrap_test_blocks(fns, name_bank_start, check_tt)
+    check_owners = fns_loaded.owners
   } else { 0 }
   -- This is a source-local analysis surface, not an emitted artifact. Bind
   -- only dependencies reached by the submitted program so the counters do
   -- not measure the compiler's universal fatal-reporting runtime.
-  pipeline_bind_runtime_preludes(check_fns, check_src, check_tt)
+  let runtime_owners = pipeline_bind_runtime_preludes(check_fns, check_src, check_tt)
   let check_errors = handle pipeline_check_loaded(check_fns, check_src, check_tt) {
     Diagnose.report(diagnostic) -> resume(0)
     Diagnose.error(msg, span) -> resume(0)
@@ -5269,7 +5294,7 @@ fn mcp_emit_opt_counters(b: i64, src: i64, n: i64) -[SourceAcquire]> i64 {
   if check_errors != 0 {
     mcp_write(b, "{\"tool\":\"opt_counters\",\"ok\":false,\"reason\":\"check errors\"}")
   } else {
-    let typed = TypedModule(check_fns, check_src, check_tt, source_owners.new())
+    let typed = TypedModule(check_fns, check_src, check_tt, source_owners.combined(check_owners, runtime_owners))
     main_acquire_native_libraries(typed)
     let ir = pipeline_lower_checked_with_weft(typed)
     let optimised = pipeline_optimise_typed_ir(typed, ir)
@@ -7811,7 +7836,7 @@ fn lsp_collect_diagnostics_legacy(st: i64, items: i64, count: i64) -> i64 {
   main_mark_root_origin_with_grant(tt, src, 0, 1, 0)
   let path = lsp_state_file_path(st)
   main_register_source_path_in_package(tt, src, n, mem_load64_at(path, 0), mem_load64_at(path, 8), 0)
-  mcp_register_source_overlays(tt, lsp_state_documents(st), src, mem_load64_at(path, 0), mem_load64_at(path, 8), lsp_state_workspace_ptr(st), lsp_state_workspace_len(st))
+  let overlay_owners = mcp_register_source_overlays(tt, lsp_state_documents(st), src, mem_load64_at(path, 0), mem_load64_at(path, 8), lsp_state_workspace_ptr(st), lsp_state_workspace_len(st))
   let grammar = weft_grammar()
   let encoding = lsp_state_position_encoding(st)
   let fns = handle grammar.parse(src, n, tt) {
@@ -9184,14 +9209,14 @@ fn main_test_prepare_source_with_table(raw: i64, raw_n: i64, path_ptr: i64, path
   pipeline_mark_root_origin(probe_tt, raw, trusted, strict)
   main_register_source_path(probe_tt, raw, raw_n, path_ptr, path_len)
   let probe_parsed = pipeline_parse_local_with_error_count(grammar, raw, raw_n, probe_tt)
-  let probe_errors = match probe_parsed { PipelineParseResult(fns, errors) -> errors }
+  let probe_errors = match probe_parsed { PipelineParseResult(fns, errors, parse_owners) -> errors }
   if probe_errors != 0 {
     eprint("test: parse failed with ")
     eprint_i(probe_errors)
     eprint(" errors\n")
     return MainTestPreparationComplete(1)
   } else { 0 }
-  let probe_fns = match probe_parsed { PipelineParseResult(fns, errors) -> fns }
+  let probe_fns = match probe_parsed { PipelineParseResult(fns, errors, parse_owners) -> fns }
   -- Prepare the final source before loading the module graph. The root-local
   -- parse above already discovered the exact test count, so the prepared
   -- source can take the one complete recursive parse used by checking and
@@ -9203,18 +9228,21 @@ fn main_test_prepare_source_with_table(raw: i64, raw_n: i64, path_ptr: i64, path
   pipeline_mark_root_origin(tt, src, trusted, strict)
   main_register_source_path(tt, src, n, path_ptr, path_len)
   let parsed = pipeline_parse_with_error_count(grammar, src, n, tt)
-  let parse_errors = match parsed { PipelineParseResult(fns, errors) -> errors }
+  let parse_errors = match parsed { PipelineParseResult(fns, errors, parse_owners) -> errors }
   if parse_errors != 0 {
     eprint("test: parse failed with ")
     eprint_i(parse_errors)
     eprint(" errors\n")
     return MainTestPreparationComplete(1)
   } else { 0 }
-  let fns = match parsed { PipelineParseResult(parsed_fns, errors) -> parsed_fns }
+  let fns = match parsed { PipelineParseResult(parsed_fns, errors, parse_owners) -> parsed_fns }
   if fns_test_count(fns) == 0 {
     eprint("test: no test blocks found\n")
     MainTestPreparationComplete(0)
-  } else { MainTestPrepared(fns, src, tt, name_bank_start, trusted) }
+  } else {
+    let owners = match parsed { PipelineParseResult(_, _, owners) -> owners }
+    MainTestPrepared(fns, src, tt, name_bank_start, trusted, owners)
+  }
 }
 
 fn main_test_finish_preparation_with_metrics_and_dependency_product(
@@ -9227,7 +9255,7 @@ fn main_test_finish_preparation_with_metrics_and_dependency_product(
 ) -[SourceAcquire]> i64 {
   match preparation {
     MainTestPreparationComplete(result) -> result
-    MainTestPrepared(fns, src, tt, name_bank_start, trusted) -> {
+    MainTestPrepared(fns, src, tt, name_bank_start, trusted, parsed_owners) -> {
     let grammar = weft_grammar()
     let regular = nlist_new()
     let mut test_entries_rev = test_harness_decl_list_empty()
@@ -9315,7 +9343,8 @@ fn main_test_finish_preparation_with_metrics_and_dependency_product(
     ttable_register_source_in_package(tt, harness_src, hp, 0, 0, harness_package)
     ttable_mark_trusted_source(tt, harness_src)
     -- Parse the harness source through the same parse pass boundary
-    let harness_fns = pipeline_parse(grammar, harness_src, hp, tt)
+    let harness_fns_loaded = pipeline_parse(grammar, harness_src, hp, tt)
+    let harness_fns = harness_fns_loaded.functions
     test_bind_harness_wrappers(tt, harness_src, src)
     -- Merge harness main into regular fns
     let hn = nlist_len(harness_fns)
@@ -9328,23 +9357,24 @@ fn main_test_finish_preparation_with_metrics_and_dependency_product(
     -- Type-check is a hard boundary before typed-IR/native emission. Continuing
     -- after diagnostics leaves poisoned AST/typed state for lowering, which can
     -- turn an ordinary positive-test failure into a codegen crash.
-    let errors = if nlist_len(ttable_checked_module_pairs(tt)) > 0 {
+    let checked = if nlist_len(ttable_checked_module_pairs(tt)) > 0 {
       handle pipeline_check_extending_checked(regular, src, tt) {
         Diagnose.report(diagnostic) -> { pipeline_diagnose_render_report(tt, diagnostic) resume(0) }
         Diagnose.error(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
         Diagnose.warn(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
         Diagnose.note(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
       }
-    } else { pipeline_check_fns_error_count(regular, src, tt) }
-    if errors != 0 {
+    } else { pipeline_check_fns_report(regular, src, tt) }
+    if checked.errors != 0 {
       eprint("test: type check failed with ")
-      eprint_i(errors)
+      eprint_i(checked.errors)
       eprint(" errors\n")
       1
     } else {
       -- The gate above already checked the expanded module; wrapping the
       -- triple directly avoids a third full check of user + harness fns.
-      let typed = TypedModule(regular, src, tt, source_owners.new())
+      let owners = source_owners.combined(parsed_owners, source_owners.combined(harness_fns_loaded.owners, checked.owners))
+      let typed = TypedModule(regular, src, tt, owners)
       let binary = if pipeline_optimised_dependency_product_is_available(product) == 1 {
         pipeline_emit_native_with_debug_mode_and_dependency_product(typed, main_test_native_debug_mode(), product)
       } else { pipeline_emit_native_with_debug_mode(typed, main_test_native_debug_mode()) }

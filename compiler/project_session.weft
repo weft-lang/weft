@@ -10,7 +10,9 @@ use compiler/diagnose.{diagnose_report_severity_tag}
 use compiler/grammar_checking.{check_weft_program_with_loader}
 use compiler/source_owners as source_owners
 use compiler/source_owners.{SourceOwners}
-use compiler/grammar_host.{parse_registered_source_with_loader}
+use compiler/grammar_host.{parse_registered_source_with_loader, source_load_descriptor}
+use compiler/source_input.{SourceRequest, SourceLoadResult, SourceLoaded, SourceUnavailable}
+use compiler/source_loading.{source_loader, source_loader_owners}
 use compiler/incremental.{*}
 use compiler/module.{module_fact_find_source, module_logical_path_len}
 use compiler/module_product.{*}
@@ -557,19 +559,11 @@ fn project_source_snapshot_acquire(context: ProjectQueryContext) -[SourceAcquire
   else { ProjectSourcePresent(runtime_str_from_bytes_copy(ptr, len)) }
 }
 
-fn project_source_snapshot_raw(snapshot: ProjectSourceSnapshot) -> i64 {
-  let result = alloc_words(2)
+fn project_source_snapshot_loaded(snapshot: ProjectSourceSnapshot) -> SourceLoadResult {
   match snapshot {
-    ProjectSourcePresent(content) -> {
-      mem_store64_at(result, 0, __str_ptr(content))
-      mem_store64_at(result, 8, __str_len(content))
-    }
-    ProjectSourceMissing -> {
-      mem_store64_at(result, 0, 0)
-      mem_store64_at(result, 8, 0)
-    }
+    ProjectSourcePresent(content) -> SourceLoaded(Source { text: content, identity: DiagnosticSourceBuffer(__str_ptr(content)) })
+    ProjectSourceMissing -> SourceUnavailable
   }
-  result
 }
 
 fn project_source_context_equal(left: ProjectQueryContext, right: ProjectQueryContext) -> bool {
@@ -605,48 +599,47 @@ fn project_disk_context(parent: ProjectQueryContext, physical_ptr: i64, physical
   )
 }
 
--- Immutable image sources have process lifetime and cannot change underneath
--- a session. Return them directly; only real filesystem inputs participate
--- in disk observation, copying, and refresh. The resolver owns SDK identity.
+-- Only filesystem inputs participate in observation and refresh. Embedded SDK
+-- sources cross the same retained-value boundary without becoming disk inputs.
 fn project_session_load_resolved_source(
   session: ProjectSession,
   parent: ProjectQueryContext,
-  diagnostics: ProjectDiagnostics,
   tt: i64,
-  physical_ptr: i64,
-  physical_len: i64,
-  logical_ptr: i64,
-  logical_len: i64,
-  package_id: i64
-) -[SourceAcquire, Diagnose]> i64 {
+  request: SourceRequest
+) -[SourceAcquire, Diagnose]> SourceLoadResult {
+  let physical_ptr = __str_ptr(request.physical_path)
+  let physical_len = __str_len(request.physical_path)
+  let logical_ptr = __str_ptr(request.logical_path)
+  let logical_len = __str_len(request.logical_path)
+  let package_id = request.package_id
   if pkg_identity_is_sdk(tt, package_id) == 1 {
     match SourceAcquire.sdk_origin() {
-      EmbeddedSdk(digest) -> sdk_source_load_module(logical_ptr, module_logical_path_len(logical_ptr, logical_len))
+      EmbeddedSdk(digest) -> source_load_descriptor(sdk_source_load_module(logical_ptr, module_logical_path_len(logical_ptr, logical_len)))
       CheckoutSdk(root) -> {
         let physical = pkg_path_join(__str_ptr(root), __str_len(root), physical_ptr, physical_len)
-        let loaded = project_session_load_observed_source(session, parent, diagnostics, pkg_resolve_ptr(physical), pkg_resolve_len(physical), logical_ptr, logical_len, package_id)
-        if mem_load64_at(loaded, 0) == 0 {
-          Diagnose.report(sdk_source_diagnostic(runtime_str_from_bytes_copy(physical_ptr, physical_len), "missing"))
-        } else { 0 }
+        let loaded = project_session_load_observed_source(session, parent, pkg_resolve_ptr(physical), pkg_resolve_len(physical), logical_ptr, logical_len, package_id)
+        match loaded {
+          SourceUnavailable -> Diagnose.report(sdk_source_diagnostic(request.physical_path, "missing"))
+          SourceLoaded(_) -> 0
+        }
         loaded
       }
-      NoSdk -> project_session_load_observed_source(session, parent, diagnostics, physical_ptr, physical_len, logical_ptr, logical_len, package_id)
+      NoSdk -> project_session_load_observed_source(session, parent, physical_ptr, physical_len, logical_ptr, logical_len, package_id)
     }
   } else {
-    project_session_load_observed_source(session, parent, diagnostics, physical_ptr, physical_len, logical_ptr, logical_len, package_id)
+    project_session_load_observed_source(session, parent, physical_ptr, physical_len, logical_ptr, logical_len, package_id)
   }
 }
 
 fn project_session_load_observed_source(
   session: ProjectSession,
   parent: ProjectQueryContext,
-  diagnostics: ProjectDiagnostics,
   physical_ptr: i64,
   physical_len: i64,
   logical_ptr: i64,
   logical_len: i64,
   package_id: i64
-) -[SourceAcquire]> i64 {
+) -[SourceAcquire]> SourceLoadResult {
   let context = project_disk_context(parent, physical_ptr, physical_len, logical_ptr, logical_len, package_id)
   project_session_record_observed_source(session, context)
   let table = project_session_sources(session)
@@ -663,13 +656,7 @@ fn project_session_load_observed_source(
     IncrementalQueryCycle(cycle) -> ProjectSourceMissing
     IncrementalQueryCorrupt -> ProjectSourceMissing
   }
-  project_diagnostics_retain(diagnostics, context.identity)
-  project_diagnostics_retain(diagnostics, context.physical_path)
-  match snapshot {
-    ProjectSourcePresent(content) -> project_diagnostics_retain(diagnostics, content)
-    ProjectSourceMissing -> 0
-  }
-  project_source_snapshot_raw(snapshot)
+  project_source_snapshot_loaded(snapshot)
 }
 
 pub(package) fn project_session_observed_source_count(session: ProjectSession) -> i64 {
@@ -753,6 +740,12 @@ fn project_diagnostics_retain(diagnostics: ProjectDiagnostics, owner: str) -> i6
   let owners = project_diagnostics_owners(diagnostics)
   vector_push<SourceOwners>(owners, source_owners.with_text(source_owners.new(), owner))
   0
+}
+
+fn project_diagnostics_retain_owners(diagnostics: ProjectDiagnostics, retained: SourceOwners) -> nil {
+  let owners = project_diagnostics_owners(diagnostics)
+  vector_push<SourceOwners>(owners, retained)
+  nil
 }
 
 fn project_diagnostics_add_item(diagnostics: ProjectDiagnostics, item: ProjectDiagnosticItem) -> i64 {
@@ -871,9 +864,9 @@ fn project_register_overlay_sources(session: ProjectSession, context: ProjectQue
                       -- Returned parse/check products can outlive this session.
                       -- Their source records must retain overlay bytes and paths
                       -- even when the registered-source fast path skips loading.
-                      project_diagnostics_retain(diagnostics, content)
-                      project_diagnostics_retain(diagnostics, overlay.physical_path)
-                      project_diagnostics_retain(diagnostics, overlay.identity)
+                      let request = SourceRequest { physical_path: overlay.physical_path, logical_path: overlay.identity, package_id: 0 }
+                      let source = Source { text: content, identity: DiagnosticSourceBuffer(__str_ptr(content)) }
+                      project_diagnostics_retain_owners(diagnostics, source_owners.with_source(source_owners.new(), request, source))
                       if __str_len(overlay.physical_path) > 0 {
                         ttable_register_source(
                           tt,
@@ -941,30 +934,20 @@ fn project_parse_present(session: ProjectSession, context: ProjectQueryContext, 
   let src = __str_ptr(content)
   let diagnostics = project_diagnostics_new()
   project_diagnostics_retain(diagnostics, context.physical_path)
-  project_diagnostics_retain(diagnostics, content)
   let tt = project_register_root(session, context, content, diagnostics)
   if tt == 0 {
     incremental_query_abort<ProjectParseResult>(ticket)
     ProjectParseCorrupt
   } else {
-    let loader = (physical_ptr: i64, physical_len: i64, logical_ptr: i64, logical_len: i64, package_id: i64) => project_session_load_resolved_source(
-      session,
-      context,
-      diagnostics,
-      tt,
-      physical_ptr,
-      physical_len,
-      logical_ptr,
-      logical_len,
-      package_id
-    )
-    let fns = handle parse_registered_source_with_loader(Source { text: content, identity: DiagnosticSourceBuffer(src) }, tt, loader) {
+    let loader = source_loader((request: SourceRequest) => project_session_load_resolved_source(session, context, tt, request), project_diagnostics_source_owners(diagnostics))
+    let parsed = handle parse_registered_source_with_loader(Source { text: content, identity: DiagnosticSourceBuffer(src) }, tt, loader) {
       Diagnose.report(diagnostic) -> { project_diagnostics_add(diagnostics, diagnostic, src, __str_len(content), tt) resume(0) }
       Diagnose.error(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, __str_len(content), tt, DiagnosticSeverityError, DiagnosticClassParse, msg, span) resume(0) }
       Diagnose.warn(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, __str_len(content), tt, DiagnosticSeverityWarning, DiagnosticClassParse, msg, span) resume(0) }
       Diagnose.note(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, __str_len(content), tt, DiagnosticSeverityNote, DiagnosticClassParse, msg, span) resume(0) }
     }
-    let ast = AstModule(fns, src, tt, project_diagnostics_source_owners(diagnostics))
+    project_diagnostics_retain_owners(diagnostics, parsed.owners)
+    let ast = AstModule(parsed.functions, src, tt, parsed.owners)
     let result = if project_diagnostics_error_count(diagnostics) == 0 {
       ProjectParseSucceeded(ast, __str_len(content), diagnostics)
     } else { ProjectParseFailed(ast, __str_len(content), diagnostics) }
@@ -1113,31 +1096,21 @@ fn project_prepared_parse_tests(session: ProjectSession, context: ProjectQueryCo
   let src = __str_ptr(content)
   let diagnostics = project_diagnostics_new()
   project_diagnostics_retain(diagnostics, context.physical_path)
-  project_diagnostics_retain(diagnostics, content)
   let tt = project_register_root(session, context, content, diagnostics)
   if tt == 0 {
     incremental_query_abort<ProjectPreparedParseResult>(ticket)
     ProjectPreparedParseCorrupt
   } else {
-    let loader = (physical_ptr: i64, physical_len: i64, logical_ptr: i64, logical_len: i64, package_id: i64) => project_session_load_resolved_source(
-      session,
-      context,
-      diagnostics,
-      tt,
-      physical_ptr,
-      physical_len,
-      logical_ptr,
-      logical_len,
-      package_id
-    )
+    let loader = source_loader((request: SourceRequest) => project_session_load_resolved_source(session, context, tt, request), project_diagnostics_source_owners(diagnostics))
     let parsed = handle parse_registered_source_with_loader(Source { text: content, identity: DiagnosticSourceBuffer(src) }, tt, loader) {
       Diagnose.report(diagnostic) -> { project_diagnostics_add(diagnostics, diagnostic, src, __str_len(content), tt) resume(0) }
       Diagnose.error(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, __str_len(content), tt, DiagnosticSeverityError, DiagnosticClassParse, msg, span) resume(0) }
       Diagnose.warn(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, __str_len(content), tt, DiagnosticSeverityWarning, DiagnosticClassParse, msg, span) resume(0) }
       Diagnose.note(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, __str_len(content), tt, DiagnosticSeverityNote, DiagnosticClassParse, msg, span) resume(0) }
     }
-    let fns = test_prepare_wrap_fns(parsed, test_prepare_source_wrapper_bank_start(prepared), tt)
-    let ast = AstModule(fns, src, tt, project_diagnostics_source_owners(diagnostics))
+    project_diagnostics_retain_owners(diagnostics, parsed.owners)
+    let fns = test_prepare_wrap_fns(parsed.functions, test_prepare_source_wrapper_bank_start(prepared), tt)
+    let ast = AstModule(fns, src, tt, parsed.owners)
     let combined_diagnostics = project_diagnostics_combine(raw_diagnostics, diagnostics)
     let result = if project_diagnostics_error_count(diagnostics) == 0 {
       ProjectPreparedParseSucceeded(ast, __str_len(content), combined_diagnostics)
@@ -1211,23 +1184,14 @@ fn project_check_compute(session: ProjectSession, context: ProjectQueryContext, 
     ProjectPreparedParseSucceeded(ast, n, parse_diagnostics) -> match ast {
       AstModule(fns, src, tt, owners) -> {
         let diagnostics = project_diagnostics_with_sources(owners)
-        let loader = (physical_ptr: i64, physical_len: i64, logical_ptr: i64, logical_len: i64, package_id: i64) => project_session_load_resolved_source(
-          session,
-          context,
-          diagnostics,
-          tt,
-          physical_ptr,
-          physical_len,
-          logical_ptr,
-          logical_len,
-          package_id
-        )
+        let loader = source_loader((request: SourceRequest) => project_session_load_resolved_source(session, context, tt, request), owners)
         let checked = handle check_weft_program_with_loader(ast, loader) {
           Diagnose.report(diagnostic) -> { project_diagnostics_add(diagnostics, diagnostic, src, n, tt) resume(0) }
           Diagnose.error(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, n, tt, DiagnosticSeverityError, DiagnosticClassType, msg, span) resume(0) }
           Diagnose.warn(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, n, tt, DiagnosticSeverityWarning, DiagnosticClassType, msg, span) resume(0) }
           Diagnose.note(msg, span) -> { project_diagnostics_add_legacy(diagnostics, src, n, tt, DiagnosticSeverityNote, DiagnosticClassType, msg, span) resume(0) }
         }
+        project_diagnostics_retain_owners(diagnostics, source_loader_owners(loader))
         -- Checking can acquire additional sources. Freeze only after the
         -- loader has finished; neither product borrows the diagnostic builder.
         let acquired = project_diagnostics_source_owners(diagnostics)

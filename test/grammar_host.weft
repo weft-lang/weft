@@ -1,10 +1,14 @@
-use compiler/grammar_host.{parse_registered_source_with_loader}
+use compiler/grammar_host.{parse_registered_source_with_loader, parse_use_file_with_loader, source_load_descriptor}
+use compiler/source_input.{SourceRequest, SourceLoadResult, SourceLoaded, SourceUnavailable}
+use compiler/source_loading.{LoadedModuleSyntax, source_loader, source_loader_owners}
+use compiler/source_owners as source_owners
 use compiler/grammar_source.{WeftParser}
-use compiler/lib.{nlist_len}
+use compiler/lib.{nlist_new, nlist_len}
+use compiler/source_registration.{is_file_loaded}
 use compiler/module.{module_fact_import_count}
 use compiler/type_registry.{ttable_new}
 use runtime/alloc.{alloc_words}
-use runtime/memory.{mem_store64_at}
+use runtime/memory.{mem_store64_at, mem_load64_at}
 use runtime/string.{runtime_str_from_bytes_copy}
 use stdlib/grammar.{Grammar, Parsed}
 use stdlib/source.{Source}
@@ -16,17 +20,15 @@ use stdlib/state.{State}
 
 effect ObserveLoad { fn request(path: str) -> nil }
 
-fn empty_source(physical: i64, physical_len: i64, logical: i64, logical_len: i64, package_id: i64) -[ObserveLoad]> i64 {
-  ObserveLoad.request(runtime_str_from_bytes_copy(logical, logical_len))
-  let result = alloc_words(2)
-  mem_store64_at(result, 0, alloc_words(1))
-  mem_store64_at(result, 8, 0)
-  result
+fn empty_source(request: SourceRequest) -[ObserveLoad]> SourceLoadResult {
+  ObserveLoad.request(request.logical_path)
+  SourceLoaded(Source { text: "", identity: DiagnosticSourceNamed(request.physical_path) })
 }
 
 type HostObservations { requests: List<str>, diagnostics: List<Diagnostic> }
 
-fn collect_host_with(source: Source, table: i64, loader: (i64, i64, i64, i64, i64) -[ObserveLoad]> i64) -> (i64, HostObservations) {
+fn collect_host_with(source: Source, table: i64, acquire: (SourceRequest) -[ObserveLoad, Diagnose]> SourceLoadResult) -> (LoadedModuleSyntax, HostObservations) {
+  let loader = source_loader(acquire, source_owners.new())
   let initial = HostObservations { requests: Nil<str>(), diagnostics: Nil<Diagnostic>() }
   state.run(initial, () => handle {
     handle parse_registered_source_with_loader(source, table, loader) {
@@ -48,7 +50,7 @@ fn collect_host_with(source: Source, table: i64, loader: (i64, i64, i64, i64, i6
   })
 }
 
-fn collect_host(source: Source, table: i64) -> (i64, HostObservations) {
+fn collect_host(source: Source, table: i64) -> (LoadedModuleSyntax, HostObservations) {
   collect_host_with(source, table, empty_source)
 }
 
@@ -56,7 +58,7 @@ test "host source acquisition follows parsed imports in declaration order" {
   let source = Source { text: "use missing/first\nfn value() -> i64 { 42 }\nuse missing/second\n", identity: DiagnosticSourceNamed("host.weft") }
   let table = ttable_new()
   let (functions, observed) = collect_host(source, table)
-  Test.assert_eq(nlist_len(functions), 1)
+  Test.assert_eq(nlist_len(functions.functions), 1)
   Test.assert_eq_usize(observed.diagnostics.len(), 0)
   let requests = observed.requests.reverse()
   Test.assert_eq_usize(requests.len(), 2)
@@ -69,7 +71,7 @@ test "a rejected local source never requests its apparent imports" {
   let source = Source { text: "use missing/first\n0x\n", identity: DiagnosticSourceNamed("broken.weft") }
   let table = ttable_new()
   let (functions, observed) = collect_host(source, table)
-  Test.assert_eq(nlist_len(functions), 0)
+  Test.assert_eq(nlist_len(functions.functions), 0)
   Test.assert_eq_usize(observed.requests.len(), 0)
   Test.assert_eq_usize(observed.diagnostics.len(), 1)
 }
@@ -78,7 +80,7 @@ test "recoverable local errors preserve source identity and valid import declara
   let source = Source { text: "}\nuse missing/first\nfn value() -> i64 { 42 }\n", identity: DiagnosticSourceNamed("recovered.weft") }
   let table = ttable_new()
   let (functions, observed) = collect_host(source, table)
-  Test.assert_eq(nlist_len(functions), 1)
+  Test.assert_eq(nlist_len(functions.functions), 1)
   Test.assert_eq_usize(observed.requests.len(), 1)
   Test.assert_eq_usize(observed.diagnostics.len(), 1)
   Test.assert_true(match observed.diagnostics.first().unwrap().primary() {
@@ -105,13 +107,11 @@ test "host loader diagnostics retain the root source identity" {
   let source = Source { text: "use missing", identity: DiagnosticSourceNamed("named-host.weft") }
   let diagnostic = uncoded(DiagnosticSeverityError, DiagnosticClassParse, "missing source",
     DiagnosticSourceRange(DiagnosticSourceBuffer(__str_ptr(source.text)), 4, 11))
-  let loader: (i64, i64, i64, i64, i64) -[Diagnose]> i64 = (physical, physical_len, logical, logical_len, package_id) => {
+  let acquire = (request: SourceRequest) => {
     Diagnose.report(diagnostic)
-    let missing = alloc_words(2)
-    mem_store64_at(missing, 0, 0)
-    mem_store64_at(missing, 8, 0)
-    missing
+    SourceUnavailable
   }
+  let loader = source_loader(acquire, source_owners.new())
   let (_, reports) = state.run(Nil<Diagnostic>(), () => handle parse_registered_source_with_loader(source, ttable_new(), loader) {
     Diagnose.report(report) -> {
       state.modify((items: List<Diagnostic>) => Cons(report, items))
@@ -132,18 +132,15 @@ test "host traverses nested imports and excludes dependency tests from the root 
   let source = Source { text: "use provided/first\nfn root_value() -> i64 { 0 }", identity: DiagnosticSourceNamed("root.weft") }
   let first = "use provided/second\npub fn first_value() -> i64 { 1 }\ntest \"dependency\" { Test.assert_true(false) }"
   let second = "pub fn second_value() -> i64 { 2 }"
-  let loader: (i64, i64, i64, i64, i64) -[ObserveLoad]> i64 = (physical, physical_len, logical, logical_len, package_id) => {
-    let name = runtime_str_from_bytes_copy(logical, logical_len)
+  let loader = (request: SourceRequest) => {
+    let name = request.logical_path
     ObserveLoad.request(name)
     let text = if name == "provided/first" { first } else { second }
-    let result = alloc_words(2)
-    mem_store64_at(result, 0, __str_ptr(text))
-    mem_store64_at(result, 8, __str_len(text))
-    result
+    SourceLoaded(Source { text: text, identity: DiagnosticSourceNamed(request.physical_path) })
   }
   let table = ttable_new()
   let (functions, observed) = collect_host_with(source, table, loader)
-  Test.assert_eq(nlist_len(functions), 3)
+  Test.assert_eq(nlist_len(functions.functions), 3)
   Test.assert_eq(module_fact_import_count(table), 2)
   Test.assert_eq_usize(observed.diagnostics.len(), 0)
   let requests = observed.requests.reverse()
@@ -155,15 +152,12 @@ test "host traverses nested imports and excludes dependency tests from the root 
 test "an invalid dependency stops its nested imports and reports its own source" {
   let source = Source { text: "use provided/broken\nfn root_value() -> i64 { 0 }", identity: DiagnosticSourceNamed("root.weft") }
   let broken = "use provided/unreachable\n0x\n"
-  let loader: (i64, i64, i64, i64, i64) -[ObserveLoad]> i64 = (physical, physical_len, logical, logical_len, package_id) => {
-    ObserveLoad.request(runtime_str_from_bytes_copy(logical, logical_len))
-    let result = alloc_words(2)
-    mem_store64_at(result, 0, __str_ptr(broken))
-    mem_store64_at(result, 8, __str_len(broken))
-    result
+  let loader = (request: SourceRequest) => {
+    ObserveLoad.request(request.logical_path)
+    SourceLoaded(Source { text: broken, identity: DiagnosticSourceBuffer(__str_ptr(broken)) })
   }
   let (functions, observed) = collect_host_with(source, ttable_new(), loader)
-  Test.assert_eq(nlist_len(functions), 1)
+  Test.assert_eq(nlist_len(functions.functions), 1)
   Test.assert_eq_usize(observed.requests.len(), 1)
   Test.assert_str_eq(observed.requests.first().unwrap(), "provided/broken")
   Test.assert_eq_usize(observed.diagnostics.len(), 1)
@@ -179,14 +173,14 @@ test "an invalid dependency stops its nested imports and reports its own source"
 }
 
 test "missing and invalid loaded sources are not accepted as empty modules" {
-  for (present, length) in [(false, 0), (true, -1), (true, 0)] {
+  for (present, length) in [(false, 0), (true, - 1), (true, 0)] {
     let source = Source { text: "use provided/empty\nfn main() -> i64 { 42 }", identity: DiagnosticSourceNamed("host.weft") }
-    let loader = (physical: i64, physical_len: i64, logical: i64, logical_len: i64, package_id: i64) => {
-      ObserveLoad.request(runtime_str_from_bytes_copy(logical, logical_len))
+    let loader = (request: SourceRequest) => {
+      ObserveLoad.request(request.logical_path)
       let descriptor = alloc_words(2)
       mem_store64_at(descriptor, 0, if present { __str_ptr("") } else { 0 })
       mem_store64_at(descriptor, 8, length)
-      descriptor
+      source_load_descriptor(descriptor)
     }
     let (_, observed) = collect_host_with(source, ttable_new(), loader)
     Test.assert_eq_usize(observed.requests.len(), 1)
@@ -204,5 +198,57 @@ test "missing and invalid loaded sources are not accepted as empty modules" {
         _ -> false
       })
     }
+  }
+}
+
+test "nested loader diagnostics retain the dependency's declared source identity" {
+  let root = Source { text: "use provided/first", identity: DiagnosticSourceNamed("root.weft") }
+  let dependency = Source { text: "use provided/missing", identity: DiagnosticSourceNamed("dependency-display.weft") }
+  let acquire = (request: SourceRequest) => {
+    ObserveLoad.request(request.logical_path)
+    if request.logical_path == "provided/first" { SourceLoaded(dependency) }
+    else {
+      Diagnose.report(uncoded(DiagnosticSeverityError, DiagnosticClassModule, "nested refusal",
+        DiagnosticSourceRange(DiagnosticSourceBuffer(__str_ptr(dependency.text)), 4, 20)))
+      SourceUnavailable
+    }
+  }
+  let (_, observed) = collect_host_with(root, ttable_new(), acquire)
+  Test.assert_eq_usize(observed.requests.len(), 2)
+  Test.assert_eq_usize(observed.diagnostics.len(), 1)
+  Test.assert_true(match observed.diagnostics.first().unwrap().primary() {
+    DiagnosticSourceRange(DiagnosticSourceNamed(path), start, end) -> path == "dependency-display.weft" and start == 4 and end == 20
+    _ -> false
+  })
+}
+
+fn detached_support(available: bool) -> (i64, LoadedModuleSyntax) {
+  let path = runtime_str_from_bytes_copy(__str_ptr("provided/detached.weft"), 22)
+  let input = SourceRequest { physical_path: "provided/detached.weft", logical_path: "provided/detached", package_id: 0 }
+  let inherited = if available {
+    source_owners.with_source(source_owners.new(), input,
+      Source { text: "pub fn value() -> i64 { 42 }", identity: DiagnosticSourceNamed(input.physical_path) })
+  } else { source_owners.new() }
+  let loader = source_loader((request: SourceRequest) => SourceUnavailable, inherited)
+  let table = ttable_new()
+  let functions = nlist_new()
+  handle parse_use_file_with_loader(functions, table, path, loader) {
+    Diagnose.report(diagnostic) -> resume(0)
+    Diagnose.error(message, position) -> resume(0)
+    Diagnose.warn(message, position) -> resume(0)
+    Diagnose.note(message, position) -> resume(0)
+  }
+  (table, LoadedModuleSyntax { functions: functions, owners: source_loader_owners(loader) })
+}
+
+test "support graph paths survive missing and inherited acquisitions" {
+  for available in [false, true] {
+    let (table, syntax) = detached_support(available)
+    for index in 0..256 {
+      let churn = runtime_str_from_bytes_copy(__str_ptr("xxxxxxxxxxxxxxxxxxxxxx"), 22)
+      Test.assert_eq_usize(churn.len(), 22)
+    }
+    Test.assert_true(is_file_loaded(mem_load64_at(table, 24), __str_ptr("provided/detached"), 0, 17, 0))
+    Test.assert_eq(nlist_len(syntax.functions), if available { 1 } else { 0 })
   }
 }
