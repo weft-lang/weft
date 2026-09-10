@@ -133,3 +133,26 @@ evidence to check the measurement environment before changing the compiler.
 Run the harness regression tests with `python3 test/test_bench_compare.py`.
 They also run in the repository gate. Benchmark checksums themselves are
 validated by executing every compiled sibling, not by the harness unit tests.
+
+## Historical revision 1 checkpoint
+
+These are the earlier **small-workload minima**, not results from the current
+workloads: 21 runs after two warmups, Apple M4 Max, 2026-09-07, benchmark
+sources `7e2dfc81`, compiler `30856f0b`, Go 1.26.6 and Rust 1.95.0. They are
+retained for provenance, not for direct speedup ratios against revision 2's
+larger workloads and median-based report.
+
+| Workload | Weft | Go | Rust |
+|---|---:|---:|---:|
+| vector_sort | 3.57 ms | 1.96 ms | 1.67 ms |
+| graph_reach | 9.34 ms | 2.98 ms | 2.69 ms |
+| nbody | 10.04 ms | 3.53 ms | 3.41 ms |
+| sieve | 22.76 ms | 10.30 ms | 6.84 ms |
+| mandelbrot | 18.89 ms | 10.51 ms | 10.71 ms |
+| sorted_lookup | 35.16 ms | 18.79 ms | 9.00 ms |
+| iterator_pipeline_direct | 1.77 ms | 3.04 ms | 1.96 ms |
+| iterator_pipeline | 1.75 ms | 2.33 ms | 1.65 ms |
+
+At that checkpoint, self-compilation took 30.85s median using
+`compile compiler/main.weft`. The small iterator timings were close to process
+startup; they do not establish an algorithm-throughput ranking.

@@ -186,32 +186,40 @@ fn open_and_close(path: Path) -[IO, Fail<IoError>]> Result<nil, IoError> {
 
 ## Benchmarks
 
-Small algorithm kernels have sibling Weft, Go, and Rust implementations with
+Algorithm workloads have sibling Weft, Go, and Rust implementations with
 the same algorithms, data sizes, and checked results. The Weft programs use
 ordinary language features and public collection APIs, including checked
 slices and optional lookups. All three n-body implementations use body records.
-Minimum elapsed time from 21 runs after two warmups, Apple M4 Max,
-2026-09-07, benchmark sources `7e2dfc81` and compiler `30856f0b`:
+Median elapsed time from 21 runs after two warmups, Apple M4 Max,
+2026-09-10, revision 2 benchmark sources `76fc0bff` and compiler `c6a1a445`.
+The empty-program control has 51 measured runs:
 
 | Workload | Weft | Go | Rust |
 |---|---:|---:|---:|
-| vector_sort | 3.57 ms | 1.96 ms | 1.67 ms |
-| graph_reach | 9.34 ms | 2.98 ms | 2.69 ms |
-| nbody | 10.04 ms | 3.53 ms | 3.41 ms |
-| sieve | 22.76 ms | 10.30 ms | 6.84 ms |
-| mandelbrot | 18.89 ms | 10.51 ms | 10.71 ms |
-| sorted_lookup | 35.16 ms | 18.79 ms | 9.00 ms |
-| iterator_pipeline_direct | 1.77 ms | 3.04 ms | 1.96 ms |
-| iterator_pipeline | 1.75 ms | 2.33 ms | 1.65 ms |
+| empty (startup/exit) | 1.50 ms | 1.95 ms | 1.72 ms |
+| vector_sort | 1868.53 ms | 68.04 ms | 65.52 ms |
+| graph_reach | 476.02 ms | 88.59 ms | 89.60 ms |
+| nbody | 320.31 ms | 65.22 ms | 69.68 ms |
+| sieve | 133.07 ms | 88.00 ms | 56.88 ms |
+| mandelbrot | 255.90 ms | 119.82 ms | 129.22 ms |
+| sorted_lookup | 299.00 ms | 166.39 ms | 67.15 ms |
+| iterator_pipeline_direct | 161.10 ms | 149.39 ms | 283.24 ms |
+| iterator_pipeline | 748.13 ms | 164.12 ms | 65.64 ms |
 
-Rust uses `-C opt-level=3 -C codegen-units=1 -C target-cpu=native`; Go uses
-its default build settings. These are small, process-level measurements;
-launch, runtime startup, and exit are included even in the minimum. The shortest
-workloads can be startup-dominated, so their ratios are not kernel-throughput
-rankings.
+Rust 1.95.0 uses `-C opt-level=3 -C codegen-units=1 -C target-cpu=native`;
+Go 1.26.6 uses its default build settings. Launch, runtime startup, and exit
+remain included; no startup time is subtracted. For every algorithm/language
+pair here, the empty-program median is below 3.1% of the workload median.
+All 27 products pass their result checks. These larger revision 2 workloads
+are not directly comparable with the old small-workload timings; the
+[benchmark guide](bench/compare/README.md#historical-revision-1-checkpoint)
+preserves that historical checkpoint and explains the changed sizes.
 
-Self-compilation at this checkpoint: **30.85 seconds** (median, timing
-`compile compiler/main.weft`, not a linked SDK-bearing compiler build).
+The latest separate self-compilation check is **37.04 seconds** (median of
+three runs after one warmup, 2026-09-10), up from the 2026-09-07 checkpoint of
+**30.85 seconds**. Both time `compile compiler/main.weft`, not a linked
+SDK-bearing compiler build; the changed compiler source makes this accumulated
+growth, not a same-source attribution to one change.
 
 Reproduce the table with
 `BENCH_COMPARE_RUNS=21 BENCH_COMPARE_WARMUPS=2 bash bench_compare.sh`.
