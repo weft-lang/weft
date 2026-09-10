@@ -25,12 +25,12 @@ func sieveCount(limit int) int {
 
 func main() {
 	limit := 200000
-	runs := 20
+	runs := 240
 	total := 0
 	for i := 0; i < runs; i++ {
 		total += sieveCount(limit)
 	}
-	if total != 359680 {
+	if total != 4316160 {
 		panic(total)
 	}
 }

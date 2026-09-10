@@ -80,13 +80,13 @@ fn run_once(n: i64) -> i64 {
 }
 
 fn main() {
-    let n = 600_i64;
-    let runs = 5;
+    let n = 30000_i64;
+    let runs = 60;
     let mut total = 0_i64;
-    for _ in 0..runs {
-        total += run_once(n);
+    for repetition in 0..runs {
+        total += run_once(n + repetition);
     }
-    if total != 902995 {
+    if total != 27054936800 {
         panic!("{}", total);
     }
 }

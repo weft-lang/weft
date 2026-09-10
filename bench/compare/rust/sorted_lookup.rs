@@ -54,13 +54,13 @@ fn lookup_sweep(m: &[Entry], span: i64) -> i64 {
 
 fn main() {
     let n: i64 = 20000;
-    let reps = 10;
+    let reps = 100;
     let m = build_map(n);
     let mut total: i64 = 0;
-    for _ in 0..reps {
-        total += lookup_sweep(&m, n * 2);
+    for repetition in 0..reps {
+        total += lookup_sweep(&m, n * 2 + repetition);
     }
-    if total != 2000100000 {
+    if total != 20001004950 {
         panic!("{}", total);
     }
 }

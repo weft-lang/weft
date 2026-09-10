@@ -243,6 +243,7 @@ run_markdown_phase() {
 }
 
 run_bootstrap_phase() {
+  python3 test/test_bench_compare.py || return 1
   python3 test/test_bootstrap_sdk.py || return 1
   local tmpw1
   local tmpw2

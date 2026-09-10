@@ -47,13 +47,13 @@ func graphReachableCount(graph []int64, nodes, start int) int64 {
 }
 
 func main() {
-	nodes := 160
+	nodes := 768
 	graph := buildGraph(nodes)
 	var total int64
 	for start := 0; start < nodes; start++ {
 		total += graphReachableCount(graph, nodes, start)
 	}
-	if total != 12880 {
+	if total != 295296 {
 		panic(total)
 	}
 }

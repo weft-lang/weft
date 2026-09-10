@@ -51,13 +51,13 @@ func lookupSweep(m []entry, span int64, cmp func(int64, int64) int64) int64 {
 
 func main() {
 	n := int64(20000)
-	reps := 10
+	reps := 100
 	m := buildMap(n)
 	var total int64
 	for r := 0; r < reps; r++ {
-		total += lookupSweep(m, n*2, cmpI64)
+		total += lookupSweep(m, n*2+int64(r), cmpI64)
 	}
-	if total != 2000100000 {
+	if total != 20001004950 {
 		panic(total)
 	}
 }

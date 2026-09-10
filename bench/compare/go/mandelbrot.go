@@ -32,14 +32,14 @@ func mandelbrotCount(size int, maxIter int) int {
 }
 
 func main() {
-	size := 256
+	size := 1024
 	maxIter := 80
 	runs := 3
 	total := 0
 	for i := 0; i < runs; i++ {
 		total += mandelbrotCount(size, maxIter)
 	}
-	if total != 51201 {
+	if total != 816975 {
 		panic(total)
 	}
 }

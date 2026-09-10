@@ -75,8 +75,8 @@ func nbodyFinalEnergy(steps int) float64 {
 }
 
 func main() {
-	expected := -0.16907807060863048
-	got := nbodyFinalEnergy(50000)
+	expected := -0.16902628585285398
+	got := nbodyFinalEnergy(2000000)
 	if !(math.Abs(got-expected) < 0.000000001) {
 		panic(got)
 	}

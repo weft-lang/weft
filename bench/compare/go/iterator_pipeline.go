@@ -72,10 +72,10 @@ func iteratorSum(n int64) int64 {
 
 func main() {
 	var total int64
-	for repetition := 0; repetition < 10; repetition++ {
-		total += iteratorSum(10000)
+	for repetition := int64(0); repetition < 300; repetition++ {
+		total += iteratorSum(1000000 + repetition*3)
 	}
-	if total != 333300000 {
+	if total != 100089626820300 {
 		os.Exit(1)
 	}
 }

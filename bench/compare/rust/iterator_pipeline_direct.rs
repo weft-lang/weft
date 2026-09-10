@@ -15,10 +15,10 @@ fn direct_sum(n: i64) -> i64 {
 
 fn main() {
     let mut total = 0_i64;
-    for _ in 0..10 {
-        total += direct_sum(10000);
+    for repetition in 0..300 {
+        total += direct_sum(1000000 + repetition * 3);
     }
-    if total != 333300000 {
+    if total != 100089626820300 {
         process::exit(1);
     }
 }

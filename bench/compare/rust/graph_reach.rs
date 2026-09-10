@@ -41,13 +41,13 @@ fn graph_reachable_count(graph: &[i64], nodes: usize, start: usize) -> i64 {
 }
 
 fn main() {
-    let nodes = 160_usize;
+    let nodes = 768_usize;
     let graph = build_graph(nodes);
     let mut total = 0_i64;
     for start in 0..nodes {
         total += graph_reachable_count(&graph, nodes, start);
     }
-    if total != 12880 {
+    if total != 295296 {
         panic!("{}", total);
     }
 }

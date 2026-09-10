@@ -27,12 +27,12 @@ fn sieve_count(limit: usize) -> i64 {
 
 fn main() {
     let limit = 200000_usize;
-    let runs = 20;
+    let runs = 240;
     let mut total = 0_i64;
     for _ in 0..runs {
         total += sieve_count(limit);
     }
-    if total != 359680 {
+    if total != 4316160 {
         panic!("{}", total);
     }
 }

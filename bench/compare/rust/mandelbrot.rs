@@ -30,14 +30,14 @@ fn mandelbrot_count(size: i64, max_iter: i64) -> i64 {
 }
 
 fn main() {
-    let size = 256_i64;
+    let size = 1024_i64;
     let max_iter = 80_i64;
     let runs = 3;
     let mut total = 0_i64;
     for _ in 0..runs {
         total += mandelbrot_count(size, max_iter);
     }
-    if total != 51201 {
+    if total != 816975 {
         panic!("{}", total);
     }
 }

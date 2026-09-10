@@ -76,13 +76,13 @@ func runOnce(n int64) int64 {
 }
 
 func main() {
-	n := int64(600)
-	runs := 5
+	n := int64(30000)
+	runs := 60
 	var total int64
 	for i := 0; i < runs; i++ {
-		total += runOnce(n)
+		total += runOnce(n + int64(i))
 	}
-	if total != 902995 {
+	if total != 27054936800 {
 		panic(total)
 	}
 }

@@ -47,8 +47,9 @@ import sys
 import tempfile
 import time
 
-ZOO_CASES = ["sieve", "vector_sort", "graph_reach", "mandelbrot", "nbody", "sorted_lookup",
-             "iterator_pipeline_direct", "iterator_pipeline"]
+from bench_compare import WORKLOADS, workload_identity, startup_comparison
+
+ZOO_CASES = list(WORKLOADS)
 TOOL_WORKLOADS = ["self_compile", "check_tree", "fmt_tree", "test_runner", "mcp_roundtrip"]
 # §3.12(a): the real-program workloads are pinned into the default paired
 # set so optimizer tuning stops being fit to the integer zoo alone.
@@ -314,7 +315,7 @@ def measure_workload(wl, a, b, tmp, pairs, floor=FLAT_FLOOR_PCT):
     else:
         verdict = "flat"
 
-    return {
+    result = {
         "workload": wl.name,
         "pairs": pairs,
         "verdict": verdict,
@@ -328,6 +329,26 @@ def measure_workload(wl, a, b, tmp, pairs, floor=FLAT_FLOOR_PCT):
         "samples_a_ms": [round(v, 3) for v in samples["a"]],
         "samples_b_ms": [round(v, 3) for v in samples["b"]],
     }
+    if isinstance(wl, ZooRun):
+        result.update(workload_identity(wl.case))
+        result["binary_a_sha256"] = compiler_sha256(wl.bins["a"])
+        result["binary_b_sha256"] = compiler_sha256(wl.bins["b"])
+    return result
+
+
+def include_startup_control(names):
+    names = list(dict.fromkeys(names))
+    if any(name in ZOO_CASES for name in names):
+        return ["empty"] + [name for name in names if name != "empty"]
+    return names
+
+
+def annotate_startup(result, startup):
+    if result["workload"] in ZOO_CASES and result["workload"] != "empty":
+        result["startup"] = {
+            side: startup_comparison(result[f"median_{side}_ms"], startup[f"median_{side}_ms"])
+            for side in ("a", "b")
+        }
 
 
 def main():
@@ -357,7 +378,9 @@ def main():
         if not (os.path.isfile(path) and os.access(path, os.X_OK)):
             fail(f"not an executable: {path}")
 
-    names = [w.strip() for w in args.workloads.split(",") if w.strip()]
+    names = include_startup_control([w.strip() for w in args.workloads.split(",") if w.strip()])
+    if args.pairs < 1:
+        fail("--pairs must be positive")
     if args.pairs < MIN_PAIRS_FOR_VERDICT:
         print(f"warning: {args.pairs} pairs is below the decision-grade minimum "
               f"({MIN_PAIRS_FOR_VERDICT}); verdicts will read insufficient-pairs",
@@ -373,20 +396,28 @@ def main():
             # embedded SDK. Reuse the same path to hold source identity fixed.
             b = a
         b_label = "repeat-A (null)" if args.null else args.b
-        print(f"=== bench_verdict ({sha}) A={args.a} B={b_label} pairs={args.pairs} floor={args.floor}% ===")
+        print(f"=== bench_verdict ({sha}) A={args.a} B={b_label} pairs={args.pairs} floor={args.floor}% ===", flush=True)
         for name in names:
             wl = make_workload(name)
             r = measure_workload(wl, a, b, tmp, args.pairs, args.floor)
+            if results and results[0]["workload"] == "empty":
+                annotate_startup(r, results[0])
             results.append(r)
             print(f"  {r['workload']:<14} {r['verdict']:<10} "
                   f"A {r['median_a_ms']:>9.3f}ms  B {r['median_b_ms']:>9.3f}ms  "
                   f"delta {r['median_delta_pct']:+7.3f}%  "
-                  f"p={r['sign_test_p']:.4f}  ({r['b_faster_pairs']}v{r['b_slower_pairs']}, {r['pairs']} pairs)")
+                  f"p={r['sign_test_p']:.4f}  ({r['b_faster_pairs']}v{r['b_slower_pairs']}, {r['pairs']} pairs)", flush=True)
+            if "startup" in r and any(side["startup_sensitive"] for side in r["startup"].values()):
+                print("    startup-sensitive: verdict describes whole-process time, not kernel throughput")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
     record = {
+        "schema_version": 2,
+        "measurement": "whole_process_wall",
         "sha": sha,
+        "dirty": bool(subprocess.run(["git", "status", "--porcelain"], cwd=REPO,
+                                     capture_output=True, text=True).stdout.strip()),
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "a": args.a,
         "b": "null" if args.null else args.b,
