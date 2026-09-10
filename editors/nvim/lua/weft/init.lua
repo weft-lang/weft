@@ -2,6 +2,8 @@ local M = {}
 
 local configured = false
 local tree_sitter_cli_version = "0.26.12"
+local query_names = { "highlights", "locals" }
+local queries_ready = false
 
 local function normalize(path)
   return vim.fs.normalize(path)
@@ -80,9 +82,42 @@ end
 
 local function load_parser(path)
   if vim.treesitter.language.add then
-    vim.treesitter.language.add("weft", { path = path })
+    local loaded, detail = vim.treesitter.language.add("weft", { path = path })
+    if not loaded then
+      error(detail or "Could not load the Weft Tree-sitter parser")
+    end
   else
-    vim.treesitter.language.require_language("weft", path, true)
+    if not vim.treesitter.language.require_language("weft", path, true) then
+      error("Could not load the Weft Tree-sitter parser")
+    end
+  end
+end
+
+local function configure_queries()
+  if not vim.uv.fs_stat(parser_path()) then
+    return
+  end
+  -- Validate before any FileType handler (including nvim-treesitter's) can
+  -- attach. Checkout queries can be newer than the separately installed parser.
+  local ok, detail = pcall(function()
+    load_parser(parser_path())
+    for _, name in ipairs(query_names) do
+      local path = grammar_root() .. "/queries/weft/" .. name .. ".scm"
+      vim.treesitter.query.parse("weft", table.concat(vim.fn.readfile(path), "\n"))
+    end
+  end)
+  if ok then
+    queries_ready = true
+    vim.opt.runtimepath:append(grammar_root())
+  else
+    -- Empty overrides also protect attachments made by another plugin. Do not
+    -- partially apply queries or silently discard unknown syntax nodes.
+    for _, name in ipairs(query_names) do
+      vim.treesitter.query.set("weft", name, "")
+    end
+    vim.schedule(function()
+      vim.notify("Weft Tree-sitter parser and queries are incompatible. Run :WeftInstallParser, then restart Neovim.\n" .. tostring(detail), vim.log.levels.WARN)
+    end)
   end
 end
 
@@ -103,7 +138,9 @@ local function install_parser()
 
   local compiled_generator = run(
     { normalize(repo_root() .. "/weft") },
-    { "compile", generator_source },
+    -- Keep the generator in the checkout package, where compiler-private
+    -- syntax data is visible. An absolute input can become a standalone root.
+    { "compile", "tools/tree_sitter_grammar.weft" },
     { cwd = repo_root(), text = false }
   )
   write_file(generator, compiled_generator.stdout)
@@ -125,21 +162,35 @@ local function install_parser()
   }, { cwd = generated_root })
   run(cli, { "build", "--output", staged_parser, generated_root }, { cwd = generated_root })
 
+  -- Validate against the staged library in a separate process: this Neovim
+  -- may already have the old language loaded, and language.add does not reload it.
+  local valid, validation_error = pcall(function()
+    for _, name in ipairs(query_names) do
+      run(cli, { "query", "--lib-path", staged_parser, "--lang-name", "weft",
+        grammar_root() .. "/queries/weft/" .. name .. ".scm", generator_source })
+    end
+  end)
+  if not valid then
+    vim.uv.fs_unlink(staged_parser)
+    error(validation_error)
+  end
+
   local installed, install_error = vim.uv.fs_rename(staged_parser, target)
   if not installed then
     vim.uv.fs_unlink(staged_parser)
     error(("could not install %s: %s"):format(target, install_error))
   end
-  load_parser(target)
-
   vim.notify(
-    "Installed the Weft Tree-sitter parser with tree-sitter-cli " .. tree_sitter_cli_version,
+    "Installed and query-checked the Weft Tree-sitter parser with tree-sitter-cli " .. tree_sitter_cli_version .. ". Restart Neovim to load it.",
     vim.log.levels.INFO
   )
   return target
 end
 
 local function start_treesitter(bufnr)
+  if not queries_ready then
+    return
+  end
   local path = parser_path()
   if vim.uv.fs_stat(path) then
     local loaded = pcall(load_parser, path)
@@ -150,8 +201,7 @@ local function start_treesitter(bufnr)
 end
 
 local function configure_treesitter()
-  -- Neovim discovers queries under queries/{language} on runtimepath.
-  vim.opt.runtimepath:append(grammar_root())
+  configure_queries()
 
   vim.api.nvim_create_user_command("WeftInstallParser", function()
     local ok, result = pcall(install_parser)
@@ -160,11 +210,6 @@ local function configure_treesitter()
       return
     end
 
-    for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
-      if vim.bo[bufnr].filetype == "weft" then
-        pcall(vim.treesitter.start, bufnr, "weft")
-      end
-    end
   end, {
     desc = "Generate and install the Weft Tree-sitter parser",
     force = true,

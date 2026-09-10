@@ -22,6 +22,13 @@ Restart Neovim, then run this once:
 :WeftInstallParser
 ```
 
+Restart Neovim after installation: already-loaded parser libraries remain
+cached for the session. Run the same command after pulling syntax or query
+changes. The plugin checks query compatibility before highlighting; an older
+parser produces a reinstall warning instead of a FileType traceback. The
+installer validates both queries against the new parser before replacing the
+installed library.
+
 The command asks the checked-in Weft compiler to build the standalone typed
 grammar generator, runs that generator and the pinned Tree-sitter CLI in
 Neovim's cache, and installs the parser under Neovim's data directory. Keeping
@@ -44,6 +51,13 @@ module under `compiler/`, `stdlib/`, `runtime/`, and `tools/`, all positive
 modules under `test/`, plus non-empty editor-query captures. `grammar.js`, C
 parser sources, and parser libraries are generated under `build/` or temporary
 cache directories and are intentionally excluded from git.
+
+The plugin's parser-installation and query-compatibility lifecycle can also be
+checked without loading your configuration or installing a parser:
+
+```sh
+nvim --headless -u NONE -i NONE -l editors/nvim/test/parser.lua
+```
 
 Useful checks after opening a `.weft` file:
 
