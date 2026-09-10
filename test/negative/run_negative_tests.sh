@@ -59,6 +59,8 @@ check_rejects() {
 }
 
 check_rejects grammar_parse_requires_diagnose test/negative/grammar_parse_requires_diagnose.weft 'error[E2001]:' 1
+check_rejects closure_open_effect_in_pure test/negative/closure_open_effect_in_pure.weft 'error[E2001]:'
+check_rejects closure_distinct_open_effects test/negative/closure_distinct_open_effects.weft 'closure combines distinct open effect parameters'
 check_rejects grammar_impl_extra_effect test/negative/grammar_impl_extra_effect.weft 'impl method effect mismatch' 1
 check_rejects grammar_result_wrong_syntax test/negative/grammar_result_wrong_syntax.weft 'error[E1002]:' 1
 check_rejects grammar_raw_source_requires_trust test/negative/grammar_raw_source_requires_trust.weft 'Unsafe is sealed to trusted runtime/platform code' 1
