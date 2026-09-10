@@ -206,9 +206,12 @@ Minimum elapsed time from 21 runs after two warmups, Apple M4 Max,
 
 Rust uses `-C opt-level=3 -C codegen-units=1 -C target-cpu=native`; Go uses
 its default build settings. These are small, process-level measurements;
-startup noise matters especially for the shortest workloads.
+launch, runtime startup, and exit are included even in the minimum. The shortest
+workloads can be startup-dominated, so their ratios are not kernel-throughput
+rankings.
 
-Self-compilation at this checkpoint: **30.85 seconds** (median).
+Self-compilation at this checkpoint: **30.85 seconds** (median, timing
+`compile compiler/main.weft`, not a linked SDK-bearing compiler build).
 
 Reproduce the table with
 `BENCH_COMPARE_RUNS=21 BENCH_COMPARE_WARMUPS=2 bash bench_compare.sh`.
