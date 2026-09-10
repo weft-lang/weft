@@ -1,9 +1,10 @@
-use compiler/grammar_host.{parse_module, parse_use_file}
+use compiler/grammar_host.{parse_module, parse_use_file, parse_registered_source_with_loader, parse_source_loader_for_table}
 -- Weft compiler — Layer 1
 -- Compiles Weft source with arithmetic, control flow, functions to aarch64 Mach-O
 -- Usage: ./weft < compiler/main.weft > output && chmod +x output
 
 use compiler/diagnostic_location.{diagnostic_location_clamp_offset}
+use compiler/diagnostic_observation.{observe_errors}
 use compiler/codegen.{*}
 use compiler/diagnose.{*}
 use compiler/docgen.{docgen_append_function_signature, docgen_decl_is_public_root, docgen_render_module}
@@ -11,6 +12,7 @@ use compiler/effect_ref.{*}
 use compiler/formatter.{*}
 use compiler/typeck.{*}
 use compiler/grammar.{*}
+use compiler/grammar_checking.{NativeRuntimeSupport, NativeRuntime, NativeRuntimeWithRcCensus, check_weft_native_program_with_support_and_loader}
 use compiler/grammar_comptime.{GrammarComptimeCheck, GrammarComptimeError, grammar_comptime_error_inputs, grammar_comptime_error_name, grammar_module_check_file_context}
 use compiler/grammar_registry.{*}
 use compiler/host_type_checking as host_types
@@ -130,10 +132,9 @@ fn main_fns_source_count(fns: i64, src: i64) -> i64 {
 }
 
 fn main_register_source_path(tt: i64, src: i64, n: i64, path_ptr: i64, path_len: i64) -[SourceAcquire]> i64 {
-  -- The effect-decomposed pipeline calls Grammar.lex + parse_tokens directly,
-  -- so Grammar.parse no longer performs this registration for anonymous
-  -- stdin roots. Diagnostics still need the source buffer even without a
-  -- physical path in order to render excerpts and primary carets.
+  -- Source origin and package identity belong to the host, before grammar
+  -- parsing begins. Anonymous stdin roots also need a registered buffer so
+  -- diagnostics can render excerpts and primary carets without a file path.
   let origin = SourceAcquire.sdk_origin()
   let sdk_package = handle pkg_install_sdk_for_table(tt, origin) {
     Diagnose.report(diagnostic) -> { pipeline_diagnose_render_report(tt, diagnostic) resume(0) }
@@ -180,8 +181,13 @@ fn main_check_source_with_origin_and_grant(src: i64, n: i64, trusted: i64, stric
 }
 
 type MainNativePreparation {
-  MainNativePrepared(NativeModule),
+  MainNativePrepared(NativeModule, Source),
   MainNativePreparationFailed(i64)
+}
+
+type MainSourceParsing {
+  MainSourceParsed(AstModule, Source),
+  MainSourceParseFailed(i64)
 }
 
 fn main_acquire_native_libraries(typed: TypedModule) -[SourceAcquire]> i64 {
@@ -190,48 +196,81 @@ fn main_acquire_native_libraries(typed: TypedModule) -[SourceAcquire]> i64 {
   }
 }
 
+-- Rendering is a host interpretation. Count errors without changing the
+-- result or acquiring any of the body's residual capabilities.
+fn main_report_diagnostics<T, E>(table: i64, source: i64, body: () -[Diagnose, E]> T) -[E]> (T, i64) {
+  handle observe_errors(body) {
+    Diagnose.report(diagnostic) -> {
+      pipeline_diagnose_render_report(table, diagnostic)
+      resume(0)
+    }
+    Diagnose.error(message, position) -> {
+      pipeline_diagnose_render(table, source, message, position)
+      resume(0)
+    }
+    Diagnose.warn(message, position) -> { pipeline_diagnose_render(table, source, message, position); resume(0) }
+    Diagnose.note(message, position) -> { pipeline_diagnose_render(table, source, message, position); resume(0) }
+  }
+}
+
+-- Every native tool configuration parses through Grammar and retains the
+-- source owner alongside the syntax until its final product has been emitted.
+fn main_parse_native_source(src: i64, n: i64, path_ptr: i64, path_len: i64, trusted: i64, strict: i64, can_grant_trust: i64, target: NativeLinkTarget) -[SourceAcquire]> MainSourceParsing {
+  let content = runtime_str_from_bytes_copy(src, n)
+  let root_src = __str_ptr(content)
+  let source = Source { text: content, identity: DiagnosticSourceBuffer(root_src) }
+  let tt = ttable_new()
+  ttable_set_native_compilation_target(tt, native_link_target_storage_kind(target))
+  main_mark_root_origin_with_grant(tt, root_src, trusted, strict, can_grant_trust)
+  main_register_source_path(tt, root_src, n, path_ptr, path_len)
+  let loader = parse_source_loader_for_table(tt)
+  let (fns, parse_error_count) = main_report_diagnostics(tt, root_src,
+    () => parse_registered_source_with_loader(source, tt, loader))
+  if parse_error_count != 0 {
+    eprint("compile: parse failed with ")
+    eprint_i(parse_error_count)
+    eprint(" errors\n")
+    MainSourceParseFailed(1)
+  } else {
+    MainSourceParsed(AstModule(fns, root_src, tt), source)
+  }
+}
+
+fn main_check_native_program(ast: AstModule, support: NativeRuntimeSupport) -[SourceAcquire]> CheckResult<TypedModule> {
+  match ast {
+    AstModule(fns, src, tt) -> {
+      let loader = parse_source_loader_for_table(tt)
+      let (checked, error_count) = main_report_diagnostics(tt, src,
+        () => check_weft_native_program_with_support_and_loader(ast, support, loader))
+      match checked {
+        CheckRejected -> {
+          eprint("compile: type check failed with ")
+          eprint_i(if error_count == 0 { 1 } else { error_count })
+          eprint(" errors\n")
+          CheckRejected<TypedModule>()
+        }
+        Checked(typed) -> if main_fns_have_root_main(fns, src) != 1 {
+          eprint("compile: missing main function\n")
+          CheckRejected<TypedModule>()
+        } else { Checked(typed) }
+      }
+    }
+  }
+}
+
 -- Compile and build are two Emit handlers over this one checked/lowered
 -- product. The build handler retains the native link plan while the compile
 -- handler writes the relocatable object to stdout.
 fn main_prepare_native_for_target_with_path_and_origin_and_grant(src: i64, n: i64, path_ptr: i64, path_len: i64, trusted: i64, strict: i64, can_grant_trust: i64, target: NativeLinkTarget) -[SourceAcquire]> MainNativePreparation {
-  let grammar = weft_grammar()
-  let tt = ttable_new()
-  ttable_set_native_compilation_target(tt, native_link_target_storage_kind(target))
-  main_mark_root_origin_with_grant(tt, src, trusted, strict, can_grant_trust)
-  main_register_source_path(tt, src, n, path_ptr, path_len)
-  let parsed = pipeline_parse_with_error_count(grammar, src, n, tt)
-  match parsed {
-    PipelineParseResult(fns, parse_errors) -> {
-      if parse_errors != 0 {
-        eprint("compile: parse failed with ")
-        eprint_i(parse_errors)
-        eprint(" errors\n")
-        MainNativePreparationFailed(1)
-      } else {
-      pipeline_bind_native_runtime_preludes(fns, src, tt)
-      let errors = pipeline_check_fns_error_count(fns, src, tt)
-      if errors != 0 {
-        eprint("compile: type check failed with ")
-        eprint_i(errors)
-        eprint(" errors\n")
-        MainNativePreparationFailed(1)
-      } else {
-        if main_fns_have_root_main(fns, src) != 1 {
-          eprint("compile: missing main function\n")
-          MainNativePreparationFailed(1)
-        } else {
-          -- The error-count pass above IS the check: both entries run the
-          -- same pipeline_check with the same rendering handlers, and
-          -- TypedModule is the same (fns, src, tt) triple — re-checking
-          -- here re-did every declaration for nothing (~258 MB and a full
-          -- checker pass per self-compile).
-          let typed = TypedModule(fns, src, tt)
-          main_acquire_native_libraries(typed)
-          let ir = pipeline_lower_checked_with_weft(typed)
-          let optimised = pipeline_optimise_typed_ir(typed, ir)
-          MainNativePrepared(pipeline_lower_native_module_for_target_closed(typed, optimised, target))
-        }
-      }
+  match main_parse_native_source(src, n, path_ptr, path_len, trusted, strict, can_grant_trust, target) {
+    MainSourceParseFailed(status) -> MainNativePreparationFailed(status)
+    MainSourceParsed(ast, source) -> match main_check_native_program(ast, NativeRuntime) {
+      CheckRejected -> MainNativePreparationFailed(1)
+      Checked(typed) -> {
+        main_acquire_native_libraries(typed)
+        let ir = pipeline_lower_checked_with_weft(typed)
+        let optimised = pipeline_optimise_typed_ir(typed, ir)
+        MainNativePrepared(pipeline_lower_native_module_for_target_closed(typed, optimised, target), source)
       }
     }
   }
@@ -253,7 +292,7 @@ fn main_prepare_native_with_path_and_origin_and_grant(src: i64, n: i64, path_ptr
 fn compile_with_path_and_origin_and_grant(src: i64, n: i64, path_ptr: i64, path_len: i64, trusted: i64, strict: i64, can_grant_trust: i64) -[SourceAcquire]> i64 {
   match main_prepare_native_with_path_and_origin_and_grant(src, n, path_ptr, path_len, trusted, strict, can_grant_trust) {
     MainNativePreparationFailed(status) -> status
-    MainNativePrepared(native) -> main_write_binary(pipeline_emit_checked_native_binary(native, src))
+    MainNativePrepared(native, source) -> main_write_binary(pipeline_emit_checked_native_binary(native, __str_ptr(source.text)))
   }
 }
 
@@ -284,38 +323,20 @@ fn main_write_native_product_stdout(product: PipelineNativeProduct) -> i64 {
 -- configuration. The static class distribution is reported by this process;
 -- the emitted program reports its exact dynamic helper-entry vector at exit.
 fn compile_with_path_and_origin_and_grant_rc_census(src: i64, n: i64, path_ptr: i64, path_len: i64, trusted: i64, strict: i64, can_grant_trust: i64) -[SourceAcquire]> i64 {
-  let grammar = weft_grammar()
-  let tt = ttable_new()
-  main_mark_root_origin_with_grant(tt, src, trusted, strict, can_grant_trust)
-  main_register_source_path(tt, src, n, path_ptr, path_len)
-  let parsed = pipeline_parse_with_error_count(grammar, src, n, tt)
-  match parsed {
-    PipelineParseResult(fns, parse_errors) -> {
-      if parse_errors != 0 {
-        eprint("compile: parse failed with ") eprint_i(parse_errors) eprint(" errors\n")
-        1
-      } else {
-        pipeline_bind_native_runtime_preludes(fns, src, tt)
-        pipeline_bind_rc_census_prelude(fns, src, tt)
-        let errors = pipeline_check_fns_error_count(fns, src, tt)
-        if errors != 0 {
-          eprint("compile: type check failed with ") eprint_i(errors) eprint(" errors\n")
-          1
-        } else { if main_fns_have_root_main(fns, src) != 1 {
-          eprint("compile: missing main function\n")
-          1
-        } else {
-          let typed = TypedModule(fns, src, tt)
-          main_acquire_native_libraries(typed)
-          let ir = pipeline_lower_checked_with_weft(typed)
-          let optimised = pipeline_optimise_typed_ir(typed, ir)
-          let native = pipeline_lower_native_module_with_audit(typed, optimised, 2)
-          let census = pipeline_rc_reclamation_site_census(optimised, native)
-          main_rc_reclamation_site_report(census)
-          main_write_native_product_stdout(
-            pipeline_checked_native_product(native, src, PipelineNativeDebugInformationIncluded)
-          )
-        } }
+  match main_parse_native_source(src, n, path_ptr, path_len, trusted, strict, can_grant_trust, native_link_target_host()) {
+    MainSourceParseFailed(status) -> status
+    MainSourceParsed(ast, source) -> match main_check_native_program(ast, NativeRuntimeWithRcCensus) {
+      CheckRejected -> 1
+      Checked(typed) -> {
+        main_acquire_native_libraries(typed)
+        let ir = pipeline_lower_checked_with_weft(typed)
+        let optimised = pipeline_optimise_typed_ir(typed, ir)
+        let native = pipeline_lower_native_module_with_audit(typed, optimised, 2)
+        let census = pipeline_rc_reclamation_site_census(optimised, native)
+        main_rc_reclamation_site_report(census)
+        main_write_native_product_stdout(
+          pipeline_checked_native_product(native, __str_ptr(source.text), PipelineNativeDebugInformationIncluded)
+        )
       }
     }
   }
@@ -358,35 +379,18 @@ fn main_compile_report_metrics(source_millis: i64, parse_millis: i64, check_mill
 -- stages. Binary bytes remain on stdout; the versioned ledger goes to stderr.
 fn compile_with_path_and_origin_and_grant_metrics(src: i64, n: i64, path_ptr: i64, path_len: i64, trusted: i64, strict: i64, can_grant_trust: i64, source_millis: i64) -[SourceAcquire]> i64 {
   let started = main_test_now_millis()
-  let grammar = weft_grammar()
-  let tt = ttable_new()
-  main_mark_root_origin_with_grant(tt, src, trusted, strict, can_grant_trust)
-  main_register_source_path(tt, src, n, path_ptr, path_len)
   let parse_started = main_test_now_millis()
-  let parsed = pipeline_parse_with_error_count(grammar, src, n, tt)
+  let parsed = main_parse_native_source(src, n, path_ptr, path_len, trusted, strict, can_grant_trust, native_link_target_host())
   let parse_finished = main_test_now_millis()
   match parsed {
-    PipelineParseResult(fns, parse_errors) -> {
-      if parse_errors != 0 {
-        eprint("compile: parse failed with ")
-        eprint_i(parse_errors)
-        eprint(" errors\n")
-        1
-      } else {
-        pipeline_bind_native_runtime_preludes(fns, src, tt)
-        let check_started = main_test_now_millis()
-        let errors = pipeline_check_fns_error_count(fns, src, tt)
-        let check_finished = main_test_now_millis()
-        if errors != 0 {
-          eprint("compile: type check failed with ")
-          eprint_i(errors)
-          eprint(" errors\n")
-          1
-        } else { if main_fns_have_root_main(fns, src) != 1 {
-          eprint("compile: missing main function\n")
-          1
-        } else {
-          let typed = TypedModule(fns, src, tt)
+    MainSourceParseFailed(status) -> status
+    MainSourceParsed(ast, source) -> {
+      let check_started = main_test_now_millis()
+      let checked = main_check_native_program(ast, NativeRuntime)
+      let check_finished = main_test_now_millis()
+      match checked {
+        CheckRejected -> 1
+        Checked(typed) -> {
           main_acquire_native_libraries(typed)
           let lower_started = main_test_now_millis()
           let ir = pipeline_lower_checked_with_weft(typed)
@@ -398,7 +402,7 @@ fn compile_with_path_and_origin_and_grant_metrics(src: i64, n: i64, path_ptr: i6
           let native = pipeline_lower_native_module_closed(typed, optimised)
           let native_finished = main_test_now_millis()
           let package_started = main_test_now_millis()
-          let binary = pipeline_emit_checked_native_binary(native, src)
+          let binary = pipeline_emit_checked_native_binary(native, __str_ptr(source.text))
           let package_finished = main_test_now_millis()
           let write_started = main_test_now_millis()
           let status = main_write_binary(binary)
@@ -413,12 +417,12 @@ fn compile_with_path_and_origin_and_grant_metrics(src: i64, n: i64, path_ptr: i6
             main_compile_elapsed_millis(package_started, package_finished),
             main_compile_elapsed_millis(write_started, finished),
             source_millis + main_compile_elapsed_millis(started, finished),
-            nlist_len(fns),
+            match typed { TypedModule(fns, _, _) -> nlist_len(fns) },
             ir_function_list_len(pipeline_ir_functions(optimised)),
             pipeline_native_function_count(native)
           )
           status
-        } }
+        }
       }
     }
   }
@@ -585,9 +589,9 @@ fn main_build_path(path: i64, output_path: i64, facts_path: i64, debug_mode: Pip
   } else {
     match main_prepare_native_for_target_with_path_and_origin_and_grant(src, n, path, len, cpath_is_trusted_source(path, len), cpath_is_strict_source(path, len), cpath_can_grant_import_trust(path, len), target) {
       MainNativePreparationFailed(status) -> status
-      MainNativePrepared(native) -> match main_build_native_with_sdk(native, sdk_embed) {
+      MainNativePrepared(native, source) -> match main_build_native_with_sdk(native, sdk_embed) {
         MainSdkPreparationFailed(status) -> status
-        MainSdkPrepared(ready, sdk) -> main_build_write_product_result(pipeline_checked_native_product(ready, src, debug_mode), output_path, facts_path, target, sdk)
+        MainSdkPrepared(ready, sdk) -> main_build_write_product_result(pipeline_checked_native_product(ready, __str_ptr(source.text), debug_mode), output_path, facts_path, target, sdk)
       }
     }
   }
@@ -937,8 +941,8 @@ fn main_run_path(path: i64, argc: i64, argv: i64, first_product_arg: i64, envp: 
       native_link_target_host()
     ) {
       MainNativePreparationFailed(status) -> status
-      MainNativePrepared(native) -> main_run_product(
-        pipeline_checked_native_product(native, src, PipelineNativeDebugInformationIncluded),
+      MainNativePrepared(native, source) -> main_run_product(
+        pipeline_checked_native_product(native, __str_ptr(source.text), PipelineNativeDebugInformationIncluded),
         argc,
         argv,
         first_product_arg,

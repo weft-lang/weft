@@ -1152,7 +1152,8 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_diagnostic_schema_public_surface" "$(<"$tmp_out")" "Public API items: 62. Documented: 62."
     assert_contains "doc_stdlib_diagnostic_schema_finite_range" "$(<"$tmp_out")" "DiagnosticSourceRange(DiagnosticSource, usize, usize)"
   elif [ "$stdlib_doc_name" = "diagnostic/registry" ]; then
-    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 49. Documented: 49."
+    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 50. Documented: 50."
+    assert_contains "doc_stdlib_diagnostic_registry_missing_source" "$(<"$tmp_out")" "pub fn module_source_unavailable() -> DiagnosticCode"
     assert_contains "doc_stdlib_diagnostic_registry_length" "$(<"$tmp_out")" "pub fn len() -> usize"
     assert_contains "doc_stdlib_diagnostic_registry_lookup" "$(<"$tmp_out")" "pub fn get(index: usize) -> Option<DiagnosticRegistryEntry>"
     assert_contains "doc_stdlib_diagnostic_registry_code" "$(<"$tmp_out")" "code: DiagnosticCode"
@@ -2702,6 +2703,65 @@ set -e
 assert_equals "compile_rc_census_extra_path_exits_usage" "$compile_rc_census_extra_exit" "2"
 assert_contains "compile_rc_census_extra_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics|--rc-census] PATH"
 
+# Instrumentation is a configuration of the same frontend, including rejection
+# and source provenance. A recovered declaration never licenses an artifact.
+native_frontend_source="$tmp_scratch_dir/native_frontend.weft"
+for native_failure in recovered lexer semantic missing_main missing_import; do
+  case "$native_failure" in
+    recovered)
+      printf '%s\n' 'extern fn placeholder() -> i64 { 0 }' 'fn main() -> i64 { 42 }' > "$native_frontend_source"
+      native_failure_message='compile: parse failed with 1 errors'
+      ;;
+    lexer)
+      printf '%s\n' 'fn main() -> i64 { 0x }' > "$native_frontend_source"
+      native_failure_message='compile: parse failed with 1 errors'
+      ;;
+    semantic)
+      printf '%s\n' 'fn main() -> i64 { "wrong" }' > "$native_frontend_source"
+      native_failure_message='compile: type check failed with 1 errors'
+      ;;
+    missing_main)
+      printf '%s\n' 'fn helper() -> i64 { 42 }' > "$native_frontend_source"
+      native_failure_message='compile: missing main function'
+      ;;
+    missing_import)
+      printf '%s\n' 'use no_such_native_frontend_module' 'fn main() -> i64 { 42 }' > "$native_frontend_source"
+      native_failure_message='compile: parse failed with 1 errors'
+      ;;
+  esac
+  for native_mode in plain metrics rc-census; do
+    native_options=()
+    if [ "$native_mode" != plain ]; then native_options=("--$native_mode"); fi
+    set +e
+    run_weft_compile_guarded "$WEFT" compile "${native_options[@]}" "$native_frontend_source" > "$tmp_out" 2> "$tmp_err"
+    native_failure_exit=$?
+    set -e
+    assert_equals "native_${native_mode}_${native_failure}_rejects" "$native_failure_exit" "1"
+    assert_equals "native_${native_mode}_${native_failure}_emits_nothing" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+    assert_contains "native_${native_mode}_${native_failure}_summary" "$(<"$tmp_err")" "$native_failure_message"
+    if [ "$native_mode" = plain ]; then
+      cp "$tmp_err" "$tmp_scratch_dir/native_frontend_expected.err"
+    else
+      assert_files_equal "native_${native_mode}_${native_failure}_preserves_diagnostics" "$tmp_err" "$tmp_scratch_dir/native_frontend_expected.err"
+    fi
+  done
+done
+
+cat > "$native_frontend_source" <<'WEFT_NATIVE_FRONTEND'
+use stdlib/option.{Option, Some, None}
+type Row { label: str, value: i64 }
+fn choose<T>(value: T) -> Option<T> { Some(value) }
+fn main() -> i64 {
+  match choose(Row { label: "λ".concat("ambda"), value: 42 }) {
+    Some(row) -> if row.label == "λambda" { row.value } else { 1 }
+    None -> 2
+  }
+}
+WEFT_NATIVE_FRONTEND
+run_weft_compile_guarded "$WEFT" compile "$native_frontend_source" > "$tmp_bin" 2> "$tmp_err"
+run_weft_compile_guarded "$WEFT" compile --metrics "$native_frontend_source" > "$tmp_out" 2> "$tmp_err"
+assert_files_equal "compile_metrics_preserves_imported_managed_generic_product" "$tmp_bin" "$tmp_out"
+
 assert_program_failure_contains "runtime_bump_rounding_overflow_exit" "test/runtime_bump_rounding_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
 assert_program_failure_contains "runtime_bump_size_overflow_exit" "test/runtime_bump_size_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
 assert_program_failure_contains "runtime_bump_words_overflow_exit" "test/runtime_bump_words_overflow_exit.weft" "70" "weft: managed heap exhausted and arena growth failed"
@@ -4188,7 +4248,8 @@ lsp_active_hover_after_stale="{\"jsonrpc\":\"2.0\",\"id\":83,\"method\":\"textDo
 lsp_active_close_dep="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_dep_uri\"}}}"
 lsp_active_hover_closed="{\"jsonrpc\":\"2.0\",\"id\":84,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"$lsp_active_dep_uri\"},\"position\":{\"line\":0,\"character\":7}}}"
 lsp_out=$(printf '%s%s%s%s%s%s%s%s%s%s%s' "$(lsp_frame "$lsp_active_init")" "$(lsp_frame "$lsp_active_open_root")" "$(lsp_frame "$lsp_active_open_dep")" "$(lsp_frame "$lsp_active_hover")" "$(lsp_frame "$lsp_active_definition")" "$(lsp_frame "$lsp_active_change_bad")" "$(lsp_frame "$lsp_active_change_good")" "$(lsp_frame "$lsp_active_change_stale")" "$(lsp_frame "$lsp_active_hover_after_stale")" "$(lsp_frame "$lsp_active_close_dep")" "$(lsp_frame "$lsp_active_hover_closed")" | "$WEFT" lsp 2>&1)
-assert_contains "lsp_active_graph_observes_missing_disk_module" "$lsp_out" "unknown function 'active_value'"
+assert_contains "lsp_active_graph_observes_missing_disk_module" "$lsp_out" '"code":"E4007"'
+assert_contains "lsp_active_graph_explains_missing_disk_module" "$lsp_out" "imported module source is unavailable"
 assert_contains "lsp_active_graph_overlay_clears_importer" "$lsp_out" "\"uri\":\"$lsp_active_root_uri\",\"diagnostics\":[]"
 assert_contains "lsp_active_graph_publishes_dependency_clean" "$lsp_out" "\"uri\":\"$lsp_active_dep_uri\",\"diagnostics\":[]"
 assert_contains "lsp_active_graph_hover_uses_overlay" "$lsp_out" '"id":81,"result":{"contents":{"kind":"plaintext","value":"function active_value: () -> i64"'
@@ -4197,7 +4258,7 @@ assert_contains "lsp_active_graph_definition_uses_overlay_range" "$lsp_out" '"st
 assert_contains "lsp_active_graph_change_invalidates_importer" "$lsp_out" '"code":"E4002"'
 assert_equals "lsp_active_graph_stale_change_is_ignored" "$(printf '%s' "$lsp_out" | grep -Eo '"source":"weft","message":"[^"]*","code":"E4002"' | wc -l | tr -d ' ')" "1"
 assert_contains "lsp_active_graph_good_version_survives_stale_change" "$lsp_out" '"id":83,"result":{"contents":{"kind":"plaintext","value":"function active_value: () -> i64"'
-assert_equals "lsp_active_graph_close_invalidates_importer" "$(printf '%s' "$lsp_out" | grep -o "\"source\":\"weft\",\"message\":\"unknown function 'active_value'\"" | wc -l | tr -d ' ')" "2"
+assert_equals "lsp_active_graph_close_invalidates_importer" "$(printf '%s' "$lsp_out" | grep -Eo '"source":"weft","message":"[^"]*","code":"E4007"' | wc -l | tr -d ' ')" "2"
 assert_contains "lsp_active_graph_close_clears_dependency" "$lsp_out" "\"uri\":\"$lsp_active_dep_uri\",\"diagnostics\":[]"
 assert_contains "lsp_active_graph_close_removes_document" "$lsp_out" '"id":84,"result":null'
 
@@ -4403,12 +4464,12 @@ printf 'fn hidden() -> i64 { 0 }\n' > "$tmp_outside_dir/lib.weft"
 printf 'package app\ndep evil ../%s\n' "$outside_name" > "$tmp_pkg_dir/weft.pkg"
 printf 'use evil/lib.{*}\nfn main() -> i64 { hidden() }\n' > "$tmp_pkg_dir/app.weft"
 traversal_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
-assert_contains "package_rejects_traversal_dep_path" "$traversal_out" "error[E1001]: unknown function"
+assert_contains "package_rejects_traversal_dep_path" "$traversal_out" "error[E4007]: imported module source is unavailable"
 
 printf 'package app\ndep math deps/math 1.0.0\n' > "$tmp_pkg_dir/weft.pkg"
 printf 'use math/lib.{*}\nfn main() -> i64 { add(1, 2) }\n' > "$tmp_pkg_dir/app.weft"
 unsupported_out=$(cd "$tmp_pkg_dir" && "$WEFT_ABS" check < app.weft 2>&1 || true)
-assert_contains "package_rejects_unsupported_version_token" "$unsupported_out" "error[E1001]: unknown function"
+assert_contains "package_rejects_unsupported_version_token" "$unsupported_out" "error[E4007]: imported module source is unavailable"
 
 mkdir -p "$tmp_pkg_cli_dir/deps/math"
 pkg_init_out=$(cd "$tmp_pkg_cli_dir" && "$WEFT_ABS" pkg init cli_app 2>&1)
