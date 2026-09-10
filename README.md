@@ -215,12 +215,6 @@ are not directly comparable with the old small-workload timings; the
 [benchmark guide](bench/compare/README.md#historical-revision-1-checkpoint)
 preserves that historical checkpoint and explains the changed sizes.
 
-The latest separate self-compilation check is **37.04 seconds** (median of
-three runs after one warmup, 2026-09-10), up from the 2026-09-07 checkpoint of
-**30.85 seconds**. Both time `compile compiler/main.weft`, not a linked
-SDK-bearing compiler build; the changed compiler source makes this accumulated
-growth, not a same-source attribution to one change.
-
 Reproduce the table with
 `BENCH_COMPARE_RUNS=21 BENCH_COMPARE_WARMUPS=2 bash bench_compare.sh`.
 The [benchmark guide](bench/compare/README.md) explains same-source compiler
