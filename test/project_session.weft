@@ -5,6 +5,7 @@ use compiler/module.{*}
 use compiler/module_product.{*}
 use compiler/pipeline.{*}
 use compiler/project_session.{*}
+use compiler/source_owners as source_owners
 use compiler/typeck.{*}
 use compiler/type_registry.{*}
 use runtime/alloc.{alloc_words}
@@ -15,6 +16,182 @@ use runtime/source_acquire.{source_acquire_with_checkout, source_acquire_with_st
 use stdlib/diagnostic.{*}
 use stdlib/diagnostic/schema.{*}
 use stdlib/string.{str_concat, str_eq}
+use stdlib/option.{Option, Some, None}
+use stdlib/vector as vector
+
+type DetachedProjectProduct<T> {
+  product: T,
+  source: i64,
+  source_len: i64,
+  dependency: i64,
+  dependency_len: i64
+}
+
+-- Return only the selected product and byte views, never the session,
+-- diagnostics, snapshots, or original managed source bindings.
+fn project_test_detached<T>(select: (ProjectSession, ProjectQueryContext) -> Option<T>) -> Option<DetachedProjectProduct<T>> {
+  let session = project_session_new(1)
+  let root = project_test_workspace_overlay("retained_root", "retained_root.weft", "retained")
+  let dependency = project_test_workspace_overlay("module_fixtures/retained_dependency", "module_fixtures/retained_dependency.weft", "retained")
+  let root_text = str_concat("use module_fixtures/retained_dependency.{ retained_answer } ", "fn main() -> i64 { retained_answer() }")
+  let dependency_text = str_concat("pub fn retained_answer() -> i64 ", "{ 42 }")
+  let installed_root = match project_session_set_source(session, root, root_text) {
+    IncrementalInputInserted(ProjectSourcePresent(text)) -> text
+    _ -> ""
+  }
+  let installed_dependency = match project_session_set_source(session, dependency, dependency_text) {
+    IncrementalInputInserted(ProjectSourcePresent(text)) -> text
+    _ -> ""
+  }
+  let overlays = project_overlay_set_new()
+  project_overlay_set_add(overlays, root)
+  project_overlay_set_add(overlays, dependency)
+  project_session_set_overlay_set(session, root, overlays)
+  match select(session, root) {
+    Some(product) -> Some(DetachedProjectProduct {
+      product: product,
+      source: __str_ptr(installed_root),
+      source_len: __str_len(installed_root),
+      dependency: __str_ptr(installed_dependency),
+      dependency_len: __str_len(installed_dependency)
+    })
+    None -> None<DetachedProjectProduct<T>>()
+  }
+}
+
+fn project_test_assert_detached<T>(detached: DetachedProjectProduct<T>) -[Test]> DetachedProjectProduct<T> {
+  -- Occupy the same string allocation sizes with different contents. A freed
+  -- source must not pass simply because its old bytes remain undisturbed.
+  let replacement = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  let mut churn = vector.new<str>()
+  for i in 0..256 {
+    churn.push(runtime_str_from_bytes_copy(__str_ptr(replacement), detached.source_len))
+    churn.push(runtime_str_from_bytes_copy(__str_ptr(replacement), detached.dependency_len))
+  }
+  Test.assert_str_eq(runtime_str_from_bytes_copy(detached.source, detached.source_len),
+    "use module_fixtures/retained_dependency.{ retained_answer } fn main() -> i64 { retained_answer() }")
+  Test.assert_str_eq(runtime_str_from_bytes_copy(detached.dependency, detached.dependency_len),
+    "pub fn retained_answer() -> i64 { 42 }")
+  Test.assert_eq_usize(churn.len(), 512)
+  detached
+}
+
+fn project_test_detached_check(session: ProjectSession, context: ProjectQueryContext) -> Option<TypedModule> {
+  match project_session_check(session, context) {
+    ProjectCheckSucceeded(typed, _, _, _) -> Some(typed)
+    _ -> None<TypedModule>()
+  }
+}
+
+test "parsed module independently retains root and imported source storage" {
+  let detached = project_test_detached((session: ProjectSession, context: ProjectQueryContext) => match project_session_parse(session, context) {
+    ProjectParseSucceeded(ast, _, _) -> Some(ast)
+    _ -> None<AstModule>()
+  })
+  match detached {
+    Some(value) -> { project_test_assert_detached(value); nil }
+    None -> { Test.assert_true(false); nil }
+  }
+}
+
+test "checked module independently retains root and imported source storage" {
+  match project_test_detached(project_test_detached_check) {
+    Some(value) -> { project_test_assert_detached(value); nil }
+    None -> { Test.assert_true(false); nil }
+  }
+}
+
+test "parse diagnostics independently retain root and imported source storage" {
+  let detached = project_test_detached((session: ProjectSession, context: ProjectQueryContext) => match project_session_parse(session, context) {
+    ProjectParseSucceeded(_, _, diagnostics) -> Some(diagnostics)
+    _ -> None<ProjectDiagnostics>()
+  })
+  match detached {
+    Some(value) -> { project_test_assert_detached(value); nil }
+    None -> { Test.assert_true(false); nil }
+  }
+}
+
+test "check diagnostics independently retain root and imported source storage" {
+  let detached = project_test_detached((session: ProjectSession, context: ProjectQueryContext) => match project_session_check(session, context) {
+    ProjectCheckSucceeded(_, _, _, diagnostics) -> Some(diagnostics)
+    _ -> None<ProjectDiagnostics>()
+  })
+  match detached {
+    Some(value) -> { project_test_assert_detached(value); nil }
+    None -> { Test.assert_true(false); nil }
+  }
+}
+
+test "instantiated parse product independently retains source storage" {
+  let detached = project_test_detached((session: ProjectSession, context: ProjectQueryContext) => match project_session_parse(session, context) {
+    ProjectParseSucceeded(AstModule(fns, src, table, owners), _, _) ->
+      match module_parse_product_instantiate(table, src, fns, owners) {
+        InvalidModuleParseInstance -> None<ModuleParseInstance>()
+        product -> Some(product)
+      }
+    _ -> None<ModuleParseInstance>()
+  })
+  match detached {
+    Some(value) -> { project_test_assert_detached(value); nil }
+    None -> { Test.assert_true(false); nil }
+  }
+}
+
+test "instantiated checked product independently retains source storage" {
+  let detached = project_test_detached((session: ProjectSession, context: ProjectQueryContext) => match project_session_checked_product(session, context) {
+    InvalidModuleCheckedInstance -> None<ModuleCheckedInstance>()
+    product -> Some(product)
+  })
+  match detached {
+    Some(value) -> { project_test_assert_detached(value); nil }
+    None -> { Test.assert_true(false); nil }
+  }
+}
+
+test "lowered IR independently retains root and imported source storage" {
+  let detached = project_test_detached((session: ProjectSession, context: ProjectQueryContext) => match project_test_detached_check(session, context) {
+    Some(typed) -> Some(pipeline_lower_checked_with_weft(typed))
+    None -> None<IrModule>()
+  })
+  match detached {
+    Some(value) -> { project_test_assert_detached(value); nil }
+    None -> { Test.assert_true(false); nil }
+  }
+}
+
+test "optimised IR independently retains root and imported source storage" {
+  let detached = project_test_detached((session: ProjectSession, context: ProjectQueryContext) => match project_test_detached_check(session, context) {
+    Some(typed) -> Some(pipeline_optimise_typed_ir(typed, pipeline_lower_checked_with_weft(typed)))
+    None -> None<IrModule>()
+  })
+  match detached {
+    Some(value) -> { project_test_assert_detached(value); nil }
+    None -> { Test.assert_true(false); nil }
+  }
+}
+
+test "native product independently retains root and imported source storage" {
+  let detached = project_test_detached((session: ProjectSession, context: ProjectQueryContext) => match project_test_detached_check(session, context) {
+    Some(typed) -> Some(pipeline_lower_native_module(typed, pipeline_lower_checked_with_weft(typed)))
+    None -> None<NativeModule>()
+  })
+  match detached {
+    Some(value) -> { project_test_assert_detached(value); nil }
+    None -> { Test.assert_true(false); nil }
+  }
+}
+
+test "reusable optimisation product independently retains source storage" {
+  let detached = project_test_detached((session: ProjectSession, context: ProjectQueryContext) => match project_test_detached_check(session, context) {
+    Some(typed) -> Some(pipeline_optimised_dependency_product_build(typed))
+    None -> None<PipelineOptimisedDependencyProduct>()
+  })
+  match detached {
+    Some(value) -> { project_test_assert_detached(value); nil }
+    None -> { Test.assert_true(false); nil }
+  }
+}
 
 fn project_test_overlay(identity: str, package_id: i64, options: i64, target: i64) -> ProjectQueryContext {
   project_query_context(package_id, identity, "", project_source_origin_overlay(), options, target)
@@ -75,7 +252,7 @@ test "project session materializes cached checked products with exact invalidati
   let mut first_tt = 0
   let mut first_valid = 0
   match first_product {
-    ModuleCheckedInstance(fns, tt) -> { first_fns = fns first_tt = tt first_valid = 1 0 }
+    ModuleCheckedInstance(fns, tt, owners) -> { first_fns = fns first_tt = tt first_valid = 1 0 }
     InvalidModuleCheckedInstance -> 0
   }
   let answer_hash = pipeline_ir_native_hash_name("answer")
@@ -87,7 +264,7 @@ test "project session materializes cached checked products with exact invalidati
   let mut second_fns = 0
   let mut second_tt = 0
   match second_product {
-    ModuleCheckedInstance(fns, tt) -> { second_fns = fns second_tt = tt 0 }
+    ModuleCheckedInstance(fns, tt, owners) -> { second_fns = fns second_tt = tt 0 }
     InvalidModuleCheckedInstance -> 0
   }
   let second_pair = if second_fns == 0 { 0 } else { pipeline_fns_lookup_pair_by_hash(second_fns, answer_hash) }
@@ -97,7 +274,7 @@ test "project session materializes cached checked products with exact invalidati
   let broken_source = str_concat("fn answer() -> i64 ", str_concat("{", str_concat(" \"wrong\" ", "}")))
   project_session_set_source(session, context, broken_source)
   let broken_rejected = match project_session_checked_product(session, context) {
-    ModuleCheckedInstance(fns, tt) -> 0
+    ModuleCheckedInstance(fns, tt, owners) -> 0
     InvalidModuleCheckedInstance -> 1
   }
 
@@ -108,7 +285,7 @@ test "project session materializes cached checked products with exact invalidati
   let mut fixed_tt = 0
   let mut fixed_valid = 0
   match fixed_product {
-    ModuleCheckedInstance(fns, tt) -> { fixed_fns = fns fixed_tt = tt fixed_valid = 1 0 }
+    ModuleCheckedInstance(fns, tt, owners) -> { fixed_fns = fns fixed_tt = tt fixed_valid = 1 0 }
     InvalidModuleCheckedInstance -> 0
   }
   let fixed_pair = if fixed_fns == 0 { 0 } else { pipeline_fns_lookup_pair_by_hash(fixed_fns, answer_hash) }
@@ -169,8 +346,15 @@ test "project session exposes exact checked dependencies for private method exte
   let mut inherited_fns = 0
   let mut inherited_tt = 0
   let mut valid = 0
+  let mut retained = source_owners.new()
   match project_session_checked_dependency_product(session, root) {
-    ModuleCheckedInstance(fns, tt) -> { inherited_fns = fns inherited_tt = tt valid = 1 0 }
+    ModuleCheckedInstance(fns, tt, owners) -> {
+      retained = owners
+      inherited_fns = fns
+      inherited_tt = tt
+      valid = 1
+      0
+    }
     InvalidModuleCheckedInstance -> 0
   }
   -- Checked dependency evidence is available before any consumer is checked.
@@ -179,7 +363,7 @@ test "project session exposes exact checked dependencies for private method exte
     str_hash(__str_ptr("SessionMethodBox"), 0, __str_len("SessionMethodBox")),
     str_hash(__str_ptr("SessionCheckedEvidence"), 0, __str_len("SessionCheckedEvidence"))), 1)
   Test.assert_eq(ctable_ttable(evidence), inherited_tt)
-  let dependency_product = pipeline_optimised_dependency_product_build(TypedModule(inherited_fns, 0, inherited_tt))
+  let dependency_product = pipeline_optimised_dependency_product_build(TypedModule(inherited_fns, 0, inherited_tt, retained))
 
   let consumer_source = str_concat(
     "use module_fixtures/project_session_checked_dependency.{",
@@ -202,7 +386,8 @@ test "project session exposes exact checked dependencies for private method exte
     Diagnose.warn(msg, span) -> resume(0)
     Diagnose.note(msg, span) -> resume(0)
   }
-  let typed = TypedModule(consumer_fns, __str_ptr(consumer_source), inherited_tt)
+  retained = source_owners.with_text(retained, consumer_source)
+  let typed = TypedModule(consumer_fns, __str_ptr(consumer_source), inherited_tt, retained)
   let ir = pipeline_lower_ir(typed)
   let optimised = pipeline_optimise_typed_ir(typed, ir)
   let reused = pipeline_optimise_typed_ir_with_dependency_product(typed, ir, dependency_product)
@@ -317,7 +502,7 @@ test "typed check failures retain provenance and are cached" {
       let diagnostic = project_diagnostics_get(check_diagnostics, 0)
       match diagnostic.primary() {
         DiagnosticSourceRange(DiagnosticSourceBuffer(source), start, end) -> {
-          match typed { TypedModule(_, registered, _) -> Test.assert_eq(source, registered) }
+          match typed { TypedModule(_, registered, _, owners) -> Test.assert_eq(source, registered) }
           Test.assert_str_eq(runtime_str_from_bytes_copy(source, source_n), broken)
           Test.assert_eq(if end > start { 1 } else { 0 }, 1)
         }
@@ -448,7 +633,7 @@ test "project diagnostics retain legacy transport metadata" {
       Test.assert_eq(if project_diagnostics_len(check_diagnostics) > 0 { 1 } else { 0 }, 1)
       Test.assert_eq(project_diagnostics_item_is_legacy(check_diagnostics, 0), true)
       let reported_source = project_diagnostics_item_source(check_diagnostics, 0)
-      match typed { TypedModule(_, registered, _) -> Test.assert_eq(reported_source, registered) }
+      match typed { TypedModule(_, registered, _, owners) -> Test.assert_eq(reported_source, registered) }
       Test.assert_str_eq(runtime_str_from_bytes_copy(reported_source, source_n), source)
       Test.assert_eq(project_diagnostics_item_source_len(check_diagnostics, 0), __str_len(source))
     }
@@ -754,7 +939,7 @@ test "project session path parsing preserves installed SDK package visibility" {
   )
   match result {
     ProjectParseSucceeded(ast, source_n, diagnostics) -> match ast {
-      AstModule(fns, src, tt) -> {
+      AstModule(fns, src, tt, owners) -> {
         let sdk_package = ttable_sdk_package_id(tt)
         let sdk_module = module_fact_find_path(
           tt,
