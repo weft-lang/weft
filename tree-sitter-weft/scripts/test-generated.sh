@@ -70,7 +70,7 @@ if [ "$mode" = all ] || [ "$mode" = queries ]; then
   highlight_output="$work_dir/highlights.txt"
   locals_output="$work_dir/locals.txt"
   printf '%s\n' \
-    'use compiler/grammar.{*}' \
+    'use stdlib/grammar.{Grammar}' \
     'type QueryBox { value: i64 }' \
     'fn query_read(input: QueryBox) -> i64 {' \
     '  let local = input' \

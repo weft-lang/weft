@@ -1,4 +1,11 @@
 use compiler/grammar_source.{WeftParser, ParsedWeftSource}
+use compiler/source_input.{source_from_text, source_from_bytes}
+use compiler/pipeline.{AstModule, TypedModule, IrModule, PipelineParseResult, pipeline_parse_local_with_error_count, pipeline_parse_source_with_origin_standalone, pipeline_check_module_standalone, pipeline_lower_ir, pipeline_ir_functions}
+use compiler/ir.{ir_function_list_len}
+use compiler/type_registry.{ttable_source_is_trusted, ttable_source_is_strict}
+use compiler/lib.{src_eq_at}
+use runtime/alloc.{arena_new, arena_alloc, arena_free}
+use runtime/memory.{mem_copy, mem_store8_at}
 use compiler/type_registry.{ttable_new}
 use compiler/lib.{nlist_len}
 use runtime/rc.{rc_count}
@@ -163,6 +170,90 @@ test "grammar source ownership balances normal abort and continuation-drop exits
     for mode in [0, 1, 2] {
       handle {
         handle hold_grammar_source(text, mode) { AbandonGrammar.abandon() -> nil }
+      } { SuspendGrammar.suspend() with k -> nil }
+      Test.assert_eq(rc_count(__str_ptr(text) - 16), 1)
+    }
+  }
+}
+
+fn detached_pipeline_root(trusted: i64, strict: i64) -> AstModule {
+  let text = "fn main() -> i64 { 42 }"
+  let arena = arena_new(128)
+  let bytes = arena_alloc(arena, __str_len(text), 8)
+  mem_copy(bytes, __str_ptr(text), __str_len(text))
+  let ast = pipeline_parse_source_with_origin_standalone(bytes, __str_len(text), trusted, strict)
+  for offset in 0..__str_len(text) { mem_store8_at(bytes, offset, 88) }
+  arena_free(arena)
+  ast
+}
+
+test "root input transport can be destroyed before checking its retained AST" {
+  for origin in [(0, 1), (1, 0)] {
+    let ast = detached_pipeline_root(origin.0, origin.1)
+    match ast {
+      AstModule(functions, src, table, owners) -> {
+        let expected = "fn main() -> i64 { 42 }"
+        Test.assert_eq(src_eq_at(src, 0, __str_ptr(expected), 0, __str_len(expected)), 1)
+        Test.assert_eq(ttable_source_is_trusted(table, src), origin.0)
+        Test.assert_eq(ttable_source_is_strict(table, src), origin.1)
+      }
+    }
+    let typed = pipeline_check_module_standalone(ast)
+    Test.assert_true(ir_function_list_len(pipeline_ir_functions(pipeline_lower_ir(typed))) > 0)
+  }
+}
+
+fn detached_pipeline_ir() -> (i64, IrModule) {
+  let typed = pipeline_check_module_standalone(detached_pipeline_root(0, 1))
+  match typed { TypedModule(_, src, _, _) -> (src, pipeline_lower_ir(typed)) }
+}
+
+test "lowered root products retain source after parser and checker products are dropped" {
+  let (src, ir) = detached_pipeline_ir()
+  for _ in 0..64 {
+    let churn = "a different source allocation".repeat(8)
+    Test.assert_true(churn.len() > 0)
+    let expected = "fn main() -> i64 { 42 }"
+    Test.assert_eq(src_eq_at(src, 0, __str_ptr(expected), 0, __str_len(expected)), 1)
+    Test.assert_true(rc_count(src - 16) > 0)
+    Test.assert_true(ir_function_list_len(pipeline_ir_functions(ir)) > 0)
+  }
+}
+
+test "empty native source input still has an owning root product" {
+  let source = source_from_bytes(0, 0)
+  match pipeline_parse_local_with_error_count(source, ttable_new()) {
+    PipelineParseResult(AstModule(functions, src, _, _), errors) -> {
+      Test.assert_eq(errors, 0)
+      Test.assert_eq(nlist_len(functions), 0)
+      Test.assert_eq(src, __str_ptr(source.text))
+      Test.assert_eq_usize(source.text.len(), 0)
+    }
+  }
+}
+
+type RootExit { CompleteRoot, AbortRoot, DropRootContinuation }
+
+fn hold_pipeline_root(text: str, exit: RootExit) -[Test, AbandonGrammar, SuspendGrammar]> nil {
+  let parsed = pipeline_parse_local_with_error_count(source_from_text(text), ttable_new())
+  match exit {
+    CompleteRoot -> nil
+    AbortRoot -> AbandonGrammar.abandon()
+    DropRootContinuation -> SuspendGrammar.suspend()
+  }
+  Test.assert_true(match parsed {
+    PipelineParseResult(AstModule(functions, src, _, _), errors) -> errors == 0 and src == __str_ptr(text) and nlist_len(functions) == 1
+  })
+  nil
+}
+
+test "pipeline root ownership balances normal abort and continuation-drop exits" {
+  let text = "fn value() -> i64 { ".concat("42 }")
+  Test.assert_eq(rc_count(__str_ptr(text) - 16), 1)
+  for _ in 0..16 {
+    for exit in [CompleteRoot, AbortRoot, DropRootContinuation] {
+      handle {
+        handle hold_pipeline_root(text, exit) { AbandonGrammar.abandon() -> nil }
       } { SuspendGrammar.suspend() with k -> nil }
       Test.assert_eq(rc_count(__str_ptr(text) - 16), 1)
     }
