@@ -1,0 +1,324 @@
+use compiler/weft/grammar.{WeftParser, ParsedWeftSource}
+use compiler/weft/syntax/declarations.{*}
+use compiler/weft/check/declarations as declarations
+use compiler/weft/check/table.{ttable_new, ttable_entry_at}
+use compiler/source/input.{source_from_text}
+use compiler/ir/data.{*}
+use compiler/types/algebra.{PRIM_I64, PRIM_STR}
+use module_fixtures/compiler_probe.{probe_check_source}
+use compiler/weft/products.{TypedModule}
+use stdlib/grammar.{Grammar, Parsed, Recovered}
+use stdlib/diagnostic/schema.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option.{Option}
+use stdlib/string.{int_to_str, str_concat}
+use stdlib/panic.{panic}
+use stdlib/state as state
+
+fn parse(text: str) -> (ParsedWeftSource, List<Diagnostic>) {
+  let (result, diagnostics) = state.run(
+    Nil<Diagnostic>(),
+    () => handle WeftParser().parse(source_from_text(text).all()) {
+      Diagnose.report(diagnostic) -> {
+        state.modify((items: List<Diagnostic>) => Cons(diagnostic, items))
+        resume(0)
+      }
+      Diagnose.error(message, location) -> resume(0)
+      Diagnose.warn(message, location) -> resume(0)
+      Diagnose.note(message, location) -> resume(0)
+    }
+  )
+  match result {
+    Parsed(syntax) -> (syntax, diagnostics.reverse())
+    Recovered(syntax) -> (syntax, diagnostics.reverse())
+    _ -> panic("expected retained declaration syntax")
+  }
+}
+
+fn text_at(syntax: ParsedWeftSource, range: TypeNameRange) -> str {
+  syntax.source.source().text.slice(
+    __i64_to_usize(range.start),
+    __i64_to_usize(range.start + range.length)
+  ).unwrap()
+}
+
+fn record_fields(syntax: ParsedWeftSource) -> List<RecordFieldSyntax> {
+  match syntax.declarations.declarations.first().unwrap().syntax {
+    TypeDefinition(RecordSyntax(_, _, fields)) -> fields
+    _ -> panic("expected record fields")
+  }
+}
+
+fn variant_members(syntax: ParsedWeftSource) -> List<VariantMemberSyntax> {
+  match syntax.declarations.declarations.first().unwrap().syntax {
+    TypeDefinition(VariantSyntax(_, _, members)) -> members
+    _ -> panic("expected variant members")
+  }
+}
+
+test "authored record fields retain Unicode names order and generic annotations" {
+  let (syntax, diagnostics) = parse(
+    "-- 🧶\npub type Row<T> { café: T, count: i64, label: str }"
+  )
+  Test.assert_true(diagnostics.is_empty())
+  let fields = record_fields(syntax)
+  Test.assert_eq_usize(fields.len(), 3)
+  Test.assert_str_eq(text_at(syntax, fields.get(0).unwrap().name), "café")
+  Test.assert_str_eq(text_at(syntax, fields.get(1).unwrap().name), "count")
+  Test.assert_str_eq(text_at(syntax, fields.get(2).unwrap().name), "label")
+  Test.assert_true(
+    match fields.get(0).unwrap().annotation { VariableTypeExpr(_) -> true, _ -> false }
+  )
+  Test.assert_true(
+    match fields.get(1).unwrap().annotation {
+      PrimitiveTypeExpr(primitive) -> primitive == PRIM_I64(),
+      _ -> false
+    }
+  )
+  Test.assert_true(
+    match fields.get(2).unwrap().annotation {
+      PrimitiveTypeExpr(primitive) -> primitive == PRIM_STR(),
+      _ -> false
+    }
+  )
+}
+
+test "variant members derive arity from ordered typed payloads" {
+  let (syntax, diagnostics) = parse(
+    "type Choice<T> { Empty, Explicit(), One(T), Many(i64, T, str), Nested(api.Box<T>), }"
+  )
+  Test.assert_true(diagnostics.is_empty())
+  let members = variant_members(syntax)
+  Test.assert_eq_usize(members.len(), 5)
+  for sample in [
+    (0, "Empty", 0),
+    (1, "Explicit", 0),
+    (2, "One", 1),
+    (3, "Many", 3),
+    (4, "Nested", 1)
+  ] {
+    let member = members.get(__i64_to_usize(sample.0)).unwrap()
+    Test.assert_str_eq(text_at(syntax, member.name), sample.1)
+    Test.assert_eq_usize(member.payloads.len(), __i64_to_usize(sample.2))
+  }
+  let payloads = members.get(3).unwrap().payloads
+  Test.assert_true(
+    match payloads.get(0).unwrap() {
+      PrimitiveTypeExpr(primitive) -> primitive == PRIM_I64(),
+      _ -> false
+    }
+  )
+  Test.assert_true(match payloads.get(1).unwrap() { VariableTypeExpr(_) -> true, _ -> false })
+  Test.assert_true(
+    match payloads.get(2).unwrap() {
+      PrimitiveTypeExpr(primitive) -> primitive == PRIM_STR(),
+      _ -> false
+    }
+  )
+  Test.assert_true(
+    match members.get(4).unwrap().payloads.first().unwrap() {
+      SourceAssociatedTypeExpr(NamedTypeExpr(_, _, TypeExprListCons(VariableTypeExpr(_), TypeExprListNil, _), _), _, range) ->
+        text_at(syntax, range) == "api.Box"
+      _ -> false
+    }
+  )
+}
+
+fn record_source(count: i64, annotation: str) -> str {
+  let mut text = "type Wide<T> { "
+  for index in 0..count {
+    text = text |> str_concat("f") |> str_concat(int_to_str(index)) |> str_concat(": ")
+      |> str_concat(annotation) |> str_concat(",")
+  }
+  text.concat(" } fn following() -> i64 { 42 }")
+}
+
+fn variant_source(count: i64) -> str {
+  let mut text = "type Choice<T> { "
+  for index in 0..count {
+    let payloads = if index % 2 == 0 { "," } else { "(i64, T, str)," }
+    text = text |> str_concat("V") |> str_concat(int_to_str(index)) |> str_concat(payloads)
+  }
+  text.concat(" } fn following() -> i64 { 42 }")
+}
+
+test "record syntax and host registration have no fixed field buffer limit" {
+  for count in [1, 340, 341, 342, 512] {
+    let (syntax, diagnostics) = parse(record_source(count, "T"))
+    Test.assert_true(diagnostics.is_empty())
+    let fields = record_fields(syntax)
+    Test.assert_eq_usize(fields.len(), __i64_to_usize(count))
+    let mut index = 0
+    for field in fields {
+      Test.assert_str_eq(text_at(syntax, field.name), "f".concat(int_to_str(index)))
+      Test.assert_true(match field.annotation { VariableTypeExpr(_) -> true, _ -> false })
+      index = index + 1
+    }
+    for repeat in 0..2 {
+      let table = ttable_new()
+      declarations.register(syntax.declarations, syntax.source.source(), table)
+      match type_entry_from_ptr(ttable_entry_at(table, 0)) {
+        TypeRecordEntry(_, _, registered) -> {
+          Test.assert_eq(type_record_field_list_len(registered), count)
+          let mut remaining = registered
+          let mut index = 0
+          loop {
+            match remaining {
+              TypeRecordFieldListCons(TypeRecordField(start, length, VariableTypeExpr(_)), rest) ->
+                {
+                  Test.assert_str_eq(
+                    text_at(syntax, TypeNameRange { start: start, length: length }),
+                    "f".concat(int_to_str(index))
+                  )
+                  remaining = rest
+                  index = index + 1
+                }
+              TypeRecordFieldListNil -> break
+              _ -> { Test.assert_true(false); break }
+            }
+          }
+          Test.assert_eq(index, count)
+        }
+        _ -> Test.assert_true(false)
+      }
+    }
+    Test.assert_eq_usize(syntax.declarations.declarations.len(), 2)
+    Test.assert_eq_usize(record_fields(syntax).len(), __i64_to_usize(count))
+  }
+}
+
+test "variant syntax and host registration have no fixed member buffer limit" {
+  for count in [0, 1, 203, 204, 205, 512] {
+    let (syntax, diagnostics) = parse(variant_source(count))
+    Test.assert_true(diagnostics.is_empty())
+    let members = variant_members(syntax)
+    Test.assert_eq_usize(members.len(), __i64_to_usize(count))
+    let mut index = 0
+    for member in members {
+      Test.assert_str_eq(text_at(syntax, member.name), "V".concat(int_to_str(index)))
+      Test.assert_eq_usize(member.payloads.len(), if index % 2 == 0 { 0 } else { 3 })
+      index = index + 1
+    }
+    for repeat in 0..2 {
+      let table = ttable_new()
+      declarations.register(syntax.declarations, syntax.source.source(), table)
+      match type_entry_from_ptr(ttable_entry_at(table, 0)) {
+        TypeVariantEntry(_, _, registered) -> {
+          Test.assert_eq(type_variant_list_len(registered), count)
+          let mut remaining = registered
+          let mut index = 0
+          loop {
+            match remaining {
+              TypeVariantListCons(TypeVariant(start, length, arity, payloads), rest) -> {
+                Test.assert_str_eq(
+                  text_at(syntax, TypeNameRange { start: start, length: length }),
+                  "V".concat(int_to_str(index))
+                )
+                Test.assert_eq(arity, if index % 2 == 0 { 0 } else { 3 })
+                Test.assert_eq(type_expr_list_len(payloads), arity)
+                if arity == 3 {
+                  Test.assert_true(
+                    match payloads {
+                      TypeExprListCons(PrimitiveTypeExpr(first),
+                      TypeExprListCons(VariableTypeExpr(_),
+                      TypeExprListCons(PrimitiveTypeExpr(last), TypeExprListNil, _), _), _) ->
+                        first == PRIM_I64() and last == PRIM_STR()
+                      _ -> false
+                    }
+                  )
+                }
+                remaining = rest
+                index = index + 1
+              }
+              TypeVariantListNil -> break
+              _ -> { Test.assert_true(false); break }
+            }
+          }
+          Test.assert_eq(index, count)
+        }
+        _ -> Test.assert_true(false)
+      }
+    }
+    Test.assert_eq_usize(syntax.declarations.declarations.len(), 2)
+    Test.assert_eq_usize(variant_members(syntax).len(), __i64_to_usize(count))
+  }
+}
+
+test "member recovery preserves diagnostics and the following declaration" {
+  for sample in [
+    ("type R { good: i64, , tail: str }", "expected record field after separator"),
+    ("type R { good: i64, bad i64, tail: str }", "expected ':' after record field name"),
+    ("type R { good: i64, bad: , tail: str }", "expected type after record field ':'"),
+    ("type R { good: i64 tail: str }", "expected ',' or '}' after record field"),
+    ("type R { good: i64, 12, tail: str }", "expected record field name or '}'"),
+    ("type R { good: i64", "expected '}' after record fields"),
+    ("type V { Good, , Tail }", "expected variant after separator"),
+    ("type V { Good Tail }", "expected ',' or '}' after variant"),
+    ("type V { 12, Tail }", "expected variant name or '}'"),
+    ("type V { Good", "expected '}' after type variants"),
+    ("type V { Bad(, Tail }", "expected variant payload type"),
+    ("type V { Bad(i64 str), Tail }", "expected ',' or ')' after variant payload type"),
+    ("type V { Bad( }", "expected ')' after variant payload types")
+  ] {
+    let source = "-- é🧶\n" |> str_concat(sample.0) |> str_concat("\nfn following() -> i64 { 42 }")
+    let (syntax, diagnostics) = parse(source)
+    Test.assert_eq_usize(diagnostics.len(), 1)
+    let diagnostic = diagnostics.first().unwrap()
+    Test.assert_true(diagnostic.code().eq(DiagnosticCodeAssigned("E0002")))
+    Test.assert_str_eq(diagnostic.message(), sample.1)
+    Test.assert_eq_usize(syntax.declarations.declarations.len(), 2)
+    let first = syntax.declarations.declarations.first().unwrap()
+    Test.assert_true(match first.validity { RecoveredDeclaration -> true, _ -> false })
+    let following = syntax.declarations.declarations.get(1).unwrap()
+    Test.assert_true(match following.validity { ParsedDeclaration -> true, _ -> false })
+    Test.assert_str_eq(text_at(syntax, following.range), "fn following() -> i64 { 42 }")
+  }
+}
+
+test "member diagnostics retain exact UTF-8 byte positions" {
+  for sample in [
+    ("type R { café: ", ",", " tail: str }", "expected type after record field ':'"),
+    ("type V { Good, ", ",", " Tail }", "expected variant after separator"),
+    ("type V { Bad(", ",", " Tail }", "expected variant payload type")
+  ] {
+    let prefix = "-- é🧶\n".concat(sample.0)
+    let source = prefix |> str_concat(sample.1) |> str_concat(sample.2)
+    let (syntax, diagnostics) = parse(source)
+    Test.assert_eq_usize(diagnostics.len(), 1)
+    let diagnostic = diagnostics.first().unwrap()
+    Test.assert_str_eq(diagnostic.message(), sample.3)
+    match diagnostic.primary() {
+      DiagnosticSourceRange(DiagnosticSourceBuffer(identity), start, end) -> {
+        Test.assert_eq(identity, __str_ptr(syntax.source.source().text))
+        Test.assert_eq_usize(start, prefix.len())
+        Test.assert_eq_usize(end, prefix.len() + 1)
+      }
+      _ -> Test.assert_true(false)
+    }
+  }
+}
+
+test "large authored type declarations reach checking with usable final members" {
+  let record_text = record_source(342, "i64").concat(
+    " fn read(value: Wide<i64>) -> i64 { value.f341 }"
+  )
+  let variant_text = variant_source(205).concat(
+    " fn last() -> Choice<i64> { V204 } fn payload(value: Choice<i64>) -> i64 { match value { V203(a, b, label) -> a + b, _ -> 0 } }"
+  )
+  match probe_check_source(__str_ptr(record_text), __str_len(record_text)) {
+    TypedModule(_, _, table, _) -> Test.assert_true(
+      match type_entry_from_ptr(ttable_entry_at(table, 0)) {
+        TypeRecordEntry(_, _, fields) -> type_record_field_list_len(fields) == 342
+        _ -> false
+      }
+    )
+  }
+  match probe_check_source(__str_ptr(variant_text), __str_len(variant_text)) {
+    TypedModule(_, _, table, _) -> Test.assert_true(
+      match type_entry_from_ptr(ttable_entry_at(table, 0)) {
+        TypeVariantEntry(_, _, members) -> type_variant_list_len(members) == 205
+        _ -> false
+      }
+    )
+  }
+}
