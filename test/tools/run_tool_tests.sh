@@ -2147,9 +2147,9 @@ assert_equals "fmt_distinguishes_generic_angles_and_comparisons" "$(<"$tmp_out")
 "$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
 assert_files_equal "fmt_angle_roles_are_idempotent" "$tmp_bin" "$tmp_out"
 
-printf 'use compiler / formatter.{ * }\nfn f() -[ Diagnose ]> i64 { resume (0) }\nfn main() -> i64 { for i in 0 .. 2 { 0 } 0 }\n' > "$tmp_src"
+printf 'use compiler / weft / format.{ * }\nfn f() -[ Diagnose ]> i64 { resume (0) }\nfn main() -> i64 { for i in 0 .. 2 { 0 } 0 }\n' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
-assert_equals "fmt_canonical_context_punctuation" "$(<"$tmp_out")" $'use compiler/formatter.{*}\n\nfn f() -[Diagnose]> i64 { resume(0) }\n\nfn main() -> i64 { for i in 0..2 { 0 } 0 }'
+assert_equals "fmt_canonical_context_punctuation" "$(<"$tmp_out")" $'use compiler/weft/format.{*}\n\nfn f() -[Diagnose]> i64 { resume(0) }\n\nfn main() -> i64 { for i in 0..2 { 0 } 0 }'
 "$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
 assert_files_equal "fmt_context_punctuation_is_idempotent" "$tmp_bin" "$tmp_out"
 
@@ -2185,9 +2185,9 @@ assert_files_equal "fmt_preserves_crlf_while_indenting" "$tmp_out" "$tmp_bin"
 "$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
 assert_files_equal "fmt_crlf_indentation_is_idempotent" "$tmp_bin" "$tmp_out"
 
-printf '%s\n' 'use compiler/formatter.{*}' '' '' 'use compiler/lex.{*}' 'fn first() -> i64 { 1 }' '' '' 'fn second() -> i64 { 2 }' > "$tmp_src"
+printf '%s\n' 'use compiler/weft/format.{*}' '' '' 'use compiler/weft/lex.{*}' 'fn first() -> i64 { 1 }' '' '' 'fn second() -> i64 { 2 }' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
-assert_equals "fmt_groups_top_level_imports_and_declarations" "$(<"$tmp_out")" $'use compiler/formatter.{*}\nuse compiler/lex.{*}\n\nfn first() -> i64 { 1 }\n\nfn second() -> i64 { 2 }'
+assert_equals "fmt_groups_top_level_imports_and_declarations" "$(<"$tmp_out")" $'use compiler/weft/format.{*}\nuse compiler/weft/lex.{*}\n\nfn first() -> i64 { 1 }\n\nfn second() -> i64 { 2 }'
 "$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
 assert_files_equal "fmt_top_level_grouping_is_idempotent" "$tmp_bin" "$tmp_out"
 
@@ -2195,9 +2195,9 @@ printf '%s\n' 'fn first() -> i64 { 1 } fn second() -> i64 { 2 }' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
 assert_equals "fmt_separates_same_line_top_level_declarations" "$(<"$tmp_out")" $'fn first() -> i64 { 1 }\n\nfn second() -> i64 { 2 }'
 
-printf '%s\n' '-- module  header' '' '' 'use compiler/formatter.{*}' '' '' '-- import  note' '' 'use compiler/lex.{*}' '' 'fn first() -> i64 { 1 } -- trailing  exact' '' '' '--- next  docs' '' '' 'fn second() -> i64 { 2 }' > "$tmp_src"
+printf '%s\n' '-- module  header' '' '' 'use compiler/weft/format.{*}' '' '' '-- import  note' '' 'use compiler/weft/lex.{*}' '' 'fn first() -> i64 { 1 } -- trailing  exact' '' '' '--- next  docs' '' '' 'fn second() -> i64 { 2 }' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
-assert_equals "fmt_attaches_top_level_comments_canonically" "$(<"$tmp_out")" $'-- module  header\n\nuse compiler/formatter.{*}\n-- import  note\nuse compiler/lex.{*}\n\nfn first() -> i64 { 1 } -- trailing  exact\n\n--- next  docs\nfn second() -> i64 { 2 }'
+assert_equals "fmt_attaches_top_level_comments_canonically" "$(<"$tmp_out")" $'-- module  header\n\nuse compiler/weft/format.{*}\n-- import  note\nuse compiler/weft/lex.{*}\n\nfn first() -> i64 { 1 } -- trailing  exact\n\n--- next  docs\nfn second() -> i64 { 2 }'
 "$WEFT" fmt < "$tmp_out" > "$tmp_bin" 2>"$tmp_err"
 assert_files_equal "fmt_top_level_comment_attachment_is_idempotent" "$tmp_bin" "$tmp_out"
 
@@ -3705,6 +3705,9 @@ assert_equals "mcp_check_summary_invalid_source_json_only_snapshot" "$mcp_out" '
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ir_summary","arguments":{"source":"fn main() -> i64 { missing }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_ir_summary_invalid_source_json_only_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"ir_summary","ok":true,"schema_version":1,"stability":"internal","functions":0,"blocks":0,"insts":0}}'
 
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ir_summary","arguments":{"source":"fn broken( -> i64 { 0 } fn main() -> i64 { 42 }"}}}' | "$WEFT" mcp 2> "$tmp_err")
+assert_equals "mcp_ir_summary_never_lowers_recovered_source" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"ir_summary","ok":true,"schema_version":1,"stability":"internal","functions":0,"blocks":0,"insts":0}}'
+
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"type_lookup","arguments":{"source":"fn main() -> i64 { missing }","name":"main"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_type_lookup_invalid_source_json_only_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"type_lookup","ok":true,"schema_version":1,"stability":"stable","name":"main","found":true,"fact":{"kind":"function","name":"main","parameters":[],"return_type":{"kind":"primitive","name":"i64"},"effects":{"kind":"closed","atoms":[]},"purity":"pure","ownership":{"kind":"borrowed_parameters","indices":[]},"return_shape":{"kind":"words","count":1,"lanes":["gpr"]},"bounds":{"kind":"type_parameters","parameters":[]}}}}'
 
@@ -3732,6 +3735,9 @@ assert_contains "mcp_opt_counters_low_mutable_slot_audit_clean" "$mcp_out" '"res
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"fn main() -> i64 { nope() }"}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_opt_counters_check_error_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"opt_counters","ok":false,"reason":"check errors"}}'
+
+mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{"source":"fn broken( -> i64 { 0 } fn main() -> i64 { 42 }"}}}' | "$WEFT" mcp 2> "$tmp_err")
+assert_equals "mcp_opt_counters_never_lowers_recovered_source" "$mcp_out" '{"jsonrpc":"2.0","id":1,"result":{"tool":"opt_counters","ok":false,"reason":"parse errors"}}'
 
 mcp_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"opt_counters","arguments":{}}}' | "$WEFT" mcp 2>&1)
 assert_equals "mcp_opt_counters_missing_source_snapshot" "$mcp_out" '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"missing source"}}'
@@ -5837,7 +5843,7 @@ assert_contains "package_l7_unstable_ir_stays_inside_owner" "$pkg_l7_unstable" "
 fi
 
 if [ "$WEFT_TOOL_SHARD" = tests ]; then
-printf 'fn helper() -> i64 { 42 }\nfn main() -> i64 { helper() }\n' > "$tmp_src"
+printf 'fn helper(n: i64) -> i64 { if n == 0 { 42 } else { helper(n - 1) } }\nfn inline_helper() -> i64 { 1 }\nfn main() -> i64 { helper(3) + inline_helper() }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" symbols "$tmp_src" > "$tmp_out" 2> "$tmp_err"
 symbols_out=$(<"$tmp_out")
 symbols_lines=$(wc -l < "$tmp_out" | tr -d ' ')
@@ -5855,6 +5861,38 @@ symbols_main_lines=$(grep -c ' main$' "$tmp_out")
 symbols_helper_lines=$(grep -c ' helper$' "$tmp_out")
 assert_equals "symbols_emits_main_once" "$symbols_main_lines" "1"
 assert_equals "symbols_emits_helper_once" "$symbols_helper_lines" "1"
+assert_not_contains "symbols_omits_inlined_function_without_emitted_body" "$symbols_out" " inline_helper"
+
+run_weft_compile_guarded "$WEFT" build tools/check.weft -o "$tmp_tool_bin" > "$tmp_out" 2> "$tmp_err"
+chmod +x "$tmp_tool_bin"
+run_binary_guarded "$tmp_tool_bin" < "$tmp_src" > "$tmp_out" 2> "$tmp_err"
+assert_contains "standalone_check_accepts_checked_program" "$(<"$tmp_err")" "0 errors"
+assert_equals "standalone_check_does_not_emit_code" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+
+printf 'fn main() -> i64 { if "a".concat("b") == "ab" { 0 } else { 1 } }\n' > "$tmp_src"
+run_binary_guarded "$tmp_tool_bin" < "$tmp_src" > "$tmp_out" 2> "$tmp_err"
+assert_contains "standalone_check_accepts_runtime_support" "$(<"$tmp_err")" "0 errors"
+run_weft_compile_guarded "$WEFT" check < "$tmp_src" > "$tmp_out" 2> "$tmp_err"
+assert_contains "stdin_check_retains_runtime_support" "$(<"$tmp_err")" "0 errors"
+
+for rejected_case in parse type effect import; do
+  case "$rejected_case" in
+    parse) printf 'fn broken( -> i64 { 0 } fn main() -> i64 { 42 }\n' > "$tmp_src" ;;
+    type) printf 'fn main() -> i64 { "wrong" }\n' > "$tmp_src" ;;
+    effect) printf 'effect Ask { fn answer() -> i64 } fn main() -[Ask]> i64 { Ask.answer() }\n' > "$tmp_src" ;;
+    import) printf 'use module_fixtures/absent_checked_grammar_support fn main() -> i64 { 42 }\n' > "$tmp_src" ;;
+  esac
+  rejected_status=0
+  run_binary_guarded "$tmp_tool_bin" < "$tmp_src" > "$tmp_out" 2> "$tmp_err" || rejected_status=$?
+  assert_equals "standalone_check_rejects_${rejected_case}" "$rejected_status" "1"
+  assert_contains "standalone_check_reports_${rejected_case}_rejection" "$(<"$tmp_err")" "source rejected"
+  assert_not_contains_file "standalone_check_never_accepts_${rejected_case}" "$tmp_err" "0 errors"
+  assert_equals "standalone_check_${rejected_case}_does_not_emit" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+  rejected_status=0
+  run_weft_compile_guarded "$WEFT" symbols "$tmp_src" > "$tmp_out" 2> "$tmp_err" || rejected_status=$?
+  assert_equals "symbols_rejects_${rejected_case}" "$rejected_status" "1"
+  assert_equals "symbols_${rejected_case}_does_not_lower" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+done
 
 printf 'test "plain" { Test.assert_eq(1, 1) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"

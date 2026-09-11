@@ -545,7 +545,7 @@ def generate_source(
     compositions: list[tuple[int, int, int]],
     conformance_cases: int,
 ) -> str:
-    return f'''-- compiler/unicode_normalization_data.weft -- GENERATED; DO NOT EDIT
+    return f'''-- compiler/weft/unicode/normalization_data.weft -- GENERATED; DO NOT EDIT
 -- Unicode {UNICODE_VERSION} NFC quick-check and canonical-composition substrate.
 -- UnicodeData SHA-256: {INPUTS['unicode_data'][1]}
 -- DerivedNormalizationProps SHA-256: {INPUTS['derived_normalization'][1]}
@@ -553,7 +553,7 @@ def generate_source(
 -- Generator: tools/generate_unicode_normalization_data.py
 -- Generator conformance: {conformance_cases} NormalizationTest sequence checks.
 
-use compiler/source_position.{{source_position_utf8_scalar, source_position_utf8_width}}
+use compiler/source/position.{{source_position_utf8_scalar, source_position_utf8_width}}
 use runtime/alloc.{{alloc_words}}
 use runtime/memory.{{mem_load8_at, mem_load64_at, mem_store64_at}}
 
@@ -755,7 +755,7 @@ def generate_compatibility_source(
 -- Generator: tools/generate_unicode_normalization_data.py
 -- Generator conformance: {conformance_cases} NormalizationTest transformations.
 
-use compiler/unicode_normalization_data.{{unicode_canonical_decomposition, unicode_normalization_hex}}
+use compiler/weft/unicode/normalization_data.{{unicode_canonical_decomposition, unicode_normalization_hex}}
 use runtime/memory.{{mem_store64_at}}
 
 pub(package) fn unicode_compatibility_max_expansion() -> i64 {{ {maximum_expansion} }}
@@ -798,7 +798,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=pathlib.Path("compiler/unicode_normalization_data.weft"),
+        default=pathlib.Path("compiler/weft/unicode/normalization_data.weft"),
     )
     parser.add_argument(
         "--compatibility-output",

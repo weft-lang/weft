@@ -1,0 +1,482 @@
+-- lib.weft — shared utilities for the Weft compiler
+-- Runtime primitives, debug output, char classification,
+-- string comparison, node/list data structures, operator precedence
+
+use runtime/syscall.{*}
+use runtime/memory.{*}
+use runtime/alloc.{*}
+use runtime/buffer.{*}
+use runtime/string.{runtime_int_to_str, runtime_str_from_bytes_copy}
+use compiler/weft/syntax/numeric.{IntegerMagnitude, ExactMagnitude, OversizedMagnitude, IntegerSpelling, ExpressionNumber, numeric_scan}
+use stdlib/source.{Source, Span}
+use stdlib/diagnostic/schema.{DiagnosticSourceUnknown}
+use compiler/source/position.{source_position_at, source_position_line0, source_position_scalar_column0}
+use stdlib/num/scalar.{num_scalar_i64_to_usize, num_scalar_usize_to_i64}
+use stdlib/option.{None, Option, Some}
+use stdlib/panic.{panic}
+
+-- Convert a legacy signed allocation hint into the finite Vector domain.
+-- Invalid hints deliberately fall back to an empty initial allocation: every
+-- caller appends through checked Vector growth, so this changes capacity only.
+pub(package) fn compiler_capacity_hint(value: i64) -> usize {
+  match value {
+    count if count > 0 -> __i64_to_usize(count)
+    _ -> __i64_to_usize(0)
+  }
+}
+
+-- Preserve a finite public count at the compiler's signed storage and native
+-- format boundaries. A compiler collection cannot reach the rejected branch
+-- on an addressable target, so failure is an internal invariant violation.
+pub(package) fn compiler_signed_count(value: usize) -> i64 {
+  match num_scalar_usize_to_i64(value) {
+    Some(count) -> count
+    None -> panic("compiler collection length exceeds signed storage domain")
+  }
+}
+
+-- Validate a signed semantic index before using it to access a finite
+-- collection. Negative sentinel and diagnostic indices remain outside the
+-- collection domain instead of being clamped to a real element.
+pub(package) fn compiler_finite_index(value: i64) -> Option<usize> {
+  num_scalar_i64_to_usize(value)
+}
+
+-- Bounds-checked little-endian byte views for pure compiler-data parsers.
+-- Raw loads remain confined to this existing compiler storage boundary.
+pub(package) fn bytes_u32_le_at(bytes: i64, len: i64, offset: i64, default: i64) -> i64 {
+  if offset < 0 or offset + 4 > len { default }
+  else {
+    mem_load8_at(bytes, offset) +
+      mem_load8_at(bytes, offset + 1) * 256 +
+      mem_load8_at(bytes, offset + 2) * 65536 +
+      mem_load8_at(bytes, offset + 3) * 16777216
+  }
+}
+
+pub(package) fn bytes_u8_at(bytes: i64, len: i64, offset: i64, default: i64) -> i64 {
+  if offset < 0 or offset >= len { default } else { mem_load8_at(bytes, offset) }
+}
+
+pub(package) fn bytes_u64_le_at(bytes: i64, len: i64, offset: i64, default: i64) -> i64 {
+  if offset < 0 or offset + 8 > len { default }
+  else {
+    bytes_u32_le_at(bytes, len, offset, default) +
+      bytes_u32_le_at(bytes, len, offset + 4, default) * 4294967296
+  }
+}
+
+pub(package) fn bytes_match_str_at(bytes: i64, len: i64, offset: i64, expected: str) -> i64 {
+  let expected_len = __str_len(expected)
+  if offset < 0 or offset + expected_len > len { 0 }
+  else {
+    let mut equal = 1
+    let mut i = 0
+    while i < expected_len and equal == 1 {
+      if mem_load8_at(bytes, offset + i) != mem_load8_at(__str_ptr(expected), i) { equal = 0 }
+      else { i = i + 1 }
+    }
+    equal
+  }
+}
+
+pub(package) fn bytes_decimal_at(bytes: i64, len: i64, offset: i64, width: i64) -> i64 {
+  if offset < 0 or width < 0 or offset + width > len { 0 - 1 }
+  else {
+    let mut value = 0
+    let mut digits = 0
+    let mut invalid = false
+    let mut i = 0
+    while i < width and invalid == false {
+      let byte = mem_load8_at(bytes, offset + i)
+      if byte >= 48 and byte <= 57 {
+        value = value * 10 + byte - 48
+        digits = digits + 1
+      } else {
+        if byte != 32 { invalid = true } else { 0 }
+      }
+      i = i + 1
+    }
+    if invalid or digits == 0 { 0 - 1 } else { value }
+  }
+}
+
+pub(package) fn bytes_cstr_len_bounded(bytes: i64, len: i64, offset: i64) -> i64 {
+  if offset < 0 or offset >= len { 0 - 1 }
+  else {
+    let mut cursor = offset
+    while cursor < len and mem_load8_at(bytes, cursor) != 0 { cursor = cursor + 1 }
+    if cursor >= len { 0 - 1 } else { cursor - offset }
+  }
+}
+
+-- Process management is in stdlib/process.weft (linked via GOT + ld).
+-- The compiler itself stays static for bootstrap stability.
+
+-- Read all bytes from an open file descriptor. Returns {ptr, len} pair.
+pub(package) fn read_fd_all(fd: i64) -> i64 {
+  let chunk_size = 65536
+  let scratch = alloc_words(chunk_size / 8)
+  let out = buf_new(chunk_size)
+  let mut done = 0
+  while done == 0 {
+    let n = sys_read(fd, scratch, chunk_size)
+    -- A short read is not end-of-input: pipes return whatever is
+    -- buffered right now, so stopping early truncates slow writers.
+    -- Only EOF (0) or an error ends the read.
+    if n > 0 {
+      bscopy(out, scratch, n, 0)
+    } else {
+      done = 1
+    }
+  }
+  let result = alloc_words(2)
+  let len = buf_len(out)
+  mem_store64_at(result, 0, buf_take_data(out))
+  mem_store64_at(result, 8, len)
+  result
+}
+
+pub(package) fn read_stdin_all() -> i64 {
+  read_fd_all(0)
+}
+
+-- Read an entire file into a bump-allocated buffer. Returns {ptr, len} pair.
+pub(package) fn read_file(path_str: i64) -> i64 {
+  -- Need null-terminated path for sys_open
+  let path_ptr = __str_ptr(path_str)
+  let path_len = __str_len(path_str)
+  let path_buf = alloc_zeroed(path_len + 1)
+  mem_copy(path_buf, path_ptr, path_len)
+  mem_store8_at(path_buf, path_len, 0)
+  -- Open file (O_RDONLY = 0)
+  let fd = sys_open_read(path_buf)
+  let result = alloc_words(2)
+  if fd < 0 {
+    mem_store64_at(result, 0, 0)
+    mem_store64_at(result, 8, 0)
+  } else {
+    let file = read_fd_all(fd)
+    sys_close(fd)
+    mem_store64_at(result, 0, mem_load64_at(file, 0))
+    mem_store64_at(result, 8, mem_load64_at(file, 8))
+  }
+  result
+}
+
+-- Typed path entry for compiler-as-data/session consumers. The legacy i64
+-- form remains while parser/package call sites still carry string words in
+-- raw tables; new typed code must not erase `str` merely to read a file.
+pub(package) fn read_file_text(path: str) -> i64 {
+  let path_len = __str_len(path)
+  let path_buf = alloc_zeroed(path_len + 1)
+  mem_copy(path_buf, __str_ptr(path), path_len)
+  mem_store8_at(path_buf, path_len, 0)
+  let fd = sys_open_read(path_buf)
+  let result = alloc_words(2)
+  if fd < 0 {
+    mem_store64_at(result, 0, 0)
+    mem_store64_at(result, 8, 0)
+  } else {
+    let file = read_fd_all(fd)
+    sys_close(fd)
+    mem_store64_at(result, 0, mem_load64_at(file, 0))
+    mem_store64_at(result, 8, mem_load64_at(file, 8))
+  }
+  result
+}
+
+-- ======================================================================
+-- Print helpers (stderr for diagnostics)
+-- ======================================================================
+
+pub(package) fn eprint(msg: str) -> i64 {
+  sys_write(2, __str_ptr(msg), __str_len(msg))
+}
+pub(package) fn eprint_nl() -> i64 {
+  let b = alloc_zeroed(1)
+  mem_store8_at(b, 0, 10)
+  sys_write(2, b, 1)
+}
+-- Print source location: "line N, col M: "
+pub(package) fn eprint_span(src: i64, offset: i64) -> i64 {
+  let position = source_position_at(src, offset, offset)
+  let line0 = source_position_line0(position)
+  let col0 = source_position_scalar_column0(position)
+  let line = if line0 < 0 { 1 } else { line0 + 1 }
+  let col = if col0 < 0 { 1 } else { col0 + 1 }
+  eprint("line ")
+  eprint_i(line)
+  eprint(", col ")
+  eprint_i(col)
+  eprint(": ")
+}
+
+pub(package) fn eprint_i(n: i64) -> i64 {
+  eprint(runtime_int_to_str(n))
+}
+
+-- ======================================================================
+-- Character classification
+-- ======================================================================
+
+pub(package) fn is_digit(ch: i64) -> bool {
+  if ch >= 48 { if ch <= 57 { true } else { false } } else { false }
+}
+pub(package) fn is_alpha(ch: i64) -> i64 {
+  if ch == 95 { 1 }
+  else { if ch >= 65 { if ch <= 90 { 1 }
+  else { if ch >= 97 { if ch <= 122 { 1 } else { 0 } } else { 0 } } }
+  else { 0 } }
+}
+pub(package) fn is_alnum(ch: i64) -> bool {
+  if is_alpha(ch) == 1 { true } else { is_digit(ch) }
+}
+pub(package) fn is_ws(ch: i64) -> i64 {
+  match ch {
+    32 -> 1
+    10 -> 1
+    13 -> 1
+    9 -> 1
+    _ -> 0
+  }
+}
+
+-- The current compiler source store uses signed offsets, including rebased
+-- interpolation fragments. Keep that representation at this copying adapter;
+-- numeric semantics consume a safe retained range with local byte positions.
+pub(package) fn compiler_source_fragment(src: i64, start: i64, len: i64) -> Span {
+  Source { text: runtime_str_from_bytes_copy(src + start, len), identity: DiagnosticSourceUnknown }.all()
+}
+
+-- The parser records boolean spelling on the legacy integer-pattern node.
+-- Its value belongs to bool; it is not a context-polymorphic numeric literal.
+pub(package) fn integer_pattern_is_boolean(node: i64) -> bool {
+  node != 0 and node_tag(node) == 19 and node_f4(node) == 1
+}
+
+pub(package) fn integer_span_magnitude(src: i64, start: i64, len: i64) -> IntegerMagnitude {
+  let source = compiler_source_fragment(src, start, len)
+  match numeric_scan(source, 0, ExpressionNumber) {
+    IntegerSpelling(end, magnitude) -> {
+      if end == source.len() { magnitude }
+      else { panic("integer spelling storage contains trailing bytes") }
+    }
+    _ -> panic("integer spelling storage is not a validated integer")
+  }
+}
+
+pub(package) fn integer_span_value_wrapping(src: i64, start: i64, len: i64) -> i64 {
+  match integer_span_magnitude(src, start, len) {
+    ExactMagnitude(value) -> __u64_to_i64(value)
+    OversizedMagnitude(bits) -> __u64_to_i64(bits)
+  }
+}
+
+pub(package) fn integer_span_le_decimal_max(src: i64, start: i64, len: i64, max: str) -> i64 {
+  if len <= 0 { 0 }
+  else {
+    let magnitude = integer_span_magnitude(src, start, len)
+    let bound = integer_span_magnitude(__str_ptr(max), 0, __str_len(max))
+    match (magnitude, bound) {
+      (ExactMagnitude(value), ExactMagnitude(limit)) -> if value <= limit { 1 } else { 0 }
+      _ -> 0
+    }
+  }
+}
+
+-- ======================================================================
+-- String comparison (byte-by-byte against source)
+-- ======================================================================
+
+pub(package) fn src_eq_at(src: i64, start: i64, p: i64, i: i64, l: i64) -> bool {
+  let mut cursor = i
+  let mut equal = true
+  while cursor < l and equal {
+    if mem_load8(src + start + cursor) != mem_load8(p + cursor) {
+      equal = false
+    } else {
+      cursor = cursor + 1
+    }
+  }
+  equal
+}
+pub(package) fn src_eq(src: i64, start: i64, len: i64, s: str) -> i64 {
+  let p = __str_ptr(s)
+  let l = __str_len(s)
+  if len != l { 0 }
+  else { src_eq_at(src, start, p, 0, l) }
+}
+
+-- ======================================================================
+-- AST nodes — bump-allocated tagged records
+-- ======================================================================
+-- Node format: [tag, field1, field2, field3, field4] (5 words = 40 bytes)
+-- Tags: 1=IntLit(raw, span_start, span_len) 2=Ident 3=BinOp 4=Call 5=If 6=Let 7=Block 8=FnDecl
+
+pub(package) fn node_new(tag: i64, f1: i64, f2: i64, f3: i64, f4: i64) -> i64 {
+  let n = alloc_words(5)
+  mem_store64_at(n, 0, tag)
+  mem_store64_at(n, 8, f1)
+  mem_store64_at(n, 16, f2)
+  mem_store64_at(n, 24, f3)
+  mem_store64_at(n, 32, f4)
+  n
+}
+
+-- The constructor type is a parser/checker fact, retained by the typed AST.
+-- This metadata bridge disappears with the remaining raw parser nodes.
+pub(package) fn record_init_type_node(node: i64) -> i64 {
+  let metadata = mem_load64_at(node_f3(node), 24)
+  if metadata == 0 { 0 } else { node_f1(metadata) }
+}
+
+pub(package) fn record_init_has_explicit_type_args(node: i64) -> bool {
+  let metadata = mem_load64_at(node_f3(node), 24)
+  metadata != 0 and node_tag(metadata) == 1
+}
+
+pub(package) fn record_init_set_type_node(node: i64, ty: i64) -> i64 {
+  let metadata = mem_load64_at(node_f3(node), 24)
+  if metadata == 0 { mem_store64_at(node_f3(node), 24, node_new(0, ty, 0, 0, 0)) }
+  else { mem_store64_at(metadata, 8, ty) }
+  0
+}
+
+pub(package) fn record_init_set_explicit_type_node(node: i64, ty: i64) -> i64 {
+  record_init_set_type_node(node, ty)
+  mem_store64_at(mem_load64_at(node_f3(node), 24), 0, 1)
+  0
+}
+
+pub(package) fn node_tag(n: i64) -> i64 { mem_load64_at(n, 0) }
+pub(package) fn node_f1(n: i64) -> i64 { mem_load64_at(n, 8) }
+pub(package) fn node_f2(n: i64) -> i64 { mem_load64_at(n, 16) }
+pub(package) fn node_f3(n: i64) -> i64 { mem_load64_at(n, 24) }
+pub(package) fn node_f4(n: i64) -> i64 { mem_load64_at(n, 32) }
+
+-- Lambda f4 carries three facts in one stable scalar: the parser's source-site
+-- offset, the scoped-Par classification added by the borrow checker, and the
+-- checker's zero-argument producer-shape fact. Keeping the site as data
+-- (rather than a node address) lets hoisted-function identity remain
+-- reproducible across compiler generations with different allocation layouts.
+pub(package) fn lambda_ast_metadata(source_site: i64, par_kind: i64) -> i64 {
+  (source_site + 1) * 8 + par_kind * 2
+}
+
+pub(package) fn lambda_ast_source_site(metadata: i64) -> i64 {
+  if metadata >= 8 { metadata / 8 - 1 } else { 0 }
+}
+
+pub(package) fn lambda_ast_par_kind(metadata: i64) -> i64 {
+  if metadata >= 8 { (metadata % 8) / 2 } else { metadata }
+}
+
+pub(package) fn lambda_ast_metadata_with_par_kind(metadata: i64, par_kind: i64) -> i64 {
+  lambda_ast_metadata(lambda_ast_source_site(metadata), par_kind) + lambda_ast_generator_producer(metadata)
+}
+
+pub(package) fn lambda_ast_generator_producer(metadata: i64) -> i64 {
+  if metadata >= 8 { metadata % 2 } else { 0 }
+}
+
+pub(package) fn lambda_ast_metadata_with_generator_producer(metadata: i64) -> i64 {
+  lambda_ast_metadata(lambda_ast_source_site(metadata), lambda_ast_par_kind(metadata)) + 1
+}
+
+-- List of AST nodes (for fn params, call args, block stmts)
+pub(package) fn nlist_new() -> i64 {
+  -- The fourth header word is a lazily built lookup index slot, used
+  -- only by the decl-list lookups (name-resolution indexing); every other consumer ignores it.
+  let h = alloc_words(4)
+  let d = alloc_words(64)
+  mem_store64_at(h, 0, d)
+  mem_store64_at(h, 8, 0)
+  mem_store64_at(h, 16, 64)
+  mem_store64_at(h, 24, 0)
+  h
+}
+pub(package) fn nlist_new_capacity(requested_capacity: i64) -> i64 {
+  let capacity = if requested_capacity < 1 { 1 } else { requested_capacity }
+  let h = alloc_words(4)
+  let d = alloc_words(capacity)
+  mem_store64_at(h, 0, d)
+  mem_store64_at(h, 8, 0)
+  mem_store64_at(h, 16, capacity)
+  mem_store64_at(h, 24, 0)
+  h
+}
+pub(package) fn nlist_add(l: i64, v: i64) -> i64 {
+  let d = mem_load64_at(l, 0)
+  let n = mem_load64_at(l, 8)
+  let cap = mem_load64_at(l, 16)
+  if n >= cap {
+    let new_cap = cap * 2
+    let new_d = alloc_words(new_cap)
+    mem_copy(new_d, d, n * 8)
+    mem_store64_at(l, 0, new_d)
+    mem_store64_at(l, 16, new_cap)
+    mem_store64_at(new_d, n * 8, v)
+    mem_store64_at(l, 8, n + 1)
+    l
+  } else {
+    mem_store64_at(d, n * 8, v)
+    mem_store64_at(l, 8, n + 1)
+    l
+  }
+}
+pub(package) fn nlist_get(l: i64, i: i64) -> i64 {
+  let d = mem_load64_at(l, 0)
+  mem_load64_at(d, i * 8)
+}
+pub(package) fn nlist_set(l: i64, i: i64, value: i64) -> i64 {
+  let d = mem_load64_at(l, 0)
+  mem_store64_at(d, i * 8, value)
+}
+pub(package) fn nlist_len(l: i64) -> i64 { mem_load64_at(l, 8) }
+pub(package) fn nlist_set_len(l: i64, len: i64) -> i64 { mem_store64_at(l, 8, len) }
+
+pub(package) fn pack(node: i64, pos: i64) -> i64 {
+  let r = alloc_words(2)
+  mem_store64_at(r, 0, node)
+  mem_store64_at(r, 8, pos)
+  r
+}
+pub(package) fn unpack_node(r: i64) -> i64 { mem_load64_at(r, 0) }
+pub(package) fn unpack_pos(r: i64) -> i64 { mem_load64_at(r, 8) }
+
+pub(package) fn op_prec(op_id: i64) -> i64 {
+  -- Precedence (higher = tighter binding):
+  -- *=3 /=4 %=11: prec 12 (multiplicative)
+  -- +=1 -=2: prec 11 (additive)
+  -- bshl=17 bshr=18: prec 10 (bitwise shift)
+  -- band=14: prec 9
+  -- bxor=16: prec 8
+  -- bor=15: prec 7
+  -- ==5 !=6 <7 >8 <=9 >=10: prec 6 (comparison)
+  -- and=12: prec 5
+  -- or=13: prec 4
+  match op_id {
+    1 -> 11
+    2 -> 11
+    3 -> 12
+    4 -> 12
+    5 -> 6
+    6 -> 6
+    7 -> 6
+    8 -> 6
+    9 -> 6
+    10 -> 6
+    11 -> 12
+    12 -> 5
+    13 -> 4
+    14 -> 9
+    15 -> 7
+    16 -> 8
+    17 -> 10
+    18 -> 10
+    19 -> 3
+    20 -> 2
+    _ -> 10
+  }
+}

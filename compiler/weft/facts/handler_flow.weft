@@ -1,0 +1,185 @@
+-- Lexical handler stacks at CFG entries. Branches and abort edges carry
+-- stacks independently of physical block order; clause bodies are separate CFGs.
+use compiler/ir/data.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/map as map
+use stdlib/map.{Map}
+use stdlib/option.{Option, Some, None}
+
+pub(package) type IrHandlerFlow {
+  IrHandlerFlowEmpty
+  IrHandlerFlowInvalid
+  IrHandlerFlowFacts(Map<i64, List<i64>>, Map<i64, List<i64>>, Map<i64, IrInst>, Map<i64, List<i64>>, List<i64>, i64)
+}
+
+type HandlerFlowWork {
+  pending: List<i64>,
+  entries: Map<i64, List<i64>>,
+  valid: bool
+}
+
+fn handler_flow_same_stack(left: List<i64>, right: List<i64>) -> bool {
+  match left {
+    Nil -> match right { Nil -> true _ -> false }
+    Cons(value, rest) -> match right {
+      Cons(other, tail) -> value == other and handler_flow_same_stack(rest, tail)
+      Nil -> false
+    }
+  }
+}
+
+fn handler_flow_reverse(values: List<i64>, result: List<i64>) -> List<i64> {
+  match values {
+    Nil -> result
+    Cons(value, rest) -> handler_flow_reverse(rest, Cons(value, result))
+  }
+}
+
+fn handler_flow_depth(values: List<i64>) -> i64 {
+  match values { Nil -> 0 Cons(_, rest) -> 1 + handler_flow_depth(rest) }
+}
+
+fn handler_flow_needed(blocks: IrBlockList) -> bool {
+  let mut current = blocks
+  while true {
+    match current {
+      IrBlockListNil -> return false
+      IrBlockListCons(IrBlock(_, _, insts, _), rest) -> {
+        let mut instructions = insts
+        let mut walking = true
+        while walking {
+          match instructions {
+            IrInstNil -> { walking = false }
+            IrInstCons(inst, tail) -> {
+              match inst {
+                IrHandleI64(_, _, _, _, count, _) if count > 0 -> return true
+                IrHandlerPopI64(_) -> return true
+                _ -> nil
+              }
+              instructions = tail
+            }
+          }
+        }
+        current = rest
+      }
+    }
+  }
+  false
+}
+
+fn handler_flow_schedule(work: HandlerFlowWork, target: i64, stack: List<i64>) -> HandlerFlowWork {
+  match work.entries.get(target) {
+    Some(previous) -> HandlerFlowWork { pending: work.pending, entries: work.entries,
+      valid: work.valid and handler_flow_same_stack(previous, stack) }
+    None -> HandlerFlowWork { pending: Cons(target, work.pending),
+      entries: work.entries.insert(target, stack), valid: work.valid }
+  }
+}
+
+pub(package) fn ir_handler_flow(blocks: IrBlockList) -> IrHandlerFlow {
+  if not handler_flow_needed(blocks) { return IrHandlerFlowEmpty } else { nil }
+  let mut definitions = map.new<i64, IrBlock>()
+  let mut sites = map.new<i64, IrInst>()
+  let mut block_sites = map.new<i64, List<i64>>()
+  let mut order: List<i64> = Nil<i64>()
+  let mut next_site = 0
+  let mut current = blocks
+  let mut first = 0 - 1
+  let mut collecting = true
+  while collecting {
+    match current {
+      IrBlockListNil -> { collecting = false }
+      IrBlockListCons(block, rest) -> match block {
+        IrBlock(id, _, insts, _) -> {
+          if first < 0 { first = id } else { nil }
+          definitions = definitions.insert(id, block)
+          let mut local: List<i64> = Nil<i64>()
+          let mut instructions = insts
+          let mut walking = true
+          while walking {
+            match instructions {
+              IrInstNil -> { walking = false }
+              IrInstCons(inst, tail) -> {
+                match inst {
+                  IrHandleI64(_, _, _, _, count, _) if count > 0 -> {
+                    sites = sites.insert(next_site, inst)
+                    local = Cons(next_site, local)
+                    order = Cons(next_site, order)
+                    next_site = next_site + 1
+                  }
+                  _ -> nil
+                }
+                instructions = tail
+              }
+            }
+          }
+          block_sites = block_sites.insert(id, handler_flow_reverse(local, Nil<i64>()))
+          current = rest
+        }
+      }
+    }
+  }
+  let mut work = HandlerFlowWork { pending: Cons(first, Nil<i64>()),
+    entries: map.new<i64, List<i64>>().insert(first, Nil<i64>()), valid: true }
+  let mut parents = map.new<i64, List<i64>>()
+  let mut maximum = 0
+  let mut walking = true
+  while walking and work.valid {
+    match work.pending {
+      Nil -> { walking = false }
+      Cons(id, pending) -> {
+        work = HandlerFlowWork { pending: pending, entries: work.entries, valid: work.valid }
+        match definitions.get(id) {
+          None -> { return IrHandlerFlowInvalid }
+          Some(IrBlock(_, _, insts, term)) -> {
+            let mut stack = work.entries.get(id).unwrap_or(Nil<i64>())
+            let mut local = block_sites.get(id).unwrap_or(Nil<i64>())
+            let mut instructions = insts
+            let mut scanning = true
+            while scanning and work.valid {
+              match instructions {
+                IrInstNil -> { scanning = false }
+                IrInstCons(inst, rest) -> {
+                  match inst {
+                    IrHandleI64(_, _, _, _, count, abort) if count > 0 -> match local {
+                      Nil -> return IrHandlerFlowInvalid
+                      Cons(site, tail) -> {
+                        parents = parents.insert(site, stack)
+                        if abort >= 0 { work = handler_flow_schedule(work, abort, stack) } else { nil }
+                        stack = Cons(site, stack)
+                        let depth = handler_flow_depth(stack)
+                        if depth > maximum { maximum = depth } else { nil }
+                        local = tail
+                      }
+                    }
+                    IrHandlerPopI64(_) -> match stack {
+                      Nil -> return IrHandlerFlowInvalid
+                      Cons(_, tail) -> { stack = tail }
+                    }
+                    _ -> nil
+                  }
+                  instructions = rest
+                }
+              }
+            }
+            work = match term {
+              IrTermJump(target, _) -> handler_flow_schedule(work, target, stack)
+              IrTermBranch(_, yes, no) -> handler_flow_schedule(handler_flow_schedule(work, yes, stack), no, stack)
+              _ -> work
+            }
+          }
+        }
+      }
+    }
+  }
+  if work.valid {
+    IrHandlerFlowFacts(work.entries, parents, sites, block_sites, handler_flow_reverse(order, Nil<i64>()), maximum)
+  } else { IrHandlerFlowInvalid }
+}
+
+pub(package) fn ir_handler_flow_max_depth(flow: IrHandlerFlow) -> i64 {
+  match flow {
+    IrHandlerFlowFacts(_, _, _, _, _, depth) -> depth
+    _ -> 0
+  }
+}

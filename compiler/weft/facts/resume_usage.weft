@@ -1,0 +1,151 @@
+-- Affine source use of the current clause's implicit continuation.
+-- Resume terminates a clause at runtime, but dead source after it still counts:
+-- `resume(1); resume(2)` must be rejected before lowering removes the second use.
+-- Alternative branches share one permission; sequences consume it cumulatively.
+
+use compiler/ir/data.{*}
+
+pub(package) type ResumeUsage {
+  NoResumeUse,
+  OneResumeUse,
+  RepeatedResumeUse,
+  UnknownResumeUse
+}
+
+pub(package) fn resume_usage_then(first: ResumeUsage, next: ResumeUsage) -> ResumeUsage {
+  match first {
+    NoResumeUse -> next
+    OneResumeUse -> match next {
+      NoResumeUse -> OneResumeUse
+      OneResumeUse -> RepeatedResumeUse
+      RepeatedResumeUse -> RepeatedResumeUse
+      UnknownResumeUse -> UnknownResumeUse
+    }
+    RepeatedResumeUse -> RepeatedResumeUse
+    UnknownResumeUse -> match next {
+      RepeatedResumeUse -> RepeatedResumeUse
+      _ -> UnknownResumeUse
+    }
+  }
+}
+
+pub(package) fn resume_usage_join(left: ResumeUsage, right: ResumeUsage) -> ResumeUsage {
+  match left {
+    NoResumeUse -> right
+    OneResumeUse -> match right {
+      NoResumeUse -> OneResumeUse
+      _ -> right
+    }
+    RepeatedResumeUse -> RepeatedResumeUse
+    UnknownResumeUse -> match right {
+      RepeatedResumeUse -> RepeatedResumeUse
+      _ -> UnknownResumeUse
+    }
+  }
+}
+
+fn resume_usage_list(values: ExprList) -> ResumeUsage {
+  match values {
+    ExprListNil -> NoResumeUse
+    ExprListCons(value, rest) -> resume_usage_then(resume_usage(value), resume_usage_list(rest))
+  }
+}
+
+fn resume_usage_fields(fields: RecordFieldList) -> ResumeUsage {
+  match fields {
+    RecordFieldListNil -> NoResumeUse
+    RecordFieldListCons(RecordField(_, _, value, _), rest) ->
+      resume_usage_then(resume_usage(value), resume_usage_fields(rest))
+    _ -> UnknownResumeUse
+  }
+}
+
+fn resume_usage_arms(arms: MatchArmList) -> ResumeUsage {
+  match arms {
+    MatchArmListNil -> NoResumeUse
+    MatchArmListCons(Arm(_, body, guard, has_guard), rest) -> {
+      let alternatives = resume_usage_join(resume_usage(body), resume_usage_arms(rest))
+      -- A false guard may continue to a later arm. An unguarded arm's body
+      -- and the remaining arms are mutually exclusive.
+      if has_guard == 1 { resume_usage_then(resume_usage(guard), alternatives) }
+      else { alternatives }
+    }
+    _ -> UnknownResumeUse
+  }
+}
+
+fn resume_usage_return(completion: HandleReturn) -> ResumeUsage {
+  match completion {
+    NoHandleReturn -> NoResumeUse
+    HandleReturnClause(_, _, body) -> resume_usage(body)
+  }
+}
+
+pub(package) fn resume_usage(expr: Expr) -> ResumeUsage {
+  match expr {
+    IntLit(_, _, _) -> NoResumeUse
+    StringLit(_, _) -> NoResumeUse
+    BoolLit(_) -> NoResumeUse
+    FloatLit(_, _, _) -> NoResumeUse
+    Ident(_, _) -> NoResumeUse
+    ResolvedEffectIdent(_, _, _) -> NoResumeUse
+    BorrowIdent(_, _, _, _) -> NoResumeUse
+    NilExpr -> NoResumeUse
+    -- Capturing an enclosing resume is checked separately. A lambda may
+    -- install its own handlers, whose continuations are independent.
+    Lambda(_, _, _) -> NoResumeUse
+    Resume(value) -> resume_usage_then(resume_usage(value), OneResumeUse)
+    Return(value) -> resume_usage(value)
+    ReturnNoValue -> NoResumeUse
+    Block(first, rest) -> resume_usage_then(resume_usage(first), resume_usage(rest))
+    Let(_, _, value, body) -> resume_usage_then(resume_usage(value), resume_usage(body))
+    LetMut(_, _, value, body) -> resume_usage_then(resume_usage(value), resume_usage(body))
+    LetTyped(inner, _) -> resume_usage(inner)
+    If(condition, yes, no) -> resume_usage_then(resume_usage(condition),
+      resume_usage_join(resume_usage(yes), resume_usage(no)))
+    Match(value, arms) -> resume_usage_then(resume_usage(value), resume_usage_arms(arms))
+    BinOp(_, left, right) -> resume_usage_then(resume_usage(left), resume_usage(right))
+    InterpConcat(left, right) -> resume_usage_then(resume_usage(left), resume_usage(right))
+    -- A tail resume exits the clause, so a single use inside a loop cannot
+    -- run again on another iteration. Separate uses still consume twice.
+    While(condition, body) -> resume_usage_then(resume_usage(condition), resume_usage(body))
+    Loop(body) -> resume_usage(body)
+    ForIter(_, _, source, body) -> resume_usage_then(resume_usage(source), resume_usage(body))
+    Break(value) -> resume_usage(value)
+    BreakNoValue -> NoResumeUse
+    Continue -> NoResumeUse
+    Defer(cleanup, body, _) -> resume_usage_then(resume_usage(body), resume_usage(cleanup))
+    Call(_, _, args) -> resume_usage_list(args)
+    Apply(callee, args, _, _) -> resume_usage_then(resume_usage(callee), resume_usage_list(args))
+    GenericCall(_, call) -> resume_usage(call)
+    MethodCall(receiver, _, args, _) -> resume_usage_then(resume_usage(receiver), resume_usage_list(args))
+    Perform(effect_expr, _, _, args) -> resume_usage_then(resume_usage(effect_expr), resume_usage_list(args))
+    -- Inner operation clauses bind their own continuation. The handled body
+    -- and normal-return transform retain the enclosing lexical continuation.
+    Handle(body, _, completion) -> resume_usage_then(resume_usage(body), resume_usage_return(completion))
+    WithHandler(config, body, _, _) -> match config {
+      HandlerConfiguration(_, _, _, args) -> resume_usage_then(resume_usage_list(args), resume_usage(body))
+      UnknownHandlerConfiguration -> UnknownResumeUse
+    }
+    Assign(_, _, value) -> resume_usage(value)
+    AddressOf(_, value) -> resume_usage(value)
+    Deref(value) -> resume_usage(value)
+    PtrAssign(pointer, value) -> resume_usage_then(resume_usage(pointer), resume_usage(value))
+    FieldAccess(value, _, _, _) -> resume_usage(value)
+    IndexedLen(value, _) -> resume_usage(value)
+    IndexedGet(value, index, _, _) -> resume_usage_then(resume_usage(value), resume_usage(index))
+    IndexedSet(value, index, replacement, _) -> resume_usage_then(resume_usage(value),
+      resume_usage_then(resume_usage(index), resume_usage(replacement)))
+    IndexedSlice(value, start, end, _) -> resume_usage_then(resume_usage(value),
+      resume_usage_then(resume_usage(start), resume_usage(end)))
+    RecordInit(_, _, fields, _) -> resume_usage_fields(fields)
+    RecordUpdate(value, fields, _) -> resume_usage_then(resume_usage(value), resume_usage_fields(fields))
+    ArrayLiteral(elements, _, _) -> resume_usage_list(elements)
+    Not(value) -> resume_usage(value)
+    Negate(value, _) -> resume_usage(value)
+    Try(value, _, _) -> resume_usage(value)
+    OptChain(value, _, _, _) -> resume_usage(value)
+    -- The private bridge uses zero for an absent trailing expression.
+    UnknownExpr(tag) -> if tag == 0 { NoResumeUse } else { UnknownResumeUse }
+  }
+}

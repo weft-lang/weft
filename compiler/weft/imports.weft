@@ -1,0 +1,433 @@
+-- Project source orchestration over grammar-owned local syntax.
+-- The project session retains source contents and all loaded dependencies.
+
+use compiler/weft/grammar.{WeftParser, ParsedWeftSource, grammar_source_location}
+use compiler/source/input.{SourceRequest, SourceLoadResult, SourceLoaded, SourceUnavailable}
+use compiler/source/loading.{SourceLoader, SourceLoadScope, LoadedModuleSyntax, source_loader, source_loader_load, source_loader_owners, source_loader_retain}
+use compiler/source/owners as source_owners
+use compiler/source/owners.{SourceOwners}
+use compiler/weft/parse.{*}
+use compiler/weft/syntax/imports.{*}
+use compiler/weft/syntax/declarations.{ParsedModuleSyntax}
+use compiler/package/manifest.{*}
+use compiler/sdk/source.{sdk_source_load_module}
+use compiler/package/diagnostics.{package_diagnose_binding_trust_failure, package_diagnose_native_target_missing, package_diagnose_resolve_failure}
+use compiler/weft/check/table.{*}
+use compiler/diagnostic/location.{diagnostic_location_from_offsets}
+use compiler/diagnostic/observe.{observe_errors}
+use runtime/alloc.{*}
+use runtime/memory.{*}
+use runtime/buffer.{*}
+use runtime/string.{runtime_str_from_bytes_copy}
+use runtime/source_acquire.{SourceAcquire}
+use stdlib/diagnostic/schema.{*}
+use stdlib/diagnostic/registry
+use compiler/source_registration.{*}
+use compiler/project/module.{*}
+use compiler/storage.{*}
+use stdlib/grammar.{Grammar, Parsed, Recovered, Rejected}
+use stdlib/source.{Source}
+use stdlib/diagnostic/schema.{Diagnose}
+use stdlib/diagnostic.{Diagnostic, DiagnosticLocation}
+use stdlib/list.{Cons, Nil}
+use stdlib/num
+use stdlib/result.{Result}
+
+fn load_source_imports<E>(syntax: ParsedModuleSyntax, src: i64, functions: i64, table: i64, loader: SourceLoader<E>) -[Diagnose, E]> i64 {
+  let mut imports = syntax.imports
+  loop {
+    match imports {
+      Nil -> break
+        Cons(declaration, rest) -> {
+        let visibility = match declaration.visibility {
+          PrivateVisibility -> 0
+          PackageVisibility -> 1
+          PublicVisibility -> 2
+        }
+        let offset = declaration.module_start.to_u64().to_i64_checked().unwrap()
+        parse_import_with_loader(declaration.syntax, 0, offset, src, functions, table, visibility, loader)
+        imports = rest
+      }
+    }
+  }
+  functions
+}
+
+-- Private checker-storage bridge. Grammar parsing owns no source acquisition;
+-- this host traverses the parsed import declarations under the supplied loader.
+fn parse_registered_source_inner<E>(source: Source, table: i64, loader: SourceLoader<E>) -[Diagnose, E]> i64 {
+  let src = __str_ptr(source.text)
+  source_register_root_native_binding(table, src)
+  let entered = source_enter_root_load(table, src)
+  let parsed = WeftParser { table: table }.parse(source.all())
+  let functions = match parsed {
+    Parsed(syntax) -> load_source_imports(syntax.declarations, src, syntax.declarations.functions, table, loader)
+    Recovered(syntax) -> load_source_imports(syntax.declarations, src, syntax.declarations.functions, table, loader)
+    Rejected -> nlist_new()
+  }
+  source_leave_root_load(table, entered)
+  parse_diagnose_module_cycle(table, src)
+  functions
+}
+
+-- Map resolver diagnostics from this root's private storage coordinates to
+-- its retained source identity. Dependency locations keep their own source.
+pub (package) fn parse_registered_source_with_loader<E>(source: Source, table: i64, loader: SourceLoader<E>) -[Diagnose, E]> LoadedModuleSyntax {
+  source_loader_retain(loader, source_owners.with_text(source_owners.new(), source.text))
+  let functions = with_source_diagnostics(source, () => parse_registered_source_inner(source, table, loader))
+  LoadedModuleSyntax { functions: functions, owners: source_loader_owners(loader) }
+}
+
+fn with_source_diagnostics<T, E>(source: Source, body: () -[Diagnose, E]> T) -[Diagnose, E]> T {
+  handle body() {
+    Diagnose.report(diagnostic) -> {
+      Diagnose.report(diagnostic.map_locations((location: DiagnosticLocation) => grammar_source_location(source, location)))
+      resume(0)
+    }
+    Diagnose.error(message, position) -> { Diagnose.error(message, position); resume(0) }
+    Diagnose.warn(message, position) -> { Diagnose.warn(message, position); resume(0) }
+    Diagnose.note(message, position) -> { Diagnose.note(message, position); resume(0) }
+  }
+}
+
+-- Standalone host configuration; the grammar itself never acquires sources.
+pub (package) fn parse_registered_source(source: Source, tt: i64) -[Diagnose, SourceAcquire]> LoadedModuleSyntax {
+  pkg_install_sdk_for_table(tt, SourceAcquire.sdk_origin())
+  let loader = parse_source_loader_for_table(tt)
+  parse_registered_source_with_loader(source, tt, loader)
+}
+
+-- Encode typed import selections only at the legacy module-graph boundary.
+-- Remove this pointer/wildcard adapter when the graph stores ImportBinding.
+pub (package) fn parse_use_register_fact(tt: i64, importer_src: i64, target_module: i64, syntax: ImportSyntax, visibility: i64, source_offset: i64) -> i64 {
+  let selections = nlist_new()
+  match syntax.binding {
+    ImportModule(alias) -> module_import_fact_register_at(tt, importer_src, target_module, selections,
+      importer_src + __u64_to_i64(__usize_to_u64(alias.start)), __u64_to_i64(__usize_to_u64(alias.length)), visibility, 0, source_offset)
+    ImportSymbols(items) -> {
+      for item in items {
+        match item {
+          ImportWildcard -> nlist_add(selections, node_new(0, 0, 0 - 1, 0, 0))
+          ImportSymbol(name) -> nlist_add(selections, node_new(0,
+            importer_src + __u64_to_i64(__usize_to_u64(name.start)), __u64_to_i64(__usize_to_u64(name.length)), 0, 0))
+          ImportRenamedSymbol(name, alias) -> nlist_add(selections, node_new(0,
+            importer_src + __u64_to_i64(__usize_to_u64(name.start)), __u64_to_i64(__usize_to_u64(name.length)),
+            importer_src + __u64_to_i64(__usize_to_u64(alias.start)), __u64_to_i64(__usize_to_u64(alias.length))))
+        }
+      }
+      module_import_fact_register_at(tt, importer_src, target_module, selections, 0, 0, visibility, 0, source_offset)
+    }
+  }
+}
+
+pub (package) type CompilerSourceLoader = ((SourceRequest) -[SourceAcquire, Diagnose]> SourceLoadResult, SourceLoadScope)
+
+pub (package) fn parse_source_loader_with_owners(tt: i64, owners: SourceOwners) -> CompilerSourceLoader {
+  let acquire = (request: SourceRequest) => {
+    let logical = request.logical_path
+    let physical = request.physical_path
+    let descriptor = if pkg_identity_is_sdk(tt, request.package_id) == 1 {
+      sdk_source_load_module(__str_ptr(logical), module_logical_path_len(__str_ptr(logical), __str_len(logical)))
+    } else {
+      SourceAcquire.load(__str_ptr(physical), __str_len(physical), __str_ptr(logical), __str_len(logical), request.package_id)
+    }
+    source_load_descriptor(descriptor)
+  }
+  source_loader(acquire, owners)
+}
+
+pub (package) fn parse_source_loader_for_table(tt: i64) -> CompilerSourceLoader {
+  parse_source_loader_with_owners(tt, source_owners.new())
+}
+
+-- Only the native acquisition boundary still uses a raw descriptor. Convert
+-- once into owned text; grammar and module loading never exchange byte handles.
+pub (package) fn source_load_descriptor(descriptor: i64) -> SourceLoadResult {
+  if descriptor == 0 { SourceUnavailable }
+  else {
+    let data = mem_load64_at(descriptor, 0)
+    let length = mem_load64_at(descriptor, 8)
+    if data == 0 or length < 0 { SourceUnavailable }
+    else {
+      let text = runtime_str_from_bytes_copy(data, length)
+      SourceLoaded(Source { text: text, identity: DiagnosticSourceBuffer(__str_ptr(text)) })
+    }
+  }
+}
+
+pub (package) fn parse_read_registered_or_load<E>(request: SourceRequest, loader: SourceLoader<E>) -[Diagnose, E]> SourceLoadResult {
+  let (source, errors) = observe_errors(() => source_loader_load(loader, request))
+  match source {
+    SourceLoaded(_) -> nil
+    SourceUnavailable -> if errors == 0 {
+      Diagnose.report(Diagnostic(
+        DiagnosticSeverityError, DiagnosticClassModule, registry.module_source_unavailable(),
+        "imported module source is unavailable",
+        DiagnosticSourceRange(DiagnosticSourceNamed(request.physical_path), 0, 0), DiagnosticRelatedLocationNil,
+        DiagnosticFieldCons(DiagnosticFieldText("module", request.logical_path),
+        DiagnosticFieldCons(DiagnosticFieldText("path", request.physical_path),
+        DiagnosticFieldCons(DiagnosticFieldI64("package_id", request.package_id), DiagnosticFieldNil)))
+      ))
+      nil
+    }
+  }
+  source
+}
+
+pub (package) fn parse_import_with_loader<E>(syntax: ImportSyntax, end_pos: i64, source_offset: i64, src: i64, fns: i64, tt: i64, visibility: i64, loader: SourceLoader<E>) -[Diagnose, E]> i64 {
+  -- Resolver paths can be retained by the legacy module graph. Copy into its
+  -- compilation arena; a managed syntax string must never become an unowned
+  -- graph pointer. This copy disappears with the typed graph-path migration.
+  let path_len = __str_len(syntax.module_path) + 5
+  let path_ptr = alloc_zeroed(path_len)
+  mem_copy(path_ptr, __str_ptr(syntax.module_path), path_len - 5)
+  mem_copy(path_ptr + path_len - 5, __str_ptr(".weft"), 5)
+  let importer_module = module_fact_find_source(tt, src)
+  let importer_package = if importer_module == 0 { 0 } else { module_fact_entry_package(importer_module) }
+  let resolved = pkg_resolve_default_import(tt, importer_package, path_ptr, path_len)
+  let resolved_ptr = pkg_resolve_ptr(resolved)
+  let resolved_len = pkg_resolve_len(resolved)
+  let resolved_package = pkg_resolve_package(resolved)
+  let resolved_logical_ptr = pkg_resolve_logical_ptr(resolved)
+  let resolved_logical_len = pkg_resolve_logical_len(resolved)
+  let resolved_module_len = module_logical_path_len(resolved_logical_ptr, resolved_logical_len)
+  let binding_trust = if pkg_resolve_status(resolved) < 0 { 0 }
+  else { pkg_binding_module_trust_state(tt, resolved_package, resolved_logical_ptr, resolved_module_len) }
+  let loaded = mem_load64_at(tt, 24)
+  if pkg_resolve_status(resolved) < 0 {
+    package_diagnose_resolve_failure(pkg_resolve_status(resolved), src, path_ptr, path_len, source_offset)
+    end_pos
+  } else { if binding_trust < 0 {
+      package_diagnose_binding_trust_failure(tt, resolved_package, src, resolved_logical_ptr, resolved_module_len, source_offset)
+      end_pos
+    } else { if is_file_loaded(loaded, resolved_logical_ptr, 0, resolved_module_len, resolved_package) {
+        -- Logical identity deduplicates diamonds and terminates back-edges. The
+        -- producer-owned graph audit below distinguishes the two semantically.
+        let target_module = module_fact_find_path(tt, resolved_logical_ptr, resolved_logical_len, resolved_package)
+        if target_module != 0 {
+          parse_use_register_fact(tt, src, target_module, syntax, visibility, source_offset)
+          module_fact_append_function_closure(tt, fns, target_module)
+        } else { 0 }
+        end_pos
+      } else {
+        mark_file_loaded(loaded, resolved_logical_ptr, 0, resolved_module_len, resolved_package)
+        let loading = mem_load64_at(tt, 96)
+        loading_stack_push(loading, resolved_logical_ptr, resolved_module_len, resolved_package)
+        let request = SourceRequest {
+          physical_path: runtime_str_from_bytes_copy(resolved_ptr, resolved_len),
+            logical_path: runtime_str_from_bytes_copy(resolved_logical_ptr, resolved_module_len),
+            package_id: resolved_package
+        }
+        match parse_read_registered_or_load<E>(request, loader) {
+          SourceUnavailable -> 0
+          SourceLoaded(source) -> {
+            let file_buf = __str_ptr(source.text)
+            let file_len = __str_len(source.text)
+            -- The transitional built-in path TCB belongs only to the root package.
+            -- A dependency cannot acquire it by aliasing its path onto runtime/.
+            if resolved_package == 0 or pkg_identity_is_sdk(tt, resolved_package) == 1 {
+              mark_trusted_import_source(tt, resolved_ptr, resolved_len, file_buf)
+            } else { 0 }
+            let native_source = source_register_manifest_import_binding(tt, file_buf, resolved_package, resolved_logical_ptr, resolved_module_len)
+            if native_source < 0 {
+              package_diagnose_native_target_missing(tt, src, resolved_logical_ptr, resolved_module_len, source_offset)
+            } else { 0 }
+            ttable_register_source_in_package(tt, file_buf, file_len, resolved_ptr, resolved_len, resolved_package)
+            let target_module = module_fact_find_source(tt, file_buf)
+            -- Source provenance keeps the physical resolver path; semantic module
+            -- identity is the canonical path-form spelling from the import.
+            module_fact_upgrade_named(target_module, resolved_logical_ptr, resolved_logical_len, resolved_package)
+            parse_use_register_fact(tt, src, target_module, syntax, visibility, source_offset)
+            parse_imported_source<E>(source, fns, tt, loader)
+            if native_source > 0 { source_register_native_binding_declarations(tt, native_source) } else { 0 }
+          } }
+        loading_stack_pop(loading)
+        end_pos
+      } } }
+}
+
+pub (package) fn parse_use_file(fns: i64, tt: i64, path_str: str) -[Diagnose, SourceAcquire]> SourceOwners {
+  pkg_install_sdk_for_table(tt, SourceAcquire.sdk_origin())
+  let loader = parse_source_loader_for_table(tt)
+  parse_use_file_with_loader(fns, tt, path_str, loader)
+  source_loader_owners(loader)
+}
+
+pub (package) fn parse_use_file_with_loader<E>(fns: i64, tt: i64, path_str: str, loader: SourceLoader<E>) -[Diagnose, E]> i64 {
+  let path_len = __str_len(path_str)
+  -- The private graph keeps path views even when acquisition fails or an
+  -- inherited source satisfies the request. Retain its own arena spelling,
+  -- just as explicit imports do, until graph paths become managed values.
+  let path_ptr = alloc_zeroed(path_len)
+  mem_copy(path_ptr, __str_ptr(path_str), path_len)
+  let logical_len = module_logical_path_len(path_ptr, path_len)
+  let sdk_package = ttable_sdk_package_id(tt)
+  let package_id = if sdk_package > 0 and pkg_import_is_sdk_module(path_ptr, path_len) == 1 { sdk_package } else { 0 }
+  let loaded = mem_load64_at(tt, 24)
+  if is_file_loaded(loaded, path_ptr, 0, logical_len, package_id) {
+    let target_module = module_fact_find_path(tt, path_ptr, logical_len, package_id)
+    if target_module != 0 { module_fact_append_function_closure(tt, fns, target_module) } else { 0 }
+    0
+  } else {
+    mark_file_loaded(loaded, path_ptr, 0, logical_len, package_id)
+    let loading = mem_load64_at(tt, 96)
+    loading_stack_push(loading, path_ptr, logical_len, package_id)
+    let request = SourceRequest {
+      physical_path: path_str,
+        logical_path: runtime_str_from_bytes_copy(path_ptr, logical_len),
+        package_id: package_id
+    }
+    match parse_read_registered_or_load<E>(request, loader) {
+      SourceUnavailable -> 0
+      SourceLoaded(source) -> {
+        let file_buf = __str_ptr(source.text)
+        let file_len = __str_len(source.text)
+        mark_trusted_import_source(tt, path_ptr, path_len, file_buf)
+        ttable_register_source_in_package(tt, file_buf, file_len, path_ptr, path_len, package_id)
+        parse_imported_source<E>(source, fns, tt, loader)
+      } }
+    loading_stack_pop(loading)
+    parse_diagnose_module_cycle(tt, 0)
+    0
+  }
+}
+
+pub (package) fn parse_import_fact_exists(tt: i64, importer: i64, target: i64, weak: i64) -> i64 {
+  let imports = module_fact_imports(tt)
+  let mut i = 0
+  let mut found = 0
+  while i < nlist_len(imports) and found == 0 {
+    let entry = nlist_get(imports, i)
+    if module_import_fact_importer(entry) == importer and module_import_fact_target(entry) == target and module_import_fact_is_weak(entry) == weak {
+      found = 1
+    } else { i = i + 1 }
+  }
+  found
+}
+
+pub (package) fn parse_append_module_cycle_path(buf: i64, module_entry: i64) -> i64 {
+  if module_fact_entry_anonymous(module_entry) != 0 { bstr(buf, "<anonymous>") }
+  else { bscopy(buf, module_fact_entry_path_ptr(module_entry), module_fact_entry_path_len(module_entry), 0) }
+}
+
+pub (package) fn parse_module_cycle_message(cycle: ModuleImportCycle) -> str {
+  let message = buf_new(128)
+  bstr(message, "circular import: ")
+  let count = module_import_cycle_count(cycle)
+  for i in 0..count {
+    if i > 0 { bstr(message, " -> ") } else { 0 }
+    parse_append_module_cycle_path(message, module_import_cycle_module_at(cycle, i))
+  }
+  if count > 0 {
+    bstr(message, " -> ")
+    parse_append_module_cycle_path(message, module_import_cycle_module_at(cycle, 0))
+  } else { 0 }
+  runtime_str_from_bytes_copy(buf_ptr(message), buf_len(message))
+}
+
+pub (package) fn parse_module_cycle_location(edge: i64, fallback_src: i64) -> DiagnosticLocation {
+  let importer = module_import_fact_importer(edge)
+  let source = if importer == 0 { fallback_src } else { module_fact_entry_source(importer) }
+  let start = module_import_fact_source_offset(edge)
+  if source == 0 or start < 0 { DiagnosticLocationNone }
+  else { diagnostic_location_from_offsets(DiagnosticSourceBuffer(source), start, start + 3) }
+}
+
+pub (package) fn parse_module_cycle_related(cycle: ModuleImportCycle, fallback_src: i64) -> DiagnosticRelatedLocationList {
+  let mut related = DiagnosticRelatedLocationNil
+  let mut i = module_import_cycle_count(cycle) - 2
+  while i >= 0 {
+    related = DiagnosticRelatedLocationCons(
+      DiagnosticRelatedLocation("cycle continues through this import", parse_module_cycle_location(module_import_cycle_edge_at(cycle, i), fallback_src)),
+      related
+    )
+    i = i - 1
+  }
+  related
+}
+
+pub (package) fn parse_module_cycle_fields(cycle: ModuleImportCycle) -> DiagnosticFieldList {
+  DiagnosticFieldCons(
+    DiagnosticFieldText("cycle", parse_module_cycle_message(cycle)),
+    DiagnosticFieldCons(
+    DiagnosticFieldI64("module_count", module_import_cycle_count(cycle)),
+    DiagnosticFieldNil
+  )
+  )
+}
+
+pub (package) fn parse_diagnose_module_cycle(tt: i64, fallback_src: i64) -[Diagnose]> i64 {
+  if module_graph_audit_needed(tt) == 0 { 0 }
+  else {
+    let cycle = module_graph_find_cycle(tt)
+    if module_import_cycle_is_present(cycle) == 0 {
+      module_graph_mark_audited(tt, 0)
+      0
+    } else {
+      let edge = module_import_cycle_edge_at(cycle, module_import_cycle_count(cycle) - 1)
+      module_graph_mark_audited(tt, 1)
+      Diagnose.report(Diagnostic(
+        DiagnosticSeverityError,
+        DiagnosticClassModule,
+        registry.module_import_cycle(),
+        parse_module_cycle_message(cycle),
+        parse_module_cycle_location(edge, fallback_src),
+        parse_module_cycle_related(cycle, fallback_src),
+        parse_module_cycle_fields(cycle)
+      ))
+    }
+  }
+}
+
+-- The implicit prelude is an ordinary module edge with weaker precedence.
+pub (package) fn parse_bind_implicit_prelude(fns: i64, src: i64, tt: i64) -[Diagnose, SourceAcquire]> SourceOwners {
+  pkg_install_sdk_for_table(tt, SourceAcquire.sdk_origin())
+  let loader = parse_source_loader_for_table(tt)
+  parse_bind_implicit_prelude_with_loader(fns, src, tt, loader)
+  source_loader_owners(loader)
+}
+
+pub (package) fn parse_bind_implicit_prelude_with_loader<E>(fns: i64, src: i64, tt: i64, loader: SourceLoader<E>) -[Diagnose, E]> i64 {
+  let prelude_path = "stdlib/prelude.weft"
+  let prelude_ptr = __str_ptr(prelude_path)
+  let prelude_len = __str_len(prelude_path)
+  let sdk_package = ttable_sdk_package_id(tt)
+  let prelude_package = if sdk_package > 0 { sdk_package } else { 0 }
+  let importer = module_fact_find_source(tt, src)
+  if importer == 0 or module_fact_path_eq(importer, prelude_ptr, prelude_len, prelude_package) == 1 { fns }
+  else {
+    -- Prelude declarations that provide callable methods must carry the same
+    -- implementation closure as an explicit import. Otherwise a method can
+    -- resolve during checking but remain absent from native emission. The
+    -- facade is deliberately exact and small; ordinary reachability and DCE
+    -- still decide which bodies survive the finished artifact.
+    parse_use_file_with_loader<E>(fns, tt, prelude_path, loader)
+    let target = module_fact_find_path(tt, prelude_ptr, prelude_len, prelude_package)
+    -- A facade constituent cannot consume the facade that already imports it:
+    -- that would manufacture result -> prelude -> result for every direct
+    -- check/doc invocation of a prelude-owned module. Keep real weak edges in
+    -- ordinary cycle semantics; simply do not synthesize one that is known to
+    -- close a path already present in the checked module graph.
+    if target != 0 and module_graph_reaches(tt, target, importer) == 0 and parse_import_fact_exists(tt, importer, target, 1) == 0 {
+      let selections = nlist_new()
+      nlist_add(selections, node_new(0, 0, 0 - 1, 0, 0))
+      module_import_fact_register(tt, src, target, selections, 0, 0, module_visibility_private(), 1)
+    } else { 0 }
+    parse_diagnose_module_cycle(tt, src)
+    fns
+  }
+}
+
+fn parse_imported_source<E>(source: Source, fns: i64, tt: i64, loader: SourceLoader<E>) -[Diagnose, E]> i64 {
+  let src = __str_ptr(source.text)
+  with_source_diagnostics(source, () => match WeftParser { table: tt }.parse(source.all()) {
+    Parsed(syntax) -> load_source_imports(syntax.declarations, src, fns, tt, loader)
+    Recovered(syntax) -> load_source_imports(syntax.declarations, src, fns, tt, loader)
+    Rejected -> 0
+  })
+  -- The parser retains test declarations as syntax. A dependency contributes
+  -- callable implementation facts; its tests are not part of this root's harness.
+  let module_entry = module_fact_find_source(tt, src)
+  if module_entry != 0 { module_fact_append_function_closure(tt, fns, module_entry) }
+  0
+}

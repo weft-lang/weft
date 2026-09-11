@@ -358,7 +358,7 @@ def generate_source(
     mappings: list[tuple[int, tuple[int, ...]]],
     maximum_expansion: int,
 ) -> str:
-    return f'''-- compiler/unicode_security_data.weft -- GENERATED; DO NOT EDIT
+    return f'''-- compiler/weft/unicode/security_data.weft -- GENERATED; DO NOT EDIT
 -- Unicode {UNICODE_VERSION} UTS #39 mixed-script and confusable substrate.
 -- UnicodeData SHA-256: {INPUTS['unicode_data'][1]}
 -- Scripts SHA-256: {INPUTS['scripts'][1]}
@@ -367,7 +367,7 @@ def generate_source(
 -- confusables SHA-256: {INPUTS['confusables'][1]}
 -- Generator: tools/generate_unicode_security_data.py
 
-use compiler/unicode_normalization_data.{{unicode_canonical_decompose_into}}
+use compiler/weft/unicode/normalization_data.{{unicode_canonical_decompose_into}}
 use runtime/memory.{{mem_load8_at}}
 
 pub(package) fn unicode_security_data_version() -> str {{ "{UNICODE_VERSION}" }}
@@ -409,7 +409,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=pathlib.Path("compiler/unicode_security_data.weft"),
+        default=pathlib.Path("compiler/weft/unicode/security_data.weft"),
     )
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()

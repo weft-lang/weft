@@ -18,6 +18,18 @@ import bench_verdict as verdict
 
 
 class BenchmarkMeasurements(unittest.TestCase):
+    def test_compiler_source_discovery_includes_nested_namespaces(self):
+        with tempfile.TemporaryDirectory(prefix="weft namespace measurement ") as work:
+            for relative in ["compiler/main.weft", "compiler/weft/check/body.weft",
+                             "compiler/backend/aarch64/encode.weft", "compiler/README.md",
+                             "stdlib/ignored.weft"]:
+                path = Path(work) / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            with patch.object(verdict, "REPO", work):
+                self.assertEqual(verdict.tree_sources(), ["compiler/backend/aarch64/encode.weft",
+                    "compiler/main.weft", "compiler/weft/check/body.weft"])
+
     def test_language_order_balances_every_position(self):
         orders = [bench.rotated_order(bench.LANGUAGES, i) for i in range(6)]
         self.assertEqual(len({tuple(order) for order in orders}), 6)

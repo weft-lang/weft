@@ -26,7 +26,7 @@ Workloads:
               compiler is pinned to the baseline ./weft on BOTH sides so the
               paired delta isolates the runner binary's own code.
   mcp_roundtrip  time `<compiler> mcp` answering a check_summary request over
-              compiler/parse.weft, paired.
+              compiler/weft/parse.weft, paired.
 
 Results append to bench/verdicts.jsonl (BENCH_VERDICT_RECORD=0 to disable).
 
@@ -129,12 +129,12 @@ def compile_with(compiler, source, out_path):
 
 
 def tree_sources():
-    comp = sorted(
-        os.path.join("compiler", f)
-        for f in os.listdir(os.path.join(REPO, "compiler"))
-        if f.endswith(".weft")
+    return sorted(
+        os.path.relpath(os.path.join(directory, name), REPO)
+        for directory, _, files in os.walk(os.path.join(REPO, "compiler"))
+        for name in files
+        if name.endswith(".weft")
     )
-    return comp
 
 
 class Workload:
@@ -247,7 +247,7 @@ class McpRoundtrip(Workload):
 
     def prepare(self, a, b, tmp):
         self.compilers = {"a": a, "b": b}
-        with open(os.path.join(REPO, "compiler", "parse.weft")) as f:
+        with open(os.path.join(REPO, "compiler", "weft", "parse.weft")) as f:
             source = f.read()
         self.request_path = os.path.join(tmp, "mcp_request.json")
         with open(self.request_path, "w") as f:

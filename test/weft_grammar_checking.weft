@@ -1,16 +1,20 @@
-use compiler/grammar_checking.{NativeRuntimeWithRcCensus, check_weft_program_with_loader, check_weft_native_program_with_loader, check_weft_native_program_with_support_and_loader}
-use compiler/grammar_source.{WeftParser}
-use compiler/diagnostic_observation.{observe_errors}
-use compiler/pipeline.{AstModule, TypedModule}
-use compiler/source_owners as source_owners
-use compiler/source_input.{SourceRequest, SourceLoaded}
-use compiler/source_loading.{source_loader}
-use compiler/type_registry.{ttable_new}
+use compiler/weft/products.{AstModule, TypedModule}
+use compiler/weft/check.{WeftChecker, WeftCheckPurpose, CheckProgram, CheckDeclarations, ExtendCheckedProgram}
+use compiler/weft/check/host_types as host_types
+use compiler/pipeline.{pipeline_check_with_loader, pipeline_check_source_with_diagnostics_standalone}
+use compiler/weft/load.{NativeRuntimeWithRcCensus, check_weft_program_with_loader, check_weft_native_program_with_loader, check_weft_native_program_with_support_and_loader}
+use compiler/weft/grammar.{WeftParser}
+use compiler/diagnostic/observe.{observe_errors}
+
+use compiler/source/owners as source_owners
+use compiler/source/input.{SourceRequest, SourceLoaded}
+use compiler/source/loading.{source_loader}
+use compiler/weft/check/table.{ttable_new}
 use runtime/alloc.{alloc_words}
 use runtime/memory.{mem_store64_at}
 use runtime/string.{runtime_str_from_bytes_copy}
 use stdlib/diagnostic.{*}
-use stdlib/grammar.{Grammar, ParseResult, Parsed, Checked, CheckRejected, CheckResult}
+use stdlib/grammar.{Grammar, CheckedGrammar, ParseResult, Parsed, Checked, CheckRejected, CheckResult}
 use stdlib/list.{List, Nil}
 use stdlib/option.{Option}
 use stdlib/source.{Source}
@@ -19,7 +23,7 @@ use stdlib/state.{State}
 
 effect ObserveLoad { fn request(path: str) -> nil }
 
-type CheckEntry { Semantic, Native, NativeCensus }
+type CheckEntry { Semantic, Native, NativeCensus, Extension }
 
 type LoadNotice { Silent, Report(DiagnosticSeverity), LegacyError, LegacyWarning, LegacyNote }
 
@@ -56,6 +60,7 @@ fn observe_source_notice_at(text: str, entry: CheckEntry, notice: LoadNotice, su
             Semantic -> check_weft_program_with_loader(syntax, loader)
             Native -> check_weft_native_program_with_loader(syntax, loader)
             NativeCensus -> check_weft_native_program_with_support_and_loader(syntax, NativeRuntimeWithRcCensus, loader)
+            Extension -> pipeline_check_with_loader(syntax, ExtendCheckedProgram, loader)
           }
         }
         _ -> CheckRejected<TypedModule>()
@@ -93,6 +98,68 @@ fn accepted(result: CheckResult<TypedModule>) -> bool {
   match result { Checked(_) -> true, CheckRejected -> false }
 }
 
+fn observe_checked_grammar(text: str, purpose: WeftCheckPurpose) -> (CheckResult<TypedModule>, i64) {
+  let source = Source { text: text, identity: DiagnosticSourceNamed("checked-grammar.weft") }
+  let table = ttable_new()
+  handle observe_errors(() => match WeftParser { table: table }.parse(source.all()) {
+    Parsed(parsed) -> {
+      let owners = source_owners.with_text(source_owners.new(), source.text)
+      let syntax = AstModule(parsed.declarations.functions, __str_ptr(source.text), table, owners)
+      host_types.run(table, __str_ptr(source.text), () => WeftChecker(purpose).check(syntax))
+    }
+    _ -> CheckRejected<TypedModule>()
+  }) {
+    Diagnose.report(diagnostic) -> resume(0)
+    Diagnose.error(message, position) -> resume(0)
+    Diagnose.warn(message, position) -> resume(0)
+    Diagnose.note(message, position) -> resume(0)
+  }
+}
+
+test "all Weft checking interpretations accept valid declarations through CheckedGrammar" {
+  for purpose in [CheckProgram, CheckDeclarations, ExtendCheckedProgram] {
+    for text in ["", "fn answer() -> i64 { 42 }", "fn main() -> i64 { 42 }"] {
+      let (result, errors) = observe_checked_grammar(text, purpose)
+      Test.assert_true(accepted(result))
+      Test.assert_eq(errors, 0)
+    }
+  }
+}
+
+test "all Weft checking interpretations reject invalid declaration bodies" {
+  for purpose in [CheckProgram, CheckDeclarations, ExtendCheckedProgram] {
+    for text in ["fn main() -> i64 { missing() }", "fn answer() -> i64 { \"wrong\" }"] {
+      let (result, errors) = observe_checked_grammar(text, purpose)
+      Test.assert_false(accepted(result))
+      Test.assert_gt(errors, 0)
+    }
+  }
+}
+
+test "only declaration checking leaves root entrypoint effects open" {
+  let text = "effect Ask { fn answer() -> i64 } fn main() -[Ask]> i64 { Ask.answer() }"
+  for purpose in [CheckProgram, CheckDeclarations, ExtendCheckedProgram] {
+    let (result, errors) = observe_checked_grammar(text, purpose)
+    match purpose {
+      CheckDeclarations -> { Test.assert_true(accepted(result)); Test.assert_eq(errors, 0) }
+      _ -> { Test.assert_false(accepted(result)); Test.assert_gt(errors, 0) }
+    }
+  }
+}
+
+test "source checking never publishes recovered syntax as a checked program" {
+  for text in ["fn broken( -> i64 { 0 } fn main() -> i64 { 42 }", "fn main() -> i64 { 0x }", "use module_fixtures/absent_checked_grammar_support fn main() -> i64 { 42 }"] {
+    let (result, errors) = handle observe_errors(() => pipeline_check_source_with_diagnostics_standalone(__str_ptr(text), __str_len(text))) {
+      Diagnose.report(diagnostic) -> resume(0)
+      Diagnose.error(message, position) -> resume(0)
+      Diagnose.warn(message, position) -> resume(0)
+      Diagnose.note(message, position) -> resume(0)
+    }
+    Test.assert_false(accepted(result))
+    Test.assert_gt(errors, 0)
+  }
+}
+
 fn same_severity(actual: DiagnosticSeverity, expected: DiagnosticSeverity) -> bool {
   match (actual, expected) {
     (DiagnosticSeverityError, DiagnosticSeverityError) -> true
@@ -114,7 +181,7 @@ fn notice_preserved(diagnostic: Diagnostic, notice: LoadNotice) -> bool {
 }
 
 test "Weft checking rejects support acquisition errors even for a valid program" {
-  for entry in [Semantic, Native, NativeCensus] {
+  for entry in [Semantic, Native, NativeCensus, Extension] {
     for notice in [Report(DiagnosticSeverityError), LegacyError] {
       let (result, observed) = observe_source("fn main() -> i64 { 42 }", entry, notice, "")
       Test.assert_false(accepted(result))
@@ -126,7 +193,7 @@ test "Weft checking rejects support acquisition errors even for a valid program"
 }
 
 test "Weft checking preserves warning and note diagnostics without rejecting" {
-  for entry in [Semantic, Native, NativeCensus] {
+  for entry in [Semantic, Native, NativeCensus, Extension] {
     for notice in [Report(DiagnosticSeverityWarning), Report(DiagnosticSeverityNote), LegacyWarning, LegacyNote] {
       let (result, observed) = observe_source("fn main() -> i64 { 42 }", entry, notice, "")
       Test.assert_true(accepted(result))
@@ -138,7 +205,7 @@ test "Weft checking preserves warning and note diagnostics without rejecting" {
 }
 
 test "Weft checking rejects malformed support before exposing a typed program" {
-  for entry in [Semantic, Native, NativeCensus] {
+  for entry in [Semantic, Native, NativeCensus, Extension] {
     for support in ["}", "0x"] {
       let (result, observed) = observe_source("fn main() -> i64 { 42 }", entry, Silent, support)
       Test.assert_false(accepted(result))
@@ -159,7 +226,7 @@ test "Weft checking retains support acquisition authority and native binding ord
 }
 
 test "Weft checked results reject semantic errors after successful support loading" {
-  for entry in [Semantic, Native, NativeCensus] {
+  for entry in [Semantic, Native, NativeCensus, Extension] {
     for text in ["fn main() -> i64 { missing }", "fn main() -> i64 { \"wrong\" }"] {
       let (result, observed) = observe_source(text, entry, Silent, "")
       Test.assert_false(accepted(result))
@@ -218,6 +285,7 @@ fn check_with_bool_loader(entry: CheckEntry) -> (CheckResult<TypedModule>, bool)
           Semantic -> check_weft_program_with_loader(syntax, loader)
           Native -> check_weft_native_program_with_loader(syntax, loader)
           NativeCensus -> check_weft_native_program_with_support_and_loader(syntax, NativeRuntimeWithRcCensus, loader)
+          Extension -> pipeline_check_with_loader(syntax, ExtendCheckedProgram, loader)
         }
       }
       _ -> CheckRejected<TypedModule>()
@@ -232,7 +300,7 @@ fn check_with_bool_loader(entry: CheckEntry) -> (CheckResult<TypedModule>, bool)
 }
 
 test "grammar support observation does not intercept a loader's boolean state" {
-  for entry in [Semantic, Native, NativeCensus] {
+  for entry in [Semantic, Native, NativeCensus, Extension] {
     let (result, requested) = check_with_bool_loader(entry)
     Test.assert_true(accepted(result))
     Test.assert_true(requested)

@@ -1,39 +1,41 @@
-use compiler/grammar_host.{parse_registered_source_with_loader, parse_source_loader_for_table, parse_source_loader_with_owners, parse_use_file, parse_use_file_with_loader, parse_bind_implicit_prelude_with_loader}
-use compiler/source_input.{source_from_bytes}
-use compiler/source_loading.{SourceLoader, LoadedModuleSyntax, source_loader_owners}
-use compiler/source_owners as source_owners
-use compiler/source_owners.{SourceOwners}
-use compiler/reclamation.{reclamation_facts}
+use compiler/weft/imports.{parse_registered_source_with_loader, parse_source_loader_for_table, parse_source_loader_with_owners, parse_use_file, parse_use_file_with_loader, parse_bind_implicit_prelude_with_loader}
+use compiler/source/input.{source_from_bytes}
+use compiler/weft/products.{AstModule, TypedModule}
+use compiler/weft/check as weft_check
+use compiler/weft/check.{WeftCheckPurpose, CheckProgram, WeftCheckReport}
+use compiler/diagnostic/observe.{observe_errors}
+use compiler/source/loading.{SourceLoader, LoadedModuleSyntax, source_loader_owners}
+use compiler/source/owners as source_owners
+use compiler/source/owners.{SourceOwners}
+use compiler/weft/facts/reclamation.{reclamation_facts}
 -- compiler/pipeline.weft -- Compiler pass boundaries
-use compiler/typeck.{*}
-use compiler/codegen.{*}
-use compiler/effect_ref.{*}
-use compiler/encode.{*}
-use compiler/elf_link.{*}
-use compiler/ir.{*}
-use compiler/cfg.{IrCfgCycles, ir_cfg_cycles, ir_cfg_compact_blocks}
-use compiler/grammar_source.{WeftParser}
-use stdlib/grammar.{Grammar, Parsed, Recovered, Rejected}
+use compiler/weft/check/body.{*}
+use compiler/backend/aarch64/codegen.{*}
+use compiler/weft/facts/effect_ref.{*}
+use compiler/backend/aarch64/encode.{*}
+use compiler/backend/elf_link.{*}
+use compiler/ir/data.{*}
+use compiler/ir/cfg.{IrCfgCycles, ir_cfg_cycles, ir_cfg_compact_blocks}
+use compiler/weft/grammar.{WeftParser}
+use stdlib/grammar.{Grammar, Parsed, Recovered, Rejected, CheckResult, Checked, CheckRejected}
 use stdlib/source.{Source}
-use compiler/handler_flow.{*}
-use compiler/lib.{*}
-use compiler/layout_query.{*}
-use compiler/runtime_abi.{runtime_abi_entries}
-use compiler/linear_flow.{*}
+use compiler/weft/facts/handler_flow.{*}
+use compiler/storage.{*}
+use compiler/weft/facts/layout.{*}
+use compiler/backend/runtime_abi.{runtime_abi_entries}
+use compiler/weft/facts/linear_flow.{*}
 use compiler/macho.{*}
-use compiler/module.{*}
-use compiler/module_diagnostics.{module_diagnose_scope_issues}
-use compiler/native_link.{*}
-use compiler/native_target.{*}
+use compiler/project/module.{*}
+use compiler/backend/link.{*}
+use compiler/backend/target.{*}
 use compiler/object.{*}
-use compiler/package.{*}
-use compiler/package_exports.{package_export_audit_loaded}
-use compiler/parse.{*}
+use compiler/package/manifest.{*}
+use compiler/weft/parse.{*}
 use runtime/sha256.{sha256}
-use compiler/binary_format.{*}
-use compiler/diagnose.{*}
-use compiler/type_registry.{*}
-use compiler/types.{*}
+use compiler/backend/format.{*}
+use compiler/diagnostic/render.{*}
+use compiler/weft/check/table.{*}
+use compiler/types/algebra.{*}
 use runtime/alloc.{*}
 use runtime/buffer.{*}
 use runtime/effects.{*}
@@ -60,18 +62,8 @@ use stdlib/vector/handles.{Vector}
 -- toward Ast -> TypedAst -> IrModule -> BinaryObject.
 -- Managed-source producers carry backing storage through every pass result.
 -- Native input adapters retain source bytes before assigning registry identity.
-pub(package) type AstModule {
-  AstModule(i64, i64, i64, SourceOwners)
-}
-
 pub(package) type PipelineParseResult {
   PipelineParseResult(AstModule, i64)
-}
-
-pub(package) type PipelineCheckReport { errors: i64, owners: SourceOwners }
-
-pub(package) type TypedModule {
-  TypedModule(i64, i64, i64, SourceOwners)
 }
 
 pub(package) type AstMigrationMetrics {
@@ -794,57 +786,6 @@ pub(package) type PipelineCgExprCtx {
   PipelineCgExprCtx(i64, i64, i64, i64, i64)
 }
 
--- Loader-aware pipelines bind every source before entering this shared core.
--- Keeping that boundary explicit prevents a failed observed prelude load from
--- silently retrying through the default filesystem path during checking.
-pub(package) type PipelineCheckPurpose { CheckProgram, CheckDeclarations }
-
-pub(package) fn pipeline_check_loaded(fns: i64, src: i64, tt: i64) -[Diagnose]> i64 {
-  pipeline_check_loaded_for(fns, src, tt, CheckProgram)
-}
-
-pub(package) fn pipeline_check_loaded_declarations(fns: i64, src: i64, tt: i64) -[Diagnose]> i64 {
-  pipeline_check_loaded_for(fns, src, tt, CheckDeclarations)
-}
-
-pub(package) fn pipeline_check_loaded_for(fns: i64, src: i64, tt: i64, purpose: PipelineCheckPurpose) -[Diagnose]> i64 {
-  let entry_source = ttable_program_entry_source_or(tt, src)
-  match purpose { CheckProgram -> prepare_root_entrypoint_effects(fns, entry_source), CheckDeclarations -> nil }
-  -- Module-owned scope facts are audited once before checker consumers run:
-  -- unused bad selections, illegal widening, and collisions are errors in
-  -- the import graph itself rather than only when a spelling is referenced.
-  module_scope_build_all(tt)
-  let module_scope_errors = module_diagnose_scope_issues(tt)
-  let package_export_errors = package_export_audit_loaded(tt)
-  let trait_identity_errors = typeck_resolve_qualified_impl_traits(tt)
-  let representation_errors = typeck_prepare_impl_target_representations(tt)
-  let ct = build_ctable(tt, src)
-  ttable_set_ct(tt, ct)
-  let errors = module_scope_errors + package_export_errors + trait_identity_errors + representation_errors + handle check_user_fns(fns, src, tt) {
-    Conformance.conforms(ty, trh) -> resume(ctable_conforms_type_atom(ct, ty, trh))
-  }
-  if errors != 0 { errors }
-  else { match purpose {
-    CheckProgram -> check_root_entrypoint_effects(fns, entry_source, tt)
-    CheckDeclarations -> 0
-  } }
-}
-
-pub(package) fn pipeline_check_loaded_extending_checked(fns: i64, src: i64, tt: i64) -[Diagnose]> i64 {
-  let entry_source = ttable_program_entry_source_or(tt, src)
-  prepare_root_entrypoint_effects(fns, entry_source)
-  module_scope_build_all(tt)
-  let module_scope_errors = module_diagnose_scope_issues(tt)
-  let package_export_errors = package_export_audit_loaded(tt)
-  let trait_identity_errors = typeck_resolve_qualified_impl_traits(tt)
-  let representation_errors = typeck_prepare_impl_target_representations(tt)
-  let ct = build_ctable(tt, src)
-  ttable_set_ct(tt, ct)
-  let errors = module_scope_errors + package_export_errors + trait_identity_errors + representation_errors + handle check_user_fns_extending_checked(fns, src, tt) {
-    Conformance.conforms(ty, trh) -> resume(ctable_conforms_type_atom(ct, ty, trh))
-  }
-  if errors != 0 { errors } else { check_root_entrypoint_effects(fns, entry_source, tt) }
-}
 
 -- Render a diagnostic whose span may point into any loaded source buffer.
 -- Absolute spans resolve through the ttable source registry (file path +
@@ -949,86 +890,50 @@ pub(package) fn pipeline_parse(source: Source, tt: i64) -[SourceAcquire]> Loaded
   }
 }
 
-pub(package) fn pipeline_check(fns: i64, src: i64, tt: i64) -[Diagnose, SourceAcquire]> PipelineCheckReport {
-  let loader = parse_source_loader_for_table(tt)
-  let errors = pipeline_check_with_loader(fns, src, tt, loader)
-  PipelineCheckReport { errors: errors, owners: source_loader_owners(loader) }
-}
-
-pub(package) fn pipeline_check_with_loader<E>(fns: i64, src: i64, tt: i64, loader: SourceLoader<E>) -[Diagnose, E]> i64 {
-  -- Language surface first, compiler-owned lowering support second. This is
-  -- separate from parse-only tooling and lets runtime selection observe any
-  -- implementation needs introduced by the real prelude module graph.
-  parse_bind_implicit_prelude_with_loader<E>(fns, src, tt, loader)
-  pipeline_bind_runtime_preludes_inner_with_loader<E>(fns, src, tt, loader)
-  pipeline_check_loaded(fns, src, tt)
-}
-
-pub(package) fn pipeline_check_extending_checked(fns: i64, src: i64, tt: i64) -[Diagnose, SourceAcquire]> PipelineCheckReport {
-  let loader = parse_source_loader_for_table(tt)
-  let errors = pipeline_check_extending_checked_with_loader(fns, src, tt, loader)
-  PipelineCheckReport { errors: errors, owners: source_loader_owners(loader) }
-}
-
-pub(package) fn pipeline_check_extending_checked_with_loader<E>(fns: i64, src: i64, tt: i64, loader: SourceLoader<E>) -[Diagnose, E]> i64 {
-  -- The checked base already owns typed bodies and a resolved signature
-  -- catalog. A root can still demand additional implicit/runtime modules, so
-  -- bind those first; every newly appended pair is then checked exactly once.
-  parse_bind_implicit_prelude_with_loader<E>(fns, src, tt, loader)
-  pipeline_bind_runtime_preludes_inner_with_loader<E>(fns, src, tt, loader)
-  pipeline_check_loaded_extending_checked(fns, src, tt)
-}
-
-pub(package) fn pipeline_parse_module(source: Source, tt: i64) -[SourceAcquire]> AstModule {
-  match pipeline_parse_with_error_count(source, tt) {
-    PipelineParseResult(ast, errors) -> ast
-  }
-}
-
-pub(package) fn pipeline_check_fns_with_diagnostics(fns: i64, src: i64, tt: i64) -[Diagnose, SourceAcquire]> TypedModule {
-  pipeline_check_fns_with_source_owners(fns, src, tt, source_owners.new())
-}
-
-pub(package) fn pipeline_check_fns_with_source_owners(fns: i64, src: i64, tt: i64, owners: SourceOwners) -[Diagnose, SourceAcquire]> TypedModule {
-  let loader = parse_source_loader_with_owners(tt, owners)
-  pipeline_check_with_loader(fns, src, tt, loader)
-  TypedModule(fns, src, tt, source_loader_owners(loader))
-}
-
-pub(package) fn pipeline_check_fns(fns: i64, src: i64, tt: i64) -[SourceAcquire]> TypedModule {
-  handle pipeline_check_fns_with_diagnostics(fns, src, tt) {
-    Diagnose.report(diagnostic) -> { pipeline_diagnose_render_report(tt, diagnostic) resume(0) }
-    Diagnose.error(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
-    Diagnose.warn(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
-    Diagnose.note(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
-  }
-}
-
-pub(package) fn pipeline_check_fns_report(fns: i64, src: i64, tt: i64) -[SourceAcquire]> PipelineCheckReport {
-  handle pipeline_check(fns, src, tt) {
-    Diagnose.report(diagnostic) -> { pipeline_diagnose_render_report(tt, diagnostic) resume(0) }
-    Diagnose.error(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
-    Diagnose.warn(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
-    Diagnose.note(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span) resume(0) }
-  }
-}
-
-pub(package) fn pipeline_check_module(ast: AstModule) -[SourceAcquire]> TypedModule {
-  match ast {
-    AstModule(fns, src, tt, owners) -> {
-      let loader = parse_source_loader_with_owners(tt, owners)
-      handle pipeline_check_with_loader(fns, src, tt, loader) {
-        Diagnose.report(diagnostic) -> { pipeline_diagnose_render_report(tt, diagnostic); resume(0) }
-        Diagnose.error(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span); resume(0) }
-        Diagnose.warn(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span); resume(0) }
-        Diagnose.note(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span); resume(0) }
+pub(package) fn pipeline_check_with_loader<E>(syntax: AstModule, purpose: WeftCheckPurpose, loader: SourceLoader<E>) -[Diagnose, E]> CheckResult<TypedModule> {
+  match syntax {
+    AstModule(fns, src, tt, _) -> {
+      let load: () -[Diagnose, E]> i64 = () => {
+        parse_bind_implicit_prelude_with_loader<E>(fns, src, tt, loader)
+        pipeline_bind_runtime_preludes_inner_with_loader<E>(fns, src, tt, loader)
       }
-      TypedModule(fns, src, tt, source_loader_owners(loader))
+      weft_check.after_loading(purpose, syntax, loader, load)
     }
   }
 }
 
-pub(package) fn pipeline_check_module_standalone(ast: AstModule) -> TypedModule {
+pub(package) fn pipeline_check_report(syntax: AstModule, purpose: WeftCheckPurpose) -[Diagnose, SourceAcquire]> WeftCheckReport {
+  match syntax {
+    AstModule(_, _, tt, owners) -> {
+      let loader = parse_source_loader_with_owners(tt, owners)
+      let (result, errors) = observe_errors(() => pipeline_check_with_loader(syntax, purpose, loader))
+      weft_check.report_value(result, errors, source_loader_owners(loader))
+    }
+  }
+}
+
+pub(package) fn pipeline_report_check(syntax: AstModule, purpose: WeftCheckPurpose) -[SourceAcquire]> WeftCheckReport {
+  match syntax {
+    AstModule(_, src, tt, _) -> handle pipeline_check_report(syntax, purpose) {
+      Diagnose.report(diagnostic) -> { pipeline_diagnose_render_report(tt, diagnostic); resume(0) }
+      Diagnose.error(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span); resume(0) }
+      Diagnose.warn(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span); resume(0) }
+      Diagnose.note(msg, span) -> { pipeline_diagnose_render(tt, src, msg, span); resume(0) }
+    }
+  }
+}
+
+pub(package) fn pipeline_parse_module(source: Source, tt: i64) -[SourceAcquire]> AstModule {
+  match pipeline_parse_with_error_count(source, tt) {
+    PipelineParseResult(ast, _) -> ast
+  }
+}
+
+pub(package) fn pipeline_check_module(ast: AstModule) -[SourceAcquire]> CheckResult<TypedModule> {
+  pipeline_report_check(ast, CheckProgram).result
+}
+
+pub(package) fn pipeline_check_module_standalone(ast: AstModule) -> CheckResult<TypedModule> {
   source_acquire_with_standalone(() => pipeline_check_module(ast))
 }
 
@@ -21678,50 +21583,70 @@ pub(package) fn pipeline_parse_source_with_diagnostics_and_origin(bytes: i64, n:
   AstModule(parsed.functions, src, tt, source_owners.combined(parsed.owners, acquired))
 }
 
-pub(package) fn pipeline_check_source(src: i64, n: i64) -[SourceAcquire]> TypedModule {
+pub(package) fn pipeline_check_source(src: i64, n: i64) -[SourceAcquire]> CheckResult<TypedModule> {
   pipeline_check_source_with_origin(src, n, 0, 1)
 }
 
-pub(package) fn pipeline_check_source_standalone(src: i64, n: i64) -> TypedModule {
+pub(package) fn pipeline_check_source_standalone(src: i64, n: i64) -> CheckResult<TypedModule> {
   source_acquire_with_standalone(() => pipeline_check_source(src, n))
 }
 
-pub(package) fn pipeline_check_source_with_trust(src: i64, n: i64, trusted: i64) -[SourceAcquire]> TypedModule {
+pub(package) fn pipeline_check_source_with_trust(src: i64, n: i64, trusted: i64) -[SourceAcquire]> CheckResult<TypedModule> {
   pipeline_check_source_with_origin(src, n, trusted, pipeline_strict_for_trust(trusted))
 }
 
-pub(package) fn pipeline_check_source_with_trust_standalone(src: i64, n: i64, trusted: i64) -> TypedModule {
+pub(package) fn pipeline_check_source_with_trust_standalone(src: i64, n: i64, trusted: i64) -> CheckResult<TypedModule> {
   source_acquire_with_standalone(() => pipeline_check_source_with_trust(src, n, trusted))
 }
 
-pub(package) fn pipeline_check_source_with_origin(src: i64, n: i64, trusted: i64, strict: i64) -[SourceAcquire]> TypedModule {
-  let ast = pipeline_parse_source_with_origin(src, n, trusted, strict)
-  pipeline_check_module(ast)
+pub(package) fn pipeline_check_source_with_origin(src: i64, n: i64, trusted: i64, strict: i64) -[SourceAcquire]> CheckResult<TypedModule> {
+  let source = source_from_bytes(src, n)
+  let retained = __str_ptr(source.text)
+  let table = ttable_new()
+  pipeline_mark_root_origin(table, retained, trusted, strict)
+  handle pipeline_check_registered_source(source, table) {
+    Diagnose.report(diagnostic) -> { pipeline_diagnose_render_report(table, diagnostic); resume(0) }
+    Diagnose.error(message, span) -> { pipeline_diagnose_render(table, retained, message, span); resume(0) }
+    Diagnose.warn(message, span) -> { pipeline_diagnose_render(table, retained, message, span); resume(0) }
+    Diagnose.note(message, span) -> { pipeline_diagnose_render(table, retained, message, span); resume(0) }
+  }
 }
 
-pub(package) fn pipeline_check_source_with_origin_standalone(src: i64, n: i64, trusted: i64, strict: i64) -> TypedModule {
+pub(package) fn pipeline_check_source_with_origin_standalone(src: i64, n: i64, trusted: i64, strict: i64) -> CheckResult<TypedModule> {
   source_acquire_with_standalone(() => pipeline_check_source_with_origin(src, n, trusted, strict))
 }
 
-pub(package) fn pipeline_check_source_with_diagnostics(src: i64, n: i64) -[Diagnose, SourceAcquire]> TypedModule {
+pub(package) fn pipeline_check_source_with_diagnostics(src: i64, n: i64) -[Diagnose, SourceAcquire]> CheckResult<TypedModule> {
   pipeline_check_source_with_diagnostics_and_origin(src, n, 0, 1)
 }
 
-pub(package) fn pipeline_check_source_with_diagnostics_standalone(src: i64, n: i64) -[Diagnose]> TypedModule {
+pub(package) fn pipeline_check_source_with_diagnostics_standalone(src: i64, n: i64) -[Diagnose]> CheckResult<TypedModule> {
   source_acquire_with_standalone(() => pipeline_check_source_with_diagnostics(src, n))
 }
 
-pub(package) fn pipeline_check_source_with_diagnostics_and_trust(src: i64, n: i64, trusted: i64) -[Diagnose, SourceAcquire]> TypedModule {
+pub(package) fn pipeline_check_source_with_diagnostics_and_trust(src: i64, n: i64, trusted: i64) -[Diagnose, SourceAcquire]> CheckResult<TypedModule> {
   pipeline_check_source_with_diagnostics_and_origin(src, n, trusted, pipeline_strict_for_trust(trusted))
 }
 
-pub(package) fn pipeline_check_source_with_diagnostics_and_origin(src: i64, n: i64, trusted: i64, strict: i64) -[Diagnose, SourceAcquire]> TypedModule {
-  match pipeline_parse_source_with_diagnostics_and_origin(src, n, trusted, strict) {
-    AstModule(fns, ast_src, tt, owners) -> {
-      let loader = parse_source_loader_with_owners(tt, owners)
-      pipeline_check_with_loader(fns, ast_src, tt, loader)
-      TypedModule(fns, ast_src, tt, source_loader_owners(loader))
-    }
+pub(package) fn pipeline_check_source_with_diagnostics_and_origin(src: i64, n: i64, trusted: i64, strict: i64) -[Diagnose, SourceAcquire]> CheckResult<TypedModule> {
+  let source = source_from_bytes(src, n)
+  let table = ttable_new()
+  pipeline_mark_root_origin(table, __str_ptr(source.text), trusted, strict)
+  pipeline_check_registered_source(source, table)
+}
+
+fn pipeline_check_registered_source(source: Source, table: i64) -[Diagnose, SourceAcquire]> CheckResult<TypedModule> {
+  let loader = parse_source_loader_for_table(table)
+  pkg_install_sdk_for_table(table, SourceAcquire.sdk_origin())
+  let (parsed, parse_errors) = observe_errors(() => {
+    let parsed = parse_registered_source_with_loader(source, table, loader)
+    pipeline_bind_runtime_preludes_inner_with_loader(parsed.functions, __str_ptr(source.text), table, loader)
+    parsed
+  })
+  if parse_errors != 0 { CheckRejected<TypedModule>() }
+  else {
+    let ast = AstModule(parsed.functions, __str_ptr(source.text), table, source_loader_owners(loader))
+    pipeline_check_with_loader(ast, CheckProgram, loader)
   }
 }
 
