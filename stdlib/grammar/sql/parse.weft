@@ -1,0 +1,600 @@
+-- SQL parsing over retained source. No compiler storage or host type table.
+
+use stdlib/diagnostic as diagnostic
+use stdlib/diagnostic/schema.{Diagnose, DiagnosticClassGrammar, DiagnosticSeverityError}
+use stdlib/grammar.{ParseResult, Parsed, Recovered}
+use stdlib/grammar/sql/syntax.{*}
+use stdlib/list.{List, Nil}
+use stdlib/num as num
+use stdlib/option.{Option, Some, None}
+use stdlib/result.{Ok, Err}
+use stdlib/source.{Span}
+use stdlib/state as state
+use stdlib/state.{State}
+
+type Step<T> { value: T, next: usize }
+
+fn step<T>(value: T, next: usize) -> Step<T> {
+  Step { value: value, next: next }
+}
+
+type Operator {
+  Scalar(SqlScalarOperator),
+  Comparison(SqlComparisonOperator),
+  Logical(SqlLogicalOperator)
+}
+
+type OperatorStep { value: Operator, precedence: usize, next: usize }
+
+fn whitespace(byte: u8) -> bool { byte == 32 or byte == 9 or byte == 10 or byte == 13 }
+
+fn digit(byte: u8) -> bool { byte >= 48 and byte <= 57 }
+
+fn letter(byte: u8) -> bool {
+  (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 95
+}
+
+fn identifier_byte(byte: u8) -> bool { letter(byte) or digit(byte) }
+
+fn lower(byte: u8) -> u8 { if byte >= 65 and byte <= 90 { byte + 32 } else { byte } }
+
+fn at(source: Span, position: usize, byte: u8) -> bool {
+  match source.byte_at(position) { Some(actual) -> actual == byte, None -> false }
+}
+
+fn skip(source: Span, initial: usize) -> usize {
+  let mut position = initial
+  while position < source.len() {
+    match source.byte_at(position) {
+      Some(byte) if whitespace(byte) -> { position = position + 1 }
+      _ -> return position
+    }
+  }
+  position
+}
+
+fn word(source: Span, position: usize, expected: str) -> bool {
+  if position > source.len() or expected.len() > source.len() - position { return false }
+  let mut offset: usize = 0
+  while offset < expected.len() {
+    if lower(source.byte_at(position + offset).unwrap()) != expected.byte_at(offset).unwrap() {
+      return false
+    }
+    offset = offset + 1
+  }
+  match source.byte_at(position + offset) {
+    Some(byte) -> not identifier_byte(byte)
+    None -> true
+  }
+}
+
+fn reserved(source: Span, position: usize) -> bool {
+  let keywords = [
+    "select",
+    "from",
+    "where",
+    "as",
+    "and",
+    "or",
+    "true",
+    "false",
+    "order",
+    "by",
+    "asc",
+    "desc",
+    "limit",
+    "offset",
+    "group",
+    "having",
+    "join",
+    "on",
+    "distinct"
+  ]
+  for keyword in keywords { if word(source, position, keyword) { return true } }
+  false
+}
+
+fn point(source: Span, position: usize) -> Span {
+  source.subspan(position, if position < source.len() { position + 1 } else { position }).unwrap()
+}
+
+fn error(source: Span, position: usize, message: str) -[Diagnose]> nil {
+  Diagnose.report(
+    diagnostic.uncoded(
+      DiagnosticSeverityError,
+      DiagnosticClassGrammar,
+      message,
+      point(source, position).location()
+    )
+  )
+  nil
+}
+
+fn identifier(source: Span, initial: usize) -> Step<Option<SqlIdentifier>> {
+  let position = skip(source, initial)
+  match source.byte_at(position) {
+    Some(byte) if letter(byte) and not reserved(source, position) -> {
+      let mut end = position + 1
+      let mut scanning = true
+      while end < source.len() and scanning {
+        match source.byte_at(end) {
+          Some(next) if identifier_byte(next) -> { end = end + 1 }
+          _ -> { scanning = false }
+        }
+      }
+      let span = source.subspan(position, end).unwrap()
+      step(Some(SqlIdentifier { text: span.text().unwrap(), span: span }), end)
+    }
+    _ -> step(None<SqlIdentifier>(), position)
+  }
+}
+
+fn aggregate(source: Span, position: usize) -> Option<SqlAggregateKind> {
+  if word(source, position, "count") { Some(SqlCount) }
+  else if word(source, position, "sum") { Some(SqlSum) }
+  else if word(source, position, "min") { Some(SqlMin) }
+  else if word(source, position, "max") { Some(SqlMax) }
+  else { None<SqlAggregateKind>() }
+}
+
+fn atom(source: Span, initial: usize, depth: usize) -[Diagnose]> Step<Option<SqlExpression>> {
+  let position = skip(source, initial)
+  if depth >= 128 {
+    error(source, position, "SQL parse error: expression nesting exceeds 128 levels")
+    return step(Some(SqlInvalidExpression(point(source, position))), source.len())
+  }
+  if at(source, position, 40) {
+    let inner = expression(source, position + 1, 0, depth + 1)
+    let close = skip(source, inner.next)
+    if at(source, close, 41) { return step(inner.value, close + 1) }
+    error(source, close, "mini_sql parse error: expected ')' in expression")
+    return step(inner.value, close)
+  }
+  if at(source, position, 39) {
+    let mut end = position + 1
+    while end < source.len() and not at(source, end, 39) { end = end + 1 }
+    let span = source.subspan(position + 1, end).unwrap()
+    if end == source.len() {
+      error(source, position, "mini_sql parse error: unterminated string literal")
+      return step(Some(SqlStringLiteral(span.text().unwrap_or(""), span)), end)
+    }
+    return step(Some(SqlStringLiteral(span.text().unwrap_or(""), span)), end + 1)
+  }
+  if word(source, position, "true") {
+    return step(
+      Some(SqlBooleanLiteral(true, source.subspan(position, position + 4).unwrap())),
+      position + 4
+    )
+  }
+  if word(source, position, "false") {
+    return step(
+      Some(SqlBooleanLiteral(false, source.subspan(position, position + 5).unwrap())),
+      position + 5
+    )
+  }
+  match source.byte_at(position) {
+    Some(byte) if digit(byte) -> {
+      let mut end = position + 1
+      let mut scanning = true
+      while end < source.len() and scanning {
+        match source.byte_at(end) {
+          Some(next) if digit(next) -> { end = end + 1 }
+          _ -> { scanning = false }
+        }
+      }
+      let span = source.subspan(position, end).unwrap()
+      return match num.parse_i64(span.text().unwrap()) {
+        Ok(value) -> step(Some(SqlIntegerLiteral(value, span)), end)
+        Err(_) -> {
+          error(source, position, "SQL parse error: integer literal is outside i64")
+          step(Some(SqlInvalidExpression(span)), end)
+        }
+      }
+    }
+    _ -> nil
+  }
+  let parsed = identifier(source, position)
+  match parsed.value {
+    None -> step(None<SqlExpression>(), position)
+    Some(name) -> {
+      let next = skip(source, parsed.next)
+      if at(source, next, 46) {
+        let field = identifier(source, next + 1)
+        return match field.value {
+          Some(value) -> step(Some(SqlQualifiedColumn(name, value)), field.next)
+          None -> {
+            error(source, field.next, "mini_sql parse error: expected field after '.'")
+            step(Some(SqlInvalidExpression(point(source, field.next))), field.next)
+          }
+        }
+      }
+      if at(source, next, 40) {
+        let argument_start = skip(source, next + 1)
+        let argument = if at(source, argument_start, 42) {
+          step(None<SqlExpression>(), argument_start + 1)
+        } else {
+          let value = expression(source, argument_start, 0, depth + 1)
+          require_expression(source, value, "mini_sql parse error: expected aggregate expression")
+          step(
+            Some(value.value.unwrap_or(SqlInvalidExpression(point(source, value.next)))),
+            value.next
+          )
+        }
+        let close = skip(source, argument.next)
+        let end = if at(source, close, 41) { close + 1 } else {
+          error(source, close, "mini_sql parse error: expected ')' in aggregate")
+          close
+        }
+        return match aggregate(source, position) {
+          Some(kind) -> step(Some(SqlAggregateExpression(kind, argument.value, name.span)), end)
+          None -> {
+            error(source, position, "mini_sql parse error: unknown aggregate function")
+            step(Some(SqlInvalidExpression(name.span)), end)
+          }
+        }
+      }
+      step(Some(SqlColumn(name)), parsed.next)
+    }
+  }
+}
+
+fn operator(source: Span, initial: usize) -> Option<OperatorStep> {
+  let position = skip(source, initial)
+  let pair = source.subspan(
+    position,
+    if source.len() - position >= 2 { position + 2 } else { position }
+  ).unwrap().text().unwrap_or("")
+  if pair == "||" {
+    return Some(OperatorStep { value: Scalar(SqlConcat), precedence: 3, next: position + 2 })
+  }
+  if pair == "!=" or pair == "<>" {
+    return Some(
+      OperatorStep { value: Comparison(SqlNotEqual), precedence: 2, next: position + 2 }
+    )
+  }
+  if pair == "<=" {
+    return Some(
+      OperatorStep { value: Comparison(SqlLessEqual), precedence: 2, next: position + 2 }
+    )
+  }
+  if pair == ">=" {
+    return Some(
+      OperatorStep { value: Comparison(SqlGreaterEqual), precedence: 2, next: position + 2 }
+    )
+  }
+  let single = match source.byte_at(position) {
+    Some(42) -> Some(
+      OperatorStep { value: Scalar(SqlMultiply), precedence: 4, next: position + 1 }
+    )
+    Some(47) -> Some(OperatorStep { value: Scalar(SqlDivide), precedence: 4, next: position + 1 })
+    Some(43) -> Some(OperatorStep { value: Scalar(SqlAdd), precedence: 3, next: position + 1 })
+    Some(45) -> Some(
+      OperatorStep { value: Scalar(SqlSubtract), precedence: 3, next: position + 1 }
+    )
+    Some(61) -> Some(
+      OperatorStep { value: Comparison(SqlEqual), precedence: 2, next: position + 1 }
+    )
+    Some(60) -> Some(
+      OperatorStep { value: Comparison(SqlLess), precedence: 2, next: position + 1 }
+    )
+    Some(62) -> Some(
+      OperatorStep { value: Comparison(SqlGreater), precedence: 2, next: position + 1 }
+    )
+    _ -> None<OperatorStep>()
+  }
+  match single { Some(_) -> return single, None -> nil }
+  if word(source, position, "and") {
+    Some(OperatorStep { value: Logical(SqlAnd), precedence: 1, next: position + 3 })
+  } else if word(source, position, "or") {
+    Some(OperatorStep { value: Logical(SqlOr), precedence: 0, next: position + 2 })
+  } else { None<OperatorStep>() }
+}
+
+fn combine(operator: Operator, left: SqlExpression, right: SqlExpression) -> SqlExpression {
+  match operator {
+    Scalar(value) -> SqlScalarExpression(value, left, right)
+    Comparison(value) -> SqlComparisonExpression(value, left, right)
+    Logical(value) -> SqlLogicalExpression(value, left, right)
+  }
+}
+
+fn require_expression(
+  source: Span,
+  parsed: Step<Option<SqlExpression>>,
+  message: str
+) -[Diagnose]> nil {
+  match parsed.value {
+    None -> error(source, parsed.next, message)
+    _ -> nil
+  }
+}
+
+fn expression(
+  source: Span,
+  initial: usize,
+  minimum: usize,
+  depth: usize
+) -[Diagnose]> Step<Option<SqlExpression>> {
+  let first = atom(source, initial, depth)
+  match first.value { None -> return first, _ -> nil }
+  let mut value = first.value.unwrap()
+  let mut position = first.next
+  let mut terms: usize = 0
+  while true {
+    match operator(source, position) {
+      Some(op) if op.precedence >= minimum -> {
+        if terms >= 128 {
+          error(source, position, "SQL parse error: expression chain exceeds 128 operators")
+          return step(Some(SqlInvalidExpression(point(source, position))), source.len())
+        }
+        terms = terms + 1
+        let right = expression(source, op.next, op.precedence + 1, depth + 1)
+        require_expression(
+          source,
+          right,
+          "mini_sql parse error: expected expression after operator"
+        )
+        value = combine(
+          op.value,
+          value,
+          right.value.unwrap_or(SqlInvalidExpression(point(source, right.next)))
+        )
+        position = right.next
+      }
+      _ -> return step(Some(value), position)
+    }
+  }
+  step(Some(value), position)
+}
+
+fn alias(source: Span, initial: usize, message: str) -[Diagnose]> Step<Option<SqlIdentifier>> {
+  let position = skip(source, initial)
+  let explicit = word(source, position, "as")
+  let parsed = identifier(source, if explicit { position + 2 } else { position })
+  match parsed.value {
+    None -> if explicit { error(source, parsed.next, message) } else { nil }
+    _ -> nil
+  }
+  parsed
+}
+
+fn selection(source: Span, initial: usize) -[Diagnose]> Step<SqlSelection> {
+  let start = skip(source, initial)
+  if at(source, start, 42) { return step(SqlSelectAll, start + 1) }
+  let mut projections: SqlProjections = Nil
+  let mut position = start
+  while true {
+    let parsed = expression(source, position, 3, 0)
+    require_expression(source, parsed, "mini_sql parse error: expected selected expression")
+    let name = alias(source, parsed.next, "mini_sql parse error: expected alias after AS")
+    projections = projections.prepend(
+      SqlProjection {
+        expression: parsed.value.unwrap_or(SqlInvalidExpression(point(source, parsed.next))),
+        alias: name.value
+      }
+    )
+    position = skip(source, name.next)
+    if not at(source, position, 44) { return step(SqlSelect(projections.reverse()), position) }
+    position = skip(source, position + 1)
+  }
+  step(SqlSelect(projections.reverse()), position)
+}
+
+fn table(source: Span, initial: usize, message: str) -[Diagnose]> Step<SqlSource> {
+  let name = identifier(source, initial)
+  match name.value { None -> error(source, name.next, message), _ -> nil }
+  let qualifier = alias(source, name.next, "mini_sql parse error: expected table alias after AS")
+  step(SqlSource { table: name.value, alias: qualifier.value }, qualifier.next)
+}
+
+fn joins(source: Span, initial: usize) -[Diagnose]> Step<SqlJoins> {
+  let mut position = skip(source, initial)
+  let mut result: SqlJoins = Nil
+  while word(source, position, "join") {
+    let joined = table(source, position + 4, "mini_sql parse error: expected join table name")
+    position = skip(source, joined.next)
+    let predicate = if word(source, position, "on") {
+      let parsed = expression(source, position + 2, 0, 0)
+      require_expression(source, parsed, "mini_sql parse error: expected join predicate")
+      parsed
+    } else {
+      error(source, position, "mini_sql parse error: expected ON")
+      step(Some(SqlInvalidExpression(point(source, position))), position)
+    }
+    result = result.prepend(
+      SqlJoinClause {
+        source: joined.value,
+        predicate: predicate.value.unwrap_or(SqlInvalidExpression(point(source, predicate.next)))
+      }
+    )
+    position = skip(source, predicate.next)
+  }
+  step(result.reverse(), position)
+}
+
+fn optional_expression(
+  source: Span,
+  initial: usize,
+  keyword: str,
+  minimum: usize,
+  message: str
+) -[Diagnose]> Step<Option<SqlExpression>> {
+  let position = skip(source, initial)
+  if not word(source, position, keyword) { return step(None<SqlExpression>(), position) }
+  let parsed = expression(source, position + keyword.len(), minimum, 0)
+  require_expression(source, parsed, message)
+  step(
+    Some(parsed.value.unwrap_or(SqlInvalidExpression(point(source, parsed.next)))),
+    parsed.next
+  )
+}
+
+fn by(source: Span, initial: usize) -[Diagnose]> usize {
+  let position = skip(source, initial)
+  if word(source, position, "by") { position + 2 } else {
+    error(source, position, "mini_sql parse error: expected BY")
+    position
+  }
+}
+
+fn groups(source: Span, initial: usize) -[Diagnose]> Step<SqlExpressions> {
+  let start = skip(source, initial)
+  let mut result: SqlExpressions = Nil
+  if not word(source, start, "group") { return step(result, start) }
+  let mut position = by(source, start + 5)
+  while true {
+    let parsed = expression(source, position, 3, 0)
+    require_expression(source, parsed, "mini_sql parse error: expected group expression")
+    result = result.prepend(
+      parsed.value.unwrap_or(SqlInvalidExpression(point(source, parsed.next)))
+    )
+    position = skip(source, parsed.next)
+    if not at(source, position, 44) { return step(result.reverse(), position) }
+    position = position + 1
+  }
+  step(result.reverse(), position)
+}
+
+fn ordering(source: Span, initial: usize) -[Diagnose]> Step<SqlOrders> {
+  let start = skip(source, initial)
+  let mut result: SqlOrders = Nil
+  if not word(source, start, "order") { return step(result, start) }
+  let mut position = by(source, start + 5)
+  while true {
+    let parsed = expression(source, position, 3, 0)
+    require_expression(source, parsed, "mini_sql parse error: expected order expression")
+    position = skip(source, parsed.next)
+    let direction = if word(source, position, "desc") {
+      position = position + 4
+      SqlDescending
+    } else {
+      if word(source, position, "asc") { position = position + 3 }
+      SqlAscending
+    }
+    result = result.prepend(
+      SqlOrder {
+        expression: parsed.value.unwrap_or(SqlInvalidExpression(point(source, parsed.next))),
+        direction: direction
+      }
+    )
+    position = skip(source, position)
+    if not at(source, position, 44) { return step(result.reverse(), position) }
+    position = position + 1
+  }
+  step(result.reverse(), position)
+}
+
+fn query(source: Span) -[Diagnose]> SqlQuery {
+  let mut position = skip(source, 0)
+  if word(source, position, "select") { position = skip(source, position + 6) }
+  else {
+    error(source, position, "mini_sql parse error: expected SELECT")
+    return SqlQuery {
+      distinct: false,
+      selection: SqlSelect(Nil<SqlProjection>()),
+      source: SqlSource { table: None<SqlIdentifier>(), alias: None<SqlIdentifier>() },
+      joins: Nil<SqlJoinClause>(),
+      predicate: None<SqlExpression>(),
+      groups: Nil<SqlExpression>(),
+      having: None<SqlExpression>(),
+      order: Nil<SqlOrder>(),
+      limit: None<SqlExpression>(),
+      offset: None<SqlExpression>()
+    }
+  }
+  let distinct = word(source, position, "distinct")
+  if distinct { position = skip(source, position + 8) }
+  let selected = selection(source, position)
+  position = skip(source, selected.next)
+  if word(source, position, "from") { position = position + 4 }
+  else {
+    error(source, position, "mini_sql parse error: expected FROM")
+    -- Recovery never treats a substring or quoted payload as a clause boundary.
+    while position < source.len() and not word(source, position, "from") {
+      if at(source, position, 39) {
+        position = position + 1
+        while position < source.len() and not at(source, position, 39) { position = position + 1 }
+        if position < source.len() { position = position + 1 }
+      } else {
+        match source.byte_at(position) {
+          Some(byte) if identifier_byte(byte) -> {
+            position = position + 1
+            let mut scanning = true
+            while position < source.len() and scanning {
+              match source.byte_at(position) {
+                Some(next) if identifier_byte(next) -> { position = position + 1 }
+                _ -> { scanning = false }
+              }
+            }
+          }
+          _ -> { position = position + 1 }
+        }
+      }
+      position = skip(source, position)
+    }
+    if word(source, position, "from") { position = position + 4 }
+  }
+  let primary = table(source, position, "mini_sql parse error: expected table name")
+  let joined = joins(source, primary.next)
+  let predicate = optional_expression(
+    source,
+    joined.next,
+    "where",
+    0,
+    "mini_sql parse error: expected predicate expression"
+  )
+  let grouped = groups(source, predicate.next)
+  let having = optional_expression(
+    source,
+    grouped.next,
+    "having",
+    0,
+    "mini_sql parse error: expected predicate expression"
+  )
+  let ordered = ordering(source, having.next)
+  let limit = optional_expression(
+    source,
+    ordered.next,
+    "limit",
+    3,
+    "mini_sql parse error: expected limit expression"
+  )
+  let offset = optional_expression(
+    source,
+    limit.next,
+    "offset",
+    3,
+    "mini_sql parse error: expected offset expression"
+  )
+  position = skip(source, offset.next)
+  if position < source.len() {
+    error(source, position, "mini_sql parse error: unexpected trailing input")
+  }
+  SqlQuery {
+    distinct: distinct,
+    selection: selected.value,
+    source: primary.value,
+    joins: joined.value,
+    predicate: predicate.value,
+    groups: grouped.value,
+    having: having.value,
+    order: ordered.value,
+    limit: limit.value,
+    offset: offset.value
+  }
+}
+
+pub(package) fn parse(source: Span) -[Diagnose]> ParseResult<SqlSyntax> {
+  let (parsed, failed) = state.run(
+    false,
+    () => handle query(source) {
+      Diagnose.report(item) -> {
+        match item.severity() { DiagnosticSeverityError -> State.put(true), _ -> nil }
+        Diagnose.report(item)
+        resume(0)
+      }
+    }
+  )
+  let syntax = SqlSyntax { query: parsed, span: source }
+  if failed { Recovered(syntax) } else { Parsed(syntax) }
+}
