@@ -4342,6 +4342,14 @@ assert_contains "check_accepts_test_blocks" "$test_check_out" "0 errors"
 test_ast_out=$("$WEFT" ast < "$tmp_src" 2>&1)
 assert_contains "ast_accepts_test_blocks" "$test_ast_out" "test plain:"
 
+printf '%s\n' 'test "🧶 quote\" slash\\" { 42 }' 'fn helper() -> i64 { 7 }' > "$tmp_src"
+test_ast_out=$("$WEFT" ast "$tmp_src" 2>&1)
+assert_equals "ast_typed_test_names_and_authored_order" "$test_ast_out" $'--- AST: 2 functions ---\n\ntest 🧶 quote" slash\\:\n  IntLit(42)\n\nfn helper:\n  IntLit(7)'
+run_weft_compile_guarded "$WEFT" compile tools/ast.weft > "$tmp_bin" 2>"$tmp_err"
+chmod +x "$tmp_bin"
+test_ast_standalone=$(run_binary_guarded "$tmp_bin" < "$tmp_src" 2>&1)
+assert_equals "ast_standalone_uses_same_typed_inspection" "$test_ast_standalone" "$test_ast_out"
+
 write_large_padding "$tmp_src"
 printf 'fn main() -> i64 { 0 }\n' >> "$tmp_src"
 large_check_out=$("$WEFT" check < "$tmp_src" 2>&1)
@@ -6401,6 +6409,7 @@ assert_contains "test_named_failures_reports_last_actual" "$test_named_failures_
 assert_not_contains "test_named_failures_omits_passing_name" "$test_named_failures_err" "test failure: passing middle"
 
 assert_test_failure_contains "test_assertion_failure_reports_diagnostic" 'test "fail_eq_diag" { Test.assert_eq(1, 2) }' 1 "test assertion failed: assert_eq"
+assert_test_failure_contains "test_decoded_name_survives_wrapper_generation" 'test "🧶 quote\" slash\\" { Test.assert_true(false) }' 1 'test failure: 🧶 quote" slash\'
 assert_test_failure_contains "test_structured_report_preserves_unassigned" 'use stdlib/diagnostic/schema.{*} test "structured" { Test.report(Diagnostic(DiagnosticSeverityError, DiagnosticClassTest, DiagnosticCodeUnassigned, "structured failure", DiagnosticLocationNone, DiagnosticRelatedLocationNil, DiagnosticFieldNil)) }' 1 "test diagnostic: structured failure"
 assert_test_failure_contains "test_structured_report_preserves_empty_assigned" 'use stdlib/diagnostic/schema.{*} test "structured" { Test.report(Diagnostic(DiagnosticSeverityError, DiagnosticClassTest, DiagnosticCodeAssigned(""), "structured failure", DiagnosticLocationNone, DiagnosticRelatedLocationNil, DiagnosticFieldNil)) }' 1 "test diagnostic []: structured failure"
 assert_test_failure_contains "test_structured_report_preserves_code" 'use stdlib/diagnostic/schema.{*} test "structured" { Test.report(Diagnostic(DiagnosticSeverityError, DiagnosticClassTest, DiagnosticCodeAssigned("E9000"), "structured failure", DiagnosticLocationNone, DiagnosticRelatedLocationNil, DiagnosticFieldCons(DiagnosticFieldU64("seed", 18446744073709551615), DiagnosticFieldNil))) }' 1 "test diagnostic [E9000]: structured failure"

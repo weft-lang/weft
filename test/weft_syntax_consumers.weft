@@ -1,0 +1,276 @@
+use compiler/weft/grammar.{WeftParser, ParsedWeftSource}
+use compiler/weft/check/table.{ttable_new}
+use compiler/weft/syntax/declarations.{
+  SourceDeclaration,
+  FunctionDefinition,
+  InvalidDefinition,
+  RecoveredDeclaration
+}
+use compiler/weft/syntax/inspection as inspection
+use compiler/weft/test_prepare as preparation
+use compiler/ir/data.{
+  IntLit,
+  Ident,
+  TypeNameRange,
+  Expr,
+  Negate,
+  Apply,
+  ExprListCons,
+  ExprListNil,
+  Block,
+  If,
+  BoolLit,
+  UnknownExpr,
+  MissingTypeExpr
+}
+use compiler/storage.{nlist_len}
+use stdlib/grammar.{Grammar, ParseResult, Parsed, Recovered, Rejected}
+use stdlib/source.{Source, Span}
+use stdlib/diagnostic.{Diagnose, DiagnosticSourceNamed, DiagnosticSeverityError}
+use stdlib/state as state
+use stdlib/list.{List}
+use stdlib/num
+use stdlib/option.{Option}
+use stdlib/result.{Result}
+use stdlib/panic.{panic}
+use stdlib/list as list
+
+fn parse_span(span: Span) -> (ParseResult<ParsedWeftSource>, i64) {
+  state.run(
+    0,
+    () => handle WeftParser { table: ttable_new() }.parse(span) {
+      Diagnose.report(diagnostic) -> {
+        match diagnostic.severity() {
+          DiagnosticSeverityError -> { state.modify((count: i64) => count + 1); nil }
+          _ -> nil
+        }
+        resume(0)
+      }
+      Diagnose.error(message, location) -> { state.modify((count: i64) => count + 1); resume(0) }
+      Diagnose.warn(message, location) -> resume(0)
+      Diagnose.note(message, location) -> resume(0)
+    }
+  )
+}
+
+fn parse_text(text: str) -[Test]> ParsedWeftSource {
+  let source = Source { text: text, identity: DiagnosticSourceNamed("syntax.weft") }
+  let (result, errors) = parse_span(source.all())
+  Test.assert_eq(errors, 0)
+  match result {
+    Parsed(syntax) -> syntax
+    _ -> panic("expected parsed syntax")
+  }
+}
+
+fn render(text: str) -[Test]> str {
+  let syntax = parse_text(text)
+  inspection.render(syntax.declarations.declarations, syntax.source.source().text)
+}
+
+test "test discovery reads typed declarations and leaves callable storage test-free" {
+  let source = "const answer: i64 = 42\ntest \"first\" { answer }\nfn helper() -> i64 { answer }\ntest \"🧶 last\" { helper() }"
+  let syntax = parse_text(source)
+  let declarations = syntax.declarations.declarations
+  Test.assert_eq(preparation.count(declarations), 2)
+  Test.assert_eq(nlist_len(syntax.declarations.functions), 1)
+  let cases = preparation.tests(declarations)
+  Test.assert_eq_usize(cases.len(), 2)
+  Test.assert_eq(cases.get(0).unwrap().name_range.start, 28)
+  Test.assert_eq(cases.get(0).unwrap().name_range.length, 7)
+  Test.assert_eq(cases.get(1).unwrap().name_range.start, 82)
+  Test.assert_eq(cases.get(1).unwrap().name_range.length, 11)
+  Test.assert_true(match cases.get(0).unwrap().body { Ident(_, _) -> true, _ -> false })
+  for (item, expected) in [(cases.get(0).unwrap(), "first"), (cases.get(1).unwrap(), "🧶 last")] {
+    Test.assert_str_eq(item.name, expected)
+    let first = item.name_range.start.to_usize_checked().unwrap()
+    let last = (item.name_range.start + item.name_range.length).to_usize_checked().unwrap()
+    Test.assert_str_eq(source.slice(first, last).unwrap(), "\"".concat(expected).concat("\""))
+  }
+}
+
+test "non-test declaration alternatives and empty inputs do not request wrappers" {
+  for source in [
+    "",
+    "-- 🧶\n",
+    "type T = i64\nconst answer: i64 = 42\neffect E { fn get() -> i64 }\ntrait Read { fn read(self) -> i64 }\nfn value() -> i64 { answer }"
+  ] {
+    let syntax = parse_text(source)
+    Test.assert_eq(preparation.count(syntax.declarations.declarations), 0)
+    Test.assert_eq_usize(preparation.tests(syntax.declarations.declarations).len(), 0)
+  }
+}
+
+test "recovered test declarations remain explicit without hiding following tests" {
+  for text in [
+    "test missing\nfn kept() -> i64 { 1 }\ntest \"last\" { 2 }",
+    "test \"missing body\"\nfn kept() -> i64 { 1 }\ntest \"last\" { 2 }"
+  ] {
+    let (result, errors) = parse_span(
+      Source { text: text, identity: DiagnosticSourceNamed("broken.weft") }.all()
+    )
+    Test.assert_true(errors > 0)
+    match result {
+      Recovered(syntax) -> {
+        let declarations = syntax.declarations.declarations
+        Test.assert_true(
+          match declarations.get(0).unwrap().syntax { InvalidDefinition -> true, _ -> false }
+        )
+        Test.assert_true(
+          match declarations.get(0).unwrap().validity { RecoveredDeclaration -> true, _ -> false }
+        )
+        Test.assert_eq(preparation.count(declarations), 1)
+        Test.assert_eq(nlist_len(syntax.declarations.functions), 1)
+      }
+      _ -> Test.assert_true(false)
+    }
+  }
+}
+
+test "fragment test names retain enclosing byte coordinates and source backing" {
+  let text = "-- 🧶 prefix\n".concat("test \"retained\" { 42 }\n-- suffix")
+  let source = Source { text: text, identity: DiagnosticSourceNamed("fragment.weft") }
+  let fragment = source.span("-- 🧶 prefix\n".len(), text.len() - "\n-- suffix".len()).unwrap()
+  let (parsed, errors) = parse_span(fragment)
+  Test.assert_eq(errors, 0)
+  match parsed {
+    Parsed(syntax) -> {
+      Test.assert_eq(preparation.count(syntax.declarations.declarations), 1)
+      Test.assert_str_eq(
+        inspection.render(syntax.declarations.declarations, syntax.source.source().text),
+        "--- AST: 1 functions ---\n\ntest retained:\n  IntLit(42)\n\n"
+      )
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "inspection preserves interleaved function test and implementation order" {
+  let source = "test \"first\" { 1 }\ntype Box { value: i64 }\nimpl Box { fn value(self) -> i64 { 2 } }\nfn last() -> i64 { 3 }"
+  Test.assert_str_eq(
+    render(source),
+    "--- AST: 3 functions ---\n\ntest first:\n  IntLit(1)\n\nfn value:\n  IntLit(2)\n\nfn last:\n  IntLit(3)\n\n"
+  )
+  Test.assert_str_eq(render("-- no declarations"), "--- AST: 0 functions ---\n\n")
+}
+
+test "inspection retains literal spelling and traverses typed expression children" {
+  for (source, expected) in [
+    ("fn value() -> i64 { 1_024 }", "IntLit(1_024)"),
+    ("fn value() -> i64 { -5 }", "BinOp(op=2)\n    IntLit(0)\n    IntLit(5)"),
+    ("fn value() -> f64 { 1.25 }", "FloatLit(1.25)"),
+    ("fn value() -> str { \"🧶\" }", "StringLit"),
+    ("fn value() -> bool { true }", "BoolLit(true)"),
+    ("fn value() -> bool { false }", "BoolLit(false)"),
+    (
+      "fn value() -> i64 { if true { 1 } else { 2 } }",
+      "If\n    BoolLit(true)\n    IntLit(1)\n    IntLit(2)"
+    ),
+    ("fn value() -> i64 { let n = 1\nn }", "Let(n)\n    IntLit(1)\n    Ident(n)"),
+    ("fn value() -> i64 { let n: i64 = 1\nn }", "LetTyped(type_tag=2, type_payload=0)"),
+    ("fn value() -> i64 { other(1) }", "Call(other, nargs=1)"),
+    ("fn value() -> i64 { (other)(1) }", "Call(other, nargs=1)"),
+    ("fn value() -> i64 { match 1 { _ -> 2 } }", "Match(narms=1)\n    IntLit(1)"),
+    ("fn value() -> i64 { [1, 2] }", "Node(tag=58)"),
+    (
+      "fn value() -> i64 { defer cleanup()\n42 }",
+      "Defer\n    Call(cleanup, nargs=0)\n    IntLit(42)"
+    )
+  ] {
+    let rendered = render(source)
+    if not rendered.contains(expected) { Test.assert_str_eq(rendered, expected) }
+  }
+}
+
+test "decoded test names retain independent text and authored token provenance" {
+  for (literal, expected) in [
+    ("\"\"", ""),
+    ("\"🧶\"", "🧶"),
+    ("\"quote\\\" slash\\\\ tab\\t line\\n\"", "quote\" slash\\ tab\t line\n")
+  ] {
+    let text = "test".concat(" ").concat(literal).concat(" { 42 }")
+    let syntax = parse_text(text)
+    let case_syntax = preparation.tests(syntax.declarations.declarations).get(0).unwrap()
+    Test.assert_str_eq(case_syntax.name, expected)
+    Test.assert_eq(case_syntax.name_range.start, 5)
+    Test.assert_eq_usize(case_syntax.name_range.length.to_usize_checked().unwrap(), literal.len())
+    Test.assert_str_eq(
+      inspection.render(syntax.declarations.declarations, ""),
+      "--- AST: 1 functions ---\n\ntest".concat(" ").concat(expected).concat(
+        ":\n  IntLit(<invalid range>)\n\n"
+      )
+    )
+  }
+}
+
+test "inspection consumes typed expressions without re-encoding checker nodes" {
+  let syntax = parse_text("fn value() -> i64 { 0 }")
+  let original = syntax.declarations.declarations.get(0).unwrap()
+  let cases: [(Expr, str); 5] = [
+    (Negate(IntLit(5, 0, 0), MissingTypeExpr), "Negate\n    IntLit(5)"),
+    (
+      Apply(IntLit(0, 0, 0), ExprListCons(IntLit(1, 0, 0), ExprListNil), MissingTypeExpr, 0),
+      "Apply\n    IntLit(0)\n    IntLit(1)"
+    ),
+    (Block(IntLit(1, 0, 0), IntLit(2, 0, 0)), "Block\n    IntLit(1)\n    IntLit(2)"),
+    (Block(IntLit(1, 0, 0), UnknownExpr(0)), "Block\n    IntLit(1)"),
+    (If(BoolLit(1), IntLit(2, 0, 0), UnknownExpr(0)), "If\n    BoolLit(true)\n    IntLit(2)")
+  ]
+  for (expr, expected) in cases {
+    let changed = original.{
+      syntax: match original.syntax {
+        FunctionDefinition(function) -> FunctionDefinition(function.{ body: expr })
+        other -> other
+      }
+    }
+    let declarations = [changed]
+    Test.assert_str_eq(
+      inspection.render(list.from_slice(declarations[..]), "fn value() -> i64 { 0 }"),
+      "--- AST: 1 functions ---\n\nfn value:\n  ".concat(expected).concat("\n\n")
+    )
+  }
+}
+
+test "inspection handles invalid ranges without reading beyond supplied source" {
+  let syntax = parse_text("fn outside() -> i64 { 42 }")
+  Test.assert_str_eq(
+    inspection.render(syntax.declarations.declarations, ""),
+    "--- AST: 1 functions ---\n\nfn <invalid range>:\n  IntLit(<invalid range>)\n\n"
+  )
+  let original = syntax.declarations.declarations.get(0).unwrap()
+  for range in [
+    TypeNameRange { start: - 1, length: 2 },
+    TypeNameRange { start: 9223372036854775807, length: 1 },
+    TypeNameRange { start: 0, length: - 1 },
+    TypeNameRange { start: 1, length: 1 }
+  ] {
+    let changed = original.{
+      syntax: match original.syntax {
+        FunctionDefinition(function) -> FunctionDefinition(
+          function.{ name: range, body: IntLit(42, 0, 0) }
+        )
+        other -> other
+      }
+    }
+    let changed_declarations = [changed]
+    Test.assert_str_eq(
+      inspection.render(list.from_slice(changed_declarations[..]), "🧶"),
+      "--- AST: 1 functions ---\n\nfn <invalid range>:\n  IntLit(42)\n\n"
+    )
+  }
+}
+
+test "large declaration lists keep every test in source order" {
+  let mut text = ""
+  for index in 0..256 { text = text.concat("test \"repeated\" { 42 }\n") }
+  let syntax = parse_text(text)
+  let cases = preparation.tests(syntax.declarations.declarations)
+  Test.assert_eq(preparation.count(syntax.declarations.declarations), 256)
+  Test.assert_eq_usize(cases.len(), 256)
+  Test.assert_eq(nlist_len(syntax.declarations.functions), 0)
+  let mut previous = - 1
+  for item in cases {
+    Test.assert_true(item.name_range.start > previous)
+    previous = item.name_range.start
+  }
+}
