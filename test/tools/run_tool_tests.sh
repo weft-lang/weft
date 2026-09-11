@@ -1083,7 +1083,8 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_grammar_sql_syntax_named_expressions" "$(<"$tmp_out")" "pub type SqlExpressions = List<SqlExpression>"
     assert_contains "doc_stdlib_grammar_sql_syntax_query" "$(<"$tmp_out")" "pub type SqlQuery {"
   elif [ "$stdlib_doc_name" = "grammar/sql/plan" ]; then
-    assert_contains "doc_stdlib_grammar_sql_plan_public_contract" "$(<"$tmp_out")" "Public API items: 60. Documented: 60."
+    assert_contains "doc_stdlib_grammar_sql_plan_public_contract" "$(<"$tmp_out")" "Public API items: 61. Documented: 61."
+    assert_contains "doc_stdlib_grammar_sql_plan_expression_origin" "$(<"$tmp_out")" "Return the retained diagnostic anchor for this expression."
     assert_contains "doc_stdlib_grammar_sql_plan_expression" "$(<"$tmp_out")" "pub type SqlPlanExpression<I> {"
     assert_contains "doc_stdlib_grammar_sql_plan_named_sources" "$(<"$tmp_out")" "pub type SqlPlanSources<I> = List<SqlPlanSource<I>>"
     assert_contains "doc_stdlib_grammar_sql_plan_root" "$(<"$tmp_out")" "pub type SqlPlan<I> = opaque"
