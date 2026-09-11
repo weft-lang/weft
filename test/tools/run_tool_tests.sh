@@ -5943,6 +5943,32 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_harness_emits_passing_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
 echo "  ok test_harness_binds_runtime_after_synthesis"
 
+# A program root without test blocks is only verified by running it against a
+# declared exit code; the planner must not report an unrun main as a pass.
+printf 'fn main() -> i64 { 0 }\n' > "$tmp_src"
+undirected_status=0
+run_weft_compile_guarded "$WEFT" test "$tmp_src" > "$tmp_out" 2>"$tmp_err" || undirected_status=$?
+assert_equals "test_rejects_program_root_without_directive" "$undirected_status" "1"
+assert_contains "test_explains_missing_exit_directive" "$(<"$tmp_err")" "Expected exit code"
+assert_contains "test_never_passes_unrun_program_root" "$(<"$tmp_err")" "0 passed, 1 failed"
+printf -- '-- Expected exit code: 7\nfn main() -> i64 { 7 }\n' > "$tmp_src"
+run_weft_compile_guarded "$WEFT" test "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+assert_contains "test_runs_directed_program_root" "$(<"$tmp_err")" "1 passed, 0 failed"
+printf 'fn helper() -> i64 { 0 }\n' > "$tmp_src"
+run_weft_compile_guarded "$WEFT" test "$tmp_src" > "$tmp_out" 2>"$tmp_err"
+assert_contains "test_reports_library_without_tests" "$(<"$tmp_err")" "no test blocks found"
+echo "  ok test_program_root_requires_exit_directive"
+
+# A test block that performs no assertion still compiles through a handler
+# that discharges Test for the chunk.
+printf 'use stdlib/panic.{panic}\ntest "silent" { if 1 + 1 != 2 { panic("bad") } }\n' > "$tmp_src"
+run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+assert_not_contains_file "test_harness_discharges_test_without_assertions" "$tmp_err" "not available in this context"
+chmod +x "$tmp_bin"
+run_binary_guarded "$tmp_bin" 2>"$tmp_err"
+assert_contains "test_silent_block_emits_passing_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
+echo "  ok test_harness_handles_assertion_free_block"
+
 printf 'use stdlib/diagnostic/schema.{Diagnose} use stdlib/vector as vector use stdlib/vector.{*} fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) let max_usize: usize = 18446744073709551615 Test.assert_eq_usize(0, 0) Test.assert_eq_usize(max_usize, max_usize) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) let mut va = vector.new<i64>() let mut vb = vector.new<i64>() va.push(7) vb.push(7) Test.assert_i64_vector_eq(va, vb) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_supports_assertion_helpers" "$tmp_err" "unknown effect operation"
