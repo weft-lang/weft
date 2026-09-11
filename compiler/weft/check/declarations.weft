@@ -1,0 +1,478 @@
+-- Host interpretation of authored declarations into private checker storage.
+-- Grammar parsing has no declaration identities or checker-table authority.
+
+use compiler/weft/syntax/declarations.{*}
+use compiler/weft/check/associated as associated
+use compiler/weft/check/table.{*}
+use compiler/ir/data.{*}
+use compiler/project/module.{*}
+use compiler/storage.{*}
+use compiler/types/algebra.{*}
+use runtime/alloc.{alloc_words}
+use runtime/memory.{mem_store64_at}
+use stdlib/list.{List}
+use stdlib/source.{Source}
+
+fn visibility_code(visibility: DeclVisibility) -> i64 {
+  match visibility {
+    PrivateVisibility -> 0
+    PackageVisibility -> 1
+    PublicVisibility -> 2
+  }
+}
+
+fn named(
+  table: i64,
+  source: i64,
+  owner: i64,
+  namespace: i64,
+  name: TypeNameRange,
+  visibility: DeclVisibility
+) -> i64 {
+  module_decl_fact_register(
+    table,
+    source,
+    owner,
+    namespace,
+    name.start,
+    name.length,
+    visibility_code(visibility)
+  )
+}
+
+fn function_node(syntax: FunctionSyntax) -> i64 {
+  let inner = node_new(
+    8,
+    syntax.name.start,
+    syntax.name.length,
+    param_list_to_nodes(syntax.params),
+    expr_to_node(syntax.body)
+  )
+  node_new(
+    23,
+    inner,
+    type_expr_to_node(syntax.result),
+    effect_sig_to_node(syntax.effects),
+    type_param_list_to_nodes(syntax.type_params)
+  )
+}
+
+fn function_pair(
+  table: i64,
+  source: i64,
+  functions: i64,
+  declaration: i64,
+  function: i64,
+  native_owner: i64,
+  target: i64
+) -> nil {
+  let pair = node_new(declaration, function, source, native_owner, target)
+  if declaration != 0 { module_decl_fact_bind_function_pair(declaration, pair) }
+  module_fact_cache_function_pair(table, source, pair)
+  nlist_add(functions, pair)
+  nil
+}
+
+fn record(
+  table: i64,
+  source: i64,
+  name: TypeNameRange,
+  parameters: TypeParamList,
+  fields: TypeRecordFieldList,
+  visibility: DeclVisibility
+) -> nil {
+  let owner = named(table, source, 0, module_decl_namespace_type(), name, visibility)
+  let count = type_record_field_list_len(fields)
+  let payload = alloc_words(count * 3)
+  let mut remaining = fields
+  let mut index = 0
+  loop {
+    match remaining {
+      TypeRecordFieldListNil -> break
+      TypeRecordFieldListCons(field, rest) -> {
+        match field {
+          TypeRecordField(start, length, annotation) -> {
+            mem_store64_at(payload, index * 24, start)
+            mem_store64_at(payload, index * 24 + 8, length)
+            mem_store64_at(payload, index * 24 + 16, type_expr_to_node(annotation))
+            named(
+              table,
+              source,
+              owner,
+              module_decl_namespace_record_field(),
+              TypeNameRange { start: start, length: length },
+              visibility
+            )
+            nil
+          }
+          MissingTypeRecordField -> nil
+        }
+        index = index + 1
+        remaining = rest
+      }
+    }
+  }
+  ttable_add(
+    table,
+    source,
+    name.start,
+    name.length,
+    0,
+    count,
+    payload,
+    type_param_list_to_nodes(parameters)
+  )
+  nil
+}
+
+fn variants(
+  table: i64,
+  source: i64,
+  name: TypeNameRange,
+  parameters: TypeParamList,
+  variants: TypeVariantList,
+  visibility: DeclVisibility
+) -> nil {
+  let owner = named(table, source, 0, module_decl_namespace_type(), name, visibility)
+  let count = type_variant_list_len(variants)
+  let payload = alloc_words(count * 5)
+  let mut remaining = variants
+  let mut index = 0
+  loop {
+    match remaining {
+      TypeVariantListNil -> break
+      TypeVariantListCons(variant, rest) -> {
+        match variant {
+          TypeVariant(start, length, arity, arguments) -> {
+            mem_store64_at(payload, index * 40, start)
+            mem_store64_at(payload, index * 40 + 8, length)
+            mem_store64_at(payload, index * 40 + 16, str_hash(source, start, length))
+            mem_store64_at(payload, index * 40 + 24, arity)
+            mem_store64_at(
+              payload,
+              index * 40 + 32,
+              if arity == 0 { 0 } else { type_expr_list_to_nodes(arguments) }
+            )
+            named(
+              table,
+              source,
+              owner,
+              module_decl_namespace_constructor(),
+              TypeNameRange { start: start, length: length },
+              visibility
+            )
+            nil
+          }
+          MissingTypeVariant -> nil
+        }
+        index = index + 1
+        remaining = rest
+      }
+    }
+  }
+  ttable_add(
+    table,
+    source,
+    name.start,
+    name.length,
+    1,
+    count,
+    payload,
+    type_param_list_to_nodes(parameters)
+  )
+  nil
+}
+
+fn type_declaration(
+  table: i64,
+  source: i64,
+  syntax: TypeSyntax,
+  visibility: DeclVisibility
+) -> nil {
+  match syntax {
+    RecordSyntax(name, parameters, fields) -> record(
+      table,
+      source,
+      name,
+      parameters,
+      fields,
+      visibility
+    )
+    VariantSyntax(name, parameters, members) -> variants(
+      table,
+      source,
+      name,
+      parameters,
+      members,
+      visibility
+    )
+    OpaqueSyntax(name, parameters, representation) -> {
+      let declaration = named(table, source, 0, module_decl_namespace_type(), name, visibility)
+      ttable_add(
+        table,
+        source,
+        name.start,
+        name.length,
+        5,
+        0,
+        type_expr_to_node(representation),
+        type_param_list_to_nodes(parameters)
+      )
+      module_decl_fact_mark_native_collision(
+        declaration,
+        type_name_hash(source, name.start, name.length)
+      )
+      nil
+    }
+    AliasSyntax(name, parameters, target) -> {
+      named(table, source, 0, module_decl_namespace_type(), name, visibility)
+      ttable_add(
+        table,
+        source,
+        name.start,
+        name.length,
+        6,
+        0,
+        type_expr_to_node(target),
+        type_param_list_to_nodes(parameters)
+      )
+      nil
+    }
+  }
+}
+
+fn effect_declaration(
+  table: i64,
+  source: i64,
+  syntax: EffectSyntax,
+  visibility: DeclVisibility
+) -> nil {
+  let owner = named(table, source, 0, module_decl_namespace_effect(), syntax.name, visibility)
+  let operations = nlist_new()
+  for member in syntax.operations {
+    let operation = type_effect_op_to_node(member.operation)
+    nlist_add(operations, operation)
+    named(
+      table,
+      source,
+      owner,
+      module_decl_namespace_effect_operation(),
+      TypeNameRange { start: node_f1(operation), length: node_f2(operation) },
+      member.visibility
+    )
+    nil
+  }
+  ttable_add(
+    table,
+    source,
+    syntax.name.start,
+    syntax.name.length,
+    2,
+    nlist_len(operations),
+    operations,
+    type_param_list_to_nodes(syntax.type_params)
+  )
+  nil
+}
+
+fn trait_declaration(
+  table: i64,
+  source: i64,
+  syntax: TraitSyntax,
+  visibility: DeclVisibility
+) -> nil {
+  let owner = named(table, source, 0, module_decl_namespace_trait(), syntax.name, visibility)
+  let members = type_trait_member_list_to_nodes(syntax.members)
+  for index in 0..nlist_len(members) {
+    let member = nlist_get(members, index)
+    let namespace = if node_tag(member) == 39 { module_decl_namespace_trait_method() } else {
+      module_decl_namespace_associated_type()
+    }
+    module_decl_fact_register(
+      table,
+      source,
+      owner,
+      namespace,
+      node_f1(member),
+      node_f2(member),
+      module_visibility_private()
+    )
+  }
+  associated.finalize_trait(members, source)
+  ttable_add(
+    table,
+    source,
+    syntax.name.start,
+    syntax.name.length,
+    3,
+    nlist_len(members),
+    members,
+    0
+  )
+  nil
+}
+
+fn impl_declaration(table: i64, source: i64, syntax: ImplSyntax, functions: i64) -> nil {
+  let info = type_impl_target_to_node(syntax.target, syntax.type_params)
+  let self_type = node_f3(info)
+  let inherent = match syntax.target.protocol { InherentTypeImpl -> true, _ -> false }
+  let target = module_decl_fact_find(
+    table,
+    source,
+    module_decl_namespace_type(),
+    source,
+    syntax.name.start,
+    syntax.name.length
+  )
+  let owner = if inherent { target } else { 0 }
+  let native_owner = module_decl_fact_native_key_or(
+    target,
+    type_name_hash(source, syntax.name.start, syntax.name.length)
+  )
+  let members = nlist_new()
+  for member in syntax.members {
+    match member {
+      ImplMethod(function, visibility) -> {
+        let node = associated.substitute_self(function_node(function), self_type)
+        nlist_add(members, node)
+        let declaration = if inherent {
+          named(
+            table,
+            source,
+            owner,
+            module_decl_namespace_inherent_method(),
+            function.name,
+            visibility
+          )
+        } else { 0 }
+        function_pair(table, source, functions, declaration, node, native_owner, self_type)
+      }
+      ImplTypeBinding(name, annotation, range) -> {
+        let substitution = subst_new()
+        subst_add(substitution, - 1, self_type)
+        let location = match range {
+          location: TypeNameRange -> node_new(0, location.start, location.length, 0, 0)
+          nil -> 0
+        }
+        nlist_add(
+          members,
+          node_new(
+            43,
+            name.start,
+            name.length,
+            ty_subst(type_expr_to_node(annotation), substitution),
+            location
+          )
+        )
+        nil
+      }
+    }
+  }
+  -- Function pairs and the impl entry deliberately share these registered
+  -- nodes. Resolution never mutates the authored syntax value.
+  associated.finalize_impl(members, source, self_type, node_f2(info), table)
+  ttable_add(
+    table,
+    source,
+    syntax.name.start,
+    syntax.name.length,
+    4,
+    nlist_len(members),
+    members,
+    info
+  )
+  nil
+}
+
+pub(package) fn register(syntax: ParsedModuleSyntax, source: Source, table: i64) -> i64 {
+  let buffer = __str_ptr(source.text)
+  ttable_register_source(table, buffer, __str_len(source.text), 0, 0)
+  let functions = nlist_new()
+  for declaration in syntax.declarations {
+    match declaration.syntax {
+      FunctionDefinition(function) -> {
+        let identity = named(
+          table,
+          buffer,
+          0,
+          module_decl_namespace_value(),
+          function.name,
+          declaration.visibility
+        )
+        function_pair(table, buffer, functions, identity, function_node(function), 0, 0)
+      }
+      TypeDefinition(definition) -> type_declaration(
+        table,
+        buffer,
+        definition,
+        declaration.visibility
+      )
+      EffectDefinition(effect_syntax) -> effect_declaration(
+        table,
+        buffer,
+        effect_syntax,
+        declaration.visibility
+      )
+      TraitDefinition(trait_syntax) -> trait_declaration(
+        table,
+        buffer,
+        trait_syntax,
+        declaration.visibility
+      )
+      ImplDefinition(implementation) -> impl_declaration(table, buffer, implementation, functions)
+      ConstantDefinition(constant) -> {
+        let identity = named(
+          table,
+          buffer,
+          0,
+          module_decl_namespace_value(),
+          constant.name,
+          declaration.visibility
+        )
+        module_decl_fact_bind_constant_fact(
+          identity,
+          module_constant_fact_new(
+            type_expr_to_node(constant.declared_type),
+            expr_to_node(constant.initializer)
+          )
+        )
+        nil
+      }
+      HandlerDefinition(handler) -> {
+        let entry = module_fact_register_source(table, buffer, 0, 0, 0)
+        if module_fact_entry_handler_implementation(entry) == 0 {
+          let clauses = handler_clause_list_to_nodes(handler.clauses)
+          let metadata = node_new(
+            0,
+            type_param_list_to_nodes(handler.type_params),
+            nlist_len(clauses),
+            visibility_code(declaration.visibility),
+            handler.keyword.start
+          )
+          module_fact_set_handler_implementation(
+            entry,
+            node_new(
+              1,
+              expr_to_node(handler.effect_reference),
+              param_list_to_nodes(handler.params),
+              clauses,
+              metadata
+            )
+          )
+        }
+      }
+      DefaultHandlerDefinition(handler) -> {
+        let entry = module_fact_register_source(table, buffer, 0, 0, 0)
+        module_fact_add_default_handler(
+          entry,
+          node_new(1, expr_to_node(handler.configuration), 0, 0, handler.keyword.start)
+        )
+        nil
+      }
+      ImportDefinition(_) -> nil
+      TestDefinition(_) -> nil
+      InvalidDefinition -> nil
+    }
+  }
+  functions
+}

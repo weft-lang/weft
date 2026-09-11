@@ -1,0 +1,374 @@
+use compiler/weft/grammar.{WeftParser, ParsedWeftSource}
+use compiler/weft/syntax/declarations.{*}
+use compiler/ir/data.{*}
+use compiler/source/input.{source_from_text}
+use stdlib/grammar.{Grammar, Parsed}
+use stdlib/diagnostic.{Diagnose}
+use stdlib/panic.{panic}
+use stdlib/list.{List, Nil, Cons}
+use stdlib/option.{Option}
+use compiler/project/module.{
+  PrivateVisibility,
+  PackageVisibility,
+  PublicVisibility,
+  module_decl_fact_find,
+  module_decl_fact_find_member,
+  module_decl_fact_visibility,
+  module_decl_namespace_effect,
+  module_decl_namespace_effect_operation
+}
+use compiler/weft/check/declarations as declarations
+use compiler/weft/check/table.{ttable_new, ttable_entry_at}
+use compiler/storage.{nlist_len, nlist_get, node_tag, node_f1, node_f2, node_f3, node_f4}
+use compiler/types/algebra.{ty_eq}
+
+fn typed_function() -> FunctionParse {
+  let function = FunctionSyntax {
+    name: TypeNameRange { start: 7, length: 4 },
+    params: ParamListCons(Param(1, 1, MissingTypeExpr, ImplicitParamLabel), ParamListNil),
+    result: MissingTypeExpr,
+    effects: effect_sig_from_node(0),
+    type_params: TypeParamListNil,
+    body: IntLit(42, 0, 0)
+  }
+  FunctionParse { syntax: function, next: 17 }
+}
+
+fn typed_members() -> List<ImplMemberSyntax> {
+  let mut members: List<ImplMemberSyntax> = Nil
+  let parsed = typed_function()
+  members = Cons(ImplMethod(parsed.syntax, PrivateVisibility), members)
+  members = Cons(
+    ImplTypeBinding(
+      TypeNameRange { start: 1, length: 2 },
+      MissingTypeExpr,
+      TypeNameRange { start: 3, length: 4 }
+    ),
+    members
+  )
+  members.reverse()
+}
+
+test "constructed heterogeneous impl members retain function signatures" {
+  for member in typed_members() {
+    match member {
+      ImplMethod(function, _) -> { Test.assert_eq(param_list_len(function.params), 1); nil }
+      ImplTypeBinding(_, _, _) -> nil
+    }
+  }
+}
+
+fn parse(text: str) -[Test]> ParsedWeftSource {
+  let result = handle WeftParser().parse(source_from_text(text).all()) {
+    Diagnose.report(diagnostic) -> { Test.assert_true(false); resume(0) }
+    Diagnose.error(message, location) -> { Test.assert_true(false); resume(0) }
+    Diagnose.warn(message, location) -> resume(0)
+    Diagnose.note(message, location) -> resume(0)
+  }
+  match result {
+    Parsed(syntax) -> syntax
+    _ -> panic("expected complete authored syntax")
+  }
+}
+
+fn assert_method_params(text: str, expected: i64) -[Test]> nil {
+  let syntax = parse(text)
+  let mut methods = 0
+  for declaration in syntax.declarations.declarations {
+    match declaration.syntax {
+      ImplDefinition(implementation) -> {
+        for member in implementation.members {
+          match member {
+            ImplMethod(function, _) -> {
+              Test.assert_eq(param_list_len(function.params), expected)
+              methods = methods + 1
+            }
+            ImplTypeBinding(_, _, _) -> nil
+          }
+        }
+      }
+      _ -> nil
+    }
+  }
+  Test.assert_eq(methods, 1)
+  nil
+}
+
+fn assert_authored_receiver(syntax: ParsedWeftSource) -[Test]> nil {
+  let mut methods = 0
+  for declaration in syntax.declarations.declarations {
+    match declaration.syntax {
+      ImplDefinition(implementation) -> for member in implementation.members {
+        match member {
+          ImplMethod(function, _) -> {
+            Test.assert_true(
+              match function.params {
+                ParamListCons(Param(_, _, VariableTypeExpr(identity), _), ParamListNil) ->
+                  identity == - 1
+                _ -> false
+              }
+            )
+            Test.assert_true(
+              match function.result { VariableTypeExpr(identity) -> identity == - 1, _ -> false }
+            )
+            methods = methods + 1
+          }
+          _ -> nil
+        }
+      }
+      _ -> nil
+    }
+  }
+  Test.assert_eq(methods, 1)
+  nil
+}
+
+test "independent host registration does not resolve authored Self syntax in place" {
+  let syntax = parse("type Box { value: i64 } impl Box { fn copy(self) -> Self { self } }")
+  assert_authored_receiver(syntax)
+  let first = declarations.register(syntax.declarations, syntax.source.source(), ttable_new())
+  assert_authored_receiver(syntax)
+  let second = declarations.register(syntax.declarations, syntax.source.source(), ttable_new())
+  assert_authored_receiver(syntax)
+  Test.assert_eq(nlist_len(first), 1)
+  Test.assert_eq(nlist_len(second), 1)
+  let first_method = node_f1(nlist_get(first, 0))
+  let second_method = node_f1(nlist_get(second, 0))
+  Test.assert_true(first_method != second_method)
+  Test.assert_true(ty_eq(node_f2(first_method), node_f2(second_method)))
+  Test.assert_true(
+    ty_eq(
+      node_f3(nlist_get(node_f3(node_f1(first_method)), 0)),
+      node_f2(first_method)
+    )
+  )
+}
+
+fn literal(expr: Expr) -> Expr {
+  match expr {
+    Block(first, rest) -> literal(expr_block_result(first, rest))
+    _ -> expr
+  }
+}
+
+test "match transport retains ordinary let and for binding contexts" {
+  for sample in [(ExplicitMatch, 0), (LetDestructuring, 1), (ForDestructuring, 2)] {
+    let arms = MatchArmListCons(Arm(Wildcard, IntLit(7, 0, 0), NilExpr, 0), MatchArmListNil)
+    let raw = expr_to_node(Match(IntLit(1, 0, 0), arms, sample.0))
+    let metadata = node_f4(raw)
+    Test.assert_eq(if metadata == 0 { 0 } else { node_f1(metadata) }, sample.1)
+    Test.assert_true(
+      match expr_from_node(raw) {
+        Match(_, _, origin) -> match origin {
+          ExplicitMatch -> sample.1 == 0
+          LetDestructuring -> sample.1 == 1
+          ForDestructuring -> sample.1 == 2
+        }
+        _ -> false
+      }
+    )
+  }
+}
+
+test "constructor transport preserves qualifiers independently of resolved identity" {
+  for declaration in [0, 123] {
+    for qualifier in [nil, TypeNameRange { start: 0, length: 3 }] {
+      let children = PatternListCons(Binding(30, 1), PatternListNil)
+      let raw = pattern_to_node(CtorPattern(4, 5, children, declaration, qualifier))
+      Test.assert_eq(
+        node_tag(raw),
+        match qualifier {
+          nil -> if declaration == 0 { 20 } else { 67 }
+          range: TypeNameRange -> 67
+        }
+      )
+      Test.assert_true(
+        match pattern_from_node(raw) {
+          CtorPattern(4, 5, PatternListCons(Binding(30, 1), PatternListNil), identity, restored) ->
+            identity == declaration and match (qualifier, restored) {
+              (nil, nil) -> true
+              (expected: TypeNameRange, actual: TypeNameRange) ->
+                expected.start == actual.start and expected.length == actual.length
+              _ -> false
+            }
+          _ -> false
+        }
+      )
+    }
+  }
+}
+
+fn authored_trait_result(syntax: ParsedWeftSource) -> TypeExpr {
+  for declaration in syntax.declarations.declarations {
+    match declaration.syntax {
+      TraitDefinition(trait_syntax) -> {
+        let mut members = trait_syntax.members
+        loop {
+          match members {
+            TypeTraitMemberListNil -> break
+            TypeTraitMemberListCons(member, rest) -> {
+              match member {
+                TypeTraitMethod(_, _, _, result, _) -> return result
+                _ -> nil
+              }
+              members = rest
+            }
+          }
+        }
+      }
+      _ -> nil
+    }
+  }
+  panic("expected a trait method")
+}
+
+test "associated type interpretation leaves authored trait names unchanged" {
+  let syntax = parse("trait Cursor { type Item fn next(self) -> Item }")
+  let before = authored_trait_result(syntax)
+  let table = ttable_new()
+  declarations.register(syntax.declarations, syntax.source.source(), table)
+  let after = authored_trait_result(syntax)
+  for result in [before, after] {
+    Test.assert_true(
+      match result {
+        NamedTypeExpr(_, _, TypeExprListNil, SourceTypeOrigin(range)) ->
+          syntax.source.source().text.slice(
+            __i64_to_usize(range.start),
+            __i64_to_usize(range.start + range.length)
+          ).unwrap() == "Item"
+        _ -> false
+      }
+    )
+  }
+  Test.assert_true(
+    match type_entry_from_ptr(ttable_entry_at(table, 0)) {
+      TypeTraitEntry(_, _, TypeTraitMemberListCons(_,
+      TypeTraitMemberListCons(TypeTraitMethod(_, _, _, AssociatedTypeExpr(VariableTypeExpr(identity), _), _),
+      TypeTraitMemberListNil))) -> identity == - 1
+      _ -> false
+    }
+  )
+}
+
+test "effect operation visibility and suspension survive host registration" {
+  let syntax = parse(
+    "pub effect Await<T> { fn visible() -> T pub(package) @deferred fn suspend(value: T) -> T }"
+  )
+  let table = ttable_new()
+  let source = syntax.source.source()
+  let buffer = __str_ptr(source.text)
+  declarations.register(syntax.declarations, source, table)
+  let mut effects = 0
+  for declaration in syntax.declarations.declarations {
+    match declaration.syntax {
+      EffectDefinition(effect_syntax) -> {
+        effects = effects + 1
+        Test.assert_eq(type_param_list_len(effect_syntax.type_params), 1)
+        Test.assert_eq_usize(effect_syntax.operations.len(), 2)
+        let owner = module_decl_fact_find(
+          table,
+          buffer,
+          module_decl_namespace_effect(),
+          buffer,
+          effect_syntax.name.start,
+          effect_syntax.name.length
+        )
+        let mut operations = 0
+        for member in effect_syntax.operations {
+          let (start, length, deferred) = match member.operation {
+            TypeEffectOp(start, length, _, VariableTypeExpr(_)) -> (start, length, false)
+            DeferredTypeEffectOp(start, length, _, VariableTypeExpr(_)) -> (start, length, true)
+            _ -> panic("expected a generic operation result")
+          }
+          let identity = module_decl_fact_find_member(
+            table,
+            owner,
+            module_decl_namespace_effect_operation(),
+            buffer,
+            start,
+            length
+          )
+          Test.assert_true(identity != 0)
+          Test.assert_true(
+            match (member.visibility, module_decl_fact_visibility(identity)) {
+              (PublicVisibility, PublicVisibility) -> not deferred and operations == 0
+              (PackageVisibility, PackageVisibility) -> deferred and operations == 1
+              _ -> false
+            }
+          )
+          operations = operations + 1
+        }
+        Test.assert_eq(operations, 2)
+        nil
+      }
+      _ -> nil
+    }
+  }
+  Test.assert_eq(effects, 1)
+}
+
+test "authored literal ranges survive declaration registration" {
+  for sample in [("true", "bool"), ("false", "bool"), ("\"café\\n\"", "str"), ("\"\"", "str")] {
+    let prefix = "-- 🧶\nfn value() -> ".concat(sample.1).concat(" { ")
+    let text = prefix.concat(sample.0).concat(" }")
+    let syntax = parse(text)
+    let mut literals = 0
+    for declaration in syntax.declarations.declarations {
+      match declaration.syntax {
+        FunctionDefinition(function) -> {
+          let range = match literal(function.body) {
+            BoolLit(_, start, length) -> TypeNameRange { start: start, length: length }
+            StringLit(_, _, start, length) -> TypeNameRange { start: start, length: length }
+            _ -> panic("expected authored literal")
+          }
+          Test.assert_eq_usize(__i64_to_usize(range.start), prefix.len())
+          Test.assert_eq_usize(__i64_to_usize(range.length), sample.0.len())
+          literals = literals + 1
+        }
+        _ -> nil
+      }
+    }
+    Test.assert_eq(literals, 1)
+    let functions = declarations.register(
+      syntax.declarations,
+      syntax.source.source(),
+      ttable_new()
+    )
+    let body = literal(expr_from_node(node_f4(node_f1(node_f1(nlist_get(functions, 0))))))
+    Test.assert_true(
+      match body {
+        BoolLit(_, start, length) -> __i64_to_usize(start) == prefix.len() and __i64_to_usize(
+          length
+        ) == sample.0.len()
+        StringLit(_, _, start, length) -> __i64_to_usize(start) == prefix.len() and
+          __i64_to_usize(length) == sample.0.len()
+        _ -> false
+      }
+    )
+  }
+}
+
+test "impl syntax retains plain method parameters" {
+  assert_method_params("impl Box { fn cast(self, value: i64) -> i64 { value } }", 2)
+}
+
+test "impl syntax retains method parameters before associated bindings" {
+  assert_method_params(
+    "impl Box { fn cast(self, value: i64) -> i64 { value } type Item = i64 }",
+    2
+  )
+}
+
+test "impl syntax retains method generics without associated bindings" {
+  assert_method_params(
+    "impl<T: api.Show> Box<T> { fn cast<U: api.Match>(self, value: U) -> U { value } }",
+    2
+  )
+}
+
+test "impl syntax retains method generics before associated bindings" {
+  assert_method_params(
+    "impl<T: api.Show> Box<T> { fn cast<U: api.Match>(self, value: U) -> U { value } type Item = [i64; 3] }",
+    2
+  )
+}

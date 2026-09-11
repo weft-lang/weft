@@ -10,13 +10,13 @@ compiler/
   weft/                 Weft's own language implementation
     grammar.weft        public Grammar implementation
     check.weft          public CheckedGrammar implementation
-    check/              checker storage, bodies, and host-type interpretation
+    check/              declaration registration, checking, and host-type interpretation
     syntax/             declarations, imports, literals, and concrete syntax graph
     facts/              Weft semantic fact producers
     unicode/            generated language tables
   source/               retained inputs, loading, provenance, and trust policy
   diagnostic/           diagnostic observation, locations, and rendering
-  types/                type algebra
+  types/                type algebra and source spelling keys
   ir/                   internal representations and control-flow analysis
   grammar/              grammar data and interpretation infrastructure
   comptime/             compile-time execution and observed artifact inputs
@@ -46,6 +46,14 @@ Source acquisition and package authority belong to the host, outside a grammar's
 parse/check capabilities. Weft-specific syntax and semantic decisions belong
 under `weft/`. Shared interpreters accept data: the Tree-sitter renderer consumes
 a `SyntaxGrammar`; its command-line caller chooses the Weft syntax graph.
+
+`WeftParser` has no checker context. Its `Grammar` interpretation produces
+retained source and authored declarations, including method bodies, associated
+type bindings, operation visibility, and literal token ranges. The host registers
+those values under `weft/check/declarations`; resolving `Self`, associated types,
+and declaration identities never mutates the authored syntax. The remaining
+expression/type adapters and checker storage are private migration boundaries,
+not extension contracts.
 
 Native and trust-sensitive relocations must remain bootstrappable from the
 checked-in root. Prepare new exact paths and refresh the root before moving a
