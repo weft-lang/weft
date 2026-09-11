@@ -6,6 +6,7 @@
 
 use compiler/diagnostic/render.{diagnose_report_severity_tag}
 use compiler/weft/grammar.{WeftParser}
+use compiler/weft/format/config as format_config
 use stdlib/grammar.{Grammar, Parsed, Recovered, Rejected}
 use stdlib/source.{Source}
 use compiler/weft/lex.{*}
@@ -107,6 +108,7 @@ fn formatter_gap_indent_depth(tokens: i64, previous: i64, current: i64, depth: i
   if next_tag == 5 and (next_value == 2 or next_value == 4 or next_value == 14) { return base } else { 0 }
   if next_tag == 3 and next_value == 4 { return base } else { 0 } -- else
   if previous < 0 { return base } else { 0 }
+  if tok_has_layout(tokens, next, LayoutMember) { return base } else { 0 }
   if tok_tag(tokens, previous) == 5 and tok_v1(tokens, previous) == 3 { return base } else { 0 } -- {
   -- No separator and no block boundary means the source newline continues an
   -- expression/signature. Give every continuation one stable extra level.
@@ -240,8 +242,7 @@ fn formatter_append_top_level_comment_gap(out: i64, src: i64, start: i64, end: i
   if previous_role == 0 and not all_leading_docs { formatter_append_source_newline(out, src, start, end) } else { out }
 }
 
-fn formatter_append_trivia_gap(out: i64, src: i64, start: i64, end: i64, tokens: i64, previous: i64, current: i64, depth: i64) -> i64 {
-  let target_depth = formatter_gap_indent_depth(tokens, previous, current, depth)
+fn formatter_append_trivia_gap(out: i64, src: i64, start: i64, end: i64, tokens: i64, previous: i64, current: i64, depth: i64, target_depth: i64) -> i64 {
   let next = formatter_next_source_token(tokens, current)
   let comment_depth = if next < tok_count(tokens) and tok_tag(tokens, next) == 5 and tok_v1(tokens, next) == 4 { depth } else { target_depth }
   let mut i = start
@@ -306,6 +307,7 @@ fn formatter_gap_wants_space(tokens: i64, previous: i64, current: i64) -> bool {
   let current_value = tok_v1(tokens, current)
   let current_role = tok_syntax_role(tokens, current)
   let prev_role = tok_syntax_role(tokens, previous)
+  if current_role == tok_syntax_role_visibility_qualifier() { return false } else { 0 }
   if current_tag == 4 and current_role == tok_syntax_role_generic_angle() and (current_value == 7 or current_value == 8) { return false } else { 0 }
   if prev_tag == 4 and prev_role == tok_syntax_role_generic_angle() and prev_value == 7 { return false } else { 0 }
   if current_role == tok_syntax_role_module_path() or prev_role == tok_syntax_role_module_path() { return false } else { 0 }
@@ -321,7 +323,7 @@ fn formatter_gap_wants_space(tokens: i64, previous: i64, current: i64) -> bool {
   } else { true }
 }
 
-fn formatter_append_gap(out: i64, src: i64, start: i64, end: i64, tokens: i64, previous: i64, current: i64, depth: i64, previous_top_level_role: i64) -> i64 {
+fn formatter_append_gap(out: i64, src: i64, start: i64, end: i64, tokens: i64, previous: i64, current: i64, depth: i64, previous_top_level_role: i64, target_depth: i64, line_break: bool, newline: str) -> i64 {
   let top_level_role = if depth == 0 { formatter_top_level_role(tokens, current) } else { 0 }
   if top_level_role != 0 and not formatter_gap_follows_synthetic_semicolon(tokens, previous, current) {
     if formatter_gap_has_comment(src, start, end) {
@@ -331,6 +333,10 @@ fn formatter_append_gap(out: i64, src: i64, start: i64, end: i64, tokens: i64, p
     }
   } else { 0 }
   if formatter_gap_follows_synthetic_semicolon(tokens, previous, current) { return out } else { 0 }
+  if line_break and not formatter_gap_is_attached_trivia(src, start, end) {
+    bstr(out, newline)
+    return formatter_append_indent(out, target_depth)
+  } else { 0 }
   -- Adjacent source tokens still need the canonical gap selected by their
   -- grammar roles. Returning early here preserved missing whitespace
   -- (`name:Type=value`, `fn main()->T`) and made formatting depend on whether
@@ -342,26 +348,211 @@ fn formatter_append_gap(out: i64, src: i64, start: i64, end: i64, tokens: i64, p
   if formatter_gap_is_attached_trivia(src, start, end) {
     -- Rebuild only whitespace around comments; comment bytes and newline
     -- spelling/count retain exact source order.
-    return formatter_append_trivia_gap(out, src, start, end, tokens, previous, current, depth)
+    return formatter_append_trivia_gap(out, src, start, end, tokens, previous, current, depth, target_depth)
   } else { 0 }
   if formatter_gap_wants_space(tokens, previous, current) {
     bstr(out, " ")
   } else { out }
 }
 
+type FormatterLayout {
+  group_ends: owned Vector<i64>,
+  signature_ends: owned Vector<i64>,
+  prefix: owned Vector<i64>,
+  lines: owned Vector<i64>,
+  next_break: owned Vector<i64>,
+  newline: str
+}
+
+type FormatterFrame {
+  close: i64,
+  indent: i64,
+  broken: bool
+}
+
+fn formatter_newline(src: i64, length: i64) -> str {
+  let mut i = 0
+  while i < length {
+    let byte = mem_load8_at(src, i)
+    if byte == 10 { return "\n" }
+    else if byte == 13 {
+      if i + 1 < length and mem_load8_at(src, i + 1) == 10 { return "\r\n" }
+      else { return "\r" }
+    } else { i = i + 1 }
+  }
+  "\n"
+}
+
+-- Width counts Unicode scalars, not UTF-8 bytes. Literal/comment payloads
+-- remain indivisible; a newline inside such a token resets the actual column.
+fn formatter_column_after(src: i64, start: i64, end: i64, initial: i64) -> i64 {
+  let mut column = initial
+  for i in start..end {
+    let byte = mem_load8_at(src, i)
+    if byte == 10 or byte == 13 { column = 0 }
+    else if byte < 128 or byte >= 192 { column = column + 1 }
+    else { 0 }
+  }
+  column
+}
+
+fn formatter_scalar_width(src: i64, start: i64, end: i64) -> i64 {
+  let mut width = 0
+  for i in start..end {
+    let byte = mem_load8_at(src, i)
+    if byte < 128 or byte >= 192 { width = width + 1 } else { 0 }
+  }
+  width
+}
+
+-- Match only parser-published groups. Prefix widths and next-break indices
+-- make every rendering decision constant-time, including deeply nested heads.
+fn formatter_layout(src: i64, source_len: i64, tokens: i64) -> FormatterLayout {
+  let count = tok_count(tokens)
+  let capacity = __i64_to_usize(count)
+  let group_ends = vector.with_capacity<i64>(capacity)
+  let signature_ends = vector.with_capacity<i64>(capacity)
+  let prefix = vector.with_capacity<i64>(capacity + 1)
+  let lines = vector.with_capacity<i64>(capacity)
+  let next_break = vector.with_capacity<i64>(capacity)
+  let opens = vector.new<i64>()
+  for i in 0..count {
+    vector_push(group_ends, -1)
+    vector_push(signature_ends, -1)
+    vector_push(next_break, count)
+  }
+  vector_push(prefix, 0)
+  let mut width = 0
+  let mut line = 0
+  let mut offset = 0
+  let mut previous = -1
+  let mut signature = -1
+  for i in 0..count {
+    let start = tok_span(tokens, i)
+    let end = tok_end(tokens, i)
+    while offset < start {
+      let byte = mem_load8_at(src, offset)
+      if byte == 10 or byte == 13 { line = line + 1 } else { 0 }
+      offset = offset + 1
+    }
+    vector_push(lines, line)
+    if end > start {
+      if formatter_gap_wants_space(tokens, previous, i) { width = width + 1 } else { 0 }
+      width = width + formatter_scalar_width(src, start, end)
+      previous = i
+    } else { 0 }
+    vector_push(prefix, width)
+    if tok_has_layout(tokens, i, LayoutSignatureEnd) and signature >= 0 {
+      vector_set(signature_ends, signature, i)
+      signature = -1
+    } else { 0 }
+    if tok_has_layout(tokens, i, LayoutSignatureStart) { signature = i } else { 0 }
+    if tok_has_layout(tokens, i, LayoutGroupClose) and vector_len(opens) > 0 {
+      let open = vector_get_in_bounds(opens, vector_len(opens) - 1)
+      vector_pop(opens)
+      vector_set(group_ends, open, i)
+    } else { 0 }
+    if tok_has_layout(tokens, i, LayoutGroupOpen) { vector_push(opens, i) } else { 0 }
+  }
+  let mut following = count
+  let mut i = count
+  while i > 0 {
+    i = i - 1
+    vector_set(next_break, i, following)
+    if tok_has_layout(tokens, i, LayoutBreak) or tok_has_layout(tokens, i, LayoutGroupClose) {
+      following = i
+    } else { 0 }
+  }
+  FormatterLayout {
+    group_ends: group_ends,
+    signature_ends: signature_ends,
+    prefix: prefix,
+    lines: lines,
+    next_break: next_break,
+    newline: formatter_newline(src, source_len)
+  }
+}
+
 pub(package) fn formatter_render_tokens(src: i64, source_len: i64, tokens: i64) -> str {
+  formatter_render_tokens_with_config(src, source_len, tokens, format_config.defaults())
+}
+
+pub(package) fn formatter_render_tokens_with_config(src: i64, source_len: i64, tokens: i64, config: format_config.Config) -> str {
   let out = buf_new(source_len + 32)
   let count = tok_count(tokens)
+  let { group_ends, signature_ends, prefix, lines, next_break, newline } = formatter_layout(src, source_len, tokens)
+  let frames = vector.new<FormatterFrame>()
   let mut previous = 0 - 1
   let mut previous_end = 0
   let mut depth = 0
   let mut top_level_role = 0
+  let mut column = 0
+  let mut line_indent = 0
+  let mut signature_end = -1
   for i in 0..count {
     let start = tok_span(tokens, i)
     let end = tok_end(tokens, i)
-    formatter_append_gap(out, src, previous_end, start, tokens, previous, i, depth, top_level_role)
+    let next = formatter_next_source_token(tokens, i)
+    let layout_depth = if vector_len(frames) > 0 {
+      let frame = vector_get_in_bounds(frames, vector_len(frames) - 1)
+      if frame.broken { frame.indent + 1 } else { depth }
+    } else { depth }
+    let mut target_depth = formatter_gap_indent_depth(tokens, previous, i, depth)
+    if tok_has_layout(tokens, next, LayoutBreak) and not tok_has_layout(tokens, next, LayoutMember) and
+        not tok_has_layout(tokens, next, LayoutItem) and not tok_has_layout(tokens, next, LayoutDeclarationBody) {
+      target_depth = layout_depth + 1
+    } else { nil }
+    let mut line_break = false
+    if vector_len(frames) > 0 {
+      let frame = vector_get_in_bounds(frames, vector_len(frames) - 1)
+      if next == frame.close {
+        target_depth = frame.indent
+        line_break = frame.broken
+      } else if frame.broken and (tok_has_layout(tokens, next, LayoutMember) or tok_has_layout(tokens, next, LayoutItem)) {
+        target_depth = frame.indent + 1
+        line_break = true
+      } else { 0 }
+    } else { 0 }
+    if i == next and tok_has_layout(tokens, i, LayoutBreak) and not line_break {
+      let boundary = vector_get_in_bounds(next_break, i)
+      let segment = vector_get_in_bounds(prefix, boundary) - vector_get_in_bounds(prefix, i)
+      if column + segment > config.max_line_length() {
+        line_break = true
+        target_depth = if tok_has_layout(tokens, i, LayoutDeclarationBody) { depth }
+          else if tok_has_layout(tokens, i, LayoutMember) { layout_depth }
+          else { layout_depth + 1 }
+      } else { 0 }
+    } else { 0 }
+    let before_gap = buf_len(out)
+    formatter_append_gap(out, src, previous_end, start, tokens, previous, i, depth, top_level_role, target_depth, line_break, newline)
+    if formatter_gap_is_attached_trivia(buf_ptr(out), before_gap, buf_len(out)) {
+      line_indent = target_depth
+    } else { 0 }
     if end > start {
       bscopy(out, src + start, end - start, 0)
+    } else { 0 }
+    column = formatter_column_after(buf_ptr(out), before_gap, buf_len(out), column)
+    if vector_len(frames) > 0 and vector_get_in_bounds(frames, vector_len(frames) - 1).close == i {
+      vector_pop(frames)
+    } else { 0 }
+    if tok_has_layout(tokens, i, LayoutSignatureEnd) { signature_end = -1 } else { 0 }
+    if tok_has_layout(tokens, i, LayoutSignatureStart) {
+      signature_end = vector_get_in_bounds(signature_ends, i)
+    } else { 0 }
+    let close = vector_get_in_bounds(group_ends, i)
+    if close > i {
+      let extent = if tok_has_layout(tokens, i, LayoutParameters) and signature_end > close {
+        signature_end
+      } else { close + 1 }
+      let flat_end = vector_get_in_bounds(prefix, extent)
+      let remaining = flat_end - vector_get_in_bounds(prefix, i + 1)
+      let multiline = vector_get_in_bounds(lines, close) > vector_get_in_bounds(lines, i)
+      let nonempty = formatter_next_source_token(tokens, i + 1) != close
+      vector_push(frames, FormatterFrame {
+        close: close,
+        indent: if tok_has_layout(tokens, i, LayoutDeclarationBody) { depth } else { line_indent },
+        broken: nonempty and (multiline or column + remaining > config.max_line_length())
+      })
     } else { 0 }
     if end > previous_end { previous_end = end } else { 0 }
     if end > start and tok_tag(tokens, i) == 5 {
@@ -411,7 +602,8 @@ pub(package) fn formatter_tokens_equivalent(left_src: i64, left_tokens: i64, rig
     } else { 0 }
     if right_i < right_count and tok_tag(right_tokens, right_i) == 5 and tok_v1(right_tokens, right_i) == 13 and
         tok_end(right_tokens, right_i) == tok_span(right_tokens, right_i) and left_i < left_count and
-        (tok_syntax_role(left_tokens, left_i) == tok_syntax_role_top_level_import() or tok_syntax_role(left_tokens, left_i) == tok_syntax_role_top_level_decl()) {
+        tok_end(left_tokens, left_i) > tok_span(left_tokens, left_i) and
+        (tok_syntax_role(left_tokens, left_i) == tok_syntax_role_top_level_import() or tok_syntax_role(left_tokens, left_i) == tok_syntax_role_top_level_decl() or tok_has_layout(left_tokens, left_i, LayoutOptionalSeparator)) {
       right_i = right_i + 1
     } else { 0 }
     if left_i >= left_count or right_i >= right_count {
@@ -434,14 +626,22 @@ pub(package) fn formatter_tokens_equivalent(left_src: i64, left_tokens: i64, rig
 -- the caller while retaining only the fatal count needed for fail-closed
 -- emission.  Warnings and notes do not suppress otherwise valid output.
 pub(package) fn formatter_format_source(src: i64, n: i64, tt: i64) -[Diagnose]> FormatterResult {
+  formatter_format_source_with_config(src, n, tt, format_config.defaults())
+}
+
+pub(package) fn formatter_format_source_with_config(src: i64, n: i64, tt: i64, config: format_config.Config) -[Diagnose]> FormatterResult {
   ttable_register_source(tt, src, n, 0, 0)
   let source = Source { text: runtime_str_from_bytes_copy(src, n), identity: DiagnosticSourceBuffer(src) }
-  formatter_format_text(source)
+  formatter_format_text_with_config(source, config)
 }
 
 -- Parsing owns a local table and retained text. Formatting neither consumes
 -- nor mutates a caller's checking context; diagnostics keep its source identity.
 pub(package) fn formatter_format_text(source: Source) -[Diagnose]> FormatterResult {
+  formatter_format_text_with_config(source, format_config.defaults())
+}
+
+pub(package) fn formatter_format_text_with_config(source: Source, config: format_config.Config) -[Diagnose]> FormatterResult {
   let parser = WeftParser { table: ttable_new() }
   let errors = formatter_error_slot_new()
   let parsed = handle parser.parse(source.all()) {
@@ -478,7 +678,7 @@ pub(package) fn formatter_format_text(source: Source) -[Diagnose]> FormatterResu
         Diagnose.error("formatter: invalid lossless token range", src)
         FormatterFailure(1)
       } else {
-        let formatted = formatter_render_tokens(src, n, tokens)
+        let formatted = formatter_render_tokens_with_config(src, n, tokens, config)
         let formatted_src = __str_ptr(formatted)
         let formatted_len = __str_len(formatted)
         let formatted_tokens = lex(formatted_src, formatted_len)

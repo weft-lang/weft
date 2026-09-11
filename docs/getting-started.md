@@ -546,6 +546,28 @@ weft fmt --write app.weft
 weft doc deps/math/lib.weft
 ```
 
+Formatting targets **98 characters per line** by default, with two-space
+indentation. Long imports, parameter lists, effect sets, result types and calls
+wrap at syntax-aware boundaries. Override the width for one invocation with:
+
+```bash
+weft fmt --max-line-length 120 app.weft
+weft fmt --write --max-line-length 98 src/
+weft fmt --check --max-line-length 98 src/
+```
+
+The width must be a positive integer. It counts Unicode scalars, not UTF-8
+bytes; indivisible identifiers, string contents and preserved comments can
+exceed the target. Formatting preserves comments and the source's LF/CRLF
+convention and does not require imports to resolve or the program to type-check.
+Invalid syntax produces no replacement.
+
+Editor and automation clients use the same policy: pass `maxLineLength` in
+the LSP `textDocument/formatting` options, or `max_line_length` in the MCP
+`format_source` arguments. Omission selects 98. The standalone formatter accepts
+`--max-line-length N` as well. Width overrides are per request; no project
+configuration file is read.
+
 The same diagnostic catalogue is available as structured library data. Each
 entry keeps its code, class, summary and teaching explanation together.
 Append positions and the catalogue length use `usize`; a position outside

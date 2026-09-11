@@ -2213,6 +2213,7 @@ echo "  ok fmt_standalone_builds"
 "$tmp_tool_bin" < compiler/main.weft > "$tmp_bin" 2>"$tmp_err"
 assert_files_equal "fmt_standalone_shares_engine" "$tmp_bin" "$tmp_out"
 assert_equals "fmt_standalone_stderr_empty" "$(<"$tmp_err")" ""
+python3 test/tools/formatter_options.py "$WEFT" "$tmp_tool_bin"
 
 printf 'fn main() -> i64 { missing }\n' > "$tmp_src"
 fmt_out=$("$WEFT" fmt < "$tmp_src" 2>"$tmp_err")
@@ -2236,7 +2237,7 @@ fmt_check_usage_exit=$?
 set -e
 assert_equals "fmt_check_requires_paths" "$fmt_check_usage_exit" "1"
 assert_equals "fmt_check_usage_stdout_empty" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
-assert_contains "fmt_check_usage_is_actionable" "$(<"$tmp_err")" "usage: weft fmt (--check | --write) <path...>"
+assert_contains "fmt_check_usage_is_actionable" "$(<"$tmp_err")" "(--check | --write) <path...>"
 
 fmt_clean="$tmp_fmt_dir/clean.weft"
 fmt_dirty="$tmp_fmt_dir/dirty.weft"
@@ -2419,7 +2420,7 @@ set +e
 fmt_plain_multiple_exit=$?
 set -e
 assert_equals "fmt_plain_multiple_paths_require_mode" "$fmt_plain_multiple_exit" "1"
-assert_contains "fmt_plain_multiple_paths_show_usage" "$(<"$tmp_err")" "usage: weft fmt (--check | --write) <path...>"
+assert_contains "fmt_plain_multiple_paths_show_usage" "$(<"$tmp_err")" "(--check | --write) <path...>"
 
 printf '%s\n' 'extern fn placeholder(n: i64) -> i64 { n }' 'fn main() -> i64 { 42 }' > "$tmp_src"
 set +e
