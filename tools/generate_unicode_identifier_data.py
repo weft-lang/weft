@@ -80,7 +80,7 @@ def generate_source(properties: dict[str, list[tuple[int, int]]]) -> str:
     xid_start = encode_ranges(properties["XID_Start"])
     xid_continue = encode_ranges(properties["XID_Continue"])
     default_ignorable = encode_ranges(properties["Default_Ignorable_Code_Point"])
-    return f'''-- compiler/unicode_identifier_data.weft -- GENERATED; DO NOT EDIT
+    return f'''-- compiler/weft/unicode/identifier_data.weft -- GENERATED; DO NOT EDIT
 -- Unicode {UNICODE_VERSION}, UAX #31 identifier properties.
 -- Source: {DERIVED_CORE_PROPERTIES_URL}
 -- SHA-256: {DERIVED_CORE_PROPERTIES_SHA256}
@@ -153,7 +153,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=pathlib.Path("compiler/unicode_identifier_data.weft"),
+        default=pathlib.Path("compiler/weft/unicode/identifier_data.weft"),
     )
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()

@@ -185,7 +185,7 @@ run_tls_probe() {
 # every checkout marker. SDK selection belongs to the installed compiler.
 mkdir -p "$work/project/shadow/stdlib" "$work/project/shadow/runtime" "$work/project/shadow/compiler"
 printf '%s\n' '{"package":"weft","version":"0.1.0","weft":"0.1","dependencies":{}}' > "$work/project/shadow/weft.pkg"
-for marker in stdlib/test.weft runtime/syscall.weft compiler/unicode_identifier_data.weft stdlib/console.weft; do
+for marker in stdlib/test.weft runtime/syscall.weft compiler/main.weft stdlib/console.weft; do
   printf '%s\n' 'this source must never be loaded' > "$work/project/shadow/$marker"
 done
 cp "$project_root/examples/hello.weft" "$work/project/shadow/hello.weft"

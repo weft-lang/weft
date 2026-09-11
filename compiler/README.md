@@ -48,8 +48,7 @@ under `weft/`. Shared interpreters accept data: the Tree-sitter renderer consume
 a `SyntaxGrammar`; its command-line caller chooses the Weft syntax graph.
 
 Native and trust-sensitive relocations must remain bootstrappable from the
-checked-in root. Until that root knows their new exact paths, `macho.weft`,
-`object.weft`, and `source_registration.weft` remain at their old locations.
-The identifier table also remains at the old checkout-detection marker until
-the refreshed root uses `main.weft`. Remove those old locations and transition
-permissions after the canonical root refresh; do not retain compatibility APIs.
+checked-in root. Prepare new exact paths and refresh the root before moving a
+leaf that depends on them; then remove the old permissions with the move.
+Checkout detection uses `compiler/main.weft`, not a generated data file whose
+location changes with its owning namespace.
