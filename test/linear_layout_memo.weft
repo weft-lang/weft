@@ -1,0 +1,171 @@
+-- Closed subgraphs have context-independent layout facts. Recursive back-edges
+-- must remain provisional until their enclosing analysis resolves them.
+
+use compiler/weft/check/body.{*}
+use compiler/weft/check/table.{*}
+use compiler/types/algebra.{*}
+use compiler/storage.{*}
+use runtime/alloc.{alloc_zeroed, alloc_bump_mark, alloc_bump_restore_same_segment}
+use runtime/memory.{mem_store64_at}
+
+fn field(fields: i64, index: i64, start: i64, length: i64, ty: i64) -> nil {
+  mem_store64_at(fields, index * 24, start)
+  mem_store64_at(fields, index * 24 + 8, length)
+  mem_store64_at(fields, index * 24 + 16, ty)
+  nil
+}
+
+test "layout analysis shares completed copyable subgraphs across diamond edges" {
+  let source = __str_ptr("AaBbCcDdEeFfGgHhIiJjKkLlMmNnleftright")
+  let table = ttable_new()
+  let types = nlist_new()
+  let mut child = ty_i64()
+  for index in 0..14 {
+    let fields = alloc_zeroed(48)
+    field(fields, 0, 28, 4, child)
+    field(fields, 1, 32, 5, child)
+    ttable_add(table, source, index * 2, 2, 0, 2, fields, nlist_new())
+    child = ty_named(type_name_hash(source, index * 2, 2), ty_i64())
+    nlist_add(types, child)
+  }
+  let fact = typeck_linear_layout_type(table, child)
+  Test.assert_eq(
+    typeck_linear_layout_fact_decision(fact),
+    typeck_linear_layout_decision_copyable()
+  )
+  for index in 0..nlist_len(types) {
+    let cached = ttable_linear_layout_fact_lookup(table, nlist_get(types, index))
+    Test.assert_true(cached != 0)
+    Test.assert_eq(
+      typeck_linear_layout_fact_decision(cached),
+      typeck_linear_layout_decision_copyable()
+    )
+  }
+}
+
+test "a recursive back-edge is not published as a completed copyable fact" {
+  let source = __str_ptr("Nodenext")
+  let table = ttable_new()
+  let node = ty_named(type_name_hash(source, 0, 4), ty_i64())
+  let fields = alloc_zeroed(24)
+  field(fields, 0, 4, 4, node)
+  ttable_add(table, source, 0, 4, 0, 1, fields, nlist_new())
+  let stack = node_new(0, node, 0, 0, 0)
+  let provisional = typeck_linear_layout_type_inner(table, node, stack)
+  Test.assert_eq(
+    typeck_linear_layout_type_list_contains(typeck_linear_layout_state_cycles(provisional), node),
+    1
+  )
+  Test.assert_eq(ttable_linear_layout_fact_lookup(table, node), 0)
+  let closed = typeck_linear_layout_type(table, node)
+  Test.assert_eq(
+    typeck_linear_layout_fact_decision(closed),
+    typeck_linear_layout_decision_copyable()
+  )
+  Test.assert_eq(ttable_linear_layout_fact_lookup(table, node), closed)
+}
+
+test "open records retain back-edges from earlier copyable fields" {
+  let table = ttable_new()
+  let node = ty_named(type_name_hash(__str_ptr("Node"), 0, 4), ty_i64())
+  let fields = nlist_new()
+  nlist_add(fields, ty_record_field(1, node, 0, 0))
+  nlist_add(fields, ty_record_field(2, ty_i64(), 0, 0))
+  let record = ty_record(fields, 1)
+  let stack = node_new(0, node, 0, 0, 0)
+  let state = typeck_linear_layout_type_inner(table, record, stack)
+  Test.assert_eq(
+    typeck_linear_layout_type_list_contains(typeck_linear_layout_state_cycles(state), node),
+    1
+  )
+  Test.assert_eq(ttable_linear_layout_fact_lookup(table, record), 0)
+}
+
+test "subgraph memoization invalidates when a nominal definition becomes available" {
+  let source = __str_ptr("WrapchildFuturetoken")
+  let table = ttable_new()
+  let future = ty_named(type_name_hash(source, 9, 6), ty_i64())
+  let wrap = ty_named(type_name_hash(source, 0, 4), ty_i64())
+  let fields = alloc_zeroed(24)
+  field(fields, 0, 4, 5, future)
+  ttable_add(table, source, 0, 4, 0, 1, fields, nlist_new())
+  Test.assert_eq(
+    typeck_linear_layout_fact_decision(typeck_linear_layout_type(table, wrap)),
+    typeck_linear_layout_decision_copyable()
+  )
+  Test.assert_true(ttable_linear_layout_fact_lookup(table, future) != 0)
+  let resource_fields = alloc_zeroed(24)
+  field(resource_fields, 0, 15, 5, ty_owned(ty_named(88, ty_i64())))
+  ttable_add(table, source, 9, 6, 0, 1, resource_fields, nlist_new())
+  Test.assert_eq(ttable_linear_layout_fact_lookup(table, future), 0)
+  Test.assert_eq(
+    typeck_linear_layout_fact_decision(typeck_linear_layout_type(table, wrap)),
+    typeck_linear_layout_decision_linear()
+  )
+}
+
+test "scratch rollback removes nested memo entries without losing persistent facts" {
+  let table = ttable_new()
+  let persistent = typeck_linear_layout_type(table, ty_i64())
+  let mark = alloc_bump_mark()
+  let checkpoint = ttable_scratch_facts_checkpoint(table)
+  let child = ty_named(987654, ty_i64())
+  let fields = nlist_new()
+  nlist_add(fields, ty_record_field(1, child, 0, 0))
+  typeck_linear_layout_type(table, ty_record(fields, 0))
+  Test.assert_true(ttable_linear_layout_fact_lookup(table, child) != 0)
+  ttable_scratch_facts_restore(table, checkpoint)
+  Test.assert_eq(ttable_linear_layout_fact_lookup(table, child), 0)
+  Test.assert_eq(ttable_linear_layout_fact_lookup(table, ty_i64()), persistent)
+  alloc_bump_restore_same_segment(mark)
+}
+
+test "copyable generic substitutions cannot hide resource-bearing substitutions" {
+  let source = __str_ptr("BoxvalueT")
+  let table = ttable_new()
+  let params = nlist_new()
+  nlist_add(params, node_new(2, 8, 1, 0, 0))
+  let fields = alloc_zeroed(24)
+  field(fields, 0, 3, 5, ty_var(0))
+  ttable_add(table, source, 0, 3, 0, 1, fields, params)
+  let copyable_args = nlist_new()
+  nlist_add(copyable_args, ty_i64())
+  let linear_args = nlist_new()
+  nlist_add(linear_args, ty_owned(ty_named(9876, ty_i64())))
+  let hash = type_name_hash(source, 0, 3)
+  let copyable = ty_named_app(hash, ty_i64(), copyable_args)
+  let resource = ty_named_app(hash, ty_i64(), linear_args)
+  for ty in [copyable, resource, copyable, resource] {
+    let fact = typeck_linear_layout_type(table, ty)
+    let expected = if ty == copyable { typeck_linear_layout_decision_copyable() }
+    else { typeck_linear_layout_decision_linear() }
+    Test.assert_eq(typeck_linear_layout_fact_decision(fact), expected)
+  }
+}
+
+test "mutual resource recursion remains rejected in either query order" {
+  for reverse in [false, true] {
+    let source = __str_ptr("ABnexttoken")
+    let table = ttable_new()
+    let first = ty_named(type_name_hash(source, 0, 1), ty_i64())
+    let second = ty_named(type_name_hash(source, 1, 1), ty_i64())
+    let first_fields = alloc_zeroed(24)
+    field(first_fields, 0, 2, 4, second)
+    ttable_add(table, source, 0, 1, 0, 1, first_fields, nlist_new())
+    let second_fields = alloc_zeroed(48)
+    field(second_fields, 0, 2, 4, first)
+    field(second_fields, 1, 6, 5, ty_owned(ty_named(9876, ty_i64())))
+    ttable_add(table, source, 1, 1, 0, 2, second_fields, nlist_new())
+    for ty in if reverse { [second, first] } else { [first, second] } {
+      let fact = typeck_linear_layout_type(table, ty)
+      Test.assert_eq(
+        typeck_linear_layout_fact_decision(fact),
+        typeck_linear_layout_decision_unsupported()
+      )
+      Test.assert_eq(
+        typeck_linear_layout_fact_reason(fact),
+        typeck_linear_layout_reason_recursive()
+      )
+    }
+  }
+}
