@@ -188,6 +188,29 @@ context it defaults to `i64`. Out-of-range literals are rejected. Prefixes are
 lowercase, and separators belong between digits: `0x_FF`, `1__000` and `1e+_2`
 are invalid. Tuple positions use plain decimal labels, such as `pair.0`.
 
+## Strings and interpolation
+
+Plain strings are always literal, including their braces. Prefix the opening
+quote with `i` when a string embeds expressions:
+
+```weft test
+test "interpolation is explicit" {
+  let name = "Weft"
+  Test.assert_str_eq("{name}", "{name}")
+  Test.assert_str_eq(i"Hello, {name}!", "Hello, Weft!")
+  Test.assert_str_eq(i"result: {{{20 + 22}}}", "result: {42}")
+}
+```
+
+Inside an interpolated string, a single `{` starts one Weft expression and its
+balanced `}` ends it. Nested blocks, records, strings, and line comments are
+scanned using their normal lexical structure. Embedded expressions run once
+from left to right and must implement `Display`.
+
+Write `{{` or `}}` for a literal brace in the surrounding text. A single
+unmatched `}` is rejected. `\{` and `\}` are deliberately not alternate
+escapes; doubled braces are the one spelling.
+
 ## Naming types
 
 Use an alias when a type expression deserves a name:

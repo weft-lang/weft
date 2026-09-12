@@ -76,6 +76,7 @@ if [ "$mode" = all ] || [ "$mode" = queries ]; then
     '  let local = input' \
     '  local.value' \
     '}' \
+    'fn query_interpolation(value: i64) -> str { i"value {{ {value} }}" }' \
     'effect Cell<T> { fn get() -> T }' \
     'pub implements<T> Cell<T>(initial: T) {' \
     '  Cell<T>.get() -> resume(initial)' \
@@ -94,6 +95,9 @@ if [ "$mode" = all ] || [ "$mode" = queries ]; then
   grep -q -- 'keyword.*text: `implements`' "$highlight_output"
   grep -q -- 'keyword.*text: `default`' "$highlight_output"
   grep -q -- 'module.*text: `state`' "$highlight_output"
+  grep -q -- 'string.*text: `i"`' "$highlight_output"
+  grep -q -- 'string.escape.*text: `{{`' "$highlight_output"
+  grep -q -- 'punctuation.special.*text: `{`' "$highlight_output"
 
   "$tree_sitter" query \
     --lib-path "$parser" \
@@ -130,5 +134,24 @@ if [ "$mode" = all ] || [ "$mode" = rejections ]; then
     fi
     test ! -s "$work_dir/formatted.weft"
     grep -Fq 'error[E0002]' "$work_dir/diagnostic.txt"
+  done
+
+  for fixture in interp_unterminated_expression interp_unmatched_close \
+    interp_backslash_brace interp_backslash_close_brace \
+    interp_empty_expression interp_multiple_expressions; do
+    source="$repo_root/test/negative/$fixture.weft"
+    if "$tree_sitter" parse --lib-path "$parser" --lang-name weft --quiet \
+      "$source" > "$work_dir/rejection.txt" 2>&1; then
+      echo "tree-sitter-weft: accepted invalid interpolation in $fixture" >&2
+      exit 1
+    fi
+    grep -Eq 'ERROR|MISSING' "$work_dir/rejection.txt"
+    if (cd "$repo_root" && "$weft" fmt "$source") \
+      > "$work_dir/formatted.weft" 2> "$work_dir/diagnostic.txt"; then
+      echo "weft: accepted invalid interpolation in $fixture" >&2
+      exit 1
+    fi
+    test ! -s "$work_dir/formatted.weft"
+    grep -Eq 'error\[E000[12]\]' "$work_dir/diagnostic.txt"
   done
 fi

@@ -12,6 +12,12 @@
 (integer) @number
 (float) @number.float
 (string) @string
+(interpolated_string
+  "i\"" @string
+  "\"" @string)
+(interpolated_string_text) @string
+(interpolated_string ["{{" "}}"] @string.escape)
+(interpolation ["{" "}"] @punctuation.special)
 (boolean) @boolean
 (nil_literal) @constant.builtin
 (nil_pattern) @constant.builtin

@@ -1243,6 +1243,8 @@ check_rejects "interp_display_missing_impl" "test/negative/interp_display_missin
 check_rejects "interp_unbound_identifier" "test/negative/interp_unbound_identifier.weft" "unknown identifier 'missing'" 1
 check_rejects "interp_unterminated_expression" "test/negative/interp_unterminated_expression.weft" "interpolation expression is not terminated before end of string" 1
 check_rejects "interp_unmatched_close" "test/negative/interp_unmatched_close.weft" "single '}' is not valid in an interpolated string" 1
+check_rejects "interp_backslash_brace" "test/negative/interp_backslash_brace.weft" "backslash does not escape interpolation braces" 1
+check_rejects "interp_backslash_close_brace" "test/negative/interp_backslash_close_brace.weft" "backslash does not escape interpolation braces" 1
 check_rejects "interp_empty_expression" "test/negative/interp_empty_expression.weft" "expected expression" 1
 check_rejects "interp_multiple_expressions" "test/negative/interp_multiple_expressions.weft" "interpolation must contain exactly one expression" 1
 check_rejects "typed_match_untagged_union" "test/negative/typed_match_untagged_union.weft" "error[E1006]"
