@@ -5827,8 +5827,9 @@ assert_contains "package_root_can_explicitly_grant_transitive_binding" "$pkg_tru
 # Package export discovery is deterministic metadata over ordinary public
 # declarations. The repository manifest is the first package-root fixture.
 pkg_exports_out=$("$WEFT" pkg exports 2>&1)
-assert_contains "pkg_exports_reports_first_party_sql_grammar" "$pkg_exports_out" '"sql":{"module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"runtime"}'
-assert_contains "pkg_exports_reports_first_party_einsum_grammar" "$pkg_exports_out" '"einsum":{"module":"stdlib/grammar/einsum","declaration":"EinsumGrammar","execution":"runtime"}'
+assert_contains "pkg_exports_reports_first_party_sql_grammar" "$pkg_exports_out" '"sql":{"module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"runtime","tooling":"stdlib/grammar/sql/tooling"}'
+assert_contains "pkg_exports_reports_first_party_einsum_grammar" "$pkg_exports_out" '"einsum":{"module":"stdlib/grammar/einsum","declaration":"EinsumGrammar","execution":"runtime","tooling":"stdlib/grammar/einsum/tooling"}'
+assert_contains "pkg_exports_reports_legacy_sql_alias_export" "$pkg_exports_out" '"mini_sql":{"module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"runtime","tooling":"stdlib/grammar/sql/tooling"}'
 assert_contains "pkg_exports_reports_ast_tool" "$pkg_exports_out" '"ast":{"module":"tools/ast","declaration":"main"}'
 assert_contains "pkg_exports_reports_check_tool" "$pkg_exports_out" '"check":{"module":"tools/check","declaration":"main"}'
 assert_contains "pkg_exports_reports_fmt_tool" "$pkg_exports_out" '"fmt":{"module":"tools/fmt","declaration":"main"}'
