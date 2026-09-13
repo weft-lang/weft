@@ -1,0 +1,752 @@
+-- The grammar tool driver end to end: export resolution through manifests,
+-- generated driver products, and the weft-grammar-tool/1 exchange over an
+-- interactive child session in every request mode and failure mode.
+
+use compiler/grammar/tool.{*}
+use compiler/pipeline.{pipeline_check_source}
+use compiler/weft/products.{TypedModule}
+use compiler/backend/target.{native_link_target_host}
+use compiler/weft/check/host_types as host_types
+use runtime/alloc.{alloc_zeroed}
+use runtime/memory.{mem_copy, mem_store64_at}
+use runtime/process as process_handler
+use runtime/source_acquire.{SourceAcquire, source_acquire_with_checkout}
+use runtime/string.{runtime_str_cstring}
+use runtime/syscall.{sys_close, sys_open_write_create_truncate, sys_remove, sys_write}
+use runtime/time as platform_time
+use stdlib/bytes as bytes
+use stdlib/diagnostic as diagnostic_impl
+use stdlib/diagnostic/schema.{*}
+use stdlib/grammar.{Checked, CheckRejected}
+use stdlib/grammar/tooling.{*}
+use stdlib/grammar/tooling/conformance.{
+  ParseOutcomeParsed,
+  ParseOutcomeRecovered,
+  ParseOutcomeRejected
+}
+use stdlib/grammar/tooling/protocol.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option.{Option, Some, None}
+use stdlib/path as path
+use stdlib/path.{Path}
+use stdlib/process.{Proc}
+use stdlib/result.{Result, Ok, Err}
+use stdlib/semantic_type.{*}
+use stdlib/num
+use stdlib/string.{str_concat, str_eq}
+use stdlib/time as time
+use stdlib/time/monotonic as monotonic
+use stdlib/time/monotonic.{Instant}
+use stdlib/typecheck.{*}
+
+fn test_cstr(value: str) -> i64 {
+  let result = alloc_zeroed(__str_len(value) + 1)
+  mem_copy(result, __str_ptr(value), __str_len(value))
+  result
+}
+
+fn test_argv() -> i64 {
+  let argv = alloc_zeroed(24)
+  mem_store64_at(argv, 0, 0)
+  mem_store64_at(argv, 8, test_cstr("PATH=/usr/bin:/bin"))
+  mem_store64_at(argv, 16, 0)
+  argv
+}
+
+fn with_platform<T>(body: () -[Proc, SourceAcquire, Test]> T) -[Test]> T {
+  with process_handler(0, test_argv()) { source_acquire_with_checkout(".", body) }
+}
+
+fn deadline_in(millis: i64) -> Instant {
+  platform_time.with_platform(() => monotonic.now()).add(time.milliseconds(millis))
+}
+
+fn toy_export() -> GrammarToolExport {
+  GrammarToolExport {
+    package_name: "weft",
+    version: "0.1.0",
+    export: "toy_assignments",
+    module: "module_fixtures/toy_grammar",
+    declaration: "AssignmentGrammar",
+    tooling: Some<str>("module_fixtures/toy_grammar")
+  }
+}
+
+fn plain_export() -> GrammarToolExport {
+  GrammarToolExport {
+    package_name: "weft",
+    version: "0.1.0",
+    export: "toy_words",
+    module: "module_fixtures/plain_grammar",
+    declaration: "WordGrammar",
+    tooling: None<str>()
+  }
+}
+
+fn request_for(export: GrammarToolExport, text: str, context: ToolContext) -> ToolRequest {
+  ToolRequest {
+    grammar: grammar_tool_identity(export),
+    source_name: "embedded",
+    source_text: text,
+    context: context
+  }
+}
+
+fn fixture_path(text: str) -> Path { path.from_utf8(text).unwrap() }
+
+fn product_of(result: GrammarToolProduct) -> str {
+  match result {
+    GrammarToolProductReady(product) -> product
+    GrammarToolProductFailed(message) -> str_concat("<failed: ", str_concat(message, ">"))
+  }
+}
+
+-- The typed module owns the table and the retained source the host
+-- handler reads; destructuring inside the arm keeps it alive for the body.
+fn with_host(
+  text: str,
+  body: (i64, i64) -[Proc, SourceAcquire, Test]> nil
+) -[Proc, SourceAcquire, Test]> nil {
+  match pipeline_check_source(__str_ptr(text), __str_len(text)) {
+    Checked(TypedModule(fns, src, tt, owners)) -> body(tt, src)
+    CheckRejected -> { Test.assert_true(false); nil }
+  }
+}
+
+fn answered(exchange: GrammarToolExchange) -> Option<ToolResponse> {
+  match exchange {
+    GrammarToolAnswered(response) -> Some<ToolResponse>(response)
+    GrammarToolFailed(_) -> None<ToolResponse>()
+  }
+}
+
+fn failure_of(exchange: GrammarToolExchange) -> str {
+  match exchange {
+    GrammarToolAnswered(_) -> "<answered>"
+    GrammarToolFailed(failure) -> grammar_tool_failure_message(failure)
+  }
+}
+
+fn primary_range(diagnostic: Diagnostic, name: str, start: i64, end: i64) -> bool {
+  match diagnostic.primary() {
+    DiagnosticSourceRange(DiagnosticSourceNamed(actual), actual_start, actual_end) ->
+      str_eq(actual, name) == 1 and actual_start == __i64_to_usize(start) and actual_end ==
+      __i64_to_usize(end)
+    _ -> false
+  }
+}
+
+fn write_script(name: str, body: str) -> str {
+  let product_path = str_concat(
+    grammar_tool_product_directory(native_link_target_host()),
+    str_concat("/", name)
+  )
+  let fd = sys_open_write_create_truncate(runtime_str_cstring(product_path), 448)
+  let text = str_concat("#!/bin/sh\n", body)
+  sys_write(fd, __str_ptr(text), __str_len(text))
+  sys_close(fd)
+  product_path
+}
+
+test "grammar exports resolve through the manifests in scope" {
+  with_platform<nil>(
+    () => {
+      match grammar_tool_resolve("sql") {
+        GrammarToolResolved(export) -> {
+          Test.assert_str_eq(export.package_name, "weft")
+          Test.assert_str_eq(export.export, "sql")
+          Test.assert_str_eq(export.module, "stdlib/grammar/sql")
+          Test.assert_str_eq(export.declaration, "SqlGrammar")
+          Test.assert_true(
+            match export.tooling {
+              Some(tooling) -> str_eq(tooling, "stdlib/grammar/sql/tooling") == 1,
+              None -> false
+            }
+          )
+        }
+        _ -> Test.assert_true(false)
+      }
+      match grammar_tool_resolve("weft/mini_sql") {
+        GrammarToolResolved(export) -> {
+          Test.assert_str_eq(export.export, "mini_sql")
+          Test.assert_str_eq(export.module, "stdlib/grammar/sql")
+        }
+        _ -> Test.assert_true(false)
+      }
+      match grammar_tool_resolve("einsum") {
+        GrammarToolResolved(export) -> Test.assert_true(
+          match export.tooling {
+            Some(tooling) -> str_eq(tooling, "stdlib/grammar/einsum/tooling") == 1,
+            None -> false
+          }
+        )
+        _ -> Test.assert_true(false)
+      }
+      Test.assert_true(
+        match grammar_tool_resolve("no_such_grammar") { GrammarToolUnknown -> true, _ -> false }
+      )
+      Test.assert_true(
+        match grammar_tool_resolve("elsewhere/sql") { GrammarToolUnknown -> true, _ -> false }
+      )
+      Test.assert_true(match grammar_tool_resolve("") { GrammarToolUnknown -> true, _ -> false })
+      nil
+    }
+  )
+}
+
+test "generated driver source imports only the export and the public driver surfaces" {
+  let full = grammar_tool_driver_source(toy_export())
+  Test.assert_true(full.contains("use module_fixtures/toy_grammar.{AssignmentGrammar}\n"))
+  Test.assert_true(full.contains("use stdlib/grammar/tooling/driver as driver\n"))
+  Test.assert_true(full.contains("use runtime/file_read as file_read_handler\n"))
+  Test.assert_true(full.contains("driver.serve(\n"))
+  Test.assert_true(full.contains("conformance.host_check(AssignmentGrammar(), syntax)"))
+  Test.assert_true(not full.contains("tooling_conformance"))
+  let sql_source = grammar_tool_driver_source(
+    GrammarToolExport {
+      package_name: "weft",
+      version: "0.1.0",
+      export: "sql",
+      module: "stdlib/grammar/sql",
+      declaration: "SqlGrammar",
+      tooling: Some<str>("stdlib/grammar/sql/tooling")
+    }
+  )
+  Test.assert_true(sql_source.contains("use stdlib/grammar/sql/tooling as tooling_conformance\n"))
+  Test.assert_true(sql_source.contains("SqlGrammar().parse(source)"))
+  let parse_only = grammar_tool_driver_source(plain_export())
+  Test.assert_true(
+    parse_only.contains("driver.serve_parse_only((source) => WordGrammar().parse(source))")
+  )
+  Test.assert_true(not parse_only.contains("file_read_handler"))
+  Test.assert_true(not parse_only.contains("conformance"))
+}
+
+test "driver products build once and are reused while their inputs are unchanged" {
+  with_platform<nil>(
+    () => {
+      let target = native_link_target_host()
+      let first = product_of(grammar_tool_ensure_product(toy_export(), target, "test"))
+      Test.assert_str_eq(first, grammar_tool_product_path(toy_export(), target, "test"))
+      Test.assert_true(first.contains("target/"))
+      Test.assert_true(first.contains("/grammar-tools/weft-toy_assignments"))
+      -- The stamp makes the second call a reuse: corrupting it forces a rebuild.
+      let stamp = str_concat(first, ".stamp.json")
+      let fd = sys_open_write_create_truncate(runtime_str_cstring(stamp), 420)
+      let stale = "{\"protocol\":\"weft-grammar-tool/1\",\"compiler\":\"other\",\"driver\":\"\",\"sources\":[]}"
+      sys_write(fd, __str_ptr(stale), __str_len(stale))
+      sys_close(fd)
+      let second = product_of(grammar_tool_ensure_product(toy_export(), target, "test"))
+      Test.assert_str_eq(second, first)
+      let parse_only = product_of(grammar_tool_ensure_product(plain_export(), target, "test"))
+      Test.assert_true(parse_only.contains("/grammar-tools/weft-toy_words"))
+      let broken = GrammarToolExport {
+        package_name: "weft",
+        version: "0.1.0",
+        export: "broken",
+        module: "module_fixtures/plain_grammar",
+        declaration: "NoSuchGrammar",
+        tooling: None<str>()
+      }
+      match grammar_tool_ensure_product(broken, target, "test") {
+        GrammarToolProductFailed(message) -> Test.assert_true(message.contains("did not check"))
+        GrammarToolProductReady(_) -> Test.assert_true(false)
+      }
+      nil
+    }
+  )
+}
+
+test "a parse only request answers without any check" {
+  with_platform<nil>(
+    () => {
+      let product = product_of(
+        grammar_tool_ensure_product(toy_export(), native_link_target_host(), "test")
+      )
+      match answered(
+        grammar_tool_exchange_without_host(
+          product,
+          request_for(toy_export(), "count = 3", ToolNoContext),
+          deadline_in(20000)
+        )
+      ) {
+        Some(response) -> {
+          Test.assert_true(match response.parse { ParseOutcomeParsed -> true, _ -> false })
+          Test.assert_true(match response.check { ToolCheckNotRequested -> true, _ -> false })
+          Test.assert_eq_usize(response.diagnostics.len(), __i64_to_usize(0))
+          Test.assert_true(same_grammar(response.grammar, grammar_tool_identity(toy_export())))
+        }
+        None -> Test.assert_true(false)
+      }
+      match answered(
+        grammar_tool_exchange_without_host(
+          product,
+          request_for(toy_export(), "count 3", ToolNoContext),
+          deadline_in(20000)
+        )
+      ) {
+        Some(response) -> {
+          Test.assert_true(match response.parse { ParseOutcomeRejected -> true, _ -> false })
+          match response.diagnostics {
+            Cons(diagnostic, Nil) -> Test.assert_true(primary_range(diagnostic, "embedded", 6, 7))
+            _ -> Test.assert_true(false)
+          }
+        }
+        None -> Test.assert_true(false)
+      }
+      -- The export without a tooling module refuses every check structurally.
+      let words = product_of(
+        grammar_tool_ensure_product(plain_export(), native_link_target_host(), "test")
+      )
+      match answered(
+        grammar_tool_exchange_without_host(
+          words,
+          request_for(
+            plain_export(),
+            "hello",
+            ToolFileContext(
+              fixture_path("test/fixtures/comptime_sql_schema_v1.json"),
+              __i64_to_usize(4096)
+            )
+          ),
+          deadline_in(20000)
+        )
+      ) {
+        Some(response) -> Test.assert_true(
+          match response.check { ToolCheckRefusedNoTooling -> true, _ -> false }
+        )
+        None -> Test.assert_true(false)
+      }
+      nil
+    }
+  )
+}
+
+fn check_name(check: ToolCheckOutcome) -> str {
+  match check {
+    ToolCheckNotRequested -> "not_requested"
+    ToolChecked -> "checked"
+    ToolCheckRejected -> "rejected"
+    ToolCheckUnsupported(GrammarHostTypesContext) -> "unsupported host"
+    ToolCheckUnsupported(GrammarFileContext) -> "unsupported file"
+    ToolContextUnavailable -> "context unavailable"
+    ToolCheckRefusedNoTooling -> "refused no tooling"
+    ToolCheckRefusedParseNotAccepted -> "refused parse"
+  }
+}
+
+fn range_name(location: DiagnosticLocation) -> str {
+  match location {
+    DiagnosticSourceRange(DiagnosticSourceNamed(name), start, end) ->
+      str_concat(
+        name,
+        str_concat(
+          ":",
+          str_concat(
+            __u64_to_i64(__usize_to_u64(start)).to_str(),
+            str_concat("..", __u64_to_i64(__usize_to_u64(end)).to_str())
+          )
+        )
+      )
+    DiagnosticSourceRange(DiagnosticSourceBuffer(buffer), start, end) ->
+      str_concat(
+        "buffer ",
+        str_concat(
+          buffer.to_str(),
+          str_concat(
+            ":",
+            str_concat(
+              __u64_to_i64(__usize_to_u64(start)).to_str(),
+              str_concat("..", __u64_to_i64(__usize_to_u64(end)).to_str())
+            )
+          )
+        )
+      )
+    _ -> "none"
+  }
+}
+
+-- One line per response: the check outcome and each diagnostic's message
+-- and range, so a failing assertion names the divergence.
+fn describe(exchange: GrammarToolExchange) -> str {
+  match exchange {
+    GrammarToolFailed(failure) -> str_concat("failed: ", grammar_tool_failure_message(failure))
+    GrammarToolAnswered(response) -> {
+      let items = response.diagnostics.map<str>(
+        (diagnostic: Diagnostic) => str_concat(
+          " | ",
+          str_concat(diagnostic.message(), str_concat(" @ ", range_name(diagnostic.primary())))
+        )
+      )
+      str_concat(
+        check_name(response.check),
+        items.fold<str>("", (acc: str, item: str) => str_concat(acc, item))
+      )
+    }
+  }
+}
+
+test "host type queries are answered through the compiler with session tokens" {
+  with_platform<nil>(
+    () => {
+      let product = product_of(
+        grammar_tool_ensure_product(toy_export(), native_link_target_host(), "test")
+      )
+      with_host(
+        "type settings { count: i64, label: str }\nfn main() -> i64 { 0 }",
+        (tt: i64, src: i64) => {
+          Test.assert_true(tt != 0)
+          Test.assert_str_eq(
+            describe(
+              grammar_tool_exchange_with_host(
+                product,
+                request_for(toy_export(), "count = 3", ToolHostContext),
+                tt,
+                src,
+                deadline_in(20000)
+              )
+            ),
+            "checked"
+          )
+          Test.assert_str_eq(
+            describe(
+              grammar_tool_exchange_with_host(
+                product,
+                request_for(toy_export(), "label = \"x\"", ToolHostContext),
+                tt,
+                src,
+                deadline_in(20000)
+              )
+            ),
+            "checked"
+          )
+          let mismatch = grammar_tool_exchange_with_host(
+            product,
+            request_for(toy_export(), "count = \"x\"", ToolHostContext),
+            tt,
+            src,
+            deadline_in(20000)
+          )
+          Test.assert_str_eq(
+            describe(mismatch),
+            "rejected | the literal does not match the field type @ embedded:8..11"
+          )
+          match mismatch {
+            GrammarToolAnswered(response) -> match response.diagnostics {
+              Cons(diagnostic, _) -> Test.assert_str_eq(
+                range_name(grammar_tool_anchor(diagnostic, "embedded", 4096).primary()),
+                "buffer 4096:8..11"
+              )
+              _ -> Test.assert_true(false)
+            }
+            _ -> Test.assert_true(false)
+          }
+          Test.assert_str_eq(
+            describe(
+              grammar_tool_exchange_with_host(
+                product,
+                request_for(toy_export(), "other = 1", ToolHostContext),
+                tt,
+                src,
+                deadline_in(20000)
+              )
+            ),
+            "rejected | settings has no field with this name @ embedded:0..5"
+          )
+          nil
+        }
+      )
+      with_host(
+        "fn main() -> i64 { 0 }",
+        (bare_tt: i64, bare_src: i64) => {
+          Test.assert_str_eq(
+            describe(
+              grammar_tool_exchange_with_host(
+                product,
+                request_for(toy_export(), "count = 3", ToolHostContext),
+                bare_tt,
+                bare_src,
+                deadline_in(20000)
+              )
+            ),
+            "rejected | the host declares no settings record @ embedded:0..5"
+          )
+          nil
+        }
+      )
+      -- A host request without host types is a failed exchange, never a guess.
+      Test.assert_str_eq(
+        describe(
+          grammar_tool_exchange_without_host(
+            product,
+            request_for(toy_export(), "count = 3", ToolHostContext),
+            deadline_in(20000)
+          )
+        ),
+        "failed: grammar tool driver raised a host type query without host types"
+      )
+      nil
+    }
+  )
+}
+
+test "file contexts are checked by the grammar with observed inputs reported" {
+  with_platform<nil>(
+    () => {
+      let export = match grammar_tool_resolve("sql") {
+        GrammarToolResolved(found) -> found,
+        _ -> toy_export()
+      }
+      let product = product_of(
+        grammar_tool_ensure_product(export, native_link_target_host(), "test")
+      )
+      let schema = fixture_path("test/fixtures/comptime_sql_schema_v1.json")
+      let context = ToolFileContext(schema, __i64_to_usize(4096))
+      match answered(
+        grammar_tool_exchange_without_host(
+          product,
+          request_for(export, "select id from users", context),
+          deadline_in(30000)
+        )
+      ) {
+        Some(response) -> {
+          Test.assert_true(match response.check { ToolChecked -> true, _ -> false })
+          match response.observed_inputs {
+            Cons(input, Nil) -> {
+              Test.assert_true(input.path.eq(schema))
+              Test.assert_eq_usize(input.limit, __i64_to_usize(4096))
+              Test.assert_true(
+                match input.outcome {
+                  ToolObservedContent(size, digest) -> size == __i64_to_usize(66) and
+                    digest.starts_with("sha256:02155a1e"),
+                  _ -> false
+                }
+              )
+            }
+            _ -> Test.assert_true(false)
+          }
+        }
+        None -> Test.assert_true(false)
+      }
+      match answered(
+        grammar_tool_exchange_without_host(
+          product,
+          request_for(export, "select missing from users", context),
+          deadline_in(30000)
+        )
+      ) {
+        Some(response) -> {
+          Test.assert_true(match response.check { ToolCheckRejected -> true, _ -> false })
+          Test.assert_true(
+            match response.diagnostics {
+              Cons(diagnostic, _) -> primary_range(diagnostic, "embedded", 7, 14),
+              _ -> false
+            }
+          )
+        }
+        None -> Test.assert_true(false)
+      }
+      let missing = ToolFileContext(
+        fixture_path("test/fixtures/no_such_schema.json"),
+        __i64_to_usize(4096)
+      )
+      match answered(
+        grammar_tool_exchange_without_host(
+          product,
+          request_for(export, "select id from users", missing),
+          deadline_in(30000)
+        )
+      ) {
+        Some(response) -> {
+          Test.assert_true(match response.check { ToolContextUnavailable -> true, _ -> false })
+          Test.assert_eq_usize(response.diagnostics.len(), __i64_to_usize(1))
+          Test.assert_true(
+            match response.observed_inputs {
+              Cons(input, Nil) -> match input.outcome {
+                ToolObservedFailure(name) -> str_eq(name, "not_found") == 1,
+                _ -> false
+              },
+              _ -> false
+            }
+          )
+        }
+        None -> Test.assert_true(false)
+      }
+      match answered(
+        grammar_tool_exchange_without_host(
+          product,
+          request_for(export, "select + from users", context),
+          deadline_in(30000)
+        )
+      ) {
+        Some(response) -> {
+          Test.assert_true(match response.parse { ParseOutcomeRecovered -> true, _ -> false })
+          Test.assert_true(
+            match response.check { ToolCheckRefusedParseNotAccepted -> true, _ -> false }
+          )
+        }
+        None -> Test.assert_true(false)
+      }
+      let toy = product_of(
+        grammar_tool_ensure_product(toy_export(), native_link_target_host(), "test")
+      )
+      match answered(
+        grammar_tool_exchange_without_host(
+          toy,
+          request_for(toy_export(), "count = 3", context),
+          deadline_in(20000)
+        )
+      ) {
+        Some(response) -> Test.assert_true(
+          match response.check { ToolCheckUnsupported(GrammarFileContext) -> true, _ -> false }
+        )
+        None -> Test.assert_true(false)
+      }
+      nil
+    }
+  )
+}
+
+test "a misbehaving driver product is a structured failure" {
+  with_platform<nil>(
+    () => {
+      grammar_tool_ensure_product(toy_export(), native_link_target_host(), "test")
+      let request = request_for(toy_export(), "count = 3", ToolNoContext)
+      let garbage = write_script("fake-garbage", "echo not json\n")
+      Test.assert_true(
+        failure_of(grammar_tool_exchange_without_host(garbage, request, deadline_in(20000))).contains(
+          "not a JSON document"
+        )
+      )
+      let silent = write_script("fake-silent", "echo failing on purpose >&2\nexit 3\n")
+      Test.assert_true(
+        failure_of(grammar_tool_exchange_without_host(silent, request, deadline_in(20000))).contains(
+          "failing on purpose"
+        )
+      )
+      let slow = write_script("fake-slow", "sleep 30\n")
+      Test.assert_true(
+        failure_of(grammar_tool_exchange_without_host(slow, request, deadline_in(300))).contains(
+          "deadline"
+        )
+      )
+      let other = write_script(
+        "fake-other",
+        "echo '{\"response\":\"weft-grammar-tool/1\",\"grammar\":{\"package\":\"weft\",\"export\":\"other\",\"module\":\"m\",\"declaration\":\"D\"},\"parse\":\"parsed\",\"check\":\"not_requested\",\"diagnostics\":[],\"observed_inputs\":[]}'\n"
+      )
+      Test.assert_true(
+        failure_of(grammar_tool_exchange_without_host(other, request, deadline_in(20000))).contains(
+          "different grammar"
+        )
+      )
+      let querying = write_script(
+        "fake-query",
+        "echo '{\"query\":\"fields\",\"base\":1}'\nread reply\n"
+      )
+      Test.assert_true(
+        failure_of(grammar_tool_exchange_without_host(querying, request, deadline_in(20000))).contains(
+          "without host types"
+        )
+      )
+      Test.assert_true(
+        failure_of(
+          grammar_tool_exchange_without_host("target/no-such-driver", request, deadline_in(20000))
+        ).contains("could not be started")
+      )
+      sys_remove(runtime_str_cstring(garbage))
+      sys_remove(runtime_str_cstring(silent))
+      sys_remove(runtime_str_cstring(slow))
+      sys_remove(runtime_str_cstring(other))
+      sys_remove(runtime_str_cstring(querying))
+      nil
+    }
+  )
+}
+
+test "the token table issues session identities and refuses foreign ones" {
+  with_platform<nil>(
+    () => {
+      with_host(
+        "type settings { count: i64, label: str }\nfn main() -> i64 { 0 }",
+        (tt: i64, src: i64) => {
+          let tokens = grammar_tool_tokens()
+          let settings_name = TypeName {
+            qualifier: None<str>(),
+            name: "settings",
+            arguments: Nil<ToolTypeIdentity>()
+          }
+          let (resolved, count_field, listed, same, foreign_fields, foreign_subtype, missing) = host_types.run(
+            tt,
+            src,
+            () => (
+              grammar_tool_answer(tokens, ToolQueryResolve(settings_name)),
+              grammar_tool_answer(
+                tokens,
+                ToolQueryField(tool_type_identity(1), NamedTypeField("count"))
+              ),
+              grammar_tool_answer(tokens, ToolQueryFields(tool_type_identity(1))),
+              grammar_tool_answer(
+                tokens,
+                ToolQuerySubtype(tool_type_identity(1), tool_type_identity(1))
+              ),
+              grammar_tool_answer(tokens, ToolQueryFields(tool_type_identity(99))),
+              grammar_tool_answer(
+                tokens,
+                ToolQuerySubtype(tool_type_identity(1), tool_type_identity(0))
+              ),
+              grammar_tool_answer(
+                tokens,
+                ToolQueryResolve(
+                  TypeName {
+                    qualifier: None<str>(),
+                    name: "orders",
+                    arguments: Nil<ToolTypeIdentity>()
+                  }
+                )
+              )
+            )
+          )
+          -- A declared record resolves nominally; its shape comes from `fields`.
+          Test.assert_true(
+            match resolved {
+              ToolReplyType(value) -> tool_type_identity_token(value.identity) == 1 and (
+                match value.description {
+                  SemanticTypeNamed(name, _) -> str_eq(name, "settings") == 1,
+                  _ -> false
+                }
+              ),
+              _ -> false
+            }
+          )
+          Test.assert_true(
+            match count_field {
+              ToolReplyType(value) -> tool_type_identity_token(value.identity) == 2 and (
+                match value.description {
+                  SemanticTypePrimitive(name) -> str_eq(name, "i64") == 1,
+                  _ -> false
+                }
+              ),
+              _ -> false
+            }
+          )
+          Test.assert_true(
+            match listed {
+              ToolReplyFields(fields) -> fields.len() == __i64_to_usize(2),
+              _ -> false
+            }
+          )
+          Test.assert_true(match same { ToolReplyBool(true) -> true, _ -> false })
+          Test.assert_true(
+            match foreign_fields { ToolReplyError(ForeignTypeIdentity) -> true, _ -> false }
+          )
+          Test.assert_true(
+            match foreign_subtype { ToolReplyError(ForeignTypeIdentity) -> true, _ -> false }
+          )
+          Test.assert_true(match missing { ToolReplyError(TypeNotFound) -> true, _ -> false })
+          nil
+        }
+      )
+      nil
+    }
+  )
+}

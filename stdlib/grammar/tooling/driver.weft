@@ -1,0 +1,502 @@
+-- stdlib/grammar/tooling/driver.weft — the grammar tool driver runtime
+--
+-- A generated driver program installs standard input, standard output and
+-- the platform file reader, then hands its exported grammar to `serve` (or
+-- `serve_parse_only` for an export without a tooling module). This module
+-- speaks `weft-grammar-tool/1` over those streams: one request line in,
+-- any number of type-query lines out with one reply line back each, and one
+-- response line out. Diagnostics are collected as values and encoded once;
+-- the grammar's file reads are confined by the conformance suite and
+-- observed here so the compiler learns exactly what was consumed.
+
+use stdlib/bytes as bytes
+use stdlib/bytes.{Bytes, bytes_concat}
+use stdlib/comptime as comptime
+use stdlib/comptime.{ComptimeEvaluation, ComptimeFileObservation}
+use stdlib/console as console
+use stdlib/console.{ConsoleRead, ConsoleWrite, ConsoleStdout}
+use stdlib/diagnostic as diagnostic
+use stdlib/diagnostic/schema.{*}
+use stdlib/file.{FileRead}
+use stdlib/grammar.{ParseResult, Parsed, Recovered, Rejected}
+use stdlib/grammar/tooling.{*}
+use stdlib/grammar/tooling/conformance.{
+  ParseOutcome,
+  ParseOutcomeParsed,
+  ParseOutcomeRecovered,
+  ParseOutcomeRejected
+}
+use stdlib/grammar/tooling/protocol.{*}
+use stdlib/io/types.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option.{Option, Some, None}
+use stdlib/path.{Path}
+use stdlib/result.{Result, Ok, Err}
+use stdlib/source.{Source, Span}
+use stdlib/string.{str_concat}
+use stdlib/typecheck.{*}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push, vector_set}
+
+-- A one-slot cell gives handler clauses interior mutability across
+-- resumptions without a state effect of their own.
+type Cell<T> { CellValue(T) }
+
+fn cell_new<T>(initial: T) -> Vector<Cell<T>> {
+  let slot = vector.with_capacity<Cell<T>>(__i64_to_usize(1))
+  vector_push<Cell<T>>(slot, CellValue<T>(initial))
+  slot
+}
+
+fn cell_get<T>(slot: Vector<Cell<T>>) -> T {
+  match vector_get_in_bounds<Cell<T>>(slot, 0) { CellValue(value) -> value }
+}
+
+fn cell_put<T>(slot: Vector<Cell<T>>, value: T) -> nil {
+  vector_set<Cell<T>>(slot, 0, CellValue<T>(value))
+  nil
+}
+
+--- Buffered line input over standard input.
+pub type LineReader { pending: Vector<Cell<Bytes>> }
+
+--- Construct an empty line reader.
+pub fn line_reader() -> LineReader { LineReader { pending: cell_new<Bytes>(bytes.empty()) } }
+
+--- Why a line could not be read.
+pub type LineError {
+  LineIo(IoError),
+  LineNotUtf8
+}
+
+fn line_text(content: Bytes) -> Result<Option<str>, LineError> {
+  match content.to_utf8() {
+    Ok(text) -> Ok<Option<str>, LineError>(Some<str>(text))
+    Err(_) -> Err<Option<str>, LineError>(LineNotUtf8)
+  }
+}
+
+--- Read the next line without its newline; `None` at end of input. A final
+--- unterminated line is still a line.
+pub fn read_line(reader: LineReader) -[ConsoleRead]> Result<Option<str>, LineError> {
+  let newline: u8 = __u64_to_u8(10)
+  let mut done = false
+  let mut result = Ok<Option<str>, LineError>(None<str>())
+  while not done {
+    let pending = cell_get<Bytes>(reader.pending)
+    match pending.find(newline) {
+      Some(index) -> {
+        let line = pending.slice(__i64_to_usize(0), index).unwrap_or(bytes.empty())
+        let rest = pending.slice(index + __i64_to_usize(1), pending.len()).unwrap_or(
+          bytes.empty()
+        )
+        cell_put<Bytes>(reader.pending, rest)
+        result = line_text(line)
+        done = true
+      }
+      None -> match console.read_bytes(__i64_to_usize(4096)) {
+        Err(error) -> {
+          result = Err<Option<str>, LineError>(LineIo(error))
+          done = true
+        }
+        Ok(chunk) -> if chunk.is_empty() {
+          cell_put<Bytes>(reader.pending, bytes.empty())
+          result = if pending.is_empty() { Ok<Option<str>, LineError>(None<str>()) } else {
+            line_text(pending)
+          }
+          done = true
+        } else {
+          cell_put<Bytes>(reader.pending, bytes_concat(pending, chunk))
+        }
+      }
+    }
+  }
+  result
+}
+
+--- Write one document as a line on standard output and flush it.
+pub fn write_line(value: Json) -[ConsoleWrite]> Result<nil, IoError> {
+  match console.write_stdout(bytes.from_str(render_line(value))) {
+    Err(error) -> Err<nil, IoError>(error)
+    Ok(_) -> console.flush(ConsoleStdout)
+  }
+}
+
+-- Diagnostics are collected as values in report order.
+type DiagnosticSink { values: Vector<Diagnostic> }
+
+fn sink_new() -> DiagnosticSink { DiagnosticSink { values: vector.new<Diagnostic>() } }
+
+fn sink_record(sink: DiagnosticSink, value: Diagnostic) -> nil {
+  let values = sink.values
+  vector_push<Diagnostic>(values, value)
+  nil
+}
+
+fn sink_legacy(sink: DiagnosticSink, severity: DiagnosticSeverity, message: str) -> nil {
+  sink_record(
+    sink,
+    diagnostic.uncoded(severity, DiagnosticClassGrammar, message, DiagnosticLocationNone)
+  )
+}
+
+fn sink_list(sink: DiagnosticSink) -> List<Diagnostic> {
+  let values = sink.values
+  let mut reversed = Nil<Diagnostic>()
+  let mut index = 0
+  while index < vector_len<Diagnostic>(values) {
+    reversed = Cons(vector_get_in_bounds<Diagnostic>(values, index), reversed)
+    index = index + 1
+  }
+  reversed.reverse()
+}
+
+--- The wire name of an I/O error, for observed inputs that failed.
+pub fn io_error_name(error: IoError) -> str {
+  match error {
+    IoInterrupted -> "interrupted"
+    IoWouldBlock -> "would_block"
+    IoNotFound -> "not_found"
+    IoPermissionDenied -> "permission_denied"
+    IoAlreadyExists -> "already_exists"
+    IoWrongKind -> "wrong_kind"
+    IoInvalidPath -> "invalid_path"
+    IoPlatform(_) -> "platform"
+    IoLimitExceeded(_) -> "limit_exceeded"
+    IoUnexpectedEof(_) -> "unexpected_eof"
+    IoInvalidProgress -> "invalid_progress"
+  }
+}
+
+fn observed_input(observation: ComptimeFileObservation) -> ToolObservedInput {
+  ToolObservedInput {
+    path: observation.path,
+    limit: observation.limit,
+    outcome: match observation.outcome {
+      Ok(content) -> ToolObservedContent(content.len(), content_digest(content))
+      Err(error) -> ToolObservedFailure(io_error_name(error))
+    }
+  }
+}
+
+fn observed_inputs(observations: List<ComptimeFileObservation>) -> List<ToolObservedInput> {
+  observations.map<ToolObservedInput>(
+    (observation: ComptimeFileObservation) => observed_input(observation)
+  )
+}
+
+fn check_outcome(outcome: GrammarCheckOutcome) -> ToolCheckOutcome {
+  match outcome {
+    GrammarChecked -> ToolChecked
+    GrammarCheckRejected -> ToolCheckRejected
+    GrammarCheckUnsupported(kind) -> ToolCheckUnsupported(kind)
+    GrammarContextUnavailable -> ToolContextUnavailable
+  }
+}
+
+-- One type query over the wire: write the query line, read one reply line.
+fn wire_query(
+  reader: LineReader,
+  query: ToolQuery
+) -[ConsoleRead, ConsoleWrite]> Result<ToolReply, ToolProtocolError> {
+  match write_line(encode_query(query)) {
+    Err(_) -> Err<ToolReply, ToolProtocolError>(ToolProtocolShape("query", "write"))
+    Ok(_) -> match read_line(reader) {
+      Err(_) -> Err<ToolReply, ToolProtocolError>(ToolProtocolShape("reply", "read"))
+      Ok(None) -> Err<ToolReply, ToolProtocolError>(ToolProtocolShape("reply", "line"))
+      Ok(Some(line)) -> match parse_line(line) {
+        Err(error) -> Err<ToolReply, ToolProtocolError>(error)
+        Ok(document) -> decode_reply(document)
+      }
+    }
+  }
+}
+
+fn reply_type(
+  reply: Result<ToolReply, ToolProtocolError>
+) -> Result<Result<ResolvedType<ToolTypeIdentity>, TypeQueryError>, ToolProtocolError> {
+  match reply {
+    Err(error) -> Err<Result<ResolvedType<ToolTypeIdentity>, TypeQueryError>, ToolProtocolError>(
+      error
+    )
+    Ok(ToolReplyType(resolved)) -> Ok<
+      Result<ResolvedType<ToolTypeIdentity>, TypeQueryError>,
+      ToolProtocolError
+    >(Ok<ResolvedType<ToolTypeIdentity>, TypeQueryError>(resolved))
+    Ok(ToolReplyError(error)) -> Ok<
+      Result<ResolvedType<ToolTypeIdentity>, TypeQueryError>,
+      ToolProtocolError
+    >(Err<ResolvedType<ToolTypeIdentity>, TypeQueryError>(error))
+    Ok(_) -> Err<Result<ResolvedType<ToolTypeIdentity>, TypeQueryError>, ToolProtocolError>(
+      ToolProtocolShape("reply", "type")
+    )
+  }
+}
+
+fn reply_fields(
+  reply: Result<ToolReply, ToolProtocolError>
+) -> Result<Result<List<ResolvedField<ToolTypeIdentity>>, TypeQueryError>, ToolProtocolError> {
+  match reply {
+    Err(error) -> Err<
+      Result<List<ResolvedField<ToolTypeIdentity>>, TypeQueryError>,
+      ToolProtocolError
+    >(error)
+    Ok(ToolReplyFields(fields)) -> Ok<
+      Result<List<ResolvedField<ToolTypeIdentity>>, TypeQueryError>,
+      ToolProtocolError
+    >(Ok<List<ResolvedField<ToolTypeIdentity>>, TypeQueryError>(fields))
+    Ok(ToolReplyError(error)) -> Ok<
+      Result<List<ResolvedField<ToolTypeIdentity>>, TypeQueryError>,
+      ToolProtocolError
+    >(Err<List<ResolvedField<ToolTypeIdentity>>, TypeQueryError>(error))
+    Ok(_) -> Err<Result<List<ResolvedField<ToolTypeIdentity>>, TypeQueryError>, ToolProtocolError>(
+      ToolProtocolShape("reply", "fields")
+    )
+  }
+}
+
+fn reply_bool(
+  reply: Result<ToolReply, ToolProtocolError>
+) -> Result<Result<bool, TypeQueryError>, ToolProtocolError> {
+  match reply {
+    Err(error) -> Err<Result<bool, TypeQueryError>, ToolProtocolError>(error)
+    Ok(ToolReplyBool(flag)) -> Ok<Result<bool, TypeQueryError>, ToolProtocolError>(
+      Ok<bool, TypeQueryError>(flag)
+    )
+    Ok(ToolReplyError(error)) -> Ok<Result<bool, TypeQueryError>, ToolProtocolError>(
+      Err<bool, TypeQueryError>(error)
+    )
+    Ok(_) -> Err<Result<bool, TypeQueryError>, ToolProtocolError>(
+      ToolProtocolShape("reply", "bool")
+    )
+  }
+}
+
+fn fail(message: str) -[ConsoleWrite]> i64 {
+  console.eprintln(str_concat("grammar tool driver: ", message))
+  2
+}
+
+fn read_request(reader: LineReader) -[ConsoleRead]> Result<ToolRequest, str> {
+  match read_line(reader) {
+    Err(LineIo(_)) -> Err<ToolRequest, str>("could not read the request line")
+    Err(LineNotUtf8) -> Err<ToolRequest, str>("the request line is not UTF-8")
+    Ok(None) -> Err<ToolRequest, str>("no request line")
+    Ok(Some(line)) -> match parse_line(line) {
+      Err(error) -> Err<ToolRequest, str>(error_message(error))
+      Ok(document) -> match decode_request(document) {
+        Err(error) -> Err<ToolRequest, str>(error_message(error))
+        Ok(request) -> Ok<ToolRequest, str>(request)
+      }
+    }
+  }
+}
+
+fn respond(response: ToolResponse) -[ConsoleWrite]> i64 {
+  match encode_response(response) {
+    Err(error) -> fail(error_message(error))
+    Ok(document) -> match write_line(document) {
+      Err(_) -> fail("could not write the response line")
+      Ok(_) -> 0
+    }
+  }
+}
+
+fn parse_outcome_of<S>(result: ParseResult<S>) -> ParseOutcome {
+  match result {
+    Parsed(_) -> ParseOutcomeParsed
+    Recovered(_) -> ParseOutcomeRecovered
+    Rejected -> ParseOutcomeRejected
+  }
+}
+
+--- Serve one request for an export without a tooling module: parse only,
+--- refusing every check context structurally.
+pub fn serve_parse_only<S>(
+  parse: (Span) -[Diagnose]> ParseResult<S>
+) -[ConsoleRead, ConsoleWrite]> i64 {
+  let reader = line_reader()
+  match read_request(reader) {
+    Err(message) -> fail(message)
+    Ok(request) -> {
+      let sink = sink_new()
+      let source = Source {
+        text: request.source_text,
+        identity: DiagnosticSourceNamed(request.source_name)
+      }
+      let parsed = handle parse(source.all()) {
+        Diagnose.report(value) -> { sink_record(sink, value); resume(0) }
+        Diagnose.error(message, position) -> {
+          sink_legacy(sink, DiagnosticSeverityError, message);
+          resume(0)
+        }
+        Diagnose.warn(message, position) -> {
+          sink_legacy(sink, DiagnosticSeverityWarning, message);
+          resume(0)
+        }
+        Diagnose.note(message, position) -> {
+          sink_legacy(sink, DiagnosticSeverityNote, message);
+          resume(0)
+        }
+      }
+      let check = match request.context {
+        ToolNoContext -> ToolCheckNotRequested,
+        _ -> ToolCheckRefusedNoTooling
+      }
+      respond(
+        ToolResponse {
+          grammar: request.grammar,
+          parse: parse_outcome_of<S>(parsed),
+          check: check,
+          diagnostics: sink_list(sink),
+          observed_inputs: Nil<ToolObservedInput>()
+        }
+      )
+    }
+  }
+}
+
+--- Serve one request for an export with a tooling module.
+pub fn serve<S>(
+  parse: (Span) -[Diagnose]> ParseResult<S>,
+  check_host: (S) -[TypeCheck<ToolTypeIdentity>, Diagnose]> GrammarCheckOutcome,
+  check_file: (S, Path, usize) -[FileRead, Diagnose]> GrammarCheckOutcome
+) -[ConsoleRead, ConsoleWrite, FileRead]> i64 {
+  let reader = line_reader()
+  match read_request(reader) {
+    Err(message) -> fail(message)
+    Ok(request) -> {
+      let sink = sink_new()
+      let source = Source {
+        text: request.source_text,
+        identity: DiagnosticSourceNamed(request.source_name)
+      }
+      let parsed = handle parse(source.all()) {
+        Diagnose.report(value) -> { sink_record(sink, value); resume(0) }
+        Diagnose.error(message, position) -> {
+          sink_legacy(sink, DiagnosticSeverityError, message);
+          resume(0)
+        }
+        Diagnose.warn(message, position) -> {
+          sink_legacy(sink, DiagnosticSeverityWarning, message);
+          resume(0)
+        }
+        Diagnose.note(message, position) -> {
+          sink_legacy(sink, DiagnosticSeverityNote, message);
+          resume(0)
+        }
+      }
+      let outcome = parse_outcome_of<S>(parsed)
+      -- A transport failure while answering type queries aborts the check;
+      -- the driver reports it on standard error instead of a response.
+      let transport = cell_new<Option<ToolProtocolError>>(None<ToolProtocolError>())
+      let observed = cell_new<List<ToolObservedInput>>(Nil<ToolObservedInput>())
+      let check = match request.context {
+        ToolNoContext -> ToolCheckNotRequested
+        ToolHostContext -> match parsed {
+          Parsed(syntax) -> {
+            -- One handle discharges one effect: type queries go to the wire
+            -- inside, diagnostics are collected outside.
+            let wired = () => handle check_host(syntax) {
+              TypeCheck<ToolTypeIdentity>.resolve(name) -> match reply_type(
+                wire_query(reader, ToolQueryResolve(name))
+              ) {
+                Ok(answer) -> resume(answer)
+                Err(error) -> {
+                  cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
+                  GrammarCheckRejected
+                }
+              }
+              TypeCheck<ToolTypeIdentity>.field(base, selector) -> match reply_type(
+                wire_query(reader, ToolQueryField(base, selector))
+              ) {
+                Ok(answer) -> resume(answer)
+                Err(error) -> {
+                  cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
+                  GrammarCheckRejected
+                }
+              }
+              TypeCheck<ToolTypeIdentity>.fields(base) -> match reply_fields(
+                wire_query(reader, ToolQueryFields(base))
+              ) {
+                Ok(answer) -> resume(answer)
+                Err(error) -> {
+                  cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
+                  GrammarCheckRejected
+                }
+              }
+              TypeCheck<ToolTypeIdentity>.subtype(actual, expected) -> match reply_bool(
+                wire_query(reader, ToolQuerySubtype(actual, expected))
+              ) {
+                Ok(answer) -> resume(answer)
+                Err(error) -> {
+                  cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
+                  GrammarCheckRejected
+                }
+              }
+            }
+            let checked = handle wired() {
+              Diagnose.report(value) -> { sink_record(sink, value); resume(0) }
+              Diagnose.error(message, position) -> {
+                sink_legacy(sink, DiagnosticSeverityError, message);
+                resume(0)
+              }
+              Diagnose.warn(message, position) -> {
+                sink_legacy(sink, DiagnosticSeverityWarning, message);
+                resume(0)
+              }
+              Diagnose.note(message, position) -> {
+                sink_legacy(sink, DiagnosticSeverityNote, message);
+                resume(0)
+              }
+            }
+            check_outcome(checked)
+          }
+          _ -> ToolCheckRefusedParseNotAccepted
+        }
+        ToolFileContext(context_path, limit) -> match parsed {
+          Parsed(syntax) -> {
+            let evaluation = handle comptime.observe_file_reads(
+              () => check_file(syntax, context_path, limit)
+            ) {
+              Diagnose.report(value) -> { sink_record(sink, value); resume(0) }
+              Diagnose.error(message, position) -> {
+                sink_legacy(sink, DiagnosticSeverityError, message);
+                resume(0)
+              }
+              Diagnose.warn(message, position) -> {
+                sink_legacy(sink, DiagnosticSeverityWarning, message);
+                resume(0)
+              }
+              Diagnose.note(message, position) -> {
+                sink_legacy(sink, DiagnosticSeverityNote, message);
+                resume(0)
+              }
+            }
+            cell_put<List<ToolObservedInput>>(
+              observed,
+              observed_inputs(evaluation.file_observations)
+            )
+            check_outcome(evaluation.value)
+          }
+          _ -> ToolCheckRefusedParseNotAccepted
+        }
+      }
+      match cell_get<Option<ToolProtocolError>>(transport) {
+        Some(error) -> {
+          console.eprintln(str_concat("grammar tool driver: ", error_message(error)))
+          3
+        }
+        None -> respond(
+          ToolResponse {
+            grammar: request.grammar,
+            parse: outcome,
+            check: check,
+            diagnostics: sink_list(sink),
+            observed_inputs: cell_get<List<ToolObservedInput>>(observed)
+          }
+        )
+      }
+    }
+  }
+}

@@ -1,0 +1,1014 @@
+-- compiler/grammar/tool.weft -- grammar-neutral tool driving over package exports
+--
+-- The compiler knows nothing about any guest language. A grammar is a
+-- manifest export (package, export name, module, declaration, optional
+-- tooling module); the compiler generates a small driver program that
+-- imports the export, builds it into the workspace target directory, and
+-- talks to it over an interactive child session with the
+-- `weft-grammar-tool/1` protocol. Host type queries are answered through the
+-- ordinary host type-check handler behind a session-scoped token table.
+
+use compiler/backend/target.{NativeLinkTarget, native_link_target_host, native_link_target_name}
+use compiler/package/manifest.{*}
+use compiler/pipeline.{*}
+use compiler/sdk/identity.{weft_product_identity_json_render_with_sdk}
+use compiler/sdk/source.{sdk_source_load_required}
+use compiler/storage.{nlist_get, nlist_len, read_fd_all}
+use compiler/weft/check/host_types as host_types
+use compiler/weft/check/host_types.{HostTypeIdentity}
+use compiler/weft/check/table.{ttable_sources}
+use runtime/alloc.{alloc_zeroed}
+use runtime/buffer.{buf_len, buf_ptr}
+use runtime/memory.{mem_load8_at, mem_load64_at, mem_store8_at}
+use runtime/sha256.{sha256}
+use runtime/source_acquire.{SdkOrigin, SourceAcquire, EmbeddedSdk, CheckoutSdk, NoSdk}
+use runtime/string.{runtime_str_byte_at, runtime_str_cstring, runtime_str_from_bytes_copy}
+use runtime/syscall.{
+  sys_close,
+  sys_dir_mkdir,
+  sys_open_read,
+  sys_open_write_create_new,
+  sys_remove,
+  sys_rename,
+  sys_write
+}
+use stdlib/bytes as bytes
+use stdlib/bytes.{Bytes, bytes_concat}
+use stdlib/diagnostic/schema.{*}
+use stdlib/grammar.{CheckResult, Checked, CheckRejected}
+use stdlib/grammar/tooling.{ToolTypeIdentity, tool_type_identity, tool_type_identity_token}
+use stdlib/grammar/tooling/protocol.{*}
+use stdlib/json.{*}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option.{Option, Some, None}
+use stdlib/process.{*}
+use stdlib/result.{Result, Ok, Err}
+use stdlib/string.{str_concat, str_eq}
+use stdlib/time/monotonic.{Instant}
+use stdlib/typecheck.{*}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push}
+
+-- Resolution -------------------------------------------------------------
+--- A grammar export resolved through package manifests.
+pub(package) type GrammarToolExport {
+  package_name: str,
+  version: str,
+  export: str,
+  module: str,
+  declaration: str,
+  tooling: Option<str>
+}
+
+--- The result of resolving a tool-facing grammar name.
+pub(package) type GrammarToolResolution {
+  GrammarToolResolved(GrammarToolExport),
+  --- No manifest in scope exports a grammar under this name.
+  GrammarToolUnknown,
+  --- More than one package exports the bare name; the candidates are `package/export`.
+  GrammarToolAmbiguous(List<str>)
+}
+
+fn manifest_package_name(m: i64) -> str {
+  pkg_str_view(pkg_manifest_package_start(m), pkg_manifest_package_len(m))
+}
+
+fn export_of(m: i64, entry: i64) -> GrammarToolExport {
+  GrammarToolExport {
+    package_name: manifest_package_name(m),
+    version: pkg_str_view(pkg_manifest_version_ptr(m), pkg_manifest_version_len(m)),
+    export: pkg_str_view(pkg_export_name_ptr(entry), pkg_export_name_len(entry)),
+    module: pkg_str_view(pkg_export_module_ptr(entry), pkg_export_module_len(entry)),
+    declaration: pkg_str_view(
+      pkg_export_declaration_ptr(entry),
+      pkg_export_declaration_len(entry)
+    ),
+    tooling: if pkg_export_has_tooling(entry) {
+      Some<str>(
+        pkg_str_view(pkg_export_tooling_module_ptr(entry), pkg_export_tooling_module_len(entry))
+      )
+    } else { None<str>() }
+  }
+}
+
+-- The SDK manifest reached through the same acquisition the checker uses;
+-- its diagnostics are the checker's business, not resolution's.
+fn sdk_manifest() -[SourceAcquire]> i64 {
+  let path = "weft.pkg"
+  let loaded = handle sdk_source_load_required(__str_ptr(path), __str_len(path)) {
+    Diagnose.report(diagnostic) -> resume(0)
+    Diagnose.error(message, span) -> resume(0)
+    Diagnose.warn(message, span) -> resume(0)
+    Diagnose.note(message, span) -> resume(0)
+  }
+  let ptr = mem_load64_at(loaded, 0)
+  let len = mem_load64_at(loaded, 8)
+  if len <= 0 { 0 } else {
+    let m = pkg_manifest_parse(ptr, len)
+    if pkg_manifest_error_count(m) > 0 { 0 } else { m }
+  }
+}
+
+fn root_manifest() -> i64 {
+  let m = pkg_manifest_load_default()
+  if pkg_manifest_error_count(m) > 0 or pkg_manifest_package_len(m) == 0 { 0 } else { m }
+}
+
+fn split_qualified(name: str) -> (Option<str>, str) {
+  match name.find("/") {
+    None -> (None<str>(), name)
+    Some(index) -> {
+      let split = __u64_to_i64(__usize_to_u64(index))
+      (Some<str>(str_slice(name, 0, split)), str_slice(name, split + 1, __str_len(name)))
+    }
+  }
+}
+
+fn str_slice(text: str, start: i64, end: i64) -> str {
+  runtime_str_from_bytes_copy(__str_ptr(text) + start, end - start)
+}
+
+fn find_in_manifest(m: i64, export: str) -> Option<GrammarToolExport> {
+  if m == 0 { None<GrammarToolExport>() } else {
+    let entry = pkg_manifest_find_export(
+      m,
+      pkg_export_kind_grammar(),
+      __str_ptr(export),
+      __str_len(export)
+    )
+    if entry == 0 { None<GrammarToolExport>() } else {
+      Some<GrammarToolExport>(export_of(m, entry))
+    }
+  }
+}
+
+--- Resolve a grammar name (`export` or `package/export`) against the
+--- workspace manifest and the SDK manifest. A bare name exported by both
+--- is ambiguous and names its candidates.
+pub(package) fn grammar_tool_resolve(name: str) -[SourceAcquire]> GrammarToolResolution {
+  let (qualifier, export) = split_qualified(name)
+  let sdk = sdk_manifest()
+  let root = root_manifest()
+  -- In a checkout the workspace manifest is the SDK manifest; count it once.
+  let same_package = sdk != 0 and root != 0 and str_eq(
+    manifest_package_name(sdk),
+    manifest_package_name(root)
+  ) == 1
+  let candidates = Nil<GrammarToolExport>()
+  let with_sdk = match find_in_manifest(sdk, export) {
+    Some(found) -> Cons(found, candidates)
+    None -> candidates
+  }
+  let with_root = if same_package { with_sdk } else {
+    match find_in_manifest(root, export) {
+      Some(found) -> Cons(found, with_sdk)
+      None -> with_sdk
+    }
+  }
+  let matching = match qualifier {
+    None -> with_root
+    Some(package_name) -> with_root.filter(
+      (candidate: GrammarToolExport) => str_eq(candidate.package_name, package_name) == 1
+    )
+  }
+  match matching {
+    Nil -> GrammarToolUnknown
+    Cons(only, Nil) -> GrammarToolResolved(only)
+    _ -> GrammarToolAmbiguous(
+      matching.map<str>(
+        (candidate: GrammarToolExport) => str_concat(
+          candidate.package_name,
+          str_concat("/", candidate.export)
+        )
+      )
+    )
+  }
+}
+
+--- The wire identity of a resolved export.
+pub(package) fn grammar_tool_identity(export: GrammarToolExport) -> ToolGrammar {
+  ToolGrammar {
+    package_name: export.package_name,
+    export: export.export,
+    module: export.module,
+    declaration: export.declaration
+  }
+}
+
+-- Driver source ----------------------------------------------------------
+--- The generated driver program for an export. Its imports are the public
+--- driver runtime, the three platform handlers it is allowed, the exported
+--- type and, when the export names one, its tooling module.
+pub(package) fn grammar_tool_driver_source(export: GrammarToolExport) -> str {
+  let header = "-- Generated grammar tool driver for "
+    |> str_concat(export.package_name)
+    |> str_concat("/")
+    |> str_concat(export.export)
+    |> str_concat(". Regenerated by the compiler; do not edit.\n")
+    |> str_concat("use stdlib/console/input as console_input\n")
+    |> str_concat("use stdlib/console/terminal as console_terminal\n")
+    |> str_concat("use stdlib/grammar/tooling/driver as driver\n")
+    |> str_concat("use ")
+    |> str_concat(export.module)
+    |> str_concat(".{")
+    |> str_concat(export.declaration)
+    |> str_concat("}\n")
+  match export.tooling {
+    None -> header
+      |> str_concat(
+        "\nfn main() -> i64 {\n  with console_input() {\n    with console_terminal() {\n      driver.serve_parse_only((source) => "
+      )
+      |> str_concat(export.declaration)
+      |> str_concat("().parse(source))\n    }\n  }\n}\n")
+    Some(tooling) -> {
+      let tooling_import = if str_eq(tooling, export.module) == 1 { "" }
+      else { str_concat("use ", str_concat(tooling, " as tooling_conformance\n")) }
+      header
+        |> str_concat("use runtime/file_read as file_read_handler\n")
+        |> str_concat("use stdlib/grammar/tooling/conformance as conformance\n")
+        |> str_concat(tooling_import)
+        |> str_concat(
+          "\nfn main() -> i64 {\n  with console_input() {\n    with console_terminal() {\n      with file_read_handler() {\n        driver.serve(\n          (source) => "
+        )
+        |> str_concat(export.declaration)
+        |> str_concat("().parse(source),\n          (syntax) => conformance.host_check(")
+        |> str_concat(export.declaration)
+        |> str_concat(
+          "(), syntax),\n          (syntax, context, limit) => conformance.context_check("
+        )
+        |> str_concat(export.declaration)
+        |> str_concat("(), syntax, context, limit)\n        )\n      }\n    }\n  }\n}\n")
+    }
+  }
+}
+
+-- Products ---------------------------------------------------------------
+--- Where driver products live for a target.
+pub(package) fn grammar_tool_product_directory(target: NativeLinkTarget) -> str {
+  str_concat("target/", str_concat(native_link_target_name(target), "/grammar-tools"))
+}
+
+--- The identity a product is built under: the product identity with the
+--- SDK it selected, then the compiler executable digest when one is given.
+fn product_identity(compiler_digest: str) -[SourceAcquire]> str {
+  str_concat(
+    weft_product_identity_json_render_with_sdk(SourceAcquire.sdk_origin()),
+    compiler_digest
+  )
+}
+
+fn identity_tag(identity: str) -> str {
+  let digest = digest_raw(__str_ptr(identity), __str_len(identity))
+  str_slice(digest, 7, 19)
+}
+
+--- Products are keyed by the identity that built them, so compilers that
+--- differ never rebuild over each other's product.
+fn product_stem(export: GrammarToolExport, target: NativeLinkTarget, identity: str) -> str {
+  grammar_tool_product_directory(target)
+    |> str_concat("/")
+    |> str_concat(export.package_name)
+    |> str_concat("-")
+    |> str_concat(export.export)
+    |> str_concat("-")
+    |> str_concat(identity_tag(identity))
+}
+
+--- The product path for an export under the running compiler's identity.
+pub(package) fn grammar_tool_product_path(
+  export: GrammarToolExport,
+  target: NativeLinkTarget,
+  compiler_digest: str
+) -[SourceAcquire]> str {
+  product_stem(export, target, product_identity(compiler_digest))
+}
+
+fn ensure_directories(target: NativeLinkTarget) -> nil {
+  sys_dir_mkdir(runtime_str_cstring("target"), 493)
+  sys_dir_mkdir(runtime_str_cstring(str_concat("target/", native_link_target_name(target))), 493)
+  sys_dir_mkdir(runtime_str_cstring(grammar_tool_product_directory(target)), 493)
+  nil
+}
+
+fn write_all(fd: i64, ptr: i64, len: i64) -> i64 {
+  let mut written = 0
+  let mut failed = 0
+  while written < len and failed == 0 {
+    let count = sys_write(fd, ptr + written, len - written)
+    if count <= 0 { failed = if count == 0 { 5 } else { 0 - count } } else {
+      written = written + count
+    }
+  }
+  failed
+}
+
+--- Claim a scratch file beside the final path that no other builder holds.
+--- Returns the descriptor and the scratch path, or a negative descriptor
+--- with the last error when no name could be claimed.
+fn claim_scratch(path: str, mode: i64, attempt: i64) -> (i64, str) {
+  let scratch = str_concat(path, str_concat(".tmp-", attempt.to_str()))
+  let fd = sys_open_write_create_new(runtime_str_cstring(scratch), mode)
+  if fd >= 0 or attempt >= 64 { (fd, scratch) } else {
+    claim_scratch(path, mode, attempt + 1)
+  }
+}
+
+--- Write a file beside its final path and rename it into place, so a reader
+--- or a running driver never observes a partial product; concurrent
+--- builders of one product each publish a complete file.
+fn publish_file(path: str, ptr: i64, len: i64, mode: i64) -> i64 {
+  let (fd, scratch) = claim_scratch(path, mode, 0)
+  if fd < 0 { 0 - fd } else {
+    let status = write_all(fd, ptr, len)
+    sys_close(fd)
+    if status != 0 {
+      sys_remove(runtime_str_cstring(scratch))
+      status
+    } else {
+      let renamed = sys_rename(runtime_str_cstring(scratch), runtime_str_cstring(path))
+      if renamed < 0 {
+        sys_remove(runtime_str_cstring(scratch))
+        0 - renamed
+      } else { 0 }
+    }
+  }
+}
+
+fn hex_digit(value: i64) -> i64 { if value < 10 { 48 + value } else { 87 + value } }
+
+fn digest_raw(ptr: i64, len: i64) -> str {
+  let raw = alloc_zeroed(32)
+  sha256(ptr, len, raw)
+  let text = alloc_zeroed(71)
+  let prefix = "sha256:"
+  for index in 0..7 { mem_store8_at(text, index, runtime_str_byte_at(prefix, index)) }
+  for index in 0..32 {
+    let byte = mem_load8_at(raw, index)
+    mem_store8_at(text, 7 + index * 2, hex_digit(byte / 16))
+    mem_store8_at(text, 8 + index * 2, hex_digit(byte - byte / 16 * 16))
+  }
+  runtime_str_from_bytes_copy(text, 71)
+}
+
+fn sdk_owned_path(path: str) -> bool {
+  path.starts_with("stdlib/") or path.starts_with("runtime/") or path.starts_with("compiler/")
+}
+
+-- The stamp records the protocol, the compiler and SDK identity, the
+-- driver source digest and the path and content digest of every module the
+-- build loaded. Embedded SDK modules are covered by the identity alone.
+fn stamp_render(identity: str, driver_digest: str, tt: i64) -> str {
+  let sources = ttable_sources(tt)
+  let mut items = Nil<Json>()
+  let mut index = 0
+  while index < nlist_len(sources) {
+    let entry = nlist_get(sources, index)
+    let path_len = mem_load64_at(entry + 24, 0)
+    if path_len > 0 {
+      let path = pkg_str_view(mem_load64_at(entry + 16, 0), path_len)
+      let content = digest_raw(mem_load64_at(entry, 0), mem_load64_at(entry + 8, 0))
+      items = Cons(
+        json_object(
+          Cons(
+            json_entry("path", json_string(path)),
+            Cons(json_entry("content", json_string(content)), Nil<JsonEntry>())
+          )
+        ),
+        items
+      )
+    } else { 0 }
+    index = index + 1
+  }
+  let document = json_object(
+    Cons(
+      json_entry("protocol", json_string(protocol_name())),
+      Cons(
+        json_entry("compiler", json_string(identity)),
+        Cons(
+          json_entry("driver", json_string(driver_digest)),
+          Cons(json_entry("sources", json_array(items.reverse())), Nil<JsonEntry>())
+        )
+      )
+    )
+  )
+  match json_stringify(document) { Ok(text) -> text, Err(_) -> "" }
+}
+
+-- Read a whole file by path: (pointer, length), or a zero pointer when the
+-- file cannot be opened.
+fn read_path(path: str) -> (i64, i64) {
+  let fd = sys_open_read(runtime_str_cstring(path))
+  if fd < 0 { (0, 0) } else {
+    let file = read_fd_all(fd)
+    sys_close(fd)
+    (mem_load64_at(file, 0), mem_load64_at(file, 8))
+  }
+}
+
+fn file_digest(path: str) -> Option<str> {
+  let (ptr, len) = read_path(path)
+  if ptr == 0 { None<str>() } else { Some<str>(digest_raw(ptr, len)) }
+}
+
+fn sources_current(items: List<Json>, embedded_sdk: bool) -> bool {
+  match items {
+    Nil -> true
+    Cons(item, rest) -> {
+      let path = json_object_get_str(item, "path", "")
+      let content = json_object_get_str(item, "content", "")
+      let current = if embedded_sdk and sdk_owned_path(path) { true } else {
+        match file_digest(path) {
+          Some(actual) -> str_eq(actual, content) == 1
+          None -> false
+        }
+      }
+      if current { sources_current(rest, embedded_sdk) } else { false }
+    }
+  }
+}
+
+fn stamp_current(stamp_path: str, identity: str, driver_digest: str, embedded_sdk: bool) -> bool {
+  let (ptr, len) = read_path(stamp_path)
+  if ptr == 0 { false } else {
+    match json_parse(runtime_str_from_bytes_copy(ptr, len)) {
+      Err(_) -> false
+      Ok(document) ->
+        str_eq(json_object_get_str(document, "protocol", ""), protocol_name()) == 1 and
+        str_eq(json_object_get_str(document, "compiler", ""), identity) == 1 and
+        str_eq(json_object_get_str(document, "driver", ""), driver_digest) == 1 and
+        match json_object_get(document, "sources") {
+          Some(JsonArray(items)) -> sources_current(items, embedded_sdk)
+          _ -> false
+        }
+    }
+  }
+}
+
+fn typed_module_table(typed: TypedModule) -> i64 {
+  match typed { TypedModule(fns, src, tt, owners) -> tt }
+}
+
+--- Whether a driver product is ready to run.
+pub(package) type GrammarToolProduct {
+  GrammarToolProductReady(str),
+  --- The driver could not be built; the message carries the first diagnostics.
+  GrammarToolProductFailed(str)
+}
+
+fn executable_kind(target: NativeLinkTarget) -> i64 {
+  match target {
+    NativeLinkMacosAarch64 -> pipeline_binary_kind_macho_executable()
+    NativeLinkLinuxAarch64 -> pipeline_binary_kind_elf_executable()
+  }
+}
+
+--- The digest of the running compiler's executable, for stamping products
+--- built by a checkout compiler whose SDK identity carries no digest. An
+--- empty path yields an empty digest and the stamp relies on the SDK
+--- identity alone.
+pub(package) fn grammar_tool_compiler_digest(executable: str) -> str {
+  if __str_len(executable) == 0 { "" } else {
+    let (ptr, len) = read_path(executable)
+    if ptr == 0 { "" } else { digest_raw(ptr, len) }
+  }
+}
+
+--- Build the driver product for an export unless the cached one is current.
+--- `compiler_digest` distinguishes compilers that share a product identity,
+--- which a checkout compiler does across its own rebuilds.
+pub(package) fn grammar_tool_ensure_product(
+  export: GrammarToolExport,
+  target: NativeLinkTarget,
+  compiler_digest: str
+) -[SourceAcquire]> GrammarToolProduct {
+  let identity = product_identity(compiler_digest)
+  let embedded_sdk = match SourceAcquire.sdk_origin() { EmbeddedSdk(_) -> true, _ -> false }
+  let source = grammar_tool_driver_source(export)
+  let driver_digest = digest_raw(__str_ptr(source), __str_len(source))
+  let stem = product_stem(export, target, identity)
+  let stamp_path = str_concat(stem, ".stamp.json")
+  let source_path = str_concat(stem, ".weft")
+  if stamp_current(stamp_path, identity, driver_digest, embedded_sdk) and pkg_file_exists_text(
+    stem
+  ) == 1 {
+    GrammarToolProductReady(stem)
+  } else {
+    ensure_directories(target)
+    publish_file(source_path, __str_ptr(source), __str_len(source), 420)
+    let messages = vector.new<str>()
+    let checked = handle pipeline_check_source_with_diagnostics(
+      __str_ptr(source),
+      __str_len(source)
+    ) {
+      Diagnose.report(diagnostic) -> {
+        vector_push<str>(messages, diagnostic.message());
+        resume(0)
+      }
+      Diagnose.error(message, span) -> { vector_push<str>(messages, message); resume(0) }
+      Diagnose.warn(message, span) -> resume(0)
+      Diagnose.note(message, span) -> resume(0)
+    }
+    match checked {
+      CheckRejected -> GrammarToolProductFailed(
+        str_concat("grammar tool driver did not check: ", first_message(messages))
+      )
+      Checked(typed) -> {
+        let native = pipeline_lower_native_ir_for_target_closed(typed, target)
+        match pipeline_checked_native_product(
+          native,
+          __str_ptr(source),
+          PipelineNativeDebugInformationStripped
+        ) {
+          PipelineNativeProductFailed(_) -> GrammarToolProductFailed(
+            "grammar tool driver did not link"
+          )
+          PipelineNativeProductReady(binary, facts) -> {
+            let output = pipeline_binary_buf(binary)
+            if pipeline_binary_kind(binary) != executable_kind(target) or buf_len(output) == 0 {
+              GrammarToolProductFailed("grammar tool driver is not a host executable")
+            } else {
+              let status = publish_file(stem, buf_ptr(output), buf_len(output), 448)
+              if status != 0 {
+                GrammarToolProductFailed("grammar tool driver product could not be written")
+              } else {
+                let stamp = stamp_render(identity, driver_digest, typed_module_table(typed))
+                publish_file(stamp_path, __str_ptr(stamp), __str_len(stamp), 420)
+                GrammarToolProductReady(stem)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn first_message(messages: Vector<str>) -> str {
+  if vector_len<str>(messages) == 0 { "no diagnostics" } else {
+    vector_get_in_bounds<str>(messages, 0)
+  }
+}
+
+-- Token table --------------------------------------------------------------
+--- One issued host identity. Boxing it keeps the table's elements on the
+--- managed word path of indexed storage.
+pub(package) type GrammarToolIssued { GrammarToolIssued(HostTypeIdentity) }
+
+--- Session-scoped tokens standing for host type identities. A token is the
+--- position of the identity it was issued for; anything not issued in this
+--- session answers `ForeignTypeIdentity` without reaching the checker.
+pub(package) type GrammarToolTokens { issued: Vector<GrammarToolIssued> }
+
+pub(package) fn grammar_tool_tokens() -> GrammarToolTokens {
+  GrammarToolTokens { issued: vector.new<GrammarToolIssued>() }
+}
+
+fn issue(tokens: GrammarToolTokens, identity: HostTypeIdentity) -> ToolTypeIdentity {
+  let issued = tokens.issued
+  vector_push<GrammarToolIssued>(issued, GrammarToolIssued(identity))
+  tool_type_identity(vector_len<GrammarToolIssued>(issued))
+}
+
+fn lookup(tokens: GrammarToolTokens, identity: ToolTypeIdentity) -> Option<HostTypeIdentity> {
+  let issued = tokens.issued
+  let token = tool_type_identity_token(identity)
+  if token < 1 or token > vector_len<GrammarToolIssued>(issued) { None<HostTypeIdentity>() }
+  else {
+    match vector_get_in_bounds<GrammarToolIssued>(issued, token - 1) {
+      GrammarToolIssued(host) -> Some<HostTypeIdentity>(host)
+    }
+  }
+}
+
+fn lookup_all(
+  tokens: GrammarToolTokens,
+  identities: List<ToolTypeIdentity>
+) -> Option<List<HostTypeIdentity>> {
+  match identities {
+    Nil -> Some<List<HostTypeIdentity>>(Nil<HostTypeIdentity>())
+    Cons(identity, rest) -> match lookup(tokens, identity) {
+      None -> None<List<HostTypeIdentity>>()
+      Some(host) -> match lookup_all(tokens, rest) {
+        None -> None<List<HostTypeIdentity>>()
+        Some(tail) -> Some<List<HostTypeIdentity>>(Cons(host, tail))
+      }
+    }
+  }
+}
+
+fn issued_type(
+  tokens: GrammarToolTokens,
+  resolved: ResolvedType<HostTypeIdentity>
+) -> ResolvedType<ToolTypeIdentity> {
+  ResolvedType { identity: issue(tokens, resolved.identity), description: resolved.description }
+}
+
+fn issued_fields(
+  tokens: GrammarToolTokens,
+  fields: List<ResolvedField<HostTypeIdentity>>
+) -> List<ResolvedField<ToolTypeIdentity>> {
+  match fields {
+    Nil -> Nil<ResolvedField<ToolTypeIdentity>>()
+    Cons(field, rest) -> Cons(
+      ResolvedField { selector: field.selector, value: issued_type(tokens, field.value) },
+      issued_fields(tokens, rest)
+    )
+  }
+}
+
+--- Answer one driver query through the host type-check handler.
+pub(package) fn grammar_tool_answer(
+  tokens: GrammarToolTokens,
+  query: ToolQuery
+) -[TypeCheck<HostTypeIdentity>]> ToolReply {
+  match query {
+    ToolQueryResolve(request) -> match lookup_all(tokens, request.arguments) {
+      None -> ToolReplyError(ForeignTypeIdentity)
+      Some(arguments) -> match TypeCheck<HostTypeIdentity>.resolve(
+        TypeName { qualifier: request.qualifier, name: request.name, arguments: arguments }
+      ) {
+        Ok(resolved) -> ToolReplyType(issued_type(tokens, resolved))
+        Err(error) -> ToolReplyError(error)
+      }
+    }
+    ToolQueryField(base, selector) -> match lookup(tokens, base) {
+      None -> ToolReplyError(ForeignTypeIdentity)
+      Some(host) -> match TypeCheck<HostTypeIdentity>.field(host, selector) {
+        Ok(resolved) -> ToolReplyType(issued_type(tokens, resolved))
+        Err(error) -> ToolReplyError(error)
+      }
+    }
+    ToolQueryFields(base) -> match lookup(tokens, base) {
+      None -> ToolReplyError(ForeignTypeIdentity)
+      Some(host) -> match TypeCheck<HostTypeIdentity>.fields(host) {
+        Ok(fields) -> ToolReplyFields(issued_fields(tokens, fields))
+        Err(error) -> ToolReplyError(error)
+      }
+    }
+    ToolQuerySubtype(actual, expected) -> match lookup(tokens, actual) {
+      None -> ToolReplyError(ForeignTypeIdentity)
+      Some(actual_host) -> match lookup(tokens, expected) {
+        None -> ToolReplyError(ForeignTypeIdentity)
+        Some(expected_host) -> match TypeCheck<HostTypeIdentity>.subtype(
+          actual_host,
+          expected_host
+        ) {
+          Ok(flag) -> ToolReplyBool(flag)
+          Err(error) -> ToolReplyError(error)
+        }
+      }
+    }
+  }
+}
+
+-- Exchange -----------------------------------------------------------------
+--- Why an exchange with a driver produced no response.
+pub(package) type GrammarToolFailure {
+  --- The driver product could not be started.
+  GrammarToolStartFailed(i64),
+  --- The deadline elapsed; the driver was killed and reaped.
+  GrammarToolTimedOut,
+  --- The driver ended without a response; its standard error text follows.
+  GrammarToolDriverEnded(str),
+  --- The driver wrote a line that is not a protocol message.
+  GrammarToolProtocol(ToolProtocolError),
+  --- The driver raised a type query for a request without host types.
+  GrammarToolUnexpectedQuery,
+  --- The driver answered for a different grammar than requested.
+  GrammarToolGrammarMismatch,
+  --- The session's request write could not complete.
+  GrammarToolRequestNotDelivered,
+  --- The session stream failed with a platform error code.
+  GrammarToolStreamFailed(i64)
+}
+
+--- The outcome of one request.
+pub(package) type GrammarToolExchange {
+  GrammarToolAnswered(ToolResponse),
+  GrammarToolFailed(GrammarToolFailure)
+}
+
+type ExchangeState {
+  request: ToolRequest,
+  deadline: Instant,
+  host: bool,
+  tokens: GrammarToolTokens,
+  pending: Bytes,
+  stderr_text: Bytes
+}
+
+fn stderr_text_of(state: ExchangeState, output: ProcOutput) -> str {
+  let own = match state.stderr_text.to_utf8() { Ok(text) -> text, Err(_) -> "" }
+  match output {
+    ProcCompleted(_, _, tail) -> str_concat(own, tail)
+    ProcTimedOut(_, _, tail) -> str_concat(own, tail)
+    ProcFailed(_, _, tail) -> str_concat(own, tail)
+  }
+}
+
+fn store_limit() -> usize { __i64_to_usize(4194304) }
+
+fn read_limit() -> usize { __i64_to_usize(65536) }
+
+fn exchange_line(
+  session: ProcSession,
+  state: ExchangeState,
+  line: Bytes,
+  rest: Bytes
+) -[Proc, TypeCheck<HostTypeIdentity>]> GrammarToolExchange {
+  let decoded = match line.to_utf8() {
+    Err(_) -> Err<ToolDriverMessage, ToolProtocolError>(ToolProtocolShape("line", "utf-8"))
+    Ok(text) -> match parse_line(text) {
+      Err(error) -> Err<ToolDriverMessage, ToolProtocolError>(error)
+      Ok(document) -> decode_driver_message(document)
+    }
+  }
+  match decoded {
+    Err(error) -> {
+      Proc.session_release(session)
+      GrammarToolFailed(GrammarToolProtocol(error))
+    }
+    Ok(ToolDriverResponse(response)) -> {
+      Proc.session_finish_until(session, state.deadline)
+      if same_grammar(response.grammar, state.request.grammar) { GrammarToolAnswered(response) }
+      else { GrammarToolFailed(GrammarToolGrammarMismatch) }
+    }
+    Ok(ToolDriverQuery(query)) -> if not state.host {
+      Proc.session_release(session)
+      GrammarToolFailed(GrammarToolUnexpectedQuery)
+    } else {
+      let reply = grammar_tool_answer(state.tokens, query)
+      let (next, wrote) = Proc.session_write(
+        session,
+        bytes.from_str(render_line(encode_reply(reply))),
+        state.deadline
+      )
+      match wrote {
+        ProcWritten -> exchange_step(next, state.{ pending: rest })
+        ProcWriteTimedOut(_) -> {
+          Proc.session_release(next);
+          GrammarToolFailed(GrammarToolTimedOut)
+        }
+        ProcWriteBlocked(_) -> {
+          Proc.session_release(next);
+          GrammarToolFailed(GrammarToolRequestNotDelivered)
+        }
+        ProcWriteRefused(_) -> exchange_step(next, state.{ pending: rest })
+        ProcWriteFailed(ProcStreamFailed(code), _) -> {
+          Proc.session_release(next);
+          GrammarToolFailed(GrammarToolStreamFailed(code))
+        }
+        ProcWriteFailed(_, _) -> {
+          Proc.session_release(next);
+          GrammarToolFailed(GrammarToolRequestNotDelivered)
+        }
+      }
+    }
+  }
+}
+
+fn exchange_step(
+  session: ProcSession,
+  state: ExchangeState
+) -[Proc, TypeCheck<HostTypeIdentity>]> GrammarToolExchange {
+  let newline: u8 = __u64_to_u8(10)
+  match state.pending.find(newline) {
+    Some(index) -> {
+      let line = state.pending.slice(__i64_to_usize(0), index).unwrap_or(bytes.empty())
+      let rest = state.pending.slice(index + __i64_to_usize(1), state.pending.len()).unwrap_or(
+        bytes.empty()
+      )
+      exchange_line(session, state, line, rest)
+    }
+    None -> {
+      let (next, got) = Proc.session_read(session, read_limit(), state.deadline)
+      match got {
+        ProcReadChunk(ProcStdout, chunk) -> exchange_step(
+          next,
+          state.{ pending: bytes_concat(state.pending, chunk) }
+        )
+        ProcReadChunk(ProcStderr, chunk) -> exchange_step(
+          next,
+          state.{ stderr_text: bytes_concat(state.stderr_text, chunk) }
+        )
+        ProcReadEnded -> {
+          let output = Proc.session_finish_until(next, state.deadline)
+          GrammarToolFailed(GrammarToolDriverEnded(stderr_text_of(state, output)))
+        }
+        ProcReadTimedOut -> { Proc.session_release(next); GrammarToolFailed(GrammarToolTimedOut) }
+        ProcReadFailed(ProcSpawnFailed(code)) -> {
+          Proc.session_release(next);
+          GrammarToolFailed(GrammarToolStartFailed(code))
+        }
+        ProcReadFailed(ProcStreamFailed(code)) -> {
+          Proc.session_release(next);
+          GrammarToolFailed(GrammarToolStreamFailed(code))
+        }
+        ProcReadFailed(_) -> {
+          Proc.session_release(next);
+          GrammarToolFailed(GrammarToolStreamFailed(0))
+        }
+      }
+    }
+  }
+}
+
+--- Run one request against a driver product. Host type queries are answered
+--- through the enclosing `TypeCheck<HostTypeIdentity>` handler when `host`
+--- is set; otherwise any query fails the exchange.
+pub(package) fn grammar_tool_exchange(
+  product: str,
+  request: ToolRequest,
+  host: bool,
+  deadline: Instant
+) -[Proc, TypeCheck<HostTypeIdentity>]> GrammarToolExchange {
+  match encode_request(request) {
+    Err(error) -> GrammarToolFailed(GrammarToolProtocol(error))
+    Ok(document) -> {
+      let session: owned ProcSession = Proc.open_session(product, Nil<str>(), store_limit())
+      let (started, wrote) = Proc.session_write(
+        session,
+        bytes.from_str(render_line(document)),
+        deadline
+      )
+      let state = ExchangeState {
+        request: request,
+        deadline: deadline,
+        host: host,
+        tokens: grammar_tool_tokens(),
+        pending: bytes.empty(),
+        stderr_text: bytes.empty()
+      }
+      match wrote {
+        ProcWritten -> exchange_step(started, state)
+        ProcWriteFailed(ProcSpawnFailed(code), _) -> {
+          Proc.session_release(started);
+          GrammarToolFailed(GrammarToolStartFailed(code))
+        }
+        ProcWriteFailed(ProcStreamFailed(code), _) -> {
+          Proc.session_release(started);
+          GrammarToolFailed(GrammarToolStreamFailed(code))
+        }
+        ProcWriteTimedOut(_) -> {
+          Proc.session_release(started);
+          GrammarToolFailed(GrammarToolTimedOut)
+        }
+        _ -> {
+          -- A driver that exits before reading its request still owes an
+          -- explanation on standard error; collect it.
+          let output = Proc.session_finish_until(started, deadline)
+          GrammarToolFailed(GrammarToolDriverEnded(stderr_text_of(state, output)))
+        }
+      }
+    }
+  }
+}
+
+--- Run one request without host types: any type query fails the exchange.
+pub(package) fn grammar_tool_exchange_without_host(
+  product: str,
+  request: ToolRequest,
+  deadline: Instant
+) -[Proc]> GrammarToolExchange {
+  handle grammar_tool_exchange(product, request, false, deadline) {
+    TypeCheck<HostTypeIdentity>.resolve(name) -> resume(
+      Err<ResolvedType<HostTypeIdentity>, TypeQueryError>(TypeNotFound)
+    )
+    TypeCheck<HostTypeIdentity>.field(base, selector) -> resume(
+      Err<ResolvedType<HostTypeIdentity>, TypeQueryError>(ForeignTypeIdentity)
+    )
+    TypeCheck<HostTypeIdentity>.fields(base) -> resume(
+      Err<List<ResolvedField<HostTypeIdentity>>, TypeQueryError>(ForeignTypeIdentity)
+    )
+    TypeCheck<HostTypeIdentity>.subtype(actual, expected) -> resume(
+      Err<bool, TypeQueryError>(ForeignTypeIdentity)
+    )
+  }
+}
+
+--- Run one request with host types answered from a checked host module.
+pub(package) fn grammar_tool_exchange_with_host(
+  product: str,
+  request: ToolRequest,
+  table: i64,
+  source: i64,
+  deadline: Instant
+) -[Proc]> GrammarToolExchange {
+  host_types.run(table, source, () => grammar_tool_exchange(product, request, true, deadline))
+}
+
+--- Render a failure for tool output.
+pub(package) fn grammar_tool_failure_message(failure: GrammarToolFailure) -> str {
+  match failure {
+    GrammarToolStartFailed(code) -> str_concat(
+      "grammar tool driver could not be started (error ",
+      str_concat(int_text(code), ")")
+    )
+    GrammarToolTimedOut -> "grammar tool driver did not answer before its deadline"
+    GrammarToolDriverEnded(text) -> if __str_len(text) == 0 {
+      "grammar tool driver ended without a response"
+    } else { str_concat("grammar tool driver ended without a response: ", text) }
+    GrammarToolProtocol(error) -> error_message(error)
+    GrammarToolUnexpectedQuery ->
+      "grammar tool driver raised a host type query without host types"
+    GrammarToolGrammarMismatch -> "grammar tool driver answered for a different grammar"
+    GrammarToolRequestNotDelivered -> "grammar tool driver did not accept the request"
+    GrammarToolStreamFailed(code) -> str_concat(
+      "grammar tool session failed (error ",
+      str_concat(int_text(code), ")")
+    )
+  }
+}
+
+fn int_text(value: i64) -> str { value.to_str() }
+
+-- Diagnostics --------------------------------------------------------------
+fn anchor_location(
+  location: DiagnosticLocation,
+  source_name: str,
+  buffer: i64
+) -> DiagnosticLocation {
+  match location {
+    DiagnosticSourceRange(DiagnosticSourceNamed(name), start, end) ->
+      if str_eq(name, source_name) == 1 {
+        DiagnosticSourceRange(DiagnosticSourceBuffer(buffer), start, end)
+      } else { location }
+    _ -> location
+  }
+}
+
+fn anchor_related(
+  related: DiagnosticRelatedLocationList,
+  source_name: str,
+  buffer: i64
+) -> DiagnosticRelatedLocationList {
+  match related {
+    DiagnosticRelatedLocationNil -> DiagnosticRelatedLocationNil
+    DiagnosticRelatedLocationCons(DiagnosticRelatedLocation(label, location), rest) ->
+      DiagnosticRelatedLocationCons(
+        DiagnosticRelatedLocation(label, anchor_location(location, source_name, buffer)),
+        anchor_related(rest, source_name, buffer)
+      )
+  }
+}
+
+fn anchor_edits(
+  edits: DiagnosticTextEditList,
+  source_name: str,
+  buffer: i64
+) -> DiagnosticTextEditList {
+  match edits {
+    DiagnosticTextEditNil -> DiagnosticTextEditNil
+    DiagnosticTextEditCons(DiagnosticTextEdit(location, text), rest) ->
+      DiagnosticTextEditCons(
+        DiagnosticTextEdit(anchor_location(location, source_name, buffer), text),
+        anchor_edits(rest, source_name, buffer)
+      )
+  }
+}
+
+fn anchor_fields(
+  fields: DiagnosticFieldList,
+  source_name: str,
+  buffer: i64
+) -> DiagnosticFieldList {
+  match fields {
+    DiagnosticFieldNil -> DiagnosticFieldNil
+    DiagnosticFieldCons(field, rest) -> {
+      let anchored = match field {
+        DiagnosticFieldLocation(name, location) -> DiagnosticFieldLocation(
+          name,
+          anchor_location(location, source_name, buffer)
+        )
+        DiagnosticFieldSuggestion(DiagnosticSuggestion(message, applicability, edits)) ->
+          DiagnosticFieldSuggestion(
+            DiagnosticSuggestion(message, applicability, anchor_edits(edits, source_name, buffer))
+          )
+        other -> other
+      }
+      DiagnosticFieldCons(anchored, anchor_fields(rest, source_name, buffer))
+    }
+  }
+}
+
+--- Re-anchor a driver diagnostic onto the compiler's source buffer: ranges
+--- naming the request's source identity become buffer ranges with the same
+--- offsets, so the existing renderers position them unchanged.
+pub(package) fn grammar_tool_anchor(
+  diagnostic: Diagnostic,
+  source_name: str,
+  buffer: i64
+) -> Diagnostic {
+  match diagnostic {
+    Diagnostic(severity, class, code, message, primary, related, fields) ->
+      Diagnostic(
+        severity,
+        class,
+        code,
+        message,
+        anchor_location(primary, source_name, buffer),
+        anchor_related(related, source_name, buffer),
+        anchor_fields(fields, source_name, buffer)
+      )
+  }
+}

@@ -1,0 +1,674 @@
+-- stdlib/diagnostic/json.weft — JSON codec for schema v1 structured diagnostics
+--
+-- The encoding is the shape the compiler's tools already emit for structured
+-- diagnostics: `kind`-tagged unions, half-open byte ranges and the open field
+-- algebra. Decoding is exact; unknown kinds are structured errors so a
+-- producer's schema bump is never absorbed silently.
+
+use stdlib/diagnostic/schema.{*}
+use stdlib/json.{*}
+use stdlib/list.{List, Cons, Nil}
+use runtime/string.{runtime_str_byte_at}
+use stdlib/num.{num_render_u64}
+use stdlib/option.{Option, Some, None}
+use stdlib/result.{Result, Ok, Err}
+use stdlib/semantic_type.{*}
+use stdlib/semantic_type/json as types
+use stdlib/string.{str_concat}
+
+--- Why a JSON document is not a schema v1 diagnostic.
+pub type DiagnosticJsonError {
+  --- The named member is missing or has the wrong shape at the given kind.
+  DiagnosticJsonShape(str, str),
+  --- A `kind` tag or severity outside the schema.
+  DiagnosticJsonUnknownKind(str),
+  --- A nested semantic type fact failed to decode.
+  DiagnosticJsonType(types.SemanticJsonError)
+}
+
+fn entry(key: str, value: Json) -> JsonEntry { JsonEntry(key, value) }
+
+fn object2(first: JsonEntry, second: JsonEntry) -> Json {
+  JsonObject(Cons(first, Cons(second, Nil<JsonEntry>())))
+}
+
+fn object3(first: JsonEntry, second: JsonEntry, third: JsonEntry) -> Json {
+  JsonObject(Cons(first, Cons(second, Cons(third, Nil<JsonEntry>()))))
+}
+
+fn shape<T>(kind: str, what: str) -> Result<T, DiagnosticJsonError> {
+  Err<T, DiagnosticJsonError>(DiagnosticJsonShape(kind, what))
+}
+
+fn kind_of(value: Json) -> str { json_object_get_str(value, "kind", "") }
+
+fn text_member(value: Json, kind: str, key: str) -> Result<str, DiagnosticJsonError> {
+  match json_object_get(value, key) {
+    Some(JsonString(text)) -> Ok<str, DiagnosticJsonError>(text)
+    _ -> shape<str>(kind, key)
+  }
+}
+
+fn array_member(value: Json, kind: str, key: str) -> Result<List<Json>, DiagnosticJsonError> {
+  match json_object_get(value, key) {
+    Some(JsonArray(items)) -> Ok<List<Json>, DiagnosticJsonError>(items)
+    _ -> shape<List<Json>>(kind, key)
+  }
+}
+
+fn present_member(value: Json, kind: str, key: str) -> Result<Json, DiagnosticJsonError> {
+  match json_object_get(value, key) {
+    Some(inner) -> Ok<Json, DiagnosticJsonError>(inner)
+    None -> shape<Json>(kind, key)
+  }
+}
+
+fn usize_json(value: usize) -> Json {
+  match value.to_u64().to_i64_checked() {
+    Ok(number) -> JsonNumber(number)
+    Err(_) -> JsonString(num_render_u64(value.to_u64()))
+  }
+}
+
+-- Values beyond the signed JSON number domain travel as decimal text.
+fn u64_json(value: u64) -> Json {
+  match value.to_i64_checked() {
+    Ok(number) -> JsonNumber(number)
+    Err(_) -> JsonString(num_render_u64(value))
+  }
+}
+
+fn parse_u64_text(text: str) -> Option<u64> {
+  let len = __str_len(text)
+  if len == 0 { return None<u64>() } else { 0 }
+  let mut value: u64 = __i64_to_u64(0)
+  let ten: u64 = __i64_to_u64(10)
+  let mut index = 0
+  let mut valid = true
+  while index < len and valid {
+    let byte = runtime_str_byte_at(text, index)
+    if byte < 48 or byte > 57 { valid = false }
+    else {
+      let digit: u64 = __i64_to_u64(byte - 48)
+      -- Reject overflow before it happens: value * 10 + digit must fit.
+      let limit: u64 = __i64_to_u64(0 - 1)
+      if value > (limit - digit) / ten { valid = false }
+      else { value = value * ten + digit }
+    }
+    index = index + 1
+  }
+  if valid { Some<u64>(value) } else { None<u64>() }
+}
+
+fn usize_member(value: Json, kind: str, key: str) -> Result<usize, DiagnosticJsonError> {
+  match json_object_get(value, key) {
+    Some(JsonNumber(number)) -> match number.to_usize_checked() {
+      Ok(converted) -> Ok<usize, DiagnosticJsonError>(converted)
+      Err(_) -> shape<usize>(kind, key)
+    }
+    _ -> shape<usize>(kind, key)
+  }
+}
+
+-- Encoding.
+--- Encode a severity as its wire name.
+pub fn severity_name(severity: DiagnosticSeverity) -> str {
+  match severity {
+    DiagnosticSeverityError -> "error"
+    DiagnosticSeverityWarning -> "warn"
+    DiagnosticSeverityNote -> "note"
+  }
+}
+
+--- Encode a class as its wire name.
+pub fn class_name(class: DiagnosticClass) -> str {
+  match class {
+    DiagnosticClassParse -> "parse"
+    DiagnosticClassType -> "type"
+    DiagnosticClassEffect -> "effect"
+    DiagnosticClassOwnership -> "ownership"
+    DiagnosticClassModule -> "module"
+    DiagnosticClassLink -> "link"
+    DiagnosticClassGrammar -> "grammar"
+    DiagnosticClassTool -> "tool"
+    DiagnosticClassRuntime -> "runtime"
+    DiagnosticClassTest -> "test"
+    DiagnosticClassOther(name) -> name
+  }
+}
+
+fn encode_source(source: DiagnosticSource) -> Json {
+  match source {
+    DiagnosticSourceUnknown -> JsonObject(
+      Cons(entry("kind", JsonString("unknown")), Nil<JsonEntry>())
+    )
+    DiagnosticSourceBuffer(id) -> object2(
+      entry("kind", JsonString("buffer")),
+      entry("id", JsonNumber(id))
+    )
+    DiagnosticSourceNamed(name) -> object2(
+      entry("kind", JsonString("named")),
+      entry("name", JsonString(name))
+    )
+  }
+}
+
+--- Encode a location; `null` stands for no location.
+pub fn encode_location(location: DiagnosticLocation) -> Json {
+  match location {
+    DiagnosticLocationNone -> JsonNull
+    DiagnosticSourceRange(source, start, end) ->
+      object3(
+        entry("source", encode_source(source)),
+        entry("start", usize_json(start)),
+        entry("end", usize_json(end))
+      )
+  }
+}
+
+fn related_items(related: DiagnosticRelatedLocationList, acc: List<Json>) -> List<Json> {
+  match related {
+    DiagnosticRelatedLocationNil -> acc.reverse()
+    DiagnosticRelatedLocationCons(DiagnosticRelatedLocation(label, location), rest) ->
+      related_items(
+        rest,
+        Cons(
+          object2(entry("label", JsonString(label)), entry("location", encode_location(location))),
+          acc
+        )
+      )
+  }
+}
+
+fn applicability_name(applicability: DiagnosticSuggestionApplicability) -> str {
+  match applicability {
+    DiagnosticSuggestionUnspecified -> "unspecified"
+    DiagnosticSuggestionMachineApplicable -> "machine_applicable"
+    DiagnosticSuggestionMaybeIncorrect -> "maybe_incorrect"
+  }
+}
+
+fn edit_items(edits: DiagnosticTextEditList, acc: List<Json>) -> List<Json> {
+  match edits {
+    DiagnosticTextEditNil -> acc.reverse()
+    DiagnosticTextEditCons(DiagnosticTextEdit(location, text), rest) ->
+      edit_items(
+        rest,
+        Cons(
+          object2(entry("location", encode_location(location)), entry("text", JsonString(text))),
+          acc
+        )
+      )
+  }
+}
+
+fn encode_field(field: DiagnosticField) -> Json {
+  match field {
+    DiagnosticFieldText(name, value) -> object3(
+      entry("kind", JsonString("text")),
+      entry("name", JsonString(name)),
+      entry("value", JsonString(value))
+    )
+    DiagnosticFieldI64(name, value) -> object3(
+      entry("kind", JsonString("i64")),
+      entry("name", JsonString(name)),
+      entry("value", JsonNumber(value))
+    )
+    DiagnosticFieldU64(name, value) -> object3(
+      entry("kind", JsonString("u64")),
+      entry("name", JsonString(name)),
+      entry("value", u64_json(value))
+    )
+    DiagnosticFieldBool(name, value) -> object3(
+      entry("kind", JsonString("bool")),
+      entry("name", JsonString(name)),
+      entry("value", JsonBool(value))
+    )
+    DiagnosticFieldLocation(name, location) -> object3(
+      entry("kind", JsonString("location")),
+      entry("name", JsonString(name)),
+      entry("value", encode_location(location))
+    )
+    DiagnosticFieldType(name, fact) -> object3(
+      entry("kind", JsonString("type")),
+      entry("name", JsonString(name)),
+      entry("value", types.encode_type(fact))
+    )
+    DiagnosticFieldEffectAtom(name, atom) -> object3(
+      entry("kind", JsonString("effect_atom")),
+      entry("name", JsonString(name)),
+      entry("value", types.encode_effect_atom(atom))
+    )
+    DiagnosticFieldEffectSet(name, effects) -> object3(
+      entry("kind", JsonString("effect_set")),
+      entry("name", JsonString(name)),
+      entry("value", types.encode_effect_set(effects))
+    )
+    DiagnosticFieldSuggestion(DiagnosticSuggestion(message, applicability, edits)) ->
+      object2(
+        entry("kind", JsonString("suggestion")),
+        entry(
+          "value",
+          object3(
+            entry("message", JsonString(message)),
+            entry("applicability", JsonString(applicability_name(applicability))),
+            entry("edits", JsonArray(edit_items(edits, Nil<Json>())))
+          )
+        )
+      )
+  }
+}
+
+fn field_items(fields: DiagnosticFieldList, acc: List<Json>) -> List<Json> {
+  match fields {
+    DiagnosticFieldNil -> acc.reverse()
+    DiagnosticFieldCons(field, rest) -> field_items(rest, Cons(encode_field(field), acc))
+  }
+}
+
+--- Encode a schema v1 diagnostic.
+pub fn encode(diagnostic: Diagnostic) -> Json {
+  match diagnostic {
+    Diagnostic(severity, class, code, message, primary, related, fields) -> {
+      let entries = [
+        entry("schema_version", JsonNumber(1)),
+        entry("severity", JsonString(severity_name(severity))),
+        entry("class", JsonString(class_name(class))),
+        entry(
+          "code",
+          match code {
+            DiagnosticCodeUnassigned -> JsonNull,
+            DiagnosticCodeAssigned(value) -> JsonString(value)
+          }
+        ),
+        entry("message", JsonString(message)),
+        entry("primary", encode_location(primary)),
+        entry("related", JsonArray(related_items(related, Nil<Json>()))),
+        entry("fields", JsonArray(field_items(fields, Nil<Json>())))
+      ]
+      JsonObject(entries_list(entries[..]))
+    }
+  }
+}
+
+fn entries_list(entries: [JsonEntry]) -> List<JsonEntry> {
+  let mut result = Nil<JsonEntry>()
+  for item in entries { result = Cons(item, result) }
+  result.reverse()
+}
+
+-- Decoding.
+fn decode_severity(name: str) -> Result<DiagnosticSeverity, DiagnosticJsonError> {
+  if name == "error" { Ok<DiagnosticSeverity, DiagnosticJsonError>(DiagnosticSeverityError) }
+  else {
+    if name == "warn" { Ok<DiagnosticSeverity, DiagnosticJsonError>(DiagnosticSeverityWarning) }
+    else {
+      if name == "note" { Ok<DiagnosticSeverity, DiagnosticJsonError>(DiagnosticSeverityNote) }
+      else { Err<DiagnosticSeverity, DiagnosticJsonError>(DiagnosticJsonUnknownKind(name)) }
+    }
+  }
+}
+
+--- Decode a class from its wire name; unknown names are additive classes.
+pub fn decode_class(name: str) -> DiagnosticClass {
+  if name == "parse" { DiagnosticClassParse }
+  else {
+    if name == "type" { DiagnosticClassType }
+    else {
+      if name == "effect" { DiagnosticClassEffect }
+      else {
+        if name == "ownership" { DiagnosticClassOwnership }
+        else {
+          if name == "module" { DiagnosticClassModule }
+          else {
+            if name == "link" { DiagnosticClassLink }
+            else {
+              if name == "grammar" { DiagnosticClassGrammar }
+              else {
+                if name == "tool" { DiagnosticClassTool }
+                else {
+                  if name == "runtime" { DiagnosticClassRuntime }
+                  else {
+                    if name == "test" { DiagnosticClassTest }
+                    else { DiagnosticClassOther(name) }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn decode_source(value: Json) -> Result<DiagnosticSource, DiagnosticJsonError> {
+  if json_kind(value) != 5 { return shape<DiagnosticSource>("source", "object") } else { 0 }
+  let kind = kind_of(value)
+  if kind == "unknown" { Ok<DiagnosticSource, DiagnosticJsonError>(DiagnosticSourceUnknown) }
+  else {
+    if kind == "buffer" {
+      match json_object_get(value, "id") {
+        Some(JsonNumber(id)) -> Ok<DiagnosticSource, DiagnosticJsonError>(
+          DiagnosticSourceBuffer(id)
+        )
+        _ -> shape<DiagnosticSource>(kind, "id")
+      }
+    } else {
+      if kind == "named" {
+        match text_member(value, kind, "name") {
+          Err(error) -> Err<DiagnosticSource, DiagnosticJsonError>(error)
+          Ok(name) -> Ok<DiagnosticSource, DiagnosticJsonError>(DiagnosticSourceNamed(name))
+        }
+      } else { Err<DiagnosticSource, DiagnosticJsonError>(DiagnosticJsonUnknownKind(kind)) }
+    }
+  }
+}
+
+--- Decode a location; `null` is no location.
+pub fn decode_location(value: Json) -> Result<DiagnosticLocation, DiagnosticJsonError> {
+  match value {
+    JsonNull -> Ok<DiagnosticLocation, DiagnosticJsonError>(DiagnosticLocationNone)
+    JsonObject(_) -> match present_member(value, "location", "source") {
+      Err(error) -> Err<DiagnosticLocation, DiagnosticJsonError>(error)
+      Ok(source_json) -> match decode_source(source_json) {
+        Err(error) -> Err<DiagnosticLocation, DiagnosticJsonError>(error)
+        Ok(source) -> match usize_member(value, "location", "start") {
+          Err(error) -> Err<DiagnosticLocation, DiagnosticJsonError>(error)
+          Ok(start) -> match usize_member(value, "location", "end") {
+            Err(error) -> Err<DiagnosticLocation, DiagnosticJsonError>(error)
+            Ok(end) -> Ok<DiagnosticLocation, DiagnosticJsonError>(
+              DiagnosticSourceRange(source, start, end)
+            )
+          }
+        }
+      }
+    }
+    _ -> shape<DiagnosticLocation>("location", "object")
+  }
+}
+
+fn decode_related(items: List<Json>) -> Result<DiagnosticRelatedLocationList, DiagnosticJsonError>
+{
+  match items {
+    Nil -> Ok<DiagnosticRelatedLocationList, DiagnosticJsonError>(DiagnosticRelatedLocationNil)
+    Cons(item, rest) -> match text_member(item, "related", "label") {
+      Err(error) -> Err<DiagnosticRelatedLocationList, DiagnosticJsonError>(error)
+      Ok(label) -> match present_member(item, "related", "location") {
+        Err(error) -> Err<DiagnosticRelatedLocationList, DiagnosticJsonError>(error)
+        Ok(location_json) -> match decode_location(location_json) {
+          Err(error) -> Err<DiagnosticRelatedLocationList, DiagnosticJsonError>(error)
+          Ok(location) -> match decode_related(rest) {
+            Err(error) -> Err<DiagnosticRelatedLocationList, DiagnosticJsonError>(error)
+            Ok(tail) -> Ok<DiagnosticRelatedLocationList, DiagnosticJsonError>(
+              DiagnosticRelatedLocationCons(DiagnosticRelatedLocation(label, location), tail)
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
+fn decode_applicability(
+  name: str
+) -> Result<DiagnosticSuggestionApplicability, DiagnosticJsonError> {
+  if name == "unspecified" {
+    Ok<DiagnosticSuggestionApplicability, DiagnosticJsonError>(DiagnosticSuggestionUnspecified)
+  }
+  else {
+    if name == "machine_applicable" {
+      Ok<DiagnosticSuggestionApplicability, DiagnosticJsonError>(
+        DiagnosticSuggestionMachineApplicable
+      )
+    }
+    else {
+      if name == "maybe_incorrect" {
+        Ok<DiagnosticSuggestionApplicability, DiagnosticJsonError>(
+          DiagnosticSuggestionMaybeIncorrect
+        )
+      }
+      else {
+        Err<DiagnosticSuggestionApplicability, DiagnosticJsonError>(
+          DiagnosticJsonUnknownKind(name)
+        )
+      }
+    }
+  }
+}
+
+fn decode_edits(items: List<Json>) -> Result<DiagnosticTextEditList, DiagnosticJsonError> {
+  match items {
+    Nil -> Ok<DiagnosticTextEditList, DiagnosticJsonError>(DiagnosticTextEditNil)
+    Cons(item, rest) -> match present_member(item, "edit", "location") {
+      Err(error) -> Err<DiagnosticTextEditList, DiagnosticJsonError>(error)
+      Ok(location_json) -> match decode_location(location_json) {
+        Err(error) -> Err<DiagnosticTextEditList, DiagnosticJsonError>(error)
+        Ok(location) -> match text_member(item, "edit", "text") {
+          Err(error) -> Err<DiagnosticTextEditList, DiagnosticJsonError>(error)
+          Ok(text) -> match decode_edits(rest) {
+            Err(error) -> Err<DiagnosticTextEditList, DiagnosticJsonError>(error)
+            Ok(tail) -> Ok<DiagnosticTextEditList, DiagnosticJsonError>(
+              DiagnosticTextEditCons(DiagnosticTextEdit(location, text), tail)
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
+fn decode_suggestion(value: Json) -> Result<DiagnosticField, DiagnosticJsonError> {
+  match text_member(value, "suggestion", "message") {
+    Err(error) -> Err<DiagnosticField, DiagnosticJsonError>(error)
+    Ok(message) -> match text_member(value, "suggestion", "applicability") {
+      Err(error) -> Err<DiagnosticField, DiagnosticJsonError>(error)
+      Ok(applicability_name) -> match decode_applicability(applicability_name) {
+        Err(error) -> Err<DiagnosticField, DiagnosticJsonError>(error)
+        Ok(applicability) -> match array_member(value, "suggestion", "edits") {
+          Err(error) -> Err<DiagnosticField, DiagnosticJsonError>(error)
+          Ok(items) -> match decode_edits(items) {
+            Err(error) -> Err<DiagnosticField, DiagnosticJsonError>(error)
+            Ok(edits) -> Ok<DiagnosticField, DiagnosticJsonError>(
+              DiagnosticFieldSuggestion(DiagnosticSuggestion(message, applicability, edits))
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
+fn typed<T>(result: Result<T, types.SemanticJsonError>) -> Result<T, DiagnosticJsonError> {
+  match result {
+    Ok(value) -> Ok<T, DiagnosticJsonError>(value)
+    Err(error) -> Err<T, DiagnosticJsonError>(DiagnosticJsonType(error))
+  }
+}
+
+fn decode_field(item: Json) -> Result<DiagnosticField, DiagnosticJsonError> {
+  if json_kind(item) != 5 { return shape<DiagnosticField>("field", "object") } else { 0 }
+  let kind = kind_of(item)
+  if kind == "suggestion" {
+    match present_member(item, kind, "value") {
+      Err(error) -> Err<DiagnosticField, DiagnosticJsonError>(error)
+      Ok(value) -> decode_suggestion(value)
+    }
+  } else {
+    match text_member(item, kind, "name") {
+      Err(error) -> Err<DiagnosticField, DiagnosticJsonError>(error)
+      Ok(name) -> match present_member(item, kind, "value") {
+        Err(error) -> Err<DiagnosticField, DiagnosticJsonError>(error)
+        Ok(value) -> if kind == "text" {
+          match value {
+            JsonString(text) -> Ok<DiagnosticField, DiagnosticJsonError>(
+              DiagnosticFieldText(name, text)
+            ),
+            _ -> shape<DiagnosticField>(kind, "value")
+          }
+        } else {
+          if kind == "i64" {
+            match value {
+              JsonNumber(number) -> Ok<DiagnosticField, DiagnosticJsonError>(
+                DiagnosticFieldI64(name, number)
+              ),
+              _ -> shape<DiagnosticField>(kind, "value")
+            }
+          } else {
+            if kind == "u64" {
+              match value {
+                JsonNumber(number) -> match number.to_u64_checked() {
+                  Ok(wide) -> Ok<DiagnosticField, DiagnosticJsonError>(
+                    DiagnosticFieldU64(name, wide)
+                  )
+                  Err(_) -> shape<DiagnosticField>(kind, "value")
+                }
+                JsonString(text) -> match parse_u64_text(text) {
+                  Some(wide) -> Ok<DiagnosticField, DiagnosticJsonError>(
+                    DiagnosticFieldU64(name, wide)
+                  )
+                  None -> shape<DiagnosticField>(kind, "value")
+                }
+                _ -> shape<DiagnosticField>(kind, "value")
+              }
+            } else {
+              if kind == "bool" {
+                match value {
+                  JsonBool(flag) -> Ok<DiagnosticField, DiagnosticJsonError>(
+                    DiagnosticFieldBool(name, flag)
+                  ),
+                  _ -> shape<DiagnosticField>(kind, "value")
+                }
+              } else {
+                if kind == "location" {
+                  match decode_location(value) {
+                    Err(error) -> Err<DiagnosticField, DiagnosticJsonError>(error)
+                    Ok(location) -> Ok<DiagnosticField, DiagnosticJsonError>(
+                      DiagnosticFieldLocation(name, location)
+                    )
+                  }
+                } else {
+                  if kind == "type" {
+                    match typed<SemanticTypeFact>(types.decode_type(value)) {
+                      Err(error) -> Err<DiagnosticField, DiagnosticJsonError>(error)
+                      Ok(fact) -> Ok<DiagnosticField, DiagnosticJsonError>(
+                        DiagnosticFieldType(name, fact)
+                      )
+                    }
+                  } else {
+                    if kind == "effect_atom" {
+                      match typed<SemanticEffectAtomFact>(types.decode_effect_atom(value)) {
+                        Err(error) -> Err<DiagnosticField, DiagnosticJsonError>(error)
+                        Ok(atom) -> Ok<DiagnosticField, DiagnosticJsonError>(
+                          DiagnosticFieldEffectAtom(name, atom)
+                        )
+                      }
+                    } else {
+                      if kind == "effect_set" {
+                        match typed<SemanticEffectSetFact>(types.decode_effect_set(value)) {
+                          Err(error) -> Err<DiagnosticField, DiagnosticJsonError>(error)
+                          Ok(effects) -> Ok<DiagnosticField, DiagnosticJsonError>(
+                            DiagnosticFieldEffectSet(name, effects)
+                          )
+                        }
+                      } else {
+                        Err<DiagnosticField, DiagnosticJsonError>(DiagnosticJsonUnknownKind(kind))
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn decode_fields(items: List<Json>) -> Result<DiagnosticFieldList, DiagnosticJsonError> {
+  match items {
+    Nil -> Ok<DiagnosticFieldList, DiagnosticJsonError>(DiagnosticFieldNil)
+    Cons(item, rest) -> match decode_field(item) {
+      Err(error) -> Err<DiagnosticFieldList, DiagnosticJsonError>(error)
+      Ok(field) -> match decode_fields(rest) {
+        Err(error) -> Err<DiagnosticFieldList, DiagnosticJsonError>(error)
+        Ok(tail) -> Ok<DiagnosticFieldList, DiagnosticJsonError>(DiagnosticFieldCons(field, tail))
+      }
+    }
+  }
+}
+
+--- Decode a schema v1 diagnostic.
+pub fn decode(value: Json) -> Result<Diagnostic, DiagnosticJsonError> {
+  if json_kind(value) != 5 { return shape<Diagnostic>("diagnostic", "object") } else { 0 }
+  if json_object_get_i64(value, "schema_version", 0) != 1 {
+    return shape<Diagnostic>("diagnostic", "schema_version")
+  } else { 0 }
+  match text_member(value, "diagnostic", "severity") {
+    Err(error) -> Err<Diagnostic, DiagnosticJsonError>(error)
+    Ok(severity_text) -> match decode_severity(severity_text) {
+      Err(error) -> Err<Diagnostic, DiagnosticJsonError>(error)
+      Ok(severity) -> match text_member(value, "diagnostic", "class") {
+        Err(error) -> Err<Diagnostic, DiagnosticJsonError>(error)
+        Ok(class_text) -> match text_member(value, "diagnostic", "message") {
+          Err(error) -> Err<Diagnostic, DiagnosticJsonError>(error)
+          Ok(message) -> {
+            let code = match json_object_get(value, "code") {
+              Some(JsonString(text)) -> Ok<DiagnosticCode, DiagnosticJsonError>(
+                DiagnosticCodeAssigned(text)
+              )
+              Some(JsonNull) -> Ok<DiagnosticCode, DiagnosticJsonError>(DiagnosticCodeUnassigned)
+              None -> Ok<DiagnosticCode, DiagnosticJsonError>(DiagnosticCodeUnassigned)
+              _ -> shape<DiagnosticCode>("diagnostic", "code")
+            }
+            match code {
+              Err(error) -> Err<Diagnostic, DiagnosticJsonError>(error)
+              Ok(assigned) -> match present_member(value, "diagnostic", "primary") {
+                Err(error) -> Err<Diagnostic, DiagnosticJsonError>(error)
+                Ok(primary_json) -> match decode_location(primary_json) {
+                  Err(error) -> Err<Diagnostic, DiagnosticJsonError>(error)
+                  Ok(primary) -> match array_member(value, "diagnostic", "related") {
+                    Err(error) -> Err<Diagnostic, DiagnosticJsonError>(error)
+                    Ok(related_items) -> match decode_related(related_items) {
+                      Err(error) -> Err<Diagnostic, DiagnosticJsonError>(error)
+                      Ok(related) -> match array_member(value, "diagnostic", "fields") {
+                        Err(error) -> Err<Diagnostic, DiagnosticJsonError>(error)
+                        Ok(field_items) -> match decode_fields(field_items) {
+                          Err(error) -> Err<Diagnostic, DiagnosticJsonError>(error)
+                          Ok(fields) -> Ok<Diagnostic, DiagnosticJsonError>(
+                            Diagnostic(
+                              severity,
+                              decode_class(class_text),
+                              assigned,
+                              message,
+                              primary,
+                              related,
+                              fields
+                            )
+                          )
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- Render an error for tool output.
+pub fn error_message(error: DiagnosticJsonError) -> str {
+  match error {
+    DiagnosticJsonShape(kind, what) -> str_concat(
+      "diagnostic JSON: ",
+      str_concat(kind, str_concat(" needs ", what))
+    )
+    DiagnosticJsonUnknownKind(kind) -> str_concat("diagnostic JSON: unknown kind ", kind)
+    DiagnosticJsonType(inner) -> types.error_message(inner)
+  }
+}
