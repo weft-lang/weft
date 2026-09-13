@@ -273,6 +273,7 @@ check_rejects "task_shutdown_scope_escape" "test/negative/task_shutdown_scope_es
 check_rejects "task_channel_shutdown_scope_escape" "test/negative/task_channel_shutdown_scope_escape.weft" "type error: Task cannot escape its structured task scope"
 check_rejects "channel_non_sendable_element" "test/negative/channel_non_sendable_element.weft" 'does not implement `Sendable`'
 check_rejects "channel_non_sendable_signature" "test/negative/channel_non_sendable_signature.weft" 'does not implement `Sendable`' 1
+check_rejects "grammar_tooling_missing_conformance" "test/negative/grammar_tooling_missing_conformance.weft" 'error[E1004]: type `plain.WordGrammar` does not implement `stdlib/grammar/tooling.GrammarTooling`'
 check_rejects "channel_non_sendable_handler" "test/negative/channel_non_sendable_handler.weft" 'does not implement `Sendable`' 1
 check_rejects "task_double_join" "test/negative/task_double_join.weft" "type error: unique value used more than once"
 check_rejects "task_constructor_private" "test/negative/task_constructor_private.weft" "type error: opaque constructor is private to its declaring module; use an exported factory"
