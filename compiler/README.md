@@ -11,7 +11,8 @@ compiler/
     grammar.weft        public Grammar implementation
     check.weft          public CheckedGrammar implementation
     check/              declaration registration, checking, and host-type interpretation
-    syntax/             declarations, imports, literals, and concrete syntax graph
+    syntax/             declarations, imports, literals, primitive spellings, and
+                        the concrete syntax graph
     facts/              Weft semantic fact producers
     unicode/            generated language tables
   source/               retained inputs, loading, provenance, and trust policy
