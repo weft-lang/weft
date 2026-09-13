@@ -1240,6 +1240,8 @@ check_rejects "generic_ctor_conflicting_args" "test/negative/generic_ctor_confli
 check_rejects "qualified_ctor_call" "test/negative/qualified_ctor_call.weft" "type error: qualified constructor syntax is not supported"
 check_rejects "qualified_ctor_nullary" "test/negative/qualified_ctor_nullary.weft" "type error: qualified constructor syntax is not supported"
 check_rejects "interp_display_missing_impl" "test/negative/interp_display_missing_impl.weft" "implement Display for the interpolated type"
+check_rejects "dot_display_missing_impl" "test/negative/dot_display_missing_impl.weft" "type error: unknown method
+" 1
 check_rejects "interp_unbound_identifier" "test/negative/interp_unbound_identifier.weft" "unknown identifier 'missing'" 1
 check_rejects "interp_unterminated_expression" "test/negative/interp_unterminated_expression.weft" "interpolation expression is not terminated before end of string" 1
 check_rejects "interp_unmatched_close" "test/negative/interp_unmatched_close.weft" "single '}' is not valid in an interpolated string" 1
