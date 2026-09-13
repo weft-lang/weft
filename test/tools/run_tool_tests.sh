@@ -914,10 +914,13 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_env_pins_public_surface" "$(<"$tmp_out")" "Public API items: 4. Documented: 4."
     assert_contains "doc_stdlib_env_pins_optional_argument" "$(<"$tmp_out")" "fn arg(index: i64) -> str | nil"
   elif [ "$stdlib_doc_name" = "process" ]; then
-    assert_contains "doc_stdlib_process_pins_public_surface" "$(<"$tmp_out")" "Public API items: 18. Documented: 18."
+    assert_contains "doc_stdlib_process_pins_public_surface" "$(<"$tmp_out")" "Public API items: 40. Documented: 40."
     assert_contains "doc_stdlib_process_pins_typed_run" "$(<"$tmp_out")" "fn run(path: str, args: List<str>) -> Result<ProcTermination, ProcError>"
     assert_contains "doc_stdlib_process_pins_opaque_owner" "$(<"$tmp_out")" "pub type ProcHandle = opaque"
     assert_contains "doc_stdlib_process_pins_typed_deadline" "$(<"$tmp_out")" "fn wait_until(resource: ProcHandle, deadline: Instant) -> ProcOutput"
+    assert_contains "doc_stdlib_process_pins_opaque_session" "$(<"$tmp_out")" "pub type ProcSession = opaque"
+    assert_contains "doc_stdlib_process_pins_session_threading" "$(<"$tmp_out")" "fn session_read(session: ProcSession, limit: usize, deadline: Instant) -> (owned ProcSession, ProcReadOutcome)"
+    assert_contains "doc_stdlib_process_pins_session_drop" "$(<"$tmp_out")" "impl stdlib/drop.Drop for ProcSession"
   elif [ "$stdlib_doc_name" = "net_address" ]; then
     assert_contains "doc_stdlib_net_address_pins_public_surface" "$(<"$tmp_out")" "Public API items: 23. Documented: 23."
   elif [ "$stdlib_doc_name" = "idna" ]; then
@@ -1907,7 +1910,8 @@ assert_not_contains "elf_linux_env_has_no_dynamic_segment" "$elf_linux_env_heade
 # Proc remains a typed, mockable capability while the sealed target runtime
 # selects the kernel process ABI. This product covers synchronous execution,
 # owned async handles, capture, environment inheritance, exec failure,
-# signal termination, timeout kill/reap and Drop cleanup without libc.
+# signal termination, timeout kill/reap, an interactive session (stdin pipe,
+# live reads, SIGPIPE disposition) and Drop cleanup without libc.
 run_weft_compile_guarded "$WEFT" compile tools/elf_linux_aarch64_process_smoke.weft > "$tmp_elf_generator" 2> "$tmp_err"
 chmod +x "$tmp_elf_generator"
 assert_equals "elf_linux_process_generator_build_stderr_empty" "$(<"$tmp_err")" ""
@@ -1927,6 +1931,7 @@ assert_contains "elf_linux_process_selects_write" "$elf_linux_process_disassembl
 assert_contains "elf_linux_process_selects_exit_group" "$elf_linux_process_disassembly" $'mov\tx8, #0x5e'
 assert_contains "elf_linux_process_selects_nanosleep" "$elf_linux_process_disassembly" $'mov\tx8, #0x65'
 assert_contains "elf_linux_process_selects_kill" "$elf_linux_process_disassembly" $'mov\tx8, #0x81'
+assert_contains "elf_linux_process_selects_rt_sigaction" "$elf_linux_process_disassembly" $'mov\tx8, #0x86'
 assert_contains "elf_linux_process_selects_clone" "$elf_linux_process_disassembly" $'mov\tx8, #0xdc'
 assert_contains "elf_linux_process_selects_execve" "$elf_linux_process_disassembly" $'mov\tx8, #0xdd'
 assert_contains "elf_linux_process_selects_wait4" "$elf_linux_process_disassembly" $'mov\tx8, #0x104'

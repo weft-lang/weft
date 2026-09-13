@@ -1,0 +1,550 @@
+-- test/linked/proc_session.weft -- interactive child sessions on Proc
+--
+-- The platform handler exercises real children on the host; scripted
+-- handlers prove every session operation is interpretable without one.
+
+use compiler/storage.{*}
+use runtime/alloc.{alloc_zeroed}
+use runtime/memory.{mem_copy, mem_store64_at}
+use runtime/process as process_handler
+use runtime/time as platform_time
+use stdlib/bytes as bytes
+use stdlib/bytes.{Bytes}
+use stdlib/list.{*}
+use stdlib/process.{*}
+use stdlib/result.{Ok, Err}
+use stdlib/string.{*}
+use stdlib/time as time
+use stdlib/time/monotonic as monotonic
+use stdlib/time/monotonic.{Instant}
+use stdlib/vector as vector
+
+fn session_test_cstr(value: str) -> i64 {
+  let result = alloc_zeroed(__str_len(value) + 1)
+  mem_copy(result, __str_ptr(value), __str_len(value))
+  result
+}
+
+fn session_test_argv() -> i64 {
+  let argv = alloc_zeroed(24)
+  mem_store64_at(argv, 0, 0)
+  mem_store64_at(argv, 8, session_test_cstr("PATH=/usr/bin:/bin"))
+  mem_store64_at(argv, 16, 0)
+  argv
+}
+
+fn session_platform(body: () -[Proc]> i64) -> i64 {
+  with process_handler(0, session_test_argv()) { body() }
+}
+
+fn session_args2(first: str, second: str) -> List<str> {
+  Cons<str>(first, Cons<str>(second, Nil<str>()))
+}
+
+fn soon() -> Instant {
+  platform_time.with_platform(() => monotonic.now()).add(time.seconds(5))
+}
+
+fn shortly() -> Instant {
+  platform_time.with_platform(() => monotonic.now()).add(time.milliseconds(100))
+}
+
+fn text_of(chunk: Bytes) -> str {
+  match chunk.to_utf8() {
+    Ok(text) -> text
+    Err(_) -> "<invalid utf-8>"
+  }
+}
+
+fn repeated_bytes(count: i64, value: u8) -> Bytes {
+  let mut values = vector.with_capacity<u8>(__i64_to_usize(count))
+  for i in 0..count { values.push(value) }
+  bytes.from_vector(values)
+}
+
+fn written(outcome: ProcWriteOutcome) -> bool {
+  match outcome { ProcWritten -> true, _ -> false }
+}
+
+fn refused_after(outcome: ProcWriteOutcome, count: i64) -> bool {
+  match outcome { ProcWriteRefused(accepted) -> accepted == __i64_to_usize(count), _ -> false }
+}
+
+fn chunk_text(outcome: ProcReadOutcome, stream_is_stdout: bool) -> str {
+  match outcome {
+    ProcReadChunk(ProcStdout, chunk) -> if stream_is_stdout { text_of(chunk) } else { "<stderr>" }
+    ProcReadChunk(ProcStderr, chunk) -> if stream_is_stdout { "<stdout>" } else { text_of(chunk) }
+    ProcReadEnded -> "<ended>"
+    ProcReadTimedOut -> "<timed out>"
+    ProcReadFailed(_) -> "<failed>"
+  }
+}
+
+fn ended(outcome: ProcReadOutcome) -> bool {
+  match outcome { ProcReadEnded -> true, _ -> false }
+}
+
+fn timed_out(outcome: ProcReadOutcome) -> bool {
+  match outcome { ProcReadTimedOut -> true, _ -> false }
+}
+
+fn completed_exact(
+  output: ProcOutput,
+  expected_status: i64,
+  expected_stdout: str,
+  expected_stderr: str
+) -> bool {
+  match output {
+    ProcCompleted(ProcExited(status), stdout_text, stderr_text) ->
+      status == expected_status and
+      str_eq(stdout_text, expected_stdout) == 1 and
+      str_eq(stderr_text, expected_stderr) == 1
+    _ -> false
+  }
+}
+
+fn completed_lengths(
+  output: ProcOutput,
+  expected_status: i64,
+  stdout_len: i64,
+  stderr_len: i64
+) -> bool {
+  match output {
+    ProcCompleted(ProcExited(status), stdout_text, stderr_text) ->
+      status == expected_status and __str_len(stdout_text) == stdout_len and __str_len(
+        stderr_text
+      ) == stderr_len
+    _ -> false
+  }
+}
+
+fn chunk_len(chunk: Bytes) -> i64 { __u64_to_i64(__usize_to_u64(chunk.len())) }
+
+-- Read until both streams end, returning the total stdout and stderr bytes.
+-- Recursion threads the owned session; a moved binding cannot be reassigned
+-- inside a loop.
+fn drain_from(
+  session: ProcSession,
+  limit: usize,
+  stdout_total: i64,
+  stderr_total: i64
+) -[Proc]> (owned ProcSession, i64, i64) {
+  let (next, outcome) = Proc.session_read(session, limit, soon())
+  match outcome {
+    ProcReadChunk(ProcStdout, chunk) -> drain_from(
+      next,
+      limit,
+      stdout_total + chunk_len(chunk),
+      stderr_total
+    )
+    ProcReadChunk(ProcStderr, chunk) -> drain_from(
+      next,
+      limit,
+      stdout_total,
+      stderr_total + chunk_len(chunk)
+    )
+    _ -> (next, stdout_total, stderr_total)
+  }
+}
+
+fn drain_all(session: ProcSession, limit: usize) -[Proc]> (owned ProcSession, i64, i64) {
+  drain_from(session, limit, 0, 0)
+}
+
+fn echo_round_trip_probe() -[Proc]> i64 {
+  let session: owned ProcSession = Proc.open_session("/bin/cat", Nil<str>())
+  let (after_write, wrote) = Proc.session_write(session, bytes.from_str("hello session"), soon())
+  if not written(wrote) { return 1 } else { 0 }
+  let (after_read, got) = Proc.session_read(after_write, __i64_to_usize(64), soon())
+  if str_eq(chunk_text(got, true), "hello session") == 0 { return 2 } else { 0 }
+  let closed = Proc.session_close_input(after_read)
+  let (finished, ended_outcome) = Proc.session_read(closed, __i64_to_usize(64), soon())
+  if not ended(ended_outcome) { return 3 } else { 0 }
+  if completed_exact(Proc.session_finish(finished), 0, "", "") { 0 } else { 4 }
+}
+
+test "proc_session_echo_round_trip_through_cat" {
+  Test.assert_eq(session_platform(echo_round_trip_probe), 0)
+}
+
+fn chunk_limit_probe() -[Proc]> i64 {
+  let session: owned ProcSession = Proc.open_session("/bin/cat", Nil<str>())
+  let (after_write, wrote) = Proc.session_write(session, bytes.from_str("abcdefgh"), soon())
+  if not written(wrote) { return 1 } else { 0 }
+  let (after_first, first) = Proc.session_read(after_write, __i64_to_usize(3), soon())
+  if str_eq(chunk_text(first, true), "abc") == 0 { return 2 } else { 0 }
+  let (after_second, second) = Proc.session_read(after_first, __i64_to_usize(3), soon())
+  if str_eq(chunk_text(second, true), "def") == 0 { return 3 } else { 0 }
+  let (after_third, third) = Proc.session_read(after_second, __i64_to_usize(3), soon())
+  if str_eq(chunk_text(third, true), "gh") == 0 { return 4 } else { 0 }
+  if completed_exact(Proc.session_finish(after_third), 0, "", "") { 0 } else { 5 }
+}
+
+test "proc_session_read_limit_bounds_each_chunk" {
+  Test.assert_eq(session_platform(chunk_limit_probe), 0)
+}
+
+fn large_write_probe() -[Proc]> i64 {
+  -- cat echoes every byte; the write can only complete if output is drained
+  -- while the input pipe is full.
+  let session: owned ProcSession = Proc.open_session("/bin/cat", Nil<str>())
+  let (after_write, wrote) = Proc.session_write(
+    session,
+    repeated_bytes(300000, __u64_to_u8(97)),
+    soon()
+  )
+  if not written(wrote) { return 1 } else { 0 }
+  let closed = Proc.session_close_input(after_write)
+  let (drained, stdout_total, stderr_total) = drain_all(closed, __i64_to_usize(65536))
+  if stdout_total != 300000 { return 2 } else { 0 }
+  if stderr_total != 0 { return 3 } else { 0 }
+  if completed_exact(Proc.session_finish(drained), 0, "", "") { 0 } else { 4 }
+}
+
+test "proc_session_write_drains_output_beyond_pipe_capacity" {
+  Test.assert_eq(session_platform(large_write_probe), 0)
+}
+
+fn unread_output_probe() -[Proc]> i64 {
+  -- Output nobody read, stored while writing or still in the pipe, comes
+  -- back from finish.
+  let session: owned ProcSession = Proc.open_session("/bin/cat", Nil<str>())
+  let (after_write, wrote) = Proc.session_write(
+    session,
+    repeated_bytes(200000, __u64_to_u8(98)),
+    soon()
+  )
+  if not written(wrote) { return 1 } else { 0 }
+  let closed = Proc.session_close_input(after_write)
+  if completed_lengths(Proc.session_finish(closed), 0, 200000, 0) { 0 } else { 2 }
+}
+
+test "proc_session_finish_returns_unread_output" {
+  Test.assert_eq(session_platform(unread_output_probe), 0)
+}
+
+fn stderr_backpressure_probe() -[Proc]> i64 {
+  -- The child floods stderr before it reads a byte of input.
+  let session: owned ProcSession = Proc.open_session(
+    "/bin/sh",
+    session_args2("-c", "head -c 200000 /dev/zero >&2; cat")
+  )
+  let (after_write, wrote) = Proc.session_write(
+    session,
+    repeated_bytes(100000, __u64_to_u8(99)),
+    soon()
+  )
+  if not written(wrote) { return 1 } else { 0 }
+  let closed = Proc.session_close_input(after_write)
+  let (drained, stdout_total, stderr_total) = drain_all(closed, __i64_to_usize(4096))
+  if stdout_total != 100000 { return 2 } else { 0 }
+  if stderr_total != 200000 { return 3 } else { 0 }
+  if completed_exact(Proc.session_finish(drained), 0, "", "") { 0 } else { 4 }
+}
+
+test "proc_session_write_survives_stderr_backpressure" {
+  Test.assert_eq(session_platform(stderr_backpressure_probe), 0)
+}
+
+fn mid_frame_exit_probe() -[Proc]> i64 {
+  let session: owned ProcSession = Proc.open_session(
+    "/bin/sh",
+    session_args2("-c", "printf partial; printf warn >&2; exit 3")
+  )
+  let (after_first, first) = Proc.session_read(session, __i64_to_usize(64), soon())
+  if str_eq(chunk_text(first, true), "partial") == 0 { return 1 } else { 0 }
+  let (after_second, second) = Proc.session_read(after_first, __i64_to_usize(64), soon())
+  if str_eq(chunk_text(second, false), "warn") == 0 { return 2 } else { 0 }
+  let (after_third, third) = Proc.session_read(after_second, __i64_to_usize(64), soon())
+  if not ended(third) { return 3 } else { 0 }
+  -- The child is gone: a write is refused instead of killing this process.
+  let (after_write, wrote) = Proc.session_write(after_third, bytes.from_str("too late"), soon())
+  if not refused_after(wrote, 0) { return 4 } else { 0 }
+  let (after_fourth, fourth) = Proc.session_read(after_write, __i64_to_usize(64), soon())
+  if not ended(fourth) { return 5 } else { 0 }
+  if completed_exact(Proc.session_finish(after_fourth), 3, "", "") { 0 } else { 6 }
+}
+
+test "proc_session_child_exit_ends_reads_and_refuses_writes" {
+  Test.assert_eq(session_platform(mid_frame_exit_probe), 0)
+}
+
+fn read_deadline_probe() -[Proc]> i64 {
+  let session: owned ProcSession = Proc.open_session("/bin/cat", Nil<str>())
+  let (after_wait, waited) = Proc.session_read(session, __i64_to_usize(64), shortly())
+  if not timed_out(waited) { return 1 } else { 0 }
+  let (after_poll, polled) = Proc.session_read(
+    after_wait,
+    __i64_to_usize(64),
+    monotonic.nanoseconds(0)
+  )
+  if not timed_out(polled) { return 2 } else { 0 }
+  let (after_write, wrote) = Proc.session_write(
+    after_poll,
+    bytes.from_str("still here"),
+    monotonic.nanoseconds(0)
+  )
+  if not written(wrote) { return 3 } else { 0 }
+  let (after_read, got) = Proc.session_read(after_write, __i64_to_usize(64), soon())
+  if str_eq(chunk_text(got, true), "still here") == 0 { return 4 } else { 0 }
+  if completed_exact(Proc.session_finish(after_read), 0, "", "") { 0 } else { 5 }
+}
+
+test "proc_session_read_deadline_keeps_the_session_usable" {
+  Test.assert_eq(session_platform(read_deadline_probe), 0)
+}
+
+fn write_deadline_probe() -[Proc]> i64 {
+  -- A child that never reads fills its input pipe; the write times out with
+  -- the accepted count and the session is still finishable.
+  let session: owned ProcSession = Proc.open_session(
+    "/bin/sh",
+    session_args2("-c", "while :; do :; done")
+  )
+  let (after_write, wrote) = Proc.session_write(
+    session,
+    repeated_bytes(1000000, __u64_to_u8(100)),
+    shortly()
+  )
+  let accepted = match wrote {
+    ProcWriteTimedOut(count) -> __u64_to_i64(__usize_to_u64(count))
+    _ -> 0 - 1
+  }
+  if accepted < 0 or accepted >= 1000000 { return 1 } else { 0 }
+  match Proc.session_finish_until(after_write, shortly()) {
+    ProcTimedOut(ProcSignaled(signal), stdout_text, stderr_text) ->
+      if signal == 9 and __str_len(stdout_text) == 0 { 0 } else { 2 }
+    _ -> 3
+  }
+}
+
+test "proc_session_write_deadline_reports_accepted_bytes_and_finish_kills" {
+  Test.assert_eq(session_platform(write_deadline_probe), 0)
+}
+
+fn finish_deadline_probe() -[Proc]> i64 {
+  let session: owned ProcSession = Proc.open_session(
+    "/bin/sh",
+    session_args2("-c", "printf early; while :; do :; done")
+  )
+  match Proc.session_finish_until(session, shortly()) {
+    ProcTimedOut(ProcSignaled(signal), stdout_text, stderr_text) ->
+      if signal == 9 and str_eq(stdout_text, "early") == 1 and str_eq(stderr_text, "") == 1 { 0 } else {
+        1
+      }
+    _ -> 2
+  }
+}
+
+test "proc_session_finish_deadline_kills_reaps_and_keeps_output" {
+  Test.assert_eq(session_platform(finish_deadline_probe), 0)
+}
+
+fn pid_line_probe() -[Proc]> str {
+  let session: owned ProcSession = Proc.open_session(
+    "/bin/sh",
+    session_args2("-c", "echo $$; exec sleep 30")
+  )
+  let (after_read, got) = Proc.session_read(session, __i64_to_usize(64), soon())
+  str_trim(chunk_text(got, true))
+}
+
+fn pid_alive(pid_text: str) -[Proc]> bool {
+  match Proc.run(
+    "/bin/sh",
+    session_args2("-c", str_concat("kill -0 ", str_concat(pid_text, " 2>/dev/null")))
+  ) {
+    Ok(ProcExited(status)) -> status == 0
+    _ -> false
+  }
+}
+
+fn drop_kills_probe() -[Proc]> i64 {
+  let pid_text = pid_line_probe()
+  if __str_len(pid_text) == 0 { return 1 } else { 0 }
+  if pid_alive(pid_text) { 2 } else { 0 }
+}
+
+test "proc_session_drop_kills_and_reaps_the_child" {
+  Test.assert_eq(session_platform(drop_kills_probe), 0)
+}
+
+fn spawn_failure_probe() -[Proc]> i64 {
+  let session: owned ProcSession = Proc.open_session(
+    "/weft-session-definitely-missing",
+    Nil<str>()
+  )
+  let (after_write, wrote) = Proc.session_write(session, bytes.from_str("x"), soon())
+  let write_failed = match wrote {
+    ProcWriteFailed(ProcSpawnFailed(error), accepted) -> error > 0 and accepted == __i64_to_usize(
+      0
+    )
+    _ -> false
+  }
+  if not write_failed { return 1 } else { 0 }
+  let (after_read, got) = Proc.session_read(after_write, __i64_to_usize(8), soon())
+  let read_failed = match got {
+    ProcReadFailed(ProcSpawnFailed(error)) -> error > 0
+    _ -> false
+  }
+  if not read_failed { return 2 } else { 0 }
+  let closed = Proc.session_close_input(after_read)
+  match Proc.session_finish(closed) {
+    ProcFailed(ProcSpawnFailed(error), stdout_text, stderr_text) ->
+      if error > 0 and __str_len(stdout_text) == 0 and __str_len(stderr_text) == 0 { 0 } else {
+        3
+      }
+    _ -> 4
+  }
+}
+
+test "proc_session_spawn_failure_is_a_value_through_every_operation" {
+  Test.assert_eq(session_platform(spawn_failure_probe), 0)
+}
+
+fn closed_input_probe() -[Proc]> i64 {
+  let session: owned ProcSession = Proc.open_session("/bin/cat", Nil<str>())
+  let closed = Proc.session_close_input(session)
+  let closed_again = Proc.session_close_input(closed)
+  let (after_write, wrote) = Proc.session_write(closed_again, bytes.from_str("ignored"), soon())
+  if not refused_after(wrote, 0) { return 1 } else { 0 }
+  let (after_zero, zero) = Proc.session_read(after_write, __i64_to_usize(0), soon())
+  let zero_rejected = match zero {
+    ProcReadFailed(ProcStreamFailed(error)) -> error == 22
+    _ -> false
+  }
+  if not zero_rejected { return 2 } else { 0 }
+  let (after_end, end_outcome) = Proc.session_read(after_zero, __i64_to_usize(8), soon())
+  if not ended(end_outcome) { return 3 } else { 0 }
+  if completed_exact(Proc.session_finish(after_end), 0, "", "") { 0 } else { 4 }
+}
+
+test "proc_session_closed_input_refuses_writes_and_zero_limit_reads_are_rejected" {
+  Test.assert_eq(session_platform(closed_input_probe), 0)
+}
+
+fn coexisting_children_probe() -[Proc]> i64 {
+  let first: owned ProcSession = Proc.open_session("/bin/cat", Nil<str>())
+  let second: owned ProcSession = Proc.open_session("/bin/cat", Nil<str>())
+  let captured: owned ProcHandle = Proc.spawn("/bin/sh", session_args2("-c", "printf handle"))
+  let (first_written, first_wrote) = Proc.session_write(first, bytes.from_str("one"), soon())
+  let (second_written, second_wrote) = Proc.session_write(second, bytes.from_str("two"), soon())
+  if not (written(first_wrote) and written(second_wrote)) { return 1 } else { 0 }
+  let (second_read, second_got) = Proc.session_read(second_written, __i64_to_usize(8), soon())
+  let (first_read, first_got) = Proc.session_read(first_written, __i64_to_usize(8), soon())
+  if str_eq(chunk_text(first_got, true), "one") == 0 or str_eq(
+    chunk_text(second_got, true),
+    "two"
+  ) == 0 { return 2 } else { 0 }
+  if not completed_exact(Proc.wait(captured), 0, "handle", "") { return 3 } else { 0 }
+  -- Closing one session's input must not end the other's: the second cat
+  -- still echoes after the first has finished.
+  let first_closed = Proc.session_close_input(first_read)
+  if not completed_exact(Proc.session_finish(first_closed), 0, "", "") { return 4 } else { 0 }
+  let (second_again, second_wrote_again) = Proc.session_write(
+    second_read,
+    bytes.from_str("still two"),
+    soon()
+  )
+  if not written(second_wrote_again) { return 5 } else { 0 }
+  let (second_final, second_final_got) = Proc.session_read(
+    second_again,
+    __i64_to_usize(16),
+    soon()
+  )
+  if str_eq(chunk_text(second_final_got, true), "still two") == 0 { return 6 } else { 0 }
+  let second_closed = Proc.session_close_input(second_final)
+  if completed_exact(Proc.session_finish(second_closed), 0, "", "") { 0 } else { 7 }
+}
+
+test "proc_session_descriptors_do_not_leak_between_children" {
+  Test.assert_eq(session_platform(coexisting_children_probe), 0)
+}
+
+-- Scripted interpretation without a child.
+fn scripted_probe() -[Proc]> i64 {
+  let session: owned ProcSession = Proc.open_session("mock-tool", session_args2("--mode", "echo"))
+  let (after_write, wrote) = Proc.session_write(
+    session,
+    bytes.from_str("ping"),
+    monotonic.nanoseconds(11)
+  )
+  let write_ok = match wrote {
+    ProcWriteTimedOut(count) -> count == __i64_to_usize(2),
+    _ -> false
+  }
+  let (after_read, got) = Proc.session_read(
+    after_write,
+    __i64_to_usize(9),
+    monotonic.nanoseconds(12)
+  )
+  let read_ok = str_eq(chunk_text(got, false), "pong") == 1
+  let closed = Proc.session_close_input(after_read)
+  let output = Proc.session_finish_until(closed, monotonic.nanoseconds(13))
+  let finish_ok = completed_exact(output, 5, "left", "over")
+  (if write_ok { 1 } else { 0 }) + (if read_ok { 2 } else { 0 }) + (if finish_ok { 4 } else { 0 })
+}
+
+test "proc_session_operations_remain_mockable" {
+  let log = nlist_new()
+  let got = handle scripted_probe() {
+    Proc.open_session(path, args) -> {
+      nlist_add(log, __str_len(path))
+      resume(proc_session_from_token(91))
+    }
+    Proc.session_write(session, chunk, deadline) -> {
+      nlist_add(log, deadline.nanoseconds())
+      nlist_add(log, __u64_to_i64(__usize_to_u64(chunk.len())))
+      resume((session, ProcWriteTimedOut(__i64_to_usize(2))))
+    }
+    Proc.session_read(session, limit, deadline) -> {
+      nlist_add(log, deadline.nanoseconds())
+      nlist_add(log, __u64_to_i64(__usize_to_u64(limit)))
+      resume((session, ProcReadChunk(ProcStderr, bytes.from_str("pong"))))
+    }
+    Proc.session_close_input(session) -> {
+      nlist_add(log, 100 + proc_session_release_token(session))
+      resume(proc_session_from_token(91))
+    }
+    Proc.session_finish(session) -> resume(ProcFailed(ProcWaitFailed(1), "", ""))
+    Proc.session_finish_until(session, deadline) -> {
+      nlist_add(log, deadline.nanoseconds())
+      nlist_add(log, 200 + proc_session_release_token(session))
+      resume(ProcCompleted(ProcExited(5), "left", "over"))
+    }
+    Proc.session_release(session) -> {
+      nlist_add(log, 300 + proc_session_release_token(session))
+      resume(0)
+    }
+  }
+  -- finish consumed the session, so no release was routed.
+  Test.assert_eq(got, 7)
+  Test.assert_eq(nlist_len(log), 8)
+  Test.assert_eq(nlist_get(log, 0), 9)
+  Test.assert_eq(nlist_get(log, 1), 11)
+  Test.assert_eq(nlist_get(log, 2), 4)
+  Test.assert_eq(nlist_get(log, 3), 12)
+  Test.assert_eq(nlist_get(log, 4), 9)
+  Test.assert_eq(nlist_get(log, 5), 191)
+  Test.assert_eq(nlist_get(log, 6), 13)
+  Test.assert_eq(nlist_get(log, 7), 291)
+}
+
+fn scripted_drop_probe() -[Proc]> i64 {
+  let session: owned ProcSession = Proc.open_session("mock-drop", Nil<str>())
+  42
+}
+
+test "proc_session_owned_drop_routes_through_session_release" {
+  let log = nlist_new()
+  let got = handle scripted_drop_probe() {
+    Proc.open_session(path, args) -> resume(proc_session_from_token(64))
+    Proc.session_release(session) -> {
+      nlist_add(log, proc_session_release_token(session))
+      resume(0)
+    }
+  }
+  Test.assert_eq(got, 42)
+  Test.assert_eq(nlist_len(log), 1)
+  Test.assert_eq(nlist_get(log, 0), 64)
+}
