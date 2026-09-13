@@ -37,11 +37,13 @@ a move. Update source fixtures, generated-source producers, tools, and recursive
 source discovery together.
 
 Namespace placement describes ownership, not a claim that all dependencies have
-already been separated. The pipeline still contains substantial pass code;
-the internal IR still includes surface syntax adapters; grammar registration
-and compile-time dispatch still contain guest-specific integration. Removing
-those dependencies requires completing the shared semantic contracts, not
-renaming them or declaring them public.
+already been separated. The pipeline still contains substantial pass code and
+the internal IR still includes surface syntax adapters. The compiler's import
+closure contains no guest grammar package: tools reach exported grammars only
+through package manifests and the `weft-grammar-tool/1` driver protocol
+(`grammar/tool.weft`), and the tool shard verifies the closure stays that
+way. Removing the remaining dependencies requires completing the shared
+semantic contracts, not renaming them or declaring them public.
 
 Source acquisition and package authority belong to the host, outside a grammar's
 parse/check capabilities. Weft-specific syntax and semantic decisions belong

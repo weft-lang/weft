@@ -577,6 +577,28 @@ write_huge_padding() {
 
 if [ "$WEFT_TOOL_SHARD" = core ]; then
 
+# The compiler's import closure must not contain a guest grammar package:
+# grammars reach tools only through the driver protocol, never by import.
+compiler_guest_grammar_imports() {
+  local queue="${1:-compiler/main.weft}" visited=" " found="" file module
+  while [ -n "$queue" ]; do
+    queue=${queue# }
+    file=${queue%% *}
+    if [ "$queue" = "$file" ]; then queue=""; else queue=${queue#* }; fi
+    case "$visited" in *" $file "*) continue ;; esac
+    visited="$visited$file "
+    for module in $(sed -n 's/^use \([A-Za-z0-9_][A-Za-z0-9_/]*\).*/\1/p' "$file"); do
+      case "$module" in
+        stdlib/grammar/sql*|stdlib/grammar/einsum*) found="$found $module" ;;
+      esac
+      if [ -f "$module.weft" ]; then queue="$queue $module.weft"; fi
+    done
+  done
+  printf '%s' "$found" | tr ' ' '\n' | sort -u | tr '\n' ' '
+}
+
+assert_equals "compiler_import_closure_has_no_guest_grammar" "$(compiler_guest_grammar_imports)" ""
+
 "$WEFT" doc test/module_fixtures/alias_docs.weft > "$tmp_out" 2> "$tmp_err"
 assert_equals "doc_alias_stderr_empty" "$(<"$tmp_err")" ""
 assert_contains "doc_aliases_are_documented" "$(<"$tmp_out")" "Public API items: 4. Documented: 4."
