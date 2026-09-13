@@ -914,7 +914,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_env_pins_public_surface" "$(<"$tmp_out")" "Public API items: 4. Documented: 4."
     assert_contains "doc_stdlib_env_pins_optional_argument" "$(<"$tmp_out")" "fn arg(index: i64) -> str | nil"
   elif [ "$stdlib_doc_name" = "process" ]; then
-    assert_contains "doc_stdlib_process_pins_public_surface" "$(<"$tmp_out")" "Public API items: 40. Documented: 40."
+    assert_contains "doc_stdlib_process_pins_public_surface" "$(<"$tmp_out")" "Public API items: 42. Documented: 42."
     assert_contains "doc_stdlib_process_pins_typed_run" "$(<"$tmp_out")" "fn run(path: str, args: List<str>) -> Result<ProcTermination, ProcError>"
     assert_contains "doc_stdlib_process_pins_opaque_owner" "$(<"$tmp_out")" "pub type ProcHandle = opaque"
     assert_contains "doc_stdlib_process_pins_typed_deadline" "$(<"$tmp_out")" "fn wait_until(resource: ProcHandle, deadline: Instant) -> ProcOutput"

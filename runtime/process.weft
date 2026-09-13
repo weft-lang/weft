@@ -58,9 +58,13 @@ fn runtime_proc_session_stdout_buffer_offset() -> i64 { 40 }
 fn runtime_proc_session_stderr_buffer_offset() -> i64 { 64 }
 fn runtime_proc_session_stdout_eof_offset() -> i64 { 88 }
 fn runtime_proc_session_stderr_eof_offset() -> i64 { 96 }
-fn runtime_proc_session_size() -> i64 { 104 }
+fn runtime_proc_session_store_limit_offset() -> i64 { 104 }
+fn runtime_proc_session_size() -> i64 { 112 }
 
 fn runtime_proc_session_scratch_size() -> i64 { 4096 }
+-- An unbounded drain still returns after this many bytes so its caller can
+-- re-check deadlines against a child that never stops writing.
+fn runtime_proc_drain_call_cap() -> i64 { 65536 }
 fn runtime_proc_signal_pipe() -> i64 { 13 }
 fn runtime_proc_disposition_ignore() -> i64 { 1 }
 
@@ -257,10 +261,7 @@ fn runtime_proc_session_protect_descriptors(plan: i64) -[Unsafe]> i64 {
   }
 }
 
--- Capture pipes plus the child's standard input. Writes to a child that no
--- longer reads must report EPIPE rather than terminate this process, so
--- SIGPIPE is ignored process-wide through the same semantic disposition
--- leaf the shutdown facility uses; both targets interpret it identically.
+-- Capture pipes plus the child's standard input.
 fn runtime_proc_prepare_session(plan: i64) -[Unsafe]> i64 {
   let captured = runtime_proc_prepare_capture(plan)
   if captured != 0 { captured }
@@ -276,14 +277,7 @@ fn runtime_proc_prepare_session(plan: i64) -[Unsafe]> i64 {
         runtime_proc_plan_fd(plan, runtime_proc_plan_stdin_write_offset())
       )
       if nonblocking < 0 { runtime_proc_error_code(nonblocking) }
-      else {
-        let protected = runtime_proc_session_protect_descriptors(plan)
-        if protected != 0 { protected }
-        else {
-          if runtime_shutdown_set_disposition(runtime_proc_signal_pipe(), runtime_proc_disposition_ignore()) < 0 { 5 }
-          else { 0 }
-        }
-      }
+      else { runtime_proc_session_protect_descriptors(plan) }
     }
   }
 }
@@ -436,26 +430,46 @@ pub(package) fn runtime_proc_spawn(envp: i64, path: str, args: List<str>) -[Unsa
   )
 }
 
--- Drain all bytes immediately available from a nonblocking pipe.
--- 1 = EOF, 0 = would block, negative = portable error code.
-pub(package) fn runtime_proc_drain(fd: i64, scratch: i64, out: i64) -[Unsafe]> i64 {
+-- Drain bytes immediately available from a nonblocking pipe into a managed
+-- buffer: at most `budget` bytes, or one per-call cap when the budget is
+-- negative, so a flooding child never keeps the caller from its deadline.
+-- 1 = EOF, 0 = would block or budget reached, 2 = budget reached with more
+-- output pending (the probe byte is discarded), negative = error code.
+pub(package) fn runtime_proc_drain(fd: i64, scratch: i64, out: i64, budget: i64) -[Unsafe]> i64 {
+  let bounded = budget >= 0
+  let mut remaining = if bounded { budget } else { runtime_proc_drain_call_cap() }
   let mut done = false
   let mut result = 0
   while not done {
-    let count = runtime_process_read(fd, scratch, 4096)
-    if count > 0 {
-      bscopy(out, scratch, count, 0)
-    } else { if count == 0 {
-      result = 1
+    if remaining <= 0 {
+      if bounded {
+        let probe = runtime_process_read(fd, scratch, 1)
+        if probe > 0 { result = 2 }
+        else { if probe == 0 { result = 1 }
+        else {
+          let error = runtime_proc_error_code(probe)
+          result = if error == 4 or error == 11 or error == 35 { 0 } else { 0 - error }
+        } }
+      } else { 0 }
       done = true
     } else {
-      let error = runtime_proc_error_code(count)
-      if error == 4 { 0 }
-      else {
-        result = if error == 11 or error == 35 { 0 } else { 0 - error }
+      let request = if remaining < 4096 { remaining } else { 4096 }
+      let count = runtime_process_read(fd, scratch, request)
+      if count > 0 {
+        bscopy(out, scratch, count, 0)
+        remaining = remaining - count
+      } else { if count == 0 {
+        result = 1
         done = true
-      }
-    } }
+      } else {
+        let error = runtime_proc_error_code(count)
+        if error == 4 { 0 }
+        else {
+          result = if error == 11 or error == 35 { 0 } else { 0 - error }
+          done = true
+        }
+      } }
+    }
   }
   result
 }
@@ -464,14 +478,23 @@ fn runtime_proc_wait_until_raw(pid: i64, stdout_fd: i64, stderr_fd: i64, spawn_e
   if spawn_error != 0 {
     ProcFailed(ProcSpawnFailed(spawn_error), "", "")
   } else {
-    runtime_proc_collect_until_raw(pid, stdout_fd, stderr_fd, buf_new(4096), buf_new(4096), deadline_nanos)
+    runtime_proc_collect_until_raw(pid, stdout_fd, stderr_fd, buf_new(4096), buf_new(4096), deadline_nanos, 0 - 1)
+  }
+}
+
+fn runtime_proc_capture_budget(capture_limit: i64, stdout_buf: i64, stderr_buf: i64) -[Unsafe]> i64 {
+  if capture_limit < 0 { 0 - 1 }
+  else {
+    let held = buf_len(stdout_buf) + buf_len(stderr_buf)
+    if held >= capture_limit { 0 } else { capture_limit - held }
   }
 }
 
 -- Drain both output descriptors into the given buffers until the child is
--- reaped or the deadline kills it, then close the descriptors. Callers seed
--- the buffers with output they had already stored.
-fn runtime_proc_collect_until_raw(pid: i64, stdout_fd: i64, stderr_fd: i64, stdout_buf: i64, stderr_buf: i64, deadline_nanos: i64) -[Unsafe]> ProcOutput {
+-- reaped, the deadline kills it, or (with a non-negative capture limit) its
+-- unread output would exceed the limit, which also kills it. Then close the
+-- descriptors. Callers seed the buffers with output they had already stored.
+fn runtime_proc_collect_until_raw(pid: i64, stdout_fd: i64, stderr_fd: i64, stdout_buf: i64, stderr_buf: i64, deadline_nanos: i64, capture_limit: i64) -[Unsafe]> ProcOutput {
   {
     let mark = alloc_bump_mark()
     let scratch = alloc_bump(4096)
@@ -487,20 +510,27 @@ fn runtime_proc_collect_until_raw(pid: i64, stdout_fd: i64, stderr_fd: i64, stdo
     let mut status_raw = 0
     let mut child_done = false
     let mut timed_out = false
+    let mut limit_exceeded = false
 
     while not child_done {
       if not stdout_eof {
-        let state = runtime_proc_drain(stdout_fd, scratch, stdout_buf)
+        let state = runtime_proc_drain(stdout_fd, scratch, stdout_buf, runtime_proc_capture_budget(capture_limit, stdout_buf, stderr_buf))
         if state == 1 { stdout_eof = true }
-        else { if state < 0 and capture_error == 0 { capture_error = 0 - state } else { 0 } }
+        else { if state == 2 { limit_exceeded = true }
+        else { if state < 0 and capture_error == 0 { capture_error = 0 - state } else { 0 } } }
       } else { 0 }
       if not stderr_eof {
-        let state = runtime_proc_drain(stderr_fd, scratch, stderr_buf)
+        let state = runtime_proc_drain(stderr_fd, scratch, stderr_buf, runtime_proc_capture_budget(capture_limit, stdout_buf, stderr_buf))
         if state == 1 { stderr_eof = true }
-        else { if state < 0 and capture_error == 0 { capture_error = 0 - state } else { 0 } }
+        else { if state == 2 { limit_exceeded = true }
+        else { if state < 0 and capture_error == 0 { capture_error = 0 - state } else { 0 } } }
       } else { 0 }
 
-      let waited = runtime_process_wait_nonblocking(pid, status_ptr)
+      let waited = if limit_exceeded {
+        -- The child cannot be captured safely: kill and reap it now.
+        runtime_process_kill(pid)
+        runtime_proc_wait_blocking_raw(pid, status_ptr)
+      } else { runtime_process_wait_nonblocking(pid, status_ptr) }
       if waited == pid {
         status_raw = __mem_load64(status_ptr)
         child_done = true
@@ -530,13 +560,15 @@ fn runtime_proc_collect_until_raw(pid: i64, stdout_fd: i64, stderr_fd: i64, stdo
       } }
     }
 
-    if not stdout_eof {
-      let state = runtime_proc_drain(stdout_fd, scratch, stdout_buf)
-      if state < 0 and capture_error == 0 { capture_error = 0 - state } else { 0 }
+    if not stdout_eof and not limit_exceeded {
+      let state = runtime_proc_drain(stdout_fd, scratch, stdout_buf, runtime_proc_capture_budget(capture_limit, stdout_buf, stderr_buf))
+      if state == 2 { limit_exceeded = true }
+      else { if state < 0 and capture_error == 0 { capture_error = 0 - state } else { 0 } }
     } else { 0 }
-    if not stderr_eof {
-      let state = runtime_proc_drain(stderr_fd, scratch, stderr_buf)
-      if state < 0 and capture_error == 0 { capture_error = 0 - state } else { 0 }
+    if not stderr_eof and not limit_exceeded {
+      let state = runtime_proc_drain(stderr_fd, scratch, stderr_buf, runtime_proc_capture_budget(capture_limit, stdout_buf, stderr_buf))
+      if state == 2 { limit_exceeded = true }
+      else { if state < 0 and capture_error == 0 { capture_error = 0 - state } else { 0 } }
     } else { 0 }
     if stdout_fd >= 0 { runtime_process_close(stdout_fd) } else { 0 }
     if stderr_fd >= 0 { runtime_process_close(stderr_fd) } else { 0 }
@@ -548,11 +580,13 @@ fn runtime_proc_collect_until_raw(pid: i64, stdout_fd: i64, stderr_fd: i64, stdo
       ProcFailed(ProcWaitFailed(wait_error), stdout_text, stderr_text)
     } else { if capture_error != 0 {
       ProcFailed(ProcCaptureFailed(capture_error), stdout_text, stderr_text)
+    } else { if limit_exceeded {
+      ProcFailed(ProcOutputLimitExceeded(runtime_proc_usize(capture_limit)), stdout_text, stderr_text)
     } else { if timed_out {
       ProcTimedOut(runtime_proc_decode_wait_raw(status_raw), stdout_text, stderr_text)
     } else {
       ProcCompleted(runtime_proc_decode_wait_raw(status_raw), stdout_text, stderr_text)
-    } } }
+    } } } }
   }
 }
 
@@ -661,19 +695,23 @@ fn runtime_proc_session_buffer_free(state: i64, offset: i64) -[Unsafe]> i64 {
   0
 }
 
--- Move every byte immediately available on one output stream into its
--- session buffer. 1 = end of input, 0 = drained or would block, negative =
--- portable error code.
-fn runtime_proc_session_drain(state: i64, fd_offset: i64, eof_offset: i64, buffer_offset: i64, scratch: i64) -[Unsafe]> i64 {
+-- Move bytes immediately available on one output stream into its session
+-- buffer, at most `budget` of them. 1 = end of input, 0 = drained, would
+-- block or budget reached, negative = portable error code.
+fn runtime_proc_session_drain(state: i64, fd_offset: i64, eof_offset: i64, buffer_offset: i64, scratch: i64, budget: i64) -[Unsafe]> i64 {
   if __mem_load64(state + eof_offset) == 1 { 1 }
   else {
     let fd = __mem_load64(state + fd_offset)
-    let mut done = false
+    let mut remaining = budget
+    let mut done = remaining <= 0
     let mut result = 0
     while not done {
-      let count = runtime_process_read(fd, scratch, runtime_proc_session_scratch_size())
+      let request = if remaining < runtime_proc_session_scratch_size() { remaining } else { runtime_proc_session_scratch_size() }
+      let count = runtime_process_read(fd, scratch, request)
       if count > 0 {
         runtime_proc_session_buffer_append(state, buffer_offset, scratch, count)
+        remaining = remaining - count
+        if remaining <= 0 { done = true } else { 0 }
       } else { if count == 0 {
         __mem_store64(state + eof_offset, 1)
         result = 1
@@ -720,14 +758,26 @@ fn runtime_proc_session_read_stream(state: i64, fd_offset: i64, eof_offset: i64,
   }
 }
 
+fn runtime_proc_session_stored_total(state: i64) -[Unsafe]> i64 {
+  runtime_proc_session_buffer_len(state, runtime_proc_session_stdout_buffer_offset()) +
+    runtime_proc_session_buffer_len(state, runtime_proc_session_stderr_buffer_offset())
+}
+
+fn runtime_proc_session_store_budget(state: i64) -[Unsafe]> i64 {
+  let limit = __mem_load64(state + runtime_proc_session_store_limit_offset())
+  let held = runtime_proc_session_stored_total(state)
+  if held >= limit { 0 } else { limit - held }
+}
+
 fn runtime_proc_session_both_ended(state: i64) -[Unsafe]> bool {
   __mem_load64(state + runtime_proc_session_stdout_eof_offset()) == 1 and
     __mem_load64(state + runtime_proc_session_stderr_eof_offset()) == 1
 }
 
-fn runtime_proc_session_new_state(pid: i64, stdin_fd: i64, stdout_fd: i64, stderr_fd: i64, error: i64) -[Unsafe]> i64 {
+fn runtime_proc_session_new_state(pid: i64, stdin_fd: i64, stdout_fd: i64, stderr_fd: i64, error: i64, store_limit: i64) -[Unsafe]> i64 {
   let state = heap_alloc_zeroed(rc_default_heap(), runtime_proc_session_size(), 8)
   __mem_store64(state + runtime_proc_session_pid_offset(), pid)
+  __mem_store64(state + runtime_proc_session_store_limit_offset(), if store_limit < 0 { 0 } else { store_limit })
   __mem_store64(state + runtime_proc_session_stdin_offset(), stdin_fd)
   __mem_store64(state + runtime_proc_session_stdout_offset(), stdout_fd)
   __mem_store64(state + runtime_proc_session_stderr_offset(), stderr_fd)
@@ -748,7 +798,7 @@ fn runtime_proc_construct_session_after_restore(mark: i64, state: i64) -[Unsafe]
   proc_session_from_token(state)
 }
 
-pub(package) fn runtime_proc_open_session(envp: i64, path: str, args: List<str>) -[Unsafe]> owned ProcSession {
+pub(package) fn runtime_proc_open_session(envp: i64, path: str, args: List<str>, store_limit: i64) -[Unsafe]> owned ProcSession {
   let mark = alloc_bump_mark()
   let plan = runtime_proc_plan_new(runtime_proc_mode_session())
   runtime_proc_spawn_into_plan(envp, path, args, plan, runtime_proc_mode_session())
@@ -769,13 +819,18 @@ pub(package) fn runtime_proc_open_session(envp: i64, path: str, args: List<str>)
     if error == 0 { stdin_fd } else { 0 - 1 },
     if error == 0 { stdout_fd } else { 0 - 1 },
     if error == 0 { stderr_fd } else { 0 - 1 },
-    if error == 0 { 0 } else { runtime_proc_error_code(error) }
+    if error == 0 { 0 } else { runtime_proc_error_code(error) },
+    store_limit
   )
   runtime_proc_construct_session_after_restore(mark, state)
 }
 
 fn runtime_proc_usize(value: i64) -> usize { __i64_to_usize(value) }
 
+-- SIGPIPE policy: a child that stopped reading must yield EPIPE, never
+-- terminate this process, so the disposition is set to ignore for exactly
+-- the duration of one write and restored afterwards. No child is spawned
+-- inside the loop, so no child inherits the ignored disposition.
 fn runtime_proc_session_write_raw(state: i64, fd: i64, chunk: Bytes, deadline_nanos: i64) -[Unsafe]> ProcWriteOutcome {
   let mark = alloc_bump_mark()
   let scratch = alloc_bump(runtime_proc_session_scratch_size())
@@ -785,9 +840,10 @@ fn runtime_proc_session_write_raw(state: i64, fd: i64, chunk: Bytes, deadline_na
   let flat = chunk.to_vector()
   let total = __u64_to_i64(__usize_to_u64(flat.len()))
   let data = vector_data<u8>(flat)
+  let previous_disposition = runtime_shutdown_set_disposition(runtime_proc_signal_pipe(), runtime_proc_disposition_ignore())
   let mut written = 0
   let mut done = total == 0
-  -- 0 written, 1 refused, 2 timed out, negative = error code
+  -- 0 written, 1 refused, 2 timed out, 3 blocked on stored output, negative = error code
   let mut verdict = 0
   while not done {
     let count = runtime_process_write(fd, data + written, total - written)
@@ -798,19 +854,17 @@ fn runtime_proc_session_write_raw(state: i64, fd: i64, chunk: Bytes, deadline_na
       let error = if count == 0 { 11 } else { runtime_proc_error_code(count) }
       if error == 4 { 0 }
       else { if error == 11 or error == 35 {
-        -- The child may be blocked on its own output; make room before pausing.
-        runtime_proc_session_drain(state, runtime_proc_session_stdout_offset(), runtime_proc_session_stdout_eof_offset(), runtime_proc_session_stdout_buffer_offset(), scratch)
-        runtime_proc_session_drain(state, runtime_proc_session_stderr_offset(), runtime_proc_session_stderr_eof_offset(), runtime_proc_session_stderr_buffer_offset(), scratch)
-        let now = runtime_time_now_nanos()
-        if now < 0 {
-          verdict = 0 - 5
-          done = true
-        } else { if now >= deadline_nanos {
-          verdict = 2
+        -- The child may be blocked on its own output: store what the limit
+        -- allows, and if the store is full only the caller's reads can help.
+        runtime_proc_session_drain(state, runtime_proc_session_stdout_offset(), runtime_proc_session_stdout_eof_offset(), runtime_proc_session_stdout_buffer_offset(), scratch, runtime_proc_session_store_budget(state))
+        runtime_proc_session_drain(state, runtime_proc_session_stderr_offset(), runtime_proc_session_stderr_eof_offset(), runtime_proc_session_stderr_buffer_offset(), scratch, runtime_proc_session_store_budget(state))
+        let held = runtime_proc_session_stored_total(state)
+        if held > 0 and held >= __mem_load64(state + runtime_proc_session_store_limit_offset()) {
+          verdict = 3
           done = true
         } else {
           runtime_process_nanosleep(pause_request)
-        } }
+        }
       } else { if error == 32 {
         verdict = 1
         done = true
@@ -819,12 +873,27 @@ fn runtime_proc_session_write_raw(state: i64, fd: i64, chunk: Bytes, deadline_na
         done = true
       } } }
     }
+    -- The deadline is honoured on every iteration, progressing or not.
+    if not done {
+      let now = runtime_time_now_nanos()
+      if now < 0 {
+        verdict = 0 - 5
+        done = true
+      } else { if now >= deadline_nanos {
+        verdict = 2
+        done = true
+      } else { 0 } }
+    } else { 0 }
   }
+  if previous_disposition >= 0 {
+    runtime_shutdown_set_disposition(runtime_proc_signal_pipe(), previous_disposition)
+  } else { 0 }
   alloc_bump_restore_same_segment(mark)
   if verdict == 0 { ProcWritten }
   else { if verdict == 1 { ProcWriteRefused(runtime_proc_usize(written)) }
   else { if verdict == 2 { ProcWriteTimedOut(runtime_proc_usize(written)) }
-  else { ProcWriteFailed(ProcStreamFailed(0 - verdict), runtime_proc_usize(written)) } } }
+  else { if verdict == 3 { ProcWriteBlocked(runtime_proc_usize(written)) }
+  else { ProcWriteFailed(ProcStreamFailed(0 - verdict), runtime_proc_usize(written)) } } } }
 }
 
 pub(package) fn runtime_proc_session_write(session: ProcSession, chunk: Bytes, deadline_nanos: i64) -[Unsafe]> (owned ProcSession, ProcWriteOutcome) {
@@ -920,13 +989,14 @@ pub(package) fn runtime_proc_session_finish_until(session: ProcSession, deadline
   let stderr_fd = __mem_load64(state + runtime_proc_session_stderr_offset())
   let error = __mem_load64(state + runtime_proc_session_error_offset())
   if stdin_fd >= 0 { runtime_process_close(stdin_fd) } else { 0 }
+  let store_limit = __mem_load64(state + runtime_proc_session_store_limit_offset())
   let stdout_buf = runtime_proc_session_seed_buffer(state, runtime_proc_session_stdout_buffer_offset())
   let stderr_buf = runtime_proc_session_seed_buffer(state, runtime_proc_session_stderr_buffer_offset())
   runtime_proc_session_free_state(state)
   if error != 0 {
     ProcFailed(ProcSpawnFailed(error), "", "")
   } else {
-    runtime_proc_collect_until_raw(pid, stdout_fd, stderr_fd, stdout_buf, stderr_buf, deadline_nanos)
+    runtime_proc_collect_until_raw(pid, stdout_fd, stderr_fd, stdout_buf, stderr_buf, deadline_nanos, store_limit)
   }
 }
 
@@ -988,8 +1058,8 @@ fn runtime_proc_release_safe(resource: ProcHandle) -> i64 {
   }
 }
 
-fn runtime_proc_open_session_safe(envp: i64, path: str, args: List<str>) -> owned ProcSession {
-  handle runtime_proc_open_session(envp, path, args) {
+fn runtime_proc_open_session_safe(envp: i64, path: str, args: List<str>, store_limit: i64) -> owned ProcSession {
+  handle runtime_proc_open_session(envp, path, args, store_limit) {
     Unsafe.transmute(raw) -> resume(__transmute(raw))
   }
 }
@@ -1037,8 +1107,8 @@ pub implements Proc(argc: i64, argv: i64) {
   Proc.wait_until(resource, deadline) ->
     resume(runtime_proc_wait_until_safe(resource, deadline.nanoseconds()))
   Proc.release(resource) -> resume(runtime_proc_release_safe(resource))
-  Proc.open_session(path, args) ->
-    resume(runtime_proc_open_session_safe(runtime_env_pointer(argc, argv), path, args))
+  Proc.open_session(path, args, store_limit) ->
+    resume(runtime_proc_open_session_safe(runtime_env_pointer(argc, argv), path, args, runtime_proc_limit(store_limit)))
   Proc.session_write(session, chunk, deadline) ->
     resume(runtime_proc_session_write_safe(session, chunk, deadline.nanoseconds()))
   Proc.session_close_input(session) -> resume(runtime_proc_session_close_input_safe(session))
