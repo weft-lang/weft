@@ -4461,6 +4461,31 @@ else
 fi
 printf '{"package":"app","dependencies":{"math":"deps/math"}}\n' > "$tmp_pkg_dir/weft.pkg"
 
+# `pkg audit` verifies every grammar export through the checker: the
+# declaration's Grammar conformance and, when a tooling module is named, the
+# GrammarTooling conformance that module supplies. Probes instantiate bounded
+# generics at the declaration, so the checker itself decides and names the
+# missing trait; nothing is constructed or rescanned.
+sdk_audit=$("$WEFT" pkg audit 2>/dev/null)
+assert_contains "pkg_audit_reports_sdk_sql_grammar_conformance" "$sdk_audit" '{"export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/sql/tooling","status":"ok","diagnostics":[]}}'
+assert_contains "pkg_audit_reports_sdk_einsum_grammar_conformance" "$sdk_audit" '{"export":"einsum","module":"stdlib/grammar/einsum","declaration":"EinsumGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/einsum/tooling","status":"ok","diagnostics":[]}}'
+assert_contains "pkg_audit_reports_sdk_alias_grammar_conformance" "$sdk_audit" '{"export":"mini_sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/sql/tooling","status":"ok","diagnostics":[]}}'
+
+mkdir -p "$tmp_pkg_dir/audit_grammar/grammars"
+cp module_fixtures/plain_grammar.weft "$tmp_pkg_dir/audit_grammar/grammars/words.weft"
+printf 'pub type Run { Run }\n' > "$tmp_pkg_dir/audit_grammar/grammars/plain.weft"
+printf '{"package":"auditpkg","manifest_version":1,"version":"0.3.0","weft":"0.1","exports":{"grammars":{"words":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime","tooling":"grammars/words"},"plain":{"module":"grammars/plain","declaration":"Run","execution":"validate_only"},"lost":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime","tooling":"grammars/no_such_module"},"fine":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime"}}}}\n' > "$tmp_pkg_dir/audit_grammar/weft.pkg"
+set +e
+grammar_audit=$(cd "$tmp_pkg_dir/audit_grammar" && "$WEFT_ABS" pkg audit 2>/dev/null)
+grammar_audit_exit=$?
+set -e
+assert_equals "pkg_audit_fails_when_a_grammar_export_does_not_conform" "$grammar_audit_exit" "1"
+assert_contains "pkg_audit_names_missing_tooling_conformance" "$grammar_audit" '{"export":"words","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/words","status":"failed","diagnostics":["type `WordGrammar` does not implement `GrammarTooling`"]}}'
+assert_contains "pkg_audit_names_missing_grammar_conformance" "$grammar_audit" '{"export":"plain","module":"grammars/plain","declaration":"Run","grammar":{"status":"failed","diagnostics":["type `Run` does not implement `Grammar`"]},"tooling":null}'
+assert_contains "pkg_audit_names_unavailable_tooling_module" "$grammar_audit" '{"export":"lost","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/no_such_module","status":"failed","diagnostics":["imported module source is unavailable"]}}'
+assert_contains "pkg_audit_accepts_parse_only_grammar_export" "$grammar_audit" '{"export":"fine","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":null}'
+assert_contains "pkg_audit_keeps_native_authority_document" "$grammar_audit" '"schema_version":1,"target":"'
+
 mkdir -p "$tmp_pkg_dir/.weft/cache/math"
 printf 'pub fn cached_value() -> i64 { 1 }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
 printf 'pub fn cached_value() -> i64 { 42 }\n' > "$tmp_pkg_dir/.weft/cache/math/lib.weft"
