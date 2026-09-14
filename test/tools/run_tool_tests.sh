@@ -4569,28 +4569,74 @@ assert_contains "pkg_audit_does_not_require_staging_of_a_validate_only_export" "
 grammar_stage_out=$(cd "$tmp_pkg_dir/audit_grammar" && printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"assignments","source":"count = 3","host_source":"type settings { count: i64 }"}}}' | "$WEFT_ABS" mcp 2>&1)
 assert_contains "mcp_grammar_diagnostics_checks_through_a_staging_driver" "$grammar_stage_out" '"export":"assignments","phase":"parse+check","diagnostics":0,"check_errors":0,"parse":"parsed","check":"checked"'
 # A staging site is a checker fact: `embed<G>` over a staged literal records
-# the export the type argument resolves to, and `--artifact-facts` renders
-# every site before any driver runs. Offsets are byte ranges in the root
+# the canonical export the type argument resolves to, and `--artifact-facts`
+# renders every site before any driver runs. Until sites are lowered, a
+# product that contains one is refused: the facts are written, the product
+# is not, and the exit status says so. Offsets are byte ranges in the root
 # source: the call spelling and the literal with its delimiters.
+mkdir -p "$tmp_pkg_dir/staged_pkg/grammars"
+cp module_fixtures/toy_grammar.weft "$tmp_pkg_dir/staged_pkg/grammars/assignments.weft"
+printf '{"package":"stagedpkg","manifest_version":1,"version":"0.4.0","weft":"0.1","exports":{"grammars":{"assignments":{"module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"typed_plan","tooling":"grammars/assignments"}}}}\n' > "$tmp_pkg_dir/staged_pkg/weft.pkg"
+printf '%s' 'use grammars/assignments.{AssignmentGrammar}
+use stdlib/grammar/staging.{embed}
+fn main() -> i64 { let staged = embed<AssignmentGrammar>(r#"count = 3"#); 0 }
+' > "$tmp_pkg_dir/staged_pkg/staged.weft"
+set +e
+(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" build staged.weft -o staged_product --artifact-facts staged.facts.json > "$tmp_out" 2> "$tmp_err")
+staged_build_exit=$?
+set -e
+assert_equals "build_refuses_a_product_with_a_staging_site" "$staged_build_exit" "1"
+assert_contains "build_names_the_unlowered_staging_site" "$(<"$tmp_err")" 'build: staging site for grammar `assignments` at bytes 112..117 is recorded but not lowered by this compiler; no product was written'
+if [ -e "$tmp_pkg_dir/staged_pkg/staged_product" ]; then
+  echo "  fail build_writes_no_product_for_a_staging_site"
+  exit 1
+else
+  echo "  ok build_writes_no_product_for_a_staging_site"
+fi
+staged_facts=$(/bin/cat "$tmp_pkg_dir/staged_pkg/staged.facts.json")
+assert_contains "build_records_staging_site_of_a_typed_plan_export" "$staged_facts" '"staging_sites":[{"package":"stagedpkg","version":"0.4.0","export":"assignments","module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"typed_plan","capability":"typed_plan","site":{"start":112,"end":117},"source":{"start":137,"end":151}}]'
+# `weft check` still accepts the site, and the audit package, which exports
+# the same declaration under two executions, makes a site ambiguous.
+staged_check_out=$(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" check staged.weft 2>&1)
+assert_contains "check_accepts_a_staging_site" "$staged_check_out" "0 errors"
 printf '%s' 'use grammars/assignments.{AssignmentGrammar}
 use stdlib/grammar/staging.{embed}
 fn main() -> i64 { let staged = embed<AssignmentGrammar>(r#"count = 3"#); 0 }
 ' > "$tmp_pkg_dir/audit_grammar/staged.weft"
-(cd "$tmp_pkg_dir/audit_grammar" && "$WEFT_ABS" build staged.weft -o staged_product --artifact-facts staged.facts.json > "$tmp_out" 2> "$tmp_err")
-assert_equals "build_records_staging_site_stderr_empty" "$(<"$tmp_err")" ""
-staged_facts=$(/bin/cat "$tmp_pkg_dir/audit_grammar/staged.facts.json")
-assert_contains "build_records_staging_site_of_a_typed_plan_export" "$staged_facts" '"staging_sites":[{"package":"auditpkg","version":"0.3.0","export":"assignments","module":"grammars/assignments","declaration":"AssignmentGrammar","capability":"typed_plan","site":{"start":112,"end":117},"source":{"start":137,"end":151}}]'
+set +e
+ambiguous_check=$(cd "$tmp_pkg_dir/audit_grammar" && "$WEFT_ABS" check staged.weft 2>&1)
+ambiguous_check_exit=$?
+set -e
+assert_equals "check_rejects_a_site_whose_export_is_ambiguous_exit" "$ambiguous_check_exit" "1"
+assert_contains "check_rejects_a_site_whose_export_is_ambiguous" "$ambiguous_check" 'error[E1009]: staging site: `AssignmentGrammar` is exported as `assignments` and `checked_only` with different tooling or execution, so no one driver applies'
 printf '%s' 'use stdlib/grammar/sql.{SqlGrammar}
 use stdlib/grammar/staging.{embed}
 fn main() -> i64 { let staged = embed<SqlGrammar>(r##"select "id" from users"##); 0 }
 ' > "$tmp_src"
+set +e
 "$WEFT" build "$tmp_src" -o "$tmp_bin" --artifact-facts "$tmp_bin.facts.json" > "$tmp_out" 2> "$tmp_err"
-assert_equals "build_records_sdk_staging_site_stderr_empty" "$(<"$tmp_err")" ""
+sdk_build_exit=$?
+set -e
+assert_equals "build_refuses_an_sdk_staging_site" "$sdk_build_exit" "1"
+assert_contains "build_names_the_unlowered_sdk_staging_site" "$(<"$tmp_err")" 'build: staging site for grammar `sql` at bytes 103..108 is recorded but not lowered by this compiler; no product was written'
 sdk_staged_facts=$(/bin/cat "$tmp_bin.facts.json")
-assert_contains "build_records_staging_site_of_an_sdk_export" "$sdk_staged_facts" '"staging_sites":[{"package":"@weft-sdk","version":"0.1.0","export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","capability":"validate_only","site":{"start":103,"end":108},"source":{"start":121,"end":150}}]'
+assert_contains "build_records_staging_site_of_an_sdk_export" "$sdk_staged_facts" '"staging_sites":[{"package":"weft","version":"0.1.0","export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"runtime","capability":"validate_only","site":{"start":103,"end":108},"source":{"start":121,"end":150}}]'
 rm -f "$tmp_bin.facts.json"
-# A program without sites renders an empty list, and a site that breaks the
-# staged-literal rule is a stable check error, over the CLI and over MCP.
+# `compile` and `run` refuse the same site; a program without sites renders
+# an empty list; a site that breaks the staged-literal rule is a stable
+# check error, over the CLI and over MCP.
+set +e
+"$WEFT" compile "$tmp_src" > "$tmp_bin" 2> "$tmp_err"
+sdk_compile_exit=$?
+set -e
+assert_equals "compile_refuses_a_staging_site" "$sdk_compile_exit" "1"
+assert_contains "compile_names_the_unlowered_staging_site" "$(<"$tmp_err")" 'compile: staging site for grammar `sql`'
+set +e
+"$WEFT" run "$tmp_src" > "$tmp_out" 2> "$tmp_err"
+sdk_run_exit=$?
+set -e
+assert_equals "run_refuses_a_staging_site" "$sdk_run_exit" "1"
+assert_contains "run_names_the_unlowered_staging_site" "$(<"$tmp_err")" 'run: staging site for grammar `sql`'
 printf 'fn main() -> i64 { 0 }\n' > "$tmp_src"
 "$WEFT" build "$tmp_src" -o "$tmp_bin" --artifact-facts "$tmp_bin.facts.json" > "$tmp_out" 2> "$tmp_err"
 assert_contains "build_renders_empty_staging_sites" "$(/bin/cat "$tmp_bin.facts.json")" '"staging_sites":[]'

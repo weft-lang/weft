@@ -200,6 +200,7 @@ fn main_staging_site_fact(fact: StagingSiteFact) -> NativeArtifactStagingSite {
     export: fact.export.export,
     module: fact.export.module,
     declaration: fact.export.declaration,
+    execution: fact.execution,
     capability: match fact.capability { StagingValidateOnly -> "validate_only", StagingTypedPlan -> "typed_plan" },
     site_start: site_start,
     site_end: site_end,
@@ -321,7 +322,9 @@ fn main_prepare_native_with_path_and_origin_and_grant(src: i64, n: i64, path_ptr
 fn compile_with_path_and_origin_and_grant(src: i64, n: i64, path_ptr: i64, path_len: i64, trusted: i64, strict: i64, can_grant_trust: i64) -[SourceAcquire]> i64 {
   match main_prepare_native_with_path_and_origin_and_grant(src, n, path_ptr, path_len, trusted, strict, can_grant_trust) {
     MainNativePreparationFailed(status) -> status
-    MainNativePrepared(native, source, _) -> main_write_binary(pipeline_emit_checked_native_binary(native, __str_ptr(source.text)))
+    MainNativePrepared(native, source, sites) -> if main_refuse_staging_sites(sites, "compile") != 0 { 1 } else {
+      main_write_binary(pipeline_emit_checked_native_binary(native, __str_ptr(source.text)))
+    }
   }
 }
 
@@ -356,7 +359,7 @@ fn compile_with_path_and_origin_and_grant_rc_census(src: i64, n: i64, path_ptr: 
     MainSourceParseFailed(status) -> status
     MainSourceParsed(ast, source) -> match main_check_native_program(ast, NativeRuntimeWithRcCensus) {
       CheckRejected -> 1
-      Checked(typed) -> {
+      Checked(typed) -> if main_refuse_staging_sites(main_staging_sites(typed), "compile") != 0 { 1 } else {
         main_acquire_native_libraries(typed)
         let ir = pipeline_lower_checked_with_weft(typed)
         let optimised = pipeline_optimise_typed_ir(typed, ir)
@@ -434,7 +437,7 @@ fn compile_with_path_and_origin_and_grant_metrics(src: i64, n: i64, path_ptr: i6
           let binary = pipeline_emit_checked_native_binary(native, __str_ptr(source.text))
           let package_finished = main_test_now_millis()
           let write_started = main_test_now_millis()
-          let status = main_write_binary(binary)
+          let status = if main_refuse_staging_sites(main_staging_sites(typed), "compile") != 0 { 1 } else { main_write_binary(binary) }
           let finished = main_test_now_millis()
           main_compile_report_metrics(
             source_millis,
@@ -552,6 +555,43 @@ fn main_build_write_product(binary: BinaryObject, output_path: i64, target: Nati
   }
 }
 
+-- Until staging sites are lowered to `Staged<G>` values, a product that
+-- contains one is refused: the site is a checked fact that tools and
+-- artifact facts can inspect, but the primitive's body is a trap that must
+-- never ship. Every emission path asks this before writing anything.
+fn main_refuse_staging_sites(sites: List<NativeArtifactStagingSite>, command: str) -> i64 {
+  let mut count = 0
+  for site in sites {
+    eprint(command)
+    eprint(": staging site for grammar `")
+    eprint(site.export)
+    eprint("` at bytes ")
+    eprint_i(site.site_start)
+    eprint("..")
+    eprint_i(site.site_end)
+    eprint(" is recorded but not lowered by this compiler; no product was written\n")
+    count = count + 1
+  }
+  count
+}
+
+fn main_build_write_facts(facts: NativeArtifactFacts, facts_path: i64, sdk: NativeArtifactSdk) -> i64 {
+  if facts_path == 0 { 0 } else {
+    let rendered = pipeline_native_artifact_facts_render_with_sdk(facts, sdk)
+    let fd = sys_open_write_create_truncate(facts_path, 420)
+    let write_status = if fd < 0 { 0 - fd }
+    else {
+      let status = main_test_write_all(fd, __str_ptr(rendered), __str_len(rendered))
+      sys_close(fd)
+      status
+    }
+    if write_status != 0 {
+      eprint("build: could not write artifact facts\n")
+      1
+    } else { 0 }
+  }
+}
+
 -- The checker's staging sites join the product's artifact facts.
 fn main_product_with_staging_sites(product: PipelineNativeProduct, sites: List<NativeArtifactStagingSite>) -> PipelineNativeProduct {
   match product {
@@ -565,21 +605,7 @@ fn main_build_write_product_result(product: PipelineNativeProduct, output_path: 
     PipelineNativeProductFailed(binary) -> main_build_write_product(binary, output_path, target)
     PipelineNativeProductReady(binary, facts) -> {
       let product_status = main_build_write_product(binary, output_path, target)
-      if product_status != 0 or facts_path == 0 { product_status }
-      else {
-        let rendered = pipeline_native_artifact_facts_render_with_sdk(facts, sdk)
-        let fd = sys_open_write_create_truncate(facts_path, 420)
-        let write_status = if fd < 0 { 0 - fd }
-        else {
-          let status = main_test_write_all(fd, __str_ptr(rendered), __str_len(rendered))
-          sys_close(fd)
-          status
-        }
-        if write_status != 0 {
-          eprint("build: could not write artifact facts\n")
-          1
-        } else { 0 }
-      }
+      if product_status != 0 { product_status } else { main_build_write_facts(facts, facts_path, sdk) }
     }
   }
 }
@@ -628,13 +654,19 @@ fn main_build_path(path: i64, output_path: i64, facts_path: i64, debug_mode: Pip
       MainNativePreparationFailed(status) -> status
       MainNativePrepared(native, source, sites) -> match main_build_native_with_sdk(native, sdk_embed) {
         MainSdkPreparationFailed(status) -> status
-        MainSdkPrepared(ready, sdk) -> main_build_write_product_result(
-          main_product_with_staging_sites(pipeline_checked_native_product(ready, __str_ptr(source.text), debug_mode), sites),
-          output_path,
-          facts_path,
-          target,
-          sdk
-        )
+        MainSdkPrepared(ready, sdk) -> {
+          let product = main_product_with_staging_sites(pipeline_checked_native_product(ready, __str_ptr(source.text), debug_mode), sites)
+          if sites.is_empty() { main_build_write_product_result(product, output_path, facts_path, target, sdk) }
+          else {
+            -- The facts stay inspectable; the product is refused.
+            match product {
+              PipelineNativeProductReady(_, facts) -> { main_build_write_facts(facts, facts_path, sdk); 0 }
+              PipelineNativeProductFailed(_) -> 0
+            }
+            main_refuse_staging_sites(sites, "build")
+            1
+          }
+        }
       }
     }
   }
@@ -984,13 +1016,15 @@ fn main_run_path(path: i64, argc: i64, argv: i64, first_product_arg: i64, envp: 
       native_link_target_host()
     ) {
       MainNativePreparationFailed(status) -> status
-      MainNativePrepared(native, source, _) -> main_run_product(
-        pipeline_checked_native_product(native, __str_ptr(source.text), PipelineNativeDebugInformationIncluded),
-        argc,
-        argv,
-        first_product_arg,
-        envp
-      )
+      MainNativePrepared(native, source, sites) -> if main_refuse_staging_sites(sites, "run") != 0 { 1 } else {
+        main_run_product(
+          pipeline_checked_native_product(native, __str_ptr(source.text), PipelineNativeDebugInformationIncluded),
+          argc,
+          argv,
+          first_product_arg,
+          envp
+        )
+      }
     }
   }
 }
@@ -2341,11 +2375,11 @@ fn main_test_run_legacy_source(path: i64, path_len: i64, bytes: i64, n: i64, tt:
           } Checked(typed) -> { if main_fns_have_root_main(fns, src) != 1 {
             eprint("test: legacy expected-exit source is missing main\n")
             1
-          } else {
+          } else { if main_refuse_staging_sites(main_staging_sites(typed), "test") != 0 { 1 } else {
             let binary = pipeline_emit_native_with_debug_mode(typed, main_test_native_debug_mode())
             if metrics != 0 { mem_store64_at(metrics, 8, main_test_now_millis()) } else { 0 }
             main_test_run_binary_with_expectation(binary, envp, index, metrics, expected_exit)
-          } } }
+          } } } }
         }
       }
     }
@@ -8917,7 +8951,7 @@ fn main_test_finish_preparation_with_metrics_and_dependency_product(
       eprint_i(checked.errors)
       eprint(" errors\n")
       1
-    } Checked(typed) -> {
+    } Checked(typed) -> if main_refuse_staging_sites(main_staging_sites(typed), "test") != 0 { 1 } else {
       let binary = if pipeline_optimised_dependency_product_is_available(product) == 1 {
         pipeline_emit_native_with_debug_mode_and_dependency_product(typed, main_test_native_debug_mode(), product)
       } else { pipeline_emit_native_with_debug_mode(typed, main_test_native_debug_mode()) }

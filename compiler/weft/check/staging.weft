@@ -155,32 +155,140 @@ fn type_arg_decl(tt: i64, ty: i64) -> i64 {
   }
 }
 
--- The manifest grammar export whose resolved declaration is `decl`, searched
--- through every package identity the checker loaded. Returns the export
--- entry and its identity, or (0, 0).
-fn export_for_decl(tt: i64, decl: i64) -> (i64, i64) {
+-- Whether two grammar exports of one manifest that name the same
+-- declaration are aliases of one grammar: they must agree on tooling and
+-- execution, or a site could not know which driver and capability apply.
+fn exports_agree(left: i64, right: i64) -> bool {
+  let same_execution = pkg_export_execution(left) == pkg_export_execution(right)
+  let left_tooling = pkg_export_has_tooling(left)
+  let right_tooling = pkg_export_has_tooling(right)
+  let same_tooling = if left_tooling != right_tooling { false } else {
+    if not left_tooling { true } else {
+      pkg_export_tooling_module_len(left) == pkg_export_tooling_module_len(right) and
+        src_eq_at(
+          pkg_export_tooling_module_ptr(left),
+          0,
+          pkg_export_tooling_module_ptr(right),
+          0,
+          pkg_export_tooling_module_len(left)
+        )
+    }
+  }
+  same_execution and same_tooling
+}
+
+-- Whether an export is named after its module's final path segment: the
+-- primary spelling of a grammar, as `sql` is for `stdlib/grammar/sql`.
+fn export_named_after_module(entry: i64) -> bool {
+  let module_ptr = pkg_export_module_ptr(entry)
+  let module_len = pkg_export_module_len(entry)
+  let mut segment = 0
+  let mut index = 0
+  while index < module_len {
+    if mem_load8_at(module_ptr, index) == 47 { segment = index + 1 } else { 0 }
+    index = index + 1
+  }
+  let segment_len = module_len - segment
+  segment_len == pkg_export_name_len(entry) and
+    src_eq_at(module_ptr, segment, pkg_export_name_ptr(entry), 0, segment_len)
+}
+
+-- Whether `candidate` is the better canonical export: named after its
+-- module first, then bytewise-first by name. Neither depends on manifest
+-- declaration order.
+fn export_preferred(candidate: i64, current: i64) -> bool {
+  let candidate_named = export_named_after_module(candidate)
+  let current_named = export_named_after_module(current)
+  if candidate_named != current_named { candidate_named } else {
+    export_name_before(candidate, current)
+  }
+}
+
+-- Whether `left` sorts before `right` by export name, bytewise.
+fn export_name_before(left: i64, right: i64) -> bool {
+  let left_len = pkg_export_name_len(left)
+  let right_len = pkg_export_name_len(right)
+  let shared = if left_len < right_len { left_len } else { right_len }
+  let mut index = 0
+  while index < shared {
+    let a = mem_load8_at(pkg_export_name_ptr(left), index)
+    let b = mem_load8_at(pkg_export_name_ptr(right), index)
+    if a != b { return a < b } else { index = index + 1 }
+  }
+  left_len < right_len
+}
+
+--- How a type argument's declaration relates to the grammar exports of the
+--- manifests in scope.
+pub(package) type StagingExportResolution {
+  --- No manifest exports the declaration as a grammar.
+  StagingExportNone,
+  --- The canonical export among aliases that agree on tooling and
+  --- execution (the one named after its module, else the bytewise-first
+  --- name) and its package identity.
+  StagingExportFound(i64, i64),
+  --- Two exports name the declaration but disagree on tooling or execution;
+  --- the site cannot know which driver applies. The two names follow.
+  StagingExportConflict(str, str)
+}
+
+-- The manifest grammar exports whose resolved declaration is `decl`,
+-- searched through every package identity the checker loaded. A
+-- declaration belongs to one package, so every match shares an identity;
+-- aliases within it resolve to a canonical export by name, never by the
+-- manifest's declaration order.
+fn export_for_decl(tt: i64, decl: i64) -> StagingExportResolution {
   let identities = pkg_identity_entries(tt)
-  let mut found_export = 0
-  let mut found_identity = 0
+  let mut canonical = 0
+  let mut canonical_identity = 0
+  let mut conflict_left = ""
+  let mut conflict_right = ""
+  let mut conflicting = false
   for i in 0..nlist_len(identities) {
     let identity = nlist_get(identities, i)
     let manifest = pkg_identity_manifest(identity)
     let exports = if manifest == 0 { 0 } else { pkg_manifest_exports(manifest) }
-    if exports != 0 and found_export == 0 {
+    if exports != 0 {
       for j in 0..nlist_len(exports) {
         let entry = nlist_get(exports, j)
-        if found_export == 0 and pkg_export_kind(entry) == pkg_export_kind_grammar() {
+        if pkg_export_kind(entry) == pkg_export_kind_grammar() {
           let status = package_export_resolve_loaded(tt, mem_load64_at(identity, 16), entry)
           if status == package_export_status_resolved() and
             module_decl_fact_same_identity(pkg_export_resolved_declaration(entry), decl) == 1 {
-              found_export = entry
-              found_identity = identity
-            } else { 0 }
-        } else { 0 }
+              if canonical == 0 {
+                canonical = entry
+                canonical_identity = identity
+              } else {
+                if not exports_agree(canonical, entry) {
+                  if not conflicting {
+                    conflicting = true
+                    conflict_left = text_of(
+                      pkg_export_name_ptr(canonical),
+                      0,
+                      pkg_export_name_len(canonical)
+                    )
+                    conflict_right = text_of(
+                      pkg_export_name_ptr(entry),
+                      0,
+                      pkg_export_name_len(entry)
+                    )
+                  } else { nil }
+                } else { nil }
+                if export_preferred(entry, canonical) {
+                  canonical = entry
+                  canonical_identity = identity
+                } else { nil }
+              }
+            } else { nil }
+        } else { nil }
       }
-    } else { 0 }
+    } else { nil }
   }
-  (found_export, found_identity)
+  if conflicting { StagingExportConflict(conflict_left, conflict_right) } else {
+    if canonical == 0 { StagingExportNone } else {
+      StagingExportFound(canonical, canonical_identity)
+    }
+  }
 }
 
 -- A staged literal: a plain string whose decoded bytes are exactly the bytes
@@ -217,32 +325,56 @@ fn staged_literal_content(node: i64, src: i64) -> (i64, i64) {
   }
 }
 
---- Check one generic call whose callee is the blessed staging primitive and
---- record it as a site. `type_args` are the call's resolved type arguments,
---- `args` its argument nodes; `ns`/`nl` name the callee spelling. Returns the
---- number of errors reported.
+--- Check one generic use of the blessed staging primitive and record it as
+--- a site. `type_args` are the resolved type arguments, `args` the call's
+--- argument nodes, `called` whether the primitive is applied at this use
+--- (a reference that is not applied, such as a function value, cannot be a
+--- site: the literal must be at the call). `ns`/`nl` name the callee
+--- spelling. Returns the number of errors reported.
 pub(package) fn check_staging_site(
   tt: i64,
   src: i64,
   ns: i64,
   nl: i64,
   type_args: i64,
-  args: i64
+  args: i64,
+  called: bool
 ) -[Diagnose]> i64 {
   let type_arg = if type_args == 0 or nlist_len(type_args) == 0 { 0 } else {
     nlist_get(type_args, 0)
   }
-  let type_spelling = if type_arg == 0 or ty_tag(type_arg) != 9 { "the type argument" } else {
-    let start = ty_named_surface_start(type_arg)
-    let len = ty_named_surface_len(type_arg)
-    if len > 0 { str_concat("`", str_concat(text_of(src, start, len), "`")) } else {
-      "the type argument"
+  let decl = type_arg_decl(tt, type_arg)
+  -- Spell the type as authored when the resolved argument retains its
+  -- range, else by its declaration name.
+  let type_spelling = if type_arg != 0 and ty_tag(type_arg) == 9 and ty_named_surface_len(
+    type_arg
+  ) > 0 {
+    str_concat(
+      "`",
+      str_concat(
+        text_of(src, ty_named_surface_start(type_arg), ty_named_surface_len(type_arg)),
+        "`"
+      )
+    )
+  } else {
+    if decl == 0 { "the type argument" } else {
+      str_concat(
+        "`",
+        str_concat(
+          text_of(module_decl_fact_name_ptr(decl), 0, module_decl_fact_name_len(decl)),
+          "`"
+        )
+      )
     }
   }
-  let decl = type_arg_decl(tt, type_arg)
-  let (export, identity) = if decl == 0 { (0, 0) } else { export_for_decl(tt, decl) }
-  let export_errors = if export == 0 {
-    report_site(
+  let resolution = if decl == 0 { StagingExportNone } else { export_for_decl(tt, decl) }
+  let (export, identity) = match resolution {
+    StagingExportFound(found, found_identity) -> (found, found_identity)
+    _ -> (0, 0)
+  }
+  let export_errors = match resolution {
+    StagingExportFound(_, _) -> 0
+    StagingExportNone -> report_site(
       registry.staging_site_grammar(),
       str_concat(
         "staging site: ",
@@ -253,22 +385,49 @@ pub(package) fn check_staging_site(
       nl,
       "not_a_grammar_export"
     )
-  } else { 0 }
-  let arg = if args == 0 or nlist_len(args) == 0 { 0 } else { nlist_get(args, 0) }
+    StagingExportConflict(left, right) -> report_site(
+      registry.staging_site_grammar(),
+      "staging site: "
+      |> str_concat(type_spelling)
+      |> str_concat(" is exported as `")
+      |> str_concat(left)
+      |> str_concat("` and `")
+      |> str_concat(right)
+      |> str_concat("` with different tooling or execution, so no one driver applies"),
+      src,
+      ns,
+      nl,
+      "conflicting_exports"
+    )
+  }
+  let arg = if not called or args == 0 or nlist_len(args) == 0 { 0 } else {
+    nlist_get(args, 0)
+  }
   let (content_start, content_len) = staged_literal_content(arg, src)
-  let literal_errors = if content_start < 0 {
-    let (start, len) = if arg == 0 { (ns, nl) } else {
-      if node_tag(arg) == 9 { (node_f3(arg), node_f4(arg)) } else { (ns, nl) }
-    }
+  let literal_errors = if not called {
     report_site(
       registry.staging_site_literal(),
-      "staging site: the source must be a raw string literal or a plain string literal without escapes",
+      "staging site: embed must be called directly with its source literal",
       src,
-      start,
-      len,
-      if arg != 0 and node_tag(arg) == 9 { "escaped_literal" } else { "not_a_literal" }
+      ns,
+      nl,
+      "not_called"
     )
-  } else { 0 }
+  } else {
+    if content_start < 0 {
+      let (start, len) = if arg == 0 { (ns, nl) } else {
+        if node_tag(arg) == 9 { (node_f3(arg), node_f4(arg)) } else { (ns, nl) }
+      }
+      report_site(
+        registry.staging_site_literal(),
+        "staging site: the source must be a raw string literal or a plain string literal without escapes",
+        src,
+        start,
+        len,
+        if arg != 0 and node_tag(arg) == 9 { "escaped_literal" } else { "not_a_literal" }
+      )
+    } else { 0 }
+  }
   if export_errors + literal_errors == 0 {
     ttable_record_staging_site(
       tt,
