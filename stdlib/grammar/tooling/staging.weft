@@ -1,0 +1,375 @@
+-- stdlib/grammar/tooling/staging.weft — build-time staging of a checked plan
+--
+-- A grammar export that conforms to `GrammarStaging` can turn accepted
+-- syntax into a persistent plan at build time. It checks the syntax with
+-- its own checker under the host's type queries, converts the checked
+-- result into a form that carries facts rather than session identities,
+-- and encodes that form through an append-only, budgeted `StagingSink`
+-- that is its only write authority. The compiler owns the sink directory,
+-- verifies what arrived against what the package reported, and stores the
+-- bytes content-addressed. Both halves of that contract live here, with a
+-- deterministic in-memory sink, so a package proves its conformance
+-- in-process without a compiler and the compiler verifies with the same
+-- rule the conformance suite tests.
+
+use stdlib/bytes as bytes
+use stdlib/bytes.{Bytes}
+use stdlib/diagnostic/schema.{Diagnose}
+use stdlib/dir.{DirInspect}
+use stdlib/file.{FileAppend, FileCreateNew, FileRead, FileWrite}
+use stdlib/grammar/tooling.{GrammarContextKind, ToolTypeIdentity}
+use stdlib/grammar/tooling/digest.{content_digest}
+use stdlib/io/types.{IoError, IoInvalidPath, IoInvalidProgress, IoLimitExceeded}
+use stdlib/json.{Json}
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option.{Option, Some, None}
+use stdlib/path as path
+use stdlib/path.{Path, PathError}
+use stdlib/result.{Result, Ok, Err}
+use stdlib/typecheck.{TypeCheck}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push, vector_set}
+
+--- What a staging site may receive, refined from the manifest's `execution`.
+pub type StagingCapability {
+  --- The site is checked and recorded; nothing is emitted.
+  StagingValidateOnly,
+  --- The package emits a typed plan for the site.
+  StagingTypedPlan
+}
+
+--- The bounds a package declares for one capability. The compiler clamps
+--- both to its ceilings; see `effective_budget`.
+pub type StagingBudget { seconds: i64, bytes: usize }
+
+--- One capability a package emits for, with its declared budget.
+pub type StagingSupport { capability: StagingCapability, budget: StagingBudget }
+
+--- What `persist` checks against.
+pub type StagingContext {
+  --- Host types answered through `TypeCheck<ToolTypeIdentity>`.
+  StagingHostTypes,
+  --- A bounded context file the grammar loads itself.
+  StagingFileContext(Path, usize)
+}
+
+--- The build target a stage is asked for.
+pub type StagingTarget { capability: StagingCapability, platform: str }
+
+--- Why `persist` withheld a plan. The exact reason has been reported
+--- through `Diagnose`; a plan is never carried alongside a refusal.
+pub type StagingRefusal {
+  --- Checking reported errors.
+  StagingCheckRejected,
+  --- The package does not check against this context kind.
+  StagingContextUnsupported(GrammarContextKind),
+  --- The context file could not be acquired or was invalid.
+  StagingContextUnavailable
+}
+
+--- What `emit` produced.
+pub type StagingOutcome {
+  --- Every chunk was accepted; the artifact is complete.
+  StagingEmitted,
+  --- The package cannot encode its plan for the target's platform.
+  StagingUnsupportedTarget,
+  --- The sink refused a chunk; whatever was written is incomplete.
+  StagingSinkRefused(IoError)
+}
+
+--- What a tool learns from one emission: the outcome and the package's own
+--- facts envelope, recorded verbatim in artifact facts.
+pub type StagingReport { outcome: StagingOutcome, facts: Json }
+
+--- The package's only write authority while emitting: append one chunk to
+--- the artifact. There is no path, mode or reopen; the handler decides
+--- where the bytes go and refuses an empty chunk or one beyond the budget.
+pub effect StagingSink {
+  --- Append one chunk; the count returned is the chunk's length.
+  fn emit(chunk: Bytes) -> Result<usize, IoError>
+}
+
+--- Build-time staging for a grammar. `Syntax` is the exported `Grammar`'s
+--- syntax type; a driver hands one parse result to every conformance and
+--- the checker enforces their agreement.
+pub trait GrammarStaging {
+  type Syntax
+  --- The package's persistent plan: what `emit` encodes. It should carry
+  --- only semantic facts, names and the package's own data; the
+  --- conformance suite tests that two sessions with disjoint identities
+  --- stage identical bytes, and cached reuse never depends on the encoding.
+  type Persistent
+  --- The capabilities this package emits for, each with a declared budget.
+  fn stagings(self) -> List<StagingSupport>
+  --- Check the syntax against the context and convert the checked result
+  --- to its persistent form in one step, so no checked value crosses the
+  --- trait boundary and no session identity needs to survive into the plan.
+  fn persist(
+    self,
+    syntax: Self.Syntax,
+    context: StagingContext
+  ) -[TypeCheck<ToolTypeIdentity>, FileRead, Diagnose]> Result<Self.Persistent, StagingRefusal>
+  --- Encode the plan through the sink and describe what was encoded.
+  fn emit(
+    self,
+    plan: Self.Persistent,
+    target: StagingTarget
+  ) -[StagingSink, Diagnose]> StagingReport
+}
+
+-- Budgets ------------------------------------------------------------------
+--- The most bytes any stage may emit, whatever a package declares.
+pub fn byte_ceiling() -> usize { __i64_to_usize(67108864) }
+
+--- The most seconds any stage may add to the tooling deadline, whatever a
+--- package declares.
+pub fn seconds_ceiling() -> i64 { 60 }
+
+--- A declared budget clamped to the compiler's ceilings; a negative time
+--- budget is no budget at all.
+pub fn effective_budget(declared: StagingBudget) -> StagingBudget {
+  let seconds = if declared.seconds < 0 { 0 } else {
+    if declared.seconds > seconds_ceiling() { seconds_ceiling() } else { declared.seconds }
+  }
+  let limit = if declared.bytes > byte_ceiling() { byte_ceiling() } else { declared.bytes }
+  StagingBudget { seconds: seconds, bytes: limit }
+}
+
+--- Whether two capabilities are the same member.
+pub fn capability_same(left: StagingCapability, right: StagingCapability) -> bool {
+  match (left, right) {
+    (StagingValidateOnly, StagingValidateOnly) -> true
+    (StagingTypedPlan, StagingTypedPlan) -> true
+    _ -> false
+  }
+}
+
+--- The declared support for one capability, if any.
+pub fn support_for(
+  supports: List<StagingSupport>,
+  capability: StagingCapability
+) -> Option<StagingSupport> {
+  match supports {
+    Nil -> None<StagingSupport>()
+    Cons(first, rest) -> if capability_same(first.capability, capability) {
+      Some<StagingSupport>(first)
+    } else { support_for(rest, capability) }
+  }
+}
+
+-- The sink ------------------------------------------------------------------
+--- What one sink has accepted: the bytes exactly as written, so the size and
+--- digest reported are those of the artifact, and the chunk count.
+pub type SinkLedger { content: Vector<u8>, chunks: Vector<i64> }
+
+--- An empty ledger.
+pub fn sink_ledger() -> SinkLedger {
+  let chunks = vector.new<i64>()
+  vector_push<i64>(chunks, 0)
+  SinkLedger { content: vector.new<u8>(), chunks: chunks }
+}
+
+--- Record one accepted chunk.
+pub fn ledger_record(ledger: SinkLedger, chunk: Bytes) -> nil {
+  let content = ledger.content
+  let zero: usize = 0
+  for index in zero..chunk.len() { vector_push<u8>(content, chunk.get(index).unwrap_or(0)) }
+  let chunks = ledger.chunks
+  vector_set<i64>(chunks, 0, vector_get_in_bounds<i64>(chunks, 0) + 1)
+  nil
+}
+
+--- How many bytes a ledger has accepted.
+pub fn ledger_size(ledger: SinkLedger) -> usize {
+  let content = ledger.content
+  __i64_to_usize(vector_len<u8>(content))
+}
+
+--- How many chunks a ledger has accepted.
+pub fn ledger_chunks(ledger: SinkLedger) -> i64 {
+  let chunks = ledger.chunks
+  vector_get_in_bounds<i64>(chunks, 0)
+}
+
+--- What a sink accepted: size, chunk count and the digest of the bytes.
+pub type SinkSummary { size: usize, chunks: i64, content: str }
+
+--- Summarise a ledger.
+pub fn sink_summary(ledger: SinkLedger) -> SinkSummary {
+  let content = ledger.content
+  SinkSummary {
+    size: ledger_size(ledger),
+    chunks: ledger_chunks(ledger),
+    content: content_digest(bytes.from_vector(content))
+  }
+}
+
+--- The name of the one file a sink creates inside its directory.
+pub fn artifact_name() -> str { "artifact" }
+
+--- The path of a named entry inside a sink directory.
+pub fn entry_path(directory: Path, name: str) -> Result<Path, PathError> {
+  let values = directory.bytes().to_vector()
+  vector_push<u8>(values, __u64_to_u8(47))
+  let suffix = bytes.from_str(name).to_vector()
+  for index in 0..vector_len<u8>(suffix) {
+    vector_push<u8>(values, vector_get_in_bounds<u8>(suffix, index))
+  }
+  path.from_vector(values)
+}
+
+--- The artifact's path inside a sink directory.
+pub fn artifact_path(directory: Path) -> Result<Path, PathError> {
+  entry_path(directory, artifact_name())
+}
+
+fn sink_accept(
+  ledger: SinkLedger,
+  target: Result<Path, PathError>,
+  budget: usize,
+  chunk: Bytes
+) -[FileWrite]> Result<usize, IoError> {
+  let written = ledger_size(ledger)
+  if chunk.is_empty() { Err<usize, IoError>(IoInvalidProgress) } else {
+    if written + chunk.len() > budget { Err<usize, IoError>(IoLimitExceeded(budget)) } else {
+      match target {
+        Err(_) -> Err<usize, IoError>(IoInvalidPath)
+        Ok(artifact) -> {
+          let first = ledger_chunks(ledger) == 0
+          let mode = if first { FileCreateNew } else { FileAppend }
+          match FileWrite.write_all(artifact, chunk, mode) {
+            Err(error) -> Err<usize, IoError>(error)
+            Ok(count) -> {
+              ledger_record(ledger, chunk)
+              Ok<usize, IoError>(count)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- Run `body` with `StagingSink` interpreted on `<directory>/artifact`: the
+--- first accepted chunk creates the file, failing if it already exists, and
+--- every later chunk appends to that one path. An empty chunk is refused as
+--- `IoInvalidProgress` and a chunk that would exceed `budget` as
+--- `IoLimitExceeded(budget)`; nothing is written for a refused chunk. The
+--- body's value is returned with a summary of exactly what was written.
+pub fn with_sink_directory<T, E>(
+  directory: Path,
+  budget: usize,
+  body: () -[StagingSink, E]> T
+) -[FileWrite, E]> (T, SinkSummary) {
+  let ledger = sink_ledger()
+  let target = artifact_path(directory)
+  let value = handle body() {
+    StagingSink.emit(chunk) -> resume(sink_accept(ledger, target, budget, chunk))
+  }
+  (value, sink_summary(ledger))
+}
+
+--- Run `body` with `StagingSink` interpreted in memory only, accepting every
+--- chunk within `budget` exactly as the directory sink would but writing
+--- nothing. The deterministic interpretation for conformance suites.
+pub fn with_memory_sink<T, E>(budget: usize, body: () -[StagingSink, E]> T) -[E]> (T, SinkSummary)
+{
+  let ledger = sink_ledger()
+  let value = handle body() {
+    StagingSink.emit(chunk) -> {
+      let written = ledger_size(ledger)
+      let accepted = if chunk.is_empty() { Err<usize, IoError>(IoInvalidProgress) } else {
+        if written + chunk.len() > budget { Err<usize, IoError>(IoLimitExceeded(budget)) } else {
+          ledger_record(ledger, chunk)
+          Ok<usize, IoError>(chunk.len())
+        }
+      }
+      resume(accepted)
+    }
+  }
+  (value, sink_summary(ledger))
+}
+
+-- Verification ---------------------------------------------------------------
+--- Why a sink directory did not hold the artifact its driver reported.
+pub type StagingVerifyFailure {
+  --- The directory could not be listed.
+  StagingDirectoryUnreadable(IoError),
+  --- The driver reported an artifact but created no file.
+  StagingArtifactMissing,
+  --- Something other than the artifact appeared in the directory.
+  StagingExtraEntry(Path),
+  --- The artifact exists but could not be read.
+  StagingArtifactUnreadable(IoError),
+  --- The file is larger than the effective budget allows.
+  StagingOverBudget(usize),
+  --- The file's size is not the reported size: reported, then actual.
+  StagingSizeMismatch(usize, usize),
+  --- The file's digest is not the reported digest: reported, then actual.
+  StagingDigestMismatch(str, str)
+}
+
+fn entry_is_artifact(entry: Path) -> bool {
+  match entry.to_utf8() {
+    Ok(name) -> name == artifact_name()
+    Err(_) -> false
+  }
+}
+
+fn extra_entry(entries: Vector<Path>) -> Option<Path> {
+  for index in 0..vector_len<Path>(entries) {
+    let entry = vector_get_in_bounds<Path>(entries, index)
+    if not entry_is_artifact(entry) { return Some<Path>(entry) }
+  }
+  None<Path>()
+}
+
+fn verify_content(
+  content: Bytes,
+  size: usize,
+  reported: str,
+  budget: usize
+) -> Result<Bytes, StagingVerifyFailure> {
+  if content.len() > budget { Err<Bytes, StagingVerifyFailure>(StagingOverBudget(content.len())) } else {
+    if content.len() != size {
+      Err<Bytes, StagingVerifyFailure>(StagingSizeMismatch(size, content.len()))
+    } else {
+      let actual = content_digest(content)
+      if actual == reported { Ok<Bytes, StagingVerifyFailure>(content) } else {
+        Err<Bytes, StagingVerifyFailure>(StagingDigestMismatch(reported, actual))
+      }
+    }
+  }
+}
+
+--- Verify a sink directory after its driver has exited: it must hold exactly
+--- one entry, the artifact, whose size is the reported size and within the
+--- budget and whose digest is the reported digest. The bytes are returned
+--- so the caller stores exactly what it verified.
+pub fn verify_artifact(
+  directory: Path,
+  size: usize,
+  content: str,
+  budget: usize
+) -[DirInspect, FileRead]> Result<Bytes, StagingVerifyFailure> {
+  match DirInspect.list(directory) {
+    Err(error) -> Err<Bytes, StagingVerifyFailure>(StagingDirectoryUnreadable(error))
+    Ok(entries) -> match extra_entry(entries) {
+      Some(entry) -> Err<Bytes, StagingVerifyFailure>(StagingExtraEntry(entry))
+      None -> if vector_len<Path>(entries) == 0 {
+        Err<Bytes, StagingVerifyFailure>(StagingArtifactMissing)
+      } else {
+        match artifact_path(directory) {
+          Err(_) -> Err<Bytes, StagingVerifyFailure>(StagingArtifactUnreadable(IoInvalidPath))
+          Ok(artifact) -> match FileRead.read_all(artifact, budget + __i64_to_usize(1)) {
+            Err(IoLimitExceeded(limit)) -> Err<Bytes, StagingVerifyFailure>(
+              StagingOverBudget(limit)
+            )
+            Err(error) -> Err<Bytes, StagingVerifyFailure>(StagingArtifactUnreadable(error))
+            Ok(bytes) -> verify_content(bytes, size, content, budget)
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,1176 @@
+-- Build-time staging of a grammar's checked plan: the conformance over the
+-- module-fixture grammar, the budgeted sink in both interpretations, the
+-- compiler-side verification of a sink directory, two-session byte identity
+-- of the persisted plan, and the process sink end to end through a child
+-- driver under the process session API.
+
+use module_fixtures/toy_grammar.{AssignmentGrammar, AssignmentSyntax, LeakyAssignmentGrammar}
+use compiler/backend/target.{native_link_target_host, native_link_target_name}
+use compiler/pipeline.{
+  PipelineNativeDebugInformationStripped,
+  PipelineNativeProductFailed,
+  PipelineNativeProductReady,
+  pipeline_binary_buf,
+  pipeline_check_source_with_diagnostics,
+  pipeline_checked_native_product,
+  pipeline_lower_native_ir_for_target_closed
+}
+use runtime/alloc.{alloc_zeroed}
+use runtime/buffer.{buf_len, buf_ptr}
+use runtime/dir_inspect as dir_inspect_handler
+use runtime/dir_mutate as dir_mutate_handler
+use runtime/file_read as file_read_handler
+use runtime/file_write as file_write_handler
+use runtime/memory.{mem_copy, mem_store64_at}
+use runtime/process as process_handler
+use runtime/source_acquire.{SourceAcquire, source_acquire_with_checkout}
+use runtime/string.{runtime_str_cstring}
+use runtime/syscall.{
+  sys_close,
+  sys_dir_mkdir,
+  sys_dir_remove_directory,
+  sys_open_write_create_truncate,
+  sys_remove,
+  sys_write
+}
+use runtime/time as platform_time
+use stdlib/bytes as bytes
+use stdlib/bytes.{Bytes}
+use stdlib/diagnostic/schema.{*}
+use stdlib/dir.{DirInspect, DirMutate}
+use stdlib/file.{FileCreateNew, FileRead, FileWrite}
+use stdlib/grammar.{Grammar, ParseResult, Parsed, Checked, CheckRejected}
+use stdlib/grammar/tooling.{*}
+use stdlib/grammar/tooling/conformance as conformance
+use stdlib/grammar/tooling/conformance.{*}
+use stdlib/grammar/tooling/digest.{content_digest}
+use stdlib/grammar/tooling/host_fixture as host
+use stdlib/grammar/tooling/host_fixture.{*}
+use stdlib/grammar/tooling/protocol.{
+  FrameBuffer,
+  frame_buffer,
+  frame_buffer_accept,
+  frame_buffer_take_line,
+  frame_limit,
+  parse_line,
+  render_line
+}
+use stdlib/grammar/tooling/staging.{*}
+use stdlib/io/types.{*}
+use stdlib/json.{*}
+use stdlib/list as list
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option.{Option, Some, None}
+use stdlib/panic.{panic}
+use stdlib/path as path
+use stdlib/path.{Path}
+use stdlib/process.{*}
+use stdlib/result.{Result, Ok, Err}
+use stdlib/source.{Source, Span}
+use stdlib/string.{str_concat}
+use stdlib/time as time
+use stdlib/time/monotonic as monotonic
+use stdlib/time/monotonic.{Instant}
+use stdlib/typecheck.{TypeCheck}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push, vector_set}
+
+-- Fixtures ------------------------------------------------------------------
+fn span(text: str) -> Span {
+  Source { text: text, identity: DiagnosticSourceNamed("embedded") }.all()
+}
+
+fn settings_fields() -> List<(str, str)> {
+  let fields = [("count", "i64"), ("name", "str")]
+  list.from_slice(fields[..])
+}
+
+fn settings_catalog() -> HostCatalog {
+  catalog_with(primitive_catalog(), catalog_record("settings", settings_fields()))
+}
+
+-- The same vocabulary behind two padding records, so every token the host
+-- answers, primitives included, differs from `settings_catalog`'s.
+fn shifted_catalog() -> HostCatalog {
+  let pad = [("left", "i64")]
+  let pads = [
+    catalog_record("pad_one", list.from_slice(pad[..])),
+    catalog_record("pad_two", list.from_slice(pad[..]))
+  ]
+  let padded = list.from_slice(pads[..])
+  catalog_with(padded.concat(primitive_catalog()), catalog_record("settings", settings_fields()))
+}
+
+fn typed_plan(platform: str) -> StagingTarget {
+  StagingTarget { capability: StagingTypedPlan, platform: platform }
+}
+
+fn validate_only(platform: str) -> StagingTarget {
+  StagingTarget { capability: StagingValidateOnly, platform: platform }
+}
+
+fn host_platform() -> str { native_link_target_name(native_link_target_host()) }
+
+fn fixture_path(text: str) -> Path { path.from_utf8(text).unwrap() }
+
+fn schema_fixture() -> Path { fixture_path("test/fixtures/comptime_sql_schema_v1.json") }
+
+fn parse_assignment(text: str) -> AssignmentSyntax {
+  let parsed = handle AssignmentGrammar().parse(span(text)) {
+    Diagnose.report(value) -> resume(0)
+    Diagnose.error(message, position) -> resume(0)
+    Diagnose.warn(message, position) -> resume(0)
+    Diagnose.note(message, position) -> resume(0)
+  }
+  match parsed {
+    Parsed(syntax) -> syntax
+    _ -> panic("the fixture assignment does not parse")
+  }
+}
+
+-- A record around a one-slot vector carries a count across resumptions and
+-- into closures.
+type Counter { hits: Vector<i64> }
+
+fn counter_new() -> Counter {
+  let hits = vector.new<i64>()
+  vector_push<i64>(hits, 0)
+  Counter { hits: hits }
+}
+
+fn counter_bump(counter: Counter) -> nil {
+  let hits = counter.hits
+  vector_set<i64>(hits, 0, vector_get_in_bounds<i64>(hits, 0) + 1)
+  nil
+}
+
+fn counter_value(counter: Counter) -> i64 {
+  let hits = counter.hits
+  vector_get_in_bounds<i64>(hits, 0)
+}
+
+-- Count error diagnostics around a stage; specialised to `StageResult` so no
+-- caller type variable flows into the handler.
+fn counting<E>(body: () -[Diagnose, E]> StageResult) -[E]> (StageResult, i64) {
+  let counter = counter_new()
+  let result = handle body() {
+    Diagnose.report(value) -> { counter_bump(counter); resume(0) }
+    Diagnose.error(message, position) -> { counter_bump(counter); resume(0) }
+    Diagnose.warn(message, position) -> resume(0)
+    Diagnose.note(message, position) -> resume(0)
+  }
+  (result, counter_value(counter))
+}
+
+-- Handlers are installed in named functions with explicit signatures; the
+-- closures below only call them.
+fn stage_toy(
+  catalog: HostCatalog,
+  syntax: AssignmentSyntax,
+  context: StagingContext,
+  target: StagingTarget
+) -[StagingSink, Diagnose]> StageResult {
+  with host(catalog) {
+    with file_read_handler() { conformance.stage(AssignmentGrammar(), syntax, context, target) }
+  }
+}
+
+fn stage_leaky(
+  catalog: HostCatalog,
+  syntax: AssignmentSyntax
+) -[StagingSink, Diagnose]> StageResult {
+  with host(catalog) {
+    with file_read_handler() {
+      conformance.stage(
+        LeakyAssignmentGrammar(),
+        syntax,
+        StagingHostTypes,
+        typed_plan("macos-aarch64")
+      )
+    }
+  }
+}
+
+--- Stage a toy assignment in memory under a catalog: the result, the error
+--- count and what the sink accepted.
+fn staged(
+  catalog: HostCatalog,
+  text: str,
+  context: StagingContext,
+  target: StagingTarget,
+  budget: usize
+) -> (StageResult, i64, SinkSummary) {
+  let syntax = parse_assignment(text)
+  let ((result, errors), summary) = with_memory_sink(
+    budget,
+    () => counting(() => stage_toy(catalog, syntax, context, target))
+  )
+  (result, errors, summary)
+}
+
+fn staged_leaky(catalog: HostCatalog, text: str) -> (StageResult, SinkSummary) {
+  let syntax = parse_assignment(text)
+  let ((result, errors), summary) = with_memory_sink(
+    __i64_to_usize(4096),
+    () => counting(() => stage_leaky(catalog, syntax))
+  )
+  (result, summary)
+}
+
+fn expected_plan(key: str, type_name: str, literal: str) -> str {
+  "assignment "
+    |> str_concat(key)
+    |> str_concat(" : ")
+    |> str_concat(type_name)
+    |> str_concat("\n= ")
+    |> str_concat(literal)
+    |> str_concat("\n")
+}
+
+fn is_emitted(result: StageResult) -> bool {
+  match result { StageEmitted(_) -> true, _ -> false }
+}
+
+fn is_check_rejected(result: StageResult) -> bool {
+  match result { StageRefused(StagingCheckRejected) -> true, _ -> false }
+}
+
+fn facts_text(result: StageResult, key: str) -> str {
+  match result {
+    StageEmitted(facts) -> match facts.get(key) {
+      Some(value) -> value.as_str().unwrap_or("<not text>")
+      None -> "<missing>"
+    }
+    _ -> "<not emitted>"
+  }
+}
+
+-- A grammar that reads a file while persisting, to prove the conformance
+-- confines reads to the context file whatever the package asks for.
+type ReadingGrammar { ReadingGrammar }
+
+impl Grammar for ReadingGrammar {
+  type Syntax = usize
+  fn parse(self, source: Span) -[Diagnose]> ParseResult<usize> { Parsed(source.len()) }
+}
+
+impl GrammarStaging for ReadingGrammar {
+  type Syntax = usize
+  type Persistent = usize
+
+  fn stagings(self) -> List<StagingSupport> {
+    let supports = [
+      StagingSupport {
+        capability: StagingTypedPlan,
+        budget: StagingBudget { seconds: 1, bytes: __i64_to_usize(64) }
+      }
+    ]
+    list.from_slice(supports[..])
+  }
+
+  fn persist(
+    self,
+    syntax: usize,
+    context: StagingContext
+  ) -[TypeCheck<ToolTypeIdentity>, FileRead, Diagnose]> Result<usize, StagingRefusal> {
+    match FileRead.read_all(schema_fixture(), __i64_to_usize(4096)) {
+      Ok(content) -> Ok<usize, StagingRefusal>(content.len())
+      Err(_) -> Err<usize, StagingRefusal>(StagingContextUnavailable)
+    }
+  }
+
+  fn emit(self, plan: usize, target: StagingTarget) -[StagingSink, Diagnose]> StagingReport {
+    let text = __u64_to_i64(__usize_to_u64(plan)).to_str()
+    match StagingSink.emit(bytes.from_str(text)) {
+      Ok(_) -> StagingReport { outcome: StagingEmitted, facts: JsonNull }
+      Err(error) -> StagingReport { outcome: StagingSinkRefused(error), facts: JsonNull }
+    }
+  }
+}
+
+fn stage_reading(context: StagingContext) -[StagingSink, Diagnose]> StageResult {
+  with host(primitive_catalog()) {
+    with file_read_handler() {
+      conformance.stage(ReadingGrammar(), __i64_to_usize(0), context, typed_plan("macos-aarch64"))
+    }
+  }
+}
+
+fn reading_staged(context: StagingContext) -> (StageResult, SinkSummary) {
+  let ((result, errors), summary) = with_memory_sink(
+    __i64_to_usize(64),
+    () => counting(() => stage_reading(context))
+  )
+  (result, summary)
+}
+
+fn read_fixture() -> Result<Bytes, IoError> {
+  with file_read_handler() { FileRead.read_all(schema_fixture(), __i64_to_usize(4096)) }
+}
+
+-- A grammar that declares no staging capability; its `persist` reports a
+-- diagnostic so a call that should never happen is visible.
+type SilentGrammar { SilentGrammar }
+
+impl GrammarStaging for SilentGrammar {
+  type Syntax = usize
+  type Persistent = usize
+
+  fn stagings(self) -> List<StagingSupport> { Nil<StagingSupport>() }
+
+  fn persist(
+    self,
+    syntax: usize,
+    context: StagingContext
+  ) -[TypeCheck<ToolTypeIdentity>, FileRead, Diagnose]> Result<usize, StagingRefusal> {
+    Diagnose.error("persist was called for an undeclared capability", 0)
+    Ok<usize, StagingRefusal>(syntax)
+  }
+
+  fn emit(self, plan: usize, target: StagingTarget) -[StagingSink, Diagnose]> StagingReport {
+    StagingReport { outcome: StagingEmitted, facts: JsonNull }
+  }
+}
+
+-- The conformance suite ------------------------------------------------------
+test "an accepted assignment stages through the sink as two chunks with its facts" {
+  let (result, errors, summary) = staged(
+    settings_catalog(),
+    "count = 3",
+    StagingHostTypes,
+    typed_plan("macos-aarch64"),
+    __i64_to_usize(4096)
+  )
+  Test.assert_true(is_emitted(result))
+  Test.assert_str_eq(facts_text(result, "key"), "count")
+  Test.assert_str_eq(facts_text(result, "literal"), "integer")
+  Test.assert_eq(errors, 0)
+  Test.assert_eq(summary.chunks, 2)
+  let plan = expected_plan("count", "i64", "3")
+  Test.assert_eq_usize(summary.size, plan.len())
+  Test.assert_str_eq(summary.content, content_digest(bytes.from_str(plan)))
+  let (text, text_errors, text_summary) = staged(
+    settings_catalog(),
+    "name = \"weft\"",
+    StagingHostTypes,
+    typed_plan("linux-aarch64"),
+    __i64_to_usize(4096)
+  )
+  Test.assert_true(is_emitted(text))
+  Test.assert_str_eq(facts_text(text, "literal"), "text")
+  Test.assert_eq(text_errors, 0)
+  Test.assert_str_eq(
+    text_summary.content,
+    content_digest(bytes.from_str(expected_plan("name", "str", "\"weft\"")))
+  )
+}
+
+test "a validate only site is checked and emits nothing" {
+  let (checked, errors, summary) = staged(
+    settings_catalog(),
+    "count = 3",
+    StagingHostTypes,
+    validate_only("macos-aarch64"),
+    __i64_to_usize(4096)
+  )
+  Test.assert_true(match checked { StagedNothing -> true, _ -> false })
+  Test.assert_eq(errors, 0)
+  Test.assert_eq(summary.chunks, 0)
+  Test.assert_eq_usize(summary.size, __i64_to_usize(0))
+  let (rejected, rejected_errors, rejected_summary) = staged(
+    settings_catalog(),
+    "other = 3",
+    StagingHostTypes,
+    validate_only("macos-aarch64"),
+    __i64_to_usize(4096)
+  )
+  Test.assert_true(is_check_rejected(rejected))
+  Test.assert_eq(rejected_errors, 1)
+  Test.assert_eq(rejected_summary.chunks, 0)
+}
+
+test "a rejected check withholds the plan before any chunk reaches the sink" {
+  let (unknown, unknown_errors, unknown_summary) = staged(
+    settings_catalog(),
+    "other = 3",
+    StagingHostTypes,
+    typed_plan("macos-aarch64"),
+    __i64_to_usize(4096)
+  )
+  Test.assert_true(is_check_rejected(unknown))
+  Test.assert_eq(unknown_errors, 1)
+  Test.assert_eq(unknown_summary.chunks, 0)
+  let (mismatch, mismatch_errors, mismatch_summary) = staged(
+    settings_catalog(),
+    "count = \"three\"",
+    StagingHostTypes,
+    typed_plan("macos-aarch64"),
+    __i64_to_usize(4096)
+  )
+  Test.assert_true(is_check_rejected(mismatch))
+  Test.assert_eq(mismatch_errors, 1)
+  Test.assert_eq(mismatch_summary.chunks, 0)
+  let (no_host, no_host_errors, no_host_summary) = staged(
+    primitive_catalog(),
+    "count = 3",
+    StagingHostTypes,
+    typed_plan("macos-aarch64"),
+    __i64_to_usize(4096)
+  )
+  Test.assert_true(is_check_rejected(no_host))
+  Test.assert_eq(no_host_errors, 1)
+  Test.assert_eq(no_host_summary.chunks, 0)
+}
+
+test "a context kind the package does not stage against is refused structurally" {
+  let (result, errors, summary) = staged(
+    settings_catalog(),
+    "count = 3",
+    StagingFileContext(schema_fixture(), __i64_to_usize(4096)),
+    typed_plan("macos-aarch64"),
+    __i64_to_usize(4096)
+  )
+  Test.assert_true(
+    match result {
+      StageRefused(StagingContextUnsupported(GrammarFileContext)) -> true,
+      _ -> false
+    }
+  )
+  Test.assert_eq(errors, 0)
+  Test.assert_eq(summary.chunks, 0)
+}
+
+test "reads while persisting are confined to the context file and its limit" {
+  let (denied, denied_summary) = reading_staged(StagingHostTypes)
+  Test.assert_true(match denied { StageRefused(StagingContextUnavailable) -> true, _ -> false })
+  Test.assert_eq(denied_summary.chunks, 0)
+  let (allowed, allowed_summary) = reading_staged(
+    StagingFileContext(schema_fixture(), __i64_to_usize(4096))
+  )
+  Test.assert_true(is_emitted(allowed))
+  Test.assert_eq(allowed_summary.chunks, 1)
+  match read_fixture() {
+    Ok(content) -> {
+      let text = __u64_to_i64(__usize_to_u64(content.len())).to_str()
+      Test.assert_str_eq(allowed_summary.content, content_digest(bytes.from_str(text)))
+    }
+    Err(_) -> Test.assert_true(false)
+  }
+  let (other_file, _) = reading_staged(
+    StagingFileContext(
+      fixture_path("test/fixtures/comptime_sql_schema_v2.json"),
+      __i64_to_usize(4096)
+    )
+  )
+  Test.assert_true(
+    match other_file { StageRefused(StagingContextUnavailable) -> true, _ -> false }
+  )
+  let (over_limit, _) = reading_staged(StagingFileContext(schema_fixture(), __i64_to_usize(8)))
+  Test.assert_true(
+    match over_limit { StageRefused(StagingContextUnavailable) -> true, _ -> false }
+  )
+}
+
+test "a platform the package cannot encode for is refused after persisting" {
+  let (result, errors, summary) = staged(
+    settings_catalog(),
+    "count = 3",
+    StagingHostTypes,
+    typed_plan("z80"),
+    __i64_to_usize(4096)
+  )
+  Test.assert_true(
+    match result { StageUnsupportedTarget(platform) -> platform == "z80", _ -> false }
+  )
+  Test.assert_eq(errors, 0)
+  Test.assert_eq(summary.chunks, 0)
+}
+
+fn stage_silent(target: StagingTarget) -[StagingSink, Diagnose]> StageResult {
+  with host(primitive_catalog()) {
+    with file_read_handler() {
+      conformance.stage(SilentGrammar(), __i64_to_usize(3), StagingHostTypes, target)
+    }
+  }
+}
+
+test "a capability the package does not declare is refused before the grammar runs" {
+  let ((result, errors), summary) = with_memory_sink(
+    __i64_to_usize(64),
+    () => counting(() => stage_silent(typed_plan("macos-aarch64")))
+  )
+  Test.assert_true(match result { StageRefusedNoStaging -> true, _ -> false })
+  Test.assert_eq(errors, 0)
+  Test.assert_eq(summary.chunks, 0)
+  -- A validate-only site still checks: the undeclared package is called.
+  let ((validated, validated_errors), _) = with_memory_sink(
+    __i64_to_usize(64),
+    () => counting(() => stage_silent(validate_only("macos-aarch64")))
+  )
+  Test.assert_true(match validated { StagedNothing -> true, _ -> false })
+  Test.assert_eq(validated_errors, 1)
+}
+
+fn emit_text(text: str) -[StagingSink]> Result<usize, IoError> {
+  StagingSink.emit(bytes.from_str(text))
+}
+
+fn is_limit(result: Result<usize, IoError>, budget: usize) -> bool {
+  match result { Err(IoLimitExceeded(limit)) -> limit == budget, _ -> false }
+}
+
+fn is_ok_count(result: Result<usize, IoError>, count: usize) -> bool {
+  match result { Ok(actual) -> actual == count, _ -> false }
+}
+
+-- The sequence every sink interpretation must answer identically.
+fn budget_sequence() -[StagingSink]> (bool, bool, bool, bool, bool) {
+  let budget = __i64_to_usize(10)
+  let empty = match emit_text("") { Err(IoInvalidProgress) -> true, _ -> false }
+  let first = is_ok_count(emit_text("12345"), __i64_to_usize(5))
+  let refused = is_limit(emit_text("678901"), budget)
+  let second = is_ok_count(emit_text("67890"), __i64_to_usize(5))
+  let full = is_limit(emit_text("x"), budget)
+  (empty, first, refused, second, full)
+}
+
+fn assert_budget_sequence(answers: (bool, bool, bool, bool, bool)) -[Test]> nil {
+  let (empty, first, refused, second, full) = answers
+  Test.assert_true(empty)
+  Test.assert_true(first)
+  Test.assert_true(refused)
+  Test.assert_true(second)
+  Test.assert_true(full)
+  nil
+}
+
+test "the memory sink refuses empty chunks and chunks beyond the budget" {
+  let (answers, summary) = with_memory_sink(__i64_to_usize(10), () => budget_sequence())
+  assert_budget_sequence(answers)
+  Test.assert_eq_usize(summary.size, __i64_to_usize(10))
+  Test.assert_eq(summary.chunks, 2)
+  Test.assert_str_eq(summary.content, content_digest(bytes.from_str("1234567890")))
+}
+
+test "budgets are clamped to the compiler's ceilings" {
+  let declared = effective_budget(StagingBudget { seconds: 5, bytes: __i64_to_usize(4096) })
+  Test.assert_eq(declared.seconds, 5)
+  Test.assert_eq_usize(declared.bytes, __i64_to_usize(4096))
+  let greedy = effective_budget(
+    StagingBudget { seconds: 600, bytes: __i64_to_usize(1099511627776) }
+  )
+  Test.assert_eq(greedy.seconds, seconds_ceiling())
+  Test.assert_eq_usize(greedy.bytes, byte_ceiling())
+  let negative = effective_budget(StagingBudget { seconds: 0 - 1, bytes: __i64_to_usize(1) })
+  Test.assert_eq(negative.seconds, 0)
+  let supports = AssignmentGrammar().stagings()
+  Test.assert_true(
+    match support_for(supports, StagingTypedPlan) {
+      Some(support) -> support.budget.seconds == 5,
+      None -> false
+    }
+  )
+  Test.assert_true(match support_for(supports, StagingValidateOnly) { None -> true, _ -> false })
+}
+
+test "the plan stages byte identical under sessions with disjoint identities" {
+  let (first, first_errors, first_summary) = staged(
+    settings_catalog(),
+    "count = 3",
+    StagingHostTypes,
+    typed_plan("macos-aarch64"),
+    __i64_to_usize(4096)
+  )
+  let (second, second_errors, second_summary) = staged(
+    shifted_catalog(),
+    "count = 3",
+    StagingHostTypes,
+    typed_plan("macos-aarch64"),
+    __i64_to_usize(4096)
+  )
+  Test.assert_true(is_emitted(first))
+  Test.assert_true(is_emitted(second))
+  Test.assert_eq(first_errors + second_errors, 0)
+  Test.assert_eq_usize(first_summary.size, second_summary.size)
+  Test.assert_str_eq(first_summary.content, second_summary.content)
+  -- The test has teeth: a plan that keeps the session token differs.
+  let (leaky_first, leaky_first_summary) = staged_leaky(settings_catalog(), "count = 3")
+  let (leaky_second, leaky_second_summary) = staged_leaky(shifted_catalog(), "count = 3")
+  Test.assert_true(is_emitted(leaky_first))
+  Test.assert_true(is_emitted(leaky_second))
+  Test.assert_str_ne(leaky_first_summary.content, leaky_second_summary.content)
+}
+
+-- The driver hands one parse result to every conformance; this function
+-- checks only when the three agree on `Syntax`.
+fn agreement(
+  grammar: AssignmentGrammar,
+  source: Span
+) -[TypeCheck<ToolTypeIdentity>, FileRead, StagingSink, Diagnose]> StageResult {
+  match grammar.parse(source) {
+    Parsed(syntax) -> match conformance.host_check(grammar, syntax) {
+      GrammarChecked -> conformance.stage(
+        grammar,
+        syntax,
+        StagingHostTypes,
+        typed_plan("macos-aarch64")
+      )
+      _ -> StageRefused(StagingCheckRejected)
+    }
+    _ -> StageRefused(StagingCheckRejected)
+  }
+}
+
+fn agreement_under_host(text: str) -[StagingSink, Diagnose]> StageResult {
+  with host(settings_catalog()) {
+    with file_read_handler() { agreement(AssignmentGrammar(), span(text)) }
+  }
+}
+
+test "the three conformances agree on the syntax they share" {
+  let ((result, errors), summary) = with_memory_sink(
+    __i64_to_usize(4096),
+    () => counting(() => agreement_under_host("count = 3"))
+  )
+  Test.assert_true(is_emitted(result))
+  Test.assert_eq(errors, 0)
+  Test.assert_eq(summary.chunks, 2)
+}
+
+-- Directories -----------------------------------------------------------------
+fn make_directory(text: str) -> i64 { sys_dir_mkdir(runtime_str_cstring(text), 448) }
+
+fn remove_entry(text: str) -> i64 { sys_remove(runtime_str_cstring(text)) }
+
+fn remove_directory(text: str) -> i64 { sys_dir_remove_directory(runtime_str_cstring(text)) }
+
+fn join(directory: str, name: str) -> str { str_concat(directory, str_concat("/", name)) }
+
+--- A fresh scratch root under `target/`, unique per run.
+fn scratch_root() -> str {
+  make_directory("target")
+  make_directory("target/staging-prototype")
+  let stamp = platform_time.with_platform(() => monotonic.now()).nanoseconds()
+  let root = str_concat("target/staging-prototype/", stamp.to_str())
+  make_directory(root)
+  root
+}
+
+fn scratch_directory(root: str, name: str) -> str {
+  let directory = join(root, name)
+  make_directory(directory)
+  directory
+}
+
+fn write_text(text: str, content: str) -> nil {
+  let fd = sys_open_write_create_truncate(runtime_str_cstring(text), 384)
+  sys_write(fd, __str_ptr(content), __str_len(content))
+  sys_close(fd)
+  nil
+}
+
+fn verified(
+  directory: str,
+  size: usize,
+  content: str,
+  budget: usize
+) -> Result<Bytes, StagingVerifyFailure> {
+  with dir_inspect_handler() {
+    with file_read_handler() { verify_artifact(fixture_path(directory), size, content, budget) }
+  }
+}
+
+fn listing_len(directory: str) -> i64 {
+  let listed = with dir_inspect_handler() { DirInspect.list(fixture_path(directory)) }
+  match listed {
+    Ok(entries) -> vector_len<Path>(entries)
+    Err(_) -> 0 - 1
+  }
+}
+
+test "the directory sink creates the artifact once and appends within the budget" {
+  let root = scratch_root()
+  let directory = scratch_directory(root, "sink")
+  let (answers, summary) = with file_write_handler() {
+    with_sink_directory(fixture_path(directory), __i64_to_usize(10), () => budget_sequence())
+  }
+  assert_budget_sequence(answers)
+  Test.assert_eq_usize(summary.size, __i64_to_usize(10))
+  Test.assert_eq(summary.chunks, 2)
+  Test.assert_str_eq(summary.content, content_digest(bytes.from_str("1234567890")))
+  match verified(directory, summary.size, summary.content, __i64_to_usize(10)) {
+    Ok(content) -> Test.assert_str_eq(content.to_utf8().unwrap_or("<bytes>"), "1234567890")
+    Err(_) -> Test.assert_true(false)
+  }
+  -- The file exists now, so a second sink on the same directory cannot
+  -- create it: the first chunk is refused and nothing is appended.
+  let (again, again_summary) = with file_write_handler() {
+    with_sink_directory(fixture_path(directory), __i64_to_usize(10), () => emit_text("abc"))
+  }
+  Test.assert_true(match again { Err(IoAlreadyExists) -> true, _ -> false })
+  Test.assert_eq(again_summary.chunks, 0)
+  match verified(directory, __i64_to_usize(10), summary.content, __i64_to_usize(10)) {
+    Ok(_) -> Test.assert_true(true)
+    Err(_) -> Test.assert_true(false)
+  }
+  remove_entry(join(directory, "artifact"))
+  remove_directory(directory)
+  remove_directory(root)
+}
+
+test "verification accepts exactly the reported artifact and rejects every deviation" {
+  let root = scratch_root()
+  let directory = scratch_directory(root, "verify")
+  let budget = __i64_to_usize(16)
+  Test.assert_true(
+    match verified(directory, __i64_to_usize(5), "sha256:", budget) {
+      Err(StagingArtifactMissing) -> true
+      _ -> false
+    }
+  )
+  write_text(join(directory, "artifact"), "hello")
+  let digest = content_digest(bytes.from_str("hello"))
+  match verified(directory, __i64_to_usize(5), digest, budget) {
+    Ok(content) -> Test.assert_str_eq(content.to_utf8().unwrap_or("<bytes>"), "hello")
+    Err(_) -> Test.assert_true(false)
+  }
+  Test.assert_true(
+    match verified(directory, __i64_to_usize(6), digest, budget) {
+      Err(StagingSizeMismatch(reported, actual)) -> reported == __i64_to_usize(6) and actual ==
+        __i64_to_usize(5)
+      _ -> false
+    }
+  )
+  let other = content_digest(bytes.from_str("other"))
+  Test.assert_true(
+    match verified(directory, __i64_to_usize(5), other, budget) {
+      Err(StagingDigestMismatch(reported, actual)) -> reported == other and actual == digest
+      _ -> false
+    }
+  )
+  Test.assert_true(
+    match verified(directory, __i64_to_usize(5), digest, __i64_to_usize(4)) {
+      Err(StagingOverBudget(_)) -> true
+      _ -> false
+    }
+  )
+  write_text(join(directory, "extra"), "stray")
+  Test.assert_true(
+    match verified(directory, __i64_to_usize(5), digest, budget) {
+      Err(StagingExtraEntry(entry)) -> entry.to_utf8().unwrap_or("<bytes>") == "extra"
+      _ -> false
+    }
+  )
+  Test.assert_true(
+    match verified(join(root, "absent"), __i64_to_usize(5), digest, budget) {
+      Err(StagingDirectoryUnreadable(_)) -> true
+      _ -> false
+    }
+  )
+  remove_entry(join(directory, "extra"))
+  remove_entry(join(directory, "artifact"))
+  remove_directory(directory)
+  remove_directory(root)
+}
+
+-- The process sink --------------------------------------------------------------
+fn test_cstr(value: str) -> i64 {
+  let result = alloc_zeroed(__str_len(value) + 1)
+  mem_copy(result, __str_ptr(value), __str_len(value))
+  result
+}
+
+fn test_argv() -> i64 {
+  let argv = alloc_zeroed(24)
+  mem_store64_at(argv, 0, 0)
+  mem_store64_at(argv, 8, test_cstr("PATH=/usr/bin:/bin"))
+  mem_store64_at(argv, 16, 0)
+  argv
+}
+
+fn with_platform<T>(body: () -[Proc, SourceAcquire, Test]> T) -[Test]> T {
+  with process_handler(0, test_argv()) { source_acquire_with_checkout(".", body) }
+}
+
+fn deadline_in(millis: i64) -> Instant {
+  platform_time.with_platform(() => monotonic.now()).add(time.milliseconds(millis))
+}
+
+fn write_fully(fd: i64, ptr: i64, len: i64) -> bool {
+  let mut done = 0
+  while done < len {
+    let wrote = sys_write(fd, ptr + done, len - done)
+    if wrote <= 0 { return false }
+    done = done + wrote
+  }
+  true
+}
+
+--- Build the child stage driver as a host executable under `root`, or say
+--- why it could not be built.
+fn build_child(root: str) -[SourceAcquire]> Result<str, str> {
+  let source = "use module_fixtures/toy_grammar_stage_child.{serve_stage}\nfn main() -> i64 { serve_stage() }\n"
+  let messages = vector.new<str>()
+  let checked = handle pipeline_check_source_with_diagnostics(
+    __str_ptr(source),
+    __str_len(source)
+  ) {
+    Diagnose.report(value) -> { vector_push<str>(messages, value.message()); resume(0) }
+    Diagnose.error(message, position) -> { vector_push<str>(messages, message); resume(0) }
+    Diagnose.warn(message, position) -> resume(0)
+    Diagnose.note(message, position) -> resume(0)
+  }
+  match checked {
+    CheckRejected -> Err<str, str>(
+      str_concat(
+        "the child did not check: ",
+        if vector_len<str>(messages) == 0 { "no diagnostics" } else {
+          vector_get_in_bounds<str>(messages, 0)
+        }
+      )
+    )
+    Checked(typed) -> {
+      let native = pipeline_lower_native_ir_for_target_closed(typed, native_link_target_host())
+      match pipeline_checked_native_product(
+        native,
+        __str_ptr(source),
+        PipelineNativeDebugInformationStripped
+      ) {
+        PipelineNativeProductFailed(_) -> Err<str, str>("the child did not link")
+        PipelineNativeProductReady(binary, facts) -> {
+          let output = pipeline_binary_buf(binary)
+          let child = join(root, "child")
+          let fd = sys_open_write_create_truncate(runtime_str_cstring(child), 448)
+          let written = if fd < 0 { false } else {
+            write_fully(fd, buf_ptr(output), buf_len(output))
+          }
+          sys_close(fd)
+          if written { Ok<str, str>(child) } else {
+            Err<str, str>(str_concat("the child could not be written to ", child))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn request_line(source: str, sink: str, budget: i64, platform: str, mode: str) -> str {
+  let entries = [
+    JsonEntry("source", JsonString(source)),
+    JsonEntry("sink", JsonString(sink)),
+    JsonEntry("bytes", JsonNumber(budget)),
+    JsonEntry("platform", JsonString(platform)),
+    JsonEntry("mode", JsonString(mode))
+  ]
+  render_line(JsonObject(list.from_slice(entries[..])))
+}
+
+fn read_response(
+  session: ProcSession,
+  buffer: FrameBuffer,
+  deadline: Instant
+) -[Proc]> (owned ProcSession, Option<Bytes>) {
+  match frame_buffer_take_line(buffer) {
+    Some(line) -> (session, Some<Bytes>(line))
+    None -> {
+      let (next, got) = Proc.session_read(session, __i64_to_usize(65536), deadline)
+      match got {
+        ProcReadChunk(ProcStdout, chunk) -> {
+          frame_buffer_accept(buffer, chunk, frame_limit())
+          read_response(next, buffer, deadline)
+        }
+        ProcReadChunk(ProcStderr, chunk) -> read_response(next, buffer, deadline)
+        _ -> (next, None<Bytes>())
+      }
+    }
+  }
+}
+
+--- One exchange: the response document, if the child answered, and how it
+--- terminated.
+fn exchange(child: str, line: str) -[Proc]> (Option<Json>, ProcOutput) {
+  let deadline = deadline_in(20000)
+  let session: owned ProcSession = Proc.open_session(child, Nil<str>(), __i64_to_usize(4194304))
+  let (written, wrote) = Proc.session_write(session, bytes.from_str(line), deadline)
+  let closed = Proc.session_close_input(written)
+  let (drained, answer) = read_response(closed, frame_buffer(), deadline)
+  let output = Proc.session_finish_until(drained, deadline)
+  let document = match answer {
+    None -> None<Json>()
+    Some(raw) -> match raw.to_utf8() {
+      Err(_) -> None<Json>()
+      Ok(text) -> match parse_line(text) {
+        Ok(parsed) -> Some<Json>(parsed)
+        Err(_) -> None<Json>()
+      }
+    }
+  }
+  (document, output)
+}
+
+fn exited_with(output: ProcOutput, code: i64) -> bool {
+  match output { ProcCompleted(ProcExited(actual), _, _) -> actual == code, _ -> false }
+}
+
+fn member_text(document: Option<Json>, key: str) -> str {
+  match document {
+    Some(value) -> match value.get(key) {
+      Some(member) -> member.as_str().unwrap_or("<not text>")
+      None -> "<missing>"
+    }
+    None -> "<no response>"
+  }
+}
+
+fn member_number(document: Option<Json>, key: str) -> i64 {
+  match document {
+    Some(value) -> match value.get(key) {
+      Some(member) -> member.as_i64().unwrap_or(0 - 1)
+      None -> 0 - 1
+    }
+    None -> 0 - 1
+  }
+}
+
+fn stored(root: str, directory: str, content: Bytes, digest: str) -[DirMutate, FileRead]> bool {
+  let store = join(
+    root,
+    str_concat("store-", digest.slice(__i64_to_usize(7), __i64_to_usize(19)).unwrap_or("x"))
+  )
+  match DirMutate.rename(fixture_path(join(directory, "artifact")), fixture_path(store)) {
+    Err(_) -> false
+    Ok(_) -> match DirMutate.remove(fixture_path(directory)) {
+      Err(_) -> false
+      Ok(_) -> match FileRead.read_all(fixture_path(store), __i64_to_usize(4096)) {
+        Ok(kept) -> kept.eq(content)
+        Err(_) -> false
+      }
+    }
+  }
+}
+
+fn stage_case(
+  child: str,
+  directory: str,
+  source: str,
+  budget: i64,
+  platform: str,
+  mode: str
+) -[Proc]> (Option<Json>, ProcOutput) {
+  exchange(child, request_line(source, directory, budget, platform, mode))
+}
+
+fn store_artifact(root: str, directory: str, content: Bytes, digest: str) -> bool {
+  with dir_mutate_handler() {
+    with file_read_handler() { stored(root, directory, content, digest) }
+  }
+}
+
+test "a child stage driver writes exactly one artifact the parent verifies, and every deviation is caught" {
+  with_platform<nil>(
+    () => {
+      let root = scratch_root()
+      let child = match build_child(root) {
+        Ok(built) -> built
+        Err(reason) -> panic(reason)
+      }
+      let plan = expected_plan("count", "i64", "3")
+      let digest = content_digest(bytes.from_str(plan))
+      let budget = __i64_to_usize(4096)
+
+      -- Faithful: verify, store, and the directory is gone.
+      let faithful = scratch_directory(root, "faithful")
+      let (answer, output) = stage_case(
+        child,
+        faithful,
+        "count = 3",
+        4096,
+        host_platform(),
+        "faithful"
+      )
+      Test.assert_true(exited_with(output, 0))
+      Test.assert_str_eq(member_text(answer, "stage"), "staged")
+      Test.assert_eq(member_number(answer, "size"), __u64_to_i64(__usize_to_u64(plan.len())))
+      Test.assert_str_eq(member_text(answer, "content"), digest)
+      Test.assert_eq(member_number(answer, "diagnostics"), 0)
+      match verified(faithful, plan.len(), digest, budget) {
+        Ok(content) -> {
+          Test.assert_str_eq(content.to_utf8().unwrap_or("<bytes>"), plan)
+          Test.assert_true(store_artifact(root, faithful, content, digest))
+        }
+        Err(_) -> Test.assert_true(false)
+      }
+      Test.assert_eq(listing_len(faithful), 0 - 1)
+
+      -- Refused by the check: explained, and nothing was created.
+      let refused = scratch_directory(root, "refused")
+      let (refused_answer, refused_output) = stage_case(
+        child,
+        refused,
+        "other = 3",
+        4096,
+        host_platform(),
+        "faithful"
+      )
+      Test.assert_true(exited_with(refused_output, 0))
+      Test.assert_str_eq(member_text(refused_answer, "stage"), "refused")
+      Test.assert_eq(member_number(refused_answer, "diagnostics"), 1)
+      Test.assert_eq(listing_len(refused), 0)
+      remove_directory(refused)
+
+      -- Over budget between the two chunks: a partial artifact the parent
+      -- discards without verifying.
+      let partial = scratch_directory(root, "partial")
+      let (partial_answer, partial_output) = stage_case(
+        child,
+        partial,
+        "count = 3",
+        25,
+        host_platform(),
+        "faithful"
+      )
+      Test.assert_true(exited_with(partial_output, 0))
+      Test.assert_str_eq(member_text(partial_answer, "stage"), "sink_refused")
+      Test.assert_eq(member_number(partial_answer, "size"), 23)
+      Test.assert_eq(listing_len(partial), 1)
+      remove_entry(join(partial, "artifact"))
+      remove_directory(partial)
+
+      -- Unsupported platform and rejected parse: nothing created.
+      let unsupported = scratch_directory(root, "unsupported")
+      let (unsupported_answer, _) = stage_case(
+        child,
+        unsupported,
+        "count = 3",
+        4096,
+        "z80",
+        "faithful"
+      )
+      Test.assert_str_eq(member_text(unsupported_answer, "stage"), "unsupported")
+      Test.assert_eq(listing_len(unsupported), 0)
+      remove_directory(unsupported)
+      let unparsed = scratch_directory(root, "unparsed")
+      let (unparsed_answer, _) = stage_case(
+        child,
+        unparsed,
+        "count 3",
+        4096,
+        host_platform(),
+        "faithful"
+      )
+      Test.assert_str_eq(member_text(unparsed_answer, "stage"), "parse_rejected")
+      Test.assert_eq(member_number(unparsed_answer, "diagnostics"), 1)
+      Test.assert_eq(listing_len(unparsed), 0)
+      remove_directory(unparsed)
+
+      -- A driver that claims an artifact it never wrote.
+      let claimed = scratch_directory(root, "claimed")
+      let (claimed_answer, _) = stage_case(
+        child,
+        claimed,
+        "count = 3",
+        4096,
+        host_platform(),
+        "claim_without_emitting"
+      )
+      Test.assert_str_eq(member_text(claimed_answer, "stage"), "staged")
+      Test.assert_true(
+        match verified(claimed, plan.len(), digest, budget) {
+          Err(StagingArtifactMissing) -> true
+          _ -> false
+        }
+      )
+      remove_directory(claimed)
+
+      -- A driver that leaves a second file.
+      let extra = scratch_directory(root, "extra")
+      let (extra_answer, _) = stage_case(
+        child,
+        extra,
+        "count = 3",
+        4096,
+        host_platform(),
+        "extra_entry"
+      )
+      Test.assert_str_eq(member_text(extra_answer, "stage"), "staged")
+      Test.assert_true(
+        match verified(extra, plan.len(), digest, budget) {
+          Err(StagingExtraEntry(entry)) -> entry.to_utf8().unwrap_or("<bytes>") == "extra"
+          _ -> false
+        }
+      )
+      remove_entry(join(extra, "extra"))
+      remove_entry(join(extra, "artifact"))
+      remove_directory(extra)
+
+      -- A driver that misreports the size, and one that misreports the digest.
+      let sized = scratch_directory(root, "sized")
+      let (sized_answer, _) = stage_case(
+        child,
+        sized,
+        "count = 3",
+        4096,
+        host_platform(),
+        "misreport_size"
+      )
+      let reported_size = __i64_to_usize(member_number(sized_answer, "size"))
+      Test.assert_eq_usize(reported_size, plan.len() + __i64_to_usize(1))
+      Test.assert_true(
+        match verified(sized, reported_size, digest, budget) {
+          Err(StagingSizeMismatch(reported, actual)) -> reported == reported_size and actual ==
+            plan.len()
+          _ -> false
+        }
+      )
+      remove_entry(join(sized, "artifact"))
+      remove_directory(sized)
+      let digested = scratch_directory(root, "digested")
+      let (digested_answer, _) = stage_case(
+        child,
+        digested,
+        "count = 3",
+        4096,
+        host_platform(),
+        "misreport_digest"
+      )
+      let reported_digest = member_text(digested_answer, "content")
+      Test.assert_str_ne(reported_digest, digest)
+      Test.assert_true(
+        match verified(digested, plan.len(), reported_digest, budget) {
+          Err(StagingDigestMismatch(reported, actual)) -> reported == reported_digest and
+            actual == digest
+          _ -> false
+        }
+      )
+      remove_entry(join(digested, "artifact"))
+      remove_directory(digested)
+
+      -- A driver that exits without answering: no response counts, whatever
+      -- it wrote is discarded.
+      let silent = scratch_directory(root, "silent")
+      let (silent_answer, silent_output) = stage_case(
+        child,
+        silent,
+        "count = 3",
+        4096,
+        host_platform(),
+        "exit_before_responding"
+      )
+      Test.assert_true(match silent_answer { None -> true, _ -> false })
+      Test.assert_true(exited_with(silent_output, 7))
+      Test.assert_eq(listing_len(silent), 1)
+      remove_entry(join(silent, "artifact"))
+      remove_directory(silent)
+
+      remove_entry(child)
+      remove_entry(
+        join(
+          root,
+          str_concat("store-", digest.slice(__i64_to_usize(7), __i64_to_usize(19)).unwrap_or("x"))
+        )
+      )
+      remove_directory(root)
+      nil
+    }
+  )
+}

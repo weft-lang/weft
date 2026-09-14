@@ -1,0 +1,300 @@
+-- A stage driver stand-in for the process-sink contract under today's
+-- process API. It reads one request line naming a private sink directory,
+-- stages a toy assignment into it through the budgeted sink, and answers
+-- one response line describing what it wrote. Misbehaving modes let the
+-- parent's verification be tested against a driver that lies or oversteps;
+-- only the faithful mode behaves as a generated driver does.
+
+use module_fixtures/toy_grammar.{AssignmentGrammar, AssignmentSyntax}
+use runtime/file_read as file_read_handler
+use runtime/file_write as file_write_handler
+use stdlib/bytes as bytes
+use stdlib/console as console
+use stdlib/console.{ConsoleRead, ConsoleWrite}
+use stdlib/console/input as console_input
+use stdlib/console/terminal as console_terminal
+use stdlib/diagnostic/schema.{Diagnose, DiagnosticSourceNamed}
+use stdlib/state.{State}
+use stdlib/file.{FileCreateNew, FileRead, FileWrite}
+use stdlib/grammar.{ParseResult, Parsed}
+use stdlib/grammar/tooling.{ToolTypeIdentity}
+use stdlib/grammar/tooling/conformance as conformance
+use stdlib/grammar/tooling/conformance.{*}
+use stdlib/grammar/tooling/digest.{content_digest}
+use stdlib/grammar/tooling/driver.{line_reader, read_line, write_line}
+use stdlib/grammar/tooling/host_fixture as host
+use stdlib/grammar/tooling/host_fixture.{
+  HostCatalog,
+  catalog_record,
+  catalog_with,
+  primitive_catalog
+}
+use stdlib/grammar/tooling/protocol.{parse_line}
+use stdlib/grammar/tooling/staging.{*}
+use stdlib/json.{Json, JsonEntry, JsonNull, JsonNumber, JsonObject, JsonString}
+use stdlib/list as list
+use stdlib/list.{List}
+use stdlib/option.{Option, Some, None}
+use stdlib/path as path
+use stdlib/path.{Path}
+use stdlib/result.{Result, Ok, Err}
+use stdlib/source.{Source}
+use stdlib/state as state
+use stdlib/typecheck.{TypeCheck}
+
+--- How the child behaves; only `StageFaithfully` is a driver.
+type StageMode {
+  StageFaithfully,
+  --- Report an artifact without creating a file.
+  ClaimWithoutEmitting,
+  --- Stage, then create a second file in the directory.
+  LeaveAnExtraEntry,
+  --- Stage, then report one byte more than was written.
+  MisreportSize,
+  --- Stage, then report the digest of other bytes.
+  MisreportDigest,
+  --- Stage, then exit without a response.
+  ExitBeforeResponding
+}
+
+--- One request: what to stage, where, within what budget, and how to behave.
+type StageRequest { source: str, sink: Path, budget: usize, platform: str, mode: StageMode }
+
+--- Serve one request from standard input and answer on standard output.
+pub fn serve_stage() -> i64 {
+  with console_input() {
+    with console_terminal() {
+      with file_read_handler() { with file_write_handler() { serve_one() } }
+    }
+  }
+}
+
+fn settings_catalog() -> HostCatalog {
+  let fields = [("count", "i64"), ("name", "str")]
+  catalog_with(primitive_catalog(), catalog_record("settings", list.from_slice(fields[..])))
+}
+
+fn decode_mode(name: str) -> Option<StageMode> {
+  if name == "faithful" { Some<StageMode>(StageFaithfully) } else {
+    if name == "claim_without_emitting" { Some<StageMode>(ClaimWithoutEmitting) } else {
+      if name == "extra_entry" { Some<StageMode>(LeaveAnExtraEntry) } else {
+        if name == "misreport_size" { Some<StageMode>(MisreportSize) } else {
+          if name == "misreport_digest" { Some<StageMode>(MisreportDigest) } else {
+            if name == "exit_before_responding" { Some<StageMode>(ExitBeforeResponding) } else {
+              None<StageMode>()
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn text_member(document: Json, name: str) -> Result<str, str> {
+  match document.get(name) {
+    Some(value) -> match value.as_str() {
+      Some(text) -> Ok<str, str>(text)
+      None -> Err<str, str>(name.concat(" is not text"))
+    }
+    None -> Err<str, str>(name.concat(" is missing"))
+  }
+}
+
+fn decode_request(document: Json) -> Result<StageRequest, str> {
+  match text_member(document, "source") {
+    Err(message) -> Err<StageRequest, str>(message)
+    Ok(source) -> match text_member(document, "sink") {
+      Err(message) -> Err<StageRequest, str>(message)
+      Ok(sink_text) -> match path.from_utf8(sink_text) {
+        Err(_) -> Err<StageRequest, str>("sink is not a path")
+        Ok(sink) -> match text_member(document, "platform") {
+          Err(message) -> Err<StageRequest, str>(message)
+          Ok(platform) -> match text_member(document, "mode") {
+            Err(message) -> Err<StageRequest, str>(message)
+            Ok(mode_name) -> match decode_mode(mode_name) {
+              None -> Err<StageRequest, str>("mode is unknown")
+              Some(mode) -> match document.get("bytes") {
+                None -> Err<StageRequest, str>("bytes is missing")
+                Some(limit) -> match limit.as_i64() {
+                  None -> Err<StageRequest, str>("bytes is not a number")
+                  Some(budget) -> Ok<StageRequest, str>(
+                    StageRequest {
+                      source: source,
+                      sink: sink,
+                      budget: __i64_to_usize(budget),
+                      platform: platform,
+                      mode: mode
+                    }
+                  )
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn fail(message: str) -[ConsoleWrite]> i64 {
+  console.eprintln("stage child: ".concat(message))
+  2
+}
+
+fn serve_one() -[ConsoleRead, ConsoleWrite, FileRead, FileWrite]> i64 {
+  match read_line(line_reader()) {
+    Ok(Some(line)) -> match parse_line(line) {
+      Err(_) -> fail("the request line is not a protocol document")
+      Ok(document) -> match decode_request(document) {
+        Err(message) -> fail(message)
+        Ok(request) -> stage_request(request)
+      }
+    }
+    _ -> fail("no request line")
+  }
+}
+
+-- Diagnostics are counted through the state effect so the parent can see
+-- that a refusal was explained.
+fn bump() -[State<i64>]> nil {
+  state.modify((count: i64) => count + 1)
+  nil
+}
+
+fn stage_counting(
+  body: () -[StagingSink, FileRead, Diagnose]> StageResult
+) -[StagingSink, FileRead]> (StageResult, i64) {
+  state.run(
+    0,
+    () => handle body() {
+      Diagnose.report(value) -> { bump(); resume(0) }
+      Diagnose.error(message, position) -> { bump(); resume(0) }
+      Diagnose.warn(message, position) -> resume(0)
+      Diagnose.note(message, position) -> resume(0)
+    }
+  )
+}
+
+fn stage_under_host(
+  syntax: AssignmentSyntax,
+  target: StagingTarget
+) -[StagingSink, FileRead]> (StageResult, i64) {
+  stage_counting(
+    () => with host(settings_catalog()) {
+      conformance.stage(AssignmentGrammar(), syntax, StagingHostTypes, target)
+    }
+  )
+}
+
+fn parse_counting(text: str) -> (ParseResult<AssignmentSyntax>, i64) {
+  let source = Source { text: text, identity: DiagnosticSourceNamed("embedded") }
+  state.run(
+    0,
+    () => handle AssignmentGrammar().parse(source.all()) {
+      Diagnose.report(value) -> { bump(); resume(0) }
+      Diagnose.error(message, position) -> { bump(); resume(0) }
+      Diagnose.warn(message, position) -> resume(0)
+      Diagnose.note(message, position) -> resume(0)
+    }
+  )
+}
+
+fn stage_name(result: StageResult) -> str {
+  match result {
+    StageEmitted(_) -> "staged"
+    StagedNothing -> "nothing"
+    StageRefused(_) -> "refused"
+    StageRefusedNoStaging -> "no_staging"
+    StageUnsupportedTarget(_) -> "unsupported"
+    StageSinkRefused(_) -> "sink_refused"
+  }
+}
+
+fn facts_of(result: StageResult) -> Json {
+  match result {
+    StageEmitted(facts) -> facts
+    _ -> JsonNull
+  }
+}
+
+fn respond(
+  name: str,
+  size: usize,
+  content: str,
+  facts: Json,
+  diagnostics: i64
+) -[ConsoleWrite]> i64 {
+  let entries = [
+    JsonEntry("stage", JsonString(name)),
+    JsonEntry("size", JsonNumber(__u64_to_i64(__usize_to_u64(size)))),
+    JsonEntry("content", JsonString(content)),
+    JsonEntry("facts", facts),
+    JsonEntry("diagnostics", JsonNumber(diagnostics))
+  ]
+  match write_line(JsonObject(list.from_slice(entries[..]))) {
+    Err(_) -> fail("could not write the response line")
+    Ok(_) -> 0
+  }
+}
+
+fn stage_request(request: StageRequest) -[ConsoleWrite, FileRead, FileWrite]> i64 {
+  let (parsed, parse_errors) = parse_counting(request.source)
+  match parsed {
+    Parsed(syntax) -> {
+      let target = StagingTarget { capability: StagingTypedPlan, platform: request.platform }
+      let ((result, stage_errors), summary) = match request.mode {
+        ClaimWithoutEmitting -> with_memory_sink(
+          request.budget,
+          () => stage_under_host(syntax, target)
+        )
+        _ -> with_sink_directory(
+          request.sink,
+          request.budget,
+          () => stage_under_host(syntax, target)
+        )
+      }
+      let diagnostics = parse_errors + stage_errors
+      match request.mode {
+        LeaveAnExtraEntry -> {
+          match entry_path(request.sink, "extra") {
+            Ok(extra) -> {
+              FileWrite.write_all(extra, bytes.from_str("stray"), FileCreateNew);
+              nil
+            }
+            Err(_) -> nil
+          }
+          respond(
+            stage_name(result),
+            summary.size,
+            summary.content,
+            facts_of(result),
+            diagnostics
+          )
+        }
+        MisreportSize -> respond(
+          stage_name(result),
+          summary.size + __i64_to_usize(1),
+          summary.content,
+          facts_of(result),
+          diagnostics
+        )
+        MisreportDigest -> respond(
+          stage_name(result),
+          summary.size,
+          content_digest(bytes.from_str("other bytes")),
+          facts_of(result),
+          diagnostics
+        )
+        ExitBeforeResponding -> 7
+        _ -> respond(
+          stage_name(result),
+          summary.size,
+          summary.content,
+          facts_of(result),
+          diagnostics
+        )
+      }
+    }
+    _ -> respond("parse_rejected", __i64_to_usize(0), "", JsonNull, parse_errors)
+  }
+}

@@ -2,17 +2,21 @@
 -- assignment checked against the host record type `settings`. It proves the
 -- tooling contract is a public surface rather than a first-party registry.
 
+use stdlib/bytes as bytes
 use stdlib/diagnostic as diagnostic
 use stdlib/diagnostic/schema.{Diagnose, DiagnosticClassGrammar, DiagnosticSeverityError}
 use stdlib/file.{FileRead}
 use stdlib/grammar.{Grammar, ParseResult, Parsed, Rejected}
 use stdlib/grammar/tooling.{*}
+use stdlib/grammar/tooling/staging.{*}
+use stdlib/io/types.{IoError}
+use stdlib/json.{Json, JsonEntry, JsonNull, JsonNumber, JsonObject, JsonString}
 use stdlib/list as list
 use stdlib/list.{List, Nil}
 use stdlib/option.{Option, Some, None}
 use stdlib/path.{Path}
-use stdlib/result.{Ok, Err}
-use stdlib/semantic_type.{SemanticTypeFact, SemanticTypePrimitive}
+use stdlib/result.{Result, Ok, Err}
+use stdlib/semantic_type.{SemanticTypeFact, SemanticTypeNamed, SemanticTypePrimitive}
 use stdlib/source.{Span}
 use stdlib/typecheck.{TypeCheck, TypeName, NamedTypeField}
 
@@ -171,6 +175,62 @@ fn literal_matches(literal: AssignmentLiteral, description: SemanticTypeFact) ->
   }
 }
 
+--- The checked assignment in the form staging persists: the key, the host
+--- field's type as a fact, and the literal as spelled. No session identity
+--- survives into it.
+pub type AssignmentPlan {
+  key: str,
+  field: SemanticTypeFact,
+  literal: AssignmentLiteral,
+  text: str
+}
+
+fn settings_request() -> TypeName<ToolTypeIdentity> {
+  TypeName { qualifier: None<str>(), name: "settings", arguments: Nil<ToolTypeIdentity>() }
+}
+
+fn literal_text(syntax: AssignmentSyntax) -> str {
+  match syntax.literal_span.text() {
+    Some(text) -> text
+    None -> ""
+  }
+}
+
+-- The one package-owned check: the tooling report and the staged plan are
+-- two views of its result.
+fn resolve_assignment(
+  syntax: AssignmentSyntax
+) -[TypeCheck<ToolTypeIdentity>, Diagnose]> Result<AssignmentPlan, StagingRefusal> {
+  match TypeCheck<ToolTypeIdentity>.resolve(settings_request()) {
+    Err(_) -> {
+      report_at(syntax.key_span, "the host declares no settings record")
+      Err<AssignmentPlan, StagingRefusal>(StagingCheckRejected)
+    }
+    Ok(settings) -> match TypeCheck<ToolTypeIdentity>.field(
+      settings.identity,
+      NamedTypeField(syntax.key)
+    ) {
+      Err(_) -> {
+        report_at(syntax.key_span, "settings has no field with this name")
+        Err<AssignmentPlan, StagingRefusal>(StagingCheckRejected)
+      }
+      Ok(field) -> if literal_matches(syntax.literal, field.description) {
+        Ok<AssignmentPlan, StagingRefusal>(
+          AssignmentPlan {
+            key: syntax.key,
+            field: field.description,
+            literal: syntax.literal,
+            text: literal_text(syntax)
+          }
+        )
+      } else {
+        report_at(syntax.literal_span, "the literal does not match the field type")
+        Err<AssignmentPlan, StagingRefusal>(StagingCheckRejected)
+      }
+    }
+  }
+}
+
 impl GrammarTooling for AssignmentGrammar {
   type Syntax = AssignmentSyntax
 
@@ -183,29 +243,9 @@ impl GrammarTooling for AssignmentGrammar {
     self,
     syntax: AssignmentSyntax
   ) -[TypeCheck<ToolTypeIdentity>, Diagnose]> GrammarCheckReport {
-    let request = TypeName {
-      qualifier: None<str>(),
-      name: "settings",
-      arguments: Nil<ToolTypeIdentity>()
-    }
-    match TypeCheck<ToolTypeIdentity>.resolve(request) {
-      Err(_) -> {
-        report_at(syntax.key_span, "the host declares no settings record")
-        rejected_report()
-      }
-      Ok(settings) -> match TypeCheck<ToolTypeIdentity>.field(
-        settings.identity,
-        NamedTypeField(syntax.key)
-      ) {
-        Err(_) -> {
-          report_at(syntax.key_span, "settings has no field with this name")
-          rejected_report()
-        }
-        Ok(field) -> if literal_matches(syntax.literal, field.description) { checked_report() } else {
-          report_at(syntax.literal_span, "the literal does not match the field type")
-          rejected_report()
-        }
-      }
+    match resolve_assignment(syntax) {
+      Ok(_) -> checked_report()
+      Err(_) -> rejected_report()
     }
   }
 
@@ -216,5 +256,134 @@ impl GrammarTooling for AssignmentGrammar {
     limit: usize
   ) -[FileRead, Diagnose]> GrammarCheckReport {
     unsupported_report(GrammarFileContext)
+  }
+}
+
+fn fact_name(fact: SemanticTypeFact) -> str {
+  match fact {
+    SemanticTypePrimitive(name) -> name
+    SemanticTypeNamed(name, _) -> name
+    _ -> "other"
+  }
+}
+
+fn literal_name(literal: AssignmentLiteral) -> str {
+  match literal {
+    IntegerLiteral -> "integer"
+    TextLiteral -> "text"
+  }
+}
+
+fn platform_known(platform: str) -> bool {
+  platform == "macos-aarch64" or platform == "linux-aarch64"
+}
+
+fn typed_plan_support() -> List<StagingSupport> {
+  let supports = [
+    StagingSupport {
+      capability: StagingTypedPlan,
+      budget: StagingBudget { seconds: 5, bytes: __i64_to_usize(4096) }
+    }
+  ]
+  list.from_slice(supports[..])
+}
+
+fn sink_refused(error: IoError) -> StagingReport {
+  StagingReport { outcome: StagingSinkRefused(error), facts: JsonNull }
+}
+
+fn plan_facts(plan: AssignmentPlan) -> Json {
+  let entries = [
+    JsonEntry("key", JsonString(plan.key)),
+    JsonEntry("literal", JsonString(literal_name(plan.literal)))
+  ]
+  JsonObject(list.from_slice(entries[..]))
+}
+
+--- Staging renders the plan as two text lines, the header and the value, so
+--- a budget that admits the first and refuses the second leaves a partial
+--- artifact the compiler must discard.
+impl GrammarStaging for AssignmentGrammar {
+  type Syntax = AssignmentSyntax
+  type Persistent = AssignmentPlan
+
+  fn stagings(self) -> List<StagingSupport> { typed_plan_support() }
+
+  fn persist(
+    self,
+    syntax: AssignmentSyntax,
+    context: StagingContext
+  ) -[TypeCheck<ToolTypeIdentity>, FileRead, Diagnose]> Result<AssignmentPlan, StagingRefusal> {
+    match context {
+      StagingFileContext(_, _) -> Err<AssignmentPlan, StagingRefusal>(
+        StagingContextUnsupported(GrammarFileContext)
+      )
+      StagingHostTypes -> resolve_assignment(syntax)
+    }
+  }
+
+  fn emit(
+    self,
+    plan: AssignmentPlan,
+    target: StagingTarget
+  ) -[StagingSink, Diagnose]> StagingReport {
+    if not platform_known(target.platform) {
+      StagingReport { outcome: StagingUnsupportedTarget, facts: JsonNull }
+    } else {
+      let typed = "assignment ".concat(plan.key).concat(" : ").concat(fact_name(plan.field))
+      let header = typed.concat("\n")
+      let value = "= ".concat(plan.text).concat("\n")
+      match StagingSink.emit(bytes.from_str(header)) {
+        Err(error) -> sink_refused(error)
+        Ok(_) -> match StagingSink.emit(bytes.from_str(value)) {
+          Err(error) -> sink_refused(error)
+          Ok(_) -> StagingReport { outcome: StagingEmitted, facts: plan_facts(plan) }
+        }
+      }
+    }
+  }
+}
+
+--- The same syntax staged by a grammar whose plan keeps the session token
+--- the host answered with. The conformance suite's two-session byte
+--- identity test exists to catch exactly this plan.
+pub type LeakyAssignmentGrammar { LeakyAssignmentGrammar }
+
+pub type LeakyPlan { key: str, token: i64 }
+
+impl Grammar for LeakyAssignmentGrammar {
+  type Syntax = AssignmentSyntax
+
+  fn parse(self, source: Span) -[Diagnose]> ParseResult<AssignmentSyntax> {
+    AssignmentGrammar().parse(source)
+  }
+}
+
+impl GrammarStaging for LeakyAssignmentGrammar {
+  type Syntax = AssignmentSyntax
+  type Persistent = LeakyPlan
+
+  fn stagings(self) -> List<StagingSupport> { typed_plan_support() }
+
+  fn persist(
+    self,
+    syntax: AssignmentSyntax,
+    context: StagingContext
+  ) -[TypeCheck<ToolTypeIdentity>, FileRead, Diagnose]> Result<LeakyPlan, StagingRefusal> {
+    match TypeCheck<ToolTypeIdentity>.resolve(settings_request()) {
+      Err(_) -> Err<LeakyPlan, StagingRefusal>(StagingCheckRejected)
+      Ok(settings) -> Ok<LeakyPlan, StagingRefusal>(
+        LeakyPlan { key: syntax.key, token: tool_type_identity_token(settings.identity) }
+      )
+    }
+  }
+
+  fn emit(self, plan: LeakyPlan, target: StagingTarget) -[StagingSink, Diagnose]> StagingReport {
+    let token = JsonNumber(plan.token).stringify().unwrap_or("?")
+    let line = plan.key.concat(" ").concat(token).concat("\n")
+    match StagingSink.emit(bytes.from_str(line)) {
+      Err(error) -> sink_refused(error)
+      Ok(_) -> StagingReport { outcome: StagingEmitted, facts: JsonNull }
+    }
   }
 }
