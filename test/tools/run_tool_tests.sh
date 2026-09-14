@@ -4467,9 +4467,9 @@ printf '{"package":"app","dependencies":{"math":"deps/math"}}\n' > "$tmp_pkg_dir
 # generics at the declaration, so the checker itself decides and names the
 # missing trait; nothing is constructed or rescanned.
 sdk_audit=$("$WEFT" pkg audit 2>/dev/null)
-assert_contains "pkg_audit_reports_sdk_sql_grammar_conformance" "$sdk_audit" '{"export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/sql/tooling","status":"ok","diagnostics":[]}}'
-assert_contains "pkg_audit_reports_sdk_einsum_grammar_conformance" "$sdk_audit" '{"export":"einsum","module":"stdlib/grammar/einsum","declaration":"EinsumGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/einsum/tooling","status":"ok","diagnostics":[]}}'
-assert_contains "pkg_audit_reports_sdk_alias_grammar_conformance" "$sdk_audit" '{"export":"mini_sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/sql/tooling","status":"ok","diagnostics":[]}}'
+assert_contains "pkg_audit_reports_sdk_sql_grammar_conformance" "$sdk_audit" '{"export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/sql/tooling","status":"ok","diagnostics":[]},"staging":null}'
+assert_contains "pkg_audit_reports_sdk_einsum_grammar_conformance" "$sdk_audit" '{"export":"einsum","module":"stdlib/grammar/einsum","declaration":"EinsumGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/einsum/tooling","status":"ok","diagnostics":[]},"staging":null}'
+assert_contains "pkg_audit_reports_sdk_alias_grammar_conformance" "$sdk_audit" '{"export":"mini_sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/sql/tooling","status":"ok","diagnostics":[]},"staging":null}'
 
 mkdir -p "$tmp_pkg_dir/audit_grammar/grammars"
 cp module_fixtures/plain_grammar.weft "$tmp_pkg_dir/audit_grammar/grammars/words.weft"
@@ -4501,17 +4501,81 @@ impl GrammarTooling for WordGrammar {
   }
 }
 WEFT
-printf '{"package":"auditpkg","manifest_version":1,"version":"0.3.0","weft":"0.1","exports":{"grammars":{"words":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime","tooling":"grammars/words"},"plain":{"module":"grammars/plain","declaration":"Run","execution":"validate_only"},"lost":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime","tooling":"grammars/no_such_module"},"fine":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime"},"mismatch":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime","tooling":"grammars/mismatch_tooling"}}}}\n' > "$tmp_pkg_dir/audit_grammar/weft.pkg"
+# A typed-plan export must also supply GrammarStaging and agree with the
+# grammar on Syntax: the assignment grammar does, a tooling module whose
+# staging conformance names another Syntax does not, and a tooling module
+# without the conformance is named exactly.
+cp module_fixtures/toy_grammar.weft "$tmp_pkg_dir/audit_grammar/grammars/assignments.weft"
+cat > "$tmp_pkg_dir/audit_grammar/grammars/words_staging.weft" <<'WEFT'
+use grammars/words.{WordGrammar, WordSyntax}
+use stdlib/diagnostic/schema.{Diagnose}
+use stdlib/file.{FileRead}
+use stdlib/grammar/tooling.{*}
+use stdlib/grammar/tooling/staging.{*}
+use stdlib/json.{JsonNull}
+use stdlib/list.{List, Nil}
+use stdlib/path.{Path}
+use stdlib/result.{Result, Ok}
+use stdlib/typecheck.{TypeCheck}
+
+pub type OtherSyntax { OtherSyntax }
+
+impl GrammarTooling for WordGrammar {
+  type Syntax = WordSyntax
+
+  fn contexts(self) -> List<GrammarContextKind> { Nil<GrammarContextKind>() }
+
+  fn check_with_host(self, syntax: WordSyntax) -[TypeCheck<ToolTypeIdentity>, Diagnose]> GrammarCheckReport {
+    checked_report()
+  }
+
+  fn check_with_context(self, syntax: WordSyntax, context: Path, limit: usize) -[FileRead, Diagnose]> GrammarCheckReport {
+    checked_report()
+  }
+}
+
+impl GrammarStaging for WordGrammar {
+  type Syntax = OtherSyntax
+  type Persistent = OtherSyntax
+
+  fn stagings(self) -> List<StagingSupport> { Nil<StagingSupport>() }
+
+  fn persist(self, syntax: OtherSyntax, context: StagingContext) -[TypeCheck<ToolTypeIdentity>, FileRead, Diagnose]> Result<OtherSyntax, StagingRefusal> {
+    Ok<OtherSyntax, StagingRefusal>(syntax)
+  }
+
+  fn emit(self, plan: OtherSyntax, target: StagingTarget) -[StagingSink, Diagnose]> StagingReport {
+    StagingReport { outcome: StagingEmitted, facts: JsonNull }
+  }
+}
+WEFT
+printf '{"package":"auditpkg","manifest_version":1,"version":"0.3.0","weft":"0.1","exports":{"grammars":{"words":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime","tooling":"grammars/words"},"plain":{"module":"grammars/plain","declaration":"Run","execution":"validate_only"},"lost":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime","tooling":"grammars/no_such_module"},"fine":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime"},"mismatch":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime","tooling":"grammars/mismatch_tooling"},"assignments":{"module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"typed_plan","tooling":"grammars/assignments"},"unstaged":{"module":"grammars/words","declaration":"WordGrammar","execution":"typed_plan","tooling":"grammars/words_staging"},"unstageable":{"module":"grammars/words","declaration":"WordGrammar","execution":"typed_plan","tooling":"grammars/mismatch_tooling"},"checked_only":{"module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"validate_only","tooling":"grammars/assignments"}}}}\n' > "$tmp_pkg_dir/audit_grammar/weft.pkg"
 set +e
 grammar_audit=$(cd "$tmp_pkg_dir/audit_grammar" && "$WEFT_ABS" pkg audit 2>/dev/null)
 grammar_audit_exit=$?
 set -e
 assert_equals "pkg_audit_fails_when_a_grammar_export_does_not_conform" "$grammar_audit_exit" "1"
-assert_contains "pkg_audit_names_missing_tooling_conformance" "$grammar_audit" '{"export":"words","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/words","status":"failed","diagnostics":["type `WordGrammar` does not implement `GrammarTooling`"]}}'
-assert_contains "pkg_audit_names_missing_grammar_conformance" "$grammar_audit" '{"export":"plain","module":"grammars/plain","declaration":"Run","grammar":{"status":"failed","diagnostics":["type `Run` does not implement `Grammar`"]},"tooling":null}'
-assert_contains "pkg_audit_names_unavailable_tooling_module" "$grammar_audit" '{"export":"lost","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/no_such_module","status":"failed","diagnostics":["imported module source is unavailable"]}}'
-assert_contains "pkg_audit_accepts_parse_only_grammar_export" "$grammar_audit" '{"export":"fine","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":null}'
-assert_contains "pkg_audit_rejects_tooling_syntax_that_disagrees_with_the_grammar" "$grammar_audit" '{"export":"mismatch","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/mismatch_tooling","status":"failed","diagnostics":["argument type mismatch: expected `OtherSyntax`, found `WordSyntax`"]}}'
+assert_contains "pkg_audit_names_missing_tooling_conformance" "$grammar_audit" '{"export":"words","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/words","status":"failed","diagnostics":["type `WordGrammar` does not implement `GrammarTooling`"]},"staging":null}'
+assert_contains "pkg_audit_names_missing_grammar_conformance" "$grammar_audit" '{"export":"plain","module":"grammars/plain","declaration":"Run","grammar":{"status":"failed","diagnostics":["type `Run` does not implement `Grammar`"]},"tooling":null,"staging":null}'
+assert_contains "pkg_audit_names_unavailable_tooling_module" "$grammar_audit" '{"export":"lost","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/no_such_module","status":"failed","diagnostics":["imported module source is unavailable"]},"staging":null}'
+assert_contains "pkg_audit_accepts_parse_only_grammar_export" "$grammar_audit" '{"export":"fine","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":null,"staging":null}'
+assert_contains "pkg_audit_rejects_tooling_syntax_that_disagrees_with_the_grammar" "$grammar_audit" '{"export":"mismatch","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/mismatch_tooling","status":"failed","diagnostics":["argument type mismatch: expected `OtherSyntax`, found `WordSyntax`"]},"staging":null}'
+assert_contains "pkg_audit_reports_staging_conformance_of_a_typed_plan_export" "$grammar_audit" '{"export":"assignments","module":"grammars/assignments","declaration":"AssignmentGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/assignments","status":"ok","diagnostics":[]},"staging":{"module":"grammars/assignments","status":"ok","diagnostics":[]}}'
+assert_contains "pkg_audit_rejects_staging_syntax_that_disagrees_with_the_grammar" "$grammar_audit" '{"export":"unstaged","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/words_staging","status":"ok","diagnostics":[]},"staging":{"module":"grammars/words_staging","status":"failed","diagnostics":["argument type mismatch: expected `OtherSyntax`, found `WordSyntax`"]}}'
+assert_contains "pkg_audit_names_missing_staging_conformance" "$grammar_audit" '{"export":"unstageable","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/mismatch_tooling","status":"failed","diagnostics":["argument type mismatch: expected `OtherSyntax`, found `WordSyntax`"]},"staging":{"module":"grammars/mismatch_tooling","status":"failed","diagnostics":["type `WordGrammar` does not implement `GrammarStaging`"]}}'
+assert_contains "pkg_audit_does_not_require_staging_of_a_validate_only_export" "$grammar_audit" '{"export":"checked_only","module":"grammars/assignments","declaration":"AssignmentGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/assignments","status":"ok","diagnostics":[]},"staging":null}'
+# The typed-plan export is driven by a staging driver that still answers
+# plain checks, with no stage phase.
+grammar_stage_out=$(cd "$tmp_pkg_dir/audit_grammar" && printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"assignments","source":"count = 3","host_source":"type settings { count: i64 }"}}}' | "$WEFT_ABS" mcp 2>&1)
+assert_contains "mcp_grammar_diagnostics_checks_through_a_staging_driver" "$grammar_stage_out" '"export":"assignments","phase":"parse+check","diagnostics":0,"check_errors":0,"parse":"parsed","check":"checked"'
+grammar_stage_product=$(ls "$tmp_pkg_dir"/audit_grammar/target/*/grammar-tools/auditpkg-assignments-*.weft 2>/dev/null | head -1)
+if [ -n "$grammar_stage_product" ] && grep -q "driver.serve_staging(" "$grammar_stage_product" && grep -q "file_write_handler" "$grammar_stage_product"; then
+  echo "  ok mcp_grammar_typed_plan_export_runs_a_staging_driver"
+else
+  echo "  fail mcp_grammar_typed_plan_export_runs_a_staging_driver"
+  cat "$grammar_stage_product" 2>&1 | head -40
+  exit 1
+fi
 assert_contains "pkg_audit_keeps_native_authority_document" "$grammar_audit" '"schema_version":1,"target":"'
 
 mkdir -p "$tmp_pkg_dir/.weft/cache/math"

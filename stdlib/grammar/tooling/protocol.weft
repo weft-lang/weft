@@ -18,6 +18,7 @@ use stdlib/grammar/tooling/conformance.{
   ParseOutcomeRecovered,
   ParseOutcomeRejected
 }
+use stdlib/grammar/tooling/staging.{StagingCapability, StagingTypedPlan, StagingValidateOnly}
 use stdlib/json as json
 use stdlib/json.{*}
 use stdlib/list.{List, Cons, Nil}
@@ -161,13 +162,26 @@ pub type ToolContext {
   ToolFileContext(Path, usize)
 }
 
---- A request to parse and optionally check embedded source.
+--- A build target a stage is asked for, with the private sink directory the
+--- compiler created for it.
+pub type ToolStageTarget { capability: StagingCapability, platform: str, sink: Path }
+
+--- What a request asks the driver to do beyond parsing.
+pub type ToolOperation {
+  --- Check under the context; the default when a request names no operation.
+  ToolOperationCheck,
+  --- Check under the context, then stage for the target.
+  ToolOperationStage(ToolStageTarget)
+}
+
+--- A request to parse and optionally check or stage embedded source.
 pub type ToolRequest {
   grammar: ToolGrammar,
   --- The source identity every diagnostic range names.
   source_name: str,
   source_text: str,
-  context: ToolContext
+  context: ToolContext,
+  operation: ToolOperation
 }
 
 --- The check phase of a response.
@@ -197,11 +211,43 @@ pub type ToolObservedOutcome {
 --- One file read the grammar performed while checking.
 pub type ToolObservedInput { path: Path, limit: usize, outcome: ToolObservedOutcome }
 
+--- The artifact a driver reports having written into the sink: its size and
+--- digest as written, the byte budget the sink enforced, and the package's
+--- facts envelope.
+pub type ToolStagedArtifact { size: usize, content: str, budget: usize, facts: Json }
+
+--- The stage phase of a response.
+pub type ToolStageOutcome {
+  --- The request asked for a check only.
+  ToolStageNotRequested,
+  --- The package emitted an artifact into the sink.
+  ToolStaged(ToolStagedArtifact),
+  --- The syntax checked; the capability emits nothing.
+  ToolStagedNothing,
+  --- The syntax was recovered or rejected, so staging was withheld.
+  ToolStageRefusedParseNotAccepted,
+  --- The package's check rejected the source.
+  ToolStageRefusedCheckRejected,
+  --- The package emits nothing for the requested capability.
+  ToolStageRefusedNoStaging,
+  --- The export names no tooling module; the driver can only parse.
+  ToolStageRefusedNoTooling,
+  --- The context file could not be acquired or was invalid.
+  ToolStageContextUnavailable,
+  --- The package does not stage against this context kind.
+  ToolStageContextUnsupported(GrammarContextKind),
+  --- The package cannot encode its plan for the target's platform.
+  ToolStageUnsupportedTarget,
+  --- The sink refused a chunk; the named I/O error follows.
+  ToolStageSinkRefused(str)
+}
+
 --- The driver's final answer.
 pub type ToolResponse {
   grammar: ToolGrammar,
   parse: ParseOutcome,
   check: ToolCheckOutcome,
+  stage: ToolStageOutcome,
   diagnostics: List<Diagnostic>,
   observed_inputs: List<ToolObservedInput>
 }
@@ -434,24 +480,107 @@ fn encode_context(context: ToolContext) -> Result<Json, ToolProtocolError> {
   }
 }
 
---- Encode a request line document.
+fn capability_name(capability: StagingCapability) -> str {
+  match capability {
+    StagingValidateOnly -> "validate_only"
+    StagingTypedPlan -> "typed_plan"
+  }
+}
+
+fn decode_capability(name: str) -> Result<StagingCapability, ToolProtocolError> {
+  if name == "validate_only" { Ok<StagingCapability, ToolProtocolError>(StagingValidateOnly) }
+  else {
+    if name == "typed_plan" { Ok<StagingCapability, ToolProtocolError>(StagingTypedPlan) }
+    else { shape<StagingCapability>("target", "capability") }
+  }
+}
+
+fn encode_target(target: ToolStageTarget) -> Result<Json, ToolProtocolError> {
+  match path_json(target.sink) {
+    Err(error) -> Err<Json, ToolProtocolError>(error)
+    Ok(sink) -> Ok<Json, ToolProtocolError>(
+      object3(
+        entry("capability", JsonString(capability_name(target.capability))),
+        entry("platform", JsonString(target.platform)),
+        entry("sink", sink)
+      )
+    )
+  }
+}
+
+fn decode_target(value: Json) -> Result<ToolStageTarget, ToolProtocolError> {
+  match text_member(value, "target", "capability") {
+    Err(error) -> Err<ToolStageTarget, ToolProtocolError>(error)
+    Ok(capability_text) -> match decode_capability(capability_text) {
+      Err(error) -> Err<ToolStageTarget, ToolProtocolError>(error)
+      Ok(capability) -> match text_member(value, "target", "platform") {
+        Err(error) -> Err<ToolStageTarget, ToolProtocolError>(error)
+        Ok(platform) -> match path_member(value, "target", "sink") {
+          Err(error) -> Err<ToolStageTarget, ToolProtocolError>(error)
+          Ok(sink) -> Ok<ToolStageTarget, ToolProtocolError>(
+            ToolStageTarget { capability: capability, platform: platform, sink: sink }
+          )
+        }
+      }
+    }
+  }
+}
+
+--- Encode a request line document. A check names no operation, so every
+--- request an older peer understands is unchanged; a stage names its
+--- operation and target.
 pub fn encode_request(request: ToolRequest) -> Result<Json, ToolProtocolError> {
   match encode_context(request.context) {
     Err(error) -> Err<Json, ToolProtocolError>(error)
-    Ok(context) -> Ok<Json, ToolProtocolError>(
-      object4(
-        entry("protocol", JsonString(protocol_name())),
-        entry("grammar", encode_grammar(request.grammar)),
-        entry(
-          "source",
-          object2(
-            entry("name", JsonString(request.source_name)),
-            entry("text", JsonString(request.source_text))
-          )
-        ),
-        entry("context", context)
+    Ok(context) -> {
+      let protocol = entry("protocol", JsonString(protocol_name()))
+      let grammar = entry("grammar", encode_grammar(request.grammar))
+      let source = entry(
+        "source",
+        object2(
+          entry("name", JsonString(request.source_name)),
+          entry("text", JsonString(request.source_text))
+        )
       )
-    )
+      match request.operation {
+        ToolOperationCheck -> Ok<Json, ToolProtocolError>(
+          object4(protocol, grammar, source, entry("context", context))
+        )
+        ToolOperationStage(target) -> match encode_target(target) {
+          Err(error) -> Err<Json, ToolProtocolError>(error)
+          Ok(target_json) -> Ok<Json, ToolProtocolError>(
+            object6(
+              protocol,
+              grammar,
+              source,
+              entry("context", context),
+              entry("operation", JsonString("stage")),
+              entry("target", target_json)
+            )
+          )
+        }
+      }
+    }
+  }
+}
+
+fn decode_operation(value: Json) -> Result<ToolOperation, ToolProtocolError> {
+  match json_object_get(value, "operation") {
+    None -> Ok<ToolOperation, ToolProtocolError>(ToolOperationCheck)
+    Some(JsonString(name)) -> if name == "check" {
+      Ok<ToolOperation, ToolProtocolError>(ToolOperationCheck)
+    } else {
+      if name == "stage" {
+        match object_member(value, "request", "target") {
+          Err(error) -> Err<ToolOperation, ToolProtocolError>(error)
+          Ok(target_json) -> match decode_target(target_json) {
+            Err(error) -> Err<ToolOperation, ToolProtocolError>(error)
+            Ok(target) -> Ok<ToolOperation, ToolProtocolError>(ToolOperationStage(target))
+          }
+        }
+      } else { shape<ToolOperation>("request", "operation") }
+    }
+    Some(_) -> shape<ToolOperation>("request", "operation")
   }
 }
 
@@ -495,14 +624,18 @@ pub fn decode_request(value: Json) -> Result<ToolRequest, ToolProtocolError> {
                   Err(error) -> Err<ToolRequest, ToolProtocolError>(error)
                   Ok(context_json) -> match decode_context(context_json) {
                     Err(error) -> Err<ToolRequest, ToolProtocolError>(error)
-                    Ok(context) -> Ok<ToolRequest, ToolProtocolError>(
-                      ToolRequest {
-                        grammar: grammar,
-                        source_name: source_name,
-                        source_text: source_text,
-                        context: context
-                      }
-                    )
+                    Ok(context) -> match decode_operation(value) {
+                      Err(error) -> Err<ToolRequest, ToolProtocolError>(error)
+                      Ok(operation) -> Ok<ToolRequest, ToolProtocolError>(
+                        ToolRequest {
+                          grammar: grammar,
+                          source_name: source_name,
+                          source_text: source_text,
+                          context: context,
+                          operation: operation
+                        }
+                      )
+                    }
                   }
                 }
               }
@@ -966,16 +1099,68 @@ fn encode_observed_list(
   }
 }
 
+--- The wire shape of a stage outcome, in the protocol's own vocabulary.
+pub fn encode_stage(outcome: ToolStageOutcome) -> Json {
+  match outcome {
+    ToolStageNotRequested -> JsonString("not_requested")
+    ToolStaged(artifact) -> object1(
+      entry(
+        "staged",
+        object4(
+          entry("size", usize_json(artifact.size)),
+          entry("content", JsonString(artifact.content)),
+          entry("budget", usize_json(artifact.budget)),
+          entry("facts", artifact.facts)
+        )
+      )
+    )
+    ToolStagedNothing -> JsonString("staged_nothing")
+    ToolStageRefusedParseNotAccepted -> object1(
+      entry("refused", JsonString("parse_not_accepted"))
+    )
+    ToolStageRefusedCheckRejected -> object1(entry("refused", JsonString("check_rejected")))
+    ToolStageRefusedNoStaging -> object1(entry("refused", JsonString("no_staging")))
+    ToolStageRefusedNoTooling -> object1(entry("refused", JsonString("no_tooling")))
+    ToolStageContextUnavailable -> JsonString("context_unavailable")
+    ToolStageContextUnsupported(kind) -> object1(
+      entry("unsupported", object1(entry("context", JsonString(context_kind_name(kind)))))
+    )
+    ToolStageUnsupportedTarget -> object1(entry("unsupported", JsonString("target")))
+    ToolStageSinkRefused(name) -> object1(entry("sink_refused", JsonString(name)))
+  }
+}
+
+fn object7(
+  first: JsonEntry,
+  second: JsonEntry,
+  third: JsonEntry,
+  fourth: JsonEntry,
+  fifth: JsonEntry,
+  sixth: JsonEntry,
+  seventh: JsonEntry
+) -> Json {
+  JsonObject(
+    Cons(
+      first,
+      Cons(
+        second,
+        Cons(third, Cons(fourth, Cons(fifth, Cons(sixth, Cons(seventh, Nil<JsonEntry>())))))
+      )
+    )
+  )
+}
+
 --- Encode a response line document.
 pub fn encode_response(response: ToolResponse) -> Result<Json, ToolProtocolError> {
   match encode_observed_list(response.observed_inputs, Nil<Json>()) {
     Err(error) -> Err<Json, ToolProtocolError>(error)
     Ok(observed) -> Ok<Json, ToolProtocolError>(
-      object6(
+      object7(
         entry("response", JsonString(protocol_name())),
         entry("grammar", encode_grammar(response.grammar)),
         entry("parse", JsonString(parse_name(response.parse))),
         entry("check", encode_check(response.check)),
+        entry("stage", encode_stage(response.stage)),
         entry(
           "diagnostics",
           JsonArray(
@@ -987,6 +1172,93 @@ pub fn encode_response(response: ToolResponse) -> Result<Json, ToolProtocolError
         entry("observed_inputs", JsonArray(observed))
       )
     )
+  }
+}
+
+fn decode_staged(value: Json) -> Result<ToolStageOutcome, ToolProtocolError> {
+  match usize_member(value, "staged", "size") {
+    Err(error) -> Err<ToolStageOutcome, ToolProtocolError>(error)
+    Ok(size) -> match text_member(value, "staged", "content") {
+      Err(error) -> Err<ToolStageOutcome, ToolProtocolError>(error)
+      Ok(content) -> match usize_member(value, "staged", "budget") {
+        Err(error) -> Err<ToolStageOutcome, ToolProtocolError>(error)
+        Ok(budget) -> match json_object_get(value, "facts") {
+          None -> shape<ToolStageOutcome>("staged", "facts")
+          Some(facts) -> Ok<ToolStageOutcome, ToolProtocolError>(
+            ToolStaged(
+              ToolStagedArtifact { size: size, content: content, budget: budget, facts: facts }
+            )
+          )
+        }
+      }
+    }
+  }
+}
+
+fn decode_stage_refusal(reason: str) -> Result<ToolStageOutcome, ToolProtocolError> {
+  if reason == "parse_not_accepted" {
+    Ok<ToolStageOutcome, ToolProtocolError>(ToolStageRefusedParseNotAccepted)
+  } else {
+    if reason == "check_rejected" {
+      Ok<ToolStageOutcome, ToolProtocolError>(ToolStageRefusedCheckRejected)
+    } else {
+      if reason == "no_staging" {
+        Ok<ToolStageOutcome, ToolProtocolError>(ToolStageRefusedNoStaging)
+      } else {
+        if reason == "no_tooling" {
+          Ok<ToolStageOutcome, ToolProtocolError>(ToolStageRefusedNoTooling)
+        } else { shape<ToolStageOutcome>("stage", "refused") }
+      }
+    }
+  }
+}
+
+fn decode_stage_unsupported(value: Json) -> Result<ToolStageOutcome, ToolProtocolError> {
+  match value {
+    JsonString(what) -> if what == "target" {
+      Ok<ToolStageOutcome, ToolProtocolError>(ToolStageUnsupportedTarget)
+    } else { shape<ToolStageOutcome>("stage", "unsupported") }
+    JsonObject(_) -> match json_object_get(value, "context") {
+      Some(JsonString(kind_name)) -> match decode_context_kind(kind_name) {
+        Err(error) -> Err<ToolStageOutcome, ToolProtocolError>(error)
+        Ok(kind) -> Ok<ToolStageOutcome, ToolProtocolError>(ToolStageContextUnsupported(kind))
+      }
+      _ -> shape<ToolStageOutcome>("stage", "unsupported")
+    }
+    _ -> shape<ToolStageOutcome>("stage", "unsupported")
+  }
+}
+
+fn decode_stage(value: Json) -> Result<ToolStageOutcome, ToolProtocolError> {
+  match value {
+    JsonString(name) -> if name == "not_requested" {
+      Ok<ToolStageOutcome, ToolProtocolError>(ToolStageNotRequested)
+    } else {
+      if name == "staged_nothing" {
+        Ok<ToolStageOutcome, ToolProtocolError>(ToolStagedNothing)
+      } else {
+        if name == "context_unavailable" {
+          Ok<ToolStageOutcome, ToolProtocolError>(ToolStageContextUnavailable)
+        } else { shape<ToolStageOutcome>("response", "stage") }
+      }
+    }
+    JsonObject(_) -> match json_object_get(value, "staged") {
+      Some(artifact) -> decode_staged(artifact)
+      None -> match json_object_get(value, "refused") {
+        Some(JsonString(reason)) -> decode_stage_refusal(reason)
+        Some(_) -> shape<ToolStageOutcome>("stage", "refused")
+        None -> match json_object_get(value, "unsupported") {
+          Some(what) -> decode_stage_unsupported(what)
+          None -> match json_object_get(value, "sink_refused") {
+            Some(JsonString(name)) -> Ok<ToolStageOutcome, ToolProtocolError>(
+              ToolStageSinkRefused(name)
+            )
+            _ -> shape<ToolStageOutcome>("response", "stage")
+          }
+        }
+      }
+    }
+    _ -> shape<ToolStageOutcome>("response", "stage")
   }
 }
 
@@ -1112,6 +1384,14 @@ fn decode_observed_list(items: List<Json>) -> Result<List<ToolObservedInput>, To
   }
 }
 
+-- A response without a stage member answers a check: the member is additive.
+fn decode_response_stage(value: Json) -> Result<ToolStageOutcome, ToolProtocolError> {
+  match json_object_get(value, "stage") {
+    None -> Ok<ToolStageOutcome, ToolProtocolError>(ToolStageNotRequested)
+    Some(stage_json) -> decode_stage(stage_json)
+  }
+}
+
 --- Decode a response line document.
 pub fn decode_response(value: Json) -> Result<ToolResponse, ToolProtocolError> {
   match text_member(value, "response", "response") {
@@ -1131,23 +1411,31 @@ pub fn decode_response(value: Json) -> Result<ToolResponse, ToolProtocolError> {
                 None -> shape<ToolResponse>("response", "check")
                 Some(check_json) -> match decode_check(check_json) {
                   Err(error) -> Err<ToolResponse, ToolProtocolError>(error)
-                  Ok(check) -> match array_member(value, "response", "diagnostics") {
+                  Ok(check) -> match decode_response_stage(value) {
                     Err(error) -> Err<ToolResponse, ToolProtocolError>(error)
-                    Ok(diagnostic_items) -> match decode_diagnostics(diagnostic_items) {
+                    Ok(stage) -> match array_member(value, "response", "diagnostics") {
                       Err(error) -> Err<ToolResponse, ToolProtocolError>(error)
-                      Ok(diagnostics) -> match array_member(value, "response", "observed_inputs") {
+                      Ok(diagnostic_items) -> match decode_diagnostics(diagnostic_items) {
                         Err(error) -> Err<ToolResponse, ToolProtocolError>(error)
-                        Ok(observed_items) -> match decode_observed_list(observed_items) {
+                        Ok(diagnostics) -> match array_member(
+                          value,
+                          "response",
+                          "observed_inputs"
+                        ) {
                           Err(error) -> Err<ToolResponse, ToolProtocolError>(error)
-                          Ok(observed) -> Ok<ToolResponse, ToolProtocolError>(
-                            ToolResponse {
-                              grammar: grammar,
-                              parse: parse,
-                              check: check,
-                              diagnostics: diagnostics,
-                              observed_inputs: observed
-                            }
-                          )
+                          Ok(observed_items) -> match decode_observed_list(observed_items) {
+                            Err(error) -> Err<ToolResponse, ToolProtocolError>(error)
+                            Ok(observed) -> Ok<ToolResponse, ToolProtocolError>(
+                              ToolResponse {
+                                grammar: grammar,
+                                parse: parse,
+                                check: check,
+                                stage: stage,
+                                diagnostics: diagnostics,
+                                observed_inputs: observed
+                              }
+                            )
+                          }
                         }
                       }
                     }

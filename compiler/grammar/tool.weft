@@ -39,6 +39,7 @@ use stdlib/diagnostic/schema.{*}
 use stdlib/grammar.{CheckResult, Checked, CheckRejected}
 use stdlib/grammar/tooling.{ToolTypeIdentity, tool_type_identity, tool_type_identity_token}
 use stdlib/grammar/tooling/protocol.{*}
+use stdlib/grammar/tooling/staging.{StagingCapability, StagingTypedPlan, StagingValidateOnly}
 use stdlib/json.{*}
 use stdlib/list.{List, Cons, Nil}
 use stdlib/option.{Option, Some, None}
@@ -58,7 +59,22 @@ pub(package) type GrammarToolExport {
   export: str,
   module: str,
   declaration: str,
-  tooling: Option<str>
+  tooling: Option<str>,
+  --- What a staging site of this export may receive, from the manifest's
+  --- `execution`.
+  capability: StagingCapability
+}
+
+--- The capability an export's `execution` grants a staging site.
+--- `typed_plan` stages a typed plan. `runtime` will stage a typed plan too
+--- once the first-party packages that declare it implement `GrammarStaging`;
+--- until then it is driven as a check-only export, so a `runtime` export
+--- without the conformance still checks. `validate_only` and an absent
+--- execution check only.
+fn export_capability(execution: i64) -> StagingCapability {
+  if execution == pkg_export_execution_typed_plan() { StagingTypedPlan } else {
+    StagingValidateOnly
+  }
 }
 
 --- The result of resolving a tool-facing grammar name.
@@ -98,7 +114,8 @@ fn export_of(m: i64, entry: i64, import_prefix: str) -> GrammarToolExport {
           pkg_str_view(pkg_export_tooling_module_ptr(entry), pkg_export_tooling_module_len(entry))
         )
       )
-    } else { None<str>() }
+    } else { None<str>() },
+    capability: export_capability(pkg_export_execution(entry))
   }
 }
 
@@ -277,7 +294,20 @@ pub(package) type GrammarToolAuditStatus {
 --- `GrammarTooling` conformance that module must supply for the declaration.
 pub(package) type GrammarToolAudit {
   grammar: GrammarToolAuditStatus,
-  tooling: Option<GrammarToolAuditStatus>
+  tooling: Option<GrammarToolAuditStatus>,
+  --- The `GrammarStaging` conformance the tooling module must supply when
+  --- the export's capability stages typed plans; absent otherwise.
+  staging: Option<GrammarToolAuditStatus>
+}
+
+--- Which conformances one audit probe asks the checker about.
+type AuditProbe {
+  grammar_only: bool,
+  tooling: bool,
+  staging: bool,
+  --- Prove the conformances agree on `Syntax` by handing one parse result
+  --- to every checked conformance, as the generated driver does.
+  agreement: bool
 }
 
 --- The grammar exports of the workspace manifest, in declaration order.
@@ -300,8 +330,8 @@ pub(package) fn grammar_tool_root_exports() -> List<GrammarToolExport> {
 --- exported declaration, so the checker itself decides each conformance and
 --- reports the exact declaration and trait when one is missing. Nothing is
 --- constructed or rescanned.
-fn audit_probe_source(export: GrammarToolExport, with_tooling: bool, with_agreement: bool) -> str
-{
+fn audit_probe_source(export: GrammarToolExport, probe: AuditProbe) -> str {
+  let with_tooling = probe.tooling or probe.staging
   let tooling_import = if with_tooling {
     match export.tooling {
       Some(tooling) -> if str_eq(tooling, export.module) == 1 { "" } else {
@@ -310,6 +340,23 @@ fn audit_probe_source(export: GrammarToolExport, with_tooling: bool, with_agreem
       None -> ""
     }
   } else { "" }
+  let agreement_effects = if probe.staging {
+    "-[TypeCheck<tooling.ToolTypeIdentity>, FileRead, staging.StagingSink, Diagnose]> conformance.StageResult"
+  } else { "-[TypeCheck<tooling.ToolTypeIdentity>, Diagnose]> tooling.GrammarCheckOutcome" }
+  -- The driver hands what `parse` produced to every conformance it drives,
+  -- so they must agree on `Syntax`; these functions type-check only when
+  -- they do. The combined probe chains the check into the stage exactly as
+  -- the generated driver does; a single-conformance probe proves that one
+  -- conformance's agreement with the grammar on its own.
+  let agreement_body = if probe.staging and probe.tooling {
+    "  match grammar.parse(source) {\n    Parsed(syntax) -> match conformance.host_check(grammar, syntax) {\n      tooling.GrammarChecked -> conformance.stage(grammar, syntax, staging.StagingHostTypes, staging.StagingTarget { capability: staging.StagingTypedPlan, platform: \"\" })\n      _ -> conformance.StageRefused(staging.StagingCheckRejected)\n    }\n    _ -> conformance.StageRefused(staging.StagingCheckRejected)\n  }\n"
+  } else {
+    if probe.staging {
+      "  match grammar.parse(source) {\n    Parsed(syntax) -> conformance.stage(grammar, syntax, staging.StagingHostTypes, staging.StagingTarget { capability: staging.StagingTypedPlan, platform: \"\" })\n    _ -> conformance.StageRefused(staging.StagingCheckRejected)\n  }\n"
+    } else {
+      "  match grammar.parse(source) {\n    Parsed(syntax) -> conformance.host_check(grammar, syntax)\n    _ -> tooling.GrammarCheckRejected\n  }\n"
+    }
+  }
   "-- Generated grammar export audit probe for "
     |> str_concat(export.package_name)
     |> str_concat("/")
@@ -327,31 +374,59 @@ fn audit_probe_source(export: GrammarToolExport, with_tooling: bool, with_agreem
         "use stdlib/grammar/tooling as tooling\nuse stdlib/grammar/tooling.{GrammarTooling}\nuse stdlib/grammar/tooling/conformance as conformance\nuse stdlib/diagnostic/schema.{Diagnose}\nuse stdlib/source.{Span}\nuse stdlib/typecheck.{TypeCheck}\n"
       } else { "" }
     )
+    |> str_concat(
+      if probe.staging {
+        "use stdlib/file.{FileRead}\nuse stdlib/grammar/tooling/staging as staging\nuse stdlib/grammar/tooling/staging.{GrammarStaging}\n"
+      } else { "" }
+    )
     |> str_concat("\nfn audit_grammar<G: Grammar>() -> nil { nil }\n")
     |> str_concat(
-      if with_tooling { "\nfn audit_tooling<G: GrammarTooling>() -> nil { nil }\n" } else { "" }
+      if probe.tooling { "\nfn audit_tooling<G: GrammarTooling>() -> nil { nil }\n" } else { "" }
     )
     |> str_concat(
-      -- The driver hands what `parse` produced to `host_check`, so the two
-      -- conformances must agree on `Syntax`; this function type-checks only
-      -- when they do, exactly as the generated driver does.
-      if with_tooling and with_agreement {
+      if probe.staging { "\nfn audit_staging<G: GrammarStaging>() -> nil { nil }\n" } else { "" }
+    )
+    |> str_concat(
+      if with_tooling and probe.agreement {
         "\nfn audit_agreement(grammar: "
       |> str_concat(export.declaration)
-      |> str_concat(
-        ", source: Span) -[TypeCheck<tooling.ToolTypeIdentity>, Diagnose]> tooling.GrammarCheckOutcome {\n  match grammar.parse(source) {\n    Parsed(syntax) -> conformance.host_check(grammar, syntax)\n    _ -> tooling.GrammarCheckRejected\n  }\n}\n"
-      )
+      |> str_concat(", source: Span) ")
+      |> str_concat(agreement_effects)
+      |> str_concat(" {\n")
+      |> str_concat(agreement_body)
+      |> str_concat("}\n")
       } else { "" }
     )
     |> str_concat("\nfn main() -> i64 {\n  audit_grammar<")
     |> str_concat(export.declaration)
     |> str_concat(">()\n")
     |> str_concat(
-      if with_tooling {
+      if probe.tooling {
         str_concat("  audit_tooling<", str_concat(export.declaration, ">()\n"))
       } else { "" }
     )
+    |> str_concat(
+      if probe.staging {
+        str_concat("  audit_staging<", str_concat(export.declaration, ">()\n"))
+      } else { "" }
+    )
     |> str_concat("  0\n}\n")
+}
+
+fn probe_grammar() -> AuditProbe {
+  AuditProbe { grammar_only: true, tooling: false, staging: false, agreement: false }
+}
+
+fn probe_tooling(agreement: bool) -> AuditProbe {
+  AuditProbe { grammar_only: false, tooling: true, staging: false, agreement: agreement }
+}
+
+fn probe_staging(agreement: bool) -> AuditProbe {
+  AuditProbe { grammar_only: false, tooling: false, staging: true, agreement: agreement }
+}
+
+fn probe_all(staging: bool) -> AuditProbe {
+  AuditProbe { grammar_only: false, tooling: true, staging: staging, agreement: true }
 }
 
 fn messages_list(messages: Vector<str>, index: i64) -> List<str> {
@@ -384,45 +459,104 @@ fn audit_check(source: str) -[SourceAcquire]> GrammarToolAuditStatus {
   if failed { GrammarToolAuditFailed(messages_list(messages, 0)) } else { GrammarToolAuditOk }
 }
 
+fn audit_of(
+  grammar: GrammarToolAuditStatus,
+  tooling: Option<GrammarToolAuditStatus>,
+  staging: Option<GrammarToolAuditStatus>
+) -> GrammarToolAudit {
+  GrammarToolAudit { grammar: grammar, tooling: tooling, staging: staging }
+}
+
+fn audit_ok() -> Option<GrammarToolAuditStatus> {
+  Some<GrammarToolAuditStatus>(GrammarToolAuditOk)
+}
+
+fn audit_not_checked() -> Option<GrammarToolAuditStatus> {
+  Some<GrammarToolAuditStatus>(GrammarToolAuditNotChecked)
+}
+
+-- One conformance's status on its own: the conformance must exist and must
+-- agree with the grammar on `Syntax`.
+fn audit_conformance(
+  export: GrammarToolExport,
+  alone: AuditProbe,
+  agreement: AuditProbe
+) -[SourceAcquire]> GrammarToolAuditStatus {
+  match audit_check(audit_probe_source(export, alone)) {
+    GrammarToolAuditOk -> audit_check(audit_probe_source(export, agreement))
+    failure -> failure
+  }
+}
+
 --- Audit one export through the checker. Without a tooling module only the
---- `Grammar` conformance is probed. With one, a combined probe asks for both
---- conformances and their `Syntax` agreement at once; when it fails, the
---- failure is attributed by probing the grammar conformance alone and then
---- the tooling conformance alone, so the reported diagnostics name exactly
---- the missing conformance or, when both hold, the disagreement.
+--- `Grammar` conformance is probed. With one, a combined probe asks for
+--- every conformance the export's capability needs and their `Syntax`
+--- agreement at once, exactly as the generated driver composes them; when
+--- it fails, each conformance is probed on its own, first for its
+--- existence and then for its own agreement with the grammar, so the
+--- reported diagnostics name exactly the missing conformance or the one
+--- that disagrees.
 pub(package) fn grammar_tool_audit(export: GrammarToolExport) -[SourceAcquire]> GrammarToolAudit {
+  let stages = match export.capability { StagingTypedPlan -> true, StagingValidateOnly -> false }
   match export.tooling {
-    None -> GrammarToolAudit {
-      grammar: audit_check(audit_probe_source(export, false, false)),
-      tooling: None<GrammarToolAuditStatus>()
-    }
-    Some(_) -> match audit_check(audit_probe_source(export, true, true)) {
-      GrammarToolAuditOk -> GrammarToolAudit {
-        grammar: GrammarToolAuditOk,
-        tooling: Some<GrammarToolAuditStatus>(GrammarToolAuditOk)
-      }
-      GrammarToolAuditNotChecked -> GrammarToolAudit {
-        grammar: GrammarToolAuditNotChecked,
-        tooling: Some<GrammarToolAuditStatus>(GrammarToolAuditNotChecked)
-      }
+    None -> audit_of(
+      audit_check(audit_probe_source(export, probe_grammar())),
+      None<GrammarToolAuditStatus>(),
+      None<GrammarToolAuditStatus>()
+    )
+    Some(_) -> match audit_check(audit_probe_source(export, probe_all(stages))) {
+      GrammarToolAuditOk -> audit_of(
+        GrammarToolAuditOk,
+        audit_ok(),
+        if stages { audit_ok() } else { None<GrammarToolAuditStatus>() }
+      )
+      GrammarToolAuditNotChecked -> audit_of(
+        GrammarToolAuditNotChecked,
+        audit_not_checked(),
+        if stages { audit_not_checked() } else { None<GrammarToolAuditStatus>() }
+      )
       GrammarToolAuditFailed(combined) -> match audit_check(
-        audit_probe_source(export, false, false)
+        audit_probe_source(export, probe_grammar())
       ) {
-        GrammarToolAuditOk -> match audit_check(audit_probe_source(export, true, false)) {
-          -- Both conformances hold, so what failed is their agreement.
-          GrammarToolAuditOk -> GrammarToolAudit {
-            grammar: GrammarToolAuditOk,
-            tooling: Some<GrammarToolAuditStatus>(GrammarToolAuditFailed(combined))
-          }
-          conformance_failure -> GrammarToolAudit {
-            grammar: GrammarToolAuditOk,
-            tooling: Some<GrammarToolAuditStatus>(conformance_failure)
+        GrammarToolAuditOk -> {
+          let tooling = audit_conformance(export, probe_tooling(false), probe_tooling(true))
+          let staging = if stages {
+            audit_conformance(export, probe_staging(false), probe_staging(true))
+          } else { GrammarToolAuditOk }
+          -- Every conformance holds and agrees on its own, so the combined
+          -- composition is what failed; its diagnostics are reported on the
+          -- conformance the composition added last.
+          let tooling_ok = match tooling { GrammarToolAuditOk -> true, _ -> false }
+          let staging_ok = match staging { GrammarToolAuditOk -> true, _ -> false }
+          if tooling_ok and staging_ok {
+            if stages {
+              audit_of(
+                GrammarToolAuditOk,
+                audit_ok(),
+                Some<GrammarToolAuditStatus>(GrammarToolAuditFailed(combined))
+              )
+            } else {
+              audit_of(
+                GrammarToolAuditOk,
+                Some<GrammarToolAuditStatus>(GrammarToolAuditFailed(combined)),
+                None<GrammarToolAuditStatus>()
+              )
+            }
+          } else {
+            audit_of(
+              GrammarToolAuditOk,
+              Some<GrammarToolAuditStatus>(tooling),
+              if stages { Some<GrammarToolAuditStatus>(staging) } else {
+                None<GrammarToolAuditStatus>()
+              }
+            )
           }
         }
-        grammar_failure -> GrammarToolAudit {
-          grammar: grammar_failure,
-          tooling: Some<GrammarToolAuditStatus>(GrammarToolAuditNotChecked)
-        }
+        grammar_failure -> audit_of(
+          grammar_failure,
+          audit_not_checked(),
+          if stages { audit_not_checked() } else { None<GrammarToolAuditStatus>() }
+        )
       }
     }
   }
@@ -434,7 +568,11 @@ pub(package) fn grammar_tool_audit_failed(audit: GrammarToolAudit) -> bool {
     Some(GrammarToolAuditFailed(_)) -> true
     _ -> false
   }
-  grammar_failed or tooling_failed
+  let staging_failed = match audit.staging {
+    Some(GrammarToolAuditFailed(_)) -> true
+    _ -> false
+  }
+  grammar_failed or tooling_failed or staging_failed
 }
 
 fn audit_status_json(status: GrammarToolAuditStatus) -> Json {
@@ -462,11 +600,11 @@ pub(package) fn grammar_tool_audit_json(
   export: GrammarToolExport,
   audit: GrammarToolAudit
 ) -> Json {
-  let tooling = match export.tooling {
+  let module_status = (status: Option<GrammarToolAuditStatus>) => match export.tooling {
     None -> json_null()
-    Some(module) -> match audit.tooling {
+    Some(module) -> match status {
       None -> json_null()
-      Some(status) -> match audit_status_json(status) {
+      Some(found) -> match audit_status_json(found) {
         JsonObject(fields) -> JsonObject(Cons(json_entry("module", json_string(module)), fields))
         other -> other
       }
@@ -481,7 +619,10 @@ pub(package) fn grammar_tool_audit_json(
           json_entry("declaration", json_string(export.declaration)),
           Cons(
             json_entry("grammar", audit_status_json(audit.grammar)),
-            Cons(json_entry("tooling", tooling), Nil<JsonEntry>())
+            Cons(
+              json_entry("tooling", module_status(audit.tooling)),
+              Cons(json_entry("staging", module_status(audit.staging)), Nil<JsonEntry>())
+            )
           )
         )
       )
@@ -517,13 +658,11 @@ pub(package) fn grammar_tool_driver_source(export: GrammarToolExport) -> str {
     Some(tooling) -> {
       let tooling_import = if str_eq(tooling, export.module) == 1 { "" }
       else { str_concat("use ", str_concat(tooling, " as tooling_conformance\n")) }
-      header
-        |> str_concat("use runtime/file_read as file_read_handler\n")
-        |> str_concat("use stdlib/grammar/tooling/conformance as conformance\n")
-        |> str_concat(tooling_import)
-        |> str_concat(
-          "\nfn main() -> i64 {\n  with console_input() {\n    with console_terminal() {\n      with file_read_handler() {\n        driver.serve(\n          (source) => "
-        )
+      let stages = match export.capability {
+        StagingTypedPlan -> true,
+        StagingValidateOnly -> false
+      }
+      let checking = "          (source) => "
         |> str_concat(export.declaration)
         |> str_concat("().parse(source),\n          (syntax) => conformance.host_check(")
         |> str_concat(export.declaration)
@@ -531,7 +670,39 @@ pub(package) fn grammar_tool_driver_source(export: GrammarToolExport) -> str {
           "(), syntax),\n          (syntax, context, limit) => conformance.context_check("
         )
         |> str_concat(export.declaration)
-        |> str_concat("(), syntax, context, limit)\n        )\n      }\n    }\n  }\n}\n")
+        |> str_concat("(), syntax, context, limit)")
+      -- A staging driver installs the platform file writer around the whole
+      -- server; only the sink handler inside `serve_staging` performs it.
+      if stages {
+        header
+          |> str_concat("use runtime/file_read as file_read_handler\n")
+          |> str_concat("use runtime/file_write as file_write_handler\n")
+          |> str_concat("use stdlib/grammar/tooling/conformance as conformance\n")
+          |> str_concat(tooling_import)
+          |> str_concat(
+            "\nfn main() -> i64 {\n  with console_input() {\n    with console_terminal() {\n      with file_read_handler() {\n        with file_write_handler() {\n          driver.serve_staging(\n  "
+          )
+          |> str_concat(checking)
+          |> str_concat(",\n            ")
+          |> str_concat(export.declaration)
+          |> str_concat(
+            "().stagings(),\n            (syntax, context, target) => conformance.stage("
+          )
+          |> str_concat(export.declaration)
+          |> str_concat(
+            "(), syntax, context, target)\n          )\n        }\n      }\n    }\n  }\n}\n"
+          )
+      } else {
+        header
+          |> str_concat("use runtime/file_read as file_read_handler\n")
+          |> str_concat("use stdlib/grammar/tooling/conformance as conformance\n")
+          |> str_concat(tooling_import)
+          |> str_concat(
+            "\nfn main() -> i64 {\n  with console_input() {\n    with console_terminal() {\n      with file_read_handler() {\n        driver.serve(\n"
+          )
+          |> str_concat(checking)
+          |> str_concat("\n        )\n      }\n    }\n  }\n}\n")
+      }
     }
   }
 }

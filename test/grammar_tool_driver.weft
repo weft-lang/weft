@@ -5,18 +5,33 @@
 use compiler/grammar/tool.{*}
 use compiler/pipeline.{pipeline_check_source}
 use compiler/weft/products.{TypedModule}
-use compiler/backend/target.{NativeLinkLinuxAarch64, native_link_target_host}
+use compiler/backend/target.{
+  NativeLinkLinuxAarch64,
+  native_link_target_host,
+  native_link_target_name
+}
 use compiler/weft/check/host_types as host_types
 use runtime/alloc.{alloc_zeroed}
+use runtime/dir_inspect as dir_inspect_handler
+use runtime/file_read as file_read_handler
 use runtime/memory.{mem_copy, mem_store64_at}
 use runtime/process as process_handler
 use runtime/source_acquire.{SourceAcquire, source_acquire_with_checkout}
 use runtime/string.{runtime_str_cstring}
-use runtime/syscall.{sys_close, sys_open_write_create_truncate, sys_remove, sys_write}
+use runtime/syscall.{
+  sys_close,
+  sys_dir_mkdir,
+  sys_dir_remove_directory,
+  sys_open_write_create_truncate,
+  sys_remove,
+  sys_write
+}
 use runtime/time as platform_time
 use stdlib/bytes as bytes
 use stdlib/diagnostic as diagnostic_impl
 use stdlib/diagnostic/schema.{*}
+use stdlib/dir.{DirInspect}
+use stdlib/file.{FileRead}
 use stdlib/grammar.{Checked, CheckRejected}
 use stdlib/grammar/tooling.{*}
 use stdlib/grammar/tooling/conformance.{
@@ -24,7 +39,9 @@ use stdlib/grammar/tooling/conformance.{
   ParseOutcomeRecovered,
   ParseOutcomeRejected
 }
+use stdlib/grammar/tooling/digest.{content_digest}
 use stdlib/grammar/tooling/protocol.{*}
+use stdlib/grammar/tooling/staging.{*}
 use stdlib/list.{List, Cons, Nil}
 use stdlib/option.{Option, Some, None}
 use stdlib/path as path
@@ -61,6 +78,7 @@ fn deadline_in(millis: i64) -> Instant {
   platform_time.with_platform(() => monotonic.now()).add(time.milliseconds(millis))
 }
 
+--- The toy export as a check-only export: its driver refuses to stage.
 fn toy_export() -> GrammarToolExport {
   GrammarToolExport {
     package_name: "weft",
@@ -68,7 +86,21 @@ fn toy_export() -> GrammarToolExport {
     export: "toy_assignments",
     module: "module_fixtures/toy_grammar",
     declaration: "AssignmentGrammar",
-    tooling: Some<str>("module_fixtures/toy_grammar")
+    tooling: Some<str>("module_fixtures/toy_grammar"),
+    capability: StagingValidateOnly
+  }
+}
+
+--- The toy export as a typed-plan export: its driver stages through the sink.
+fn toy_staging_export() -> GrammarToolExport {
+  GrammarToolExport {
+    package_name: "weft",
+    version: "0.1.0",
+    export: "toy_staged_assignments",
+    module: "module_fixtures/toy_grammar",
+    declaration: "AssignmentGrammar",
+    tooling: Some<str>("module_fixtures/toy_grammar"),
+    capability: StagingTypedPlan
   }
 }
 
@@ -79,7 +111,8 @@ fn plain_export() -> GrammarToolExport {
     export: "toy_words",
     module: "module_fixtures/plain_grammar",
     declaration: "WordGrammar",
-    tooling: None<str>()
+    tooling: None<str>(),
+    capability: StagingValidateOnly
   }
 }
 
@@ -88,7 +121,27 @@ fn request_for(export: GrammarToolExport, text: str, context: ToolContext) -> To
     grammar: grammar_tool_identity(export),
     source_name: "embedded",
     source_text: text,
-    context: context
+    context: context,
+    operation: ToolOperationCheck
+  }
+}
+
+fn stage_request_for(
+  export: GrammarToolExport,
+  text: str,
+  context: ToolContext,
+  capability: StagingCapability,
+  platform: str,
+  sink: str
+) -> ToolRequest {
+  ToolRequest {
+    grammar: grammar_tool_identity(export),
+    source_name: "embedded",
+    source_text: text,
+    context: context,
+    operation: ToolOperationStage(
+      ToolStageTarget { capability: capability, platform: platform, sink: fixture_path(sink) }
+    )
   }
 }
 
@@ -217,7 +270,8 @@ test "generated driver source imports only the export and the public driver surf
       export: "sql",
       module: "stdlib/grammar/sql",
       declaration: "SqlGrammar",
-      tooling: Some<str>("stdlib/grammar/sql/tooling")
+      tooling: Some<str>("stdlib/grammar/sql/tooling"),
+      capability: StagingValidateOnly
     }
   )
   Test.assert_true(sql_source.contains("use stdlib/grammar/sql/tooling as tooling_conformance\n"))
@@ -228,6 +282,22 @@ test "generated driver source imports only the export and the public driver surf
   )
   Test.assert_true(not parse_only.contains("file_read_handler"))
   Test.assert_true(not parse_only.contains("conformance"))
+  -- A check-only export never installs the file writer; a typed-plan export
+  -- installs it around the staging server and hands over the package's
+  -- declared support and stage path.
+  Test.assert_true(not full.contains("file_write_handler"))
+  Test.assert_true(not full.contains("serve_staging"))
+  let staged = grammar_tool_driver_source(toy_staging_export())
+  Test.assert_true(staged.contains("use runtime/file_write as file_write_handler\n"))
+  Test.assert_true(staged.contains("with file_write_handler() {\n"))
+  Test.assert_true(staged.contains("driver.serve_staging(\n"))
+  Test.assert_true(staged.contains("AssignmentGrammar().stagings(),\n"))
+  Test.assert_true(
+    staged.contains(
+      "(syntax, context, target) => conformance.stage(AssignmentGrammar(), syntax, context, target)"
+    )
+  )
+  Test.assert_true(staged.contains("conformance.host_check(AssignmentGrammar(), syntax)"))
 }
 
 test "driver products build once and are reused while their inputs are unchanged" {
@@ -254,7 +324,8 @@ test "driver products build once and are reused while their inputs are unchanged
         export: "broken",
         module: "module_fixtures/plain_grammar",
         declaration: "NoSuchGrammar",
-        tooling: None<str>()
+        tooling: None<str>(),
+        capability: StagingValidateOnly
       }
       match grammar_tool_ensure_product(broken, target, "test") {
         GrammarToolProductFailed(message) -> Test.assert_true(message.contains("did not check"))
@@ -850,3 +921,341 @@ test "the token table issues session identities and refuses foreign ones" {
     }
   )
 }
+
+-- Staging exchanges --------------------------------------------------------
+fn stage_name(stage: ToolStageOutcome) -> str {
+  match stage {
+    ToolStageNotRequested -> "not_requested"
+    ToolStaged(_) -> "staged"
+    ToolStagedNothing -> "staged_nothing"
+    ToolStageRefusedParseNotAccepted -> "refused parse"
+    ToolStageRefusedCheckRejected -> "refused check"
+    ToolStageRefusedNoStaging -> "refused no staging"
+    ToolStageRefusedNoTooling -> "refused no tooling"
+    ToolStageContextUnavailable -> "context unavailable"
+    ToolStageContextUnsupported(GrammarHostTypesContext) -> "unsupported host"
+    ToolStageContextUnsupported(GrammarFileContext) -> "unsupported file"
+    ToolStageUnsupportedTarget -> "unsupported target"
+    ToolStageSinkRefused(name) -> str_concat("sink refused ", name)
+  }
+}
+
+-- The check phase, the stage phase and every diagnostic of a response.
+fn describe_stage(exchange: GrammarToolExchange) -> str {
+  match exchange {
+    GrammarToolFailed(failure) -> str_concat("failed: ", grammar_tool_failure_message(failure))
+    GrammarToolAnswered(response) -> str_concat(
+      describe(exchange),
+      str_concat(" / ", stage_name(response.stage))
+    )
+  }
+}
+
+fn staged_of(exchange: GrammarToolExchange) -> Option<ToolStagedArtifact> {
+  match exchange {
+    GrammarToolAnswered(response) -> match response.stage {
+      ToolStaged(artifact) -> Some<ToolStagedArtifact>(artifact)
+      _ -> None<ToolStagedArtifact>()
+    }
+    GrammarToolFailed(_) -> None<ToolStagedArtifact>()
+  }
+}
+
+fn make_directory(text: str) -> i64 { sys_dir_mkdir(runtime_str_cstring(text), 448) }
+
+fn scratch_sink_root() -> str {
+  make_directory("target")
+  let stamp = platform_time.with_platform(() => monotonic.now()).nanoseconds()
+  let root = str_concat("target/staging-driver-", stamp.to_str())
+  make_directory(root)
+  root
+}
+
+fn sink_directory(root: str, name: str) -> str {
+  let directory = str_concat(root, str_concat("/", name))
+  make_directory(directory)
+  directory
+}
+
+fn remove_directory(text: str) -> i64 { sys_dir_remove_directory(runtime_str_cstring(text)) }
+
+fn remove_artifact(directory: str) -> i64 {
+  sys_remove(runtime_str_cstring(str_concat(directory, "/artifact")))
+}
+
+fn verified(directory: str, artifact: ToolStagedArtifact) -> Result<Bytes, StagingVerifyFailure> {
+  with dir_inspect_handler() {
+    with file_read_handler() {
+      verify_artifact(fixture_path(directory), artifact.size, artifact.content, artifact.budget)
+    }
+  }
+}
+
+fn entry_count(directory: str) -> i64 {
+  let listed = with dir_inspect_handler() { DirInspect.list(fixture_path(directory)) }
+  match listed {
+    Ok(entries) -> __u64_to_i64(__usize_to_u64(entries.len()))
+    Err(_) -> 0 - 1
+  }
+}
+
+fn expected_plan() -> str { "assignment count : i64\n= 3\n" }
+
+test "a typed plan export stages through the driver into the compiler's sink directory" {
+  with_platform<nil>(
+    () => {
+      let product = product_of(
+        grammar_tool_ensure_product(toy_staging_export(), native_link_target_host(), "test")
+      )
+      Test.assert_true(product.contains("/grammar-tools/weft-toy_staged_assignments"))
+      let root = scratch_sink_root()
+      let platform = native_link_target_name(native_link_target_host())
+      with_host(
+        "type settings { count: i64, label: str }\nfn main() -> i64 { 0 }",
+        (tt: i64, src: i64) => {
+          -- The staging driver still answers plain checks, with no stage phase.
+          Test.assert_str_eq(
+            describe_stage(
+              grammar_tool_exchange_with_host(
+                product,
+                request_for(toy_staging_export(), "count = 3", ToolHostContext),
+                tt,
+                src,
+                deadline_in(20000)
+              )
+            ),
+            "checked / not_requested"
+          )
+          -- A typed plan lands as exactly one artifact the verifier accepts.
+          let staged = sink_directory(root, "staged")
+          let exchange = grammar_tool_exchange_with_host(
+            product,
+            stage_request_for(
+              toy_staging_export(),
+              "count = 3",
+              ToolHostContext,
+              StagingTypedPlan,
+              platform,
+              staged
+            ),
+            tt,
+            src,
+            deadline_in(20000)
+          )
+          Test.assert_str_eq(describe_stage(exchange), "checked / staged")
+          match staged_of(exchange) {
+            Some(artifact) -> {
+              Test.assert_eq_usize(artifact.size, expected_plan().len())
+              Test.assert_str_eq(
+                artifact.content,
+                content_digest(bytes.from_str(expected_plan()))
+              )
+              Test.assert_eq_usize(artifact.budget, __i64_to_usize(4096))
+              Test.assert_true(
+                match artifact.facts.get("key") {
+                  Some(value) -> value.as_str().unwrap_or("") == "count",
+                  None -> false
+                }
+              )
+              match verified(staged, artifact) {
+                Ok(content) -> Test.assert_str_eq(
+                  content.to_utf8().unwrap_or(""),
+                  expected_plan()
+                )
+                Err(_) -> Test.assert_true(false)
+              }
+            }
+            None -> Test.assert_true(false)
+          }
+          remove_artifact(staged)
+          remove_directory(staged)
+          -- A validate-only target checks and emits nothing.
+          let validated = sink_directory(root, "validated")
+          Test.assert_str_eq(
+            describe_stage(
+              grammar_tool_exchange_with_host(
+                product,
+                stage_request_for(
+                  toy_staging_export(),
+                  "count = 3",
+                  ToolHostContext,
+                  StagingValidateOnly,
+                  platform,
+                  validated
+                ),
+                tt,
+                src,
+                deadline_in(20000)
+              )
+            ),
+            "checked / staged_nothing"
+          )
+          Test.assert_eq(entry_count(validated), 0)
+          remove_directory(validated)
+          -- A rejected check withholds the plan and explains itself.
+          let rejected = sink_directory(root, "rejected")
+          Test.assert_str_eq(
+            describe_stage(
+              grammar_tool_exchange_with_host(
+                product,
+                stage_request_for(
+                  toy_staging_export(),
+                  "other = 3",
+                  ToolHostContext,
+                  StagingTypedPlan,
+                  platform,
+                  rejected
+                ),
+                tt,
+                src,
+                deadline_in(20000)
+              )
+            ),
+            "rejected | settings has no field with this name @ embedded:0..5 / refused check"
+          )
+          Test.assert_eq(entry_count(rejected), 0)
+          remove_directory(rejected)
+          -- A platform the package cannot encode for is refused after the check.
+          let unsupported = sink_directory(root, "unsupported")
+          Test.assert_str_eq(
+            describe_stage(
+              grammar_tool_exchange_with_host(
+                product,
+                stage_request_for(
+                  toy_staging_export(),
+                  "count = 3",
+                  ToolHostContext,
+                  StagingTypedPlan,
+                  "z80",
+                  unsupported
+                ),
+                tt,
+                src,
+                deadline_in(20000)
+              )
+            ),
+            "checked / unsupported target"
+          )
+          Test.assert_eq(entry_count(unsupported), 0)
+          remove_directory(unsupported)
+          -- A recovered or rejected parse never reaches the package.
+          let unparsed = sink_directory(root, "unparsed")
+          Test.assert_str_eq(
+            describe_stage(
+              grammar_tool_exchange_with_host(
+                product,
+                stage_request_for(
+                  toy_staging_export(),
+                  "count 3",
+                  ToolHostContext,
+                  StagingTypedPlan,
+                  platform,
+                  unparsed
+                ),
+                tt,
+                src,
+                deadline_in(20000)
+              )
+            ),
+            "refused parse | expected '=' after the key @ embedded:6..7 / refused parse"
+          )
+          Test.assert_eq(entry_count(unparsed), 0)
+          remove_directory(unparsed)
+          nil
+        }
+      )
+      -- A context kind the package does not stage against is refused structurally,
+      -- and a stage without any context is not a request the driver answers.
+      let file_context = sink_directory(root, "file")
+      Test.assert_str_eq(
+        describe_stage(
+          grammar_tool_exchange_without_host(
+            product,
+            stage_request_for(
+              toy_staging_export(),
+              "count = 3",
+              ToolFileContext(
+                fixture_path("test/fixtures/comptime_sql_schema_v1.json"),
+                __i64_to_usize(4096)
+              ),
+              StagingTypedPlan,
+              platform,
+              file_context
+            ),
+            deadline_in(20000)
+          )
+        ),
+        "unsupported file / unsupported file"
+      )
+      Test.assert_eq(entry_count(file_context), 0)
+      remove_directory(file_context)
+      let no_context = sink_directory(root, "none")
+      Test.assert_true(
+        describe_stage(
+          grammar_tool_exchange_without_host(
+            product,
+            stage_request_for(
+              toy_staging_export(),
+              "count = 3",
+              ToolNoContext,
+              StagingTypedPlan,
+              platform,
+              no_context
+            ),
+            deadline_in(20000)
+          )
+        ).contains("needs a host or file context")
+      )
+      remove_directory(no_context)
+      -- A check-only export refuses to stage before its grammar runs, and a
+      -- parse-only export refuses because it has no tooling at all.
+      let check_only = product_of(
+        grammar_tool_ensure_product(toy_export(), native_link_target_host(), "test")
+      )
+      let refused = sink_directory(root, "refused")
+      Test.assert_str_eq(
+        describe_stage(
+          grammar_tool_exchange_without_host(
+            check_only,
+            stage_request_for(
+              toy_export(),
+              "count = 3",
+              ToolHostContext,
+              StagingTypedPlan,
+              platform,
+              refused
+            ),
+            deadline_in(20000)
+          )
+        ),
+        "not_requested / refused no staging"
+      )
+      Test.assert_eq(entry_count(refused), 0)
+      let words = product_of(
+        grammar_tool_ensure_product(plain_export(), native_link_target_host(), "test")
+      )
+      Test.assert_str_eq(
+        describe_stage(
+          grammar_tool_exchange_without_host(
+            words,
+            stage_request_for(
+              plain_export(),
+              "hello",
+              ToolHostContext,
+              StagingTypedPlan,
+              platform,
+              refused
+            ),
+            deadline_in(20000)
+          )
+        ),
+        "refused no tooling / refused no tooling"
+      )
+      Test.assert_eq(entry_count(refused), 0)
+      remove_directory(refused)
+      remove_directory(root)
+      nil
+    }
+  )
+}
+

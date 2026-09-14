@@ -17,7 +17,7 @@ use stdlib/console as console
 use stdlib/console.{ConsoleRead, ConsoleWrite, ConsoleStdout}
 use stdlib/diagnostic as diagnostic
 use stdlib/diagnostic/schema.{*}
-use stdlib/file.{FileRead}
+use stdlib/file.{FileRead, FileWrite}
 use stdlib/grammar.{ParseResult, Parsed, Recovered, Rejected}
 use stdlib/grammar/tooling.{*}
 use stdlib/grammar/tooling/digest.{content_digest}
@@ -25,8 +25,16 @@ use stdlib/grammar/tooling/conformance.{
   ParseOutcome,
   ParseOutcomeParsed,
   ParseOutcomeRecovered,
-  ParseOutcomeRejected
+  ParseOutcomeRejected,
+  StageResult,
+  StageEmitted,
+  StagedNothing,
+  StageRefused,
+  StageRefusedNoStaging,
+  StageUnsupportedTarget,
+  StageSinkRefused
 }
+use stdlib/grammar/tooling/staging.{*}
 use stdlib/grammar/tooling/protocol.{*}
 use stdlib/io/types.{*}
 use stdlib/list.{List, Cons, Nil}
@@ -353,11 +361,16 @@ pub fn serve_parse_only<S>(
         ToolNoContext -> ToolCheckNotRequested,
         _ -> ToolCheckRefusedNoTooling
       }
+      let stage = match request.operation {
+        ToolOperationCheck -> ToolStageNotRequested
+        ToolOperationStage(_) -> ToolStageRefusedNoTooling
+      }
       respond(
         ToolResponse {
           grammar: request.grammar,
           parse: parse_outcome_of<S>(parsed),
           check: check,
+          stage: stage,
           diagnostics: sink_list(sink),
           observed_inputs: Nil<ToolObservedInput>()
         }
@@ -366,12 +379,303 @@ pub fn serve_parse_only<S>(
   }
 }
 
---- Serve one request for an export with a tooling module.
-pub fn serve<S>(
-  parse: (Span) -[Diagnose]> ParseResult<S>,
+type TransportCell = Vector<Cell<Option<ToolProtocolError>>>
+
+type ObservedCell = Vector<Cell<List<ToolObservedInput>>>
+
+fn collect_diagnostics<T, E>(sink: DiagnosticSink, body: () -[Diagnose, E]> T) -[E]> T {
+  handle body() {
+    Diagnose.report(value) -> { sink_record(sink, value); resume(0) }
+    Diagnose.error(message, position) -> {
+      sink_legacy(sink, DiagnosticSeverityError, message);
+      resume(0)
+    }
+    Diagnose.warn(message, position) -> {
+      sink_legacy(sink, DiagnosticSeverityWarning, message);
+      resume(0)
+    }
+    Diagnose.note(message, position) -> {
+      sink_legacy(sink, DiagnosticSeverityNote, message);
+      resume(0)
+    }
+  }
+}
+
+-- The check phase of a request: host type queries go to the wire, file
+-- reads are observed, diagnostics are collected. A transport failure while
+-- answering a query is recorded and the check is abandoned.
+fn check_request<S>(
+  reader: LineReader,
+  sink: DiagnosticSink,
+  transport: TransportCell,
+  observed: ObservedCell,
+  context: ToolContext,
+  parsed: ParseResult<S>,
   check_host: (S) -[TypeCheck<ToolTypeIdentity>, Diagnose]> GrammarCheckOutcome,
   check_file: (S, Path, usize) -[FileRead, Diagnose]> GrammarCheckOutcome
-) -[ConsoleRead, ConsoleWrite, FileRead]> i64 {
+) -[ConsoleRead, ConsoleWrite, FileRead]> ToolCheckOutcome {
+  match context {
+    ToolNoContext -> ToolCheckNotRequested
+    ToolHostContext -> match parsed {
+      Parsed(syntax) -> {
+        -- One handle discharges one effect: type queries go to the wire
+        -- inside, diagnostics are collected outside.
+        let wired = () => handle check_host(syntax) {
+          TypeCheck<ToolTypeIdentity>.resolve(name) -> match reply_type(
+            wire_query(reader, ToolQueryResolve(name))
+          ) {
+            Ok(answer) -> resume(answer)
+            Err(error) -> {
+              cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
+              GrammarCheckRejected
+            }
+          }
+          TypeCheck<ToolTypeIdentity>.field(base, selector) -> match reply_type(
+            wire_query(reader, ToolQueryField(base, selector))
+          ) {
+            Ok(answer) -> resume(answer)
+            Err(error) -> {
+              cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
+              GrammarCheckRejected
+            }
+          }
+          TypeCheck<ToolTypeIdentity>.fields(base) -> match reply_fields(
+            wire_query(reader, ToolQueryFields(base))
+          ) {
+            Ok(answer) -> resume(answer)
+            Err(error) -> {
+              cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
+              GrammarCheckRejected
+            }
+          }
+          TypeCheck<ToolTypeIdentity>.subtype(actual, expected) -> match reply_bool(
+            wire_query(reader, ToolQuerySubtype(actual, expected))
+          ) {
+            Ok(answer) -> resume(answer)
+            Err(error) -> {
+              cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
+              GrammarCheckRejected
+            }
+          }
+        }
+        check_outcome(collect_diagnostics(sink, wired))
+      }
+      _ -> ToolCheckRefusedParseNotAccepted
+    }
+    ToolFileContext(context_path, limit) -> match parsed {
+      Parsed(syntax) -> {
+        let evaluation = collect_diagnostics(
+          sink,
+          () => comptime.observe_file_reads(() => check_file(syntax, context_path, limit))
+        )
+        cell_put<List<ToolObservedInput>>(observed, observed_inputs(evaluation.file_observations))
+        check_outcome(evaluation.value)
+      }
+      _ -> ToolCheckRefusedParseNotAccepted
+    }
+  }
+}
+
+-- The stage phase of a request under the sink: host type queries go to the
+-- wire, every file read is observed, diagnostics are collected.
+fn stage_body<S>(
+  reader: LineReader,
+  sink: DiagnosticSink,
+  transport: TransportCell,
+  observed: ObservedCell,
+  stage: (S, StagingContext, StagingTarget) -[
+    TypeCheck<ToolTypeIdentity>,
+    FileRead,
+    StagingSink,
+    Diagnose
+  ]> StageResult,
+  syntax: S,
+  context: StagingContext,
+  target: StagingTarget
+) -[ConsoleRead, ConsoleWrite, FileRead, StagingSink]> StageResult {
+  let wired = () => handle stage(syntax, context, target) {
+    TypeCheck<ToolTypeIdentity>.resolve(name) -> match reply_type(
+      wire_query(reader, ToolQueryResolve(name))
+    ) {
+      Ok(answer) -> resume(answer)
+      Err(error) -> {
+        cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
+        StageRefused(StagingCheckRejected)
+      }
+    }
+    TypeCheck<ToolTypeIdentity>.field(base, selector) -> match reply_type(
+      wire_query(reader, ToolQueryField(base, selector))
+    ) {
+      Ok(answer) -> resume(answer)
+      Err(error) -> {
+        cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
+        StageRefused(StagingCheckRejected)
+      }
+    }
+    TypeCheck<ToolTypeIdentity>.fields(base) -> match reply_fields(
+      wire_query(reader, ToolQueryFields(base))
+    ) {
+      Ok(answer) -> resume(answer)
+      Err(error) -> {
+        cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
+        StageRefused(StagingCheckRejected)
+      }
+    }
+    TypeCheck<ToolTypeIdentity>.subtype(actual, expected) -> match reply_bool(
+      wire_query(reader, ToolQuerySubtype(actual, expected))
+    ) {
+      Ok(answer) -> resume(answer)
+      Err(error) -> {
+        cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
+        StageRefused(StagingCheckRejected)
+      }
+    }
+  }
+  let evaluation = collect_diagnostics(sink, () => comptime.observe_file_reads(wired))
+  cell_put<List<ToolObservedInput>>(observed, observed_inputs(evaluation.file_observations))
+  evaluation.value
+}
+
+fn staging_context(context: ToolContext) -> Option<StagingContext> {
+  match context {
+    ToolNoContext -> None<StagingContext>()
+    ToolHostContext -> Some<StagingContext>(StagingHostTypes)
+    ToolFileContext(context_path, limit) -> Some<StagingContext>(
+      StagingFileContext(context_path, limit)
+    )
+  }
+}
+
+-- The check phase a stage result implies, and the stage phase itself.
+fn stage_answer(
+  result: StageResult,
+  summary: SinkSummary,
+  budget: usize
+) -> (ToolCheckOutcome, ToolStageOutcome) {
+  match result {
+    StageEmitted(facts) -> (
+      ToolChecked,
+      ToolStaged(
+        ToolStagedArtifact {
+          size: summary.size,
+          content: summary.content,
+          budget: budget,
+          facts: facts
+        }
+      )
+    )
+    StagedNothing -> (ToolChecked, ToolStagedNothing)
+    StageRefused(StagingCheckRejected) -> (ToolCheckRejected, ToolStageRefusedCheckRejected)
+    StageRefused(StagingContextUnsupported(kind)) -> (
+      ToolCheckUnsupported(kind),
+      ToolStageContextUnsupported(kind)
+    )
+    StageRefused(StagingContextUnavailable) -> (
+      ToolContextUnavailable,
+      ToolStageContextUnavailable
+    )
+    StageRefusedNoStaging -> (ToolCheckNotRequested, ToolStageRefusedNoStaging)
+    StageUnsupportedTarget(_) -> (ToolChecked, ToolStageUnsupportedTarget)
+    StageSinkRefused(error) -> (ToolChecked, ToolStageSinkRefused(io_error_name(error)))
+  }
+}
+
+-- A stage request: a capability the package does not declare is refused
+-- before the grammar runs and before any sink exists; a validate-only
+-- target checks under a zero-budget sink; a typed plan is emitted into the
+-- compiler's private directory within the effective budget.
+fn stage_request<S>(
+  reader: LineReader,
+  sink: DiagnosticSink,
+  transport: TransportCell,
+  observed: ObservedCell,
+  context: ToolContext,
+  parsed: ParseResult<S>,
+  target: ToolStageTarget,
+  supports: List<StagingSupport>,
+  stage: (S, StagingContext, StagingTarget) -[
+    TypeCheck<ToolTypeIdentity>,
+    FileRead,
+    StagingSink,
+    Diagnose
+  ]> StageResult
+) -[ConsoleRead, ConsoleWrite, FileRead, FileWrite]> Result<
+  (ToolCheckOutcome, ToolStageOutcome),
+  str
+> {
+  match parsed {
+    Parsed(syntax) -> match staging_context(context) {
+      None -> Err<(ToolCheckOutcome, ToolStageOutcome), str>(
+        "a stage request needs a host or file context"
+      )
+      Some(staging) -> {
+        let staging_target = StagingTarget {
+          capability: target.capability,
+          platform: target.platform
+        }
+        match target.capability {
+          StagingValidateOnly -> {
+            let (result, summary) = with_memory_sink(
+              __i64_to_usize(0),
+              () => stage_body(
+                reader,
+                sink,
+                transport,
+                observed,
+                stage,
+                syntax,
+                staging,
+                staging_target
+              )
+            )
+            Ok<(ToolCheckOutcome, ToolStageOutcome), str>(
+              stage_answer(result, summary, __i64_to_usize(0))
+            )
+          }
+          StagingTypedPlan -> match support_for(supports, StagingTypedPlan) {
+            None -> Ok<(ToolCheckOutcome, ToolStageOutcome), str>(
+              (ToolCheckNotRequested, ToolStageRefusedNoStaging)
+            )
+            Some(support) -> {
+              let budget = effective_budget(support.budget).bytes
+              let (result, summary) = with_sink_directory(
+                target.sink,
+                budget,
+                () => stage_body(
+                  reader,
+                  sink,
+                  transport,
+                  observed,
+                  stage,
+                  syntax,
+                  staging,
+                  staging_target
+                )
+              )
+              Ok<(ToolCheckOutcome, ToolStageOutcome), str>(stage_answer(result, summary, budget))
+            }
+          }
+        }
+      }
+    }
+    _ -> Ok<(ToolCheckOutcome, ToolStageOutcome), str>(
+      (ToolCheckRefusedParseNotAccepted, ToolStageRefusedParseNotAccepted)
+    )
+  }
+}
+
+fn serve_with<S>(
+  parse: (Span) -[Diagnose]> ParseResult<S>,
+  check_host: (S) -[TypeCheck<ToolTypeIdentity>, Diagnose]> GrammarCheckOutcome,
+  check_file: (S, Path, usize) -[FileRead, Diagnose]> GrammarCheckOutcome,
+  supports: List<StagingSupport>,
+  stage: (S, StagingContext, StagingTarget) -[
+    TypeCheck<ToolTypeIdentity>,
+    FileRead,
+    StagingSink,
+    Diagnose
+  ]> StageResult
+) -[ConsoleRead, ConsoleWrite, FileRead, FileWrite]> i64 {
   let reader = line_reader()
   match read_request(reader) {
     Err(message) -> fail(message)
@@ -381,132 +685,101 @@ pub fn serve<S>(
         text: request.source_text,
         identity: DiagnosticSourceNamed(request.source_name)
       }
-      let parsed = handle parse(source.all()) {
-        Diagnose.report(value) -> { sink_record(sink, value); resume(0) }
-        Diagnose.error(message, position) -> {
-          sink_legacy(sink, DiagnosticSeverityError, message);
-          resume(0)
-        }
-        Diagnose.warn(message, position) -> {
-          sink_legacy(sink, DiagnosticSeverityWarning, message);
-          resume(0)
-        }
-        Diagnose.note(message, position) -> {
-          sink_legacy(sink, DiagnosticSeverityNote, message);
-          resume(0)
-        }
-      }
+      let parsed = collect_diagnostics(sink, () => parse(source.all()))
       let outcome = parse_outcome_of<S>(parsed)
-      -- A transport failure while answering type queries aborts the check;
+      -- A transport failure while answering type queries aborts the request;
       -- the driver reports it on standard error instead of a response.
       let transport = cell_new<Option<ToolProtocolError>>(None<ToolProtocolError>())
       let observed = cell_new<List<ToolObservedInput>>(Nil<ToolObservedInput>())
-      let check = match request.context {
-        ToolNoContext -> ToolCheckNotRequested
-        ToolHostContext -> match parsed {
-          Parsed(syntax) -> {
-            -- One handle discharges one effect: type queries go to the wire
-            -- inside, diagnostics are collected outside.
-            let wired = () => handle check_host(syntax) {
-              TypeCheck<ToolTypeIdentity>.resolve(name) -> match reply_type(
-                wire_query(reader, ToolQueryResolve(name))
-              ) {
-                Ok(answer) -> resume(answer)
-                Err(error) -> {
-                  cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
-                  GrammarCheckRejected
-                }
-              }
-              TypeCheck<ToolTypeIdentity>.field(base, selector) -> match reply_type(
-                wire_query(reader, ToolQueryField(base, selector))
-              ) {
-                Ok(answer) -> resume(answer)
-                Err(error) -> {
-                  cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
-                  GrammarCheckRejected
-                }
-              }
-              TypeCheck<ToolTypeIdentity>.fields(base) -> match reply_fields(
-                wire_query(reader, ToolQueryFields(base))
-              ) {
-                Ok(answer) -> resume(answer)
-                Err(error) -> {
-                  cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
-                  GrammarCheckRejected
-                }
-              }
-              TypeCheck<ToolTypeIdentity>.subtype(actual, expected) -> match reply_bool(
-                wire_query(reader, ToolQuerySubtype(actual, expected))
-              ) {
-                Ok(answer) -> resume(answer)
-                Err(error) -> {
-                  cell_put<Option<ToolProtocolError>>(transport, Some<ToolProtocolError>(error));
-                  GrammarCheckRejected
-                }
-              }
-            }
-            let checked = handle wired() {
-              Diagnose.report(value) -> { sink_record(sink, value); resume(0) }
-              Diagnose.error(message, position) -> {
-                sink_legacy(sink, DiagnosticSeverityError, message);
-                resume(0)
-              }
-              Diagnose.warn(message, position) -> {
-                sink_legacy(sink, DiagnosticSeverityWarning, message);
-                resume(0)
-              }
-              Diagnose.note(message, position) -> {
-                sink_legacy(sink, DiagnosticSeverityNote, message);
-                resume(0)
-              }
-            }
-            check_outcome(checked)
-          }
-          _ -> ToolCheckRefusedParseNotAccepted
-        }
-        ToolFileContext(context_path, limit) -> match parsed {
-          Parsed(syntax) -> {
-            let evaluation = handle comptime.observe_file_reads(
-              () => check_file(syntax, context_path, limit)
-            ) {
-              Diagnose.report(value) -> { sink_record(sink, value); resume(0) }
-              Diagnose.error(message, position) -> {
-                sink_legacy(sink, DiagnosticSeverityError, message);
-                resume(0)
-              }
-              Diagnose.warn(message, position) -> {
-                sink_legacy(sink, DiagnosticSeverityWarning, message);
-                resume(0)
-              }
-              Diagnose.note(message, position) -> {
-                sink_legacy(sink, DiagnosticSeverityNote, message);
-                resume(0)
-              }
-            }
-            cell_put<List<ToolObservedInput>>(
+      let answer = match request.operation {
+        ToolOperationCheck -> Ok<(ToolCheckOutcome, ToolStageOutcome), str>(
+          (
+            check_request(
+              reader,
+              sink,
+              transport,
               observed,
-              observed_inputs(evaluation.file_observations)
-            )
-            check_outcome(evaluation.value)
-          }
-          _ -> ToolCheckRefusedParseNotAccepted
-        }
-      }
-      match cell_get<Option<ToolProtocolError>>(transport) {
-        Some(error) -> {
-          console.eprintln(str_concat("grammar tool driver: ", error_message(error)))
-          3
-        }
-        None -> respond(
-          ToolResponse {
-            grammar: request.grammar,
-            parse: outcome,
-            check: check,
-            diagnostics: sink_list(sink),
-            observed_inputs: cell_get<List<ToolObservedInput>>(observed)
-          }
+              request.context,
+              parsed,
+              check_host,
+              check_file
+            ),
+            ToolStageNotRequested
+          )
         )
+        ToolOperationStage(target) -> stage_request(
+          reader,
+          sink,
+          transport,
+          observed,
+          request.context,
+          parsed,
+          target,
+          supports,
+          stage
+        )
+      }
+      match answer {
+        Err(message) -> fail(message)
+        Ok((check, stage_outcome)) -> match cell_get<Option<ToolProtocolError>>(transport) {
+          Some(error) -> {
+            console.eprintln(str_concat("grammar tool driver: ", error_message(error)))
+            3
+          }
+          None -> respond(
+            ToolResponse {
+              grammar: request.grammar,
+              parse: outcome,
+              check: check,
+              stage: stage_outcome,
+              diagnostics: sink_list(sink),
+              observed_inputs: cell_get<List<ToolObservedInput>>(observed)
+            }
+          )
+        }
       }
     }
   }
+}
+
+--- Serve one request for an export with a tooling module and no staging
+--- conformance. A stage request is refused before any grammar code runs,
+--- so the file write capability is never needed: it is denied here rather
+--- than installed.
+pub fn serve<S>(
+  parse: (Span) -[Diagnose]> ParseResult<S>,
+  check_host: (S) -[TypeCheck<ToolTypeIdentity>, Diagnose]> GrammarCheckOutcome,
+  check_file: (S, Path, usize) -[FileRead, Diagnose]> GrammarCheckOutcome
+) -[ConsoleRead, ConsoleWrite, FileRead]> i64 {
+  handle serve_with(
+    parse,
+    check_host,
+    check_file,
+    Nil<StagingSupport>(),
+    (syntax: S, context: StagingContext, target: StagingTarget) => StageRefusedNoStaging
+  ) {
+    FileWrite.write_all(requested, values, mode) -> resume(
+      Err<usize, IoError>(IoPermissionDenied)
+    )
+  }
+}
+
+--- Serve one request for an export whose tooling module also stages:
+--- `supports` are the package's declared capabilities with their budgets
+--- and `stage` its conformance's stage path. The file write capability the
+--- generated driver installs is reachable only through the sink handler
+--- installed around one stage; package code never carries it.
+pub fn serve_staging<S>(
+  parse: (Span) -[Diagnose]> ParseResult<S>,
+  check_host: (S) -[TypeCheck<ToolTypeIdentity>, Diagnose]> GrammarCheckOutcome,
+  check_file: (S, Path, usize) -[FileRead, Diagnose]> GrammarCheckOutcome,
+  supports: List<StagingSupport>,
+  stage: (S, StagingContext, StagingTarget) -[
+    TypeCheck<ToolTypeIdentity>,
+    FileRead,
+    StagingSink,
+    Diagnose
+  ]> StageResult
+) -[ConsoleRead, ConsoleWrite, FileRead, FileWrite]> i64 {
+  serve_with(parse, check_host, check_file, supports, stage)
 }
