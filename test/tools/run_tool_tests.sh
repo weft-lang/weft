@@ -4474,7 +4474,34 @@ assert_contains "pkg_audit_reports_sdk_alias_grammar_conformance" "$sdk_audit" '
 mkdir -p "$tmp_pkg_dir/audit_grammar/grammars"
 cp module_fixtures/plain_grammar.weft "$tmp_pkg_dir/audit_grammar/grammars/words.weft"
 printf 'pub type Run { Run }\n' > "$tmp_pkg_dir/audit_grammar/grammars/plain.weft"
-printf '{"package":"auditpkg","manifest_version":1,"version":"0.3.0","weft":"0.1","exports":{"grammars":{"words":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime","tooling":"grammars/words"},"plain":{"module":"grammars/plain","declaration":"Run","execution":"validate_only"},"lost":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime","tooling":"grammars/no_such_module"},"fine":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime"}}}}\n' > "$tmp_pkg_dir/audit_grammar/weft.pkg"
+# A tooling conformance whose Syntax disagrees with the grammar's: the driver
+# hands what parse produced to the checker, so audit must reject this too.
+cat > "$tmp_pkg_dir/audit_grammar/grammars/mismatch_tooling.weft" <<'WEFT'
+use grammars/words.{WordGrammar}
+use stdlib/diagnostic/schema.{Diagnose}
+use stdlib/file.{FileRead}
+use stdlib/grammar/tooling.{*}
+use stdlib/list.{List, Nil}
+use stdlib/path.{Path}
+use stdlib/typecheck.{TypeCheck}
+
+pub type OtherSyntax { OtherSyntax }
+
+impl GrammarTooling for WordGrammar {
+  type Syntax = OtherSyntax
+
+  fn contexts(self) -> List<GrammarContextKind> { Nil<GrammarContextKind>() }
+
+  fn check_with_host(self, syntax: OtherSyntax) -[TypeCheck<ToolTypeIdentity>, Diagnose]> GrammarCheckReport {
+    rejected_report()
+  }
+
+  fn check_with_context(self, syntax: OtherSyntax, context: Path, limit: usize) -[FileRead, Diagnose]> GrammarCheckReport {
+    rejected_report()
+  }
+}
+WEFT
+printf '{"package":"auditpkg","manifest_version":1,"version":"0.3.0","weft":"0.1","exports":{"grammars":{"words":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime","tooling":"grammars/words"},"plain":{"module":"grammars/plain","declaration":"Run","execution":"validate_only"},"lost":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime","tooling":"grammars/no_such_module"},"fine":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime"},"mismatch":{"module":"grammars/words","declaration":"WordGrammar","execution":"runtime","tooling":"grammars/mismatch_tooling"}}}}\n' > "$tmp_pkg_dir/audit_grammar/weft.pkg"
 set +e
 grammar_audit=$(cd "$tmp_pkg_dir/audit_grammar" && "$WEFT_ABS" pkg audit 2>/dev/null)
 grammar_audit_exit=$?
@@ -4484,6 +4511,7 @@ assert_contains "pkg_audit_names_missing_tooling_conformance" "$grammar_audit" '
 assert_contains "pkg_audit_names_missing_grammar_conformance" "$grammar_audit" '{"export":"plain","module":"grammars/plain","declaration":"Run","grammar":{"status":"failed","diagnostics":["type `Run` does not implement `Grammar`"]},"tooling":null}'
 assert_contains "pkg_audit_names_unavailable_tooling_module" "$grammar_audit" '{"export":"lost","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/no_such_module","status":"failed","diagnostics":["imported module source is unavailable"]}}'
 assert_contains "pkg_audit_accepts_parse_only_grammar_export" "$grammar_audit" '{"export":"fine","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":null}'
+assert_contains "pkg_audit_rejects_tooling_syntax_that_disagrees_with_the_grammar" "$grammar_audit" '{"export":"mismatch","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/mismatch_tooling","status":"failed","diagnostics":["argument type mismatch: expected `OtherSyntax`, found `WordSyntax`"]}}'
 assert_contains "pkg_audit_keeps_native_authority_document" "$grammar_audit" '"schema_version":1,"target":"'
 
 mkdir -p "$tmp_pkg_dir/.weft/cache/math"
