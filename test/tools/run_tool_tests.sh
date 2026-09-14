@@ -4439,6 +4439,28 @@ chmod +x "$tmp_pkg_dir/app"
 run_binary_guarded "$tmp_pkg_dir/app"
 echo "  ok package_local_dep_import_compiles"
 
+# Grammar tooling resolves exports through the dependency graph: a grammar
+# exported by a path dependency is driven without the compiler importing it.
+mkdir -p "$tmp_pkg_dir/deps/words"
+printf '{"package":"words","manifest_version":1,"version":"0.2.0","weft":"0.1","exports":{"grammars":{"words":{"module":"grammar","declaration":"WordGrammar","execution":"runtime"}}}}\n' > "$tmp_pkg_dir/deps/words/weft.pkg"
+cp module_fixtures/plain_grammar.weft "$tmp_pkg_dir/deps/words/grammar.weft"
+printf '{"package":"app","dependencies":{"math":"deps/math","words":"deps/words"}}\n' > "$tmp_pkg_dir/weft.pkg"
+grammar_dep_out=$(cd "$tmp_pkg_dir" && printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"words","source":"hello"}}}' | "$WEFT_ABS" mcp 2>&1)
+assert_contains "mcp_grammar_diagnostics_resolves_dependency_export" "$grammar_dep_out" '"grammar":"words","package":"words","version":"0.2.0","export":"words","phase":"parse","diagnostics":0,"check_errors":0,"parse":"parsed","check":"not_requested"'
+grammar_dep_out=$(cd "$tmp_pkg_dir" && printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"words/words","source":"hello","host_source":"type t { a: i64 }"}}}' | "$WEFT_ABS" mcp 2>&1)
+assert_contains "mcp_grammar_diagnostics_dependency_export_declines_check_without_tooling" "$grammar_dep_out" '"grammar":"words/words","package":"words","version":"0.2.0","export":"words","phase":"parse+check","diagnostics":0,"check_errors":0,"parse":"parsed","check":{"refused":"no_tooling"}'
+grammar_dep_out=$(cd "$tmp_pkg_dir" && printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"words","source":"hello 2"}}}' | "$WEFT_ABS" mcp 2>&1)
+assert_contains "mcp_grammar_diagnostics_dependency_export_reports_its_diagnostics" "$grammar_dep_out" '"parse":"rejected"'
+grammar_dep_product=$(ls "$tmp_pkg_dir"/target/*/grammar-tools/words-words-* 2>/dev/null | grep -v '\.weft$\|\.stamp\.json$' | head -1)
+if [ -n "$grammar_dep_product" ] && [ -x "$grammar_dep_product" ]; then
+  echo "  ok mcp_grammar_dependency_driver_product_lives_in_workspace_target"
+else
+  echo "  fail mcp_grammar_dependency_driver_product_lives_in_workspace_target"
+  ls -R "$tmp_pkg_dir/target" 2>&1
+  exit 1
+fi
+printf '{"package":"app","dependencies":{"math":"deps/math"}}\n' > "$tmp_pkg_dir/weft.pkg"
+
 mkdir -p "$tmp_pkg_dir/.weft/cache/math"
 printf 'pub fn cached_value() -> i64 { 1 }\n' > "$tmp_pkg_dir/deps/math/lib.weft"
 printf 'pub fn cached_value() -> i64 { 42 }\n' > "$tmp_pkg_dir/.weft/cache/math/lib.weft"

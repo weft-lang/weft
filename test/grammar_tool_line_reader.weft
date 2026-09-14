@@ -1,0 +1,187 @@
+-- The driver's line reader over a scripted console: lines split at newlines
+-- however the input is chunked, the end of input is a value, bytes that are
+-- not UTF-8 are refused, and a line beyond the reader's bound is refused
+-- before it is stored.
+
+use stdlib/bytes as bytes
+use stdlib/bytes.{Bytes}
+use stdlib/console.{ConsoleRead}
+use stdlib/grammar/tooling/driver.{
+  LineError,
+  LineIo,
+  LineNotUtf8,
+  LineReader,
+  LineTooLong,
+  line_reader,
+  line_reader_bounded,
+  read_line
+}
+use stdlib/grammar/tooling/protocol.{
+  FrameBuffer,
+  frame_buffer,
+  frame_buffer_accept,
+  frame_buffer_len,
+  frame_buffer_take_line,
+  frame_buffer_take_rest,
+  frame_limit
+}
+use stdlib/io/types.{IoError}
+use stdlib/option.{Option, Some, None}
+use stdlib/result.{Result, Ok, Err}
+use stdlib/string.{str_eq}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_push, vector_set}
+
+--- Serve `script` to console reads in pieces of at most `piece` bytes.
+fn serve<T>(script: Bytes, piece: usize, body: () -[ConsoleRead, Test]> T) -[Test]> T {
+  let cursor = vector.with_capacity<i64>(__i64_to_usize(1))
+  vector_push<i64>(cursor, 0)
+  handle body() {
+    ConsoleRead.read(limit) -> {
+      let start = __i64_to_usize(vector_get_in_bounds<i64>(cursor, 0))
+      let want = if piece < limit { piece } else { limit }
+      let end = if start + want > script.len() { script.len() } else { start + want }
+      vector_set<i64>(cursor, 0, __u64_to_i64(__usize_to_u64(end)))
+      resume(Ok<Bytes, IoError>(script.slice(start, end).unwrap_or(bytes.empty())))
+    }
+  }
+}
+
+fn line_is(result: Result<Option<str>, LineError>, expected: str) -> bool {
+  match result {
+    Ok(Some(text)) -> str_eq(text, expected) == 1
+    _ -> false
+  }
+}
+
+fn ended(result: Result<Option<str>, LineError>) -> bool {
+  match result {
+    Ok(None) -> true
+    _ -> false
+  }
+}
+
+test "lines split at newlines however the input is chunked" {
+  for piece in 1..5 {
+    serve<nil>(
+      bytes.from_str("alpha\nbeta\n\ngamma"),
+      __i64_to_usize(piece),
+      () => {
+        let reader = line_reader()
+        Test.assert_true(line_is(read_line(reader), "alpha"))
+        Test.assert_true(line_is(read_line(reader), "beta"))
+        Test.assert_true(line_is(read_line(reader), ""))
+        -- A final unterminated line is still a line, and then the input ends.
+        Test.assert_true(line_is(read_line(reader), "gamma"))
+        Test.assert_true(ended(read_line(reader)))
+        Test.assert_true(ended(read_line(reader)))
+        nil
+      }
+    )
+  }
+}
+
+test "empty input is the end of input" {
+  serve<nil>(
+    bytes.empty(),
+    __i64_to_usize(64),
+    () => {
+      Test.assert_true(ended(read_line(line_reader())))
+      nil
+    }
+  )
+}
+
+test "bytes that are not UTF-8 are refused as a line" {
+  let raw = [
+    __u64_to_u8(104),
+    __u64_to_u8(105),
+    __u64_to_u8(255),
+    __u64_to_u8(10),
+    __u64_to_u8(111),
+    __u64_to_u8(107),
+    __u64_to_u8(10)
+  ]
+  serve<nil>(
+    bytes.from_slice(raw[..]),
+    __i64_to_usize(3),
+    () => {
+      let reader = line_reader()
+      Test.assert_true(match read_line(reader) { Err(LineNotUtf8) -> true, _ -> false })
+      -- The reader stays usable for the next line.
+      Test.assert_true(line_is(read_line(reader), "ok"))
+      nil
+    }
+  )
+}
+
+test "a line beyond the reader's bound is refused before it is stored" {
+  serve<nil>(
+    bytes.from_str("0123456789abcdef\nshort\n"),
+    __i64_to_usize(4),
+    () => {
+      let reader = line_reader_bounded(__i64_to_usize(8))
+      Test.assert_true(
+        match read_line(reader) {
+          Err(LineTooLong(limit)) -> limit == __i64_to_usize(8)
+          _ -> false
+        }
+      )
+      nil
+    }
+  )
+  -- A line exactly at the bound is accepted.
+  serve<nil>(
+    bytes.from_str("12345678\n"),
+    __i64_to_usize(3),
+    () => {
+      Test.assert_true(line_is(read_line(line_reader_bounded(__i64_to_usize(8))), "12345678"))
+      nil
+    }
+  )
+}
+
+test "the protocol reader is bounded by the frame limit" {
+  Test.assert_eq_usize(line_reader().limit, frame_limit())
+  Test.assert_eq_usize(frame_limit(), __i64_to_usize(16777216))
+}
+
+fn taken_is(taken: Option<Bytes>, expected: str) -> bool {
+  match taken {
+    Some(line) -> match line.to_utf8() {
+      Ok(text) -> str_eq(text, expected) == 1
+      Err(_) -> false
+    }
+    None -> false
+  }
+}
+
+test "frame buffers hand out complete lines once and keep the remainder" {
+  let frames = frame_buffer()
+  Test.assert_true(match frame_buffer_take_line(frames) { None -> true, _ -> false })
+  Test.assert_true(frame_buffer_accept(frames, bytes.from_str("alp"), __i64_to_usize(64)))
+  Test.assert_true(match frame_buffer_take_line(frames) { None -> true, _ -> false })
+  -- One chunk may end a line and begin the next two.
+  Test.assert_true(
+    frame_buffer_accept(frames, bytes.from_str("ha\nbeta\nga"), __i64_to_usize(64))
+  )
+  Test.assert_true(taken_is(frame_buffer_take_line(frames), "alpha"))
+  Test.assert_true(taken_is(frame_buffer_take_line(frames), "beta"))
+  Test.assert_true(match frame_buffer_take_line(frames) { None -> true, _ -> false })
+  Test.assert_eq_usize(frame_buffer_len(frames), __i64_to_usize(2))
+  Test.assert_true(frame_buffer_accept(frames, bytes.from_str("mma"), __i64_to_usize(64)))
+  Test.assert_true(str_eq(frame_buffer_take_rest(frames).to_utf8().unwrap_or(""), "gamma") == 1)
+  Test.assert_eq_usize(frame_buffer_len(frames), __i64_to_usize(0))
+}
+
+test "frame buffers count only the current line against the bound" {
+  let frames = frame_buffer()
+  -- Eight bytes buffered, then a chunk whose newline comes at its first byte:
+  -- the line is exactly eight bytes, so it is accepted at a bound of eight.
+  Test.assert_true(frame_buffer_accept(frames, bytes.from_str("12345678"), __i64_to_usize(8)))
+  Test.assert_true(frame_buffer_accept(frames, bytes.from_str("\nnext line"), __i64_to_usize(8)))
+  Test.assert_true(taken_is(frame_buffer_take_line(frames), "12345678"))
+  -- The next line already exceeds the bound with a chunk that has no newline.
+  Test.assert_true(not frame_buffer_accept(frames, bytes.from_str("x"), __i64_to_usize(8)))
+  Test.assert_eq_usize(frame_buffer_len(frames), __i64_to_usize(0))
+}

@@ -9,6 +9,7 @@
 -- ordinary host type-check handler behind a session-scoped token table.
 
 use compiler/backend/target.{NativeLinkTarget, native_link_target_host, native_link_target_name}
+use compiler/package/lock_data.{pkg_lock_parse}
 use compiler/package/manifest.{*}
 use compiler/pipeline.{*}
 use compiler/sdk/identity.{weft_product_identity_json_render_with_sdk}
@@ -73,19 +74,29 @@ fn manifest_package_name(m: i64) -> str {
   pkg_str_view(pkg_manifest_package_start(m), pkg_manifest_package_len(m))
 }
 
-fn export_of(m: i64, entry: i64) -> GrammarToolExport {
+--- The export of a manifest entry. `import_prefix` is how the driver source
+--- reaches the package's modules: empty for the SDK and the workspace root,
+--- whose modules import by their own paths, and `<package>/` for a
+--- dependency, whose modules import through its package name.
+fn export_of(m: i64, entry: i64, import_prefix: str) -> GrammarToolExport {
   GrammarToolExport {
     package_name: manifest_package_name(m),
     version: pkg_str_view(pkg_manifest_version_ptr(m), pkg_manifest_version_len(m)),
     export: pkg_str_view(pkg_export_name_ptr(entry), pkg_export_name_len(entry)),
-    module: pkg_str_view(pkg_export_module_ptr(entry), pkg_export_module_len(entry)),
+    module: str_concat(
+      import_prefix,
+      pkg_str_view(pkg_export_module_ptr(entry), pkg_export_module_len(entry))
+    ),
     declaration: pkg_str_view(
       pkg_export_declaration_ptr(entry),
       pkg_export_declaration_len(entry)
     ),
     tooling: if pkg_export_has_tooling(entry) {
       Some<str>(
-        pkg_str_view(pkg_export_tooling_module_ptr(entry), pkg_export_tooling_module_len(entry))
+        str_concat(
+          import_prefix,
+          pkg_str_view(pkg_export_tooling_module_ptr(entry), pkg_export_tooling_module_len(entry))
+        )
       )
     } else { None<str>() }
   }
@@ -114,6 +125,38 @@ fn root_manifest() -> i64 {
   if pkg_manifest_error_count(m) > 0 or pkg_manifest_package_len(m) == 0 { 0 } else { m }
 }
 
+--- The workspace lock, when present, so remote dependencies resolve to their
+--- cached roots exactly as the checker resolves them.
+fn root_lock() -> i64 {
+  let (ptr, len) = read_path("weft.lock")
+  if ptr == 0 or len == 0 { 0 } else { pkg_lock_parse(runtime_str_from_bytes_copy(ptr, len)) }
+}
+
+--- The manifests of the workspace's direct dependencies, each with the
+--- import prefix its modules are reached through. Only direct dependencies
+--- are importable by a root module, so they are the whole set a driver can
+--- name; a dependency whose root cannot be resolved contributes nothing.
+fn dependency_manifests(root: i64) -> List<(i64, str)> {
+  if root == 0 { Nil<(i64, str)>() } else {
+    let lock = root_lock()
+    let deps = pkg_manifest_deps(root)
+    let mut found = Nil<(i64, str)>()
+    for index in 0..nlist_len(deps) {
+      let dep = nlist_get(deps, index)
+      match pkg_dependency_root(dep, 0, 0, lock) {
+        PackageDependencyRootReady(dep_root, _) -> {
+          let m = pkg_manifest_load_at_root(__str_ptr(dep_root), __str_len(dep_root))
+          if pkg_manifest_error_count(m) == 0 and pkg_manifest_package_len(m) > 0 {
+            found = Cons((m, str_concat(pkg_dep_name(dep), "/")), found)
+          } else { nil }
+        }
+        _ -> nil
+      }
+    }
+    found.reverse()
+  }
+}
+
 fn split_qualified(name: str) -> (Option<str>, str) {
   match name.find("/") {
     None -> (None<str>(), name)
@@ -128,7 +171,7 @@ fn str_slice(text: str, start: i64, end: i64) -> str {
   runtime_str_from_bytes_copy(__str_ptr(text) + start, end - start)
 }
 
-fn find_in_manifest(m: i64, export: str) -> Option<GrammarToolExport> {
+fn find_in_manifest(m: i64, export: str, import_prefix: str) -> Option<GrammarToolExport> {
   if m == 0 { None<GrammarToolExport>() } else {
     let entry = pkg_manifest_find_export(
       m,
@@ -137,14 +180,37 @@ fn find_in_manifest(m: i64, export: str) -> Option<GrammarToolExport> {
       __str_len(export)
     )
     if entry == 0 { None<GrammarToolExport>() } else {
-      Some<GrammarToolExport>(export_of(m, entry))
+      Some<GrammarToolExport>(export_of(m, entry, import_prefix))
     }
+  }
+}
+
+fn find_in_dependencies(
+  manifests: List<(i64, str)>,
+  export: str,
+  found: List<GrammarToolExport>
+) -> List<GrammarToolExport> {
+  match manifests {
+    Nil -> found
+    Cons((m, prefix), rest) -> find_in_dependencies(
+      rest,
+      export,
+      match find_in_manifest(m, export, prefix) {
+        Some(candidate) -> Cons(candidate, found)
+        None -> found
+      }
+    )
   }
 }
 
 --- Resolve a grammar name (`export` or `package/export`) against the
 --- workspace manifest and the SDK manifest. A bare name exported by both
 --- is ambiguous and names its candidates.
+--- Resolve a tool-facing grammar name through every manifest a driver can
+--- import from: the SDK, the workspace root and the root's direct
+--- dependencies (path dependencies directly, remote ones through the lock
+--- and cache). A bare name that more than one package exports is ambiguous
+--- and must be qualified as `package/export`.
 pub(package) fn grammar_tool_resolve(name: str) -[SourceAcquire]> GrammarToolResolution {
   let (qualifier, export) = split_qualified(name)
   let sdk = sdk_manifest()
@@ -155,16 +221,17 @@ pub(package) fn grammar_tool_resolve(name: str) -[SourceAcquire]> GrammarToolRes
     manifest_package_name(root)
   ) == 1
   let candidates = Nil<GrammarToolExport>()
-  let with_sdk = match find_in_manifest(sdk, export) {
+  let with_sdk = match find_in_manifest(sdk, export, "") {
     Some(found) -> Cons(found, candidates)
     None -> candidates
   }
-  let with_root = if same_package { with_sdk } else {
-    match find_in_manifest(root, export) {
+  let with_workspace = if same_package { with_sdk } else {
+    match find_in_manifest(root, export, "") {
       Some(found) -> Cons(found, with_sdk)
       None -> with_sdk
     }
   }
+  let with_root = find_in_dependencies(dependency_manifests(root), export, with_workspace)
   let matching = match qualifier {
     None -> with_root
     Some(package_name) -> with_root.filter(
@@ -357,7 +424,7 @@ fn sdk_owned_path(path: str) -> bool {
 -- The stamp records the protocol, the compiler and SDK identity, the
 -- driver source digest and the path and content digest of every module the
 -- build loaded. Embedded SDK modules are covered by the identity alone.
-fn stamp_render(identity: str, driver_digest: str, tt: i64) -> str {
+fn stamp_render(identity: str, driver_digest: str, product_digest: str, tt: i64) -> str {
   let sources = ttable_sources(tt)
   let mut items = Nil<Json>()
   let mut index = 0
@@ -386,7 +453,10 @@ fn stamp_render(identity: str, driver_digest: str, tt: i64) -> str {
         json_entry("compiler", json_string(identity)),
         Cons(
           json_entry("driver", json_string(driver_digest)),
-          Cons(json_entry("sources", json_array(items.reverse())), Nil<JsonEntry>())
+          Cons(
+            json_entry("product", json_string(product_digest)),
+            Cons(json_entry("sources", json_array(items.reverse())), Nil<JsonEntry>())
+          )
         )
       )
     )
@@ -427,7 +497,18 @@ fn sources_current(items: List<Json>, embedded_sdk: bool) -> bool {
   }
 }
 
-fn stamp_current(stamp_path: str, identity: str, driver_digest: str, embedded_sdk: bool) -> bool {
+--- A cached product is current when its stamp names this protocol, this
+--- compiler identity, this driver source and the digest of every loaded
+--- source, and when the executable on disk still has the digest the stamp
+--- recorded: a stamp and product published separately can never be taken
+--- together unless they belong together.
+fn stamp_current(
+  stamp_path: str,
+  product_path: str,
+  identity: str,
+  driver_digest: str,
+  embedded_sdk: bool
+) -> bool {
   let (ptr, len) = read_path(stamp_path)
   if ptr == 0 { false } else {
     match json_parse(runtime_str_from_bytes_copy(ptr, len)) {
@@ -436,6 +517,10 @@ fn stamp_current(stamp_path: str, identity: str, driver_digest: str, embedded_sd
         str_eq(json_object_get_str(document, "protocol", ""), protocol_name()) == 1 and
         str_eq(json_object_get_str(document, "compiler", ""), identity) == 1 and
         str_eq(json_object_get_str(document, "driver", ""), driver_digest) == 1 and
+        match file_digest(product_path) {
+          Some(actual) -> str_eq(actual, json_object_get_str(document, "product", "")) == 1
+          None -> false
+        } and
         match json_object_get(document, "sources") {
           Some(JsonArray(items)) -> sources_current(items, embedded_sdk)
           _ -> false
@@ -488,9 +573,7 @@ pub(package) fn grammar_tool_ensure_product(
   let stem = product_stem(export, target, identity)
   let stamp_path = str_concat(stem, ".stamp.json")
   let source_path = str_concat(stem, ".weft")
-  if stamp_current(stamp_path, identity, driver_digest, embedded_sdk) and pkg_file_exists_text(
-    stem
-  ) == 1 {
+  if stamp_current(stamp_path, stem, identity, driver_digest, embedded_sdk) {
     GrammarToolProductReady(stem)
   } else {
     ensure_directories(target)
@@ -527,11 +610,17 @@ pub(package) fn grammar_tool_ensure_product(
             if pipeline_binary_kind(binary) != executable_kind(target) or buf_len(output) == 0 {
               GrammarToolProductFailed("grammar tool driver is not a host executable")
             } else {
+              let product_digest = digest_raw(buf_ptr(output), buf_len(output))
               let status = publish_file(stem, buf_ptr(output), buf_len(output), 448)
               if status != 0 {
                 GrammarToolProductFailed("grammar tool driver product could not be written")
               } else {
-                let stamp = stamp_render(identity, driver_digest, typed_module_table(typed))
+                let stamp = stamp_render(
+                  identity,
+                  driver_digest,
+                  product_digest,
+                  typed_module_table(typed)
+                )
                 publish_file(stamp_path, __str_ptr(stamp), __str_len(stamp), 420)
                 GrammarToolProductReady(stem)
               }
@@ -679,7 +768,14 @@ pub(package) type GrammarToolFailure {
   --- The session's request write could not complete.
   GrammarToolRequestNotDelivered,
   --- The session stream failed with a platform error code.
-  GrammarToolStreamFailed(i64)
+  GrammarToolStreamFailed(i64),
+  --- The driver wrote more protocol output than the exchange accepts: a line
+  --- longer than the frame limit, or output after its response beyond the
+  --- session store. The limit that was exceeded follows.
+  GrammarToolOutputExceeded(usize),
+  --- The driver answered but did not exit cleanly; its termination and
+  --- standard error text follow.
+  GrammarToolDriverFailed(ProcTermination, str)
 }
 
 --- The outcome of one request.
@@ -693,16 +789,21 @@ type ExchangeState {
   deadline: Instant,
   host: bool,
   tokens: GrammarToolTokens,
-  pending: Bytes,
+  frames: FrameBuffer,
   stderr_text: Bytes
 }
 
+--- The bounded standard error text of a driver: what the exchange kept while
+--- it ran, then the tail the session captured at finish, capped together.
 fn stderr_text_of(state: ExchangeState, output: ProcOutput) -> str {
-  let own = match state.stderr_text.to_utf8() { Ok(text) -> text, Err(_) -> "" }
-  match output {
-    ProcCompleted(_, _, tail) -> str_concat(own, tail)
-    ProcTimedOut(_, _, tail) -> str_concat(own, tail)
-    ProcFailed(_, _, tail) -> str_concat(own, tail)
+  let tail = match output {
+    ProcCompleted(_, _, text) -> text
+    ProcTimedOut(_, _, text) -> text
+    ProcFailed(_, _, text) -> text
+  }
+  match keep_stderr(state.stderr_text, bytes.from_str(tail)).to_utf8() {
+    Ok(text) -> text
+    Err(_) -> ""
   }
 }
 
@@ -710,11 +811,51 @@ fn store_limit() -> usize { __i64_to_usize(4194304) }
 
 fn read_limit() -> usize { __i64_to_usize(65536) }
 
+--- Standard error text kept from a driver: the head of what it wrote, enough
+--- to explain a failure without letting a chattering driver grow memory.
+fn stderr_limit() -> usize { __i64_to_usize(65536) }
+
+fn keep_stderr(kept: Bytes, chunk: Bytes) -> Bytes {
+  if kept.len() >= stderr_limit() { kept } else {
+    let joined = bytes_concat(kept, chunk)
+    if joined.len() <= stderr_limit() { joined } else {
+      joined.slice(__i64_to_usize(0), stderr_limit()).unwrap_or(kept)
+    }
+  }
+}
+
+--- The exchange after a response: the driver must exit cleanly before the
+--- deadline, with nothing more than the bounded output the session stores.
+fn answered(
+  state: ExchangeState,
+  response: ToolResponse,
+  output: ProcOutput
+) -> GrammarToolExchange {
+  if not same_grammar(response.grammar, state.request.grammar) {
+    GrammarToolFailed(GrammarToolGrammarMismatch)
+  } else {
+    match output {
+      ProcCompleted(termination, _, _) -> match termination {
+        ProcExited(status) -> if status == 0 { GrammarToolAnswered(response) } else {
+          GrammarToolFailed(GrammarToolDriverFailed(termination, stderr_text_of(state, output)))
+        }
+        ProcSignaled(_) ->
+          GrammarToolFailed(GrammarToolDriverFailed(termination, stderr_text_of(state, output)))
+      }
+      ProcTimedOut(_, _, _) -> GrammarToolFailed(GrammarToolTimedOut)
+      ProcFailed(ProcOutputLimitExceeded(limit), _, _) ->
+        GrammarToolFailed(GrammarToolOutputExceeded(limit))
+      ProcFailed(ProcStreamFailed(code), _, _) -> GrammarToolFailed(GrammarToolStreamFailed(code))
+      ProcFailed(ProcSpawnFailed(code), _, _) -> GrammarToolFailed(GrammarToolStartFailed(code))
+      ProcFailed(_, _, _) -> GrammarToolFailed(GrammarToolStreamFailed(0))
+    }
+  }
+}
+
 fn exchange_line(
   session: ProcSession,
   state: ExchangeState,
-  line: Bytes,
-  rest: Bytes
+  line: Bytes
 ) -[Proc, TypeCheck<HostTypeIdentity>]> GrammarToolExchange {
   let decoded = match line.to_utf8() {
     Err(_) -> Err<ToolDriverMessage, ToolProtocolError>(ToolProtocolShape("line", "utf-8"))
@@ -728,11 +869,8 @@ fn exchange_line(
       Proc.session_release(session)
       GrammarToolFailed(GrammarToolProtocol(error))
     }
-    Ok(ToolDriverResponse(response)) -> {
-      Proc.session_finish_until(session, state.deadline)
-      if same_grammar(response.grammar, state.request.grammar) { GrammarToolAnswered(response) }
-      else { GrammarToolFailed(GrammarToolGrammarMismatch) }
-    }
+    Ok(ToolDriverResponse(response)) ->
+      answered(state, response, Proc.session_finish_until(session, state.deadline))
     Ok(ToolDriverQuery(query)) -> if not state.host {
       Proc.session_release(session)
       GrammarToolFailed(GrammarToolUnexpectedQuery)
@@ -744,7 +882,7 @@ fn exchange_line(
         state.deadline
       )
       match wrote {
-        ProcWritten -> exchange_step(next, state.{ pending: rest })
+        ProcWritten -> exchange_step(next, state)
         ProcWriteTimedOut(_) -> {
           Proc.session_release(next);
           GrammarToolFailed(GrammarToolTimedOut)
@@ -753,7 +891,7 @@ fn exchange_line(
           Proc.session_release(next);
           GrammarToolFailed(GrammarToolRequestNotDelivered)
         }
-        ProcWriteRefused(_) -> exchange_step(next, state.{ pending: rest })
+        ProcWriteRefused(_) -> exchange_step(next, state)
         ProcWriteFailed(ProcStreamFailed(code), _) -> {
           Proc.session_release(next);
           GrammarToolFailed(GrammarToolStreamFailed(code))
@@ -771,25 +909,22 @@ fn exchange_step(
   session: ProcSession,
   state: ExchangeState
 ) -[Proc, TypeCheck<HostTypeIdentity>]> GrammarToolExchange {
-  let newline: u8 = __u64_to_u8(10)
-  match state.pending.find(newline) {
-    Some(index) -> {
-      let line = state.pending.slice(__i64_to_usize(0), index).unwrap_or(bytes.empty())
-      let rest = state.pending.slice(index + __i64_to_usize(1), state.pending.len()).unwrap_or(
-        bytes.empty()
-      )
-      exchange_line(session, state, line, rest)
-    }
+  match frame_buffer_take_line(state.frames) {
+    Some(line) -> exchange_line(session, state, line)
     None -> {
       let (next, got) = Proc.session_read(session, read_limit(), state.deadline)
       match got {
-        ProcReadChunk(ProcStdout, chunk) -> exchange_step(
-          next,
-          state.{ pending: bytes_concat(state.pending, chunk) }
-        )
+        ProcReadChunk(ProcStdout, chunk) ->
+          if frame_buffer_accept(state.frames, chunk, frame_limit()) {
+            exchange_step(next, state)
+          }
+        else {
+          Proc.session_release(next)
+          GrammarToolFailed(GrammarToolOutputExceeded(frame_limit()))
+        }
         ProcReadChunk(ProcStderr, chunk) -> exchange_step(
           next,
-          state.{ stderr_text: bytes_concat(state.stderr_text, chunk) }
+          state.{ stderr_text: keep_stderr(state.stderr_text, chunk) }
         )
         ProcReadEnded -> {
           let output = Proc.session_finish_until(next, state.deadline)
@@ -836,7 +971,7 @@ pub(package) fn grammar_tool_exchange(
         deadline: deadline,
         host: host,
         tokens: grammar_tool_tokens(),
-        pending: bytes.empty(),
+        frames: frame_buffer(),
         stderr_text: bytes.empty()
       }
       match wrote {
@@ -913,6 +1048,18 @@ pub(package) fn grammar_tool_failure_message(failure: GrammarToolFailure) -> str
       "grammar tool driver raised a host type query without host types"
     GrammarToolGrammarMismatch -> "grammar tool driver answered for a different grammar"
     GrammarToolRequestNotDelivered -> "grammar tool driver did not accept the request"
+    GrammarToolOutputExceeded(limit) -> str_concat(
+      "grammar tool driver wrote more than ",
+      str_concat(int_text(__u64_to_i64(__usize_to_u64(limit))), " bytes of protocol output")
+    )
+    GrammarToolDriverFailed(termination, text) -> {
+      let ending = match termination {
+        ProcExited(status) -> str_concat("exited with status ", int_text(status))
+        ProcSignaled(signal) -> str_concat("was terminated by signal ", int_text(signal))
+      }
+      let head = str_concat("grammar tool driver answered but ", ending)
+      if __str_len(text) == 0 { head } else { str_concat(head, str_concat(": ", text)) }
+    }
     GrammarToolStreamFailed(code) -> str_concat(
       "grammar tool session failed (error ",
       str_concat(int_text(code), ")")
