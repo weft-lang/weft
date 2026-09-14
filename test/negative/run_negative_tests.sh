@@ -64,6 +64,10 @@ check_rejects closure_distinct_open_effects test/negative/closure_distinct_open_
 check_rejects grammar_impl_extra_effect test/negative/grammar_impl_extra_effect.weft 'impl method effect mismatch' 1
 check_rejects grammar_result_wrong_syntax test/negative/grammar_result_wrong_syntax.weft 'error[E1002]:' 1
 check_rejects staging_syntax_disagrees test/negative/staging_syntax_disagrees.weft 'error[E1002]:' 1
+check_rejects staging_site_not_an_export test/negative/staging_site_not_an_export.weft 'error[E1009]:' 1
+check_rejects staging_site_interpolated_source test/negative/staging_site_interpolated_source.weft 'error[E1010]:' 1
+check_rejects staging_site_escaped_source test/negative/staging_site_escaped_source.weft 'error[E1010]:' 1
+check_rejects staging_site_computed_source test/negative/staging_site_computed_source.weft 'error[E1010]:' 1
 check_rejects grammar_raw_source_requires_trust test/negative/grammar_raw_source_requires_trust.weft 'Unsafe is sealed to trusted runtime/platform code' 1
 check_rejects checked_grammar_impl_effect_identity test/negative/checked_grammar_impl_effect_identity.weft 'impl method effect mismatch' 1
 check_rejects checked_grammar_requires_host_effect test/negative/checked_grammar_requires_host_effect.weft 'error[E2001]: effect `TypeCheck<G.Identity>` is not available in this context' 1

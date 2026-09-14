@@ -23,12 +23,14 @@ use compiler/weft/load.{NativeRuntimeSupport, NativeRuntime, NativeRuntimeWithRc
 use compiler/weft/check as weft_check
 use compiler/weft/check.{CheckProgram, ExtendCheckedProgram}
 use compiler/grammar/tool.{*}
+use compiler/weft/facts/staging.{StagingSiteFact, staging_site_facts}
+use stdlib/grammar/tooling/staging.{StagingTypedPlan, StagingValidateOnly}
 use compiler/project/incremental.{*}
 use compiler/ir/data.{*}
 use compiler/storage.{*}
 use compiler/project/module.{*}
 use compiler/project/checked_modules.{*}
-use compiler/backend/link.{NativeArtifactSdk, NativeArtifactSdkAbsent, NativeArtifactSdkEmbedded, NativeLinkLibrary, native_link_artifact_platform_abi_json, native_link_target_platform_abi}
+use compiler/backend/link.{NativeArtifactSdk, NativeArtifactSdkAbsent, NativeArtifactSdkEmbedded, NativeArtifactStagingSite, NativeLinkLibrary, native_link_artifact_platform_abi_json, native_link_artifact_with_staging_sites, native_link_target_platform_abi}
 use compiler/backend/target.{NativeLinkLinuxAarch64, NativeLinkMacosAarch64, NativeLinkTarget, NativeLinkTargetParse, NativeLinkTargetParsed, NativeLinkTargetUnsupported, native_link_supported_targets, native_link_target_host, native_link_target_is_host, native_link_target_name, native_link_target_parse, native_link_target_storage_kind}
 use compiler/package/manifest.{*}
 use compiler/package/lock.{PackageCacheCorrupt, PackageCacheLockMalformed, PackageCacheMissing, PackageCacheVerified, PackageLockQuiet, pkg_cli_fetch_offline, pkg_cli_fetch_online, pkg_cli_lock, pkg_cli_lock_with_notice, pkg_lock_load_safe, pkg_lock_verify_project_cache}
@@ -176,8 +178,40 @@ fn main_register_source_path_in_package(tt: i64, src: i64, n: i64, path_ptr: i64
 }
 
 type MainNativePreparation {
-  MainNativePrepared(NativeModule, Source),
+  --- The lowered module, its root source and the program's staging sites as
+  --- artifact facts.
+  MainNativePrepared(NativeModule, Source, List<NativeArtifactStagingSite>),
   MainNativePreparationFailed(i64)
+}
+
+fn main_location_offsets(location: DiagnosticLocation) -> (i64, i64) {
+  match location {
+    DiagnosticSourceRange(_, start, end) -> (__u64_to_i64(__usize_to_u64(start)), __u64_to_i64(__usize_to_u64(end)))
+    _ -> (0 - 1, 0 - 1)
+  }
+}
+
+fn main_staging_site_fact(fact: StagingSiteFact) -> NativeArtifactStagingSite {
+  let (site_start, site_end) = main_location_offsets(fact.site)
+  let (source_start, source_end) = main_location_offsets(fact.source)
+  NativeArtifactStagingSite {
+    package_name: fact.export.package_name,
+    version: fact.version,
+    export: fact.export.export,
+    module: fact.export.module,
+    declaration: fact.export.declaration,
+    capability: match fact.capability { StagingValidateOnly -> "validate_only", StagingTypedPlan -> "typed_plan" },
+    site_start: site_start,
+    site_end: site_end,
+    source_start: source_start,
+    source_end: source_end
+  }
+}
+
+fn main_staging_sites(typed: TypedModule) -> List<NativeArtifactStagingSite> {
+  match typed {
+    TypedModule(_, src, tt, _) -> staging_site_facts(tt, src).map<NativeArtifactStagingSite>((fact: StagingSiteFact) => main_staging_site_fact(fact))
+  }
 }
 
 type MainSourceParsing {
@@ -265,7 +299,7 @@ fn main_prepare_native_for_target_with_path_and_origin_and_grant(src: i64, n: i6
         main_acquire_native_libraries(typed)
         let ir = pipeline_lower_checked_with_weft(typed)
         let optimised = pipeline_optimise_typed_ir(typed, ir)
-        MainNativePrepared(pipeline_lower_native_module_for_target_closed(typed, optimised, target), source)
+        MainNativePrepared(pipeline_lower_native_module_for_target_closed(typed, optimised, target), source, main_staging_sites(typed))
       }
     }
   }
@@ -287,7 +321,7 @@ fn main_prepare_native_with_path_and_origin_and_grant(src: i64, n: i64, path_ptr
 fn compile_with_path_and_origin_and_grant(src: i64, n: i64, path_ptr: i64, path_len: i64, trusted: i64, strict: i64, can_grant_trust: i64) -[SourceAcquire]> i64 {
   match main_prepare_native_with_path_and_origin_and_grant(src, n, path_ptr, path_len, trusted, strict, can_grant_trust) {
     MainNativePreparationFailed(status) -> status
-    MainNativePrepared(native, source) -> main_write_binary(pipeline_emit_checked_native_binary(native, __str_ptr(source.text)))
+    MainNativePrepared(native, source, _) -> main_write_binary(pipeline_emit_checked_native_binary(native, __str_ptr(source.text)))
   }
 }
 
@@ -518,6 +552,14 @@ fn main_build_write_product(binary: BinaryObject, output_path: i64, target: Nati
   }
 }
 
+-- The checker's staging sites join the product's artifact facts.
+fn main_product_with_staging_sites(product: PipelineNativeProduct, sites: List<NativeArtifactStagingSite>) -> PipelineNativeProduct {
+  match product {
+    PipelineNativeProductReady(binary, facts) -> PipelineNativeProductReady(binary, native_link_artifact_with_staging_sites(facts, sites))
+    failed -> failed
+  }
+}
+
 fn main_build_write_product_result(product: PipelineNativeProduct, output_path: i64, facts_path: i64, target: NativeLinkTarget, sdk: NativeArtifactSdk) -> i64 {
   match product {
     PipelineNativeProductFailed(binary) -> main_build_write_product(binary, output_path, target)
@@ -584,9 +626,15 @@ fn main_build_path(path: i64, output_path: i64, facts_path: i64, debug_mode: Pip
   } else {
     match main_prepare_native_for_target_with_path_and_origin_and_grant(src, n, path, len, cpath_is_trusted_source(path, len), cpath_is_strict_source(path, len), cpath_can_grant_import_trust(path, len), target) {
       MainNativePreparationFailed(status) -> status
-      MainNativePrepared(native, source) -> match main_build_native_with_sdk(native, sdk_embed) {
+      MainNativePrepared(native, source, sites) -> match main_build_native_with_sdk(native, sdk_embed) {
         MainSdkPreparationFailed(status) -> status
-        MainSdkPrepared(ready, sdk) -> main_build_write_product_result(pipeline_checked_native_product(ready, __str_ptr(source.text), debug_mode), output_path, facts_path, target, sdk)
+        MainSdkPrepared(ready, sdk) -> main_build_write_product_result(
+          main_product_with_staging_sites(pipeline_checked_native_product(ready, __str_ptr(source.text), debug_mode), sites),
+          output_path,
+          facts_path,
+          target,
+          sdk
+        )
       }
     }
   }
@@ -936,7 +984,7 @@ fn main_run_path(path: i64, argc: i64, argv: i64, first_product_arg: i64, envp: 
       native_link_target_host()
     ) {
       MainNativePreparationFailed(status) -> status
-      MainNativePrepared(native, source) -> main_run_product(
+      MainNativePrepared(native, source, _) -> main_run_product(
         pipeline_checked_native_product(native, __str_ptr(source.text), PipelineNativeDebugInformationIncluded),
         argc,
         argv,
@@ -3644,7 +3692,7 @@ fn run_symbols_path(path: i64) -[SourceAcquire]> i64 {
   let n = mem_load64_at(file, 8)
   match main_prepare_native_with_path_and_origin_and_grant(src, n, path, plen, cpath_is_trusted_source(path, plen), cpath_is_strict_source(path, plen), cpath_can_grant_import_trust(path, plen)) {
     MainNativePreparationFailed(status) -> status
-    MainNativePrepared(native, source) -> main_dump_symbols(native)
+    MainNativePrepared(native, source, _) -> main_dump_symbols(native)
   }
 }
 

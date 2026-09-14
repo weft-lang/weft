@@ -1178,7 +1178,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_diagnostic_schema_public_surface" "$(<"$tmp_out")" "Public API items: 62. Documented: 62."
     assert_contains "doc_stdlib_diagnostic_schema_finite_range" "$(<"$tmp_out")" "DiagnosticSourceRange(DiagnosticSource, usize, usize)"
   elif [ "$stdlib_doc_name" = "diagnostic/registry" ]; then
-    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 50. Documented: 50."
+    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 52. Documented: 52."
     assert_contains "doc_stdlib_diagnostic_registry_missing_source" "$(<"$tmp_out")" "pub fn module_source_unavailable() -> DiagnosticCode"
     assert_contains "doc_stdlib_diagnostic_registry_length" "$(<"$tmp_out")" "pub fn len() -> usize"
     assert_contains "doc_stdlib_diagnostic_registry_lookup" "$(<"$tmp_out")" "pub fn get(index: usize) -> Option<DiagnosticRegistryEntry>"
@@ -1387,10 +1387,10 @@ assert_equals "doc_extra_arg_exits_usage" "$doc_extra_arg_exit" "2"
 assert_contains "doc_extra_arg_prints_usage" "$(<"$tmp_err")" "usage: weft doc PATH"
 
 version_out=$("$WEFT" --version 2> "$tmp_err")
-assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 4; targets macos-aarch64,linux-aarch64; sdk checkout .)"
+assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 5; targets macos-aarch64,linux-aarch64; sdk checkout .)"
 assert_equals "version_human_stderr_empty" "$(<"$tmp_err")" ""
 version_json=$("$WEFT" version --json 2> "$tmp_err")
-assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":4,"targets":["macos-aarch64","linux-aarch64"],"sdk":{"kind":"checkout","root":"."}}'
+assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":5,"targets":["macos-aarch64","linux-aarch64"],"sdk":{"kind":"checkout","root":"."}}'
 assert_equals "version_json_stderr_empty" "$(<"$tmp_err")" ""
 
 target_list=$("$WEFT" target list 2> "$tmp_err")
@@ -4568,6 +4568,42 @@ assert_contains "pkg_audit_does_not_require_staging_of_a_validate_only_export" "
 # plain checks, with no stage phase.
 grammar_stage_out=$(cd "$tmp_pkg_dir/audit_grammar" && printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"assignments","source":"count = 3","host_source":"type settings { count: i64 }"}}}' | "$WEFT_ABS" mcp 2>&1)
 assert_contains "mcp_grammar_diagnostics_checks_through_a_staging_driver" "$grammar_stage_out" '"export":"assignments","phase":"parse+check","diagnostics":0,"check_errors":0,"parse":"parsed","check":"checked"'
+# A staging site is a checker fact: `embed<G>` over a staged literal records
+# the export the type argument resolves to, and `--artifact-facts` renders
+# every site before any driver runs. Offsets are byte ranges in the root
+# source: the call spelling and the literal with its delimiters.
+printf '%s' 'use grammars/assignments.{AssignmentGrammar}
+use stdlib/grammar/staging.{embed}
+fn main() -> i64 { let staged = embed<AssignmentGrammar>(r#"count = 3"#); 0 }
+' > "$tmp_pkg_dir/audit_grammar/staged.weft"
+(cd "$tmp_pkg_dir/audit_grammar" && "$WEFT_ABS" build staged.weft -o staged_product --artifact-facts staged.facts.json > "$tmp_out" 2> "$tmp_err")
+assert_equals "build_records_staging_site_stderr_empty" "$(<"$tmp_err")" ""
+staged_facts=$(/bin/cat "$tmp_pkg_dir/audit_grammar/staged.facts.json")
+assert_contains "build_records_staging_site_of_a_typed_plan_export" "$staged_facts" '"staging_sites":[{"package":"auditpkg","version":"0.3.0","export":"assignments","module":"grammars/assignments","declaration":"AssignmentGrammar","capability":"typed_plan","site":{"start":112,"end":117},"source":{"start":137,"end":151}}]'
+printf '%s' 'use stdlib/grammar/sql.{SqlGrammar}
+use stdlib/grammar/staging.{embed}
+fn main() -> i64 { let staged = embed<SqlGrammar>(r##"select "id" from users"##); 0 }
+' > "$tmp_src"
+"$WEFT" build "$tmp_src" -o "$tmp_bin" --artifact-facts "$tmp_bin.facts.json" > "$tmp_out" 2> "$tmp_err"
+assert_equals "build_records_sdk_staging_site_stderr_empty" "$(<"$tmp_err")" ""
+sdk_staged_facts=$(/bin/cat "$tmp_bin.facts.json")
+assert_contains "build_records_staging_site_of_an_sdk_export" "$sdk_staged_facts" '"staging_sites":[{"package":"@weft-sdk","version":"0.1.0","export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","capability":"validate_only","site":{"start":103,"end":108},"source":{"start":121,"end":150}}]'
+rm -f "$tmp_bin.facts.json"
+# A program without sites renders an empty list, and a site that breaks the
+# staged-literal rule is a stable check error, over the CLI and over MCP.
+printf 'fn main() -> i64 { 0 }\n' > "$tmp_src"
+"$WEFT" build "$tmp_src" -o "$tmp_bin" --artifact-facts "$tmp_bin.facts.json" > "$tmp_out" 2> "$tmp_err"
+assert_contains "build_renders_empty_staging_sites" "$(/bin/cat "$tmp_bin.facts.json")" '"staging_sites":[]'
+rm -f "$tmp_bin.facts.json"
+printf 'use stdlib/grammar/sql.{SqlGrammar}\nuse stdlib/grammar/staging.{embed}\nfn main() -> i64 { let staged = embed<SqlGrammar>("select \\"id\\""); 0 }\n' > "$tmp_src"
+set +e
+staged_check=$("$WEFT" check "$tmp_src" 2>&1)
+staged_check_exit=$?
+set -e
+assert_equals "check_rejects_escaped_staging_source_exit" "$staged_check_exit" "1"
+assert_contains "check_rejects_escaped_staging_source" "$staged_check" 'error[E1010]: staging site: the source must be a raw string literal or a plain string literal without escapes'
+mcp_staged_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"use stdlib/grammar/sql.{SqlGrammar}\nuse stdlib/grammar/staging.{embed}\nfn main() -> i64 { let t = \"x\"\n let staged = embed<SqlGrammar>(i\"select {t}\"); 0 }"}}}' | "$WEFT" mcp 2>&1)
+assert_contains "mcp_diagnostics_reports_staging_site_literal_code" "$mcp_staged_out" '"code":"E1010"'
 grammar_stage_product=$(ls "$tmp_pkg_dir"/audit_grammar/target/*/grammar-tools/auditpkg-assignments-*.weft 2>/dev/null | head -1)
 if [ -n "$grammar_stage_product" ] && grep -q "driver.serve_staging(" "$grammar_stage_product" && grep -q "file_write_handler" "$grammar_stage_product"; then
   echo "  ok mcp_grammar_typed_plan_export_runs_a_staging_driver"
@@ -5388,7 +5424,7 @@ else
   exit 1
 fi
 native_forward_facts=$(/bin/cat "$tmp_pkg_trust_dir/native_artifacts/native_forward.facts.json")
-assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":4'
+assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":5'
 assert_contains "package_native_artifact_facts_name_target" "$native_forward_facts" '"target":"macos-aarch64"'
 assert_contains "package_native_artifact_facts_name_minimum_platform" "$native_forward_facts" '"minimum_platform_abi":{"platform":"macos","major":11,"minor":0,"patch":0}'
 assert_contains "package_native_artifact_facts_claim_standalone" "$native_forward_facts" '"standalone":true'
