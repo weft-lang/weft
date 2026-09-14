@@ -67922,6 +67922,177 @@ pub(package) fn pipeline_ir_function_list_replace_from_product(functions: IrFunc
   }
 }
 
+fn pipeline_ir_function_hashes_present(functions: IrFunctionList, present: Map<i64, i64>) -> Map<i64, i64> {
+  match functions {
+    IrFunctionNil -> present
+    IrFunctionCons(irf, rest) ->
+      pipeline_ir_function_hashes_present(rest, present.insert(pipeline_ir_function_hash(irf), 1))
+  }
+}
+
+-- Every hash a function calls directly, including calls inside handler
+-- clause bodies and deferred handler bodies, which carry their own blocks.
+fn pipeline_ir_block_list_direct_callees(blocks: IrBlockList, callees: List<i64>) -> List<i64> {
+  let mut found = callees
+  let mut current = blocks
+  let mut walking = true
+  while walking {
+    match current {
+      IrBlockListNil -> { walking = false }
+      IrBlockListCons(IrBlock(_, _, insts, _), rest) -> {
+        let mut instructions = insts
+        let mut scanning = true
+        while scanning {
+          match instructions {
+            IrInstNil -> { scanning = false }
+            IrInstCons(inst, tail) -> {
+              found = match inst {
+                IrCallI64(_, callee, _) -> Cons(callee, found)
+                IrHandleI64(_, _, _, clauses, _, _) ->
+                  pipeline_ir_handler_clauses_direct_callees(clauses, found)
+                IrDeferredHandleI64(_, _, body, clauses, _, _, _) -> pipeline_ir_handler_clauses_direct_callees(
+                  clauses,
+                  pipeline_ir_deferred_body_direct_callees(body, found)
+                )
+                _ -> found
+              }
+              instructions = tail
+            }
+          }
+        }
+        current = rest
+      }
+    }
+  }
+  found
+}
+
+fn pipeline_ir_handler_clauses_direct_callees(clauses: IrHandlerClauseBodyList, callees: List<i64>) -> List<i64> {
+  match clauses {
+    IrHandlerClauseBodyNil -> callees
+    IrHandlerClauseBodyCons(clause, rest) -> pipeline_ir_handler_clauses_direct_callees(
+      rest,
+      match clause {
+        IrHandlerClauseBody(_, _, _, _, _, _, _, _, _, _, blocks) ->
+          pipeline_ir_block_list_direct_callees(blocks, callees)
+        IrHandlerClauseBodyInvalid(_) -> callees
+      }
+    )
+  }
+}
+
+fn pipeline_ir_deferred_body_direct_callees(body: IrDeferredHandlerBody, callees: List<i64>) -> List<i64> {
+  match body {
+    IrDeferredHandlerBody(_, _, _, _, _, blocks, completion) -> {
+      let with_body = pipeline_ir_block_list_direct_callees(blocks, callees)
+      match completion {
+        IrDeferredCompletionBody(_, _, _, completion_blocks) ->
+          pipeline_ir_block_list_direct_callees(completion_blocks, with_body)
+        _ -> with_body
+      }
+    }
+    IrDeferredHandlerBodyInvalid(_) -> callees
+  }
+}
+
+fn pipeline_ir_function_direct_callees(irf: IrFunction) -> List<i64> {
+  match irf {
+    IrFunction(_, _, blocks, _) -> pipeline_ir_block_list_direct_callees(blocks, Nil<i64>())
+  }
+}
+
+-- A shared product carries the bodies the group leader optimised over the
+-- whole dependency closure. A root's own lowering may never have lowered a
+-- dependency function those bodies call directly (a private helper inlined
+-- into a handler clause at lowering, for example), so replacing a root
+-- function with its product version can leave a call to a hash that no
+-- function in the list defines; emission then reports an unresolved forward
+-- reference and produces no executable. The replaced list must close over
+-- the product: every directly called hash missing from the list is appended
+-- from the product and scanned in turn. Appended functions are emitted only
+-- when demanded, so the closure adds no code the root does not reach.
+pub(package) fn pipeline_ir_function_list_close_over_product(
+  functions: IrFunctionList,
+  product_functions: IrFunctionList
+) -> IrFunctionList {
+  -- `known` answers every callee hash once: 1 when the list defines it, 0
+  -- when neither the list nor the product does (intrinsics, runtime entry
+  -- points), so no hash is looked up in the product more than once.
+  let product_index = pipeline_ir_function_index(product_functions)
+  let mut known = pipeline_ir_function_hashes_present(functions, map.new<i64, i64>())
+  let mut added = ir_function_list_empty()
+  let mut pending = functions
+  let mut open = true
+  while open {
+    let mut next_pending = ir_function_list_empty()
+    let mut walk = pending
+    let mut walking = true
+    while walking {
+      match walk {
+        IrFunctionNil -> { walking = false }
+        IrFunctionCons(irf, rest) -> {
+          let mut callees = pipeline_ir_function_direct_callees(irf)
+          let mut scanning = true
+          while scanning {
+            match callees {
+              Nil -> { scanning = false }
+              Cons(callee, more) -> {
+                match known.get(callee) {
+                  Some(_) -> nil
+                  None -> match product_index.get(callee) {
+                    None -> { known = known.insert(callee, 0) }
+                    Some(found) -> {
+                      known = known.insert(callee, 1)
+                      next_pending = ir_function_list_prepend(found, next_pending)
+                      added = ir_function_list_prepend(found, added)
+                    }
+                  }
+                }
+                callees = more
+              }
+            }
+          }
+          walk = rest
+        }
+      }
+    }
+    match next_pending {
+      IrFunctionNil -> { open = false }
+      _ -> { pending = next_pending }
+    }
+  }
+  match added {
+    IrFunctionNil -> functions
+    _ -> pipeline_ir_function_list_append(functions, added)
+  }
+}
+
+--- The same closure over the finished module: the finishing passes copy and
+--- specialise bodies, so a dangling product call can appear after the list
+--- was first closed. The final list is what emission predeclares.
+fn pipeline_ir_module_close_over_product(module: IrModule, product_functions: IrFunctionList) -> IrModule {
+  match module {
+    IrModule(functions, owners) ->
+      IrModule(pipeline_ir_function_list_close_over_product(functions, product_functions), owners)
+    OptimisedIrModule(functions, inline_sites, residual_sites, evidence_candidate_sites, const_fold_sites, algebraic_fold_sites, dead_inst_sites, facts, pure_call_dce_sites, reserved, block_entry_narrowing_sites, direct_call_inline_sites, owners) ->
+      OptimisedIrModule(
+        pipeline_ir_function_list_close_over_product(functions, product_functions),
+        inline_sites,
+        residual_sites,
+        evidence_candidate_sites,
+        const_fold_sites,
+        algebraic_fold_sites,
+        dead_inst_sites,
+        facts,
+        pure_call_dce_sites,
+        reserved,
+        block_entry_narrowing_sites,
+        direct_call_inline_sites,
+        owners
+      )
+  }
+}
+
 pub(package) fn pipeline_optimised_dependency_product_build(typed: TypedModule) -> PipelineOptimisedDependencyProduct {
   match typed {
     TypedModule(fns, src, tt, owners) -> {
@@ -70338,7 +70509,10 @@ pub(package) fn pipeline_optimise_typed_ir_with_dependency_product(typed: TypedM
         pipeline_ir_pure_callee_tree(facts)
       )
       let promoted = pipeline_ir_function_list_replace_from_product(functions, product_functions, promoted_overlay)
-      pipeline_finish_typed_optimisation(retained_typed, functions, facts, opt, promoted, 1)
+      pipeline_ir_module_close_over_product(
+        pipeline_finish_typed_optimisation(retained_typed, functions, facts, opt, promoted, 1),
+        product_functions
+      )
     }
   }
 }

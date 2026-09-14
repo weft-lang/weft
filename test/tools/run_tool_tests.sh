@@ -6180,6 +6180,22 @@ test_rss_err=$(<"$tmp_err")
 assert_contains "test_rss_limit_reports_peak_and_limit" "$test_rss_err" "KB exceeded limit"
 assert_contains "test_rss_limit_reports_failed_summary" "$test_rss_err" "0 passed, 1 failed"
 
+# A shared optimised dependency product replaces a root's dependency functions
+# with bodies optimised over the whole closure. `host_type_queries` inlines the
+# host-type handler's private helpers away at lowering, so its own list never
+# defines them while the product bodies still call them; the replacement must
+# close over the product or emission reports unresolved forward references and
+# the runner reports an emission failure. Two roots with the forced product
+# reproduce the exact eight-worker suite grouping.
+set +e
+shared_product_out=$(env WEFT_TEST_OPTIMISED_PRODUCTS=1 WEFT_TEST_PLAN_TRACE=1 WEFT_TEST_COMPILE_TIMEOUT=480 WEFT_TEST_RUN_TIMEOUT=480 "$WEFT" test --jobs 2 test/host_type_queries.weft test/weak_cleanup_metrics.weft 2>&1)
+shared_product_exit=$?
+set -e
+assert_equals "test_shared_optimised_product_roots_pass" "$shared_product_exit" "0"
+assert_contains "test_shared_optimised_product_was_built" "$shared_product_out" "optimised_product=1"
+assert_contains "test_shared_optimised_product_closes_over_pruned_callees" "$shared_product_out" "2 passed, 0 failed"
+assert_not_contains "test_shared_optimised_product_emits_every_referenced_function" "$shared_product_out" "unresolved forward reference"
+
 set +e
 env WEFT_TEST_COMPILE_RSS_LIMIT_KB=1 "$WEFT" test --jobs 1 "$tmp_test_fail_one" > "$tmp_out" 2>"$tmp_err"
 test_failure_rss_exit=$?
