@@ -24,11 +24,15 @@ use runtime/memory.{mem_load8_at, mem_load64_at, mem_store8_at}
 use runtime/sha256.{sha256}
 use runtime/source_acquire.{SdkOrigin, SourceAcquire, EmbeddedSdk, CheckoutSdk, NoSdk}
 use runtime/string.{runtime_str_byte_at, runtime_str_cstring, runtime_str_from_bytes_copy}
+use runtime/dir_inspect as dir_inspect_handler
+use runtime/file_read as file_read_handler
 use runtime/syscall.{
   sys_close,
   sys_dir_mkdir,
+  sys_dir_remove_directory,
   sys_open_read,
   sys_open_write_create_new,
+  sys_proc_id,
   sys_remove,
   sys_rename,
   sys_write
@@ -39,7 +43,22 @@ use stdlib/diagnostic/schema.{*}
 use stdlib/grammar.{CheckResult, Checked, CheckRejected}
 use stdlib/grammar/tooling.{ToolTypeIdentity, tool_type_identity, tool_type_identity_token}
 use stdlib/grammar/tooling/protocol.{*}
-use stdlib/grammar/tooling/staging.{StagingCapability, StagingTypedPlan, StagingValidateOnly}
+use stdlib/grammar/tooling/staging.{
+  StagingArtifactMissing,
+  StagingArtifactUnreadable,
+  StagingCapability,
+  StagingDigestMismatch,
+  StagingDirectoryUnreadable,
+  StagingExtraEntry,
+  StagingOverBudget,
+  StagingSizeMismatch,
+  StagingTypedPlan,
+  StagingValidateOnly,
+  StagingVerifyFailure,
+  byte_ceiling,
+  verify_artifact
+}
+use stdlib/path as path
 use stdlib/json.{*}
 use stdlib/list.{List, Cons, Nil}
 use stdlib/option.{Option, Some, None}
@@ -1461,12 +1480,72 @@ fn anchor_location(
   source_name: str,
   buffer: i64
 ) -> DiagnosticLocation {
+  anchor_location_at(location, source_name, buffer, __i64_to_usize(0))
+}
+
+-- The request's source text starts `shift` bytes into the buffer: a staged
+-- literal's content offset, or zero when the request was the whole buffer.
+fn anchor_location_at(
+  location: DiagnosticLocation,
+  source_name: str,
+  buffer: i64,
+  shift: usize
+) -> DiagnosticLocation {
   match location {
     DiagnosticSourceRange(DiagnosticSourceNamed(name), start, end) ->
       if str_eq(name, source_name) == 1 {
-        DiagnosticSourceRange(DiagnosticSourceBuffer(buffer), start, end)
+        DiagnosticSourceRange(DiagnosticSourceBuffer(buffer), start + shift, end + shift)
       } else { location }
     _ -> location
+  }
+}
+
+--- Re-anchor a driver diagnostic onto a staged literal inside the compiler's
+--- source buffer: ranges naming the request's source identity become buffer
+--- ranges shifted by the literal content's offset.
+pub(package) fn grammar_tool_anchor_at(
+  diagnostic: Diagnostic,
+  source_name: str,
+  buffer: i64,
+  shift: usize
+) -> Diagnostic {
+  match grammar_tool_anchor(diagnostic, source_name, buffer) {
+    Diagnostic(severity, class, code, message, primary, related, fields) ->
+      Diagnostic(
+        severity,
+        class,
+        code,
+        message,
+        shift_location(primary, buffer, shift),
+        shift_related(related, buffer, shift),
+        fields
+      )
+  }
+}
+
+fn shift_location(location: DiagnosticLocation, buffer: i64, shift: usize) -> DiagnosticLocation {
+  match location {
+    DiagnosticSourceRange(DiagnosticSourceBuffer(found), start, end) ->
+      if found == buffer {
+        DiagnosticSourceRange(DiagnosticSourceBuffer(buffer), start + shift, end + shift)
+      }
+    else { location }
+    _ -> location
+  }
+}
+
+fn shift_related(
+  related: DiagnosticRelatedLocationList,
+  buffer: i64,
+  shift: usize
+) -> DiagnosticRelatedLocationList {
+  match related {
+    DiagnosticRelatedLocationNil -> DiagnosticRelatedLocationNil
+    DiagnosticRelatedLocationCons(DiagnosticRelatedLocation(message, location), rest) ->
+      DiagnosticRelatedLocationCons(
+        DiagnosticRelatedLocation(message, shift_location(location, buffer, shift)),
+        shift_related(rest, buffer, shift)
+      )
   }
 }
 
@@ -1543,5 +1622,263 @@ pub(package) fn grammar_tool_anchor(
         anchor_related(related, source_name, buffer),
         anchor_fields(fields, source_name, buffer)
       )
+  }
+}
+
+-- Staging -------------------------------------------------------------------
+--- A verified artifact: its bytes exactly as the driver wrote them, the
+--- digest and size the compiler verified, the byte budget the sink enforced,
+--- the package's facts envelope, the file reads the driver observed, and
+--- the content-addressed store path the bytes now live at.
+pub(package) type GrammarStagedArtifact {
+  content: str,
+  size: usize,
+  budget: usize,
+  bytes: Bytes,
+  facts: Json,
+  observed_inputs: List<ToolObservedInput>,
+  store: str
+}
+
+--- What staging one site produced.
+pub(package) type GrammarStageOutcome {
+  --- The export emitted an artifact, verified and stored.
+  GrammarStageStaged(GrammarStagedArtifact),
+  --- The export checked the source and emits nothing; its observed reads.
+  GrammarStageValidated(List<ToolObservedInput>),
+  --- The driver answered but withheld staging; the response carries the
+  --- diagnostics and the refusal.
+  GrammarStageRefused(ToolResponse),
+  --- The exchange produced no response.
+  GrammarStageFailed(GrammarToolFailure),
+  --- The driver reported an artifact the sink directory does not hold.
+  GrammarStageVerifyFailed(StagingVerifyFailure),
+  --- The private sink directory could not be created; the error follows.
+  GrammarStageSinkUnavailable(i64),
+  --- The verified bytes could not be stored; the error follows.
+  GrammarStageStoreFailed(i64)
+}
+
+--- Where staged artifacts live for a target, content-addressed per export.
+pub(package) fn grammar_tool_artifact_directory(
+  target: NativeLinkTarget,
+  export: GrammarToolExport
+) -> str {
+  "target/"
+    |> str_concat(native_link_target_name(target))
+    |> str_concat("/grammar-artifacts/")
+    |> str_concat(export.package_name)
+    |> str_concat("-")
+    |> str_concat(export.export)
+}
+
+fn stage_sink_root() -> str { ".weft/staging" }
+
+-- One private directory per request: the process id and a build sequence
+-- number, so concurrent builds and sequential sites never share one.
+fn stage_sink_directory(sequence: i64) -> Result<str, i64> {
+  sys_dir_mkdir(runtime_str_cstring(".weft"), 493)
+  sys_dir_mkdir(runtime_str_cstring(stage_sink_root()), 448)
+  let directory = stage_sink_root()
+    |> str_concat("/")
+    |> str_concat(sys_proc_id().to_str())
+    |> str_concat("-")
+    |> str_concat(sequence.to_str())
+  let status = sys_dir_mkdir(runtime_str_cstring(directory), 448)
+  if status < 0 { Err<str, i64>(0 - status) } else { Ok<str, i64>(directory) }
+}
+
+fn stage_sink_cleanup(directory: str) -> nil {
+  sys_remove(runtime_str_cstring(str_concat(directory, "/artifact")))
+  sys_dir_remove_directory(runtime_str_cstring(directory))
+  nil
+}
+
+fn stage_verify(
+  directory: str,
+  artifact: ToolStagedArtifact
+) -> Result<Bytes, StagingVerifyFailure> {
+  match path.from_utf8(directory) {
+    Err(_) -> Err<Bytes, StagingVerifyFailure>(StagingArtifactMissing)
+    Ok(sink) -> with dir_inspect_handler() {
+      with file_read_handler() {
+        verify_artifact(sink, artifact.size, artifact.content, artifact.budget)
+      }
+    }
+  }
+}
+
+fn digest_hex(content: str) -> str {
+  match content.slice(__i64_to_usize(7), content.len()) {
+    Some(hex) -> hex
+    None -> content
+  }
+}
+
+-- Move the verified artifact into the store. A file already present under
+-- the same digest is the same bytes, so the sink copy is simply dropped.
+fn stage_store(
+  directory: str,
+  target: NativeLinkTarget,
+  export: GrammarToolExport,
+  artifact: ToolStagedArtifact
+) -> Result<str, i64> {
+  ensure_directories(target)
+  sys_dir_mkdir(
+    runtime_str_cstring(
+      str_concat("target/", str_concat(native_link_target_name(target), "/grammar-artifacts"))
+    ),
+    493
+  )
+  let store_directory = grammar_tool_artifact_directory(target, export)
+  sys_dir_mkdir(runtime_str_cstring(store_directory), 493)
+  let store = str_concat(store_directory, str_concat("/", digest_hex(artifact.content)))
+  let (existing_ptr, existing_len) = read_path(store)
+  if existing_ptr != 0 { Ok<str, i64>(store) } else {
+    let sink_artifact = str_concat(directory, "/artifact")
+    let renamed = sys_rename(runtime_str_cstring(sink_artifact), runtime_str_cstring(store))
+    if renamed >= 0 { Ok<str, i64>(store) } else {
+      -- A store on another filesystem cannot take the rename; publish the
+      -- verified file's bytes beside the final path instead.
+      let (ptr, len) = read_path(sink_artifact)
+      if ptr == 0 { Err<str, i64>(0 - renamed) } else {
+        let status = publish_file(store, ptr, len, 420)
+        if status == 0 { Ok<str, i64>(store) } else { Err<str, i64>(status) }
+      }
+    }
+  }
+}
+
+--- Stage one site: check the source against the host module's types and,
+--- for a typed-plan export, drive the export's staging into a private sink
+--- directory, verify what arrived against what the driver reported, and
+--- store the bytes content-addressed. The sink directory is removed on
+--- every path. `sequence` distinguishes sites within one build.
+pub(package) fn grammar_tool_stage(
+  product: str,
+  export: GrammarToolExport,
+  source_name: str,
+  source_text: str,
+  target: NativeLinkTarget,
+  table: i64,
+  source: i64,
+  sequence: i64,
+  deadline: Instant
+) -[Proc]> GrammarStageOutcome {
+  let identity = grammar_tool_identity(export)
+  match export.capability {
+    StagingValidateOnly -> {
+      let request = ToolRequest {
+        grammar: identity,
+        source_name: source_name,
+        source_text: source_text,
+        context: ToolHostContext,
+        operation: ToolOperationCheck
+      }
+      match grammar_tool_exchange_with_host(product, request, table, source, deadline) {
+        GrammarToolFailed(failure) -> GrammarStageFailed(failure)
+        GrammarToolAnswered(response) -> match response.check {
+          ToolChecked -> GrammarStageValidated(response.observed_inputs)
+          _ -> GrammarStageRefused(response)
+        }
+      }
+    }
+    StagingTypedPlan -> match stage_sink_directory(sequence) {
+      Err(code) -> GrammarStageSinkUnavailable(code)
+      Ok(directory) -> {
+        let outcome = match path.from_utf8(directory) {
+          Err(_) -> GrammarStageSinkUnavailable(22)
+          Ok(sink) -> {
+            let request = ToolRequest {
+              grammar: identity,
+              source_name: source_name,
+              source_text: source_text,
+              context: ToolHostContext,
+              operation: ToolOperationStage(
+                ToolStageTarget {
+                  capability: StagingTypedPlan,
+                  platform: native_link_target_name(target),
+                  sink: sink
+                }
+              )
+            }
+            match grammar_tool_exchange_with_host(product, request, table, source, deadline) {
+              GrammarToolFailed(failure) -> GrammarStageFailed(failure)
+              GrammarToolAnswered(response) -> match response.stage {
+                ToolStaged(artifact) -> if artifact.budget > byte_ceiling() {
+                  GrammarStageVerifyFailed(StagingOverBudget(artifact.budget))
+                } else {
+                  match stage_verify(directory, artifact) {
+                    Err(failure) -> GrammarStageVerifyFailed(failure)
+                    Ok(bytes) -> match stage_store(directory, target, export, artifact) {
+                      Err(code) -> GrammarStageStoreFailed(code)
+                      Ok(store) -> GrammarStageStaged(
+                        GrammarStagedArtifact {
+                          content: artifact.content,
+                          size: artifact.size,
+                          budget: artifact.budget,
+                          bytes: bytes,
+                          facts: artifact.facts,
+                          observed_inputs: response.observed_inputs,
+                          store: store
+                        }
+                      )
+                    }
+                  }
+                }
+                ToolStagedNothing -> GrammarStageValidated(response.observed_inputs)
+                _ -> GrammarStageRefused(response)
+              }
+            }
+          }
+        }
+        stage_sink_cleanup(directory)
+        outcome
+      }
+    }
+  }
+}
+
+--- Render a staging outcome that is not an artifact for tool output.
+pub(package) fn grammar_stage_failure_message(outcome: GrammarStageOutcome) -> str {
+  match outcome {
+    GrammarStageStaged(_) -> "staged"
+    GrammarStageValidated(_) -> "validated"
+    GrammarStageRefused(response) -> match response.stage {
+      ToolStageRefusedParseNotAccepted -> "the grammar did not accept the source"
+      ToolStageRefusedCheckRejected -> "the grammar rejected the source"
+      ToolStageRefusedNoStaging -> "the export does not stage typed plans"
+      ToolStageRefusedNoTooling -> "the export has no tooling module"
+      ToolStageContextUnavailable -> "the grammar's context was unavailable"
+      ToolStageContextUnsupported(_) -> "the grammar does not stage against host types"
+      ToolStageUnsupportedTarget -> "the grammar cannot stage for this target"
+      ToolStageSinkRefused(name) -> str_concat("the sink refused a chunk: ", name)
+      _ -> match response.check {
+        ToolCheckRejected -> "the grammar rejected the source"
+        ToolCheckRefusedParseNotAccepted -> "the grammar did not accept the source"
+        ToolCheckUnsupported(_) -> "the grammar does not check against host types"
+        ToolContextUnavailable -> "the grammar's context was unavailable"
+        ToolCheckRefusedNoTooling -> "the export has no tooling module"
+        _ -> "the driver withheld the site"
+      }
+    }
+    GrammarStageFailed(failure) -> grammar_tool_failure_message(failure)
+    GrammarStageVerifyFailed(failure) -> match failure {
+      StagingDirectoryUnreadable(_) -> "the sink directory could not be listed"
+      StagingArtifactMissing -> "the driver reported an artifact it did not write"
+      StagingExtraEntry(_) -> "the driver wrote more than its artifact into the sink"
+      StagingArtifactUnreadable(_) -> "the artifact could not be read back"
+      StagingOverBudget(_) -> "the artifact exceeds the byte budget"
+      StagingSizeMismatch(_, _) -> "the artifact's size is not the size the driver reported"
+      StagingDigestMismatch(_, _) -> "the artifact's digest is not the digest the driver reported"
+    }
+    GrammarStageSinkUnavailable(code) -> str_concat(
+      "the staging directory could not be created (error ",
+      str_concat(int_text(code), ")")
+    )
+    GrammarStageStoreFailed(code) -> str_concat(
+      "the artifact could not be stored (error ",
+      str_concat(int_text(code), ")")
+    )
   }
 }

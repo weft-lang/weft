@@ -1387,10 +1387,10 @@ assert_equals "doc_extra_arg_exits_usage" "$doc_extra_arg_exit" "2"
 assert_contains "doc_extra_arg_prints_usage" "$(<"$tmp_err")" "usage: weft doc PATH"
 
 version_out=$("$WEFT" --version 2> "$tmp_err")
-assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 5; targets macos-aarch64,linux-aarch64; sdk checkout .)"
+assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 6; targets macos-aarch64,linux-aarch64; sdk checkout .)"
 assert_equals "version_human_stderr_empty" "$(<"$tmp_err")" ""
 version_json=$("$WEFT" version --json 2> "$tmp_err")
-assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":5,"targets":["macos-aarch64","linux-aarch64"],"sdk":{"kind":"checkout","root":"."}}'
+assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":6,"targets":["macos-aarch64","linux-aarch64"],"sdk":{"kind":"checkout","root":"."}}'
 assert_equals "version_json_stderr_empty" "$(<"$tmp_err")" ""
 
 target_list=$("$WEFT" target list 2> "$tmp_err")
@@ -4568,40 +4568,78 @@ assert_contains "pkg_audit_does_not_require_staging_of_a_validate_only_export" "
 # plain checks, with no stage phase.
 grammar_stage_out=$(cd "$tmp_pkg_dir/audit_grammar" && printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grammar_diagnostics","arguments":{"grammar":"assignments","source":"count = 3","host_source":"type settings { count: i64 }"}}}' | "$WEFT_ABS" mcp 2>&1)
 assert_contains "mcp_grammar_diagnostics_checks_through_a_staging_driver" "$grammar_stage_out" '"export":"assignments","phase":"parse+check","diagnostics":0,"check_errors":0,"parse":"parsed","check":"checked"'
-# A staging site is a checker fact: `embed<G>` over a staged literal records
-# the canonical export the type argument resolves to, and `--artifact-facts`
-# renders every site before any driver runs. Until sites are lowered, a
-# product that contains one is refused: the facts are written, the product
-# is not, and the exit status says so. Offsets are byte ranges in the root
-# source: the call spelling and the literal with its delimiters.
+# A staging site is a checker fact and a build step: `embed<G>` over a
+# staged literal records the canonical export the type argument resolves
+# to, `weft build` drives the export's driver product to check and, for a
+# typed-plan export, stage the source into a private sink, verifies the
+# artifact, stores it content-addressed and lowers the site to a
+# `Staged<G>` value the product carries. Offsets are byte ranges in the
+# root source: the call spelling and the literal with its delimiters.
 mkdir -p "$tmp_pkg_dir/staged_pkg/grammars"
 cp module_fixtures/toy_grammar.weft "$tmp_pkg_dir/staged_pkg/grammars/assignments.weft"
 printf '{"package":"stagedpkg","manifest_version":1,"version":"0.4.0","weft":"0.1","exports":{"grammars":{"assignments":{"module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"typed_plan","tooling":"grammars/assignments"}}}}\n' > "$tmp_pkg_dir/staged_pkg/weft.pkg"
 printf '%s' 'use grammars/assignments.{AssignmentGrammar}
 use stdlib/grammar/staging.{embed}
-fn main() -> i64 { let staged = embed<AssignmentGrammar>(r#"count = 3"#); 0 }
+type settings { count: i64, name: str }
+fn main() -> i64 { let staged = embed<AssignmentGrammar>(r#"count = 3"#); match staged.artifact { Some(artifact) -> if artifact.bytes.len() == __i64_to_usize(27) { 0 } else { 3 }, None -> 4 } }
 ' > "$tmp_pkg_dir/staged_pkg/staged.weft"
-set +e
 (cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" build staged.weft -o staged_product --artifact-facts staged.facts.json > "$tmp_out" 2> "$tmp_err")
-staged_build_exit=$?
-set -e
-assert_equals "build_refuses_a_product_with_a_staging_site" "$staged_build_exit" "1"
-assert_contains "build_names_the_unlowered_staging_site" "$(<"$tmp_err")" 'build: staging site for grammar `assignments` at bytes 112..117 is recorded but not lowered by this compiler; no product was written'
-if [ -e "$tmp_pkg_dir/staged_pkg/staged_product" ]; then
-  echo "  fail build_writes_no_product_for_a_staging_site"
+assert_equals "build_stages_a_typed_plan_site_stderr_empty" "$(<"$tmp_err")" ""
+staged_facts=$(/bin/cat "$tmp_pkg_dir/staged_pkg/staged.facts.json")
+assert_contains "build_records_a_staged_site" "$staged_facts" '"staging_sites":[{"package":"stagedpkg","version":"0.4.0","export":"assignments","module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"typed_plan","capability":"typed_plan","site":{"start":152,"end":157},"source":{"start":177,"end":191},"staged":{"outcome":"staged","driver":"target/'
+assert_contains "build_records_the_verified_artifact" "$staged_facts" '"content":"sha256:11923d3439a10fc9d43ffcc503dde655a21d3182cc30bf656f7abf297cdbd33f","size":27,"budget":4096,"facts":{"key":"count","literal":"integer"}}}]'
+if [ -s "$tmp_pkg_dir/staged_pkg/target/$(basename "$(ls -d "$tmp_pkg_dir"/staged_pkg/target/*/ | head -1)")/grammar-artifacts/stagedpkg-assignments/11923d3439a10fc9d43ffcc503dde655a21d3182cc30bf656f7abf297cdbd33f" ]; then
+  echo "  ok build_stores_the_artifact_content_addressed"
+else
+  echo "  fail build_stores_the_artifact_content_addressed"
+  ls -R "$tmp_pkg_dir/staged_pkg/target" 2>&1 | head -20
+  exit 1
+fi
+if [ -d "$tmp_pkg_dir/staged_pkg/.weft/staging" ] && [ -n "$(ls -A "$tmp_pkg_dir/staged_pkg/.weft/staging")" ]; then
+  echo "  fail build_removes_its_private_sink_directory"
+  ls -R "$tmp_pkg_dir/staged_pkg/.weft" 2>&1 | head -10
   exit 1
 else
-  echo "  ok build_writes_no_product_for_a_staging_site"
+  echo "  ok build_removes_its_private_sink_directory"
 fi
-staged_facts=$(/bin/cat "$tmp_pkg_dir/staged_pkg/staged.facts.json")
-assert_contains "build_records_staging_site_of_a_typed_plan_export" "$staged_facts" '"staging_sites":[{"package":"stagedpkg","version":"0.4.0","export":"assignments","module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"typed_plan","capability":"typed_plan","site":{"start":112,"end":117},"source":{"start":137,"end":151}}]'
-# `weft check` still accepts the site, and the audit package, which exports
-# the same declaration under two executions, makes a site ambiguous.
+# The lowered site carries the verified bytes: the program checks their
+# size and exits accordingly.
+run_binary_guarded "$tmp_pkg_dir/staged_pkg/staged_product"
+echo "  ok staged_product_carries_the_artifact"
+set +e
+(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" run staged.weft > "$tmp_out" 2> "$tmp_err")
+staged_run_exit=$?
+set -e
+assert_equals "run_stages_and_runs_a_typed_plan_site" "$staged_run_exit" "0"
+# A driver that rejects the source fails the build at the literal, with the
+# grammar's own diagnostic anchored onto the root source.
+printf '%s' 'use grammars/assignments.{AssignmentGrammar}
+use stdlib/grammar/staging.{embed}
+type settings { count: i64, name: str }
+fn main() -> i64 { let staged = embed<AssignmentGrammar>(r#"other = 3"#); 0 }
+' > "$tmp_pkg_dir/staged_pkg/rejected.weft"
+set +e
+rejected_build=$(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" build rejected.weft -o rejected_product 2>&1)
+rejected_build_exit=$?
+set -e
+assert_equals "build_fails_when_the_grammar_rejects_the_source" "$rejected_build_exit" "1"
+assert_contains "build_anchors_the_grammar_diagnostic_on_the_literal" "$rejected_build" 'settings has no field with this name'
+assert_contains "build_names_the_refused_site" "$rejected_build" 'build: staging site for grammar `assignments` at bytes 152..157: staging failed: the grammar rejected the source'
+if [ -e "$tmp_pkg_dir/staged_pkg/rejected_product" ]; then
+  echo "  fail build_writes_no_product_for_a_rejected_site"
+  exit 1
+else
+  echo "  ok build_writes_no_product_for_a_rejected_site"
+fi
+# `weft check` accepts a site without staging it, and the audit package,
+# which exports the same declaration under two executions, makes a site
+# ambiguous.
 staged_check_out=$(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" check staged.weft 2>&1)
 assert_contains "check_accepts_a_staging_site" "$staged_check_out" "0 errors"
 printf '%s' 'use grammars/assignments.{AssignmentGrammar}
 use stdlib/grammar/staging.{embed}
-fn main() -> i64 { let staged = embed<AssignmentGrammar>(r#"count = 3"#); 0 }
+type settings { count: i64, name: str }
+fn main() -> i64 { let staged = embed<AssignmentGrammar>(r#"count = 3"#); match staged.artifact { Some(artifact) -> if artifact.bytes.len() == __i64_to_usize(27) { 0 } else { 3 }, None -> 4 } }
 ' > "$tmp_pkg_dir/audit_grammar/staged.weft"
 set +e
 ambiguous_check=$(cd "$tmp_pkg_dir/audit_grammar" && "$WEFT_ABS" check staged.weft 2>&1)
@@ -4609,34 +4647,23 @@ ambiguous_check_exit=$?
 set -e
 assert_equals "check_rejects_a_site_whose_export_is_ambiguous_exit" "$ambiguous_check_exit" "1"
 assert_contains "check_rejects_a_site_whose_export_is_ambiguous" "$ambiguous_check" 'error[E1009]: staging site: `AssignmentGrammar` is exported as `assignments` and `checked_only` with different tooling or execution, so no one driver applies'
+# An SDK export that only validates today is checked through its driver and
+# lowered without an artifact; the product runs.
 printf '%s' 'use stdlib/grammar/sql.{SqlGrammar}
 use stdlib/grammar/staging.{embed}
-fn main() -> i64 { let staged = embed<SqlGrammar>(r##"select "id" from users"##); 0 }
+type users { id: i64, name: str, active: bool }
+fn main() -> i64 { let staged = embed<SqlGrammar>(r#"select id from users"#); match staged.artifact { Some(_) -> 5, None -> 0 } }
 ' > "$tmp_src"
-set +e
 "$WEFT" build "$tmp_src" -o "$tmp_bin" --artifact-facts "$tmp_bin.facts.json" > "$tmp_out" 2> "$tmp_err"
-sdk_build_exit=$?
-set -e
-assert_equals "build_refuses_an_sdk_staging_site" "$sdk_build_exit" "1"
-assert_contains "build_names_the_unlowered_sdk_staging_site" "$(<"$tmp_err")" 'build: staging site for grammar `sql` at bytes 103..108 is recorded but not lowered by this compiler; no product was written'
+assert_equals "build_validates_an_sdk_site_stderr_empty" "$(<"$tmp_err")" ""
 sdk_staged_facts=$(/bin/cat "$tmp_bin.facts.json")
-assert_contains "build_records_staging_site_of_an_sdk_export" "$sdk_staged_facts" '"staging_sites":[{"package":"weft","version":"0.1.0","export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"runtime","capability":"validate_only","site":{"start":103,"end":108},"source":{"start":121,"end":150}}]'
+assert_contains "build_records_a_validated_sdk_site" "$sdk_staged_facts" '"staging_sites":[{"package":"weft","version":"0.1.0","export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"runtime","capability":"validate_only","site":{"start":151,"end":156},"source":{"start":169,"end":194},"staged":{"outcome":"validated"}}]'
 rm -f "$tmp_bin.facts.json"
-# `compile` and `run` refuse the same site; a program without sites renders
-# an empty list; a site that breaks the staged-literal rule is a stable
-# check error, over the CLI and over MCP.
-set +e
+chmod +x "$tmp_bin"
+run_binary_guarded "$tmp_bin"
+echo "  ok validated_product_carries_no_artifact"
 "$WEFT" compile "$tmp_src" > "$tmp_bin" 2> "$tmp_err"
-sdk_compile_exit=$?
-set -e
-assert_equals "compile_refuses_a_staging_site" "$sdk_compile_exit" "1"
-assert_contains "compile_names_the_unlowered_staging_site" "$(<"$tmp_err")" 'compile: staging site for grammar `sql`'
-set +e
-"$WEFT" run "$tmp_src" > "$tmp_out" 2> "$tmp_err"
-sdk_run_exit=$?
-set -e
-assert_equals "run_refuses_a_staging_site" "$sdk_run_exit" "1"
-assert_contains "run_names_the_unlowered_staging_site" "$(<"$tmp_err")" 'run: staging site for grammar `sql`'
+assert_equals "compile_stages_a_site_stderr_empty" "$(<"$tmp_err")" ""
 printf 'fn main() -> i64 { 0 }\n' > "$tmp_src"
 "$WEFT" build "$tmp_src" -o "$tmp_bin" --artifact-facts "$tmp_bin.facts.json" > "$tmp_out" 2> "$tmp_err"
 assert_contains "build_renders_empty_staging_sites" "$(/bin/cat "$tmp_bin.facts.json")" '"staging_sites":[]'
@@ -5470,7 +5497,7 @@ else
   exit 1
 fi
 native_forward_facts=$(/bin/cat "$tmp_pkg_trust_dir/native_artifacts/native_forward.facts.json")
-assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":5'
+assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":6'
 assert_contains "package_native_artifact_facts_name_target" "$native_forward_facts" '"target":"macos-aarch64"'
 assert_contains "package_native_artifact_facts_name_minimum_platform" "$native_forward_facts" '"minimum_platform_abi":{"platform":"macos","major":11,"minor":0,"patch":0}'
 assert_contains "package_native_artifact_facts_claim_standalone" "$native_forward_facts" '"standalone":true'
