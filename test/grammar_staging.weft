@@ -24,7 +24,7 @@ use runtime/file_write as file_write_handler
 use runtime/memory.{mem_copy, mem_store64_at}
 use runtime/process as process_handler
 use runtime/source_acquire.{SourceAcquire, source_acquire_with_checkout}
-use runtime/string.{runtime_str_cstring}
+use runtime/string.{runtime_str_cstring, runtime_str_from_bytes_copy}
 use runtime/syscall.{
   sys_close,
   sys_dir_mkdir,
@@ -35,7 +35,7 @@ use runtime/syscall.{
 }
 use runtime/time as platform_time
 use stdlib/bytes as bytes
-use stdlib/bytes.{Bytes}
+use stdlib/bytes.{Bytes, InvalidUtf8}
 use stdlib/diagnostic/schema.{*}
 use stdlib/dir.{DirInspect, DirMutate}
 use stdlib/file.{FileCreateNew, FileRead, FileWrite}
@@ -56,7 +56,7 @@ use stdlib/grammar/tooling/protocol.{
   render_line
 }
 use stdlib/grammar/tooling/staging.{*}
-use stdlib/grammar/staging.{Staged, StagedBytes, bytes_from_hex, staged_from_hex, validated}
+use stdlib/grammar/staging.{Staged, StagedBytes, staged_from_static, validated}
 use stdlib/io/types.{*}
 use stdlib/json.{*}
 use stdlib/list as list
@@ -74,7 +74,14 @@ use stdlib/time/monotonic as monotonic
 use stdlib/time/monotonic.{Instant}
 use stdlib/typecheck.{TypeCheck}
 use stdlib/vector as vector
-use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push, vector_set}
+use stdlib/vector.{
+  Vector,
+  vector_data,
+  vector_get_in_bounds,
+  vector_len,
+  vector_push,
+  vector_set
+}
 
 -- Fixtures ------------------------------------------------------------------
 fn span(text: str) -> Span {
@@ -216,24 +223,6 @@ fn staged_leaky(catalog: HostCatalog, text: str) -> (StageResult, SinkSummary) {
     () => counting(() => stage_leaky(catalog, syntax))
   )
   (result, summary)
-}
-
-fn hex_digit_text(value: i64) -> str {
-  let digits = "0123456789abcdef"
-  digits.slice(__i64_to_usize(value), __i64_to_usize(value + 1)).unwrap_or("?")
-}
-
-fn plan_hex(text: str) -> str {
-  let mut out = ""
-  let zero: usize = 0
-  for index in zero..text.len() {
-    let byte = __u64_to_i64(__u8_to_u64(text.byte_at(index).unwrap_or(__u64_to_u8(0))))
-    out = str_concat(
-      out,
-      str_concat(hex_digit_text(byte / 16), hex_digit_text(byte - byte / 16 * 16))
-    )
-  }
-  out
 }
 
 fn expected_plan(key: str, type_name: str, literal: str) -> str {
@@ -658,18 +647,17 @@ test "the three conformances agree on the syntax they share" {
 }
 
 -- Lowered sites -----------------------------------------------------------------
-test "lowered sites carry their source identity and decode staged bytes once" {
+test "lowered sites carry their source identity and static staged bytes" {
   let none = validated<AssignmentGrammar>("app.weft@137")
   Test.assert_true(
     match none.source { DiagnosticSourceNamed(name) -> name == "app.weft@137", _ -> false }
   )
   Test.assert_true(match none.artifact { None -> true, _ -> false })
   let plan = expected_plan("count", "i64", "3")
-  let hex = plan_hex(plan)
-  let some = staged_from_hex<AssignmentGrammar>(
+  let some = staged_from_static<AssignmentGrammar>(
     "app.weft@137",
     content_digest(bytes.from_str(plan)),
-    hex
+    plan
   )
   match some.artifact {
     Some(artifact) -> {
@@ -681,37 +669,38 @@ test "lowered sites carry their source identity and decode staged bytes once" {
   }
 }
 
-test "hexadecimal decoding covers every byte value in both cases" {
-  Test.assert_eq_usize(bytes_from_hex("").len(), __i64_to_usize(0))
-  let all = bytes_from_hex("00017f80fffe")
-  Test.assert_eq_usize(all.len(), __i64_to_usize(6))
-  Test.assert_eq(
-    __u64_to_i64(__u8_to_u64(all.get(__i64_to_usize(0)).unwrap_or(__u64_to_u8(1)))),
-    0
-  )
-  Test.assert_eq(
-    __u64_to_i64(__u8_to_u64(all.get(__i64_to_usize(1)).unwrap_or(__u64_to_u8(0)))),
-    1
-  )
-  Test.assert_eq(
-    __u64_to_i64(__u8_to_u64(all.get(__i64_to_usize(2)).unwrap_or(__u64_to_u8(0)))),
-    127
-  )
-  Test.assert_eq(
-    __u64_to_i64(__u8_to_u64(all.get(__i64_to_usize(3)).unwrap_or(__u64_to_u8(0)))),
-    128
-  )
-  Test.assert_eq(
-    __u64_to_i64(__u8_to_u64(all.get(__i64_to_usize(4)).unwrap_or(__u64_to_u8(0)))),
-    255
-  )
-  Test.assert_eq(
-    __u64_to_i64(__u8_to_u64(all.get(__i64_to_usize(5)).unwrap_or(__u64_to_u8(0)))),
-    254
-  )
-  Test.assert_true(bytes_from_hex("ABCDEF").eq(bytes_from_hex("abcdef")))
-  -- A trailing odd digit is dropped; the pairs before it decode.
-  Test.assert_eq_usize(bytes_from_hex("abc").len(), __i64_to_usize(1))
+test "static staged storage preserves arbitrary bytes behind the UTF-8 boundary" {
+  let raw = [
+    __u64_to_u8(0),
+    __u64_to_u8(1),
+    __u64_to_u8(127),
+    __u64_to_u8(128),
+    __u64_to_u8(255),
+    __u64_to_u8(254)
+  ]
+  let mut values = vector.new<u8>()
+  for value in raw { values.push(value) }
+  let length = vector_len<u8>(values)
+  let storage = runtime_str_from_bytes_copy(vector_data<u8>(values), length)
+  let staged = staged_from_static<AssignmentGrammar>("binary.weft@0", "sha256:test", storage)
+  match staged.artifact {
+    None -> Test.assert_true(false)
+    Some(artifact) -> {
+      Test.assert_eq_usize(artifact.bytes.len(), __i64_to_usize(6))
+      for index in 0..6 {
+        Test.assert_eq(
+          __u64_to_i64(
+            __u8_to_u64(artifact.bytes.get(__i64_to_usize(index)).unwrap_or(__u64_to_u8(9)))
+          ),
+          __u64_to_i64(__u8_to_u64(raw[__i64_to_usize(index)]))
+        )
+      }
+      match artifact.bytes.to_utf8() {
+        Ok(_) -> Test.assert_true(false)
+        Err(InvalidUtf8(offset)) -> Test.assert_eq_usize(offset, __i64_to_usize(3))
+      }
+    }
+  }
 }
 
 -- Directories -----------------------------------------------------------------

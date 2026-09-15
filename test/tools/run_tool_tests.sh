@@ -4630,6 +4630,41 @@ assert_contains "build_records_the_file_context" "$staged_file_facts" '"context"
 assert_contains "build_observes_the_file_context" "$staged_file_facts" '"compile_time_inputs":[{"path_bytes":[99,111,110,116,101,120,116,46,116,120,116],"limit":"1048576","size":"9","content":"sha256:'
 run_binary_guarded "$tmp_pkg_dir/staged_pkg/staged_file_product"
 echo "  ok staged_file_product_carries_the_context_checked_artifact"
+# Static staged storage is a byte view, not a hidden string contract. Drive a
+# file-context grammar with every boundary byte, including malformed UTF-8,
+# and observe those exact bytes from the emitted product.
+printf '\000\001\177\200\377\376' > "$tmp_pkg_dir/staged_pkg/context.bin"
+printf '%s' 'use grammars/assignments.{FileAssignmentGrammar}
+use stdlib/bytes
+use stdlib/bytes.{Bytes}
+use stdlib/grammar/staging.{embed_with_file}
+fn byte_at(values: Bytes, index: i64) -> i64 {
+  match values.get(__i64_to_usize(index)) {
+    Some(value) -> __u64_to_i64(__u8_to_u64(value))
+    None -> 9
+  }
+}
+fn main() -> i64 {
+  let staged = embed_with_file<FileAssignmentGrammar>(r#"count = 3"#, "context.bin")
+  match staged.artifact {
+    Some(artifact) -> if artifact.bytes.len() == __i64_to_usize(12) and
+      byte_at(artifact.bytes, 6) == 0 and byte_at(artifact.bytes, 7) == 1 and
+      byte_at(artifact.bytes, 8) == 127 and byte_at(artifact.bytes, 9) == 128 and
+      byte_at(artifact.bytes, 10) == 255 and byte_at(artifact.bytes, 11) == 254 {
+      0
+    } else { 3 }
+    None -> 4
+  }
+}
+' > "$tmp_pkg_dir/staged_pkg/staged_binary.weft"
+if ! (cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" build staged_binary.weft -o staged_binary_product --artifact-facts staged_binary.facts.json > "$tmp_out" 2> "$tmp_err"); then
+  /bin/cat "$tmp_err"
+  exit 1
+fi
+assert_equals "build_stages_arbitrary_binary_data_stderr_empty" "$(<"$tmp_err")" ""
+assert_contains "build_records_the_binary_context" "$(/bin/cat "$tmp_pkg_dir/staged_pkg/staged_binary.facts.json")" '"context":{"kind":"file","path_bytes":[99,111,110,116,101,120,116,46,98,105,110],"limit":"1048576"}'
+run_binary_guarded "$tmp_pkg_dir/staged_pkg/staged_binary_product"
+echo "  ok staged_product_observes_static_nul_and_high_bytes"
 staged_file_driver=$(ls "$tmp_pkg_dir"/staged_pkg/target/*/grammar-tools/stagedpkg-files-* 2>/dev/null | grep -v '\.weft$\|\.stamp\.json$' | head -1)
 chmod -x "$staged_file_driver"
 printf 'schema-v2' > "$tmp_pkg_dir/staged_pkg/context.txt"
