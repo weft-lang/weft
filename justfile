@@ -6,7 +6,9 @@ test:
 
 # Test the converged candidate without installing it as the trust root.
 # Repository-private fixtures require checkout SDK selection, which depends on
-# the executable being invoked from the checkout rather than from /tmp.
+# the executable being invoked from the checkout rather than from /tmp. The
+# suite verifies and reuses this recipe's three bootstrap products instead of
+# compiling the same generations again.
 test-candidate: bootstrap
     #!/usr/bin/env bash
     set -euo pipefail
@@ -19,7 +21,7 @@ test-candidate: bootstrap
         echo "candidate test gate: expected checkout SDK selection: $identity" >&2
         exit 1
     fi
-    WEFT="$candidate" bash run_tests.sh
+    WEFT="$candidate" WEFT_BOOTSTRAP_EVIDENCE_PREFIX=/tmp/weft_b bash run_tests.sh
 
 # Type-check the compiler tree (no codegen)
 check:
@@ -55,11 +57,12 @@ bootstrap:
         exit 1
     fi
 
-# Deliberate trust-root refresh: run the gate, then install weft2 as ./weft.
+# Deliberate trust-root refresh: bootstrap once, test that exact converged
+# candidate, then install it as ./weft.
 # SDK source changes also need this refresh before the binary is distributed.
 # Keep the binary/snapshot refresh separate from stdlib source/API commits.
 # rm-first (never overwrite in place) for the macOS signature cache.
-update-root: bootstrap
+update-root: test-candidate
     #!/usr/bin/env bash
     set -e
     rm -f ./weft

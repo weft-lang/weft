@@ -245,6 +245,28 @@ run_markdown_phase() {
 run_bootstrap_phase() {
   python3 test/test_bench_compare.py || return 1
   python3 test/test_bootstrap_sdk.py || return 1
+  if [ -n "${WEFT_BOOTSTRAP_EVIDENCE_PREFIX:-}" ]; then
+    local evidence1="${WEFT_BOOTSTRAP_EVIDENCE_PREFIX}1"
+    local evidence2="${WEFT_BOOTSTRAP_EVIDENCE_PREFIX}2"
+    local evidence3="${WEFT_BOOTSTRAP_EVIDENCE_PREFIX}3"
+    if [ ! -x "$evidence1" ] || [ ! -x "$evidence2" ] || [ ! -x "$evidence3" ]; then
+      echo "  ✗ bootstrap evidence is incomplete"
+      return 1
+    fi
+    if ! cmp -s "$WEFT" "$evidence2"; then
+      echo "  ✗ tested compiler does not match converged bootstrap evidence"
+      return 1
+    fi
+    if ! bash tools/verify_bootstrap_sdk.sh "$evidence1" "$evidence2" "$evidence3"; then
+      return 1
+    fi
+    if ! cmp -s "$evidence2" "$evidence3"; then
+      echo "  ✗ bootstrap evidence is not byte-identical"
+      return 1
+    fi
+    echo "  ✓ reused verified bootstrap evidence (weft2 == weft3)"
+    return 0
+  fi
   local tmpw1
   local tmpw2
   local tmpw3

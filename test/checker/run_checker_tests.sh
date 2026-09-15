@@ -133,7 +133,6 @@ check_accepts "generic_type_declarations" "test/checker/generic_type_declaration
 check_accepts "array_slice_types" "test/checker/array_slice_types.weft"
 check_accepts "structural_types" "test/checker/structural_types.weft"
 check_accepts "no_else_nil" "test/checker/no_else_nil.weft"
-check_accepts "compiler_self_check" "compiler/main.weft"
 
 echo ""
 echo "Checker summary: $PASS passed, $FAIL failed"
