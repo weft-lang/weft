@@ -1,0 +1,327 @@
+-- Persistent typed plans for staged einsum sources.
+--
+-- The driver records only the equation, semantic element facts and checked
+-- shapes. Runtime decoding reparses and rechecks that stable vocabulary into
+-- the sealed plan type, so neither a tooling-session identity nor an unchecked
+-- plan constructor crosses the build boundary.
+
+use stdlib/bytes
+use stdlib/diagnostic/schema.{Diagnose, DiagnosticSource}
+use stdlib/grammar.{CheckResult, Checked, CheckRejected, Parsed}
+use stdlib/grammar/einsum as einsum
+use stdlib/grammar/einsum.{EinsumGrammar}
+use stdlib/grammar/einsum/check as check
+use stdlib/grammar/einsum/plan.{*}
+use stdlib/grammar/einsum/syntax.{EinsumSyntax}
+use stdlib/grammar/staging.{Staged}
+use stdlib/json as json
+use stdlib/json.{Json, JsonArray, JsonEntry, JsonNumber, JsonObject, JsonString}
+use stdlib/list as list
+use stdlib/list.{List, Cons, Nil}
+use stdlib/num
+use stdlib/option
+use stdlib/option.{Some, None}
+use stdlib/result
+use stdlib/result.{Result, Ok, Err}
+use stdlib/semantic_type.{SemanticTypeFact, SemanticTypePrimitive}
+use stdlib/semantic_type/json as semantic_json
+use stdlib/source.{Source}
+use stdlib/tensor as tensor
+use stdlib/tensor.{TensorDimensions, TensorShape}
+use stdlib/typecheck.{*}
+
+--- One identity-free operand retained by the package's staged plan.
+pub type EinsumPersistentOperand {
+  element: SemanticTypeFact,
+  shape: TensorShape
+}
+
+--- The stable input sufficient to reconstruct one sealed checked plan.
+pub type EinsumPersistentPlan {
+  source: str,
+  operands: List<EinsumPersistentOperand>
+}
+
+--- Why staged einsum bytes could not be reconstructed as a checked plan.
+pub type EinsumStagedPlanError {
+  EinsumStagedArtifactMissing,
+  EinsumStagedTextInvalid,
+  EinsumStagedDocumentInvalid,
+  EinsumStagedSchemaUnsupported,
+  EinsumStagedPlanRejected
+}
+
+fn persistent_operand<I>(operand: EinsumPlanOperand<I>) -> EinsumPersistentOperand {
+  EinsumPersistentOperand {
+    element: operand.element.description,
+    shape: operand.shape
+  }
+}
+
+--- Remove handler-scoped identities from a checked plan while retaining its
+--- semantic types and exact checked operand shapes.
+pub(package) fn persistent<I>(
+  syntax: EinsumSyntax,
+  plan: EinsumPlan<I>
+) -> EinsumPersistentPlan {
+  EinsumPersistentPlan {
+    source: syntax.span.text().unwrap_or(""),
+    operands: plan.operands().map<EinsumPersistentOperand>(
+      (operand: EinsumPlanOperand<I>) => persistent_operand<I>(operand)
+    )
+  }
+}
+
+fn shape_json(shape: TensorShape) -> Json {
+  let mut items = Nil<Json>()
+  for dimension in shape.dimensions() {
+    items = items.append(
+      JsonNumber(dimension.to_u64().to_i64_checked().unwrap_or(0 - 1))
+    )
+  }
+  JsonArray(items)
+}
+
+fn operand_json(operand: EinsumPersistentOperand) -> Json {
+  let fields = [
+    JsonEntry("element", semantic_json.encode_type(operand.element)),
+    JsonEntry("shape", shape_json(operand.shape))
+  ]
+  JsonObject(list.from_slice(fields[..]))
+}
+
+--- Canonically encode a persistent einsum plan for `StagingSink`.
+pub(package) fn encode(plan: EinsumPersistentPlan) -> str {
+  let mut operands = Nil<Json>()
+  for operand in plan.operands { operands = operands.append(operand_json(operand)) }
+  let fields = [
+    JsonEntry("schema_version", JsonNumber(1)),
+    JsonEntry("source", JsonString(plan.source)),
+    JsonEntry("operands", JsonArray(operands))
+  ]
+  JsonObject(list.from_slice(fields[..])).stringify().unwrap_or("")
+}
+
+fn entry_count(entries: List<JsonEntry>, wanted: str) -> usize {
+  match entries {
+    Nil -> {
+      let zero: usize = 0
+      zero
+    }
+    Cons(entry, rest) -> if entry.key() == wanted {
+      let one: usize = 1
+      one + entry_count(rest, wanted)
+    } else { entry_count(rest, wanted) }
+  }
+}
+
+fn entry_value(entries: List<JsonEntry>, wanted: str) -> Json {
+  match entries {
+    Nil -> JsonObject(Nil<JsonEntry>())
+    Cons(entry, rest) -> if entry.key() == wanted { entry.value() }
+    else { entry_value(rest, wanted) }
+  }
+}
+
+fn dimensions(value: Json) -> Result<TensorDimensions, EinsumStagedPlanError> {
+  match value {
+    JsonArray(items) -> {
+      let mut values = Nil<usize>()
+      for item in items {
+        match item {
+          JsonNumber(value) if value >= 0 -> {
+            values = values.append(value.to_usize_checked().unwrap_or(0))
+            nil
+          }
+          _ -> return Err<TensorDimensions, EinsumStagedPlanError>(
+            EinsumStagedDocumentInvalid
+          )
+        }
+      }
+      Ok<TensorDimensions, EinsumStagedPlanError>(values)
+    }
+    _ -> Err<TensorDimensions, EinsumStagedPlanError>(EinsumStagedDocumentInvalid)
+  }
+}
+
+fn decode_operand(value: Json) -> Result<EinsumPersistentOperand, EinsumStagedPlanError> {
+  match value {
+    JsonObject(entries) -> if entry_count(entries, "element") != 1 or
+      entry_count(entries, "shape") != 1 {
+        Err<EinsumPersistentOperand, EinsumStagedPlanError>(EinsumStagedDocumentInvalid)
+      } else {
+        match semantic_json.decode_type(entry_value(entries, "element")) {
+          Err(_) -> Err<EinsumPersistentOperand, EinsumStagedPlanError>(
+            EinsumStagedDocumentInvalid
+          )
+          Ok(element) -> match dimensions(entry_value(entries, "shape")) {
+            Err(error) -> Err<EinsumPersistentOperand, EinsumStagedPlanError>(error)
+            Ok(values) -> match tensor.shape(values) {
+              Err(_) -> Err<EinsumPersistentOperand, EinsumStagedPlanError>(
+                EinsumStagedDocumentInvalid
+              )
+              Ok(shape) -> Ok<EinsumPersistentOperand, EinsumStagedPlanError>(
+                EinsumPersistentOperand { element: element, shape: shape }
+              )
+            }
+          }
+        }
+      }
+    _ -> Err<EinsumPersistentOperand, EinsumStagedPlanError>(EinsumStagedDocumentInvalid)
+  }
+}
+
+fn persistent_operands(
+  value: Json
+) -> Result<List<EinsumPersistentOperand>, EinsumStagedPlanError> {
+  match value {
+    JsonArray(items) -> {
+      let mut operands = Nil<EinsumPersistentOperand>()
+      for item in items {
+        match decode_operand(item) {
+          Err(error) -> return Err<List<EinsumPersistentOperand>, EinsumStagedPlanError>(error)
+          Ok(value) -> { operands = operands.append(value); nil }
+        }
+      }
+      Ok<List<EinsumPersistentOperand>, EinsumStagedPlanError>(operands)
+    }
+    _ -> Err<List<EinsumPersistentOperand>, EinsumStagedPlanError>(
+      EinsumStagedDocumentInvalid
+    )
+  }
+}
+
+fn persistent_document(value: Json) -> Result<EinsumPersistentPlan, EinsumStagedPlanError> {
+  match value {
+    JsonObject(entries) -> if entry_count(entries, "schema_version") != 1 or
+      entry_count(entries, "source") != 1 or entry_count(entries, "operands") != 1 {
+        Err<EinsumPersistentPlan, EinsumStagedPlanError>(EinsumStagedDocumentInvalid)
+      } else {
+        match entry_value(entries, "schema_version") {
+          JsonNumber(1) -> match entry_value(entries, "source") {
+            JsonString(source) -> match persistent_operands(entry_value(entries, "operands")) {
+              Err(error) -> Err<EinsumPersistentPlan, EinsumStagedPlanError>(error)
+              Ok(operands) -> Ok<EinsumPersistentPlan, EinsumStagedPlanError>(
+                EinsumPersistentPlan { source: source, operands: operands }
+              )
+            }
+            _ -> Err<EinsumPersistentPlan, EinsumStagedPlanError>(EinsumStagedDocumentInvalid)
+          }
+          JsonNumber(_) -> Err<EinsumPersistentPlan, EinsumStagedPlanError>(
+            EinsumStagedSchemaUnsupported
+          )
+          _ -> Err<EinsumPersistentPlan, EinsumStagedPlanError>(EinsumStagedDocumentInvalid)
+        }
+      }
+    _ -> Err<EinsumPersistentPlan, EinsumStagedPlanError>(EinsumStagedDocumentInvalid)
+  }
+}
+
+fn resolved(fact: SemanticTypeFact) -> ResolvedType<SemanticTypeFact> {
+  ResolvedType<SemanticTypeFact> { identity: fact, description: fact }
+}
+
+fn semantic_operand(operand: EinsumPersistentOperand) -> EinsumOperandSpec<SemanticTypeFact> {
+  EinsumOperandSpec<SemanticTypeFact> {
+    element: resolved(operand.element),
+    shape: operand.shape
+  }
+}
+
+fn semantic_primitive(identity: SemanticTypeFact) -> Result<str, TypeQueryError> {
+  match identity {
+    SemanticTypePrimitive(name) -> Ok<str, TypeQueryError>(name)
+    _ -> Err<str, TypeQueryError>(ForeignTypeIdentity)
+  }
+}
+
+fn check_with_semantic_types(
+  syntax: EinsumSyntax,
+  operands: List<EinsumPersistentOperand>
+) -[Diagnose]> CheckResult<EinsumPlan<SemanticTypeFact>> {
+  let specs = operands.map<EinsumOperandSpec<SemanticTypeFact>>(
+    (item: EinsumPersistentOperand) => semantic_operand(item)
+  )
+  handle check.checker<SemanticTypeFact>(specs).check(syntax) {
+    TypeCheck<SemanticTypeFact>.resolve(request) -> match request.qualifier {
+      Some(_) -> resume(Err<ResolvedType<SemanticTypeFact>, TypeQueryError>(TypeNotFound))
+      None -> if not request.arguments.is_empty() {
+        resume(
+          Err<ResolvedType<SemanticTypeFact>, TypeQueryError>(
+            TypeArgumentCount(0, request.arguments.len())
+          )
+        )
+      } else if request.name == "f64" {
+        resume(
+          Ok<ResolvedType<SemanticTypeFact>, TypeQueryError>(
+            resolved(SemanticTypePrimitive("f64"))
+          )
+        )
+      } else {
+        resume(Err<ResolvedType<SemanticTypeFact>, TypeQueryError>(TypeNotFound))
+      }
+    }
+    TypeCheck<SemanticTypeFact>.field(base, field) -> resume(
+      Err<ResolvedType<SemanticTypeFact>, TypeQueryError>(TypeFieldNotFound)
+    )
+    TypeCheck<SemanticTypeFact>.fields(base) -> resume(
+      Err<List<ResolvedField<SemanticTypeFact>>, TypeQueryError>(TypeFieldsUnavailable)
+    )
+    TypeCheck<SemanticTypeFact>.subtype(actual, expected) -> match (
+      semantic_primitive(actual),
+      semantic_primitive(expected)
+    ) {
+      (Ok(left), Ok(right)) -> resume(Ok<bool, TypeQueryError>(left == right))
+      _ -> resume(Err<bool, TypeQueryError>(ForeignTypeIdentity))
+    }
+  }
+}
+
+fn reconstruct(
+  persistent: EinsumPersistentPlan,
+  identity: DiagnosticSource
+) -> Result<EinsumPlan<SemanticTypeFact>, EinsumStagedPlanError> {
+  let source = Source { text: persistent.source, identity: identity }
+  let parsed = handle einsum.grammar().parse(source.all()) {
+    Diagnose.report(diagnostic) -> resume(0)
+  }
+  match parsed {
+    Parsed(syntax) -> {
+      let checked = handle check_with_semantic_types(syntax, persistent.operands) {
+        Diagnose.report(diagnostic) -> resume(0)
+      }
+      match checked {
+        Checked(plan) -> Ok<EinsumPlan<SemanticTypeFact>, EinsumStagedPlanError>(plan)
+        CheckRejected -> Err<EinsumPlan<SemanticTypeFact>, EinsumStagedPlanError>(
+          EinsumStagedPlanRejected
+        )
+      }
+    }
+    _ -> Err<EinsumPlan<SemanticTypeFact>, EinsumStagedPlanError>(EinsumStagedPlanRejected)
+  }
+}
+
+--- Decode and recheck a staged artifact into the package's sealed plan type.
+pub fn decode(
+  staged: Staged<EinsumGrammar>
+) -> Result<EinsumPlan<SemanticTypeFact>, EinsumStagedPlanError> {
+  match staged.artifact {
+    None -> Err<EinsumPlan<SemanticTypeFact>, EinsumStagedPlanError>(
+      EinsumStagedArtifactMissing
+    )
+    Some(artifact) -> match artifact.bytes.to_utf8() {
+      Err(_) -> Err<EinsumPlan<SemanticTypeFact>, EinsumStagedPlanError>(
+        EinsumStagedTextInvalid
+      )
+      Ok(text) -> match json.parse(text) {
+        Err(_) -> Err<EinsumPlan<SemanticTypeFact>, EinsumStagedPlanError>(
+          EinsumStagedDocumentInvalid
+        )
+        Ok(document) -> match persistent_document(document) {
+          Err(error) -> Err<EinsumPlan<SemanticTypeFact>, EinsumStagedPlanError>(error)
+          Ok(plan) -> reconstruct(plan, staged.source)
+        }
+      }
+    }
+  }
+}

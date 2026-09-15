@@ -1387,10 +1387,10 @@ assert_equals "doc_extra_arg_exits_usage" "$doc_extra_arg_exit" "2"
 assert_contains "doc_extra_arg_prints_usage" "$(<"$tmp_err")" "usage: weft doc PATH"
 
 version_out=$("$WEFT" --version 2> "$tmp_err")
-assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 7; targets macos-aarch64,linux-aarch64; sdk checkout .)"
+assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 8; targets macos-aarch64,linux-aarch64; sdk checkout .)"
 assert_equals "version_human_stderr_empty" "$(<"$tmp_err")" ""
 version_json=$("$WEFT" version --json 2> "$tmp_err")
-assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":7,"targets":["macos-aarch64","linux-aarch64"],"sdk":{"kind":"checkout","root":"."}}'
+assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":8,"targets":["macos-aarch64","linux-aarch64"],"sdk":{"kind":"checkout","root":"."}}'
 assert_equals "version_json_stderr_empty" "$(<"$tmp_err")" ""
 
 target_list=$("$WEFT" target list 2> "$tmp_err")
@@ -4467,9 +4467,9 @@ printf '{"package":"app","dependencies":{"math":"deps/math"}}\n' > "$tmp_pkg_dir
 # generics at the declaration, so the checker itself decides and names the
 # missing trait; nothing is constructed or rescanned.
 sdk_audit=$("$WEFT" pkg audit 2>/dev/null)
-assert_contains "pkg_audit_reports_sdk_sql_grammar_conformance" "$sdk_audit" '{"export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/sql/tooling","status":"ok","diagnostics":[]},"staging":null}'
-assert_contains "pkg_audit_reports_sdk_einsum_grammar_conformance" "$sdk_audit" '{"export":"einsum","module":"stdlib/grammar/einsum","declaration":"EinsumGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/einsum/tooling","status":"ok","diagnostics":[]},"staging":null}'
-assert_contains "pkg_audit_reports_sdk_alias_grammar_conformance" "$sdk_audit" '{"export":"mini_sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/sql/tooling","status":"ok","diagnostics":[]},"staging":null}'
+assert_contains "pkg_audit_reports_sdk_sql_grammar_conformance" "$sdk_audit" '{"export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/sql/tooling","status":"ok","diagnostics":[]},"staging":{"module":"stdlib/grammar/sql/tooling","status":"ok","diagnostics":[]}}'
+assert_contains "pkg_audit_reports_sdk_einsum_grammar_conformance" "$sdk_audit" '{"export":"einsum","module":"stdlib/grammar/einsum","declaration":"EinsumGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/einsum/tooling","status":"ok","diagnostics":[]},"staging":{"module":"stdlib/grammar/einsum/tooling","status":"ok","diagnostics":[]}}'
+assert_contains "pkg_audit_reports_sdk_alias_grammar_conformance" "$sdk_audit" '{"export":"mini_sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"stdlib/grammar/sql/tooling","status":"ok","diagnostics":[]},"staging":{"module":"stdlib/grammar/sql/tooling","status":"ok","diagnostics":[]}}'
 
 mkdir -p "$tmp_pkg_dir/audit_grammar/grammars"
 cp module_fixtures/plain_grammar.weft "$tmp_pkg_dir/audit_grammar/grammars/words.weft"
@@ -4555,11 +4555,11 @@ grammar_audit=$(cd "$tmp_pkg_dir/audit_grammar" && "$WEFT_ABS" pkg audit 2>/dev/
 grammar_audit_exit=$?
 set -e
 assert_equals "pkg_audit_fails_when_a_grammar_export_does_not_conform" "$grammar_audit_exit" "1"
-assert_contains "pkg_audit_names_missing_tooling_conformance" "$grammar_audit" '{"export":"words","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/words","status":"failed","diagnostics":["type `WordGrammar` does not implement `GrammarTooling`"]},"staging":null}'
+assert_contains "pkg_audit_names_missing_tooling_conformance" "$grammar_audit" '{"export":"words","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/words","status":"failed","diagnostics":["type `WordGrammar` does not implement `GrammarTooling`"]},"staging":{"module":"grammars/words","status":"failed","diagnostics":["type `WordGrammar` does not implement `GrammarStaging`"]}}'
 assert_contains "pkg_audit_names_missing_grammar_conformance" "$grammar_audit" '{"export":"plain","module":"grammars/plain","declaration":"Run","grammar":{"status":"failed","diagnostics":["type `Run` does not implement `Grammar`"]},"tooling":null,"staging":null}'
-assert_contains "pkg_audit_names_unavailable_tooling_module" "$grammar_audit" '{"export":"lost","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/no_such_module","status":"failed","diagnostics":["imported module source is unavailable"]},"staging":null}'
-assert_contains "pkg_audit_accepts_parse_only_grammar_export" "$grammar_audit" '{"export":"fine","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":null,"staging":null}'
-assert_contains "pkg_audit_rejects_tooling_syntax_that_disagrees_with_the_grammar" "$grammar_audit" '{"export":"mismatch","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/mismatch_tooling","status":"failed","diagnostics":["argument type mismatch: expected `OtherSyntax`, found `WordSyntax`"]},"staging":null}'
+assert_contains "pkg_audit_names_unavailable_tooling_module" "$grammar_audit" '{"export":"lost","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/no_such_module","status":"failed","diagnostics":["imported module source is unavailable"]},"staging":{"module":"grammars/no_such_module","status":"failed","diagnostics":["imported module source is unavailable"]}}'
+assert_contains "pkg_audit_rejects_runtime_export_without_tooling" "$grammar_audit" '{"export":"fine","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":null,"staging":{"module":null,"status":"failed","diagnostics":["typed-plan execution requires a tooling module with GrammarStaging"]}}'
+assert_contains "pkg_audit_rejects_tooling_syntax_that_disagrees_with_the_grammar" "$grammar_audit" '{"export":"mismatch","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/mismatch_tooling","status":"failed","diagnostics":["argument type mismatch: expected `OtherSyntax`, found `WordSyntax`"]},"staging":{"module":"grammars/mismatch_tooling","status":"failed","diagnostics":["type `WordGrammar` does not implement `GrammarStaging`"]}}'
 assert_contains "pkg_audit_reports_staging_conformance_of_a_typed_plan_export" "$grammar_audit" '{"export":"assignments","module":"grammars/assignments","declaration":"AssignmentGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/assignments","status":"ok","diagnostics":[]},"staging":{"module":"grammars/assignments","status":"ok","diagnostics":[]}}'
 assert_contains "pkg_audit_rejects_staging_syntax_that_disagrees_with_the_grammar" "$grammar_audit" '{"export":"unstaged","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/words_staging","status":"ok","diagnostics":[]},"staging":{"module":"grammars/words_staging","status":"failed","diagnostics":["argument type mismatch: expected `OtherSyntax`, found `WordSyntax`"]}}'
 assert_contains "pkg_audit_names_missing_staging_conformance" "$grammar_audit" '{"export":"unstageable","module":"grammars/words","declaration":"WordGrammar","grammar":{"status":"ok","diagnostics":[]},"tooling":{"module":"grammars/mismatch_tooling","status":"failed","diagnostics":["argument type mismatch: expected `OtherSyntax`, found `WordSyntax`"]},"staging":{"module":"grammars/mismatch_tooling","status":"failed","diagnostics":["type `WordGrammar` does not implement `GrammarStaging`"]}}'
@@ -4577,7 +4577,7 @@ assert_contains "mcp_grammar_diagnostics_checks_through_a_staging_driver" "$gram
 # site's owning source: the call spelling and the literal with its delimiters.
 mkdir -p "$tmp_pkg_dir/staged_pkg/grammars"
 cp module_fixtures/toy_grammar.weft "$tmp_pkg_dir/staged_pkg/grammars/assignments.weft"
-printf '{"package":"stagedpkg","manifest_version":1,"version":"0.4.0","weft":"0.1","exports":{"grammars":{"assignments":{"module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"typed_plan","tooling":"grammars/assignments"}}}}\n' > "$tmp_pkg_dir/staged_pkg/weft.pkg"
+printf '{"package":"stagedpkg","manifest_version":1,"version":"0.4.0","weft":"0.1","exports":{"grammars":{"assignments":{"module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"typed_plan","tooling":"grammars/assignments"},"files":{"module":"grammars/assignments","declaration":"FileAssignmentGrammar","execution":"typed_plan","tooling":"grammars/assignments"}}}}\n' > "$tmp_pkg_dir/staged_pkg/weft.pkg"
 printf '%s' 'use grammars/assignments.{AssignmentGrammar}
 use stdlib/grammar/staging.{embed}
 type settings { count: i64, name: str }
@@ -4586,7 +4586,7 @@ fn main() -> i64 { let staged = embed<AssignmentGrammar>(r#"count = 3"#); match 
 (cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" build staged.weft -o staged_product --artifact-facts staged.facts.json > "$tmp_out" 2> "$tmp_err")
 assert_equals "build_stages_a_typed_plan_site_stderr_empty" "$(<"$tmp_err")" ""
 staged_facts=$(/bin/cat "$tmp_pkg_dir/staged_pkg/staged.facts.json")
-assert_contains "build_records_a_staged_site" "$staged_facts" '"staging_sites":[{"package":"stagedpkg","version":"0.4.0","export":"assignments","module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"typed_plan","capability":"typed_plan","site":{"start":152,"end":157},"source":{"start":177,"end":191},"staged":{"outcome":"staged","driver":"target/'
+assert_contains "build_records_a_staged_site" "$staged_facts" '"staging_sites":[{"package":"stagedpkg","version":"0.4.0","export":"assignments","module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"typed_plan","capability":"typed_plan","site":{"start":152,"end":157},"source":{"start":177,"end":191},"context":{"kind":"host"},"staged":{"outcome":"staged","driver":"target/'
 assert_contains "build_records_the_verified_artifact" "$staged_facts" '"content":"sha256:11923d3439a10fc9d43ffcc503dde655a21d3182cc30bf656f7abf297cdbd33f","size":27,"budget":4096,"host_transcript":"sha256:'
 assert_contains "build_records_the_package_staging_facts" "$staged_facts" '"facts":{"key":"count","literal":"integer"}}}]'
 if [ -s "$tmp_pkg_dir/staged_pkg/target/$(basename "$(ls -d "$tmp_pkg_dir"/staged_pkg/target/*/ | head -1)")/grammar-artifacts/stagedpkg-assignments/11923d3439a10fc9d43ffcc503dde655a21d3182cc30bf656f7abf297cdbd33f" ]; then
@@ -4607,6 +4607,39 @@ fi
 # size and exits accordingly.
 run_binary_guarded "$tmp_pkg_dir/staged_pkg/staged_product"
 echo "  ok staged_product_carries_the_artifact"
+# File-context staging is a distinct blessed primitive, not an inference from
+# a grammar name. The selected path is sent through the neutral protocol,
+# observed as a compile-time input and included in cache validation.
+printf 'schema-v1' > "$tmp_pkg_dir/staged_pkg/context.txt"
+printf '%s' 'use grammars/assignments.{FileAssignmentGrammar}
+use stdlib/bytes
+use stdlib/grammar/staging.{embed_with_file}
+use stdlib/result
+fn main() -> i64 {
+  let staged = embed_with_file<FileAssignmentGrammar>(r#"count = 3"#, "context.txt")
+  match staged.artifact {
+    Some(artifact) -> if artifact.bytes.to_utf8().unwrap_or("") == "count\nschema-v1" { 0 } else { 3 }
+    None -> 4
+  }
+}
+' > "$tmp_pkg_dir/staged_pkg/staged_file.weft"
+(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" build staged_file.weft -o staged_file_product --artifact-facts staged_file.facts.json > "$tmp_out" 2> "$tmp_err")
+assert_equals "build_stages_a_file_context_site_stderr_empty" "$(<"$tmp_err")" ""
+staged_file_facts=$(/bin/cat "$tmp_pkg_dir/staged_pkg/staged_file.facts.json")
+assert_contains "build_records_the_file_context" "$staged_file_facts" '"context":{"kind":"file","path_bytes":[99,111,110,116,101,120,116,46,116,120,116],"limit":"1048576"}'
+assert_contains "build_observes_the_file_context" "$staged_file_facts" '"compile_time_inputs":[{"path_bytes":[99,111,110,116,101,120,116,46,116,120,116],"limit":"1048576","size":"9","content":"sha256:'
+run_binary_guarded "$tmp_pkg_dir/staged_pkg/staged_file_product"
+echo "  ok staged_file_product_carries_the_context_checked_artifact"
+staged_file_driver=$(ls "$tmp_pkg_dir"/staged_pkg/target/*/grammar-tools/stagedpkg-files-* 2>/dev/null | grep -v '\.weft$\|\.stamp\.json$' | head -1)
+chmod -x "$staged_file_driver"
+printf 'schema-v2' > "$tmp_pkg_dir/staged_pkg/context.txt"
+set +e
+changed_context=$(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" build staged_file.weft -o staged_file_changed 2>&1)
+changed_context_exit=$?
+set -e
+assert_equals "changed_file_context_invalidates_the_stage_cache_exit" "$changed_context_exit" "1"
+assert_contains "changed_file_context_reruns_the_driver" "$changed_context" 'grammar tool driver could not be started'
+chmod +x "$staged_file_driver"
 # Cached reuse is accepted only after replaying every host-type query against
 # the current checked module and revalidating the stored plan. Making the
 # driver non-executable proves a hit never starts it; changing a queried host
@@ -4806,23 +4839,118 @@ ambiguous_check_exit=$?
 set -e
 assert_equals "check_rejects_a_site_whose_export_is_ambiguous_exit" "$ambiguous_check_exit" "1"
 assert_contains "check_rejects_a_site_whose_export_is_ambiguous" "$ambiguous_check" 'error[E1009]: staging site: `AssignmentGrammar` is exported as `assignments` and `checked_only` with different tooling or execution, so no one driver applies'
-# An SDK export that only validates today is checked through its driver and
-# lowered without an artifact; the product runs.
+# The first-party grammars are ordinary runtime exports: their package-owned
+# staging conformances produce stable plans, their public decoders reconstruct
+# sealed checked plans, and execution still crosses the public Lower effect.
 printf '%s' 'use stdlib/grammar/sql.{SqlGrammar}
+use stdlib/grammar/sql/execute as execution
+use stdlib/grammar/sql/execute.{SqlInputRow, SqlIntegerValue, SqlOutputRecordRow}
+use stdlib/grammar/sql/staged as staged_sql
 use stdlib/grammar/staging.{embed}
-type users { id: i64, name: str, active: bool }
-fn main() -> i64 { let staged = embed<SqlGrammar>(r#"select id from users"#); match staged.artifact { Some(_) -> 5, None -> 0 } }
+use stdlib/list as list
+use stdlib/list.{Cons, Nil}
+use stdlib/result.{Ok, Err}
+type users { id: i64 }
+fn main() -> i64 {
+  let staged = embed<SqlGrammar>(r#"select id + 2 from users where id > 10"#)
+  match staged_sql.decode(staged) {
+    Err(_) -> 1
+    Ok(plan) -> {
+      let first = [SqlIntegerValue(40)]
+      let second = [SqlIntegerValue(5)]
+      let rows = [
+        SqlInputRow { values: list.from_slice(first[..]) },
+        SqlInputRow { values: list.from_slice(second[..]) }
+      ]
+      let inputs = [execution.input(plan.source(), list.from_slice(rows[..]))]
+      let result = execution.with_reference(
+        () => execution.lower(plan, list.from_slice(inputs[..]))
+      )
+      match result {
+        Ok(value) -> match value.rows {
+          Cons(SqlOutputRecordRow(Cons(SqlIntegerValue(answer), Nil)), Nil) -> if answer == 42 {
+            0
+          } else { 2 }
+          _ -> 3
+        }
+        Err(_) -> 4
+      }
+    }
+  }
+}
 ' > "$tmp_src"
 "$WEFT" build "$tmp_src" -o "$tmp_bin" --artifact-facts "$tmp_bin.facts.json" > "$tmp_out" 2> "$tmp_err"
-assert_equals "build_validates_an_sdk_site_stderr_empty" "$(<"$tmp_err")" ""
+assert_equals "build_stages_the_sdk_sql_site_stderr_empty" "$(<"$tmp_err")" ""
 sdk_staged_facts=$(/bin/cat "$tmp_bin.facts.json")
-assert_contains "build_records_a_validated_sdk_site" "$sdk_staged_facts" '"staging_sites":[{"package":"weft","version":"0.1.0","export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"runtime","capability":"validate_only","site":{"start":151,"end":156},"source":{"start":169,"end":194},"staged":{"outcome":"validated","host_transcript":"sha256:'
+assert_contains "build_records_a_staged_sdk_sql_site" "$sdk_staged_facts" '"package":"weft","version":"0.1.0","export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"runtime","capability":"typed_plan"'
+assert_contains "build_records_the_sdk_sql_artifact" "$sdk_staged_facts" '"context":{"kind":"host"},"staged":{"outcome":"staged","driver":"target/'
+assert_contains "build_records_the_sdk_sql_plan_facts" "$sdk_staged_facts" '"facts":{"schema_version":1,"sources":1}'
 rm -f "$tmp_bin.facts.json"
 chmod +x "$tmp_bin"
 run_binary_guarded "$tmp_bin"
-echo "  ok validated_product_carries_no_artifact"
+echo "  ok staged_sql_product_decodes_and_executes_through_lower"
 "$WEFT" compile "$tmp_src" > "$tmp_bin" 2> "$tmp_err"
 assert_equals "compile_stages_a_site_stderr_empty" "$(<"$tmp_err")" ""
+
+printf '%s' 'use stdlib/grammar/einsum.{EinsumGrammar}
+use stdlib/grammar/einsum/execute as execution
+use stdlib/grammar/einsum/staged as staged_einsum
+use stdlib/grammar/staging.{embed_with_file}
+use stdlib/list as list
+use stdlib/option
+use stdlib/result
+use stdlib/result.{Ok, Err}
+use stdlib/tensor as tensor
+fn main() -> i64 {
+  let staged = embed_with_file<EinsumGrammar>(
+    r#"ij,jk->ik"#,
+    "test/fixtures/comptime_einsum_context_v1.json"
+  )
+  match staged_einsum.decode(staged) {
+    Err(_) -> 1
+    Ok(plan) -> {
+      let left_shape: [usize; 2] = [2, 3]
+      let right_shape: [usize; 2] = [3, 4]
+      let left_values: [f64; 6] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      let right_values: [f64; 12] = [
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0
+      ]
+      let inputs = [
+        tensor.from_slice<f64>(
+          tensor.shape_from_slice(left_shape[..]).unwrap(),
+          left_values[..]
+        ).unwrap(),
+        tensor.from_slice<f64>(
+          tensor.shape_from_slice(right_shape[..]).unwrap(),
+          right_values[..]
+        ).unwrap()
+      ]
+      let result = execution.with_reference(
+        () => execution.lower(plan, list.from_slice(inputs[..]))
+      )
+      match result {
+        Ok(output) -> if output.len() == __i64_to_usize(8) and
+          output.get_flat(0).unwrap_or(0.0) == 3.0 { 0 } else { 2 }
+        Err(_) -> 3
+      }
+    }
+  }
+}
+' > "$tmp_src"
+"$WEFT" build "$tmp_src" -o "$tmp_bin" --artifact-facts "$tmp_bin.facts.json" > "$tmp_out" 2> "$tmp_err"
+assert_equals "build_stages_the_sdk_einsum_site_stderr_empty" "$(<"$tmp_err")" ""
+sdk_einsum_facts=$(/bin/cat "$tmp_bin.facts.json")
+assert_contains "build_records_a_staged_sdk_einsum_site" "$sdk_einsum_facts" '"package":"weft","version":"0.1.0","export":"einsum","module":"stdlib/grammar/einsum","declaration":"EinsumGrammar","execution":"runtime","capability":"typed_plan"'
+assert_contains "build_records_the_sdk_einsum_context" "$sdk_einsum_facts" '"context":{"kind":"file","path_bytes":[116,101,115,116,47,102,105,120,116,117,114,101,115,47,99,111,109,112,116,105,109,101,95,101,105,110,115,117,109,95,99,111,110,116,101,120,116,95,118,49,46,106,115,111,110],"limit":"1048576"}'
+assert_contains "build_observes_the_sdk_einsum_context" "$sdk_einsum_facts" '"compile_time_inputs":[{"path_bytes":[116,101,115,116,47,102,105,120,116,117,114,101,115,47,99,111,109,112,116,105,109,101,95,101,105,110,115,117,109,95,99,111,110,116,101,120,116,95,118,49,46,106,115,111,110],"limit":"1048576","size":"63","content":"sha256:68c37c7276391ae22886f7d9c952c276338a7d60ebedeec5ff712cdd88c56f5a"}]'
+assert_contains "build_records_the_sdk_einsum_plan_facts" "$sdk_einsum_facts" '"facts":{"schema_version":1,"operands":2}'
+rm -f "$tmp_bin.facts.json"
+chmod +x "$tmp_bin"
+run_binary_guarded "$tmp_bin"
+echo "  ok staged_einsum_product_decodes_and_executes_through_lower"
+
 printf 'fn main() -> i64 { 0 }\n' > "$tmp_src"
 "$WEFT" build "$tmp_src" -o "$tmp_bin" --artifact-facts "$tmp_bin.facts.json" > "$tmp_out" 2> "$tmp_err"
 assert_contains "build_renders_empty_staging_sites" "$(/bin/cat "$tmp_bin.facts.json")" '"staging_sites":[]'
@@ -4834,6 +4962,13 @@ staged_check_exit=$?
 set -e
 assert_equals "check_rejects_escaped_staging_source_exit" "$staged_check_exit" "1"
 assert_contains "check_rejects_escaped_staging_source" "$staged_check" 'error[E1010]: staging site: the source must be a raw string literal or a plain string literal without escapes'
+printf 'use stdlib/grammar/sql.{SqlGrammar}\nuse stdlib/grammar/staging.{embed_with_file}\nfn main() -> i64 { let path = "schema.json"; let staged = embed_with_file<SqlGrammar>(r#"select id from users"#, path); 0 }\n' > "$tmp_src"
+set +e
+staged_context_check=$("$WEFT" check "$tmp_src" 2>&1)
+staged_context_check_exit=$?
+set -e
+assert_equals "check_rejects_computed_staging_context_exit" "$staged_context_check_exit" "1"
+assert_contains "check_rejects_computed_staging_context" "$staged_context_check" 'error[E1010]: staging site: the context path must be a raw string literal or a plain string literal without escapes'
 mcp_staged_out=$(printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{"source":"use stdlib/grammar/sql.{SqlGrammar}\nuse stdlib/grammar/staging.{embed}\nfn main() -> i64 { let t = \"x\"\n let staged = embed<SqlGrammar>(i\"select {t}\"); 0 }"}}}' | "$WEFT" mcp 2>&1)
 assert_contains "mcp_diagnostics_reports_staging_site_literal_code" "$mcp_staged_out" '"code":"E1010"'
 grammar_stage_product=$(ls "$tmp_pkg_dir"/audit_grammar/target/*/grammar-tools/auditpkg-assignments-*.weft 2>/dev/null | head -1)
@@ -5656,7 +5791,7 @@ else
   exit 1
 fi
 native_forward_facts=$(/bin/cat "$tmp_pkg_trust_dir/native_artifacts/native_forward.facts.json")
-assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":7'
+assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":8'
 assert_contains "package_native_artifact_facts_name_target" "$native_forward_facts" '"target":"macos-aarch64"'
 assert_contains "package_native_artifact_facts_name_minimum_platform" "$native_forward_facts" '"minimum_platform_abi":{"platform":"macos","major":11,"minor":0,"patch":0}'
 assert_contains "package_native_artifact_facts_claim_standalone" "$native_forward_facts" '"standalone":true'

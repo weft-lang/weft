@@ -1,0 +1,478 @@
+-- Persistent typed plans for staged SQL sources.
+--
+-- A staged artifact retains the query plus the semantic host catalog the
+-- checker actually accepted. Decoding installs that catalog as a local
+-- `TypeCheck` interpretation and reruns the public parser and checker, so the
+-- sealed plan constructor remains the only route to executable plan values.
+
+use stdlib/bytes
+use stdlib/diagnostic/schema.{Diagnose, DiagnosticSource}
+use stdlib/grammar.{CheckResult, Checked, CheckRejected, Parsed}
+use stdlib/grammar/sql as sql
+use stdlib/grammar/sql.{SqlGrammar}
+use stdlib/grammar/sql/check as check
+use stdlib/grammar/sql/plan.{*}
+use stdlib/grammar/sql/syntax.{SqlSyntax}
+use stdlib/grammar/staging.{Staged}
+use stdlib/json as json
+use stdlib/json.{Json, JsonArray, JsonEntry, JsonNumber, JsonObject, JsonString}
+use stdlib/list as list
+use stdlib/list.{List, Cons, Nil}
+use stdlib/num
+use stdlib/option
+use stdlib/option.{Option, Some, None}
+use stdlib/result
+use stdlib/result.{Result, Ok, Err}
+use stdlib/semantic_type.{SemanticTypeFact, SemanticTypePrimitive}
+use stdlib/semantic_type/json as semantic_json
+use stdlib/source.{Source}
+use stdlib/typecheck.{*}
+
+--- One stable field in a staged SQL source row.
+pub type SqlPersistentField {
+  selector: TypeField,
+  value: SemanticTypeFact
+}
+
+--- One table identity and ordered row shape accepted by the checker.
+pub type SqlPersistentSource {
+  name: str,
+  row: SemanticTypeFact,
+  fields: List<SqlPersistentField>
+}
+
+--- The query and semantic host catalog sufficient to reconstruct its plan.
+pub type SqlPersistentPlan {
+  source: str,
+  sources: List<SqlPersistentSource>
+}
+
+--- Scoped identities created while a staged SQL plan is reconstructed.
+pub type SqlStagedIdentity {
+  SqlStagedTableIdentity(str),
+  SqlStagedValueIdentity(SemanticTypeFact)
+}
+
+--- Why staged SQL bytes could not be reconstructed as a checked plan.
+pub type SqlStagedPlanError {
+  SqlStagedArtifactMissing,
+  SqlStagedTextInvalid,
+  SqlStagedDocumentInvalid,
+  SqlStagedSchemaUnsupported,
+  SqlStagedPlanRejected
+}
+
+fn persistent_field<I>(field: ResolvedField<I>) -> SqlPersistentField {
+  SqlPersistentField { selector: field.selector, value: field.value.description }
+}
+
+fn persistent_source<I>(source: SqlPlanSource<I>) -> SqlPersistentSource {
+  SqlPersistentSource {
+    name: source.table.text,
+    row: source.row.description,
+    fields: source.fields.map<SqlPersistentField>(
+      (field: ResolvedField<I>) => persistent_field<I>(field)
+    )
+  }
+}
+
+fn checked_sources<I>(plan: SqlPlan<I>) -> List<SqlPlanSource<I>> {
+  let mut sources = Nil<SqlPlanSource<I>>().append(plan.source())
+  for join in plan.joins() { sources = sources.append(join.source) }
+  sources
+}
+
+--- Remove handler-scoped identities from a checked plan while retaining every
+--- source row and field type as stable semantic facts.
+pub(package) fn persistent<I>(syntax: SqlSyntax, plan: SqlPlan<I>) -> SqlPersistentPlan {
+  SqlPersistentPlan {
+    source: syntax.span.text().unwrap_or(""),
+    sources: checked_sources(plan).map<SqlPersistentSource>(
+      (source: SqlPlanSource<I>) => persistent_source<I>(source)
+    )
+  }
+}
+
+fn selector_json(selector: TypeField) -> Json {
+  match selector {
+    NamedTypeField(name) -> {
+      let fields = [
+        JsonEntry("kind", JsonString("named")),
+        JsonEntry("name", JsonString(name))
+      ]
+      JsonObject(list.from_slice(fields[..]))
+    }
+    PositionalTypeField(position) -> {
+      let fields = [
+        JsonEntry("kind", JsonString("positional")),
+        JsonEntry(
+          "position",
+          JsonNumber(position.to_u64().to_i64_checked().unwrap_or(0 - 1))
+        )
+      ]
+      JsonObject(list.from_slice(fields[..]))
+    }
+  }
+}
+
+fn field_json(field: SqlPersistentField) -> Json {
+  let fields = [
+    JsonEntry("selector", selector_json(field.selector)),
+    JsonEntry("value", semantic_json.encode_type(field.value))
+  ]
+  JsonObject(list.from_slice(fields[..]))
+}
+
+fn source_json(source: SqlPersistentSource) -> Json {
+  let mut field_items = Nil<Json>()
+  for field in source.fields { field_items = field_items.append(field_json(field)) }
+  let fields = [
+    JsonEntry("name", JsonString(source.name)),
+    JsonEntry("row", semantic_json.encode_type(source.row)),
+    JsonEntry("fields", JsonArray(field_items))
+  ]
+  JsonObject(list.from_slice(fields[..]))
+}
+
+--- Canonically encode a persistent SQL plan for `StagingSink`.
+pub(package) fn encode(plan: SqlPersistentPlan) -> str {
+  let mut sources = Nil<Json>()
+  for source in plan.sources { sources = sources.append(source_json(source)) }
+  let fields = [
+    JsonEntry("schema_version", JsonNumber(1)),
+    JsonEntry("source", JsonString(plan.source)),
+    JsonEntry("sources", JsonArray(sources))
+  ]
+  JsonObject(list.from_slice(fields[..])).stringify().unwrap_or("")
+}
+
+fn entry_count(entries: List<JsonEntry>, wanted: str) -> usize {
+  match entries {
+    Nil -> {
+      let zero: usize = 0
+      zero
+    }
+    Cons(entry, rest) -> if entry.key() == wanted {
+      let one: usize = 1
+      one + entry_count(rest, wanted)
+    } else { entry_count(rest, wanted) }
+  }
+}
+
+fn entry_value(entries: List<JsonEntry>, wanted: str) -> Json {
+  match entries {
+    Nil -> JsonObject(Nil<JsonEntry>())
+    Cons(entry, rest) -> if entry.key() == wanted { entry.value() }
+    else { entry_value(rest, wanted) }
+  }
+}
+
+fn decode_selector(value: Json) -> Result<TypeField, SqlStagedPlanError> {
+  match value {
+    JsonObject(entries) -> if entry_count(entries, "kind") != 1 {
+      Err<TypeField, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+    } else {
+      match entry_value(entries, "kind") {
+        JsonString(kind) if kind == "named" -> if entry_count(entries, "name") != 1 {
+          Err<TypeField, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+        } else {
+          match entry_value(entries, "name") {
+            JsonString(name) -> Ok<TypeField, SqlStagedPlanError>(NamedTypeField(name))
+            _ -> Err<TypeField, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+          }
+        }
+        JsonString(kind) if kind == "positional" -> if entry_count(
+          entries,
+          "position"
+        ) != 1 {
+          Err<TypeField, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+        } else {
+          match entry_value(entries, "position") {
+            JsonNumber(position) if position >= 0 -> Ok<TypeField, SqlStagedPlanError>(
+              PositionalTypeField(position.to_usize_checked().unwrap_or(0))
+            )
+            _ -> Err<TypeField, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+          }
+        }
+        _ -> Err<TypeField, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+      }
+    }
+    _ -> Err<TypeField, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+  }
+}
+
+fn decode_field(value: Json) -> Result<SqlPersistentField, SqlStagedPlanError> {
+  match value {
+    JsonObject(entries) -> if entry_count(entries, "selector") != 1 or
+      entry_count(entries, "value") != 1 {
+        Err<SqlPersistentField, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+      } else {
+        match decode_selector(entry_value(entries, "selector")) {
+          Err(error) -> Err<SqlPersistentField, SqlStagedPlanError>(error)
+          Ok(selector) -> match semantic_json.decode_type(entry_value(entries, "value")) {
+            Err(_) -> Err<SqlPersistentField, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+            Ok(value) -> Ok<SqlPersistentField, SqlStagedPlanError>(
+              SqlPersistentField { selector: selector, value: value }
+            )
+          }
+        }
+      }
+    _ -> Err<SqlPersistentField, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+  }
+}
+
+fn decode_fields(value: Json) -> Result<List<SqlPersistentField>, SqlStagedPlanError> {
+  match value {
+    JsonArray(items) -> {
+      let mut fields = Nil<SqlPersistentField>()
+      for item in items {
+        match decode_field(item) {
+          Err(error) -> return Err<List<SqlPersistentField>, SqlStagedPlanError>(error)
+          Ok(field) -> { fields = fields.append(field); nil }
+        }
+      }
+      Ok<List<SqlPersistentField>, SqlStagedPlanError>(fields)
+    }
+    _ -> Err<List<SqlPersistentField>, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+  }
+}
+
+fn decode_source(value: Json) -> Result<SqlPersistentSource, SqlStagedPlanError> {
+  match value {
+    JsonObject(entries) -> if entry_count(entries, "name") != 1 or
+      entry_count(entries, "row") != 1 or entry_count(entries, "fields") != 1 {
+        Err<SqlPersistentSource, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+      } else {
+        match entry_value(entries, "name") {
+          JsonString(name) -> match semantic_json.decode_type(entry_value(entries, "row")) {
+            Err(_) -> Err<SqlPersistentSource, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+            Ok(row) -> match decode_fields(entry_value(entries, "fields")) {
+              Err(error) -> Err<SqlPersistentSource, SqlStagedPlanError>(error)
+              Ok(fields) -> Ok<SqlPersistentSource, SqlStagedPlanError>(
+                SqlPersistentSource { name: name, row: row, fields: fields }
+              )
+            }
+          }
+          _ -> Err<SqlPersistentSource, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+        }
+      }
+    _ -> Err<SqlPersistentSource, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+  }
+}
+
+fn decode_sources(value: Json) -> Result<List<SqlPersistentSource>, SqlStagedPlanError> {
+  match value {
+    JsonArray(items) -> {
+      let mut sources = Nil<SqlPersistentSource>()
+      for item in items {
+        match decode_source(item) {
+          Err(error) -> return Err<List<SqlPersistentSource>, SqlStagedPlanError>(error)
+          Ok(source) -> { sources = sources.append(source); nil }
+        }
+      }
+      Ok<List<SqlPersistentSource>, SqlStagedPlanError>(sources)
+    }
+    _ -> Err<List<SqlPersistentSource>, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+  }
+}
+
+fn persistent_document(value: Json) -> Result<SqlPersistentPlan, SqlStagedPlanError> {
+  match value {
+    JsonObject(entries) -> if entry_count(entries, "schema_version") != 1 or
+      entry_count(entries, "source") != 1 or entry_count(entries, "sources") != 1 {
+        Err<SqlPersistentPlan, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+      } else {
+        match entry_value(entries, "schema_version") {
+          JsonNumber(1) -> match entry_value(entries, "source") {
+            JsonString(source) -> match decode_sources(entry_value(entries, "sources")) {
+              Err(error) -> Err<SqlPersistentPlan, SqlStagedPlanError>(error)
+              Ok(sources) -> Ok<SqlPersistentPlan, SqlStagedPlanError>(
+                SqlPersistentPlan { source: source, sources: sources }
+              )
+            }
+            _ -> Err<SqlPersistentPlan, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+          }
+          JsonNumber(_) -> Err<SqlPersistentPlan, SqlStagedPlanError>(
+            SqlStagedSchemaUnsupported
+          )
+          _ -> Err<SqlPersistentPlan, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+        }
+      }
+    _ -> Err<SqlPersistentPlan, SqlStagedPlanError>(SqlStagedDocumentInvalid)
+  }
+}
+
+fn find_source(
+  sources: List<SqlPersistentSource>,
+  name: str
+) -> Option<SqlPersistentSource> {
+  match sources {
+    Nil -> None<SqlPersistentSource>()
+    Cons(source, rest) -> if source.name == name { Some(source) }
+    else { find_source(rest, name) }
+  }
+}
+
+fn type_field_same(left: TypeField, right: TypeField) -> bool {
+  match (left, right) {
+    (NamedTypeField(a), NamedTypeField(b)) -> a == b
+    (PositionalTypeField(a), PositionalTypeField(b)) -> a == b
+    _ -> false
+  }
+}
+
+fn find_field(
+  fields: List<SqlPersistentField>,
+  selector: TypeField
+) -> Option<SqlPersistentField> {
+  match fields {
+    Nil -> None<SqlPersistentField>()
+    Cons(field, rest) -> if type_field_same(field.selector, selector) { Some(field) }
+    else { find_field(rest, selector) }
+  }
+}
+
+fn semantic_same(left: SemanticTypeFact, right: SemanticTypeFact) -> bool {
+  match (
+    semantic_json.encode_type(left).stringify(),
+    semantic_json.encode_type(right).stringify()
+  ) {
+    (Ok(a), Ok(b)) -> a == b
+    _ -> false
+  }
+}
+
+fn resolved_value(fact: SemanticTypeFact) -> ResolvedType<SqlStagedIdentity> {
+  ResolvedType<SqlStagedIdentity> {
+    identity: SqlStagedValueIdentity(fact),
+    description: fact
+  }
+}
+
+fn resolved_table(source: SqlPersistentSource) -> ResolvedType<SqlStagedIdentity> {
+  ResolvedType<SqlStagedIdentity> {
+    identity: SqlStagedTableIdentity(source.name),
+    description: source.row
+  }
+}
+
+fn resolved_fields(source: SqlPersistentSource) -> List<ResolvedField<SqlStagedIdentity>> {
+  source.fields.map<ResolvedField<SqlStagedIdentity>>(
+    (field: SqlPersistentField) => ResolvedField<SqlStagedIdentity> {
+      selector: field.selector,
+      value: resolved_value(field.value)
+    }
+  )
+}
+
+fn check_with_catalog(
+  syntax: SqlSyntax,
+  sources: List<SqlPersistentSource>
+) -[Diagnose]> CheckResult<SqlPlan<SqlStagedIdentity>> {
+  handle check.checker<SqlStagedIdentity>().check(syntax) {
+    TypeCheck<SqlStagedIdentity>.resolve(request) -> match request.qualifier {
+      Some(_) -> resume(Err<ResolvedType<SqlStagedIdentity>, TypeQueryError>(TypeNotFound))
+      None -> if not request.arguments.is_empty() {
+        resume(
+          Err<ResolvedType<SqlStagedIdentity>, TypeQueryError>(
+            TypeArgumentCount(0, request.arguments.len())
+          )
+        )
+      } else if request.name == "i64" or request.name == "str" or request.name == "bool" {
+        resume(
+          Ok<ResolvedType<SqlStagedIdentity>, TypeQueryError>(
+            resolved_value(SemanticTypePrimitive(request.name))
+          )
+        )
+      } else {
+        match find_source(sources, request.name) {
+          None -> resume(Err<ResolvedType<SqlStagedIdentity>, TypeQueryError>(TypeNotFound))
+          Some(source) -> resume(
+            Ok<ResolvedType<SqlStagedIdentity>, TypeQueryError>(resolved_table(source))
+          )
+        }
+      }
+    }
+    TypeCheck<SqlStagedIdentity>.field(base, selector) -> match base {
+      SqlStagedValueIdentity(_) -> resume(
+        Err<ResolvedType<SqlStagedIdentity>, TypeQueryError>(TypeFieldsUnavailable)
+      )
+      SqlStagedTableIdentity(name) -> match find_source(sources, name) {
+        None -> resume(Err<ResolvedType<SqlStagedIdentity>, TypeQueryError>(ForeignTypeIdentity))
+        Some(source) -> match find_field(source.fields, selector) {
+          None -> resume(Err<ResolvedType<SqlStagedIdentity>, TypeQueryError>(TypeFieldNotFound))
+          Some(field) -> resume(
+            Ok<ResolvedType<SqlStagedIdentity>, TypeQueryError>(resolved_value(field.value))
+          )
+        }
+      }
+    }
+    TypeCheck<SqlStagedIdentity>.fields(base) -> match base {
+      SqlStagedValueIdentity(_) -> resume(
+        Err<List<ResolvedField<SqlStagedIdentity>>, TypeQueryError>(TypeFieldsUnavailable)
+      )
+      SqlStagedTableIdentity(name) -> match find_source(sources, name) {
+        None -> resume(
+          Err<List<ResolvedField<SqlStagedIdentity>>, TypeQueryError>(ForeignTypeIdentity)
+        )
+        Some(source) -> resume(
+          Ok<List<ResolvedField<SqlStagedIdentity>>, TypeQueryError>(resolved_fields(source))
+        )
+      }
+    }
+    TypeCheck<SqlStagedIdentity>.subtype(actual, expected) -> match (actual, expected) {
+      (SqlStagedValueIdentity(left), SqlStagedValueIdentity(right)) -> resume(
+        Ok<bool, TypeQueryError>(semantic_same(left, right))
+      )
+      (SqlStagedTableIdentity(left), SqlStagedTableIdentity(right)) -> resume(
+        Ok<bool, TypeQueryError>(left == right)
+      )
+      _ -> resume(Ok<bool, TypeQueryError>(false))
+    }
+  }
+}
+
+fn reconstruct(
+  persistent: SqlPersistentPlan,
+  identity: DiagnosticSource
+) -> Result<SqlPlan<SqlStagedIdentity>, SqlStagedPlanError> {
+  let source = Source { text: persistent.source, identity: identity }
+  let parsed = handle sql.grammar().parse(source.all()) {
+    Diagnose.report(diagnostic) -> resume(0)
+  }
+  match parsed {
+    Parsed(syntax) -> {
+      let checked = handle check_with_catalog(syntax, persistent.sources) {
+        Diagnose.report(diagnostic) -> resume(0)
+      }
+      match checked {
+        Checked(plan) -> Ok<SqlPlan<SqlStagedIdentity>, SqlStagedPlanError>(plan)
+        CheckRejected -> Err<SqlPlan<SqlStagedIdentity>, SqlStagedPlanError>(
+          SqlStagedPlanRejected
+        )
+      }
+    }
+    _ -> Err<SqlPlan<SqlStagedIdentity>, SqlStagedPlanError>(SqlStagedPlanRejected)
+  }
+}
+
+--- Decode and recheck a staged artifact into the package's sealed plan type.
+pub fn decode(
+  staged: Staged<SqlGrammar>
+) -> Result<SqlPlan<SqlStagedIdentity>, SqlStagedPlanError> {
+  match staged.artifact {
+    None -> Err<SqlPlan<SqlStagedIdentity>, SqlStagedPlanError>(SqlStagedArtifactMissing)
+    Some(artifact) -> match artifact.bytes.to_utf8() {
+      Err(_) -> Err<SqlPlan<SqlStagedIdentity>, SqlStagedPlanError>(SqlStagedTextInvalid)
+      Ok(text) -> match json.parse(text) {
+        Err(_) -> Err<SqlPlan<SqlStagedIdentity>, SqlStagedPlanError>(
+          SqlStagedDocumentInvalid
+        )
+        Ok(document) -> match persistent_document(document) {
+          Err(error) -> Err<SqlPlan<SqlStagedIdentity>, SqlStagedPlanError>(error)
+          Ok(plan) -> reconstruct(plan, staged.source)
+        }
+      }
+    }
+  }
+}
