@@ -4574,7 +4574,7 @@ assert_contains "mcp_grammar_diagnostics_checks_through_a_staging_driver" "$gram
 # typed-plan export, stage the source into a private sink, verifies the
 # artifact, stores it content-addressed and lowers the site to a
 # `Staged<G>` value the product carries. Offsets are byte ranges in the
-# root source: the call spelling and the literal with its delimiters.
+# site's owning source: the call spelling and the literal with its delimiters.
 mkdir -p "$tmp_pkg_dir/staged_pkg/grammars"
 cp module_fixtures/toy_grammar.weft "$tmp_pkg_dir/staged_pkg/grammars/assignments.weft"
 printf '{"package":"stagedpkg","manifest_version":1,"version":"0.4.0","weft":"0.1","exports":{"grammars":{"assignments":{"module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"typed_plan","tooling":"grammars/assignments"}}}}\n' > "$tmp_pkg_dir/staged_pkg/weft.pkg"
@@ -4606,6 +4606,29 @@ fi
 # size and exits accordingly.
 run_binary_guarded "$tmp_pkg_dir/staged_pkg/staged_product"
 echo "  ok staged_product_carries_the_artifact"
+# Imported modules own their staging sites. The driver checks against that
+# module's types, and lowering replaces the call in that module without
+# regenerating or appending source to the root program.
+printf '%s' 'use grammars/assignments.{AssignmentGrammar}
+use stdlib/grammar/staging.{Staged, embed}
+pub type settings { count: i64, name: str }
+pub fn staged_plan() -> Staged<AssignmentGrammar> {
+  embed<AssignmentGrammar>(r#"count = 3"#)
+}
+' > "$tmp_pkg_dir/staged_pkg/staged_plan.weft"
+printf '%s' 'use staged_plan.{staged_plan}
+fn main() -> i64 {
+  match staged_plan().artifact {
+    Some(artifact) -> if artifact.bytes.len() == __i64_to_usize(27) { 0 } else { 3 }
+    None -> 4
+  }
+}
+' > "$tmp_pkg_dir/staged_pkg/staged_module.weft"
+(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" build staged_module.weft -o staged_module_product --artifact-facts staged_module.facts.json > "$tmp_out" 2> "$tmp_err")
+assert_equals "build_stages_an_imported_module_site_stderr_empty" "$(<"$tmp_err")" ""
+assert_contains "build_records_an_imported_module_site" "$(/bin/cat "$tmp_pkg_dir/staged_pkg/staged_module.facts.json")" '"export":"assignments","module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"typed_plan","capability":"typed_plan"'
+run_binary_guarded "$tmp_pkg_dir/staged_pkg/staged_module_product"
+echo "  ok imported_module_staging_uses_its_own_source_and_lowers_the_site"
 set +e
 (cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" run staged.weft > "$tmp_out" 2> "$tmp_err")
 staged_run_exit=$?

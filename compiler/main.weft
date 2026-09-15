@@ -23,8 +23,7 @@ use compiler/weft/load.{NativeRuntimeSupport, NativeRuntime, NativeRuntimeWithRc
 use compiler/weft/check as weft_check
 use compiler/weft/check.{CheckProgram, ExtendCheckedProgram}
 use compiler/grammar/tool.{*}
-use compiler/weft/check/staging.{staging_site_call_start, staging_site_node, ttable_staging_sites}
-use compiler/weft/facts/staging.{StagingSiteFact, staging_site_facts}
+use compiler/weft/facts/staging.{*}
 use stdlib/bytes.{Bytes}
 use stdlib/grammar/tooling/staging.{StagingCapability, StagingTypedPlan, StagingValidateOnly, seconds_ceiling}
 use compiler/project/incremental.{*}
@@ -254,7 +253,7 @@ fn main_staging_site_fact(staged: MainStagedSite) -> NativeArtifactStagingSite {
 --- The staging sites the checker recorded for a program, as facts.
 fn main_staging_site_facts(typed: TypedModule) -> List<StagingSiteFact> {
   match typed {
-    TypedModule(_, src, tt, _) -> staging_site_facts(tt, src)
+    TypedModule(_, _, tt, _) -> staging_site_facts(tt)
   }
 }
 
@@ -288,10 +287,25 @@ fn main_product_facts_of(staged: List<MainStagedSite>) -> MainProductFacts {
   }
 }
 
--- The name a site's diagnostics and its lowered value carry: the root
--- source's path and the literal's offset, or the anonymous buffer.
-fn main_site_source_name(path_ptr: i64, path_len: i64) -> str {
-  if path_ptr == 0 or path_len <= 0 { "embedded" } else { runtime_str_from_bytes_copy(path_ptr, path_len) }
+fn main_site_source_buffer(site: StagingSiteFact) -> i64 {
+  match site.source {
+    DiagnosticSourceRange(DiagnosticSourceBuffer(buffer), _, _) -> buffer
+    _ -> 0
+  }
+}
+
+-- The physical source name belonging to this site, including imported
+-- modules. Anonymous buffers retain the protocol's stable fallback name.
+fn main_site_source_name(tt: i64, site: StagingSiteFact) -> str {
+  let entry = ttable_find_source_buffer_entry(tt, main_site_source_buffer(site))
+  if entry == 0 or mem_load64_at(entry + 24, 0) <= 0 { "embedded" } else {
+    runtime_str_from_bytes_copy(mem_load64_at(entry + 16, 0), mem_load64_at(entry + 24, 0))
+  }
+}
+
+fn main_site_value_source_name(tt: i64, site: StagingSiteFact) -> str {
+  let (source_start, _) = main_location_offsets(site.source)
+  str_concat(main_site_source_name(tt, site), str_concat("@", source_start.to_str()))
 }
 
 fn main_site_report(site: StagingSiteFact, command: str, message: str) -> nil {
@@ -341,10 +355,15 @@ fn main_stage_deadline() -[MonotonicClock]> Instant {
   monotonic.now().add(time.seconds(30 + seconds_ceiling()))
 }
 
--- Render a driver's diagnostics onto the staged literal inside the root
--- source: the request named the source, and its offsets start at the
--- literal's content.
-fn main_render_site_diagnostics(tt: i64, src: i64, site: StagingSiteFact, source_name: str, diagnostics: List<Diagnostic>) -> nil {
+-- Render a driver's diagnostics onto the staged literal in its owning
+-- source. Driver offsets start at the literal's content.
+fn main_render_site_diagnostics(
+  tt: i64,
+  site: StagingSiteFact,
+  source_name: str,
+  diagnostics: List<Diagnostic>
+) -> nil {
+  let src = main_site_source_buffer(site)
   let (source_start, _) = main_location_offsets(site.source)
   let (_, site_end) = main_location_offsets(site.site)
   -- The literal's content starts after its opening delimiter: the raw
@@ -373,8 +392,6 @@ fn main_stage_failed(site: StagingSiteFact, command: str, outcome: GrammarStageO
 fn main_stage_exchanges(
   prepared: List<MainPreparedSite>,
   tt: i64,
-  src: i64,
-  source_name: str,
   target: NativeLinkTarget,
   command: str
 ) -[Proc, MonotonicClock]> Result<List<MainStagedSite>, i64> {
@@ -385,8 +402,20 @@ fn main_stage_exchanges(
     let site = entry.fact
     let export = entry.export
     let product = entry.product
+    let source = main_site_source_buffer(site)
+    let source_name = main_site_source_name(tt, site)
     if failed == 0 {
-      let outcome = grammar_tool_stage(product, export, source_name, site.text, target, tt, src, sequence, main_stage_deadline())
+      let outcome = grammar_tool_stage(
+        product,
+        export,
+        source_name,
+        site.text,
+        target,
+        tt,
+        source,
+        sequence,
+        main_stage_deadline()
+      )
       sequence = sequence + 1
       match outcome {
         GrammarStageStaged(artifact) -> if main_observed_reads_failed(site, command, artifact.observed_inputs) { failed = 1; nil } else {
@@ -398,7 +427,7 @@ fn main_stage_exchanges(
           nil
         }
         GrammarStageRefused(response) -> {
-          main_render_site_diagnostics(tt, src, site, source_name, response.diagnostics)
+          main_render_site_diagnostics(tt, site, source_name, response.diagnostics)
           main_stage_failed(site, command, outcome)
           failed = 1
           nil
@@ -429,8 +458,6 @@ fn main_observed_reads_failed(site: StagingSiteFact, command: str, observed: Lis
 fn main_stage_sites(
   typed: TypedModule,
   sites: List<StagingSiteFact>,
-  path_ptr: i64,
-  path_len: i64,
   target: NativeLinkTarget,
   host: MainGrammarHost,
   command: str
@@ -438,10 +465,11 @@ fn main_stage_sites(
   match main_stage_prepare(sites, host, command) {
     Err(status) -> Err<List<MainStagedSite>, i64>(status)
     Ok(prepared) -> match typed {
-      TypedModule(_, src, tt, _) -> {
-        let source_name = main_site_source_name(path_ptr, path_len)
+      TypedModule(_, _, tt, _) -> {
         with process_handler(host.argc, host.argv) {
-          platform_time.with_platform(() => main_stage_exchanges(prepared, tt, src, source_name, target, command))
+          platform_time.with_platform(
+            () => main_stage_exchanges(prepared, tt, target, command)
+          )
         }
       }
     }
@@ -465,104 +493,60 @@ fn main_bytes_hex(content: Bytes) -> str {
   runtime_str_from_bytes_copy(out, count * 2)
 }
 
-fn main_escape_name(text: str) -> str {
-  text.replace("\\", "\\\\").replace("\"", "\\\"")
-}
-
---- The lowering of staged sites as source appended to the root: one
---- generated function per site, in the program's own module so the
---- rewritten call resolves through its own scope. Returns the appended
---- text and the offset of each function's name within it.
-fn main_staged_lowering(staged: List<MainStagedSite>, source_name: str) -> (str, List<i64>) {
-  let mut text = "\n-- Staging sites lowered by the compiler; regenerated on every build.\nuse stdlib/grammar/staging as __weft_staging\n"
-  let mut names = Nil<i64>()
-  let mut index = 0
-  for site in staged {
-    text = text |> str_concat("use ") |> str_concat(site.export.module) |> str_concat(" as __weft_grammar_") |> str_concat(index.to_str()) |> str_concat("\n")
-    index = index + 1
-  }
-  index = 0
-  for site in staged {
-    let grammar = "__weft_grammar_" |> str_concat(index.to_str()) |> str_concat(".") |> str_concat(site.export.declaration)
-    let (source_start, _) = main_location_offsets(site.fact.source)
-    let name = main_escape_name(source_name) |> str_concat("@") |> str_concat(source_start.to_str())
-    text = str_concat(text, "fn ")
-    names = names.append(__str_len(text))
-    text = text
-      |> str_concat("__weft_staged_site_")
-      |> str_concat(index.to_str())
-      |> str_concat("() -> __weft_staging.Staged<")
-      |> str_concat(grammar)
-      |> str_concat("> {\n  ")
-    text = match site.outcome {
-      GrammarStageStaged(artifact) -> text
-        |> str_concat("__weft_staging.staged_from_hex<")
-        |> str_concat(grammar)
-        |> str_concat(">(\"")
-        |> str_concat(name)
-        |> str_concat("\", \"")
-        |> str_concat(artifact.content)
-        |> str_concat("\", \"")
-        |> str_concat(main_bytes_hex(artifact.bytes))
-        |> str_concat("\")\n}\n")
-      _ -> text
-        |> str_concat("__weft_staging.validated<")
-        |> str_concat(grammar)
-        |> str_concat(">(\"")
-        |> str_concat(name)
-        |> str_concat("\")\n}\n")
-    }
-    index = index + 1
-  }
-  (text, names)
-}
-
-fn main_staged_site_name_len(index: i64) -> i64 {
-  __str_len(str_concat("__weft_staged_site_", index.to_str()))
-}
-
---- Rewrite each site's generic call, in the re-checked program, into a call
---- of its generated function: the same module, so the name resolves as any
---- other call. The re-check must have recorded the same sites in order.
-fn main_rewrite_staged_sites(typed: TypedModule, staged: List<MainStagedSite>, names: List<i64>, root_len: i64, command: str) -> i64 {
+--- Attach each verified result to the checker record that owns its source
+--- call. Lowering consumes this fact directly, so staging never regenerates,
+--- reparses or rechecks authored source.
+fn main_materialize_staging_sites(
+  typed: TypedModule,
+  staged: List<MainStagedSite>,
+  command: str
+) -> i64 {
   match typed {
-    TypedModule(_, src, tt, _) -> {
-      let sites = ttable_staging_sites(tt)
-      let count = if sites == 0 { 0 } else { nlist_len(sites) }
+    TypedModule(_, _, tt, _) -> {
+      let count = staging_site_record_count(tt)
       if count != __u64_to_i64(__usize_to_u64(staged.len())) {
         eprint(command)
-        eprint(": staging sites changed between checks; the product was not written\n")
+        eprint(": staged result count does not match the checked sites; the product was not written\n")
         1
       } else {
         let mut index = 0
         let mut errors = 0
         let mut remaining = staged
-        let mut remaining_names = names
         while index < count {
-          let site = nlist_get(sites, index)
           match remaining {
             Cons(expected, rest) -> {
               remaining = rest
               let (site_start, _) = main_location_offsets(expected.fact.site)
-              if staging_site_call_start(site) != site_start {
-                eprint(command)
-                eprint(": staging site order changed between checks; the product was not written\n")
-                errors = errors + 1
-              } else {
-                match remaining_names {
-                  Cons(name_offset, name_rest) -> {
-                    remaining_names = name_rest
-                    let node = staging_site_node(site)
-                    mem_store64_at(node, 0, 4)
-                    mem_store64_at(node, 8, root_len + name_offset)
-                    mem_store64_at(node, 16, main_staged_site_name_len(index))
-                    mem_store64_at(node, 24, 0)
-                    mem_store64_at(node, 32, 0)
-                    nil
-                  }
-                  Nil -> { errors = errors + 1; nil }
-                }
+              let source = main_site_source_buffer(expected.fact)
+              let source_name = main_site_value_source_name(tt, expected.fact)
+              let materialized = match expected.outcome {
+                GrammarStageStaged(artifact) -> staging_site_materialize(
+                    tt,
+                    index,
+                    source,
+                    site_start,
+                    2,
+                    source_name,
+                    artifact.content,
+                    main_bytes_hex(artifact.bytes)
+                  )
+                GrammarStageValidated(_) -> staging_site_materialize(
+                    tt,
+                    index,
+                    source,
+                    site_start,
+                    1,
+                    source_name,
+                    "",
+                    ""
+                  )
+                _ -> false
               }
+              if not materialized {
+                eprint(command)
+                eprint(": staged result does not match a lowerable checked site; the product was not written\n")
+                errors = errors + 1
+              } else { 0 }
             }
             Nil -> { errors = errors + 1; nil }
           }
@@ -659,10 +643,9 @@ fn main_check_native_program(ast: AstModule, support: NativeRuntimeSupport) -[So
 -- product. The build handler retains the native link plan while the compile
 -- handler writes the relocatable object to stdout.
 -- A program with staging sites is checked, its sites are staged through
--- their driver products, the lowering of every site is appended to the
--- root source, and the program is checked again before each site's call
--- is rewritten in place to its generated function. A program without sites
--- is lowered once.
+-- their driver products, and each verified result is attached to the site's
+-- semantic fact for lowering. Every authored module is parsed and checked
+-- exactly once.
 fn main_prepare_native_for_target_with_path_and_origin_and_grant(src: i64, n: i64, path_ptr: i64, path_len: i64, trusted: i64, strict: i64, can_grant_trust: i64, target: NativeLinkTarget, host: MainGrammarHost) -[SourceAcquire]> MainNativePreparation {
   match main_parse_native_source(src, n, path_ptr, path_len, trusted, strict, can_grant_trust, target) {
     MainSourceParseFailed(status) -> MainNativePreparationFailed(status)
@@ -671,26 +654,11 @@ fn main_prepare_native_for_target_with_path_and_origin_and_grant(src: i64, n: i6
       Checked(typed) -> {
         let sites = main_staging_site_facts(typed)
         if sites.is_empty() { main_lower_prepared(typed, source, target, main_no_product_facts()) }
-        else { match main_stage_sites(typed, sites, path_ptr, path_len, target, host, "build") {
+        else { match main_stage_sites(typed, sites, target, host, "build") {
           Err(status) -> MainNativePreparationFailed(status)
-          Ok(staged) -> {
-            let (appended, names) = main_staged_lowering(staged, main_site_source_name(path_ptr, path_len))
-            let total = n + __str_len(appended)
-            let buffer = alloc_zeroed(total + 1)
-            mem_copy(buffer, src, n)
-            mem_copy(buffer + n, __str_ptr(appended), __str_len(appended))
-            match main_parse_native_source(buffer, total, path_ptr, path_len, trusted, strict, can_grant_trust, target) {
-              MainSourceParseFailed(status) -> MainNativePreparationFailed(status)
-              MainSourceParsed(lowered_ast, lowered_source) -> match main_check_native_program(lowered_ast, NativeRuntime) {
-                CheckRejected -> MainNativePreparationFailed(1)
-                Checked(lowered) -> if main_rewrite_staged_sites(lowered, staged, names, n, "build") != 0 {
-                  MainNativePreparationFailed(1)
-                } else {
-                  main_lower_prepared(lowered, lowered_source, target, main_product_facts_of(staged))
-                }
-              }
-            }
-          }
+          Ok(staged) -> if main_materialize_staging_sites(typed, staged, "build") != 0 {
+            MainNativePreparationFailed(1)
+          } else { main_lower_prepared(typed, source, target, main_product_facts_of(staged)) }
         } }
       }
     }

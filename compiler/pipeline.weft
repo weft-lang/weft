@@ -11,6 +11,7 @@ use compiler/source/owners.{SourceOwners}
 use compiler/weft/facts/reclamation.{reclamation_facts}
 -- compiler/pipeline.weft -- Compiler pass boundaries
 use compiler/weft/check/body.{*}
+use compiler/weft/facts/staging.{*}
 use compiler/backend/aarch64/codegen.{*}
 use compiler/weft/facts/effect_ref.{*}
 use compiler/backend/aarch64/encode.{*}
@@ -11953,6 +11954,100 @@ pub(package) fn pipeline_lower_decl_generic_call_typed_to_target_blocks(decl: i6
   } }
 }
 
+-- Lower a materialised staging site through the stdlib constructor selected
+-- by its checker fact. The site is keyed by its owning source and call offset,
+-- so imported modules never borrow the root source's text or namespace.
+fn pipeline_lower_staging_site_typed(
+  type_args: TypeExprList,
+  call_start: i64,
+  next_value: i64,
+  lower_ctx: PipelineHandlerLowerCtx
+) -> IrLoweredExpr {
+  let tt = pipeline_handler_lower_ctx_tt(lower_ctx)
+  let material = staging_lowering_material_find(
+    tt,
+    pipeline_handler_lower_ctx_src(lower_ctx),
+    call_start
+  )
+  let (declaration, source_ptr, source_len, digest_ptr, digest_len, hex_ptr, hex_len, kind) = match material {
+      StagingLoweringUnavailable -> (0, 0, 0, 0, 0, 0, 0, 0)
+      StagingLoweringValidated(decl, src_ptr, src_len) -> (
+        decl, src_ptr, src_len, 0, 0, 0, 0, 1
+      )
+      StagingLoweringArtifact(decl, src_ptr, src_len, dig_ptr, dig_len, bytes_ptr, bytes_len) -> (
+        decl, src_ptr, src_len, dig_ptr, dig_len, bytes_ptr, bytes_len, 2
+      )
+    }
+  let pair = if declaration == 0 { 0 } else { module_decl_fact_function_pair(declaration) }
+  if pair == 0 { ir_lowered_expr_invalid(next_value) } else {
+    let source_value = next_value
+    let mut next = source_value + 1
+    let mut insts = ir_inst_list_prepend(
+      IrStringLit(
+        source_value,
+        source_ptr,
+        0,
+        source_len
+      ),
+      ir_inst_list_empty()
+    )
+    let mut args = ir_value_list_prepend(source_value, ir_value_list_empty())
+    if kind == 2 {
+      let digest_value = next
+      let hex_value = next + 1
+      next = next + 2
+      insts = ir_inst_list_append(
+        insts,
+        ir_inst_list_prepend(
+          IrStringLit(
+            digest_value,
+            digest_ptr,
+            0,
+            digest_len
+          ),
+          ir_inst_list_prepend(
+            IrStringLit(
+              hex_value,
+              hex_ptr,
+              0,
+              hex_len
+            ),
+            ir_inst_list_empty()
+          )
+        )
+      )
+      args = ir_value_list_append(
+        args,
+        ir_value_list_prepend(
+          digest_value,
+          ir_value_list_prepend(hex_value, ir_value_list_empty())
+        )
+      )
+    } else { 0 }
+    let call_type_args = pipeline_type_expr_list_subst(
+      type_args,
+      pipeline_handler_lower_ctx_subst(lower_ctx)
+    )
+    let expected_subst = cg_build_subst_with_associated(
+      fn_tparams(node_f1(pair)),
+      type_expr_list_to_nodes(call_type_args),
+      tt
+    )
+    let result_ty = pipeline_function_return_type_with_subst(
+      node_f1(pair),
+      expected_subst,
+      tt
+    )
+    let call = IrGenericCallI64(next, pipeline_fn_pair_key(pair), call_type_args, args)
+    let call_insts = ir_inst_list_prepend(
+      call,
+      pipeline_ir_call_result_lane_insts(next, result_ty)
+    )
+    let result_lanes = pipeline_type_value_lane_count_or_one(result_ty)
+    ir_lowered_expr(next, next + result_lanes, ir_inst_list_append(insts, call_insts))
+  }
+}
+
 pub(package) fn pipeline_lower_generic_call_typed_to_target_blocks(type_args: TypeExprList, inner_call: Expr, params: i64, locals: PipelineValueEnv, module: PipelineLowerModule, next_value: i64, start_block: i64, next_block: i64, target_block: i64) -> PipelineLoweredBlocks {
   let src = pipeline_lower_module_src(module)
   let tt = pipeline_lower_module_tt(module)
@@ -11961,6 +12056,34 @@ pub(package) fn pipeline_lower_generic_call_typed_to_target_blocks(type_args: Ty
   let concrete_type_args = pipeline_type_expr_list_subst(type_args, subst)
   match inner_call {
     Call(ns, nl, args_exprs) -> {
+      let staged = pipeline_lower_staging_site_typed(
+        type_args,
+        ns,
+        next_value,
+        pipeline_handler_lower_ctx_from_module(params, locals, module)
+      )
+      if ir_lowered_expr_is_valid(staged) == 1 {
+        let result_lanes = ir_lowered_expr_next_value(staged) - ir_lowered_expr_value(staged)
+        let block = ir_block_new_term(
+          start_block,
+          ir_lowered_expr_insts(staged),
+          ir_term_jump_args(
+            target_block,
+            pipeline_ir_value_lane_ids(
+              ir_lowered_expr_value(staged),
+              0,
+              result_lanes
+            )
+          )
+        )
+        return pipeline_lowered_blocks_control(
+          next_block,
+          ir_lowered_expr_next_value(staged),
+          ir_block_list_prepend(block, ir_block_list_empty()),
+          1,
+          1
+        )
+      } else { 0 }
       let declaration = pipeline_local_opaque_type_declaration(tt, src, ns, nl)
       if declaration != 0 {
         return pipeline_lower_opaque_wrap_typed_to_target_blocks(declaration, type_expr_list_to_nodes(concrete_type_args), args_exprs, params, locals, module, next_value, start_block, next_block, target_block)
@@ -25359,6 +25482,8 @@ pub(package) fn pipeline_lower_generic_call_expr_typed_sidecar_handler_opt(type_
   let concrete_type_args = pipeline_type_expr_list_subst(type_args, subst)
   match inner_call {
     Call(ns, nl, args_exprs) -> {
+      let staged = pipeline_lower_staging_site_typed(type_args, ns, next_value, lower_ctx)
+      if ir_lowered_expr_is_valid(staged) == 1 { return staged } else { 0 }
       let declaration = pipeline_local_opaque_type_declaration(tt, src, ns, nl)
       if declaration != 0 {
         return pipeline_lower_opaque_wrap_expr_typed(declaration, type_expr_list_to_nodes(concrete_type_args), args_exprs, next_value, lower_ctx)
@@ -28020,6 +28145,13 @@ pub(package) fn pipeline_lower_generic_call_node_typed_sidecar_handler_opt(type_
   let fns = pipeline_handler_lower_ctx_fns(lower_ctx)
   let subst = pipeline_handler_lower_ctx_subst(lower_ctx)
   if inner_call != 0 and node_tag(inner_call) == 4 {
+    let staged = pipeline_lower_staging_site_typed(
+      type_expr_list_from_type_nodes(type_args),
+      node_f1(inner_call),
+      next_value,
+      lower_ctx
+    )
+    if ir_lowered_expr_is_valid(staged) == 1 { return staged } else { 0 }
     let declaration = pipeline_local_opaque_type_declaration(tt, src, node_f1(inner_call), node_f2(inner_call))
     if declaration != 0 {
       let concrete_type_args = if subst == 0 { type_args } else { type_list_subst(type_args, subst) }
