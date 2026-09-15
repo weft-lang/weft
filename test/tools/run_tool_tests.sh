@@ -2618,14 +2618,14 @@ compile_metrics_missing_exit=$?
 set -e
 assert_equals "compile_metrics_missing_path_exits_usage" "$compile_metrics_missing_exit" "2"
 assert_equals "compile_metrics_missing_path_stdout_empty" "$(<"$tmp_out")" ""
-assert_contains "compile_metrics_missing_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics] PATH"
+assert_contains "compile_metrics_missing_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics|--rc-census|--checker-storage-census] PATH"
 
 set +e
 "$WEFT" compile --metrics "$tmp_src" "$tmp_check_clean" > "$tmp_out" 2>"$tmp_err"
 compile_metrics_extra_exit=$?
 set -e
 assert_equals "compile_metrics_extra_path_exits_usage" "$compile_metrics_extra_exit" "2"
-assert_contains "compile_metrics_extra_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics] PATH"
+assert_contains "compile_metrics_extra_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics|--rc-census|--checker-storage-census] PATH"
 
 # Non-tail recursion preserves an inferred borrowed call boundary when projection
 # accessors inline. The census must observe executed transfers, not require
@@ -2692,6 +2692,29 @@ fi
 assert_contains "compile_rc_census_dynamic_human_names_events" "$(<"$tmp_err")" "rc census: default_alloc="
 assert_contains "compile_rc_census_dynamic_human_names_origins" "$(<"$tmp_err")" "origin_call_transport_retain="
 
+# Checker-storage instrumentation is a separate measurement configuration.
+# The fixture pins every named facade group and proves recursive entries are
+# counted dynamically rather than as static functions or call sites.
+run_weft_compile_guarded "$WEFT" compile --checker-storage-census \
+  test/fixtures/checker_storage_census_driver.weft > "$tmp_out" 2> "$tmp_err"
+chmod +x "$tmp_out"
+run_binary_guarded "$tmp_out" > /dev/null 2> "$tmp_err"
+read -r -a checker_storage_entry_fields <<< "$(grep '^WEFT_CHECKER_STORAGE_CENSUS ' "$tmp_err")"
+assert_equals \
+  "checker_storage_dynamic_census_schema_version" \
+  "${checker_storage_entry_fields[0]}:${checker_storage_entry_fields[1]}" \
+  "WEFT_CHECKER_STORAGE_CENSUS:1"
+assert_equals "checker_storage_dynamic_registered_modules" "${checker_storage_entry_fields[2]}" "2"
+assert_equals "checker_storage_dynamic_checked_expressions" "${checker_storage_entry_fields[3]}" "3"
+assert_equals "checker_storage_dynamic_semantic_type_nodes" "${checker_storage_entry_fields[4]}" "2"
+assert_equals "checker_storage_dynamic_typed_to_raw_calls" "${checker_storage_entry_fields[5]}" "6"
+assert_equals "checker_storage_dynamic_raw_to_typed_calls" "${checker_storage_entry_fields[6]}" "6"
+assert_equals "checker_storage_dynamic_checked_type_clone_passes" "${checker_storage_entry_fields[7]}" "2"
+assert_contains \
+  "checker_storage_dynamic_census_human_names" \
+  "$(<"$tmp_err")" \
+  "checker storage census: registered_modules="
+
 cat > "$tmp_rc_census_src" <<'WEFT_ARRAY_CENSUS'
 fn increment(values: [mut i64]) -> nil {
   let first: usize = 0
@@ -2748,14 +2771,43 @@ compile_rc_census_missing_exit=$?
 set -e
 assert_equals "compile_rc_census_missing_path_exits_usage" "$compile_rc_census_missing_exit" "2"
 assert_equals "compile_rc_census_missing_path_stdout_empty" "$(<"$tmp_out")" ""
-assert_contains "compile_rc_census_missing_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics|--rc-census] PATH"
+assert_contains "compile_rc_census_missing_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics|--rc-census|--checker-storage-census] PATH"
 
 set +e
 "$WEFT" compile --rc-census "$tmp_rc_census_src" "$tmp_check_clean" > "$tmp_out" 2> "$tmp_err"
 compile_rc_census_extra_exit=$?
 set -e
 assert_equals "compile_rc_census_extra_path_exits_usage" "$compile_rc_census_extra_exit" "2"
-assert_contains "compile_rc_census_extra_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics|--rc-census] PATH"
+assert_contains "compile_rc_census_extra_path_prints_usage" "$(<"$tmp_err")" "usage: weft compile [--metrics|--rc-census|--checker-storage-census] PATH"
+
+set +e
+"$WEFT" compile --checker-storage-census > "$tmp_out" 2> "$tmp_err"
+compile_checker_storage_census_missing_exit=$?
+set -e
+assert_equals \
+  "compile_checker_storage_census_missing_path_exits_usage" \
+  "$compile_checker_storage_census_missing_exit" \
+  "2"
+assert_equals "compile_checker_storage_census_missing_path_stdout_empty" "$(<"$tmp_out")" ""
+assert_contains \
+  "compile_checker_storage_census_missing_path_prints_usage" \
+  "$(<"$tmp_err")" \
+  "usage: weft compile --checker-storage-census [--embed-sdk ROOT] PATH"
+
+set +e
+"$WEFT" compile --checker-storage-census \
+  test/fixtures/checker_storage_census_driver.weft \
+  "$tmp_check_clean" > "$tmp_out" 2> "$tmp_err"
+compile_checker_storage_census_extra_exit=$?
+set -e
+assert_equals \
+  "compile_checker_storage_census_extra_path_exits_usage" \
+  "$compile_checker_storage_census_extra_exit" \
+  "2"
+assert_contains \
+  "compile_checker_storage_census_extra_path_prints_usage" \
+  "$(<"$tmp_err")" \
+  "usage: weft compile --checker-storage-census [--embed-sdk ROOT] PATH"
 
 # Instrumentation is a configuration of the same frontend, including rejection
 # and source provenance. A recovered declaration never licenses an artifact.
