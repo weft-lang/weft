@@ -1387,10 +1387,10 @@ assert_equals "doc_extra_arg_exits_usage" "$doc_extra_arg_exit" "2"
 assert_contains "doc_extra_arg_prints_usage" "$(<"$tmp_err")" "usage: weft doc PATH"
 
 version_out=$("$WEFT" --version 2> "$tmp_err")
-assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 6; targets macos-aarch64,linux-aarch64; sdk checkout .)"
+assert_equals "version_human_reports_all_compatibility_facts" "$version_out" "weft 0.1.0 (language 0.1; manifest 1; lock 1; native-binding 1; artifact-facts 7; targets macos-aarch64,linux-aarch64; sdk checkout .)"
 assert_equals "version_human_stderr_empty" "$(<"$tmp_err")" ""
 version_json=$("$WEFT" version --json 2> "$tmp_err")
-assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":6,"targets":["macos-aarch64","linux-aarch64"],"sdk":{"kind":"checkout","root":"."}}'
+assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":7,"targets":["macos-aarch64","linux-aarch64"],"sdk":{"kind":"checkout","root":"."}}'
 assert_equals "version_json_stderr_empty" "$(<"$tmp_err")" ""
 
 target_list=$("$WEFT" target list 2> "$tmp_err")
@@ -4587,7 +4587,8 @@ fn main() -> i64 { let staged = embed<AssignmentGrammar>(r#"count = 3"#); match 
 assert_equals "build_stages_a_typed_plan_site_stderr_empty" "$(<"$tmp_err")" ""
 staged_facts=$(/bin/cat "$tmp_pkg_dir/staged_pkg/staged.facts.json")
 assert_contains "build_records_a_staged_site" "$staged_facts" '"staging_sites":[{"package":"stagedpkg","version":"0.4.0","export":"assignments","module":"grammars/assignments","declaration":"AssignmentGrammar","execution":"typed_plan","capability":"typed_plan","site":{"start":152,"end":157},"source":{"start":177,"end":191},"staged":{"outcome":"staged","driver":"target/'
-assert_contains "build_records_the_verified_artifact" "$staged_facts" '"content":"sha256:11923d3439a10fc9d43ffcc503dde655a21d3182cc30bf656f7abf297cdbd33f","size":27,"budget":4096,"facts":{"key":"count","literal":"integer"}}}]'
+assert_contains "build_records_the_verified_artifact" "$staged_facts" '"content":"sha256:11923d3439a10fc9d43ffcc503dde655a21d3182cc30bf656f7abf297cdbd33f","size":27,"budget":4096,"host_transcript":"sha256:'
+assert_contains "build_records_the_package_staging_facts" "$staged_facts" '"facts":{"key":"count","literal":"integer"}}}]'
 if [ -s "$tmp_pkg_dir/staged_pkg/target/$(basename "$(ls -d "$tmp_pkg_dir"/staged_pkg/target/*/ | head -1)")/grammar-artifacts/stagedpkg-assignments/11923d3439a10fc9d43ffcc503dde655a21d3182cc30bf656f7abf297cdbd33f" ]; then
   echo "  ok build_stores_the_artifact_content_addressed"
 else
@@ -4606,6 +4607,71 @@ fi
 # size and exits accordingly.
 run_binary_guarded "$tmp_pkg_dir/staged_pkg/staged_product"
 echo "  ok staged_product_carries_the_artifact"
+# Cached reuse is accepted only after replaying every host-type query against
+# the current checked module and revalidating the stored plan. Making the
+# driver non-executable proves a hit never starts it; changing a queried host
+# type, corrupting the record, or hiding the plan proves each condition is a
+# miss that tries to run the driver again.
+staged_driver=$(ls "$tmp_pkg_dir"/staged_pkg/target/*/grammar-tools/stagedpkg-assignments-* 2>/dev/null | grep -v '\.weft$\|\.stamp\.json$' | head -1)
+staged_cache=$(ls "$tmp_pkg_dir"/staged_pkg/target/*/grammar-stage-cache/stagedpkg-assignments/* 2>/dev/null | head -1)
+if [ -s "$staged_cache" ] && grep -q '"transcript":"sha256:' "$staged_cache"; then
+  echo "  ok build_records_a_complete_staging_transcript"
+else
+  echo "  fail build_records_a_complete_staging_transcript"
+  exit 1
+fi
+chmod -x "$staged_driver"
+(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" build staged.weft -o staged_cached_product --artifact-facts staged_cached.facts.json > "$tmp_out" 2> "$tmp_err")
+assert_equals "build_reuses_a_replayed_staging_transcript_without_starting_the_driver" "$(<"$tmp_err")" ""
+run_binary_guarded "$tmp_pkg_dir/staged_pkg/staged_cached_product"
+echo "  ok cached_product_carries_the_revalidated_artifact"
+printf '%s' 'use grammars/assignments.{AssignmentGrammar}
+use stdlib/grammar/staging.{embed}
+type settings { count: str, name: str }
+fn main() -> i64 { let staged = embed<AssignmentGrammar>(r#"count = 3"#); match staged.artifact { Some(artifact) -> if artifact.bytes.len() == __i64_to_usize(27) { 0 } else { 3 }, None -> 4 } }
+' > "$tmp_pkg_dir/staged_pkg/staged.weft"
+set +e
+host_changed=$(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" build staged.weft -o staged_host_changed 2>&1)
+host_changed_exit=$?
+set -e
+assert_equals "changed_host_reply_invalidates_the_stage_cache_exit" "$host_changed_exit" "1"
+assert_contains "changed_host_reply_reruns_the_driver" "$host_changed" 'grammar tool driver could not be started'
+printf '%s' 'use grammars/assignments.{AssignmentGrammar}
+use stdlib/grammar/staging.{embed}
+type settings { count: i64, name: str }
+fn main() -> i64 { let staged = embed<AssignmentGrammar>(r#"count = 3"#); match staged.artifact { Some(artifact) -> if artifact.bytes.len() == __i64_to_usize(27) { 0 } else { 3 }, None -> 4 } }
+' > "$tmp_pkg_dir/staged_pkg/staged.weft"
+printf '%s' '-- The same literal at a different source position is a distinct observable input.
+use grammars/assignments.{AssignmentGrammar}
+use stdlib/grammar/staging.{embed}
+type settings { count: i64, name: str }
+fn main() -> i64 { let staged = embed<AssignmentGrammar>(r#"count = 3"#); match staged.artifact { Some(artifact) -> if artifact.bytes.len() == __i64_to_usize(27) { 0 } else { 3 }, None -> 4 } }
+' > "$tmp_pkg_dir/staged_pkg/staged_shifted.weft"
+set +e
+shifted_source=$(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" build staged_shifted.weft -o staged_shifted 2>&1)
+shifted_source_exit=$?
+set -e
+assert_equals "changed_staging_source_identity_is_a_cache_miss_exit" "$shifted_source_exit" "1"
+assert_contains "changed_staging_source_identity_reruns_the_driver" "$shifted_source" 'grammar tool driver could not be started'
+cp "$staged_cache" "$staged_cache.saved"
+printf '{}\n' > "$staged_cache"
+set +e
+corrupt_cache=$(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" build staged.weft -o staged_corrupt_cache 2>&1)
+corrupt_cache_exit=$?
+set -e
+assert_equals "corrupt_stage_cache_record_is_a_miss_exit" "$corrupt_cache_exit" "1"
+assert_contains "corrupt_stage_cache_record_reruns_the_driver" "$corrupt_cache" 'grammar tool driver could not be started'
+mv "$staged_cache.saved" "$staged_cache"
+staged_artifact="$tmp_pkg_dir/staged_pkg/target/$(basename "$(ls -d "$tmp_pkg_dir"/staged_pkg/target/*/ | head -1)")/grammar-artifacts/stagedpkg-assignments/11923d3439a10fc9d43ffcc503dde655a21d3182cc30bf656f7abf297cdbd33f"
+mv "$staged_artifact" "$staged_artifact.saved"
+set +e
+missing_artifact=$(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" build staged.weft -o staged_missing_artifact 2>&1)
+missing_artifact_exit=$?
+set -e
+assert_equals "missing_staged_artifact_is_a_cache_miss_exit" "$missing_artifact_exit" "1"
+assert_contains "missing_staged_artifact_reruns_the_driver" "$missing_artifact" 'grammar tool driver could not be started'
+mv "$staged_artifact.saved" "$staged_artifact"
+chmod +x "$staged_driver"
 # Imported modules own their staging sites. The driver checks against that
 # module's types, and lowering replaces the call in that module without
 # regenerating or appending source to the root program.
@@ -4750,7 +4816,7 @@ fn main() -> i64 { let staged = embed<SqlGrammar>(r#"select id from users"#); ma
 "$WEFT" build "$tmp_src" -o "$tmp_bin" --artifact-facts "$tmp_bin.facts.json" > "$tmp_out" 2> "$tmp_err"
 assert_equals "build_validates_an_sdk_site_stderr_empty" "$(<"$tmp_err")" ""
 sdk_staged_facts=$(/bin/cat "$tmp_bin.facts.json")
-assert_contains "build_records_a_validated_sdk_site" "$sdk_staged_facts" '"staging_sites":[{"package":"weft","version":"0.1.0","export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"runtime","capability":"validate_only","site":{"start":151,"end":156},"source":{"start":169,"end":194},"staged":{"outcome":"validated"}}]'
+assert_contains "build_records_a_validated_sdk_site" "$sdk_staged_facts" '"staging_sites":[{"package":"weft","version":"0.1.0","export":"sql","module":"stdlib/grammar/sql","declaration":"SqlGrammar","execution":"runtime","capability":"validate_only","site":{"start":151,"end":156},"source":{"start":169,"end":194},"staged":{"outcome":"validated","host_transcript":"sha256:'
 rm -f "$tmp_bin.facts.json"
 chmod +x "$tmp_bin"
 run_binary_guarded "$tmp_bin"
@@ -5590,7 +5656,7 @@ else
   exit 1
 fi
 native_forward_facts=$(/bin/cat "$tmp_pkg_trust_dir/native_artifacts/native_forward.facts.json")
-assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":6'
+assert_contains "package_native_artifact_facts_are_versioned" "$native_forward_facts" '"artifact_facts_version":7'
 assert_contains "package_native_artifact_facts_name_target" "$native_forward_facts" '"target":"macos-aarch64"'
 assert_contains "package_native_artifact_facts_name_minimum_platform" "$native_forward_facts" '"minimum_platform_abi":{"platform":"macos","major":11,"minor":0,"patch":0}'
 assert_contains "package_native_artifact_facts_claim_standalone" "$native_forward_facts" '"standalone":true'

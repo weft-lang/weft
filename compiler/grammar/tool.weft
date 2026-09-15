@@ -40,8 +40,10 @@ use runtime/syscall.{
 use stdlib/bytes as bytes
 use stdlib/bytes.{Bytes, bytes_concat}
 use stdlib/diagnostic/schema.{*}
+use stdlib/file as file
 use stdlib/grammar.{CheckResult, Checked, CheckRejected}
 use stdlib/grammar/tooling.{ToolTypeIdentity, tool_type_identity, tool_type_identity_token}
+use stdlib/grammar/tooling/digest.{content_digest}
 use stdlib/grammar/tooling/protocol.{*}
 use stdlib/grammar/tooling/staging.{
   StagingArtifactMissing,
@@ -56,10 +58,13 @@ use stdlib/grammar/tooling/staging.{
   StagingValidateOnly,
   StagingVerifyFailure,
   byte_ceiling,
+  transcript_ceiling,
   verify_artifact
 }
 use stdlib/path as path
+use stdlib/json as json
 use stdlib/json.{*}
+use stdlib/list as list
 use stdlib/list.{List, Cons, Nil}
 use stdlib/option.{Option, Some, None}
 use stdlib/process.{*}
@@ -1189,13 +1194,42 @@ pub(package) type GrammarToolExchange {
   GrammarToolFailed(GrammarToolFailure)
 }
 
+--- One host query and the canonical reply the compiler returned. Query
+--- tokens retain their session-local numbers so replay can prove that a
+--- fresh token table issues the same identities in the same order.
+pub(package) type GrammarToolTranscriptEntry { query: ToolQuery, reply: str }
+
+--- The complete observable protocol transcript for one successful exchange.
+--- `complete` is false when its canonical lines exceed the cache ceiling;
+--- the exchange remains valid, but cannot be reused without rerunning.
+pub(package) type GrammarToolTranscript {
+  request: str,
+  entries: List<GrammarToolTranscriptEntry>,
+  response: str,
+  size: usize,
+  complete: bool
+}
+
+type GrammarToolTranscriptState {
+  request: str,
+  entries: List<GrammarToolTranscriptEntry>,
+  size: usize,
+  complete: bool
+}
+
+type GrammarToolRecordedExchange {
+  GrammarToolRecordedAnswered(ToolResponse, GrammarToolTranscript),
+  GrammarToolRecordedFailed(GrammarToolFailure)
+}
+
 type ExchangeState {
   request: ToolRequest,
   deadline: Instant,
   host: bool,
   tokens: GrammarToolTokens,
   frames: FrameBuffer,
-  stderr_text: Bytes
+  stderr_text: Bytes,
+  transcript: GrammarToolTranscriptState
 }
 
 --- The bounded standard error text of a driver: what the exchange kept while
@@ -1231,28 +1265,78 @@ fn keep_stderr(kept: Bytes, chunk: Bytes) -> Bytes {
 
 --- The exchange after a response: the driver must exit cleanly before the
 --- deadline, with nothing more than the bounded output the session stores.
+fn transcript_add(
+  state: GrammarToolTranscriptState,
+  entry: GrammarToolTranscriptEntry
+) -> GrammarToolTranscriptState {
+  if not state.complete { state } else {
+    let query_line = render_line(encode_query(entry.query))
+    let next_size = state.size + query_line.len() + entry.reply.len()
+    if next_size > transcript_ceiling() { state.{ complete: false } } else {
+      state.{ entries: Cons(entry, state.entries), size: next_size }
+    }
+  }
+}
+
+fn transcript_finish(
+  state: GrammarToolTranscriptState,
+  response: ToolResponse
+) -> GrammarToolTranscript {
+  match encode_response(response) {
+    Err(_) -> GrammarToolTranscript {
+      request: state.request,
+      entries: Nil<GrammarToolTranscriptEntry>(),
+      response: "",
+      size: state.size,
+      complete: false
+    }
+    Ok(document) -> {
+      let response_line = render_line(document)
+      let next_size = state.size + response_line.len()
+      let complete = state.complete and next_size <= transcript_ceiling()
+      GrammarToolTranscript {
+        request: state.request,
+        entries: if complete { state.entries.reverse() } else {
+          Nil<GrammarToolTranscriptEntry>()
+        },
+        response: if complete { response_line } else { "" },
+        size: next_size,
+        complete: complete
+      }
+    }
+  }
+}
+
 fn answered(
   state: ExchangeState,
   response: ToolResponse,
   output: ProcOutput
-) -> GrammarToolExchange {
+) -> GrammarToolRecordedExchange {
   if not same_grammar(response.grammar, state.request.grammar) {
-    GrammarToolFailed(GrammarToolGrammarMismatch)
+    GrammarToolRecordedFailed(GrammarToolGrammarMismatch)
   } else {
     match output {
       ProcCompleted(termination, _, _) -> match termination {
-        ProcExited(status) -> if status == 0 { GrammarToolAnswered(response) } else {
-          GrammarToolFailed(GrammarToolDriverFailed(termination, stderr_text_of(state, output)))
+        ProcExited(status) -> if status == 0 {
+          GrammarToolRecordedAnswered(response, transcript_finish(state.transcript, response))
+        } else {
+          GrammarToolRecordedFailed(
+            GrammarToolDriverFailed(termination, stderr_text_of(state, output))
+          )
         }
         ProcSignaled(_) ->
-          GrammarToolFailed(GrammarToolDriverFailed(termination, stderr_text_of(state, output)))
+          GrammarToolRecordedFailed(
+            GrammarToolDriverFailed(termination, stderr_text_of(state, output))
+          )
       }
-      ProcTimedOut(_, _, _) -> GrammarToolFailed(GrammarToolTimedOut)
+      ProcTimedOut(_, _, _) -> GrammarToolRecordedFailed(GrammarToolTimedOut)
       ProcFailed(ProcOutputLimitExceeded(limit), _, _) ->
-        GrammarToolFailed(GrammarToolOutputExceeded(limit))
-      ProcFailed(ProcStreamFailed(code), _, _) -> GrammarToolFailed(GrammarToolStreamFailed(code))
-      ProcFailed(ProcSpawnFailed(code), _, _) -> GrammarToolFailed(GrammarToolStartFailed(code))
-      ProcFailed(_, _, _) -> GrammarToolFailed(GrammarToolStreamFailed(0))
+        GrammarToolRecordedFailed(GrammarToolOutputExceeded(limit))
+      ProcFailed(ProcStreamFailed(code), _, _) ->
+        GrammarToolRecordedFailed(GrammarToolStreamFailed(code))
+      ProcFailed(ProcSpawnFailed(code), _, _) ->
+        GrammarToolRecordedFailed(GrammarToolStartFailed(code))
+      ProcFailed(_, _, _) -> GrammarToolRecordedFailed(GrammarToolStreamFailed(0))
     }
   }
 }
@@ -1261,7 +1345,7 @@ fn exchange_line(
   session: ProcSession,
   state: ExchangeState,
   line: Bytes
-) -[Proc, TypeCheck<HostTypeIdentity>]> GrammarToolExchange {
+) -[Proc, TypeCheck<HostTypeIdentity>]> GrammarToolRecordedExchange {
   let decoded = match line.to_utf8() {
     Err(_) -> Err<ToolDriverMessage, ToolProtocolError>(ToolProtocolShape("line", "utf-8"))
     Ok(text) -> match parse_line(text) {
@@ -1272,38 +1356,51 @@ fn exchange_line(
   match decoded {
     Err(error) -> {
       Proc.session_release(session)
-      GrammarToolFailed(GrammarToolProtocol(error))
+      GrammarToolRecordedFailed(GrammarToolProtocol(error))
     }
     Ok(ToolDriverResponse(response)) ->
       answered(state, response, Proc.session_finish_until(session, state.deadline))
     Ok(ToolDriverQuery(query)) -> if not state.host {
       Proc.session_release(session)
-      GrammarToolFailed(GrammarToolUnexpectedQuery)
+      GrammarToolRecordedFailed(GrammarToolUnexpectedQuery)
     } else {
       let reply = grammar_tool_answer(state.tokens, query)
+      let reply_line = render_line(encode_reply(reply))
       let (next, wrote) = Proc.session_write(
         session,
-        bytes.from_str(render_line(encode_reply(reply))),
+        bytes.from_str(reply_line),
         state.deadline
       )
+      let next_state = state.{
+        transcript: transcript_add(
+          state.transcript,
+          GrammarToolTranscriptEntry { query: query, reply: reply_line }
+        )
+      }
       match wrote {
-        ProcWritten -> exchange_step(next, state)
+        ProcWritten -> exchange_step(next, next_state)
         ProcWriteTimedOut(_) -> {
           Proc.session_release(next);
-          GrammarToolFailed(GrammarToolTimedOut)
+          GrammarToolRecordedFailed(GrammarToolTimedOut)
         }
         ProcWriteBlocked(_) -> {
           Proc.session_release(next);
-          GrammarToolFailed(GrammarToolRequestNotDelivered)
+          GrammarToolRecordedFailed(GrammarToolRequestNotDelivered)
         }
-        ProcWriteRefused(_) -> exchange_step(next, state)
+        -- Preserve the existing exchange behavior after a refused write, but
+        -- never reuse it: the child may have observed only a prefix of the
+        -- canonical reply.
+        ProcWriteRefused(_) -> exchange_step(
+          next,
+          state.{ transcript: state.transcript.{ complete: false } }
+        )
         ProcWriteFailed(ProcStreamFailed(code), _) -> {
           Proc.session_release(next);
-          GrammarToolFailed(GrammarToolStreamFailed(code))
+          GrammarToolRecordedFailed(GrammarToolStreamFailed(code))
         }
         ProcWriteFailed(_, _) -> {
           Proc.session_release(next);
-          GrammarToolFailed(GrammarToolRequestNotDelivered)
+          GrammarToolRecordedFailed(GrammarToolRequestNotDelivered)
         }
       }
     }
@@ -1313,7 +1410,7 @@ fn exchange_line(
 fn exchange_step(
   session: ProcSession,
   state: ExchangeState
-) -[Proc, TypeCheck<HostTypeIdentity>]> GrammarToolExchange {
+) -[Proc, TypeCheck<HostTypeIdentity>]> GrammarToolRecordedExchange {
   match frame_buffer_take_line(state.frames) {
     Some(line) -> exchange_line(session, state, line)
     None -> {
@@ -1325,7 +1422,7 @@ fn exchange_step(
           }
         else {
           Proc.session_release(next)
-          GrammarToolFailed(GrammarToolOutputExceeded(frame_limit()))
+          GrammarToolRecordedFailed(GrammarToolOutputExceeded(frame_limit()))
         }
         ProcReadChunk(ProcStderr, chunk) -> exchange_step(
           next,
@@ -1333,20 +1430,75 @@ fn exchange_step(
         )
         ProcReadEnded -> {
           let output = Proc.session_finish_until(next, state.deadline)
-          GrammarToolFailed(GrammarToolDriverEnded(stderr_text_of(state, output)))
+          GrammarToolRecordedFailed(GrammarToolDriverEnded(stderr_text_of(state, output)))
         }
-        ProcReadTimedOut -> { Proc.session_release(next); GrammarToolFailed(GrammarToolTimedOut) }
+        ProcReadTimedOut -> {
+          Proc.session_release(next)
+          GrammarToolRecordedFailed(GrammarToolTimedOut)
+        }
         ProcReadFailed(ProcSpawnFailed(code)) -> {
           Proc.session_release(next);
-          GrammarToolFailed(GrammarToolStartFailed(code))
+          GrammarToolRecordedFailed(GrammarToolStartFailed(code))
         }
         ProcReadFailed(ProcStreamFailed(code)) -> {
           Proc.session_release(next);
-          GrammarToolFailed(GrammarToolStreamFailed(code))
+          GrammarToolRecordedFailed(GrammarToolStreamFailed(code))
         }
         ProcReadFailed(_) -> {
           Proc.session_release(next);
-          GrammarToolFailed(GrammarToolStreamFailed(0))
+          GrammarToolRecordedFailed(GrammarToolStreamFailed(0))
+        }
+      }
+    }
+  }
+}
+
+fn grammar_tool_exchange_recorded(
+  product: str,
+  request: ToolRequest,
+  transcript_request: ToolRequest,
+  host: bool,
+  deadline: Instant
+) -[Proc, TypeCheck<HostTypeIdentity>]> GrammarToolRecordedExchange {
+  match (encode_request(request), encode_request(transcript_request)) {
+    (Err(error), _) -> GrammarToolRecordedFailed(GrammarToolProtocol(error))
+    (_, Err(error)) -> GrammarToolRecordedFailed(GrammarToolProtocol(error))
+    (Ok(document), Ok(transcript_document)) -> {
+      let request_line = render_line(document)
+      let transcript_line = render_line(transcript_document)
+      let session: owned ProcSession = Proc.open_session(product, Nil<str>(), store_limit())
+      let (started, wrote) = Proc.session_write(session, bytes.from_str(request_line), deadline)
+      let state = ExchangeState {
+        request: request,
+        deadline: deadline,
+        host: host,
+        tokens: grammar_tool_tokens(),
+        frames: frame_buffer(),
+        stderr_text: bytes.empty(),
+        transcript: GrammarToolTranscriptState {
+          request: transcript_line,
+          entries: Nil<GrammarToolTranscriptEntry>(),
+          size: transcript_line.len(),
+          complete: transcript_line.len() <= transcript_ceiling()
+        }
+      }
+      match wrote {
+        ProcWritten -> exchange_step(started, state)
+        ProcWriteFailed(ProcSpawnFailed(code), _) -> {
+          Proc.session_release(started);
+          GrammarToolRecordedFailed(GrammarToolStartFailed(code))
+        }
+        ProcWriteFailed(ProcStreamFailed(code), _) -> {
+          Proc.session_release(started);
+          GrammarToolRecordedFailed(GrammarToolStreamFailed(code))
+        }
+        ProcWriteTimedOut(_) -> {
+          Proc.session_release(started);
+          GrammarToolRecordedFailed(GrammarToolTimedOut)
+        }
+        _ -> {
+          let output = Proc.session_finish_until(started, deadline)
+          GrammarToolRecordedFailed(GrammarToolDriverEnded(stderr_text_of(state, output)))
         }
       }
     }
@@ -1362,45 +1514,9 @@ pub(package) fn grammar_tool_exchange(
   host: bool,
   deadline: Instant
 ) -[Proc, TypeCheck<HostTypeIdentity>]> GrammarToolExchange {
-  match encode_request(request) {
-    Err(error) -> GrammarToolFailed(GrammarToolProtocol(error))
-    Ok(document) -> {
-      let session: owned ProcSession = Proc.open_session(product, Nil<str>(), store_limit())
-      let (started, wrote) = Proc.session_write(
-        session,
-        bytes.from_str(render_line(document)),
-        deadline
-      )
-      let state = ExchangeState {
-        request: request,
-        deadline: deadline,
-        host: host,
-        tokens: grammar_tool_tokens(),
-        frames: frame_buffer(),
-        stderr_text: bytes.empty()
-      }
-      match wrote {
-        ProcWritten -> exchange_step(started, state)
-        ProcWriteFailed(ProcSpawnFailed(code), _) -> {
-          Proc.session_release(started);
-          GrammarToolFailed(GrammarToolStartFailed(code))
-        }
-        ProcWriteFailed(ProcStreamFailed(code), _) -> {
-          Proc.session_release(started);
-          GrammarToolFailed(GrammarToolStreamFailed(code))
-        }
-        ProcWriteTimedOut(_) -> {
-          Proc.session_release(started);
-          GrammarToolFailed(GrammarToolTimedOut)
-        }
-        _ -> {
-          -- A driver that exits before reading its request still owes an
-          -- explanation on standard error; collect it.
-          let output = Proc.session_finish_until(started, deadline)
-          GrammarToolFailed(GrammarToolDriverEnded(stderr_text_of(state, output)))
-        }
-      }
-    }
+  match grammar_tool_exchange_recorded(product, request, request, host, deadline) {
+    GrammarToolRecordedAnswered(response, _) -> GrammarToolAnswered(response)
+    GrammarToolRecordedFailed(failure) -> GrammarToolFailed(failure)
   }
 }
 
@@ -1435,6 +1551,27 @@ pub(package) fn grammar_tool_exchange_with_host(
   deadline: Instant
 ) -[Proc]> GrammarToolExchange {
   host_types.run(table, source, () => grammar_tool_exchange(product, request, true, deadline))
+}
+
+fn grammar_tool_exchange_recorded_with_host(
+  product: str,
+  request: ToolRequest,
+  transcript_request: ToolRequest,
+  table: i64,
+  source: i64,
+  deadline: Instant
+) -[Proc]> GrammarToolRecordedExchange {
+  host_types.run(
+    table,
+    source,
+    () => grammar_tool_exchange_recorded(
+      product,
+      request,
+      transcript_request,
+      true,
+      deadline
+    )
+  )
 }
 
 --- Render a failure for tool output.
@@ -1637,7 +1774,13 @@ pub(package) type GrammarStagedArtifact {
   bytes: Bytes,
   facts: Json,
   observed_inputs: List<ToolObservedInput>,
-  store: str
+  store: str,
+  host_transcript: str
+}
+
+pub(package) type GrammarValidatedStage {
+  observed_inputs: List<ToolObservedInput>,
+  host_transcript: str
 }
 
 --- What staging one site produced.
@@ -1645,7 +1788,7 @@ pub(package) type GrammarStageOutcome {
   --- The export emitted an artifact, verified and stored.
   GrammarStageStaged(GrammarStagedArtifact),
   --- The export checked the source and emits nothing; its observed reads.
-  GrammarStageValidated(List<ToolObservedInput>),
+  GrammarStageValidated(GrammarValidatedStage),
   --- The driver answered but withheld staging; the response carries the
   --- diagnostics and the refusal.
   GrammarStageRefused(ToolResponse),
@@ -1749,6 +1892,394 @@ fn stage_store(
   }
 }
 
+-- Cached staging -----------------------------------------------------------
+-- The cache is deliberately private compiler data. Artifact facts expose
+-- only its transcript digest; no cached query token or checked plan becomes
+-- a public ABI.
+type GrammarStageCacheIdentity {
+  key: str,
+  driver: str,
+  request: str,
+  path: str
+}
+
+type GrammarStageCacheRecord {
+  transcript: GrammarToolTranscript,
+  response: ToolResponse,
+  store: str
+}
+
+fn stage_cache_directory(target: NativeLinkTarget, export: GrammarToolExport) -> str {
+  "target/"
+    |> str_concat(native_link_target_name(target))
+    |> str_concat("/grammar-stage-cache/")
+    |> str_concat(export.package_name)
+    |> str_concat("-")
+    |> str_concat(export.export)
+}
+
+fn stage_cache_ensure_directory(target: NativeLinkTarget, export: GrammarToolExport) -> nil {
+  ensure_directories(target)
+  sys_dir_mkdir(
+    runtime_str_cstring(
+      str_concat("target/", str_concat(native_link_target_name(target), "/grammar-stage-cache"))
+    ),
+    493
+  )
+  sys_dir_mkdir(runtime_str_cstring(stage_cache_directory(target, export)), 493)
+  nil
+}
+
+fn stage_cache_identity(
+  product: str,
+  export: GrammarToolExport,
+  target: NativeLinkTarget,
+  request: ToolRequest
+) -> GrammarStageCacheIdentity {
+  match (file_digest(product), encode_request(request)) {
+    (Some(driver), Ok(request_document)) -> {
+      let request_line = render_line(request_document)
+      let identity_entries = [
+        json_entry("schema", json_number(1)),
+        json_entry("protocol", json_string(protocol_name())),
+        json_entry("driver", json_string(driver)),
+        json_entry("version", json_string(export.version)),
+        json_entry("request", request_document)
+      ]
+      let identity_document = json_object(list.from_slice(identity_entries[..]))
+      match json_stringify(identity_document) {
+        Err(_) -> GrammarStageCacheIdentity { key: "", driver: "", request: "", path: "" }
+        Ok(identity) -> {
+          let key = digest_raw(__str_ptr(identity), __str_len(identity))
+          let directory = stage_cache_directory(target, export)
+          GrammarStageCacheIdentity {
+            key: key,
+            driver: driver,
+            request: request_line,
+            path: str_concat(directory, str_concat("/", digest_hex(key)))
+          }
+        }
+      }
+    }
+    _ -> GrammarStageCacheIdentity { key: "", driver: "", request: "", path: "" }
+  }
+}
+
+fn transcript_text(transcript: GrammarToolTranscript) -> str {
+  let mut text = transcript.request
+  for entry in transcript.entries {
+    text = str_concat(text, render_line(encode_query(entry.query)))
+    text = str_concat(text, entry.reply)
+  }
+  str_concat(text, transcript.response)
+}
+
+fn transcript_digest(transcript: GrammarToolTranscript) -> str {
+  if not transcript.complete { "" } else {
+    let text = transcript_text(transcript)
+    digest_raw(__str_ptr(text), __str_len(text))
+  }
+}
+
+fn cache_entries_json(entries: List<GrammarToolTranscriptEntry>) -> List<Json> {
+  entries.map<Json>(
+    (entry: GrammarToolTranscriptEntry) => {
+      let fields = [
+        json_entry("query", encode_query(entry.query)),
+        json_entry("reply", json_string(entry.reply))
+      ]
+      json_object(list.from_slice(fields[..]))
+    }
+  )
+}
+
+fn stage_cache_render(
+  identity: GrammarStageCacheIdentity,
+  record: GrammarStageCacheRecord
+) -> Option<str> {
+  match encode_response(record.response) {
+    Err(_) -> None<str>()
+    Ok(response) -> {
+      let fields = [
+        json_entry("schema", json_number(1)),
+        json_entry("key", json_string(identity.key)),
+        json_entry("driver", json_string(identity.driver)),
+        json_entry("request", json_string(record.transcript.request)),
+        json_entry("exchanges", json_array(cache_entries_json(record.transcript.entries))),
+        json_entry("transcript", json_string(transcript_digest(record.transcript))),
+        json_entry("response", response),
+        json_entry("store", json_string(record.store))
+      ]
+      match json_stringify(json_object(list.from_slice(fields[..]))) {
+        Ok(text) -> Some<str>(text)
+        Err(_) -> None<str>()
+      }
+    }
+  }
+}
+
+fn stage_cache_decode_entries(items: List<Json>) -> Option<List<GrammarToolTranscriptEntry>> {
+  let mut decoded = Nil<GrammarToolTranscriptEntry>()
+  let mut remaining = items
+  let mut valid = true
+  while valid and not remaining.is_empty() {
+    match remaining {
+      Nil -> nil
+      Cons(item, rest) -> {
+        remaining = rest
+        match (json_object_get(item, "query"), json_object_get(item, "reply")) {
+          (Some(query_document), Some(JsonString(reply))) -> match decode_query(query_document) {
+            Err(_) -> { valid = false; nil }
+            Ok(query) -> {
+              decoded = Cons(GrammarToolTranscriptEntry { query: query, reply: reply }, decoded)
+              nil
+            }
+          }
+          _ -> { valid = false; nil }
+        }
+      }
+    }
+  }
+  if valid { Some<List<GrammarToolTranscriptEntry>>(decoded.reverse()) } else {
+    None<List<GrammarToolTranscriptEntry>>()
+  }
+}
+
+fn stage_cache_decode(
+  identity: GrammarStageCacheIdentity,
+  text: str
+) -> Option<GrammarStageCacheRecord> {
+  match json.parse(text) {
+    Err(_) -> None<GrammarStageCacheRecord>()
+    Ok(document) -> if json_object_get_i64(document, "schema", 0) != 1 or
+      str_eq(json_object_get_str(document, "key", ""), identity.key) == 0 or
+      str_eq(json_object_get_str(document, "driver", ""), identity.driver) == 0 or
+      str_eq(json_object_get_str(document, "request", ""), identity.request) == 0 {
+        None<GrammarStageCacheRecord>()
+      } else {
+        match (json_object_get(document, "exchanges"), json_object_get(document, "response")) {
+          (Some(JsonArray(items)), Some(response_document)) -> match stage_cache_decode_entries(
+            items
+          ) {
+            None -> None<GrammarStageCacheRecord>()
+            Some(entries) -> match decode_response(response_document) {
+              Err(_) -> None<GrammarStageCacheRecord>()
+              Ok(response) -> {
+                let response_line = render_line(response_document)
+                let transcript = GrammarToolTranscript {
+                  request: identity.request,
+                  entries: entries,
+                  response: response_line,
+                  size: 0,
+                  complete: true
+                }
+                let size = transcript_text(transcript).len()
+                let complete = transcript.{ size: size }
+                if size > transcript_ceiling() or
+                  str_eq(
+                    json_object_get_str(document, "transcript", ""),
+                    transcript_digest(complete)
+                  ) == 0 {
+                    None<GrammarStageCacheRecord>()
+                  } else {
+                    Some<GrammarStageCacheRecord>(
+                      GrammarStageCacheRecord {
+                        transcript: complete,
+                        response: response,
+                        store: json_object_get_str(document, "store", "")
+                      }
+                    )
+                  }
+              }
+            }
+          }
+          _ -> None<GrammarStageCacheRecord>()
+        }
+      }
+  }
+}
+
+fn stage_cache_replay_entries(
+  entries: List<GrammarToolTranscriptEntry>,
+  tokens: GrammarToolTokens
+) -[TypeCheck<HostTypeIdentity>]> bool {
+  let mut current = entries
+  let mut valid = true
+  while valid and not current.is_empty() {
+    match current {
+      Nil -> nil
+      Cons(entry, rest) -> {
+        current = rest
+        let reply = render_line(encode_reply(grammar_tool_answer(tokens, entry.query)))
+        valid = str_eq(reply, entry.reply) == 1
+        nil
+      }
+    }
+  }
+  valid
+}
+
+fn stage_cache_replays(
+  record: GrammarStageCacheRecord,
+  table: i64,
+  source: i64
+) -> bool {
+  host_types.run(
+    table,
+    source,
+    () => stage_cache_replay_entries(record.transcript.entries, grammar_tool_tokens())
+  )
+}
+
+fn stage_cache_observed_current(inputs: List<ToolObservedInput>) -> bool {
+  with file_read_handler() {
+    let mut remaining = inputs
+    let mut current = true
+    while current and not remaining.is_empty() {
+      match remaining {
+        Nil -> nil
+        Cons(input, rest) -> {
+          remaining = rest
+          current = match input.outcome {
+            ToolObservedFailure(_) -> false
+            ToolObservedContent(size, digest) -> match file.read_all(input.path, input.limit) {
+              Err(_) -> false
+              Ok(content) -> content.len() == size and str_eq(content_digest(content), digest) ==
+                1
+            }
+          }
+          nil
+        }
+      }
+    }
+    current
+  }
+}
+
+fn stage_cache_artifact(
+  artifact: ToolStagedArtifact,
+  record: GrammarStageCacheRecord
+) -> Option<GrammarStagedArtifact> {
+  if artifact.budget > byte_ceiling() or record.store == "" { None<GrammarStagedArtifact>() }
+  else {
+    match path.from_utf8(record.store) {
+      Err(_) -> None<GrammarStagedArtifact>()
+      Ok(store_path) -> with file_read_handler() {
+        match file.read_all(store_path, artifact.budget) {
+          Err(_) -> None<GrammarStagedArtifact>()
+          Ok(content) -> if content.len() != artifact.size or
+            str_eq(content_digest(content), artifact.content) == 0 {
+              None<GrammarStagedArtifact>()
+            } else {
+              Some<GrammarStagedArtifact>(
+                GrammarStagedArtifact {
+                  content: artifact.content,
+                  size: artifact.size,
+                  budget: artifact.budget,
+                  bytes: content,
+                  facts: artifact.facts,
+                  observed_inputs: record.response.observed_inputs,
+                  store: record.store,
+                  host_transcript: transcript_digest(record.transcript)
+                }
+              )
+            }
+        }
+      }
+    }
+  }
+}
+
+fn stage_cache_outcome(
+  identity: GrammarStageCacheIdentity,
+  record: GrammarStageCacheRecord,
+  request: ToolRequest,
+  table: i64,
+  source: i64
+) -> Option<GrammarStageOutcome> {
+  if str_eq(record.transcript.request, identity.request) == 0 or
+    not same_grammar(record.response.grammar, request.grammar) or
+    not stage_cache_observed_current(record.response.observed_inputs) or
+    not stage_cache_replays(record, table, source) {
+      None<GrammarStageOutcome>()
+    } else {
+      let digest = transcript_digest(record.transcript)
+      match request.operation {
+        ToolOperationCheck -> match record.response.check {
+          ToolChecked -> Some<GrammarStageOutcome>(
+            GrammarStageValidated(
+              GrammarValidatedStage {
+                observed_inputs: record.response.observed_inputs,
+                host_transcript: digest
+              }
+            )
+          )
+          _ -> None<GrammarStageOutcome>()
+        }
+        ToolOperationStage(_) -> match record.response.stage {
+          ToolStaged(artifact) -> match stage_cache_artifact(artifact, record) {
+            Some(staged) -> Some<GrammarStageOutcome>(GrammarStageStaged(staged))
+            None -> None<GrammarStageOutcome>()
+          }
+          ToolStagedNothing -> Some<GrammarStageOutcome>(
+            GrammarStageValidated(
+              GrammarValidatedStage {
+                observed_inputs: record.response.observed_inputs,
+                host_transcript: digest
+              }
+            )
+          )
+          _ -> None<GrammarStageOutcome>()
+        }
+      }
+    }
+}
+
+fn stage_cache_lookup(
+  identity: GrammarStageCacheIdentity,
+  request: ToolRequest,
+  table: i64,
+  source: i64
+) -> Option<GrammarStageOutcome> {
+  if identity.path.len() == __i64_to_usize(0) { None<GrammarStageOutcome>() }
+  else {
+    match path.from_utf8(identity.path) {
+      Err(_) -> None<GrammarStageOutcome>()
+      Ok(record_path) -> with file_read_handler() {
+        match file.read_all(record_path, transcript_ceiling() * __i64_to_usize(3)) {
+          Err(_) -> None<GrammarStageOutcome>()
+          Ok(content) -> match content.to_utf8() {
+            Err(_) -> None<GrammarStageOutcome>()
+            Ok(text) -> match stage_cache_decode(identity, text) {
+              None -> None<GrammarStageOutcome>()
+              Some(record) -> stage_cache_outcome(identity, record, request, table, source)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn stage_cache_publish(
+  identity: GrammarStageCacheIdentity,
+  export: GrammarToolExport,
+  target: NativeLinkTarget,
+  record: GrammarStageCacheRecord
+) -> nil {
+  if identity.path.len() > __i64_to_usize(0) and record.transcript.complete and
+    stage_cache_observed_current(record.response.observed_inputs) {
+      match stage_cache_render(identity, record) {
+        None -> nil
+        Some(text) -> {
+          stage_cache_ensure_directory(target, export)
+          publish_file(identity.path, __str_ptr(text), __str_len(text), 420)
+          nil
+        }
+      }
+    } else { nil }
+}
+
 --- Stage one site: check the source against the host module's types and,
 --- for a typed-plan export, drive the export's staging into a private sink
 --- directory, verify what arrived against what the driver reported, and
@@ -1765,75 +2296,151 @@ pub(package) fn grammar_tool_stage(
   sequence: i64,
   deadline: Instant
 ) -[Proc]> GrammarStageOutcome {
-  let identity = grammar_tool_identity(export)
+  let grammar = grammar_tool_identity(export)
   match export.capability {
     StagingValidateOnly -> {
       let request = ToolRequest {
-        grammar: identity,
+        grammar: grammar,
         source_name: source_name,
         source_text: source_text,
         context: ToolHostContext,
         operation: ToolOperationCheck
       }
-      match grammar_tool_exchange_with_host(product, request, table, source, deadline) {
-        GrammarToolFailed(failure) -> GrammarStageFailed(failure)
-        GrammarToolAnswered(response) -> match response.check {
-          ToolChecked -> GrammarStageValidated(response.observed_inputs)
-          _ -> GrammarStageRefused(response)
-        }
-      }
-    }
-    StagingTypedPlan -> match stage_sink_directory(sequence) {
-      Err(code) -> GrammarStageSinkUnavailable(code)
-      Ok(directory) -> {
-        let outcome = match path.from_utf8(directory) {
-          Err(_) -> GrammarStageSinkUnavailable(22)
-          Ok(sink) -> {
-            let request = ToolRequest {
-              grammar: identity,
-              source_name: source_name,
-              source_text: source_text,
-              context: ToolHostContext,
-              operation: ToolOperationStage(
-                ToolStageTarget {
-                  capability: StagingTypedPlan,
-                  platform: native_link_target_name(target),
-                  sink: sink
+      let cache_identity = stage_cache_identity(product, export, target, request)
+      match stage_cache_lookup(cache_identity, request, table, source) {
+        Some(cached) -> cached
+        None -> match grammar_tool_exchange_recorded_with_host(
+          product,
+          request,
+          request,
+          table,
+          source,
+          deadline
+        ) {
+          GrammarToolRecordedFailed(failure) -> GrammarStageFailed(failure)
+          GrammarToolRecordedAnswered(response, transcript) -> match response.check {
+            ToolChecked -> {
+              stage_cache_publish(
+                cache_identity,
+                export,
+                target,
+                GrammarStageCacheRecord {
+                  transcript: transcript,
+                  response: response,
+                  store: ""
+                }
+              )
+              GrammarStageValidated(
+                GrammarValidatedStage {
+                  observed_inputs: response.observed_inputs,
+                  host_transcript: transcript_digest(transcript)
                 }
               )
             }
-            match grammar_tool_exchange_with_host(product, request, table, source, deadline) {
-              GrammarToolFailed(failure) -> GrammarStageFailed(failure)
-              GrammarToolAnswered(response) -> match response.stage {
-                ToolStaged(artifact) -> if artifact.budget > byte_ceiling() {
-                  GrammarStageVerifyFailed(StagingOverBudget(artifact.budget))
-                } else {
-                  match stage_verify(directory, artifact) {
-                    Err(failure) -> GrammarStageVerifyFailed(failure)
-                    Ok(bytes) -> match stage_store(directory, target, export, artifact) {
-                      Err(code) -> GrammarStageStoreFailed(code)
-                      Ok(store) -> GrammarStageStaged(
-                        GrammarStagedArtifact {
-                          content: artifact.content,
-                          size: artifact.size,
-                          budget: artifact.budget,
-                          bytes: bytes,
-                          facts: artifact.facts,
+            _ -> GrammarStageRefused(response)
+          }
+        }
+      }
+    }
+    StagingTypedPlan -> {
+      let semantic_request = ToolRequest {
+        grammar: grammar,
+        source_name: source_name,
+        source_text: source_text,
+        context: ToolHostContext,
+        operation: ToolOperationStage(
+          ToolStageTarget {
+            capability: StagingTypedPlan,
+            platform: native_link_target_name(target),
+            sink: path.from_utf8("artifact").unwrap()
+          }
+        )
+      }
+      let cache_identity = stage_cache_identity(product, export, target, semantic_request)
+      match stage_cache_lookup(cache_identity, semantic_request, table, source) {
+        Some(cached) -> cached
+        None -> match stage_sink_directory(sequence) {
+          Err(code) -> GrammarStageSinkUnavailable(code)
+          Ok(directory) -> {
+            let outcome = match path.from_utf8(directory) {
+              Err(_) -> GrammarStageSinkUnavailable(22)
+              Ok(sink) -> {
+                let request = semantic_request.{
+                  operation: ToolOperationStage(
+                    ToolStageTarget {
+                      capability: StagingTypedPlan,
+                      platform: native_link_target_name(target),
+                      sink: sink
+                    }
+                  )
+                }
+                match grammar_tool_exchange_recorded_with_host(
+                  product,
+                  request,
+                  semantic_request,
+                  table,
+                  source,
+                  deadline
+                ) {
+                  GrammarToolRecordedFailed(failure) -> GrammarStageFailed(failure)
+                  GrammarToolRecordedAnswered(response, transcript) -> match response.stage {
+                    ToolStaged(artifact) -> if artifact.budget > byte_ceiling() {
+                      GrammarStageVerifyFailed(StagingOverBudget(artifact.budget))
+                    } else {
+                      match stage_verify(directory, artifact) {
+                        Err(failure) -> GrammarStageVerifyFailed(failure)
+                        Ok(bytes) -> match stage_store(directory, target, export, artifact) {
+                          Err(code) -> GrammarStageStoreFailed(code)
+                          Ok(store) -> {
+                            let record = GrammarStageCacheRecord {
+                              transcript: transcript,
+                              response: response,
+                              store: store
+                            }
+                            stage_cache_publish(cache_identity, export, target, record)
+                            GrammarStageStaged(
+                              GrammarStagedArtifact {
+                                content: artifact.content,
+                                size: artifact.size,
+                                budget: artifact.budget,
+                                bytes: bytes,
+                                facts: artifact.facts,
+                                observed_inputs: response.observed_inputs,
+                                store: store,
+                                host_transcript: transcript_digest(transcript)
+                              }
+                            )
+                          }
+                        }
+                      }
+                    }
+                    ToolStagedNothing -> {
+                      stage_cache_publish(
+                        cache_identity,
+                        export,
+                        target,
+                        GrammarStageCacheRecord {
+                          transcript: transcript,
+                          response: response,
+                          store: ""
+                        }
+                      )
+                      GrammarStageValidated(
+                        GrammarValidatedStage {
                           observed_inputs: response.observed_inputs,
-                          store: store
+                          host_transcript: transcript_digest(transcript)
                         }
                       )
                     }
+                    _ -> GrammarStageRefused(response)
                   }
                 }
-                ToolStagedNothing -> GrammarStageValidated(response.observed_inputs)
-                _ -> GrammarStageRefused(response)
               }
             }
+            stage_sink_cleanup(directory)
+            outcome
           }
         }
-        stage_sink_cleanup(directory)
-        outcome
       }
     }
   }
