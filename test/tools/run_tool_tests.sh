@@ -5056,6 +5056,105 @@ assert_contains "installed_task_scope_rejects_both_scheduler_operations" "$insta
 installed_sdk_identity=$(cd "$tmp_sdk_layout_dir/app" && "$tmp_sdk_layout_dir/bin/weft" version --json)
 assert_contains "installed_compiler_reports_embedded_sdk" "$installed_sdk_identity" '"sdk":{"kind":"embedded","archive_version":1,"digest":"sha256:'
 
+# A detached compiler using only its embedded SDK can discover and stage a
+# grammar exported by a path dependency. The driver is always a host product;
+# its plan is platform-neutral data embedded into either target product.
+mkdir -p "$tmp_sdk_layout_dir/staged_app/deps/external"
+cp "$PROJECT_ROOT/module_fixtures/toy_grammar.weft" \
+  "$tmp_sdk_layout_dir/staged_app/deps/external/grammar.weft"
+printf '%s\n' \
+  '{"package":"external","manifest_version":1,"version":"0.5.0","weft":"0.1","exports":{"grammars":{"files":{"module":"grammar","declaration":"FileAssignmentGrammar","execution":"typed_plan","tooling":"grammar"}}}}' \
+  > "$tmp_sdk_layout_dir/staged_app/deps/external/weft.pkg"
+printf '%s\n' \
+  '{"package":"detached-consumer","manifest_version":1,"version":"0.1.0","weft":"0.1","dependencies":{"external":"deps/external"}}' \
+  > "$tmp_sdk_layout_dir/staged_app/weft.pkg"
+printf '%s' 'schema-v1' > "$tmp_sdk_layout_dir/staged_app/context.txt"
+printf '%s' 'use external/grammar.{FileAssignmentGrammar}
+use stdlib/bytes
+use stdlib/grammar/staging.{embed_with_file}
+use stdlib/result
+fn main() -> i64 {
+  let staged = embed_with_file<FileAssignmentGrammar>(r#"count = 3"#, "context.txt")
+  match staged.artifact {
+    Some(artifact) -> if artifact.bytes.to_utf8().unwrap_or("") == "count\nschema-v1" {
+      0
+    } else { 3 }
+    None -> 4
+  }
+}
+' > "$tmp_sdk_layout_dir/staged_app/main.weft"
+for staged_target in macos-aarch64 linux-aarch64; do
+  (
+    cd "$tmp_sdk_layout_dir/staged_app"
+    "$tmp_sdk_layout_dir/bin/weft" build main.weft \
+      -o "app-$staged_target" \
+      --target "$staged_target" \
+      --artifact-facts "app-$staged_target.facts.json"
+  ) > "$tmp_out" 2> "$tmp_err"
+  assert_equals \
+    "detached_external_staging_${staged_target}_has_no_diagnostics" \
+    "$(<"$tmp_err")" \
+    ""
+  staged_facts=$(<"$tmp_sdk_layout_dir/staged_app/app-$staged_target.facts.json")
+  assert_contains \
+    "detached_external_staging_${staged_target}_names_path_dependency" \
+    "$staged_facts" \
+    '"package":"external","version":"0.5.0","export":"files","module":"grammar","declaration":"FileAssignmentGrammar"'
+  assert_contains \
+    "detached_external_staging_${staged_target}_uses_host_driver" \
+    "$staged_facts" \
+    '"driver":"target/'"$host_target"'/grammar-tools/external-files-'
+done
+detached_macos_plan=$(
+  jq -r '.staging_sites[0].staged.content' \
+    "$tmp_sdk_layout_dir/staged_app/app-macos-aarch64.facts.json"
+)
+detached_linux_plan=$(
+  jq -r '.staging_sites[0].staged.content' \
+    "$tmp_sdk_layout_dir/staged_app/app-linux-aarch64.facts.json"
+)
+assert_equals \
+  "detached_external_staging_plan_is_platform_neutral" \
+  "$detached_linux_plan" \
+  "$detached_macos_plan"
+assert_contains \
+  "detached_external_staging_linux_product_is_static_elf" \
+  "$(/usr/bin/file -b "$tmp_sdk_layout_dir/staged_app/app-linux-aarch64")" \
+  "statically linked"
+run_binary_guarded "$tmp_sdk_layout_dir/staged_app/app-$host_target"
+echo "  ok detached_external_staged_host_product_observes_plan"
+detached_stage_driver=$(
+  ls "$tmp_sdk_layout_dir"/staged_app/target/"$host_target"/grammar-tools/external-files-* \
+    2>/dev/null | grep -v '\.weft$\|\.stamp\.json$' | head -1
+)
+chmod -x "$detached_stage_driver"
+printf '%s' 'schema-v2' > "$tmp_sdk_layout_dir/staged_app/context.txt"
+set +e
+detached_context_changed=$(
+  cd "$tmp_sdk_layout_dir/staged_app"
+  "$tmp_sdk_layout_dir/bin/weft" build main.weft \
+    -o app-context-changed \
+    --target "$host_target" \
+    2>&1
+)
+detached_context_changed_exit=$?
+set -e
+assert_equals \
+  "detached_external_changed_context_invalidates_cache_exit" \
+  "$detached_context_changed_exit" \
+  "1"
+assert_contains \
+  "detached_external_changed_context_reruns_driver" \
+  "$detached_context_changed" \
+  "grammar tool driver could not be started"
+chmod +x "$detached_stage_driver"
+if find "$tmp_sdk_layout_dir/staged_app/.weft/staging" -mindepth 1 -print -quit | grep -q .; then
+  echo "  fail detached_external_staging_cleanup"
+  exit 1
+else
+  echo "  ok detached_external_staging_cleanup"
+fi
+
 # SQL is a public semantic package, not a client of compiler-private storage.
 sql_private_dependencies=$(grep -Enr '(^use (compiler|runtime)/)|__[a-zA-Z]' stdlib/grammar/sql.weft stdlib/grammar/sql || true)
 assert_equals "sql_package_has_no_private_compiler_or_runtime_dependencies" "$sql_private_dependencies" ""
