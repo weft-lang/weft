@@ -1,0 +1,199 @@
+-- Physical representation gate for typed checker storage.
+
+use compiler/source/input.{source_from_text}
+use compiler/weft/check/storage.{*}
+use compiler/weft/grammar.{ParsedWeftSource, WeftParser}
+use compiler/weft/syntax/declarations.{SourceDeclaration}
+use runtime/rc_implicit_test.{
+  RuntimeRcProbe,
+  runtime_rc_probe_count,
+  runtime_rc_probe_load,
+  runtime_rc_probe_new,
+  runtime_rc_test_heap_arena_offset
+}
+use stdlib/diagnostic.{Diagnose}
+use stdlib/grammar.{Grammar, Parsed}
+use stdlib/io.{io_read_file_raw}
+use stdlib/list as list
+use stdlib/list.{List, Cons, Nil}
+use stdlib/option
+use stdlib/option.{None, Some}
+use stdlib/panic.{panic}
+
+type ProbeTypeId = opaque usize
+
+type ProbeExprId = opaque usize
+
+type ProbeExpr {
+  ProbeInt(i64, ProbeTypeId),
+  ProbeAdd(ProbeExprId, ProbeExprId, ProbeTypeId),
+  ProbeResolvedCall(usize, List<ProbeExprId>, ProbeTypeId)
+}
+
+fn probe_type(value: usize) -> ProbeTypeId { ProbeTypeId(value) }
+
+fn probe_expr(value: DenseIndex) -> ProbeExprId {
+  ProbeExprId(dense_index_value(value))
+}
+
+fn probe_id_value(value: ProbeExprId) -> usize {
+  match value { ProbeExprId(index) -> index }
+}
+
+fn probe_type_value(value: ProbeTypeId) -> usize {
+  match value { ProbeTypeId(index) -> index }
+}
+
+fn probe_get(segment: DenseSegment<ProbeExpr>, id: ProbeExprId) -> ProbeExpr {
+  segment.get(dense_index(probe_id_value(id))).expect("probe expression id is in bounds")
+}
+
+fn parsed(text: str) -[Test]> ParsedWeftSource {
+  let result = handle WeftParser().parse(source_from_text(text).all()) {
+    Diagnose.report(diagnostic) -> { Test.assert_true(false); resume(0) }
+    Diagnose.error(message, location) -> { Test.assert_true(false); resume(0) }
+    Diagnose.warn(message, location) -> resume(0)
+    Diagnose.note(message, location) -> resume(0)
+  }
+  match result {
+    Parsed(syntax) -> syntax
+    _ -> panic("expected complete Weft syntax")
+  }
+}
+
+fn declaration_segment(
+  declarations: List<SourceDeclaration>
+) -> DenseSegment<SourceDeclaration> {
+  let mut builder = dense_builder_with_capacity<SourceDeclaration>(declarations.len())
+  let mut remaining = declarations
+  let mut done = false
+  while not done {
+    match remaining {
+      Nil -> { done = true }
+      Cons(declaration, rest) -> {
+        builder.push(declaration)
+        remaining = rest
+      }
+    }
+  }
+  builder.freeze()
+}
+
+fn dead_segment_payload() -> weak RuntimeRcProbe {
+  let value = runtime_rc_probe_new(17)
+  let observation = weak_ref(value)
+  let mut builder = dense_builder<RuntimeRcProbe>()
+  builder.push(value)
+  let segment = builder.freeze()
+  segment.len()
+  observation
+}
+
+test "dense builder assigns stable insertion-order indices" {
+  let mut builder = dense_builder<ProbeExpr>()
+  let int_type = probe_type(1)
+  let left = probe_expr(builder.push(ProbeInt(20, int_type)))
+  let right = probe_expr(builder.push(ProbeInt(22, int_type)))
+  let add = probe_expr(builder.push(ProbeAdd(left, right, int_type)))
+  let segment = builder.freeze()
+
+  Test.assert_eq_usize(segment.len(), 3)
+  match probe_get(segment, add) {
+    ProbeAdd(actual_left, actual_right, actual_type) -> {
+      Test.assert_eq_usize(probe_id_value(actual_left), 0)
+      Test.assert_eq_usize(probe_id_value(actual_right), 1)
+      Test.assert_eq_usize(probe_type_value(actual_type), 1)
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "cold dense lookup returns typed variants and rejects foreign offsets" {
+  let mut builder = dense_builder<ProbeExpr>()
+  let arguments = [ProbeExprId(0), ProbeExprId(1)]
+  builder.push(ProbeResolvedCall(91, list.from_slice(arguments[..]), probe_type(3)))
+  let segment = builder.freeze()
+
+  match segment.get(dense_index(0)) {
+    Some(ProbeResolvedCall(declaration, arguments, result_type)) -> {
+      Test.assert_eq_usize(declaration, 91)
+      Test.assert_eq_usize(arguments.len(), 2)
+      Test.assert_eq_usize(probe_type_value(result_type), 3)
+    }
+    _ -> Test.assert_true(false)
+  }
+  Test.assert_true(match segment.get(dense_index(1)) { None -> true, _ -> false })
+}
+
+test "freezing transfers storage without persistent allocation" {
+  let mut builder = dense_builder_with_capacity<i64>(128)
+  for value in 0..128 { builder.push(value) }
+  let before = runtime_rc_test_heap_arena_offset()
+  let segment = builder.freeze()
+  let after = runtime_rc_test_heap_arena_offset()
+
+  Test.assert_eq(after - before, 0)
+  Test.assert_eq_usize(segment.len(), 128)
+}
+
+test "repeated managed lookup has no persistent allocation or stake drift" {
+  let value = runtime_rc_probe_new(29)
+  let mut builder = dense_builder_with_capacity<RuntimeRcProbe>(1)
+  let id = builder.push(value)
+  let segment = builder.freeze()
+  let stable_count = runtime_rc_probe_count(value)
+
+  for warm in 0..100 {
+    match segment.get(id) {
+      Some(found) -> Test.assert_eq(runtime_rc_probe_load(found), 29)
+      None -> Test.assert_true(false)
+    }
+  }
+  let before = runtime_rc_test_heap_arena_offset()
+  for iteration in 0..10000 {
+    match segment.get(id) {
+      Some(found) -> Test.assert_eq(runtime_rc_probe_load(found), 29)
+      None -> Test.assert_true(false)
+    }
+  }
+  let after = runtime_rc_test_heap_arena_offset()
+
+  Test.assert_eq(after - before, 0)
+  Test.assert_eq(runtime_rc_probe_count(value), stable_count)
+}
+
+test "immutable segment storage is shared by independent consumers" {
+  let mut builder = dense_builder_with_capacity<i64>(4096)
+  for value in 0..4096 { builder.push(value) }
+  let segment = builder.freeze()
+  let first = segment
+  let second = segment
+
+  Test.assert_eq(first.get(dense_index(0)).unwrap(), 0)
+  Test.assert_eq(second.get(dense_index(4095)).unwrap(), 4095)
+  Test.assert_eq_usize(first.len(), second.len())
+}
+
+test "dropping the final segment releases managed payloads" {
+  let observation = dead_segment_payload()
+  Test.assert_true(weak_load(observation) == nil)
+}
+
+test "compiler main declarations freeze and traverse as typed values" {
+  let source = io_read_file_raw("compiler/main.weft")
+  let syntax = parsed(source)
+  let expected = syntax.declarations.declarations.len()
+  let segment = declaration_segment(syntax.declarations.declarations)
+  let mut visited: usize = 0
+  let mut index: usize = 0
+  while index < segment.len() {
+    match segment.get(dense_index(index)) {
+      Some(declaration) -> { visited = visited + 1; nil }
+      None -> { Test.assert_true(false); nil }
+    }
+    index = index + 1
+  }
+
+  Test.assert_true(expected > 0)
+  Test.assert_eq_usize(visited, expected)
+}

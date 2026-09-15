@@ -2717,6 +2717,31 @@ assert_equals "array_census_detachments" "${rc_array_fields[42]}" "1"
 assert_equals "array_census_owner_allocations" "${rc_array_fields[43]}" "3"
 assert_equals "array_census_backing_allocations" "${rc_array_fields[44]}" "2"
 
+# A frozen checked-expression store is columnar: typed scalar ids and facts
+# live in separate immutable segments instead of boxed universal nodes. The
+# fixture performs 10,000 branch inspections. Construction and final cleanup
+# may use a small constant number of RC operations, but none may scale with the
+# inspection loop.
+run_weft_compile_guarded "$WEFT" compile --rc-census \
+  test/fixtures/typed_checker_columnar_census.weft > "$tmp_out" 2> "$tmp_err"
+chmod +x "$tmp_out"
+run_binary_guarded "$tmp_out" > /dev/null 2> "$tmp_err"
+read -r -a checker_storage_fields <<< "$(grep '^WEFT_RC_CENSUS ' "$tmp_err")"
+assert_equals \
+  "typed_checker_storage_census_schema_version" \
+  "${checker_storage_fields[0]}:${checker_storage_fields[1]}" \
+  "WEFT_RC_CENSUS:6"
+if [ "${checker_storage_fields[2]}" -le 64 ] && \
+  [ "${checker_storage_fields[3]}" -le 64 ] && \
+  [ "${checker_storage_fields[4]}" -le 64 ] && \
+  [ "${checker_storage_fields[21]}" -eq 0 ]; then
+  echo "  ok typed_checker_storage_inspection_is_allocation_and_retain_flat"
+else
+  echo "  fail typed_checker_storage_inspection_is_allocation_and_retain_flat"
+  echo "    census: ${checker_storage_fields[*]}"
+  exit 1
+fi
+
 set +e
 "$WEFT" compile --rc-census > "$tmp_out" 2> "$tmp_err"
 compile_rc_census_missing_exit=$?
