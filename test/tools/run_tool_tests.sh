@@ -4634,6 +4634,76 @@ set +e
 staged_run_exit=$?
 set -e
 assert_equals "run_stages_and_runs_a_typed_plan_site" "$staged_run_exit" "0"
+# Test harnesses stage through the same public driver boundary before native
+# emission. Cover the generated harness, its --emit form, and the legacy
+# expected-exit root: all three used to reject an otherwise valid site.
+printf '%s' 'use grammars/assignments.{AssignmentGrammar}
+use stdlib/grammar/staging.{embed}
+type settings { count: i64, name: str }
+test "staged plan is available" {
+  let staged = embed<AssignmentGrammar>(r#"count = 3"#)
+  match staged.artifact {
+    Some(artifact) -> Test.assert_eq_usize(artifact.bytes.len(), __i64_to_usize(27))
+    None -> Test.assert_true(false)
+  }
+}
+' > "$tmp_pkg_dir/staged_pkg/staged_test.weft"
+set +e
+(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" test --jobs 1 staged_test.weft > "$tmp_out" 2> "$tmp_err")
+staged_test_exit=$?
+set -e
+if [ "$staged_test_exit" -ne 0 ]; then /bin/cat "$tmp_err"; fi
+assert_equals "test_stages_a_typed_plan_site" "$staged_test_exit" "0"
+assert_contains "test_runs_the_staged_harness" "$(<"$tmp_err")" "1 passed, 0 failed"
+(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" test --emit staged_test.weft > staged_test_product 2> "$tmp_err")
+assert_equals "test_emit_stages_a_typed_plan_site_stderr_empty" "$(<"$tmp_err")" ""
+chmod +x "$tmp_pkg_dir/staged_pkg/staged_test_product"
+run_binary_guarded "$tmp_pkg_dir/staged_pkg/staged_test_product"
+echo "  ok emitted_test_product_carries_the_staged_artifact"
+printf '%s' '-- Expected exit code: 0
+use grammars/assignments.{AssignmentGrammar}
+use stdlib/grammar/staging.{embed}
+type settings { count: i64, name: str }
+fn main() -> i64 {
+  match embed<AssignmentGrammar>(r#"count = 3"#).artifact {
+    Some(artifact) -> if artifact.bytes.len() == __i64_to_usize(27) { 0 } else { 3 }
+    None -> 4
+  }
+}
+' > "$tmp_pkg_dir/staged_pkg/staged_expected_exit.weft"
+set +e
+(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" test --jobs 1 staged_expected_exit.weft > "$tmp_out" 2> "$tmp_err")
+staged_expected_exit=$?
+set -e
+if [ "$staged_expected_exit" -ne 0 ]; then /bin/cat "$tmp_err"; fi
+assert_equals "test_stages_an_expected_exit_site" "$staged_expected_exit" "0"
+assert_contains "test_runs_the_staged_expected_exit_product" "$(<"$tmp_err")" "1 passed, 0 failed"
+printf '%s' 'use grammars/assignments.{AssignmentGrammar}
+use stdlib/grammar/staging.{embed}
+type settings { count: i64, name: str }
+test "rejected staged plan" {
+  let staged = embed<AssignmentGrammar>(r#"other = 3"#)
+  Test.assert_true(false)
+}
+' > "$tmp_pkg_dir/staged_pkg/staged_test_rejected.weft"
+set +e
+(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" test --jobs 1 staged_test_rejected.weft > "$tmp_out" 2> "$tmp_err")
+staged_test_rejected_exit=$?
+set -e
+assert_equals "test_fails_when_the_grammar_rejects_a_site" "$staged_test_rejected_exit" "1"
+assert_contains "test_reports_the_grammar_diagnostic" "$(<"$tmp_err")" 'settings has no field with this name'
+set +e
+(cd "$tmp_pkg_dir/staged_pkg" && "$WEFT_ABS" test --emit staged_test_rejected.weft > staged_test_rejected_product 2> "$tmp_err")
+staged_test_rejected_emit_exit=$?
+set -e
+assert_equals "test_emit_fails_when_the_grammar_rejects_a_site" "$staged_test_rejected_emit_exit" "1"
+assert_contains "test_emit_reports_the_grammar_diagnostic" "$(<"$tmp_err")" 'settings has no field with this name'
+if [ -s "$tmp_pkg_dir/staged_pkg/staged_test_rejected_product" ]; then
+  echo "  fail rejected_test_emit_writes_no_product"
+  exit 1
+else
+  echo "  ok rejected_test_emit_writes_no_product"
+fi
 # A driver that rejects the source fails the build at the literal, with the
 # grammar's own diagnostic anchored onto the root source.
 printf '%s' 'use grammars/assignments.{AssignmentGrammar}
