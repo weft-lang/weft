@@ -13,13 +13,21 @@ use compiler/project/identity.{
   NamedModuleIdentity,
   AnonymousModuleIdentity,
   declaration_identity_name,
+  declaration_identity_namespace,
   declaration_namespace_code
 }
 use compiler/project/module.{
+  ModuleNameResolution,
+  MissingModuleName,
+  InvisibleModuleName,
+  AmbiguousModuleName,
+  ResolvedDeclarationName,
+  ResolvedModuleName,
   module_decl_fact_find_indexed,
   module_fact_entry_anonymous,
+  module_fact_entry_package,
+  module_fact_entry_source,
   module_fact_find_path,
-  module_fact_find_source,
   module_fact_module_at,
   module_fact_module_count,
   module_id_from_entry
@@ -27,23 +35,54 @@ use compiler/project/module.{
 use compiler/weft/check/registration/catalog.{RegisteredName, RegisteredModule}
 use compiler/weft/check/registration/scope.{
   RegistrationScope,
+  ScopeCandidate,
+  ScopeDeclarationTarget,
   ScopeModuleTarget,
   ScopeNameResolved,
-  registration_scope_find,
-  registration_scope_lookup_span,
-  registration_scope_lookup_declaration_span,
-  registration_scope_lookup_qualified_declaration_span
+  QualifiedScopeResolved,
+  QualifiedScopeInvisible,
+  QualifiedScopeAmbiguous,
+  QualifiedScopeMissing,
+  registration_scope_at,
+  registration_scope_candidate_declaration,
+  registration_scope_declaration_from_lookup,
+  registration_scope_len,
+  registration_scope_lookup_at,
+  registration_scope_lookup_qualified_declaration_span,
+  registration_scope_lookup_span_at,
+  registration_name_belongs_to,
+  registration_scope_qualified_from_lookup
 }
+use stdlib/map as map
+use stdlib/map.{Map}
 use stdlib/option.{Option, Some, None}
 use stdlib/source.{Span}
 
-pub(package) type RegistrationStorage = opaque(i64, RegistrationScope)
+pub(package) type RegistrationStorage = opaque(
+  i64,
+  RegistrationScope,
+  Map<i64, i64>
+)
 
 pub(package) fn registration_storage(
   table: i64,
   registrations: RegistrationScope
 ) -> RegistrationStorage {
-  RegistrationStorage((table, registrations))
+  let mut index = map.new<i64, i64>()
+  let length = __u64_to_i64(__usize_to_u64(registration_scope_len(registrations)))
+  for ordinal in 0..length {
+    let module = registration_scope_at(registrations, ordinal)
+    let entry = module_entry_for_identity(table, module.identity)
+    if entry != 0 {
+      let source = module_fact_entry_source(entry)
+      -- Retained source buffers and raw module entries are distinct live
+      -- allocations. One scalar map therefore indexes source -> entry and
+      -- entry -> typed ordinal without widening the storage ABI.
+      index = index.insert(source, entry)
+      index = index.insert(entry, ordinal)
+    } else { nil }
+  }
+  RegistrationStorage((table, registrations, index))
 }
 
 fn module_entry_for_identity(table: i64, identity: ModuleIdentity) -> i64 {
@@ -54,13 +93,14 @@ fn module_entry_for_identity(table: i64, identity: ModuleIdentity) -> i64 {
       __str_len(path),
       package_id
     )
-    AnonymousModuleIdentity(ordinal) -> {
+    AnonymousModuleIdentity(ordinal, package_id) -> {
       let mut index: i64 = 0
       while index < module_fact_module_count(table) {
         let entry = module_fact_module_at(table, index)
-        if module_fact_entry_anonymous(entry) == __u64_to_i64(__usize_to_u64(ordinal)) {
-          return entry
-        }
+        if module_fact_entry_anonymous(entry) == __u64_to_i64(__usize_to_u64(ordinal)) and
+          module_fact_entry_package(entry) == package_id {
+            return entry
+          }
         index = index + 1
       }
       0
@@ -77,20 +117,26 @@ fn span_length(span: Span) -> i64 {
 }
 
 pub(package) fn registration_storage_declaration(
-  storage: RegistrationStorage,
+  storage: borrow RegistrationStorage,
   identity: DeclarationIdentity
 ) -> i64 {
   match storage {
-    RegistrationStorage((table, _)) -> match identity {
-      ModuleDeclarationIdentity(module, namespace, name) -> module_decl_fact_find_indexed(
-        table,
-        module_entry_for_identity(table, module),
-        0,
-        declaration_namespace_code(namespace),
-        __str_ptr(name.source().text),
-        span_start(name),
-        span_length(name)
-      )
+    RegistrationStorage((table, _, index)) -> match identity {
+      ModuleDeclarationIdentity(module, namespace, name) -> {
+        let entry = match index.get(__str_ptr(name.source().text)) {
+          Some(found) -> found
+          None -> module_entry_for_identity(table, module)
+        }
+        module_decl_fact_find_indexed(
+          table,
+          entry,
+          0,
+          declaration_namespace_code(namespace),
+          __str_ptr(name.source().text),
+          span_start(name),
+          span_length(name)
+        )
+      }
       MemberDeclarationIdentity(owner, namespace, name) -> {
         let raw_owner = registration_storage_declaration(storage, owner)
         if raw_owner == 0 { 0 }
@@ -130,24 +176,81 @@ fn registered_module_span(
   }
 }
 
-fn source_module(
-  table: i64,
-  registrations: RegistrationScope,
-  source: i64
-) -> Option<(ModuleIdentity, RegisteredModule)> {
-  let entry = module_fact_find_source(table, source)
-  if entry == 0 { None<(ModuleIdentity, RegisteredModule)>() }
-  else {
-    let identity = module_id_from_entry(entry)
-    match registration_scope_find(registrations, identity) {
-      Some(module) -> Some((identity, module))
-      None -> None<(ModuleIdentity, RegisteredModule)>()
+fn registered_span(
+  registrations: borrow RegistrationScope,
+  source: i64,
+  start: i64,
+  length: i64
+) -> Option<Span> {
+  let count = __u64_to_i64(__usize_to_u64(registration_scope_len(registrations)))
+  for ordinal in 0..count {
+    match registered_module_span(
+      registration_scope_at(registrations, ordinal),
+      source,
+      start,
+      length
+    ) {
+      Some(span) -> return Some(span)
+      None -> nil
     }
+  }
+  None<Span>()
+}
+
+fn source_module(
+  index: borrow Map<i64, i64>,
+  registrations: borrow RegistrationScope,
+  source: i64
+) -> Option<(ModuleIdentity, RegisteredModule, i64)> {
+  match index.get(source) {
+    Some(entry) -> match index.get(entry) {
+      Some(ordinal) -> {
+        let module = registration_scope_at(registrations, ordinal)
+        Some((module.identity, module, ordinal))
+      }
+      None -> None<(ModuleIdentity, RegisteredModule, i64)>()
+    }
+    None -> None<(ModuleIdentity, RegisteredModule, i64)>()
+  }
+}
+
+fn module_ordinal(
+  table: i64,
+  index: borrow Map<i64, i64>,
+  identity: ModuleIdentity
+) -> i64 {
+  let entry = module_entry_for_identity(table, identity)
+  if entry == 0 { 0 - 1 }
+  else { index.get(entry).unwrap_or(0 - 1) }
+}
+
+fn qualified_lookup(
+  table: i64,
+  registrations: borrow RegistrationScope,
+  index: borrow Map<i64, i64>,
+  caller: ModuleIdentity,
+  caller_ordinal: i64,
+  qualifier: Span,
+  spelling: Span
+) -> QualifiedScopeLookup {
+  match registration_scope_lookup_span_at(registrations, caller_ordinal, qualifier) {
+    ScopeNameResolved(candidate) -> match candidate.target {
+      ScopeModuleTarget(target) -> {
+        let target_ordinal = module_ordinal(table, index, target)
+        registration_scope_qualified_from_lookup(
+          registration_scope_lookup_span_at(registrations, target_ordinal, spelling),
+          target,
+          caller
+        )
+      }
+      _ -> QualifiedScopeMissing
+    }
+    _ -> QualifiedScopeMissing
   }
 }
 
 pub(package) fn registration_storage_lookup_declaration(
-  storage: RegistrationStorage,
+  storage: borrow RegistrationStorage,
   source: i64,
   namespace: DeclarationNamespace,
   name_source: i64,
@@ -155,22 +258,23 @@ pub(package) fn registration_storage_lookup_declaration(
   name_length: i64
 ) -> i64 {
   match storage {
-    RegistrationStorage((table, registrations)) -> match source_module(
-      table,
+    RegistrationStorage((_, registrations, index)) -> match source_module(
+      index,
       registrations,
       source
     ) {
-      Some((module_identity, module)) -> match registered_module_span(
+      Some((_, module, ordinal)) -> match match registered_module_span(
         module,
         name_source,
         name_start,
         name_length
       ) {
-        Some(spelling) -> match registration_scope_lookup_declaration_span(
-          registrations,
-          module_identity,
-          namespace,
-          spelling
+        Some(spelling) -> Some(spelling)
+        None -> registered_span(registrations, name_source, name_start, name_length)
+      } {
+        Some(spelling) -> match registration_scope_declaration_from_lookup(
+          registration_scope_lookup_span_at(registrations, ordinal, spelling),
+          namespace
         ) {
           Some(registered) -> registration_storage_declaration(storage, registered.identity)
           None -> 0
@@ -182,8 +286,71 @@ pub(package) fn registration_storage_lookup_declaration(
   }
 }
 
+pub(package) fn registration_storage_lookup_local_declaration(
+  storage: borrow RegistrationStorage,
+  source: i64,
+  namespace: DeclarationNamespace,
+  name_source: i64,
+  name_start: i64,
+  name_length: i64
+) -> i64 {
+  match storage {
+    RegistrationStorage((_, registrations, index)) -> match source_module(
+      index,
+      registrations,
+      source
+    ) {
+      Some((module_identity, module, ordinal)) -> match registered_module_span(
+        module,
+        name_source,
+        name_start,
+        name_length
+      ) {
+        Some(spelling) -> match registration_scope_declaration_from_lookup(
+          registration_scope_lookup_span_at(registrations, ordinal, spelling),
+          namespace
+        ) {
+          Some(registered) -> if registration_name_belongs_to(
+            registered,
+            module_identity
+          ) {
+            registration_storage_declaration(storage, registered.identity)
+          } else { 0 }
+          None -> 0
+        }
+        None -> 0
+      }
+      None -> 0
+    }
+  }
+}
+
+pub(package) fn registration_storage_lookup_declaration_text(
+  storage: borrow RegistrationStorage,
+  source: i64,
+  namespace: DeclarationNamespace,
+  spelling: str
+) -> i64 {
+  match storage {
+    RegistrationStorage((_, registrations, index)) -> match source_module(
+      index,
+      registrations,
+      source
+    ) {
+      Some((_, _, ordinal)) -> match registration_scope_declaration_from_lookup(
+        registration_scope_lookup_at(registrations, ordinal, spelling),
+        namespace
+      ) {
+        Some(registered) -> registration_storage_declaration(storage, registered.identity)
+        None -> 0
+      }
+      None -> 0
+    }
+  }
+}
+
 pub(package) fn registration_storage_lookup_qualified_declaration(
-  storage: RegistrationStorage,
+  storage: borrow RegistrationStorage,
   source: i64,
   qualifier_source: i64,
   qualifier_start: i64,
@@ -194,12 +361,12 @@ pub(package) fn registration_storage_lookup_qualified_declaration(
   name_length: i64
 ) -> i64 {
   match storage {
-    RegistrationStorage((table, registrations)) -> match source_module(
-      table,
+    RegistrationStorage((table, registrations, index)) -> match source_module(
+      index,
       registrations,
       source
     ) {
-      Some((module_identity, module)) -> match (
+      Some((module_identity, module, _)) -> match (
         registered_module_span(module, qualifier_source, qualifier_start, qualifier_length),
         registered_module_span(module, name_source, name_start, name_length)
       ) {
@@ -221,28 +388,132 @@ pub(package) fn registration_storage_lookup_qualified_declaration(
   }
 }
 
+pub(package) fn registration_storage_resolve_qualified_name(
+  storage: borrow RegistrationStorage,
+  source: i64,
+  qualifier_source: i64,
+  qualifier_start: i64,
+  qualifier_length: i64,
+  name_source: i64,
+  name_start: i64,
+  name_length: i64
+) -> ModuleNameResolution {
+  match storage {
+    RegistrationStorage((table, registrations, index)) -> match source_module(
+      index,
+      registrations,
+      source
+    ) {
+      Some((module_identity, module, ordinal)) -> match (
+        registered_module_span(module, qualifier_source, qualifier_start, qualifier_length),
+        registered_module_span(module, name_source, name_start, name_length)
+      ) {
+        (Some(qualifier), Some(spelling)) -> match qualified_lookup(
+          table,
+          registrations,
+          index,
+          module_identity,
+          ordinal,
+          qualifier,
+          spelling
+        ) {
+          QualifiedScopeMissing -> MissingModuleName
+          QualifiedScopeAmbiguous(_, _) -> AmbiguousModuleName
+          QualifiedScopeInvisible(_) -> InvisibleModuleName
+          QualifiedScopeResolved(candidate) -> match candidate.target {
+            ScopeDeclarationTarget(declaration) ->
+              ResolvedDeclarationName(declaration.identity)
+            ScopeModuleTarget(target) -> ResolvedModuleName(target)
+          }
+        }
+        _ -> MissingModuleName
+      }
+      None -> MissingModuleName
+    }
+  }
+}
+
+fn diagnostic_candidate_declaration(
+  storage: borrow RegistrationStorage,
+  candidate: ScopeCandidate,
+  namespace: DeclarationNamespace
+) -> i64 {
+  match candidate.target {
+    ScopeDeclarationTarget(declaration) -> if declaration_namespace_code(
+      declaration_identity_namespace(declaration.identity)
+    ) == declaration_namespace_code(namespace) {
+      registration_storage_declaration(storage, declaration.identity)
+    } else { 0 }
+    _ -> 0
+  }
+}
+
+pub(package) fn registration_storage_lookup_qualified_declaration_for_diagnostic(
+  storage: borrow RegistrationStorage,
+  source: i64,
+  qualifier_source: i64,
+  qualifier_start: i64,
+  qualifier_length: i64,
+  namespace: DeclarationNamespace,
+  name_source: i64,
+  name_start: i64,
+  name_length: i64
+) -> i64 {
+  match storage {
+    RegistrationStorage((table, registrations, index)) -> match source_module(
+      index,
+      registrations,
+      source
+    ) {
+      Some((module_identity, module, ordinal)) -> match (
+        registered_module_span(module, qualifier_source, qualifier_start, qualifier_length),
+        registered_module_span(module, name_source, name_start, name_length)
+      ) {
+        (Some(qualifier), Some(spelling)) ->
+          match qualified_lookup(
+            table,
+            registrations,
+            index,
+            module_identity,
+            ordinal,
+            qualifier,
+            spelling
+          ) {
+            QualifiedScopeResolved(found) ->
+              diagnostic_candidate_declaration(storage, found, namespace)
+            QualifiedScopeInvisible(found) ->
+              diagnostic_candidate_declaration(storage, found, namespace)
+            _ -> 0
+          }
+        _ -> 0
+      }
+      None -> 0
+    }
+  }
+}
+
 pub(package) fn registration_storage_lookup_module(
-  storage: RegistrationStorage,
+  storage: borrow RegistrationStorage,
   source: i64,
   qualifier_source: i64,
   qualifier_start: i64,
   qualifier_length: i64
 ) -> i64 {
   match storage {
-    RegistrationStorage((table, registrations)) -> match source_module(
-      table,
+    RegistrationStorage((table, registrations, index)) -> match source_module(
+      index,
       registrations,
       source
     ) {
-      Some((module_identity, module)) -> match registered_module_span(
+      Some((_, module, ordinal)) -> match registered_module_span(
         module,
         qualifier_source,
         qualifier_start,
         qualifier_length
       ) {
-        Some(qualifier) -> match registration_scope_lookup_span(
+        Some(qualifier) -> match registration_scope_lookup_span_at(
           registrations,
-          module_identity,
+          ordinal,
           qualifier
         ) {
           ScopeNameResolved(candidate) -> match candidate.target {
@@ -259,7 +530,7 @@ pub(package) fn registration_storage_lookup_module(
 }
 
 pub(package) fn registration_storage_qualifier_is_module(
-  storage: RegistrationStorage,
+  storage: borrow RegistrationStorage,
   source: i64,
   qualifier_source: i64,
   qualifier_start: i64,
