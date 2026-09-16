@@ -40,10 +40,8 @@ if [ "$WEFT_FEEDBACK_JOBS" -lt 1 ]; then
   echo "WEFT_FEEDBACK_JOBS must be a positive integer" >&2
   exit 2
 fi
-# The runtime planner and one shared pool of auxiliary phases run concurrently.
-# Tool shards run in an isolated wave first: they build enough compiler-sized
-# products that overlapping them with the planner turns the wall-time guards
-# into host-load tests. Reserve the feedback pool from the host-selected total
+# The runtime planner and one shared pool of independent tool/auxiliary phases
+# run concurrently. Reserve the feedback pool from the host-selected total
 # unless the caller explicitly chooses a planner width; the runaway stop
 # remains observational only.
 if [ -z "${WEFT_TEST_JOBS:-}" ]; then
@@ -353,15 +351,27 @@ run_feedback_task() {
   esac
 }
 
-run_feedback_schedule() {
-  local schedule=("$@")
+tool_shards_finished() {
+  local shard
+  for shard in core elf_core elf_io elf_system elf_network frontend packages tests; do
+    if [ ! -r "$RESULTS_DIR/tool_$shard.status" ]; then return 1; fi
+  done
+  return 0
+}
+
+run_feedback_phases() {
+  local schedule=(tool_elf_network tool_elf_io tool_tests tool_elf_system bootstrap tool_elf_core linked formatter tool_frontend tool_packages tool_core checker markdown negative signing)
   local pids=()
+  local started
+  local tool_finished=""
   local next=0
   local running=0
   local progress
   local index
   local pid
   local stat
+  started=$(now_s)
+
   while [ "$next" -lt "${#schedule[@]}" ] || [ "$running" -gt 0 ]; do
     while [ "$next" -lt "${#schedule[@]}" ] && [ "$running" -lt "$WEFT_FEEDBACK_JOBS" ]; do
       run_feedback_task "${schedule[$next]}" &
@@ -382,19 +392,16 @@ run_feedback_schedule() {
         progress=1
       fi
     done
+    if [ -z "$tool_finished" ] && tool_shards_finished; then
+      tool_finished=$(($(now_s) - started))
+      printf '%s\n' "$tool_finished" > "$TOOL_PHASE_TIMING"
+    fi
     if [ "$running" -gt 0 ] && [ "$progress" -eq 0 ]; then sleep 0.1; fi
   done
-}
 
-run_tool_phases() {
-  local started
-  started=$(now_s)
-  run_feedback_schedule tool_elf_network tool_elf_io tool_tests tool_elf_system tool_elf_core tool_frontend tool_packages tool_core
-  printf '%s\n' "$(($(now_s) - started))" > "$TOOL_PHASE_TIMING"
-}
-
-run_feedback_phases() {
-  run_feedback_schedule bootstrap linked formatter checker markdown negative signing
+  if [ -z "$tool_finished" ]; then
+    printf '%s\n' "$(($(now_s) - started))" > "$TOOL_PHASE_TIMING"
+  fi
 }
 
 collect_tool_phase() {
@@ -422,7 +429,7 @@ collect_tool_phase() {
   if [ -r "$TOOL_PHASE_TIMING" ]; then
     read -r timing < "$TOOL_PHASE_TIMING" || timing="unknown"
   fi
-  echo "Tool boundary timing: ${timing}s wall, ${WEFT_FEEDBACK_JOBS} isolated shard jobs"
+  echo "Tool boundary timing: ${timing}s wall, ${WEFT_FEEDBACK_JOBS} shared feedback jobs"
   if [ "$status" -eq 0 ]; then
     echo "Tool boundary summary: 8 shards passed, 0 failed"
     PASS=$((PASS+1))
@@ -506,13 +513,6 @@ SIGNING_PHASE_STATUS="$RESULTS_DIR/signing.status"
 FORMATTER_PHASE_STATUS="$RESULTS_DIR/formatter.status"
 MARKDOWN_PHASE_STATUS="$RESULTS_DIR/markdown.status"
 NEGATIVE_PHASE_STATUS="$RESULTS_DIR/negative.status"
-# Compiler-heavy tool shards are reliable in isolation and have their own
-# bounded concurrency. Complete that wave before allowing the project planner
-# and the remaining feedback phases to share the host.
-run_tool_phases &
-FEEDBACK_PHASE_PID=$!
-wait "$FEEDBACK_PHASE_PID" || true
-FEEDBACK_PHASE_PID=""
 run_feedback_phases &
 FEEDBACK_PHASE_PID=$!
 RUNTIME_TEST_FILES=()
