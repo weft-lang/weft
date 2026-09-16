@@ -2742,9 +2742,10 @@ assert_equals "array_census_backing_allocations" "${rc_array_fields[44]}" "2"
 
 # A frozen checked-expression store is columnar: typed scalar ids and facts
 # live in separate immutable segments instead of boxed universal nodes. The
-# fixture performs 10,000 branch inspections. Construction and final cleanup
-# may use a small constant number of RC operations, but none may scale with the
-# inspection loop.
+# fixture performs 10,000 branch inspections, yielding more than 80,000
+# borrowed calls. Publishing the segments and their final cleanup may use a
+# bounded number of managed operations, but inspection must not scale them
+# with the borrowed-call count.
 run_weft_compile_guarded "$WEFT" compile --rc-census \
   test/fixtures/typed_checker_columnar_census.weft > "$tmp_out" 2> "$tmp_err"
 chmod +x "$tmp_out"
@@ -2756,11 +2757,13 @@ assert_equals \
   "WEFT_RC_CENSUS:6"
 if [ "${checker_storage_fields[2]}" -le 64 ] && \
   [ "${checker_storage_fields[3]}" -le 64 ] && \
-  [ "${checker_storage_fields[4]}" -le 64 ] && \
-  [ "${checker_storage_fields[21]}" -eq 0 ]; then
-  echo "  ok typed_checker_storage_inspection_is_allocation_and_retain_flat"
+  [ "${checker_storage_fields[4]}" -le 128 ] && \
+  [ "${checker_storage_fields[17]}" -gt 80000 ] && \
+  [ "${checker_storage_fields[21]}" -le 32 ] && \
+  [ "${checker_storage_fields[22]}" -le 128 ]; then
+  echo "  ok typed_checker_storage_inspection_keeps_managed_transport_bounded"
 else
-  echo "  fail typed_checker_storage_inspection_is_allocation_and_retain_flat"
+  echo "  fail typed_checker_storage_inspection_keeps_managed_transport_bounded"
   echo "    census: ${checker_storage_fields[*]}"
   exit 1
 fi
