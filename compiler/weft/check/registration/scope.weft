@@ -1,0 +1,779 @@
+-- Typed module scopes over retained declaration catalogs.
+--
+-- Package resolution supplies exact target module identities. This producer
+-- owns name visibility, import precedence and ambiguity; it never consults or
+-- constructs the legacy checker table.
+
+use compiler/project/identity.{*}
+use compiler/project/identity/equality.{declaration_identity_eq, module_identity_eq}
+use compiler/project/module.{
+  DeclVisibility,
+  PrivateVisibility,
+  PackageVisibility,
+  PublicVisibility
+}
+use compiler/weft/check/registration/catalog.{
+  RegisteredModule,
+  RegisteredName,
+  declaration_names
+}
+use compiler/weft/syntax/imports.{
+  ImportBinding,
+  ImportDeclaration,
+  ImportModule,
+  ImportName,
+  ImportRenamedSymbol,
+  ImportSelection,
+  ImportSymbol,
+  ImportSymbols,
+  ImportWildcard
+}
+use stdlib/list.{List, Nil}
+use stdlib/option.{Option, Some, None}
+use stdlib/panic.{panic}
+use stdlib/source.{Source, Span}
+use stdlib/string.{str_eq}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push, vector_set}
+
+pub(package) type ResolvedImportSelection {
+  ResolvedImportWildcard,
+  ResolvedImportSymbol(Span, Span)
+}
+
+pub(package) type ResolvedImportBinding {
+  ResolvedModuleImport(Span),
+  ResolvedSymbolImport(List<ResolvedImportSelection>)
+}
+
+pub(package) type ResolvedImport {
+  importer: ModuleIdentity,
+  target: ModuleIdentity,
+  binding: ResolvedImportBinding,
+  visibility: DeclVisibility,
+  weak: bool,
+  location: Option<Span>
+}
+
+pub(package) type ScopeTarget {
+  ScopeDeclarationTarget(RegisteredName),
+  ScopeModuleTarget(ModuleIdentity)
+}
+
+pub(package) type ScopeCandidate {
+  target: ScopeTarget,
+  visibility: DeclVisibility,
+  weak: bool
+}
+
+pub(package) type ScopeEntryStatus {
+  ScopeEntryResolved,
+  ScopeEntryAmbiguous
+}
+
+pub(package) type ScopeEntry {
+  module: ModuleIdentity,
+  spelling: str,
+  primary: ScopeCandidate,
+  conflict: Option<ScopeCandidate>,
+  status: ScopeEntryStatus
+}
+
+pub(package) type ScopeIssueStatus {
+  ScopeImportMissing,
+  ScopeImportInvisible,
+  ScopeImportWidenedReexport,
+  ScopeImportAmbiguous
+}
+
+pub(package) type ScopeIssue {
+  module: ModuleIdentity,
+  spelling: str,
+  import: ResolvedImport,
+  status: ScopeIssueStatus,
+  primary: Option<ScopeCandidate>,
+  conflict: Option<ScopeCandidate>
+}
+
+pub(package) type ScopeLookup {
+  ScopeNameResolved(ScopeCandidate),
+  ScopeNameAmbiguous(ScopeCandidate, Option<ScopeCandidate>),
+  ScopeNameMissing
+}
+
+pub(package) type RegistrationScope = opaque(
+  Vector<RegisteredModule>,
+  Vector<ResolvedImport>,
+  Vector<ScopeEntry>,
+  Vector<ScopeIssue>
+)
+
+fn required_span(source: Source, start: usize, end: usize) -> Span {
+  match source.span(start, end) {
+    Some(span) -> span
+    None -> panic("registered import range is outside its retained source")
+  }
+}
+
+fn import_name_span(source: Source, name: ImportName) -> Span {
+  required_span(source, name.start, name.start + name.length)
+}
+
+fn resolved_import_selection(
+  source: Source,
+  selection: ImportSelection
+) -> ResolvedImportSelection {
+  match selection {
+    ImportWildcard -> ResolvedImportWildcard
+    ImportSymbol(name) -> {
+      let spelling = import_name_span(source, name)
+      ResolvedImportSymbol(spelling, spelling)
+    }
+    ImportRenamedSymbol(name, alias) -> ResolvedImportSymbol(
+      import_name_span(source, name),
+      import_name_span(source, alias)
+    )
+  }
+}
+
+pub(package) fn resolved_import(
+  importer: RegisteredModule,
+  declaration: ImportDeclaration,
+  target: ModuleIdentity,
+  weak: bool
+) -> ResolvedImport {
+  let binding = match declaration.syntax.binding {
+    ImportModule(alias) -> ResolvedModuleImport(import_name_span(importer.source, alias))
+    ImportSymbols(selections) -> ResolvedSymbolImport(
+      selections.map<ResolvedImportSelection>(
+        (selection: ImportSelection) => resolved_import_selection(importer.source, selection)
+      )
+    )
+  }
+  ResolvedImport {
+    importer: importer.identity,
+    target: target,
+    binding: binding,
+    visibility: declaration.visibility,
+    weak: weak,
+    location: Some(
+      required_span(importer.source, declaration.start, declaration.end)
+    )
+  }
+}
+
+pub(package) fn resolved_implicit_wildcard_import(
+  importer: ModuleIdentity,
+  target: ModuleIdentity
+) -> ResolvedImport {
+  ResolvedImport {
+    importer: importer,
+    target: target,
+    binding: ResolvedSymbolImport(
+      Nil<ResolvedImportSelection>().prepend(ResolvedImportWildcard())
+    ),
+    visibility: PrivateVisibility,
+    weak: true,
+    location: None<Span>()
+  }
+}
+
+fn visibility_rank(visibility: DeclVisibility) -> i64 {
+  match visibility {
+    PrivateVisibility -> 0
+    PackageVisibility -> 1
+    PublicVisibility -> 2
+  }
+}
+
+fn target_eq(left: ScopeTarget, right: ScopeTarget) -> bool {
+  match (left, right) {
+    (ScopeDeclarationTarget(a), ScopeDeclarationTarget(b)) ->
+      declaration_occurrence_eq(a.identity, b.identity)
+    (ScopeModuleTarget(a), ScopeModuleTarget(b)) -> module_identity_eq(a, b)
+    _ -> false
+  }
+}
+
+-- Invalid source can declare the same spelling more than once. Semantic name
+-- equality deliberately treats reparsed declarations alike, while scope
+-- collision detection must still distinguish two authored occurrences in one
+-- module. Exact retained ranges supply that occurrence discriminator.
+fn declaration_occurrence_eq(
+  left: DeclarationIdentity,
+  right: DeclarationIdentity
+) -> bool {
+  if not declaration_identity_eq(left, right) { false }
+  else {
+    let left_name = declaration_identity_name(left)
+    let right_name = declaration_identity_name(right)
+    if left_name.start() != right_name.start() or left_name.end() != right_name.end() {
+      false
+    } else {
+      match (declaration_identity_owner(left), declaration_identity_owner(right)) {
+        (nil, nil) -> true
+        (left_owner: DeclarationIdentity, right_owner: DeclarationIdentity) ->
+          declaration_occurrence_eq(left_owner, right_owner)
+        _ -> false
+      }
+    }
+  }
+}
+
+fn candidate_visible_from(
+  candidate: ScopeCandidate,
+  declaring_scope: ModuleIdentity,
+  importer: ModuleIdentity
+) -> bool {
+  if module_identity_eq(declaring_scope, importer) { true }
+  else {
+    match candidate.visibility {
+      PublicVisibility -> true
+      PackageVisibility -> match (declaring_scope, importer) {
+        (NamedModuleIdentity(_, left), NamedModuleIdentity(_, right)) -> left == right
+        _ -> false
+      }
+      PrivateVisibility -> false
+    }
+  }
+}
+
+fn module_item(name: RegisteredName) -> bool {
+  match declaration_identity_namespace(name.identity) {
+    ValueDeclaration -> declaration_identity_owner(name.identity) == nil
+    TypeDeclaration -> declaration_identity_owner(name.identity) == nil
+    EffectDeclaration -> declaration_identity_owner(name.identity) == nil
+    TraitDeclaration -> declaration_identity_owner(name.identity) == nil
+    ConstructorDeclaration -> true
+    _ -> false
+  }
+}
+
+fn required_text(span: Span) -> str {
+  match span.text() {
+    Some(text) -> text
+    None -> panic("registered name range is outside its retained source")
+  }
+}
+
+fn entry_index(
+  entries: borrow Vector<ScopeEntry>,
+  module: ModuleIdentity,
+  spelling: str
+) -> i64 {
+  for index in 0..vector_len<ScopeEntry>(entries) {
+    let entry = vector_get_in_bounds<ScopeEntry>(entries, index)
+    if module_identity_eq(entry.module, module) and str_eq(entry.spelling, spelling) == 1 {
+      return index
+    }
+  }
+  0 - 1
+}
+
+fn replace_entry(entries: borrow Vector<ScopeEntry>, index: i64, entry: ScopeEntry) -> nil {
+  if vector_set<ScopeEntry>(entries, index, entry) { nil }
+  else { panic("typed scope entry index is out of bounds") }
+}
+
+fn add_binding(
+  entries: borrow Vector<ScopeEntry>,
+  module: ModuleIdentity,
+  spelling: str,
+  incoming: ScopeCandidate
+) -> nil {
+  let index = entry_index(entries, module, spelling)
+  if index < 0 {
+    vector_push<ScopeEntry>(
+      entries,
+      ScopeEntry {
+        module: module,
+        spelling: spelling,
+        primary: incoming,
+        conflict: None<ScopeCandidate>(),
+        status: ScopeEntryResolved
+      }
+    )
+    nil
+  } else {
+    let existing = vector_get_in_bounds<ScopeEntry>(entries, index)
+    if existing.primary.weak and not incoming.weak {
+      replace_entry(
+        entries,
+        index,
+        ScopeEntry {
+          module: module,
+          spelling: spelling,
+          primary: incoming,
+          conflict: None<ScopeCandidate>(),
+          status: ScopeEntryResolved
+        }
+      )
+    } else {
+      if not existing.primary.weak and incoming.weak { nil }
+      else {
+        if target_eq(existing.primary.target, incoming.target) {
+          let primary = if visibility_rank(incoming.visibility) >
+            visibility_rank(existing.primary.visibility) {
+              ScopeCandidate {
+                target: existing.primary.target,
+                visibility: incoming.visibility,
+                weak: existing.primary.weak
+              }
+            } else { existing.primary }
+          replace_entry(
+            entries,
+            index,
+            ScopeEntry {
+              module: existing.module,
+              spelling: existing.spelling,
+              primary: primary,
+              conflict: existing.conflict,
+              status: existing.status
+            }
+          )
+        } else {
+          replace_entry(
+            entries,
+            index,
+            ScopeEntry {
+              module: existing.module,
+              spelling: existing.spelling,
+              primary: existing.primary,
+              conflict: match existing.conflict {
+                Some(conflict) -> Some(conflict)
+                None -> Some(incoming)
+              },
+              status: ScopeEntryAmbiguous
+            }
+          )
+        }
+      }
+    }
+  }
+}
+
+fn add_issue(
+  issues: borrow Vector<ScopeIssue>,
+  edge: ResolvedImport,
+  spelling: str,
+  status: ScopeIssueStatus,
+  primary: Option<ScopeCandidate>,
+  conflict: Option<ScopeCandidate>
+) -> nil {
+  vector_push<ScopeIssue>(
+    issues,
+    ScopeIssue {
+      module: edge.importer,
+      spelling: spelling,
+      import: edge,
+      status: status,
+      primary: primary,
+      conflict: conflict
+    }
+  )
+  nil
+}
+
+fn candidates_are_type_constructor_pair(
+  first_candidate: ScopeCandidate,
+  conflict: Option<ScopeCandidate>
+) -> bool {
+  match (first_candidate.target, conflict) {
+    (ScopeDeclarationTarget(first), Some(second_candidate)) -> match second_candidate.target {
+      ScopeDeclarationTarget(second) -> {
+        let first_namespace = declaration_identity_namespace(first.identity)
+        let second_namespace = declaration_identity_namespace(second.identity)
+        (
+          match first_namespace { TypeDeclaration -> true, _ -> false }
+        ) and match second_namespace {
+          ConstructorDeclaration -> match declaration_identity_owner(second.identity) {
+            owner: DeclarationIdentity -> declaration_occurrence_eq(owner, first.identity)
+            nil -> false
+          }
+          _ -> false
+        } or (
+          match second_namespace { TypeDeclaration -> true, _ -> false }
+        ) and match first_namespace {
+          ConstructorDeclaration -> match declaration_identity_owner(first.identity) {
+            owner: DeclarationIdentity -> declaration_occurrence_eq(owner, second.identity)
+            nil -> false
+          }
+          _ -> false
+        }
+      }
+      _ -> false
+    }
+    _ -> false
+  }
+}
+
+fn type_constructor_pair(entry: ScopeEntry) -> bool {
+  candidates_are_type_constructor_pair(entry.primary, entry.conflict)
+}
+
+fn imported_candidate(candidate: ScopeCandidate, edge: ResolvedImport) -> ScopeCandidate {
+  ScopeCandidate {
+    target: candidate.target,
+    visibility: edge.visibility,
+    weak: edge.weak
+  }
+}
+
+fn import_candidate(
+  entries: borrow Vector<ScopeEntry>,
+  issues: borrow Vector<ScopeIssue>,
+  edge: ResolvedImport,
+  target_entry: ScopeEntry,
+  spelling: str,
+  candidate: ScopeCandidate
+) -> nil {
+  if not candidate_visible_from(candidate, target_entry.module, edge.importer) {
+    add_issue(
+      issues,
+      edge,
+      spelling,
+      ScopeImportInvisible,
+      Some(candidate),
+      None
+    )
+  } else {
+    if visibility_rank(edge.visibility) > visibility_rank(candidate.visibility) {
+      add_issue(
+        issues,
+        edge,
+        spelling,
+        ScopeImportWidenedReexport,
+        Some(candidate),
+        None
+      )
+    } else {
+      add_binding(entries, edge.importer, spelling, imported_candidate(candidate, edge))
+    }
+  }
+}
+
+fn import_entry(
+  entries: borrow Vector<ScopeEntry>,
+  issues: borrow Vector<ScopeIssue>,
+  edge: ResolvedImport,
+  target_entry: ScopeEntry,
+  spelling: str
+) -> nil {
+  match target_entry.status {
+    ScopeEntryResolved -> import_candidate(
+      entries,
+      issues,
+      edge,
+      target_entry,
+      spelling,
+      target_entry.primary
+    )
+    ScopeEntryAmbiguous -> if type_constructor_pair(target_entry) {
+      import_candidate(
+        entries,
+        issues,
+        edge,
+        target_entry,
+        spelling,
+        target_entry.primary
+      )
+      match target_entry.conflict {
+        Some(conflict) -> import_candidate(
+          entries,
+          issues,
+          edge,
+          target_entry,
+          spelling,
+          conflict
+        )
+        None -> nil
+      }
+    } else {
+      add_issue(
+        issues,
+        edge,
+        spelling,
+        ScopeImportAmbiguous,
+        Some(target_entry.primary),
+        target_entry.conflict
+      )
+    }
+  }
+}
+
+fn add_wildcard_import(
+  entries: borrow Vector<ScopeEntry>,
+  issues: borrow Vector<ScopeIssue>,
+  edge: ResolvedImport
+) -> nil {
+  let count = vector_len<ScopeEntry>(entries)
+  for index in 0..count {
+    let entry = vector_get_in_bounds<ScopeEntry>(entries, index)
+    if module_identity_eq(entry.module, edge.target) and
+      candidate_visible_from(entry.primary, entry.module, edge.importer) and
+      visibility_rank(edge.visibility) <= visibility_rank(entry.primary.visibility) {
+        import_entry(entries, issues, edge, entry, entry.spelling)
+      }
+  }
+  nil
+}
+
+fn add_selected_import(
+  entries: borrow Vector<ScopeEntry>,
+  issues: borrow Vector<ScopeIssue>,
+  edge: ResolvedImport,
+  selected: Span,
+  local: Span
+) -> nil {
+  let selected_name = required_text(selected)
+  let local_name = required_text(local)
+  let index = entry_index(entries, edge.target, selected_name)
+  if index < 0 {
+    add_issue(issues, edge, local_name, ScopeImportMissing, None, None)
+  } else {
+    import_entry(
+      entries,
+      issues,
+      edge,
+      vector_get_in_bounds<ScopeEntry>(entries, index),
+      local_name
+    )
+  }
+}
+
+fn add_import(
+  entries: borrow Vector<ScopeEntry>,
+  issues: borrow Vector<ScopeIssue>,
+  edge: ResolvedImport
+) -> nil {
+  match edge.binding {
+    ResolvedModuleImport(alias) -> add_binding(
+      entries,
+      edge.importer,
+      required_text(alias),
+      ScopeCandidate {
+        target: ScopeModuleTarget(edge.target),
+        visibility: edge.visibility,
+        weak: edge.weak
+      }
+    )
+    ResolvedSymbolImport(selections) -> for selection in selections {
+      match selection {
+        ResolvedImportWildcard -> add_wildcard_import(entries, issues, edge)
+        ResolvedImportSymbol(selected, local) -> add_selected_import(
+          entries,
+          issues,
+          edge,
+          selected,
+          local
+        )
+      }
+    }
+  }
+  nil
+}
+
+fn module_index(modules: borrow Vector<RegisteredModule>, identity: ModuleIdentity) -> i64 {
+  for index in 0..vector_len<RegisteredModule>(modules) {
+    if module_identity_eq(
+      vector_get_in_bounds<RegisteredModule>(modules, index).identity,
+      identity
+    ) { return index }
+  }
+  0 - 1
+}
+
+fn build_module(
+  modules: borrow Vector<RegisteredModule>,
+  imports: borrow Vector<ResolvedImport>,
+  entries: borrow Vector<ScopeEntry>,
+  issues: borrow Vector<ScopeIssue>,
+  states: borrow Vector<i64>,
+  identity: ModuleIdentity
+) -> nil {
+  let index = module_index(modules, identity)
+  if index < 0 { nil }
+  else {
+    let state = vector_get_in_bounds<i64>(states, index)
+    if state != 0 { nil }
+    else {
+      vector_set<i64>(states, index, 1)
+      let module = vector_get_in_bounds<RegisteredModule>(modules, index)
+      for name in declaration_names(module) {
+        if module_item(name) {
+          add_binding(
+            entries,
+            identity,
+            required_text(declaration_identity_name(name.identity)),
+            ScopeCandidate {
+              target: ScopeDeclarationTarget(name),
+              visibility: name.visibility,
+              weak: false
+            }
+          )
+        }
+      }
+      for import_index in 0..vector_len<ResolvedImport>(imports) {
+        let edge = vector_get_in_bounds<ResolvedImport>(imports, import_index)
+        if module_identity_eq(edge.importer, identity) {
+          build_module(modules, imports, entries, issues, states, edge.target)
+          add_import(entries, issues, edge)
+        }
+      }
+      vector_set<i64>(states, index, 2)
+      nil
+    }
+  }
+}
+
+fn module_vector(modules: List<RegisteredModule>) -> Vector<RegisteredModule> {
+  let result = vector.with_capacity<RegisteredModule>(modules.len())
+  for module in modules { vector_push<RegisteredModule>(result, module) }
+  result
+}
+
+fn import_vector(imports: List<ResolvedImport>) -> Vector<ResolvedImport> {
+  let result = vector.with_capacity<ResolvedImport>(imports.len())
+  for edge in imports { vector_push<ResolvedImport>(result, edge) }
+  result
+}
+
+pub(package) fn registration_scope_build(
+  module_list: List<RegisteredModule>,
+  import_list: List<ResolvedImport>
+) -> RegistrationScope {
+  let modules = module_vector(module_list)
+  let imports = import_vector(import_list)
+  let entries = vector.new<ScopeEntry>()
+  let issues = vector.new<ScopeIssue>()
+  let states = vector.with_capacity<i64>(modules.len())
+  for _ in 0..vector_len<RegisteredModule>(modules) { vector_push<i64>(states, 0) }
+  for index in 0..vector_len<RegisteredModule>(modules) {
+    build_module(
+      modules,
+      imports,
+      entries,
+      issues,
+      states,
+      vector_get_in_bounds<RegisteredModule>(modules, index).identity
+    )
+  }
+  RegistrationScope((modules, imports, entries, issues))
+}
+
+pub(package) fn registration_scope_lookup(
+  scope: RegistrationScope,
+  module: ModuleIdentity,
+  spelling: str
+) -> ScopeLookup {
+  match scope {
+    RegistrationScope((_, _, entries, _)) -> {
+      let index = entry_index(entries, module, spelling)
+      if index < 0 { ScopeNameMissing() }
+      else {
+        let entry = vector_get_in_bounds<ScopeEntry>(entries, index)
+        match entry.status {
+          ScopeEntryResolved -> ScopeNameResolved(entry.primary)
+          ScopeEntryAmbiguous -> ScopeNameAmbiguous(entry.primary, entry.conflict)
+        }
+      }
+    }
+  }
+}
+
+fn candidate_declaration(
+  candidate: ScopeCandidate,
+  namespace: DeclarationNamespace
+) -> Option<RegisteredName> {
+  match candidate.target {
+    ScopeDeclarationTarget(name) -> if declaration_namespace_code(
+      declaration_identity_namespace(name.identity)
+    ) == declaration_namespace_code(namespace) { Some(name) }
+    else { None }
+    ScopeModuleTarget(_) -> None
+  }
+}
+
+pub(package) fn registration_scope_lookup_declaration(
+  scope: RegistrationScope,
+  module: ModuleIdentity,
+  namespace: DeclarationNamespace,
+  spelling: str
+) -> Option<RegisteredName> {
+  match registration_scope_lookup(scope, module, spelling) {
+    ScopeNameMissing -> None
+    ScopeNameResolved(candidate) -> candidate_declaration(candidate, namespace)
+    ScopeNameAmbiguous(primary, conflict) -> if candidates_are_type_constructor_pair(
+      primary,
+      conflict
+    ) {
+      match candidate_declaration(primary, namespace) {
+        Some(name) -> Some(name)
+        None -> match conflict {
+          Some(candidate) -> candidate_declaration(candidate, namespace)
+          None -> None
+        }
+      }
+    } else { None<RegisteredName>() }
+  }
+}
+
+pub(package) fn registration_scope_lookup_qualified_declaration(
+  scope: RegistrationScope,
+  caller: ModuleIdentity,
+  qualifier: str,
+  namespace: DeclarationNamespace,
+  spelling: str
+) -> Option<RegisteredName> {
+  match registration_scope_lookup(scope, caller, qualifier) {
+    ScopeNameResolved(candidate) -> match candidate.target {
+      ScopeModuleTarget(target) -> match scope {
+        RegistrationScope((_, _, entries, _)) -> {
+          let index = entry_index(entries, target, spelling)
+          if index < 0 { None<RegisteredName>() }
+          else {
+            let entry = vector_get_in_bounds<ScopeEntry>(entries, index)
+            let selectable = match entry.status {
+              ScopeEntryResolved -> true
+              ScopeEntryAmbiguous -> type_constructor_pair(entry)
+            }
+            let selected = if not selectable {
+              None<(RegisteredName, ScopeCandidate)>()
+            } else {
+              match candidate_declaration(entry.primary, namespace) {
+                Some(name) -> Some((name, entry.primary))
+                None -> match entry.conflict {
+                  Some(conflict) -> match candidate_declaration(conflict, namespace) {
+                    Some(name) -> Some((name, conflict))
+                    None -> None<(RegisteredName, ScopeCandidate)>()
+                  }
+                  None -> None<(RegisteredName, ScopeCandidate)>()
+                }
+              }
+            }
+            match selected {
+              Some((name, declaration)) -> if candidate_visible_from(
+                declaration,
+                target,
+                caller
+              ) { Some(name) } else { None<RegisteredName>() }
+              None -> None<RegisteredName>()
+            }
+          }
+        }
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+pub(package) fn registration_scope_issue_count(scope: RegistrationScope) -> usize {
+  match scope { RegistrationScope((_, _, _, issues)) -> issues.len() }
+}
+
+pub(package) fn registration_scope_issue_at(scope: RegistrationScope, index: i64) -> ScopeIssue {
+  match scope {
+    RegistrationScope((_, _, _, issues)) -> vector_get_in_bounds<ScopeIssue>(issues, index)
+  }
+}
