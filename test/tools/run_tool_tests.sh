@@ -942,7 +942,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_process_pins_typed_deadline" "$(<"$tmp_out")" "fn wait_until(resource: ProcHandle, deadline: Instant) -> ProcOutput"
     assert_contains "doc_stdlib_process_pins_opaque_session" "$(<"$tmp_out")" "pub type ProcSession = opaque"
     assert_contains "doc_stdlib_process_pins_session_threading" "$(<"$tmp_out")" "fn session_read(session: ProcSession, limit: usize, deadline: Instant) -> (owned ProcSession, ProcReadOutcome)"
-    assert_contains "doc_stdlib_process_pins_session_drop" "$(<"$tmp_out")" "impl stdlib/drop.Drop for ProcSession"
+    assert_contains "doc_stdlib_process_pins_session_drop" "$(<"$tmp_out")" "impl Drop for ProcSession"
   elif [ "$stdlib_doc_name" = "net_address" ]; then
     assert_contains "doc_stdlib_net_address_pins_public_surface" "$(<"$tmp_out")" "Public API items: 23. Documented: 23."
   elif [ "$stdlib_doc_name" = "idna" ]; then
@@ -998,7 +998,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_http_pins_finite_header_count" "$(<"$tmp_out")" "pub fn len(self: HttpHeaders) -> usize"
     assert_contains "doc_stdlib_http_pins_empty_headers" "$(<"$tmp_out")" "pub fn is_empty(self: HttpHeaders) -> bool"
     assert_contains "doc_stdlib_http_pins_finite_header_lookup" "$(<"$tmp_out")" "pub fn get(self: HttpHeaders, index: usize) -> Option<HttpHeader>"
-    assert_contains "doc_stdlib_http_pins_header_iteration" "$(<"$tmp_out")" "impl stdlib/iter/protocol.IntoIterator for HttpHeaders"
+    assert_contains "doc_stdlib_http_pins_header_iteration" "$(<"$tmp_out")" "impl IntoIterator for HttpHeaders"
     assert_not_contains "doc_stdlib_http_hides_header_storage" "$(<"$tmp_out")" "HttpHeadersParts"
     assert_contains "doc_stdlib_http_pins_opaque_head" "$(<"$tmp_out")" "pub type HttpRequestHead = opaque"
     assert_contains "doc_stdlib_http_pins_typed_framing" "$(<"$tmp_out")" "pub type HttpBodyFraming {"
@@ -1101,7 +1101,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "grammar/sql" ]; then
     assert_contains "doc_stdlib_grammar_sql_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
     assert_contains "doc_stdlib_grammar_sql_parser" "$(<"$tmp_out")" "pub fn grammar() -> SqlGrammar"
-    assert_contains "doc_stdlib_grammar_sql_implementation" "$(<"$tmp_out")" "impl stdlib/grammar.Grammar for SqlGrammar"
+    assert_contains "doc_stdlib_grammar_sql_implementation" "$(<"$tmp_out")" "impl Grammar for SqlGrammar"
   elif [ "$stdlib_doc_name" = "grammar/sql/syntax" ]; then
     assert_contains "doc_stdlib_grammar_sql_syntax_public_contract" "$(<"$tmp_out")" "Public API items: 71. Documented: 71."
     assert_contains "doc_stdlib_grammar_sql_syntax_expression" "$(<"$tmp_out")" "pub type SqlExpression {"
@@ -1116,7 +1116,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "grammar/sql/check" ]; then
     assert_contains "doc_stdlib_grammar_sql_check_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
     assert_contains "doc_stdlib_grammar_sql_check_constructor" "$(<"$tmp_out")" "pub fn checker<I>() -> SqlChecker<I>"
-    assert_contains "doc_stdlib_grammar_sql_checked_contract" "$(<"$tmp_out")" "impl<I> stdlib/grammar.CheckedGrammar for SqlChecker<I>"
+    assert_contains "doc_stdlib_grammar_sql_checked_contract" "$(<"$tmp_out")" "impl<I> CheckedGrammar for SqlChecker<I>"
   elif [ "$stdlib_doc_name" = "grammar/sql/execute" ]; then
     assert_contains "doc_stdlib_grammar_sql_execute_public_contract" "$(<"$tmp_out")" "Public API items: 39. Documented: 39."
     assert_contains "doc_stdlib_grammar_sql_execute_checked_input" "$(<"$tmp_out")" "pub fn input<I>(source: SqlPlanSource<I>, rows: SqlInputRows) -> SqlInputSource<I>"
@@ -1137,7 +1137,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "grammar/einsum" ]; then
     assert_contains "doc_stdlib_grammar_einsum_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
     assert_contains "doc_stdlib_grammar_einsum_parser" "$(<"$tmp_out")" "pub fn grammar() -> EinsumGrammar"
-    assert_contains "doc_stdlib_grammar_einsum_implementation" "$(<"$tmp_out")" "impl stdlib/grammar.Grammar for EinsumGrammar"
+    assert_contains "doc_stdlib_grammar_einsum_implementation" "$(<"$tmp_out")" "impl public_grammar.Grammar for EinsumGrammar"
   elif [ "$stdlib_doc_name" = "grammar/einsum/syntax" ]; then
     assert_contains "doc_stdlib_grammar_einsum_syntax_public_contract" "$(<"$tmp_out")" "Public API items: 12. Documented: 12."
     assert_contains "doc_stdlib_grammar_einsum_syntax_axes" "$(<"$tmp_out")" "pub type EinsumAxes = List<EinsumAxis>"
@@ -1150,7 +1150,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "grammar/einsum/check" ]; then
     assert_contains "doc_stdlib_grammar_einsum_check_public_contract" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
     assert_contains "doc_stdlib_grammar_einsum_check_constructor" "$(<"$tmp_out")" "pub fn checker<I>(operands: EinsumOperandSpecs<I>) -> EinsumChecker<I>"
-    assert_contains "doc_stdlib_grammar_einsum_checked_contract" "$(<"$tmp_out")" "impl<I> stdlib/grammar.CheckedGrammar for EinsumChecker<I>"
+    assert_contains "doc_stdlib_grammar_einsum_checked_contract" "$(<"$tmp_out")" "impl<I> CheckedGrammar for EinsumChecker<I>"
   elif [ "$stdlib_doc_name" = "grammar/einsum/execute" ]; then
     assert_contains "doc_stdlib_grammar_einsum_execute_public_contract" "$(<"$tmp_out")" "Public API items: 11. Documented: 11."
     assert_contains "doc_stdlib_grammar_einsum_execute_inputs" "$(<"$tmp_out")" "pub type EinsumInputs = List<Tensor<f64>>"
@@ -1168,7 +1168,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "diagnostic" ]; then
     assert_contains "doc_stdlib_diagnostic_public_facade" "$(<"$tmp_out")" "Public API items: 80. Documented: 80."
     assert_contains "doc_stdlib_diagnostic_location_transform_effects" "$(<"$tmp_out")" "pub fn map_locations<E>(self: Diagnostic, transform: (DiagnosticLocation) -[E]> DiagnosticLocation) -[E]> Diagnostic"
-    assert_contains "doc_stdlib_diagnostic_code_equality" "$(<"$tmp_out")" "impl stdlib/eq.Eq for DiagnosticCode"
+    assert_contains "doc_stdlib_diagnostic_code_equality" "$(<"$tmp_out")" "impl Eq for DiagnosticCode"
     assert_contains "doc_stdlib_diagnostic_finite_related_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticRelatedLocationList) -> usize"
     assert_contains "doc_stdlib_diagnostic_finite_edit_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticTextEditList) -> usize"
     assert_contains "doc_stdlib_diagnostic_finite_field_length" "$(<"$tmp_out")" "pub fn len(self: DiagnosticFieldList) -> usize"
