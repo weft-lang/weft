@@ -34,8 +34,11 @@ export WEFT_TEST_COMPILE_TIMEOUT
 export WEFT_TEST_COMPILE_RSS_LIMIT_KB
 
 CENSUS_ONLY=0
+SELECTED_CASES=()
 if [ "${1:-}" = "__census" ]; then
   CENSUS_ONLY=1
+else
+  SELECTED_CASES=("$@")
 fi
 
 if [ "$CENSUS_ONLY" -eq 0 ]; then
@@ -44,6 +47,15 @@ if [ "$CENSUS_ONLY" -eq 0 ]; then
 fi
 JOB_N=0
 
+case_is_selected() {
+  local requested
+  if [ "${#SELECTED_CASES[@]}" -eq 0 ]; then return 0; fi
+  for requested in "${SELECTED_CASES[@]}"; do
+    if [ "$requested" = "$1" ]; then return 0; fi
+  done
+  return 1
+}
+
 # Register only. One public multi-root project check below owns every source,
 # runs bounded root workers, and replays diagnostics in this exact order.
 check_rejects() {
@@ -51,6 +63,7 @@ check_rejects() {
     JOB_N=$((JOB_N+1))
     return
   fi
+  if ! case_is_selected "$1"; then return; fi
   NAMES[$JOB_N]="$1"
   FILES[$JOB_N]="$2"
   PATTERNS[$JOB_N]="$3"
@@ -1475,6 +1488,11 @@ check_rejects nil_typed_pattern_nullable_scalar test/negative/nil_typed_pattern_
 if [ "$CENSUS_ONLY" -eq 1 ]; then
   echo "$JOB_N"
   exit 0
+fi
+
+if [ "$JOB_N" -eq 0 ]; then
+  echo "negative tests: no registered cases matched: ${SELECTED_CASES[*]}" >&2
+  exit 2
 fi
 
 BATCH_OUTPUT=$(mktemp /tmp/weft_negative_batch_XXXXXX)

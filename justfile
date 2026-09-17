@@ -4,6 +4,44 @@ default: test
 test:
     bash run_tests.sh
 
+# Build one SDK-bearing generation for focused development feedback. This
+# proves that the installed root can compile the live source and gives focused
+# tests a compiler containing that source; it does not prove bootstrap
+# convergence or replace checkpoint acceptance.
+dev-candidate:
+    bash tools/build_dev_candidate.sh
+
+# Exercise one or more affected runtime roots with a fresh one-generation
+# candidate. WEFT_FOCUS_JOBS defaults to four and may be overridden by the
+# caller when the selected roots have a different resource shape.
+test-focus +roots: dev-candidate
+    ./.weft-dev-candidate test --jobs "${WEFT_FOCUS_JOBS:-4}" {{ roots }}
+
+# Exercise every modified, staged, or untracked runnable test/*.weft root with
+# a fresh candidate. WEFT_CHANGED_BASE may add committed changes to the scan.
+test-changed: dev-candidate
+    bash tools/test_changed_roots.sh ./.weft-dev-candidate
+
+# Exercise one affected tool shard with a fresh candidate. Valid shards are
+# core, elf_core, elf_io, elf_system, elf_network, frontend, packages, tests.
+tool-focus shard: dev-candidate
+    WEFT="$PWD/.weft-dev-candidate" WEFT_TOOL_SHARD="{{ shard }}" bash test/tools/run_tool_tests.sh
+
+# Exercise named negative diagnostic cases through one shared checker session.
+negative-focus +cases: dev-candidate
+    WEFT="$PWD/.weft-dev-candidate" bash test/negative/run_negative_tests.sh {{ cases }}
+
+# Exercise the complete documentation boundary with a fresh candidate. This is
+# cheap enough to keep Markdown, source examples, and README facts together.
+docs-focus: dev-candidate
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export WEFT="$PWD/.weft-dev-candidate"
+    python3 test/docs/test_markdown_runner.py
+    bash test/docs/run_markdown_examples.sh README.md docs/getting-started.md docs/networking.md docs/concurrency.md docs/testing.md
+    python3 test/docs/run_source_examples.py
+    bash test/docs/check_readme_facts.sh
+
 # Test the converged candidate without installing it as the trust root.
 # Repository-private fixtures require checkout SDK selection, which depends on
 # the executable being invoked from the checkout rather than from /tmp. The
@@ -21,6 +59,10 @@ test-candidate: bootstrap
         echo "candidate test gate: expected checkout SDK selection: $identity" >&2
         exit 1
     fi
+    # Surface mistakes in edited runtime roots before starting the complete
+    # parallel corpus. This is additive: the unchanged full gate still reruns
+    # the roots and remains the acceptance authority.
+    bash tools/test_changed_roots.sh "$candidate"
     WEFT="$candidate" WEFT_BOOTSTRAP_EVIDENCE_PREFIX=/tmp/weft_b bash run_tests.sh
 
 # Type-check the compiler tree (no codegen)
@@ -110,4 +152,4 @@ bench:
 # with protected guard pages; macOS uses the checked-in release archive under
 # Guard Malloc. Pass the official Mbed TLS tar path on Linux.
 native-binding-diagnostics source_archive="":
-    WEFT_MBEDTLS_SOURCE_ARCHIVE="{{source_archive}}" bash test/run_native_binding_diagnostics.sh
+    WEFT_MBEDTLS_SOURCE_ARCHIVE="{{ source_archive }}" bash test/run_native_binding_diagnostics.sh
