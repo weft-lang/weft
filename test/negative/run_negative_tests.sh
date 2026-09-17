@@ -740,7 +740,7 @@ check_rejects "module_qualified_effect_identity_mismatch" "test/negative/module_
 check_rejects "module_qualified_trait_unknown" "test/negative/module_qualified_trait_unknown.weft" "error[E4002]: unknown module member 'traits.Missing'"
 check_rejects "module_qualified_trait_private" "test/negative/module_qualified_trait_private.weft" "error[E4004]: module member 'traits.HiddenGauge' is not visible"
 check_rejects "module_qualified_trait_identity_mismatch" "test/negative/module_qualified_trait_identity_mismatch.weft" "type error: impl missing required method"
-check_rejects "module_qualified_trait_bound_identity_mismatch" "test/negative/module_qualified_trait_bound_identity_mismatch.weft" 'error[E1004]: type `QualifiedBoundMismatchBox` does not implement `module_fixtures/g2_trait_right.Gauge`'
+check_rejects "module_qualified_trait_bound_identity_mismatch" "test/negative/module_qualified_trait_bound_identity_mismatch.weft" 'error[E1004]: type `QualifiedBoundMismatchBox` does not implement `right.Gauge`'
 check_rejects "module_qualified_trait_bound_unknown" "test/negative/module_qualified_trait_bound_unknown.weft" "error[E4002]: unknown module member 'traits.Missing'"
 check_rejects "module_qualified_trait_bound_private" "test/negative/module_qualified_trait_bound_private.weft" "error[E4004]: module member 'traits.HiddenGauge' is not visible"
 check_rejects "module_qualified_member_ambiguous" "test/negative/module_qualified_member_ambiguous.weft" "error[E4003]: module item 'work' is ambiguous in this scope" 1
