@@ -19,11 +19,12 @@ changed=$(mktemp /tmp/weft_changed_roots_XXXXXX)
 trap 'rm -f "$changed"' EXIT
 cd "$repo_root"
 
-git diff --name-only --diff-filter=ACMR -- 'test/*.weft' >> "$changed"
-git diff --cached --name-only --diff-filter=ACMR -- 'test/*.weft' >> "$changed"
-git ls-files --others --exclude-standard -- 'test/*.weft' >> "$changed"
+git diff --name-only --diff-filter=ACMR -- ':(glob)test/*.weft' >> "$changed"
+git diff --cached --name-only --diff-filter=ACMR -- ':(glob)test/*.weft' >> "$changed"
+git ls-files --others --exclude-standard -- ':(glob)test/*.weft' >> "$changed"
 if [ -n "${WEFT_CHANGED_BASE:-}" ]; then
-  git diff --name-only --diff-filter=ACMR "$WEFT_CHANGED_BASE" -- 'test/*.weft' >> "$changed"
+  git diff --name-only --diff-filter=ACMR "$WEFT_CHANGED_BASE" -- \
+    ':(glob)test/*.weft' >> "$changed"
 fi
 
 roots=()
