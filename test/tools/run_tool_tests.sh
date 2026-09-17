@@ -2769,10 +2769,10 @@ else
 fi
 
 # Full semantic ids retain module identity at graph boundaries. Hot traversal
-# projects one local, scalar-only graph and then follows typed unary/binary
-# edges without repeatedly transporting that identity. The fixture performs
-# 10,000 binary inspections; managed operations must remain bounded while the
-# borrowed-call count scales with the work.
+# projects local scalar-only graph and type-list views, then follows typed
+# binary and list edges without repeatedly transporting that identity. The
+# fixture performs 10,000 inspections of each family; managed operations must
+# remain bounded while the borrowed-call count scales with the work.
 run_weft_compile_guarded "$WEFT" compile --rc-census \
   test/fixtures/semantic_type_graph_census.weft > "$tmp_out" 2> "$tmp_err"
 chmod +x "$tmp_out"
@@ -2782,12 +2782,12 @@ assert_equals \
   "semantic_type_graph_census_schema_version" \
   "${semantic_graph_fields[0]}:${semantic_graph_fields[1]}" \
   "WEFT_RC_CENSUS:6"
-if [ "${semantic_graph_fields[2]}" -le 128 ] && \
-  [ "${semantic_graph_fields[3]}" -le 256 ] && \
-  [ "${semantic_graph_fields[4]}" -le 320 ] && \
-  [ "${semantic_graph_fields[17]}" -gt 170000 ] && \
-  [ "${semantic_graph_fields[21]}" -le 192 ] && \
-  [ "${semantic_graph_fields[22]}" -le 320 ]; then
+if [ "${semantic_graph_fields[2]}" -le 160 ] && \
+  [ "${semantic_graph_fields[3]}" -le 320 ] && \
+  [ "${semantic_graph_fields[4]}" -le 416 ] && \
+  [ "${semantic_graph_fields[17]}" -gt 350000 ] && \
+  [ "${semantic_graph_fields[21]}" -le 224 ] && \
+  [ "${semantic_graph_fields[22]}" -le 384 ]; then
   echo "  ok semantic_type_graph_local_traversal_keeps_managed_transport_bounded"
 else
   echo "  fail semantic_type_graph_local_traversal_keeps_managed_transport_bounded"
