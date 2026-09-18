@@ -1,0 +1,1484 @@
+-- Target byte placement derived from immutable semantic-type facts.
+--
+-- Semantic layout owns value lanes, cleanup kinds and canonical record order.
+-- This module adds only target ABI width/alignment and compact aggregate
+-- descriptors. It never consults the checker table or reconstructs a raw type.
+
+use compiler/backend/target.{
+  NativeLinkLinuxAarch64,
+  NativeLinkMacosAarch64,
+  NativeLinkTarget
+}
+use compiler/project/identity.{DeclarationIdentity}
+use compiler/project/identity/equality.{declaration_identity_eq}
+use compiler/types/graph.{*}
+use compiler/types/graph/catalog.{SemanticTypeCatalog}
+use compiler/types/graph/declarations.{*}
+use compiler/types/graph/layout.{
+  SemanticClosureRelease,
+  SemanticIncompatibleUnionStorage,
+  SemanticManagedRelease,
+  SemanticNoRelease,
+  SemanticRecordLayoutField,
+  SemanticReleaseKind,
+  SemanticUnionStorageClass,
+  SemanticWeakRelease,
+  SemanticWordUnionStorage,
+  SemanticManagedUnionStorage,
+  semantic_field_release_kind,
+  semantic_record_layout_fields,
+  semantic_union_storage_class
+}
+use compiler/types/graph/substitution.{
+  SemanticTypeSubstitution,
+  semantic_type_substitution_empty,
+  semantic_type_substitution_get,
+  semantic_type_substitution_len
+}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/num/scalar.{
+  num_scalar_usize_checked_add,
+  num_scalar_usize_checked_mul
+}
+use stdlib/option.{None, Option, Some}
+use stdlib/panic.{panic}
+
+pub(package) type SemanticTargetStorage {
+  SemanticTargetEmptyStorage,
+  SemanticTargetU8Storage,
+  SemanticTargetI8Storage,
+  SemanticTargetU16Storage,
+  SemanticTargetI16Storage,
+  SemanticTargetU32Storage,
+  SemanticTargetI32Storage,
+  SemanticTargetWordStorage,
+  SemanticTargetPairStorage,
+  SemanticTargetRecordStorage,
+  SemanticTargetArrayStorage,
+  SemanticTargetVariantStorage
+}
+
+pub(package) type SemanticTargetFieldPlacement {
+  SemanticTargetFieldPlacement(
+    SemanticTargetFieldIdentity,
+    usize,
+    usize,
+    SemanticTargetPlacement
+  )
+}
+
+pub(package) type SemanticTargetFieldIdentity {
+  SemanticTargetStructuralField(i64),
+  SemanticTargetDeclaredField(DeclarationIdentity)
+}
+
+pub(package) type SemanticTargetPlacement {
+  SemanticTargetPlacementUnavailable,
+  SemanticTargetPartialPlacement(Option<usize>, Option<usize>),
+  SemanticTargetScalarPlacement(
+    usize,
+    usize,
+    SemanticTargetStorage,
+    SemanticReleaseKind
+  ),
+  SemanticTargetRecordPlacement(
+    usize,
+    usize,
+    List<SemanticTargetFieldPlacement>
+  ),
+  SemanticTargetArrayPlacement(
+    usize,
+    usize,
+    usize,
+    usize,
+    SemanticTargetPlacement
+  ),
+  SemanticTargetVariantPlacement(usize, usize, SemanticTargetPlacement),
+  SemanticTargetDeclaredVariantPlacement(usize, usize)
+}
+
+type SemanticTargetRecordBuild {
+  SemanticTargetRecordBuildUnavailable,
+  SemanticTargetRecordBuild(
+    usize,
+    usize,
+    List<SemanticTargetFieldPlacement>
+  )
+}
+
+fn semantic_target_required_graph(
+  catalog: borrow SemanticTypeCatalog,
+  id: SemanticTypeId
+) -> SemanticTypeGraph {
+  match catalog.graph_for(id) {
+    Some(graph) -> if semantic_type_graph_contains(graph, id) { graph }
+    else { panic("Semantic target placement id is outside its segment") }
+    None -> panic("Semantic target placement catalog is missing a segment")
+  }
+}
+
+fn semantic_target_resolve_from(
+  catalog: borrow SemanticTypeCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  id: SemanticTypeId,
+  remaining: usize
+) -> SemanticTypeId {
+  if remaining == 0 { id }
+  else {
+    let graph = semantic_target_required_graph(catalog, id)
+    match semantic_type_graph_node(graph, id) {
+      SemanticVariableNode(variable) -> match semantic_type_substitution_get(
+        substitution,
+        variable
+      ) {
+        Some(value) -> if semantic_type_id_eq(value, id) { id }
+        else {
+          semantic_target_resolve_from(
+            catalog,
+            substitution,
+            value,
+            remaining - 1
+          )
+        }
+        None -> id
+      }
+      _ -> id
+    }
+  }
+}
+
+fn semantic_target_resolve(
+  catalog: borrow SemanticTypeCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  id: SemanticTypeId
+) -> SemanticTypeId {
+  semantic_target_resolve_from(
+    catalog,
+    substitution,
+    id,
+    semantic_type_substitution_len(substitution) + 1
+  )
+}
+
+fn semantic_target_word_size(target: NativeLinkTarget) -> usize {
+  match target {
+    NativeLinkMacosAarch64 -> 8
+    NativeLinkLinuxAarch64 -> 8
+  }
+}
+
+fn semantic_target_max(left: usize, right: usize) -> usize {
+  if left > right { left } else { right }
+}
+
+fn semantic_target_align_up(value: usize, alignment: usize) -> Option<usize> {
+  if alignment == 0 { None<usize>() }
+  else {
+    let remainder = value - value / alignment * alignment
+    let padding = if remainder == 0 { __i64_to_usize(0) }
+    else { alignment - remainder }
+    num_scalar_usize_checked_add(value, padding)
+  }
+}
+
+fn semantic_target_scalar(
+  size: usize,
+  alignment: usize,
+  storage: SemanticTargetStorage,
+  release: SemanticReleaseKind
+) -> SemanticTargetPlacement {
+  SemanticTargetScalarPlacement(size, alignment, storage, release)
+}
+
+fn semantic_target_word(
+  target: NativeLinkTarget,
+  release: SemanticReleaseKind
+) -> SemanticTargetPlacement {
+  let word = semantic_target_word_size(target)
+  semantic_target_scalar(word, word, SemanticTargetWordStorage, release)
+}
+
+fn semantic_target_primitive(
+  target: NativeLinkTarget,
+  primitive: SemanticPrimitive
+) -> SemanticTargetPlacement {
+  match primitive {
+    SemanticNil -> semantic_target_scalar(
+      0,
+      1,
+      SemanticTargetEmptyStorage,
+      SemanticNoRelease
+    )
+    SemanticBool -> semantic_target_scalar(
+      1,
+      1,
+      SemanticTargetU8Storage,
+      SemanticNoRelease
+    )
+    SemanticU8 -> semantic_target_scalar(
+      1,
+      1,
+      SemanticTargetU8Storage,
+      SemanticNoRelease
+    )
+    SemanticI8 -> semantic_target_scalar(
+      1,
+      1,
+      SemanticTargetI8Storage,
+      SemanticNoRelease
+    )
+    SemanticU16 -> semantic_target_scalar(
+      2,
+      2,
+      SemanticTargetU16Storage,
+      SemanticNoRelease
+    )
+    SemanticI16 -> semantic_target_scalar(
+      2,
+      2,
+      SemanticTargetI16Storage,
+      SemanticNoRelease
+    )
+    SemanticU32 -> semantic_target_scalar(
+      4,
+      4,
+      SemanticTargetU32Storage,
+      SemanticNoRelease
+    )
+    SemanticF32 -> semantic_target_scalar(
+      4,
+      4,
+      SemanticTargetU32Storage,
+      SemanticNoRelease
+    )
+    SemanticI32 -> semantic_target_scalar(
+      4,
+      4,
+      SemanticTargetI32Storage,
+      SemanticNoRelease
+    )
+    SemanticStr -> semantic_target_word(target, SemanticManagedRelease)
+    SemanticI64 -> semantic_target_word(target, SemanticNoRelease)
+    SemanticF64 -> semantic_target_word(target, SemanticNoRelease)
+    SemanticU64 -> semantic_target_word(target, SemanticNoRelease)
+    SemanticIsize -> semantic_target_word(target, SemanticNoRelease)
+    SemanticUsize -> semantic_target_word(target, SemanticNoRelease)
+  }
+}
+
+pub(package) fn semantic_target_placement_size(
+  placement: borrow SemanticTargetPlacement
+) -> Option<usize> {
+  match placement {
+    SemanticTargetPlacementUnavailable -> None<usize>()
+    SemanticTargetPartialPlacement(size, _) -> size
+    SemanticTargetScalarPlacement(size, _, _, _) -> Some<usize>(size)
+    SemanticTargetRecordPlacement(size, _, _) -> Some<usize>(size)
+    SemanticTargetArrayPlacement(size, _, _, _, _) -> Some<usize>(size)
+    SemanticTargetVariantPlacement(size, _, _) -> Some<usize>(size)
+    SemanticTargetDeclaredVariantPlacement(size, _) -> Some<usize>(size)
+  }
+}
+
+pub(package) fn semantic_target_placement_alignment(
+  placement: borrow SemanticTargetPlacement
+) -> Option<usize> {
+  match placement {
+    SemanticTargetPlacementUnavailable -> None<usize>()
+    SemanticTargetPartialPlacement(_, alignment) -> alignment
+    SemanticTargetScalarPlacement(_, alignment, _, _) -> Some<usize>(alignment)
+    SemanticTargetRecordPlacement(_, alignment, _) -> Some<usize>(alignment)
+    SemanticTargetArrayPlacement(_, alignment, _, _, _) -> Some<usize>(alignment)
+    SemanticTargetVariantPlacement(_, alignment, _) -> Some<usize>(alignment)
+    SemanticTargetDeclaredVariantPlacement(_, alignment) -> Some<usize>(alignment)
+  }
+}
+
+fn semantic_target_record_alignment(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  fields: borrow List<SemanticRecordLayoutField>,
+  maximum: usize
+) -> Option<usize> {
+  match fields {
+    Nil -> Some<usize>(maximum)
+    Cons(field, remaining) -> match field {
+      SemanticRecordLayoutField(_, _, field_type) -> {
+        let placement = semantic_target_storage_placement_with_substitution(
+          target,
+          catalog,
+          declarations,
+          substitution,
+          field_type
+        )
+        match semantic_target_placement_alignment(placement) {
+          None -> None<usize>()
+          Some(alignment) -> semantic_target_record_alignment(
+            target,
+            catalog,
+            declarations,
+            substitution,
+            remaining,
+            semantic_target_max(maximum, alignment)
+          )
+        }
+      }
+    }
+  }
+}
+
+fn semantic_target_record_build(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  fields: List<SemanticRecordLayoutField>,
+  offset: usize,
+  maximum_alignment: usize
+) -> SemanticTargetRecordBuild {
+  match fields {
+    Nil -> SemanticTargetRecordBuild(
+      offset,
+      maximum_alignment,
+      Nil<SemanticTargetFieldPlacement>()
+    )
+    Cons(field, remaining) -> match field {
+      SemanticRecordLayoutField(hash, source_index, field_type) -> {
+        let field_placement = semantic_target_storage_placement_with_substitution(
+          target,
+          catalog,
+          declarations,
+          substitution,
+          field_type
+        )
+        match (
+          semantic_target_placement_size(field_placement),
+          semantic_target_placement_alignment(field_placement),
+        ) {
+          (Some(size), Some(alignment)) -> match semantic_target_align_up(
+            offset,
+            alignment
+          ) {
+            None -> SemanticTargetRecordBuildUnavailable
+            Some(field_offset) -> match num_scalar_usize_checked_add(
+              field_offset,
+              size
+            ) {
+              None -> SemanticTargetRecordBuildUnavailable
+              Some(next_offset) -> match semantic_target_record_build(
+                target,
+                catalog,
+                declarations,
+                substitution,
+                remaining,
+                next_offset,
+                semantic_target_max(maximum_alignment, alignment)
+              ) {
+                SemanticTargetRecordBuildUnavailable ->
+                  SemanticTargetRecordBuildUnavailable
+                SemanticTargetRecordBuild(end, final_alignment, placed) ->
+                  SemanticTargetRecordBuild(
+                    end,
+                    final_alignment,
+                    Cons<SemanticTargetFieldPlacement>(
+                      SemanticTargetFieldPlacement(
+                        SemanticTargetStructuralField(hash),
+                        source_index,
+                        field_offset,
+                        field_placement
+                      ),
+                      placed
+                    )
+                  )
+              }
+            }
+          }
+          _ -> SemanticTargetRecordBuildUnavailable
+        }
+      }
+    }
+  }
+}
+
+fn semantic_target_record(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  id: SemanticTypeId
+) -> SemanticTargetPlacement {
+  match semantic_record_layout_fields(catalog, id) {
+    None -> SemanticTargetPlacementUnavailable
+    Some(fields) -> {
+      let known_alignment = semantic_target_record_alignment(
+        target,
+        catalog,
+        declarations,
+        substitution,
+        fields,
+        1
+      )
+      match semantic_target_record_build(
+        target,
+        catalog,
+        declarations,
+        substitution,
+        fields,
+        0,
+        1
+      ) {
+        SemanticTargetRecordBuildUnavailable ->
+          SemanticTargetPartialPlacement(None<usize>(), known_alignment)
+        SemanticTargetRecordBuild(size, alignment, placed) ->
+          match semantic_target_align_up(size, alignment) {
+            None -> SemanticTargetPartialPlacement(None<usize>(), known_alignment)
+            Some(final_size) -> SemanticTargetRecordPlacement(
+              final_size,
+              alignment,
+              placed
+            )
+          }
+      }
+    }
+  }
+}
+
+fn semantic_target_array(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  element: SemanticTypeId,
+  length: usize
+) -> SemanticTargetPlacement {
+  if length == 0 {
+    SemanticTargetArrayPlacement(
+      0,
+      1,
+      0,
+      0,
+      SemanticTargetPlacementUnavailable
+    )
+  } else {
+    let element_placement = semantic_target_indexed_placement_with_substitution(
+      target,
+      catalog,
+      declarations,
+      substitution,
+      element
+    )
+    match (
+      semantic_target_placement_size(element_placement),
+      semantic_target_placement_alignment(element_placement),
+    ) {
+      (Some(element_size), Some(element_alignment)) ->
+        match semantic_target_align_up(element_size, element_alignment) {
+          None -> SemanticTargetPlacementUnavailable
+          Some(stride) -> match num_scalar_usize_checked_mul(length, stride) {
+            None -> SemanticTargetPlacementUnavailable
+            Some(size) -> SemanticTargetArrayPlacement(
+              size,
+              element_alignment,
+              length,
+              stride,
+              element_placement
+            )
+          }
+        }
+      (_, Some(element_alignment)) -> SemanticTargetPartialPlacement(
+        None<usize>(),
+        Some<usize>(element_alignment)
+      )
+      _ -> SemanticTargetPlacementUnavailable
+    }
+  }
+}
+
+fn semantic_target_union(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  id: SemanticTypeId
+) -> SemanticTargetPlacement {
+  match semantic_union_storage_class(catalog, id) {
+    SemanticWordUnionStorage -> semantic_target_word(
+      target,
+      semantic_field_release_kind(catalog, id)
+    )
+    SemanticManagedUnionStorage -> semantic_target_word(
+      target,
+      semantic_field_release_kind(catalog, id)
+    )
+    SemanticIncompatibleUnionStorage -> SemanticTargetPlacementUnavailable
+    _ -> SemanticTargetPlacementUnavailable
+  }
+}
+
+fn semantic_target_is_nil(
+  catalog: borrow SemanticTypeCatalog,
+  id: SemanticTypeId
+) -> bool {
+  let graph = semantic_target_required_graph(catalog, id)
+  match semantic_type_graph_node(graph, id) {
+    SemanticPrimitiveNode(SemanticNil) -> true
+    _ -> false
+  }
+}
+
+fn semantic_target_nullable_inline(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  union: SemanticTypeId,
+  left: SemanticTypeId,
+  right: SemanticTypeId
+) -> SemanticTargetPlacement {
+  let value = if semantic_target_is_nil(catalog, left) { right }
+  else {
+    if semantic_target_is_nil(catalog, right) { left }
+    else { return SemanticTargetPlacementUnavailable }
+  }
+  let placement = semantic_target_storage_placement_with_substitution(
+    target,
+    catalog,
+    declarations,
+    substitution,
+    value
+  )
+  match semantic_target_placement_size(placement) {
+    Some(size) if size == semantic_target_word_size(target) -> semantic_target_word(
+      target,
+      semantic_field_release_kind(catalog, union)
+    )
+    _ -> SemanticTargetPlacementUnavailable
+  }
+}
+
+fn semantic_target_storage_placement_with_substitution(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  id: SemanticTypeId
+) -> SemanticTargetPlacement {
+  let resolved = semantic_target_resolve(catalog, substitution, id)
+  let graph = semantic_target_required_graph(catalog, resolved)
+  match semantic_type_graph_node(graph, resolved) {
+    SemanticPrimitiveNode(primitive) -> semantic_target_primitive(target, primitive)
+    SemanticUnionNode(_, _) -> semantic_target_union(target, catalog, resolved)
+    SemanticContinuationNode(_, _) -> semantic_target_word(
+      target,
+      SemanticClosureRelease
+    )
+    SemanticWeakNode(_) -> semantic_target_word(
+      target,
+      semantic_field_release_kind(catalog, resolved)
+    )
+    SemanticAtomicNode(_) -> semantic_target_word(
+      target,
+      semantic_field_release_kind(catalog, resolved)
+    )
+    SemanticUniqueNode(inner) -> semantic_target_storage_placement_with_substitution(
+      target,
+      catalog,
+      declarations,
+      substitution,
+      inner
+    )
+    SemanticOwnedNode(inner) -> semantic_target_storage_placement_with_substitution(
+      target,
+      catalog,
+      declarations,
+      substitution,
+      inner
+    )
+    SemanticPointerNode(_, _) -> semantic_target_word(target, SemanticNoRelease)
+    SemanticBorrowNode(inner, _) -> semantic_target_storage_placement_with_substitution(
+      target,
+      catalog,
+      declarations,
+      substitution,
+      inner
+    )
+    SemanticSliceNode(_, _) -> {
+      let word = semantic_target_word_size(target)
+      semantic_target_scalar(
+        word * 2,
+        word,
+        SemanticTargetPairStorage,
+        SemanticNoRelease
+      )
+    }
+    SemanticArrayNode(element, length) -> semantic_target_array(
+      target,
+      catalog,
+      declarations,
+      substitution,
+      element,
+      length
+    )
+    SemanticFunctionNode(_, _, _) -> semantic_target_word(
+      target,
+      SemanticClosureRelease
+    )
+    SemanticNamedNode(_, role, representation, _) -> match role {
+      SemanticOpaqueType -> semantic_target_storage_placement_with_substitution(
+        target,
+        catalog,
+        declarations,
+        substitution,
+        representation
+      )
+      SemanticNominalType -> semantic_target_word(target, SemanticManagedRelease)
+      SemanticPayloadlessVariantType -> semantic_target_word(
+        target,
+        SemanticNoRelease
+      )
+    }
+    SemanticRecordNode(_, _, _) -> semantic_target_record(
+      target,
+      catalog,
+      declarations,
+      substitution,
+      resolved
+    )
+    SemanticVariantNode(_, _) -> semantic_target_word(
+      target,
+      semantic_field_release_kind(catalog, resolved)
+    )
+    _ -> SemanticTargetPlacementUnavailable
+  }
+}
+
+pub(package) fn semantic_target_storage_placement(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  id: SemanticTypeId
+) -> SemanticTargetPlacement {
+  let declarations = semantic_type_declaration_catalog_empty()
+  let substitution = semantic_type_substitution_empty()
+  semantic_target_storage_placement_with_substitution(
+    target,
+    catalog,
+    declarations,
+    substitution,
+    id
+  )
+}
+
+pub(package) fn semantic_target_storage_placement_with(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  id: SemanticTypeId
+) -> SemanticTargetPlacement {
+  let substitution = semantic_type_substitution_empty()
+  semantic_target_storage_placement_with_substitution(
+    target,
+    catalog,
+    declarations,
+    substitution,
+    id
+  )
+}
+
+fn semantic_target_declared_record_alignment(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  layout_index: usize,
+  field_index: usize,
+  field_count: usize,
+  maximum: usize
+) -> Option<usize> {
+  if field_index == field_count { Some<usize>(maximum) }
+  else {
+    match semantic_type_declared_record_field_type(
+      declarations,
+      layout_index,
+      field_index
+    ) {
+      None -> None<usize>()
+      Some(field_type) -> {
+        let placement = semantic_target_inline_placement_with_substitution(
+          target,
+          catalog,
+          declarations,
+          substitution,
+          field_type
+        )
+        match semantic_target_placement_alignment(placement) {
+          None -> None<usize>()
+          Some(alignment) -> semantic_target_declared_record_alignment(
+            target,
+            catalog,
+            declarations,
+            substitution,
+            layout_index,
+            field_index + 1,
+            field_count,
+            semantic_target_max(maximum, alignment)
+          )
+        }
+      }
+    }
+  }
+}
+
+fn semantic_target_declared_record_build(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  layout_index: usize,
+  field_index: usize,
+  field_count: usize,
+  offset: usize,
+  maximum_alignment: usize
+) -> SemanticTargetRecordBuild {
+  if field_index == field_count {
+    SemanticTargetRecordBuild(
+      offset,
+      maximum_alignment,
+      Nil<SemanticTargetFieldPlacement>()
+    )
+  } else {
+    match (
+      semantic_type_declared_record_field_declaration(
+        declarations,
+        layout_index,
+        field_index
+      ),
+      semantic_type_declared_record_field_type(
+        declarations,
+        layout_index,
+        field_index
+      ),
+    ) {
+      (Some(declaration), Some(field_type)) -> {
+        let field_placement = semantic_target_inline_placement_with_substitution(
+          target,
+          catalog,
+          declarations,
+          substitution,
+          field_type
+        )
+        match (
+          semantic_target_placement_size(field_placement),
+          semantic_target_placement_alignment(field_placement),
+        ) {
+          (Some(size), Some(alignment)) -> match semantic_target_align_up(
+            offset,
+            alignment
+          ) {
+            None -> SemanticTargetRecordBuildUnavailable
+            Some(field_offset) -> match num_scalar_usize_checked_add(
+              field_offset,
+              size
+            ) {
+              None -> SemanticTargetRecordBuildUnavailable
+              Some(next_offset) -> match semantic_target_declared_record_build(
+                target,
+                catalog,
+                declarations,
+                substitution,
+                layout_index,
+                field_index + 1,
+                field_count,
+                next_offset,
+                semantic_target_max(maximum_alignment, alignment)
+              ) {
+                SemanticTargetRecordBuildUnavailable ->
+                  SemanticTargetRecordBuildUnavailable
+                SemanticTargetRecordBuild(end, final_alignment, placed) ->
+                  SemanticTargetRecordBuild(
+                    end,
+                    final_alignment,
+                    Cons<SemanticTargetFieldPlacement>(
+                      SemanticTargetFieldPlacement(
+                        SemanticTargetDeclaredField(declaration),
+                        field_index,
+                        field_offset,
+                        field_placement
+                      ),
+                      placed
+                    )
+                  )
+              }
+            }
+          }
+          _ -> SemanticTargetRecordBuildUnavailable
+        }
+      }
+      _ -> SemanticTargetRecordBuildUnavailable
+    }
+  }
+}
+
+fn semantic_target_declared_record(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  layout_index: usize
+) -> SemanticTargetPlacement {
+  match semantic_type_declared_record_field_count(declarations, layout_index) {
+    None -> SemanticTargetPlacementUnavailable
+    Some(field_count) -> {
+      let known_alignment = semantic_target_declared_record_alignment(
+        target,
+        catalog,
+        declarations,
+        substitution,
+        layout_index,
+        0,
+        field_count,
+        1
+      )
+      match semantic_target_declared_record_build(
+        target,
+        catalog,
+        declarations,
+        substitution,
+        layout_index,
+        0,
+        field_count,
+        0,
+        1
+      ) {
+        SemanticTargetRecordBuildUnavailable -> SemanticTargetPartialPlacement(
+          None<usize>(),
+          known_alignment
+        )
+        SemanticTargetRecordBuild(size, alignment, placed) ->
+          match semantic_target_align_up(size, alignment) {
+            None -> SemanticTargetPartialPlacement(None<usize>(), known_alignment)
+            Some(final_size) -> SemanticTargetRecordPlacement(
+              final_size,
+              alignment,
+              placed
+            )
+          }
+      }
+    }
+  }
+}
+
+fn semantic_target_payload_alignment(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  layout_index: usize,
+  case_index: usize,
+  payload_index: usize,
+  payload_count: usize,
+  maximum: usize
+) -> Option<usize> {
+  if payload_index == payload_count { Some<usize>(maximum) }
+  else {
+    match semantic_type_declared_variant_payload_type(
+      declarations,
+      layout_index,
+      case_index,
+      payload_index
+    ) {
+      None -> None<usize>()
+      Some(payload) -> {
+        let placement = semantic_target_inline_placement_with_substitution(
+          target,
+          catalog,
+          declarations,
+          substitution,
+          payload
+        )
+        match semantic_target_placement_alignment(placement) {
+          None -> None<usize>()
+          Some(alignment) -> semantic_target_payload_alignment(
+            target,
+            catalog,
+            declarations,
+            substitution,
+            layout_index,
+            case_index,
+            payload_index + 1,
+            payload_count,
+            semantic_target_max(maximum, alignment)
+          )
+        }
+      }
+    }
+  }
+}
+
+fn semantic_target_payload_size_from(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  layout_index: usize,
+  case_index: usize,
+  payload_index: usize,
+  payload_count: usize,
+  offset: usize
+) -> Option<usize> {
+  if payload_index == payload_count { Some<usize>(offset) }
+  else {
+    match semantic_type_declared_variant_payload_type(
+      declarations,
+      layout_index,
+      case_index,
+      payload_index
+    ) {
+      None -> None<usize>()
+      Some(payload) -> {
+        let placement = semantic_target_inline_placement_with_substitution(
+          target,
+          catalog,
+          declarations,
+          substitution,
+          payload
+        )
+        match (
+          semantic_target_placement_size(placement),
+          semantic_target_placement_alignment(placement),
+        ) {
+          (Some(size), Some(alignment)) -> match semantic_target_align_up(
+            offset,
+            alignment
+          ) {
+            None -> None<usize>()
+            Some(aligned) -> match num_scalar_usize_checked_add(aligned, size) {
+              None -> None<usize>()
+              Some(next) -> semantic_target_payload_size_from(
+                target,
+                catalog,
+                declarations,
+                substitution,
+                layout_index,
+                case_index,
+                payload_index + 1,
+                payload_count,
+                next
+              )
+            }
+          }
+          _ -> None<usize>()
+        }
+      }
+    }
+  }
+}
+
+type SemanticTargetVariantMeasure {
+  SemanticTargetVariantMeasure(Option<usize>, Option<usize>)
+}
+
+fn semantic_target_variant_measure(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  layout_index: usize,
+  case_index: usize,
+  case_count: usize,
+  maximum_payload: Option<usize>,
+  maximum_alignment: Option<usize>
+) -> SemanticTargetVariantMeasure {
+  if case_index == case_count {
+    SemanticTargetVariantMeasure(maximum_payload, maximum_alignment)
+  } else {
+    match (
+      semantic_type_declared_variant_case_declaration(
+        declarations,
+        layout_index,
+        case_index
+      ),
+      semantic_type_declared_variant_payload_count(
+        declarations,
+        layout_index,
+        case_index
+      ),
+    ) {
+      (Some(_), Some(payload_count)) -> {
+        let case_alignment = semantic_target_payload_alignment(
+          target,
+          catalog,
+          declarations,
+          substitution,
+          layout_index,
+          case_index,
+          0,
+          payload_count,
+          1
+        )
+        let case_size = match semantic_target_payload_size_from(
+          target,
+          catalog,
+          declarations,
+          substitution,
+          layout_index,
+          case_index,
+          0,
+          payload_count,
+          0
+        ) {
+          None -> None<usize>()
+          Some(size) -> match case_alignment {
+            None -> None<usize>()
+            Some(alignment) -> semantic_target_align_up(size, alignment)
+          }
+        }
+        let next_payload = match (maximum_payload, case_size) {
+          (Some(left), Some(right)) -> Some<usize>(semantic_target_max(left, right))
+          _ -> None<usize>()
+        }
+        let next_alignment = match (maximum_alignment, case_alignment) {
+          (Some(left), Some(right)) -> Some<usize>(semantic_target_max(left, right))
+          _ -> None<usize>()
+        }
+        semantic_target_variant_measure(
+          target,
+          catalog,
+          declarations,
+          substitution,
+          layout_index,
+          case_index + 1,
+          case_count,
+          next_payload,
+          next_alignment
+        )
+      }
+      _ -> SemanticTargetVariantMeasure(None<usize>(), None<usize>())
+    }
+  }
+}
+
+fn semantic_target_declared_variant(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  layout_index: usize
+) -> SemanticTargetPlacement {
+  let word = semantic_target_word_size(target)
+  match semantic_type_declared_variant_case_count(declarations, layout_index) {
+    None -> SemanticTargetPlacementUnavailable
+    Some(case_count) -> match semantic_target_variant_measure(
+      target,
+      catalog,
+      declarations,
+      substitution,
+      layout_index,
+      0,
+      case_count,
+      Some<usize>(0),
+      Some<usize>(word)
+    ) {
+      SemanticTargetVariantMeasure(maximum_payload, maximum_alignment) ->
+        match (maximum_payload, maximum_alignment) {
+          (Some(payload_size), Some(alignment)) -> match semantic_target_align_up(
+            word,
+            alignment
+          ) {
+            None -> SemanticTargetPartialPlacement(None<usize>(), Some(alignment))
+            Some(payload_offset) -> match num_scalar_usize_checked_add(
+              payload_offset,
+              payload_size
+            ) {
+              None -> SemanticTargetPartialPlacement(None<usize>(), Some(alignment))
+              Some(unpadded) -> match semantic_target_align_up(
+                unpadded,
+                alignment
+              ) {
+                None -> SemanticTargetPartialPlacement(None<usize>(), Some(alignment))
+                Some(size) -> SemanticTargetDeclaredVariantPlacement(size, alignment)
+              }
+            }
+          }
+          (_, alignment) -> SemanticTargetPartialPlacement(None<usize>(), alignment)
+        }
+    }
+  }
+}
+
+fn semantic_target_inline_placement_with_substitution(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  id: SemanticTypeId
+) -> SemanticTargetPlacement {
+  let resolved = semantic_target_resolve(catalog, substitution, id)
+  let graph = semantic_target_required_graph(catalog, resolved)
+  match semantic_type_graph_node(graph, resolved) {
+    SemanticUnionNode(left, right) -> semantic_target_nullable_inline(
+      target,
+      catalog,
+      declarations,
+      substitution,
+      resolved,
+      left,
+      right
+    )
+    SemanticVariantNode(_, payload) -> {
+      let payload_placement = semantic_target_inline_placement_with_substitution(
+        target,
+        catalog,
+        declarations,
+        substitution,
+        payload
+      )
+      match semantic_target_placement_size(payload_placement) {
+        None -> SemanticTargetPartialPlacement(
+          None<usize>(),
+          Some<usize>(semantic_target_word_size(target))
+        )
+        Some(payload_size) -> {
+          let word = semantic_target_word_size(target)
+          match num_scalar_usize_checked_add(word, payload_size) {
+            None -> SemanticTargetPlacementUnavailable
+            Some(unpadded) -> match semantic_target_align_up(unpadded, word) {
+              None -> SemanticTargetPlacementUnavailable
+              Some(size) -> SemanticTargetVariantPlacement(
+                size,
+                word,
+                payload_placement
+              )
+            }
+          }
+        }
+      }
+    }
+    SemanticUniqueNode(inner) -> semantic_target_inline_placement_with_substitution(
+      target,
+      catalog,
+      declarations,
+      substitution,
+      inner
+    )
+    SemanticOwnedNode(inner) -> semantic_target_inline_placement_with_substitution(
+      target,
+      catalog,
+      declarations,
+      substitution,
+      inner
+    )
+    SemanticBorrowNode(inner, _) -> semantic_target_inline_placement_with_substitution(
+      target,
+      catalog,
+      declarations,
+      substitution,
+      inner
+    )
+    SemanticNamedNode(_, SemanticOpaqueType, representation, _) ->
+      semantic_target_inline_placement_with_substitution(
+        target,
+        catalog,
+        declarations,
+        substitution,
+        representation
+      )
+    SemanticNamedNode(_, SemanticNominalType, _, _) ->
+      match semantic_type_declaration_catalog_resolve(
+        catalog,
+        declarations,
+        resolved,
+        substitution
+      ) {
+        SemanticRecordDeclarationLayoutMatched(layout_index, matched) ->
+          semantic_target_declared_record(
+            target,
+            catalog,
+            declarations,
+            matched,
+            layout_index
+          )
+        SemanticVariantDeclarationLayoutMatched(layout_index, matched) ->
+          semantic_target_declared_variant(
+            target,
+            catalog,
+            declarations,
+            matched,
+            layout_index
+          )
+        SemanticTypeDeclarationLayoutMissing ->
+          semantic_target_storage_placement_with_substitution(
+            target,
+            catalog,
+            declarations,
+            substitution,
+            resolved
+          )
+      }
+    _ -> semantic_target_storage_placement_with_substitution(
+      target,
+      catalog,
+      declarations,
+      substitution,
+      resolved
+    )
+  }
+}
+
+pub(package) fn semantic_target_inline_placement(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  id: SemanticTypeId
+) -> SemanticTargetPlacement {
+  let declarations = semantic_type_declaration_catalog_empty()
+  let substitution = semantic_type_substitution_empty()
+  semantic_target_inline_placement_with_substitution(
+    target,
+    catalog,
+    declarations,
+    substitution,
+    id
+  )
+}
+
+pub(package) fn semantic_target_inline_placement_with(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  id: SemanticTypeId
+) -> SemanticTargetPlacement {
+  let substitution = semantic_type_substitution_empty()
+  semantic_target_inline_placement_with_substitution(
+    target,
+    catalog,
+    declarations,
+    substitution,
+    id
+  )
+}
+
+fn semantic_target_plain_field(
+  catalog: borrow SemanticTypeCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  id: SemanticTypeId
+) -> bool {
+  let resolved = semantic_target_resolve(catalog, substitution, id)
+  let graph = semantic_target_required_graph(catalog, resolved)
+  match semantic_type_graph_node(graph, resolved) {
+    SemanticPrimitiveNode(SemanticNil) -> false
+    SemanticPrimitiveNode(SemanticStr) -> false
+    SemanticPrimitiveNode(_) -> true
+    SemanticPointerNode(_, _) -> true
+    SemanticNamedNode(_, SemanticOpaqueType, representation, _) ->
+      semantic_target_plain_field(catalog, substitution, representation)
+    _ -> false
+  }
+}
+
+fn semantic_target_plain_record_fields(
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  layout_index: usize,
+  field_index: usize,
+  field_count: usize
+) -> bool {
+  if field_index == field_count { true }
+  else {
+    match semantic_type_declared_record_field_type(
+      declarations,
+      layout_index,
+      field_index
+    ) {
+      None -> false
+      Some(field_type) ->
+        semantic_target_plain_field(catalog, substitution, field_type) and
+        semantic_target_plain_record_fields(
+          catalog,
+          declarations,
+          substitution,
+          layout_index,
+          field_index + 1,
+          field_count
+        )
+    }
+  }
+}
+
+fn semantic_target_indexed_placement_with_substitution(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  id: SemanticTypeId
+) -> SemanticTargetPlacement {
+  let resolved = semantic_target_resolve(catalog, substitution, id)
+  let graph = semantic_target_required_graph(catalog, resolved)
+  match semantic_type_graph_node(graph, resolved) {
+    SemanticNamedNode(_, SemanticOpaqueType, representation, _) ->
+      semantic_target_indexed_placement_with_substitution(
+        target,
+        catalog,
+        declarations,
+        substitution,
+        representation
+      )
+    SemanticNamedNode(_, SemanticNominalType, _, _) ->
+      match semantic_type_declaration_catalog_resolve(
+        catalog,
+        declarations,
+        resolved,
+        substitution
+      ) {
+        SemanticRecordDeclarationLayoutMatched(layout_index, matched) ->
+          match semantic_type_declared_record_field_count(
+            declarations,
+            layout_index
+          ) {
+            Some(field_count) -> if semantic_target_plain_record_fields(
+              catalog,
+              declarations,
+              matched,
+              layout_index,
+              0,
+              field_count
+            ) {
+              semantic_target_declared_record(
+                target,
+                catalog,
+                declarations,
+                matched,
+                layout_index
+              )
+            } else {
+              semantic_target_storage_placement_with_substitution(
+                target,
+                catalog,
+                declarations,
+                substitution,
+                resolved
+              )
+            }
+            None -> SemanticTargetPlacementUnavailable
+          }
+        _ -> semantic_target_storage_placement_with_substitution(
+          target,
+          catalog,
+          declarations,
+          substitution,
+          resolved
+        )
+      }
+    _ -> semantic_target_storage_placement_with_substitution(
+      target,
+      catalog,
+      declarations,
+      substitution,
+      resolved
+    )
+  }
+}
+
+-- Indexed collections share one element ABI across arrays, vectors and
+-- slices. Only resolved plain named records select the packed record form.
+pub(package) fn semantic_target_indexed_placement(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  id: SemanticTypeId
+) -> SemanticTargetPlacement {
+  let declarations = semantic_type_declaration_catalog_empty()
+  let substitution = semantic_type_substitution_empty()
+  semantic_target_indexed_placement_with_substitution(
+    target,
+    catalog,
+    declarations,
+    substitution,
+    id
+  )
+}
+
+pub(package) fn semantic_target_indexed_placement_with(
+  target: NativeLinkTarget,
+  catalog: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  id: SemanticTypeId
+) -> SemanticTargetPlacement {
+  let substitution = semantic_type_substitution_empty()
+  semantic_target_indexed_placement_with_substitution(
+    target,
+    catalog,
+    declarations,
+    substitution,
+    id
+  )
+}
+
+pub(package) fn semantic_target_array_stride(
+  placement: borrow SemanticTargetPlacement
+) -> Option<usize> {
+  match placement {
+    SemanticTargetArrayPlacement(_, _, _, stride, _) -> Some<usize>(stride)
+    _ -> None<usize>()
+  }
+}
+
+fn semantic_target_field_offset_from(
+  fields: List<SemanticTargetFieldPlacement>,
+  wanted_hash: i64
+) -> Option<usize> {
+  match fields {
+    Nil -> None<usize>()
+    Cons(field, remaining) -> match field {
+      SemanticTargetFieldPlacement(identity, _, offset, _) -> match identity {
+        SemanticTargetStructuralField(hash) ->
+          if hash == wanted_hash { Some<usize>(offset) }
+        else { semantic_target_field_offset_from(remaining, wanted_hash) }
+        SemanticTargetDeclaredField(_) -> semantic_target_field_offset_from(
+          remaining,
+          wanted_hash
+        )
+      }
+    }
+  }
+}
+
+pub(package) fn semantic_target_field_offset(
+  placement: borrow SemanticTargetPlacement,
+  field_hash: i64
+) -> Option<usize> {
+  match placement {
+    SemanticTargetRecordPlacement(_, _, fields) ->
+      semantic_target_field_offset_from(fields, field_hash)
+    _ -> None<usize>()
+  }
+}
+
+fn semantic_target_declared_field_offset_from(
+  fields: List<SemanticTargetFieldPlacement>,
+  wanted: DeclarationIdentity
+) -> Option<usize> {
+  match fields {
+    Nil -> None<usize>()
+    Cons(field, remaining) -> match field {
+      SemanticTargetFieldPlacement(identity, _, offset, _) -> match identity {
+        SemanticTargetDeclaredField(declaration) ->
+          if declaration_identity_eq(declaration, wanted) { Some<usize>(offset) }
+        else { semantic_target_declared_field_offset_from(remaining, wanted) }
+        SemanticTargetStructuralField(_) -> semantic_target_declared_field_offset_from(
+          remaining,
+          wanted
+        )
+      }
+    }
+  }
+}
+
+pub(package) fn semantic_target_declared_field_offset(
+  placement: borrow SemanticTargetPlacement,
+  declaration: DeclarationIdentity
+) -> Option<usize> {
+  match placement {
+    SemanticTargetRecordPlacement(_, _, fields) ->
+      semantic_target_declared_field_offset_from(fields, declaration)
+    _ -> None<usize>()
+  }
+}
