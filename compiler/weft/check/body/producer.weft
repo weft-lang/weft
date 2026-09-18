@@ -104,17 +104,19 @@ use compiler/project/identity.{
 use compiler/project/identity/equality.{declaration_identity_eq}
 use compiler/types/graph.{
   SemanticBool,
+  SemanticClosedEffects,
+  SemanticContinuationNode,
   SemanticEffectAtomNode,
   SemanticEffectSignatureNode,
   SemanticF32,
   SemanticF64,
   SemanticFunctionNode,
-  SemanticContinuationNode,
   SemanticI16,
   SemanticI32,
   SemanticI64,
   SemanticI8,
   SemanticIsize,
+  SemanticOpenEffects,
   SemanticPrimitiveNode,
   SemanticTypeId,
   SemanticU16,
@@ -299,6 +301,7 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerFieldProjectionUnavailable(SemanticTypeId),
   CheckedBodyProducerEffectReferenceRequired,
   CheckedBodyProducerEffectUnavailable(SemanticTypeId),
+  CheckedBodyProducerEffectTailUnavailable(usize),
   CheckedBodyProducerEffectApplicationUnavailable,
   CheckedBodyProducerUnknownEffectOperation(CheckedSourceRange),
   CheckedBodyProducerAmbiguousEffectApplication(DeclarationIdentity),
@@ -500,6 +503,12 @@ type CheckedBodyEffectSelection {
   CheckedBodyEffectOperationMissing,
   CheckedBodyEffectApplicationMissing,
   CheckedBodyEffectSelectionAmbiguous(DeclarationIdentity)
+}
+
+type CheckedBodyEffectRequirement {
+  CheckedBodyEffectsAvailable,
+  CheckedBodyEffectAtomUnavailable(SemanticTypeId),
+  CheckedBodyEffectTailUnavailable(usize)
 }
 
 type CheckedBodyEffectSite {
@@ -870,6 +879,56 @@ fn lexical_allows_effect(
   }
 }
 
+fn semantic_function_allows_effect_tail(
+  catalog: borrow SemanticTypeCatalog,
+  function_type: SemanticTypeId,
+  wanted: usize
+) -> bool {
+  match catalog.graph_for(function_type) {
+    Some(function_graph) -> match semantic_type_graph_node(function_graph, function_type) {
+      SemanticFunctionNode(_, _, effects) -> match catalog.graph_for(effects) {
+        Some(effect_graph) -> match semantic_type_graph_node(effect_graph, effects) {
+          SemanticEffectSignatureNode(_, SemanticOpenEffects(available)) ->
+            available == wanted
+          _ -> false
+        }
+        None -> false
+      }
+      _ -> false
+    }
+    None -> false
+  }
+}
+
+fn lexical_allows_effect_tail(
+  catalog: borrow SemanticTypeCatalog,
+  environment: CheckedLexicalEnvironment,
+  wanted: usize
+) -> bool {
+  match environment {
+    CheckedLexicalRoot(_, _, _, function_type) -> semantic_function_allows_effect_tail(
+      catalog,
+      function_type,
+      wanted
+    )
+    CheckedLexicalBinding(_, _, _, _, _, parent) -> lexical_allows_effect_tail(
+      catalog,
+      parent,
+      wanted
+    )
+    CheckedLexicalHandledEffect(_, parent) -> lexical_allows_effect_tail(
+      catalog,
+      parent,
+      wanted
+    )
+    CheckedLexicalResume(_, _, parent) -> lexical_allows_effect_tail(
+      catalog,
+      parent,
+      wanted
+    )
+  }
+}
+
 fn lexical_resume_types(
   environment: CheckedLexicalEnvironment
 ) -> CheckedLexicalResumeLookup {
@@ -1128,6 +1187,49 @@ fn semantic_function_allows_effect(
       _ -> false
     }
     None -> false
+  }
+}
+
+fn checked_body_function_effect_requirement(
+  catalog: borrow SemanticTypeCatalog,
+  environment: CheckedLexicalEnvironment,
+  function_type: SemanticTypeId
+) -> CheckedBodyEffectRequirement {
+  match catalog.graph_for(function_type) {
+    Some(function_graph) -> match semantic_type_graph_node(function_graph, function_type) {
+      SemanticContinuationNode(_, _) -> CheckedBodyEffectsAvailable
+      SemanticFunctionNode(_, _, effects) -> match catalog.graph_for(effects) {
+        Some(effect_graph) -> match semantic_type_graph_node(effect_graph, effects) {
+          SemanticEffectSignatureNode(atoms, tail) -> {
+            let lists = semantic_type_graph_type_lists_local(effect_graph)
+            let mut index: usize = 0
+            while index < semantic_type_list_len(lists, atoms) {
+              let atom = semantic_type_graph_list_type_id(
+                effect_graph,
+                semantic_type_list_edge(lists, atoms, index)
+              )
+              if not lexical_allows_effect(catalog, environment, atom) {
+                return CheckedBodyEffectAtomUnavailable(atom)
+              }
+              index = index + 1
+            }
+            match tail {
+              SemanticClosedEffects -> CheckedBodyEffectsAvailable
+              SemanticOpenEffects(variable) -> if lexical_allows_effect_tail(
+                catalog,
+                environment,
+                variable
+              ) { CheckedBodyEffectsAvailable }
+              else { CheckedBodyEffectTailUnavailable(variable) }
+            }
+          }
+          _ -> panic("Checked function effects are not an effect signature")
+        }
+        None -> panic("Checked function effects are outside the type catalog")
+      }
+      _ -> panic("Checked call signature is not callable")
+    }
+    None -> panic("Checked call signature is outside the type catalog")
   }
 }
 
@@ -5942,48 +6044,63 @@ fn checked_body_call_with_signature(
   expectation: CheckedBodyExpectation
 ) -[SemanticConformance]> CheckedBodyExprBuild {
   let catalog = types.catalog
-  let result = semantic_function_result(catalog, signature)
-  if not expectation_allows(catalog, result, expectation) {
-    CheckedBodyExprRejected(state, expectation_mismatch(result, expectation))
-  } else {
-    let total = __i64_to_usize(expr_list_len(arguments))
-    match state.expression_list() {
-      (state, list) -> match checked_body_arguments(
-        state,
-        source,
-        types,
-        owner,
-        function_result,
-        loop_context,
-        environment,
-        signature,
-        arguments,
-        0,
-        total,
-        list,
-        name_range
-      ) {
-        CheckedBodyArgumentsBuilt(state, checked_arguments, range) -> match callee {
-          CheckedDirectCallee(function) -> match state.direct_call(
-            function,
-            checked_arguments,
-            result,
-            range
-          ) {
-            (state, expression) -> CheckedBodyExprBuilt(state, expression)
-          }
-          CheckedAppliedCallee(expression) -> match state.apply(
-            expression,
-            checked_arguments,
+  match checked_body_function_effect_requirement(catalog, environment, signature) {
+    CheckedBodyEffectAtomUnavailable(atom) -> CheckedBodyExprRejected(
+      state,
+      CheckedBodyProducerEffectUnavailable(atom)
+    )
+    CheckedBodyEffectTailUnavailable(variable) -> CheckedBodyExprRejected(
+      state,
+      CheckedBodyProducerEffectTailUnavailable(variable)
+    )
+    CheckedBodyEffectsAvailable -> {
+      let result = semantic_function_result(catalog, signature)
+      if not expectation_allows(catalog, result, expectation) {
+        CheckedBodyExprRejected(state, expectation_mismatch(result, expectation))
+      } else {
+        let total = __i64_to_usize(expr_list_len(arguments))
+        match state.expression_list() {
+          (state, list) -> match checked_body_arguments(
+            state,
+            source,
+            types,
+            owner,
+            function_result,
+            loop_context,
+            environment,
             signature,
-            name_range.start,
-            result,
-            range
+            arguments,
+            0,
+            total,
+            list,
+            name_range
           ) {
-            (state, applied) -> CheckedBodyExprBuilt(state, applied)
+            CheckedBodyArgumentsBuilt(state, checked_arguments, range) -> match callee {
+              CheckedDirectCallee(function) -> match state.direct_call(
+                function,
+                checked_arguments,
+                result,
+                range
+              ) {
+                (state, expression) -> CheckedBodyExprBuilt(state, expression)
+              }
+              CheckedAppliedCallee(expression) -> match state.apply(
+                expression,
+                checked_arguments,
+                signature,
+                name_range.start,
+                result,
+                range
+              ) {
+                (state, applied) -> CheckedBodyExprBuilt(state, applied)
+              }
+            }
+            CheckedBodyArgumentsRejected(state, issue) -> CheckedBodyExprRejected(
+              state,
+              issue
+            )
           }
         }
-        CheckedBodyArgumentsRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
       }
     }
   }
