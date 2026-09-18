@@ -2773,11 +2773,12 @@ fi
 # record, payload-variant, variable, trait and associated-projection views,
 # then follows their typed edges and scalar declaration hashes without
 # repeatedly transporting retained identity. The fixture performs 10,000
-# inspections of each family and 10,000 structural comparisons between
-# independently allocated equivalent unions. Traversal allocation remains a
-# construction constant, while equality is pinned below nineteen managed
-# retains and releases per comparison; complete ids are not carried through
-# local recursive edges. The borrowed-call count must scale with the work.
+# inspections of each family, 10,000 structural comparisons between
+# independently allocated equivalent unions and 10,000 semantic hashes of the
+# same local root. Traversal allocation remains a construction constant, while
+# equality and hashing together stay below nineteen managed retains and
+# releases per iteration; complete ids are not carried through local recursive
+# edges. The borrowed-call count must scale with the work.
 run_weft_compile_guarded "$WEFT" compile --rc-census \
   test/fixtures/semantic_type_graph_census.weft > "$tmp_out" 2> "$tmp_err"
 chmod +x "$tmp_out"
@@ -2793,9 +2794,9 @@ if [ "${semantic_graph_fields[2]}" -le 640 ] && \
   [ "${semantic_graph_fields[17]}" -gt 2300000 ] && \
   [ "${semantic_graph_fields[21]}" -le 185000 ] && \
   [ "${semantic_graph_fields[22]}" -le 185500 ]; then
-  echo "  ok semantic_type_graph_equality_keeps_local_transport_within_budget"
+  echo "  ok semantic_type_graph_equality_and_hashing_keep_local_transport_within_budget"
 else
-  echo "  fail semantic_type_graph_equality_keeps_local_transport_within_budget"
+  echo "  fail semantic_type_graph_equality_and_hashing_keep_local_transport_within_budget"
   echo "    census: ${semantic_graph_fields[*]}"
   exit 1
 fi
