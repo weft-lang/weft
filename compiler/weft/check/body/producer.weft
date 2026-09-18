@@ -109,6 +109,7 @@ use compiler/types/graph.{
   SemanticF32,
   SemanticF64,
   SemanticFunctionNode,
+  SemanticContinuationNode,
   SemanticI16,
   SemanticI32,
   SemanticI64,
@@ -122,13 +123,18 @@ use compiler/types/graph.{
   SemanticU8,
   SemanticUsize,
   semantic_type_graph_list_type_id,
+  semantic_type_graph_builder,
   semantic_type_graph_node,
   semantic_type_graph_type_lists_local,
   semantic_type_id_eq,
   semantic_type_list_edge,
-  semantic_type_list_len
+  semantic_type_list_len,
+  semantic_type_derived_segment_id
 }
-use compiler/types/graph/catalog.{SemanticTypeCatalog}
+use compiler/types/graph/catalog.{
+  SemanticTypeCatalog,
+  semantic_type_catalog_with_graph
+}
 use compiler/types/graph/conformance.{SemanticConformance}
 use compiler/types/graph/equality.{semantic_type_catalog_equal}
 use compiler/types/graph/layout.{
@@ -159,6 +165,7 @@ use compiler/types/graph/subtyping.{semantic_type_is_subtype}
 use compiler/weft/check/body/closure.{CheckedClosureBuilder, checked_closure_builder}
 use compiler/weft/check/body/effects.{
   CheckedEffectBuilder,
+  CheckedDeferredHandlerClause,
   CheckedHandle,
   CheckedHandleReturn,
   CheckedHandleReturnClause,
@@ -167,6 +174,7 @@ use compiler/weft/check/body/effects.{
   CheckedHandlerClauseListId,
   CheckedHandlerClauseListBuilder,
   CheckedHandlerCompletion,
+  CheckedHandlerDeferred,
   CheckedHandlerMixed,
   CheckedHandlerParameterListBuilder,
   CheckedHandlerParameterListId,
@@ -296,7 +304,7 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerAmbiguousEffectApplication(DeclarationIdentity),
   CheckedBodyProducerHandlerClauseRequired,
   CheckedBodyProducerHandlerEffectMismatch(SemanticTypeId, SemanticTypeId),
-  CheckedBodyProducerDeferredHandlerUnsupported,
+  CheckedBodyProducerHandlerContinuationRequiresDeferred,
   CheckedBodyProducerResumeOutsideHandler,
   CheckedBodyProducerBodyLocalTypeUnavailable(SemanticTypeId),
   CheckedBodyProducerUnsupportedBinaryOperator(i64),
@@ -331,6 +339,26 @@ type CheckedBodyPrimitiveTypes {
 type CheckedBodyPrimitiveResolution {
   CheckedBodyPrimitivesResolved(CheckedBodyPrimitiveTypes),
   CheckedBodyPrimitivesRejected(SemanticTypeResolutionIssue)
+}
+
+fn checked_body_types_with_catalog(
+  types: CheckedBodyPrimitiveTypes,
+  catalog: SemanticTypeCatalog
+) -> CheckedBodyPrimitiveTypes {
+  CheckedBodyPrimitiveTypes {
+    module: types.module,
+    catalog: catalog,
+    applications: types.applications,
+    effect_applications: types.effect_applications,
+    resolution: types.resolution,
+    never_type: types.never_type,
+    integer: types.integer,
+    string: types.string,
+    boolean: types.boolean,
+    nil_type: types.nil_type,
+    float64: types.float64,
+    float32: types.float32
+  }
 }
 
 type CheckedLexicalEnvironment {
@@ -1008,6 +1036,7 @@ fn semantic_function_result(
   match catalog.graph_for(function_type) {
     Some(graph) -> match semantic_type_graph_node(graph, function_type) {
       SemanticFunctionNode(_, result, _) -> result
+      SemanticContinuationNode(_, result) -> result
       _ -> panic("Checked body signature is not a function type")
     }
     _ -> panic("Checked body signature is outside its type catalog")
@@ -1023,6 +1052,10 @@ fn semantic_function_parameter_count(
       SemanticFunctionNode(parameters, _, _) -> {
         let lists = semantic_type_graph_type_lists_local(graph)
         semantic_type_list_len(lists, parameters)
+      }
+      SemanticContinuationNode(_, _) -> {
+        let arity: usize = 1
+        arity
       }
       _ -> panic("Checked body signature is not a function type")
     }
@@ -1044,6 +1077,8 @@ fn semantic_function_parameter(
           semantic_type_list_edge(lists, parameters, index)
         )
       }
+      SemanticContinuationNode(input, _) -> if index == 0 { input }
+      else { panic("Checked continuation parameter is out of range") }
       _ -> panic("Checked body signature is not a function type")
     }
     _ -> panic("Checked body signature is outside its type catalog")
@@ -1057,6 +1092,7 @@ fn semantic_function_type(
   match catalog.graph_for(function_type) {
     Some(graph) -> match semantic_type_graph_node(graph, function_type) {
       SemanticFunctionNode(_, _, _) -> true
+      SemanticContinuationNode(_, _) -> true
       _ -> false
     }
     _ -> false
@@ -1424,6 +1460,36 @@ impl CheckedBodyBuild {
       CheckedBodyBuild(storage) -> {
         let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
         expressions.segment()
+      }
+    }
+  }
+
+  fn types(self: borrow Self) -> SemanticTypeCatalog {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        expressions.types()
+      }
+    }
+  }
+
+  fn with_types(
+    self: owned Self,
+    types: SemanticTypeCatalog
+  ) -> owned CheckedBodyBuild {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        CheckedBodyBuild(
+          CheckedBodyBuildStorage {
+            signatures: signatures,
+            expressions: expressions.with_types(types),
+            patterns: patterns.with_types(types),
+            closures: closures,
+            effects: effects.with_types(types),
+            propagation: propagation.with_types(types)
+          }
+        )
       }
     }
   }
@@ -4886,6 +4952,29 @@ fn checked_body_handler_parameter_type(
   }
 }
 
+fn checked_body_continuation_type(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  input: SemanticTypeId,
+  result: SemanticTypeId
+) -> (owned CheckedBodyBuild, CheckedBodyPrimitiveTypes, SemanticTypeId) {
+  let catalog = state.types()
+  let module = types.module
+  let resolution = types.resolution
+  let segment = semantic_type_derived_segment_id(
+    module.identity,
+    catalog.next_derived_segment(module.identity, resolution.next_type_segment())
+  )
+  let builder = semantic_type_graph_builder(segment)
+  let (builder, continuation) = builder.continuation(input, result)
+  let next_catalog = semantic_type_catalog_with_graph(catalog, builder.freeze())
+  (
+    state.with_types(next_catalog),
+    checked_body_types_with_catalog(types, next_catalog),
+    continuation
+  )
+}
+
 fn checked_body_handler_parameters(
   state: owned CheckedBodyBuild,
   source: Source,
@@ -5066,12 +5155,7 @@ fn checked_body_handler_clauses(
                         )
                       } else {
                         match continuation {
-                          HandlerClauseNoContinuation -> if site.deferred {
-                            CheckedBodyHandlerClausesRejected(
-                              state,
-                              CheckedBodyProducerDeferredHandlerUnsupported
-                            )
-                          } else {
+                          HandlerClauseNoContinuation ->
                             match checked_body_handler_completion(authored) {
                               None -> CheckedBodyHandlerClausesRejected(
                                 state,
@@ -5096,80 +5180,214 @@ fn checked_body_handler_clauses(
                                       CheckedBodyHandlerParametersRejected(state, issue) ->
                                         CheckedBodyHandlerClausesRejected(state, issue)
                                       CheckedBodyHandlerParametersBuilt(
+                                state,
+                                parameters_list,
+                                clause_environment,
+                              ) -> match state.finish_handler_parameter_list(
+                                parameters_list
+                              ) {
+                                (state, checked_parameters) -> match checked_body_expr(
+                                  state,
+                                  source,
+                                  types,
+                                  owner,
+                                  function_result,
+                                  loop_context,
+                                  CheckedLexicalResume(
+                                    site.result,
+                                    handle_result,
+                                    clause_environment
+                                  ),
+                                  body,
+                                  CheckedRequireResult(handle_result)
+                                ) {
+                                  CheckedBodyExprRejected(state, issue) ->
+                                    CheckedBodyHandlerClausesRejected(state, issue)
+                                  CheckedBodyExprBuilt(state, checked_body) -> {
+                                    let clause_range = match covering_range(
+                                      effect_range,
+                                      state.range(checked_body)
+                                    ) {
+                                      value: CheckedSourceRange -> value
+                                      nil -> operation_range
+                                    }
+                                    match state.handler_clause_list_push(
+                                      list,
+                                      CheckedHandlerClause {
+                                        effect_declaration: site.effect_declaration,
+                                        operation: site.operation_declaration,
+                                        atom: site.atom,
+                                        parameters: checked_parameters,
+                                        continuation: CheckedImmediateHandlerClause,
+                                        body: checked_body,
+                                        completion: completion,
+                                        range: clause_range
+                                      }
+                                    ) {
+                                      (state, list) -> checked_body_handler_clauses(
+                                        state,
+                                        source,
+                                        types,
+                                        owner,
+                                        function_result,
+                                        loop_context,
+                                        environment,
+                                        handled_atom,
+                                        handle_result,
+                                        rest,
+                                        list,
+                                        match covering_range(range, clause_range) {
+                                          value: CheckedSourceRange -> value
+                                          nil -> range
+                                        }
+                                      )
+                                    }
+                                  }
+                                }
+                              }
+                                    }
+                                }
+                            }
+                          HandlerClauseContinuation(continuation_start, continuation_length) ->
+                            if not site.deferred {
+                              CheckedBodyHandlerClausesRejected(
+                                state,
+                                CheckedBodyProducerHandlerContinuationRequiresDeferred
+                              )
+                            } else {
+                              match source_range(
+                                source,
+                                continuation_start,
+                                continuation_length
+                              ) {
+                                nil -> CheckedBodyHandlerClausesRejected(
+                                  state,
+                                  CheckedBodyProducerInvalidRange
+                                )
+                                continuation_range: CheckedSourceRange ->
+                                  match state.handler_parameter_list() {
+                                    (state, parameters_list) ->
+                                      match checked_body_handler_parameters(
+                                        state,
+                                        source,
+                                        types,
+                                        owner,
+                                        environment,
+                                        site.atom,
+                                        operation_name,
+                                        parameters,
+                                        0,
+                                        site.parameter_count,
+                                        parameters_list
+                                      ) {
+                                        CheckedBodyHandlerParametersRejected(state, issue) ->
+                                          CheckedBodyHandlerClausesRejected(state, issue)
+                                        CheckedBodyHandlerParametersBuilt(
                                   state,
                                   parameters_list,
                                   clause_environment,
                                 ) -> match state.finish_handler_parameter_list(
                                   parameters_list
                                 ) {
-                                  (state, checked_parameters) -> match checked_body_expr(
-                                    state,
-                                    source,
-                                    types,
-                                    owner,
-                                    function_result,
-                                    loop_context,
-                                    CheckedLexicalResume(
+                                  (state, checked_parameters) -> {
+                                    let (
+                                      state,
+                                      clause_types,
+                                      continuation_type,
+                                    ) = checked_body_continuation_type(
+                                      state,
+                                      types,
                                       site.result,
-                                      handle_result,
-                                      clause_environment
-                                    ),
-                                    body,
-                                    CheckedRequireResult(handle_result)
-                                  ) {
-                                    CheckedBodyExprRejected(state, issue) ->
-                                      CheckedBodyHandlerClausesRejected(state, issue)
-                                    CheckedBodyExprBuilt(state, checked_body) -> {
-                                      let clause_range = match covering_range(
-                                        effect_range,
-                                        state.range(checked_body)
-                                      ) {
-                                        value: CheckedSourceRange -> value
-                                        nil -> operation_range
-                                      }
-                                      match state.handler_clause_list_push(
-                                        list,
-                                        CheckedHandlerClause {
-                                          effect_declaration: site.effect_declaration,
-                                          operation: site.operation_declaration,
-                                          atom: site.atom,
-                                          parameters: checked_parameters,
-                                          continuation: CheckedImmediateHandlerClause,
-                                          body: checked_body,
-                                          completion: completion,
-                                          range: clause_range
-                                        }
-                                      ) {
-                                        (state, list) -> checked_body_handler_clauses(
+                                      handle_result
+                                    )
+                                    match state.binding(
+                                      owner,
+                                      continuation_type,
+                                      continuation_range,
+                                      CheckedImmutableBinding
+                                    ) {
+                                      (state, continuation_binding) ->
+                                        match checked_body_expr(
                                           state,
                                           source,
-                                          types,
+                                          clause_types,
                                           owner,
                                           function_result,
                                           loop_context,
-                                          environment,
-                                          handled_atom,
-                                          handle_result,
-                                          rest,
-                                          list,
-                                          match covering_range(range, clause_range) {
+                                          CheckedLexicalBinding(
+                                            continuation_start,
+                                            continuation_length,
+                                            continuation_binding,
+                                            continuation_type,
+                                            false,
+                                            clause_environment
+                                          ),
+                                          body,
+                                          CheckedRequireResult(handle_result)
+                                        ) {
+                                          CheckedBodyExprRejected(state, issue) ->
+                                            CheckedBodyHandlerClausesRejected(
+                                              state,
+                                              issue
+                                            )
+                                          CheckedBodyExprBuilt(
+                                          state,
+                                          checked_body,
+                                        ) -> {
+                                          let clause_range = match covering_range(
+                                            effect_range,
+                                            state.range(checked_body)
+                                          ) {
                                             value: CheckedSourceRange -> value
-                                            nil -> range
+                                            nil -> operation_range
                                           }
-                                        )
-                                      }
+                                          match state.handler_clause_list_push(
+                                            list,
+                                            CheckedHandlerClause {
+                                              effect_declaration:
+                                              site.effect_declaration,
+                                              operation: site.operation_declaration,
+                                              atom: site.atom,
+                                              parameters: checked_parameters,
+                                              continuation: CheckedDeferredHandlerClause(
+                                                continuation_binding
+                                              ),
+                                              body: checked_body,
+                                              completion: CheckedHandlerDeferred,
+                                              range: clause_range
+                                            }
+                                          ) {
+                                            (state, list) ->
+                                              checked_body_handler_clauses(
+                                                state,
+                                                source,
+                                                clause_types,
+                                                owner,
+                                                function_result,
+                                                loop_context,
+                                                environment,
+                                                handled_atom,
+                                                handle_result,
+                                                rest,
+                                                list,
+                                                match covering_range(
+                                                  range,
+                                                  clause_range
+                                                ) {
+                                                  value: CheckedSourceRange -> value
+                                                  nil -> range
+                                                }
+                                              )
+                                          }
+                                        }
+                                        }
                                     }
                                   }
                                 }
-                                    }
-                                }
+                                      }
+                                  }
+                              }
                             }
-                          }
-                          HandlerClauseContinuation(_, _) ->
-                            CheckedBodyHandlerClausesRejected(
-                              state,
-                              CheckedBodyProducerDeferredHandlerUnsupported
-                            )
                           UnknownHandlerClauseContinuation ->
                             CheckedBodyHandlerClausesRejected(
                               state,
