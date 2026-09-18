@@ -1,0 +1,596 @@
+-- Concrete declared-record applications resolved before body checking.
+--
+-- Declaration layouts retain generic field templates. This product walks the
+-- semantic types reachable from function signatures, applies each concrete
+-- record substitution once, and publishes exact field result types. Checked
+-- expressions therefore consume an immutable complete catalog rather than
+-- extending type storage while companion graphs are already being built.
+
+use compiler/project/identity.{
+  DeclarationIdentity,
+  declaration_identity_name
+}
+use compiler/types/graph.{*}
+use compiler/types/graph/catalog.{SemanticTypeCatalog}
+use compiler/types/graph/declarations.{
+  SemanticRecordDeclarationLayoutMatched,
+  SemanticTypeDeclarationCatalog,
+  semantic_type_declaration_catalog_resolve,
+  semantic_type_declared_record_field_count,
+  semantic_type_declared_record_field_declaration,
+  semantic_type_declared_record_field_type
+}
+use compiler/types/graph/equality.{semantic_type_catalog_equal}
+use compiler/types/graph/substitution.{
+  SemanticTypeSubstitution,
+  semantic_type_substitution_empty
+}
+use compiler/weft/check/semantic_types.{
+  SemanticTypeProductBuilder,
+  semantic_type_product_catalog,
+  semantic_type_product_substitute
+}
+use compiler/weft/check/signatures.{SemanticSignatureProduct}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/num/scalar.{num_scalar_usize_checked_add}
+use stdlib/option.{None, Option, Some}
+use stdlib/panic.{panic}
+
+type SemanticRecordApplicationCatalogStorage {
+  targets: List<SemanticTypeId>,
+  field_counts: List<usize>,
+  declarations: List<DeclarationIdentity>,
+  types: List<SemanticTypeId>
+}
+
+pub(package) type SemanticRecordApplicationCatalog = opaque SemanticRecordApplicationCatalogStorage
+
+pub(package) type SemanticDeclaredFieldProjection {
+  SemanticDeclaredFieldProjected(DeclarationIdentity, usize, SemanticTypeId),
+  SemanticDeclaredFieldMissing,
+  SemanticDeclaredFieldProjectionUnavailable
+}
+
+type SemanticApplicationBuild {
+  product: SemanticTypeProductBuilder,
+  applications: SemanticRecordApplicationCatalog,
+  visited: List<SemanticTypeId>
+}
+
+type SemanticApplicationFields {
+  build: SemanticApplicationBuild,
+  declarations: List<DeclarationIdentity>,
+  types: List<SemanticTypeId>
+}
+
+fn semantic_record_applications_empty() -> SemanticRecordApplicationCatalog {
+  SemanticRecordApplicationCatalog(
+    SemanticRecordApplicationCatalogStorage {
+      targets: Nil<SemanticTypeId>(),
+      field_counts: Nil<usize>(),
+      declarations: Nil<DeclarationIdentity>(),
+      types: Nil<SemanticTypeId>()
+    }
+  )
+}
+
+fn semantic_application_declarations_prepend(
+  values: List<DeclarationIdentity>,
+  suffix: List<DeclarationIdentity>
+) -> List<DeclarationIdentity> {
+  match values {
+    Nil -> suffix
+    Cons(value, remaining) -> Cons<DeclarationIdentity>(
+      value,
+      semantic_application_declarations_prepend(remaining, suffix)
+    )
+  }
+}
+
+fn semantic_application_types_prepend(
+  values: List<SemanticTypeId>,
+  suffix: List<SemanticTypeId>
+) -> List<SemanticTypeId> {
+  match values {
+    Nil -> suffix
+    Cons(value, remaining) -> Cons<SemanticTypeId>(
+      value,
+      semantic_application_types_prepend(remaining, suffix)
+    )
+  }
+}
+
+fn semantic_record_applications_add(
+  applications: SemanticRecordApplicationCatalog,
+  target: SemanticTypeId,
+  declarations: List<DeclarationIdentity>,
+  types: List<SemanticTypeId>
+) -> SemanticRecordApplicationCatalog {
+  match applications {
+    SemanticRecordApplicationCatalog(storage) ->
+      SemanticRecordApplicationCatalog(
+        SemanticRecordApplicationCatalogStorage {
+          targets: storage.targets.prepend(target),
+          field_counts: storage.field_counts.prepend(declarations.len()),
+          declarations: semantic_application_declarations_prepend(
+            declarations,
+            storage.declarations
+          ),
+          types: semantic_application_types_prepend(types, storage.types)
+        }
+      )
+  }
+}
+
+fn semantic_application_seen(
+  visited: List<SemanticTypeId>,
+  wanted: SemanticTypeId,
+  catalog: borrow SemanticTypeCatalog
+) -> bool {
+  match visited {
+    Nil -> false
+    Cons(value, remaining) -> semantic_type_catalog_equal(catalog, value, wanted) or
+      semantic_application_seen(remaining, wanted, catalog)
+  }
+}
+
+fn semantic_application_with_visit(
+  build: SemanticApplicationBuild,
+  value: SemanticTypeId
+) -> SemanticApplicationBuild {
+  SemanticApplicationBuild {
+    product: build.product,
+    applications: build.applications,
+    visited: build.visited.prepend(value)
+  }
+}
+
+fn semantic_application_with_product(
+  build: SemanticApplicationBuild,
+  product: SemanticTypeProductBuilder
+) -> SemanticApplicationBuild {
+  SemanticApplicationBuild {
+    product: product,
+    applications: build.applications,
+    visited: build.visited
+  }
+}
+
+fn semantic_application_with_catalog(
+  build: SemanticApplicationBuild,
+  applications: SemanticRecordApplicationCatalog
+) -> SemanticApplicationBuild {
+  SemanticApplicationBuild {
+    product: build.product,
+    applications: applications,
+    visited: build.visited
+  }
+}
+
+fn semantic_application_type_list(
+  build: SemanticApplicationBuild,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  graph: borrow SemanticTypeGraph,
+  values: SemanticTypeListId,
+  index: usize
+) -> SemanticApplicationBuild {
+  let lists = semantic_type_graph_type_lists_local(graph)
+  if index >= semantic_type_list_len(lists, values) { build }
+  else {
+    let value = semantic_type_graph_list_type_id(
+      graph,
+      semantic_type_list_edge(lists, values, index)
+    )
+    semantic_application_type_list(
+      semantic_application_type(build, declarations, value),
+      declarations,
+      graph,
+      values,
+      index + 1
+    )
+  }
+}
+
+fn semantic_application_record_fields(
+  build: SemanticApplicationBuild,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  graph: borrow SemanticTypeGraph,
+  fields: SemanticRecordFieldListId,
+  index: usize
+) -> SemanticApplicationBuild {
+  let records = semantic_type_graph_records_local(graph)
+  if index >= semantic_type_record_field_count(records, fields) { build }
+  else {
+    let field = semantic_type_record_field_edge(records, fields, index)
+    semantic_application_record_fields(
+      semantic_application_type(
+        build,
+        declarations,
+        semantic_type_graph_record_field_type_id(graph, field)
+      ),
+      declarations,
+      graph,
+      fields,
+      index + 1
+    )
+  }
+}
+
+fn semantic_application_trait_bindings(
+  build: SemanticApplicationBuild,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  graph: borrow SemanticTypeGraph,
+  bindings: SemanticTraitBindingListId,
+  index: usize
+) -> SemanticApplicationBuild {
+  let traits = semantic_type_graph_traits_local(graph)
+  if index >= semantic_type_trait_binding_count(traits, bindings) { build }
+  else {
+    let binding = semantic_type_trait_binding_edge(traits, bindings, index)
+    semantic_application_trait_bindings(
+      semantic_application_type(
+        build,
+        declarations,
+        semantic_type_graph_trait_binding_type_id(graph, binding)
+      ),
+      declarations,
+      graph,
+      bindings,
+      index + 1
+    )
+  }
+}
+
+fn semantic_application_declared_fields(
+  build: SemanticApplicationBuild,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  layout: usize,
+  substitution: borrow SemanticTypeSubstitution,
+  index: usize,
+  field_count: usize,
+  resolved_declarations: List<DeclarationIdentity>,
+  resolved_types: List<SemanticTypeId>
+) -> SemanticApplicationFields {
+  if index >= field_count {
+    SemanticApplicationFields {
+      build: build,
+      declarations: resolved_declarations.reverse(),
+      types: resolved_types.reverse()
+    }
+  } else {
+    match (
+      semantic_type_declared_record_field_declaration(declarations, layout, index),
+      semantic_type_declared_record_field_type(declarations, layout, index),
+    ) {
+      (Some(declaration), Some(template)) -> {
+        let (product, resolved) = semantic_type_product_substitute(
+          build.product,
+          substitution,
+          template
+        )
+        let next = semantic_application_type(
+          semantic_application_with_product(build, product),
+          declarations,
+          resolved
+        )
+        semantic_application_declared_fields(
+          next,
+          declarations,
+          layout,
+          substitution,
+          index + 1,
+          field_count,
+          resolved_declarations.prepend(declaration),
+          resolved_types.prepend(resolved)
+        )
+      }
+      _ -> panic("Semantic record declaration columns diverged")
+    }
+  }
+}
+
+fn semantic_application_named(
+  build: SemanticApplicationBuild,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  value: SemanticTypeId,
+  representation: SemanticTypeId,
+  arguments: SemanticTypeListId,
+  graph: borrow SemanticTypeGraph
+) -> SemanticApplicationBuild {
+  let product = build.product
+  let catalog = semantic_type_product_catalog(product)
+  let empty = semantic_type_substitution_empty()
+  let next = match semantic_type_declaration_catalog_resolve(
+    catalog,
+    declarations,
+    value,
+    empty
+  ) {
+    SemanticRecordDeclarationLayoutMatched(layout, substitution) ->
+      match semantic_type_declared_record_field_count(declarations, layout) {
+        Some(field_count) -> {
+          let fields = semantic_application_declared_fields(
+            build,
+            declarations,
+            layout,
+            substitution,
+            0,
+            field_count,
+            Nil<DeclarationIdentity>(),
+            Nil<SemanticTypeId>()
+          )
+          semantic_application_with_catalog(
+            fields.build,
+            semantic_record_applications_add(
+              fields.build.applications,
+              value,
+              fields.declarations,
+              fields.types
+            )
+          )
+        }
+        None -> panic("Semantic record declaration count is missing")
+      }
+    _ -> build
+  }
+  semantic_application_type_list(
+    semantic_application_type(next, declarations, representation),
+    declarations,
+    graph,
+    arguments,
+    0
+  )
+}
+
+fn semantic_application_type(
+  build: SemanticApplicationBuild,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  value: SemanticTypeId
+) -> SemanticApplicationBuild {
+  let product = build.product
+  let catalog = semantic_type_product_catalog(product)
+  if semantic_application_seen(build.visited, value, catalog) { build }
+  else {
+    let next = semantic_application_with_visit(build, value)
+    match catalog.graph_for(value) {
+      None -> panic("Semantic application type is outside its catalog")
+      Some(graph) -> match semantic_type_graph_node(graph, value) {
+        SemanticBottomNode -> next
+        SemanticTopNode -> next
+        SemanticPrimitiveNode(_) -> next
+        SemanticVariableNode(_) -> next
+        SemanticUnionNode(left, right) -> semantic_application_type(
+          semantic_application_type(next, declarations, left),
+          declarations,
+          right
+        )
+        SemanticIntersectionNode(left, right) -> semantic_application_type(
+          semantic_application_type(next, declarations, left),
+          declarations,
+          right
+        )
+        SemanticContinuationNode(input, result) -> semantic_application_type(
+          semantic_application_type(next, declarations, input),
+          declarations,
+          result
+        )
+        SemanticComplementNode(inner) -> semantic_application_type(next, declarations, inner)
+        SemanticWeakNode(inner) -> semantic_application_type(next, declarations, inner)
+        SemanticAtomicNode(inner) -> semantic_application_type(next, declarations, inner)
+        SemanticUniqueNode(inner) -> semantic_application_type(next, declarations, inner)
+        SemanticOwnedNode(inner) -> semantic_application_type(next, declarations, inner)
+        SemanticPointerNode(inner, _) -> semantic_application_type(next, declarations, inner)
+        SemanticBorrowNode(inner, _) -> semantic_application_type(next, declarations, inner)
+        SemanticSliceNode(inner, _) -> semantic_application_type(next, declarations, inner)
+        SemanticArrayNode(inner, _) -> semantic_application_type(next, declarations, inner)
+        SemanticFunctionNode(parameters, result, effects) -> semantic_application_type(
+          semantic_application_type(
+            semantic_application_type_list(
+              next,
+              declarations,
+              graph,
+              parameters,
+              0
+            ),
+            declarations,
+            result
+          ),
+          declarations,
+          effects
+        )
+        SemanticEffectAtomNode(_, arguments) -> semantic_application_type_list(
+          next,
+          declarations,
+          graph,
+          arguments,
+          0
+        )
+        SemanticEffectSignatureNode(effects, _) -> semantic_application_type_list(
+          next,
+          declarations,
+          graph,
+          effects,
+          0
+        )
+        SemanticNamedNode(_, _, representation, arguments) -> semantic_application_named(
+          next,
+          declarations,
+          value,
+          representation,
+          arguments,
+          graph
+        )
+        SemanticRecordNode(fields, _, _) -> semantic_application_record_fields(
+          next,
+          declarations,
+          graph,
+          fields,
+          0
+        )
+        SemanticVariantNode(_, payload) -> semantic_application_type(
+          next,
+          declarations,
+          payload
+        )
+        SemanticTraitNode(_, bindings) -> semantic_application_trait_bindings(
+          next,
+          declarations,
+          graph,
+          bindings,
+          0
+        )
+        SemanticAssociatedNode(base, _) -> semantic_application_type(
+          next,
+          declarations,
+          base
+        )
+      }
+    }
+  }
+}
+
+fn semantic_application_signatures(
+  build: SemanticApplicationBuild,
+  signatures: borrow SemanticSignatureProduct,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  index: usize
+) -> SemanticApplicationBuild {
+  if index >= signatures.len() { build }
+  else {
+    let signature = signatures.at(index)
+    let mut next = semantic_application_type(build, declarations, signature.type_id)
+    let mut bound: usize = 0
+    while bound < signatures.bound_count(signature) {
+      next = semantic_application_type(
+        next,
+        declarations,
+        signatures.bound_at(signature, bound).trait_atom
+      )
+      bound = bound + 1
+    }
+    semantic_application_signatures(next, signatures, declarations, index + 1)
+  }
+}
+
+pub(package) fn resolve_semantic_record_applications(
+  product: SemanticTypeProductBuilder,
+  signatures: borrow SemanticSignatureProduct,
+  declarations: borrow SemanticTypeDeclarationCatalog
+) -> (SemanticTypeProductBuilder, SemanticRecordApplicationCatalog) {
+  let build = semantic_application_signatures(
+    SemanticApplicationBuild {
+      product: product,
+      applications: semantic_record_applications_empty(),
+      visited: Nil<SemanticTypeId>()
+    },
+    signatures,
+    declarations,
+    0
+  )
+  (build.product, build.applications)
+}
+
+fn semantic_application_usize_prefix(
+  values: List<usize>,
+  count: usize,
+  total: usize
+) -> Option<usize> {
+  if count == 0 { Some<usize>(total) }
+  else {
+    match values {
+      Nil -> None<usize>()
+      Cons(value, remaining) -> match num_scalar_usize_checked_add(total, value) {
+        Some(next) -> semantic_application_usize_prefix(remaining, count - 1, next)
+        None -> None<usize>()
+      }
+    }
+  }
+}
+
+fn semantic_application_at<T>(values: List<T>, index: usize) -> Option<T> {
+  match values {
+    Nil -> None<T>()
+    Cons(value, remaining) -> if index == 0 { Some<T>(value) }
+    else { semantic_application_at(remaining, index - 1) }
+  }
+}
+
+fn semantic_application_target_index(
+  targets: List<SemanticTypeId>,
+  wanted: SemanticTypeId,
+  catalog: borrow SemanticTypeCatalog,
+  index: usize
+) -> Option<usize> {
+  match targets {
+    Nil -> None<usize>()
+    Cons(target, remaining) -> if semantic_type_catalog_equal(catalog, target, wanted) {
+      Some<usize>(index)
+    } else {
+      semantic_application_target_index(remaining, wanted, catalog, index + 1)
+    }
+  }
+}
+
+fn semantic_application_field_projection(
+  storage: SemanticRecordApplicationCatalogStorage,
+  wanted: str,
+  field: usize,
+  field_count: usize,
+  start: usize
+) -> SemanticDeclaredFieldProjection {
+  if field >= field_count { SemanticDeclaredFieldMissing }
+  else {
+    let ordinal = start + field
+    match (
+      semantic_application_at(storage.declarations, ordinal),
+      semantic_application_at(storage.types, ordinal),
+    ) {
+      (Some(declaration), Some(field_type)) -> {
+        let name = declaration_identity_name(declaration)
+        if match name.text() { Some(value) -> value == wanted, None -> false } {
+          SemanticDeclaredFieldProjected(declaration, field, field_type)
+        } else {
+          semantic_application_field_projection(
+            storage,
+            wanted,
+            field + 1,
+            field_count,
+            start
+          )
+        }
+      }
+      _ -> panic("Semantic record application columns diverged")
+    }
+  }
+}
+
+pub(package) fn semantic_declared_field_projection(
+  applications: borrow SemanticRecordApplicationCatalog,
+  types: borrow SemanticTypeCatalog,
+  base: SemanticTypeId,
+  wanted: str
+) -> SemanticDeclaredFieldProjection {
+  match applications {
+    SemanticRecordApplicationCatalog(storage) -> match semantic_application_target_index(
+      storage.targets,
+      base,
+      types,
+      0
+    ) {
+      None -> SemanticDeclaredFieldProjectionUnavailable
+      Some(application) -> match (
+        semantic_application_at(storage.field_counts, application),
+        semantic_application_usize_prefix(storage.field_counts, application, 0),
+      ) {
+        (Some(field_count), Some(start)) -> semantic_application_field_projection(
+          storage,
+          wanted,
+          0,
+          field_count,
+          start
+        )
+        _ -> panic("Semantic record application bounds diverged")
+      }
+    }
+  }
+}
