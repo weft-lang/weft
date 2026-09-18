@@ -1,0 +1,523 @@
+-- Immutable semantic resolution shared by body checking and lowering.
+--
+-- Function signatures and declared aggregate layouts extend one semantic type
+-- catalog. Later conformance selections and effect-operation signatures join
+-- this product rather than introducing expression-specific lookup tables.
+
+use compiler/ir/data.{
+  MissingTypeExpr,
+  MissingTypeParam,
+  NamedTypeExpr,
+  NoTypeRepresentation,
+  SourceTypeOrigin,
+  TypeExpr,
+  TypeExprList,
+  TypeExprListCons,
+  TypeExprListNil,
+  TypeParam,
+  TypeParamList,
+  TypeParamListCons,
+  TypeParamListNil,
+  VariableTypeExpr
+}
+use compiler/project/identity.{DeclarationIdentity, FunctionIdentity, ModuleIdentity}
+use compiler/types/graph.{SemanticTypeId}
+use compiler/types/graph/catalog.{SemanticTypeCatalog}
+use compiler/types/graph/declarations.{
+  SemanticTypeDeclarationCatalog,
+  semantic_record_declaration_layout,
+  semantic_type_declaration_catalog_add,
+  semantic_type_declaration_catalog_empty,
+  semantic_variant_declaration_layout
+}
+use compiler/weft/check/registration/catalog.{
+  RegisteredDeclarationKind,
+  RegisteredModule,
+  RegisteredName,
+  RegisteredRecordField,
+  RegisteredRecordType,
+  RegisteredTypeDeclaration,
+  RegisteredVariantMember,
+  RegisteredVariantType
+}
+use compiler/weft/check/registration/scope.{RegistrationScope}
+use compiler/weft/check/semantic_types.{
+  SemanticTypeProductBuilder,
+  SemanticTypeResolution,
+  SemanticTypeRejected,
+  SemanticTypeResolutionIssue,
+  SemanticTypeResolved,
+  resolve_type_product_in_scope,
+  semantic_type_product_catalog,
+  semantic_type_product_continue,
+  semantic_type_product_next_segment
+}
+use compiler/weft/check/signatures.{
+  SemanticSignatureProduct,
+  SemanticSignaturesRejected,
+  SemanticSignaturesResolved,
+  resolve_module_signatures
+}
+use compiler/weft/check/storage.{dense_index}
+use stdlib/list.{Cons, List, Nil}
+
+type SemanticResolutionProductStorage {
+  signatures: SemanticSignatureProduct,
+  catalog: SemanticTypeCatalog,
+  next_type_segment: usize,
+  declarations: SemanticTypeDeclarationCatalog
+}
+
+pub(package) type SemanticResolutionProduct = opaque SemanticResolutionProductStorage
+
+pub(package) type SemanticResolutionIssue {
+  SemanticSignatureResolutionIssue(FunctionIdentity, SemanticTypeResolutionIssue),
+  SemanticDeclarationResolutionIssue(DeclarationIdentity, SemanticTypeResolutionIssue)
+}
+
+pub(package) type SemanticResolution {
+  SemanticResolutionAccepted(SemanticResolutionProduct),
+  SemanticResolutionRejected(SemanticResolutionIssue)
+}
+
+type SemanticDeclarationEnvironment {
+  SemanticDeclarationEnvironment(RegisteredModule, RegistrationScope, TypeParamList)
+}
+
+type SemanticRecordFieldsResolution {
+  SemanticRecordFieldsResolved(
+    SemanticTypeProductBuilder,
+    List<DeclarationIdentity>,
+    List<SemanticTypeId>
+  ),
+  SemanticRecordFieldsRejected(
+    SemanticTypeProductBuilder,
+    SemanticTypeResolutionIssue
+  )
+}
+
+type SemanticVariantPayloadsResolution {
+  SemanticVariantPayloadsResolved(
+    SemanticTypeProductBuilder,
+    List<SemanticTypeId>,
+    usize
+  ),
+  SemanticVariantPayloadsRejected(
+    SemanticTypeProductBuilder,
+    SemanticTypeResolutionIssue
+  )
+}
+
+type SemanticVariantCasesResolution {
+  SemanticVariantCasesResolved(
+    SemanticTypeProductBuilder,
+    List<DeclarationIdentity>,
+    List<usize>,
+    List<SemanticTypeId>
+  ),
+  SemanticVariantCasesRejected(
+    SemanticTypeProductBuilder,
+    SemanticTypeResolutionIssue
+  )
+}
+
+type SemanticDeclarationsResolution {
+  SemanticDeclarationsResolved(
+    SemanticTypeProductBuilder,
+    SemanticTypeDeclarationCatalog
+  ),
+  SemanticDeclarationsRejected(
+    SemanticTypeProductBuilder,
+    DeclarationIdentity,
+    SemanticTypeResolutionIssue
+  )
+}
+
+fn semantic_environment_module(
+  environment: SemanticDeclarationEnvironment
+) -> RegisteredModule {
+  match environment {
+    SemanticDeclarationEnvironment(module, _, _) -> module
+  }
+}
+
+fn semantic_environment_scope(
+  environment: SemanticDeclarationEnvironment
+) -> RegistrationScope {
+  match environment {
+    SemanticDeclarationEnvironment(_, scope, _) -> scope
+  }
+}
+
+fn semantic_environment_parameters(
+  environment: SemanticDeclarationEnvironment
+) -> TypeParamList {
+  match environment {
+    SemanticDeclarationEnvironment(_, _, parameters) -> parameters
+  }
+}
+
+fn semantic_parameter_arguments(parameters: TypeParamList) -> TypeExprList {
+  match parameters {
+    TypeParamListNil -> TypeExprListNil
+    TypeParamListCons(parameter, remaining) -> match parameter {
+      TypeParam(_, _, identity, _) -> TypeExprListCons(
+        VariableTypeExpr(identity),
+        semantic_parameter_arguments(remaining),
+        nil
+      )
+      MissingTypeParam -> TypeExprListCons(
+        MissingTypeExpr,
+        semantic_parameter_arguments(remaining),
+        nil
+      )
+    }
+  }
+}
+
+fn semantic_declaration_target(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticDeclarationEnvironment,
+  name: RegisteredName
+) -> (SemanticTypeProductBuilder, SemanticTypeResolution) {
+  let parameters = semantic_environment_parameters(environment)
+  resolve_type_product_in_scope(
+    product,
+    semantic_environment_module(environment),
+    semantic_environment_scope(environment),
+    parameters,
+    NamedTypeExpr(
+      0,
+      NoTypeRepresentation,
+      semantic_parameter_arguments(parameters),
+      SourceTypeOrigin(name.range)
+    )
+  )
+}
+
+fn semantic_record_fields(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticDeclarationEnvironment,
+  fields: List<RegisteredRecordField>,
+  declarations: List<DeclarationIdentity>,
+  types: List<SemanticTypeId>
+) -> SemanticRecordFieldsResolution {
+  match fields {
+    Nil -> SemanticRecordFieldsResolved(
+      product,
+      declarations.reverse(),
+      types.reverse()
+    )
+    Cons(field, remaining) -> match resolve_type_product_in_scope(
+      product,
+      semantic_environment_module(environment),
+      semantic_environment_scope(environment),
+      semantic_environment_parameters(environment),
+      field.syntax.annotation
+    ) {
+      (product, SemanticTypeResolved(field_type)) -> semantic_record_fields(
+        product,
+        environment,
+        remaining,
+        declarations.prepend(field.name.identity),
+        types.prepend(field_type)
+      )
+      (product, SemanticTypeRejected(issue)) -> SemanticRecordFieldsRejected(
+        product,
+        issue
+      )
+    }
+  }
+}
+
+fn semantic_variant_payloads(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticDeclarationEnvironment,
+  payloads: List<TypeExpr>,
+  types: List<SemanticTypeId>,
+  count: usize
+) -> SemanticVariantPayloadsResolution {
+  match payloads {
+    Nil -> SemanticVariantPayloadsResolved(product, types, count)
+    Cons(payload, remaining) -> match resolve_type_product_in_scope(
+      product,
+      semantic_environment_module(environment),
+      semantic_environment_scope(environment),
+      semantic_environment_parameters(environment),
+      payload
+    ) {
+      (product, SemanticTypeResolved(payload_type)) -> semantic_variant_payloads(
+        product,
+        environment,
+        remaining,
+        types.prepend(payload_type),
+        count + 1
+      )
+      (product, SemanticTypeRejected(issue)) -> SemanticVariantPayloadsRejected(
+        product,
+        issue
+      )
+    }
+  }
+}
+
+fn semantic_variant_cases(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticDeclarationEnvironment,
+  members: List<RegisteredVariantMember>,
+  declarations: List<DeclarationIdentity>,
+  counts: List<usize>,
+  types: List<SemanticTypeId>
+) -> SemanticVariantCasesResolution {
+  match members {
+    Nil -> SemanticVariantCasesResolved(
+      product,
+      declarations.reverse(),
+      counts.reverse(),
+      types.reverse()
+    )
+    Cons(member, remaining) -> match semantic_variant_payloads(
+      product,
+      environment,
+      member.syntax.payloads,
+      types,
+      0
+    ) {
+      SemanticVariantPayloadsResolved(product, types, count) ->
+        semantic_variant_cases(
+          product,
+          environment,
+          remaining,
+          declarations.prepend(member.name.identity),
+          counts.prepend(count),
+          types
+        )
+      SemanticVariantPayloadsRejected(product, issue) ->
+        SemanticVariantCasesRejected(product, issue)
+    }
+  }
+}
+
+fn semantic_record_layout(
+  product: SemanticTypeProductBuilder,
+  module: RegisteredModule,
+  scope: RegistrationScope,
+  name: RegisteredName,
+  parameters: TypeParamList,
+  fields: List<RegisteredRecordField>,
+  catalog: SemanticTypeDeclarationCatalog
+) -> SemanticDeclarationsResolution {
+  let environment = SemanticDeclarationEnvironment(module, scope, parameters)
+  match semantic_declaration_target(product, environment, name) {
+    (product, SemanticTypeRejected(issue)) -> SemanticDeclarationsRejected(
+      product,
+      name.identity,
+      issue
+    )
+    (product, SemanticTypeResolved(target)) -> match semantic_record_fields(
+      product,
+      environment,
+      fields,
+      Nil<DeclarationIdentity>(),
+      Nil<SemanticTypeId>()
+    ) {
+      SemanticRecordFieldsResolved(product, declarations, types) ->
+        SemanticDeclarationsResolved(
+          product,
+          semantic_type_declaration_catalog_add(
+            catalog,
+            semantic_record_declaration_layout(target, declarations, types)
+          )
+        )
+      SemanticRecordFieldsRejected(product, issue) -> SemanticDeclarationsRejected(
+        product,
+        name.identity,
+        issue
+      )
+    }
+  }
+}
+
+fn semantic_variant_layout(
+  product: SemanticTypeProductBuilder,
+  module: RegisteredModule,
+  scope: RegistrationScope,
+  name: RegisteredName,
+  parameters: TypeParamList,
+  members: List<RegisteredVariantMember>,
+  catalog: SemanticTypeDeclarationCatalog
+) -> SemanticDeclarationsResolution {
+  let environment = SemanticDeclarationEnvironment(module, scope, parameters)
+  match semantic_declaration_target(product, environment, name) {
+    (product, SemanticTypeRejected(issue)) -> SemanticDeclarationsRejected(
+      product,
+      name.identity,
+      issue
+    )
+    (product, SemanticTypeResolved(target)) -> match semantic_variant_cases(
+      product,
+      environment,
+      members,
+      Nil<DeclarationIdentity>(),
+      Nil<usize>(),
+      Nil<SemanticTypeId>()
+    ) {
+      SemanticVariantCasesResolved(
+        product,
+        declarations,
+        counts,
+        types,
+      ) -> SemanticDeclarationsResolved(
+        product,
+        semantic_type_declaration_catalog_add(
+          catalog,
+          semantic_variant_declaration_layout(
+            target,
+            declarations,
+            counts,
+            types
+          )
+        )
+      )
+      SemanticVariantCasesRejected(product, issue) -> SemanticDeclarationsRejected(
+        product,
+        name.identity,
+        issue
+      )
+    }
+  }
+}
+
+fn semantic_declarations(
+  module: RegisteredModule,
+  scope: RegistrationScope,
+  index: usize,
+  product: SemanticTypeProductBuilder,
+  catalog: SemanticTypeDeclarationCatalog
+) -> SemanticDeclarationsResolution {
+  let declarations = module.declarations
+  if index >= declarations.len() {
+    SemanticDeclarationsResolved(product, catalog)
+  } else {
+    let declaration = declarations.at(dense_index(index))
+    match declaration.kind {
+      RegisteredTypeDeclaration(registered) -> match registered {
+        RegisteredRecordType(name, parameters, fields) -> match semantic_record_layout(
+          product,
+          module,
+          scope,
+          name,
+          parameters,
+          fields,
+          catalog
+        ) {
+          SemanticDeclarationsResolved(product, declarations) -> semantic_declarations(
+            module,
+            scope,
+            index + 1,
+            product,
+            declarations
+          )
+          SemanticDeclarationsRejected(product, identity, issue) ->
+            SemanticDeclarationsRejected(product, identity, issue)
+        }
+        RegisteredVariantType(name, parameters, members) -> match semantic_variant_layout(
+          product,
+          module,
+          scope,
+          name,
+          parameters,
+          members,
+          catalog
+        ) {
+          SemanticDeclarationsResolved(product, addition) -> semantic_declarations(
+            module,
+            scope,
+            index + 1,
+            product,
+            addition
+          )
+          SemanticDeclarationsRejected(product, identity, issue) ->
+            SemanticDeclarationsRejected(product, identity, issue)
+        }
+        _ -> semantic_declarations(module, scope, index + 1, product, catalog)
+      }
+      _ -> semantic_declarations(module, scope, index + 1, product, catalog)
+    }
+  }
+}
+
+pub(package) fn resolve_module_semantics(
+  module: RegisteredModule,
+  scope: RegistrationScope
+) -> SemanticResolution {
+  match resolve_module_signatures(module, scope) {
+    SemanticSignaturesRejected(function, issue) -> SemanticResolutionRejected(
+      SemanticSignatureResolutionIssue(function, issue)
+    )
+    SemanticSignaturesResolved(signatures) -> match semantic_declarations(
+      module,
+      scope,
+      0,
+      signatures.continue_types(),
+      semantic_type_declaration_catalog_empty()
+    ) {
+      SemanticDeclarationsRejected(_, declaration, issue) -> SemanticResolutionRejected(
+        SemanticDeclarationResolutionIssue(declaration, issue)
+      )
+      SemanticDeclarationsResolved(product, declarations) ->
+        SemanticResolutionAccepted(
+          SemanticResolutionProduct(
+            SemanticResolutionProductStorage {
+              signatures: signatures,
+              catalog: semantic_type_product_catalog(product),
+              next_type_segment: semantic_type_product_next_segment(product),
+              declarations: declarations
+            }
+          )
+        )
+    }
+  }
+}
+
+impl SemanticResolutionProduct {
+  pub(package) fn module(self: borrow Self) -> ModuleIdentity {
+    match self {
+      SemanticResolutionProduct(storage) -> {
+        let signatures = storage.signatures
+        signatures.module()
+      }
+    }
+  }
+
+  pub(package) fn signatures(self: borrow Self) -> SemanticSignatureProduct {
+    match self {
+      SemanticResolutionProduct(storage) -> storage.signatures
+    }
+  }
+
+  pub(package) fn catalog(self: borrow Self) -> SemanticTypeCatalog {
+    match self {
+      SemanticResolutionProduct(storage) -> storage.catalog
+    }
+  }
+
+  pub(package) fn declarations(self: borrow Self) -> SemanticTypeDeclarationCatalog {
+    match self {
+      SemanticResolutionProduct(storage) -> storage.declarations
+    }
+  }
+
+  pub(package) fn continue_types(self: borrow Self) -> SemanticTypeProductBuilder {
+    match self {
+      SemanticResolutionProduct(storage) -> {
+        let signatures = storage.signatures
+        semantic_type_product_continue(
+          signatures.module(),
+          storage.catalog,
+          storage.next_type_segment
+        )
+      }
+    }
+  }
+}
