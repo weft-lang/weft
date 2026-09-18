@@ -5,13 +5,23 @@
 -- unimplemented authored form structurally; it never falls back to raw nodes.
 
 use compiler/ir/data.{
+  Assign,
+  Block,
   BoolLit,
   Expr,
+  Ident,
   IntLit,
+  Let,
+  LetMut,
   NilExpr,
+  Param,
+  ParamList,
+  ParamListCons,
+  ParamListNil,
   PrimitiveTypeExpr,
   TypeParamListNil
 }
+use compiler/project/identity.{FunctionIdentity}
 use compiler/types/graph.{
   SemanticBool,
   SemanticF32,
@@ -29,7 +39,11 @@ use compiler/types/graph.{
   SemanticU64,
   SemanticU8,
   SemanticUsize,
-  semantic_type_graph_node
+  semantic_type_graph_list_type_id,
+  semantic_type_graph_node,
+  semantic_type_graph_type_lists_local,
+  semantic_type_list_edge,
+  semantic_type_list_len
 }
 use compiler/types/graph/catalog.{SemanticTypeCatalog}
 use compiler/types/graph/conformance.{SemanticConformance}
@@ -39,6 +53,10 @@ use compiler/weft/check/body/effects.{CheckedEffectBuilder, checked_effect_build
 use compiler/weft/check/body/graph.{
   CheckedExprGraphBuilder,
   CheckedExprId,
+  CheckedBindingId,
+  CheckedImmutableBinding,
+  CheckedBindingMutability,
+  CheckedMutableBinding,
   CheckedSourceRange,
   checked_expr_graph_builder
 }
@@ -77,6 +95,9 @@ use stdlib/source.{Source}
 pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerTypeRejected(SemanticTypeResolutionIssue),
   CheckedBodyProducerInvalidRange,
+  CheckedBodyProducerUnknownIdentifier(CheckedSourceRange),
+  CheckedBodyProducerImmutableAssignment(CheckedSourceRange),
+  CheckedBodyProducerUnsupportedParameter,
   CheckedBodyProducerTypeMismatch(SemanticTypeId, SemanticTypeId),
   CheckedBodyProducerUnsupportedExpression,
   CheckedBodyProducerFreezeRejected(CheckedBodyProductIssue)
@@ -99,6 +120,23 @@ type CheckedBodyPrimitiveResolution {
   CheckedBodyPrimitivesRejected(SemanticTypeResolutionIssue)
 }
 
+type CheckedLexicalEnvironment {
+  CheckedLexicalEmpty,
+  CheckedLexicalBinding(
+    i64,
+    i64,
+    CheckedBindingId,
+    SemanticTypeId,
+    bool,
+    CheckedLexicalEnvironment
+  )
+}
+
+type CheckedLexicalLookup {
+  CheckedLexicalFound(CheckedBindingId, SemanticTypeId, bool),
+  CheckedLexicalMissing
+}
+
 type CheckedBodyBuildStorage {
   signatures: SemanticSignatureProduct,
   expressions: owned CheckedExprGraphBuilder,
@@ -115,9 +153,19 @@ type CheckedBodyExprBuild {
   CheckedBodyExprRejected(owned CheckedBodyBuild, CheckedBodyProducerIssue)
 }
 
+type CheckedBodyExpectation {
+  CheckedInferResult,
+  CheckedRequireResult(SemanticTypeId)
+}
+
 type CheckedBodyFunctionsBuild {
   CheckedBodyFunctionsBuilt(owned CheckedBodyBuild),
   CheckedBodyFunctionsRejected(owned CheckedBodyBuild, CheckedBodyProducerIssue)
+}
+
+type CheckedBodyParametersBuild {
+  CheckedBodyParametersBuilt(owned CheckedBodyBuild, CheckedLexicalEnvironment),
+  CheckedBodyParametersRejected(owned CheckedBodyBuild, CheckedBodyProducerIssue)
 }
 
 fn checked_body_primitive_types(
@@ -209,6 +257,50 @@ fn source_range(
   }
 }
 
+fn same_source_name(
+  source: Source,
+  left_start: i64,
+  left_length: i64,
+  right_start: i64,
+  right_length: i64
+) -> bool {
+  if left_length != right_length or left_start < 0 or right_start < 0 or
+    left_length < 0 { false }
+  else {
+    let left_first = __i64_to_usize(left_start)
+    let right_first = __i64_to_usize(right_start)
+    let count = __i64_to_usize(left_length)
+    match (
+      source.text.slice(left_first, left_first + count),
+      source.text.slice(right_first, right_first + count)
+    ) {
+      (Some(left), Some(right)) -> left == right
+      _ -> false
+    }
+  }
+}
+
+fn lexical_lookup(
+  environment: CheckedLexicalEnvironment,
+  source: Source,
+  start: i64,
+  length: i64
+) -> CheckedLexicalLookup {
+  match environment {
+    CheckedLexicalEmpty -> CheckedLexicalMissing
+    CheckedLexicalBinding(binding_start, binding_length, binding, value_type, mutable, parent) ->
+      if same_source_name(
+        source,
+        start,
+        length,
+        binding_start,
+        binding_length
+      ) {
+        CheckedLexicalFound(binding, value_type, mutable)
+      } else { lexical_lookup(parent, source, start, length) }
+  }
+}
+
 fn semantic_function_result(
   catalog: borrow SemanticTypeCatalog,
   signature: SemanticFunctionSignature
@@ -216,6 +308,42 @@ fn semantic_function_result(
   match catalog.graph_for(signature.type_id) {
     Some(graph) -> match semantic_type_graph_node(graph, signature.type_id) {
       SemanticFunctionNode(_, result, _) -> result
+      _ -> panic("Checked body signature is not a function type")
+    }
+    _ -> panic("Checked body signature is outside its type catalog")
+  }
+}
+
+fn semantic_function_parameter_count(
+  catalog: borrow SemanticTypeCatalog,
+  signature: SemanticFunctionSignature
+) -> usize {
+  match catalog.graph_for(signature.type_id) {
+    Some(graph) -> match semantic_type_graph_node(graph, signature.type_id) {
+      SemanticFunctionNode(parameters, _, _) -> {
+        let lists = semantic_type_graph_type_lists_local(graph)
+        semantic_type_list_len(lists, parameters)
+      }
+      _ -> panic("Checked body signature is not a function type")
+    }
+    _ -> panic("Checked body signature is outside its type catalog")
+  }
+}
+
+fn semantic_function_parameter(
+  catalog: borrow SemanticTypeCatalog,
+  signature: SemanticFunctionSignature,
+  index: usize
+) -> SemanticTypeId {
+  match catalog.graph_for(signature.type_id) {
+    Some(graph) -> match semantic_type_graph_node(graph, signature.type_id) {
+      SemanticFunctionNode(parameters, _, _) -> {
+        let lists = semantic_type_graph_type_lists_local(graph)
+        semantic_type_graph_list_type_id(
+          graph,
+          semantic_type_list_edge(lists, parameters, index)
+        )
+      }
       _ -> panic("Checked body signature is not a function type")
     }
     _ -> panic("Checked body signature is outside its type catalog")
@@ -255,6 +383,205 @@ impl CheckedBodyBuild {
       CheckedBodyBuild(storage) -> {
         let { signatures, expressions: _, patterns: _, closures: _, effects: _, propagation: _ } = storage
         signatures.at(index)
+      }
+    }
+  }
+
+  fn binding(
+    self: owned Self,
+    owner: FunctionIdentity,
+    value_type: SemanticTypeId,
+    range: CheckedSourceRange,
+    mutability: CheckedBindingMutability
+  ) -> (owned CheckedBodyBuild, CheckedBindingId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match expressions.binding(
+          owner,
+          value_type,
+          range,
+          mutability
+        ) {
+          (expressions, binding) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            binding
+          )
+        }
+      }
+    }
+  }
+
+  fn function_parameter(
+    self: owned Self,
+    binding: CheckedBindingId
+  ) -> owned CheckedBodyBuild {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        CheckedBodyBuild(
+          CheckedBodyBuildStorage {
+            signatures: signatures,
+            expressions: expressions.function_parameter(binding),
+            patterns: patterns,
+            closures: closures,
+            effects: effects,
+            propagation: propagation
+          }
+        )
+      }
+    }
+  }
+
+  fn local_reference(
+    self: owned Self,
+    binding: CheckedBindingId,
+    result: SemanticTypeId,
+    range: CheckedSourceRange
+  ) -> (owned CheckedBodyBuild, CheckedExprId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match expressions.local_reference(binding, result, range) {
+          (expressions, expression) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            expression
+          )
+        }
+      }
+    }
+  }
+
+  fn result_type(
+    self: borrow Self,
+    expression: CheckedExprId
+  ) -> SemanticTypeId {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        expressions.result_type(expression)
+      }
+    }
+  }
+
+  fn range(
+    self: borrow Self,
+    expression: CheckedExprId
+  ) -> CheckedSourceRange {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        expressions.range(expression)
+      }
+    }
+  }
+
+  fn block(
+    self: owned Self,
+    first: CheckedExprId,
+    rest: CheckedExprId,
+    result: SemanticTypeId,
+    range: CheckedSourceRange
+  ) -> (owned CheckedBodyBuild, CheckedExprId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match expressions.block(first, rest, result, range) {
+          (expressions, expression) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            expression
+          )
+        }
+      }
+    }
+  }
+
+  fn let_binding(
+    self: owned Self,
+    binding: CheckedBindingId,
+    value: CheckedExprId,
+    body: CheckedExprId,
+    mutable: bool,
+    result: SemanticTypeId,
+    range: CheckedSourceRange
+  ) -> (owned CheckedBodyBuild, CheckedExprId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let built = if mutable {
+          expressions.let_mut_expr(binding, value, body, result, range)
+        } else { expressions.let_expr(binding, value, body, result, range) }
+        match built {
+          (expressions, expression) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            expression
+          )
+        }
+      }
+    }
+  }
+
+  fn assign(
+    self: owned Self,
+    binding: CheckedBindingId,
+    value: CheckedExprId,
+    result: SemanticTypeId,
+    range: CheckedSourceRange
+  ) -> (owned CheckedBodyBuild, CheckedExprId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match expressions.assign(binding, value, result, range) {
+          (expressions, expression) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            expression
+          )
+        }
       }
     }
   }
@@ -401,38 +728,368 @@ impl Drop for CheckedBodyBuild {
   }
 }
 
+fn checked_body_parameters(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  catalog: SemanticTypeCatalog,
+  signature: SemanticFunctionSignature,
+  parameters: ParamList,
+  index: usize,
+  environment: CheckedLexicalEnvironment
+) -> CheckedBodyParametersBuild {
+  match parameters {
+    ParamListNil -> if index == semantic_function_parameter_count(catalog, signature) {
+      CheckedBodyParametersBuilt(state, environment)
+    } else {
+      CheckedBodyParametersRejected(state, CheckedBodyProducerUnsupportedParameter)
+    }
+    ParamListCons(parameter, rest) -> match parameter {
+      Param(start, length, _, _) -> match source_range(source, start, length) {
+        range: CheckedSourceRange -> {
+          let value_type = semantic_function_parameter(catalog, signature, index)
+          match state.binding(
+            signature.identity,
+            value_type,
+            range,
+            CheckedImmutableBinding
+          ) {
+            (state, binding) -> checked_body_parameters(
+              state.function_parameter(binding),
+              source,
+              catalog,
+              signature,
+              rest,
+              index + 1,
+              CheckedLexicalBinding(
+                start,
+                length,
+                binding,
+                value_type,
+                false,
+                environment
+              )
+            )
+          }
+        }
+        nil -> CheckedBodyParametersRejected(state, CheckedBodyProducerInvalidRange)
+      }
+      _ -> CheckedBodyParametersRejected(
+        state,
+        CheckedBodyProducerUnsupportedParameter
+      )
+    }
+  }
+}
+
+fn expectation_allows(
+  catalog: borrow SemanticTypeCatalog,
+  actual: SemanticTypeId,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> bool {
+  match expectation {
+    CheckedInferResult -> true
+    CheckedRequireResult(expected) -> semantic_type_is_subtype(catalog, actual, expected)
+  }
+}
+
+fn expectation_mismatch(
+  actual: SemanticTypeId,
+  expectation: CheckedBodyExpectation
+) -> CheckedBodyProducerIssue {
+  match expectation {
+    CheckedRequireResult(expected) -> CheckedBodyProducerTypeMismatch(actual, expected)
+    CheckedInferResult -> panic("Inferred checked expression cannot mismatch its context")
+  }
+}
+
+fn contextual_integer_type(
+  catalog: borrow SemanticTypeCatalog,
+  fallback: SemanticTypeId,
+  expectation: CheckedBodyExpectation
+) -> SemanticTypeId {
+  match expectation {
+    CheckedRequireResult(expected) -> if semantic_integer_type(catalog, expected) {
+      expected
+    } else { fallback }
+    CheckedInferResult -> fallback
+  }
+}
+
+fn checked_body_block(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
+  first: Expr,
+  rest: Expr,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  match checked_body_expr(
+    state,
+    source,
+    types,
+    owner,
+    environment,
+    first,
+    CheckedInferResult
+  ) {
+    CheckedBodyExprBuilt(state, checked_first) -> match checked_body_expr(
+      state,
+      source,
+      types,
+      owner,
+      environment,
+      rest,
+      expectation
+    ) {
+      CheckedBodyExprBuilt(state, checked_rest) -> {
+        let result = state.result_type(checked_rest)
+        let first_range = state.range(checked_first)
+        let rest_range = state.range(checked_rest)
+        if rest_range.end < first_range.start {
+          CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+        } else {
+          match state.block(
+            checked_first,
+            checked_rest,
+            result,
+            CheckedSourceRange { start: first_range.start, end: rest_range.end }
+          ) {
+            (state, expression) -> CheckedBodyExprBuilt(state, expression)
+          }
+        }
+      }
+      CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+    }
+    CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+  }
+}
+
+fn checked_body_let(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
+  start: i64,
+  length: i64,
+  value: Expr,
+  body: Expr,
+  mutable: bool,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  match source_range(source, start, length) {
+    binding_range: CheckedSourceRange -> match checked_body_expr(
+      state,
+      source,
+      types,
+      owner,
+      environment,
+      value,
+      CheckedInferResult
+    ) {
+      CheckedBodyExprBuilt(state, checked_value) -> {
+        let value_type = state.result_type(checked_value)
+        let mutability = if mutable {
+          CheckedMutableBinding
+        } else { CheckedImmutableBinding }
+        match state.binding(owner, value_type, binding_range, mutability) {
+          (state, binding) -> match checked_body_expr(
+            state,
+            source,
+            types,
+            owner,
+            CheckedLexicalBinding(
+              start,
+              length,
+              binding,
+              value_type,
+              mutable,
+              environment
+            ),
+            body,
+            expectation
+          ) {
+            CheckedBodyExprBuilt(state, checked_body) -> {
+              let result = state.result_type(checked_body)
+              let body_range = state.range(checked_body)
+              if body_range.end < binding_range.start {
+                CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+              } else {
+                match state.let_binding(
+                  binding,
+                  checked_value,
+                  checked_body,
+                  mutable,
+                  result,
+                  CheckedSourceRange {
+                    start: binding_range.start,
+                    end: body_range.end
+                  }
+                ) {
+                  (state, expression) -> CheckedBodyExprBuilt(state, expression)
+                }
+              }
+            }
+            CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+          }
+        }
+      }
+      CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+    }
+    nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+  }
+}
+
+fn checked_body_assign(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
+  start: i64,
+  length: i64,
+  value: Expr,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  let catalog = types.catalog
+  match source_range(source, start, length) {
+    name_range: CheckedSourceRange -> match lexical_lookup(
+      environment,
+      source,
+      start,
+      length
+    ) {
+      CheckedLexicalFound(binding, value_type, true) -> if expectation_allows(
+        catalog,
+        types.nil_type,
+        expectation
+      ) {
+        match checked_body_expr(
+          state,
+          source,
+          types,
+          owner,
+          environment,
+          value,
+          CheckedRequireResult(value_type)
+        ) {
+          CheckedBodyExprBuilt(state, checked_value) -> {
+            let value_range = state.range(checked_value)
+            if value_range.end < name_range.start {
+              CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+            } else {
+              match state.assign(
+                binding,
+                checked_value,
+                types.nil_type,
+                CheckedSourceRange { start: name_range.start, end: value_range.end }
+              ) {
+                (state, expression) -> CheckedBodyExprBuilt(state, expression)
+              }
+            }
+          }
+          CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+        }
+      } else {
+        CheckedBodyExprRejected(
+          state,
+          expectation_mismatch(types.nil_type, expectation)
+        )
+      }
+      CheckedLexicalFound(_, _, false) -> CheckedBodyExprRejected(
+        state,
+        CheckedBodyProducerImmutableAssignment(name_range)
+      )
+      CheckedLexicalMissing -> CheckedBodyExprRejected(
+        state,
+        CheckedBodyProducerUnknownIdentifier(name_range)
+      )
+    }
+    nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+  }
+}
+
 fn checked_body_expr(
   state: owned CheckedBodyBuild,
   source: Source,
   types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
   authored: Expr,
-  expected: SemanticTypeId
+  expectation: CheckedBodyExpectation
 ) -[SemanticConformance]> CheckedBodyExprBuild {
   let catalog = types.catalog
   match authored {
+    Block(first, rest) -> checked_body_block(
+      state,
+      source,
+      types,
+      owner,
+      environment,
+      first,
+      rest,
+      expectation
+    )
+    Let(start, length, value, body) -> checked_body_let(
+      state,
+      source,
+      types,
+      owner,
+      environment,
+      start,
+      length,
+      value,
+      body,
+      false,
+      expectation
+    )
+    LetMut(start, length, value, body) -> checked_body_let(
+      state,
+      source,
+      types,
+      owner,
+      environment,
+      start,
+      length,
+      value,
+      body,
+      true,
+      expectation
+    )
+    Assign(start, length, value) -> checked_body_assign(
+      state,
+      source,
+      types,
+      owner,
+      environment,
+      start,
+      length,
+      value,
+      expectation
+    )
     IntLit(value, start, length) -> match source_range(source, start, length) {
       range: CheckedSourceRange -> {
-        let actual = if semantic_integer_type(catalog, expected) {
-          expected
-        } else { types.integer }
-        if semantic_type_is_subtype(catalog, actual, expected) {
+        let actual = contextual_integer_type(catalog, types.integer, expectation)
+        if expectation_allows(catalog, actual, expectation) {
           match state.integer(value, actual, range) {
             (state, expression) -> CheckedBodyExprBuilt(state, expression)
           }
         } else {
           CheckedBodyExprRejected(
             state,
-            CheckedBodyProducerTypeMismatch(actual, expected)
+            expectation_mismatch(actual, expectation)
           )
         }
       }
       nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
     }
     BoolLit(value, start, length) -> match source_range(source, start, length) {
-      range: CheckedSourceRange -> if semantic_type_is_subtype(
+      range: CheckedSourceRange -> if expectation_allows(
         catalog,
         types.boolean,
-        expected
+        expectation
       ) {
         match state.boolean(value != 0, types.boolean, range) {
           (state, expression) -> CheckedBodyExprBuilt(state, expression)
@@ -440,12 +1097,12 @@ fn checked_body_expr(
       } else {
         CheckedBodyExprRejected(
           state,
-          CheckedBodyProducerTypeMismatch(types.boolean, expected)
+          expectation_mismatch(types.boolean, expectation)
         )
       }
       nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
     }
-    NilExpr -> if semantic_type_is_subtype(catalog, types.nil_type, expected) {
+    NilExpr -> if expectation_allows(catalog, types.nil_type, expectation) {
       match state.nil(
         types.nil_type,
         CheckedSourceRange { start: 0, end: 0 }
@@ -455,8 +1112,36 @@ fn checked_body_expr(
     } else {
       CheckedBodyExprRejected(
         state,
-        CheckedBodyProducerTypeMismatch(types.nil_type, expected)
+        expectation_mismatch(types.nil_type, expectation)
       )
+    }
+    Ident(start, length) -> match source_range(source, start, length) {
+      range: CheckedSourceRange -> match lexical_lookup(
+        environment,
+        source,
+        start,
+        length
+      ) {
+        CheckedLexicalFound(binding, actual, _) -> if expectation_allows(
+          catalog,
+          actual,
+          expectation
+        ) {
+          match state.local_reference(binding, actual, range) {
+            (state, expression) -> CheckedBodyExprBuilt(state, expression)
+          }
+        } else {
+          CheckedBodyExprRejected(
+            state,
+            expectation_mismatch(actual, expectation)
+          )
+        }
+        CheckedLexicalMissing -> CheckedBodyExprRejected(
+          state,
+          CheckedBodyProducerUnknownIdentifier(range)
+        )
+      }
+      nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
     }
     _ -> CheckedBodyExprRejected(state, CheckedBodyProducerUnsupportedExpression)
   }
@@ -475,14 +1160,36 @@ fn checked_body_functions(
     let function = functions.at(dense_index(index))
     let signature = state.signature(index)
     let expected = semantic_function_result(catalog, signature)
-    match checked_body_expr(state, module.source, types, function.syntax.body, expected) {
-      CheckedBodyExprBuilt(state, root) -> checked_body_functions(
-        module,
+    match checked_body_parameters(
+      state,
+      module.source,
+      catalog,
+      signature,
+      function.syntax.params,
+      0,
+      CheckedLexicalEmpty
+    ) {
+      CheckedBodyParametersBuilt(state, environment) -> match checked_body_expr(
+        state,
+        module.source,
         types,
-        index + 1,
-        state.function(signature, root)
+        signature.identity,
+        environment,
+        function.syntax.body,
+        CheckedRequireResult(expected)
+      ) {
+        CheckedBodyExprBuilt(state, root) -> checked_body_functions(
+          module,
+          types,
+          index + 1,
+          state.function(signature, root)
+        )
+        CheckedBodyExprRejected(state, issue) -> CheckedBodyFunctionsRejected(state, issue)
+      }
+      CheckedBodyParametersRejected(state, issue) -> CheckedBodyFunctionsRejected(
+        state,
+        issue
       )
-      CheckedBodyExprRejected(state, issue) -> CheckedBodyFunctionsRejected(state, issue)
     }
   }
 }
