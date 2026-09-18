@@ -4,6 +4,16 @@
 -- lifetime. Body checking consumes this value rather than separating a wide
 -- root id from its graph or recovering a signature from authored syntax.
 
+use compiler/ir/data.{
+  MissingTypeParam,
+  TypeParam,
+  TypeParamBoundList,
+  TypeParamBoundListCons,
+  TypeParamBoundListNil,
+  TypeParamList,
+  TypeParamListCons,
+  TypeParamListNil
+}
 use compiler/project/identity.{FunctionIdentity, ModuleIdentity}
 use compiler/project/identity/equality.{function_identity_eq}
 use compiler/types/graph.{*}
@@ -12,10 +22,13 @@ use compiler/weft/check/registration/catalog.{RegisteredModule}
 use compiler/weft/check/registration/scope.{RegistrationScope}
 use compiler/weft/check/semantic_types.{
   SemanticTypeProductBuilder,
+  SemanticDeclarationResolutionRequired,
+  SemanticInvalidVariable,
   SemanticTypeRejected,
   SemanticTypeResolutionIssue,
   SemanticTypeResolved,
   resolve_function_signature_product_in_scope,
+  resolve_type_product_in_scope,
   semantic_type_product_builder,
   semantic_type_product_catalog
 }
@@ -26,16 +39,25 @@ use compiler/weft/check/storage.{
   dense_index
 }
 use stdlib/option.{None, Option, Some}
+use stdlib/panic.{panic}
 
 pub(package) type SemanticFunctionSignature {
   identity: FunctionIdentity,
-  type_id: SemanticTypeId
+  type_id: SemanticTypeId,
+  bounds_start: usize,
+  bounds_count: usize
+}
+
+pub(package) type SemanticSignatureBound {
+  variable: SemanticTypeVariable,
+  trait_atom: SemanticTypeId
 }
 
 type SemanticSignatureProductStorage {
   module: ModuleIdentity,
   catalog: SemanticTypeCatalog,
-  functions: DenseSegment<SemanticFunctionSignature>
+  functions: DenseSegment<SemanticFunctionSignature>,
+  bounds: DenseSegment<SemanticSignatureBound>
 }
 
 pub(package) type SemanticSignatureProduct = opaque SemanticSignatureProductStorage
@@ -48,14 +70,121 @@ pub(package) type SemanticSignatureResolution {
 type SemanticSignatureBuild {
   SemanticSignatureBuildResolved(
     SemanticTypeProductBuilder,
-    owned DenseBuilder<SemanticFunctionSignature>
+    owned DenseBuilder<SemanticFunctionSignature>,
+    owned DenseBuilder<SemanticSignatureBound>
   ),
   SemanticSignatureBuildRejected(
     SemanticTypeProductBuilder,
     owned DenseBuilder<SemanticFunctionSignature>,
+    owned DenseBuilder<SemanticSignatureBound>,
     FunctionIdentity,
     SemanticTypeResolutionIssue
   )
+}
+
+type SemanticSignatureBoundsBuild {
+  SemanticSignatureBoundsResolved(
+    SemanticTypeProductBuilder,
+    owned DenseBuilder<SemanticSignatureBound>
+  ),
+  SemanticSignatureBoundsRejected(
+    SemanticTypeProductBuilder,
+    owned DenseBuilder<SemanticSignatureBound>,
+    SemanticTypeResolutionIssue
+  )
+}
+
+fn resolve_parameter_bound_list(
+  module: RegisteredModule,
+  scope: RegistrationScope,
+  parameters: TypeParamList,
+  variable: SemanticTypeVariable,
+  authored: TypeParamBoundList,
+  product: SemanticTypeProductBuilder,
+  bounds: owned DenseBuilder<SemanticSignatureBound>
+) -> SemanticSignatureBoundsBuild {
+  match authored {
+    TypeParamBoundListNil -> SemanticSignatureBoundsResolved(product, bounds)
+    TypeParamBoundListCons(bound, _, rest) -> match resolve_type_product_in_scope(
+      product,
+      module,
+      scope,
+      parameters,
+      bound
+    ) {
+      (product, SemanticTypeResolved(trait_atom)) -> {
+        let mut next_bounds = bounds
+        next_bounds.push(
+          SemanticSignatureBound {
+            variable: variable,
+            trait_atom: trait_atom
+          }
+        )
+        resolve_parameter_bound_list(
+          module,
+          scope,
+          parameters,
+          variable,
+          rest,
+          product,
+          next_bounds
+        )
+      }
+      (product, SemanticTypeRejected(issue)) -> SemanticSignatureBoundsRejected(
+        product,
+        bounds,
+        issue
+      )
+    }
+  }
+}
+
+fn resolve_parameter_bounds(
+  module: RegisteredModule,
+  scope: RegistrationScope,
+  parameters: TypeParamList,
+  remaining: TypeParamList,
+  product: SemanticTypeProductBuilder,
+  bounds: owned DenseBuilder<SemanticSignatureBound>
+) -> SemanticSignatureBoundsBuild {
+  match remaining {
+    TypeParamListNil -> SemanticSignatureBoundsResolved(product, bounds)
+    TypeParamListCons(parameter, rest) -> match parameter {
+      TypeParam(_, _, identity, authored) -> if identity < 0 {
+        SemanticSignatureBoundsRejected(
+          product,
+          bounds,
+          SemanticInvalidVariable(identity)
+        )
+      } else {
+        match resolve_parameter_bound_list(
+          module,
+          scope,
+          parameters,
+          SemanticParameterVariable(__i64_to_usize(identity)),
+          authored,
+          product,
+          bounds
+        ) {
+          SemanticSignatureBoundsResolved(product, bounds) -> resolve_parameter_bounds(
+            module,
+            scope,
+            parameters,
+            rest,
+            product,
+            bounds
+          )
+          SemanticSignatureBoundsRejected(product, bounds, issue) ->
+            SemanticSignatureBoundsRejected(product, bounds, issue)
+        }
+      }
+      MissingTypeParam -> SemanticSignatureBoundsRejected(
+        product,
+        bounds,
+        SemanticDeclarationResolutionRequired
+      )
+    }
+  }
 }
 
 fn resolve_registered_functions(
@@ -63,41 +192,65 @@ fn resolve_registered_functions(
   scope: RegistrationScope,
   index: usize,
   product: SemanticTypeProductBuilder,
-  signatures: owned DenseBuilder<SemanticFunctionSignature>
+  signatures: owned DenseBuilder<SemanticFunctionSignature>,
+  bounds: owned DenseBuilder<SemanticSignatureBound>
 ) -> SemanticSignatureBuild {
   let functions = module.functions
   if index >= functions.len() {
-    SemanticSignatureBuildResolved(product, signatures)
+    SemanticSignatureBuildResolved(product, signatures, bounds)
   } else {
     let function = functions.at(dense_index(index))
-    match resolve_function_signature_product_in_scope(
-      product,
+    let bounds_start = bounds.len()
+    match resolve_parameter_bounds(
       module,
       scope,
-      function.syntax
+      function.syntax.type_params,
+      function.syntax.type_params,
+      product,
+      bounds
     ) {
-      (product, SemanticTypeResolved(type_id)) -> {
-        let mut next_signatures = signatures
-        next_signatures.push(
-          SemanticFunctionSignature {
-            identity: function.identity,
-            type_id: type_id
-          }
-        )
-        resolve_registered_functions(
+      SemanticSignatureBoundsResolved(product, bounds) ->
+        match resolve_function_signature_product_in_scope(
+          product,
           module,
           scope,
-          index + 1,
+          function.syntax
+        ) {
+          (product, SemanticTypeResolved(type_id)) -> {
+            let mut next_signatures = signatures
+            next_signatures.push(
+              SemanticFunctionSignature {
+                identity: function.identity,
+                type_id: type_id,
+                bounds_start: bounds_start,
+                bounds_count: bounds.len() - bounds_start
+              }
+            )
+            resolve_registered_functions(
+              module,
+              scope,
+              index + 1,
+              product,
+              next_signatures,
+              bounds
+            )
+          }
+          (product, SemanticTypeRejected(issue)) -> SemanticSignatureBuildRejected(
+            product,
+            signatures,
+            bounds,
+            function.identity,
+            issue
+          )
+        }
+      SemanticSignatureBoundsRejected(product, bounds, issue) ->
+        SemanticSignatureBuildRejected(
           product,
-          next_signatures
+          signatures,
+          bounds,
+          function.identity,
+          issue
         )
-      }
-      (product, SemanticTypeRejected(issue)) -> SemanticSignatureBuildRejected(
-        product,
-        signatures,
-        function.identity,
-        issue
-      )
     }
   }
 }
@@ -111,21 +264,24 @@ pub(package) fn resolve_module_signatures(
   let signatures = dense_builder_with_capacity<SemanticFunctionSignature>(
     functions.len()
   )
-  match resolve_registered_functions(module, scope, 0, product, signatures) {
-    SemanticSignatureBuildResolved(product, signatures) -> {
+  let bounds = dense_builder_with_capacity<SemanticSignatureBound>(functions.len())
+  match resolve_registered_functions(module, scope, 0, product, signatures, bounds) {
+    SemanticSignatureBuildResolved(product, signatures, bounds) -> {
       let catalog = semantic_type_product_catalog(product)
       SemanticSignaturesResolved(
         SemanticSignatureProduct(
           SemanticSignatureProductStorage {
             module: module.identity,
             catalog: catalog,
-            functions: signatures.freeze()
+            functions: signatures.freeze(),
+            bounds: bounds.freeze()
           }
         )
       )
     }
-    SemanticSignatureBuildRejected(_, signatures, function, issue) -> {
+    SemanticSignatureBuildRejected(_, signatures, bounds, function, issue) -> {
       signatures.drop()
+      bounds.drop()
       SemanticSignaturesRejected(function, issue)
     }
   }
@@ -158,6 +314,30 @@ impl SemanticSignatureProduct {
       SemanticSignatureProduct(storage) -> {
         let functions = storage.functions
         functions.at(dense_index(index))
+      }
+    }
+  }
+
+  pub(package) fn bound_count(
+    self: borrow Self,
+    signature: SemanticFunctionSignature
+  ) -> usize {
+    signature.bounds_count
+  }
+
+  pub(package) fn bound_at(
+    self: borrow Self,
+    signature: SemanticFunctionSignature,
+    index: usize
+  ) -> SemanticSignatureBound {
+    if index >= signature.bounds_count {
+      panic("Semantic signature bound index is out of bounds")
+    } else {
+      match self {
+        SemanticSignatureProduct(storage) -> {
+          let bounds = storage.bounds
+          bounds.at(dense_index(signature.bounds_start + index))
+        }
       }
     }
   }
