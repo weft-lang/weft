@@ -10,9 +10,13 @@ use compiler/ir/data.{
   BoolLit,
   Break,
   BreakNoValue,
+  Call,
   Continue,
   Defer,
   Expr,
+  ExprList,
+  ExprListCons,
+  ExprListNil,
   Ident,
   If,
   IntLit,
@@ -31,9 +35,15 @@ use compiler/ir/data.{
   Return,
   ReturnNoValue,
   TypeParamListNil,
-  While
+  While,
+  expr_list_len
 }
-use compiler/project/identity.{FunctionIdentity}
+use compiler/project/identity.{
+  DeclaredFunctionIdentity,
+  FunctionIdentity,
+  ModuleIdentity,
+  ValueDeclaration
+}
 use compiler/types/graph.{
   SemanticBool,
   SemanticF32,
@@ -66,6 +76,8 @@ use compiler/weft/check/body/effects.{CheckedEffectBuilder, checked_effect_build
 use compiler/weft/check/body/graph.{
   CheckedExprGraphBuilder,
   CheckedExprId,
+  CheckedExprListBuilder,
+  CheckedExprListId,
   CheckedBindingId,
   CheckedImmutableBinding,
   CheckedBindingMutability,
@@ -89,7 +101,10 @@ use compiler/weft/check/body/propagation.{
   checked_propagation_builder
 }
 use compiler/weft/check/registration/catalog.{RegisteredModule}
-use compiler/weft/check/registration/scope.{RegistrationScope}
+use compiler/weft/check/registration/scope.{
+  RegistrationScope,
+  registration_scope_lookup_declaration_span
+}
 use compiler/weft/check/semantic_types.{
   SemanticTypeProductBuilder,
   SemanticTypeRejected,
@@ -101,7 +116,7 @@ use compiler/weft/check/semantic_types.{
 use compiler/weft/check/signatures.{SemanticFunctionSignature, SemanticSignatureProduct}
 use compiler/weft/check/storage.{dense_index}
 use stdlib/drop.{Drop}
-use stdlib/option.{Some}
+use stdlib/option.{None, Option, Some}
 use stdlib/panic.{panic}
 use stdlib/source.{Source}
 
@@ -114,7 +129,10 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerLoopContextRequired,
   CheckedBodyProducerBreakOutsideLoop,
   CheckedBodyProducerContinueOutsideLoop,
+  CheckedBodyProducerArityMismatch(usize, usize),
+  CheckedBodyProducerCallableRequired(SemanticTypeId),
   CheckedBodyProducerNumericOperandRequired(SemanticTypeId),
+  CheckedBodyProducerSignatureUnavailable(CheckedSourceRange),
   CheckedBodyProducerUnsupportedParameter,
   CheckedBodyProducerTypeMismatch(SemanticTypeId, SemanticTypeId),
   CheckedBodyProducerUnsupportedExpression,
@@ -140,7 +158,7 @@ type CheckedBodyPrimitiveResolution {
 }
 
 type CheckedLexicalEnvironment {
-  CheckedLexicalEmpty,
+  CheckedLexicalRoot(RegistrationScope, ModuleIdentity),
   CheckedLexicalBinding(
     i64,
     i64,
@@ -195,6 +213,16 @@ type CheckedBodyFunctionsBuild {
 type CheckedBodyParametersBuild {
   CheckedBodyParametersBuilt(owned CheckedBodyBuild, CheckedLexicalEnvironment),
   CheckedBodyParametersRejected(owned CheckedBodyBuild, CheckedBodyProducerIssue)
+}
+
+type CheckedBodyArgumentsBuild {
+  CheckedBodyArgumentsBuilt(owned CheckedBodyBuild, CheckedExprListId, CheckedSourceRange),
+  CheckedBodyArgumentsRejected(owned CheckedBodyBuild, CheckedBodyProducerIssue)
+}
+
+type CheckedCallCallee {
+  CheckedDirectCallee(FunctionIdentity),
+  CheckedAppliedCallee(CheckedExprId)
 }
 
 fn checked_body_primitive_types(
@@ -340,7 +368,7 @@ fn lexical_lookup(
   length: i64
 ) -> CheckedLexicalLookup {
   match environment {
-    CheckedLexicalEmpty -> CheckedLexicalMissing
+    CheckedLexicalRoot(_, _) -> CheckedLexicalMissing
     CheckedLexicalBinding(binding_start, binding_length, binding, value_type, mutable, parent) ->
       if same_source_name(
         source,
@@ -354,12 +382,26 @@ fn lexical_lookup(
   }
 }
 
+fn lexical_scope(environment: CheckedLexicalEnvironment) -> RegistrationScope {
+  match environment {
+    CheckedLexicalRoot(scope, _) -> scope
+    CheckedLexicalBinding(_, _, _, _, _, parent) -> lexical_scope(parent)
+  }
+}
+
+fn lexical_module(environment: CheckedLexicalEnvironment) -> ModuleIdentity {
+  match environment {
+    CheckedLexicalRoot(_, module) -> module
+    CheckedLexicalBinding(_, _, _, _, _, parent) -> lexical_module(parent)
+  }
+}
+
 fn semantic_function_result(
   catalog: borrow SemanticTypeCatalog,
-  signature: SemanticFunctionSignature
+  function_type: SemanticTypeId
 ) -> SemanticTypeId {
-  match catalog.graph_for(signature.type_id) {
-    Some(graph) -> match semantic_type_graph_node(graph, signature.type_id) {
+  match catalog.graph_for(function_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, function_type) {
       SemanticFunctionNode(_, result, _) -> result
       _ -> panic("Checked body signature is not a function type")
     }
@@ -369,10 +411,10 @@ fn semantic_function_result(
 
 fn semantic_function_parameter_count(
   catalog: borrow SemanticTypeCatalog,
-  signature: SemanticFunctionSignature
+  function_type: SemanticTypeId
 ) -> usize {
-  match catalog.graph_for(signature.type_id) {
-    Some(graph) -> match semantic_type_graph_node(graph, signature.type_id) {
+  match catalog.graph_for(function_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, function_type) {
       SemanticFunctionNode(parameters, _, _) -> {
         let lists = semantic_type_graph_type_lists_local(graph)
         semantic_type_list_len(lists, parameters)
@@ -385,11 +427,11 @@ fn semantic_function_parameter_count(
 
 fn semantic_function_parameter(
   catalog: borrow SemanticTypeCatalog,
-  signature: SemanticFunctionSignature,
+  function_type: SemanticTypeId,
   index: usize
 ) -> SemanticTypeId {
-  match catalog.graph_for(signature.type_id) {
-    Some(graph) -> match semantic_type_graph_node(graph, signature.type_id) {
+  match catalog.graph_for(function_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, function_type) {
       SemanticFunctionNode(parameters, _, _) -> {
         let lists = semantic_type_graph_type_lists_local(graph)
         semantic_type_graph_list_type_id(
@@ -400,6 +442,19 @@ fn semantic_function_parameter(
       _ -> panic("Checked body signature is not a function type")
     }
     _ -> panic("Checked body signature is outside its type catalog")
+  }
+}
+
+fn semantic_function_type(
+  catalog: borrow SemanticTypeCatalog,
+  function_type: SemanticTypeId
+) -> bool {
+  match catalog.graph_for(function_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, function_type) {
+      SemanticFunctionNode(_, _, _) -> true
+      _ -> false
+    }
+    _ -> false
   }
 }
 
@@ -463,6 +518,18 @@ impl CheckedBodyBuild {
       CheckedBodyBuild(storage) -> {
         let { signatures, expressions: _, patterns: _, closures: _, effects: _, propagation: _ } = storage
         signatures.at(index)
+      }
+    }
+  }
+
+  fn find_signature(
+    self: borrow Self,
+    identity: FunctionIdentity
+  ) -> Option<SemanticFunctionSignature> {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions: _, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        signatures.find(identity)
       }
     }
   }
@@ -532,6 +599,151 @@ impl CheckedBodyBuild {
       CheckedBodyBuild(storage) -> {
         let { signatures, expressions, patterns, closures, effects, propagation } = storage
         match expressions.local_reference(binding, result, range) {
+          (expressions, expression) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            expression
+          )
+        }
+      }
+    }
+  }
+
+  fn expression_list(
+    self: owned Self
+  ) -> (owned CheckedBodyBuild, CheckedExprListBuilder) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match expressions.expression_list() {
+          (expressions, list) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            list
+          )
+        }
+      }
+    }
+  }
+
+  fn expression_list_push(
+    self: owned Self,
+    list: CheckedExprListBuilder,
+    child: CheckedExprId
+  ) -> (owned CheckedBodyBuild, CheckedExprListBuilder) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match expressions.expression_list_push(list, child) {
+          (expressions, list) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            list
+          )
+        }
+      }
+    }
+  }
+
+  fn finish_expression_list(
+    self: owned Self,
+    list: CheckedExprListBuilder
+  ) -> (owned CheckedBodyBuild, CheckedExprListId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match expressions.finish_expression_list(list) {
+          (expressions, list) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            list
+          )
+        }
+      }
+    }
+  }
+
+  fn direct_call(
+    self: owned Self,
+    function: FunctionIdentity,
+    arguments: CheckedExprListId,
+    result: SemanticTypeId,
+    range: CheckedSourceRange
+  ) -> (owned CheckedBodyBuild, CheckedExprId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match expressions.direct_call(function, arguments, result, range) {
+          (expressions, expression) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            expression
+          )
+        }
+      }
+    }
+  }
+
+  fn apply(
+    self: owned Self,
+    callee: CheckedExprId,
+    arguments: CheckedExprListId,
+    signature: SemanticTypeId,
+    source_site: usize,
+    result: SemanticTypeId,
+    range: CheckedSourceRange
+  ) -> (owned CheckedBodyBuild, CheckedExprId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match expressions.apply(
+          callee,
+          arguments,
+          signature,
+          source_site,
+          result,
+          range
+        ) {
           (expressions, expression) -> (
             CheckedBodyBuild(
               CheckedBodyBuildStorage {
@@ -1134,7 +1346,7 @@ fn checked_body_parameters(
   environment: CheckedLexicalEnvironment
 ) -> CheckedBodyParametersBuild {
   match parameters {
-    ParamListNil -> if index == semantic_function_parameter_count(catalog, signature) {
+    ParamListNil -> if index == semantic_function_parameter_count(catalog, signature.type_id) {
       CheckedBodyParametersBuilt(state, environment)
     } else {
       CheckedBodyParametersRejected(state, CheckedBodyProducerUnsupportedParameter)
@@ -1142,7 +1354,7 @@ fn checked_body_parameters(
     ParamListCons(parameter, rest) -> match parameter {
       Param(start, length, _, _) -> match source_range(source, start, length) {
         range: CheckedSourceRange -> {
-          let value_type = semantic_function_parameter(catalog, signature, index)
+          let value_type = semantic_function_parameter(catalog, signature.type_id, index)
           match state.binding(
             signature.identity,
             value_type,
@@ -1510,6 +1722,7 @@ fn checked_body_let(
   mutable: bool,
   expectation: CheckedBodyExpectation
 ) -[SemanticConformance]> CheckedBodyExprBuild {
+  let catalog = types.catalog
   match source_range(source, start, length) {
     binding_range: CheckedSourceRange -> match checked_body_expr(
       state,
@@ -1808,6 +2021,238 @@ fn checked_body_defer(
   }
 }
 
+fn checked_body_arguments(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  function_type: SemanticTypeId,
+  arguments: ExprList,
+  index: usize,
+  total: usize,
+  list: CheckedExprListBuilder,
+  range: CheckedSourceRange
+) -[SemanticConformance]> CheckedBodyArgumentsBuild {
+  let catalog = types.catalog
+  let parameter_count = semantic_function_parameter_count(catalog, function_type)
+  match arguments {
+    ExprListNil -> if index == parameter_count {
+      match state.finish_expression_list(list) {
+        (state, arguments) -> CheckedBodyArgumentsBuilt(state, arguments, range)
+      }
+    } else {
+      CheckedBodyArgumentsRejected(
+        state,
+        CheckedBodyProducerArityMismatch(parameter_count, total)
+      )
+    }
+    ExprListCons(argument, rest) -> if index >= parameter_count {
+      CheckedBodyArgumentsRejected(
+        state,
+        CheckedBodyProducerArityMismatch(parameter_count, total)
+      )
+    } else {
+      let parameter = semantic_function_parameter(catalog, function_type, index)
+      match checked_body_expr(
+        state,
+        source,
+        types,
+        owner,
+        function_result,
+        loop_context,
+        environment,
+        argument,
+        CheckedRequireResult(parameter)
+      ) {
+        CheckedBodyExprBuilt(state, checked_argument) -> {
+          let argument_range = state.range(checked_argument)
+          match covering_range(range, argument_range) {
+            next_range: CheckedSourceRange -> match state.expression_list_push(
+              list,
+              checked_argument
+            ) {
+              (state, list) -> checked_body_arguments(
+                state,
+                source,
+                types,
+                owner,
+                function_result,
+                loop_context,
+                environment,
+                function_type,
+                rest,
+                index + 1,
+                total,
+                list,
+                next_range
+              )
+            }
+            nil -> CheckedBodyArgumentsRejected(
+              state,
+              CheckedBodyProducerInvalidRange
+            )
+          }
+        }
+        CheckedBodyExprRejected(state, issue) -> CheckedBodyArgumentsRejected(state, issue)
+      }
+    }
+  }
+}
+
+fn checked_body_call_with_signature(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  name_range: CheckedSourceRange,
+  arguments: ExprList,
+  signature: SemanticTypeId,
+  callee: CheckedCallCallee,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  let catalog = types.catalog
+  let result = semantic_function_result(catalog, signature)
+  if not expectation_allows(catalog, result, expectation) {
+    CheckedBodyExprRejected(state, expectation_mismatch(result, expectation))
+  } else {
+    let total = __i64_to_usize(expr_list_len(arguments))
+    match state.expression_list() {
+      (state, list) -> match checked_body_arguments(
+        state,
+        source,
+        types,
+        owner,
+        function_result,
+        loop_context,
+        environment,
+        signature,
+        arguments,
+        0,
+        total,
+        list,
+        name_range
+      ) {
+        CheckedBodyArgumentsBuilt(state, checked_arguments, range) -> match callee {
+          CheckedDirectCallee(function) -> match state.direct_call(
+            function,
+            checked_arguments,
+            result,
+            range
+          ) {
+            (state, expression) -> CheckedBodyExprBuilt(state, expression)
+          }
+          CheckedAppliedCallee(expression) -> match state.apply(
+            expression,
+            checked_arguments,
+            signature,
+            name_range.start,
+            result,
+            range
+          ) {
+            (state, applied) -> CheckedBodyExprBuilt(state, applied)
+          }
+        }
+        CheckedBodyArgumentsRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+      }
+    }
+  }
+}
+
+fn checked_body_call(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  start: i64,
+  length: i64,
+  arguments: ExprList,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  let catalog = types.catalog
+  match source_range(source, start, length) {
+    name_range: CheckedSourceRange -> match lexical_lookup(
+      environment,
+      source,
+      start,
+      length
+    ) {
+      CheckedLexicalFound(binding, callee_type, _) -> if semantic_function_type(
+        catalog,
+        callee_type
+      ) {
+        match state.local_reference(binding, callee_type, name_range) {
+          (state, callee) -> checked_body_call_with_signature(
+            state,
+            source,
+            types,
+            owner,
+            function_result,
+            loop_context,
+            environment,
+            name_range,
+            arguments,
+            callee_type,
+            CheckedAppliedCallee(callee),
+            expectation
+          )
+        }
+      } else {
+        CheckedBodyExprRejected(
+          state,
+          CheckedBodyProducerCallableRequired(callee_type)
+        )
+      }
+      CheckedLexicalMissing -> match source.span(name_range.start, name_range.end) {
+        Some(name) -> match registration_scope_lookup_declaration_span(
+          lexical_scope(environment),
+          lexical_module(environment),
+          ValueDeclaration,
+          name
+        ) {
+          Some(declaration) -> {
+            let function = DeclaredFunctionIdentity(declaration.identity)
+            match state.find_signature(function) {
+              Some(signature) -> checked_body_call_with_signature(
+                state,
+                source,
+                types,
+                owner,
+                function_result,
+                loop_context,
+                environment,
+                name_range,
+                arguments,
+                signature.type_id,
+                CheckedDirectCallee(function),
+                expectation
+              )
+              None -> CheckedBodyExprRejected(
+                state,
+                CheckedBodyProducerSignatureUnavailable(name_range)
+              )
+            }
+          }
+          None -> CheckedBodyExprRejected(
+            state,
+            CheckedBodyProducerUnknownIdentifier(name_range)
+          )
+        }
+        None -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+      }
+    }
+    nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+  }
+}
+
 fn checked_body_expr(
   state: owned CheckedBodyBuild,
   source: Source,
@@ -2067,6 +2512,19 @@ fn checked_body_expr(
       source_site,
       expectation
     )
+    Call(start, length, arguments) -> checked_body_call(
+      state,
+      source,
+      types,
+      owner,
+      function_result,
+      loop_context,
+      environment,
+      start,
+      length,
+      arguments,
+      expectation
+    )
     IntLit(value, start, length) -> match source_range(source, start, length) {
       range: CheckedSourceRange -> {
         let actual = contextual_integer_type(catalog, types.integer, expectation)
@@ -2147,6 +2605,7 @@ fn checked_body_expr(
 
 fn checked_body_functions(
   module: RegisteredModule,
+  scope: RegistrationScope,
   types: CheckedBodyPrimitiveTypes,
   index: usize,
   state: owned CheckedBodyBuild
@@ -2157,7 +2616,7 @@ fn checked_body_functions(
   else {
     let function = functions.at(dense_index(index))
     let signature = state.signature(index)
-    let expected = semantic_function_result(catalog, signature)
+    let expected = semantic_function_result(catalog, signature.type_id)
     match checked_body_parameters(
       state,
       module.source,
@@ -2165,7 +2624,7 @@ fn checked_body_functions(
       signature,
       function.syntax.params,
       0,
-      CheckedLexicalEmpty
+      CheckedLexicalRoot(scope, module.identity)
     ) {
       CheckedBodyParametersBuilt(state, environment) -> match checked_body_expr(
         state,
@@ -2180,6 +2639,7 @@ fn checked_body_functions(
       ) {
         CheckedBodyExprBuilt(state, root) -> checked_body_functions(
           module,
+          scope,
           types,
           index + 1,
           state.function(signature, root)
@@ -2202,6 +2662,7 @@ pub(package) fn check_registered_bodies(
   match checked_body_primitive_types(module, scope, signatures) {
     CheckedBodyPrimitivesResolved(types) -> match checked_body_functions(
       module,
+      scope,
       types,
       0,
       checked_body_build(module, signatures, types)
