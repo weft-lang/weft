@@ -17,6 +17,17 @@ use compiler/project/identity.{
 }
 use compiler/project/identity/equality.{declaration_identity_eq}
 use compiler/types/graph.{*}
+use compiler/types/graph/catalog.{
+  SemanticTypeCatalog,
+  semantic_type_catalog_empty,
+  semantic_type_catalog_with_graph
+}
+use compiler/types/graph/substitution.{
+  SemanticTypeSubstitution,
+  semantic_type_substitute,
+  semantic_type_substitution_bind,
+  semantic_type_substitution_empty
+}
 use compiler/weft/check/registration/catalog.{
   RegisteredDeclarationKind,
   RegisteredModule,
@@ -58,6 +69,14 @@ pub(package) type SemanticTypeResolution {
   SemanticTypeResolved(SemanticTypeId),
   SemanticTypeRejected(SemanticTypeResolutionIssue)
 }
+
+type SemanticTypeProductBuilderStorage {
+  owner: ModuleIdentity,
+  catalog: SemanticTypeCatalog,
+  next_segment: usize
+}
+
+pub(package) type SemanticTypeProductBuilder = opaque SemanticTypeProductBuilderStorage
 
 type SemanticTypeValuesResolution {
   SemanticTypeValuesResolved(List<SemanticTypeId>),
@@ -1071,4 +1090,950 @@ pub(package) fn resolve_function_signature_in_scope(
     function.result,
     effect_type(function.effects)
   )
+}
+
+pub(package) fn semantic_type_product_builder(
+  owner: ModuleIdentity,
+  expected_segments: usize
+) -> SemanticTypeProductBuilder {
+  SemanticTypeProductBuilder(
+    SemanticTypeProductBuilderStorage {
+      owner: owner,
+      catalog: semantic_type_catalog_empty(expected_segments),
+      next_segment: 0
+    }
+  )
+}
+
+pub(package) fn semantic_type_product_catalog(
+  product: borrow SemanticTypeProductBuilder
+) -> SemanticTypeCatalog {
+  match product {
+    SemanticTypeProductBuilder(storage) -> storage.catalog
+  }
+}
+
+fn semantic_type_product_segment(
+  product: borrow SemanticTypeProductBuilder,
+  offset: usize
+) -> SemanticTypeSegmentId {
+  match product {
+    SemanticTypeProductBuilder(storage) -> semantic_type_derived_segment_id(
+      storage.owner,
+      storage.next_segment + offset
+    )
+  }
+}
+
+fn semantic_type_product_advance(
+  product: SemanticTypeProductBuilder,
+  count: usize
+) -> SemanticTypeProductBuilder {
+  match product {
+    SemanticTypeProductBuilder(storage) -> SemanticTypeProductBuilder(
+      SemanticTypeProductBuilderStorage {
+        owner: storage.owner,
+        catalog: storage.catalog,
+        next_segment: storage.next_segment + count
+      }
+    )
+  }
+}
+
+fn semantic_type_product_include_graph(
+  product: SemanticTypeProductBuilder,
+  graph: SemanticTypeGraph,
+  consumed_segments: usize
+) -> SemanticTypeProductBuilder {
+  match product {
+    SemanticTypeProductBuilder(storage) -> {
+      let catalog = storage.catalog
+      SemanticTypeProductBuilder(
+        SemanticTypeProductBuilderStorage {
+          owner: storage.owner,
+          catalog: semantic_type_catalog_with_graph(catalog, graph),
+          next_segment: storage.next_segment + consumed_segments
+        }
+      )
+    }
+  }
+}
+
+fn semantic_type_product_add_graph(
+  product: SemanticTypeProductBuilder,
+  graph: SemanticTypeGraph
+) -> SemanticTypeProductBuilder {
+  semantic_type_product_include_graph(product, graph, 1)
+}
+
+type SemanticProductResolution {
+  SemanticProductResolved(SemanticTypeProductBuilder, SemanticTypeId),
+  SemanticProductRejected(SemanticTypeResolutionIssue)
+}
+
+type SemanticProductValuesResolution {
+  SemanticProductValuesResolved(SemanticTypeProductBuilder, List<SemanticTypeId>),
+  SemanticProductValuesRejected(SemanticTypeResolutionIssue)
+}
+
+fn semantic_product_values(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  values: TypeExprList
+) -> SemanticProductValuesResolution {
+  match values {
+    TypeExprListNil -> SemanticProductValuesResolved(
+      product,
+      Nil<SemanticTypeId>()
+    )
+    TypeExprListCons(value, rest, _) -> match resolve_type_product_with(
+      product,
+      environment,
+      value
+    ) {
+      SemanticProductResolved(product, resolved) -> match semantic_product_values(
+        product,
+        environment,
+        rest
+      ) {
+        SemanticProductValuesResolved(product, resolved_rest) ->
+          SemanticProductValuesResolved(
+            product,
+            Cons<SemanticTypeId>(resolved, resolved_rest)
+          )
+        SemanticProductValuesRejected(issue) -> SemanticProductValuesRejected(issue)
+      }
+      SemanticProductRejected(issue) -> SemanticProductValuesRejected(issue)
+    }
+  }
+}
+
+fn semantic_product_add_binary(
+  product: SemanticTypeProductBuilder,
+  left: SemanticTypeId,
+  right: SemanticTypeId,
+  intersection: bool
+) -> SemanticProductResolution {
+  let builder = semantic_type_graph_builder(semantic_type_product_segment(product, 0))
+  let (builder, root) = if intersection {
+    builder.intersection(left, right)
+  } else { builder.union(left, right) }
+  SemanticProductResolved(
+    semantic_type_product_add_graph(product, builder.freeze()),
+    root
+  )
+}
+
+fn semantic_product_add_unary(
+  product: SemanticTypeProductBuilder,
+  inner: SemanticTypeId,
+  kind: i64
+) -> SemanticProductResolution {
+  let builder = semantic_type_graph_builder(semantic_type_product_segment(product, 0))
+  let (builder, root) = match kind {
+    0 -> builder.complement(inner)
+    1 -> builder.weak(inner)
+    2 -> builder.atomic(inner)
+    3 -> builder.unique(inner)
+    _ -> builder.owned(inner)
+  }
+  SemanticProductResolved(
+    semantic_type_product_add_graph(product, builder.freeze()),
+    root
+  )
+}
+
+fn semantic_product_add_mutable_unary(
+  product: SemanticTypeProductBuilder,
+  inner: SemanticTypeId,
+  access: TypeAccess,
+  kind: i64
+) -> SemanticProductResolution {
+  let builder = semantic_type_graph_builder(semantic_type_product_segment(product, 0))
+  let mutability = semantic_mutability(access)
+  let (builder, root) = match kind {
+    0 -> builder.pointer(inner, mutability)
+    1 -> builder.borrow(inner, mutability)
+    _ -> builder.slice(inner, mutability)
+  }
+  SemanticProductResolved(
+    semantic_type_product_add_graph(product, builder.freeze()),
+    root
+  )
+}
+
+type SemanticProductRecordFieldsResolution {
+  SemanticProductRecordFieldsResolved(
+    SemanticTypeProductBuilder,
+    List<str>,
+    List<SemanticTypeId>
+  ),
+  SemanticProductRecordFieldsRejected(SemanticTypeResolutionIssue)
+}
+
+fn semantic_product_record_fields(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  fields: TypeExprList
+) -> SemanticProductRecordFieldsResolution {
+  match fields {
+    TypeExprListNil -> SemanticProductRecordFieldsResolved(
+      product,
+      Nil<str>(),
+      Nil<SemanticTypeId>()
+    )
+    TypeExprListCons(field, rest, _) -> match field {
+      RecordFieldTypeExpr(_, annotation, range) -> match required_field_name(
+        environment_source(environment),
+        range
+      ) {
+        Some(name) -> match resolve_type_product_with(
+          product,
+          environment,
+          annotation
+        ) {
+          SemanticProductResolved(product, resolved) ->
+            match semantic_product_record_fields(product, environment, rest) {
+              SemanticProductRecordFieldsResolved(product, names, values) ->
+                SemanticProductRecordFieldsResolved(
+                  product,
+                  Cons<str>(name, names),
+                  Cons<SemanticTypeId>(resolved, values)
+                )
+              SemanticProductRecordFieldsRejected(issue) ->
+                SemanticProductRecordFieldsRejected(issue)
+            }
+          SemanticProductRejected(issue) -> SemanticProductRecordFieldsRejected(issue)
+        }
+        None -> SemanticProductRecordFieldsRejected(
+          SemanticInvalidRecordFieldRange(range)
+        )
+      }
+      _ -> SemanticProductRecordFieldsRejected(SemanticExpectedRecordField)
+    }
+  }
+}
+
+fn semantic_product_tuple_fields(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  fields: TypeExprList
+) -> SemanticProductValuesResolution {
+  match fields {
+    TypeExprListNil -> SemanticProductValuesResolved(product, Nil<SemanticTypeId>())
+    TypeExprListCons(field, rest, _) -> match field {
+      RecordFieldTypeExpr(_, annotation, _) -> match resolve_type_product_with(
+        product,
+        environment,
+        annotation
+      ) {
+        SemanticProductResolved(product, resolved) -> match semantic_product_tuple_fields(
+          product,
+          environment,
+          rest
+        ) {
+          SemanticProductValuesResolved(product, values) ->
+            SemanticProductValuesResolved(
+              product,
+              Cons<SemanticTypeId>(resolved, values)
+            )
+          SemanticProductValuesRejected(issue) -> SemanticProductValuesRejected(issue)
+        }
+        SemanticProductRejected(issue) -> SemanticProductValuesRejected(issue)
+      }
+      _ -> SemanticProductValuesRejected(SemanticExpectedRecordField)
+    }
+  }
+}
+
+fn semantic_product_add_record(
+  product: SemanticTypeProductBuilder,
+  names: List<str>,
+  values: List<SemanticTypeId>,
+  openness: SemanticRecordOpenness
+) -> SemanticProductResolution {
+  let builder = semantic_type_graph_builder(semantic_type_product_segment(product, 0))
+  let (builder, root) = builder.record(names, values, openness)
+  SemanticProductResolved(
+    semantic_type_product_add_graph(product, builder.freeze()),
+    root
+  )
+}
+
+fn semantic_product_add_tuple(
+  product: SemanticTypeProductBuilder,
+  values: List<SemanticTypeId>
+) -> SemanticProductResolution {
+  let builder = semantic_type_graph_builder(semantic_type_product_segment(product, 0))
+  let (builder, root) = builder.tuple(values)
+  SemanticProductResolved(
+    semantic_type_product_add_graph(product, builder.freeze()),
+    root
+  )
+}
+
+fn semantic_product_effect_atom(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  atom: TypeExpr
+) -> SemanticProductResolution {
+  let declaration = match atom {
+    UnqualifiedEffectTypeExpr(_, _, range) -> environment_declaration(
+      environment,
+      EffectDeclaration,
+      range
+    )
+    QualifiedEffectTypeExpr(qualifier, range, _) -> environment_qualified_declaration(
+      environment,
+      EffectDeclaration,
+      qualifier,
+      range
+    )
+    _ -> nil
+  }
+  match declaration {
+    registered: RegisteredName -> {
+      let arguments = match atom {
+        UnqualifiedEffectTypeExpr(_, values, _) -> values
+        QualifiedEffectTypeExpr(_, _, values) -> values
+        _ -> TypeExprListNil
+      }
+      match semantic_product_values(product, environment, arguments) {
+        SemanticProductValuesResolved(product, values) -> {
+          let builder = semantic_type_graph_builder(
+            semantic_type_product_segment(product, 0)
+          )
+          let (builder, list) = builder.type_list(values)
+          let (builder, root) = builder.effect_atom(registered.identity, list)
+          SemanticProductResolved(
+            semantic_type_product_add_graph(product, builder.freeze()),
+            root
+          )
+        }
+        SemanticProductValuesRejected(issue) -> SemanticProductRejected(issue)
+      }
+    }
+    nil -> SemanticProductRejected(SemanticDeclarationResolutionRequired)
+  }
+}
+
+fn semantic_product_effect_atoms(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  atoms: TypeExprList
+) -> SemanticProductValuesResolution {
+  match atoms {
+    TypeExprListNil -> SemanticProductValuesResolved(product, Nil<SemanticTypeId>())
+    TypeExprListCons(atom, rest, _) -> match semantic_product_effect_atom(
+      product,
+      environment,
+      atom
+    ) {
+      SemanticProductResolved(product, resolved) -> match semantic_product_effect_atoms(
+        product,
+        environment,
+        rest
+      ) {
+        SemanticProductValuesResolved(product, values) ->
+          SemanticProductValuesResolved(
+            product,
+            Cons<SemanticTypeId>(resolved, values)
+          )
+        SemanticProductValuesRejected(issue) -> SemanticProductValuesRejected(issue)
+      }
+      SemanticProductRejected(issue) -> SemanticProductValuesRejected(issue)
+    }
+  }
+}
+
+fn semantic_product_effect_set(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  atoms: TypeExprList,
+  tail: i64
+) -> SemanticProductResolution {
+  if tail < 0 { SemanticProductRejected(SemanticInvalidVariable(tail)) }
+  else {
+    match semantic_product_effect_atoms(product, environment, atoms) {
+      SemanticProductValuesResolved(product, values) -> {
+        let builder = semantic_type_graph_builder(
+          semantic_type_product_segment(product, 0)
+        )
+        let (builder, effects) = builder.type_list(values)
+        let semantic_tail = if tail == 0 { SemanticClosedEffects }
+        else { SemanticOpenEffects(__i64_to_usize(tail - 1)) }
+        let (builder, root) = builder.effect_signature(effects, semantic_tail)
+        SemanticProductResolved(
+          semantic_type_product_add_graph(product, builder.freeze()),
+          root
+        )
+      }
+      SemanticProductValuesRejected(issue) -> SemanticProductRejected(issue)
+    }
+  }
+}
+
+type SemanticProductSubstitutionResolution {
+  SemanticProductSubstitutionResolved(SemanticTypeSubstitution),
+  SemanticProductSubstitutionRejected(SemanticTypeResolutionIssue)
+}
+
+fn semantic_product_bind_parameters(
+  parameters: TypeParamList,
+  arguments: List<SemanticTypeId>,
+  substitution: SemanticTypeSubstitution
+) -> SemanticProductSubstitutionResolution {
+  match (parameters, arguments) {
+    (TypeParamListNil, Nil) -> SemanticProductSubstitutionResolved(substitution)
+    (TypeParamListCons(parameter, remaining_parameters),
+      Cons(argument, remaining_arguments)) -> match parameter {
+        TypeParam(_, _, identity, _) -> if identity < 0 {
+          SemanticProductSubstitutionRejected(SemanticInvalidVariable(identity))
+        } else {
+          semantic_product_bind_parameters(
+            remaining_parameters,
+            remaining_arguments,
+            semantic_type_substitution_bind(
+              substitution,
+              SemanticParameterVariable(__i64_to_usize(identity)),
+              argument
+            )
+          )
+        }
+        MissingTypeParam -> SemanticProductSubstitutionRejected(
+          SemanticDeclarationResolutionRequired
+        )
+      }
+    _ -> SemanticProductSubstitutionRejected(SemanticDeclarationResolutionRequired)
+  }
+}
+
+fn semantic_product_substitute(
+  product: SemanticTypeProductBuilder,
+  substitution: borrow SemanticTypeSubstitution,
+  root: SemanticTypeId
+) -> SemanticProductResolution {
+  let catalog = semantic_type_product_catalog(product)
+  let provisional = semantic_type_product_segment(product, 0)
+  let result_segment = semantic_type_product_segment(product, 1)
+  let result = semantic_type_substitute(
+    catalog,
+    substitution,
+    provisional,
+    result_segment,
+    root
+  )
+  let graph = result.graph
+  if semantic_type_graph_len(graph) == 0 {
+    SemanticProductResolved(semantic_type_product_advance(product, 2), result.root)
+  } else {
+    SemanticProductResolved(
+      semantic_type_product_include_graph(product, graph, 2),
+      result.root
+    )
+  }
+}
+
+fn semantic_product_add_named(
+  product: SemanticTypeProductBuilder,
+  declaration: DeclarationIdentity,
+  role: SemanticNamedRole,
+  representation: SemanticTypeId,
+  arguments: List<SemanticTypeId>
+) -> SemanticProductResolution {
+  let builder = semantic_type_graph_builder(semantic_type_product_segment(product, 0))
+  let (builder, argument_list) = builder.type_list(arguments)
+  let (builder, root) = builder.named(
+    declaration,
+    role,
+    representation,
+    argument_list
+  )
+  SemanticProductResolved(
+    semantic_type_product_add_graph(product, builder.freeze()),
+    root
+  )
+}
+
+fn semantic_product_expand_definition(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  declaration: RegisteredName,
+  parameters: TypeParamList,
+  arguments: List<SemanticTypeId>,
+  target: TypeExpr,
+  opaque: bool
+) -> SemanticProductResolution {
+  match environment_for_definition(environment, declaration.identity) {
+    definition: SemanticTypeEnvironment -> match resolve_type_product_with(
+      product,
+      definition,
+      target
+    ) {
+      SemanticProductResolved(product, template) ->
+        match semantic_product_bind_parameters(
+          parameters,
+          arguments,
+          semantic_type_substitution_empty()
+        ) {
+          SemanticProductSubstitutionResolved(substitution) ->
+            match semantic_product_substitute(product, substitution, template) {
+              SemanticProductResolved(product, resolved) -> if opaque {
+                semantic_product_add_named(
+                  product,
+                  declaration.identity,
+                  SemanticOpaqueType,
+                  resolved,
+                  arguments
+                )
+              } else { SemanticProductResolved(product, resolved) }
+              SemanticProductRejected(issue) -> SemanticProductRejected(issue)
+            }
+          SemanticProductSubstitutionRejected(issue) -> SemanticProductRejected(issue)
+        }
+      SemanticProductRejected(issue) -> SemanticProductRejected(issue)
+    }
+    nil -> SemanticProductRejected(
+      SemanticRecursiveTypeDefinition(declaration.identity)
+    )
+  }
+}
+
+fn semantic_product_named_declaration(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  declaration: RegisteredName,
+  arguments: TypeExprList
+) -> SemanticProductResolution {
+  match environment_registered_type(environment, declaration.identity) {
+    registered: RegisteredType -> {
+      let parameters = registered_type_parameters(registered)
+      let expected = __i64_to_usize(type_param_list_len(parameters))
+      let actual = __i64_to_usize(type_expr_list_len(arguments))
+      if expected != actual {
+        SemanticProductRejected(SemanticTypeArgumentCount(expected, actual))
+      } else {
+        match semantic_product_values(product, environment, arguments) {
+          SemanticProductValuesResolved(product, resolved_arguments) -> match registered {
+            RegisteredRecordType(_, _, _) -> {
+              let builder = semantic_type_graph_builder(
+                semantic_type_product_segment(product, 0)
+              )
+              let (builder, representation) = builder.top()
+              let (builder, argument_list) = builder.type_list(resolved_arguments)
+              let (builder, root) = builder.named(
+                declaration.identity,
+                SemanticNominalType,
+                representation,
+                argument_list
+              )
+              SemanticProductResolved(
+                semantic_type_product_add_graph(product, builder.freeze()),
+                root
+              )
+            }
+            RegisteredVariantType(_, _, _) -> {
+              let builder = semantic_type_graph_builder(
+                semantic_type_product_segment(product, 0)
+              )
+              let (builder, representation) = builder.top()
+              let (builder, argument_list) = builder.type_list(resolved_arguments)
+              let (builder, root) = builder.named(
+                declaration.identity,
+                SemanticNominalType,
+                representation,
+                argument_list
+              )
+              SemanticProductResolved(
+                semantic_type_product_add_graph(product, builder.freeze()),
+                root
+              )
+            }
+            RegisteredOpaqueType(_, _, representation) ->
+              semantic_product_expand_definition(
+                product,
+                environment,
+                declaration,
+                parameters,
+                resolved_arguments,
+                representation,
+                true
+              )
+            RegisteredAliasType(_, _, target) -> semantic_product_expand_definition(
+              product,
+              environment,
+              declaration,
+              parameters,
+              resolved_arguments,
+              target,
+              false
+            )
+          }
+          SemanticProductValuesRejected(issue) -> SemanticProductRejected(issue)
+        }
+      }
+    }
+    nil -> SemanticProductRejected(SemanticDeclarationResolutionRequired)
+  }
+}
+
+fn semantic_product_unqualified_named(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  arguments: TypeExprList,
+  range: TypeNameRange
+) -> SemanticProductResolution {
+  match environment_declaration(environment, TypeDeclaration, range) {
+    declaration: RegisteredName -> semantic_product_named_declaration(
+      product,
+      environment,
+      declaration,
+      arguments
+    )
+    nil -> SemanticProductRejected(SemanticDeclarationResolutionRequired)
+  }
+}
+
+fn semantic_product_qualified_named(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  base: TypeExpr,
+  range: TypeNameRange
+) -> SemanticProductResolution {
+  match base {
+    NamedTypeExpr(_, _, arguments, SourceTypeOrigin(qualifier)) -> {
+      let member_start = qualifier.start + qualifier.length + 1
+      let member_length = range.start + range.length - member_start
+      if member_length <= 0 {
+        SemanticProductRejected(SemanticDeclarationResolutionRequired)
+      } else {
+        let member = TypeNameRange { start: member_start, length: member_length }
+        match environment_qualified_declaration(
+          environment,
+          TypeDeclaration,
+          qualifier,
+          member
+        ) {
+          declaration: RegisteredName -> semantic_product_named_declaration(
+            product,
+            environment,
+            declaration,
+            arguments
+          )
+          nil -> SemanticProductRejected(SemanticDeclarationResolutionRequired)
+        }
+      }
+    }
+    _ -> SemanticProductRejected(SemanticDeclarationResolutionRequired)
+  }
+}
+
+fn semantic_product_expanded_binary(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  left: TypeExpr,
+  right: TypeExpr,
+  intersection: bool
+) -> SemanticProductResolution {
+  match resolve_type_product_with(product, environment, left) {
+    SemanticProductResolved(product, resolved_left) -> match resolve_type_product_with(
+      product,
+      environment,
+      right
+    ) {
+      SemanticProductResolved(product, resolved_right) -> semantic_product_add_binary(
+        product,
+        resolved_left,
+        resolved_right,
+        intersection
+      )
+      SemanticProductRejected(issue) -> SemanticProductRejected(issue)
+    }
+    SemanticProductRejected(issue) -> SemanticProductRejected(issue)
+  }
+}
+
+fn semantic_product_expanded_unary(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  inner: TypeExpr,
+  kind: i64
+) -> SemanticProductResolution {
+  match resolve_type_product_with(product, environment, inner) {
+    SemanticProductResolved(product, resolved) -> semantic_product_add_unary(
+      product,
+      resolved,
+      kind
+    )
+    SemanticProductRejected(issue) -> SemanticProductRejected(issue)
+  }
+}
+
+fn semantic_product_expanded_mutable_unary(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  inner: TypeExpr,
+  access: TypeAccess,
+  kind: i64
+) -> SemanticProductResolution {
+  match resolve_type_product_with(product, environment, inner) {
+    SemanticProductResolved(product, resolved) -> semantic_product_add_mutable_unary(
+      product,
+      resolved,
+      access,
+      kind
+    )
+    SemanticProductRejected(issue) -> SemanticProductRejected(issue)
+  }
+}
+
+fn semantic_product_expanded_function(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  parameters: TypeExprList,
+  result: TypeExpr,
+  effects: TypeExpr
+) -> SemanticProductResolution {
+  match semantic_product_values(product, environment, parameters) {
+    SemanticProductValuesResolved(product, parameter_values) ->
+      match resolve_type_product_with(product, environment, result) {
+        SemanticProductResolved(product, result_value) -> match effects {
+          EffectSetTypeExpr(atoms, tail) -> match semantic_product_effect_set(
+            product,
+            environment,
+            atoms,
+            tail
+          ) {
+            SemanticProductResolved(product, effect_value) -> {
+              let builder = semantic_type_graph_builder(
+                semantic_type_product_segment(product, 0)
+              )
+              let (builder, parameter_list) = builder.type_list(parameter_values)
+              let (builder, root) = builder.function(
+                parameter_list,
+                result_value,
+                effect_value
+              )
+              SemanticProductResolved(
+                semantic_type_product_add_graph(product, builder.freeze()),
+                root
+              )
+            }
+            SemanticProductRejected(issue) -> SemanticProductRejected(issue)
+          }
+          _ -> SemanticProductRejected(SemanticUnsupportedAuthoredType(6))
+        }
+        SemanticProductRejected(issue) -> SemanticProductRejected(issue)
+      }
+    SemanticProductValuesRejected(issue) -> SemanticProductRejected(issue)
+  }
+}
+
+fn resolve_type_product_expanded(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  ty: TypeExpr
+) -> SemanticProductResolution {
+  match ty {
+    UnionTypeExpr(left, right) -> semantic_product_expanded_binary(
+      product,
+      environment,
+      left,
+      right,
+      false
+    )
+    IntersectionTypeExpr(left, right) -> semantic_product_expanded_binary(
+      product,
+      environment,
+      left,
+      right,
+      true
+    )
+    ComplementTypeExpr(inner) -> semantic_product_expanded_unary(
+      product,
+      environment,
+      inner,
+      0
+    )
+    FunctionTypeExpr(parameters, result, effects) -> semantic_product_expanded_function(
+      product,
+      environment,
+      parameters,
+      result,
+      effects
+    )
+    RecordTypeExpr(fields, extent, NamedTypeFields) ->
+      match semantic_product_record_fields(product, environment, fields) {
+        SemanticProductRecordFieldsResolved(product, names, values) ->
+          semantic_product_add_record(product, names, values, record_openness(extent))
+        SemanticProductRecordFieldsRejected(issue) -> SemanticProductRejected(issue)
+      }
+    RecordTypeExpr(fields, _, PositionalTypeFields) ->
+      match semantic_product_tuple_fields(product, environment, fields) {
+        SemanticProductValuesResolved(product, values) -> semantic_product_add_tuple(
+          product,
+          values
+        )
+        SemanticProductValuesRejected(issue) -> SemanticProductRejected(issue)
+      }
+    NamedTypeExpr(_, _, arguments, SourceTypeOrigin(range)) ->
+      semantic_product_unqualified_named(product, environment, arguments, range)
+    SourceAssociatedTypeExpr(base, _, range) -> semantic_product_qualified_named(
+      product,
+      environment,
+      base,
+      range
+    )
+    UnqualifiedEffectTypeExpr(_, _, _) -> semantic_product_effect_atom(
+      product,
+      environment,
+      ty
+    )
+    QualifiedEffectTypeExpr(_, _, _) -> semantic_product_effect_atom(
+      product,
+      environment,
+      ty
+    )
+    EffectSetTypeExpr(atoms, tail) -> semantic_product_effect_set(
+      product,
+      environment,
+      atoms,
+      tail
+    )
+    ContinuationTypeExpr(input, result) -> match resolve_type_product_with(
+      product,
+      environment,
+      input
+    ) {
+      SemanticProductResolved(product, resolved_input) -> match resolve_type_product_with(
+        product,
+        environment,
+        result
+      ) {
+        SemanticProductResolved(product, resolved_result) -> {
+          let builder = semantic_type_graph_builder(
+            semantic_type_product_segment(product, 0)
+          )
+          let (builder, root) = builder.continuation(resolved_input, resolved_result)
+          SemanticProductResolved(
+            semantic_type_product_add_graph(product, builder.freeze()),
+            root
+          )
+        }
+        SemanticProductRejected(issue) -> SemanticProductRejected(issue)
+      }
+      SemanticProductRejected(issue) -> SemanticProductRejected(issue)
+    }
+    PointerTypeExpr(inner, access) -> semantic_product_expanded_mutable_unary(
+      product,
+      environment,
+      inner,
+      access,
+      0
+    )
+    BorrowTypeExpr(inner, access) -> semantic_product_expanded_mutable_unary(
+      product,
+      environment,
+      inner,
+      access,
+      1
+    )
+    SliceTypeExpr(inner, access) -> semantic_product_expanded_mutable_unary(
+      product,
+      environment,
+      inner,
+      access,
+      2
+    )
+    WeakTypeExpr(inner) -> semantic_product_expanded_unary(
+      product,
+      environment,
+      inner,
+      1
+    )
+    AtomicTypeExpr(inner) -> semantic_product_expanded_unary(
+      product,
+      environment,
+      inner,
+      2
+    )
+    UniqueTypeExpr(inner) -> semantic_product_expanded_unary(
+      product,
+      environment,
+      inner,
+      3
+    )
+    OwnedTypeExpr(inner) -> semantic_product_expanded_unary(
+      product,
+      environment,
+      inner,
+      4
+    )
+    ArrayTypeExpr(inner, length) -> if length < 0 {
+      SemanticProductRejected(SemanticInvalidArrayLength(length))
+    } else {
+      match resolve_type_product_with(product, environment, inner) {
+        SemanticProductResolved(product, element) -> {
+          let builder = semantic_type_graph_builder(
+            semantic_type_product_segment(product, 0)
+          )
+          let (builder, root) = builder.array(element, __i64_to_usize(length))
+          SemanticProductResolved(
+            semantic_type_product_add_graph(product, builder.freeze()),
+            root
+          )
+        }
+        SemanticProductRejected(issue) -> SemanticProductRejected(issue)
+      }
+    }
+    _ -> SemanticProductRejected(SemanticDeclarationResolutionRequired)
+  }
+}
+
+fn resolve_type_product_with(
+  product: SemanticTypeProductBuilder,
+  environment: SemanticTypeEnvironment,
+  ty: TypeExpr
+) -> SemanticProductResolution {
+  let builder = semantic_type_graph_builder(semantic_type_product_segment(product, 0))
+  match resolve_type_with(builder, environment, ty) {
+    (builder, SemanticTypeResolved(root)) -> SemanticProductResolved(
+      semantic_type_product_add_graph(product, builder.freeze()),
+      root
+    )
+    (builder, SemanticTypeRejected(SemanticDefinitionExpansionRequired(_))) -> {
+      builder.drop()
+      resolve_type_product_expanded(product, environment, ty)
+    }
+    (builder, SemanticTypeRejected(issue)) -> {
+      builder.drop()
+      SemanticProductRejected(issue)
+    }
+  }
+}
+
+pub(package) fn resolve_function_signature_product_in_scope(
+  product: SemanticTypeProductBuilder,
+  module: RegisteredModule,
+  scope: RegistrationScope,
+  function: FunctionSyntax
+) -> (SemanticTypeProductBuilder, SemanticTypeResolution) {
+  match resolve_type_product_with(
+    product,
+    SemanticTypesInScope(module, scope, Nil<DeclarationIdentity>()),
+    FunctionTypeExpr(
+      parameter_types(function.params),
+      function.result,
+      effect_type(function.effects)
+    )
+  ) {
+    SemanticProductResolved(product, root) -> (
+      product,
+      SemanticTypeResolved(root)
+    )
+    SemanticProductRejected(issue) -> (
+      product,
+      SemanticTypeRejected(issue)
+    )
+  }
 }
