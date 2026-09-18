@@ -2,18 +2,29 @@
 -- checked-body storage switches away from pointer-shaped legacy nodes.
 
 use compiler/ir/data.{*}
-use compiler/project/identity.{named_module_identity}
+use compiler/project/identity.{
+  EffectDeclaration,
+  TraitDeclaration,
+  declaration_identity_name,
+  declaration_identity_namespace,
+  named_module_identity
+}
 use compiler/source/input.{source_from_text}
 use compiler/types/graph.{*}
 use compiler/weft/check/registration/catalog as registration
-use compiler/weft/check/registration/catalog.{RegisteredModule}
+use compiler/weft/check/registration/catalog.{RegisteredFunction, RegisteredModule}
+use compiler/weft/check/registration/scope as registration_scope
+use compiler/weft/check/registration/scope.{RegistrationScope, ResolvedImport}
 use compiler/weft/check/semantic_types.{*}
 use compiler/weft/check/storage.{dense_index}
 use compiler/weft/grammar.{ParsedWeftSource, WeftParser}
 use stdlib/diagnostic.{Diagnose}
 use stdlib/grammar.{Grammar, Parsed}
+use stdlib/list as list
+use stdlib/list.{List, Nil}
+use stdlib/option.{Option}
 use stdlib/panic.{panic}
-use stdlib/source.{Source}
+use stdlib/source.{Source, Span}
 use stdlib/string.{str_concat}
 
 fn parse(text: str) -[Test]> ParsedWeftSource {
@@ -38,9 +49,36 @@ fn registered(text: str) -[Test]> RegisteredModule {
   )
 }
 
-fn resolved_signature(module: RegisteredModule) -> (SemanticTypeGraph, SemanticTypeId) {
+fn scope_for(module: RegisteredModule) -> RegistrationScope {
+  let builder = registration_scope.registration_builder()
+  registration_scope.registration_builder_add(builder, module)
+  registration_scope.registration_builder_freeze(builder)
+}
+
+fn modules2(first: RegisteredModule, second: RegisteredModule) -> List<RegisteredModule> {
+  let modules = [first, second]
+  list.from_slice(modules[..])
+}
+
+fn imports1(edge: ResolvedImport) -> List<ResolvedImport> {
+  let imports = [edge]
+  list.from_slice(imports[..])
+}
+
+fn first_function(module: RegisteredModule) -> RegisteredFunction {
   let functions = module.functions
-  let registered_function = functions.at(dense_index(0))
+  functions.at(dense_index(0))
+}
+
+fn first_type_parameter_bound(function: RegisteredFunction) -> TypeExpr {
+  match function.syntax.type_params {
+    TypeParamListCons(TypeParam(_, _, _, TypeParamBoundListCons(bound, _, _)), _) -> bound
+    _ -> MissingTypeExpr
+  }
+}
+
+fn resolved_signature(module: RegisteredModule) -> (SemanticTypeGraph, SemanticTypeId) {
+  let registered_function = first_function(module)
   let function = registered_function.syntax
   let builder = semantic_type_graph_builder(semantic_type_segment_id(module.identity))
   match resolve_function_signature(builder, module.source, function) {
@@ -48,6 +86,26 @@ fn resolved_signature(module: RegisteredModule) -> (SemanticTypeGraph, SemanticT
     (builder, SemanticTypeRejected(_)) -> {
       builder.drop()
       panic("expected signature to resolve")
+    }
+  }
+}
+
+fn resolved_scoped_signature(
+  module: RegisteredModule,
+  scope: RegistrationScope
+) -> (SemanticTypeGraph, SemanticTypeId) {
+  let registered_function = first_function(module)
+  let builder = semantic_type_graph_builder(semantic_type_segment_id(module.identity))
+  match resolve_function_signature_in_scope(
+    builder,
+    module,
+    scope,
+    registered_function.syntax
+  ) {
+    (builder, SemanticTypeResolved(signature)) -> (builder.freeze(), signature)
+    (builder, SemanticTypeRejected(_)) -> {
+      builder.drop()
+      panic("expected scoped signature to resolve")
     }
   }
 }
@@ -305,6 +363,327 @@ test "structural record field names come from retained source ranges" {
       _ -> Test.assert_true(false)
     }
     _ -> Test.assert_true(false)
+  }
+}
+
+test "typed scopes resolve exact effect and trait identities in authored signatures" {
+  let module = registered(
+    "effect Read<T> { fn read() -> T } trait Show { fn show(self) -> str } "
+    |> str_concat("fn consume<T: Show, E>(value: T) -[Read<T>, E]> T { value }")
+  )
+  let scope = scope_for(module)
+  let (graph, signature) = resolved_scoped_signature(module, scope)
+  match semantic_type_graph_node(graph, signature) {
+    SemanticFunctionNode(_, _, effects) -> match semantic_type_graph_node(graph, effects) {
+      SemanticEffectSignatureNode(atoms, SemanticOpenEffects(tail)) -> {
+        let lists = semantic_type_graph_type_lists_local(graph)
+        Test.assert_eq_usize(
+          semantic_type_list_len(lists, atoms),
+          1
+        )
+        Test.assert_eq_usize(tail, 1)
+        match semantic_type_graph_node(graph, list_type(graph, atoms, 0)) {
+          SemanticEffectAtomNode(declaration, arguments) -> {
+            Test.assert_true(
+              match declaration_identity_namespace(declaration) {
+                EffectDeclaration -> true
+                _ -> false
+              }
+            )
+            Test.assert_str_eq(declaration_identity_name(declaration).text().unwrap(), "Read")
+            Test.assert_eq_usize(
+              semantic_type_list_len(lists, arguments),
+              1
+            )
+          }
+          _ -> Test.assert_true(false)
+        }
+      }
+      _ -> Test.assert_true(false)
+    }
+    _ -> Test.assert_true(false)
+  }
+
+  let function = first_function(module)
+  let builder = semantic_type_graph_builder(semantic_type_segment_id(module.identity))
+  match resolve_type_in_scope(
+    builder,
+    module,
+    scope,
+    first_type_parameter_bound(function)
+  ) {
+    (builder, SemanticTypeResolved(bound)) -> {
+      let graph = builder.freeze()
+      match semantic_type_graph_node(graph, bound) {
+        SemanticTraitNode(declaration, _) -> {
+          Test.assert_true(
+            match declaration_identity_namespace(declaration) {
+              TraitDeclaration -> true
+              _ -> false
+            }
+          )
+          Test.assert_str_eq(declaration_identity_name(declaration).text().unwrap(), "Show")
+        }
+        _ -> Test.assert_true(false)
+      }
+      nil
+    }
+    (builder, _) -> {
+      builder.drop()
+      Test.assert_true(false)
+      nil
+    }
+  }
+}
+
+test "typed scopes resolve generic nominal record and variant identities" {
+  let module = registered(
+    "type Box<T> { value: T } type Choice<T> { Empty, Value(T) } "
+    |> str_concat(
+      "fn transform(box: Box<i64>, choice: Choice<str>) -> Box<str> { box }"
+    )
+  )
+  let scope = scope_for(module)
+  let (graph, signature) = resolved_scoped_signature(module, scope)
+  match semantic_type_graph_node(graph, signature) {
+    SemanticFunctionNode(parameters, result, _) -> {
+      match semantic_type_graph_node(graph, list_type(graph, parameters, 0)) {
+        SemanticNamedNode(declaration, SemanticNominalType, _, arguments) -> {
+          Test.assert_str_eq(declaration_identity_name(declaration).text().unwrap(), "Box")
+          Test.assert_true(
+            match semantic_type_graph_node(graph, list_type(graph, arguments, 0)) {
+              SemanticPrimitiveNode(SemanticI64) -> true
+              _ -> false
+            }
+          )
+        }
+        _ -> Test.assert_true(false)
+      }
+      match semantic_type_graph_node(graph, list_type(graph, parameters, 1)) {
+        SemanticNamedNode(declaration, SemanticNominalType, _, arguments) -> {
+          Test.assert_str_eq(
+            declaration_identity_name(declaration).text().unwrap(),
+            "Choice"
+          )
+          Test.assert_true(
+            match semantic_type_graph_node(graph, list_type(graph, arguments, 0)) {
+              SemanticPrimitiveNode(SemanticStr) -> true
+              _ -> false
+            }
+          )
+        }
+        _ -> Test.assert_true(false)
+      }
+      match semantic_type_graph_node(graph, result) {
+        SemanticNamedNode(declaration, SemanticNominalType, _, arguments) -> {
+          Test.assert_str_eq(declaration_identity_name(declaration).text().unwrap(), "Box")
+          Test.assert_true(
+            match semantic_type_graph_node(graph, list_type(graph, arguments, 0)) {
+              SemanticPrimitiveNode(SemanticStr) -> true
+              _ -> false
+            }
+          )
+        }
+        _ -> Test.assert_true(false)
+      }
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "nominal arity and representation-bearing definitions reject explicitly" {
+  let arity_module = registered(
+    "type Box<T> { value: T } fn bad(value: Box<i64, str>) -> i64 { 0 }"
+  )
+  let arity_function = first_function(arity_module)
+  let arity_builder = semantic_type_graph_builder(
+    semantic_type_segment_id(arity_module.identity)
+  )
+  match resolve_function_signature_in_scope(
+    arity_builder,
+    arity_module,
+    scope_for(arity_module),
+    arity_function.syntax
+  ) {
+    (builder, SemanticTypeRejected(SemanticTypeArgumentCount(expected, actual))) -> {
+      Test.assert_eq_usize(expected, 1)
+      Test.assert_eq_usize(actual, 2)
+      Test.assert_eq_usize(builder.len(), 0)
+      builder.drop()
+    }
+    (builder, _) -> {
+      builder.drop()
+      Test.assert_true(false)
+      nil
+    }
+  }
+
+  let representation_module = registered(
+    "type Token<T> = opaque T type Alias<T> = T "
+    |> str_concat("fn opaque(value: Token<i64>) -> Alias<i64> { 0 }")
+  )
+  let representation_function = first_function(representation_module)
+  let representation_builder = semantic_type_graph_builder(
+    semantic_type_segment_id(representation_module.identity)
+  )
+  match resolve_function_signature_in_scope(
+    representation_builder,
+    representation_module,
+    scope_for(representation_module),
+    representation_function.syntax
+  ) {
+    (builder, SemanticTypeRejected(SemanticDefinitionExpansionRequired(declaration))) -> {
+      Test.assert_str_eq(declaration_identity_name(declaration).text().unwrap(), "Token")
+      Test.assert_eq_usize(builder.len(), 0)
+      builder.drop()
+    }
+    (builder, _) -> {
+      builder.drop()
+      Test.assert_true(false)
+      nil
+    }
+  }
+}
+
+test "non-generic opaque and alias definitions expand under their producer scope" {
+  let module = registered(
+    "type Token = opaque i64 type Alias = Token fn identity(value: Token) -> Alias { value }"
+  )
+  let scope = scope_for(module)
+  let (graph, signature) = resolved_scoped_signature(module, scope)
+  match semantic_type_graph_node(graph, signature) {
+    SemanticFunctionNode(parameters, result, _) -> {
+      match semantic_type_graph_node(graph, list_type(graph, parameters, 0)) {
+        SemanticNamedNode(declaration, SemanticOpaqueType, representation, arguments) -> {
+          let lists = semantic_type_graph_type_lists_local(graph)
+          Test.assert_str_eq(declaration_identity_name(declaration).text().unwrap(), "Token")
+          Test.assert_eq_usize(
+            semantic_type_list_len(lists, arguments),
+            0
+          )
+          Test.assert_true(
+            match semantic_type_graph_node(graph, representation) {
+              SemanticPrimitiveNode(SemanticI64) -> true
+              _ -> false
+            }
+          )
+        }
+        _ -> Test.assert_true(false)
+      }
+      Test.assert_true(
+        match semantic_type_graph_node(graph, result) {
+          SemanticNamedNode(declaration, SemanticOpaqueType, _, _) ->
+            declaration_identity_name(declaration).text().unwrap() == "Token"
+          _ -> false
+        }
+      )
+    }
+    _ -> Test.assert_true(false)
+  }
+
+  let recursive = registered("type Cycle = Cycle fn cycle() -> Cycle { 0 }")
+  let recursive_function = first_function(recursive)
+  let builder = semantic_type_graph_builder(semantic_type_segment_id(recursive.identity))
+  match resolve_function_signature_in_scope(
+    builder,
+    recursive,
+    scope_for(recursive),
+    recursive_function.syntax
+  ) {
+    (builder, SemanticTypeRejected(SemanticRecursiveTypeDefinition(declaration))) -> {
+      Test.assert_str_eq(declaration_identity_name(declaration).text().unwrap(), "Cycle")
+      builder.drop()
+    }
+    (builder, _) -> {
+      builder.drop()
+      Test.assert_true(false)
+      nil
+    }
+  }
+}
+
+test "qualified effect and trait lookup follows the typed import scope" {
+  let dependency_parsed = parse(
+    "pub effect Read<T> { fn read() -> T } pub trait Show { fn show(self) -> str } "
+    |> str_concat("pub type Box<T> { value: T }")
+  )
+  let dependency = registration.register(
+    dependency_parsed.declarations,
+    dependency_parsed.source.source(),
+    named_module_identity("fixture/dependency", 73)
+  )
+  let consumer_parsed = parse(
+    "use dependency as dep "
+    |> str_concat(
+      "fn consume<T: dep.Show, E>(box: dep.Box<T>, value: T) -[dep.Read<T>, E]> T { value }"
+    )
+  )
+  let consumer = registration.register(
+    consumer_parsed.declarations,
+    consumer_parsed.source.source(),
+    named_module_identity("fixture/consumer", 73)
+  )
+  let authored_imports = consumer.syntax.imports
+  let authored_import = authored_imports.first().unwrap()
+  let edge = registration_scope.resolved_import(
+    consumer,
+    authored_import,
+    dependency.identity,
+    false
+  )
+  let scope = registration_scope.registration_scope_build(
+    modules2(dependency, consumer),
+    imports1(edge)
+  )
+  let (graph, signature) = resolved_scoped_signature(consumer, scope)
+  match semantic_type_graph_node(graph, signature) {
+    SemanticFunctionNode(parameters, _, effects) -> {
+      match semantic_type_graph_node(graph, list_type(graph, parameters, 0)) {
+        SemanticNamedNode(declaration, SemanticNominalType, _, _) -> Test.assert_str_eq(
+          declaration_identity_name(declaration).text().unwrap(),
+          "Box"
+        )
+        _ -> Test.assert_true(false)
+      }
+      match semantic_type_graph_node(graph, effects) {
+        SemanticEffectSignatureNode(atoms, SemanticOpenEffects(_)) ->
+          match semantic_type_graph_node(graph, list_type(graph, atoms, 0)) {
+            SemanticEffectAtomNode(declaration, _) -> Test.assert_str_eq(
+              declaration_identity_name(declaration).text().unwrap(),
+              "Read"
+            )
+            _ -> Test.assert_true(false)
+          }
+        _ -> Test.assert_true(false)
+      }
+    }
+    _ -> Test.assert_true(false)
+  }
+
+  let function = first_function(consumer)
+  let builder = semantic_type_graph_builder(semantic_type_segment_id(consumer.identity))
+  match resolve_type_in_scope(
+    builder,
+    consumer,
+    scope,
+    first_type_parameter_bound(function)
+  ) {
+    (builder, SemanticTypeResolved(bound)) -> {
+      let graph = builder.freeze()
+      match semantic_type_graph_node(graph, bound) {
+        SemanticTraitNode(declaration, _) -> Test.assert_str_eq(
+          declaration_identity_name(declaration).text().unwrap(),
+          "Show"
+        )
+        _ -> Test.assert_true(false)
+      }
+      nil
+    }
+    (builder, _) -> {
+      builder.drop()
+      Test.assert_true(false)
+      nil
+    }
   }
 }
 
