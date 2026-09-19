@@ -63,6 +63,7 @@ use compiler/ir/data.{
   NilExpr,
   NilPattern,
   Not,
+  OptChain,
   Param,
   ParamList,
   ParamListCons,
@@ -149,6 +150,7 @@ use compiler/types/graph.{
   SemanticMutable,
   SemanticNamedNode,
   SemanticNominalType,
+  SemanticUnionNode,
   SemanticOpenEffects,
   SemanticOwnedNode,
   SemanticParameterVariable,
@@ -343,8 +345,12 @@ use compiler/weft/check/body/product.{
   checked_body_product
 }
 use compiler/weft/check/body/propagation.{
+  CheckedDeclaredProjection,
   CheckedFailurePropagation,
+  CheckedOptionalProjection,
+  CheckedProjection,
   CheckedPropagationBuilder,
+  CheckedStructuralProjection,
   checked_propagation_builder
 }
 use compiler/weft/check/registration/catalog.{RegisteredModule}
@@ -425,6 +431,8 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerCanonicalFailUnavailable,
   CheckedBodyProducerResultOperandRequired(SemanticTypeId),
   CheckedBodyProducerTryEffectUnavailable(SemanticTypeId),
+  CheckedBodyProducerOptionalBaseRequired(SemanticTypeId),
+  CheckedBodyProducerMaybeEffectUnavailable,
   CheckedBodyProducerSignatureUnavailable(CheckedSourceRange),
   CheckedBodyProducerFieldProjectionUnavailable(SemanticTypeId),
   CheckedBodyProducerIndexedBaseRequired(SemanticTypeId),
@@ -1356,6 +1364,27 @@ fn checked_body_effect_reference(
       true
     )
     _ -> CheckedBodyInvalidEffectReference
+  }
+}
+
+fn checked_body_nullary_effect_type(expression: Expr) -> Option<TypeExpr> {
+  match expression {
+    Ident(start, length) -> Some<TypeExpr>(
+      UnqualifiedEffectTypeExpr(
+        0,
+        TypeExprListNil,
+        TypeNameRange { start: start, length: length }
+      )
+    )
+    FieldAccess(Ident(qualifier_start, qualifier_length), start, length, _) ->
+      Some<TypeExpr>(
+        QualifiedEffectTypeExpr(
+          TypeNameRange { start: qualifier_start, length: qualifier_length },
+          TypeNameRange { start: start, length: length },
+          TypeExprListNil
+        )
+      )
+    _ -> None<TypeExpr>()
   }
 }
 
@@ -2904,6 +2933,78 @@ impl CheckedBodyBuild {
               ),
               expression
             )
+          }
+        }
+      }
+    }
+  }
+
+  fn optional_projection(
+    self: owned Self,
+    base: CheckedExprId,
+    projection: CheckedProjection,
+    atom: SemanticTypeId,
+    field_range: CheckedSourceRange,
+    result: SemanticTypeId,
+    range: CheckedSourceRange
+  ) -> (owned CheckedBodyBuild, CheckedExprId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let detail = CheckedOptionalProjection {
+          base: base,
+          projection: projection,
+          atom: atom,
+          field_range: field_range
+        }
+        match projection {
+          CheckedDeclaredProjection(_, _) -> match propagation.declared_optional_projection(
+            expressions,
+            detail
+          ) {
+            (propagation, selected) -> match expressions.declared_optional_projection(
+              selected,
+              result,
+              range
+            ) {
+              (expressions, expression) -> (
+                CheckedBodyBuild(
+                  CheckedBodyBuildStorage {
+                    signatures: signatures,
+                    expressions: expressions,
+                    patterns: patterns,
+                    closures: closures,
+                    effects: effects,
+                    propagation: propagation
+                  }
+                ),
+                expression
+              )
+            }
+          }
+          CheckedStructuralProjection(_, _) -> match propagation.structural_optional_projection(
+            expressions,
+            detail
+          ) {
+            (propagation, selected) -> match expressions.structural_optional_projection(
+              selected,
+              result,
+              range
+            ) {
+              (expressions, expression) -> (
+                CheckedBodyBuild(
+                  CheckedBodyBuildStorage {
+                    signatures: signatures,
+                    expressions: expressions,
+                    patterns: patterns,
+                    closures: closures,
+                    effects: effects,
+                    propagation: propagation
+                  }
+                ),
+                expression
+              )
+            }
           }
         }
       }
@@ -8122,6 +8223,25 @@ fn checked_body_handler_first_site(
                 authored,
                 operation
               )
+              CheckedBodyBareEffect(declaration) -> match checked_body_select_registered_effect(
+                types,
+                declaration,
+                operation
+              ) {
+                CheckedBodyEffectApplicationMissing -> match checked_body_nullary_effect_type(
+                  effect_ref
+                ) {
+                  Some(authored) -> checked_body_explicit_handler_effect(
+                    types.module,
+                    types,
+                    environment,
+                    authored,
+                    operation
+                  )
+                  None -> (types, CheckedBodyEffectApplicationMissing, nil)
+                }
+                selection -> (types, selection, nil)
+              }
               _ -> match checked_body_handler_selection(
                 types.module,
                 source,
@@ -11168,6 +11288,262 @@ fn checked_body_try(
   }
 }
 
+fn checked_body_nullable_payload(
+  catalog: borrow SemanticTypeCatalog,
+  value: SemanticTypeId,
+  nil_type: SemanticTypeId
+) -> Option<SemanticTypeId> {
+  match catalog.graph_for(value) {
+    None -> None<SemanticTypeId>()
+    Some(graph) -> match semantic_type_graph_node(graph, value) {
+      SemanticUnionNode(left, right) -> if semantic_type_catalog_equal(catalog, left, nil_type) {
+        Some<SemanticTypeId>(right)
+      } else {
+        if semantic_type_catalog_equal(catalog, right, nil_type) {
+          Some<SemanticTypeId>(left)
+        } else { None<SemanticTypeId>() }
+      }
+      _ -> None<SemanticTypeId>()
+    }
+  }
+}
+
+fn checked_body_maybe_atom_matches(
+  catalog: borrow SemanticTypeCatalog,
+  atom: SemanticTypeId,
+  declaration: DeclarationIdentity
+) -> bool {
+  match catalog.graph_for(atom) {
+    None -> false
+    Some(graph) -> match semantic_type_graph_node(graph, atom) {
+      SemanticEffectAtomNode(candidate, arguments) -> {
+        let lists = semantic_type_graph_type_lists_local(graph)
+        declaration_identity_eq(candidate, declaration) and
+          semantic_type_list_len(lists, arguments) == 0
+      }
+      _ -> false
+    }
+  }
+}
+
+fn checked_body_maybe_atom_in_function(
+  catalog: borrow SemanticTypeCatalog,
+  function_type: SemanticTypeId,
+  declaration: DeclarationIdentity
+) -> Option<SemanticTypeId> {
+  match catalog.graph_for(function_type) {
+    None -> None<SemanticTypeId>()
+    Some(graph) -> match semantic_type_graph_node(graph, function_type) {
+      SemanticFunctionNode(_, _, effects) -> match catalog.graph_for(effects) {
+        None -> None<SemanticTypeId>()
+        Some(effect_graph) -> match semantic_type_graph_node(effect_graph, effects) {
+          SemanticEffectSignatureNode(atoms, _) -> {
+            let lists = semantic_type_graph_type_lists_local(effect_graph)
+            let mut index: usize = 0
+            while index < semantic_type_list_len(lists, atoms) {
+              let atom = semantic_type_graph_list_type_id(
+                effect_graph,
+                semantic_type_list_edge(lists, atoms, index)
+              )
+              if checked_body_maybe_atom_matches(catalog, atom, declaration) {
+                return Some<SemanticTypeId>(atom)
+              }
+              index = index + 1
+            }
+            None<SemanticTypeId>()
+          }
+          _ -> None<SemanticTypeId>()
+        }
+      }
+      _ -> None<SemanticTypeId>()
+    }
+  }
+}
+
+fn checked_body_maybe_atom(
+  catalog: borrow SemanticTypeCatalog,
+  environment: CheckedLexicalEnvironment,
+  declaration: DeclarationIdentity
+) -> Option<SemanticTypeId> {
+  match environment {
+    CheckedLexicalRoot(_, _, _, function_type) -> checked_body_maybe_atom_in_function(
+      catalog,
+      function_type,
+      declaration
+    )
+    CheckedLexicalBinding(_, _, _, _, _, parent) -> checked_body_maybe_atom(
+      catalog,
+      parent,
+      declaration
+    )
+    CheckedLexicalHandledEffect(atom, parent) -> if checked_body_maybe_atom_matches(
+      catalog,
+      atom,
+      declaration
+    ) { Some<SemanticTypeId>(atom) }
+    else { checked_body_maybe_atom(catalog, parent, declaration) }
+    CheckedLexicalResume(_, _, parent) -> checked_body_maybe_atom(
+      catalog,
+      parent,
+      declaration
+    )
+  }
+}
+
+fn checked_body_optional_field(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  base: CheckedExprId,
+  payload_type: SemanticTypeId,
+  field_name: str,
+  field_range: CheckedSourceRange,
+  atom: SemanticTypeId,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  let catalog = state.types()
+  match semantic_record_field_projection(catalog, payload_type, field_name) {
+    SemanticRecordFieldProjected(key, offset, result) -> if expectation_allows(
+      catalog,
+      result,
+      expectation
+    ) {
+      match covering_range(state.range(base), field_range) {
+        nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+        range: CheckedSourceRange -> match state.optional_projection(
+          base,
+          CheckedStructuralProjection(key, offset),
+          atom,
+          field_range,
+          result,
+          range
+        ) {
+          (state, expression) -> CheckedBodyExprBuilt(state, expression)
+        }
+      }
+    } else {
+      CheckedBodyExprRejected(state, expectation_mismatch(result, expectation))
+    }
+    SemanticRecordFieldMissing -> CheckedBodyExprRejected(
+      state,
+      CheckedBodyProducerUnknownField(field_range)
+    )
+    SemanticRecordFieldProjectionUnavailable -> {
+      let applications = types.applications
+      match semantic_declared_field_projection(
+        applications,
+        catalog,
+        payload_type,
+        field_name
+      ) {
+        SemanticDeclaredFieldProjected(declaration, offset, result) -> if expectation_allows(
+          catalog,
+          result,
+          expectation
+        ) {
+          match covering_range(state.range(base), field_range) {
+            nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+            range: CheckedSourceRange -> match state.optional_projection(
+              base,
+              CheckedDeclaredProjection(declaration, offset),
+              atom,
+              field_range,
+              result,
+              range
+            ) {
+              (state, expression) -> CheckedBodyExprBuilt(state, expression)
+            }
+          }
+        } else {
+          CheckedBodyExprRejected(state, expectation_mismatch(result, expectation))
+        }
+        SemanticDeclaredFieldMissing -> CheckedBodyExprRejected(
+          state,
+          CheckedBodyProducerUnknownField(field_range)
+        )
+        SemanticDeclaredFieldProjectionUnavailable -> CheckedBodyExprRejected(
+          state,
+          CheckedBodyProducerFieldProjectionUnavailable(payload_type)
+        )
+      }
+    }
+  }
+}
+
+fn checked_body_optional_chain(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  base: Expr,
+  field_start: i64,
+  field_length: i64,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  match checked_body_standard_declaration(
+    types,
+    lexical_scope(environment),
+    "stdlib/maybe",
+    EffectDeclaration,
+    "Maybe"
+  ) {
+    nil -> CheckedBodyExprRejected(state, CheckedBodyProducerMaybeEffectUnavailable)
+    maybe_declaration: DeclarationIdentity -> {
+      let catalog = state.types()
+      match checked_body_maybe_atom(catalog, environment, maybe_declaration) {
+        Some(atom) -> match checked_body_expr(
+          state,
+          source,
+          types,
+          owner,
+          function_result,
+          loop_context,
+          environment,
+          base,
+          CheckedInferResult
+        ) {
+          CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+          CheckedBodyExprBuilt(state, checked_base) -> {
+            let catalog = state.types()
+            let base_type = state.result_type(checked_base)
+            match checked_body_nullable_payload(catalog, base_type, types.nil_type) {
+              None -> CheckedBodyExprRejected(
+                state,
+                CheckedBodyProducerOptionalBaseRequired(base_type)
+              )
+              Some(payload_type) -> match source_range(source, field_start, field_length) {
+                nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+                field_range: CheckedSourceRange -> match source.span(
+                  field_range.start,
+                  field_range.end
+                ) {
+                  None -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+                  Some(field_span) -> match field_span.text() {
+                    None -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+                    Some(field_name) -> checked_body_optional_field(
+                      state,
+                      types,
+                      checked_base,
+                      payload_type,
+                      field_name,
+                      field_range,
+                      atom,
+                      expectation
+                    )
+                  }
+                }
+              }
+            }
+          }
+        }
+        _ -> CheckedBodyExprRejected(state, CheckedBodyProducerMaybeEffectUnavailable)
+      }
+    }
+  }
+}
+
 fn checked_body_expr(
   state: owned CheckedBodyBuild,
   source: Source,
@@ -11636,6 +12012,19 @@ fn checked_body_expr(
       environment,
       operand,
       operator,
+      expectation
+    )
+    OptChain(base, field_start, field_length, _) -> checked_body_optional_chain(
+      state,
+      source,
+      types,
+      owner,
+      function_result,
+      loop_context,
+      environment,
+      base,
+      field_start,
+      field_length,
       expectation
     )
     IntLit(value, start, length) -> match source_range(source, start, length) {
