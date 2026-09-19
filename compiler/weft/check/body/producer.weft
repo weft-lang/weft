@@ -67,12 +67,17 @@ use compiler/ir/data.{
   ParamListCons,
   ParamListNil,
   Pattern,
+  PatternField,
+  PatternFieldList,
+  PatternFieldListCons,
+  PatternFieldListNil,
   PatternList,
   PatternListCons,
   PatternListNil,
   PrimitiveTypeExpr,
   QualifiedEffectTypeExpr,
   ResolvedEffectAccessFact,
+  RecordPattern,
   Resume,
   Return,
   ReturnNoValue,
@@ -87,6 +92,7 @@ use compiler/ir/data.{
   TuplePattern,
   UnqualifiedEffectTypeExpr,
   UnknownFieldAccessFact,
+  UnknownPatternField,
   UnknownHandlerClause,
   UnknownHandlerClauseContinuation,
   UnknownHandlerClauseName,
@@ -169,6 +175,7 @@ use compiler/types/graph/layout.{
   SemanticRecordFieldProjected,
   SemanticRecordFieldProjectionUnavailable,
   semantic_record_field_projection,
+  semantic_closed_structural_record,
   semantic_tuple_pattern_arity,
   semantic_tuple_pattern_element
 }
@@ -280,6 +287,8 @@ use compiler/weft/check/body/pattern.{
   CheckedMatchArmListBuilder,
   CheckedNumericPattern,
   CheckedPatternId,
+  CheckedPatternFieldListBuilder,
+  CheckedPatternFieldListId,
   CheckedPatternListId,
   CheckedPatternListBuilder,
   CheckedPatternGraphBuilder,
@@ -382,6 +391,8 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerUnsupportedPattern,
   CheckedBodyProducerTuplePatternRequired(SemanticTypeId),
   CheckedBodyProducerTuplePatternArityMismatch(usize, usize),
+  CheckedBodyProducerRecordPatternRequired(SemanticTypeId),
+  CheckedBodyProducerDuplicateRecordPatternField(CheckedSourceRange),
   CheckedBodyProducerUnsupportedParameter,
   CheckedBodyProducerTypeMismatch(SemanticTypeId, SemanticTypeId),
   CheckedBodyProducerUnsupportedExpression,
@@ -717,6 +728,18 @@ type CheckedTuplePatternItemsBuild {
     CheckedSourceRange
   ),
   CheckedTuplePatternItemsRejected(owned CheckedBodyBuild, CheckedBodyProducerIssue)
+}
+
+type CheckedRecordPatternItemsBuild {
+  CheckedRecordPatternItemsBuilt(
+    owned CheckedBodyBuild,
+    List<str>,
+    List<usize>,
+    CheckedLexicalEnvironment,
+    bool,
+    CheckedSourceRange
+  ),
+  CheckedRecordPatternItemsRejected(owned CheckedBodyBuild, CheckedBodyProducerIssue)
 }
 
 type CheckedBodyArmsBuild {
@@ -1730,6 +1753,46 @@ fn checked_body_type_arguments_into(
   }
 }
 
+fn checked_body_record_fields_into(
+  patterns: owned CheckedPatternGraphBuilder,
+  segment: CheckedExprSegmentId,
+  catalog: borrow SemanticTypeCatalog,
+  input_type: SemanticTypeId,
+  names: List<str>,
+  ordinals: List<usize>,
+  list: CheckedPatternFieldListBuilder
+) -> (owned CheckedPatternGraphBuilder, CheckedPatternFieldListBuilder) {
+  match (names, ordinals) {
+    (Nil, Nil) -> (patterns, list)
+    (Cons(name, remaining_names), Cons(ordinal, remaining_ordinals)) ->
+      match
+      semantic_record_field_projection(catalog, input_type, name) {
+        SemanticRecordFieldProjected(stable_key, word_offset, value_type) -> {
+          let child = checked_pattern_id_from_ordinal(segment, ordinal)
+          match patterns.structural_pattern_field(
+            list,
+            stable_key,
+            child,
+            word_offset,
+            value_type
+          ) {
+            (patterns, list) -> checked_body_record_fields_into(
+              patterns,
+              segment,
+              catalog,
+              input_type,
+              remaining_names,
+              remaining_ordinals,
+              list
+            )
+          }
+        }
+        _ -> panic("Resolved record pattern field disappeared before freeze")
+      }
+    _ -> panic("Record pattern field preparation lost its ordinal")
+  }
+}
+
 impl CheckedBodyBuild {
   fn segment(self: borrow Self) -> CheckedExprSegmentId {
     match self {
@@ -2253,6 +2316,48 @@ impl CheckedBodyBuild {
       CheckedBodyBuild(storage) -> {
         let { signatures, expressions, patterns, closures, effects, propagation } = storage
         match patterns.tuple(items, input_type, range) {
+          (patterns, id) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            id
+          )
+        }
+      }
+    }
+  }
+
+  fn record_pattern(
+    self: owned Self,
+    input_type: SemanticTypeId,
+    names: List<str>,
+    ordinals: List<usize>,
+    range: CheckedSourceRange
+  ) -> (owned CheckedBodyBuild, CheckedPatternId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let catalog = expressions.types()
+        let segment = expressions.segment()
+        let (patterns, list) = patterns.pattern_field_list()
+        let (patterns, list) = checked_body_record_fields_into(
+          patterns,
+          segment,
+          catalog,
+          input_type,
+          names,
+          ordinals,
+          list
+        )
+        let (patterns, fields) = patterns.pattern_field_list_finish(list)
+        match patterns.record(fields, input_type, range) {
           (patterns, id) -> (
             CheckedBodyBuild(
               CheckedBodyBuildStorage {
@@ -5133,6 +5238,184 @@ fn checked_body_tuple_pattern(
   }
 }
 
+fn checked_body_record_name_seen(names: List<str>, wanted: str) -> bool {
+  match names {
+    Nil -> false
+    Cons(name, rest) -> if name == wanted { true } else {
+      checked_body_record_name_seen(rest, wanted)
+    }
+  }
+}
+
+fn checked_body_record_pattern_items(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
+  input_type: SemanticTypeId,
+  authored: PatternFieldList,
+  names: List<str>,
+  ordinals: List<usize>,
+  complete: bool,
+  range: CheckedSourceRange
+) -[SemanticConformance]> CheckedRecordPatternItemsBuild {
+  match authored {
+    PatternFieldListNil -> CheckedRecordPatternItemsBuilt(
+      state,
+      names,
+      ordinals,
+      environment,
+      complete,
+      range
+    )
+    PatternFieldListCons(field, rest) -> match field {
+      PatternField(start, length, child, _) -> match source_range(source, start, length) {
+        field_range: CheckedSourceRange -> match source.span(
+          field_range.start,
+          field_range.end
+        ) {
+          Some(field_span) -> match field_span.text() {
+            Some(name) -> if checked_body_record_name_seen(names, name) {
+              CheckedRecordPatternItemsRejected(
+                state,
+                CheckedBodyProducerDuplicateRecordPatternField(field_range)
+              )
+            } else {
+              let catalog = state.types()
+              match semantic_record_field_projection(catalog, input_type, name) {
+                SemanticRecordFieldProjected(_, _, element_type) -> match checked_body_pattern(
+                  state,
+                  source,
+                  types,
+                  owner,
+                  environment,
+                  element_type,
+                  child
+                ) {
+                  CheckedBodyPatternBuilt(
+                    state,
+                    checked_child,
+                    next_environment,
+                    coverage,
+                    child_range,
+                  ) -> {
+                    let next_catalog = state.types()
+                    let next_types = checked_body_types_with_catalog(types, next_catalog)
+                    match covering_range(field_range, child_range) {
+                      selected_range: CheckedSourceRange -> match covering_range(
+                        range,
+                        selected_range
+                      ) {
+                        next_range: CheckedSourceRange -> checked_body_record_pattern_items(
+                          state,
+                          source,
+                          next_types,
+                          owner,
+                          next_environment,
+                          input_type,
+                          rest,
+                          names.append(name),
+                          ordinals.append(checked_pattern_id_ordinal(checked_child)),
+                          complete and checked_pattern_coverage_complete(coverage),
+                          next_range
+                        )
+                        nil -> CheckedRecordPatternItemsRejected(
+                          state,
+                          CheckedBodyProducerInvalidRange
+                        )
+                      }
+                      nil -> CheckedRecordPatternItemsRejected(
+                        state,
+                        CheckedBodyProducerInvalidRange
+                      )
+                    }
+                  }
+                  CheckedBodyPatternRejected(state, issue) -> CheckedRecordPatternItemsRejected(
+                    state,
+                    issue
+                  )
+                }
+                SemanticRecordFieldMissing -> CheckedRecordPatternItemsRejected(
+                  state,
+                  CheckedBodyProducerUnknownField(field_range)
+                )
+                SemanticRecordFieldProjectionUnavailable -> CheckedRecordPatternItemsRejected(
+                  state,
+                  CheckedBodyProducerRecordPatternRequired(input_type)
+                )
+              }
+            }
+            None -> CheckedRecordPatternItemsRejected(
+              state,
+              CheckedBodyProducerInvalidRange
+            )
+          }
+          None -> CheckedRecordPatternItemsRejected(
+            state,
+            CheckedBodyProducerInvalidRange
+          )
+        }
+        nil -> CheckedRecordPatternItemsRejected(
+          state,
+          CheckedBodyProducerInvalidRange
+        )
+      }
+      UnknownPatternField(_) -> CheckedRecordPatternItemsRejected(
+        state,
+        CheckedBodyProducerUnsupportedPattern
+      )
+    }
+  }
+}
+
+fn checked_body_record_pattern(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
+  input_type: SemanticTypeId,
+  authored: PatternFieldList
+) -[SemanticConformance]> CheckedBodyPatternBuild {
+  let catalog = state.types()
+  if not semantic_closed_structural_record(catalog, input_type) {
+    CheckedBodyPatternRejected(
+      state,
+      CheckedBodyProducerRecordPatternRequired(input_type)
+    )
+  } else {
+    match checked_body_record_pattern_items(
+      state,
+      source,
+      types,
+      owner,
+      environment,
+      input_type,
+      authored,
+      Nil<str>(),
+      Nil<usize>(),
+      true,
+      CheckedSourceRange { start: 0, end: 0 }
+    ) {
+      CheckedRecordPatternItemsRejected(state, issue) -> CheckedBodyPatternRejected(
+        state,
+        issue
+      )
+      CheckedRecordPatternItemsBuilt(state, names, ordinals, next_environment, complete, range) ->
+        match state.record_pattern(input_type, names, ordinals, range) {
+          (state, pattern) -> CheckedBodyPatternBuilt(
+            state,
+            pattern,
+            next_environment,
+            if complete { CheckedPatternComplete } else { CheckedPatternOpen },
+            range
+          )
+        }
+    }
+  }
+}
+
 fn checked_body_pattern(
   state: owned CheckedBodyBuild,
   source: Source,
@@ -5276,6 +5559,15 @@ fn checked_body_pattern(
       environment,
       input_type,
       items
+    )
+    RecordPattern(fields) -> checked_body_record_pattern(
+      state,
+      source,
+      types,
+      owner,
+      environment,
+      input_type,
+      fields
     )
     _ -> CheckedBodyPatternRejected(state, CheckedBodyProducerUnsupportedPattern)
   }
