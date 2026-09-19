@@ -175,6 +175,13 @@ use compiler/types/graph/catalog.{
   SemanticTypeCatalog,
   semantic_type_catalog_with_graph
 }
+use compiler/types/graph/declarations.{
+  SemanticUnparameterizedVariantAmbiguous,
+  SemanticUnparameterizedVariantMissing,
+  SemanticUnparameterizedVariantSelected,
+  semantic_type_declared_unparameterized_variant_constructor,
+  semantic_type_declared_variant_payload_type
+}
 use compiler/types/graph/conformance.{SemanticConformance}
 use compiler/types/graph/equality.{semantic_type_catalog_equal}
 use compiler/types/graph/layout.{
@@ -559,6 +566,11 @@ type CheckedBodyParametersBuild {
 type CheckedBodyArgumentsBuild {
   CheckedBodyArgumentsBuilt(owned CheckedBodyBuild, CheckedExprListId, CheckedSourceRange),
   CheckedBodyArgumentsRejected(owned CheckedBodyBuild, CheckedBodyProducerIssue)
+}
+
+type CheckedConstructorPayloadSource {
+  CheckedAppliedConstructor(usize),
+  CheckedDeclaredConstructor(usize, usize)
 }
 
 type CheckedBodyArrayElementsBuild {
@@ -8768,7 +8780,7 @@ fn checked_body_constructor_arguments(
   loop_context: CheckedLoopContext,
   environment: CheckedLexicalEnvironment,
   result_type: SemanticTypeId,
-  case_index: usize,
+  payload_source: CheckedConstructorPayloadSource,
   arguments: ExprList,
   index: usize,
   values: List<CheckedExprId>,
@@ -8781,13 +8793,26 @@ fn checked_body_constructor_arguments(
     ExprListCons(argument, rest) -> {
       let catalog = state.types()
       let applications = types.variant_applications
-      match semantic_variant_payload_type(
-        applications,
-        catalog,
-        result_type,
-        case_index,
-        index
-      ) {
+      let payload_type = match payload_source {
+        CheckedAppliedConstructor(case_index) -> semantic_variant_payload_type(
+          applications,
+          catalog,
+          result_type,
+          case_index,
+          index
+        )
+        CheckedDeclaredConstructor(layout_index, case_index) -> {
+          let resolution = types.resolution
+          let declarations = resolution.declarations()
+          semantic_type_declared_variant_payload_type(
+            declarations,
+            layout_index,
+            case_index,
+            index
+          )
+        }
+      }
+      match payload_type {
         None -> CheckedBodyArgumentsRejected(
           state,
           CheckedBodyProducerVariantPatternRequired(result_type)
@@ -8815,7 +8840,7 @@ fn checked_body_constructor_arguments(
               loop_context,
               environment,
               result_type,
-              case_index,
+              payload_source,
               rest,
               index + 1,
               values.prepend(value),
@@ -8823,6 +8848,56 @@ fn checked_body_constructor_arguments(
             )
           }
         }
+      }
+    }
+  }
+}
+
+fn checked_body_constructor_finish(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  declaration: DeclarationIdentity,
+  result_type: SemanticTypeId,
+  payload_count: usize,
+  payload_source: CheckedConstructorPayloadSource,
+  name_range: CheckedSourceRange,
+  arguments: ExprList
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  let provided = __i64_to_usize(expr_list_len(arguments))
+  if provided != payload_count {
+    CheckedBodyExprRejected(
+      state,
+      CheckedBodyProducerConstructorArityMismatch(payload_count, provided)
+    )
+  } else {
+    match checked_body_constructor_arguments(
+      state,
+      source,
+      types,
+      owner,
+      function_result,
+      loop_context,
+      environment,
+      result_type,
+      payload_source,
+      arguments,
+      0,
+      Nil<CheckedExprId>(),
+      name_range
+    ) {
+      CheckedBodyArgumentsRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+      CheckedBodyArgumentsBuilt(state, checked_arguments, range) -> match state.constructor_call(
+        declaration,
+        checked_arguments,
+        result_type,
+        range
+      ) {
+        (state, expression) -> CheckedBodyExprBuilt(state, expression)
       }
     }
   }
@@ -8855,10 +8930,39 @@ fn checked_body_constructor_call(
       Some(visible) -> {
         let applications = types.variant_applications
         match semantic_variant_constructor_result(applications, visible.identity) {
-          SemanticVariantConstructorResultMissing -> CheckedBodyExprRejected(
-            state,
-            CheckedBodyProducerConstructorResultRequired(name_range)
-          )
+          SemanticVariantConstructorResultMissing -> {
+            let catalog = state.types()
+            let resolution = types.resolution
+            let declarations = resolution.declarations()
+            match semantic_type_declared_unparameterized_variant_constructor(
+              catalog,
+              declarations,
+              visible.identity
+            ) {
+              SemanticUnparameterizedVariantMissing -> CheckedBodyExprRejected(
+                state,
+                CheckedBodyProducerConstructorResultRequired(name_range)
+              )
+              SemanticUnparameterizedVariantAmbiguous -> CheckedBodyExprRejected(
+                state,
+                CheckedBodyProducerConstructorResultAmbiguous(name_range)
+              )
+              SemanticUnparameterizedVariantSelected(result_type, _, _, _) ->
+                checked_body_constructor_call(
+                  state,
+                  source,
+                  types,
+                  owner,
+                  function_result,
+                  loop_context,
+                  environment,
+                  name,
+                  name_range,
+                  arguments,
+                  CheckedRequireResult(result_type)
+                )
+            }
+          }
           SemanticVariantConstructorResultAmbiguous -> CheckedBodyExprRejected(
             state,
             CheckedBodyProducerConstructorResultAmbiguous(name_range)
@@ -8882,39 +8986,61 @@ fn checked_body_constructor_call(
     }
     CheckedRequireResult(result_type) -> match name.text() {
       None -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
-      Some(spelling) -> {
-        let catalog = state.types()
-        let applications = types.variant_applications
-        match semantic_variant_case_projection(
-          applications,
-          catalog,
-          result_type,
-          spelling
-        ) {
-          SemanticVariantCaseProjected(declaration, case_index, payload_count) -> {
-            match registration_scope_lookup_declaration_span(
-              lexical_scope(environment),
-              lexical_module(environment),
-              ConstructorDeclaration,
-              name
-            ) {
-              Some(visible) -> if not declaration_identity_eq(
-                visible.identity,
-                declaration
-              ) {
-                CheckedBodyExprRejected(
+      Some(spelling) -> match registration_scope_lookup_declaration_span(
+        lexical_scope(environment),
+        lexical_module(environment),
+        ConstructorDeclaration,
+        name
+      ) {
+        None -> CheckedBodyExprRejected(
+          state,
+          CheckedBodyProducerUnknownConstructor(name_range)
+        )
+        Some(visible) -> {
+          let catalog = state.types()
+          let applications = types.variant_applications
+          match semantic_variant_case_projection(
+            applications,
+            catalog,
+            result_type,
+            spelling
+          ) {
+            SemanticVariantCaseProjected(declaration, case_index, payload_count) ->
+              if
+              declaration_identity_eq(visible.identity, declaration) {
+                checked_body_constructor_finish(
                   state,
-                  CheckedBodyProducerUnknownConstructor(name_range)
+                  source,
+                  types,
+                  owner,
+                  function_result,
+                  loop_context,
+                  environment,
+                  declaration,
+                  result_type,
+                  payload_count,
+                  CheckedAppliedConstructor(case_index),
+                  name_range,
+                  arguments
                 )
               } else {
-                let provided = __i64_to_usize(expr_list_len(arguments))
-                if provided != payload_count {
-                  CheckedBodyExprRejected(
-                    state,
-                    CheckedBodyProducerConstructorArityMismatch(payload_count, provided)
-                  )
-                } else {
-                  match checked_body_constructor_arguments(
+                CheckedBodyExprRejected(state, CheckedBodyProducerUnknownConstructor(name_range))
+              }
+            _ -> {
+              let resolution = types.resolution
+              let declarations = resolution.declarations()
+              match semantic_type_declared_unparameterized_variant_constructor(
+                catalog,
+                declarations,
+                visible.identity
+              ) {
+                SemanticUnparameterizedVariantSelected(
+                  target,
+                  layout_index,
+                  case_index,
+                  payload_count,
+                ) -> if semantic_type_catalog_equal(catalog, target, result_type) {
+                  checked_body_constructor_finish(
                     state,
                     source,
                     types,
@@ -8922,39 +9048,26 @@ fn checked_body_constructor_call(
                     function_result,
                     loop_context,
                     environment,
+                    visible.identity,
                     result_type,
-                    case_index,
-                    arguments,
-                    0,
-                    Nil<CheckedExprId>(),
-                    name_range
-                  ) {
-                    CheckedBodyArgumentsRejected(state, issue) -> CheckedBodyExprRejected(
-                      state,
-                      issue
-                    )
-                    CheckedBodyArgumentsBuilt(state, checked_arguments, range) ->
-                      match state.constructor_call(
-                        declaration,
-                        checked_arguments,
-                        result_type,
-                        range
-                      ) {
-                        (state, expression) -> CheckedBodyExprBuilt(state, expression)
-                      }
-                  }
+                    payload_count,
+                    CheckedDeclaredConstructor(layout_index, case_index),
+                    name_range,
+                    arguments
+                  )
+                } else {
+                  CheckedBodyExprRejected(
+                    state,
+                    CheckedBodyProducerUnknownConstructor(name_range)
+                  )
                 }
+                _ -> CheckedBodyExprRejected(
+                  state,
+                  CheckedBodyProducerUnknownConstructor(name_range)
+                )
               }
-              None -> CheckedBodyExprRejected(
-                state,
-                CheckedBodyProducerUnknownConstructor(name_range)
-              )
             }
           }
-          _ -> CheckedBodyExprRejected(
-            state,
-            CheckedBodyProducerUnknownConstructor(name_range)
-          )
         }
       }
     }
