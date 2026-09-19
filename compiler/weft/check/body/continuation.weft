@@ -1,0 +1,1062 @@
+-- One-shot continuation use over immutable checked expressions.
+--
+-- The analysis is binding-based: deferred continuations and every local alias
+-- are exact CheckedBindingIds, while immediate `resume` is scoped by handler
+-- clause boundaries. Branches join by maximum use, sequential expressions add
+-- uses, and any use in a repeated loop is conservatively more than once.
+
+use compiler/weft/check/body/closure.{CheckedClosureGraph}
+use compiler/weft/check/body/effects.{*}
+use compiler/weft/check/body/graph.{*}
+use compiler/weft/check/body/pattern.{CheckedGuarded, CheckedPatternGraph, CheckedUnguarded}
+use compiler/weft/check/body/propagation.{
+  CheckedFailurePropagationDetail,
+  CheckedOptionalProjectionDetail,
+  CheckedPropagationGraph
+}
+use stdlib/list.{Cons, List, Nil}
+
+pub(package) type CheckedContinuationIssue {
+  CheckedContinuationUsedMoreThanOnce,
+  CheckedContinuationCaptured
+}
+
+type CheckedContinuationTarget {
+  CheckedImmediateContinuation,
+  CheckedDeferredContinuation(CheckedBindingId, List<CheckedBindingId>)
+}
+
+type CheckedContinuationReference {
+  CheckedContinuationReferenceMissing,
+  CheckedContinuationReferenceActive,
+  CheckedContinuationReferenceRetired
+}
+
+type CheckedContinuationSummary {
+  uses: usize,
+  captured: bool
+}
+
+fn empty_summary() -> CheckedContinuationSummary {
+  CheckedContinuationSummary { uses: 0, captured: false }
+}
+
+fn repeated_summary(summary: CheckedContinuationSummary) -> CheckedContinuationSummary {
+  if summary.uses == 0 { summary }
+  else { CheckedContinuationSummary { uses: 2, captured: summary.captured } }
+}
+
+fn continuation_use_sum(left: usize, right: usize) -> usize {
+  let repeated: usize = 2
+  if left >= repeated or right >= repeated or (left == 1 and right == 1) {
+    repeated
+  }
+  else { left + right }
+}
+
+fn sequence_summary(
+  left: CheckedContinuationSummary,
+  right: CheckedContinuationSummary
+) -> CheckedContinuationSummary {
+  CheckedContinuationSummary {
+    uses: continuation_use_sum(left.uses, right.uses),
+    captured: left.captured or right.captured
+  }
+}
+
+fn branch_summary(
+  left: CheckedContinuationSummary,
+  right: CheckedContinuationSummary
+) -> CheckedContinuationSummary {
+  CheckedContinuationSummary {
+    uses: if left.uses > right.uses { left.uses } else { right.uses },
+    captured: left.captured or right.captured
+  }
+}
+
+fn retired_contains(
+  retired: List<CheckedBindingId>,
+  wanted: CheckedBindingId
+) -> bool {
+  match retired {
+    Nil -> false
+    Cons(binding, rest) -> checked_binding_id_eq(binding, wanted) or
+      retired_contains(rest, wanted)
+  }
+}
+
+fn continuation_reference(
+  target: CheckedContinuationTarget,
+  binding: CheckedBindingId
+) -> CheckedContinuationReference {
+  match target {
+    CheckedImmediateContinuation -> CheckedContinuationReferenceMissing
+    CheckedDeferredContinuation(active, retired) -> if checked_binding_id_eq(
+      active,
+      binding
+    ) { CheckedContinuationReferenceActive }
+    else {
+      if retired_contains(retired, binding) { CheckedContinuationReferenceRetired }
+      else { CheckedContinuationReferenceMissing }
+    }
+  }
+}
+
+fn continuation_alias(
+  target: CheckedContinuationTarget,
+  binding: CheckedBindingId
+) -> CheckedContinuationTarget {
+  match target {
+    CheckedImmediateContinuation -> CheckedImmediateContinuation
+    CheckedDeferredContinuation(active, retired) -> CheckedDeferredContinuation(
+      binding,
+      retired.prepend(active)
+    )
+  }
+}
+
+fn direct_reference(
+  expressions: borrow CheckedExprGraph,
+  expression: CheckedExprId,
+  target: CheckedContinuationTarget
+) -> CheckedContinuationReference {
+  let value = expressions.inspect(expression)
+  match value.node {
+    CheckedLocalReferenceNode(binding) -> continuation_reference(target, binding)
+    _ -> CheckedContinuationReferenceMissing
+  }
+}
+
+fn reference_summary(reference: CheckedContinuationReference) -> CheckedContinuationSummary {
+  match reference {
+    CheckedContinuationReferenceMissing -> empty_summary()
+    CheckedContinuationReferenceActive -> CheckedContinuationSummary {
+      uses: 1,
+      captured: false
+    }
+    CheckedContinuationReferenceRetired -> CheckedContinuationSummary {
+      uses: 2,
+      captured: false
+    }
+  }
+}
+
+fn expression_list_summary(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  values: CheckedExprListId,
+  target: CheckedContinuationTarget
+) -> CheckedContinuationSummary {
+  let mut summary = empty_summary()
+  let mut index: usize = 0
+  while index < expressions.expression_list_len(values) {
+    summary = sequence_summary(
+      summary,
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        expressions.expression_list_at(values, index),
+        target
+      )
+    )
+    index = index + 1
+  }
+  summary
+}
+
+fn record_field_list_summary(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  fields: CheckedRecordFieldListId,
+  target: CheckedContinuationTarget
+) -> CheckedContinuationSummary {
+  let mut summary = empty_summary()
+  let mut index: usize = 0
+  while index < expressions.record_field_list_len(fields) {
+    let field = expressions.record_field_list_at(fields, index)
+    summary = sequence_summary(
+      summary,
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        field.value,
+        target
+      )
+    )
+    index = index + 1
+  }
+  summary
+}
+
+fn match_summary(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  scrutinee: CheckedExprId,
+  arms: CheckedMatchArmListId,
+  target: CheckedContinuationTarget
+) -> CheckedContinuationSummary {
+  let scrutinee_summary = expression_summary(
+    expressions,
+    patterns,
+    closures,
+    effects,
+    propagation,
+    scrutinee,
+    target
+  )
+  let mut arms_summary = empty_summary()
+  let mut index: usize = 0
+  while index < patterns.match_arm_list_len(arms) {
+    let arm = patterns.match_arm_list_at(arms, index)
+    let guard_summary = match arm.guard {
+      CheckedUnguarded -> empty_summary()
+      CheckedGuarded(guard) -> expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        guard,
+        target
+      )
+    }
+    let arm_summary = sequence_summary(
+      guard_summary,
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        arm.body,
+        target
+      )
+    )
+    arms_summary = branch_summary(arms_summary, arm_summary)
+    index = index + 1
+  }
+  sequence_summary(scrutinee_summary, arms_summary)
+}
+
+fn closure_summary(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  lambda: CheckedLambdaId,
+  target: CheckedContinuationTarget
+) -> CheckedContinuationSummary {
+  match target {
+    CheckedImmediateContinuation -> {
+      let nested = expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        closures.inspect(lambda).body,
+        target
+      )
+      CheckedContinuationSummary {
+        uses: 0,
+        captured: nested.uses > 0 or nested.captured
+      }
+    }
+    CheckedDeferredContinuation(active, retired) -> {
+      let closure = closures.inspect(lambda)
+      let mut index: usize = 0
+      let mut captured = false
+      while index < closures.binding_list_len(closure.captures) {
+        let binding = closures.binding_list_at(closure.captures, index)
+        if checked_binding_id_eq(binding, active) or retired_contains(
+          retired,
+          binding
+        ) { captured = true }
+        else { nil }
+        index = index + 1
+      }
+      CheckedContinuationSummary { uses: 0, captured: captured }
+    }
+  }
+}
+
+fn effect_summary(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  detail: CheckedEffectExprId,
+  target: CheckedContinuationTarget
+) -> CheckedContinuationSummary {
+  match effects.inspect(detail) {
+    CheckedPerformDetail(value) -> expression_list_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      value.arguments,
+      target
+    )
+    CheckedHandlerInstallDetail(value) -> sequence_summary(
+      expression_list_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        value.arguments,
+        target
+      ),
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        value.body,
+        target
+      )
+    )
+    CheckedHandleDetail(value) -> {
+      let mut summary = expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        value.body,
+        target
+      )
+      summary = sequence_summary(
+        summary,
+        match value.return_clause {
+          CheckedNoHandleReturn -> empty_summary()
+          CheckedHandleReturnClause(_, body) -> expression_summary(
+            expressions,
+            patterns,
+            closures,
+            effects,
+            propagation,
+            body,
+            target
+          )
+        }
+      )
+      match target {
+        CheckedImmediateContinuation -> summary
+        CheckedDeferredContinuation(_, _) -> {
+          let mut index: usize = 0
+          while index < effects.clause_list_len(value.clauses) {
+            let clause = effects.clause_list_at(value.clauses, index)
+            summary = sequence_summary(
+              summary,
+              expression_summary(
+                expressions,
+                patterns,
+                closures,
+                effects,
+                propagation,
+                clause.body,
+                target
+              )
+            )
+            index = index + 1
+          }
+          summary
+        }
+      }
+    }
+  }
+}
+
+fn propagation_summary(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  detail: CheckedPropagationExprId,
+  target: CheckedContinuationTarget
+) -> CheckedContinuationSummary {
+  match propagation.inspect(detail) {
+    CheckedFailurePropagationDetail(value) -> expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      value.value,
+      target
+    )
+    CheckedOptionalProjectionDetail(value) -> expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      value.base,
+      target
+    )
+  }
+}
+
+fn expression_summary(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  expression: CheckedExprId,
+  target: CheckedContinuationTarget
+) -> CheckedContinuationSummary {
+  let value = expressions.inspect(expression)
+  match value.node {
+    CheckedLocalReferenceNode(binding) -> reference_summary(
+      continuation_reference(target, binding)
+    )
+    CheckedNotNode(child) -> expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      child,
+      target
+    )
+    CheckedNegateNode(child) -> expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      child,
+      target
+    )
+    CheckedBinaryNode(_, left, right) -> sequence_summary(
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        left,
+        target
+      ),
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        right,
+        target
+      )
+    )
+    CheckedIfNode(condition, when_true, when_false) -> sequence_summary(
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        condition,
+        target
+      ),
+      branch_summary(
+        expression_summary(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          when_true,
+          target
+        ),
+        expression_summary(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          when_false,
+          target
+        )
+      )
+    )
+    CheckedBlockNode(first, rest) -> sequence_summary(
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        first,
+        target
+      ),
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        rest,
+        target
+      )
+    )
+    CheckedLetNode(binding, initializer, body) -> match direct_reference(
+      expressions,
+      initializer,
+      target
+    ) {
+      CheckedContinuationReferenceActive -> expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        body,
+        continuation_alias(target, binding)
+      )
+      CheckedContinuationReferenceRetired -> CheckedContinuationSummary {
+        uses: 2,
+        captured: false
+      }
+      CheckedContinuationReferenceMissing -> sequence_summary(
+        expression_summary(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          initializer,
+          target
+        ),
+        expression_summary(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          body,
+          target
+        )
+      )
+    }
+    CheckedLetMutNode(_, initializer, body) -> sequence_summary(
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        initializer,
+        target
+      ),
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        body,
+        target
+      )
+    )
+    CheckedAssignNode(_, assigned) -> expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      assigned,
+      target
+    )
+    CheckedWhileNode(condition, body) -> repeated_summary(
+      sequence_summary(
+        expression_summary(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          condition,
+          target
+        ),
+        expression_summary(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          body,
+          target
+        )
+      )
+    )
+    CheckedLoopNode(body) -> repeated_summary(
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        body,
+        target
+      )
+    )
+    CheckedBreakNode(child) -> expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      child,
+      target
+    )
+    CheckedReturnNode(child) -> expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      child,
+      target
+    )
+    CheckedDeferNode(cleanup, body, _) -> sequence_summary(
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        body,
+        target
+      ),
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        cleanup,
+        target
+      )
+    )
+    CheckedDirectCallNode(_, arguments) -> expression_list_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      arguments,
+      target
+    )
+    CheckedConstructorCallNode(_, arguments) -> expression_list_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      arguments,
+      target
+    )
+    CheckedApplyNode(callee, arguments, _, _) -> sequence_summary(
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        callee,
+        target
+      ),
+      expression_list_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        arguments,
+        target
+      )
+    )
+    CheckedGenericCallNode(callee, _) -> expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      callee,
+      target
+    )
+    CheckedMethodCallNode(_, receiver, arguments) -> sequence_summary(
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        receiver,
+        target
+      ),
+      expression_list_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        arguments,
+        target
+      )
+    )
+    CheckedAddressOfNode(_, child) -> expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      child,
+      target
+    )
+    CheckedDerefNode(child) -> expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      child,
+      target
+    )
+    CheckedPointerAssignNode(pointer, assigned) -> sequence_summary(
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        pointer,
+        target
+      ),
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        assigned,
+        target
+      )
+    )
+    CheckedDeclaredFieldAccessNode(base, _, _) -> expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      base,
+      target
+    )
+    CheckedStructuralFieldAccessNode(base, _, _) -> expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      base,
+      target
+    )
+    CheckedIndexedLengthNode(base, _, _) -> expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      base,
+      target
+    )
+    CheckedIndexedGetNode(base, index, _, _) -> sequence_summary(
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        base,
+        target
+      ),
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        index,
+        target
+      )
+    )
+    CheckedIndexedSetNode(base, index, assigned, _) -> sequence_summary(
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        base,
+        target
+      ),
+      sequence_summary(
+        expression_summary(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          index,
+          target
+        ),
+        expression_summary(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          assigned,
+          target
+        )
+      )
+    )
+    CheckedIndexedSliceNode(base, start, end, _) -> sequence_summary(
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        base,
+        target
+      ),
+      sequence_summary(
+        expression_summary(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          start,
+          target
+        ),
+        expression_summary(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          end,
+          target
+        )
+      )
+    )
+    CheckedRecordInitNode(_, fields) -> record_field_list_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      fields,
+      target
+    )
+    CheckedRecordUpdateNode(base, fields) -> sequence_summary(
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        base,
+        target
+      ),
+      record_field_list_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        fields,
+        target
+      )
+    )
+    CheckedArrayLiteralNode(elements, _) -> expression_list_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      elements,
+      target
+    )
+    CheckedLambdaNode(lambda) -> closure_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      lambda,
+      target
+    )
+    CheckedPerformNode(detail) -> effect_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      detail,
+      target
+    )
+    CheckedHandleNode(detail) -> effect_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      detail,
+      target
+    )
+    CheckedResumeNode(child) -> sequence_summary(
+      match target {
+        CheckedImmediateContinuation -> CheckedContinuationSummary {
+          uses: 1,
+          captured: false
+        }
+        CheckedDeferredContinuation(_, _) -> empty_summary()
+      },
+      expression_summary(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        child,
+        target
+      )
+    )
+    CheckedHandlerInstallNode(detail) -> effect_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      detail,
+      target
+    )
+    CheckedFailurePropagationNode(detail) -> propagation_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      detail,
+      target
+    )
+    CheckedOptionalProjectionNode(detail) -> propagation_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      detail,
+      target
+    )
+    CheckedMatchNode(_, scrutinee, arms) -> match_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      scrutinee,
+      arms,
+      target
+    )
+    CheckedBorrowNode(binding, _) -> reference_summary(
+      continuation_reference(target, binding)
+    )
+    CheckedIntegerNode(_) -> empty_summary()
+    CheckedBooleanNode(_) -> empty_summary()
+    CheckedNilNode -> empty_summary()
+    CheckedStringNode(_) -> empty_summary()
+    CheckedFloatNode(_) -> empty_summary()
+    CheckedDeclarationReferenceNode(_) -> empty_summary()
+    CheckedBreakNoValueNode -> empty_summary()
+    CheckedContinueNode -> empty_summary()
+    CheckedReturnNoValueNode -> empty_summary()
+  }
+}
+
+fn summary_issue(summary: CheckedContinuationSummary) -> CheckedContinuationIssue? {
+  if summary.captured { CheckedContinuationCaptured }
+  else {
+    if summary.uses > 1 {
+      CheckedContinuationUsedMoreThanOnce
+    } else { nil }
+  }
+}
+
+pub(package) fn checked_immediate_continuation_issue(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  body: CheckedExprId
+) -> CheckedContinuationIssue? {
+  summary_issue(
+    expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      body,
+      CheckedImmediateContinuation
+    )
+  )
+}
+
+pub(package) fn checked_deferred_continuation_issue(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  body: CheckedExprId,
+  binding: CheckedBindingId
+) -> CheckedContinuationIssue? {
+  summary_issue(
+    expression_summary(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      body,
+      CheckedDeferredContinuation(binding, Nil<CheckedBindingId>())
+    )
+  )
+}
