@@ -15,6 +15,7 @@ use compiler/ir/data.{
   BreakNoValue,
   Call,
   Continue,
+  CtorPattern,
   Defer,
   Expr,
   ExprList,
@@ -114,6 +115,7 @@ use compiler/ir/data.{
 use compiler/project/identity.{
   DeclarationIdentity,
   DeclaredFunctionIdentity,
+  ConstructorDeclaration,
   EffectDeclaration,
   FunctionIdentity,
   ModuleIdentity,
@@ -192,10 +194,17 @@ use compiler/weft/check/resolution/applications.{
   SemanticDeclaredFieldProjected,
   SemanticDeclaredFieldProjectionUnavailable,
   SemanticRecordApplicationCatalog,
+  SemanticVariantApplicationCatalog,
+  SemanticVariantCaseProjected,
+  SemanticVariantCaseMissing,
+  SemanticVariantApplicationUnavailable,
   semantic_declared_field_projection,
   semantic_effect_application_for_declaration,
   semantic_effect_application_parameter_type,
-  semantic_effect_operation_projection
+  semantic_effect_operation_projection,
+  semantic_variant_case_count,
+  semantic_variant_case_projection,
+  semantic_variant_payload_type
 }
 use compiler/weft/check/resolution/methods.{
   SemanticImplementationMethodSelected,
@@ -393,6 +402,9 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerTuplePatternArityMismatch(usize, usize),
   CheckedBodyProducerRecordPatternRequired(SemanticTypeId),
   CheckedBodyProducerDuplicateRecordPatternField(CheckedSourceRange),
+  CheckedBodyProducerVariantPatternRequired(SemanticTypeId),
+  CheckedBodyProducerUnknownConstructor(CheckedSourceRange),
+  CheckedBodyProducerConstructorPatternArityMismatch(usize, usize),
   CheckedBodyProducerUnsupportedParameter,
   CheckedBodyProducerTypeMismatch(SemanticTypeId, SemanticTypeId),
   CheckedBodyProducerUnsupportedExpression,
@@ -408,6 +420,7 @@ type CheckedBodyPrimitiveTypes {
   module: RegisteredModule,
   catalog: SemanticTypeCatalog,
   applications: SemanticRecordApplicationCatalog,
+  variant_applications: SemanticVariantApplicationCatalog,
   effect_applications: SemanticEffectApplicationCatalog,
   resolution: SemanticResolutionProduct,
   never_type: SemanticTypeId,
@@ -433,6 +446,7 @@ fn checked_body_types_with_catalog(
     module: types.module,
     catalog: catalog,
     applications: types.applications,
+    variant_applications: types.variant_applications,
     effect_applications: types.effect_applications,
     resolution: types.resolution,
     never_type: types.never_type,
@@ -705,6 +719,7 @@ type CheckedPatternCoverage {
   CheckedPatternBooleanTrue,
   CheckedPatternBooleanFalse,
   CheckedPatternBooleanComplete,
+  CheckedPatternVariantCases(List<DeclarationIdentity>, usize),
   CheckedPatternComplete
 }
 
@@ -728,6 +743,23 @@ type CheckedTuplePatternItemsBuild {
     CheckedSourceRange
   ),
   CheckedTuplePatternItemsRejected(owned CheckedBodyBuild, CheckedBodyProducerIssue)
+}
+
+type CheckedConstructorPatternItemsBuild {
+  CheckedConstructorPatternItemsBuilt(
+    owned CheckedBodyBuild,
+    List<usize>,
+    CheckedLexicalEnvironment,
+    bool,
+    CheckedSourceRange
+  ),
+  CheckedConstructorPatternItemsRejected(owned CheckedBodyBuild, CheckedBodyProducerIssue)
+}
+
+type CheckedConstructorReference {
+  CheckedConstructorResolved(CheckedSourceRange?),
+  CheckedConstructorMissing,
+  CheckedConstructorInvalidRange
 }
 
 type CheckedRecordPatternItemsBuild {
@@ -853,6 +885,7 @@ fn checked_body_primitive_types(
                       module: module,
                       catalog: semantic_type_product_catalog(product),
                       applications: resolution.applications(),
+                      variant_applications: resolution.variant_applications(),
                       effect_applications: resolution.effect_applications(),
                       resolution: resolution,
                       never_type: never_type,
@@ -2316,6 +2349,36 @@ impl CheckedBodyBuild {
       CheckedBodyBuild(storage) -> {
         let { signatures, expressions, patterns, closures, effects, propagation } = storage
         match patterns.tuple(items, input_type, range) {
+          (patterns, id) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            id
+          )
+        }
+      }
+    }
+  }
+
+  fn constructor_pattern(
+    self: owned Self,
+    declaration: DeclarationIdentity,
+    children: CheckedPatternListId,
+    qualifier: CheckedSourceRange?,
+    input_type: SemanticTypeId,
+    range: CheckedSourceRange
+  ) -> (owned CheckedBodyBuild, CheckedPatternId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match patterns.constructor(declaration, children, qualifier, input_type, range) {
           (patterns, id) -> (
             CheckedBodyBuild(
               CheckedBodyBuildStorage {
@@ -5055,6 +5118,31 @@ fn checked_body_binary(
   }
 }
 
+fn checked_variant_case_seen(
+  cases: List<DeclarationIdentity>,
+  wanted: DeclarationIdentity
+) -> bool {
+  match cases {
+    Nil -> false
+    Cons(declaration, rest) -> declaration_identity_eq(declaration, wanted) or
+      checked_variant_case_seen(rest, wanted)
+  }
+}
+
+fn checked_variant_cases_union(
+  cases: List<DeclarationIdentity>,
+  result: List<DeclarationIdentity>
+) -> List<DeclarationIdentity> {
+  match cases {
+    Nil -> result
+    Cons(declaration, rest) -> checked_variant_cases_union(
+      rest,
+      if checked_variant_case_seen(result, declaration) { result }
+    else { result.prepend(declaration) }
+    )
+  }
+}
+
 fn checked_pattern_coverage_add(
   accumulated: CheckedPatternCoverage,
   next: CheckedPatternCoverage
@@ -5072,6 +5160,12 @@ fn checked_pattern_coverage_add(
     (_, CheckedPatternBooleanTrue) -> CheckedPatternBooleanTrue
     (CheckedPatternBooleanFalse, _) -> CheckedPatternBooleanFalse
     (_, CheckedPatternBooleanFalse) -> CheckedPatternBooleanFalse
+    (CheckedPatternVariantCases(left, total), CheckedPatternVariantCases(right, other_total)) ->
+      if total == other_total {
+        CheckedPatternVariantCases(checked_variant_cases_union(right, left), total)
+      } else { CheckedPatternOpen }
+    (CheckedPatternVariantCases(cases, total), _) -> CheckedPatternVariantCases(cases, total)
+    (_, CheckedPatternVariantCases(cases, total)) -> CheckedPatternVariantCases(cases, total)
     _ -> CheckedPatternOpen
   }
 }
@@ -5080,6 +5174,7 @@ fn checked_pattern_coverage_complete(coverage: CheckedPatternCoverage) -> bool {
   match coverage {
     CheckedPatternComplete -> true
     CheckedPatternBooleanComplete -> true
+    CheckedPatternVariantCases(cases, total) -> cases.len() == total
     _ -> false
   }
 }
@@ -5089,6 +5184,282 @@ fn checked_match_origin(origin: MatchOrigin) -> CheckedMatchOrigin {
     ExplicitMatch -> CheckedExplicitMatch
     LetDestructuring -> CheckedLetDestructuring
     ForDestructuring -> CheckedForDestructuring
+  }
+}
+
+fn checked_body_constructor_reference(
+  source: Source,
+  environment: CheckedLexicalEnvironment,
+  declaration: DeclarationIdentity,
+  name_range: CheckedSourceRange,
+  authored_qualifier: TypeNameRange?
+) -> CheckedConstructorReference {
+  match source.span(name_range.start, name_range.end) {
+    None -> CheckedConstructorInvalidRange
+    Some(name) -> match authored_qualifier {
+      nil -> match registration_scope_lookup_declaration_span(
+        lexical_scope(environment),
+        lexical_module(environment),
+        ConstructorDeclaration,
+        name
+      ) {
+        Some(registered) -> if declaration_identity_eq(registered.identity, declaration) {
+          CheckedConstructorResolved(nil)
+        } else { CheckedConstructorMissing }
+        None -> CheckedConstructorMissing
+      }
+      qualifier: TypeNameRange -> match source_range(
+        source,
+        qualifier.start,
+        qualifier.length
+      ) {
+        nil -> CheckedConstructorInvalidRange
+        qualifier_range: CheckedSourceRange -> match source.span(
+          qualifier_range.start,
+          qualifier_range.end
+        ) {
+          None -> CheckedConstructorInvalidRange
+          Some(qualifier_span) -> match registration_scope_lookup_qualified_declaration_span(
+            lexical_scope(environment),
+            lexical_module(environment),
+            qualifier_span,
+            ConstructorDeclaration,
+            name
+          ) {
+            Some(registered) -> if declaration_identity_eq(
+              registered.identity,
+              declaration
+            ) { CheckedConstructorResolved(qualifier_range) }
+            else { CheckedConstructorMissing }
+            None -> CheckedConstructorMissing
+          }
+        }
+      }
+    }
+  }
+}
+
+fn checked_body_constructor_pattern_items(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
+  input_type: SemanticTypeId,
+  case_index: usize,
+  authored: PatternList,
+  index: usize,
+  ordinals: List<usize>,
+  complete: bool,
+  range: CheckedSourceRange
+) -[SemanticConformance]> CheckedConstructorPatternItemsBuild {
+  match authored {
+    PatternListNil -> CheckedConstructorPatternItemsBuilt(
+      state,
+      ordinals,
+      environment,
+      complete,
+      range
+    )
+    PatternListCons(item, rest) -> {
+      let applications = types.variant_applications
+      let catalog = state.types()
+      match semantic_variant_payload_type(
+        applications,
+        catalog,
+        input_type,
+        case_index,
+        index
+      ) {
+        None -> CheckedConstructorPatternItemsRejected(
+          state,
+          CheckedBodyProducerVariantPatternRequired(input_type)
+        )
+        Some(payload_type) -> match checked_body_pattern(
+          state,
+          source,
+          types,
+          owner,
+          environment,
+          payload_type,
+          item
+        ) {
+          CheckedBodyPatternRejected(state, issue) -> CheckedConstructorPatternItemsRejected(
+            state,
+            issue
+          )
+          CheckedBodyPatternBuilt(state, child, next_environment, coverage, child_range) -> {
+            let next_types = checked_body_types_with_catalog(types, state.types())
+            match covering_range(range, child_range) {
+              nil -> CheckedConstructorPatternItemsRejected(
+                state,
+                CheckedBodyProducerInvalidRange
+              )
+              next_range: CheckedSourceRange -> checked_body_constructor_pattern_items(
+                state,
+                source,
+                next_types,
+                owner,
+                next_environment,
+                input_type,
+                case_index,
+                rest,
+                index + 1,
+                ordinals.append(checked_pattern_id_ordinal(child)),
+                complete and checked_pattern_coverage_complete(coverage),
+                next_range
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn checked_body_constructor_pattern(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
+  input_type: SemanticTypeId,
+  name_start: i64,
+  name_length: i64,
+  authored: PatternList,
+  authored_qualifier: TypeNameRange?
+) -[SemanticConformance]> CheckedBodyPatternBuild {
+  match source_range(source, name_start, name_length) {
+    nil -> CheckedBodyPatternRejected(state, CheckedBodyProducerInvalidRange)
+    name_range: CheckedSourceRange -> match source.span(name_range.start, name_range.end) {
+      None -> CheckedBodyPatternRejected(state, CheckedBodyProducerInvalidRange)
+      Some(name) -> match name.text() {
+        None -> CheckedBodyPatternRejected(state, CheckedBodyProducerInvalidRange)
+        Some(spelling) -> {
+          let applications = types.variant_applications
+          let catalog = state.types()
+          match semantic_variant_case_projection(
+            applications,
+            catalog,
+            input_type,
+            spelling
+          ) {
+            SemanticVariantApplicationUnavailable -> CheckedBodyPatternRejected(
+              state,
+              CheckedBodyProducerVariantPatternRequired(input_type)
+            )
+            SemanticVariantCaseMissing -> CheckedBodyPatternRejected(
+              state,
+              CheckedBodyProducerUnknownConstructor(name_range)
+            )
+            SemanticVariantCaseProjected(declaration, case_index, payload_count) -> {
+              let provided = __i64_to_usize(pattern_list_len(authored))
+              if provided != payload_count {
+                CheckedBodyPatternRejected(
+                  state,
+                  CheckedBodyProducerConstructorPatternArityMismatch(payload_count, provided)
+                )
+              } else {
+                match checked_body_constructor_reference(
+                  source,
+                  environment,
+                  declaration,
+                  name_range,
+                  authored_qualifier
+                ) {
+                  CheckedConstructorInvalidRange -> CheckedBodyPatternRejected(
+                    state,
+                    CheckedBodyProducerInvalidRange
+                  )
+                  CheckedConstructorMissing -> CheckedBodyPatternRejected(
+                    state,
+                    CheckedBodyProducerUnknownConstructor(name_range)
+                  )
+                  CheckedConstructorResolved(qualifier) ->
+                    match checked_body_constructor_pattern_items(
+                      state,
+                      source,
+                      types,
+                      owner,
+                      environment,
+                      input_type,
+                      case_index,
+                      authored,
+                      0,
+                      Nil<usize>(),
+                      true,
+                      name_range
+                    ) {
+                      CheckedConstructorPatternItemsRejected(state, issue) ->
+                        CheckedBodyPatternRejected(state, issue)
+                      CheckedConstructorPatternItemsBuilt(
+                      state,
+                      ordinals,
+                      next_environment,
+                      complete,
+                      child_range,
+                    ) -> {
+                      let selected_range: CheckedSourceRange? = match qualifier {
+                        nil -> child_range
+                        qualifier_range: CheckedSourceRange -> covering_range(
+                          qualifier_range,
+                          child_range
+                        )
+                      }
+                      match selected_range {
+                        nil -> CheckedBodyPatternRejected(
+                          state,
+                          CheckedBodyProducerInvalidRange
+                        )
+                        range: CheckedSourceRange -> {
+                          let (state, list) = state.pattern_list()
+                          let (state, list) = checked_body_tuple_pattern_list_into(
+                            state,
+                            list,
+                            ordinals
+                          )
+                          let (state, children) = state.pattern_list_finish(list)
+                          let applications = types.variant_applications
+                          let catalog = state.types()
+                          let case_count = match semantic_variant_case_count(
+                            applications,
+                            catalog,
+                            input_type
+                          ) {
+                            Some(count) -> count
+                            None -> panic("Projected variant has no case count")
+                          }
+                          match state.constructor_pattern(
+                            declaration,
+                            children,
+                            qualifier,
+                            input_type,
+                            range
+                          ) {
+                            (state, pattern) -> CheckedBodyPatternBuilt(
+                              state,
+                              pattern,
+                              next_environment,
+                              if complete {
+                                CheckedPatternVariantCases(
+                                  Nil<DeclarationIdentity>().prepend(declaration),
+                                  case_count
+                                )
+                              } else { CheckedPatternOpen },
+                              range
+                            )
+                          }
+                        }
+                      }
+                    }
+                    }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }
 
@@ -5551,6 +5922,18 @@ fn checked_body_pattern(
       }
       nil -> CheckedBodyPatternRejected(state, CheckedBodyProducerInvalidRange)
     }
+    CtorPattern(start, length, children, _, qualifier) -> checked_body_constructor_pattern(
+      state,
+      source,
+      types,
+      owner,
+      environment,
+      input_type,
+      start,
+      length,
+      children,
+      qualifier
+    )
     TuplePattern(items) -> checked_body_tuple_pattern(
       state,
       source,
