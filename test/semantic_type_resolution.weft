@@ -4,6 +4,7 @@
 use compiler/ir/data.{*}
 use compiler/project/identity.{
   DeclarationIdentity,
+  DeclaredFunctionIdentity,
   EffectDeclaration,
   MemberDeclarationIdentity,
   ModuleDeclarationIdentity,
@@ -55,6 +56,14 @@ use compiler/weft/check/resolution/effects.{
   semantic_effect_operation_parameter_count,
   semantic_effect_operation_parameter_type,
   semantic_effect_operation_result
+}
+use compiler/weft/check/resolution/methods.{
+  SemanticImplementationMethodSelected,
+  SemanticImplementationMethodSelectionAmbiguous,
+  SemanticImplementationMethodSelectionMissing,
+  SemanticTraitMethodSelected,
+  semantic_implementation_method_select,
+  semantic_trait_method_select
 }
 use compiler/weft/check/registration/catalog as registration
 use compiler/weft/check/registration/catalog.{RegisteredFunction, RegisteredModule}
@@ -200,6 +209,40 @@ fn catalog_graph(
   match catalog.graph_for(id) {
     Some(graph) -> graph
     None -> panic("semantic signature catalog is missing a type segment")
+  }
+}
+
+fn semantic_signature_named(
+  product: SemanticResolutionProduct,
+  wanted: str
+) -> SemanticFunctionSignature {
+  let signatures = product.signatures()
+  let mut index: usize = 0
+  while index < signatures.len() {
+    let signature = signatures.at(index)
+    match signature.identity {
+      DeclaredFunctionIdentity(declaration) -> match declaration_identity_name(
+        declaration
+      ).text() {
+        Some(name) -> if name == wanted { return signature } else { nil }
+        None -> nil
+      }
+      _ -> nil
+    }
+    index = index + 1
+  }
+  panic("expected named semantic signature")
+}
+
+fn semantic_function_parameter_at(
+  catalog: borrow SemanticTypeCatalog,
+  signature: SemanticTypeId,
+  index: usize
+) -> SemanticTypeId {
+  let graph = catalog_graph(catalog, signature)
+  match semantic_type_graph_node(graph, signature) {
+    SemanticFunctionNode(parameters, _, _) -> list_type(graph, parameters, index)
+    _ -> panic("expected semantic function type")
   }
 }
 
@@ -1870,4 +1913,238 @@ test "semantic resolution rejects invalid effect operation types atomically" {
       _ -> false
     }
   )
+}
+
+test "semantic method selection specializes generic trait implementations" {
+  let module = registered(
+    "trait Same { fn same(self, other: Self) -> bool } "
+    |> str_concat("type Box<T> { value: T } ")
+    |> str_concat(
+      "impl<T> Same for Box<T> { fn same(self, other: Self) -> bool { true } } "
+    )
+    |> str_concat("fn compare(left: Box<i64>, right: Box<i64>) -> bool { true }")
+  )
+  let scope = scope_for(module)
+  match resolve_module_semantics(module, scope) {
+    SemanticResolutionAccepted(product) -> {
+      let catalog = product.catalog()
+      let methods = product.methods()
+      let conformances = product.conformances()
+      let signature = semantic_signature_named(product, "compare")
+      let receiver = semantic_function_parameter_at(catalog, signature.type_id, 0)
+      match semantic_implementation_method_select(
+        methods,
+        catalog,
+        conformances,
+        receiver,
+        "same"
+      ) {
+        SemanticImplementationMethodSelected(
+          declaration,
+          _,
+          template,
+          substitution,
+        ) -> {
+          Test.assert_str_eq(declaration_identity_name(declaration).text().unwrap(), "same")
+          let (types, specialized) = semantic_type_product_substitute(
+            product.continue_types(),
+            substitution,
+            template
+          )
+          let specialized_catalog = semantic_type_product_catalog(types)
+          Test.assert_true(
+            semantic_type_catalog_equal(
+              specialized_catalog,
+              semantic_function_parameter_at(specialized_catalog, specialized, 0),
+              receiver
+            )
+          )
+          Test.assert_true(
+            semantic_type_catalog_equal(
+              specialized_catalog,
+              semantic_function_parameter_at(specialized_catalog, specialized, 1),
+              receiver
+            )
+          )
+        }
+        _ -> Test.assert_true(false)
+      }
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "semantic method selection enforces conditional implementation bounds" {
+  let module = registered(
+    "trait Show { fn show(self) -> str } type Wrap<T> { value: T } "
+    |> str_concat("impl Show for i64 { fn show(self) -> str { \"i64\" } } ")
+    |> str_concat(
+      "impl<T: Show> Show for Wrap<T> { fn show(self) -> str { \"wrap\" } } "
+    )
+    |> str_concat(
+      "fn shown(value: Wrap<i64>) -> str { \"\" } fn hidden(value: Wrap<bool>) -> str { \"\" }"
+    )
+  )
+  let scope = scope_for(module)
+  match resolve_module_semantics(module, scope) {
+    SemanticResolutionAccepted(product) -> {
+      let catalog = product.catalog()
+      let methods = product.methods()
+      let conformances = product.conformances()
+      let shown = semantic_signature_named(product, "shown")
+      let hidden = semantic_signature_named(product, "hidden")
+      let shown_receiver = semantic_function_parameter_at(catalog, shown.type_id, 0)
+      let hidden_receiver = semantic_function_parameter_at(catalog, hidden.type_id, 0)
+      Test.assert_true(
+        match semantic_implementation_method_select(
+          methods,
+          catalog,
+          conformances,
+          shown_receiver,
+          "show"
+        ) {
+          SemanticImplementationMethodSelected(_, _, _, _) -> true
+          _ -> false
+        }
+      )
+      Test.assert_true(
+        match semantic_implementation_method_select(
+          methods,
+          catalog,
+          conformances,
+          hidden_receiver,
+          "show"
+        ) {
+          SemanticImplementationMethodSelectionMissing -> true
+          _ -> false
+        }
+      )
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "generic signature bounds select exact trait method declarations" {
+  let module = registered(
+    "trait Show { fn show(self) -> str } fn render<T: Show>(value: T) -> str { \"\" }"
+  )
+  let scope = scope_for(module)
+  match resolve_module_semantics(module, scope) {
+    SemanticResolutionAccepted(product) -> {
+      let catalog = product.catalog()
+      let methods = product.methods()
+      let signature = semantic_signature_named(product, "render")
+      let signatures = product.signatures()
+      let bound = signatures.bound_at(signature, 0)
+      let graph = catalog_graph(catalog, bound.trait_atom)
+      match semantic_type_graph_node(graph, bound.trait_atom) {
+        SemanticTraitNode(declaration, _) -> match semantic_trait_method_select(
+          methods,
+          declaration,
+          "show"
+        ) {
+          SemanticTraitMethodSelected(method, method_signature) -> {
+            Test.assert_str_eq(declaration_identity_name(method).text().unwrap(), "show")
+            let method_graph = catalog_graph(catalog, method_signature)
+            Test.assert_true(
+              match semantic_type_graph_node(
+                method_graph,
+                method_signature
+              ) {
+                SemanticFunctionNode(_, _, _) -> true
+                _ -> false
+              }
+            )
+          }
+          _ -> Test.assert_true(false)
+        }
+        _ -> Test.assert_true(false)
+      }
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "semantic method catalogs compose dependency implementations independent of module order" {
+  let dependency_parsed = parse(
+    "pub trait Show { fn show(self) -> str } pub type Box<T> { value: T } "
+    |> str_concat("impl<T> Show for Box<T> { fn show(self) -> str { \"box\" } }")
+  )
+  let dependency = registration.register(
+    dependency_parsed.declarations,
+    dependency_parsed.source.source(),
+    named_module_identity("fixture/method_dependency", 73)
+  )
+  let consumer_parsed = parse(
+    "use dependency as dep fn render(value: dep.Box<i64>) -> str { \"\" }"
+  )
+  let consumer = registration.register(
+    consumer_parsed.declarations,
+    consumer_parsed.source.source(),
+    named_module_identity("fixture/method_consumer", 73)
+  )
+  let edge = registration_scope.resolved_import(
+    consumer,
+    consumer.syntax.imports.first().unwrap(),
+    dependency.identity,
+    false
+  )
+  let scope = registration_scope.registration_scope_build(
+    modules2(consumer, dependency),
+    imports1(edge)
+  )
+  match resolve_module_semantics(consumer, scope) {
+    SemanticResolutionAccepted(product) -> {
+      let catalog = product.catalog()
+      let methods = product.methods()
+      let conformances = product.conformances()
+      let signature = semantic_signature_named(product, "render")
+      let receiver = semantic_function_parameter_at(catalog, signature.type_id, 0)
+      Test.assert_true(
+        match semantic_implementation_method_select(
+          methods,
+          catalog,
+          conformances,
+          receiver,
+          "show"
+        ) {
+          SemanticImplementationMethodSelected(declaration, _, _, _) ->
+            declaration_identity_name(declaration).text().unwrap() == "show"
+          _ -> false
+        }
+      )
+    }
+    _ -> Test.assert_true(false)
+  }
+}
+
+test "semantic method selection reports overlapping applicable implementations" {
+  let module = registered(
+    "type Box { value: i64 } impl Box { fn value(self) -> i64 { 1 } } "
+    |> str_concat("impl Box { fn value(self) -> i64 { 2 } } ")
+    |> str_concat("fn read(box: Box) -> i64 { 0 }")
+  )
+  let scope = scope_for(module)
+  match resolve_module_semantics(module, scope) {
+    SemanticResolutionAccepted(product) -> {
+      let catalog = product.catalog()
+      let methods = product.methods()
+      let conformances = product.conformances()
+      let signature = semantic_signature_named(product, "read")
+      let receiver = semantic_function_parameter_at(catalog, signature.type_id, 0)
+      Test.assert_true(
+        match semantic_implementation_method_select(
+          methods,
+          catalog,
+          conformances,
+          receiver,
+          "value"
+        ) {
+          SemanticImplementationMethodSelectionAmbiguous -> true
+          _ -> false
+        }
+      )
+    }
+    _ -> Test.assert_true(false)
+  }
 }
