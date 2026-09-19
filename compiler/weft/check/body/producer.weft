@@ -87,6 +87,7 @@ use compiler/ir/data.{
   InferredRecordType,
   ExplicitRecordType,
   RecordInit,
+  RecordUpdate,
   RecordSourceRange,
   NamedTypeExpr,
   SourceAssociatedTypeExpr,
@@ -126,6 +127,7 @@ use compiler/ir/data.{
   pattern_list_len,
   record_construction_range,
   record_construction_type,
+  record_update_fact_range,
   type_expr_list_len,
   handler_clause_completion
 }
@@ -220,11 +222,13 @@ use compiler/types/graph/conformance.{SemanticConformance}
 use compiler/types/graph/equality.{semantic_type_catalog_equal}
 use compiler/types/graph/layout.{
   SemanticRecordLayoutField,
+  SemanticStructuralRecordFields,
   SemanticRecordFieldMissing,
   SemanticRecordFieldProjected,
   SemanticRecordFieldProjectionUnavailable,
   semantic_record_field_projection,
   semantic_record_layout_fields,
+  semantic_structural_record_source_fields,
   semantic_closed_structural_record,
   semantic_tuple_pattern_arity,
   semantic_tuple_pattern_element
@@ -505,6 +509,7 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerRecordTemplateAmbiguous(DeclarationIdentity),
   CheckedBodyProducerRecordArgumentsUnresolved(DeclarationIdentity),
   CheckedBodyProducerMissingRecordField(DeclarationIdentity),
+  CheckedBodyProducerRecordUpdateRequired(SemanticTypeId),
   CheckedBodyProducerVariantPatternRequired(SemanticTypeId),
   CheckedBodyProducerUnknownConstructor(CheckedSourceRange),
   CheckedBodyProducerConstructorResultRequired(CheckedSourceRange),
@@ -11763,6 +11768,475 @@ fn checked_body_record_literal(
   }
 }
 
+fn checked_body_update_field_type(
+  names: List<str>,
+  types: List<SemanticTypeId>,
+  wanted: str,
+  fallback: SemanticTypeId
+) -> SemanticTypeId {
+  match (names, types) {
+    (Nil, Nil) -> fallback
+    (Cons(name, remaining_names), Cons(field_type, remaining_types)) -> if name == wanted {
+      field_type
+    } else {
+      checked_body_update_field_type(remaining_names, remaining_types, wanted, fallback)
+    }
+    _ -> panic("Record update names and types diverged")
+  }
+}
+
+fn checked_body_update_extension_fields(
+  base_names: List<str>,
+  names: List<str>,
+  types: List<SemanticTypeId>
+) -> (List<str>, List<SemanticTypeId>) {
+  match (names, types) {
+    (Nil, Nil) -> (Nil<str>(), Nil<SemanticTypeId>())
+    (Cons(name, remaining_names), Cons(field_type, remaining_types)) -> {
+      let (suffix_names, suffix_types) = checked_body_update_extension_fields(
+        base_names,
+        remaining_names,
+        remaining_types
+      )
+      if checked_body_record_name_seen(base_names, name) {
+        (suffix_names, suffix_types)
+      } else {
+        (Cons<str>(name, suffix_names), Cons<SemanticTypeId>(field_type, suffix_types))
+      }
+    }
+    _ -> panic("Record update names and types diverged")
+  }
+}
+
+fn checked_body_update_base_fields(
+  base_names: List<str>,
+  base_types: List<SemanticTypeId>,
+  update_names: List<str>,
+  update_types: List<SemanticTypeId>,
+  extension_names: List<str>,
+  extension_types: List<SemanticTypeId>
+) -> (List<str>, List<SemanticTypeId>) {
+  match (base_names, base_types) {
+    (Nil, Nil) -> (extension_names, extension_types)
+    (Cons(name, remaining_names), Cons(field_type, remaining_types)) -> {
+      let replacement = checked_body_update_field_type(
+        update_names,
+        update_types,
+        name,
+        field_type
+      )
+      let (suffix_names, suffix_types) = checked_body_update_base_fields(
+        remaining_names,
+        remaining_types,
+        update_names,
+        update_types,
+        extension_names,
+        extension_types
+      )
+      (Cons<str>(name, suffix_names), Cons<SemanticTypeId>(replacement, suffix_types))
+    }
+    _ -> panic("Structural record names and types diverged")
+  }
+}
+
+fn checked_body_updated_record_fields(
+  base_names: List<str>,
+  base_types: List<SemanticTypeId>,
+  update_names: List<str>,
+  update_types: List<SemanticTypeId>
+) -> (List<str>, List<SemanticTypeId>) {
+  let (extension_names, extension_types) = checked_body_update_extension_fields(
+    base_names,
+    update_names,
+    update_types
+  )
+  checked_body_update_base_fields(
+    base_names,
+    base_types,
+    update_names,
+    update_types,
+    extension_names,
+    extension_types
+  )
+}
+
+fn checked_body_record_source_index(
+  names: List<str>,
+  wanted: str,
+  index: usize
+) -> usize {
+  match names {
+    Nil -> panic("Validated update field is absent from the result record")
+    Cons(name, remaining) -> if name == wanted { index }
+    else { checked_body_record_source_index(remaining, wanted, index + 1) }
+  }
+}
+
+fn checked_body_publish_structural_update_fields(
+  expressions: owned CheckedExprGraphBuilder,
+  list: CheckedRecordFieldListBuilder,
+  layout: List<SemanticRecordLayoutField>,
+  result_names: List<str>,
+  names: List<str>,
+  values: List<CheckedExprId>,
+  types: List<SemanticTypeId>
+) -> (owned CheckedExprGraphBuilder, CheckedRecordFieldListId) {
+  match (names, values, types) {
+    (Nil, Nil, Nil) -> expressions.finish_record_field_list(list)
+    (
+      Cons(name, remaining_names),
+      Cons(value, remaining_values),
+      Cons(value_type, remaining_types),
+    ) -> {
+      let index = checked_body_record_source_index(result_names, name, 0)
+      let (expressions, list) = expressions.structural_record_field(
+        list,
+        checked_body_record_layout_key(layout, index),
+        value,
+        CheckedRecordFieldOrdinal(index),
+        value_type
+      )
+      checked_body_publish_structural_update_fields(
+        expressions,
+        list,
+        layout,
+        result_names,
+        remaining_names,
+        remaining_values,
+        remaining_types
+      )
+    }
+    _ -> panic("Structural record update fields diverged")
+  }
+}
+
+fn checked_body_nominal_update_validate(
+  applications: borrow SemanticRecordApplicationCatalog,
+  catalog: borrow SemanticTypeCatalog,
+  base: SemanticTypeId,
+  names: List<str>,
+  types: List<SemanticTypeId>,
+  range: CheckedSourceRange
+) -[SemanticConformance]> Option<CheckedBodyProducerIssue> {
+  match (names, types) {
+    (Nil, Nil) -> None<CheckedBodyProducerIssue>()
+    (Cons(name, remaining_names), Cons(actual, remaining_types)) ->
+      match semantic_declared_field_projection(applications, catalog, base, name) {
+        SemanticDeclaredFieldProjected(_, _, expected) -> if semantic_type_is_subtype(
+          catalog,
+          actual,
+          expected
+        ) {
+          checked_body_nominal_update_validate(
+            applications,
+            catalog,
+            base,
+            remaining_names,
+            remaining_types,
+            range
+          )
+        } else {
+          Some<CheckedBodyProducerIssue>(CheckedBodyProducerTypeMismatch(actual, expected))
+        }
+        SemanticDeclaredFieldMissing -> Some<CheckedBodyProducerIssue>(
+          CheckedBodyProducerUnknownField(range)
+        )
+        SemanticDeclaredFieldProjectionUnavailable -> Some<CheckedBodyProducerIssue>(
+          CheckedBodyProducerFieldProjectionUnavailable(base)
+        )
+      }
+    _ -> Some<CheckedBodyProducerIssue>(CheckedBodyProducerInvalidRange)
+  }
+}
+
+fn checked_body_nominal_record_update(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  base: CheckedExprId,
+  base_type: SemanticTypeId,
+  fields: RecordFieldList,
+  range: CheckedSourceRange,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  let catalog = state.types()
+  if not expectation_allows(catalog, base_type, expectation) {
+    CheckedBodyExprRejected(state, expectation_mismatch(base_type, expectation))
+  } else {
+    let resolution = types.resolution
+    let product = semantic_type_product_continue(
+      types.module.identity,
+      catalog,
+      catalog.next_derived_segment(types.module.identity, resolution.next_type_segment())
+    )
+    let ready_types = checked_body_nominal_record_materialize(
+      checked_body_types_with_catalog(types, catalog),
+      product,
+      base_type
+    )
+    let state = state.with_types(ready_types.catalog)
+    match checked_body_record_values(
+      state,
+      source,
+      ready_types,
+      owner,
+      function_result,
+      loop_context,
+      environment,
+      fields,
+      CheckedNominalRecordShape(Some<SemanticTypeId>(base_type)),
+      0,
+      Nil<str>(),
+      Nil<CheckedExprId>(),
+      Nil<SemanticTypeId>(),
+      CheckedRequireResult(base_type)
+    ) {
+      CheckedBodyRecordValuesRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+      CheckedBodyRecordValuesBuilt(state, names, values, field_types) -> {
+        let catalog = state.types()
+        let applications = ready_types.applications
+        match checked_body_nominal_update_validate(
+          applications,
+          catalog,
+          base_type,
+          names,
+          field_types,
+          range
+        ) {
+          Some(issue) -> CheckedBodyExprRejected(state, issue)
+          None -> match state {
+            CheckedBodyBuild(storage) -> {
+              let { signatures, expressions, patterns, closures, effects, propagation } = storage
+              let (expressions, list) = expressions.record_field_list()
+              let (expressions, checked_fields) = checked_body_publish_nominal_fields(
+                expressions,
+                list,
+                applications,
+                catalog,
+                base_type,
+                names,
+                values
+              )
+              match expressions.record_update(base, checked_fields, base_type, range) {
+                (expressions, expression) -> CheckedBodyExprBuilt(
+                  CheckedBodyBuild(
+                    CheckedBodyBuildStorage {
+                      signatures: signatures,
+                      expressions: expressions,
+                      patterns: patterns,
+                      closures: closures,
+                      effects: effects,
+                      propagation: propagation
+                    }
+                  ),
+                  expression
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn checked_body_structural_record_update(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  base: CheckedExprId,
+  fields: RecordFieldList,
+  base_fields: SemanticStructuralRecordFields,
+  range: CheckedSourceRange,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  match checked_body_record_values(
+    state,
+    source,
+    types,
+    owner,
+    function_result,
+    loop_context,
+    environment,
+    fields,
+    CheckedStructuralRecordShape,
+    0,
+    Nil<str>(),
+    Nil<CheckedExprId>(),
+    Nil<SemanticTypeId>(),
+    CheckedInferResult
+  ) {
+    CheckedBodyRecordValuesRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+    CheckedBodyRecordValuesBuilt(state, names, values, field_types) -> {
+      let (result_names, result_types) = match base_fields {
+        SemanticStructuralRecordFields(base_names, base_types) ->
+          checked_body_updated_record_fields(
+            base_names,
+            base_types,
+            names,
+            field_types
+          )
+      }
+      let catalog = state.types()
+      let resolution = types.resolution
+      let segment = semantic_type_derived_segment_id(
+        types.module.identity,
+        catalog.next_derived_segment(types.module.identity, resolution.next_type_segment())
+      )
+      let builder = semantic_type_graph_builder(segment)
+      let (builder, result) = builder.record(result_names, result_types, SemanticClosedRecord)
+      let catalog = semantic_type_catalog_with_graph(catalog, builder.freeze())
+      if not expectation_allows(catalog, result, expectation) {
+        CheckedBodyExprRejected(state, expectation_mismatch(result, expectation))
+      } else {
+        let layout = match semantic_record_layout_fields(catalog, result) {
+          Some(value) -> value
+          None -> panic("Closed structural update has no semantic layout")
+        }
+        match state.with_types(catalog) {
+          CheckedBodyBuild(storage) -> {
+            let { signatures, expressions, patterns, closures, effects, propagation } = storage
+            let (expressions, list) = expressions.record_field_list()
+            let (expressions, checked_fields) = checked_body_publish_structural_update_fields(
+              expressions,
+              list,
+              layout,
+              result_names,
+              names,
+              values,
+              field_types
+            )
+            match expressions.record_update(base, checked_fields, result, range) {
+              (expressions, expression) -> CheckedBodyExprBuilt(
+                CheckedBodyBuild(
+                  CheckedBodyBuildStorage {
+                    signatures: signatures,
+                    expressions: expressions,
+                    patterns: patterns,
+                    closures: closures,
+                    effects: effects,
+                    propagation: propagation
+                  }
+                ),
+                expression
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn checked_body_record_update(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  base: Expr,
+  fields: RecordFieldList,
+  authored_range: RecordSourceRange,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  if authored_range.end <= authored_range.start {
+    CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+  } else {
+    match source_range(source, authored_range.start, authored_range.end - authored_range.start) {
+      nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+      suffix_range: CheckedSourceRange -> match checked_body_expr(
+        state,
+        source,
+        types,
+        owner,
+        function_result,
+        loop_context,
+        environment,
+        base,
+        CheckedInferResult
+      ) {
+        CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+        CheckedBodyExprBuilt(state, checked_base) -> match covering_range(
+          state.range(checked_base),
+          suffix_range
+        ) {
+          nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+          range: CheckedSourceRange -> {
+            let base_type = state.result_type(checked_base)
+            let catalog = state.types()
+            let resolution = types.resolution
+            let declarations = resolution.declarations()
+            let declaration = match catalog.graph_for(base_type) {
+              None -> None<DeclarationIdentity>()
+              Some(graph) -> match semantic_type_graph_node(graph, base_type) {
+                SemanticNamedNode(found, _, _, _) -> Some<DeclarationIdentity>(found)
+                _ -> None<DeclarationIdentity>()
+              }
+            }
+            match declaration {
+              Some(found) -> match semantic_type_declared_record_template(
+                catalog,
+                declarations,
+                found
+              ) {
+                SemanticRecordDeclarationTemplateSelected(_, _, _) ->
+                  checked_body_nominal_record_update(
+                    state,
+                    source,
+                    types,
+                    owner,
+                    function_result,
+                    loop_context,
+                    environment,
+                    checked_base,
+                    base_type,
+                    fields,
+                    range,
+                    expectation
+                  )
+                _ -> CheckedBodyExprRejected(
+                  state,
+                  CheckedBodyProducerRecordUpdateRequired(base_type)
+                )
+              }
+              None -> match semantic_structural_record_source_fields(catalog, base_type) {
+                Some(base_fields) -> checked_body_structural_record_update(
+                  state,
+                  source,
+                  types,
+                  owner,
+                  function_result,
+                  loop_context,
+                  environment,
+                  checked_base,
+                  fields,
+                  base_fields,
+                  range,
+                  expectation
+                )
+                None -> CheckedBodyExprRejected(
+                  state,
+                  CheckedBodyProducerRecordUpdateRequired(base_type)
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 fn checked_body_nominal_record_prepare(
   state: borrow CheckedBodyBuild,
   source: Source,
@@ -13230,6 +13704,19 @@ fn checked_body_expr(
           expectation
         )
       }
+    RecordUpdate(base, fields, fact) -> checked_body_record_update(
+      state,
+      source,
+      types,
+      owner,
+      function_result,
+      loop_context,
+      environment,
+      base,
+      fields,
+      record_update_fact_range(fact),
+      expectation
+    )
     ArrayLiteral(elements, _, source_site) -> checked_body_array_literal(
       state,
       source,
