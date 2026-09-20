@@ -14,12 +14,12 @@ use compiler/ir/data.{
   TypeParamListCons,
   TypeParamListNil
 }
-use compiler/project/identity.{FunctionIdentity, ModuleIdentity}
-use compiler/project/identity/equality.{function_identity_eq}
+use compiler/project/identity.{FunctionIdentity, ModuleIdentity, function_identity_module}
+use compiler/project/identity/equality.{function_identity_eq, module_identity_eq}
 use compiler/types/graph.{*}
 use compiler/types/graph/catalog.{*}
-use compiler/weft/check/registration/catalog.{RegisteredModule}
-use compiler/weft/check/registration/scope.{RegistrationScope}
+use compiler/weft/check/registration/catalog.{RegisteredFunction, RegisteredModule}
+use compiler/weft/check/registration/scope.{RegistrationScope, registration_scope_find}
 use compiler/weft/check/semantic_types.{
   SemanticTypeProductBuilder,
   SemanticDeclarationResolutionRequired,
@@ -62,6 +62,7 @@ type SemanticSignatureProductStorage {
   catalog: SemanticTypeCatalog,
   next_type_segment: usize,
   functions: DenseSegment<SemanticFunctionSignature>,
+  external_functions: DenseSegment<SemanticFunctionSignature>,
   type_parameters: DenseSegment<SemanticTypeVariable>,
   bounds: DenseSegment<SemanticSignatureBound>
 }
@@ -71,6 +72,12 @@ pub(package) type SemanticSignatureProduct = opaque SemanticSignatureProductStor
 pub(package) type SemanticSignatureResolution {
   SemanticSignaturesResolved(SemanticSignatureProduct),
   SemanticSignaturesRejected(FunctionIdentity, SemanticTypeResolutionIssue)
+}
+
+pub(package) type SemanticScopeSignatureLookup {
+  SemanticScopeSignatureFound(SemanticSignatureProduct, SemanticFunctionSignature),
+  SemanticScopeSignatureMissing(SemanticSignatureProduct),
+  SemanticScopeSignatureRejected(SemanticSignatureProduct, SemanticTypeResolutionIssue)
 }
 
 type SemanticSignatureBuild {
@@ -316,6 +323,7 @@ pub(package) fn resolve_module_signatures(
             catalog: catalog,
             next_type_segment: next_type_segment,
             functions: signatures.freeze(),
+            external_functions: dense_builder_with_capacity<SemanticFunctionSignature>(0).freeze(),
             type_parameters: type_parameters.freeze(),
             bounds: bounds.freeze()
           }
@@ -331,11 +339,156 @@ pub(package) fn resolve_module_signatures(
   }
 }
 
+fn registered_function_for_identity(
+  module: RegisteredModule,
+  wanted: FunctionIdentity
+) -> Option<RegisteredFunction> {
+  let functions = module.functions
+  let mut index: usize = 0
+  while index < functions.len() {
+    let function = functions.at(dense_index(index))
+    if function_identity_eq(function.identity, wanted) {
+      return Some<RegisteredFunction>(function)
+    } else { nil }
+    index = index + 1
+  }
+  None<RegisteredFunction>()
+}
+
+-- The scope lookup has already established visibility. Materialize only the
+-- selected dependency function, retaining its generic bounds in this product
+-- rather than re-resolving every function in every imported module.
+pub(package) fn semantic_signature_in_scope(
+  signatures: SemanticSignatureProduct,
+  catalog: SemanticTypeCatalog,
+  scope: RegistrationScope,
+  wanted: FunctionIdentity
+) -> SemanticScopeSignatureLookup {
+  match signatures.find(wanted) {
+    Some(signature) -> SemanticScopeSignatureFound(signatures.with_catalog(catalog), signature)
+    None -> if module_identity_eq(signatures.module(), function_identity_module(wanted)) {
+      SemanticScopeSignatureMissing(signatures)
+    } else {
+      match registration_scope_find(scope, function_identity_module(wanted)) {
+        None -> SemanticScopeSignatureMissing(signatures)
+        Some(module) -> match registered_function_for_identity(module, wanted) {
+          None -> SemanticScopeSignatureMissing(signatures)
+          Some(function) -> {
+            let next_segment = catalog.next_derived_segment(
+              signatures.module(),
+              signatures.next_type_segment()
+            )
+            let product = semantic_type_product_continue(
+              signatures.module(),
+              catalog,
+              next_segment
+            )
+            match resolve_parameter_bounds(
+              module,
+              scope,
+              function.syntax.type_params,
+              function.syntax.type_params,
+              product,
+              dense_builder_with_capacity<SemanticSignatureBound>(0),
+              dense_builder_with_capacity<SemanticTypeVariable>(0)
+            ) {
+              SemanticSignatureBoundsRejected(_, bounds, variables, issue) -> {
+                bounds.drop()
+                variables.drop()
+                SemanticScopeSignatureRejected(signatures, issue)
+              }
+              SemanticSignatureBoundsResolved(product, bounds, variables) ->
+                match resolve_function_signature_product_with_self_in_scope(
+                  product,
+                  module,
+                  scope,
+                  function.syntax,
+                  function.self_trait
+                ) {
+                  (_, SemanticTypeRejected(issue)) -> {
+                    bounds.drop()
+                    variables.drop()
+                    SemanticScopeSignatureRejected(signatures, issue)
+                  }
+                  (product, SemanticTypeResolved(type_id)) -> {
+                    let SemanticSignatureProduct(storage) = signatures
+                    let local_variables = storage.type_parameters
+                    let local_bounds = storage.bounds
+                    let signature = SemanticFunctionSignature {
+                      identity: wanted,
+                      type_id: type_id,
+                      type_parameters_start: local_variables.len(),
+                      type_parameters_count: variables.len(),
+                      bounds_start: local_bounds.len(),
+                      bounds_count: bounds.len()
+                    }
+                    let mut merged_variables = local_variables
+                    let variables = variables.freeze()
+                    let mut index: usize = 0
+                    while index < variables.len() {
+                      merged_variables = merged_variables.push(variables.at(dense_index(index)))
+                      index = index + 1
+                    }
+                    let mut merged_bounds = local_bounds
+                    let bounds = bounds.freeze()
+                    index = 0
+                    while index < bounds.len() {
+                      merged_bounds = merged_bounds.push(bounds.at(dense_index(index)))
+                      index = index + 1
+                    }
+                    SemanticScopeSignatureFound(
+                      SemanticSignatureProduct(
+                        SemanticSignatureProductStorage {
+                          module: storage.module,
+                          catalog: semantic_type_product_catalog(product),
+                          next_type_segment: semantic_type_product_next_segment(product),
+                          functions: storage.functions,
+                          external_functions: storage.external_functions.push(signature),
+                          type_parameters: merged_variables,
+                          bounds: merged_bounds
+                        }
+                      ),
+                      signature
+                    )
+                  }
+                }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 impl SemanticSignatureProduct {
+  pub(package) fn with_catalog(
+    self: Self,
+    catalog: SemanticTypeCatalog
+  ) -> SemanticSignatureProduct {
+    let SemanticSignatureProduct(storage) = self
+    SemanticSignatureProduct(
+      SemanticSignatureProductStorage {
+        module: storage.module,
+        catalog: catalog,
+        next_type_segment: storage.next_type_segment,
+        functions: storage.functions,
+        external_functions: storage.external_functions,
+        type_parameters: storage.type_parameters,
+        bounds: storage.bounds
+      }
+    )
+  }
+
+  pub(package) fn next_type_segment(self: borrow Self) -> usize {
+    match self {
+      SemanticSignatureProduct(storage) -> storage.next_type_segment
+    }
+  }
+
   pub(package) fn module(self: borrow Self) -> ModuleIdentity {
     match self {
       SemanticSignatureProduct(storage) -> {
-        let { module, catalog: _, next_type_segment: _, functions: _, type_parameters: _, bounds: _ } = storage
+        let { module, catalog: _, next_type_segment: _, functions: _, external_functions: _, type_parameters: _, bounds: _ } = storage
         module
       }
     }
@@ -344,7 +497,7 @@ impl SemanticSignatureProduct {
   pub(package) fn catalog(self: borrow Self) -> SemanticTypeCatalog {
     match self {
       SemanticSignatureProduct(storage) -> {
-        let { module: _, catalog, next_type_segment: _, functions: _, type_parameters: _, bounds: _ } = storage
+        let { module: _, catalog, next_type_segment: _, functions: _, external_functions: _, type_parameters: _, bounds: _ } = storage
         catalog
       }
     }
@@ -353,7 +506,7 @@ impl SemanticSignatureProduct {
   pub(package) fn continue_types(self: borrow Self) -> SemanticTypeProductBuilder {
     match self {
       SemanticSignatureProduct(storage) -> {
-        let { module, catalog, next_type_segment, functions: _, type_parameters: _, bounds: _ } = storage
+        let { module, catalog, next_type_segment, functions: _, external_functions: _, type_parameters: _, bounds: _ } = storage
         semantic_type_product_continue(module, catalog, next_type_segment)
       }
     }
@@ -362,7 +515,7 @@ impl SemanticSignatureProduct {
   pub(package) fn len(self: borrow Self) -> usize {
     match self {
       SemanticSignatureProduct(storage) -> {
-        let { module: _, catalog: _, next_type_segment: _, functions, type_parameters: _, bounds: _ } = storage
+        let { module: _, catalog: _, next_type_segment: _, functions, external_functions: _, type_parameters: _, bounds: _ } = storage
         functions.len()
       }
     }
@@ -371,7 +524,7 @@ impl SemanticSignatureProduct {
   pub(package) fn at(self: borrow Self, index: usize) -> SemanticFunctionSignature {
     match self {
       SemanticSignatureProduct(storage) -> {
-        let { module: _, catalog: _, next_type_segment: _, functions, type_parameters: _, bounds: _ } = storage
+        let { module: _, catalog: _, next_type_segment: _, functions, external_functions: _, type_parameters: _, bounds: _ } = storage
         functions.at(dense_index(index))
       }
     }
@@ -394,7 +547,7 @@ impl SemanticSignatureProduct {
     } else {
       match self {
         SemanticSignatureProduct(storage) -> {
-          let { module: _, catalog: _, next_type_segment: _, functions: _, type_parameters, bounds: _ } = storage
+          let { module: _, catalog: _, next_type_segment: _, functions: _, external_functions: _, type_parameters, bounds: _ } = storage
           type_parameters.at(dense_index(signature.type_parameters_start + index))
         }
       }
@@ -418,7 +571,7 @@ impl SemanticSignatureProduct {
     } else {
       match self {
         SemanticSignatureProduct(storage) -> {
-          let { module: _, catalog: _, next_type_segment: _, functions: _, type_parameters: _, bounds } = storage
+          let { module: _, catalog: _, next_type_segment: _, functions: _, external_functions: _, type_parameters: _, bounds } = storage
           bounds.at(dense_index(signature.bounds_start + index))
         }
       }
@@ -431,10 +584,13 @@ impl SemanticSignatureProduct {
   ) -> Option<SemanticFunctionSignature> {
     match self {
       SemanticSignatureProduct(storage) -> {
-        let { module: _, catalog: _, next_type_segment: _, functions, type_parameters: _, bounds: _ } = storage
+        let { module, catalog: _, next_type_segment: _, functions, external_functions, type_parameters: _, bounds: _ } = storage
+        let selected = if module_identity_eq(module, function_identity_module(wanted)) {
+          functions
+        } else { external_functions }
         let mut index: usize = 0
-        while index < functions.len() {
-          let signature = functions.at(dense_index(index))
+        while index < selected.len() {
+          let signature = selected.at(dense_index(index))
           if function_identity_eq(signature.identity, wanted) {
             return Some<SemanticFunctionSignature>(signature)
           } else { nil }
