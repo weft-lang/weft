@@ -24,16 +24,26 @@ use compiler/types/graph.{
   semantic_type_graph_node
 }
 use compiler/types/graph/catalog.{SemanticTypeCatalog}
+use compiler/types/graph/borrow_shape.{
+  SemanticContainsSlice,
+  SemanticDoesNotContainSlice,
+  SemanticSliceContainment,
+  semantic_type_slice_containment
+}
+use compiler/types/graph/declarations.{SemanticTypeDeclarationCatalog}
 use compiler/weft/check/body/graph.{
+  CheckedArrayLiteralKind,
   CheckedExprId,
   CheckedExprGraph,
   CheckedExprSegmentId,
   CheckedBlockKind,
+  CheckedConstructorCallKind,
   CheckedIfKind,
   CheckedIndexedSliceKind,
   CheckedLetKind,
   CheckedLetMutKind,
   CheckedLocalReferenceKind,
+  CheckedRecordInitKind,
   checked_binding_id_ordinal,
   checked_expr_id_from_ordinal,
   checked_expr_id_ordinal,
@@ -237,8 +247,129 @@ fn checked_known_view_origins(
   }
 }
 
+fn checked_merge_content(
+  left: Option<CheckedBorrowOrigins>,
+  right: Option<CheckedBorrowOrigins>
+) -> Option<CheckedBorrowOrigins> {
+  match (left, right) {
+    (None, None) -> None<CheckedBorrowOrigins>()
+    (Some(origins), None) -> Some<CheckedBorrowOrigins>(origins)
+    (None, Some(origins)) -> Some<CheckedBorrowOrigins>(origins)
+    (Some(a), Some(b)) -> Some<CheckedBorrowOrigins>(checked_borrow_origins_union(a, b))
+  }
+}
+
+fn checked_child_content(
+  facts: borrow CheckedBorrowFacts,
+  child: CheckedExprId
+) -> Option<CheckedBorrowOrigins> {
+  checked_merge_content(facts.view(child), facts.contained(child))
+}
+
+fn checked_unknown_content() -> Option<CheckedBorrowOrigins> {
+  Some<CheckedBorrowOrigins>(
+    checked_borrow_origins_single(
+      CheckedBorrowOrigin {
+        storage: CheckedUnknownStorage,
+        access: CheckedSharedAccess
+      }
+    )
+  )
+}
+
+fn checked_record_content(
+  expressions: borrow CheckedExprGraph,
+  facts: borrow CheckedBorrowFacts,
+  expression: CheckedExprId
+) -> Option<CheckedBorrowOrigins> {
+  let (_, fields) = expressions.record_init_parts(expression)
+  let mut found: Option<CheckedBorrowOrigins> = None<CheckedBorrowOrigins>()
+  let mut field: usize = 0
+  while field < expressions.record_field_list_len(fields) {
+    let child = expressions.record_field_list_at(fields, field).value
+    found = checked_merge_content(found, checked_child_content(facts, child))
+    field = field + 1
+  }
+  found
+}
+
+fn checked_array_content(
+  expressions: borrow CheckedExprGraph,
+  facts: borrow CheckedBorrowFacts,
+  expression: CheckedExprId
+) -> Option<CheckedBorrowOrigins> {
+  let (elements, _) = expressions.array_literal_parts(expression)
+  let mut found: Option<CheckedBorrowOrigins> = None<CheckedBorrowOrigins>()
+  let mut index: usize = 0
+  while index < expressions.expression_list_len(elements) {
+    let child = expressions.expression_list_at(elements, index)
+    found = checked_merge_content(found, checked_child_content(facts, child))
+    index = index + 1
+  }
+  found
+}
+
+fn checked_constructor_content(
+  expressions: borrow CheckedExprGraph,
+  facts: borrow CheckedBorrowFacts,
+  expression: CheckedExprId
+) -> Option<CheckedBorrowOrigins> {
+  let (_, arguments) = expressions.constructor_call_parts(expression)
+  let mut found: Option<CheckedBorrowOrigins> = None<CheckedBorrowOrigins>()
+  let mut index: usize = 0
+  while index < expressions.expression_list_len(arguments) {
+    let child = expressions.expression_list_at(arguments, index)
+    found = checked_merge_content(found, checked_child_content(facts, child))
+    index = index + 1
+  }
+  found
+}
+
+fn checked_contained_origins(
+  expressions: borrow CheckedExprGraph,
+  facts: borrow CheckedBorrowFacts,
+  initializers: borrow Map<i64, usize>,
+  expression: CheckedExprId,
+  containment: SemanticSliceContainment
+) -> Option<CheckedBorrowOrigins> {
+  match expressions.kind(expression) {
+    CheckedLocalReferenceKind -> {
+      let binding = expressions.local_binding(expression)
+      let key = ordinal_key(checked_binding_id_ordinal(binding))
+      match initializers.get(key) {
+        Some(value_ordinal) -> facts.contained(
+          checked_expr_id_from_ordinal(expressions.segment(), value_ordinal)
+        )
+        None -> match containment {
+          SemanticContainsSlice -> checked_unknown_content()
+          _ -> None<CheckedBorrowOrigins>()
+        }
+      }
+    }
+    CheckedBlockKind -> facts.contained(expressions.block_rest(expression))
+    CheckedLetKind -> match expressions.let_parts(expression) {
+      (_, _, body) -> facts.contained(body)
+    }
+    CheckedLetMutKind -> match expressions.let_mut_parts(expression) {
+      (_, _, body) -> facts.contained(body)
+    }
+    CheckedIfKind -> checked_merge_content(
+      facts.contained(expressions.if_then(expression)),
+      facts.contained(expressions.if_else(expression))
+    )
+    CheckedRecordInitKind -> checked_record_content(expressions, facts, expression)
+    CheckedArrayLiteralKind -> checked_array_content(expressions, facts, expression)
+    CheckedConstructorCallKind -> checked_constructor_content(expressions, facts, expression)
+    _ -> match containment {
+      SemanticContainsSlice -> checked_unknown_content()
+      _ -> None<CheckedBorrowOrigins>()
+    }
+  }
+}
+
 pub(package) fn checked_borrow_facts_conservative(
-  expressions: borrow CheckedExprGraph
+  expressions: borrow CheckedExprGraph,
+  declarations: borrow SemanticTypeDeclarationCatalog
 ) -> CheckedBorrowFacts {
   let catalog = expressions.types()
   let mut facts = checked_borrow_facts_empty(expressions.segment())
@@ -329,6 +460,31 @@ pub(package) fn checked_borrow_facts_conservative(
           Some(next) -> next
           None -> panic("Checked view fact derivation failed")
         }
+      }
+    }
+    match semantic_type_slice_containment(
+      catalog,
+      declarations,
+      expressions.result_type(expression)
+    ) {
+      SemanticDoesNotContainSlice -> nil
+      containment -> match access {
+        CheckedNotView -> match checked_contained_origins(
+          expressions,
+          facts,
+          initializers,
+          expression,
+          containment
+        ) {
+          Some(origins) -> {
+            facts = match facts.with_contained(expression, origins) {
+              Some(next) -> next
+              None -> panic("Checked contained fact derivation failed")
+            }
+          }
+          None -> nil
+        }
+        _ -> nil
       }
     }
     ordinal = ordinal + 1
