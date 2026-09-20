@@ -44,6 +44,7 @@ use compiler/ir/data.{
   If,
   IndexedGet,
   IndexedSet,
+  IndexedSlice,
   IntLit,
   IntPattern,
   Let,
@@ -167,6 +168,7 @@ use compiler/types/graph.{
   SemanticIsize,
   SemanticImmutable,
   SemanticMutable,
+  SemanticMutability,
   SemanticNamedNode,
   SemanticNominalType,
   SemanticUnionNode,
@@ -802,6 +804,13 @@ type CheckedBodyWritableShape {
   CheckedWritableSlice(SemanticTypeId),
   CheckedImmutableSlice,
   CheckedNotWritableIndexed
+}
+
+type CheckedBodySliceShape {
+  CheckedSliceArray(SemanticTypeId),
+  CheckedSliceVector(SemanticTypeId),
+  CheckedSliceView(SemanticTypeId, SemanticMutability),
+  CheckedNotSliceable
 }
 
 type CheckedBodyEffectArgumentsPreparation {
@@ -3149,6 +3158,37 @@ impl CheckedBodyBuild {
       CheckedBodyBuild(storage) -> {
         let { signatures, expressions, patterns, closures, effects, propagation } = storage
         match expressions.indexed_set(base, index, value, element_type, length, result, range) {
+          (expressions, expression) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            expression
+          )
+        }
+      }
+    }
+  }
+
+  fn indexed_slice(
+    self: owned Self,
+    base: CheckedExprId,
+    start: CheckedExprId,
+    end: CheckedExprId,
+    element_type: SemanticTypeId,
+    result: SemanticTypeId,
+    range: CheckedSourceRange
+  ) -> (owned CheckedBodyBuild, CheckedExprId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match expressions.indexed_slice(base, start, end, element_type, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
               CheckedBodyBuildStorage {
@@ -11785,6 +11825,272 @@ fn checked_body_writable_shape(
   }
 }
 
+fn checked_body_slice_shape(
+  catalog: borrow SemanticTypeCatalog,
+  value_type: SemanticTypeId,
+  vector_declaration: DeclarationIdentity?
+) -> CheckedBodySliceShape {
+  match catalog.graph_for(value_type) {
+    None -> CheckedNotSliceable
+    Some(graph) -> match semantic_type_graph_node(graph, value_type) {
+      SemanticArrayNode(element, _) -> CheckedSliceArray(element)
+      SemanticSliceNode(element, mutability) -> CheckedSliceView(element, mutability)
+      SemanticBorrowNode(inner, _) -> checked_body_slice_shape(catalog, inner, vector_declaration)
+      SemanticOwnedNode(inner) -> checked_body_slice_shape(catalog, inner, vector_declaration)
+      SemanticUniqueNode(inner) -> checked_body_slice_shape(catalog, inner, vector_declaration)
+      SemanticNamedNode(found, SemanticNominalType, _, arguments) ->
+        match vector_declaration {
+          nil -> CheckedNotSliceable
+          declared: DeclarationIdentity -> if not declaration_identity_eq(found, declared) {
+            CheckedNotSliceable
+          } else {
+            let lists = semantic_type_graph_type_lists_local(graph)
+            if semantic_type_list_len(lists, arguments) != 1 { CheckedNotSliceable }
+          else {
+            CheckedSliceVector(
+              semantic_type_graph_list_type_id(
+                graph,
+                semantic_type_list_edge(lists, arguments, 0)
+              )
+            )
+          }
+          }
+        }
+      _ -> CheckedNotSliceable
+    }
+  }
+}
+
+fn checked_body_slice_permission(
+  source: Source,
+  environment: CheckedLexicalEnvironment,
+  base: Expr,
+  shape: CheckedBodySliceShape,
+  mutable: bool,
+  range: CheckedSourceRange
+) -> Option<CheckedBodyProducerIssue> {
+  let named = match base {
+    Ident(start, length) -> lexical_lookup(environment, source, start, length)
+    _ -> CheckedLexicalMissing
+  }
+  match shape {
+    CheckedNotSliceable -> None<CheckedBodyProducerIssue>()
+    CheckedSliceArray(_) -> match named {
+      CheckedLexicalFound(_, _, writable) -> if mutable and not writable {
+        Some<CheckedBodyProducerIssue>(CheckedBodyProducerImmutableAssignment(range))
+      } else { None<CheckedBodyProducerIssue>() }
+      CheckedLexicalMissing -> Some<CheckedBodyProducerIssue>(
+        CheckedBodyProducerIndexedNamedBindingRequired(range)
+      )
+    }
+    CheckedSliceVector(_) -> match named {
+      CheckedLexicalFound(_, _, _) -> None<CheckedBodyProducerIssue>()
+      CheckedLexicalMissing -> Some<CheckedBodyProducerIssue>(
+        CheckedBodyProducerIndexedNamedBindingRequired(range)
+      )
+    }
+    CheckedSliceView(_, mutability) -> if not mutable { None<CheckedBodyProducerIssue>() }
+    else {
+      match mutability {
+        SemanticImmutable -> Some<CheckedBodyProducerIssue>(
+          CheckedBodyProducerImmutableAssignment(range)
+        )
+        SemanticMutable -> match named {
+          CheckedLexicalFound(_, _, _) -> None<CheckedBodyProducerIssue>()
+          CheckedLexicalMissing -> Some<CheckedBodyProducerIssue>(
+            CheckedBodyProducerIndexedNamedBindingRequired(range)
+          )
+        }
+      }
+    }
+  }
+}
+
+fn checked_body_slice_bound(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  bound: Expr
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  match bound {
+    NilExpr -> checked_body_expr(
+      state,
+      source,
+      types,
+      owner,
+      function_result,
+      loop_context,
+      environment,
+      bound,
+      CheckedInferResult
+    )
+    _ -> checked_body_expr(
+      state,
+      source,
+      types,
+      owner,
+      function_result,
+      loop_context,
+      environment,
+      bound,
+      CheckedRequireResult(types.usize_type)
+    )
+  }
+}
+
+fn checked_body_indexed_slice(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  base: Expr,
+  start: Expr,
+  end: Expr,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  match checked_body_expr(
+    state,
+    source,
+    types,
+    owner,
+    function_result,
+    loop_context,
+    environment,
+    base,
+    CheckedInferResult
+  ) {
+    CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+    CheckedBodyExprBuilt(state, checked_base) -> {
+      let base_type = state.result_type(checked_base)
+      let catalog = state.types()
+      let vector = checked_body_standard_declaration(
+        types,
+        lexical_scope(environment),
+        "stdlib/vector/handles",
+        TypeDeclaration,
+        "Vector"
+      )
+      let shape = checked_body_slice_shape(catalog, base_type, vector)
+      let element = match shape {
+        CheckedSliceArray(inner) -> Some<SemanticTypeId>(inner)
+        CheckedSliceVector(inner) -> Some<SemanticTypeId>(inner)
+        CheckedSliceView(inner, _) -> Some<SemanticTypeId>(inner)
+        CheckedNotSliceable -> None<SemanticTypeId>()
+      }
+      match element {
+        None -> CheckedBodyExprRejected(
+          state,
+          CheckedBodyProducerIndexedBaseRequired(base_type)
+        )
+        Some(inner) -> {
+          let mutable = match expectation {
+            CheckedInferResult -> false
+            CheckedRequireResult(expected) -> match catalog.graph_for(expected) {
+              None -> false
+              Some(graph) -> match semantic_type_graph_node(graph, expected) {
+                SemanticSliceNode(_, SemanticMutable) -> true
+                _ -> false
+              }
+            }
+          }
+          match checked_body_slice_permission(
+            source,
+            environment,
+            base,
+            shape,
+            mutable,
+            state.range(checked_base)
+          ) {
+            Some(issue) -> CheckedBodyExprRejected(state, issue)
+            None -> match checked_body_slice_bound(
+              state,
+              source,
+              types,
+              owner,
+              function_result,
+              loop_context,
+              environment,
+              start
+            ) {
+              CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+              CheckedBodyExprBuilt(state, checked_start) -> match checked_body_slice_bound(
+                state,
+                source,
+                types,
+                owner,
+                function_result,
+                loop_context,
+                environment,
+                end
+              ) {
+                CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+                CheckedBodyExprBuilt(state, checked_end) -> {
+                  let catalog = state.types()
+                  let resolution = types.resolution
+                  let segment = semantic_type_derived_segment_id(
+                    types.module.identity,
+                    catalog.next_derived_segment(
+                      types.module.identity,
+                      resolution.next_type_segment()
+                    )
+                  )
+                  let builder = semantic_type_graph_builder(segment)
+                  let mutability = if mutable { SemanticMutable } else { SemanticImmutable }
+                  match builder.slice(inner, mutability) {
+                    (builder, result) -> {
+                      let next_catalog = semantic_type_catalog_with_graph(
+                        catalog,
+                        builder.freeze()
+                      )
+                      if not expectation_allows(next_catalog, result, expectation) {
+                        CheckedBodyExprRejected(state, expectation_mismatch(result, expectation))
+                      } else {
+                        let state = state.with_types(next_catalog)
+                        match covering_range(
+                          state.range(checked_base),
+                          state.range(checked_start)
+                        ) {
+                          nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+                          first: CheckedSourceRange -> match covering_range(
+                            first,
+                            state.range(checked_end)
+                          ) {
+                            nil -> CheckedBodyExprRejected(
+                              state,
+                              CheckedBodyProducerInvalidRange
+                            )
+                            range: CheckedSourceRange -> match state.indexed_slice(
+                              checked_base,
+                              checked_start,
+                              checked_end,
+                              inner,
+                              result,
+                              range
+                            ) {
+                              (state, expression) -> CheckedBodyExprBuilt(state, expression)
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 fn checked_body_indexed_length(
   state: owned CheckedBodyBuild,
   types: CheckedBodyPrimitiveTypes,
@@ -14880,6 +15186,19 @@ fn checked_body_expr(
       base,
       index,
       value,
+      expectation
+    )
+    IndexedSlice(base, start, end, _) -> checked_body_indexed_slice(
+      state,
+      source,
+      types,
+      owner,
+      function_result,
+      loop_context,
+      environment,
+      base,
+      start,
+      end,
       expectation
     )
     Perform(effect_ref, operation_start, operation_length, arguments) -> checked_body_perform(
