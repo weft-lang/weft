@@ -1,0 +1,313 @@
+-- A named handler's checked clauses retain their defining source and a
+-- context-specialized expression segment, distinct from the caller's body.
+
+use compiler/project/identity.{
+  HandlerImplementationIdentity,
+  ModuleFunctionIdentity,
+  ModuleIdentity,
+  handler_implementation_module
+}
+use compiler/project/identity/equality.{function_identity_eq, module_identity_eq}
+use compiler/types/graph.{SemanticTypeId}
+use compiler/weft/check/body/borrow/facts.{CheckedBorrowFacts}
+use compiler/weft/check/body/closure.{CheckedClosureGraph}
+use compiler/weft/check/body/continuation.{
+  CheckedContinuationIssue,
+  checked_deferred_continuation_issue,
+  checked_immediate_continuation_issue
+}
+use compiler/weft/check/body/effects.{
+  CheckedDeferredHandlerClause,
+  CheckedEffectGraph,
+  CheckedHandlerClauseListId,
+  CheckedImmediateHandlerClause
+}
+use compiler/weft/check/body/graph.{
+  CheckedExprGraph,
+  checked_expr_id_eq,
+  checked_expr_id_ordinal,
+  checked_expr_segment_id_eq,
+  checked_expr_segment_module,
+  checked_expr_segment_ordinal
+}
+use compiler/weft/check/body/pattern.{CheckedPatternGraph}
+use compiler/weft/check/body/product.{
+  CheckedBodyProductIssue,
+  checked_body_borrow_issue,
+  checked_body_companion_issue,
+  checked_body_continuation_issue,
+  checked_body_segments_agree
+}
+use compiler/weft/check/body/propagation.{CheckedPropagationGraph}
+use stdlib/diagnostic/schema.{
+  DiagnosticSource,
+  DiagnosticSourceBuffer,
+  DiagnosticSourceNamed,
+  DiagnosticSourceUnknown
+}
+use stdlib/option.{Option}
+use stdlib/source.{Source}
+
+pub(package) type CheckedHandlerBodyIssue {
+  CheckedHandlerBodyOrdinarySegment,
+  CheckedHandlerBodyModuleMismatch,
+  CheckedHandlerBodySourceMismatch,
+  CheckedHandlerBodyCompanionSegmentMismatch,
+  CheckedHandlerBodyClauseListMissing,
+  CheckedHandlerBodyClauseCountMismatch(usize, usize),
+  CheckedHandlerBodyClauseOwnerMismatch(usize),
+  CheckedHandlerBodyClauseRootMismatch(usize),
+  CheckedHandlerBodyClauseParameterOwnerMismatch(usize, usize),
+  CheckedHandlerBodyClauseContinuationOwnerMismatch(usize),
+  CheckedHandlerBodyUnownedExpression(usize),
+  CheckedHandlerBodyCompanionRejected(CheckedBodyProductIssue),
+  CheckedHandlerBodyNestedContinuationRejected(CheckedBodyProductIssue),
+  CheckedHandlerBodyContinuationRejected(usize, CheckedContinuationIssue),
+  CheckedHandlerBodyBorrowRejected(CheckedBodyProductIssue)
+}
+
+type CheckedHandlerBodyStorage {
+  implementation: HandlerImplementationIdentity,
+  caller: ModuleIdentity,
+  source_site: usize,
+  result_type: SemanticTypeId,
+  source: Source,
+  clauses: CheckedHandlerClauseListId,
+  expressions: CheckedExprGraph,
+  patterns: CheckedPatternGraph,
+  closures: CheckedClosureGraph,
+  effects: CheckedEffectGraph,
+  propagation: CheckedPropagationGraph,
+  borrows: CheckedBorrowFacts
+}
+
+pub(package) type CheckedHandlerBodyProduct = opaque CheckedHandlerBodyStorage
+
+pub(package) type CheckedHandlerBodyResult {
+  CheckedHandlerBodyAccepted(CheckedHandlerBodyProduct),
+  CheckedHandlerBodyRejected(CheckedHandlerBodyIssue)
+}
+
+fn checked_handler_source_identity_eq(left: DiagnosticSource, right: DiagnosticSource) -> bool {
+  match (left, right) {
+    (DiagnosticSourceUnknown, DiagnosticSourceUnknown) -> true
+    (DiagnosticSourceBuffer(a), DiagnosticSourceBuffer(b)) -> a == b
+    (DiagnosticSourceNamed(a), DiagnosticSourceNamed(b)) -> a == b
+    _ -> false
+  }
+}
+
+fn checked_handler_clause_roots_issue(
+  implementation: HandlerImplementationIdentity,
+  expressions: borrow CheckedExprGraph,
+  effects: borrow CheckedEffectGraph,
+  clauses: CheckedHandlerClauseListId
+) -> CheckedHandlerBodyIssue? {
+  let count = effects.clause_list_len(clauses)
+  if count != expressions.function_len() {
+    return CheckedHandlerBodyClauseCountMismatch(count, expressions.function_len())
+  }
+  let module = handler_implementation_module(implementation)
+  let mut index: usize = 0
+  let mut next_expression: usize = 0
+  while index < count {
+    let clause = effects.clause_list_at(clauses, index)
+    let function = expressions.function(index)
+    if not function_identity_eq(function.identity, ModuleFunctionIdentity(module, index)) {
+      return CheckedHandlerBodyClauseOwnerMismatch(index)
+    }
+    if not checked_expr_id_eq(function.root, clause.body) {
+      return CheckedHandlerBodyClauseRootMismatch(index)
+    }
+    let root_ordinal = checked_expr_id_ordinal(function.root)
+    if root_ordinal < next_expression {
+      return CheckedHandlerBodyClauseRootMismatch(index)
+    }
+    let mut parameter: usize = 0
+    while parameter < effects.parameter_list_len(clause.parameters) {
+      let binding = effects.parameter_list_at(clause.parameters, parameter)
+      if not function_identity_eq(expressions.binding(binding).owner, function.identity) {
+        return CheckedHandlerBodyClauseParameterOwnerMismatch(index, parameter)
+      }
+      parameter = parameter + 1
+    }
+    match clause.continuation {
+      CheckedImmediateHandlerClause -> nil
+      CheckedDeferredHandlerClause(binding) -> if not function_identity_eq(
+        expressions.binding(binding).owner,
+        function.identity
+      ) { return CheckedHandlerBodyClauseContinuationOwnerMismatch(index) }
+    }
+    next_expression = root_ordinal + 1
+    index = index + 1
+  }
+  if next_expression != expressions.len() { CheckedHandlerBodyUnownedExpression(next_expression) }
+  else { nil }
+}
+
+fn checked_handler_continuation_issue(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  clauses: CheckedHandlerClauseListId
+) -> CheckedHandlerBodyIssue? {
+  let mut index: usize = 0
+  while index < effects.clause_list_len(clauses) {
+    let clause = effects.clause_list_at(clauses, index)
+    let issue = match clause.continuation {
+      CheckedImmediateHandlerClause -> checked_immediate_continuation_issue(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        clause.body
+      )
+      CheckedDeferredHandlerClause(binding) -> checked_deferred_continuation_issue(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        clause.body,
+        binding
+      )
+    }
+    match issue {
+      value: CheckedContinuationIssue -> return CheckedHandlerBodyContinuationRejected(
+        index,
+        value
+      )
+      nil -> nil
+    }
+    index = index + 1
+  }
+  nil
+}
+
+pub(package) fn checked_handler_body_product(
+  implementation: HandlerImplementationIdentity,
+  caller: ModuleIdentity,
+  source_site: usize,
+  result_type: SemanticTypeId,
+  source: Source,
+  clauses: CheckedHandlerClauseListId,
+  expressions: CheckedExprGraph,
+  patterns: CheckedPatternGraph,
+  closures: CheckedClosureGraph,
+  effects: CheckedEffectGraph,
+  propagation: CheckedPropagationGraph,
+  borrows: CheckedBorrowFacts
+) -> CheckedHandlerBodyResult {
+  let segment = expressions.segment()
+  if checked_expr_segment_ordinal(segment) == 0 {
+    return CheckedHandlerBodyRejected(CheckedHandlerBodyOrdinarySegment)
+  }
+  if not module_identity_eq(
+    checked_expr_segment_module(segment),
+    handler_implementation_module(implementation)
+  ) { return CheckedHandlerBodyRejected(CheckedHandlerBodyModuleMismatch) }
+  let actual_source = expressions.source()
+  if actual_source.text != source.text or not checked_handler_source_identity_eq(
+    actual_source.identity,
+    source.identity
+  ) { return CheckedHandlerBodyRejected(CheckedHandlerBodySourceMismatch) }
+  if not checked_body_segments_agree(expressions, patterns, closures, effects, propagation) {
+    return CheckedHandlerBodyRejected(CheckedHandlerBodyCompanionSegmentMismatch)
+  }
+  if not effects.contains_clause_list(clauses) {
+    return CheckedHandlerBodyRejected(CheckedHandlerBodyClauseListMissing)
+  }
+  match checked_handler_clause_roots_issue(implementation, expressions, effects, clauses) {
+    issue: CheckedHandlerBodyIssue -> return CheckedHandlerBodyRejected(issue)
+    nil -> nil
+  }
+  match checked_body_companion_issue(expressions, patterns, closures, effects, propagation) {
+    issue: CheckedBodyProductIssue -> return CheckedHandlerBodyRejected(
+      CheckedHandlerBodyCompanionRejected(issue)
+    )
+    nil -> nil
+  }
+  match checked_handler_continuation_issue(
+    expressions,
+    patterns,
+    closures,
+    effects,
+    propagation,
+    clauses
+  ) {
+    issue: CheckedHandlerBodyIssue -> return CheckedHandlerBodyRejected(issue)
+    nil -> nil
+  }
+  match checked_body_continuation_issue(
+    expressions,
+    patterns,
+    closures,
+    effects,
+    propagation
+  ) {
+    issue: CheckedBodyProductIssue -> return CheckedHandlerBodyRejected(
+      CheckedHandlerBodyNestedContinuationRejected(issue)
+    )
+    nil -> nil
+  }
+  match checked_body_borrow_issue(expressions, borrows) {
+    issue: CheckedBodyProductIssue -> CheckedHandlerBodyRejected(
+      CheckedHandlerBodyBorrowRejected(issue)
+    )
+    nil -> CheckedHandlerBodyAccepted(
+      CheckedHandlerBodyProduct(
+        CheckedHandlerBodyStorage {
+          implementation: implementation,
+          caller: caller,
+          source_site: source_site,
+          result_type: result_type,
+          source: source,
+          clauses: clauses,
+          expressions: expressions,
+          patterns: patterns,
+          closures: closures,
+          effects: effects,
+          propagation: propagation,
+          borrows: borrows
+        }
+      )
+    )
+  }
+}
+
+impl CheckedHandlerBodyProduct {
+  pub(package) fn implementation(self: borrow Self) -> HandlerImplementationIdentity {
+    match self { CheckedHandlerBodyProduct(storage) -> storage.implementation }
+  }
+
+  pub(package) fn caller(self: borrow Self) -> ModuleIdentity {
+    match self { CheckedHandlerBodyProduct(storage) -> storage.caller }
+  }
+
+  pub(package) fn source_site(self: borrow Self) -> usize {
+    match self { CheckedHandlerBodyProduct(storage) -> storage.source_site }
+  }
+
+  pub(package) fn result_type(self: borrow Self) -> SemanticTypeId {
+    match self { CheckedHandlerBodyProduct(storage) -> storage.result_type }
+  }
+
+  pub(package) fn source(self: borrow Self) -> Source {
+    match self { CheckedHandlerBodyProduct(storage) -> storage.source }
+  }
+
+  pub(package) fn expressions(self: borrow Self) -> CheckedExprGraph {
+    match self { CheckedHandlerBodyProduct(storage) -> storage.expressions }
+  }
+
+  pub(package) fn effects(self: borrow Self) -> CheckedEffectGraph {
+    match self { CheckedHandlerBodyProduct(storage) -> storage.effects }
+  }
+
+  pub(package) fn clauses(self: borrow Self) -> CheckedHandlerClauseListId {
+    match self { CheckedHandlerBodyProduct(storage) -> storage.clauses }
+  }
+}
