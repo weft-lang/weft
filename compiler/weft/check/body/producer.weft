@@ -49,6 +49,7 @@ use compiler/ir/data.{
   Let,
   LetMut,
   LetTyped,
+  Lambda,
   Loop,
   Match,
   MatchArm,
@@ -128,6 +129,7 @@ use compiler/ir/data.{
   record_construction_type,
   record_update_fact_range,
   type_expr_list_len,
+  param_list_len,
   handler_clause_completion
 }
 use compiler/project/identity.{
@@ -292,7 +294,13 @@ use compiler/types/graph/substitution.{
   semantic_type_substitution_empty,
   semantic_type_substitution_get
 }
-use compiler/weft/check/body/closure.{CheckedClosureBuilder, checked_closure_builder}
+use compiler/weft/check/body/closure.{
+  CheckedBindingListBuilder,
+  CheckedBindingListId,
+  CheckedClosureBuilder,
+  CheckedOrdinaryLambda,
+  checked_closure_builder
+}
 use compiler/weft/check/body/borrow/facts.{checked_borrow_facts_conservative}
 use compiler/weft/check/body/effects.{
   CheckedEffectBuilder,
@@ -346,7 +354,9 @@ use compiler/weft/check/body/graph.{
   CheckedForDestructuring,
   CheckedGreaterOrEqual,
   CheckedGreaterThan,
+  CheckedBinding,
   CheckedBindingId,
+  checked_binding_id_eq,
   CheckedImmutableBinding,
   CheckedBindingMutability,
   CheckedLessOrEqual,
@@ -458,6 +468,8 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerArityMismatch(usize, usize),
   CheckedBodyProducerGenericBoundRejected(SemanticTypeId, SemanticTypeId),
   CheckedBodyProducerGenericInferenceIncomplete(CheckedSourceRange),
+  CheckedBodyProducerLambdaContextRequired(CheckedSourceRange),
+  CheckedBodyProducerLambdaCaptureUnsupported(CheckedSourceRange),
   CheckedBodyProducerGenericDeclarationRequired(CheckedSourceRange),
   CheckedBodyProducerCallableRequired(SemanticTypeId),
   CheckedBodyProducerContinuationConsumerRequired(CheckedSourceRange),
@@ -678,6 +690,15 @@ type CheckedBodyFunctionsBuild {
 type CheckedBodyParametersBuild {
   CheckedBodyParametersBuilt(owned CheckedBodyBuild, CheckedLexicalEnvironment),
   CheckedBodyParametersRejected(owned CheckedBodyBuild, CheckedBodyProducerIssue)
+}
+
+type CheckedLambdaParametersBuild {
+  CheckedLambdaParametersBuilt(
+    owned CheckedBodyBuild,
+    CheckedLexicalEnvironment,
+    List<CheckedBindingId>
+  ),
+  CheckedLambdaParametersRejected(owned CheckedBodyBuild, CheckedBodyProducerIssue)
 }
 
 type CheckedBodyArgumentsBuild {
@@ -1289,6 +1310,29 @@ fn lexical_function_type(environment: CheckedLexicalEnvironment) -> SemanticType
     CheckedLexicalBinding(_, _, _, _, _, parent) -> lexical_function_type(parent)
     CheckedLexicalHandledEffect(_, parent) -> lexical_function_type(parent)
     CheckedLexicalResume(_, _, parent) -> lexical_function_type(parent)
+  }
+}
+
+-- A closure retains lexical values, but starts a new function/effect scope.
+-- Handler and resume scopes in the enclosing expression do not authorize its body.
+fn lexical_lambda_environment(
+  environment: CheckedLexicalEnvironment,
+  function_type: SemanticTypeId
+) -> CheckedLexicalEnvironment {
+  match environment {
+    CheckedLexicalRoot(scope, module, parameters, _) ->
+      CheckedLexicalRoot(scope, module, parameters, function_type)
+    CheckedLexicalBinding(start, length, binding, value_type, mutable, parent) ->
+      CheckedLexicalBinding(
+        start,
+        length,
+        binding,
+        value_type,
+        mutable,
+        lexical_lambda_environment(parent, function_type)
+      )
+    CheckedLexicalHandledEffect(_, parent) -> lexical_lambda_environment(parent, function_type)
+    CheckedLexicalResume(_, _, parent) -> lexical_lambda_environment(parent, function_type)
   }
 }
 
@@ -2116,6 +2160,39 @@ fn checked_body_record_fields_into(
       )
     }
     _ -> panic("Record pattern field preparation lost its ordinal")
+  }
+}
+
+fn checked_closure_push_bindings(
+  closures: owned CheckedClosureBuilder,
+  expressions: borrow CheckedExprGraphBuilder,
+  list: CheckedBindingListBuilder,
+  bindings: List<CheckedBindingId>
+) -> (owned CheckedClosureBuilder, CheckedBindingListId) {
+  match bindings {
+    Nil -> closures.finish_binding_list(list)
+    Cons(binding, remaining) -> match closures.binding_list_push(
+      expressions,
+      list,
+      binding
+    ) {
+      (closures, next) -> checked_closure_push_bindings(
+        closures,
+        expressions,
+        next,
+        remaining
+      )
+    }
+  }
+}
+
+fn checked_closure_bindings(
+  closures: owned CheckedClosureBuilder,
+  expressions: borrow CheckedExprGraphBuilder,
+  bindings: List<CheckedBindingId>
+) -> (owned CheckedClosureBuilder, CheckedBindingListId) {
+  match closures.binding_list() {
+    (closures, list) -> checked_closure_push_bindings(closures, expressions, list, bindings)
   }
 }
 
@@ -3680,6 +3757,98 @@ impl CheckedBodyBuild {
     }
   }
 
+  fn expression_count(self: borrow Self) -> usize {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        expressions.len()
+      }
+    }
+  }
+
+  fn binding_count(self: borrow Self) -> usize {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        expressions.binding_len()
+      }
+    }
+  }
+
+  fn binding_info(
+    self: borrow Self,
+    binding: CheckedBindingId
+  ) -> CheckedBinding {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        expressions.binding_info(binding)
+      }
+    }
+  }
+
+  fn outer_references_since(
+    self: borrow Self,
+    first_expression: usize,
+    first_binding: usize
+  ) -> List<CheckedBindingId> {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        expressions.outer_references_since(first_expression, first_binding)
+      }
+    }
+  }
+
+  fn lambda(
+    self: owned Self,
+    parameters: List<CheckedBindingId>,
+    captures: List<CheckedBindingId>,
+    body: CheckedExprId,
+    source_site: usize,
+    result: SemanticTypeId,
+    range: CheckedSourceRange
+  ) -> (owned CheckedBodyBuild, CheckedExprId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match checked_closure_bindings(closures, expressions, parameters) {
+          (closures, parameters) -> match checked_closure_bindings(
+            closures,
+            expressions,
+            captures
+          ) {
+            (closures, captures) -> match closures.lambda(
+              expressions,
+              parameters,
+              captures,
+              body,
+              source_site,
+              CheckedOrdinaryLambda,
+              false
+            ) {
+              (closures, lambda) -> match expressions.lambda(lambda, result, range) {
+                (expressions, expression) -> (
+                  CheckedBodyBuild(
+                    CheckedBodyBuildStorage {
+                      signatures: signatures,
+                      expressions: expressions,
+                      patterns: patterns,
+                      closures: closures,
+                      effects: effects,
+                      propagation: propagation
+                    }
+                  ),
+                  expression
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   fn block(
     self: owned Self,
     first: CheckedExprId,
@@ -4315,6 +4484,265 @@ fn checked_body_parameters(
         state,
         CheckedBodyProducerUnsupportedParameter
       )
+    }
+  }
+}
+
+fn checked_body_lambda_parameters(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_type: SemanticTypeId,
+  parameters: ParamList,
+  index: usize,
+  environment: CheckedLexicalEnvironment,
+  bindings: List<CheckedBindingId>
+) -[SemanticConformance]> CheckedLambdaParametersBuild {
+  let catalog = state.types()
+  match parameters {
+    ParamListNil -> if index == semantic_function_parameter_count(catalog, function_type) {
+      CheckedLambdaParametersBuilt(state, environment, bindings)
+    } else {
+      CheckedLambdaParametersRejected(
+        state,
+        CheckedBodyProducerArityMismatch(
+          semantic_function_parameter_count(catalog, function_type),
+          index
+        )
+      )
+    }
+    ParamListCons(parameter, rest) -> if index >= semantic_function_parameter_count(
+      catalog,
+      function_type
+    ) {
+      CheckedLambdaParametersRejected(
+        state,
+        CheckedBodyProducerArityMismatch(
+          semantic_function_parameter_count(catalog, function_type),
+          index + __i64_to_usize(param_list_len(parameters))
+        )
+      )
+    } else {
+      match parameter {
+        Param(start, length, annotation, _) -> match source_range(source, start, length) {
+          range: CheckedSourceRange -> {
+            let expected = semantic_function_parameter(catalog, function_type, index)
+            match annotation {
+              MissingTypeExpr -> match state.binding(
+                owner,
+                expected,
+                range,
+                CheckedImmutableBinding
+              ) {
+                (state, binding) -> checked_body_lambda_parameters(
+                  state,
+                  source,
+                  types,
+                  owner,
+                  function_type,
+                  rest,
+                  index + 1,
+                  CheckedLexicalBinding(
+                    start,
+                    length,
+                    binding,
+                    expected,
+                    false,
+                    environment
+                  ),
+                  bindings.append(binding)
+                )
+              }
+              _ -> {
+                let resolution = types.resolution
+                let segment = catalog.next_derived_segment(
+                  types.module.identity,
+                  resolution.next_type_segment()
+                )
+                match resolve_type_product_in_scope(
+                  semantic_type_product_continue(types.module.identity, catalog, segment),
+                  types.module,
+                  lexical_scope(environment),
+                  lexical_type_parameters(environment),
+                  annotation
+                ) {
+                  (_, SemanticTypeRejected(issue)) -> CheckedLambdaParametersRejected(
+                    state,
+                    CheckedBodyProducerTypeRejected(issue)
+                  )
+                  (product, SemanticTypeResolved(declared)) -> {
+                    let next_catalog = semantic_type_product_catalog(product)
+                    if not semantic_type_is_subtype(next_catalog, expected, declared) {
+                      CheckedLambdaParametersRejected(
+                        state,
+                        CheckedBodyProducerTypeMismatch(expected, declared)
+                      )
+                    } else {
+                      match state.with_types(next_catalog).binding(
+                        owner,
+                        declared,
+                        range,
+                        CheckedImmutableBinding
+                      ) {
+                        (state, binding) -> checked_body_lambda_parameters(
+                          state,
+                          source,
+                          types,
+                          owner,
+                          function_type,
+                          rest,
+                          index + 1,
+                          CheckedLexicalBinding(
+                            start,
+                            length,
+                            binding,
+                            declared,
+                            false,
+                            environment
+                          ),
+                          bindings.append(binding)
+                        )
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          nil -> CheckedLambdaParametersRejected(state, CheckedBodyProducerInvalidRange)
+        }
+        _ -> CheckedLambdaParametersRejected(
+          state,
+          CheckedBodyProducerUnsupportedParameter
+        )
+      }
+    }
+  }
+}
+
+-- Primitive values can be copied into an immutable closure environment.
+-- Aggregate, borrowed, unique and resource captures need ownership proofs
+-- that this producer does not yet publish, so they remain structural refusals.
+fn checked_body_lambda_captures_safe(
+  state: borrow CheckedBodyBuild,
+  captures: List<CheckedBindingId>
+) -> bool {
+  match captures {
+    Nil -> true
+    Cons(binding, remaining) -> {
+      let detail = state.binding_info(binding)
+      match detail.mutability {
+        CheckedMutableBinding -> false
+        CheckedImmutableBinding -> {
+          let catalog = state.types()
+          match catalog.graph_for(detail.value_type) {
+            Some(graph) -> match semantic_type_graph_node(graph, detail.value_type) {
+              SemanticPrimitiveNode(_) -> checked_body_lambda_captures_safe(state, remaining)
+              _ -> false
+            }
+            None -> false
+          }
+        }
+      }
+    }
+  }
+}
+
+fn checked_body_lambda(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
+  parameters: ParamList,
+  body: Expr,
+  source_site: i64,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  match source_range(source, source_site, 2) {
+    nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+    site: CheckedSourceRange -> match expectation {
+      CheckedInferResult -> CheckedBodyExprRejected(
+        state,
+        CheckedBodyProducerLambdaContextRequired(site)
+      )
+      CheckedRequireResult(function_type) -> {
+        let catalog = state.types()
+        match catalog.graph_for(function_type) {
+          Some(graph) -> match semantic_type_graph_node(graph, function_type) {
+            SemanticFunctionNode(_, result, _) -> {
+              let first_expression = state.expression_count()
+              let first_binding = state.binding_count()
+              match checked_body_lambda_parameters(
+                state,
+                source,
+                types,
+                owner,
+                function_type,
+                parameters,
+                0,
+                lexical_lambda_environment(environment, function_type),
+                Nil<CheckedBindingId>()
+              ) {
+                CheckedLambdaParametersRejected(state, issue) ->
+                  CheckedBodyExprRejected(state, issue)
+                CheckedLambdaParametersBuilt(state, lambda_environment, bindings) ->
+                  match checked_body_expr(
+                    state,
+                    source,
+                    types,
+                    owner,
+                    result,
+                    CheckedOutsideLoop,
+                    lambda_environment,
+                    body,
+                    CheckedRequireResult(result)
+                  ) {
+                    CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+                    CheckedBodyExprBuilt(state, checked_body) -> {
+                      let captures = state.outer_references_since(
+                        first_expression,
+                        first_binding
+                      )
+                      if not checked_body_lambda_captures_safe(state, captures) {
+                        CheckedBodyExprRejected(
+                          state,
+                          CheckedBodyProducerLambdaCaptureUnsupported(site)
+                        )
+                      } else {
+                        match covering_range(site, state.range(checked_body)) {
+                          nil -> CheckedBodyExprRejected(
+                            state,
+                            CheckedBodyProducerInvalidRange
+                          )
+                          range: CheckedSourceRange -> match state.lambda(
+                            bindings,
+                            captures,
+                            checked_body,
+                            __i64_to_usize(source_site),
+                            function_type,
+                            range
+                          ) {
+                            (state, expression) -> CheckedBodyExprBuilt(state, expression)
+                          }
+                        }
+                      }
+                    }
+                  }
+              }
+            }
+            _ -> CheckedBodyExprRejected(
+              state,
+              CheckedBodyProducerCallableRequired(function_type)
+            )
+          }
+          _ -> CheckedBodyExprRejected(
+            state,
+            CheckedBodyProducerCallableRequired(function_type)
+          )
+        }
+      }
     }
   }
 }
@@ -14119,6 +14547,17 @@ fn checked_body_expr(
       environment,
       type_arguments,
       inner,
+      expectation
+    )
+    Lambda(parameters, body, source_site) -> checked_body_lambda(
+      state,
+      source,
+      types,
+      owner,
+      environment,
+      parameters,
+      body,
+      source_site,
       expectation
     )
     Apply(callee, arguments, _, site) -> checked_body_apply(
