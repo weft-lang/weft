@@ -2,17 +2,21 @@
 -- context-specialized expression segment, distinct from the caller's body.
 
 use compiler/project/identity.{
+  EffectOperationDeclaration,
   HandlerImplementationIdentity,
+  MemberDeclarationIdentity,
   ModuleFunctionIdentity,
   ModuleIdentity,
   handler_implementation_module
 }
 use compiler/project/identity/equality.{
+  declaration_identity_eq,
   function_identity_eq,
   handler_implementation_identity_eq,
   module_identity_eq
 }
-use compiler/types/graph.{SemanticTypeId}
+use compiler/types/graph.{SemanticEffectAtomNode, SemanticTypeId, semantic_type_graph_node}
+use compiler/types/graph/equality.{semantic_type_catalog_equal}
 use compiler/weft/check/body/borrow/facts.{CheckedBorrowFacts}
 use compiler/weft/check/body/closure.{CheckedClosureGraph}
 use compiler/weft/check/body/continuation.{
@@ -44,6 +48,8 @@ use compiler/weft/check/body/product.{
   checked_body_segments_agree
 }
 use compiler/weft/check/body/propagation.{CheckedPropagationGraph}
+use compiler/weft/check/resolution/handler_contract.{SemanticHandlerClauseRequirement}
+use stdlib/list.{List}
 use stdlib/diagnostic/schema.{
   DiagnosticSource,
   DiagnosticSourceBuffer,
@@ -57,10 +63,17 @@ pub(package) type CheckedHandlerBodyIssue {
   CheckedHandlerBodyOrdinarySegment,
   CheckedHandlerBodyModuleMismatch,
   CheckedHandlerBodySourceMismatch,
+  CheckedHandlerBodyAtomRequired,
   CheckedHandlerBodyResultTypeMissing,
   CheckedHandlerBodyCompanionSegmentMismatch,
   CheckedHandlerBodyClauseListMissing,
   CheckedHandlerBodyClauseCountMismatch(usize, usize),
+  CheckedHandlerBodyRequirementCountMismatch(usize, usize),
+  CheckedHandlerBodyClauseEffectMismatch(usize),
+  CheckedHandlerBodyClauseOperationMismatch(usize),
+  CheckedHandlerBodyClauseAtomMismatch(usize),
+  CheckedHandlerBodyClauseParameterCountMismatch(usize, usize, usize),
+  CheckedHandlerBodyClauseDeferredMismatch(usize),
   CheckedHandlerBodyClauseOwnerMismatch(usize),
   CheckedHandlerBodyClauseRootMismatch(usize),
   CheckedHandlerBodyClauseParameterOwnerMismatch(usize, usize),
@@ -76,6 +89,7 @@ type CheckedHandlerBodyStorage {
   implementation: HandlerImplementationIdentity,
   caller: ModuleIdentity,
   source_site: usize,
+  atom: SemanticTypeId,
   result_type: SemanticTypeId,
   source: Source,
   clauses: CheckedHandlerClauseListId,
@@ -99,6 +113,7 @@ pub(package) type CheckedHandlerBodyLinkIssue {
   CheckedHandlerBodyLinkCallerMismatch,
   CheckedHandlerBodyLinkSegmentMismatch,
   CheckedHandlerBodyLinkSiteMismatch,
+  CheckedHandlerBodyLinkAtomMismatch,
   CheckedHandlerBodyLinkBodyMissing
 }
 
@@ -121,6 +136,10 @@ pub(package) fn checked_handler_body_link_issue(
     return CheckedHandlerBodyLinkSegmentMismatch
   }
   if product.source_site() != install.source_site { return CheckedHandlerBodyLinkSiteMismatch }
+  let caller_types = caller.types()
+  if not semantic_type_catalog_equal(caller_types, product.atom(), install.atom) {
+    return CheckedHandlerBodyLinkAtomMismatch
+  }
   if not caller.contains(install.body) { CheckedHandlerBodyLinkBodyMissing }
   else { nil }
 }
@@ -138,17 +157,51 @@ fn checked_handler_clause_roots_issue(
   implementation: HandlerImplementationIdentity,
   expressions: borrow CheckedExprGraph,
   effects: borrow CheckedEffectGraph,
-  clauses: CheckedHandlerClauseListId
+  atom: SemanticTypeId,
+  clauses: CheckedHandlerClauseListId,
+  requirements: List<SemanticHandlerClauseRequirement>
 ) -> CheckedHandlerBodyIssue? {
   let count = effects.clause_list_len(clauses)
   if count != expressions.function_len() {
     return CheckedHandlerBodyClauseCountMismatch(count, expressions.function_len())
   }
+  if count != requirements.len() {
+    return CheckedHandlerBodyRequirementCountMismatch(count, requirements.len())
+  }
+  let catalog = expressions.types()
   let module = handler_implementation_module(implementation)
   let mut index: usize = 0
   let mut next_expression: usize = 0
   while index < count {
     let clause = effects.clause_list_at(clauses, index)
+    let requirement = requirements.get(index).unwrap()
+    let effect_declaration = match requirement.operation {
+      MemberDeclarationIdentity(owner, EffectOperationDeclaration, _) -> owner
+      _ -> return CheckedHandlerBodyClauseOperationMismatch(index)
+    }
+    if not declaration_identity_eq(clause.effect_declaration, effect_declaration) {
+      return CheckedHandlerBodyClauseEffectMismatch(index)
+    }
+    if not declaration_identity_eq(clause.operation, requirement.operation) {
+      return CheckedHandlerBodyClauseOperationMismatch(index)
+    }
+    if not semantic_type_catalog_equal(catalog, requirement.atom, atom) or
+      not
+      semantic_type_catalog_equal(catalog, clause.atom, requirement.atom) {
+        return CheckedHandlerBodyClauseAtomMismatch(index)
+      }
+    let parameter_count = effects.parameter_list_len(clause.parameters)
+    if parameter_count != requirement.parameter_count {
+      return CheckedHandlerBodyClauseParameterCountMismatch(
+        index,
+        requirement.parameter_count,
+        parameter_count
+      )
+    }
+    if match clause.continuation {
+      CheckedDeferredHandlerClause(_) -> not requirement.allows_deferred
+      _ -> false
+    } { return CheckedHandlerBodyClauseDeferredMismatch(index) }
     let function = expressions.function(index)
     if not function_identity_eq(function.identity, ModuleFunctionIdentity(module, index)) {
       return CheckedHandlerBodyClauseOwnerMismatch(index)
@@ -228,8 +281,10 @@ pub(package) fn checked_handler_body_product(
   implementation: HandlerImplementationIdentity,
   caller: ModuleIdentity,
   source_site: usize,
+  atom: SemanticTypeId,
   result_type: SemanticTypeId,
   source: Source,
+  requirements: List<SemanticHandlerClauseRequirement>,
   clauses: CheckedHandlerClauseListId,
   expressions: CheckedExprGraph,
   patterns: CheckedPatternGraph,
@@ -252,6 +307,13 @@ pub(package) fn checked_handler_body_product(
     source.identity
   ) { return CheckedHandlerBodyRejected(CheckedHandlerBodySourceMismatch) }
   let catalog = expressions.types()
+  if match catalog.graph_for(atom) {
+    None -> true
+    Some(graph) -> match semantic_type_graph_node(graph, atom) {
+      SemanticEffectAtomNode(_, _) -> false
+      _ -> true
+    }
+  } { return CheckedHandlerBodyRejected(CheckedHandlerBodyAtomRequired) }
   if match catalog.graph_for(result_type) { None -> true, _ -> false } {
     return CheckedHandlerBodyRejected(CheckedHandlerBodyResultTypeMissing)
   }
@@ -261,7 +323,14 @@ pub(package) fn checked_handler_body_product(
   if not effects.contains_clause_list(clauses) {
     return CheckedHandlerBodyRejected(CheckedHandlerBodyClauseListMissing)
   }
-  match checked_handler_clause_roots_issue(implementation, expressions, effects, clauses) {
+  match checked_handler_clause_roots_issue(
+    implementation,
+    expressions,
+    effects,
+    atom,
+    clauses,
+    requirements
+  ) {
     issue: CheckedHandlerBodyIssue -> return CheckedHandlerBodyRejected(issue)
     nil -> nil
   }
@@ -304,6 +373,7 @@ pub(package) fn checked_handler_body_product(
           implementation: implementation,
           caller: caller,
           source_site: source_site,
+          atom: atom,
           result_type: result_type,
           source: source,
           clauses: clauses,
@@ -334,6 +404,10 @@ impl CheckedHandlerBodyProduct {
 
   pub(package) fn result_type(self: borrow Self) -> SemanticTypeId {
     match self { CheckedHandlerBodyProduct(storage) -> storage.result_type }
+  }
+
+  pub(package) fn atom(self: borrow Self) -> SemanticTypeId {
+    match self { CheckedHandlerBodyProduct(storage) -> storage.atom }
   }
 
   pub(package) fn source(self: borrow Self) -> Source {
