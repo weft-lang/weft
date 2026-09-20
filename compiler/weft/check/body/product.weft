@@ -7,9 +7,16 @@
 
 use compiler/project/identity/equality.{function_identity_eq, module_identity_eq}
 use compiler/project/identity.{FunctionIdentity}
+use compiler/weft/check/body/borrow.{
+  checked_borrow_origins_exclusive,
+  checked_borrow_origins_valid_for_function
+}
+use compiler/weft/check/body/borrow/facts.{CheckedBorrowFacts}
 use compiler/types/graph.{
   SemanticContinuationNode,
   SemanticFunctionNode,
+  SemanticMutable,
+  SemanticSliceNode,
   semantic_type_graph_node,
   semantic_type_graph_type_lists_local,
   semantic_type_list_len
@@ -44,6 +51,7 @@ use compiler/weft/check/body/graph.{
   CheckedForDestructuringKind,
   CheckedHandleKind,
   CheckedHandlerInstallKind,
+  CheckedIndexedSliceKind,
   CheckedLambdaKind,
   CheckedLetDestructuringKind,
   CheckedPerformKind,
@@ -61,6 +69,7 @@ use compiler/weft/check/body/propagation.{
   CheckedStructuralOptionalProjectionDetailKind
 }
 use compiler/weft/check/signatures.{SemanticFunctionSignature, SemanticSignatureProduct}
+use stdlib/list.{Cons, List, Nil}
 use stdlib/option.{None, Option, Some}
 use stdlib/panic.{panic}
 
@@ -80,6 +89,13 @@ pub(package) type CheckedBodyProductIssue {
   CheckedBodyFunctionRootMissing(usize),
   CheckedBodyFunctionRootOutOfOrder(usize),
   CheckedBodyUnownedExpression(usize),
+  CheckedBodyBorrowSegmentMismatch,
+  CheckedBodyBorrowFactOutOfRange(usize),
+  CheckedBodyBorrowFactInconsistent(usize),
+  CheckedBodyBorrowViewTypeMismatch(usize),
+  CheckedBodyBorrowViewAccessMismatch(usize),
+  CheckedBodyBorrowInvalidOrigin(usize),
+  CheckedBodyBorrowViewMissing(usize),
   CheckedBodyCompanionReferenceMissing(usize),
   CheckedBodyCompanionKindMismatch(usize),
   CheckedBodyMatchArmListMissing(usize),
@@ -99,7 +115,8 @@ type CheckedBodyProductStorage {
   patterns: CheckedPatternGraph,
   closures: CheckedClosureGraph,
   effects: CheckedEffectGraph,
-  propagation: CheckedPropagationGraph
+  propagation: CheckedPropagationGraph,
+  borrows: CheckedBorrowFacts
 }
 
 pub(package) type CheckedBodyProduct = opaque CheckedBodyProductStorage
@@ -405,13 +422,127 @@ fn checked_body_continuation_issue(
   nil
 }
 
+fn checked_body_expression_owner_in_graph(
+  expressions: borrow CheckedExprGraph,
+  expression: CheckedExprId
+) -> Option<FunctionIdentity> {
+  if not expressions.contains(expression) { None<FunctionIdentity>() }
+  else {
+    let ordinal = checked_expr_id_ordinal(expression)
+    let mut index: usize = 0
+    while index < expressions.function_len() {
+      let function = expressions.function(index)
+      if ordinal <= checked_expr_id_ordinal(function.root) {
+        return Some<FunctionIdentity>(function.identity)
+      } else { nil }
+      index = index + 1
+    }
+    None<FunctionIdentity>()
+  }
+}
+
+fn checked_body_borrow_entries_issue(
+  expressions: borrow CheckedExprGraph,
+  borrows: borrow CheckedBorrowFacts,
+  ordinals: List<usize>,
+  view: bool
+) -> CheckedBodyProductIssue? {
+  let mut remaining = ordinals
+  while match remaining { Nil -> false, _ -> true } {
+    match remaining {
+      Nil -> nil
+      Cons(ordinal, rest) -> {
+        if ordinal >= expressions.len() {
+          return CheckedBodyBorrowFactOutOfRange(ordinal)
+        } else { nil }
+        let expression = checked_expr_id_from_ordinal(expressions.segment(), ordinal)
+        let origins = if view { borrows.view(expression) }
+        else { borrows.contained(expression) }
+        match origins {
+          None -> return CheckedBodyBorrowFactInconsistent(ordinal)
+          Some(origins) -> {
+            let (shape_ok, access_ok) = if not view { (true, true) }
+            else {
+              let result = expressions.result_type(expression)
+              let catalog = expressions.types()
+              match catalog.graph_for(result) {
+                None -> (false, false)
+                Some(graph) -> match semantic_type_graph_node(graph, result) {
+                  SemanticSliceNode(_, SemanticMutable) -> (
+                    true,
+                    checked_borrow_origins_exclusive(origins)
+                  )
+                  SemanticSliceNode(_, _) -> (true, true)
+                  _ -> (false, false)
+                }
+              }
+            }
+            if not shape_ok { return CheckedBodyBorrowViewTypeMismatch(ordinal) }
+            else if not access_ok { return CheckedBodyBorrowViewAccessMismatch(ordinal) }
+            else { nil }
+            match checked_body_expression_owner_in_graph(expressions, expression) {
+              None -> return CheckedBodyBorrowInvalidOrigin(ordinal)
+              Some(owner) -> if not checked_borrow_origins_valid_for_function(
+                expressions,
+                owner,
+                origins
+              ) { return CheckedBodyBorrowInvalidOrigin(ordinal) } else { nil }
+            }
+            remaining = rest
+          }
+        }
+      }
+    }
+  }
+  nil
+}
+
+fn checked_body_borrow_issue(
+  expressions: borrow CheckedExprGraph,
+  borrows: borrow CheckedBorrowFacts
+) -> CheckedBodyProductIssue? {
+  if not checked_expr_segment_id_eq(expressions.segment(), borrows.segment()) {
+    CheckedBodyBorrowSegmentMismatch
+  } else {
+    match checked_body_borrow_entries_issue(expressions, borrows, borrows.view_ordinals(), true) {
+      issue: CheckedBodyProductIssue -> return issue
+      nil -> match checked_body_borrow_entries_issue(
+        expressions,
+        borrows,
+        borrows.contained_ordinals(),
+        false
+      ) {
+        issue: CheckedBodyProductIssue -> return issue
+        nil -> {
+          let mut ordinal: usize = 0
+          while ordinal < expressions.len() {
+            let expression = checked_expr_id_from_ordinal(expressions.segment(), ordinal)
+            if match expressions.kind(expression) {
+              CheckedIndexedSliceKind -> true
+              _ -> false
+            } {
+              match borrows.view(expression) {
+                None -> return CheckedBodyBorrowViewMissing(ordinal)
+                Some(_) -> nil
+              }
+            } else { nil }
+            ordinal = ordinal + 1
+          }
+          nil
+        }
+      }
+    }
+  }
+}
+
 pub(package) fn checked_body_product(
   signatures: SemanticSignatureProduct,
   expressions: CheckedExprGraph,
   patterns: CheckedPatternGraph,
   closures: CheckedClosureGraph,
   effects: CheckedEffectGraph,
-  propagation: CheckedPropagationGraph
+  propagation: CheckedPropagationGraph,
+  borrows: CheckedBorrowFacts
 ) -> CheckedBodyProductResult {
   if not module_identity_eq(
     signatures.module(),
@@ -444,18 +575,22 @@ pub(package) fn checked_body_product(
             propagation
           ) {
             issue: CheckedBodyProductIssue -> CheckedBodyProductRejected(issue)
-            nil -> CheckedBodyProductAccepted(
-              CheckedBodyProduct(
-                CheckedBodyProductStorage {
-                  signatures: signatures,
-                  expressions: expressions,
-                  patterns: patterns,
-                  closures: closures,
-                  effects: effects,
-                  propagation: propagation
-                }
+            nil -> match checked_body_borrow_issue(expressions, borrows) {
+              issue: CheckedBodyProductIssue -> CheckedBodyProductRejected(issue)
+              nil -> CheckedBodyProductAccepted(
+                CheckedBodyProduct(
+                  CheckedBodyProductStorage {
+                    signatures: signatures,
+                    expressions: expressions,
+                    patterns: patterns,
+                    closures: closures,
+                    effects: effects,
+                    propagation: propagation,
+                    borrows: borrows
+                  }
+                )
               )
-            )
+            }
           }
         }
       }
@@ -471,19 +606,7 @@ impl CheckedBodyProduct {
     expression: CheckedExprId
   ) -> Option<FunctionIdentity> {
     let expressions = self.expressions()
-    if not expressions.contains(expression) { None<FunctionIdentity>() }
-    else {
-      let ordinal = checked_expr_id_ordinal(expression)
-      let mut index: usize = 0
-      while index < expressions.function_len() {
-        let function = expressions.function(index)
-        if ordinal <= checked_expr_id_ordinal(function.root) {
-          return Some<FunctionIdentity>(function.identity)
-        } else { nil }
-        index = index + 1
-      }
-      None<FunctionIdentity>()
-    }
+    checked_body_expression_owner_in_graph(expressions, expression)
   }
 
   pub(package) fn signatures(self: borrow Self) -> SemanticSignatureProduct {
@@ -508,6 +631,10 @@ impl CheckedBodyProduct {
 
   pub(package) fn propagation(self: borrow Self) -> CheckedPropagationGraph {
     match self { CheckedBodyProduct(storage) -> storage.propagation }
+  }
+
+  pub(package) fn borrows(self: borrow Self) -> CheckedBorrowFacts {
+    match self { CheckedBodyProduct(storage) -> storage.borrows }
   }
 
   pub(package) fn function_count(self: borrow Self) -> usize {

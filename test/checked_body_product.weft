@@ -8,19 +8,34 @@ use compiler/project/identity.{
 use compiler/project/identity/equality.{function_identity_eq}
 use compiler/source/input.{source_from_text}
 use compiler/types/graph.{
+  SemanticArrayNode,
   SemanticFunctionNode,
+  SemanticSliceNode,
   SemanticTypeId,
+  semantic_type_graph_list_type_id,
   semantic_type_graph_node,
+  semantic_type_graph_type_lists_local,
+  semantic_type_list_edge,
   semantic_type_id_eq
 }
 use compiler/types/graph/catalog.{SemanticTypeCatalog}
 use compiler/weft/check/body/closure.{checked_closure_builder}
+use compiler/weft/check/body/borrow/facts.{checked_borrow_facts_empty}
+use compiler/weft/check/body/borrow.{
+  CheckedBorrowOrigin,
+  CheckedCallerStorage,
+  CheckedLocalStorage,
+  CheckedSharedAccess,
+  checked_borrow_origins_single
+}
 use compiler/weft/check/body/effects.{checked_effect_builder}
 use compiler/weft/check/body/graph.{
   CheckedImmutableBinding,
   CheckedSourceRange,
   checked_expr_graph_builder,
-  checked_expr_id_eq
+  checked_expr_id_from_ordinal,
+  checked_expr_id_eq,
+  checked_expr_segment_id
 }
 use compiler/weft/check/body/pattern.{checked_pattern_graph_builder}
 use compiler/weft/check/body/product.{*}
@@ -87,6 +102,22 @@ fn signature_result(
   }
 }
 
+fn first_parameter_type(
+  catalog: borrow SemanticTypeCatalog,
+  signature: SemanticFunctionSignature
+) -> SemanticTypeId {
+  match catalog.graph_for(signature.type_id) {
+    Some(graph) -> match semantic_type_graph_node(graph, signature.type_id) {
+      SemanticFunctionNode(parameters, _, _) -> {
+        let lists = semantic_type_graph_type_lists_local(graph)
+        semantic_type_graph_list_type_id(graph, semantic_type_list_edge(lists, parameters, 0))
+      }
+      _ -> panic("expected function signature")
+    }
+    _ -> panic("expected signature graph")
+  }
+}
+
 fn range(start: usize, end: usize) -> CheckedSourceRange {
   CheckedSourceRange { start: start, end: end }
 }
@@ -123,7 +154,239 @@ fn complete_body(
     patterns.freeze(),
     closures.freeze(),
     effects.freeze(),
-    propagation.freeze()
+    propagation.freeze(),
+    checked_borrow_facts_empty(checked_expr_segment_id(module.identity))
+  )
+}
+
+type SliceFactCase {
+  MissingSliceFact,
+  ValidSliceFact,
+  MisclassifiedSliceFact,
+  ForeignSliceFactSegment,
+  OutOfRangeSliceFact,
+  WrongViewTypeFact,
+  SharedMutableViewFact,
+  MisclassifiedContainedFact
+}
+
+fn slice_body(case: SliceFactCase) -[Test]> CheckedBodyProductResult {
+  let identity = named_module_identity("fixture/checked_borrow_product", 88)
+  let text = match case {
+    SharedMutableViewFact -> "fn view(input: [mut i64]) -> [mut i64] { input[..] }"
+    _ -> "fn view(input: [i64; 2]) -> [i64] { input[..] }"
+  }
+  let module = registered(text, identity)
+  let product = signatures(module)
+  let signature = product.at(0)
+  let catalog = product.catalog()
+  let array_type = first_parameter_type(catalog, signature)
+  let element_type = match catalog.graph_for(array_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, array_type) {
+      SemanticArrayNode(element, _) -> element
+      SemanticSliceNode(element, _) -> element
+      _ -> panic("expected indexed parameter")
+    }
+    _ -> panic("expected array graph")
+  }
+  let slice_type = signature_result(catalog, signature)
+  let expressions = checked_expr_graph_builder(module.identity, module.source, catalog, 4)
+  let patterns = checked_pattern_graph_builder(expressions.segment(), module.source, catalog)
+  let closures = checked_closure_builder(expressions, 0)
+  let effects = checked_effect_builder(expressions, 0)
+  let propagation = checked_propagation_builder(expressions, 0)
+  let (expressions, parameter) = expressions.binding(
+    signature.identity,
+    array_type,
+    range(8, 13),
+    CheckedImmutableBinding
+  )
+  let expressions = expressions.function_parameter(parameter)
+  let (expressions, base) = expressions.local_reference(parameter, array_type, range(40, 45))
+  let (expressions, start) = expressions.integer(0, element_type, range(0, 0))
+  let (expressions, end) = expressions.integer(2, element_type, range(0, 0))
+  let (expressions, slice) = expressions.indexed_slice(
+    base,
+    start,
+    end,
+    element_type,
+    slice_type,
+    range(40, 47)
+  )
+  let expressions = expressions.function(signature.identity, slice)
+  let empty = checked_borrow_facts_empty(checked_expr_segment_id(module.identity))
+  let borrows = match case {
+    MissingSliceFact -> empty
+    ValidSliceFact -> match empty.with_view(
+      slice,
+      checked_borrow_origins_single(
+        CheckedBorrowOrigin {
+          storage: CheckedCallerStorage(parameter),
+          access: CheckedSharedAccess
+        }
+      )
+    ) {
+      Some(facts) -> facts
+      None -> panic("expected view fact")
+    }
+    MisclassifiedSliceFact -> match empty.with_view(
+      slice,
+      checked_borrow_origins_single(
+        CheckedBorrowOrigin {
+          storage: CheckedLocalStorage(parameter),
+          access: CheckedSharedAccess
+        }
+      )
+    ) {
+      Some(facts) -> facts
+      None -> panic("expected view fact")
+    }
+    ForeignSliceFactSegment -> checked_borrow_facts_empty(
+      checked_expr_segment_id(named_module_identity("fixture/other_borrow_product", 88))
+    )
+    OutOfRangeSliceFact -> match empty.with_view(
+      checked_expr_id_from_ordinal(expressions.segment(), 9),
+      checked_borrow_origins_single(
+        CheckedBorrowOrigin {
+          storage: CheckedCallerStorage(parameter),
+          access: CheckedSharedAccess
+        }
+      )
+    ) {
+      Some(facts) -> facts
+      None -> panic("expected view fact")
+    }
+    WrongViewTypeFact -> match empty.with_view(
+      base,
+      checked_borrow_origins_single(
+        CheckedBorrowOrigin {
+          storage: CheckedCallerStorage(parameter),
+          access: CheckedSharedAccess
+        }
+      )
+    ) {
+      Some(facts) -> facts
+      None -> panic("expected view fact")
+    }
+    SharedMutableViewFact -> match empty.with_view(
+      slice,
+      checked_borrow_origins_single(
+        CheckedBorrowOrigin {
+          storage: CheckedCallerStorage(parameter),
+          access: CheckedSharedAccess
+        }
+      )
+    ) {
+      Some(facts) -> facts
+      None -> panic("expected view fact")
+    }
+    MisclassifiedContainedFact -> {
+      let views = match empty.with_view(
+        slice,
+        checked_borrow_origins_single(
+          CheckedBorrowOrigin {
+            storage: CheckedCallerStorage(parameter),
+            access: CheckedSharedAccess
+          }
+        )
+      ) {
+        Some(facts) -> facts
+        None -> panic("expected view fact")
+      }
+      match views.with_contained(
+        base,
+        checked_borrow_origins_single(
+          CheckedBorrowOrigin {
+            storage: CheckedLocalStorage(parameter),
+            access: CheckedSharedAccess
+          }
+        )
+      ) {
+        Some(facts) -> facts
+        None -> panic("expected contained fact")
+      }
+    }
+  }
+  checked_body_product(
+    product,
+    expressions.freeze(),
+    patterns.freeze(),
+    closures.freeze(),
+    effects.freeze(),
+    propagation.freeze(),
+    borrows
+  )
+}
+
+test "checked body freeze requires a slice view provenance fact" {
+  Test.assert_true(
+    match slice_body(MissingSliceFact) {
+      CheckedBodyProductRejected(CheckedBodyBorrowViewMissing(3)) -> true
+      _ -> false
+    }
+  )
+}
+
+test "checked body freeze accepts a slice rooted in its exact parameter" {
+  Test.assert_true(
+    match slice_body(ValidSliceFact) {
+      CheckedBodyProductAccepted(_) -> true
+      _ -> false
+    }
+  )
+}
+
+test "checked body freeze rejects a misclassified slice parameter" {
+  Test.assert_true(
+    match slice_body(MisclassifiedSliceFact) {
+      CheckedBodyProductRejected(CheckedBodyBorrowInvalidOrigin(3)) -> true
+      _ -> false
+    }
+  )
+}
+
+test "checked body freeze rejects a fact from another module" {
+  Test.assert_true(
+    match slice_body(ForeignSliceFactSegment) {
+      CheckedBodyProductRejected(CheckedBodyBorrowSegmentMismatch) -> true
+      _ -> false
+    }
+  )
+}
+
+test "checked body freeze rejects a fact for an absent expression" {
+  Test.assert_true(
+    match slice_body(OutOfRangeSliceFact) {
+      CheckedBodyProductRejected(CheckedBodyBorrowFactOutOfRange(9)) -> true
+      _ -> false
+    }
+  )
+}
+
+test "checked body freeze rejects a view fact on an array value" {
+  Test.assert_true(
+    match slice_body(WrongViewTypeFact) {
+      CheckedBodyProductRejected(CheckedBodyBorrowViewTypeMismatch(0)) -> true
+      _ -> false
+    }
+  )
+}
+
+test "checked body freeze requires exclusive origins for a mutable view" {
+  Test.assert_true(
+    match slice_body(SharedMutableViewFact) {
+      CheckedBodyProductRejected(CheckedBodyBorrowViewAccessMismatch(3)) -> true
+      _ -> false
+    }
+  )
+}
+
+test "checked body freeze validates contained origins independently of views" {
+  Test.assert_true(
+    match slice_body(MisclassifiedContainedFact) {
+      CheckedBodyProductRejected(CheckedBodyBorrowInvalidOrigin(0)) -> true
+      _ -> false
+    }
   )
 }
 
@@ -180,7 +443,8 @@ test "checked body freeze rejects expressions after the final function root" {
       patterns.freeze(),
       closures.freeze(),
       effects.freeze(),
-      propagation.freeze()
+      propagation.freeze(),
+      checked_borrow_facts_empty(checked_expr_segment_id(module.identity))
     ) {
       CheckedBodyProductRejected(CheckedBodyUnownedExpression(1)) -> true
       _ -> false
@@ -210,7 +474,8 @@ test "checked body freeze rejects reused or reversed function roots" {
       patterns.freeze(),
       closures.freeze(),
       effects.freeze(),
-      propagation.freeze()
+      propagation.freeze(),
+      checked_borrow_facts_empty(checked_expr_segment_id(module.identity))
     ) {
       CheckedBodyProductRejected(CheckedBodyFunctionRootOutOfOrder(1)) -> true
       _ -> false
@@ -241,7 +506,8 @@ test "checked expression owners follow distinct function root ranges" {
     patterns.freeze(),
     closures.freeze(),
     effects.freeze(),
-    propagation.freeze()
+    propagation.freeze(),
+    checked_borrow_facts_empty(checked_expr_segment_id(module.identity))
   ) {
     CheckedBodyProductAccepted(body) -> {
       Test.assert_true(
@@ -310,7 +576,8 @@ test "checked body freeze rejects a parameter owned by another function" {
       patterns.freeze(),
       closures.freeze(),
       effects.freeze(),
-      propagation.freeze()
+      propagation.freeze(),
+      checked_borrow_facts_empty(checked_expr_segment_id(module.identity))
     ) {
       CheckedBodyProductRejected(CheckedBodyFunctionParameterMismatch(0, 0)) -> true
       _ -> false
