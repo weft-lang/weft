@@ -9,9 +9,17 @@ use compiler/ir/data.{
   Expr,
   FieldAccess,
   GenericCall,
+  HandlerClause,
+  HandlerClauseContinuation,
+  HandlerClauseList,
+  HandlerClauseListCons,
+  HandlerClauseListNil,
+  HandlerClauseName,
+  HandlerClauseNoContinuation,
   HandlerConfiguration,
   Ident,
   MissingTypeExpr,
+  MissingTypeEffectOp,
   Param,
   ParamList,
   ParamListCons,
@@ -21,6 +29,8 @@ use compiler/ir/data.{
   TypeExprList,
   TypeExprListCons,
   TypeExprListNil,
+  TypeEffectOp,
+  DeferredTypeEffectOp,
   TypeNameRange,
   TypeParam,
   TypeParamBoundList,
@@ -31,9 +41,21 @@ use compiler/ir/data.{
   TypeParamListNil,
   UnqualifiedEffectTypeExpr,
   UnknownHandlerConfiguration,
-  UnknownParam
+  UnknownHandlerClause,
+  UnknownHandlerClauseContinuation,
+  UnknownHandlerClauseName,
+  UnknownParam,
+  param_list_len
 }
-use compiler/project/identity.{HandlerImplementationIdentity}
+use compiler/project/identity.{
+  DeclarationIdentity,
+  HandlerImplementationIdentity,
+  declaration_identity_module,
+  declaration_identity_name,
+  module_identity_package
+}
+use compiler/project/identity/equality.{declaration_identity_eq, module_identity_eq}
+use compiler/project/module.{PackageVisibility, PublicVisibility}
 use compiler/types/graph.{
   SemanticEffectAtomNode,
   SemanticParameterVariable,
@@ -47,13 +69,21 @@ use compiler/types/graph/substitution.{
   semantic_type_substitution_empty
 }
 use compiler/types/graph/subtyping.{semantic_type_is_subtype}
-use compiler/weft/check/registration/catalog.{RegisteredHandler, RegisteredModule}
+use compiler/types/graph/equality.{semantic_type_catalog_equal}
+use compiler/weft/check/registration/catalog.{
+  RegisteredEffect,
+  RegisteredEffectDeclaration,
+  RegisteredEffectOperation,
+  RegisteredHandler,
+  RegisteredModule
+}
 use compiler/weft/check/registration/handler.{
   RegisteredHandlerSelected,
   RegisteredHandlerSelection,
   registration_scope_select_handler
 }
-use compiler/weft/check/registration/scope.{RegistrationScope}
+use compiler/weft/check/registration/scope.{RegistrationScope, registration_scope_find}
+use compiler/weft/check/storage.{dense_index}
 use compiler/weft/check/semantic_types.{
   SemanticTypeProductBuilder,
   SemanticTypeRejected,
@@ -125,6 +155,42 @@ pub(package) type SemanticHandlerCallResolution {
     List<SemanticTypeId>
   ),
   SemanticHandlerCallRejected(SemanticTypeProductBuilder, SemanticHandlerCallIssue)
+}
+
+pub(package) type SemanticHandlerClauseContract {
+  operation: DeclarationIdentity,
+  syntax: HandlerClause
+}
+
+pub(package) type SemanticHandlerContractIssue {
+  SemanticHandlerTargetDeclarationMissing,
+  SemanticHandlerOperationInvisible(DeclarationIdentity),
+  SemanticHandlerClauseSyntaxInvalid,
+  SemanticHandlerClauseRangeInvalid,
+  SemanticHandlerClauseEffectRejected(SemanticTypeResolutionIssue),
+  SemanticHandlerClauseAtomMismatch(SemanticTypeId),
+  SemanticHandlerClauseOperationMissing(str),
+  SemanticHandlerClauseArityMismatch(DeclarationIdentity, usize, usize),
+  SemanticHandlerClauseContinuationMismatch(DeclarationIdentity),
+  SemanticHandlerClauseDuplicate(DeclarationIdentity),
+  SemanticHandlerClauseMissing(DeclarationIdentity)
+}
+
+pub(package) type SemanticHandlerContractResult {
+  SemanticHandlerContractResolved(
+    SemanticTypeProductBuilder,
+    SemanticHandlerTemplate,
+    List<SemanticHandlerClauseContract>
+  ),
+  SemanticHandlerContractRejected(
+    SemanticTypeProductBuilder,
+    SemanticHandlerContractIssue
+  )
+}
+
+type HandlerOperationSignature {
+  HandlerOperationSignature(usize, bool),
+  HandlerOperationInvalid
 }
 
 type SemanticHandlerCallArguments {
@@ -599,6 +665,294 @@ pub(package) fn resolve_semantic_handler_call(
           )
         }
       }
+    }
+  }
+}
+
+fn handler_target_effect(
+  scope: RegistrationScope,
+  atom: SemanticTypeId,
+  product: SemanticTypeProductBuilder
+) -> Option<(RegisteredModule, RegisteredEffect)> {
+  let catalog = semantic_type_product_catalog(product)
+  match catalog.graph_for(atom) {
+    None -> None<(RegisteredModule, RegisteredEffect)>()
+    Some(graph) -> match semantic_type_graph_node(graph, atom) {
+      SemanticEffectAtomNode(declaration, _) -> match registration_scope_find(
+        scope,
+        declaration_identity_module(declaration)
+      ) {
+        None -> None<(RegisteredModule, RegisteredEffect)>()
+        Some(module) -> {
+          let declarations = module.declarations
+          let mut index: usize = 0
+          while index < declarations.len() {
+            let candidate = declarations.at(dense_index(index))
+            match candidate.kind {
+              RegisteredEffectDeclaration(target_effect) -> if declaration_identity_eq(
+                target_effect.name.identity,
+                declaration
+              ) {
+                return Some<(RegisteredModule, RegisteredEffect)>((module, target_effect))
+              }
+              _ -> nil
+            }
+            index = index + 1
+          }
+          None<(RegisteredModule, RegisteredEffect)>()
+        }
+      }
+      _ -> None<(RegisteredModule, RegisteredEffect)>()
+    }
+  }
+}
+
+fn handler_contract_operation_visible(
+  operation: RegisteredEffectOperation,
+  owner: RegisteredModule,
+  handler: RegisteredModule
+) -> bool {
+  if module_identity_eq(owner.identity, handler.identity) { true }
+  else {
+    match operation.name.visibility {
+      PublicVisibility -> true
+      PackageVisibility -> module_identity_package(owner.identity) ==
+        module_identity_package(handler.identity)
+      _ -> false
+    }
+  }
+}
+
+fn handler_contract_hidden_operation(
+  operations: List<RegisteredEffectOperation>,
+  owner: RegisteredModule,
+  handler: RegisteredModule
+) -> Option<DeclarationIdentity> {
+  match operations {
+    Nil -> None<DeclarationIdentity>()
+    Cons(operation, rest) -> if handler_contract_operation_visible(operation, owner, handler) {
+      handler_contract_hidden_operation(rest, owner, handler)
+    } else { Some<DeclarationIdentity>(operation.name.identity) }
+  }
+}
+
+fn handler_contract_find_operation(
+  operations: List<RegisteredEffectOperation>,
+  name: str
+) -> Option<RegisteredEffectOperation> {
+  match operations {
+    Nil -> None<RegisteredEffectOperation>()
+    Cons(operation, rest) -> if match declaration_identity_name(operation.name.identity).text() {
+      Some(found) -> found == name
+      None -> false
+    } {
+      Some<RegisteredEffectOperation>(operation)
+    } else { handler_contract_find_operation(rest, name) }
+  }
+}
+
+fn handler_contract_operation_signature(
+  operation: RegisteredEffectOperation
+) -> HandlerOperationSignature {
+  match operation.syntax {
+    TypeEffectOp(_, _, parameters, _) ->
+      HandlerOperationSignature(__i64_to_usize(param_list_len(parameters)), false)
+    DeferredTypeEffectOp(_, _, parameters, _) ->
+      HandlerOperationSignature(__i64_to_usize(param_list_len(parameters)), true)
+    MissingTypeEffectOp -> HandlerOperationInvalid
+  }
+}
+
+fn handler_contract_seen(
+  seen: List<DeclarationIdentity>,
+  operation: DeclarationIdentity
+) -> bool {
+  match seen {
+    Nil -> false
+    Cons(candidate, rest) -> if declaration_identity_eq(candidate, operation) { true }
+    else { handler_contract_seen(rest, operation) }
+  }
+}
+
+fn handler_contract_missing_operation(
+  operations: List<RegisteredEffectOperation>,
+  seen: List<DeclarationIdentity>
+) -> Option<DeclarationIdentity> {
+  match operations {
+    Nil -> None<DeclarationIdentity>()
+    Cons(operation, rest) -> if handler_contract_seen(seen, operation.name.identity) {
+      handler_contract_missing_operation(rest, seen)
+    } else { Some<DeclarationIdentity>(operation.name.identity) }
+  }
+}
+
+fn handler_contract_clauses(
+  product: SemanticTypeProductBuilder,
+  scope: RegistrationScope,
+  template: SemanticHandlerTemplate,
+  target_effect: RegisteredEffect,
+  clauses: HandlerClauseList,
+  seen: List<DeclarationIdentity>,
+  selected: List<SemanticHandlerClauseContract>
+) -> SemanticHandlerContractResult {
+  match clauses {
+    HandlerClauseListNil -> match handler_contract_missing_operation(
+      target_effect.operations,
+      seen
+    ) {
+      Some(operation) -> SemanticHandlerContractRejected(
+        product,
+        SemanticHandlerClauseMissing(operation)
+      )
+      None -> SemanticHandlerContractResolved(product, template, selected)
+    }
+    HandlerClauseListCons(clause, rest) -> match clause {
+      UnknownHandlerClause(_) -> SemanticHandlerContractRejected(
+        product,
+        SemanticHandlerClauseSyntaxInvalid
+      )
+      HandlerClause(name, parameters, _, continuation) -> match name {
+        UnknownHandlerClauseName -> SemanticHandlerContractRejected(
+          product,
+          SemanticHandlerClauseSyntaxInvalid
+        )
+        HandlerClauseName(reference, start, length) -> {
+          if start < 0 or length <= 0 {
+            return SemanticHandlerContractRejected(
+              product,
+              SemanticHandlerClauseRangeInvalid
+            )
+          }
+          match template.module.source.span(
+            __i64_to_usize(start),
+            __i64_to_usize(start + length)
+          ) {
+            None -> SemanticHandlerContractRejected(
+              product,
+              SemanticHandlerClauseRangeInvalid
+            )
+            Some(span) -> match (span.text(), handler_effect_type(reference)) {
+              (Some(operation_name), Some(effect_type)) ->
+                match resolve_type_product_in_scope(
+                  product,
+                  template.module,
+                  scope,
+                  template.handler.syntax.type_params,
+                  effect_type
+                ) {
+                  (product, SemanticTypeRejected(issue)) -> SemanticHandlerContractRejected(
+                    product,
+                    SemanticHandlerClauseEffectRejected(issue)
+                  )
+                  (product, SemanticTypeResolved(atom)) -> {
+                    let catalog = semantic_type_product_catalog(product)
+                    if not semantic_type_catalog_equal(catalog, atom, template.atom) {
+                      SemanticHandlerContractRejected(
+                        product,
+                        SemanticHandlerClauseAtomMismatch(atom)
+                      )
+                    } else {
+                      match handler_contract_find_operation(
+                        target_effect.operations,
+                        operation_name
+                      ) {
+                        None -> SemanticHandlerContractRejected(
+                          product,
+                          SemanticHandlerClauseOperationMissing(operation_name)
+                        )
+                        Some(operation) -> {
+                          let identity = operation.name.identity
+                          if handler_contract_seen(seen, identity) {
+                            return SemanticHandlerContractRejected(
+                              product,
+                              SemanticHandlerClauseDuplicate(identity)
+                            )
+                          }
+                          match handler_contract_operation_signature(operation) {
+                            HandlerOperationInvalid -> SemanticHandlerContractRejected(
+                              product,
+                              SemanticHandlerClauseSyntaxInvalid
+                            )
+                            HandlerOperationSignature(expected, deferred) -> {
+                              let actual = __i64_to_usize(param_list_len(parameters))
+                              if actual != expected {
+                                return SemanticHandlerContractRejected(
+                                  product,
+                                  SemanticHandlerClauseArityMismatch(identity, expected, actual)
+                                )
+                              }
+                              let valid_continuation = match continuation {
+                                HandlerClauseNoContinuation -> true
+                                HandlerClauseContinuation(_, _) -> deferred
+                                UnknownHandlerClauseContinuation -> false
+                              }
+                              if not valid_continuation {
+                                SemanticHandlerContractRejected(
+                                  product,
+                                  SemanticHandlerClauseContinuationMismatch(identity)
+                                )
+                              } else {
+                                handler_contract_clauses(
+                                  product,
+                                  scope,
+                                  template,
+                                  target_effect,
+                                  rest,
+                                  Cons<DeclarationIdentity>(identity, seen),
+                                  selected.append(
+                                    SemanticHandlerClauseContract {
+                                      operation: identity,
+                                      syntax: clause
+                                    }
+                                  )
+                                )
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              _ -> SemanticHandlerContractRejected(
+                product,
+                SemanticHandlerClauseSyntaxInvalid
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+-- Validate the package-owned implementation independently of any call site's
+-- result type. Clause bodies are checked later against that contextual result.
+pub(package) fn resolve_semantic_handler_contract(
+  product: SemanticTypeProductBuilder,
+  scope: RegistrationScope,
+  template: SemanticHandlerTemplate
+) -> SemanticHandlerContractResult {
+  match handler_target_effect(scope, template.atom, product) {
+    None -> SemanticHandlerContractRejected(product, SemanticHandlerTargetDeclarationMissing)
+    Some((owner, target_effect)) -> match handler_contract_hidden_operation(
+      target_effect.operations,
+      owner,
+      template.module
+    ) {
+      Some(operation) -> SemanticHandlerContractRejected(
+        product,
+        SemanticHandlerOperationInvisible(operation)
+      )
+      None -> handler_contract_clauses(
+        product,
+        scope,
+        template,
+        target_effect,
+        template.handler.syntax.clauses,
+        Nil<DeclarationIdentity>(),
+        Nil<SemanticHandlerClauseContract>()
+      )
     }
   }
 }
