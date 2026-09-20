@@ -347,7 +347,10 @@ run_feedback_task() {
     signing) run_recorded_phase "Release Signing Tests" "Release signing" "$SIGNING_PHASE_LOG" "$SIGNING_PHASE_STATUS" bash test/run_release_signing.sh ;;
     formatter) run_recorded_phase "Formatter Dogfood" "Formatter dogfood" "$FORMATTER_PHASE_LOG" "$FORMATTER_PHASE_STATUS" bash test/tools/run_formatter_dogfood.sh ;;
     markdown) run_recorded_phase "Markdown Examples" "Markdown examples" "$MARKDOWN_PHASE_LOG" "$MARKDOWN_PHASE_STATUS" run_markdown_phase ;;
-    negative) run_recorded_phase "Negative Tests" "Negative tests" "$NEGATIVE_PHASE_LOG" "$NEGATIVE_PHASE_STATUS" bash test/negative/run_negative_tests.sh ;;
+    # The runtime planner is already using its own worker pool. Keep this
+    # nested batch inside the feedback budget rather than detecting all host
+    # CPUs again and oversubscribing the full gate.
+    negative) run_recorded_phase "Negative Tests" "Negative tests" "$NEGATIVE_PHASE_LOG" "$NEGATIVE_PHASE_STATUS" env WEFT_TEST_JOBS="$WEFT_FEEDBACK_JOBS" bash test/negative/run_negative_tests.sh ;;
   esac
 }
 
