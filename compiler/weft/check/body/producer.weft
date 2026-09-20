@@ -1647,6 +1647,37 @@ fn semantic_function_parameter(
   }
 }
 
+fn semantic_function_parameters_into(
+  catalog: borrow SemanticTypeCatalog,
+  function_type: SemanticTypeId,
+  index: usize,
+  values: List<SemanticTypeId>
+) -> List<SemanticTypeId> {
+  if index >= semantic_function_parameter_count(catalog, function_type) { values }
+  else {
+    semantic_function_parameters_into(
+      catalog,
+      function_type,
+      index + 1,
+      values.append(semantic_function_parameter(catalog, function_type, index))
+    )
+  }
+}
+
+fn semantic_function_result_is_variable(
+  catalog: borrow SemanticTypeCatalog,
+  function_type: SemanticTypeId
+) -> bool {
+  let result = semantic_function_result(catalog, function_type)
+  match catalog.graph_for(result) {
+    Some(graph) -> match semantic_type_graph_node(graph, result) {
+      SemanticVariableNode(_) -> true
+      _ -> false
+    }
+    None -> false
+  }
+}
+
 fn semantic_function_type(
   catalog: borrow SemanticTypeCatalog,
   function_type: SemanticTypeId
@@ -4649,6 +4680,37 @@ fn checked_body_lambda_captures_safe(
   }
 }
 
+fn checked_body_lambda_inferred_type(
+  catalog: SemanticTypeCatalog,
+  types: CheckedBodyPrimitiveTypes,
+  function_type: SemanticTypeId,
+  body_result: SemanticTypeId
+) -> (SemanticTypeCatalog, SemanticTypeId) {
+  let effects = match catalog.graph_for(function_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, function_type) {
+      SemanticFunctionNode(_, _, effects) -> effects
+      _ -> panic("Inferred lambda context must be a function")
+    }
+    None -> panic("Inferred lambda context is outside its type catalog")
+  }
+  let parameters = semantic_function_parameters_into(
+    catalog,
+    function_type,
+    0,
+    Nil<SemanticTypeId>()
+  )
+  let module = types.module
+  let resolution = types.resolution
+  let segment = semantic_type_derived_segment_id(
+    module.identity,
+    catalog.next_derived_segment(module.identity, resolution.next_type_segment())
+  )
+  let builder = semantic_type_graph_builder(segment)
+  let (builder, parameter_list) = builder.type_list(parameters)
+  let (builder, inferred) = builder.function(parameter_list, body_result, effects)
+  (semantic_type_catalog_with_graph(catalog, builder.freeze()), inferred)
+}
+
 fn checked_body_lambda(
   state: owned CheckedBodyBuild,
   source: Source,
@@ -4658,7 +4720,8 @@ fn checked_body_lambda(
   parameters: ParamList,
   body: Expr,
   source_site: i64,
-  expectation: CheckedBodyExpectation
+  expectation: CheckedBodyExpectation,
+  infer_body_result: bool
 ) -[SemanticConformance]> CheckedBodyExprBuild {
   match source_range(source, source_site, 2) {
     nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
@@ -4687,7 +4750,9 @@ fn checked_body_lambda(
               ) {
                 CheckedLambdaParametersRejected(state, issue) ->
                   CheckedBodyExprRejected(state, issue)
-                CheckedLambdaParametersBuilt(state, lambda_environment, bindings) ->
+                CheckedLambdaParametersBuilt(state, lambda_environment, bindings) -> {
+                  let body_expectation = if infer_body_result { CheckedInferResult }
+                  else { CheckedRequireResult(result) }
                   match checked_body_expr(
                     state,
                     source,
@@ -4697,7 +4762,7 @@ fn checked_body_lambda(
                     CheckedOutsideLoop,
                     lambda_environment,
                     body,
-                    CheckedRequireResult(result)
+                    body_expectation
                   ) {
                     CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
                     CheckedBodyExprBuilt(state, checked_body) -> {
@@ -4716,20 +4781,53 @@ fn checked_body_lambda(
                             state,
                             CheckedBodyProducerInvalidRange
                           )
-                          range: CheckedSourceRange -> match state.lambda(
-                            bindings,
-                            captures,
-                            checked_body,
-                            __i64_to_usize(source_site),
-                            function_type,
-                            range
-                          ) {
-                            (state, expression) -> CheckedBodyExprBuilt(state, expression)
+                          range: CheckedSourceRange -> if infer_body_result {
+                            let actual_result = state.result_type(checked_body)
+                            let current_catalog = state.types()
+                            if semantic_type_catalog_equal(
+                              current_catalog,
+                              actual_result,
+                              types.never_type
+                            ) {
+                              CheckedBodyExprRejected(
+                                state,
+                                CheckedBodyProducerGenericInferenceIncomplete(site)
+                              )
+                            } else {
+                              let (next_catalog, inferred_type) = checked_body_lambda_inferred_type(
+                                current_catalog,
+                                types,
+                                function_type,
+                                actual_result
+                              )
+                              match state.with_types(next_catalog).lambda(
+                                bindings,
+                                captures,
+                                checked_body,
+                                __i64_to_usize(source_site),
+                                inferred_type,
+                                range
+                              ) {
+                                (state, expression) -> CheckedBodyExprBuilt(state, expression)
+                              }
+                            }
+                          } else {
+                            match state.lambda(
+                              bindings,
+                              captures,
+                              checked_body,
+                              __i64_to_usize(source_site),
+                              function_type,
+                              range
+                            ) {
+                              (state, expression) -> CheckedBodyExprBuilt(state, expression)
+                            }
                           }
                         }
                       }
                     }
                   }
+                }
               }
             }
             _ -> CheckedBodyExprRejected(
@@ -10091,7 +10189,7 @@ fn checked_body_infer_generic_arguments(
     } else {
       let parameter = semantic_function_parameter(catalog, signature, index)
       let checked_argument = match argument {
-        Lambda(_, _, _) -> {
+        Lambda(lambda_parameters, lambda_body, lambda_site) -> {
           let resolution = types.resolution
           let segment = catalog.next_derived_segment(
             types.module.identity,
@@ -10104,17 +10202,34 @@ fn checked_body_infer_generic_arguments(
             parameter
           )
           let next_catalog = semantic_type_product_catalog(product)
-          checked_body_expr(
-            state.with_types(next_catalog),
-            source,
-            checked_body_types_with_catalog(types, next_catalog),
-            owner,
-            function_result,
-            loop_context,
-            environment,
-            argument,
-            CheckedRequireResult(specialized)
-          )
+          let next_types = checked_body_types_with_catalog(types, next_catalog)
+          let next_state = state.with_types(next_catalog)
+          if semantic_function_result_is_variable(next_catalog, specialized) {
+            checked_body_lambda(
+              next_state,
+              source,
+              next_types,
+              owner,
+              environment,
+              lambda_parameters,
+              lambda_body,
+              lambda_site,
+              CheckedRequireResult(specialized),
+              true
+            )
+          } else {
+            checked_body_expr(
+              next_state,
+              source,
+              next_types,
+              owner,
+              function_result,
+              loop_context,
+              environment,
+              argument,
+              CheckedRequireResult(specialized)
+            )
+          }
         }
         _ -> checked_body_expr(
           state,
@@ -14596,7 +14711,8 @@ fn checked_body_expr(
       parameters,
       body,
       source_site,
-      expectation
+      expectation,
+      false
     )
     Apply(callee, arguments, _, site) -> checked_body_apply(
       state,
