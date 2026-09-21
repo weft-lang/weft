@@ -1,0 +1,571 @@
+-- Reachable monomorphisation over immutable checked bodies.
+--
+-- A specialization is an exact function identity plus concrete semantic type
+-- arguments. The planner lowers only typed bodies, discovers further requests
+-- from semantic IR calls, substitutes arguments in the caller's context, and
+-- assigns native keys before rewriting those calls to direct transfers.
+
+use compiler/ir/data.{*}
+use compiler/project/identity.{FunctionIdentity}
+use compiler/project/identity/equality.{function_identity_eq}
+use compiler/types/graph.{SemanticTypeId}
+use compiler/types/graph/catalog.{SemanticTypeCatalog}
+use compiler/types/graph/substitution.{
+  SemanticTypeSubstitution,
+  semantic_type_substitution_bind,
+  semantic_type_substitution_empty
+}
+use compiler/weft/check/body/product.{CheckedBodyProduct}
+use compiler/weft/check/semantic_types.{
+  SemanticTypeProductBuilder,
+  semantic_type_product_catalog,
+  semantic_type_product_continue,
+  semantic_type_product_substitute
+}
+use compiler/weft/lower/straight.{
+  CheckedStraightFunctionLowered,
+  CheckedStraightFunctionRejected,
+  CheckedStraightLowerIssue,
+  lower_checked_straight_function_specialization
+}
+use compiler/weft/lower/symbols.{
+  CheckedFunctionSpecialization,
+  CheckedNativeFunctionSymbols,
+  checked_native_function_symbols,
+  checked_native_function_symbols_bind_specialization,
+  checked_native_function_symbols_resolve_specialization
+}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/option.{None, Option, Some}
+
+type CheckedSpecializationRequest {
+  identity: FunctionIdentity,
+  type_arguments: List<SemanticTypeId>
+}
+
+type CheckedSpecializationPending {
+  specialization: CheckedFunctionSpecialization,
+  function_index: usize,
+  substitution: SemanticTypeSubstitution
+}
+
+type CheckedSpecializationPlanner {
+  types: SemanticTypeProductBuilder,
+  symbols: CheckedNativeFunctionSymbols,
+  pending: List<CheckedSpecializationPending>,
+  instances: List<CheckedFunctionSpecialization>,
+  functions: List<IrFunction>,
+  next_key: i64
+}
+
+pub(package) type CheckedSpecializationPlan {
+  catalog: SemanticTypeCatalog,
+  symbols: CheckedNativeFunctionSymbols,
+  instances: List<CheckedFunctionSpecialization>,
+  functions: List<IrFunction>
+}
+
+pub(package) type CheckedSpecializationIssue {
+  CheckedSpecializationFunctionMissing(FunctionIdentity),
+  CheckedSpecializationTypeArgumentCount(FunctionIdentity, usize, usize),
+  CheckedSpecializationLoweringRejected(
+    CheckedFunctionSpecialization,
+    CheckedStraightLowerIssue
+  ),
+  CheckedSpecializationRewriteMismatch
+}
+
+pub(package) type CheckedSpecializationResult {
+  CheckedSpecializationAccepted(CheckedSpecializationPlan),
+  CheckedSpecializationRejected(CheckedSpecializationIssue)
+}
+
+type CheckedSpecializationRequestsResult {
+  CheckedSpecializationRequestsAccepted(CheckedSpecializationPlanner, List<i64>),
+  CheckedSpecializationRequestsRejected(CheckedSpecializationIssue)
+}
+
+type CheckedSpecializationArguments {
+  types: SemanticTypeProductBuilder,
+  values: List<SemanticTypeId>
+}
+
+type CheckedSpecializationRewrite {
+  CheckedSpecializationRewritten(IrFunction, List<i64>),
+  CheckedSpecializationRewriteRejected
+}
+
+fn checked_specialization_requests_in_insts(
+  instructions: IrInstList
+) -> List<CheckedSpecializationRequest> {
+  match instructions {
+    IrInstNil -> Nil<CheckedSpecializationRequest>()
+    IrInstCons(instruction, remaining) -> {
+      let rest = checked_specialization_requests_in_insts(remaining)
+      match instruction {
+        IrSemanticCallI64(_, IrSemanticGenericTarget(identity, arguments), _, _) ->
+          rest.prepend(
+            CheckedSpecializationRequest {
+              identity: identity,
+              type_arguments: arguments
+            }
+          )
+        _ -> rest
+      }
+    }
+  }
+}
+
+fn checked_specialization_requests_in_blocks(
+  blocks: IrBlockList
+) -> List<CheckedSpecializationRequest> {
+  match blocks {
+    IrBlockListNil -> Nil<CheckedSpecializationRequest>()
+    IrBlockListCons(IrBlock(_, _, instructions, _), remaining) -> {
+      let current = checked_specialization_requests_in_insts(instructions)
+      current.concat(checked_specialization_requests_in_blocks(remaining))
+    }
+  }
+}
+
+fn checked_specialization_requests(
+  function: IrFunction
+) -> List<CheckedSpecializationRequest> {
+  match function {
+    IrFunction(_, _, blocks, _) -> checked_specialization_requests_in_blocks(blocks)
+  }
+}
+
+fn checked_specialization_rewrite_insts(
+  instructions: IrInstList,
+  keys: List<i64>
+) -> (IrInstList, List<i64>, bool) {
+  match instructions {
+    IrInstNil -> (IrInstNil, keys, true)
+    IrInstCons(instruction, remaining) -> match instruction {
+      IrSemanticCallI64(dst, IrSemanticGenericTarget(_, _), _, arguments) -> match keys {
+        Nil -> (instructions, keys, false)
+        Cons(key, remaining_keys) -> match checked_specialization_rewrite_insts(
+          remaining,
+          remaining_keys
+        ) {
+          (rewritten, final_keys, valid) -> (
+            IrInstCons(IrCallI64(dst, key, arguments), rewritten),
+            final_keys,
+            valid
+          )
+        }
+      }
+      other -> match checked_specialization_rewrite_insts(remaining, keys) {
+        (rewritten, final_keys, valid) -> (
+          IrInstCons(other, rewritten),
+          final_keys,
+          valid
+        )
+      }
+    }
+  }
+}
+
+fn checked_specialization_rewrite_blocks(
+  blocks: IrBlockList,
+  keys: List<i64>
+) -> (IrBlockList, List<i64>, bool) {
+  match blocks {
+    IrBlockListNil -> (IrBlockListNil, keys, true)
+    IrBlockListCons(IrBlock(id, parameters, instructions, terminator), remaining) ->
+      match checked_specialization_rewrite_insts(instructions, keys) {
+        (rewritten_instructions, after_instructions, valid_instructions) ->
+          match checked_specialization_rewrite_blocks(remaining, after_instructions) {
+            (rewritten_blocks, final_keys, valid_blocks) -> (
+              IrBlockListCons(
+                IrBlock(id, parameters, rewritten_instructions, terminator),
+                rewritten_blocks
+              ),
+              final_keys,
+              valid_instructions and valid_blocks
+            )
+          }
+      }
+  }
+}
+
+fn checked_specialization_rewrite(
+  function: IrFunction,
+  keys: List<i64>
+) -> CheckedSpecializationRewrite {
+  match function {
+    IrFunction(key, parameters, blocks, source) ->
+      match checked_specialization_rewrite_blocks(blocks, keys) {
+        (rewritten, remaining, valid) -> if valid and remaining.len() == 0 {
+          CheckedSpecializationRewritten(
+            IrFunction(key, parameters, rewritten, source),
+            remaining
+          )
+        } else { CheckedSpecializationRewriteRejected }
+      }
+  }
+}
+
+fn checked_specialization_materialize_arguments(
+  types: SemanticTypeProductBuilder,
+  substitution: borrow SemanticTypeSubstitution,
+  arguments: List<SemanticTypeId>
+) -> CheckedSpecializationArguments {
+  match arguments {
+    Nil -> CheckedSpecializationArguments {
+      types: types,
+      values: Nil<SemanticTypeId>()
+    }
+    Cons(argument, remaining) -> {
+      let (next_types, concrete) = semantic_type_product_substitute(
+        types,
+        substitution,
+        argument
+      )
+      let rest = checked_specialization_materialize_arguments(
+        next_types,
+        substitution,
+        remaining
+      )
+      CheckedSpecializationArguments {
+        types: rest.types,
+        values: rest.values.prepend(concrete)
+      }
+    }
+  }
+}
+
+fn checked_specialization_function_index(
+  product: borrow CheckedBodyProduct,
+  wanted: FunctionIdentity
+) -> Option<usize> {
+  let mut index: usize = 0
+  while index < product.function_count() {
+    if function_identity_eq(product.function(index).signature.identity, wanted) {
+      return Some<usize>(index)
+    }
+    index = index + 1
+  }
+  None<usize>()
+}
+
+fn checked_specialization_substitution_from(
+  product: borrow CheckedBodyProduct,
+  function_index: usize,
+  arguments: List<SemanticTypeId>,
+  position: usize,
+  substitution: SemanticTypeSubstitution
+) -> SemanticTypeSubstitution {
+  match arguments {
+    Nil -> substitution
+    Cons(argument, remaining) -> {
+      let signatures = product.signatures()
+      let signature = product.function(function_index).signature
+      checked_specialization_substitution_from(
+        product,
+        function_index,
+        remaining,
+        position + 1,
+        semantic_type_substitution_bind(
+          substitution,
+          signatures.type_parameter_at(signature, position),
+          argument
+        )
+      )
+    }
+  }
+}
+
+fn checked_specialization_process_requests(
+  product: borrow CheckedBodyProduct,
+  caller: borrow SemanticTypeSubstitution,
+  requests: List<CheckedSpecializationRequest>,
+  planner: CheckedSpecializationPlanner,
+  keys: List<i64>
+) -> CheckedSpecializationRequestsResult {
+  match requests {
+    Nil -> CheckedSpecializationRequestsAccepted(planner, keys)
+    Cons(request, remaining) -> match checked_specialization_function_index(
+      product,
+      request.identity
+    ) {
+      None -> CheckedSpecializationRequestsRejected(
+        CheckedSpecializationFunctionMissing(request.identity)
+      )
+      Some(function_index) -> {
+        let {
+          types,
+            symbols,
+            pending,
+            instances,
+            functions,
+            next_key,
+        } = planner
+        let concrete = checked_specialization_materialize_arguments(
+          types,
+          caller,
+          request.type_arguments
+        )
+        let { types: concrete_types, values } = concrete
+        let signature = product.function(function_index).signature
+        let signatures = product.signatures()
+        let expected = signatures.type_parameter_count(signature)
+        let actual = values.len()
+        if expected != actual {
+          CheckedSpecializationRequestsRejected(
+            CheckedSpecializationTypeArgumentCount(request.identity, expected, actual)
+          )
+        } else {
+          let specialization = CheckedFunctionSpecialization {
+            identity: request.identity,
+            type_arguments: values
+          }
+          let catalog = semantic_type_product_catalog(concrete_types)
+          match checked_native_function_symbols_resolve_specialization(
+            symbols,
+            catalog,
+            specialization
+          ) {
+            Some(key) -> checked_specialization_process_requests(
+              product,
+              caller,
+              remaining,
+              CheckedSpecializationPlanner {
+                types: concrete_types,
+                symbols: symbols,
+                pending: pending,
+                instances: instances,
+                functions: functions,
+                next_key: next_key
+              },
+              keys.append(key)
+            )
+            None -> {
+              let substitution = checked_specialization_substitution_from(
+                product,
+                function_index,
+                values,
+                0,
+                semantic_type_substitution_empty()
+              )
+              checked_specialization_process_requests(
+                product,
+                caller,
+                remaining,
+                CheckedSpecializationPlanner {
+                  types: concrete_types,
+                  symbols: checked_native_function_symbols_bind_specialization(
+                    symbols,
+                    specialization,
+                    next_key
+                  ),
+                  pending: pending.prepend(
+                    CheckedSpecializationPending {
+                      specialization: specialization,
+                      function_index: function_index,
+                      substitution: substitution
+                    }
+                  ),
+                  instances: instances,
+                  functions: functions,
+                  next_key: next_key + 1
+                },
+                keys.append(next_key)
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn checked_specialization_plan_pending(
+  product: borrow CheckedBodyProduct,
+  planner: CheckedSpecializationPlanner
+) -> CheckedSpecializationResult {
+  let {
+    types,
+      symbols,
+      pending: pending_instances,
+      instances,
+      functions,
+      next_key,
+  } = planner
+  match pending_instances {
+    Nil -> CheckedSpecializationAccepted(
+      CheckedSpecializationPlan {
+        catalog: semantic_type_product_catalog(types),
+        symbols: symbols,
+        instances: instances,
+        functions: functions
+      }
+    )
+    Cons(pending, remaining) -> {
+      let catalog = semantic_type_product_catalog(types)
+      let caller = pending.substitution
+      match lower_checked_straight_function_specialization(
+        product,
+        symbols,
+        pending.function_index,
+        catalog,
+        pending.specialization,
+        caller
+      ) {
+        CheckedStraightFunctionRejected(issue) -> CheckedSpecializationRejected(
+          CheckedSpecializationLoweringRejected(pending.specialization, issue)
+        )
+        CheckedStraightFunctionLowered(function) ->
+          match checked_specialization_process_requests(
+            product,
+            caller,
+            checked_specialization_requests(function),
+            CheckedSpecializationPlanner {
+              types: types,
+              symbols: symbols,
+              pending: remaining,
+              instances: instances,
+              functions: functions,
+              next_key: next_key
+            },
+            Nil<i64>()
+          ) {
+            CheckedSpecializationRequestsRejected(issue) ->
+              CheckedSpecializationRejected(issue)
+            CheckedSpecializationRequestsAccepted(after_requests, keys) -> {
+              let {
+              types: after_types,
+                symbols: after_symbols,
+                pending: after_pending,
+                instances: after_instances,
+                functions: after_functions,
+                next_key: after_key,
+            } = after_requests
+              match checked_specialization_rewrite(function, keys) {
+                CheckedSpecializationRewriteRejected -> CheckedSpecializationRejected(
+                  CheckedSpecializationRewriteMismatch
+                )
+                CheckedSpecializationRewritten(rewritten, _) ->
+                  checked_specialization_plan_pending(
+                    product,
+                    CheckedSpecializationPlanner {
+                      types: after_types,
+                      symbols: after_symbols,
+                      pending: after_pending,
+                      instances: after_instances.append(pending.specialization),
+                      functions: after_functions.append(rewritten),
+                      next_key: after_key
+                    }
+                  )
+              }
+            }
+          }
+      }
+    }
+  }
+}
+
+fn checked_specialization_seed_from(
+  product: borrow CheckedBodyProduct,
+  index: usize,
+  planner: CheckedSpecializationPlanner
+) -> CheckedSpecializationPlanner {
+  if index >= product.function_count() { planner }
+  else {
+    let signature = product.function(index).signature
+    let signatures = product.signatures()
+    if signatures.type_parameter_count(signature) == 0 {
+      let {
+        types,
+          symbols,
+          pending,
+          instances,
+          functions,
+          next_key,
+      } = planner
+      let specialization = CheckedFunctionSpecialization {
+        identity: signature.identity,
+        type_arguments: Nil<SemanticTypeId>()
+      }
+      checked_specialization_seed_from(
+        product,
+        index + 1,
+        CheckedSpecializationPlanner {
+          types: types,
+          symbols: checked_native_function_symbols_bind_specialization(
+            symbols,
+            specialization,
+            next_key
+          ),
+          pending: pending.append(
+            CheckedSpecializationPending {
+              specialization: specialization,
+              function_index: index,
+              substitution: semantic_type_substitution_empty()
+            }
+          ),
+          instances: instances,
+          functions: functions,
+          next_key: next_key + 1
+        }
+      )
+    } else { checked_specialization_seed_from(product, index + 1, planner) }
+  }
+}
+
+pub(package) fn plan_checked_body_specializations(
+  product: borrow CheckedBodyProduct
+) -> CheckedSpecializationResult {
+  let signatures = product.signatures()
+  let expressions = product.expressions()
+  let catalog = expressions.types()
+  let types = semantic_type_product_continue(
+    signatures.module(),
+    catalog,
+    catalog.next_derived_segment(signatures.module(), signatures.next_type_segment())
+  )
+  checked_specialization_plan_pending(
+    product,
+    checked_specialization_seed_from(
+      product,
+      0,
+      CheckedSpecializationPlanner {
+        types: types,
+        symbols: checked_native_function_symbols(),
+        pending: Nil<CheckedSpecializationPending>(),
+        instances: Nil<CheckedFunctionSpecialization>(),
+        functions: Nil<IrFunction>(),
+        next_key: 1
+      }
+    )
+  )
+}
+
+impl CheckedSpecializationPlan {
+  pub(package) fn instance_count(self: borrow Self) -> usize {
+    let { catalog: _, symbols: _, instances, functions: _ } = self
+    instances.len()
+  }
+
+  pub(package) fn function_count(self: borrow Self) -> usize {
+    let { catalog: _, symbols: _, instances: _, functions } = self
+    functions.len()
+  }
+
+  pub(package) fn instruction_count(self: borrow Self, tag: i64) -> i64 {
+    let { catalog: _, symbols: _, instances: _, functions } = self
+    let mut count: i64 = 0
+    let mut remaining = functions
+    loop {
+      match remaining {
+        Nil -> return count
+        Cons(function, rest) -> {
+          count = count + ir_function_count_tag(function, tag)
+          remaining = rest
+        }
+      }
+    }
+    count
+  }
+}
