@@ -34,6 +34,7 @@ use compiler/weft/check/body/graph.{
   CheckedExprListId,
   CheckedGreaterOrEqual,
   CheckedGreaterThan,
+  CheckedIfKind,
   CheckedIntegerKind,
   CheckedInterpolationConcatKind,
   CheckedLetKind,
@@ -75,6 +76,15 @@ type CheckedStraightValueEnv {
   CheckedStraightValueEnvCons(CheckedBindingId, i64, CheckedStraightValueEnv)
 }
 
+type CheckedStraightFlowState {
+  current_block: i64,
+  current_params: IrValueList,
+  current_insts: IrInstList,
+  completed_blocks: IrBlockList,
+  next_block: i64,
+  next_value: i64
+}
+
 type CheckedStraightValueResult {
   CheckedStraightValueLowered(i64, i64, IrInstList),
   CheckedStraightValueRejected(CheckedStraightLowerIssue)
@@ -83,6 +93,16 @@ type CheckedStraightValueResult {
 type CheckedStraightArgumentsResult {
   CheckedStraightArgumentsLowered(IrValueList, i64, IrInstList),
   CheckedStraightArgumentsRejected(CheckedStraightLowerIssue)
+}
+
+type CheckedFlowValueResult {
+  CheckedFlowValueLowered(i64, CheckedStraightFlowState),
+  CheckedFlowValueRejected(CheckedStraightLowerIssue)
+}
+
+type CheckedFlowArgumentsResult {
+  CheckedFlowArgumentsLowered(IrValueList, CheckedStraightFlowState),
+  CheckedFlowArgumentsRejected(CheckedStraightLowerIssue)
 }
 
 type CheckedStraightParametersResult {
@@ -101,6 +121,7 @@ pub(package) fn checked_straight_kind_supported(kind: CheckedExprKind) -> bool {
     CheckedNotKind -> true
     CheckedNegateKind -> true
     CheckedBinaryKind -> true
+    CheckedIfKind -> true
     CheckedBlockKind -> true
     CheckedLetKind -> true
     CheckedDirectCallKind -> true
@@ -466,6 +487,452 @@ fn checked_straight_lower_expression(
   }
 }
 
+fn checked_flow_emit(
+  state: CheckedStraightFlowState,
+  instruction: IrInst,
+  consumed_values: i64
+) -> CheckedStraightFlowState {
+  CheckedStraightFlowState {
+    current_block: state.current_block,
+    current_params: state.current_params,
+    current_insts: ir_inst_list_append(
+      state.current_insts,
+      ir_inst_list_prepend(instruction, ir_inst_list_empty())
+    ),
+    completed_blocks: state.completed_blocks,
+    next_block: state.next_block,
+    next_value: state.next_value + consumed_values
+  }
+}
+
+fn checked_flow_close(
+  state: CheckedStraightFlowState,
+  terminator: IrTerminator
+) -> CheckedStraightFlowState {
+  CheckedStraightFlowState {
+    current_block: 0 - 1,
+    current_params: ir_value_list_empty(),
+    current_insts: ir_inst_list_empty(),
+    completed_blocks: ir_block_list_append(
+      state.completed_blocks,
+      ir_block_list_prepend(
+        ir_block_new_params(
+          state.current_block,
+          state.current_params,
+          state.current_insts,
+          terminator
+        ),
+        ir_block_list_empty()
+      )
+    ),
+    next_block: state.next_block,
+    next_value: state.next_value
+  }
+}
+
+fn checked_flow_open(
+  state: CheckedStraightFlowState,
+  block: i64,
+  parameters: IrValueList
+) -> CheckedStraightFlowState {
+  CheckedStraightFlowState {
+    current_block: block,
+    current_params: parameters,
+    current_insts: ir_inst_list_empty(),
+    completed_blocks: state.completed_blocks,
+    next_block: state.next_block,
+    next_value: state.next_value
+  }
+}
+
+fn checked_flow_lower_arguments_from(
+  graph: borrow CheckedExprGraph,
+  symbols: borrow CheckedNativeFunctionSymbols,
+  arguments: CheckedExprListId,
+  position: usize,
+  state: CheckedStraightFlowState,
+  env: CheckedStraightValueEnv
+) -> CheckedFlowArgumentsResult {
+  if position >= graph.expression_list_len(arguments) {
+    CheckedFlowArgumentsLowered(ir_value_list_empty(), state)
+  } else {
+    match checked_flow_lower_expression(
+      graph,
+      symbols,
+      graph.expression_list_at(arguments, position),
+      state,
+      env
+    ) {
+      CheckedFlowValueRejected(issue) -> CheckedFlowArgumentsRejected(issue)
+      CheckedFlowValueLowered(value, after_value) ->
+        match checked_flow_lower_arguments_from(
+          graph,
+          symbols,
+          arguments,
+          position + 1,
+          after_value,
+          env
+        ) {
+          CheckedFlowArgumentsRejected(issue) -> CheckedFlowArgumentsRejected(issue)
+          CheckedFlowArgumentsLowered(values, after_arguments) ->
+            CheckedFlowArgumentsLowered(
+              ir_value_list_prepend(value, values),
+              after_arguments
+            )
+        }
+    }
+  }
+}
+
+fn checked_flow_lower_if(
+  graph: borrow CheckedExprGraph,
+  symbols: borrow CheckedNativeFunctionSymbols,
+  expression: CheckedExprId,
+  state: CheckedStraightFlowState,
+  env: CheckedStraightValueEnv
+) -> CheckedFlowValueResult {
+  let catalog = graph.types()
+  match semantic_value_word_count(catalog, graph.result_type(expression)) {
+    None -> CheckedFlowValueRejected(CheckedStraightValueShapeUnavailable)
+    Some(words) -> if words != 1 {
+      CheckedFlowValueRejected(CheckedStraightWideValueUnsupported(words))
+    } else {
+      match checked_flow_lower_expression(
+        graph,
+        symbols,
+        graph.if_condition(expression),
+        state,
+        env
+      ) {
+        CheckedFlowValueRejected(issue) -> CheckedFlowValueRejected(issue)
+        CheckedFlowValueLowered(condition, after_condition) -> {
+          let then_block = after_condition.next_block
+          let else_block = then_block + 1
+          let join_block = then_block + 2
+          let branched = checked_flow_close(
+            CheckedStraightFlowState {
+              current_block: after_condition.current_block,
+              current_params: after_condition.current_params,
+              current_insts: after_condition.current_insts,
+              completed_blocks: after_condition.completed_blocks,
+              next_block: join_block + 1,
+              next_value: after_condition.next_value
+            },
+            ir_term_branch(condition, then_block, else_block)
+          )
+          match checked_flow_lower_expression(
+            graph,
+            symbols,
+            graph.if_then(expression),
+            checked_flow_open(branched, then_block, ir_value_list_empty()),
+            env
+          ) {
+            CheckedFlowValueRejected(issue) -> CheckedFlowValueRejected(issue)
+            CheckedFlowValueLowered(then_value, after_then) -> {
+              let closed_then = checked_flow_close(
+                after_then,
+                ir_term_jump_args(
+                  join_block,
+                  ir_value_list_prepend(then_value, ir_value_list_empty())
+                )
+              )
+              match checked_flow_lower_expression(
+                graph,
+                symbols,
+                graph.if_else(expression),
+                checked_flow_open(closed_then, else_block, ir_value_list_empty()),
+                env
+              ) {
+                CheckedFlowValueRejected(issue) -> CheckedFlowValueRejected(issue)
+                CheckedFlowValueLowered(else_value, after_else) -> {
+                  let closed_else = checked_flow_close(
+                    after_else,
+                    ir_term_jump_args(
+                      join_block,
+                      ir_value_list_prepend(else_value, ir_value_list_empty())
+                    )
+                  )
+                  let result = closed_else.next_value
+                  CheckedFlowValueLowered(
+                    result,
+                    checked_flow_open(
+                      CheckedStraightFlowState {
+                        current_block: closed_else.current_block,
+                        current_params: closed_else.current_params,
+                        current_insts: closed_else.current_insts,
+                        completed_blocks: closed_else.completed_blocks,
+                        next_block: closed_else.next_block,
+                        next_value: result + 1
+                      },
+                      join_block,
+                      ir_value_list_prepend(result, ir_value_list_empty())
+                    )
+                  )
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn checked_flow_lower_expression(
+  graph: borrow CheckedExprGraph,
+  symbols: borrow CheckedNativeFunctionSymbols,
+  expression: CheckedExprId,
+  state: CheckedStraightFlowState,
+  env: CheckedStraightValueEnv
+) -> CheckedFlowValueResult {
+  let kind = graph.kind(expression)
+  match kind {
+    CheckedIntegerKind -> {
+      let result = state.next_value
+      CheckedFlowValueLowered(
+        result,
+        checked_flow_emit(
+          state,
+          ir_inst_const_i64(result, graph.integer_value(expression)),
+          1
+        )
+      )
+    }
+    CheckedBooleanKind -> {
+      let result = state.next_value
+      CheckedFlowValueLowered(
+        result,
+        checked_flow_emit(
+          state,
+          ir_inst_const_i64(result, graph.boolean_value(expression)),
+          1
+        )
+      )
+    }
+    CheckedNilKind -> {
+      let result = state.next_value
+      CheckedFlowValueLowered(
+        result,
+        checked_flow_emit(state, ir_inst_nil_i64(result), 1)
+      )
+    }
+    CheckedStringKind -> {
+      let result = state.next_value
+      let value = graph.string_value(expression)
+      CheckedFlowValueLowered(
+        result,
+        checked_flow_emit(
+          state,
+          ir_inst_string_lit(result, __str_ptr(value), 0, __str_len(value)),
+          1
+        )
+      )
+    }
+    CheckedLocalReferenceKind -> match checked_straight_env_find(
+      env,
+      graph.local_binding(expression)
+    ) {
+      Some(value) -> CheckedFlowValueLowered(value, state)
+      None -> CheckedFlowValueRejected(
+        CheckedStraightBindingMissing(graph.local_binding(expression))
+      )
+    }
+    CheckedDeclarationReferenceKind -> match checked_native_function_symbols_resolve(
+      symbols,
+      DeclaredFunctionIdentity(graph.declaration(expression))
+    ) {
+      None -> CheckedFlowValueRejected(
+        CheckedStraightFunctionSymbolMissing(
+          DeclaredFunctionIdentity(graph.declaration(expression))
+        )
+      )
+      Some(key) -> {
+        let result = state.next_value
+        CheckedFlowValueLowered(
+          result,
+          checked_flow_emit(state, ir_inst_function_ref_i64(result, key), 1)
+        )
+      }
+    }
+    CheckedNotKind -> match checked_flow_lower_expression(
+      graph,
+      symbols,
+      graph.not_operand(expression),
+      state,
+      env
+    ) {
+      CheckedFlowValueRejected(issue) -> CheckedFlowValueRejected(issue)
+      CheckedFlowValueLowered(value, after_value) -> {
+        let result = after_value.next_value
+        CheckedFlowValueLowered(
+          result,
+          checked_flow_emit(
+            after_value,
+            ir_inst_unary_i64(result, ir_unary_op_not(), value),
+            1
+          )
+        )
+      }
+    }
+    CheckedNegateKind -> match checked_flow_lower_expression(
+      graph,
+      symbols,
+      graph.negate_operand(expression),
+      state,
+      env
+    ) {
+      CheckedFlowValueRejected(issue) -> CheckedFlowValueRejected(issue)
+      CheckedFlowValueLowered(value, after_value) -> {
+        let zero = after_value.next_value
+        let result = zero + 1
+        let with_zero = checked_flow_emit(
+          after_value,
+          ir_inst_const_i64(zero, 0),
+          1
+        )
+        CheckedFlowValueLowered(
+          result,
+          checked_flow_emit(
+            with_zero,
+            ir_inst_binary_i64(result, IrSub, zero, value),
+            1
+          )
+        )
+      }
+    }
+    CheckedBinaryKind -> match checked_flow_lower_expression(
+      graph,
+      symbols,
+      graph.binary_left(expression),
+      state,
+      env
+    ) {
+      CheckedFlowValueRejected(issue) -> CheckedFlowValueRejected(issue)
+      CheckedFlowValueLowered(left, after_left) -> match checked_flow_lower_expression(
+        graph,
+        symbols,
+        graph.binary_right(expression),
+        after_left,
+        env
+      ) {
+        CheckedFlowValueRejected(issue) -> CheckedFlowValueRejected(issue)
+        CheckedFlowValueLowered(right, after_right) -> {
+          let result = after_right.next_value
+          CheckedFlowValueLowered(
+            result,
+            checked_flow_emit(
+              after_right,
+              ir_inst_binary_i64(
+                result,
+                checked_straight_binary_operator(graph.binary_operator(expression)),
+                left,
+                right
+              ),
+              1
+            )
+          )
+        }
+      }
+    }
+    CheckedIfKind -> checked_flow_lower_if(graph, symbols, expression, state, env)
+    CheckedBlockKind -> match checked_flow_lower_expression(
+      graph,
+      symbols,
+      graph.block_first(expression),
+      state,
+      env
+    ) {
+      CheckedFlowValueRejected(issue) -> CheckedFlowValueRejected(issue)
+      CheckedFlowValueLowered(_, after_first) -> checked_flow_lower_expression(
+        graph,
+        symbols,
+        graph.block_rest(expression),
+        after_first,
+        env
+      )
+    }
+    CheckedLetKind -> match graph.let_parts(expression) {
+      (binding, value_expression, body) -> match checked_flow_lower_expression(
+        graph,
+        symbols,
+        value_expression,
+        state,
+        env
+      ) {
+        CheckedFlowValueRejected(issue) -> CheckedFlowValueRejected(issue)
+        CheckedFlowValueLowered(value, after_value) -> checked_flow_lower_expression(
+          graph,
+          symbols,
+          body,
+          after_value,
+          CheckedStraightValueEnvCons(binding, value, env)
+        )
+      }
+    }
+    CheckedDirectCallKind -> match graph.direct_call_parts(expression) {
+      (function, arguments) -> match checked_native_function_symbols_resolve(
+        symbols,
+        function
+      ) {
+        None -> CheckedFlowValueRejected(CheckedStraightFunctionSymbolMissing(function))
+        Some(key) -> match checked_flow_lower_arguments_from(
+          graph,
+          symbols,
+          arguments,
+          0,
+          state,
+          env
+        ) {
+          CheckedFlowArgumentsRejected(issue) -> CheckedFlowValueRejected(issue)
+          CheckedFlowArgumentsLowered(values, after_arguments) -> {
+            let result = after_arguments.next_value
+            CheckedFlowValueLowered(
+              result,
+              checked_flow_emit(
+                after_arguments,
+                ir_inst_call_i64(result, key, values),
+                1
+              )
+            )
+          }
+        }
+      }
+    }
+    CheckedInterpolationConcatKind -> match graph.interpolation_concat_parts(expression) {
+      (left_expression, right_expression) -> match checked_flow_lower_expression(
+        graph,
+        symbols,
+        left_expression,
+        state,
+        env
+      ) {
+        CheckedFlowValueRejected(issue) -> CheckedFlowValueRejected(issue)
+        CheckedFlowValueLowered(left, after_left) -> match checked_flow_lower_expression(
+          graph,
+          symbols,
+          right_expression,
+          after_left,
+          env
+        ) {
+          CheckedFlowValueRejected(issue) -> CheckedFlowValueRejected(issue)
+          CheckedFlowValueLowered(right, after_right) -> {
+            let result = after_right.next_value
+            CheckedFlowValueLowered(
+              result,
+              checked_flow_emit(
+                after_right,
+                ir_inst_string_concat_i64(result, left, right),
+                1
+              )
+            )
+          }
+        }
+      }
+    }
+    _ -> CheckedFlowValueRejected(CheckedStraightUnsupportedExpression(kind))
+  }
+}
+
 fn checked_straight_parameters_from(
   product: borrow CheckedBodyProduct,
   function_index: usize,
@@ -518,21 +985,29 @@ pub(package) fn lower_checked_straight_function(
       CheckedStraightParametersRejected(issue) -> CheckedStraightFunctionRejected(issue)
       CheckedStraightParametersLowered(env, parameter_lanes) -> {
         let graph = product.expressions()
-        match checked_straight_lower_expression(
+        match checked_flow_lower_expression(
           graph,
           symbols,
           function.body,
-          parameter_lanes,
+          CheckedStraightFlowState {
+            current_block: 0,
+            current_params: ir_value_list_empty(),
+            current_insts: ir_inst_list_empty(),
+            completed_blocks: ir_block_list_empty(),
+            next_block: 1,
+            next_value: parameter_lanes
+          },
           env
         ) {
-          CheckedStraightValueRejected(issue) -> CheckedStraightFunctionRejected(issue)
-          CheckedStraightValueLowered(value, _, insts) -> {
+          CheckedFlowValueRejected(issue) -> CheckedStraightFunctionRejected(issue)
+          CheckedFlowValueLowered(value, state) -> {
             let source = graph.source()
+            let completed = checked_flow_close(state, ir_term_return(value))
             CheckedStraightFunctionLowered(
-              ir_function_new_src(
+              ir_function_new_blocks_src(
                 key,
                 parameter_lanes,
-                ir_block_new_term(0, insts, ir_term_return(value)),
+                completed.completed_blocks,
                 __str_ptr(source.text)
               )
             )
