@@ -154,6 +154,7 @@ use compiler/project/identity.{
   TypeDeclaration,
   ValueDeclaration,
   declaration_identity_module,
+  declaration_identity_owner,
   module_identity_package
 }
 use compiler/project/identity/equality.{declaration_identity_eq, module_identity_eq}
@@ -181,6 +182,7 @@ use compiler/types/graph.{
   SemanticMutability,
   SemanticNamedNode,
   SemanticNominalType,
+  SemanticOpaqueType,
   SemanticUnionNode,
   SemanticOpenEffects,
   SemanticOwnedNode,
@@ -193,6 +195,7 @@ use compiler/types/graph.{
   SemanticTypeId,
   SemanticTypeGraphBuilder,
   SemanticTypeVariable,
+  SemanticTypeNode,
   SemanticUniqueNode,
   SemanticVariableNode,
   SemanticU16,
@@ -416,6 +419,7 @@ use compiler/weft/check/body/pattern.{
   CheckedGuarded,
   CheckedIntegerPatternOrigin,
   CheckedMatchGuard,
+  CheckedMatchArm,
   CheckedMatchArmListBuilder,
   CheckedNumericPattern,
   CheckedPatternId,
@@ -478,6 +482,7 @@ use compiler/weft/check/semantic_types.{
   SemanticTypeResolution,
   SemanticTypeResolutionIssue,
   SemanticTypeResolved,
+  resolve_named_declaration_product_in_scope,
   resolve_type_product_in_scope,
   semantic_type_product_catalog,
   semantic_type_product_continue,
@@ -503,6 +508,7 @@ use runtime/float.{
 }
 use runtime/string.{runtime_str_from_bytes_copy}
 use stdlib/drop.{Drop}
+use stdlib/list as list
 use stdlib/list.{Cons, List, Nil}
 use stdlib/option.{None, Option, Some}
 use stdlib/panic.{panic}
@@ -520,7 +526,11 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerMutablePointerBindingRequired(CheckedSourceRange),
   CheckedBodyProducerPointerTypeRequired(SemanticTypeId),
   CheckedBodyProducerMutablePointerRequired(SemanticTypeId),
-  CheckedBodyProducerInferredBranchMismatch(SemanticTypeId, SemanticTypeId),
+  CheckedBodyProducerInferredBranchMismatch(
+    SemanticTypeId,
+    SemanticTypeId,
+    CheckedSourceRange
+  ),
   CheckedBodyProducerLoopContextRequired,
   CheckedBodyProducerBreakOutsideLoop,
   CheckedBodyProducerContinueOutsideLoop,
@@ -601,7 +611,11 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerRecordArgumentsUnresolved(DeclarationIdentity),
   CheckedBodyProducerMissingRecordField(DeclarationIdentity),
   CheckedBodyProducerRecordUpdateRequired(SemanticTypeId),
-  CheckedBodyProducerVariantPatternRequired(SemanticTypeId),
+  CheckedBodyProducerVariantPatternRequired(
+    SemanticTypeId,
+    CheckedSourceRange,
+    Option<SemanticTypeNode>
+  ),
   CheckedBodyProducerUnknownConstructor(CheckedSourceRange),
   CheckedBodyProducerConstructorResultRequired(CheckedSourceRange),
   CheckedBodyProducerConstructorResultAmbiguous(CheckedSourceRange),
@@ -1239,7 +1253,7 @@ type CheckedMatchContext {
 }
 
 type CheckedMatchProgress {
-  list: CheckedMatchArmListBuilder,
+  list: List<CheckedMatchArm>,
   result: CheckedMatchResult,
   coverage: CheckedPatternCoverage,
   range: CheckedSourceRange
@@ -5646,13 +5660,19 @@ fn negation_expectations(
 }
 
 fn checked_branch_result(
+  catalog: borrow SemanticTypeCatalog,
+  never_type: SemanticTypeId,
   expectation: CheckedBodyExpectation,
   then_type: SemanticTypeId,
   else_type: SemanticTypeId
 ) -> CheckedBranchResult {
   match expectation {
     CheckedRequireResult(expected) -> CheckedBranchResolved(expected)
-    CheckedInferResult -> if semantic_type_id_eq(then_type, else_type) {
+    CheckedInferResult -> if semantic_type_catalog_equal(catalog, then_type, else_type) {
+      CheckedBranchResolved(then_type)
+    } else if semantic_type_catalog_equal(catalog, then_type, never_type) {
+      CheckedBranchResolved(else_type)
+    } else if semantic_type_catalog_equal(catalog, else_type, never_type) {
       CheckedBranchResolved(then_type)
     } else { CheckedBranchMismatch }
   }
@@ -5767,7 +5787,14 @@ fn checked_body_if(
         CheckedBodyExprBuilt(state, checked_else) -> {
           let then_type = state.result_type(checked_then)
           let else_type = state.result_type(checked_else)
-          match checked_branch_result(result_expectation, then_type, else_type) {
+          let catalog = state.types()
+          match checked_branch_result(
+            catalog,
+            types.never_type,
+            result_expectation,
+            then_type,
+            else_type
+          ) {
             CheckedBranchResolved(result) -> {
               let current_catalog = state.types()
               let then_continuation = semantic_continuation_type(current_catalog, then_type)
@@ -5798,10 +5825,17 @@ fn checked_body_if(
                 }
               }
             }
-            CheckedBranchMismatch -> CheckedBodyExprRejected(
-              state,
-              CheckedBodyProducerInferredBranchMismatch(then_type, else_type)
-            )
+            CheckedBranchMismatch -> {
+              let mismatch_range = state.range(checked_else)
+              CheckedBodyExprRejected(
+                state,
+                CheckedBodyProducerInferredBranchMismatch(
+                  then_type,
+                  else_type,
+                  mismatch_range
+                )
+              )
+            }
           }
         }
         CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
@@ -8485,6 +8519,7 @@ fn checked_body_constructor_reference(
   source: Source,
   environment: CheckedLexicalEnvironment,
   declaration: DeclarationIdentity,
+  namespace: DeclarationNamespace,
   name_range: CheckedSourceRange,
   authored_qualifier: TypeNameRange?
 ) -> CheckedConstructorReference {
@@ -8494,7 +8529,7 @@ fn checked_body_constructor_reference(
       nil -> match registration_scope_lookup_declaration_span(
         lexical_scope(environment),
         lexical_module(environment),
-        ConstructorDeclaration,
+        namespace,
         name
       ) {
         Some(registered) -> if declaration_identity_eq(registered.identity, declaration) {
@@ -8517,7 +8552,7 @@ fn checked_body_constructor_reference(
             lexical_scope(environment),
             lexical_module(environment),
             qualifier_span,
-            ConstructorDeclaration,
+            namespace,
             name
           ) {
             Some(registered) -> if declaration_identity_eq(
@@ -8530,6 +8565,16 @@ fn checked_body_constructor_reference(
         }
       }
     }
+  }
+}
+
+fn checked_body_input_node(
+  catalog: borrow SemanticTypeCatalog,
+  input_type: SemanticTypeId
+) -> Option<SemanticTypeNode> {
+  match catalog.graph_for(input_type) {
+    None -> None<SemanticTypeNode>()
+    Some(graph) -> Some(semantic_type_graph_node(graph, input_type))
   }
 }
 
@@ -8567,7 +8612,11 @@ fn checked_body_constructor_pattern_items(
       ) {
         None -> CheckedConstructorPatternItemsRejected(
           state,
-          CheckedBodyProducerVariantPatternRequired(input_type)
+          CheckedBodyProducerVariantPatternRequired(
+            input_type,
+            range,
+            checked_body_input_node(catalog, input_type)
+          )
         )
         Some(payload_type) -> match checked_body_pattern(
           state,
@@ -8611,13 +8660,171 @@ fn checked_body_constructor_pattern_items(
   }
 }
 
-fn checked_body_constructor_pattern(
+fn checked_body_opaque_borrowed_payload(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  inner: SemanticTypeId,
+  access: SemanticMutability
+) -> (owned CheckedBodyBuild, CheckedBodyPrimitiveTypes, SemanticTypeId) {
+  let catalog = state.types()
+  let resolution = types.resolution
+  let segment = semantic_type_derived_segment_id(
+    types.module.identity,
+    catalog.next_derived_segment(types.module.identity, resolution.next_type_segment())
+  )
+  let builder = semantic_type_graph_builder(segment)
+  let (builder, borrowed) = builder.borrow(inner, access)
+  let next_catalog = semantic_type_catalog_with_graph(catalog, builder.freeze())
+  (
+    state.with_types(next_catalog),
+    checked_body_types_with_catalog(types, next_catalog),
+    borrowed
+  )
+}
+
+-- A borrowed wrapper permits inspection of a copyable scalar representation,
+-- but does not transfer ownership of a resource hidden inside it. The pattern
+-- child receives a borrow of that resource, retaining the wrapper's access.
+fn checked_body_opaque_pattern_payload(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  input_type: SemanticTypeId,
+  representation: SemanticTypeId
+) -> (owned CheckedBodyBuild, CheckedBodyPrimitiveTypes, SemanticTypeId) {
+  let catalog = state.types()
+  match catalog.graph_for(input_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, input_type) {
+      SemanticBorrowNode(_, access) -> match catalog.graph_for(representation) {
+        Some(representation_graph) -> match semantic_type_graph_node(
+          representation_graph,
+          representation
+        ) {
+          SemanticPrimitiveNode(_) -> (state, types, representation)
+          SemanticBorrowNode(_, _) -> (state, types, representation)
+          SemanticOwnedNode(inner) -> checked_body_opaque_borrowed_payload(
+            state,
+            types,
+            inner,
+            access
+          )
+          SemanticUniqueNode(inner) -> checked_body_opaque_borrowed_payload(
+            state,
+            types,
+            inner,
+            access
+          )
+          _ -> checked_body_opaque_borrowed_payload(state, types, representation, access)
+        }
+        None -> (state, types, representation)
+      }
+      _ -> (state, types, representation)
+    }
+    None -> (state, types, representation)
+  }
+}
+
+fn checked_body_opaque_pattern(
   state: owned CheckedBodyBuild,
   source: Source,
   types: CheckedBodyPrimitiveTypes,
   owner: FunctionIdentity,
   environment: CheckedLexicalEnvironment,
   input_type: SemanticTypeId,
+  declaration: DeclarationIdentity,
+  representation: SemanticTypeId,
+  name_range: CheckedSourceRange,
+  authored: PatternList,
+  authored_qualifier: TypeNameRange?
+) -[SemanticConformance]> CheckedBodyPatternBuild {
+  match authored {
+    PatternListCons(item, PatternListNil) -> match checked_body_constructor_reference(
+      source,
+      environment,
+      declaration,
+      TypeDeclaration,
+      name_range,
+      authored_qualifier
+    ) {
+      CheckedConstructorInvalidRange -> CheckedBodyPatternRejected(
+        state,
+        CheckedBodyProducerInvalidRange
+      )
+      CheckedConstructorMissing -> CheckedBodyPatternRejected(
+        state,
+        CheckedBodyProducerUnknownConstructor(name_range)
+      )
+      CheckedConstructorResolved(qualifier) -> match checked_body_opaque_pattern_payload(
+        state,
+        types,
+        input_type,
+        representation
+      ) {
+        (state, types, payload_type) -> match checked_body_pattern(
+          state,
+          source,
+          types,
+          owner,
+          environment,
+          payload_type,
+          item
+        ) {
+          CheckedBodyPatternRejected(state, issue) -> CheckedBodyPatternRejected(state, issue)
+          CheckedBodyPatternBuilt(state, child, next_environment, coverage, child_range) -> {
+            let initial_range: CheckedSourceRange? = covering_range(name_range, child_range)
+            let final_range: CheckedSourceRange? = match initial_range {
+              range: CheckedSourceRange -> match qualifier {
+                nil -> range
+                qualifier_range: CheckedSourceRange -> covering_range(qualifier_range, range)
+              }
+              nil -> nil
+            }
+            match final_range {
+              nil -> CheckedBodyPatternRejected(state, CheckedBodyProducerInvalidRange)
+              range: CheckedSourceRange -> {
+                let (state, children) = state.pattern_list()
+                let (state, children) = state.pattern_list_push(children, child)
+                let (state, children) = state.pattern_list_finish(children)
+                match state.constructor_pattern(
+                  declaration,
+                  children,
+                  qualifier,
+                  input_type,
+                  range
+                ) {
+                  (state, pattern) -> CheckedBodyPatternBuilt(
+                    state,
+                    pattern,
+                    next_environment,
+                    if checked_pattern_coverage_complete(coverage) {
+                      CheckedPatternComplete
+                    } else { CheckedPatternOpen },
+                    range
+                  )
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    _ -> CheckedBodyPatternRejected(
+      state,
+      CheckedBodyProducerConstructorPatternArityMismatch(
+        1,
+        __i64_to_usize(pattern_list_len(authored))
+      )
+    )
+  }
+}
+
+fn checked_body_variant_constructor_pattern(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
+  input_type: SemanticTypeId,
+  shape_type: SemanticTypeId,
   name_start: i64,
   name_length: i64,
   authored: PatternList,
@@ -8635,12 +8842,16 @@ fn checked_body_constructor_pattern(
           match semantic_variant_case_projection(
             applications,
             catalog,
-            input_type,
+            shape_type,
             spelling
           ) {
             SemanticVariantApplicationUnavailable -> CheckedBodyPatternRejected(
               state,
-              CheckedBodyProducerVariantPatternRequired(input_type)
+              CheckedBodyProducerVariantPatternRequired(
+                input_type,
+                name_range,
+                checked_body_input_node(catalog, input_type)
+              )
             )
             SemanticVariantCaseMissing -> CheckedBodyPatternRejected(
               state,
@@ -8658,6 +8869,7 @@ fn checked_body_constructor_pattern(
                   source,
                   environment,
                   declaration,
+                  ConstructorDeclaration,
                   name_range,
                   authored_qualifier
                 ) {
@@ -8676,7 +8888,7 @@ fn checked_body_constructor_pattern(
                       types,
                       owner,
                       environment,
-                      input_type,
+                      shape_type,
                       case_index,
                       authored,
                       0,
@@ -8718,7 +8930,7 @@ fn checked_body_constructor_pattern(
                           let case_count = match semantic_variant_case_count(
                             applications,
                             catalog,
-                            input_type
+                            shape_type
                           ) {
                             Some(count) -> count
                             None -> panic("Projected variant has no case count")
@@ -8754,6 +8966,124 @@ fn checked_body_constructor_pattern(
         }
       }
     }
+  }
+}
+
+fn checked_body_materialized_variant_constructor_pattern(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
+  input_type: SemanticTypeId,
+  shape_type: SemanticTypeId,
+  name_start: i64,
+  name_length: i64,
+  authored: PatternList,
+  authored_qualifier: TypeNameRange?
+) -[SemanticConformance]> CheckedBodyPatternBuild {
+  let catalog = state.types()
+  let resolution = types.resolution
+  let product = semantic_type_product_continue(
+    types.module.identity,
+    catalog,
+    catalog.next_derived_segment(types.module.identity, resolution.next_type_segment())
+  )
+  let ready_types = checked_body_nominal_record_materialize(
+    checked_body_types_with_catalog(types, catalog),
+    product,
+    shape_type
+  )
+  checked_body_variant_constructor_pattern(
+    state.with_types(ready_types.catalog),
+    source,
+    ready_types,
+    owner,
+    environment,
+    input_type,
+    shape_type,
+    name_start,
+    name_length,
+    authored,
+    authored_qualifier
+  )
+}
+
+fn checked_body_pattern_nominal_shape(
+  catalog: borrow SemanticTypeCatalog,
+  input_type: SemanticTypeId
+) -> SemanticTypeId {
+  match catalog.graph_for(input_type) {
+    None -> input_type
+    Some(graph) -> match semantic_type_graph_node(graph, input_type) {
+      SemanticOwnedNode(inner) -> checked_body_pattern_nominal_shape(catalog, inner)
+      SemanticUniqueNode(inner) -> checked_body_pattern_nominal_shape(catalog, inner)
+      SemanticBorrowNode(inner, _) -> checked_body_pattern_nominal_shape(catalog, inner)
+      _ -> input_type
+    }
+  }
+}
+
+fn checked_body_constructor_pattern(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
+  input_type: SemanticTypeId,
+  name_start: i64,
+  name_length: i64,
+  authored: PatternList,
+  authored_qualifier: TypeNameRange?
+) -[SemanticConformance]> CheckedBodyPatternBuild {
+  let catalog = state.types()
+  let shape_type = checked_body_pattern_nominal_shape(catalog, input_type)
+  match catalog.graph_for(shape_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, shape_type) {
+      SemanticNamedNode(declaration, SemanticOpaqueType, representation, _) ->
+        match source_range(source, name_start, name_length) {
+          nil -> CheckedBodyPatternRejected(state, CheckedBodyProducerInvalidRange)
+          range: CheckedSourceRange -> checked_body_opaque_pattern(
+            state,
+            source,
+            types,
+            owner,
+            environment,
+            input_type,
+            declaration,
+            representation,
+            range,
+            authored,
+            authored_qualifier
+          )
+        }
+      _ -> checked_body_materialized_variant_constructor_pattern(
+        state,
+        source,
+        types,
+        owner,
+        environment,
+        input_type,
+        shape_type,
+        name_start,
+        name_length,
+        authored,
+        authored_qualifier
+      )
+    }
+    None -> checked_body_materialized_variant_constructor_pattern(
+      state,
+      source,
+      types,
+      owner,
+      environment,
+      input_type,
+      shape_type,
+      name_start,
+      name_length,
+      authored,
+      authored_qualifier
+    )
   }
 }
 
@@ -9372,11 +9702,24 @@ fn checked_match_arm_expectation(
 }
 
 fn checked_match_arm_result(
+  catalog: borrow SemanticTypeCatalog,
+  never_type: SemanticTypeId,
   expectation: CheckedBodyExpectation,
   previous: CheckedMatchResult,
   body_type: SemanticTypeId
 ) -> CheckedMatchResult {
-  if previous.resolved { previous }
+  if previous.resolved {
+    match expectation {
+      CheckedRequireResult(_) -> previous
+      CheckedInferResult -> if semantic_type_catalog_equal(
+        catalog,
+        previous.value,
+        never_type
+      ) {
+        CheckedMatchResult { resolved: true, value: body_type }
+      } else { previous }
+    }
+  }
   else {
     CheckedMatchResult {
       resolved: true,
@@ -9399,6 +9742,7 @@ fn checked_match_arm_coverage(
 
 fn checked_match_arm_result_accepts(
   catalog: borrow SemanticTypeCatalog,
+  never_type: SemanticTypeId,
   expectation: CheckedBodyExpectation,
   previous: CheckedMatchResult,
   body_type: SemanticTypeId
@@ -9406,11 +9750,9 @@ fn checked_match_arm_result_accepts(
   match expectation {
     CheckedRequireResult(_) -> true
     CheckedInferResult -> if previous.resolved {
-      semantic_type_catalog_equal(
-        catalog,
-        previous.value,
-        body_type
-      )
+      semantic_type_catalog_equal(catalog, previous.value, body_type) or
+        semantic_type_catalog_equal(catalog, previous.value, never_type) or
+        semantic_type_catalog_equal(catalog, body_type, never_type)
     } else { true }
   }
 }
@@ -9438,6 +9780,8 @@ fn checked_body_match_arm_body(
       let body_type = state.result_type(checked_body)
       let body_range = state.range(checked_body)
       let selected_result = checked_match_arm_result(
+        catalog,
+        context.types.never_type,
         context.expectation,
         progress.result,
         body_type
@@ -9449,13 +9793,18 @@ fn checked_body_match_arm_body(
         )
       } else if not checked_match_arm_result_accepts(
         catalog,
+        context.types.never_type,
         context.expectation,
         progress.result,
         body_type
       ) {
         CheckedBodyArmsRejected(
           state,
-          CheckedBodyProducerInferredBranchMismatch(progress.result.value, body_type)
+          CheckedBodyProducerInferredBranchMismatch(
+            progress.result.value,
+            body_type,
+            body_range
+          )
         )
       } else {
         match covering_range(arm.pattern_range, arm.guard_range) {
@@ -9463,37 +9812,36 @@ fn checked_body_match_arm_body(
             guarded_range,
             body_range
           ) {
-            arm_range: CheckedSourceRange -> match state.match_arm_list_push(
-              progress.list,
-              arm.pattern,
-              arm.guard,
-              checked_body,
-              arm_range
-            ) {
-              (state, list) -> match covering_range(progress.range, arm_range) {
-                next_range: CheckedSourceRange -> checked_body_match_arms(
-                  state,
-                  context,
-                  arm.rest,
-                  CheckedMatchProgress {
-                    list: list,
-                    result: selected_result,
-                    coverage: checked_match_arm_coverage(
-                      progress.coverage,
-                      arm.coverage,
-                      match arm.guard {
-                        CheckedUnguarded -> false
-                        CheckedGuarded(_) -> true
-                      }
-                    ),
-                    range: next_range
-                  }
-                )
-                nil -> CheckedBodyArmsRejected(
-                  state,
-                  CheckedBodyProducerInvalidRange
-                )
-              }
+            arm_range: CheckedSourceRange -> match covering_range(progress.range, arm_range) {
+              next_range: CheckedSourceRange -> checked_body_match_arms(
+                state,
+                context,
+                arm.rest,
+                CheckedMatchProgress {
+                  list: progress.list.prepend(
+                    CheckedMatchArm {
+                      pattern: arm.pattern,
+                      guard: arm.guard,
+                      body: checked_body,
+                      range: arm_range
+                    }
+                  ),
+                  result: selected_result,
+                  coverage: checked_match_arm_coverage(
+                    progress.coverage,
+                    arm.coverage,
+                    match arm.guard {
+                      CheckedUnguarded -> false
+                      CheckedGuarded(_) -> true
+                    }
+                  ),
+                  range: next_range
+                }
+              )
+              nil -> CheckedBodyArmsRejected(
+                state,
+                CheckedBodyProducerInvalidRange
+              )
             }
             nil -> CheckedBodyArmsRejected(state, CheckedBodyProducerInvalidRange)
           }
@@ -9586,6 +9934,25 @@ fn checked_body_match_arm(
   }
 }
 
+fn checked_body_publish_match_arms(
+  state: owned CheckedBodyBuild,
+  list: CheckedMatchArmListBuilder,
+  arms: List<CheckedMatchArm>
+) -> (owned CheckedBodyBuild, CheckedMatchArmListId) {
+  match arms {
+    Nil -> state.finish_match_arm_list(list)
+    Cons(arm, rest) -> match state.match_arm_list_push(
+      list,
+      arm.pattern,
+      arm.guard,
+      arm.body,
+      arm.range
+    ) {
+      (state, next) -> checked_body_publish_match_arms(state, next, rest)
+    }
+  }
+}
+
 fn checked_body_match_arms(
   state: owned CheckedBodyBuild,
   context: CheckedMatchContext,
@@ -9600,7 +9967,8 @@ fn checked_body_match_arms(
       )
     } else {
       if checked_pattern_coverage_complete(progress.coverage) {
-        match state.finish_match_arm_list(progress.list) {
+        let (state, list) = state.match_arm_list()
+        match checked_body_publish_match_arms(state, list, progress.list.reverse()) {
           (state, arms) -> CheckedBodyArmsBuilt(
             state,
             arms,
@@ -9651,42 +10019,40 @@ fn checked_body_match(
       let input_type = state.result_type(checked_scrutinee)
       let scrutinee_range = state.range(checked_scrutinee)
       let next_types = checked_body_types_with_catalog(types, state.types())
-      match state.match_arm_list() {
-        (state, list) -> match checked_body_match_arms(
-          state,
-          CheckedMatchContext {
-            source: source,
-            types: next_types,
-            owner: owner,
-            function_result: function_result,
-            loop_context: loop_context,
-            environment: environment,
-            input_type: input_type,
-            expectation: expectation
+      match checked_body_match_arms(
+        state,
+        CheckedMatchContext {
+          source: source,
+          types: next_types,
+          owner: owner,
+          function_result: function_result,
+          loop_context: loop_context,
+          environment: environment,
+          input_type: input_type,
+          expectation: expectation
+        },
+        arms,
+        CheckedMatchProgress {
+          list: Nil<CheckedMatchArm>(),
+          result: CheckedMatchResult {
+            resolved: false,
+            value: types.never_type
           },
-          arms,
-          CheckedMatchProgress {
-            list: list,
-            result: CheckedMatchResult {
-              resolved: false,
-              value: types.never_type
-            },
-            coverage: CheckedPatternOpen,
-            range: scrutinee_range
-          }
-        ) {
-          CheckedBodyArmsBuilt(state, checked_arms, result, _, range) ->
-            match state.match_expr(
-              checked_match_origin(origin),
-              checked_scrutinee,
-              checked_arms,
-              result,
-              range
-            ) {
-              (state, expression) -> CheckedBodyExprBuilt(state, expression)
-            }
-          CheckedBodyArmsRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+          coverage: CheckedPatternOpen,
+          range: scrutinee_range
         }
+      ) {
+        CheckedBodyArmsBuilt(state, checked_arms, result, _, range) ->
+          match state.match_expr(
+            checked_match_origin(origin),
+            checked_scrutinee,
+            checked_arms,
+            result,
+            range
+          ) {
+            (state, expression) -> CheckedBodyExprBuilt(state, expression)
+          }
+        CheckedBodyArmsRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
       }
     }
     CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
@@ -10119,6 +10485,20 @@ fn checked_body_method_selection(
                 inner,
                 spelling
               )
+              SemanticUniqueNode(inner) -> semantic_implementation_method_select(
+                methods,
+                catalog,
+                conformances,
+                inner,
+                spelling
+              )
+              SemanticBorrowNode(inner, _) -> semantic_implementation_method_select(
+                methods,
+                catalog,
+                conformances,
+                inner,
+                spelling
+              )
               _ -> direct
             }
           _ -> direct
@@ -10157,14 +10537,48 @@ fn checked_body_method_selection_for_trait(
       _ -> {
         let methods = resolution.methods()
         let conformances = resolution.conformances()
-        match semantic_trait_implementation_method_select(
+        let direct = semantic_trait_implementation_method_select(
           methods,
           catalog,
           conformances,
           receiver,
           trait_declaration,
           spelling
-        ) {
+        )
+        let selected = match direct {
+          SemanticImplementationMethodSelectionMissing -> match semantic_type_graph_node(
+            graph,
+            receiver
+          ) {
+            SemanticOwnedNode(inner) -> semantic_trait_implementation_method_select(
+              methods,
+              catalog,
+              conformances,
+              inner,
+              trait_declaration,
+              spelling
+            )
+            SemanticUniqueNode(inner) -> semantic_trait_implementation_method_select(
+              methods,
+              catalog,
+              conformances,
+              inner,
+              trait_declaration,
+              spelling
+            )
+            SemanticBorrowNode(inner, _) -> semantic_trait_implementation_method_select(
+              methods,
+              catalog,
+              conformances,
+              inner,
+              trait_declaration,
+              spelling
+            )
+            _ -> direct
+          }
+          _ -> direct
+        }
+        match selected {
           SemanticImplementationMethodSelected(declaration, _, signature, substitution) ->
             CheckedBodyMethodSelected(declaration, signature, substitution)
           SemanticImplementationMethodSelectionMissing -> CheckedBodyMethodSelectionMissing
@@ -13635,6 +14049,12 @@ fn checked_body_inferred_generic_call(
 
 type CheckedBodyGenericTarget {
   CheckedBodyGenericTargetResolved(DeclarationIdentity, CheckedSourceRange, ExprList),
+  CheckedBodyGenericConstructorTarget(
+    DeclarationIdentity,
+    Span,
+    CheckedSourceRange,
+    ExprList
+  ),
   CheckedBodyGenericTargetRejected(CheckedBodyProducerIssue)
 }
 
@@ -13658,9 +14078,35 @@ fn checked_body_generic_target(
             ValueDeclaration,
             name
           ) {
-            None -> CheckedBodyGenericTargetRejected(
-              CheckedBodyProducerUnknownIdentifier(range)
-            )
+            None -> match registration_scope_lookup_declaration_span(
+              lexical_scope(environment),
+              lexical_module(environment),
+              ConstructorDeclaration,
+              name
+            ) {
+              Some(constructor) -> CheckedBodyGenericConstructorTarget(
+                constructor.identity,
+                name,
+                range,
+                arguments
+              )
+              None -> match registration_scope_lookup_declaration_span(
+                lexical_scope(environment),
+                lexical_module(environment),
+                TypeDeclaration,
+                name
+              ) {
+                Some(declaration) -> CheckedBodyGenericConstructorTarget(
+                  declaration.identity,
+                  name,
+                  range,
+                  arguments
+                )
+                None -> CheckedBodyGenericTargetRejected(
+                  CheckedBodyProducerUnknownIdentifier(range)
+                )
+              }
+            }
             Some(declaration) -> CheckedBodyGenericTargetResolved(
               declaration.identity,
               range,
@@ -13689,9 +14135,39 @@ fn checked_body_generic_target(
           member_range,
           ValueDeclaration
         ) {
-          None -> CheckedBodyGenericTargetRejected(
-            CheckedBodyProducerUnknownIdentifier(member_range)
-          )
+          None -> match checked_body_qualified_declaration(
+            source,
+            environment,
+            qualifier,
+            member,
+            member_range,
+            ConstructorDeclaration
+          ) {
+            Some((declaration, range)) -> CheckedBodyGenericConstructorTarget(
+              declaration,
+              member,
+              range,
+              arguments
+            )
+            None -> match checked_body_qualified_declaration(
+              source,
+              environment,
+              qualifier,
+              member,
+              member_range,
+              TypeDeclaration
+            ) {
+              Some((declaration, range)) -> CheckedBodyGenericConstructorTarget(
+                declaration,
+                member,
+                range,
+                arguments
+              )
+              None -> CheckedBodyGenericTargetRejected(
+                CheckedBodyProducerUnknownIdentifier(member_range)
+              )
+            }
+          }
           Some((declaration, range)) -> CheckedBodyGenericTargetResolved(
             declaration,
             range,
@@ -13701,6 +14177,177 @@ fn checked_body_generic_target(
       }
     }
     _ -> CheckedBodyGenericTargetRejected(CheckedBodyProducerUnsupportedExpression)
+  }
+}
+
+fn checked_body_opaque_constructor_call(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  type_arguments: TypeExprList,
+  declaration: DeclarationIdentity,
+  range: CheckedSourceRange,
+  arguments: ExprList
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  let catalog = state.types()
+  let resolution = types.resolution
+  let segment = catalog.next_derived_segment(
+    types.module.identity,
+    resolution.next_type_segment()
+  )
+  let product = semantic_type_product_continue(types.module.identity, catalog, segment)
+  match resolve_named_declaration_product_in_scope(
+    product,
+    types.module,
+    lexical_scope(environment),
+    lexical_type_parameters(environment),
+    declaration,
+    type_arguments
+  ) {
+    (_, SemanticTypeRejected(issue)) -> CheckedBodyExprRejected(
+      state,
+      CheckedBodyProducerTypeRejected(issue)
+    )
+    (product, SemanticTypeResolved(result_type)) -> {
+      let next_types = checked_body_nominal_record_materialize(types, product, result_type)
+      let state = state.with_types(next_types.catalog)
+      let catalog = state.types()
+      match catalog.graph_for(result_type) {
+        None -> CheckedBodyExprRejected(
+          state,
+          CheckedBodyProducerUnknownConstructor(range)
+        )
+        Some(graph) -> match semantic_type_graph_node(graph, result_type) {
+          SemanticNamedNode(found, SemanticOpaqueType, representation, _) ->
+            if
+            declaration_identity_eq(found, declaration) {
+              match arguments {
+                ExprListCons(argument, ExprListNil) -> match checked_body_expr(
+                  state,
+                  source,
+                  next_types,
+                  owner,
+                  function_result,
+                  loop_context,
+                  environment,
+                  argument,
+                  CheckedRequireResult(representation)
+                ) {
+                  CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+                  CheckedBodyExprBuilt(state, value) -> match covering_range(
+                    range,
+                    state.range(value)
+                  ) {
+                    nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+                    call_range: CheckedSourceRange -> {
+                      let argument_values = [value]
+                      match checked_body_publish_arguments(
+                        state,
+                        list.from_slice(argument_values[..])
+                      ) {
+                        (state, values) -> match state.constructor_call(
+                          declaration,
+                          values,
+                          result_type,
+                          call_range
+                        ) {
+                          (state, expression) -> CheckedBodyExprBuilt(state, expression)
+                        }
+                      }
+                    }
+                  }
+                }
+                _ -> CheckedBodyExprRejected(
+                  state,
+                  CheckedBodyProducerConstructorArityMismatch(
+                    1,
+                    __i64_to_usize(expr_list_len(arguments))
+                  )
+                )
+              }
+            } else {
+              CheckedBodyExprRejected(state, CheckedBodyProducerUnknownConstructor(range))
+            }
+          _ -> CheckedBodyExprRejected(state, CheckedBodyProducerUnknownConstructor(range))
+        }
+      }
+    }
+  }
+}
+
+fn checked_body_generic_constructor_call(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  type_arguments: TypeExprList,
+  visible: DeclarationIdentity,
+  name: Span,
+  range: CheckedSourceRange,
+  arguments: ExprList,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  match declaration_identity_owner(visible) {
+    nil -> checked_body_opaque_constructor_call(
+      state,
+      source,
+      types,
+      owner,
+      function_result,
+      loop_context,
+      environment,
+      type_arguments,
+      visible,
+      range,
+      arguments
+    )
+    owner_type: DeclarationIdentity -> {
+      let catalog = state.types()
+      let resolution = types.resolution
+      let segment = catalog.next_derived_segment(
+        types.module.identity,
+        resolution.next_type_segment()
+      )
+      let product = semantic_type_product_continue(types.module.identity, catalog, segment)
+      match resolve_named_declaration_product_in_scope(
+        product,
+        types.module,
+        lexical_scope(environment),
+        lexical_type_parameters(environment),
+        owner_type,
+        type_arguments
+      ) {
+        (_, SemanticTypeRejected(issue)) -> CheckedBodyExprRejected(
+          state,
+          CheckedBodyProducerTypeRejected(issue)
+        )
+        (product, SemanticTypeResolved(result_type)) -> {
+          let next_types = checked_body_nominal_record_materialize(types, product, result_type)
+          let state = state.with_types(next_types.catalog)
+          checked_body_constructor_invoke(
+            state,
+            source,
+            next_types,
+            owner,
+            function_result,
+            loop_context,
+            environment,
+            visible,
+            name,
+            range,
+            arguments,
+            CheckedRequireResult(result_type)
+          )
+        }
+      }
+    }
   }
 }
 
@@ -13717,6 +14364,22 @@ fn checked_body_generic_call(
   expectation: CheckedBodyExpectation
 ) -[SemanticConformance]> CheckedBodyExprBuild {
   match checked_body_generic_target(source, environment, inner) {
+    CheckedBodyGenericConstructorTarget(visible, name, range, arguments) ->
+      checked_body_generic_constructor_call(
+        state,
+        source,
+        types,
+        owner,
+        function_result,
+        loop_context,
+        environment,
+        type_arguments,
+        visible,
+        name,
+        range,
+        arguments,
+        expectation
+      )
     CheckedBodyGenericTargetResolved(declaration, name_range, arguments) -> {
       let function = DeclaredFunctionIdentity(declaration)
       match state.resolve_signature(lexical_scope(environment), function) {
@@ -13865,7 +14528,11 @@ fn checked_body_constructor_arguments(
       match payload_type {
         None -> CheckedBodyArgumentsRejected(
           state,
-          CheckedBodyProducerVariantPatternRequired(result_type)
+          CheckedBodyProducerVariantPatternRequired(
+            result_type,
+            range,
+            checked_body_input_node(catalog, result_type)
+          )
         )
         Some(payload_type) -> match checked_body_expr(
           state,
@@ -14699,10 +15366,30 @@ fn checked_body_call(
               arguments,
               expectation
             )
-            None -> CheckedBodyExprRejected(
-              state,
-              CheckedBodyProducerUnknownIdentifier(name_range)
-            )
+            None -> match registration_scope_lookup_declaration_span(
+              lexical_scope(environment),
+              lexical_module(environment),
+              TypeDeclaration,
+              name
+            ) {
+              Some(declaration) -> checked_body_opaque_constructor_call(
+                state,
+                source,
+                types,
+                owner,
+                function_result,
+                loop_context,
+                environment,
+                TypeExprListNil,
+                declaration.identity,
+                name_range,
+                arguments
+              )
+              None -> CheckedBodyExprRejected(
+                state,
+                CheckedBodyProducerUnknownIdentifier(name_range)
+              )
+            }
           }
         }
         None -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
