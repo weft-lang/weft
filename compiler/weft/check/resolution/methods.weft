@@ -47,15 +47,23 @@ use compiler/project/identity.{
   DeclarationIdentity,
   DeclaredFunctionIdentity,
   FunctionIdentity,
+  ImplementationTargetDeclaration,
+  InherentMethodDeclaration,
+  MemberDeclarationIdentity,
+  ModuleDeclarationIdentity,
   declaration_identity_name
 }
 use compiler/project/identity/equality.{declaration_identity_eq, function_identity_eq}
 use compiler/types/graph.{
   SemanticParameterVariable,
+  SemanticNamedNode,
+  SemanticOwnedNode,
   SemanticSelfVariable,
   SemanticTraitNode,
   SemanticTypeId,
   SemanticTypeVariable,
+  SemanticUniqueNode,
+  SemanticVariantNode,
   semantic_type_graph_node,
   semantic_type_graph_trait_binding_declaration,
   semantic_type_graph_trait_binding_type_id,
@@ -119,6 +127,7 @@ use compiler/weft/check/semantic_types.{
 use compiler/weft/check/storage.{dense_index}
 use stdlib/list.{Cons, List, Nil}
 use stdlib/option.{None, Option, Some}
+use stdlib/source.{Span}
 use stdlib/string.{str_eq}
 
 type SemanticMethodCatalogStorage {
@@ -145,8 +154,10 @@ pub(package) type SemanticMethodResolutionIssue {
   SemanticImplementationTargetRejected(TypeNameRange, SemanticTypeResolutionIssue),
   SemanticImplementationTraitRejected(TypeNameRange, SemanticTypeResolutionIssue),
   SemanticImplementationBoundRejected(TypeNameRange, SemanticTypeResolutionIssue),
-  SemanticImplementationMethodMissing(TypeNameRange),
-  SemanticImplementationMethodTypeRejected(FunctionIdentity, SemanticTypeResolutionIssue)
+  SemanticImplementationMethodMissing(FunctionIdentity, Option<Span>),
+  SemanticImplementationMethodTypeRejected(FunctionIdentity, SemanticTypeResolutionIssue),
+  SemanticImplementationTraitContractMissing(TypeNameRange),
+  SemanticImplementationRequiredMethodMissing(DeclarationIdentity)
 }
 
 pub(package) type SemanticMethodsResolution {
@@ -564,19 +575,143 @@ fn semantic_method_trait_member_from_catalog(
   catalog: borrow SemanticMethodCatalog,
   types: borrow SemanticTypeCatalog,
   trait_atom: SemanticTypeId,
-  source: str
+  source: Span
 ) -> Option<DeclarationIdentity> {
-  let graph = types.graph_for(trait_atom).unwrap()
-  match semantic_type_graph_node(graph, trait_atom) {
-    SemanticTraitNode(declaration, _) -> match semantic_trait_method_select(
-      catalog,
-      declaration,
-      source
-    ) {
-      SemanticTraitMethodSelected(method, _) -> Some<DeclarationIdentity>(method)
+  match types.graph_for(trait_atom) {
+    None -> None<DeclarationIdentity>()
+    Some(graph) -> match semantic_type_graph_node(graph, trait_atom) {
+      SemanticTraitNode(declaration, _) -> match source.text() {
+        None -> None<DeclarationIdentity>()
+        Some(spelling) -> match semantic_trait_method_select(
+          catalog,
+          declaration,
+          spelling
+        ) {
+          SemanticTraitMethodSelected(method, _) -> Some<DeclarationIdentity>(method)
+          -- A trait implementation may also expose concrete methods beyond
+          -- the trait contract. Keep their family distinct from required
+          -- trait members while the function identity remains exact.
+          SemanticTraitMethodSelectionMissing -> Some<DeclarationIdentity>(
+            MemberDeclarationIdentity(declaration, InherentMethodDeclaration, source)
+          )
+          SemanticTraitMethodSelectionAmbiguous -> None<DeclarationIdentity>()
+        }
+      }
       _ -> None<DeclarationIdentity>()
     }
-    _ -> None<DeclarationIdentity>()
+  }
+}
+
+fn semantic_implementation_contains_method(
+  implemented: List<DeclarationIdentity>,
+  required: DeclarationIdentity
+) -> bool {
+  match implemented {
+    Nil -> false
+    Cons(method, remaining) -> if declaration_identity_eq(method, required) { true }
+    else { semantic_implementation_contains_method(remaining, required) }
+  }
+}
+
+fn semantic_trait_catalog_index(
+  declarations: List<DeclarationIdentity>,
+  wanted: DeclarationIdentity,
+  index: usize
+) -> Option<usize> {
+  match declarations {
+    Nil -> None<usize>()
+    Cons(declaration, remaining) -> if declaration_identity_eq(declaration, wanted) {
+      Some(index)
+    } else { semantic_trait_catalog_index(remaining, wanted, index + 1) }
+  }
+}
+
+fn semantic_required_method_missing(
+  available: List<DeclarationIdentity>,
+  start: usize,
+  count: usize,
+  implemented: List<DeclarationIdentity>
+) -> Option<DeclarationIdentity> {
+  if count == 0 { None<DeclarationIdentity>() }
+  else {
+    match semantic_method_at(available, start) {
+      None -> None<DeclarationIdentity>()
+      Some(required) -> if semantic_implementation_contains_method(implemented, required) {
+        semantic_required_method_missing(available, start + 1, count - 1, implemented)
+      } else { Some(required) }
+    }
+  }
+}
+
+fn semantic_implementation_coverage_issue(
+  catalog: borrow SemanticMethodCatalog,
+  types: borrow SemanticTypeCatalog,
+  trait_atom: Option<SemanticTypeId>,
+  site: TypeNameRange,
+  implemented: List<DeclarationIdentity>
+) -> Option<SemanticMethodResolutionIssue> {
+  match trait_atom {
+    None -> None<SemanticMethodResolutionIssue>()
+    Some(atom) -> match types.graph_for(atom) {
+      None -> Some(SemanticImplementationTraitContractMissing(site))
+      Some(graph) -> match semantic_type_graph_node(graph, atom) {
+        SemanticTraitNode(declaration, _) -> match catalog {
+          SemanticMethodCatalog(storage) -> match semantic_trait_catalog_index(
+            storage.trait_declarations,
+            declaration,
+            0
+          ) {
+            None -> Some(SemanticImplementationTraitContractMissing(site))
+            Some(index) -> match (
+              semantic_method_at(storage.trait_method_counts, index),
+              semantic_method_prefix(storage.trait_method_counts, index, 0)
+            ) {
+              (Some(count), Some(start)) -> match semantic_required_method_missing(
+                storage.trait_method_declarations,
+                start,
+                count,
+                implemented
+              ) {
+                Some(method) -> Some(SemanticImplementationRequiredMethodMissing(method))
+                None -> None<SemanticMethodResolutionIssue>()
+              }
+              _ -> Some(SemanticImplementationTraitContractMissing(site))
+            }
+          }
+        }
+        _ -> Some(SemanticImplementationTraitContractMissing(site))
+      }
+    }
+  }
+}
+
+fn semantic_inherent_method_owner(
+  types: borrow SemanticTypeCatalog,
+  target: SemanticTypeId,
+  module: RegisteredModule,
+  site: TypeNameRange
+) -> Option<DeclarationIdentity> {
+  match types.graph_for(target) {
+    None -> None<DeclarationIdentity>()
+    Some(graph) -> match semantic_type_graph_node(graph, target) {
+      SemanticNamedNode(declaration, _, _, _) -> Some(declaration)
+      SemanticVariantNode(declaration, _) -> Some(declaration)
+      SemanticOwnedNode(inner) -> semantic_inherent_method_owner(types, inner, module, site)
+      SemanticUniqueNode(inner) -> semantic_inherent_method_owner(types, inner, module, site)
+      _ -> match module.source.span(
+        __i64_to_usize(site.start),
+        __i64_to_usize(site.start + site.length)
+      ) {
+        Some(target_name) -> Some(
+          ModuleDeclarationIdentity(
+            module.identity,
+            ImplementationTargetDeclaration,
+            target_name
+          )
+        )
+        None -> None<DeclarationIdentity>()
+      }
+    }
   }
 }
 
@@ -587,6 +722,8 @@ fn semantic_implementation_methods(
   catalog: borrow SemanticMethodCatalog,
   types: borrow SemanticTypeCatalog,
   trait_atom: Option<SemanticTypeId>,
+  target: SemanticTypeId,
+  target_name: TypeNameRange,
   members: List<RegisteredImplMember>,
   declarations: List<DeclarationIdentity>,
   functions: List<FunctionIdentity>,
@@ -606,30 +743,40 @@ fn semantic_implementation_methods(
       ) {
         None -> SemanticImplementationMethodsRejected(
           product,
-          SemanticImplementationMethodMissing(function.syntax.name)
+          SemanticImplementationMethodMissing(function.identity, None<Span>())
         )
         Some(name_span) -> match name_span.text() {
           None -> SemanticImplementationMethodsRejected(
             product,
-            SemanticImplementationMethodMissing(function.syntax.name)
+            SemanticImplementationMethodMissing(function.identity, Some(name_span))
           )
-          Some(spelling) -> {
+          Some(_) -> {
             let declaration = match trait_atom {
               Some(atom) -> semantic_method_trait_member_from_catalog(
                 catalog,
                 types,
                 atom,
-                spelling
+                name_span
               )
               None -> match function.identity {
                 DeclaredFunctionIdentity(identity) -> Some<DeclarationIdentity>(identity)
-                _ -> None<DeclarationIdentity>()
+                _ -> match semantic_inherent_method_owner(
+                  types,
+                  target,
+                  module,
+                  target_name
+                ) {
+                  Some(owner) -> Some<DeclarationIdentity>(
+                    MemberDeclarationIdentity(owner, InherentMethodDeclaration, name_span)
+                  )
+                  None -> None<DeclarationIdentity>()
+                }
               }
             }
             match declaration {
               None -> SemanticImplementationMethodsRejected(
                 product,
-                SemanticImplementationMethodMissing(function.syntax.name)
+                SemanticImplementationMethodMissing(function.identity, Some(name_span))
               )
               Some(selected) -> match
                 resolve_function_signature_product_with_self_in_scope(
@@ -647,6 +794,8 @@ fn semantic_implementation_methods(
                       catalog,
                       types,
                       trait_atom,
+                      target,
+                      target_name,
                       remaining,
                       declarations.prepend(selected),
                       functions.prepend(function.identity),
@@ -669,6 +818,8 @@ fn semantic_implementation_methods(
         catalog,
         types,
         trait_atom,
+        target,
+        target_name,
         remaining,
         declarations,
         functions,
@@ -768,6 +919,8 @@ fn semantic_resolve_implementation_ready(
         catalog,
         types,
         trait_atom,
+        target,
+        implementation.name,
         implementation.members,
         Nil<DeclarationIdentity>(),
         Nil<FunctionIdentity>(),
@@ -779,24 +932,33 @@ fn semantic_resolve_implementation_ready(
           declarations,
           functions,
           signatures,
-        ) -> {
-          let next_catalog = semantic_method_catalog_add_implementation(
-            catalog,
-            target,
-            trait_atom,
-            requirements,
-            declarations,
-            functions,
-            signatures
-          )
-          let next_conformances = match trait_atom {
-            Some(atom) -> semantic_conformance_catalog_add_evidence(
-              conformances,
-              semantic_conformance_evidence(target, atom, requirements)
+        ) -> match semantic_implementation_coverage_issue(
+          catalog,
+          types,
+          trait_atom,
+          implementation.name,
+          declarations
+        ) {
+          Some(issue) -> SemanticMethodsRejected(issue)
+          None -> {
+            let next_catalog = semantic_method_catalog_add_implementation(
+              catalog,
+              target,
+              trait_atom,
+              requirements,
+              declarations,
+              functions,
+              signatures
             )
-            None -> conformances
+            let next_conformances = match trait_atom {
+              Some(atom) -> semantic_conformance_catalog_add_evidence(
+                conformances,
+                semantic_conformance_evidence(target, atom, requirements)
+              )
+              None -> conformances
+            }
+            SemanticMethodsResolved(product, next_catalog, next_conformances)
           }
-          SemanticMethodsResolved(product, next_catalog, next_conformances)
         }
       }
     }
