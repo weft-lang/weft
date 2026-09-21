@@ -531,7 +531,6 @@ pub(package) type CheckedBodyProducerIssue {
     SemanticTypeId,
     CheckedSourceRange
   ),
-  CheckedBodyProducerLoopContextRequired,
   CheckedBodyProducerBreakOutsideLoop,
   CheckedBodyProducerContinueOutsideLoop,
   CheckedBodyProducerArityMismatch(usize, usize),
@@ -814,7 +813,8 @@ type CheckedBodyExpectation {
 
 type CheckedLoopContext {
   CheckedOutsideLoop,
-  CheckedInsideLoop(SemanticTypeId)
+  CheckedInsideLoop(SemanticTypeId),
+  CheckedInferredLoop(usize)
 }
 
 type CheckedBranchResult {
@@ -2546,6 +2546,60 @@ impl CheckedBodyBuild {
             propagation: propagation.with_types(types)
           }
         )
+      }
+    }
+  }
+
+  fn begin_inferred_loop(self: owned Self) -> (owned CheckedBodyBuild, usize) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match expressions.begin_inferred_loop() {
+          (expressions, frame) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            frame
+          )
+        }
+      }
+    }
+  }
+
+  fn record_inferred_break(
+    self: owned Self,
+    frame: usize,
+    value: SemanticTypeId
+  ) -> owned CheckedBodyBuild {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        CheckedBodyBuild(
+          CheckedBodyBuildStorage {
+            signatures: signatures,
+            expressions: expressions.record_inferred_break(frame, value),
+            patterns: patterns,
+            closures: closures,
+            effects: effects,
+            propagation: propagation
+          }
+        )
+      }
+    }
+  }
+
+  fn inferred_breaks(self: borrow Self, frame: usize) -> List<SemanticTypeId> {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        expressions.inferred_breaks(frame)
       }
     }
   }
@@ -5701,35 +5755,38 @@ fn checked_body_block(
     first,
     CheckedInferResult
   ) {
-    CheckedBodyExprBuilt(state, checked_first) -> match checked_body_expr(
-      state,
-      source,
-      types,
-      owner,
-      function_result,
-      loop_context,
-      environment,
-      rest,
-      expectation
-    ) {
-      CheckedBodyExprBuilt(state, checked_rest) -> {
-        let result = state.result_type(checked_rest)
-        let first_range = state.range(checked_first)
-        let rest_range = state.range(checked_rest)
-        match covering_range(first_range, rest_range) {
-          range: CheckedSourceRange ->
-            match state.block(
-              checked_first,
-              checked_rest,
-              result,
-              range
-            ) {
-              (state, expression) -> CheckedBodyExprBuilt(state, expression)
-            }
-          nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+    CheckedBodyExprBuilt(state, checked_first) -> {
+      let next_types = checked_body_types_with_catalog(types, state.types())
+      match checked_body_expr(
+        state,
+        source,
+        next_types,
+        owner,
+        function_result,
+        loop_context,
+        environment,
+        rest,
+        expectation
+      ) {
+        CheckedBodyExprBuilt(state, checked_rest) -> {
+          let result = state.result_type(checked_rest)
+          let first_range = state.range(checked_first)
+          let rest_range = state.range(checked_rest)
+          match covering_range(first_range, rest_range) {
+            range: CheckedSourceRange ->
+              match state.block(
+                checked_first,
+                checked_rest,
+                result,
+                range
+              ) {
+                (state, expression) -> CheckedBodyExprBuilt(state, expression)
+              }
+            nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+          }
         }
+        CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
       }
-      CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
     }
     CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
   }
@@ -6889,10 +6946,48 @@ fn checked_body_loop(
   expectation: CheckedBodyExpectation
 ) -[SemanticConformance]> CheckedBodyExprBuild {
   match expectation {
-    CheckedInferResult -> CheckedBodyExprRejected(
-      state,
-      CheckedBodyProducerLoopContextRequired
-    )
+    CheckedInferResult -> match state.begin_inferred_loop() {
+      (state, frame) -> match checked_body_expr(
+        state,
+        source,
+        types,
+        owner,
+        function_result,
+        CheckedInferredLoop(frame),
+        environment,
+        body,
+        CheckedInferResult
+      ) {
+        CheckedBodyExprBuilt(state, checked_body) -> {
+          let breaks = state.inferred_breaks(frame)
+          let (state, result) = match breaks {
+            Nil -> (state, types.never_type)
+            Cons(first, Nil) -> (state, first)
+            Cons(first, rest) -> {
+              let catalog = state.types()
+              let module = types.module
+              let resolution = types.resolution
+              let segment = semantic_type_derived_segment_id(
+                module.identity,
+                catalog.next_derived_segment(module.identity, resolution.next_type_segment())
+              )
+              let builder = semantic_type_graph_builder(segment)
+              match checked_body_type_union(builder, first, rest) {
+                (builder, result) -> (
+                  state.with_types(semantic_type_catalog_with_graph(catalog, builder.freeze())),
+                  result
+                )
+              }
+            }
+          }
+          let range = state.range(checked_body)
+          match state.loop_expr(checked_body, result, range) {
+            (state, expression) -> CheckedBodyExprBuilt(state, expression)
+          }
+        }
+        CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+      }
+    }
     CheckedRequireResult(result) -> match checked_body_expr(
       state,
       source,
@@ -6948,6 +7043,7 @@ fn checked_body_let(
       value_expectation
     ) {
       CheckedBodyExprBuilt(state, checked_value) -> {
+        let types = checked_body_types_with_catalog(types, state.types())
         let value_type = state.result_type(checked_value)
         let binding_type = match annotation {
           Some(declared) -> declared
@@ -17958,7 +18054,7 @@ fn checked_body_array_elements(
   }
 }
 
-fn checked_body_array_union(
+fn checked_body_type_union(
   builder: owned SemanticTypeGraphBuilder,
   current: SemanticTypeId,
   remaining: List<SemanticTypeId>
@@ -17966,7 +18062,7 @@ fn checked_body_array_union(
   match remaining {
     Nil -> (builder, current)
     Cons(next, rest) -> match builder.union(current, next) {
-      (builder, joined) -> checked_body_array_union(builder, joined, rest)
+      (builder, joined) -> checked_body_type_union(builder, joined, rest)
     }
   }
 }
@@ -18051,7 +18147,7 @@ fn checked_body_array_literal(
             let builder = semantic_type_graph_builder(segment)
             let (builder, inner) = match element_types.reverse() {
               Nil -> (builder, types.never_type)
-              Cons(first, rest) -> checked_body_array_union(builder, first, rest)
+              Cons(first, rest) -> checked_body_type_union(builder, first, rest)
             }
             match builder.array(inner, length) {
               (builder, result) -> {
@@ -18935,6 +19031,39 @@ fn checked_body_expr(
         }
         CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
       }
+      CheckedInferredLoop(frame) -> match checked_body_expr(
+        state,
+        source,
+        types,
+        owner,
+        function_result,
+        CheckedInferredLoop(frame),
+        environment,
+        value,
+        CheckedInferResult
+      ) {
+        CheckedBodyExprBuilt(state, checked_value) -> {
+          let range = state.range(checked_value)
+          let value_type = state.result_type(checked_value)
+          let catalog = state.types()
+          if expectation_allows(catalog, types.never_type, expectation) {
+            let state = state.record_inferred_break(frame, value_type)
+            match state.break_expr(
+              checked_value,
+              types.never_type,
+              range
+            ) {
+              (state, expression) -> CheckedBodyExprBuilt(state, expression)
+            }
+          } else {
+            CheckedBodyExprRejected(
+              state,
+              expectation_mismatch(types.never_type, expectation)
+            )
+          }
+        }
+        CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+      }
     }
     BreakNoValue(start, length) -> match loop_context {
       CheckedOutsideLoop -> CheckedBodyExprRejected(
@@ -18958,13 +19087,33 @@ fn checked_body_expr(
           CheckedBodyProducerTypeMismatch(types.nil_type, result)
         )
       }
+      CheckedInferredLoop(frame) -> if expectation_allows(
+        catalog,
+        types.never_type,
+        expectation
+      ) {
+        match source_range(source, start, length) {
+          range: CheckedSourceRange -> {
+            let state = state.record_inferred_break(frame, types.nil_type)
+            match state.break_no_value(types.never_type, range) {
+              (state, expression) -> CheckedBodyExprBuilt(state, expression)
+            }
+          }
+          nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+        }
+      } else {
+        CheckedBodyExprRejected(
+          state,
+          expectation_mismatch(types.never_type, expectation)
+        )
+      }
     }
     Continue(start, length) -> match loop_context {
       CheckedOutsideLoop -> CheckedBodyExprRejected(
         state,
         CheckedBodyProducerContinueOutsideLoop
       )
-      CheckedInsideLoop(_) -> if expectation_allows(
+      _ -> if expectation_allows(
         catalog,
         types.never_type,
         expectation
