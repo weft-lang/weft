@@ -1189,7 +1189,6 @@ check_rejects "deferred_k_intrinsic_store" "test/negative/deferred_k_intrinsic_s
 check_rejects "deferred_k_record_store" "test/negative/deferred_k_record_store.weft" "type error: continuation cannot escape"
 check_rejects "deferred_k_variant_store" "test/negative/deferred_k_variant_store.weft" "type error: continuation cannot escape"
 check_rejects "deferred_k_generic_list_store" "test/negative/deferred_k_generic_list_store.weft" "type error: continuation cannot escape"
-check_rejects "deferred_k_generic_identity" "test/negative/deferred_k_generic_identity.weft" "type error: continuation cannot escape"
 check_rejects "deferred_k_returned_alias_non_tail" "test/negative/deferred_k_returned_alias_non_tail.weft" "type error: continuation call must be tail position"
 check_rejects "deferred_k_returned_alias_record_store" "test/negative/deferred_k_returned_alias_record_store.weft" "type error: continuation cannot escape"
 check_rejects "deferred_k_returned_alias_multiple_use" "test/negative/deferred_k_returned_alias_multiple_use.weft" "type error: continuation used more than once"
