@@ -6,16 +6,30 @@
 -- assigns native keys before rewriting those calls to direct transfers.
 
 use compiler/ir/data.{*}
-use compiler/project/identity.{FunctionIdentity, ModuleIdentity}
+use compiler/project/identity.{
+  DeclarationIdentity,
+  DeclaredFunctionIdentity,
+  FunctionIdentity,
+  ModuleIdentity
+}
 use compiler/project/identity/equality.{function_identity_eq}
 use compiler/types/graph.{
+  SemanticBorrowNode,
+  SemanticContinuationNode,
+  SemanticFunctionNode,
+  SemanticOwnedNode,
   SemanticTraitNode,
   SemanticTypeId,
   SemanticTypeVariable,
+  SemanticUniqueNode,
+  semantic_type_graph_list_type_id,
   semantic_type_graph_node,
   semantic_type_graph_trait_binding_declaration,
   semantic_type_graph_trait_binding_type_id,
   semantic_type_graph_traits_local,
+  semantic_type_graph_type_lists_local,
+  semantic_type_list_edge,
+  semantic_type_list_len,
   semantic_type_trait_binding_count,
   semantic_type_trait_binding_edge
 }
@@ -31,6 +45,11 @@ use compiler/types/graph/conformance/catalog.{
   semantic_conformance_catalog_empty,
   semantic_conformance_catalog_witness
 }
+use compiler/types/graph/pattern.{
+  SemanticTypePatternMatched,
+  SemanticTypePatternRejected,
+  semantic_type_pattern_match_substituted
+}
 use compiler/types/graph/substitution.{
   SemanticTypeSubstitution,
   semantic_type_substitution_bind,
@@ -40,6 +59,15 @@ use compiler/types/graph/substitution.{
 }
 use compiler/weft/check/body/product.{CheckedBodyProduct}
 use compiler/weft/check/checked_program.{CheckedProgram}
+use compiler/weft/check/resolution/methods.{
+  SemanticImplementationMethodSelected,
+  SemanticImplementationMethodSelection,
+  SemanticImplementationMethodSelectionAmbiguous,
+  SemanticImplementationMethodSelectionMissing,
+  SemanticMethodCatalog,
+  semantic_method_catalog_empty,
+  semantic_implementation_method_resolve
+}
 use compiler/weft/check/semantic_types.{
   SemanticTypeProductBuilder,
   semantic_type_product_catalog,
@@ -65,7 +93,10 @@ use stdlib/option.{None, Option, Some}
 
 type CheckedSpecializationRequest {
   identity: FunctionIdentity,
-  type_arguments: List<SemanticTypeId>
+  type_arguments: List<SemanticTypeId>,
+  call_signature: Option<SemanticTypeId>,
+  method_declaration: Option<DeclarationIdentity>,
+  dispatch_target: Option<SemanticTypeId>
 }
 
 type CheckedSpecializationPending {
@@ -83,6 +114,7 @@ type CheckedSpecializationFunction {
 type CheckedSpecializationUniverse {
   catalog: SemanticTypeCatalog,
   conformances: SemanticConformanceCatalog,
+  methods: SemanticMethodCatalog,
   bodies: List<CheckedBodyProduct>
 }
 
@@ -109,6 +141,7 @@ pub(package) type CheckedSpecializationIssue {
     CheckedFunctionSpecialization,
     CheckedStraightLowerIssue
   ),
+  CheckedSpecializationCallSignatureMismatch(FunctionIdentity),
   CheckedSpecializationRewriteMismatch
 }
 
@@ -127,6 +160,14 @@ type CheckedSpecializationArguments {
   values: List<SemanticTypeId>
 }
 
+type CheckedSpecializationPreparedRequest {
+  types: SemanticTypeProductBuilder,
+  identity: FunctionIdentity,
+  arguments: List<SemanticTypeId>,
+  concrete_signature: Option<SemanticTypeId>,
+  method_substitution: Option<SemanticTypeSubstitution>
+}
+
 type CheckedSpecializationBoundSubstitution {
   types: SemanticTypeProductBuilder,
   substitution: SemanticTypeSubstitution
@@ -135,6 +176,65 @@ type CheckedSpecializationBoundSubstitution {
 type CheckedSpecializationRewrite {
   CheckedSpecializationRewritten(IrFunction, List<i64>),
   CheckedSpecializationRewriteRejected
+}
+
+fn checked_specialization_function_parameter_count(
+  catalog: borrow SemanticTypeCatalog,
+  function_type: SemanticTypeId
+) -> usize {
+  match catalog.graph_for(function_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, function_type) {
+      SemanticFunctionNode(parameters, _, _) -> {
+        let lists = semantic_type_graph_type_lists_local(graph)
+        semantic_type_list_len(lists, parameters)
+      }
+      SemanticContinuationNode(_, _) -> {
+        let one: usize = 1
+        one
+      }
+      _ -> {
+        let zero: usize = 0
+        zero
+      }
+    }
+    None -> {
+      let zero: usize = 0
+      zero
+    }
+  }
+}
+
+fn checked_specialization_function_parameter(
+  catalog: borrow SemanticTypeCatalog,
+  function_type: SemanticTypeId,
+  index: usize
+) -> Option<SemanticTypeId> {
+  match catalog.graph_for(function_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, function_type) {
+      SemanticFunctionNode(parameters, _, _) -> {
+        let lists = semantic_type_graph_type_lists_local(graph)
+        if index >= semantic_type_list_len(lists, parameters) {
+          None<SemanticTypeId>()
+        } else {
+          Some<SemanticTypeId>(
+            semantic_type_graph_list_type_id(
+              graph,
+              semantic_type_list_edge(
+                lists,
+                parameters,
+                index
+              )
+            )
+          )
+        }
+      }
+      SemanticContinuationNode(input, _) -> if index == 0 {
+        Some<SemanticTypeId>(input)
+      } else { None<SemanticTypeId>() }
+      _ -> None<SemanticTypeId>()
+    }
+    None -> None<SemanticTypeId>()
+  }
 }
 
 fn checked_specialization_requests_in_insts(
@@ -149,9 +249,40 @@ fn checked_specialization_requests_in_insts(
           rest.prepend(
             CheckedSpecializationRequest {
               identity: identity,
-              type_arguments: arguments
+              type_arguments: arguments,
+              call_signature: None<SemanticTypeId>(),
+              method_declaration: None<DeclarationIdentity>(),
+              dispatch_target: None<SemanticTypeId>()
             }
           )
+        IrSemanticCallI64(
+          _,
+          IrSemanticMethodTarget(declaration, _, signature),
+          _,
+          _,
+        ) -> rest.prepend(
+          CheckedSpecializationRequest {
+            identity: DeclaredFunctionIdentity(declaration),
+            type_arguments: Nil<SemanticTypeId>(),
+            call_signature: Some<SemanticTypeId>(signature),
+            method_declaration: Some<DeclarationIdentity>(declaration),
+            dispatch_target: None<SemanticTypeId>()
+          }
+        )
+        IrSemanticCallI64(
+          _,
+          IrSemanticAssociatedTarget(declaration, target, signature),
+          _,
+          _,
+        ) -> rest.prepend(
+          CheckedSpecializationRequest {
+            identity: DeclaredFunctionIdentity(declaration),
+            type_arguments: Nil<SemanticTypeId>(),
+            call_signature: Some<SemanticTypeId>(signature),
+            method_declaration: Some<DeclarationIdentity>(declaration),
+            dispatch_target: Some<SemanticTypeId>(target)
+          }
+        )
         IrSemanticCallI64(_, IrSemanticHandleTarget(handler), _, _) ->
           checked_specialization_requests_in_handler(handler).concat(rest)
         IrSemanticDataI64(
@@ -162,7 +293,10 @@ fn checked_specialization_requests_in_insts(
         ) -> rest.prepend(
           CheckedSpecializationRequest {
             identity: identity,
-            type_arguments: arguments
+            type_arguments: arguments,
+            call_signature: None<SemanticTypeId>(),
+            method_declaration: None<DeclarationIdentity>(),
+            dispatch_target: None<SemanticTypeId>()
           }
         )
         IrSemanticDataI64(
@@ -351,6 +485,45 @@ fn checked_specialization_rewrite_insts(
           )
         }
       }
+      IrSemanticCallI64(
+        dst,
+        IrSemanticMethodTarget(_, receiver, _),
+        _,
+        arguments,
+      ) -> match keys {
+        Nil -> (instructions, keys, false)
+        Cons(key, remaining_keys) -> match checked_specialization_rewrite_insts(
+          remaining,
+          remaining_keys
+        ) {
+          (rewritten, final_keys, valid) -> (
+            IrInstCons(
+              IrCallI64(dst, key, ir_value_list_prepend(receiver, arguments)),
+              rewritten
+            ),
+            final_keys,
+            valid
+          )
+        }
+      }
+      IrSemanticCallI64(
+        dst,
+        IrSemanticAssociatedTarget(_, _, _),
+        _,
+        arguments,
+      ) -> match keys {
+        Nil -> (instructions, keys, false)
+        Cons(key, remaining_keys) -> match checked_specialization_rewrite_insts(
+          remaining,
+          remaining_keys
+        ) {
+          (rewritten, final_keys, valid) -> (
+            IrInstCons(IrCallI64(dst, key, arguments), rewritten),
+            final_keys,
+            valid
+          )
+        }
+      }
       IrSemanticCallI64(dst, IrSemanticHandleTarget(handler), result, arguments) ->
         match checked_specialization_rewrite_handler(handler, keys) {
           (rewritten_handler, after_handler, handler_valid) ->
@@ -492,6 +665,258 @@ fn checked_specialization_materialize_arguments(
       CheckedSpecializationArguments {
         types: rest.types,
         values: rest.values.prepend(concrete)
+      }
+    }
+  }
+}
+
+fn checked_specialization_arguments_from_substitution(
+  product: borrow CheckedBodyProduct,
+  function_index: usize,
+  substitution: borrow SemanticTypeSubstitution,
+  position: usize,
+  values: List<SemanticTypeId>
+) -> Option<List<SemanticTypeId>> {
+  let signatures = product.signatures()
+  let signature = product.function(function_index).signature
+  if position >= signatures.type_parameter_count(signature) {
+    Some<List<SemanticTypeId>>(values)
+  } else {
+    match semantic_type_substitution_get(
+      substitution,
+      signatures.type_parameter_at(signature, position)
+    ) {
+      None -> None<List<SemanticTypeId>>()
+      Some(argument) -> checked_specialization_arguments_from_substitution(
+        product,
+        function_index,
+        substitution,
+        position + 1,
+        values.append(argument)
+      )
+    }
+  }
+}
+
+fn checked_specialization_resolve_method(
+  methods: borrow SemanticMethodCatalog,
+  catalog: borrow SemanticTypeCatalog,
+  conformances: borrow SemanticConformanceCatalog,
+  target: SemanticTypeId,
+  declaration: DeclarationIdentity
+) -> SemanticImplementationMethodSelection {
+  let direct = semantic_implementation_method_resolve(
+    methods,
+    catalog,
+    conformances,
+    target,
+    declaration
+  )
+  match direct {
+    SemanticImplementationMethodSelectionMissing -> match catalog.graph_for(target) {
+      None -> direct
+      Some(graph) -> match semantic_type_graph_node(graph, target) {
+        SemanticOwnedNode(inner) -> checked_specialization_resolve_method(
+          methods,
+          catalog,
+          conformances,
+          inner,
+          declaration
+        )
+        SemanticUniqueNode(inner) -> checked_specialization_resolve_method(
+          methods,
+          catalog,
+          conformances,
+          inner,
+          declaration
+        )
+        SemanticBorrowNode(inner, _) -> checked_specialization_resolve_method(
+          methods,
+          catalog,
+          conformances,
+          inner,
+          declaration
+        )
+        _ -> direct
+      }
+    }
+    _ -> direct
+  }
+}
+
+fn checked_specialization_prepare_request(
+  universe: borrow CheckedSpecializationUniverse,
+  request: CheckedSpecializationRequest,
+  types: SemanticTypeProductBuilder,
+  caller: borrow SemanticTypeSubstitution
+) -> Option<CheckedSpecializationPreparedRequest> {
+  match request.call_signature {
+    None -> {
+      let concrete = checked_specialization_materialize_arguments(
+        types,
+        caller,
+        request.type_arguments
+      )
+      Some<CheckedSpecializationPreparedRequest>(
+        CheckedSpecializationPreparedRequest {
+          types: concrete.types,
+          identity: request.identity,
+          arguments: concrete.values,
+          concrete_signature: None<SemanticTypeId>(),
+          method_substitution: None<SemanticTypeSubstitution>()
+        }
+      )
+    }
+    Some(signature) -> {
+      let (signature_types, concrete_signature) = semantic_type_product_substitute(
+        types,
+        caller,
+        signature
+      )
+      let signature_catalog = semantic_type_product_catalog(signature_types)
+      let target_result = match request.dispatch_target {
+        None -> if checked_specialization_function_parameter_count(
+          signature_catalog,
+          concrete_signature
+        ) == 0 {
+          None<(SemanticTypeProductBuilder, SemanticTypeId)>()
+        } else {
+          match checked_specialization_function_parameter(
+            signature_catalog,
+            concrete_signature,
+            0
+          ) {
+            None -> None<(SemanticTypeProductBuilder, SemanticTypeId)>()
+            Some(parameter) -> Some<(SemanticTypeProductBuilder, SemanticTypeId)>(
+              (signature_types, parameter)
+            )
+          }
+        }
+        Some(target) -> {
+          let (target_types, concrete_target) = semantic_type_product_substitute(
+            signature_types,
+            caller,
+            target
+          )
+          Some<(SemanticTypeProductBuilder, SemanticTypeId)>(
+            (target_types, concrete_target)
+          )
+        }
+      }
+      match (request.method_declaration, target_result) {
+        (Some(declaration), Some((next_types, target))) -> {
+          let methods = universe.methods
+          let conformances = universe.conformances
+          let next_catalog = semantic_type_product_catalog(next_types)
+          match checked_specialization_resolve_method(
+            methods,
+            next_catalog,
+            conformances,
+            target,
+            declaration
+          ) {
+            SemanticImplementationMethodSelected(_, function, _, substitution) ->
+              Some<CheckedSpecializationPreparedRequest>(
+                CheckedSpecializationPreparedRequest {
+                  types: next_types,
+                  identity: function,
+                  arguments: Nil<SemanticTypeId>(),
+                  concrete_signature: Some<SemanticTypeId>(concrete_signature),
+                  method_substitution: Some<SemanticTypeSubstitution>(substitution)
+                }
+              )
+            _ -> match checked_specialization_function(
+              universe.bodies,
+              request.identity
+            ) {
+              Some(_) -> Some<CheckedSpecializationPreparedRequest>(
+                CheckedSpecializationPreparedRequest {
+                  types: next_types,
+                  identity: request.identity,
+                  arguments: Nil<SemanticTypeId>(),
+                  concrete_signature: Some<SemanticTypeId>(concrete_signature),
+                  method_substitution: None<SemanticTypeSubstitution>()
+                }
+              )
+              None -> None<CheckedSpecializationPreparedRequest>()
+            }
+          }
+        }
+        _ -> None<CheckedSpecializationPreparedRequest>()
+      }
+    }
+  }
+}
+
+fn checked_specialization_materialize_request(
+  product: borrow CheckedBodyProduct,
+  function_index: usize,
+  request: CheckedSpecializationPreparedRequest
+) -> Option<CheckedSpecializationArguments> {
+  match request.method_substitution {
+    Some(substitution) -> match checked_specialization_arguments_from_substitution(
+      product,
+      function_index,
+      substitution,
+      0,
+      Nil<SemanticTypeId>()
+    ) {
+      None -> None<CheckedSpecializationArguments>()
+      Some(arguments) -> Some<CheckedSpecializationArguments>(
+        CheckedSpecializationArguments {
+          types: request.types,
+          values: arguments
+        }
+      )
+    }
+    None -> match request.concrete_signature {
+      None -> Some<CheckedSpecializationArguments>(
+        CheckedSpecializationArguments {
+          types: request.types,
+          values: request.arguments
+        }
+      )
+      Some(concrete_signature) -> if {
+        let signatures = product.signatures()
+        let function = product.function(function_index)
+        signatures.type_parameter_count(function.signature)
+      } == 0 {
+        Some<CheckedSpecializationArguments>(
+          CheckedSpecializationArguments {
+            types: request.types,
+            values: Nil<SemanticTypeId>()
+          }
+        )
+      } else {
+        let request_types = request.types
+        let catalog = semantic_type_product_catalog(request_types)
+        let template = product.function(function_index).signature.type_id
+        let empty = semantic_type_substitution_empty()
+        match semantic_type_pattern_match_substituted(
+          catalog,
+          template,
+          empty,
+          concrete_signature,
+          empty
+        ) {
+          SemanticTypePatternRejected -> None<CheckedSpecializationArguments>()
+          SemanticTypePatternMatched(substitution) ->
+            match checked_specialization_arguments_from_substitution(
+              product,
+              function_index,
+              substitution,
+              0,
+              Nil<SemanticTypeId>()
+            ) {
+              None -> None<CheckedSpecializationArguments>()
+              Some(arguments) -> Some<CheckedSpecializationArguments>(
+                CheckedSpecializationArguments {
+                  types: request_types,
+                  values: arguments
+                }
+              )
+            }
+        }
       }
     }
   }
@@ -689,105 +1114,122 @@ fn checked_specialization_process_requests(
 ) -> CheckedSpecializationRequestsResult {
   match requests {
     Nil -> CheckedSpecializationRequestsAccepted(planner, keys)
-    Cons(request, remaining) -> match checked_specialization_function(
-      universe.bodies,
-      request.identity
-    ) {
-      None -> CheckedSpecializationRequestsRejected(
-        CheckedSpecializationFunctionMissing(request.identity)
-      )
-      Some(location) -> {
-        let product = location.product
-        let function_index = location.function_index
-        let {
-          types,
-            symbols,
-            pending,
-            instances,
-            functions,
-            next_key,
-        } = planner
-        let concrete = checked_specialization_materialize_arguments(
-          types,
-          caller,
-          request.type_arguments
+    Cons(request, remaining) -> {
+      let {
+        types,
+          symbols,
+          pending,
+          instances,
+          functions,
+          next_key,
+      } = planner
+      match checked_specialization_prepare_request(universe, request, types, caller) {
+        None -> CheckedSpecializationRequestsRejected(
+          CheckedSpecializationCallSignatureMismatch(request.identity)
         )
-        let { types: concrete_types, values } = concrete
-        let signature = product.function(function_index).signature
-        let signatures = product.signatures()
-        let expected = signatures.type_parameter_count(signature)
-        let actual = values.len()
-        if expected != actual {
-          CheckedSpecializationRequestsRejected(
-            CheckedSpecializationTypeArgumentCount(request.identity, expected, actual)
+        Some(prepared) -> match checked_specialization_function(
+          universe.bodies,
+          prepared.identity
+        ) {
+          None -> CheckedSpecializationRequestsRejected(
+            CheckedSpecializationFunctionMissing(prepared.identity)
           )
-        } else {
-          let specialization = CheckedFunctionSpecialization {
-            identity: request.identity,
-            type_arguments: values
-          }
-          let catalog = semantic_type_product_catalog(concrete_types)
-          match checked_native_function_symbols_resolve_specialization(
-            symbols,
-            catalog,
-            specialization
-          ) {
-            Some(key) -> checked_specialization_process_requests(
-              universe,
-              caller,
-              remaining,
-              CheckedSpecializationPlanner {
-                types: concrete_types,
-                symbols: symbols,
-                pending: pending,
-                instances: instances,
-                functions: functions,
-                next_key: next_key
-              },
-              keys.append(key)
-            )
-            None -> {
-              let conformances = universe.conformances
-              let base_substitution = checked_specialization_substitution_from(
-                product,
-                function_index,
-                values,
-                0,
-                semantic_type_substitution_empty()
+          Some(location) -> {
+            let product = location.product
+            let function_index = location.function_index
+            match checked_specialization_materialize_request(
+              product,
+              function_index,
+              prepared
+            ) {
+              None -> CheckedSpecializationRequestsRejected(
+                CheckedSpecializationCallSignatureMismatch(prepared.identity)
               )
-              let resolved = checked_specialization_bound_substitution_from(
-                product,
-                function_index,
-                conformances,
-                0,
-                concrete_types,
-                base_substitution
-              )
-              checked_specialization_process_requests(
-                universe,
-                caller,
-                remaining,
-                CheckedSpecializationPlanner {
-                  types: resolved.types,
-                  symbols: checked_native_function_symbols_bind_specialization(
+              Some(concrete) -> {
+                let { types: concrete_types, values } = concrete
+                let signature = product.function(function_index).signature
+                let signatures = product.signatures()
+                let expected = signatures.type_parameter_count(signature)
+                let actual = values.len()
+                if expected != actual {
+                  CheckedSpecializationRequestsRejected(
+                    CheckedSpecializationTypeArgumentCount(
+                      prepared.identity,
+                      expected,
+                      actual
+                    )
+                  )
+                } else {
+                  let specialization = CheckedFunctionSpecialization {
+                    identity: prepared.identity,
+                    type_arguments: values
+                  }
+                  let catalog = semantic_type_product_catalog(concrete_types)
+                  match checked_native_function_symbols_resolve_specialization(
                     symbols,
-                    specialization,
-                    next_key
-                  ),
-                  pending: pending.prepend(
-                    CheckedSpecializationPending {
-                      specialization: specialization,
-                      product: product,
-                      function_index: function_index,
-                      substitution: resolved.substitution
+                    catalog,
+                    specialization
+                  ) {
+                    Some(key) -> checked_specialization_process_requests(
+                      universe,
+                      caller,
+                      remaining,
+                      CheckedSpecializationPlanner {
+                        types: concrete_types,
+                        symbols: symbols,
+                        pending: pending,
+                        instances: instances,
+                        functions: functions,
+                        next_key: next_key
+                      },
+                      keys.append(key)
+                    )
+                    None -> {
+                      let conformances = universe.conformances
+                      let base_substitution = checked_specialization_substitution_from(
+                        product,
+                        function_index,
+                        values,
+                        0,
+                        semantic_type_substitution_empty()
+                      )
+                      let resolved = checked_specialization_bound_substitution_from(
+                        product,
+                        function_index,
+                        conformances,
+                        0,
+                        concrete_types,
+                        base_substitution
+                      )
+                      checked_specialization_process_requests(
+                        universe,
+                        caller,
+                        remaining,
+                        CheckedSpecializationPlanner {
+                          types: resolved.types,
+                          symbols: checked_native_function_symbols_bind_specialization(
+                            symbols,
+                            specialization,
+                            next_key
+                          ),
+                          pending: pending.prepend(
+                            CheckedSpecializationPending {
+                              specialization: specialization,
+                              product: product,
+                              function_index: function_index,
+                              substitution: resolved.substitution
+                            }
+                          ),
+                          instances: instances,
+                          functions: functions,
+                          next_key: next_key + 1
+                        },
+                        keys.append(next_key)
+                      )
                     }
-                  ),
-                  instances: instances,
-                  functions: functions,
-                  next_key: next_key + 1
-                },
-                keys.append(next_key)
-              )
+                  }
+                }
+              }
             }
           }
         }
@@ -983,6 +1425,7 @@ pub(package) fn plan_checked_body_specializations(
     CheckedSpecializationUniverse {
       catalog: catalog,
       conformances: semantic_conformance_catalog_empty(),
+      methods: semantic_method_catalog_empty(),
       bodies: list.from_slice<CheckedBodyProduct>(bodies[..])
     },
     signatures.module(),
@@ -1010,6 +1453,7 @@ fn checked_specialization_program_universe_from(
       CheckedSpecializationUniverse {
         catalog: combined,
         conformances: universe.conformances,
+        methods: universe.methods,
         bodies: universe.bodies.append(product)
       }
     )
@@ -1022,12 +1466,14 @@ pub(package) fn plan_checked_program_specializations(
   let root = program.module(program.root()).unwrap()
   let resolution = root.resolution()
   let conformances = resolution.conformances()
+  let methods = resolution.methods()
   let universe = checked_specialization_program_universe_from(
     program,
     0,
     CheckedSpecializationUniverse {
       catalog: semantic_type_catalog_empty(program.module_count()),
       conformances: conformances,
+      methods: methods,
       bodies: Nil<CheckedBodyProduct>()
     }
   )
