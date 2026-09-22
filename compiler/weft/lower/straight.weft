@@ -52,8 +52,10 @@ use compiler/types/graph/layout.{
   SemanticClosureRelease,
   SemanticManagedRelease,
   SemanticNoRelease,
+  SemanticRecordLayoutField,
   SemanticWeakRelease,
   semantic_field_may_require_release_with_substitution,
+  semantic_record_layout_fields,
   semantic_value_lane_release_kind_with_substitution,
   semantic_value_word_count_with_substitution
 }
@@ -201,7 +203,7 @@ use compiler/weft/check/body/pattern.{
   CheckedWildcardPatternKind
 }
 use stdlib/hash.{Hash}
-use stdlib/list.{List, Nil}
+use stdlib/list.{Cons, List, Nil}
 use stdlib/option.{None, Option, Some}
 
 pub(package) type CheckedStraightLowerIssue {
@@ -1675,6 +1677,157 @@ fn checked_flow_lower_record_fields_from(
   }
 }
 
+fn checked_flow_record_field_input(
+  graph: borrow CheckedExprGraph,
+  fields: CheckedRecordFieldListId,
+  source_index: usize,
+  position: usize,
+  input_word: usize,
+  catalog: borrow SemanticTypeCatalog,
+  substitution: SemanticTypeSubstitution
+) -> Option<(usize, usize)> {
+  if position >= graph.record_field_list_len(fields) {
+    None<(usize, usize)>()
+  } else {
+    let field = graph.record_field_list_at(fields, position)
+    match checked_flow_value_word_count(catalog, substitution, field.value_type) {
+      None -> None<(usize, usize)>()
+      Some(words) -> match field.position {
+        CheckedRecordFieldOrdinal(index) -> if index == source_index {
+          Some<(usize, usize)>((input_word, words))
+        } else {
+          checked_flow_record_field_input(
+            graph,
+            fields,
+            source_index,
+            position + 1,
+            input_word + words,
+            catalog,
+            substitution
+          )
+        }
+        CheckedRecordFieldWordOffset(_) -> None<(usize, usize)>()
+      }
+    }
+  }
+}
+
+fn checked_flow_structural_record_lanes(
+  graph: borrow CheckedExprGraph,
+  fields: CheckedRecordFieldListId,
+  layout: List<SemanticRecordLayoutField>,
+  values: IrValueList,
+  catalog: borrow SemanticTypeCatalog,
+  substitution: SemanticTypeSubstitution
+) -> Option<IrValueList> {
+  match layout {
+    Nil -> Some<IrValueList>(ir_value_list_empty())
+    Cons(SemanticRecordLayoutField(_, source_index, field_type), remaining) -> {
+      match checked_flow_record_field_input(
+        graph,
+        fields,
+        source_index,
+        0,
+        0,
+        catalog,
+        substitution
+      ) {
+        None -> None<IrValueList>()
+        Some((input_word, words)) -> match checked_flow_value_word_count(
+          catalog,
+          substitution,
+          field_type
+        ) {
+          Some(layout_words) if layout_words == words -> {
+            let field_lanes = checked_flow_value_take_lanes(
+              checked_flow_value_drop_lanes(values, input_word),
+              words
+            )
+            match checked_flow_structural_record_lanes(
+              graph,
+              fields,
+              remaining,
+              values,
+              catalog,
+              substitution
+            ) {
+              None -> None<IrValueList>()
+              Some(rest) -> Some<IrValueList>(ir_value_list_append(field_lanes, rest))
+            }
+          }
+          _ -> None<IrValueList>()
+        }
+      }
+    }
+  }
+}
+
+fn checked_flow_lower_record_value(
+  graph: borrow CheckedExprGraph,
+  expression: CheckedExprId,
+  construction: CheckedRecordConstruction,
+  fields: CheckedRecordFieldListId,
+  values: IrValueList,
+  state: CheckedStraightFlowState
+) -> CheckedFlowValueResult {
+  match construction {
+    CheckedDeclaredRecordConstruction(declaration) ->
+      checked_flow_emit_semantic_data_value(
+        graph,
+        expression,
+        state,
+        IrSemanticRecordInit(
+          checked_semantic_record_construction(construction),
+          checked_semantic_record_fields_from(graph, fields, 0)
+        ),
+        values
+      )
+    CheckedTupleRecordConstruction -> match values {
+      IrValueNil -> {
+        let result = state.next_value
+        CheckedFlowValueLowered(
+          checked_flow_scalar(result),
+          checked_flow_emit(state, ir_inst_nil_i64(result), 1)
+        )
+      }
+      IrValueCons(head, _) -> CheckedFlowValueLowered(
+        CheckedFlowValue { head: head, lanes: values },
+        state
+      )
+    }
+    CheckedStructuralRecordConstruction -> {
+      let catalog = state.catalog
+      let substitution = state.substitution
+      match semantic_record_layout_fields(catalog, graph.result_type(expression)) {
+        None -> CheckedFlowValueRejected(CheckedStraightValueShapeUnavailable)
+        Some(layout) -> match checked_flow_structural_record_lanes(
+          graph,
+          fields,
+          layout,
+          values,
+          catalog,
+          substitution
+        ) {
+          None -> CheckedFlowValueRejected(CheckedStraightValueShapeUnavailable)
+          Some(lanes) -> match lanes {
+            IrValueNil -> {
+              let result = state.next_value
+              CheckedFlowValueLowered(
+                checked_flow_scalar(result),
+                checked_flow_emit(state, ir_inst_nil_i64(result), 1)
+              )
+            }
+            IrValueCons(head, _) -> CheckedFlowValueLowered(
+              CheckedFlowValue { head: head, lanes: lanes },
+              state
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
 fn checked_semantic_type_arguments_from(
   graph: borrow CheckedExprGraph,
   arguments: CheckedTypeListId,
@@ -2657,6 +2810,7 @@ fn checked_flow_lower_pattern_fields(
   patterns: borrow CheckedPatternGraph,
   fields: CheckedPatternFieldListId,
   position: usize,
+  record_type: SemanticTypeId,
   value: CheckedFlowValue,
   state: CheckedStraightFlowState,
   env: CheckedStraightValueEnv,
@@ -2673,7 +2827,7 @@ fn checked_flow_lower_pattern_fields(
             checked_flow_emit_semantic_data_type_value(
               field.value_type,
               state,
-              IrSemanticDeclaredFieldAccess(declaration, ordinal),
+              IrSemanticDeclaredFieldAccess(declaration, ordinal, record_type),
               value.lanes
             )
           _ -> CheckedFlowValueRejected(CheckedStraightValueShapeUnavailable)
@@ -2723,6 +2877,7 @@ fn checked_flow_lower_pattern_fields(
             patterns,
             fields,
             position + 1,
+            record_type,
             value,
             after_child,
             child_env,
@@ -2862,6 +3017,7 @@ fn checked_flow_lower_pattern(
       patterns,
       patterns.record_fields(pattern),
       0,
+      patterns.input_type(pattern),
       value,
       state,
       env,
@@ -4874,7 +5030,11 @@ fn checked_flow_lower_expression(
           graph,
           expression,
           after_base,
-          IrSemanticDeclaredFieldAccess(declaration, offset),
+          IrSemanticDeclaredFieldAccess(
+            declaration,
+            offset,
+            graph.result_type(base_expression)
+          ),
           base.lanes
         )
       }
@@ -4889,16 +5049,33 @@ fn checked_flow_lower_expression(
       ) {
         CheckedFlowValueRejected(issue) -> CheckedFlowValueRejected(issue)
         CheckedFlowValueTerminated(after_base) -> CheckedFlowValueTerminated(after_base)
-        CheckedFlowValueLowered(base, after_base) -> checked_flow_emit_semantic_data_value(
-          graph,
-          expression,
-          after_base,
-          IrSemanticStructuralFieldAccess(
-            stable_key,
-            checked_semantic_structural_field_position(position)
-          ),
-          base.lanes
-        )
+        CheckedFlowValueLowered(base, after_base) -> match position {
+          CheckedStructuralFieldWordOffset(offset) -> {
+            let catalog = after_base.catalog
+            match checked_flow_value_word_count(
+              catalog,
+              after_base.substitution,
+              graph.result_type(expression)
+            ) {
+              None -> CheckedFlowValueRejected(CheckedStraightValueShapeUnavailable)
+              Some(0) -> CheckedFlowValueRejected(CheckedStraightWideValueUnsupported(0))
+              Some(words) -> match checked_flow_value_slice(base, offset, words) {
+                None -> CheckedFlowValueRejected(CheckedStraightValueShapeUnavailable)
+                Some(value) -> CheckedFlowValueLowered(value, after_base)
+              }
+            }
+          }
+          CheckedStructuralFieldUnplaced(_) -> checked_flow_emit_semantic_data_value(
+            graph,
+            expression,
+            after_base,
+            IrSemanticStructuralFieldAccess(
+              stable_key,
+              checked_semantic_structural_field_position(position)
+            ),
+            base.lanes
+          )
+        }
       }
     }
     CheckedIndexedLengthKind -> match graph.indexed_length_parts(expression) {
@@ -4963,17 +5140,14 @@ fn checked_flow_lower_expression(
         CheckedFlowArgumentsRejected(issue) -> CheckedFlowValueRejected(issue)
         CheckedFlowArgumentsTerminated(after_fields) ->
           CheckedFlowValueTerminated(after_fields)
-        CheckedFlowArgumentsLowered(values, after_fields) ->
-          checked_flow_emit_semantic_data_value(
-            graph,
-            expression,
-            after_fields,
-            IrSemanticRecordInit(
-              checked_semantic_record_construction(construction),
-              checked_semantic_record_fields_from(graph, fields, 0)
-            ),
-            values
-          )
+        CheckedFlowArgumentsLowered(values, after_fields) -> checked_flow_lower_record_value(
+          graph,
+          expression,
+          construction,
+          fields,
+          values,
+          after_fields
+        )
       }
     }
     CheckedArrayLiteralKind -> match graph.array_literal_parts(expression) {
