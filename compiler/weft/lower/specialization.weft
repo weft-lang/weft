@@ -45,6 +45,13 @@ use compiler/types/graph/conformance/catalog.{
   semantic_conformance_catalog_empty,
   semantic_conformance_catalog_witness
 }
+use compiler/types/graph/layout.{
+  SemanticClosureRelease,
+  SemanticManagedRelease,
+  SemanticNoRelease,
+  SemanticWeakRelease,
+  semantic_value_lane_release_kind_with_substitution
+}
 use compiler/types/graph/pattern.{
   SemanticTypePatternMatched,
   SemanticTypePatternRejected,
@@ -86,6 +93,12 @@ use compiler/weft/lower/symbols.{
   checked_native_function_symbols,
   checked_native_function_symbols_bind_specialization,
   checked_native_function_symbols_resolve_specialization
+}
+use runtime/effects.{
+  continuation_cleanup_kind_closure,
+  continuation_cleanup_kind_none,
+  continuation_cleanup_kind_rc,
+  continuation_cleanup_kind_weak
 }
 use stdlib/list.{Cons, List, Nil}
 use stdlib/list as list
@@ -142,6 +155,7 @@ pub(package) type CheckedSpecializationIssue {
     CheckedStraightLowerIssue
   ),
   CheckedSpecializationCallSignatureMismatch(FunctionIdentity),
+  CheckedSpecializationMutableSlotLayoutUnavailable(SemanticTypeId),
   CheckedSpecializationRewriteMismatch
 }
 
@@ -176,6 +190,11 @@ type CheckedSpecializationBoundSubstitution {
 type CheckedSpecializationRewrite {
   CheckedSpecializationRewritten(IrFunction, List<i64>),
   CheckedSpecializationRewriteRejected
+}
+
+type CheckedSpecializationLegalize {
+  CheckedSpecializationLegalized(IrFunction),
+  CheckedSpecializationLegalizeRejected(SemanticTypeId)
 }
 
 fn checked_specialization_function_parameter_count(
@@ -637,6 +656,312 @@ fn checked_specialization_rewrite(
             remaining
           )
         } else { CheckedSpecializationRewriteRejected }
+      }
+  }
+}
+
+fn checked_specialization_cleanup_kind(
+  catalog: borrow SemanticTypeCatalog,
+  substitution: borrow SemanticTypeSubstitution,
+  value_type: SemanticTypeId
+) -> i64 {
+  match semantic_value_lane_release_kind_with_substitution(
+    catalog,
+    substitution,
+    value_type,
+    0
+  ) {
+    SemanticNoRelease -> continuation_cleanup_kind_none()
+    SemanticManagedRelease -> continuation_cleanup_kind_rc()
+    SemanticClosureRelease -> continuation_cleanup_kind_closure()
+    SemanticWeakRelease -> continuation_cleanup_kind_weak()
+  }
+}
+
+fn checked_specialization_legalize_function(
+  function: IrFunction,
+  catalog: borrow SemanticTypeCatalog,
+  substitution: borrow SemanticTypeSubstitution
+) -> CheckedSpecializationLegalize {
+  match function {
+    IrFunction(key, parameters, blocks, source) ->
+      match checked_specialization_legalize_blocks(blocks, catalog, substitution) {
+        (rewritten, None) -> CheckedSpecializationLegalized(
+          IrFunction(key, parameters, rewritten, source)
+        )
+        (_, Some(value_type)) -> CheckedSpecializationLegalizeRejected(value_type)
+      }
+  }
+}
+
+fn checked_specialization_legalize_handler_clauses(
+  clauses: IrSemanticHandlerClauseList,
+  catalog: borrow SemanticTypeCatalog,
+  substitution: borrow SemanticTypeSubstitution
+) -> (IrSemanticHandlerClauseList, Option<SemanticTypeId>) {
+  match clauses {
+    IrSemanticHandlerClauseNil -> (IrSemanticHandlerClauseNil, None<SemanticTypeId>())
+    IrSemanticHandlerClauseCons(clause, remaining) ->
+      match checked_specialization_legalize_function(clause.body, catalog, substitution) {
+        CheckedSpecializationLegalizeRejected(value_type) -> (clauses, Some(value_type))
+        CheckedSpecializationLegalized(body) ->
+          match checked_specialization_legalize_handler_clauses(
+            remaining,
+            catalog,
+            substitution
+          ) {
+            (_, Some(value_type)) -> (clauses, Some(value_type))
+            (rest, None) -> (
+              IrSemanticHandlerClauseCons(
+                IrSemanticHandlerClause {
+                  effect_declaration: clause.effect_declaration,
+                  operation: clause.operation,
+                  atom: clause.atom,
+                  parameters: clause.parameters,
+                  parameter_words: clause.parameter_words,
+                  captures: clause.captures,
+                  capture_values: clause.capture_values,
+                  capture_words: clause.capture_words,
+                  continuation: clause.continuation,
+                  completion: clause.completion,
+                  result_type: clause.result_type,
+                  body: body
+                },
+                rest
+              ),
+              None<SemanticTypeId>()
+            )
+          }
+      }
+  }
+}
+
+fn checked_specialization_legalize_handler_return(
+  returned: IrSemanticHandleReturn,
+  catalog: borrow SemanticTypeCatalog,
+  substitution: borrow SemanticTypeSubstitution
+) -> (IrSemanticHandleReturn, Option<SemanticTypeId>) {
+  match returned {
+    IrSemanticNoHandleReturn -> (IrSemanticNoHandleReturn, None<SemanticTypeId>())
+    IrSemanticHandleReturnTransform(input, function) ->
+      match checked_specialization_legalize_function(function, catalog, substitution) {
+        CheckedSpecializationLegalizeRejected(value_type) -> (returned, Some(value_type))
+        CheckedSpecializationLegalized(rewritten) -> (
+          IrSemanticHandleReturnTransform(input, rewritten),
+          None<SemanticTypeId>()
+        )
+      }
+  }
+}
+
+fn checked_specialization_legalize_handler(
+  handler: IrSemanticHandler,
+  catalog: borrow SemanticTypeCatalog,
+  substitution: borrow SemanticTypeSubstitution
+) -> (IrSemanticHandler, Option<SemanticTypeId>) {
+  match checked_specialization_legalize_function(handler.body, catalog, substitution) {
+    CheckedSpecializationLegalizeRejected(value_type) -> (handler, Some(value_type))
+    CheckedSpecializationLegalized(body) ->
+      match checked_specialization_legalize_handler_clauses(
+        handler.clauses,
+        catalog,
+        substitution
+      ) {
+        (_, Some(value_type)) -> (handler, Some(value_type))
+        (clauses, None) -> match checked_specialization_legalize_handler_return(
+          handler.return_clause,
+          catalog,
+          substitution
+        ) {
+          (_, Some(value_type)) -> (handler, Some(value_type))
+          (return_clause, None) -> (
+            IrSemanticHandler {
+              body: body,
+              body_type: handler.body_type,
+              captures: handler.captures,
+              capture_words: handler.capture_words,
+              clauses: clauses,
+              return_clause: return_clause
+            },
+            None<SemanticTypeId>()
+          )
+        }
+      }
+  }
+}
+
+fn checked_specialization_legalize_mutable_slot(
+  value_type: SemanticTypeId,
+  slot: i64,
+  action: IrSemanticMutableSlotAction,
+  arguments: IrValueList,
+  catalog: borrow SemanticTypeCatalog,
+  substitution: borrow SemanticTypeSubstitution
+) -> (IrInst, bool) {
+  let kind = checked_specialization_cleanup_kind(catalog, substitution, value_type)
+  let value = ir_value_list_nth_or(arguments, 0, 0 - 1)
+  let count = ir_value_list_len(arguments)
+  if kind == continuation_cleanup_kind_none() or value < 0 {
+    (
+      IrSemanticDataI64(
+        0 - 1,
+        IrSemanticMutableSlot(value_type, slot, action),
+        value_type,
+        arguments
+      ),
+      false
+    )
+  } else {
+    match action {
+      IrSemanticMutableSlotAcquire -> (
+        IrManagedSlotI64(0 - 1, value, slot, kind, IrManagedSlotAcquire),
+        count == 1
+      )
+      IrSemanticMutableSlotObserve -> (
+        IrManagedSlotI64(0 - 1, value, slot, kind, IrManagedSlotObserve),
+        count == 1
+      )
+      IrSemanticMutableSlotReplace(previous) -> (
+        IrManagedSlotI64(
+          0 - 1,
+          value,
+          slot,
+          kind,
+          IrManagedSlotReplace(previous)
+        ),
+        count == 2 and ir_value_list_nth_or(arguments, 1, 0 - 1) == previous
+      )
+      IrSemanticMutableSlotRelease -> (
+        IrManagedSlotI64(0 - 1, value, slot, kind, IrManagedSlotRelease),
+        count == 1
+      )
+    }
+  }
+}
+
+fn checked_specialization_legalize_insts(
+  instructions: IrInstList,
+  catalog: borrow SemanticTypeCatalog,
+  substitution: borrow SemanticTypeSubstitution
+) -> (IrInstList, Option<SemanticTypeId>) {
+  match instructions {
+    IrInstNil -> (IrInstNil, None<SemanticTypeId>())
+    IrInstCons(instruction, remaining) -> match instruction {
+      IrSemanticCallI64(dst, IrSemanticHandleTarget(handler), result, arguments) ->
+        match checked_specialization_legalize_handler(handler, catalog, substitution) {
+          (_, Some(value_type)) -> (instructions, Some(value_type))
+          (rewritten_handler, None) -> match checked_specialization_legalize_insts(
+            remaining,
+            catalog,
+            substitution
+          ) {
+            (_, Some(value_type)) -> (instructions, Some(value_type))
+            (rewritten, None) -> (
+              IrInstCons(
+                IrSemanticCallI64(
+                  dst,
+                  IrSemanticHandleTarget(rewritten_handler),
+                  result,
+                  arguments
+                ),
+                rewritten
+              ),
+              None<SemanticTypeId>()
+            )
+          }
+        }
+      IrSemanticDataI64(
+        _,
+        IrSemanticMutableSlot(value_type, slot, action),
+        _,
+        arguments,
+      ) -> match checked_specialization_legalize_mutable_slot(
+        value_type,
+        slot,
+        action,
+        arguments,
+        catalog,
+        substitution
+      ) {
+        (_, false) -> (instructions, Some(value_type))
+        (concrete, true) -> match checked_specialization_legalize_insts(
+          remaining,
+          catalog,
+          substitution
+        ) {
+          (_, Some(failed_type)) -> (instructions, Some(failed_type))
+          (rewritten, None) -> (
+            IrInstCons(concrete, rewritten),
+            None<SemanticTypeId>()
+          )
+        }
+      }
+      IrSemanticDataI64(
+        dst,
+        IrSemanticClosure(function, captures, source_site, role, generator),
+        result,
+        arguments,
+      ) -> match checked_specialization_legalize_function(function, catalog, substitution) {
+        CheckedSpecializationLegalizeRejected(value_type) -> (instructions, Some(value_type))
+        CheckedSpecializationLegalized(rewritten_function) ->
+          match checked_specialization_legalize_insts(remaining, catalog, substitution) {
+            (_, Some(value_type)) -> (instructions, Some(value_type))
+            (rewritten, None) -> (
+              IrInstCons(
+                IrSemanticDataI64(
+                  dst,
+                  IrSemanticClosure(
+                    rewritten_function,
+                    captures,
+                    source_site,
+                    role,
+                    generator
+                  ),
+                  result,
+                  arguments
+                ),
+                rewritten
+              ),
+              None<SemanticTypeId>()
+            )
+          }
+      }
+      other -> match checked_specialization_legalize_insts(
+        remaining,
+        catalog,
+        substitution
+      ) {
+        (_, Some(value_type)) -> (instructions, Some(value_type))
+        (rewritten, None) -> (IrInstCons(other, rewritten), None<SemanticTypeId>())
+      }
+    }
+  }
+}
+
+fn checked_specialization_legalize_blocks(
+  blocks: IrBlockList,
+  catalog: borrow SemanticTypeCatalog,
+  substitution: borrow SemanticTypeSubstitution
+) -> (IrBlockList, Option<SemanticTypeId>) {
+  match blocks {
+    IrBlockListNil -> (IrBlockListNil, None<SemanticTypeId>())
+    IrBlockListCons(IrBlock(id, parameters, instructions, terminator), remaining) ->
+      match checked_specialization_legalize_insts(instructions, catalog, substitution) {
+        (_, Some(value_type)) -> (blocks, Some(value_type))
+        (rewritten_instructions, None) -> match checked_specialization_legalize_blocks(
+          remaining,
+          catalog,
+          substitution
+        ) {
+          (_, Some(value_type)) -> (blocks, Some(value_type))
+          (rewritten_blocks, None) -> (
+            IrBlockListCons(
+              IrBlock(id, parameters, rewritten_instructions, terminator),
+              rewritten_blocks
+            ),
+            None<SemanticTypeId>()
+          )
+        }
       }
   }
 }
@@ -1304,18 +1629,31 @@ fn checked_specialization_plan_pending(
                 CheckedSpecializationRewriteRejected -> CheckedSpecializationRejected(
                   CheckedSpecializationRewriteMismatch
                 )
-                CheckedSpecializationRewritten(rewritten, _) ->
-                  checked_specialization_plan_pending(
-                    universe,
-                    CheckedSpecializationPlanner {
-                      types: after_types,
-                      symbols: after_symbols,
-                      pending: after_pending,
-                      instances: after_instances.append(pending.specialization),
-                      functions: after_functions.append(rewritten),
-                      next_key: after_key
-                    }
-                  )
+                CheckedSpecializationRewritten(rewritten, _) -> {
+                  let after_catalog = semantic_type_product_catalog(after_types)
+                  match checked_specialization_legalize_function(
+                    rewritten,
+                    after_catalog,
+                    caller
+                  ) {
+                    CheckedSpecializationLegalizeRejected(value_type) ->
+                      CheckedSpecializationRejected(
+                        CheckedSpecializationMutableSlotLayoutUnavailable(value_type)
+                      )
+                    CheckedSpecializationLegalized(concrete) ->
+                      checked_specialization_plan_pending(
+                        universe,
+                        CheckedSpecializationPlanner {
+                          types: after_types,
+                          symbols: after_symbols,
+                          pending: after_pending,
+                          instances: after_instances.append(pending.specialization),
+                          functions: after_functions.append(concrete),
+                          next_key: after_key
+                        }
+                      )
+                  }
+                }
               }
             }
           }
@@ -1632,6 +1970,93 @@ fn checked_specialization_count_calls(function: IrFunction, kind: i64) -> i64 {
   }
 }
 
+fn checked_specialization_data_kind(operation: IrSemanticDataOp) -> i64 {
+  match operation {
+    IrSemanticFunctionReference(_, _) -> 1
+    IrSemanticDeclaredFieldAccess(_, _) -> 2
+    IrSemanticStructuralFieldAccess(_, _) -> 3
+    IrSemanticIndexedLength(_, _) -> 4
+    IrSemanticIndexedGet(_, _) -> 5
+    IrSemanticRecordInit(_, _) -> 6
+    IrSemanticArrayLiteral(_) -> 7
+    IrSemanticMutableSlot(_, _, _) -> 8
+    IrSemanticClosure(_, _, _, _, _) -> 9
+  }
+}
+
+fn checked_specialization_count_data_handler_clauses(
+  clauses: IrSemanticHandlerClauseList,
+  kind: i64
+) -> i64 {
+  match clauses {
+    IrSemanticHandlerClauseNil -> 0
+    IrSemanticHandlerClauseCons(clause, remaining) ->
+      checked_specialization_count_data(clause.body, kind) +
+      checked_specialization_count_data_handler_clauses(remaining, kind)
+  }
+}
+
+fn checked_specialization_count_data_handler_return(
+  returned: IrSemanticHandleReturn,
+  kind: i64
+) -> i64 {
+  match returned {
+    IrSemanticNoHandleReturn -> 0
+    IrSemanticHandleReturnTransform(_, function) ->
+      checked_specialization_count_data(function, kind)
+  }
+}
+
+fn checked_specialization_count_data_handler(
+  handler: IrSemanticHandler,
+  kind: i64
+) -> i64 {
+  checked_specialization_count_data(handler.body, kind) +
+    checked_specialization_count_data_handler_clauses(handler.clauses, kind) +
+    checked_specialization_count_data_handler_return(handler.return_clause, kind)
+}
+
+fn checked_specialization_count_data_instructions(
+  instructions: IrInstList,
+  kind: i64
+) -> i64 {
+  match instructions {
+    IrInstNil -> 0
+    IrInstCons(instruction, remaining) -> {
+      let current = match instruction {
+        IrSemanticCallI64(_, IrSemanticHandleTarget(handler), _, _) ->
+          checked_specialization_count_data_handler(handler, kind)
+        IrSemanticDataI64(_, operation, _, _) -> {
+          let nested = match operation {
+            IrSemanticClosure(function, _, _, _, _) ->
+              checked_specialization_count_data(function, kind)
+            _ -> 0
+          }
+          (if checked_specialization_data_kind(operation) == kind { 1 } else { 0 }) +
+            nested
+        }
+        _ -> 0
+      }
+      current + checked_specialization_count_data_instructions(remaining, kind)
+    }
+  }
+}
+
+fn checked_specialization_count_data_blocks(blocks: IrBlockList, kind: i64) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(IrBlock(_, _, instructions, _), remaining) ->
+      checked_specialization_count_data_instructions(instructions, kind) +
+      checked_specialization_count_data_blocks(remaining, kind)
+  }
+}
+
+fn checked_specialization_count_data(function: IrFunction, kind: i64) -> i64 {
+  match function {
+    IrFunction(_, _, blocks, _) -> checked_specialization_count_data_blocks(blocks, kind)
+  }
+}
+
 impl CheckedSpecializationPlan {
   pub(package) fn instance_count(self: borrow Self) -> usize {
     let { catalog: _, symbols: _, instances, functions: _ } = self
@@ -1668,6 +2093,22 @@ impl CheckedSpecializationPlan {
         Nil -> return count
         Cons(function, rest) -> {
           count = count + checked_specialization_count_calls(function, kind)
+          remaining = rest
+        }
+      }
+    }
+    count
+  }
+
+  pub(package) fn semantic_data_count(self: borrow Self, kind: i64) -> i64 {
+    let { catalog: _, symbols: _, instances: _, functions } = self
+    let mut count: i64 = 0
+    let mut remaining = functions
+    loop {
+      match remaining {
+        Nil -> return count
+        Cons(function, rest) -> {
+          count = count + checked_specialization_count_data(function, kind)
           remaining = rest
         }
       }
