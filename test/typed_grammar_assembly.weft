@@ -1,3 +1,4 @@
+use compiler/ir/data.{*}
 use compiler/weft/check/checked_program.{CheckedProgram}
 use compiler/weft/check/checked_module.{CheckedModule}
 use compiler/weft/check/body/program.{CheckedModuleBodyProduct}
@@ -32,10 +33,64 @@ use compiler/weft/check/table.{ttable_new}
 use stdlib/diagnostic.{Diagnose}
 use stdlib/diagnostic/schema.{DiagnosticSourceNamed}
 use stdlib/grammar.{Checked, CheckRejected, CheckResult}
+use stdlib/list.{Cons, List, Nil}
 use stdlib/option.{Option}
 use stdlib/source.{Source}
 use stdlib/string.{int_to_str, str_concat}
 use stdlib/test.{Test}
+use runtime/effects.{continuation_cleanup_kind_rc}
+
+fn capture_word_shape(words: IrConcreteCaptureWordList) -> (i64, i64) {
+  match words {
+    IrConcreteCaptureWordNil -> (0, 0)
+    IrConcreteCaptureWordCons(word, remaining) -> {
+      let (count, managed) = capture_word_shape(remaining)
+      (
+        count + 1,
+        managed + if word.cleanup_kind == continuation_cleanup_kind_rc() { 1 }
+      else { 0 }
+      )
+    }
+  }
+}
+
+fn capture_shape_in_instructions(instructions: IrInstList) -> (i64, i64) {
+  match instructions {
+    IrInstNil -> (0, 0)
+    IrInstCons(instruction, remaining) -> {
+      let (rest_count, rest_managed) = capture_shape_in_instructions(remaining)
+      match instruction {
+        IrSemanticDataI64(_, IrSemanticSpecializedClosure(_, words, _, _, _), _, _) -> {
+          let (count, managed) = capture_word_shape(words)
+          (count + rest_count, managed + rest_managed)
+        }
+        _ -> (rest_count, rest_managed)
+      }
+    }
+  }
+}
+
+fn capture_shape_in_blocks(blocks: IrBlockList) -> (i64, i64) {
+  match blocks {
+    IrBlockListNil -> (0, 0)
+    IrBlockListCons(IrBlock(_, _, instructions, _), remaining) -> {
+      let (count, managed) = capture_shape_in_instructions(instructions)
+      let (rest_count, rest_managed) = capture_shape_in_blocks(remaining)
+      (count + rest_count, managed + rest_managed)
+    }
+  }
+}
+
+fn capture_shape_in_functions(functions: List<IrFunction>) -> (i64, i64) {
+  match functions {
+    Nil -> (0, 0)
+    Cons(IrFunction(_, _, blocks, _), remaining) -> {
+      let (count, managed) = capture_shape_in_blocks(blocks)
+      let (rest_count, rest_managed) = capture_shape_in_functions(remaining)
+      (count + rest_count, managed + rest_managed)
+    }
+  }
+}
 
 fn observe_typed_assembled_program(text: str) -> (CheckResult<CheckedProgram>, i64) {
   let source = Source { text: text, identity: DiagnosticSourceNamed("typed-assembled.weft") }
@@ -588,6 +643,59 @@ test "typed specialization resolves generic managed mutable cleanup" {
     }
   }
   Test.assert_eq(errors, 0)
+}
+
+test "typed specialization materializes closure capture layout" {
+  let source = "fn main(value: str) -> i64 { let callback = () => value\n0 }"
+  let (result, errors) = observe_typed_assembled_program(source)
+  match result {
+    CheckRejected -> Test.assert_true(false)
+    Checked(program) -> match plan_checked_program_specializations(program) {
+      CheckedSpecializationAccepted(plan) -> {
+        Test.assert_eq(plan.semantic_data_count(9), 0)
+        Test.assert_eq(plan.semantic_data_count(10), 1)
+        let { catalog: _, symbols: _, instances: _, functions } = plan
+        let (words, managed) = capture_shape_in_functions(functions)
+        Test.assert_eq(words, 1)
+        Test.assert_eq(managed, 1)
+      }
+      CheckedSpecializationRejected(_) -> Test.assert_true(false)
+    }
+  }
+  Test.assert_eq(errors, 0)
+}
+
+test "typed specialization materializes every lane of an owned record capture" {
+  let source = "fn main() -> i64 { let value = { left: 1, right: \"owned\" }\n" |>
+    str_concat("let callback = () => value\n0 }")
+  let (result, errors) = observe_typed_assembled_program(source)
+  match result {
+    CheckRejected -> Test.assert_true(false)
+    Checked(program) -> match plan_checked_program_specializations(program) {
+      CheckedSpecializationAccepted(plan) -> {
+        Test.assert_eq(plan.semantic_data_count(9), 0)
+        Test.assert_eq(plan.semantic_data_count(10), 1)
+        let { catalog: _, symbols: _, instances: _, functions } = plan
+        let (words, managed) = capture_shape_in_functions(functions)
+        Test.assert_eq(words, 2)
+        Test.assert_eq(managed, 1)
+      }
+      CheckedSpecializationRejected(_) -> Test.assert_true(false)
+    }
+  }
+  Test.assert_eq(errors, 0)
+}
+
+test "typed closure captures reject structural records containing borrows" {
+  let source = "fn main(value: [i64]) -> i64 { let wrapped = { inner: value }\n" |>
+    str_concat("let callback = () => wrapped\n0 }")
+  let (result, _) = observe_typed_assembled_program(source)
+  Test.assert_true(
+    match result {
+      CheckRejected -> true
+      Checked(_) -> false
+    }
+  )
 }
 
 test "typed specialization legalizes variant constructors" {
