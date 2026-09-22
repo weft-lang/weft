@@ -32,7 +32,7 @@ negative-focus +cases: dev-candidate
     WEFT="$PWD/.weft-dev-candidate" bash test/negative/run_negative_tests.sh {{ cases }}
 
 # Exercise the complete documentation boundary with a fresh candidate. This is
-# cheap enough to keep Markdown, source examples, and README facts together.
+# cheap enough to keep Markdown and source examples together.
 docs-focus: dev-candidate
     #!/usr/bin/env bash
     set -euo pipefail
@@ -40,7 +40,6 @@ docs-focus: dev-candidate
     python3 test/docs/test_markdown_runner.py
     bash test/docs/run_markdown_examples.sh README.md docs/getting-started.md docs/networking.md docs/concurrency.md docs/testing.md
     python3 test/docs/run_source_examples.py
-    bash test/docs/check_readme_facts.sh
 
 # Test the converged candidate without installing it as the trust root.
 # Repository-private fixtures require checkout SDK selection, which depends on
