@@ -1,0 +1,267 @@
+-- Immutable ownership provenance for checked expression results.
+--
+-- A result either owns its cleanup stake or aliases one exact lexical
+-- binding. Exact aliases preserve the complete value; projected aliases name
+-- a field or other subvalue whose stake must be acquired before the owner is
+-- released. The producer stores only scalar kinds and binding ordinals; the
+-- retained expression segment reconstructs a complete binding identity on the
+-- cold path.
+
+use compiler/weft/check/body/graph.{
+  CheckedBlockKind,
+  CheckedBindingId,
+  CheckedDeclaredFieldAccessKind,
+  CheckedDeferKind,
+  CheckedExprGraph,
+  CheckedExprId,
+  CheckedExprSegmentId,
+  CheckedGenericCallKind,
+  CheckedLetKind,
+  CheckedLetMutKind,
+  CheckedLocalReferenceKind,
+  CheckedStructuralFieldAccessKind,
+  checked_binding_id_eq,
+  checked_binding_id_from_ordinal,
+  checked_binding_id_ordinal,
+  checked_expr_id_from_ordinal,
+  checked_expr_id_ordinal,
+  checked_expr_id_segment,
+  checked_expr_segment_id_eq
+}
+use compiler/weft/check/storage.{
+  DenseBuilder,
+  DenseSegment,
+  dense_builder_with_capacity,
+  dense_index
+}
+use stdlib/option.{None, Option, Some}
+use stdlib/panic.{panic}
+
+pub(package) type CheckedValueOwnershipKind {
+  CheckedOwnedValue,
+  CheckedExactBorrowedValue,
+  CheckedProjectedBorrowedValue
+}
+
+type CheckedOwnershipFactStorage {
+  segment: CheckedExprSegmentId,
+  kinds: DenseSegment<CheckedValueOwnershipKind>,
+  bindings: DenseSegment<usize>
+}
+
+pub(package) type CheckedOwnershipFacts = opaque CheckedOwnershipFactStorage
+
+type CheckedDerivedOwnership {
+  CheckedDerivedOwned,
+  CheckedDerivedExact(usize),
+  CheckedDerivedProjected(usize)
+}
+
+fn checked_ownership_derived_at(
+  kinds: borrow DenseBuilder<CheckedValueOwnershipKind>,
+  bindings: borrow DenseBuilder<usize>,
+  expression: CheckedExprId,
+  current: usize
+) -> CheckedDerivedOwnership {
+  let ordinal = checked_expr_id_ordinal(expression)
+  if ordinal >= current { panic("Checked ownership dependency is not yet published") }
+  else {
+    match kinds.at(dense_index(ordinal)) {
+      CheckedOwnedValue -> CheckedDerivedOwned
+      CheckedExactBorrowedValue -> CheckedDerivedExact(
+        bindings.at(dense_index(ordinal))
+      )
+      CheckedProjectedBorrowedValue -> CheckedDerivedProjected(
+        bindings.at(dense_index(ordinal))
+      )
+    }
+  }
+}
+
+fn checked_ownership_project(
+  kinds: borrow DenseBuilder<CheckedValueOwnershipKind>,
+  bindings: borrow DenseBuilder<usize>,
+  base: CheckedExprId,
+  current: usize
+) -> CheckedDerivedOwnership {
+  match checked_ownership_derived_at(kinds, bindings, base, current) {
+    CheckedDerivedOwned -> CheckedDerivedOwned
+    CheckedDerivedExact(binding) -> CheckedDerivedProjected(binding)
+    CheckedDerivedProjected(binding) -> CheckedDerivedProjected(binding)
+  }
+}
+
+fn checked_ownership_scope(
+  kinds: borrow DenseBuilder<CheckedValueOwnershipKind>,
+  bindings: borrow DenseBuilder<usize>,
+  binding: usize,
+  body: CheckedExprId,
+  current: usize
+) -> CheckedDerivedOwnership {
+  match checked_ownership_derived_at(kinds, bindings, body, current) {
+    CheckedDerivedExact(origin) -> if origin == binding {
+      CheckedDerivedOwned
+    } else { CheckedDerivedExact(origin) }
+    CheckedDerivedProjected(origin) -> if origin == binding {
+      CheckedDerivedOwned
+    } else { CheckedDerivedProjected(origin) }
+    CheckedDerivedOwned -> CheckedDerivedOwned
+  }
+}
+
+fn checked_ownership_publish(
+  kinds: borrow mut DenseBuilder<CheckedValueOwnershipKind>,
+  bindings: borrow mut DenseBuilder<usize>,
+  ownership: CheckedDerivedOwnership
+) -> nil {
+  match ownership {
+    CheckedDerivedOwned -> {
+      kinds.push(CheckedOwnedValue)
+      bindings.push(0)
+      nil
+    }
+    CheckedDerivedExact(binding) -> {
+      kinds.push(CheckedExactBorrowedValue)
+      bindings.push(binding)
+      nil
+    }
+    CheckedDerivedProjected(binding) -> {
+      kinds.push(CheckedProjectedBorrowedValue)
+      bindings.push(binding)
+      nil
+    }
+  }
+}
+
+pub(package) fn checked_ownership_facts(
+  expressions: borrow CheckedExprGraph
+) -> CheckedOwnershipFacts {
+  let mut kinds = dense_builder_with_capacity<CheckedValueOwnershipKind>(
+    expressions.len()
+  )
+  let mut bindings = dense_builder_with_capacity<usize>(expressions.len())
+  let mut ordinal: usize = 0
+  while ordinal < expressions.len() {
+    let expression = checked_expr_id_from_ordinal(expressions.segment(), ordinal)
+    let ownership = match expressions.kind(expression) {
+      CheckedLocalReferenceKind -> CheckedDerivedExact(
+        checked_binding_id_ordinal(expressions.local_binding(expression))
+      )
+      CheckedDeclaredFieldAccessKind -> match expressions.declared_field_access_parts(
+        expression
+      ) {
+        (base, _, _) -> checked_ownership_project(kinds, bindings, base, ordinal)
+      }
+      CheckedStructuralFieldAccessKind -> match expressions.structural_field_access_parts(
+        expression
+      ) {
+        (base, _, _) -> checked_ownership_project(kinds, bindings, base, ordinal)
+      }
+      CheckedBlockKind -> checked_ownership_derived_at(
+        kinds,
+        bindings,
+        expressions.block_rest(expression),
+        ordinal
+      )
+      CheckedLetKind -> match expressions.let_parts(expression) {
+        (binding, _, body) -> checked_ownership_scope(
+          kinds,
+          bindings,
+          checked_binding_id_ordinal(binding),
+          body,
+          ordinal
+        )
+      }
+      CheckedLetMutKind -> match expressions.let_mut_parts(expression) {
+        (binding, _, body) -> checked_ownership_scope(
+          kinds,
+          bindings,
+          checked_binding_id_ordinal(binding),
+          body,
+          ordinal
+        )
+      }
+      CheckedDeferKind -> checked_ownership_derived_at(
+        kinds,
+        bindings,
+        expressions.defer_body(expression),
+        ordinal
+      )
+      CheckedGenericCallKind -> match expressions.generic_call_parts(expression) {
+        (call, _) -> checked_ownership_derived_at(kinds, bindings, call, ordinal)
+      }
+      _ -> CheckedDerivedOwned
+    }
+    checked_ownership_publish(kinds, bindings, ownership)
+    ordinal = ordinal + 1
+  }
+  CheckedOwnershipFacts(
+    CheckedOwnershipFactStorage {
+      segment: expressions.segment(),
+      kinds: kinds.freeze(),
+      bindings: bindings.freeze()
+    }
+  )
+}
+
+impl CheckedOwnershipFacts {
+  pub(package) fn segment(self: borrow Self) -> CheckedExprSegmentId {
+    match self { CheckedOwnershipFacts(storage) -> storage.segment }
+  }
+
+  pub(package) fn len(self: borrow Self) -> usize {
+    match self {
+      CheckedOwnershipFacts(storage) -> {
+        let kinds = storage.kinds
+        kinds.len()
+      }
+    }
+  }
+
+  pub(package) fn kind(
+    self: borrow Self,
+    expression: CheckedExprId
+  ) -> CheckedValueOwnershipKind {
+    if not checked_expr_segment_id_eq(self.segment(), checked_expr_id_segment(expression)) {
+      panic("Checked ownership expression belongs to another segment")
+    } else {
+      match self {
+        CheckedOwnershipFacts(storage) -> {
+          let kinds = storage.kinds
+          kinds.at(dense_index(checked_expr_id_ordinal(expression)))
+        }
+      }
+    }
+  }
+
+  pub(package) fn binding(
+    self: borrow Self,
+    expression: CheckedExprId
+  ) -> Option<CheckedBindingId> {
+    match self.kind(expression) {
+      CheckedOwnedValue -> None<CheckedBindingId>()
+      _ -> match self {
+        CheckedOwnershipFacts(storage) -> {
+          let bindings = storage.bindings
+          Some<CheckedBindingId>(
+            checked_binding_id_from_ordinal(
+              storage.segment,
+              bindings.at(dense_index(checked_expr_id_ordinal(expression)))
+            )
+          )
+        }
+      }
+    }
+  }
+
+  pub(package) fn borrows_from(
+    self: borrow Self,
+    expression: CheckedExprId,
+    binding: CheckedBindingId
+  ) -> bool {
+    match self.binding(expression) {
+      Some(found) -> checked_binding_id_eq(found, binding)
+      None -> false
+    }
+  }
+}
