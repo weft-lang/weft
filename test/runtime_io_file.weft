@@ -1,19 +1,97 @@
 use runtime/memory.{*}
 use runtime/alloc.{*}
 use runtime/string.{*}
+use runtime/descriptor_io.{descriptor_write_from}
+use stdlib/bytes.{Bytes, InvalidUtf8}
 use stdlib/io.{*}
+use stdlib/io/types.{
+  IoError,
+  IoInterrupted,
+  IoInvalidProgress,
+  IoNotFound,
+  IoPlatform,
+  IoTextError,
+  IoTextInvalidUtf8,
+  IoTextIo
+}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/state as state
+use stdlib/state.{State}
 use stdlib/string.{*}
 
 effect FileAbort {
   fn stop(value: i64) -> i64
 }
 
-fn io_mock_read_file_program() -[IO]> str {
+fn io_mock_read_file_program() -[IO]> Result<str, IoTextError> {
   io_read_file("mock-path")
 }
 
-fn io_mock_write_file_program() -[IO]> i64 {
+fn io_mock_write_file_program() -[IO]> Result<usize, IoError> {
   io_write_file("mock-path", "abc")
+}
+
+fn io_test_count(value: usize) -> i64 {
+  __u64_to_i64(__usize_to_u64(value))
+}
+
+fn io_test_error_code(error: IoError) -> i64 {
+  match error {
+    IoInterrupted -> 4
+    IoNotFound -> 2
+    IoInvalidProgress -> 1000
+    IoPlatform(code) -> 2000 + code
+    _ -> 0 - 1
+  }
+}
+
+-- Written counts stay nonnegative; failures become negative error codes.
+fn io_test_written(result: Result<usize, IoError>) -> i64 {
+  match result {
+    Ok(count) -> io_test_count(count)
+    Err(error) -> 0 - io_test_error_code(error)
+  }
+}
+
+-- Text reads render their exact outcome so assertions compare one string.
+fn io_test_text(result: Result<str, IoTextError>) -> str {
+  match result {
+    Ok(text) -> "ok:".concat(text)
+    Err(error) -> match error {
+      IoTextIo(io) -> "io:".concat(int_to_str(io_test_error_code(io)))
+      IoTextInvalidUtf8(invalid) -> match invalid {
+        InvalidUtf8(offset) -> "utf8:".concat(int_to_str(io_test_count(offset)))
+      }
+    }
+  }
+}
+
+-- Mock handlers number their calls through an enclosing State handler.
+fn io_test_next_call() -[State<i64>]> i64 {
+  let call = State<i64>.get()
+  State<i64>.put(call + 1)
+  call
+}
+
+fn io_test_byte(value: u8) -> i64 {
+  __u64_to_i64(__u8_to_u64(value))
+}
+
+fn io_test_second_byte(values: Bytes) -> i64 {
+  match values.get(__i64_to_usize(1)) {
+    Some(byte) -> io_test_byte(byte)
+    None -> 0 - 1
+  }
+}
+
+-- Byte reads render their length and second byte, or their exact failure.
+fn io_test_bytes(result: Result<Bytes, IoError>) -> str {
+  match result {
+    Ok(values) -> int_to_str(io_test_count(values.len())).concat(":").concat(
+      int_to_str(io_test_second_byte(values))
+    )
+    Err(error) -> "io:".concat(int_to_str(io_test_error_code(error)))
+  }
 }
 
 fn io_owned_file_abort(log: i64) -[IO, FileAbort]> i64 {
@@ -44,58 +122,150 @@ test "runtime_io_cstring_scope_preserves_boundary_bytes" {
 }
 
 test "runtime_io_write_file_mock_handler" {
-  let arena = arena_new(64)
-  let seen = arena_alloc(arena, 40, 8)
-  let got = handle io_mock_write_file_program() {
-    IO.open_write(path) -> {
-      mem_store64(seen, 1)
-      resume(7)
+  let (got, seen) = state.run(
+    0,
+    () => handle io_mock_write_file_program() {
+      IO.open_write(path) -> resume(7)
+      IO.write_from(fd, buffer) -> {
+        State<i64>.put(fd * 1000 + io_test_count(buffer.len) * 100 + io_test_byte(buffer[0]))
+        resume(io_test_count(buffer.len))
+      }
+      IO.close(fd) -> resume(0)
     }
-    IO.write(fd, buf, len) -> {
-      mem_store64(seen + 8, fd)
-      mem_store64(seen + 16, len)
-      mem_store64(seen + 24, mem_load8(buf))
-      resume(len)
+  )
+  Test.assert_eq(io_test_written(got), 3)
+  Test.assert_eq(seen, 7397)
+}
+
+test "runtime_io_write_file_retries_partial_and_interrupted_writes" {
+  let (got, calls) = state.run(
+    0,
+    () => handle io_mock_write_file_program() {
+      IO.open_write(path) -> resume(7)
+      IO.write_from(fd, buffer) -> {
+        let call = io_test_next_call()
+        let expected = if call == 0 { 97 } else { 96 + call }
+        if call == 1 { resume(0 - 4) } else {
+          if buffer[0] == __i64_to_u8(expected) { resume(1) } else { resume(0 - 8197) }
+        }
+      }
+      IO.close(fd) -> resume(0)
     }
+  )
+  Test.assert_eq(io_test_written(got), 3)
+  Test.assert_eq(calls, 4)
+}
+
+test "runtime_io_write_file_rejects_stalled_and_impossible_progress" {
+  let stalled = handle io_mock_write_file_program() {
+    IO.open_write(path) -> resume(7)
+    IO.write_from(fd, buffer) -> resume(0)
     IO.close(fd) -> resume(0)
   }
-  Test.assert_eq(got, 3)
-  Test.assert_eq(mem_load64(seen), 1)
-  Test.assert_eq(mem_load64(seen + 8), 7)
-  Test.assert_eq(mem_load64(seen + 16), 3)
-  Test.assert_eq(mem_load64(seen + 24), 97)
-  arena_free(arena)
+  Test.assert_eq(io_test_written(stalled), 0 - 1000)
+  let excessive = handle io_mock_write_file_program() {
+    IO.open_write(path) -> resume(7)
+    IO.write_from(fd, buffer) -> resume(io_test_count(buffer.len) + 1)
+    IO.close(fd) -> resume(0)
+  }
+  Test.assert_eq(io_test_written(excessive), 0 - 1000)
+}
+
+test "runtime_io_write_file_reports_platform_failures" {
+  let failed = handle io_mock_write_file_program() {
+    IO.open_write(path) -> resume(7)
+    IO.write_from(fd, buffer) -> resume(0 - 8197)
+    IO.close(fd) -> resume(0)
+  }
+  Test.assert_eq(io_test_written(failed), 0 - 2005)
+  let unopened = handle io_mock_write_file_program() {
+    IO.open_write(path) -> resume(0 - 2)
+  }
+  Test.assert_eq(io_test_written(unopened), 0 - 2)
 }
 
 test "runtime_io_read_file_mock_handler" {
-  let arena = arena_new(64)
-  let reads = arena_alloc(arena, 8, 8)
-  mem_store64(reads, 0)
-  let got = handle io_mock_read_file_program() {
-    IO.open_read(path) -> resume(9)
-    IO.read(fd, buf, len) -> {
-      let count = mem_load64(reads)
-      if count == 0 {
-        mem_store8(buf, 111)
-        mem_store8(buf + 1, 107)
-        mem_store64(reads, 1)
-        resume(2)
-      } else {
-        resume(0)
+  let (got, calls) = state.run(
+    0,
+    () => handle io_mock_read_file_program() {
+      IO.open_read(path) -> resume(9)
+      IO.read_into(fd, buffer) -> {
+        let call = io_test_next_call()
+        if call == 0 {
+          buffer[0] = __i64_to_u8(111)
+          buffer[1] = __i64_to_u8(107)
+          resume(2)
+        } else { resume(0) }
       }
+      IO.close(fd) -> resume(0)
     }
-    IO.close(fd) -> resume(0)
-  }
-  Test.assert_eq(str_eq(got, "ok"), 1)
-  Test.assert_eq(mem_load64(reads), 1)
-  arena_free(arena)
+  )
+  Test.assert_str_eq(io_test_text(got), "ok:ok")
+  Test.assert_eq(calls, 2)
 }
 
-test "runtime_io_read_file_open_failure_is_empty" {
+test "runtime_io_read_file_continues_after_short_and_interrupted_reads" {
+  let (got, calls) = state.run(
+    0,
+    () => handle io_mock_read_file_program() {
+      IO.open_read(path) -> resume(9)
+      IO.read_into(fd, buffer) -> {
+        let call = io_test_next_call()
+        if call == 0 {
+          buffer[0] = __i64_to_u8(206)
+          resume(1)
+        } else if call == 1 { resume(0 - 4) } else if call == 2 {
+          buffer[0] = __i64_to_u8(169)
+          buffer[1] = __i64_to_u8(33)
+          resume(2)
+        } else { resume(0) }
+      }
+      IO.close(fd) -> resume(0)
+    }
+  )
+  Test.assert_str_eq(io_test_text(got), "ok:Ω!")
+  Test.assert_eq(calls, 4)
+}
+
+test "runtime_io_read_file_open_failure_is_typed" {
   let got = handle io_read_file("missing") {
     IO.open_read(path) -> resume(0 - 2)
   }
-  Test.assert_eq(str_len(got), 0)
+  Test.assert_str_eq(io_test_text(got), "io:2")
+}
+
+test "runtime_io_read_file_reports_failed_and_impossible_reads" {
+  let failed = handle io_mock_read_file_program() {
+    IO.open_read(path) -> resume(9)
+    IO.read_into(fd, buffer) -> resume(0 - 8197)
+    IO.close(fd) -> resume(0)
+  }
+  Test.assert_str_eq(io_test_text(failed), "io:2005")
+  let excessive = handle io_mock_read_file_program() {
+    IO.open_read(path) -> resume(9)
+    IO.read_into(fd, buffer) -> resume(io_test_count(buffer.len) + 1)
+    IO.close(fd) -> resume(0)
+  }
+  Test.assert_str_eq(io_test_text(excessive), "io:1000")
+}
+
+test "runtime_io_read_file_rejects_malformed_text" {
+  let (got, calls) = state.run(
+    0,
+    () => handle io_mock_read_file_program() {
+      IO.open_read(path) -> resume(9)
+      IO.read_into(fd, buffer) -> {
+        if io_test_next_call() == 0 {
+          buffer[0] = __i64_to_u8(111)
+          buffer[1] = __i64_to_u8(255)
+          resume(2)
+        } else { resume(0) }
+      }
+      IO.close(fd) -> resume(0)
+    }
+  )
+  Test.assert_str_eq(io_test_text(got), "utf8:1")
+  Test.assert_eq(calls, 2)
 }
 
 test "runtime_io_owned_file_auto_drop_uses_local_handler" {
@@ -111,8 +281,8 @@ test "runtime_io_owned_file_auto_drop_uses_local_handler" {
       mem_store64(log, mem_load64(log) * 10 + 2)
       resume(7)
     }
-    IO.read(fd, buf, len) -> resume(0)
-    IO.write(fd, buf, len) -> resume(len)
+    IO.read_into(fd, buffer) -> resume(0)
+    IO.write_from(fd, buffer) -> resume(io_test_count(buffer.len))
     IO.close(fd) -> {
       mem_store64(log, mem_load64(log) * 10 + fd)
       resume(0)
@@ -133,8 +303,8 @@ test "runtime_io_owned_file_defer_runs_before_drop" {
     mem_store64(log, mem_load64(log) * 10 + 1)
     88
   } {
-    IO.read(fd, buf, len) -> resume(0)
-    IO.write(fd, buf, len) -> resume(len)
+    IO.read_into(fd, buffer) -> resume(0)
+    IO.write_from(fd, buffer) -> resume(io_test_count(buffer.len))
     IO.open_read(path) -> resume(7)
     IO.close(fd) -> {
       mem_store64(log, mem_load64(log) * 10 + fd)
@@ -156,8 +326,8 @@ test "runtime_io_opaque_owned_file_drops_on_abort" {
     }
   } {
     IO.open_read(path) -> resume(7)
-    IO.read(fd, buf, len) -> resume(0)
-    IO.write(fd, buf, len) -> resume(len)
+    IO.read_into(fd, buffer) -> resume(0)
+    IO.write_from(fd, buffer) -> resume(io_test_count(buffer.len))
     IO.close(fd) -> {
       mem_store64(log, mem_load64(log) * 10 + fd)
       resume(0)
@@ -180,8 +350,8 @@ test "runtime_io_opaque_owned_file_drops_each_loop_iteration" {
       mem_store64(opened, next)
       resume(next)
     }
-    IO.read(fd, buf, len) -> resume(0)
-    IO.write(fd, buf, len) -> resume(len)
+    IO.read_into(fd, buffer) -> resume(0)
+    IO.write_from(fd, buffer) -> resume(io_test_count(buffer.len))
     IO.close(fd) -> {
       mem_store64(log, mem_load64(log) * 10 + fd)
       resume(0)
@@ -200,9 +370,33 @@ test "runtime_io_raw_file_roundtrip_and_unlink" {
   let read_back = io_read_file_raw(path)
   let unlinked = raw_remove(path)
   let missing = io_read_file_raw(path)
-  Test.assert_eq(if missing_before < 0 { 1 } else { 0 }, 1)
-  Test.assert_eq(wrote, 9)
-  Test.assert_eq(str_eq(read_back, "roundtrip"), 1)
+  Test.assert_true(missing_before < 0)
+  Test.assert_eq(io_test_written(wrote), 9)
+  Test.assert_str_eq(io_test_text(read_back), "ok:roundtrip")
   Test.assert_eq(unlinked, 0)
-  Test.assert_eq(str_len(missing), 0)
+  Test.assert_str_eq(io_test_text(missing), "io:2")
+}
+
+test "runtime_io_raw_file_reads_span_many_chunks" {
+  let path = "/tmp/weft-runtime-io-file-chunks.txt"
+  raw_remove(path)
+  let text = "0123456789abcdef".repeat(__i64_to_usize(641))
+  Test.assert_eq(io_test_written(io_write_file_raw(path, text)), 10256)
+  let read_back = io_read_file_raw(path)
+  raw_remove(path)
+  Test.assert_str_eq(io_test_text(read_back), "ok:".concat(text))
+}
+
+test "runtime_io_raw_file_bytes_preserve_malformed_contents" {
+  let path = "/tmp/weft-runtime-io-file-bytes.bin"
+  raw_remove(path)
+  let fd = raw_open_write_create_truncate(path, io_mode_user_rw())
+  let mut payload: [u8; 3] = [65, 255, 66]
+  Test.assert_eq(descriptor_write_from(fd, payload[..]), 3)
+  raw_close(fd)
+  let values = io_read_file_bytes_raw(path)
+  let text = io_read_file_raw(path)
+  raw_remove(path)
+  Test.assert_str_eq(io_test_bytes(values), "3:255")
+  Test.assert_str_eq(io_test_text(text), "utf8:1")
 }

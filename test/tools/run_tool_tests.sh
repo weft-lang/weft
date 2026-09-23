@@ -839,7 +839,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_iter_pins_owned_iterator" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
     assert_contains "doc_stdlib_iter_pins_source_normalization" "$(<"$tmp_out")" "fn map<S: IntoIterator, U>(input: S, f: (S.Item) -> U)"
   elif [ "$stdlib_doc_name" = "test" ]; then
-    assert_contains "doc_stdlib_test_pins_public_surface" "$(<"$tmp_out")" "Public API items: 41. Documented: 41."
+    assert_contains "doc_stdlib_test_pins_public_surface" "$(<"$tmp_out")" "Public API items: 39. Documented: 39."
     assert_contains "doc_stdlib_test_pins_structured_report" "$(<"$tmp_out")" "fn report(diagnostic: Diagnostic) -> i64"
     assert_contains "doc_stdlib_test_pins_unsigned_equality" "$(<"$tmp_out")" "fn assert_eq_usize(got: usize, expected: usize) -> i64"
   elif [ "$stdlib_doc_name" = "string/builder" ]; then
@@ -1308,7 +1308,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "task/shutdown" ]; then
     assert_contains "doc_stdlib_task_shutdown_pins_public_surface" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
   elif [ "$stdlib_doc_name" = "io" ]; then
-    assert_contains "doc_stdlib_io_pins_public_surface" "$(<"$tmp_out")" "Public API items: 15. Documented: 15."
+    assert_contains "doc_stdlib_io_pins_public_surface" "$(<"$tmp_out")" "Public API items: 13. Documented: 13."
   elif [ "$stdlib_doc_name" = "par" ]; then
     assert_contains "doc_stdlib_par_pins_public_surface" "$(<"$tmp_out")" "Public API items: 14. Documented: 14."
     assert_contains "doc_stdlib_par_pins_validated_configuration" "$(<"$tmp_out")" "pub fn pool_config(workers: usize, task_capacity: usize) -> Result<PoolConfig, PoolConfigError>"
@@ -6813,7 +6813,7 @@ run_binary_guarded "$tmp_bin" 2>"$tmp_err"
 assert_contains "test_silent_block_emits_passing_result" "$(<"$tmp_err")" "WEFT_TEST_RESULT 1 1 0 1"
 echo "  ok test_harness_handles_assertion_free_block"
 
-printf 'use stdlib/diagnostic/schema.{Diagnose} use stdlib/vector as vector use stdlib/vector.{*} fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) let max_usize: usize = 18446744073709551615 Test.assert_eq_usize(0, 0) Test.assert_eq_usize(max_usize, max_usize) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) let mut va = vector.new<i64>() let mut vb = vector.new<i64>() va.push(7) vb.push(7) Test.assert_i64_vector_eq(va, vb) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.write(1, 0, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
+printf 'use stdlib/diagnostic/schema.{Diagnose} use stdlib/vector as vector use stdlib/vector.{*} fn tool_fail5() -[Fail<i64>]> i64 { Fail.fail(5) } test "helpers" { Test.assert_eq(1, 1) let max_usize: usize = 18446744073709551615 Test.assert_eq_usize(0, 0) Test.assert_eq_usize(max_usize, max_usize) Test.assert_ne(1, 2) Test.assert_true(1 == 1) Test.assert_false(1 == 2) Test.assert_lt(1, 2) Test.assert_le(2, 2) Test.assert_gt(3, 2) Test.assert_ge(3, 3) Test.assert_eq_f64(1.5, 1.5) Test.assert_near_f64(0.1 + 0.2, 0.3, 1e-12) Test.forall_i64_range(0, 3, x => x < 3) let mut va = vector.new<i64>() let mut vb = vector.new<i64>() va.push(7) vb.push(7) Test.assert_i64_vector_eq(va, vb) Test.assert_eq(Test.with_state_i64(4, () => TestState.get()), 4) Test.assert_eq(Test.expect_fail_i64(5, () => tool_fail5()), 5) Test.assert_eq(Test.with_io_i64(() => IO.seek_start(1, 2)), 2) Test.assert_eq(Test.with_diagnose_i64(() => Diagnose.error("x", 0 - 1)), 1) }\n' > "$tmp_src"
 run_weft_compile_guarded "$WEFT" test < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_not_contains_file "test_harness_supports_assertion_helpers" "$tmp_err" "unknown effect operation"
 chmod +x "$tmp_bin"
@@ -7365,7 +7365,7 @@ assert_test_compile_rejects "test_assert_i64_vector_rejects_wrong_element_type" 
 assert_test_compile_rejects "test_property_rejects_i64_predicate" 'test "bad_property" { Test.forall_i64_range(0, 1, x => x + 1) }' 'error[E1002]: lambda return value type mismatch: expected `bool`, found `i64`'
 assert_test_compile_rejects "test_property_rejects_effectful_predicate" $'effect Log { fn hit() -> i64 }\ntest "bad_property_effect" { Test.forall_i64_range(0, 1, x => Log.hit() == x) }' "error[E2001]:"
 assert_test_compile_rejects "test_fixture_rejects_unhandled_state" 'test "bad_state" { TestState.get() }' "error[E2001]:"
-assert_test_compile_rejects "test_fixture_rejects_wrong_effect_body" 'test "bad_fixture_effect" { Test.with_state_i64(0, () => IO.write(1, 0, 1)) }' "error[E2001]:"
+assert_test_compile_rejects "test_fixture_rejects_wrong_effect_body" 'test "bad_fixture_effect" { Test.with_state_i64(0, () => IO.flush(1)) }' "error[E2001]:"
 assert_test_compile_rejects "test_fixture_rejects_wrong_return_body" 'test "bad_fixture_return" { Test.with_io_i64(() => "nope") }' 'error[E1002]: lambda return value type mismatch: expected `i64`, found `str`'
 
 # The embedded SDK closes runtime calls even outside the checkout. This

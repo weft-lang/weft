@@ -7,23 +7,33 @@
 -- In tests, a mock handler can intercept IO operations for
 -- deterministic testing without actual file/console access.
 
-use runtime/buffer.{*}
 use runtime/descriptor_io.{descriptor_read_into, descriptor_write_from}
 use runtime/syscall.{*}
-use runtime/string.{*}
+use runtime/string.{runtime_str_with_cstring_i64}
+use stdlib/bytes as bytes
+use stdlib/bytes.{Bytes}
 use stdlib/drop.{*}
+use stdlib/io/types.{
+  IoError,
+  IoInterrupted,
+  IoInvalidProgress,
+  IoTextError,
+  IoTextInvalidUtf8,
+  IoTextIo,
+  io_error_from_errno
+}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/vector as vector
+use stdlib/vector.{vector_get_in_bounds, vector_len}
+use stdlib/vector/handles.{Vector}
 
 --- Legacy handler-facing I/O transport used by owned streaming files.
 ---
 --- Application code should prefer `ConsoleRead`/`ConsoleWrite`,
 --- `FileRead`/`FileWrite`, directory capabilities, and the typed streaming
---- functions in `stdlib/file`. These operations carry descriptor, pointer,
---- and platform-status conventions only between package/runtime adapters.
+--- functions in `stdlib/file`. These operations carry descriptor and
+--- platform-status conventions only between package/runtime adapters.
 pub effect IO {
-  --- Handler operation: read at most `len` bytes into package-managed storage.
-  fn read(fd: i64, buf: i64, len: i64) -> i64
-  --- Handler operation: write at most `len` bytes from package-managed storage.
-  fn write(fd: i64, buf: i64, len: i64) -> i64
   --- Handler operation: read at most `buffer.len` bytes into a non-escaping view.
   fn read_into(fd: i64, buffer: [mut u8]) -> i64
   --- Handler operation: write at most `buffer.len` bytes from a non-escaping view.
@@ -66,16 +76,14 @@ pub(package) fn io_mode_user_rw() -> i64 { 420 }
 
 pub(package) fn io_read_chunk_size() -> i64 { 4096 }
 
-pub(package) fn io_string_from_bytes(ptr: i64, len: i64) -> str {
-  runtime_str_from_bytes(ptr, len)
+-- Transfers reach the handler through parameters, so a caller's view is
+-- a borrowed actual rather than local storage entering handler state.
+fn io_read_into(fd: i64, buffer: [mut u8]) -[IO]> i64 {
+  IO.read_into(fd, buffer)
 }
 
-pub(package) fn io_read(fd: i64, buf: i64, len: i64) -[IO]> i64 {
-  IO.read(fd, buf, len)
-}
-
-pub(package) fn io_write(fd: i64, buf: i64, len: i64) -[IO]> i64 {
-  IO.write(fd, buf, len)
+fn io_write_from(fd: i64, buffer: [u8]) -[IO]> i64 {
+  IO.write_from(fd, buffer)
 }
 
 pub(package) fn io_open_read(path: str) -[IO]> i64 {
@@ -156,12 +164,12 @@ pub(package) fn io_file_open_append_checked_with<E>(
   io_file_open_checked_status<E>(IO.open_append(path), on_error)
 }
 
-pub(package) fn io_file_read_raw(file: borrow mut FileHandle, buf: i64, len: i64) -[IO]> i64 {
-  match file { FileHandle(fd) -> IO.read(fd, buf, len) }
+pub(package) fn io_file_read_into(file: borrow mut FileHandle, buffer: [mut u8]) -[IO]> i64 {
+  match file { FileHandle(fd) -> IO.read_into(fd, buffer) }
 }
 
-pub(package) fn io_file_write_raw(file: borrow mut FileHandle, buf: i64, len: i64) -[IO]> i64 {
-  match file { FileHandle(fd) -> IO.write(fd, buf, len) }
+pub(package) fn io_file_write_from(file: borrow mut FileHandle, buffer: [u8]) -[IO]> i64 {
+  match file { FileHandle(fd) -> IO.write_from(fd, buffer) }
 }
 
 pub(package) fn io_file_seek_start_raw(file: borrow mut FileHandle, offset: i64) -[IO]> i64 {
@@ -184,66 +192,105 @@ pub(package) fn io_file_close_raw(file: owned FileHandle) -[IO]> i64 {
   file.drop()
 }
 
--- Convenience: print a string to stderr
-pub(package) fn io_eprint(s: str) -[IO]> i64 {
-  IO.write(2, runtime_str_ptr(s), runtime_str_len(s))
-}
-
--- Convenience: print to stdout
-pub(package) fn io_print(s: str) -[IO]> i64 {
-  IO.write(1, runtime_str_ptr(s), runtime_str_len(s))
-}
-
-pub(package) fn io_read_fd_all(fd: i64) -[IO]> str {
+-- Read to end of file, retrying interrupted reads. Impossible progress is
+-- a failure, never a truncated success.
+fn io_read_fd_bytes(fd: i64) -[IO]> Result<Bytes, IoError> {
   let chunk = io_read_chunk_size()
-  let scratch_buf = buf_new(chunk)
-  let scratch = buf_ptr(scratch_buf)
-  let out = buf_new(chunk)
-  let mut done = 0
-  while done == 0 {
-    let n = IO.read(fd, scratch, chunk)
-    if n > 0 {
-      bscopy(out, scratch, n, 0)
-      if n < chunk { done = 1 } else { 0 }
+  let mut scratch = vector.with_capacity<u8>(__i64_to_usize(chunk))
+  for i in 0..chunk { scratch.push(__i64_to_u8(0)) }
+  let mut out = vector.new<u8>()
+  let mut reading = true
+  let mut failed = false
+  let mut failure = IoInvalidProgress
+  while reading {
+    let status = io_read_into(fd, scratch[..])
+    if status > chunk {
+      failed = true
+      reading = false
     } else {
-      done = 1
+      if status > 0 {
+        for i in 0..status { out.push(vector_get_in_bounds<u8>(scratch, i)) }
+      } else {
+        if status == 0 { reading = false }
+        else {
+          match io_error_from_errno(status) {
+            IoInterrupted -> nil
+            error -> {
+              failure = error
+              failed = true
+              reading = false
+            }
+          }
+        }
+      }
     }
   }
-  let len = buf_len(out)
-  io_string_from_bytes(buf_ptr(out), len)
+  if failed { Err<Bytes, IoError>(failure) }
+  else { Ok<Bytes, IoError>(bytes.from_vector(out)) }
 }
 
-pub(package) fn io_read_file(path: str) -[IO]> str {
+--- Read a whole file through the IO handler.
+pub(package) fn io_read_file_bytes(path: str) -[IO]> Result<Bytes, IoError> {
   let fd = io_open_read(path)
-  if fd < 0 {
-    ""
-  } else {
-    let data = io_read_fd_all(fd)
+  if fd < 0 { Err<Bytes, IoError>(io_error_from_errno(fd)) }
+  else {
+    let values = io_read_fd_bytes(fd)
     IO.close(fd)
-    data
+    values
   }
 }
 
-pub(package) fn io_write_file(path: str, data: str) -[IO]> i64 {
+--- Read a whole file through the IO handler and validate it as UTF-8 text.
+pub(package) fn io_read_file(path: str) -[IO]> Result<str, IoTextError> {
+  match io_read_file_bytes(path) {
+    Err(error) -> Err<str, IoTextError>(IoTextIo(error))
+    Ok(values) -> match values.to_utf8() {
+      Err(error) -> Err<str, IoTextError>(IoTextInvalidUtf8(error))
+      Ok(text) -> Ok<str, IoTextError>(text)
+    }
+  }
+}
+
+-- Write every byte, retrying interrupted writes. A write that makes no
+-- progress or reports more than it was offered fails instead of looping.
+fn io_write_all(fd: i64, values: borrow Vector<u8>) -[IO]> Result<usize, IoError> {
+  let total = vector_len<u8>(values)
+  let mut offset = 0
+  let mut failed = false
+  let mut failure = IoInvalidProgress
+  while offset < total and not failed {
+    let status = io_write_from(fd, values[__i64_to_usize(offset)..])
+    if status > 0 and status <= total - offset { offset = offset + status }
+    else {
+      if status >= 0 { failed = true }
+      else {
+        match io_error_from_errno(status) {
+          IoInterrupted -> nil
+          error -> {
+            failure = error
+            failed = true
+          }
+        }
+      }
+    }
+  }
+  if failed { Err<usize, IoError>(failure) }
+  else { Ok<usize, IoError>(__i64_to_usize(offset)) }
+}
+
+--- Create or truncate `path` and write all of `data` through the IO handler.
+pub(package) fn io_write_file(path: str, data: str) -[IO]> Result<usize, IoError> {
   let fd = io_open_write(path)
-  if fd < 0 {
-    fd
-  } else {
-    let written = IO.write(fd, runtime_str_ptr(data), runtime_str_len(data))
+  if fd < 0 { Err<usize, IoError>(io_error_from_errno(fd)) }
+  else {
+    let values = bytes.from_str(data).to_vector()
+    let written = io_write_all(fd, values)
     IO.close(fd)
     written
   }
 }
 
 -- Raw syscall wrappers (for the default IO handler)
-pub(package) fn raw_read(fd: i64, buf: i64, len: i64) -> i64 {
-  sys_read(fd, buf, len)
-}
-
-pub(package) fn raw_write(fd: i64, buf: i64, len: i64) -> i64 {
-  sys_write(fd, buf, len)
-}
-
 pub(package) fn raw_open_read(path: str) -> i64 {
   runtime_str_with_cstring_i64(path, (raw_path) => sys_open_read(raw_path))
 }
@@ -299,10 +346,8 @@ pub(package) fn raw_flush(fd: i64) -> i64 {
   sys_file_flush(fd)
 }
 
-pub(package) fn with_raw_io_i64(f: () -[IO]> i64) -> i64 {
+pub(package) fn with_raw_io<T>(f: () -[IO]> T) -> T {
   handle f() {
-    IO.read(fd, buf, len) -> resume(raw_read(fd, buf, len))
-    IO.write(fd, buf, len) -> resume(raw_write(fd, buf, len))
     IO.read_into(fd, buffer) -> resume(descriptor_read_into(fd, buffer))
     IO.write_from(fd, buffer) -> resume(descriptor_write_from(fd, buffer))
     IO.open_read(path) -> resume(raw_open_read(path))
@@ -319,30 +364,14 @@ pub(package) fn with_raw_io_i64(f: () -[IO]> i64) -> i64 {
   }
 }
 
-pub(package) fn with_raw_io_str(f: () -[IO]> str) -> str {
-  handle f() {
-    IO.read(fd, buf, len) -> resume(raw_read(fd, buf, len))
-    IO.write(fd, buf, len) -> resume(raw_write(fd, buf, len))
-    IO.read_into(fd, buffer) -> resume(descriptor_read_into(fd, buffer))
-    IO.write_from(fd, buffer) -> resume(descriptor_write_from(fd, buffer))
-    IO.open_read(path) -> resume(raw_open_read(path))
-    IO.open_write(path) -> resume(raw_open_write_create_truncate(path, io_mode_user_rw()))
-    IO.open_read_write(path) -> resume(
-      raw_open_read_write_create_truncate(path, io_mode_user_rw())
-    )
-    IO.open_append(path) -> resume(raw_open_write_append(path, io_mode_user_rw()))
-    IO.close(fd) -> resume(raw_close(fd))
-    IO.seek_start(fd, offset) -> resume(raw_seek_start(fd, offset))
-    IO.seek_current(fd, offset) -> resume(raw_seek_current(fd, offset))
-    IO.seek_end(fd, offset) -> resume(raw_seek_end(fd, offset))
-    IO.flush(fd) -> resume(raw_flush(fd))
-  }
+pub(package) fn io_write_file_raw(path: str, data: str) -> Result<usize, IoError> {
+  with_raw_io<Result<usize, IoError>>(() => io_write_file(path, data))
 }
 
-pub(package) fn io_write_file_raw(path: str, data: str) -> i64 {
-  with_raw_io_i64(() => io_write_file(path, data))
+pub(package) fn io_read_file_bytes_raw(path: str) -> Result<Bytes, IoError> {
+  with_raw_io<Result<Bytes, IoError>>(() => io_read_file_bytes(path))
 }
 
-pub(package) fn io_read_file_raw(path: str) -> str {
-  with_raw_io_str(() => io_read_file(path))
+pub(package) fn io_read_file_raw(path: str) -> Result<str, IoTextError> {
+  with_raw_io<Result<str, IoTextError>>(() => io_read_file(path))
 }
