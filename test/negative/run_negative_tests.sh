@@ -1330,6 +1330,9 @@ check_rejects "destructuring_for_refutable_constructor" "test/negative/destructu
 check_rejects "destructuring_let_mutable" "test/negative/destructuring_let_mutable.weft" "error[E0003]: mutable destructuring bindings are not supported"
 check_rejects "destructuring_let_annotation_mismatch" "test/negative/destructuring_let_annotation_mismatch.weft" 'error[E1002]: type annotation type mismatch: expected `(str, str)`, found `(i64, i64)`'
 check_rejects "destructuring_let_tuple_arity" "test/negative/destructuring_let_tuple_arity.weft" "type error: tuple pattern arity mismatch"
+check_rejects "multiline_tuple_pattern_missing_comma" "test/negative/multiline_tuple_pattern_missing_comma.weft" "line 4, col 5: error[E0002]: expected ')' after grouped pattern"
+check_rejects "multiline_constructor_pattern_missing_comma" "test/negative/multiline_constructor_pattern_missing_comma.weft" "line 9, col 7: error[E0002]: expected ',' or ')' after constructor pattern payload"
+check_rejects "multiline_record_pattern_missing_comma" "test/negative/multiline_record_pattern_missing_comma.weft" "line 4, col 5: error[E0002]: expected ',' or '}' after record pattern field"
 check_rejects "structural_shape_missing_field" "test/negative/structural_shape_missing_field.weft" 'error[E1002]: argument type mismatch: expected `{answer: i64, ..}`, found `StructuralShapeMissing`'
 check_rejects "structural_shape_wrong_field_type" "test/negative/structural_shape_wrong_field_type.weft" 'error[E1002]: argument type mismatch: expected `{answer: i64, ..}`, found `StructuralShapeWrong`'
 check_rejects "structural_shape_closed_extra_nominal" "test/negative/structural_shape_closed_extra_nominal.weft" 'error[E1002]: argument type mismatch: expected `{answer: i64}`, found `StructuralShapeExtra`'

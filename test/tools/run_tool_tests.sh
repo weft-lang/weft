@@ -2169,6 +2169,18 @@ fmt_formatted_status=$?
 set -e
 assert_equals "fmt_canonical_native_equivalent" "$fmt_original_status:$fmt_formatted_status" "42:42"
 
+# A newline before a pattern list's closing delimiter separates nothing, as
+# in an argument list: nested multi-line patterns bind without trailing commas.
+printf 'type Pair {\n  Pair(i64, i64)\n}\n\nfn split(value: ((i64, i64), { x: i64, y: i64 }), pair: Pair) -> i64 {\n  let (\n    (\n      left,\n      middle\n    ),\n    {\n      x,\n      y: right\n    }\n  ) = value\n  match pair {\n    Pair(\n      first,\n      second\n    ) -> left + middle + x + right + first - second\n  }\n}\n\nfn main() -> i64 { split(((10, 4), { x: 8, y: 6 }), Pair(20, 6)) }\n' > "$tmp_src"
+"$WEFT" compile < "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
+assert_equals "multiline_patterns_compile_stderr_empty" "$(<"$tmp_err")" ""
+chmod +x "$tmp_bin"
+set +e
+run_binary_guarded "$tmp_bin" >/dev/null 2>"$tmp_err"
+multiline_pattern_status=$?
+set -e
+assert_equals "multiline_patterns_bind_without_trailing_commas" "$multiline_pattern_status" "42"
+
 printf 'fn id < T > (x: T) -> T { x }\nfn main() -> i64 { if 1   <   2 { id < i64 > (42) } else { 0 } }\n' > "$tmp_src"
 "$WEFT" fmt < "$tmp_src" > "$tmp_out" 2>"$tmp_err"
 assert_equals "fmt_distinguishes_generic_angles_and_comparisons" "$(<"$tmp_out")" $'fn id<T>(x: T) -> T { x }\n\nfn main() -> i64 { if 1 < 2 { id<i64>(42) } else { 0 } }'
