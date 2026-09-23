@@ -10,6 +10,8 @@ import re
 import sys
 import urllib.request
 
+import weft_generated_source
+
 
 UNICODE_VERSION = "17.0.0"
 UTS46_REVISION = "35"
@@ -591,8 +593,12 @@ def main() -> int:
     bidi = parse_property(loaded["bidi"], BIDI_NAMES, BIDI_ALIASES)
     joining = parse_property(loaded["joining"], JOINING_NAMES, JOINING_ALIASES)
     tests, skipped_ill_formed = parse_tests(loaded["tests"])
-    generated = generate_data_source(mappings, max_mapping, bidi, joining).encode("utf-8")
-    generated_tests = generate_test_source(tests, skipped_ill_formed).encode("utf-8")
+    generated = weft_generated_source.canonical(
+        generate_data_source(mappings, max_mapping, bidi, joining).encode("utf-8")
+    )
+    generated_tests = weft_generated_source.canonical(
+        generate_test_source(tests, skipped_ill_formed).encode("utf-8")
+    )
 
     if args.check:
         stale = False

@@ -9,6 +9,8 @@ import pathlib
 import sys
 import urllib.request
 
+import weft_generated_source
+
 
 UNICODE_VERSION = "17.0.0"
 INPUTS = {
@@ -421,13 +423,15 @@ def main() -> int:
     script_ranges, all_mask, script_count = build_script_masks(scripts, extensions)
     mappings = parse_confusables(loaded["confusables"])
     canonical = parse_canonical_decompositions(loaded["unicode_data"])
-    generated = generate_source(
-        script_ranges,
-        all_mask,
-        script_count,
-        mappings,
-        maximum_skeleton_expansion(mappings, canonical),
-    ).encode("utf-8")
+    generated = weft_generated_source.canonical(
+        generate_source(
+            script_ranges,
+            all_mask,
+            script_count,
+            mappings,
+            maximum_skeleton_expansion(mappings, canonical),
+        ).encode("utf-8")
+    )
 
     if args.check:
         if not args.output.exists() or args.output.read_bytes() != generated:

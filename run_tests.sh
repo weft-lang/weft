@@ -244,6 +244,7 @@ run_markdown_phase() {
 run_bootstrap_phase() {
   python3 test/test_bench_compare.py || return 1
   python3 test/test_bootstrap_sdk.py || return 1
+  python3 test/test_weft_generated_source.py || return 1
   if [ -n "${WEFT_BOOTSTRAP_EVIDENCE_PREFIX:-}" ]; then
     local evidence1="${WEFT_BOOTSTRAP_EVIDENCE_PREFIX}1"
     local evidence2="${WEFT_BOOTSTRAP_EVIDENCE_PREFIX}2"

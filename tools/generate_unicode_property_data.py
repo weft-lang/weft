@@ -9,6 +9,8 @@ import pathlib
 import sys
 import urllib.request
 
+import weft_generated_source
+
 
 UNICODE_VERSION = "17.0.0"
 INPUTS = {
@@ -328,9 +330,11 @@ def main() -> int:
             (loaded["emoji_data"], EMOJI_PROPERTIES),
         )
     )
-    generated = generate_source(
-        categories, scripts, binary_mask_ranges(binary)
-    ).encode("utf-8")
+    generated = weft_generated_source.canonical(
+        generate_source(
+            categories, scripts, binary_mask_ranges(binary)
+        ).encode("utf-8")
+    )
 
     if args.check:
         if not args.output.exists() or args.output.read_bytes() != generated:

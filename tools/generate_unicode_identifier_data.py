@@ -14,6 +14,8 @@ import pathlib
 import sys
 import urllib.request
 
+import weft_generated_source
+
 
 UNICODE_VERSION = "17.0.0"
 DERIVED_CORE_PROPERTIES_URL = (
@@ -160,7 +162,9 @@ def main() -> int:
 
     data = args.input.read_bytes() if args.input else fetch_input()
     verify_input(data)
-    generated = generate_source(parse_properties(data)).encode("utf-8")
+    generated = weft_generated_source.canonical(
+        generate_source(parse_properties(data)).encode("utf-8")
+    )
 
     if args.check:
         if not args.output.exists() or args.output.read_bytes() != generated:

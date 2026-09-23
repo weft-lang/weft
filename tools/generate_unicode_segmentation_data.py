@@ -9,6 +9,8 @@ import pathlib
 import sys
 import urllib.request
 
+import weft_generated_source
+
 
 UNICODE_VERSION = "17.0.0"
 INPUTS = {
@@ -432,8 +434,12 @@ def main() -> int:
     counts = {kind: len(values) for kind, values in tests.items()}
     if counts != EXPECTED_CASE_COUNTS:
         raise SystemExit(f"Unicode 17 segmentation case counts changed: {counts}")
-    generated = generate_property_source(properties).encode("utf-8")
-    generated_tests = generate_test_source(tests).encode("utf-8")
+    generated = weft_generated_source.canonical(
+        generate_property_source(properties).encode("utf-8")
+    )
+    generated_tests = weft_generated_source.canonical(
+        generate_test_source(tests).encode("utf-8")
+    )
 
     if args.check:
         stale = False

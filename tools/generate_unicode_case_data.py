@@ -9,6 +9,8 @@ import pathlib
 import sys
 import urllib.request
 
+import weft_generated_source
+
 
 UNICODE_VERSION = "17.0.0"
 INPUTS = {
@@ -336,7 +338,9 @@ def main() -> int:
     folding = parse_full_case_folding(loaded["case_folding"])
     validate_tables(upper, lower, title, folding, special_count)
     tables = tuple(non_identity(table) for table in (upper, lower, title, folding))
-    generated = generate_source(*tables, special_count).encode("utf-8")
+    generated = weft_generated_source.canonical(
+        generate_source(*tables, special_count).encode("utf-8")
+    )
 
     summary = (
         f"Unicode {UNICODE_VERSION}; upper {len(tables[0])}; lower {len(tables[1])}; "

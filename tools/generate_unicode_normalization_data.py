@@ -9,6 +9,8 @@ import pathlib
 import sys
 import urllib.request
 
+import weft_generated_source
+
 
 UNICODE_VERSION = "17.0.0"
 INPUTS = {
@@ -823,19 +825,23 @@ def main() -> int:
         compositions,
     )
     no, maybe = quick_checks["NFC"]
-    generated = generate_source(
-        no,
-        maybe,
-        combining,
-        canonical_decompositions,
-        compositions,
-        conformance_cases // 4,
-    ).encode("utf-8")
-    compatibility_generated = generate_compatibility_source(
-        canonical_decompositions,
-        compatibility_decompositions,
-        conformance_cases,
-    ).encode("utf-8")
+    generated = weft_generated_source.canonical(
+        generate_source(
+            no,
+            maybe,
+            combining,
+            canonical_decompositions,
+            compositions,
+            conformance_cases // 4,
+        ).encode("utf-8")
+    )
+    compatibility_generated = weft_generated_source.canonical(
+        generate_compatibility_source(
+            canonical_decompositions,
+            compatibility_decompositions,
+            conformance_cases,
+        ).encode("utf-8")
+    )
 
     if args.check:
         stale = []
