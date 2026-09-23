@@ -208,7 +208,7 @@ def generate_property_lookup(name: str, values: list[tuple[int, int, int]]) -> s
         parts.append(f"{prefix} scalar <= {chunk[-1][1]} {{")
         parts.append(
             "    unicode_segmentation_range_value(scalar, "
-            f'__str_ptr("{encode_property_ranges(chunk)}"), {len(chunk)})'
+            f'"{encode_property_ranges(chunk)}", {len(chunk)})'
         )
         parts.append("  }" if index == 0 else "  }")
     parts.append("  else { 0 }" + " }" * (len(table_chunks) - 1))
@@ -239,7 +239,7 @@ def generate_property_source(
 -- emoji-data SHA-256: {INPUTS['emoji_data'][1]}
 -- Generator: tools/generate_unicode_segmentation_data.py
 
-use runtime/memory.{{mem_load8_at}}
+use runtime/string.{{runtime_str_byte_at}}
 
 pub(package) fn unicode_segmentation_data_version() -> str {{ "{UNICODE_VERSION}" }}
 
@@ -248,17 +248,17 @@ pub(package) fn unicode_segmentation_hex_value(ch: i64) -> i64 {{
   else {{ if ch >= 65 and ch <= 70 {{ ch - 55 }} else {{ 0 }} }}
 }}
 
-pub(package) fn unicode_segmentation_hex(src: i64, offset: i64, digits: i64) -> i64 {{
+pub(package) fn unicode_segmentation_hex(src: str, offset: i64, digits: i64) -> i64 {{
   let mut value = 0
   let mut i = 0
   while i < digits {{
-    value = value * 16 + unicode_segmentation_hex_value(mem_load8_at(src, offset + i))
+    value = value * 16 + unicode_segmentation_hex_value(runtime_str_byte_at(src, offset + i))
     i = i + 1
   }}
   value
 }}
 
-pub(package) fn unicode_segmentation_range_value(scalar: i64, ranges: i64, count: i64) -> i64 {{
+pub(package) fn unicode_segmentation_range_value(scalar: i64, ranges: str, count: i64) -> i64 {{
   if scalar < 0 or scalar > 1114111 {{ 0 }}
   else {{
     let mut lo = 0
@@ -333,12 +333,12 @@ def generate_case_lookup(
         parts.append(f"{prefix} index < {last_index} {{")
         parts.append(
             "    unicode_segmentation_test_case_from_tables(index - "
-            f'{first_index}, __str_ptr("{indexes}"), __str_ptr("{data}"))'
+            f'{first_index}, "{indexes}", "{data}")'
         )
         parts.append("  }" if chunk_index == 0 else "  }")
         first_index = last_index
     parts.append(
-        '  else { UnicodeSegmentationTestCase(__str_ptr(""), 0, 0) }'
+        '  else { UnicodeSegmentationTestCase("", 0, 0) }'
         + " }" * (len(table_chunks) - 1)
     )
     parts.append("}")
@@ -355,14 +355,14 @@ def generate_test_source(
 -- SentenceBreakTest SHA-256: {INPUTS['sentence_test'][1]}
 -- Generator: tools/generate_unicode_segmentation_data.py
 
-use runtime/memory.{{mem_load8_at}}
+use runtime/string.{{runtime_str_byte_at}}
 use stdlib/unicode/data/segmentation.{{unicode_segmentation_hex}}
 
 pub(package) type UnicodeSegmentationTestCase {{
-  UnicodeSegmentationTestCase(i64, i64, i64)
+  UnicodeSegmentationTestCase(str, i64, i64)
 }}
 
-pub(package) fn unicode_segmentation_test_case_from_tables(index: i64, indexes: i64, data: i64) -> UnicodeSegmentationTestCase {{
+pub(package) fn unicode_segmentation_test_case_from_tables(index: i64, indexes: str, data: str) -> UnicodeSegmentationTestCase {{
   let offset = unicode_segmentation_hex(indexes, index * 6, 6)
   let count = unicode_segmentation_hex(data, offset, 2)
   UnicodeSegmentationTestCase(data, offset + 2, count)
@@ -380,7 +380,7 @@ pub(package) fn unicode_segmentation_test_case_scalar(value: UnicodeSegmentation
 
 pub(package) fn unicode_segmentation_test_case_boundary(value: UnicodeSegmentationTestCase, index: i64) -> i64 {{
   match value {{
-    UnicodeSegmentationTestCase(data, offset, count) -> mem_load8_at(data, offset + index * 7) - 48
+    UnicodeSegmentationTestCase(data, offset, count) -> runtime_str_byte_at(data, offset + index * 7) - 48
   }}
 }}
 

@@ -89,7 +89,7 @@ def generate_source(properties: dict[str, list[tuple[int, int]]]) -> str:
 -- Generator: tools/generate_unicode_identifier_data.py
 -- Ranges are merged inclusive endpoints, each encoded as two six-digit hex words.
 
-use runtime/memory.{{mem_load8_at}}
+use runtime/string.{{runtime_str_byte_at}}
 
 pub(package) fn unicode_identifier_data_version() -> str {{ "{UNICODE_VERSION}" }}
 
@@ -98,16 +98,16 @@ pub(package) fn unicode_identifier_hex_value(ch: i64) -> i64 {{
   else {{ if ch >= 65 and ch <= 70 {{ ch - 55 }} else {{ 0 }} }}
 }}
 
-pub(package) fn unicode_identifier_hex24(src: i64, offset: i64) -> i64 {{
-  unicode_identifier_hex_value(mem_load8_at(src, offset)) * 1048576 +
-    unicode_identifier_hex_value(mem_load8_at(src, offset + 1)) * 65536 +
-    unicode_identifier_hex_value(mem_load8_at(src, offset + 2)) * 4096 +
-    unicode_identifier_hex_value(mem_load8_at(src, offset + 3)) * 256 +
-    unicode_identifier_hex_value(mem_load8_at(src, offset + 4)) * 16 +
-    unicode_identifier_hex_value(mem_load8_at(src, offset + 5))
+pub(package) fn unicode_identifier_hex24(src: str, offset: i64) -> i64 {{
+  unicode_identifier_hex_value(runtime_str_byte_at(src, offset)) * 1048576 +
+    unicode_identifier_hex_value(runtime_str_byte_at(src, offset + 1)) * 65536 +
+    unicode_identifier_hex_value(runtime_str_byte_at(src, offset + 2)) * 4096 +
+    unicode_identifier_hex_value(runtime_str_byte_at(src, offset + 3)) * 256 +
+    unicode_identifier_hex_value(runtime_str_byte_at(src, offset + 4)) * 16 +
+    unicode_identifier_hex_value(runtime_str_byte_at(src, offset + 5))
 }}
 
-pub(package) fn unicode_identifier_range_contains(scalar: i64, ranges: i64, count: i64) -> i64 {{
+pub(package) fn unicode_identifier_range_contains(scalar: i64, ranges: str, count: i64) -> i64 {{
   if scalar < 0 or scalar > 1114111 {{ 0 }}
   else {{
     let mut lo = 0
@@ -126,15 +126,15 @@ pub(package) fn unicode_identifier_range_contains(scalar: i64, ranges: i64, coun
 }}
 
 pub(package) fn unicode_xid_start(scalar: i64) -> i64 {{
-  unicode_identifier_range_contains(scalar, __str_ptr("{xid_start}"), {len(properties['XID_Start'])})
+  unicode_identifier_range_contains(scalar, "{xid_start}", {len(properties['XID_Start'])})
 }}
 
 pub(package) fn unicode_xid_continue(scalar: i64) -> i64 {{
-  unicode_identifier_range_contains(scalar, __str_ptr("{xid_continue}"), {len(properties['XID_Continue'])})
+  unicode_identifier_range_contains(scalar, "{xid_continue}", {len(properties['XID_Continue'])})
 }}
 
 pub(package) fn unicode_default_ignorable(scalar: i64) -> i64 {{
-  unicode_identifier_range_contains(scalar, __str_ptr("{default_ignorable}"), {len(properties['Default_Ignorable_Code_Point'])})
+  unicode_identifier_range_contains(scalar, "{default_ignorable}", {len(properties['Default_Ignorable_Code_Point'])})
 }}
 
 pub(package) fn unicode_identifier_profile_start(scalar: i64) -> i64 {{

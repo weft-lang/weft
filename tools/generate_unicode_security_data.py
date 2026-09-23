@@ -14,10 +14,6 @@ import weft_generated_source
 
 UNICODE_VERSION = "17.0.0"
 INPUTS = {
-    "unicode_data": (
-        "https://www.unicode.org/Public/17.0.0/ucd/UnicodeData.txt",
-        "2e1efc1dcb59c575eedf5ccae60f95229f706ee6d031835247d843c11d96470c",
-    ),
     "scripts": (
         "https://www.unicode.org/Public/17.0.0/ucd/Scripts.txt",
         "9f5e50d3abaee7d6ce09480f325c706f485ae3240912527e651954d2d6b035bf",
@@ -177,50 +173,6 @@ def parse_confusables(data: bytes) -> list[tuple[int, tuple[int, ...]]]:
     return sorted(mappings)
 
 
-def parse_canonical_decompositions(data: bytes) -> dict[int, tuple[int, ...]]:
-    mappings: dict[int, tuple[int, ...]] = {}
-    for raw_line in data.decode("utf-8").splitlines():
-        fields = raw_line.split(";")
-        decomposition = fields[5]
-        if decomposition and not decomposition.startswith("<"):
-            mappings[int(fields[0], 16)] = tuple(
-                int(value, 16) for value in decomposition.split()
-            )
-    return mappings
-
-
-def canonical_decompose(
-    scalar: int, mappings: dict[int, tuple[int, ...]]
-) -> tuple[int, ...]:
-    if 0xAC00 <= scalar < 0xAC00 + 11172:
-        s_index = scalar - 0xAC00
-        parts = [0x1100 + s_index // 588, 0x1161 + (s_index % 588) // 28]
-        if s_index % 28:
-            parts.append(0x11A7 + s_index % 28)
-        return tuple(parts)
-    direct = mappings.get(scalar)
-    if direct is None:
-        return (scalar,)
-    return tuple(
-        nested
-        for part in direct
-        for nested in canonical_decompose(part, mappings)
-    )
-
-
-def maximum_skeleton_expansion(
-    mappings: list[tuple[int, tuple[int, ...]]],
-    canonical: dict[int, tuple[int, ...]],
-) -> int:
-    maximum = 4
-    for _, target in mappings:
-        maximum = max(
-            maximum,
-            sum(len(canonical_decompose(part, canonical)) for part in target),
-        )
-    return maximum
-
-
 def chunks(values: list[tuple], size: int) -> list[list[tuple]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
 
@@ -273,7 +225,7 @@ def generate_script_lookup(
     ranges: list[tuple[int, int, tuple[int, int, int]]]
 ) -> str:
     parts = [
-        "pub(package) fn unicode_security_script_mask_lookup(scalar: i64, word: i64, ranges: i64, count: i64) -> i64 {",
+        "pub(package) fn unicode_security_script_mask_lookup(scalar: i64, word: i64, ranges: str, count: i64) -> i64 {",
         "  let mut lo = 0",
         "  let mut hi = count",
         "  let mut result = 0",
@@ -298,7 +250,7 @@ def generate_script_lookup(
         parts.append(f"{prefix} scalar <= {chunk[-1][1]} {{")
         parts.append(
             "    unicode_security_script_mask_lookup(scalar, word, "
-            f'__str_ptr("{encode_script_masks(chunk)}"), {len(chunk)})'
+            f'"{encode_script_masks(chunk)}", {len(chunk)})'
         )
         parts.append("  }" if index == 0 else "  }")
     parts.append("  else { 0 }" + " }" * (len(table_chunks) - 1))
@@ -310,7 +262,7 @@ def generate_confusable_lookup(
     mappings: list[tuple[int, tuple[int, ...]]]
 ) -> str:
     parts = [
-        "pub(package) fn unicode_confusable_lookup(scalar: i64, entries: i64, entry_count: i64, values: i64, out: i64, count: i64) -> i64 {",
+        "pub(package) fn unicode_confusable_lookup(scalar: i64, entries: str, entry_count: i64, values: str, out: borrow mut Vector<i64>) -> bool {",
         "  let mut lo = 0",
         "  let mut hi = entry_count",
         "  let mut found = 0 - 1",
@@ -320,23 +272,22 @@ def generate_confusable_lookup(
         "    if scalar < key { hi = mid }",
         "    else { if scalar > key { lo = mid + 1 } else { found = mid } }",
         "  }",
-        "  if found < 0 { 0 - 1 }",
+        "  if found < 0 { false }",
         "  else {",
         "    let entry_offset = found * 12",
         "    let value_offset = unicode_security_hex(entries, entry_offset + 6, 4)",
         "    let value_count = unicode_security_hex(entries, entry_offset + 10, 2)",
-        "    let mut next = count",
         "    let mut i = 0",
         "    while i < value_count {",
         "      let target = unicode_security_hex(values, (value_offset + i) * 6, 6)",
-        "      next = unicode_canonical_decompose_into(target, out, next)",
+        "      unicode_canonical_decompose_push(target, out)",
         "      i = i + 1",
         "    }",
-        "    next",
+        "    true",
         "  }",
         "}",
         "",
-        "pub(package) fn unicode_confusable_map_into(scalar: i64, out: i64, count: i64) -> i64 {",
+        "pub(package) fn unicode_confusable_push(scalar: i64, out: borrow mut Vector<i64>) -> bool {",
     ]
     table_chunks = decomposition_chunks(mappings)
     for index, chunk in enumerate(table_chunks):
@@ -344,11 +295,11 @@ def generate_confusable_lookup(
         parts.append(f"{prefix} scalar <= {chunk[-1][0]} {{")
         parts.append(
             "    unicode_confusable_lookup(scalar, "
-            f'__str_ptr("{encode_mapping_index(chunk)}"), {len(chunk)}, '
-            f'__str_ptr("{encode_mapping_values(chunk)}"), out, count)'
+            f'"{encode_mapping_index(chunk)}", {len(chunk)}, '
+            f'"{encode_mapping_values(chunk)}", out)'
         )
         parts.append("  }" if index == 0 else "  }")
-    parts.append("  else { 0 - 1 }" + " }" * (len(table_chunks) - 1))
+    parts.append("  else { false }" + " }" * (len(table_chunks) - 1))
     parts.append("}")
     return "\n".join(parts)
 
@@ -358,37 +309,36 @@ def generate_source(
     all_mask: tuple[int, int, int],
     script_count: int,
     mappings: list[tuple[int, tuple[int, ...]]],
-    maximum_expansion: int,
 ) -> str:
     return f'''-- compiler/weft/unicode/security_data.weft -- GENERATED; DO NOT EDIT
 -- Unicode {UNICODE_VERSION} UTS #39 mixed-script and confusable substrate.
--- UnicodeData SHA-256: {INPUTS['unicode_data'][1]}
 -- Scripts SHA-256: {INPUTS['scripts'][1]}
 -- ScriptExtensions SHA-256: {INPUTS['script_extensions'][1]}
 -- PropertyValueAliases SHA-256: {INPUTS['property_value_aliases'][1]}
 -- confusables SHA-256: {INPUTS['confusables'][1]}
 -- Generator: tools/generate_unicode_security_data.py
 
-use compiler/weft/unicode/normalization_data.{{unicode_canonical_decompose_into}}
-use runtime/memory.{{mem_load8_at}}
+use compiler/weft/unicode/normalization_data.{{unicode_canonical_decompose_push}}
+use runtime/string.{{runtime_str_byte_at}}
+use stdlib/vector as vector
+use stdlib/vector/handles.{{Vector}}
 
 pub(package) fn unicode_security_data_version() -> str {{ "{UNICODE_VERSION}" }}
 pub(package) fn unicode_security_script_count() -> i64 {{ {script_count} }}
 pub(package) fn unicode_security_script_all_0() -> i64 {{ {all_mask[0]} }}
 pub(package) fn unicode_security_script_all_1() -> i64 {{ {all_mask[1]} }}
 pub(package) fn unicode_security_script_all_2() -> i64 {{ {all_mask[2]} }}
-pub(package) fn unicode_confusable_max_expansion() -> i64 {{ {maximum_expansion} }}
 
 pub(package) fn unicode_security_hex_value(ch: i64) -> i64 {{
   if ch >= 48 and ch <= 57 {{ ch - 48 }}
   else {{ if ch >= 65 and ch <= 70 {{ ch - 55 }} else {{ 0 }} }}
 }}
 
-pub(package) fn unicode_security_hex(src: i64, offset: i64, digits: i64) -> i64 {{
+pub(package) fn unicode_security_hex(src: str, offset: i64, digits: i64) -> i64 {{
   let mut value = 0
   let mut i = 0
   while i < digits {{
-    value = value * 16 + unicode_security_hex_value(mem_load8_at(src, offset + i))
+    value = value * 16 + unicode_security_hex_value(runtime_str_byte_at(src, offset + i))
     i = i + 1
   }}
   value
@@ -422,14 +372,12 @@ def main() -> int:
     extensions = parse_script_extensions(loaded["script_extensions"])
     script_ranges, all_mask, script_count = build_script_masks(scripts, extensions)
     mappings = parse_confusables(loaded["confusables"])
-    canonical = parse_canonical_decompositions(loaded["unicode_data"])
     generated = weft_generated_source.canonical(
         generate_source(
             script_ranges,
             all_mask,
             script_count,
             mappings,
-            maximum_skeleton_expansion(mappings, canonical),
         ).encode("utf-8")
     )
 

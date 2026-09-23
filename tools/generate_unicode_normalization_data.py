@@ -399,28 +399,9 @@ def encode_variable_decomposition_values(
     return "".join(f"{part:06X}" for _, parts in values for part in parts)
 
 
-def maximum_decomposition_expansion(
-    canonical_decompositions: list[tuple[int, tuple[int, ...]]],
-    compatibility_decompositions: list[tuple[int, tuple[int, ...]]],
-    compatibility: bool,
-) -> int:
-    canonical_map = dict(canonical_decompositions)
-    compatibility_map = dict(compatibility_decompositions)
-    candidates = set(canonical_map)
-    if compatibility:
-        candidates.update(compatibility_map)
-    maximum = 3  # Algorithmic Hangul decomposition.
-    for scalar in candidates:
-        maximum = max(
-            maximum,
-            len(decompose(scalar, canonical_map, compatibility_map, compatibility)),
-        )
-    return maximum
-
-
 def generate_decomposition_lookup(values: list[tuple[int, tuple[int, ...]]]) -> str:
     parts = [
-        "pub(package) fn unicode_canonical_decomposition_lookup(scalar: i64, values: i64, count: i64) -> i64 {",
+        "pub(package) fn unicode_canonical_decomposition_lookup(scalar: i64, values: str, count: i64) -> i64 {",
         "  let mut lo = 0",
         "  let mut hi = count",
         "  let mut result = 0",
@@ -448,7 +429,7 @@ def generate_decomposition_lookup(values: list[tuple[int, tuple[int, ...]]]) -> 
         parts.append(f"{prefix} scalar <= {chunk[-1][0]} {{")
         parts.append(
             "    unicode_canonical_decomposition_lookup(scalar, "
-            f'__str_ptr("{encode_decompositions(chunk)}"), {len(chunk)})'
+            f'"{encode_decompositions(chunk)}", {len(chunk)})'
         )
         parts.append("  }" if index == 0 else "  }")
     parts.append("  else { 0 }" + " }" * (len(table_chunks) - 1))
@@ -458,7 +439,7 @@ def generate_decomposition_lookup(values: list[tuple[int, tuple[int, ...]]]) -> 
 
 def generate_composition_lookup(values: list[tuple[int, int, int]]) -> str:
     parts = [
-        "pub(package) fn unicode_canonical_composition_lookup(first: i64, second: i64, values: i64, count: i64) -> i64 {",
+        "pub(package) fn unicode_canonical_composition_lookup(first: i64, second: i64, values: str, count: i64) -> i64 {",
         "  let mut lo = 0",
         "  let mut hi = count",
         "  let mut result = 0 - 1",
@@ -484,7 +465,7 @@ def generate_composition_lookup(values: list[tuple[int, int, int]]) -> str:
         parts.append(f"{prefix} {condition} {{")
         parts.append(
             "    unicode_canonical_composition_lookup(first, second, "
-            f'__str_ptr("{encode_compositions(chunk)}"), {len(chunk)})'
+            f'"{encode_compositions(chunk)}", {len(chunk)})'
         )
         parts.append("  }" if index == 0 else "  }")
     parts.append("  else { 0 - 1 }" + " }" * (len(table_chunks) - 1))
@@ -496,7 +477,7 @@ def generate_compatibility_decomposition_lookup(
     values: list[tuple[int, tuple[int, ...]]],
 ) -> str:
     parts = [
-        "pub(package) fn unicode_compatibility_decomposition_lookup(scalar: i64, entries: i64, entry_count: i64, values: i64, out: i64, count: i64) -> i64 {",
+        "pub(package) fn unicode_compatibility_decomposition_lookup(scalar: i64, entries: str, entry_count: i64, values: str, out: borrow mut Vector<i64>) -> bool {",
         "  let mut lo = 0",
         "  let mut hi = entry_count",
         "  let mut found = 0 - 1",
@@ -506,23 +487,22 @@ def generate_compatibility_decomposition_lookup(
         "    if scalar < key { hi = mid }",
         "    else { if scalar > key { lo = mid + 1 } else { found = mid } }",
         "  }",
-        "  if found < 0 { 0 - 1 }",
+        "  if found < 0 { false }",
         "  else {",
         "    let entry_offset = found * 12",
         "    let value_offset = unicode_normalization_hex(entries, entry_offset + 6, 4)",
         "    let value_count = unicode_normalization_hex(entries, entry_offset + 10, 2)",
-        "    let mut next = count",
         "    let mut i = 0",
         "    while i < value_count {",
         "      let part = unicode_normalization_hex(values, (value_offset + i) * 6, 6)",
-        "      next = unicode_compatibility_decompose_into(part, out, next)",
+        "      unicode_compatibility_decompose_push(part, out)",
         "      i = i + 1",
         "    }",
-        "    next",
+        "    true",
         "  }",
         "}",
         "",
-        "pub(package) fn unicode_compatibility_decomposition(scalar: i64, out: i64, count: i64) -> i64 {",
+        "pub(package) fn unicode_compatibility_decomposition(scalar: i64, out: borrow mut Vector<i64>) -> bool {",
     ]
     table_chunks = decomposition_chunks(values)
     for index, chunk in enumerate(table_chunks):
@@ -530,11 +510,11 @@ def generate_compatibility_decomposition_lookup(
         parts.append(f"{prefix} scalar <= {chunk[-1][0]} {{")
         parts.append(
             "    unicode_compatibility_decomposition_lookup(scalar, "
-            f'__str_ptr("{encode_variable_decomposition_index(chunk)}"), {len(chunk)}, '
-            f'__str_ptr("{encode_variable_decomposition_values(chunk)}"), out, count)'
+            f'"{encode_variable_decomposition_index(chunk)}", {len(chunk)}, '
+            f'"{encode_variable_decomposition_values(chunk)}", out)'
         )
         parts.append("  }" if index == 0 else "  }")
-    parts.append("  else { 0 - 1 }" + " }" * (len(table_chunks) - 1))
+    parts.append("  else { false }" + " }" * (len(table_chunks) - 1))
     parts.append("}")
     return "\n".join(parts)
 
@@ -555,9 +535,11 @@ def generate_source(
 -- Generator: tools/generate_unicode_normalization_data.py
 -- Generator conformance: {conformance_cases} NormalizationTest sequence checks.
 
-use compiler/source/position.{{source_position_utf8_scalar, source_position_utf8_width}}
-use runtime/alloc.{{alloc_words}}
-use runtime/memory.{{mem_load8_at, mem_load64_at, mem_store64_at}}
+use runtime/string.{{runtime_str_byte_at, runtime_str_len, runtime_str_utf8_decode}}
+use runtime/utf8.{{Utf8StorageMalformed, Utf8StorageScalar}}
+use stdlib/vector as vector
+use stdlib/vector.{{vector_get_in_bounds, vector_len, vector_set}}
+use stdlib/vector/handles.{{Vector}}
 
 pub(package) fn unicode_normalization_data_version() -> str {{ "{UNICODE_VERSION}" }}
 
@@ -566,17 +548,17 @@ pub(package) fn unicode_normalization_hex_value(ch: i64) -> i64 {{
   else {{ if ch >= 65 and ch <= 70 {{ ch - 55 }} else {{ 0 }} }}
 }}
 
-pub(package) fn unicode_normalization_hex(src: i64, offset: i64, digits: i64) -> i64 {{
+pub(package) fn unicode_normalization_hex(src: str, offset: i64, digits: i64) -> i64 {{
   let mut i = 0
   let mut value = 0
   while i < digits {{
-    value = value * 16 + unicode_normalization_hex_value(mem_load8_at(src, offset + i))
+    value = value * 16 + unicode_normalization_hex_value(runtime_str_byte_at(src, offset + i))
     i = i + 1
   }}
   value
 }}
 
-pub(package) fn unicode_normalization_range_contains(scalar: i64, ranges: i64, count: i64) -> i64 {{
+pub(package) fn unicode_normalization_range_contains(scalar: i64, ranges: str, count: i64) -> i64 {{
   if scalar < 0 or scalar > 1114111 {{ 0 }}
   else {{
     let mut lo = 0
@@ -595,15 +577,15 @@ pub(package) fn unicode_normalization_range_contains(scalar: i64, ranges: i64, c
 }}
 
 pub(package) fn unicode_nfc_quick_check_no(scalar: i64) -> i64 {{
-  unicode_normalization_range_contains(scalar, __str_ptr("{encode_ranges(no)}"), {len(no)})
+  unicode_normalization_range_contains(scalar, "{encode_ranges(no)}", {len(no)})
 }}
 
 pub(package) fn unicode_nfc_quick_check_maybe(scalar: i64) -> i64 {{
-  unicode_normalization_range_contains(scalar, __str_ptr("{encode_ranges(maybe)}"), {len(maybe)})
+  unicode_normalization_range_contains(scalar, "{encode_ranges(maybe)}", {len(maybe)})
 }}
 
 pub(package) fn unicode_canonical_combining_class(scalar: i64) -> i64 {{
-  let ranges = __str_ptr("{encode_value_ranges(combining)}")
+  let ranges = "{encode_value_ranges(combining)}"
   let mut lo = 0
   let mut hi = {len(combining)}
   let mut result = 0
@@ -634,108 +616,121 @@ pub(package) fn unicode_hangul_composition(first: i64, second: i64) -> i64 {{
   }}
 }}
 
-pub(package) fn unicode_canonical_decompose_into(scalar: i64, out: i64, count: i64) -> i64 {{
+--- Push the full canonical decomposition of `scalar` onto `out`.
+pub(package) fn unicode_canonical_decompose_push(scalar: i64, out: borrow mut Vector<i64>) -> nil {{
   if scalar >= 44032 and scalar < 55204 {{
     let s_index = scalar - 44032
-    mem_store64_at(out, count * 8, 4352 + s_index / 588)
-    mem_store64_at(out, count * 8 + 8, 4449 + (s_index % 588) / 28)
+    out.push(4352 + s_index / 588)
+    out.push(4449 + (s_index % 588) / 28)
     let trailing = s_index % 28
-    if trailing == 0 {{ count + 2 }}
-    else {{ mem_store64_at(out, count * 8 + 16, 4519 + trailing) count + 3 }}
+    if trailing != 0 {{ out.push(4519 + trailing) }} else {{ nil }}
   }} else {{
     let packed = unicode_canonical_decomposition(scalar)
-    if packed == 0 {{ mem_store64_at(out, count * 8, scalar) count + 1 }}
+    if packed == 0 {{ out.push(scalar) }}
     else {{
       let parts = packed / 4398046511104
       let remainder = packed - parts * 4398046511104
       let first = remainder / 2097152
       let second = remainder - first * 2097152
-      let after_first = unicode_canonical_decompose_into(first, out, count)
-      if parts == 1 {{ after_first }} else {{ unicode_canonical_decompose_into(second, out, after_first) }}
+      unicode_canonical_decompose_push(first, out)
+      if parts == 1 {{ nil }} else {{ unicode_canonical_decompose_push(second, out) }}
     }}
   }}
 }}
 
-pub(package) fn unicode_canonical_order(values: i64, count: i64) -> i64 {{
+--- Stably reorder combining marks by canonical combining class in place.
+pub(package) fn unicode_canonical_order(values: borrow mut Vector<i64>) -> nil {{
+  let count = vector_len<i64>(values)
   let mut i = 1
   while i < count {{
-    let scalar = mem_load64_at(values, i * 8)
+    let scalar = vector_get_in_bounds<i64>(values, i)
     let ccc = unicode_canonical_combining_class(scalar)
     if ccc != 0 {{
       let mut j = i
-      let mut done = 0
-      while j > 0 and done == 0 {{
-        let previous = mem_load64_at(values, (j - 1) * 8)
+      let mut done = false
+      while j > 0 and not done {{
+        let previous = vector_get_in_bounds<i64>(values, j - 1)
         let previous_ccc = unicode_canonical_combining_class(previous)
-        if previous_ccc == 0 or previous_ccc <= ccc {{ done = 1 }}
-        else {{ mem_store64_at(values, j * 8, previous) j = j - 1 }}
+        if previous_ccc == 0 or previous_ccc <= ccc {{ done = true }}
+        else {{
+          vector_set<i64>(values, j, previous)
+          j = j - 1
+        }}
       }}
-      mem_store64_at(values, j * 8, scalar)
-    }} else {{ 0 }}
+      vector_set<i64>(values, j, scalar)
+    }} else {{ false }}
     i = i + 1
   }}
-  count
 }}
 
-pub(package) fn unicode_canonical_compose(values: i64, count: i64, out: i64) -> i64 {{
-  if count == 0 {{ 0 }}
-  else {{
-    let first = mem_load64_at(values, 0)
-    mem_store64_at(out, 0, first)
-    let mut out_count = 1
-    let mut starter_index = if unicode_canonical_combining_class(first) == 0 {{ 0 }} else {{ 0 - 1 }}
+--- Canonically compose ordered `values`, pushing the composed scalars onto `out`.
+pub(package) fn unicode_canonical_compose(values: borrow Vector<i64>, out: borrow mut Vector<i64>) -> nil {{
+  let count = vector_len<i64>(values)
+  if count > 0 {{
+    let first = vector_get_in_bounds<i64>(values, 0)
+    let base = vector_len<i64>(out)
+    out.push(first)
+    let mut starter_index = if unicode_canonical_combining_class(first) == 0 {{ base }} else {{ 0 - 1 }}
     let mut last_ccc = 0
     let mut i = 1
     while i < count {{
-      let scalar = mem_load64_at(values, i * 8)
+      let scalar = vector_get_in_bounds<i64>(values, i)
       let ccc = unicode_canonical_combining_class(scalar)
       let unblocked = last_ccc == 0 or last_ccc < ccc
       let mut replacement = 0 - 1
       if starter_index >= 0 and unblocked {{
-        let starter = mem_load64_at(out, starter_index * 8)
+        let starter = vector_get_in_bounds<i64>(out, starter_index)
         replacement = unicode_canonical_composition(starter, scalar)
         if replacement < 0 {{ replacement = unicode_hangul_composition(starter, scalar) }} else {{ 0 }}
       }} else {{ 0 }}
-      if replacement >= 0 {{ mem_store64_at(out, starter_index * 8, replacement) }}
+      if replacement >= 0 {{ vector_set<i64>(out, starter_index, replacement) }}
       else {{
-        if ccc == 0 {{ starter_index = out_count }} else {{ 0 }}
-        mem_store64_at(out, out_count * 8, scalar)
-        out_count = out_count + 1
+        if ccc == 0 {{ starter_index = vector_len<i64>(out) }} else {{ 0 }}
+        out.push(scalar)
         last_ccc = ccc
+        true
       }}
       i = i + 1
     }}
-    out_count
-  }}
+  }} else {{ nil }}
 }}
 
-pub(package) fn unicode_bytes_are_nfc(src: i64, start: i64, len: i64) -> i64 {{
-  let end = start + len
-  let mut pos = start
-  let decomposed = alloc_words(len * 4 + 4)
-  let mut decomposed_count = 0
-  let mut valid = 1
-  while pos < end and valid == 1 {{
-    let width = source_position_utf8_width(src, end, pos)
-    let scalar = source_position_utf8_scalar(src, end, pos)
-    if width < 0 or scalar < 0 {{ valid = 0 }}
-    else {{ decomposed_count = unicode_canonical_decompose_into(scalar, decomposed, decomposed_count) pos = pos + width }}
-  }}
-  if valid == 0 or pos != end {{ 0 }}
-  else {{
-    unicode_canonical_order(decomposed, decomposed_count)
-    let composed = alloc_words(decomposed_count + 1)
-    let composed_count = unicode_canonical_compose(decomposed, decomposed_count, composed)
-    let mut source_pos = start
-    let mut index = 0
-    let mut equal = 1
-    while source_pos < end and index < composed_count and equal == 1 {{
-      let width = source_position_utf8_width(src, end, source_pos)
-      let scalar = source_position_utf8_scalar(src, end, source_pos)
-      if width < 0 or scalar != mem_load64_at(composed, index * 8) {{ equal = 0 }}
-      else {{ source_pos = source_pos + width index = index + 1 }}
+--- Return whether `text` is well-formed UTF-8 already in NFC.
+pub(package) fn unicode_text_is_nfc(text: str) -> bool {{
+  let n = runtime_str_len(text)
+  let mut decomposed = vector.new<i64>()
+  let mut pos = 0
+  let mut valid = true
+  while pos < n and valid {{
+    match runtime_str_utf8_decode(text, pos) {{
+      Utf8StorageMalformed(offset) -> {{ valid = false }}
+      Utf8StorageScalar(next, scalar) -> {{
+        unicode_canonical_decompose_push(scalar, decomposed)
+        pos = next
+      }}
     }}
-    if equal == 1 and source_pos == end and index == composed_count {{ 1 }} else {{ 0 }}
+  }}
+  if not valid {{ false }}
+  else {{
+    unicode_canonical_order(decomposed)
+    let mut composed = vector.new<i64>()
+    unicode_canonical_compose(decomposed, composed)
+    let count = vector_len<i64>(composed)
+    let mut source_pos = 0
+    let mut index = 0
+    let mut equal = true
+    while source_pos < n and index < count and equal {{
+      match runtime_str_utf8_decode(text, source_pos) {{
+        Utf8StorageMalformed(offset) -> {{ equal = false }}
+        Utf8StorageScalar(next, scalar) -> if scalar != vector_get_in_bounds<i64>(composed, index) {{
+          equal = false
+        }} else {{
+          source_pos = next
+          index = index + 1
+        }}
+      }}
+    }}
+    equal and source_pos == n and index == count
   }}
 }}
 '''
@@ -746,9 +741,6 @@ def generate_compatibility_source(
     compatibility_decompositions: list[tuple[int, tuple[int, ...]]],
     conformance_cases: int,
 ) -> str:
-    maximum_expansion = maximum_decomposition_expansion(
-        canonical_decompositions, compatibility_decompositions, True
-    )
     return f'''-- stdlib/unicode/data/compatibility.weft -- GENERATED; DO NOT EDIT
 -- Unicode {UNICODE_VERSION} compatibility-decomposition substrate.
 -- UnicodeData SHA-256: {INPUTS['unicode_data'][1]}
@@ -758,33 +750,31 @@ def generate_compatibility_source(
 -- Generator conformance: {conformance_cases} NormalizationTest transformations.
 
 use compiler/weft/unicode/normalization_data.{{unicode_canonical_decomposition, unicode_normalization_hex}}
-use runtime/memory.{{mem_store64_at}}
-
-pub(package) fn unicode_compatibility_max_expansion() -> i64 {{ {maximum_expansion} }}
+use stdlib/vector as vector
+use stdlib/vector/handles.{{Vector}}
 
 {generate_compatibility_decomposition_lookup(compatibility_decompositions)}
 
-pub(package) fn unicode_compatibility_decompose_into(scalar: i64, out: i64, count: i64) -> i64 {{
+--- Push the full compatibility decomposition of `scalar` onto `out`.
+pub(package) fn unicode_compatibility_decompose_push(scalar: i64, out: borrow mut Vector<i64>) -> nil {{
   if scalar >= 44032 and scalar < 55204 {{
     let s_index = scalar - 44032
-    mem_store64_at(out, count * 8, 4352 + s_index / 588)
-    mem_store64_at(out, count * 8 + 8, 4449 + (s_index % 588) / 28)
+    out.push(4352 + s_index / 588)
+    out.push(4449 + (s_index % 588) / 28)
     let trailing = s_index % 28
-    if trailing == 0 {{ count + 2 }}
-    else {{ mem_store64_at(out, count * 8 + 16, 4519 + trailing) count + 3 }}
+    if trailing != 0 {{ out.push(4519 + trailing) }} else {{ nil }}
   }} else {{
-    let compatibility_count = unicode_compatibility_decomposition(scalar, out, count)
-    if compatibility_count >= 0 {{ compatibility_count }}
+    if unicode_compatibility_decomposition(scalar, out) {{ nil }}
     else {{
       let packed = unicode_canonical_decomposition(scalar)
-      if packed == 0 {{ mem_store64_at(out, count * 8, scalar) count + 1 }}
+      if packed == 0 {{ out.push(scalar) }}
       else {{
         let parts = packed / 4398046511104
         let remainder = packed - parts * 4398046511104
         let first = remainder / 2097152
         let second = remainder - first * 2097152
-        let after_first = unicode_compatibility_decompose_into(first, out, count)
-        if parts == 1 {{ after_first }} else {{ unicode_compatibility_decompose_into(second, out, after_first) }}
+        unicode_compatibility_decompose_push(first, out)
+        if parts == 1 {{ nil }} else {{ unicode_compatibility_decompose_push(second, out) }}
       }}
     }}
   }}

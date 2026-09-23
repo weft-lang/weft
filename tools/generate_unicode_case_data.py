@@ -221,18 +221,18 @@ def encode_mapping_values(values: list[tuple[int, tuple[int, ...]]]) -> str:
 def generate_mapping_function(
     function_name: str, values: list[tuple[int, tuple[int, ...]]]
 ) -> str:
-    parts = [f"pub(package) fn {function_name}(scalar: i64, out: i64, count: i64) -> i64 {{"]
+    parts = [f"pub(package) fn {function_name}(scalar: i64, out: borrow mut Vector<i64>) -> bool {{"]
     chunks = mapping_chunks(values)
     for index, chunk in enumerate(chunks):
         prefix = "  if" if index == 0 else "  else { if"
         parts.append(f"{prefix} scalar <= {chunk[-1][0]} {{")
         parts.append(
             "    unicode_case_mapping_lookup(scalar, "
-            f'__str_ptr("{encode_mapping_index(chunk)}"), {len(chunk)}, '
-            f'__str_ptr("{encode_mapping_values(chunk)}"), out, count)'
+            f'"{encode_mapping_index(chunk)}", {len(chunk)}, '
+            f'"{encode_mapping_values(chunk)}", out)'
         )
         parts.append("  }" if index == 0 else "  }")
-    parts.append("  else { 0 - 1 }" + " }" * (len(chunks) - 1))
+    parts.append("  else { false }" + " }" * (len(chunks) - 1))
     parts.append("}")
     return "\n".join(parts)
 
@@ -244,10 +244,6 @@ def generate_source(
     folding: list[tuple[int, tuple[int, ...]]],
     unconditional_special_count: int,
 ) -> str:
-    maximum_expansion = max(
-        [1]
-        + [len(target) for values in (upper, lower, title, folding) for _, target in values]
-    )
     return f'''-- stdlib/unicode/data/case.weft -- GENERATED; DO NOT EDIT
 -- Unicode {UNICODE_VERSION} default full case mappings and case folding.
 -- UnicodeData SHA-256: {INPUTS['unicode_data'][1]}
@@ -256,27 +252,29 @@ def generate_source(
 -- Unconditional SpecialCasing entries: {unconditional_special_count}
 -- Generator: tools/generate_unicode_case_data.py
 
-use runtime/memory.{{mem_load8_at, mem_store64_at}}
+use runtime/string.{{runtime_str_byte_at}}
+use stdlib/vector as vector
+use stdlib/vector/handles.{{Vector}}
 
 pub(package) fn unicode_case_data_version() -> str {{ "{UNICODE_VERSION}" }}
-pub(package) fn unicode_case_max_expansion() -> i64 {{ {maximum_expansion} }}
 
 pub(package) fn unicode_case_hex_value(ch: i64) -> i64 {{
   if ch >= 48 and ch <= 57 {{ ch - 48 }}
   else {{ if ch >= 65 and ch <= 70 {{ ch - 55 }} else {{ 0 }} }}
 }}
 
-pub(package) fn unicode_case_hex(src: i64, offset: i64, digits: i64) -> i64 {{
+pub(package) fn unicode_case_hex(src: str, offset: i64, digits: i64) -> i64 {{
   let mut value = 0
   let mut i = 0
   while i < digits {{
-    value = value * 16 + unicode_case_hex_value(mem_load8_at(src, offset + i))
+    value = value * 16 + unicode_case_hex_value(runtime_str_byte_at(src, offset + i))
     i = i + 1
   }}
   value
 }}
 
-pub(package) fn unicode_case_mapping_lookup(scalar: i64, entries: i64, entry_count: i64, values: i64, out: i64, count: i64) -> i64 {{
+-- Push the table mapping of `scalar` onto `out`, reporting whether one exists.
+pub(package) fn unicode_case_mapping_lookup(scalar: i64, entries: str, entry_count: i64, values: str, out: borrow mut Vector<i64>) -> bool {{
   let mut lo = 0
   let mut hi = entry_count
   let mut found = 0 - 1
@@ -286,29 +284,27 @@ pub(package) fn unicode_case_mapping_lookup(scalar: i64, entries: i64, entry_cou
     if scalar < key {{ hi = mid }}
     else {{ if scalar > key {{ lo = mid + 1 }} else {{ found = mid }} }}
   }}
-  if found < 0 {{ 0 - 1 }}
+  if found < 0 {{ false }}
   else {{
     let entry_offset = found * 12
     let value_offset = unicode_case_hex(entries, entry_offset + 6, 4)
     let value_count = unicode_case_hex(entries, entry_offset + 10, 2)
-    let mut next = count
     let mut i = 0
     while i < value_count {{
-      mem_store64_at(out, next * 8, unicode_case_hex(values, (value_offset + i) * 6, 6))
-      next = next + 1
+      out.push(unicode_case_hex(values, (value_offset + i) * 6, 6))
       i = i + 1
     }}
-    next
+    true
   }}
 }}
 
-{generate_mapping_function("unicode_full_uppercase_map_into", upper)}
+{generate_mapping_function("unicode_full_uppercase_push", upper)}
 
-{generate_mapping_function("unicode_full_lowercase_map_into", lower)}
+{generate_mapping_function("unicode_full_lowercase_push", lower)}
 
-{generate_mapping_function("unicode_full_titlecase_map_into", title)}
+{generate_mapping_function("unicode_full_titlecase_push", title)}
 
-{generate_mapping_function("unicode_full_casefold_map_into", folding)}
+{generate_mapping_function("unicode_full_casefold_push", folding)}
 '''
 
 

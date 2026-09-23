@@ -206,7 +206,7 @@ def generate_chunked_lookup(
         parts.append(f"{prefix} scalar <= {chunk[-1][1]} {{")
         parts.append(
             "    unicode_property_range_value(scalar, "
-            f'__str_ptr("{encode_value_ranges(chunk, value_digits)}"), '
+            f'"{encode_value_ranges(chunk, value_digits)}", '
             f"{len(chunk)}, {value_digits}, {default})"
         )
         parts.append("  }" if index == 0 else "  }")
@@ -251,7 +251,7 @@ def generate_source(
 -- emoji-data SHA-256: {INPUTS['emoji_data'][1]}
 -- Generator: tools/generate_unicode_property_data.py
 
-use runtime/memory.{{mem_load8_at}}
+use runtime/string.{{runtime_str_byte_at}}
 
 pub(package) fn unicode_property_data_version() -> str {{ "{UNICODE_VERSION}" }}
 
@@ -260,17 +260,17 @@ pub(package) fn unicode_property_hex_value(ch: i64) -> i64 {{
   else {{ if ch >= 65 and ch <= 70 {{ ch - 55 }} else {{ 0 }} }}
 }}
 
-pub(package) fn unicode_property_hex(src: i64, offset: i64, digits: i64) -> i64 {{
+pub(package) fn unicode_property_hex(src: str, offset: i64, digits: i64) -> i64 {{
   let mut value = 0
   let mut i = 0
   while i < digits {{
-    value = value * 16 + unicode_property_hex_value(mem_load8_at(src, offset + i))
+    value = value * 16 + unicode_property_hex_value(runtime_str_byte_at(src, offset + i))
     i = i + 1
   }}
   value
 }}
 
-pub(package) fn unicode_property_range_value(scalar: i64, ranges: i64, count: i64, value_digits: i64, default: i64) -> i64 {{
+pub(package) fn unicode_property_range_value(scalar: i64, ranges: str, count: i64, value_digits: i64, default: i64) -> i64 {{
   if scalar < 0 or scalar > 1114111 {{ default }}
   else {{
     let width = 12 + value_digits
