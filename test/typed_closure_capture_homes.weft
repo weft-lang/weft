@@ -1,0 +1,176 @@
+use compiler/backend/aarch64/codegen.{fmap_add, fmap_emit_error_count, fmap_new}
+use compiler/backend/aarch64/encode.{*}
+use compiler/ir/data.{
+  IrConcreteCaptureWord,
+  IrConcreteCaptureWordCons,
+  IrConcreteCaptureWordNil
+}
+use compiler/pipeline.{*}
+use compiler/types/graph/layout.{
+  SemanticF32Lane,
+  SemanticF64Lane,
+  SemanticGprLane,
+  SemanticLaneUnavailable
+}
+use runtime/buffer.{*}
+use runtime/effects.{
+  continuation_cleanup_kind_closure,
+  continuation_cleanup_kind_none,
+  continuation_cleanup_kind_rc,
+  continuation_cleanup_kind_weak
+}
+use stdlib/test.{Test}
+
+test "typed floating closure captures materialise exact bit homes" {
+  for fd in [8, 9, 14, 15] {
+    let f64_homes = pipeline_ir_native_value_home_facts(
+      24,
+      pipeline_ir_native_pinned_slot_new(
+        20,
+        1000 + fd,
+        pipeline_ir_native_pinned_slot_kind_resident(),
+        0
+      )
+    )
+    let f64_code = buf_new(32)
+    let fm = fmap_new()
+    pipeline_ir_native_spill_concrete_capture_word(
+      f64_code,
+      fm,
+      IrConcreteCaptureWord { value: 20, cleanup_kind: 0, lane_class: SemanticF64Lane },
+      f64_homes
+    )
+    Test.assert_eq(fmap_emit_error_count(fm), 0)
+    Test.assert_eq(buf_len(f64_code), 8)
+    Test.assert_eq(pipeline_native_code_word(f64_code, 0), encode_fmov_x_from_d(16, fd))
+    Test.assert_eq(pipeline_native_code_word(f64_code, 4), encode_str(16, 31, 96))
+
+    let f32_code = buf_new(32)
+    pipeline_ir_native_spill_concrete_capture_word(
+      f32_code,
+      fm,
+      IrConcreteCaptureWord { value: 20, cleanup_kind: 0, lane_class: SemanticF32Lane },
+      f64_homes
+    )
+    Test.assert_eq(fmap_emit_error_count(fm), 0)
+    Test.assert_eq(buf_len(f32_code), 8)
+    Test.assert_eq(pipeline_native_code_word(f32_code, 0), encode_fmov_w_from_s(16, fd))
+    Test.assert_eq(pipeline_native_code_word(f32_code, 4), encode_str(16, 31, 96))
+  }
+}
+
+test "typed integer closure captures keep relocated register homes" {
+  let homes = pipeline_ir_native_value_home_facts(
+    24,
+    pipeline_ir_native_pinned_slot_new(
+      20,
+      23,
+      pipeline_ir_native_pinned_slot_kind_resident(),
+      0
+    )
+  )
+  let code = buf_new(32)
+  let fm = fmap_new()
+  pipeline_ir_native_spill_concrete_capture_word(
+    code,
+    fm,
+    IrConcreteCaptureWord { value: 20, cleanup_kind: 0, lane_class: SemanticGprLane },
+    homes
+  )
+  Test.assert_eq(fmap_emit_error_count(fm), 0)
+  Test.assert_eq(buf_len(code), 4)
+  Test.assert_eq(pipeline_native_code_word(code, 0), encode_str(23, 31, 96))
+}
+
+test "typed closure capture rejects unavailable or contradictory register facts" {
+  let homes = pipeline_ir_native_value_home_facts(
+    24,
+    pipeline_ir_native_pinned_slot_new(
+      20,
+      1008,
+      pipeline_ir_native_pinned_slot_kind_resident(),
+      0
+    )
+  )
+  let fm = fmap_new()
+  let code = buf_new(32)
+  pipeline_ir_native_spill_concrete_capture_word(
+    code,
+    fm,
+    IrConcreteCaptureWord { value: 20, cleanup_kind: 0, lane_class: SemanticGprLane },
+    homes
+  )
+  Test.assert_eq(fmap_emit_error_count(fm), 1)
+  Test.assert_eq(pipeline_native_code_word(code, 0), encode_brk(20))
+  pipeline_ir_native_spill_concrete_capture_word(
+    code,
+    fm,
+    IrConcreteCaptureWord { value: 20, cleanup_kind: 0, lane_class: SemanticLaneUnavailable },
+    homes
+  )
+  Test.assert_eq(fmap_emit_error_count(fm), 2)
+  Test.assert_eq(pipeline_native_code_word(code, 4), encode_brk(20))
+}
+
+test "typed closure environment reads nonconsecutive capture words" {
+  let homes = pipeline_ir_native_value_home_facts(41, 0)
+  let captures = IrConcreteCaptureWordCons(
+    IrConcreteCaptureWord { value: 20, cleanup_kind: 0, lane_class: SemanticGprLane },
+    IrConcreteCaptureWordCons(
+      IrConcreteCaptureWord { value: 31, cleanup_kind: 0, lane_class: SemanticGprLane },
+      IrConcreteCaptureWordNil
+    )
+  )
+  let code = buf_new(64)
+  let written = pipeline_ir_native_lambda_store_concrete_capture_values_from(
+    code,
+    0,
+    40,
+    captures,
+    0,
+    homes,
+    homes
+  )
+  Test.assert_eq(written, 2)
+  Test.assert_eq(buf_len(code), 48)
+  Test.assert_eq(pipeline_native_code_word(code, 0), encode_ldr(9, 31, 96))
+  Test.assert_eq(pipeline_native_code_word(code, 8), encode_str(9, 16, 8))
+  Test.assert_eq(pipeline_native_code_word(code, 24), encode_ldr(9, 31, 184))
+  Test.assert_eq(pipeline_native_code_word(code, 32), encode_str(9, 16, 24))
+}
+
+test "typed closure environment records every capture cleanup kind" {
+  let homes = pipeline_ir_native_value_home_facts(41, 0)
+  let kinds = [
+    continuation_cleanup_kind_none(),
+    continuation_cleanup_kind_rc(),
+    continuation_cleanup_kind_closure(),
+    continuation_cleanup_kind_weak()
+  ]
+  let flags = [0, 1, 2, 4]
+  for index in 0..4 {
+    let slot = __i64_to_usize(index)
+    let code = buf_new(128)
+    let fm = fmap_new()
+    let rc = "rc_default_retain"
+    let closure = "closure_default_retain"
+    let weak = "rc_default_weak_retain"
+    fmap_add(fm, __str_ptr(rc), 0, __str_len(rc), 4096)
+    fmap_add(fm, __str_ptr(closure), 0, __str_len(closure), 8192)
+    fmap_add(fm, __str_ptr(weak), 0, __str_len(weak), 12288)
+    pipeline_ir_native_lambda_store_capture_word(
+      code,
+      fm,
+      40,
+      0,
+      20,
+      kinds[slot],
+      homes,
+      homes
+    )
+    Test.assert_eq(fmap_emit_error_count(fm), 0)
+    let end = buf_len(code)
+    Test.assert_eq(pipeline_native_code_word(code, end - 8), encode_movz(9, flags[slot], 0))
+    Test.assert_eq(pipeline_native_code_word(code, end - 4), encode_str(9, 16, 16))
+  }
+}

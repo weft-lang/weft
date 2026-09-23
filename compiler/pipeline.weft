@@ -27,6 +27,12 @@ use compiler/weft/facts/effect_ref.{*}
 use compiler/backend/aarch64/encode.{*}
 use compiler/backend/elf_link.{*}
 use compiler/ir/data.{*}
+use compiler/types/graph/layout.{
+  SemanticF32Lane,
+  SemanticF64Lane,
+  SemanticGprLane,
+  SemanticLaneUnavailable
+}
 use compiler/ir/cfg.{IrCfgCycles, ir_cfg_cycles, ir_cfg_compact_blocks}
 use compiler/weft/grammar.{WeftParser}
 use compiler/weft/check/declarations as declarations
@@ -73936,13 +73942,13 @@ pub(package) fn pipeline_ir_native_emit_indirect_call(
   pipeline_ir_native_store_reg_pinned(code, pinned, dst, 0)
 }
 
-pub(package) fn pipeline_ir_native_lambda_store_capture_value(
+pub(package) fn pipeline_ir_native_lambda_store_capture_word(
   code: i64,
   fm: i64,
   env_ctr: i64,
   index: i64,
-  capture: i64,
-  lane: i64,
+  cap_value: i64,
+  cap_kind: i64,
   pinned: PipelineIrNativeValueHomeFacts,
   real: PipelineIrNativeValueHomeFacts
 ) -> i64 {
@@ -73952,7 +73958,6 @@ pub(package) fn pipeline_ir_native_lambda_store_capture_value(
   -- identity view's ledger is never armed, so each canonical read is
   -- recorded against `real` explicitly; the emitted bytes are
   -- unchanged.
-  let cap_value = node_f3(capture) + lane
   pipeline_ir_native_ck_read(code, real, pipeline_ir_native_identity_home(cap_value), cap_value)
   let enc_phys = pipeline_ir_native_load_value_temp_pinned(code, pinned, cap_value, 9)
   let env_phys = pipeline_ir_native_load_reg_temp(code, real, env_ctr, 16)
@@ -73961,7 +73966,6 @@ pub(package) fn pipeline_ir_native_lambda_store_capture_value(
   bu32(code, cg_str(enc_phys, env_phys, val_off))
   -- Ownership is a lane fact: slices keep their non-owning length lane while
   -- closed structural aggregates can carry managed fields at any position.
-  let cap_kind = cg_managed_drop_kind_for_ty_lane(node_f4(capture), lane)
   if cap_kind == continuation_cleanup_kind_rc() {
     cg_emit_rc_retain_phys(code, fm, enc_phys)
     let env_phys2 = pipeline_ir_native_load_reg_raw(code, real, env_ctr)
@@ -73986,6 +73990,28 @@ pub(package) fn pipeline_ir_native_lambda_store_capture_value(
       }
     }
   }
+}
+
+pub(package) fn pipeline_ir_native_lambda_store_capture_value(
+  code: i64,
+  fm: i64,
+  env_ctr: i64,
+  index: i64,
+  capture: i64,
+  lane: i64,
+  pinned: PipelineIrNativeValueHomeFacts,
+  real: PipelineIrNativeValueHomeFacts
+) -> i64 {
+  pipeline_ir_native_lambda_store_capture_word(
+    code,
+    fm,
+    env_ctr,
+    index,
+    node_f3(capture) + lane,
+    cg_managed_drop_kind_for_ty_lane(node_f4(capture), lane),
+    pinned,
+    real
+  )
 }
 
 -- Load a value from its explicit home fact (swap-promoted bank register,
@@ -74090,6 +74116,83 @@ pub(package) fn pipeline_ir_native_spill_pinned_lambda_capture_values(
   0
 }
 
+-- A checked closure carries the exact SSA word and register class of each
+-- capture. Materialise its canonical integer-bit home before allocation and
+-- retain calls can clobber a floating resident. The environment stores bits,
+-- so an f32 lane uses the zero-extended W result of FMOV.
+pub(package) fn pipeline_ir_native_spill_concrete_capture_word(
+  code: i64,
+  fm: i64,
+  word: IrConcreteCaptureWord,
+  pinned: PipelineIrNativeValueHomeFacts
+) -> i64 {
+  let resident_fd = pipeline_ir_native_fp_resident_fd(pinned, word.value)
+  match word.lane_class {
+    SemanticGprLane -> if resident_fd != 0 {
+      fmap_inc_emit_error_count(fm)
+      bu32(code, encode_brk(20))
+    }
+    else { pipeline_ir_native_spill_pinned_value(code, word.value, pinned) }
+    SemanticF32Lane -> if resident_fd != 0 {
+      bu32(code, encode_fmov_w_from_s(16, resident_fd))
+      pipeline_ir_native_store_reg(code, pinned, word.value, 16)
+    } else { pipeline_ir_native_spill_pinned_value(code, word.value, pinned) }
+    SemanticF64Lane -> if resident_fd != 0 {
+      bu32(code, encode_fmov_x_from_d(16, resident_fd))
+      pipeline_ir_native_store_reg(code, pinned, word.value, 16)
+    } else { pipeline_ir_native_spill_pinned_value(code, word.value, pinned) }
+    SemanticLaneUnavailable -> {
+      fmap_inc_emit_error_count(fm)
+      bu32(code, encode_brk(20))
+    }
+  }
+}
+
+pub(package) fn pipeline_ir_native_spill_concrete_capture_words(
+  code: i64,
+  fm: i64,
+  captures: IrConcreteCaptureWordList,
+  pinned: PipelineIrNativeValueHomeFacts
+) -> i64 {
+  match captures {
+    IrConcreteCaptureWordNil -> 0
+    IrConcreteCaptureWordCons(word, remaining) -> {
+      pipeline_ir_native_spill_concrete_capture_word(code, fm, word, pinned)
+      pipeline_ir_native_spill_concrete_capture_words(code, fm, remaining, pinned)
+    }
+  }
+}
+
+type PipelineIrNativeCaptureSource {
+  PipelineIrNativeRawCaptures(i64),
+  PipelineIrNativeConcreteCaptures(IrConcreteCaptureWordList)
+}
+
+fn pipeline_ir_native_capture_source_words(captures: PipelineIrNativeCaptureSource) -> i64 {
+  match captures {
+    PipelineIrNativeRawCaptures(raw) -> pipeline_capture_value_lane_count(raw)
+    PipelineIrNativeConcreteCaptures(words) -> ir_concrete_capture_word_list_len(words)
+  }
+}
+
+fn pipeline_ir_native_spill_capture_source(
+  code: i64,
+  fm: i64,
+  captures: PipelineIrNativeCaptureSource,
+  pinned: PipelineIrNativeValueHomeFacts
+) -> i64 {
+  match captures {
+    PipelineIrNativeRawCaptures(raw) -> pipeline_ir_native_spill_pinned_lambda_capture_values(
+      code,
+      raw,
+      nlist_len(raw),
+      pinned
+    )
+    PipelineIrNativeConcreteCaptures(words) ->
+      pipeline_ir_native_spill_concrete_capture_words(code, fm, words, pinned)
+  }
+}
+
 pub(package) fn pipeline_ir_native_lambda_store_capture_values(
   code: i64,
   fm: i64,
@@ -74120,6 +74223,41 @@ pub(package) fn pipeline_ir_native_lambda_store_capture_values(
     i = i + 1
   }
   0
+}
+
+pub(package) fn pipeline_ir_native_lambda_store_concrete_capture_values_from(
+  code: i64,
+  fm: i64,
+  env_ctr: i64,
+  captures: IrConcreteCaptureWordList,
+  index: i64,
+  pinned: PipelineIrNativeValueHomeFacts,
+  real: PipelineIrNativeValueHomeFacts
+) -> i64 {
+  match captures {
+    IrConcreteCaptureWordNil -> index
+    IrConcreteCaptureWordCons(word, remaining) -> {
+      pipeline_ir_native_lambda_store_capture_word(
+        code,
+        fm,
+        env_ctr,
+        index,
+        word.value,
+        word.cleanup_kind,
+        pinned,
+        real
+      )
+      pipeline_ir_native_lambda_store_concrete_capture_values_from(
+        code,
+        fm,
+        env_ctr,
+        remaining,
+        index + 1,
+        pinned,
+        real
+      )
+    }
+  }
 }
 
 pub(package) fn pipeline_typed_expr_list_performs_key(
@@ -74488,11 +74626,11 @@ pub(package) fn pipeline_ir_native_emit_lambda_env_evidence_store(
   }
 }
 
-pub(package) fn pipeline_ir_native_emit_lambda_env_captures(
+fn pipeline_ir_native_emit_lambda_env_captures(
   code: i64,
   fm: i64,
   closure_ctr: i64,
-  captures: i64,
+  captures: PipelineIrNativeCaptureSource,
   nfree: i64,
   pinned: PipelineIrNativeValueHomeFacts,
   real: PipelineIrNativeValueHomeFacts,
@@ -74516,15 +74654,27 @@ pub(package) fn pipeline_ir_native_emit_lambda_env_captures(
     let encoded_count = if evidence_ops_ctr < 0 { nfree } else { 0 - nfree - 1 }
     emit_mov_imm_safe(code, 9, encoded_count)
     bu32(code, cg_str(9, env_phys, 0))
-    pipeline_ir_native_lambda_store_capture_values(
-      code,
-      fm,
-      env_ctr,
-      captures,
-      nlist_len(captures),
-      pinned,
-      real
-    )
+    match captures {
+      PipelineIrNativeRawCaptures(raw) -> pipeline_ir_native_lambda_store_capture_values(
+        code,
+        fm,
+        env_ctr,
+        raw,
+        nlist_len(raw),
+        pinned,
+        real
+      )
+      PipelineIrNativeConcreteCaptures(words) ->
+        pipeline_ir_native_lambda_store_concrete_capture_values_from(
+          code,
+          fm,
+          env_ctr,
+          words,
+          0,
+          pinned,
+          real
+        )
+    }
     pipeline_ir_native_emit_lambda_env_evidence_store(
       code,
       env_ctr,
@@ -74617,11 +74767,11 @@ pub(package) fn pipeline_ir_native_adr_offset_fits(offset: i64) -> i64 {
   if offset >= 0 - 1048576 and offset <= 1048575 { 1 } else { 0 }
 }
 
-pub(package) fn pipeline_ir_native_emit_closure(
+fn pipeline_ir_native_emit_closure_with_captures(
   code: i64,
   dst: i64,
   f: IrFunction,
-  captures: i64,
+  captures: PipelineIrNativeCaptureSource,
   evidence: IrLambdaEvidence,
   fm: i64,
   ctx: PipelineNativeEmitCtx
@@ -74629,14 +74779,13 @@ pub(package) fn pipeline_ir_native_emit_closure(
   let pinned = pipeline_ir_native_emit_ctx_pinned(ctx)
   let handlers = pipeline_ir_native_emit_ctx_handlers(ctx)
   let fns = pipeline_ir_native_emit_ctx_fns(ctx)
-  let nfree = nlist_len(captures)
-  let capture_lanes = pipeline_capture_value_lane_count(captures)
+  let capture_lanes = pipeline_ir_native_capture_source_words(captures)
   fmap_inc_hoisted_closure_emit_count(fm)
   match f {
     IrFunction(fn_hash, fparams, fblocks, fsrc) -> {
       pipeline_ir_lambda_evidence_registry_add(fm, fn_hash, evidence)
-      if nfree > 0 {
-        pipeline_ir_native_spill_pinned_lambda_capture_values(code, captures, nfree, pinned)
+      if capture_lanes > 0 {
+        pipeline_ir_native_spill_capture_source(code, fm, captures, pinned)
       } else { 0 }
       cg_emit_rc_default_alloc_nozero_lit(code, fm, continuation_cleanup_kind_closure(), 16, 8)
       pipeline_ir_native_store_reg_pinned(code, pinned, dst, 0)
@@ -74697,6 +74846,46 @@ pub(package) fn pipeline_ir_native_emit_closure(
       )
     }
   }
+}
+
+pub(package) fn pipeline_ir_native_emit_closure(
+  code: i64,
+  dst: i64,
+  f: IrFunction,
+  captures: i64,
+  evidence: IrLambdaEvidence,
+  fm: i64,
+  ctx: PipelineNativeEmitCtx
+) -> i64 {
+  pipeline_ir_native_emit_closure_with_captures(
+    code,
+    dst,
+    f,
+    PipelineIrNativeRawCaptures(captures),
+    evidence,
+    fm,
+    ctx
+  )
+}
+
+pub(package) fn pipeline_ir_native_emit_concrete_closure(
+  code: i64,
+  dst: i64,
+  f: IrFunction,
+  captures: IrConcreteCaptureWordList,
+  evidence: IrLambdaEvidence,
+  fm: i64,
+  ctx: PipelineNativeEmitCtx
+) -> i64 {
+  pipeline_ir_native_emit_closure_with_captures(
+    code,
+    dst,
+    f,
+    PipelineIrNativeConcreteCaptures(captures),
+    evidence,
+    fm,
+    ctx
+  )
 }
 
 pub(package) fn pipeline_ir_native_vector_push_hash() -> i64 {
