@@ -99,7 +99,7 @@ def chunks(values: list, size: int) -> list[list]:
 
 def parse_mapping(
     data: bytes,
-) -> tuple[list[tuple[int, int, int, tuple[int, ...]]], int]:
+) -> list[tuple[int, int, int, tuple[int, ...]]]:
     rows: list[tuple[int, int, int, tuple[int, ...]]] = []
     input_rows = 0
     previous_hi = -1
@@ -144,7 +144,7 @@ def parse_mapping(
         raise SystemExit("IDNA mapping table does not cover the Unicode range")
     if input_rows != EXPECTED_MAPPING_ROWS:
         raise SystemExit(f"Unicode 17 IDNA mapping row count changed: {input_rows}")
-    return rows, max((len(mapping) for _, _, _, mapping in rows), default=1)
+    return rows
 
 
 def parse_property(
@@ -305,7 +305,7 @@ def encode_mapping_chunk(
 def generate_mapping_lookup(
     values: list[tuple[int, int, int, tuple[int, ...]]]
 ) -> str:
-    parts = ["pub(package) fn unicode_idna_map_into(scalar: i64, out: i64) -> i64 {"]
+    parts = ["pub(package) fn unicode_idna_map_push(scalar: i64, out: borrow mut Vector<i64>) -> bool {"]
     table_chunks = chunks(values, 450)
     for index, chunk in enumerate(table_chunks):
         ranges, mappings = encode_mapping_chunk(chunk)
@@ -313,10 +313,10 @@ def generate_mapping_lookup(
         parts.append(f"{prefix} scalar <= {chunk[-1][1]} {{")
         parts.append(
             "    unicode_idna_map_from_tables(scalar, "
-            f'__str_ptr("{ranges}"), {len(chunk)}, __str_ptr("{mappings}"), out)'
+            f'"{ranges}", {len(chunk)}, "{mappings}", out)'
         )
         parts.append("  }" if index == 0 else "  }")
-    parts.append("  else { mem_store64_at(out, 0, scalar) 1 }" + " }" * (len(table_chunks) - 1))
+    parts.append("  else {\n    out.push(scalar)\n    true\n  }" + " }" * (len(table_chunks) - 1))
     parts.append("}")
     return "\n".join(parts)
 
@@ -333,7 +333,7 @@ def generate_property_lookup(name: str, values: list[tuple[int, int, int]]) -> s
         parts.append(f"{prefix} scalar <= {chunk[-1][1]} {{")
         parts.append(
             "    unicode_idna_range_value(scalar, "
-            f'__str_ptr("{encode_property_ranges(chunk)}"), {len(chunk)})'
+            f'"{encode_property_ranges(chunk)}", {len(chunk)})'
         )
         parts.append("  }" if index == 0 else "  }")
     parts.append("  else { 0 }" + " }" * (len(table_chunks) - 1))
@@ -343,7 +343,6 @@ def generate_property_lookup(name: str, values: list[tuple[int, int, int]]) -> s
 
 def generate_data_source(
     mappings: list[tuple[int, int, int, tuple[int, ...]]],
-    max_mapping: int,
     bidi: list[tuple[int, int, int]],
     joining: list[tuple[int, int, int]],
 ) -> str:
@@ -362,31 +361,35 @@ def generate_data_source(
 -- DerivedJoiningType SHA-256: {INPUTS["joining"][1]}
 -- Generator: tools/generate_unicode_idna_data.py
 
-use runtime/memory.{{mem_load8_at, mem_store64_at}}
+use runtime/string.{{runtime_str_byte_at}}
+use stdlib/vector as vector
+use stdlib/vector/handles.{{Vector}}
 
 pub(package) fn unicode_idna_data_version() -> str {{ "{UNICODE_VERSION}" }}
-pub(package) fn unicode_idna_max_mapping_expansion() -> i64 {{ {max_mapping} }}
 
 pub(package) fn unicode_idna_hex_value(ch: i64) -> i64 {{
   if ch >= 48 and ch <= 57 {{ ch - 48 }}
   else {{ if ch >= 65 and ch <= 70 {{ ch - 55 }} else {{ 0 }} }}
 }}
 
-pub(package) fn unicode_idna_hex(src: i64, offset: i64, digits: i64) -> i64 {{
+pub(package) fn unicode_idna_hex(src: str, offset: i64, digits: i64) -> i64 {{
   let mut value = 0
   let mut i = 0
   while i < digits {{
-    value = value * 16 + unicode_idna_hex_value(mem_load8_at(src, offset + i))
+    value = value * 16 + unicode_idna_hex_value(runtime_str_byte_at(src, offset + i))
     i = i + 1
   }}
   value
 }}
 
-pub(package) fn unicode_idna_map_from_tables(scalar: i64, ranges: i64, count: i64, mappings: i64, out: i64) -> i64 {{
+-- Push the UTS #46 mapping of `scalar` onto `out`: nothing when ignored, the
+-- mapped scalars, or the scalar itself when valid. Disallowed pushes nothing
+-- and reports false.
+pub(package) fn unicode_idna_map_from_tables(scalar: i64, ranges: str, count: i64, mappings: str, out: borrow mut Vector<i64>) -> bool {{
   let mut lo = 0
   let mut hi = count
   let mut found = 0
-  let mut result = 1
+  let mut result = true
   while lo < hi and found == 0 {{
     let mid = lo + (hi - lo) / 2
     let offset = mid * 21
@@ -398,23 +401,22 @@ pub(package) fn unicode_idna_map_from_tables(scalar: i64, ranges: i64, count: i6
       let kind = unicode_idna_hex(ranges, offset + 12, 1)
       let mapping_offset = unicode_idna_hex(ranges, offset + 13, 6)
       let mapping_count = unicode_idna_hex(ranges, offset + 19, 2)
-      if kind == 0 {{ result = 0 }}
-      else {{ if kind == 2 {{ result = 0 - 1 }}
-      else {{
+      if kind == 2 {{ result = false }}
+      else {{ if kind == 1 {{
         let mut i = 0
         while i < mapping_count {{
-          mem_store64_at(out, i * 8, unicode_idna_hex(mappings, mapping_offset + i * 6, 6))
+          out.push(unicode_idna_hex(mappings, mapping_offset + i * 6, 6))
           i = i + 1
         }}
-        result = mapping_count
-      }} }}
+      }} else {{ nil }} }}
       found = 1
     }} }}
   }}
-  if found == 0 {{ mem_store64_at(out, 0, scalar) 1 }} else {{ result }}
+  if found == 0 {{ out.push(scalar) }} else {{ nil }}
+  result
 }}
 
-pub(package) fn unicode_idna_range_value(scalar: i64, ranges: i64, count: i64) -> i64 {{
+pub(package) fn unicode_idna_range_value(scalar: i64, ranges: str, count: i64) -> i64 {{
   let mut lo = 0
   let mut hi = count
   let mut result = 0
@@ -473,16 +475,16 @@ def generate_test_lookup(values: list[tuple[bytes, bytes, int, int]]) -> str:
         prefix = "  if" if chunk_index == 0 else "  else { if"
         parts.append(f"{prefix} index < {last_index} {{")
         parts.append(
-            "    UnicodeIdnaTestCase(__str_ptr(\""
+            "    UnicodeIdnaTestCase(\""
             + indexes
-            + "\"), __str_ptr(\""
+            + "\", \""
             + data
-            + f'\"), index - {first_index})'
+            + f'\", index - {first_index})'
         )
         parts.append("  }" if chunk_index == 0 else "  }")
         first_index = last_index
     parts.append(
-        '  else { UnicodeIdnaTestCase(__str_ptr(""), __str_ptr(""), 0) }'
+        '  else { UnicodeIdnaTestCase("", "", 0) }'
         + " }" * (len(table_chunks) - 1)
     )
     parts.append("}")
@@ -498,12 +500,13 @@ def generate_test_source(
 -- {skipped_ill_formed} ill-formed UTF-16/source rows are excluded because Weft str is valid UTF-8.
 -- Generator: tools/generate_unicode_idna_data.py
 
-use runtime/memory.{{mem_load8_at, mem_store8_at}}
-use runtime/string.{{runtime_str_alloc_uninit, runtime_str_ptr}}
+use runtime/string.{{runtime_str_byte_at, runtime_str_from_utf8_vector}}
+use stdlib/panic.{{panic}}
 use stdlib/unicode/data/idna.{{unicode_idna_hex}}
+use stdlib/vector as vector
 
 pub(package) type UnicodeIdnaTestCase {{
-  UnicodeIdnaTestCase(i64, i64, i64)
+  UnicodeIdnaTestCase(str, str, i64)
 }}
 
 pub(package) fn unicode_idna_test_case_offset(value: UnicodeIdnaTestCase) -> i64 {{
@@ -526,13 +529,13 @@ pub(package) fn unicode_idna_test_case_expected_len(value: UnicodeIdnaTestCase) 
 
 pub(package) fn unicode_idna_test_case_success(value: UnicodeIdnaTestCase) -> i64 {{
   match value {{
-    UnicodeIdnaTestCase(indexes, data, index) -> mem_load8_at(data, unicode_idna_test_case_offset(value) + 8) - 48
+    UnicodeIdnaTestCase(indexes, data, index) -> runtime_str_byte_at(data, unicode_idna_test_case_offset(value) + 8) - 48
   }}
 }}
 
 pub(package) fn unicode_idna_test_case_absolute(value: UnicodeIdnaTestCase) -> i64 {{
   match value {{
-    UnicodeIdnaTestCase(indexes, data, index) -> mem_load8_at(data, unicode_idna_test_case_offset(value) + 9) - 48
+    UnicodeIdnaTestCase(indexes, data, index) -> runtime_str_byte_at(data, unicode_idna_test_case_offset(value) + 9) - 48
   }}
 }}
 
@@ -544,14 +547,17 @@ pub(package) fn unicode_idna_test_case_text(value: UnicodeIdnaTestCase, expected
       let expected_len = unicode_idna_hex(data, offset + 4, 4)
       let len = if expected == 1 {{ expected_len }} else {{ source_len }}
       let encoded_offset = if expected == 1 {{ offset + 10 + source_len * 2 }} else {{ offset + 10 }}
-      let text = runtime_str_alloc_uninit(len)
-      let out = runtime_str_ptr(text)
+      let mut bytes = vector.with_capacity<u8>(__i64_to_usize(len))
       let mut i = 0
       while i < len {{
-        mem_store8_at(out, i, unicode_idna_hex(data, encoded_offset + i * 2, 2))
+        bytes.push(__i64_to_u8(unicode_idna_hex(data, encoded_offset + i * 2, 2)))
         i = i + 1
       }}
-      text
+      -- Only well-formed rows are generated, so every case decodes as text.
+      match runtime_str_from_utf8_vector(bytes) {{
+        nil -> panic("IDNA conformance row is not UTF-8")
+        text: str -> text
+      }}
     }}
   }}
 }}
@@ -589,12 +595,12 @@ def main() -> int:
     args = parser.parse_args()
 
     loaded = {name: load(getattr(args, name), name) for name in INPUTS}
-    mappings, max_mapping = parse_mapping(loaded["mapping"])
+    mappings = parse_mapping(loaded["mapping"])
     bidi = parse_property(loaded["bidi"], BIDI_NAMES, BIDI_ALIASES)
     joining = parse_property(loaded["joining"], JOINING_NAMES, JOINING_ALIASES)
     tests, skipped_ill_formed = parse_tests(loaded["tests"])
     generated = weft_generated_source.canonical(
-        generate_data_source(mappings, max_mapping, bidi, joining).encode("utf-8")
+        generate_data_source(mappings, bidi, joining).encode("utf-8")
     )
     generated_tests = weft_generated_source.canonical(
         generate_test_source(tests, skipped_ill_formed).encode("utf-8")
