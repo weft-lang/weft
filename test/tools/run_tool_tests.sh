@@ -839,7 +839,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_iter_pins_owned_iterator" "$(<"$tmp_out")" "pub type Iterator<T> = opaque"
     assert_contains "doc_stdlib_iter_pins_source_normalization" "$(<"$tmp_out")" "fn map<S: IntoIterator, U>(input: S, f: (S.Item) -> U)"
   elif [ "$stdlib_doc_name" = "test" ]; then
-    assert_contains "doc_stdlib_test_pins_public_surface" "$(<"$tmp_out")" "Public API items: 39. Documented: 39."
+    assert_contains "doc_stdlib_test_pins_public_surface" "$(<"$tmp_out")" "Public API items: 41. Documented: 41."
     assert_contains "doc_stdlib_test_pins_structured_report" "$(<"$tmp_out")" "fn report(diagnostic: Diagnostic) -> i64"
     assert_contains "doc_stdlib_test_pins_unsigned_equality" "$(<"$tmp_out")" "fn assert_eq_usize(got: usize, expected: usize) -> i64"
   elif [ "$stdlib_doc_name" = "string/builder" ]; then
