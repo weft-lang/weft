@@ -302,7 +302,8 @@ use compiler/types/graph/layout.{
   semantic_structural_record_source_fields,
   semantic_structural_record,
   semantic_tuple_pattern_arity,
-  semantic_tuple_pattern_element
+  semantic_tuple_pattern_element,
+  semantic_value_excludes_zero
 }
 use compiler/types/graph/pattern.{
   SemanticTypePatternMatched,
@@ -660,6 +661,8 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerUnsupportedBinaryOperator(i64),
   CheckedBodyProducerUnsupportedMatchArm,
   CheckedBodyProducerUnsupportedPattern,
+  CheckedBodyProducerTypedArmOutsideScrutinee(CheckedSourceRange),
+  CheckedBodyProducerRuntimeDiscriminationUnavailable(SemanticTypeId, CheckedSourceRange),
   CheckedBodyProducerTuplePatternRequired(SemanticTypeId),
   CheckedBodyProducerTuplePatternArityMismatch(usize, usize),
   CheckedBodyProducerRecordPatternRequired(SemanticTypeId),
@@ -1250,6 +1253,9 @@ type CheckedPatternCoverage {
   CheckedPatternBooleanFalse,
   CheckedPatternBooleanComplete,
   CheckedPatternVariantCases(List<DeclarationIdentity>, usize),
+  -- The two halves of a nil-sentinel scrutinee `T | nil`.
+  CheckedPatternNilCovered,
+  CheckedPatternNonNilCovered,
   CheckedPatternComplete
 }
 
@@ -3150,6 +3156,43 @@ impl CheckedBodyBuild {
       CheckedBodyBuild(storage) -> {
         let { signatures, expressions, patterns, closures, effects, propagation } = storage
         match patterns.integer(value, origin, input_type, range) {
+          (patterns, pattern) -> (
+            CheckedBodyBuild(
+              CheckedBodyBuildStorage {
+                signatures: signatures,
+                expressions: expressions,
+                patterns: patterns,
+                closures: closures,
+                effects: effects,
+                propagation: propagation
+              }
+            ),
+            pattern
+          )
+        }
+      }
+    }
+  }
+
+  fn typed_binding_pattern(
+    self: owned Self,
+    binding: CheckedBindingId,
+    annotation: SemanticTypeId,
+    nil_tested: bool,
+    input_type: SemanticTypeId,
+    range: CheckedSourceRange
+  ) -> (owned CheckedBodyBuild, CheckedPatternId) {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        match patterns.typed_binding(
+          expressions,
+          binding,
+          annotation,
+          nil_tested,
+          input_type,
+          range
+        ) {
           (patterns, pattern) -> (
             CheckedBodyBuild(
               CheckedBodyBuildStorage {
@@ -8786,6 +8829,12 @@ fn checked_pattern_coverage_add(
     (_, CheckedPatternComplete) -> CheckedPatternComplete
     (CheckedPatternBooleanComplete, _) -> CheckedPatternBooleanComplete
     (_, CheckedPatternBooleanComplete) -> CheckedPatternBooleanComplete
+    (CheckedPatternNilCovered, CheckedPatternNonNilCovered) -> CheckedPatternComplete
+    (CheckedPatternNonNilCovered, CheckedPatternNilCovered) -> CheckedPatternComplete
+    (CheckedPatternNilCovered, _) -> CheckedPatternNilCovered
+    (_, CheckedPatternNilCovered) -> CheckedPatternNilCovered
+    (CheckedPatternNonNilCovered, _) -> CheckedPatternNonNilCovered
+    (_, CheckedPatternNonNilCovered) -> CheckedPatternNonNilCovered
     (CheckedPatternBooleanTrue, CheckedPatternBooleanFalse) ->
       CheckedPatternBooleanComplete
     (CheckedPatternBooleanFalse, CheckedPatternBooleanTrue) ->
@@ -9831,6 +9880,177 @@ fn checked_body_record_pattern(
   }
 }
 
+-- How one zero compare can separate `nil` from the rest of a scrutinee
+-- (kernel §6.2). An unresolved `any` scrutinee has no static representation
+-- to prove, so it is left to the value's own dynamic discipline.
+type CheckedNilDiscrimination {
+  CheckedNilOnly,
+  CheckedNilSentinel,
+  CheckedNilUnresolved,
+  CheckedNilUndiscriminable
+}
+
+fn checked_nil_discrimination(
+  catalog: borrow SemanticTypeCatalog,
+  types: CheckedBodyPrimitiveTypes,
+  input_type: SemanticTypeId
+) -> CheckedNilDiscrimination {
+  if semantic_type_catalog_equal(catalog, input_type, types.nil_type) { CheckedNilOnly }
+  else {
+    match catalog.graph_for(input_type) {
+      Some(graph) -> match semantic_type_graph_node(graph, input_type) {
+        SemanticTopNode -> CheckedNilUnresolved
+        _ -> {
+          if checked_nil_sentinel_members(catalog, types, input_type) {
+            CheckedNilSentinel
+          } else { CheckedNilUndiscriminable }
+        }
+      }
+      None -> CheckedNilUndiscriminable
+    }
+  }
+}
+
+-- Every union member is `nil` or a single non-zero word.
+fn checked_nil_sentinel_members(
+  catalog: borrow SemanticTypeCatalog,
+  types: CheckedBodyPrimitiveTypes,
+  member: SemanticTypeId
+) -> bool {
+  if semantic_type_catalog_equal(catalog, member, types.nil_type) { true }
+  else {
+    match catalog.graph_for(member) {
+      Some(graph) -> match semantic_type_graph_node(graph, member) {
+        SemanticUnionNode(left, right) -> checked_nil_sentinel_members(catalog, types, left) and
+          checked_nil_sentinel_members(catalog, types, right)
+        _ -> semantic_value_excludes_zero(catalog, member)
+      }
+      None -> false
+    }
+  }
+}
+
+-- Every union member of `input` is `nil` or lies inside `annotation`.
+fn checked_members_within_or_nil(
+  catalog: borrow SemanticTypeCatalog,
+  types: CheckedBodyPrimitiveTypes,
+  member: SemanticTypeId,
+  annotation: SemanticTypeId
+) -[SemanticConformance]> bool {
+  if semantic_type_catalog_equal(catalog, member, types.nil_type) { true }
+  else {
+    match catalog.graph_for(member) {
+      Some(graph) -> match semantic_type_graph_node(graph, member) {
+        SemanticUnionNode(left, right) -> checked_members_within_or_nil(
+          catalog,
+          types,
+          left,
+          annotation
+        ) and checked_members_within_or_nil(catalog, types, right, annotation)
+        _ -> semantic_type_is_subtype(catalog, member, annotation)
+      }
+      None -> false
+    }
+  }
+}
+
+type CheckedTypedArmAdmission {
+  CheckedTypedArmOutside,
+  CheckedTypedArmUndiscriminable,
+  CheckedTypedArmAdmitted(CheckedPatternCoverage)
+}
+
+-- A typed arm narrows by set difference (kernel §6.2). V1 admits a whole
+-- scrutinee catch-all, which needs no runtime test, or the exact non-nil side
+-- of a nil-sentinel union, whose test is one zero compare.
+fn checked_body_typed_binding_pattern(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
+  input_type: SemanticTypeId,
+  start: i64,
+  length: i64,
+  authored: TypeExpr
+) -[SemanticConformance]> CheckedBodyPatternBuild {
+  match source_range(source, start, length) {
+    nil -> CheckedBodyPatternRejected(state, CheckedBodyProducerInvalidRange)
+    range: CheckedSourceRange -> {
+      let catalog = state.types()
+      let resolution = types.resolution
+      let segment = catalog.next_derived_segment(
+        types.module.identity,
+        resolution.next_type_segment()
+      )
+      match checked_body_resolve_type_in_environment(
+        semantic_type_product_continue(types.module.identity, catalog, segment),
+        types.module,
+        environment,
+        authored
+      ) {
+        (_, SemanticTypeRejected(issue)) -> CheckedBodyPatternRejected(
+          state,
+          CheckedBodyProducerTypeRejected(issue)
+        )
+        (product, SemanticTypeResolved(annotation)) -> {
+          let next_catalog = semantic_type_product_catalog(product)
+          let state = state.with_types(next_catalog)
+          let catalog = state.types()
+          let next_types = checked_body_types_with_catalog(types, catalog)
+          let admission = if not semantic_type_is_subtype(catalog, annotation, input_type) {
+            CheckedTypedArmOutside
+          } else if semantic_type_is_subtype(catalog, input_type, annotation) {
+            CheckedTypedArmAdmitted(CheckedPatternComplete)
+          } else if not semantic_type_is_subtype(catalog, next_types.nil_type, annotation) and
+            checked_members_within_or_nil(catalog, next_types, input_type, annotation) and
+            match checked_nil_discrimination(catalog, next_types, input_type) {
+              CheckedNilSentinel -> true
+              _ -> false
+            } {
+              CheckedTypedArmAdmitted(CheckedPatternNonNilCovered)
+            } else { CheckedTypedArmUndiscriminable }
+          match admission {
+            CheckedTypedArmOutside -> CheckedBodyPatternRejected(
+              state,
+              CheckedBodyProducerTypedArmOutsideScrutinee(range)
+            )
+            CheckedTypedArmUndiscriminable -> CheckedBodyPatternRejected(
+              state,
+              CheckedBodyProducerRuntimeDiscriminationUnavailable(input_type, range)
+            )
+            CheckedTypedArmAdmitted(admitted) -> match state.binding(
+              owner,
+              annotation,
+              range,
+              CheckedImmutableBinding
+            ) {
+              (state, binding) -> match state.typed_binding_pattern(
+                binding,
+                annotation,
+                match admitted {
+                  CheckedPatternNonNilCovered -> true
+                  _ -> false
+                },
+                input_type,
+                range
+              ) {
+                (state, pattern) -> CheckedBodyPatternBuilt(
+                  state,
+                  pattern,
+                  CheckedLexicalBinding(start, length, binding, annotation, false, environment),
+                  admitted,
+                  range
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 fn checked_body_pattern(
   state: owned CheckedBodyBuild,
   source: Source,
@@ -9942,30 +10162,49 @@ fn checked_body_pattern(
       nil -> CheckedBodyPatternRejected(state, CheckedBodyProducerInvalidRange)
     }
     NilPattern(start, length) -> match source_range(source, start, length) {
-      range: CheckedSourceRange -> if semantic_type_is_subtype(
+      range: CheckedSourceRange -> if not semantic_type_is_subtype(
         catalog,
         types.nil_type,
         input_type
       ) {
-        match state.nil_pattern(input_type, range) {
-          (state, pattern) -> CheckedBodyPatternBuilt(
-            state,
-            pattern,
-            environment,
-            if semantic_type_catalog_equal(catalog, input_type, types.nil_type) {
-              CheckedPatternComplete
-            } else { CheckedPatternOpen },
-            range
-          )
-        }
-      } else {
         CheckedBodyPatternRejected(
           state,
           CheckedBodyProducerTypeMismatch(types.nil_type, input_type)
         )
+      } else {
+        match checked_nil_discrimination(catalog, types, input_type) {
+          CheckedNilUndiscriminable -> CheckedBodyPatternRejected(
+            state,
+            CheckedBodyProducerRuntimeDiscriminationUnavailable(input_type, range)
+          )
+          discrimination -> match state.nil_pattern(input_type, range) {
+            (state, pattern) -> CheckedBodyPatternBuilt(
+              state,
+              pattern,
+              environment,
+              match discrimination {
+                CheckedNilOnly -> CheckedPatternComplete
+                CheckedNilSentinel -> CheckedPatternNilCovered
+                _ -> CheckedPatternOpen
+              },
+              range
+            )
+          }
+        }
       }
       nil -> CheckedBodyPatternRejected(state, CheckedBodyProducerInvalidRange)
     }
+    TypedBinding(start, length, annotation) -> checked_body_typed_binding_pattern(
+      state,
+      source,
+      types,
+      owner,
+      environment,
+      input_type,
+      start,
+      length,
+      annotation
+    )
     CtorPattern(start, length, children, _, qualifier) -> checked_body_constructor_pattern(
       state,
       source,
