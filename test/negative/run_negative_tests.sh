@@ -1390,6 +1390,8 @@ check_rejects "slice_local_closure_capture" "test/negative/slice_local_closure_c
 check_rejects "slice_par_mutable_worker" "test/negative/slice_par_mutable_worker.weft" "type error: mutable slice cannot cross a scoped Par boundary"
 check_rejects "sendable_bound_mutable_vector" "test/negative/sendable_bound_mutable_vector.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
 check_rejects "sendable_bound_nested_mutable" "test/negative/sendable_bound_nested_mutable.weft" 'error[E1004]: type `SendableEnvelope<Vector<i64>>` does not implement `Sendable`'
+check_rejects "sendable_bound_mutable_sorted_map" "test/negative/sendable_bound_mutable_sorted_map.weft" 'error[E1004]: type `SortedMap<i64, i64>` does not implement `Sendable`'
+check_rejects "sendable_bound_mutable_sorted_set" "test/negative/sendable_bound_mutable_sorted_set.weft" 'error[E1004]: type `SortedSet<i64>` does not implement `Sendable`'
 check_rejects "sendable_bound_function_requires_value" "test/negative/sendable_bound_function_requires_value.weft" 'error[E1004]: type `(i64) -> i64` does not implement `Sendable`'
 check_rejects "sendable_bound_slice_requires_scope" "test/negative/sendable_bound_slice_requires_scope.weft" 'error[E1004]: type `[i64]` does not implement `Sendable`'
 check_rejects "sendable_par_worker_dynamic_capture" "test/negative/sendable_par_worker_dynamic_capture.weft" "type error: closure capture is not Sendable across scoped Par"
