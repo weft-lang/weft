@@ -1390,6 +1390,9 @@ check_rejects "slice_local_closure_capture" "test/negative/slice_local_closure_c
 check_rejects "slice_par_mutable_worker" "test/negative/slice_par_mutable_worker.weft" "type error: mutable slice cannot cross a scoped Par boundary"
 check_rejects "sendable_bound_mutable_vector" "test/negative/sendable_bound_mutable_vector.weft" 'error[E1004]: type `Vector<i64>` does not implement `Sendable`'
 check_rejects "sendable_bound_nested_mutable" "test/negative/sendable_bound_nested_mutable.weft" 'error[E1004]: type `SendableEnvelope<Vector<i64>>` does not implement `Sendable`'
+check_rejects "sendable_bound_iterator_token" "test/negative/sendable_bound_iterator_token.weft" 'error[E1004]: type `Iterator<i64>` does not implement `Sendable`'
+check_rejects "sendable_bound_generator_token" "test/negative/sendable_bound_generator_token.weft" 'error[E1004]: type `Generator<i64, nil>` does not implement `Sendable`'
+check_rejects "sendable_bound_par_task_token" "test/negative/sendable_bound_par_task_token.weft" 'error[E1004]: type `ParTask<i64>` does not implement `Sendable`'
 check_rejects "sendable_bound_mutable_sorted_map" "test/negative/sendable_bound_mutable_sorted_map.weft" 'error[E1004]: type `SortedMap<i64, i64>` does not implement `Sendable`'
 check_rejects "sendable_bound_mutable_sorted_set" "test/negative/sendable_bound_mutable_sorted_set.weft" 'error[E1004]: type `SortedSet<i64>` does not implement `Sendable`'
 check_rejects "sendable_same_named_user_map" "test/negative/sendable_same_named_user_map.weft" 'error[E1004]: type `Map` does not implement `Sendable`'
