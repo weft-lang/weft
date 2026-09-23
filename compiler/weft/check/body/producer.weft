@@ -507,7 +507,11 @@ use compiler/weft/check/body/propagation.{
   CheckedStructuralProjection,
   checked_propagation_builder
 }
-use compiler/weft/check/registration/catalog.{RegisteredModule}
+use compiler/weft/check/registration/catalog.{
+  RegisteredModule,
+  RegisteredOpaqueType,
+  RegisteredType
+}
 use compiler/weft/check/resolution/handlers.{
   SemanticHandlerCallIssue,
   SemanticHandlerCallRejected,
@@ -530,7 +534,8 @@ use compiler/weft/check/registration/scope.{
   registration_scope_find,
   registration_scope_len,
   registration_scope_lookup_declaration_span,
-  registration_scope_lookup_qualified_declaration_span
+  registration_scope_lookup_qualified_declaration_span,
+  registration_scope_registered_type
 }
 use compiler/weft/check/semantic_types.{
   SemanticTypeProductBuilder,
@@ -673,6 +678,8 @@ pub(package) type CheckedBodyProducerIssue {
     Option<SemanticTypeNode>
   ),
   CheckedBodyProducerUnknownConstructor(CheckedSourceRange),
+  CheckedBodyProducerOpaqueConstructorPrivate(CheckedSourceRange),
+  CheckedBodyProducerOpaqueProjectionPrivate(CheckedSourceRange),
   CheckedBodyProducerConstructorResultRequired(CheckedSourceRange),
   CheckedBodyProducerConstructorResultAmbiguous(CheckedSourceRange),
   CheckedBodyProducerConstructorArityMismatch(usize, usize),
@@ -1608,6 +1615,14 @@ fn lexical_module(environment: CheckedLexicalEnvironment) -> ModuleIdentity {
     CheckedLexicalHandledEffect(_, _, parent) -> lexical_module(parent)
     CheckedLexicalResume(_, _, parent) -> lexical_module(parent)
   }
+}
+
+-- Opaque wrap and projection authority belongs only to the declaring module.
+fn lexical_foreign_declaration(
+  environment: CheckedLexicalEnvironment,
+  declaration: DeclarationIdentity
+) -> bool {
+  not module_identity_eq(declaration_identity_module(declaration), lexical_module(environment))
 }
 
 fn lexical_type_parameters(environment: CheckedLexicalEnvironment) -> TypeParamList {
@@ -9044,6 +9059,8 @@ fn checked_body_opaque_pattern(
         state,
         CheckedBodyProducerUnknownConstructor(name_range)
       )
+      CheckedConstructorResolved(_) if lexical_foreign_declaration(environment, declaration) ->
+        CheckedBodyPatternRejected(state, CheckedBodyProducerOpaqueProjectionPrivate(name_range))
       CheckedConstructorResolved(qualifier) -> match checked_body_opaque_pattern_payload(
         state,
         types,
@@ -13591,21 +13608,44 @@ fn checked_body_perform(
             arguments,
             expectation
           )
-          None -> checked_body_perform_other(
-            state,
-            module,
+          None -> match checked_body_qualified_declaration(
             source,
-            types,
-            owner,
-            function_result,
-            loop_context,
             environment,
             effect_ref,
-            operation_start,
-            operation_length,
-            arguments,
-            expectation
-          )
+            operation_span,
+            operation_range,
+            TypeDeclaration
+          ) {
+            Some((declaration, range)) -> checked_body_opaque_constructor_call(
+              state,
+              source,
+              types,
+              owner,
+              function_result,
+              loop_context,
+              environment,
+              TypeExprListNil,
+              declaration,
+              operation_range,
+              range,
+              arguments
+            )
+            None -> checked_body_perform_other(
+              state,
+              module,
+              source,
+              types,
+              owner,
+              function_result,
+              loop_context,
+              environment,
+              effect_ref,
+              operation_start,
+              operation_length,
+              arguments,
+              expectation
+            )
+          }
         }
       }
     }
@@ -15123,6 +15163,8 @@ fn checked_body_generic_target(
   }
 }
 
+-- The declaration named decides wrap authority before its type arguments
+-- resolve, so a foreign opaque constructor is refused however it is spelled.
 fn checked_body_opaque_constructor_call(
   state: owned CheckedBodyBuild,
   source: Source,
@@ -15133,6 +15175,51 @@ fn checked_body_opaque_constructor_call(
   environment: CheckedLexicalEnvironment,
   type_arguments: TypeExprList,
   declaration: DeclarationIdentity,
+  name_range: CheckedSourceRange,
+  range: CheckedSourceRange,
+  arguments: ExprList
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  let foreign_opaque = match registration_scope_registered_type(
+    lexical_scope(environment),
+    declaration
+  ) {
+    nil -> false
+    registered: RegisteredType -> match registered {
+      RegisteredOpaqueType(_, _, _) -> lexical_foreign_declaration(environment, declaration)
+      _ -> false
+    }
+  }
+  if foreign_opaque {
+    CheckedBodyExprRejected(state, CheckedBodyProducerOpaqueConstructorPrivate(name_range))
+  } else {
+    checked_body_opaque_constructor_application(
+      state,
+      source,
+      types,
+      owner,
+      function_result,
+      loop_context,
+      environment,
+      type_arguments,
+      declaration,
+      name_range,
+      range,
+      arguments
+    )
+  }
+}
+
+fn checked_body_opaque_constructor_application(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  type_arguments: TypeExprList,
+  declaration: DeclarationIdentity,
+  name_range: CheckedSourceRange,
   range: CheckedSourceRange,
   arguments: ExprList
 ) -[SemanticConformance]> CheckedBodyExprBuild {
@@ -15165,9 +15252,15 @@ fn checked_body_opaque_constructor_call(
           CheckedBodyProducerUnknownConstructor(range)
         )
         Some(graph) -> match semantic_type_graph_node(graph, result_type) {
+          -- An alias does not grant the wrap authority of its opaque target.
           SemanticNamedNode(found, SemanticOpaqueType, representation, _) ->
             if
-            declaration_identity_eq(found, declaration) {
+            lexical_foreign_declaration(environment, found) {
+              CheckedBodyExprRejected(
+                state,
+                CheckedBodyProducerOpaqueConstructorPrivate(name_range)
+              )
+            } else if declaration_identity_eq(found, declaration) {
               match arguments {
                 ExprListCons(argument, ExprListNil) -> match checked_body_expr(
                   state,
@@ -15248,6 +15341,7 @@ fn checked_body_generic_constructor_call(
       environment,
       type_arguments,
       visible,
+      CheckedSourceRange { start: name.start(), end: name.end() },
       range,
       arguments
     )
@@ -16516,6 +16610,7 @@ fn checked_body_call(
                 environment,
                 TypeExprListNil,
                 declaration.identity,
+                name_range,
                 name_range,
                 arguments
               )
