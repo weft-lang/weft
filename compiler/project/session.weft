@@ -17,7 +17,9 @@ use compiler/source/loading.{source_loader, source_loader_owners}
 use compiler/project/incremental.{*}
 use compiler/project/module.{module_fact_find_source, module_logical_path_len}
 use compiler/project/checked_modules.{*}
-use compiler/weft/check/registration/scope.{RegistrationScope}
+use compiler/weft/assemble.{assemble_weft_program_with_loader}
+use compiler/weft/check/checked_program.{CheckedProgramResult, check_registered_program}
+use compiler/weft/check/registration/scope.{RegistrationScope, registration_scope_find_source}
 use compiler/storage.{nlist_len}
 use compiler/sdk/source.{sdk_source_load_module, sdk_source_diagnostic}
 use compiler/package/manifest.{
@@ -36,8 +38,10 @@ use compiler/weft/check/table.{
   str_hash,
   ttable_mark_checked_module_products,
   ttable_new,
+  ttable_program_entry_source_or,
   ttable_register_source,
-  ttable_register_source_in_package
+  ttable_register_source_in_package,
+  ttable_sdk_package_id
 }
 use runtime/alloc.{alloc_words}
 use runtime/buffer.{bstr, buf_len, buf_new, buf_ptr}
@@ -1817,6 +1821,63 @@ pub(package) fn project_session_prepared_parse(
   )
 }
 
+-- Collect diagnostics against one product's registered sources. Legacy span
+-- reports keep the supplied class until their producers report structured data.
+fn project_diagnostics_collect<T, E>(
+  diagnostics: ProjectDiagnostics,
+  src: i64,
+  n: i64,
+  tt: i64,
+  class: DiagnosticClass,
+  body: () -[Diagnose, E]> T
+) -[E]> T {
+  handle body() {
+    Diagnose.report(diagnostic) -> {
+      project_diagnostics_add(diagnostics, diagnostic, src, n, tt)
+      resume(0)
+    }
+    Diagnose.error(msg, span) -> {
+      project_diagnostics_add_legacy(
+        diagnostics,
+        src,
+        n,
+        tt,
+        DiagnosticSeverityError,
+        class,
+        msg,
+        span
+      )
+      resume(0)
+    }
+    Diagnose.warn(msg, span) -> {
+      project_diagnostics_add_legacy(
+        diagnostics,
+        src,
+        n,
+        tt,
+        DiagnosticSeverityWarning,
+        class,
+        msg,
+        span
+      )
+      resume(0)
+    }
+    Diagnose.note(msg, span) -> {
+      project_diagnostics_add_legacy(
+        diagnostics,
+        src,
+        n,
+        tt,
+        DiagnosticSeverityNote,
+        class,
+        msg,
+        span
+      )
+      resume(0)
+    }
+  }
+}
+
 fn project_check_compute(
   session: ProjectSession,
   context: ProjectQueryContext,
@@ -1835,51 +1896,14 @@ fn project_check_compute(
           ),
           owners
         )
-        let checked = handle check_weft_program_with_loader(ast, loader) {
-          Diagnose.report(diagnostic) -> {
-            project_diagnostics_add(diagnostics, diagnostic, src, n, tt)
-            resume(0)
-          }
-          Diagnose.error(msg, span) -> {
-            project_diagnostics_add_legacy(
-              diagnostics,
-              src,
-              n,
-              tt,
-              DiagnosticSeverityError,
-              DiagnosticClassType,
-              msg,
-              span
-            )
-            resume(0)
-          }
-          Diagnose.warn(msg, span) -> {
-            project_diagnostics_add_legacy(
-              diagnostics,
-              src,
-              n,
-              tt,
-              DiagnosticSeverityWarning,
-              DiagnosticClassType,
-              msg,
-              span
-            )
-            resume(0)
-          }
-          Diagnose.note(msg, span) -> {
-            project_diagnostics_add_legacy(
-              diagnostics,
-              src,
-              n,
-              tt,
-              DiagnosticSeverityNote,
-              DiagnosticClassType,
-              msg,
-              span
-            )
-            resume(0)
-          }
-        }
+        let checked = project_diagnostics_collect(
+          diagnostics,
+          src,
+          n,
+          tt,
+          DiagnosticClassType,
+          () => check_weft_program_with_loader(ast, loader)
+        )
         project_diagnostics_retain_owners(diagnostics, source_loader_owners(loader))
         -- Checking can acquire additional sources. Freeze only after the
         -- loader has finished; neither product borrows the diagnostic builder.
@@ -1960,6 +1984,66 @@ pub(package) fn project_session_check_with_acquire(
     IncrementalQueryMiss(ticket) -> project_check_compute(session, context, ticket)
     IncrementalQueryCycle(cycle) -> ProjectCheckCycle(cycle)
     IncrementalQueryCorrupt -> ProjectCheckCorrupt
+  }
+}
+
+-- Typed checking of one prepared project root. This is the comparison boundary
+-- used by the differential checker oracle: ordinary checking still publishes
+-- only the legacy product until the single production switch, and this query is
+-- never cached beside it. The returned table is only the source registry used
+-- to render rejection locations; the typed program does not consult it.
+pub(package) type ProjectTypedCheckResult {
+  ProjectTypedCheckCompleted(CheckedProgramResult, RegistrationScope, i64),
+  ProjectTypedCheckLoadRejected(ProjectDiagnostics),
+  ProjectTypedCheckRootUnregistered,
+  ProjectTypedCheckParseFailed(ProjectPreparedParseResult)
+}
+
+pub(package) fn project_session_typed_check_with_acquire(
+  session: ProjectSession,
+  context: ProjectQueryContext
+) -[SourceAcquire]> ProjectTypedCheckResult {
+  match project_session_prepared_parse_with_acquire(session, context) {
+    ProjectPreparedParseSucceeded(ast, n, _) -> match ast {
+      AstModule(_, src, tt, owners, (_, registrations)) -> match registration_scope_find_source(
+        registrations,
+        ttable_program_entry_source_or(tt, src)
+      ) {
+        None -> ProjectTypedCheckRootUnregistered
+        Some(root) -> {
+          let diagnostics = project_diagnostics_with_sources(owners)
+          let loader = source_loader(
+            (request: SourceRequest) => project_session_load_resolved_source(
+              session,
+              context,
+              tt,
+              request
+            ),
+            owners
+          )
+          match project_diagnostics_collect(
+            diagnostics,
+            src,
+            n,
+            tt,
+            DiagnosticClassType,
+            () => assemble_weft_program_with_loader(ast, root.identity, loader)
+          ) {
+            CheckRejected -> ProjectTypedCheckLoadRejected(diagnostics)
+            Checked(program) -> ProjectTypedCheckCompleted(
+              check_registered_program(
+                program.root,
+                program.registrations,
+                ttable_sdk_package_id(tt)
+              ),
+              program.registrations,
+              tt
+            )
+          }
+        }
+      }
+    }
+    other -> ProjectTypedCheckParseFailed(other)
   }
 }
 

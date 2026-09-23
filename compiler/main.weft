@@ -30,6 +30,11 @@ use compiler/source/loading.{source_loader_owners}
 -- Weft compiler — Layer 1
 -- Compiles Weft source with arithmetic, control flow, functions to aarch64 Mach-O
 -- Usage: ./weft < compiler/main.weft > output && chmod +x output
+use compiler/diagnostic/frame.{
+  DiagnosticFrameSourceKnown,
+  DiagnosticFrameSourceMissing,
+  diagnostic_frame_source
+}
 use compiler/diagnostic/location.{diagnostic_location_clamp_offset}
 use compiler/diagnostic/observe.{observe_errors}
 use compiler/backend/aarch64/codegen.{*}
@@ -52,6 +57,7 @@ use compiler/weft/load.{
 }
 use compiler/weft/check as weft_check
 use compiler/weft/check.{CheckProgram, ExtendCheckedProgram}
+use compiler/weft/check/rejection.{typed_check_program_rejection, typed_check_stage_name}
 use compiler/weft/check/registration/storage.{RegistrationStorage, registration_storage}
 use compiler/grammar/tool.{*}
 use compiler/weft/facts/staging.{*}
@@ -5142,20 +5148,24 @@ fn main_dispatch_unchecked(argc: i64, argv: i64) -[SourceAcquire]> i64 {
             if cstr_eq(cmd, "check") == 1 {
               if argc > 2 {
                 let first = mem_load64_at(argv, 16)
-                if cstr_eq(first, "--jobs") == 1 or cstr_eq(first, "-j") == 1 {
-                  if argc < 5 {
-                    eprint("usage: weft check [--jobs N] <path...>\n")
-                    2
-                  } else {
-                    let jobs = main_test_parse_jobs(mem_load64_at(argv, 24))
-                    if jobs == 0 {
-                      eprint("check: --jobs must be an integer from 1 to 64\n")
-                      2
-                    } else { run_check_paths(argc, argv, 4, jobs) }
-                  }
+                if cstr_eq(first, "--typed-differential") == 1 {
+                  run_check_typed_differential(argc, argv)
                 } else {
-                  if argc == 3 { run_check_path(first) }
-                  else { run_check_paths(argc, argv, 2, 4) }
+                  if cstr_eq(first, "--jobs") == 1 or cstr_eq(first, "-j") == 1 {
+                    if argc < 5 {
+                      eprint("usage: weft check [--jobs N] <path...>\n")
+                      2
+                    } else {
+                      let jobs = main_test_parse_jobs(mem_load64_at(argv, 24))
+                      if jobs == 0 {
+                        eprint("check: --jobs must be an integer from 1 to 64\n")
+                        2
+                      } else { run_check_paths(argc, argv, 4, jobs, MainCheckOrdinary) }
+                    }
+                  } else {
+                    if argc == 3 { run_check_path(first) }
+                    else { run_check_paths(argc, argv, 2, 4, MainCheckOrdinary) }
+                  }
                 }
               } else { run_check() }
             }
@@ -6269,11 +6279,193 @@ fn main_check_redirect_stderr(path: i64) -> i64 {
   }
 }
 
+-- The internal differential mode compares the legacy project check with typed
+-- checking of a fresh prepared parse. It reports one record per root and never
+-- publishes a typed product; ordinary checking is unchanged.
+type MainCheckMode {
+  MainCheckOrdinary,
+  MainCheckTypedDifferential
+}
+
+fn main_typed_differential_location(tt: i64, location: DiagnosticLocation) -> i64 {
+  match location {
+    DiagnosticLocationNone -> eprint("-")
+    DiagnosticSourceRange(source, start, _) -> match diagnostic_frame_source(tt, source) {
+      DiagnosticFrameSourceMissing -> eprint("?")
+      DiagnosticFrameSourceKnown(src, n, path_ptr, path_len) -> {
+        if path_len > 0 { sys_write(2, path_ptr, path_len) } else { eprint("<buffer>") }
+        let position = source_position_at(src, n, diagnostic_location_clamp_offset(start, n))
+        eprint(":")
+        eprint_i(source_position_line0(position) + 1)
+        eprint(":")
+        eprint_i(source_position_scalar_column0(position) + 1)
+      }
+    }
+  }
+}
+
+fn main_typed_differential_first_error(diagnostics: ProjectDiagnostics) -> i64 {
+  for i in 0..project_diagnostics_len(diagnostics) {
+    match project_diagnostics_get(diagnostics, i).severity() {
+      DiagnosticSeverityError -> return i
+      _ -> nil
+    }
+  }
+  0 - 1
+}
+
+-- Report an error count plus the first error's location; return its message.
+fn main_typed_differential_error_at(
+  prefix: str,
+  errors: i64,
+  diagnostics: ProjectDiagnostics,
+  first: i64
+) -> str {
+  eprint(" ")
+  eprint(prefix)
+  eprint("_errors=")
+  eprint_i(errors)
+  eprint(" ")
+  eprint(prefix)
+  eprint("_at=")
+  if first < 0 {
+    eprint("-")
+    ""
+  } else {
+    main_typed_differential_location(
+      project_diagnostics_item_type_table(diagnostics, first),
+      project_diagnostics_get(diagnostics, first).primary()
+    )
+    project_diagnostics_get(diagnostics, first).message()
+  }
+}
+
+fn main_typed_differential_errors(
+  prefix: str,
+  parse: ProjectDiagnostics,
+  check: ProjectDiagnostics
+) -> str {
+  let errors = project_diagnostics_error_count(parse) + project_diagnostics_error_count(check)
+  let parse_first = main_typed_differential_first_error(parse)
+  if parse_first >= 0 { main_typed_differential_error_at(prefix, errors, parse, parse_first) }
+  else {
+    main_typed_differential_error_at(
+      prefix,
+      errors,
+      check,
+      main_typed_differential_first_error(check)
+    )
+  }
+}
+
+fn main_typed_differential_list_errors(prefix: str, diagnostics: ProjectDiagnostics) -> str {
+  main_typed_differential_error_at(
+    prefix,
+    project_diagnostics_error_count(diagnostics),
+    diagnostics,
+    main_typed_differential_first_error(diagnostics)
+  )
+}
+
+fn main_typed_differential_legacy(result: ProjectCheckResult) -> str {
+  match result {
+    ProjectCheckSucceeded(_, _, parse, check) -> {
+      eprint("legacy=accepted")
+      main_typed_differential_errors("legacy", parse, check)
+    }
+    ProjectCheckFailed(_, _, parse, check) -> {
+      eprint("legacy=rejected")
+      main_typed_differential_errors("legacy", parse, check)
+    }
+    ProjectCheckParseFailed(parse) -> {
+      eprint("legacy=parse_rejected")
+      match parse {
+        ProjectPreparedParseFailed(_, _, diagnostics) -> main_typed_differential_list_errors(
+          "legacy",
+          diagnostics
+        )
+        _ -> {
+          eprint(" legacy_errors=0 legacy_at=-")
+          ""
+        }
+      }
+    }
+    _ -> {
+      eprint("legacy=unavailable legacy_errors=0 legacy_at=-")
+      ""
+    }
+  }
+}
+
+fn main_typed_differential_typed(result: ProjectTypedCheckResult) -> i64 {
+  match result {
+    ProjectTypedCheckCompleted(program, scope, tt) -> match typed_check_program_rejection(
+      program,
+      scope
+    ) {
+      None -> eprint(" typed=accepted stage=- module=- function=- category=- typed_at=-")
+      Some(rejection) -> {
+        eprint(" typed=rejected stage=")
+        eprint(typed_check_stage_name(rejection.stage))
+        eprint(" module=")
+        eprint(rejection.module)
+        eprint(" function=")
+        eprint(rejection.function)
+        eprint(" category=")
+        eprint(rejection.category)
+        eprint(" typed_at=")
+        main_typed_differential_location(tt, rejection.location)
+      }
+    }
+    ProjectTypedCheckLoadRejected(diagnostics) -> {
+      eprint(" typed=load_rejected stage=load module=- function=- category=load")
+      main_typed_differential_list_errors("typed", diagnostics)
+      0
+    }
+    ProjectTypedCheckRootUnregistered -> eprint(
+      " typed=root_unregistered stage=root module=- function=- category=root_unregistered typed_at=-"
+    )
+    ProjectTypedCheckParseFailed(_) -> eprint(
+      " typed=parse_rejected stage=parse module=- function=- category=parse typed_at=-"
+    )
+  }
+}
+
+fn main_check_typed_differential_path(
+  session: ProjectSession,
+  path: i64
+) -[SourceAcquire]> i64 {
+  let context = main_check_context(path)
+  let legacy = project_session_check_with_acquire(session, context)
+  let typed_session = project_session_new_with_root_registration(1, main_project_register_root)
+  main_check_register_path(typed_session, path)
+  let typed = project_session_typed_check_with_acquire(typed_session, context)
+  eprint("typed-differential ")
+  let message = main_typed_differential_legacy(legacy)
+  main_typed_differential_typed(typed)
+  eprint(" | ")
+  eprint(message)
+  eprint("\n")
+  0
+}
+
+fn main_check_path_in_mode(
+  session: ProjectSession,
+  path: i64,
+  mode: MainCheckMode
+) -[SourceAcquire]> i64 {
+  match mode {
+    MainCheckOrdinary -> main_check_registered_path(session, path)
+    MainCheckTypedDifferential -> main_check_typed_differential_path(session, path)
+  }
+}
+
 fn main_check_spawn_worker(
   session: ProjectSession,
   path: i64,
   index: i64,
-  owner_pid: i64
+  owner_pid: i64,
+  mode: MainCheckMode
 ) -[SourceAcquire]> i64 {
   let output_path = main_check_output_path(owner_pid, index)
   sys_remove(output_path)
@@ -6282,7 +6474,7 @@ fn main_check_spawn_worker(
   else {
     if fork_result == 0 {
       if main_check_redirect_stderr(output_path) != 0 { sys_exit(2) }
-      else { sys_exit(main_check_registered_path(session, path)) }
+      else { sys_exit(main_check_path_in_mode(session, path, mode)) }
     } else { fork_result }
   }
 }
@@ -6319,7 +6511,12 @@ fn main_check_replay_result(
   0
 }
 
-fn main_check_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -[SourceAcquire]> i64 {
+fn main_check_run_paths_parallel(
+  paths: i64,
+  envp: i64,
+  jobs: i64,
+  mode: MainCheckMode
+) -[SourceAcquire]> i64 {
   let count = nlist_len(paths)
   let pids = alloc_zeroed(jobs * 8)
   let indexes = alloc_zeroed(jobs * 8)
@@ -6342,7 +6539,7 @@ fn main_check_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -[SourceAcqui
   while next < count or active > 0 {
     while next < count and active < jobs {
       let slot = main_test_find_free_worker(pids, jobs)
-      let pid = main_check_spawn_worker(session, nlist_get(paths, next), next, owner_pid)
+      let pid = main_check_spawn_worker(session, nlist_get(paths, next), next, owner_pid, mode)
       if pid < 0 {
         mem_store64_at(results, next * 8, 127)
       } else {
@@ -6416,15 +6613,41 @@ fn main_check_run_paths_parallel(paths: i64, envp: i64, jobs: i64) -[SourceAcqui
   failures
 }
 
-fn run_check_paths(argc: i64, argv: i64, first_path: i64, jobs: i64) -[SourceAcquire]> i64 {
+fn run_check_paths(
+  argc: i64,
+  argv: i64,
+  first_path: i64,
+  jobs: i64,
+  mode: MainCheckMode
+) -[SourceAcquire]> i64 {
   let paths = nlist_new()
   for i in first_path..argc { nlist_add(paths, mem_load64_at(argv, i * 8)) }
   if nlist_len(paths) == 0 {
     eprint("usage: weft check [--jobs N] <path...>\n")
     2
   } else {
-    let failures = main_check_run_paths_parallel(paths, argv + (argc + 1) * 8, jobs)
+    let failures = main_check_run_paths_parallel(paths, argv + (argc + 1) * 8, jobs, mode)
     if failures == 0 { 0 } else { 1 }
+  }
+}
+
+fn run_check_typed_differential(argc: i64, argv: i64) -[SourceAcquire]> i64 {
+  if argc > 4 and (
+    cstr_eq(mem_load64_at(argv, 24), "--jobs") == 1 or cstr_eq(
+      mem_load64_at(argv, 24),
+      "-j"
+    ) == 1
+  ) {
+    let jobs = main_test_parse_jobs(mem_load64_at(argv, 32))
+    if jobs == 0 or argc < 6 {
+      eprint("usage: weft check --typed-differential [--jobs N] <path...>\n")
+      2
+    } else { run_check_paths(argc, argv, 5, jobs, MainCheckTypedDifferential) }
+  } else {
+    if argc < 4 {
+      eprint("usage: weft check --typed-differential [--jobs N] <path...>\n")
+      2
+    } else { run_check_paths(argc, argv, 3, 4, MainCheckTypedDifferential) }
   }
 }
 
