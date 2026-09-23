@@ -1308,7 +1308,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
   elif [ "$stdlib_doc_name" = "task/shutdown" ]; then
     assert_contains "doc_stdlib_task_shutdown_pins_public_surface" "$(<"$tmp_out")" "Public API items: 3. Documented: 3."
   elif [ "$stdlib_doc_name" = "io" ]; then
-    assert_contains "doc_stdlib_io_pins_public_surface" "$(<"$tmp_out")" "Public API items: 13. Documented: 13."
+    assert_contains "doc_stdlib_io_pins_public_surface" "$(<"$tmp_out")" "Public API items: 15. Documented: 15."
   elif [ "$stdlib_doc_name" = "par" ]; then
     assert_contains "doc_stdlib_par_pins_public_surface" "$(<"$tmp_out")" "Public API items: 14. Documented: 14."
     assert_contains "doc_stdlib_par_pins_validated_configuration" "$(<"$tmp_out")" "pub fn pool_config(workers: usize, task_capacity: usize) -> Result<PoolConfig, PoolConfigError>"
