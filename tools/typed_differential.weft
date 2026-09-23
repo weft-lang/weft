@@ -1,0 +1,237 @@
+-- tools/typed_differential.weft -- differential checker oracle for one root.
+--
+-- Checks one root with the legacy project check and, on a fresh prepared
+-- parse, with the typed checked-program path, then prints one comparison
+-- record. tools/typed_differential.py runs roots in parallel and classifies
+-- the records. This is cutover scaffolding: it never publishes a typed
+-- product, the compiler binary does not include it, and it is deleted with
+-- the legacy checker.
+
+use compiler/diagnostic/frame.{
+  DiagnosticFrameSourceKnown,
+  DiagnosticFrameSourceMissing,
+  diagnostic_frame_source
+}
+use compiler/diagnostic/location.{diagnostic_location_clamp_offset}
+use compiler/project/session.{*}
+use compiler/project/typed_check.{
+  ProjectTypedCheckCompleted,
+  ProjectTypedCheckLoadRejected,
+  ProjectTypedCheckParseFailed,
+  ProjectTypedCheckResult,
+  ProjectTypedCheckRootUnregistered,
+  project_session_typed_check_with_acquire
+}
+use compiler/source/position.{
+  source_position_at,
+  source_position_line0,
+  source_position_scalar_column0
+}
+use compiler/storage.{eprint, eprint_i, read_file}
+use compiler/weft/check/rejection.{typed_check_program_rejection, typed_check_stage_name}
+use runtime/alloc.{alloc_words}
+use runtime/memory.{mem_load8_at, mem_load64_at, mem_store64_at}
+use runtime/source_acquire.{SourceAcquire, source_acquire_with_checkout}
+use runtime/string.{runtime_str_from_bytes_copy}
+use runtime/syscall.{sys_write}
+use stdlib/diagnostic/schema.{*}
+use stdlib/option.{None, Some}
+
+fn differential_location(tt: i64, location: DiagnosticLocation) -> i64 {
+  match location {
+    DiagnosticLocationNone -> eprint("-")
+    DiagnosticSourceRange(source, start, _) -> match diagnostic_frame_source(tt, source) {
+      DiagnosticFrameSourceMissing -> eprint("?")
+      DiagnosticFrameSourceKnown(src, n, path_ptr, path_len) -> {
+        if path_len > 0 { sys_write(2, path_ptr, path_len) } else { eprint("<buffer>") }
+        let position = source_position_at(src, n, diagnostic_location_clamp_offset(start, n))
+        eprint(":")
+        eprint_i(source_position_line0(position) + 1)
+        eprint(":")
+        eprint_i(source_position_scalar_column0(position) + 1)
+      }
+    }
+  }
+}
+
+fn differential_first_error(diagnostics: ProjectDiagnostics) -> i64 {
+  for i in 0..project_diagnostics_len(diagnostics) {
+    match project_diagnostics_get(diagnostics, i).severity() {
+      DiagnosticSeverityError -> return i
+      _ -> nil
+    }
+  }
+  0 - 1
+}
+
+-- Report an error count plus the first error's location; return its message.
+fn differential_error_at(
+  prefix: str,
+  errors: i64,
+  diagnostics: ProjectDiagnostics,
+  first: i64
+) -> str {
+  eprint(" ")
+  eprint(prefix)
+  eprint("_errors=")
+  eprint_i(errors)
+  eprint(" ")
+  eprint(prefix)
+  eprint("_at=")
+  if first < 0 {
+    eprint("-")
+    ""
+  } else {
+    differential_location(
+      project_diagnostics_item_type_table(diagnostics, first),
+      project_diagnostics_get(diagnostics, first).primary()
+    )
+    project_diagnostics_get(diagnostics, first).message()
+  }
+}
+
+fn differential_errors(
+  prefix: str,
+  parse: ProjectDiagnostics,
+  check: ProjectDiagnostics
+) -> str {
+  let errors = project_diagnostics_error_count(parse) + project_diagnostics_error_count(check)
+  let parse_first = differential_first_error(parse)
+  if parse_first >= 0 { differential_error_at(prefix, errors, parse, parse_first) }
+  else {
+    differential_error_at(
+      prefix,
+      errors,
+      check,
+      differential_first_error(check)
+    )
+  }
+}
+
+fn differential_list_errors(prefix: str, diagnostics: ProjectDiagnostics) -> str {
+  differential_error_at(
+    prefix,
+    project_diagnostics_error_count(diagnostics),
+    diagnostics,
+    differential_first_error(diagnostics)
+  )
+}
+
+fn differential_legacy(result: ProjectCheckResult) -> str {
+  match result {
+    ProjectCheckSucceeded(_, _, parse, check) -> {
+      eprint("legacy=accepted")
+      differential_errors("legacy", parse, check)
+    }
+    ProjectCheckFailed(_, _, parse, check) -> {
+      eprint("legacy=rejected")
+      differential_errors("legacy", parse, check)
+    }
+    ProjectCheckParseFailed(parse) -> {
+      eprint("legacy=parse_rejected")
+      match parse {
+        ProjectPreparedParseFailed(_, _, diagnostics) -> differential_list_errors(
+          "legacy",
+          diagnostics
+        )
+        _ -> {
+          eprint(" legacy_errors=0 legacy_at=-")
+          ""
+        }
+      }
+    }
+    _ -> {
+      eprint("legacy=unavailable legacy_errors=0 legacy_at=-")
+      ""
+    }
+  }
+}
+
+fn differential_typed(result: ProjectTypedCheckResult) -> i64 {
+  match result {
+    ProjectTypedCheckCompleted(program, scope, tt) -> match typed_check_program_rejection(
+      program,
+      scope
+    ) {
+      None -> eprint(" typed=accepted stage=- module=- function=- category=- typed_at=-")
+      Some(rejection) -> {
+        eprint(" typed=rejected stage=")
+        eprint(typed_check_stage_name(rejection.stage))
+        eprint(" module=")
+        eprint(rejection.module)
+        eprint(" function=")
+        eprint(rejection.function)
+        eprint(" category=")
+        eprint(rejection.category)
+        eprint(" typed_at=")
+        differential_location(tt, rejection.location)
+      }
+    }
+    ProjectTypedCheckLoadRejected(diagnostics) -> {
+      eprint(" typed=load_rejected stage=load module=- function=- category=load")
+      differential_list_errors("typed", diagnostics)
+      0
+    }
+    ProjectTypedCheckRootUnregistered -> eprint(
+      " typed=root_unregistered stage=root module=- function=- category=root_unregistered typed_at=-"
+    )
+    ProjectTypedCheckParseFailed(_) -> eprint(
+      " typed=parse_rejected stage=parse module=- function=- category=parse typed_at=-"
+    )
+  }
+}
+
+fn differential_path_length(path: i64) -> i64 {
+  let mut length = 0
+  while mem_load8_at(path, length) != 0 { length = length + 1 }
+  length
+}
+
+-- Roots are checked as untrusted strict user code, exactly as `weft check`
+-- treats any root outside the trusted compiler/runtime tree. Trusted roots
+-- are out of scope: this tool cannot grant source trust.
+fn differential_context(path: i64, length: i64) -> ProjectQueryContext {
+  let source_path = runtime_str_from_bytes_copy(path, length)
+  project_query_context(0, source_path, source_path, project_source_origin_disk(), 0, 1)
+}
+
+fn differential_session(path: i64, context: ProjectQueryContext) -> ProjectSession {
+  let session = project_session_new(1)
+  let pair = alloc_words(2)
+  mem_store64_at(pair, 0, path)
+  mem_store64_at(pair, 8, differential_path_length(path))
+  let file = read_file(pair)
+  let n = mem_load64_at(file, 8)
+  if n <= 0 { project_session_set_missing(session, context) }
+  else {
+    project_session_set_source(
+      session,
+      context,
+      runtime_str_from_bytes_copy(mem_load64_at(file, 0), n)
+    )
+  }
+  session
+}
+
+fn differential_root(path: i64) -[SourceAcquire]> i64 {
+  let context = differential_context(path, differential_path_length(path))
+  let legacy = project_session_check_with_acquire(differential_session(path, context), context)
+  let typed = project_session_typed_check_with_acquire(
+    differential_session(path, context),
+    context
+  )
+  eprint("typed-differential ")
+  let message = differential_legacy(legacy)
+  differential_typed(typed)
+  eprint(" | ")
+  eprint(message)
+  eprint("\n")
+  0
+}
+
+pub fn main(argc: i64, argv: i64) -> i64 {
+  if argc != 2 {
+    eprint("usage: typed_differential <path>\n")
+    2
+  } else { source_acquire_with_checkout(".", () => differential_root(mem_load64_at(argv, 8))) }
+}

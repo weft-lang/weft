@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Differential census of the typed checker against the legacy checker.
 
-Runs `weft check --typed-differential` over root sets and classifies each root:
+Builds tools/typed_differential.weft once, runs it for each root in parallel,
+and classifies each root:
 
   agree_accept         both checkers accept
   agree_reject         both reject; `site` compares the first legacy error line
@@ -14,12 +15,15 @@ Runs `weft check --typed-differential` over root sets and classifies each root:
   excluded_parse       legacy rejects during parsing; not a checker comparison
   harness_failure      the worker produced no record (timeout, crash, RSS)
 
+Roots are checked as untrusted strict user code, as `weft check` treats any
+root outside the trusted compiler/runtime tree; trusted roots are out of scope.
 This is test scaffolding for the no-bridge cutover. It never makes the typed
 path authoritative and must be deleted with the legacy checker.
 """
 
 import argparse
 import collections
+import concurrent.futures
 import glob
 import os
 import re
@@ -63,38 +67,54 @@ ROOT_SETS = {
     "negatives": negative_roots,
     "runtime": runtime_roots,
     "examples": example_roots,
-    "compiler": lambda: ["compiler/main.weft"],
 }
 
 
-def run(weft, jobs, roots, timeout):
-    env = dict(os.environ)
-    env["WEFT_TEST_COMPILE_TIMEOUT"] = str(timeout)
+FAILURE = re.compile(r"weft: (panic|trap): .*")
+
+
+def build_tool(builder, output):
     completed = subprocess.run(
-        [weft, "check", "--typed-differential", "--jobs", str(jobs), *roots],
+        [builder, "build", "tools/typed_differential.weft", "-o", output],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        env=env,
         check=False,
     )
-    records = {}
-    failures = {}
-    current = None
-    for raw in completed.stderr.decode("utf-8", "replace").splitlines():
-        if raw.startswith("==> ") and raw.endswith(" <=="):
-            current = raw[4:-4]
-            continue
-        if current is None:
-            continue
+    if completed.returncode != 0:
+        sys.stderr.write(completed.stderr.decode("utf-8", "replace"))
+        raise SystemExit(f"could not build the differential tool with {builder}")
+
+
+def run_root(tool, root, timeout):
+    try:
+        completed = subprocess.run(
+            [tool, root], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "worker timed out"
+    text = completed.stderr.decode("utf-8", "replace")
+    for raw in text.splitlines():
         match = RECORD.match(raw)
         if match:
-            records[current] = match.groupdict()
-            continue
-        # A worker that panics or traps never finishes its record line.
-        found = re.search(r"weft: (panic|trap): .*|check: worker (timed out|exceeded .*|failed)",
-                          raw)
-        if found and current not in failures:
-            failures[current] = found.group(0)
+            return match.groupdict(), None
+    found = FAILURE.search(text)
+    if found:
+        return None, found.group(0)
+    return None, f"no record (exit {completed.returncode})"
+
+
+def run(tool, jobs, roots, timeout):
+    records, failures = {}, {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {pool.submit(run_root, tool, root, timeout): root for root in roots}
+        for future in concurrent.futures.as_completed(futures):
+            root = futures[future]
+            record, failure = future.result()
+            if record is not None:
+                records[root] = record
+            else:
+                failures[root] = failure
     return records, failures
 
 
@@ -137,19 +157,22 @@ def message_class(message):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--weft", default="./.weft-dev-candidate")
+    parser.add_argument("--builder", default="./.weft-dev-candidate",
+                        help="compiler used to build tools/typed_differential.weft")
     parser.add_argument("--jobs", type=int, default=8)
-    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--timeout", type=int, default=300, help="seconds per root")
     parser.add_argument("--set", action="append", choices=sorted(ROOT_SETS), dest="sets")
     parser.add_argument("--out", help="write per-root TSV records to this file")
     parser.add_argument("--detail", type=int, default=25, help="rows per breakdown table")
     options = parser.parse_args()
     sets = options.sets or ["negatives", "runtime", "examples"]
 
+    tool = f"/tmp/weft-typed-differential-{os.getpid()}"
+    build_tool(options.builder, tool)
     rows = []
     for name in sets:
         roots = ROOT_SETS[name]()
-        records, failures = run(options.weft, options.jobs, roots, options.timeout)
+        records, failures = run(tool, options.jobs, roots, options.timeout)
         for root in roots:
             record = records.get(root)
             verdict, site = classify(record)
@@ -199,6 +222,7 @@ def main():
             print("  harness_failure by message:")
             for message, count in failures.most_common(options.detail):
                 print(f"    {count:5}  {message}")
+    os.remove(tool)
     return 0
 
 
