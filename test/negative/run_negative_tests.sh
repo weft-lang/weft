@@ -709,6 +709,14 @@ check_rejects "nonregular_generic_recursion_components" "test/negative/nonregula
 check_rejects "nonregular_generic_recursion_components_second" "test/negative/nonregular_generic_recursion_components.weft" 'error[E1012]: generic function `deepen` instantiates its recursion with ever-growing type arguments' 2
 check_rejects "nonregular_generic_recursion_bounded_dispatch" "test/negative/nonregular_generic_recursion_bounded_dispatch.weft" 'error[E1012]: generic function `go` instantiates its recursion with ever-growing type arguments' 1
 check_rejects "bounded_impl_parameter_lacks_bound" "test/negative/bounded_impl_parameter_lacks_bound.weft" 'error[E1004]: type `Box<T>` does not implement `Deep`' 1
+check_rejects "associated_type_without_bound" "test/negative/associated_type_without_bound.weft" 'error[E1004]: type `T.Child` does not implement `Level`' 1
+check_rejects "nonregular_generic_recursion_projection" "test/negative/nonregular_generic_recursion_projection.weft" 'error[E1012]: generic function `walk` instantiates its recursion with ever-growing type arguments' 1
+check_rejects "nested_projection_type_argument" "test/negative/nested_projection_type_argument.weft" 'error[E0003]: an associated type of an associated type cannot be specialised yet' 2
+check_rejects "nested_projection_method_result" "test/negative/nested_projection_method_result.weft" 'error[E0003]: an associated type of an associated type cannot be specialised yet' 1
+check_rejects "nested_projection_signature" "test/negative/nested_projection_signature.weft" 'error[E0003]: an associated type of an associated type cannot be specialised yet' 1
+check_rejects "nested_projection_annotation" "test/negative/nested_projection_annotation.weft" 'error[E0003]: an associated type of an associated type cannot be specialised yet' 1
+check_rejects "trait_constraint_later_type_parameter" "test/negative/trait_constraint_later_type_parameter.weft" "error[E1001]: unknown type 'C'" 1
+check_rejects "trait_constraint_unknown_type" "test/negative/trait_constraint_unknown_type.weft" "error[E1001]: unknown type 'Brnch'" 1
 check_rejects "unknown_intrinsic_call" "test/negative/unknown_intrinsic_call.weft" "error[E1001]: unknown function '__definitely_not_an_intrinsic'"
 check_rejects "unknown_function_in_import" "test/negative/unknown_function_in_import.weft" "error[E1001]: unknown function 'some_function_that_does_not_exist'"
 check_rejects "module_plain_import_does_not_leak_value" "test/negative/module_plain_import_does_not_leak_value.weft" "error[E1001]: unknown function 'work'"
