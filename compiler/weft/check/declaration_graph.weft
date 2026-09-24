@@ -6,7 +6,11 @@
 --
 -- Import cycles are rejected, so every strongly connected component lies within
 -- one module. The graph is therefore built over the declarations of the module
--- being checked.
+-- being checked. A foreign generic declaration contributes only a summary of how
+-- it holds each of its parameters and whether it hides a closure environment:
+-- nothing it declares concretely can lead back into an importing module.
+--
+-- Two properties are checked over the graph.
 --
 -- Regularity. A recursive instantiation passes its own parameters or closed
 -- types, never a type built from its parameters: `Chain<T>` may recur at
@@ -14,9 +18,14 @@
 -- specialises every instantiation, and layouts, cleanup plans and ownership
 -- facts must close over finitely many of them, so a growing recursion can never
 -- be compiled.
+--
+-- Ownership (kernel §10.3). An edge is cycle-forming when it passes through a
+-- mutably updatable container. A component with a cycle-forming edge could
+-- build a strong cycle that reference counting never reclaims, and a closure
+-- environment held by a mutable container could capture the container.
 
 use compiler/diagnostic/location.{diagnostic_location_from_offsets}
-use compiler/storage.{nlist_get, nlist_len}
+use compiler/storage.{nlist_get, nlist_len, node_f3}
 use compiler/types/algebra.{
   ty_f1,
   ty_f2,
@@ -42,7 +51,11 @@ use compiler/weft/check/table.{
   ttable_entry_type_declaration,
   ttable_entry_variant_payloads,
   ttable_lookup_decl_fact,
-  ttable_mark_nonregular_declaration
+  ttable_mark_nonregular_declaration,
+  ttable_entry_tparams,
+  declaration_is_persistent_collection,
+  declaration_is_runtime_token,
+  declaration_is_vector_handle
 }
 use runtime/string.{runtime_str_from_bytes_copy}
 use stdlib/diagnostic/registry
@@ -368,6 +381,523 @@ fn check_declaration_regularity(
   errors
 }
 
+-- How a declaration holds a value: not at all, through strong managed edges
+-- whose target is fixed at construction, or through a mutably updatable
+-- container that can install a later back-edge.
+type OwnershipHold { OwnershipNotHeld, OwnershipStrong, OwnershipCycleForming }
+
+fn ownership_hold_join(left: OwnershipHold, right: OwnershipHold) -> OwnershipHold {
+  match left {
+    OwnershipCycleForming -> OwnershipCycleForming
+    OwnershipStrong -> match right {
+      OwnershipCycleForming -> OwnershipCycleForming
+      _ -> OwnershipStrong
+    }
+    OwnershipNotHeld -> right
+  }
+}
+
+-- A value held at `inner` inside a value that is itself held at `outer`.
+fn ownership_hold_through(outer: OwnershipHold, inner: OwnershipHold) -> OwnershipHold {
+  match inner {
+    OwnershipNotHeld -> OwnershipNotHeld
+    OwnershipStrong -> outer
+    OwnershipCycleForming -> OwnershipCycleForming
+  }
+}
+
+fn ownership_hold_eq(left: OwnershipHold, right: OwnershipHold) -> bool {
+  match left {
+    OwnershipNotHeld -> match right {
+      OwnershipNotHeld -> true
+      _ -> false
+    }
+    OwnershipStrong -> match right {
+      OwnershipStrong -> true
+      _ -> false
+    }
+    OwnershipCycleForming -> match right {
+      OwnershipCycleForming -> true
+      _ -> false
+    }
+  }
+}
+
+-- Runtime storage handles keep their elements outside any declared field, so
+-- exact declaration identity fixes how they hold their arguments. Runtime
+-- tokens additionally erase a closure environment the graph cannot inspect.
+type DeclarationStorage {
+  MutableElementStorage,
+  ImmutableElementStorage,
+  ClosureTokenStorage,
+  DeclaredStorage
+}
+
+fn declaration_storage(declaration: i64) -> DeclarationStorage {
+  if declaration_is_vector_handle(declaration) { MutableElementStorage }
+  else if declaration_is_persistent_collection(declaration) { ImmutableElementStorage }
+  else if declaration_is_runtime_token(declaration) { ClosureTokenStorage }
+  else { DeclaredStorage }
+}
+
+-- One owning position reached while walking a declaration's shape.
+type OwnershipOccurrence {
+  ParameterHeld(i64, OwnershipHold),
+  DeclarationHeld(i64, OwnershipHold),
+  ClosureHeld(OwnershipHold)
+}
+
+-- How a declaration holds each of its parameters, in declaration order, and
+-- whether its shape hides a closure environment at an owning position.
+type DeclarationSummary { holds: List<OwnershipHold>, hides_closure: bool }
+
+fn declaration_summary_empty(parameter_count: i64) -> DeclarationSummary {
+  let mut holds = Nil<OwnershipHold>()
+  for index in 0..parameter_count { holds = Cons<OwnershipHold>(OwnershipNotHeld, holds) }
+  DeclarationSummary { holds: holds, hides_closure: false }
+}
+
+fn declaration_summary_eq(left: DeclarationSummary, right: DeclarationSummary) -> bool {
+  left.hides_closure == right.hides_closure and ownership_hold_list_eq(left.holds, right.holds)
+}
+
+fn ownership_hold_list_eq(left: List<OwnershipHold>, right: List<OwnershipHold>) -> bool {
+  match left {
+    Nil -> match right {
+      Nil -> true
+      Cons(other, rest) -> false
+    }
+    Cons(hold, rest) -> match right {
+      Nil -> false
+      Cons(other, other_rest) -> ownership_hold_eq(hold, other) and
+        ownership_hold_list_eq(rest, other_rest)
+    }
+  }
+}
+
+-- Record every owning position of `ty`, which is itself held at `hold`. Weak
+-- references, slices and raw pointers own nothing. A function type or
+-- continuation owns an environment the graph cannot inspect.
+fn ownership_walk(
+  tt: i64,
+  positions: Map<i64, i64>,
+  summaries: Map<i64, DeclarationSummary>,
+  ty: i64,
+  hold: OwnershipHold,
+  occurrences: borrow mut Vector<OwnershipOccurrence>
+) -> nil {
+  if ty == 0 { return nil }
+  match ty_tag(ty) {
+    3 -> {
+      ownership_walk(tt, positions, summaries, ty_f1(ty), hold, occurrences)
+      ownership_walk(tt, positions, summaries, ty_f2(ty), hold, occurrences)
+    }
+    4 -> {
+      ownership_walk(tt, positions, summaries, ty_f1(ty), hold, occurrences)
+      ownership_walk(tt, positions, summaries, ty_f2(ty), hold, occurrences)
+    }
+    5 -> ownership_walk(tt, positions, summaries, ty_f1(ty), hold, occurrences)
+    6 -> occurrences.push(ClosureHeld(hold))
+    7 -> {
+      let fields = ty_record_fields(ty)
+      if fields != 0 {
+        for index in 0..nlist_len(fields) {
+          ownership_walk(
+            tt,
+            positions,
+            summaries,
+            ty_record_field_type(nlist_get(fields, index)),
+            hold,
+            occurrences
+          )
+        }
+      } else { nil }
+    }
+    8 -> ownership_walk(tt, positions, summaries, ty_f2(ty), hold, occurrences)
+    9 -> ownership_walk_named(tt, positions, summaries, ty, hold, occurrences)
+    12 -> occurrences.push(ParameterHeld(ty_f1(ty), hold))
+    14 -> occurrences.push(ClosureHeld(hold))
+    17 -> ownership_walk(tt, positions, summaries, ty_f1(ty), hold, occurrences)
+    18 -> ownership_walk(tt, positions, summaries, ty_f1(ty), hold, occurrences)
+    19 -> ownership_walk(tt, positions, summaries, ty_f1(ty), hold, occurrences)
+    22 -> ownership_walk(tt, positions, summaries, ty_f1(ty), hold, occurrences)
+    29 -> ownership_walk(tt, positions, summaries, ty_f1(ty), hold, occurrences)
+    _ -> nil
+  }
+}
+
+fn ownership_walk_named(
+  tt: i64,
+  positions: Map<i64, i64>,
+  summaries: Map<i64, DeclarationSummary>,
+  ty: i64,
+  hold: OwnershipHold,
+  occurrences: borrow mut Vector<OwnershipOccurrence>
+) -> nil {
+  if ty_is_rc(ty) {
+    return ownership_walk(tt, positions, summaries, ty_rc_inner(ty), hold, occurrences)
+  }
+  let declaration = ty_named_declaration(ty)
+  let arguments = ty_f3(ty)
+  match declaration_storage(declaration) {
+    MutableElementStorage -> ownership_walk_arguments(
+      tt,
+      positions,
+      summaries,
+      arguments,
+      OwnershipCycleForming,
+      occurrences
+    )
+    ImmutableElementStorage ->
+      ownership_walk_arguments(tt, positions, summaries, arguments, hold, occurrences)
+    ClosureTokenStorage -> {
+      occurrences.push(ClosureHeld(hold))
+      ownership_walk_arguments(tt, positions, summaries, arguments, hold, occurrences)
+    }
+    DeclaredStorage -> {
+      let entry = if declaration == 0 { 0 } else { ttable_lookup_decl_fact(tt, declaration) }
+      if entry == 0 { return nil }
+      let index = ttable_entry_index(tt, entry)
+      match positions.get(index) {
+        Some(position) -> occurrences.push(DeclarationHeld(position, hold))
+        None -> nil
+      }
+      match summaries.get(index) {
+        Some(summary) -> {
+          if summary.hides_closure { occurrences.push(ClosureHeld(hold)) } else { nil }
+          ownership_walk_held_arguments(
+            tt,
+            positions,
+            summaries,
+            arguments,
+            0,
+            summary.holds,
+            hold,
+            occurrences
+          )
+        }
+        None -> nil
+      }
+    }
+  }
+}
+
+fn ownership_walk_arguments(
+  tt: i64,
+  positions: Map<i64, i64>,
+  summaries: Map<i64, DeclarationSummary>,
+  arguments: i64,
+  hold: OwnershipHold,
+  occurrences: borrow mut Vector<OwnershipOccurrence>
+) -> nil {
+  if arguments != 0 {
+    for index in 0..nlist_len(arguments) {
+      ownership_walk(tt, positions, summaries, nlist_get(arguments, index), hold, occurrences)
+    }
+  } else { nil }
+}
+
+-- Walk each argument at the hold its declaration gives the matching parameter.
+fn ownership_walk_held_arguments(
+  tt: i64,
+  positions: Map<i64, i64>,
+  summaries: Map<i64, DeclarationSummary>,
+  arguments: i64,
+  index: i64,
+  holds: List<OwnershipHold>,
+  hold: OwnershipHold,
+  occurrences: borrow mut Vector<OwnershipOccurrence>
+) -> nil {
+  match holds {
+    Nil -> nil
+    Cons(parameter_hold, rest) -> {
+      if arguments != 0 and index < nlist_len(arguments) {
+        match ownership_hold_through(hold, parameter_hold) {
+          OwnershipNotHeld -> nil
+          through -> ownership_walk(
+            tt,
+            positions,
+            summaries,
+            nlist_get(arguments, index),
+            through,
+            occurrences
+          )
+        }
+        ownership_walk_held_arguments(
+          tt,
+          positions,
+          summaries,
+          arguments,
+          index + 1,
+          rest,
+          hold,
+          occurrences
+        )
+      } else { nil }
+    }
+  }
+}
+
+fn declaration_occurrences(
+  tt: i64,
+  positions: Map<i64, i64>,
+  summaries: Map<i64, DeclarationSummary>,
+  entry: i64
+) -> owned Vector<OwnershipOccurrence> {
+  let mut occurrences = vector.new<OwnershipOccurrence>()
+  let mut shape = declaration_shape(entry)
+  let mut done = false
+  while not done {
+    match shape {
+      Nil -> { done = true }
+      Cons(ty, rest) -> {
+        ownership_walk(tt, positions, summaries, ty, OwnershipStrong, occurrences)
+        shape = rest
+      }
+    }
+  }
+  occurrences
+}
+
+fn declaration_summary(
+  tt: i64,
+  positions: Map<i64, i64>,
+  summaries: Map<i64, DeclarationSummary>,
+  entry: i64
+) -> DeclarationSummary {
+  let occurrences = declaration_occurrences(tt, positions, summaries, entry)
+  let mut hides_closure = false
+  for index in 0..vector_len<OwnershipOccurrence>(occurrences) {
+    match vector_get_in_bounds<OwnershipOccurrence>(occurrences, index) {
+      ClosureHeld(hold) -> { hides_closure = true }
+      _ -> nil
+    }
+  }
+  let parameters = ttable_entry_tparams(entry)
+  let count = if parameters == 0 { 0 } else { nlist_len(parameters) }
+  let mut holds = Nil<OwnershipHold>()
+  for offset in 0..count {
+    let variable = node_f3(nlist_get(parameters, count - 1 - offset))
+    let mut parameter_hold = OwnershipNotHeld
+    for index in 0..vector_len<OwnershipOccurrence>(occurrences) {
+      match vector_get_in_bounds<OwnershipOccurrence>(occurrences, index) {
+        ParameterHeld(held, hold) -> if held == variable {
+          parameter_hold = ownership_hold_join(parameter_hold, hold)
+        } else { nil }
+        _ -> nil
+      }
+    }
+    holds = Cons<OwnershipHold>(parameter_hold, holds)
+  }
+  DeclarationSummary { holds: holds, hides_closure: hides_closure }
+}
+
+-- Collect the table entries of every declared-storage type named at an owning
+-- position of `ty`, including inside the arguments of any named type.
+fn declaration_graph_named_entries(tt: i64, ty: i64, out: borrow mut Vector<i64>) -> nil {
+  if ty == 0 { return nil }
+  match ty_tag(ty) {
+    3 -> {
+      declaration_graph_named_entries(tt, ty_f1(ty), out)
+      declaration_graph_named_entries(tt, ty_f2(ty), out)
+    }
+    4 -> {
+      declaration_graph_named_entries(tt, ty_f1(ty), out)
+      declaration_graph_named_entries(tt, ty_f2(ty), out)
+    }
+    5 -> declaration_graph_named_entries(tt, ty_f1(ty), out)
+    7 -> {
+      let fields = ty_record_fields(ty)
+      if fields != 0 {
+        for index in 0..nlist_len(fields) {
+          declaration_graph_named_entries(tt, ty_record_field_type(nlist_get(fields, index)), out)
+        }
+      } else { nil }
+    }
+    8 -> declaration_graph_named_entries(tt, ty_f2(ty), out)
+    9 -> {
+      if ty_is_rc(ty) { declaration_graph_named_entries(tt, ty_rc_inner(ty), out) }
+      else {
+        let declaration = ty_named_declaration(ty)
+        match declaration_storage(declaration) {
+          DeclaredStorage -> {
+            let entry = if declaration == 0 { 0 } else {
+              ttable_lookup_decl_fact(tt, declaration)
+            }
+            if entry != 0 { out.push(ttable_entry_index(tt, entry)) } else { nil }
+          }
+          _ -> nil
+        }
+        let arguments = ty_f3(ty)
+        if arguments != 0 {
+          for index in 0..nlist_len(arguments) {
+            declaration_graph_named_entries(tt, nlist_get(arguments, index), out)
+          }
+        } else { nil }
+      }
+    }
+    17 -> declaration_graph_named_entries(tt, ty_f1(ty), out)
+    18 -> declaration_graph_named_entries(tt, ty_f1(ty), out)
+    19 -> declaration_graph_named_entries(tt, ty_f1(ty), out)
+    22 -> declaration_graph_named_entries(tt, ty_f1(ty), out)
+    29 -> declaration_graph_named_entries(tt, ty_f1(ty), out)
+    _ -> nil
+  }
+}
+
+-- Every declared-storage entry reachable from the module's declarations
+-- through owning positions, beginning with the declarations themselves.
+fn declaration_graph_reachable(tt: i64, locals: borrow Vector<i64>) -> owned Vector<i64> {
+  let mut reachable = vector.new<i64>()
+  let mut seen = map.new<i64, bool>()
+  for position in 0..vector_len<i64>(locals) {
+    let index = vector_get_in_bounds<i64>(locals, position)
+    seen = seen.insert(index, true)
+    reachable.push(index)
+  }
+  let mut cursor = 0
+  while cursor < vector_len<i64>(reachable) {
+    let mut named = vector.new<i64>()
+    let mut shape = declaration_shape(
+      ttable_entry_at(tt, vector_get_in_bounds<i64>(reachable, cursor))
+    )
+    let mut done = false
+    while not done {
+      match shape {
+        Nil -> { done = true }
+        Cons(ty, rest) -> {
+          declaration_graph_named_entries(tt, ty, named)
+          shape = rest
+        }
+      }
+    }
+    for offset in 0..vector_len<i64>(named) {
+      let index = vector_get_in_bounds<i64>(named, offset)
+      if not seen.contains_key(index) {
+        seen = seen.insert(index, true)
+        reachable.push(index)
+      } else { nil }
+    }
+    cursor = cursor + 1
+  }
+  reachable
+}
+
+-- The least fixed point of every reachable declaration's summary. Holds and
+-- closure facts only grow, so iteration stops after a pass with no change.
+fn declaration_graph_summaries(
+  tt: i64,
+  positions: Map<i64, i64>,
+  reachable: borrow Vector<i64>
+) -> Map<i64, DeclarationSummary> {
+  let mut summaries = map.new<i64, DeclarationSummary>()
+  let count = vector_len<i64>(reachable)
+  for offset in 0..count {
+    let index = vector_get_in_bounds<i64>(reachable, offset)
+    let parameters = ttable_entry_tparams(ttable_entry_at(tt, index))
+    summaries = summaries.insert(
+      index,
+      declaration_summary_empty(if parameters == 0 { 0 } else { nlist_len(parameters) })
+    )
+  }
+  let mut changed = true
+  while changed {
+    changed = false
+    -- Discovery order places dependencies late; visit them first.
+    for offset in 0..count {
+      let index = vector_get_in_bounds<i64>(reachable, count - 1 - offset)
+      let next = declaration_summary(tt, positions, summaries, ttable_entry_at(tt, index))
+      match summaries.get(index) {
+        Some(previous) -> if not declaration_summary_eq(previous, next) {
+          summaries = summaries.insert(index, next)
+          changed = true
+        } else { nil }
+        None -> nil
+      }
+    }
+  }
+  summaries
+}
+
+fn check_declaration_ownership(
+  tt: i64,
+  locals: borrow Vector<i64>,
+  positions: Map<i64, i64>,
+  summaries: Map<i64, DeclarationSummary>
+) -[Diagnose]> i64 {
+  let count = vector_len<i64>(locals)
+  let mut adjacency = vector.new<List<i64>>()
+  let mut forming = vector.new<List<i64>>()
+  let mut closures = vector.new<bool>()
+  for position in 0..count {
+    let entry = ttable_entry_at(tt, vector_get_in_bounds<i64>(locals, position))
+    let occurrences = declaration_occurrences(tt, positions, summaries, entry)
+    let mut targets = Nil<i64>()
+    let mut cycle_targets = Nil<i64>()
+    let mut closure = false
+    for index in 0..vector_len<OwnershipOccurrence>(occurrences) {
+      match vector_get_in_bounds<OwnershipOccurrence>(occurrences, index) {
+        DeclarationHeld(target, hold) -> {
+          targets = Cons<i64>(target, targets)
+          match hold {
+            OwnershipCycleForming -> { cycle_targets = Cons<i64>(target, cycle_targets) }
+            _ -> nil
+          }
+        }
+        ClosureHeld(hold) -> match hold {
+          OwnershipCycleForming -> { closure = true }
+          _ -> nil
+        }
+        ParameterHeld(variable, hold) -> nil
+      }
+    }
+    adjacency.push(targets)
+    forming.push(cycle_targets)
+    closures.push(closure)
+  }
+  let mut errors = 0
+  for position in 0..count {
+    let entry = ttable_entry_at(tt, vector_get_in_bounds<i64>(locals, position))
+    let name = declaration_graph_name(entry)
+    if vector_get_in_bounds<bool>(closures, position) {
+      errors = errors + declaration_graph_report(
+        DiagnosticClassOwnership,
+        registry.ownership_closure_cycle(),
+        i"type `{name}` keeps a closure environment in a mutable container",
+        entry,
+        DiagnosticRelatedLocationNil,
+        "closure_in_mutable_container"
+      )
+    } else { nil }
+    let mut candidates = vector_get_in_bounds<List<i64>>(forming, position)
+    let mut done = false
+    while not done {
+      match candidates {
+        Nil -> { done = true }
+        Cons(target, rest) -> {
+          if declaration_graph_reaches(adjacency, target, position) {
+            let returning = ttable_entry_at(tt, vector_get_in_bounds<i64>(locals, target))
+            errors = errors + declaration_graph_report(
+              DiagnosticClassOwnership,
+              registry.ownership_cycle(),
+              i"type `{name}` can own itself through a mutable container",
+              entry,
+              declaration_graph_related(
+                "the ownership cycle returns through this type",
+                returning,
+                entry
+              ),
+              "mutable_container_cycle"
+            )
+            done = true
+          } else { candidates = rest }
+        }
+      }
+    }
+  }
+  errors
+}
+
 -- The module's declarations as exact table entries, in table order, and each
 -- entry's position among them.
 fn declaration_graph_locals(tt: i64, user_src: i64) -> (owned Vector<i64>, Map<i64, i64>) {
@@ -393,7 +923,10 @@ fn declaration_graph_locals(tt: i64, user_src: i64) -> (owned Vector<i64>, Map<i
 -- every module when `user_src` is zero.
 pub(package) fn check_declaration_graph(tt: i64, user_src: i64) -[Diagnose]> i64 {
   let (locals, positions) = declaration_graph_locals(tt, user_src)
-  if vector_len<i64>(locals) == 0 { 0 } else {
-    check_declaration_regularity(tt, locals, positions)
-  }
+  if vector_len<i64>(locals) == 0 { return 0 }
+  let regularity = check_declaration_regularity(tt, locals, positions)
+  if regularity != 0 { return regularity }
+  let reachable = declaration_graph_reachable(tt, locals)
+  let summaries = declaration_graph_summaries(tt, positions, reachable)
+  check_declaration_ownership(tt, locals, positions, summaries)
 }
