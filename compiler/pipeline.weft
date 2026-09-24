@@ -38319,6 +38319,150 @@ type PipelineIrConsumeFrame {
   PipelineIrConsumeExit(i64)
 }
 
+fn pipeline_ir_block_find(blocks: IrBlockList, target_block: i64) -> Option<IrBlock> {
+  let mut remaining = blocks
+  while true {
+    match remaining {
+      IrBlockListNil -> return None<IrBlock>()
+      IrBlockListCons(block, rest) -> match block {
+        IrBlock(id, _, _, _) -> {
+          if id == target_block { return Some(block) }
+          remaining = rest
+        }
+      }
+    }
+  }
+  None<IrBlock>()
+}
+
+fn pipeline_ir_value_list_index_transferring(
+  values: IrValueList,
+  insts: IrInstList,
+  source: i64,
+  index: i64
+) -> i64 {
+  match values {
+    IrValueNil -> 0 - 1
+    IrValueCons(value, rest) -> if pipeline_ir_value_transfers_from(insts, value, source) == 1 {
+      index
+    } else { pipeline_ir_value_list_index_transferring(rest, insts, source, index + 1) }
+  }
+}
+
+-- Whether `value`, live on entry to `start`, is consumed or transferred on every
+-- forward path from `start` to a scope exit. A jump that passes it on continues
+-- with the receiving parameter. Unreachable blocks owe no cleanup.
+fn pipeline_ir_value_consumed_forward(
+  blocks: IrBlockList,
+  start: i64,
+  value: i64,
+  exits: PipelineLinearCleanupExit,
+  fns: i64,
+  tt: i64
+) -> bool {
+  let mut pending = Cons<(i64, i64)>((start, value), Nil<(i64, i64)>())
+  let mut seen_blocks = ir_value_list_empty()
+  let mut seen_values = ir_value_list_empty()
+  while true {
+    match pending {
+      Nil -> return true
+      Cons((block_id, carrier), rest) -> {
+        pending = rest
+        if pipeline_ir_value_pair_seen(seen_blocks, seen_values, block_id, carrier) { continue }
+        seen_blocks = ir_value_list_prepend(block_id, seen_blocks)
+        seen_values = ir_value_list_prepend(carrier, seen_values)
+        match pipeline_ir_block_find(blocks, block_id) {
+          None -> return false
+          Some(IrBlock(_, _, insts, term)) -> {
+            if pipeline_ir_inst_list_consumes_value(insts, insts, carrier, fns, tt) == 1 {
+              continue
+            }
+            if pipeline_ir_linear_cleanup_exit_applies(term, exits) {
+              if pipeline_ir_linear_exit_transfers(term, blocks, carrier) { continue }
+              return false
+            }
+            match term {
+              IrTermJump(target, args) -> {
+                let index = pipeline_ir_value_list_index_transferring(args, insts, carrier, 0)
+                let next = if index < 0 { carrier } else {
+                  match pipeline_ir_block_find(blocks, target) {
+                    Some(IrBlock(_, params, _, _)) -> pipeline_ir_value_list_get_or(
+                      params,
+                      index,
+                      0 - 1
+                    )
+                    None -> 0 - 1
+                  }
+                }
+                if next < 0 { return false }
+                pending = Cons<(i64, i64)>((target, next), pending)
+              }
+              IrTermBranch(_, then_block, else_block) -> {
+                pending = Cons<(i64, i64)>(
+                  (then_block, carrier),
+                  Cons<(i64, i64)>((else_block, carrier), pending)
+                )
+              }
+              IrTermUnreachable -> continue
+              IrTermNone -> continue
+              _ -> return false
+            }
+          }
+        }
+      }
+    }
+  }
+  true
+}
+
+fn pipeline_ir_value_pair_seen(
+  blocks: IrValueList,
+  values: IrValueList,
+  block_id: i64,
+  carrier: i64
+) -> bool {
+  match (blocks, values) {
+    (IrValueCons(block, block_rest), IrValueCons(value, value_rest)) -> if block == block_id and
+      value == carrier { true } else {
+        pipeline_ir_value_pair_seen(block_rest, value_rest, block_id, carrier)
+      }
+    _ -> false
+  }
+}
+
+-- A jump that passes `source`, or a value built from it in this block, into a
+-- successor parameter moves ownership only when that parameter is itself
+-- consumed or transferred on every path onward, including by the cleanup of a
+-- binding that holds it. Otherwise the source binding keeps its obligation.
+fn pipeline_ir_block_moves_value_into_successor(
+  blocks: IrBlockList,
+  target_block: i64,
+  source: i64,
+  exits: PipelineLinearCleanupExit,
+  fns: i64,
+  tt: i64
+) -> bool {
+  match pipeline_ir_block_find(blocks, target_block) {
+    None -> false
+    Some(IrBlock(_, _, insts, term)) -> match term {
+      IrTermJump(target, args) -> {
+        let index = pipeline_ir_value_list_index_transferring(args, insts, source, 0)
+        if index < 0 { false } else {
+          match pipeline_ir_block_find(blocks, target) {
+            Some(IrBlock(_, params, _, _)) -> {
+              let parameter = pipeline_ir_value_list_get_or(params, index, 0 - 1)
+              parameter >= 0 and
+                pipeline_ir_value_consumed_forward(blocks, target, parameter, exits, fns, tt)
+            }
+            None -> false
+          }
+        }
+      }
+      _ -> false
+    }
+  }
+}
+
 fn pipeline_ir_block_insts_for_consumption(
   blocks: IrBlockList,
   target_block: i64
@@ -38341,6 +38485,7 @@ pub(package) fn pipeline_ir_block_paths_consume_value(
   current: IrBlockList,
   target_block: i64,
   source: i64,
+  exits: PipelineLinearCleanupExit,
   fns: i64,
   tt: i64,
   visited: IrValueList
@@ -38370,7 +38515,7 @@ pub(package) fn pipeline_ir_block_paths_consume_value(
         match pipeline_ir_block_insts_for_consumption(search, id) {
           None -> return 0
           Some(insts) -> if pipeline_ir_inst_list_consumes_value(insts, insts, source, fns, tt) ==
-            1 {
+            1 or pipeline_ir_block_moves_value_into_successor(search, id, source, exits, fns, tt) {
               proved = ir_value_list_prepend(id, proved)
             } else {
               let mut remaining = blocks
@@ -38469,6 +38614,7 @@ pub(package) fn pipeline_ir_block_linear_cleanup_applies_in(
           blocks,
           id,
           bind_value,
+          exits,
           fns,
           tt,
           ir_value_list_empty()
