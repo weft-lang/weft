@@ -75,6 +75,11 @@ exec 7>&2
 
 WEFT=${WEFT:-./weft}
 WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-120}
+# Tool shards drive whole-compiler runs (product generators over complete
+# module graphs, about 40 s alone) while the gate saturates every core. Their
+# stop is a runaway guard sized for that contention, independent of the
+# runtime roots' per-root compile stop.
+WEFT_TOOL_COMPILE_TIMEOUT=${WEFT_TOOL_COMPILE_TIMEOUT:-360}
 WEFT_TEST_RUN_TIMEOUT=${WEFT_TEST_RUN_TIMEOUT:-120}
 WEFT_TEST_RUNAWAY_RSS_LIMIT_KB=${WEFT_TEST_RUNAWAY_RSS_LIMIT_KB:-28000000}
 WEFT_TEST_COMPILE_RSS_LIMIT_KB=${WEFT_TEST_COMPILE_RSS_LIMIT_KB:-$WEFT_TEST_RUNAWAY_RSS_LIMIT_KB}
@@ -217,7 +222,7 @@ run_guarded() {
 }
 
 run_weft_compile_guarded() {
-  run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$@"
+  run_guarded "$WEFT_TOOL_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$@"
 }
 
 run_binary_guarded() {
@@ -231,7 +236,7 @@ run_binary_guarded() {
 # through DomainName, and even the shutdown generator's ~0.8 GiB left almost no
 # headroom, so whether the gate passed depended on which poll caught the peak.
 run_generator_guarded() {
-  run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$@"
+  run_guarded "$WEFT_TOOL_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$@"
 }
 
 # Apple's llvm-objdump walks executable ELF program segments even when a
