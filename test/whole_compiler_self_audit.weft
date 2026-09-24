@@ -1,0 +1,245 @@
+-- Run budget: 300 s
+-- test/whole_compiler_self_audit.weft -- the compiler checks itself.
+--
+-- One pass of the compiler's own source through checking, lowering, the full
+-- optimiser and audited native emission feeds three permanent tripwires: the
+-- IR verifier, the emission residency audit and the allocation read checker.
+-- They share the audited module instead of recomputing the whole pipeline
+-- three times. The run phase takes about 80 s alone, so this root declares a
+-- runaway stop of 300 s; every other root keeps the host stop.
+
+use module_fixtures/compiler_probe.{probe_check_sdk_source_with_origin}
+use compiler/backend/aarch64/codegen.{*}
+use compiler/backend/aarch64/encode.{*}
+use compiler/storage.{*}
+use compiler/weft/check/body.{*}
+use compiler/weft/check/table.{*}
+use compiler/backend/macho.{*}
+use compiler/backend/object.{*}
+use compiler/ir/data.{*}
+use compiler/pipeline.{*}
+use runtime/alloc.{*}
+use runtime/buffer.{*}
+use runtime/memory.{*}
+use stdlib/string.{int_to_str, str_concat}
+
+fn ck_positive(count: i64) -> i64 {
+  if count > 0 { 1 } else { 0 }
+}
+
+fn ck_failure_coordinates(native: NativeModule) -> str {
+  let mut detail = str_concat(
+    "violations=",
+    int_to_str(pipeline_native_ck_violation_count(native))
+  )
+  detail = str_concat(
+    detail,
+    str_concat(" fn=", int_to_str(pipeline_native_ck_first_fn_hash(native)))
+  )
+  detail = str_concat(
+    detail,
+    str_concat(" off=", int_to_str(pipeline_native_ck_first_offset(native)))
+  )
+  detail = str_concat(
+    detail,
+    str_concat(" loc=", int_to_str(pipeline_native_ck_first_loc(native)))
+  )
+  detail = str_concat(
+    detail,
+    str_concat(" expected=", int_to_str(pipeline_native_ck_first_expected(native)))
+  )
+  str_concat(detail, str_concat(" found=", int_to_str(pipeline_native_ck_first_found(native))))
+}
+
+fn ck_path_pair(path: str) -> i64 {
+  let pair = alloc_words(2)
+  mem_store64_at(pair, 0, __str_ptr(path))
+  mem_store64_at(pair, 8, __str_len(path))
+  pair
+}
+
+fn audit_positive(count: i64) -> i64 {
+  if count > 0 { 1 } else { 0 }
+}
+
+fn audit_assert_clean(native: NativeModule) -[Test]> i64 {
+  Test.assert_eq(pipeline_native_residency_audit_violation_count(native), 0)
+  Test.assert_eq(pipeline_native_residency_audit_cs_violation_count(native), 0)
+  Test.assert_eq(pipeline_native_residency_audit_skew_count(native), 0)
+  -- On failure these carry the diagnosis: function hash, byte offset,
+  -- the clobbering word, and the tenant register.
+  Test.assert_eq(pipeline_native_residency_audit_first_fn_hash(native), 0)
+  Test.assert_eq(pipeline_native_residency_audit_first_offset(native), 0)
+  Test.assert_eq(pipeline_native_residency_audit_first_word(native), 0)
+  Test.assert_eq(pipeline_native_residency_audit_first_phys(native), 0)
+  0
+}
+
+test "whole_compiler_pipeline_verifies_audits_and_checks_clean" {
+  -- The compiler's own emission, replayed, at ZERO violations: this is
+  -- the live checker gate (register-allocation audit). Every read the emission records must
+  -- observe the value the allocator claims. Any change that moves the
+  -- count off zero is a regression to classify at ground truth (IR +
+  -- event + code dump), never a number to bump.
+  let file = read_file(ck_path_pair("compiler/main.weft"))
+  let csrc = mem_load64_at(file, 0)
+  let clen = mem_load64_at(file, 8)
+  let typed = probe_check_sdk_source_with_origin(csrc, clen, 1, 0)
+  let ir = pipeline_lower_ir(typed)
+  let optimised = pipeline_optimise_typed_ir(typed, ir)
+  -- IR verifier: every function of the compiler itself, through lowering and
+  -- the full optimiser, verifies structurally.
+  Test.assert_eq(pipeline_ir_verify_module(optimised), 0)
+  let native = pipeline_lower_native_module_with_audit(typed, optimised, 1)
+  -- Emission audit: the compiler's own emitted code, with every pool tenancy
+  -- checked at the byte level. Any pass or emission change that writes a
+  -- residency register across a tenant window fails here.
+  audit_assert_clean(native)
+  Test.assert_eq(audit_positive(pipeline_native_residency_audit_checked_count(native) - 100), 1)
+  Test.assert_eq(audit_positive(pipeline_native_ir_param_resident_count(native)), 1)
+  -- Allocation checker: every read the emission records must observe the
+  -- value the allocator claims.
+  -- Floor sits below the current v2 deterministic count (312,030) but
+  -- ABOVE the v1 linear replay's 186,677: a regression that silently
+  -- reverts the CFG-worklist join coverage fails this gate.
+  -- Keep the first violation coordinates observable when the zero gate trips;
+  -- these remain zero on a clean corpus and turn a failure into a directly
+  -- classifiable function/event/code location.
+  Test.assert_str_eq(
+    ck_failure_coordinates(native),
+    "violations=0 fn=0 off=0 loc=0 expected=0 found=0"
+  )
+  Test.assert_eq(ck_positive(pipeline_native_ck_checked_count(native) - 250000), 1)
+  -- Stage 1 pre-measurement corpus floors: liveness must have measured
+  -- the bulk of the corpus and found call sites, real pressure, and
+  -- spilled defs — zeros here mean the producer silently disengaged.
+  Test.assert_eq(ck_positive(pipeline_native_live_functions_measured(native) - 5000), 1)
+  Test.assert_eq(ck_positive(pipeline_native_call_sites_measured(native) - 10000), 1)
+  Test.assert_eq(ck_positive(pipeline_native_max_pressure(native) - 10), 1)
+  Test.assert_eq(
+    ck_positive(
+      pipeline_native_spill_load_bucket(native, 0) + pipeline_native_spill_load_bucket(native, 1) -
+        100
+    ),
+    1
+  )
+  -- Prologue-pair census canary (volatile-pool allocation): every callee-saved
+  -- register the emitted body writes must sit inside the saved pair
+  -- prefix. 32 handler-clause writes escaped before the handle-bearing
+  -- pair force; this pin at ZERO is the save-discipline gate — a
+  -- regression is caller corruption the checker cannot see.
+  Test.assert_eq(pipeline_native_pair_census_counter(native, 4), 0)
+  Test.assert_eq(pipeline_native_pair_census_counter(native, 5), 0)
+  Test.assert_eq(ck_positive(pipeline_native_pair_census_counter(native, 0) - 10000), 1)
+  -- Soft-barrier census after pool-transparency classification and the
+  -- bespoke-arm scratch rewrite: every former soft barrier is now
+  -- simple, so the only remaining soft kind is content-eq (44). The original
+  -- eleven sites remain: Eq for str, DiagnosticCode equality, eight checked
+  -- SQL/einsum comparisons, and one ordered host-field lookup. Compile-time
+  -- SQL schemas add seventeen directly attributable comparisons in
+  -- schema.weft and schema_typecheck.weft. Installing SqlSchemaIdentity as a
+  -- real TypeCheck interpretation adds a second six-site specialization of
+  -- the generic SQL checked-plan comparisons. A typed-IR function census
+  -- against the last eleven-site compiler confirmed the exact 11 + 17 + 6
+  -- split. Einsum contexts add four more: parse, einsum_context_entry,
+  -- einsum_context_entry_count, and einsum_context_resolve. The unchanged
+  -- compiler and a typed-IR function census both confirm these exact sites.
+  -- Retained source lookup adds one physical-path comparison. A typed-IR
+  -- function census confirms the previous thirty-eight sites are unchanged
+  -- and the only addition is compiler/source/owners.weft:lookup.
+  -- The safe SQL operator parser contributes five comparisons: ||, !=, <>,
+  -- <= and >=. The typed-IR function census preserves all thirty-nine prior
+  -- sites and attributes exactly these five additions to that parser.
+  -- Tool-driven grammar checking instantiates the generic SQL checked-plan
+  -- comparisons at ToolTypeIdentity in the SQL tooling module, which the
+  -- compiler does not import. (Placing the conformance in the root module
+  -- added exactly six sites here.)
+  -- Running grammar tools through their driver products removed every
+  -- guest checker from the compiler's import closure: the eight checked
+  -- SQL/einsum comparisons, the ordered host-field lookup, the seventeen
+  -- schema comparisons, the six SqlSchemaIdentity specializations, the four
+  -- einsum context sites and the five safe SQL operator comparisons are
+  -- gone (41), leaving stdlib Eq, DiagnosticCode equality and the owners
+  -- lookup. The protocol codecs the compiler now carries as the driver's
+  -- peer add ninety-five tag comparisons, all decoders of wire vocabulary:
+  -- thirty-four in stdlib/grammar/tooling/protocol.weft (decode_check 6,
+  -- decode_query_error 6, same_grammar 4, decode_query 4, decode_issue 4,
+  -- decode_parse 3, decode_context 3, decode_context_kind 2, decode_request
+  -- 1, decode_response 1), thirty-three in stdlib/semantic_type/json.weft
+  -- (decode_type 23, decode_effect_set 4, and one each in decode_type_items,
+  -- decode_record_fields, decode_record_field, decode_named,
+  -- decode_effect_atoms and decode_effect_atom) and twenty-eight in
+  -- stdlib/diagnostic/json.weft (decode_class 10, decode_field 9,
+  -- decode_source 3, decode_severity 3, decode_applicability 3). A
+  -- typed-IR census of the current compiler attributed exactly those
+  -- ninety-eight sites.
+  -- Staging verification, which the conformance module now carries for the
+  -- compiler as the sink directory's verifier, adds three comparisons in
+  -- stdlib/grammar/tooling/staging.weft: the artifact-name test in
+  -- entry_is_artifact and its inlined copy in extra_entry, and the reported
+  -- digest comparison in verify_content. A typed-IR census attributed
+  -- exactly those three additions and kept every prior site.
+  -- The protocol's stage operation adds twelve more wire-vocabulary
+  -- decoders in stdlib/grammar/tooling/protocol.weft: decode_capability 2,
+  -- decode_operation 2, decode_stage 3, decode_stage_refusal 4 and
+  -- decode_stage_unsupported 1. A typed-IR census attributes exactly these
+  -- twelve additions and keeps every prior site.
+  -- Cached staging adds the artifact digest comparison in
+  -- compiler/grammar/tool.weft:stage_cache_artifact. Rendering the additive
+  -- host-transcript fact contributes two reachable inlined comparisons in
+  -- compiler/backend/link.weft:native_link_artifact_staging_outcome_json.
+  -- The typed-IR census also sees the now-unreferenced original helper in
+  -- native_link_optional_text_json, which reachability removes before native
+  -- emission; the emitting census therefore moves by exactly three.
+  -- Typed registration scopes add two comparisons: declaration-name lookup in
+  -- compiler/weft/check/registration/scope.weft:registration_scope_find and
+  -- the now-reachable package qualifier in
+  -- compiler/project/identity/equality.weft:module_identity_eq. A typed-IR
+  -- census keeps every prior site and attributes exactly these two additions.
+  -- Publishing the complete typed registration scope adds eight comparisons,
+  -- all in compiler/weft/check/registration/scope.weft: declaration selection
+  -- in registration_module_selected and registration_name_belongs_to, mutable
+  -- builder lookup in registration_builder_find_module, two build_module
+  -- sites, immutable indexing in persistent_module_index and module_index, and
+  -- target_eq. A differential typed-IR census against the 118-site compiler
+  -- attributes exactly these additions and removes none.
+  -- Joining an audited package export back to its retained declaration adds
+  -- exactly two comparisons in compiler/package/exports.weft:
+  -- package_export_matches_declaration compares the module path and the
+  -- declaration spelling. This replaces the raw-table export adapter; no
+  -- other emitting function changed.
+  -- Threading body checking through preselected RegistrationStorage entries
+  -- removes nine emitted comparisons from compiler/weft/check/registration/
+  -- scope.weft: registration_scope_find, registration_module_selected,
+  -- registration_name_belongs_to, registration_builder_find_module, two
+  -- build_module sites, persistent_module_index, module_index and target_eq.
+  -- A differential typed-IR census against the 128-site compiler attributes
+  -- exactly these removals and adds no site.
+  -- Concrete record legalization calls declaration_identity_eq at the
+  -- checked_specialization_record_layout_fields_from and
+  -- checked_specialization_record_projection. Each reachable call adds one
+  -- module-path content comparison; the existing identity comparisons stay
+  -- unchanged, taking the emitting census from 119 to 121.
+  -- All one hundred and twenty-one use the same kind-44 clobber mask
+  -- (261120); managed work keeps every site except stdlib Eq and protocol
+  -- same_grammar (four identity string comparisons and nothing else) out of
+  -- the soft-only function census.
+  -- Movement in these exact pins requires classifying the emitting functions
+  -- and their masks; the specimen below independently keeps the census
+  -- machinery proven live.
+  Test.assert_eq(pipeline_native_soft_barrier_counter(native, 0), 121)
+  Test.assert_eq(ck_positive(pipeline_native_soft_barrier_counter(native, 1) - 40000), 1)
+  Test.assert_eq(pipeline_native_soft_barrier_counter(native, 2), 2)
+  -- Function-parameter pool residency floors: thousands of
+  -- parameters live in caller-saved seats corpus-wide (whole-window +
+  -- call-final classes). Zeros mean the admission silently disengaged.
+  Test.assert_eq(ck_positive(pipeline_native_fn_param_resident_counter(native, 0) - 1000), 1)
+  Test.assert_eq(ck_positive(pipeline_native_fn_param_resident_counter(native, 1) - 1000), 1)
+  -- Cross-block pool residency floors: barrier-free
+  -- cross-block windows (rounded over enclosing loops) and their
+  -- call-final variant live in caller-saved seats corpus-wide
+  -- (1,864 / 631 at landing). Zeros mean the admission silently
+  -- disengaged.
+  Test.assert_eq(ck_positive(pipeline_native_crossblock_pool_counter(native, 0) - 1000), 1)
+  Test.assert_eq(ck_positive(pipeline_native_crossblock_pool_counter(native, 1) - 300), 1)
+}
