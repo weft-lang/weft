@@ -68,6 +68,10 @@ case "$WEFT_TOOL_SHARD" in
     ;;
 esac
 tool_shard_started=$(date +%s)
+# Guarded commands redirect their own streams, so a guard stop is reported on
+# the shard's original stderr. Otherwise a timeout under `set -e` ends the
+# shard without saying which command was stopped.
+exec 7>&2
 
 WEFT=${WEFT:-./weft}
 WEFT_TEST_COMPILE_TIMEOUT=${WEFT_TEST_COMPILE_TIMEOUT:-120}
@@ -164,7 +168,7 @@ run_guarded() {
   local rss_limit_kb="$2"
   shift 2
 
-  "$@" <&0 &
+  "$@" <&0 7>&- &
   local pid=$!
   local start
   start=$(now_s)
@@ -184,6 +188,7 @@ run_guarded() {
       sleep 1
       kill -9 "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
+      echo "  ✗ guarded command stopped above ${rss_limit_kb} KB RSS: $*" >&7
       return 125
     fi
 
@@ -194,6 +199,7 @@ run_guarded() {
       sleep 1
       kill -9 "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
+      echo "  ✗ guarded command stopped after ${timeout_s}s: $*" >&7
       return 124
     fi
 
