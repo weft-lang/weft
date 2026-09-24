@@ -5,7 +5,12 @@ set -e
 
 default_test_jobs() {
   local detected
-  detected=$(sysctl -n hw.ncpu 2>/dev/null || true)
+  # Size from full-speed performance cores on heterogeneous hosts, matching
+  # the repository gate.
+  detected=$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || true)
+  if ! [[ "$detected" =~ ^[0-9]+$ ]] || [ "$detected" -lt 1 ]; then
+    detected=$(sysctl -n hw.ncpu 2>/dev/null || true)
+  fi
   if ! [[ "$detected" =~ ^[0-9]+$ ]] || [ "$detected" -lt 1 ]; then
     detected=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
   fi

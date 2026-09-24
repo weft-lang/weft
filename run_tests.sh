@@ -6,7 +6,15 @@ set -e
 
 default_test_jobs() {
   local detected
-  detected=$(sysctl -n hw.ncpu 2>/dev/null || true)
+  # Heterogeneous hosts include efficiency cores in hw.ncpu. Every gate worker
+  # is CPU-bound, and a compiler-heavy root placed on an efficiency core runs at
+  # roughly half speed without adding throughput, so it can cross a runaway
+  # timeout that its real cost never approaches. Size from the full-speed
+  # performance level whenever the host reports one.
+  detected=$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || true)
+  if ! [[ "$detected" =~ ^[0-9]+$ ]] || [ "$detected" -lt 1 ]; then
+    detected=$(sysctl -n hw.ncpu 2>/dev/null || true)
+  fi
   if ! [[ "$detected" =~ ^[0-9]+$ ]] || [ "$detected" -lt 1 ]; then
     detected=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
   fi
@@ -362,13 +370,24 @@ tool_shards_finished() {
   return 0
 }
 
+# Concurrent workers a feedback task runs. The negative phase checks its cases
+# with the whole feedback width; every other task is one worker.
+feedback_task_weight() {
+  case "$1" in
+    negative) echo "$WEFT_FEEDBACK_JOBS" ;;
+    *) echo 1 ;;
+  esac
+}
+
 run_feedback_phases() {
   local schedule=(tool_elf_network tool_elf_io tool_tests tool_elf_system bootstrap tool_elf_core linked formatter tool_frontend tool_packages tool_core checker markdown negative signing)
   local pids=()
+  local weights=()
   local started
   local tool_finished=""
   local next=0
   local running=0
+  local weight
   local progress
   local index
   local pid
@@ -376,11 +395,16 @@ run_feedback_phases() {
   started=$(now_s)
 
   while [ "$next" -lt "${#schedule[@]}" ] || [ "$running" -gt 0 ]; do
-    while [ "$next" -lt "${#schedule[@]}" ] && [ "$running" -lt "$WEFT_FEEDBACK_JOBS" ]; do
+    # A task occupies as many pool slots as it runs concurrent workers, so the
+    # pool never oversubscribes the width reserved from the host.
+    while [ "$next" -lt "${#schedule[@]}" ]; do
+      weight=$(feedback_task_weight "${schedule[$next]}")
+      if [ "$running" -gt 0 ] && [ $((running + weight)) -gt "$WEFT_FEEDBACK_JOBS" ]; then break; fi
       run_feedback_task "${schedule[$next]}" &
       pids[$next]=$!
+      weights[$next]=$weight
       next=$((next + 1))
-      running=$((running + 1))
+      running=$((running + weight))
     done
 
     progress=0
@@ -391,7 +415,7 @@ run_feedback_phases() {
       if ! kill -0 "$pid" 2>/dev/null || [[ "$stat" == Z* ]]; then
         wait "$pid" || true
         pids[$index]=""
-        running=$((running - 1))
+        running=$((running - ${weights[$index]}))
         progress=1
       fi
     done
