@@ -322,31 +322,128 @@ pub(package) fn module_fact_pair_list_contains(pairs: i64, pair: i64) -> i64 {
   found
 }
 
+-- A module's function closure is appended to one compilation unit's function
+-- list once per import that reaches an already-loaded module. Membership in
+-- the list and each module's own imports are indexed, so an append costs the
+-- size of the closure rather than the list's length for every pair and the
+-- program's import count for every module. The list and the import facts only
+-- grow, so absorbing each one's new suffix keeps the index exact.
+--
+-- Index (ttable h+312): node(list, absorbed pairs, pair tree, imports), with
+-- imports = node(absorbed import facts, importer tree, 0, 0). Tree keys are
+-- mixed pointers; buckets hold the exact entries, rechecked on every lookup.
+-- The splitmix64 finaliser: allocation order makes raw pointers nearly
+-- monotonic, which would degrade the unbalanced trees to lists.
+fn module_closure_key(pointer: i64) -> i64 {
+  let first = (pointer bxor (pointer bshr 30)) * (0 - 4658895280553007687)
+  let second = (first bxor (first bshr 27)) * (0 - 7723592293110705685)
+  second bxor (second bshr 31)
+}
+
+fn module_closure_index(tt: i64, fns: i64) -> i64 {
+  let existing = mem_load64_at(tt + 312, 0)
+  let index = if existing != 0 and node_f1(existing) == fns and node_f2(existing) <= nlist_len(
+    fns
+  ) {
+    existing
+  } else {
+    let fresh = node_new(0, fns, 0, 0, node_new(0, 0, 0, 0, 0))
+    mem_store64_at(tt + 312, 0, fresh)
+    fresh
+  }
+  let mut absorbed = node_f2(index)
+  let mut pairs = node_f3(index)
+  while absorbed < nlist_len(fns) {
+    let pair = nlist_get(fns, absorbed)
+    pairs = module_fact_index_insert(pairs, module_closure_key(pair), pair)
+    absorbed = absorbed + 1
+  }
+  mem_store64_at(index, 16, absorbed)
+  mem_store64_at(index, 24, pairs)
+  let imports = node_f4(index)
+  let facts = module_fact_imports(tt)
+  let mut seen = node_f1(imports)
+  let mut importers = node_f2(imports)
+  while seen < nlist_len(facts) {
+    let fact = nlist_get(facts, seen)
+    importers = module_fact_index_insert(
+      importers,
+      module_closure_key(module_import_fact_importer(fact)),
+      fact
+    )
+    seen = seen + 1
+  }
+  mem_store64_at(imports, 8, seen)
+  mem_store64_at(imports, 16, importers)
+  index
+}
+
+fn module_closure_bucket_contains(bucket: i64, entry: i64) -> bool {
+  let mut found = false
+  if bucket != 0 {
+    for i in 0..nlist_len(bucket) {
+      if nlist_get(bucket, i) == entry { found = true } else { 0 }
+    }
+  } else { 0 }
+  found
+}
+
+fn module_closure_has_pair(index: i64, pair: i64) -> bool {
+  let node = module_fact_index_find_node(node_f3(index), module_closure_key(pair))
+  node != 0 and module_closure_bucket_contains(node_f2(node), pair)
+}
+
+fn module_closure_add_pair(fns: i64, index: i64, pair: i64) -> i64 {
+  nlist_add(fns, pair)
+  mem_store64_at(
+    index,
+    24,
+    module_fact_index_insert(node_f3(index), module_closure_key(pair), pair)
+  )
+  mem_store64_at(index, 16, nlist_len(fns))
+  0
+}
+
+-- The import facts whose importer is `module_entry`, in registration order.
+fn module_closure_imports_of(index: i64, module_entry: i64) -> i64 {
+  let node = module_fact_index_find_node(
+    node_f2(node_f4(index)),
+    module_closure_key(module_entry)
+  )
+  if node == 0 { 0 } else { node_f2(node) }
+}
+
 pub(package) fn module_fact_append_function_closure_from(
   tt: i64,
   fns: i64,
   module_entry: i64,
-  visited: i64
+  visited: i64,
+  index: i64
 ) -> i64 {
   if module_fact_pair_list_contains(visited, module_entry) == 1 { fns }
   else {
     nlist_add(visited, module_entry)
-    let imports = module_fact_imports(tt)
-    for i in 0..nlist_len(imports) {
-      let import_entry = nlist_get(imports, i)
-      if module_import_fact_importer(import_entry) == module_entry {
-        module_fact_append_function_closure_from(
-          tt,
-          fns,
-          module_import_fact_target(import_entry),
-          visited
-        )
-      } else { 0 }
-    }
+    let imports = module_closure_imports_of(index, module_entry)
+    if imports != 0 {
+      for i in 0..nlist_len(imports) {
+        let import_entry = nlist_get(imports, i)
+        if module_import_fact_importer(import_entry) == module_entry {
+          module_fact_append_function_closure_from(
+            tt,
+            fns,
+            module_import_fact_target(import_entry),
+            visited,
+            index
+          )
+        } else { 0 }
+      }
+    } else { 0 }
     let pairs = module_fact_entry_function_pairs(module_entry)
     for i in 0..nlist_len(pairs) {
       let pair = nlist_get(pairs, i)
-      if module_fact_pair_list_contains(fns, pair) == 0 { nlist_add(fns, pair) } else { 0 }
+      if not module_closure_has_pair(index, pair) { module_closure_add_pair(fns, index, pair) } else {
+        0
+      }
     }
     fns
   }
@@ -356,7 +453,13 @@ pub(package) fn module_fact_append_function_closure_from(
 -- compilation unit. Dependencies precede the module, matching fresh parse
 -- order and preserving the existing forward-reference discipline.
 pub(package) fn module_fact_append_function_closure(tt: i64, fns: i64, module_entry: i64) -> i64 {
-  module_fact_append_function_closure_from(tt, fns, module_entry, nlist_new())
+  module_fact_append_function_closure_from(
+    tt,
+    fns,
+    module_entry,
+    nlist_new(),
+    module_closure_index(tt, fns)
+  )
 }
 
 pub(package) fn module_id_from_entry(entry: i64) -> ModuleIdentity {
