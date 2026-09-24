@@ -707,6 +707,8 @@ check_rejects "nonregular_generic_recursion_method_function" "test/negative/nonr
 check_rejects "nonregular_generic_recursion_dispatch" "test/negative/nonregular_generic_recursion_dispatch.weft" 'error[E1012]: generic function `deep` instantiates its recursion with ever-growing type arguments' 1
 check_rejects "nonregular_generic_recursion_components" "test/negative/nonregular_generic_recursion_components.weft" 'error[E1012]: generic function `widen` instantiates its recursion with ever-growing type arguments' 2
 check_rejects "nonregular_generic_recursion_components_second" "test/negative/nonregular_generic_recursion_components.weft" 'error[E1012]: generic function `deepen` instantiates its recursion with ever-growing type arguments' 2
+check_rejects "nonregular_generic_recursion_bounded_dispatch" "test/negative/nonregular_generic_recursion_bounded_dispatch.weft" 'error[E1012]: generic function `go` instantiates its recursion with ever-growing type arguments' 1
+check_rejects "bounded_impl_parameter_lacks_bound" "test/negative/bounded_impl_parameter_lacks_bound.weft" 'error[E1004]: type `Box<T>` does not implement `Deep`' 1
 check_rejects "unknown_intrinsic_call" "test/negative/unknown_intrinsic_call.weft" "error[E1001]: unknown function '__definitely_not_an_intrinsic'"
 check_rejects "unknown_function_in_import" "test/negative/unknown_function_in_import.weft" "error[E1001]: unknown function 'some_function_that_does_not_exist'"
 check_rejects "module_plain_import_does_not_leak_value" "test/negative/module_plain_import_does_not_leak_value.weft" "error[E1001]: unknown function 'work'"
