@@ -1,0 +1,393 @@
+-- compiler/weft/check/instantiation.weft -- generic instantiations of checked bodies
+--
+-- Checking a generic body records every instantiation it demands: generic
+-- function calls and references, method calls at the impl arguments their
+-- receivers bind, and trait-method calls on type-variable receivers, which
+-- specialisation sends to whichever implementation the receiver's instantiation
+-- selects. Specialisation follows all of them, so a growing cycle among them
+-- (see compiler/weft/check/expansion) could never finish and is rejected
+-- before lowering.
+
+use compiler/diagnostic/location.{diagnostic_location_from_offsets}
+use compiler/storage.{nlist_get, nlist_len, node_f1, node_f2, node_f3, node_f4, node_tag}
+use compiler/types/algebra.{trait_atom_decl, trait_atom_head}
+use compiler/types/names.{effect_name_hash}
+use compiler/weft/check/expansion.{
+  ExpansionEdge,
+  GrowsBy,
+  Growth,
+  expansion_edge,
+  expansion_growing_edges,
+  expansion_growth,
+  expansion_projection_growths,
+  growth_shift
+}
+use compiler/weft/check/table.{
+  fn_inner,
+  fn_tparams,
+  generic_call_edge_arguments,
+  generic_call_edge_callee,
+  generic_call_edge_caller,
+  generic_call_edge_is_dispatch,
+  generic_call_edge_site_length,
+  generic_call_edge_site_source,
+  generic_call_edge_site_start,
+  generic_dispatch_local_arguments,
+  generic_dispatch_method,
+  generic_dispatch_receiver,
+  generic_dispatch_trait,
+  generic_unit_body,
+  generic_unit_name_length,
+  generic_unit_name_start,
+  generic_unit_new,
+  generic_unit_source,
+  generic_unit_target,
+  generic_unit_tparams,
+  ttable_entry_at,
+  ttable_entry_count,
+  ttable_entry_kind,
+  ttable_entry_source,
+  ttable_generic_call,
+  ttable_generic_call_count,
+  ttable_impl_members,
+  ttable_impl_parameters,
+  ttable_impl_target,
+  ttable_impl_trait_declaration,
+  ttable_impl_trait_hash
+}
+use runtime/string.{runtime_str_from_bytes_copy}
+use stdlib/diagnostic/registry
+use stdlib/diagnostic/schema.{*}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/map as map
+use stdlib/map.{Map}
+use stdlib/option.{None, Some}
+use stdlib/vector as vector
+use stdlib/vector.{vector_get_in_bounds, vector_len}
+use stdlib/vector/handles.{Vector}
+
+-- A generic implementation method that dispatch on its trait may select.
+type DispatchCandidate {
+  unit: i64,
+  trait_hash: i64,
+  trait_declaration: i64,
+  impl_parameters: i64
+}
+
+-- The generic implementation methods named by any dispatched method, by name.
+fn instantiation_candidates(
+  tt: i64,
+  methods: Map<i64, bool>
+) -> Map<i64, List<DispatchCandidate>> {
+  let mut candidates = map.new<i64, List<DispatchCandidate>>()
+  for index in 0..ttable_entry_count(tt) {
+    let entry = ttable_entry_at(tt, index)
+    let members = if ttable_entry_kind(entry) == 4 { ttable_impl_members(entry) } else { 0 }
+    if members != 0 {
+      let source = ttable_entry_source(entry)
+      for member_index in 0..nlist_len(members) {
+        let method = nlist_get(members, member_index)
+        let tparams = if node_tag(method) == 23 { fn_tparams(method) } else { 0 }
+        if tparams != 0 {
+          let inner = fn_inner(method)
+          let hash = effect_name_hash(source, node_f1(inner), node_f2(inner))
+          if methods.contains_key(hash) {
+            let existing = match candidates.get(hash) {
+              Some(list) -> list
+              None -> Nil<DispatchCandidate>()
+            }
+            candidates = candidates.insert(
+              hash,
+              Cons<DispatchCandidate>(
+                DispatchCandidate {
+                  unit: generic_unit_new(
+                    node_f4(inner),
+                    tparams,
+                    source,
+                    node_f1(inner),
+                    node_f2(inner),
+                    ttable_impl_target(entry)
+                  ),
+                  trait_hash: ttable_impl_trait_hash(entry),
+                  trait_declaration: ttable_impl_trait_declaration(entry),
+                  impl_parameters: ttable_impl_parameters(entry)
+                },
+                existing
+              )
+            )
+          } else { nil }
+        } else { nil }
+      }
+    } else { nil }
+  }
+  candidates
+}
+
+fn instantiation_candidate_matches(candidate: DispatchCandidate, trait_atom: i64) -> bool {
+  let declaration = trait_atom_decl(trait_atom)
+  candidate.trait_hash == trait_atom_head(trait_atom) and (
+    declaration == 0 or candidate.trait_declaration == 0 or
+      candidate.trait_declaration == declaration
+  )
+}
+
+-- The implementations a dispatch edge may select.
+fn instantiation_dispatch_candidates(
+  candidates: Map<i64, List<DispatchCandidate>>,
+  edge: i64
+) -> List<DispatchCandidate> {
+  let mut pending = match candidates.get(generic_dispatch_method(edge)) {
+    Some(list) -> list
+    None -> Nil<DispatchCandidate>()
+  }
+  let mut selected = Nil<DispatchCandidate>()
+  let mut walking = true
+  while walking {
+    match pending {
+      Nil -> { walking = false }
+      Cons(candidate, rest) -> {
+        if instantiation_candidate_matches(candidate, generic_dispatch_trait(edge)) {
+          selected = Cons<DispatchCandidate>(candidate, selected)
+        } else { nil }
+        pending = rest
+      }
+    }
+  }
+  selected
+}
+
+-- Units are identified by their bodies.
+fn instantiation_register(
+  units: borrow mut Vector<i64>,
+  positions: Map<i64, i64>,
+  unit: i64
+) -> Map<i64, i64> {
+  let body = generic_unit_body(unit)
+  if positions.contains_key(body) { positions }
+  else {
+    let position = vector_len<i64>(units)
+    units.push(unit)
+    positions.insert(body, position)
+  }
+}
+
+fn instantiation_position(positions: Map<i64, i64>, unit: i64) -> i64 {
+  match positions.get(generic_unit_body(unit)) {
+    Some(position) -> position
+    None -> 0 - 1
+  }
+}
+
+fn instantiation_parameter_count(unit: i64) -> i64 {
+  let parameters = generic_unit_tparams(unit)
+  if parameters == 0 { 0 } else { nlist_len(parameters) }
+}
+
+fn instantiation_variable(unit: i64, slot: i64) -> i64 {
+  node_f3(nlist_get(generic_unit_tparams(unit), slot))
+}
+
+-- Edges binding `slot` of the unit at `callee_base` to `argument`, from every
+-- parameter of the caller the argument mentions.
+fn instantiation_bind(
+  edges: borrow mut Vector<ExpansionEdge>,
+  caller: i64,
+  caller_base: i64,
+  callee_node: i64,
+  argument: i64,
+  shift: i64,
+  projections: Map<i64, Growth>,
+  site: i64
+) -> nil {
+  for parameter in 0..instantiation_parameter_count(caller) {
+    expansion_edge(
+      edges,
+      caller_base + parameter,
+      callee_node,
+      growth_shift(
+        expansion_growth(argument, instantiation_variable(caller, parameter), projections),
+        shift
+      ),
+      site
+    )
+  }
+}
+
+fn instantiation_report(edge: i64) -[Diagnose]> i64 {
+  let caller = generic_call_edge_caller(edge)
+  let source = generic_unit_source(caller)
+  let start = generic_unit_name_start(caller)
+  let length = generic_unit_name_length(caller)
+  let name = runtime_str_from_bytes_copy(source + start, length)
+  let site_start = generic_call_edge_site_start(edge)
+  Diagnose.report(
+    Diagnostic(
+      DiagnosticSeverityError,
+      DiagnosticClassType,
+      registry.nonregular_generic_recursion(),
+      i"generic function `{name}` instantiates its recursion with ever-growing type arguments",
+      diagnostic_location_from_offsets(DiagnosticSourceBuffer(source), start, start + length),
+      DiagnosticRelatedLocationCons(
+        DiagnosticRelatedLocation(
+          "growing instantiation here",
+          diagnostic_location_from_offsets(
+            DiagnosticSourceBuffer(generic_call_edge_site_source(edge)),
+            site_start,
+            site_start + generic_call_edge_site_length(edge)
+          )
+        ),
+        DiagnosticRelatedLocationNil
+      ),
+      DiagnosticFieldCons(
+        DiagnosticFieldText("reason", "growing_generic_recursion"),
+        DiagnosticFieldNil
+      )
+    )
+  )
+  1
+}
+
+-- Reject every growing cycle among the instantiations recorded from index
+-- `first` on. Generic call graphs follow imports, which are acyclic, so a cycle
+-- never mixes bodies checked in different passes over one table.
+pub(package) fn check_generic_instantiation_growth(tt: i64, first: i64) -[Diagnose]> i64 {
+  let count = ttable_generic_call_count(tt)
+  if count <= first { return 0 }
+  let mut units = vector.new<i64>()
+  let mut positions = map.new<i64, i64>()
+  let mut methods = map.new<i64, bool>()
+  for index in first..count {
+    let edge = ttable_generic_call(tt, index)
+    positions = instantiation_register(units, positions, generic_call_edge_caller(edge))
+    if generic_call_edge_is_dispatch(edge) {
+      methods = methods.insert(generic_dispatch_method(edge), true)
+    } else {
+      let callee = generic_call_edge_callee(edge)
+      positions = instantiation_register(units, positions, callee)
+    }
+  }
+  let candidates = instantiation_candidates(tt, methods)
+  for index in first..count {
+    let edge = ttable_generic_call(tt, index)
+    if generic_call_edge_is_dispatch(edge) {
+      let mut selected = instantiation_dispatch_candidates(candidates, edge)
+      let mut walking = true
+      while walking {
+        match selected {
+          Nil -> { walking = false }
+          Cons(candidate, rest) -> {
+            positions = instantiation_register(units, positions, candidate.unit)
+            selected = rest
+          }
+        }
+      }
+    } else { nil }
+  }
+  let mut bases = vector.new<i64>()
+  let mut node_count = 0
+  for position in 0..vector_len<i64>(units) {
+    bases.push(node_count)
+    node_count = node_count + instantiation_parameter_count(
+      vector_get_in_bounds<i64>(units, position)
+    )
+  }
+  let projections = expansion_projection_growths(tt)
+  let mut edges = vector.new<ExpansionEdge>()
+  for index in first..count {
+    let edge = ttable_generic_call(tt, index)
+    let caller = generic_call_edge_caller(edge)
+    let caller_base = vector_get_in_bounds<i64>(bases, instantiation_position(positions, caller))
+    if generic_call_edge_is_dispatch(edge) {
+      let receiver = generic_dispatch_receiver(edge)
+      let local = generic_dispatch_local_arguments(edge)
+      let mut selected = instantiation_dispatch_candidates(candidates, edge)
+      let mut walking = true
+      while walking {
+        match selected {
+          Nil -> { walking = false }
+          Cons(candidate, rest) -> {
+            let callee = candidate.unit
+            let callee_base = vector_get_in_bounds<i64>(
+              bases,
+              instantiation_position(positions, callee)
+            )
+            let impl_count = if candidate.impl_parameters == 0 { 0 } else {
+              nlist_len(candidate.impl_parameters)
+            }
+            for slot in 0..instantiation_parameter_count(callee) {
+              if slot < impl_count {
+                -- The receiver's instantiation selects this implementation, so
+                -- its parameter is the part of the receiver at the parameter's
+                -- depth in the target. A parameter the target does not
+                -- determine is not bound by dispatch at all.
+                match expansion_growth(
+                  generic_unit_target(callee),
+                  instantiation_variable(callee, slot),
+                  projections
+                ) {
+                  GrowsBy(depth) -> instantiation_bind(
+                    edges,
+                    caller,
+                    caller_base,
+                    callee_base + slot,
+                    receiver,
+                    0 - depth,
+                    projections,
+                    index
+                  )
+                  _ -> nil
+                }
+              } else if local != 0 and slot - impl_count < nlist_len(local) {
+                instantiation_bind(
+                  edges,
+                  caller,
+                  caller_base,
+                  callee_base + slot,
+                  nlist_get(local, slot - impl_count),
+                  0,
+                  projections,
+                  index
+                )
+              } else { nil }
+            }
+            selected = rest
+          }
+        }
+      }
+    } else {
+      let callee = generic_call_edge_callee(edge)
+      let callee_base = vector_get_in_bounds<i64>(
+        bases,
+        instantiation_position(positions, callee)
+      )
+      let arguments = generic_call_edge_arguments(edge)
+      let bound = if arguments == 0 { 0 } else {
+        let written = nlist_len(arguments)
+        let accepted = instantiation_parameter_count(callee)
+        if written < accepted { written } else { accepted }
+      }
+      for slot in 0..bound {
+        instantiation_bind(
+          edges,
+          caller,
+          caller_base,
+          callee_base + slot,
+          nlist_get(arguments, slot),
+          0,
+          projections,
+          index
+        )
+      }
+    }
+  }
+  let (growing, _) = expansion_growing_edges(node_count, edges)
+  let mut errors = 0
+  for index in 0..vector_len<i64>(growing) {
+    let witness = vector_get_in_bounds<ExpansionEdge>(
+      edges,
+      vector_get_in_bounds<i64>(growing, index)
+    )
+    errors = errors + instantiation_report(ttable_generic_call(tt, witness.site))
+  }
+  errors
+}

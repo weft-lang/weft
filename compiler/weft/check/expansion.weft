@@ -1,0 +1,644 @@
+-- compiler/weft/check/expansion.weft -- finite instantiation of recursive generics
+--
+-- Monomorphisation gives every generic declaration and function one
+-- specialisation per instantiation it reaches, so recursion through generics
+-- compiles only when the instantiations it demands stop growing.
+--
+-- Instantiations form a weighted graph over type parameters. When an
+-- instantiation binds a target parameter to a type mentioning a parameter of the
+-- instantiating unit, an edge joins the two, weighted by an upper bound on how
+-- much deeper the bound type can be than that parameter's own instantiation:
+-- zero when the parameter passes through unchanged, the depth of the
+-- constructors built around it, and less when dispatch selects an
+-- implementation whose target takes it apart. A cycle of positive weight
+-- deepens its instantiations on every turn and never closes. Without one every
+-- instantiation's depth stays bounded, so finitely many exist: Kennedy and
+-- Pierce's finite-expansion condition, extended with destructuring weights.
+
+use compiler/storage.{nlist_get, nlist_len, node_f1, node_f2, node_f3, node_tag}
+use compiler/types/algebra.{
+  subst_add,
+  subst_new,
+  ty_f1,
+  ty_f2,
+  ty_f3,
+  ty_is_rc,
+  ty_rc_inner,
+  ty_record_field_type,
+  ty_record_fields,
+  ty_subst,
+  ty_tag
+}
+use compiler/types/names.{effect_name_hash}
+use compiler/weft/check/table.{
+  ttable_entry_at,
+  ttable_entry_count,
+  ttable_entry_kind,
+  ttable_entry_source,
+  ttable_impl_members,
+  ttable_impl_parameters,
+  ttable_impl_target
+}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/map as map
+use stdlib/map.{Map}
+use stdlib/option.{None, Some}
+use stdlib/vector as vector
+use stdlib/vector.{vector_get_in_bounds, vector_len, vector_set_borrowed}
+use stdlib/vector/handles.{Vector}
+
+-- How much deeper a type can be than one parameter's instantiation: unrelated
+-- to the parameter, deeper by at most a fixed depth, or without any bound.
+pub(package) type Growth { Independent, GrowsBy(i64), Unbounded }
+
+pub(package) fn growth_join(left: Growth, right: Growth) -> Growth {
+  match left {
+    Independent -> right
+    Unbounded -> Unbounded
+    GrowsBy(depth) -> match right {
+      Independent -> left
+      Unbounded -> Unbounded
+      GrowsBy(other) -> if other > depth { right } else { left }
+    }
+  }
+}
+
+pub(package) fn growth_shift(growth: Growth, depth: i64) -> Growth {
+  match growth {
+    GrowsBy(current) -> GrowsBy(current + depth)
+    other -> other
+  }
+}
+
+-- A projection of a type that grows by `base`, through implementation bindings
+-- that deepen their targets by at most `projection`.
+fn growth_through(base: Growth, projection: Growth) -> Growth {
+  match base {
+    Independent -> Independent
+    _ -> match projection {
+      Independent -> Independent
+      Unbounded -> Unbounded
+      GrowsBy(depth) -> growth_shift(base, depth)
+    }
+  }
+}
+
+fn growth_eq(left: Growth, right: Growth) -> bool {
+  match left {
+    Independent -> match right {
+      Independent -> true
+      _ -> false
+    }
+    Unbounded -> match right {
+      Unbounded -> true
+      _ -> false
+    }
+    GrowsBy(depth) -> match right {
+      GrowsBy(other) -> depth == other
+      _ -> false
+    }
+  }
+}
+
+fn growth_under(constructor: Growth) -> Growth { growth_shift(constructor, 1) }
+
+-- The growth of `ty` relative to type variable `variable`. Each constructor
+-- around an occurrence deepens it by one. Set-theoretic connectives do not:
+-- types are sets, and unions, intersections and complements over a finite set
+-- of atoms have finitely many normal forms, so `T | nil` recurring at
+-- `(T | nil) | nil` names the same type. Effect sets flatten on substitution
+-- and never repeat a label, so only their atoms' arguments deepen them. An
+-- associated projection deepens its base by what the implementations binding
+-- that name can add to their targets.
+pub(package) fn expansion_growth(
+  ty: i64,
+  variable: i64,
+  projections: Map<i64, Growth>
+) -> Growth {
+  if ty == 0 { return Independent }
+  match ty_tag(ty) {
+    12 -> if ty_f1(ty) == variable { GrowsBy(0) } else { Independent }
+    9 -> if ty_is_rc(ty) { expansion_growth(ty_rc_inner(ty), variable, projections) } else {
+      growth_under(expansion_growth_list(ty_f3(ty), variable, projections))
+    }
+    21 -> growth_through(
+      expansion_growth(ty_f1(ty), variable, projections),
+      match projections.get(ty_f2(ty)) {
+        Some(growth) -> growth
+        None -> Independent
+      }
+    )
+    3 -> growth_join(
+      expansion_growth(ty_f1(ty), variable, projections),
+      expansion_growth(ty_f2(ty), variable, projections)
+    )
+    4 -> growth_join(
+      expansion_growth(ty_f1(ty), variable, projections),
+      expansion_growth(ty_f2(ty), variable, projections)
+    )
+    5 -> expansion_growth(ty_f1(ty), variable, projections)
+    14 -> growth_under(
+      growth_join(
+        expansion_growth(ty_f1(ty), variable, projections),
+        expansion_growth(ty_f2(ty), variable, projections)
+      )
+    )
+    6 -> growth_under(
+      growth_join(
+        growth_join(
+          expansion_growth_list(ty_f1(ty), variable, projections),
+          expansion_growth(ty_f2(ty), variable, projections)
+        ),
+        expansion_growth(ty_f3(ty), variable, projections)
+      )
+    )
+    7 -> {
+      let fields = ty_record_fields(ty)
+      let mut growth = Independent
+      if fields != 0 {
+        for index in 0..nlist_len(fields) {
+          growth = growth_join(
+            growth,
+            expansion_growth(
+              ty_record_field_type(nlist_get(fields, index)),
+              variable,
+              projections
+            )
+          )
+        }
+      } else { nil }
+      growth_under(growth)
+    }
+    8 -> growth_under(expansion_growth(ty_f2(ty), variable, projections))
+    -- An effect set's tail is stored as its variable id plus one.
+    10 -> growth_join(
+      if ty_f2(ty) == variable + 1 { GrowsBy(0) } else { Independent },
+      expansion_growth_list(ty_f1(ty), variable, projections)
+    )
+    11 -> growth_under(expansion_growth_list(ty_f2(ty), variable, projections))
+    25 -> growth_under(expansion_growth_list(ty_f2(ty), variable, projections))
+    tag -> if tag == 15 or tag == 16 or tag == 17 or tag == 18 or tag == 19 or
+      tag == 22 or tag == 23 or tag == 29 {
+        growth_under(expansion_growth(ty_f1(ty), variable, projections))
+      } else { Independent }
+  }
+}
+
+fn expansion_growth_list(types: i64, variable: i64, projections: Map<i64, Growth>) -> Growth {
+  let mut growth = Independent
+  if types != 0 {
+    for index in 0..nlist_len(types) {
+      growth = growth_join(
+        growth,
+        expansion_growth(nlist_get(types, index), variable, projections)
+      )
+    }
+  } else { nil }
+  growth
+}
+
+-- One implementation's binding of an associated type, with the target it is
+-- selected by and the implementation's parameters.
+type AssociatedBinding { name: i64, binding: i64, target: i64, parameters: i64 }
+
+-- Every associated-type binding in the table's implementations. Self in a
+-- binding denotes the implementation's target.
+fn expansion_associated_bindings(tt: i64) -> List<AssociatedBinding> {
+  let mut bindings = Nil<AssociatedBinding>()
+  for index in 0..ttable_entry_count(tt) {
+    let entry = ttable_entry_at(tt, index)
+    if ttable_entry_kind(entry) == 4 {
+      let members = ttable_impl_members(entry)
+      let source = ttable_entry_source(entry)
+      let target = ttable_impl_target(entry)
+      if members != 0 and target != 0 {
+        let self_target = subst_new()
+        subst_add(self_target, 0 - 1, target)
+        for member_index in 0..nlist_len(members) {
+          let member = nlist_get(members, member_index)
+          if node_tag(member) == 43 and node_f3(member) != 0 {
+            bindings = Cons<AssociatedBinding>(
+              AssociatedBinding {
+                name: effect_name_hash(source, node_f1(member), node_f2(member)),
+                binding: ty_subst(node_f3(member), self_target),
+                target: target,
+                parameters: ttable_impl_parameters(entry)
+              },
+              bindings
+            )
+          } else { nil }
+        }
+      } else { nil }
+    } else { nil }
+  }
+  bindings
+}
+
+-- How much deeper one binding can be than the target that selected it: for
+-- each implementation parameter, its depth in the binding less its depth in the
+-- target. A parameter the target does not determine is unbounded.
+fn expansion_binding_growth(binding: AssociatedBinding, projections: Map<i64, Growth>) -> Growth {
+  let parameters = binding.parameters
+  let mut growth = Independent
+  if parameters != 0 {
+    for index in 0..nlist_len(parameters) {
+      let variable = node_f3(nlist_get(parameters, index))
+      let deepened = expansion_growth(binding.binding, variable, projections)
+      match deepened {
+        Independent -> nil
+        _ -> {
+          growth = growth_join(
+            growth,
+            match expansion_growth(binding.target, variable, projections) {
+              GrowsBy(depth) -> growth_shift(deepened, 0 - depth)
+              _ -> Unbounded
+            }
+          )
+        }
+      }
+    }
+  } else { nil }
+  growth
+}
+
+-- The growth each associated-type name can add through any implementation that
+-- binds it. Keying by name alone over-approximates: a projection is bounded by
+-- every binding it could select. Bindings may project further, so the bounds
+-- are iterated to a fixed point; a name still deepening once every chain of
+-- names has been followed deepens on a cycle and is unbounded.
+pub(package) fn expansion_projection_growths(tt: i64) -> Map<i64, Growth> {
+  let bindings = expansion_associated_bindings(tt)
+  let mut names = map.new<i64, bool>()
+  let mut name_count = 0
+  let mut remaining = bindings
+  let mut listing = true
+  while listing {
+    match remaining {
+      Nil -> { listing = false }
+      Cons(binding, rest) -> {
+        if not names.contains_key(binding.name) {
+          names = names.insert(binding.name, true)
+          name_count = name_count + 1
+        } else { nil }
+        remaining = rest
+      }
+    }
+  }
+  let rounds = name_count + 1
+  let mut growths = map.new<i64, Growth>()
+  let mut round = 0
+  let mut changed = true
+  while changed and round <= rounds {
+    changed = false
+    let mut next = map.new<i64, Growth>()
+    let mut pending = bindings
+    let mut walking = true
+    while walking {
+      match pending {
+        Nil -> { walking = false }
+        Cons(binding, rest) -> {
+          let current = match next.get(binding.name) {
+            Some(growth) -> growth
+            None -> Independent
+          }
+          next = next.insert(
+            binding.name,
+            growth_join(current, expansion_binding_growth(binding, growths))
+          )
+          pending = rest
+        }
+      }
+    }
+    let mut compared = bindings
+    let mut comparing = true
+    while comparing {
+      match compared {
+        Nil -> { comparing = false }
+        Cons(binding, rest) -> {
+          let before = match growths.get(binding.name) {
+            Some(growth) -> growth
+            None -> Independent
+          }
+          let after = match next.get(binding.name) {
+            Some(growth) -> growth
+            None -> Independent
+          }
+          if not growth_eq(before, after) {
+            changed = true
+            if round == rounds { next = next.insert(binding.name, Unbounded) } else { nil }
+          } else { nil }
+          compared = rest
+        }
+      }
+    }
+    growths = next
+    round = round + 1
+  }
+  growths
+}
+
+-- One edge between parameter nodes. `site` identifies the instantiation that
+-- produced it for the caller's diagnostics.
+pub(package) type ExpansionEdge { from: i64, to: i64, weight: i64, site: i64 }
+
+-- The edge weight standing for unbounded growth: heavier than every bounded
+-- path, so any cycle through it is positive.
+fn expansion_unbounded_weight() -> i64 { 1073741824 }
+
+-- The edge for an instantiation that binds node `to` with growth `growth`
+-- relative to node `from`, if the binding mentions it at all.
+pub(package) fn expansion_edge(
+  edges: borrow mut Vector<ExpansionEdge>,
+  from: i64,
+  to: i64,
+  growth: Growth,
+  site: i64
+) -> nil {
+  match growth {
+    Independent -> nil
+    GrowsBy(depth) -> edges.push(ExpansionEdge { from: from, to: to, weight: depth, site: site })
+    Unbounded -> edges.push(
+      ExpansionEdge { from: from, to: to, weight: expansion_unbounded_weight(), site: site }
+    )
+  }
+}
+
+type ComponentFrame { node: i64, pending: List<i64> }
+
+fn expansion_min(left: i64, right: i64) -> i64 { if left < right { left } else { right } }
+
+-- Strongly connected components of the parameter graph (Tarjan), iteratively.
+fn expansion_components(
+  node_count: i64,
+  adjacency: borrow Vector<List<i64>>,
+  edges: borrow Vector<ExpansionEdge>
+) -> owned Vector<i64> {
+  let mut order = vector.new<i64>()
+  let mut low = vector.new<i64>()
+  let mut on_stack = vector.new<bool>()
+  let mut component = vector.new<i64>()
+  for node in 0..node_count {
+    order.push(0 - 1)
+    low.push(0)
+    on_stack.push(false)
+    component.push(0 - 1)
+  }
+  let mut stack = vector.new<i64>()
+  let mut next_order = 0
+  let mut next_component = 0
+  for root in 0..node_count {
+    if vector_get_in_bounds<i64>(order, root) < 0 {
+      vector_set_borrowed<i64>(order, root, next_order)
+      vector_set_borrowed<i64>(low, root, next_order)
+      next_order = next_order + 1
+      stack.push(root)
+      vector_set_borrowed<bool>(on_stack, root, true)
+      let mut frames = Cons<ComponentFrame>(
+        ComponentFrame { node: root, pending: vector_get_in_bounds<List<i64>>(adjacency, root) },
+        Nil<ComponentFrame>()
+      )
+      let mut walking = true
+      while walking {
+        match frames {
+          Nil -> { walking = false }
+          Cons(frame, outer) -> match frame.pending {
+            Cons(edge, rest) -> {
+              frames = Cons<ComponentFrame>(
+                ComponentFrame { node: frame.node, pending: rest },
+                outer
+              )
+              let next = vector_get_in_bounds<ExpansionEdge>(edges, edge).to
+              if vector_get_in_bounds<i64>(order, next) < 0 {
+                vector_set_borrowed<i64>(order, next, next_order)
+                vector_set_borrowed<i64>(low, next, next_order)
+                next_order = next_order + 1
+                stack.push(next)
+                vector_set_borrowed<bool>(on_stack, next, true)
+                frames = Cons<ComponentFrame>(
+                  ComponentFrame {
+                    node: next,
+                    pending: vector_get_in_bounds<List<i64>>(adjacency, next)
+                  },
+                  frames
+                )
+              } else if vector_get_in_bounds<bool>(on_stack, next) {
+                vector_set_borrowed<i64>(
+                  low,
+                  frame.node,
+                  expansion_min(
+                    vector_get_in_bounds<i64>(low, frame.node),
+                    vector_get_in_bounds<i64>(order, next)
+                  )
+                )
+              } else { nil }
+            }
+            Nil -> {
+              frames = outer
+              let node = frame.node
+              if vector_get_in_bounds<i64>(low, node) == vector_get_in_bounds<i64>(order, node) {
+                let mut popping = true
+                while popping {
+                  match stack.pop() {
+                    Some(member) -> {
+                      vector_set_borrowed<bool>(on_stack, member, false)
+                      vector_set_borrowed<i64>(component, member, next_component)
+                      if member == node { popping = false } else { nil }
+                    }
+                    None -> { popping = false }
+                  }
+                }
+                next_component = next_component + 1
+              } else { nil }
+              match outer {
+                Cons(parent, _) -> {
+                  vector_set_borrowed<i64>(
+                    low,
+                    parent.node,
+                    expansion_min(
+                      vector_get_in_bounds<i64>(low, parent.node),
+                      vector_get_in_bounds<i64>(low, node)
+                    )
+                  )
+                  nil
+                }
+                Nil -> nil
+              }
+            }
+          }
+        }
+      }
+    } else { nil }
+  }
+  component
+}
+
+-- The heaviest edge on a positive cycle among `inside`, the edges internal to
+-- one component, or -1 when every cycle there is non-positive. Longest paths
+-- are relaxed once per node (Bellman-Ford); an edge that still relaxes after
+-- that lies downstream of a positive cycle, which following predecessors from
+-- it reaches.
+fn expansion_positive_cycle_edge(
+  inside: List<i64>,
+  size: i64,
+  edges: borrow Vector<ExpansionEdge>,
+  distance: borrow mut Vector<i64>,
+  predecessor: borrow mut Vector<i64>
+) -> i64 {
+  let mut members = inside
+  let mut resetting = true
+  while resetting {
+    match members {
+      Nil -> { resetting = false }
+      Cons(edge, rest) -> {
+        let at = vector_get_in_bounds<ExpansionEdge>(edges, edge)
+        vector_set_borrowed<i64>(distance, at.from, 0)
+        vector_set_borrowed<i64>(distance, at.to, 0)
+        vector_set_borrowed<i64>(predecessor, at.from, 0 - 1)
+        vector_set_borrowed<i64>(predecessor, at.to, 0 - 1)
+        members = rest
+      }
+    }
+  }
+  let mut round = 0
+  let mut relaxed_node = 0 - 1
+  let mut changed = true
+  while changed and round <= size {
+    changed = false
+    let mut pending = inside
+    let mut walking = true
+    while walking {
+      match pending {
+        Nil -> { walking = false }
+        Cons(edge, rest) -> {
+          let at = vector_get_in_bounds<ExpansionEdge>(edges, edge)
+          let reach = vector_get_in_bounds<i64>(distance, at.from) + at.weight
+          if reach > vector_get_in_bounds<i64>(distance, at.to) {
+            vector_set_borrowed<i64>(distance, at.to, reach)
+            vector_set_borrowed<i64>(predecessor, at.to, edge)
+            relaxed_node = at.to
+            changed = true
+          } else { nil }
+          pending = rest
+        }
+      }
+    }
+    round = round + 1
+  }
+  if not changed { return 0 - 1 }
+  -- Walking back once per node lands on the cycle itself.
+  let mut node = relaxed_node
+  for _ in 0..size {
+    node = vector_get_in_bounds<ExpansionEdge>(
+      edges,
+      vector_get_in_bounds<i64>(predecessor, node)
+    ).from
+  }
+  let start = node
+  let mut heaviest = vector_get_in_bounds<i64>(predecessor, start)
+  let mut current = vector_get_in_bounds<ExpansionEdge>(edges, heaviest).from
+  while current != start {
+    let edge = vector_get_in_bounds<i64>(predecessor, current)
+    let candidate = vector_get_in_bounds<ExpansionEdge>(edges, edge)
+    let best = vector_get_in_bounds<ExpansionEdge>(edges, heaviest)
+    if candidate.weight > best.weight or candidate.weight == best.weight and edge < heaviest {
+      heaviest = edge
+    } else { nil }
+    current = candidate.from
+  }
+  heaviest
+}
+
+-- The heaviest edge on a positive cycle of each component that has one, in
+-- component order, and whether each node lies in such a component. Components
+-- whose internal edges are all non-positive cannot hold one and are skipped
+-- without relaxation.
+pub(package) fn expansion_growing_edges(
+  node_count: i64,
+  edges: borrow Vector<ExpansionEdge>
+) -> (owned Vector<i64>, owned Vector<bool>) {
+  let mut adjacency = vector.new<List<i64>>()
+  for node in 0..node_count { adjacency.push(Nil<i64>()) }
+  let edge_count = vector_len<ExpansionEdge>(edges)
+  let mut index = edge_count
+  while index > 0 {
+    index = index - 1
+    let from = vector_get_in_bounds<ExpansionEdge>(edges, index).from
+    vector_set_borrowed<List<i64>>(
+      adjacency,
+      from,
+      Cons<i64>(index, vector_get_in_bounds<List<i64>>(adjacency, from))
+    )
+  }
+  let component = expansion_components(node_count, adjacency, edges)
+  let mut inside = map.new<i64, List<i64>>()
+  let mut sizes = map.new<i64, i64>()
+  let mut positive = map.new<i64, bool>()
+  for node in 0..node_count {
+    let owner = vector_get_in_bounds<i64>(component, node)
+    sizes = sizes.insert(
+      owner,
+      match sizes.get(owner) {
+        Some(size) -> size + 1
+        None -> 1
+      }
+    )
+  }
+  index = edge_count
+  while index > 0 {
+    index = index - 1
+    let edge = vector_get_in_bounds<ExpansionEdge>(edges, index)
+    let owner = vector_get_in_bounds<i64>(component, edge.from)
+    if owner == vector_get_in_bounds<i64>(component, edge.to) {
+      inside = inside.insert(
+        owner,
+        Cons<i64>(
+          index,
+          match inside.get(owner) {
+            Some(list) -> list
+            None -> Nil<i64>()
+          }
+        )
+      )
+      if edge.weight > 0 { positive = positive.insert(owner, true) } else { nil }
+    } else { nil }
+  }
+  let mut distance = vector.new<i64>()
+  let mut predecessor = vector.new<i64>()
+  for node in 0..node_count {
+    distance.push(0)
+    predecessor.push(0 - 1)
+  }
+  let mut growing = vector.new<i64>()
+  let mut grows = map.new<i64, bool>()
+  let mut components = 0
+  for node in 0..node_count {
+    let owner = vector_get_in_bounds<i64>(component, node)
+    if owner + 1 > components { components = owner + 1 } else { nil }
+  }
+  for owner in 0..components {
+    if positive.contains_key(owner) {
+      let edge = expansion_positive_cycle_edge(
+        match inside.get(owner) {
+          Some(list) -> list
+          None -> Nil<i64>()
+        },
+        match sizes.get(owner) {
+          Some(size) -> size
+          None -> 0
+        },
+        edges,
+        distance,
+        predecessor
+      )
+      if edge >= 0 {
+        growing.push(edge)
+        grows = grows.insert(owner, true)
+      } else { nil }
+    } else { nil }
+  }
+  let mut members = vector.new<bool>()
+  for node in 0..node_count {
+    members.push(grows.contains_key(vector_get_in_bounds<i64>(component, node)))
+  }
+  (growing, members)
+}

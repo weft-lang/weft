@@ -697,6 +697,16 @@ check_rejects "nonregular_recursive_type_mutual" "test/negative/nonregular_recur
 check_rejects "nonregular_recursive_type_function" "test/negative/nonregular_recursive_type_function.weft" 'error[E1011]: recursive type `Knot` instantiates its recursion'
 check_rejects "nonregular_recursive_type_weak" "test/negative/nonregular_recursive_type_weak.weft" 'error[E1011]: recursive type `Tower` instantiates its recursion'
 check_rejects "nonregular_recursive_type_body_use" "test/negative/nonregular_recursive_type_body_use.weft" 'error[E1011]: recursive type `Chain` instantiates its recursion' 1
+check_rejects "nonregular_generic_recursion" "test/negative/nonregular_generic_recursion.weft" 'error[E1012]: generic function `grow` instantiates its recursion with ever-growing type arguments' 1
+check_rejects "nonregular_generic_recursion_inferred" "test/negative/nonregular_generic_recursion_inferred.weft" 'error[E1012]: generic function `grow` instantiates its recursion with ever-growing type arguments' 1
+check_rejects "nonregular_generic_recursion_mutual" "test/negative/nonregular_generic_recursion_mutual.weft" 'error[E1012]: generic function `outward` instantiates its recursion with ever-growing type arguments' 1
+check_rejects "nonregular_generic_recursion_closure" "test/negative/nonregular_generic_recursion_closure.weft" 'error[E1012]: generic function `grow` instantiates its recursion with ever-growing type arguments' 1
+check_rejects "nonregular_generic_recursion_permuted" "test/negative/nonregular_generic_recursion_permuted.weft" 'error[E1012]: generic function `braid` instantiates its recursion with ever-growing type arguments' 1
+check_rejects "nonregular_generic_recursion_method" "test/negative/nonregular_generic_recursion_method.weft" 'error[E1012]: generic function `depth` instantiates its recursion with ever-growing type arguments' 1
+check_rejects "nonregular_generic_recursion_method_function" "test/negative/nonregular_generic_recursion_method_function.weft" 'error[E1012]: generic function `nest` instantiates its recursion with ever-growing type arguments' 1
+check_rejects "nonregular_generic_recursion_dispatch" "test/negative/nonregular_generic_recursion_dispatch.weft" 'error[E1012]: generic function `deep` instantiates its recursion with ever-growing type arguments' 1
+check_rejects "nonregular_generic_recursion_components" "test/negative/nonregular_generic_recursion_components.weft" 'error[E1012]: generic function `widen` instantiates its recursion with ever-growing type arguments' 2
+check_rejects "nonregular_generic_recursion_components_second" "test/negative/nonregular_generic_recursion_components.weft" 'error[E1012]: generic function `deepen` instantiates its recursion with ever-growing type arguments' 2
 check_rejects "unknown_intrinsic_call" "test/negative/unknown_intrinsic_call.weft" "error[E1001]: unknown function '__definitely_not_an_intrinsic'"
 check_rejects "unknown_function_in_import" "test/negative/unknown_function_in_import.weft" "error[E1001]: unknown function 'some_function_that_does_not_exist'"
 check_rejects "module_plain_import_does_not_leak_value" "test/negative/module_plain_import_does_not_leak_value.weft" "error[E1001]: unknown function 'work'"

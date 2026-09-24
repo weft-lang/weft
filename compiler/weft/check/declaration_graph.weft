@@ -37,6 +37,13 @@ use compiler/types/algebra.{
   ty_record_fields,
   ty_tag
 }
+use compiler/weft/check/expansion.{
+  ExpansionEdge,
+  expansion_edge,
+  expansion_growing_edges,
+  expansion_growth,
+  expansion_projection_growths
+}
 use compiler/weft/check/table.{
   ttable_entry_at,
   ttable_entry_count,
@@ -261,81 +268,37 @@ fn declaration_graph_uses_list(
   } else { nil }
 }
 
--- Whether a type mentions any type variable.
-fn declaration_graph_mentions_variable(ty: i64) -> bool {
-  if ty == 0 { return false }
-  match ty_tag(ty) {
-    12 -> true
-    3 -> declaration_graph_mentions_variable(ty_f1(ty)) or
-      declaration_graph_mentions_variable(ty_f2(ty))
-    4 -> declaration_graph_mentions_variable(ty_f1(ty)) or
-      declaration_graph_mentions_variable(ty_f2(ty))
-    6 -> declaration_graph_list_mentions_variable(ty_f1(ty)) or
-      declaration_graph_mentions_variable(ty_f2(ty))
-    7 -> {
-      let fields = ty_record_fields(ty)
-      let mut found = false
-      if fields != 0 {
-        for index in 0..nlist_len(fields) {
-          if declaration_graph_mentions_variable(ty_record_field_type(nlist_get(fields, index))) {
-            found = true
-          } else { nil }
-        }
-      } else { nil }
-      found
-    }
-    8 -> declaration_graph_mentions_variable(ty_f2(ty))
-    9 -> if ty_is_rc(ty) { declaration_graph_mentions_variable(ty_rc_inner(ty)) } else {
-      declaration_graph_list_mentions_variable(ty_f3(ty))
-    }
-    14 -> declaration_graph_mentions_variable(ty_f1(ty)) or
-      declaration_graph_mentions_variable(ty_f2(ty))
-    tag -> if tag == 5 or tag == 15 or tag == 16 or tag == 17 or tag == 18 or tag == 19 or
-      tag == 21 or tag == 22 or tag == 23 or tag == 29 {
-        declaration_graph_mentions_variable(ty_f1(ty))
-      } else { false }
-  }
+-- One instantiation of a module declaration inside another declaration.
+type DeclarationSite { declaration: i64, target: i64 }
+
+fn declaration_graph_parameter_count(tt: i64, locals: borrow Vector<i64>, position: i64) -> i64 {
+  let parameters = ttable_entry_tparams(
+    ttable_entry_at(tt, vector_get_in_bounds<i64>(locals, position))
+  )
+  if parameters == 0 { 0 } else { nlist_len(parameters) }
 }
 
-fn declaration_graph_list_mentions_variable(types: i64) -> bool {
-  let mut found = false
-  if types != 0 {
-    for index in 0..nlist_len(types) {
-      if declaration_graph_mentions_variable(nlist_get(types, index)) { found = true } else {
-        nil
-      }
-    }
-  } else { nil }
-  found
-}
-
--- A recursive instantiation's argument grows when it is built from the
--- declaration's parameters without being one of them.
-fn declaration_graph_arguments_grow(arguments: i64) -> bool {
-  let mut grows = false
-  if arguments != 0 {
-    for index in 0..nlist_len(arguments) {
-      let argument = nlist_get(arguments, index)
-      if argument != 0 and ty_tag(argument) != 12 and declaration_graph_mentions_variable(
-        argument
-      ) {
-        grows = true
-      } else { nil }
-    }
-  } else { nil }
-  grows
-}
-
+-- Regularity over the module's declarations: each use binds its target's
+-- parameters to types that may mention the using declaration's parameters, and
+-- a growing cycle among them can never be instantiated finitely.
 fn check_declaration_regularity(
   tt: i64,
   locals: borrow Vector<i64>,
   positions: Map<i64, i64>
 ) -[Diagnose]> i64 {
   let count = vector_len<i64>(locals)
-  let mut adjacency = vector.new<List<i64>>()
-  let mut uses = vector.new<Vector<DeclarationUse>>()
+  let mut bases = vector.new<i64>()
+  let mut node_count = 0
+  for position in 0..count {
+    bases.push(node_count)
+    node_count = node_count + declaration_graph_parameter_count(tt, locals, position)
+  }
+  let projections = expansion_projection_growths(tt)
+  let mut edges = vector.new<ExpansionEdge>()
+  let mut sites = vector.new<DeclarationSite>()
   for position in 0..count {
     let entry = ttable_entry_at(tt, vector_get_in_bounds<i64>(locals, position))
+    let parameters = ttable_entry_tparams(entry)
     let mut found = vector.new<DeclarationUse>()
     let mut shape = declaration_shape(entry)
     let mut done = false
@@ -348,39 +311,79 @@ fn check_declaration_regularity(
         }
       }
     }
-    let mut targets = Nil<i64>()
-    for index in 0..vector_len<DeclarationUse>(found) {
-      targets = Cons<i64>(vector_get_in_bounds<DeclarationUse>(found, index).target, targets)
+    if parameters != 0 {
+      for index in 0..vector_len<DeclarationUse>(found) {
+        let use_site = vector_get_in_bounds<DeclarationUse>(found, index)
+        let site = vector_len<DeclarationSite>(sites)
+        sites.push(DeclarationSite { declaration: position, target: use_site.target })
+        let arguments = use_site.arguments
+        let bound = if arguments == 0 { 0 } else {
+          declaration_graph_min(
+            nlist_len(arguments),
+            declaration_graph_parameter_count(tt, locals, use_site.target)
+          )
+        }
+        for slot in 0..bound {
+          let argument = nlist_get(arguments, slot)
+          for parameter in 0..nlist_len(parameters) {
+            expansion_edge(
+              edges,
+              vector_get_in_bounds<i64>(bases, position) + parameter,
+              vector_get_in_bounds<i64>(bases, use_site.target) + slot,
+              expansion_growth(argument, node_f3(nlist_get(parameters, parameter)), projections),
+              site
+            )
+          }
+        }
+      }
+    } else { nil }
+  }
+  let (growing, members) = expansion_growing_edges(node_count, edges)
+  -- Every declaration of a growing component is non-regular: none of their
+  -- storage shapes may be expanded by later checks.
+  for position in 0..count {
+    let mut grows = false
+    for parameter in 0..declaration_graph_parameter_count(tt, locals, position) {
+      if vector_get_in_bounds<bool>(
+        members,
+        vector_get_in_bounds<i64>(bases, position) + parameter
+      ) {
+        grows = true
+      } else { nil }
     }
-    adjacency.push(targets)
-    uses.push(found)
+    if grows {
+      ttable_mark_nonregular_declaration(
+        tt,
+        ttable_entry_type_declaration(
+          tt,
+          ttable_entry_at(tt, vector_get_in_bounds<i64>(locals, position))
+        )
+      )
+    } else { nil }
   }
   let mut errors = 0
-  for position in 0..count {
-    let found = vector_get_in_bounds<Vector<DeclarationUse>>(uses, position)
-    let mut reported = false
-    for index in 0..vector_len<DeclarationUse>(found) {
-      let use_site = vector_get_in_bounds<DeclarationUse>(found, index)
-      if not reported and declaration_graph_arguments_grow(use_site.arguments) and
-        declaration_graph_reaches(adjacency, use_site.target, position) {
-          let entry = ttable_entry_at(tt, vector_get_in_bounds<i64>(locals, position))
-          let target = ttable_entry_at(tt, vector_get_in_bounds<i64>(locals, use_site.target))
-          let name = declaration_graph_name(entry)
-          ttable_mark_nonregular_declaration(tt, ttable_entry_type_declaration(tt, entry))
-          errors = errors + declaration_graph_report(
-            DiagnosticClassType,
-            registry.nonregular_recursive_type(),
-            i"recursive type `{name}` instantiates its recursion with an argument built from its parameters",
-            entry,
-            declaration_graph_related("recursive instantiation of this type", target, entry),
-            "growing_recursive_argument"
-          )
-          reported = true
-        } else { nil }
-    }
+  for index in 0..vector_len<i64>(growing) {
+    let edge = vector_get_in_bounds<ExpansionEdge>(
+      edges,
+      vector_get_in_bounds<i64>(growing, index)
+    )
+    let site = vector_get_in_bounds<DeclarationSite>(sites, edge.site)
+    let entry = ttable_entry_at(tt, vector_get_in_bounds<i64>(locals, site.declaration))
+    let target = ttable_entry_at(tt, vector_get_in_bounds<i64>(locals, site.target))
+    let name = declaration_graph_name(entry)
+    errors = errors + declaration_graph_report(
+      DiagnosticClassType,
+      registry.nonregular_recursive_type(),
+      i"recursive type `{name}` instantiates its recursion with an argument built from its parameters",
+      entry,
+      declaration_graph_related("recursive instantiation of this type", target, entry),
+      "growing_recursive_argument"
+    )
   }
   errors
 }
+
+fn declaration_graph_min(left: i64, right: i64) -> i64 { if left < right { left } else { right } }
 
 -- How a declaration holds a value: not at all, through strong managed edges
 -- whose target is fixed at construction, or through a mutably updatable

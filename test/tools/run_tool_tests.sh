@@ -1178,7 +1178,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_diagnostic_schema_public_surface" "$(<"$tmp_out")" "Public API items: 62. Documented: 62."
     assert_contains "doc_stdlib_diagnostic_schema_finite_range" "$(<"$tmp_out")" "DiagnosticSourceRange(DiagnosticSource, usize, usize)"
   elif [ "$stdlib_doc_name" = "diagnostic/registry" ]; then
-    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 55. Documented: 55."
+    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 56. Documented: 56."
     assert_contains "doc_stdlib_diagnostic_registry_missing_source" "$(<"$tmp_out")" "pub fn module_source_unavailable() -> DiagnosticCode"
     assert_contains "doc_stdlib_diagnostic_registry_length" "$(<"$tmp_out")" "pub fn len() -> usize"
     assert_contains "doc_stdlib_diagnostic_registry_lookup" "$(<"$tmp_out")" "pub fn get(index: usize) -> Option<DiagnosticRegistryEntry>"
