@@ -540,7 +540,16 @@ SIGNING_PHASE_STATUS="$RESULTS_DIR/signing.status"
 FORMATTER_PHASE_STATUS="$RESULTS_DIR/formatter.status"
 MARKDOWN_PHASE_STATUS="$RESULTS_DIR/markdown.status"
 NEGATIVE_PHASE_STATUS="$RESULTS_DIR/negative.status"
-run_feedback_phases &
+FEEDBACK_PHASE_STATUS="$RESULTS_DIR/feedback.status"
+# The coordinator records its status in the results directory, like every
+# phase: bash keeps only a bounded table of finished background statuses, and
+# the planner's polling forks enough children to evict it before the final
+# wait.
+(
+  feedback_exit=0
+  run_feedback_phases || feedback_exit=$?
+  printf '%s\n' "$feedback_exit" > "$FEEDBACK_PHASE_STATUS"
+) &
 FEEDBACK_PHASE_PID=$!
 RUNTIME_TEST_FILES=()
 RUNTIME_TEST_BLOCKS=0
@@ -623,10 +632,13 @@ if [ "$runtime_count" -gt 0 ]; then
   fi
 fi
 
-feedback_status=0
-wait "$FEEDBACK_PHASE_PID" || feedback_status=$?
+wait "$FEEDBACK_PHASE_PID" 2>/dev/null || true
 FEEDBACK_PHASE_PID=""
-if [ "$feedback_status" -ne 0 ]; then
+feedback_status=1
+if [ -r "$FEEDBACK_PHASE_STATUS" ]; then
+  read -r feedback_status < "$FEEDBACK_PHASE_STATUS" || feedback_status=1
+fi
+if ! [[ "$feedback_status" =~ ^[0-9]+$ ]] || [ "$feedback_status" -ne 0 ]; then
   echo "  ✗ feedback gate coordinator failed"
 fi
 
