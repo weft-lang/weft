@@ -6950,6 +6950,65 @@ test_timeout_err=$(<"$tmp_err")
 assert_contains "test_timeout_preserves_exact_worker_status" "$test_timeout_err" "  FAIL: $tmp_test_timeout ("
 assert_contains "test_timeout_reports_reason" "$test_timeout_err" ", timeout)"
 
+# A root that legitimately runs a whole-compiler pipeline declares its run-phase
+# runaway stop. The declaration extends the host stop and never shortens it;
+# every root without one keeps the host stop.
+test_budget_elapsed() {
+  sed -nE 's/.*FAIL: .* \(([0-9]+) ms, timeout\).*/\1/p' "$1" | head -1
+}
+test_budget_root="$tmp_scratch_dir/test_run_budget.weft"
+printf -- '-- Run budget: 6 s\ntest "declared budget" { while true { Test.assert_eq(1, 1) } }\n' > "$test_budget_root"
+set +e
+env WEFT_TEST_COMPILE_TIMEOUT=30 WEFT_TEST_RUN_TIMEOUT=1 "$WEFT" test --jobs 1 "$test_budget_root" > "$tmp_out" 2>"$tmp_err"
+test_budget_exit=$?
+set -e
+assert_equals "test_run_budget_still_stops_a_runaway" "$test_budget_exit" "1"
+test_budget_ms=$(test_budget_elapsed "$tmp_err")
+if [[ "$test_budget_ms" =~ ^[0-9]+$ ]] && [ "$test_budget_ms" -ge 6000 ]; then
+  echo "  ok test_run_budget_extends_the_host_stop"
+else
+  echo "  fail test_run_budget_extends_the_host_stop"
+  echo "    elapsed: ${test_budget_ms:-missing}"
+  exit 1
+fi
+printf -- '-- Run budget: 1 s\ntest "short budget" { while true { Test.assert_eq(1, 1) } }\n' > "$test_budget_root"
+set +e
+env WEFT_TEST_COMPILE_TIMEOUT=30 WEFT_TEST_RUN_TIMEOUT=4 "$WEFT" test --jobs 1 "$test_budget_root" > "$tmp_out" 2>"$tmp_err"
+set -e
+test_budget_ms=$(test_budget_elapsed "$tmp_err")
+if [[ "$test_budget_ms" =~ ^[0-9]+$ ]] && [ "$test_budget_ms" -ge 4000 ]; then
+  echo "  ok test_run_budget_never_shortens_the_host_stop"
+else
+  echo "  fail test_run_budget_never_shortens_the_host_stop"
+  echo "    elapsed: ${test_budget_ms:-missing}"
+  exit 1
+fi
+for test_budget_directive in '-- Run budget: 0 s' '-- Run budget: 5' '-- Run budget: 4000 s' '-- Run budget: s'; do
+  printf -- '%s\ntest "malformed budget" { Test.assert_eq(1, 1) }\n' "$test_budget_directive" > "$test_budget_root"
+  set +e
+  "$WEFT" test --jobs 1 "$test_budget_root" > "$tmp_out" 2>"$tmp_err"
+  test_budget_exit=$?
+  set -e
+  assert_equals "test_run_budget_rejects_malformed: $test_budget_directive" "$test_budget_exit" "1"
+  assert_contains "test_run_budget_reports_malformed: $test_budget_directive" "$(<"$tmp_err")" "malformed run budget directive"
+done
+
+# Linked programs declare compile-phase stops the same way.
+source test/linked/budget.sh
+printf 'fn main() -> i64 { 0 }\n' > "$test_budget_root"
+assert_equals "linked_compile_budget_defaults_to_host" "$(linked_compile_budget "$test_budget_root" 120)" "120"
+printf -- '-- Compile budget: 300 s\nfn main() -> i64 { 0 }\n' > "$test_budget_root"
+assert_equals "linked_compile_budget_extends_host" "$(linked_compile_budget "$test_budget_root" 120)" "300"
+printf -- '-- Compile budget: 30 s\nfn main() -> i64 { 0 }\n' > "$test_budget_root"
+assert_equals "linked_compile_budget_never_shortens_host" "$(linked_compile_budget "$test_budget_root" 120)" "120"
+for test_budget_directive in '-- Compile budget: 0 s' '-- Compile budget: 5' '-- Compile budget: 4000 s' '-- Compile budget: s'; do
+  printf -- '%s\nfn main() -> i64 { 0 }\n' "$test_budget_directive" > "$test_budget_root"
+  test_budget_status=0
+  linked_compile_budget "$test_budget_root" 120 > "$tmp_out" || test_budget_status=$?
+  assert_equals "linked_compile_budget_rejects_malformed: $test_budget_directive" "$test_budget_status" "1"
+done
+assert_equals "linked_grammar_comptime_declares_compile_budget" "$(linked_compile_budget test/linked/grammar_comptime.weft 120)" "300"
+
 set +e
 env WEFT_TEST_COMPILE_RSS_LIMIT_KB=1 "$WEFT" test --jobs 1 "$tmp_test_after" > "$tmp_out" 2>"$tmp_err"
 test_rss_exit=$?

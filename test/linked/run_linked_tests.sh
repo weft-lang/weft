@@ -70,6 +70,8 @@ run_guarded() {
   wait "$pid"
 }
 
+source "$(dirname "$0")/budget.sh"
+
 echo "=== Linked Test Suite ==="
 echo ""
 
@@ -99,6 +101,13 @@ for f in test/linked/*.weft; do
       ;;
   esac
 
+  if ! compile_timeout=$(linked_compile_budget "$f" "$WEFT_TEST_COMPILE_TIMEOUT"); then
+    echo "  ✗ $name (malformed compile budget; use \`-- Compile budget: N s\`, 1..3600)"
+    ERRORS="$ERRORS\n  $name: malformed compile budget"
+    FAIL=$((FAIL+1))
+    continue
+  fi
+
   tmpbin=$(mktemp /tmp/weft_linked_XXXXXX)
 
   # Compile straight to the final native-linked executable. No host linker or
@@ -106,9 +115,9 @@ for f in test/linked/*.weft; do
   compile_exit=0
   if grep -qE '(^|[[:space:]])fn[[:space:]]+main[[:space:]]*\(' "$f"; then
     rm -f "$tmpbin"
-    run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" build "$f" -o "$tmpbin" >/dev/null 2>&1 || compile_exit=$?
+    run_guarded "$compile_timeout" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" build "$f" -o "$tmpbin" >/dev/null 2>&1 || compile_exit=$?
   else
-    run_guarded "$WEFT_TEST_COMPILE_TIMEOUT" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" test --emit "$f" > "$tmpbin" 2>/dev/null || compile_exit=$?
+    run_guarded "$compile_timeout" "$WEFT_TEST_COMPILE_RSS_LIMIT_KB" "$WEFT" test --emit "$f" > "$tmpbin" 2>/dev/null || compile_exit=$?
   fi
   if [ "$compile_exit" -ne 0 ]; then
     if [ "$compile_exit" -eq 124 ]; then
