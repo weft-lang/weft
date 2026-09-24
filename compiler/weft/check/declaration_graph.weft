@@ -1,0 +1,399 @@
+-- compiler/weft/check/declaration_graph.weft -- a module's type-declaration graph
+--
+-- Type declarations form a graph through the named types in their fields,
+-- variant payloads, opaque representations and alias targets. Nodes are exact
+-- declaration identities; a short name never classifies a declaration.
+--
+-- Import cycles are rejected, so every strongly connected component lies within
+-- one module. The graph is therefore built over the declarations of the module
+-- being checked.
+--
+-- Regularity. A recursive instantiation passes its own parameters or closed
+-- types, never a type built from its parameters: `Chain<T>` may recur at
+-- `Chain<T>` or `Chain<i64>`, but not at `Chain<Vector<T>>`. Monomorphisation
+-- specialises every instantiation, and layouts, cleanup plans and ownership
+-- facts must close over finitely many of them, so a growing recursion can never
+-- be compiled.
+
+use compiler/diagnostic/location.{diagnostic_location_from_offsets}
+use compiler/storage.{nlist_get, nlist_len}
+use compiler/types/algebra.{
+  ty_f1,
+  ty_f2,
+  ty_f3,
+  ty_is_rc,
+  ty_named_declaration,
+  ty_rc_inner,
+  ty_record_field_type,
+  ty_record_fields,
+  ty_tag
+}
+use compiler/weft/check/table.{
+  ttable_entry_at,
+  ttable_entry_count,
+  ttable_entry_index,
+  ttable_entry_item_count,
+  ttable_entry_items,
+  ttable_entry_kind,
+  ttable_entry_name_len,
+  ttable_entry_name_ptr,
+  ttable_entry_record_field_type,
+  ttable_entry_source,
+  ttable_entry_type_declaration,
+  ttable_entry_variant_payloads,
+  ttable_lookup_decl_fact,
+  ttable_mark_nonregular_declaration
+}
+use runtime/string.{runtime_str_from_bytes_copy}
+use stdlib/diagnostic/registry
+use stdlib/diagnostic/schema.{*}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/map as map
+use stdlib/map.{Map}
+use stdlib/option.{None, Some}
+use stdlib/vector as vector
+use stdlib/vector.{vector_get_in_bounds, vector_len}
+use stdlib/vector/handles.{Vector}
+
+-- Resolve a named type to its exact table entry. A named type without a
+-- resolved declaration has no identity the graph may classify.
+fn declaration_graph_entry(tt: i64, ty: i64) -> i64 {
+  let declaration = ty_named_declaration(ty)
+  if declaration == 0 { 0 } else { ttable_lookup_decl_fact(tt, declaration) }
+}
+
+fn declaration_graph_is_declaration_kind(kind: i64) -> bool {
+  kind == 0 or kind == 1 or kind == 5 or kind == 6
+}
+
+-- The types a declaration's values are made of: record fields, variant
+-- payloads, an opaque representation or an alias target.
+fn declaration_shape(entry: i64) -> List<i64> {
+  let kind = ttable_entry_kind(entry)
+  let mut shape = Nil<i64>()
+  if kind == 0 {
+    for index in 0..ttable_entry_item_count(entry) {
+      shape = Cons<i64>(ttable_entry_record_field_type(entry, index), shape)
+    }
+  } else if kind == 1 {
+    for variant in 0..ttable_entry_item_count(entry) {
+      let payloads = ttable_entry_variant_payloads(entry, variant)
+      if payloads != 0 {
+        for index in 0..nlist_len(payloads) {
+          shape = Cons<i64>(nlist_get(payloads, index), shape)
+        }
+      } else { nil }
+    }
+  } else if kind == 5 or kind == 6 { shape = Cons<i64>(ttable_entry_items(entry), shape) }
+  else { nil }
+  shape
+}
+
+-- Whether `target` is reachable from `from` along the module's edges.
+fn declaration_graph_reaches(adjacency: borrow Vector<List<i64>>, from: i64, target: i64) -> bool
+{
+  let mut visited = map.new<i64, bool>()
+  let mut pending = Cons<i64>(from, Nil<i64>())
+  let mut found = false
+  let mut done = false
+  while not done {
+    match pending {
+      Nil -> { done = true }
+      Cons(position, rest) -> {
+        pending = rest
+        if position == target {
+          found = true
+          done = true
+        } else if not visited.contains_key(position) {
+          visited = visited.insert(position, true)
+          let mut targets = vector_get_in_bounds<List<i64>>(adjacency, position)
+          let mut listed = false
+          while not listed {
+            match targets {
+              Nil -> { listed = true }
+              Cons(next, others) -> {
+                pending = Cons<i64>(next, pending)
+                targets = others
+              }
+            }
+          }
+        } else { nil }
+      }
+    }
+  }
+  found
+}
+
+fn declaration_graph_name(entry: i64) -> str {
+  runtime_str_from_bytes_copy(ttable_entry_name_ptr(entry), ttable_entry_name_len(entry))
+}
+
+fn declaration_graph_location(entry: i64) -> DiagnosticLocation {
+  let source = ttable_entry_source(entry)
+  let start = ttable_entry_name_ptr(entry) - source
+  diagnostic_location_from_offsets(
+    DiagnosticSourceBuffer(source),
+    start,
+    start + ttable_entry_name_len(entry)
+  )
+}
+
+fn declaration_graph_related(label: str, entry: i64, owner: i64) -> DiagnosticRelatedLocationList
+{
+  if entry == owner { DiagnosticRelatedLocationNil }
+  else {
+    DiagnosticRelatedLocationCons(
+      DiagnosticRelatedLocation(label, declaration_graph_location(entry)),
+      DiagnosticRelatedLocationNil
+    )
+  }
+}
+
+fn declaration_graph_report(
+  class: DiagnosticClass,
+  code: DiagnosticCode,
+  message: str,
+  entry: i64,
+  related: DiagnosticRelatedLocationList,
+  reason: str
+) -[Diagnose]> i64 {
+  Diagnose.report(
+    Diagnostic(
+      DiagnosticSeverityError,
+      class,
+      code,
+      message,
+      declaration_graph_location(entry),
+      related,
+      DiagnosticFieldCons(DiagnosticFieldText("reason", reason), DiagnosticFieldNil)
+    )
+  )
+  1
+}
+
+-- A use of one of the module's declarations inside another declaration.
+type DeclarationUse { target: i64, arguments: i64 }
+
+-- Collect every use of a module declaration at any position of `ty`, owning
+-- or not: regularity concerns instantiation, not ownership.
+fn declaration_graph_uses(
+  tt: i64,
+  positions: Map<i64, i64>,
+  ty: i64,
+  out: borrow mut Vector<DeclarationUse>
+) -> nil {
+  if ty == 0 { return nil }
+  match ty_tag(ty) {
+    3 -> {
+      declaration_graph_uses(tt, positions, ty_f1(ty), out)
+      declaration_graph_uses(tt, positions, ty_f2(ty), out)
+    }
+    4 -> {
+      declaration_graph_uses(tt, positions, ty_f1(ty), out)
+      declaration_graph_uses(tt, positions, ty_f2(ty), out)
+    }
+    6 -> {
+      declaration_graph_uses_list(tt, positions, ty_f1(ty), out)
+      declaration_graph_uses(tt, positions, ty_f2(ty), out)
+    }
+    7 -> {
+      let fields = ty_record_fields(ty)
+      if fields != 0 {
+        for index in 0..nlist_len(fields) {
+          declaration_graph_uses(
+            tt,
+            positions,
+            ty_record_field_type(nlist_get(fields, index)),
+            out
+          )
+        }
+      } else { nil }
+    }
+    8 -> declaration_graph_uses(tt, positions, ty_f2(ty), out)
+    9 -> {
+      if ty_is_rc(ty) { declaration_graph_uses(tt, positions, ty_rc_inner(ty), out) }
+      else {
+        let entry = declaration_graph_entry(tt, ty)
+        if entry != 0 {
+          match positions.get(ttable_entry_index(tt, entry)) {
+            Some(position) -> out.push(DeclarationUse { target: position, arguments: ty_f3(ty) })
+            None -> nil
+          }
+        } else { nil }
+        declaration_graph_uses_list(tt, positions, ty_f3(ty), out)
+      }
+    }
+    14 -> {
+      declaration_graph_uses(tt, positions, ty_f1(ty), out)
+      declaration_graph_uses(tt, positions, ty_f2(ty), out)
+    }
+    tag -> if tag == 5 or tag == 15 or tag == 16 or tag == 17 or tag == 18 or tag == 19 or
+      tag == 21 or tag == 22 or tag == 23 or tag == 29 {
+        declaration_graph_uses(tt, positions, ty_f1(ty), out)
+      } else { nil }
+  }
+}
+
+fn declaration_graph_uses_list(
+  tt: i64,
+  positions: Map<i64, i64>,
+  types: i64,
+  out: borrow mut Vector<DeclarationUse>
+) -> nil {
+  if types != 0 {
+    for index in 0..nlist_len(types) {
+      declaration_graph_uses(tt, positions, nlist_get(types, index), out)
+    }
+  } else { nil }
+}
+
+-- Whether a type mentions any type variable.
+fn declaration_graph_mentions_variable(ty: i64) -> bool {
+  if ty == 0 { return false }
+  match ty_tag(ty) {
+    12 -> true
+    3 -> declaration_graph_mentions_variable(ty_f1(ty)) or
+      declaration_graph_mentions_variable(ty_f2(ty))
+    4 -> declaration_graph_mentions_variable(ty_f1(ty)) or
+      declaration_graph_mentions_variable(ty_f2(ty))
+    6 -> declaration_graph_list_mentions_variable(ty_f1(ty)) or
+      declaration_graph_mentions_variable(ty_f2(ty))
+    7 -> {
+      let fields = ty_record_fields(ty)
+      let mut found = false
+      if fields != 0 {
+        for index in 0..nlist_len(fields) {
+          if declaration_graph_mentions_variable(ty_record_field_type(nlist_get(fields, index))) {
+            found = true
+          } else { nil }
+        }
+      } else { nil }
+      found
+    }
+    8 -> declaration_graph_mentions_variable(ty_f2(ty))
+    9 -> if ty_is_rc(ty) { declaration_graph_mentions_variable(ty_rc_inner(ty)) } else {
+      declaration_graph_list_mentions_variable(ty_f3(ty))
+    }
+    14 -> declaration_graph_mentions_variable(ty_f1(ty)) or
+      declaration_graph_mentions_variable(ty_f2(ty))
+    tag -> if tag == 5 or tag == 15 or tag == 16 or tag == 17 or tag == 18 or tag == 19 or
+      tag == 21 or tag == 22 or tag == 23 or tag == 29 {
+        declaration_graph_mentions_variable(ty_f1(ty))
+      } else { false }
+  }
+}
+
+fn declaration_graph_list_mentions_variable(types: i64) -> bool {
+  let mut found = false
+  if types != 0 {
+    for index in 0..nlist_len(types) {
+      if declaration_graph_mentions_variable(nlist_get(types, index)) { found = true } else {
+        nil
+      }
+    }
+  } else { nil }
+  found
+}
+
+-- A recursive instantiation's argument grows when it is built from the
+-- declaration's parameters without being one of them.
+fn declaration_graph_arguments_grow(arguments: i64) -> bool {
+  let mut grows = false
+  if arguments != 0 {
+    for index in 0..nlist_len(arguments) {
+      let argument = nlist_get(arguments, index)
+      if argument != 0 and ty_tag(argument) != 12 and declaration_graph_mentions_variable(
+        argument
+      ) {
+        grows = true
+      } else { nil }
+    }
+  } else { nil }
+  grows
+}
+
+fn check_declaration_regularity(
+  tt: i64,
+  locals: borrow Vector<i64>,
+  positions: Map<i64, i64>
+) -[Diagnose]> i64 {
+  let count = vector_len<i64>(locals)
+  let mut adjacency = vector.new<List<i64>>()
+  let mut uses = vector.new<Vector<DeclarationUse>>()
+  for position in 0..count {
+    let entry = ttable_entry_at(tt, vector_get_in_bounds<i64>(locals, position))
+    let mut found = vector.new<DeclarationUse>()
+    let mut shape = declaration_shape(entry)
+    let mut done = false
+    while not done {
+      match shape {
+        Nil -> { done = true }
+        Cons(ty, rest) -> {
+          declaration_graph_uses(tt, positions, ty, found)
+          shape = rest
+        }
+      }
+    }
+    let mut targets = Nil<i64>()
+    for index in 0..vector_len<DeclarationUse>(found) {
+      targets = Cons<i64>(vector_get_in_bounds<DeclarationUse>(found, index).target, targets)
+    }
+    adjacency.push(targets)
+    uses.push(found)
+  }
+  let mut errors = 0
+  for position in 0..count {
+    let found = vector_get_in_bounds<Vector<DeclarationUse>>(uses, position)
+    let mut reported = false
+    for index in 0..vector_len<DeclarationUse>(found) {
+      let use_site = vector_get_in_bounds<DeclarationUse>(found, index)
+      if not reported and declaration_graph_arguments_grow(use_site.arguments) and
+        declaration_graph_reaches(adjacency, use_site.target, position) {
+          let entry = ttable_entry_at(tt, vector_get_in_bounds<i64>(locals, position))
+          let target = ttable_entry_at(tt, vector_get_in_bounds<i64>(locals, use_site.target))
+          let name = declaration_graph_name(entry)
+          ttable_mark_nonregular_declaration(tt, ttable_entry_type_declaration(tt, entry))
+          errors = errors + declaration_graph_report(
+            DiagnosticClassType,
+            registry.nonregular_recursive_type(),
+            i"recursive type `{name}` instantiates its recursion with an argument built from its parameters",
+            entry,
+            declaration_graph_related("recursive instantiation of this type", target, entry),
+            "growing_recursive_argument"
+          )
+          reported = true
+        } else { nil }
+    }
+  }
+  errors
+}
+
+-- The module's declarations as exact table entries, in table order, and each
+-- entry's position among them.
+fn declaration_graph_locals(tt: i64, user_src: i64) -> (owned Vector<i64>, Map<i64, i64>) {
+  let mut locals = vector.new<i64>()
+  let mut positions = map.new<i64, i64>()
+  for index in 0..ttable_entry_count(tt) {
+    let entry = ttable_entry_at(tt, index)
+    if declaration_graph_is_declaration_kind(ttable_entry_kind(entry)) and
+      (user_src == 0 or ttable_entry_source(entry) == user_src) {
+        let declaration = ttable_entry_type_declaration(tt, entry)
+        let exact = if declaration == 0 { 0 } else { ttable_lookup_decl_fact(tt, declaration) }
+        let canonical = ttable_entry_index(tt, if exact == 0 { entry } else { exact })
+        if not positions.contains_key(canonical) {
+          positions = positions.insert(canonical, vector_len<i64>(locals))
+          locals.push(canonical)
+        } else { nil }
+      } else { nil }
+  }
+  (locals, positions)
+}
+
+-- Check the type declarations of the module whose source is `user_src`, or of
+-- every module when `user_src` is zero.
+pub(package) fn check_declaration_graph(tt: i64, user_src: i64) -[Diagnose]> i64 {
+  let (locals, positions) = declaration_graph_locals(tt, user_src)
+  if vector_len<i64>(locals) == 0 { 0 } else {
+    check_declaration_regularity(tt, locals, positions)
+  }
+}

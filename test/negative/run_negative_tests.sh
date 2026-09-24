@@ -692,6 +692,11 @@ check_rejects "unknown_type_signature" "test/negative/unknown_type_signature.wef
 check_rejects "unimported_loaded_type" "test/negative/unimported_loaded_type.weft" "error[E1001]: unknown type 'Vector'"
 check_rejects "prelude_type_in_imported_module" "test/negative/prelude_type_in_imported_module.weft" "error[E1001]: unknown type 'Option'"
 check_rejects "private_type_glob_import" "test/negative/private_type_glob_import.weft" "error[E1001]: unknown type 'HiddenType'"
+check_rejects "nonregular_recursive_type" "test/negative/nonregular_recursive_type.weft" 'error[E1011]: recursive type `Chain` instantiates its recursion with an argument built from its parameters'
+check_rejects "nonregular_recursive_type_mutual" "test/negative/nonregular_recursive_type_mutual.weft" 'error[E1011]: recursive type `Left` instantiates its recursion'
+check_rejects "nonregular_recursive_type_function" "test/negative/nonregular_recursive_type_function.weft" 'error[E1011]: recursive type `Knot` instantiates its recursion'
+check_rejects "nonregular_recursive_type_weak" "test/negative/nonregular_recursive_type_weak.weft" 'error[E1011]: recursive type `Tower` instantiates its recursion'
+check_rejects "nonregular_recursive_type_body_use" "test/negative/nonregular_recursive_type_body_use.weft" 'error[E1011]: recursive type `Chain` instantiates its recursion' 1
 check_rejects "unknown_intrinsic_call" "test/negative/unknown_intrinsic_call.weft" "error[E1001]: unknown function '__definitely_not_an_intrinsic'"
 check_rejects "unknown_function_in_import" "test/negative/unknown_function_in_import.weft" "error[E1001]: unknown function 'some_function_that_does_not_exist'"
 check_rejects "module_plain_import_does_not_leak_value" "test/negative/module_plain_import_does_not_leak_value.weft" "error[E1001]: unknown function 'work'"
