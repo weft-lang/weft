@@ -717,6 +717,11 @@ check_rejects "nested_projection_signature" "test/negative/nested_projection_sig
 check_rejects "nested_projection_annotation" "test/negative/nested_projection_annotation.weft" 'error[E0003]: an associated type of an associated type cannot be specialised yet' 1
 check_rejects "trait_constraint_later_type_parameter" "test/negative/trait_constraint_later_type_parameter.weft" "error[E1001]: unknown type 'C'" 1
 check_rejects "trait_constraint_unknown_type" "test/negative/trait_constraint_unknown_type.weft" "error[E1001]: unknown type 'Brnch'" 1
+check_rejects "unknown_associated_type_signature" "test/negative/unknown_associated_type_signature.weft" "error[E1001]: unknown associated type 'T.Parent'" 1
+check_rejects "unknown_associated_type_unbounded" "test/negative/unknown_associated_type_unbounded.weft" "error[E1001]: unknown associated type 'T.Child'" 1
+check_rejects "unknown_associated_type_annotation" "test/negative/unknown_associated_type_annotation.weft" "error[E1001]: unknown associated type 'T.Parent'" 1
+check_rejects "unknown_associated_type_argument" "test/negative/unknown_associated_type_argument.weft" "error[E1001]: unknown associated type 'T.Parent'" 1
+check_rejects "unknown_type_generic_argument" "test/negative/unknown_type_generic_argument.weft" "error[E1001]: unknown type 'Nope'" 2
 check_rejects "unknown_intrinsic_call" "test/negative/unknown_intrinsic_call.weft" "error[E1001]: unknown function '__definitely_not_an_intrinsic'"
 check_rejects "unknown_function_in_import" "test/negative/unknown_function_in_import.weft" "error[E1001]: unknown function 'some_function_that_does_not_exist'"
 check_rejects "module_plain_import_does_not_leak_value" "test/negative/module_plain_import_does_not_leak_value.weft" "error[E1001]: unknown function 'work'"
