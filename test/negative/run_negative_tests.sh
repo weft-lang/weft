@@ -1140,6 +1140,7 @@ check_rejects "owned_opaque_vector_wrapper" "test/negative/owned_opaque_vector_w
 check_rejects "slice_same_named_user_vector" "test/negative/slice_same_named_user_vector.weft" "type error: slicing requires an array, slice, or Vector"
 check_rejects "for_same_named_user_iterator" "test/negative/for_same_named_user_iterator.weft" "type error: for iterator requires an array, slice, Cons/Nil list, or IntoIterator"
 check_rejects "ownership_cycle_vector_self" "test/negative/ownership_cycle_vector_self.weft" 'error[E3001]: type `Node` can own itself through a mutable container'
+check_rejects "ownership_cycle_imported_module" "test/negative/ownership_cycle_imported_module.weft" 'error[E3001]: type `LoopNode` can own itself through a mutable container'
 check_rejects "ownership_cycle_vector_mutual" "test/negative/ownership_cycle_vector_mutual.weft" 'error[E3001]: type `Parent` can own itself through a mutable container'
 check_rejects "ownership_cycle_vector_generic_box" "test/negative/ownership_cycle_vector_generic_box.weft" 'error[E3001]: type `Node` can own itself through a mutable container'
 check_rejects "ownership_cycle_sorted_map_self" "test/negative/ownership_cycle_sorted_map_self.weft" 'error[E3001]: type `Node` can own itself through a mutable container'
