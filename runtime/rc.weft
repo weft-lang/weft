@@ -1,7 +1,7 @@
 -- runtime/rc.weft -- explicit reference-counted heap blocks
 
 use runtime/alloc.{*}
-use runtime/panic.{runtime_trap}
+use runtime/panic.{runtime_capture_trace, runtime_trap, runtime_trap_with_history}
 use runtime/effects.{*}
 use runtime/memory.{*}
 use runtime/syscall.{*}
@@ -28,8 +28,123 @@ pub(package) fn rc_magic_value() -> i64 { 974319517 }
 -- block, or a node whose strong count has already reached zero, means that
 -- stake no longer exists. Ordinary code cannot free a managed object, so this
 -- is an ownership miscompilation; continuing would corrupt the free list or
--- resurrect a dying node.
-pub(package) fn rc_stale_reference_trap() -> never { runtime_trap(48, 0) }
+-- resurrect a dying node. A quarantine build still holds a freed block, so
+-- its report also names the release that freed it and where that happened.
+pub(package) fn rc_stale_reference_trap(header: i64) -> never {
+  let entry = rc_quarantine_find(heap_quarantine(rc_default_heap_existing()), header)
+  if entry == 0 { runtime_trap(48, 0) }
+  else {
+    runtime_trap_with_history(
+      48,
+      "freed by release",
+      rc_quarantine_entry_sequence(entry),
+      rc_quarantine_entry_trace(entry),
+      rc_quarantine_entry_trace_length(entry),
+      rc_quarantine_trace_limit()
+    )
+  }
+}
+
+-- Quarantine: delayed reuse of freed managed objects.
+--
+-- An `--rc-quarantine` build holds each freed default-heap block out of the
+-- free lists for a bounded time. The freed header stays recognisably dead,
+-- so a retain or release of the freed object traps (code 48) instead of
+-- touching a reused one. The entry keeps the free's sequence number and its
+-- calling chain, so the trap can report which release freed the object and
+-- where. Once the ring is full, each new entry returns the oldest block to
+-- the heap. Ordinary builds never create a quarantine.
+--
+-- The table is [capacity, count, oldest slot, next sequence], followed by
+-- `capacity` entries of [header, block size, sequence, trace length,
+-- trace...]. Arena memory starts zeroed.
+pub(package) fn rc_quarantine_trace_limit() -> i64 { 12 }
+
+pub(package) fn rc_quarantine_entry_words() -> i64 { 4 + rc_quarantine_trace_limit() }
+
+pub(package) fn rc_quarantine_default_capacity() -> i64 { 262144 }
+
+pub(package) fn rc_quarantine_new(capacity: i64) -> i64 {
+  if capacity <= 0 { 0 }
+  else {
+    let bytes = (4 + capacity * rc_quarantine_entry_words()) * 8
+    let table = arena_alloc(arena_new(bytes), bytes, 16)
+    if table != 0 {
+      __mem_store64(table, capacity)
+      __mem_store64(table + 24, 1)
+    } else { 0 }
+    table
+  }
+}
+
+pub(package) fn rc_quarantine_capacity(quarantine: i64) -> i64 { __mem_load64(quarantine) }
+
+pub(package) fn rc_quarantine_count(quarantine: i64) -> i64 { __mem_load64(quarantine + 8) }
+
+fn rc_quarantine_slot(quarantine: i64, slot: i64) -> i64 {
+  quarantine + (4 + slot * rc_quarantine_entry_words()) * 8
+}
+
+--- Hold a freed block. `size` is what the heap needs to free it later. When
+--- the ring is full, the oldest held block goes back to the heap first.
+--- Returns the new entry's sequence number, counting frees from one.
+pub(package) fn rc_quarantine_hold(heap: i64, quarantine: i64, header: i64, size: i64) -> i64 {
+  -- Capturing first keeps this function's own frame the start of the chain.
+  let frame = __frame_pointer()
+  heap_lock(heap)
+  let capacity = __mem_load64(quarantine)
+  let count = __mem_load64(quarantine + 8)
+  let oldest = __mem_load64(quarantine + 16)
+  let sequence = __mem_load64(quarantine + 24)
+  let slot = if count < capacity { (oldest + count) % capacity } else {
+    let evicted = rc_quarantine_slot(quarantine, oldest)
+    heap_free_unlocked(heap, __mem_load64(evicted), __mem_load64(evicted + 8))
+    __mem_store64(quarantine + 16, (oldest + 1) % capacity)
+    oldest
+  }
+  let entry = rc_quarantine_slot(quarantine, slot)
+  __mem_store64(entry, header)
+  __mem_store64(entry + 8, size)
+  __mem_store64(entry + 16, sequence)
+  __mem_store64(entry + 24, runtime_capture_trace(frame, entry + 32, rc_quarantine_trace_limit()))
+  if count < capacity { __mem_store64(quarantine + 8, count + 1) } else { 0 }
+  __mem_store64(quarantine + 24, sequence + 1)
+  heap_unlock(heap)
+  sequence
+}
+
+--- The held entry for a freed block's header, or 0 when the block is not
+--- held (never freed, or already returned to the heap).
+pub(package) fn rc_quarantine_find(quarantine: i64, header: i64) -> i64 {
+  if quarantine == 0 { 0 }
+  else {
+    let capacity = __mem_load64(quarantine)
+    let count = __mem_load64(quarantine + 8)
+    let oldest = __mem_load64(quarantine + 16)
+    let mut found = 0
+    let mut i = count
+    while found == 0 and i > 0 {
+      i = i - 1
+      let entry = rc_quarantine_slot(quarantine, (oldest + i) % capacity)
+      if __mem_load64(entry) == header { found = entry } else { 0 }
+    }
+    found
+  }
+}
+
+pub(package) fn rc_quarantine_entry_sequence(entry: i64) -> i64 { __mem_load64(entry + 16) }
+
+pub(package) fn rc_quarantine_entry_trace_length(entry: i64) -> i64 {
+  __mem_load64(entry + 24)
+}
+
+pub(package) fn rc_quarantine_entry_trace(entry: i64) -> i64 { entry + 32 }
+
+--- Called once before `main` in an `--rc-quarantine` build: from here on the
+--- default heap holds freed managed objects back from reuse.
+pub(package) fn rc_quarantine_enable() -> i64 {
+  heap_set_quarantine(rc_default_heap(), rc_quarantine_new(rc_quarantine_default_capacity()))
+}
 
 pub(package) fn rc_default_heap_offset() -> i64 { 8 }
 
@@ -262,7 +377,13 @@ pub(package) fn rc_free_if_unreferenced(heap: i64, header: i64) -> i64 {
   if strong <= 0 and weak <= 0 {
     let block_size = rc_header_block_size(header)
     __mem_store64(header + rc_magic_offset(), 0)
-    heap_free(heap, header, block_size)
+    let quarantine = heap_quarantine(heap)
+    if quarantine == 0 { heap_free(heap, header, block_size) }
+    else {
+      -- Holding the block frees it as far as the caller can tell.
+      rc_quarantine_hold(heap, quarantine, header, block_size)
+      0
+    }
   } else { 0 }
 }
 
@@ -587,11 +708,11 @@ pub(package) fn rc_default_retain(payload: i64) -> i64 {
     if in_heap == 0 { 0 - 1 }
     else {
       if __mem_load64(header + rc_magic_offset()) != rc_magic_value() {
-        rc_stale_reference_trap()
+        rc_stale_reference_trap(header)
       }
       else {
         let count = __mem_load64(header + rc_count_offset())
-        if count <= 0 { rc_stale_reference_trap() }
+        if count <= 0 { rc_stale_reference_trap(header) }
         else {
           if __mem_load64(header + rc_promoted_offset()) != 0 {
             rc_default_retain_promoted_slow(payload)
@@ -649,11 +770,11 @@ pub(package) fn rc_deep_release_child(child: i64, pending: i64) -> i64 {
     if in_heap == 0 { pending }
     else {
       if __mem_load64(header + rc_magic_offset()) != rc_magic_value() {
-        rc_stale_reference_trap()
+        rc_stale_reference_trap(header)
       }
       else {
         let count = __mem_load64(header + rc_count_offset())
-        if count <= 0 { rc_stale_reference_trap() }
+        if count <= 0 { rc_stale_reference_trap(header) }
         else {
           if __mem_load64(header + rc_promoted_offset()) != 0 {
             rc_default_release_promoted(child)
@@ -1331,6 +1452,7 @@ pub(package) fn rc_deep_release_custom(
 
 pub(package) fn rc_deep_release_walk(first: i64) -> i64 {
   let heap = rc_default_heap()
+  let quarantine = heap_quarantine(heap)
   let mut pending = first
   while pending != 0 {
     let node = pending
@@ -1378,7 +1500,8 @@ pub(package) fn rc_deep_release_walk(first: i64) -> i64 {
       let rounded = (rc_header_size() + rc_size_word_size(word) + 7) / 8 * 8
       let need = if rounded < heap_min_block_size() { heap_min_block_size() } else { rounded }
       __mem_store64(header + rc_magic_offset(), 0)
-      if need <= heap_bin_limit() {
+      if quarantine != 0 { rc_quarantine_hold(heap, quarantine, header, need) }
+      else if need <= heap_bin_limit() {
         heap_lock(heap)
         let cell = heap + 16 + (need / 8) * 8
         __mem_store64(header, __mem_load64(cell))
@@ -1515,11 +1638,11 @@ pub(package) fn rc_default_release(payload: i64) -> i64 {
     if in_heap == 0 { 0 - 1 }
     else {
       if __mem_load64(header + rc_magic_offset()) != rc_magic_value() {
-        rc_stale_reference_trap()
+        rc_stale_reference_trap(header)
       }
       else {
         let count = __mem_load64(header + rc_count_offset())
-        if count <= 0 { rc_stale_reference_trap() }
+        if count <= 0 { rc_stale_reference_trap(header) }
         else {
           if __mem_load64(header + rc_promoted_offset()) != 0 {
             rc_default_release_promoted(payload)
@@ -1580,7 +1703,10 @@ pub(package) fn rc_default_drop_reuse(payload: i64) -> i64 {
       __mem_load64(header + rc_promoted_offset()) == 0 and
       __mem_load64(header + rc_weak_count_offset()) <= 0 and
       rc_size_word_has_layout_descriptor(size_word) == 0 and
-      rc_size_word_mask(size_word) < 1073741824
+      rc_size_word_mask(size_word) < 1073741824 and
+      heap_quarantine(rc_default_heap_existing()) == 0
+    -- Quarantine forgoes reuse tokens: a token reuses a block without
+    -- freeing it, which would hide the block from a stale reference.
     if reusable {
       rc_default_drop_reuse_fields(payload, size_word)
       -- A live token owns the raw block but none of its former children.

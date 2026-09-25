@@ -3117,6 +3117,58 @@ assert_contains "trap_reason" "$trap_err" "weft: trap: invalid native value home
 assert_contains "trap_trace_header" "$trap_err" "stack backtrace:"
 assert_contains "trap_trace_main" "$trap_err" "main at test/trap_exit.weft:5:4"
 
+# `--rc-quarantine` holds freed managed objects back from reuse and records
+# each free's calling chain. A stale release then reports the release that
+# freed the object after its own trace; an ordinary build reports only its own.
+run_weft_compile_guarded "$WEFT" build test/rc_quarantine_trace_exit.weft -o "$tmp_bin" --rc-quarantine > "$tmp_out" 2> "$tmp_err"
+chmod +x "$tmp_bin"
+set +e
+run_binary_guarded "$tmp_bin" >/dev/null 2>"$tmp_err"
+quarantine_trap_exit=$?
+set -e
+quarantine_trap_err=$(<"$tmp_err")
+quarantine_freeing_trace=${quarantine_trap_err#*freed by release #1:}
+quarantine_stale_trace=${quarantine_trap_err%%freed by release*}
+assert_equals "rc_quarantine_trap_exit" "$quarantine_trap_exit" "102"
+assert_contains "rc_quarantine_trap_reason" "$quarantine_trap_err" "weft: trap: managed object retained or released after it was freed (code 48)"
+assert_contains "rc_quarantine_names_the_freeing_release" "$quarantine_trap_err" $'stack backtrace:\n  0: rc_deep_release_walk at runtime/rc.weft:'
+assert_contains "rc_quarantine_freeing_trace_names_its_caller" "$quarantine_freeing_trace" $'  2: free_after at test/rc_quarantine_trace_exit.weft:8:4\n  3: free_after at test/rc_quarantine_trace_exit.weft:8:4\n  4: main at test/rc_quarantine_trace_exit.weft:16:4'
+assert_not_contains "rc_quarantine_freeing_trace_omits_the_stale_release" "$quarantine_freeing_trace" "release_after"
+assert_contains "rc_quarantine_stale_trace_comes_first" "$quarantine_stale_trace" "  2: release_after at test/rc_quarantine_trace_exit.weft:12:4"
+assert_not_contains "rc_quarantine_stale_trace_omits_the_free" "$quarantine_stale_trace" "free_after"
+run_weft_compile_guarded "$WEFT" build test/rc_quarantine_trace_exit.weft -o "$tmp_bin" > "$tmp_out" 2> "$tmp_err"
+chmod +x "$tmp_bin"
+set +e
+run_binary_guarded "$tmp_bin" >/dev/null 2>"$tmp_err"
+ordinary_trap_exit=$?
+set -e
+assert_equals "rc_ordinary_stale_release_exit" "$ordinary_trap_exit" "102"
+assert_not_contains "rc_ordinary_build_has_no_freeing_history" "$(<"$tmp_err")" "freed by release"
+# Quarantine changes when freed blocks are reused, never what a program
+# computes. This one frees enough objects to cycle the quarantine's ring.
+printf 'fn words(n: i64) -> List<str> { if n == 0 { Nil } else { Cons("w".concat(n.display()), words(n - 1)) } }\nfn total(list: List<str>) -> i64 { match list { Nil -> 0\n Cons(word, rest) -> (if word.len() > 2 { 2 } else { 1 }) + total(rest) } }\nfn main() -> i64 { let mut sum = 0\n for round in 0..4000 { sum = sum + total(words(40)) }\n sum %% 256 }\n' > "$tmp_src"
+run_weft_compile_guarded "$WEFT" build "$tmp_src" -o "$tmp_bin" --rc-quarantine > "$tmp_out" 2> "$tmp_err"
+chmod +x "$tmp_bin"
+set +e
+run_binary_guarded "$tmp_bin" > "$tmp_out" 2> "$tmp_err"
+quarantine_clean_exit=$?
+set -e
+assert_equals "rc_quarantine_keeps_program_results" "$quarantine_clean_exit" "96"
+assert_equals "rc_quarantine_clean_program_stderr_empty" "$(<"$tmp_err")" ""
+run_weft_compile_guarded "$WEFT" build "$tmp_src" -o "$tmp_bin" > "$tmp_out" 2> "$tmp_err"
+chmod +x "$tmp_bin"
+set +e
+run_binary_guarded "$tmp_bin" > "$tmp_out" 2> "$tmp_err"
+ordinary_clean_exit=$?
+set -e
+assert_equals "rc_quarantine_matches_ordinary_result" "$ordinary_clean_exit" "96"
+set +e
+"$WEFT" build test/rc_quarantine_trace_exit.weft -o "$tmp_bin" --rc-quarantine --rc-quarantine > "$tmp_out" 2> "$tmp_err"
+quarantine_twice_exit=$?
+set -e
+assert_equals "rc_quarantine_option_once_exit" "$quarantine_twice_exit" "2"
+assert_contains "rc_quarantine_option_in_usage" "$(<"$tmp_err")" "[--rc-quarantine]"
+
 printf 'fn broken() -> i64 { 1\nfn after() -> i64 { 2 }\n' > "$tmp_src"
 parse_recovery_out=$("$WEFT" ast < "$tmp_src" 2>&1)
 assert_contains "ast_reports_parse_recovery" "$parse_recovery_out" "error[E0002]: expected '}' before declaration"
@@ -7166,6 +7218,39 @@ assert_equals "test_rss_limit_returns_failure" "$test_rss_exit" "1"
 test_rss_err=$(<"$tmp_err")
 assert_contains "test_rss_limit_reports_peak_and_limit" "$test_rss_err" "KB exceeded limit"
 assert_contains "test_rss_limit_reports_failed_summary" "$test_rss_err" "0 passed, 1 failed"
+
+# WEFT_TEST_RC_QUARANTINE=1 builds every root with the `--rc-quarantine`
+# heap: ordinary roots, and legacy expected-exit roots alike.
+cat > "$tmp_import" <<'QUARANTINE_EOF'
+use runtime/alloc.{heap_quarantine}
+use runtime/rc.{rc_default_heap}
+
+test "the default heap quarantines freed objects" {
+  Test.assert_eq(if heap_quarantine(rc_default_heap()) != 0 { 1 } else { 0 }, 1)
+}
+QUARANTINE_EOF
+set +e
+env WEFT_TEST_RC_QUARANTINE=1 "$WEFT" test --jobs 1 "$tmp_import" > "$tmp_out" 2>"$tmp_err"
+quarantine_root_exit=$?
+"$WEFT" test --jobs 1 "$tmp_import" > "$tmp_out" 2>"$tmp_err"
+ordinary_root_exit=$?
+set -e
+assert_equals "test_rc_quarantine_env_quarantines_roots" "$quarantine_root_exit" "0"
+assert_equals "test_rc_quarantine_is_off_by_default" "$ordinary_root_exit" "1"
+# A failing root's trap report carries the freeing history only when the
+# runner built it with the quarantine.
+sed 's/^-- Expected exit code: 102/-- Expected exit code: 0/' test/rc_quarantine_trace_exit.weft > "$tmp_import"
+set +e
+env WEFT_TEST_RC_QUARANTINE=1 "$WEFT" test --jobs 1 "$tmp_import" > "$tmp_out" 2>"$tmp_err"
+quarantine_legacy_exit=$?
+quarantine_legacy_err=$(<"$tmp_err")
+"$WEFT" test --jobs 1 "$tmp_import" > "$tmp_out" 2>"$tmp_err"
+ordinary_legacy_err=$(<"$tmp_err")
+set -e
+assert_equals "test_rc_quarantine_expected_exit_root_fails" "$quarantine_legacy_exit" "1"
+assert_contains "test_rc_quarantine_expected_exit_root_reports_the_free" "$quarantine_legacy_err" "freed by release #1:"
+assert_contains "test_rc_quarantine_expected_exit_root_names_the_freeing_caller" "$quarantine_legacy_err" "free_after at $tmp_import:8:4"
+assert_not_contains "test_rc_quarantine_expected_exit_root_is_ordinary_by_default" "$ordinary_legacy_err" "freed by release"
 
 # A shared optimised dependency product replaces a root's dependency functions
 # with bodies optimised over the whole closure. `host_type_queries` inlines the
