@@ -1242,7 +1242,9 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_list_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len<T>(self: List<T>) -> usize"
     assert_contains "doc_stdlib_list_pins_unsigned_index" "$(<"$tmp_out")" "pub fn get<T>(self: List<T>, index: usize) -> Option<T>"
   elif [ "$stdlib_doc_name" = "bytes" ]; then
-    assert_contains "doc_stdlib_bytes_pins_public_surface" "$(<"$tmp_out")" "Public API items: 14. Documented: 14."
+    assert_contains "doc_stdlib_bytes_pins_public_surface" "$(<"$tmp_out")" "Public API items: 16. Documented: 16."
+    assert_contains "doc_stdlib_bytes_pins_bulk_append" "$(<"$tmp_out")" "pub fn append_to(self: Bytes, out: borrow Vector<u8>) -> nil"
+    assert_contains "doc_stdlib_bytes_pins_checked_range_copy" "$(<"$tmp_out")" "pub fn from_vector_range(values: borrow Vector<u8>, start: usize, end: usize) -> Option<Bytes>"
     assert_contains "doc_stdlib_bytes_pins_unsigned_length" "$(<"$tmp_out")" "pub fn len(self: Bytes) -> usize"
     assert_contains "doc_stdlib_bytes_pins_unsigned_index" "$(<"$tmp_out")" "pub fn get(self: Bytes, index: usize) -> Option<u8>"
     assert_contains "doc_stdlib_bytes_pins_unsigned_search" "$(<"$tmp_out")" "pub fn find(self: Bytes, needle: u8) -> Option<usize>"
