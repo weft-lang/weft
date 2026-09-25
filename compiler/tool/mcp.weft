@@ -1,0 +1,903 @@
+-- The compiler's Model Context Protocol surface.
+--
+-- One typed table names every tool with its stability, description and input
+-- schema; both tool listings are generated from it. Requests are classified
+-- once from a decoded JSON-RPC message, tool arguments are read from the
+-- request's JSON, and a tool answers with a typed outcome. Semantic facts are
+-- projected as JSON values: semantic types through the standard codec, every
+-- other fact kind through the projection below. The tool implementations are
+-- handler configurations in the compiler's command line.
+
+use compiler/tool/jsonrpc.{JsonRpcErrorCode, jsonrpc_member, jsonrpc_object, jsonrpc_render}
+use compiler/weft/facts/semantic.{*}
+use stdlib/json.{
+  Json,
+  JsonArray,
+  JsonBool,
+  JsonEntry,
+  JsonNull,
+  JsonNumber,
+  JsonObject,
+  JsonString,
+  json_quote_string
+}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/option.{None, Option, Some}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/semantic_type.{*}
+use stdlib/semantic_type/json as types
+use stdlib/string/builder as string_builder
+use stdlib/string.{str_concat}
+
+pub(package) type McpTool {
+  McpParseSummary,
+  McpCheckSummary,
+  McpIrSummary,
+  McpTypeLookup,
+  McpEffectLookup,
+  McpDiagnostics,
+  McpGrammarDiagnostics,
+  McpOptCounters,
+  McpFactAtPosition,
+  McpVisibleBindings,
+  McpConformanceAtPosition,
+  McpFormatSource
+}
+
+--- Whether a tool's result shape is a stable contract or internal telemetry.
+pub(package) type McpStability {
+  McpStable,
+  McpInternal
+}
+
+--- Every tool, in listing order.
+pub(package) fn mcp_tools() -> List<McpTool> {
+  let tools = [
+    McpParseSummary,
+    McpCheckSummary,
+    McpIrSummary,
+    McpTypeLookup,
+    McpEffectLookup,
+    McpDiagnostics,
+    McpGrammarDiagnostics,
+    McpOptCounters,
+    McpFactAtPosition,
+    McpVisibleBindings,
+    McpConformanceAtPosition,
+    McpFormatSource
+  ]
+  let mut listed = Nil<McpTool>()
+  for tool in tools { listed = Cons(tool, listed) }
+  listed.reverse()
+}
+
+pub(package) fn mcp_tool_name(tool: McpTool) -> str {
+  match tool {
+    McpParseSummary -> "parse_summary"
+    McpCheckSummary -> "check_summary"
+    McpIrSummary -> "ir_summary"
+    McpTypeLookup -> "type_lookup"
+    McpEffectLookup -> "effect_lookup"
+    McpDiagnostics -> "diagnostics"
+    McpGrammarDiagnostics -> "grammar_diagnostics"
+    McpOptCounters -> "opt_counters"
+    McpFactAtPosition -> "fact_at_position"
+    McpVisibleBindings -> "visible_bindings"
+    McpConformanceAtPosition -> "conformance_at_position"
+    McpFormatSource -> "format_source"
+  }
+}
+
+--- The tool with this exact name, if any.
+pub(package) fn mcp_tool_named(name: str) -> Option<McpTool> {
+  let mut remaining = mcp_tools()
+  loop {
+    match remaining {
+      Nil -> return None<McpTool>()
+      Cons(tool, rest) -> {
+        if mcp_tool_name(tool) == name { return Some<McpTool>(tool) }
+        remaining = rest
+      }
+    }
+  }
+  None<McpTool>()
+}
+
+pub(package) fn mcp_tool_stability(tool: McpTool) -> McpStability {
+  match tool {
+    McpParseSummary -> McpInternal
+    McpCheckSummary -> McpInternal
+    McpIrSummary -> McpInternal
+    McpOptCounters -> McpInternal
+    _ -> McpStable
+  }
+}
+
+pub(package) fn mcp_stability_name(stability: McpStability) -> str {
+  match stability {
+    McpStable -> "stable"
+    McpInternal -> "internal"
+  }
+}
+
+fn mcp_tool_description(tool: McpTool) -> str {
+  match tool {
+    McpParseSummary ->
+      "Parse Weft source and report function count and first body expression tag."
+    McpCheckSummary ->
+      "Parse and type-check Weft source; report function count and first body tag."
+    McpIrSummary ->
+      "Lower Weft source to typed IR; report function, block, and instruction counts."
+    McpTypeLookup ->
+      "Look up a semantic function or type-declaration fact by visible name, including optimizer-produced return provenance."
+    McpEffectLookup ->
+      "Look up a checker-produced effect declaration and operation-signature fact by visible name."
+    McpDiagnostics ->
+      "Parse and type-check Weft source; report all diagnostics with line and column."
+    McpGrammarDiagnostics ->
+      "Report structured embedded-grammar diagnostics from the grammar's own tool driver. Parse-only without a context; parse and check with host types from host_source, or with a bounded context_file the grammar interprets itself."
+    McpOptCounters ->
+      "Compile Weft source through the optimiser and report per-pass site counters and native emission counters."
+    McpFactAtPosition -> "Return the checker-produced semantic fact at a UTF-8 byte offset."
+    McpVisibleBindings -> "List checker-resolved typed bindings visible at a UTF-8 byte offset."
+    McpConformanceAtPosition ->
+      "Ask the checker whether the value type at a UTF-8 byte offset satisfies a visible trait."
+    McpFormatSource -> "Format Weft source with the lossless parse-only formatter."
+  }
+}
+
+fn mcp_source_property() -> str {
+  "\"source\":{\"type\":\"string\",\"description\":\"Weft source text\"}"
+}
+
+fn mcp_offset_property() -> str {
+  "\"offset\":{\"type\":\"integer\",\"minimum\":0,\"description\":\"UTF-8 byte offset\"}"
+}
+
+fn mcp_schema(properties: str, required: str) -> str {
+  "{\"type\":\"object\",\"properties\":{"
+    |> str_concat(properties)
+    |> str_concat("},\"required\":[")
+    |> str_concat(required)
+    |> str_concat("]}")
+}
+
+fn mcp_tool_input_schema(tool: McpTool) -> str {
+  match tool {
+    McpTypeLookup -> mcp_schema(
+      str_concat(
+        mcp_source_property(),
+        ",\"name\":{\"type\":\"string\",\"description\":\"Visible function, type, or trait name\"}"
+      ),
+      "\"source\",\"name\""
+    )
+    McpEffectLookup -> mcp_schema(
+      str_concat(
+        mcp_source_property(),
+        ",\"name\":{\"type\":\"string\",\"description\":\"Visible effect name\"}"
+      ),
+      "\"source\",\"name\""
+    )
+    McpGrammarDiagnostics -> mcp_schema(
+      "\"grammar\":{\"type\":\"string\",\"description\":\"Exported grammar name, or package/export when the bare name is ambiguous\"},\"source\":{\"type\":\"string\",\"description\":\"Source text in the embedded language\"},\"host_source\":{\"type\":\"string\",\"description\":\"Optional host Weft source providing host types; exclusive with context_file\"},\"context_file\":{\"type\":\"string\",\"description\":\"Optional file consumed by the grammar as bounded compile-time context; exclusive with host_source\"},\"context_limit\":{\"type\":\"integer\",\"minimum\":1,\"description\":\"Optional maximum context bytes\"}",
+      "\"grammar\",\"source\""
+    )
+    McpFactAtPosition -> mcp_schema(
+      mcp_source_property() |> str_concat(",") |> str_concat(mcp_offset_property()),
+      "\"source\",\"offset\""
+    )
+    McpVisibleBindings -> mcp_schema(
+      mcp_source_property() |> str_concat(",") |> str_concat(mcp_offset_property()),
+      "\"source\",\"offset\""
+    )
+    McpConformanceAtPosition -> mcp_schema(
+      mcp_source_property()
+        |> str_concat(",")
+        |> str_concat(mcp_offset_property())
+        |> str_concat(",\"trait\":{\"type\":\"string\",\"description\":\"Visible trait name\"}"),
+      "\"source\",\"offset\",\"trait\""
+    )
+    McpFormatSource -> mcp_schema(
+      str_concat(
+        mcp_source_property(),
+        ",\"max_line_length\":{\"type\":\"integer\",\"minimum\":1,\"default\":98,\"description\":\"Target line width in Unicode scalars; indivisible tokens and comments may exceed it\"}"
+      ),
+      "\"source\""
+    )
+    _ -> mcp_schema(mcp_source_property(), "\"source\"")
+  }
+}
+
+--- The one-shot `tools/list` result: names and stability.
+pub(package) fn mcp_tools_list_payload() -> str {
+  let mut out = string_builder.new()
+  out.append("{\"schema_version\":1,\"tools\":[")
+  let mut first = true
+  let mut remaining = mcp_tools()
+  while not remaining.is_empty() {
+    match remaining {
+      Nil -> nil
+      Cons(tool, rest) -> {
+        if not first { out.append(",") }
+        first = false
+        out.append("{\"name\":")
+        out.append(json_quote_string(mcp_tool_name(tool)))
+        out.append(",\"stability\":")
+        out.append(json_quote_string(mcp_stability_name(mcp_tool_stability(tool))))
+        out.append("}")
+        remaining = rest
+      }
+    }
+  }
+  out.append("]}")
+  out.finish()
+}
+
+--- The server `tools/list` result, with descriptions and input schemas.
+pub(package) fn mcp_serve_tools_list_payload() -> str {
+  let mut out = string_builder.new()
+  out.append("{\"tools\":[")
+  let mut first = true
+  let mut remaining = mcp_tools()
+  while not remaining.is_empty() {
+    match remaining {
+      Nil -> nil
+      Cons(tool, rest) -> {
+        if not first { out.append(",") }
+        first = false
+        out.append("{\"name\":")
+        out.append(json_quote_string(mcp_tool_name(tool)))
+        out.append(",\"x-weft-stability\":")
+        out.append(json_quote_string(mcp_stability_name(mcp_tool_stability(tool))))
+        out.append(",\"description\":")
+        out.append(json_quote_string(mcp_tool_description(tool)))
+        out.append(",\"inputSchema\":")
+        out.append(mcp_tool_input_schema(tool))
+        out.append("}")
+        remaining = rest
+      }
+    }
+  }
+  out.append("]}")
+  out.finish()
+}
+
+--- The server `initialize` result. The client's requested protocol version
+--- is echoed when it names one.
+pub(package) fn mcp_initialize_payload(params: Json, server_version: str) -> str {
+  let protocol = match params.get("protocolVersion") {
+    Some(JsonString(version)) -> version
+    _ -> "2025-06-18"
+  }
+  "{\"protocolVersion\":"
+    |> str_concat(json_quote_string(protocol))
+    |> str_concat(
+      ",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"weft\",\"version\":"
+    )
+    |> str_concat(json_quote_string(server_version))
+    |> str_concat("}}")
+}
+
+-- Requests --------------------------------------------------------------
+pub(package) type McpRequest {
+  McpInitialize(Json),
+  McpPing,
+  McpListTools,
+  --- A tool call with its `arguments` (`JsonNull` when absent).
+  McpCallTool(McpTool, Json),
+  McpToolNameMissing,
+  McpToolUnknown,
+  McpMethodUnknown
+}
+
+--- Classify a request by its method and params.
+pub(package) fn mcp_request(method: str, params: Json) -> McpRequest {
+  if method == "tools/list" { McpListTools }
+  else if method == "tools/call" {
+    match params.get("name") {
+      None -> McpToolNameMissing
+      Some(JsonString(name)) -> match mcp_tool_named(name) {
+        Some(tool) -> McpCallTool(
+          tool,
+          match params.get("arguments") {
+            Some(arguments) -> arguments
+            None -> JsonNull
+          }
+        )
+        None -> McpToolUnknown
+      }
+      Some(_) -> McpToolUnknown
+    }
+  } else if method == "initialize" { McpInitialize(params) }
+  else if method == "ping" { McpPing }
+  else { McpMethodUnknown }
+}
+
+--- A string argument, or `nil` when absent or not a string.
+pub(package) fn mcp_argument_text(arguments: Json, key: str) -> str? {
+  match arguments.get(key) {
+    Some(JsonString(value)) -> return value
+    _ -> nil
+  }
+  nil
+}
+
+--- An integer argument, or `None` when absent or not an integer.
+pub(package) fn mcp_argument_integer(arguments: Json, key: str) -> Option<i64> {
+  match arguments.get(key) {
+    Some(JsonNumber(value)) -> Some<i64>(value)
+    _ -> None<i64>()
+  }
+}
+
+-- Results ---------------------------------------------------------------
+--- What a tool answers: a result payload or a JSON-RPC error.
+pub(package) type McpOutcome {
+  McpPayload(str),
+  McpFailure(JsonRpcErrorCode, str)
+}
+
+--- A successful tool result: the tool header, then `members` in order.
+pub(package) fn mcp_result(tool: McpTool, members: List<JsonEntry>) -> str {
+  let stability = JsonString(mcp_stability_name(mcp_tool_stability(tool)))
+  let all = Cons(
+    jsonrpc_member("tool", JsonString(mcp_tool_name(tool))),
+    Cons(
+      jsonrpc_member("ok", JsonBool(true)),
+      Cons(
+        jsonrpc_member("schema_version", JsonNumber(1)),
+        Cons(jsonrpc_member("stability", stability), members)
+      )
+    )
+  )
+  jsonrpc_render(JsonObject(all))
+}
+
+--- The server's `tools/call` result: the payload as one text content item.
+pub(package) fn mcp_content(payload: str) -> str {
+  "{\"content\":[{\"type\":\"text\",\"text\":"
+    |> str_concat(json_quote_string(payload))
+    |> str_concat("}],\"isError\":false}")
+}
+
+--- The units every reported position uses.
+pub(package) fn mcp_position_units() -> Json {
+  let members = [
+    jsonrpc_member("span", JsonString("utf-8-byte-offset")),
+    jsonrpc_member("line_base", JsonNumber(1)),
+    jsonrpc_member("col", JsonString("utf-8-byte-column")),
+    jsonrpc_member("scalar_col", JsonString("unicode-scalar-column")),
+    jsonrpc_member("utf16_col", JsonString("utf-16-code-unit-column"))
+  ]
+  jsonrpc_object(members[..])
+}
+
+-- Semantic facts --------------------------------------------------------
+fn mcp_other(name: str) -> Json {
+  let members = [
+    jsonrpc_member("kind", JsonString("other")),
+    jsonrpc_member("name", JsonString(name))
+  ]
+  jsonrpc_object(members[..])
+}
+
+fn mcp_items(reversed: List<Json>) -> Json { JsonArray(reversed.reverse()) }
+
+fn mcp_type(ty: SemanticTypeFact) -> Json { types.encode_type(ty) }
+
+fn mcp_parameters(params: SemanticParameterFactList) -> Json {
+  let mut items = Nil<Json>()
+  let mut current = params
+  loop {
+    match current {
+      SemanticParameterFactListNil -> return mcp_items(items)
+      SemanticParameterFactListCons(param, rest) -> {
+        let item = match param {
+          SemanticParameter(name, ty) -> {
+            let members = [
+              jsonrpc_member("name", JsonString(name)),
+              jsonrpc_member("type", mcp_type(ty))
+            ]
+            jsonrpc_object(members[..])
+          }
+          SemanticParameterOther(name) -> mcp_other(name)
+        }
+        items = Cons(item, items)
+        current = rest
+      }
+      SemanticParameterFactListOther(name) -> return mcp_items(Cons(mcp_other(name), items))
+    }
+  }
+  mcp_items(items)
+}
+
+fn mcp_associated_constraints(constraints: SemanticAssociatedTypeConstraintFactList) -> Json {
+  let mut items = Nil<Json>()
+  let mut current = constraints
+  loop {
+    match current {
+      SemanticAssociatedTypeConstraintFactListNil -> return mcp_items(items)
+      SemanticAssociatedTypeConstraintFactListCons(constraint, rest) -> {
+        let item = match constraint {
+          SemanticAssociatedTypeConstraint(name, ty) -> {
+            let members = [
+              jsonrpc_member("name", JsonString(name)),
+              jsonrpc_member("type", mcp_type(ty))
+            ]
+            jsonrpc_object(members[..])
+          }
+          SemanticAssociatedTypeConstraintOther(name) -> mcp_other(name)
+        }
+        items = Cons(item, items)
+        current = rest
+      }
+      SemanticAssociatedTypeConstraintFactListOther(name) -> return mcp_items(
+        Cons(mcp_other(name), items)
+      )
+    }
+  }
+  mcp_items(items)
+}
+
+fn mcp_trait_bounds(traits: SemanticTraitBoundFactList) -> Json {
+  let mut items = Nil<Json>()
+  let mut current = traits
+  loop {
+    match current {
+      SemanticTraitBoundFactListNil -> return mcp_items(items)
+      SemanticTraitBoundFactListCons(bound, rest) -> {
+        let item = match bound {
+          SemanticTraitBound(name) -> JsonString(name)
+          SemanticTraitBoundWithAssociated(name, constraints) -> {
+            let members = [
+              jsonrpc_member("name", JsonString(name)),
+              jsonrpc_member("associated", mcp_associated_constraints(constraints))
+            ]
+            jsonrpc_object(members[..])
+          }
+          SemanticTraitBoundOther(name) -> mcp_other(name)
+        }
+        items = Cons(item, items)
+        current = rest
+      }
+      SemanticTraitBoundFactListOther(name) -> return mcp_items(Cons(mcp_other(name), items))
+    }
+  }
+  mcp_items(items)
+}
+
+fn mcp_bounds(bounds: SemanticBoundsFact) -> Json {
+  match bounds {
+    SemanticBoundsUnknown -> {
+      let members = [jsonrpc_member("kind", JsonString("unknown"))]
+      jsonrpc_object(members[..])
+    }
+    SemanticBoundsTraits(traits) -> {
+      let members = [
+        jsonrpc_member("kind", JsonString("traits")),
+        jsonrpc_member("traits", mcp_trait_bounds(traits))
+      ]
+      jsonrpc_object(members[..])
+    }
+    SemanticBoundsTypeParameters(params) -> {
+      let members = [
+        jsonrpc_member("kind", JsonString("type_parameters")),
+        jsonrpc_member("parameters", mcp_type_parameters(params))
+      ]
+      jsonrpc_object(members[..])
+    }
+    SemanticBoundsOther(name) -> mcp_other(name)
+  }
+}
+
+fn mcp_type_parameters(params: SemanticTypeParameterFactList) -> Json {
+  let mut items = Nil<Json>()
+  let mut current = params
+  loop {
+    match current {
+      SemanticTypeParameterFactListNil -> return mcp_items(items)
+      SemanticTypeParameterFactListCons(param, rest) -> {
+        let item = match param {
+          SemanticTypeParameter(name, bounds) -> {
+            let members = [
+              jsonrpc_member("name", JsonString(name)),
+              jsonrpc_member("bounds", mcp_bounds(bounds))
+            ]
+            jsonrpc_object(members[..])
+          }
+          SemanticTypeParameterOther(name) -> mcp_other(name)
+        }
+        items = Cons(item, items)
+        current = rest
+      }
+      SemanticTypeParameterFactListOther(name) -> return mcp_items(Cons(mcp_other(name), items))
+    }
+  }
+  mcp_items(items)
+}
+
+fn mcp_purity(purity: SemanticPurityFact) -> Json {
+  match purity {
+    SemanticPurityPure -> JsonString("pure")
+    SemanticPurityEffectful -> JsonString("effectful")
+    SemanticPurityOpen -> JsonString("open")
+    SemanticPurityOther(name) -> JsonString(name)
+  }
+}
+
+fn mcp_indices(indices: SemanticIndexFactList) -> Json {
+  let mut items = Nil<Json>()
+  let mut current = indices
+  loop {
+    match current {
+      SemanticIndexFactListNil -> return mcp_items(items)
+      SemanticIndexFactListCons(index, rest) -> {
+        items = Cons(JsonNumber(index), items)
+        current = rest
+      }
+      SemanticIndexFactListOther(name) -> return mcp_items(items)
+    }
+  }
+  mcp_items(items)
+}
+
+fn mcp_ownership(ownership: SemanticOwnershipFact) -> Json {
+  match ownership {
+    SemanticOwnershipUnknown -> {
+      let members = [jsonrpc_member("kind", JsonString("unknown"))]
+      jsonrpc_object(members[..])
+    }
+    SemanticOwnershipBorrowedParameters(indices) -> {
+      let members = [
+        jsonrpc_member("kind", JsonString("borrowed_parameters")),
+        jsonrpc_member("indices", mcp_indices(indices))
+      ]
+      jsonrpc_object(members[..])
+    }
+    SemanticOwnershipOther(name) -> mcp_other(name)
+  }
+}
+
+fn mcp_lanes(lanes: SemanticValueLaneFactList) -> Json {
+  let mut items = Nil<Json>()
+  let mut current = lanes
+  loop {
+    match current {
+      SemanticValueLaneFactListNil -> return mcp_items(items)
+      SemanticValueLaneFactListCons(lane, rest) -> {
+        let item = match lane {
+          SemanticValueLaneGpr -> JsonString("gpr")
+          SemanticValueLaneF32 -> JsonString("f32")
+          SemanticValueLaneF64 -> JsonString("f64")
+          SemanticValueLaneOther(name) -> mcp_other(name)
+        }
+        items = Cons(item, items)
+        current = rest
+      }
+      SemanticValueLaneFactListOther(name) -> return mcp_items(Cons(mcp_other(name), items))
+    }
+  }
+  mcp_items(items)
+}
+
+fn mcp_shape(shape: SemanticValueShapeFact) -> Json {
+  match shape {
+    SemanticValueShapeUnknown -> {
+      let members = [jsonrpc_member("kind", JsonString("unknown"))]
+      jsonrpc_object(members[..])
+    }
+    SemanticValueShapeWords(count) -> {
+      let members = [
+        jsonrpc_member("kind", JsonString("words")),
+        jsonrpc_member("count", JsonNumber(count))
+      ]
+      jsonrpc_object(members[..])
+    }
+    SemanticValueShapeExactWords(count, lanes) -> {
+      let members = [
+        jsonrpc_member("kind", JsonString("words")),
+        jsonrpc_member("count", JsonNumber(count)),
+        jsonrpc_member("lanes", mcp_lanes(lanes))
+      ]
+      jsonrpc_object(members[..])
+    }
+    SemanticValueShapeOther(name) -> mcp_other(name)
+  }
+}
+
+fn mcp_effect_operations(operations: SemanticEffectOperationFactList) -> Json {
+  let mut items = Nil<Json>()
+  let mut current = operations
+  loop {
+    match current {
+      SemanticEffectOperationFactListNil -> return mcp_items(items)
+      SemanticEffectOperationFactListCons(operation, rest) -> {
+        let item = match operation {
+          SemanticEffectOperation(name, params, result, deferred) -> {
+            let members = [
+              jsonrpc_member("name", JsonString(name)),
+              jsonrpc_member("parameters", mcp_parameters(params)),
+              jsonrpc_member("return_type", mcp_type(result)),
+              jsonrpc_member("deferred", JsonBool(deferred))
+            ]
+            jsonrpc_object(members[..])
+          }
+          SemanticEffectOperationOther(name) -> mcp_other(name)
+        }
+        items = Cons(item, items)
+        current = rest
+      }
+      SemanticEffectOperationFactListOther(name) -> return mcp_items(Cons(mcp_other(name), items))
+    }
+  }
+  mcp_items(items)
+}
+
+pub(package) fn mcp_symbol_kind(kind: SemanticSymbolKind) -> Json {
+  match kind {
+    SemanticSymbolFunction -> JsonString("function")
+    SemanticSymbolConstructor -> JsonString("constructor")
+    SemanticSymbolLocal -> JsonString("local")
+    SemanticSymbolParameter -> JsonString("parameter")
+    SemanticSymbolPattern -> JsonString("pattern")
+    SemanticSymbolLoopBinding -> JsonString("loop_binding")
+    SemanticSymbolModule -> JsonString("module")
+    SemanticSymbolType -> JsonString("type")
+    SemanticSymbolEffect -> JsonString("effect")
+    SemanticSymbolTrait -> JsonString("trait")
+    SemanticSymbolField -> JsonString("field")
+    SemanticSymbolTuplePosition -> JsonString("tuple_position")
+    SemanticSymbolEffectOperation -> JsonString("effect_operation")
+    SemanticSymbolConstant -> JsonString("constant")
+    SemanticSymbolKindOther(name) -> JsonString(name)
+  }
+}
+
+fn mcp_source_location(location: SemanticSourceLocationFact) -> Json {
+  match location {
+    SemanticSourceLocation(path, start, length) -> {
+      let members = [
+        jsonrpc_member("path", JsonString(path)),
+        jsonrpc_member("start", JsonNumber(start)),
+        jsonrpc_member("length", JsonNumber(length))
+      ]
+      jsonrpc_object(members[..])
+    }
+    SemanticSourceLocationOther(name) -> mcp_other(name)
+  }
+}
+
+fn mcp_function_fact(function: SemanticFunctionFact) -> Json {
+  match function {
+    SemanticFunction(name, params, result, effects, purity, ownership, shape, bounds) -> {
+      let members = [
+        jsonrpc_member("kind", JsonString("function")),
+        jsonrpc_member("name", JsonString(name)),
+        jsonrpc_member("parameters", mcp_parameters(params)),
+        jsonrpc_member("return_type", mcp_type(result)),
+        jsonrpc_member("effects", types.encode_effect_set(effects)),
+        jsonrpc_member("purity", mcp_purity(purity)),
+        jsonrpc_member("ownership", mcp_ownership(ownership)),
+        jsonrpc_member("return_shape", mcp_shape(shape)),
+        jsonrpc_member("bounds", mcp_bounds(bounds))
+      ]
+      jsonrpc_object(members[..])
+    }
+    SemanticFunctionOther(name) -> mcp_other(name)
+  }
+}
+
+fn mcp_type_declaration_fact(declaration: SemanticTypeDeclarationFact) -> Json {
+  match declaration {
+    SemanticTypeDeclaration(name, kind, params, count) -> {
+      let head = [
+        jsonrpc_member("kind", JsonString("type_declaration")),
+        jsonrpc_member("name", JsonString(name))
+      ]
+      let tail = [
+        jsonrpc_member("type_parameters", mcp_type_parameters(params)),
+        jsonrpc_member("items", JsonNumber(count))
+      ]
+      let mut members = Nil<JsonEntry>()
+      for item in head { members = Cons(item, members) }
+      members = match kind {
+        SemanticTypeDeclarationRecord -> Cons(
+          jsonrpc_member("declaration_kind", JsonString("record")),
+          members
+        )
+        SemanticTypeDeclarationVariant -> Cons(
+          jsonrpc_member("declaration_kind", JsonString("variant")),
+          members
+        )
+        SemanticTypeDeclarationOpaque -> Cons(
+          jsonrpc_member("declaration_kind", JsonString("opaque")),
+          members
+        )
+        SemanticTypeDeclarationAlias(target) -> Cons(
+          jsonrpc_member("target", mcp_type(target)),
+          Cons(jsonrpc_member("declaration_kind", JsonString("alias")), members)
+        )
+        SemanticTypeDeclarationTrait -> Cons(
+          jsonrpc_member("declaration_kind", JsonString("trait")),
+          members
+        )
+        SemanticTypeDeclarationKindOther(other) -> Cons(
+          jsonrpc_member("declaration_kind", JsonString(other)),
+          members
+        )
+      }
+      for item in tail { members = Cons(item, members) }
+      JsonObject(members.reverse())
+    }
+    SemanticTypeDeclarationOther(name) -> mcp_other(name)
+  }
+}
+
+fn mcp_effect_declaration_fact(declaration: SemanticEffectDeclarationFact) -> Json {
+  match declaration {
+    SemanticEffectDeclaration(name, params, operations) -> {
+      let members = [
+        jsonrpc_member("kind", JsonString("effect_declaration")),
+        jsonrpc_member("name", JsonString(name)),
+        jsonrpc_member("type_parameters", mcp_type_parameters(params)),
+        jsonrpc_member("operations", mcp_effect_operations(operations))
+      ]
+      jsonrpc_object(members[..])
+    }
+    SemanticEffectDeclarationOther(name) -> mcp_other(name)
+  }
+}
+
+fn mcp_conformance_decision(decision: SemanticConformanceDecisionFact) -> Json {
+  match decision {
+    SemanticConformanceYes -> JsonString("yes")
+    SemanticConformanceNo -> JsonString("no")
+    SemanticConformanceUnknown(reason) -> {
+      let members = [
+        jsonrpc_member("kind", JsonString("unknown")),
+        jsonrpc_member("reason", JsonString(reason))
+      ]
+      jsonrpc_object(members[..])
+    }
+    SemanticConformanceDecisionOther(name) -> mcp_other(name)
+  }
+}
+
+--- Project one semantic fact.
+pub(package) fn mcp_fact(fact: SemanticFact) -> Json {
+  match fact {
+    SemanticFactFunction(function) -> mcp_function_fact(function)
+    SemanticFactTypeDeclaration(declaration) -> mcp_type_declaration_fact(declaration)
+    SemanticFactEffectDeclaration(declaration) -> mcp_effect_declaration_fact(declaration)
+    SemanticFactSymbol(symbol) -> match symbol {
+      SemanticSymbol(name, kind, ty, occurrence, definition) -> {
+        let members = [
+          jsonrpc_member("kind", JsonString("symbol")),
+          jsonrpc_member("name", JsonString(name)),
+          jsonrpc_member("symbol_kind", mcp_symbol_kind(kind)),
+          jsonrpc_member("type", mcp_type(ty)),
+          jsonrpc_member("occurrence", mcp_source_location(occurrence)),
+          jsonrpc_member("definition", mcp_source_location(definition))
+        ]
+        jsonrpc_object(members[..])
+      }
+      SemanticSymbolOther(name) -> mcp_other(name)
+    }
+    SemanticFactEffectAtomUse(use_fact) -> match use_fact {
+      SemanticEffectAtomUse(atom, occurrence, definition) -> {
+        let members = [
+          jsonrpc_member("kind", JsonString("effect_atom_use")),
+          jsonrpc_member("atom", types.encode_effect_atom(atom)),
+          jsonrpc_member("occurrence", mcp_source_location(occurrence)),
+          jsonrpc_member("definition", mcp_source_location(definition))
+        ]
+        jsonrpc_object(members[..])
+      }
+      SemanticEffectAtomUseOther(name) -> mcp_other(name)
+    }
+    SemanticFactEffectOperationUse(use_fact) -> match use_fact {
+      SemanticEffectOperationUse(atom, name, ty, occurrence, definition) -> {
+        let members = [
+          jsonrpc_member("kind", JsonString("effect_operation_use")),
+          jsonrpc_member("atom", types.encode_effect_atom(atom)),
+          jsonrpc_member("name", JsonString(name)),
+          jsonrpc_member("type", mcp_type(ty)),
+          jsonrpc_member("occurrence", mcp_source_location(occurrence)),
+          jsonrpc_member("definition", mcp_source_location(definition))
+        ]
+        jsonrpc_object(members[..])
+      }
+      SemanticEffectOperationUseOther(name) -> mcp_other(name)
+    }
+    SemanticFactAssociatedTypeUse(use_fact) -> match use_fact {
+      SemanticAssociatedTypeUse(base, name, resolved, occurrence, definition) -> {
+        let members = [
+          jsonrpc_member("kind", JsonString("associated_type_use")),
+          jsonrpc_member("base", mcp_type(base)),
+          jsonrpc_member("name", JsonString(name)),
+          jsonrpc_member("resolved_type", mcp_type(resolved)),
+          jsonrpc_member("occurrence", mcp_source_location(occurrence)),
+          jsonrpc_member("definition", mcp_source_location(definition))
+        ]
+        jsonrpc_object(members[..])
+      }
+      SemanticAssociatedTypeUseOther(name) -> mcp_other(name)
+    }
+    SemanticFactMatchArm(arm) -> match arm {
+      SemanticMatchArm(narrowed, residual, guarded, occurrence) -> {
+        let members = [
+          jsonrpc_member("kind", JsonString("match_arm")),
+          jsonrpc_member("narrowed_type", mcp_type(narrowed)),
+          jsonrpc_member("residual_type", mcp_type(residual)),
+          jsonrpc_member("guarded", JsonBool(guarded)),
+          jsonrpc_member("occurrence", mcp_source_location(occurrence))
+        ]
+        jsonrpc_object(members[..])
+      }
+      SemanticMatchArmOther(name) -> mcp_other(name)
+    }
+    SemanticFactConformance(conformance) -> match conformance {
+      SemanticConformance(ty, trait_name, decision) -> {
+        let members = [
+          jsonrpc_member("kind", JsonString("conformance")),
+          jsonrpc_member("type", mcp_type(ty)),
+          jsonrpc_member("trait", JsonString(trait_name)),
+          jsonrpc_member("decision", mcp_conformance_decision(decision))
+        ]
+        jsonrpc_object(members[..])
+      }
+      SemanticConformanceOther(name) -> mcp_other(name)
+    }
+    SemanticFactOther(name) -> mcp_other(name)
+  }
+}
+
+--- The `found` members of a lookup result, after its leading members.
+pub(package) fn mcp_found_members(envelope: SemanticFactEnvelope) -> List<JsonEntry> {
+  match envelope {
+    SemanticFactEnvelope(version, SemanticFactFound(fact)) -> Cons(
+      jsonrpc_member("found", JsonBool(true)),
+      Cons(jsonrpc_member("fact", mcp_fact(fact)), Nil<JsonEntry>())
+    )
+    SemanticFactEnvelope(version, SemanticFactMissing) -> Cons(
+      jsonrpc_member("found", JsonBool(false)),
+      Nil<JsonEntry>()
+    )
+    SemanticFactEnvelope(version, SemanticFactResultOther(name)) -> Cons(
+      jsonrpc_member("found", JsonBool(false)),
+      Cons(jsonrpc_member("other", JsonString(name)), Nil<JsonEntry>())
+    )
+    SemanticFactEnvelopeOther(name) -> Cons(
+      jsonrpc_member("found", JsonBool(false)),
+      Cons(jsonrpc_member("other", JsonString(name)), Nil<JsonEntry>())
+    )
+  }
+}
+
+--- Project visible bindings.
+pub(package) fn mcp_bindings(bindings: SemanticBindingFactList) -> Json {
+  let mut items = Nil<Json>()
+  let mut current = bindings
+  loop {
+    match current {
+      SemanticBindingFactListNil -> return mcp_items(items)
+      SemanticBindingFactListCons(binding, rest) -> {
+        let item = match binding {
+          SemanticBinding(name, kind, ty) -> {
+            let members = [
+              jsonrpc_member("name", JsonString(name)),
+              jsonrpc_member("symbol_kind", mcp_symbol_kind(kind)),
+              jsonrpc_member("type", mcp_type(ty))
+            ]
+            jsonrpc_object(members[..])
+          }
+          SemanticBindingOther(name) -> mcp_other(name)
+        }
+        items = Cons(item, items)
+        current = rest
+      }
+      SemanticBindingFactListOther(name) -> return mcp_items(Cons(mcp_other(name), items))
+    }
+  }
+  mcp_items(items)
+}

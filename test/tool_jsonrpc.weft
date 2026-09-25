@@ -1,0 +1,477 @@
+-- JSON-RPC documents, envelopes and standard-stream framing for the compiler's
+-- tools, driven through deterministic console handlers.
+
+use compiler/tool/jsonrpc.{*}
+use stdlib/bytes as bytes
+use stdlib/bytes.{Bytes}
+use stdlib/console.{ConsoleRead, ConsoleWrite}
+use stdlib/io/types.{IoError}
+use stdlib/json.{Json, JsonBool, JsonEntry, JsonNumber, JsonString}
+use stdlib/option.{None, Some}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/string.{str_concat}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push, vector_set}
+
+fn text_bytes(text: str) -> Bytes { bytes.from_str(text) }
+
+fn raw_bytes(values: [i64]) -> Bytes {
+  let out = vector.new<u8>()
+  for value in values { vector_push<u8>(out, __u64_to_u8(__i64_to_u64(value))) }
+  bytes.from_vector(out)
+}
+
+fn render(value: Json) -> str {
+  match value.stringify() {
+    Ok(text) -> text
+    Err(_) -> "<non-finite>"
+  }
+}
+
+fn describe_id(field: JsonRpcIdField) -> str {
+  match field {
+    JsonRpcIdGiven(id) -> jsonrpc_id_text(id)
+    JsonRpcIdUnusable -> "unusable"
+    JsonRpcIdAbsent -> "absent"
+  }
+}
+
+fn describe(message: JsonRpcMessage) -> str {
+  match message {
+    JsonRpcCall(id, method, params) -> "call "
+      |> str_concat(jsonrpc_id_text(id))
+      |> str_concat(" ")
+      |> str_concat(method)
+      |> str_concat(" ")
+      |> str_concat(render(params))
+    JsonRpcNotice(method, params) -> "notice "
+      |> str_concat(method)
+      |> str_concat(" ")
+      |> str_concat(render(params))
+    JsonRpcInvalid(field) -> str_concat("invalid ", describe_id(field))
+    JsonRpcUnparsable -> "unparsable"
+  }
+}
+
+fn decoded(text: str) -> str { describe(jsonrpc_decode(text_bytes(text))) }
+
+fn describe_batch(text: Bytes) -> str {
+  let messages = jsonrpc_decode_batch(text)
+  let mut out = ""
+  for index in 0..vector_len<JsonRpcMessage>(messages) {
+    if index > 0 { out = str_concat(out, " | ") }
+    out = str_concat(out, describe(vector_get_in_bounds<JsonRpcMessage>(messages, index)))
+  }
+  out
+}
+
+-- Standard input as a fixed sequence of chunks, then end of input.
+type Chunks { values: Vector<Bytes>, next: Vector<i64> }
+
+fn chunks_of(values: Vector<Bytes>) -> Chunks {
+  let next = vector.new<i64>()
+  vector_push<i64>(next, 0)
+  Chunks { values: values, next: next }
+}
+
+fn chunk_take(chunks: Chunks) -> Bytes {
+  let values = chunks.values
+  let next = chunks.next
+  let index = vector_get_in_bounds<i64>(next, 0)
+  if index < vector_len<Bytes>(values) {
+    vector_set<i64>(next, 0, index + 1)
+    vector_get_in_bounds<Bytes>(values, index)
+  } else { bytes.empty() }
+}
+
+-- Split `text` into chunks of `size` bytes.
+fn split_every(text: Bytes, size: i64) -> Vector<Bytes> {
+  let out = vector.new<Bytes>()
+  let total = text.len()
+  let step = size.to_usize_checked().unwrap_or(1)
+  let mut start: usize = 0
+  while start < total {
+    let end = if start + step < total { start + step } else { total }
+    match text.slice(start, end) {
+      Some(chunk) -> vector_push<Bytes>(out, chunk)
+      None -> false
+    }
+    start = end
+  }
+  out
+}
+
+fn one_chunk(text: Bytes) -> Vector<Bytes> {
+  let out = vector.new<Bytes>()
+  vector_push<Bytes>(out, text)
+  out
+}
+
+fn describe_frame(frame: JsonRpcFrame) -> str {
+  match frame {
+    JsonRpcFramed(body) -> str_concat("framed ", body.to_utf8().unwrap_or("<bytes>"))
+    JsonRpcUnframed(rest) -> str_concat("unframed ", rest.to_utf8().unwrap_or("<bytes>"))
+    JsonRpcFrameEnd -> "end"
+    JsonRpcFrameBroken -> "broken"
+  }
+}
+
+fn frames_read(input: JsonRpcInput) -[ConsoleRead]> str {
+  let mut out = ""
+  let mut done = false
+  while not done {
+    let frame = jsonrpc_read_frame(input)
+    done = match frame {
+      JsonRpcFramed(_) -> false
+      _ -> true
+    }
+    out = if out == "" { describe_frame(frame) } else {
+      out |> str_concat(" | ") |> str_concat(describe_frame(frame))
+    }
+  }
+  out
+}
+
+fn frames_from(values: Vector<Bytes>) -> str {
+  let chunks = chunks_of(values)
+  handle frames_read(jsonrpc_input()) {
+    ConsoleRead.read(limit) -> resume(Ok<Bytes, IoError>(chunk_take(chunks)))
+  }
+}
+
+fn lines_read(input: JsonRpcInput) -[ConsoleRead]> str {
+  let mut out = ""
+  let mut done = false
+  while not done {
+    match jsonrpc_read_line(input) {
+      line: Bytes -> {
+        out = out |> str_concat("[") |> str_concat(line.to_utf8().unwrap_or("<bytes>")) |>
+          str_concat("]")
+      }
+      nil -> { done = true }
+    }
+  }
+  out
+}
+
+fn lines_from(values: Vector<Bytes>) -> str {
+  let chunks = chunks_of(values)
+  handle lines_read(jsonrpc_input()) {
+    ConsoleRead.read(limit) -> resume(Ok<Bytes, IoError>(chunk_take(chunks)))
+  }
+}
+
+fn all_read(input: JsonRpcInput) -[ConsoleRead]> str {
+  jsonrpc_read_all(input).to_utf8().unwrap_or("<bytes>")
+}
+
+fn all_from(values: Vector<Bytes>) -> str {
+  let chunks = chunks_of(values)
+  handle all_read(jsonrpc_input()) {
+    ConsoleRead.read(limit) -> resume(Ok<Bytes, IoError>(chunk_take(chunks)))
+  }
+}
+
+-- Standard output as the concatenation of every write.
+type Written { parts: Vector<str> }
+
+fn written_text(written: Written) -> str {
+  let parts = written.parts
+  let mut out = ""
+  for index in 0..vector_len<str>(parts) {
+    out = str_concat(out, vector_get_in_bounds<str>(parts, index))
+  }
+  out
+}
+
+fn frame_written(body: str) -> str {
+  let written = Written { parts: vector.new<str>() }
+  handle jsonrpc_write_frame(body) {
+    ConsoleWrite.write_all(stream, values) -> {
+      let parts = written.parts
+      vector_push<str>(parts, values.to_utf8().unwrap_or("<bytes>"))
+      resume(Ok<usize, IoError>(values.len()))
+    }
+    ConsoleWrite.flush(stream) -> resume(Ok<nil, IoError>(nil))
+  }
+  written_text(written)
+}
+
+fn text_written(body: str) -> str {
+  let written = Written { parts: vector.new<str>() }
+  handle jsonrpc_write_text(body) {
+    ConsoleWrite.write_all(stream, values) -> {
+      let parts = written.parts
+      vector_push<str>(parts, values.to_utf8().unwrap_or("<bytes>"))
+      resume(Ok<usize, IoError>(values.len()))
+    }
+    ConsoleWrite.flush(stream) -> resume(Ok<nil, IoError>(nil))
+  }
+  written_text(written)
+}
+
+fn line_written(body: str) -> str {
+  let written = Written { parts: vector.new<str>() }
+  handle jsonrpc_write_line(body) {
+    ConsoleWrite.write_all(stream, values) -> {
+      let parts = written.parts
+      vector_push<str>(parts, values.to_utf8().unwrap_or("<bytes>"))
+      resume(Ok<usize, IoError>(values.len()))
+    }
+    ConsoleWrite.flush(stream) -> resume(Ok<nil, IoError>(nil))
+  }
+  written_text(written)
+}
+
+test "decode_calls_notices_and_params" {
+  Test.assert_str_eq(
+    decoded(
+      "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\",\"params\":{\"a\":[1,true]}}"
+    ),
+    "call 7 tools/list {\"a\":[1,true]}"
+  )
+  Test.assert_str_eq(
+    decoded("{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"method\":\"ping\"}"),
+    "call \"req-1\" ping null"
+  )
+  Test.assert_str_eq(
+    decoded(" \n{\"method\":\"initialized\",\"params\":{},\"jsonrpc\":\"2.0\"}\r\n"),
+    "notice initialized {}"
+  )
+  Test.assert_str_eq(
+    decoded("{\"jsonrpc\":\"2.0\",\"id\":-3,\"method\":\"\"}"),
+    "call -3  null"
+  )
+}
+
+test "decode_escaped_and_duplicate_members" {
+  Test.assert_str_eq(
+    decoded("{\"jsonr\\u0070c\":\"2.0\",\"i\\u0064\":1,\"meth\\u006fd\":\"tools\\/list\"}"),
+    "call 1 tools/list null"
+  )
+  -- The first of duplicate members is the one that counts.
+  Test.assert_str_eq(
+    decoded("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"first\",\"method\":\"second\"}"),
+    "call 1 first null"
+  )
+  Test.assert_str_eq(
+    decoded("{\"jsonrpc\":\"2.0\",\"id\":\"\\uD83D\\uDC69\",\"method\":\"m\"}"),
+    "call \"👩\" m null"
+  )
+}
+
+test "decode_invalid_requests_keep_their_id" {
+  Test.assert_str_eq(decoded("{\"id\":4,\"method\":\"ping\"}"), "invalid 4")
+  Test.assert_str_eq(decoded("{\"jsonrpc\":\"1.0\",\"id\":4,\"method\":\"ping\"}"), "invalid 4")
+  Test.assert_str_eq(decoded("{\"jsonrpc\":2,\"id\":\"x\",\"method\":\"ping\"}"), "invalid \"x\"")
+  Test.assert_str_eq(decoded("{\"jsonrpc\":\"2.0\",\"id\":4}"), "invalid 4")
+  Test.assert_str_eq(decoded("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":5}"), "invalid 4")
+  Test.assert_str_eq(decoded("{\"jsonrpc\":\"2.0\",\"method\":null}"), "invalid absent")
+  Test.assert_str_eq(decoded("{}"), "invalid absent")
+}
+
+test "decode_unusable_ids_are_invalid" {
+  let ids = ["null", "1.5", "1e3", "true", "[1]", "{\"n\":1}", "18446744073709551616"]
+  for id in ids {
+    let text = "{\"jsonrpc\":\"2.0\",\"id\":"
+      |> str_concat(id)
+      |> str_concat(",\"method\":\"ping\"}")
+    Test.assert_str_eq(decoded(text), "invalid unusable")
+  }
+}
+
+test "decode_unparsable_documents" {
+  let texts = [
+    "",
+    "   ",
+    "[1]",
+    "\"text\"",
+    "5",
+    "null",
+    "{",
+    "{\"jsonrpc\":\"2.0\",}",
+    "{\"a\":\"\\uD800\"}",
+    "{\"a\":\"\\uDC00\"}",
+    "{\"a\":\"\\u12G4\"}",
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"} trailing",
+    "{\"a\":1}{\"b\":2}"
+  ]
+  for text in texts { Test.assert_str_eq(decoded(text), "unparsable") }
+  let malformed = [123, 34, 97, 34, 58, 34, 195, 40, 34, 125]
+  Test.assert_str_eq(
+    describe(jsonrpc_decode(raw_bytes(malformed[..]))),
+    "unparsable"
+  )
+}
+
+test "decode_batches_in_order" {
+  Test.assert_str_eq(
+    describe_batch(
+      text_bytes(
+        " {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"a\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"b\"}  [2] "
+      )
+    ),
+    "call 1 a null | notice b null | unparsable"
+  )
+  Test.assert_str_eq(
+    describe_batch(text_bytes("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"a\"} {broken")),
+    "call 1 a null | unparsable"
+  )
+  Test.assert_str_eq(describe_batch(text_bytes("")), "")
+  Test.assert_str_eq(describe_batch(text_bytes(" \r\n\t")), "")
+  let malformed = [123, 255, 125]
+  Test.assert_str_eq(describe_batch(raw_bytes(malformed[..])), "unparsable")
+}
+
+test "responses_render_exact_envelopes" {
+  Test.assert_str_eq(
+    jsonrpc_result(JsonRpcNumberId(12), "{\"ok\":true}"),
+    "{\"jsonrpc\":\"2.0\",\"id\":12,\"result\":{\"ok\":true}}"
+  )
+  Test.assert_str_eq(
+    jsonrpc_result(JsonRpcTextId("a\"b\\c\n"), "null"),
+    "{\"jsonrpc\":\"2.0\",\"id\":\"a\\\"b\\\\c\\n\",\"result\":null}"
+  )
+  Test.assert_str_eq(
+    jsonrpc_error(nil, JsonRpcParseError, "invalid json-rpc"),
+    "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"invalid json-rpc\"}}"
+  )
+  Test.assert_str_eq(
+    jsonrpc_error(JsonRpcTextId("q"), JsonRpcMethodNotFound, "say \"why\""),
+    "{\"jsonrpc\":\"2.0\",\"id\":\"q\",\"error\":{\"code\":-32601,\"message\":\"say \\\"why\\\"\"}}"
+  )
+  Test.assert_str_eq(
+    jsonrpc_error_with_data(JsonRpcNumberId(3), JsonRpcRequestFailed, "failed", "{\"n\":2}"),
+    "{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32803,\"message\":\"failed\",\"data\":{\"n\":2}}}"
+  )
+  Test.assert_str_eq(
+    jsonrpc_notification("textDocument/publishDiagnostics", "{\"uri\":\"\"}"),
+    "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"\"}}"
+  )
+}
+
+test "requests_without_an_id_are_answered_with_null" {
+  Test.assert_str_eq(jsonrpc_result(nil, "[]"), "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":[]}")
+  Test.assert_str_eq(jsonrpc_id_text(JsonRpcNumberId(0 - 9)), "-9")
+  Test.assert_str_eq(jsonrpc_id_text(JsonRpcTextId("")), "\"\"")
+}
+
+test "invalid_documents_answer_with_their_usable_id" {
+  let given = jsonrpc_reply_id(JsonRpcIdGiven(JsonRpcTextId("seven")))
+  Test.assert_str_eq(
+    jsonrpc_error(given, JsonRpcInvalidRequest, "x"),
+    jsonrpc_error(JsonRpcTextId("seven"), JsonRpcInvalidRequest, "x")
+  )
+  Test.assert_str_eq(
+    jsonrpc_error(jsonrpc_reply_id(JsonRpcIdUnusable), JsonRpcInvalidRequest, "x"),
+    jsonrpc_error(nil, JsonRpcInvalidRequest, "x")
+  )
+  Test.assert_str_eq(
+    jsonrpc_error(jsonrpc_reply_id(JsonRpcIdAbsent), JsonRpcInvalidRequest, "x"),
+    "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"x\"}}"
+  )
+}
+
+test "error_codes_have_their_wire_values" {
+  Test.assert_eq(jsonrpc_error_code_value(JsonRpcParseError), 0 - 32700)
+  Test.assert_eq(jsonrpc_error_code_value(JsonRpcInvalidRequest), 0 - 32600)
+  Test.assert_eq(jsonrpc_error_code_value(JsonRpcMethodNotFound), 0 - 32601)
+  Test.assert_eq(jsonrpc_error_code_value(JsonRpcInvalidParams), 0 - 32602)
+  Test.assert_eq(jsonrpc_error_code_value(JsonRpcInternalError), 0 - 32603)
+  Test.assert_eq(jsonrpc_error_code_value(JsonRpcRequestFailed), 0 - 32803)
+}
+
+test "frames_read_whole_and_split_at_every_boundary" {
+  let stream = "Content-Length: 7\r\n\r\n{\"a\":1}Content-Length:2\r\nContent-Type: x\r\n\r\n[]"
+  let expected = "framed {\"a\":1} | framed [] | end"
+  Test.assert_str_eq(frames_from(one_chunk(text_bytes(stream))), expected)
+  for size in 1..16 {
+    Test.assert_str_eq(frames_from(split_every(text_bytes(stream), size)), expected)
+  }
+}
+
+test "frames_count_body_bytes_not_scalars" {
+  let body = "{\"t\":\"é👩\"}"
+  let stream = "Content-Length: 14\r\n\r\n" |> str_concat(body)
+  Test.assert_str_eq(
+    frames_from(split_every(text_bytes(stream), 3)),
+    "framed {\"t\":\"é👩\"} | end"
+  )
+  Test.assert_str_eq(
+    frames_from(one_chunk(text_bytes("Content-Length: 0\r\n\r\n"))),
+    "framed  | end"
+  )
+}
+
+test "frames_switch_to_unframed_documents" {
+  Test.assert_str_eq(
+    frames_from(split_every(text_bytes(" \n{\"a\":1} {\"b\":2}"), 2)),
+    "unframed  \n{\"a\":1} {\"b\":2}"
+  )
+  Test.assert_str_eq(
+    frames_from(one_chunk(text_bytes("Content-Length: 2\r\n\r\n{}{\"x\":1}"))),
+    "framed {} | unframed {\"x\":1}"
+  )
+}
+
+test "frames_report_broken_input" {
+  let cases = [
+    "Content-Type: x\r\n\r\n{}",
+    "Content-Length: \r\n\r\n{}",
+    "Content-Length: -2\r\n\r\n{}",
+    "Content-Length: 99999999999999999999\r\n\r\n{}",
+    "Content-Length: 9\r\n\r\n{}",
+    "Content-Length: 2\r\n"
+  ]
+  for text in cases { Test.assert_str_eq(frames_from(one_chunk(text_bytes(text))), "broken") }
+  -- Bytes after the last frame that never become a header are a truncated
+  -- header, even when they are only whitespace.
+  Test.assert_str_eq(
+    frames_from(one_chunk(text_bytes("Content-Length: 2\r\n\r\n{}\n"))),
+    "framed {} | broken"
+  )
+  Test.assert_str_eq(frames_from(vector.new<Bytes>()), "end")
+  let malformed = [67, 255, 13, 10, 13, 10]
+  Test.assert_str_eq(
+    frames_from(one_chunk(raw_bytes(malformed[..]))),
+    "broken"
+  )
+}
+
+test "lines_split_across_chunks" {
+  let stream = "{\"a\":1}\n\n{\"b\":2}\r\nlast"
+  let expected = "[{\"a\":1}][][{\"b\":2}\r][last]"
+  Test.assert_str_eq(lines_from(one_chunk(text_bytes(stream))), expected)
+  for size in 1..9 {
+    Test.assert_str_eq(lines_from(split_every(text_bytes(stream), size)), expected)
+  }
+  Test.assert_str_eq(lines_from(vector.new<Bytes>()), "")
+  Test.assert_str_eq(lines_from(one_chunk(text_bytes("one\n"))), "[one]")
+}
+
+test "read_all_concatenates_chunks" {
+  Test.assert_str_eq(all_from(split_every(text_bytes("{\"a\":\"xyz\"}"), 4)), "{\"a\":\"xyz\"}")
+  Test.assert_str_eq(all_from(vector.new<Bytes>()), "")
+}
+
+test "writes_frame_and_line_messages" {
+  Test.assert_str_eq(frame_written("{}"), "Content-Length: 2\r\n\r\n{}")
+  Test.assert_str_eq(frame_written("\"é\""), "Content-Length: 4\r\n\r\n\"é\"")
+  Test.assert_str_eq(frame_written(""), "Content-Length: 0\r\n\r\n")
+  Test.assert_str_eq(line_written("{\"a\":1}"), "{\"a\":1}\n")
+  Test.assert_str_eq(text_written("{}"), "{}")
+}
+
+test "json_objects_keep_member_order" {
+  let members = [
+    jsonrpc_member("b", JsonNumber(2)),
+    jsonrpc_member("a", JsonString("é\n")),
+    jsonrpc_member("b", JsonBool(true))
+  ]
+  Test.assert_str_eq(
+    jsonrpc_render(jsonrpc_object(members[..])),
+    "{\"b\":2,\"a\":\"é\\n\",\"b\":true}"
+  )
+  let none: [JsonEntry; 0] = []
+  Test.assert_str_eq(jsonrpc_render(jsonrpc_object(none[..])), "{}")
+}

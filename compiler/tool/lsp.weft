@@ -1,0 +1,452 @@
+-- The compiler's Language Server Protocol surface.
+--
+-- Requests are classified once from a decoded JSON-RPC message into typed
+-- values with their parameters. Open documents keep their URI, text and
+-- version as values; positions and ranges are computed from the text in the
+-- negotiated encoding. The language services behind the requests are handler
+-- configurations in the compiler's command line.
+
+use compiler/source/position.{*}
+use compiler/tool/jsonrpc.{jsonrpc_member, jsonrpc_object}
+use compiler/weft/facts/semantic.{*}
+use stdlib/json.{Json, JsonArray, JsonNull, JsonNumber, JsonObject, JsonString}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/option.{None, Option, Some}
+use stdlib/string.{str_byte_at, str_concat, str_len, str_slice_bytes}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push, vector_set}
+
+--- A protocol position: zero-based line and character in encoding units.
+pub(package) type LspPosition { line: i64, character: i64 }
+
+pub(package) type LspRequest {
+  --- The workspace root URI, when given, and the negotiated encoding.
+  LspInitialize(str?, SourcePositionEncoding),
+  LspInitialized,
+  LspShutdown,
+  LspExit,
+  --- URI, text and version of a newly opened document.
+  LspDidOpen(str, str, i64),
+  --- URI, the new version when given, and the first change's full text.
+  LspDidChange(str, Option<i64>, str),
+  LspDidClose(str),
+  LspHover(str, LspPosition),
+  LspDefinition(str, LspPosition),
+  LspCompletion(str, LspPosition),
+  LspCodeAction,
+  --- URI and the formatting options, when given.
+  LspFormatting(str, Option<Json>),
+  --- A document notification without a document URI.
+  LspMissingDocument,
+  LspUnknown
+}
+
+fn lsp_member(value: Json, key: str) -> Json {
+  match value.get(key) {
+    Some(found) -> found
+    None -> JsonNull
+  }
+}
+
+fn lsp_text_member(value: Json, key: str) -> str? {
+  match value.get(key) {
+    Some(JsonString(text)) -> return text
+    _ -> nil
+  }
+  nil
+}
+
+fn lsp_integer_member(value: Json, key: str) -> Option<i64> {
+  match value.get(key) {
+    Some(JsonNumber(number)) -> Some<i64>(number)
+    _ -> None<i64>()
+  }
+}
+
+fn lsp_document_uri(params: Json) -> str? {
+  lsp_text_member(lsp_member(params, "textDocument"), "uri")
+}
+
+fn lsp_position(params: Json) -> LspPosition {
+  let position = lsp_member(params, "position")
+  LspPosition {
+    line: lsp_integer_member(position, "line").unwrap_or(0),
+    character: lsp_integer_member(position, "character").unwrap_or(0)
+  }
+}
+
+fn lsp_encodings_include(encodings: Json, name: str) -> bool {
+  match encodings {
+    JsonArray(items) -> {
+      let mut remaining = items
+      loop {
+        match remaining {
+          Nil -> return false
+          Cons(JsonString(offered), rest) -> {
+            if offered == name { return true }
+            remaining = rest
+          }
+          Cons(_, rest) -> { remaining = rest }
+        }
+      }
+      false
+    }
+    _ -> false
+  }
+}
+
+--- The encoding to use: UTF-8 when the client offers it, then UTF-16, then
+--- UTF-32. LSP defaults to UTF-16 when the client names none.
+pub(package) fn lsp_negotiated_encoding(params: Json) -> SourcePositionEncoding {
+  let offered = params
+    |> lsp_member("capabilities")
+    |> lsp_member("general")
+    |> lsp_member("positionEncodings")
+  if lsp_encodings_include(offered, "utf-8") { SourceUtf8Units }
+  else if lsp_encodings_include(offered, "utf-16") { SourceUtf16Units }
+  else if lsp_encodings_include(offered, "utf-32") { SourceUtf32Units }
+  else { SourceUtf16Units }
+}
+
+pub(package) fn lsp_encoding_name(encoding: SourcePositionEncoding) -> str {
+  match encoding {
+    SourceUtf8Units -> "utf-8"
+    SourceUtf16Units -> "utf-16"
+    SourceUtf32Units -> "utf-32"
+  }
+}
+
+-- A request without a document URI names no open document.
+fn lsp_document_request(params: Json, request: (str) -> LspRequest) -> LspRequest {
+  match lsp_document_uri(params) {
+    uri: str -> request(uri)
+    nil -> request("")
+  }
+}
+
+fn lsp_did_open(params: Json) -> LspRequest {
+  let document = lsp_member(params, "textDocument")
+  match lsp_text_member(document, "uri") {
+    uri: str -> LspDidOpen(
+      uri,
+      match lsp_text_member(document, "text") {
+        text: str -> text
+        nil -> ""
+      },
+      lsp_integer_member(document, "version").unwrap_or(1)
+    )
+    nil -> LspMissingDocument
+  }
+}
+
+fn lsp_did_change(params: Json) -> LspRequest {
+  let document = lsp_member(params, "textDocument")
+  let text = match lsp_member(params, "contentChanges") {
+    JsonArray(Cons(change, _)) -> match lsp_text_member(change, "text") {
+      changed: str -> changed
+      nil -> ""
+    }
+    _ -> ""
+  }
+  match lsp_text_member(document, "uri") {
+    uri: str -> LspDidChange(uri, lsp_integer_member(document, "version"), text)
+    nil -> LspMissingDocument
+  }
+}
+
+--- Classify a request or notification by its method and params.
+pub(package) fn lsp_request(method: str, params: Json) -> LspRequest {
+  if method == "initialize" {
+    LspInitialize(lsp_text_member(params, "rootUri"), lsp_negotiated_encoding(params))
+  } else if method == "initialized" { LspInitialized }
+  else if method == "shutdown" { LspShutdown }
+  else if method == "exit" { LspExit }
+  else if method == "textDocument/didOpen" { lsp_did_open(params) }
+  else if method == "textDocument/didChange" { lsp_did_change(params) }
+  else if method == "textDocument/didClose" {
+    lsp_document_request(params, (uri: str) => LspDidClose(uri))
+  } else if method == "textDocument/hover" {
+    lsp_document_request(params, (uri: str) => LspHover(uri, lsp_position(params)))
+  } else if method == "textDocument/definition" {
+    lsp_document_request(params, (uri: str) => LspDefinition(uri, lsp_position(params)))
+  } else if method == "textDocument/completion" {
+    lsp_document_request(params, (uri: str) => LspCompletion(uri, lsp_position(params)))
+  } else if method == "textDocument/codeAction" { LspCodeAction }
+  else if method == "textDocument/formatting" {
+    lsp_document_request(params, (uri: str) => LspFormatting(uri, params.get("options")))
+  } else { LspUnknown }
+}
+
+-- Workspace and paths ---------------------------------------------------
+fn lsp_file_path(uri: str) -> str? {
+  if str_len(uri) > 7 and uri.starts_with("file://") {
+    return str_slice_bytes(uri, 7, str_len(uri) - 7)
+  }
+  nil
+}
+
+--- The workspace root named by an `initialize` root URI, without trailing
+--- slashes. A root other than a `file:` URI names no workspace.
+pub(package) fn lsp_workspace_from_root_uri(uri: str) -> str {
+  if not uri.starts_with("file://") { return "" }
+  let mut length = str_len(uri) - 7
+  while length > 1 and str_byte_at(uri, 7 + length - 1) == 47 { length = length - 1 }
+  str_slice_bytes(uri, 7, length)
+}
+
+--- The workspace inferred from the first opened document: its directory.
+pub(package) fn lsp_workspace_from_document(uri: str) -> str {
+  match lsp_file_path(uri) {
+    nil -> ""
+    path: str -> {
+      let mut slash = str_len(path)
+      while slash > 1 and str_byte_at(path, slash - 1) != 47 { slash = slash - 1 }
+      str_slice_bytes(path, 0, if slash > 1 { slash - 1 } else { 1 })
+    }
+  }
+}
+
+--- The path a document is loaded under. The root document keeps its
+--- absolute path; other documents under the workspace are named relative to
+--- it, as their imports spell them.
+pub(package) fn lsp_document_path(uri: str, workspace: str, root: bool) -> str {
+  match lsp_file_path(uri) {
+    nil -> ""
+    path: str -> {
+      let path_len = str_len(path)
+      let workspace_len = str_len(workspace)
+      let under_workspace = not root and workspace_len > 0 and path_len > workspace_len and
+        path.starts_with(workspace) and (
+          workspace_len == 1 or str_byte_at(path, workspace_len) == 47
+        )
+      let start = if not under_workspace { 0 } else if workspace_len == 1 { 1 } else {
+        workspace_len + 1
+      }
+      str_slice_bytes(path, start, path_len - start)
+    }
+  }
+}
+
+--- The URI of a definition at `path`: the current document when the path is
+--- empty, an absolute file, or a module path relative to the workspace.
+pub(package) fn lsp_definition_uri(path: str, workspace: str, current: str) -> str {
+  if str_len(path) == 0 { current }
+  else if str_byte_at(path, 0) == 47 { str_concat("file://", path) }
+  else {
+    let root = if str_len(workspace) > 1 { str_concat(workspace, "/") } else { workspace }
+    "file://" |> str_concat(root) |> str_concat(path)
+  }
+}
+
+-- Documents -------------------------------------------------------------
+pub(package) type LspDocument { uri: str, text: str, version: i64 }
+
+-- A closed document keeps its slot, so publication follows opening order.
+type LspDocumentSlot {
+  LspOpenDocument(LspDocument),
+  LspClosedDocument
+}
+
+--- The server's document state and negotiated settings.
+pub(package) type LspServer {
+  slots: Vector<LspDocumentSlot>,
+  workspace: Vector<str>,
+  encoding: Vector<SourcePositionEncoding>
+}
+
+pub(package) fn lsp_server_new() -> LspServer {
+  let workspace = vector.new<str>()
+  vector_push<str>(workspace, "")
+  let encoding = vector.new<SourcePositionEncoding>()
+  vector_push<SourcePositionEncoding>(encoding, SourceUtf16Units)
+  LspServer { slots: vector.new<LspDocumentSlot>(), workspace: workspace, encoding: encoding }
+}
+
+pub(package) fn lsp_server_workspace(server: LspServer) -> str {
+  let workspace = server.workspace
+  vector_get_in_bounds<str>(workspace, 0)
+}
+
+pub(package) fn lsp_server_set_workspace(server: LspServer, root: str) -> nil {
+  let workspace = server.workspace
+  vector_set<str>(workspace, 0, root)
+  nil
+}
+
+pub(package) fn lsp_server_encoding(server: LspServer) -> SourcePositionEncoding {
+  let encoding = server.encoding
+  vector_get_in_bounds<SourcePositionEncoding>(encoding, 0)
+}
+
+pub(package) fn lsp_server_set_encoding(server: LspServer, value: SourcePositionEncoding) -> nil {
+  let encoding = server.encoding
+  vector_set<SourcePositionEncoding>(encoding, 0, value)
+  nil
+}
+
+fn lsp_slot_index(server: LspServer, uri: str) -> i64 {
+  let slots = server.slots
+  for index in 0..vector_len<LspDocumentSlot>(slots) {
+    match vector_get_in_bounds<LspDocumentSlot>(slots, index) {
+      LspOpenDocument(document) -> if document.uri == uri { return index }
+      LspClosedDocument -> nil
+    }
+  }
+  0 - 1
+}
+
+--- The open document with this URI.
+pub(package) fn lsp_document(server: LspServer, uri: str) -> Option<LspDocument> {
+  let index = lsp_slot_index(server, uri)
+  if index < 0 { return None<LspDocument>() }
+  let slots = server.slots
+  match vector_get_in_bounds<LspDocumentSlot>(slots, index) {
+    LspOpenDocument(document) -> Some<LspDocument>(document)
+    LspClosedDocument -> None<LspDocument>()
+  }
+}
+
+--- Record a document's current text, replacing an open document with the
+--- same URI in place.
+pub(package) fn lsp_server_store(server: LspServer, document: LspDocument) -> nil {
+  let slots = server.slots
+  let index = lsp_slot_index(server, document.uri)
+  if index < 0 { vector_push<LspDocumentSlot>(slots, LspOpenDocument(document)) }
+  else { vector_set<LspDocumentSlot>(slots, index, LspOpenDocument(document)) }
+  nil
+}
+
+--- Close the document with this URI; false when none is open.
+pub(package) fn lsp_server_close(server: LspServer, uri: str) -> bool {
+  let index = lsp_slot_index(server, uri)
+  if index < 0 { false }
+  else {
+    let slots = server.slots
+    vector_set<LspDocumentSlot>(slots, index, LspClosedDocument)
+    true
+  }
+}
+
+--- Every open document, in opening order.
+pub(package) fn lsp_open_documents(server: LspServer) -> List<LspDocument> {
+  let slots = server.slots
+  let mut documents = Nil<LspDocument>()
+  for index in 0..vector_len<LspDocumentSlot>(slots) {
+    match vector_get_in_bounds<LspDocumentSlot>(slots, index) {
+      LspOpenDocument(document) -> { documents = Cons(document, documents) }
+      LspClosedDocument -> nil
+    }
+  }
+  documents.reverse()
+}
+
+-- Positions -------------------------------------------------------------
+--- The byte offset of a protocol position, clamped into the text.
+pub(package) fn lsp_offset<S: SourceBytes>(
+  bytes: S,
+  position: LspPosition,
+  encoding: SourcePositionEncoding
+) -> i64 {
+  let offset = source_position_offset_for_line_column(
+    bytes,
+    position.line,
+    position.character,
+    encoding
+  )
+  if offset < 0 { 0 } else { offset }
+}
+
+fn lsp_position_json<S: SourceBytes>(
+  bytes: S,
+  offset: i64,
+  encoding: SourcePositionEncoding
+) -> Json {
+  let position = source_position_at(bytes, offset)
+  let line = source_position_line0(position)
+  let column = source_position_column0(position, encoding)
+  let members = [
+    jsonrpc_member("line", JsonNumber(if line < 0 { 0 } else { line })),
+    jsonrpc_member("character", JsonNumber(if column < 0 { 0 } else { column }))
+  ]
+  jsonrpc_object(members[..])
+}
+
+--- The range of `[start, end)`. An empty range widens to the next scalar so
+--- the client has something to underline.
+pub(package) fn lsp_range<S: SourceBytes>(
+  bytes: S,
+  start: i64,
+  end: i64,
+  encoding: SourcePositionEncoding
+) -> Json {
+  let first = if start < 0 { 0 } else { start }
+  let last = if end <= first { source_position_next_scalar_offset(bytes, first) } else { end }
+  let members = [
+    jsonrpc_member("start", lsp_position_json(bytes, first, encoding)),
+    jsonrpc_member("end", lsp_position_json(bytes, last, encoding))
+  ]
+  jsonrpc_object(members[..])
+}
+
+--- The range of the whole text, for a full-document edit.
+pub(package) fn lsp_full_range<S: SourceBytes>(bytes: S, encoding: SourcePositionEncoding) -> Json
+{
+  let origin = [jsonrpc_member("line", JsonNumber(0)), jsonrpc_member("character", JsonNumber(0))]
+  let members = [
+    jsonrpc_member("start", jsonrpc_object(origin[..])),
+    jsonrpc_member("end", lsp_position_json(bytes, bytes.byte_count(), encoding))
+  ]
+  jsonrpc_object(members[..])
+}
+
+-- Results ---------------------------------------------------------------
+--- The `initialize` result for the negotiated encoding.
+pub(package) fn lsp_initialize_result(encoding: SourcePositionEncoding) -> str {
+  "{\"capabilities\":{\"positionEncoding\":\""
+    |> str_concat(lsp_encoding_name(encoding))
+    |> str_concat(
+      "\",\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"codeActionProvider\":true,\"documentFormattingProvider\":true}}"
+    )
+}
+
+--- How hover text names a symbol's kind.
+pub(package) fn lsp_symbol_kind_label(kind: SemanticSymbolKind) -> str {
+  match kind {
+    SemanticSymbolFunction -> "function"
+    SemanticSymbolConstructor -> "constructor"
+    SemanticSymbolLocal -> "local"
+    SemanticSymbolParameter -> "parameter"
+    SemanticSymbolPattern -> "pattern binding"
+    SemanticSymbolLoopBinding -> "loop binding"
+    SemanticSymbolModule -> "module"
+    SemanticSymbolType -> "type"
+    SemanticSymbolEffect -> "effect"
+    SemanticSymbolTrait -> "trait"
+    SemanticSymbolField -> "field"
+    SemanticSymbolTuplePosition -> "tuple position"
+    SemanticSymbolEffectOperation -> "effect operation"
+    SemanticSymbolConstant -> "constant"
+    SemanticSymbolKindOther(name) -> name
+  }
+}
+
+--- LSP's `CompletionItemKind` for a symbol kind.
+pub(package) fn lsp_completion_kind(kind: SemanticSymbolKind) -> i64 {
+  match kind {
+    SemanticSymbolFunction -> 3
+    SemanticSymbolConstructor -> 4
+    SemanticSymbolLocal -> 6
+    SemanticSymbolParameter -> 6
+    SemanticSymbolPattern -> 6
+    SemanticSymbolLoopBinding -> 6
+    SemanticSymbolModule -> 9
+    SemanticSymbolType -> 7
+    SemanticSymbolEffect -> 7
+    SemanticSymbolTrait -> 8
+    SemanticSymbolField -> 5
+    SemanticSymbolTuplePosition -> 5
+    SemanticSymbolEffectOperation -> 3
+    SemanticSymbolConstant -> 21
+    SemanticSymbolKindOther(name) -> 7
+  }
+}

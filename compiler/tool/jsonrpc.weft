@@ -1,0 +1,444 @@
+-- JSON-RPC 2.0 messages for the compiler's standard-stream tools.
+--
+-- Decoding is total: every input document is a call, a notice, an invalid
+-- request (with whatever id it carried) or unparsable text, so a server
+-- matches one value instead of probing raw fields. Responses are composed
+-- as text around result payloads the tools render themselves. Transports
+-- read and write through `ConsoleRead` and `ConsoleWrite`; the host installs
+-- the process streams, and tests install deterministic handlers.
+
+use stdlib/bytes as bytes
+use stdlib/bytes.{Bytes}
+use stdlib/console as console
+use stdlib/console.{ConsoleRead, ConsoleWrite}
+use stdlib/json as json
+use stdlib/json.{
+  Json,
+  JsonEntry,
+  JsonNull,
+  JsonNumber,
+  JsonObject,
+  JsonParseFailed,
+  JsonParsed,
+  JsonString,
+  json_parse_value,
+  json_quote_string,
+  json_skip_ws,
+  json_stringify
+}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/option.{None, Option, Some}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/string/builder as string_builder
+use stdlib/string.{str_byte_at, str_concat, str_len}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_clear, vector_get_in_bounds, vector_len, vector_push}
+
+--- A request identity. JSON-RPC permits integers and strings; LSP and MCP
+--- both exclude null and fractional ids from requests.
+pub(package) type JsonRpcId {
+  JsonRpcNumberId(i64),
+  JsonRpcTextId(str)
+}
+
+--- The `id` member of a document that is not a valid request.
+pub(package) type JsonRpcIdField {
+  JsonRpcIdGiven(JsonRpcId),
+  --- Present but not an integer or string; errors answer with a null id.
+  JsonRpcIdUnusable,
+  JsonRpcIdAbsent
+}
+
+--- One decoded JSON-RPC document. `params` is `JsonNull` when absent.
+pub(package) type JsonRpcMessage {
+  --- A request that is answered with a result or an error.
+  JsonRpcCall(JsonRpcId, str, Json),
+  --- A notification, which is never answered.
+  JsonRpcNotice(str, Json),
+  --- A JSON object without the `jsonrpc: "2.0"` version, a string method or
+  --- a usable id.
+  JsonRpcInvalid(JsonRpcIdField),
+  --- Not UTF-8, not JSON or not an object.
+  JsonRpcUnparsable
+}
+
+--- The error codes these tools answer with.
+pub(package) type JsonRpcErrorCode {
+  JsonRpcParseError,
+  JsonRpcInvalidRequest,
+  JsonRpcMethodNotFound,
+  JsonRpcInvalidParams,
+  JsonRpcInternalError,
+  --- LSP's `RequestFailed`: a well-formed request whose operation failed.
+  JsonRpcRequestFailed
+}
+
+pub(package) fn jsonrpc_error_code_value(code: JsonRpcErrorCode) -> i64 {
+  match code {
+    JsonRpcParseError -> 0 - 32700
+    JsonRpcInvalidRequest -> 0 - 32600
+    JsonRpcMethodNotFound -> 0 - 32601
+    JsonRpcInvalidParams -> 0 - 32602
+    JsonRpcInternalError -> 0 - 32603
+    JsonRpcRequestFailed -> 0 - 32803
+  }
+}
+
+-- Decoding --------------------------------------------------------------
+fn jsonrpc_id_field(document: Json) -> JsonRpcIdField {
+  match document.get("id") {
+    None -> JsonRpcIdAbsent
+    Some(JsonNumber(value)) -> JsonRpcIdGiven(JsonRpcNumberId(value))
+    Some(JsonString(value)) -> JsonRpcIdGiven(JsonRpcTextId(value))
+    Some(_) -> JsonRpcIdUnusable
+  }
+}
+
+fn jsonrpc_is_version_2(document: Json) -> bool {
+  match document.get("jsonrpc") {
+    Some(JsonString(version)) -> version == "2.0"
+    _ -> false
+  }
+}
+
+fn jsonrpc_params(document: Json) -> Json {
+  match document.get("params") {
+    Some(params) -> params
+    None -> JsonNull
+  }
+}
+
+--- Classify one parsed document.
+pub(package) fn jsonrpc_decode_value(document: Json) -> JsonRpcMessage {
+  match document {
+    JsonObject(_) -> {
+      let id = jsonrpc_id_field(document)
+      match document.get("method") {
+        Some(JsonString(method)) -> if not jsonrpc_is_version_2(document) {
+          JsonRpcInvalid(id)
+        } else {
+          match id {
+            JsonRpcIdGiven(given) -> JsonRpcCall(given, method, jsonrpc_params(document))
+            JsonRpcIdAbsent -> JsonRpcNotice(method, jsonrpc_params(document))
+            JsonRpcIdUnusable -> JsonRpcInvalid(id)
+          }
+        }
+        _ -> JsonRpcInvalid(id)
+      }
+    }
+    _ -> JsonRpcUnparsable
+  }
+}
+
+--- Decode one complete document.
+pub(package) fn jsonrpc_decode(frame: Bytes) -> JsonRpcMessage {
+  match frame.to_utf8() {
+    Err(_) -> JsonRpcUnparsable
+    Ok(text) -> match json.parse(text) {
+      Err(_) -> JsonRpcUnparsable
+      Ok(document) -> jsonrpc_decode_value(document)
+    }
+  }
+}
+
+--- Decode concatenated documents, in order. Decoding stops at the first
+--- unparsable document, which ends the list.
+pub(package) fn jsonrpc_decode_batch(text: Bytes) -> Vector<JsonRpcMessage> {
+  let messages = vector.new<JsonRpcMessage>()
+  match text.to_utf8() {
+    Err(_) -> {
+      vector_push<JsonRpcMessage>(messages, JsonRpcUnparsable)
+      nil
+    }
+    Ok(source) -> {
+      let n = str_len(source)
+      let mut pos = json_skip_ws(source, n, 0)
+      while pos < n {
+        match json_parse_value(source, n, pos) {
+          JsonParseFailed(_) -> {
+            vector_push<JsonRpcMessage>(messages, JsonRpcUnparsable)
+            pos = n
+          }
+          JsonParsed(next, document) -> {
+            vector_push<JsonRpcMessage>(messages, jsonrpc_decode_value(document))
+            pos = json_skip_ws(source, n, next)
+          }
+        }
+      }
+    }
+  }
+  messages
+}
+
+-- Responses -------------------------------------------------------------
+pub(package) fn jsonrpc_id_text(id: JsonRpcId) -> str {
+  match id {
+    JsonRpcNumberId(value) -> value.to_str()
+    JsonRpcTextId(value) -> json_quote_string(value)
+  }
+}
+
+--- The id an error about an invalid document answers with.
+pub(package) fn jsonrpc_reply_id(field: JsonRpcIdField) -> JsonRpcId? {
+  match field {
+    JsonRpcIdGiven(id) -> return id
+    _ -> nil
+  }
+  nil
+}
+
+fn jsonrpc_reply_id_text(id: JsonRpcId?) -> str {
+  match id {
+    given: JsonRpcId -> jsonrpc_id_text(given)
+    nil -> "null"
+  }
+}
+
+--- One object member.
+pub(package) fn jsonrpc_member(key: str, value: Json) -> JsonEntry { JsonEntry(key, value) }
+
+--- An object with `members` in order.
+pub(package) fn jsonrpc_object(members: [JsonEntry]) -> Json {
+  let mut listed = Nil<JsonEntry>()
+  for member in members { listed = Cons(member, listed) }
+  JsonObject(listed.reverse())
+}
+
+--- Render a JSON value the tools produced; they contain only finite numbers.
+pub(package) fn jsonrpc_render(value: Json) -> str {
+  json_stringify(value).expect("compiler tool results contain only finite JSON")
+}
+
+--- A result response around an already rendered JSON payload. A request
+--- that arrived without an id is answered with a null id.
+pub(package) fn jsonrpc_result(id: JsonRpcId?, result: str) -> str {
+  let mut out = string_builder.with_capacity(str_len(result).to_usize_checked().unwrap_or(0) + 48)
+  out.append("{\"jsonrpc\":\"2.0\",\"id\":")
+  out.append(jsonrpc_reply_id_text(id))
+  out.append(",\"result\":")
+  out.append(result)
+  out.append("}")
+  out.finish()
+}
+
+--- An error response; a missing id is rendered as `null`.
+pub(package) fn jsonrpc_error(id: JsonRpcId?, code: JsonRpcErrorCode, message: str) -> str {
+  jsonrpc_error_with(id, code, message, "")
+}
+
+--- An error response whose `data` member is an already rendered JSON value.
+pub(package) fn jsonrpc_error_with_data(
+  id: JsonRpcId?,
+  code: JsonRpcErrorCode,
+  message: str,
+  data: str
+) -> str {
+  jsonrpc_error_with(id, code, message, str_concat(",\"data\":", data))
+}
+
+fn jsonrpc_error_with(id: JsonRpcId?, code: JsonRpcErrorCode, message: str, data: str) -> str {
+  let mut out = string_builder.new()
+  out.append("{\"jsonrpc\":\"2.0\",\"id\":")
+  out.append(jsonrpc_reply_id_text(id))
+  out.append(",\"error\":{\"code\":")
+  out.append(jsonrpc_error_code_value(code).to_str())
+  out.append(",\"message\":")
+  out.append(json_quote_string(message))
+  out.append(data)
+  out.append("}}")
+  out.finish()
+}
+
+--- A notification sent by the server.
+pub(package) fn jsonrpc_notification(method: str, params: str) -> str {
+  let mut out = string_builder.new()
+  out.append("{\"jsonrpc\":\"2.0\",\"method\":")
+  out.append(json_quote_string(method))
+  out.append(",\"params\":")
+  out.append(params)
+  out.append("}")
+  out.finish()
+}
+
+-- Transports ------------------------------------------------------------
+--- Input read from standard input and not yet consumed as a message.
+pub(package) type JsonRpcInput { pending: Vector<u8> }
+
+pub(package) fn jsonrpc_input() -> JsonRpcInput { JsonRpcInput { pending: vector.new<u8>() } }
+
+--- One message boundary on a Content-Length stream.
+pub(package) type JsonRpcFrame {
+  --- One framed body.
+  JsonRpcFramed(Bytes),
+  --- The stream began a document without a header: every remaining byte,
+  --- to be decoded as concatenated documents.
+  JsonRpcUnframed(Bytes),
+  --- Clean end of input between messages.
+  JsonRpcFrameEnd,
+  --- A truncated or invalid header, or a body cut short by end of input.
+  JsonRpcFrameBroken
+}
+
+fn jsonrpc_input_len(input: JsonRpcInput) -> i64 {
+  let pending = input.pending
+  vector_len<u8>(pending)
+}
+
+fn jsonrpc_input_byte(input: JsonRpcInput, index: i64) -> i64 {
+  let pending = input.pending
+  __u64_to_i64(vector_get_in_bounds<u8>(pending, index).to_u64())
+}
+
+-- Append the next chunk of standard input; false at end of input.
+fn jsonrpc_input_fill(input: JsonRpcInput) -[ConsoleRead]> bool {
+  let limit: usize = 65536
+  match console.read_bytes(limit) {
+    Err(_) -> false
+    Ok(chunk) -> if chunk.is_empty() { false } else {
+      let pending = input.pending
+      let zero: usize = 0
+      for index in zero..chunk.len() { vector_push<u8>(pending, chunk.get(index).unwrap_or(0)) }
+      true
+    }
+  }
+}
+
+-- Copy `[start, end)` out, then drop everything before `consumed`.
+fn jsonrpc_input_take(input: JsonRpcInput, start: i64, end: i64, consumed: i64) -> Bytes {
+  let pending = input.pending
+  let taken = vector.new<u8>()
+  for index in start..end { vector_push<u8>(taken, vector_get_in_bounds<u8>(pending, index)) }
+  let rest = vector.new<u8>()
+  for index in consumed..vector_len<u8>(pending) {
+    vector_push<u8>(rest, vector_get_in_bounds<u8>(pending, index))
+  }
+  vector_clear<u8>(pending)
+  for index in 0..vector_len<u8>(rest) {
+    vector_push<u8>(pending, vector_get_in_bounds<u8>(rest, index))
+  }
+  bytes.from_vector(taken)
+}
+
+fn jsonrpc_is_space(byte: i64) -> bool {
+  byte == 32 or byte == 10 or byte == 13 or byte == 9
+}
+
+-- Whether the buffered input, after leading whitespace, starts a document.
+fn jsonrpc_input_starts_document(input: JsonRpcInput) -> bool {
+  let n = jsonrpc_input_len(input)
+  let mut index = 0
+  while index < n and jsonrpc_is_space(jsonrpc_input_byte(input, index)) { index = index + 1 }
+  index < n and jsonrpc_input_byte(input, index) == 123
+}
+
+-- The offset of the blank line ending the header, or -1 when none has arrived.
+fn jsonrpc_input_header_end(input: JsonRpcInput) -> i64 {
+  let n = jsonrpc_input_len(input)
+  let mut index = 0
+  let mut found = 0 - 1
+  while found < 0 and index + 3 < n {
+    if jsonrpc_input_byte(input, index) == 13 and jsonrpc_input_byte(input, index + 1) == 10 and
+      jsonrpc_input_byte(input, index + 2) == 13 and jsonrpc_input_byte(input, index + 3) == 10 {
+        found = index
+      } else { index = index + 1 }
+  }
+  found
+}
+
+-- The declared body length, or -1 when the header declares none.
+fn jsonrpc_content_length(header: str) -> i64 {
+  match header.find("Content-Length:") {
+    None -> 0 - 1
+    Some(found) -> {
+      let n = str_len(header)
+      let mut pos = found.to_u64().to_i64_checked().unwrap_or(n) + 15
+      while pos < n and jsonrpc_is_space(str_byte_at(header, pos)) { pos = pos + 1 }
+      let mut value = 0
+      let mut digits = 0
+      let mut valid = true
+      while valid and pos < n and str_byte_at(header, pos) >= 48 and str_byte_at(header, pos) <=
+        57 {
+          let digit = str_byte_at(header, pos) - 48
+          if value > (9223372036854775807 - digit) / 10 { valid = false }
+          else {
+            value = value * 10 + digit
+            digits = digits + 1
+            pos = pos + 1
+          }
+        }
+      if valid and digits > 0 { value } else { 0 - 1 }
+    }
+  }
+}
+
+--- Read the next Content-Length framed message.
+pub(package) fn jsonrpc_read_frame(input: JsonRpcInput) -[ConsoleRead]> JsonRpcFrame {
+  let mut header_end = jsonrpc_input_header_end(input)
+  while header_end < 0 {
+    if jsonrpc_input_starts_document(input) {
+      while jsonrpc_input_fill(input) { nil }
+      let n = jsonrpc_input_len(input)
+      return JsonRpcUnframed(jsonrpc_input_take(input, 0, n, n))
+    }
+    if not jsonrpc_input_fill(input) {
+      return if jsonrpc_input_len(input) == 0 { JsonRpcFrameEnd } else { JsonRpcFrameBroken }
+    }
+    header_end = jsonrpc_input_header_end(input)
+  }
+  let length = match jsonrpc_input_take(input, 0, header_end, 0).to_utf8() {
+    Ok(header) -> jsonrpc_content_length(header)
+    Err(_) -> 0 - 1
+  }
+  if length < 0 { return JsonRpcFrameBroken }
+  let body_start = header_end + 4
+  let body_end = body_start + length
+  while jsonrpc_input_len(input) < body_end {
+    if not jsonrpc_input_fill(input) { return JsonRpcFrameBroken }
+  }
+  JsonRpcFramed(jsonrpc_input_take(input, body_start, body_end, body_end))
+}
+
+--- Read the next newline-terminated line without its newline; a final
+--- unterminated line is still a line. `nil` at end of input.
+pub(package) fn jsonrpc_read_line(input: JsonRpcInput) -[ConsoleRead]> Bytes? {
+  let mut scanned = 0
+  loop {
+    let n = jsonrpc_input_len(input)
+    while scanned < n and jsonrpc_input_byte(input, scanned) != 10 { scanned = scanned + 1 }
+    if scanned < n { return jsonrpc_input_take(input, 0, scanned, scanned + 1) }
+    if not jsonrpc_input_fill(input) {
+      return if n == 0 { nil } else { jsonrpc_input_take(input, 0, n, n) }
+    }
+  }
+  nil
+}
+
+--- Read every remaining byte of standard input.
+pub(package) fn jsonrpc_read_all(input: JsonRpcInput) -[ConsoleRead]> Bytes {
+  while jsonrpc_input_fill(input) { nil }
+  let n = jsonrpc_input_len(input)
+  jsonrpc_input_take(input, 0, n, n)
+}
+
+--- Write text to standard output as is.
+pub(package) fn jsonrpc_write_text(text: str) -[ConsoleWrite]> nil {
+  -- A closed peer ends the session through its own input; a failed write
+  -- has nobody left to report to.
+  match console.try_print(text) {
+    Ok(_) -> nil
+    Err(_) -> nil
+  }
+}
+
+--- Write one message with a Content-Length header.
+pub(package) fn jsonrpc_write_frame(body: str) -[ConsoleWrite]> nil {
+  let header = "Content-Length: "
+    |> str_concat(str_len(body).to_str())
+    |> str_concat("\r\n\r\n")
+  jsonrpc_write_text(str_concat(header, body))
+}
+
+--- Write one message followed by a newline.
+pub(package) fn jsonrpc_write_line(body: str) -[ConsoleWrite]> nil {
+  jsonrpc_write_text(str_concat(body, "\n"))
+}
