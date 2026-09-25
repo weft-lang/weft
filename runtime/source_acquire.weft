@@ -5,9 +5,8 @@
 -- sequence; overlay and project-session handlers can interpret the same
 -- request without filesystem authority.
 
-use runtime/alloc.{alloc_words, alloc_zeroed}
-use runtime/buffer.{bscopy, bu8, buf_len, buf_new, buf_take_data}
-use runtime/memory.{mem_copy, mem_load8_at, mem_load64_at, mem_store8_at, mem_store64_at}
+use runtime/alloc.{alloc_words}
+use runtime/buffer.{bscopy, buf_len, buf_new, buf_ptr}
 use runtime/sdk_archive.{
   EmbeddedSdkArchiveAbsent,
   EmbeddedSdkArchivePresent,
@@ -22,7 +21,9 @@ use runtime/sdk_archive.{
   sdk_archive_lookup,
   sdk_archive_path_is_canonical
 }
+use runtime/string.{runtime_str_concat, runtime_str_cstring, runtime_str_from_bytes}
 use runtime/syscall.{sys_close, sys_open_read, sys_read}
+use stdlib/bytes.{Bytes, bytes_from_storage}
 use stdlib/result.{Err, Ok, Result}
 
 pub(package) type SdkOrigin {
@@ -31,8 +32,9 @@ pub(package) type SdkOrigin {
   NoSdk
 }
 
+--- An SDK file's exact bytes, or why the selected SDK cannot supply it.
 pub(package) type SdkSource {
-  SdkSourcePresent(i64, i64),
+  SdkSourceFound(Bytes),
   SdkSourceMissing,
   SdkSourceInvalidPath
 }
@@ -40,59 +42,45 @@ pub(package) type SdkSource {
 pub(package) effect SourceAcquire {
   -- Typed semantic origin selected for canonical SDK modules and assets.
   fn sdk_origin() -> SdkOrigin
-  fn load_sdk(path: i64, path_len: i64) -> SdkSource
-  fn load(
-    physical_path: i64,
-    physical_len: i64,
-    logical_path: i64,
-    logical_len: i64,
-    package_id: i64
-  ) -> i64
+  --- The bytes of a canonical SDK path such as `stdlib/io.weft`.
+  fn load_sdk(path: str) -> SdkSource
+  --- The bytes of the file a resolved request names, or `nil` when it cannot
+  --- be opened. An empty file is present, with no bytes.
+  fn load(physical_path: str, logical_path: str, package_id: i64) -> Bytes?
 }
 
-fn source_acquire_read_fd_all(fd: i64) -> i64 {
+fn source_acquire_read_fd(fd: i64) -> Bytes {
   let chunk_size = 65536
   let scratch = alloc_words(chunk_size / 8)
   let out = buf_new(chunk_size)
   let mut done = 0
   while done == 0 {
     let n = sys_read(fd, scratch, chunk_size)
-    if n > 0 {
-      bscopy(out, scratch, n, 0)
-    } else {
-      done = 1
-    }
+    if n > 0 { bscopy(out, scratch, n, 0) } else { done = 1 }
   }
-  let result = alloc_words(2)
-  let len = buf_len(out)
-  mem_store64_at(result, 0, buf_take_data(out))
-  mem_store64_at(result, 8, len)
-  result
+  -- The read buffer is released with `out`; the bytes keep their own copy.
+  bytes_from_storage(runtime_str_from_bytes(buf_ptr(out), buf_len(out)))
 }
 
-fn source_acquire_load_file(path: i64, path_len: i64) -> i64 {
-  let path_buf = alloc_zeroed(path_len + 1)
-  mem_copy(path_buf, path, path_len)
-  mem_store8_at(path_buf, path_len, 0)
-  let fd = sys_open_read(path_buf)
-  let result = alloc_words(2)
-  if fd < 0 {
-    mem_store64_at(result, 0, 0)
-    mem_store64_at(result, 8, 0)
-  } else {
-    let file = source_acquire_read_fd_all(fd)
+fn source_acquire_load_file(path: str) -> Bytes? {
+  let fd = sys_open_read(runtime_str_cstring(path))
+  if fd < 0 { nil }
+  else {
+    let bytes = source_acquire_read_fd(fd)
     sys_close(fd)
-    mem_store64_at(result, 0, mem_load64_at(file, 0))
-    mem_store64_at(result, 8, mem_load64_at(file, 8))
+    bytes
   }
-  result
 }
 
-fn source_acquire_sdk_file(path: i64, path_len: i64) -> SdkSource {
-  let file = source_acquire_load_file(path, path_len)
-  let data = mem_load64_at(file, 0)
-  if data == 0 { SdkSourceMissing }
-  else { SdkSourcePresent(data, mem_load64_at(file, 8)) }
+fn source_acquire_path_is_canonical(path: str) -> bool {
+  sdk_archive_path_is_canonical(__str_ptr(path), __str_len(path))
+}
+
+fn source_acquire_sdk_file(path: str) -> SdkSource {
+  match source_acquire_load_file(path) {
+    nil -> SdkSourceMissing
+    bytes: Bytes -> SdkSourceFound(bytes)
+  }
 }
 
 pub(package) fn source_acquire_with_standalone<T, E>(
@@ -100,31 +88,21 @@ pub(package) fn source_acquire_with_standalone<T, E>(
 ) -[E]> T {
   handle body() {
     SourceAcquire.sdk_origin() -> resume(NoSdk)
-    SourceAcquire.load_sdk(path, path_len) -> {
-      let source = if sdk_archive_path_is_canonical(path, path_len) {
-        source_acquire_sdk_file(path, path_len)
-      }
+    SourceAcquire.load_sdk(path) -> resume(
+      if source_acquire_path_is_canonical(path) { source_acquire_sdk_file(path) }
       else { SdkSourceInvalidPath }
-      resume(source)
-    }
-    SourceAcquire.load(physical_path, physical_len, logical_path, logical_len, package_id) ->
-      resume(source_acquire_load_file(physical_path, physical_len))
+    )
+    SourceAcquire.load(physical_path, logical_path, package_id) -> resume(
+      source_acquire_load_file(physical_path)
+    )
   }
 }
 
-fn source_acquire_sdk_physical_path(sdk_root: str, path: i64, path_len: i64) -> i64 {
+fn source_acquire_sdk_physical_path(sdk_root: str, path: str) -> str {
   let root_len = __str_len(sdk_root)
-  let joined = buf_new(root_len + path_len + 2)
-  bscopy(joined, __str_ptr(sdk_root), root_len, 0)
-  if root_len > 0 and mem_load8_at(__str_ptr(sdk_root), root_len - 1) != 47 {
-    bu8(joined, 47)
-  } else { 0 }
-  bscopy(joined, path, path_len, 0)
-  let result = alloc_words(2)
-  let len = buf_len(joined)
-  mem_store64_at(result, 0, buf_take_data(joined))
-  mem_store64_at(result, 8, len)
-  result
+  if root_len > 0 and __mem_load8(__str_ptr(sdk_root) + root_len - 1) != 47 {
+    runtime_str_concat(runtime_str_concat(sdk_root, "/"), path)
+  } else { runtime_str_concat(sdk_root, path) }
 }
 
 -- Checkout compilers select one package root at process startup. Only
@@ -136,21 +114,22 @@ pub(package) fn source_acquire_with_checkout<T, E>(
 ) -[E]> T {
   handle body() {
     SourceAcquire.sdk_origin() -> resume(CheckoutSdk(sdk_root))
-    SourceAcquire.load_sdk(path, path_len) -> {
-      let source = if sdk_archive_path_is_canonical(path, path_len) {
-        let installed = source_acquire_sdk_physical_path(sdk_root, path, path_len)
-        source_acquire_sdk_file(mem_load64_at(installed, 0), mem_load64_at(installed, 8))
+    SourceAcquire.load_sdk(path) -> resume(
+      if source_acquire_path_is_canonical(path) {
+        source_acquire_sdk_file(source_acquire_sdk_physical_path(sdk_root, path))
       } else { SdkSourceInvalidPath }
-      resume(source)
-    }
-    SourceAcquire.load(physical_path, physical_len, logical_path, logical_len, package_id) ->
-      resume(source_acquire_load_file(physical_path, physical_len))
+    )
+    SourceAcquire.load(physical_path, logical_path, package_id) -> resume(
+      source_acquire_load_file(physical_path)
+    )
   }
 }
 
-fn source_acquire_archive_result(archive: SdkArchive, path: i64, path_len: i64) -> SdkSource {
-  match sdk_archive_lookup(archive, path, path_len) {
-    SdkArchiveFound(data, len) -> SdkSourcePresent(data, len)
+fn source_acquire_archive_result(archive: SdkArchive, path: str) -> SdkSource {
+  match sdk_archive_lookup(archive, __str_ptr(path), __str_len(path)) {
+    SdkArchiveFound(data, len) -> SdkSourceFound(
+      bytes_from_storage(runtime_str_from_bytes(data, len))
+    )
     SdkArchiveMissing -> SdkSourceMissing
     SdkArchiveInvalidPath -> SdkSourceInvalidPath
   }
@@ -163,11 +142,10 @@ pub(package) fn source_acquire_with_archive<T, E>(
   let digest = sdk_archive_digest(archive)
   handle body() {
     SourceAcquire.sdk_origin() -> resume(EmbeddedSdk(digest))
-    SourceAcquire.load_sdk(path, path_len) -> resume(
-      source_acquire_archive_result(archive, path, path_len)
+    SourceAcquire.load_sdk(path) -> resume(source_acquire_archive_result(archive, path))
+    SourceAcquire.load(physical_path, logical_path, package_id) -> resume(
+      source_acquire_load_file(physical_path)
     )
-    SourceAcquire.load(physical_path, physical_len, logical_path, logical_len, package_id) ->
-      resume(source_acquire_load_file(physical_path, physical_len))
   }
 }
 
