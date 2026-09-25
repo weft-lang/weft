@@ -12293,11 +12293,114 @@ pub(package) fn pipeline_call_transport_retain_type(
   else { expected_ty }
 }
 
--- Evaluated arguments own their transport stakes until the call begins.
--- A return, break or continue in a later argument leaves that evaluation
--- scope before ownership transfers to the callee. Release these stakes on
--- those exits; abort and continuation abandonment use the acquisition facts
--- through the runtime cleanup chain.
+--- Later operands' blocks after one operand's exit cleanup, with the value
+--- and block ids the cleanup reserved.
+pub(package) type PipelineOperandExitBlocks {
+  blocks: IrBlockList,
+  next_value: i64,
+  next_block: i64
+}
+
+--- What an evaluated operand owns until it is consumed: a managed stake of
+--- `release_ty` (0 for none), or a linear temporary with cleanup `plan`.
+pub(package) type PipelineOperandObligation {
+  release_ty: i64,
+  plan: i64
+}
+
+-- A temporary owns its value outright. Otherwise the operand owns only the
+-- stake its evaluation retained.
+pub(package) fn pipeline_operand_obligation(
+  operand: Expr,
+  retained_ty: i64,
+  actual_ty: i64,
+  module: PipelineLowerModule
+) -> PipelineOperandObligation {
+  let tt = pipeline_lower_module_tt(module)
+  let temporary = pipeline_expr_owned_rvalue_temp_typed(
+    operand,
+    pipeline_lower_module_src(module),
+    tt
+  ) == 1 or
+    pipeline_expr_owned_temp_drop_kind_typed(operand) != continuation_cleanup_kind_none()
+  let plan = if temporary { pipeline_linear_cleanup_plan(tt, actual_ty) } else { 0 }
+  PipelineOperandObligation {
+    release_ty: if plan != 0 { 0 } else {
+      if retained_ty != 0 { retained_ty } else { if temporary { actual_ty } else { 0 } }
+    },
+    plan: plan
+  }
+}
+
+-- An evaluated operand owns its obligation until the call or construction
+-- that consumes it begins. A return, break or continue in a later operand
+-- leaves that evaluation scope before ownership transfers, so each such exit
+-- releases the stake or drops the linear temporary. Abort and continuation
+-- abandonment use the acquisition facts through the runtime cleanup chain.
+-- `blocks` are the later operands' blocks, already carrying their own exit
+-- cleanup.
+pub(package) fn pipeline_operand_exit_cleanup(
+  blocks: IrBlockList,
+  next_value: i64,
+  next_block: i64,
+  value: i64,
+  obligation: PipelineOperandObligation,
+  module: PipelineLowerModule
+) -> PipelineOperandExitBlocks {
+  let exits = pipeline_lower_module_scope_exit(module, - 1)
+  let tt = pipeline_lower_module_tt(module)
+  let release_ty = obligation.release_ty
+  let plan = obligation.plan
+  let exit_count = if release_ty != 0 and ty_value_has_release_lane(release_ty) == 1 {
+    pipeline_ir_block_list_scope_exit_count(blocks, exits)
+  } else { 0 }
+  if exit_count == 0 and plan == 0 {
+    return PipelineOperandExitBlocks {
+      blocks: blocks,
+      next_value: next_value,
+      next_block: next_block
+    }
+  } else { 0 }
+  let managed = if exit_count == 0 { blocks } else {
+    pipeline_ir_block_list_append_exit_managed_cleanup_indexed(
+      blocks,
+      value,
+      release_ty,
+      next_value,
+      0,
+      exits
+    )
+  }
+  let after_managed = if exit_count == 0 { next_value } else {
+    next_value + exit_count * pipeline_type_managed_release_lane_count(release_ty)
+  }
+  let linear = pipeline_ir_linear_cleanup(
+    managed,
+    value,
+    plan,
+    exits,
+    pipeline_lower_module_fns(module),
+    tt,
+    after_managed,
+    next_block
+  )
+  -- The operand has not yet transferred its linear obligation. The generic
+  -- cleanup producer can still track aliases carried by a return.
+  let prepared = if ir_inst_list_len(linear.init) == 0 { linear.blocks }
+  else {
+    pipeline_ir_block_list_prepend_entry_insts(
+      linear.blocks,
+      ir_block_list_first_block_id(linear.blocks),
+      linear.init
+    )
+  }
+  PipelineOperandExitBlocks {
+    blocks: prepared,
+    next_value: linear.next_value,
+    next_block: linear.next_block
+  }
+}
+
 pub(package) fn pipeline_call_argument_exit_cleanup(
   rest: PipelineLoweredCallBlocks,
   arg: Expr,
@@ -12308,64 +12411,59 @@ pub(package) fn pipeline_call_argument_exit_cleanup(
 ) -> PipelineLoweredCallBlocks {
   if pipeline_lowered_call_blocks_is_valid(rest) == 0 { rest }
   else {
-    let exits = pipeline_lower_module_scope_exit(module, - 1)
-    let tt = pipeline_lower_module_tt(module)
-    let temporary = pipeline_expr_owned_rvalue_temp_typed(
-      arg,
-      pipeline_lower_module_src(module),
-      tt
-    ) == 1 or
-      pipeline_expr_owned_temp_drop_kind_typed(arg) != continuation_cleanup_kind_none()
-    let plan = if temporary { pipeline_linear_cleanup_plan(tt, actual_ty) } else { 0 }
-    let release_ty = if plan != 0 { 0 } else {
-      if retained_ty != 0 { retained_ty } else { if temporary { actual_ty } else { 0 } }
-    }
-    let blocks = pipeline_lowered_call_blocks_blocks(rest)
-    let next_value = pipeline_lowered_call_blocks_next_value(rest)
-    let exit_count = if release_ty != 0 and ty_value_has_release_lane(release_ty) == 1 {
-      pipeline_ir_block_list_scope_exit_count(blocks, exits)
-    } else { 0 }
-    if exit_count == 0 and plan == 0 { return rest } else { 0 }
-    let managed = if exit_count == 0 { blocks } else {
-      pipeline_ir_block_list_append_exit_managed_cleanup_indexed(
-        blocks,
-        value,
-        release_ty,
-        next_value,
-        0,
-        exits
-      )
-    }
-    let after_managed = if exit_count == 0 { next_value } else {
-      next_value + exit_count * pipeline_type_managed_release_lane_count(release_ty)
-    }
-    let linear = pipeline_ir_linear_cleanup(
-      managed,
+    let cleaned = pipeline_operand_exit_cleanup(
+      pipeline_lowered_call_blocks_blocks(rest),
+      pipeline_lowered_call_blocks_next_value(rest),
+      pipeline_lowered_call_blocks_next_block(rest),
       value,
-      plan,
-      exits,
-      pipeline_lower_module_fns(module),
-      tt,
-      after_managed,
-      pipeline_lowered_call_blocks_next_block(rest)
+      pipeline_operand_obligation(arg, retained_ty, actual_ty, module),
+      module
     )
-    -- A call argument has not yet transferred its linear obligation. The
-    -- generic cleanup producer can still track aliases carried by a return.
-    let prepared = if ir_inst_list_len(linear.init) == 0 { linear.blocks }
-    else {
-      pipeline_ir_block_list_prepend_entry_insts(
-        linear.blocks,
-        ir_block_list_first_block_id(linear.blocks),
-        linear.init
-      )
-    }
     pipeline_lowered_call_blocks_control(
       pipeline_lowered_call_blocks_values(rest),
-      linear.next_block,
-      linear.next_value,
-      prepared,
+      cleaned.next_block,
+      cleaned.next_value,
+      cleaned.blocks,
       1,
       pipeline_lowered_call_blocks_falls_through(rest)
+    )
+  }
+}
+
+-- A record or tuple literal's fields are the construction's operands: an
+-- exit in a later field releases each earlier field, as a call's exit does
+-- for its earlier arguments. The construction takes every field it stores,
+-- so a field holds a stake unless it is linear, which moves its obligation.
+pub(package) fn pipeline_record_field_exit_cleanup(
+  rest: PipelineLoweredRecordFieldBlocks,
+  field: Expr,
+  value: i64,
+  field_ty: i64,
+  module: PipelineLowerModule
+) -> PipelineLoweredRecordFieldBlocks {
+  if pipeline_lowered_record_field_blocks_is_valid(rest) == 0 { rest }
+  else {
+    let retained_ty = pipeline_call_transport_retain_type(
+      pipeline_lower_module_tt(module),
+      field_ty,
+      field_ty,
+      0
+    )
+    let cleaned = pipeline_operand_exit_cleanup(
+      pipeline_lowered_record_field_blocks_blocks(rest),
+      pipeline_lowered_record_field_blocks_next_value(rest),
+      pipeline_lowered_record_field_blocks_next_block(rest),
+      value,
+      pipeline_operand_obligation(field, retained_ty, field_ty, module),
+      module
+    )
+    pipeline_lowered_record_field_blocks_control(
+      pipeline_lowered_record_field_blocks_values(rest),
+      cleaned.next_block,
+      cleaned.next_value,
+      cleaned.blocks,
+      1,
+      pipeline_lowered_record_field_blocks_falls_through(rest)
     )
   }
 }
@@ -18911,7 +19009,7 @@ pub(package) fn pipeline_lower_record_field_blocks_typed(
                     field_ty
                   )
                 )
-                let rest = pipeline_lower_record_field_blocks_typed(
+                let rest_before_cleanup = pipeline_lower_record_field_blocks_typed(
                   rest_fields,
                   params,
                   locals,
@@ -18923,6 +19021,13 @@ pub(package) fn pipeline_lower_record_field_blocks_typed(
                   pipeline_lowered_args_next_value(retain),
                   rest_start,
                   next_values
+                )
+                let rest = pipeline_record_field_exit_cleanup(
+                  rest_before_cleanup,
+                  value_expr,
+                  field_value,
+                  field_ty,
+                  module
                 )
                 if pipeline_lowered_record_field_blocks_is_valid(rest) == 1 {
                   let last_field = record_field_list_len(rest_fields) == 0
@@ -18995,7 +19100,7 @@ pub(package) fn pipeline_lower_record_field_blocks_typed(
                   field_ty
                 )
               )
-              let rest = pipeline_lower_record_field_blocks_typed(
+              let rest_before_cleanup = pipeline_lower_record_field_blocks_typed(
                 rest_fields,
                 params,
                 locals,
@@ -19007,6 +19112,13 @@ pub(package) fn pipeline_lower_record_field_blocks_typed(
                 pipeline_lowered_args_next_value(retain),
                 rest_start,
                 next_values
+              )
+              let rest = pipeline_record_field_exit_cleanup(
+                rest_before_cleanup,
+                value_expr,
+                ir_lowered_expr_value(lowered),
+                field_ty,
+                module
               )
               if pipeline_lowered_record_field_blocks_is_valid(rest) == 1 {
                 let last_field = record_field_list_len(rest_fields) == 0
@@ -19314,10 +19426,21 @@ pub(package) fn pipeline_lower_array_literal_typed_to_target_blocks(
       if pipeline_lowered_blocks_is_valid(lowered) == 0 {
         pipeline_lowered_blocks_invalid(start_block, next_value)
       } else {
-        pipeline_lowered_blocks_control(
-          pipeline_lowered_blocks_next_block(lowered),
+        -- The storage owns every element stored so far, and its unstored
+        -- elements are still zero. An exit in a later element releases the
+        -- storage, which releases exactly the stored elements.
+        let cleaned = pipeline_operand_exit_cleanup(
+          pipeline_lowered_blocks_blocks(lowered),
           pipeline_lowered_blocks_next_value(lowered),
-          ir_block_list_prepend(entry, pipeline_lowered_blocks_blocks(lowered)),
+          pipeline_lowered_blocks_next_block(lowered),
+          ir_lowered_expr_value(storage),
+          PipelineOperandObligation { release_ty: array_ty, plan: 0 },
+          module
+        )
+        pipeline_lowered_blocks_control(
+          cleaned.next_block,
+          cleaned.next_value,
+          ir_block_list_prepend(entry, cleaned.blocks),
           1,
           pipeline_lowered_blocks_falls_through(lowered)
         )
