@@ -18,7 +18,7 @@ compiler/
   source/               retained inputs, loading, provenance, and trust policy
   diagnostic/           diagnostic observation, locations, and rendering
   types/                type algebra and source spelling keys
-  ir/                   internal representations and control-flow analysis
+  ir/                   internal representations, control-flow analysis and their text view
   grammar/              grammar data and interpretation infrastructure
   comptime/             compile-time execution and observed artifact inputs
   project/              sessions, module identity, and reusable checked products

@@ -2521,6 +2521,144 @@ assert_equals "ast_snapshot_exact" "$ast_out" $'--- AST: 1 functions ---\n\nfn m
 ast_path_out=$("$WEFT" ast "$tmp_src" 2>&1)
 assert_equals "ast_path_snapshot_exact" "$ast_path_out" $'--- AST: 1 functions ---\n\nfn main:\n  IntLit(42)'
 
+# `weft ir` renders the checked program's typed IR. The root file's functions
+# are the default view, `--all` adds the SDK closure and `--function` selects
+# one function. The text is a debugging view of an unstable tier, so these
+# checks pin names, nesting and scope rather than whole dumps.
+cat > "$tmp_import" <<'IR_EOF'
+type Shape { Circle(i64), Empty }
+
+effect Log { fn note(n: i64) -> i64 }
+
+fn area(shape: Shape) -> i64 {
+  match shape {
+    Circle(radius) -> radius * radius
+    Empty -> 0
+  }
+}
+
+fn logged(n: i64) -[Log]> i64 { Log.note(n) + 1 }
+
+fn width(text: str) -> usize { text.len() }
+
+fn main() -> i64 {
+  let total = handle logged(area(Circle(3))) { Log.note(n) -> resume(n * 2) }
+  let add = (x: i64) => x + total
+  add(1)
+}
+IR_EOF
+ir_out=$("$WEFT" ir --stage lowered "$tmp_import" 2>&1)
+assert_contains "ir_renders_root_function" "$ir_out" "fn area (1 params)"
+assert_contains "ir_renders_block_parameters_and_return" "$ir_out" $'  b1(%11):\n    return %11'
+assert_contains "ir_names_constructor" "$ir_out" "= variant Circle(%1) mask=0"
+assert_contains "ir_names_called_function" "$ir_out" "= call area(%2)"
+assert_contains "ir_names_effect_operation" "$ir_out" "= perform Log.note(%0)"
+assert_contains "ir_nests_handler_clause" "$ir_out" "_ = handle Log clauses=1 abort=none"
+assert_contains "ir_renders_clause_body" "$ir_out" "      clause note params=1 captures=[] resumes"
+assert_contains "ir_nests_closure_body" "$ir_out" $'= closure captures=[%0]\n      fn h'
+assert_contains "ir_renders_managed_stakes" "$ir_out" "= release.rc %2 origin=call_transport"
+assert_contains "ir_renders_typed_binds" "$ir_out" "bind %0 : Shape"
+assert_contains "ir_names_primitive_method_receiver" "$ir_out" "= method str.len(%0)"
+assert_not_contains "ir_root_scope_omits_sdk_functions" "$ir_out" "fn u64.display"
+ir_all_out=$("$WEFT" ir --all --stage lowered "$tmp_import" 2>&1)
+assert_contains "ir_all_includes_sdk_methods" "$ir_all_out" "fn u64.display (1 params)"
+assert_contains "ir_all_includes_root_functions" "$ir_all_out" "fn logged (1 params)"
+ir_one_out=$("$WEFT" ir --stage lowered --function logged "$tmp_import" 2>&1)
+assert_equals "ir_function_selects_one_function" "$ir_one_out" $'fn logged (1 params)\n  b0():\n    bind %0 : i64\n    %1 = perform Log.note(%0)\n    %2 = const 1\n    %3 = add %1, %2\n    return %3'
+ir_optimised_out=$("$WEFT" ir "$tmp_import" 2>&1)
+assert_contains "ir_default_stage_is_optimised" "$ir_optimised_out" "fn main (0 params)"
+set +e
+"$WEFT" ir --function missing "$tmp_import" > "$tmp_out" 2> "$tmp_err"
+ir_missing_function_exit=$?
+"$WEFT" ir --stage bogus "$tmp_import" > "$tmp_out" 2> "$tmp_err"
+ir_bad_stage_exit=$?
+ir_bad_stage_err=$(<"$tmp_err")
+"$WEFT" ir --all --function main "$tmp_import" > "$tmp_out" 2> "$tmp_err"
+ir_both_scopes_exit=$?
+ir_both_scopes_err=$(<"$tmp_err")
+"$WEFT" ir > "$tmp_out" 2> "$tmp_err"
+ir_no_file_exit=$?
+ir_no_file_err=$(<"$tmp_err")
+"$WEFT" ir "$tmp_import" "$tmp_src" > "$tmp_out" 2> "$tmp_err"
+ir_two_files_exit=$?
+ir_two_files_err=$(<"$tmp_err")
+"$WEFT" ir /nonexistent/weft_ir_input.weft > "$tmp_out" 2> "$tmp_err"
+ir_unreadable_exit=$?
+ir_unreadable_err=$(<"$tmp_err")
+set -e
+assert_equals "ir_missing_function_exit" "$ir_missing_function_exit" "1"
+assert_equals "ir_bad_stage_exit" "$ir_bad_stage_exit" "2"
+assert_contains "ir_bad_stage_reports_choices" "$ir_bad_stage_err" "ir: unknown stage (use lowered, optimised or native)"
+assert_contains "ir_bad_stage_prints_usage" "$ir_bad_stage_err" "usage: weft ir [--stage lowered|optimised|native] [--facts cleanup] [--all | --function NAME] FILE"
+assert_equals "ir_both_scopes_exit" "$ir_both_scopes_exit" "2"
+assert_contains "ir_both_scopes_reported" "$ir_both_scopes_err" "ir: choose one of --all and --function"
+assert_equals "ir_no_file_exit" "$ir_no_file_exit" "2"
+assert_contains "ir_no_file_reported" "$ir_no_file_err" "ir: expected an input file"
+assert_equals "ir_two_files_exit" "$ir_two_files_exit" "2"
+assert_contains "ir_two_files_reported" "$ir_two_files_err" "ir: expected exactly one input file"
+assert_equals "ir_unreadable_exit" "$ir_unreadable_exit" "1"
+assert_contains "ir_unreadable_reported" "$ir_unreadable_err" "ir: could not read input file"
+# `--stage native` shows the functions native emission consumes, and
+# `--facts cleanup` adds the abort-cleanup records emission arms for each body
+# beneath that body's blocks. The facts describe native emission, so they
+# imply the native stage and reject any other.
+cat > "$tmp_import" <<'IR_EOF'
+use stdlib/drop.{Drop}
+
+type Token { id: i64 }
+
+impl Drop for Token {
+  fn drop(self) -> i64 { self.id }
+}
+
+type Held { HeldToken(owned Token), Nothing }
+
+effect Stop { fn stop() -> i64 }
+
+fn guarded(held: bool) -[Stop]> i64 {
+  let choice: Held = if held { HeldToken(Token { id: 4 }) } else { Nothing }
+  Stop.stop() + 100
+}
+
+fn main() -> i64 { handle guarded(true) { Stop.stop() -> 42 } }
+IR_EOF
+ir_native_out=$("$WEFT" ir --stage native --function guarded "$tmp_import" 2>&1)
+assert_contains "ir_native_stage_renders_prepared_body" "$ir_native_out" "structural_drop %1 plan{variant Held words=1}"
+assert_not_contains "ir_native_stage_omits_facts_by_default" "$ir_native_out" "cleanup r"
+ir_cleanup_out=$("$WEFT" ir --facts cleanup "$tmp_import" 2>&1)
+assert_contains "ir_cleanup_follows_its_body" "$ir_cleanup_out" $'    return %8\n  cleanup r0 drop Token %3 at %3 (unknown)\n'
+assert_contains "ir_cleanup_names_structural_glue_plan" "$ir_cleanup_out" "  cleanup r1 glue plan{variant Held words=1} %4 at %4 (unknown)"
+assert_contains "ir_cleanup_decodes_bind_site" "$ir_cleanup_out" "  cleanup r2 glue plan{variant Held words=1} %1 at bind %1 (unknown)"
+assert_contains "ir_cleanup_renders_join_alias" "$ir_cleanup_out" "  cleanup %1 aliases r1 (join)"
+assert_contains "ir_cleanup_names_release_helper" "$ir_cleanup_out" "  cleanup r0 release rc_default_release %0 at %0 (parameter_cleanup)"
+ir_cleanup_explicit_out=$("$WEFT" ir --stage native --facts cleanup "$tmp_import" 2>&1)
+assert_equals "ir_cleanup_implies_native_stage" "$ir_cleanup_explicit_out" "$ir_cleanup_out"
+set +e
+"$WEFT" ir --stage optimised --facts cleanup "$tmp_import" > "$tmp_out" 2> "$tmp_err"
+ir_cleanup_wrong_stage_exit=$?
+ir_cleanup_wrong_stage_err=$(<"$tmp_err")
+"$WEFT" ir --facts bogus "$tmp_import" > "$tmp_out" 2> "$tmp_err"
+ir_bad_facts_exit=$?
+ir_bad_facts_err=$(<"$tmp_err")
+"$WEFT" ir "$tmp_import" --facts > "$tmp_out" 2> "$tmp_err"
+ir_missing_facts_exit=$?
+ir_missing_facts_err=$(<"$tmp_err")
+set -e
+assert_equals "ir_cleanup_wrong_stage_exit" "$ir_cleanup_wrong_stage_exit" "2"
+assert_contains "ir_cleanup_wrong_stage_reported" "$ir_cleanup_wrong_stage_err" "ir: --facts cleanup describes native emission (use --stage native)"
+assert_equals "ir_bad_facts_exit" "$ir_bad_facts_exit" "2"
+assert_contains "ir_bad_facts_reported" "$ir_bad_facts_err" "ir: unknown facts (use cleanup)"
+assert_equals "ir_missing_facts_exit" "$ir_missing_facts_exit" "2"
+assert_contains "ir_missing_facts_reported" "$ir_missing_facts_err" "ir: --facts needs cleanup"
+printf 'fn main() -> i64 { "text" }\n' > "$tmp_import"
+set +e
+"$WEFT" ir "$tmp_import" > "$tmp_out" 2> "$tmp_err"
+ir_type_error_exit=$?
+set -e
+assert_equals "ir_type_error_exit" "$ir_type_error_exit" "1"
+assert_equals "ir_type_error_prints_no_ir" "$(wc -c < "$tmp_out" | tr -d ' ')" "0"
+assert_contains "ir_type_error_reports_diagnostic" "$(<"$tmp_err")" "error[E1002]: return value type mismatch"
+
 check_out=$("$WEFT" check < "$tmp_src" 2>&1)
 assert_contains "check_parse_and_typecheck" "$check_out" "functions, 0 errors"
 

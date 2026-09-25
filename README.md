@@ -232,6 +232,7 @@ The compiler is a Weft program: the IR is a Weft type, passes are effect-annotat
 | `weft fmt` | parse only | cannot depend on type info by construction |
 | `weft check` | parse + check | no emission effects |
 | `weft ast` | parse | structure dump |
+| `weft ir` | parse + check + lower (+ optimise, native preparation) | typed-IR debugging view with native abort-cleanup facts; unstable, not an interface |
 | `weft test` | full pipeline | `Test` effect harness |
 | `weft doc` | parse + check | checker-owned API facts; no lower/emit |
 | `weft explain` | diagnostic registry | append-only code teaching bodies |

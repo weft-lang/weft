@@ -1,0 +1,1403 @@
+-- Human-readable text for typed IR, for `weft ir`.
+--
+-- Typed IR is an Unstable tier (kernel §13.6): this text is a debugging view
+-- for compiler work, not an interface. Tools that need stable meaning consume
+-- semantic facts. Every instruction and terminator is matched exhaustively, so
+-- new IR cannot be added without this view learning to show it.
+
+use compiler/ir/data.{*}
+use compiler/project/identity.{
+  DeclarationIdentity,
+  DeclaredFunctionIdentity,
+  FunctionIdentity,
+  IntrinsicFunctionIdentity,
+  MemberDeclarationIdentity,
+  ModuleDeclarationIdentity,
+  ModuleFunctionIdentity
+}
+use compiler/storage.{*}
+use compiler/types/algebra.{*}
+use compiler/types/graph.{SemanticTypeId, semantic_type_id_ordinal}
+use runtime/effects.{
+  continuation_cleanup_kind_closure,
+  continuation_cleanup_kind_continuation,
+  continuation_cleanup_kind_none,
+  continuation_cleanup_kind_rc,
+  continuation_cleanup_kind_weak
+}
+use stdlib/display.{Display}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/map.{Map}
+use stdlib/option.{None, Option, Some}
+use stdlib/source.{Span}
+use stdlib/string.{int_to_str}
+use stdlib/string/builder as builder
+use stdlib/string/builder.{Builder}
+
+--- Names and interpretations the IR cannot carry itself. `names` resolves
+--- the declaration hashes IR instructions store (functions, types,
+--- constructors, effects and operations). `plan_text` summarises a
+--- checker-produced cleanup plan; the IR layer does not read plan storage.
+--- `cleanup` supplies the abort-cleanup records native emission arms for a
+--- body, which render beneath its blocks; it answers `Nil` when they are not
+--- requested.
+pub(package) type IrRenderContext {
+  names: Map<i64, str>,
+  plan_text: (i64) -> str,
+  cleanup: (IrBlockList) -> List<IrCleanupRecord>
+}
+
+--- Where native emission arms an abort-cleanup record: at the value an
+--- instruction defines, at a typed owned bind or a rewrap of a value, or on
+--- a mutable linear slot. Aliases arm nothing and have no site.
+pub(package) type IrCleanupSite {
+  IrCleanupAtValue(i64),
+  IrCleanupAtBind(i64),
+  IrCleanupAtRewrap(i64),
+  IrCleanupAtSlot(i64),
+  IrCleanupUnsited
+}
+
+--- What a record runs if its body aborts while it is armed: a release
+--- helper (a function hash), an owned type's Drop (a type hash), array glue,
+--- or a structural plan's glue. An alias names a value that reaches a record
+--- armed elsewhere, loaded from a mutable slot or merged at a join.
+pub(package) type IrCleanupAction {
+  IrCleanupRelease(i64),
+  IrCleanupDrop(i64),
+  IrCleanupArrayGlue(i64),
+  IrCleanupPlanGlue(i64),
+  IrCleanupSlotAlias,
+  IrCleanupFlowAlias
+}
+
+--- One abort-cleanup record: its index in the body's record frame, the
+--- value it protects and the managed-stake origin that produced it.
+pub(package) type IrCleanupRecord {
+  record: i64,
+  site: IrCleanupSite,
+  value: i64,
+  action: IrCleanupAction,
+  origin: i64
+}
+
+--- A context that renders no cleanup records.
+pub(package) fn no_cleanup(blocks: IrBlockList) -> List<IrCleanupRecord> { Nil }
+
+--- Which functions a dump shows: every function, those lowered from one
+--- source buffer, or those with one rendered name (from any source).
+pub(package) type IrRenderSelection {
+  IrRenderAll,
+  IrRenderSource(i64),
+  IrRenderNamed(str)
+}
+
+fn selected(selection: IrRenderSelection, context: IrRenderContext, function: IrFunction) -> bool
+{
+  match function {
+    IrFunction(hash, _, _, source) -> match selection {
+      IrRenderAll -> true
+      IrRenderSource(root) -> source == root
+      IrRenderNamed(name) -> function_name(context, hash) == name
+    }
+  }
+}
+
+--- Render the selected functions in module order. Nested lambda,
+--- handler-clause and deferred bodies are rendered beneath the instruction
+--- that owns them.
+pub(package) fn render_selected(
+  functions: IrFunctionList,
+  context: IrRenderContext,
+  selection: IrRenderSelection
+) -> str {
+  let mut out = builder.new()
+  let mut remaining = functions
+  let mut first = true
+  loop {
+    match remaining {
+      IrFunctionNil -> break
+      IrFunctionCons(function, rest) -> {
+        if selected(selection, context, function) {
+          if not first { out.append("\n") } else { nil }
+          first = false
+          render_function(out, function, context, "")
+        } else { nil }
+        remaining = rest
+      }
+    }
+  }
+  out.finish()
+}
+
+--- Render every function whose resolved name equals `only`, or all functions
+--- when `only` is empty.
+pub(package) fn render_functions(
+  functions: IrFunctionList,
+  context: IrRenderContext,
+  only: str
+) -> str {
+  render_selected(
+    functions,
+    context,
+    if only.len() == 0 { IrRenderAll } else { IrRenderNamed(only) }
+  )
+}
+
+--- The rendered name of a function hash: its declared name when the context
+--- knows it, otherwise `h<hash>` (generic specialisations and synthetic
+--- bodies such as hoisted lambdas have no declared name).
+pub(package) fn function_name(context: IrRenderContext, hash: i64) -> str {
+  match context.names.get(hash) {
+    Some(name) -> name
+    None -> "h".concat(int_to_str(hash))
+  }
+}
+
+fn hash_text(context: IrRenderContext, hash: i64) -> str {
+  match context.names.get(hash) {
+    Some(name) -> name
+    None -> "#".concat(int_to_str(hash))
+  }
+}
+
+fn plan_text(context: IrRenderContext, plan: i64) -> str {
+  let describe = context.plan_text
+  describe(plan)
+}
+
+fn cleanup_records(context: IrRenderContext, blocks: IrBlockList) -> List<IrCleanupRecord> {
+  let describe = context.cleanup
+  describe(blocks)
+}
+
+fn value(id: i64) -> str { if id < 0 { "_" } else { "%".concat(int_to_str(id)) } }
+
+fn block_label(id: i64) -> str { "b".concat(int_to_str(id)) }
+
+fn values(list: IrValueList) -> str {
+  let mut out = builder.new()
+  let mut remaining = list
+  let mut first = true
+  loop {
+    match remaining {
+      IrValueNil -> break
+      IrValueCons(id, rest) -> {
+        if not first { out.append(", ") } else { nil }
+        first = false
+        out.append(value(id))
+        remaining = rest
+      }
+    }
+  }
+  out.finish()
+}
+
+fn render_function(
+  out: borrow mut Builder,
+  function: IrFunction,
+  context: IrRenderContext,
+  indent: str
+) -> nil {
+  match function {
+    IrFunction(hash, params, blocks, _) -> {
+      out.append(indent)
+      out.append("fn ")
+      out.append(function_name(context, hash))
+      out.append(" (")
+      out.append(int_to_str(params))
+      out.append(" params)\n")
+      render_body(out, blocks, context, indent)
+    }
+  }
+}
+
+fn render_body(
+  out: borrow mut Builder,
+  blocks: IrBlockList,
+  context: IrRenderContext,
+  indent: str
+) -> nil {
+  render_blocks(out, blocks, context, indent)
+  let mut records = cleanup_records(context, blocks)
+  loop {
+    match records {
+      Nil -> break
+      Cons(record, rest) -> {
+        line(out, indent.concat("  "), cleanup_record(context, record))
+        records = rest
+      }
+    }
+  }
+}
+
+fn cleanup_site(site: IrCleanupSite) -> str {
+  match site {
+    IrCleanupAtValue(id) -> value(id)
+    IrCleanupAtBind(id) -> "bind ".concat(value(id))
+    IrCleanupAtRewrap(id) -> "rewrap ".concat(value(id))
+    IrCleanupAtSlot(slot) -> "slot".concat(int_to_str(slot))
+    IrCleanupUnsited -> "-"
+  }
+}
+
+--- `cleanup rN ACTION %v at SITE (ORIGIN)` for an armed record, and
+--- `cleanup %v aliases rN (slot|join)` for a value that reaches one.
+fn cleanup_record(context: IrRenderContext, record: IrCleanupRecord) -> str {
+  let index = "r".concat(int_to_str(record.record))
+  let protects = value(record.value)
+  let armed = match record.action {
+    IrCleanupRelease(helper) -> "release ".concat(function_name(context, helper))
+    IrCleanupDrop(owner) -> "drop ".concat(hash_text(context, owner))
+    IrCleanupArrayGlue(glue) -> "array_glue ".concat(hash_text(context, glue))
+    IrCleanupPlanGlue(plan) -> "glue ".concat(plan_text(context, plan))
+    IrCleanupSlotAlias -> ""
+    IrCleanupFlowAlias -> ""
+  }
+  match record.action {
+    IrCleanupSlotAlias -> "cleanup ".concat(protects).concat(" aliases ").concat(index).concat(
+      " (slot)"
+    )
+    IrCleanupFlowAlias -> "cleanup ".concat(protects).concat(" aliases ").concat(index).concat(
+      " (join)"
+    )
+    _ -> "cleanup ".concat(index).concat(" ").concat(armed).concat(" ").concat(protects).concat(
+      " at "
+    ).concat(cleanup_site(record.site)).concat(" (").concat(origin(record.origin)).concat(")")
+  }
+}
+
+fn render_blocks(
+  out: borrow mut Builder,
+  blocks: IrBlockList,
+  context: IrRenderContext,
+  indent: str
+) -> nil {
+  let mut remaining = blocks
+  loop {
+    match remaining {
+      IrBlockListNil -> break
+      IrBlockListCons(IrBlock(id, params, insts, term), rest) -> {
+        out.append(indent)
+        out.append("  ")
+        out.append(block_label(id))
+        out.append("(")
+        out.append(values(params))
+        out.append("):\n")
+        let body_indent = indent.concat("    ")
+        let mut current = insts
+        loop {
+          match current {
+            IrInstNil -> break
+            IrInstCons(inst, next) -> {
+              render_inst(out, inst, context, body_indent)
+              current = next
+            }
+          }
+        }
+        out.append(body_indent)
+        out.append(terminator(term))
+        out.append("\n")
+        remaining = rest
+      }
+    }
+  }
+}
+
+fn terminator(term: IrTerminator) -> str {
+  match term {
+    IrTermNone -> "<no terminator>"
+    IrTermReturn(result) -> "return ".concat(value(result))
+    IrTermHandlerResume(result) -> "handler_resume ".concat(value(result))
+    IrTermJump(target, args) -> "jump ".concat(block_label(target)).concat("(").concat(
+      values(args)
+    ).concat(")")
+    IrTermBranch(condition, then_block, else_block) -> "branch ".concat(value(condition)).concat(
+      " ? "
+    ).concat(block_label(then_block)).concat(" : ").concat(block_label(else_block))
+    IrTermUnreachable -> "unreachable"
+  }
+}
+
+fn binary_op(op: IrBinaryOp) -> str {
+  match op {
+    IrBinaryUnknown -> "binary?"
+    IrAdd -> "add"
+    IrSub -> "sub"
+    IrMul -> "mul"
+    IrDiv -> "div"
+    IrEq -> "eq"
+    IrNe -> "ne"
+    IrLt -> "lt"
+    IrGt -> "gt"
+    IrLe -> "le"
+    IrGe -> "ge"
+    IrMod -> "mod"
+    IrAnd -> "and"
+    IrOr -> "or"
+    IrBand -> "band"
+    IrBor -> "bor"
+    IrBxor -> "bxor"
+    IrBshl -> "bshl"
+    IrBshr -> "bshr"
+  }
+}
+
+fn storage(kind: IrScalarStorage) -> str {
+  match kind {
+    IrStorageEmpty -> "empty"
+    IrStorageU8 -> "u8"
+    IrStorageI8 -> "i8"
+    IrStorageU16 -> "u16"
+    IrStorageI16 -> "i16"
+    IrStorageU32 -> "u32"
+    IrStorageI32 -> "i32"
+    IrStorageWord64 -> "word"
+    IrStorageInvalid -> "invalid"
+  }
+}
+
+fn completion(kind: HandlerClauseCompletion) -> str {
+  match kind {
+    HandlerClauseAborts -> "aborts"
+    HandlerClauseResumes -> "resumes"
+    HandlerClauseMixed -> "mixed"
+    HandlerClauseDeferred -> "deferred"
+    HandlerClauseUnknown -> "unknown"
+  }
+}
+
+fn slot_action(action: IrManagedSlotAction) -> str {
+  match action {
+    IrManagedSlotAcquire -> "acquire"
+    IrManagedSlotObserve -> "observe"
+    IrManagedSlotReplace(previous) -> "replace ".concat(value(previous))
+    IrManagedSlotRebind(previous) -> "rebind ".concat(value(previous))
+    IrManagedSlotRelease -> "release"
+  }
+}
+
+fn cleanup_kind(kind: i64) -> str {
+  if kind == continuation_cleanup_kind_none() { "none" }
+  else if kind == continuation_cleanup_kind_rc() { "rc" }
+  else if kind == continuation_cleanup_kind_closure() { "closure" }
+  else if kind == continuation_cleanup_kind_continuation() { "continuation" }
+  else if kind == continuation_cleanup_kind_weak() { "weak" }
+  else { "kind".concat(int_to_str(kind)) }
+}
+
+--- The semantic origin of a managed stake or cleanup record.
+fn origin(kind: i64) -> str {
+  if kind == ir_managed_stake_origin_unknown() { "unknown" }
+  else if kind == ir_managed_stake_origin_result_transfer() { "result_transfer" }
+  else if kind == ir_managed_stake_origin_call_transport() { "call_transport" }
+  else if kind == ir_managed_stake_origin_binding() { "binding" }
+  else if kind == ir_managed_stake_origin_aggregate() { "aggregate" }
+  else if kind == ir_managed_stake_origin_arm_normalization() { "arm_normalization" }
+  else if kind == ir_managed_stake_origin_discard() { "discard" }
+  else if kind == ir_managed_stake_origin_cleanup() { "cleanup" }
+  else if kind == ir_managed_stake_origin_control() { "control" }
+  else if kind == ir_managed_stake_origin_parameter_cleanup() { "parameter_cleanup" }
+  else { "origin".concat(int_to_str(kind)) }
+}
+
+fn prim_name(prim: i64) -> str {
+  match prim {
+    0 -> "i64"
+    1 -> "str"
+    2 -> "bool"
+    3 -> "nil"
+    4 -> "f64"
+    5 -> "i32"
+    6 -> "i8"
+    7 -> "i16"
+    8 -> "u8"
+    9 -> "u16"
+    10 -> "u32"
+    11 -> "u64"
+    12 -> "isize"
+    13 -> "usize"
+    14 -> "f32"
+    _ -> "prim".concat(int_to_str(prim))
+  }
+}
+
+fn type_list(context: IrRenderContext, list: i64) -> str {
+  if list == 0 { "" }
+  else {
+    let mut out = builder.new()
+    for i in 0..nlist_len(list) {
+      if i > 0 { out.append(", ") } else { nil }
+      out.append(type_text(context, nlist_get(list, i)))
+    }
+    out.finish()
+  }
+}
+
+--- Structural text for a checker type node. Nominal names come from the
+--- context; an unknown hash prints as `#hash`. This is a debugging rendering,
+--- not the diagnostic renderer, and it does not normalise.
+pub(package) fn type_text(context: IrRenderContext, ty: i64) -> str {
+  if ty == 0 { "?" }
+  else {
+    match ty_tag(ty) {
+      0 -> "never"
+      1 -> "any"
+      2 -> prim_name(ty_f1(ty))
+      3 -> type_text(context, ty_f1(ty)).concat(" | ").concat(type_text(context, ty_f2(ty)))
+      4 -> type_text(context, ty_f1(ty)).concat(" & ").concat(type_text(context, ty_f2(ty)))
+      5 -> "~".concat(type_text(context, ty_f1(ty)))
+      6 -> "(".concat(type_list(context, ty_f1(ty))).concat(") -> ").concat(
+        type_text(context, ty_f2(ty))
+      )
+      7 -> "{record}"
+      8 -> hash_text(context, ty_f1(ty))
+      9 -> {
+        let args = ty_f3(ty)
+        let head = hash_text(context, ty_f1(ty))
+        if args == 0 or nlist_len(args) == 0 { head }
+        else { head.concat("<").concat(type_list(context, args)).concat(">") }
+      }
+      10 -> "effects"
+      11 -> hash_text(context, ty_f1(ty))
+      12 -> "T".concat(int_to_str(ty_f1(ty)))
+      13 -> hash_text(context, ty_f1(ty))
+      14 -> "continuation"
+      15 -> "ptr ".concat(type_text(context, ty_f1(ty)))
+      16 -> "weak ".concat(type_text(context, ty_f1(ty)))
+      17 -> "arc ".concat(type_text(context, ty_f1(ty)))
+      18 -> "Unique<".concat(type_text(context, ty_f1(ty))).concat(">")
+      19 -> "owned ".concat(type_text(context, ty_f1(ty)))
+      21 -> type_text(context, ty_f1(ty)).concat(".").concat(hash_text(context, ty_f2(ty)))
+      22 -> "[".concat(type_text(context, ty_f1(ty))).concat("; ").concat(
+        int_to_str(ty_f2(ty))
+      ).concat("]")
+      23 -> "[".concat(type_text(context, ty_f1(ty))).concat("]")
+      tag -> "type".concat(int_to_str(tag))
+    }
+  }
+}
+
+fn span_name(span: Span) -> str {
+  match span.text() {
+    Some(text) -> text
+    None -> "?"
+  }
+}
+
+fn declaration_text(identity: DeclarationIdentity) -> str {
+  match identity {
+    ModuleDeclarationIdentity(_, _, span) -> span_name(span)
+    MemberDeclarationIdentity(owner, _, span) -> declaration_text(owner).concat(".").concat(
+      span_name(span)
+    )
+  }
+}
+
+fn function_identity_text(identity: FunctionIdentity) -> str {
+  match identity {
+    DeclaredFunctionIdentity(declaration) -> declaration_text(declaration)
+    ModuleFunctionIdentity(_, index) -> "module_fn".concat(index.display())
+    IntrinsicFunctionIdentity(_, _) -> "intrinsic"
+  }
+}
+
+fn semantic_type(id: SemanticTypeId) -> str {
+  "t".concat(semantic_type_id_ordinal(id).display())
+}
+
+fn record_fields(context: IrRenderContext, fields: IrRecordFieldList) -> str {
+  let mut out = builder.new()
+  let mut remaining = fields
+  let mut first = true
+  loop {
+    match remaining {
+      IrRecordFieldNil -> break
+      IrRecordFieldCons(field_hash, word_offset, field_value, rest) -> {
+        if not first { out.append(", ") } else { nil }
+        first = false
+        out.append(hash_text(context, field_hash))
+        out.append("@")
+        out.append(int_to_str(word_offset))
+        out.append("=")
+        out.append(value(field_value))
+        remaining = rest
+      }
+    }
+  }
+  out.finish()
+}
+
+fn layout_fields(context: IrRenderContext, fields: IrRecordLayoutFieldList) -> str {
+  let mut out = builder.new()
+  let mut remaining = fields
+  let mut first = true
+  loop {
+    match remaining {
+      IrRecordLayoutFieldNil -> break
+      IrRecordLayoutFieldWord(field_hash, byte_offset, field_value, kind, rest) -> {
+        if not first { out.append(", ") } else { nil }
+        first = false
+        out.append(hash_text(context, field_hash))
+        out.append("+")
+        out.append(int_to_str(byte_offset))
+        out.append("=")
+        out.append(value(field_value))
+        out.append(":")
+        out.append(cleanup_kind(kind))
+        remaining = rest
+      }
+      IrRecordLayoutFieldArray(
+        field_hash,
+        byte_offset,
+        array_storage,
+        byte_size,
+        leaf_count,
+        leaf_stride,
+        leaf_kind,
+        rest
+      ) -> {
+        if not first { out.append(", ") } else { nil }
+        first = false
+        out.append(hash_text(context, field_hash))
+        out.append("+")
+        out.append(int_to_str(byte_offset))
+        out.append("=array ")
+        out.append(value(array_storage))
+        out.append(" bytes=")
+        out.append(int_to_str(byte_size))
+        out.append(" leaves=")
+        out.append(int_to_str(leaf_count))
+        out.append("x")
+        out.append(int_to_str(leaf_stride))
+        out.append(":")
+        out.append(cleanup_kind(leaf_kind))
+        remaining = rest
+      }
+    }
+  }
+  out.finish()
+}
+
+fn captures(capture_list: i64) -> str {
+  -- Lowering records each capture as [name start, name length, value, type].
+  if capture_list == 0 { "" }
+  else {
+    let mut out = builder.new()
+    for i in 0..nlist_len(capture_list) {
+      if i > 0 { out.append(", ") } else { nil }
+      out.append(value(node_f3(nlist_get(capture_list, i))))
+    }
+    out.finish()
+  }
+}
+
+fn line(out: borrow mut Builder, indent: str, text: str) -> nil {
+  out.append(indent)
+  out.append(text)
+  out.append("\n")
+}
+
+fn assign(dst: i64, text: str) -> str { value(dst).concat(" = ").concat(text) }
+
+-- A transfer binds to the call boundary that follows it: a named callee, or
+-- the typed-direct, effect-dispatch or indirect boundary. These markers are
+-- not declaration hashes, so they never consult the names.
+fn transfer_target(context: IrRenderContext, callee: i64) -> str {
+  if callee == ir_managed_transfer_direct_target() { "direct" }
+  else if callee == ir_managed_transfer_effect_target() { "effect" }
+  else if callee == 0 { "indirect" }
+  else { function_name(context, callee) }
+}
+
+fn operation_text(context: IrRenderContext, operation: i64, args: IrValueList) -> str {
+  hash_text(context, operation).concat("(").concat(values(args)).concat(")")
+}
+
+fn call_text(context: IrRenderContext, callee: i64, args: IrValueList) -> str {
+  function_name(context, callee).concat("(").concat(values(args)).concat(")")
+}
+
+fn render_clauses(
+  out: borrow mut Builder,
+  clauses: IrHandlerClauseBodyList,
+  context: IrRenderContext,
+  indent: str
+) -> nil {
+  let mut remaining = clauses
+  loop {
+    match remaining {
+      IrHandlerClauseBodyNil -> break
+      IrHandlerClauseBodyCons(clause, rest) -> {
+        match clause {
+          IrHandlerClauseBody(
+            op_hash,
+            params,
+            clause_captures,
+            has_continuation,
+            clause_completion,
+            result_cleanup,
+            transferred,
+            resume_lanes,
+            result_lanes,
+            first_value,
+            blocks
+          ) -> {
+            line(
+              out,
+              indent,
+              "clause ".concat(hash_text(context, op_hash)).concat(" params=").concat(
+                int_to_str(params)
+              ).concat(" captures=[").concat(captures(clause_captures)).concat("]").concat(
+                if has_continuation == 1 { " continuation" } else { "" }
+              ).concat(" ").concat(completion(clause_completion)).concat(" result=").concat(
+                cleanup_kind(result_cleanup)
+              ).concat(" first=").concat(value(first_value))
+            )
+            render_body(out, blocks, context, indent)
+          }
+          IrHandlerClauseBodyInvalid(reason) -> line(
+            out,
+            indent,
+            "clause <invalid ".concat(int_to_str(reason)).concat(">")
+          )
+        }
+        remaining = rest
+      }
+    }
+  }
+}
+
+fn render_deferred_body(
+  out: borrow mut Builder,
+  body: IrDeferredHandlerBody,
+  context: IrRenderContext,
+  indent: str
+) -> nil {
+  match body {
+    IrDeferredHandlerBody(_, body_captures, ops, result_lanes, first_value, blocks, finish) -> {
+      line(
+        out,
+        indent,
+        "body captures=[".concat(captures(body_captures)).concat("] ops=").concat(value(ops)).concat(
+          " result_lanes="
+        ).concat(int_to_str(result_lanes)).concat(" first=").concat(value(first_value))
+      )
+      render_body(out, blocks, context, indent)
+      match finish {
+        IrDeferredCompletionBodyNone -> nil
+        IrDeferredCompletionBody(input_lanes, output_lanes, completion_first, completion_blocks) ->
+          {
+            line(
+              out,
+              indent,
+              "completion in=".concat(int_to_str(input_lanes)).concat(" out=").concat(
+                int_to_str(output_lanes)
+              ).concat(" first=").concat(value(completion_first))
+            )
+            render_body(out, completion_blocks, context, indent)
+          }
+        IrDeferredCompletionBodyInvalid(reason) -> line(
+          out,
+          indent,
+          "completion <invalid ".concat(int_to_str(reason)).concat(">")
+        )
+      }
+    }
+    IrDeferredHandlerBodyInvalid(reason) -> line(
+      out,
+      indent,
+      "body <invalid ".concat(int_to_str(reason)).concat(">")
+    )
+  }
+}
+
+fn semantic_types(types: List<SemanticTypeId>) -> str {
+  let mut out = builder.new()
+  let mut remaining = types
+  let mut first = true
+  loop {
+    match remaining {
+      Nil -> break
+      Cons(id, rest) -> {
+        if not first { out.append(", ") } else { nil }
+        first = false
+        out.append(semantic_type(id))
+        remaining = rest
+      }
+    }
+  }
+  out.finish()
+}
+
+fn render_semantic_handler(
+  out: borrow mut Builder,
+  handler: IrSemanticHandler,
+  context: IrRenderContext,
+  indent: str
+) -> nil {
+  line(out, indent, "handled body : ".concat(semantic_type(handler.body_type)))
+  render_function(out, handler.body, context, indent)
+  let mut clauses = handler.clauses
+  loop {
+    match clauses {
+      IrSemanticHandlerClauseNil -> break
+      IrSemanticHandlerClauseCons(clause, rest) -> {
+        line(
+          out,
+          indent,
+          "clause ".concat(declaration_text(clause.operation)).concat(" ").concat(
+            completion(clause.completion)
+          ).concat(" : ").concat(semantic_type(clause.result_type))
+        )
+        render_function(out, clause.body, context, indent)
+        clauses = rest
+      }
+    }
+  }
+  match handler.return_clause {
+    IrSemanticNoHandleReturn -> nil
+    IrSemanticHandleReturnTransform(result, body) -> {
+      line(out, indent, "return clause : ".concat(semantic_type(result)))
+      render_function(out, body, context, indent)
+    }
+  }
+}
+
+fn semantic_target(
+  out: borrow mut Builder,
+  target: IrSemanticCallTarget,
+  context: IrRenderContext,
+  indent: str
+) -> str {
+  match target {
+    IrSemanticGenericTarget(function, type_args) -> function_identity_text(function).concat("<").concat(
+      semantic_types(type_args)
+    ).concat(">")
+    IrSemanticApplyTarget(callee, callee_type, words) -> "apply ".concat(value(callee)).concat(
+      " : "
+    ).concat(semantic_type(callee_type))
+    IrSemanticMethodTarget(declaration, method_hash, receiver_type) -> declaration_text(
+      declaration
+    ).concat(".").concat(hash_text(context, method_hash)).concat(" on ").concat(
+      semantic_type(receiver_type)
+    )
+    IrSemanticAssociatedTarget(declaration, owner_type, _) -> declaration_text(declaration).concat(
+      " on "
+    ).concat(semantic_type(owner_type))
+    IrSemanticPerformTarget(effect_id, operation, _) -> "perform ".concat(
+      declaration_text(effect_id)
+    ).concat(
+      "."
+    ).concat(declaration_text(operation))
+    IrSemanticHandleTarget(handler) -> {
+      render_semantic_handler(out, handler, context, indent.concat("  "))
+      "handle"
+    }
+    IrSemanticResumeTarget(result) -> "resume : ".concat(semantic_type(result))
+  }
+}
+
+fn semantic_data(
+  out: borrow mut Builder,
+  operation: IrSemanticDataOp,
+  context: IrRenderContext,
+  indent: str
+) -> str {
+  match operation {
+    IrSemanticFunctionReference(function, type_args) -> "fnref ".concat(
+      function_identity_text(function)
+    ).concat("<").concat(semantic_types(type_args)).concat(">")
+    IrSemanticDeclaredFieldAccess(declaration, index, _) -> "field ".concat(
+      declaration_text(declaration)
+    ).concat("#").concat(index.display())
+    IrSemanticStructuralFieldAccess(field_hash, _) -> "field ".concat(
+      hash_text(context, field_hash)
+    )
+    IrSemanticIndexedLength(indexed, _) -> "length ".concat(semantic_type(indexed))
+    IrSemanticIndexedGet(indexed, _) -> "index ".concat(semantic_type(indexed))
+    IrSemanticRecordInit(construction, _) -> match construction {
+      IrSemanticDeclaredRecord(declaration) -> "record ".concat(declaration_text(declaration))
+      IrSemanticStructuralRecord -> "record {}"
+      IrSemanticTupleRecord -> "tuple"
+    }
+    IrSemanticArrayLiteral(element) -> "array ".concat(semantic_type(element))
+    IrSemanticMutableSlot(slot_type, slot, action) -> {
+      let transition = match action {
+        IrSemanticMutableSlotAcquire -> "acquire"
+        IrSemanticMutableSlotObserve -> "observe"
+        IrSemanticMutableSlotReplace(previous) -> "replace ".concat(value(previous))
+        IrSemanticMutableSlotRelease -> "release"
+      }
+      "slot".concat(int_to_str(slot)).concat(" ").concat(transition).concat(" : ").concat(
+        semantic_type(slot_type)
+      )
+    }
+    IrSemanticClosure(body, _, words, _, _) -> {
+      render_function(out, body, context, indent.concat("  "))
+      "closure words=".concat(words.display())
+    }
+    IrSemanticSpecializedClosure(body, _, words, _, _, _) -> {
+      render_function(out, body, context, indent.concat("  "))
+      "specialized closure words=".concat(words.display())
+    }
+  }
+}
+
+fn render_inst(
+  out: borrow mut Builder,
+  inst: IrInst,
+  context: IrRenderContext,
+  indent: str
+) -> nil {
+  match inst {
+    IrConstI64(dst, constant) -> line(
+      out,
+      indent,
+      assign(dst, "const ".concat(int_to_str(constant)))
+    )
+    IrNilI64(dst) -> line(out, indent, assign(dst, "nil"))
+    IrStringLit(dst, literal_src, start, length) -> line(
+      out,
+      indent,
+      assign(dst, "string ".concat(int_to_str(length)).concat(" bytes"))
+    )
+    IrStringConcatI64(dst, left, right) -> line(
+      out,
+      indent,
+      assign(dst, "concat ".concat(value(left)).concat(", ").concat(value(right)))
+    )
+    IrBinaryI64(dst, op, lhs, rhs) -> line(
+      out,
+      indent,
+      assign(dst, binary_op(op).concat(" ").concat(value(lhs)).concat(", ").concat(value(rhs)))
+    )
+    IrFloatBinaryI64(dst, prim, op, lhs, rhs) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        binary_op(op).concat(".").concat(prim_name(prim)).concat(" ").concat(value(lhs)).concat(
+          ", "
+        ).concat(value(rhs))
+      )
+    )
+    IrUnaryI64(dst, op, operand) -> {
+      let name = match op {
+        IrUnaryUnknown -> "unary? "
+        IrNot -> "not "
+      }
+      line(out, indent, assign(dst, name.concat(value(operand))))
+    }
+    IrClosureI64(dst, function, closure_captures, _) -> {
+      line(
+        out,
+        indent,
+        assign(dst, "closure captures=[".concat(captures(closure_captures)).concat("]"))
+      )
+      render_function(out, function, context, indent.concat("  "))
+    }
+    IrFunctionRefI64(dst, callee) -> line(
+      out,
+      indent,
+      assign(dst, "fnref ".concat(function_name(context, callee)))
+    )
+    IrAddressOfSlotI64(dst, slot) -> line(
+      out,
+      indent,
+      assign(dst, "address slot".concat(int_to_str(slot)))
+    )
+    IrPtrLoadI64(dst, pointer, kind) -> line(
+      out,
+      indent,
+      assign(dst, "load.".concat(storage(kind)).concat(" ").concat(value(pointer)))
+    )
+    IrPtrStoreI64(dst, pointer, stored, kind) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "store.".concat(storage(kind)).concat(" ").concat(value(pointer)).concat(", ").concat(
+          value(stored)
+        )
+      )
+    )
+    IrLoweringFailureI64(reason) -> line(
+      out,
+      indent,
+      "lowering_failure ".concat(int_to_str(reason))
+    )
+    IrPerformI64(dst, effect_id, operation, args) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "perform ".concat(hash_text(context, effect_id)).concat(".").concat(
+          operation_text(context, operation, args)
+        )
+      )
+    )
+    IrHandlerDirectI64(dst, effect_id, operation, depth, clause_index, args) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "handler_direct ".concat(hash_text(context, effect_id)).concat(".").concat(
+          operation_text(context, operation, args)
+        ).concat(" depth=").concat(int_to_str(depth)).concat(" clause=").concat(
+          int_to_str(clause_index)
+        )
+      )
+    )
+    IrHandlerPopI64(frame) -> line(out, indent, "handler_pop ".concat(value(frame)))
+    IrAbortLandingI64(dst) -> line(out, indent, assign(dst, "abort_landing"))
+    IrBindI64(name_start, name_len, bound, ty) -> line(
+      out,
+      indent,
+      "bind ".concat(value(bound)).concat(" : ").concat(type_text(context, ty))
+    )
+    IrHandleI64(dst, _, effect_id, clauses, nclauses, abort_block) -> {
+      line(
+        out,
+        indent,
+        assign(
+          dst,
+          "handle ".concat(hash_text(context, effect_id)).concat(" clauses=").concat(
+            int_to_str(nclauses)
+          ).concat(
+            " abort="
+          ).concat(if abort_block < 0 { "none" } else { block_label(abort_block) })
+        )
+      )
+      render_clauses(out, clauses, context, indent.concat("  "))
+    }
+    IrDeferredHandleI64(dst, _, body, clauses, nclauses, effect_id, scratch) -> {
+      line(
+        out,
+        indent,
+        assign(
+          dst,
+          "deferred_handle ".concat(hash_text(context, effect_id)).concat(" clauses=").concat(
+            int_to_str(nclauses)
+          ).concat(" scratch=").concat(value(scratch))
+        )
+      )
+      render_deferred_body(out, body, context, indent.concat("  "))
+      render_clauses(out, clauses, context, indent.concat("  "))
+    }
+    IrResumeI64(dst, resumed) -> line(out, indent, assign(dst, "resume ".concat(value(resumed))))
+    IrTryI64(dst, boxed, key, payload_lanes) -> line(
+      out,
+      indent,
+      assign(dst, "try ".concat(value(boxed)).concat(" fail=").concat(hash_text(context, key)))
+    )
+    IrTryLinearI64(dst, tried, key, parent, ok, error) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "try_linear ".concat(value(tried)).concat(" fail=").concat(hash_text(context, key)).concat(
+          " parent="
+        ).concat(plan_text(context, parent)).concat(" ok=").concat(plan_text(context, ok)).concat(
+          " error="
+        ).concat(plan_text(context, error))
+      )
+    )
+    IrTryResultLaneI64(dst, scratch) -> line(
+      out,
+      indent,
+      assign(dst, "try_lane ".concat(value(scratch)))
+    )
+    IrOptChainI64(dst, base, field_hash, field_index, key) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "opt_field ".concat(value(base)).concat(".").concat(hash_text(context, field_hash)).concat(
+          "#"
+        ).concat(
+          int_to_str(field_index)
+        )
+      )
+    )
+    IrCallI64(dst, callee, args) -> line(
+      out,
+      indent,
+      assign(dst, "call ".concat(call_text(context, callee, args)))
+    )
+    IrCallResultLaneI64(dst, lane) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "result_lane ".concat(int_to_str(ir_call_result_lane_physical(lane))).concat(" of ").concat(
+          value(ir_call_result_lane_head(dst, lane))
+        )
+      )
+    )
+    IrReturnLaneI64(lane, returned) -> line(
+      out,
+      indent,
+      "return_lane ".concat(int_to_str(lane)).concat(" ").concat(value(returned))
+    )
+    IrIndirectCallI64(dst, callee, args, result) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "call_indirect ".concat(value(callee)).concat("(").concat(values(args)).concat(") : ").concat(
+          type_text(context, type_expr_to_node(result))
+        )
+      )
+    )
+    IrGenericCallI64(dst, callee, type_args, args) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "call_generic ".concat(function_name(context, callee)).concat("<").concat(
+          type_list(context, type_expr_list_to_nodes(type_args))
+        ).concat(">(").concat(values(args)).concat(")")
+      )
+    )
+    IrSemanticCallI64(dst, target, result, args) -> {
+      let target_text = semantic_target(out, target, context, indent)
+      line(
+        out,
+        indent,
+        assign(
+          dst,
+          "semantic_call ".concat(target_text).concat("(").concat(values(args)).concat(") : ").concat(
+            semantic_type(result)
+          )
+        )
+      )
+    }
+    IrSemanticDataI64(dst, operation, result, args) -> {
+      let operation_text = semantic_data(out, operation, context, indent)
+      line(
+        out,
+        indent,
+        assign(
+          dst,
+          "semantic ".concat(operation_text).concat("(").concat(values(args)).concat(") : ").concat(
+            semantic_type(result)
+          )
+        )
+      )
+    }
+    IrSemanticResultLaneI64(dst, head, lane) -> line(
+      out,
+      indent,
+      assign(dst, "semantic_lane ".concat(value(head)).concat(" ").concat(int_to_str(lane)))
+    )
+    IrSemanticConstructorI64(dst, declaration, result, args) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "semantic_construct ".concat(declaration_text(declaration)).concat("(").concat(
+          values(args)
+        ).concat(
+          ") : "
+        ).concat(semantic_type(result))
+      )
+    )
+    IrVectorGetI64(dst, vector, index, fallback, mode) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "vector_get ".concat(value(vector)).concat("[").concat(value(index)).concat("] mode=").concat(
+          int_to_str(mode)
+        )
+      )
+    )
+    IrVectorSetI64(dst, vector, index, stored, mode) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "vector_set ".concat(value(vector)).concat("[").concat(value(index)).concat("] = ").concat(
+          value(stored)
+        ).concat(" mode=").concat(int_to_str(mode))
+      )
+    )
+    IrMethodCallI64(dst, type_hash, method, receiver, args) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "method ".concat(hash_text(context, type_hash)).concat(".").concat(
+          hash_text(context, method)
+        ).concat(
+          "("
+        ).concat(value(receiver)).concat(if ir_value_list_len(args) > 0 { ", " } else { "" }).concat(
+          values(args)
+        ).concat(")")
+      )
+    )
+    IrOwnedDropI64(dropped, type_hash) -> line(
+      out,
+      indent,
+      "owned_drop ".concat(value(dropped)).concat(" : ").concat(hash_text(context, type_hash))
+    )
+    IrStructuralDropI64(dropped, plan) -> line(
+      out,
+      indent,
+      "structural_drop ".concat(value(dropped)).concat(" ").concat(plan_text(context, plan))
+    )
+    IrStructuralSlotI64(slot_value, slot, plan, mode) -> {
+      let role = match mode {
+        1 -> "alias"
+        2 -> "rebind"
+        3 -> "transfer"
+        4 -> "drop"
+        5 -> "rewrap"
+        _ -> "mode".concat(int_to_str(mode))
+      }
+      line(
+        out,
+        indent,
+        "structural_slot ".concat(role).concat(" ").concat(value(slot_value)).concat(" slot=").concat(
+          value(slot)
+        ).concat(" ").concat(plan_text(context, plan))
+      )
+    }
+    IrStructuralSplitI64(split, parent, residual, release_backing) -> line(
+      out,
+      indent,
+      "structural_split ".concat(value(split)).concat(" parent=").concat(
+        plan_text(context, parent)
+      ).concat(
+        " residual="
+      ).concat(plan_text(context, residual)).concat(
+        if release_backing == 1 { " release_backing" } else { "" }
+      )
+    )
+    IrArrayStorageI64(dst, byte_size, align) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "array_storage ".concat(int_to_str(byte_size)).concat(" align=").concat(int_to_str(align))
+      )
+    )
+    IrArrayStorageDescribeI64(array_storage, byte_size, layout) -> line(
+      out,
+      indent,
+      "array_describe ".concat(value(array_storage)).concat(" bytes=").concat(
+        int_to_str(byte_size)
+      ).concat(
+        match layout {
+          IrArrayLayout(element_count, stride, fields) -> " elements=".concat(
+            int_to_str(element_count)
+          ).concat(
+            "x"
+          ).concat(int_to_str(stride)).concat(" [").concat(layout_fields(context, fields)).concat(
+            "]"
+          )
+        }
+      )
+    )
+    IrArrayCopyI64(destination, source, byte_size, leaf_count, leaf_stride, leaf_kind) -> line(
+      out,
+      indent,
+      "array_copy ".concat(value(destination)).concat(" <- ").concat(value(source)).concat(
+        " bytes="
+      ).concat(
+        int_to_str(byte_size)
+      ).concat(" leaves=").concat(int_to_str(leaf_count)).concat("x").concat(
+        int_to_str(leaf_stride)
+      ).concat(
+        ":"
+      ).concat(cleanup_kind(leaf_kind))
+    )
+    IrArrayCopyLayoutI64(destination, source, byte_size, layout) -> line(
+      out,
+      indent,
+      "array_copy_layout ".concat(value(destination)).concat(" <- ").concat(value(source)).concat(
+        " bytes="
+      ).concat(int_to_str(byte_size))
+    )
+    IrArrayDropI64(data, leaf_count, leaf_stride, leaf_kind) -> line(
+      out,
+      indent,
+      "array_drop ".concat(value(data)).concat(" leaves=").concat(int_to_str(leaf_count)).concat(
+        "x"
+      ).concat(
+        int_to_str(leaf_stride)
+      ).concat(":").concat(cleanup_kind(leaf_kind))
+    )
+    IrVariantInitI64(dst, tag, payloads, mask) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "variant ".concat(hash_text(context, tag)).concat("(").concat(values(payloads)).concat(
+          ") mask="
+        ).concat(int_to_str(mask))
+      )
+    )
+    IrVariantTagI64(dst, base) -> line(
+      out,
+      indent,
+      assign(dst, "variant_tag ".concat(value(base)))
+    )
+    IrVariantPayloadI64(dst, base, index) -> line(
+      out,
+      indent,
+      assign(dst, "variant_payload ".concat(value(base)).concat("#").concat(int_to_str(index)))
+    )
+    IrRecordInitI64(dst, type_hash, fields) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "record ".concat(hash_text(context, type_hash)).concat(" {").concat(
+          record_fields(context, fields)
+        ).concat(
+          "}"
+        )
+      )
+    )
+    IrRecordLayoutInitI64(dst, type_hash, data_size, align, fields) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "record_layout ".concat(hash_text(context, type_hash)).concat(" size=").concat(
+          int_to_str(data_size)
+        ).concat(
+          " {"
+        ).concat(layout_fields(context, fields)).concat("}")
+      )
+    )
+    IrRecordLayoutArrayLoadI64(
+      dst,
+      owner,
+      record_size,
+      field_hash,
+      byte_offset,
+      byte_size,
+      leaves,
+      leaf_kind
+    ) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "record_array_load ".concat(value(owner)).concat(".").concat(
+          hash_text(context, field_hash)
+        ).concat(
+          "+"
+        ).concat(int_to_str(byte_offset)).concat(" bytes=").concat(int_to_str(byte_size))
+      )
+    )
+    IrRecordLayoutWordLoadI64(dst, owner, record_size, field_hash, byte_offset) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "record_word_load ".concat(value(owner)).concat(".").concat(
+          hash_text(context, field_hash)
+        ).concat(
+          "+"
+        ).concat(int_to_str(byte_offset))
+      )
+    )
+    IrFieldLoadI64(dst, base, field_hash, field_index) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "field ".concat(value(base)).concat(".").concat(hash_text(context, field_hash)).concat(
+          "#"
+        ).concat(
+          int_to_str(field_index)
+        )
+      )
+    )
+    IrSlotI64(slot) -> if ir_borrowed_param_mask_slot_is(slot) == 1 {
+      line(
+        out,
+        indent,
+        "borrowed_params mask=".concat(int_to_str(ir_borrowed_param_mask_slot_decode(slot)))
+      )
+    } else { line(out, indent, "slot".concat(int_to_str(slot))) }
+    IrLoadI64(dst, slot) -> line(out, indent, assign(dst, "load slot".concat(int_to_str(slot))))
+    IrStoreI64(slot, stored) -> line(
+      out,
+      indent,
+      "store slot".concat(int_to_str(slot)).concat(" = ").concat(value(stored))
+    )
+    IrGenericFunctionRefI64(dst, callee, type_args) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "fnref ".concat(function_name(context, callee)).concat("<").concat(
+          type_list(context, type_expr_list_to_nodes(type_args))
+        ).concat(">")
+      )
+    )
+    IrManagedStakeI64(dst, stake, kind, delta, stake_origin) -> {
+      let direction = if delta > 0 { "retain." } else { "release." }
+      line(
+        out,
+        indent,
+        assign(
+          dst,
+          direction.concat(cleanup_kind(kind)).concat(" ").concat(value(stake)).concat(" origin=").concat(
+            origin(stake_origin)
+          )
+        )
+      )
+    }
+    IrManagedTransferI64(call_dst, callee, transferred, lane, kind) ->
+      if ir_managed_transfer_is_commit(
+        call_dst,
+        callee,
+        lane
+      ) {
+        line(
+          out,
+          indent,
+          "commit.".concat(cleanup_kind(kind)).concat(" ").concat(value(transferred))
+        )
+      } else {
+        line(
+          out,
+          indent,
+          "transfer.".concat(cleanup_kind(kind)).concat(" ").concat(value(transferred)).concat(
+            " to "
+          ).concat(
+            transfer_target(context, callee)
+          ).concat(" lane=").concat(int_to_str(lane)).concat(" at ").concat(value(call_dst))
+        )
+      }
+    IrManagedAcquireI64(acquired, kind, acquire_origin) -> line(
+      out,
+      indent,
+      "acquire.".concat(cleanup_kind(kind)).concat(" ").concat(value(acquired)).concat(" origin=").concat(
+        origin(acquire_origin)
+      )
+    )
+    IrReuseInitI64(token, constructor) -> {
+      line(out, indent, "reuse ".concat(value(token)))
+      render_inst(out, constructor, context, indent.concat("  "))
+    }
+    IrManagedSlotI64(dst, slot_value, slot, kind, action) -> line(
+      out,
+      indent,
+      assign(
+        dst,
+        "managed_slot".concat(int_to_str(slot)).concat(" ").concat(slot_action(action)).concat(
+          " "
+        ).concat(
+          value(slot_value)
+        ).concat(" : ").concat(cleanup_kind(kind))
+      )
+    )
+  }
+}

@@ -66,6 +66,15 @@ use stdlib/grammar/tooling/staging.{
 }
 use compiler/project/incremental.{*}
 use compiler/ir/data.{*}
+use compiler/ir/render as ir_render
+use compiler/ir/render.{
+  IrRenderAll,
+  IrRenderContext,
+  IrRenderNamed,
+  IrRenderSelection,
+  IrRenderSource
+}
+use compiler/types/names.{effect_name_hash, str_hash}
 use compiler/storage.{*}
 use compiler/project/module.{*}
 use compiler/project/checked_modules.{*}
@@ -198,6 +207,8 @@ use stdlib/process.{Proc}
 use stdlib/time as time
 use stdlib/time/monotonic as monotonic
 use stdlib/time/monotonic.{Instant, MonotonicClock}
+use stdlib/map as map
+use stdlib/map.{Map}
 use stdlib/string.{str_concat, str_contains, str_eq, str_split}
 use stdlib/vector as vector
 use stdlib/vector.{vector_get_in_bounds, vector_len, vector_push, vector_set}
@@ -920,6 +931,54 @@ fn main_check_native_report(
 -- their driver products, and each verified result is attached to the site's
 -- semantic fact for lowering. Every authored module is parsed and checked
 -- exactly once.
+--- A checked program ready for lowering: parsed, checked and with every
+--- staging site verified and materialised, as `build` and `ir` both need.
+type MainCheckedProgram {
+  MainCheckedProgramReady(TypedModule, Source, MainProductFacts),
+  MainCheckedProgramFailed(i64)
+}
+
+fn main_check_program_for_target_with_path_and_origin_and_grant(
+  src: i64,
+  n: i64,
+  path_ptr: i64,
+  path_len: i64,
+  trusted: i64,
+  strict: i64,
+  can_grant_trust: i64,
+  target: NativeLinkTarget,
+  host: MainGrammarHost,
+  command: str
+) -[SourceAcquire]> MainCheckedProgram {
+  match main_parse_native_source(
+    src,
+    n,
+    path_ptr,
+    path_len,
+    trusted,
+    strict,
+    can_grant_trust,
+    target
+  ) {
+    MainSourceParseFailed(status) -> MainCheckedProgramFailed(status)
+    MainSourceParsed(ast, source, _) -> match main_check_native_program(ast, NativeRuntime) {
+      CheckRejected -> MainCheckedProgramFailed(1)
+      Checked(typed) -> {
+        let sites = main_staging_site_facts(typed)
+        if sites.is_empty() { MainCheckedProgramReady(typed, source, main_no_product_facts()) }
+        else {
+          match main_stage_sites(typed, sites, target, host, command) {
+            Err(status) -> MainCheckedProgramFailed(status)
+            Ok(staged) -> if main_materialize_staging_sites(typed, staged, command) != 0 {
+              MainCheckedProgramFailed(1)
+            } else { MainCheckedProgramReady(typed, source, main_product_facts_of(staged)) }
+          }
+        }
+      }
+    }
+  }
+}
+
 fn main_prepare_native_for_target_with_path_and_origin_and_grant(
   src: i64,
   n: i64,
@@ -931,7 +990,7 @@ fn main_prepare_native_for_target_with_path_and_origin_and_grant(
   target: NativeLinkTarget,
   host: MainGrammarHost
 ) -[SourceAcquire]> MainNativePreparation {
-  match main_parse_native_source(
+  match main_check_program_for_target_with_path_and_origin_and_grant(
     src,
     n,
     path_ptr,
@@ -939,26 +998,17 @@ fn main_prepare_native_for_target_with_path_and_origin_and_grant(
     trusted,
     strict,
     can_grant_trust,
-    target
+    target,
+    host,
+    "build"
   ) {
-    MainSourceParseFailed(status) -> MainNativePreparationFailed(status)
-    MainSourceParsed(ast, source, _) -> match main_check_native_program(ast, NativeRuntime) {
-      CheckRejected -> MainNativePreparationFailed(1)
-      Checked(typed) -> {
-        let sites = main_staging_site_facts(typed)
-        if sites.is_empty() {
-          main_lower_prepared(typed, source, target, main_no_product_facts())
-        }
-        else {
-          match main_stage_sites(typed, sites, target, host, "build") {
-            Err(status) -> MainNativePreparationFailed(status)
-            Ok(staged) -> if main_materialize_staging_sites(typed, staged, "build") != 0 {
-              MainNativePreparationFailed(1)
-            } else { main_lower_prepared(typed, source, target, main_product_facts_of(staged)) }
-          }
-        }
-      }
-    }
+    MainCheckedProgramFailed(status) -> MainNativePreparationFailed(status)
+    MainCheckedProgramReady(typed, source, facts) -> main_lower_prepared(
+      typed,
+      source,
+      target,
+      facts
+    )
   }
 }
 
@@ -5304,7 +5354,10 @@ fn main_dispatch_unchecked(argc: i64, argv: i64) -[SourceAcquire]> i64 {
                         else {
                           if cstr_eq(cmd, "doc") == 1 { run_doc(argc, argv) }
                           else {
-                            if cstr_eq(cmd, "symbols") == 1 {
+                            if cstr_eq(cmd, "ir") == 1 {
+                              run_ir(argc, argv, main_grammar_host(argc, argv))
+                            }
+                            else if cstr_eq(cmd, "symbols") == 1 {
                               if argc > 2 {
                                 run_symbols_path(
                                   mem_load64_at(argv, 16),
@@ -5763,6 +5816,415 @@ fn run_symbols_path(path: i64, host: MainGrammarHost) -[SourceAcquire]> i64 {
   ) {
     MainNativePreparationFailed(status) -> status
     MainNativePrepared(native, source, _) -> main_dump_symbols(native)
+  }
+}
+
+-- ======================================================================
+-- Tool: ir — render typed IR for compiler work
+-- `weft ir [--stage lowered|optimised|native] [--facts cleanup] [--all |
+-- --function NAME] FILE` checks FILE as `build` does, lowers it, and prints
+-- the IR of its functions. Typed IR is an unstable tier: this text is a
+-- debugging view, not an interface.
+-- ======================================================================
+--- `native` is the optimised IR after native preparation: exactly the
+--- functions native emission consumes.
+type MainIrStage {
+  MainIrLowered,
+  MainIrOptimised,
+  MainIrNative
+}
+
+--- Emission facts to show beneath each body. Cleanup records describe native
+--- emission, so they require (and imply) the native stage.
+type MainIrFacts {
+  MainIrNoFacts,
+  MainIrCleanupFacts
+}
+
+--- Which functions to show: the root file's own (the default), every
+--- function including the SDK closure, or one function by name.
+type MainIrScope {
+  MainIrRoot,
+  MainIrEverything,
+  MainIrFunction(str)
+}
+
+type MainIrOptions {
+  MainIrOptionsReady(MainIrStage, MainIrFacts, MainIrScope, i64),
+  MainIrOptionsInvalid(str)
+}
+
+fn main_ir_usage() -> str {
+  "usage: weft ir [--stage lowered|optimised|native] [--facts cleanup] [--all | --function NAME] FILE\n"
+}
+
+fn main_ir_options(argc: i64, argv: i64) -> MainIrOptions {
+  let mut stage = MainIrOptimised
+  let mut staged = false
+  let mut facts = MainIrNoFacts
+  let mut scope = MainIrRoot
+  let mut scoped = false
+  let mut path = 0
+  let mut problem = ""
+  let mut i = 2
+  while i < argc and problem.len() == 0 {
+    let arg = mem_load64_at(argv, i * 8)
+    if cstr_eq(arg, "--stage") == 1 {
+      if i + 1 >= argc { problem = "--stage needs lowered, optimised or native" }
+      else {
+        let choice = mem_load64_at(argv, (i + 1) * 8)
+        if cstr_eq(choice, "lowered") == 1 { stage = MainIrLowered }
+        else if cstr_eq(choice, "optimised") == 1 { stage = MainIrOptimised }
+        else if cstr_eq(choice, "native") == 1 { stage = MainIrNative }
+        else { problem = "unknown stage (use lowered, optimised or native)" }
+        staged = true
+        i = i + 1
+      }
+    } else if cstr_eq(arg, "--facts") == 1 {
+      if i + 1 >= argc { problem = "--facts needs cleanup" }
+      else if cstr_eq(mem_load64_at(argv, (i + 1) * 8), "cleanup") == 1 {
+        facts = MainIrCleanupFacts
+        i = i + 1
+      } else { problem = "unknown facts (use cleanup)" }
+    } else if cstr_eq(arg, "--function") == 1 {
+      if i + 1 >= argc { problem = "--function needs a function name" }
+      else if scoped { problem = "choose one of --all and --function" }
+      else {
+        let name = mem_load64_at(argv, (i + 1) * 8)
+        scope = MainIrFunction(runtime_str_from_bytes_copy(name, cstr_len(name)))
+        scoped = true
+        i = i + 1
+      }
+    } else if cstr_eq(arg, "--all") == 1 {
+      if scoped { problem = "choose one of --all and --function" }
+      else {
+        scope = MainIrEverything
+        scoped = true
+      }
+    } else if path == 0 { path = arg }
+    else { problem = "expected exactly one input file" }
+    i = i + 1
+  }
+  if problem.len() > 0 { MainIrOptionsInvalid(problem) }
+  else if path == 0 { MainIrOptionsInvalid("expected an input file") }
+  else {
+    match facts {
+      MainIrNoFacts -> MainIrOptionsReady(stage, facts, scope, path)
+      MainIrCleanupFacts -> match stage {
+        MainIrNative -> MainIrOptionsReady(stage, facts, scope, path)
+        _ -> if staged {
+          MainIrOptionsInvalid("--facts cleanup describes native emission (use --stage native)")
+        } else { MainIrOptionsReady(MainIrNative, facts, scope, path) }
+      }
+    }
+  }
+}
+
+fn main_ir_name_insert(names: Map<i64, str>, src: i64, start: i64, len: i64) -> Map<i64, str> {
+  if len <= 0 { names }
+  else {
+    -- Declarations, constructors, fields and operations are keyed by the
+    -- spelling hashes IR instructions store. A name spelled once may be keyed
+    -- under more than one of them.
+    let name = runtime_str_from_bytes_copy(src + start, len)
+    names.insert(str_hash(src, start, len), name).insert(effect_name_hash(src, start, len), name).insert(
+      field_access_key(src, start, len),
+      name
+    )
+  }
+}
+
+-- Declared names by hash: functions from the checked function list, and
+-- types, constructors, fields, effects and operations from the type table.
+-- Specialisations and synthetic bodies have no entry and render as h<hash>.
+fn main_ir_names(typed: TypedModule) -> Map<i64, str> {
+  match typed {
+    TypedModule(fns, _, tt, _, _) -> {
+      let mut names = map.new<i64, str>()
+      for i in 0..ttable_entry_count(tt) {
+        let entry = ttable_entry_at(tt, i)
+        let entry_src = ttable_entry_source(entry)
+        let name_len = ttable_entry_name_len(entry)
+        let kind = ttable_entry_kind(entry)
+        if name_len > 0 {
+          -- Checked effect atoms and resolved nominal references key by the
+          -- declaration identity rather than by spelling.
+          let name = runtime_str_from_bytes_copy(ttable_entry_name_ptr(entry), name_len)
+          let namespace = if kind == 2 { module_decl_namespace_effect() }
+          else if kind == 3 { module_decl_namespace_trait() }
+          else { module_decl_namespace_type() }
+          let identity = ty_declaration_identity_hash(
+            module_decl_fact_find(
+              tt,
+              entry_src,
+              namespace,
+              entry_src,
+              ttable_entry_name_start(entry),
+              name_len
+            )
+          )
+          -- An implementation entry is named and indexed by its target type,
+          -- which is how primitive method receivers get their names.
+          names = main_ir_name_insert(names, entry_src, ttable_entry_name_start(entry), name_len).insert(
+            ttable_entry_name_hash(entry),
+            name
+          )
+          if identity != 0 { names = names.insert(identity, name) } else { 0 }
+        } else { 0 }
+        let items = ttable_entry_items(entry)
+        let count = ttable_entry_item_count(entry)
+        if kind == 1 and items != 0 {
+          for vi in 0..count {
+            names = main_ir_name_insert(
+              names,
+              entry_src,
+              ttable_entry_variant_name_start(entry, vi),
+              ttable_entry_variant_name_len(entry, vi)
+            )
+          }
+        } else if kind == 0 and items != 0 {
+          for fi in 0..count {
+            names = main_ir_name_insert(
+              names,
+              entry_src,
+              ttable_entry_record_field_name_start(entry, fi),
+              ttable_entry_record_field_name_len(entry, fi)
+            )
+          }
+        } else if (kind == 2 or kind == 3) and items != 0 {
+          -- Effect operations and trait methods are name nodes.
+          for oi in 0..nlist_len(items) {
+            let item = nlist_get(items, oi)
+            names = main_ir_name_insert(names, entry_src, node_f1(item), node_f2(item))
+          }
+        } else { 0 }
+      }
+      -- Functions after types, so impl methods can name their owner. The
+      -- native pair key is how calls reach module functions and methods.
+      for i in 0..nlist_len(fns) {
+        let pair = nlist_get(fns, i)
+        let decl = decl_from_node(node_f1(pair))
+        let fn_src = node_f2(pair)
+        let name_start = decl_name_start_or(decl, 0)
+        let name_len = decl_name_len_or(decl, 0)
+        names = main_ir_name_insert(names, fn_src, name_start, name_len)
+        if name_len > 0 and pipeline_decl_node_is_function(node_f1(pair)) == 1 {
+          let name = runtime_str_from_bytes_copy(fn_src + name_start, name_len)
+          let label = if node_f3(pair) == 0 { name }
+          else {
+            match names.get(pipeline_impl_pair_native_type_hash(pair)) {
+              Some(owner) -> owner.concat(".").concat(name)
+              None -> name
+            }
+          }
+          names = names.insert(pipeline_fn_pair_key(pair), label)
+        } else { 0 }
+      }
+      main_ir_pseudo_names(main_ir_intrinsic_names(names, tt))
+    }
+  }
+}
+
+-- Intrinsic calls are keyed by their spelling, and the intrinsic registry is
+-- a spelling test rather than data. Name every `__identifier` the loaded
+-- sources spell, which covers exactly the intrinsics this program calls.
+fn main_ir_intrinsic_names(names: Map<i64, str>, tt: i64) -> Map<i64, str> {
+  let sources = ttable_sources(tt)
+  let mut result = names
+  for si in 0..nlist_len(sources) {
+    let entry = nlist_get(sources, si)
+    let buffer = ttable_source_entry_buffer(entry)
+    let length = ttable_source_entry_len(entry)
+    let mut i = 0
+    while i + 2 < length {
+      let previous = if i == 0 { 32 } else { mem_load8_at(buffer, i - 1) }
+      let boundary = not (
+        (previous >= 97 and previous <= 122) or (previous >= 65 and previous <= 90) or (
+          previous >= 48 and previous <= 57
+        ) or previous == 95
+      )
+      if boundary and mem_load8_at(buffer, i) == 95 and mem_load8_at(buffer, i + 1) == 95 {
+        let mut end = i + 2
+        while end < length and (
+          (mem_load8_at(buffer, end) >= 97 and mem_load8_at(buffer, end) <= 122) or (
+            mem_load8_at(buffer, end) >= 48 and mem_load8_at(buffer, end) <= 57
+          ) or mem_load8_at(buffer, end) == 95
+        ) { end = end + 1 }
+        if end > i + 2 {
+          result = result.insert(
+            str_hash(buffer, i, end - i),
+            runtime_str_from_bytes_copy(buffer + i, end - i)
+          )
+        } else { 0 }
+        i = end
+      } else { i = i + 1 }
+    }
+  }
+  result
+}
+
+-- Compiler-owned pseudo callees stand in for lowering-time operations until
+-- native emission; they have no declaration of their own.
+fn main_ir_pseudo_names(names: Map<i64, str>) -> Map<i64, str> {
+  names.insert(pipeline_ir_pseudo_scaled_load64_hash(), "pseudo.scaled_load64").insert(
+    pipeline_ir_pseudo_scaled_store64_hash(),
+    "pseudo.scaled_store64"
+  ).insert(pipeline_ir_pseudo_scaled_store64_discard_hash(), "pseudo.scaled_store64_discard").insert(
+    pipeline_ir_pseudo_bridge_load64_hash(),
+    "pseudo.bridge_load64"
+  ).insert(pipeline_ir_pseudo_bridge_store64_hash(), "pseudo.bridge_store64").insert(
+    pipeline_ir_pseudo_bridge_store64_discard_hash(),
+    "pseudo.bridge_store64_discard"
+  ).insert(pipeline_ir_pseudo_bridge_load8_hash(), "pseudo.bridge_load8").insert(
+    pipeline_ir_pseudo_bridge_store8_hash(),
+    "pseudo.bridge_store8"
+  ).insert(pipeline_ir_pseudo_bridge_store8_discard_hash(), "pseudo.bridge_store8_discard").insert(
+    pipeline_ir_pseudo_par_lowering_marker_hash(),
+    "pseudo.par_lowering_marker"
+  ).insert(
+    pipeline_ir_pseudo_handler_cleanup_reactivate_hash(),
+    "pseudo.handler_cleanup_reactivate"
+  )
+}
+
+fn main_ir_plan_kind(kind: i64) -> str {
+  match kind {
+    1 -> "owned"
+    2 -> "record"
+    3 -> "tuple"
+    4 -> "named"
+    5 -> "variant"
+    6 -> "opaque"
+    _ -> "kind".concat(runtime_int_to_str(kind))
+  }
+}
+
+fn main_ir_plan_text(names: Map<i64, str>, plan: i64) -> str {
+  if plan == 0 { "plan{}" }
+  else {
+    let types = IrRenderContext {
+      names: names,
+      plan_text: (inner: i64) => "plan",
+      cleanup: ir_render.no_cleanup
+    }
+    "plan{".concat(main_ir_plan_kind(typeck_linear_layout_plan_kind(plan))).concat(" ").concat(
+      ir_render.type_text(types, typeck_linear_layout_plan_type(plan))
+    ).concat(" words=").concat(runtime_int_to_str(typeck_linear_layout_plan_words(plan))).concat(
+      "}"
+    )
+  }
+}
+
+-- Cleanup records are computed as native emission computes them: over one
+-- map carrying the type table, the checked functions and the call contracts
+-- of the prepared module.
+fn main_ir_cleanup_map(typed: TypedModule, native: PipelineIrNativeInput) -> i64 {
+  match typed {
+    TypedModule(fns, _, tt, _, _) -> {
+      let fm = fmap_new()
+      fmap_set_tt(fm, tt)
+      fmap_set_native_fns(fm, fns)
+      fmap_set_native_call_contract_facts(
+        fm,
+        pipeline_ir_native_call_contract_facts(native.facts)
+      )
+      fm
+    }
+  }
+}
+
+fn main_ir_render(
+  typed: TypedModule,
+  stage: MainIrStage,
+  facts: MainIrFacts,
+  selection: IrRenderSelection
+) -> str {
+  let names = main_ir_names(typed)
+  let plans = (plan: i64) => main_ir_plan_text(names, plan)
+  let lowered = pipeline_lower_checked_with_weft(typed)
+  match stage {
+    MainIrLowered -> ir_render.render_selected(
+      pipeline_ir_functions(lowered),
+      IrRenderContext { names: names, plan_text: plans, cleanup: ir_render.no_cleanup },
+      selection
+    )
+    MainIrOptimised -> ir_render.render_selected(
+      pipeline_ir_functions(pipeline_optimise_typed_ir(typed, lowered)),
+      IrRenderContext { names: names, plan_text: plans, cleanup: ir_render.no_cleanup },
+      selection
+    )
+    MainIrNative -> {
+      let native = pipeline_ir_native_input(typed, pipeline_optimise_typed_ir(typed, lowered), 0)
+      let cleanup = match facts {
+        MainIrNoFacts -> ir_render.no_cleanup
+        MainIrCleanupFacts -> {
+          let fm = main_ir_cleanup_map(typed, native)
+          (blocks: IrBlockList) => pipeline_ir_abort_cleanup_records(blocks, fm)
+        }
+      }
+      ir_render.render_selected(
+        native.functions,
+        IrRenderContext { names: names, plan_text: plans, cleanup: cleanup },
+        selection
+      )
+    }
+  }
+}
+
+fn run_ir(argc: i64, argv: i64, host: MainGrammarHost) -[SourceAcquire]> i64 {
+  match main_ir_options(argc, argv) {
+    MainIrOptionsInvalid(problem) -> {
+      eprint("ir: ".concat(problem).concat("\n"))
+      eprint(main_ir_usage())
+      2
+    }
+    MainIrOptionsReady(stage, facts, scope, path) -> {
+      let plen = cstr_len(path)
+      let file = read_cpath_file(path, plen)
+      let src = mem_load64_at(file, 0)
+      let n = mem_load64_at(file, 8)
+      if n <= 0 {
+        eprint("ir: could not read input file\n")
+        1
+      } else {
+        match main_check_program_for_target_with_path_and_origin_and_grant(
+          src,
+          n,
+          path,
+          plen,
+          cpath_is_trusted_source(path, plen),
+          cpath_is_strict_source(path, plen),
+          cpath_can_grant_import_trust(path, plen),
+          native_link_target_host(),
+          host,
+          "ir"
+        ) {
+          MainCheckedProgramFailed(status) -> status
+          MainCheckedProgramReady(typed, _, _) -> {
+            let root = match typed { TypedModule(_, root_src, _, _, _) -> root_src }
+            let selection = match scope {
+              MainIrRoot -> IrRenderSource(root)
+              MainIrEverything -> IrRenderAll
+              MainIrFunction(name) -> IrRenderNamed(name)
+            }
+            let text = main_ir_render(typed, stage, facts, selection)
+            match scope {
+              MainIrFunction(name) -> if text.len() == 0 {
+                eprint("ir: no function named `".concat(name).concat("`\n"))
+                1
+              } else {
+                oprint(text)
+                0
+              }
+              _ -> {
+                oprint(text)
+                0
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }
 
