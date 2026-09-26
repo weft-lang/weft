@@ -26,7 +26,7 @@ compiler/
   tool/                 JSON-RPC, MCP and LSP protocol surfaces of the command-line tools;
                         input discovery, the supervised worker pool and console notes
                         they share; the `weft test` policy, scheduler and generated
-                        harness; and the `weft fmt` command and file policy
+                        harness; and the `weft fmt` and `weft check` command policies
   sdk/                  embedded source archive and product identity
   backend/              native targets, link graphs, and binary formats
     aarch64/            encoding and native code generation

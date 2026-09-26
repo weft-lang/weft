@@ -1,11 +1,11 @@
 -- The test runner's process supervision over real processes: forked workers,
--- supervised executables, deadlines, standard-input isolation, usage and
--- owner-only executables.
+-- supervised executables, deadlines, standard-input isolation, usage,
+-- owner-only executables and captured standard error.
 
 use runtime/time as platform_time
 use runtime/tool_platform.{*}
 use stdlib/bytes as bytes
-use stdlib/io/types.{IoNotFound}
+use stdlib/io/types.{IoAlreadyExists, IoNotFound}
 use stdlib/list.{Cons, List, Nil}
 use stdlib/panic.{panic}
 use stdlib/path as path
@@ -183,6 +183,85 @@ fn unwritable_executable() -[Supervise]> i64 {
   }
 }
 
+fn capture_path() -[Supervise]> str {
+  str_concat("/tmp/weft-supervise-capture-", Supervise.process_id().to_str())
+}
+
+-- A worker captures its standard error, and a program it runs inherits the
+-- capture. The code is the worker's status, then whether the file holds
+-- exactly the program's output with owner-only permissions.
+fn captured_worker() -[Supervise, Sleep]> i64 {
+  let target = capture_path()
+  shell(str_concat("rm -f ", target), time.seconds(10))
+  match Supervise.fork() {
+    SupervisedChild -> match Supervise.capture_errors(native(target)) {
+      Ok(_) -> Supervise.exit(
+        shell("printf 'first\\nsecond' >&2", time.seconds(10))
+      )
+      Err(error) -> Supervise.exit(9)
+    }
+    SupervisedParent(worker) -> {
+      let status = code(wait_for(worker))
+      let contents = shell(
+        i"test \"$(cat {target})\" = \"$(printf 'first\\nsecond')\"",
+        time.seconds(10)
+      )
+      let mode = shell(
+        i"test \"$(stat -c %a {target} 2>/dev/null || stat -f %Lp {target})\" = 600",
+        time.seconds(10)
+      )
+      shell(str_concat("rm -f ", target), time.seconds(10))
+      status * 100 + contents * 10 + mode
+    }
+    SupervisedForkFailed(error) -> 3000
+  }
+}
+
+-- An existing file or a planted symbolic link refuses the capture, and both
+-- the entry and anything it leads to are left exactly as they were. The
+-- shell scripts receive the capture path as $0 and a victim file as $1.
+fn in_capture_files(script: str) -[Supervise]> i64 {
+  let target = capture_path()
+  code(
+    Supervise.run(
+      native("/bin/sh"),
+      script_args(script, target, str_concat(target, "-victim")),
+      time.seconds(10)
+    )
+  )
+}
+
+fn refused_capture(plant: str, planted: str) -[Supervise, Sleep]> i64 {
+  in_capture_files(i"rm -f \"$0\" \"$1\"; printf kept > \"$1\"; {plant}")
+  let target = native(capture_path())
+  let refused = match Supervise.fork() {
+    SupervisedChild -> match Supervise.capture_errors(target) {
+      Ok(_) -> Supervise.exit(0)
+      Err(IoAlreadyExists) -> Supervise.exit(1)
+      Err(other) -> Supervise.exit(2)
+    }
+    SupervisedParent(worker) -> code(wait_for(worker))
+    SupervisedForkFailed(error) -> 3000
+  }
+  let kept = in_capture_files(
+    i"test \"$(cat \"$1\")\" = kept -a \"$(cat \"$0\")\" = {planted}"
+  )
+  in_capture_files("rm -f \"$0\" \"$1\"")
+  refused * 10 + kept
+}
+
+fn capture_in_missing_directory() -[Supervise, Sleep]> i64 {
+  match Supervise.fork() {
+    SupervisedChild -> match Supervise.capture_errors(native("/nonexistent-weft-dir/errors")) {
+      Ok(_) -> Supervise.exit(0)
+      Err(IoNotFound) -> Supervise.exit(1)
+      Err(other) -> Supervise.exit(2)
+    }
+    SupervisedParent(worker) -> code(wait_for(worker))
+    SupervisedForkFailed(error) -> 3000
+  }
+}
+
 fn usage_of_forked_worker() -[Supervise, Sleep]> i64 {
   match Supervise.fork() {
     SupervisedChild -> Supervise.exit(0)
@@ -260,6 +339,16 @@ test "owner_only_executables_are_written_replaced_and_rejected" {
   Test.assert_eq(supervised(() => executable_round_trip()), 405)
   Test.assert_eq(supervised(() => owner_only_mode()), 0)
   Test.assert_eq(supervised(() => unwritable_executable()), 1)
+}
+
+test "a_worker_captures_its_standard_error_in_an_owner_only_file" {
+  Test.assert_eq(supervised(() => captured_worker()), 0)
+}
+
+test "capturing_standard_error_never_replaces_or_follows_an_entry" {
+  Test.assert_eq(supervised(() => refused_capture("printf old > \"$0\"", "old")), 10)
+  Test.assert_eq(supervised(() => refused_capture("ln -s \"$1\" \"$0\"", "kept")), 10)
+  Test.assert_eq(supervised(() => capture_in_missing_directory()), 1)
 }
 
 test "the_process_identity_is_available" {

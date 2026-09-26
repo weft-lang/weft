@@ -2721,6 +2721,68 @@ set -e
 assert_equals "check_batch_requires_paths" "$check_missing_paths_exit" "2"
 assert_contains "check_batch_missing_paths_shows_usage" "$(<"$tmp_err")" "usage: weft check [--jobs N] <path...>"
 
+set +e
+"$WEFT" check -x "$tmp_check_clean" > "$tmp_out" 2> "$tmp_err"
+check_unknown_option_exit=$?
+set -e
+assert_equals "check_rejects_unknown_option" "$check_unknown_option_exit" "2"
+assert_contains "check_unknown_option_shows_usage" "$(<"$tmp_err")" "usage: weft check [path]"
+
+# An empty file is an empty module, not an unreadable one.
+tmp_check_empty="$tmp_check_dir/empty.weft"
+: > "$tmp_check_empty"
+set +e
+"$WEFT" check "$tmp_check_empty" > "$tmp_out" 2> "$tmp_err"
+check_empty_exit=$?
+set -e
+assert_equals "check_empty_file_exit" "$check_empty_exit" "0"
+assert_check_output_equals "check_empty_file_is_an_empty_module" "$(<"$tmp_err")" "check: 0 functions, 0 errors"
+
+# Directories and patterns name their roots in place, input by input, each
+# in byte order; a root named again keeps its first place.
+tmp_check_tree="$tmp_check_dir/tree"
+mkdir -p "$tmp_check_tree/nested" "$tmp_check_dir/no_sources"
+printf 'fn tree_b() -> i64 { 1 }\n' > "$tmp_check_tree/b.weft"
+printf 'fn tree_a() -> i64 { 1 }\n' > "$tmp_check_tree/nested/a.weft"
+printf 'not weft\n' > "$tmp_check_tree/notes.txt"
+set +e
+"$WEFT" check "$tmp_check_clean" "$tmp_check_tree" "$tmp_check_clean" > "$tmp_out" 2> "$tmp_err"
+check_tree_exit=$?
+set -e
+assert_equals "check_tree_exit" "$check_tree_exit" "0"
+assert_equals "check_tree_expands_in_input_order" "$(grep '^==> ' "$tmp_err")" "$(printf '==> %s <==\n==> %s <==\n==> %s <==' "$tmp_check_clean" "$tmp_check_tree/b.weft" "$tmp_check_tree/nested/a.weft")"
+assert_check_output_contains "check_tree_checks_nested_root" "$(<"$tmp_err")" "==> $tmp_check_tree/nested/a.weft <=="$'\n'"check: 1 functions, 0 errors"
+set +e
+"$WEFT" check "$tmp_check_tree" > "$tmp_out" 2> "$tmp_err"
+check_directory_exit=$?
+set -e
+assert_equals "check_single_directory_exit" "$check_directory_exit" "0"
+assert_equals "check_single_directory_reports_each_root" "$(grep '^==> ' "$tmp_err")" "$(printf '==> %s <==\n==> %s <==' "$tmp_check_tree/b.weft" "$tmp_check_tree/nested/a.weft")"
+set +e
+"$WEFT" check "$tmp_check_tree/*.weft" > "$tmp_out" 2> "$tmp_err"
+check_pattern_exit=$?
+set -e
+assert_equals "check_pattern_exit" "$check_pattern_exit" "0"
+assert_equals "check_pattern_names_matching_files" "$(grep '^==> ' "$tmp_err")" "==> $tmp_check_tree/b.weft <=="
+set +e
+"$WEFT" check "$tmp_check_tree/zz*.weft" "$tmp_check_dir/no_sources" "$tmp_check_clean" > "$tmp_out" 2> "$tmp_err"
+check_unmatched_exit=$?
+set -e
+assert_equals "check_unmatched_inputs_fail" "$check_unmatched_exit" "1"
+assert_contains "check_reports_unmatched_pattern" "$(<"$tmp_err")" "check: no .weft files matched: $tmp_check_tree/zz*.weft"
+assert_contains "check_reports_directory_without_sources" "$(<"$tmp_err")" "check: no .weft files in directory: $tmp_check_dir/no_sources"
+assert_check_output_contains "check_unmatched_inputs_still_check_the_rest" "$(<"$tmp_err")" "==> $tmp_check_clean <=="$'\n'"check: 1 functions, 0 errors"
+
+# A worker over the memory limit fails its root after replaying what it
+# reported.
+set +e
+WEFT_TEST_COMPILE_RSS_LIMIT_KB=1 "$WEFT" check "$tmp_check_clean" "$tmp_check_fail" > "$tmp_out" 2> "$tmp_err"
+check_memory_exit=$?
+set -e
+assert_equals "check_memory_limit_fails" "$check_memory_exit" "1"
+assert_check_output_contains "check_memory_limit_keeps_report" "$(<"$tmp_err")" "==> $tmp_check_clean <=="$'\n'"check: 1 functions, 0 errors"$'\n'"check: worker exceeded "
+assert_equals "check_memory_limit_names_every_worker" "$(grep -c 'check: worker exceeded [0-9]* KB RSS' "$tmp_err")" "2"
+
 run_weft_compile_guarded "$WEFT" compile "$tmp_src" > "$tmp_bin" 2>"$tmp_err"
 assert_equals "compile_path_default_stderr_empty" "$(<"$tmp_err")" ""
 chmod +x "$tmp_bin"

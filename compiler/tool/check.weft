@@ -1,0 +1,285 @@
+-- compiler/tool/check.weft -- the `weft check` command's policy
+--
+-- Arguments, each root's verdict and the report replayed for it are values
+-- here. One file is checked in place. Several are checked in supervised
+-- workers, each capturing its standard error in a private file, and the
+-- runner replays every report in the order the inputs named its root, so
+-- concurrent diagnostics never interleave.
+
+use compiler/tool/console.{tool_note}
+use compiler/tool/discovery.{
+  DiscoveryDirectoryEmpty,
+  DiscoveryDirectoryUnreadable,
+  DiscoveryPatternUnmatched,
+  DiscoveryPatternUnreadable,
+  DiscoveryProblem
+}
+use compiler/tool/pool.{
+  PoolEvent,
+  PoolReaped,
+  PoolRefused,
+  PoolRun,
+  PoolStarting,
+  PoolWorker,
+  pool_run
+}
+use runtime/tool_platform.{SupervisedEnded, SupervisedExit, SupervisedStopped, Supervise}
+use stdlib/bytes.{bytes_storage}
+use stdlib/console.{ConsoleWrite}
+use stdlib/dir as dir
+use stdlib/dir.{DirMutate}
+use stdlib/file as file
+use stdlib/file.{FileRead}
+use stdlib/option.{None, Option, Some}
+use stdlib/panic.{panic}
+use stdlib/path as path
+use stdlib/path.{Path}
+use stdlib/process.{ProcExited}
+use stdlib/result.{Err, Ok}
+use stdlib/string.{str_byte_at, str_len}
+use stdlib/time.{Duration}
+use stdlib/time/monotonic.{MonotonicClock}
+use stdlib/time/sleep.{Sleep}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push, vector_set}
+
+-- Command -------------------------------------------------------------------
+--- What one `weft check` invocation asks for.
+pub(package) type CheckCommand {
+  --- Check standard input.
+  CheckInput,
+  --- Check what one input names; a single file is checked in place.
+  CheckFile(str),
+  --- Check every root the inputs name, in at most this many workers.
+  CheckFiles(Vector<str>, i64),
+  --- The arguments do not form a command.
+  CheckUsage,
+  --- `--jobs` is repeated or not an integer from 1 to 64.
+  CheckBadJobs
+}
+
+pub(package) fn check_usage() -> str {
+  "usage: weft check [path]\nusage: weft check [--jobs N] <path...>\n"
+}
+
+--- Worker counts are decimals from 1 to 64.
+fn check_jobs(text: str) -> Option<i64> {
+  let n = str_len(text)
+  if n == 0 { return None }
+  let mut value = 0
+  for index in 0..n {
+    let byte = str_byte_at(text, index)
+    if byte < 48 or byte > 57 { return None }
+    value = value * 10 + byte - 48
+    if value > 64 { return None }
+  }
+  if value == 0 { None } else { Some(value) }
+}
+
+--- Interpret the arguments that follow `check`. The whole request is
+--- validated before any file is read.
+pub(package) fn check_command(args: Vector<str>) -> CheckCommand {
+  let count = vector_len<str>(args)
+  let inputs: Vector<str> = vector.new<str>()
+  let mut jobs = None<i64>()
+  let mut options = true
+  let mut index = 0
+  while index < count {
+    let arg = vector_get_in_bounds<str>(args, index)
+    if options and arg == "--" { options = false }
+    else if options and (arg == "--jobs" or arg == "-j") {
+      if index + 1 >= count { return CheckUsage }
+      match jobs {
+        Some(_) -> return CheckBadJobs
+        None -> nil
+      }
+      index = index + 1
+      match check_jobs(vector_get_in_bounds<str>(args, index)) {
+        Some(value) -> { jobs = Some(value) }
+        None -> return CheckBadJobs
+      }
+    } else if options and arg.starts_with("-") { return CheckUsage }
+    else { vector_push<str>(inputs, arg) }
+    index = index + 1
+  }
+  let named = vector_len<str>(inputs)
+  match jobs {
+    None -> if named == 0 { CheckInput }
+    else if named == 1 { CheckFile(vector_get_in_bounds<str>(inputs, 0)) }
+    else { CheckFiles(inputs, 4) }
+    Some(workers) -> if named == 0 { CheckUsage } else { CheckFiles(inputs, workers) }
+  }
+}
+
+--- A discovery problem in the check command's words.
+pub(package) fn check_problem_text(problem: DiscoveryProblem) -> str {
+  match problem {
+    DiscoveryPatternUnreadable(input) -> i"check: could not expand pattern: {input}\n"
+    DiscoveryPatternUnmatched(input) -> i"check: no .weft files matched: {input}\n"
+    DiscoveryDirectoryUnreadable(directory) -> i"check: could not list directory: {directory}\n"
+    DiscoveryDirectoryEmpty(input) -> i"check: no .weft files in directory: {input}\n"
+  }
+}
+
+-- Verdicts ------------------------------------------------------------------
+--- How checking one root in a worker ended.
+pub(package) type CheckVerdict {
+  --- The root checked without errors.
+  CheckClean,
+  --- The root has errors, which its diagnostics report.
+  CheckErrors,
+  --- The worker reached the compile limit and was stopped.
+  CheckTimedOut,
+  --- The worker's peak resident set exceeded the limit; its peak in KiB.
+  CheckOverMemory(i64),
+  --- The worker could not start or capture its output, or ended abnormally.
+  CheckWorkerFailed
+}
+
+--- The status a worker ends with when it cannot capture its output.
+pub(package) fn check_capture_failed_status() -> i64 { 2 }
+
+--- A reaped worker's verdict. A worker reports clean with status 0 and
+--- errors with 1; either fails once its peak exceeds `memory_limit_kb`.
+pub(package) fn check_verdict(exit: SupervisedExit, memory_limit_kb: Option<i64>) -> CheckVerdict
+{
+  let checked = match exit.termination {
+    SupervisedEnded(ProcExited(0)) -> CheckClean
+    SupervisedEnded(ProcExited(1)) -> CheckErrors
+    SupervisedStopped -> return CheckTimedOut
+    _ -> return CheckWorkerFailed
+  }
+  let peak = exit.usage.peak_rss_bytes
+  match memory_limit_kb {
+    Some(limit) -> if peak > limit * 1024 { CheckOverMemory((peak + 1023) / 1024) } else {
+      checked
+    }
+    None -> checked
+  }
+}
+
+--- Whether a verdict fails the invocation.
+pub(package) fn check_verdict_failed(verdict: CheckVerdict) -> bool {
+  match verdict {
+    CheckClean -> false
+    _ -> true
+  }
+}
+
+--- The report replayed for one root: its name, the diagnostics its worker
+--- captured, and why a worker that did not finish its check ended.
+pub(package) fn check_report(root: str, captured: str, verdict: CheckVerdict) -> str {
+  let silent = if str_len(captured) == 0 and check_verdict_failed(verdict) {
+    "check: worker produced no diagnostic output\n"
+  } else { "" }
+  let ending = match verdict {
+    CheckTimedOut -> "check: worker timed out\n"
+    CheckOverMemory(peak_kb) -> i"check: worker exceeded {peak_kb} KB RSS\n"
+    CheckWorkerFailed -> "check: worker failed\n"
+    _ -> ""
+  }
+  i"==> {root} <==\n{captured}{silent}{ending}"
+}
+
+-- Workers -------------------------------------------------------------------
+--- A pooled check as the runner sees it: its process, which names the
+--- capture files, and each root's verdict by position.
+pub(package) type CheckRun { runner: i64, verdicts: Vector<CheckVerdict> }
+
+--- Where the worker for root `index` of runner `runner` captures its
+--- standard error.
+pub(package) fn check_capture_path(runner: i64, index: i64) -> Path {
+  match path.from_utf8(i"/tmp/weft-check-output-{runner}-{index}") {
+    Ok(native) -> native
+    Err(_) -> panic("capture paths are text without NUL")
+  }
+}
+
+fn check_step(
+  run: CheckRun,
+  event: PoolEvent,
+  memory_limit_kb: Option<i64>
+) -[DirMutate]> CheckRun {
+  let verdicts = run.verdicts
+  match event {
+    -- A stale capture from an earlier runner with this identifier would make
+    -- the worker's exclusive capture fail, so the runner clears it first.
+    PoolStarting(item) -> {
+      dir.remove(check_capture_path(run.runner, item))
+      nil
+    }
+    PoolReaped(item, exit, elapsed) -> {
+      vector_set<CheckVerdict>(verdicts, item, check_verdict(exit, memory_limit_kb))
+      nil
+    }
+    PoolRefused(item) -> {
+      vector_set<CheckVerdict>(verdicts, item, CheckWorkerFailed)
+      nil
+    }
+  }
+  run
+}
+
+--- Check `count` roots in at most `jobs` workers, each stopped at `limit`.
+--- The fork's worker side returns at once with its assignment.
+pub(package) fn check_schedule(
+  count: i64,
+  jobs: i64,
+  limit: Duration,
+  memory_limit_kb: Option<i64>
+) -[Supervise, DirMutate, MonotonicClock, Sleep]> PoolRun<CheckRun> {
+  let limits: Vector<Option<Duration>> = vector.new<Option<Duration>>()
+  let verdicts: Vector<CheckVerdict> = vector.new<CheckVerdict>()
+  for index in 0..count {
+    vector_push<Option<Duration>>(limits, Some(limit))
+    vector_push<CheckVerdict>(verdicts, CheckWorkerFailed)
+  }
+  let start = CheckRun { runner: Supervise.process_id(), verdicts: verdicts }
+  pool_run(
+    limits,
+    jobs,
+    start,
+    (run: CheckRun, event: PoolEvent) => check_step(run, event, memory_limit_kb)
+  )
+}
+
+--- In a worker, send standard error to the runner's capture file for its
+--- root. Nothing is captured when this fails.
+pub(package) fn check_capture(worker: PoolWorker) -[Supervise]> bool {
+  match Supervise.capture_errors(check_capture_path(worker.runner, worker.item)) {
+    Ok(_) -> true
+    Err(_) -> false
+  }
+}
+
+-- Captures hold diagnostics; the bound only refuses absurd output.
+fn check_capture_limit() -> usize {
+  let limit: usize = 1073741824
+  limit
+}
+
+fn check_captured(capture: Path) -[FileRead]> str {
+  match file.read_all(capture, check_capture_limit()) {
+    Ok(contents) -> bytes_storage(contents)
+    Err(_) -> ""
+  }
+}
+
+--- Replay every root's report in order, removing its capture, and count
+--- the roots that failed.
+pub(package) fn check_replay(
+  roots: Vector<str>,
+  run: CheckRun
+) -[FileRead, DirMutate, ConsoleWrite]> i64 {
+  let verdicts = run.verdicts
+  let mut failures = 0
+  for index in 0..vector_len<str>(roots) {
+    let capture = check_capture_path(run.runner, index)
+    let captured = check_captured(capture)
+    dir.remove(capture)
+    let verdict = vector_get_in_bounds<CheckVerdict>(verdicts, index)
+    tool_note(check_report(vector_get_in_bounds<str>(roots, index), captured, verdict))
+    if check_verdict_failed(verdict) { failures = failures + 1 }
+  }
+  failures
+}

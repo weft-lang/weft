@@ -1,0 +1,414 @@
+-- The `weft check` command's policy under deterministic interpretations:
+-- argument interpretation, every worker verdict, the replayed report, and
+-- the pooled schedule and replay over scripted workers, a recorded
+-- filesystem, a captured console and a clock that advances 100 ms per
+-- reading.
+
+use compiler/tool/check.{*}
+use compiler/tool/discovery.{
+  DiscoveryDirectoryEmpty,
+  DiscoveryDirectoryUnreadable,
+  DiscoveryPatternUnmatched,
+  DiscoveryPatternUnreadable
+}
+use compiler/tool/pool.{PoolFinished, PoolRun, PoolWorker, PoolWorkerStarted}
+use runtime/tool_platform.{
+  SupervisedEnded,
+  SupervisedExit,
+  SupervisedFailed,
+  SupervisedScript,
+  SupervisedStopped,
+  SupervisedTermination,
+  SupervisedUsage,
+  runtime_supervise_scripted
+}
+use stdlib/bytes as bytes
+use stdlib/bytes.{Bytes, bytes_storage}
+use stdlib/console.{ConsoleWrite}
+use stdlib/dir.{DirMutate}
+use stdlib/file.{FileRead}
+use stdlib/io/types.{IoError, IoNotFound}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/option.{None, Option, Some}
+use stdlib/path.{Path}
+use stdlib/process.{ProcExited, ProcSignaled, ProcSpawnFailed, ProcTermination, ProcWaitFailed}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/string/builder as builder
+use stdlib/time as time
+use stdlib/time/monotonic as monotonic
+use stdlib/time/monotonic.{MonotonicClock}
+use stdlib/time/sleep.{Sleep}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push, vector_set}
+
+fn texts(values: List<str>) -> Vector<str> {
+  let out: Vector<str> = vector.new<str>()
+  for value in values { vector_push<str>(out, value) }
+  out
+}
+
+fn joined(values: Vector<str>) -> str {
+  let mut out = builder.new()
+  for index in 0..vector_len<str>(values) {
+    if index > 0 { out.append("|") }
+    out.append(vector_get_in_bounds<str>(values, index))
+  }
+  out.finish()
+}
+
+fn one(a: str) -> List<str> { Cons(a, Nil<str>()) }
+
+fn two(a: str, b: str) -> List<str> { Cons(a, one(b)) }
+
+fn three(a: str, b: str, c: str) -> List<str> { Cons(a, two(b, c)) }
+
+fn four(a: str, b: str, c: str, d: str) -> List<str> { Cons(a, three(b, c, d)) }
+
+-- A command as one comparable line.
+fn command(args: List<str>) -> str {
+  match check_command(texts(args)) {
+    CheckInput -> "input"
+    CheckFile(input) -> i"file {input}"
+    CheckFiles(inputs, jobs) -> i"files {joined(inputs)} jobs {jobs}"
+    CheckUsage -> "usage"
+    CheckBadJobs -> "bad jobs"
+  }
+}
+
+test "check_command_selects_input_file_or_files" {
+  Test.assert_str_eq(command(Nil<str>()), "input")
+  Test.assert_str_eq(command(one("a.weft")), "file a.weft")
+  Test.assert_str_eq(command(one("src")), "file src")
+  Test.assert_str_eq(command(two("b.weft", "a.weft")), "files b.weft|a.weft jobs 4")
+  -- An explicit worker count always checks in workers, even for one input.
+  Test.assert_str_eq(command(three("--jobs", "2", "a.weft")), "files a.weft jobs 2")
+  Test.assert_str_eq(command(four("a.weft", "-j", "64", "b.weft")), "files a.weft|b.weft jobs 64")
+  Test.assert_str_eq(command(three("-j", "1", "a.weft")), "files a.weft jobs 1")
+}
+
+test "check_command_ends_options_at_a_double_dash" {
+  Test.assert_str_eq(command(two("--", "-odd.weft")), "file -odd.weft")
+  Test.assert_str_eq(command(four("-j", "3", "--", "--jobs")), "files --jobs jobs 3")
+  Test.assert_str_eq(command(two("--", "--")), "file --")
+}
+
+test "check_command_rejects_malformed_requests" {
+  -- A worker count needs a path; an option needs its value.
+  Test.assert_str_eq(command(two("-j", "1")), "usage")
+  Test.assert_str_eq(command(one("--jobs")), "usage")
+  Test.assert_str_eq(command(two("a.weft", "-j")), "usage")
+  -- Unknown options, including ones that resemble known ones.
+  Test.assert_str_eq(command(one("-x")), "usage")
+  Test.assert_str_eq(command(two("--jobs=2", "a.weft")), "usage")
+  Test.assert_str_eq(command(one("-")), "usage")
+}
+
+test "check_command_rejects_every_malformed_worker_count" {
+  Test.assert_str_eq(command(three("--jobs", "0", "a.weft")), "bad jobs")
+  Test.assert_str_eq(command(three("--jobs", "65", "a.weft")), "bad jobs")
+  Test.assert_str_eq(command(three("--jobs", "-2", "a.weft")), "bad jobs")
+  Test.assert_str_eq(command(three("--jobs", "four", "a.weft")), "bad jobs")
+  Test.assert_str_eq(command(three("--jobs", "", "a.weft")), "bad jobs")
+  Test.assert_str_eq(command(three("--jobs", "1000000000000000000000", "a.weft")), "bad jobs")
+  Test.assert_str_eq(command(four("-j", "2", "-j", "2")), "bad jobs")
+  -- The count is validated before the missing path is noticed.
+  Test.assert_str_eq(command(two("--jobs", "0")), "bad jobs")
+}
+
+-- Verdicts ----------------------------------------------------------------------
+fn usage(peak: i64) -> SupervisedUsage {
+  SupervisedUsage { user_micros: 0, system_micros: 0, peak_rss_bytes: peak }
+}
+
+fn exited(termination: SupervisedTermination, peak: i64) -> SupervisedExit {
+  SupervisedExit { termination: termination, usage: usage(peak) }
+}
+
+fn verdict_name(verdict: CheckVerdict) -> str {
+  match verdict {
+    CheckClean -> "clean"
+    CheckErrors -> "errors"
+    CheckTimedOut -> "timed out"
+    CheckOverMemory(peak_kb) -> i"over memory {peak_kb}"
+    CheckWorkerFailed -> "worker failed"
+  }
+}
+
+fn judged(termination: SupervisedTermination, peak: i64, limit: Option<i64>) -> str {
+  verdict_name(check_verdict(exited(termination, peak), limit))
+}
+
+fn status(code: i64) -> SupervisedTermination { SupervisedEnded(ProcExited(code)) }
+
+test "check_verdict_reads_every_way_a_worker_ends" {
+  Test.assert_str_eq(judged(status(0), 0, None<i64>()), "clean")
+  Test.assert_str_eq(judged(status(1), 0, None<i64>()), "errors")
+  Test.assert_str_eq(judged(status(2), 0, None<i64>()), "worker failed")
+  Test.assert_str_eq(judged(status(127), 0, None<i64>()), "worker failed")
+  Test.assert_str_eq(judged(SupervisedEnded(ProcSignaled(11)), 0, None<i64>()), "worker failed")
+  Test.assert_str_eq(judged(SupervisedStopped, 0, None<i64>()), "timed out")
+  Test.assert_str_eq(
+    judged(SupervisedFailed(ProcWaitFailed(10)), 0, None<i64>()),
+    "worker failed"
+  )
+  Test.assert_str_eq(
+    judged(SupervisedFailed(ProcSpawnFailed(11)), 0, None<i64>()),
+    "worker failed"
+  )
+  Test.assert_eq(check_capture_failed_status(), 2)
+}
+
+test "check_verdict_fails_a_finished_check_over_the_memory_limit" {
+  -- At the limit is within it; one byte over rounds up to whole KiB.
+  Test.assert_str_eq(judged(status(0), 2048, Some(2)), "clean")
+  Test.assert_str_eq(judged(status(0), 2049, Some(2)), "over memory 3")
+  Test.assert_str_eq(judged(status(1), 4096, Some(2)), "over memory 4")
+  Test.assert_str_eq(judged(status(1), 1000000000, None<i64>()), "errors")
+  -- A worker that did not finish its check keeps that verdict.
+  Test.assert_str_eq(judged(SupervisedStopped, 1000000000, Some(2)), "timed out")
+  Test.assert_str_eq(judged(status(3), 1000000000, Some(2)), "worker failed")
+}
+
+test "check_verdicts_fail_the_invocation_unless_clean" {
+  Test.assert_false(check_verdict_failed(CheckClean))
+  Test.assert_true(check_verdict_failed(CheckErrors))
+  Test.assert_true(check_verdict_failed(CheckTimedOut))
+  Test.assert_true(check_verdict_failed(CheckOverMemory(1)))
+  Test.assert_true(check_verdict_failed(CheckWorkerFailed))
+}
+
+test "check_reports_name_the_root_and_explain_an_unfinished_worker" {
+  Test.assert_str_eq(
+    check_report("a.weft", "check: 1 functions, 0 errors\n", CheckClean),
+    "==> a.weft <==\ncheck: 1 functions, 0 errors\n"
+  )
+  Test.assert_str_eq(
+    check_report("dir/b c.weft", "error\ncheck: 1 functions, 1 errors\n", CheckErrors),
+    "==> dir/b c.weft <==\nerror\ncheck: 1 functions, 1 errors\n"
+  )
+  Test.assert_str_eq(
+    check_report("a.weft", "", CheckErrors),
+    "==> a.weft <==\ncheck: worker produced no diagnostic output\n"
+  )
+  Test.assert_str_eq(
+    check_report("a.weft", "partial\n", CheckTimedOut),
+    "==> a.weft <==\npartial\ncheck: worker timed out\n"
+  )
+  Test.assert_str_eq(
+    check_report("a.weft", "", CheckTimedOut),
+    "==> a.weft <==\ncheck: worker produced no diagnostic output\ncheck: worker timed out\n"
+  )
+  Test.assert_str_eq(
+    check_report("a.weft", "check: 1 functions, 0 errors\n", CheckOverMemory(3)),
+    "==> a.weft <==\ncheck: 1 functions, 0 errors\ncheck: worker exceeded 3 KB RSS\n"
+  )
+  Test.assert_str_eq(
+    check_report("a.weft", "", CheckWorkerFailed),
+    "==> a.weft <==\ncheck: worker produced no diagnostic output\ncheck: worker failed\n"
+  )
+  -- A clean root with nothing captured reports only its name; a braced or
+  -- non-ASCII name is data.
+  Test.assert_str_eq(check_report("ünï {x}.weft", "", CheckClean), "==> ünï {x}.weft <==\n")
+}
+
+test "check_reports_every_discovery_problem" {
+  Test.assert_str_eq(
+    check_problem_text(DiscoveryPatternUnreadable("src/*.weft")),
+    "check: could not expand pattern: src/*.weft\n"
+  )
+  Test.assert_str_eq(
+    check_problem_text(DiscoveryPatternUnmatched("none/*.weft")),
+    "check: no .weft files matched: none/*.weft\n"
+  )
+  Test.assert_str_eq(
+    check_problem_text(DiscoveryDirectoryUnreadable("src/locked")),
+    "check: could not list directory: src/locked\n"
+  )
+  Test.assert_str_eq(
+    check_problem_text(DiscoveryDirectoryEmpty("docs")),
+    "check: no .weft files in directory: docs\n"
+  )
+}
+
+-- Pooled checks -------------------------------------------------------------------
+fn path_text(target: Path) -> str {
+  match target.to_utf8() {
+    Ok(text) -> text
+    Err(_) -> ""
+  }
+}
+
+fn worker(polls: i64, termination: SupervisedTermination, peak: i64) -> SupervisedScript {
+  SupervisedScript { polls: polls, exit: exited(termination, peak) }
+}
+
+fn scripts(values: List<SupervisedScript>) -> Vector<SupervisedScript> {
+  let out: Vector<SupervisedScript> = vector.new<SupervisedScript>()
+  for value in values { vector_push<SupervisedScript>(out, value) }
+  out
+}
+
+-- Every reading advances the clock by 100 ms; sleeping takes no time.
+fn with_clock<T, E>(body: () -[MonotonicClock, Sleep, E]> T) -[E]> T {
+  let elapsed: Vector<i64> = vector.new<i64>()
+  vector_push<i64>(elapsed, 0)
+  handle {
+    handle body() {
+      MonotonicClock.now() -> {
+        let now = vector_get_in_bounds<i64>(elapsed, 0) + 100
+        vector_set<i64>(elapsed, 0, now)
+        resume(monotonic.nanoseconds(now * 1000000))
+      }
+    }
+  } {
+    Sleep.wait(duration) -> resume(Ok(nil))
+  }
+}
+
+-- Removals are recorded; the runner's filesystem changes nothing else.
+fn with_removals<T, E>(removed: Vector<str>, body: () -[DirMutate, E]> T) -[E]> T {
+  handle body() {
+    DirMutate.remove(target) -> {
+      vector_push<str>(removed, path_text(target))
+      resume(Ok(nil))
+    }
+    DirMutate.mkdir(target) -> resume(Ok(nil))
+    DirMutate.rename(from, to) -> resume(Ok(nil))
+  }
+}
+
+fn verdicts_of(run: CheckRun) -> str {
+  let verdicts = run.verdicts
+  let names: Vector<str> = vector.new<str>()
+  for index in 0..vector_len<CheckVerdict>(verdicts) {
+    vector_push<str>(names, verdict_name(vector_get_in_bounds<CheckVerdict>(verdicts, index)))
+  }
+  joined(names)
+}
+
+-- The verdicts of a scripted pooled check, then every capture it cleared.
+fn scheduled(count: i64, jobs: i64, memory: Option<i64>, script: Vector<SupervisedScript>) -> str
+{
+  let removed: Vector<str> = vector.new<str>()
+  let run = with_removals(
+    removed,
+    () =>
+      with_clock(
+        () =>
+          runtime_supervise_scripted(
+            script,
+            () => check_schedule(count, jobs, time.milliseconds(250), memory)
+          )
+      )
+  )
+  match run {
+    PoolFinished(finished) ->
+      i"runner {finished.runner}: {verdicts_of(finished)}; cleared {joined(removed)}"
+    PoolWorkerStarted(assigned) -> "worker side"
+  }
+}
+
+test "check_schedule_records_each_roots_verdict_by_position" {
+  Test.assert_str_eq(
+    scheduled(
+      3,
+      2,
+      None<i64>(),
+      scripts(
+        Cons(
+          worker(1, status(1), 0),
+          Cons(worker(0, status(0), 0), Cons(worker(0, status(3), 0), Nil<SupervisedScript>()))
+        )
+      )
+    ),
+    "runner 1: errors|clean|worker failed; cleared /tmp/weft-check-output-1-0|/tmp/weft-check-output-1-1|/tmp/weft-check-output-1-2"
+  )
+}
+
+test "check_schedule_stops_slow_workers_and_applies_the_memory_limit" {
+  Test.assert_str_eq(
+    scheduled(
+      2,
+      1,
+      Some(1),
+      scripts(
+        Cons(
+          worker(1000000, status(0), 0),
+          Cons(worker(0, status(0), 5000), Nil<SupervisedScript>())
+        )
+      )
+    ),
+    "runner 1: timed out|over memory 5; cleared /tmp/weft-check-output-1-0|/tmp/weft-check-output-1-1"
+  )
+}
+
+test "check_schedule_fails_a_root_whose_worker_could_not_start" {
+  Test.assert_str_eq(
+    scheduled(2, 2, None<i64>(), scripts(Cons(worker(0, status(0), 0), Nil<SupervisedScript>()))),
+    "runner 1: clean|worker failed; cleared /tmp/weft-check-output-1-0|/tmp/weft-check-output-1-1"
+  )
+  Test.assert_str_eq(
+    scheduled(0, 4, None<i64>(), scripts(Nil<SupervisedScript>())),
+    "runner 1: ; cleared "
+  )
+}
+
+test "check_capture_is_refused_without_a_process_to_capture" {
+  let captured = runtime_supervise_scripted(
+    scripts(Nil<SupervisedScript>()),
+    () => check_capture(PoolWorker { item: 0, runner: 1 })
+  )
+  Test.assert_false(captured)
+}
+
+-- Captured reports of runner 7: root 0 and root 2 left output, root 1 none.
+fn capture_of(target: str) -> Result<Bytes, IoError> {
+  if target == "/tmp/weft-check-output-7-0" {
+    Ok(bytes.from_str("error[E1001]\ncheck: 1 functions, 1 errors\n"))
+  } else if target == "/tmp/weft-check-output-7-2" {
+    Ok(bytes.from_str("check: 2 functions, 0 errors\n"))
+  } else { Err(IoNotFound) }
+}
+
+fn verdicts(values: List<CheckVerdict>) -> Vector<CheckVerdict> {
+  let out: Vector<CheckVerdict> = vector.new<CheckVerdict>()
+  for value in values { vector_push<CheckVerdict>(out, value) }
+  out
+}
+
+test "check_replay_reports_every_root_in_order_and_removes_its_capture" {
+  let removed: Vector<str> = vector.new<str>()
+  let written: Vector<str> = vector.new<str>()
+  let failures = with_removals(
+    removed,
+    () =>
+      handle {
+        handle check_replay(
+          texts(three("z.weft", "a.weft", "m.weft")),
+          CheckRun {
+            runner: 7,
+            verdicts: verdicts(
+              Cons(CheckErrors, Cons(CheckTimedOut, Cons(CheckClean, Nil<CheckVerdict>())))
+            )
+          }
+        ) {
+          FileRead.read_all(target, limit) -> resume(capture_of(path_text(target)))
+        }
+      } {
+        ConsoleWrite.write_all(stream, values) -> {
+          vector_push<str>(written, bytes_storage(values))
+          resume(Ok(values.len()))
+        }
+        ConsoleWrite.flush(stream) -> resume(Ok(nil))
+      }
+  )
+  Test.assert_eq(failures, 2)
+  Test.assert_str_eq(
+    joined(written),
+    "==> z.weft <==\nerror[E1001]\ncheck: 1 functions, 1 errors\n|==> a.weft <==\ncheck: worker produced no diagnostic output\ncheck: worker timed out\n|==> m.weft <==\ncheck: 2 functions, 0 errors\n"
+  )
+  Test.assert_str_eq(
+    joined(removed),
+    "/tmp/weft-check-output-7-0|/tmp/weft-check-output-7-1|/tmp/weft-check-output-7-2"
+  )
+}
