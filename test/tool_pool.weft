@@ -1,0 +1,162 @@
+-- The worker pool under a scripted supervisor and a clock that advances
+-- 100 ms per reading: the exact event order a command folds over, bounded
+-- concurrency, unlimited items, stopped items and refused forks.
+
+use compiler/tool/pool.{*}
+use runtime/tool_platform.{
+  SupervisedEnded,
+  SupervisedExit,
+  SupervisedScript,
+  SupervisedStopped,
+  SupervisedTermination,
+  SupervisedUsage,
+  runtime_supervise_scripted
+}
+use stdlib/io/types.{IoError}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/option.{None, Option, Some}
+use stdlib/process.{ProcExited, ProcSignaled}
+use stdlib/result.{Ok}
+use stdlib/time as time
+use stdlib/time.{Duration}
+use stdlib/time/monotonic as monotonic
+use stdlib/time/monotonic.{MonotonicClock}
+use stdlib/time/sleep.{Sleep, SleepError}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_push, vector_set}
+
+fn no_usage() -> SupervisedUsage {
+  SupervisedUsage { user_micros: 0, system_micros: 0, peak_rss_bytes: 0 }
+}
+
+fn worker(polls: i64, status: i64) -> SupervisedScript {
+  SupervisedScript {
+    polls: polls,
+    exit: SupervisedExit { termination: SupervisedEnded(ProcExited(status)), usage: no_usage() }
+  }
+}
+
+fn scripts(values: List<SupervisedScript>) -> Vector<SupervisedScript> {
+  let out: Vector<SupervisedScript> = vector.new<SupervisedScript>()
+  for value in values { vector_push<SupervisedScript>(out, value) }
+  out
+}
+
+fn limits(values: List<Option<Duration>>) -> Vector<Option<Duration>> {
+  let out: Vector<Option<Duration>> = vector.new<Option<Duration>>()
+  for value in values { vector_push<Option<Duration>>(out, value) }
+  out
+}
+
+fn ending(termination: SupervisedTermination) -> str {
+  match termination {
+    SupervisedEnded(ProcExited(status)) -> i"exit {status}"
+    SupervisedEnded(ProcSignaled(signal)) -> i"signal {signal}"
+    SupervisedStopped -> "stopped"
+    _ -> "failed"
+  }
+}
+
+-- The fold every test uses: a log of the events in observation order.
+fn record(log: str, event: PoolEvent) -> str {
+  match event {
+    PoolStarting(item) -> log.concat(i"start {item}; ")
+    PoolReaped(item, exit, elapsed) ->
+      log.concat(i"reap {item} {ending(exit.termination)} {elapsed.milliseconds()}ms; ")
+    PoolRefused(item) -> log.concat(i"refuse {item}; ")
+  }
+}
+
+-- Every reading advances the clock by 100 ms; sleeping takes no time.
+fn with_clock<T, E>(body: () -[MonotonicClock, Sleep, E]> T) -[E]> T {
+  let elapsed: Vector<i64> = vector.new<i64>()
+  vector_push<i64>(elapsed, 0)
+  handle {
+    handle body() {
+      MonotonicClock.now() -> {
+        let now = vector_get_in_bounds<i64>(elapsed, 0) + 100
+        vector_set<i64>(elapsed, 0, now)
+        resume(monotonic.nanoseconds(now * 1000000))
+      }
+    }
+  } {
+    Sleep.wait(duration) -> resume(Ok<nil, SleepError>(nil))
+  }
+}
+
+fn pooled(
+  items: Vector<Option<Duration>>,
+  jobs: i64,
+  script: Vector<SupervisedScript>
+) -> str {
+  let run = with_clock(
+    () =>
+      runtime_supervise_scripted(
+        script,
+        () => pool_run(items, jobs, "", (log: str, event: PoolEvent) => record(log, event))
+      )
+  )
+  match run {
+    PoolFinished(log) -> log
+    PoolWorkerStarted(assigned) -> "worker side"
+  }
+}
+
+fn within(millis: i64) -> Option<Duration> { Some(time.milliseconds(millis)) }
+
+test "a_pool_folds_every_event_in_observation_order" {
+  Test.assert_str_eq(
+    pooled(
+      limits(Cons(within(5000), Cons(within(5000), Cons(within(5000), Nil<Option<Duration>>())))),
+      2,
+      scripts(Cons(worker(1, 0), Cons(worker(0, 3), Cons(worker(0, 0), Nil<SupervisedScript>()))))
+    ),
+    "start 0; start 1; reap 1 exit 3 200ms; start 2; reap 0 exit 0 500ms; reap 2 exit 0 200ms; "
+  )
+}
+
+test "a_pool_of_one_runs_items_in_sequence" {
+  Test.assert_str_eq(
+    pooled(
+      limits(Cons(within(5000), Cons(within(5000), Nil<Option<Duration>>()))),
+      1,
+      scripts(Cons(worker(0, 0), Cons(worker(0, 1), Nil<SupervisedScript>())))
+    ),
+    "start 0; reap 0 exit 0 100ms; start 1; reap 1 exit 1 100ms; "
+  )
+}
+
+test "a_pool_stops_a_limited_item_but_never_an_unlimited_one" {
+  Test.assert_str_eq(
+    pooled(
+      limits(Cons(within(250), Nil<Option<Duration>>())),
+      1,
+      scripts(Cons(worker(1000000, 0), Nil<SupervisedScript>()))
+    ),
+    "start 0; reap 0 stopped 300ms; "
+  )
+  -- Without a limit the worker is polled until it ends on its own.
+  Test.assert_str_eq(
+    pooled(
+      limits(Cons(None<Duration>(), Nil<Option<Duration>>())),
+      1,
+      scripts(Cons(worker(4, 0), Nil<SupervisedScript>()))
+    ),
+    "start 0; reap 0 exit 0 500ms; "
+  )
+}
+
+test "a_pool_reports_an_item_whose_worker_could_not_start" {
+  Test.assert_str_eq(
+    pooled(
+      limits(Cons(within(5000), Cons(within(5000), Nil<Option<Duration>>()))),
+      2,
+      scripts(Cons(worker(0, 0), Nil<SupervisedScript>()))
+    ),
+    "start 0; start 1; refuse 1; reap 0 exit 0 200ms; "
+  )
+  Test.assert_str_eq(
+    pooled(limits(Nil<Option<Duration>>()), 4, scripts(Nil<SupervisedScript>())),
+    ""
+  )
+}

@@ -1,0 +1,148 @@
+-- compiler/tool/pool.weft -- run a command's items in supervised workers
+--
+-- `weft test`, `check` and `fmt` each run their items in forked workers that
+-- inherit the runner's prepared state copy-on-write. The pool owns only
+-- supervision: bounded concurrency, limits, polling and the fork's two
+-- sides. Each command folds its own state over completions. The fork's
+-- worker side returns out of the pool as a value, so a worker does its work
+-- beneath none of the runner's handlers: an abortive handler in scope makes
+-- every function beneath it maintain abort-cleanup records.
+
+use runtime/tool_platform.{
+  Supervise,
+  SupervisedChild,
+  SupervisedExit,
+  SupervisedForkFailed,
+  SupervisedParent,
+  SupervisedProcess
+}
+use stdlib/option.{None, Option, Some}
+use stdlib/time as time
+use stdlib/time.{Duration}
+use stdlib/time/monotonic as monotonic
+use stdlib/time/monotonic.{Instant, MonotonicClock}
+use stdlib/time/sleep as sleep
+use stdlib/time/sleep.{Sleep}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push, vector_set}
+
+--- A forked worker's assignment: its item and the runner that supervises it.
+pub(package) type PoolWorker { item: i64, runner: i64 }
+
+--- Which process a pool run returns in.
+pub(package) type PoolRun<S> {
+  --- The runner, after every item finished, with the command's final state.
+  PoolFinished(S),
+  --- A forked worker, which must do its item's work and then exit.
+  PoolWorkerStarted(PoolWorker)
+}
+
+-- A worker slot: free, or supervising one item's worker since `start`.
+type PoolSlot {
+  PoolSlotFree,
+  -- Worker, item, start, stop.
+  PoolSlotBusy(SupervisedProcess, i64, Instant, Option<Duration>)
+}
+
+fn pool_free_slot(slots: Vector<PoolSlot>) -> i64 {
+  for index in 0..vector_len<PoolSlot>(slots) {
+    match vector_get_in_bounds<PoolSlot>(slots, index) {
+      PoolSlotFree -> return index
+      _ -> nil
+    }
+  }
+  -1
+}
+
+fn pool_expired(elapsed: Duration, stop: Option<Duration>) -> bool {
+  match stop {
+    Some(limit) -> elapsed.milliseconds() >= limit.milliseconds()
+    None -> false
+  }
+}
+
+--- What happened to one item, in the order the runner observes it.
+pub(package) type PoolEvent {
+  --- The item's worker is about to start.
+  PoolStarting(i64),
+  --- The item's worker was reaped after running for the duration.
+  PoolReaped(i64, SupervisedExit, Duration),
+  --- The item's worker could not start.
+  PoolRefused(i64)
+}
+
+--- Run one worker per entry of `limits`, at most `jobs` at a time. A
+--- worker still running at its item's limit is stopped together with any
+--- process it started. The runner folds `state` through `step` for every
+--- event, in the order it observes them, and returns the final state. The
+--- fork's worker side returns at once with its assignment.
+pub(package) fn pool_run<S, E>(
+  limits: Vector<Option<Duration>>,
+  jobs: i64,
+  state: S,
+  step: (S, PoolEvent) -[E]> S
+) -[Supervise, MonotonicClock, Sleep, E]> PoolRun<S> {
+  let count = vector_len<Option<Duration>>(limits)
+  let runner = Supervise.process_id()
+  let slots: Vector<PoolSlot> = vector.new<PoolSlot>()
+  for index in 0..jobs { vector_push<PoolSlot>(slots, PoolSlotFree) }
+  let mut folded = state
+  let mut next = 0
+  let mut active = 0
+  while next < count or active > 0 {
+    while next < count and active < jobs {
+      folded = step(folded, PoolStarting(next))
+      let start = monotonic.now()
+      match Supervise.fork() {
+        SupervisedChild -> return PoolWorkerStarted(PoolWorker { item: next, runner: runner })
+        SupervisedParent(worker) -> {
+          vector_set<PoolSlot>(
+            slots,
+            pool_free_slot(slots),
+            PoolSlotBusy(
+              worker,
+              next,
+              start,
+              vector_get_in_bounds<Option<Duration>>(limits, next)
+            )
+          )
+          active = active + 1
+          nil
+        }
+        SupervisedForkFailed(error) -> {
+          folded = step(folded, PoolRefused(next))
+          nil
+        }
+      }
+      next = next + 1
+    }
+    let mut progressed = false
+    for slot in 0..jobs {
+      match vector_get_in_bounds<PoolSlot>(slots, slot) {
+        PoolSlotFree -> nil
+        PoolSlotBusy(worker, item, start, stop) -> {
+          let polled = Supervise.poll(worker)
+          let elapsed = monotonic.now().duration_since(start)
+          let finished: Option<SupervisedExit> = match polled {
+            exit: SupervisedExit -> Some(exit)
+            nil -> if pool_expired(elapsed, stop) { Some(Supervise.stop(worker)) } else {
+              None
+            }
+          }
+          match finished {
+            None -> nil
+            Some(exit) -> {
+              folded = step(folded, PoolReaped(item, exit, elapsed))
+              vector_set<PoolSlot>(slots, slot, PoolSlotFree)
+              active = active - 1
+              progressed = true
+              nil
+            }
+          }
+        }
+      }
+    }
+    if active > 0 and not progressed { sleep.wait(time.milliseconds(10)) }
+  }
+  PoolFinished(folded)
+}

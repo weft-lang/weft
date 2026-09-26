@@ -1,0 +1,279 @@
+-- compiler/tool/discovery.weft -- the source roots a command's inputs name
+--
+-- `weft test`, `fmt` and `check` accept the same inputs: a pattern names its
+-- matching files, a directory names every `.weft` file beneath it, and any
+-- other input names itself. Discovery reads the filesystem through
+-- `DirInspect` alone and reports problems as values; each command words them.
+
+use stdlib/bytes.{bytes_storage}
+use stdlib/dir.{DirDirectory, DirInspect, DirKind}
+use stdlib/option.{None, Option, Some}
+use stdlib/ord.{Less, Ord}
+use stdlib/path as path
+use stdlib/path.{Path}
+use stdlib/result.{Err, Ok}
+use stdlib/bytes as bytes
+use stdlib/sorted_set as sorted_set
+use stdlib/sorted_set.{SortedSet}
+use stdlib/string.{str_byte_at, str_find, str_len, str_slice_bytes}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_insert_at, vector_len}
+
+--- Why one discovery input names no roots.
+pub(package) type DiscoveryProblem {
+  --- The directory of a pattern could not be listed.
+  DiscoveryPatternUnreadable(str),
+  --- A pattern matched no files.
+  DiscoveryPatternUnmatched(str),
+  --- A directory in a tree could not be listed.
+  DiscoveryDirectoryUnreadable(str),
+  --- A directory tree holds no `.weft` files.
+  DiscoveryDirectoryEmpty(str)
+}
+
+--- The roots a set of inputs names, in byte order without duplicates, and
+--- the problems that made inputs fail.
+pub(package) type Discovery {
+  roots: Vector<str>,
+  problems: Vector<DiscoveryProblem>,
+  failed_inputs: i64
+}
+
+-- Discovery keeps each name's exact native bytes; roots are text only in the
+-- sense of the compiler's byte-exact `str`.
+fn discovery_path_text(value: Path) -> str { bytes_storage(value.bytes()) }
+
+fn discovery_native(text: str) -> Option<Path> {
+  match path.from_bytes(bytes.from_str(text)) {
+    Ok(value) -> Some(value)
+    Err(_) -> None
+  }
+}
+
+fn discovery_kind_is_directory(kind: DirKind) -> bool {
+  match kind {
+    DirDirectory -> true
+    _ -> false
+  }
+}
+
+fn discovery_is_directory(text: str) -[DirInspect]> bool {
+  match discovery_native(text) {
+    None -> false
+    Some(native) -> match DirInspect.stat(native) {
+      Ok(metadata) -> metadata.exists and discovery_kind_is_directory(metadata.kind)
+      Err(_) -> false
+    }
+  }
+}
+
+fn discovery_list(directory: str) -[DirInspect]> Option<owned Vector<str>> {
+  match discovery_native(directory) {
+    None -> None
+    Some(native) -> match DirInspect.list(native) {
+      Err(_) -> None
+      Ok(entries) -> {
+        let mut names = vector.new<str>()
+        for entry in entries[..] { names.push(discovery_path_text(entry)) }
+        Some(names)
+      }
+    }
+  }
+}
+
+fn discovery_has_glob(input: str) -> bool {
+  str_find(input, "*") >= 0 or str_find(input, "?") >= 0
+}
+
+fn discovery_last_slash(input: str) -> i64 {
+  let mut slash = -1
+  for index in 0..str_len(input) {
+    if str_byte_at(input, index) == 47 { slash = index }
+  }
+  slash
+}
+
+--- Whether `name` matches a pattern of literal bytes, `?` for any one byte
+--- and `*` for any run. Richer unquoted globs are the invoking shell's job.
+pub(package) fn discovery_glob_matches(name: str, pattern: str) -> bool {
+  let name_len = str_len(name)
+  let pattern_len = str_len(pattern)
+  let mut at = 0
+  let mut next = 0
+  let mut star = -1
+  let mut retry = 0
+  while at < name_len {
+    if next < pattern_len and (
+      str_byte_at(pattern, next) == 63 or str_byte_at(pattern, next) == str_byte_at(name, at)
+    ) {
+      at = at + 1
+      next = next + 1
+    } else if next < pattern_len and str_byte_at(pattern, next) == 42 {
+      star = next
+      next = next + 1
+      retry = at
+    } else if star >= 0 {
+      retry = retry + 1
+      at = retry
+      next = star + 1
+    } else { return false }
+  }
+  while next < pattern_len and str_byte_at(pattern, next) == 42 { next = next + 1 }
+  next == pattern_len
+}
+
+-- Expand a pattern over the files, not directories, of its directory.
+fn discovery_pattern(
+  input: str,
+  roots: SortedSet<str>,
+  problems: borrow mut Vector<DiscoveryProblem>
+) -[DirInspect]> bool {
+  let slash = discovery_last_slash(input)
+  let directory = if slash < 0 { "." } else if slash == 0 { "/" } else {
+    str_slice_bytes(input, 0, slash)
+  }
+  let prefix = str_slice_bytes(input, 0, slash + 1)
+  let pattern = str_slice_bytes(input, slash + 1, str_len(input) - slash - 1)
+  match discovery_list(directory) {
+    None -> {
+      problems.push(DiscoveryPatternUnreadable(input))
+      false
+    }
+    Some(names) -> {
+      let mut matched = 0
+      for name in names {
+        let candidate = prefix.concat(name)
+        if discovery_glob_matches(name, pattern) and not discovery_is_directory(candidate) {
+          roots.insert(candidate)
+          matched = matched + 1
+          nil
+        }
+      }
+      if matched == 0 {
+        problems.push(DiscoveryPatternUnmatched(input))
+        false
+      } else { true }
+    }
+  }
+}
+
+type DiscoveryIdentity { device: i64, inode: i64 }
+
+-- Record a directory's filesystem identity; false when already recorded.
+fn discovery_visit(visited: borrow mut Vector<DiscoveryIdentity>, device: i64, inode: i64) -> bool
+{
+  for identity in visited[..] {
+    if identity.device == device and identity.inode == inode { return false }
+  }
+  visited.push(DiscoveryIdentity { device: device, inode: inode })
+  true
+}
+
+fn discovery_insert_sorted(values: borrow mut Vector<str>, value: str) -> nil {
+  let mut low = 0
+  let mut high = vector_len<str>(values)
+  while low < high {
+    let middle = (low + high) / 2
+    match vector_get_in_bounds<str>(values, middle).compare(value) {
+      Less -> {
+        low = middle + 1
+        nil
+      }
+      _ -> {
+        high = middle
+        nil
+      }
+    }
+  }
+  vector_insert_at<str>(values, low, value)
+  nil
+}
+
+fn discovery_join(directory: str, name: str) -> str {
+  let n = str_len(directory)
+  if n > 0 and str_byte_at(directory, n - 1) == 47 { directory.concat(name) }
+  else { directory.concat("/").concat(name) }
+}
+
+-- Walk a directory tree, always visiting the smallest pending directory next,
+-- and following each filesystem identity once so symlink cycles end.
+fn discovery_tree(
+  input: str,
+  roots: SortedSet<str>,
+  problems: borrow mut Vector<DiscoveryProblem>
+) -[DirInspect]> bool {
+  let mut pending = vector.new<str>()
+  let mut visited = vector.new<DiscoveryIdentity>()
+  pending.push(input)
+  match discovery_native(input) {
+    None -> nil
+    Some(native) -> match DirInspect.stat(native) {
+      Ok(metadata) -> {
+        discovery_visit(visited, metadata.device, metadata.inode)
+        nil
+      }
+      Err(_) -> nil
+    }
+  }
+  let mut unreadable = false
+  let mut matched = 0
+  let mut next = 0
+  while next < vector_len<str>(pending) {
+    let directory = vector_get_in_bounds<str>(pending, next)
+    match discovery_list(directory) {
+      None -> {
+        problems.push(DiscoveryDirectoryUnreadable(directory))
+        unreadable = true
+      }
+      Some(names) -> {
+        for name in names {
+          let child = discovery_join(directory, name)
+          match discovery_native(child) {
+            None -> nil
+            Some(native) -> match DirInspect.stat(native) {
+              Err(_) -> nil
+              Ok(metadata) -> if not metadata.exists { nil }
+              else if discovery_kind_is_directory(metadata.kind) {
+                if discovery_visit(visited, metadata.device, metadata.inode) {
+                  discovery_insert_sorted(pending, child)
+                }
+                nil
+              } else if name.ends_with(".weft") {
+                roots.insert(child)
+                matched = matched + 1
+                nil
+              } else { nil }
+            }
+          }
+        }
+      }
+    }
+    next = next + 1
+  }
+  if unreadable { false }
+  else if matched == 0 {
+    problems.push(DiscoveryDirectoryEmpty(input))
+    false
+  } else { true }
+}
+
+--- Expand inputs: a pattern names its matching files, a directory names
+--- every `.weft` file beneath it, and anything else, including a missing
+--- file, names itself so compilation reports it.
+pub(package) fn discover(inputs: Vector<str>) -[DirInspect]> Discovery {
+  let roots = sorted_set.new<str>()
+  let mut problems = vector.new<DiscoveryProblem>()
+  let mut failed_inputs = 0
+  for input in inputs[..] {
+    let found = if discovery_has_glob(input) { discovery_pattern(input, roots, problems) }
+    else if discovery_is_directory(input) { discovery_tree(input, roots, problems) }
+    else {
+      roots.insert(input)
+      true
+    }
+    if not found { failed_inputs = failed_inputs + 1 }
+  }
+  -- Problems are built through an exclusive borrow, then published shared.
+  let published: Vector<DiscoveryProblem> = problems
+  Discovery { roots: roots.values(), problems: published, failed_inputs: failed_inputs }
+}
