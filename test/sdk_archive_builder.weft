@@ -1,5 +1,8 @@
 use compiler/sdk/embed.{SdkArchiveBuild, SdkArchiveBuildFailed, SdkArchiveBuilt, sdk_embed_build}
-use runtime/memory.{mem_load8_at}
+use runtime/dir_inspect as dir_inspect_handler
+use runtime/file_read as file_read_handler
+use runtime/memory.{mem_load8_at, mem_load64_at}
+use runtime/process as process_handler
 use runtime/sdk_archive.{
   SdkArchive,
   SdkArchiveFound,
@@ -9,9 +12,18 @@ use runtime/sdk_archive.{
   sdk_archive_lookup,
   sdk_archive_validate
 }
+use stdlib/list.{Cons, Nil}
 use stdlib/num
-use stdlib/result.{Result}
+use stdlib/option.{Option}
+use stdlib/process.{Proc, ProcExited}
+use stdlib/result.{Ok, Result}
 use stdlib/vector.{vector_data}
+
+fn built(root: str) -> SdkArchiveBuild {
+  with dir_inspect_handler() {
+    with file_read_handler() { sdk_embed_build(root) }
+  }
+}
 
 fn sdk_archive_assert_entry(archive: SdkArchive, path: str) -[Test]> i64 {
   match sdk_archive_lookup(archive, __str_ptr(path), __str_len(path)) {
@@ -26,7 +38,7 @@ fn sdk_archive_assert_entry(archive: SdkArchive, path: str) -[Test]> i64 {
 }
 
 test "complete SDK archive contains sources manifest and both native targets" {
-  match sdk_embed_build(".") {
+  match built(".") {
     SdkArchiveBuildFailed(message) -> Test.assert_true(false)
     SdkArchiveBuilt(archive, digest, count) -> {
       let bytes = vector_data<u8>(archive)
@@ -52,9 +64,9 @@ test "complete SDK archive contains sources manifest and both native targets" {
 }
 
 test "SDK archive construction is deterministic" {
-  match sdk_embed_build(".") {
+  match built(".") {
     SdkArchiveBuildFailed(message) -> Test.assert_true(false)
-    SdkArchiveBuilt(first, first_digest, first_count) -> match sdk_embed_build(".") {
+    SdkArchiveBuilt(first, first_digest, first_count) -> match built(".") {
       SdkArchiveBuildFailed(message) -> Test.assert_true(false)
       SdkArchiveBuilt(second, second_digest, second_count) -> {
         let first_len = first.len().to_u64().to_i64_checked().expect("SDK archive size fits i64")
@@ -81,8 +93,137 @@ test "SDK archive construction is deterministic" {
 }
 
 test "SDK archive construction rejects incomplete roots" {
-  match sdk_embed_build("test/fixtures/source-acquire-definitely-missing") {
+  match built("test/fixtures/source-acquire-definitely-missing") {
     SdkArchiveBuildFailed(message) -> Test.assert_true(__str_len(message) > 0)
     SdkArchiveBuilt(archive, digest, count) -> Test.assert_true(false)
   }
+}
+
+-- A small SDK tree under /tmp, arranged by a shell script that receives the
+-- tree's directory as $0. The base tree is minimal and valid.
+fn fixture(name: str, arrange: str) -> str {
+  let tree = i"/tmp/weft-sdk-archive-{name}"
+  let script = i"rm -rf \"$0\" && mkdir -p \"$0/compiler/a\" \"$0/runtime\" \"$0/stdlib\" \"$0/native/lib/macos-aarch64\" \"$0/native/lib/linux-aarch64\" && printf 'fn b() -> i64 {{ 1 }}\\n' > \"$0/compiler/b.weft\" && printf 'fn a() -> i64 {{ 2 }}\\n' > \"$0/compiler/a.weft\" && printf 'fn x() -> i64 {{ 3 }}\\n' > \"$0/compiler/a/x.weft\" && printf 'notes' > \"$0/compiler/notes.txt\" && printf 'fn r() -> i64 {{ 4 }}\\n' > \"$0/runtime/r.weft\" && printf 'fn s() -> i64 {{ 5 }}\\n' > \"$0/stdlib/s.weft\" && printf '{{}}' > \"$0/weft.pkg\" && printf 'mac' > \"$0/native/lib/macos-aarch64/libweft_mbedtls.a\" && printf 'linux' > \"$0/native/lib/linux-aarch64/libweft_mbedtls.a\" && {arrange}"
+  let status = with process_handler(0, 0) {
+    Proc.run("/bin/sh", Cons("-c", Cons(script, Cons(tree, Nil<str>()))))
+  }
+  match status {
+    Ok(ProcExited(0)) -> tree
+    _ -> "/nonexistent-weft-sdk-fixture"
+  }
+}
+
+fn failure(name: str, arrange: str) -> str {
+  match built(fixture(name, arrange)) {
+    SdkArchiveBuildFailed(message) -> message
+    SdkArchiveBuilt(archive, digest, count) -> i"built {count}"
+  }
+}
+
+fn entry_path(bytes: i64, index: i64) -> str {
+  let entry = bytes + 96 + index * 32
+  let offset = mem_load64_at(entry, 0)
+  let len = mem_load64_at(entry, 8)
+  let mut text = ""
+  for position in 0..len {
+    text = text.concat(i"{mem_load8_at(bytes, offset + position)},")
+  }
+  text
+}
+
+fn text_codes(text: str) -> str {
+  let mut codes = ""
+  for position in 0..text.len().to_u64().to_i64_checked().unwrap_or(0) {
+    codes = codes.concat(
+      i"{text.byte_at(position.to_usize_checked().unwrap_or(0)).unwrap_or(0)},"
+    )
+  }
+  codes
+}
+
+test "a minimal SDK archive lists its inputs in byte order with exact contents" {
+  match built(fixture("layout", "mkfifo \"$0/stdlib/pipe.weft\"")) {
+    SdkArchiveBuildFailed(message) -> Test.assert_str_eq(message, "built")
+    SdkArchiveBuilt(archive, digest, count) -> {
+      let bytes = vector_data<u8>(archive)
+      let len = archive.len().to_u64().to_i64_checked().expect("SDK archive size fits i64")
+      let validated = sdk_archive_validate(bytes, len).expect(
+        "builder produces a valid signed archive"
+      )
+      -- Five sources, the manifest and both native archives; the text file
+      -- and the FIFO named like a source are not inputs.
+      Test.assert_eq(count, 8)
+      Test.assert_eq(mem_load64_at(bytes, 16), 8)
+      Test.assert_eq(mem_load64_at(bytes, 32), len)
+      Test.assert_str_eq(sdk_archive_digest(validated), digest)
+      -- Byte order: `.` (46) sorts before `/` (47), and `/` before letters.
+      Test.assert_str_eq(entry_path(bytes, 0), text_codes("compiler/a.weft"))
+      Test.assert_str_eq(entry_path(bytes, 1), text_codes("compiler/a/x.weft"))
+      Test.assert_str_eq(entry_path(bytes, 2), text_codes("compiler/b.weft"))
+      Test.assert_str_eq(
+        entry_path(bytes, 3),
+        text_codes("native/lib/linux-aarch64/libweft_mbedtls.a")
+      )
+      Test.assert_str_eq(
+        entry_path(bytes, 4),
+        text_codes("native/lib/macos-aarch64/libweft_mbedtls.a")
+      )
+      Test.assert_str_eq(entry_path(bytes, 5), text_codes("runtime/r.weft"))
+      Test.assert_str_eq(entry_path(bytes, 6), text_codes("stdlib/s.weft"))
+      Test.assert_str_eq(entry_path(bytes, 7), text_codes("weft.pkg"))
+      Test.assert_eq(
+        sdk_archive_assert_entry(validated, "native/lib/linux-aarch64/libweft_mbedtls.a"),
+        5
+      )
+      Test.assert_eq(sdk_archive_assert_entry(validated, "compiler/a/x.weft"), 20)
+    }
+  }
+}
+
+test "SDK archive construction refuses every malformed tree" {
+  match built("") {
+    SdkArchiveBuildFailed(message) -> Test.assert_str_eq(
+      message,
+      "SDK archive root cannot be empty"
+    )
+    SdkArchiveBuilt(archive, digest, count) -> Test.assert_true(false)
+  }
+  Test.assert_str_eq(
+    failure("no_stdlib", "rm -r \"$0/stdlib\""),
+    "SDK source root is missing or is not a directory"
+  )
+  Test.assert_str_eq(
+    failure("file_root", "rm -r \"$0/runtime\" && printf x > \"$0/runtime\""),
+    "SDK source root is missing or is not a directory"
+  )
+  Test.assert_str_eq(
+    failure("link", "ln -s ../stdlib/s.weft \"$0/compiler/linked.weft\""),
+    "SDK source roots cannot contain symbolic links"
+  )
+  Test.assert_str_eq(
+    failure("dangling", "ln -s nowhere \"$0/runtime/dangling\""),
+    "SDK source roots cannot contain symbolic links"
+  )
+  Test.assert_str_eq(
+    failure("no_manifest", "rm \"$0/weft.pkg\""),
+    "required SDK archive input is missing or is not a regular file"
+  )
+  Test.assert_str_eq(
+    failure(
+      "native_directory",
+      "rm \"$0/native/lib/linux-aarch64/libweft_mbedtls.a\" && mkdir \"$0/native/lib/linux-aarch64/libweft_mbedtls.a\""
+    ),
+    "required SDK archive input is missing or is not a regular file"
+  )
+  Test.assert_str_eq(
+    failure(
+      "native_link",
+      "rm \"$0/native/lib/macos-aarch64/libweft_mbedtls.a\" && ln -s ../../../weft.pkg \"$0/native/lib/macos-aarch64/libweft_mbedtls.a\""
+    ),
+    "required SDK archive input is missing or is not a regular file"
+  )
+  Test.assert_str_eq(
+    failure("empty", ": > \"$0/stdlib/empty.weft\""),
+    "SDK archive input cannot be read or is empty"
+  )
 }
