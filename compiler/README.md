@@ -23,7 +23,8 @@ compiler/
   comptime/             compile-time execution and observed artifact inputs
   project/              sessions, module identity, and reusable checked products
   package/              package resolution, exports, native declarations, and locks
-  tool/                 JSON-RPC, MCP and LSP protocol surfaces of the command-line tools
+  tool/                 JSON-RPC, MCP and LSP protocol surfaces of the command-line tools,
+                        and the `weft test` policy, scheduler and generated harness
   sdk/                  embedded source archive and product identity
   backend/              native targets, link graphs, and binary formats
     aarch64/            encoding and native code generation

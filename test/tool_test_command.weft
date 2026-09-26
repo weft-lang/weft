@@ -1,0 +1,859 @@
+-- The `weft test` command's policy and records: arguments, environment
+-- settings, root directives, outcomes and their wire codes, reports, result
+-- and measure records, totals, and discovery over a deterministic filesystem.
+
+use compiler/tool/test.{*}
+use runtime/tool_platform.{SupervisedUsage}
+use stdlib/dir.{DirDirectory, DirFile, DirInspect, DirKind, DirMetadata, DirOther}
+use stdlib/env.{Env}
+use stdlib/io/types.{IoError, IoNotFound, IoPermissionDenied}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/option.{None, Option, Some}
+use stdlib/path as path
+use stdlib/path.{Path}
+use stdlib/panic.{panic}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/string.{str_concat}
+use stdlib/string/builder as builder
+use stdlib/time as time
+use stdlib/time.{Duration}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push}
+
+fn texts(values: List<str>) -> Vector<str> {
+  let out: Vector<str> = vector.new<str>()
+  for value in values { vector_push<str>(out, value) }
+  out
+}
+
+fn joined(values: Vector<str>) -> str {
+  let mut out = builder.new()
+  for index in 0..vector_len<str>(values) {
+    if index > 0 { out.append("|") }
+    out.append(vector_get_in_bounds<str>(values, index))
+  }
+  out.finish()
+}
+
+fn args0() -> Vector<str> { texts(Nil<str>()) }
+
+fn args1(a: str) -> Vector<str> { texts(Cons(a, Nil<str>())) }
+
+fn args2(a: str, b: str) -> Vector<str> { texts(Cons(a, Cons(b, Nil<str>()))) }
+
+fn args3(a: str, b: str, c: str) -> Vector<str> { texts(Cons(a, Cons(b, Cons(c, Nil<str>())))) }
+
+fn args4(a: str, b: str, c: str, d: str) -> Vector<str> {
+  texts(Cons(a, Cons(b, Cons(c, Cons(d, Nil<str>())))))
+}
+
+-- A command as text: its variant and payload.
+fn command(values: Vector<str>) -> str {
+  match test_command(values) {
+    TestEmitInput -> "emit-input"
+    TestEmitPath(target) -> str_concat("emit:", target)
+    TestRunInputs(inputs, jobs) -> i"run {jobs}:{joined(inputs)}"
+    TestUsage -> "usage"
+    TestInvalidJobs -> "invalid-jobs"
+  }
+}
+
+fn jobs(text: str) -> i64 {
+  match test_jobs(text) {
+    Some(value) -> value
+    None -> 0 - 1
+  }
+}
+
+test "test_command_selects_emission_running_and_usage" {
+  Test.assert_str_eq(command(args0()), "emit-input")
+  Test.assert_str_eq(command(args1("--emit")), "emit-input")
+  Test.assert_str_eq(command(args2("--emit", "a.weft")), "emit:a.weft")
+  Test.assert_str_eq(command(args3("--emit", "a.weft", "b.weft")), "usage")
+  Test.assert_str_eq(command(args2("a.weft", "b.weft")), "run 4:a.weft|b.weft")
+  Test.assert_str_eq(command(args1("dir/")), "run 4:dir/")
+  Test.assert_str_eq(command(args4("--jobs", "2", "a.weft", "b.weft")), "run 2:a.weft|b.weft")
+  Test.assert_str_eq(command(args3("-j", "64", "a.weft")), "run 64:a.weft")
+  -- A spelled-together flag is an ordinary input.
+  Test.assert_str_eq(command(args2("--jobs=2", "a.weft")), "run 4:--jobs=2|a.weft")
+}
+
+test "test_command_rejects_incomplete_and_invalid_worker_counts" {
+  Test.assert_str_eq(command(args1("--jobs")), "usage")
+  Test.assert_str_eq(command(args2("--jobs", "2")), "usage")
+  Test.assert_str_eq(command(args2("-j", "2")), "usage")
+  Test.assert_str_eq(command(args3("--jobs", "0", "a.weft")), "invalid-jobs")
+  Test.assert_str_eq(command(args3("--jobs", "65", "a.weft")), "invalid-jobs")
+  Test.assert_str_eq(command(args3("--jobs", "two", "a.weft")), "invalid-jobs")
+  Test.assert_str_eq(command(args3("--jobs", "", "a.weft")), "invalid-jobs")
+}
+
+test "test_jobs_accepts_exactly_one_to_sixty_four" {
+  Test.assert_eq(jobs("1"), 1)
+  Test.assert_eq(jobs("64"), 64)
+  Test.assert_eq(jobs("064"), 64)
+  Test.assert_eq(jobs("0"), 0 - 1)
+  Test.assert_eq(jobs("65"), 0 - 1)
+  Test.assert_eq(jobs(""), 0 - 1)
+  Test.assert_eq(jobs("-1"), 0 - 1)
+  Test.assert_eq(jobs("+1"), 0 - 1)
+  Test.assert_eq(jobs("1a"), 0 - 1)
+  Test.assert_eq(jobs(" 1"), 0 - 1)
+  Test.assert_eq(jobs("99999999999999999999999"), 0 - 1)
+}
+
+-- Settings ------------------------------------------------------------------
+-- A fixed environment holding at most two variables.
+fn lookup(requested: str, first: str, first_value: str, second: str, second_value: str) -> str? {
+  if requested == first { return first_value }
+  if requested == second { return second_value }
+  nil
+}
+
+fn settings_with_two(first: str, first_value: str, second: str, second_value: str) -> TestSettings
+{
+  handle test_settings() {
+    Env.arg_count() -> resume(0)
+    Env.arg(index) -> resume(nil)
+    Env.var(requested) -> resume(lookup(requested, first, first_value, second, second_value))
+  }
+}
+
+fn settings_with(name: str, value: str) -> TestSettings { settings_with_two(name, value, "", "") }
+
+fn memory(settings: TestSettings) -> i64 {
+  match settings.memory_limit_kb {
+    Some(limit) -> limit
+    None -> 0 - 1
+  }
+}
+
+fn flags(settings: TestSettings) -> str {
+  let mut out = builder.new()
+  if settings.quarantine { out.append("q") }
+  if settings.plan_trace { out.append("t") }
+  if settings.report_metrics { out.append("m") }
+  out.finish()
+}
+
+fn sharing(settings: TestSettings) -> str {
+  let checked = match settings.checked_sharing {
+    TestShareFullWaves -> "waves"
+    TestShareAlways -> "always"
+  }
+  let optimised = match settings.optimised_sharing {
+    TestOptimiseRepaid -> "repaid"
+    TestOptimiseAlways -> "always"
+    TestOptimiseNever -> "never"
+  }
+  i"{checked}/{optimised}"
+}
+
+test "test_settings_default_to_two_minute_stops_and_no_policy" {
+  let unset = test_settings_unset()
+  Test.assert_eq(unset.compile_limit.milliseconds(), 120000)
+  Test.assert_eq(unset.run_limit.milliseconds(), 120000)
+  Test.assert_eq(memory(unset), 0 - 1)
+  Test.assert_str_eq(flags(unset), "")
+}
+
+test "test_settings_read_phase_stops_in_whole_seconds_up_to_a_day" {
+  Test.assert_eq(
+    settings_with("WEFT_TEST_COMPILE_TIMEOUT", "30").compile_limit.milliseconds(),
+    30000
+  )
+  Test.assert_eq(settings_with("WEFT_TEST_RUN_TIMEOUT", "1").run_limit.milliseconds(), 1000)
+  Test.assert_eq(
+    settings_with("WEFT_TEST_RUN_TIMEOUT", "86400").run_limit.milliseconds(),
+    86400000
+  )
+  -- Invalid values read as unset.
+  Test.assert_eq(settings_with("WEFT_TEST_RUN_TIMEOUT", "86401").run_limit.milliseconds(), 120000)
+  Test.assert_eq(settings_with("WEFT_TEST_RUN_TIMEOUT", "0").run_limit.milliseconds(), 120000)
+  Test.assert_eq(settings_with("WEFT_TEST_RUN_TIMEOUT", "1.5").run_limit.milliseconds(), 120000)
+  Test.assert_eq(settings_with("WEFT_TEST_RUN_TIMEOUT", "").run_limit.milliseconds(), 120000)
+  -- Each stop reads its own variable.
+  Test.assert_eq(settings_with("WEFT_TEST_RUN_TIMEOUT", "5").compile_limit.milliseconds(), 120000)
+}
+
+test "test_settings_take_the_smaller_memory_limit" {
+  Test.assert_eq(memory(settings_with("WEFT_TEST_COMPILE_RSS_LIMIT_KB", "900")), 900)
+  Test.assert_eq(memory(settings_with("WEFT_TEST_RUN_RSS_LIMIT_KB", "700")), 700)
+  let both = settings_with_two(
+    "WEFT_TEST_COMPILE_RSS_LIMIT_KB",
+    "900",
+    "WEFT_TEST_RUN_RSS_LIMIT_KB",
+    "700"
+  )
+  Test.assert_eq(memory(both), 700)
+  let reversed = settings_with_two(
+    "WEFT_TEST_COMPILE_RSS_LIMIT_KB",
+    "300",
+    "WEFT_TEST_RUN_RSS_LIMIT_KB",
+    "700"
+  )
+  Test.assert_eq(memory(reversed), 300)
+  let invalid = settings_with_two(
+    "WEFT_TEST_COMPILE_RSS_LIMIT_KB",
+    "lots",
+    "WEFT_TEST_RUN_RSS_LIMIT_KB",
+    "700"
+  )
+  Test.assert_eq(memory(invalid), 700)
+  Test.assert_eq(memory(settings_with("WEFT_TEST_RUN_RSS_LIMIT_KB", "1000000001")), 0 - 1)
+}
+
+test "test_settings_flags_are_set_only_by_one" {
+  Test.assert_str_eq(flags(settings_with("WEFT_TEST_RC_QUARANTINE", "1")), "q")
+  Test.assert_str_eq(flags(settings_with("WEFT_TEST_PLAN_TRACE", "1")), "t")
+  Test.assert_str_eq(flags(settings_with("WEFT_TEST_METRICS", "1")), "m")
+  Test.assert_str_eq(flags(settings_with("WEFT_TEST_METRICS", "0")), "")
+  Test.assert_str_eq(flags(settings_with("WEFT_TEST_METRICS", "true")), "")
+  Test.assert_str_eq(flags(settings_with("WEFT_TEST_METRICS", "11")), "")
+  Test.assert_str_eq(flags(settings_with("WEFT_TEST_METRICS", "")), "")
+}
+
+test "test_settings_select_product_sharing_policies" {
+  Test.assert_str_eq(sharing(test_settings_unset()), "waves/repaid")
+  Test.assert_str_eq(sharing(settings_with("WEFT_TEST_OPTIMISED_PRODUCTS", "1")), "always/always")
+  Test.assert_str_eq(
+    sharing(settings_with("WEFT_TEST_DISABLE_OPTIMISED_PRODUCTS", "1")),
+    "waves/never"
+  )
+  -- Disabling optimised products leaves forced checked sharing in place.
+  let both = settings_with_two(
+    "WEFT_TEST_OPTIMISED_PRODUCTS",
+    "1",
+    "WEFT_TEST_DISABLE_OPTIMISED_PRODUCTS",
+    "1"
+  )
+  Test.assert_str_eq(sharing(both), "always/never")
+  Test.assert_str_eq(
+    sharing(settings_with("WEFT_TEST_OPTIMISED_PRODUCTS", "yes")),
+    "waves/repaid"
+  )
+}
+
+fn thresholds(settings: TestSettings, roots: i64, jobs: i64) -> str {
+  let chosen = test_group_thresholds(settings, roots, jobs)
+  i"{chosen.checked_min_roots}/{chosen.optimised_min_roots}"
+}
+
+test "test_group_thresholds_follow_worker_waves_unless_forced" {
+  let measured = test_settings_unset()
+  -- Checked sharing needs a full wave: the smaller of roots and workers.
+  Test.assert_str_eq(thresholds(measured, 3, 8), "3/25")
+  Test.assert_str_eq(thresholds(measured, 600, 8), "8/25")
+  Test.assert_str_eq(
+    thresholds(settings_with("WEFT_TEST_OPTIMISED_PRODUCTS", "1"), 600, 8),
+    "2/2"
+  )
+  Test.assert_str_eq(
+    thresholds(settings_with("WEFT_TEST_DISABLE_OPTIMISED_PRODUCTS", "1"), 600, 8),
+    "8/601"
+  )
+}
+
+test "test_groups_share_when_they_fill_the_threshold_and_repay_rechecking" {
+  let chosen = test_group_thresholds(test_settings_unset(), 600, 2)
+  -- A group of two must avoid rechecking at least 32 pairs, a group of
+  -- three at least 16 per extra root, and so on.
+  Test.assert_true(test_group_shares(chosen, 2, 32))
+  Test.assert_false(test_group_shares(chosen, 2, 31))
+  Test.assert_true(test_group_shares(chosen, 3, 16))
+  Test.assert_false(test_group_shares(chosen, 3, 15))
+  Test.assert_true(test_group_shares(chosen, 33, 1))
+  -- One root alone shares nothing, however large its closure.
+  Test.assert_false(test_group_shares(chosen, 1, 100000))
+  Test.assert_false(test_group_shares(chosen, 0, 100000))
+  let waves = test_group_thresholds(test_settings_unset(), 600, 8)
+  Test.assert_false(test_group_shares(waves, 7, 100000))
+  Test.assert_true(test_group_shares(waves, 8, 100000))
+  Test.assert_false(test_group_optimises(waves, 24))
+  Test.assert_true(test_group_optimises(waves, 25))
+}
+
+fn plan_text(totals: TestPlanTotals) -> str {
+  i"{totals.groups} {totals.roots} {totals.reused_pairs} {totals.optimised_groups} {totals.optimised_roots} {totals.reused_optimised_functions}"
+}
+
+test "test_plan_totals_count_work_every_extra_root_reuses" {
+  let checked = test_plan_totals_add_group(test_plan_totals_empty(), 3, 40, None<i64>())
+  Test.assert_str_eq(plan_text(checked), "1 3 80 0 0 0")
+  let optimised = test_plan_totals_add_group(checked, 2, 10, Some<i64>(7))
+  Test.assert_str_eq(plan_text(optimised), "2 5 90 1 2 7")
+  Test.assert_str_eq(
+    test_plan_group_trace(3, 40, false),
+    "test plan group: roots=3 checked_pairs=40 duplicate_pairs=80 optimised_product=0\n"
+  )
+  Test.assert_str_eq(
+    test_plan_group_trace(2, 10, true),
+    "test plan group: roots=2 checked_pairs=10 duplicate_pairs=10 optimised_product=1\n"
+  )
+  Test.assert_str_eq(
+    test_plan_trace(optimised),
+    "test plan: shared checked dependency groups=2 roots=5\n"
+  )
+}
+
+-- Directives ----------------------------------------------------------------
+fn directive(value: TestDirective) -> i64 {
+  match value {
+    TestDirectiveAbsent -> 0 - 1
+    TestDirectiveValue(number) -> number
+    TestDirectiveMalformed -> 0 - 2
+  }
+}
+
+test "test_expected_exit_directive_accepts_zero_to_one_hundred_twenty_three" {
+  Test.assert_eq(directive(test_expected_exit("fn main() -> i64 { 0 }\n")), 0 - 1)
+  Test.assert_eq(
+    directive(test_expected_exit("-- Expected exit code: 7\nfn main() -> i64 { 7 }\n")),
+    7
+  )
+  Test.assert_eq(directive(test_expected_exit("-- Expected exit code: 0")), 0)
+  Test.assert_eq(directive(test_expected_exit("-- Expected exit code: 42\r\nfn main")), 42)
+  Test.assert_eq(directive(test_expected_exit("-- Expected exit code: 123\n")), 123)
+  -- A directive is a whole line; the first such line decides.
+  Test.assert_eq(
+    directive(test_expected_exit("x -- Expected exit code: 3\n-- Expected exit code: 4\n")),
+    4
+  )
+  Test.assert_eq(
+    directive(test_expected_exit("-- Expected exit code: 5\r\n-- Expected exit code: 6\n")),
+    5
+  )
+  Test.assert_eq(
+    directive(test_expected_exit("let text = \"-- Expected exit code: 7\"\n")),
+    0 - 1
+  )
+}
+
+test "test_expected_exit_directive_rejects_reserved_and_malformed_values" {
+  Test.assert_eq(directive(test_expected_exit("-- Expected exit code: 124\n")), 0 - 2)
+  Test.assert_eq(directive(test_expected_exit("-- Expected exit code: 99999999999\n")), 0 - 2)
+  Test.assert_eq(directive(test_expected_exit("-- Expected exit code: \n")), 0 - 2)
+  Test.assert_eq(directive(test_expected_exit("-- Expected exit code: 7 then\n")), 0 - 2)
+  Test.assert_eq(directive(test_expected_exit("-- Expected exit code: -1\n")), 0 - 2)
+  Test.assert_eq(directive(test_expected_exit("-- Expected exit code: ")), 0 - 2)
+}
+
+test "test_run_budget_directive_accepts_one_to_thirty_six_hundred_seconds" {
+  Test.assert_eq(directive(test_run_budget("test \"x\" { }\n")), 0 - 1)
+  Test.assert_eq(directive(test_run_budget("-- Run budget: 6 s\n")), 6)
+  Test.assert_eq(directive(test_run_budget("-- Run budget: 1 s")), 1)
+  Test.assert_eq(directive(test_run_budget("-- Run budget: 3600 s\n")), 3600)
+  Test.assert_eq(directive(test_run_budget("-- Run budget: 0 s\n")), 0 - 2)
+  Test.assert_eq(directive(test_run_budget("-- Run budget: 3601 s\n")), 0 - 2)
+  Test.assert_eq(directive(test_run_budget("-- Run budget: 4000 s\n")), 0 - 2)
+  Test.assert_eq(directive(test_run_budget("-- Run budget: 5\n")), 0 - 2)
+  Test.assert_eq(directive(test_run_budget("-- Run budget: s\n")), 0 - 2)
+  Test.assert_eq(directive(test_run_budget("-- Run budget: 5 seconds\n")), 0 - 2)
+  Test.assert_eq(directive(test_run_budget("-- Run budget: 5 s trailing\n")), 0 - 2)
+  Test.assert_eq(directive(test_run_budget("fn f() {}\n-- Run budget: 9 s\n")), 9)
+  Test.assert_eq(directive(test_run_budget("fn f() {} -- Run budget: 9 s\n")), 0 - 1)
+}
+
+test "test_run_limit_extends_but_never_shortens_the_host_stop" {
+  let host = settings_with("WEFT_TEST_RUN_TIMEOUT", "4")
+  Test.assert_eq(test_run_limit(host, "-- Run budget: 6 s\n").milliseconds(), 6000)
+  Test.assert_eq(test_run_limit(host, "-- Run budget: 1 s\n").milliseconds(), 4000)
+  Test.assert_eq(test_run_limit(host, "-- Run budget: 4 s\n").milliseconds(), 4000)
+  Test.assert_eq(test_run_limit(host, "-- Run budget: 0 s\n").milliseconds(), 4000)
+  Test.assert_eq(test_run_limit(host, "").milliseconds(), 4000)
+  let limits = settings_with_two("WEFT_TEST_COMPILE_TIMEOUT", "30", "WEFT_TEST_RUN_TIMEOUT", "4")
+  Test.assert_eq(test_root_limit(limits, "-- Run budget: 6 s\n").milliseconds(), 36000)
+  Test.assert_eq(test_root_limit(limits, "").milliseconds(), 34000)
+}
+
+-- Outcomes ------------------------------------------------------------------
+fn outcomes() -> List<TestOutcome> {
+  Cons(
+    TestPassed,
+    Cons(
+      TestFailed(1),
+      Cons(
+        TestFailed(137),
+        Cons(
+          TestFailed(255),
+          Cons(
+            TestTimedOut,
+            Cons(
+              TestUnsupervised,
+              Cons(
+                TestForeignExecutable,
+                Cons(
+                  TestUnwritable,
+                  Cons(
+                    TestResultInvalid,
+                    Cons(TestExitMismatch, Cons(TestNoExecutable, Nil<TestOutcome>()))
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+}
+
+fn round_trip(outcome: TestOutcome) -> i64 {
+  match test_outcome_from_code(test_outcome_code(outcome)) {
+    Some(decoded) -> test_outcome_code(decoded)
+    None -> 0 - 1
+  }
+}
+
+fn decodes(code: i64) -> bool {
+  match test_outcome_from_code(code) {
+    Some(_) -> true
+    None -> false
+  }
+}
+
+test "test_outcome_codes_round_trip_every_worker_outcome" {
+  for outcome in outcomes() { Test.assert_eq(round_trip(outcome), test_outcome_code(outcome)) }
+  Test.assert_eq(test_outcome_code(TestPassed), 0)
+  Test.assert_eq(test_outcome_code(TestTimedOut), 256)
+  Test.assert_eq(test_outcome_code(TestUnsupervised), 257)
+  Test.assert_eq(test_outcome_code(TestForeignExecutable), 258)
+  Test.assert_eq(test_outcome_code(TestUnwritable), 259)
+  Test.assert_eq(test_outcome_code(TestResultInvalid), 260)
+  Test.assert_eq(test_outcome_code(TestMemoryExceeded(4096)), 261)
+  Test.assert_eq(test_outcome_code(TestExitMismatch), 262)
+  Test.assert_eq(test_outcome_code(TestNoExecutable), 263)
+}
+
+test "test_outcome_codes_reject_supervisor_judgements_and_unknown_codes" {
+  -- Only the supervisor judges memory, so no worker may report it.
+  Test.assert_false(decodes(261))
+  Test.assert_false(decodes(0 - 1))
+  Test.assert_false(decodes(264))
+  Test.assert_true(decodes(255))
+}
+
+test "test_outcome_statuses_keep_executable_statuses_and_fold_the_rest_to_one" {
+  Test.assert_eq(test_outcome_status(TestPassed), 0)
+  Test.assert_eq(test_outcome_status(TestFailed(7)), 7)
+  Test.assert_eq(test_outcome_status(TestFailed(137)), 137)
+  Test.assert_eq(test_outcome_status(TestTimedOut), 1)
+  Test.assert_eq(test_outcome_status(TestMemoryExceeded(1)), 1)
+  Test.assert_eq(test_outcome_status(TestNoExecutable), 1)
+  Test.assert_eq(test_outcome_code(test_outcome_from_status(0)), 0)
+  Test.assert_eq(test_outcome_code(test_outcome_from_status(3)), 3)
+}
+
+test "test_report_lines_name_the_root_time_and_reason" {
+  let ms = time.milliseconds(42)
+  Test.assert_str_eq(
+    test_report_line("test/a.weft", TestPassed, ms),
+    "  pass: test/a.weft (42 ms)\n"
+  )
+  Test.assert_str_eq(
+    test_report_line("test/a.weft", TestFailed(1), ms),
+    "  FAIL: test/a.weft (42 ms, exit 1)\n"
+  )
+  Test.assert_str_eq(
+    test_report_line("a.weft", TestFailed(137), ms),
+    "  FAIL: a.weft (42 ms, exit 137)\n"
+  )
+  Test.assert_str_eq(
+    test_report_line("a.weft", TestTimedOut, ms),
+    "  FAIL: a.weft (42 ms, timeout)\n"
+  )
+  Test.assert_str_eq(
+    test_report_line("a.weft", TestNoExecutable, ms),
+    "  FAIL: a.weft (42 ms, emission produced no executable)\n"
+  )
+  Test.assert_str_eq(
+    test_report_line("a.weft", TestMemoryExceeded(2048), ms),
+    "  FAIL: a.weft (42 ms, peak RSS 2 KB exceeded limit)\n"
+  )
+  -- Peaks round up to whole KiB.
+  Test.assert_str_eq(
+    test_report_line("a.weft", TestMemoryExceeded(1025), ms),
+    "  FAIL: a.weft (42 ms, peak RSS 2 KB exceeded limit)\n"
+  )
+  for outcome in Cons(
+    TestUnsupervised,
+    Cons(
+      TestForeignExecutable,
+      Cons(TestUnwritable, Cons(TestResultInvalid, Cons(TestExitMismatch, Nil<TestOutcome>())))
+    )
+  ) {
+    Test.assert_str_eq(
+      test_report_line("a.weft", outcome, ms),
+      "  FAIL: a.weft (42 ms, exit 1)\n"
+    )
+  }
+  Test.assert_str_eq(
+    test_report_line("tést/ünï.weft", TestPassed, time.milliseconds(0)),
+    "  pass: tést/ünï.weft (0 ms)\n"
+  )
+}
+
+test "test_summary_counts_roots_and_failed_inputs" {
+  let nothing = test_summary(0, 0, 0)
+  Test.assert_str_eq(nothing.text, "test: no test files provided\n\n0 passed, 1 failed\n")
+  Test.assert_false(nothing.succeeded)
+  let clean = test_summary(3, 0, 0)
+  Test.assert_str_eq(clean.text, "\n3 passed, 0 failed\n")
+  Test.assert_true(clean.succeeded)
+  let mixed = test_summary(3, 1, 2)
+  Test.assert_str_eq(mixed.text, "\n2 passed, 3 failed\n")
+  Test.assert_false(mixed.succeeded)
+  -- An input that named nothing is a failure, not an empty invocation.
+  let unmatched = test_summary(0, 0, 1)
+  Test.assert_str_eq(unmatched.text, "\n0 passed, 1 failed\n")
+  Test.assert_false(unmatched.succeeded)
+}
+
+-- Records -------------------------------------------------------------------
+fn counts(text: str) -> str {
+  match test_counts_parse(text) {
+    Some(parsed) -> i"{parsed.passed}/{parsed.failed}/{parsed.total}"
+    None -> "invalid"
+  }
+}
+
+test "test_result_records_round_trip_and_must_add_up" {
+  let record = test_counts_render(TestCounts { passed: 9, failed: 1, total: 10 })
+  Test.assert_str_eq(record, "WEFT_TEST_RESULT 1 9 1 10\n")
+  Test.assert_str_eq(counts(record), "9/1/10")
+  Test.assert_str_eq(counts("WEFT_TEST_RESULT 1 0 0 0\n"), "0/0/0")
+  Test.assert_str_eq(counts("WEFT_TEST_RESULT 1 007 0 7\n"), "7/0/7")
+  Test.assert_str_eq(counts("WEFT_TEST_RESULT 1 9 1 11\n"), "invalid")
+  Test.assert_str_eq(counts("WEFT_TEST_RESULT 1 9 1 10"), "invalid")
+  Test.assert_str_eq(counts("WEFT_TEST_RESULT 1 9 1 10\nmore"), "invalid")
+  Test.assert_str_eq(counts("WEFT_TEST_RESULT 1 9 1 10 0\n"), "invalid")
+  Test.assert_str_eq(counts("WEFT_TEST_RESULT 1 9  1 10\n"), "invalid")
+  Test.assert_str_eq(counts("WEFT_TEST_RESULT 1 -1 1 0\n"), "invalid")
+  Test.assert_str_eq(counts("WEFT_TEST_RESULT 2 9 1 10\n"), "invalid")
+  Test.assert_str_eq(counts("WEFT_TEST_METRIC 1 9 1 10\n"), "invalid")
+  Test.assert_str_eq(counts(""), "invalid")
+}
+
+fn measure(outcome: TestOutcome) -> TestMeasure {
+  TestMeasure {
+    outcome: outcome,
+    compile_millis: 11,
+    link_millis: 2,
+    run_millis: 33,
+    user_micros: 4400,
+    system_micros: 55,
+    peak_rss_bytes: 6600000
+  }
+}
+
+fn measured(text: str) -> str {
+  match test_measure_parse(text) {
+    Some(parsed) -> {
+      let code = test_outcome_code(parsed.outcome)
+      i"{code} {parsed.compile_millis} {parsed.link_millis} {parsed.run_millis} {parsed.user_micros} {parsed.system_micros} {parsed.peak_rss_bytes}"
+    }
+    None -> "invalid"
+  }
+}
+
+test "test_measure_records_round_trip_every_worker_outcome" {
+  Test.assert_str_eq(
+    test_measure_render(measure(TestPassed)),
+    "WEFT_TEST_METRIC 1 0 11 2 33 4400 55 6600000\n"
+  )
+  for outcome in outcomes() {
+    let code = test_outcome_code(outcome)
+    Test.assert_str_eq(
+      measured(test_measure_render(measure(outcome))),
+      i"{code} 11 2 33 4400 55 6600000"
+    )
+  }
+}
+
+test "test_measure_records_reject_supervisor_codes_and_malformed_fields" {
+  Test.assert_str_eq(measured(test_measure_render(measure(TestMemoryExceeded(9)))), "invalid")
+  Test.assert_str_eq(measured("WEFT_TEST_METRIC 1 0 11 2 33 4400 55\n"), "invalid")
+  Test.assert_str_eq(measured("WEFT_TEST_METRIC 1 0 11 2 33 4400 55 66 77\n"), "invalid")
+  Test.assert_str_eq(measured("WEFT_TEST_METRIC 1 999 11 2 33 4400 55 66\n"), "invalid")
+  Test.assert_str_eq(measured("WEFT_TEST_RESULT 1 0 11 2 33 4400 55 66\n"), "invalid")
+}
+
+test "test_scratch_paths_are_private_to_process_and_root" {
+  Test.assert_str_eq(test_scratch_text(TestExecutableFile, 812, 3), "/tmp/weft-test-812-3")
+  Test.assert_str_eq(test_scratch_text(TestResultFile, 812, 3), "/tmp/weft-test-result-812-3")
+  Test.assert_str_eq(test_scratch_text(TestMeasureFile, 812, 0), "/tmp/weft-test-metric-812-0")
+  match test_scratch_path(TestMeasureFile, 1, 2).to_utf8() {
+    Ok(text) -> Test.assert_str_eq(text, "/tmp/weft-test-metric-1-2")
+    Err(_) -> Test.assert_true(false)
+  }
+}
+
+-- Totals --------------------------------------------------------------------
+fn usage(user: i64, system: i64, peak: i64) -> SupervisedUsage {
+  SupervisedUsage { user_micros: user, system_micros: system, peak_rss_bytes: peak }
+}
+
+fn totals_text(totals: TestTotals) -> str {
+  i"{totals.measured} {totals.compile_millis} {totals.link_millis} {totals.run_millis} {totals.user_micros} {totals.system_micros} {totals.peak_rss_bytes}"
+}
+
+test "test_totals_add_worker_usage_and_measures" {
+  let empty = test_totals_empty()
+  Test.assert_str_eq(totals_text(empty), "0 0 0 0 0 0 0")
+  -- A worker without a measure still contributes its own usage.
+  let unmeasured = test_totals_add(empty, usage(10, 20, 700), None<TestMeasure>())
+  Test.assert_str_eq(totals_text(unmeasured), "0 0 0 0 10 20 700")
+  let measured_once = test_totals_add(
+    unmeasured,
+    usage(1, 2, 300),
+    Some<TestMeasure>(measure(TestPassed))
+  )
+  Test.assert_str_eq(totals_text(measured_once), "1 11 2 33 4411 77 6600000")
+  let again = test_totals_add(
+    measured_once,
+    usage(0, 0, 9000000),
+    Some<TestMeasure>(measure(TestPassed))
+  )
+  Test.assert_str_eq(totals_text(again), "2 22 4 66 8811 132 9000000")
+  Test.assert_eq(test_root_peak(usage(0, 0, 500), None<TestMeasure>()), 500)
+  Test.assert_eq(
+    test_root_peak(usage(0, 0, 500), Some<TestMeasure>(measure(TestPassed))),
+    6600000
+  )
+  Test.assert_eq(
+    test_root_peak(usage(0, 0, 7000000), Some<TestMeasure>(measure(TestPassed))),
+    7000000
+  )
+}
+
+test "test_measures_report_both_schema_three_and_its_reading" {
+  let plan = TestPlanTotals {
+    groups: 1,
+    roots: 2,
+    reused_pairs: 40,
+    optimised_groups: 1,
+    optimised_roots: 2,
+    reused_optimised_functions: 17,
+    query_hits: 5,
+    query_misses: 6,
+    query_executions: 7
+  }
+  let report = test_measures_report(
+    TestRunMeasures {
+      roots: 3,
+      wall: time.milliseconds(900),
+      discovery: time.milliseconds(8),
+      planning: time.milliseconds(90),
+      totals: test_totals_add(
+        test_totals_empty(),
+        usage(0, 0, 2048),
+        Some<TestMeasure>(measure(TestPassed))
+      ),
+      plan: plan
+    }
+  )
+  Test.assert_str_eq(
+    report,
+    "WEFT_TEST_METRICS 3 3 1 900 8 90 11 2 33 4400 55 6600000 1 2 40 5 6 7 1 2 17\ntest metrics: roots=3 measured=1 wall_ms=900 discovery_ms=8 planning_ms=90 compile_ms_sum=11 link_ms_sum=2 run_ms_sum=33 cpu_user_us_sum=4400 cpu_system_us_sum=55 peak_rss_kb=6446 shared_groups=1 shared_roots=2 reused_checked_pairs=40 query_hits=5 query_misses=6 query_executions=7 optimised_product_groups=1 optimised_product_roots=2 reused_optimised_functions=17\n"
+  )
+}
+
+-- Discovery -----------------------------------------------------------------
+-- A deterministic filesystem. `root/loop` and `root/alias` lead back to
+-- directories already reached; `root/locked` cannot be listed.
+fn native(text: str) -> Path {
+  match path.from_utf8(text) {
+    Ok(value) -> value
+    Err(_) -> panic("fixture paths are text")
+  }
+}
+
+fn text_of(value: Path) -> str {
+  match value.to_utf8() {
+    Ok(text) -> text
+    Err(_) -> ""
+  }
+}
+
+fn entries(names: List<str>) -> Result<Vector<Path>, IoError> {
+  let out: Vector<Path> = vector.new<Path>()
+  for name in names { vector_push<Path>(out, native(name)) }
+  Ok<Vector<Path>, IoError>(out)
+}
+
+fn fake_list(directory: str) -> Result<Vector<Path>, IoError> {
+  if directory == "root" or directory == "root/" {
+    entries(
+      Cons(
+        "b.weft",
+        Cons(
+          "a.weft",
+          Cons(
+            "nested",
+            Cons(
+              "notes.txt",
+              Cons("loop", Cons("empty", Cons("locked", Cons("dir.weft", Nil<str>()))))
+            )
+          )
+        )
+      )
+    )
+  } else if directory == "root/nested" {
+    entries(Cons("c.weft", Cons("alias", Cons("deeper", Nil<str>()))))
+  } else if directory == "root/nested/deeper" {
+    entries(Cons("d.weft", Nil<str>()))
+  } else if directory == "root/empty" or directory == "root/dir.weft" {
+    entries(Nil<str>())
+  } else if directory == "." {
+    entries(
+      Cons(
+        "x_pass.weft",
+        Cons("y_pass.weft", Cons("z_fail.weft", Cons("q_pass.weft", Nil<str>())))
+      )
+    )
+  } else if directory == "root/locked" or directory == "/denied" {
+    Err<Vector<Path>, IoError>(IoPermissionDenied)
+  } else { Err<Vector<Path>, IoError>(IoNotFound) }
+}
+
+fn metadata(kind: DirKind, inode: i64) -> Result<DirMetadata, IoError> {
+  Ok<DirMetadata, IoError>(
+    DirMetadata { exists: true, kind: kind, size: 0, modified_millis: 0, device: 1, inode: inode }
+  )
+}
+
+fn absent() -> Result<DirMetadata, IoError> {
+  Ok<DirMetadata, IoError>(
+    DirMetadata {
+      exists: false,
+      kind: DirOther,
+      size: 0,
+      modified_millis: 0,
+      device: 0,
+      inode: 0
+    }
+  )
+}
+
+fn fake_stat(target: str) -> Result<DirMetadata, IoError> {
+  if target == "root" or target == "root/" or target == "root/loop" or target == "root//loop" {
+    metadata(DirDirectory, 1)
+  } else if target == "root/nested" or target == "root/nested/alias" {
+    metadata(DirDirectory, 2)
+  } else if target == "root/nested/deeper" {
+    metadata(DirDirectory, 3)
+  } else if target == "root/empty" {
+    metadata(DirDirectory, 4)
+  } else if target == "root/locked" {
+    metadata(DirDirectory, 5)
+  } else if target == "root/dir.weft" or target == "q_pass.weft" {
+    metadata(DirDirectory, 6)
+  } else if target == "root/unstatable.weft" {
+    Err<DirMetadata, IoError>(IoPermissionDenied)
+  } else if target == "root/missing" or target == "missing.weft" {
+    absent()
+  } else { metadata(DirFile, 100) }
+}
+
+fn discovered(inputs: Vector<str>) -> TestDiscovery {
+  handle test_discover(inputs) {
+    DirInspect.list(directory) -> resume(fake_list(text_of(directory)))
+    DirInspect.stat(target) -> resume(fake_stat(text_of(target)))
+    DirInspect.lstat(target) -> resume(fake_stat(text_of(target)))
+    DirInspect.current() -> resume(Err<Path, IoError>(IoNotFound))
+  }
+}
+
+fn problems(discovery: TestDiscovery) -> str {
+  let found = discovery.problems
+  let mut out = builder.new()
+  for index in 0..vector_len<TestDiscoveryProblem>(found) {
+    out.append(test_problem_text(vector_get_in_bounds<TestDiscoveryProblem>(found, index)))
+  }
+  out.finish()
+}
+
+test "test_discovery_walks_a_tree_in_byte_order_and_breaks_cycles" {
+  let tree = discovered(args1("root"))
+  Test.assert_str_eq(
+    joined(tree.roots),
+    "root/a.weft|root/b.weft|root/nested/c.weft|root/nested/deeper/d.weft"
+  )
+  -- The locked subdirectory fails the input, but the rest of the tree remains.
+  Test.assert_str_eq(problems(tree), "test: could not list directory: root/locked\n")
+  Test.assert_eq(tree.failed_inputs, 1)
+}
+
+test "test_discovery_joins_a_trailing_slash_directory_once" {
+  let tree = discovered(args1("root/"))
+  Test.assert_str_eq(
+    joined(tree.roots),
+    "root/a.weft|root/b.weft|root/nested/c.weft|root/nested/deeper/d.weft"
+  )
+}
+
+test "test_discovery_reports_a_tree_without_weft_files" {
+  let empty = discovered(args1("root/empty"))
+  Test.assert_str_eq(joined(empty.roots), "")
+  Test.assert_str_eq(problems(empty), "test: no .weft files in directory: root/empty\n")
+  Test.assert_eq(empty.failed_inputs, 1)
+  let locked = discovered(args1("root/locked"))
+  Test.assert_str_eq(problems(locked), "test: could not list directory: root/locked\n")
+  Test.assert_eq(locked.failed_inputs, 1)
+}
+
+test "test_discovery_keeps_files_as_given_and_deduplicates_inputs" {
+  let files = discovered(args4("root/b.weft", "missing.weft", "root/nested", "root/b.weft"))
+  Test.assert_str_eq(
+    joined(files.roots),
+    "missing.weft|root/b.weft|root/nested/c.weft|root/nested/deeper/d.weft"
+  )
+  Test.assert_eq(files.failed_inputs, 0)
+  Test.assert_str_eq(problems(files), "")
+  Test.assert_str_eq(joined(discovered(args0()).roots), "")
+}
+
+test "test_discovery_expands_patterns_over_files_only" {
+  let pattern = discovered(args1("?_pass.weft"))
+  -- `q_pass.weft` is a directory and does not match.
+  Test.assert_str_eq(joined(pattern.roots), "x_pass.weft|y_pass.weft")
+  Test.assert_eq(pattern.failed_inputs, 0)
+  let prefixed = discovered(args1("root/*.weft"))
+  Test.assert_str_eq(joined(prefixed.roots), "root/a.weft|root/b.weft")
+  -- A pattern that only repeats an explicit input still matched.
+  let overlap = discovered(args2("root/a.weft", "root/a*"))
+  Test.assert_str_eq(joined(overlap.roots), "root/a.weft")
+  Test.assert_eq(overlap.failed_inputs, 0)
+}
+
+test "test_discovery_reports_unmatched_and_unreadable_patterns" {
+  let unmatched = discovered(args1("root/nope*.weft"))
+  Test.assert_str_eq(problems(unmatched), "test: no test files matched: root/nope*.weft\n")
+  Test.assert_eq(unmatched.failed_inputs, 1)
+  let unreadable = discovered(args1("/denied/*.weft"))
+  Test.assert_str_eq(problems(unreadable), "test: could not expand pattern: /denied/*.weft\n")
+  let both = discovered(args3("root/nope*", "root/a.weft", "/denied/?"))
+  Test.assert_str_eq(joined(both.roots), "root/a.weft")
+  Test.assert_eq(both.failed_inputs, 2)
+  Test.assert_str_eq(
+    problems(both),
+    "test: no test files matched: root/nope*\ntest: could not expand pattern: /denied/?\n"
+  )
+}
+
+test "test_glob_matches_literal_single_and_run_wildcards" {
+  Test.assert_true(test_glob_matches("a_pass.weft", "?_pass.weft"))
+  Test.assert_false(test_glob_matches("ab_pass.weft", "?_pass.weft"))
+  Test.assert_true(test_glob_matches("ab", "a*b"))
+  Test.assert_true(test_glob_matches("axxxb", "a*b"))
+  Test.assert_false(test_glob_matches("axxxc", "a*b"))
+  Test.assert_true(test_glob_matches("xaybzb", "*a*b"))
+  Test.assert_true(test_glob_matches(".weft", "*.weft"))
+  Test.assert_true(test_glob_matches("anything", "*"))
+  Test.assert_true(test_glob_matches("abc", "abc**"))
+  Test.assert_false(test_glob_matches("abc", "abcd"))
+  Test.assert_false(test_glob_matches("abcd", "abc"))
+  Test.assert_true(test_glob_matches("", ""))
+  Test.assert_false(test_glob_matches("a", ""))
+  Test.assert_true(test_glob_matches("ünï.weft", "*.weft"))
+}

@@ -7153,6 +7153,17 @@ test_timeout_err=$(<"$tmp_err")
 assert_contains "test_timeout_preserves_exact_worker_status" "$test_timeout_err" "  FAIL: $tmp_test_timeout ("
 assert_contains "test_timeout_reports_reason" "$test_timeout_err" ", timeout)"
 
+# An executable-style root is stopped the same way. Its stop is a timeout,
+# not an exit status that mismatched its directive.
+printf -- '-- Expected exit code: 0\nfn main() -> i64 {\n  let mut spins = 0\n  while true { spins = spins + 1 }\n  spins\n}\n' > "$tmp_test_timeout"
+set +e
+env WEFT_TEST_COMPILE_TIMEOUT=30 WEFT_TEST_RUN_TIMEOUT=1 "$WEFT" test --jobs 1 "$tmp_test_timeout" > "$tmp_out" 2>"$tmp_err"
+test_program_timeout_exit=$?
+set -e
+assert_equals "test_program_timeout_returns_failure" "$test_program_timeout_exit" "1"
+assert_contains "test_program_timeout_reports_reason" "$(<"$tmp_err")" ", timeout)"
+assert_not_contains "test_program_timeout_is_not_an_exit_mismatch" "$(<"$tmp_err")" "legacy main exited"
+
 # A root that legitimately runs a whole-compiler pipeline declares its run-phase
 # runaway stop. The declaration extends the host stop and never shortens it;
 # every root without one keeps the host stop.

@@ -1,0 +1,1232 @@
+-- compiler/tool/test.weft -- the `weft test` command's policy and records
+--
+-- Arguments, environment settings, root directives, root outcomes, worker
+-- measures, totals and reports are values here. The compiler CLI owns
+-- compilation and supervision. Settings read `Env`, discovery reads the
+-- filesystem through `DirInspect` alone, and the scratch-record, report and
+-- pause leaves name exactly the capability each needs; everything else is
+-- pure.
+
+use runtime/tool_platform.{
+  Supervise,
+  SupervisedChild,
+  SupervisedEnded,
+  SupervisedExit,
+  SupervisedFailed,
+  SupervisedForkFailed,
+  SupervisedParent,
+  SupervisedProcess,
+  SupervisedStopped,
+  SupervisedTermination,
+  SupervisedUsage
+}
+use stdlib/bytes as bytes
+use stdlib/bytes.{bytes_storage}
+use stdlib/console as console
+use stdlib/console.{ConsoleWrite}
+use stdlib/dir as dir
+use stdlib/dir.{DirDirectory, DirInspect, DirKind, DirMutate}
+use stdlib/env.{Env}
+use stdlib/file as file
+use stdlib/file.{FileRead, FileWrite}
+use stdlib/option.{None, Option, Some}
+use stdlib/ord.{Less, Ord}
+use stdlib/panic.{panic}
+use stdlib/path as path
+use stdlib/path.{Path}
+use stdlib/process.{ProcExited, ProcSignaled, ProcTermination}
+use stdlib/result.{Err, Ok}
+use stdlib/sorted_set as sorted_set
+use stdlib/sorted_set.{SortedSet}
+use stdlib/string.{str_byte_at, str_find, str_len, str_slice_bytes, str_starts_with}
+use stdlib/time as time
+use stdlib/time.{Duration}
+use stdlib/time/monotonic as monotonic
+use stdlib/time/monotonic.{Instant, MonotonicClock}
+use stdlib/time/sleep as sleep
+use stdlib/time/sleep.{Sleep}
+use stdlib/vector as vector
+use stdlib/vector.{
+  Vector,
+  vector_get_in_bounds,
+  vector_insert_at,
+  vector_len,
+  vector_push,
+  vector_set
+}
+
+-- Command -------------------------------------------------------------------
+--- What one `weft test` invocation asks for.
+pub(package) type TestCommand {
+  --- Compile standard input and write its test executable to standard output.
+  TestEmitInput,
+  --- Compile one root file and write its test executable to standard output.
+  TestEmitPath(str),
+  --- Discover, compile and run roots with this many concurrent workers.
+  TestRunInputs(Vector<str>, i64),
+  --- The arguments do not form a command.
+  TestUsage,
+  --- `--jobs` is not an integer from 1 to 64.
+  TestInvalidJobs
+}
+
+--- Interpret the arguments that follow `test`.
+pub(package) fn test_command(args: Vector<str>) -> TestCommand {
+  let count = vector_len<str>(args)
+  if count == 0 { return TestEmitInput }
+  let first = vector_get_in_bounds<str>(args, 0)
+  if first == "--emit" {
+    if count == 1 { TestEmitInput }
+    else if count == 2 { TestEmitPath(vector_get_in_bounds<str>(args, 1)) }
+    else { TestUsage }
+  } else if first == "--jobs" or first == "-j" {
+    if count < 3 { TestUsage }
+    else {
+      match test_jobs(vector_get_in_bounds<str>(args, 1)) {
+        Some(jobs) -> TestRunInputs(test_arguments_from(args, 2), jobs)
+        None -> TestInvalidJobs
+      }
+    }
+  } else { TestRunInputs(args, 4) }
+}
+
+fn test_arguments_from(args: Vector<str>, first: i64) -> Vector<str> {
+  let rest: Vector<str> = vector.new<str>()
+  for index in first..vector_len<str>(args) {
+    vector_push<str>(rest, vector_get_in_bounds<str>(args, index))
+  }
+  rest
+}
+
+--- A worker count: a decimal from 1 to 64.
+pub(package) fn test_jobs(text: str) -> Option<i64> { test_positive(text, 64) }
+
+fn test_is_digit(byte: i64) -> bool { byte >= 48 and byte <= 57 }
+
+-- A nonempty run of ASCII digits whose value does not exceed `maximum`.
+fn test_decimal(text: str, maximum: i64) -> Option<i64> {
+  let n = str_len(text)
+  if n == 0 { return None<i64>() }
+  let mut value = 0
+  for index in 0..n {
+    let byte = str_byte_at(text, index)
+    if not test_is_digit(byte) { return None<i64>() }
+    value = value * 10 + byte - 48
+    if value > maximum { return None<i64>() }
+  }
+  Some<i64>(value)
+}
+
+fn test_positive(text: str, maximum: i64) -> Option<i64> {
+  match test_decimal(text, maximum) {
+    Some(value) -> if value > 0 { Some<i64>(value) } else { None<i64>() }
+    None -> None<i64>()
+  }
+}
+
+-- Settings ------------------------------------------------------------------
+--- The runner's environment policy, read once per invocation.
+pub(package) type TestSettings {
+  --- The stop applied to each root's compilation.
+  compile_limit: Duration,
+  --- The stop applied to each root's run unless the root declares a longer one.
+  run_limit: Duration,
+  --- The peak resident set, in KiB, a passing root may reach.
+  memory_limit_kb: Option<i64>,
+  --- Build every root with the heap that quarantines freed objects.
+  quarantine: bool,
+  --- When roots with one dependency closure share a checked product.
+  checked_sharing: TestCheckedSharing,
+  --- When a sharing group also builds an optimised dependency product.
+  optimised_sharing: TestOptimisedSharing,
+  --- Trace how roots are grouped around shared dependency products.
+  plan_trace: bool,
+  --- Report aggregate measurements after the summary.
+  report_metrics: bool
+}
+
+--- When roots with one dependency closure share one checked product.
+pub(package) type TestCheckedSharing {
+  --- Only when the group fills a worker wave, so retaining its checked graph
+  --- in the runner repays the serial preparation.
+  TestShareFullWaves,
+  --- Whenever two roots agree.
+  TestShareAlways
+}
+
+--- When a sharing group also builds an optimised dependency product.
+pub(package) type TestOptimisedSharing {
+  --- Only for groups whose worker waves repay its serial construction.
+  TestOptimiseRepaid,
+  --- For every sharing group.
+  TestOptimiseAlways,
+  --- Never.
+  TestOptimiseNever
+}
+
+--- Read the runner's settings. An invalid value reads as unset.
+pub(package) fn test_settings() -[Env]> TestSettings {
+  let compile_memory = test_env_positive("WEFT_TEST_COMPILE_RSS_LIMIT_KB", 1000000000)
+  let run_memory = test_env_positive("WEFT_TEST_RUN_RSS_LIMIT_KB", 1000000000)
+  -- Forcing products shares every agreeing group; disabling optimised
+  -- products still leaves checked sharing to that policy.
+  let forced = test_env_flag("WEFT_TEST_OPTIMISED_PRODUCTS")
+  TestSettings {
+    compile_limit: test_env_seconds("WEFT_TEST_COMPILE_TIMEOUT"),
+    run_limit: test_env_seconds("WEFT_TEST_RUN_TIMEOUT"),
+    memory_limit_kb: test_smaller_limit(compile_memory, run_memory),
+    quarantine: test_env_flag("WEFT_TEST_RC_QUARANTINE"),
+    checked_sharing: if forced { TestShareAlways } else { TestShareFullWaves },
+    optimised_sharing: if test_env_flag("WEFT_TEST_DISABLE_OPTIMISED_PRODUCTS") {
+      TestOptimiseNever
+    } else if forced { TestOptimiseAlways } else { TestOptimiseRepaid },
+    plan_trace: test_env_flag("WEFT_TEST_PLAN_TRACE"),
+    report_metrics: test_env_flag("WEFT_TEST_METRICS")
+  }
+}
+
+--- The settings of an empty environment, used by emission-only commands.
+pub(package) fn test_settings_unset() -> TestSettings {
+  handle test_settings() {
+    Env.arg_count() -> resume(0)
+    Env.arg(index) -> resume(nil)
+    Env.var(name) -> resume(nil)
+  }
+}
+
+fn test_env_flag(name: str) -[Env]> bool {
+  match Env.var(name) {
+    value: str -> value == "1"
+    nil -> false
+  }
+}
+
+fn test_env_positive(name: str, maximum: i64) -[Env]> Option<i64> {
+  match Env.var(name) {
+    value: str -> test_positive(value, maximum)
+    nil -> None<i64>()
+  }
+}
+
+-- A phase stop in whole seconds, up to one day; two minutes when unset.
+fn test_env_seconds(name: str) -[Env]> Duration {
+  match test_env_positive(name, 86400) {
+    Some(seconds) -> time.seconds(seconds)
+    None -> time.seconds(120)
+  }
+}
+
+fn test_smaller_limit(first: Option<i64>, second: Option<i64>) -> Option<i64> {
+  match first {
+    None -> second
+    Some(left) -> match second {
+      None -> first
+      Some(right) -> if right < left { second } else { first }
+    }
+  }
+}
+
+-- Product sharing ---------------------------------------------------------
+--- The group sizes at which planning shares products.
+pub(package) type TestGroupThresholds { checked_min_roots: i64, optimised_min_roots: i64 }
+
+--- The sharing thresholds for `roots` roots over `jobs` workers.
+pub(package) fn test_group_thresholds(
+  settings: TestSettings,
+  roots: i64,
+  jobs: i64
+) -> TestGroupThresholds {
+  TestGroupThresholds {
+    -- A retained checked graph pays for serial preparation only when its
+    -- users fill an available worker wave. Smaller groups check independently
+    -- in workers, which releases their private compiler state on completion.
+    checked_min_roots: match settings.checked_sharing {
+      TestShareAlways -> 2
+      TestShareFullWaves -> if roots < jobs { roots } else { jobs }
+    },
+    -- Product construction is serial in the runner while root-local savings
+    -- accrue once per worker wave. The measured compiler-sized product
+    -- repays its construction after three complete waves; smaller groups
+    -- keep checked-product reuse without paying the backend cost.
+    optimised_min_roots: match settings.optimised_sharing {
+      TestOptimiseNever -> roots + 1
+      TestOptimiseAlways -> 2
+      TestOptimiseRepaid -> jobs * 3 + 1
+    }
+  }
+}
+
+--- Whether `group_roots` roots sharing `pair_count` checked declaration and
+--- function pairs share one checked product: the group must meet its
+--- threshold and together avoid rechecking at least 32 pairs.
+pub(package) fn test_group_shares(
+  thresholds: TestGroupThresholds,
+  group_roots: i64,
+  pair_count: i64
+) -> bool {
+  let reused_roots = group_roots - 1
+  if reused_roots <= 0 or group_roots < thresholds.checked_min_roots { false }
+  else { pair_count >= (32 + reused_roots - 1) / reused_roots }
+}
+
+--- Whether a sharing group of `group_roots` roots also builds its optimised product.
+pub(package) fn test_group_optimises(thresholds: TestGroupThresholds, group_roots: i64) -> bool {
+  group_roots >= thresholds.optimised_min_roots
+}
+
+-- Root directives -----------------------------------------------------------
+--- A numeric header directive of a test root.
+pub(package) type TestDirective {
+  TestDirectiveAbsent,
+  TestDirectiveValue(i64),
+  --- The directive is present but its value is missing, malformed or too large.
+  TestDirectiveMalformed
+}
+
+-- A directive is a whole line: the first line that begins with `prefix`,
+-- then decimal digits below `limit`, then `suffix`, then the end of the line.
+-- Text elsewhere in a line, such as a string literal, never declares one.
+fn test_directive_line(text: str, prefix: str) -> i64 {
+  if str_starts_with(text, prefix) == 1 { return 0 }
+  let found = str_find(text, "\n".concat(prefix))
+  if found < 0 { 0 - 1 } else { found + 1 }
+}
+
+fn test_numeric_directive(text: str, prefix: str, suffix: str, limit: i64) -> TestDirective {
+  let start = test_directive_line(text, prefix)
+  if start < 0 { return TestDirectiveAbsent }
+  let n = str_len(text)
+  let digits = start + str_len(prefix)
+  let mut end = digits
+  let mut value = 0
+  while end < n and test_is_digit(str_byte_at(text, end)) and value < limit {
+    value = value * 10 + str_byte_at(text, end) - 48
+    end = end + 1
+  }
+  let suffix_len = str_len(suffix)
+  let suffixed = end + suffix_len <= n and str_slice_bytes(text, end, suffix_len) == suffix
+  let line_end = if suffixed { end + suffix_len } else { end }
+  let terminated = line_end == n or str_byte_at(text, line_end) == 10 or
+    str_byte_at(text, line_end) == 13
+  if end == digits or not suffixed or not terminated or value >= limit { TestDirectiveMalformed }
+  else { TestDirectiveValue(value) }
+}
+
+--- `-- Expected exit code: N` marks an executable-style root whose `main`
+--- must exit with N, from 0 to 123; 124 and 125 stay reserved for runner stops.
+pub(package) fn test_expected_exit(text: str) -> TestDirective {
+  test_numeric_directive(text, "-- Expected exit code: ", "", 124)
+}
+
+--- `-- Run budget: N s`, from 1 to 3600, extends a root's run stop.
+pub(package) fn test_run_budget(text: str) -> TestDirective {
+  match test_numeric_directive(text, "-- Run budget: ", " s", 3601) {
+    TestDirectiveValue(seconds) -> if seconds == 0 { TestDirectiveMalformed } else {
+      TestDirectiveValue(seconds)
+    }
+    other -> other
+  }
+}
+
+--- A root's run stop: its declared budget when longer than the host's stop.
+--- A declaration never shortens the host's stop.
+pub(package) fn test_run_limit(settings: TestSettings, text: str) -> Duration {
+  match test_run_budget(text) {
+    TestDirectiveValue(seconds) -> {
+      let declared = time.seconds(seconds)
+      if declared.milliseconds() > settings.run_limit.milliseconds() { declared }
+      else { settings.run_limit }
+    }
+    _ -> settings.run_limit
+  }
+}
+
+--- A root's whole stop from the start of its worker: compilation plus run.
+pub(package) fn test_root_limit(settings: TestSettings, text: str) -> Duration {
+  settings.compile_limit.add(test_run_limit(settings, text))
+}
+
+-- Outcomes ------------------------------------------------------------------
+--- How one root ended.
+pub(package) type TestOutcome {
+  --- Every test passed, or the program exited with its declared status.
+  TestPassed,
+  --- Diagnosed failures report 1; an executable reports its exit status, or
+  --- 128 plus the signal that ended it.
+  TestFailed(i64),
+  --- The root passed its stop and was killed.
+  TestTimedOut,
+  --- The platform could not start, observe or reap a process.
+  TestUnsupervised,
+  --- Emission produced a binary format the host cannot execute.
+  TestForeignExecutable,
+  --- The executable could not be written.
+  TestUnwritable,
+  --- The executable's structured result was missing, malformed or
+  --- contradicted its exit status.
+  TestResultInvalid,
+  --- A passing root exceeded the memory limit, with its peak in bytes.
+  TestMemoryExceeded(i64),
+  --- An executable-style root exited with another status than declared.
+  TestExitMismatch,
+  --- Emission refused to produce an executable.
+  TestNoExecutable
+}
+
+--- A worker's outcome on the measure wire, where 0 to 255 are statuses.
+pub(package) fn test_outcome_code(outcome: TestOutcome) -> i64 {
+  match outcome {
+    TestPassed -> 0
+    TestFailed(status) -> status
+    TestTimedOut -> 256
+    TestUnsupervised -> 257
+    TestForeignExecutable -> 258
+    TestUnwritable -> 259
+    TestResultInvalid -> 260
+    TestMemoryExceeded(peak) -> 261
+    TestExitMismatch -> 262
+    TestNoExecutable -> 263
+  }
+}
+
+--- The outcome a worker's measure names. Only the supervisor judges memory,
+--- so no worker reports an exceeded limit.
+pub(package) fn test_outcome_from_code(code: i64) -> Option<TestOutcome> {
+  if code == 0 { Some<TestOutcome>(TestPassed) }
+  else if code > 0 and code < 256 { Some<TestOutcome>(TestFailed(code)) }
+  else if code == 256 { Some<TestOutcome>(TestTimedOut) }
+  else if code == 257 { Some<TestOutcome>(TestUnsupervised) }
+  else if code == 258 { Some<TestOutcome>(TestForeignExecutable) }
+  else if code == 259 { Some<TestOutcome>(TestUnwritable) }
+  else if code == 260 { Some<TestOutcome>(TestResultInvalid) }
+  else if code == 262 { Some<TestOutcome>(TestExitMismatch) }
+  else if code == 263 { Some<TestOutcome>(TestNoExecutable) }
+  else { None<TestOutcome>() }
+}
+
+--- The status a worker process exits with.
+pub(package) fn test_outcome_status(outcome: TestOutcome) -> i64 {
+  match outcome {
+    TestPassed -> 0
+    TestFailed(status) -> status
+    _ -> 1
+  }
+}
+
+--- The outcome an executable's exit status means on its own.
+pub(package) fn test_outcome_from_status(status: i64) -> TestOutcome {
+  if status == 0 { TestPassed } else { TestFailed(status) }
+}
+
+--- An executable's status: its exit code, or 128 plus the ending signal.
+pub(package) fn test_exit_status(ended: ProcTermination) -> i64 {
+  match ended {
+    ProcExited(status) -> status
+    ProcSignaled(signal) -> 128 + signal
+  }
+}
+
+--- What a worker's own termination means when it left no measure.
+pub(package) fn test_worker_outcome(termination: SupervisedTermination) -> TestOutcome {
+  match termination {
+    SupervisedEnded(ended) -> test_outcome_from_status(test_exit_status(ended))
+    SupervisedStopped -> TestTimedOut
+    SupervisedFailed(error) -> TestUnsupervised
+  }
+}
+
+--- Judge a passing root against the memory limit. A root that already
+--- failed keeps its semantic failure.
+pub(package) fn test_limit_memory(
+  outcome: TestOutcome,
+  peak: i64,
+  settings: TestSettings
+) -> TestOutcome {
+  match outcome {
+    TestPassed -> match settings.memory_limit_kb {
+      Some(limit) -> if peak > limit * 1024 { TestMemoryExceeded(peak) } else { TestPassed }
+      None -> TestPassed
+    }
+    other -> other
+  }
+}
+
+fn test_outcome_detail(outcome: TestOutcome) -> str {
+  match outcome {
+    TestPassed -> ""
+    TestFailed(status) -> i", exit {status}"
+    TestTimedOut -> ", timeout"
+    TestMemoryExceeded(peak) -> i", peak RSS {(peak + 1023) / 1024} KB exceeded limit"
+    TestNoExecutable -> ", emission produced no executable"
+    _ -> ", exit 1"
+  }
+}
+
+--- The report line for one root.
+pub(package) fn test_report_line(root: str, outcome: TestOutcome, elapsed: Duration) -> str {
+  let verdict = match outcome {
+    TestPassed -> "pass"
+    _ -> "FAIL"
+  }
+  i"  {verdict}: {root} ({elapsed.milliseconds()} ms{test_outcome_detail(outcome)})\n"
+}
+
+--- The summary of one invocation and whether it succeeded.
+pub(package) type TestSummary { text: str, succeeded: bool }
+
+--- Summarise `roots` discovered roots, `root_failures` of which failed, and
+--- `input_failures` inputs that named no roots. Naming nothing at all fails.
+pub(package) fn test_summary(roots: i64, root_failures: i64, input_failures: i64) -> TestSummary {
+  let passed = roots - root_failures
+  let failed = root_failures + input_failures
+  if roots == 0 and failed == 0 {
+    TestSummary { text: "test: no test files provided\n\n0 passed, 1 failed\n", succeeded: false }
+  } else {
+    TestSummary { text: i"\n{passed} passed, {failed} failed\n", succeeded: failed == 0 }
+  }
+}
+
+-- Records -------------------------------------------------------------------
+-- `prefix`, then `count` decimals separated by single spaces, then the text's
+-- only newline at its end.
+fn test_record_fields(text: str, prefix: str, count: i64) -> Option<Vector<i64>> {
+  if str_starts_with(text, prefix) == 0 { return None<Vector<i64>>() }
+  let n = str_len(text)
+  let fields: Vector<i64> = vector.new<i64>()
+  let mut end = str_len(prefix)
+  for index in 0..count {
+    let start = end
+    let mut value = 0
+    while end < n and test_is_digit(str_byte_at(text, end)) {
+      value = value * 10 + str_byte_at(text, end) - 48
+      end = end + 1
+    }
+    let delimiter = if index + 1 == count { 10 } else { 32 }
+    if end == start or end >= n or str_byte_at(text, end) != delimiter {
+      return None<Vector<i64>>()
+    }
+    vector_push<i64>(fields, value)
+    end = end + 1
+  }
+  if end == n { Some<Vector<i64>>(fields) } else { None<Vector<i64>>() }
+}
+
+--- The structured result a test executable writes for the runner.
+pub(package) type TestCounts { passed: i64, failed: i64, total: i64 }
+
+pub(package) fn test_counts_render(counts: TestCounts) -> str {
+  i"WEFT_TEST_RESULT 1 {counts.passed} {counts.failed} {counts.total}\n"
+}
+
+--- Parse a result record. Its counts must add up.
+pub(package) fn test_counts_parse(text: str) -> Option<TestCounts> {
+  match test_record_fields(text, "WEFT_TEST_RESULT 1 ", 3) {
+    None -> None<TestCounts>()
+    Some(fields) -> {
+      let counts = TestCounts {
+        passed: vector_get_in_bounds<i64>(fields, 0),
+        failed: vector_get_in_bounds<i64>(fields, 1),
+        total: vector_get_in_bounds<i64>(fields, 2)
+      }
+      if counts.passed + counts.failed == counts.total { Some<TestCounts>(counts) }
+      else { None<TestCounts>() }
+    }
+  }
+}
+
+--- What a worker measured for its root. CPU time and peak memory belong to
+--- the executable the worker ran, not to the worker itself.
+pub(package) type TestMeasure {
+  outcome: TestOutcome,
+  compile_millis: i64,
+  link_millis: i64,
+  run_millis: i64,
+  user_micros: i64,
+  system_micros: i64,
+  peak_rss_bytes: i64
+}
+
+pub(package) fn test_measure_render(measure: TestMeasure) -> str {
+  let code = test_outcome_code(measure.outcome)
+  i"WEFT_TEST_METRIC 1 {code} {measure.compile_millis} {measure.link_millis} {measure.run_millis} {measure.user_micros} {measure.system_micros} {measure.peak_rss_bytes}\n"
+}
+
+pub(package) fn test_measure_parse(text: str) -> Option<TestMeasure> {
+  match test_record_fields(text, "WEFT_TEST_METRIC 1 ", 7) {
+    None -> None<TestMeasure>()
+    Some(fields) -> match test_outcome_from_code(vector_get_in_bounds<i64>(fields, 0)) {
+      None -> None<TestMeasure>()
+      Some(outcome) -> Some<TestMeasure>(
+        TestMeasure {
+          outcome: outcome,
+          compile_millis: vector_get_in_bounds<i64>(fields, 1),
+          link_millis: vector_get_in_bounds<i64>(fields, 2),
+          run_millis: vector_get_in_bounds<i64>(fields, 3),
+          user_micros: vector_get_in_bounds<i64>(fields, 4),
+          system_micros: vector_get_in_bounds<i64>(fields, 5),
+          peak_rss_bytes: vector_get_in_bounds<i64>(fields, 6)
+        }
+      )
+    }
+  }
+}
+
+--- A runner scratch file, private to one process and root.
+pub(package) type TestScratch {
+  --- The executable a worker materialises.
+  TestExecutableFile,
+  --- The structured result the executable writes.
+  TestResultFile,
+  --- The measure a worker leaves for its supervisor.
+  TestMeasureFile
+}
+
+--- The scratch path of `scratch` for root `index` of process `owner`.
+pub(package) fn test_scratch_text(scratch: TestScratch, owner: i64, index: i64) -> str {
+  let kind = match scratch {
+    TestExecutableFile -> ""
+    TestResultFile -> "result-"
+    TestMeasureFile -> "metric-"
+  }
+  i"/tmp/weft-test-{kind}{owner}-{index}"
+}
+
+pub(package) fn test_scratch_path(scratch: TestScratch, owner: i64, index: i64) -> Path {
+  match path.from_utf8(test_scratch_text(scratch, owner, index)) {
+    Ok(native) -> native
+    Err(_) -> panic("runner scratch paths are text without NUL")
+  }
+}
+
+--- Remove a scratch file. Absence is the goal, so a missing file is fine.
+pub(package) fn test_remove_scratch(scratch: Path) -[DirMutate]> nil {
+  dir.remove(scratch)
+  nil
+}
+
+--- A scratch record's text, when the file exists and holds text.
+pub(package) fn test_read_scratch(scratch: Path) -[FileRead]> Option<str> {
+  let limit: usize = 4096
+  match file.read_all(scratch, limit) {
+    Err(_) -> None<str>()
+    Ok(contents) -> match contents.to_utf8() {
+      Ok(record) -> Some<str>(record)
+      Err(_) -> None<str>()
+    }
+  }
+}
+
+--- Replace a scratch record. A lost measure only costs its exact outcome;
+--- the supervisor falls back to the worker's exit status.
+pub(package) fn test_write_scratch(scratch: Path, record: str) -[FileWrite]> nil {
+  file.write_text(scratch, record)
+  nil
+}
+
+--- Report a line on standard error. Best effort: a runner whose standard
+--- error is gone still reports through its exit status.
+pub(package) fn test_note(text: str) -[ConsoleWrite]> nil {
+  console.try_eprint(text)
+  nil
+}
+
+--- Wait briefly before polling workers again.
+pub(package) fn test_pause() -[Sleep]> nil {
+  sleep.wait(time.milliseconds(10))
+  nil
+}
+
+-- Totals --------------------------------------------------------------------
+--- Resources summed over every root whose worker left a measure.
+pub(package) type TestTotals {
+  measured: i64,
+  compile_millis: i64,
+  link_millis: i64,
+  run_millis: i64,
+  user_micros: i64,
+  system_micros: i64,
+  peak_rss_bytes: i64
+}
+
+pub(package) fn test_totals_empty() -> TestTotals {
+  TestTotals {
+    measured: 0,
+    compile_millis: 0,
+    link_millis: 0,
+    run_millis: 0,
+    user_micros: 0,
+    system_micros: 0,
+    peak_rss_bytes: 0
+  }
+}
+
+fn test_larger(left: i64, right: i64) -> i64 { if right > left { right } else { left } }
+
+--- A root's peak resident set: its worker's, or its executable's when larger.
+pub(package) fn test_root_peak(worker: SupervisedUsage, measure: Option<TestMeasure>) -> i64 {
+  match measure {
+    None -> worker.peak_rss_bytes
+    Some(measured) -> test_larger(worker.peak_rss_bytes, measured.peak_rss_bytes)
+  }
+}
+
+--- Add one reaped worker's own usage and, when it left one, its measure.
+pub(package) fn test_totals_add(
+  totals: TestTotals,
+  worker: SupervisedUsage,
+  measure: Option<TestMeasure>
+) -> TestTotals {
+  let user = totals.user_micros + worker.user_micros
+  let system = totals.system_micros + worker.system_micros
+  let peak = test_larger(totals.peak_rss_bytes, worker.peak_rss_bytes)
+  match measure {
+    None -> TestTotals {
+      measured: totals.measured,
+      compile_millis: totals.compile_millis,
+      link_millis: totals.link_millis,
+      run_millis: totals.run_millis,
+      user_micros: user,
+      system_micros: system,
+      peak_rss_bytes: peak
+    }
+    Some(measured) -> TestTotals {
+      measured: totals.measured + 1,
+      compile_millis: totals.compile_millis + measured.compile_millis,
+      link_millis: totals.link_millis + measured.link_millis,
+      run_millis: totals.run_millis + measured.run_millis,
+      user_micros: user + measured.user_micros,
+      system_micros: system + measured.system_micros,
+      peak_rss_bytes: test_larger(peak, measured.peak_rss_bytes)
+    }
+  }
+}
+
+--- Work shared across roots through checked dependency products, and the
+--- project queries that planning executed.
+pub(package) type TestPlanTotals {
+  groups: i64,
+  roots: i64,
+  --- Declaration/function pairs checked once for more than one root.
+  reused_pairs: i64,
+  optimised_groups: i64,
+  optimised_roots: i64,
+  --- Optimised functions reused by more than one root.
+  reused_optimised_functions: i64,
+  query_hits: i64,
+  query_misses: i64,
+  query_executions: i64
+}
+
+pub(package) fn test_plan_totals_empty() -> TestPlanTotals {
+  TestPlanTotals {
+    groups: 0,
+    roots: 0,
+    reused_pairs: 0,
+    optimised_groups: 0,
+    optimised_roots: 0,
+    reused_optimised_functions: 0,
+    query_hits: 0,
+    query_misses: 0,
+    query_executions: 0
+  }
+}
+
+--- Add one sharing group of `group_roots` roots whose leader checks
+--- `pair_count` pairs, with its optimised product's function count when it
+--- built one. Every root past the leader reuses that work: this counts
+--- semantic work avoided, not an inferred wall-time saving.
+pub(package) fn test_plan_totals_add_group(
+  totals: TestPlanTotals,
+  group_roots: i64,
+  pair_count: i64,
+  optimised_functions: Option<i64>
+) -> TestPlanTotals {
+  let reused_roots = group_roots - 1
+  let (optimised_groups, optimised_roots, reused_functions) = match optimised_functions {
+    None -> (0, 0, 0)
+    Some(functions) -> (1, group_roots, functions * reused_roots)
+  }
+  TestPlanTotals {
+    groups: totals.groups + 1,
+    roots: totals.roots + group_roots,
+    reused_pairs: totals.reused_pairs + pair_count * reused_roots,
+    optimised_groups: totals.optimised_groups + optimised_groups,
+    optimised_roots: totals.optimised_roots + optimised_roots,
+    reused_optimised_functions: totals.reused_optimised_functions + reused_functions,
+    query_hits: totals.query_hits,
+    query_misses: totals.query_misses,
+    query_executions: totals.query_executions
+  }
+}
+
+--- The trace line for one candidate group of more than one root.
+pub(package) fn test_plan_group_trace(group_roots: i64, pair_count: i64, optimised: bool) -> str {
+  let duplicate_pairs = pair_count * (group_roots - 1)
+  let product = if optimised { 1 } else { 0 }
+  i"test plan group: roots={group_roots} checked_pairs={pair_count} duplicate_pairs={duplicate_pairs} optimised_product={product}\n"
+}
+
+--- The trace line summarising planning.
+pub(package) fn test_plan_trace(totals: TestPlanTotals) -> str {
+  i"test plan: shared checked dependency groups={totals.groups} roots={totals.roots}\n"
+}
+
+--- One invocation's measurements.
+pub(package) type TestRunMeasures {
+  roots: i64,
+  wall: Duration,
+  discovery: Duration,
+  planning: Duration,
+  totals: TestTotals,
+  plan: TestPlanTotals
+}
+
+--- The machine-readable measurement line, schema 3, then its human reading.
+pub(package) fn test_measures_report(measures: TestRunMeasures) -> str {
+  let totals = measures.totals
+  let plan = measures.plan
+  let wall = measures.wall.milliseconds()
+  let discovery = measures.discovery.milliseconds()
+  let planning = measures.planning.milliseconds()
+  let peak_kb = (totals.peak_rss_bytes + 1023) / 1024
+  let machine = i"WEFT_TEST_METRICS 3 {measures.roots} {totals.measured} {wall} {discovery} {planning} {totals.compile_millis} {totals.link_millis} {totals.run_millis} {totals.user_micros} {totals.system_micros} {totals.peak_rss_bytes} {plan.groups} {plan.roots} {plan.reused_pairs} {plan.query_hits} {plan.query_misses} {plan.query_executions} {plan.optimised_groups} {plan.optimised_roots} {plan.reused_optimised_functions}\n"
+  let human = i"test metrics: roots={measures.roots} measured={totals.measured} wall_ms={wall} discovery_ms={discovery} planning_ms={planning} compile_ms_sum={totals.compile_millis} link_ms_sum={totals.link_millis} run_ms_sum={totals.run_millis} cpu_user_us_sum={totals.user_micros} cpu_system_us_sum={totals.system_micros} peak_rss_kb={peak_kb} shared_groups={plan.groups} shared_roots={plan.roots} reused_checked_pairs={plan.reused_pairs} query_hits={plan.query_hits} query_misses={plan.query_misses} query_executions={plan.query_executions} optimised_product_groups={plan.optimised_groups} optimised_product_roots={plan.optimised_roots} reused_optimised_functions={plan.reused_optimised_functions}\n"
+  machine.concat(human)
+}
+
+-- Discovery -----------------------------------------------------------------
+--- Why one discovery input names no roots.
+pub(package) type TestDiscoveryProblem {
+  --- The directory of a pattern could not be listed.
+  TestPatternUnreadable(str),
+  --- A pattern matched no files.
+  TestPatternUnmatched(str),
+  --- A directory in a tree could not be listed.
+  TestDirectoryUnreadable(str),
+  --- A directory tree holds no `.weft` files.
+  TestDirectoryEmpty(str)
+}
+
+pub(package) fn test_problem_text(problem: TestDiscoveryProblem) -> str {
+  match problem {
+    TestPatternUnreadable(input) -> i"test: could not expand pattern: {input}\n"
+    TestPatternUnmatched(input) -> i"test: no test files matched: {input}\n"
+    TestDirectoryUnreadable(directory) -> i"test: could not list directory: {directory}\n"
+    TestDirectoryEmpty(input) -> i"test: no .weft files in directory: {input}\n"
+  }
+}
+
+--- The roots a set of inputs names, in byte order without duplicates, and
+--- the problems that made inputs fail.
+pub(package) type TestDiscovery {
+  roots: Vector<str>,
+  problems: Vector<TestDiscoveryProblem>,
+  failed_inputs: i64
+}
+
+-- Discovery keeps each name's exact native bytes; roots are text only in the
+-- sense of the compiler's byte-exact `str`.
+fn test_path_text(value: Path) -> str { bytes_storage(value.bytes()) }
+
+fn test_native(text: str) -> Option<Path> {
+  match path.from_bytes(bytes.from_str(text)) {
+    Ok(value) -> Some<Path>(value)
+    Err(_) -> None<Path>()
+  }
+}
+
+fn test_kind_is_directory(kind: DirKind) -> bool {
+  match kind {
+    DirDirectory -> true
+    _ -> false
+  }
+}
+
+fn test_is_directory(text: str) -[DirInspect]> bool {
+  match test_native(text) {
+    None -> false
+    Some(native) -> match DirInspect.stat(native) {
+      Ok(metadata) -> metadata.exists and test_kind_is_directory(metadata.kind)
+      Err(_) -> false
+    }
+  }
+}
+
+fn test_list(directory: str) -[DirInspect]> Option<Vector<str>> {
+  match test_native(directory) {
+    None -> None<Vector<str>>()
+    Some(native) -> match DirInspect.list(native) {
+      Err(_) -> None<Vector<str>>()
+      Ok(entries) -> {
+        let names: Vector<str> = vector.new<str>()
+        for index in 0..vector_len<Path>(entries) {
+          vector_push<str>(names, test_path_text(vector_get_in_bounds<Path>(entries, index)))
+        }
+        Some<Vector<str>>(names)
+      }
+    }
+  }
+}
+
+fn test_has_glob(input: str) -> bool { str_find(input, "*") >= 0 or str_find(input, "?") >= 0 }
+
+fn test_last_slash(input: str) -> i64 {
+  let mut slash = 0 - 1
+  for index in 0..str_len(input) {
+    if str_byte_at(input, index) == 47 { slash = index }
+  }
+  slash
+}
+
+--- Whether `name` matches a pattern of literal bytes, `?` for any one byte
+--- and `*` for any run. Richer unquoted globs are the invoking shell's job.
+pub(package) fn test_glob_matches(name: str, pattern: str) -> bool {
+  let name_len = str_len(name)
+  let pattern_len = str_len(pattern)
+  let mut at = 0
+  let mut next = 0
+  let mut star = 0 - 1
+  let mut retry = 0
+  while at < name_len {
+    if next < pattern_len and (
+      str_byte_at(pattern, next) == 63 or str_byte_at(pattern, next) == str_byte_at(name, at)
+    ) {
+      at = at + 1
+      next = next + 1
+    } else if next < pattern_len and str_byte_at(pattern, next) == 42 {
+      star = next
+      next = next + 1
+      retry = at
+    } else if star >= 0 {
+      retry = retry + 1
+      at = retry
+      next = star + 1
+    } else { return false }
+  }
+  while next < pattern_len and str_byte_at(pattern, next) == 42 { next = next + 1 }
+  next == pattern_len
+}
+
+-- Expand a pattern over the files, not directories, of its directory.
+fn test_discover_pattern(
+  input: str,
+  roots: SortedSet<str>,
+  problems: Vector<TestDiscoveryProblem>
+) -[DirInspect]> bool {
+  let slash = test_last_slash(input)
+  let directory = if slash < 0 { "." } else if slash == 0 { "/" } else {
+    str_slice_bytes(input, 0, slash)
+  }
+  let prefix = str_slice_bytes(input, 0, slash + 1)
+  let pattern = str_slice_bytes(input, slash + 1, str_len(input) - slash - 1)
+  match test_list(directory) {
+    None -> {
+      vector_push<TestDiscoveryProblem>(problems, TestPatternUnreadable(input))
+      false
+    }
+    Some(names) -> {
+      let mut matched = 0
+      for index in 0..vector_len<str>(names) {
+        let name = vector_get_in_bounds<str>(names, index)
+        let candidate = prefix.concat(name)
+        if test_glob_matches(name, pattern) and not test_is_directory(candidate) {
+          roots.insert(candidate)
+          matched = matched + 1
+          nil
+        }
+      }
+      if matched == 0 {
+        vector_push<TestDiscoveryProblem>(problems, TestPatternUnmatched(input))
+        false
+      } else { true }
+    }
+  }
+}
+
+type TestDirectoryIdentity { device: i64, inode: i64 }
+
+-- Record a directory's filesystem identity; false when already recorded.
+fn test_visit(visited: Vector<TestDirectoryIdentity>, device: i64, inode: i64) -> bool {
+  for index in 0..vector_len<TestDirectoryIdentity>(visited) {
+    let identity = vector_get_in_bounds<TestDirectoryIdentity>(visited, index)
+    if identity.device == device and identity.inode == inode { return false }
+  }
+  vector_push<TestDirectoryIdentity>(
+    visited,
+    TestDirectoryIdentity { device: device, inode: inode }
+  )
+  true
+}
+
+fn test_insert_sorted(values: Vector<str>, value: str) -> nil {
+  let mut low = 0
+  let mut high = vector_len<str>(values)
+  while low < high {
+    let middle = (low + high) / 2
+    match vector_get_in_bounds<str>(values, middle).compare(value) {
+      Less -> {
+        low = middle + 1
+        nil
+      }
+      _ -> {
+        high = middle
+        nil
+      }
+    }
+  }
+  vector_insert_at<str>(values, low, value)
+  nil
+}
+
+fn test_join(directory: str, name: str) -> str {
+  let n = str_len(directory)
+  if n > 0 and str_byte_at(directory, n - 1) == 47 { directory.concat(name) }
+  else { directory.concat("/").concat(name) }
+}
+
+-- Walk a directory tree, always visiting the smallest pending directory next,
+-- and following each filesystem identity once so symlink cycles end.
+fn test_discover_tree(
+  input: str,
+  roots: SortedSet<str>,
+  problems: Vector<TestDiscoveryProblem>
+) -[DirInspect]> bool {
+  let pending: Vector<str> = vector.new<str>()
+  let visited: Vector<TestDirectoryIdentity> = vector.new<TestDirectoryIdentity>()
+  vector_push<str>(pending, input)
+  match test_native(input) {
+    None -> nil
+    Some(native) -> match DirInspect.stat(native) {
+      Ok(metadata) -> {
+        test_visit(visited, metadata.device, metadata.inode)
+        nil
+      }
+      Err(_) -> nil
+    }
+  }
+  let mut unreadable = false
+  let mut matched = 0
+  let mut next = 0
+  while next < vector_len<str>(pending) {
+    let directory = vector_get_in_bounds<str>(pending, next)
+    match test_list(directory) {
+      None -> {
+        vector_push<TestDiscoveryProblem>(problems, TestDirectoryUnreadable(directory))
+        unreadable = true
+      }
+      Some(names) -> {
+        for index in 0..vector_len<str>(names) {
+          let name = vector_get_in_bounds<str>(names, index)
+          let child = test_join(directory, name)
+          match test_native(child) {
+            None -> nil
+            Some(native) -> match DirInspect.stat(native) {
+              Err(_) -> nil
+              Ok(metadata) -> if not metadata.exists { nil }
+              else if test_kind_is_directory(metadata.kind) {
+                if test_visit(visited, metadata.device, metadata.inode) {
+                  test_insert_sorted(pending, child)
+                }
+                nil
+              } else if name.ends_with(".weft") {
+                roots.insert(child)
+                matched = matched + 1
+                nil
+              } else { nil }
+            }
+          }
+        }
+      }
+    }
+    next = next + 1
+  }
+  if unreadable { false }
+  else if matched == 0 {
+    vector_push<TestDiscoveryProblem>(problems, TestDirectoryEmpty(input))
+    false
+  } else { true }
+}
+
+--- Expand inputs: a pattern names its matching files, a directory names
+--- every `.weft` file beneath it, and anything else, including a missing
+--- file, names itself so compilation reports it.
+pub(package) fn test_discover(inputs: Vector<str>) -[DirInspect]> TestDiscovery {
+  let roots = sorted_set.new<str>()
+  let problems: Vector<TestDiscoveryProblem> = vector.new<TestDiscoveryProblem>()
+  let mut failed_inputs = 0
+  for index in 0..vector_len<str>(inputs) {
+    let input = vector_get_in_bounds<str>(inputs, index)
+    let found = if test_has_glob(input) { test_discover_pattern(input, roots, problems) }
+    else if test_is_directory(input) { test_discover_tree(input, roots, problems) }
+    else {
+      roots.insert(input)
+      true
+    }
+    if not found { failed_inputs = failed_inputs + 1 }
+  }
+  TestDiscovery { roots: roots.values(), problems: problems, failed_inputs: failed_inputs }
+}
+
+-- Scheduling ----------------------------------------------------------------
+-- A worker slot: free, or supervising one root's worker since `start`.
+type TestSlot {
+  TestSlotFree,
+  -- Worker, root index, start, whole-root stop.
+  TestSlotBusy(SupervisedProcess, i64, Instant, Duration)
+}
+
+--- What a finished schedule reports: failed roots and summed resources.
+pub(package) type TestPool { failures: i64, totals: TestTotals }
+
+--- A forked worker's assignment: its root and the runner that supervises it.
+pub(package) type TestWorker { root: i64, runner: i64 }
+
+--- Which process a schedule returns in.
+pub(package) type TestScheduled {
+  --- The runner, after every root was reported.
+  TestRunnerFinished(TestPool),
+  --- A forked worker, which must compile and run its root, then finish.
+  TestWorkerStarted(TestWorker)
+}
+
+--- Leave a worker's measure for its runner and exit with its outcome's status.
+pub(package) fn test_worker_finish(
+  worker: TestWorker,
+  measure: TestMeasure
+) -[FileWrite, Supervise]> never {
+  test_write_scratch(
+    test_scratch_path(TestMeasureFile, worker.runner, worker.root),
+    test_measure_render(measure)
+  )
+  Supervise.exit(test_outcome_status(measure.outcome))
+}
+
+fn test_free_slot(slots: Vector<TestSlot>) -> i64 {
+  for index in 0..vector_len<TestSlot>(slots) {
+    match vector_get_in_bounds<TestSlot>(slots, index) {
+      TestSlotFree -> return index
+      _ -> nil
+    }
+  }
+  0 - 1
+}
+
+-- Judge and report one reaped worker. Its measure, when it left one, names
+-- the exact outcome; otherwise its own termination does.
+fn test_finish(
+  root: str,
+  index: i64,
+  owner: i64,
+  exit: SupervisedExit,
+  elapsed: Duration,
+  settings: TestSettings,
+  pool: TestPool
+) -[FileRead, DirMutate, ConsoleWrite]> TestPool {
+  let scratch = test_scratch_path(TestMeasureFile, owner, index)
+  let measure = match test_read_scratch(scratch) {
+    None -> None<TestMeasure>()
+    Some(record) -> test_measure_parse(record)
+  }
+  test_remove_scratch(scratch)
+  let reported = match measure {
+    Some(measured) -> measured.outcome
+    None -> test_worker_outcome(exit.termination)
+  }
+  let outcome = test_limit_memory(reported, test_root_peak(exit.usage, measure), settings)
+  test_note(test_report_line(root, outcome, elapsed))
+  let failed = match outcome {
+    TestPassed -> 0
+    _ -> 1
+  }
+  TestPool {
+    failures: pool.failures + failed,
+    totals: test_totals_add(pool.totals, exit.usage, measure)
+  }
+}
+
+--- Start every root in its own forked worker, at most `jobs` at a time, and
+--- report each root as it finishes. A worker still running at its root's
+--- `limit(index)` is stopped with any executable it started. The fork's
+--- worker side returns at once with its assignment, so a worker compiles its
+--- root beneath none of the runner's handlers: an abortive handler in scope
+--- makes every function beneath it maintain abort-cleanup records.
+pub(package) fn test_schedule<E>(
+  roots: Vector<str>,
+  jobs: i64,
+  settings: TestSettings,
+  limit: (i64) -[E]> Duration
+) -[Supervise, FileRead, DirMutate, ConsoleWrite, MonotonicClock, Sleep, E]> TestScheduled {
+  let count = vector_len<str>(roots)
+  let owner = Supervise.process_id()
+  let slots: Vector<TestSlot> = vector.new<TestSlot>()
+  for index in 0..jobs { vector_push<TestSlot>(slots, TestSlotFree) }
+  let mut next = 0
+  let mut active = 0
+  let mut pool = TestPool { failures: 0, totals: test_totals_empty() }
+  while next < count or active > 0 {
+    while next < count and active < jobs {
+      let start = monotonic.now()
+      test_remove_scratch(test_scratch_path(TestMeasureFile, owner, next))
+      match Supervise.fork() {
+        SupervisedChild -> return TestWorkerStarted(TestWorker { root: next, runner: owner })
+        SupervisedParent(worker) -> {
+          vector_set<TestSlot>(
+            slots,
+            test_free_slot(slots),
+            TestSlotBusy(worker, next, start, limit(next))
+          )
+          active = active + 1
+          nil
+        }
+        SupervisedForkFailed(error) -> {
+          test_note(
+            test_report_line(
+              vector_get_in_bounds<str>(roots, next),
+              TestUnsupervised,
+              time.milliseconds(0)
+            )
+          )
+          pool = TestPool { failures: pool.failures + 1, totals: pool.totals }
+          nil
+        }
+      }
+      next = next + 1
+    }
+    let mut progressed = false
+    for slot in 0..jobs {
+      match vector_get_in_bounds<TestSlot>(slots, slot) {
+        TestSlotFree -> nil
+        TestSlotBusy(worker, index, start, stop) -> {
+          let polled = Supervise.poll(worker)
+          let elapsed = monotonic.now().duration_since(start)
+          let finished = match polled {
+            exit: SupervisedExit -> Some<SupervisedExit>(exit)
+            nil -> if elapsed.milliseconds() >= stop.milliseconds() {
+              Some<SupervisedExit>(Supervise.stop(worker))
+            } else { None<SupervisedExit>() }
+          }
+          match finished {
+            None -> nil
+            Some(exit) -> {
+              pool = test_finish(
+                vector_get_in_bounds<str>(roots, index),
+                index,
+                owner,
+                exit,
+                elapsed,
+                settings,
+                pool
+              )
+              vector_set<TestSlot>(slots, slot, TestSlotFree)
+              active = active - 1
+              progressed = true
+              nil
+            }
+          }
+        }
+      }
+    }
+    if active > 0 and not progressed { test_pause() }
+  }
+  TestRunnerFinished(pool)
+}

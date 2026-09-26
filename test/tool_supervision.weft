@@ -1,0 +1,267 @@
+-- The test runner's process supervision over real processes: forked workers,
+-- supervised executables, deadlines, standard-input isolation, usage and
+-- owner-only executables.
+
+use runtime/time as platform_time
+use runtime/tool_platform.{*}
+use stdlib/bytes as bytes
+use stdlib/io/types.{IoNotFound}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/panic.{panic}
+use stdlib/path as path
+use stdlib/path.{Path}
+use stdlib/process.{ProcExited, ProcSignaled, ProcSpawnFailed, ProcWaitFailed}
+use stdlib/result.{Err, Ok}
+use stdlib/string.{str_concat}
+use stdlib/time as time
+use stdlib/time.{Duration}
+use stdlib/time/monotonic as monotonic
+use stdlib/time/monotonic.{MonotonicClock}
+use stdlib/time/sleep as sleep
+use stdlib/time/sleep.{Sleep}
+
+-- Exits encode as: an exit status as itself, a signal as 1000 + signal, a
+-- stop as 2000, and a platform failure as 3000 (spawn) or 4000 (wait).
+fn code(exit: SupervisedExit) -> i64 {
+  match exit.termination {
+    SupervisedEnded(ProcExited(status)) -> status
+    SupervisedEnded(ProcSignaled(signal)) -> 1000 + signal
+    SupervisedStopped -> 2000
+    SupervisedFailed(ProcSpawnFailed(errno)) -> 3000
+    SupervisedFailed(ProcWaitFailed(errno)) -> 4000
+    SupervisedFailed(other) -> 5000
+  }
+}
+
+fn args(first: str, second: str) -> List<str> { Cons(first, Cons(second, Nil<str>())) }
+
+fn script_args(script: str, first: str, second: str) -> List<str> {
+  Cons("-c", Cons(script, Cons(first, Cons(second, Nil<str>()))))
+}
+
+fn native(text: str) -> Path {
+  match path.from_utf8(text) {
+    Ok(value) -> value
+    Err(_) -> panic("test paths are valid native paths")
+  }
+}
+
+fn supervised(body: () -[Supervise, MonotonicClock, Sleep]> i64) -> i64 {
+  platform_time.with_platform(() => runtime_supervise(0, 0, body))
+}
+
+fn pause_for(milliseconds: i64) -[Sleep]> nil {
+  sleep.wait(time.milliseconds(milliseconds))
+  nil
+}
+
+fn pause() -[Sleep]> nil { pause_for(10) }
+
+fn wait_for(worker: SupervisedProcess) -[Supervise, Sleep]> SupervisedExit {
+  loop {
+    match Supervise.poll(worker) {
+      finished: SupervisedExit -> return finished
+      nil -> pause()
+    }
+  }
+  Supervise.stop(worker)
+}
+
+fn fork_exiting(status: i64) -[Supervise, Sleep]> i64 {
+  match Supervise.fork() {
+    SupervisedChild -> Supervise.exit(status)
+    SupervisedParent(worker) -> code(wait_for(worker))
+    SupervisedForkFailed(error) -> 3000
+  }
+}
+
+fn fork_stopped() -[Supervise, Sleep]> i64 {
+  match Supervise.fork() {
+    SupervisedChild -> {
+      loop { pause() }
+      Supervise.exit(0)
+    }
+    SupervisedParent(worker) -> {
+      let pending = match Supervise.poll(worker) {
+        finished: SupervisedExit -> 1
+        nil -> 0
+      }
+      pending * 10000 + code(Supervise.stop(worker))
+    }
+    SupervisedForkFailed(error) -> 3000
+  }
+}
+
+-- A stopped worker takes the executable it started with it: the grandchild
+-- shares the worker's process group, so it never reaches its marker write.
+fn fork_stops_group(marker: str) -[Supervise, Sleep]> i64 {
+  shell(str_concat("rm -f ", marker), time.seconds(10))
+  match Supervise.fork() {
+    SupervisedChild -> {
+      Supervise.run(
+        native("/bin/sh"),
+        script_args("sleep 1; : > \"$0\"", marker, ""),
+        time.seconds(30)
+      )
+      Supervise.exit(0)
+    }
+    SupervisedParent(worker) -> {
+      pause_for(300)
+      let stopped = code(Supervise.stop(worker))
+      pause_for(1500)
+      stopped * 10 + shell(str_concat("test ! -e ", marker), time.seconds(10))
+    }
+    SupervisedForkFailed(error) -> 3000
+  }
+}
+
+fn shell(script: str, limit: Duration) -[Supervise]> i64 {
+  code(Supervise.run(native("/bin/sh"), args("-c", script), limit))
+}
+
+fn run_path(executable: Path) -[Supervise]> i64 {
+  code(Supervise.run(executable, Nil<str>(), time.seconds(10)))
+}
+
+fn elapsed_shell(script: str, limit: Duration) -[Supervise, MonotonicClock]> i64 {
+  let start = monotonic.now()
+  let result = shell(script, limit)
+  let elapsed = monotonic.now().duration_since(start).milliseconds()
+  if elapsed < 5000 { result } else { 0 - result }
+}
+
+fn script_path() -[Supervise]> Path {
+  "/tmp/weft-supervise-" |> str_concat(Supervise.process_id().to_str()) |> str_concat(".sh") |>
+    native()
+}
+
+fn executable_round_trip() -[Supervise]> i64 {
+  let target = script_path()
+  let first = match Supervise.write_executable(target, bytes.from_str("#!/bin/sh\nexit 4\n")) {
+    Ok(_) -> run_path(target)
+    Err(error) -> 3000
+  }
+  -- Replacing an existing executable installs the new contents.
+  let second = match Supervise.write_executable(target, bytes.from_str("#!/bin/sh\nexit 5\n")) {
+    Ok(_) -> run_path(target)
+    Err(error) -> 3000
+  }
+  shell(str_concat("rm -f ", script_text(target)), time.seconds(10))
+  first * 100 + second
+}
+
+fn script_text(value: Path) -> str {
+  match value.to_utf8() {
+    Ok(text) -> text
+    Err(_) -> ""
+  }
+}
+
+fn owner_only_mode() -[Supervise]> i64 {
+  let target = script_path()
+  match Supervise.write_executable(target, bytes.from_str("#!/bin/sh\nexit 0\n")) {
+    Ok(_) -> {
+      let mode = shell(
+        str_concat("test \"$(stat -c %a ", script_text(target))
+          |> str_concat(" 2>/dev/null || stat -f %Lp ")
+          |> str_concat(script_text(target))
+          |> str_concat(")\" = 700"),
+        time.seconds(10)
+      )
+      shell(str_concat("rm -f ", script_text(target)), time.seconds(10))
+      mode
+    }
+    Err(error) -> 3000
+  }
+}
+
+fn unwritable_executable() -[Supervise]> i64 {
+  match Supervise.write_executable(native("/nonexistent-weft-dir/x.sh"), bytes.from_str("x")) {
+    Ok(_) -> 0
+    Err(IoNotFound) -> 1
+    Err(other) -> 2
+  }
+}
+
+fn usage_of_forked_worker() -[Supervise, Sleep]> i64 {
+  match Supervise.fork() {
+    SupervisedChild -> Supervise.exit(0)
+    SupervisedParent(worker) -> {
+      let usage = wait_for(worker).usage
+      if usage.user_micros >= 0 and usage.system_micros >= 0 and usage.peak_rss_bytes > 0 { 1 }
+      else { 0 }
+    }
+    SupervisedForkFailed(error) -> 0
+  }
+}
+
+fn usage_of_executable() -[Supervise]> i64 {
+  let usage = Supervise.run(native("/bin/sh"), args("-c", "exit 0"), time.seconds(10)).usage
+  if usage.peak_rss_bytes > 0 { 1 } else { 0 }
+}
+
+fn process_identity() -[Supervise]> i64 {
+  match Supervise.fork() {
+    SupervisedChild -> Supervise.exit(0)
+    SupervisedParent(worker) -> {
+      let parent = Supervise.process_id()
+      Supervise.stop(worker)
+      if parent > 0 { 1 } else { 0 }
+    }
+    SupervisedForkFailed(error) -> 0
+  }
+}
+
+test "forked_workers_report_their_exit_status" {
+  Test.assert_eq(supervised(() => fork_exiting(0)), 0)
+  Test.assert_eq(supervised(() => fork_exiting(7)), 7)
+  Test.assert_eq(supervised(() => fork_exiting(255)), 255)
+}
+
+test "a_running_worker_is_stopped_and_reaped" {
+  Test.assert_eq(supervised(() => fork_stopped()), 2000)
+}
+
+test "stopping_a_worker_stops_the_executable_it_started" {
+  Test.assert_eq(supervised(() => fork_stops_group("/tmp/weft-supervise-group-marker")), 20000)
+}
+
+test "reaped_children_report_usage" {
+  Test.assert_eq(supervised(() => usage_of_forked_worker()), 1)
+  Test.assert_eq(supervised(() => usage_of_executable()), 1)
+}
+
+test "executables_exit_are_signalled_or_are_stopped_at_their_limit" {
+  Test.assert_eq(supervised(() => shell("exit 3", time.seconds(10))), 3)
+  Test.assert_eq(supervised(() => shell("kill -9 $$", time.seconds(10))), 1009)
+  Test.assert_eq(supervised(() => elapsed_shell("sleep 30", time.milliseconds(200))), 2000)
+  -- A zero limit still ends in a reaped child, finished or stopped.
+  let immediate = supervised(() => shell("exit 0", time.milliseconds(0)))
+  Test.assert_true(immediate == 0 or immediate == 2000)
+  Test.assert_eq(supervised(() => run_path(native("/nonexistent-weft-binary"))), 127)
+}
+
+test "executables_read_standard_input_from_dev_null" {
+  Test.assert_eq(supervised(() => shell("read line || exit 6; exit 0", time.seconds(10))), 6)
+}
+
+fn argument_order() -[Supervise]> i64 {
+  let script = "test \"$0\" = one -a \"$1\" = \"two words\" -a $# -eq 1"
+  code(
+    Supervise.run(native("/bin/sh"), script_args(script, "one", "two words"), time.seconds(10))
+  )
+}
+
+test "executables_receive_their_arguments_in_order" {
+  Test.assert_eq(supervised(() => argument_order()), 0)
+}
+
+test "owner_only_executables_are_written_replaced_and_rejected" {
+  Test.assert_eq(supervised(() => executable_round_trip()), 405)
+  Test.assert_eq(supervised(() => owner_only_mode()), 0)
+  Test.assert_eq(supervised(() => unwritable_executable()), 1)
+}
+
+test "the_process_identity_is_available" {
+  Test.assert_eq(supervised(() => process_identity()), 1)
+}

@@ -5,17 +5,46 @@
 -- explicit residual effect sets are intentional: Weft does not infer effect
 -- tails, so each layer documents exactly what it forwards.
 
+use runtime/alloc.{alloc_bump_mark, alloc_bump_restore_same_segment, alloc_zeroed}
 use runtime/dir.{*}
 use runtime/env.{*}
+use runtime/memory.{mem_load64_at, mem_store64_at}
 use runtime/panic.{runtime_trap}
 use runtime/process.{*}
+use runtime/safe_file_core.{runtime_safe_path_string}
+use runtime/safe_write_core.{runtime_safe_write_fd}
 use runtime/time.{*}
+use runtime/string.{runtime_str_cstring}
+use runtime/syscall.{
+  sys_close,
+  sys_exit,
+  sys_file_chmod,
+  sys_open_read,
+  sys_open_write_create_truncate,
+  sys_proc_dup_to,
+  sys_proc_exec,
+  sys_proc_fork,
+  sys_proc_id,
+  sys_proc_kill,
+  sys_proc_set_group,
+  sys_proc_wait_usage,
+  sys_remove
+}
 use runtime/unsafe.{*}
+use stdlib/bytes.{Bytes}
 use stdlib/dir.{*}
 use stdlib/env.{Env}
+use stdlib/io/types.{IoError, IoPermissionDenied, io_error_from_errno}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/panic.{panic}
+use stdlib/path.{Path}
 use stdlib/process.{*}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/time.{Duration}
 use stdlib/time/monotonic as monotonic
 use stdlib/time/monotonic.{MonotonicClock}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push, vector_set}
 
 -- Linker fixture only: production process execution is syscall-backed and
 -- runtime/process.weft intentionally has no Darwin GOT dependency.
@@ -123,5 +152,292 @@ pub(package) fn runtime_platform_tool(
 ) -> i64 {
   handle runtime_tool_platform_handle(argc, argv, body) {
     Unsafe.transmute(raw) -> resume(__transmute(raw))
+  }
+}
+
+-- Test-runner supervision ----------------------------------------------------
+--- A child process the test runner supervises.
+pub(package) type SupervisedProcess = opaque i64
+
+--- How a supervised child ended.
+pub(package) type SupervisedTermination {
+  --- The child exited or was signalled on its own.
+  SupervisedEnded(ProcTermination),
+  --- The deadline passed or the supervisor stopped it; it was killed and reaped.
+  SupervisedStopped,
+  --- The platform could not start, observe or reap the child.
+  SupervisedFailed(ProcError)
+}
+
+--- CPU time and peak resident set of a reaped child and its reaped descendants.
+pub(package) type SupervisedUsage { user_micros: i64, system_micros: i64, peak_rss_bytes: i64 }
+
+pub(package) type SupervisedExit { termination: SupervisedTermination, usage: SupervisedUsage }
+
+--- Which side of a fork this process continues on.
+pub(package) type SupervisedFork {
+  --- This process is the new worker, in its own process group.
+  SupervisedChild,
+  --- The worker started.
+  SupervisedParent(SupervisedProcess),
+  SupervisedForkFailed(ProcError)
+}
+
+--- Process supervision for the test runner. Workers fork the runner itself,
+--- so they inherit its prepared compiler state copy-on-write; each process
+--- resumes a fork exactly once. Executables run with standard input from
+--- /dev/null and the runner's other streams under a deadline, and every
+--- reaped child reports its usage. `Proc` captures output and reports no
+--- usage, so it cannot serve the runner.
+pub(package) effect Supervise {
+  fn fork() -> SupervisedFork
+  --- End a forked worker with `status`.
+  fn exit(status: i64) -> never
+  --- The worker's exit once it has ended, without waiting.
+  fn poll(worker: SupervisedProcess) -> SupervisedExit?
+  --- Kill the worker's process group and reap it.
+  fn stop(worker: SupervisedProcess) -> SupervisedExit
+  --- Run an executable, with `args` after its path, until it ends or
+  --- `limit` of wall time passes.
+  fn run(path: Path, args: List<str>, limit: Duration) -> SupervisedExit
+  --- Replace `path` with an executable only its owner may run.
+  fn write_executable(path: Path, contents: Bytes) -> Result<nil, IoError>
+  --- This process's identifier, which names its private scratch files.
+  fn process_id() -> i64
+}
+
+-- The platform's rusage leaf reports user and system time as seconds and
+-- microseconds, and the peak resident set in bytes.
+fn runtime_supervise_usage(usage: i64) -> SupervisedUsage {
+  SupervisedUsage {
+    user_micros: mem_load64_at(usage, 0) * 1000000 + mem_load64_at(usage, 8),
+    system_micros: mem_load64_at(usage, 16) * 1000000 + mem_load64_at(usage, 24),
+    peak_rss_bytes: mem_load64_at(usage, 32)
+  }
+}
+
+fn runtime_supervise_termination(status: i64) -> SupervisedTermination {
+  let signal = status band 127
+  SupervisedEnded(
+    if signal == 0 { ProcExited((status bshr 8) band 255) } else { ProcSignaled(signal) }
+  )
+}
+
+fn runtime_supervise_no_usage() -> SupervisedUsage {
+  SupervisedUsage { user_micros: 0, system_micros: 0, peak_rss_bytes: 0 }
+}
+
+fn runtime_supervise_failed(error: ProcError) -> SupervisedExit {
+  SupervisedExit { termination: SupervisedFailed(error), usage: runtime_supervise_no_usage() }
+}
+
+-- Reap a killed child, retrying interrupted waits.
+fn runtime_supervise_reap_stopped(pid: i64) -> SupervisedExit {
+  let mark = alloc_bump_mark()
+  let status = alloc_zeroed(8)
+  let usage = alloc_zeroed(256)
+  let mut waited = sys_proc_wait_usage(pid, status, 0, usage)
+  while waited == 0 - 4 { waited = sys_proc_wait_usage(pid, status, 0, usage) }
+  let result = if waited == pid {
+    SupervisedExit { termination: SupervisedStopped, usage: runtime_supervise_usage(usage) }
+  } else { runtime_supervise_failed(ProcWaitFailed(if waited < 0 { 0 - waited } else { 0 })) }
+  alloc_bump_restore_same_segment(mark)
+  result
+}
+
+fn runtime_supervise_poll(pid: i64) -> SupervisedExit? {
+  let mark = alloc_bump_mark()
+  let status = alloc_zeroed(8)
+  let usage = alloc_zeroed(256)
+  let waited = sys_proc_wait_usage(pid, status, 1, usage)
+  let exit = if waited == pid {
+    SupervisedExit {
+      termination: runtime_supervise_termination(mem_load64_at(status, 0)),
+      usage: runtime_supervise_usage(usage)
+    }
+  } else if waited < 0 and waited != 0 - 4 {
+    runtime_supervise_failed(ProcWaitFailed(0 - waited))
+  } else {
+    alloc_bump_restore_same_segment(mark)
+    return nil
+  }
+  alloc_bump_restore_same_segment(mark)
+  exit
+}
+
+-- Replace standard input with /dev/null in a child about to exec.
+fn runtime_supervise_isolate_stdin() -> i64 {
+  let fd = sys_open_read(runtime_str_cstring("/dev/null"))
+  if fd < 0 { fd }
+  else {
+    let status = if fd == 0 { 0 } else { sys_proc_dup_to(fd, 0) }
+    if fd != 0 { sys_close(fd) } else { 0 }
+    status
+  }
+}
+
+fn runtime_supervise_argv(path: str, args: List<str>) -> i64 {
+  let count = args.len().to_u64().to_i64_checked().unwrap_or(0)
+  let argv = alloc_zeroed((count + 2) * 8)
+  mem_store64_at(argv, 0, runtime_str_cstring(path))
+  let mut index = 1
+  let mut remaining = args
+  while not remaining.is_empty() {
+    match remaining {
+      Nil -> nil
+      Cons(arg, rest) -> {
+        mem_store64_at(argv, index * 8, runtime_str_cstring(arg))
+        index = index + 1
+        remaining = rest
+      }
+    }
+  }
+  argv
+}
+
+fn runtime_supervise_run(
+  envp: i64,
+  path: Path,
+  args: List<str>,
+  limit: Duration
+) -> SupervisedExit {
+  let argv = runtime_supervise_argv(runtime_safe_path_string(path), args)
+  let environment = if envp == 0 { alloc_zeroed(8) } else { envp }
+  let start = runtime_platform_now_nanos()
+  let deadline = start + limit.milliseconds() * 1000000
+  let pid = sys_proc_fork()
+  if pid < 0 { return runtime_supervise_failed(ProcSpawnFailed(0 - pid)) }
+  if pid == 0 {
+    runtime_supervise_isolate_stdin()
+    sys_proc_exec(mem_load64_at(argv, 0), argv, environment)
+    sys_exit(127)
+  }
+  loop {
+    match runtime_supervise_poll(pid) {
+      finished: SupervisedExit -> return finished
+      nil -> {
+        if runtime_platform_now_nanos() >= deadline {
+          sys_proc_kill(pid)
+          return runtime_supervise_reap_stopped(pid)
+        }
+        runtime_platform_sleep_millis(10)
+      }
+    }
+  }
+  runtime_supervise_reap_stopped(pid)
+}
+
+fn runtime_supervise_write_executable(path: Path, contents: Bytes) -> Result<nil, IoError> {
+  let cpath = runtime_str_cstring(runtime_safe_path_string(path))
+  sys_remove(cpath)
+  let fd = sys_open_write_create_truncate(cpath, 448)
+  if fd < 0 { return Err<nil, IoError>(io_error_from_errno(fd)) }
+  let written = runtime_safe_write_fd(fd, contents)
+  let permission = match written {
+    Ok(_) -> sys_file_chmod(fd, 448)
+    Err(_) -> 0
+  }
+  sys_close(fd)
+  match written {
+    Err(error) -> Err<nil, IoError>(error)
+    Ok(_) -> if permission < 0 { Err<nil, IoError>(io_error_from_errno(permission)) }
+    else { Ok<nil, IoError>(nil) }
+  }
+}
+
+--- Interpret `Supervise` over the host process. `argc`/`argv` locate the
+--- environment executables inherit.
+pub(package) fn runtime_supervise<T, E>(
+  argc: i64,
+  argv: i64,
+  body: () -[Supervise, E]> T
+) -[E]> T {
+  let envp = runtime_env_pointer(argc, argv)
+  handle body() {
+    Supervise.fork() -> {
+      let pid = sys_proc_fork()
+      if pid < 0 { resume(SupervisedForkFailed(ProcSpawnFailed(0 - pid))) }
+      else if pid == 0 {
+        -- A separate process group lets the runner stop the worker together
+        -- with any executable it has started.
+        sys_proc_set_group(0)
+        resume(SupervisedChild)
+      } else {
+        sys_proc_set_group(pid)
+        resume(SupervisedParent(SupervisedProcess(pid)))
+      }
+    }
+    Supervise.exit(status) -> sys_exit(status)
+    Supervise.poll(worker) -> match worker {
+      SupervisedProcess(pid) -> resume(runtime_supervise_poll(pid))
+    }
+    Supervise.stop(worker) -> match worker {
+      SupervisedProcess(pid) -> {
+        sys_proc_kill(0 - pid)
+        resume(runtime_supervise_reap_stopped(pid))
+      }
+    }
+    Supervise.run(path, args, limit) -> resume(runtime_supervise_run(envp, path, args, limit))
+    Supervise.write_executable(path, contents) -> resume(
+      runtime_supervise_write_executable(path, contents)
+    )
+    Supervise.process_id() -> resume(sys_proc_id())
+  }
+}
+
+--- One scripted worker for deterministic supervision: the polls it keeps
+--- running through and how it ends.
+pub(package) type SupervisedScript { polls: i64, exit: SupervisedExit }
+
+fn runtime_supervise_scripted_poll(script: SupervisedScript, seen: i64) -> SupervisedExit? {
+  if seen < script.polls { return nil }
+  script.exit
+}
+
+--- Interpret `Supervise` without processes, so a supervisor's policy can be
+--- tested exactly. Each fork starts the next scripted worker and continues
+--- as its parent; no worker side runs. A worker ends once polled `polls`
+--- times, and `stop` ends it as stopped with its scripted usage. A fork past
+--- the script fails, executables can be neither written nor run, and the
+--- process identifier is 1.
+pub(package) fn runtime_supervise_scripted<T, E>(
+  script: Vector<SupervisedScript>,
+  body: () -[Supervise, E]> T
+) -[E]> T {
+  let polled: Vector<i64> = vector.new<i64>()
+  handle body() {
+    Supervise.fork() -> {
+      let worker = vector_len<i64>(polled)
+      if worker >= vector_len<SupervisedScript>(script) {
+        resume(SupervisedForkFailed(ProcSpawnFailed(11)))
+      } else {
+        vector_push<i64>(polled, 0)
+        resume(SupervisedParent(SupervisedProcess(worker)))
+      }
+    }
+    Supervise.exit(status) -> panic("a scripted supervisor runs no worker side")
+    Supervise.poll(worker) -> match worker {
+      SupervisedProcess(index) -> {
+        let seen = vector_get_in_bounds<i64>(polled, index)
+        vector_set<i64>(polled, index, seen + 1)
+        resume(
+          runtime_supervise_scripted_poll(
+            vector_get_in_bounds<SupervisedScript>(script, index),
+            seen
+          )
+        )
+      }
+    }
+    Supervise.stop(worker) -> match worker {
+      SupervisedProcess(index) -> resume(
+        SupervisedExit {
+          termination: SupervisedStopped,
+          usage: vector_get_in_bounds<SupervisedScript>(script, index).exit.usage
+        }
+      )
+    }
+    Supervise.run(path, args, limit) -> resume(runtime_supervise_failed(ProcSpawnFailed(1)))
+    Supervise.write_executable(path, contents) -> resume(Err<nil, IoError>(IoPermissionDenied))
+    Supervise.process_id() -> resume(1)
   }
 }

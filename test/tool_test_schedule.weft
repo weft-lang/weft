@@ -1,0 +1,390 @@
+-- The `weft test` scheduler under deterministic interpretations: scripted
+-- workers, scripted measure records, a captured console and a clock that
+-- advances 100 ms per reading. Reports, stops, fallbacks, the memory limit
+-- and totals are exact because no process or wall clock takes part.
+
+use compiler/tool/test.{*}
+use runtime/tool_platform.{
+  Supervise,
+  SupervisedEnded,
+  SupervisedExit,
+  SupervisedForkFailed,
+  SupervisedScript,
+  SupervisedUsage,
+  runtime_supervise_scripted
+}
+use stdlib/bytes as bytes
+use stdlib/bytes.{Bytes, bytes_storage}
+use stdlib/console.{ConsoleWrite}
+use stdlib/dir.{DirMutate}
+use stdlib/env.{Env}
+use stdlib/file.{FileRead, FileWrite}
+use stdlib/io/types.{IoError, IoNotFound}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/panic.{panic}
+use stdlib/path.{Path}
+use stdlib/process.{ProcExited, ProcSignaled, ProcSpawnFailed, ProcTermination}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/string.{str_concat}
+use stdlib/string/builder as builder
+use stdlib/time as time
+use stdlib/time/monotonic as monotonic
+use stdlib/time/monotonic.{MonotonicClock}
+use stdlib/time/sleep.{Sleep, SleepError}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push, vector_set}
+
+fn texts(values: List<str>) -> Vector<str> {
+  let out: Vector<str> = vector.new<str>()
+  for value in values { vector_push<str>(out, value) }
+  out
+}
+
+fn joined(values: Vector<str>) -> str {
+  let mut out = builder.new()
+  for index in 0..vector_len<str>(values) { out.append(vector_get_in_bounds<str>(values, index)) }
+  out.finish()
+}
+
+fn usage(user: i64, system: i64, peak: i64) -> SupervisedUsage {
+  SupervisedUsage { user_micros: user, system_micros: system, peak_rss_bytes: peak }
+}
+
+fn ended(ending: ProcTermination, spent: SupervisedUsage) -> SupervisedExit {
+  SupervisedExit { termination: SupervisedEnded(ending), usage: spent }
+}
+
+fn worker(polls: i64, exit: SupervisedExit) -> SupervisedScript {
+  SupervisedScript { polls: polls, exit: exit }
+}
+
+fn record(outcome: TestOutcome, peak: i64) -> str {
+  test_measure_render(
+    TestMeasure {
+      outcome: outcome,
+      compile_millis: 5,
+      link_millis: 1,
+      run_millis: 7,
+      user_micros: 100,
+      system_micros: 10,
+      peak_rss_bytes: peak
+    }
+  )
+}
+
+-- The measure of root `index` as its worker would have left it; an empty
+-- record means the worker left none.
+fn read_measure(target: str, measures: Vector<str>) -> Result<Bytes, IoError> {
+  for index in 0..vector_len<str>(measures) {
+    let record = vector_get_in_bounds<str>(measures, index)
+    if target == test_scratch_text(TestMeasureFile, 1, index) and record != "" {
+      return Ok<Bytes, IoError>(bytes.from_str(record))
+    }
+  }
+  Err<Bytes, IoError>(IoNotFound)
+}
+
+fn path_text(target: Path) -> str {
+  match target.to_utf8() {
+    Ok(text) -> text
+    Err(_) -> ""
+  }
+}
+
+fn with_measures<T, E>(measures: Vector<str>, body: () -[FileRead, E]> T) -[E]> T {
+  handle body() {
+    FileRead.read_all(target, limit) -> resume(read_measure(path_text(target), measures))
+  }
+}
+
+fn with_scratch<T, E>(body: () -[FileWrite, DirMutate, E]> T) -[E]> T {
+  handle {
+    handle body() {
+      FileWrite.write_all(target, values, mode) -> resume(Ok<usize, IoError>(values.len()))
+    }
+  } {
+    DirMutate.mkdir(target) -> resume(Ok<nil, IoError>(nil))
+    DirMutate.remove(target) -> resume(Ok<nil, IoError>(nil))
+    DirMutate.rename(from, to) -> resume(Ok<nil, IoError>(nil))
+  }
+}
+
+fn with_console<T, E>(lines: Vector<str>, body: () -[ConsoleWrite, E]> T) -[E]> T {
+  handle body() {
+    ConsoleWrite.write_all(stream, values) -> {
+      vector_push<str>(lines, bytes_storage(values))
+      resume(Ok<usize, IoError>(values.len()))
+    }
+    ConsoleWrite.flush(stream) -> resume(Ok<nil, IoError>(nil))
+  }
+}
+
+-- Every reading advances the clock by 100 ms; sleeping takes no time.
+fn with_clock<T, E>(body: () -[MonotonicClock, Sleep, E]> T) -[E]> T {
+  let elapsed: Vector<i64> = vector.new<i64>()
+  vector_push<i64>(elapsed, 0)
+  handle {
+    handle body() {
+      MonotonicClock.now() -> {
+        let now = vector_get_in_bounds<i64>(elapsed, 0) + 100
+        vector_set<i64>(elapsed, 0, now)
+        resume(monotonic.nanoseconds(now * 1000000))
+      }
+    }
+  } {
+    Sleep.wait(duration) -> resume(Ok<nil, SleepError>(nil))
+  }
+}
+
+fn runner_pool(scheduled: TestScheduled) -> TestPool {
+  match scheduled {
+    TestRunnerFinished(pool) -> pool
+    TestWorkerStarted(worker) -> panic("a scripted supervisor starts no worker side")
+  }
+}
+
+fn lookup(requested: str, name: str, value: str) -> str? {
+  if requested == name { return value }
+  nil
+}
+
+fn settings_with(name: str, value: str) -> TestSettings {
+  handle test_settings() {
+    Env.arg_count() -> resume(0)
+    Env.arg(index) -> resume(nil)
+    Env.var(requested) -> resume(lookup(requested, name, value))
+  }
+}
+
+type Scheduled { pool: TestPool, report: str }
+
+fn scheduled(
+  roots: Vector<str>,
+  jobs: i64,
+  settings: TestSettings,
+  limit_millis: i64,
+  script: Vector<SupervisedScript>,
+  measures: Vector<str>
+) -> Scheduled {
+  let lines: Vector<str> = vector.new<str>()
+  let pool = with_console(
+    lines,
+    () =>
+      with_clock(
+        () =>
+          with_scratch(
+            () =>
+              with_measures(
+                measures,
+                () =>
+                  runtime_supervise_scripted(
+                    script,
+                    () =>
+                      test_schedule(
+                        roots,
+                        jobs,
+                        settings,
+                        (index: i64) => time.milliseconds(limit_millis)
+                      )
+                  )
+              )
+          )
+      )
+  )
+  Scheduled { pool: runner_pool(pool), report: joined(lines) }
+}
+
+fn totals_text(totals: TestTotals) -> str {
+  i"{totals.measured} {totals.compile_millis} {totals.link_millis} {totals.run_millis} {totals.user_micros} {totals.system_micros} {totals.peak_rss_bytes}"
+}
+
+fn scripts(values: List<SupervisedScript>) -> Vector<SupervisedScript> {
+  let out: Vector<SupervisedScript> = vector.new<SupervisedScript>()
+  for value in values { vector_push<SupervisedScript>(out, value) }
+  out
+}
+
+test "the_scheduler_reports_roots_in_completion_order_and_refills_free_slots" {
+  let run = scheduled(
+    texts(Cons("a.weft", Cons("b.weft", Cons("c.weft", Nil<str>())))),
+    2,
+    test_settings_unset(),
+    10000,
+    scripts(
+      Cons(
+        worker(2, ended(ProcExited(0), usage(10, 20, 1000))),
+        Cons(
+          worker(0, ended(ProcExited(1), usage(1, 2, 3000))),
+          Cons(worker(1, ended(ProcExited(0), usage(5, 5, 100))), Nil<SupervisedScript>())
+        )
+      )
+    ),
+    texts(Cons(record(TestPassed, 2000), Cons(record(TestFailed(1), 500), Cons("", Nil<str>()))))
+  )
+  -- `c` reuses the slot `b` freed; `c` left no measure, so its clean exit
+  -- is its outcome.
+  Test.assert_str_eq(
+    run.report,
+    "  FAIL: b.weft (200 ms, exit 1)\n  pass: a.weft (700 ms)\n  pass: c.weft (400 ms)\n"
+  )
+  Test.assert_eq(run.pool.failures, 1)
+  Test.assert_str_eq(totals_text(run.pool.totals), "2 10 2 14 216 47 3000")
+}
+
+test "the_scheduler_stops_a_worker_at_its_root_limit" {
+  let run = scheduled(
+    texts(Cons("slow.weft", Nil<str>())),
+    1,
+    test_settings_unset(),
+    250,
+    scripts(
+      Cons(worker(1000000, ended(ProcExited(0), usage(7, 8, 900))), Nil<SupervisedScript>())
+    ),
+    texts(Cons("", Nil<str>()))
+  )
+  Test.assert_str_eq(run.report, "  FAIL: slow.weft (300 ms, timeout)\n")
+  Test.assert_eq(run.pool.failures, 1)
+  -- A stopped worker's usage still counts; it left no measure.
+  Test.assert_str_eq(totals_text(run.pool.totals), "0 0 0 0 7 8 900")
+}
+
+test "the_scheduler_reports_a_failed_fork_and_keeps_supervising" {
+  let run = scheduled(
+    texts(Cons("a.weft", Cons("b.weft", Nil<str>()))),
+    2,
+    test_settings_unset(),
+    10000,
+    scripts(Cons(worker(0, ended(ProcExited(0), usage(0, 0, 0))), Nil<SupervisedScript>())),
+    texts(Cons(record(TestPassed, 0), Cons("", Nil<str>())))
+  )
+  Test.assert_str_eq(run.report, "  FAIL: b.weft (0 ms, exit 1)\n  pass: a.weft (200 ms)\n")
+  Test.assert_eq(run.pool.failures, 1)
+}
+
+test "the_scheduler_judges_only_passing_roots_against_the_memory_limit" {
+  let run = scheduled(
+    texts(Cons("big.weft", Cons("bad.weft", Nil<str>()))),
+    2,
+    settings_with("WEFT_TEST_RUN_RSS_LIMIT_KB", "1024"),
+    10000,
+    scripts(
+      Cons(
+        worker(0, ended(ProcExited(0), usage(0, 0, 3145728))),
+        Cons(worker(0, ended(ProcExited(1), usage(0, 0, 3145728))), Nil<SupervisedScript>())
+      )
+    ),
+    texts(Cons(record(TestPassed, 0), Cons(record(TestFailed(1), 0), Nil<str>())))
+  )
+  Test.assert_str_eq(
+    run.report,
+    "  FAIL: big.weft (200 ms, peak RSS 3072 KB exceeded limit)\n  FAIL: bad.weft (200 ms, exit 1)\n"
+  )
+  Test.assert_eq(run.pool.failures, 2)
+}
+
+test "the_scheduler_falls_back_to_the_worker_status_without_a_valid_measure" {
+  let run = scheduled(
+    texts(Cons("crash.weft", Cons("quiet.weft", Nil<str>()))),
+    1,
+    test_settings_unset(),
+    10000,
+    scripts(
+      Cons(
+        worker(0, ended(ProcSignaled(9), usage(0, 0, 0))),
+        Cons(worker(0, ended(ProcExited(3), usage(0, 0, 0))), Nil<SupervisedScript>())
+      )
+    ),
+    texts(Cons("WEFT_TEST_METRIC 1 garbage\n", Cons("", Nil<str>())))
+  )
+  Test.assert_str_eq(
+    run.report,
+    "  FAIL: crash.weft (100 ms, exit 137)\n  FAIL: quiet.weft (100 ms, exit 3)\n"
+  )
+  Test.assert_str_eq(totals_text(run.pool.totals), "0 0 0 0 0 0 0")
+}
+
+test "the_scheduler_prefers_a_workers_exact_measure_over_its_status" {
+  -- A worker exits 1 for every non-status outcome; its measure keeps the reason.
+  let run = scheduled(
+    texts(Cons("empty.weft", Nil<str>())),
+    4,
+    test_settings_unset(),
+    10000,
+    scripts(Cons(worker(0, ended(ProcExited(1), usage(0, 0, 0))), Nil<SupervisedScript>())),
+    texts(Cons(record(TestNoExecutable, 0), Nil<str>()))
+  )
+  Test.assert_str_eq(run.report, "  FAIL: empty.weft (100 ms, emission produced no executable)\n")
+}
+
+test "the_scheduler_starts_nothing_without_roots" {
+  let run = scheduled(
+    texts(Nil<str>()),
+    3,
+    test_settings_unset(),
+    10000,
+    scripts(Nil<SupervisedScript>()),
+    texts(Nil<str>())
+  )
+  Test.assert_str_eq(run.report, "")
+  Test.assert_eq(run.pool.failures, 0)
+  Test.assert_str_eq(totals_text(run.pool.totals), "0 0 0 0 0 0 0")
+}
+
+-- A worker leaves its measure under its runner's identity and exits with its
+-- outcome's status. `exit` becomes the handled value here.
+fn finished_worker(worker: TestWorker, outcome: TestOutcome) -> str {
+  let written: Vector<str> = vector.new<str>()
+  let status = handle {
+    handle exit_status(worker, measure_of(outcome)) {
+      FileWrite.write_all(target, values, mode) -> {
+        vector_push<str>(
+          written,
+          str_concat(path_text(target), "\n") |> str_concat(bytes_storage(values))
+        )
+        resume(Ok<usize, IoError>(values.len()))
+      }
+    }
+  } {
+    Supervise.fork() -> resume(SupervisedForkFailed(ProcSpawnFailed(1)))
+    Supervise.exit(code) -> code
+    Supervise.poll(child) -> resume(nil)
+    Supervise.stop(child) -> resume(ended(ProcExited(0), usage(0, 0, 0)))
+    Supervise.run(target, args, limit) -> resume(ended(ProcExited(0), usage(0, 0, 0)))
+    Supervise.write_executable(target, contents) -> resume(Err<nil, IoError>(IoNotFound))
+    Supervise.process_id() -> resume(1)
+  }
+  i"{status}|{joined(written)}"
+}
+
+-- The status a finished worker exits with, as this handler's value.
+fn exit_status(worker: TestWorker, measure: TestMeasure) -[FileWrite, Supervise]> i64 {
+  test_worker_finish(worker, measure)
+}
+
+fn measure_of(outcome: TestOutcome) -> TestMeasure {
+  TestMeasure {
+    outcome: outcome,
+    compile_millis: 5,
+    link_millis: 1,
+    run_millis: 7,
+    user_micros: 100,
+    system_micros: 10,
+    peak_rss_bytes: 0
+  }
+}
+
+test "a_finished_worker_leaves_its_measure_for_its_runner_and_exits_with_its_status" {
+  Test.assert_str_eq(
+    finished_worker(TestWorker { root: 3, runner: 812 }, TestPassed),
+    "0|/tmp/weft-test-metric-812-3\nWEFT_TEST_METRIC 1 0 5 1 7 100 10 0\n"
+  )
+  Test.assert_str_eq(
+    finished_worker(TestWorker { root: 0, runner: 9 }, TestFailed(7)),
+    "7|/tmp/weft-test-metric-9-0\nWEFT_TEST_METRIC 1 7 5 1 7 100 10 0\n"
+  )
+  -- Reasons beyond an exit status travel in the measure; the process exits 1.
+  Test.assert_str_eq(
+    finished_worker(TestWorker { root: 1, runner: 9 }, TestTimedOut),
+    "1|/tmp/weft-test-metric-9-1\nWEFT_TEST_METRIC 1 256 5 1 7 100 10 0\n"
+  )
+}

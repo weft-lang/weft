@@ -1,0 +1,216 @@
+-- compiler/tool/test/harness.weft -- the generated entry module of a test root
+--
+-- A test root compiles with one more module: this generated harness. It runs
+-- the root's wrapped tests in chunks, each under a handler for every `Test`
+-- operation, reclaims per-test temporaries, and writes the structured result
+-- record the runner reads. The harness is compiler-generated trusted code; its
+-- assertion state cells use raw memory that user code may not.
+
+use compiler/weft/syntax/declarations.{TestSyntax}
+use compiler/weft/test_prepare.{test_prepare_wrapper_name}
+use stdlib/list.{List}
+use stdlib/string.{str_byte_at, str_len, str_slice_bytes}
+use stdlib/string/builder as builder
+use stdlib/string/builder.{Builder}
+
+--- Tests per generated chunk. Chunking keeps every generated function small,
+--- and each chunk owns its assertion state and handler, so nested compiler
+--- invocations in one chunk cannot clobber state a later chunk holds.
+pub(package) fn harness_chunk_size() -> i64 { 10 }
+
+--- The harness source for `tests`. Trusted roots give their wrappers
+--- `Unsafe` as well as `Test`, so the generated chain declares both.
+pub(package) fn harness_source(tests: List<TestSyntax>, trusted: bool) -> str {
+  let mut out = builder.new()
+  -- The harness is a distinct module; it imports every effect it handles
+  -- rather than relying on the root's lexical scope.
+  out.append("use stdlib/test.{Test, TestState, Fail, IO}")
+  if trusted { out.append(" use runtime/unsafe.{Unsafe}") }
+  out.append(" use runtime/syscall.{*} use runtime/alloc.{*} use runtime/rc.{*}")
+  out.append(
+    " use runtime/test_fixtures.{test_fixture_with_io_i64} use runtime/string.{runtime_str_from_bytes_copy}"
+  )
+  out.append(" use stdlib/string.{*} use stdlib/test/report.{*} use stdlib/diagnostic")
+  out.append(
+    " use stdlib/diagnostic/schema.{Diagnose, DiagnosticSeverityError, DiagnosticSeverityWarning, DiagnosticSeverityNote}"
+  )
+  out.append(
+    " fn test_current_name(st: i64) -> str { runtime_str_from_bytes_copy(__mem_load64(st + 8), __mem_load64(st + 16)) } fn test_write_result_fd(fd: i64, passed: i64, failed: i64, total: i64) -> i64 { let p = int_to_str(passed) let f = int_to_str(failed) let t = int_to_str(total) let line = str_concat(\"WEFT_TEST_RESULT 1 \", str_concat(p, str_concat(\" \", str_concat(f, str_concat(\" \", str_concat(t, \"\\n\")))))) sys_write(fd, __str_ptr(line), __str_len(line)) } "
+  )
+  let mut count = 0
+  for case_syntax in tests { count = count + 1 }
+  let chunks = (count + harness_chunk_size() - 1) / harness_chunk_size()
+  for chunk in 0..chunks {
+    harness_chunk(out, tests, chunk, trusted)
+    harness_chunk_handler(out, chunk, trusted)
+  }
+  harness_run_all(out, chunks, trusted)
+  harness_main(out, count, trusted)
+  out.finish()
+}
+
+fn harness_chunk_name(chunk: i64) -> str { i"run_chunk_{chunk}" }
+
+-- Reset assertion state, call the stable generated wrapper, then reclaim the
+-- test's compiler and runtime temporaries. Compiler-as-data roots build many
+-- modules in one process; without this isolation the bump allocator grows
+-- for the whole file.
+fn harness_call(out: borrow mut Builder, case_syntax: TestSyntax, index: i64) -> nil {
+  out.append(i"let m_{index} = alloc_bump_mark() __mem_store64(st, 1) let n_{index} = ")
+  harness_string_literal(out, case_syntax.name)
+  out.append(
+    i" __mem_store64(st + 8, __str_ptr(n_{index})) __mem_store64(st + 16, __str_len(n_{index})) "
+  )
+  out.append(test_prepare_wrapper_name(index))
+  out.append("() if __mem_load64(st) == 1 { p = p + 1 } else { f = f + 1 } ")
+  out.append(
+    i"let h_{index} = rc_default_heap_existing() if h_{index} != 0 {{ heap_destroy(h_{index}) __mem_store64(rc_default_heap_cell(), 0) }} else {{ 0 }} alloc_bump_restore_same_segment(m_{index}) "
+  )
+}
+
+fn harness_chunk(
+  out: borrow mut Builder,
+  tests: List<TestSyntax>,
+  chunk: i64,
+  trusted: bool
+) -> nil {
+  let effects = if trusted { "Test, Unsafe" } else { "Test" }
+  out.append(
+    i"fn {harness_chunk_name(chunk)}(st: i64) -[{effects}]> i64 {{ let mut p = 0 let mut f = 0 "
+  )
+  let start = chunk * harness_chunk_size()
+  let end = start + harness_chunk_size()
+  let mut index = 0
+  for case_syntax in tests {
+    if index >= end { break }
+    if index >= start { harness_call(out, case_syntax, index) }
+    index = index + 1
+  }
+  out.append("f } ")
+}
+
+fn harness_chunk_handler(out: borrow mut Builder, chunk: i64, trusted: bool) -> nil {
+  let signature = if trusted { "() -[Unsafe]> i64" } else { "() -> i64" }
+  let name = harness_chunk_name(chunk)
+  out.append(i"fn {name}_handled{signature} {{ let st = __bump_alloc(24) handle {name}(st) {{")
+  harness_clauses(out)
+  out.append(" } } ")
+}
+
+fn harness_run_all(out: borrow mut Builder, chunks: i64, trusted: bool) -> nil {
+  if trusted { out.append("fn run_all() -[Unsafe]> i64 { let mut f = 0 ") }
+  else { out.append("fn run_all() -> i64 { let mut f = 0 ") }
+  for chunk in 0..chunks { out.append(i"f = f + {harness_chunk_name(chunk)}_handled() ") }
+  out.append("f } ")
+}
+
+-- The executable writes its result record to the path in its first argument,
+-- or to standard error when run without one.
+fn harness_main(out: borrow mut Builder, count: i64, trusted: bool) -> nil {
+  if trusted {
+    out.append(
+      "fn main(argc: i64, argv: i64) -> i64 { let f = handle run_all() { Unsafe.transmute(value) -> resume(__transmute(value)) } let p = "
+    )
+  } else { out.append("fn main(argc: i64, argv: i64) -> i64 { let f = run_all() let p = ") }
+  out.append(
+    i"{count} - f let fd = if argc == 2 {{ sys_open_write_create_truncate(__mem_load64(argv + 8), 384) }} else {{ 2 }} if fd >= 0 {{ test_write_result_fd(fd, p, f, {count}) if fd != 2 {{ sys_close(fd) }} else {{ 0 }} }} else {{ 0 }} if fd < 0 {{ 1 }} else {{ if f == 0 {{ 0 }} else {{ 1 }} }} }}"
+  )
+}
+
+-- The generated handler covers every `Test` operation, so wrappers and test
+-- libraries may perform any of them; no scan of the root decides which
+-- clauses exist.
+fn harness_clauses(out: borrow mut Builder) -> nil {
+  out.append(
+    " Test.report(diagnostic) -> { test_report_structured(test_current_name(st), diagnostic) __mem_store64(st, 0) resume(0) }"
+  )
+  out.append(
+    " Test.assert_eq(g, e) -> { if g != e { test_report_i64(test_current_name(st), \"assert_eq\", g, e) __mem_store64(st, 0) } else { 0 } resume(0) }"
+  )
+  out.append(
+    " Test.assert_eq_usize(g, e) -> { if g != e { test_report_usize(test_current_name(st), \"assert_eq_usize\", g, e) __mem_store64(st, 0) } else { 0 } resume(0) }"
+  )
+  out.append(
+    " Test.assert_ne(g, u) -> { if g == u { test_report_i64_unexpected(test_current_name(st), \"assert_ne\", g, u) __mem_store64(st, 0) } else { 0 } resume(0) }"
+  )
+  out.append(
+    " Test.assert_true(v) -> { if v { 0 } else { test_report_bool(test_current_name(st), \"assert_true\", v, true) __mem_store64(st, 0) } resume(0) }"
+  )
+  out.append(
+    " Test.assert_false(v) -> { if v { test_report_bool(test_current_name(st), \"assert_false\", v, false) __mem_store64(st, 0) } else { 0 } resume(0) }"
+  )
+  out.append(
+    " Test.assert_lt(l, r) -> { if l < r { 0 } else { test_report_i64(test_current_name(st), \"assert_lt\", l, r) __mem_store64(st, 0) } resume(0) }"
+  )
+  out.append(
+    " Test.assert_le(l, r) -> { if l <= r { 0 } else { test_report_i64(test_current_name(st), \"assert_le\", l, r) __mem_store64(st, 0) } resume(0) }"
+  )
+  out.append(
+    " Test.assert_gt(l, r) -> { if l > r { 0 } else { test_report_i64(test_current_name(st), \"assert_gt\", l, r) __mem_store64(st, 0) } resume(0) }"
+  )
+  out.append(
+    " Test.assert_ge(l, r) -> { if l >= r { 0 } else { test_report_i64(test_current_name(st), \"assert_ge\", l, r) __mem_store64(st, 0) } resume(0) }"
+  )
+  out.append(
+    " Test.assert_str_eq(g, e) -> { if str_eq(g, e) == 0 { test_report_string(test_current_name(st), \"assert_str_eq\", g, e) __mem_store64(st, 0) } else { 0 } resume(0) }"
+  )
+  out.append(
+    " Test.assert_str_ne(g, u) -> { if str_eq(g, u) == 1 { test_report_string_unexpected(test_current_name(st), \"assert_str_ne\", g) __mem_store64(st, 0) } else { 0 } resume(0) }"
+  )
+  out.append(
+    " Test.assert_snapshot(g, e) -> { if str_eq(g, e) == 0 { test_report_string(test_current_name(st), \"snapshot\", g, e) __mem_store64(st, 0) } else { 0 } resume(0) }"
+  )
+  -- Exact IEEE numeric equality. NaN fails; signed zero compares equal.
+  out.append(
+    " Test.assert_eq_f64(g, e) -> { if g == e { 0 } else { test_report_f64(test_current_name(st), \"assert_eq_f64\", g, e) __mem_store64(st, 0) } resume(0) }"
+  )
+  out.append(
+    " Test.assert_near_f64(g, e, eps) -> { let ok = if eps < 0.0 { false } else { if g == e { true } else { let d = if g >= e { g - e } else { e - g } d <= eps } } if ok { 0 } else { test_report_f64_near(test_current_name(st), \"assert_near_f64\", g, e, eps) __mem_store64(st, 0) } resume(0) }"
+  )
+  out.append(
+    " Test.assert_i64_vector_eq(g, e) -> { if test_report_i64_vector_equal(g, e) { 0 } else { test_report_i64_vector(test_current_name(st), \"assert_i64_vector_eq\", g, e) __mem_store64(st, 0) } resume(0) }"
+  )
+  out.append(
+    " Test.forall_i64_range(s, e, prop) -> { let mut i = s let mut seen = 0 let mut failed = 0 let mut counterexample = 0 while i < e { seen = 1 if prop(i) { 0 } else { failed = 1 counterexample = i i = e } i = i + 1 } if seen == 0 { test_report_simple(test_current_name(st), \"forall_i64_range_empty\") __mem_store64(st, 0) } else { if failed == 1 { test_report_i64_detail(test_current_name(st), \"forall_i64_range\", \"counterexample\", counterexample) __mem_store64(st, 0) } else { 0 } } resume(0) }"
+  )
+  out.append(
+    " Test.with_state_i64(init, body) -> { let cell = __bump_alloc(8) __mem_store64(cell, init) let result = handle body() { TestState.get() -> resume(__mem_load64(cell)) TestState.put(v) -> { __mem_store64(cell, v) resume(nil) } } resume(result) }"
+  )
+  out.append(
+    " Test.expect_fail_i64(expected, body) -> { let seen = __bump_alloc(16) __mem_store64(seen, 0) __mem_store64(seen + 8, 0) let result = handle body() { Fail.fail(e) -> { __mem_store64(seen, 1) __mem_store64(seen + 8, e) e } } if __mem_load64(seen) == 0 { test_report_simple(test_current_name(st), \"expect_fail_missing\") __mem_store64(st, 0) } else { if __mem_load64(seen + 8) != expected { test_report_i64(test_current_name(st), \"expect_fail_i64\", __mem_load64(seen + 8), expected) __mem_store64(st, 0) } else { 0 } } resume(if __mem_load64(seen) == 1 { __mem_load64(seen + 8) } else { result }) }"
+  )
+  out.append(" Test.with_io_i64(body) -> resume(test_fixture_with_io_i64(body))")
+  out.append(
+    " Test.with_diagnose_i64(body) -> { let result = handle body() { Diagnose.report(diagnostic) -> resume(match diagnostic.severity() { DiagnosticSeverityError -> 1, DiagnosticSeverityWarning -> 2, DiagnosticSeverityNote -> 3 }) Diagnose.error(msg, span) -> resume(1) Diagnose.warn(msg, span) -> resume(2) Diagnose.note(msg, span) -> resume(3) } resume(result) }"
+  )
+}
+
+-- How a test-name byte appears in a generated string literal: nil keeps it,
+-- otherwise its escape, where control bytes without one are dropped.
+fn harness_escape(byte: i64) -> str? {
+  if byte == 34 { "\\\"" }
+  else if byte == 92 { "\\\\" }
+  else if byte == 10 { "\\n" }
+  else if byte == 13 { "\\r" }
+  else if byte == 9 { "\\t" }
+  else if byte < 32 { "" }
+  else { nil }
+}
+
+fn harness_string_literal(out: borrow mut Builder, text: str) -> nil {
+  out.append("\"")
+  let n = str_len(text)
+  let mut kept = 0
+  for index in 0..n {
+    match harness_escape(str_byte_at(text, index)) {
+      nil -> nil
+      escape: str -> {
+        out.append(str_slice_bytes(text, kept, index - kept))
+        out.append(escape)
+        kept = index + 1
+      }
+    }
+  }
+  out.append(str_slice_bytes(text, kept, n - kept))
+  out.append("\"")
+}
