@@ -24,6 +24,7 @@ if [ -z "${WEFT_TOOL_SHARD:-}" ]; then
   tool_running=0
   tool_failed=0
   tool_pids=()
+  tool_failed_shards=()
 
   while [ "$tool_next" -lt "${#tool_schedule[@]}" ] || [ "$tool_running" -gt 0 ]; do
     while [ "$tool_next" -lt "${#tool_schedule[@]}" ] && [ "$tool_running" -lt "$tool_jobs" ]; do
@@ -40,7 +41,10 @@ if [ -z "${WEFT_TOOL_SHARD:-}" ]; then
       if [ -z "$tool_pid" ]; then continue; fi
       tool_stat=$(ps -o stat= -p "$tool_pid" 2>/dev/null | tr -d ' ')
       if ! kill -0 "$tool_pid" 2>/dev/null || [[ "$tool_stat" == Z* ]]; then
-        if ! wait "$tool_pid"; then tool_failed=1; fi
+        if ! wait "$tool_pid"; then
+          tool_failed=1
+          tool_failed_shards+=("${tool_schedule[$tool_index]}")
+        fi
         tool_pids[$tool_index]=""
         tool_running=$((tool_running - 1))
         tool_progress=1
@@ -52,7 +56,10 @@ if [ -z "${WEFT_TOOL_SHARD:-}" ]; then
   for tool_shard in "${tool_shards[@]}"; do
     /bin/cat "$tool_result_dir/$tool_shard.log"
   done
-  if [ "$tool_failed" -ne 0 ]; then exit 1; fi
+  if [ "$tool_failed" -ne 0 ]; then
+    echo "Tool boundary summary: failed shard(s): ${tool_failed_shards[*]}"
+    exit 1
+  fi
 
   tool_elapsed=$(($(date +%s) - tool_started))
   echo "Tool boundary timing: ${tool_elapsed}s wall, ${tool_jobs} shard jobs"
@@ -163,6 +170,15 @@ tmp_compiler_probe="compiler/_weft_trust_probe_$$.weft"
 tmp_runtime_probe="runtime/_weft_trust_probe_$$.weft"
 tmp_stdlib_probe="stdlib/_weft_trust_probe_$$.weft"
 trap 'rm -f "$tmp_src" "$tmp_import" "$tmp_bin" "$tmp_err" "$tmp_out" "$tmp_tool_obj" "$tmp_tool_bin" "$tmp_fake_weft" "$tmp_test_shared_support" "$tmp_tree_sitter_grammar" "$tmp_tree_sitter_grammar_second" "$tmp_tree_sitter_generator" "$tmp_elf_generator" "$tmp_elf_product" "$tmp_elf_product.facts.json" "$tmp_elf_product_second" "$tmp_elf_product_second.facts.json" "$tmp_native_debug_lldb" "$tmp_compiler_probe" "$tmp_runtime_probe" "$tmp_stdlib_probe"; rm -rf "$tmp_scratch_dir" "$tmp_pkg_dir" "$tmp_pkg_cli_dir" "$tmp_pkg_lock_dir" "$tmp_pkg_remote_dir" "$tmp_pkg_trusted_update_dir" "$tmp_pkg_trust_dir" "$tmp_pkg_missing_dir" "$tmp_sdk_layout_dir" "$tmp_project_target_dir" "$tmp_outside_dir" "$tmp_test_dir" "$tmp_check_dir" "$tmp_fmt_dir" "$tmp_lsp_stream_dir" "$tmp_native_debug_dir" "$tmp_elf_archive_dir"' EXIT
+# `set -e` ends a shard at its first failing command, which can come before
+# the assertion that would have reported it. Name the command and its line on
+# the saved stderr (fd 7), since the failing command's own output may be
+# redirected, so such a shard is still located.
+set -E
+# Report only a failure that stops the shard: one in the shard's own process
+# while errexit is on. Command substitutions and `set +e` regions run failing
+# probe commands deliberately and assert on their outcome.
+trap 'tool_err_status=$?; if [ "$BASHPID" = "$$" ] && [[ $- == *e* ]]; then echo "  ✗ tool shard ${WEFT_TOOL_SHARD:-all} stopped (exit $tool_err_status) at line $LINENO, call lines ${BASH_LINENO[*]}: $BASH_COMMAND" >&7; fi' ERR
 
 now_s() {
   date +%s
