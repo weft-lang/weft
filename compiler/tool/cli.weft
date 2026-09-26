@@ -1,0 +1,559 @@
+-- compiler/tool/cli.weft -- the weft command line as typed values
+--
+-- A command line is its colour choice, its command and the command's own
+-- arguments. This module reads the global option, the command table and
+-- the arguments of every command without a module of its own; reading is
+-- pure, and the entry point interprets each request.
+
+use compiler/backend/target.{
+  NativeLinkTarget,
+  NativeLinkTargetParsed,
+  NativeLinkTargetUnsupported,
+  native_link_target_parse
+}
+use stdlib/option.{None, Option, Some}
+use stdlib/string.{str_byte_at, str_len, str_slice_bytes}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push}
+
+-- Invocation ----------------------------------------------------------------
+--- How diagnostics on standard error are coloured.
+pub(package) type CliColor {
+  --- Colour a terminal unless `NO_COLOR` or a dumb `TERM` says otherwise.
+  CliColorAuto,
+  CliColorAlways,
+  CliColorNever
+}
+
+--- A weft command.
+pub(package) type CliCommand {
+  --- No command: compile standard input to standard output.
+  CliCompileInput,
+  --- `--version`.
+  CliVersionFlag,
+  CliVersion,
+  CliTarget,
+  CliFmt,
+  CliCheck,
+  CliAst,
+  CliTest,
+  CliMcp,
+  CliLsp,
+  CliPkg,
+  CliExplain,
+  CliDoc,
+  CliIr,
+  CliSymbols,
+  CliRun,
+  CliBuild,
+  CliCompile,
+  --- A word that names no command.
+  CliUnknown(str)
+}
+
+--- One invocation. `consumed` counts the colour words before the command,
+--- which the entry point steps over for commands that still read their
+--- arguments by position.
+pub(package) type CliInvocation {
+  color: Option<CliColor>,
+  command: CliCommand,
+  arguments: Vector<str>,
+  consumed: i64
+}
+
+--- A command line, or why its colour option is malformed.
+pub(package) type CliParse {
+  CliParsed(CliInvocation),
+  --- `--color` without a mode.
+  CliColorMissing,
+  --- A mode other than `auto`, `always` or `never`.
+  CliColorInvalid
+}
+
+pub(package) fn cli_usage() -> str {
+  "usage: weft [--color auto|always|never] <command> [args...]\n"
+}
+
+fn cli_color(word: str) -> Option<CliColor> {
+  if word == "auto" { Some(CliColorAuto) }
+  else if word == "always" { Some(CliColorAlways) }
+  else if word == "never" { Some(CliColorNever) }
+  else { None }
+}
+
+--- The command a word names.
+pub(package) fn cli_command(word: str) -> CliCommand {
+  if word == "--version" { CliVersionFlag }
+  else if word == "version" { CliVersion }
+  else if word == "target" { CliTarget }
+  else if word == "fmt" { CliFmt }
+  else if word == "check" { CliCheck }
+  else if word == "ast" { CliAst }
+  else if word == "test" { CliTest }
+  else if word == "mcp" { CliMcp }
+  else if word == "lsp" { CliLsp }
+  else if word == "pkg" { CliPkg }
+  else if word == "explain" { CliExplain }
+  else if word == "doc" { CliDoc }
+  else if word == "ir" { CliIr }
+  else if word == "symbols" { CliSymbols }
+  else if word == "run" { CliRun }
+  else if word == "build" { CliBuild }
+  else if word == "compile" { CliCompile }
+  else { CliUnknown(word) }
+}
+
+fn cli_rest(words: Vector<str>, first: i64) -> Vector<str> {
+  let rest: Vector<str> = vector.new<str>()
+  for index in first..vector_len<str>(words) {
+    vector_push<str>(rest, vector_get_in_bounds<str>(words, index))
+  }
+  rest
+}
+
+--- Read the words after the program name. At most one colour option comes
+--- first: `--color=MODE`, `--color MODE` or `--no-color`.
+pub(package) fn cli_parse(words: Vector<str>) -> CliParse {
+  let count = vector_len<str>(words)
+  let mut color = None<CliColor>()
+  let mut consumed = 0
+  if count > 0 {
+    let first = vector_get_in_bounds<str>(words, 0)
+    if first == "--no-color" {
+      color = Some(CliColorNever)
+      consumed = 1
+    } else if first == "--color" {
+      if count < 2 { return CliColorMissing }
+      match cli_color(vector_get_in_bounds<str>(words, 1)) {
+        Some(mode) -> { color = Some(mode) }
+        None -> return CliColorInvalid
+      }
+      consumed = 2
+    } else if first.starts_with("--color=") {
+      match cli_color(str_slice_bytes(first, 8, str_len(first) - 8)) {
+        Some(mode) -> { color = Some(mode) }
+        None -> return CliColorInvalid
+      }
+      consumed = 1
+    }
+  }
+  let command = if consumed < count { cli_command(vector_get_in_bounds<str>(words, consumed)) }
+  else { CliCompileInput }
+  CliParsed(
+    CliInvocation {
+      color: color,
+      command: command,
+      arguments: cli_rest(words, consumed + 1),
+      consumed: consumed
+    }
+  )
+}
+
+--- Whether a command needs the project's locked packages present first.
+--- Commands that describe the tool or manage packages themselves do not.
+pub(package) fn cli_uses_package_cache(command: CliCommand) -> bool {
+  match command {
+    CliVersionFlag -> false
+    CliVersion -> false
+    CliTarget -> false
+    CliExplain -> false
+    CliPkg -> false
+    CliUnknown(_) -> false
+    _ -> true
+  }
+}
+
+-- Sources -------------------------------------------------------------------
+--- The source a command reads.
+pub(package) type CliSource {
+  CliStandardInput,
+  CliSourcePath(str)
+}
+
+--- One optional source path: standard input without one.
+pub(package) fn cli_source(args: Vector<str>) -> Option<CliSource> {
+  match vector_len<str>(args) {
+    0 -> Some(CliStandardInput)
+    1 -> Some(CliSourcePath(vector_get_in_bounds<str>(args, 0)))
+    _ -> None
+  }
+}
+
+--- Exactly one word, such as a required path or code.
+pub(package) fn cli_single(args: Vector<str>) -> Option<str> {
+  if vector_len<str>(args) == 1 { Some(vector_get_in_bounds<str>(args, 0)) } else { None }
+}
+
+-- Version and target --------------------------------------------------------
+--- What `weft version` prints.
+pub(package) type CliVersionRequest {
+  CliVersionHuman,
+  CliVersionJson,
+  CliVersionUsage
+}
+
+pub(package) fn cli_version(args: Vector<str>) -> CliVersionRequest {
+  match vector_len<str>(args) {
+    0 -> CliVersionHuman
+    1 -> if vector_get_in_bounds<str>(args, 0) == "--json" { CliVersionJson } else {
+      CliVersionUsage
+    }
+    _ -> CliVersionUsage
+  }
+}
+
+--- What `weft target` describes.
+pub(package) type CliTargetRequest {
+  --- Every supported target.
+  CliTargetList,
+  --- One target, or the host without a name.
+  CliTargetShow(Option<NativeLinkTarget>),
+  --- A target name this compiler does not support.
+  CliTargetUnsupported,
+  CliTargetUsage
+}
+
+pub(package) fn cli_target(args: Vector<str>) -> CliTargetRequest {
+  let count = vector_len<str>(args)
+  if count == 0 { return CliTargetUsage }
+  let action = vector_get_in_bounds<str>(args, 0)
+  if action == "list" {
+    if count == 1 { CliTargetList } else { CliTargetUsage }
+  } else if action == "show" {
+    if count == 1 { CliTargetShow(None) }
+    else if count == 2 {
+      match native_link_target_parse(vector_get_in_bounds<str>(args, 1)) {
+        NativeLinkTargetParsed(target) -> CliTargetShow(Some(target))
+        NativeLinkTargetUnsupported -> CliTargetUnsupported
+      }
+    } else { CliTargetUsage }
+  } else { CliTargetUsage }
+}
+
+-- Compile -------------------------------------------------------------------
+--- What `weft compile` produces.
+pub(package) type CliCompileRequest {
+  --- A native executable on standard output.
+  CliCompileProgram(CliSource),
+  --- The executable plus a stage-timing ledger on standard error.
+  CliCompileMetrics(str),
+  --- A census of reference-count operations.
+  CliCompileRcCensus(str),
+  --- A census of checker storage, optionally embedding an SDK root first.
+  CliCompileCheckerStorage(str, Option<str>),
+  --- Malformed; the usage line to print.
+  CliCompileUsage(str)
+}
+
+fn cli_compile_usage() -> str {
+  "usage: weft compile [--metrics|--rc-census|--checker-storage-census] PATH\n"
+}
+
+pub(package) fn cli_compile(args: Vector<str>) -> CliCompileRequest {
+  let count = vector_len<str>(args)
+  if count == 0 { return CliCompileProgram(CliStandardInput) }
+  let first = vector_get_in_bounds<str>(args, 0)
+  if first == "--metrics" {
+    if count == 2 { CliCompileMetrics(vector_get_in_bounds<str>(args, 1)) }
+    else { CliCompileUsage(cli_compile_usage()) }
+  } else if first == "--rc-census" {
+    if count == 2 { CliCompileRcCensus(vector_get_in_bounds<str>(args, 1)) }
+    else { CliCompileUsage(cli_compile_usage()) }
+  } else if first == "--checker-storage-census" {
+    if count == 2 { CliCompileCheckerStorage(vector_get_in_bounds<str>(args, 1), None) }
+    else if count == 4 and vector_get_in_bounds<str>(args, 1) == "--embed-sdk" {
+      CliCompileCheckerStorage(
+        vector_get_in_bounds<str>(args, 3),
+        Some(vector_get_in_bounds<str>(args, 2))
+      )
+    } else {
+      CliCompileUsage("usage: weft compile --checker-storage-census [--embed-sdk ROOT] PATH\n")
+    }
+  } else if count == 1 and not first.starts_with("-") {
+    CliCompileProgram(CliSourcePath(first))
+  } else { CliCompileUsage(cli_compile_usage()) }
+}
+
+-- Run -----------------------------------------------------------------------
+--- What `weft run` builds and runs.
+pub(package) type CliRunInput {
+  --- A source file: a word containing `/` or ending in `.weft`.
+  CliRunPath(str),
+  --- A manifest target; empty for the default one.
+  CliRunTarget(str)
+}
+
+--- A run request: its input and the product's own arguments.
+pub(package) type CliRunRequest {
+  CliRunReady(CliRunInput, Vector<str>),
+  CliRunUsage
+}
+
+fn cli_names_source(word: str) -> bool {
+  let n = str_len(word)
+  for index in 0..n {
+    if str_byte_at(word, index) == 47 { return true }
+  }
+  word.ends_with(".weft")
+}
+
+--- `weft run [TARGET|PATH] [-- ARG...]`: the product's arguments always
+--- follow `--`.
+pub(package) fn cli_run(args: Vector<str>) -> CliRunRequest {
+  let count = vector_len<str>(args)
+  if count == 0 { return CliRunReady(CliRunTarget(""), args) }
+  let first = vector_get_in_bounds<str>(args, 0)
+  if first == "--" { return CliRunReady(CliRunTarget(""), cli_rest(args, 1)) }
+  let input = if cli_names_source(first) { CliRunPath(first) } else { CliRunTarget(first) }
+  if count == 1 { CliRunReady(input, cli_rest(args, 1)) }
+  else if vector_get_in_bounds<str>(args, 1) == "--" { CliRunReady(input, cli_rest(args, 2)) }
+  else { CliRunUsage }
+}
+
+-- Build ---------------------------------------------------------------------
+--- Whether a native product keeps its debug information.
+pub(package) type CliDebug {
+  CliDebugIncluded,
+  CliDebugStripped
+}
+
+--- How a product's heap treats freed objects.
+pub(package) type CliHeap {
+  --- Freed blocks are reused.
+  CliHeapReuse,
+  --- Freed blocks stay out of reuse, so a stale reference names the
+  --- release that freed it.
+  CliHeapQuarantine
+}
+
+--- A source file built to an explicit output.
+pub(package) type CliBuildFile {
+  source: str,
+  output: str,
+  facts: Option<str>,
+  --- An SDK root embedded in the product.
+  sdk: Option<str>
+}
+
+--- What `weft build` builds.
+pub(package) type CliBuildInput {
+  CliBuildPath(CliBuildFile),
+  --- A manifest target; empty for the default one.
+  CliBuildTarget(str)
+}
+
+--- A build request. Without a target the host is built.
+pub(package) type CliBuildOptions {
+  input: CliBuildInput,
+  debug: CliDebug,
+  target: Option<NativeLinkTarget>,
+  heap: CliHeap
+}
+
+pub(package) type CliBuildRequest {
+  CliBuildReady(CliBuildOptions),
+  CliBuildUsage
+}
+
+pub(package) fn cli_build_usage() -> str {
+  "usage: weft build [TARGET] [--target macos-aarch64|linux-aarch64] [--strip-debug] [--rc-quarantine]\n       weft build PATH -o OUTPUT [--target macos-aarch64|linux-aarch64] [--artifact-facts PATH] [--strip-debug] [--rc-quarantine] [--embed-sdk ROOT]\n"
+}
+
+-- The value that follows an option, unless the option was already given.
+fn cli_option_value(args: Vector<str>, index: i64, seen: bool) -> Option<str> {
+  if seen or index + 1 >= vector_len<str>(args) { None }
+  else { Some(vector_get_in_bounds<str>(args, index + 1)) }
+}
+
+--- Each option may be given once. A file build names its output; its
+--- facts and embedded SDK apply only there.
+pub(package) fn cli_build(args: Vector<str>) -> CliBuildRequest {
+  let count = vector_len<str>(args)
+  let mut positional = None<str>()
+  let mut output = None<str>()
+  let mut facts = None<str>()
+  let mut sdk = None<str>()
+  let mut target = None<NativeLinkTarget>()
+  let mut debug = CliDebugIncluded
+  let mut stripped = false
+  let mut heap = CliHeapReuse
+  let mut quarantined = false
+  let mut index = 0
+  while index < count {
+    let option = vector_get_in_bounds<str>(args, index)
+    if option == "-o" {
+      match cli_option_value(args, index, output.is_some()) {
+        Some(value) -> { output = Some(value) }
+        None -> return CliBuildUsage
+      }
+      index = index + 2
+    } else if option == "--artifact-facts" {
+      match cli_option_value(args, index, facts.is_some()) {
+        Some(value) -> { facts = Some(value) }
+        None -> return CliBuildUsage
+      }
+      index = index + 2
+    } else if option == "--embed-sdk" {
+      match cli_option_value(args, index, sdk.is_some()) {
+        Some(value) -> { sdk = Some(value) }
+        None -> return CliBuildUsage
+      }
+      index = index + 2
+    } else if option == "--target" {
+      let named = match target {
+        Some(_) -> None<str>()
+        None -> cli_option_value(args, index, false)
+      }
+      match named {
+        None -> return CliBuildUsage
+        Some(value) -> match native_link_target_parse(value) {
+          NativeLinkTargetParsed(selected) -> { target = Some(selected) }
+          NativeLinkTargetUnsupported -> return CliBuildUsage
+        }
+      }
+      index = index + 2
+    } else if option == "--strip-debug" {
+      if stripped { return CliBuildUsage }
+      stripped = true
+      debug = CliDebugStripped
+      index = index + 1
+    } else if option == "--rc-quarantine" {
+      if quarantined { return CliBuildUsage }
+      quarantined = true
+      heap = CliHeapQuarantine
+      index = index + 1
+    } else if option.starts_with("-") { return CliBuildUsage }
+    else {
+      match positional {
+        Some(_) -> return CliBuildUsage
+        None -> { positional = Some(option) }
+      }
+      index = index + 1
+    }
+  }
+  let input = match output {
+    Some(written) -> match positional {
+      None -> return CliBuildUsage
+      Some(source) -> CliBuildPath(
+        CliBuildFile { source: source, output: written, facts: facts, sdk: sdk }
+      )
+    }
+    None -> {
+      if facts.is_some() or sdk.is_some() { return CliBuildUsage }
+      match positional {
+        Some(name) -> CliBuildTarget(name)
+        None -> CliBuildTarget("")
+      }
+    }
+  }
+  CliBuildReady(CliBuildOptions { input: input, debug: debug, target: target, heap: heap })
+}
+
+-- IR ------------------------------------------------------------------------
+--- The stage whose IR `weft ir` shows.
+pub(package) type CliIrStage {
+  CliIrLowered,
+  CliIrOptimised,
+  CliIrNative
+}
+
+--- Emission facts to show beneath each body. Cleanup records describe native
+--- emission, so they require (and imply) the native stage.
+pub(package) type CliIrFacts {
+  CliIrNoFacts,
+  CliIrCleanupFacts
+}
+
+--- Which functions to show: the root file's own (the default), every
+--- function including the SDK closure, or one function by name.
+pub(package) type CliIrScope {
+  CliIrRoot,
+  CliIrEverything,
+  CliIrFunction(str)
+}
+
+pub(package) type CliIrOptions {
+  stage: CliIrStage,
+  facts: CliIrFacts,
+  scope: CliIrScope,
+  path: str
+}
+
+--- An IR request, or what is wrong with it.
+pub(package) type CliIrRequest {
+  CliIrReady(CliIrOptions),
+  CliIrProblem(str)
+}
+
+pub(package) fn cli_ir_usage() -> str {
+  "usage: weft ir [--stage lowered|optimised|native] [--facts cleanup] [--all | --function NAME] FILE\n"
+}
+
+fn cli_ir_stage(word: str) -> Option<CliIrStage> {
+  if word == "lowered" { Some(CliIrLowered) }
+  else if word == "optimised" { Some(CliIrOptimised) }
+  else if word == "native" { Some(CliIrNative) }
+  else { None }
+}
+
+pub(package) fn cli_ir(args: Vector<str>) -> CliIrRequest {
+  let count = vector_len<str>(args)
+  let mut stage = CliIrOptimised
+  let mut staged = false
+  let mut facts = CliIrNoFacts
+  let mut scope = CliIrRoot
+  let mut scoped = false
+  let mut path = None<str>()
+  let mut index = 0
+  while index < count {
+    let arg = vector_get_in_bounds<str>(args, index)
+    let has_value = index + 1 < count
+    if arg == "--stage" {
+      if not has_value { return CliIrProblem("--stage needs lowered, optimised or native") }
+      match cli_ir_stage(vector_get_in_bounds<str>(args, index + 1)) {
+        Some(chosen) -> { stage = chosen }
+        None -> return CliIrProblem("unknown stage (use lowered, optimised or native)")
+      }
+      staged = true
+      index = index + 1
+    } else if arg == "--facts" {
+      if not has_value { return CliIrProblem("--facts needs cleanup") }
+      if vector_get_in_bounds<str>(args, index + 1) != "cleanup" {
+        return CliIrProblem("unknown facts (use cleanup)")
+      }
+      facts = CliIrCleanupFacts
+      index = index + 1
+    } else if arg == "--function" {
+      if not has_value { return CliIrProblem("--function needs a function name") }
+      if scoped { return CliIrProblem("choose one of --all and --function") }
+      scope = CliIrFunction(vector_get_in_bounds<str>(args, index + 1))
+      scoped = true
+      index = index + 1
+    } else if arg == "--all" {
+      if scoped { return CliIrProblem("choose one of --all and --function") }
+      scope = CliIrEverything
+      scoped = true
+    } else {
+      match path {
+        Some(_) -> return CliIrProblem("expected exactly one input file")
+        None -> { path = Some(arg) }
+      }
+    }
+    index = index + 1
+  }
+  let file = match path {
+    Some(named) -> named
+    None -> return CliIrProblem("expected an input file")
+  }
+  -- Cleanup facts imply the native stage unless another stage was asked for.
+  let shown = match facts {
+    CliIrNoFacts -> stage
+    CliIrCleanupFacts -> match stage {
+      CliIrNative -> stage
+      _ -> if staged {
+        return CliIrProblem("--facts cleanup describes native emission (use --stage native)")
+      } else { CliIrNative }
+    }
+  }
+  CliIrReady(CliIrOptions { stage: shown, facts: facts, scope: scope, path: file })
+}

@@ -1406,6 +1406,38 @@ version_json=$("$WEFT" version --json 2> "$tmp_err")
 assert_equals "version_json_is_exact_and_deterministic" "$version_json" '{"compiler_version":"0.1.0","language_version":"0.1","manifest_schema_version":1,"lock_schema_version":1,"native_binding_abi_version":1,"artifact_facts_schema_version":8,"targets":["macos-aarch64","linux-aarch64"],"sdk":{"kind":"checkout","root":"."}}'
 assert_equals "version_json_stderr_empty" "$(<"$tmp_err")" ""
 
+# A colour option before the command selects the same SDK and identity.
+version_no_color_json=$("$WEFT" --no-color version --json 2> "$tmp_err")
+assert_equals "no_color_option_keeps_sdk_selection" "$version_no_color_json" "$version_json"
+version_separate_color_json=$("$WEFT" --color always version --json 2> "$tmp_err")
+assert_equals "separate_color_value_keeps_sdk_selection" "$version_separate_color_json" "$version_json"
+version_inline_color_json=$("$WEFT" --color=never version --json 2> "$tmp_err")
+assert_equals "inline_color_value_keeps_sdk_selection" "$version_inline_color_json" "$version_json"
+
+# An unknown command is a usage error; it never waits on standard input.
+set +e
+"$WEFT" frobnicate > "$tmp_out" 2> "$tmp_err" < /dev/null
+unknown_command_exit=$?
+set -e
+assert_equals "unknown_command_exits_usage" "$unknown_command_exit" "2"
+assert_equals "unknown_command_writes_no_stdout" "$(<"$tmp_out")" ""
+assert_contains "unknown_command_is_named" "$(<"$tmp_err")" "weft: unknown command 'frobnicate'"
+assert_contains "unknown_command_prints_usage" "$(<"$tmp_err")" "usage: weft [--color auto|always|never] <command> [args...]"
+set +e
+"$WEFT" --no-color frobnicate > "$tmp_out" 2> "$tmp_err" < /dev/null
+unknown_colored_exit=$?
+set -e
+assert_equals "unknown_command_after_color_exits_usage" "$unknown_colored_exit" "2"
+
+for malformed in "symbols" "ast a.weft b.weft" "compile a.weft b.weft" "compile --fast" "version --JSON" "target describe"; do
+  set +e
+  "$WEFT" $malformed > "$tmp_out" 2> "$tmp_err" < /dev/null
+  malformed_exit=$?
+  set -e
+  assert_equals "malformed_command_exits_usage: $malformed" "$malformed_exit" "2"
+  assert_contains "malformed_command_prints_usage: $malformed" "$(<"$tmp_err")" "usage: weft"
+done
+
 target_list=$("$WEFT" target list 2> "$tmp_err")
 assert_equals "target_list_is_canonical_and_stable" "$target_list" $'macos-aarch64\nlinux-aarch64'
 assert_equals "target_list_stderr_empty" "$(<"$tmp_err")" ""
